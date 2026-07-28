@@ -499,20 +499,49 @@ def test_sky_modes():
     """Every sky mode must produce its own visible background."""
     from ..core.scene import ImageBuffer, World
     from .scenebuild import checker_image
+    from ..core import sky as SKY
     st = base_settings(120, 90)
     seen = {}
-    for mode in ('SOLID', 'GRADIENT', 'BRYCE', 'PHYSICAL'):
+    # driven by the mode list rather than a copy of it, so a mode added to the
+    # engine and forgotten here fails this test instead of going untested
+    modes = [m for m in SKY.MODES if m not in ('NODES', 'HDRI')]
+    check('every sky mode but NODES and HDRI is covered here',
+          len(modes) == len(SKY.MODES) - 2, str(modes))
+    for mode in modes:
         sc = demo_scene(st)
         sc.world = World()
         sc.world.mode = mode
+        if mode == 'STARFIELD':
+            # the default backdrop is nearly black by design; give it enough
+            # to measure without changing what is being measured
+            sc.world.color = (0.02, 0.02, 0.06)
+            sc.world.star_brightness = 2.0
         img = R.render(sc, st)
         seen[mode] = _sky_rows(img)
         check(f'{mode} sky renders something', float(seen[mode].mean()) > 0.01,
               str(np.round(seen[mode].reshape(-1, 3).mean(0), 3)))
-    pairs = [(a, b) for i, a in enumerate(seen) for b in list(seen)[i + 1:]]
+    # Distinctness is asked of the whole sphere rather than of the strip of
+    # sky one camera happens to see: the demo scene's horizon is flat, and
+    # down there a banded gradient and a smooth one agree exactly -- correctly,
+    # since the first band *is* the horizon colour.
+    th = np.linspace(0.02, np.pi - 0.02, 48)
+    ph = np.linspace(0.0, 2.0 * np.pi, 48, endpoint=False)
+    T_, P_ = np.meshgrid(th, ph)
+    dirs = np.stack([np.sin(T_) * np.cos(P_), np.sin(T_) * np.sin(P_),
+                     np.cos(T_)], -1).reshape(-1, 3).astype(np.float32)
+    full = {}
+    for mode in modes:
+        w = World()
+        w.mode = mode
+        if mode == 'STARFIELD':
+            w.color = (0.02, 0.02, 0.06)
+            w.star_brightness = 2.0
+        full[mode] = SKY.evaluate(w, dirs)
+    pairs = [(a, b) for i, a in enumerate(full) for b in list(full)[i + 1:]]
     same = [f'{a}=={b}' for a, b in pairs
-            if float(np.abs(seen[a] - seen[b]).mean()) < 1e-4]
-    check('the sky modes are all distinct', not same, ', '.join(same))
+            if float(np.abs(full[a] - full[b]).mean()) < 1e-4]
+    check('the sky modes are all distinct over the whole sphere', not same,
+          ', '.join(same))
 
     sc = demo_scene(st)
     sc.world = World()
@@ -1745,6 +1774,551 @@ def test_matcap_coordinates():
         check('they vary with the normal', float(uv[:, 0].std()) > 0.05)
     check('no error was swallowed', not ev.errors,
           str(ev.errors[0] if ev.errors else ''))
+
+
+def test_period_objects():
+    """The Add-menu objects must be sound geometry, not just a pile of quads.
+
+    Each generator is checked for the mistakes a lattice generator actually
+    makes -- an off-by-one in a wrap, a degenerate quad, an index past the end
+    -- and then for the things that make each object itself: the teapot has a
+    handle on one side and a spout on the other, the Cornell box is the
+    published measurement with its normals facing in, and the checkerboard
+    alternates.
+    """
+    from ..core import geometry as GEO
+
+    broke = []
+    for label, (verts, faces) in (
+            ('teapot', GEO.utah_teapot(6, 12)),
+            ('teacup', GEO.teacup(4, 12)),
+            ('saucer', GEO.saucer(4, 12)),
+            ('teaspoon', GEO.teaspoon(4, 10))):
+        ok, msg = GEO.is_manifoldish(verts, faces)
+        if not ok:
+            broke.append(f'{label}: {msg}')
+    check('every generated object is sound geometry', not broke,
+          '; '.join(broke))
+
+    # resolution is a real knob, not decoration
+    low = GEO.utah_teapot(4, 8)
+    high = GEO.utah_teapot(12, 24)
+    check('the teapot resolution knob does something',
+          len(high[1]) > 4 * len(low[1]),
+          f'{len(low[1])} -> {len(high[1])} faces')
+
+    (lo, _ly, lz), (hi, _hy, hz) = GEO.bounds(GEO.utah_teapot(8, 16)[0])
+    check('the teapot has a spout on one side and a handle on the other',
+          lo < -2.8 and hi > 2.9, f'x from {lo:.2f} to {hi:.2f}')
+    check('the teapot stands on the floor at Newell height',
+          abs(lz) < 1e-6 and abs(hz - 3.15) < 1e-6, f'z {lz:.3f}..{hz:.3f}')
+
+    # the Cornell box: measurements, normals and which wall is which
+    verts, faces, groups = GEO.cornell_box()
+    ok, msg = GEO.is_manifoldish(verts, faces)
+    check('the Cornell box is sound geometry', ok, msg)
+    V = np.asarray(verts, np.float64)
+    room = [i for i, g in enumerate(groups)
+            if g in ('white', 'red', 'green', 'light')]
+    centre = (V.min(0) + V.max(0)) * 0.5
+    outward = []
+    for i in room:
+        p = V[list(faces[i])]
+        n = np.cross(p[1] - p[0], p[2] - p[0])
+        n = n / max(float(np.linalg.norm(n)), 1e-12)
+        to_centre = centre - p.mean(0)
+        if float(np.dot(n, to_centre / np.linalg.norm(to_centre))) < 0:
+            outward.append(groups[i])
+    check('every wall of the Cornell box faces inward', not outward,
+          ', '.join(outward))
+
+    for name, want_sign in (('red', +1.0), ('green', -1.0)):
+        idx = [i for i, g in enumerate(groups) if g == name]
+        x = float(np.mean([V[list(faces[i])][:, 0].mean() for i in idx]))
+        check(f'the {name} wall is on the side the published scene puts it',
+              x * want_sign > 0.4, f'x={x:.3f}')
+
+    for name, height in (('short', 165.0), ('tall', 330.0)):
+        idx = [i for i, g in enumerate(groups) if g == name]
+        z = max(float(V[list(faces[i])][:, 2].max()) for i in idx)
+        check(f'the {name} block is {height:.0f}mm tall',
+              abs(z - height / 552.8) < 1e-6, f'{z * 552.8:.1f}mm')
+
+    # the checkerboard
+    cv, cf, cg = GEO.checker_plane(10.0, 6)
+    ok, msg = GEO.is_manifoldish(cv, cf)
+    check('the checker plane is sound geometry', ok, msg)
+    check('the checker plane has one group per face', len(cg) == len(cf))
+    grid = np.asarray(cg).reshape(6, 6)
+    check('the checker plane actually alternates',
+          bool((grid[:, :-1] != grid[:, 1:]).all()
+               and (grid[:-1, :] != grid[1:, :]).all()))
+    span = np.asarray(cv)[:, 0]
+    check('the checker plane is the size it was asked for',
+          abs(float(span.max() - span.min()) - 10.0) < 1e-6)
+
+
+def test_generated_objects_are_wound_outward():
+    """Every generated solid must have its normals pointing out of it.
+
+    This is the bug the first cut of these objects shipped with. A surface of
+    revolution swept while walking *down* the profile and *anticlockwise* around
+    the axis winds every quad the wrong way round, and nothing says so: the
+    z-buffer does not care, and the shading takes an absolute value. It only
+    appears when backface culling is switched on -- five presets do -- and then
+    the whole outer surface is culled and you are looking at the far interior.
+    The teapot's own base was visible through its side.
+
+    Two independent checks, because the first is cheap and the second is what
+    the user actually sees.
+    """
+    from ..core import geometry as GEO
+    from ..core.scene import Camera, Light, Material, ObjectInfo, Scene, World
+    from .scenebuild import _mesh_concat, look_at_matrix
+
+    # 1. the divergence theorem. Exact for these even though the band seams are
+    #    topologically open, because the two rings at a seam are coincident.
+    wrong = []
+    for label, built in (('teapot', GEO.utah_teapot(8, 16)),
+                         ('teacup', GEO.teacup(5, 16)),
+                         ('saucer', GEO.saucer(4, 16)),
+                         ('teaspoon', GEO.teaspoon(5, 12))):
+        vol = GEO.signed_volume(built[0], built[1])
+        if vol <= 0.0:
+            wrong.append(f'{label} encloses {vol:+.4f}')
+    check('every lathed object encloses a positive volume', not wrong,
+          '; '.join(wrong))
+
+    # the Cornell box is the deliberate exception: its walls face inward, so
+    # its signed volume is negative, and a test that just asked for "positive"
+    # everywhere would have to make an exception rather than state the rule
+    v, f, _g = GEO.cornell_box()
+    check('the Cornell box is inside out on purpose, and stays that way',
+          GEO.signed_volume(v, f) < 0.0)
+
+    # 2. and the invariant that matters: for a closed solid seen from outside,
+    #    culling the back can only ever remove something already hidden.
+    def prim(built):
+        V = np.asarray(built[0], np.float32)
+        tris = []
+        for face in built[1]:
+            for k in range(1, len(face) - 1):
+                tris.append((face[0], face[k], face[k + 1]))
+        T = np.asarray(tris, np.int32)
+        N = np.zeros_like(V)
+        fn = np.cross(V[T[:, 1]] - V[T[:, 0]], V[T[:, 2]] - V[T[:, 0]])
+        for i in range(3):
+            np.add.at(N, T[:, i], fn)
+        ln = np.linalg.norm(N, axis=1, keepdims=True)
+        N = N / np.where(ln < 1e-12, 1.0, ln)
+        return (V, N.astype(np.float32),
+                (V[:, :2] * 0.25 + 0.5).astype(np.float32), T, 0, 0)
+
+    def shot(built, cull, cam, target):
+        st = base_settings(200, 150)
+        st.backface_cull = cull
+        mesh = _mesh_concat([prim(built)])
+        mesh.smooth = np.ones(mesh.tris.shape[0], bool)
+        sc = Scene(
+            mesh=mesh,
+            materials=[Material(name='P', index=0, model='BLINN_PHONG',
+                                diffuse=(0.8, 0.72, 0.35),
+                                specular_level=0.9, glossiness=140.0)],
+            objects=[ObjectInfo(name='T', index=0,
+                                matrix_world=np.eye(4, dtype=np.float32))],
+            lights=[Light(type='SUN', direction=(-0.55, 0.5, -0.65),
+                          energy=5.0)],
+            camera=Camera(matrix_world=look_at_matrix(cam, target), lens=45.0,
+                          sensor=36.0, clip_start=0.1, clip_end=500.0),
+            world=World(mode='SOLID', color=(0.0, 0.0, 0.0)), settings=st)
+        return R.render(sc, st)[..., :3]
+
+    views = ((1, 0, 0.4), (-1, 0, 0.4), (0, 1, 0.4), (0, -1, 0.4),
+             (0.93, 0, 0.37), (0, 0, 1), (0, 0, -1))
+    bad = []
+    for label, built in (('teapot', GEO.utah_teapot(8, 20)),
+                         ('teacup', GEO.teacup(5, 16)),
+                         ('saucer', GEO.saucer(4, 16)),
+                         ('teaspoon', GEO.teaspoon(5, 12))):
+        V = np.asarray(built[0], np.float64)
+        centre = (V.min(0) + V.max(0)) * 0.5
+        radius = float(np.linalg.norm(V - centre, axis=1).max())
+        for d in views:
+            d = np.asarray(d, np.float64)
+            d = d / np.linalg.norm(d)
+            cam = tuple(centre + d * radius * 4.0)
+            a = shot(built, False, cam, tuple(centre))
+            b = shot(built, True, cam, tuple(centre))
+            mean = float(np.abs(a - b).mean())
+            px = int((np.abs(a - b).mean(axis=2) > 1e-3).sum())
+            # a handful of pixels may legitimately flip: exactly at the
+            # silhouette a front and a back face meet inside one pixel, and
+            # which of them wins is a tie that culling breaks differently.
+            # A winding error is not a handful of pixels, it is the object.
+            if mean > 1e-3 or px > a[..., 0].size // 2000:
+                bad.append(f'{label} from {np.round(d, 2).tolist()}: '
+                           f'{px}px, mean {mean:.5f}')
+    check('culling the back of a generated solid leaves the picture alone',
+          not bad, '; '.join(bad[:3]))
+
+
+def test_period_objects_render():
+    """And each of them survives being handed to the renderer."""
+    from ..core import geometry as GEO
+    from .scenebuild import _mesh_concat, demo_scene
+
+    def as_mesh(built):
+        verts, faces = built[0], built[1]
+        V = np.asarray(verts, np.float32)
+        extent = float(np.abs(V).max()) or 1.0
+        V = V * (1.6 / extent)
+        tris = []
+        for f in faces:
+            for k in range(1, len(f) - 1):
+                tris.append((f[0], f[k], f[k + 1]))
+        T = np.asarray(tris, np.int32)
+        # smooth vertex normals, so a shared vertex gets one -- the renderer
+        # uses the face normal anyway with smooth off, but the array must be
+        # there and must be the right length
+        N = np.zeros_like(V)
+        e1 = V[T[:, 1]] - V[T[:, 0]]
+        e2 = V[T[:, 2]] - V[T[:, 0]]
+        fn = np.cross(e1, e2)
+        for i in range(3):
+            np.add.at(N, T[:, i], fn)
+        ln = np.linalg.norm(N, axis=1, keepdims=True)
+        N = N / np.where(ln < 1e-12, 1.0, ln)
+        UV = V[:, :2] * 0.5 + 0.5
+        return _mesh_concat([(V, N.astype(np.float32),
+                              UV.astype(np.float32), T, 0, 0)])
+
+    broke = []
+    for label, built in (('teapot', GEO.utah_teapot(6, 14)),
+                         ('teacup', GEO.teacup(4, 12)),
+                         ('saucer', GEO.saucer(4, 12)),
+                         ('teaspoon', GEO.teaspoon(4, 10)),
+                         ('cornell', GEO.cornell_box()),
+                         ('checker', GEO.checker_plane(6.0, 6))):
+        st = base_settings(96, 72)
+        sc = demo_scene(st)
+        sc.mesh = as_mesh(built)
+        try:
+            img = R.render(sc, st)
+        except Exception as exc:                                # noqa: BLE001
+            broke.append(f'{label}: {exc!r}')
+            continue
+        if not np.isfinite(img).all():
+            broke.append(f'{label}: not finite')
+        elif float(img[..., :3].std()) < 1e-3:
+            broke.append(f'{label}: nothing visible')
+    check('every period object renders', not broke, '; '.join(broke))
+
+
+def test_add_menu_is_complete():
+    """Every Add-menu operator must be registered and reachable from the menu.
+
+    An operator that exists but is in no menu is invisible, and a menu entry
+    for an operator that was renamed is a dead click. Both have happened here.
+    """
+    import inspect
+
+    from . import fakebpy
+    bpy = fakebpy.install()
+    bpy.types.UIList = type('UIList', (bpy.types.Panel,), {})
+    import importlib
+    objects = importlib.import_module('halcyon.objects')
+
+    ops = [c for c in objects.CLASSES
+           if c.__name__.startswith('HALCYON_OT_')]
+    check('the Add menu has the four period objects', len(ops) == 4,
+          ', '.join(c.bl_idname for c in ops))
+
+    src = inspect.getsource(objects.VIEW3D_MT_halcyon_add.draw)
+    missing = [c.bl_idname for c in ops if c.__name__ not in src]
+    check('every Add operator appears in the menu', not missing,
+          ', '.join(missing))
+
+    drawn = inspect.getsource(objects.draw_add_menu)
+    check('the Add menu is gated on the engine', 'ENGINE' in drawn)
+    check('the menu is appended to the 3D view Add menu',
+          'VIEW3D_MT_add' in inspect.getsource(objects.register))
+
+    # every operator's properties must be real bpy properties, which is what
+    # the stub's register_class already asserts -- so registering is the test
+    objects.register()
+    objects.unregister()
+    check('the Add-menu module registers and unregisters cleanly', True)
+
+
+def test_backface_culling_keeps_the_front():
+    """Culling must remove the far side of a solid, not the near side.
+
+    The sign was inverted, and it survived because nothing closed was ever
+    rendered with culling on: five presets set it, and on those a cube showed
+    its own interior -- which is dark, and reads as the object not being there
+    rather than as being inside out. The test that catches it is the one that
+    needs no reference image: culling the back of a *closed convex* solid can
+    only ever be invisible, because the back was behind the front anyway.
+    """
+    from ..core.scene import Camera, Light, Material, ObjectInfo, Scene, World
+    from .scenebuild import _mesh_concat, cube, look_at_matrix, plane, sphere
+
+    def shot(prim, cull, flip=False):
+        st = base_settings(140, 105)
+        st.backface_cull = cull
+        v, n, uv, t, mi, oi = prim
+        if flip:
+            t = t[:, ::-1].copy()
+        mesh = _mesh_concat([(v, n, uv, t, mi, oi)])
+        mesh.smooth = np.zeros(mesh.tris.shape[0], bool)
+        sc = Scene(
+            mesh=mesh,
+            materials=[Material(name='A', index=0, model='LAMBERT',
+                                diffuse=(0.9, 0.9, 0.9))],
+            objects=[ObjectInfo(name='P', index=0,
+                                matrix_world=np.eye(4, dtype=np.float32))],
+            lights=[Light(type='SUN', direction=(-0.4, 0.5, -0.7), energy=5.0)],
+            camera=Camera(matrix_world=look_at_matrix((4, -5, 3), (0, 0, 0)),
+                          lens=45.0, sensor=36.0, clip_start=0.1,
+                          clip_end=100.0),
+            world=World(mode='SOLID', color=(0.0, 0.0, 0.0)), settings=st)
+        return R.render(sc, st)
+
+    for label, prim in (('cube', cube(centre=(0, 0, 0), size=2.0)),
+                        ('sphere', sphere(centre=(0, 0, 0), radius=1.0))):
+        plain, culled = shot(prim, False), shot(prim, True)
+        check(f'culling the back of a closed {label} changes nothing at all',
+              float(np.abs(plain - culled).max()) == 0.0,
+              f'max delta {float(np.abs(plain - culled).max()):.6f}')
+
+    floor = plane(z=-1.0, size=8.0)
+    faced = shot(floor, True)
+    check('a surface facing the camera survives culling',
+          float(faced[..., :3].mean()) > 0.05,
+          f'mean {float(faced[..., :3].mean()):.4f}')
+    away = shot(floor, True, flip=True)
+    check('and the same surface wound the other way is culled',
+          float(away[..., :3].max()) < 1e-6,
+          f'max {float(away[..., :3].max()):.4f}')
+
+
+def test_banded_sky_is_banded():
+    """The banded gradient must produce exactly the number of steps asked for."""
+    from ..core import sky as SKY
+    from ..core.scene import World
+
+    up = np.linspace(0.001, 1.0, 4096, dtype=np.float32)
+    dirs = np.stack([np.zeros_like(up), np.sqrt(np.maximum(1 - up * up, 0)),
+                     up], 1).astype(np.float32)
+
+    wrong = []
+    for count in (2, 5, 8, 17):
+        w = World()
+        w.mode = 'BANDS'
+        w.band_count = count
+        col = SKY.bands(w, dirs)
+        levels = np.unique(np.round(col[:, 2].astype(np.float64), 6))
+        # `count` steps between horizon and zenith, and the zenith itself is
+        # the last sample's own step, so `count` distinct values is right
+        if len(levels) != count:
+            wrong.append(f'{count} bands -> {len(levels)} levels')
+    check('a banded sky has exactly as many levels as it was asked for',
+          not wrong, '; '.join(wrong))
+
+    w = World()
+    w.mode = 'GRADIENT'
+    smooth = SKY.gradient(w, dirs)
+    w.mode = 'BANDS'
+    w.band_count = 6
+    stepped = SKY.bands(w, dirs)
+    check('banding is a quantisation of the same gradient, not another one',
+          float(np.abs(smooth - stepped).max()) < 1.0 / 6.0 + 1e-3,
+          f'max gap {float(np.abs(smooth - stepped).max()):.4f}')
+
+    w.band_softness = 1.0
+    soft = SKY.bands(w, dirs)
+    check('softness rounds the step edges off',
+          len(np.unique(np.round(soft[:, 2].astype(np.float64), 6))) > 6)
+
+
+def test_starfield_goes_all_the_way_round():
+    """Starfield stars must appear below the horizon as well as above it.
+
+    Bryce's star layer fades out toward the ground because it sits under a sky
+    dome. This mode has no dome, so a star at -60 degrees is as valid as one
+    at +60, and getting that wrong would be invisible until someone pointed a
+    camera up from below.
+    """
+    from ..core import sky as SKY
+    from ..core.scene import World
+
+    rng = np.random.default_rng(7)
+    d = rng.normal(size=(40000, 3)).astype(np.float32)
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+
+    w = World()
+    w.mode = 'STARFIELD'
+    w.color = (0.0, 0.0, 0.0)
+    w.star_brightness = 1.0
+    col = SKY.starfield(w, d)
+    lit = col.max(axis=1) > 0.02
+    up = float(lit[d[:, 2] > 0.3].mean())
+    down = float(lit[d[:, 2] < -0.3].mean())
+    check('stars appear above the horizon', up > 0.001, f'{up:.4f}')
+    check('and just as many below it', down > 0.001 and
+          abs(up - down) < max(up, down) * 0.5, f'up {up:.4f} down {down:.4f}')
+
+    w.star_brightness = 0.0
+    dark = SKY.starfield(w, d)
+    check('zero brightness means no stars at all',
+          float(np.abs(dark).max()) < 1e-6)
+
+    w.star_brightness = 1.0
+    w.nebula = 2.0
+    neb = SKY.starfield(w, d)
+    check('a nebula adds light without removing the stars',
+          float(neb.mean()) > float(col.mean()) and
+          float(neb.max()) >= float(col.max()) - 1e-4)
+
+
+def test_sheen_bump_and_refraction():
+    """The three new master-shader inputs, and that their defaults change nothing.
+
+    The defaults matter as much as the effects: these sockets were added to a
+    shader that already had thirty-three, and anything that shifted an existing
+    render by a hair would have broken every scene made before them.
+    """
+    st = base_settings(140, 105, backface_cull=False)
+    st.raytrace = True
+    st.ray_refraction = True
+    st.ray_reflection = True
+
+    def graph(extra=None, opacity=1.0, bumped=False):
+        g = _master(**{'Opacity': opacity})
+        if bumped:
+            g['nodes']['n'] = _wnode(
+                'n', 'ShaderNodeTexNoise', {'noise_dimensions': '3D'},
+                [_sk('Vector', 'VECTOR', [0, 0, 0]), _sk('Scale', 'VALUE', 14.0),
+                 _sk('Detail', 'VALUE', 3.0), _sk('Roughness', 'VALUE', 0.5),
+                 _sk('Distortion', 'VALUE', 0.0)],
+                [{'name': 'Fac', 'type': 'VALUE'},
+                 {'name': 'Color', 'type': 'RGBA'}])
+            g['nodes']['bp'] = _wnode(
+                'bp', 'ShaderNodeBump', {},
+                [_sk('Strength', 'VALUE', 1.0), _sk('Distance', 'VALUE', 1.0),
+                 _sk('Height', 'VALUE', 0.0, ['n', 0]),
+                 _sk('Normal', 'VECTOR', [0, 0, 0])],
+                [{'name': 'Normal', 'type': 'VECTOR'}])
+            g['nodes']['h']['inputs'].append(
+                _sk('Normal', 'VECTOR', [0, 0, 0], ['bp', 0]))
+        for name, value in (extra or {}).items():
+            kind = 'RGBA' if isinstance(value, (list, tuple)) else 'VALUE'
+            g['nodes']['h']['inputs'].append(_sk(name, kind, value))
+        return g
+
+    def shot(g):
+        sc = demo_scene(st)
+        for m in sc.materials:
+            m.graph = g
+        return R.render(sc, st)
+
+    # 1. the defaults are inert
+    plain = shot(graph())
+    defaults = shot(graph({'Sheen': 0.0, 'Sheen Color': [1, 1, 1, 1],
+                           'Sheen Roughness': 0.3, 'Bump Strength': 1.0,
+                           'Refraction Amount': 1.0}))
+    check('the new inputs at their defaults change nothing at all',
+          float(np.abs(plain - defaults).max()) == 0.0,
+          f'max delta {float(np.abs(plain - defaults).max()):.8f}')
+
+    # 2. sheen is a lit term at the silhouette, not a flat add
+    sheened = shot(graph({'Sheen': 2.5, 'Sheen Roughness': 0.1}))
+    delta = np.abs(sheened - plain)[..., :3].mean(axis=2)
+    check('Sheen changes the render', float(delta.mean()) > 1e-4,
+          f'delta {float(delta.mean()):.6f}')
+    check('Sheen is concentrated rather than uniform',
+          float(delta.max()) > 4.0 * float(delta.mean()),
+          f'peak {float(delta.max()):.4f} vs mean {float(delta.mean()):.4f}')
+    broad = shot(graph({'Sheen': 2.5, 'Sheen Roughness': 1.0}))
+    check('Sheen Roughness widens the band',
+          float(np.abs(broad - sheened).mean()) > 1e-4)
+    tinted = shot(graph({'Sheen': 2.5, 'Sheen Roughness': 0.1,
+                         'Sheen Color': [1.0, 0.0, 0.0, 1.0]}))
+    check('Sheen Color tints it', float(np.abs(tinted - sheened).mean()) > 1e-4)
+    check('sheen stays finite', bool(np.isfinite(sheened).all()))
+
+    # 3. an unlit surface gets no sheen, because sheen needs a light
+    st_dark = base_settings(80, 60, backface_cull=False)
+    sc = demo_scene(st_dark)
+    sc.lights = []
+    for m in sc.materials:
+        m.graph = graph({'Sheen': 3.0})
+    lit_none = R.render(sc, st_dark)
+    sc2 = demo_scene(st_dark)
+    sc2.lights = []
+    for m in sc2.materials:
+        m.graph = graph()
+    check('sheen needs a light, unlike the rim term',
+          float(np.abs(lit_none - R.render(sc2, st_dark)).max()) < 1e-6)
+
+    # 4. bump strength scales the supplied normal
+    bumped = shot(graph(bumped=True))
+    off = shot(graph({'Bump Strength': 0.0}, bumped=True))
+    hard = shot(graph({'Bump Strength': 3.0}, bumped=True))
+    flat_ = shot(graph())
+    check('Bump Strength 0 puts the normal back where it started',
+          float(np.abs(off - flat_).mean()) < 1e-6,
+          f'delta {float(np.abs(off - flat_).mean()):.8f}')
+    check('Bump Strength 1 leaves the bump as given',
+          float(np.abs(bumped - flat_).mean()) > 1e-4)
+    check('Bump Strength above 1 is not the same as leaving it alone',
+          float(np.abs(hard - bumped).mean()) > 1e-4)
+
+    # and the claim itself -- that the knob scales how far the normal is bent
+    # away from the surface -- measured on the normals rather than the pixels,
+    # where a saturating highlight could hide it. A constant normal is fed in
+    # rather than a bump node, so the only thing varying is the knob.
+    from ..core.nodeeval import GraphEvaluator
+    from ..core.render import closure_to_surface
+
+    def tilted(k):
+        g = _master()
+        g['nodes']['v'] = _wnode(
+            'v', 'ShaderNodeCombineXYZ', {},
+            [_sk('X', 'VALUE', 0.6), _sk('Y', 'VALUE', 0.0),
+             _sk('Z', 'VALUE', 0.8)],
+            [{'name': 'Vector', 'type': 'VECTOR'}])
+        g['nodes']['h']['inputs'].append(
+            _sk('Normal', 'VECTOR', [0, 0, 1], ['v', 0]))
+        g['nodes']['h']['inputs'].append(_sk('Bump Strength', 'VALUE', k))
+        return g
+
+    angles = []
+    for k in (0.0, 0.5, 1.0, 2.0):
+        ctx = _emit_ctx(64)
+        ev = GraphEvaluator(tilted(k), ctx)
+        cl, _ = ev.evaluate_surface()
+        _surf, _model, nrm = closure_to_surface(cl, ctx, st)
+        n = np.asarray(nrm, np.float32)
+        n = n / np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-9)
+        g = np.asarray(ctx.N, np.float32)
+        g = g / np.maximum(np.linalg.norm(g, axis=1, keepdims=True), 1e-9)
+        angles.append(float(np.arccos(np.clip((n * g).sum(1), -1, 1)).mean()))
+    check('Bump Strength 0 leaves the geometric normal untouched',
+          angles[0] < 1e-5, f'{angles[0]:.6f} rad')
+    check('Bump Strength scales the angle the normal is bent through',
+          angles[1] < angles[2] < angles[3],
+          str([round(a, 5) for a in angles]))
+
+    # 5. refraction amount gates the ray traced through the surface
+    glass = shot(graph(opacity=0.25))
+    none = shot(graph({'Refraction Amount': 0.0}, opacity=0.25))
+    half = shot(graph({'Refraction Amount': 0.5}, opacity=0.25))
+    check('Refraction Amount 0 stops the surface refracting',
+          float(np.abs(none - glass).mean()) > 1e-3)
+    check('and 0.5 lands between the two',
+          float(np.abs(half - glass).mean()) < float(np.abs(none - glass).mean()))
+    check('refraction stays finite', bool(np.isfinite(none).all()))
 
 
 def test_no_setting_lies():
@@ -3311,6 +3885,88 @@ void main() {
           f'max difference {e:.6f}')
     check('and agrees about which pixels are covered',
           np.array_equal(out[:, 3].reshape(h, w) > 0.5, cov))
+
+
+def test_spot_cones_match_a_brute_force_march():
+    """The analytic cone must agree with marching the whole ray.
+
+    The fast path solves a quadratic for where the view ray enters and leaves
+    the cone; the reference walks the entire ray in small steps and tests
+    containment at each one. They share no code, so agreement means the
+    intersection maths is right rather than that one bug is in both.
+    """
+    from ..core import cones, mathx as MX
+    from ..core.scene import Light
+
+    n = 3000
+    rng = np.random.default_rng(7)
+    lt = Light(type='SPOT', position=(0.0, 3.0, 0.0), direction=(0.0, -1.0, 0.0),
+               spot_size=0.9, spot_blend=0.2, volumetric=1.0)
+    origin = np.array([[0.0, 1.0, 6.0]], np.float32)
+    d = rng.normal(size=(n, 3)).astype(np.float32)
+    d[:, 2] = -np.abs(d[:, 2]) - 0.3
+    rays = MX.normalize(d)
+    far = np.full(n, np.inf, np.float32)
+
+    fast = cones.spot_cone(origin, rays, far, lt, samples=1024)
+    ref = cones.reference(origin, rays, far, lt, samples=4096)
+    check('the cone maths produces no NaNs', bool(np.all(np.isfinite(fast))))
+
+    lit = ref > 1e-5
+    agree = float(((fast > 1e-6) == lit).mean())
+    check('it agrees which rays are inside the beam', agree > 0.99,
+          f'{100 * agree:.1f}%')
+    if lit.any():
+        rel = np.abs(fast[lit] - ref[lit]) / np.maximum(ref[lit], 1e-6)
+        check('and how much each one scatters', float(np.median(rel)) < 5e-3,
+              f'median relative error {float(np.median(rel)):.5f}')
+
+    # geometry must cut the beam short rather than shine through it
+    near = np.full(n, 4.0, np.float32)
+    cut = cones.spot_cone(origin, rays, near, lt, samples=1024)
+    check('a surface never makes the beam brighter',
+          bool(np.all(cut <= fast + 1e-6)))
+    check('and does dim it somewhere', bool(np.any(cut < fast - 1e-5)))
+
+    # a ray pointing away from the light gets nothing at all
+    away = MX.normalize(np.tile(np.array([[0, 0, 1.0]], np.float32), (16, 1)))
+    check('rays facing away from the cone stay black',
+          float(cones.spot_cone(origin, away, np.full(16, np.inf, np.float32),
+                                lt).max()) == 0.0)
+
+    # only spot lights have cones
+    for kind in ('POINT', 'SUN', 'AREA'):
+        other = Light(type=kind, position=(0, 3, 0), volumetric=1.0)
+        check(f'a {kind.lower()} light casts no cone',
+              float(cones.spot_cone(origin, rays, far, other).max()) == 0.0)
+
+
+def test_spot_cones_only_add_light():
+    """The pass must brighten, never darken, and do nothing when switched off."""
+    from ..core.scene import Light
+
+    st = base_settings(160, 120)
+    sc = demo_scene(st)
+    sc.lights.append(Light(type='SPOT', position=(0, 4, 2),
+                           direction=(0, -1, -0.3), color=(1.0, 0.9, 0.7),
+                           energy=800.0, spot_size=0.8, spot_blend=0.25,
+                           volumetric=1.0))
+    st.spot_cones = False
+    off = R.render(sc, st)
+    st.spot_cones = True
+    on = R.render(sc, st)
+
+    check('the frame is still finite', bool(np.all(np.isfinite(on))))
+    d = on[:, :, :3] - off[:, :, :3]
+    check('cones only ever add light', float(d.min()) >= -1e-6,
+          f'darkest change {float(d.min()):.6f}')
+    check('and brighten some of the frame', int((d.sum(axis=2) > 1e-4).sum()) > 50,
+          str(int((d.sum(axis=2) > 1e-4).sum())))
+
+    # a light with no volumetric value contributes nothing
+    sc.lights[-1].volumetric = 0.0
+    check('a spot with no volumetric value draws no cone',
+          np.array_equal(R.render(sc, st), off))
 
 
 def test_debug_passes():

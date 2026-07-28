@@ -159,7 +159,8 @@ class Camera:
 
 @dataclass
 class World:
-    mode: str = 'NODES'               # NODES|SOLID|GRADIENT|BRYCE|PHYSICAL|HDRI
+    # NODES|SOLID|GRADIENT|BANDS|STARFIELD|BRYCE|PHYSICAL|HDRI
+    mode: str = 'NODES'
     strength: float = 1.0
     rotation: float = 0.0
     color: tuple = (0.05, 0.05, 0.06)
@@ -245,6 +246,16 @@ class World:
     stars: bool = False
     star_density: float = 0.5
     star_brightness: float = 0.8
+    # starfield mode: stars all the way round, with no dome under them
+    star_size: float = 0.35
+    star_twinkle: float = 0.0
+    nebula: float = 0.0
+    nebula_color: tuple = (0.35, 0.15, 0.55)
+    nebula_scale: float = 2.0
+    nebula_detail: int = 5
+    # banded gradient
+    band_count: int = 8
+    band_softness: float = 0.0
     # physical
     turbidity: float = 2.5
     ground_albedo: float = 0.3

@@ -216,9 +216,9 @@ def fill(gbuf, sx, sy, iw, z, bw, src, cull='NONE', frags=None, flat_depth=None,
 
     live = np.abs(area) > 1e-9
     if cull == 'BACK':
-        live &= area < 0.0          # Blender/OpenGL CCW front faces, y-up screen
+        live &= area > 0.0          # CCW front faces, y-up screen. See below.
     elif cull == 'FRONT':
-        live &= area > 0.0
+        live &= area < 0.0
 
     bxmin = np.maximum(np.floor(np.minimum(np.minimum(x0, x1), x2)).astype(np.int32), 0)
     bxmax = np.minimum(np.ceil(np.maximum(np.maximum(x0, x1), x2)).astype(np.int32), W - 1)
@@ -494,9 +494,9 @@ def fill_batched(gbuf, sx, sy, iw, z, bw, src, cull='NONE', frags=None,
 
     live = np.abs(area) > 1e-9
     if cull == 'BACK':
-        live &= area < 0.0
-    elif cull == 'FRONT':
         live &= area > 0.0
+    elif cull == 'FRONT':
+        live &= area < 0.0
 
     bxmin = np.maximum(np.floor(np.minimum(np.minimum(x0, x1), x2)), 0).astype(np.int64)
     bxmax = np.minimum(np.ceil(np.maximum(np.maximum(x0, x1), x2)), W - 1).astype(np.int64)

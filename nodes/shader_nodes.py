@@ -101,6 +101,29 @@ SOCKET_DOCS = {
                     "curve. Below 1 it thins the edges for holograms; above the "
                     "centre opacity it thickens them, which is how glass reads",
     'Backface Color': "Colour used where a surface faces away from the camera",
+    'Vertex Color': "Colour carried on the mesh's own vertices. Leave it "
+                    "unlinked and set Vertex Color Mix above zero to use the "
+                    "active colour attribute directly -- which is how the "
+                    "packages that had this worked, since a vertex colour was "
+                    "a property of the model rather than something you routed",
+    'Sheen': "A velvet lobe added on top of whichever model is chosen: light "
+             "scattered back toward the viewer at grazing angles, which is "
+             "what makes velvet, suede and dusty cloth bright at their edges "
+             "and dark face-on",
+    'Sheen Color': "Colour of the sheen lobe. Real velvet's sheen is close to "
+                   "white however deeply the pile is dyed",
+    'Sheen Roughness': "Width of the sheen band. 0 confines it to the "
+                       "silhouette; 1 spreads it across the whole surface",
+    'Bump Strength': "Scales how far the Normal input is allowed to bend the "
+                     "shading normal away from the surface. 0 ignores the bump "
+                     "entirely, 1 uses it as given, above 1 exaggerates it",
+    'Refraction Amount': "How much of the ray traced *through* a transparent "
+                         "surface is used. 1 is glass; lower values keep what "
+                         "is behind the surface where it is, which is how a "
+                         "scanline renderer's alpha blend looked",
+    'Vertex Color Mix': "How much the vertex colour replaces Diffuse Color. At "
+                        "1 the mesh's colours are the surface colour outright, "
+                        "which is what the flat-shaded era used them for",
     'Backface Mix': "How strongly Backface Color replaces the normal shading on "
                     "back faces. Useful on single-sided leaves, cloth and cards",
 }
@@ -142,6 +165,9 @@ SOCKET_MODELS = {
     'Rim Light': ALL, 'Rim Amount': ALL, 'Rim Power': ALL,
     'Matcap': ALL, 'Matcap Blend': ALL, 'Reflection Color': ALL,
     'Edge Opacity': ALL, 'Backface Color': ALL, 'Backface Mix': ALL,
+    'Vertex Color': ALL, 'Vertex Color Mix': ALL,
+    'Sheen': ALL, 'Sheen Color': ALL, 'Sheen Roughness': ALL,
+    'Bump Strength': ALL, 'Refraction Amount': ALL,
 }
 
 # measured parameters -- the ones a test verifies against the shading code
@@ -183,20 +209,23 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
 
     RELEVANT = {
         'LAMBERT': {'Diffuse Color', 'Diffuse Level', 'Ambient', 'Opacity',
-                    'Self-Illumination', 'Normal'},
+                    'Self-Illumination', 'Normal', 'Bump Strength'},
         'GOURAUD': None, 'FLAT': None, 'PHONG': None, 'BLINN_PHONG': None,
         'BLINN': None, 'COOK_TORRANCE': None,
         'OREN_NAYAR': {'Diffuse Color', 'Diffuse Level', 'Roughness', 'Ambient',
-                       'Opacity', 'Self-Illumination', 'Normal'},
+                       'Opacity', 'Self-Illumination', 'Normal',
+                       'Bump Strength'},
         'MINNAERT': {'Diffuse Color', 'Diffuse Level', 'Roughness', 'Ambient',
-                     'Opacity', 'Self-Illumination', 'Normal'},
+                     'Opacity', 'Self-Illumination', 'Normal',
+                     'Bump Strength'},
         'WARD': None, 'ANISOTROPIC': None, 'METAL': None, 'STRAUSS': None,
         'MULTI_LAYER': None,
         'TOON': {'Diffuse Color', 'Diffuse Level', 'Specular Color',
                  'Specular Level', 'Toon Size', 'Toon Smooth', 'Ambient',
-                 'Opacity', 'Self-Illumination', 'Normal'},
+                 'Opacity', 'Self-Illumination', 'Normal', 'Bump Strength'},
         'TRANSLUCENT': {'Diffuse Color', 'Diffuse Level', 'Translucency',
-                        'Ambient', 'Opacity', 'Self-Illumination', 'Normal'},
+                        'Ambient', 'Opacity', 'Self-Illumination', 'Normal',
+                        'Bump Strength'},
         'CONSTANT': {'Diffuse Color', 'Opacity', 'Self-Illumination'},
         'WIREFRAME': {'Diffuse Color', 'Opacity'},
     }
@@ -233,6 +262,13 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
         ('NodeSocketFloat', 'Edge Opacity', 1.0),
         ('NodeSocketColor', 'Backface Color', (0.0, 0.0, 0.0, 1.0)),
         ('NodeSocketFloat', 'Backface Mix', 0.0),
+        ('NodeSocketColor', 'Vertex Color', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketFloat', 'Vertex Color Mix', 0.0),
+        ('NodeSocketFloat', 'Sheen', 0.0),
+        ('NodeSocketColor', 'Sheen Color', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketFloat', 'Sheen Roughness', 0.3),
+        ('NodeSocketFloat', 'Bump Strength', 1.0),
+        ('NodeSocketFloat', 'Refraction Amount', 1.0),
     )
 
     def init(self, context):
@@ -268,7 +304,8 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
     ALWAYS = ('Fresnel', 'Fresnel Power', 'Fresnel Color', 'Rim Light',
               'Rim Amount', 'Rim Power', 'Matcap', 'Matcap Blend',
               'Reflection Color', 'Edge Opacity', 'Backface Color',
-              'Backface Mix')
+              'Backface Mix', 'Sheen', 'Sheen Color', 'Sheen Roughness',
+              'Refraction Amount')
 
     def refresh_sockets(self):
         keep = self.RELEVANT.get(self.model)

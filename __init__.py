@@ -11,7 +11,7 @@ tested without Blender at all:
 bl_info = {
     "name": "Halcyon Render Engine",
     "author": "Built by Claude with help from Mr. Emotiman",
-    "version": (1, 14, 0),
+    "version": (1, 17, 1),
     "blender": (5, 1, 0),
     "location": "Render Properties > Render Engine > Halcyon",
     "description": "Scanline/raytrace hybrid engine reproducing mid-to-late "
@@ -26,10 +26,10 @@ _MODULES = ()
 
 
 def _import_modules():
-    from . import (compat, convert, engine, export, properties, selftest,
-                   templates, ui)
+    from . import (compat, convert, engine, export, objects, properties,
+                   selftest, templates, ui)
     from .nodes import shader_nodes
-    return (properties, shader_nodes, convert, templates, engine,
+    return (properties, shader_nodes, convert, templates, objects, engine,
             selftest, ui)
 
 

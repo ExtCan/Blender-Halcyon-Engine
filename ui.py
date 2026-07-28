@@ -329,6 +329,32 @@ class HALCYON_PT_lighting(HalcyonPanel, Panel):
         col.prop(hs, 'light_falloff_default')
 
 
+class HALCYON_PT_spot_cones(HalcyonPanel, Panel):
+    bl_label = "Spot Cones"
+    bl_parent_id = "HALCYON_PT_lighting"
+    bl_context = "render"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw_header(self, context):
+        self.layout.prop(context.scene.halcyon, 'spot_cones', text="")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        hs = context.scene.halcyon
+        col = layout.column()
+        col.active = hs.spot_cones
+        col.prop(hs, 'spot_cone_density')
+        col.prop(hs, 'spot_cone_samples')
+        col.prop(hs, 'spot_cone_falloff')
+        col.prop(hs, 'spot_cone_reach')
+        note = col.column(align=True)
+        note.active = False
+        note.scale_y = 0.8
+        note.label(text="Each spot light's own Volumetric value", icon='INFO')
+        note.label(text="decides whether it has a beam, and how strong.")
+
+
 class HALCYON_PT_shadows(HalcyonPanel, Panel):
     bl_label = "Shadows"
     bl_parent_id = 'HALCYON_PT_lighting'
@@ -1258,7 +1284,7 @@ class HALCYON_PT_world(HalcyonPanel, Panel):
         m = hs.mode
         if m == 'SOLID':
             col.prop(hs, 'color')
-        elif m in ('GRADIENT', 'BRYCE'):
+        elif m in ('GRADIENT', 'BANDS', 'BRYCE'):
             col.prop(hs, 'horizon')
             if m == 'BRYCE':
                 col.prop(hs, 'use_sky_mid')
@@ -1268,9 +1294,27 @@ class HALCYON_PT_world(HalcyonPanel, Panel):
                 sub.prop(hs, 'sky_mid_height')
             col.prop(hs, 'zenith')
             col.prop(hs, 'gradient_falloff')
-            if m == 'GRADIENT':
+            if m in ('GRADIENT', 'BANDS'):
                 col.prop(hs, 'blend_mode')
                 col.prop(hs, 'horizon_height')
+            if m == 'BANDS':
+                col.separator()
+                col.prop(hs, 'band_count')
+                col.prop(hs, 'band_softness')
+        elif m == 'STARFIELD':
+            col.prop(hs, 'color', text="Space")
+            col.separator()
+            col.prop(hs, 'star_density')
+            col.prop(hs, 'star_brightness')
+            col.prop(hs, 'star_size')
+            col.prop(hs, 'star_twinkle')
+            col.separator()
+            col.prop(hs, 'nebula')
+            sub = col.column()
+            sub.active = hs.nebula > 0.0
+            sub.prop(hs, 'nebula_color')
+            sub.prop(hs, 'nebula_scale')
+            sub.prop(hs, 'nebula_detail')
         elif m == 'HDRI':
             col.template_ID(hs, 'env_image', open='image.open')
             col.prop(hs, 'env_mapping')
@@ -1280,7 +1324,7 @@ class HALCYON_PT_world(HalcyonPanel, Panel):
             col.prop(hs, 'turbidity')
             col.prop(hs, 'ground_albedo')
 
-        if m in ('GRADIENT', 'BRYCE', 'PHYSICAL'):
+        if m in ('GRADIENT', 'BANDS', 'BRYCE', 'PHYSICAL'):
             col.separator()
             col.prop(hs, 'show_ground')
             sub = col.column()
@@ -1351,7 +1395,8 @@ CLASSES = (
     HALCYON_OT_fix_view_transform, HALCYON_UL_materials,
     HalcyonPreferences,
     HALCYON_PT_presets, HALCYON_PT_sampling, HALCYON_PT_geometry,
-    HALCYON_PT_shading, HALCYON_PT_lighting, HALCYON_PT_shadows, HALCYON_PT_ao,
+    HALCYON_PT_shading, HALCYON_PT_lighting, HALCYON_PT_spot_cones,
+    HALCYON_PT_shadows, HALCYON_PT_ao,
     HALCYON_PT_raytrace, HALCYON_PT_textures, HALCYON_PT_transparency,
     HALCYON_PT_fog, HALCYON_PT_effects, HALCYON_PT_colour, HALCYON_PT_display,
     HALCYON_PT_crt, HALCYON_PT_composite, HALCYON_PT_jpeg,

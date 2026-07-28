@@ -128,6 +128,72 @@ SPECS = [
       (C, 'Color 1', GREY_B), (C, 'Color 2', GREY_A)],
      {'axis': ('enum', 'Z', AXIS, "Axis")},
      [(C, 'Color'), (F, 'Fac')]),
+
+    # ------------------------------------------- the POV-Ray pattern family
+
+    ('Bozo', "Bozo", 'TEXTURE',
+     "POV-Ray's bozo: plain noise under a colour map, optionally displaced by "
+     "turbulence. Half the materials of the era started here",
+     [(V, 'Vector', None), (F, 'Scale', 4.0), (F, 'Turbulence', 0.0),
+      (F, 'Lacunarity', 2.0),
+      (C, 'Color 1', (0.20, 0.35, 0.70, 1.0)),
+      (C, 'Color 2', (1.0, 1.0, 1.0, 1.0))],
+     {'octaves': ('int', 4, 1, 10, "Turbulence Octaves")},
+     [(C, 'Color'), (F, 'Fac')]),
+
+    ('Agate', "Agate", 'TEXTURE',
+     "POV-Ray's agate: a band thrown about by a large turbulence and raised to "
+     "0.77, which is what makes it read as layered stone",
+     [(V, 'Vector', None), (F, 'Scale', 2.0), (F, 'Turbulence', 1.0),
+      (F, 'Bands', 1.1), (F, 'Sharpness', 0.77),
+      (C, 'Color 1', (0.62, 0.40, 0.26, 1.0)),
+      (C, 'Color 2', (0.96, 0.92, 0.84, 1.0))],
+     {'octaves': ('int', 6, 1, 10, "Octaves"),
+      'axis': ('enum', 'Z', AXIS, "Band Axis")},
+     [(C, 'Color'), (F, 'Fac')]),
+
+    ('Leopard', "Leopard", 'TEXTURE',
+     "POV-Ray's leopard: three sines summed and squared, leaving a rounded "
+     "spot per cell. Every animal-print material was this",
+     [(V, 'Vector', None), (F, 'Scale', 3.0), (F, 'Spot', 1.0),
+      (C, 'Color 1', (0.86, 0.68, 0.30, 1.0)),
+      (C, 'Color 2', (0.14, 0.10, 0.06, 1.0))],
+     {}, [(C, 'Color'), (F, 'Fac')]),
+
+    ('Onion', "Onion", 'MESH_UVSPHERE',
+     "POV-Ray's onion: concentric spherical shells around the origin",
+     [(V, 'Vector', None), (F, 'Scale', 3.0), (F, 'Thickness', 1.0),
+      (F, 'Sharpness', 1.0),
+      (C, 'Color 1', (0.90, 0.86, 0.70, 1.0)),
+      (C, 'Color 2', (0.55, 0.42, 0.22, 1.0))],
+     {}, [(C, 'Color'), (F, 'Fac')]),
+
+    ('Bumps', "Bumps", 'MOD_SMOOTH',
+     "POV-Ray's bumps: smooth noise read as a height field. Feed Fac to a Bump "
+     "node, or to the shader's Displacement",
+     [(V, 'Vector', None), (F, 'Scale', 3.0), (F, 'Roundness', 1.0),
+      (F, 'Lacunarity', 2.0), (F, 'Gain', 0.5),
+      (C, 'Color 1', GREY_B), (C, 'Color 2', GREY_A)],
+     {'octaves': ('int', 1, 1, 8, "Octaves")},
+     [(C, 'Color'), (F, 'Fac')]),
+
+    ('Wrinkles', "Wrinkles", 'MOD_CLOTH',
+     "POV-Ray's wrinkles: folded noise summed at halving amplitude, creasing "
+     "wherever an octave crosses zero. Crumpled paper and foil",
+     [(V, 'Vector', None), (F, 'Scale', 4.0), (F, 'Lacunarity', 2.0),
+      (F, 'Crease', 1.0), (C, 'Color 1', GREY_B), (C, 'Color 2', GREY_A)],
+     {'octaves': ('int', 8, 1, 12, "Octaves")},
+     [(C, 'Color'), (F, 'Fac')]),
+
+    ('Brick', "Brick", 'MOD_BUILD',
+     "Running-bond brickwork with mortar courses, bevelled edges and a "
+     "per-brick id so no two bricks need be the same colour",
+     [(V, 'Vector', None), (F, 'Scale', 1.0), (F, 'Width', 0.25),
+      (F, 'Height', 0.125), (F, 'Mortar', 0.05), (F, 'Offset', 0.5),
+      (F, 'Bevel', 0.08), (F, 'Variation', 0.25),
+      (C, 'Brick Color', (0.55, 0.24, 0.17, 1.0)),
+      (C, 'Mortar Color', (0.78, 0.76, 0.72, 1.0))],
+     {}, [(C, 'Color'), (F, 'Fac'), (F, 'Brick ID')]),
 ]
 
 

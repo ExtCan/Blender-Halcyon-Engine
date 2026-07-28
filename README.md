@@ -9,7 +9,7 @@ mid-to-late 1990s home-computer 3D software.
 Not a filter over a modern render. A scanline z-buffer rasteriser with optional
 ray tracing, the reflectance models those packages actually shipped, real
 framebuffer quantisation, and a genuine GLSL/HLSL compiler for the coded-shader
-nodes. 24,000 lines of Python and NumPy, no compiled dependencies.
+nodes. 29,000 lines of Python and NumPy, no compiled dependencies.
 
 ![contact sheet](docs/halcyon_contact_sheet.png)
 
@@ -74,7 +74,7 @@ selecting Flat evaluates once per face. That is where the banding and the
 faceting genuinely come from, and it is why they look right instead of merely
 blurry.
 
-**106 node types** are evaluated, including the full Principled BSDF,
+**113 node types** are evaluated, including the full Principled BSDF,
 node groups (recursively), muted nodes, reroutes, all the texture and colour
 nodes, and every Math and Vector Math operation. Nodes the engine doesn't know
 pass their first matching input through and are reported as a warning rather
@@ -92,19 +92,41 @@ Infinite Ground.
 
 **Painter's Algorithm** alongside the z-buffer, comparing whole polygons rather
 than fragments, with the sorting errors that implies. **Light linking** per lamp
-by collection. **Fresnel, rim light, matcap, reflection tint, edge opacity and
-backface override** on the master shader, all applied after the reflectance model
-so they behave the same on every one.
+by collection. **Fresnel, rim light, sheen, matcap, reflection tint, edge
+opacity and backface override** on the master shader, all applied outside the
+reflectance model so they behave the same on every one — with **Bump Strength**
+scaling how far the Normal input may bend the shading normal, and **Refraction
+Amount** gating how much of the ray traced through a transparent surface is
+used. Sheen is the one that still needs a light: it is a velvet lobe, not the
+rim cheat.
 
 **Material conversion.** Three buttons in the Material panel convert the active
 material, everything on the selected objects, or the whole scene onto the
 Halcyon Shader — relinking existing textures rather than discarding them, and
 choosing the reflectance model from what the source shader actually was.
 
-**13 procedural texture nodes** of the kind these packages shipped with —
+**20 procedural texture nodes** of the kind these packages shipped with —
 Marble, Wood, Granite, Dents, Crackle, Plasma, Ripples, Starfield, Weave,
-Scratches, Tiles and Spiral. Solid textures, evaluated in 3D, under
+Scratches, Tiles and Spiral, plus the POV-Ray family: Bozo, Agate, Leopard,
+Onion, Bumps, Wrinkles and Brick. Solid textures, evaluated in 3D, under
 *Add > Halcyon > Halcyon Textures*. Plasma and Ripples animate.
+
+Each is written from its published definition rather than from something that
+looks similar. Agate's 0.77 exponent is the whole character of that pattern;
+leopard really is three sines summed and squared.
+
+**Period objects in the Add menu.** *Add > Halcyon*, in the 3D view: the **Utah
+teapot**, the **Cornell box** at its published millimetre measurements with an
+area lamp already placed at the ceiling panel, the **Newell teaset**, and a
+**checker ground plane** built from real alternating faces rather than a
+texture. All generated, so resolution is a knob rather than a decimation, and
+all arriving with Halcyon materials on them.
+
+The teapot's rotational parts are swept from its own profile with the quarter
+circle constant Newell used — 0.56, not the 0.5523 that approximates one, which
+is why the Utah teapot has always been very slightly out of round. Its handle
+and spout are swept to the published silhouette rather than lifted from the
+1975 control-point file; that distinction is in `core/geometry.py` too.
 
 **Coded shader nodes.** A real compiler — preprocessor, recursive-descent
 parser, type inference, and NumPy code generation with SIMT execution masks.
@@ -130,14 +152,17 @@ That gives you a node with **Tint** and **Rim Power** sockets and a **Color**
 output. Edit the source, press Compile, and the sockets rebuild while keeping
 every link that still has somewhere to go.
 
-**Six sky modes** — node tree, solid, gradient, Preetham physical sky, HDRI with
+**Eight sky modes** — node tree, solid, gradient, **banded gradient** (the same
+blend cut into the handful of flat steps a 256-colour palette could actually
+spare for a sky), **starfield** (a backdrop, stars all the way round with no
+dome under them, and an optional nebula), Preetham physical sky, HDRI with
 rotation and tint, and a full **Bryce atmosphere**: sky dome, sun corona, haze
 that warms toward the sun, separate ground fog, a wind-streaked stratus deck, a
 self-shadowed cumulus deck built from turbulence rather than fBm (which is where
 the cauliflower edges come from), plus a rainbow at the correct 42 degrees and
 stars.
 
-**52 presets** across six categories — a Default that resets everything, then
+**69 presets** across six categories — a Default that resets everything, then
 3D software (Infini-D, Ray Dream, StudioPro, 3D Studio R4 and MAX R2, trueSpace,
 LightWave, Imagine, POV-Ray 2.2 and 3.1, Bryce, ElectricImage, Softimage|3D,
 Alias PowerAnimator, Wavefront, CINEMA 4D, Real 3D, Vistapro, Animation:Master,
@@ -145,13 +170,17 @@ Vue), home computers (VGA Mode 13h, Mac 8-bit and 1-bit, Windows 3.1 and 95,
 EGA, CGA, Hercules, Amiga OCS and AGA, Atari ST, PC-98, X68000, SVGA, Quake
 software), consoles (PlayStation and its high-res mode, Saturn, N64, Voodoo,
 Dreamcast, 3DO, Jaguar), broadcast (Video Toaster, PAL, VHS, S-Video) and early
-web (GIF, JPEG, PNG-8, CD-ROM FMV).
+web (GIF, JPEG, PNG-8, CD-ROM FMV) — with handhelds and later consoles (Game
+Boy, Virtual Boy, Game Gear, SNES, Neo Geo, 32X), more home computers
+(Commodore 64, ZX Spectrum, Apple IIGS, MSX2, NeXTSTEP, SGI Indy) and the
+software renderers (Doom, RenderMan, Turbo Silver, Lightscape, AutoShade)
+alongside them.
 
 Applying a preset resets everything first, so presets never accumulate — machine
 settings like thread count and Transparent Film are preserved. **Add On Top**
 layers one deliberately.
 
-**153 settings**, all exposed. A test fails if any of them is drawn in the UI without something reading it.
+**159 settings**, all exposed. A test fails if any of them is drawn in the UI without something reading it.
 
 ---
 
@@ -238,7 +267,8 @@ renderer (geometry landing where independently projected, shadows by both
 methods agreeing, every shading model distinct, all six debug passes, affine
 texture warp, vertex snapping, A-buffer transparency, ray-traced reflection,
 node-graph evaluation including group recursion and unknown-node fallback,
-palette colour counts, the full post chain, and all 52 presets rendering).
+palette colour counts, the full post chain, the generated period objects,
+and all 69 presets rendering).
 
 Set `HALCYON_DEBUG=1` to make node evaluation raise instead of falling back
 silently — useful when a material isn't doing what you expect.
@@ -484,7 +514,7 @@ Two stages remain, and they are where the time actually is:
 | Rasterisation to a G-buffer | moderate | there is already a bit-identical CPU reference to diff against |
 | The 18 shading models | moderate | mechanical translation of formulas already written down |
 | Coded-shader node | *easier* | it is already GLSL; today it compiles **to** NumPy, which stops being necessary |
-| Node evaluator | hard | 106 node types would each need a GLSL emitter |
+| Node evaluator | hard | 113 node types would each need a GLSL emitter |
 | A-buffer transparency | hard | needs depth peeling or per-pixel linked lists |
 | Error-diffusion dither | does not port | inherently serial, and stays on the CPU |
 
@@ -500,24 +530,25 @@ halcyon/
   core/          bpy-free renderer
     mathx.py       vector maths on (N,3) arrays
     scene.py       dataclasses the renderer consumes
-    settings.py    RenderSettings — the 153 knobs
+    settings.py    RenderSettings — the 159 knobs
     raster.py      clipping, z-buffer, A-buffer fragment lists
     bvh.py         median-split BVH for rays
     texture.py     sampling, mips, N64 three-point filter
     shading.py     the 18 reflectance models
     lights.py      attenuation, shadow maps, PCF, ray shadows
-    nodeeval.py    106 node types
-    patterns.py    12 solid procedural textures
+    nodeeval.py    113 node types
+    patterns.py    19 solid procedural textures
     render.py      the orchestrator
     post.py        glow, palettes, dither, NTSC, CRT, JPEG
     palette.py     median cut, octree, k-means, VGA/Mac/EGA/HAM
     dither.py      Bayer, Floyd-Steinberg, Stucki, Atkinson, …
+    geometry.py    the Add-menu objects, generated
   shaders/       bpy-free GLSL/HLSL compiler
     lexer.py parser.py gtypes.py builtins.py codegen.py compiler.py
   nodes/         Blender node classes
-  presets/       the 52 preset definitions
+  presets/       the 69 preset definitions
   tests/         headless test suite + bpy stub
-  compat.py properties.py export.py engine.py ui.py
+  compat.py properties.py export.py engine.py ui.py objects.py
 ```
 
 ---

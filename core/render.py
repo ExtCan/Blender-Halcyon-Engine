@@ -244,13 +244,27 @@ def closure_to_surface(cl, ctx, settings, material=None):
                 ('reflect_color', 'reflect_color', 'c'),
                 ('edge_opacity', 'edge_opacity', 'v'),
                 ('backface_color', 'backface_color', 'c'),
-                ('backface_mix', 'backface_mix', 'v')):
+                ('backface_mix', 'backface_mix', 'v'),
+                ('sheen', 'sheen', 'v'), ('sheen_color', 'sheen_color', 'c'),
+                ('sheen_roughness', 'sheen_roughness', 'v'),
+                ('refraction', 'refraction', 'v')):
             if p.get(key) is not None:
                 setattr(surf, attr, to_color(p[key], n)[:, :3] if kind == 'c'
                         else to_value(p[key], n))
         model = p.get('model', model)
         if p.get('normal') is not None:
             normal = p['normal']
+            # Bump Strength scales how far the supplied normal is allowed to
+            # bend away from the surface it sits on. Done here rather than in
+            # the node graph because the geometric normal is only known once
+            # the closure has been collapsed against a fragment.
+            bs = p.get('bump_strength')
+            if bs is not None:
+                k = to_value(bs, n)[:, None]
+                if np.any(np.abs(k - 1.0) > 1e-4):
+                    geo = M.normalize(np.asarray(ctx.N, np.float32))
+                    normal = geo + (M.normalize(np.asarray(normal, np.float32))
+                                    - geo) * k
     else:
         w = np.maximum(diff_w, 1e-6)
         if np.any(diff_w > 1e-6):
@@ -312,6 +326,13 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
     if settings.ambient_occlusion and bvh is not None:
         out *= ambient_occlusion(ctx.P, N, bvh, settings, rng)[:, None]
 
+    # the sheen lobe's falloff, computed once rather than per light
+    sheen_exp = None
+    if np.any(surf.sheen > 1e-4):
+        r = np.clip(surf.sheen_roughness, 0.0, 1.0)
+        sheen_exp = 1.0 + (1.0 - r) * 15.0
+        edge_vn = np.clip(1.0 - np.abs(M.dot(N, V)), 0.0, 1.0)
+
     lights = active_lights if active_lights is not None else \
         LI.select_lights(scene.lights, settings)
     clamp = float(settings.light_clamp)
@@ -344,6 +365,14 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
             if not settings.specular_in_gamma:
                 sp = np.power(np.maximum(sp, 0.0), 2.2)
             contrib += sp * surf.specular_level[:, None] * rad
+            if sheen_exp is not None:
+                # velvet: light scattered back at grazing angles, so the lobe
+                # lives at the silhouette and vanishes face-on. It still needs
+                # a light -- unlike the rim term, which is the cheat version of
+                # the same look and needs none.
+                sh = (np.power(edge_vn, sheen_exp) *
+                      np.maximum(ndl, 0.0) * surf.sheen)
+                contrib += surf.sheen_color * sh[:, None] * rad
         contrib *= inv_pi
         contrib *= vis[:, None]
         if lit_mask is not None:
@@ -820,7 +849,8 @@ class ShadeJob:
                 bad = (T * T).sum(1) < 1e-9
                 T = np.where(bad[:, None], M.reflect(-Vw, Nw), T)
                 hit = self.trace(ctx.P[want] - Nw * st.ray_bias, T, ray_depth + 1)
-                k = (1.0 - np.clip(surf.opacity[want], 0.0, 1.0))[:, None]
+                k = ((1.0 - np.clip(surf.opacity[want], 0.0, 1.0)) *
+                     np.clip(surf.refraction[want], 0.0, 1.0))[:, None]
                 rgb[want] = rgb[want] * (1.0 - k) + hit * k * surf.diffuse[want]
         return rgb
 
@@ -1054,6 +1084,8 @@ def render(scene, settings=None, progress=None, band=None):
         img = _background_image(scene, st, rw, rh, vp, eye,
                                 (~covered) & (keep[:, None] if band is not None
                                               else True), textures, ss=ss)
+    _spot_cones(img, scene, st, gbuf, vp, eye, rw, rh)
+
     py, px = np.nonzero(covered)
     if py.size:
         tri_idx = gbuf.tri[py, px]
@@ -1297,6 +1329,60 @@ def _split_by_alpha(scene, mesh, st=None):
     mi = np.clip(mesh.mat_index, 0, see_through.size - 1)
     t = see_through[mi]
     return np.nonzero(~t)[0].astype(np.int32), np.nonzero(t)[0].astype(np.int32)
+
+
+def _spot_cones(img, scene, st, gbuf, vp, eye, w, h):
+    """Add the visible beam of each spot light over the whole frame.
+
+    Unlike the background this runs on every pixel, not just uncovered ones: a
+    beam is in front of whatever it crosses, and stops at it rather than behind
+    it. The depth buffer is what cuts it short.
+    """
+    if not getattr(st, 'spot_cones', False):
+        return
+    lights = [l for l in (scene.lights or ())
+              if str(getattr(l, 'type', '')).upper() == 'SPOT'
+              and float(getattr(l, 'volumetric', 0.0)) > 0.0]
+    if not lights:
+        return
+    from . import cones as CONES
+    with ST.track('spot cones'):
+        inv = np.linalg.inv(vp).astype(np.float32)
+        yy, xx = np.mgrid[0:h, 0:w]
+        nx = (xx.ravel().astype(np.float32) + 0.5) / w * 2.0 - 1.0
+        ny = (yy.ravel().astype(np.float32) + 0.5) / h * 2.0 - 1.0
+        one = np.ones(nx.size, np.float32)
+        world = np.stack([nx, ny, one, one], axis=1) @ inv.T
+        world = world[:, :3] / np.where(np.abs(world[:, 3:4]) < 1e-9, 1e-9,
+                                        world[:, 3:4])
+        dirs = M.normalize(world - eye[None, :])
+
+        depth = gbuf.depth.reshape(-1).astype(np.float32)
+        # the z-buffer holds view depth; the beam needs distance along the ray
+        forward = M.normalize(np.asarray(scene.camera.forward, np.float32)
+                              [None, :])[0] if hasattr(scene.camera, 'forward') \
+            else None
+        if forward is not None:
+            cosang = np.abs(np.einsum('ij,j->i', dirs, forward))
+            dist = np.where(np.isfinite(depth),
+                            depth / np.maximum(cosang, 1e-4), np.inf)
+        else:
+            dist = np.where(np.isfinite(depth), depth, np.inf)
+
+        reach = float(getattr(st, 'spot_cone_reach', 64.0))
+        add = np.zeros((nx.size, 3), np.float32)
+        for light in lights:
+            scatter = CONES.spot_cone(
+                eye, dirs, dist, light,
+                samples=int(getattr(st, 'spot_cone_samples', 12)),
+                density=float(getattr(st, 'spot_cone_density', 1.0))
+                * float(light.volumetric),
+                falloff=float(getattr(st, 'spot_cone_falloff', 2.0)),
+                max_distance=reach)
+            if scatter.any():
+                col = np.asarray(light.color, np.float32)[None, :]
+                add += scatter[:, None] * col * float(light.energy) / np.pi
+        img[:, :, :3] += add.reshape(h, w, 3)
 
 
 def _background_image(scene, st, w, h, vp, eye, uncovered=None,

@@ -263,3 +263,138 @@ def spiral(p, turns=4.0, sharpness=1.0, axis=2, twist=0.0):
     v = np.sin(ang * max(turns, 1e-3) + r * TWO_PI + p[:, ax] * twist)
     v = v * 0.5 + 0.5
     return np.power(np.clip(v, 0.0, 1.0), max(sharpness, 0.01)).astype(np.float32)
+
+
+# ------------------------------------------------- the POV-Ray pattern family
+#
+# These seven are the ones that came in POV-Ray's own pattern list and were
+# copied through 3D Studio's material editor and Bryce's Deep Texture Editor
+# after it. Each is written from the pattern's published definition rather than
+# approximated by something that looks similar, for the same reason the
+# reflectance models are.
+
+
+def bozo(p, turb=0.0, octaves=4, lacunarity=2.0):
+    """POV-Ray's `bozo`: plain value noise, optionally turbulence-displaced.
+
+    The simplest pattern in the box and the one most 1990s materials were built
+    on -- a colour map over noise. With turbulence above zero the point is
+    displaced before it is sampled, which is what turned bozo into clouds.
+    """
+    q = p
+    if turb > 1e-6:
+        d = np.stack([signed_noise(p + 11.3), signed_noise(p + 47.1),
+                      signed_noise(p + 83.7)], axis=1)
+        for i in range(1, int(max(octaves, 1))):
+            f = lacunarity ** i
+            d = d + np.stack([signed_noise((p + 11.3) * f),
+                              signed_noise((p + 47.1) * f),
+                              signed_noise((p + 83.7) * f)], axis=1) / f
+        q = p + d * turb
+    return np.clip(value_noise(q), 0.0, 1.0).astype(np.float32)
+
+
+def agate(p, turb=1.0, octaves=6, bands=1.1, sharpness=0.77, axis=2):
+    """POV-Ray's `agate`: a sine band along one axis, thrown about by a large
+    turbulence and then raised to 0.77.
+
+    POV computes `pow(0.5 * (sin(1.3 * turb + 1.1 * z) + 1), 0.77)`, and that
+    0.77 is the whole character of the pattern -- it pushes the midtones up so
+    the bands read as layered stone rather than as a sine wave.
+    """
+    ax = int(axis) % 3
+    t = turbulence(p, octaves=octaves) * 2.0 - 1.0
+    v = 0.5 * (np.sin(1.3 * t * max(turb, 0.0) +
+                      max(bands, 1e-3) * p[:, ax]) + 1.0)
+    return np.power(np.clip(v, 0.0, 1.0),
+                    max(sharpness, 0.01)).astype(np.float32)
+
+
+def leopard(p, spot=1.0):
+    """POV-Ray's `leopard`: ((sin x + sin y + sin z) / 3) squared.
+
+    Three interfering sines squared, which lands a rounded spot in the middle
+    of every unit cell. It is the pattern every 1990s "animal print" material
+    was actually made of.
+    """
+    s = (np.sin(p[:, 0]) + np.sin(p[:, 1]) + np.sin(p[:, 2])) / 3.0
+    v = s * s
+    return np.power(np.clip(v, 0.0, 1.0), max(spot, 0.01)).astype(np.float32)
+
+
+def onion(p, thickness=1.0, sharpness=1.0):
+    """POV-Ray's `onion`: concentric spherical shells around the origin.
+
+    The value ramps 0 to 1 across each shell, so a colour map over it gives the
+    layers. Thickness scales the shell spacing; sharpness bends the ramp.
+    """
+    r = np.linalg.norm(p, axis=1) / max(thickness, 1e-4)
+    v = r - np.floor(r)
+    return np.power(np.clip(v, 0.0, 1.0),
+                    max(sharpness, 0.01)).astype(np.float32)
+
+
+def bumps(p, roundness=1.0, octaves=1, lacunarity=2.0, gain=0.5):
+    """POV-Ray's `bumps`: smooth noise, read as a height field.
+
+    A single octave by default, because that is what makes a bump rather than a
+    crumple -- add octaves and it becomes terrain. Roundness above 1 flattens
+    the troughs and leaves the peaks proud, which is the difference between a
+    bumped surface and a noisy one.
+    """
+    v = fbm(p, octaves=octaves, lacunarity=lacunarity, gain=gain)
+    v = np.clip(v, 0.0, 1.0)
+    v = v * v * (3.0 - 2.0 * v)                 # smoothstep: rounds the tops
+    return np.power(v, max(roundness, 0.01)).astype(np.float32)
+
+
+def wrinkles(p, octaves=8, lacunarity=2.0, crease=1.0):
+    """POV-Ray's `wrinkles`: folded noise summed at halving amplitude.
+
+    Every octave is |signed noise|, so each one creases where it crosses zero.
+    Ten octaves is what POV used; the creases from the coarse ones are the
+    folds and the fine ones are the paper's grain.
+    """
+    total = np.zeros(p.shape[0], np.float32)
+    amp, norm, freq = 1.0, 0.0, 1.0
+    for _ in range(int(max(octaves, 1))):
+        total += np.abs(signed_noise(p * freq)) * amp
+        norm += amp
+        amp *= 0.5
+        freq *= lacunarity
+    # folded noise averages about a quarter of its range, so the sum is
+    # lifted to reach the top of a colour map rather than sitting in the
+    # bottom third of it. A fixed gain, not a per-batch normalisation: the
+    # renderer shades in chunks, and anything normalised across a chunk would
+    # tile differently in every one of them
+    v = np.clip(1.4 * total / max(norm, 1e-6), 0.0, 1.0)
+    return np.power(v, max(crease, 0.01)).astype(np.float32)
+
+
+def brick(p, width=0.25, height=0.125, mortar=0.05, offset=0.5, bevel=0.12):
+    """Running-bond brickwork with mortar courses.
+
+    POV's `brick` returns 0 in the mortar and 1 in the brick and nothing in
+    between. This keeps that -- `inside` is the hard answer -- but also returns
+    a bevel ramp for shading the edges and a per-brick id, because a wall where
+    every brick is exactly the same colour is the one thing that never looked
+    right.
+    """
+    w = max(float(width), 1e-3)
+    h = max(float(height), 1e-3)
+    row = np.floor(p[:, 2] / h)
+    shift = row * float(offset) * w
+    u = (p[:, 0] + shift) / w
+    col = np.floor(u)
+    fu = u - col
+    fv = p[:, 2] / h - row
+    m = np.clip(float(mortar), 0.0, 0.49)
+    inside = ((fu > m) & (fu < 1.0 - m) & (fv > m) & (fv < 1.0 - m))
+    b = max(float(bevel), 1e-4)
+    du = np.minimum(fu - m, (1.0 - m) - fu) / b
+    dv = np.minimum(fv - m, (1.0 - m) - fv) / b
+    ramp = np.clip(np.minimum(du, dv), 0.0, 1.0)
+    fac = np.where(inside, ramp, 0.0).astype(np.float32)
+    bid = hash3(col.astype(np.int64), row.astype(np.int64),
+                np.zeros(p.shape[0], np.int64))
+    return fac, bid.astype(np.float32), inside

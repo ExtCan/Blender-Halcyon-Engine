@@ -15,6 +15,11 @@ class RenderSettings:
     max_transparent_layers: int = 16
     fast_background: bool = True
     cache_shadows: bool = True
+    spot_cones: bool = False
+    spot_cone_density: float = 1.0
+    spot_cone_samples: int = 12
+    spot_cone_falloff: float = 2.0
+    spot_cone_reach: float = 64.0
     render_device: str = 'CPU'
     gpu_post: bool = False
     use_processes: bool = False

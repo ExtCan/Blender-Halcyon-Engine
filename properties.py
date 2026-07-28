@@ -265,6 +265,19 @@ LABELS = {
 }
 
 DESCRIPTIONS = {
+    'spot_cones': "Draw the visible beam of every spot light whose Volumetric "
+                  "value is above zero. The view ray is intersected with the "
+                  "cone and a few samples are summed along whatever falls "
+                  "inside it -- which is what LightWave and 3D Studio did, "
+                  "rather than integrating a volume",
+    'spot_cone_samples': "Samples along each view ray. Low counts band, and "
+                         "the banding is the period artefact rather than a "
+                         "defect -- 8 to 16 is where those renderers sat",
+    'spot_cone_density': "Overall strength of every cone. Each light's own "
+                         "Volumetric value scales it further",
+    'spot_cone_falloff': "How fast scattering fades with distance from the "
+                         "lamp. 2 is inverse-square; lower carries further",
+    'spot_cone_reach': "How far a beam is drawn when nothing stops it",
     'threads': "How many threads share the shading work. Measured on a 20-core "
                "machine this is neutral at best and about 3% slower at worst, "
                "because NumPy releases the interpreter lock only for large "
@@ -517,6 +530,11 @@ class HalcyonWorldSettings(PropertyGroup):
         ('NODES', "Use Node Tree", "Evaluate the world's own shader nodes"),
         ('SOLID', "Solid Colour", "A single flat background colour"),
         ('GRADIENT', "Gradient", "Horizon to zenith blend, with an optional ground"),
+        ('BANDS', "Banded Gradient",
+         "The same blend cut into flat steps, the way a 256-colour palette "
+         "could only ever render one"),
+        ('STARFIELD', "Starfield",
+         "Space: a flat backdrop, stars all the way round, optional nebula"),
         ('BRYCE', "Bryce Atmosphere",
          "Layered sky: gradient, sun glow, haze band and a fractal cloud deck"),
         ('PHYSICAL', "Physical Sky", "Preetham analytic daylight"),
@@ -660,6 +678,28 @@ class HalcyonWorldSettings(PropertyGroup):
     stars: BoolProperty(name="Stars", default=False)
     star_density: FloatProperty(name="Density", default=0.5, min=0.0, max=1.0)
     star_brightness: FloatProperty(name="Brightness", default=0.8, min=0.0, max=4.0)
+    star_size: FloatProperty(
+        name="Star Size", default=0.35, min=0.01, max=1.0,
+        description="Diameter of a star within its cell. Small values give "
+                    "single-pixel points, which is what these looked like")
+    star_twinkle: FloatProperty(name="Twinkle", default=0.0, min=0.0, max=1.0,
+                                description="Animated flicker, per star")
+    nebula: FloatProperty(
+        name="Nebula", default=0.0, min=0.0, max=4.0,
+        description="Turbulent cloud behind the stars. Zero leaves plain space")
+    nebula_color: _col("Nebula Colour", (0.35, 0.15, 0.55))
+    nebula_scale: FloatProperty(name="Nebula Scale", default=2.0, min=0.05,
+                                max=32.0)
+    nebula_detail: IntProperty(name="Nebula Detail", default=5, min=1, max=10)
+
+    band_count: IntProperty(
+        name="Bands", default=8, min=1, max=64,
+        description="How many flat steps the gradient is cut into. A 256-colour "
+                    "machine could spare about this many for the sky")
+    band_softness: FloatProperty(
+        name="Softness", default=0.0, min=0.0, max=1.0,
+        description="Rounds the step edges. 0 is the hard band the hardware "
+                    "actually gave you")
 
     turbidity: FloatProperty(name="Turbidity", default=2.5, min=1.0, max=10.0,
                              description="Atmospheric haziness. 2 is a clear "

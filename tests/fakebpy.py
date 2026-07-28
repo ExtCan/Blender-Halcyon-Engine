@@ -125,7 +125,13 @@ class _Types(types.ModuleType):
             'remove': classmethod(lambda cls, fn: None)})
 
     def __getattr__(self, name):
-        cls = type(name, (_Base,), {'COMPAT_ENGINES': set()})
+        # menus are appended to by name, so every stubbed class needs the
+        # append/prepend/remove trio -- VIEW3D_MT_add is reached this way
+        cls = type(name, (_Base,), {
+            'COMPAT_ENGINES': set(),
+            'append': classmethod(lambda cls, fn: None),
+            'prepend': classmethod(lambda cls, fn: None),
+            'remove': classmethod(lambda cls, fn: None)})
         setattr(self, name, cls)
         return cls
 
@@ -152,7 +158,26 @@ utils.register_class = register_class
 utils.unregister_class = unregister_class
 
 app = types.SimpleNamespace(version=(5, 2, 0), background=True)
-data = types.SimpleNamespace(texts=types.SimpleNamespace(new=lambda n: Text()))
+class _Collection:
+    def __init__(self, factory=None):
+        self._items = []
+        self._factory = factory or (lambda *a, **k: types.SimpleNamespace())
+
+    def new(self, *a, **k):
+        item = self._factory(*a, **k)
+        self._items.append(item)
+        return item
+
+    def remove(self, item):
+        if item in self._items:
+            self._items.remove(item)
+
+
+data = types.SimpleNamespace(texts=types.SimpleNamespace(new=lambda n: Text()),
+                             materials=_Collection(),
+                             meshes=_Collection(),
+                             objects=_Collection(),
+                             lights=_Collection())
 context = types.SimpleNamespace(engine='HALCYON_RENDER')
 
 bpy = types.ModuleType('bpy')

@@ -1676,8 +1676,24 @@ def n_halcyon_shader(ev, node):
     p = node.get('props', {})
     model = p.get('model', 'PHONG')
     cl = Closure()
+
+    # Vertex colour blends over the diffuse input rather than sitting beside
+    # it. An unlinked socket reads the mesh's own colour attribute, because in
+    # the packages that had this a vertex colour was a property of the model,
+    # not something you routed through a graph.
+    base = ev.input(node, 'Diffuse Color', RGBA)
+    vmix = np.clip(_opt(ev, node, 'Vertex Color Mix', VALUE, 0.0), 0.0, 1.0)
+    if np.any(vmix > 0.0):
+        if ev.has_link(node, 'Vertex Color'):
+            vcol = ev.input(node, 'Vertex Color', RGBA)
+        else:
+            mesh_col = getattr(ev.ctx, 'vcol', None)
+            vcol = (coerce(mesh_col, RGBA, ev.n) if mesh_col is not None
+                    else coerce((1.0, 1.0, 1.0, 1.0), RGBA, ev.n))
+        base = base + (vcol - base) * vmix[:, None]
+
     kw = dict(
-        color=ev.input(node, 'Diffuse Color', RGBA),
+        color=base,
         diffuse_level=ev.input(node, 'Diffuse Level', VALUE),
         spec_color=ev.input(node, 'Specular Color', RGBA),
         spec_level=ev.input(node, 'Specular Level', VALUE),
@@ -1705,6 +1721,11 @@ def n_halcyon_shader(ev, node):
         edge_opacity=_opt(ev, node, 'Edge Opacity', VALUE, 1.0),
         backface_color=_opt(ev, node, 'Backface Color', RGBA, (0, 0, 0)),
         backface_mix=_opt(ev, node, 'Backface Mix', VALUE, 0.0),
+        sheen=_opt(ev, node, 'Sheen', VALUE, 0.0),
+        sheen_color=_opt(ev, node, 'Sheen Color', RGBA, (1, 1, 1)),
+        sheen_roughness=_opt(ev, node, 'Sheen Roughness', VALUE, 0.3),
+        bump_strength=_opt(ev, node, 'Bump Strength', VALUE, 1.0),
+        refraction=_opt(ev, node, 'Refraction Amount', VALUE, 1.0),
         toon_size=ev.input(node, 'Toon Size', VALUE),
         toon_smooth=ev.input(node, 'Toon Smooth', VALUE),
         normal=ev.input(node, 'Normal', VECTOR) if ev.has_link(node, 'Normal') else None,
@@ -2282,6 +2303,70 @@ def n_pat_spiral(ev, node):
     return _pat_out(ev, node, f)
 
 
+def n_pat_bozo(ev, node):
+    p = _pat_vec(ev, node)
+    f = PT.bozo(p, ev.input(node, 'Turbulence', VALUE).mean(),
+                int(_prop(node, 'octaves', 4)),
+                ev.input(node, 'Lacunarity', VALUE).mean())
+    return _pat_out(ev, node, f)
+
+
+def n_pat_agate(ev, node):
+    p = _pat_vec(ev, node)
+    f = PT.agate(p, ev.input(node, 'Turbulence', VALUE).mean(),
+                 int(_prop(node, 'octaves', 6)),
+                 ev.input(node, 'Bands', VALUE).mean(),
+                 ev.input(node, 'Sharpness', VALUE).mean(),
+                 {'X': 0, 'Y': 1, 'Z': 2}.get(_prop(node, 'axis', 'Z'), 2))
+    return _pat_out(ev, node, f)
+
+
+def n_pat_leopard(ev, node):
+    p = _pat_vec(ev, node)
+    f = PT.leopard(p, ev.input(node, 'Spot', VALUE).mean())
+    return _pat_out(ev, node, f)
+
+
+def n_pat_onion(ev, node):
+    p = _pat_vec(ev, node)
+    f = PT.onion(p, ev.input(node, 'Thickness', VALUE).mean(),
+                 ev.input(node, 'Sharpness', VALUE).mean())
+    return _pat_out(ev, node, f)
+
+
+def n_pat_bumps(ev, node):
+    p = _pat_vec(ev, node)
+    f = PT.bumps(p, ev.input(node, 'Roundness', VALUE).mean(),
+                 int(_prop(node, 'octaves', 1)),
+                 ev.input(node, 'Lacunarity', VALUE).mean(),
+                 ev.input(node, 'Gain', VALUE).mean())
+    return _pat_out(ev, node, f)
+
+
+def n_pat_wrinkles(ev, node):
+    p = _pat_vec(ev, node)
+    f = PT.wrinkles(p, int(_prop(node, 'octaves', 8)),
+                    ev.input(node, 'Lacunarity', VALUE).mean(),
+                    ev.input(node, 'Crease', VALUE).mean())
+    return _pat_out(ev, node, f)
+
+
+def n_pat_brick(ev, node):
+    p = _pat_vec(ev, node)
+    f, bid, inside = PT.brick(p, ev.input(node, 'Width', VALUE).mean(),
+                              ev.input(node, 'Height', VALUE).mean(),
+                              ev.input(node, 'Mortar', VALUE).mean(),
+                              ev.input(node, 'Offset', VALUE).mean(),
+                              ev.input(node, 'Bevel', VALUE).mean())
+    brick_c = ev.input(node, 'Brick Color', RGBA)
+    mortar_c = ev.input(node, 'Mortar Color', RGBA)
+    vary = ev.input(node, 'Variation', VALUE)
+    shade = 1.0 + (bid - 0.5) * vary
+    col = np.where(inside[:, None], brick_c * (f * shade)[:, None], mortar_c)
+    col[:, 3] = 1.0
+    return {'Color': col.astype(np.float32), 'Fac': f, 'Brick ID': bid}
+
+
 
 def n_halcyon_matcap_uv(ev, node):
     """Sphere-map coordinates from the view-space normal.
@@ -2422,5 +2507,12 @@ DISPATCH = {
     'HALCYON_ScratchesNode': n_pat_scratches,
     'HALCYON_TilesNode': n_pat_tiles,
     'HALCYON_SpiralNode': n_pat_spiral,
+    'HALCYON_BozoNode': n_pat_bozo,
+    'HALCYON_AgateNode': n_pat_agate,
+    'HALCYON_LeopardNode': n_pat_leopard,
+    'HALCYON_OnionNode': n_pat_onion,
+    'HALCYON_BumpsNode': n_pat_bumps,
+    'HALCYON_WrinklesNode': n_pat_wrinkles,
+    'HALCYON_BrickNode': n_pat_brick,
     'HALCYON_MatcapUVNode': n_halcyon_matcap_uv,
 }

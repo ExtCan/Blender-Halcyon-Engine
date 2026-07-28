@@ -14,7 +14,8 @@ import numpy as np
 from . import mathx as M
 from .patterns import fbm, hash3 as _hash3, turbulence, value_noise as _value_noise
 
-MODES = ('NODES', 'SOLID', 'GRADIENT', 'BRYCE', 'PHYSICAL', 'HDRI')
+MODES = ('NODES', 'SOLID', 'GRADIENT', 'BANDS', 'STARFIELD', 'BRYCE',
+         'PHYSICAL', 'HDRI')
 
 
 def _rotate_z(d, angle):
@@ -76,6 +77,103 @@ def gradient(world, dirs):
         sky = np.where(up[:, None] < height, hor + (gnd - hor) * b, sky)
     return sky.astype(np.float32)
 
+
+
+def bands(world, dirs):
+    """The gradient, quantised into a fixed number of flat steps.
+
+    This is not a stylised gradient -- it is what a gradient *was* on a machine
+    with 256 colours and most of them already spent on the scene. The sky got a
+    handful of entries, so it arrived as visible bands, and the bands moved
+    when the camera did. Reproducing that here rather than leaving it to the
+    palette stage matters, because the palette stage is quantising the whole
+    frame at once: a sky that was already stepped keeps its steps whatever the
+    rest of the image spends its colours on.
+
+    Steps are cut in the blend parameter rather than in the output colour, so
+    the band edges land at the same heights whichever two colours are set.
+    """
+    up = np.clip(dirs[:, 2], -1.0, 1.0)
+    hor = np.asarray(world.horizon, np.float32)[None, :]
+    zen = np.asarray(world.zenith, np.float32)[None, :]
+    gnd = np.asarray(world.ground_color, np.float32)[None, :]
+    height = float(world.horizon_height)
+    falloff = max(float(world.gradient_falloff), 0.01)
+    steps = max(int(getattr(world, 'band_count', 8)), 1)
+    soft = float(np.clip(getattr(world, 'band_softness', 0.0), 0.0, 1.0))
+
+    def quantise(t):
+        # `steps` bands means `steps` colours *including both ends*, so the
+        # divisor is one less than the count. Dividing by the count instead
+        # leaves a band at the zenith that is infinitesimally thin -- it only
+        # ever gets hit exactly at t = 1 -- and every palette then carries one
+        # entry it never spends.
+        if steps == 1:
+            return np.zeros_like(t)
+        s = np.minimum(np.floor(t * steps), steps - 1)
+        if soft > 1e-4:
+            frac = t * steps - np.floor(t * steps)
+            e = np.clip((frac - (1.0 - soft)) / max(soft, 1e-4), 0.0, 1.0)
+            s = np.minimum(s + e * e * (3.0 - 2.0 * e), steps - 1)
+        return np.clip(s / (steps - 1), 0.0, 1.0)
+
+    above = np.clip((up - height) / max(1.0 - height, 1e-3), 0.0, 1.0)
+    t = quantise(_blend(np.power(above, falloff), world.blend_mode))[:, None]
+    sky = hor + (zen - hor) * t
+
+    if world.show_ground:
+        below = np.clip((height - up) / max(1.0 + height, 1e-3), 0.0, 1.0)
+        b = quantise(_blend(np.power(below, falloff), world.blend_mode))[:, None]
+        sky = np.where(up[:, None] < height, hor + (gnd - hor) * b, sky)
+    return sky.astype(np.float32)
+
+
+def starfield(world, dirs):
+    """Nothing but space: a flat backdrop, stars, and optional nebula.
+
+    Every package shipped a space scene and none of them lit one with a sky
+    model. The background was a colour, the stars were points scattered on it,
+    and if there was a nebula it was noise through a colour map. There is no
+    horizon here at all -- stars go all the way round, which the Bryce star
+    layer deliberately does not do because it sits under a sky dome.
+    """
+    n = dirs.shape[0]
+    col = np.broadcast_to(np.asarray(world.color, np.float32)[None, :],
+                          (n, 3)).copy()
+
+    amount = float(getattr(world, 'nebula', 0.0))
+    if amount > 1e-4:
+        scale = max(float(getattr(world, 'nebula_scale', 2.0)), 1e-3)
+        p = dirs * scale
+        v = turbulence(p, octaves=int(getattr(world, 'nebula_detail', 5)))
+        v = np.clip((v - 0.35) * 2.2, 0.0, 1.0) ** 1.6
+        neb = np.asarray(getattr(world, 'nebula_color', (0.35, 0.15, 0.55)),
+                         np.float32)[None, :]
+        col = col + neb * (v * amount)[:, None]
+
+    bright = float(getattr(world, 'star_brightness', 0.8))
+    if bright > 1e-4:
+        from .patterns import starfield as _star_pattern
+        size = float(getattr(world, 'star_size', 0.35))
+        scale = 60.0 + float(getattr(world, 'star_density', 0.5)) * 340.0
+        mag = _star_pattern(dirs * scale,
+                            float(getattr(world, 'star_density', 0.5)),
+                            size, float(getattr(world, 'star_twinkle', 0.0)),
+                            float(getattr(world, '_time', 0.0)))
+        # stars are not all white: hot ones read blue, cool ones amber, and a
+        # single hash per cell is enough to say which
+        tint = _hash3f_dirs(dirs * scale)
+        warm = np.array([1.0, 0.86, 0.70], np.float32)
+        cool = np.array([0.74, 0.84, 1.0], np.float32)
+        star_col = cool[None, :] + (warm[None, :] - cool[None, :]) * tint[:, None]
+        col = col + star_col * (mag * bright)[:, None]
+    return col.astype(np.float32)
+
+
+def _hash3f_dirs(p):
+    c = np.floor(p)
+    return _hash3(c[:, 0].astype(np.int64), c[:, 1].astype(np.int64),
+                  c[:, 2].astype(np.int64) + 613)
 
 
 def _dome_project(dirs, altitude, scale, squash=1.0):
@@ -566,6 +664,10 @@ def evaluate(world, dirs, textures=None, strength=True, eye=None,
         col = solid(world, dirs)
     elif mode == 'GRADIENT':
         col = gradient(world, dirs)
+    elif mode == 'BANDS':
+        col = bands(world, dirs)
+    elif mode == 'STARFIELD':
+        col = starfield(world, dirs)
     elif mode == 'BRYCE':
         col = bryce(world, dirs)
     elif mode == 'PHYSICAL':

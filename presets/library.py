@@ -346,6 +346,277 @@ PRESETS = {
             'output_scale': '3X',
         },
     },
+    # ---- handhelds and later consoles -------------------------------------
+    'GAME_BOY': {
+        'label': "Game Boy",
+        'category': 'CONSOLE',
+        'note': "160x144 in four shades. No colour, no shadows, and a screen "
+                "small enough that everything had to read as silhouette.",
+        'settings': {
+            'resolution_x': 160, 'resolution_y': 144,
+            'aa_mode': 'NONE', 'aa_samples': 1,
+            'default_model': 'FLAT', 'shading_rate': 'FACE',
+            'tex_filter': 'NEAREST', 'color_depth': '2',
+            'palette_mode': 'GRAY', 'palette_size': 4,
+            'dither': 'BAYER2', 'shadows': False, 'max_lights': 1,
+            'output_scale': '4X',
+        },
+    },
+    'VIRTUAL_BOY': {
+        'label': "Virtual Boy",
+        'category': 'CONSOLE',
+        'note': "384x224 in four levels of red on black. The only console that "
+                "shipped a palette with one hue in it.",
+        'settings': {
+            'resolution_x': 384, 'resolution_y': 224,
+            'aa_mode': 'NONE', 'aa_samples': 1,
+            'default_model': 'FLAT', 'shading_rate': 'FACE',
+            'tex_filter': 'NEAREST', 'color_depth': '2',
+            'palette_mode': 'GRAY', 'palette_size': 4,
+            'dither': 'BAYER4', 'shadows': False, 'max_lights': 1,
+            'crt': True, 'crt_scanlines': 0.0, 'crt_bloom': 0.4,
+            'output_scale': '2X',
+        },
+    },
+    'GAME_GEAR': {
+        'label': "Game Gear",
+        'category': 'CONSOLE',
+        'note': "160x144 from a 4096-colour master palette, on a backlit "
+                "screen that smeared everything it showed.",
+        'settings': {
+            'resolution_x': 160, 'resolution_y': 144,
+            'aa_mode': 'NONE', 'aa_samples': 1,
+            'default_model': 'FLAT', 'shading_rate': 'FACE',
+            'tex_filter': 'NEAREST', 'color_depth': '4',
+            'palette_mode': 'ADAPTIVE', 'palette_size': 32,
+            'palette_method': 'MEDIAN_CUT', 'dither': 'BAYER4',
+            'shadows': False, 'max_lights': 2, 'glow': True,
+            'glow_threshold': 0.6, 'glow_intensity': 0.25,
+            'output_scale': '4X',
+        },
+    },
+    'SNES': {
+        'label': "Super Nintendo",
+        'category': 'CONSOLE',
+        'note': "256x224. Polygons on this hardware came from a chip on the "
+                "cartridge, so they were few, flat and unfiltered.",
+        'settings': {
+            'resolution_x': 256, 'resolution_y': 224,
+            'pixel_aspect_x': 1.0, 'pixel_aspect_y': 1.14,
+            'aa_mode': 'NONE', 'aa_samples': 1,
+            'default_model': 'FLAT', 'shading_rate': 'FACE',
+            'tex_filter': 'NEAREST', 'color_depth': '5',
+            'palette_mode': 'ADAPTIVE', 'palette_size': 256,
+            'palette_method': 'MEDIAN_CUT', 'dither': 'NONE',
+            'depth_sort': 'PAINTERS', 'shadows': False, 'max_lights': 1,
+            'output_scale': '3X',
+        },
+    },
+    'NEO_GEO': {
+        'label': "Neo Geo",
+        'category': 'CONSOLE',
+        'note': "320x224 from 65,536 colours. The most expensive way to see a "
+                "sprite in 1990.",
+        'settings': {
+            'resolution_x': 320, 'resolution_y': 224,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 2,
+            'default_model': 'GOURAUD', 'shading_rate': 'VERTEX',
+            'tex_filter': 'NEAREST', 'color_depth': '5',
+            'palette_mode': 'ADAPTIVE', 'palette_size': 256,
+            'palette_method': 'OCTREE', 'dither': 'NONE',
+            'shadows': True, 'max_lights': 3, 'output_scale': '3X',
+        },
+    },
+    'SEGA_32X': {
+        'label': "Sega 32X",
+        'category': 'CONSOLE',
+        'note': "Two extra processors bolted on top of a Mega Drive, and "
+                "32,768 colours to show for it.",
+        'settings': {
+            'resolution_x': 320, 'resolution_y': 224,
+            'aa_mode': 'NONE', 'aa_samples': 1,
+            'default_model': 'FLAT', 'shading_rate': 'FACE',
+            'tex_filter': 'NEAREST', 'color_depth': '5',
+            'palette_mode': 'ADAPTIVE', 'palette_size': 256,
+            'palette_method': 'MEDIAN_CUT', 'dither': 'BAYER4',
+            'depth_sort': 'PAINTERS', 'shadows': False, 'max_lights': 2,
+            'composite': True, 'output_scale': '2X',
+        },
+    },
+
+    # ---- home computers ----------------------------------------------------
+    'C64': {
+        'label': "Commodore 64",
+        'category': 'PLATFORM',
+        'note': "160x200 in sixteen fixed colours, half of them barely "
+                "distinguishable. Wide pixels, because the mode was.",
+        'settings': {
+            'resolution_x': 160, 'resolution_y': 200,
+            'pixel_aspect_x': 2.0, 'pixel_aspect_y': 1.0,
+            'aa_mode': 'NONE', 'aa_samples': 1,
+            'default_model': 'FLAT', 'shading_rate': 'FACE',
+            'tex_filter': 'NEAREST', 'color_depth': '4',
+            'palette_mode': 'ADAPTIVE', 'palette_size': 16,
+            'palette_method': 'MEDIAN_CUT', 'dither': 'BAYER4',
+            'shadows': False, 'max_lights': 1, 'output_scale': '3X',
+        },
+    },
+    'ZX_SPECTRUM': {
+        'label': "ZX Spectrum",
+        'category': 'PLATFORM',
+        'note': "256x192 from fifteen colours. The real machine allowed two "
+                "per character cell, which is why everything on it looked "
+                "like it had been coloured in afterwards.",
+        'settings': {
+            'resolution_x': 256, 'resolution_y': 192,
+            'aa_mode': 'NONE', 'aa_samples': 1,
+            'default_model': 'FLAT', 'shading_rate': 'FACE',
+            'tex_filter': 'NEAREST', 'color_depth': '3',
+            'palette_mode': 'ADAPTIVE', 'palette_size': 15,
+            'palette_method': 'MEDIAN_CUT', 'dither': 'BAYER8',
+            'shadows': False, 'max_lights': 1, 'output_scale': '3X',
+        },
+    },
+    'APPLE_IIGS': {
+        'label': "Apple IIGS",
+        'category': 'PLATFORM',
+        'note': "320x200, sixteen colours a line chosen from 4096. Gentler "
+                "than the PC palettes of the same year.",
+        'settings': {
+            'resolution_x': 320, 'resolution_y': 200,
+            'pixel_aspect_x': 1.0, 'pixel_aspect_y': 1.2,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 2,
+            'default_model': 'GOURAUD', 'shading_rate': 'VERTEX',
+            'tex_filter': 'NEAREST', 'color_depth': '4',
+            'palette_mode': 'ADAPTIVE', 'palette_size': 16,
+            'palette_method': 'MEDIAN_CUT', 'dither': 'FLOYD',
+            'shadows': False, 'max_lights': 2, 'output_scale': '3X',
+        },
+    },
+    'MSX2': {
+        'label': "MSX2",
+        'category': 'PLATFORM',
+        'note': "256x212 in 256 colours. Japan's home standard, and better at "
+                "this than anything sold in the West that year.",
+        'settings': {
+            'resolution_x': 256, 'resolution_y': 212,
+            'aa_mode': 'NONE', 'aa_samples': 1,
+            'default_model': 'GOURAUD', 'shading_rate': 'VERTEX',
+            'tex_filter': 'NEAREST', 'color_depth': '8',
+            'palette_mode': 'ADAPTIVE', 'palette_size': 256,
+            'palette_method': 'MEDIAN_CUT', 'dither': 'FLOYD',
+            'shadows': False, 'max_lights': 2, 'output_scale': '3X',
+        },
+    },
+    'NEXTSTEP': {
+        'label': "NeXTSTEP",
+        'category': 'PLATFORM',
+        'note': "Two-bit greyscale on a large, sharp display. Everything the "
+                "MegaPixel monitor showed was four shades and no apology.",
+        'settings': {
+            'resolution_x': 1120, 'resolution_y': 832,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'PHONG', 'shading_rate': 'PIXEL',
+            'tex_filter': 'BILINEAR', 'color_depth': '2',
+            'palette_mode': 'GRAY', 'palette_size': 4,
+            'dither': 'ATKINSON', 'shadows': True, 'max_lights': 4,
+        },
+    },
+    'SGI_INDY': {
+        'label': "SGI Indy",
+        'category': 'PLATFORM',
+        'note': "The workstation everything else was compared against: full "
+                "24-bit colour, smooth shading and no palette at all.",
+        'settings': {
+            'resolution_x': 1024, 'resolution_y': 768,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'PHONG', 'shading_rate': 'PIXEL',
+            'tex_filter': 'TRILINEAR', 'color_depth': '8',
+            'palette_mode': 'ADAPTIVE', 'palette_size': 256,
+            'dither': 'NONE', 'shadows': True, 'max_lights': 8,
+        },
+    },
+
+    # ---- software renderers ------------------------------------------------
+    'DOOM': {
+        'label': "Doom software",
+        'category': 'PLATFORM',
+        'note': "320x200 in 256 colours with light levels quantised into "
+                "bands. The bands are the shading model, not an artefact.",
+        'settings': {
+            'resolution_x': 320, 'resolution_y': 200,
+            'pixel_aspect_x': 1.0, 'pixel_aspect_y': 1.2,
+            'aa_mode': 'NONE', 'aa_samples': 1,
+            'default_model': 'FLAT', 'shading_rate': 'FACE',
+            'tex_filter': 'NEAREST', 'color_depth': '8',
+            'palette_mode': 'ADAPTIVE', 'palette_size': 256,
+            'palette_method': 'MEDIAN_CUT', 'dither': 'NONE',
+            'depth_sort': 'PAINTERS', 'shadows': False, 'max_lights': 2,
+            'fog': True, 'output_scale': '3X',
+        },
+    },
+    'RENDERMAN': {
+        'label': "RenderMan",
+        'category': 'SOFTWARE',
+        'note': "What the film houses used while everyone else argued about "
+                "palettes. Full colour, clean edges, and time to spare.",
+        'settings': {
+            'resolution_x': 1024, 'resolution_y': 778,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'BLINN', 'shading_rate': 'PIXEL',
+            'tex_filter': 'TRILINEAR', 'color_depth': '8',
+            'palette_mode': 'ADAPTIVE', 'palette_size': 256,
+            'dither': 'NONE', 'shadows': True, 'max_lights': 8,
+            'raytrace': True, 'ambient_occlusion': True,
+        },
+    },
+    'TURBO_SILVER': {
+        'label': "Turbo Silver",
+        'category': 'SOFTWARE',
+        'note': "The Amiga raytracer that became Imagine. Hard shadows, hard "
+                "reflections, and a HAM palette doing its best underneath.",
+        'settings': {
+            'resolution_x': 320, 'resolution_y': 256,
+            'pixel_aspect_x': 1.0, 'pixel_aspect_y': 1.1,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 2,
+            'default_model': 'PHONG', 'shading_rate': 'PIXEL',
+            'tex_filter': 'NEAREST', 'color_depth': '6',
+            'palette_mode': 'ADAPTIVE', 'palette_size': 64,
+            'palette_method': 'MEDIAN_CUT', 'dither': 'FLOYD',
+            'shadows': True, 'shadow_softness': 0.0, 'max_lights': 3,
+            'raytrace': True, 'output_scale': '2X',
+        },
+    },
+    'LIGHTSCAPE': {
+        'label': "Lightscape",
+        'category': 'SOFTWARE',
+        'note': "Radiosity, when that meant hours of solving before anything "
+                "appeared. Soft, indirect, and short of hard shadows.",
+        'settings': {
+            'resolution_x': 800, 'resolution_y': 600,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'LAMBERT', 'shading_rate': 'PIXEL',
+            'tex_filter': 'BILINEAR', 'color_depth': '8',
+            'palette_mode': 'ADAPTIVE', 'palette_size': 256,
+            'dither': 'NONE', 'shadows': True, 'shadow_softness': 4.0,
+            'max_lights': 6, 'ambient_occlusion': True, 'ao_intensity': 0.8,
+            'global_ambient_level': 0.35,
+        },
+    },
+    'AUTOSHADE': {
+        'label': "AutoShade",
+        'category': 'SOFTWARE',
+        'note': "AutoCAD's renderer, when rendering meant filling each face "
+                "with one colour and calling it a day.",
+        'settings': {
+            'resolution_x': 640, 'resolution_y': 480,
+            'aa_mode': 'NONE', 'aa_samples': 1,
+            'default_model': 'FLAT', 'shading_rate': 'FACE',
+            'tex_filter': 'NEAREST', 'color_depth': '4',
+            'palette_mode': 'EGA16', 'dither': 'NONE',
+            'shadows': False, 'max_lights': 1,
+        },
+    },
     'AMIGA_AGA': {
         'label': "Amiga AGA 256",
         'category': 'PLATFORM',

@@ -108,7 +108,8 @@ class Surface:
                  'fresnel', 'fresnel_power', 'fresnel_color',
                  'rim', 'rim_power', 'rim_color',
                  'matcap', 'matcap_blend', 'reflect_color',
-                 'edge_opacity', 'backface_color', 'backface_mix')
+                 'edge_opacity', 'backface_color', 'backface_mix',
+                 'sheen', 'sheen_color', 'sheen_roughness', 'refraction')
 
     def __init__(self, n):
         self.n = n
@@ -150,6 +151,14 @@ class Surface:
         self.edge_opacity = np.ones(n, np.float32)
         self.backface_color = np.zeros((n, 3), np.float32)
         self.backface_mix = np.zeros(n, np.float32)
+        # a velvet lobe, added in the light loop rather than inside a model:
+        # the packages that had this offered it on top of whichever shader was
+        # picked, exactly like the terms above
+        self.sheen = np.zeros(n, np.float32)
+        self.sheen_color = np.ones((n, 3), np.float32)
+        self.sheen_roughness = np.full(n, 0.3, np.float32)
+        # how much of the ray traced through a transparent surface is kept
+        self.refraction = np.ones(n, np.float32)
         self.model = 'PHONG'
 
 
