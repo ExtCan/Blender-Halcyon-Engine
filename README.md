@@ -1,7 +1,7 @@
 # Halcyon
 
 > **This Addon is and always will be free. If you paid for this, you were
-> scammed. Please demand your money back and report the seller.**
+> scammed.**
 
 A from-scratch render engine for Blender that reproduces the output of
 mid-to-late 1990s home-computer 3D software.
@@ -517,6 +517,3 @@ GPL-3.0-or-later, matching Blender.
 ## Credits
 
 Built by Claude with help from Mr. Emotiman.
-
-This Addon is and always will be free. If you paid for this, you were scammed.
-Please demand your money back and report the seller.
