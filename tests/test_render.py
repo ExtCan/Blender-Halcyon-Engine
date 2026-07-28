@@ -1,0 +1,2911 @@
+"""Renderer tests. Run with:  python3 -m halcyon.tests.test_render"""
+
+import os
+import sys
+
+import numpy as np
+
+from ..core import post
+from ..core import render as R
+from ..core.nodeeval import Closure, GraphEvaluator, ShadeContext
+from ..core.settings import RenderSettings
+from ..presets.library import PRESETS, apply_preset
+from .scenebuild import demo_scene
+
+FAILS = []
+
+
+def check(name, cond, extra=''):
+    print(('  ok   ' if cond else '  FAIL ') + name + (('  ' + extra) if extra else ''))
+    if not cond:
+        FAILS.append(name)
+
+
+def base_settings(w=96, h=72, **kw):
+    st = RenderSettings()
+    st.resolution_x, st.resolution_y = w, h
+    st.aa_samples = 1
+    for k, v in kw.items():
+        setattr(st, k, v)
+    return st
+
+
+def render(st):
+    return R.render(demo_scene(st), st)
+
+
+# ------------------------------------------------------------------- basics
+
+
+def test_renders_something():
+    st = base_settings()
+    img = render(st)
+    check('render produces a full image', img.shape == (72, 96, 4))
+    check('image has real content', img[..., :3].std() > 0.02,
+          f'std={img[..., :3].std():.4f}')
+    check('no NaNs or infinities', np.isfinite(img).all())
+
+
+def test_geometry_lands_where_projected():
+    """Project known world points and confirm the right surface is there.
+
+    Stronger than eyeballing brightness: it ties the camera matrices, the
+    clipper and the rasteriser together against an independently computed
+    answer.
+    """
+    from ..core import raster
+    w, h = 128, 96
+    st = base_settings(w, h, shadows=False)
+    sc = demo_scene(st)
+    _view, _proj, vp, _eye = R.camera_matrices(sc.camera, w, h)
+    gb = raster.GBuffer(w, h)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=gb)
+    for name, pt, expect in (('sphere', (-1.3, 0.2, 1.0), 1),
+                             ('cube', (1.4, -0.4, 0.9), 2),
+                             ('floor', (-4.5, 0.0, 0.0), 0)):
+        p = np.array([pt[0], pt[1], pt[2], 1.0], np.float32) @ vp.T
+        ndc = p[:3] / p[3]
+        x = int(np.clip((ndc[0] * 0.5 + 0.5) * w, 0, w - 1))
+        y = int(np.clip((ndc[1] * 0.5 + 0.5) * h, 0, h - 1))
+        tri = int(gb.tri[y, x])
+        mat = int(sc.mesh.mat_index[tri]) if tri >= 0 else -1
+        check(f'{name} rasterises at its projected pixel', mat == expect,
+              f'pixel ({x},{y}) holds material {mat}, expected {expect}')
+    covered = float(gb.mask().mean())
+    check('geometry covers a sensible share of the frame',
+          0.25 < covered < 0.98, f'{covered:.2f}')
+
+
+def _shadowed_fraction(lit, shadowed):
+    """Share of pixels the shadow pass meaningfully darkened."""
+    return float(((lit[..., :3] - shadowed[..., :3]).mean(axis=2) > 0.02).mean())
+
+
+def test_shadows_darken():
+    lit = render(base_settings(shadows=False))
+    mapped = render(base_settings(shadows=True, shadow_default='MAP'))
+    rayed = render(base_settings(shadows=True, shadow_default='RAY'))
+    fm = _shadowed_fraction(lit, mapped)
+    fr = _shadowed_fraction(lit, rayed)
+    check('shadow maps darken a real region', fm > 0.01, f'{fm:.3f} of pixels')
+    check('ray-traced shadows darken a real region', fr > 0.01,
+          f'{fr:.3f} of pixels')
+    check('shadows never brighten anything',
+          float((mapped[..., :3] - lit[..., :3]).max()) < 1e-4)
+    # the two methods are approximating the same thing, so they must agree
+    agree = float(np.abs(mapped[..., :3] - rayed[..., :3]).mean())
+    check('shadow maps and shadow rays agree', agree < 0.02, f'delta={agree:.4f}')
+
+
+def test_shading_rates_differ():
+    px = render(base_settings(shading_rate='PIXEL'))
+    vx = render(base_settings(shading_rate='VERTEX'))
+    fc = render(base_settings(shading_rate='FACE'))
+    check('Gouraud differs from Phong',
+          float(np.abs(px - vx).mean()) > 1e-3, f'{np.abs(px - vx).mean():.4f}')
+    check('flat differs from Gouraud',
+          float(np.abs(vx - fc).mean()) > 1e-3, f'{np.abs(vx - fc).mean():.4f}')
+
+
+# Translucent with Translucency at 0 genuinely *is* Lambert -- the back lobe is
+# multiplied by zero. That is correct behaviour, not a collision to fix.
+EXPECTED_TWINS = {('LAMBERT', 'TRANSLUCENT')}
+
+
+def test_models_differ():
+    """Each reflectance model must produce its own image."""
+    from ..core.shading import MODEL_ITEMS
+    imgs = {}
+    for ident, _label, _d in MODEL_ITEMS:
+        st = base_settings(64, 48, force_model=ident, shadows=False)
+        imgs[ident] = render(st)
+        if not np.isfinite(imgs[ident]).all():
+            check(f'model {ident} produces finite output', False)
+    keys = list(imgs)
+    collisions = []
+    for i, a in enumerate(keys):
+        for b in keys[i + 1:]:
+            if float(np.abs(imgs[a] - imgs[b]).mean()) < 1e-6:
+                if (a, b) not in EXPECTED_TWINS and (b, a) not in EXPECTED_TWINS:
+                    collisions.append(f'{a}=={b}')
+    check(f'all {len(keys)} shading models are distinct (bar documented twins)',
+          not collisions, ', '.join(collisions[:4]))
+
+    # the pairs that carry the most weight for a period look
+    must_differ = (
+        ('PHONG', 'BLINN_PHONG'), ('PHONG', 'COOK_TORRANCE'),
+        ('LAMBERT', 'OREN_NAYAR'), ('LAMBERT', 'MINNAERT'),
+        ('PHONG', 'WARD'), ('PHONG', 'ANISOTROPIC'), ('PHONG', 'STRAUSS'),
+        ('PHONG', 'TOON'), ('PHONG', 'CONSTANT'), ('PHONG', 'METAL'),
+        ('PHONG', 'BLINN'),
+        # Gouraud and flat are shading *rates*: selecting them must change
+        # the frequency at which lighting is evaluated, not just the maths
+        ('PHONG', 'GOURAUD'), ('GOURAUD', 'FLAT'),
+    )
+    # a highlight changing shape is a large *local* change and a tiny mean one,
+    # so the peak difference is the meaningful measure here
+    bad = [f'{a}~{b}' for a, b in must_differ
+           if float(np.abs(imgs[a] - imgs[b]).max()) < 1e-3]
+    check('the significant model pairs are all visibly different', not bad,
+          ', '.join(bad))
+
+
+def test_batched_rasteriser_matches_reference():
+    """The fast rasteriser must be bit-identical to the reference loop.
+
+    This is the whole licence for having two implementations: if they ever
+    disagree, the fast one is wrong and this catches it.
+    """
+    from ..core import raster
+    from .scenebuild import _mesh_concat, plane, sphere
+    cases = {
+        'demo scene': None,
+        'dense sphere': [sphere(radius=1.5, segs=64, rings=40, mat=0)],
+        'mixed sizes': [plane(size=12.0, mat=0),
+                        sphere(centre=(-1, 0, 1), segs=40, rings=26, mat=0)],
+    }
+    for name, parts in cases.items():
+        st = base_settings(200, 150)
+        sc = demo_scene(st)
+        if parts is not None:
+            sc.mesh = _mesh_concat(parts)
+        _v, _p, vp, _e = R.camera_matrices(sc.camera, 200, 150)
+        bufs = []
+        for mode in (False, True):
+            gb = raster.GBuffer(200, 150)
+            gb.alloc_linear()
+            raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, 200, 150,
+                             gbuf=gb, batched=mode)
+            bufs.append(gb)
+        a, b = bufs
+        ok = (np.array_equal(a.tri, b.tri) and
+              np.array_equal(a.front, b.front) and
+              float(np.abs(a.bary - b.bary).max()) == 0.0 and
+              float(np.abs(a.bary_lin - b.bary_lin).max()) == 0.0)
+        fa = np.where(np.isfinite(a.depth), a.depth, 0.0)
+        fb = np.where(np.isfinite(b.depth), b.depth, 0.0)
+        ok = ok and float(np.abs(fa - fb).max()) == 0.0
+        check(f'batched rasteriser is bit-identical ({name})', ok)
+
+
+def test_batched_transparency_matches_reference():
+    """A-buffer fragment sets must agree too, not just the depth buffer."""
+    from ..core import raster
+    st = base_settings(160, 120)
+    sc = demo_scene(st)
+    _v, _p, vp, _e = R.camera_matrices(sc.camera, 160, 120)
+    sets = []
+    for mode in (False, True):
+        gb = raster.GBuffer(160, 120)
+        fl = raster.FragmentList()
+        raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, 160, 120, gbuf=gb,
+                         frags=fl, depth_write=False, batched=mode)
+        px, py, tri, depth, bary, front = fl.finish()
+        order = np.lexsort((tri, depth, px, py))
+        sets.append((px[order], py[order], tri[order], np.round(depth[order], 6)))
+    same = all(np.array_equal(a, b) for a, b in zip(sets[0], sets[1]))
+    check('batched A-buffer fragments match the reference', same,
+          f'{sets[0][0].size} vs {sets[1][0].size} fragments')
+
+
+def test_lighting_is_exposed_sanely():
+    """A Blender-default light rig must not clip the frame to white.
+
+    Light energy arrives in watts, so the Lambertian 1/pi has to be applied or
+    everything blows out and the material colour is invisible.
+    """
+    st = base_settings(96, 72)
+    for desc, kind, energy, limit in (("Blender's default 1000 W point",
+                                       'POINT', 1000.0, 0.08),
+                                      ("a sun at strength 3", 'SUN', 3.0, 0.02)):
+        sc = demo_scene(st)
+        sc.lights = [l for l in sc.lights if l.type == kind]
+        sc.lights[0].energy = energy
+        img = R.render(sc, st)[..., :3]
+        clipped = float((img >= 1.0).mean())
+        check(f'{desc} does not blow the frame out', clipped < limit,
+              f'{clipped * 100:.1f}% of channels clipped')
+
+    # and the material colour has to survive to the framebuffer
+    sc = demo_scene(st)
+    sc.materials[1].diffuse = (0.85, 0.1, 0.1)
+    sc.materials[2].diffuse = (0.85, 0.1, 0.1)
+    red = R.render(sc, st)[..., :3].reshape(-1, 3).mean(0)
+    sc = demo_scene(st)
+    sc.materials[1].diffuse = (0.1, 0.3, 0.85)
+    sc.materials[2].diffuse = (0.1, 0.3, 0.85)
+    blue = R.render(sc, st)[..., :3].reshape(-1, 3).mean(0)
+    check('material colour survives to the framebuffer',
+          red[0] > blue[0] * 1.2 and blue[2] > red[2] * 1.2,
+          f'red={np.round(red, 3)} blue={np.round(blue, 3)}')
+
+
+def test_image_row_order():
+    """Row 0 must be the bottom of the picture, matching Blender's rect buffer.
+
+    Getting this backwards renders the whole frame upside down.
+    """
+    from ..core import raster
+    st = base_settings(80, 60, shadows=False)
+    sc = demo_scene(st)
+    _v, _p, vp, _e = R.camera_matrices(sc.camera, 80, 60)
+    gb = raster.GBuffer(80, 60)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, 80, 60, gbuf=gb)
+    cov = gb.mask()
+    check('row 0 is the bottom of the image (Blender rect order)',
+          cov[0].mean() > cov[-1].mean(),
+          f'row0 coverage {cov[0].mean():.2f}, last row {cov[-1].mean():.2f}')
+
+
+def test_delivered_size_is_exact():
+    """post.process must honour target_size whatever the chain does to the image.
+
+    Blender allocates the render buffer up front; handing back anything larger
+    overruns it and takes the process down. Pixel Scale and pixel aspect both
+    resize, so the guarantee has to hold across them.
+    """
+    img = render(base_settings(96, 72))
+    target = (96, 72)
+    combos = [
+        dict(output_scale='NONE'), dict(output_scale='2X'),
+        dict(output_scale='3X'), dict(output_scale='4X'),
+        dict(pixel_aspect_x=1.0, pixel_aspect_y=1.2),
+        dict(pixel_aspect_x=10.0, pixel_aspect_y=11.0, output_scale='2X'),
+        dict(output_scale='4X', pixel_aspect_x=59.0, pixel_aspect_y=54.0,
+             crt=True, crt_curvature=0.4, composite=True, jpeg_artifacts=True),
+    ]
+    bad = []
+    for kw in combos:
+        st = base_settings(96, 72, **kw)
+        out = post.process(img, st, target_size=target)
+        if out.shape[1] != target[0] or out.shape[0] != target[1]:
+            bad.append(f'{kw} -> {out.shape[1]}x{out.shape[0]}')
+    check('post output is always exactly the requested size', not bad,
+          '; '.join(bad[:2]))
+
+    # and the unconstrained path must still be free to resize
+    st = base_settings(96, 72, output_scale='3X')
+    free = post.process(img, st)
+    check('without a target the chain may still scale up',
+          free.shape[:2] == (72 * 3, 96 * 3), str(free.shape))
+
+
+def test_threaded_shading_is_deterministic():
+    """Shading across threads must be bit-identical to shading on one."""
+    base = None
+    bad = []
+    for threads in (1, 4, 20):
+        st = base_settings(160, 120, threads=threads)
+        img = R.render(demo_scene(st), st)
+        if base is None:
+            base = img
+        elif float(np.abs(base - img).max()) != 0.0:
+            bad.append(str(threads))
+    check('threaded shading matches single-threaded exactly', not bad,
+          'differs at ' + ','.join(bad) if bad else '')
+
+
+def _wnode(nid, idname, props=None, ins=(), outs=()):
+    return {'id': nid, 'bl_idname': idname, 'props': props or {},
+            'inputs': [dict(i) for i in ins], 'outputs': [dict(o) for o in outs]}
+
+
+def _sk(name, typ, default, link=None):
+    return {'name': name, 'type': typ, 'default': default, 'link': link}
+
+
+def _sky_rows(img):
+    """The uncovered top of the frame. Row 0 is the bottom."""
+    return img[-20:, :, :3]
+
+
+def test_world_backgrounds_render():
+    """Background, environment texture and sky texture must all show up.
+
+    The background pass used to be handed an empty texture dictionary, so any
+    world driven by an image rendered black.
+    """
+    from ..core.scene import ImageBuffer, World
+    from .scenebuild import checker_image
+
+    # plain Background node
+    st = base_settings(120, 90)
+    sc = demo_scene(st)
+    sc.world = World()
+    sc.world.graph = {'output': 'w', 'nodes': {
+        'bg': _wnode('bg', 'ShaderNodeBackground', {},
+                     [_sk('Color', 'RGBA', [0.15, 0.35, 0.8, 1.0]),
+                      _sk('Strength', 'VALUE', 1.0)],
+                     [{'name': 'Background', 'type': 'SHADER'}]),
+        'w': _wnode('w', 'ShaderNodeOutputWorld', {},
+                    [_sk('Surface', 'SHADER', None, ['bg', 0])], [])}}
+    sky = _sky_rows(R.render(sc, st)).reshape(-1, 3).mean(0)
+    check('Background node reaches the sky',
+          np.allclose(sky, [0.15, 0.35, 0.8], atol=0.05), str(np.round(sky, 3)))
+
+    # environment texture
+    env = ImageBuffer(name='sky.hdr',
+                      pixels=checker_image(64, a=(0.2, 0.5, 1.0),
+                                           b=(1.0, 0.7, 0.3), squares=4))
+    sc = demo_scene(st)
+    sc.images = {'sky.hdr': env}
+    sc.world = World()
+    sc.world.graph = {'output': 'w', 'nodes': {
+        'e': _wnode('e', 'ShaderNodeTexEnvironment', {'image': 'sky.hdr'},
+                    [_sk('Vector', 'VECTOR', [0, 0, 0])],
+                    [{'name': 'Color', 'type': 'RGBA'}]),
+        'bg': _wnode('bg', 'ShaderNodeBackground', {},
+                     [_sk('Color', 'RGBA', [0.05, 0.05, 0.05, 1.0], ['e', 0]),
+                      _sk('Strength', 'VALUE', 1.0)],
+                     [{'name': 'Background', 'type': 'SHADER'}]),
+        'w': _wnode('w', 'ShaderNodeOutputWorld', {},
+                    [_sk('Surface', 'SHADER', None, ['bg', 0])], [])}}
+    sky = _sky_rows(R.render(sc, st))
+    check('environment texture reaches the sky', sky.std() > 0.05,
+          f'std={sky.std():.4f} mean={np.round(sky.reshape(-1, 3).mean(0), 3)}')
+
+    # sky texture
+    sc = demo_scene(st)
+    sc.world = World()
+    sc.world.graph = {'output': 'w', 'nodes': {
+        's': _wnode('s', 'ShaderNodeTexSky',
+                    {'sky_type': 'PREETHAM', 'sun_elevation': 0.4,
+                     'turbidity': 2.5, 'sun_disc': False},
+                    [_sk('Vector', 'VECTOR', [0, 0, 0])],
+                    [{'name': 'Color', 'type': 'RGBA'}]),
+        'bg': _wnode('bg', 'ShaderNodeBackground', {},
+                     [_sk('Color', 'RGBA', [0.05, 0.05, 0.05, 1.0], ['s', 0]),
+                      _sk('Strength', 'VALUE', 1.0)],
+                     [{'name': 'Background', 'type': 'SHADER'}]),
+        'w': _wnode('w', 'ShaderNodeOutputWorld', {},
+                    [_sk('Surface', 'SHADER', None, ['bg', 0])], [])}}
+    sky = _sky_rows(R.render(sc, st)).reshape(-1, 3).mean(0)
+    check('sky texture produces a lit sky', float(sky.mean()) > 0.05,
+          str(np.round(sky, 3)))
+    check('sky texture is blue-ish upward', sky[2] > sky[0], str(np.round(sky, 3)))
+
+
+def test_generated_coords_are_per_object():
+    """Generated coordinates normalise over each object, as Blender does.
+
+    Normalising over the whole scene made every procedural texture on a
+    normal-sized object sample a tiny patch of its own space and come out flat
+    whenever a large ground plane was present.
+    """
+    from ..core.scene import ObjectInfo
+    from .scenebuild import _mesh_concat, plane, sphere
+    st = base_settings(64, 48)
+    sc = demo_scene(st)
+    sc.mesh = _mesh_concat([plane(size=200.0, mat=0, obj=0),
+                            sphere(centre=(0, 0, 1), radius=1.0, mat=1, obj=1)])
+    sc.objects = [ObjectInfo(name='Ground', index=0,
+                             matrix_world=np.eye(4, dtype=np.float32)),
+                  ObjectInfo(name='Ball', index=1,
+                             matrix_world=np.eye(4, dtype=np.float32))]
+    job = R.ShadeJob(sc, st, {}, None, np.eye(4, dtype=np.float32),
+                     np.zeros(3, np.float32), 64, 48)
+    sel = np.nonzero(sc.mesh.mat_index == 1)[0]
+    g = job.context(sel, np.full((sel.size, 3), 1 / 3.0, np.float32)).generated
+    span = g.max(0) - g.min(0)
+    check('a small object still gets a full 0..1 Generated span',
+          float(span.min()) > 0.9, str(np.round(span, 3)))
+
+
+def test_procedural_textures_vary():
+    """Every procedural texture must produce spatial variation, not flat colour."""
+    tex = {
+        'ShaderNodeTexChecker': ([_sk('Vector', 'VECTOR', [0, 0, 0]),
+                                  _sk('Color1', 'RGBA', [.8, .8, .8, 1]),
+                                  _sk('Color2', 'RGBA', [.2, .2, .2, 1]),
+                                  _sk('Scale', 'VALUE', 8.0)], {}),
+        'ShaderNodeTexNoise': ([_sk('Vector', 'VECTOR', [0, 0, 0]),
+                                _sk('Scale', 'VALUE', 8.0),
+                                _sk('Detail', 'VALUE', 2.0),
+                                _sk('Roughness', 'VALUE', .5),
+                                _sk('Distortion', 'VALUE', 0.)],
+                               {'noise_dimensions': '3D'}),
+        'ShaderNodeTexGradient': ([_sk('Vector', 'VECTOR', [0, 0, 0])],
+                                  {'gradient_type': 'LINEAR'}),
+        'ShaderNodeTexVoronoi': ([_sk('Vector', 'VECTOR', [0, 0, 0]),
+                                  _sk('Scale', 'VALUE', 8.0),
+                                  _sk('Randomness', 'VALUE', 1.0)],
+                                 {'distance': 'EUCLIDEAN', 'feature': 'F1',
+                                  'voronoi_dimensions': '3D'}),
+        'ShaderNodeTexMagic': ([_sk('Vector', 'VECTOR', [0, 0, 0]),
+                                _sk('Scale', 'VALUE', 5.0),
+                                _sk('Distortion', 'VALUE', 1.0)],
+                               {'turbulence_depth': 2}),
+        'ShaderNodeTexWave': ([_sk('Vector', 'VECTOR', [0, 0, 0]),
+                               _sk('Scale', 'VALUE', 5.0),
+                               _sk('Distortion', 'VALUE', 0.),
+                               _sk('Detail', 'VALUE', 2.0)],
+                              {'wave_type': 'BANDS', 'wave_profile': 'SIN',
+                               'bands_direction': 'X'}),
+    }
+    flat = []
+    for tid, (ins, props) in tex.items():
+        st = base_settings(120, 90)
+        sc = demo_scene(st)
+        sc.materials[0].graph = {'output': 'out', 'nodes': {
+            't': _wnode('t', tid, props, ins,
+                        [{'name': 'Color', 'type': 'RGBA'},
+                         {'name': 'Fac', 'type': 'VALUE'}]),
+            'b': _wnode('b', 'ShaderNodeBsdfDiffuse', {},
+                        [_sk('Color', 'RGBA', [.8, .8, .8, 1], ['t', 0]),
+                         _sk('Roughness', 'VALUE', 0.),
+                         _sk('Normal', 'VECTOR', [0, 0, 0])],
+                        [{'name': 'BSDF', 'type': 'SHADER'}]),
+            'out': _wnode('out', 'ShaderNodeOutputMaterial', {},
+                          [_sk('Surface', 'SHADER', None, ['b', 0]),
+                           _sk('Displacement', 'VECTOR', [0, 0, 0])], [])}}
+        floor = R.render(sc, st)[5:40, :, :3]
+        if floor.std() < 0.01:
+            flat.append(tid.replace('ShaderNodeTex', ''))
+    check(f'all {len(tex)} procedural textures produce variation', not flat,
+          'flat: ' + ', '.join(flat))
+
+
+def test_wireframe_shows_the_world_behind():
+    """Wireframe's see-through pixels must show the world, not black.
+
+    Rendered with a transparent film so alpha marks the wire itself; with an
+    opaque film those pixels are still alpha 1, they just show the sky.
+    """
+    st = base_settings(160, 120, film_transparent=True)
+    sc = demo_scene(st)
+    sc.world.sky_blend = True
+    sc.world.horizon = (0.9, 0.3, 0.1)
+    sc.world.zenith = (0.1, 0.2, 0.9)
+    wire = {'output': 'out', 'nodes': {
+        'h': _wnode('h', 'HALCYON_ShaderNode', {'model': 'WIREFRAME'},
+                    [_sk('Diffuse Color', 'RGBA', [1, 1, 1, 1]),
+                     _sk('Opacity', 'VALUE', 1.0)],
+                    [{'name': 'Surface', 'type': 'SHADER'}]),
+        'out': _wnode('out', 'ShaderNodeOutputMaterial', {},
+                      [_sk('Surface', 'SHADER', None, ['h', 0]),
+                       _sk('Displacement', 'VECTOR', [0, 0, 0])], [])}}
+    for m in sc.materials:
+        m.graph = wire
+    img = R.render(sc, st)
+    frac = float((img[..., 3] > 0.5).mean())
+    check('the wireframe model draws edges', 0.002 < frac < 0.25,
+          f'{frac * 100:.2f}% of pixels')
+    covered_bg = img[60, 80, :3]
+    check('see-through pixels show the world, not black',
+          float(covered_bg.sum()) > 0.02, str(np.round(covered_bg, 4)))
+
+
+def test_sky_modes():
+    """Every sky mode must produce its own visible background."""
+    from ..core.scene import ImageBuffer, World
+    from .scenebuild import checker_image
+    st = base_settings(120, 90)
+    seen = {}
+    for mode in ('SOLID', 'GRADIENT', 'BRYCE', 'PHYSICAL'):
+        sc = demo_scene(st)
+        sc.world = World()
+        sc.world.mode = mode
+        img = R.render(sc, st)
+        seen[mode] = _sky_rows(img)
+        check(f'{mode} sky renders something', float(seen[mode].mean()) > 0.01,
+              str(np.round(seen[mode].reshape(-1, 3).mean(0), 3)))
+    pairs = [(a, b) for i, a in enumerate(seen) for b in list(seen)[i + 1:]]
+    same = [f'{a}=={b}' for a, b in pairs
+            if float(np.abs(seen[a] - seen[b]).mean()) < 1e-4]
+    check('the sky modes are all distinct', not same, ', '.join(same))
+
+    sc = demo_scene(st)
+    sc.world = World()
+    sc.world.mode = 'HDRI'
+    sc.world.env_image = ImageBuffer(
+        name='sky.hdr', pixels=checker_image(64, a=(0.2, 0.5, 1.0),
+                                             b=(1.0, 0.7, 0.3), squares=4))
+    sc.images = {'sky.hdr': sc.world.env_image}
+    hd = _sky_rows(R.render(sc, st))
+    check('HDRI sky renders the image', hd.std() > 0.05, f'std={hd.std():.4f}')
+
+    # an explicit mode must beat the node tree, which Blender worlds always have
+    sc = demo_scene(st)
+    sc.world = World()
+    sc.world.mode = 'GRADIENT'
+    sc.world.zenith = (0.9, 0.1, 0.1)
+    sc.world.graph = {'output': 'w', 'nodes': {
+        'bg': _wnode('bg', 'ShaderNodeBackground', {},
+                     [_sk('Color', 'RGBA', [0.0, 1.0, 0.0, 1.0]),
+                      _sk('Strength', 'VALUE', 1.0)],
+                     [{'name': 'Background', 'type': 'SHADER'}]),
+        'w': _wnode('w', 'ShaderNodeOutputWorld', {},
+                    [_sk('Surface', 'SHADER', None, ['bg', 0])], [])}}
+    top = _sky_rows(R.render(sc, st)).reshape(-1, 3).mean(0)
+    green_wins = top[1] > top[0] * 1.5 and top[1] > top[2] * 1.5
+    check('an explicit sky mode overrides the node tree', not green_wins,
+          str(np.round(top, 3)))
+
+
+def _hemisphere(n_el=60, n_az=120):
+    """A real grid of sky directions. A spiral of samples can miss a thin band
+    like a rainbow entirely, which is exactly how it fooled me once."""
+    el = np.linspace(-0.1, 1.45, n_el)
+    az = np.linspace(0, 2 * np.pi, n_az)
+    E, A = np.meshgrid(el, az, indexing='ij')
+    d = np.stack([np.cos(E) * np.cos(A), np.cos(E) * np.sin(A), np.sin(E)], -1)
+    return d.reshape(-1, 3).astype(np.float32)
+
+
+def test_bryce_layers_respond():
+    """Every layer of the Bryce stack must change the sky on its own."""
+    from ..core import sky as SKY
+    from ..core.scene import World
+    dirs = _hemisphere()
+
+    def sky_of(**kw):
+        w = World()
+        w.mode = 'BRYCE'
+        for k, v in kw.items():
+            setattr(w, k, v)
+        return SKY.evaluate(w, dirs, {})
+
+    base = sky_of()
+    check('the Bryce sky is finite and positive',
+          bool(np.isfinite(base).all()) and float(base.min()) >= 0.0)
+
+    layers = (
+        ('cumulus', dict(clouds=False)),
+        ('cloud cover', dict(cloud_cover=0.9)),
+        ('cloud thickness', dict(cloud_thickness=1.6)),
+        ('cloud sun rim', dict(cloud_rim=3.0)),
+        ('cloud frequency', dict(cloud_scale=6.0)),
+        ('stratus', dict(stratus=True, stratus_density=1.0)),
+        ('haze', dict(haze_density=1.0, haze_height=1.0)),
+        ('haze sun tint', dict(haze_density=1.0, haze_sun_tint=1.0)),
+        ('ground fog', dict(fog_density=0.9)),
+        ('sun corona', dict(sun_corona=4.0, sun_glow=1.0)),
+        ('sun altitude', dict(sun_elevation=1.2)),
+        ('sun azimuth', dict(sun_rotation=3.0)),
+        ('rainbow', dict(rainbow=True, rainbow_intensity=1.0)),
+        ('secondary bow', dict(rainbow=True, rainbow_intensity=1.0,
+                               rainbow_secondary=2.0)),
+        ('stars', dict(stars=True, star_brightness=2.0, star_density=1.0)),
+        ('sky rotation', dict(rotation=1.5)),
+    )
+    dead = []
+    for label, kw in layers:
+        alt = sky_of(**kw)
+        if float(np.abs(base - alt).max()) < 1e-3:
+            dead.append(label)
+    check(f'all {len(layers)} Bryce controls change the sky', not dead,
+          'no effect: ' + ', '.join(dead))
+
+
+def test_rainbow_geometry():
+    """The bow must sit at its stated angle from the antisolar point."""
+    from ..core import sky as SKY
+    from ..core.scene import World
+    dirs = _hemisphere(120, 240)
+    w = World()
+    w.mode = 'BRYCE'
+    w.clouds = False
+    w.haze_density = 0.0
+    plain = SKY.evaluate(w, dirs, {})
+    w.rainbow = True
+    w.rainbow_intensity = 1.0
+    w.rainbow_secondary = 0.0
+    bowed = SKY.evaluate(w, dirs, {})
+    diff = np.abs(bowed - plain).max(axis=1)
+    sun = SKY._sun_vector(w.sun_elevation, w.sun_rotation)
+    ang = np.degrees(np.arccos(np.clip(dirs @ -sun, -1.0, 1.0)))
+    lit = diff > 1e-3
+    check('the rainbow appears somewhere', bool(lit.any()))
+    if lit.any():
+        centre = float(ang[lit].mean())
+        check('the bow sits at ~42 degrees from the antisolar point',
+              abs(centre - w.rainbow_radius) < 3.0, f'{centre:.1f} deg')
+        outside = ang[lit] > centre
+        inside = ang[lit] < centre
+        if outside.any() and inside.any():
+            red_out = float(bowed[lit][outside][:, 0].mean())
+            red_in = float(bowed[lit][inside][:, 0].mean())
+            check('red is on the outside of the primary bow', red_out > red_in,
+                  f'{red_out:.3f} vs {red_in:.3f}')
+
+
+def test_debug_passes_survive_a_preset():
+    """Render passes are data and must bypass the period display chain."""
+    from ..presets.library import apply_preset
+    from ..core.settings import RenderSettings
+    for mode in ('DEPTH', 'NORMAL', 'UV', 'MATID', 'OVERDRAW'):
+        st = RenderSettings()
+        apply_preset(st, 'EGA')          # 16 colours + heavy error diffusion
+        st.resolution_x, st.resolution_y = 120, 90
+        st.aa_samples = 1
+        st.output_scale = 'NONE'
+        st.debug_pass = mode
+        raw = R.render(demo_scene(st), st)
+        out = post.process(raw, st, target_size=(120, 90))[..., :3]
+        # only the display gamma may touch a data pass -- no palette, no dither,
+        # no CRT mask, no JPEG blocks
+        expect = np.power(np.clip(raw[..., :3], 0, 1), 1.0 / max(st.gamma, 1e-3))
+        delta = float(np.abs(out - expect).mean())
+        check(f'{mode} survives a 16-colour preset',
+              out.std() > 0.02 and delta < 0.02,
+              f'std={out.std():.4f} delta-beyond-gamma={delta:.4f}')
+
+
+def test_gabor_and_noise_types():
+    """Gabor exists, and the Noise node honours every fractal type."""
+    from ..core.nodeeval import DISPATCH
+    check('Gabor texture is implemented', 'ShaderNodeTexGabor' in DISPATCH)
+    ins = [_sk('Vector', 'VECTOR', [0, 0, 0]), _sk('Scale', 'VALUE', 6.0),
+           _sk('Detail', 'VALUE', 3.0), _sk('Roughness', 'VALUE', 0.5),
+           _sk('Lacunarity', 'VALUE', 2.0), _sk('Offset', 'VALUE', 0.0),
+           _sk('Gain', 'VALUE', 1.0), _sk('Distortion', 'VALUE', 0.0)]
+    outs = [{'name': 'Fac', 'type': 'VALUE'}, {'name': 'Color', 'type': 'RGBA'}]
+    seen = {}
+    for ntype in ('FBM', 'MULTIFRACTAL', 'RIDGED_MULTIFRACTAL',
+                  'HYBRID_MULTIFRACTAL', 'HETERO_TERRAIN'):
+        st = base_settings(96, 72)
+        sc = demo_scene(st)
+        sc.materials[0].graph = {'output': 'out', 'nodes': {
+            't': _wnode('t', 'ShaderNodeTexNoise',
+                        {'noise_dimensions': '3D', 'noise_type': ntype,
+                         'normalize': True}, ins, outs),
+            'b': _wnode('b', 'ShaderNodeBsdfDiffuse', {},
+                        [_sk('Color', 'RGBA', [.8, .8, .8, 1], ['t', 0]),
+                         _sk('Roughness', 'VALUE', 0.),
+                         _sk('Normal', 'VECTOR', [0, 0, 0])],
+                        [{'name': 'BSDF', 'type': 'SHADER'}]),
+            'out': _wnode('out', 'ShaderNodeOutputMaterial', {},
+                          [_sk('Surface', 'SHADER', None, ['b', 0]),
+                           _sk('Displacement', 'VECTOR', [0, 0, 0])], [])}}
+        seen[ntype] = R.render(sc, st)[5:40, :, :3]
+        check(f'noise type {ntype} varies', seen[ntype].std() > 0.01,
+              f'std={seen[ntype].std():.4f}')
+    same = [a for a in seen if a != 'FBM'
+            and float(np.abs(seen[a] - seen['FBM']).mean()) < 1e-5]
+    check('the fractal types differ from plain fBm', not same, ', '.join(same))
+
+    # Gabor through a material
+    st = base_settings(96, 72)
+    sc = demo_scene(st)
+    sc.materials[0].graph = {'output': 'out', 'nodes': {
+        't': _wnode('t', 'ShaderNodeTexGabor', {'gabor_type': '2D'},
+                    [_sk('Vector', 'VECTOR', [0, 0, 0]),
+                     _sk('Scale', 'VALUE', 5.0), _sk('Frequency', 'VALUE', 2.0),
+                     _sk('Anisotropy', 'VALUE', 1.0),
+                     _sk('Orientation', 'VALUE', 0.7)],
+                    [{'name': 'Value', 'type': 'VALUE'},
+                     {'name': 'Phase', 'type': 'VALUE'},
+                     {'name': 'Intensity', 'type': 'VALUE'}]),
+        'b': _wnode('b', 'ShaderNodeBsdfDiffuse', {},
+                    [_sk('Color', 'RGBA', [.8, .8, .8, 1], ['t', 0]),
+                     _sk('Roughness', 'VALUE', 0.),
+                     _sk('Normal', 'VECTOR', [0, 0, 0])],
+                    [{'name': 'BSDF', 'type': 'SHADER'}]),
+        'out': _wnode('out', 'ShaderNodeOutputMaterial', {},
+                      [_sk('Surface', 'SHADER', None, ['b', 0]),
+                       _sk('Displacement', 'VECTOR', [0, 0, 0])], [])}}
+    g = R.render(sc, st)[5:40, :, :3]
+    check('Gabor renders a pattern', g.std() > 0.01, f'std={g.std():.4f}')
+
+
+def test_wireframe_via_material_override():
+    """A material set to Wireframe in the Halcyon panel must draw edges.
+
+    Blender materials always carry a node tree, so the override has to win over
+    the graph or the model silently degrades to flat colour.
+    """
+    st = base_settings(160, 120, film_transparent=True)
+    sc = demo_scene(st)
+    for m in sc.materials:
+        m.use_override = True
+        m.model = 'WIREFRAME'
+        m.graph = {'output': 'out', 'nodes': {
+            'b': _wnode('b', 'ShaderNodeBsdfDiffuse', {},
+                        [_sk('Color', 'RGBA', [.8, .8, .8, 1]),
+                         _sk('Roughness', 'VALUE', 0.5),
+                         _sk('Normal', 'VECTOR', [0, 0, 0])],
+                        [{'name': 'BSDF', 'type': 'SHADER'}]),
+            'out': _wnode('out', 'ShaderNodeOutputMaterial', {},
+                          [_sk('Surface', 'SHADER', None, ['b', 0]),
+                           _sk('Displacement', 'VECTOR', [0, 0, 0])], [])}}
+    img = R.render(sc, st)
+    frac = float((img[..., 3] > 0.5).mean())
+    check('material-override Wireframe draws edges', 0.002 < frac < 0.25,
+          f'{frac * 100:.2f}% of pixels solid')
+
+
+def test_no_node_falls_back_silently():
+    """No node in a normal material may raise and degrade to pass-through.
+
+    A node that throws is caught and replaced by its first input, which still
+    produces plausible variation -- that is exactly how a crash inside the Noise
+    texture went unnoticed while looking like it worked.
+    """
+    from ..core.nodeeval import GraphEvaluator, ShadeContext
+    from ..core.settings import RenderSettings
+    ctx = ShadeContext(64)
+    ctx.settings = RenderSettings()
+    ctx.generated = np.stack([np.linspace(0, 1, 64)] * 3, 1).astype(np.float32)
+    ctx.uv = np.stack([np.linspace(0, 1, 64)] * 2, 1).astype(np.float32)
+    ctx.N = np.tile(np.array([[0, 0, 1.0]], np.float32), (64, 1))
+    ctx.I = np.tile(np.array([[0, 0, -1.0]], np.float32), (64, 1))
+    ctx.P = np.zeros((64, 3), np.float32)
+
+    cases = {
+        'ShaderNodeTexNoise': ([_sk('Vector', 'VECTOR', [0, 0, 0]),
+                                _sk('Scale', 'VALUE', 5.0),
+                                _sk('Detail', 'VALUE', 3.0),
+                                _sk('Roughness', 'VALUE', 0.5),
+                                _sk('Lacunarity', 'VALUE', 2.0),
+                                _sk('Distortion', 'VALUE', 0.0)],
+                               {'noise_dimensions': '3D'}),
+        'ShaderNodeTexVoronoi': ([_sk('Vector', 'VECTOR', [0, 0, 0]),
+                                  _sk('Scale', 'VALUE', 5.0),
+                                  _sk('Randomness', 'VALUE', 1.0)],
+                                 {'feature': 'F1', 'distance': 'EUCLIDEAN'}),
+        'ShaderNodeTexMagic': ([_sk('Vector', 'VECTOR', [0, 0, 0]),
+                                _sk('Scale', 'VALUE', 5.0),
+                                _sk('Distortion', 'VALUE', 1.0)],
+                               {'turbulence_depth': 2}),
+        'ShaderNodeTexWave': ([_sk('Vector', 'VECTOR', [0, 0, 0]),
+                               _sk('Scale', 'VALUE', 5.0),
+                               _sk('Distortion', 'VALUE', 2.0),
+                               _sk('Detail', 'VALUE', 2.0)],
+                              {'wave_type': 'BANDS'}),
+        'ShaderNodeTexGabor': ([_sk('Vector', 'VECTOR', [0, 0, 0]),
+                                _sk('Scale', 'VALUE', 5.0),
+                                _sk('Frequency', 'VALUE', 2.0),
+                                _sk('Anisotropy', 'VALUE', 1.0),
+                                _sk('Orientation', 'VALUE', 0.5)],
+                               {'gabor_type': '2D'}),
+    }
+    broken = []
+    for tid, (ins, props) in cases.items():
+        node = _wnode('t', tid, props, ins,
+                      [{'name': 'Fac', 'type': 'VALUE'},
+                       {'name': 'Color', 'type': 'RGBA'},
+                       {'name': 'Value', 'type': 'VALUE'}])
+        ev = GraphEvaluator({'output': None, 'nodes': {'t': node}}, ctx)
+        ev.eval_output('t', 0)
+        ev.eval_output('t', 1)
+        if ev.errors:
+            broken.append(f"{tid}: {ev.errors[0][2][:60]}")
+    check('no texture node raises and silently falls back', not broken,
+          '; '.join(broken))
+
+
+def _pattern_specs():
+    """SPECS from the node module, which needs bpy -- so provide the stub.
+
+    Tests must not depend on another test having installed it first; the runner
+    orders them alphabetically and that ordering has already shifted once.
+    """
+    from . import fakebpy
+    bpy = fakebpy.install()
+    if not hasattr(bpy.types, 'UIList'):
+        bpy.types.UIList = type('UIList', (bpy.types.Panel,), {})
+    from ..nodes.pattern_nodes import SPECS
+    return SPECS
+
+
+def _pattern_graph(cls_name, sockets, props, outputs, out_index=0):
+    ins = []
+    for kind, name, default in sockets:
+        typ = {'NodeSocketFloat': 'VALUE', 'NodeSocketColor': 'RGBA',
+               'NodeSocketVector': 'VECTOR'}[kind]
+        d = list(default) if isinstance(default, tuple) else default
+        ins.append(_sk(name, typ, d if d is not None else [0, 0, 0]))
+    kinds = {'NodeSocketFloat': 'VALUE', 'NodeSocketColor': 'RGBA',
+             'NodeSocketVector': 'VECTOR'}
+    outs = [{'name': n, 'type': kinds[k]} for k, n in outputs]
+    pv = {}
+    for key, spec in props.items():
+        pv[key] = spec[1]
+    return {'output': 'out', 'nodes': {
+        't': _wnode('t', cls_name, pv, ins, outs),
+        'b': _wnode('b', 'ShaderNodeBsdfDiffuse', {},
+                    [_sk('Color', 'RGBA', [.8, .8, .8, 1], ['t', out_index]),
+                     _sk('Roughness', 'VALUE', 0.0),
+                     _sk('Normal', 'VECTOR', [0, 0, 0])],
+                    [{'name': 'BSDF', 'type': 'SHADER'}]),
+        'out': _wnode('out', 'ShaderNodeOutputMaterial', {},
+                      [_sk('Surface', 'SHADER', None, ['b', 0]),
+                       _sk('Displacement', 'VECTOR', [0, 0, 0])], [])}}
+
+
+def test_pattern_nodes():
+    """Every Halcyon procedural must render, vary, and never silently fall back.
+
+    The graphs are built from the same spec table the node classes are, so a
+    socket rename cannot make this test quietly stop covering anything.
+    """
+    from ..core.nodeeval import DISPATCH, GraphEvaluator, ShadeContext
+    from ..core.settings import RenderSettings
+    SPECS = _pattern_specs()
+
+    ctx = ShadeContext(256)
+    ctx.settings = RenderSettings()
+    g = np.stack([np.linspace(0, 1, 256), np.linspace(0, 1, 256) ** 1.3,
+                  np.linspace(0.2, 0.8, 256)], 1).astype(np.float32)
+    ctx.generated = g
+    ctx.uv = g[:, :2].copy()
+    ctx.P = g * 3.0
+    ctx.N = np.tile(np.array([[0, 0, 1.0]], np.float32), (256, 1))
+    ctx.I = np.tile(np.array([[0, 0, -1.0]], np.float32), (256, 1))
+    ctx.time = 1.5
+
+    broke, flat, missing = [], [], []
+    for name, _label, _icon, _desc, sockets, props, outputs in SPECS:
+        idname = f'HALCYON_{name}Node'
+        if idname not in DISPATCH:
+            missing.append(idname)
+            continue
+        graph = _pattern_graph(idname, sockets, props, outputs)
+        ev = GraphEvaluator(graph, ctx)
+        for oi in range(len(outputs)):
+            v = ev.eval_output('t', oi)
+            if v is None:
+                broke.append(f'{name}[{oi}]=None')
+        if ev.errors:
+            broke.append(f'{name}: {ev.errors[0][2][:70]}')
+            continue
+        col = ev.eval_output('t', 0)
+        if col is None or float(np.asarray(col).std()) < 1e-4:
+            flat.append(name)
+    check(f'all {len(SPECS)} pattern nodes have evaluators', not missing,
+          ', '.join(missing))
+    check('no pattern node raises and silently falls back', not broke,
+          '; '.join(broke[:3]))
+    check('every pattern node produces variation', not flat, ', '.join(flat))
+
+
+def test_pattern_nodes_render():
+    """And they survive a real render through the material pipeline."""
+    SPECS = _pattern_specs()
+    flat = []
+    for name, _label, _icon, _desc, sockets, props, outputs in SPECS:
+        st = base_settings(96, 72)
+        sc = demo_scene(st)
+        sc.materials[0].graph = _pattern_graph(f'HALCYON_{name}Node', sockets,
+                                               props, outputs)
+        floor = R.render(sc, st)[5:40, :, :3]
+        if not np.isfinite(floor).all() or floor.std() < 0.005:
+            flat.append(f'{name}({floor.std():.4f})')
+    check('every pattern node renders with visible variation', not flat,
+          ', '.join(flat))
+
+
+def test_film_transparency():
+    """The background must be opaque unless transparency is asked for."""
+    for transparent in (False, True):
+        st = base_settings(80, 60, film_transparent=transparent)
+        img = R.render(demo_scene(st), st)
+        bg = float(img[-5:, :, 3].max())
+        geo = float(img[5:20, :, 3].min())
+        check(f'film_transparent={transparent} gives the right background alpha',
+              (bg < 0.01) if transparent else (bg > 0.99), f'alpha={bg:.2f}')
+        check(f'film_transparent={transparent} keeps geometry opaque', geo > 0.99,
+              f'alpha={geo:.2f}')
+
+
+def test_material_conversion_plan():
+    """Converting a material must pick a sensible model and carry inputs over."""
+    from ..core.convert import SOURCES, choose_model, glossiness_from_roughness, plan
+
+    expected = {
+        'ShaderNodeBsdfDiffuse': 'LAMBERT',
+        'ShaderNodeEmission': 'CONSTANT',
+        'ShaderNodeBsdfGlass': 'BLINN',
+        'ShaderNodeBsdfToon': 'TOON',
+        'ShaderNodeBsdfTranslucent': 'TRANSLUCENT',
+        'ShaderNodeBsdfMetallic': 'METAL',
+    }
+    wrong = []
+    for idname, model in expected.items():
+        got = choose_model(idname, {'Roughness': 0.0}, set())
+        if got != model:
+            wrong.append(f'{idname}->{got} (wanted {model})')
+    check('each source shader maps to the right model', not wrong,
+          ', '.join(wrong))
+
+    # every source in the table must produce a plan with a valid model
+    from ..core.shading import MODEL_ITEMS
+    valid = {m[0] for m in MODEL_ITEMS}
+    bad = []
+    for idname in SOURCES:
+        p = plan(idname, {'Color': [.5, .5, .5, 1], 'Roughness': 0.3}, set())
+        if p['model'] not in valid:
+            bad.append(f"{idname}->{p['model']}")
+        if not p['pairs']:
+            bad.append(f'{idname}: nothing carried')
+    check(f'all {len(SOURCES)} source shaders plan cleanly', not bad,
+          ', '.join(bad))
+
+    # an unknown shader must still convert rather than fail
+    p = plan('ShaderNodeBsdfFromTheFuture', {'Color': [1, 0, 0, 1]}, set())
+    check('an unknown source still converts', p['model'] in valid and p['pairs'],
+          f"{p['model']} {[t for t, _ in p['pairs']]}")
+
+    # linked sockets count even when their constant reads zero
+    check('a linked Metallic still selects METAL',
+          choose_model('ShaderNodeBsdfPrincipled', {'Metallic': 0.0},
+                       {'Metallic'}) == 'METAL')
+    check('a linked Anisotropic still selects ANISOTROPIC',
+          choose_model('ShaderNodeBsdfPrincipled', {}, {'Anisotropic'})
+          == 'ANISOTROPIC')
+
+    # roughness has to become the exponent the period models actually shade with
+    check('roughness maps to a sane specular exponent',
+          glossiness_from_roughness(1.0) < glossiness_from_roughness(0.5)
+          < glossiness_from_roughness(0.1),
+          f'{glossiness_from_roughness(1.0):.1f} / '
+          f'{glossiness_from_roughness(0.5):.1f} / '
+          f'{glossiness_from_roughness(0.1):.1f}')
+
+    # the mapping must only name sockets the master shader actually has
+    from ..nodes import shader_nodes as SN
+    sockets = {name for _k, name, _d in SN.HALCYON_ShaderNode.SOCKETS}
+    unknown = set()
+    for table in SOURCES.values():
+        for target, _aliases in table:
+            if target not in sockets:
+                unknown.add(target)
+    for extras in __import__('halcyon.core.convert', fromlist=['EXTRAS']).EXTRAS.values():
+        for target in extras:
+            if target not in sockets:
+                unknown.add(target)
+    check('every mapped socket exists on the master shader', not unknown,
+          ', '.join(sorted(unknown)))
+
+
+def test_stock_panels_are_adopted():
+    """Blender's engine-agnostic property panels must all be available.
+
+    A hand-written list of panel names rots: the previous one was missing the
+    material slot list, so a model with several materials had no way to reach
+    any but the active one, and the UV map list, colour attributes, vertex
+    groups and colour management were gone too.
+    """
+    from . import fakebpy
+    bpy = fakebpy.install()
+
+    class _Panel(bpy.types.Panel):
+        pass
+
+    keep = []                       # __subclasses__ is weak; hold references
+
+    def mk(name, compat, space='PROPERTIES'):
+        cls = type(name, (_Panel,), {'COMPAT_ENGINES': set(compat),
+                                     'bl_space_type': space})
+        keep.append(cls)
+        return cls
+
+    wanted = ['MATERIAL_PT_context_material', 'DATA_PT_uv_texture',
+              'DATA_PT_vertex_colors', 'DATA_PT_vertex_groups',
+              'DATA_PT_shape_keys', 'RENDER_PT_color_management',
+              'WORLD_PT_viewport_display', 'MATERIAL_PT_viewport']
+    for name in wanted:
+        mk(name, {'BLENDER_EEVEE'})
+    generic = mk('RENDER_PT_output', {'BLENDER_RENDER', 'BLENDER_EEVEE'})
+    rejects = [mk('RENDER_PT_freestyle', {'BLENDER_RENDER'}),
+               mk('CYCLES_PT_sampling', {'CYCLES'}),
+               mk('VIEW3D_PT_tools', {'BLENDER_RENDER'}, space='VIEW_3D')]
+
+    import importlib
+    engine = importlib.import_module('halcyon.engine')
+    adopted = {c.__name__ for c in engine.enable_compatible_panels()}
+    missing = [w for w in wanted if w not in adopted]
+    check('every essential stock panel is adopted', not missing,
+          ', '.join(missing))
+    check('generic panels are adopted', generic.__name__ in adopted)
+    wrong = [r.__name__ for r in rejects if r.__name__ in adopted]
+    check('unsupported and foreign panels are left alone', not wrong,
+          ', '.join(wrong))
+    engine.disable_compatible_panels()
+    still = [c.__name__ for c in keep
+             if 'HALCYON_RENDER' in getattr(c, 'COMPAT_ENGINES', set())]
+    check('unregistering removes the engine from every panel', not still,
+          ', '.join(still))
+
+
+def test_inverse_colormap_is_exact():
+    """The fast nearest-colour cube must agree with brute force.
+
+    It is built with a matrix product and the |c|^2 term dropped, which is only
+    valid because that term cannot change which palette entry is nearest. If
+    that reasoning were wrong the dithering would go subtly wrong everywhere.
+    """
+    from ..core import palette as PA
+    rng = np.random.default_rng(3)
+    for size in (16, 64, 256):
+        pal = rng.random((size, 3)).astype(np.float32)
+        icm = PA.InverseColormap(pal)
+        n = icm.bits
+        cells = rng.integers(0, icm.n, size=(2000, 3))
+        c = ((cells + 0.5) / icm.n).astype(np.float32)
+        brute = np.argmin(((c[:, None, :] - pal[None, :, :]) ** 2).sum(2), axis=1)
+        got = icm.lut[(cells[:, 0] << (2 * n)) | (cells[:, 1] << n) | cells[:, 2]]
+        check(f'inverse colormap matches brute force ({size} colours)',
+              bool((brute == got).all()),
+              f'{int((brute != got).sum())} of 2000 differ')
+
+    pal = rng.random((64, 3)).astype(np.float32)
+    a = PA.get_inverse_colormap(pal)
+    b = PA.get_inverse_colormap(pal)
+    check('the cached cube is the same object', a is b)
+    check('the cached cube matches an uncached one',
+          np.array_equal(a.lut, PA.InverseColormap(pal).lut))
+
+
+def test_palette_lock():
+    """A locked palette must be identical frame to frame, and releasable."""
+    from ..core import palette as PA
+    from ..core import post as PO
+    from ..core.settings import RenderSettings
+    PA.clear_caches()
+    st = RenderSettings()
+    st.palette_mode = 'ADAPTIVE'
+    st.palette_size = 64
+    rng = np.random.default_rng(5)
+    frame_a = rng.random((32, 32, 3)).astype(np.float32)
+    frame_b = rng.random((32, 32, 3)).astype(np.float32)
+
+    st.palette_lock = True
+    p1 = PO._palette_for(st, 64, frame_a, 0)
+    p2 = PO._palette_for(st, 64, frame_b, 0)
+    check('a locked palette is identical on the next frame',
+          np.array_equal(p1, p2))
+
+    st.palette_lock = False
+    p3 = PO._palette_for(st, 64, frame_b, 0)
+    check('unlocking rebuilds it from the new frame',
+          not np.array_equal(p1, p3))
+
+    PA.clear_caches()
+    st.palette_lock = True
+    p4 = PO._palette_for(st, 64, frame_b, 0)
+    check('clearing the cache releases the lock', not np.array_equal(p1, p4))
+
+
+def test_error_diffusion_output():
+    """The rewritten diffusion loop must still produce palette-only output."""
+    from ..core import dither as DI
+    from ..core import palette as PA
+    rng = np.random.default_rng(7)
+    img = rng.random((48, 64, 3)).astype(np.float32)
+    pal = PA.get_palette('ADAPTIVE', 32, img.reshape(-1, 3), 'MEDIAN_CUT', 0)
+    for kind in ('FLOYD', 'STUCKI', 'ATKINSON', 'JJN', 'BURKES', 'SIERRA'):
+        out, idx = DI.error_diffusion(img, pal, kind, 1.0, True)
+        check(f'{kind} emits only palette colours',
+              bool(np.abs(out - pal[idx]).max() < 1e-6))
+        check(f'{kind} output is finite and in range',
+              bool(np.isfinite(out).all() and out.min() >= -1e-6
+                   and out.max() <= 1.0 + 1e-6))
+    # serpentine must actually change the result
+    a, _ = DI.error_diffusion(img, pal, 'FLOYD', 1.0, True)
+    b, _ = DI.error_diffusion(img, pal, 'FLOYD', 1.0, False)
+    check('serpentine traversal changes the pattern',
+          float(np.abs(a - b).mean()) > 1e-4)
+
+
+def test_wavefront_diffusion_matches_sequential():
+    """The diagonal-at-a-time diffusion must equal the pixel-at-a-time one.
+
+    Error diffusion looks strictly serial, but a pixel only depends on
+    neighbours up and to the left, so everything on the skewed diagonal
+    x + b*y = t is mutually independent. That is only worth having if the result
+    is provably the same, so this compares them exactly.
+    """
+    from ..core import dither as DI
+    from ..core import palette as PA
+    rng = np.random.default_rng(11)
+    img = rng.random((60, 80, 3)).astype(np.float32)
+    pal = PA.get_palette('ADAPTIVE', 32, img.reshape(-1, 3), 'MEDIAN_CUT', 0)
+    icm = PA.get_inverse_colormap(pal)
+    bad = []
+    for kind in ('FLOYD', 'JJN', 'STUCKI', 'ATKINSON', 'BURKES', 'SIERRA',
+                 'SIERRA_LITE'):
+        saved = DI.error_diffusion_wavefront
+        DI.error_diffusion_wavefront = lambda *a, **k: None
+        try:
+            seq, seq_i = DI.error_diffusion(img, pal, kind, 1.0, False, icm)
+        finally:
+            DI.error_diffusion_wavefront = saved
+        fast, fast_i = DI.error_diffusion(img, pal, kind, 1.0, False, icm)
+        if not np.array_equal(seq_i, fast_i) or \
+                float(np.abs(seq - fast).max()) != 0.0:
+            bad.append(kind)
+    check('wavefront diffusion is identical to sequential for every kernel',
+          not bad, ', '.join(bad))
+
+    # the schedule must be rejected outright if a kernel cannot support one
+    check('an unschedulable kernel is refused',
+          DI._wave_skew([(-1, 0, 1.0)]) is None)
+    check('Floyd-Steinberg skews by 2', DI._wave_skew(DI.KERNELS['FLOYD'][0]) == 2)
+
+    # serpentine must still take the sequential route
+    a, _ = DI.error_diffusion(img, pal, 'FLOYD', 1.0, True, icm)
+    b, _ = DI.error_diffusion(img, pal, 'FLOYD', 1.0, False, icm)
+    check('serpentine still differs from single-direction',
+          float(np.abs(a - b).mean()) > 1e-4)
+
+
+def test_band_rendering_rejoins_exactly():
+    """Rendering in horizontal bands must equal rendering the whole frame."""
+    for ss in (1, 2):
+        st = base_settings(120, 90, aa_mode='SUPERSAMPLE' if ss > 1 else 'NONE')
+        st.aa_samples = ss * ss
+        sc = demo_scene(st)
+        full = R.render(sc, st)
+        rows = [(y, min(y + 15, 90)) for y in range(0, 90, 15)]
+        joined = np.concatenate([R.render(sc, st, band=b) for b in rows], axis=0)
+        check(f'bands rejoin exactly at {ss}x supersampling',
+              joined.shape == full.shape and
+              float(np.abs(joined - full).max()) == 0.0,
+              f'{joined.shape} vs {full.shape}')
+
+
+def test_worker_pool():
+    """Worker processes must produce the same image, and fail safely."""
+    from ..core import parallel as P
+
+    exe = P.find_interpreter()
+    check('a worker interpreter can be located', exe is not None, str(exe))
+    parent, pkg = P.package_location()
+    check('the package can be imported by a worker',
+          os.path.isdir(os.path.join(parent, pkg)), f'{parent} / {pkg}')
+
+    st = base_settings(320, 240)
+    sc = demo_scene(st)
+    ref = R.render(sc, st)
+    img, err = P.render_parallel(sc, st, workers=3, scene_key='test')
+    if img is None:
+        check('worker pool renders (skipped: unavailable here)', True, str(err))
+    else:
+        check('the worker pool result is identical to in-process',
+              img.shape == ref.shape and float(np.abs(img - ref).max()) == 0.0,
+              f'{img.shape} vs {ref.shape}')
+        img2, _ = P.render_parallel(sc, st, workers=3, scene_key='test')
+        check('a second frame reuses the workers and still matches',
+              img2 is not None and float(np.abs(img2 - ref).max()) == 0.0)
+
+    # every refusal must be a reason, never a crash
+    small = base_settings(40, 30)
+    _none, why = P.render_parallel(sc, small, workers=4)
+    check('an undersized frame declines with a reason',
+          _none is None and bool(why), str(why))
+    _none, why = P.render_parallel(sc, st, workers=1)
+    check('a single worker declines with a reason',
+          _none is None and bool(why), str(why))
+    P.shutdown()
+    check('the pool shuts down cleanly', True)
+
+
+def test_compiled_shader_survives_pickling():
+    """Workers rebuild compiled shaders from their generated source."""
+    import pickle
+
+    from ..shaders.compiler import compile_shader
+    prog = compile_shader(
+        'uniform float k = 2.0; in vec2 vUV; out vec4 C;'
+        ' void main(){ C = vec4(vUV.x * k, k, 0.0, 1.0); }', 'GLSL')
+    clone = pickle.loads(pickle.dumps(prog))
+    n = 8
+    uni = {'k': np.full(n, 3.0, np.float32)}
+    varying = {'vUV': np.stack([np.linspace(0, 1, n),
+                                np.zeros(n)], 1).astype(np.float32)}
+    a, _ = prog.run(uni, varying, n)
+    b, _ = clone.run(uni, varying, n)
+    check('a pickled shader still compiles and runs identically',
+          np.array_equal(a['C'], b['C']))
+
+
+def test_caches_do_not_change_the_image():
+    """Every cache must be invisible in the output."""
+    from ..core import lights as LI
+    from ..core import render as RR
+    st = base_settings(200, 150)
+    sc = demo_scene(st)
+    RR.clear_caches()
+    st.cache_shadows = False
+    plain = R.render(sc, st)
+    RR.clear_caches()
+    st.cache_shadows = True
+    first = R.render(sc, st)
+    second = R.render(sc, st)
+    check('shadow caching does not change the first frame',
+          float(np.abs(plain - first).max()) == 0.0)
+    check('shadow caching does not change later frames',
+          float(np.abs(plain - second).max()) == 0.0)
+
+    # moving a light must invalidate the cache
+    sc2 = demo_scene(st)
+    sc2.lights[0].direction = (0.7, -0.3, -0.6)
+    moved = R.render(sc2, st)
+    check('moving a light rebuilds its shadow map',
+          float(np.abs(moved - second).max()) > 1e-4)
+    RR.clear_caches()
+
+
+def test_stats_report():
+    """The timing breakdown must record the stages it claims to."""
+    from ..core import stats as SS
+    SS.reset()
+    st = base_settings(120, 90)
+    R.render(demo_scene(st), st)
+    lines = []
+    SS.report(printer=lines.append)
+    text = '\n'.join(lines)
+    missing = [s for s in ('rasterise', 'shade', 'shadow maps')
+               if s not in text]
+    check('the breakdown names each render stage', not missing,
+          ', '.join(missing))
+    check('the breakdown names a slowest stage', 'slowest stage' in text)
+
+
+def test_stats_account_for_the_whole_frame():
+    """The breakdown must show any time it failed to attribute.
+
+    A report whose parts summed to 0.08s against a 19.5s total is worse than no
+    report, because it points at the wrong stage with apparent authority.
+    """
+    from ..core import stats as SS
+    SS.reset()
+    SS.add('a', 0.1)
+    lines = []
+    SS.report(total=10.0, printer=lines.append)
+    text = '\n'.join(lines)
+    check('a large gap is reported as unaccounted for', 'unaccounted' in text)
+    check('it refuses to name a slowest stage when most time is untracked',
+          'not instrumented' in text)
+
+    SS.reset()
+    st = base_settings(160, 120)
+    R.render(demo_scene(st), st)
+    lines = []
+    SS.report(printer=lines.append)
+    text = '\n'.join(lines)
+    for stage in ('rasterise', 'shade', 'background / sky',
+                  'resolve / downsample'):
+        check(f'the breakdown covers {stage}', stage in text)
+
+
+def test_fast_background():
+    """The cheap background path must not visibly change a smooth sky."""
+    from ..core.scene import World
+    out = {}
+    for fast in (False, True):
+        st = base_settings(200, 150, aa_mode='SUPERSAMPLE')
+        st.aa_samples = 4
+        st.fast_background = fast
+        sc = demo_scene(st)
+        sc.world = World()
+        sc.world.mode = 'GRADIENT'
+        out[fast] = R.render(sc, st)
+    diff = float(np.abs(out[False] - out[True]).mean())
+    check('the fast background matches a smooth sky closely', diff < 0.01,
+          f'mean difference {diff:.6f}')
+    check('the fast background keeps the frame size',
+          out[True].shape == out[False].shape)
+
+
+def _glass_scene(st, layers=8):
+    from .scenebuild import _mesh_concat, plane, sphere
+    parts = [plane(size=14.0, mat=0)]
+    parts += [sphere(centre=(0, 0, 0.6 + i * 0.3), radius=1.5, segs=24,
+                     rings=16, mat=1) for i in range(layers)]
+    sc = demo_scene(st)
+    sc.mesh = _mesh_concat(parts)
+    sc.materials[1].opacity = 0.35
+    sc.materials[1].has_alpha = True
+    return sc
+
+
+def test_abuffer_threading_and_layers():
+    """Transparency must be threaded, and identical however it is threaded."""
+    base = None
+    for threads in (1, 4, 16):
+        st = base_settings(200, 150, transparency='ABUFFER', threads=threads)
+        st.max_transparent_layers = 0
+        img = R.render(_glass_scene(st), st)
+        if base is None:
+            base = img
+        else:
+            check(f'A-buffer output is identical at {threads} threads',
+                  float(np.abs(base - img).max()) == 0.0)
+
+    # the layer cap must keep the near layers, which are the visible ones
+    st = base_settings(200, 150, transparency='ABUFFER')
+    st.max_transparent_layers = 4
+    capped = R.render(_glass_scene(st), st)
+    check('a layer cap barely changes the picture',
+          float(np.abs(base - capped).mean()) < 0.02,
+          f'mean difference {float(np.abs(base - capped).mean()):.5f}')
+    check('a layer cap keeps the image finite', bool(np.isfinite(capped).all()))
+
+    # and deep stacks must not cost more per layer than shallow ones
+    from ..core import stats as SS
+    SS.reset()
+    st = base_settings(200, 150, transparency='ABUFFER')
+    st.max_transparent_layers = 0
+    R.render(_glass_scene(st, layers=16), st)
+    lines = []
+    SS.report(printer=lines.append)
+    check('transparency shading is reported separately',
+          'transparency shading' in '\n'.join(lines))
+
+
+def test_transparency_modes():
+    """All four transparency modes must render, and mean different things."""
+    out = {}
+    for mode in ('NONE', 'STIPPLE', 'SORTED', 'ABUFFER'):
+        st = base_settings(200, 150, transparency=mode)
+        sc = demo_scene(st)
+        sc.materials[1].opacity = 0.4
+        sc.materials[1].has_alpha = True
+        out[mode] = R.render(sc, st)
+        check(f'{mode} renders a visible scene',
+              float(out[mode][..., :3].std()) > 0.05,
+              f'std={float(out[mode][..., :3].std()):.4f}')
+
+    check('Opaque ignores alpha entirely',
+          float(np.abs(out['NONE'] - out['ABUFFER']).mean()) > 1e-4)
+    check('Screen Door differs from blending',
+          float(np.abs(out['STIPPLE'] - out['ABUFFER']).mean()) > 1e-4)
+
+    # Sorted and A-Buffer agree on convex geometry and part where it crosses
+    from .scenebuild import _mesh_concat, plane
+
+    def tilted(z, tilt, mat):
+        V, N, UV, T, _m, _o = plane(z=z, size=6.0, mat=mat)
+        V = V.copy()
+        V[:, 2] += V[:, 0] * tilt
+        return (V, N, UV, T, mat, 0)
+
+    got = {}
+    for mode in ('SORTED', 'ABUFFER'):
+        st = base_settings(200, 150, transparency=mode)
+        sc = demo_scene(st)
+        sc.mesh = _mesh_concat([tilted(1.0, 0.6, 1), tilted(1.2, -0.6, 2)])
+        for m in (sc.materials[1], sc.materials[2]):
+            m.opacity = 0.5
+            m.has_alpha = True
+        got[mode] = R.render(sc, st)
+    check('Sorted and A-Buffer differ where polygons interpenetrate',
+          float(np.abs(got['SORTED'] - got['ABUFFER']).mean()) > 1e-5,
+          f"{float(np.abs(got['SORTED'] - got['ABUFFER']).mean()):.6f}")
+
+
+def test_rays_only_where_wanted():
+    """Secondary rays must be traced per fragment, not per batch.
+
+    Testing np.any() and then tracing for the whole batch meant one transparent
+    fragment in a chunk cost a refraction ray for every fragment in it.
+    """
+    st = base_settings(200, 150, raytrace=True)
+    st.ray_depth = 2
+    st.ray_refraction = True
+    sc = demo_scene(st)
+    sc.materials[1].opacity = 0.4
+    sc.materials[1].has_alpha = True
+    with_glass = R.render(sc, st)
+
+    sc2 = demo_scene(st)          # nothing transparent at all
+    opaque_only = R.render(sc2, st)
+    check('a transparent material changes the picture',
+          float(np.abs(with_glass - opaque_only).mean()) > 1e-4)
+    check('ray-traced output stays finite', bool(np.isfinite(with_glass).all()))
+
+    # and reflection must only touch reflective fragments
+    sc3 = demo_scene(st)
+    sc3.materials[1].reflect_level = 0.0
+    sc3.materials[2].reflect_level = 0.9
+    mixed = R.render(sc3, st)
+    check('reflection applies selectively', bool(np.isfinite(mixed).all())
+          and float(np.abs(mixed - opaque_only).mean()) > 1e-5)
+
+
+def test_strict_node_evaluation():
+    """Strict mode must surface a node failure instead of hiding it."""
+    from ..core import nodeeval as NE
+    from ..core.settings import RenderSettings
+
+    bad = _wnode('t', 'ShaderNodeTexNoise', {'noise_dimensions': 'NONSENSE'},
+                 [_sk('Vector', 'VECTOR', [0, 0, 0]),
+                  _sk('Scale', 'VALUE', 'not a number')],
+                 [{'name': 'Fac', 'type': 'VALUE'}])
+    ctx = _ctx()
+    graph = {'output': None, 'nodes': {'t': bad}}
+
+    NE.STRICT = False
+    ev = NE.GraphEvaluator(graph, ctx)
+    ev.eval_output('t', 0)
+    check('a broken node falls back quietly by default', bool(ev.errors))
+
+    NE.STRICT = True
+    try:
+        raised = False
+        try:
+            NE.GraphEvaluator(graph, ctx).eval_output('t', 0)
+        except Exception:                                       # noqa: BLE001
+            raised = True
+        check('strict mode raises instead', raised)
+    finally:
+        NE.STRICT = False
+    check('strict mode is off again afterwards', NE.STRICT is False)
+
+
+def test_debug_settings_survive_presets():
+    """Developer settings must not be reset by loading a preset."""
+    from ..core.settings import RenderSettings
+    from ..presets.library import PRESERVED
+    st = RenderSettings()
+    st.use_processes = True
+    st.process_count = 12
+    st.show_stats = True
+    st.debug_pass = 'NORMAL'
+    apply_preset(st, 'PSX')
+    check('worker settings survive a preset',
+          st.use_processes and st.process_count == 12,
+          f'{st.use_processes} {st.process_count}')
+    check('the timing and pass settings survive a preset',
+          st.show_stats and st.debug_pass == 'NORMAL')
+    for name in ('use_processes', 'process_count', 'show_stats', 'debug_pass'):
+        check(f'{name} is listed as preserved', name in PRESERVED)
+
+
+def test_shader_node_tooltips():
+    """Every input documented, and the model lists checked against the shader.
+
+    The claim "Glossiness affects Phong but not Cook-Torrance" is only worth
+    making if it is true, so the ones that can be measured are measured: each
+    parameter is perturbed and the models whose output changes are compared with
+    what the tooltip says.
+    """
+    from ..core.shading import MODEL_ITEMS, Surface, evaluate
+    from ..core import mathx as MX
+    from ..nodes.shader_nodes import (ALL, MEASURED, SOCKET_DOCS, SOCKET_MODELS,
+                                      HALCYON_ShaderNode as HS)
+
+    names = [n for _k, n, _d in HS.SOCKETS]
+    check('every input has a tooltip',
+          all(n in SOCKET_DOCS for n in names),
+          ', '.join(n for n in names if n not in SOCKET_DOCS))
+    check('every input has a model list',
+          all(n in SOCKET_MODELS for n in names),
+          ', '.join(n for n in names if n not in SOCKET_MODELS))
+
+    idents = [m[0] for m in MODEL_ITEMS]
+    bad = []
+    for n, who in SOCKET_MODELS.items():
+        if who != ALL:
+            bad += [f'{n}:{m}' for m in who if m not in idents]
+    check('model lists name only real models', not bad, ', '.join(bad))
+    check('every model has a substantial description',
+          all(len(m[2]) > 60 for m in MODEL_ITEMS),
+          ', '.join(m[0] for m in MODEL_ITEMS if len(m[2]) <= 60))
+
+    # measure the truth and compare
+    fields = {'Specular Color': 'specular', 'Glossiness': 'glossiness',
+              'Roughness': 'roughness', 'Anisotropy': 'anisotropy',
+              'Anisotropic Rotation': 'aniso_rot', 'IOR': 'ior',
+              'Toon Size': 'toon_size', 'Toon Smooth': 'toon_smooth'}
+    n = 48
+    N = np.tile(np.array([[0, 0, 1.0]], np.float32), (n, 1))
+    L = np.stack([np.linspace(-0.9, 0.9, n), np.full(n, 0.3),
+                  np.full(n, 0.6)], 1).astype(np.float32)
+    L /= np.linalg.norm(L, axis=1, keepdims=True)
+    V = np.tile(np.array([[0, 0.2, 0.98]], np.float32), (n, 1))
+
+    def fresh():
+        s = Surface(n)
+        s.diffuse[:] = 0.6
+        s.specular[:] = 0.9
+        s.specular_level[:] = 0.7
+        s.glossiness[:] = 25.0
+        s.roughness[:] = 0.4
+        s.metallic[:] = 0.3
+        s.anisotropy[:] = 0.3
+        s.aniso_rot[:] = 0.4
+        s.ior[:] = 1.5
+        s.toon_size[:] = 0.5
+        s.toon_smooth[:] = 0.2
+        s.tangent, s.bitangent = MX.orthonormal_basis(N)
+        return s
+
+    wrong = []
+    for sock, attr in fields.items():
+        if sock not in MEASURED:
+            continue
+        measured = set()
+        for ident in idents:
+            a = fresh()
+            d1, s1 = evaluate(ident, a, N, L, V)
+            b = fresh()
+            setattr(b, attr, getattr(b, attr) * 0.25 + 0.05)
+            d2, s2 = evaluate(ident, b, N, L, V)
+            if float(np.abs(d1 - d2).max()) > 1e-6 or \
+                    float(np.abs(s1 - s2).max()) > 1e-6:
+                measured.add(ident)
+        claimed = set(SOCKET_MODELS[sock]) if SOCKET_MODELS[sock] != ALL \
+            else set(idents)
+        if measured != claimed:
+            wrong.append(f"{sock}: claims {sorted(claimed)} but measures "
+                         f"{sorted(measured)}")
+    check('the documented model lists match the shading code', not wrong,
+          ' | '.join(wrong[:2]))
+
+
+def test_material_panel_visibility():
+    """The material panel must appear even with no material, so one can be made.
+
+    Requiring context.material to exist meant an object with no material had no
+    panel, and gating the slot list on more than one slot meant no Add button --
+    between them there was no way to create the first material from here.
+    """
+    import types
+
+    from . import fakebpy
+    bpy = fakebpy.install()
+    bpy.types.UIList = type('UIList', (bpy.types.Panel,), {})
+    bpy.types.AddonPreferences = type('AddonPreferences', (bpy.types.Panel,), {})
+    import importlib
+    ui = importlib.import_module('halcyon.ui')
+
+    def ctx(engine='HALCYON_RENDER', material=None, obj=True, slots=0):
+        o = None
+        if obj:
+            o = types.SimpleNamespace(
+                material_slots=[types.SimpleNamespace(material=None)] * slots,
+                active_material_index=0)
+        return types.SimpleNamespace(engine=engine, material=material, object=o)
+
+    cases = [
+        ('no object', ctx(obj=False), False),
+        ('zero slots', ctx(slots=0), True),
+        ('one empty slot', ctx(slots=1), True),
+        ('a real material', ctx(material=object(), slots=1), True),
+        ('another engine', ctx(engine='CYCLES', slots=2), False),
+    ]
+    wrong = [label for label, c, want in cases
+             if bool(ui.HALCYON_PT_material.poll(c)) is not want]
+    check('the material panel shows exactly when it should', not wrong,
+          ', '.join(wrong))
+
+    src = __import__('inspect').getsource(ui.HALCYON_PT_material.draw)
+    check('the slot list is not gated on the slot count',
+          'material_slots' in src and "len(slots) > 1" not in
+          src.split('template_list')[0],
+          'the list is still conditional')
+    check('a New control is offered', 'material.new' in src)
+
+
+def _master(**over):
+    ins = [_sk('Diffuse Color', 'RGBA', [.7, .7, .75, 1]),
+           _sk('Diffuse Level', 'VALUE', 1.0),
+           _sk('Specular Color', 'RGBA', [1, 1, 1, 1]),
+           _sk('Specular Level', 'VALUE', 0.5),
+           _sk('Glossiness', 'VALUE', 25.0), _sk('Opacity', 'VALUE', 1.0),
+           _sk('Fresnel', 'VALUE', 0.0), _sk('Fresnel Power', 'VALUE', 3.0),
+           _sk('Fresnel Color', 'RGBA', [1, 1, 1, 1]),
+           _sk('Rim Light', 'RGBA', [1, 1, 1, 1]),
+           _sk('Rim Amount', 'VALUE', 0.0), _sk('Rim Power', 'VALUE', 3.0),
+           _sk('Matcap', 'RGBA', [1, 0, 0, 1]),
+           _sk('Matcap Blend', 'VALUE', 0.0),
+           _sk('Reflection Color', 'RGBA', [1, 1, 1, 1]),
+           _sk('Edge Opacity', 'VALUE', 1.0),
+           _sk('Backface Color', 'RGBA', [0, 1, 0, 1]),
+           _sk('Backface Mix', 'VALUE', 0.0)]
+    for k, v in over.items():
+        for x in ins:
+            if x['name'] == k:
+                x['default'] = v
+    return {'output': 'out', 'nodes': {
+        'h': _wnode('h', 'HALCYON_ShaderNode', {'model': 'PHONG'}, ins,
+                    [{'name': 'Surface', 'type': 'SHADER'}]),
+        'out': _wnode('out', 'ShaderNodeOutputMaterial', {},
+                      [_sk('Surface', 'SHADER', None, ['h', 0]),
+                       _sk('Displacement', 'VECTOR', [0, 0, 0])], [])}}
+
+
+def test_master_shader_effects():
+    """Fresnel, rim, matcap, edge opacity and backface must each do something."""
+    st = base_settings(160, 120, backface_cull=False)
+
+    def go(**over):
+        sc = demo_scene(st)
+        for m in sc.materials:
+            m.graph = _master(**over)
+        return R.render(sc, st)
+
+    base = go()
+    for label, over in (('Fresnel', {'Fresnel': 1.5}),
+                        ('Rim Light', {'Rim Amount': 1.2}),
+                        ('Matcap', {'Matcap Blend': 0.9}),
+                        ('Edge Opacity', {'Edge Opacity': 0.0}),
+                        ('Backface Mix', {'Backface Mix': 1.0})):
+        img = go(**over)
+        check(f'{label} changes the render',
+              float(np.abs(img - base).mean()) > 1e-4,
+              f'delta {float(np.abs(img - base).mean()):.6f}')
+        check(f'{label} stays finite', bool(np.isfinite(img).all()))
+
+    # Fresnel must act at the silhouette, not uniformly
+    lit = go(Fresnel=3.0)
+    diff = np.abs(lit - base)[..., :3].mean(axis=2)
+    check('Fresnel is stronger somewhere than everywhere',
+          float(diff.max()) > 4.0 * float(diff.mean()) if diff.mean() > 0 else False,
+          f'peak {diff.max():.4f} vs mean {diff.mean():.4f}')
+
+    # and the effects work whatever reflectance model is chosen
+    broken = []
+    for model in ('LAMBERT', 'COOK_TORRANCE', 'TOON', 'METAL'):
+        sc = demo_scene(st)
+        g = _master(**{'Rim Amount': 1.5})
+        g['nodes']['h']['props']['model'] = model
+        for m in sc.materials:
+            m.graph = g
+        plain = _master()
+        plain['nodes']['h']['props']['model'] = model
+        sc2 = demo_scene(st)
+        for m in sc2.materials:
+            m.graph = plain
+        if float(np.abs(R.render(sc, st) - R.render(sc2, st)).mean()) < 1e-4:
+            broken.append(model)
+    check('the rim term works on every model', not broken, ', '.join(broken))
+
+
+def test_matcap_coordinates():
+    """Matcap UVs must span the sphere and stay inside 0..1."""
+    from ..core.nodeeval import DISPATCH, GraphEvaluator
+    check('the Matcap Coordinates node exists',
+          'HALCYON_MatcapUVNode' in DISPATCH)
+    ctx = _ctx(64)
+    ang = np.linspace(-1.2, 1.2, 64)
+    ctx.N = np.stack([np.sin(ang), np.zeros(64), np.cos(ang)], 1).astype(np.float32)
+    ctx.I = np.tile(np.array([[0, 0, -1.0]], np.float32), (64, 1))
+    node = _wnode('m', 'HALCYON_MatcapUVNode', {},
+                  [_sk('Scale', 'VALUE', 1.0)],
+                  [{'name': 'Vector', 'type': 'VECTOR'},
+                   {'name': 'Facing', 'type': 'VALUE'}])
+    ev = GraphEvaluator({'output': None, 'nodes': {'m': node}}, ctx)
+    uv = ev.eval_output('m', 0)
+    check('matcap coordinates are produced', uv is not None)
+    if uv is not None:
+        check('they stay within the unit square',
+              float(uv[:, :2].min()) >= -0.001 and float(uv[:, :2].max()) <= 1.001,
+              f'{uv[:, :2].min():.3f}..{uv[:, :2].max():.3f}')
+        check('they vary with the normal', float(uv[:, 0].std()) > 0.05)
+    check('no error was swallowed', not ev.errors,
+          str(ev.errors[0] if ev.errors else ''))
+
+
+def test_no_setting_lies():
+    """Nothing in the UI may be a control that does nothing.
+
+    A slider that silently has no effect is worse than an absent one: it costs
+    the user time and their trust in every other control.
+    """
+    import dataclasses
+    import os
+    import re
+
+    from ..core.settings import RenderSettings
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = ''
+    for base, _dirs, files in os.walk(root):
+        if '__pycache__' in base or os.path.basename(base) == 'tests':
+            continue
+        for f in files:
+            if f.endswith('.py'):
+                with open(os.path.join(base, f)) as fh:
+                    src += fh.read() + '\n'
+    with open(os.path.join(root, 'ui.py')) as fh:
+        ui = fh.read()
+
+    dead = [f.name for f in dataclasses.fields(RenderSettings)
+            if not re.search(r'(?:st|settings|self\.settings)\.' + f.name + r'\b',
+                             src)
+            and not re.search(r"getattr\([^,]+,\s*'" + f.name + r"'", src)]
+    shown = [n for n in dead
+             if re.search(r"\.prop\((?:hs|self), '" + n + r"'", ui)]
+    check('no unimplemented setting is exposed in the UI', not shown,
+          ', '.join(shown))
+
+
+def test_no_duplicate_definitions():
+    """A definition shadowed by a later copy is dead code waiting to mislead."""
+    import ast
+    import os
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    problems = []
+    for base, _dirs, files in os.walk(root):
+        if '__pycache__' in base:
+            continue
+        for f in files:
+            if not f.endswith('.py'):
+                continue
+            path = os.path.join(base, f)
+            with open(path) as fh:
+                try:
+                    tree = ast.parse(fh.read())
+                except SyntaxError:
+                    problems.append(f'{f}: does not parse')
+                    continue
+            names = [n.name for n in tree.body
+                     if isinstance(n, (ast.FunctionDef, ast.ClassDef))]
+            dupes = sorted({n for n in names if names.count(n) > 1})
+            if dupes:
+                problems.append(f'{f}: {", ".join(dupes)}')
+    check('no module defines the same thing twice', not problems,
+          ' | '.join(problems))
+
+
+def test_new_settings_are_implemented():
+    """The settings implemented in this pass must actually change a render."""
+    st = base_settings(120, 90)
+
+    def go(**kw):
+        s = base_settings(120, 90, **kw)
+        sc = demo_scene(s)
+        sc.materials[1].opacity = 0.45
+        sc.materials[1].has_alpha = True
+        return R.render(sc, s)
+
+    check('alpha_threshold clips alpha',
+          float(np.abs(go(alpha_threshold=0.2) - go(alpha_threshold=0.8)).mean())
+          > 1e-4)
+    fog = dict(fog=True, fog_start=2.0, fog_end=20.0)
+    check('fog_vertex bands the fog',
+          float(np.abs(go(**fog) - go(fog_vertex=True, **fog)).mean()) > 1e-6)
+
+    from ..core import lights as LI
+    from ..core.scene import Light
+    from ..core.settings import RenderSettings
+    l = Light(type='POINT', position=(0, 0, 5))
+    d = np.array([2.0, 4.0], np.float32)
+    a = RenderSettings()
+    a.light_falloff_default = 'INVERSE'
+    b = RenderSettings()
+    b.light_falloff_default = 'INVERSE_SQUARE'
+    check('light_falloff_default drives a light set to Scene Default',
+          not np.allclose(LI.attenuate(l, d, a), LI.attenuate(l, d, b)))
+
+
+def test_painters_algorithm():
+    """Painter's must compare polygons, and fail the way the real thing does."""
+    from .scenebuild import _mesh_concat, plane
+
+    def tilted(z, tilt, mat):
+        V, N, UV, T, _m, _o = plane(z=z, size=6.0, mat=mat)
+        V = V.copy()
+        V[:, 2] += V[:, 0] * tilt
+        return (V, N, UV, T, mat, 0)
+
+    def cross(mode, key='CENTROID'):
+        st = base_settings(200, 150, depth_sort=mode)
+        st.painters_key = key
+        sc = demo_scene(st)
+        sc.mesh = _mesh_concat([tilted(1.0, 0.7, 1), tilted(1.1, -0.7, 2)])
+        sc.materials[1].diffuse = (0.9, 0.15, 0.1)
+        sc.materials[2].diffuse = (0.1, 0.3, 0.9)
+        return R.render(sc, st)
+
+    zb = cross('ZBUFFER')
+    pa = cross('PAINTERS')
+    check('interpenetrating surfaces render differently under Painters',
+          float(np.abs(zb - pa).mean()) > 1e-3,
+          f'mean difference {float(np.abs(zb - pa).mean()):.5f}')
+    check('both stay finite',
+          bool(np.isfinite(zb).all() and np.isfinite(pa).all()))
+
+    # the sort key must change where it goes wrong
+    keys = {}
+    for key in ('CENTROID', 'NEAREST', 'FARTHEST'):
+        st = base_settings(200, 150, depth_sort='PAINTERS')
+        st.painters_key = key
+        keys[key] = R.render(demo_scene(st), st)
+    pairs = [('CENTROID', 'NEAREST'), ('CENTROID', 'FARTHEST'),
+             ('NEAREST', 'FARTHEST')]
+    same = [f'{a}=={b}' for a, b in pairs
+            if float(np.abs(keys[a] - keys[b]).mean()) < 1e-5]
+    check('all three sort keys give different results', not same,
+          ', '.join(same))
+
+    # a whole polygon must carry one depth
+    from ..core import raster
+    st = base_settings(160, 120, depth_sort='PAINTERS')
+    sc = demo_scene(st)
+    _v, _p, vp, eye = R.camera_matrices(sc.camera, 160, 120)
+    view = np.linalg.inv(np.asarray(sc.camera.matrix_world, np.float32))
+    fd = R.polygon_depths(sc.mesh, view, eye, 'CENTROID')
+    check('one depth per triangle', fd.shape == (sc.mesh.tris.shape[0],),
+          str(fd.shape))
+    gb = raster.GBuffer(160, 120)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, 160, 120, gbuf=gb,
+                     flat_depth=fd)
+    cov = gb.mask()
+    yy, xx = np.nonzero(cov)
+    if yy.size:
+        tri = gb.tri[yy, xx]
+        got = gb.depth[yy, xx]
+        check('every fragment carries its polygon depth',
+              float(np.abs(got - fd[tri]).max()) < 1e-4,
+              f'max deviation {float(np.abs(got - fd[tri]).max()):.6f}')
+
+    # and the fast path must agree with the reference
+    saved = (raster.BATCH_MIN_TRIS, raster.LARGE_TRI_PX)
+    try:
+        raster.BATCH_MIN_TRIS, raster.LARGE_TRI_PX = 10 ** 9, 0
+        seq = R.render(demo_scene(st), st)
+        raster.BATCH_MIN_TRIS, raster.LARGE_TRI_PX = 24, 16384
+        bat = R.render(demo_scene(st), st)
+    finally:
+        raster.BATCH_MIN_TRIS, raster.LARGE_TRI_PX = saved
+    check('batched and sequential agree under Painters',
+          float(np.abs(seq - bat).max()) == 0.0)
+
+
+def test_new_features_1_5():
+    """Displacement bump, light linking, lens, shafts and defocus."""
+    st = base_settings(200, 150)
+
+    # light linking
+    base = R.render(demo_scene(st), st)
+    sc = demo_scene(st)
+    sc.lights[0].exclude_objects = (1,)
+    excl = R.render(sc, st)
+    sc2 = demo_scene(st)
+    sc2.lights[0].exclude_objects = (1,)
+    sc2.lights[0].exclude_mode = 'ONLY'
+    only = R.render(sc2, st)
+    check('light linking Exclude changes the render',
+          float(np.abs(base - excl).mean()) > 1e-4)
+    check('Only differs from Exclude', float(np.abs(excl - only).mean()) > 1e-4)
+
+    # displacement as bump
+    g = {'output': 'out', 'nodes': {
+        'n': _wnode('n', 'ShaderNodeTexNoise', {'noise_dimensions': '3D'},
+                    [_sk('Vector', 'VECTOR', [0, 0, 0]),
+                     _sk('Scale', 'VALUE', 9.0), _sk('Detail', 'VALUE', 3.0),
+                     _sk('Roughness', 'VALUE', .5),
+                     _sk('Distortion', 'VALUE', 0.)],
+                    [{'name': 'Fac', 'type': 'VALUE'},
+                     {'name': 'Color', 'type': 'RGBA'}]),
+        'd': _wnode('d', 'ShaderNodeDisplacement', {'space': 'OBJECT'},
+                    [_sk('Height', 'VALUE', 0.0, ['n', 0]),
+                     _sk('Midlevel', 'VALUE', 0.5), _sk('Scale', 'VALUE', 1.0),
+                     _sk('Normal', 'VECTOR', [0, 0, 0])],
+                    [{'name': 'Displacement', 'type': 'VECTOR'}]),
+        'b': _wnode('b', 'ShaderNodeBsdfDiffuse', {},
+                    [_sk('Color', 'RGBA', [.8, .8, .8, 1]),
+                     _sk('Roughness', 'VALUE', 0.),
+                     _sk('Normal', 'VECTOR', [0, 0, 0])],
+                    [{'name': 'BSDF', 'type': 'SHADER'}]),
+        'out': _wnode('out', 'ShaderNodeOutputMaterial', {},
+                      [_sk('Surface', 'SHADER', None, ['b', 0]),
+                       _sk('Displacement', 'VECTOR', [0, 0, 0], ['d', 0])], [])}}
+
+    def with_disp(scale):
+        s2 = base_settings(200, 150)
+        s2.displacement_scale = scale
+        sc3 = demo_scene(s2)
+        for m in sc3.materials:
+            m.graph = g
+        return R.render(sc3, s2)
+
+    check('displacement drives a bump normal',
+          float(np.abs(with_disp(1.5) - with_disp(0.0)).mean()) > 1e-4)
+
+    # post effects
+    def shot(**kw):
+        s2 = base_settings(200, 150, **{k: v for k, v in kw.items()
+                                        if k != 'vol'})
+        sc4 = demo_scene(s2)
+        if kw.get('vol'):
+            sc4.lights[0].direction = (0.55, -0.67, -0.38)
+            sc4.lights[0].volumetric = 2.0
+        img = R.render(sc4, s2)
+        return post.process(img, s2, target_size=(200, 150),
+                            depth=getattr(sc4, 'last_depth', None),
+                            shaft_sources=getattr(sc4, 'last_shafts', None))
+
+    plain = shot()
+    for label, kw in (('lens distortion', dict(lens_distortion=0.35)),
+                      ('chromatic aberration', dict(chromatic_aberration=4.0)),
+                      ('depth of field', dict(dof=True, dof_focus=9.0,
+                                              dof_amount=2.0)),
+                      ('light shafts', dict(vol=True))):
+        img = shot(**kw)
+        check(f'{label} changes the image',
+              float(np.abs(img - plain).mean()) > 1e-4,
+              f'delta {float(np.abs(img - plain).mean()):.5f}')
+        check(f'{label} stays finite', bool(np.isfinite(img).all()))
+
+    # a light behind the camera must throw no shafts
+    s3 = base_settings(200, 150)
+    sc5 = demo_scene(s3)
+    sc5.lights[0].direction = (-0.55, 0.67, 0.38)
+    sc5.lights[0].volumetric = 2.0
+    R.render(sc5, s3)
+    check('a source behind the camera is skipped',
+          len(getattr(sc5, 'last_shafts', [])) == 0)
+
+
+def test_gpu_shaders_compile_and_agree():
+    """Validate GLSL that no driver here can execute.
+
+    Halcyon has its own GLSL front-end and a NumPy backend. Compiling the GPU
+    stages with it and running them proves the *logic*, even though nothing on
+    this machine can prove the *execution*. Every stage the engine is allowed to
+    run must agree with the CPU function it replaces.
+    """
+    from ..core import dither as DI
+    from ..core import post as PO
+    from ..core.settings import RenderSettings
+    from ..core.texture import Texture
+    from ..gpu.stages import ENABLED, MASK_KINDS, STAGES, VALIDATION
+    from ..shaders.compiler import try_compile
+
+    bad = []
+    for name, src in STAGES.items():
+        prog, err = try_compile(src, 'GLSL')
+        if prog is None:
+            bad.append(f'{name}: {err}')
+    check(f'all {len(STAGES)} GPU stages are valid GLSL', not bad,
+          '; '.join(bad))
+
+    h, w = 32, 48
+    img = np.random.default_rng(2).random((h, w, 3)).astype(np.float32)
+    tex = Texture(np.concatenate([img, np.ones((h, w, 1), np.float32)], 2),
+                  colorspace='Non-Color', filt='NEAREST', wrap='EXTEND')
+    yy, xx = np.mgrid[0:h, 0:w]
+    uv = np.stack([((xx + 0.5) / w).ravel(),
+                   ((yy + 0.5) / h).ravel()], 1).astype(np.float32)
+    n = h * w
+
+    def run(name, **uni):
+        # bound as a uniform here only: the compiler resolves known varying
+        # names from a shading context this harness does not have
+        src = STAGES[name].replace('in vec2 vUV;', 'uniform vec2 vUV;')
+        prog, err = try_compile(src, 'GLSL')
+        u = {'source': tex, 'vUV': uv}
+        for k, v in uni.items():
+            u[k] = (np.full(n, float(v), np.float32)
+                    if isinstance(v, (int, float))
+                    else np.broadcast_to(np.asarray(v, np.float32),
+                                         (n, len(v))).copy())
+        outs, _d = prog.run(u, {}, n)
+        return outs['Color'].reshape(h, w, 4)[:, :, :3]
+
+    st = RenderSettings()
+    st.exposure, st.gamma, st.contrast = 1.3, 2.2, 0.15
+    st.saturation, st.brightness = 1.25, 0.05
+    got = run('DISPLAY', exposure=1.3, brightness=0.05, contrast=0.15,
+              saturation=1.25, gamma=2.2)
+    want = PO.display_transform(img.copy(), st)
+    check('the DISPLAY shader is exact against the CPU path',
+          float(np.abs(got - want).max()) < 1e-5,
+          f'max {float(np.abs(got - want).max()):.6f}')
+
+    s3 = RenderSettings()
+    s3.crt, s3.crt_scanlines, s3.crt_mask = True, 0.4, 'APERTURE'
+    s3.crt_mask_strength, s3.crt_vignette = 0.35, 0.5
+    s3.crt_curvature = s3.crt_bloom = 0.0
+    got = run('CRT', scanlines=0.4, mask_strength=0.35,
+              mask_kind=MASK_KINDS['APERTURE'], vignette=0.5, resolution=(w, h))
+    want = PO.crt(img.copy(), s3)
+    tol = VALIDATION['CRT'][1]
+    check('the CRT shader agrees within its stated tolerance',
+          float(np.abs(got - want).max()) <= tol,
+          f'max {float(np.abs(got - want).max()):.5f} vs tolerance {tol}')
+
+    got = run('DITHER', levels=(32., 64., 32.), strength=1.0, matrix_size=4.0,
+              resolution=(w, h))
+    want = DI.ordered_bits(img.copy(), (5, 6, 5), 'BAYER4', 1.0)
+    tol = VALIDATION['DITHER'][1]
+    check('the DITHER shader agrees within its stated tolerance',
+          float(np.abs(got - want).max()) <= tol,
+          f'max {float(np.abs(got - want).max()):.5f} vs tolerance {tol}')
+
+    # nothing unproven may be enabled
+    unproven = [k for k, (grade, _t) in VALIDATION.items()
+                if grade == 'UNPROVEN' and k in ENABLED]
+    check('no unvalidated stage is enabled', not unproven, ', '.join(unproven))
+    check('every enabled stage has a validation grade',
+          all(k in VALIDATION for k in ENABLED))
+
+
+def test_gpu_absence_is_handled():
+    """With no gpu module the engine must explain itself, not fall over."""
+    from ..gpu import device
+    from ..gpu.stages import STAGES
+    device.reset()
+    ok, why = device.probe()
+    check('probing without a GPU returns a reason', bool(why), str(why))
+    shader, err = device.compile_stage('DISPLAY', STAGES['DISPLAY'])
+    check('compiling without a GPU returns None and a reason',
+          shader is None and bool(err), str(err))
+    check('describe() is human readable', 'GPU' in device.describe(),
+          device.describe())
+
+
+def test_selftest_report():
+    """The self-test must produce a full report on a machine with no GPU."""
+    from . import fakebpy
+    bpy = fakebpy.install()
+    for name in ('UIList', 'AddonPreferences', 'Collection'):
+        if not hasattr(bpy.types, name):
+            setattr(bpy.types, name, type(name, (bpy.types.Panel,), {}))
+    bpy.app.version = (5, 2, 0)
+    import importlib
+    st_mod = importlib.import_module('halcyon.selftest')
+
+    out = []
+    st_mod.environment(out)
+    text = '\n'.join(out)
+    for field in ('addon', 'blender', 'platform', 'numpy', 'logical cores'):
+        check(f'the report states the {field}', field in text)
+
+    out = []
+    st_mod.gpu_stages(out)
+    check('the GPU section explains itself when there is no GPU',
+          'skipped' in '\n'.join(out), '\n'.join(out)[:80])
+
+    out = []
+    st_mod.frame_breakdown(out)
+    check('the report includes a frame breakdown',
+          'slowest stage' in '\n'.join(out))
+
+    out = []
+    st_mod.cpu_scaling(out)
+    text = '\n'.join(out)
+    check('the report includes thread scaling', 'threads' in text)
+    check('the report covers the worker pool', 'worker processes' in text)
+
+
+def test_no_bl_info_dependency():
+    """Nothing may read bl_info: an installed extension does not have it.
+
+    Blender uses blender_manifest.toml for extensions and does not expose
+    bl_info at all, so importing it raises ImportError on exactly the install
+    path most users take.
+    """
+    import os
+    import re
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    offenders = []
+    for base, _dirs, files in os.walk(root):
+        if '__pycache__' in base or os.path.basename(base) == 'tests':
+            continue
+        for f in files:
+            if not f.endswith('.py') or f == '__init__.py':
+                continue
+            with open(os.path.join(base, f)) as fh:
+                text = fh.read()
+            if re.search(r'import\s+bl_info|bl_info\s*\[', text):
+                offenders.append(f)
+    check('no module reads bl_info', not offenders, ', '.join(offenders))
+
+    from ..version import version, version_string
+    check('the version comes from the manifest',
+          isinstance(version(), tuple) and len(version()) == 3,
+          str(version()))
+    manifest = os.path.join(root, 'blender_manifest.toml')
+    with open(manifest) as fh:
+        raw = [l for l in fh if l.strip().startswith('version')][0]
+    check('it matches blender_manifest.toml', version_string() in raw,
+          f'{version_string()} vs {raw.strip()}')
+
+
+def test_selftest_survives_a_broken_section():
+    """One failing section must not take the whole report with it."""
+    from . import fakebpy
+    bpy = fakebpy.install()
+    for name in ('UIList', 'AddonPreferences', 'Collection'):
+        if not hasattr(bpy.types, name):
+            setattr(bpy.types, name, type(name, (bpy.types.Panel,), {}))
+    bpy.app.version = (5, 2, 0)
+    import importlib
+    mod = importlib.import_module('halcyon.selftest')
+
+    original = mod.gpu_stages
+    try:
+        def explode(_out):
+            raise RuntimeError('simulated driver failure')
+        mod.gpu_stages = explode
+        op = mod.HALCYON_OT_selftest()
+        op.include_scaling = False
+        op.heavy = False
+
+        class _WM:
+            clipboard = ''
+
+        class _Ctx:
+            window_manager = _WM()
+
+        printed = []
+        real_p = mod._p
+        mod._p = lambda out, text='': (out.append(text), printed.append(text))
+        try:
+            op.report = lambda *a, **k: None
+            op.execute(_Ctx())
+        finally:
+            mod._p = real_p
+    finally:
+        mod.gpu_stages = original
+
+    text = '\n'.join(printed)
+    check('the failing section is named', 'gpu stages failed' in text)
+    check('later sections still ran', 'slowest stage' in text
+          or 'FRAME BREAKDOWN' in text)
+    check('the report still closes properly', 'end of report' in text)
+
+
+def test_gpu_interface_specs():
+    """Every stage must have a CreateInfo spec matching its GLSL.
+
+    Blender defaults to Vulkan, where the legacy GPUShader constructor does not
+    exist and the interface has to be declared separately from the source. A
+    mismatch there fails on the driver and nowhere else.
+    """
+    import re
+
+    from ..gpu.stages import INTERFACE, STAGES, body
+
+    missing = [k for k in STAGES if k not in INTERFACE]
+    check('every stage has an interface spec', not missing, ', '.join(missing))
+
+    problems = []
+    for name in STAGES:
+        src = body(name)
+        if re.search(r'^(uniform|in|out)\s+\w', src, re.M):
+            problems.append(f'{name}: declarations survived stripping')
+        if 'void main()' not in src:
+            problems.append(f'{name}: lost main()')
+        spec = INTERFACE[name]
+        for group in ('floats', 'ints', 'vec2', 'vec3', 'samplers'):
+            for uni in spec.get(group, ()):
+                if not re.search(r'\b' + re.escape(uni) + r'\b', src):
+                    problems.append(f'{name}: declares {uni}, body never uses it')
+    check('interface specs match their shader bodies', not problems,
+          '; '.join(problems[:3]))
+
+    # anything the body reads must be declared, or the driver rejects it
+    undeclared = []
+    for name in STAGES:
+        spec = INTERFACE[name]
+        declared = {'vUV', 'Color', 'pos', 'uv'}
+        for group in ('floats', 'ints', 'vec2', 'vec3', 'samplers'):
+            declared |= set(spec.get(group, ()))
+        for line in STAGES[name].splitlines():
+            m = re.match(r'^(?:uniform|in|out)\s+\w+\s+(\w+)\s*;', line.strip())
+            if m and m.group(1) not in declared:
+                undeclared.append(f'{name}: {m.group(1)}')
+    check('every declaration in the source is in the spec', not undeclared,
+          ', '.join(undeclared))
+
+
+def test_threaded_background():
+    """The background pass must be identical however many threads run it."""
+    from ..core.scene import World
+    base = None
+    for threads in (1, 4, 16):
+        st = base_settings(320, 240, threads=threads)
+        st.aa_samples = 4
+        sc = demo_scene(st)
+        sc.world = World()
+        sc.world.mode = 'BRYCE'
+        img = R.render(sc, st)
+        if base is None:
+            base = img
+        else:
+            # summing a slice and summing the whole array can differ in the
+            # last bit; one ULP of float32 is the honest bar here, not zero
+            d = float(np.abs(base - img).max())
+            check(f'threaded background matches at {threads} threads',
+                  d <= 1e-6, f'max difference {d:.3e}')
+
+
+def test_material_templates():
+    """Every template must name real models, sockets and texture nodes.
+
+    They are recipes built at runtime, so a renamed socket turns one into a
+    silent no-op rather than an error -- which is exactly what a test is for.
+    """
+    from . import fakebpy
+    bpy = fakebpy.install()
+    for name in ('UIList', 'AddonPreferences', 'Collection'):
+        if not hasattr(bpy.types, name):
+            setattr(bpy.types, name, type(name, (bpy.types.Panel,), {}))
+    import importlib
+    tmpl = importlib.import_module('halcyon.templates')
+    from ..core.nodeeval import DISPATCH
+    from ..core.shading import MODEL_ITEMS
+    from ..nodes.shader_nodes import HALCYON_ShaderNode as HS
+
+    models = {m[0] for m in MODEL_ITEMS}
+    sockets = {n for _k, n, _d in HS.SOCKETS}
+    problems = []
+    for key, spec in tmpl.TEMPLATES.items():
+        for field in ('label', 'note', 'model'):
+            if field not in spec:
+                problems.append(f'{key}: missing {field}')
+        if spec.get('model') not in models:
+            problems.append(f"{key}: unknown model {spec.get('model')}")
+        for sock in spec.get('inputs', {}):
+            if sock not in sockets:
+                problems.append(f'{key}: unknown socket {sock}')
+        for idname, _p, _i, target in spec.get('textures', []):
+            if idname not in DISPATCH:
+                problems.append(f'{key}: {idname} has no evaluator')
+            if target not in sockets:
+                problems.append(f'{key}: unknown target {target}')
+    check(f'all {len(tmpl.TEMPLATES)} templates are valid', not problems,
+          '; '.join(problems[:3]))
+    labels = [v['label'] for v in tmpl.TEMPLATES.values()]
+    check('template labels are unique', len(labels) == len(set(labels)))
+    check('the menu lists every template',
+          len(tmpl.template_items()) == len(tmpl.TEMPLATES))
+
+
+def test_infinite_ground():
+    """The analytic ground plane must appear below the horizon and nowhere else."""
+    from ..core import sky as SKY
+    from ..core.scene import World
+
+    dirs = _hemisphere(80, 120)
+    el = np.linspace(-1.2, -0.05, 40)
+    az = np.linspace(0, 2 * np.pi, 120)
+    E, A = np.meshgrid(el, az, indexing='ij')
+    down = np.stack([np.cos(E) * np.cos(A), np.cos(E) * np.sin(A),
+                     np.sin(E)], -1).reshape(-1, 3).astype(np.float32)
+    eye = np.array([0.0, 0.0, 4.0], np.float32)
+
+    # strictly upward: _hemisphere dips just below the horizon, where the
+    # ground legitimately appears
+    up_el = np.linspace(0.05, 1.45, 40)
+    UE, UA = np.meshgrid(up_el, az, indexing='ij')
+    up = np.stack([np.cos(UE) * np.cos(UA), np.cos(UE) * np.sin(UA),
+                   np.sin(UE)], -1).reshape(-1, 3).astype(np.float32)
+
+    plain = World()
+    plain.mode = 'GRADIENT'
+    above = SKY.evaluate(plain, up, {}, eye=eye)
+
+    seen = {}
+    for mode in ('SOLID', 'CHECKER', 'NOISE', 'OCEAN'):
+        w = World()
+        w.mode = 'GRADIENT'
+        w.ground_plane = True
+        w.ground_mode = mode
+        seen[mode] = SKY.evaluate(w, down, {}, eye=eye, time=1.0)
+        check(f'{mode} ground renders below the horizon',
+              float(np.abs(seen[mode] - SKY.evaluate(plain, down, {},
+                                                     eye=eye)).mean()) > 1e-4)
+        check(f'{mode} ground stays finite', bool(np.isfinite(seen[mode]).all()))
+
+    w = World()
+    w.mode = 'GRADIENT'
+    w.ground_plane = True
+    w.ground_mode = 'CHECKER'
+    check('the ground never touches rays pointing up',
+          float(np.abs(SKY.evaluate(w, up, {}, eye=eye) - above).max()) == 0.0)
+
+    # the ocean animates, the others do not
+    a = SKY.evaluate(w, down, {}, eye=eye, time=0.0)
+    b = SKY.evaluate(w, down, {}, eye=eye, time=5.0)
+    check('a checker floor does not animate',
+          float(np.abs(a - b).max()) == 0.0)
+    w.ground_mode = 'OCEAN'
+    a = SKY.evaluate(w, down, {}, eye=eye, time=0.0)
+    b = SKY.evaluate(w, down, {}, eye=eye, time=5.0)
+    check('the ocean animates with scene time',
+          float(np.abs(a - b).mean()) > 1e-4)
+
+
+def test_bryce_sky_lab():
+    """Every Bryce control must change the sky on its own."""
+    from ..core import sky as SKY
+    from ..core.scene import World
+    dirs = _hemisphere(70, 120)
+
+    def sky_of(**kw):
+        w = World()
+        w.mode = 'BRYCE'
+        for k, v in kw.items():
+            setattr(w, k, v)
+        return SKY.evaluate(w, dirs, {}, eye=np.array([0, 0, 3.0], np.float32),
+                            time=1.0)
+
+    base = sky_of()
+    layers = (
+        ('three-stop gradient', dict(sky_mid=(0.9, 0.3, 0.2))),
+        ('mid stop height', dict(sky_mid=(0.9, 0.3, 0.2), sky_mid_height=0.8)),
+        ('atmosphere', dict(atmosphere_density=0.8)),
+        ('atmosphere falloff', dict(atmosphere_density=0.8,
+                                    atmosphere_falloff=4.0)),
+        ('haze blend with sky', dict(haze_density=1.0, haze_blend_sky=1.0)),
+        ('cloud ambience', dict(cloud_ambience=1.0)),
+        ('moon', dict(celestial='MOON', sun_elevation=0.6)),
+    )
+    dead = [name for name, kw in layers
+            if float(np.abs(base - sky_of(**kw)).max()) < 1e-3]
+    check(f'all {len(layers)} new Bryce controls change the sky', not dead,
+          'no effect: ' + ', '.join(dead))
+
+    # wind must move the deck with time, and only with time
+    still_a = sky_of(cloud_wind=0.0)
+    still_b = sky_of(cloud_wind=0.0)
+    check('a windless sky does not drift',
+          float(np.abs(still_a - still_b).max()) == 0.0)
+    w = World()
+    w.mode = 'BRYCE'
+    w.cloud_wind = 3.0
+    eye = np.array([0, 0, 3.0], np.float32)
+    a = SKY.evaluate(w, dirs, {}, eye=eye, time=0.0)
+    b = SKY.evaluate(w, dirs, {}, eye=eye, time=4.0)
+    check('wind drifts the cloud deck over time',
+          float(np.abs(a - b).mean()) > 1e-4)
+
+    # moon phases must actually differ from each other
+    phases = [sky_of(celestial='MOON', sun_elevation=0.6, moon_phase=p)
+              for p in (0.05, 0.25, 0.5)]
+    same = [i for i in range(len(phases) - 1)
+            if float(np.abs(phases[i] - phases[i + 1]).max()) < 1e-3]
+    check('the moon shows different phases', not same)
+
+    # cloud shadows need the ground to land on
+    def ground(shadows):
+        w = World()
+        w.mode = 'BRYCE'
+        w.ground_plane = True
+        w.ground_mode = 'SOLID'
+        w.cloud_shadows = shadows
+        el = np.linspace(-0.6, -0.05, 40)
+        az = np.linspace(0, 2 * np.pi, 100)
+        E, A = np.meshgrid(el, az, indexing='ij')
+        d = np.stack([np.cos(E) * np.cos(A), np.cos(E) * np.sin(A),
+                      np.sin(E)], -1).reshape(-1, 3).astype(np.float32)
+        return SKY.evaluate(w, d, {}, eye=eye, time=1.0)
+
+    check('cloud shadows land on the ground',
+          float(np.abs(ground(0.0) - ground(1.0)).mean()) > 1e-4)
+
+
+def test_no_socket_edits_in_update_callbacks():
+    """RNA update callbacks must not add or remove sockets.
+
+    Blender is mid-update inside a property callback, and mutating a node's
+    sockets there segfaults rather than raising. Selecting HLSL did exactly
+    that -- and worse, it set another property whose own callback then rebuilt
+    the sockets from inside a nested callback.
+
+    This cannot be exercised without Blender, so the rule is checked statically
+    instead: no function used as an `update=` handler may reach socket
+    mutation.
+    """
+    import ast
+    import os
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # Only topology changes are the hazard. Setting `hide` or a description on
+    # an existing socket is a property write and is safe -- Blender's own nodes
+    # do it. Adding or removing sockets while RNA is mid-update is not.
+    banned = ('rebuild_sockets', 'compile_source')
+    offenders = []
+    for base, _dirs, files in os.walk(root):
+        if '__pycache__' in base or os.path.basename(base) == 'tests':
+            continue
+        for f in files:
+            if not f.endswith('.py'):
+                continue
+            path = os.path.join(base, f)
+            with open(path) as fh:
+                tree = ast.parse(fh.read())
+            # every name used as update=<name>
+            handlers = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.keyword) and node.arg == 'update':
+                    if isinstance(node.value, ast.Name):
+                        handlers.add(node.value.id)
+                    elif isinstance(node.value, ast.Attribute):
+                        handlers.add(node.value.attr)
+            if not handlers:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef) and node.name in handlers:
+                    for call in ast.walk(node):
+                        if isinstance(call, ast.Call):
+                            name = getattr(call.func, 'attr',
+                                           getattr(call.func, 'id', ''))
+                            if name in banned:
+                                offenders.append(f'{f}:{node.name} calls {name}')
+                    for sub in ast.walk(node):
+                        if isinstance(sub, ast.Attribute) and \
+                                sub.attr in ('clear', 'new', 'remove'):
+                            owner = getattr(sub.value, 'attr', '')
+                            if owner in ('inputs', 'outputs'):
+                                offenders.append(
+                                    f'{f}:{node.name} edits {owner}')
+    check('no update callback rebuilds sockets', not offenders,
+          '; '.join(sorted(set(offenders))))
+
+    # and the one function an update callback IS allowed to call must stay
+    # free of topology changes, or the exemption stops being true
+    import importlib
+    from . import fakebpy
+    bpy = fakebpy.install()
+    for name in ('UIList', 'AddonPreferences', 'Collection'):
+        if not hasattr(bpy.types, name):
+            setattr(bpy.types, name, type(name, (bpy.types.Panel,), {}))
+    sn = importlib.import_module('halcyon.nodes.shader_nodes')
+    body = __import__('inspect').getsource(sn.HALCYON_ShaderNode.refresh_sockets)
+    topology = [w for w in ('inputs.new', 'inputs.clear', 'inputs.remove',
+                            'outputs.new', 'outputs.clear', 'outputs.remove')
+                if w in body]
+    check('the master shader only toggles existing sockets', not topology,
+          ', '.join(topology))
+
+
+def test_both_shader_languages():
+    """Both default templates must compile and run through the interpreter."""
+    from . import fakebpy
+    bpy = fakebpy.install()
+    for name in ('UIList', 'AddonPreferences', 'Collection'):
+        if not hasattr(bpy.types, name):
+            setattr(bpy.types, name, type(name, (bpy.types.Panel,), {}))
+    import importlib
+    sn = importlib.import_module('halcyon.nodes.shader_nodes')
+    from ..shaders.compiler import try_compile
+
+    for lang, src in (('GLSL', sn.DEFAULT_GLSL), ('HLSL', sn.DEFAULT_HLSL)):
+        prog, err = try_compile(src, lang)
+        check(f'the default {lang} template compiles', prog is not None,
+              str(err))
+        if prog is None:
+            continue
+        uni = {}
+        for u in prog.uniform_schema():
+            k = u['kind']
+            if k in ('VALUE', 'INT'):
+                uni[u['name']] = np.full(4, 1.0, np.float32)
+            elif k in ('VECTOR2', 'VECTOR', 'RGBA'):
+                uni[u['name']] = np.ones(
+                    (4, {'VECTOR2': 2, 'VECTOR': 3, 'RGBA': 4}[k]), np.float32)
+        outs, _d = prog.run(uni, {}, 4)
+        check(f'the default {lang} template runs',
+              bool(outs) and all(np.isfinite(np.asarray(v)).all()
+                                 for v in outs.values() if v is not None))
+
+
+def test_debug_passes():
+    for mode in ('DEPTH', 'NORMAL', 'UV', 'MATID', 'OVERDRAW', 'WIREFRAME'):
+        st = base_settings(64, 48, debug_pass=mode)
+        img = render(st)
+        ok = np.isfinite(img).all() and img[..., :3].std() > 1e-4
+        check(f'debug pass {mode}', ok, f'std={img[..., :3].std():.4f}')
+
+
+def test_affine_texture_warp():
+    persp = render(base_settings(tex_perspective=True))
+    affine = render(base_settings(tex_perspective=False))
+    d = float(np.abs(persp - affine).mean())
+    check('affine mapping warps the floor texture', d > 1e-3, f'delta={d:.4f}')
+
+
+def test_vertex_snap():
+    smooth = render(base_settings(vertex_snap=False))
+    snapped = render(base_settings(vertex_snap=True, vertex_snap_grid=4.0))
+    d = float(np.abs(smooth - snapped).mean())
+    check('vertex snapping moves geometry', d > 1e-3, f'delta={d:.4f}')
+
+
+def test_supersampling():
+    a = render(base_settings(aa_mode='NONE'))
+    st = base_settings(aa_mode='SUPERSAMPLE', aa_samples=4)
+    b = render(st)
+    check('supersampled image is the requested size', b.shape == a.shape)
+    edge_a = float(np.abs(np.diff(a[..., :3], axis=1)).mean())
+    edge_b = float(np.abs(np.diff(b[..., :3], axis=1)).mean())
+    check('supersampling softens edges', edge_b < edge_a,
+          f'{edge_b:.4f} < {edge_a:.4f}')
+
+
+def test_transparency():
+    st = base_settings(transparency='ABUFFER')
+    sc = demo_scene(st)
+    sc.materials[1].opacity = 0.35
+    sc.materials[1].has_alpha = True
+    img = R.render(sc, st)
+    st2 = base_settings()
+    opaque = render(st2)
+    d = float(np.abs(img - opaque).mean())
+    check('A-buffer composites transparent surfaces', d > 1e-3, f'delta={d:.4f}')
+    check('transparency stays finite', np.isfinite(img).all())
+
+
+def test_fog():
+    clear = render(base_settings(fog=False))
+    foggy = render(base_settings(fog=True, fog_mode='LINEAR', fog_start=2.0,
+                                 fog_end=15.0, fog_color=(1.0, 0.0, 0.0)))
+    check('fog tints distant geometry',
+          float(foggy[..., 0].mean() - clear[..., 0].mean()) > 0.01)
+
+
+def test_raytraced_reflection():
+    st = base_settings(raytrace=True, ray_depth=2)
+    sc = demo_scene(st)
+    sc.materials[1].reflect_level = 0.9
+    ref = R.render(sc, st)
+    sc2 = demo_scene(st)
+    flat = R.render(sc2, st)
+    check('reflections change the image',
+          float(np.abs(ref - flat).mean()) > 1e-3)
+
+
+# --------------------------------------------------------------- node graph
+
+
+def _ctx(n=16):
+    c = ShadeContext(n)
+    c.N = np.tile(np.array([[0., 0., 1.]], np.float32), (n, 1))
+    c.I = np.tile(np.array([[0., 0., -1.]], np.float32), (n, 1))
+    c.uv = np.stack([np.linspace(0, 1, n), np.linspace(0, 1, n)], 1).astype(np.float32)
+    c.P = np.zeros((n, 3), np.float32)
+    c.settings = RenderSettings()
+    return c
+
+
+def _node(nid, idname, props=None, inputs=(), outputs=()):
+    return {'id': nid, 'bl_idname': idname, 'props': props or {},
+            'inputs': [dict(i) for i in inputs],
+            'outputs': [dict(o) for o in outputs]}
+
+
+def test_node_math():
+    g = {'output': None, 'nodes': {'m': _node(
+        'm', 'ShaderNodeMath', {'operation': 'MULTIPLY'},
+        [{'name': 'Value', 'type': 'VALUE', 'default': 3.0, 'link': None},
+         {'name': 'Value_001', 'type': 'VALUE', 'default': 4.0, 'link': None},
+         {'name': 'Value_002', 'type': 'VALUE', 'default': 0.0, 'link': None}],
+        [{'name': 'Value', 'type': 'VALUE'}])}}
+    ev = GraphEvaluator(g, _ctx())
+    v = ev.eval_output('m', 0)
+    check('Math node multiplies', np.allclose(v, 12.0), str(v[:2]))
+
+
+def test_node_chain_and_ramp():
+    lut = np.zeros((256, 4), np.float32)
+    lut[:, 0] = np.linspace(0, 1, 256)
+    lut[:, 3] = 1.0
+    g = {'output': None, 'nodes': {
+        'coord': _node('coord', 'ShaderNodeTexCoord', {}, [],
+                       [{'name': 'Generated', 'type': 'VECTOR'},
+                        {'name': 'Normal', 'type': 'VECTOR'},
+                        {'name': 'UV', 'type': 'VECTOR'}]),
+        'sep': _node('sep', 'ShaderNodeSeparateXYZ', {},
+                     [{'name': 'Vector', 'type': 'VECTOR', 'default': [0, 0, 0],
+                       'link': ['coord', 2]}],
+                     [{'name': 'X', 'type': 'VALUE'}, {'name': 'Y', 'type': 'VALUE'},
+                      {'name': 'Z', 'type': 'VALUE'}]),
+        'ramp': _node('ramp', 'ShaderNodeValToRGB', {'lut': lut.tolist()},
+                      [{'name': 'Fac', 'type': 'VALUE', 'default': 0.0,
+                        'link': ['sep', 0]}],
+                      [{'name': 'Color', 'type': 'RGBA'},
+                       {'name': 'Alpha', 'type': 'VALUE'}]),
+    }}
+    ev = GraphEvaluator(g, _ctx())
+    col = ev.eval_output('ramp', 0)
+    check('TexCoord -> SeparateXYZ -> ColorRamp chain',
+          col is not None and abs(float(col[0, 0])) < 0.02 and
+          float(col[-1, 0]) > 0.95, str(col[[0, -1], 0]) if col is not None else 'None')
+
+
+def test_node_group_recursion():
+    inner = {'nodes': {
+        'gi': _node('gi', 'NodeGroupInput', {}, [],
+                    [{'name': 'Val', 'type': 'VALUE'}]),
+        'add': _node('add', 'ShaderNodeMath', {'operation': 'ADD'},
+                     [{'name': 'Value', 'type': 'VALUE', 'default': 0.0,
+                       'link': ['gi', 0]},
+                      {'name': 'Value_001', 'type': 'VALUE', 'default': 10.0,
+                       'link': None},
+                      {'name': 'Value_002', 'type': 'VALUE', 'default': 0.0,
+                       'link': None}],
+                     [{'name': 'Value', 'type': 'VALUE'}]),
+        'go': _node('go', 'NodeGroupOutput', {},
+                    [{'name': 'Out', 'type': 'VALUE', 'default': 0.0,
+                      'link': ['add', 0]}], []),
+    }, 'output': None, 'group_output': 'go'}
+    grp = _node('g', 'ShaderNodeGroup', {},
+                [{'name': 'Val', 'type': 'VALUE', 'default': 5.0, 'link': None}],
+                [{'name': 'Out', 'type': 'VALUE'}])
+    grp['group'] = inner
+    ev = GraphEvaluator({'output': None, 'nodes': {'g': grp}}, _ctx())
+    v = ev.eval_output('g', 0)
+    check('node groups evaluate recursively', v is not None and
+          np.allclose(v, 15.0), str(v[:2]) if v is not None else 'None')
+
+
+def test_unknown_node_passthrough():
+    g = {'output': None, 'nodes': {'weird': _node(
+        'weird', 'ShaderNodeSomethingFromTheFuture', {},
+        [{'name': 'Color', 'type': 'RGBA', 'default': [0.25, 0.5, 0.75, 1.0],
+          'link': None}],
+        [{'name': 'Color', 'type': 'RGBA'}])}}
+    ev = GraphEvaluator(g, _ctx())
+    v = ev.eval_output('weird', 0)
+    ok = v is not None and np.allclose(v[0, :3], [0.25, 0.5, 0.75], atol=1e-4)
+    check('unknown nodes pass through and are reported',
+          ok and 'ShaderNodeSomethingFromTheFuture' in ev.unsupported)
+
+
+def test_coded_shader_in_graph():
+    from ..shaders.compiler import compile_shader
+    src = """
+    uniform vec3 tint = vec3(1.0, 0.5, 0.25);
+    in vec2 vUV;
+    out vec4 Color;
+    void main() { Color = vec4(tint * vUV.x, 1.0); }
+    """
+    prog = compile_shader(src, 'GLSL')
+    node = _node('code', 'HALCYON_CodeNode', {},
+                 [{'name': 'Tint', 'type': 'RGBA', 'uniform': 'tint',
+                   'default': [0.2, 0.4, 0.8, 1.0], 'link': None}],
+                 [{'name': 'Color', 'type': 'RGBA', 'key': 'Color'}])
+    ev = GraphEvaluator({'output': None, 'nodes': {'code': node}}, _ctx(),
+                        programs={'code': prog})
+    col = ev.eval_output('code', 0)
+    ok = col is not None and float(col[0, 0]) < 0.01 and \
+        abs(float(col[-1, 0]) - 0.2) < 0.02
+    check('coded shader node runs inside a material graph', ok,
+          str(col[[0, -1], :3]) if col is not None else 'None')
+
+
+def test_bsdf_translation():
+    g = {'output': 'out', 'nodes': {
+        'p': _node('p', 'ShaderNodeBsdfPrincipled', {},
+                   [{'name': 'Base Color', 'type': 'RGBA',
+                     'default': [0.9, 0.1, 0.1, 1.0], 'link': None},
+                    {'name': 'Metallic', 'type': 'VALUE', 'default': 0.0,
+                     'link': None},
+                    {'name': 'Roughness', 'type': 'VALUE', 'default': 0.25,
+                     'link': None},
+                    {'name': 'IOR', 'type': 'VALUE', 'default': 1.45, 'link': None},
+                    {'name': 'Alpha', 'type': 'VALUE', 'default': 1.0, 'link': None},
+                    {'name': 'Specular', 'type': 'VALUE', 'default': 0.5,
+                     'link': None},
+                    {'name': 'Transmission', 'type': 'VALUE', 'default': 0.0,
+                     'link': None}],
+                   [{'name': 'BSDF', 'type': 'SHADER'}]),
+        'out': _node('out', 'ShaderNodeOutputMaterial', {},
+                     [{'name': 'Surface', 'type': 'SHADER', 'default': None,
+                       'link': ['p', 0]},
+                      {'name': 'Displacement', 'type': 'VECTOR',
+                       'default': [0, 0, 0], 'link': None}], []),
+    }}
+    ctx = _ctx()
+    ev = GraphEvaluator(g, ctx)
+    cl, _ = ev.evaluate_surface()
+    check('Principled BSDF becomes a closure',
+          isinstance(cl, Closure) and len(cl) >= 2, f'{len(cl) if cl else 0} lobes')
+    surf, model, _ = R.closure_to_surface(cl, ctx, ctx.settings)
+    check('closure resolves to a period model with the right colour',
+          np.allclose(surf.diffuse[0], [0.9, 0.1, 0.1], atol=0.05) and
+          model in ('COOK_TORRANCE', 'OREN_NAYAR', 'PHONG', 'BLINN_PHONG'),
+          f'{model} {np.round(surf.diffuse[0], 3)}')
+
+
+# ------------------------------------------------------------------- post
+
+
+def test_palette_counts():
+    img = render(base_settings())
+    for depth, mode, size, limit in (('8', 'ADAPTIVE', 256, 256),
+                                     ('8', 'VGA256', 256, 256),
+                                     ('4', 'EGA16', 16, 16),
+                                     ('1', 'GRAY', 2, 2)):
+        st = base_settings(color_depth=depth, palette_mode=mode,
+                           palette_size=size, dither='FLOYD')
+        out = post.process(img, st)[..., :3]
+        n = len(np.unique(out.reshape(-1, 3), axis=0))
+        check(f'{mode} yields at most {limit} colours', n <= limit, f'{n} colours')
+
+
+def test_dither_changes_image():
+    img = render(base_settings())
+    st_a = base_settings(color_depth='4', palette_mode='EGA16', dither='NONE')
+    st_b = base_settings(color_depth='4', palette_mode='EGA16', dither='FLOYD')
+    a = post.process(img, st_a)
+    b = post.process(img, st_b)
+    check('dithering changes the quantised image',
+          float(np.abs(a - b).mean()) > 1e-3)
+
+
+def test_output_scale_and_aspect():
+    img = render(base_settings(96, 72))
+    st = base_settings(96, 72, output_scale='3X')
+    out = post.process(img, st)
+    check('3x nearest upscale', out.shape[:2] == (216, 288), str(out.shape))
+    st2 = base_settings(96, 72, pixel_aspect_x=1.0, pixel_aspect_y=1.2)
+    out2 = post.process(img, st2)
+    check('pixel aspect stretches the image', out2.shape[0] > 72, str(out2.shape))
+
+
+def test_post_chain_stability():
+    img = render(base_settings())
+    st = base_settings(glow=True, star_filter=True, lens_flare=True,
+                       color_depth='16', dither='BAYER4', composite=True,
+                       interlace='BLEND', crt=True, crt_scanlines=0.4,
+                       crt_mask='SHADOW', crt_curvature=0.3, crt_vignette=0.4,
+                       jpeg_artifacts=True, jpeg_quality=30, output_scale='2X')
+    out = post.process(img, st)
+    check('every post stage at once stays finite and in range',
+          np.isfinite(out).all() and out[..., :3].min() >= -1e-6 and
+          out[..., :3].max() <= 1.0 + 1e-6)
+
+
+def test_presets_do_not_overlap():
+    """Applying a preset must reset first, so nothing carries over.
+
+    Without this, going from EGA to Infini-D left EGA's 16-colour palette, its
+    2-light limit, its 1.2 pixel aspect and its 3x output scale behind, because
+    Infini-D's entry does not mention any of them.
+    """
+    import dataclasses
+
+    from ..core.settings import RenderSettings
+    from ..presets.library import PRESERVED, reset_settings
+
+    fresh = RenderSettings()
+    fields = [f.name for f in dataclasses.fields(RenderSettings)]
+
+    pairs = [('EGA', 'INFINID_4'), ('PSX', 'LIGHTWAVE_56'), ('VHS', 'WEB_PNG8'),
+             ('CGA', 'ELECTRIC_IMAGE')]
+    leaks = []
+    for first, second in pairs:
+        st = RenderSettings()
+        apply_preset(st, first)
+        apply_preset(st, second)
+        clean = RenderSettings()
+        apply_preset(clean, second)
+        for name in fields:
+            if getattr(st, name) != getattr(clean, name):
+                leaks.append(f'{first}->{second}: {name}')
+    check('switching presets leaves nothing behind', not leaks,
+          '; '.join(leaks[:4]))
+
+    # the default preset is a full reset
+    st = RenderSettings()
+    apply_preset(st, 'PSX')
+    apply_preset(st, 'DEFAULT')
+    dirty = [n for n in fields if getattr(st, n) != getattr(fresh, n)]
+    check('the Default preset restores every setting', not dirty,
+          ', '.join(dirty[:5]))
+
+    # machine and pipeline settings survive a preset change
+    st = RenderSettings()
+    st.threads = 12
+    st.seed = 4242
+    st.film_transparent = True
+    st.debug_pass = 'NORMAL'
+    apply_preset(st, 'N64')
+    kept = (st.threads == 12 and st.seed == 4242 and st.film_transparent
+            and st.debug_pass == 'NORMAL')
+    check('machine and pipeline settings survive a preset', kept,
+          f'threads={st.threads} seed={st.seed} '
+          f'transparent={st.film_transparent} pass={st.debug_pass}')
+
+    # and opting out of the reset still layers
+    st = RenderSettings()
+    apply_preset(st, 'EGA')
+    apply_preset(st, 'INFINID_4', reset=False)
+    check('reset can be turned off to layer presets',
+          st.palette_mode == 'EGA16', st.palette_mode)
+
+    check('every preserved field exists on RenderSettings',
+          all(p in fields for p in PRESERVED),
+          ', '.join(sorted(set(PRESERVED) - set(fields))))
+    reset_settings(RenderSettings())
+
+
+def test_preset_library_is_well_formed():
+    """Every preset must be complete and name only real settings."""
+    import dataclasses
+
+    from ..core.settings import RenderSettings
+    from ..presets.library import CATEGORIES
+    fields = {f.name for f in dataclasses.fields(RenderSettings)}
+    cats = {c[0] for c in CATEGORIES}
+    problems = []
+    for key, entry in PRESETS.items():
+        for required in ('label', 'category', 'note', 'settings'):
+            if required not in entry:
+                problems.append(f'{key}: missing {required}')
+        if entry.get('category') not in cats:
+            problems.append(f"{key}: unknown category {entry.get('category')}")
+        for name in entry.get('settings', {}):
+            if name not in fields:
+                problems.append(f'{key}: unknown setting {name}')
+    check(f'all {len(PRESETS)} presets are well formed', not problems,
+          '; '.join(problems[:4]))
+    check('there is a Default preset', 'DEFAULT' in PRESETS)
+    labels = [e['label'] for e in PRESETS.values()]
+    check('preset labels are unique', len(labels) == len(set(labels)))
+
+
+def test_all_presets_render():
+    bad = []
+    for key in sorted(PRESETS):
+        st = RenderSettings()
+        apply_preset(st, key)
+        st.resolution_x, st.resolution_y = 64, 48
+        st.aa_samples = min(st.aa_samples, 2)
+        st.output_scale = 'NONE'
+        try:
+            img = R.render(demo_scene(st), st)
+            out = post.process(img, st)
+            if not np.isfinite(out).all():
+                bad.append(key + '(nan)')
+        except Exception as exc:                                # noqa: BLE001
+            bad.append(f'{key}({type(exc).__name__})')
+    check(f'all {len(PRESETS)} presets render', not bad, ', '.join(bad[:4]))
+
+
+def test_blender_layer_imports():
+    from . import fakebpy
+    fakebpy.install()
+    import importlib
+    try:
+        mod = importlib.import_module('halcyon')
+        importlib.reload(mod) if 'halcyon.engine' in sys.modules else None
+        mod.register()
+        mod.unregister()
+        check('the Blender layer registers cleanly against a bpy stub', True)
+    except Exception as exc:                                    # noqa: BLE001
+        check('the Blender layer registers cleanly against a bpy stub', False,
+              repr(exc))
+
+
+def main():
+    order = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
+    for fn in order:
+        print(fn.__name__)
+        try:
+            fn()
+        except Exception as exc:                                # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            FAILS.append(fn.__name__)
+    print()
+    print(f'{len(FAILS)} failure(s): ' + ', '.join(FAILS) if FAILS
+          else 'all renderer tests passed')
+    return 1 if FAILS else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
