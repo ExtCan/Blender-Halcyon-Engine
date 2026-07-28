@@ -1,0 +1,32 @@
+name: tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  suite:
+    # The renderer and the shader compiler import nothing from bpy, which is
+    # what makes this possible: the whole suite runs on a plain Python with
+    # NumPy, no Blender download and no display.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: halcyon
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install NumPy
+        run: python -m pip install --upgrade pip numpy
+      - name: Run the suite
+        run: python -m halcyon.tests.run_all
+      - name: Check every module compiles
+        run: python -m compileall -q halcyon
