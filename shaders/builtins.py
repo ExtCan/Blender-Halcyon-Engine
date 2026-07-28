@@ -165,6 +165,13 @@ def sel(mask, a, b):
     a = np.asarray(a)
     b = np.asarray(b)
     n = max(lanes(a, b), mask.shape[0] if isinstance(mask, np.ndarray) else 1)
+    # A 1-D array of 2..4 elements is ambiguous: it could be that many lanes of
+    # a scalar, or one uniform vector. The other operand settles it -- this is
+    # what a vec3 read out of a `uniform vec3 x[N]` array looks like.
+    if a.ndim == 1 and b.ndim == 2 and a.shape[0] == b.shape[1] and n != a.shape[0]:
+        a = np.broadcast_to(a[None, :], (n, a.shape[0]))
+    if b.ndim == 1 and a.ndim == 2 and b.shape[0] == a.shape[1] and n != b.shape[0]:
+        b = np.broadcast_to(b[None, :], (n, b.shape[0]))
     a = bc(a, n)
     b = bc(b, n)
     m = bc(np.asarray(mask), n)

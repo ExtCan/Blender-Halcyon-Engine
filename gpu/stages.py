@@ -265,7 +265,7 @@ VALIDATION = {
     'DISPLAY': ('EXACT', 0.0001),    # 0.00001 measured on hardware at 32F
     'CRT': ('CLOSE', 0.03),          # 0.0113 measured
     'DITHER': ('CLOSE', 0.04),       # 0.0327 measured
-    'LENS': ('UNPROVEN', 0.99),      # half-pixel convention differs from the CPU
+    'LENS': ('CLOSE', 0.01),         # 0.00426 measured after the half-texel fix
     'NTSC': ('UNPROVEN', None),      # no CPU reference yet
 }
 

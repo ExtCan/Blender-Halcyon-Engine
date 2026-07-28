@@ -11,7 +11,7 @@ tested without Blender at all:
 bl_info = {
     "name": "Halcyon Render Engine",
     "author": "Built by Claude with help from Mr. Emotiman",
-    "version": (1, 9, 0),
+    "version": (1, 14, 0),
     "blender": (5, 1, 0),
     "location": "Render Properties > Render Engine > Halcyon",
     "description": "Scanline/raytrace hybrid engine reproducing mid-to-late "

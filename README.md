@@ -1,7 +1,7 @@
 # Halcyon
 
 > **This Addon is and always will be free. If you paid for this, you were
-> scammed.**
+> scammed. Please demand your money back and report the seller.**
 
 A from-scratch render engine for Blender that reproduces the output of
 mid-to-late 1990s home-computer 3D software.
@@ -351,22 +351,36 @@ Both implementations are kept, and a test asserts they are **bit-identical** —
 same triangle buffer, same depths, same barycentrics, same A-buffer fragment
 set. If they ever diverge, the fast one is wrong and the suite says so.
 
-### Threading
+### Threading, and why it does not help much
 
-Shading runs across threads. Deferred shading makes every fragment
-independent, so the frame is split into bounded chunks and handed to a thread
-pool; the workers only touch bpy-free code and read-only state, and NumPy
-releases the GIL for the array work, so they do real parallel work rather than
-taking turns. **Threads** is in the Performance panel — 0 follows Blender's own
-setting, which normally means one per core.
+Shading runs across a thread pool, and the result is **bit-identical** at 1, 4
+and 20 threads — a test asserts that. What it is not is faster, so **Threads
+defaults to 1**. Measured on a 20-core machine at 640x480:
 
-A test asserts the threaded result is bit-identical to the single-threaded one
-at 1, 4 and 20 threads.
+| threads | time | speedup |
+|---|---|---|
+| 1 | 0.283 s | 1.00x |
+| 4 | 0.296 s | 0.96x |
+| 16 | 0.303 s | 0.93x |
+| 32 | 0.326 s | 0.87x |
 
-Chunking matters even on one core: a 3440×1440 frame at 4× supersampling is 79
-million fragments, and building the shading context for all of them at once
-would want tens of gigabytes. Peak memory is now a function of chunk size and
-thread count, not resolution.
+More threads are slightly *slower*. NumPy releases the interpreter lock only for
+large array operations, and the node evaluator is dominated by Python dispatch
+between small ones — so the threads contend rather than divide the work. Giving
+the pool more chunks to work with was tried, and measured worse still.
+
+This was claimed to work for several releases on the strength of reasoning
+rather than measurement, on a machine with one core where it could not have been
+observed either way. It is written down here because it is the sort of claim
+that quietly wastes someone's afternoon.
+
+**Worker processes are the answer to this**, not threads: separate interpreters
+have no shared lock at all. That path is described below.
+
+Chunking still matters even at one thread: a 3440x1440 frame at 4x
+supersampling is 79 million fragments, and building the shading context for all
+of them at once would want tens of gigabytes. Peak memory is a function of chunk
+size, not resolution.
 
 ### Rendering an animation
 
@@ -517,3 +531,6 @@ GPL-3.0-or-later, matching Blender.
 ## Credits
 
 Built by Claude with help from Mr. Emotiman.
+
+This Addon is and always will be free. If you paid for this, you were scammed.
+Please demand your money back and report the seller.

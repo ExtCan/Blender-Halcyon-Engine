@@ -46,6 +46,15 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
         ST.reset()
         ST.enable(bool(settings.show_stats))
         _apply_debug_prefs()
+        try:
+            from .gpu import capability as _cap
+            dev, _stages, notes = _cap.plan(scene, settings)
+            if str(settings.render_device).upper() == 'GPU':
+                print(f"[Halcyon] device: {dev}")
+                for note in notes:
+                    print(f"[Halcyon]   {note}")
+        except Exception:                                       # noqa: BLE001
+            pass
         export_started = time.time()
         try:
             with ST.track('export scene (Blender side)'):

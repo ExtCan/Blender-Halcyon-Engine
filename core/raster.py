@@ -319,12 +319,18 @@ BATCH_MIN_TRIS = 24          # below this the loop wins; setup dominates
 def rasterize(verts, tris, mvp, width, height, cull='NONE', snap=0.0,
               depth_bits=24, subset=None, gbuf=None, frags=None,
               depth_write=True, depth_test=True, count_overdraw=False,
-              z_offset=0.0, near_eps=1e-5, batched=None, flat_depth=None):
+              z_offset=0.0, near_eps=1e-5, batched=None, flat_depth=None,
+              scissor=None):
     """Convenience: project + clip + fill in one call.
 
     `batched` selects the loop-free rasteriser; None picks automatically. The
     reference per-triangle path is kept because it is the simpler code and the
     batched one is validated against it in the test suite.
+
+    `scissor` is a (y0, y1) row range. Triangles that fall entirely outside it
+    are dropped before filling. That is what makes splitting a frame across
+    processes worth doing: without it every worker rasterises the whole mesh
+    for its own slice, and sixty slices means sixty rasterisations.
     """
     if gbuf is None:
         gbuf = GBuffer(width, height)
@@ -333,8 +339,41 @@ def rasterize(verts, tris, mvp, width, height, cull='NONE', snap=0.0,
         tri_map = np.asarray(subset, dtype=np.int32)
         tris = tris[tri_map]
     clip, _, _, _ = project(verts, mvp, width, height, snap=0.0, near_eps=near_eps)
+
+    if scissor is not None and tris.shape[0]:
+        # Drop triangles outside the band *before* clipping, not after. Clipping
+        # every triangle in every band is the cost that made splitting a frame
+        # across processes lose to not splitting it. Only triangles wholly in
+        # front of the near plane can be judged this cheaply; any that straddle
+        # it are kept and sorted out by the clipper as usual.
+        y0s, y1s = scissor
+        w = clip[:, 3]
+        tw = w[tris]
+        infront = (tw > near_eps).all(axis=1)
+        if infront.any():
+            ndc_y = clip[:, 1] / np.where(np.abs(w) < near_eps, near_eps, w)
+            sy_all = (ndc_y * 0.5 + 0.5) * height
+            ty = sy_all[tris]
+            lo = ty.min(axis=1)
+            hi = ty.max(axis=1)
+            outside = infront & ((hi < y0s - 1.0) | (lo > y1s + 1.0))
+            if outside.any():
+                keep_tris = ~outside
+                tris = tris[keep_tris]
+                if tri_map is not None:
+                    tri_map = tri_map[keep_tris]
+                elif subset is None:
+                    tri_map = np.nonzero(keep_tris)[0].astype(np.int32)
+
     sx, sy, iw, z, bw, src = build_screen_tris(clip, tris, width, height, snap=snap,
                                                near_eps=near_eps, depth_bits=depth_bits)
+    if scissor is not None and sx.shape[0]:
+        y0, y1 = scissor
+        lo = sy.min(axis=1)
+        hi = sy.max(axis=1)
+        keep = (hi >= y0) & (lo < y1)
+        if not keep.all():
+            sx, sy, iw, z, bw, src = (a[keep] for a in (sx, sy, iw, z, bw, src))
     if batched is None:
         # overdraw counting needs the sequential semantics to stay exact
         batched = (sx.shape[0] >= BATCH_MIN_TRIS) and not count_overdraw

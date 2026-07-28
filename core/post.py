@@ -557,7 +557,8 @@ def upscale(rgb, st):
 
 def _gpu_stage(name, rgb, st):
     """Ask the GPU chain for a stage. None means the CPU one runs."""
-    if not getattr(st, 'gpu_post', False):
+    if str(getattr(st, 'render_device', 'CPU')).upper() != 'GPU' and \
+            not getattr(st, 'gpu_post', False):
         return None
     try:
         from ..gpu import chain

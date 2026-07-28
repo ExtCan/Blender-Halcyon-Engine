@@ -1150,6 +1150,53 @@ def test_wavefront_diffusion_matches_sequential():
           float(np.abs(a - b).mean()) > 1e-4)
 
 
+def test_scissor_cuts_work_without_changing_pixels():
+    """A banded render must skip triangles outside the band, not just their pixels.
+
+    Without this every worker in a pool rasterises and clips the whole mesh for
+    its own slice, and sixty slices means sixty rasterisations -- which measured
+    2.3x *slower* than not using the pool at all.
+    """
+    from ..core import raster
+
+    st = base_settings(240, 180)
+    sc = demo_scene(st)
+    _v, _p, vp, _eye = R.camera_matrices(sc.camera, 240, 180)
+
+    full = raster.GBuffer(240, 180)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, 240, 180, gbuf=full)
+    drawn_full = int(full.mask().sum())
+
+    band = raster.GBuffer(240, 180)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, 240, 180, gbuf=band,
+                     scissor=(60, 120))
+    cov = band.mask()
+    # A triangle overlapping the band still covers rows beyond it, and that is
+    # harmless: only the band's rows are ever read back. What the scissor
+    # guarantees is that triangles wholly outside are never processed at all.
+    check('the band itself is covered', int(cov[60:120].sum()) > 0)
+    check('less is drawn than for a whole frame', int(cov.sum()) < drawn_full,
+          f'{int(cov.sum())} vs {drawn_full}')
+    check('pixels inside the band are identical either way',
+          np.array_equal(full.tri[60:120], band.tri[60:120]))
+    fa = np.isfinite(full.depth[60:120])
+    fb = np.isfinite(band.depth[60:120])
+    check('the uncovered pixels are the same ones', np.array_equal(fa, fb))
+    check('and so are their depths where finite',
+          float(np.abs(full.depth[60:120][fa] - band.depth[60:120][fa]).max())
+          == 0.0)
+
+    # a thin band must touch fewer triangles -- the pixel count is not the
+    # measure here, because the floor plane spans the whole frame either way
+    thin = raster.GBuffer(240, 180)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, 240, 180, gbuf=thin,
+                     scissor=(0, 4))
+    seen_full = len(np.unique(full.tri[full.mask()]))
+    seen_thin = len(np.unique(thin.tri[thin.mask()]))
+    check('a thin band touches fewer triangles', seen_thin < seen_full,
+          f'{seen_thin} vs {seen_full}')
+
+
 def test_band_rendering_rejoins_exactly():
     """Rendering in horizontal bands must equal rendering the whole frame."""
     for ss in (1, 2):
@@ -2500,6 +2547,770 @@ def test_both_shader_languages():
         check(f'the default {lang} template runs',
               bool(outs) and all(np.isfinite(np.asarray(v)).all()
                                  for v in outs.values() if v is not None))
+
+
+def test_device_capability_table():
+    """The capability table must be honest about can't versus not yet."""
+    from ..gpu import capability as C
+    from ..gpu.stages import VALIDATION
+
+    bad = [f for f, (sup, why) in C.FEATURES.items()
+           if sup not in (C.BOTH, C.NOT_YET, C.NEVER) or len(why) < 20]
+    check('every feature has a support level and a real reason', not bad,
+          ', '.join(bad))
+
+    # anything claimed as running on both must be a stage proven on hardware
+    proven = {k for k, (grade, _t) in VALIDATION.items()
+              if grade in ('EXACT', 'CLOSE')}
+    claimed = {f for f, (sup, _w) in C.FEATURES.items() if sup == C.BOTH}
+    mapping = {'display_transform': 'DISPLAY', 'ordered_dither': 'DITHER',
+               'crt': 'CRT', 'lens': 'LENS'}
+    unproven = [f for f in claimed if mapping.get(f, '') not in proven]
+    check('nothing claims GPU support without a measured stage', not unproven,
+          ', '.join(unproven))
+
+    # the two impossible ones must stay impossible
+    check('error diffusion is marked as never portable',
+          C.FEATURES['error_diffusion'][0] == C.NEVER)
+    check('the A-buffer is marked as never portable',
+          C.FEATURES['abuffer'][0] == C.NEVER)
+
+    # the coded shader node is NOT_YET, not NEVER -- it is the easiest piece
+    check('the coded shader node is portable, just unported',
+          C.FEATURES['code_node'][0] == C.NOT_YET)
+    check('the rasteriser is named as the last piece',
+          'last piece' in C.FEATURES['rasterise'][1].lower(),
+          C.FEATURES['rasterise'][1][:50])
+    # the two must not get swapped: the code node is the easy one
+    check('the coded shader node is described as the easiest piece',
+          'easiest' in C.FEATURES['code_node'][1].lower(),
+          C.FEATURES['code_node'][1][:60])
+    check('the node evaluator is described as the hard one',
+          'hard' in C.FEATURES['node_graph'][1].lower(),
+          C.FEATURES['node_graph'][1][:60])
+
+
+def test_device_plan_falls_back():
+    """Choosing GPU must never refuse to render, and must say what moved."""
+    from ..gpu import capability as C
+    from ..gpu import device as dev
+
+    st = base_settings(120, 90)
+    st.render_device = 'GPU'
+    st.raytrace = True
+    st.dither = 'FLOYD'
+    sc = demo_scene(st)
+    sc.materials[0].programs = {'shader': object()}
+
+    device, stages, notes = C.plan(sc, st)
+    check('a missing GPU falls back to the CPU', device == C.CPU)
+    check('and explains why', any('no GPU' in n for n in notes),
+          '; '.join(notes))
+
+    # now pretend a GPU is there
+    saved = dev.probe
+    try:
+        dev.probe = lambda: (True, 'stub device')
+        device, stages, notes = C.plan(sc, st)
+        proven_now = {f for f, (g, _t) in C.FEATURES.items() if g == C.BOTH}
+        check('with a GPU present every proven stage is selected',
+              set(stages) == proven_now, f'{sorted(stages)} vs {sorted(proven_now)}')
+        text = ' '.join(notes)
+        for feat in ('code_node', 'node_graph'):
+            check(f'{feat} is reported as staying on the CPU', feat in text)
+        check('the reason is given, not just the name',
+              'GLSL' in text or 'NumPy' in text)
+    finally:
+        dev.probe = saved
+
+    # CPU is always unconditionally fine
+    st.render_device = 'CPU'
+    device, stages, notes = C.plan(sc, st)
+    check('CPU mode asks nothing of the GPU',
+          device == C.CPU and stages == () and not notes)
+    check('every feature is supported on the CPU',
+          all(C.supports(f, C.CPU) for f in C.FEATURES))
+
+
+def test_device_choice_does_not_change_the_image():
+    """Selecting GPU must not alter output when it all falls back anyway."""
+    st_cpu = base_settings(160, 120)
+    st_gpu = base_settings(160, 120)
+    st_gpu.render_device = 'GPU'
+    a = post.process(R.render(demo_scene(st_cpu), st_cpu), st_cpu,
+                     target_size=(160, 120), allow_resize=False)
+    b = post.process(R.render(demo_scene(st_gpu), st_gpu), st_gpu,
+                     target_size=(160, 120), allow_resize=False)
+    check('with no GPU present both devices render identically',
+          float(np.abs(a - b).max()) == 0.0)
+
+
+def test_glsl_shading_models_match_cpu():
+    """Every reflectance model in GLSL must equal its CPU counterpart.
+
+    Halcyon's own GLSL front-end executes the shaders through NumPy, so the
+    maths of a GPU port can be checked exactly on a machine with no GPU. This
+    found nine wrong formulas on the first run -- Blinn-Phong's exponent is
+    four times the stated gloss, Minnaert takes 1 + 2*roughness as its
+    darkness, Ward is driven by roughness rather than the Phong exponent, Toon
+    steps on the angle rather than the cosine, and Strauss scales its diffuse
+    by rn and skips the soften pass entirely.
+    """
+    from ..core import mathx as MX
+    from ..core.shading import MODEL_ITEMS, Surface, evaluate
+    from ..gpu.glsl_shading import DISPATCH, GLSL
+    from ..shaders.compiler import try_compile
+
+    src = GLSL + DISPATCH + """
+uniform int model;
+uniform float glossiness; uniform float roughness; uniform float metallic;
+uniform float anisotropy; uniform float soften; uniform float ior;
+uniform float translucency; uniform float toon_size; uniform float toon_smooth;
+uniform float opacity;
+uniform vec3 diffuse; uniform vec3 tangent; uniform vec3 bitangent;
+uniform vec3 nrm; uniform vec3 lgt; uniform vec3 vew;
+out vec4 Color;
+void main() {
+    HalcyonSurface s;
+    s.diffuse = diffuse; s.specular = vec3(1.0);
+    s.diffuse_level = 1.0; s.specular_level = 1.0;
+    s.glossiness = glossiness; s.roughness = roughness; s.metallic = metallic;
+    s.anisotropy = anisotropy; s.aniso_rot = 0.0; s.soften = soften;
+    s.ior = ior; s.translucency = translucency; s.opacity = opacity;
+    s.toon_size = toon_size; s.toon_smooth = toon_smooth; s.toon_steps = 2.0;
+    s.tangent = tangent; s.bitangent = bitangent;
+    Color = hal_evaluate(model, s, nrm, lgt, vew);
+}
+"""
+    prog, err = try_compile(src, 'GLSL')
+    check('the GLSL shading library compiles', prog is not None, str(err))
+    if prog is None:
+        return
+
+    n = 64
+    N = np.tile(np.array([[0, 0, 1.0]], np.float32), (n, 1))
+    th = np.linspace(0.05, 3.0, n)
+    ph = np.linspace(0, 6.0, n)
+    L = MX.normalize(np.stack([np.sin(th) * np.cos(ph),
+                               np.sin(th) * np.sin(ph), np.cos(th)],
+                              1).astype(np.float32))
+    V = MX.normalize(np.tile(np.array([[0.15, 0.25, 0.95]], np.float32), (n, 1)))
+    T, B = MX.orthonormal_basis(N)
+
+    def surf():
+        s2 = Surface(n)
+        s2.diffuse[:] = 0.7
+        s2.specular[:] = 1.0
+        s2.specular_level[:] = 1.0
+        s2.glossiness[:] = 28.0
+        s2.roughness[:] = 0.35
+        s2.metallic[:] = 0.4
+        s2.anisotropy[:] = 0.35
+        s2.soften[:] = 0.0
+        s2.ior[:] = 1.5
+        s2.translucency[:] = 0.6
+        s2.toon_size[:] = 0.5
+        s2.toon_smooth[:] = 0.15
+        s2.opacity[:] = 0.85
+        s2.tangent, s2.bitangent = T, B
+        return s2
+
+    ref = surf()
+    idx = {m[0]: i for i, m in enumerate(MODEL_ITEMS)}
+    uni = {'glossiness': ref.glossiness, 'roughness': ref.roughness,
+           'metallic': ref.metallic, 'anisotropy': ref.anisotropy,
+           'soften': ref.soften, 'ior': ref.ior,
+           'translucency': ref.translucency, 'toon_size': ref.toon_size,
+           'toon_smooth': ref.toon_smooth, 'opacity': ref.opacity,
+           'diffuse': np.tile(np.array([[0.7, 0.7, 0.7]], np.float32), (n, 1)),
+           'tangent': T, 'bitangent': B, 'nrm': N, 'lgt': L, 'vew': V}
+
+    wrong = []
+    tested = 0
+    for ident, _label, _note in MODEL_ITEMS:
+        if ident == 'WIREFRAME':          # not a reflectance model
+            continue
+        tested += 1
+        d_cpu, s_cpu = evaluate(ident, surf(), N, L, V)
+        u = dict(uni)
+        u['model'] = np.full(n, idx[ident], np.int32)
+        col = prog.run(u, {}, n)[0]['Color']
+        de = float(np.abs(col[:, 0] - np.asarray(d_cpu)).max())
+        se = float(np.abs(col[:, 1:4] - np.asarray(s_cpu)).max())
+        if de > 2e-3 or se > 2e-3:
+            wrong.append(f'{ident} (d {de:.4f}, s {se:.4f})')
+    check(f'all {tested} GLSL models match the CPU exactly', not wrong,
+          '; '.join(wrong[:4]))
+
+
+def _emit_ctx(n=32):
+    from ..core.nodeeval import ShadeContext
+    from ..core.settings import RenderSettings
+    c = ShadeContext(n)
+    c.settings = RenderSettings()
+    g = np.stack([np.linspace(0.05, 0.95, n), np.linspace(0.9, 0.1, n) ** 1.3,
+                  np.linspace(0.2, 0.8, n)], 1).astype(np.float32)
+    c.generated = g
+    c.uv = g[:, :2].copy()
+    c.P = g * 3.0
+    c.N = np.tile(np.array([[0, 0, 1.0]], np.float32), (n, 1))
+    c.I = np.tile(np.array([[0.1, 0.2, -0.97]], np.float32), (n, 1))
+    return c
+
+
+def test_glsl_node_emitters_match_cpu():
+    """Every GLSL node emitter must equal the NumPy evaluator.
+
+    This is the piece that decides whether a GPU frame is possible at all, and
+    the one where a wrong answer is most dangerous: an emitter that is merely
+    plausible still produces a picture, just not the right one. So each is run
+    through Halcyon's own GLSL front-end and compared against the node it
+    replaces.
+
+    Four real errors were found this way, all of which would have rendered
+    something believable: alpha was being blended in MixRGB where Blender keeps
+    it from the first input, RGB and Value read a property rather than a
+    socket, Logarithm takes a base, an unlinked texture Vector means generated
+    coordinates rather than the socket default, and Layer Weight's facing
+    output is driven by an exponent rather than a plain one-minus-cosine.
+    """
+    from ..core.nodeeval import GraphEvaluator
+    from ..gpu.emit import Emitter, Unsupported
+    from ..gpu.glsl_shading import GLSL
+    from ..shaders.compiler import try_compile
+
+    n = 32
+
+    def val(name, d, link=None):
+        return {'name': name, 'type': 'VALUE', 'default': d, 'link': link}
+
+    def col(name, d, link=None):
+        return {'name': name, 'type': 'RGBA', 'default': d, 'link': link}
+
+    def vec(name, d, link=None):
+        return {'name': name, 'type': 'VECTOR', 'default': d, 'link': link}
+
+    def node(idname, props, ins, outs):
+        return {'output': None, 'nodes': {'n': {
+            'id': 'n', 'bl_idname': idname, 'props': props,
+            'inputs': [dict(i) for i in ins],
+            'outputs': [{'name': o[0], 'type': o[1]} for o in outs]}}}
+
+    cases = []
+    cases.append(('RGB', node('ShaderNodeRGB', {'value': [.8, .3, .15, 1]}, [],
+                              [('Color', 'RGBA')]), 'vec4', 0))
+    cases.append(('Value', node('ShaderNodeValue', {'value': 0.42}, [],
+                                [('Value', 'VALUE')]), 'float', 0))
+    for op in ('MIX', 'ADD', 'MULTIPLY', 'SUBTRACT', 'SCREEN', 'DIFFERENCE',
+               'LIGHTEN', 'DARKEN', 'DIVIDE'):
+        cases.append((f'MixRGB {op}',
+                      node('ShaderNodeMixRGB', {'blend_type': op},
+                           [val('Fac', .65), col('Color1', [.8, .2, .4, 1]),
+                            col('Color2', [.1, .7, .3, 1])],
+                           [('Color', 'RGBA')]), 'vec4', 0))
+    for op in ('ADD', 'SUBTRACT', 'MULTIPLY', 'DIVIDE', 'POWER', 'MINIMUM',
+               'MAXIMUM', 'SQRT', 'ABSOLUTE', 'SINE', 'COSINE', 'FLOOR',
+               'CEIL', 'FRACT', 'MODULO', 'LESS_THAN', 'GREATER_THAN',
+               'ARCTAN2', 'EXPONENT', 'LOGARITHM', 'SIGN'):
+        cases.append((f'Math {op}',
+                      node('ShaderNodeMath', {'operation': op},
+                           [val('Value', .7), val('Value', .35)],
+                           [('Value', 'VALUE')]), 'float', 0))
+    for op, gt, idx in (('ADD', 'vec3', 0), ('SUBTRACT', 'vec3', 0),
+                        ('MULTIPLY', 'vec3', 0), ('CROSS_PRODUCT', 'vec3', 0),
+                        ('NORMALIZE', 'vec3', 0), ('ABSOLUTE', 'vec3', 0),
+                        ('MINIMUM', 'vec3', 0), ('MAXIMUM', 'vec3', 0),
+                        ('DOT_PRODUCT', 'float', 1), ('DISTANCE', 'float', 1),
+                        ('LENGTH', 'float', 1)):
+        cases.append((f'VecMath {op}',
+                      node('ShaderNodeVectorMath', {'operation': op},
+                           [vec('Vector', [.5, -.3, .8]),
+                            vec('Vector', [.2, .9, -.4])],
+                           [('Vector', 'VECTOR'), ('Value', 'VALUE')]), gt, idx))
+    cases += [
+        ('Invert', node('ShaderNodeInvert', {},
+                        [val('Fac', .8), col('Color', [.7, .25, .5, 1])],
+                        [('Color', 'RGBA')]), 'vec4', 0),
+        ('Gamma', node('ShaderNodeGamma', {},
+                       [col('Color', [.6, .3, .9, 1]), val('Gamma', 2.2)],
+                       [('Color', 'RGBA')]), 'vec4', 0),
+        ('BrightContrast', node('ShaderNodeBrightContrast', {},
+                                [col('Color', [.5, .4, .7, 1]),
+                                 val('Bright', .15), val('Contrast', .4)],
+                                [('Color', 'RGBA')]), 'vec4', 0),
+        ('CombineXYZ', node('ShaderNodeCombineXYZ', {},
+                            [val('X', .3), val('Y', .6), val('Z', .9)],
+                            [('Vector', 'VECTOR')]), 'vec3', 0),
+        ('CombineRGB', node('ShaderNodeCombineRGB', {},
+                            [val('R', .3), val('G', .6), val('B', .9)],
+                            [('Image', 'RGBA')]), 'vec4', 0),
+        ('Clamp', node('ShaderNodeClamp', {'clamp_type': 'MINMAX'},
+                       [val('Value', 1.4), val('Min', .2), val('Max', .9)],
+                       [('Result', 'VALUE')]), 'float', 0),
+        ('MapRange', node('ShaderNodeMapRange', {'clamp': True},
+                          [val('Value', .6), val('From Min', 0.), val('From Max', 1.),
+                           val('To Min', -2.), val('To Max', 4.)],
+                          [('Result', 'VALUE')]), 'float', 0),
+        ('HueSaturation', node('ShaderNodeHueSaturation', {},
+                               [val('Hue', .62), val('Saturation', 1.4),
+                                val('Value', .9), val('Fac', 1.),
+                                col('Color', [.8, .35, .2, 1])],
+                               [('Color', 'RGBA')]), 'vec4', 0),
+        ('LayerWeight facing', node('ShaderNodeLayerWeight', {},
+                                    [val('Blend', .5), vec('Normal', [0, 0, 0])],
+                                    [('Fresnel', 'VALUE'), ('Facing', 'VALUE')]),
+         'float', 1),
+        ('Checker', node('ShaderNodeTexChecker', {},
+                         [vec('Vector', [.3, .7, .1]),
+                          col('Color1', [.9, .9, .9, 1]),
+                          col('Color2', [.1, .1, .1, 1]), val('Scale', 5.)],
+                         [('Color', 'RGBA'), ('Fac', 'VALUE')]), 'vec4', 0),
+    ]
+
+    wrong = []
+    for label, graph, gtype, index in cases:
+        em = Emitter(graph)
+        try:
+            var, vt = em.output('n', index)
+        except Unsupported as exc:
+            wrong.append(f'{label}: unsupported ({exc})')
+            continue
+        var = em.cast(var, vt, gtype)
+        wrap = ('vec4(vec3(%s), 1.0)' % var) if gtype == 'float' else (
+            ('vec4(%s, 1.0)' % var) if gtype == 'vec3' else var)
+        src = GLSL + """
+uniform vec3 hal_N; uniform vec3 hal_V; uniform vec3 hal_P; uniform vec3 hal_T;
+uniform vec3 hal_generated; uniform vec2 hal_uv;
+out vec4 Color;
+void main() {
+%s
+    Color = %s;
+}
+""" % (em.body(), wrap)
+        prog, err = try_compile(src, 'GLSL')
+        if prog is None:
+            wrong.append(f'{label}: will not compile ({err})')
+            continue
+        c = _emit_ctx(n)
+        got = prog.run({'hal_N': c.N, 'hal_V': -c.I, 'hal_P': c.P,
+                        'hal_T': c.N, 'hal_generated': c.generated,
+                        'hal_uv': c.uv}, {}, n)[0]['Color']
+        want = GraphEvaluator(graph, _emit_ctx(n)).eval_output('n', index)
+        if not isinstance(want, np.ndarray):
+            continue                       # closure outputs go another route
+        want = np.asarray(want, np.float32)
+        if want.ndim == 1:
+            want = np.stack([want] * 3, 1)
+        w = min(want.shape[1], got.shape[1])
+        e = float(np.abs(got[:, :w] - want[:, :w]).max())
+        if e > 2e-3:
+            wrong.append(f'{label} ({e:.5f})')
+    check(f'all {len(cases)} GLSL node emitters match the CPU', not wrong,
+          '; '.join(wrong[:4]))
+
+    # the image texture, whose coordinate default is the easy thing to get wrong
+    from ..core.texture import Texture
+    from ..core.settings import RenderSettings
+    src_img = np.zeros((16, 16, 4), np.float32)
+    yy, xx = np.mgrid[0:16, 0:16]
+    src_img[..., 0] = xx / 15.0
+    src_img[..., 1] = yy / 15.0
+    src_img[..., 2] = 0.5
+    src_img[..., 3] = 1.0
+    tex = Texture(src_img, colorspace='Non-Color', filt='NEAREST',
+                  wrap='REPEAT')
+    gg = np.stack([np.linspace(0.05, 0.95, n), np.linspace(0.9, 0.1, n),
+                   np.zeros(n)], 1).astype(np.float32)
+
+    def img_ctx():
+        c = _emit_ctx(n)
+        st2 = RenderSettings()
+        st2.tex_filter = 'NEAREST'
+        c.settings = st2
+        c.generated = gg * 0.3          # deliberately unlike the UVs
+        c.uv = gg[:, :2].copy()
+        return c
+
+    igraph = {'output': None, 'nodes': {'n': {
+        'id': 'n', 'bl_idname': 'ShaderNodeTexImage',
+        'props': {'image': 'tex', 'interpolation': 'Closest',
+                  'extension': 'REPEAT'},
+        'inputs': [{'name': 'Vector', 'type': 'VECTOR', 'default': [0, 0, 0],
+                    'link': None}],
+        'outputs': [{'name': 'Color', 'type': 'RGBA'},
+                    {'name': 'Alpha', 'type': 'VALUE'}]}}}
+    em = Emitter(igraph)
+    var, _vt = em.output('n', 0)
+    prog, err = try_compile(GLSL + """
+uniform sampler2D hal_tex0; uniform vec3 hal_generated; uniform vec2 hal_uv;
+out vec4 Color;
+void main() {
+%s
+    Color = %s;
+}
+""" % (em.body(), var), 'GLSL')
+    check('the image texture emitter compiles', prog is not None, str(err))
+    if prog is not None:
+        c = img_ctx()
+        got = prog.run({'hal_tex0': tex, 'hal_generated': c.generated,
+                        'hal_uv': c.uv}, {}, n)[0]['Color']
+        want = GraphEvaluator(igraph, img_ctx(), {'tex': tex}).eval_output('n', 0)
+        e = float(np.abs(got[:, :3] - np.asarray(want)[:, :3]).max())
+        check('the image texture samples where the CPU does', e < 2e-3,
+              f'max difference {e:.6f}')
+        check('it declares a sampler for the assembler to bind',
+              len(em.samplers) == 1 and em.samplers[0]['image'] == 'tex',
+              str(em.samplers))
+
+
+def test_emitter_declines_rather_than_guesses():
+    """An unknown node must be reported, never approximated."""
+    from ..gpu.emit import EMITTERS, can_emit, supported
+    graph = {'output': 'out', 'nodes': {
+        'x': {'id': 'x', 'bl_idname': 'ShaderNodeSomethingNew', 'props': {},
+              'inputs': [], 'outputs': [{'name': 'Out', 'type': 'RGBA'}]},
+        'out': {'id': 'out', 'bl_idname': 'ShaderNodeOutputMaterial',
+                'props': {},
+                'inputs': [{'name': 'Surface', 'type': 'SHADER',
+                            'default': None, 'link': ['x', 0]}],
+                'outputs': []}}}
+    ok, missing = can_emit(graph)
+    check('an unknown node blocks emission', not ok)
+    check('and is named', 'ShaderNodeSomethingNew' in missing, str(missing))
+    check('the supported list is not empty', len(supported()) > 20,
+          str(len(supported())))
+    check('every emitter is callable',
+          all(callable(f) for f in EMITTERS.values()))
+
+
+def test_assembled_material_shader_matches_cpu():
+    """A whole material, assembled into one shader, must shade as the CPU does.
+
+    This is the test that matters most: the emitter, the reflectance models and
+    the light loop are checked *together*, so the seams between them are
+    covered rather than only the pieces. It is also what proves a GPU frame is
+    achievable at all -- everything below the rasteriser now exists and agrees.
+    """
+    from ..core import mathx as MX
+    from ..core.nodeeval import GraphEvaluator
+    from ..core.scene import Light
+    from ..core.shading import MODEL_ITEMS, Surface, evaluate
+    from ..gpu.material import LIGHT_KIND, assemble
+    from ..shaders.compiler import try_compile
+
+    n = 48
+
+    def wn(i, t, p=None, ins=(), outs=()):
+        return {'id': i, 'bl_idname': t, 'props': p or {},
+                'inputs': [dict(x) for x in ins],
+                'outputs': [dict(x) for x in outs]}
+
+    def sk(nm, t, d, l=None):
+        return {'name': nm, 'type': t, 'default': d, 'link': l}
+
+    graph = {'output': 'out', 'nodes': {
+        'a': wn('a', 'ShaderNodeRGB', {'value': [.85, .25, .15, 1]}, [],
+                [{'name': 'Color', 'type': 'RGBA'}]),
+        'b': wn('b', 'ShaderNodeRGB', {'value': [.1, .45, .9, 1]}, [],
+                [{'name': 'Color', 'type': 'RGBA'}]),
+        'm': wn('m', 'ShaderNodeMixRGB', {'blend_type': 'MIX'},
+                [sk('Fac', 'VALUE', .35), sk('Color1', 'RGBA', [0, 0, 0, 1], ['a', 0]),
+                 sk('Color2', 'RGBA', [0, 0, 0, 1], ['b', 0])],
+                [{'name': 'Color', 'type': 'RGBA'}]),
+        'h': wn('h', 'ShaderNodeHueSaturation', {},
+                [sk('Hue', 'VALUE', .55), sk('Saturation', 'VALUE', 1.3),
+                 sk('Value', 'VALUE', .95), sk('Fac', 'VALUE', 1.0),
+                 sk('Color', 'RGBA', [0, 0, 0, 1], ['m', 0])],
+                [{'name': 'Color', 'type': 'RGBA'}]),
+        'd': wn('d', 'ShaderNodeBsdfDiffuse', {},
+                [sk('Color', 'RGBA', [0, 0, 0, 1], ['h', 0]),
+                 sk('Roughness', 'VALUE', 0.0), sk('Normal', 'VECTOR', [0, 0, 0])],
+                [{'name': 'BSDF', 'type': 'SHADER'}]),
+        'out': wn('out', 'ShaderNodeOutputMaterial', {},
+                  [sk('Surface', 'SHADER', None, ['d', 0]),
+                   sk('Displacement', 'VECTOR', [0, 0, 0])], [])}}
+
+    lights = [Light(type='SUN', direction=(-0.4, 0.3, -0.86),
+                    color=(1.0, 0.95, 0.85), energy=3.0),
+              Light(type='POINT', position=(2.0, -1.5, 3.0),
+                    color=(0.4, 0.6, 1.0), energy=25.0)]
+
+    src, samplers = assemble(graph, light_count=len(lights))
+    check('a complete material assembles into one shader', src is not None,
+          str(samplers))
+    if src is None:
+        return
+    prog, err = try_compile(src, 'GLSL')
+    check('the assembled shader compiles', prog is not None, str(err))
+    if prog is None:
+        return
+
+    P = np.stack([np.linspace(-2, 2, n), np.linspace(-1, 1, n),
+                  np.full(n, 0.5)], 1).astype(np.float32)
+    Nr = MX.normalize(np.stack([np.linspace(-.4, .4, n),
+                                np.linspace(.3, -.3, n),
+                                np.ones(n)], 1).astype(np.float32))
+    V = MX.normalize(np.tile(np.array([[0.1, 0.2, 0.97]], np.float32), (n, 1)))
+    T, B = MX.orthonormal_basis(Nr)
+    ambient = np.array([0.05, 0.06, 0.08], np.float32)
+
+    def ctx():
+        c = _emit_ctx(n)
+        c.generated = np.abs(P) * 0.2
+        c.uv = P[:, :2] * 0.1
+        c.P = P
+        c.N = Nr
+        c.I = -V
+        c.T = T
+        return c
+
+    base = np.asarray(GraphEvaluator(graph, ctx()).eval_output('h', 0))[:, :3]
+
+    def cpu(model):
+        s2 = Surface(n)
+        s2.diffuse = base.copy()
+        s2.specular[:] = 1.0
+        s2.diffuse_level[:] = 1.0
+        s2.specular_level[:] = 0.6
+        s2.glossiness[:] = 30.0
+        s2.roughness[:] = 0.35
+        s2.metallic[:] = 0.2
+        s2.soften[:] = 0.0
+        s2.ior[:] = 1.45
+        s2.toon_size[:] = 0.5
+        s2.toon_smooth[:] = 0.15
+        s2.opacity[:] = 1.0
+        s2.tangent, s2.bitangent = T, B
+        out = base * ambient[None, :]
+        for lt in lights:
+            if lt.type == 'SUN':
+                L = MX.normalize(-np.tile(
+                    np.asarray(lt.direction, np.float32)[None, :], (n, 1)))
+                att = np.ones(n, np.float32)
+            else:
+                d = np.asarray(lt.position, np.float32)[None, :] - P
+                dist = np.linalg.norm(d, axis=1)
+                L = d / np.maximum(dist, 1e-6)[:, None]
+                att = 1.0 / np.maximum(dist * dist, 1e-6)
+            dif, spec = evaluate(model, s2, Nr, L, V)
+            rad = (np.asarray(lt.color, np.float32)[None, :] * lt.energy
+                   * att[:, None] / np.pi)
+            out = out + (base * np.asarray(dif)[:, None]
+                         + s2.specular * 0.6 * np.asarray(spec)) * rad
+        return out
+
+    uni = {'hal_P': P, 'hal_N': Nr, 'hal_V': V, 'hal_T': T,
+           'hal_generated': np.abs(P) * 0.2, 'hal_uv': P[:, :2] * 0.1,
+           'hal_diffuse_level': np.full(n, 1.0, np.float32),
+           'hal_specular_level': np.full(n, 0.6, np.float32),
+           'hal_glossiness': np.full(n, 30.0, np.float32),
+           'hal_roughness': np.full(n, 0.35, np.float32),
+           'hal_metallic': np.full(n, 0.2, np.float32),
+           'hal_anisotropy': np.zeros(n, np.float32),
+           'hal_aniso_rot': np.zeros(n, np.float32),
+           'hal_soften': np.zeros(n, np.float32),
+           'hal_ior': np.full(n, 1.45, np.float32),
+           'hal_translucency': np.zeros(n, np.float32),
+           'hal_toon_size': np.full(n, 0.5, np.float32),
+           'hal_toon_smooth': np.full(n, 0.15, np.float32),
+           'hal_opacity': np.ones(n, np.float32),
+           'hal_specular_tint': np.ones((n, 3), np.float32),
+           'hal_ambient': np.tile(ambient[None, :], (n, 1))}
+    for i, lt in enumerate(lights):
+        uni[f'hal_lkind{i}'] = np.full(n, LIGHT_KIND[lt.type], np.int32)
+        uni[f'hal_lpos{i}'] = np.tile(
+            np.asarray(lt.position, np.float32)[None, :], (n, 1))
+        uni[f'hal_ldir{i}'] = np.tile(
+            np.asarray(lt.direction, np.float32)[None, :], (n, 1))
+        uni[f'hal_lcol{i}'] = np.tile(
+            np.asarray(lt.color, np.float32)[None, :], (n, 1))
+        uni[f'hal_lenergy{i}'] = np.full(n, lt.energy, np.float32)
+        uni[f'hal_lradius{i}'] = np.full(n, 0.5, np.float32)
+
+    idx = {m[0]: i for i, m in enumerate(MODEL_ITEMS)}
+    wrong = []
+    tested = 0
+    for ident, _l, _no in MODEL_ITEMS:
+        if ident in ('WIREFRAME', 'GOURAUD', 'FLAT'):
+            continue
+        tested += 1
+        u = dict(uni)
+        u['hal_model'] = np.full(n, idx[ident], np.int32)
+        got = prog.run(u, {}, n)[0]['Color'][:, :3]
+        want = cpu(ident)
+        rel = float(np.abs(got - want).max()) / max(float(np.abs(want).max()), 1e-6)
+        if rel > 5e-3:
+            wrong.append(f'{ident} ({rel:.5f})')
+    check(f'all {tested} models shade identically in an assembled shader',
+          not wrong, '; '.join(wrong[:4]))
+
+    # a material using a node with no emitter must produce no shader at all
+    bad_graph = {'output': 'out', 'nodes': {
+        'x': wn('x', 'ShaderNodeSomethingNew', {}, [],
+                [{'name': 'BSDF', 'type': 'SHADER'}]),
+        'out': wn('out', 'ShaderNodeOutputMaterial', {},
+                  [sk('Surface', 'SHADER', None, ['x', 0])], [])}}
+    src2, why = assemble(bad_graph, light_count=1)
+    check('an unsupported material assembles to nothing', src2 is None)
+    check('and the missing node type is named',
+          'ShaderNodeSomethingNew' in str(why), str(why))
+
+
+def test_worker_resolves_blender_package_names():
+    """A worker must unpickle objects made under the add-on's Blender name.
+
+    Installed as an extension the package is imported as
+    `bl_ext.user_default.halcyon_render`, so every dataclass pickled inside
+    Blender carries that module path. A worker importing the same files as
+    plain `halcyon_render` cannot resolve those names, and unpickling the scene
+    fails with `No module named 'bl_ext'`.
+
+    That failure spent five releases looking like the worker exiting for no
+    reason, because a read error in the worker's loop was caught and treated
+    exactly like end of stream.
+    """
+    import importlib
+    import os
+    import pickle
+    import subprocess
+    import types
+
+    from ..core import parallel as P
+
+    check('the package can name itself as Blender sees it',
+          isinstance(P.import_name(), str) and P.import_name(),
+          P.import_name())
+
+    alias = 'bl_ext.user_default.halcyon_probe'
+    real = P.package_location()[1]
+    parent = P.package_location()[0]
+
+    # pickle something under the alias, exactly as Blender would
+    from ..core.scene import Material
+    from ..core.settings import RenderSettings
+    saved = (Material.__module__, RenderSettings.__module__)
+    stubs = []
+    try:
+        for name in ('bl_ext', 'bl_ext.user_default'):
+            if name not in sys.modules:
+                mod = types.ModuleType(name)
+                mod.__path__ = []
+                sys.modules[name] = mod
+                stubs.append(name)
+        pkg = importlib.import_module(real)
+        sys.modules[alias] = pkg
+        stubs.append(alias)
+        for sub in ('core', 'core.scene', 'core.settings'):
+            full = f'{alias}.{sub}'
+            sys.modules[full] = importlib.import_module(f'{real}.{sub}')
+            stubs.append(full)
+        Material.__module__ = f'{alias}.core.scene'
+        RenderSettings.__module__ = f'{alias}.core.settings'
+        blob = pickle.dumps((Material(), RenderSettings()))
+    finally:
+        Material.__module__, RenderSettings.__module__ = saved
+        for name in stubs:
+            sys.modules.pop(name, None)
+
+    check('the pickle really carries the Blender module path', b'bl_ext' in blob)
+
+    exe = P.find_interpreter()
+    if exe is None:
+        check('worker alias resolution (skipped: no interpreter)', True)
+        return
+
+    env = dict(os.environ)
+    env['PYTHONPATH'] = parent + os.pathsep + env.get('PYTHONPATH', '')
+    env['HALCYON_WORKER_ROOT'] = parent
+    env['HALCYON_WORKER_PKG'] = real
+    env['HALCYON_WORKER_ALIAS'] = alias
+    code = P.BOOTSTRAP_SOURCE.split("note('entering main')")[0] + """
+import pickle, sys
+obj = pickle.loads(sys.stdin.buffer.read())
+sys.stderr.write('OK ' + ','.join(type(o).__name__ for o in obj))
+"""
+    try:
+        run = subprocess.run([exe, '-c', code], input=blob, env=env,
+                             capture_output=True, timeout=90)
+    except Exception as exc:                                    # noqa: BLE001
+        check('worker alias resolution (skipped: could not spawn)', True,
+              str(exc))
+        return
+    text = run.stderr.decode('utf-8', 'replace')
+    check('a worker unpickles objects named for Blender', 'OK ' in text,
+          text.strip()[-160:])
+    check('and gets both objects back',
+          'Material' in text and 'RenderSettings' in text,
+          text.strip()[-80:])
+
+
+def test_gbuffer_reconstruction_matches_cpu():
+    """GLSL must rebuild shading inputs from a packed G-buffer exactly.
+
+    This is the foundation of moving shading to the GPU without writing a GPU
+    rasteriser first -- which is the right order, because shading is about 71%
+    of a frame and rasterising is about 9%. The CPU already produces triangle
+    IDs and barycentrics; a full-screen pass can turn those back into
+    positions, normals and UVs, using the same mechanism the post stages
+    already prove works on real hardware.
+    """
+    from ..core import raster
+    from ..core.texture import Texture
+    from ..gpu import gbuffer as GB
+    from ..gpu.glsl_shading import GLSL
+    from ..shaders.compiler import try_compile
+
+    w, h = 64, 48
+    st = base_settings(w, h)
+    sc = demo_scene(st)
+    _v, _p, vp, _e = R.camera_matrices(sc.camera, w, h)
+    g = raster.GBuffer(w, h)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+
+    ids = GB.pack_ids(g)
+    attrs, side = GB.pack_attributes(sc.mesh)
+    check('the id texture is one texel per pixel', ids.shape == (h, w, 4),
+          str(ids.shape))
+    check('triangle ids survive the float packing',
+          np.array_equal(ids[:, :, 3].astype(np.int64), g.tri.astype(np.int64)))
+    check('barycentrics sum to one where covered',
+          float(np.abs(ids[g.tri >= 0, :3].sum(axis=1) - 1.0).max()) < 1e-5)
+
+    prog, err = try_compile(GLSL + GB.GLSL + """
+uniform vec2 hal_screen;
+out vec4 Color;
+void main() {
+    HalcyonFragment f = hal_read_gbuffer(hal_screen);
+    Color = vec4(f.P, f.covered ? 1.0 : 0.0);
+}
+""", 'GLSL')
+    check('the G-buffer reader compiles', prog is not None, str(err))
+    if prog is None:
+        return
+
+    yy, xx = np.mgrid[0:h, 0:w]
+    uv = np.stack([(xx.ravel() + 0.5) / w, (yy.ravel() + 0.5) / h],
+                  1).astype(np.float32)
+    n = w * h
+    out = prog.run({
+        'hal_gb_ids': Texture(ids, colorspace='Non-Color', filt='NEAREST',
+                              wrap='EXTEND'),
+        'hal_gb_attrs': Texture(attrs, colorspace='Non-Color', filt='NEAREST',
+                                wrap='EXTEND'),
+        'hal_attr_side': np.full(n, float(side), np.float32),
+        'hal_slot_count': np.full(n, float(GB.SLOTS), np.float32),
+        'hal_screen': uv}, {}, n)[0]['Color']
+
+    got = out[:, :3].reshape(h, w, 3)
+    want = GB.cpu_reconstruct(sc.mesh, g, 0)
+    cov = g.tri >= 0
+    check('some of the frame is actually covered', int(cov.sum()) > 100,
+          str(int(cov.sum())))
+    e = float(np.abs(got[cov] - want[cov]).max())
+    check('GLSL rebuilds positions exactly as the CPU does', e < 2e-3,
+          f'max difference {e:.6f}')
+    check('and agrees about which pixels are covered',
+          np.array_equal(out[:, 3].reshape(h, w) > 0.5, cov))
 
 
 def test_debug_passes():

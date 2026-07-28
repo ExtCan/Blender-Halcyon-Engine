@@ -1024,6 +1024,12 @@ def render(scene, settings=None, progress=None, band=None):
     snap = st.vertex_snap_grid if st.vertex_snap else 0.0
     cull = 'BACK' if st.backface_cull else 'NONE'
 
+    # when only a band is wanted, the rasteriser is told so: otherwise every
+    # worker in a pool rasterises the whole mesh for its own slice
+    scissor = None
+    if band is not None:
+        scissor = (max(band[0], 0) * ss, min(band[1], H) * ss)
+
     flat_depth = None
     if st.depth_sort == 'PAINTERS':
         flat_depth = polygon_depths(mesh, view, eye, st.painters_key)
@@ -1033,6 +1039,7 @@ def render(scene, settings=None, progress=None, band=None):
         raster.rasterize(mesh.verts, mesh.tris, vp, rw, rh, cull=cull, snap=snap,
                          depth_bits=st.depth_precision, subset=opaque, gbuf=gbuf,
                          count_overdraw=want_overdraw, flat_depth=flat_depth,
+                         scissor=scissor,
                          batched=False if want_overdraw else None)
 
     if progress:
@@ -1067,13 +1074,13 @@ def render(scene, settings=None, progress=None, band=None):
         raster.rasterize(mesh.verts, mesh.tris, vp, rw, rh, cull='NONE', snap=snap,
                          depth_bits=st.depth_precision, subset=transparent,
                          gbuf=gbuf, frags=frags, depth_write=False,
-                         flat_depth=flat_depth)
+                         flat_depth=flat_depth, scissor=scissor)
         with ST.track('transparency'):
             img = _composite_abuffer(job, frags, gbuf, img, st)
     elif transparent is not None and transparent.size:
         raster.rasterize(mesh.verts, mesh.tris, vp, rw, rh, cull=cull, snap=snap,
                          depth_bits=st.depth_precision, subset=transparent,
-                         gbuf=gbuf, flat_depth=flat_depth)
+                         gbuf=gbuf, flat_depth=flat_depth, scissor=scissor)
 
     if st.debug_pass != 'BEAUTY':
         img = _debug_pass(job, gbuf, img, st)
@@ -1157,6 +1164,7 @@ def _shade_all(job, tri_idx, bary, px, py, front, blin, st):
 
 
 MIN_CHUNK = 16384            # below this, per-chunk overhead dominates
+SMALL_CHUNK = 2048           # ...but an idle core costs more than that overhead
 MAX_CHUNK = 262144           # above this, one chunk's temporaries get large
 
 
@@ -1194,6 +1202,12 @@ def _shade_chunked(job, tri_idx, bary, px, py, front, blin, st):
     workers = resolve_threads(st)
     chunk = int(np.ceil(n / max(workers * 4, 1)))
     chunk = int(min(max(chunk, MIN_CHUNK), MAX_CHUNK))
+    # Subdividing below this floor to give every worker a chunk was tried and
+    # measured *worse* on a 20-core machine -- 1.00x became 0.87x -- because
+    # the shading path is not actually thread-limited by chunk count. See the
+    # threading note in the README: NumPy releases the interpreter lock only
+    # for large operations, and the node evaluator is dominated by Python
+    # dispatch between small ones. More chunks bought only more overhead.
     starts = list(range(0, n, chunk))
 
     if workers == 1 or len(starts) == 1:

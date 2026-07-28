@@ -154,7 +154,9 @@ def cpu_scaling(out, heavy=False):
     _p(out, LINE)
     _p(out, 'CPU SCALING  (same scene, varying thread count)')
     _p(out, LINE)
-    res = (480, 360) if heavy else (320, 240)
+    # 320x240 is too small to show threading on a fast machine: the whole
+    # frame is a few milliseconds and the pool costs more than it saves
+    res = (960, 720) if heavy else (640, 480)
     counts = [1, 2, 4, 8, 16, 32]
     try:
         import os
@@ -165,6 +167,8 @@ def cpu_scaling(out, heavy=False):
 
     base = None
     _p(out, f'  {res[0]}x{res[1]}, supersampling off')
+    _p(out, '  (a small frame cannot show thread scaling -- the pool costs more '
+            'than it saves)')
     for n in counts:
         st = RenderSettings()
         st.resolution_x, st.resolution_y = res
@@ -172,11 +176,25 @@ def cpu_scaling(out, heavy=False):
         st.threads = n
         sc = demo_scene(st)
         core_render.render(sc, st)                       # warm caches
-        t0 = time.perf_counter()
-        core_render.render(sc, st)
-        dt = time.perf_counter() - t0
+        dt = min((lambda t0: (core_render.render(sc, st),
+                              time.perf_counter() - t0)[1])(time.perf_counter())
+                 for _ in range(3))
         base = base or dt
         _p(out, f'    {n:3d} threads  {dt:7.3f}s   {base / dt:5.2f}x')
+
+    _p(out)
+    _p(out, '  the same frame, threads off vs auto:')
+    for label, th in (('one thread', 1), ('auto', 0)):
+        st = RenderSettings()
+        st.resolution_x, st.resolution_y = res
+        st.aa_samples = 4
+        st.threads = th
+        sc = demo_scene(st)
+        core_render.render(sc, st)
+        dt = min((lambda t0: (core_render.render(sc, st),
+                              time.perf_counter() - t0)[1])(time.perf_counter())
+                 for _ in range(3))
+        _p(out, f'    {label:12s} {dt:7.3f}s')
 
     _p(out)
     _p(out, '  worker processes:')

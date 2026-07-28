@@ -1028,14 +1028,31 @@ class HALCYON_PT_debug(HalcyonPanel, Panel):
         box.label(text="Experimental", icon='ERROR')
         col = box.column()
         col.use_property_split = True
-        col.prop(hs, 'gpu_post')
-        if hs.gpu_post:
+        col.prop(hs, 'render_device')
+        if str(hs.render_device).upper() == 'GPU':
+            from .gpu import capability as _cap
             from .gpu import device as _dev
-            note = box.column(align=True)
-            note.scale_y = 0.8
-            note.label(text=_dev.describe(), icon='INFO')
-            note.label(text="Shaders validated against the CPU path, never on "
-                            "a driver", icon='ERROR')
+            sub = box.column(align=True)
+            sub.scale_y = 0.85
+            sub.label(text=_dev.describe(), icon='INFO')
+            sub.separator()
+            for feat, support, why in _cap.summary():
+                row = sub.row()
+                if support == _cap.BOTH:
+                    row.label(text=feat.replace('_', ' ').title(),
+                              icon='CHECKMARK')
+                elif support == _cap.NEVER:
+                    row.active = False
+                    row.label(text=feat.replace('_', ' ').title()
+                              + " — CPU only, always", icon='X')
+                else:
+                    row.active = False
+                    row.label(text=feat.replace('_', ' ').title()
+                              + " — CPU for now", icon='TIME')
+            note = box.row()
+            note.active = False
+            note.label(text="Unsupported work falls back automatically",
+                       icon='INFO')
         col.separator()
         col.prop(hs, 'use_processes')
         sub = col.column()

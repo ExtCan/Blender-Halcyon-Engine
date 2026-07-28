@@ -15,6 +15,7 @@ class RenderSettings:
     max_transparent_layers: int = 16
     fast_background: bool = True
     cache_shadows: bool = True
+    render_device: str = 'CPU'
     gpu_post: bool = False
     use_processes: bool = False
     process_count: int = 0
@@ -170,7 +171,7 @@ class RenderSettings:
     pixel_grid: bool = False
     # ------------------------------------------------------------ performance
     tile_size: int = 128
-    threads: int = 0                   # 0 = auto
+    threads: int = 1                   # 0 = auto
     bucket_order: str = 'HILBERT'      # HILBERT | TOP | CENTER | RANDOM
     preview_scale: int = 4
     max_texture_memory: int = 0

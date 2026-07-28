@@ -16,11 +16,137 @@ import os
 import pickle
 import struct
 import subprocess
+import threading
+
+import numpy as np
 import sys
 
 # The child is told where to import from with PYTHONPATH rather than by
 # editing sys.path, which an extension may not do.
-BOOTSTRAP = "from {pkg}.core import worker; worker.main()"
+# Written to a file rather than passed with -c. On Windows a -c string reaches
+# the child through the shell's quoting rules, and when that goes wrong the
+# child exits cleanly having done nothing -- which is indistinguishable from a
+# closed pipe, and cost three releases to tell apart. A file has no quoting.
+BOOTSTRAP_SOURCE = """import os
+import sys
+import traceback
+
+# The worker has failed four times with 'exited cleanly having said nothing',
+# which is the least informative failure there is. So it keeps a log: every
+# step is recorded before it is attempted, and the parent reads the file when a
+# worker will not answer. Guessing has been more expensive than logging.
+LOG = os.environ.get('HALCYON_WORKER_LOG')
+
+
+def note(msg):
+    if not LOG:
+        return
+    try:
+        with open(LOG, 'a', encoding='utf-8') as fh:
+            fh.write(str(msg) + chr(10))
+    except Exception:
+        pass
+
+
+note('bootstrap start ' + sys.executable)
+note('version ' + sys.version.replace(chr(10), ' '))
+note('stdin  ' + repr(sys.stdin))
+note('stdout ' + repr(sys.stdout))
+try:
+    note('stdin fileno ' + repr(sys.stdin.fileno()))
+except Exception as exc:
+    note('stdin fileno FAILED ' + repr(exc))
+try:
+    import numpy
+    note('numpy ' + numpy.__version__)
+except Exception:
+    note('numpy import FAILED')
+    note(traceback.format_exc())
+    raise
+root = os.environ.get('HALCYON_WORKER_ROOT')
+if root:
+    sys.path.insert(0, root)
+pkg = os.environ.get('HALCYON_WORKER_PKG')
+alias = os.environ.get('HALCYON_WORKER_ALIAS')
+note('root  ' + repr(root))
+note('pkg   ' + repr(pkg))
+note('alias ' + repr(alias))
+if alias and alias != pkg:
+    # Make the package answer to the name it had inside Blender, so pickles
+    # made there resolve here. A finder rather than a fixed list, because we
+    # cannot know in advance which submodules a pickle will reach for.
+    import importlib
+    import types
+    from importlib.machinery import ModuleSpec
+
+    class _AliasLoader(object):
+        def __init__(self, module):
+            self.module = module
+
+        def create_module(self, spec):
+            return self.module
+
+        def exec_module(self, module):
+            pass
+
+    class _AliasFinder(object):
+        def __init__(self, alias_name, real_name):
+            self.alias = alias_name
+            self.real = real_name
+
+        def find_spec(self, fullname, path=None, target=None):
+            # pickle imports the top of the dotted path first, so the parents
+            # of the alias have to exist as well: 'bl_ext' and
+            # 'bl_ext.user_default' before 'bl_ext.user_default.halcyon'.
+            if self.alias.startswith(fullname + '.'):
+                stub = types.ModuleType(fullname)
+                stub.__path__ = []
+                return ModuleSpec(fullname, _AliasLoader(stub),
+                                  is_package=True)
+            if fullname != self.alias and not fullname.startswith(self.alias + '.'):
+                return None
+            suffix = fullname[len(self.alias):]
+            try:
+                module = importlib.import_module(self.real + suffix)
+            except ImportError:
+                return None
+            return ModuleSpec(fullname, _AliasLoader(module),
+                              is_package=hasattr(module, '__path__'))
+
+    sys.meta_path.insert(0, _AliasFinder(alias, pkg))
+    note('alias finder installed: ' + alias + ' -> ' + pkg)
+
+try:
+    mod = __import__(pkg + '.core.worker', fromlist=['main'])
+except Exception:
+    note('import FAILED')
+    note(traceback.format_exc())
+    raise
+note('entering main')
+try:
+    mod.main()
+    note('main returned normally')
+except Exception:
+    note('main RAISED')
+    note(traceback.format_exc())
+    raise
+"""
+
+
+def _bootstrap_path():
+    import hashlib
+    import tempfile
+    tag = hashlib.md5(BOOTSTRAP_SOURCE.encode('utf-8')).hexdigest()[:10]
+    path = os.path.join(tempfile.gettempdir(), 'halcyon_worker_%s.py' % tag)
+    if not os.path.exists(path):
+        tmp = path + '.%d' % os.getpid()
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            fh.write(BOOTSTRAP_SOURCE)
+        try:
+            os.replace(tmp, path)
+        except OSError:
+            pass
+    return path
 
 
 def find_interpreter():
@@ -46,17 +172,44 @@ def package_location():
     return os.path.dirname(pkg_dir), os.path.basename(pkg_dir)
 
 
+def import_name():
+    """What this package is called *inside Blender*.
+
+    Installed as an extension it is `bl_ext.user_default.halcyon_render`, and
+    every dataclass pickled from it carries that module path. A worker that
+    imports the same code as plain `halcyon_render` cannot resolve those names,
+    and unpickling the scene fails with `No module named 'bl_ext'` -- which for
+    five releases looked like the worker exiting for no reason.
+    """
+    return __name__.rsplit('.core.parallel', 1)[0]
+
+
 class Worker:
     def __init__(self, exe, parent, pkg):
-        code = BOOTSTRAP.format(pkg=pkg)
         env = dict(os.environ)
         env.pop('PYTHONHOME', None)
         env['PYTHONDONTWRITEBYTECODE'] = '1'
         existing = env.get('PYTHONPATH', '')
         env['PYTHONPATH'] = (parent + os.pathsep + existing) if existing else parent
+        env['HALCYON_WORKER_ROOT'] = parent
+        env['HALCYON_WORKER_PKG'] = pkg
+        env['HALCYON_WORKER_ALIAS'] = import_name()
+        import tempfile
+        self.log = os.path.join(tempfile.gettempdir(),
+                                'halcyon_worker_%d_%d.log'
+                                % (os.getpid(), id(self) & 0xffff))
+        try:
+            if os.path.exists(self.log):
+                os.remove(self.log)
+        except OSError:
+            pass
+        env['HALCYON_WORKER_LOG'] = self.log
+        self.bootstrap = _bootstrap_path()
         self.proc = subprocess.Popen(
-            [exe, '-c', code], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, env=env, cwd=parent)
+            [exe, self.bootstrap], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+            cwd=parent)
+        self.lock = threading.Lock()
         self.alive = True
 
     def send(self, msg):
@@ -79,6 +232,7 @@ class Worker:
         return pickle.loads(bytes(buf))
 
     def call(self, msg):
+        with self.lock:
             try:
                 self.send(msg)
                 return self.recv()
@@ -101,7 +255,21 @@ class Worker:
             text = data.decode('utf-8', 'replace').strip()
             if text:
                 return ' | worker said: ' + text[-limit:]
-            return f' | worker exited with code {self.proc.returncode}'
+            tail = f' | worker exited with code {self.proc.returncode}'
+            return tail + self.log_tail()
+        except Exception:
+            return ''
+
+    def log_tail(self, limit=600):
+        """What the child recorded about its own startup."""
+        try:
+            with open(self.log, encoding='utf-8') as fh:
+                text = fh.read().strip()
+            if not text:
+                return ' | worker log is empty (it never started)'
+            return ' | worker log: ' + text.replace(chr(10), ' / ')[-limit:]
+        except FileNotFoundError:
+            return ' | no worker log was written (the bootstrap never ran)'
         except Exception:
             return ''
 
@@ -147,7 +315,8 @@ class Pool:
             except Exception as exc:                            # noqa: BLE001
                 self.error = (f'{type(exc).__name__}: {exc}'
                               f' | interpreter {exe}'
-                              f' | importing {pkg} from {parent}')
+                              f' | importing {pkg} from {parent}'
+                              f' | bootstrap {_bootstrap_path()}')
                 self.close()
                 return
 
@@ -190,10 +359,17 @@ class Pool:
                     errors.append(f'{type(exc).__name__}: {exc}'
                                   + worker.stderr_tail())
                     continue
-                if reply[0] != 'band':
-                    errors.append(str(reply))
+                if reply[0] == 'band_raw':
+                    # raw bytes plus shape: pickling the array costs the parent
+                    # interpreter-lock time it cannot overlap with the other
+                    # workers still rendering
+                    shape, blob = reply[1], reply[2]
+                    out[i] = np.frombuffer(blob, dtype=np.float32).reshape(shape)
+                elif reply[0] == 'band':
+                    out[i] = reply[1]
+                else:
+                    errors.append(str(reply)[:200])
                     continue
-                out[i] = reply[1]
             if errors:
                 break
         if errors or any(a is None for a in out):
@@ -265,8 +441,12 @@ def render_parallel(scene, settings, workers, scene_key=None, progress=None):
     if not pool.ok():
         return None, pool.error
 
-    # more bands than workers, so a slow band cannot leave a core idle
-    n_bands = min(count * 3, H)
+    # One band per worker, not three. Every band repeats the fixed cost of a
+    # render call -- projecting the vertices, preparing the light lookups --
+    # and with a scissor keeping the rasterisation proportional there is little
+    # left to load-balance. Three bands each made the pool slower than not
+    # using it at all.
+    n_bands = min(count, H)
     edges = [round(i * H / n_bands) for i in range(n_bands + 1)]
     bands = [(edges[i], edges[i + 1]) for i in range(n_bands)
              if edges[i + 1] > edges[i]]
