@@ -9,7 +9,7 @@ mid-to-late 1990s home-computer 3D software.
 Not a filter over a modern render. A scanline z-buffer rasteriser with optional
 ray tracing, the reflectance models those packages actually shipped, real
 framebuffer quantisation, and a genuine GLSL/HLSL compiler for the coded-shader
-nodes. 13,600 lines of Python and NumPy, no compiled dependencies.
+nodes. 24,000 lines of Python and NumPy, no compiled dependencies.
 
 ![contact sheet](docs/halcyon_contact_sheet.png)
 
@@ -74,18 +74,34 @@ selecting Flat evaluates once per face. That is where the banding and the
 faceting genuinely come from, and it is why they look right instead of merely
 blurry.
 
-**105 node types** are evaluated, including the full Principled BSDF,
+**106 node types** are evaluated, including the full Principled BSDF,
 node groups (recursively), muted nodes, reroutes, all the texture and colour
 nodes, and every Math and Vector Math operation. Nodes the engine doesn't know
 pass their first matching input through and are reported as a warning rather
 than failing the render.
+
+**13 material templates** — Chrome, Gold, Brushed Metal, Glass, Shiny Plastic,
+Rubber, Polished Marble, Varnished Wood, Terrain, Cel Shaded, Velvet, Hologram
+and Wireframe. Built at runtime as recipes rather than saved node trees, so they
+always match the current nodes.
+
+**An infinite ground plane** — solid, checker, fractal or animated ocean —
+intersected analytically in the background pass rather than built from geometry,
+exactly as POV-Ray and Bryce provided one. World Properties ▸ Halcyon World ▸
+Infinite Ground.
+
+**Painter's Algorithm** alongside the z-buffer, comparing whole polygons rather
+than fragments, with the sorting errors that implies. **Light linking** per lamp
+by collection. **Fresnel, rim light, matcap, reflection tint, edge opacity and
+backface override** on the master shader, all applied after the reflectance model
+so they behave the same on every one.
 
 **Material conversion.** Three buttons in the Material panel convert the active
 material, everything on the selected objects, or the whole scene onto the
 Halcyon Shader — relinking existing textures rather than discarding them, and
 choosing the reflectance model from what the source shader actually was.
 
-**12 procedural texture nodes** of the kind these packages shipped with —
+**13 procedural texture nodes** of the kind these packages shipped with —
 Marble, Wood, Granite, Dents, Crackle, Plasma, Ripples, Starfield, Weave,
 Scratches, Tiles and Spiral. Solid textures, evaluated in 3D, under
 *Add > Halcyon > Halcyon Textures*. Plasma and Ripples animate.
@@ -135,7 +151,7 @@ Applying a preset resets everything first, so presets never accumulate — machi
 settings like thread count and Transparent Film are preserved. **Add On Top**
 layers one deliberately.
 
-**131 settings**, all exposed, all doing something real.
+**153 settings**, all exposed. A test fails if any of them is drawn in the UI without something reading it.
 
 ---
 
@@ -203,8 +219,8 @@ the whole renderer can be tested headlessly, and it is the reason the test suite
 below exists at all.
 
 `properties.py` is **generated from the `RenderSettings` dataclass**, so the UI
-cannot drift from the renderer. A test asserts all 131 fields have matching
-properties.
+cannot drift from the renderer. A test asserts every field has a matching
+property.
 
 ---
 
@@ -222,7 +238,7 @@ renderer (geometry landing where independently projected, shadows by both
 methods agreeing, every shading model distinct, all six debug passes, affine
 texture warp, vertex snapping, A-buffer transparency, ray-traced reflection,
 node-graph evaluation including group recursion and unknown-node fallback,
-palette colour counts, the full post chain, and all 24 presets rendering).
+palette colour counts, the full post chain, and all 52 presets rendering).
 
 Set `HALCYON_DEBUG=1` to make node evaluation raise instead of falling back
 silently — useful when a material isn't doing what you expect.
@@ -277,11 +293,9 @@ running it in Blender: an inverted image, a missing 1/π that whitened every
 material, and a preview crash. If something misbehaves, the traceback in
 Window ▸ Toggle System Console is the fastest way to tell me what happened.
 
-**There is no GPU backend.** See *On GPU support* above. Everything is CPU, and
-threaded.
-
-**It is CPU-only.** See *Performance* below for what that costs and what to do
-about it.
+**The GPU port is one stage of three.** The post chain runs on the GPU;
+rasterisation and shading do not. See *GPU support* below. Everything else is
+CPU, and threaded.
 
 **Procedural textures differ slightly from Cycles.** Noise, Voronoi, Musgrave
 and Magic are independently implemented from their published definitions. They
@@ -295,17 +309,23 @@ rotation and turbidity inputs, and close enough in shape and colour for output
 that is about to be quantised to 256 colours. `altitude`, `air_density`,
 `dust_density` and `ozone_density` are exported but unused.
 
-**Volumetrics are not implemented.** The light volumetric setting is exported
-and stored but unused. Same for depth of field — the camera setting round-trips
-but no defocus is applied.
+**Volumetrics are screen-space.** A light's Volumetric setting throws shafts by
+smearing bright pixels outward from its position on screen, which is how it was
+done then. No volume is integrated.
 
-**Displacement is evaluated but not applied.** The graph's displacement output
-is computed and available; it does not tessellate geometry.
+**Depth of field is layered, not sampled.** The frame is split into depth slabs
+and each blurred by its circle of confusion — a handful of blurs instead of
+hundreds of rays, as compositors of the era did.
+
+**Displacement drives a bump, not geometry.** The height becomes a normal
+perturbation from its screen-space gradient. Nothing is tessellated, which is
+also what 1990s scanline renderers did.
 
 **Ambient occlusion is not period correct** and is off by default. It's there
 because it's occasionally useful, not because a 1996 renderer had it.
 
-**Motion blur, particles and hair are not supported.**
+**Motion blur, particles and hair are not supported.** Baking to texture is not
+implemented either.
 
 ---
 
@@ -420,46 +440,42 @@ Shading, not rasterisation. The knobs that actually matter, in order:
    and only rebuilds it when something actually changes, so orbiting no longer
    re-converts every mesh per frame.
 
-### On GPU support
+### GPU support
 
-There is no GPU backend. Here is exactly what the two Blender engines do and
-which of them an add-on can actually follow.
+Stage one of a GPU port is live, on Blender's own `gpu` module — the layer EEVEE
+is built on. Cycles' device abstraction is C++ with precompiled kernels and is
+not exposed to Python at all, so this is the only route an add-on has.
 
-**Cycles is not reachable.** It is C++ with its own device abstraction and
-precompiled kernels for CUDA, OptiX, HIP, oneAPI and Metal. None of that layer
-is exposed to Python — there is no API to ask Blender for a CUDA context or to
-enqueue work on a Cycles device. An add-on cannot borrow it at any level.
+**GPU Post Processing** in the Debug panel runs the parallel post stages as GLSL.
+Measured on an RTX 5060 Ti under Vulkan against the CPU function each replaces:
 
-**EEVEE's approach is reachable.** EEVEE is built on Blender's internal GPU
-module, and a usable subset of that same module is exposed to Python as `gpu`:
-`GPUShader` (you supply GLSL), `GPUBatch`, `GPUOffScreen`, `GPUTexture`,
-`gpu.state`. That is genuinely enough to rasterise and shade on the GPU from an
-add-on. The entry point for final renders is `bl_use_gpu_context = True` on the
-RenderEngine, which makes Blender provide a GPU context during `render()`; the
-viewport path already has one in `view_draw`.
+| stage | agreement | enabled |
+|---|---|---|
+| Display transform | 0.00001 max difference | yes |
+| CRT mask, scanlines, vignette | 0.0115 | yes |
+| Ordered dither and bit depth | 0.0327 | yes |
+| Lens distortion | 0.318 | no |
+| Composite NTSC | 0.287 | no |
 
-So the honest answer to "can you do it the way EEVEE does" is **yes, and that is
-the right route** — but it is a port, not a switch:
+A stage runs because it was measured, not because it was written, and a test
+fails if anything unproven appears in the enabled list. Blender defaults to
+**Vulkan**, where the legacy `GPUShader(vertex, fragment)` constructor does not
+exist — shaders are built from a `GPUShaderCreateInfo`, with the old constructor
+kept only as an OpenGL fallback.
+
+Two stages remain, and they are where the time actually is:
 
 | piece | difficulty | notes |
 |---|---|---|
-| Post chain | easy | full-screen fragment shaders; biggest win per unit of work at high resolution |
-| Rasterisation to a G-buffer | moderate | draw the mesh, write triangle ID and barycentrics to an offscreen target |
+| Rasterisation to a G-buffer | moderate | there is already a bit-identical CPU reference to diff against |
 | The 18 shading models | moderate | mechanical translation of formulas already written down |
-| Coded-shader node | *easier* | it is already GLSL; today it is compiled **to** NumPy, which stops being necessary |
-| Node evaluator | hard | 92 node types would need a GLSL backend instead of the NumPy one |
+| Coded-shader node | *easier* | it is already GLSL; today it compiles **to** NumPy, which stops being necessary |
+| Node evaluator | hard | 106 node types would each need a GLSL emitter |
 | A-buffer transparency | hard | needs depth peeling or per-pixel linked lists |
-| Error-diffusion dither | does not port | Floyd-Steinberg and friends are inherently serial. Ordered dither parallelises fine; the error-diffusion kernels would stay on the CPU |
+| Error-diffusion dither | does not port | inherently serial, and stays on the CPU |
 
-A sensible order would be post chain, then rasterisation, then shading, keeping
-the CPU path as the reference to diff against at each stage — the same way the
-batched rasteriser is validated bit-for-bit against the loop today.
-
-What I have not done is write any of it, because this add-on was developed in an
-environment with no GPU. I could write the code but could not run a single line
-of it, and an untested "GPU support" checkbox is worse than an honest gap. The
-batched rasteriser is the prerequisite work either way: removing the per-triangle
-Python loop is what makes both routes possible.
+Shading is over half of a typical frame, so nothing before the third stage will
+move a render much.
 
 ---
 
@@ -470,13 +486,13 @@ halcyon/
   core/          bpy-free renderer
     mathx.py       vector maths on (N,3) arrays
     scene.py       dataclasses the renderer consumes
-    settings.py    RenderSettings — the 131 knobs
+    settings.py    RenderSettings — the 153 knobs
     raster.py      clipping, z-buffer, A-buffer fragment lists
     bvh.py         median-split BVH for rays
     texture.py     sampling, mips, N64 three-point filter
     shading.py     the 18 reflectance models
     lights.py      attenuation, shadow maps, PCF, ray shadows
-    nodeeval.py    105 node types
+    nodeeval.py    106 node types
     patterns.py    12 solid procedural textures
     render.py      the orchestrator
     post.py        glow, palettes, dither, NTSC, CRT, JPEG
@@ -485,7 +501,7 @@ halcyon/
   shaders/       bpy-free GLSL/HLSL compiler
     lexer.py parser.py gtypes.py builtins.py codegen.py compiler.py
   nodes/         Blender node classes
-  presets/       the 24 preset definitions
+  presets/       the 52 preset definitions
   tests/         headless test suite + bpy stub
   compat.py properties.py export.py engine.py ui.py
 ```
