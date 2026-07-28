@@ -1,0 +1,55 @@
+name: Bug report
+description: Something renders wrong, crashes, or does nothing
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **The single most useful thing you can attach is the self test.**
+
+        Preferences ▸ Add-ons ▸ Halcyon ▸ tick **Developer Options**, then
+        Render Properties ▸ Debug ▸ **Run Self Test**. It copies itself to the
+        clipboard. It reports your Blender and GPU, compiles the shaders on your
+        driver, times every render stage and measures thread scaling.
+
+        Nearly every bug in this add-on's history was diagnosed from that output
+        or from a timing breakdown, and almost none from a description alone.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: selftest
+    attributes:
+      label: Self test output
+      description: Paste the whole report. Skip only if the add-on will not register at all.
+      render: text
+
+  - type: textarea
+    id: breakdown
+    attributes:
+      label: Timing breakdown (performance issues only)
+      description: >
+        Debug panel ▸ tick Timing Breakdown, render one frame, and paste the
+        table from the system console. Say which preset and resolution.
+      render: text
+
+  - type: input
+    id: preset
+    attributes:
+      label: Preset and resolution
+      placeholder: "Infini-D 4, 1920x1080, 4x supersampling"
+
+  - type: textarea
+    id: console
+    attributes:
+      label: Console output
+      description: >
+        Window ▸ Toggle System Console. Include any traceback in full — the last
+        line alone is rarely the useful part.
+      render: text
