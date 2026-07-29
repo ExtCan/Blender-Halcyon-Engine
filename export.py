@@ -84,7 +84,7 @@ NODE_PROPS = {
     'ShaderNodeCombineColor': ('mode',),
     'ShaderNodeBsdfToon': ('component',),
     'ShaderNodeOutputMaterial': ('target',),
-    'HALCYON_ShaderNode': ('model', 'toon_steps'),
+    'HALCYON_ShaderNode': ('model', 'toon_steps', 'wire_size'),
     'ShaderNodeTexGabor': ('gabor_type',),
     'HALCYON_CodeNode': ('language', 'as_surface', 'source_text'),
 }
@@ -277,7 +277,6 @@ def export_material(mat, images, warnings):
         m.cast_shadow = hs.cast_shadow
         m.receive_shadow = hs.receive_shadow
         m.wire = hs.wire
-        m.wire_size = hs.wire_size
     else:
         try:
             m.diffuse = tuple(mat.diffuse_color[:3])
@@ -286,6 +285,11 @@ def export_material(mat, images, warnings):
             m.specular_level = float(getattr(mat, 'specular_intensity', 0.5))
         except Exception:                                       # noqa: BLE001
             pass
+    if hs is not None:
+        # outside the override branch on purpose: a material shaded as
+        # Wireframe by its *node* never went through that branch, so its wire
+        # width was stuck at the dataclass default with no way to change it
+        m.wire_size = hs.wire_size
     if mat.use_nodes and mat.node_tree:
         m.programs = {}
         m.graph = serialize_tree(mat.node_tree, images, m.programs, warnings)
@@ -476,6 +480,17 @@ def export_light(ob, matrix, unit_scale=1.0):
 # ------------------------------------------------------------------ the job
 
 
+_KINDS = {'MESH': "Mesh", 'FONT': "Text", 'CURVE': "Curve",
+          'SURFACE': "Surface", 'META': "Metaball", 'CURVES': "Hair curves",
+          'POINTCLOUD': "Point cloud", 'VOLUME': "Volume",
+          'GPENCIL': "Grease pencil", 'GREASEPENCIL': "Grease pencil"}
+
+
+def _kind(ob):
+    """What to call an object in a message, in the user's words not Blender's."""
+    return _KINDS.get(getattr(ob, 'type', ''), "Object")
+
+
 def export_scene(depsgraph, settings, warnings=None):
     """Evaluated depsgraph -> Scene."""
     warnings = warnings if warnings is not None else []
@@ -487,21 +502,39 @@ def export_scene(depsgraph, settings, warnings=None):
     lights = []
     parts = []
 
-    for ob, me, matrix, temp in list(compat.evaluated_meshes(depsgraph)):
-        offset = len(materials)
-        slots = list(me.materials) if me.materials else [None]
-        for slot in slots:
-            key = slot.name_full if slot else '__default__'
-            if key not in mat_lookup:
-                mat_lookup[key] = len(materials)
-                materials.append(export_material(slot, images, warnings))
-        remap = np.array([mat_lookup[(s.name_full if s else '__default__')]
-                          for s in slots], np.int32)
-        obj_index = len(objects)
-        data = _mesh_arrays(me, matrix, 0, obj_index)
-        if temp:
-            compat.free_mesh(ob)
+    # consumed lazily on purpose: the generator frees each converted mesh on
+    # the way to the next one, and wrapping it in list() would read every one
+    # of them after it had been freed. See compat.evaluated_meshes.
+    for ob, me, matrix, temp in compat.evaluated_meshes(depsgraph):
+        try:
+            slots = list(me.materials) if me.materials else [None]
+            for slot in slots:
+                key = slot.name_full if slot else '__default__'
+                if key not in mat_lookup:
+                    mat_lookup[key] = len(materials)
+                    materials.append(export_material(slot, images, warnings))
+            remap = np.array([mat_lookup[(s.name_full if s else '__default__')]
+                              for s in slots], np.int32)
+            obj_index = len(objects)
+            data = _mesh_arrays(me, matrix, 0, obj_index)
+        except Exception as exc:                                # noqa: BLE001
+            # one object that will not convert is not a reason to lose the
+            # frame. Say which one it was, in the console and in the UI, and
+            # carry on with the rest of the scene.
+            import traceback
+            traceback.print_exc()
+            warnings.append(f"{_kind(ob)} '{getattr(ob, 'name', '?')}' could "
+                            f"not be exported ({type(exc).__name__}: {exc}) "
+                            f"and is missing from the render")
+            continue
         if data is None:
+            if getattr(ob, 'type', 'MESH') in compat.ALLOCATING_TYPES:
+                # the usual reason a text object is invisible: it converted,
+                # but to outlines rather than to faces
+                warnings.append(
+                    f"{_kind(ob)} '{ob.name}' has no faces to render. Give it "
+                    f"a Fill Mode (Object Data ▸ Geometry) or an Extrude, or "
+                    f"convert it to a mesh")
             continue
         idx = np.clip(data['mat_index'], 0, len(remap) - 1)
         data['mat_index'] = remap[idx]
@@ -515,6 +548,11 @@ def export_scene(depsgraph, settings, warnings=None):
             visible_camera=getattr(ob, 'visible_camera', True),
             cast_shadow=getattr(ob, 'visible_shadow', True),
             holdout=getattr(ob, 'is_holdout', False)))
+
+    for name, kind in compat.unconvertible(depsgraph):
+        warnings.append(f"{_KINDS.get(kind, kind.title())} '{name}' is not a "
+                        f"surface Halcyon can render. Convert it to a mesh "
+                        f"to include it")
 
     for inst in depsgraph.object_instances:
         ob = inst.object

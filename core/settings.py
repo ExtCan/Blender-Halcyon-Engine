@@ -184,10 +184,23 @@ class RenderSettings:
     # ------------------------------------------------------------------ misc
     seed: int = 0
     render_wire: bool = False
+    # ALL draws every triangle edge, which is what the model always did and
+    # what fills a dense mesh solid; CREASE draws only silhouettes and edges
+    # where the surface actually turns, which stays a wireframe however many
+    # triangles are behind it
+    wire_mode: str = 'ALL'            # ALL | CREASE
+    wire_angle: float = 25.0
     wire_color: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     wire_width: float = 1.0
     show_stats: bool = False
     watermark: str = ''
+    # extra outputs written alongside the beauty image, for the compositor
+    pass_depth: bool = False
+    pass_normal: bool = False
+    pass_position: bool = False
+    pass_uv: bool = False
+    pass_object_index: bool = False
+    pass_material_index: bool = False
     debug_pass: str = 'BEAUTY'         # BEAUTY | DEPTH | NORMAL | UV | MATID | \
                                        # DIFFUSE | SPECULAR | AMBIENT | SHADOW | \
                                        # OVERDRAW | WIREFRAME

@@ -229,11 +229,30 @@ def diffuse_minnaert(ndl, ndv, darkness=1.0, **_):
 
 
 def diffuse_toon(ndl, size, smooth, steps=2.0, **_):
+    """Cel shading: the light ramp cut into `steps` flat tones.
+
+    `steps` counts tones, not edges, so two is the familiar lit/unlit cel and
+    the edges for more than that are spread evenly across the lit range. At two
+    this is bit-identical to the single-step version it replaces -- the loop
+    runs once and reproduces the old expression exactly -- which matters
+    because two is the default and every toon render made before this used it.
+
+    The parameter was accepted and ignored for four releases: it reached the
+    node, the exporter and this signature, and then nothing read it.
+    """
     nl = np.clip(ndl, 0.0, 1.0)
     ang = np.arccos(np.clip(nl, 0.0, 1.0)) / (np.pi * 0.5)
     lim = np.clip(1.0 - size, 0.0, 1.0)
     sm = np.maximum(smooth, 1e-4)
-    return np.clip((lim + sm - ang) / sm, 0.0, 1.0)
+    edges = np.maximum(np.round(np.asarray(steps, np.float32)) - 1.0, 1.0)
+    top = int(np.max(edges)) if np.size(edges) else 1
+    if top <= 1:
+        return np.clip((lim + sm - ang) / sm, 0.0, 1.0)
+    acc = np.zeros_like(nl, np.float32)
+    for i in range(1, top + 1):
+        band = np.clip((lim * (np.float32(i) / edges) + sm - ang) / sm, 0.0, 1.0)
+        acc = acc + np.where(i <= edges, band, 0.0)
+    return (acc / edges).astype(np.float32)
 
 
 def diffuse_fujii(ndl, ndv, roughness, **_):

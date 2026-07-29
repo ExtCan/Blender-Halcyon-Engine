@@ -2,6 +2,7 @@
 
 import os
 import sys
+import types
 
 import numpy as np
 
@@ -2321,6 +2322,1390 @@ def test_sheen_bump_and_refraction():
     check('refraction stays finite', bool(np.isfinite(none).all()))
 
 
+def test_render_passes_reach_blender():
+    """Every pass Halcyon offers must be produced, and be data rather than a picture.
+
+    The engine was force-enabling Blender's own Passes panel and then writing
+    exactly one pass into the render result, so every box in it was a control
+    that did nothing. This covers both halves: the buffers exist and hold the
+    right kind of number, and the engine declares and writes each one.
+    """
+    import inspect
+
+    from ..core import render as CR
+    from ..core.settings import RenderSettings
+
+    st = RenderSettings()
+    st.resolution_x, st.resolution_y = 120, 90
+    st.output_scale = 'NONE'
+    for attr in ('pass_depth', 'pass_normal', 'pass_position', 'pass_uv',
+                 'pass_object_index', 'pass_material_index'):
+        setattr(st, attr, True)
+    wanted = CR.wanted_passes(st)
+    check('all six passes are offered', len(wanted) == 6, str(wanted))
+
+    for aa in (1, 4):
+        st.aa_samples = aa
+        sc = demo_scene(st)
+        R.render(sc, st)
+        got = getattr(sc, 'last_passes', None) or {}
+        missing = [n for n in wanted if n not in got]
+        check(f'every requested pass is produced at aa={aa}', not missing,
+              ', '.join(missing))
+        wrong = [f'{n}{got[n].shape}' for n in got
+                 if got[n].shape[:2] != (90, 120)]
+        check(f'every pass is at the output resolution at aa={aa}', not wrong,
+              ', '.join(wrong))
+
+    sc = demo_scene(st)
+    R.render(sc, st)
+    got = sc.last_passes
+    d = got['Depth'][..., 0]
+    covered = np.isfinite(d) & (d < 1e9)
+    check('the depth pass holds distances, not a grey ramp',
+          covered.any() and float(d[covered].min()) > 0.1
+          and float(d[covered].max()) > 1.5,
+          f'{float(d[covered].min()):.2f}..{float(d[covered].max()):.2f}')
+    check('uncovered pixels use the far value the compositor expects',
+          float(d[~covered].min()) >= 1e10 if (~covered).any() else True)
+
+    n = got['Normal']
+    lens = np.linalg.norm(n[covered], axis=1)
+    check('the normal pass holds unit vectors in -1..1',
+          float(np.abs(lens - 1.0).max()) < 1e-3 and float(n.min()) < -0.1,
+          f'|n| off by {float(np.abs(lens - 1.0).max()):.5f}')
+
+    ids = got['IndexMA'][..., 0]
+    check('the material index pass holds whole numbers',
+          float(np.abs(ids - np.round(ids)).max()) < 1e-6
+          and len(np.unique(ids)) > 1, str(np.unique(ids)[:6]))
+
+    # ...and the engine end: declared, and written
+    src = inspect.getsource(_engine_module())
+    check('the engine declares its passes to Blender',
+          'def update_render_passes' in src and 'register_pass' in src)
+    check('and writes them into the render result',
+          '_deliver_passes' in src and 'foreach_set' in src)
+    from .. import engine as ENG
+    names = {p[0] for p in ENG.PASS_SPEC}
+    check('the declared passes are exactly the ones produced',
+          names == set(wanted), f'{sorted(names)} vs {sorted(wanted)}')
+    check("Blender's own Passes panel is not force-enabled any more",
+          'VIEWLAYER_PT_layer_passes' not in ENG.FORCED_PANELS)
+
+
+def _engine_module():
+    from . import fakebpy
+    fakebpy.install()
+    import importlib
+    return importlib.import_module('halcyon.engine')
+
+
+def test_socket_values_survive_a_rebuild():
+    """Rebuilding the coded shader's sockets must not read freed memory.
+
+    Selecting HLSL crashed Blender. `sock.default_value` on a colour or vector
+    socket is a live view into the socket's own memory rather than a copy, and
+    the rebuild held one across `inputs.clear()` -- then read it back to
+    restore the value, which is a use-after-free. It takes the process down
+    instead of raising, so no amount of exception handling would have helped.
+
+    Checked statically, since it needs Blender to reproduce: the captured value
+    must be materialised before anything is cleared.
+    """
+    import ast
+    import inspect
+
+    from . import fakebpy
+    fakebpy.install()
+    import importlib
+    mod = importlib.import_module('halcyon.nodes.shader_nodes')
+    src = inspect.getsource(mod.HALCYON_CodeNode.rebuild_sockets)
+    tree = ast.parse(src.lstrip())
+
+    clear_line = None
+    capture_lines = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, 'attr', '') == 'clear':
+            clear_line = node.lineno if clear_line is None else min(clear_line,
+                                                                    node.lineno)
+        if isinstance(node, ast.Attribute) and node.attr == 'default_value':
+            if isinstance(node.ctx, ast.Load):
+                capture_lines.append(node.lineno)
+    check('the rebuild does clear the sockets', clear_line is not None)
+    before = [l for l in capture_lines if clear_line and l < clear_line]
+    check('a default_value is read before the clear', bool(before))
+
+    # nothing captured before the clear may be stored raw: the value has to go
+    # through tuple() or float() first, which is what makes it a copy
+    lines = src.splitlines()
+    copies = sum(1 for l in lines[:clear_line] if 'tuple(' in l or 'float(' in l)
+    check('and the captured value is copied before anything is cleared',
+          copies > 0, 'no tuple()/float() copy before the clear')
+    check('nothing is stored straight into the keep table',
+          not any('.default_value' in l and 'keep[' in l
+                  for l in lines[:clear_line]),
+          '; '.join(l.strip() for l in lines[:clear_line]
+                    if '.default_value' in l and 'keep[' in l))
+
+    # the re-entrancy guard must not live on the node instance: Blender hands
+    # out a new wrapper per access, so such an attribute is written to a
+    # temporary and read back as the class default. Checked on the parsed tree,
+    # so a comment explaining the old bug does not count as the bug.
+    whole = ast.parse(inspect.getsource(mod))
+    stale = [x for x in ast.walk(whole)
+             if isinstance(x, ast.Attribute) and x.attr == '_busy']
+    check('the update guard does not rely on an instance attribute', not stale,
+          f'{len(stale)} reference(s) remain')
+    text = inspect.getsource(mod)
+    check('it uses the node pointer instead',
+          'as_pointer' in text and '_UPDATING' in text)
+
+
+def test_toon_steps_actually_steps():
+    """Toon Steps must produce that many tones, and two must not change.
+
+    It was accepted by the node, copied by the exporter, threaded into the
+    shading signature -- and then never read. Four releases of a control that
+    did nothing.
+    """
+    from ..core.shading import diffuse_toon
+
+    # sampled evenly in the *angle*, because that is the axis the tones are cut
+    # along -- sampling ndl evenly crowds the samples toward the light and the
+    # narrowest tone gets too few of them to count
+    n = 4000
+    ang = np.linspace(0.0, 1.0, n).astype(np.float32)
+    ndl = np.cos(ang * np.pi * 0.5).astype(np.float32)
+    size = np.full(n, 0.5, np.float32)
+    smooth = np.full(n, 1e-4, np.float32)
+
+    def plateaus(steps):
+        v = diffuse_toon(ndl, size, smooth, np.full(n, steps, np.float32))
+        vals, counts = np.unique(np.round(v, 5), return_counts=True)
+        # a level that only a couple of samples land on is the ramp between two
+        # tones, not a tone
+        return vals[counts > n // 200]
+
+    wrong = []
+    for steps in (2, 3, 4, 6, 10, 16):
+        got = len(plateaus(steps))
+        if got != steps:
+            wrong.append(f'{steps} steps -> {got} tones')
+    check('Toon Steps produces exactly that many tones', not wrong,
+          '; '.join(wrong))
+
+    # the default must be untouched, or every toon render ever made changes
+    one = diffuse_toon(ndl, size, smooth, np.full(n, 2.0, np.float32))
+    old = np.clip((np.clip(1.0 - size, 0, 1) + np.maximum(smooth, 1e-4)
+                   - np.arccos(np.clip(ndl, 0, 1)) / (np.pi * 0.5))
+                  / np.maximum(smooth, 1e-4), 0.0, 1.0)
+    check('two steps is bit-identical to the single-step version it replaces',
+          float(np.abs(one - old).max()) == 0.0,
+          f'max delta {float(np.abs(one - old).max()):.8f}')
+
+    # and it survives the whole pipeline, which is where it was lost
+    def shot(steps):
+        st = base_settings(140, 105)
+        sc = demo_scene(st)
+        g = _master()
+        g['nodes']['h']['props']['model'] = 'TOON'
+        g['nodes']['h']['props']['toon_steps'] = steps
+        for m in sc.materials:
+            m.graph = g
+        return R.render(sc, st)
+
+    a, b = shot(2), shot(8)
+    check('and reaches the renderer from the node',
+          float(np.abs(a - b).mean()) > 1e-3,
+          f'delta {float(np.abs(a - b).mean()):.5f}')
+
+
+def test_wireframe_draws_wires():
+    """The Wireframe model must draw edges on dense meshes, not dots.
+
+    The edge distance came from a central difference that needed the pixels on
+    *both* sides to be the same triangle. On anything denser than a cube that
+    is rarely true, the derivative collapsed to zero, the distance went to
+    infinity and the wire came out as a scatter of dots -- or, with the
+    interior knocked through to the background, as nothing at all.
+    """
+    from ..core import geometry as GEO
+    from ..core.scene import Camera, Light, Material, ObjectInfo, Scene, World
+    from .scenebuild import _mesh_concat, look_at_matrix, sphere
+
+    def wire_shot(prim, res=(200, 150)):
+        st = base_settings(*res)
+        mesh = _mesh_concat([prim])
+        mesh.smooth = np.zeros(mesh.tris.shape[0], bool)
+        mat = Material(name='W', index=0, model='WIREFRAME',
+                       diffuse=(1.0, 1.0, 1.0))
+        sc = Scene(
+            mesh=mesh, materials=[mat],
+            objects=[ObjectInfo(name='T', index=0,
+                                matrix_world=np.eye(4, dtype=np.float32))],
+            lights=[Light(type='SUN', direction=(-0.5, 0.5, -0.7), energy=5.0)],
+            camera=Camera(matrix_world=look_at_matrix((4, -5, 3), (0, 0, 0)),
+                          lens=45.0, sensor=36.0, clip_start=0.1,
+                          clip_end=200.0),
+            world=World(mode='SOLID', color=(0.0, 0.0, 0.0)), settings=st)
+        img = R.render(sc, st)[..., :3]
+        return (img.max(axis=2) > 0.25)
+
+    def teapot_prim(steps, segs):
+        verts, faces = GEO.utah_teapot(steps, segs)
+        V = np.asarray(verts, np.float32) * 0.55
+        tris = []
+        for f in faces:
+            for k in range(1, len(f) - 1):
+                tris.append((f[0], f[k], f[k + 1]))
+        T = np.asarray(tris, np.int32)
+        N = np.tile(np.array([[0, 0, 1.0]], np.float32), (len(V), 1))
+        return (V, N, V[:, :2].astype(np.float32), T, 0, 0)
+
+    # A wire is a connected structure. Dots are not: count how much of the lit
+    # area has a lit neighbour, which is near 1 for lines and low for specks.
+    def connectedness(on):
+        if not on.any():
+            return 0.0
+        nb = np.zeros_like(on)
+        nb[1:, :] |= on[:-1, :]
+        nb[:-1, :] |= on[1:, :]
+        nb[:, 1:] |= on[:, :-1]
+        nb[:, :-1] |= on[:, 1:]
+        return float((on & nb).sum()) / float(on.sum())
+
+    for label, prim in (('sphere', sphere(radius=1.4)),
+                        ('teapot 2.6k', teapot_prim(8, 16)),
+                        ('teapot 13k', teapot_prim(16, 40))):
+        on = wire_shot(prim)
+        frac = float(on.mean())
+        conn = connectedness(on)
+        check(f'the {label} wireframe draws something', frac > 0.01,
+              f'{frac * 100:.1f}% of the frame lit')
+        check(f'the {label} wireframe is lines rather than dots', conn > 0.9,
+              f'{conn * 100:.0f}% of lit pixels have a lit neighbour')
+        check(f'the {label} wireframe is not a solid fill', frac < 0.5,
+              f'{frac * 100:.1f}% lit')
+
+
+def test_the_engine_actually_runs():
+    """One frame, all the way through the real engine, against a fake Blender.
+
+    Everything above this line tests the renderer. Nothing tested the *engine*:
+    the property group, `to_settings`, the exporter, the delivery. Six bugs
+    shipped through that gap in a row, every one of them a control wired up at
+    one end and not the other, and every one of them invisible to a test that
+    calls `render()` directly with a hand-built scene.
+
+    It is not Blender. It cannot catch a segfault or a driver quirk. It catches
+    the setting that never arrives.
+    """
+    from . import fakeblender as FB
+    props, engine = FB.install()
+
+    img, passes, cap = FB.run_render(props, engine)
+    check('a frame renders through the engine and is delivered', img is not None,
+          str(cap.get('reports')))
+    if img is None:
+        return
+    check('the delivered buffer is the size Blender asked for',
+          img.shape == (90, 120, 4), str(img.shape))
+    check('and it holds finite pixels', bool(np.isfinite(img).all()))
+
+    # every render pass in the dropdown must change what is delivered
+    base = FB.run_render(props, engine, debug_pass='BEAUTY')[0]
+    same = []
+    for mode in ('DEPTH', 'NORMAL', 'UV', 'MATID', 'OVERDRAW', 'WIREFRAME'):
+        shot = FB.run_render(props, engine, debug_pass=mode)[0]
+        if shot is None or float(np.abs(shot - base).mean()) < 1e-4:
+            same.append(mode)
+    check('every render pass reaches the delivered image', not same,
+          ', '.join(same) + ' came out as the beauty render')
+
+    # and the extra passes arrive as separate buffers
+    _img, extra, _cap = FB.run_render(
+        props, engine, pass_depth=True, pass_normal=True,
+        pass_object_index=True)
+    missing = [n for n in ('Depth', 'Normal', 'IndexOB') if n not in extra]
+    check('the extra passes are registered and written', not missing,
+          ', '.join(missing))
+    if 'Depth' in extra:
+        d = extra['Depth'][..., 0]
+        hit = d < 1e9
+        check('the depth pass holds real distances', hit.any()
+              and float(d[hit].min()) > 0.5, f'{float(d[hit].min()):.2f}')
+
+
+def test_wireframe_through_the_engine():
+    """A material shaded as Wireframe by its node must carve edges.
+
+    The reported symptom was a flat unlit fill, and the cause turned out not to
+    be a broken carve at all: once a mesh's triangles are a couple of pixels
+    across, *every* pixel is within a wire width of an edge, so All Edges is a
+    solid fill and no width setting escapes it. This pins down both halves --
+    that the carve happens at all, and that Creases & Silhouette stays a
+    wireframe however dense the mesh gets.
+    """
+    from . import fakeblender as FB
+    props, engine = FB.install()
+
+    def lit(mode='ALL', divisions=12, wire_size=None, **kw):
+        mat = FB.halcyon_material('Wire', model='WIREFRAME',
+                                  diffuse=(0.95, 0.9, 0.35, 1.0))
+        if wire_size is not None:
+            mat.node_tree.nodes[0].wire_size = wire_size
+        img, _p, _c = FB.run_render(props, engine, material=mat,
+                                    mesh=FB.grid_mesh(6.0, divisions),
+                                    wire_mode=mode, **kw)
+        if img is None:
+            return None
+        return float((img[..., :3].max(axis=2) > 0.12).mean())
+
+    solid = lit('ALL', 4)
+    check('a coarse mesh draws edges rather than filling',
+          solid is not None and 0.02 < solid < 0.35, f'{solid}')
+
+    # the shape of the reported bug, stated as a measurement
+    dense = lit('ALL', 40)
+    check('All Edges does fill in on a dense mesh -- this is arithmetic, '
+          'not a defect', dense is not None and dense > 0.45, f'{dense}')
+
+    # and the way out must not care how dense the mesh is
+    creases = [lit('CREASE', d) for d in (4, 12, 40, 80)]
+    ok = all(c is not None and 0.001 < c < 0.12 for c in creases)
+    spread = max(creases) - min(creases) if ok else 1.0
+    check('Creases & Silhouette stays a wireframe at any density', ok,
+          str([round(c, 3) for c in creases]))
+    check('and barely moves as triangles are added', spread < 0.02,
+          f'spread {spread:.3f}')
+
+    # the width has to be reachable from the node, which it was not
+    thin, thick = lit('ALL', 24, wire_size=0.2), lit('ALL', 24, wire_size=3.0)
+    check('the wire size on the shader node changes the wire',
+          thin is not None and thick is not None and thick > thin + 0.02,
+          f'{thin} -> {thick}')
+
+
+def test_wire_size_is_reachable():
+    """A node-shaded Wireframe material must be able to set its own width.
+
+    It could not: `wire_size` was only exported inside the material-override
+    branch, and a material shaded by a Halcyon Shader node never goes through
+    that branch. The width was stuck at the dataclass default with no control
+    anywhere in the interface that could change it.
+    """
+    from ..core.render import material_wire_size
+    from ..core.scene import Material
+    from . import fakebpy
+    fakebpy.install()
+    import importlib
+    from .. import export as EX
+
+    check('the exporter carries the shader node wire size',
+          'wire_size' in EX.NODE_PROPS.get('HALCYON_ShaderNode', ()),
+          str(EX.NODE_PROPS.get('HALCYON_ShaderNode')))
+
+    mat = Material(name='m', index=0)
+    mat.graph = {'output': 'o', 'nodes': {
+        'h': {'id': 'h', 'bl_idname': 'HALCYON_ShaderNode',
+              'props': {'model': 'WIREFRAME', 'wire_size': 0.4},
+              'inputs': [], 'outputs': []}}}
+    check('and the renderer reads it from the node',
+          abs(material_wire_size(mat) - 0.4) < 1e-6, str(material_wire_size(mat)))
+
+    plain = Material(name='p', index=0)
+    plain.wire_size = 2.5
+    check('falling back to the material when there is no node',
+          abs(material_wire_size(plain) - 2.5) < 1e-6)
+
+    shader = importlib.import_module('halcyon.nodes.shader_nodes')
+    check('the shader node offers a Wire Size',
+          'wire_size' in shader.HALCYON_ShaderNode.__annotations__)
+    import inspect
+    src = inspect.getsource(shader.HALCYON_ShaderNode.draw_buttons)
+    check('and draws it when the model is Wireframe',
+          "WIREFRAME" in src and 'wire_size' in src)
+
+
+def test_every_sky_lab_control_does_something():
+    """Each Bryce Sky Lab control must change the sky it belongs to.
+
+    A control that exists and does nothing is the failure mode this project
+    keeps hitting, and a sky with sixty of them is sixty chances to hit it. So
+    each one is perturbed on its own, against a world where the layer it
+    belongs to is switched on, and asked to change the picture.
+    """
+    from ..core import sky as SKY
+    from ..core.scene import World
+
+    rng = np.random.default_rng(11)
+    d = rng.normal(size=(6000, 3)).astype(np.float32)
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+
+    def base(**kw):
+        w = World(mode='BRYCE')
+        w.clouds = True
+        w.stratus = True
+        w.haze_density = 0.5
+        w.fog_density = 0.3
+        w.stars = True
+        w.star_brightness = 1.0
+        for k, v in kw.items():
+            setattr(w, k, v)
+        return w
+
+    ref = SKY.evaluate(base(), d)
+    dead = []
+    knobs = (
+        ('sky_mode', 'SOFT'), ('sun_glow_color', (0.2, 0.9, 0.3)),
+        ('shadow_color', (0.9, 0.1, 0.1)), ('shadow_intensity', 0.0),
+        ('haze_base_height', 0.4), ('fog_base_height', 0.4),
+        ('fog_blend_sky', 1.0), ('fog_sun_tint', 1.0),
+        ('cloud_frequency', 3.0), ('cloud_amplitude', 2.5),
+        ('cloud_turbulence', 0.3), ('spherical_clouds', False),
+        ('stratus_frequency', 3.0), ('stratus_amplitude', 2.5),
+        ('comets', 2.0),
+    )
+    for name, value in knobs:
+        got = SKY.evaluate(base(**{name: value}), d)
+        if float(np.abs(got - ref).mean()) < 1e-5:
+            dead.append(name)
+    check('every new Sky Lab control changes the sky', not dead,
+          ', '.join(dead))
+
+    # the moon's own controls need the moon out
+    moon_ref = SKY.evaluate(base(celestial='MOON'), d)
+    soft = SKY.evaluate(base(celestial='MOON', moon_softness=0.9), d)
+    check('moon softness changes the terminator',
+          float(np.abs(soft - moon_ref).mean()) > 1e-7,
+          f'{float(np.abs(soft - moon_ref).mean()):.9f}')
+
+    # the comets' own controls need comets out
+    comet_ref = SKY.evaluate(base(comets=2.0), d)
+    comet_dead = []
+    for name, value in (('comet_length', 0.6), ('comet_width', 0.05),
+                        ('comet_tail_sun', 0.0),
+                        ('comet_color', (0.2, 0.5, 1.0)),
+                        ('comet_speed', 1.0)):
+        got = SKY.evaluate(base(comets=2.0, **{name: value}), d, time=3.0)
+        base_t = SKY.evaluate(base(comets=2.0), d, time=3.0)
+        if float(np.abs(got - base_t).mean()) < 1e-9:
+            comet_dead.append(name)
+    check('every comet control changes the comets', not comet_dead,
+          ', '.join(comet_dead))
+
+    # comet count only matters once comets are on
+    c1 = SKY.evaluate(base(comets=2.0, comet_count=1), d)
+    c8 = SKY.evaluate(base(comets=2.0, comet_count=8), d)
+    check('the comet count changes how many there are',
+          float(np.abs(c8 - c1).mean()) > 1e-6)
+
+    # the four that only mean anything once the camera is somewhere
+    eye = (3.0, 2.0, 1.5)
+    ref_eye = SKY.evaluate(base(), d, eye=eye)
+    dead = []
+    for name, value in (('volumetric_world', 3.0),
+                        # the link is on by default, so *off* is the change
+                        ('link_clouds_to_view', False),
+                        ('fixed_cloud_plane', False)):
+        got = SKY.evaluate(base(**{name: value}), d, eye=eye)
+        if float(np.abs(got - ref_eye).mean()) < 1e-5:
+            dead.append(name)
+    check('the camera-relative cloud controls do something', not dead,
+          ', '.join(dead))
+
+    ocean = World(mode='BRYCE')
+    ocean.ground_plane = True
+    ocean.ground_mode = 'OCEAN'
+    ocean.ground_fade = 50.0
+    flat = SKY.evaluate(ocean, d, eye=(0.0, 0.0, 2.0))
+    ocean.color_perspective = 2.0
+    curved = SKY.evaluate(ocean, d, eye=(0.0, 0.0, 2.0))
+    check('Colour Perspective changes how distance takes the haze',
+          float(np.abs(curved - flat).mean()) > 1e-5)
+
+
+def test_the_sky_lab_stacks_in_brydes_order():
+    """Layer order is half of why a Bryce sky reads as one.
+
+    Stars sit beyond the atmosphere, so a cloud in front of one must hide it,
+    and haze must dim a cloud rather than leaving it crisp against a hazed
+    sky. Both were wrong: stars were composited over the clouds, and the haze
+    went on before the decks did.
+    """
+    from ..core import sky as SKY
+    from ..core.scene import World
+
+    rng = np.random.default_rng(5)
+    d = rng.normal(size=(20000, 3)).astype(np.float32)
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+    d = d[d[:, 2] > 0.25]
+
+    def w(**kw):
+        world = World(mode='BRYCE')
+        world.horizon = (0.0, 0.0, 0.0)
+        world.sky_mid = (0.0, 0.0, 0.0)
+        world.zenith = (0.0, 0.0, 0.0)
+        world.sun_glow = 0.0
+        world.sun_disc = False
+        world.sun_intensity = 0.0
+        world.clouds = False
+        world.stratus = False
+        world.haze_density = 0.0
+        world.fog_density = 0.0
+        for k, v in kw.items():
+            setattr(world, k, v)
+        return world
+
+    stars_only = SKY.evaluate(w(stars=True, star_brightness=2.0), d)
+    lit = stars_only.max(axis=1) > 0.02
+    check('there are stars to hide', int(lit.sum()) > 20, str(int(lit.sum())))
+
+    # a solid cloud deck over the top of them
+    covered = SKY.evaluate(w(stars=True, star_brightness=2.0, clouds=True,
+                             cloud_cover=1.0, cloud_density=1.0,
+                             cloud_color=(0.5, 0.5, 0.5)), d)
+    star_px = covered[lit]
+    check('a cloud deck hides the stars behind it',
+          float(np.abs(star_px - covered[lit].mean(axis=0)).mean()) <
+          float(np.abs(stars_only[lit] - stars_only[lit].mean(axis=0)).mean()),
+          'stars still show through the clouds')
+
+    # and haze must reach the clouds, not stop behind them
+    clouds = w(clouds=True, cloud_cover=0.6, cloud_color=(1.0, 1.0, 1.0))
+    plain = SKY.evaluate(clouds, d)
+    hazed = w(clouds=True, cloud_cover=0.6, cloud_color=(1.0, 1.0, 1.0),
+              haze_density=1.0, haze_height=1.0, haze_color=(0.0, 0.0, 0.0))
+    dimmed = SKY.evaluate(hazed, d)
+    bright = plain.max(axis=1) > 0.5
+    check('haze dims the clouds as well as the sky behind them',
+          bool(bright.any()) and
+          float(dimmed[bright].mean()) < float(plain[bright].mean()) * 0.9,
+          f'{float(dimmed[bright].mean()):.3f} vs {float(plain[bright].mean()):.3f}')
+
+
+def test_the_ocean_is_water():
+    """The infinite ocean's own properties, measured rather than eyeballed."""
+    from ..core import sky as SKY
+    from ..core.scene import World
+
+    n = 40000
+    rng = np.random.default_rng(19)
+    d = rng.normal(size=(n, 3)).astype(np.float32)
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+    d = d[d[:, 2] < -0.02]                     # only rays that hit the water
+    eye = (0.0, 0.0, 2.0)
+
+    def w(**kw):
+        world = World(mode='BRYCE')
+        world.ground_plane = True
+        world.ground_mode = 'OCEAN'
+        world.ground_fade = 1e6                # keep distance haze out of it
+        for k, v in kw.items():
+            setattr(world, k, v)
+        return world
+
+    ref = SKY.evaluate(w(), d, eye=eye)
+    dead = []
+    for name, value in (('ocean_choppiness', 1.4), ('ocean_wind_angle', 2.4),
+                        ('ocean_spread', 0.0), ('ocean_wave_scale', 4.0),
+                        ('ocean_detail', 9), ('ocean_deep', (0.4, 0.0, 0.0)),
+                        ('ocean_shallow', (0.0, 0.4, 0.0)),
+                        ('ocean_glitter', 8.0), ('ocean_glitter_size', 2.0),
+                        ('ocean_foam', 1.0), ('ocean_transparency', 1.0)):
+        got = SKY.evaluate(w(**{name: value}), d, eye=eye)
+        if float(np.abs(got - ref).mean()) < 1e-6:
+            dead.append(name)
+    check('every ocean control changes the water', not dead, ', '.join(dead))
+
+    # Fresnel: water seen edge-on is a mirror, water seen from above is not
+    steep = np.array([[0.0, 0.2, -0.98]], np.float32)
+    steep /= np.linalg.norm(steep)
+    graze = np.array([[0.0, 0.999, -0.045]], np.float32)
+    graze /= np.linalg.norm(graze)
+    flat = w(ocean_choppiness=0.0, ocean_glitter=0.0,
+             zenith=(0.0, 0.0, 0.0), horizon=(1.0, 1.0, 1.0),
+             sky_mid=(1.0, 1.0, 1.0), sun_glow=0.0, sun_disc=False,
+             clouds=False, haze_density=0.0, ocean_deep=(0.0, 0.0, 0.0),
+             ocean_shallow=(0.0, 0.0, 0.0))
+    down = float(SKY.evaluate(flat, steep, eye=eye).mean())
+    side = float(SKY.evaluate(flat, graze, eye=eye).mean())
+    check('water is a mirror at a glancing angle and dark looking down',
+          side > down + 0.3, f'grazing {side:.3f} vs down {down:.3f}')
+
+    # the glitter path must sit under the sun, not opposite it
+    sunny = w(sun_elevation=0.25, sun_rotation=1.5708, ocean_glitter=6.0,
+              ocean_choppiness=0.25, clouds=False)
+    col = SKY.evaluate(sunny, d, eye=eye)
+    bright = col.max(axis=1) > np.percentile(col.max(axis=1), 99.0)
+    toward = d[bright][:, 1] > 0                  # the sun is toward +Y
+    check('the glitter path lands under the sun',
+          float(toward.mean()) > 0.8, f'{float(toward.mean()) * 100:.0f}% of it')
+
+
+def test_sub_pixel_waves_widen_the_glitter():
+    """When Horizon Smoothing is on, what it removes must go somewhere.
+
+    Smoothing is off by default -- Bryce kept its waves all the way to the
+    horizon -- but for anyone who turns it up, dropping the small waves
+    outright is what turns distant water to glass. The test is the shape of
+    the falloff: with a large pixel footprint the same wave field must still
+    produce a highlight, and a wider one.
+    """
+    from ..core import sky as SKY
+    from ..core.scene import World
+
+    world = World(mode='BRYCE')
+    world.ocean_choppiness = 0.5
+    world.ocean_detail = 8
+    world.ocean_horizon_smooth = 1.0
+    world.ocean_sparkle = 0.0          # measuring the fade, not the jitter
+    n = 4000
+    p = np.stack([np.linspace(0, 40, n), np.zeros(n), np.zeros(n)],
+                 1).astype(np.float32)
+
+    sharp, lost_sharp = SKY._wave_normal(p, world, 0.0,
+                                         lod=np.full(n, 1e-4, np.float32))
+    blurred, lost_blur = SKY._wave_normal(p, world, 0.0,
+                                          lod=np.full(n, 2.0, np.float32))
+    check('a large footprint flattens the drawn normal',
+          float(np.abs(blurred[:, 2] - 1.0).mean()) <
+          float(np.abs(sharp[:, 2] - 1.0).mean()),
+          'the blurred normal is not flatter')
+    check('and the slope it lost is accounted for instead',
+          float(lost_blur.mean()) > float(lost_sharp.mean()) + 1e-6,
+          f'{float(lost_sharp.mean()):.6f} -> {float(lost_blur.mean()):.6f}')
+    check('nothing is lost when every wave is resolvable',
+          float(lost_sharp.max()) < 1e-6, f'{float(lost_sharp.max()):.8f}')
+
+
+def test_wave_size_makes_waves_smaller_not_fainter():
+    """Reported: the waves are far too big, and turning them down erases them.
+
+    Two faults behind it. The pixel footprint the waves are measured against
+    was a hard-coded 0.002 rad, four to six times coarser than a real frame,
+    and it was taken along the *stretched* axis of a grazing ray rather than
+    the area-equivalent square -- ten times too coarse again at the horizon.
+    Between them they cut most of the wave trains out of the picture, leaving
+    a big smooth swell near the camera and glass everywhere else. Turning Wave
+    Size down pushed every remaining train under the cut, so the water went
+    flat instead of fine.
+    """
+    from ..core import sky as SKY
+    from ..core import render as R
+    from ..core.scene import World
+
+    # a real frame is far finer than the guess that was hard-coded
+    proj = R.camera_matrices(None, 1920, 1080)[1]
+    angle, width = R.pixel_footprint(None, proj, 1080)
+    check('the pixel footprint comes from the frame, not a constant',
+          0.0 < angle < 0.002 * 0.5, f'{angle:.6f} rad')
+    check('and an orthographic camera reports a width instead',
+          R.pixel_footprint(types.SimpleNamespace(type='ORTHO', ortho_scale=8.0),
+                            proj, 400)[1] == 0.02)
+
+    # and it has to actually reach the water: the setting was read at one end
+    # and never written at the other, which is why it was stuck on the guess
+    sc = demo_scene()
+    st = RenderSettings(resolution_x=64, resolution_y=48)
+    sc.world.mode = 'BRYCE'
+    sc.world.ground_plane = True
+    sc.world.ground_mode = 'OCEAN'
+    if hasattr(sc.world, '_pixel_angle'):
+        del sc.world._pixel_angle
+    R.render(sc, st)
+    want = R.pixel_footprint(sc.camera,
+                             R.camera_matrices(sc.camera, 64, 48)[1], 48)[0]
+    got = float(getattr(sc.world, '_pixel_angle', 0.0))
+    check('and a render puts it where the water reads it',
+          got > 0.0 and abs(got - want) < 1e-6, f'{got:.6f} want {want:.6f}')
+
+    def water(wave_size, pixel_angle, height=12.0, w=400, h=150):
+        world = World(mode='BRYCE')
+        world.ground_plane = True
+        world.ground_mode = 'OCEAN'
+        world.ground_height = 0.0
+        world.ocean_wave_scale = wave_size
+        world._pixel_angle = pixel_angle
+        world._pixel_width = 0.0
+        eye = np.array([0.0, 0.0, height], np.float32)
+        ys = np.linspace(np.tan(np.radians(-20.0)), np.tan(np.radians(-0.4)), h)
+        xs = np.linspace(-0.4, 0.4, w)
+        gx, gy = np.meshgrid(xs, ys)
+        d = np.stack([gx.ravel(), np.ones(gx.size), gy.ravel()],
+                     1).astype(np.float32)
+        d /= np.linalg.norm(d, axis=1, keepdims=True)
+        return SKY.evaluate(world, d, None, eye=eye, time=0.0).reshape(h, w, 3)
+
+    def texture(img, r0, r1):
+        # adjacent-pixel difference along a row: wave detail with the
+        # distance gradient taken out
+        return float(np.mean(np.abs(np.diff(img[r0:r1].mean(axis=2), axis=1))))
+
+    pa = 2.0 * np.arctan(18.0 / 50.0) / (1080 * 2)      # 50mm, 1080 rows, 4x
+    fine = texture(water(0.25, pa), 0, 25)
+    coarse = texture(water(2.0, pa), 0, 25)
+    check('small waves survive being made small', fine > coarse * 0.75,
+          f'2.0m -> {coarse:.5f}, 0.25m -> {fine:.5f}')
+    check('and they are finer than the big ones, not just present',
+          fine >= coarse, f'{coarse:.5f} vs {fine:.5f}')
+
+    # the count that matters: how many of the trains are still drawn
+    def trains(scale, lod):
+        freq, n = 1.0, 0
+        for _ in range(5):
+            if np.clip(scale / freq / max(lod * 2.0, 1e-9) - 1.0, 0, 1) > 0.05:
+                n += 1
+            freq *= 1.9
+        return n
+    dist, graze = 66.0, 0.18
+    old = dist / graze * 0.002
+    new = dist * pa / np.sqrt(graze)
+    check('mid-distance water keeps most of its wave trains now',
+          trains(1.0, new) >= 4 > trains(2.0, old),
+          f'{trains(2.0, old)} -> {trains(1.0, new)} of 5')
+
+    # with smoothing turned up, what it removes must roughen the reflection
+    # rather than leave a mirror
+    world = World(mode='BRYCE')
+    world.ground_mode = 'OCEAN'
+    world.ocean_horizon_smooth = 1.0
+    n = 512
+    p = np.stack([np.linspace(0, 200, n), np.zeros(n), np.zeros(n)],
+                 1).astype(np.float32)
+    d = np.stack([np.zeros(n), np.full(n, 0.99), np.full(n, -0.14)],
+                 1).astype(np.float32)
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+    sky_c = np.tile(np.asarray(world.horizon, np.float32), (n, 1))
+    glass = SKY._ocean(world, d, d, p, np.full(n, 60.0, np.float32), sky_c,
+                       0.0, np.full(n, 1e-4, np.float32))
+    rough = SKY._ocean(world, d, d, p, np.full(n, 60.0, np.float32), sky_c,
+                       0.0, np.full(n, 8.0, np.float32))
+    check('water too far to draw waves on is rough, not a mirror',
+          float(np.std(rough)) < float(np.std(glass)) and
+          not np.allclose(rough, glass),
+          f'{float(np.std(glass)):.5f} -> {float(np.std(rough)):.5f}')
+
+    # and Wave Size is the water's own control now
+    a = World(mode='BRYCE'); a.ground_mode = 'OCEAN'; a.ground_scale = 2.0
+    b = World(mode='BRYCE'); b.ground_mode = 'OCEAN'; b.ground_scale = 40.0
+    na = SKY._wave_normal(p, a, 0.0)[0]
+    nb = SKY._wave_normal(p, b, 0.0)[0]
+    check('the chequerboard Scale no longer sets the size of the sea',
+          np.allclose(na, nb), 'ground_scale still moves the waves')
+
+
+def test_the_waves_reach_the_horizon():
+    """Reported: small waves fade out with distance. They must not.
+
+    A modern renderer fades waves a pixel cannot resolve, and the water goes
+    smooth toward the horizon. Bryce did not: its ocean was a procedural
+    material on an infinite plane with nothing filtering it, so the waves
+    compressed into a band of shimmer instead of flattening into glass. The
+    fade is now off unless asked for -- and this is the check that it stays
+    off, because it was on and nothing noticed.
+    """
+    from ..core import sky as SKY
+    from ..core.scene import World
+
+    def water(smooth, sparkle=1.0, wave=0.3, h=180, w=360, height=14.0):
+        world = World(mode='BRYCE')
+        world.ground_plane = True
+        world.ground_mode = 'OCEAN'
+        world.ground_height = 0.0
+        world.ground_fade = 1e5              # haze off: this is about waves
+        world.ocean_wave_scale = wave
+        world.ocean_horizon_smooth = smooth
+        world.ocean_sparkle = sparkle
+        world._pixel_angle = 2.0 * np.arctan(18.0 / 50.0) / (h * 4)
+        world._pixel_width = 0.0
+        eye = np.array([0.0, 0.0, height], np.float32)
+        ys = np.linspace(np.tan(np.radians(-24.0)), np.tan(np.radians(-0.25)), h)
+        xs = np.linspace(-0.6, 0.6, w)
+        gx, gy = np.meshgrid(xs, ys)
+        d = np.stack([gx.ravel(), np.ones(gx.size), gy.ravel()],
+                     1).astype(np.float32)
+        d /= np.linalg.norm(d, axis=1, keepdims=True)
+        return SKY.evaluate(world, d, None, eye=eye, time=0.0).reshape(h, w, 3)
+
+    def texture(img, r0, r1):
+        return float(np.mean(np.abs(np.diff(img[r0:r1].mean(axis=2), axis=1))))
+
+    near, far = (0, 20), (150, 180)
+    keep = water(0.0)
+    near_k, far_k = texture(keep, *near), texture(keep, *far)
+    check('by default the waves still have texture at the horizon',
+          far_k > near_k * 0.5, f'near {near_k:.5f}, far {far_k:.5f}')
+    check('and it is real detail, not a flat band',
+          far_k > 0.002, f'{far_k:.5f}')
+
+    # the control still works for anyone who wants the smooth version
+    smoothed = water(1.0)
+    far_s = texture(smoothed, *far)
+    check('Horizon Smoothing at 1 does smooth the horizon',
+          far_s < far_k * 0.5, f'{far_k:.5f} -> {far_s:.5f}')
+    check('and it is a slider, not a switch',
+          far_k > texture(water(0.5), *far) > far_s,
+          f'{far_k:.5f} / {texture(water(0.5), *far):.5f} / {far_s:.5f}')
+
+    # the shimmer must be decorrelation, not extra contrast: jittering where
+    # the sample lands inside a pixel may not brighten or darken the water
+    plain = water(0.0, sparkle=0.0)
+    check('shimmer does not change how bright the water is',
+          abs(float(plain.mean()) - float(keep.mean())) < 0.01,
+          f'{float(plain.mean()):.4f} vs {float(keep.mean()):.4f}')
+
+    # and it must be repeatable: the same still frame twice, the same pixels
+    check('and it is deterministic, so still water does not crawl',
+          np.array_equal(water(0.0), keep))
+
+
+def test_clouds_do_not_react_to_the_camera():
+    """Moving the camera must not move the clouds, unless asked.
+
+    Reported straight after 1.20.0: the clouds raced whenever the camera
+    rotated. Orbiting a viewport *translates* the eye around a pivot, and
+    Link Clouds to View had shipped defaulting to off -- so the deck was
+    nailed to the world and slid past, against a cloud height of 1.0 that is a
+    dome parameter rather than a distance. A one-unit move was a whole
+    deck-height of parallax.
+
+    The default is the bit-identical case, and that is what is asserted: not
+    "close", identical, because a sky that does not depend on the camera
+    cannot depend on it a little.
+    """
+    from ..core import sky as SKY
+    from ..core.scene import World
+
+    rng = np.random.default_rng(2)
+    d = rng.normal(size=(6000, 3)).astype(np.float32)
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+    d = d[d[:, 2] > 0.05]
+
+    def world(**kw):
+        w = World(mode='BRYCE')
+        w.clouds = True
+        w.stratus = True
+        w.cloud_cover = 0.55
+        for k, v in kw.items():
+            setattr(w, k, v)
+        return w
+
+    check('Link Clouds to View is on by default',
+          World().link_clouds_to_view is True)
+
+    base = SKY.evaluate(world(), d, eye=(0.0, 0.0, 1.6))
+    moved = []
+    for eye in ((1.0, 0.0, 1.6), (6.0, 0.0, 1.6), (0.0, 6.0, 3.0),
+                (-4.0, 2.0, 0.5)):
+        got = SKY.evaluate(world(), d, eye=eye)
+        delta = float(np.abs(got - base).max())
+        if delta != 0.0:
+            moved.append(f'{eye}: {delta:.8f}')
+    check('the camera does not move the clouds at all', not moved,
+          '; '.join(moved))
+
+    # and with it off, the parallax has to be *weighted*: a cloud overhead is
+    # at the deck's height and swings past, one at the horizon is effectively
+    # at infinity and does not. Adding the offset flat slides the whole sky,
+    # which is what made it look like the clouds were racing.
+    free = world(link_clouds_to_view=False)
+    ref = SKY.evaluate(free, d, eye=(0.0, 0.0, 1.6))
+    far = SKY.evaluate(free, d, eye=(6.0, 0.0, 1.6))
+    check('turning the link off does give parallax',
+          float(np.abs(far - ref).mean()) > 1e-3,
+          f'{float(np.abs(far - ref).mean()):.6f}')
+
+    horizon = d[np.abs(d[:, 2]) < 0.10]
+    overhead = d[d[:, 2] > 0.7]
+    h = float(np.abs(SKY.evaluate(free, horizon, eye=(0.0, 0.0, 1.6))
+                     - SKY.evaluate(free, horizon, eye=(6.0, 0.0, 1.6))).mean())
+    o = float(np.abs(SKY.evaluate(free, overhead, eye=(0.0, 0.0, 1.6))
+                     - SKY.evaluate(free, overhead, eye=(6.0, 0.0, 1.6))).mean())
+    check('and the parallax is largest overhead and least at the horizon',
+          o > h * 2.0, f'overhead {o:.5f} vs horizon {h:.5f}')
+
+
+def test_the_water_reflects_the_same_sky():
+    """The ocean's reflection must be the sky the camera is actually under.
+
+    It evaluated the sky from the origin while the sky above was evaluated
+    from the camera, so with camera-dependent clouds the two disagreed -- the
+    water reflected a sky that was not there.
+    """
+    from ..core import sky as SKY
+    from ..core.scene import World
+
+    rng = np.random.default_rng(8)
+    d = rng.normal(size=(8000, 3)).astype(np.float32)
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+    d = d[d[:, 2] < -0.05]
+
+    w = World(mode='BRYCE')
+    w.ground_plane = True
+    w.ground_mode = 'OCEAN'
+    w.clouds = True
+    w.link_clouds_to_view = False        # make the sky camera-dependent
+    w.ocean_choppiness = 0.05            # near mirror, so the sky dominates
+
+    near = SKY.evaluate(w, d, eye=(0.0, 0.0, 2.0))
+    far = SKY.evaluate(w, d, eye=(40.0, 0.0, 2.0))
+    check('the reflection follows the camera when the sky does',
+          float(np.abs(near - far).mean()) > 1e-4,
+          f'{float(np.abs(near - far).mean()):.6f}')
+
+    # The water surface itself legitimately moves with the camera -- a
+    # different viewpoint sees different water -- so "does it hold still" is
+    # not the question. The question is whether the reflection was evaluated
+    # from the camera at all, and that is asked directly.
+    import inspect
+    src = inspect.getsource(SKY._ocean)
+    check('the reflection is evaluated from the camera, not the origin',
+          "eye=getattr(world, '_eye'" in src,
+          'the reflection still evaluates the sky from the origin')
+    SKY.evaluate(w, d, eye=(12.0, -3.0, 2.0))
+    stashed = getattr(w, '_eye', None)
+    check('and the camera position is there for it to use',
+          stashed is not None and abs(float(stashed[0]) - 12.0) < 1e-6,
+          str(stashed))
+
+
+def test_comets_are_animated():
+    """Comets must cross the sky over time, and be comet-shaped while they do.
+
+    Two things were wrong before they could move at all. The sun vector had
+    been an argument of the comet function since it was written and was never
+    read, so tails pointed wherever the random number generator sent them; and
+    the streak was bounded at the far end only, so it ran on *in front of* the
+    head as far as a cos^8 falloff allowed -- about forty degrees, which draws
+    a line through the sky rather than a comet.
+    """
+    from ..core import sky as SKY
+    from ..core.scene import World
+
+    rng = np.random.default_rng(7)
+    d = rng.normal(size=(9000, 3)).astype(np.float32)
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+
+    def night(**kw):
+        w = World(mode='BRYCE')
+        w.clouds = False
+        w.stratus = False
+        w.haze_density = 0.0
+        w.fog_density = 0.0
+        w.sun_elevation = -0.3
+        w.comets = 1.5
+        w.comet_count = 8
+        for k, v in kw.items():
+            setattr(w, k, v)
+        return w
+
+    a = SKY.evaluate(night(), d, time=0.0)
+    b = SKY.evaluate(night(), d, time=5.0)
+    check('comets move as time passes', float(np.abs(b - a).mean()) > 1e-6,
+          f'{float(np.abs(b - a).mean()):.9f}')
+
+    still = SKY.evaluate(night(comet_speed=0.0), d, time=5.0)
+    still0 = SKY.evaluate(night(comet_speed=0.0), d, time=0.0)
+    check('and hold still at zero speed', np.array_equal(still, still0))
+    check('a still frame is where the animation starts, so turning the speed '
+          'up does not empty it',
+          float(np.abs(still0 - a).mean()) < 1e-9,
+          f'{float(np.abs(still0 - a).mean()):.9f}')
+
+    # the shape: a compact head with a tail on one side of it only. Measured
+    # on a fine grid of the sky around the comet rather than on scattered
+    # directions, because one comet is about two degrees across and a random
+    # sphere sample barely lands on it
+    one = World(mode='BRYCE')
+    one.comets = 1.0
+    one.comet_count = 1
+    one.comet_speed = 0.0
+    one.comet_length = 0.12
+    sun = SKY._sun_vector(-0.3, 0.6)
+
+    coarse = rng.normal(size=(200000, 3)).astype(np.float32)
+    coarse /= np.linalg.norm(coarse, axis=1, keepdims=True)
+    head = coarse[int(np.argmax(
+        SKY._comets(coarse, sun, one, 1.0, 1, 0, 0.0)[:, 0]))]
+
+    e1 = np.cross(head, np.array([0.0, 0.0, 1.0], np.float32))
+    e1 /= max(float(np.linalg.norm(e1)), 1e-9)
+    e2 = np.cross(head, e1)
+    span = np.linspace(-0.30, 0.30, 301, dtype=np.float32)   # +/- 17 degrees
+    ga, gb = np.meshgrid(span, span)
+    patch = head[None, :] + ga.ravel()[:, None] * e1[None, :] \
+        + gb.ravel()[:, None] * e2[None, :]
+    patch /= np.linalg.norm(patch, axis=1, keepdims=True)
+    mag = SKY._comets(patch, sun, one, 1.0, 1, 0, 0.0)[:, 0]
+
+    lit = mag > 0.02
+    frac = float(lit.mean())
+    check('a comet lights a small part of the sky and no more',
+          0.0005 < frac < 0.25, f'{frac * 100:.2f}% of a 34-degree patch')
+    check('the head is the brightest part of it',
+          float(np.hypot(ga.ravel()[int(np.argmax(mag))],
+                         gb.ravel()[int(np.argmax(mag))])) < 0.02)
+
+    # everything lit outside the coma sits on one side: that is what a tail is
+    r = np.hypot(ga.ravel(), gb.ravel())
+    tail = lit & (r > 0.03)
+    check('there is a tail as well as a head', int(tail.sum()) > 50,
+          str(int(tail.sum())))
+    if tail.any():
+        wts = mag[tail]
+        ca = float(np.average(ga.ravel()[tail], weights=wts))
+        cb = float(np.average(gb.ravel()[tail], weights=wts))
+        n = max((ca * ca + cb * cb) ** 0.5, 1e-9)
+        side = (ga.ravel()[tail] * ca + gb.ravel()[tail] * cb) / n
+        behind = float(mag[tail][side > 0.05].sum())
+        ahead = float(mag[tail][side < -0.05].sum())
+        check('the tail runs one way, not both',
+              behind > ahead * 40.0,
+              f'{behind:.2f} behind the head, {ahead:.4f} in front')
+
+    # the sun vector is read now: pointing the tail at the sun must move it
+    away = SKY._comets(coarse, sun, night(comet_tail_sun=1.0), 1.0, 1, 0, 0.0)
+    trail = SKY._comets(coarse, sun, night(comet_tail_sun=0.0), 1.0, 1, 0, 0.0)
+    check('tail direction is the sun, not the random seed',
+          float(np.abs(away - trail).mean()) > 1e-9,
+          f'{float(np.abs(away - trail).mean()):.9f}')
+    other = SKY._sun_vector(0.9, 3.0)
+    moved = SKY._comets(coarse, other, night(comet_tail_sun=1.0), 1.0, 1, 0, 0.0)
+    check('and moving the sun moves the tail with it',
+          float(np.abs(moved - away).mean()) > 1e-9,
+          f'{float(np.abs(moved - away).mean()):.9f}')
+
+
+def test_water_presets():
+    """Every water must apply, render, and be its own water."""
+    from ..core import sky as SKY
+    from ..core.scene import World
+    from ..presets import skies as SK
+    from ..presets import waters as WA
+
+    items = WA.water_items()
+    check('there is a library of waters', len(items) >= 16, str(len(items)))
+    check('every entry has a label and a note',
+          all(label and note for _k, label, note in items))
+    check('the display order covers the library',
+          set(WA.ORDER) == set(WA.WATERS),
+          str(set(WA.ORDER) ^ set(WA.WATERS)))
+
+    fields = set(WA.water_fields())
+    stray = []
+    for key, entry in WA.WATERS.items():
+        unknown = [n for n in entry['settings'] if n not in fields]
+        if unknown:
+            stray.append(f'{key}: {", ".join(unknown)}')
+    check('no preset sets a field that does not exist', not stray,
+          '; '.join(stray))
+
+    # the two libraries must own disjoint halves of the World, or picking a
+    # sky throws the water away and nobody can see why
+    overlap = fields & set(SK.sky_fields())
+    check('skies and waters own disjoint fields', not overlap, str(overlap))
+
+    eye = np.array([0.0, 0.0, 9.0], np.float32)
+    rng = np.random.default_rng(5)
+    d = rng.normal(size=(4000, 3)).astype(np.float32)
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+    d[:, 2] = -np.abs(d[:, 2]) - 0.05      # all looking down at the water
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+
+    rendered, broke = {}, []
+    for key, label, _note in items:
+        w = World(mode='BRYCE')
+        ok, msg = WA.apply_water(w, key)
+        if not ok:
+            broke.append(f'{key}: {msg}')
+            continue
+        if not (w.ground_plane and w.ground_mode == 'OCEAN'):
+            broke.append(f'{key}: does not turn the plane to water')
+            continue
+        w._pixel_angle, w._pixel_width = 0.0006, 0.0
+        col = SKY.evaluate(w, d, None, eye=eye, time=0.0)
+        if col is None or not np.isfinite(col).all():
+            broke.append(f'{key}: not finite')
+            continue
+        rendered[key] = col
+    check('every water applies and renders', not broke, '; '.join(broke))
+
+    same = []
+    keys = list(rendered)
+    for i, a in enumerate(keys):
+        for b in keys[i + 1:]:
+            if float(np.abs(rendered[a] - rendered[b]).mean()) < 1e-4:
+                same.append(f'{a} == {b}')
+    check('no two waters land on the same picture', not same, '; '.join(same))
+
+    # save and load must be exact for every one of them
+    bad = []
+    for key, _label, _note in items:
+        w = World(mode='BRYCE')
+        WA.apply_water(w, key)
+        text = WA.dumps(w, key)
+        w2 = World(mode='BRYCE')
+        ok, _msg = WA.loads(w2, text)
+        if not ok:
+            bad.append(f'{key}: would not load')
+            continue
+        for f in fields:
+            if getattr(w, f) != getattr(w2, f):
+                bad.append(f'{key}.{f}')
+    check('every water survives a save and a load exactly', not bad,
+          '; '.join(bad[:6]))
+
+    # a sky file is not a water file and must be refused
+    w = World(mode='BRYCE')
+    ok, msg = WA.loads(w, SK.dumps(w, 'a sky'))
+    check('a sky file is refused by the water loader', not ok, msg)
+    ok, msg = SK.loads(w, WA.dumps(w, 'a water'))
+    check('and a water file is refused by the sky loader', not ok, msg)
+
+    # applying a sky must leave the water exactly as it was, and the reverse
+    w = World(mode='BRYCE')
+    WA.apply_water(w, 'STORM_SWELL')
+    before = {f: getattr(w, f) for f in fields}
+    SK.apply_sky(w, 'DAWN')
+    changed = [f for f in fields if getattr(w, f) != before[f]]
+    check('applying a sky does not touch the water', not changed,
+          ', '.join(changed))
+    sky_before = {f: getattr(w, f) for f in SK.sky_fields()}
+    WA.apply_water(w, 'MILLPOND')
+    changed = [f for f in SK.sky_fields() if getattr(w, f) != sky_before[f]]
+    check('and applying a water does not touch the sky', not changed,
+          ', '.join(changed))
+
+
+def test_water_preset_operators_are_wired():
+    """The water library's buttons must exist and do what they say."""
+    import os
+
+    from . import fakeblender as FB
+    props, _engine = FB.install()
+    from .. import ui as UI
+    from ..presets import waters as WA
+
+    for name in ('HALCYON_OT_water_preset', 'HALCYON_OT_water_save',
+                 'HALCYON_OT_water_load'):
+        check(f'{name} exists', hasattr(UI, name))
+    check('all three are registered',
+          all(getattr(UI, n) in UI.CLASSES for n in
+              ('HALCYON_OT_water_preset', 'HALCYON_OT_water_save',
+               'HALCYON_OT_water_load')))
+    check('Apply Preset is what the button says',
+          UI.HALCYON_OT_water_preset.bl_label == "Apply Preset",
+          UI.HALCYON_OT_water_preset.bl_label)
+    check('and importing says so too',
+          UI.HALCYON_OT_water_load.bl_label == "Import Preset",
+          UI.HALCYON_OT_water_load.bl_label)
+
+    src = open(os.path.join(os.path.dirname(UI.__file__), 'ui.py'),
+               encoding='utf-8').read()
+    at = src.index('Water Presets')
+    body = src[at:at + 700]
+    for want in ('water_preset', 'halcyon.water_preset', 'halcyon.water_save',
+                 'halcyon.water_load'):
+        check(f'the panel draws {want}', want in body)
+    # drawn under the water, where Bryce kept it, not in the sky lab
+    before = src[max(at - 500, 0):at]
+    check("the library is drawn only when the plane is water",
+          "ground_mode == 'OCEAN'" in before)
+
+    items = props.water_preset_items(None, None)
+    check('the dropdown lists the library',
+          len(items) >= len(WA.ORDER), str(len(items)))
+    check('and its keys match the library',
+          {i[0] for i in items} >= set(WA.ORDER))
+
+
+def test_sky_presets():
+    """Every sky must apply, render, and be its own sky.
+
+    A preset library where two entries land on the same picture is a library
+    with a copy-paste in it, and that is not something you notice by scrolling
+    the list.
+    """
+    import dataclasses
+
+    from ..core import sky as SKY
+    from ..core.scene import World
+    from ..presets import skies as SK
+
+    items = SK.sky_items()
+    check('there is a library of skies', len(items) >= 20, str(len(items)))
+    check('every entry has a label and a note',
+          all(label and note for _k, label, note in items))
+    check('the display order covers the library',
+          set(SK.ORDER) == set(SK.SKIES),
+          str(set(SK.ORDER) ^ set(SK.SKIES)))
+
+    rng = np.random.default_rng(4)
+    d = rng.normal(size=(4000, 3)).astype(np.float32)
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+
+    fields = set(SK.sky_fields())
+    stray = []
+    for key, entry in SK.SKIES.items():
+        unknown = [n for n in entry['settings'] if n not in fields]
+        if unknown:
+            stray.append(f'{key}: {", ".join(unknown)}')
+    check('no preset sets a field that does not exist', not stray,
+          '; '.join(stray))
+
+    rendered = {}
+    broke = []
+    for key, _label, _note in items:
+        w = World(mode='BRYCE')
+        ok, msg = SK.apply_sky(w, key)
+        if not ok:
+            broke.append(f'{key}: {msg}')
+            continue
+        col = SKY.evaluate(w, d)
+        if not np.isfinite(col).all():
+            broke.append(f'{key}: not finite')
+            continue
+        rendered[key] = col
+    check('every sky applies and renders', not broke, '; '.join(broke))
+
+    pairs = [(a, b) for i, a in enumerate(rendered)
+             for b in list(rendered)[i + 1:]]
+    same = [f'{a}=={b}' for a, b in pairs
+            if float(np.abs(rendered[a] - rendered[b]).mean()) < 1e-4]
+    check('no two skies are the same sky', not same, ', '.join(same[:4]))
+
+    # applying one after another must not leave anything behind
+    w = World(mode='BRYCE')
+    SK.apply_sky(w, 'VOLCANIC')
+    SK.apply_sky(w, 'CLEAR_BLUE')
+    fresh = World(mode='BRYCE')
+    SK.apply_sky(fresh, 'CLEAR_BLUE')
+    left = [f.name for f in dataclasses.fields(World)
+            if f.name in fields and getattr(w, f.name) != getattr(fresh, f.name)]
+    check('presets do not accumulate', not left, ', '.join(left))
+
+    # the mode and the strength are the user's, not the preset's
+    w = World(mode='BRYCE')
+    w.strength = 2.5
+    SK.apply_sky(w, 'SUNSET')
+    check('a sky does not touch Strength', abs(w.strength - 2.5) < 1e-6)
+
+
+def test_sky_files_round_trip():
+    """A saved sky must load back exactly, and survive being from elsewhere."""
+    import dataclasses
+
+    from ..core.scene import World
+    from ..presets import skies as SK
+
+    fields = set(SK.sky_fields())
+    wrong = []
+    for key, _label, _note in SK.sky_items():
+        a = World(mode='BRYCE')
+        SK.apply_sky(a, key)
+        b = World(mode='BRYCE')
+        ok, _msg = SK.loads(b, SK.dumps(a, key))
+        if not ok:
+            wrong.append(f'{key}: would not load')
+            continue
+        diff = [f.name for f in dataclasses.fields(World)
+                if f.name in fields
+                and getattr(a, f.name) != getattr(b, f.name)]
+        if diff:
+            wrong.append(f'{key}: {", ".join(diff[:3])}')
+    check('every sky survives a save and a load unchanged', not wrong,
+          '; '.join(wrong[:3]))
+
+    # a file from a later version, carrying a field this one has never heard of
+    w = World(mode='BRYCE')
+    data = SK.sky_to_dict(w, 'from the future')
+    data['version'] = SK.FORMAT_VERSION + 1
+    data['settings']['cloud_hyperbole'] = 3.0
+    ok, msg = SK.sky_from_dict(World(mode='BRYCE'), data)
+    check('a sky from a later version still loads', ok, msg)
+    check('and says what it had to leave out', 'does not have' in msg, msg)
+
+    # and something that is not a sky at all is refused rather than half-applied
+    ok, msg = SK.loads(World(), '{"format": "something-else", "settings": {}}')
+    check('a file that is not a sky is refused', not ok, msg)
+    ok, msg = SK.loads(World(), 'not json at all')
+    check('and so is a file that is not JSON', not ok, msg)
+
+    # the excluded fields must never be written into a file
+    text = SK.dumps(World(mode='BRYCE'), 'x')
+    leaked = [n for n in SK.EXCLUDED if f'"{n}"' in text]
+    check('a sky file carries no node tree, image or render setting',
+          not leaked, ', '.join(leaked))
+
+
+def test_sky_preset_operators_are_wired():
+    """Picking a sky, applying it and importing one are three separate acts.
+
+    They used to be one: the menu applied on selection, and the file browser
+    applied whatever it opened. Both are now choices that wait for a button --
+    and the whole box only appears under the Bryce sky, because a library of
+    Bryce skies means nothing next to a solid colour.
+    """
+    import inspect
+
+    from . import fakebpy
+    fakebpy.install()
+    import importlib
+    ui = importlib.import_module('halcyon.ui')
+    props = importlib.import_module('halcyon.properties')
+
+    for name in ('HALCYON_OT_sky_preset', 'HALCYON_OT_sky_save',
+                 'HALCYON_OT_sky_load'):
+        cls = getattr(ui, name, None)
+        check(f'{name} exists', cls is not None)
+        if cls is not None:
+            check(f'{name} is registered', cls in ui.CLASSES, name)
+
+    src = inspect.getsource(ui.HALCYON_PT_world.draw)
+    for op in ('halcyon.sky_preset', 'halcyon.sky_save', 'halcyon.sky_load'):
+        check(f'{op} is reachable from the World panel', op in src)
+
+    # the selection lives on the world, so the dropdown remembers it
+    check('the world carries the chosen sky',
+          'sky_preset' in props.HalcyonWorldSettings.__annotations__)
+    check('the panel draws it as a property rather than a menu of actions',
+          "prop(hs, 'sky_preset'" in src and 'operator_menu_enum' not in src)
+    check('and applying it is its own button',
+          "operator('halcyon.sky_preset'" in src and 'Apply Preset' in src)
+
+    # the box only exists under Bryce
+    at = src.index('Sky Presets')
+    body = src[max(at - 400, 0):at]
+    check('the preset box is gated on the Bryce sky',
+          "hs.mode == 'BRYCE'" in body, body[-120:])
+
+    # importing must not touch the current sky
+    load = inspect.getsource(ui.HALCYON_OT_sky_load.execute)
+    check('importing copies the file into the library',
+          'copyfile' in load and '_sky_library_dir' in load)
+    check('and does not apply it',
+          'SK.loads' not in load and 'apply_sky' not in load)
+    check('a file that is not a sky is refused before it is copied',
+          load.index('SK.FORMAT') < load.index('copyfile'))
+
+    # the menu must offer every built-in sky
+    from ..presets.skies import sky_items
+    keys = {i[0] for i in props.sky_preset_items(None, None)}
+    missing = [k for k, _l, _n in sky_items() if k not in keys]
+    check('the menu offers every built-in sky', not missing,
+          ', '.join(missing))
+
+    # Blender does not hold the strings an items callback returns, so the
+    # module has to. A garbage-collected enum item is a corrupted menu.
+    first = props.sky_preset_items(None, None)
+    second = props.sky_preset_items(None, None)
+    check('the enum items are kept alive between calls', first is second)
+
+
+
+
 def test_no_setting_lies():
     """Nothing in the UI may be a control that does nothing.
 
@@ -4356,6 +5741,81 @@ def test_blender_layer_imports():
     except Exception as exc:                                    # noqa: BLE001
         check('the Blender layer registers cleanly against a bpy stub', False,
               repr(exc))
+
+
+def test_text_objects_export_without_losing_the_frame():
+    """A text object is the first thing to enter that is not a mesh.
+
+    Blender hands a mesh object geometry the depsgraph already owns, so
+    `to_mesh_clear()` on one frees nothing and the old export ordering --
+    convert everything, then read everything -- got away with it for the whole
+    project. Text, curves, surfaces and metaballs *build* a temporary instead,
+    and the next conversion of the same object destroys the last one. The
+    moment one of those is in the scene twice, the export was reading freed
+    memory, which in Blender is a crash and not an exception.
+    """
+    from . import fakeblender as FB
+    from ..core.settings import RenderSettings
+    props, engine = FB.install()
+    from .. import export as EX
+
+    def one(objects):
+        warn = []
+        dg = FB.depsgraph_of(props, objects)
+        return EX.export_scene(dg, RenderSettings(), warn), warn
+
+    text = FB.geometry_object('Text', FB.glyph_mesh)
+    sc, warn = one([text])
+    check('a text object exports', len(sc.mesh.tris) > 0, str(len(sc.mesh.tris)))
+    check('with no material of its own it still gets one',
+          len(sc.materials) >= 1, str(len(sc.materials)))
+    check('and nothing is reported against it', not warn, str(warn))
+
+    # the case that used to read freed memory: one object, two instances
+    sc, warn = one([text, text])
+    check('the same text object instanced twice does not read a freed mesh',
+          len(sc.mesh.tris) > 0, str(warn))
+
+    # a mixed scene, since text and mesh objects free differently
+    cube = FB.geometry_object('Cube', FB.cube_mesh, kind='MESH')
+    curve = FB.geometry_object('Curve', FB.glyph_mesh, kind='CURVE')
+    meta = FB.geometry_object('Metaball', FB.cube_mesh, kind='META')
+    sc, warn = one([cube, text, curve, meta, text])
+    check('text, curve, metaball and mesh export together in one scene',
+          len(sc.objects) == 5, f'{len(sc.objects)} objects, {warn}')
+
+    # text with its fill off converts to outlines: nothing to draw, and the
+    # user should be told why rather than left looking at an empty frame
+    hollow = FB.geometry_object(
+        'Outline', lambda: FB.glyph_mesh(faces=False))
+    sc, warn = one([hollow])
+    check('a text object with no faces is named in a warning',
+          any('Outline' in w and 'Fill' in w for w in warn), str(warn))
+
+    # one object that cannot convert must not take the rest of the frame down
+    class Broken:
+        type = 'FONT'
+        name = 'Broken'
+        color = (1, 1, 1, 1)
+        matrix_world = np.eye(4, dtype=np.float32)
+
+        def to_mesh(self):
+            return types.SimpleNamespace(materials=None)
+
+        def to_mesh_clear(self):
+            pass
+
+    sc, warn = one([cube, Broken(), text])
+    check('an object that will not convert is skipped, not fatal',
+          len(sc.objects) == 2, f'{len(sc.objects)} objects')
+    check('and it is named in the report',
+          any('Broken' in w for w in warn), str(warn))
+
+    # and the whole thing goes through the engine, not just the exporter
+    img, _passes, cap = FB.run_render(props, engine, mesh=FB.glyph_mesh())
+    check('a glyph-shaped mesh renders through the engine',
+          img is not None and bool(np.isfinite(img).all()),
+          str(cap.get('reports')))
 
 
 def main():

@@ -90,6 +90,14 @@ intersected analytically in the background pass rather than built from geometry,
 exactly as POV-Ray and Bryce provided one. World Properties ▸ Halcyon World ▸
 Infinite Ground.
 
+**Wireframe two ways.** All Edges draws every triangle edge, which is what
+these renderers did — and once triangles are a couple of pixels across, every
+pixel is within a pixel of an edge and the surface fills in solid. That is
+arithmetic, not a setting. Creases & Silhouette keeps only the outline and the
+edges where the surface turns, and stays one pixel wide however many triangles
+are behind it. Render Properties ▸ Shading ▸ Wireframe; the width lives on each
+material's shader node.
+
 **Painter's Algorithm** alongside the z-buffer, comparing whole polygons rather
 than fragments, with the sorting errors that implies. **Light linking** per lamp
 by collection. **Fresnel, rim light, sheen, matcap, reflection tint, edge
@@ -99,6 +107,13 @@ scaling how far the Normal input may bend the shading normal, and **Refraction
 Amount** gating how much of the ray traced through a transparent surface is
 used. Sheen is the one that still needs a light: it is a velvet lobe, not the
 rim cheat.
+
+**Render passes.** Depth, Normal, Position, UV, Object Index and Material
+Index, written alongside the beauty image under Blender's own names and channel
+layouts — so a Halcyon Z pass drops into a comp built for Cycles without
+rewiring. View Layer Properties ▸ Halcyon Passes. They are data: they skip the
+display chain, the palette and the dither, and Depth is a distance in scene
+units rather than normalised device depth.
 
 **Material conversion.** Three buttons in the Material panel convert the active
 material, everything on the selected objects, or the whole scene onto the
@@ -156,11 +171,58 @@ every link that still has somewhere to go.
 blend cut into the handful of flat steps a 256-colour palette could actually
 spare for a sky), **starfield** (a backdrop, stars all the way round with no
 dome under them, and an optional nebula), Preetham physical sky, HDRI with
-rotation and tint, and a full **Bryce atmosphere**: sky dome, sun corona, haze
+rotation and tint, and a full **Bryce Sky Lab**: sky dome, sun corona, haze
 that warms toward the sun, separate ground fog, a wind-streaked stratus deck, a
 self-shadowed cumulus deck built from turbulence rather than fBm (which is where
-the cauliflower edges come from), plus a rainbow at the correct 42 degrees and
-stars.
+the cauliflower edges come from), plus a rainbow at the correct 42 degrees,
+stars and comets.
+
+Every control the Sky Lab and the Sky & Fog palette are documented as having is
+there, under the same name and in the same tab: Soft Sky and Custom Sky, Sun
+Glow Colour, Shadow Colour and Intensity, cloud Frequency / Amplitude /
+Turbulence, Spherical Clouds, Link Clouds to View, Fixed Cloud Plane, Base
+Height and both blends for fog and haze, Colour Perspective, Volumetric World,
+moon Softness, comets. They stack in Bryce's order too — dome, then what is
+beyond the atmosphere, then the cloud decks, then the atmosphere itself, which
+is what makes haze reach the clouds instead of stopping behind them.
+
+**The comets travel.** Each runs around a great circle of its own at Comet
+Speed, off the scene's clock, so the same frame renders the same sky anywhere —
+with Tail Length, Tail Width and Colour, and a Tail Direction that runs from
+trailing its own path, as a dust tail does, to pointing straight away from the
+sun, as an ion tail does.
+
+**43 sky presets** with a save/load format behind them — Dawn through Deep
+Space, and a pink-and-purple shelf from Rose Tinted Glasses to Synthetic
+Wonderworld, each built out of the Sky Lab's own controls so it doubles as a worked
+example of them. The list sits under the Bryce sky mode: pick one, press *Apply
+Preset*. *Save As...* writes a `.halsky` file anywhere, *Add to Library* puts one
+in the list beside the built-ins, and *Import Preset...* takes someone else's
+`.halsky` into the library without applying it. They are skies built to Bryce's
+controls, not Bryce's own preset files, which were never published.
+
+**20 water presets** in the same shape, under the water plane rather than the
+Sky Lab because that is where Bryce kept them — its Materials Library had a
+**Waters & Liquids** category and dropping one on the plane was how a picture
+got its sea. Caribbean Resort through Storm Swell, Millpond, Moonlit Water,
+Liquid Mercury and Alien Sea, saved as `.halwater`. Skies and waters own
+disjoint halves of the world, so applying one never disturbs the other. Of the
+names, *Waters & Liquids* and *Caribbean Resort* are Bryce's own; the rest are
+named for what they are.
+
+**The infinite ocean** is the other half of a Bryce picture: a directional wave
+spectrum fanned off a wind direction, deep and shallow colours with the path
+length between them, and the sun's glitter path — which is the sun found in the
+distribution of wave normals rather than a highlight on a plane. *Wave Size* is
+the length of the longest train, crest to crest, from two centimetres to five
+hundred metres. The waves run all the way to the horizon and compress into a
+band of shimmer there rather than fading out, which is what Bryce's water did:
+its ocean was a procedural material on an infinite plane with nothing filtering
+it. *Horizon Shimmer* is what keeps that band reading as sea instead of as
+moiré, by taking each sample from a random point inside its pixel rather than
+the centre. *Horizon Smoothing* turns the modern behaviour back on if you want
+smooth distant water, and what it removes widens the glitter path and roughens
+the reflection instead of disappearing.
 
 **69 presets** across six categories — a Default that resets everything, then
 3D software (Infini-D, Ray Dream, StudioPro, 3D Studio R4 and MAX R2, trueSpace,
@@ -180,7 +242,7 @@ Applying a preset resets everything first, so presets never accumulate — machi
 settings like thread count and Transparent Film are preserved. **Add On Top**
 layers one deliberately.
 
-**159 settings**, all exposed. A test fails if any of them is drawn in the UI without something reading it.
+**167 settings**, all exposed. A test fails if any of them is drawn in the UI without something reading it.
 
 ---
 
@@ -314,7 +376,13 @@ iterations.
 
 These are real, and I would rather write them down than have you find them.
 
-**The Blender layer is only partly validated here.** It was developed without
+**The Blender layer is only partly validated here.** There are now two levels
+of stand-in: one that imports and registers every module, and one that actually
+*runs* a frame through `HalcyonRenderEngine.render()` — property group,
+exporter, renderer, post chain, delivery and passes — against a fake depsgraph.
+The second exists because six bugs in a row got past the first, every one of
+them a control wired up at one end and not the other. Neither can catch a
+segfault, a driver quirk or an RNA lifetime bug. It was developed without
 Blender installed. Every module is import- and registration-tested against a
 `bpy` stub (`tests/fakebpy.py`) which catches typos, bad enum defaults and
 malformed property declarations, and confirms all settings map across — but no
@@ -356,6 +424,13 @@ because it's occasionally useful, not because a 1996 renderer had it.
 
 **Motion blur, particles and hair are not supported.** Baking to texture is not
 implemented either.
+
+**Mesh, curve, surface, text and metaball objects render**; Blender converts
+each to triangles and Halcyon takes it from there. Grease pencil, hair curves,
+point clouds and volumes do not, and are named in the info bar rather than
+quietly left out of the picture. An object that will not convert is skipped
+with its name reported and its traceback on the console — one bad object costs
+you that object, not the frame.
 
 ---
 
@@ -530,7 +605,7 @@ halcyon/
   core/          bpy-free renderer
     mathx.py       vector maths on (N,3) arrays
     scene.py       dataclasses the renderer consumes
-    settings.py    RenderSettings — the 159 knobs
+    settings.py    RenderSettings — the 167 knobs
     raster.py      clipping, z-buffer, A-buffer fragment lists
     bvh.py         median-split BVH for rays
     texture.py     sampling, mips, N64 three-point filter
@@ -546,8 +621,8 @@ halcyon/
   shaders/       bpy-free GLSL/HLSL compiler
     lexer.py parser.py gtypes.py builtins.py codegen.py compiler.py
   nodes/         Blender node classes
-  presets/       the 69 preset definitions
-  tests/         headless test suite + bpy stub
+  presets/       the 69 render presets, 43 skies + 20 waters
+  tests/         headless test suite, bpy stub + a runnable fake Blender
   compat.py properties.py export.py engine.py ui.py objects.py
 ```
 

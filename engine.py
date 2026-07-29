@@ -42,19 +42,14 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
         settings = _settings_from_scene(bscene, tw, th, preview)
         warnings = []
 
+        from .version import version_string
+        print(f"[Halcyon] {version_string()} rendering "
+              f"{tw}x{th}  pass={settings.debug_pass}"
+              f"  wire={settings.wire_mode}")
         self.update_stats("Halcyon", "Exporting scene")
         ST.reset()
         ST.enable(bool(settings.show_stats))
         _apply_debug_prefs()
-        try:
-            from .gpu import capability as _cap
-            dev, _stages, notes = _cap.plan(scene, settings)
-            if str(settings.render_device).upper() == 'GPU':
-                print(f"[Halcyon] device: {dev}")
-                for note in notes:
-                    print(f"[Halcyon]   {note}")
-        except Exception:                                       # noqa: BLE001
-            pass
         export_started = time.time()
         try:
             with ST.track('export scene (Blender side)'):
@@ -66,6 +61,20 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                 self.report({'ERROR'}, f"Halcyon export failed: {exc}")
             return
 
+        # the device plan needs the exported scene, so it runs after the export
+        # rather than before it, where `scene` did not yet exist -- the
+        # UnboundLocalError went straight into a bare except and the plan has
+        # never once run
+        try:
+            from .gpu import capability as _cap
+            dev, _stages, notes = _cap.plan(scene, settings)
+            if str(settings.render_device).upper() == 'GPU':
+                print(f"[Halcyon] device: {dev}")
+                for note in notes:
+                    print(f"[Halcyon]   {note}")
+        except Exception:                                       # noqa: BLE001
+            pass
+
         def on_progress(frac, msg):
             if self.test_break():
                 raise _Cancelled()
@@ -73,7 +82,11 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             self.update_stats("Halcyon", msg)
 
         image = None
-        if settings.use_processes and not preview:
+        if settings.use_processes and not preview and \
+                core_render.wanted_passes(settings):
+            print("[Halcyon] extra render passes are on, so this frame renders "
+                  "in-process: the worker pool sends back pixels, not buffers")
+        elif settings.use_processes and not preview:
             from .core import parallel as _par
             n = int(settings.process_count) or _resolve_cpus()
             key = (id(depsgraph), bscene.frame_current, tw, th)
@@ -119,7 +132,8 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             final = post.fit_to(np.clip(image, 0.0, 1.0), (tw, th))
 
         with ST.track('deliver to Blender'):
-            self._deliver(final, bscene)
+            self._deliver(final, bscene,
+                          getattr(scene, 'last_passes', None))
 
         # reporting during a preview render pushes UI work onto the preview
         # thread for a thumbnail nobody is reading
@@ -131,6 +145,55 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             ST.report(total=elapsed)
         self.update_stats("Halcyon", f"Done in {elapsed:.1f}s")
         self.update_progress(1.0)
+
+    # ------------------------------------------------------------------ passes
+    def update_render_passes(self, scene=None, renderlayer=None):
+        """Tell Blender which extra passes this render will contain.
+
+        Without this the render result holds one pass, Combined, and everything
+        else the compositor offers reads as black. Halcyon was force-enabling
+        Blender's own Passes panel while delivering exactly one pass, which is
+        the worst of both: the controls were there and none of them did
+        anything.
+        """
+        self.register_pass(scene, renderlayer, "Combined", 4, "RGBA", 'COLOR')
+        st = _settings_from_scene(scene, 1, 1) if scene is not None else None
+        if st is None:
+            return
+        for name, chans, chan_id, kind in PASS_SPEC:
+            if name in core_render.wanted_passes(st):
+                self.register_pass(scene, renderlayer, name, chans, chan_id, kind)
+
+    def _deliver_passes(self, result, buffers, w, h):
+        """Write the extra passes, each fitted to Blender's own buffer."""
+        try:
+            passes = result.layers[0].passes
+        except (IndexError, AttributeError):
+            return
+        for name, buf in buffers.items():
+            try:
+                target = passes[name]
+            except (KeyError, TypeError):
+                continue          # not enabled on this view layer
+            arr = np.asarray(buf, np.float32)
+            if arr.shape[0] != h or arr.shape[1] != w:
+                arr = post.fit_to(arr, (w, h))
+            chans = int(getattr(target, 'channels', arr.shape[2]) or arr.shape[2])
+            if arr.shape[2] < chans:
+                arr = np.concatenate(
+                    [arr, np.zeros(arr.shape[:2] + (chans - arr.shape[2],),
+                                   np.float32)], axis=2)
+            elif arr.shape[2] > chans:
+                arr = arr[:, :, :chans]
+            flat = np.ascontiguousarray(np.nan_to_num(
+                arr, nan=0.0, posinf=1e10, neginf=0.0).reshape(-1))
+            try:
+                target.rect.foreach_set(flat)
+            except Exception:                                   # noqa: BLE001
+                try:
+                    target.rect = flat.reshape(-1, chans).tolist()
+                except Exception:                               # noqa: BLE001
+                    pass
 
     def _target_size(self, bscene):
         """The exact buffer size Blender has allocated for this render.
@@ -147,7 +210,7 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
         pct = max(r.resolution_percentage, 1) / 100.0
         return max(int(r.resolution_x * pct), 1), max(int(r.resolution_y * pct), 1)
 
-    def _deliver(self, final, bscene):
+    def _deliver(self, final, bscene, extra=None):
         """Hand the finished image back through the render result.
 
         The buffer size is dictated by Blender, never by the image: writing more
@@ -168,6 +231,8 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
 
         result = self.begin_result(0, 0, w, h)
         try:
+            if extra:
+                self._deliver_passes(result, extra, w, h)
             layer = result.layers[0].passes["Combined"]
             # Both buffers are bottom-row-first: the rasteriser maps NDC y = -1
             # to row 0, and Blender's rect expects the bottom row first.
@@ -329,6 +394,18 @@ def _apply_view_camera(scene, context, settings):
                           clip_end=context.space_data.clip_end)
 
 
+#: (name, channels, channel ids, type) exactly as Blender names them, so a
+#: Halcyon Z pass drops into a comp built for Cycles without rewiring
+PASS_SPEC = (
+    ("Depth", 1, "Z", 'VALUE'),
+    ("Normal", 3, "XYZ", 'VECTOR'),
+    ("Position", 3, "XYZ", 'VECTOR'),
+    ("UV", 3, "UVA", 'VECTOR'),
+    ("IndexOB", 1, "X", 'VALUE'),
+    ("IndexMA", 1, "X", 'VALUE'),
+)
+
+
 # ---------------------------------------------------------------- UI plumbing
 
 # Blender marks its own engine-agnostic property panels by listing
@@ -359,8 +436,11 @@ FORCED_PANELS = {
     'DATA_PT_spot', 'DATA_PT_area',
     'WORLD_PT_context_world', 'WORLD_PT_viewport_display',
     'RENDER_PT_color_management', 'RENDER_PT_color_management_curves',
-    'VIEWLAYER_PT_layer_passes',
 }
+# VIEWLAYER_PT_layer_passes is deliberately *not* forced: it lists Mist,
+# Vector, Denoising Data and the light-component passes, none of which this
+# engine produces. Halcyon has its own Passes panel offering the six it can
+# actually fill, which is the same rule EXCLUDED_PANELS exists for.
 
 _patched = []
 

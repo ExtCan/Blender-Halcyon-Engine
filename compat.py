@@ -17,10 +17,16 @@ def at_least(*ver):
 
 
 def loop_triangles(mesh):
-    """Ensure and return the triangulated loops."""
+    """Ensure and return the triangulated loops.
+
+    `calc_loop_triangles` went away in 4.1 and the cache is built on access
+    now, so its absence is expected. Anything else it may raise -- a mesh that
+    is temporary, or read-only, or owned by the depsgraph rather than by us --
+    is equally not fatal, because the property below is what we actually want.
+    """
     try:
         mesh.calc_loop_triangles()
-    except AttributeError:
+    except Exception:                                           # noqa: BLE001
         pass
     return mesh.loop_triangles
 
@@ -75,31 +81,87 @@ def color_layers(mesh):
 # ------------------------------------------------------------------ objects
 
 
-def evaluated_meshes(depsgraph):
-    """Yield (object, evaluated mesh, matrix, is_temporary).
+# object types that carry surfaces we can turn into triangles
+GEOMETRY_TYPES = frozenset({'MESH', 'CURVE', 'SURFACE', 'FONT', 'META'})
 
-    The instance list is snapshotted first: `to_mesh()` and `to_mesh_clear()`
-    allocate and free depsgraph-owned data, and doing that while the
-    object_instances iterator is still live can invalidate it under us.
+# object types that plainly have geometry in them but that we cannot convert.
+# Naming them is the difference between "unsupported, and here is what it was"
+# and an object that silently is not in the picture.
+UNCONVERTIBLE_TYPES = frozenset({'GPENCIL', 'GREASEPENCIL', 'CURVES',
+                                 'POINTCLOUD', 'VOLUME'})
+
+# types that convert by *building* a mesh rather than by handing over one the
+# depsgraph already made. These are the ones the lifetime rules below exist
+# for: a mesh object gives back geometry that outlives the call, whereas a
+# text, curve, surface or metaball gives back a temporary that the next
+# `to_mesh()` on the same object -- or any `to_mesh_clear()` -- destroys.
+ALLOCATING_TYPES = frozenset({'CURVE', 'SURFACE', 'FONT', 'META'})
+
+
+def evaluated_meshes(depsgraph):
+    """Yield (object, evaluated mesh, matrix, is_temporary), one at a time.
+
+    Two Blender rules govern this, and breaking either is a hard crash rather
+    than an exception:
+
+    * The instance iterator must not be live while `to_mesh()` runs, because
+      converting allocates depsgraph-owned data and can invalidate it under
+      us. So the instance list is snapshotted first.
+    * A mesh from `to_mesh()` belongs to the object, not to the caller. The
+      next `to_mesh()` on that same object frees it, and so does
+      `to_mesh_clear()`. Converting every object up front and reading them
+      afterwards -- which is what a `list()` around this generator does --
+      therefore reads freed memory the moment one object appears twice, which
+      is exactly what an instanced text or curve is.
+
+    So each mesh is freed here, on the way to the next object, and the caller
+    must consume this lazily and must not free anything itself. A mesh object
+    survived the old ordering by luck: it hands back geometry the depsgraph
+    already owns, so nothing was ever actually freed. Text, curves, surfaces
+    and metaballs are the ones that allocate, and they are the ones it broke.
     """
     try:
         instances = [(i.object, i.matrix_world.copy(), i.show_self)
                      for i in depsgraph.object_instances]
     except Exception:                                           # noqa: BLE001
         return
-    for ob, matrix_world, show_self in instances:
-        if ob is None or ob.type not in {'MESH', 'CURVE', 'SURFACE', 'FONT',
-                                         'META'}:
-            continue
-        if not show_self:
-            continue
-        try:
-            me = ob.to_mesh()
-        except Exception:                                       # noqa: BLE001
-            continue
-        if me is None:
-            continue
-        yield ob, me, matrix_world, True
+    live = None
+    try:
+        for ob, matrix_world, show_self in instances:
+            if ob is None or ob.type not in GEOMETRY_TYPES or not show_self:
+                continue
+            if live is not None:
+                free_mesh(live)
+                live = None
+            try:
+                me = ob.to_mesh()
+            except Exception:                                   # noqa: BLE001
+                continue
+            if me is None:
+                continue
+            live = ob
+            yield ob, me, matrix_world, True
+    finally:
+        # runs on exhaustion, on an early break, and on close()
+        if live is not None:
+            free_mesh(live)
+
+
+def unconvertible(depsgraph):
+    """Names and types of visible objects we had to leave out."""
+    out = []
+    try:
+        seen = set()
+        for i in depsgraph.object_instances:
+            ob = i.object
+            if ob is None or not i.show_self:
+                continue
+            if ob.type in UNCONVERTIBLE_TYPES and ob.name not in seen:
+                seen.add(ob.name)
+                out.append((ob.name, ob.type))
+    except Exception:                                           # noqa: BLE001
+        pass
+    return out
 
 
 def free_mesh(ob):

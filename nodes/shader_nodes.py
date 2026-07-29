@@ -202,6 +202,12 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
     model: EnumProperty(name="Model", items=[(a, b, c) for a, b, c in MODEL_ITEMS],
                         default='PHONG', update=_update)
     toon_steps: IntProperty(name="Toon Steps", default=2, min=1, max=16)
+    wire_size: FloatProperty(
+        name="Wire Size", default=1.0, min=0.05, max=16.0,
+        description="Width of the drawn edge, in rendered pixels. A material "
+                    "shaded as Wireframe had no reachable width at all before "
+                    "-- on a dense mesh at a period resolution every pixel is "
+                    "within a pixel of an edge, and the surface fills in")
 
     # which sockets each model actually uses -- the rest are hidden, not removed,
     # so switching models never loses a connection
@@ -326,6 +332,8 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
         layout.prop(self, 'model', text="")
         if self.model == 'TOON':
             layout.prop(self, 'toon_steps')
+        if self.model == 'WIREFRAME':
+            layout.prop(self, 'wire_size')
         used = sum(1 for _k, n, _d in self.SOCKETS
                    if SOCKET_MODELS.get(n) == ALL
                    or (SOCKET_MODELS.get(n) and self.model in SOCKET_MODELS[n]))
@@ -441,6 +449,17 @@ def _run_rebuilds():
     return None                       # one-shot
 
 
+#: nodes currently inside their own update callback, by pointer
+_UPDATING = set()
+
+
+def _node_key(node):
+    try:
+        return node.as_pointer()
+    except Exception:                                           # noqa: BLE001
+        return id(node)
+
+
 def _schedule_rebuild():
     if _REBUILD_QUEUED[0]:
         return
@@ -463,23 +482,30 @@ class HALCYON_CodeNode(Node, HalcyonNodeBase):
 
     def _lang_changed(self, context):
         # Sockets must not be added or removed from inside an RNA update
-        # callback -- Blender is mid-update and it segfaults. Worse, setting
-        # source_text here fires _source_changed as well, so the rebuild would
-        # happen inside a *nested* callback. Both are deferred instead.
-        if self._busy:
+        # callback -- Blender is mid-update and it segfaults -- so the rebuild
+        # is only ever flagged here and done from a timer.
+        #
+        # The re-entrancy guard used to be `self._busy`, an ordinary Python
+        # attribute. Blender hands out a fresh wrapper object on every access
+        # to a node, so that attribute was written to a temporary and read back
+        # as the class default: the guard was never once closed. It lives in a
+        # module-level set now, keyed by the node's own pointer, which is the
+        # only identity that survives the wrapper being rebuilt.
+        key = _node_key(self)
+        if key in _UPDATING:
             return
-        self._busy = True
+        _UPDATING.add(key)
         try:
             if not self.source and not self.source_text.strip():
                 self.source_text = DEFAULT_GLSL if self.language == 'GLSL' \
                     else DEFAULT_HLSL
         finally:
-            self._busy = False
+            _UPDATING.discard(key)
         self.needs_rebuild = True
         _schedule_rebuild()
 
     def _source_changed(self, context):
-        if self._busy:
+        if _node_key(self) in _UPDATING:
             return
         self.needs_rebuild = True
         _schedule_rebuild()
@@ -487,7 +513,6 @@ class HALCYON_CodeNode(Node, HalcyonNodeBase):
     language: EnumProperty(name="Language", items=LANGUAGES, default='GLSL',
                            update=_lang_changed)
     needs_rebuild: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
-    _busy = False
     source: PointerProperty(name="Text", type=bpy.types.Text,
                             description="A text datablock holding the shader",
                             update=_source_changed)
@@ -533,10 +558,19 @@ class HALCYON_CodeNode(Node, HalcyonNodeBase):
         wanted_in = prog.uniform_schema()
         wanted_out = prog.output_schema()
 
+        # `sock.default_value` on a colour or vector socket is a live view into
+        # the socket's own memory, not a copy. Holding one across
+        # `inputs.clear()` leaves a pointer into freed memory, and reading it
+        # back afterwards to restore the value is a use-after-free -- which
+        # takes Blender down rather than raising. Every value is materialised
+        # here, before anything is cleared.
         keep = {}
         for sock in self.inputs:
-            keep[sock.name] = (sock.default_value if hasattr(sock, 'default_value')
-                               else None,
+            value = None
+            if hasattr(sock, 'default_value'):
+                dv = sock.default_value
+                value = tuple(dv) if hasattr(dv, '__len__') else float(dv)
+            keep[sock.name] = (value,
                                [(l.from_node.name, l.from_socket.name)
                                 for l in sock.links])
         links_out = []

@@ -176,6 +176,44 @@ class World:
     horizon_height: float = 0.0
     gradient_falloff: float = 1.0
     blend_mode: str = 'LINEAR'        # LINEAR|SMOOTH|SHARP|EASE
+    # ------------------------------------------------ Bryce's Sky Lab
+    # Bryce's Sky & Fog palette offered a Sky Mode: Soft Sky drove the dome
+    # from the sun's own colour, Custom Sky exposed the three stops directly.
+    sky_mode: str = 'CUSTOM'            # SOFT | CUSTOM
+    sun_glow_color: tuple = (1.0, 0.86, 0.62)
+    shadow_color: tuple = (0.30, 0.34, 0.45)
+    shadow_intensity: float = 1.0
+    # the Atmosphere tab keeps a base height for each of fog and haze, and
+    # blends each toward the sun's colour and the sky's own
+    fog_base_height: float = 0.0
+    haze_base_height: float = 0.0
+    fog_blend_sky: float = 0.0
+    fog_sun_tint: float = 0.0
+    color_perspective: float = 0.0
+    volumetric_world: float = 0.0
+    # the Cloud Cover tab's own names: frequency and amplitude, not "scale"
+    cloud_frequency: float = 1.0
+    cloud_amplitude: float = 1.0
+    cloud_turbulence: float = 1.0
+    spherical_clouds: bool = True
+    # On by default, which is both what the control is for and what Halcyon
+    # did before it existed: the cloud pattern does not react to the camera at
+    # all. Off gives real parallax against cloud_height, which is a dome
+    # parameter rather than a distance -- so a low deck slides a long way for
+    # a small move, exactly as a low deck would.
+    link_clouds_to_view: bool = True
+    fixed_cloud_plane: bool = True
+    stratus_frequency: float = 1.0
+    stratus_amplitude: float = 1.0
+    # the Celestial tab
+    moon_softness: float = 0.05
+    comets: float = 0.0
+    comet_count: int = 3
+    comet_speed: float = 0.05
+    comet_length: float = 0.10
+    comet_width: float = 0.006
+    comet_tail_sun: float = 0.6
+    comet_color: tuple = (1.0, 0.96, 0.88)
     # sun, shared by BRYCE and PHYSICAL
     sun_elevation: float = 0.35
     sun_rotation: float = 0.6
@@ -269,6 +307,20 @@ class World:
     ground_fade: float = 60.0
     ocean_choppiness: float = 0.35
     ocean_speed: float = 1.0
+    # the water, the other half of a Bryce picture
+    ocean_wind_angle: float = 0.6
+    ocean_spread: float = 0.6
+    ocean_wave_scale: float = 1.0
+    ocean_detail: int = 5
+    ocean_sparkle: float = 1.0
+    ocean_horizon_smooth: float = 0.0
+    ocean_deep: tuple = (0.03, 0.09, 0.13)
+    ocean_shallow: tuple = (0.06, 0.22, 0.26)
+    ocean_glitter: float = 1.0
+    ocean_glitter_size: float = 0.45
+    ocean_foam: float = 0.0
+    ocean_foam_color: tuple = (0.92, 0.95, 0.96)
+    ocean_transparency: float = 0.25
     env_filter: str = 'BILINEAR'
     env_tint: tuple = (1.0, 1.0, 1.0)
     sky_blend: bool = False

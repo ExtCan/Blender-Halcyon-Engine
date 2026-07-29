@@ -58,6 +58,26 @@ def camera_matrices(camera, width, height):
     return view, proj, (proj @ view).astype(np.float32), eye
 
 
+def pixel_footprint(camera, proj, height):
+    """How much of the world one rendered pixel covers.
+
+    Returns (radians, metres): the angle a pixel subtends for a perspective
+    camera, or the constant width it covers for an orthographic one. The
+    infinite water plane needs this to know which waves are small enough that
+    drawing them would only alias -- and it was reading a hard-coded guess of
+    0.002 rad, which is roughly four times coarser than a 480-row frame at a
+    normal lens and is why the waves stopped being drawn so close in.
+
+    `height` is the *rendered* height, so supersampling is already in it: a
+    frame rendered at 4x resolves waves a quarter the size, which it should.
+    """
+    if camera is not None and getattr(camera, 'type', '') == 'ORTHO':
+        return 0.0, float(getattr(camera, 'ortho_scale', 6.0)) / max(height, 1)
+    f = abs(float(proj[1, 1])) if proj is not None else 1.0
+    fov_y = 2.0 * np.arctan(1.0 / max(f, 1e-6))
+    return float(fov_y) / max(height, 1), 0.0
+
+
 # ---------------------------------------------------------------- textures
 
 
@@ -236,6 +256,8 @@ def closure_to_surface(cl, ctx, settings, material=None):
         surf.translucency = to_value(p['translucency'], n)
         surf.toon_size = to_value(p['toon_size'], n)
         surf.toon_smooth = to_value(p['toon_smooth'], n)
+        if p.get('toon_steps') is not None:
+            surf.toon_steps = to_value(p['toon_steps'], n)
         for key, attr, kind in (
                 ('fresnel', 'fresnel', 'v'), ('fresnel_power', 'fresnel_power', 'v'),
                 ('fresnel_color', 'fresnel_color', 'c'), ('rim', 'rim', 'v'),
@@ -1018,6 +1040,15 @@ def render(scene, settings=None, progress=None, band=None):
     rw, rh = W * ss, H * ss
 
     view, proj, vp, eye = camera_matrices(scene.camera, rw, rh)
+    # the water needs to know how big a pixel is before it can decide which
+    # waves are too small to draw
+    if getattr(scene, 'world', None) is not None:
+        try:
+            pa, pw = pixel_footprint(scene.camera, proj, rh)
+            scene.world._pixel_angle = pa
+            scene.world._pixel_width = pw
+        except Exception:                                       # noqa: BLE001
+            pass
     with ST.track('prepare textures'):
         textures = prepare_textures(scene, st)
 
@@ -1120,10 +1151,26 @@ def render(scene, settings=None, progress=None, band=None):
     if progress:
         progress(0.85, 'Resolving')
     # hand the post chain what it needs for defocus and shafts
+    # Extra passes come off the same G-buffer the beauty image did, before
+    # anything downsamples or quantises it.
+    depth_m = None
+    if st.dof or 'Depth' in wanted_passes(st):
+        with ST.track('linear depth'):
+            depth_m = linear_depth(job, gbuf, eye)
+    scene.last_passes = build_aux_passes(job, gbuf, st, depth_m)
+    if scene.last_passes and ss > 1:
+        # data, not colour: averaging a normal or an object index across
+        # samples produces a value that was never on any surface, so the
+        # top-left sample of each output pixel is taken instead
+        scene.last_passes = {k: v[::ss, ::ss]
+                             for k, v in scene.last_passes.items()}
+
     scene.last_depth = None
-    if st.dof:
-        d = np.where(np.isfinite(gbuf.depth), gbuf.depth, np.nan)
-        scene.last_depth = d[::ss, ::ss] if ss > 1 else d
+    if st.dof and depth_m is not None:
+        # metres, so Focus Distance in the UI is the distance it says it is.
+        # It was normalised device depth, which put every focus value the
+        # slider allows far behind the whole scene and blurred the lot.
+        scene.last_depth = depth_m[::ss, ::ss] if ss > 1 else depth_m
     scene.last_shafts = shaft_sources(scene, st, vp)
 
     with ST.track('resolve / downsample'):
@@ -1156,6 +1203,25 @@ def material_model(mat, settings):
                 return node.get('props', {}).get('model', settings.default_model)
         return getattr(mat, 'model', None) if getattr(mat, 'model', None) else None
     return getattr(mat, 'model', None) or settings.default_model
+
+
+def material_wire_size(mat, default=1.0):
+    """The wire width for a material, from its node if it has one.
+
+    Same reasoning as `material_model`: for a material shaded as Wireframe by a
+    Halcyon Shader node, the node is where the user set it, so the node is
+    where it is read from.
+    """
+    if mat is None:
+        return default
+    graph = getattr(mat, 'graph', None)
+    if graph:
+        for node in graph.get('nodes', {}).values():
+            if node.get('bl_idname') == 'HALCYON_ShaderNode':
+                v = node.get('props', {}).get('wire_size')
+                if v is not None:
+                    return max(float(v), 0.05)
+    return max(float(getattr(mat, 'wire_size', default) or default), 0.05)
 
 
 RATE_FOR_MODEL = {'GOURAUD': 'VERTEX', 'FLAT': 'FACE', 'WIREFRAME': 'PIXEL'}
@@ -1542,22 +1608,188 @@ def edge_factor(gbuf, width=1.0):
     derivative converts them into a width that stays constant however far away
     the triangle is -- the standard barycentric wireframe, done properly rather
     than by thresholding raw barycentrics.
+
+    The derivative is the whole difficulty. A central difference needs the
+    pixels on *both* sides to belong to the same triangle, and on anything
+    denser than a cube that is rarely true: the derivative collapses to zero,
+    the distance goes to infinity, and the wire comes out as a scatter of dots
+    with most of it missing. One-sided differences are used instead -- a pixel
+    needs only one neighbour along each axis, in either direction -- which is
+    the difference between a wireframe and a dotted line.
+
+    A pixel with no same-triangle neighbour on either axis is a triangle about
+    one pixel across. There is no derivative to measure and no interior to
+    speak of, so it is treated as being *on* the edge rather than infinitely
+    far from it. That is what a wireframe of a dense mesh looks like, and the
+    alternative was those triangles vanishing entirely.
     """
     b = gbuf.bary
     tri = gbuf.tri
-    same_x = np.zeros_like(tri, bool)
-    same_y = np.zeros_like(tri, bool)
-    same_x[:, 1:-1] = (tri[:, 2:] == tri[:, :-2])
-    same_y[1:-1, :] = (tri[2:, :] == tri[:-2, :])
-    dx = np.zeros_like(b)
-    dy = np.zeros_like(b)
-    dx[:, 1:-1] = (b[:, 2:] - b[:, :-2]) * 0.5
-    dy[1:-1, :] = (b[2:, :] - b[:-2, :]) * 0.5
-    dx *= same_x[:, :, None]
-    dy *= same_y[:, :, None]
+
+    def one_sided(axis):
+        # neighbouring pixels along `axis` that share a triangle
+        if axis == 1:
+            same = tri[:, 1:] == tri[:, :-1]
+            diff = b[:, 1:] - b[:, :-1]
+        else:
+            same = tri[1:, :] == tri[:-1, :]
+            diff = b[1:, :] - b[:-1, :]
+        d = np.zeros_like(b)
+        have = np.zeros(tri.shape, bool)
+        if axis == 1:
+            d[:, :-1] = np.where(same[:, :, None], diff, 0.0)   # forward
+            have[:, :-1] = same
+            back = np.zeros_like(b)
+            back[:, 1:] = np.where(same[:, :, None], diff, 0.0)  # backward
+            hb = np.zeros(tri.shape, bool)
+            hb[:, 1:] = same
+        else:
+            d[:-1, :] = np.where(same[:, :, None], diff, 0.0)
+            have[:-1, :] = same
+            back = np.zeros_like(b)
+            back[1:, :] = np.where(same[:, :, None], diff, 0.0)
+            hb = np.zeros(tri.shape, bool)
+            hb[1:, :] = same
+        # prefer the forward difference, fall back to the backward one
+        out = np.where(have[:, :, None], d, back)
+        return out, (have | hb)
+
+    dx, has_x = one_sided(1)
+    dy, has_y = one_sided(0)
     fw = np.abs(dx) + np.abs(dy)
+    measurable = has_x | has_y
     dist = b / np.maximum(fw, 1e-6)
-    return dist.min(axis=2)
+    dist = dist.min(axis=2)
+    return np.where(measurable, dist, 0.0)
+
+
+def edge_distance_exact(gbuf, mesh, vp, snap=0.0):
+    """Distance in pixels from each covered pixel to its triangle's nearest edge.
+
+    Computed from the triangle's own projected vertices rather than from a
+    finite difference of the barycentrics. The difference matters more than it
+    sounds: a derivative needs neighbouring pixels that belong to the same
+    triangle, and on a mesh whose triangles are a few pixels across there are
+    none -- which is how a wireframe ends up as a scatter of dots, or as
+    nothing at all.
+
+    For a point with linear barycentrics l0,l1,l2 in a triangle of screen area
+    A, the distance to the edge opposite corner i is |l_i| * 2A / |e_i|. Exact,
+    at any triangle size, at any resolution, with no neighbours involved.
+
+    Returns None if it cannot be computed, so the caller can fall back.
+    """
+    if mesh is None or mesh.tris is None or mesh.verts is None:
+        return None
+    from . import raster as _raster
+    try:
+        _clip, screen, _invw, _z = _raster.project(
+            np.asarray(mesh.verts, np.float32), vp, gbuf.width, gbuf.height,
+            snap=snap)
+    except Exception:                                           # noqa: BLE001
+        return None
+
+    cov = gbuf.mask()
+    py, px = np.nonzero(cov)
+    out = np.full((gbuf.height, gbuf.width), 1e9, np.float32)
+    if py.size == 0:
+        return out
+    tri = np.asarray(mesh.tris, np.int32)[gbuf.tri[py, px]]
+    p0 = screen[tri[:, 0]]
+    p1 = screen[tri[:, 1]]
+    p2 = screen[tri[:, 2]]
+    qx = px.astype(np.float32) + 0.5
+    qy = py.astype(np.float32) + 0.5
+
+    area2 = ((p1[:, 0] - p0[:, 0]) * (p2[:, 1] - p0[:, 1])
+             - (p2[:, 0] - p0[:, 0]) * (p1[:, 1] - p0[:, 1]))
+    safe = np.where(np.abs(area2) < 1e-9, 1e-9, area2)
+    l0 = ((p1[:, 1] - p2[:, 1]) * (qx - p2[:, 0])
+          + (p2[:, 0] - p1[:, 0]) * (qy - p2[:, 1])) / safe
+    l1 = ((p2[:, 1] - p0[:, 1]) * (qx - p2[:, 0])
+          + (p0[:, 0] - p2[:, 0]) * (qy - p2[:, 1])) / safe
+    l2 = 1.0 - l0 - l1
+
+    e0 = np.linalg.norm(p1 - p2, axis=1)
+    e1 = np.linalg.norm(p2 - p0, axis=1)
+    e2 = np.linalg.norm(p0 - p1, axis=1)
+    a2 = np.abs(area2)
+    d0 = np.abs(l0) * a2 / np.maximum(e0, 1e-6)
+    d1 = np.abs(l1) * a2 / np.maximum(e1, 1e-6)
+    d2 = np.abs(l2) * a2 / np.maximum(e2, 1e-6)
+    d = np.minimum(np.minimum(d0, d1), d2)
+    # a triangle straddling the near plane projects a corner to nonsense; those
+    # keep the fallback rather than inventing a distance
+    bad = ~np.isfinite(d)
+    d = np.where(bad, 0.0, d)
+    out[py, px] = d.astype(np.float32)
+    return out
+
+
+def crease_edges(gbuf, mesh, angle_deg=25.0):
+    """Pixels on a silhouette or on an edge where the surface turns.
+
+    A wireframe of every triangle edge is what these renderers drew, and on a
+    dense mesh at 320x240 it is also a solid fill: once triangles are a couple
+    of pixels across, every pixel is within a pixel of an edge. That is
+    arithmetic rather than a bug, and no width setting escapes it.
+
+    This is the way out. An edge is kept only where the surface genuinely
+    turns -- against the background, against another object, or across a
+    face-normal difference wider than `angle_deg`. The result is one pixel
+    wide whatever the triangle count behind it.
+    """
+    cov = gbuf.mask()
+    out = np.zeros(cov.shape, bool)
+    if not cov.any():
+        return out
+    tri = gbuf.tri
+    fn = getattr(mesh, 'face_normals', None)
+    obj = getattr(mesh, 'obj_index', None)
+    cos_lim = float(np.cos(np.radians(max(min(angle_deg, 179.0), 0.0))))
+
+    normals = None
+    if fn is not None:
+        fn = np.asarray(fn, np.float32)
+        normals = np.zeros(cov.shape + (3,), np.float32)
+        normals[cov] = fn[tri[cov]]
+
+    for dy, dx in ((0, 1), (1, 0)):
+        a = (slice(None, -dy or None), slice(None, -dx or None))
+        b = (slice(dy, None), slice(dx, None))
+        both = cov[a] & cov[b]
+        # one side covered and the other not: a silhouette
+        edge = cov[a] ^ cov[b]
+        diff = both & (tri[a] != tri[b])
+        if obj is not None and diff.any():
+            oi = np.asarray(obj, np.int32)
+            diff_obj = diff & (oi[tri[a]] != oi[tri[b]])
+        else:
+            diff_obj = np.zeros_like(diff)
+        turn = np.zeros_like(diff)
+        if normals is not None and diff.any():
+            dot = (normals[a] * normals[b]).sum(axis=2)
+            turn = diff & (dot < cos_lim)
+        hit = edge | diff_obj | turn
+        out[a] |= hit
+        out[b] |= hit
+    return out & cov
+
+
+def _thicken(mask, radius):
+    """Grow a boolean mask by `radius` pixels, so a wire can be more than one."""
+    r = int(max(round(radius - 1.0), 0))
+    if r <= 0:
+        return mask
+    out = mask.copy()
+    for _ in range(r):
+        grown = out.copy()
+        grown[1:, :] |= out[:-1, :]
+        grown[:-1, :] |= out[1:, :]
+        grown[:, 1:] |= out[:, :-1]
+        grown[:, :-1] |= out[:, 1:]
+        out = grown
+    return out
 
 
 def apply_wireframe(job, gbuf, img, st, vp, eye, textures):
@@ -1570,13 +1802,27 @@ def apply_wireframe(job, gbuf, img, st, vp, eye, textures):
     wire_mats = {i for i, m in enumerate(scene.materials)
                  if material_model(m, st) == 'WIREFRAME'}
     if not wire_mats and not st.render_wire:
+        # Nothing to carve. If a *surface* nonetheless shaded as Wireframe the
+        # user is looking at a flat unlit fill and has no way to know why, so
+        # the mismatch is recorded rather than left silent.
+        scene.wireframe_note = None
         return img
-    dist = edge_factor(gbuf)
+    scene.wireframe_note = sorted(wire_mats)
+    crease = None
+    if str(getattr(st, 'wire_mode', 'ALL')) == 'CREASE':
+        crease = crease_edges(gbuf, mesh, float(getattr(st, 'wire_angle', 25.0)))
+        dist = None
+    else:
+        dist = edge_distance_exact(
+            gbuf, mesh, vp, snap=st.vertex_snap_grid if st.vertex_snap else 0.0)
+        if dist is None:
+            dist = edge_factor(gbuf)
     py, px = np.nonzero(cov)
-    d = dist[py, px]
+    d = dist[py, px] if dist is not None else None
     if st.render_wire:
         w = max(float(st.wire_width), 0.1)
-        on = d < w
+        on = (d < w) if d is not None else \
+            _thicken(crease, w)[py, px]
         col = np.asarray(st.wire_color, np.float32)
         yy, xx = py[on], px[on]
         img[yy, xx, :3] = col[None, :]
@@ -1586,10 +1832,14 @@ def apply_wireframe(job, gbuf, img, st, vp, eye, textures):
             else np.zeros(py.size, np.int32)
         is_wire = np.isin(mat_idx, list(wire_mats))
         if is_wire.any():
-            widths = np.array([max(getattr(m, 'wire_size', 1.0), 0.1)
+            widths = np.array([material_wire_size(m)
                                for m in scene.materials] or [1.0], np.float32)
             w = widths[np.clip(mat_idx, 0, widths.size - 1)]
-            off = is_wire & (d >= w)
+            if d is not None:
+                off = is_wire & (d >= w)
+            else:
+                thick = _thicken(crease, float(np.max(w)))
+                off = is_wire & ~thick[py, px]
             if off.any():
                 yy, xx = py[off], px[off]
                 # these pixels see straight through the surface, so they get the
@@ -1647,6 +1897,100 @@ def _debug_pass(job, gbuf, img, st):
         out[py, px, :3] = edge[:, None]
     else:
         return img
+    return out
+
+
+def linear_depth(job, gbuf, eye):
+    """Distance from the camera, in scene units, with NaN where nothing was hit.
+
+    `gbuf.depth` is normalised device depth: it runs 0..1 and crowds almost
+    everything into the last few thousandths, which is exactly what a depth
+    buffer is for and exactly wrong for anything that wants a distance. A Z
+    pass in NDC is unusable in a comp, and a depth-of-field focus expressed in
+    metres compared against it is not comparing anything.
+    """
+    h, w = gbuf.height, gbuf.width
+    out = np.full((h, w), np.nan, np.float32)
+    cov = gbuf.mask()
+    py, px = np.nonzero(cov)
+    if py.size == 0:
+        return out
+    ctx = job.context(gbuf.tri[py, px], gbuf.bary[py, px], px, py)
+    out[py, px] = np.linalg.norm(ctx.P - np.asarray(eye, np.float32)[None, :],
+                                 axis=1)
+    return out
+
+
+def wanted_passes(st):
+    """Which extra passes this render is being asked for.
+
+    Written out one setting at a time rather than looped over a table of
+    strings, so that a reader -- and the test that hunts for controls nothing
+    reads -- can see each one actually being used.
+    """
+    names = []
+    if getattr(st, 'pass_depth', False):
+        names.append('Depth')
+    if getattr(st, 'pass_normal', False):
+        names.append('Normal')
+    if getattr(st, 'pass_position', False):
+        names.append('Position')
+    if getattr(st, 'pass_uv', False):
+        names.append('UV')
+    if getattr(st, 'pass_object_index', False):
+        names.append('IndexOB')
+    if getattr(st, 'pass_material_index', False):
+        names.append('IndexMA')
+    return tuple(names)
+
+
+def build_aux_passes(job, gbuf, st, depth_m=None):
+    """Raw data buffers for the compositor, straight off the G-buffer.
+
+    These are *data*, so nothing here is display-transformed, dithered or
+    filtered: a depth in metres stays a depth in metres, and an object index
+    stays an integer. Uncovered pixels get the conventions Blender's own
+    engines use -- 1e10 for depth, zero for everything else -- so a Z pass
+    composites the same way a Cycles one does.
+    """
+    names = wanted_passes(st)
+    if not names:
+        return {}
+    mesh = job.scene.mesh
+    h, w = gbuf.height, gbuf.width
+    cov = gbuf.mask()
+    py, px = np.nonzero(cov)
+    out = {}
+    ctx = None
+    if py.size and ({'Normal', 'Position', 'UV'} & set(names)):
+        ctx = job.context(gbuf.tri[py, px], gbuf.bary[py, px], px, py)
+    for name in names:
+        if name == 'Depth':
+            d = depth_m if depth_m is not None else linear_depth(
+                job, gbuf, getattr(job, 'eye', (0.0, 0.0, 0.0)))
+            d = np.where(np.isfinite(d), d, 1e10)
+            out[name] = d[:, :, None].astype(np.float32)
+            continue
+        chans = 1 if name in ('IndexOB', 'IndexMA') else 3
+        buf = np.zeros((h, w, chans), np.float32)
+        if py.size:
+            if name == 'Normal':
+                buf[py, px] = ctx.N
+            elif name == 'Position':
+                buf[py, px] = ctx.P
+            elif name == 'UV':
+                buf[py, px, 0] = ctx.uv[:, 0]
+                buf[py, px, 1] = ctx.uv[:, 1]
+                buf[py, px, 2] = 1.0
+            elif name == 'IndexMA':
+                mi = (mesh.mat_index[gbuf.tri[py, px]]
+                      if mesh.mat_index is not None else np.zeros(py.size))
+                buf[py, px, 0] = np.asarray(mi, np.float32)
+            elif name == 'IndexOB':
+                oi = (mesh.obj_index[gbuf.tri[py, px]]
+                      if mesh.obj_index is not None else np.zeros(py.size))
+                buf[py, px, 0] = np.asarray(oi, np.float32)
+        out[name] = buf
     return out
 
 

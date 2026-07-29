@@ -1728,6 +1728,11 @@ def n_halcyon_shader(ev, node):
         refraction=_opt(ev, node, 'Refraction Amount', VALUE, 1.0),
         toon_size=ev.input(node, 'Toon Size', VALUE),
         toon_smooth=ev.input(node, 'Toon Smooth', VALUE),
+        # Toon Steps is a node property rather than a socket -- it is a count,
+        # and a count has no business being a float someone can plug a texture
+        # into. It still has to reach the surface, which for four releases it
+        # did not: the shading code read the default 2 whatever the node said.
+        toon_steps=float(p.get('toon_steps', 2) or 2),
         normal=ev.input(node, 'Normal', VECTOR) if ev.has_link(node, 'Normal') else None,
         model=model,
     )

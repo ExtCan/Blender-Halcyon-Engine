@@ -8,7 +8,7 @@ reports what is actually installed.
 
 import os
 
-VERSION = (1, 17, 1)
+VERSION = (1, 24, 0)
 
 
 def _from_manifest():

@@ -102,7 +102,7 @@ def surface_setup(indent='    '):
     lines = [f'{indent}HalcyonSurface s;']
     for f in fields:
         lines.append(f'{indent}s.{f} = hal_{f};')
-    lines.append(f'{indent}s.toon_steps = 2.0;')
+    lines.append(f'{indent}s.toon_steps = hal_toon_steps;')
     lines.append(f'{indent}s.tangent = hal_T;')
     lines.append(f'{indent}s.bitangent = normalize(cross(hal_N, hal_T));')
     return '\n'.join(lines)
@@ -121,6 +121,7 @@ uniform float hal_ior;
 uniform float hal_translucency;
 uniform float hal_toon_size;
 uniform float hal_toon_smooth;
+uniform float hal_toon_steps;
 uniform float hal_opacity;
 uniform vec3  hal_specular_tint;
 """

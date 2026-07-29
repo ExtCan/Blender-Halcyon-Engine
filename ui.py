@@ -735,6 +735,51 @@ class HALCYON_PT_world_ground(HalcyonPanel, Panel):
                               "this panel's header.", 46):
                 note.label(text=line)
 
+        if hs.ground_plane and hs.ground_mode == 'OCEAN':
+            layout.separator()
+            # Bryce kept its waters in the Materials Library, not the Sky
+            # Lab, so this is its own library and picking a sky never
+            # touches it
+            lib = layout.box()
+            lib.label(text="Water Presets", icon='MOD_FLUIDSIM')
+            lib.prop(hs, 'water_preset', text="")
+            lib.operator('halcyon.water_preset', text="Apply Preset",
+                         icon='CHECKMARK')
+            row = lib.row(align=True)
+            op = row.operator('halcyon.water_save', text="Save As...",
+                              icon='FILE_TICK')
+            op.to_library = False
+            op = row.operator('halcyon.water_save', text="Add to Library",
+                              icon='ADD')
+            op.to_library = True
+            lib.operator('halcyon.water_load', text="Import Preset...",
+                         icon='IMPORT')
+
+            box = layout.column()
+            box.label(text="Water", icon='MOD_OCEAN')
+            box.prop(hs, 'ocean_deep')
+            box.prop(hs, 'ocean_shallow')
+            box.prop(hs, 'ocean_transparency')
+            box.separator()
+            box.prop(hs, 'ocean_choppiness', text="Wave Height")
+            box.prop(hs, 'ocean_wave_scale')
+            box.prop(hs, 'ocean_detail')
+            box.prop(hs, 'ocean_sparkle')
+            box.prop(hs, 'ocean_horizon_smooth')
+            box.prop(hs, 'ocean_wind_angle')
+            box.prop(hs, 'ocean_spread')
+            box.prop(hs, 'ocean_speed')
+            box.separator()
+            box.prop(hs, 'ocean_glitter')
+            sub = box.column()
+            sub.active = hs.ocean_glitter > 0.0
+            sub.prop(hs, 'ocean_glitter_size')
+            box.separator()
+            box.prop(hs, 'ocean_foam')
+            sub = box.column()
+            sub.active = hs.ocean_foam > 0.0
+            sub.prop(hs, 'ocean_foam_color')
+
 
 class _BrycePanel(HalcyonPanel):
     """Sub-panels that only make sense for the Bryce atmosphere."""
@@ -772,11 +817,17 @@ class HALCYON_PT_world_sun(_BrycePanel, Panel):
             col.prop(hs, 'moon_size')
             col.prop(hs, 'moon_phase')
             col.prop(hs, 'moon_earthshine')
+            col.prop(hs, 'moon_softness')
         else:
             col.prop(hs, 'sun_color')
             if hs.mode == 'BRYCE':
                 col.prop(hs, 'sun_glow')
+                col.prop(hs, 'sun_glow_color')
                 col.prop(hs, 'sun_corona')
+        if hs.mode == 'BRYCE':
+            col.separator()
+            col.prop(hs, 'shadow_color')
+            col.prop(hs, 'shadow_intensity')
             col.separator()
             col.prop(hs, 'sun_disc')
             sub = col.column()
@@ -794,6 +845,7 @@ class HALCYON_PT_world_atmosphere(_BrycePanel, Panel):
         hs = context.world.halcyon
         col = layout.column(heading="Haze")
         col.prop(hs, 'haze_density', text="Amount")
+        col.prop(hs, 'haze_base_height')
         sub = col.column()
         sub.active = hs.haze_density > 0.0
         sub.prop(hs, 'haze_color')
@@ -812,6 +864,12 @@ class HALCYON_PT_world_atmosphere(_BrycePanel, Panel):
         sub.active = hs.fog_density > 0.0
         sub.prop(hs, 'fog_color')
         sub.prop(hs, 'fog_height')
+        sub.prop(hs, 'fog_base_height')
+        sub.prop(hs, 'fog_sun_tint')
+        sub.prop(hs, 'fog_blend_sky')
+        col.separator()
+        col.prop(hs, 'color_perspective')
+        col.prop(hs, 'volumetric_world')
 
 
 class HALCYON_PT_world_cumulus(_BrycePanel, Panel):
@@ -829,6 +887,9 @@ class HALCYON_PT_world_cumulus(_BrycePanel, Panel):
         col.prop(hs, 'cloud_cover')
         col.prop(hs, 'cloud_density')
         col.prop(hs, 'cloud_scale')
+        col.prop(hs, 'cloud_frequency')
+        col.prop(hs, 'cloud_amplitude')
+        col.prop(hs, 'cloud_turbulence')
         col.prop(hs, 'cloud_height')
         col.prop(hs, 'cloud_thickness')
         col.prop(hs, 'cloud_softness')
@@ -843,6 +904,10 @@ class HALCYON_PT_world_cumulus(_BrycePanel, Panel):
         col.prop(hs, 'cloud_rim')
         col.prop(hs, 'cloud_ambience')
         col.prop(hs, 'cloud_shadows')
+        col.separator()
+        col.prop(hs, 'spherical_clouds')
+        col.prop(hs, 'link_clouds_to_view')
+        col.prop(hs, 'fixed_cloud_plane')
 
 
 class HALCYON_PT_world_stratus(_BrycePanel, Panel):
@@ -860,6 +925,8 @@ class HALCYON_PT_world_stratus(_BrycePanel, Panel):
         col.prop(hs, 'stratus_amount')
         col.prop(hs, 'stratus_density')
         col.prop(hs, 'stratus_scale')
+        col.prop(hs, 'stratus_frequency')
+        col.prop(hs, 'stratus_amplitude')
         col.prop(hs, 'stratus_altitude')
         col.prop(hs, 'stratus_squash')
         col.prop(hs, 'stratus_sharpness')
@@ -889,6 +956,16 @@ class HALCYON_PT_world_effects(_BrycePanel, Panel):
         sub.active = hs.stars
         sub.prop(hs, 'star_density')
         sub.prop(hs, 'star_brightness')
+        col.separator()
+        col.prop(hs, 'comets')
+        sub = col.column()
+        sub.active = hs.comets > 0.0
+        sub.prop(hs, 'comet_count')
+        sub.prop(hs, 'comet_speed')
+        sub.prop(hs, 'comet_length')
+        sub.prop(hs, 'comet_width')
+        sub.prop(hs, 'comet_tail_sun')
+        sub.prop(hs, 'comet_color')
 
 
 def prefs(context=None):
@@ -980,16 +1057,33 @@ class HALCYON_OT_diagnostics(Operator):
         except Exception as exc:                                # noqa: BLE001
             self.report({'ERROR'}, f"export failed: {exc}")
             return {'CANCELLED'}
+        from .core.render import material_model, material_wire_size
         print("=" * 70)
         print("HALCYON DIAGNOSTICS")
         print("=" * 70)
+        print(f"version        : {'.'.join(str(v) for v in _version())}  "
+              f"({__package__})")
         mesh = exported.mesh
         print(f"triangles      : {0 if mesh is None or mesh.tris is None else len(mesh.tris)}")
         print(f"objects        : {len(exported.objects)}")
         print(f"lights         : {[(l.type, round(l.energy, 2)) for l in exported.lights]}")
         print(f"images         : {list(getattr(exported, 'images', {}))}")
         print(f"world mode     : {exported.world.mode}  graph={'yes' if exported.world.graph else 'no'}")
-        print(f"debug pass     : {st.debug_pass}")
+        print(f"render pass    : {st.debug_pass}"
+              + ("" if st.debug_pass == 'BEAUTY'
+                 else "   (the beauty image is replaced by this)"))
+        wire = [(i, m.name) for i, m in enumerate(exported.materials)
+                if material_model(m, st) == 'WIREFRAME']
+        print(f"wire materials : {wire if wire else 'none resolve to WIREFRAME'}"
+              f"   mode={st.wire_mode} angle={st.wire_angle}")
+        for i, name in wire:
+            print(f"                 [{i}] {name!r} wire size "
+                  f"{material_wire_size(exported.materials[i])}")
+        tri_count = 0 if mesh is None or mesh.tris is None else len(mesh.tris)
+        px = max(st.resolution_x * st.resolution_y, 1)
+        if wire and tri_count:
+            print(f"                 ~{px * 0.5 / tri_count:.1f} pixels per "
+                  f"triangle -- under about 5, All Edges fills solid")
         print(f"resolution     : {st.resolution_x}x{st.resolution_y} "
               f"scale={st.output_scale} aa={st.aa_mode}/{st.aa_samples}")
         for m in exported.materials:
@@ -1211,7 +1305,7 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
         row.prop(hs, 'cast_shadow')
         row.prop(hs, 'receive_shadow')
         col.prop(hs, 'wire')
-        if hs.wire:
+        if hs.wire or hs.model == 'WIREFRAME':
             col.prop(hs, 'wire_size')
 
 
@@ -1262,6 +1356,458 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
         sub.prop(hs, 'exclude_mode')
 
 
+class HALCYON_PT_wireframe(HalcyonPanel, Panel):
+    """The wireframe controls, which had no panel at all until now."""
+
+    bl_label = "Wireframe"
+    bl_context = "render"
+    bl_parent_id = 'HALCYON_PT_shading'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        hs = context.scene.halcyon
+        col = layout.column()
+        col.prop(hs, 'wire_mode')
+        sub = col.column()
+        sub.active = hs.wire_mode == 'CREASE'
+        sub.prop(hs, 'wire_angle')
+        col.separator()
+        col.prop(hs, 'render_wire')
+        sub = col.column()
+        sub.active = hs.render_wire
+        sub.prop(hs, 'wire_width')
+        sub.prop(hs, 'wire_color')
+        note = layout.column(align=True)
+        note.active = False
+        note.scale_y = 0.8
+        for line in _wrap("All Edges draws every triangle edge, which is what "
+                          "these renderers did -- and once triangles are a "
+                          "couple of pixels across, every pixel is within a "
+                          "pixel of an edge and the surface fills in solid. "
+                          "That is arithmetic, not a setting. Creases & "
+                          "Silhouette is the way out; each material's own Wire "
+                          "Size sets the width.", 46):
+            note.label(text=line)
+
+
+# ------------------------------------------------------------- sky presets
+
+
+def _sky_library_dir():
+    from .properties import sky_library_dir
+    return sky_library_dir()
+
+
+def _user_skies():
+    from .properties import user_skies
+    return user_skies()
+
+
+def sky_preset_items(self=None, context=None):
+    from .properties import sky_preset_items as items
+    return items(self, context)
+
+
+class HALCYON_OT_sky_preset(Operator):
+    """Load the selected sky onto this world"""
+
+    bl_idname = 'halcyon.sky_preset'
+    bl_label = "Apply Preset"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    preset: StringProperty(
+        name="Sky", default='',
+        description="Leave empty to use whatever the World panel has selected")
+    reset: BoolProperty(
+        name="Reset First", default=True,
+        description="Return every sky setting to its default before applying, "
+                    "so nothing carries over from the last one")
+
+    @classmethod
+    def poll(cls, context):
+        return context.world is not None
+
+    def execute(self, context):
+        from .presets import skies as SK
+        hs = context.world.halcyon
+        key = self.preset or getattr(hs, 'sky_preset', '') or ''
+        if not key:
+            self.report({'WARNING'}, "No sky selected")
+            return {'CANCELLED'}
+        if key.startswith('FILE:'):
+            try:
+                with open(key[5:], 'r', encoding='utf-8') as fh:
+                    ok, msg = SK.loads(hs, fh.read(), reset=self.reset)
+            except OSError as exc:
+                self.report({'ERROR'}, str(exc))
+                return {'CANCELLED'}
+        else:
+            ok, msg = SK.apply_sky(hs, key, reset=self.reset)
+        if not ok:
+            self.report({'ERROR'}, msg)
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Sky: {msg}")
+        return {'FINISHED'}
+
+
+class HALCYON_OT_sky_save(Operator):
+    """Save this world's sky to a .halsky file"""
+
+    bl_idname = 'halcyon.sky_save'
+    bl_label = "Save Sky"
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filter_glob: StringProperty(default="*.halsky", options={'HIDDEN'})
+    to_library: BoolProperty(
+        name="Add to Library", default=False,
+        description="Save into Halcyon's own folder so it appears in the sky "
+                    "list next to the built-in ones")
+    sky_name: StringProperty(name="Name", default="My Sky")
+
+    @classmethod
+    def poll(cls, context):
+        return context.world is not None
+
+    def invoke(self, context, event):
+        import os
+        if self.to_library:
+            return self.execute(context)
+        if not self.filepath:
+            self.filepath = (self.sky_name or 'sky') + '.halsky'
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        import os
+        from .presets import skies as SK
+        text = SK.dumps(context.world.halcyon, self.sky_name)
+        path = self.filepath
+        if self.to_library:
+            folder = _sky_library_dir()
+            if not folder:
+                self.report({'ERROR'}, "Cannot reach the preset folder")
+                return {'CANCELLED'}
+            safe = ''.join(c for c in (self.sky_name or 'Sky')
+                           if c.isalnum() or c in ' _-').strip() or 'Sky'
+            path = os.path.join(folder, safe + '.halsky')
+        if not path:
+            self.report({'ERROR'}, "No file path")
+            return {'CANCELLED'}
+        if not path.lower().endswith('.halsky'):
+            path += '.halsky'
+        try:
+            with open(path, 'w', encoding='utf-8') as fh:
+                fh.write(text)
+        except OSError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Saved {os.path.basename(path)}")
+        return {'FINISHED'}
+
+
+class HALCYON_OT_sky_load(Operator):
+    """Add a .halsky file to the preset list, without changing this sky"""
+
+    bl_idname = 'halcyon.sky_load'
+    bl_label = "Import Preset"
+    bl_options = {'REGISTER'}
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filter_glob: StringProperty(default="*.halsky", options={'HIDDEN'})
+    select: BoolProperty(
+        name="Select After Importing", default=True,
+        description="Point the preset list at what was just imported. It is "
+                    "still not applied until Apply Preset is pressed")
+
+    @classmethod
+    def poll(cls, context):
+        return context.world is not None
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        import json
+        import os
+        import shutil
+
+        from .presets import skies as SK
+        if not self.filepath or not os.path.isfile(self.filepath):
+            self.report({'ERROR'}, "No file")
+            return {'CANCELLED'}
+        # read it before copying it: a file that is not a sky should be
+        # refused at the door rather than landing in the library and failing
+        # every time somebody picks it
+        try:
+            with open(self.filepath, 'r', encoding='utf-8') as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as exc:
+            self.report({'ERROR'}, f"Cannot read it: {exc}")
+            return {'CANCELLED'}
+        if not isinstance(data, dict) or data.get('format') != SK.FORMAT:
+            self.report({'ERROR'}, "That is not a Halcyon sky file")
+            return {'CANCELLED'}
+
+        folder = _sky_library_dir()
+        if not folder:
+            self.report({'ERROR'}, "Cannot reach the preset folder")
+            return {'CANCELLED'}
+        name = os.path.basename(self.filepath)
+        dest = os.path.join(folder, name)
+        stem, ext = os.path.splitext(name)
+        n = 2
+        while os.path.exists(dest) and not os.path.samefile(
+                self.filepath, dest):
+            dest = os.path.join(folder, f'{stem} {n}{ext}')
+            n += 1
+        try:
+            if os.path.abspath(dest) != os.path.abspath(self.filepath):
+                shutil.copyfile(self.filepath, dest)
+        except OSError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+
+        if self.select:
+            try:
+                context.world.halcyon.sky_preset = 'FILE:' + dest
+            except TypeError:
+                pass          # the enum has not rebuilt yet; harmless
+        self.report({'INFO'},
+                    f"Added {os.path.splitext(os.path.basename(dest))[0]} "
+                    f"to the preset list")
+        return {'FINISHED'}
+
+
+# ----------------------------------------------------------- water presets
+#
+# The same three operators as the sky library, against the other half of the
+# World. They are deliberately not shared code: the file extensions, the
+# folders and the field sets differ, and a generic version of this would be
+# longer than both of them.
+
+
+def _water_library_dir():
+    from .properties import water_library_dir
+    return water_library_dir()
+
+
+def _user_waters():
+    from .properties import user_waters
+    return user_waters()
+
+
+def water_preset_items(self=None, context=None):
+    from .properties import water_preset_items as items
+    return items(self, context)
+
+
+class HALCYON_OT_water_preset(Operator):
+    """Load the selected water onto this world's infinite plane"""
+
+    bl_idname = 'halcyon.water_preset'
+    bl_label = "Apply Preset"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    preset: StringProperty(
+        name="Water", default='',
+        description="Leave empty to use whatever the World panel has selected")
+    reset: BoolProperty(
+        name="Reset First", default=True,
+        description="Return every water setting to its default before "
+                    "applying, so nothing carries over from the last one")
+
+    @classmethod
+    def poll(cls, context):
+        return context.world is not None
+
+    def execute(self, context):
+        from .presets import waters as WA
+        hs = context.world.halcyon
+        key = self.preset or getattr(hs, 'water_preset', '') or ''
+        if not key:
+            self.report({'WARNING'}, "No water selected")
+            return {'CANCELLED'}
+        if key.startswith('FILE:'):
+            try:
+                with open(key[5:], 'r', encoding='utf-8') as fh:
+                    ok, msg = WA.loads(hs, fh.read(), reset=self.reset)
+            except OSError as exc:
+                self.report({'ERROR'}, str(exc))
+                return {'CANCELLED'}
+        else:
+            ok, msg = WA.apply_water(hs, key, reset=self.reset)
+        if not ok:
+            self.report({'ERROR'}, msg)
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Water: {msg}")
+        return {'FINISHED'}
+
+
+class HALCYON_OT_water_save(Operator):
+    """Save this world's water to a .halwater file"""
+
+    bl_idname = 'halcyon.water_save'
+    bl_label = "Save Water"
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filter_glob: StringProperty(default="*.halwater", options={'HIDDEN'})
+    to_library: BoolProperty(
+        name="Add to Library", default=False,
+        description="Save into Halcyon's own folder so it appears in the "
+                    "water list next to the built-in ones")
+    water_name: StringProperty(name="Name", default="My Water")
+
+    @classmethod
+    def poll(cls, context):
+        return context.world is not None
+
+    def invoke(self, context, event):
+        if self.to_library:
+            return self.execute(context)
+        if not self.filepath:
+            self.filepath = (self.water_name or 'water') + '.halwater'
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        import os
+
+        from .presets import waters as WA
+        text = WA.dumps(context.world.halcyon, self.water_name)
+        path = self.filepath
+        if self.to_library:
+            folder = _water_library_dir()
+            if not folder:
+                self.report({'ERROR'}, "Cannot reach the preset folder")
+                return {'CANCELLED'}
+            safe = ''.join(c for c in (self.water_name or 'Water')
+                           if c.isalnum() or c in ' _-').strip() or 'Water'
+            path = os.path.join(folder, safe + '.halwater')
+        if not path:
+            self.report({'ERROR'}, "No file path")
+            return {'CANCELLED'}
+        if not path.lower().endswith('.halwater'):
+            path += '.halwater'
+        try:
+            with open(path, 'w', encoding='utf-8') as fh:
+                fh.write(text)
+        except OSError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Saved {os.path.basename(path)}")
+        return {'FINISHED'}
+
+
+class HALCYON_OT_water_load(Operator):
+    """Add a .halwater file to the preset list, without changing this water"""
+
+    bl_idname = 'halcyon.water_load'
+    bl_label = "Import Preset"
+    bl_options = {'REGISTER'}
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filter_glob: StringProperty(default="*.halwater", options={'HIDDEN'})
+    select: BoolProperty(
+        name="Select After Importing", default=True,
+        description="Point the preset list at what was just imported. It is "
+                    "still not applied until Apply Preset is pressed")
+
+    @classmethod
+    def poll(cls, context):
+        return context.world is not None
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        import json
+        import os
+        import shutil
+
+        from .presets import waters as WA
+        if not self.filepath or not os.path.isfile(self.filepath):
+            self.report({'ERROR'}, "No file")
+            return {'CANCELLED'}
+        # checked before it is copied, so a wrong pick leaves no trace
+        try:
+            with open(self.filepath, 'r', encoding='utf-8') as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as exc:
+            self.report({'ERROR'}, f"Cannot read it: {exc}")
+            return {'CANCELLED'}
+        if not isinstance(data, dict) or data.get('format') != WA.FORMAT:
+            self.report({'ERROR'}, "That is not a Halcyon water file")
+            return {'CANCELLED'}
+
+        folder = _water_library_dir()
+        if not folder:
+            self.report({'ERROR'}, "Cannot reach the preset folder")
+            return {'CANCELLED'}
+        name = os.path.basename(self.filepath)
+        dest = os.path.join(folder, name)
+        stem, ext = os.path.splitext(name)
+        n = 2
+        while os.path.exists(dest) and not os.path.samefile(
+                self.filepath, dest):
+            dest = os.path.join(folder, f'{stem} {n}{ext}')
+            n += 1
+        try:
+            if os.path.abspath(dest) != os.path.abspath(self.filepath):
+                shutil.copyfile(self.filepath, dest)
+        except OSError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+
+        if self.select:
+            try:
+                context.world.halcyon.water_preset = 'FILE:' + dest
+            except TypeError:
+                pass          # the enum has not rebuilt yet; harmless
+        self.report({'INFO'},
+                    f"Added {os.path.splitext(os.path.basename(dest))[0]} "
+                    f"to the preset list")
+        return {'FINISHED'}
+
+
+class HALCYON_PT_passes(HalcyonPanel, Panel):
+    """The extra buffers written alongside the image, for the compositor."""
+
+    bl_label = "Halcyon Passes"
+    bl_context = "view_layer"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        hs = context.scene.halcyon
+        col = layout.column(heading="Data")
+        col.prop(hs, 'pass_depth')
+        col.prop(hs, 'pass_normal')
+        col.prop(hs, 'pass_position')
+        col.prop(hs, 'pass_uv')
+        col.separator()
+        col.prop(hs, 'pass_object_index')
+        col.prop(hs, 'pass_material_index')
+        note = layout.column(align=True)
+        note.active = False
+        note.scale_y = 0.8
+        for line in _wrap("These are data, not pictures: they skip the display "
+                          "chain, the palette and the dither entirely. Blender's "
+                          "own Passes panel is not shown because most of what it "
+                          "lists -- mist, vectors, light components -- is not "
+                          "something this engine produces.", 46):
+            note.label(text=line)
+        if hs.use_processes:
+            box = layout.box()
+            box.scale_y = 0.8
+            box.label(text="Worker Processes send back pixels, not buffers,",
+                      icon='INFO')
+            box.label(text="so a frame with passes on renders in-process.")
+
+
 class HALCYON_PT_world(HalcyonPanel, Panel):
     bl_label = "Halcyon World"
     bl_context = "world"
@@ -1274,6 +1820,24 @@ class HALCYON_PT_world(HalcyonPanel, Panel):
         layout = self.layout
         layout.use_property_split = True
         hs = context.world.halcyon
+
+        # the library is Bryce's, and only means anything under Bryce's sky
+        if hs.mode == 'BRYCE':
+            box = layout.box()
+            box.label(text="Sky Presets", icon='WORLD')
+            box.prop(hs, 'sky_preset', text="")
+            box.operator('halcyon.sky_preset', text="Apply Preset",
+                         icon='CHECKMARK')
+            row = box.row(align=True)
+            op = row.operator('halcyon.sky_save', text="Save As...",
+                              icon='FILE_TICK')
+            op.to_library = False
+            op = row.operator('halcyon.sky_save', text="Add to Library",
+                              icon='ADD')
+            op.to_library = True
+            box.operator('halcyon.sky_load', text="Import Preset...",
+                         icon='IMPORT')
+
         col = layout.column()
         col.prop(hs, 'mode')
         if hs.mode != 'NODES':
@@ -1285,6 +1849,13 @@ class HALCYON_PT_world(HalcyonPanel, Panel):
         if m == 'SOLID':
             col.prop(hs, 'color')
         elif m in ('GRADIENT', 'BANDS', 'BRYCE'):
+            if m == 'BRYCE':
+                col.prop(hs, 'sky_mode')
+                if hs.sky_mode == 'SOFT':
+                    note = col.row()
+                    note.active = False
+                    note.label(text="Horizon comes from the Sun Glow Colour",
+                               icon='INFO')
             col.prop(hs, 'horizon')
             if m == 'BRYCE':
                 col.prop(hs, 'use_sky_mid')
@@ -1392,7 +1963,10 @@ def _wrap(text, width):
 
 CLASSES = (
     HALCYON_OT_apply_preset, HALCYON_OT_set_resolution, HALCYON_MT_resolutions,
-    HALCYON_OT_fix_view_transform, HALCYON_UL_materials,
+    HALCYON_OT_fix_view_transform,
+    HALCYON_OT_sky_preset, HALCYON_OT_sky_save, HALCYON_OT_sky_load,
+    HALCYON_OT_water_preset, HALCYON_OT_water_save, HALCYON_OT_water_load,
+    HALCYON_UL_materials,
     HalcyonPreferences,
     HALCYON_PT_presets, HALCYON_PT_sampling, HALCYON_PT_geometry,
     HALCYON_PT_shading, HALCYON_PT_lighting, HALCYON_PT_spot_cones,
@@ -1403,7 +1977,8 @@ CLASSES = (
     HALCYON_PT_performance, HALCYON_PT_debug,
     HALCYON_OT_clear_palette_cache,
     HALCYON_OT_diagnostics, HALCYON_PT_material,
-    HALCYON_PT_light, HALCYON_PT_world, HALCYON_PT_world_sun,
+    HALCYON_PT_light, HALCYON_PT_wireframe, HALCYON_PT_passes,
+    HALCYON_PT_world, HALCYON_PT_world_sun,
     HALCYON_PT_world_atmosphere, HALCYON_PT_world_cumulus,
     HALCYON_PT_world_stratus, HALCYON_PT_world_effects,
     HALCYON_PT_world_ground,

@@ -154,6 +154,15 @@ DEBUG_PASS = _items(
     ('UV', "UV", ""), ('MATID', "Material ID", ""), ('OVERDRAW', "Overdraw", ""),
     ('WIREFRAME', "Wireframe", ""),
 )
+WIRE_MODE = _items(
+    ('ALL', "All Edges", "Every triangle edge. What a wireframe renderer drew "
+                         "-- and on a dense mesh at a period resolution every "
+                         "pixel is within a pixel of an edge, so the surface "
+                         "fills in solid"),
+    ('CREASE', "Creases & Silhouette",
+     "Only the outline and the edges where the surface turns by more than the "
+     "angle below. Stays a wireframe however many triangles are behind it"),
+)
 BUCKET = _items(('HILBERT', "Hilbert", ""), ('SPIRAL', "Spiral", ""),
                 ('TOP', "Top to Bottom", ""), ('RANDOM', "Random", ""))
 LIGHT_LIMIT = _items(
@@ -190,6 +199,7 @@ ENUMS = {
     'color_management': COLOR_MGMT, 'crt_mask': CRT_MASK,
     'interlace': INTERLACE, 'output_scale': OUTPUT_SCALE,
     'bucket_order': BUCKET, 'debug_pass': DEBUG_PASS,
+    'wire_mode': WIRE_MODE,
     'res_preset': [('CUSTOM', "Custom", "")] +
     [(k, k.replace('_', ' ').title(), f"{v[0]}x{v[1]}")
      for k, v in RESOLUTION_PRESETS.items()],
@@ -232,7 +242,7 @@ RANGES = {
     'jpeg_quality': (1, 100), 'jpeg_passes': (1, 8), 'block_size': (4, 16),
     'tile_size': (16, 1024), 'threads': (0, 64), 'preview_scale': (1, 16),
     'max_texture_memory': (0, 4096), 'seed': (0, 2 ** 30),
-    'wire_width': (0.1, 8.0), 'resolution_x': (1, 16384),
+    'wire_width': (0.1, 8.0), 'wire_angle': (0.0, 180.0), 'resolution_x': (1, 16384),
     'resolution_y': (1, 16384), 'pixel_aspect_x': (0.01, 100.0),
     'pixel_aspect_y': (0.01, 100.0), 'jitter_seed': (0, 2 ** 30),
     'clip_near_epsilon': (1e-6, 1.0), 'decay_start': (0.0, 10000.0),
@@ -262,6 +272,12 @@ LABELS = {
     'color_management': "View Transform", 'crt': "CRT Simulation",
     'composite': "Composite Video", 'jpeg_artifacts': "JPEG Artefacts",
     'output_scale': "Pixel Scale", 'debug_pass': "Render Pass",
+    'render_wire': "Wireframe Overlay", 'wire_width': "Wire Width",
+    'wire_color': "Wire Colour", 'wire_mode': "Edges",
+    'wire_angle': "Crease Angle",
+    'pass_depth': "Depth", 'pass_normal': "Normal",
+    'pass_position': "Position", 'pass_uv': "UV",
+    'pass_object_index': "Object Index", 'pass_material_index': "Material Index",
 }
 
 DESCRIPTIONS = {
@@ -525,7 +541,117 @@ def _col(name, default, desc=''):
                                size=3, default=default, min=0.0, max=1.0)
 
 
+# --------------------------------------------------------------- sky library
+#
+# The bpy-touching half of the sky preset system. `presets/skies.py` stays
+# bpy-free because the renderer reads it; finding the folder Blender keeps
+# user presets in does not belong there.
+
+
+def sky_library_dir():
+    """Where saved skies live, alongside Blender's own presets.
+
+    Never fatal: a build that cannot hand out a scripts folder should cost the
+    saved-sky list, not the whole World panel.
+    """
+    import os
+    try:
+        path = bpy.utils.user_resource('SCRIPTS', path="presets/halcyon_skies",
+                                       create=True)
+    except Exception:                                           # noqa: BLE001
+        return None
+    return path if path and os.path.isdir(path) else None
+
+
+def user_skies():
+    """(path, label) for every sky saved into the library, sorted."""
+    import os
+    out = []
+    folder = sky_library_dir()
+    if not folder:
+        return out
+    try:
+        for name in sorted(os.listdir(folder)):
+            if name.lower().endswith('.halsky'):
+                out.append((os.path.join(folder, name),
+                            os.path.splitext(name)[0]))
+    except OSError:
+        pass
+    return out
+
+
+#: Blender does not keep a reference to the strings an items callback returns,
+#: and a garbage-collected enum item is a corrupted menu. The list is held here
+#: for as long as the property might read it.
+_SKY_ITEMS = []
+
+
+def sky_preset_items(self=None, context=None):
+    from .presets.skies import sky_items
+    items = [(k, label, note) for k, label, note in sky_items()]
+    saved = user_skies()
+    if saved:
+        items.append(('', "Saved Skies", ''))
+        for path, label in saved:
+            items.append(('FILE:' + path, label, "A sky you saved"))
+    _SKY_ITEMS[:] = items
+    return _SKY_ITEMS
+
+
+def water_library_dir():
+    """Where saved waters live. Never fatal, for the same reason as skies."""
+    import os
+    try:
+        path = bpy.utils.user_resource('SCRIPTS', path="presets/halcyon_waters",
+                                       create=True)
+    except Exception:                                           # noqa: BLE001
+        return None
+    return path if path and os.path.isdir(path) else None
+
+
+def user_waters():
+    """(path, label) for every water saved into the library, sorted."""
+    import os
+    out = []
+    folder = water_library_dir()
+    if not folder:
+        return out
+    try:
+        for name in sorted(os.listdir(folder)):
+            if name.lower().endswith('.halwater'):
+                out.append((os.path.join(folder, name),
+                            os.path.splitext(name)[0]))
+    except OSError:
+        pass
+    return out
+
+
+_WATER_ITEMS = []
+
+
+def water_preset_items(self=None, context=None):
+    from .presets.waters import water_items
+    items = [(k, label, note) for k, label, note in water_items()]
+    saved = user_waters()
+    if saved:
+        items.append(('', "Saved Waters", ''))
+        for path, label in saved:
+            items.append(('FILE:' + path, label, "A water you saved"))
+    _WATER_ITEMS[:] = items
+    return _WATER_ITEMS
+
+
 class HalcyonWorldSettings(PropertyGroup):
+    sky_preset: EnumProperty(
+        name="Sky Preset", items=sky_preset_items,
+        description="Pick a sky, then press Apply Preset. Choosing one here "
+                    "does not change anything on its own")
+    water_preset: EnumProperty(
+        name="Water Preset", items=water_preset_items,
+        description="Pick a water, then press Apply Preset. Choosing one here "
+                    "does not change anything on its own. Waters and skies "
+                    "are separate libraries and neither overwrites the other")
+
     mode: EnumProperty(name="Sky", default='NODES', items=_items(
         ('NODES', "Use Node Tree", "Evaluate the world's own shader nodes"),
         ('SOLID', "Solid Colour", "A single flat background colour"),
@@ -560,6 +686,97 @@ class HalcyonWorldSettings(PropertyGroup):
     blend_mode: EnumProperty(name="Blend", default='LINEAR', items=_items(
         ('LINEAR', "Linear", ""), ('SMOOTH', "Smooth", ""),
         ('SHARP', "Sharp", ""), ('EASE', "Ease", "")))
+
+    # ------------------------------------------------------ Bryce's Sky Lab
+    sky_mode: EnumProperty(name="Sky Mode", default='CUSTOM', items=_items(
+        ('SOFT', "Soft Sky",
+         "Bryce's default: the horizon is derived from the sun's glow colour "
+         "and only the dome is set by hand, which is why every Bryce sky "
+         "warmed toward the sun without anybody choosing to"),
+        ('CUSTOM', "Custom Sky", "All three gradient stops set directly")))
+    sun_glow_color: _col("Sun Glow Colour", (1.0, 0.86, 0.62),
+                         "The corona's own colour, which Bryce kept separate "
+                         "from the sun's light colour")
+    shadow_color: _col("Shadow Colour", (0.30, 0.34, 0.45),
+                       "What the shaded side of a cloud is tinted toward")
+    shadow_intensity: FloatProperty(name="Shadow Intensity", default=1.0,
+                                    min=0.0, max=1.0)
+    fog_base_height: FloatProperty(
+        name="Fog Base Height", default=0.0, min=-1.0, max=1.0,
+        description="Where the fog bank starts. Below this it is solid, above "
+                    "it falls away over the fog height")
+    haze_base_height: FloatProperty(
+        name="Haze Base Height", default=0.0, min=-1.0, max=1.0,
+        description="Where the haze starts. The Sky Lab has this and the Sky "
+                    "& Fog palette does not")
+    fog_blend_sky: FloatProperty(name="Fog Blend With Sky", default=0.0,
+                                 min=0.0, max=1.0)
+    fog_sun_tint: FloatProperty(name="Fog Blend With Sun", default=0.0,
+                                min=0.0, max=1.0)
+    color_perspective: FloatProperty(
+        name="Colour Perspective", default=0.0, min=0.0, max=4.0,
+        description="How fast distance takes the haze colour. Bryce applied "
+                    "this to everything in the scene, not only to the sky")
+    volumetric_world: FloatProperty(
+        name="Volumetric World", default=0.0, min=0.0, max=4.0,
+        description="Shafts of sunlight through the atmosphere, which in Bryce "
+                    "was the render-time setting nobody left on by accident")
+    cloud_frequency: FloatProperty(
+        name="Frequency", default=1.0, min=0.05, max=16.0,
+        description="How tight the cloud pattern is. Bryce's own control name")
+    cloud_amplitude: FloatProperty(
+        name="Amplitude", default=1.0, min=0.0, max=4.0,
+        description="How far the pattern swings either side of the cover "
+                    "threshold -- which separates billows without changing how "
+                    "much sky is covered")
+    cloud_turbulence: FloatProperty(name="Turbulence", default=1.0, min=0.05,
+                                    max=2.0)
+    spherical_clouds: BoolProperty(
+        name="Spherical Clouds", default=True,
+        description="On, clouds stay puffy out to the horizon; off, they "
+                    "stretch into streaks, which is what the switch did")
+    link_clouds_to_view: BoolProperty(
+        name="Link Clouds to View", default=True,
+        description="Keep the cloud pattern fixed relative to the camera, so "
+                    "moving does not change which clouds are where. Turn it "
+                    "off for real parallax -- but note that Cloud Height is a "
+                    "dome parameter rather than a distance, so a low deck "
+                    "slides a long way for a small move")
+    fixed_cloud_plane: BoolProperty(name="Fixed Cloud Plane", default=True)
+    stratus_frequency: FloatProperty(name="Stratus Frequency", default=1.0,
+                                     min=0.05, max=16.0)
+    stratus_amplitude: FloatProperty(name="Stratus Amplitude", default=1.0,
+                                     min=0.0, max=4.0)
+    moon_softness: FloatProperty(
+        name="Softness", default=0.05, min=0.0, max=1.0,
+        description="How hard the terminator is across the moon's disc")
+    comets: FloatProperty(
+        name="Comet Intensity", default=0.0, min=0.0, max=4.0,
+        description="Bryce put comets in the Celestial tab, and they are the "
+                    "reason its night skies were never just a starfield")
+    comet_count: IntProperty(name="Comets", default=3, min=1, max=32)
+    comet_speed: FloatProperty(
+        name="Comet Speed", default=0.05, min=0.0, max=4.0,
+        description="How fast each comet runs around its own great circle, in "
+                    "radians of sky per second. At zero they stand still, as "
+                    "they used to. They all start where a still frame puts "
+                    "them, so turning this up never empties the first frame")
+    comet_length: FloatProperty(
+        name="Tail Length", default=0.10, min=0.005, max=1.5,
+        description="How far the tail reaches behind the head, as a fraction "
+                    "of the sky. Each comet varies either side of it")
+    comet_width: FloatProperty(
+        name="Tail Width", default=0.006, min=0.0005, max=0.2,
+        description="How wide the tail is at the head. It flares out from "
+                    "there and dims as it goes, which is the shape a comet's "
+                    "dust tail actually has")
+    comet_tail_sun: FloatProperty(
+        name="Tail Direction", default=0.6, min=0.0, max=1.0,
+        description="0 trails the comet's own path, the way a dust tail does; "
+                    "1 points straight away from the sun, the way an ion tail "
+                    "does. Real comets show both at once, so the truth is in "
+                    "between")
+    comet_color: _col("Comet Colour", (1.0, 0.96, 0.88))
 
     sun_elevation: FloatProperty(name="Sun Altitude", default=0.35,
                                  min=-1.5708, max=1.5708, subtype='ANGLE')
@@ -727,6 +944,55 @@ class HalcyonWorldSettings(PropertyGroup):
         description="How far the plane reaches before it has faded into the "
                     "horizon. Without this it reads as a flat sheet rather "
                     "than as ground going away")
+    ocean_wind_angle: FloatProperty(name="Wind Direction", default=0.6,
+                                    min=-6.2832, max=6.2832, subtype='ANGLE',
+                                    description="Waves run mostly with the wind")
+    ocean_spread: FloatProperty(
+        name="Spread", default=0.6, min=0.0, max=1.0,
+        description="How far the shorter waves fan off the wind. 0 is a "
+                    "regular swell, 1 is confused chop")
+    ocean_wave_scale: FloatProperty(
+        name="Wave Size", default=1.0, min=0.02, max=500.0, soft_min=0.05,
+        soft_max=40.0, subtype='DISTANCE', unit='LENGTH',
+        description="The length of the longest wave train, crest to crest. "
+                    "The shorter trains are fractions of it, so this sets the "
+                    "size of the whole sea at once. It no longer multiplies "
+                    "the ground Scale, which is the chequerboard's and has "
+                    "nothing to do with water")
+    ocean_detail: IntProperty(name="Wave Detail", default=5, min=1, max=10,
+                              description="How many wave trains are summed")
+    ocean_sparkle: FloatProperty(
+        name="Horizon Shimmer", default=1.0, min=0.0, max=1.0,
+        description="Where a pixel covers many waves, take the sample from a "
+                    "random point inside it rather than its centre. Sampling "
+                    "the centre makes the wave trains beat against the pixel "
+                    "grid and fills the distance with moire fringes; this "
+                    "turns the same detail into the fine shimmer a Bryce "
+                    "ocean has. Turn it down to see the fringes")
+    ocean_horizon_smooth: FloatProperty(
+        name="Horizon Smoothing", default=0.0, min=0.0, max=1.0,
+        description="Fades out waves too small for a pixel to draw cleanly. "
+                    "Bryce did none of this -- its water kept every wave to "
+                    "the horizon and compressed them into a band of shimmer, "
+                    "which is what its pictures look like. Turn this up for "
+                    "smoother distant water, at the cost of it going to glass")
+    ocean_deep: _col("Deep Colour", (0.03, 0.09, 0.13))
+    ocean_shallow: _col("Shallow Colour", (0.06, 0.22, 0.26))
+    ocean_glitter: FloatProperty(
+        name="Sun Glitter", default=1.0, min=0.0, max=16.0,
+        description="The sun's reflection smeared down the wave slopes. Waves "
+                    "too small to draw widen the path rather than vanishing, "
+                    "which is what makes it spread toward the horizon")
+    ocean_glitter_size: FloatProperty(name="Glitter Width", default=0.45,
+                                      min=0.01, max=4.0)
+    ocean_foam: FloatProperty(
+        name="Foam", default=0.0, min=0.0, max=1.0,
+        description="Off by default: Bryce had no foam control, and adding one "
+                    "unasked would be inventing a feature it did not have")
+    ocean_foam_color: _col("Foam Colour", (0.92, 0.95, 0.96))
+    ocean_transparency: FloatProperty(name="Transparency", default=0.25,
+                                      min=0.0, max=1.0)
+
     ocean_choppiness: FloatProperty(name="Choppiness", default=0.35, min=0.0,
                                     max=4.0)
     ocean_speed: FloatProperty(name="Wave Speed", default=1.0, min=0.0, max=16.0)

@@ -157,6 +157,19 @@ def unregister_class(cls):
 utils.register_class = register_class
 utils.unregister_class = unregister_class
 
+
+def user_resource(kind, path='', create=False):
+    # Blender's own scripts folder. The stub keeps it out of the way, in temp.
+    import os
+    import tempfile
+    base = os.path.join(tempfile.gettempdir(), 'halcyon-fake-scripts', path)
+    if create:
+        os.makedirs(base, exist_ok=True)
+    return base
+
+
+utils.user_resource = user_resource
+
 app = types.SimpleNamespace(version=(5, 2, 0), background=True)
 class _Collection:
     def __init__(self, factory=None):

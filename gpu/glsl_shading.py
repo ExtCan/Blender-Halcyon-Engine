@@ -133,7 +133,13 @@ float hal_diffuse_toon(float ndl, float size, float smoothness, float steps)
     float ang = acos(clamp(nl, 0.0, 1.0)) / (3.14159265 * 0.5);
     float lim = clamp(1.0 - size, 0.0, 1.0);
     float sm = max(smoothness, 1e-4);
-    return clamp((lim + sm - ang) / sm, 0.0, 1.0);
+    float edges = max(floor(steps + 0.5) - 1.0, 1.0);
+    float acc = 0.0;
+    for (int i = 1; i <= 16; i++) {
+        if (float(i) > edges) break;
+        acc += clamp((lim * (float(i) / edges) + sm - ang) / sm, 0.0, 1.0);
+    }
+    return acc / edges;
 }
 """
 

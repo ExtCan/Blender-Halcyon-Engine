@@ -4,6 +4,680 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
 
 ---
 
+## [1.24.0] — 2026-07-29
+
+### Added — the comets move
+
+Bryce put comets in the Celestial tab and Halcyon drew them, but they were
+nailed to the sky: the same streak in the same place on every frame of an
+animation. Each one now runs around a great circle of its own at **Comet
+Speed**, at its own pace, off the scene's own clock — so the same frame number
+gives the same sky on any machine that renders it. They all start where a still
+frame put them, so turning the speed up never empties frame one.
+
+Four more controls came with it, because everything about them had been a
+hard-coded random number: **Tail Length**, **Tail Width**, **Comet Colour**,
+and **Tail Direction**. That last one is the interesting one. A comet's ion
+tail is blown straight away from the sun and its dust tail trails its own path,
+so the two disagree and the honest answer is a mix; the slider is that mix.
+Which matters more than it sounds, because the sun vector had been an argument
+of the comet function since the day it was written and was **never once read** —
+the tails pointed wherever the random number generator sent them, including at
+the sun.
+
+### Fixed — comets were drawn as lines, not comets
+
+The streak was bounded at the far end only, so it ran on *in front of* the head
+as far as a cosine falloff allowed — around forty degrees of sky. Two of them
+crossing drew a plus sign. A comet is now a compact coma at the head with a
+tail behind it and nothing in front, and the tail flares and dims as it goes,
+which is the shape a dust tail actually has.
+
+### Added — 20 water presets, and a library to keep them in
+
+Bryce kept its waters in the Materials Library under **Waters & Liquids**, and
+dropping one onto the water plane was how a Bryce picture got its sea. The
+infinite ocean now has the same thing, built the same way as the sky library:
+a dropdown, an explicit **Apply Preset**, *Save As...*, *Add to Library* and
+*Import Preset...*, in a `.halwater` file that is a flat dict of field names
+and so still loads when a later version adds fields to it.
+
+The twenty: **Bryce Water**, then the tropics — **Caribbean Resort**,
+**Tropical Shallows**, **Calm Lagoon**, **Mediterranean**; the open water —
+**Open Ocean**, **Rolling Swell**, **Choppy Bay**, **Deep Atlantic**,
+**Storm Swell**, **Arctic Sea**; inland — **Millpond**, **Mountain Lake**,
+**Swimming Pool**, **Black Lagoon**, **Glacial Melt**; and light on water —
+**Moonlit Water**, **Sunset Ocean**, **Liquid Mercury**, **Alien Sea**.
+
+Same honesty as the skies. Two things here are Bryce's and are used
+deliberately: the category name *Waters & Liquids*, and **Caribbean Resort**,
+which a period tutorial places second along the top row of it. Every other name
+is the obvious name for the thing rather than a claim about what Bryce shipped,
+and all twenty are waters built out of Halcyon's own controls. No test passes
+unless every one of them applies, renders, survives a save and a load exactly,
+and lands on a different picture from all the others.
+
+### Fixed — picking a sky threw your water away
+
+The sky library reset *every* World field it did not explicitly exclude, and
+the infinite plane was not excluded. Applying a sky therefore silently returned
+the water to defaults — colour, waves, glitter, all of it — which is a hard
+thing to notice and a harder one to explain. The two libraries now own disjoint
+halves of the World and a test fails if that ever stops being true, so a sky
+cannot touch the water and a water cannot touch the sky.
+
+### Changed — skylight on water multiplies instead of adding
+
+Water is lit by the whole sky and not only by what it mirrors, or the troughs
+go black. That contribution was being *added* as a flat fraction of the zenith
+colour, which made it a floor: the darkest waters could not be dark, and a
+black lagoon under a blue sky came out the same mid blue as everything else. It
+now multiplies the body colour, because what comes back up is skylight the
+water scattered and water that scatters nothing returns nothing. Mid-tone water
+lands within a few percent of where it was; dark water is finally dark.
+
+---
+
+## [1.23.1] — 2026-07-29
+
+### Fixed — the waves stopped before the horizon
+
+Reported against 1.23.0, and correctly: the water still lost its waves with
+distance, and the ocean's own Distance Fade would not bring them back because
+that is haze and this was not.
+
+It was the Nyquist fade. A wave narrower than the pixel it lands in cannot be
+drawn cleanly, only aliased, so it was being faded out — which is what a modern
+renderer does and is why distant water goes smooth. Bryce did none of it. Its
+ocean was a procedural water material on an infinite plane, evaluated per pixel
+with nothing filtering it, so the waves ran all the way to the horizon and
+compressed into a band of shimmer instead of flattening into glass. That
+shimmer is not an artefact of the reproduction, it is what the pictures look
+like, and smoothing it away is the less accurate of the two options.
+
+**So the fade is off.** It is now a control — *Horizon Smoothing*, defaulting
+to zero — for anyone who wants the smooth version, and everything it removes
+still goes into widening the glitter path and roughening the reflection as
+before. At zero, which is the default, every wave train is drawn at every
+distance.
+
+### Added — Horizon Shimmer
+
+Keeping the waves to the horizon exposed the reason the fade was there. Where
+one pixel covers many wavelengths, sampling the middle of it makes the wave
+trains beat against the pixel grid, and the far water fills with moiré fringes:
+regular, diagonal, and unmistakably a rendering artefact rather than a sea.
+Bryce did not have them, because a noise field undersampled gives speckle and
+a sine wave undersampled gives fringes.
+
+*Horizon Shimmer* takes the sample from a fixed random point inside the pixel
+rather than its centre. The contrast is untouched — the water is neither
+brighter nor darker, and a still frame renders identically twice — the detail
+is only decorrelated between neighbours, so the same waves read as the fine
+shimmer a Bryce ocean has. On by default; turn it down to see the fringes it
+is replacing.
+
+---
+
+## [1.23.0] — 2026-07-29
+
+### Fixed — text objects took the whole frame down
+
+Adding a text object to a scene killed the render. Blender hands a *mesh*
+object geometry the depsgraph already owns, so freeing the conversion
+afterwards frees nothing and the old export ordering — convert every object,
+then read them all — got away with it for the entire project. Text, curves,
+surfaces and metaballs are different: they *build* a temporary mesh, and the
+next conversion of the same object destroys the last one. The first object
+that is not a mesh is therefore the first object that could ever hit it, and
+reading freed geometry is a crash rather than an exception.
+
+The conversion now happens one object at a time and each temporary is released
+on the way to the next, which is the only ordering that is safe for all five
+types. It also stops the exporter holding every converted mesh in memory at
+once, which a heavy scene was paying for.
+
+Three things around it, so that this class of fault cannot cost a frame again:
+
+- **One object that will not convert is now skipped, not fatal.** It is named
+  in the Blender info bar and its traceback goes to the console, and the rest
+  of the scene renders. Losing an object is a problem; losing the frame and
+  being told nothing about which object did it is a worse one.
+- **A text object with no faces says so.** The most common reason text is
+  invisible is that it converted to outlines — no Fill Mode, no extrude — and
+  Halcyon now names the object and says which setting to reach for instead of
+  rendering an empty picture.
+- **Grease pencil, hair curves, point clouds and volumes are named as
+  unsupported** rather than silently missing from the render.
+
+### Fixed — the ocean's waves could not be made smaller
+
+Two faults, and between them they cut most of the wave trains out of every
+picture: what was left read as a few big smooth swells near the camera and
+glass everywhere beyond them, and turning Wave Scale down pushed the rest
+under the same cut and flattened the sea entirely.
+
+**The pixel footprint was a guess.** Waves smaller than the pixel they land in
+can only alias, so they are faded out — the right thing to do, but it was being
+measured against a hard-coded 0.002 radians per pixel that nothing ever wrote.
+A 1080-row frame at a 50 mm lens is 0.0006, and half that again at 4x
+supersampling. The number is now taken from the actual projection and the
+actual rendered height, so a frame rendered larger resolves finer water, which
+is what it should always have done.
+
+**And it was measured along the wrong axis.** A ray that grazes the water is
+stretched a long way *along* the view but stays narrow *across* it, and a wave
+train running across the view is perfectly resolvable at that distance. Taking
+the long axis over-blurred by a further ten times near the horizon. It now uses
+the area-equivalent square, which is what a pixel actually covers.
+
+Together, at sixty metres out: one wave train survived before, four of five do
+now.
+
+**What still cannot be drawn now roughens the water instead of vanishing.**
+Slope too fine to resolve is still slope — it scatters what the water mirrors
+rather than reflecting it cleanly. That already widened the sun's glitter path;
+it now also softens the reflection toward the colour of the sky at the horizon,
+so distant water reads as water seen from far away rather than as a sheet of
+glass.
+
+### Changed — Wave Scale is now Wave Size, and it is a length
+
+It used to be a multiplier on the ground plane's **Scale** — the size of the
+chequerboard squares, which is not drawn under water and has nothing to do with
+it — so the same value meant a different sea in every scene. It is now the
+length of the longest wave train, crest to crest, in metres, and nothing else
+feeds into it. The range runs from 2 cm to 500 m.
+
+Existing scenes will find their water about half the size it was at the default
+ground Scale of 2; set Wave Size to twice its current value to get exactly what
+you had. The foam speckle follows the wave size now too, rather than the
+chequerboard.
+
+### Changed — wave trains no longer start in step
+
+Every train began at phase zero, so they all peaked together at the world
+origin and the sea read as corrugated iron. Each train now starts wherever the
+sky's seed puts it. It was invisible while the waves were too big to see and
+obvious the moment they were not.
+
+---
+
+## [1.22.1] — 2026-07-29
+
+### Changed — the sky library asks before it acts
+
+Three things about the preset system, all of them about not doing anything you
+did not ask for.
+
+**The library only appears under the Bryce sky.** It was always Bryce's
+library — every field it writes is a Sky Lab field — but it sat in the panel
+under Solid and Gradient and Physical too, offering to load skies that those
+modes have no way to show. It is now drawn only when the sky mode is Bryce, and
+it no longer switches the mode out from under you when you apply something.
+
+**Picking and applying are two separate acts.** The presets are now a dropdown
+that only holds a selection, plus an **Apply Preset** button that writes it into
+the world. Scrolling through the list to read the names no longer rewrites your
+sky forty-three times on the way past. The dropdown lists the built-in skies
+first and any you have saved to the library underneath, under a *Saved Skies*
+heading.
+
+**Import Preset adds a file to the library and stops there.** The old Load File
+button read a `.halsky` off disk and immediately applied it. It now copies the
+file into your sky library, selects it in the dropdown, and leaves the world
+alone — press Apply Preset when you actually want it. If a file of that name is
+already in the library the copy is given a numbered name rather than replacing
+what is there, and the file is checked for being a Halcyon sky *before* anything
+is written to disk, so a wrong pick leaves no trace.
+
+---
+## [1.22.0] — 2026-07-29
+
+### Added — 19 more skies, 43 in total
+
+Six asked for by name in pink and purple, thirteen more built from names alone.
+
+**Rose Tinted Glasses** — everything a shade warmer and kinder than it was,
+with the haze in on it. **Valentines** — red at the horizon into rose into deep
+pink, the clouds catching all of it. **In The Land of Vapor** — pink one way
+and cyan the other, pastel and soft-edged. **Vaportrails** — high thin streaks
+pulled right across a lilac sky and nothing below them, which is the stratus
+deck squashed to five and sharpened. **Synthetic Wonderworld** — hot magenta at
+the deck, indigo overhead, one enormous low sun; the airbrush school, rendered.
+**See It To Believe It** — a sky nobody would accept as a photograph: magenta
+banding, a corona too wide for its sun, and a bow over the top.
+
+Then: **Afterlife Day** and **Afterlife Night** as one place twice, the day
+blown out and lilac-shadowed, the night a violet dark that glows rather than
+falls. **Alien Planet** — violet air over a teal horizon and a small hard white
+sun, kept distinct from the existing green Alien Sky. **Abstract Movie** — flat
+saturated bands and clouds with no soft edge left in them; a title sequence
+rather than a place. **Old Age Photograph** and **Stone Age Photograph** — sepia
+and low contrast, then older and colder, a plate rather than a print. **Amber
+Lamps** — sodium light on the underside of a low overcast and no sky past it.
+**Sapphire Imagination** — jewel blue all the way down, lit from inside. **Beyond
+The Rainbow** — past where the colours stop making sense, a full bow and a
+secondary and a sky already doing the same thing. **Halloween** — a big low
+orange moon with ragged cloud crossing it. **Christmas** — cold blue dusk over
+snow, the light going and the first stars up. **Easter** — pastel and evenly
+lit, the sky as a sugared egg. **Crystal Stars** — air with nothing in it, every
+star out and a violet wash where the sun went.
+
+### Note on the tuning
+
+Five of them came out of the first pass as white paper. The cause was the same
+each time and it is worth writing down: **haze density above about 0.6 with a
+blend toward the sky will eat any gradient underneath it.** A pastel sky and a
+heavy haze are the same instruction twice, and the haze wins. They were retuned
+by pulling the haze back to where the dome could be seen through it, not by
+darkening the colours.
+
+The test that no two skies land on the same picture now runs over 43 of them,
+which is 903 pairs and the point at which that test starts being worth having.
+
+---
+
+## [1.21.0] — 2026-07-29
+
+### Added — a sky library, and a file format for skies
+
+Bryce's Sky & Fog palette kept a library of skies and a row of memory dots to
+drop them onto, and half of using Bryce was starting from one of those and
+pushing it somewhere. A Sky Lab with sixty controls and no library is a Sky Lab
+nobody opens twice.
+
+**24 skies**, in the World panel under *Sky Presets*: Bryce Default, Dawn,
+Sunrise, Morning Haze, High Noon, Desert Noon, Tropical Afternoon, Golden Hour,
+Sunset, Dusk, Moonlit Night, Deep Night, Clear Blue, Mackerel Sky, Overcast,
+Storm Front, Fog Bank, After the Rain, Sun Through Cloud, Mars, Alien Sky, Ice
+World, Ashfall and Deep Space.
+
+Each is built out of the Sky Lab's own controls, so every one of them is also a
+worked example of what those controls do together — Deep Night is the Celestial
+tab with everything on, Sun Through Cloud is Volumetric World, Fog Bank is the
+fog base height doing the thing base heights are for.
+
+**Save Sky** writes a `.halsky` file, **Add to Library** drops one into
+Halcyon's own preset folder so it appears in the list beside the built-in ones,
+and **Load File** reads one back. The format is a flat JSON dict of field names
+to values, which is not laziness: a sky saved by a later version still loads
+here, minus whatever fields this version has never heard of, and it says how
+many it had to leave out rather than failing or lying.
+
+A sky file carries the sky and nothing else. Node trees, image datablocks, the
+world's Strength and the render-side mist settings are excluded by name, and a
+test asserts none of them ever appears in a saved file.
+
+### What these presets are, and are not
+
+They are skies built to Bryce's controls and tuned to the conditions they are
+named for. **They are not Bryce's own preset files.** Those shipped inside the
+application, there is no published list of them, and I could not verify one —
+so presenting these as Bryce's would be a claim I cannot back. Where a name is
+one Bryce itself used for a category — dawn, storm, alien — it is used here
+because it is the obvious name for the thing, not because the numbers came from
+Bryce.
+
+### The tests
+
+Applying every sky and looking at the contact sheet is how they were tuned, but
+it is not what is asserted. Three things are: every preset applies and renders
+finite; **no two of them land on the same picture**, which is how a copy-paste
+in a library of twenty-four would otherwise go unnoticed; and every one
+survives a save and a load with every field unchanged. Plus the awkward cases —
+a file from a later version, a file that is not a sky, a file that is not JSON —
+each refused or handled rather than half-applied.
+
+Presets also reset before they apply, for the same reason the render presets
+do: without it they accumulate, and the tenth sky you try is nine skies deep. A
+test applies Ashfall, then Clear Blue, and checks the result is field-for-field
+identical to Clear Blue on a fresh world.
+
+---
+
+## [1.20.1] — 2026-07-29
+
+### Fixed — the clouds raced when the camera moved
+
+Reported straight after 1.20.0. Two things were wrong and they compounded.
+
+**Link Clouds to View shipped defaulting to off.** That control exists to stop
+the cloud pattern changing as the camera moves, and Halcyon's behaviour before
+1.20.0 was equivalent to having it on. Shipping it off silently switched every
+scene to world-locked clouds. It is on by default now, which restores exactly
+what the sky did before — a camera at any position gets a **bit-identical**
+sky, and that is what the test asserts, because a sky that does not depend on
+the camera cannot depend on it a little.
+
+Worth naming why "the camera rotates" was enough to trigger it: orbiting a
+viewport *translates* the eye around a pivot. It reads as a rotation and it is
+a move.
+
+**And the parallax was unweighted.** The camera offset was added flat to the
+dome projection, so the whole sky slid — the horizon along with everything
+else. A cloud overhead is at the deck's height and genuinely swings past you as
+you move; a cloud on the horizon is effectively at infinity and does not move
+at all. The offset is now weighted by how steeply the ray looks, so parallax is
+greatest overhead and vanishes at the horizon. Measured on the same camera
+move: 0.121 overhead against 0.024 at the horizon, where before it was uniform.
+
+There is a second-order reason the old behaviour was so violent. Cloud Height
+is a *dome parameter*, not a distance — the default is 1.0 — so world-locking
+against it means a one-unit camera move is a whole deck-height of parallax.
+That is geometrically right and practically useless, and it is now said in the
+control's own tooltip.
+
+### Fixed — the water reflected a sky the camera was not under
+
+The ocean evaluated the sky for its reflection from the origin, while the sky
+above the horizon was evaluated from the camera. With camera-dependent clouds
+switched on, the two disagreed: the water mirrored a sky that was not there.
+The camera position is carried through to the reflection now.
+
+---
+
+## [1.20.0] — 2026-07-29
+
+### Added — the Sky Lab's own controls, under the Sky Lab's own names
+
+Thirty-two more world settings, taken from what Bryce's Sky & Fog palette and
+Sky Lab actually shipped rather than from what seemed useful. Where Bryce had a
+name for something, that is the name it has here.
+
+**Sky Mode.** Bryce's palette offered Soft Sky and Custom Sky. Custom is the
+three gradient stops as set. Soft derives the horizon from the sun's own glow
+colour and leaves only the dome to the user, which is why every default Bryce
+sky warmed toward the sun without anybody choosing to make it.
+
+**Sun Glow Colour** as its own swatch, separate from the sun's light colour —
+Bryce kept them apart and the corona takes the glow one. **Shadow Colour** and
+**Shadow Intensity**, which tint the shaded side of a cloud. **Softness** on the
+moon's terminator, next to the phase, because a hard one reads as a cut-out and
+a soft one as a sphere.
+
+**Comets**, with an intensity and a count. They were in the Celestial tab and
+they are the reason a Bryce night sky was never just a starfield: each is a
+great-circle streak with a bright head and a tail that thins along it.
+
+**Frequency, Amplitude and Turbulence** on both cloud decks, which are Bryce's
+three cloud controls under Bryce's three names. Amplitude is the interesting
+one — it swings the noise about the *cover threshold* rather than about zero,
+so raising it separates the billows without changing how much sky is covered,
+which is exactly what the control did.
+
+**Spherical Clouds**, **Link Clouds to View** and **Fixed Cloud Plane**. The
+first rolls the dome projection off toward a sphere so clouds stay puffy at the
+horizon instead of smearing into streaks. The second keeps the pattern still as
+the camera moves. The third measures the deck's height from the camera rather
+than the ground, so climbing never puts you inside it.
+
+**Base Height** for fog and for haze, and **Blend With Sun** and **Blend With
+Sky** for fog as well as haze — the Sky Lab's Atmosphere tab has all four, and
+the base height is what lets a fog bank sit above the camera instead of always
+hugging zero.
+
+**Colour Perspective**, the rate at which distance takes the haze colour, and
+**Volumetric World**, which lights the haze along the rays that reach the sun
+through a break in the deck. The shafts are proportional to the haze that is
+actually there — a shaft needs something to scatter off, and without that the
+control just floods the frame, which is what the first attempt did.
+
+### Fixed — the sky was stacked in the wrong order
+
+Bryce's Sky Lab layers in a fixed order and the order is half of why a Bryce sky
+reads as one. Halcyon had stars composited *over* the cloud decks, and haze
+applied *before* them — so stars shone through solid cloud, and clouds at the
+horizon stayed crisp against a sky that had hazed over behind them.
+
+It now goes: sky dome, then everything beyond the atmosphere (stars, comets,
+the sun or moon), then the cloud decks in front of those, and the atmosphere
+last, because haze and fog are between the viewer and all of it. Two tests
+check it rather than a picture: a solid deck must reduce the variance of the
+pixels that had stars in them, and haze must dim the clouds and not only the
+sky behind them.
+
+### Added — the ocean, rebuilt
+
+The old water crossed four sine trains at fixed angles, which reads as
+corrugation. Real waves run mostly *with* the wind, with the shorter ones fanned
+out either side of it, so there is now a **Wind Direction** and a **Spread**:
+zero gives a regular swell, one gives confused chop. **Wave Detail** sets how
+many trains are summed and **Wave Scale** their base size.
+
+**Sun Glitter** is the piece that was missing, and it is what makes a Bryce
+water picture. It is not a highlight on a plane — it is the sun found in the
+*distribution* of wave normals, so it widens with the chop and tightens as the
+water calms.
+
+Which leads to the part worth writing down. Waves smaller than the pixel they
+land in cannot be drawn, only aliased, so they are faded out with distance —
+and fading them to nothing is what turns distant water into glass. **A wave too
+small to draw still tilts the water inside its pixel.** So the slope that gets
+faded out is measured and folded into the glitter's width instead: the
+highlight broadens toward the horizon rather than disappearing, which is the
+glitter path spreading away from you across the water.
+
+Also **Deep** and **Shallow** colours with the path length between them,
+**Transparency**, and an optional **Foam** on the crests. Foam is off by
+default and says so in its tooltip: Bryce had no foam control, and adding one
+unasked would be inventing a feature it did not have.
+
+### On "1 to 1"
+
+It is worth being straight about this. Without Bryce's source there is no way
+to be bit-identical to it, and anything claiming otherwise would be guessing
+with confidence. What this is: every control the Sky Lab and the Sky & Fog
+palette are documented as having, under the same names, grouped into the same
+tabs, layered in the same order, each one doing what the documentation says it
+does. Where a control's *internal* formulation is not documented — cloud
+amplitude, the glitter's width, the shaft falloff — the behaviour is
+reconstructed from what the control is described as doing and tuned by eye
+against Bryce output, and those are the places this is a faithful
+reconstruction rather than a copy.
+
+A test perturbs all thirty-two new controls one at a time and fails if any of
+them leaves the picture unchanged. Four of them did, on the first pass.
+
+---
+
+## [1.19.0] — 2026-07-29
+
+Reported: the Wireframe model and the render passes still do not work. Both
+were fixed in 1.18.0 by reasoning rather than by reproducing, and reasoning
+lost. This release is mostly about not doing that again.
+
+### Added — a fake Blender the add-on can actually be run against
+
+`tests/fakebpy.py` proved the modules import and register. It caught typos and
+bad enum defaults, and it caught nothing whatever about whether the engine
+works, because the engine was never executed: **six bugs shipped through it in
+a row**, every one a control wired up at one end and not the other.
+
+`tests/fakeblender.py` goes one level further. It builds a scene — an object
+with a real mesh, a material with a node tree, a light and a camera — hands it
+to `HalcyonRenderEngine.render()` through a fake depsgraph, and captures what
+comes back out of `begin_result`. That is the whole path: the property group,
+`to_settings`, the exporter, the renderer, the post chain, the delivery, the
+passes.
+
+It is not Blender and never will be; it cannot catch a segfault, a driver quirk
+or an RNA lifetime bug. What it catches is the thing that kept getting through:
+a setting that never arrives.
+
+The first thing it did was render every pass in the dropdown through the real
+engine and show all six of them arriving correctly — which is a finding, even
+though it is not the one that was wanted. See the note at the end.
+
+### Fixed — the Wireframe fill, which was arithmetic rather than a bug
+
+Reproduced at last, and it is worth stating plainly because it is not what it
+looked like. Measured at 120x90:
+
+| triangles | pixels per triangle | fraction of the object drawn as wire |
+|---|---|---|
+| 32 | 169 | 20% |
+| 288 | 19 | 43% |
+| 1,152 | 4.7 | 52% |
+| 3,200 | 1.7 | **53% — the whole object** |
+
+Once triangles are a couple of pixels across, **every** pixel is within a wire
+width of an edge, so a wireframe of every triangle edge *is* a solid fill. No
+width setting escapes that; it is the same arithmetic that made the wire look
+broken on a dense mesh and fine on a cube.
+
+Three things came out of it:
+
+**Creases & Silhouette.** A new wire mode that keeps only the outline and the
+edges where the surface actually turns by more than a set angle. It is one
+pixel wide however many triangles are behind it — measured at 1.9% of the frame
+on the same object at 32, 288, 3,200 and 12,800 triangles, a spread of nothing.
+All Edges stays the default, because that is what these renderers did.
+
+**Wire Size, reachable.** It was exported only inside the material-override
+branch, and a material shaded as Wireframe by a Halcyon Shader *node* never
+goes through that branch — so its wire width was stuck at the default with no
+control anywhere in the interface that could change it. It is now on the shader
+node, shown when the model is Wireframe, and read from there.
+
+**A Wireframe panel.** `render_wire`, `wire_width` and `wire_color` had no
+panel at all: three settings the renderer read and nothing could set. Render
+Properties ▸ Shading ▸ Wireframe.
+
+### Changed — the edge distance is computed, not estimated
+
+The screen-space distance to a triangle's edge came from a finite difference of
+the barycentrics. It is now solved directly from the triangle's own projected
+vertices: for a point with barycentrics l0,l1,l2 in a triangle of screen area
+A, the distance to the edge opposite corner i is `|l_i| * 2A / |e_i|`. Exact,
+at any triangle size, at any resolution, with no neighbouring pixels involved
+at all — which removes the entire class of failure the previous two attempts
+were chasing.
+
+### Note — the render passes
+
+Every render pass in the Debug panel's dropdown is produced correctly through
+the full engine path in the new harness: with each of four presets applied,
+with the GPU device selected, with worker processes on, at 4x supersampling and
+at 3x pixel scale. I could not reproduce the failure, and I would rather say
+that than ship a third fix I cannot verify.
+
+So this release makes the next report conclusive instead. Every render now
+prints its version, the requested pass and the wire mode to the system console:
+
+    [Halcyon] 1.19.0 rendering 1920x1080  pass=DEPTH  wire=ALL
+
+and **Print Halcyon Diagnostics** now reports the version and package name, the
+pass the renderer received, which materials resolve to Wireframe with their
+wire sizes, and how many pixels a triangle covers — the number that decides
+whether All Edges can draw a wire at all.
+
+If that banner says a version older than this one, Blender is running a
+different build from the one installed, and that alone would explain two fixes
+appearing to do nothing.
+
+---
+
+## [1.18.0] — 2026-07-28
+
+Four bugs reported from real use in Blender, and the two more that turned up
+while chasing them. Every one of them is the same shape: a control that was
+wired up at one end and not the other.
+
+### Fixed — the render passes were one pass
+
+Halcyon force-enabled Blender's own **View Layer ▸ Passes** panel and then
+wrote exactly one pass into the render result. Every checkbox in it was a
+control that did nothing, and the compositor read black for all of them.
+
+Now there is a **Halcyon Passes** panel in View Layer Properties offering the
+six this engine can genuinely fill — **Depth, Normal, Position, UV, Object
+Index, Material Index** — declared to Blender through `update_render_passes`
+and written alongside Combined. They use Blender's own names and channel
+layouts, so a Halcyon Z pass drops into a comp built for Cycles without
+rewiring.
+
+Blender's panel is no longer forced on. It lists mist, vectors, denoising data
+and the light-component passes, none of which this engine produces, and showing
+controls that do nothing is the exact thing `EXCLUDED_PANELS` exists to
+prevent.
+
+These are data, so they skip the display chain, the palette and the dither
+entirely, and at 4x supersampling they take one sample per output pixel rather
+than an average — averaging a normal or an object index produces a value that
+was never on any surface.
+
+The worker pool sends pixels back through its pipes, not buffers, so a frame
+with passes enabled renders in-process and says so on the console rather than
+quietly dropping them.
+
+### Fixed — the depth buffer was never a distance
+
+Found while writing the Z pass. `gbuf.depth` is normalised device depth: it
+runs 0 to 1 and crowds an entire scene into the last few thousandths. A Z pass
+in NDC is useless in a comp — and **depth of field was comparing a Focus
+Distance in metres against it**, so every value the slider allows sat far
+behind the whole scene and the frame blurred uniformly.
+
+Both now use a real distance from the camera, reconstructed from the G-buffer.
+Focus Distance is the distance it says it is.
+
+### Fixed — selecting HLSL crashed Blender
+
+`sock.default_value` on a colour or vector socket is a **live view into the
+socket's own memory**, not a copy. The socket rebuild captured those views,
+called `inputs.clear()`, and then read them back to restore the values — a
+use-after-free, which takes the process down rather than raising, so no amount
+of exception handling was ever going to help. Every captured value is
+materialised now, before anything is cleared.
+
+The re-entrancy guard next to it was `self._busy`, an ordinary Python
+attribute. Blender hands out a fresh wrapper object on every access to a node,
+so that attribute was written to a temporary and read back as the class
+default: **the guard had never once closed**. It lives in a module-level set
+keyed by the node's own pointer, which is the only identity that survives the
+wrapper being rebuilt.
+
+### Fixed — the Wireframe model drew dots, not wires
+
+The screen-space edge distance came from a central difference that required the
+pixels on *both* sides to belong to the same triangle. On anything denser than
+a cube that is rarely true: the derivative collapsed to zero, the distance went
+to infinity, and the wireframe came out as a scatter of specks — or, with the
+interior knocked through to the background, as very little at all.
+
+One-sided differences are used instead, so a pixel needs only one neighbour
+along each axis, in either direction. A pixel with no same-triangle neighbour
+at all is a triangle about one pixel across; there is no derivative to measure
+and no interior to speak of, so it counts as being *on* the edge rather than
+infinitely far from it.
+
+The test asks the question that matters rather than counting pixels: a wire is
+connected, and specks are not. Over 90% of lit pixels must have a lit
+neighbour, on a sphere and on teapots of 2,600 and 13,000 triangles.
+
+### Fixed — Toon Steps never did anything
+
+It was offered by the node, copied by the exporter, carried into the shading
+function's signature — and then not read. `diffuse_toon` took a `steps`
+argument and produced one hard step regardless. Four releases of a control that
+did nothing.
+
+Cel shading now cuts the light ramp into that many flat tones, with the edges
+spread evenly across the lit range. **Two is bit-identical** to the single-step
+version it replaces — the loop runs once and reproduces the old expression
+exactly — which matters because two is the default and every toon render made
+before this used it. The GLSL emitter got the same loop, so the GPU path agrees.
+
+### Fixed — the GPU device plan had never run
+
+`_cap.plan(scene, settings)` was called with `scene` several lines before
+`scene` was assigned. The `UnboundLocalError` went into a bare `except` and was
+swallowed, so the device plan and every note it prints have never once
+executed. Moved to after the export.
+
+---
+
 ## [1.17.1] — 2026-07-28
 
 ### Fixed — the generated objects were wound inside out
