@@ -21,7 +21,41 @@ class RenderSettings:
     spot_cone_falloff: float = 2.0
     spot_cone_reach: float = 64.0
     render_device: str = 'CPU'
-    gpu_post: bool = False
+    # all three act only when render_device is GPU: the top-of-panel switch
+    # is the choice, and these default on so choosing GPU means the GPU.
+    # Each stays a Debug-panel toggle for opting back out per stage
+    gpu_post: bool = True
+    gpu_shading: bool = True
+    gpu_raster: bool = True
+    # hold the GPU context on the render thread for the whole frame (the
+    # pre-1.25.53 behaviour: fastest possible bursts, but Blender's
+    # interface cannot draw until the frame ends). Off, the interface
+    # stays live and GPU bursts are marshalled to the main thread
+    gpu_hold_context: bool = False
+    # A-buffer rank routing: a depth layer whose fragment count falls
+    # below this fraction of the frame's pixels shades on the proven
+    # per-rank CPU path even when GPU shading is on. The GPU pays
+    # full-frame FIXED costs per layer (a draw and a readback-sync
+    # cover every pixel whether three fragments live there or a
+    # million); the CPU pays per FRAGMENT. Routing is by WHOLE layer,
+    # never splitting one, so each path receives complete ranks and
+    # the per-rank fields both paths build are exactly the ones the
+    # pure runs build. 0.02 is set FROM the first field routing line
+    # (1.25.60, 16 layers, 9.4M fragments): ~0.4s of fixed driver cost
+    # per layer against ~3.7us per fragment on 20 CPU cores puts the
+    # break-even near 3% of the frame -- 2% keeps a safety margin, so
+    # a routed layer is still a near-certain win. 0.0 keeps every
+    # layer on the GPU. Internal for now -- the printed routing line
+    # is the dial's evidence before it earns a panel row.
+    layer_gpu_min_frac: float = 0.02
+    # scissor the per-layer GPU passes (and their readbacks) to each
+    # depth layer's own bounding box. Pure transport: the same pixels
+    # shade either way, and the self test proves the two paths
+    # bit-identical on the driver. The toggle exists because scissored
+    # reads are a newer driver path than full-frame texture reads --
+    # if a driver ever disagrees, turn it off and the picture is the
+    # proven full-frame one
+    gpu_scissor: bool = True
     use_processes: bool = False
     process_count: int = 0
     displacement_scale: float = 1.0

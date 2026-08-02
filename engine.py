@@ -19,6 +19,26 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
     bl_use_eevee_viewport = False
     bl_use_custom_freestyle = False
     bl_use_alembic_procedural = False
+    # True so Blender binds a GPU context around render() -- the final F12
+    # render runs on a render thread where gpu.* otherwise has no context
+    # at all ("No active GPU context found") and every stage fell back to
+    # the CPU. The self-test never saw it: operators run on the main
+    # thread, which has one. This is the difference between the GPU port
+    # working in a report and working on F12.
+    #
+    # …and holding that context froze the interface for the whole frame:
+    # Blender cannot draw a window while the render thread owns the GPU,
+    # so a 33-second frame read "Not Responding" for 33 seconds -- the
+    # field named it twice. The default is now the viewport's own
+    # architecture applied to F12: the render thread runs with NO context
+    # and every GPU burst (compile, upload, draw, read back) is
+    # marshalled to the main thread, which always has one, through
+    # gpu/marshal.py. The interface breathes between bursts. The Debug
+    # panel's "Hold GPU Context" restores the old behaviour (it can
+    # start bursts a tick sooner), background renders keep it
+    # automatically (no interface to freeze, and -b may give the main
+    # loop no timers), and every marshalling failure falls back to the
+    # CPU frame with the reason printed -- never a broken picture.
     bl_use_gpu_context = False
 
     def __init__(self, *args, **kwargs):
@@ -30,9 +50,12 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
         self._scene_key = None
         self._draw_data = None
         self._last_hash = None
+        self._vp = None
 
     def __del__(self):
-        pass
+        vp = getattr(self, '_vp', None)
+        if vp is not None:
+            vp.abort = True
 
     # ------------------------------------------------------------ final render
     def render(self, depsgraph):
@@ -41,6 +64,34 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
         preview = bool(getattr(self, 'is_preview', False))
         settings = _settings_from_scene(bscene, tw, th, preview)
         warnings = []
+
+        # GPU context stewardship. `granted` is what Blender already did
+        # for THIS render (it read the class attribute when the job
+        # started); the class attribute is then re-synced from the
+        # setting so the NEXT render follows it. Background renders
+        # always hold: there is no interface to keep alive, and a
+        # windowless main loop may never run a timer.
+        background = bool(getattr(bpy.app, 'background', False))
+        granted = bool(type(self).bl_use_gpu_context)
+        hold = bool(getattr(settings, 'gpu_hold_context', False)) or \
+            background
+        type(self).bl_use_gpu_context = hold
+        from .gpu import marshal as _marshal
+        marshalled = (not granted
+                      and str(getattr(settings, 'render_device',
+                                      'CPU')).upper() == 'GPU'
+                      and not background)
+        if marshalled:
+            _marshal.enable()
+        try:
+            self._render_body(depsgraph, bscene, tw, th, preview,
+                              settings, warnings)
+        finally:
+            if marshalled:
+                _marshal.disable()
+
+    def _render_body(self, depsgraph, bscene, tw, th, preview, settings,
+                     warnings):
 
         from .version import version_string
         print(f"[Halcyon] {version_string()} rendering "
@@ -70,6 +121,15 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             dev, _stages, notes = _cap.plan(scene, settings)
             if str(settings.render_device).upper() == 'GPU':
                 print(f"[Halcyon] device: {dev}")
+                # a stage toggled off under the GPU device is worth one
+                # plain line each -- the 10-second frame that looked broken
+                # was exactly this, silently
+                for name, label in (('gpu_raster', 'GPU Rasteriser'),
+                                    ('gpu_shading', 'GPU Shading'),
+                                    ('gpu_post', 'GPU Post Processing')):
+                    if not getattr(settings, name, True):
+                        print(f"[Halcyon]   {label} is OFF (Debug panel) -- "
+                              "this stage runs on the CPU")
                 for note in notes:
                     print(f"[Halcyon]   {note}")
         except Exception:                                       # noqa: BLE001
@@ -82,10 +142,23 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             self.update_stats("Halcyon", msg)
 
         image = None
+        gpu_whole_frame = str(getattr(settings, 'render_device',
+                                      'CPU')).upper() == 'GPU' and \
+            bool(getattr(settings, 'gpu_shading', False))
         if settings.use_processes and not preview and \
                 core_render.wanted_passes(settings):
             print("[Halcyon] extra render passes are on, so this frame renders "
                   "in-process: the worker pool sends back pixels, not buffers")
+        elif settings.use_processes and not preview and gpu_whole_frame:
+            # the pool splits the frame into bands, and a band shades on
+            # the CPU -- the deferred pass is whole-frame by design. With
+            # the GPU device on, pooling would silently throw the driver
+            # away: the field's 33-second render was exactly this, with
+            # Task Manager honestly reading 0% GPU. The faster machine
+            # wins; the pool stays available by turning GPU Shading off.
+            print("[Halcyon] worker pool skipped: GPU Shading renders "
+                  "whole frames in-process (a pooled band would shade on "
+                  "the CPU). Turn GPU Shading off to use the pool instead")
         elif settings.use_processes and not preview:
             from .core import parallel as _par
             n = int(settings.process_count) or _resolve_cpus()
@@ -143,6 +216,16 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
         elapsed = time.time() - export_started
         if settings.show_stats:
             ST.report(total=elapsed)
+        # the one-line answer to "where did this frame go", printed for
+        # EVERY render: the 33-second mystery frame had its breakdown
+        # collected all along, gated behind a panel nobody had ticked
+        tops = ST.top(3)
+        if tops:
+            line = ', '.join(f'{n} {t:.1f}s' for n, t in tops)
+            tail = '' if settings.show_stats else \
+                "  (the Debug panel's Timing Breakdown toggle prints " \
+                'the full table)'
+            print(f"[Halcyon] {elapsed:.1f}s -- top stages: {line}{tail}")
         self.update_stats("Halcyon", f"Done in {elapsed:.1f}s")
         self.update_progress(1.0)
 
@@ -248,63 +331,66 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             self.end_result(result)
 
     # --------------------------------------------------------------- viewport
+    #
+    # The shape Blender's own engines use: view_update syncs data (main
+    # thread, bpy access is legal), view_draw only DRAWS. The old path
+    # rendered synchronously inside the draw callback -- the whole UI froze
+    # for every frame, seconds at a time on a real scene, and any failure
+    # left the viewport permanently blank. Rendering now happens on a
+    # background thread against the bpy-free exported scene; every draw
+    # blits the newest finished frame and kicks a fresh render only when
+    # the camera, the region or the scene actually moved on.
+
     def view_update(self, context, depsgraph):
-        # the scene only needs re-exporting when something actually changed;
-        # orbiting the view fires view_draw, not view_update
-        self._scene = None
-        self._scene_key = None
+        vp = self._viewport()
+        try:
+            region = getattr(context, 'region', None)
+            w = int(getattr(region, 'width', 0) or 0) or 640
+            h = int(getattr(region, 'height', 0) or 0) or 480
+            settings = _viewport_settings(depsgraph.scene, w, h)
+            scene = export.export_scene(depsgraph, settings)
+            vp.set_scene(scene, settings)
+        except Exception:                                       # noqa: BLE001
+            import traceback
+            vp.complain('the viewport export failed',
+                        traceback.format_exc())
         self.tag_redraw()
 
     def view_draw(self, context, depsgraph):
         import gpu
-        from gpu_extras.presets import draw_texture_2d
 
+        vp = self._viewport()
         region = context.region
-        w, h = region.width, region.height
-        settings = _settings_from_scene(depsgraph.scene, max(w, 4), max(h, 4))
-        scale = max(int(settings.preview_scale), 1)
-        settings.resolution_x = max(w // scale, 4)
-        settings.resolution_y = max(h // scale, 4)
-        settings.aa_mode = 'NONE'
-        settings.aa_samples = 1
-        settings.output_scale = 'NONE'
-        settings.pixel_aspect_x = settings.pixel_aspect_y = 1.0
-        settings.raytrace = False
-        settings.ambient_occlusion = False
+        w, h = max(int(region.width), 4), max(int(region.height), 4)
 
+        if vp.scene is None:
+            # Blender promises a view_update before the first view_draw, but
+            # a failed export leaves nothing to render -- say so on screen
+            # rather than showing an eternal void
+            vp.draw_placeholder(depsgraph)
+            return
+
+        vp.want(_view_camera(context), w, h)
+        vp.kick(self)
+
+        if vp.frame is None:
+            vp.draw_placeholder(depsgraph)
+            return
         try:
-            # Re-exporting the whole scene on every redraw makes orbiting cost
-            # a full mesh conversion per frame. The export is cached and only
-            # rebuilt when view_update says something changed; the camera is
-            # cheap and is re-applied every draw.
-            scene = self._scene
-            if scene is None:
-                scene = export.export_scene(depsgraph, settings)
-                self._scene = scene
-            scene.settings = settings
-            _apply_view_camera(scene, context, settings)
-            img = core_render.render(scene, settings)
-            img = post.process(img, settings,
-                               target_size=(settings.resolution_x,
-                                            settings.resolution_y))
+            tex = vp.texture(gpu)
+            self.bind_display_space_shader(depsgraph.scene)
+            _draw_texture(tex, w, h)
+            self.unbind_display_space_shader()
         except Exception:                                       # noqa: BLE001
             import traceback
-            traceback.print_exc()
-            return
+            vp.complain('drawing the viewport frame failed',
+                        traceback.format_exc())
 
-        ih, iw = img.shape[:2]
-        if img.shape[2] == 3:
-            img = np.concatenate([img, np.ones((ih, iw, 1), np.float32)], 2)
-        flat = np.ascontiguousarray(
-            np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0),
-            dtype=np.float32).ravel()
-        if flat.size != ih * iw * 4:            # never hand gpu a short buffer
-            return
-        buf = gpu.types.Buffer('FLOAT', ih * iw * 4, flat.tolist())
-        tex = gpu.types.GPUTexture((iw, ih), format='RGBA16F', data=buf)
-        self.bind_display_space_shader(depsgraph.scene)
-        draw_texture_2d(tex, (0, 0), w, h)
-        self.unbind_display_space_shader()
+    def _viewport(self):
+        if getattr(self, '_vp', None) is None:
+            from .preview import Viewport
+            self._vp = Viewport()
+        return self._vp
 
 
 class _Cancelled(Exception):
@@ -381,17 +467,72 @@ def _settings_from_scene(bscene, target_w, target_h, preview=False):
     return st
 
 
-def _apply_view_camera(scene, context, settings):
-    """Point the render at the viewport's own camera."""
+def _viewport_settings(bscene, w, h):
+    """Render settings for an interactive preview of the region.
+
+    The look stays the F12 look -- dither, CRT, the whole post chain are the
+    point of this engine -- but everything about WHERE the work runs is
+    pinned to the one shape that is safe from a viewport worker thread: the
+    CPU. The GPU stages need a GPU context, worker threads have none, and
+    the old path running them inside the draw callback is the prime suspect
+    for the viewport rendering nothing at all under Vulkan.
+    """
+    settings = _settings_from_scene(bscene, max(w, 4), max(h, 4))
+    scale = max(int(settings.preview_scale), 1)
+    settings.resolution_x = max(w // scale, 4)
+    settings.resolution_y = max(h // scale, 4)
+    settings.aa_mode = 'NONE'
+    settings.aa_samples = 1
+    settings.output_scale = 'NONE'
+    settings.pixel_aspect_x = settings.pixel_aspect_y = 1.0
+    settings.render_device = 'CPU'
+    settings.gpu_shading = settings.gpu_post = False
+    settings.gpu_raster = False
+    settings.use_processes = False
+    settings.show_stats = False
+    settings.progressive = False
+    return settings
+
+
+def _view_camera(context):
+    """The viewport's own camera as a Halcyon Camera, or None."""
     rv3d = context.region_data
     if rv3d is None:
-        return
+        return None
     from .core.scene import Camera
     view_matrix = np.asarray(rv3d.view_matrix, np.float32)
-    scene.camera = Camera(matrix_world=np.linalg.inv(view_matrix).astype(np.float32),
-                          projection=np.asarray(rv3d.window_matrix, np.float32),
-                          clip_start=context.space_data.clip_start,
-                          clip_end=context.space_data.clip_end)
+    persp = bool(getattr(rv3d, 'is_perspective', True))
+    space = getattr(context, 'space_data', None)
+    return Camera(
+        matrix_world=np.linalg.inv(view_matrix).astype(np.float32),
+        projection=np.asarray(rv3d.window_matrix, np.float32),
+        type='PERSP' if persp else 'ORTHO',
+        clip_start=float(getattr(space, 'clip_start', 0.1) or 0.1),
+        clip_end=float(getattr(space, 'clip_end', 1000.0) or 1000.0))
+
+
+def _draw_texture(tex, w, h):
+    """Blit a texture over the region.
+
+    The template idiom, with two amendments: TRI_STRIP instead of the
+    deprecated TRI_FAN `draw_texture_2d` still carries (the fan leaves in
+    Blender 6.0, and its warning was flooding consoles once per redraw),
+    and premultiplied blending so a Film > Transparent frame composites
+    over the viewport instead of overwriting it with black.
+    """
+    import gpu
+    from gpu_extras.batch import batch_for_shader
+    shader = gpu.shader.from_builtin('IMAGE')
+    batch = batch_for_shader(
+        shader, 'TRI_STRIP',
+        {'pos': ((0, 0), (w, 0), (0, h), (w, h)),
+         'texCoord': ((0, 0), (1, 0), (0, 1), (1, 1))})
+    gpu.state.blend_set('ALPHA_PREMULT')
+    try:
+        shader.uniform_sampler('image', tex)
+        batch.draw(shader)
+    finally:
+        gpu.state.blend_set('NONE')
 
 
 #: (name, channels, channel ids, type) exactly as Blender names them, so a

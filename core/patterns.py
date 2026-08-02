@@ -29,6 +29,48 @@ def hash3f(p, salt=0.0):
                  (c[:, 2] + salt).astype(np.int64))
 
 
+# ------------------------------------------------- deterministic sampling
+#
+# Soft ray shadows and ambient occlusion average jittered rays. Drawing the
+# jitter from a sequential random stream made the PICTURE depend on batch
+# order and thread count -- the same disease the bump chunk seam had -- and
+# made the sampling impossible to reproduce on a GPU. These primitives make
+# every sample a pure function of (pixel, sample index, stream, seed),
+# riding the SAME integer hash the pattern textures proved bit-exact on
+# real drivers. The angle comes from a 256-entry unit-circle table rather
+# than sin/cos of the hash, because a driver's transcendentals round
+# differently and an occlusion ray is a cliff: the table is float32 DATA,
+# identical on every device that reads it.
+
+#: cos/sin pairs for 256 evenly spaced angles, computed in float64 once and
+#: frozen to float32 -- the GPU reads these exact values as a texture
+CIRCLE256 = np.stack([
+    np.cos(2.0 * np.pi * np.arange(256) / 256.0),
+    np.sin(2.0 * np.pi * np.arange(256) / 256.0),
+], axis=1).astype(np.float32)
+
+
+def sample_u(spx, spy, z):
+    """One uniform in [0, 1] per pixel: hash3 of the pixel and a salt.
+
+    `spx`/`spy` are integer pixel coordinates (any int dtype), `z` the
+    stream salt combining sample index, stream id and seed. 16-bit
+    stratification -- plenty for jitter, and exactly reproducible."""
+    return hash3(np.asarray(spx, np.int64), np.asarray(spy, np.int64),
+                 np.int64(z))
+
+
+def sample_circle(u):
+    """(cos, sin) for a hash draw `u`, from the shared table.
+
+    The index recovers the hash's own 16-bit integer (u * 65535 is exact
+    in float32) and keeps its low 8 bits -- the same arithmetic the GLSL
+    side runs, cliff-free by construction."""
+    ai = (np.asarray(u * np.float32(65535.0) + np.float32(0.5),
+                     np.float32)).astype(np.int64) & 255
+    return CIRCLE256[ai, 0], CIRCLE256[ai, 1]
+
+
 def value_noise(p):
     """Trilinearly interpolated value noise in 0..1."""
     i = np.floor(p).astype(np.int64)

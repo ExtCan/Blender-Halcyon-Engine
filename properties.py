@@ -266,6 +266,10 @@ LABELS = {
     'fast_background': "Fast Background",
     'use_processes': "Use Worker Processes", 'process_count': "Processes",
     'gpu_post': "GPU Post Processing", 'render_device': "Device",
+    'gpu_shading': "GPU Shading",
+    'gpu_raster': "GPU Rasteriser",
+    'gpu_hold_context': "Hold GPU Context (freezes UI)",
+    'gpu_scissor': "Scissor Layer Passes",
     'palette_lock': "Lock Palette", 'displacement_scale': "Displacement",
     'color_depth': "Colour Depth", 'palette_mode': "Palette",
     'palette_method': "Quantiser", 'dither': "Dither",
@@ -300,15 +304,53 @@ DESCRIPTIONS = {
                "array operations and the node evaluator is dominated by Python "
                "dispatch between small ones. Defaults to 1 for that reason. "
                "Worker Processes is the route that actually parallelises",
-    'render_device': "Where the frame is computed. GPU currently moves only the "
-                     "post stages that have been measured against the CPU path "
-                     "on real hardware; everything else stays on the CPU and "
-                     "the panel says which features and why",
+    'render_device': "Where the frame is computed. GPU rasterises the frame, "
+                     "shades it and runs the post stages on your driver -- "
+                     "each measured against the CPU frame on real hardware, "
+                     "and each falling back per frame with the reason on the "
+                     "console when a scene uses something still CPU-only "
+                     "(ray tracing, for now). Flipping to GPU turns the "
+                     "proven stages on; the Debug panel can switch them off "
+                     "individually",
     'gpu_post': "Run the parallel post stages on the GPU through Blender's own "
-                "gpu module, the layer EEVEE is built on. Experimental: the "
-                "shaders were written on a machine with no GPU and have never "
-                "been executed by a driver. Falls back to the CPU stage by "
+                "gpu module, the layer EEVEE is built on. Measured against "
+                "the CPU stages on real hardware. Falls back to the CPU stage by "
                 "stage, and says why on the console",
+    'gpu_hold_context': "Give the render thread the GPU context for the "
+                        "whole frame, as before 1.25.53. Bursts start "
+                        "instantly but Blender's interface cannot redraw "
+                        "until the frame ends (Not Responding on long "
+                        "renders). Off, the interface stays live and each "
+                        "GPU burst runs on the main thread instead. Takes "
+                        "effect from the next render",
+    'gpu_scissor': "Limit each transparent depth layer's GPU passes and "
+                   "readbacks to the layer's own bounding box. The same "
+                   "pixels shade either way -- the self test proves the "
+                   "two paths identical on your driver -- but a sparse "
+                   "layer stops paying for the whole frame. Turn off only "
+                   "if a driver disagrees with scissored reads; the "
+                   "picture is then the proven full-frame path",
+    'gpu_shading': "Shade the frame on the GPU: the G-buffer is shaded in "
+                   "one full-screen pass per material -- shadow maps, image "
+                   "textures, converted master-shader materials, normal-map "
+                   "chains, coded shader nodes, the period pattern "
+                   "textures, matcap, backface and environment reflections "
+                   "all included, with sun, point, spot and area lights. "
+                   "Measured against the CPU frame at 0.00002 max "
+                   "difference on real hardware. Frames using what the GLSL "
+                   "does not reproduce yet -- ray-traced shadows, fog, ray "
+                   "tracing, the N64 texture filter, the Bump node -- "
+                   "shade on the CPU with the reason on the console. "
+                   "Shader compiles, plans and unchanged uploads are all "
+                   "cached across frames",
+    'gpu_raster': "Rasterise the frame on the GPU too: a compute-shader "
+                  "port of the CPU rasteriser's own fill rules, one thread "
+                  "per pixel, measured at ZERO differing pixels against the "
+                  "CPU on real hardware and several times faster at "
+                  "working sizes. Frames it cannot reproduce yet -- "
+                  "Painter's depth sort, affine texture mode, overdraw "
+                  "debugging, banded worker renders -- rasterise on the "
+                  "CPU with the reason on the console",
     'lens_distortion': "Barrel distortion below zero, pincushion above. What a "
                        "cheap lens does to straight lines",
     'chromatic_aberration': "Splits the colour channels radially, because a "
@@ -398,11 +440,24 @@ def _build():
         label = LABELS.get(name, name.replace('_', ' ').title())
         desc = DESCRIPTIONS.get(name, '')
         if name in ENUMS:
+            extra = {}
+            if name == 'render_device':
+                # the top-of-panel switch MEANS it: flipping to GPU turns
+                # the proven stages on, so a scene saved back when they
+                # defaulted off cannot silently render a 10-second CPU
+                # frame under a switch that says GPU. Flipping to CPU
+                # leaves them alone; the Debug toggles still opt out
+                def _device_flip(self, _context):
+                    if str(self.render_device).upper() == 'GPU':
+                        self.gpu_raster = True
+                        self.gpu_shading = True
+                        self.gpu_post = True
+                extra['update'] = _device_flip
             props[name] = EnumProperty(name=label, description=desc,
                                        items=ENUMS[name],
                                        default=default if any(
                                            i[0] == default for i in ENUMS[name])
-                                       else ENUMS[name][0][0])
+                                       else ENUMS[name][0][0], **extra)
         elif isinstance(default, bool):
             props[name] = BoolProperty(name=label, description=desc,
                                        default=default)

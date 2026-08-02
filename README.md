@@ -391,9 +391,10 @@ running it in Blender: an inverted image, a missing 1/π that whitened every
 material, and a preview crash. If something misbehaves, the traceback in
 Window ▸ Toggle System Console is the fastest way to tell me what happened.
 
-**The GPU port is one stage of three.** The post chain runs on the GPU;
-rasterisation and shading do not. See *GPU support* below. Everything else is
-CPU, and threaded.
+**The GPU port is two stages of three.** The post chain runs on the GPU, and
+deferred shading of the CPU's G-buffer is written, verified, and waiting on a
+hardware measurement before it defaults on; rasterisation does not. See *GPU
+support* below. Everything else is CPU, and threaded.
 
 **Procedural textures differ slightly from Cycles.** Noise, Voronoi, Musgrave
 and Magic are independently implemented from their published definitions. They
@@ -573,8 +574,8 @@ Measured on an RTX 5060 Ti under Vulkan against the CPU function each replaces:
 | Display transform | 0.00001 max difference | yes |
 | CRT mask, scanlines, vignette | 0.0115 | yes |
 | Ordered dither and bit depth | 0.0327 | yes |
-| Lens distortion | 0.318 | no |
-| Composite NTSC | 0.287 | no |
+| Lens distortion | 0.00426 after the half-texel fix | yes |
+| Composite NTSC | 0.00037, as three blur draws + combine | yes |
 
 A stage runs because it was measured, not because it was written, and a test
 fails if anything unproven appears in the enabled list. Blender defaults to
@@ -582,19 +583,68 @@ fails if anything unproven appears in the enabled list. Blender defaults to
 exist — shaders are built from a `GPUShaderCreateInfo`, with the old constructor
 kept only as an OpenGL fallback.
 
-Two stages remain, and they are where the time actually is:
+The NTSC stage spent a year unvalidated because it was the wrong shape: one
+triangle blur at one radius, where the CPU blurs I and Q at *different* radii
+with a box blur run three times, re-padding the frame edge before each pass.
+It is now three blur draws and a combine — the only structure that can match
+that — and the hardware measurement came back at 0.00037, in agreement with
+the 0.0004 the NumPy backend predicted. Dot crawl is frame-dependent and keeps
+a frame that uses it on the CPU.
+
+**Deferred GPU shading — stage two — is measured and enabled.** The CPU still
+rasterises; the G-buffer is packed into textures and shaded in one full-screen
+pass per material, every frame constant baked into the shader source so the
+Vulkan push-constant budget never enters into it. On an RTX 5060 Ti under
+Vulkan it reproduces the renderer's own frame to a max difference of
+**0.000051** — sun, point and spot lights, two-sided lighting, flat and smooth
+normals, all three materials of the test scene. Turn on **GPU Shading** in the
+Debug panel (Device: GPU). **Shadow maps travel with the frame**: the same
+depth images the CPU just baked are packed into an atlas per light — six cells
+for a point light's cube — with the light-space matrix, the slope bias, the
+normal offset and every Vogel PCF tap baked into the shader exactly as the CPU
+computes them, and a shadowed frame matches `render()` to the same 0.00002 the
+unshadowed one does. **Image textures travel too**: the CPU samples prepared
+pixels — resized, quantised, colourspace-converted — so those exact pixels are
+what the GPU samples, with the filter arithmetic (floor-based nearest,
+half-texel bilinear, all four wrap modes) reproduced in the shader rather than
+left to the driver's sampler state; all eight filter/wrap combinations match
+`Texture.sample` to the texel. Unchanged uploads — shadow atlases, mesh
+attributes, texture pixels — are cached across frames behind content
+fingerprints, so an animation re-uploads what moved and nothing else.
+**Converted materials qualify**: the master shader node's colour chain is
+emitted and every other socket rides as a probed constant — including the
+era's silhouette cheats, rim and fresnel, and the sheen lobe, reproduced from
+`light_surface`'s own formulas — and **area lights** join sun, point and spot
+in the loop, their softness living in the cube shadow the map builder already
+gives them. **Surface parameters vary per pixel**: a texture or node chain
+driving the master shader's Roughness, Glossiness, Specular Level or Colour,
+or Self-Illumination emits its chain into the frame shader — through the same
+emitter as the colour, sharing subexpressions — instead of pushing the
+material off the GPU. **Vertex colours travel too**, in the attribute slot the tangent
+never used — the master node's Vertex Color Mix and the Color Attribute node
+both read the same painted corners the CPU reads. Frames using anything the
+GLSL does not reproduce yet (ray-traced shadows, fog, ray tracing, the N64
+three-point filter, normal/bump chains) shade on the CPU with the reason
+printed.
+
+Honesty about the clock: the first measured frame took 316 ms against the
+CPU's 31, because a first frame pays the driver's compile of each material's
+shader plus the upload of the G-buffer. The compile is cached per scene — an
+animation pays it once, not per frame — and the upload path no longer detours
+through a Python list. The self-test reports cold and warm frames separately,
+so the number that matters for animation is the one being measured.
+
+What remains, and why:
 
 | piece | difficulty | notes |
 |---|---|---|
-| Rasterisation to a G-buffer | moderate | there is already a bit-identical CPU reference to diff against |
-| The 18 shading models | moderate | mechanical translation of formulas already written down |
-| Coded-shader node | *easier* | it is already GLSL; today it compiles **to** NumPy, which stops being necessary |
-| Node evaluator | hard | 113 node types would each need a GLSL emitter |
+| Rasterisation to a G-buffer | moderate | the last stage; there is a bit-identical CPU reference to diff against |
+| Node evaluator | hard | 29 of 113 node types have a verified GLSL emitter; the rest keep a material on the CPU |
 | A-buffer transparency | hard | needs depth peeling or per-pixel linked lists |
 | Error-diffusion dither | does not port | inherently serial, and stays on the CPU |
 
-Shading is over half of a typical frame, so nothing before the third stage will
-move a render much.
+Shading is about 71% of a typical frame and rasterising about 9%, which is why
+deferred shading came before a GPU rasteriser rather than after it.
 
 ---
 

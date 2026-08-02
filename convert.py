@@ -78,8 +78,8 @@ def convert_material(mat, model='AUTO', keep_original=True, force=False):
     """Rebuild `mat` around a Halcyon Shader. Returns (ok, message)."""
     if mat is None:
         return False, "no material"
-    if not mat.use_nodes:
-        mat.use_nodes = True
+    from . import compat
+    compat.enable_nodes(mat)
     tree = mat.node_tree
     if tree is None:
         return False, f"{mat.name}: no node tree"

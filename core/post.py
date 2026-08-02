@@ -565,7 +565,16 @@ def _gpu_stage(name, rgb, st):
     except Exception:                                           # noqa: BLE001
         return None
     fn = getattr(chain, name, None)
-    return fn(rgb, st) if fn is not None else None
+    if fn is None:
+        return None
+    try:
+        # the GPU crossings live at the device boundary (gpu/device.py):
+        # the stage's own arithmetic stays here, its driver calls cross
+        # as millisecond bursts
+        return fn(rgb, st)
+    except Exception as exc:                                    # noqa: BLE001
+        print(f'[Halcyon GPU] {name} on the CPU: {exc}')
+        return None
 
 
 def fit_to(rgb, size):
@@ -620,7 +629,8 @@ def process(image, st, frame=0, seed=0, target_size=None, allow_resize=True,
     gpu_out = _gpu_stage('display', rgb, st)
     rgb = gpu_out if gpu_out is not None else display_transform(rgb, st)
     rgb = reduce_depth(rgb, st, seed)
-    rgb = composite_ntsc(rgb, st, frame)
+    gpu_out = _gpu_stage('ntsc', rgb, st)
+    rgb = gpu_out if gpu_out is not None else composite_ntsc(rgb, st, frame)
     rgb = interlace(rgb, st, frame)
     gpu_out = _gpu_stage('crt', rgb, st)
     rgb = gpu_out if gpu_out is not None else crt(rgb, st)

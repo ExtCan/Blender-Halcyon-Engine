@@ -17,8 +17,10 @@ What is not: the upload and the draw.
 
 import numpy as np
 
-#: layout of the packed attribute texture, one texel per vertex-attribute slot
-POSITION, NORMAL, UV0, TANGENT = 0, 1, 2, 3
+#: layout of the packed attribute texture, one texel per vertex-attribute slot.
+#: Slot 3 held a tangent that was never written; the vertex COLOUR lives there
+#: now, all four components, which is what unlocked painted-vertex materials
+POSITION, NORMAL, UV0, COLOR = 0, 1, 2, 3
 SLOTS = 4
 
 
@@ -40,12 +42,19 @@ def pack_ids(gbuf):
     return out
 
 
-def pack_attributes(mesh, slot_count=SLOTS):
+def pack_attributes(mesh, slot_count=SLOTS, respect_smooth=False):
     """Per-triangle vertex attributes as a texture the shader can index.
 
     Laid out as (tri_count * 3 * slot_count) texels in a 2D texture, so a
     fragment reads its three corners' attributes by computing texel offsets
     from the triangle ID rather than following any pointer.
+
+    `respect_smooth` writes each flat triangle's *face* normal into all three
+    of its corners, which is what the CPU's attribute interpolation resolves
+    to for flat shading -- interpolating three identical normals is that face
+    normal at every barycentric coordinate. Without it a flat-shaded cube
+    comes back smooth from the GPU and nothing else in the picture is wrong,
+    which is the most confusing possible way to disagree.
     """
     tris = np.asarray(mesh.tris, np.int32)
     n = tris.shape[0]
@@ -57,15 +66,52 @@ def pack_attributes(mesh, slot_count=SLOTS):
     normals = getattr(mesh, 'normals', None)
     uvs = getattr(mesh, 'uvs', None)
 
+    flat = None
+    if respect_smooth:
+        smooth = getattr(mesh, 'smooth', None)
+        fn = getattr(mesh, 'face_normals', None)
+        if smooth is not None and fn is not None:
+            flat = ~np.asarray(smooth, bool)
+            fn = np.asarray(fn, np.float32)
+
+    colors = getattr(mesh, 'colors', None)
     for corner in range(3):
         idx = tris[:, corner]
         base = (np.arange(n) * 3 + corner) * slot_count
         out[base + POSITION, :3] = verts[idx]
         if normals is not None:
-            out[base + NORMAL, :3] = np.asarray(normals, np.float32)[idx]
+            nrm = np.asarray(normals, np.float32)[idx]
+            if flat is not None and flat.any():
+                nrm = np.where(flat[:, None], fn, nrm)
+            out[base + NORMAL, :3] = nrm
         if uvs is not None:
             uv = np.asarray(uvs, np.float32)
             out[base + UV0, :2] = uv[idx] if uv.ndim == 2 else uv[tris][:, corner]
+        # an unpainted mesh reads as white, exactly as ShadeJob.attributes
+        # answers when mesh.colors is None
+        if colors is not None:
+            out[base + COLOR] = np.asarray(colors, np.float32)[idx]
+        else:
+            out[base + COLOR] = 1.0
+    return out.reshape(side, side, 4), side
+
+
+def pack_tri_data(mesh):
+    """Per-triangle data (not per-corner): material and object index.
+
+    One texel per triangle, so a fragment can ask which material covered it
+    and the per-material passes can keep to their own pixels.
+    """
+    tris = np.asarray(mesh.tris, np.int32)
+    n = tris.shape[0]
+    side = int(np.ceil(np.sqrt(max(n, 1))))
+    out = np.zeros((side * side, 4), np.float32)
+    mats = getattr(mesh, 'mat_index', None)
+    objs = getattr(mesh, 'obj_index', None)
+    if mats is not None:
+        out[:n, 0] = np.asarray(mats, np.float32)
+    if objs is not None:
+        out[:n, 1] = np.asarray(objs, np.float32)
     return out.reshape(side, side, 4), side
 
 
@@ -96,6 +142,27 @@ vec3 hal_interp(float tri, vec3 bary, int slot)
     vec3 b = hal_fetch_attr(tri, 1, slot).xyz;
     vec3 c = hal_fetch_attr(tri, 2, slot).xyz;
     return a * bary.x + b * bary.y + c * bary.z;
+}
+
+// All four components, for the slots that carry them -- the vertex colour
+// keeps its alpha.
+vec4 hal_interp4(float tri, vec3 bary, int slot)
+{
+    vec4 a = hal_fetch_attr(tri, 0, slot);
+    vec4 b = hal_fetch_attr(tri, 1, slot);
+    vec4 c = hal_fetch_attr(tri, 2, slot);
+    return a * bary.x + b * bary.y + c * bary.z;
+}
+
+uniform sampler2D hal_gb_tris;       // one texel per triangle: (mat, obj, -, -)
+uniform float     hal_tri_side;
+
+vec4 hal_tri_data(float tri)
+{
+    float x = mod(tri, hal_tri_side);
+    float y = floor(tri / hal_tri_side);
+    vec2 uv = (vec2(x, y) + vec2(0.5)) / hal_tri_side;
+    return texture(hal_gb_tris, uv);
 }
 
 struct HalcyonFragment {

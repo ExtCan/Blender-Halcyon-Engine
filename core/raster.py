@@ -17,6 +17,51 @@ from . import mathx as M
 
 EMPTY = -1
 
+#: A-buffer depth tolerance. A modeled contact -- glass resting ON an
+#: opaque surface, a box standing on a floor -- interpolates its
+#: transparent fragments to the opaque depth plus or minus a few float32
+#: ULPs, and the CPU and compute rasterisers round those ULPs
+#: DIFFERENTLY (measured ~9e-7 apart on zndc). A bare `<` therefore let
+#: the render DEVICE decide, pixel by pixel, whether the coplanar layer
+#: exists: 1036 px of salt-and-pepper between otherwise-identical
+#: frames, found by the self test the moment it diffed a transparent
+#: frame across rasterisers. Collection keeps anything within ~30 ULPs
+#: of the surface (real geometric separation is orders of magnitude
+#: larger), and the compositor tests against the SAME limit, so the tie
+#: lands the same way under any rounding. Opaque hidden-surface removal
+#: keeps its exact `<`: this tolerance is only for deciding whether a
+#: see-through fragment sits on or behind the surface.
+ABUF_DEPTH_TOL_REL = np.float32(4e-6)
+ABUF_DEPTH_TOL_ABS = np.float32(1e-7)
+
+
+def abuf_depth_limit(opaque_z):
+    """The keep limit for A-buffer fragments against the opaque depth."""
+    return opaque_z + np.abs(opaque_z) * ABUF_DEPTH_TOL_REL \
+        + ABUF_DEPTH_TOL_ABS
+
+
+def quantize_depth(zz, depth_bits):
+    """Round interpolated depth to the z-buffer's grid, PER PIXEL.
+
+    What an N-bit z-buffer of the period actually did: interpolate at
+    full precision, round when the value meets the buffer. Every stored
+    depth lies exactly on the 2^N-step grid, so two surfaces fight only
+    where they are genuinely within a step of each other -- thin bands
+    at the crossing, the authentic artifact. (Quantizing the VERTEX z
+    before interpolation -- the old way -- tilted whole depth planes
+    and cut solid wedges through close-fitting geometry like a face.)
+    float32 throughout, and the compute kernel applies the same formula
+    with roundEven, so both rasterisers round the same half-cases the
+    same way.
+    """
+    if depth_bits >= 32:
+        return zz
+    steps = np.float32((1 << int(max(2, int(depth_bits)))) - 1)
+    z32 = np.asarray(zz, np.float32)
+    return (np.round((z32 * np.float32(0.5) + np.float32(0.5)) * steps)
+            / steps * np.float32(2.0) - np.float32(1.0))
+
 
 class GBuffer:
     __slots__ = ('width', 'height', 'tri', 'bary', 'bary_lin', 'depth', 'zndc',
@@ -187,9 +232,15 @@ def build_screen_tris(clip, tris, width, height, snap=0.0, near_eps=1e-5,
     if snap > 0.0:
         sx = np.round(sx / snap) * snap
         sy = np.round(sy / snap) * snap
-    if depth_bits < 32:
-        steps = float((1 << int(max(2, depth_bits))) - 1)
-        z = np.round((z * 0.5 + 0.5) * steps) / steps * 2.0 - 1.0
+    # depth_bits is accepted (and threaded to the fillers by rasterize)
+    # but NOT applied here any more. Quantizing the VERTEX z and then
+    # interpolating tilted every triangle's whole depth plane by up to
+    # half a step -- two close surfaces' planes then CROSS, and a
+    # low-bit z-buffer showed big solid wedges punching through faces
+    # instead of the thin dithered bands real hardware showed. Period
+    # hardware interpolated depth at full precision and rounded PER
+    # PIXEL at the buffer; quantize_depth() in the fillers does exactly
+    # that now, on both rasterisers.
     return sx, sy, iw, z, B, S
 
 
@@ -198,7 +249,7 @@ def build_screen_tris(clip, tris, width, height, snap=0.0, near_eps=1e-5,
 
 def fill(gbuf, sx, sy, iw, z, bw, src, cull='NONE', frags=None, flat_depth=None,
          depth_write=True, depth_test=True, count_overdraw=False,
-         tri_offset=0, z_offset=0.0, tri_map=None):
+         tri_offset=0, z_offset=0.0, tri_map=None, depth_bits=32):
     """Fill emitted triangles into a GBuffer (and/or a FragmentList).
 
     cull: 'NONE' | 'BACK' | 'FRONT'
@@ -268,11 +319,18 @@ def fill(gbuf, sx, sy, iw, z, bw, src, cull='NONE', frags=None, flat_depth=None,
                          np.float32)
         else:
             zz = (l0 * z[t, 0] + l1 * z[t, 1] + l2 * z[t, 2]) + z_offset
+        if depth_bits < 32:
+            zz = quantize_depth(zz, depth_bits)
         px = xx + bxmin[t]
         py = yy + bymin[t]
 
         if depth_test:
-            keep = zz < depth[py, px]
+            if frags is not None:
+                # A-buffer collection: the tolerant limit, so a modeled
+                # contact survives whichever rasteriser wrote the depth
+                keep = zz < abuf_depth_limit(depth[py, px])
+            else:
+                keep = zz < depth[py, px]
             if not keep.any():
                 continue
             if not keep.all():
@@ -380,12 +438,13 @@ def rasterize(verts, tris, mvp, width, height, cull='NONE', snap=0.0,
     if batched:
         fill_batched(gbuf, sx, sy, iw, z, bw, src, cull=cull, frags=frags,
                      flat_depth=flat_depth, depth_write=depth_write,
-                     depth_test=depth_test, z_offset=z_offset, tri_map=tri_map)
+                     depth_test=depth_test, z_offset=z_offset, tri_map=tri_map,
+                     depth_bits=depth_bits)
     else:
         fill(gbuf, sx, sy, iw, z, bw, src, cull=cull, frags=frags,
              flat_depth=flat_depth, depth_write=depth_write,
              depth_test=depth_test, count_overdraw=count_overdraw,
-             z_offset=z_offset, tri_map=tri_map)
+             z_offset=z_offset, tri_map=tri_map, depth_bits=depth_bits)
     return gbuf
 
 
@@ -467,7 +526,8 @@ LARGE_TRI_PX = 16384         # a 128x128 box; above this the loop amortises fine
 
 def fill_batched(gbuf, sx, sy, iw, z, bw, src, cull='NONE', frags=None,
                  flat_depth=None, depth_write=True, depth_test=True, tri_offset=0,
-                 z_offset=0.0, tri_map=None, max_batch_px=4_000_000):
+                 z_offset=0.0, tri_map=None, max_batch_px=4_000_000,
+                 depth_bits=32):
     """Same result as fill(), without the per-triangle Python loop.
 
     Small triangles are bucketed by bounding-box size class -- separately in
@@ -515,7 +575,8 @@ def fill_batched(gbuf, sx, sy, iw, z, bw, src, cull='NONE', frags=None,
                         cull=cull, frags=frags, flat_depth=flat_depth,
                         depth_write=depth_write,
                         depth_test=depth_test, tri_offset=tri_offset,
-                        z_offset=z_offset, tri_map=tri_map)
+                        z_offset=z_offset, tri_map=tri_map,
+                        depth_bits=depth_bits)
 
     idx_all = np.nonzero(live & ~big)[0]
     if idx_all.size == 0:
@@ -527,7 +588,8 @@ def fill_batched(gbuf, sx, sy, iw, z, bw, src, cull='NONE', frags=None,
             gbuf, sx[idx_all], sy[idx_all], iw[idx_all], z[idx_all],
             bw[idx_all], src[idx_all], cull=cull, frags=frags,
             depth_write=depth_write, depth_test=depth_test,
-            tri_offset=tri_offset, z_offset=z_offset, tri_map=tri_map)
+            tri_offset=tri_offset, z_offset=z_offset, tri_map=tri_map,
+            depth_bits=depth_bits)
 
     wc = _size_classes(bw_px[idx_all])
     hc = _size_classes(bh_px[idx_all])
@@ -576,9 +638,17 @@ def fill_batched(gbuf, sx, sy, iw, z, bw, src, cull='NONE', frags=None,
             else:
                 zz = (l0 * z[t, 0][ti] + l1 * z[t, 1][ti] +
                       l2 * z[t, 2][ti]) + z_offset
+            if depth_bits < 32:
+                zz = quantize_depth(zz, depth_bits)
 
             if depth_test:
-                keep = zz < gbuf.depth[py, px]
+                if frags is not None:
+                    # A-buffer collection: the tolerant limit (see
+                    # abuf_depth_limit) -- modeled contacts survive
+                    # whichever rasteriser wrote the opaque depth
+                    keep = zz < abuf_depth_limit(gbuf.depth[py, px])
+                else:
+                    keep = zz < gbuf.depth[py, px]
                 if not keep.any():
                     continue
                 ti, l0, l1, l2, px, py, zz, src_tri = (

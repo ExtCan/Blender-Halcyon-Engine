@@ -98,6 +98,36 @@ UNCONVERTIBLE_TYPES = frozenset({'GPENCIL', 'GREASEPENCIL', 'CURVES',
 ALLOCATING_TYPES = frozenset({'CURVE', 'SURFACE', 'FONT', 'META'})
 
 
+def uses_nodes(datablock):
+    """`use_nodes` without the 6.0 deprecation flood.
+
+    Blender 5.2 deprecates Material.use_nodes and World.use_nodes ahead of
+    their 6.0 removal, and warns on EVERY read -- ten materials times every
+    export made the console unreadable and buried real errors. The
+    semantics still matter in 5.x (a legacy material with the toggle off
+    renders from its flat settings), so the value is read, with only the
+    deprecation warning suppressed. When the attribute finally goes,
+    absent means True -- which is exactly what its removal will mean.
+    """
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', DeprecationWarning)
+        return bool(getattr(datablock, 'use_nodes', True))
+
+
+def enable_nodes(datablock):
+    """Turn node mode on where the attribute still exists, silently.
+
+    In 6.0 the attribute disappears because nodes become the only mode --
+    at which point this is correctly a no-op.
+    """
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', DeprecationWarning)
+        if hasattr(datablock, 'use_nodes') and not datablock.use_nodes:
+            datablock.use_nodes = True
+
+
 def evaluated_meshes(depsgraph):
     """Yield (object, evaluated mesh, matrix, is_temporary), one at a time.
 

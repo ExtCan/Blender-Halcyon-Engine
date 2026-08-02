@@ -287,7 +287,13 @@ vec4 hal_evaluate(int model, HalcyonSurface s, vec3 n, vec3 l, vec3 v)
 
     float d = 0.0;
     float sp = 0.0;
-    vec3 tint = vec3(1.0);
+    // The CPU's evaluate() folds the specular COLOUR into its specular term
+    // (spec_col), and the light loop then multiplies only specular_level. So
+    // the tint starts as s.specular here and Metal overrides it with the
+    // diffuse, exactly as the CPU does -- it used to start as white and be
+    // multiplied by s.specular in the loop afterwards, which double-tinted
+    // Metal and Strauss. Invisible while every test used a white specular.
+    vec3 tint = s.specular;
 
     if (model == 0) {                       // LAMBERT
         d = hal_diffuse_lambert(ndl);

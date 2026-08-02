@@ -170,7 +170,33 @@ def user_resource(kind, path='', create=False):
 
 utils.user_resource = user_resource
 
-app = types.SimpleNamespace(version=(5, 2, 0), background=True)
+class _Timers:
+    """bpy.app.timers, pumpable by hand: the test IS the main loop."""
+
+    def __init__(self):
+        self.fns = []
+
+    def register(self, fn, first_interval=0.0, persistent=False):
+        if fn not in self.fns:
+            self.fns.append(fn)
+
+    def unregister(self, fn):
+        if fn in self.fns:
+            self.fns.remove(fn)
+
+    def is_registered(self, fn):
+        return fn in self.fns
+
+    def pump(self):
+        """Run each registered timer once; a None return unregisters it,
+        exactly as Blender's main loop would."""
+        for fn in list(self.fns):
+            if fn() is None:
+                self.unregister(fn)
+
+
+app = types.SimpleNamespace(version=(5, 2, 0), background=True,
+                            timers=_Timers())
 class _Collection:
     def __init__(self, factory=None):
         self._items = []

@@ -4,6 +4,3530 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
 
 ---
 
+## [1.25.66] — 2026-08-02
+
+You're right, and I should have shipped this last round instead of
+describing it. Two fixes, both measured.
+
+### Fixed — a shading RATE interpolates the light, not the texture
+
+Halcyon evaluated the **whole material** at each vertex — texture
+sampling included — and interpolated the result across the triangle.
+On a 1209-triangle character that means three texture samples spread
+over a face, which is the smear the field photographed. Measured on
+the demo scene's textured material: mean horizontal contrast **0.0092
+against per-pixel shading's 0.0692 — a 7.5x blur**.
+
+Hardware of the period did not do that. It interpolated the vertex
+**colour** and sampled the **texture** at every pixel, then multiplied:
+MODULATE, the fixed-function combiner. (Before OpenGL 1.2 added
+`GL_SEPARATE_SPECULAR_COLOR`, that combined vertex colour was the
+entire lighting result — which is why this multiplies all of it by the
+texel rather than holding specular out. That is the 1990s default, not
+a simplification.)
+
+So the vertex and face rates now shade the lighting over a **white**
+surface, interpolate that, and multiply by albedo and alpha sampled at
+the **pixel** rate. Alpha comes from the pixel pass on purpose: a
+cut-out texture's edge is the one thing that must never be
+interpolated between vertices.
+
+Detail restored to **0.0587** — 85% of per-pixel sharpness, with the
+banding intact. And the change is a fix rather than a new look: an
+untextured diffuse material renders **bit-identically** to before
+(max difference 0.000000), because factoring one flat colour out and
+multiplying it back is an identity.
+
+### Fixed — the depth line understands Painter's algorithm
+
+The field's console read:
+
+    ndc z 4.467430..5.482941; every covered pixel sits at this
+    projection's depth asymptote, where NO distance can be recovered
+
+Those are not ndc values — they are **view distances**, 4.5 to 5.5
+units. Painter's algorithm gives every fragment of a polygon that
+polygon's single depth, so the buffer holds distances, and reading
+them as ndc produced an alarming diagnosis of a scene that was sitting
+normally in front of the camera. The line now detects the mode and
+says what it actually means: one depth per polygon, no per-pixel
+z-buffer, the bit-depth setting does not apply, and interpenetrating
+polygons meeting along an edge is the algorithm rather than a fault —
+with Depth Method → Z-Buffer named as the per-pixel alternative.
+
+That also re-frames the whole thread honestly: with Painter's
+selected, *some* of what looked like broken depth was the period
+algorithm doing exactly what it does. What was genuinely broken —
+every material mis-classified see-through (1.25.64) — is fixed, and
+now the console distinguishes the two.
+
+### Verification
+
+- The blur is measured, and the OLD path is reproduced inline as a
+  negative control so the test can tell a fix from a coincidence.
+- Untextured diffuse: bit-identical to the previous behaviour.
+- The rates still differ from each other and from per-pixel shading —
+  the banding a shading rate exists for is intact.
+- Painter's mode is reported as Painter's, with no asymptote claim.
+- Full renderer and shader suites green.
+
+---
+
+## [1.25.65] — 2026-08-02
+
+The 1.25.64 console is a clean bill of health on the thing that was
+actually broken: **the transparency lines are gone entirely.** No
+mis-flagged materials, nothing pushed out of the depth-buffered pass,
+no A-buffer stage in the breakdown. Sonic is z-buffered, with culling
+and depth writes, for the first time in this whole thread.
+
+What the field saw instead is a *different* pass taking over, and one
+line in that console names it:
+
+    [Halcyon GPU] shading on the CPU: the scene shading rate is VERTEX
+
+### Why the picture changed character
+
+`shading_rate` is a **rate**, not a model: the same shading maths
+evaluated at vertices and interpolated across the triangle — Gouraud,
+which most of the console and home-computer presets select on purpose.
+The frames before 1.25.64 never applied it, because every triangle was
+in the transparent pass, and the A-buffer path shades per fragment
+without consulting the rate at all. So the mis-classification had been
+silently overriding the preset's own shading rate, and fixing it
+handed the frame back to Gouraud.
+
+That is the setting doing its job. The immediate dial is **Shading
+Rate → Pixel** (Render properties), which gives per-pixel shading with
+the depth now correct — the sharpness of the old frames, without the
+tearing.
+
+It also exposes a genuine fidelity gap worth naming plainly: Halcyon
+evaluates the *whole* material per vertex, textures included, so a
+textured model smears. Period hardware interpolated the **lighting**
+per vertex and still sampled the **texture** per pixel — `texel ×
+gouraud colour` — which is why a Gouraud-shaded PlayStation model has
+soft banded light over a sharp texture. Making that split properly is
+its own piece of work (the albedo has to come out of the shading
+chain, and specular does not multiply by it); it is not shipped here
+rather than shipped as a guess.
+
+### Fixed — the depth line no longer invents a number
+
+1.25.63's instrument reported:
+
+    the subject sits at 2e+14..2e+14, where the buffer resolves
+    9.32e+19..9.32e+19 world units
+
+which is nonsense, and mine. ndc z reaches 1 exactly *at* the far
+plane and approaches `(f+n)/(f-n)` — an asymptote — as distance runs
+to infinity. The first version divided by that vanishing denominator
+with a `1e-12` clamp and printed **the clamp** as a measurement. The
+line now:
+
+- prints the raw `ndc z` range every time, so the input is visible;
+- names pixels **past the far clip** as their own condition (drawn
+  anyway — period renderers did — but outside the range the buffer was
+  set up for), while still measuring the rest;
+- refuses outright when depths sit at the asymptote, and says the
+  geometry is effectively infinitely far for this clip range rather
+  than making a number up.
+
+An instrument that lies is worse than no instrument. This one now says
+"I cannot measure this, and here is why".
+
+### Verification
+
+- New checks: asymptote depths are refused and never printed as a
+  figure; past-the-far-clip pixels are named while the rest are still
+  measured; the raw ndc range appears in every variant.
+- Full renderer and shader suites green.
+
+---
+
+## [1.25.64] — 2026-08-02
+
+Caught, by the line 1.25.63 added:
+
+    [Halcyon] transparency: 25 of 25 materials are see-through
+    (1209 of 1209 triangles) -- s_kihon10_sonic.nja.sa1mdl_0: flagged
+    see-through on export (blend mode or an alpha socket) ...
+    [Halcyon] transparency: NOTHING is in the depth-buffered pass
+
+Not a depth bug. A **classification** bug, and mine.
+
+### Fixed — a blend mode is not evidence of alpha
+
+`_tree_has_alpha` returned True for any material whose Blender
+`blend_method` was anything other than OPAQUE. Importers routinely set
+a non-opaque blend mode on every material they create, and this model
+arrived from a game format with all 25 of its carrying one. So all
+1209 triangles were classified see-through, the depth-buffered pass
+received **nothing**, and a solid character was rasterised with
+**culling off and no depth writes** — hidden-surface removal never
+happened at all. Its fragments were then composited as stacked layers,
+and under Sorted Blend that is polygon-centroid ordering, whose
+signature failure is exactly what the field kept photographing: wedges
+of one surface punching through another, back faces showing through
+the front, holes where the layers ran out.
+
+Three rounds went looking for that in the z-buffer. It was never in
+the z-buffer.
+
+Alpha must now be **used**, not merely permitted. A material is
+see-through when it has an opacity below one, a
+transparent/glass/refraction/holdout node, or an Alpha socket that is
+linked or set below one — and it is opaque whatever its blend mode
+says. Nothing is lost: a material with no alpha anywhere would have
+blended with alpha 1.0, which is what the z-buffer does for free and
+correctly. `blend_method` is now deliberately not consulted in either
+direction, because Halcyon's own alpha lives on the master shader's
+sockets independently of EEVEE's blend mode — reading the mode would
+misclassify the add-on's own Glass preset, which is the bug this
+check was added to fix in 1.25.50.
+
+The console line also names the specific evidence now — `Opacity
+0.120`, `its Opacity socket is linked`, `a Transparent BSDF node in
+its tree` — instead of the vague "flagged see-through on export" that
+let a whole mis-flagged character hide behind it.
+
+### What this should do to the picture
+
+Sonic's 25 materials go back through the z-buffer: culling on, depth
+writes on, per-pixel hidden-surface removal. The tearing through his
+face should be gone, not reduced. As a bonus the transparency stage
+disappears from that frame entirely — it was doing A-buffer work for a
+model that never needed a single layer.
+
+If some materials are still listed as see-through after this, the line
+now says which evidence found them, and that evidence is real alpha.
+
+### Verification
+
+- New test: every blend mode — CLIP, HASHED, BLEND, DITHERED, BLENDED
+  — leaves a solid material in the depth-buffered pass, while every
+  genuine kind of alpha (opacity, master Opacity, Edge Opacity, a
+  linked Opacity socket, a Transparent BSDF anywhere in the tree)
+  still routes it to the A-buffer with its reason named. End to end,
+  a fully solid model puts every triangle in the depth-buffered pass.
+- The 1.25.50 regression this check originally fixed stays fixed: the
+  master shader's Opacity and Edge Opacity sockets are still read, and
+  the existing glass tests still pass.
+- Full renderer and shader suites green.
+
+---
+
+## [1.25.63] — 2026-08-02
+
+The close-up says 1.25.62 did not fix the picture, and that is
+consistent with what 1.25.62 actually was: at 24 bits its grid step is
+6e-8, so an invisible-by-arithmetic fix cannot be the one the field is
+looking at. It was a real bug and it stays fixed; it was not **this**
+bug. Rather than guess a fourth time from a JPEG, this release makes
+the frame state its own depth situation, in numbers, on every render.
+
+### Added — the frame reports what its z-buffer can resolve
+
+    [Halcyon] depth: 16-bit z-buffer, clip 0.1..200; the subject sits
+    at 5.83..7.11, where the buffer resolves 0.00519..0.00772 world
+    units -- surfaces closer together than that cannot be told apart
+
+Near and far come back out of the projection matrix, the frame's own
+covered depths say where the subject sits, and the N-bit grid step
+converts to the smallest world separation two surfaces can have and
+still be told apart *there*. Perspective depth is hyperbolic —
+resolution falls with the SQUARE of distance — so a near plane set
+very close spends the whole buffer on empty air in front of the
+subject. That is the classic cause of close-fitting surfaces tearing
+through each other at a bit depth that sounds generous, and it is now
+a printed number instead of a suspicion. The claim is falsifiable and
+the test falsifies it: surfaces a quarter of the reported figure apart
+quantize to the same value, surfaces four times it apart do not.
+
+### Added — the frame names which surfaces left the depth-buffered pass
+
+    [Halcyon] transparency: 3 of 5 materials are see-through (1184 of
+    1620 triangles) -- Skin: flagged see-through on export (blend mode
+    or an alpha socket); Eyes: Opacity 0.980
+
+A material in the transparent pass is rasterised with **culling off
+and no depth write**, and its fragments stack as A-buffer layers. For
+glass that is the whole point. For a solid character whose materials
+were merely *flagged* — an imported model often arrives with every
+material set to Alpha Clip or Alpha Blend, or with an alpha socket
+linked — it means the surface no longer participates in
+hidden-surface removal at all, so it can show its own back faces and
+its interior geometry through itself. That reads exactly like broken
+depth, and until now nothing said it was happening. If every material
+is flagged, the line says so outright and names the setting that puts
+the frame back through the z-buffer.
+
+### Added — the layer cap says when it drops fragments
+
+    [Halcyon] transparency: the 16-layer cap dropped 41822 fragments
+    at 9310 pixels -- those layers are not drawn, and where nothing
+    opaque sits behind them the background shows through. Raise Max
+    Transparent Layers to draw them
+
+`max_transparent_layers` truncated silently. Where the dropped layers
+were the only geometry at a pixel — which is precisely the case when
+a solid object went entirely into the transparent pass — the
+**background** showed through instead: black patches in the middle of
+solid-looking geometry. The field frame printing exactly "16 layers"
+was the cap being hit, not a coincidence of scene depth.
+
+### Verification
+
+- New test: the reported resolution is checked against the
+  quantization it predicts (a quarter of it indistinguishable, four
+  times it distinguishable); near/far recovered from the projection
+  matrix match the camera's own; the classification record names
+  reasons for opacity-driven and export-flagged materials alike, and
+  records nothing for an all-opaque scene.
+- Full renderer and shader suites green.
+
+### What to try first, before any more code
+
+One render settles it. If the character's materials are meant to be
+solid, set **Transparency → None** (Render properties) and render the
+same frame: the whole model goes back through the z-buffer, culling
+on, depth writes on. If the tearing vanishes, the mechanism was the
+transparent pass, not depth precision — and the fix is the materials'
+blend mode, not the renderer. If it survives, the depth line above
+tells us what the buffer could resolve, and that is the next round's
+starting number.
+
+---
+
+## [1.25.62] — 2026-08-01
+
+Two field pictures named the same bug: solid wedges punching through
+Sonic's face, and bad depth where the grass meets the stone. Both are
+what a low-bit z-buffer looks like when the quantization is applied in
+the WRONG PLACE.
+
+### Fixed — depth quantizes per PIXEL, not per vertex
+
+`build_screen_tris` rounded the **vertex** z to the N-bit grid and the
+fillers then interpolated between rounded corners. That tilts every
+triangle's whole depth plane by up to half a step — and between two
+independently-triangulated close surfaces (a muzzle over a head, eye
+sockets around eyes, grass against stone) the tilted planes CROSS, so
+one surface stomps through the other in big solid wedges. Measured on
+a slanted quad at 16 bits: stored depths landed up to a **full step
+off the grid** (1.51e-5, one whole 16-bit step).
+
+Real N-bit hardware interpolated depth at full precision and rounded
+when the value met the buffer. Both rasterisers now do exactly that:
+
+- `fill` and `fill_batched` take `depth_bits` and round the
+  interpolated `zz` per pixel (`quantize_depth`, float32 throughout);
+  `build_screen_tris` no longer touches z.
+- The compute kernel applies the identical formula before its depth
+  compare — `roundEven`, which is NumPy's own half-to-even, so both
+  rasterisers round the same half-cases the same way. The front-end
+  mirror (`simulate_raster`) carries the same `depth_bits`.
+
+What changes on screen: at the default 24 bits, nothing visible (the
+grid step is 6e-8). At low bit depths — the period look the setting
+exists for — every stored depth sits ON the grid, so two surfaces
+fight only where they are genuinely within one step of each other:
+thin dithered bands at the true crossing, the authentic artifact,
+instead of view-dependent wedges. Exactly coplanar contacts quantize
+to the SAME value on both rasterisers and resolve stably by
+submission order, and the A-buffer's tolerant keep still holds
+(equal quantized depths are within the limit by definition).
+
+### Verification
+
+- New test: on a slanted 16-bit quad, every stored depth lies exactly
+  on the N-bit grid (max off-grid 0.0); the OLD vertex-quantized
+  behaviour is reproduced as a negative control and is provably off
+  the grid (1.51e-5); `fill` and `fill_batched` quantize identically;
+  the kernel's front-end mirror picks the same winners and stores the
+  same quantized depths at 16 bits, bit for bit; quantized coplanar
+  contacts stay within the A-buffer keep limit.
+- Full renderer and shader suites green — including the raster-pair,
+  ULP-invariance, painter's and A-buffer seams, all of which ride the
+  changed fillers at their scenes' own bit depths.
+
+If the face still shows artifacts after this on YOUR scene, check the
+Z-Buffer Bits value (Debug panel): at 16 bits a close-up face with a
+distant far plane is genuinely at the edge of what period hardware
+could hold apart — that part is authentic. This fix removes the part
+that wasn't.
+
+---
+
+## [1.25.61] — 2026-08-01
+
+The 1.25.60 field frame did what it was built to do: **it printed the
+frame's own depth distribution** — `per-layer frags 2.7M 1.6M 1.2M …
+15.8k 12.5k 274` — and the honest accounting put a name on the missing
+seconds: `reads+sync 4.9s` of an 11.0 s stage, with `draws 0.6s`. Two
+verdicts fall straight out of those numbers, and one apology rides
+along.
+
+First: the 0.25 % routing default was set ~20× below THIS frame's
+break-even, so routing moved exactly one layer of 274 fragments — the
+machinery proven, the dial wrong. Measured properly from the split:
+~0.4 s of fixed driver cost per layer against ~3.7 µs per fragment on
+the CPU (34.8 s for 9.4 M fragments on the 1.25.56 frame) puts the
+break-even near **3 %** of the frame, not 0.25 %.
+
+Second: `reads 4.9s` is not mostly copying. A draw call *submits*;
+the readback is where the driver **synchronises** — the queued passes
+execute inside that wait. So the old `draws 2.0s` was submission plus
+sync lumped together, and the new split separates them. The bucket is
+now printed as **`reads+sync`** so nobody (the author included) reads
+it as pure transfer again.
+
+The apology: the new HYBRID LAYER ROUTING self-test section reported
+`NOT A MIX` — vacuous — because the bumpy-glass frame's two layers are
+the SAME glass ball's front and back faces, **exactly equal in size**
+(8542 and 8542), and no threshold fits between equals. The section
+said so honestly instead of passing silently, which is the one thing
+it did right. Fixed below.
+
+### Changed — the threshold is now the measured one
+
+`layer_gpu_min_frac` default 0.0025 → **0.02**: just under the ~3 %
+measured break-even, margin included. On the 1.25.60 field
+distribution this routes the 50.2k / 15.8k / 12.5k / 274 layers — four
+of sixteen — each a near-certain win.
+
+### Added — targets live for the loop
+
+The field frame allocated and freed a ~50 MB `GPUOffScreen` **per
+layer**, plus one per sweep level and one per height pre-pass — driver
+allocations at that size cost milliseconds each, sixteen layers deep.
+One layer target, one sweep target, and one pre-pass target per
+(material, height-node) now live for the whole loop. Semantically
+identical by construction: every pass full-clears before its first
+draw, and every rank draws at least one pass (coverage guaranteed it),
+so a reused target can never show a stale layer. The pre-pass texture
+handles are fetched once, so the marshal crosses less too.
+
+### Added — scissored layer passes
+
+Each depth layer's passes and readbacks are clipped to the layer's own
+bounding box (`gpu.state.scissor_set` on the draw, `read_color` on the
+region). The clear stays full-frame — every texel defined, so a
+neighbour fetch outside the scissor reads a clean zero and is masked
+by the ids test exactly as the CPU masks it. A layer whose fragments
+sit in a corner stops paying for the whole frame's rasterisation, sync
+and transfer. The split prints the aggregate — `scissor 41% of full
+frames` — so the field says how much area the boxes actually saved.
+
+Because scissored *reads* are a newer driver path than the proven
+full-frame texture read, two guards ship with it: a Debug toggle
+(**Scissor Layer Passes**, on by default) that reverts to the proven
+path, and a new self-test section — SCISSORED LAYERS — that renders
+the same frame both ways and demands **bit-identical** output on your
+driver, printing the verdict either way.
+
+### Changed — the per-rank NumPy pays less
+
+The ids scatter is two fused writes instead of four, the reset one
+write instead of two — the `other` bucket on a 9.4 M-fragment frame is
+substantially these fancy-index passes.
+
+### Fixed — the hybrid self test can actually mix
+
+The HYBRID LAYER ROUTING section now makes the mirror see-through
+too, so the frame holds two transparent materials with different
+footprints — layers of *distinct* sizes — and picks its threshold
+between the two largest distinct sizes. It renders its own CPU and
+all-GPU references on that scene and proves the mixed picture against
+both, as designed. (The exact-merge and maths-level hybrid tests in
+the headless suite already split correctly — their splitter
+deduplicated sizes; the section's didn't. It does now.)
+
+### On the +5.5 s
+
+Total 15.3 s → 20.9 s between 1.25.59 and 1.25.60 on essentially
+identical submitted GPU work (the .60 code changes were CPU-side and
+strictly smaller: same draws, same reads, one routed layer fewer) —
+and uploads dropped 1611 → 1510 MB, which says the scene itself was
+not byte-identical between the two pastes either. Run-to-run driver
+variance and scene drift both live in that delta; the split's
+*internal shares* are the numbers to steer by, not one run's total.
+If 1.25.61 lands and the total still sits high while `scissor %` is
+large and `reads+sync` barely moves, the next lever is architectural
+(compacting the readbacks to fragment lists instead of frames) and
+the split will have said so.
+
+### Verification
+
+- Both suites green from the shipped zip (routing exact-merge and
+  hybrid tests unchanged and passing — they pin their own thresholds).
+- SCISSORED LAYERS: bit-identity demanded on the driver, verdict
+  printed.
+- HYBRID LAYER ROUTING: forced mix on the new two-glass frame, proven
+  against both pure runs, bucket-sum soundness line kept.
+- The three GPU layer sections still pin routing off and now run WITH
+  the scissor — a region bug cannot hide from their 0 px demands.
+
+---
+
+## [1.25.60] — 2026-08-01
+
+The 1.25.59 field split falsified 1.25.59's own bet, and it deserves
+saying plainly: the absent-material skip and the buffer reuse **bought
+nothing** — `draws 2.0s` (was 1.9), stage 7.386s (was 7.076), total
+15.299s (was 15.395). The crossings dropped 741 → 662, so the skip
+*fired*; it just skipped passes that were never the cost. The scene's
+see-through materials appear in nearly every rank, and the real bill
+is structural: the driver pays **full-frame fixed costs per depth
+layer** — a draw and a readback cover every pixel whether the layer
+holds three fragments or a million — sixteen times, plus ~1.8 s of
+worker-side NumPy the split didn't even have a bucket for. Wrong
+theory, correctly measured; this round changes the structure instead.
+
+### Added — rank routing: each layer shades where it is cheap
+
+The CPU pays **per fragment**; the driver pays **per layer**. So the
+compositor now routes each depth layer to whichever path is cheaper
+for it: layers whose fragment count falls below
+`layer_gpu_min_frac` of the frame's pixels (default **0.25 %** —
+deliberately far below the ~1 % break-even the field numbers suggest,
+so every routed layer is a near-certain win and a mistaken route
+costs milliseconds) shade on the proven per-rank CPU path; the dense
+layers stay on the driver. Three properties hold by construction:
+
+- **Whole layers only.** A rank is never split across paths, so both
+  sides build their per-rank Bump gradient fields from complete
+  layers — each fragment's colour is exactly what the pure run would
+  have given it. The new exact-merge test stubs the driver with the
+  CPU's own colours and demands the routed picture equal the pure CPU
+  picture **bit for bit**; it does.
+- **A route is not a refusal.** A frame whose every layer sits below
+  the break-even prints `layer routing: all N layers below the GPU
+  break-even (…); shaded on the CPU (routed, not refused)` — calmly,
+  and only when a driver was actually present to be skipped.
+- **The field sees the decision.** Every GPU layer frame now prints a
+  routing line with per-layer fragment counts:
+  `layer routing: GPU 6 layers (4.8M), CPU 10 layers (81k, 0.4s);
+  per-layer frags 1.9M 1.2M …` — the frame's own depth distribution,
+  so the next threshold argument is measured, not guessed.
+
+Coverage even *relaxes* correctly: a material that refuses GLSL but
+appears only in routed layers no longer blocks the dense layers from
+the driver, because coverage is checked against the fragments the
+driver is actually asked to shade.
+
+### Added — the split accounts for every millisecond
+
+The 1.25.59 split summed to ~5.6 s of a 7.386 s stage; the missing
+1.8 s had no name, and a remainder nobody prints is a cost nobody
+attacks. The buckets are now **disjoint** and the line adds three:
+
+    transparent split: plan 0.1s, compile 0.1s, uploads 0.5s (1611 MB),
+    draws 1.2s, reads 0.8s, sweeps 1.6s (of which CPU ray build 0.9s),
+    other 1.8s of 7.4s; 6 of 16 layers on the GPU; marshal …
+
+`reads` pulls the full-frame readbacks out of `draws` (they were
+hiding there), `compile` names the cold-frame shader builds, sweep
+time no longer double-counts the uploads and reads inside it, and
+`other` is the printed remainder — the worker-side scatters, gathers
+and copies — measured against a true stage total.
+
+### Changed — one sort finds every layer
+
+Both per-rank loops (driver and CPU) found each layer with a full
+`rank == r` scan over every fragment in the frame — sixteen scans of
+millions. One stable argsort plus `searchsorted` bounds now yields
+each layer as a slice, bit-identical to the scans (stable sort keeps
+equal ranks in original index order), the same pattern the compositor
+itself has always used. The per-rank evaluator caches are also cleared
+when the driver loop ends, so nothing dangles on the job.
+
+### Verification
+
+- New: the exact-merge routing test (stub driver answers with the
+  CPU's own colours; routed picture must be bit-identical; frac 0 and
+  frac 1 negative controls; partition asserted layer by layer against
+  the routing record — a hybrid that quietly ran pure fails by name).
+- New: the maths-level hybrid test through `simulate_fragments` — the
+  mixed frame sits within the proven layer tolerance of BOTH pure
+  runs, with the mix asserted non-vacuous.
+- Self Test: the three GPU layer sections pin `layer_gpu_min_frac 0`
+  so they keep proving the full driver machinery; a new HYBRID LAYER
+  ROUTING section forces a split on the bumpy-glass frame, checks the
+  mixed picture against both pure runs above it, and checks the split
+  buckets sum to the stage total (`sound` / `OVERLAPPING` printed).
+- Field-size slicing benchmark: slices bit-identical to the scans;
+  routing partition ~15 ms on 3.2 M fragments.
+
+What this should do to the field frame depends on its depth
+distribution, which the routing line will now print. If the deep
+tail is sparse (typical), several of the 16 layers leave the driver
+and their full-frame fixed costs leave with them; if the tail is
+dense, the counts will say so and the threshold argument moves to
+measured ground either way. The `other`/`reads` buckets name the
+remaining ~1.8 s regardless.
+
+---
+
+## [1.25.59] — 2026-08-01
+
+The first field split answered the question precisely: `uploads 0.5s
+(1611 MB)` — the bus is fine — `marshal 0.3s waiting` over 741
+crossings — the marshal is fine — and **16 layers**, each paying
+full-frame fixed costs however few fragments it holds. The fat is
+per-rank overhead: every depth layer drew every material's pass over
+the whole screen and allocated fresh 50 MB buffers, even when a deep,
+sparse layer held a few thousand fragments of one material.
+
+### Changed — the per-rank loop pays for the rank, not the frame
+
+Three cuts, each bit-identical by construction:
+
+- **Absent materials skip.** A layer pass writes only where its keep
+  is one; a rank that contains no fragments of a material gets
+  nothing from its pass, so it no longer runs — nor do its height
+  pre-passes. A deep rank usually holds one material, not the scene's
+  whole list; on the field frame that alone should fold most of the
+  1.9 s of draws.
+- **One ids buffer, one virtual surface, for the whole loop.** Each
+  rank scatters its fragments in, and afterwards scatters them back
+  out — a reset proportional to the rank's own fragment count instead
+  of a fresh 50 MB clear per layer. The ray machinery's evaluator
+  caches key on surface identity, so the reused surface gets fresh
+  cache dictionaries per rank.
+- The simulate mirror skips identically, so the headless seams keep
+  proving the exact frame the driver draws.
+
+Every per-fragment seam holds unchanged: plain glass, ray-traced
+glass, the Water anatomy, the last-ULP invariance — all exact.
+
+---
+
+## [1.25.58] — 2026-08-01
+
+The 1.25.57 field frame is the milestone this whole arc pointed at:
+**no fallback line** — the scene's transparent layers shaded on the
+driver, on the real frame, and 50.7 seconds became **16.0** with the
+interface live throughout. Against the 33.7 s where the transparency
+arc began, the frame has halved, and every named refusal along the way
+was lifted rather than worked around.
+
+### Added — the transparent split names the next second
+
+The summary line still points at `transparency shading (GPU) 7.9s` —
+on the GPU, not yet fast on it. Before optimizing blind, the stage
+now prints where its seconds went, one line after every successful
+GPU layer frame:
+
+    [Halcyon GPU] transparent split: plan 0.2s, uploads 3.1s (610 MB),
+    draws 0.8s, sweeps 3.2s (of which CPU ray build 1.7s), 4 layers;
+    marshal 214 crossings, 0.4s waiting
+
+The suspects it separates: per-layer ids uploads (a 1024×768 frame at
+SuperSample ×4 uploads ~50 MB per depth layer, plus a ray buffer per
+sweep level), the full-screen draws, the sweeps' CPU ray building,
+and the marshal's own crossing latency (wall time waiting minus time
+the bursts actually ran). The marshal carries the accounting
+(`marshal.acct()`), so the field's next paste names the perf round
+instead of guessing at it.
+
+---
+
+## [1.25.57] — 2026-08-01
+
+The 1.25.56 field frame got past the Mapping gap — the layer plan
+qualified for the first time on the real scene — and then the marshal
+failed it: `transparency shading (GPU) 8.011s` in the breakdown is
+exactly the 8-second timeout, expiring on a burst that was busy
+succeeding. 43 seconds became 50: the work was discarded and the CPU
+path paid on top. Two design flaws, both fixed.
+
+### Fixed — the timeout bounds pickup, never execution
+
+The old cap timed start-to-FINISH: a real frame's layer burst
+(shader compiles, 50 MB uploads per depth layer, the ray sweeps)
+legitimately needs longer than any fixed number, so the worker gave
+up on work that was completing. The timeout now answers exactly one
+question — is the main loop alive? — by bounding only the PICKUP. A
+burst that has started runs to completion, however long it takes.
+And a burst the worker abandoned is skipped if the timer fires late,
+so no main loop ever blocks on work whose result was given up on.
+
+### Changed — the marshal moved to the device boundary
+
+The deeper flaw: the bursts were too big. A whole `shade_frame` or
+layer pass crossed as ONE unit, carrying its CPU halves with it —
+ray building, composites, height chains — which meant minutes-class
+work could sit on the main thread, freezing the interface the
+marshal exists to free. The crossings now live inside
+`gpu/device.py` itself: compile, upload, draw, dispatch, read-back —
+each a genuine millisecond burst — while every CPU stretch stays on
+the worker with the interface untouched. Cache hits (shaders,
+uploaded atlases) return on the calling thread without crossing at
+all, and texture packing happens worker-side before the upload
+crosses. The pump also lingers two milliseconds after each burst, so
+a streaming call sequence (upload, draw, draw, read...) crosses in
+one timer slice instead of paying a tick per call.
+
+Nothing above the device layer carries marshal code any more — the
+call sites that wrapped whole stages went back to plain calls, and
+any new device use is automatically marshalled right by
+construction. The self test is untouched (operators run on the main
+thread, where every crossing short-circuits in place).
+
+Proof: the marshal's new semantics test one by one (a picked-up
+burst outliving its pickup timeout, an abandoned burst never
+running), and the threaded whole-engine render still completes with
+no deadlock and nothing left registered.
+
+---
+
+## [1.25.56] — 2026-08-01
+
+The 1.25.55 self test was all zeros — BUMPY GLASS LAYERS at
+**0.000012, 0 px**: the entire transparent-layer arc is proven on
+hardware. The field frame moved to a new KIND of wall — not an
+architecture refusal but an emitter gap, named by material:
+`'Material.002' (as a transparent layer): no GLSL emitter for
+ShaderNodeMapping`. And the frame time rose 33→43 s: the per-rank
+correctness fix was re-running the waves' noise chain once per depth
+layer. Three fixes.
+
+### Added — ShaderNodeMapping emits GLSL
+
+The 58th node type. All four vector types — POINT, TEXTURE, VECTOR,
+NORMAL — with `n_mapping`'s exact arithmetic: multiply by Scale,
+rotate X-then-Y-then-Z in the evaluator's own hand-rolled sequence,
+then add Location or normalize; TEXTURE subtracts Location, rotates
+by the NEGATED angles through the SAME sequence (the evaluator's
+quirk, reproduced rather than corrected), and divides by the Scale
+floored at 1e-8. When the Rotation socket is unlinked — practically
+always — its cos/sin are computed at plan time with NumPy's own
+float32 trig and baked as literals, so the driver does no
+trigonometry a CPU frame did not do (a driver's sin rounds
+differently, and a texture lookup at a texel boundary is a cliff).
+Per-pixel-driven Rotation falls back to in-shader trig.
+
+Verified in the emitter parity harness (all four modes, a varying
+vector, a linked rotation — 59 cases all matching the evaluator) and
+end to end as the field's own shape: a Texture-Coordinate → Mapping →
+Image-Texture chain driving glass, per-fragment against the
+compositor's CPU call — 0 of 678, max 0.000000.
+
+### Fixed — the per-rank correctness fix no longer re-runs the chains
+
+1.25.55's rank-by-rank CPU shading rebuilt each Bump material's
+height field per rank — re-evaluating the noise chain once per depth
+layer, which took the field frame from 33 to 43 seconds while the
+Mapping gap kept it off the GPU. Heights are per-fragment pure, so
+each material's chain now evaluates ONCE over all its fragments;
+each rank scatters its own subset and differences on the frame grid.
+Same fields to the bit, a fraction of the evaluator cost. (Once the
+GPU takes the frame this path only matters for CPU renders — but a
+correctness fix should not cost 30% either way.)
+
+### Fixed — the console hint names a real toggle
+
+The summary line said "Show Statistics in the Debug panel"; the
+toggle is labelled **Timing Breakdown**. The field looked for a
+button that did not exist. The hint now names the label on the
+actual switch.
+
+---
+
+## [1.25.55] — 2026-08-01
+
+The 1.25.54 report proved the ray-traced layers on hardware
+(**0.000012, 0 px**) and the field named its last wall by material:
+`'Material.008': a Bump pre-pass on a transparent layer is not ported
+yet`. The field's glass is bump water — the Water anatomy itself.
+This round ports it, and fixes the CPU bug the port dug up.
+
+### Fixed — transparent bump gradients were a function of the batch
+
+Older than the port: a transparent fragment's Bump gradients came
+from `_screen_grad` over whatever shading batch it landed in. All
+ranks shade in ONE mixed array there, so front and back faces of the
+same glass COLLIDED in the height scatter (last write winning by
+sort order), and every chunk boundary cut the waves: in the repro
+scene, 539 of 1914 fragments moved with the chunk size — by up to
+2.98 — in rasterisation order, dozens even in the compositor's
+pixel-sorted order. The picture depended on the batch layout, on the
+field's own 25-second path, and nothing had ever diffed it.
+
+The layer is the surface: one fragment per pixel per rank. The CPU
+now shades the A-buffer RANK BY RANK when any fragment's material
+carries a Bump node, with whole-material gradient fields built from
+each rank's own fragments — `_bump_height_fields`, the same pre-pass
+the opaque frame runs, applied per layer. Frames without a Bump
+material keep the old single call untouched. The bumpy-glass frame
+is now bit-identical across thread counts and chunk caps, and the
+bump still moves the fragments by 3.38 — invariant, not inert.
+
+### Added — Bump pre-passes ride the transparent layers
+
+The GPU side is the same definition: each material's height pre-pass
+draws PER RANK over that layer's own ids texture (the same shader
+names the opaque frame compiles — cache hits), and chains the GLSL
+emitter refuses — Blender's sin-fract Noise above all, the exact
+Water — are CPU-evaluated over the rank's virtual surface into the
+pre-pass image, exactly as the opaque path does. The main pass takes
+its neighbour differences from the rank's own coverage, which IS the
+per-rank field the CPU now gathers from. The refusal is gone in both
+plan paths (plain and ray-traced layers).
+
+Proof per FRAGMENT against the compositor's own CPU call, alpha
+included: bump glass **0 of 678, max 0.000022**; the full Water
+anatomy — sin-fract Noise into Bump on 0.5-opacity glass, ray
+tracing ON, refracting among mirrors — **0 of 678, max 0.000003**.
+The self test gains a BUMPY GLASS LAYERS whole-render section:
+NOISE-into-BUMP glass with a mirror, ray on, CPU vs driver.
+
+With this, every named transparent-layer refusal that fit the
+architecture is lifted: layers shade, recurse, and bend on the GPU.
+(Rich worlds behind NON-ray layers remain the one named holdout.)
+
+---
+
+## [1.25.54] — 2026-08-01
+
+The 1.25.53 report confirmed the freeze fix in five words better than
+the last five ("It no longer stops responding") and left exactly one
+named enemy: `transparent layers under ray tracing recurse on the
+CPU` — 25.1 of the 33.3 seconds. This round lifts it.
+
+### Added — transparent layers ray-trace on the GPU
+
+Under ray tracing, a transparent fragment spawns the same recursion an
+opaque pixel does: reflection rays scaled by the material's constants,
+refraction rays lerped through the glass, children at every depth. The
+executors now run exactly that machinery per layer: each rank's
+fragments become a virtual PRIMARY surface — triangle ids and true
+barycentrics are all the ray machinery reads from a surface — and
+`_run_sweeps` walks `_add_raytraced`'s tree from it, with the layer
+pass's real alpha riding through untouched (the CPU's own order: rays
+modify rgb, then alpha computes independently). The secondary passes
+compile under the same names the opaque frame uses, so a frame that
+already traced its opaque half pays no new compiles. Sampling identity
+is the fragment's own pixel — the same streams the CPU threads through
+`trace()` — so soft shadows and ambient occlusion jitter identically
+from a layer fragment on either device.
+
+The plan side grew three legs to stand on:
+
+- see-through materials pass the same ray gate opaque ones do, and
+  their reflect scales and refraction lerps join the ray plan — which
+  the LAYER materials can now open by themselves, so an all-glass
+  frame (the field's shape) traces with no opaque material anywhere;
+- secondary (hit) probes treat the alpha fields as inert — every
+  consumer of a hit colour reads rgb only — closing a latent refusal
+  where any see-through material in the mesh pushed a whole
+  Sorted-Blend ray frame off the GPU with 'visible only in
+  reflections' plus the alpha message;
+- rich worlds behind RAY-TRACED glass qualify outright: under ray
+  tracing the environment term lives at the recursion's final depth,
+  where the CPU-composite `__env` machinery already covers any world.
+  (The non-ray rich-world refusal keeps its name, and a Bump pre-pass
+  on a layer still refuses by name.)
+
+Proof per FRAGMENT against `_shade_chunked` — the compositor's own
+call — alpha included, all exact on the first full run: one bounce
+**0 of 678, max 0.000003** (and ray tracing moves those fragments by
+1.59, so the rays are load-bearing); ray depth 2 **0 of 678**; the
+field's own shape, all-transparent AND ray-traced, **0 of 7303**;
+Bryce behind reflective glass **0 of 678**; soft shadows + AO sampled
+from layer fragments **0 of 304**. The self test gains a RAY-TRACED
+GLASS LAYERS whole-render section (glass among mirrors, CPU vs your
+driver).
+
+---
+
+## [1.25.53] — 2026-08-01
+
+The 1.25.52 report closed the transparent-layer arc on hardware —
+**0.000024, 0 px** — and the field named the remaining wound in five
+words: "still does the not responding thing". This is the freeze
+round, planned since 1.25.49 and deliberately shipped alone.
+
+### Fixed — the interface stays alive during a render
+
+`bl_use_gpu_context` gave the render thread a GPU context by freezing
+the interface: Blender cannot draw a window while another thread holds
+the context, so a 33-second frame was 33 seconds of "Not Responding".
+
+The flag is now off by default. The render thread runs with NO
+context — export, rasterising, sorting, compositing, every CPU
+fallback — and the moments that genuinely need the driver (compile,
+upload, draw, read back) are marshalled to the main thread through the
+new `gpu/marshal.py`: the worker queues the burst and waits, a
+`bpy.app.timers` timer (Blender's own documented cross-thread
+pattern) runs it on the main thread, and the result or the exception
+crosses back. Each burst is milliseconds; the interface breathes
+between bursts. The four crossings are the compute rasteriser, the
+deferred frame, the transparent layers, and each post stage.
+
+Every failure mode stays honest and lands on the CPU with the reason
+printed, never a broken picture:
+
+- background renders (`blender -b`) hold the context automatically —
+  there is no interface to freeze, and a windowless main loop may
+  pump no timers;
+- a main thread that never runs the burst is a bounded timeout, not a
+  hang, and the frame shades on the CPU with that reason printed;
+- the Debug panel gains **Hold GPU Context (freezes UI)** to restore
+  the exact pre-1.25.53 behaviour with one click, from the next
+  render;
+- the self test is untouched by construction: operators already run
+  on the main thread, so its bursts run in place.
+
+Proven headless with the fake Blender grown a pumpable main loop: the
+marshal's mechanics (crossing, result, exception, timeout, timer
+retirement) test one by one, and a whole engine render runs from a
+worker thread while the test pumps the timer — completes with no
+deadlock, delivers a real frame, five bursts crossed, nothing left
+registered. The real proof is the field's own F12: the render should
+keep painting tiles and the interface should keep drawing.
+
+Expect the frame a shade slower than 1.25.52 in exchange: each burst
+now waits for a main-loop tick (~10 ms each, a handful per frame).
+The 25.2 s that remains in the field frame is the ray-traced layer
+recursion — top of the ROADMAP, unchanged by this round.
+
+---
+
+## [1.25.52] — 2026-08-01
+
+The 1.25.51 report was the diagnosis working as designed. The new
+fragment-level instrument reported **0 of 76573 flips, max 0.000048**
+— the driver's layer shading is exact — while the whole-render diff
+sat at *bit-identical* numbers to the round before (0.125066,
+1036 px) across two different blend modes. Identical numbers under a
+changed suspect acquit the suspect: the divergence was never in the
+layer shading.
+
+### Fixed — the picture no longer depends on the rasteriser's last ULP
+
+The real mechanism, confirmed numerically: the demo box's bottom face
+is **coplanar with the floor** — a modeled contact — so its
+transparent fragments interpolate to exactly the opaque depth, give
+or take a few float32 ULPs. The CPU rasteriser and the compute kernel
+round those ULPs differently (zndc measured ~9e-7 apart, within the
+rasteriser section's stated bounds), and the A-buffer's bare `<`
+depth test let that rounding decide, pixel by pixel, whether the
+contact layer exists: 2877 tie pixels in the scene, ~1000 flipped
+per device — the 1036.
+
+Collection and compositor now share one tolerant limit
+(`raster.abuf_depth_limit`, ~30 ULPs): a fragment on or immediately
+behind the opaque surface is kept the same way whichever rasteriser
+wrote the depth. Opaque hidden-surface removal keeps its exact `<` —
+the tolerance exists only to decide whether a see-through fragment
+sits ON a surface, where modeled geometry makes exact ties common.
+This extends the scheduling-invariance doctrine to the rasteriser
+pair: chunks, threads, bands — and now devices — cannot move the
+picture. Proof: 3606 keep flips under last-ULP rounding with the bare
+comparison, **0** with the limit; the end-to-end surviving fragment
+sets are identical (81544 = 81544); the contact layer is kept whole.
+
+The next self test's TRANSPARENT LAYERS section should read
+0.0001-class. Nothing about this was specific to transparency ports —
+the tie has been latent since the compute rasteriser landed; the new
+section was simply the first to diff a transparent frame across
+devices.
+
+### The field frame's named refusal stands — and names the next round
+
+`transparent layers under ray tracing recurse on the CPU` is the
+correct, intended refusal for the field scene (all-transparent AND
+ray-traced): a traced frame's transparent fragments spawn their own
+reflection and refraction rays, and that recursion is not ported yet.
+It is now the top of the ROADMAP — the sweeps machinery (secondary
+passes, hit shading, the recursion tree) already runs per-frame on
+the driver; the round to come runs it per LAYER, over the same ids
+frames the layer passes already draw.
+
+---
+
+## [1.25.51] — 2026-08-01
+
+The 1.25.50 field report caught the layer port twice — once refusing
+where it should have engaged, once engaging wrongly — and both
+mechanisms are now closed. The field frame printed `transparent layers
+on the CPU: no transparent-layer plan for this frame` and kept its
+26.5 s; the new TRANSPARENT LAYERS self-test section measured
+**0.125066, 1036 px** against the CPU.
+
+### Fixed — an all-transparency frame never built its layer plan
+
+The field frame's `transparency shading 26.5s` with no `shade` stage
+anywhere in the top list was the tell: every visible material in that
+scene is see-through, so the **whole picture** goes through the
+A-buffer and the opaque G-buffer is empty. `plan_frame`'s
+"nothing to shade is a success" early return — written when the plan
+only served the opaque pass — returned before the layer planning ever
+ran, with empty atlases and the unnamed default message. An empty
+opaque frame now falls through: the opaque loop sees no materials (an
+empty pass list is still a success), and the layer plan builds from
+each see-through material's own triangles, no G-buffer pixels
+required. Proven headless on the exact shape: all three demo
+materials at opacity 0.5, opaque G-buffer empty, layer plan holds
+every material, per-fragment seam 0 of 7303 at max 0.000006.
+
+And the default message is gone as a category: when the layer plan is
+empty but fragments arrive anyway, the refusal now names the first
+fragment's material and the exact fields the predicate read
+(`'Water' (opacity 1.000, has_alpha False read as opaque...)`) — a
+disagreement between the transparent subset and the layer predicate
+can no longer hide behind a generic line.
+
+### Fixed — the layer merge stands on the proven blend state
+
+The self-test's fragment shading mismatched 1036 px of 172800 (max
+0.125) on hardware while the headless seam was exact at the same
+480×360 — a driver-only divergence, in the one place this engine used
+a blend state no field frame had ever proven: `ADDITIVE_PREMULT`. The
+proven paths — the opaque frame's material merge and every secondary
+sweep, same scattered ids content, same texture sizes — all composite
+disjoint per-pixel writes under `ALPHA_PREMULT`, and for disjoint
+writes the two are the same arithmetic (`out = src + dst·(1−src.a)`:
+at a material's own pixels dst is 0; everywhere else src is vec4(0)
+and dst passes through). The layer merge now uses `ALPHA_PREMULT`
+like everything else. Lesson recorded in the code: never stand new
+driver state under a new feature when a proven state computes the
+same thing.
+
+### Added — the layers section diagnoses itself
+
+If the TRANSPARENT LAYERS section still disagrees, it now corners the
+mechanism at the FRAGMENT: the compositor's own `_shade_chunked` call
+against the driver's layer draws on identical sorted ranks, with flip
+counts, channel structure (rgb-only / alpha-only / both), histograms
+by rank, material, and facing, a driver-vs-itself determinism check,
+and the three worst fragments in numbers. Whatever survives the blend
+fix gets named, not guessed at.
+
+---
+
+## [1.25.50] — 2026-08-01
+
+The 1.25.49 summary line did its job on its first field frame: of the
+33.7 seconds, **transparency 28.4s — transparency shading 25.7s**. The
+A-buffer's fragments (two faces of every glass surface, times four at
+SuperSample ×4) were shaded entirely on the CPU: the deferred pass
+only ever drew the opaque G-buffer. This release puts the transparent
+layers on the driver too.
+
+### Added — transparent layers shade on the GPU
+
+Under Sorted Blend and A-Buffer transparency, the compositor's
+fragments now shade through the same deferred machinery as the opaque
+frame. Per depth layer: the layer's fragments become an ids texture
+(real triangle, REAL barycentrics, everything else uncovered), every
+see-through material draws a full-screen LAYER pass over it, and the
+per-pixel-disjoint materials merge additively into one target — one
+readback per layer, gathered back per fragment. The depth sort, the
+per-pixel ranking, and the farthest-first alpha blend stay exactly
+where they were, on the CPU; only the shading crossed.
+
+The layer pass emits the material's REAL alpha, the same chain
+`shade_batch` runs: opacity clamped, the hard Alpha Threshold cutoff,
+then the edge-opacity silhouette blend — measured against the bent
+normal, exactly as the CPU tests `ctx.N` (a normal-mapped glass
+silhouette fades identically on both devices). The driver merge uses
+ADDITIVE_PREMULT — the plain (ONE, ONE) sum on both channels. Plain
+ADDITIVE would have premultiplied rgb by alpha and accumulated NO
+alpha at all: every layer would have read back invisible.
+
+Refusals stay narrow and named, and the transparent shading falls back
+to the CPU with the reason printed — the opaque frame keeps its GPU
+pass either way:
+
+- `transparent layers under ray tracing recurse on the CPU` (a traced
+  frame's layers spawn their own rays — unchanged this round)
+- `a rich world behind transparent layers stays on the CPU` (the
+  CPU-composite env term adds at G-buffer pixels; a layer's fragments
+  are not those)
+- `a Bump pre-pass on a transparent layer is not ported yet`
+- materials that never rasterise a transparent fragment are not
+  probed for layers at all — an opaque Bump material next to glass no
+  longer costs the frame its layer pass, and a run-time coverage
+  check refuses by name if a fragment ever arrives with no pass
+
+Proof, headless: the exact per-fragment compare — `_shade_chunked`
+(the compositor's own CPU call) against the layer passes through the
+GLSL front-end on identical sorted ranks, **alpha included**. Two
+glass materials at once (the smooth ball and the anisotropic box),
+1631 backfaces of 3049 fragments, layers 4 deep, the env term on a
+layer: **0 fragments off by >0.01, max 0.000006**. The edge-opacity
+trial (threshold 0.6 zeroing the facing area, rim term only):
+**max 0.000000**. The self test gains a TRANSPARENT LAYERS section
+that runs the whole two-glass render on the driver.
+
+### Fixed — the add-on's own glass templates exported as opaque
+
+Surfaced by the layer port: `_tree_has_alpha` never looked at the
+master shader node, so a converted or template material carrying its
+alpha on the node's sockets — the Glass template is Opacity **0.12**,
+with the override off — exported `has_alpha=False`, landed in the
+OPAQUE pass, and rendered solid under Sorted/A-Buffer. The exporter
+now reads the master node's Opacity and Edge Opacity (linked, or
+below 1.0) exactly as it already read Principled's Alpha. Ray-traced
+refraction had hidden this: `surf.opacity` drives refraction rays
+regardless of the pass split, so glass LOOKED right under Ray Trace
+and quietly went solid without it.
+
+### Fixed — a stale Alpha Threshold could outlive its plan
+
+The plan cache's signature did not include `alpha_threshold`, which
+the layer alpha chain bakes as a constant; editing the threshold on
+an otherwise-unchanged scene would have re-served the old cutoff.
+It signs the plan now.
+
+---
+
+## [1.25.49] — 2026-07-31
+
+The field reported a 33-second 1024×768 render (SuperSample ×4 —
+2048×1536, 3.1 million pixels) with Task Manager reading 0% GPU and
+the interface frozen until the frame finished. The self-test was all
+zeros. Three findings, two fixed here:
+
+### Fixed — the worker pool no longer throws the GPU away
+
+With Use Processes on, F12 rendered through the worker pool — and the
+pool splits the frame into bands, where the deferred pass (whole-frame
+by design) silently never engages. No fallback line printed, because a
+banded worker never even attempts the driver. A 3.1-million-pixel
+frame CPU-shaded across bands: 33 seconds, and Task Manager's 0% GPU
+was the literal truth. The pool made sense in the CPU-only era; with
+GPU Shading on it is strictly slower.
+
+Now, when the device is GPU with GPU Shading enabled, the pool is
+skipped with a printed line — whole frames, in-process, on the driver.
+Turning GPU Shading off restores the pool for CPU rendering.
+
+### Fixed — every render prints where its seconds went
+
+The frame breakdown was collected for every render all along, but only
+printed with Show Statistics ticked — the 33-second mystery had its
+answer gated behind a panel. Every F12 now ends with one line:
+`[Halcyon] 12.3s -- top stages: shade 8.1s, post 2.2s, rasterise 1.1s`
+— and points at the Debug panel for the full table.
+
+### Known, planned — the UI freeze during long renders
+
+`bl_use_gpu_context` holds the GPU context for the whole render, so
+Blender's interface cannot draw until the frame ends. With the pool
+fix the freeze shrinks with the render time, but the real cure is the
+viewport's own pattern — CPU work with the context released, GPU
+bursts marshalled to the main thread — which lands as its own
+carefully-tested round (ROADMAP has the entry). Task Manager note for
+the meantime: the deferred pass's driver work is milliseconds per
+frame, so 0-1% GPU utilisation is what a HEALTHY GPU render reads —
+the number to watch is the frame time, not the gauge.
+
+---
+
+## [1.25.48] — 2026-07-31
+
+The 1.25.47 report confirmed the sky column on hardware — the Bryce
+sky lab in a mirror at **0.000048, 0 px of 172800** — thirteen
+sections, all zero. This release closes the last scheduling-dependent
+picture artifact anywhere in the engine.
+
+### Fixed — worker bands no longer seam the waves
+
+A pooled CPU render splits the frame into bands, each worker shading
+only its rows — and `n_bump`'s gradients difference toward the +y
+neighbour, so a band's top row flattened its waves against missing
+coverage. The chunk seam's sibling, at every band edge, in every
+pooled render of a bump material.
+
+Two small moves kill it exactly: the band's scissor rasterises ONE
+context row past its edge (the scissor culls whole triangles, so that
+row's coverage is complete), and the bump gradient fields build from
+the G-buffer's full coverage instead of the band's shading rows. A
+band's gradients are now the whole frame's, bit for bit: two bands
+stitch to the exact whole frame (0.000000000), with the negative
+control proving the seam was real (0.28 on exactly the edge row with
+the mechanism disabled).
+
+With chunks (1.25.40), threads (1.25.43's sampling), and now bands,
+the invariant is complete: **the picture never depends on internal
+scheduling.** Not chunk size, not thread count, not how the pool
+splits the frame.
+
+### ROADMAP
+
+Skies marked confirmed-on-hardware; the band item checked off. What
+remains for 1.26.0: texture filters (TRILINEAR/N64, STIPPLE, affine
+carry), Gabor/TexSky, cast-filtered shadows, the viewport question.
+
+---
+
+## [1.25.47] — 2026-07-31
+
+The ray arc confirmed complete, the roadmap said skies — and the whole
+sky column falls to one mechanism instead of five ports.
+
+### Added — every world reflects, evaluated by the renderer itself
+
+The insight: the environment-reflection term is the LAST rgb term the
+CPU adds to a pixel (fog frames already refuse), and every pixel it
+applies to is CPU-known — reflective primaries by mask, depth-exhausted
+hits by readback. So a world too rich to bake into GLSL does not need
+porting at all: the composite asks `world_color` — the renderer's own
+world, the full Bryce sky lab included — along the reflected rays, and
+adds the term after readback. Exact for ANY world, by construction:
+same normals (the proven bent, unflipped ray normals), same camera V,
+same add, in the same place.
+
+Six refusals deleted at once: **STARFIELD, BRYCE, PHYSICAL, HDRI,
+world node graphs, and the ground plane** all reflect now — in primary
+env (ray tracing off), at depth-exhausted hits (ray tracing on, any
+depth), and under the recursion (Bryce at ray depth 2, mirror-in-
+mirror under the sky lab, proven). The simple modes (SOLID, GRADIENT,
+BANDS, BLEND, EQUIRECT, MIRRORBALL) keep their baked GLSL fast paths.
+
+Headless seams: all twelve world/site combinations at **0 px**, max
+0.000006, each with the env term proven load-bearing in the mirror.
+The honest cost: one CPU world evaluation per frame over the env
+pixels — proportional to reflective coverage, like the ray slices.
+
+The self-test gains a RICH WORLDS IN REFLECTIONS section: the Bryce
+sky lab in a mirror, on your driver.
+
+### ROADMAP
+
+The skies-and-worlds column is DONE. Remaining for 1.26.0: texture
+filters (TRILINEAR/N64, STIPPLE, affine carry), Gabor/TexSky,
+cast-filtered shadows, the worker-band seams, the viewport question.
+
+---
+
+## [1.25.46] — 2026-07-31
+
+The 1.25.45 report, RAY DEPTH 2 section, first working driver run:
+
+```
+max difference : 0.000024
+px off by >0.01: 0 of 172800
+mirror-in-mirror on your driver -- the ray arc is COMPLETE
+```
+
+### Changed — `raytrace` flips to BOTH
+
+The capability table's bar for BOTH is "ported, and measured against
+the CPU path on real hardware." Every piece of the ray arc has now met
+it, on the field machine, at zero: hard ray shadows (0.000048, 0 px),
+soft ray shadows and ambient occlusion (0.000047, 0 px), one traced
+bounce (0.000048, 0 px), refraction through bent noise-and-bump
+normals (0.000028, 0 px), and the full recursion tree at depth beyond
+one (0.000024, 0 px). The flag's text now records those numbers, and
+the ROADMAP marks the ray column DONE.
+
+"Ray tracing and all that" — the scope 1.26.0 was named for — is on
+the GPU, in full, exactly.
+
+Next per the ROADMAP: the remaining sky modes in reflections
+(STARFIELD, BRYCE, PHYSICAL, HDRI, the ground plane).
+
+---
+
+## [1.25.45] — 2026-07-31
+
+The 1.25.44 report: every proven section still zero — soft+AO at
+0.000047/0 px again, 53.9 ms — and the new RAY DEPTH 2 section crashed
+on its first driver run:
+
+```
+[gpu compute capability failed: ValueError: operands could not be
+ broadcast together with shapes (34940,4) (34940,3)]
+```
+
+### Fixed — the level-image contract, and shade_frame's promise
+
+A backend split the headless path could never reach: the front-end
+adapter returns level images with THREE channels, the driver's
+`read_target` returns FOUR — readable by every composite that only
+looked, but depth > 1's child composites are the first code to WRITE
+into a level image, and `(N,4) + (N,3)` is a broadcast error. The
+shared recursion now normalises every level image to (H, W, 3) at the
+single point both backends meet, and the depth test exercises a
+driver-shaped four-channel adapter through the real recursion and
+trace: both shapes must produce the identical picture.
+
+Second fix, the deeper one: that ValueError ESCAPED `shade_frame`,
+whose contract says every failure is a reason and the caller shades on
+the CPU — instead it killed the whole self-test section. The sweep
+loop now converts any unexpected exception into a named reason
+(`the ray sweeps failed: ...`), so a driver-path surprise costs a CPU
+fallback with its cause printed, never a crashed render.
+
+Run Self Test again: the RAY DEPTH 2 line should read its numbers this
+time, and if the max is zero-class, the ray arc's last driver
+confirmation is in.
+
+---
+
+## [1.25.44] — 2026-07-31
+
+The 1.25.43 report proved the sampling arc on hardware first try —
+SOFT SHADOWS + AMBIENT OCCLUSION at 0.000047, **0 px of 172800**, 69.6
+ms against the CPU's 2270 — alongside the first field picture rendered
+entirely on the GPU. One ray item remained, and this release takes it:
+**ray depth > 1**. The ray arc is now ported whole.
+
+### Added — the recursion tree, walked branch by branch
+
+The CPU's `_add_raytraced` recurses: at depth d < D a hit's own
+reflective and refractive materials spawn the next rays — and its
+shading carries NO environment term, because the traced child replaces
+it — while at d == D the hit shades with the environment, the
+depth-exhausted branch. The deferred pass now walks the same tree:
+
+- per level, hits shade through the secondary passes — a new
+  `secondary_mid` variant (no env) above the final depth, the existing
+  env-bearing variant at it;
+- hits on ray materials spawn the next level's rays FROM the hit
+  surfaces: camera V (ctx.I = P − eye, always — the CPU's own rule),
+  the Normal Map chain bending, the Bump node a wire (ctx.px is None
+  at a hit), reflection stepping off the surface and refraction into
+  it by the raw bias;
+- children composite BACKWARD with the HIT material's constants — the
+  reflect scale, the refraction lerp's k and tint — and `world_color`
+  along child rays that missed;
+- a pixel whose reflection hit both reflects and refracts BRANCHES,
+  exactly as the CPU branches: the tree is per-branch state, not one
+  collapsed image;
+- hidden materials' constants join the plan (a level-2 ray can hit a
+  material no camera ray sees, and ITS hits spawn level 3);
+- the deterministic sampling identity follows every chain (1.25.43's
+  threading was already recursive), so soft shadows and AO at any
+  depth's hits draw the same streams on both devices.
+
+Depth 1 reduces to the exact flat sweep it generalises — same draws,
+same trace, same composite. Headless seams, two mirrors + branching
+glass (second bounce load-bearing at 0.615): **depth 1: 0 px. Depth 2:
+0 px, max 0.000003. Depth 3: 0 px, max 0.000003.**
+
+The self-test gains a RAY DEPTH 2 section — mirror-in-mirror on the
+driver — and the capability table now says it plainly: the ray arc is
+ported whole, flipping to BOTH when the depth-2 frame earns its driver
+zero. The old refusal ('ray depth N recurses on the CPU') is deleted.
+
+### ROADMAP
+
+Ray depth > 1 is checked off. The ray column of the 1.26.0 map is
+DONE, pending its last driver confirmation.
+
+---
+
+## [1.25.43] — 2026-07-31
+
+The ray arc resumes, by request: of "ray depth beyond 1, ambient
+occlusion, and soft ray shadows", the two sampling features fall
+together this release — because they shared one disease, and it was
+the same disease the bump seam had.
+
+### Fixed, then ported — sampling is a pure function of the pixel
+
+Soft ray shadows drew their jitter from a sequential random stream —
+two scalars per sample **shared by every pixel in a batch**, the
+sequence owned by chunk order. Ambient occlusion drew per-pixel numbers
+from the same kind of stream. Both meant the PICTURE depended on
+internal scheduling (penumbras could seam at chunk boundaries exactly
+like the bump waves did), and neither could ever be reproduced by a
+full-screen pass. The old refusal named it precisely.
+
+Now every sample is a pure function of (pixel, sample index, stream,
+seed): draws through the same integer hash the pattern textures proved
+bit-exact on real drivers, and angles from a shared 256-entry
+unit-circle table — a texture both devices read, because a driver's own
+sin/cos round differently and an occlusion ray is a cliff. All float32,
+mirrored operation for operation. Consequences, in order:
+
+- the CPU picture is **chunking- and thread-invariant** (proven
+  0.000000000 across thread counts), and soft penumbras are per-pixel
+  jittered now — strictly better-looking than the old batch-uniform
+  offsets;
+- traced HITS sample the same streams: the CPU threads the spawning
+  pixel's identity through `trace()`, and the GPU's secondary-pass
+  fragment simply IS that pixel;
+- both features shade in the deferred pass: the soft loop in the ray
+  shadow function, `hal_ao` scaling the ambient term exactly where
+  `light_surface` scales it, both walking the shared BVH traversal.
+
+Headless seam, the full stack at once — soft fill light + AO + traced
+reflections with hits shading both: **0 px off, max 0.000013**. Two
+refusals gone: 'a random stream whose sequence the CPU batch order
+owns' and 'ambient occlusion is not ported'. The self-test gains a
+SOFT SHADOWS + AMBIENT OCCLUSION section to prove it on your driver.
+
+The interface declarations moved to the head of the assembled source
+(the sampling helpers read `vUV` inside function bodies, and GLSL wants
+declarations first) — the driver-strict lint holds as before.
+
+### Added — ROADMAP.md
+
+The living map of the distance to 1.26.0: what is proven on hardware,
+what remains (ray depth > 1 is the ray arc's last item), what refuses
+by name, and what is impossible by construction. Updated each release.
+
+---
+
+## [1.25.42] — 2026-07-31
+
+The 1.25.41 field console:
+
+```
+[Halcyon GPU] shading on the CPU: 'Water': its Bump gradients chunk
+on the CPU at 347106 covered pixels (one batch holds 262144)
+```
+
+The 1.25.40 refusal — added for what looked like an edge case — fired
+on the field's own Water and threw the frame back to an 11-second CPU
+shade. That refusal was sized to a demo scene, and it was treating a
+symptom. This release removes the disease instead, and the refusal
+with it.
+
+### Fixed — bump gradients are whole at ANY size, so nothing refuses
+
+The cap existed because the CPU could only make `n_bump`'s gradients
+whole by shading a material in ONE batch, and one batch is memory-
+bounded. But the gradients never needed the *shading* to be one batch —
+they need the *heights* to be one picture. So the CPU now does exactly
+what the deferred pass already proved: a material too covered for one
+batch gets a whole-material height PRE-PASS first — its height chains
+evaluated over the material's full frame pixels (chunked internally;
+heights are per-pixel independent, so chunking there cannot cut
+anything), scattered to a frame grid, differenced ONCE — and every
+shading chunk gathers its gradients from that field instead of from
+its own batch. Bitwise the same arithmetic as a whole-material batch:
+same float32 grid, same forward differences, same validity, same
+gather. Materials that fit one batch never build a field and take the
+exact path they always took.
+
+Proven at the field's own scale: a 307200-pixel bump material (over
+the 262144 cap) renders IDENTICALLY at threads 1 and threads 8
+(0.000000000), QUALIFIES for the deferred pass, and the GPU frame
+matches the whole-gradient CPU frame at 0 px off, max 0.000009. The
+memory bound chunking exists for is untouched.
+
+What remains named: the WORKER-POOL bands still cut gradients at band
+edges (each band shades its rows independently) — visible only in
+pooled CPU renders of bump materials, never in the deferred frame.
+
+### For the field scene
+
+F12. The console line above is gone — 'Water' at 347106 pixels takes
+the height pre-pass on the CPU and the deferred pass on your driver,
+at any resolution, permanently. The 2-second frame is not coming back;
+it was never supposed to leave.
+
+---
+
+## [1.25.41] — 2026-07-31
+
+The 1.25.40 report came back all zeros — the Water anatomy proven end
+to end on hardware, the chunk seam confirmed dead — which promotes the
+next number in line: the warm frame's ~2.1 s of `shade (GPU)` at
+640×480, which is not GPU time at all but the per-frame CPU slices
+(ray construction and the noise heights). This release makes them
+share their work.
+
+### Changed — the frame's CPU slices compute once, not three times
+
+Profiled at 640×480: the height image cost 54 ms, reflection rays
+164 ms, refraction rays 85 ms — and they were all rebuilding the same
+things. Both sweeps ran `job.context` AND the full evaluator over the
+water's pixels (it reflects AND refracts), and the height pre-pass
+built its own context and evaluated the noise chain a third time.
+
+Now one per-material, per-frame cache (`_mat_eval`, living on the job —
+one job is one frame, keyed by the G-buffer's identity) holds each
+material's pixels, shading context and GraphEvaluator. The height
+image, the reflection rays and the refraction rays all pull from it,
+and sharing the EVALUATOR is the point: its per-node cache means the
+sin-fract noise evaluates once and every later ask — the bend, the
+pre-pass — is a lookup. Ray building itself became per-material blocks
+(`_ray_blocks`), so a material in both sweeps pays its bend once.
+
+Exactness is untouched by construction — the blocks run the same
+per-pixel arithmetic the mixed selections ran, every consumer scatters
+by pixel coordinates, and the shared evaluator returns the identical
+cached arrays: the 640×480 Water frame still reads **0 px off, max
+0.000018** against `render()`. Measured: heights + both sweeps went
+**305 ms → 140 ms** at 640×480 in the build sandbox (~2.2×; a
+water-dominated frame gains more, since the water is exactly the
+material both sweeps share).
+
+### Added — the report shows where the sweep milliseconds go
+
+`LAST_TIMINGS` gains `ray_build_ms`, and the self-test's shade split
+now reads `sweeps X (of which CPU ray build Y)` — so the next
+conversation about the warm frame starts from a number instead of a
+guess.
+
+### For the field scene
+
+F12 twice and compare the warm frame: the shade (GPU) stage should
+drop by roughly the shared work — the water pays its context, its
+noise and its bend once per frame now. The remaining CPU cost is the
+one honest slice left (one evaluator run per ray material per frame);
+if the report shows it still dominating, a bend pre-pass on the GPU is
+the next candidate — but only if it can earn a zero of its own.
+
+---
+
+## [1.25.40] — 2026-07-31
+
+The A/B quartet convicted the bump bend — and then the hunt turned the
+verdict inside out: **the driver was innocent all along. The GPU
+picture was right; the CPU picture had the bug.**
+
+### Fixed — the CPU's bump gradients no longer depend on the chunking
+
+The trail, step by step: the 38 bad pixels reproduced HEADLESSLY, byte
+for byte — same count, same max (0.192843), same worst pixel (166,196)
+— so this was never driver arithmetic. The front-end's bent normal,
+`P`, `V` and the two-sided flip all matched the CPU's own evaluator
+exactly at the bad pixels; the sky was already ruled out by magnitude;
+shadows survived their own A/B. What remained was the reference itself:
+the CPU shades PIXEL-rate fragments in mixed-material chunks, `n_bump`'s
+neighbour validity means "shaded in the same batch", and chunk boundary
+79917 of the 480×360 frame landed mid-glass on row 166 — every pixel on
+that row whose +y neighbour fell in the NEXT chunk shaded with its
+waves flattened (dhdy forced to 0). One row of subtly wrong water, on
+any machine whose settings chunked there, in every CPU render since the
+Bump node existed. The GPU's whole-material height pre-pass computed
+those gradients CORRECTLY — the 38 px were the fix disagreeing with the
+bug.
+
+The cure is CPU-side and principled: `_shade_all` now shades PIXEL-rate
+fragments ONE MATERIAL PER CHUNKED CALL. Gradients are whole for any
+material that fits the existing memory cap (262144 fragments — the cap
+itself is untouched, chunks just never cross a material's interior
+below it), and the picture is now a function of the scene, not of the
+thread count. Proven by invariant: threads 1 and threads 8 render the
+IDENTICAL frame (0.000000000), and the field-size Water frame reads
+**0 px off, max 0.000012** against the deferred pass — the very check
+that read 38.
+
+Honesty at the boundary: a Bump material covering MORE than one batch's
+cap would still cut on the CPU, so the plan now refuses it by name
+("its Bump gradients chunk on the CPU at N covered pixels") rather than
+render a different, seamless picture. And a named limitation that
+remains: the WORKER-POOL bands still cut bump gradients at band edges
+(each band shades its rows independently), so a pooled CPU render of a
+bump material can still seam at band boundaries — the deferred GPU
+path, which shades the frame whole, does not.
+
+One side effect worth naming: CPU frames rendered with soft-shadow or
+other per-chunk sampling may show a different (equally valid) noise
+pattern, because the chunk seeding now walks materials in order.
+
+### For the field scene
+
+Run Self Test: the refracted section should finally read near-zero with
+no DIAGNOSIS block at all. And your renders gain something real — every
+CPU frame of the water was carrying a one-row flattened-wave seam
+wherever the chunking landed; it is gone from CPU and GPU alike, and
+the two now agree because both are right.
+
+---
+
+## [1.25.39] — 2026-07-30
+
+The 1.25.38 report is the one this arc was for: the field F12 went
+**12.7 s → 3.9 s** with a single `shade (GPU)` line — 'Water' compiles,
+the fallback is gone — and the refracted section reads `shade_frame
+directly: OK` at 111 ms against 390 CPU. And then the honest number
+underneath: **max 0.192843, 38 px of 172800**. This frame's GLSL — the
+bump main pass, the secondary passes of a two-sweep frame — had never
+actually executed on a driver until the glue fix landed; every earlier
+0.000012 in this section was CPU against CPU. The first real run
+disagrees somewhere, and this release makes the section corner it.
+
+### Added — the refracted frame diagnoses itself
+
+Headless analysis already ruled the BANDS sky OUT for this scene: its
+bands are two near-identical darks, a band flip moves a pixel by about
+0.01, and the ground branch is off — nothing in that chain can make
+0.19. What remains needs the driver to separate, so on disagreement the
+section now prints:
+
+- **bad px by surface** (floor / glass / mirror / background), their
+  **ray membership** (reflection px, refraction px), and **what their
+  own rays hit** — rays rebuilt by the frame's own builders and traced
+  by the proven CPU BVH, so the classification is exact;
+- the **three worst pixels** with both devices' RGB — channel structure
+  tells a shadow flip (large, light-coloured, all channels) from a tint
+  or band error (small, colour-shaped);
+- the **A/B quartet**: the same frame re-rendered four times, one
+  suspect disabled per run — shadows OFF, sky strength 0, bump
+  strength 0, ray refraction OFF — with the differing-pixel count for
+  each. Whichever variant reads zero names the mechanism, and the next
+  round aims instead of guessing.
+
+State is restored after every variant; the quartet costs a few seconds
+of self-test time and only runs when the frame disagrees.
+
+### For the field scene
+
+Press F12 **twice** and compare: the 3.29 s shade (GPU) in the report
+was a first-frame number — it pays every material's shader compiles
+(primary + secondary + pre-passes). The second, warm frame shows what
+an animation would pay, which is the per-frame CPU slices (ray-context
+bends and the noise heights) plus the true GPU time. And Run Self Test
+once more: if the 38 px reproduce, the DIAGNOSIS block underneath is
+the whole next round.
+
+---
+
+## [1.25.38] — 2026-07-30
+
+The 1.25.37 report's new line said everything: **`shade_frame directly:
+FELL BACK: the driver rejected 'Bumpy': HAL_MAT_1: CreateInfo failed`**
+— and the field's F12 console showed the corpse itself:
+
+```
+757 | uniform sampler2D hal_bump0;uniform sampler2D hal_shadow0;
+      python_shader.glsl:418: Error: 'hal_bump0' : redefinition
+```
+
+Two declarations **glued on one line**. Every bump-node material has
+been rejected by the driver since 1.25.34 and silently shaded on the
+CPU — 'Bumpy' in the self-test, 'Water' in the field, 11.4 s a frame.
+
+### Fixed — the splice
+
+`assemble_frame` joins its source blocks with `''.join`, and each block
+was expected to end with its own newline. The texture samplers did; the
+Bump emitter's `uniform sampler2D hal_bump0;` did not — so whenever a
+bump material had NO image texture in its main pass (the empty texture
+block between them), it glued straight onto the shadow block's
+`uniform sampler2D hal_shadow0;`. One line, two declarations. The
+whole-line stripper couldn't match it, both names reached CreateInfo
+already declared, the driver refused the shader, and `render()` fell
+back — while every headless seam read zero, because Halcyon's own
+front-end happily parses the glued line. The normal-mapped 'Bumpy' in
+the first deferred section compiled fine all along (its texture block
+is non-empty and newline-terminated), which is why the failure hid in
+the refracted section alone.
+
+Three walls now stand where none did:
+
+1. **The joins are line-safe.** All multi-line blocks go through
+   `_block()` — newline-separated, newline-TERMINATED when non-empty —
+   in the frame assembler and the height-pass assembler both. No
+   emitter has to remember its own trailing newline again.
+2. **The stripper is immune anyway.** `strip_declarations` now strips a
+   line made of ANY number of whole declarations, so even a future
+   splice of two declarations cannot reach CreateInfo. (Verified: with
+   the old join deliberately restored in memory, the hardened stripper
+   alone saves the frame.)
+3. **The lint hunts the whole class.** `surviving()` no longer shares
+   the stripper's blind spot: it flags glued declaration lines AND any
+   surviving `uniform` token anywhere — a stripped source has no
+   legitimate use for the word. And the lint finally assembles the
+   field's exact combo (Bump material under SHADOW MAPS with an empty
+   texture block — `shadows=False` had kept the shadow block out of
+   every linted source): primary passes, the height PRE-PASS and the
+   secondary passes all strip clean, by name.
+
+The negative control ran before the fix shipped: the old join
+reproduces the field's glued line byte for byte, and the old stripper
+misses it. Both new walls kill it independently.
+
+### For the field scene
+
+'Water' should compile on your driver now — this was the wall between
+your scene and the GPU since the Bump round. F12: the console's
+`[Halcyon GPU] shading on the CPU` line should be GONE, and the 11.4 s
+shade stage should become GPU milliseconds. Run Self Test too: the
+refracted section should read `shade_frame directly: OK` with the
+stage table showing ONE shade line, and the section's GPU total should
+finally sit far under the CPU's.
+
+---
+
+## [1.25.37] — 2026-07-30
+
+The 1.25.36 report cracked both mysteries open. The new stage table
+showed **`shade (GPU)` AND `shade` both running** in the warm frame —
+shade_frame has been failing on the driver and falling back to CPU
+shading in that section, its reason printed only to the Blender console
+— and the field's F12 crashed the off-screen material probe:
+**'Material.003' (visible only in reflections): probing it off-screen
+failed (operands could not be broadcast together with shapes (16,3,3)
+(16,2,1))**. This release fixes the crash outright and drags the hidden
+fallback reason into the report where it can be aimed at.
+
+### Fixed — a material visible only in reflections no longer crashes the plan
+
+The off-screen probe — how a material with no pixel on screen still
+gets its secondary pass, sixteen samples spread over its own triangles
+— built 2-wide synthetic barycentrics. `gbuf.bary` is (H,W,3) and
+`raster.fetch` requires (N,3); the shapes collided on the first scene
+that actually exercised the path, which was the field's. The probe now
+builds full three-component barycentrics (1/3, 1/3, 1/3: the triangle
+centroid), and the path finally has the test that should have shipped
+with it: a glass floor (IOR 1.0, rays pass straight through) over a
+self-lit plane the z-buffer occludes everywhere, plus the mirror. The
+plan qualifies, the hidden material gets its probed pass, the frame's
+own refraction rays land on it ([3] confirmed by the BVH), the frame
+matches `render()` at **0.00002**, and recolouring the hidden plane
+moves the picture by 0.25 — through the glass alone — with the GPU
+tracking the recolour exactly.
+
+### Added — the silent CPU fallback now names itself in the report
+
+`render()` prints shade_frame's rejection to the console and shades on
+the CPU; the report's match then reads 0.000012 — CPU against CPU — and
+looks like victory. The RAY-REFRACTED section now calls `shade_frame`
+DIRECTLY after the warm render and prints the verdict into the report:
+`shade_frame directly: OK` or `shade_frame directly: FELL BACK:
+<reason>`. If the stage table shows both shade lines, the line below it
+now says why — that reason is the whole next round.
+
+### For the field scene
+
+Material.003 — whatever surface hides where only the Water's rays can
+see it — now probes instead of crashing. F12 again: either the frame
+qualifies, or the console names the next layer. And Run Self Test once
+more: the FELL BACK line will name what the driver rejects.
+
+---
+
+## [1.25.36] — 2026-07-30
+
+The first picture of the field scene arrived — checkerboard plane, palm,
+grand piano, noise-rippled water, banded sky; the exact mid-90s image
+this engine exists to make — and its console named the next wall:
+**'Water' reflects the world: the BANDS sky mode is not in the deferred
+pass yet**. So the water reflects too, and the sky it reflects is the
+quantised gradient. This release ports it.
+
+### Added — the simple sky modes join the environment term
+
+`sky.solid`, `sky.gradient` and `sky.bands`, term for term, with every
+world constant baked into the reflective materials' passes: the
+horizon/zenith/ground colours, horizon height, falloff, the blend curve
+(LINEAR/SMOOTH/SHARP/EASE), the band count and softness with the same
+quantise-in-the-blend-parameter arithmetic, the below-horizon ground
+branch, and the strength multiplier — exactly as `evaluate()` applies
+them. Rotation is correctly absent: it spins x and y, these formulas
+read only the ray's z. STARFIELD, BRYCE, PHYSICAL and HDRI still refuse
+by name; the ground PLANE (a traced surface, not a sky) still refuses.
+
+Seam numbers, headless: the complete field frame — noise-into-Bump
+REFLECTIVE wavy glass under a BANDS sky, with the mirror — matches
+`render()` at **0.00001**, with the banding load-bearing against a
+smooth gradient (0.026). GRADIENT qualifies and matches identically.
+
+### Added — the self-test corners the missing milliseconds
+
+The 1.25.35 report proved the shade split honest (28 ms accounted) and
+the section still 383 ms — so the hole is OUTSIDE the shade stage. The
+RAY-REFRACTED section now prints the warm GPU render's full stage-by-
+stage frame breakdown, the same table the field console shows. Whatever
+stage holds the missing ~350 ms has nowhere left to hide. (The section
+also gains the field's own sky: BANDS, reflective water included.)
+
+### For the field scene
+
+Water's console trail so far: refraction → ported; the Normal chain →
+rays bend; the Bump node → height pre-pass; the noise height → CPU
+image; the BANDS sky → this release. Each layer was named, each is
+lifted. F12 again — and if a next layer exists, the console will name
+it, as it has named every one before.
+
+---
+
+## [1.25.35] — 2026-07-30
+
+The 1.25.34 report held two teeth. The Bump machinery proved exact on
+hardware (0.000012, 0 px) but its section ran SLOWER than the CPU — 355
+ms against 325 — and the field scene peeled to Water's actual core:
+**ShaderNodeTexNoise feeding the Bump height**, the sin-fract wall this
+project built on purpose. Both fall this release.
+
+### Fixed — the 355 ms: a texture-cache stampede, not the new code
+
+The upload cache held 24 entries and its eviction policy was *clear
+everything*. The moment a frame's working set crossed the cap — and the
+Bump height map was the texture that tipped it — every warm frame
+re-packed and re-uploaded everything it had just evicted, the 33 MB
+shadow atlases included. A 60 ms section became 355 over ONE texture of
+growth. The cache now holds 64 entries, moves hits to the end, and
+evicts the least-recently-used half — a working set that fits never
+loses a member. The section also prints its full shade split now
+(plan / pack+upload / draw+read / sweeps / other), so a cost like this
+can never hide in a catch-all again.
+
+### Added — sin-fract heights evaluate on the CPU, into the pre-pass
+
+The Noise-family refusal exists because a driver's float32 sin
+decorrelates the sin-fract hash — the GPU would render a DIFFERENT
+pattern. But the Bump pre-pass is only an IMAGE. So a height chain the
+emitter refuses no longer refuses the material: the renderer's own
+evaluator produces the height image on the CPU — float64 sin and all,
+exactly — and the GPU takes its neighbour differences from that image
+by texelFetch, precisely as it would from a GPU-rendered pre-pass. The
+honest cost: one height-chain evaluation over the material's pixels per
+frame. The honest boundary: noise driving a COLOUR still refuses by
+name — that would need per-pixel colour from the CPU, which is the
+whole frame's job, not an image's.
+
+Seam numbers, headless: **NOISE-into-Bump wavy glass under ray tracing
+matches `render()` at 0.00001**, the pre-pass confirmed CPU-evaluated,
+the noise load-bearing (strength moves the glass by 0.72).
+
+### Self-test
+
+The RAY-REFRACTED section now renders the exact Water anatomy — Blender
+noise through Bump into the master Normal socket, refraction, mirror —
+and prints the full shade split.
+
+### For the field scene
+
+Noise-into-Bump was the last named layer of Water's console trail. If
+nothing else hides behind it, this is the release where the
+eleven-second shade moves to the GPU.
+
+---
+
+## [1.25.34] — 2026-07-30
+
+The 1.25.33 report proved the bent-ray machinery on hardware (wavy glass
+at 0.000012, 0 px) — and the field scene answered with what its Water is
+actually made of: **ShaderNodeBump**, height-driven, not a Normal Map.
+The last refusal standing in that scene's console was an emitter gap.
+This release closes it.
+
+### Added — the Bump node shades on the GPU
+
+`n_bump`'s exact algorithm, split the only way a fragment shader can run
+it:
+
+- **A height pre-pass per Bump node**: the height chain — textures,
+  patterns, generated coordinates, whatever feeds it — renders to its
+  own full-screen target over the same ids texture, writing
+  `(height, 0, 0, keep)`. Alpha is the material's own coverage, which is
+  exactly `n_bump`'s validity mask.
+- **The main pass takes the CPU's own differences**: the +x and +y
+  neighbour texels fetched by `texelFetch` with INTEGER coordinates
+  (the sampler lottery stays closed; explicit edge guards because
+  out-of-bounds texelFetch is undefined on a driver), gated on the
+  neighbour's coverage, then
+  `normalize(n − invert·strength·distance·(t·dhdx + b·dhdy)·20)` with
+  the renderer's own tangent basis.
+- **Hit shading treats the node as a wire** — `trace()` shades hits with
+  `ctx.px` None and `n_bump` passes its Normal input through there — and
+  **ray construction still bends**, through the CPU-evaluated chain the
+  last release added. A Bump inside another Bump's height chain refuses
+  by name.
+
+Seam numbers, headless: a Bump-driven master material against `render()`
+at **0.00003**, with the bump load-bearing (strength moves the ball by
+2.19) — and the complete field shape, **Bump-driven wavy glass under ray
+tracing**, at **0.00001**.
+
+### Self-test
+
+The RAY-REFRACTED DEFERRED FRAME section now builds its wavy glass with
+the Bump chain — height pre-pass, texelFetch differences, bent rays,
+refraction and the mirror, all in one frame on your driver. This is the
+exact shape the field scene's Water takes.
+
+### Noted
+
+One honest asterisk carried from the CPU: `n_bump`'s validity mask is
+the shading batch, so on the CPU a frame large enough to split into
+several chunks (over ~262k fragments per material) can see gradient
+seams at chunk boundaries that the GPU — which shades the whole material
+in one pass — does not reproduce. At working resolutions a material is
+one chunk and the two agree to the numbers above.
+
+---
+
+## [1.25.33] — 2026-07-30
+
+The 1.25.32 report: refraction proven on hardware first try (0.000017,
+0 px, glass and mirror in one frame) — and the field scene answered with
+its next wall, the most water-shaped refusal possible: **'Water' bends
+its refraction rays with a Normal chain, which the rays are built
+before**. Of course it does. Water is normal-mapped waves. This release
+builds the rays after the bend.
+
+### Fixed — secondary rays bend with the Normal chain
+
+Ray construction now evaluates the master Normal chain for exactly the
+ray pixels, with the CPU's own closure code — `GraphEvaluator` through
+`closure_to_surface`, the same calls `shade_batch` makes — so a
+normal-mapped material builds the same reflection and refraction rays
+on either device, **by construction**, not by approximation. The two
+Normal-chain refusals are gone.
+
+Honest cost note: this is the one slice of a ray-traced frame that
+still runs the node evaluator on the CPU, proportional to the ray
+count, not the frame. It is the price of an exact zero today; a
+GPU-side bend pre-pass can replace it later if it earns a zero of its
+own.
+
+Seam numbers, headless: normal-mapped wavy glass (the Water shape —
+master graph, Normal chain, flat tint, Opacity 0.4, IOR 1.33) plus the
+mirror, against `render()` with ray tracing ON: **max 0.00001** — with
+proof the chain is load-bearing (flattening Bump Strength moves the
+glass by 0.70, so the match is not vacuous).
+
+### Self-test
+
+The RAY-REFRACTED DEFERRED FRAME section now renders **wavy** glass —
+the normal-mapped master graph — so the next report proves the exact
+field shape on the driver, bent rays and all.
+
+### For the field scene
+
+If Water's base colour is flat, this is the release that moves the
+eleven-second shade to the GPU. The remaining named gates a Water could
+still hit: a base colour that varies per pixel (the refraction tint
+must be constant), a per-pixel IOR, per-pixel Specular Color on a
+reflective material. The console names whichever applies, per material,
+as always.
+
+---
+
+## [1.25.32] — 2026-07-30
+
+The 1.25.31 report read zero — the reflected frame at 0.000048 with 0 px
+off, the texelFetch fix confirmed on hardware, the one-bounce arc proven
+end to end. So this release takes the next wall, and it is the one the
+field scene names: **refraction**.
+
+### Added — ray refraction shades on the GPU
+
+The refraction half of `_add_raytraced`, term for term, on the secondary
+machinery reflections already proved:
+
+- **Rays**: per-fragment eta chosen by which side the camera sees
+  (`dot(N,V) < 0` → exiting), GLSL `refract` with the total-internal-
+  reflection fallback to a mirror bounce, origin stepped INTO the
+  surface by the raw ray bias.
+- **Hits** shade through the same secondary passes (env on, backface
+  off, camera V), misses fall to `world_color` along the transmitted
+  ray.
+- **The blend is the CPU's lerp**: `rgb*(1−k) + hit*k*diffuse` with
+  `k = (1−opacity)·refraction` — applied AFTER the reflection add,
+  in `_add_raytraced`'s order. Glass and mirrors share one tree in one
+  frame, and a material may be both.
+- The tint needs the primary pixel's base colour as a constant, so the
+  probe now remembers a FLAT base colour even for graph materials —
+  which is what qualifies a real converted Water material — and a base
+  colour that varies per pixel refuses by name. Per-pixel IOR refuses;
+  a Normal chain on a refracting material refuses (the rays are built
+  before the bend); a varying Refraction Amount refuses through the
+  standard constancy probe.
+
+Seam numbers, headless: the glass frame against `render()` at
+**0.00001**; refraction changes the glass by 2.3 (no vacuous matches);
+refraction OFF under ray tracing still qualifies and matches the CPU
+without the lerp; texture-tinted glass refuses with the varying-colour
+message.
+
+### Self-test
+
+A **RAY-REFRACTED DEFERRED FRAME** section: glass Ball AND mirror Box in
+one frame, both sweeps, whole render both ways — max difference, >0.01
+pixel count, timings, and the combined traced-sweep slice.
+
+### For the field scene
+
+'Water' was the one named refusal left. If its base colour is flat and
+its IOR unlinked, this release moves it — and the ten-second shade —
+to the GPU. If anything still refuses, the console names it, per
+material, as always.
+
+---
+
+## [1.25.31] — 2026-07-30
+
+**Found it.** The 1.25.30 probes ended the hunt: fresh textures flip the
+same 95 (texture-state theory dead), the path is deterministic, and the
+flip dumps were the confession — `cpu id 0, t 0.196` → `dev id −1,
+t 1e+30`, and one `t 0`, which is a tmax read back as zero. The flipped
+rays sit at indices 122, 245, 367: **once per row of the 245-wide rays
+texture, every one a row-boundary-adjacent texel** (an org at x=244
+whose dir wraps to the next row; an org at x=0 of a row). The `t 0` case
+means the fetch landed on a neighbouring DIR texel, whose `.w` is 0 by
+layout.
+
+The mechanism: `texture()` with computed normalized coordinates can
+resolve to the adjacent texel at specific (position, texture-side)
+combinations — side 283 reads clean on this driver, side 245 does not.
+Data-texture exactness through the sampler is a texture-size lottery,
+and every measured zero this project has earned through `texture()` was
+earned at sides that happened to win it.
+
+### Fixed — compute kernels fetch data by texelFetch
+
+Integer texel addressing, exact by specification, no sampler in the
+chain. Applied to every driver-only compute source:
+
+- the occlusion and closest-hit wrappers' RAY fetches (where the flips
+  were caught), with integer index arithmetic throughout;
+- the compute rasteriser's corner, bin and tile fetches — its zeros were
+  real but earned at lucky sides, so it exits the lottery too, and the
+  next report's DIFFERING PIXELS integer re-proves it.
+
+The FRAGMENT variants keep `texture()`: they are what the NumPy
+front-end runs, every headless proof is built on them, and the shared
+BVH texel helpers stay with them — fragment-measured at zero across the
+shadow and kernel sections. A new test locks the split: compute sources
+must texelFetch their data and strip clean, fragment sources must stay
+front-end shaped.
+
+Expected next report: RAY-REFLECTED DEFERRED FRAME at ~0.000048 with
+0 px off, the DIAGNOSIS block silent, and every existing zero still a
+zero.
+
+### Verified
+
+Full suite green from the packaged zip — kernels, rasteriser, seams,
+and the new exact-fetch guard.
+
+---
+
+## [1.25.30] — 2026-07-30
+
+The 1.25.29 diagnosis came back perfectly sharp: **95 = 95 = 95**. Every
+bad pixel is on the mirror, every one is a trace flip, and the trace
+flips account for all of them — the secondary shading and the composite
+are fully exonerated. This release acts on that number.
+
+### The contradiction, and the one suspect left standing
+
+The same box-pixel rays — bit-identical values — sit inside the 40,000
+kernel-section rays that read **zero** mismatches on the same driver. So
+the flips cannot be a function of the ray or of the tree content (the
+ray-shadow frame reads the same cached tree textures across 172,800
+pixels at zero). Ruled out this round, by computation: texel-centre
+rounding for both ray-texture sides (worst deviation 7e-6 texels against
+a half-subtexel budget of 2e-3), and ulp sensitivity (previously: zero
+flips at 1e-6 jitter). What remains is the one thing the failing path
+does that no proven path does: it samples texture objects in a COMPUTE
+dispatch that fragment passes had previously sampled — the kernel
+sections upload fresh textures that only ever see compute, and the
+flips are deterministic, which fits per-object image state and not a
+race.
+
+### Fixed (most probably) — the compute trace owns its textures
+
+`intersect_frame` no longer reuses the texture objects the ray-shadow
+fragment passes bind. It keeps its own cached copies of the tree under
+compute-only keys, so no texture object ever crosses the
+fragment/compute boundary in either direction. Two copies of a small
+tree in VRAM is the price. If the theory is right, the reflected
+frame's next run reads 0 px off and the DIAGNOSIS block never prints.
+
+### Added — and if it still disagrees, the section digs deeper
+
+When trace flips remain, the DIAGNOSIS now also prints: the same frame
+rays through the fresh-texture kernel path (separating texture state
+from arithmetic conclusively), the cached path against itself
+(nondeterminism check), and the first three flips as `cpu id/t → dev
+id/t` — near-t neighbours would mean arithmetic; wild values would mean
+misread data.
+
+### Verified
+
+Full suite green from the packaged zip; the reflection seams
+(0.00002), the full ray stack, and the headless no-driver degradation
+of the reworked `intersect_frame` all hold.
+
+---
+
+## [1.25.29] — 2026-07-30
+
+The reflected frame's first hardware run disagreed: 95 pixels of 172,800
+off by more than 0.01, max 0.459 — where the headless seam holds at
+0.00002, and every other section (the closest-hit kernel itself included)
+still reads zero. This release does not guess at the cause. It makes the
+self-test find it.
+
+### Added — the reflected-frame section diagnoses itself
+
+When the RAY-REFLECTED DEFERRED FRAME disagrees, the section now rebuilds
+the frame's exact reflection rays and prints the numbers that decide the
+next round:
+
+- **whose pixels the bad ones are** — on the mirror vs elsewhere;
+- **frame-ray trace agreement** — the same rays through `bvh.intersect()`
+  and through the device kernel, hit id against hit id (the 40,000-ray
+  kernel sample reads zero; this is the exact frame population instead);
+- if the trace disagrees: how many bad pixels are trace-flipped;
+- if the trace agrees: how many bad pixels are ray MISSES (the
+  `world_color` composite path) versus hits (the secondary-pass shading)
+  — which splits the remaining suspects cleanly.
+
+Ruled out already, headlessly: ulp-scale ray sensitivity (perturbing the
+frame's 29,967 rays by up to 1e-6 flips ZERO hits, so this is not
+silhouette float-dust), and driver-strictness of the secondary sources
+(the strip-declarations lint now runs over the reflection passes too —
+they come back clean, and that check stays in the suite).
+
+### Fixed
+
+- `intersect_frame` now degrades with a reason on a machine with no GPU
+  module instead of raising — found by dry-running the new diagnosis
+  path headlessly.
+
+### Verified
+
+Full suite green from the packaged zip, including the extended
+driver-strictness test over the secondary passes.
+
+---
+
+## [1.25.28] — 2026-07-30
+
+**Ray-traced reflections shade on the GPU.** The refusal this whole arc
+existed to lift — "ray tracing shades recursively on the CPU" — lifts:
+a frame with ray tracing ON at depth 1 now rasterises, shades, traces
+its reflections and shades the hit points entirely on the driver, and
+matches `render()` to 0.00002 headlessly. The self-test's closest-hit
+gate passed first (0 mismatched hits in 40,000, ties decided by the
+baked visit order, 80.5 ms → 1.9 ms), and this release stands on it.
+
+### Added — one traced bounce, the whole formula
+
+- **Rays** are built exactly as `_add_raytraced` builds them: the
+  unflipped interpolated normal, the camera V, the RAW ray bias (no
+  floor — the shadow branch's floor is the shadow branch's), directions
+  mirroring V about N, tmax 1e30.
+- **Hits** come from the closest-hit kernel already proven tie-for-tie
+  against `bvh.intersect()`, through a frame-rate dispatcher that rides
+  the same content-fingerprint upload cache as every atlas.
+- **Hit points shade as a second G-buffer**: the hits become an ids
+  texture aligned with the primary pixels, and every material in the
+  MESH — including materials with no pixel on screen, probed over their
+  own triangles, because a mirror can see what the camera cannot — gets
+  a secondary pass. Two deliberate differences from the primary pass,
+  both because they are what the CPU does: the environment term is ON
+  (the depth-exhausted branch shades hits with it) and the backface
+  override is OFF (`trace()` shades hits with `front=None`). The
+  secondary V is the camera's — `ctx.I` is always `P − eye` on the CPU,
+  hits included — so the same `hal_eye` uniform serves both passes.
+- **The composite is `_add_raytraced`'s own blend**: hit colour (or
+  `world_color` along the ray for misses — computed by the renderer's
+  own function, so ANY world is exact there, however rich the sky) times
+  reflect × specular × reflect colour, a per-material constant.
+- **Ray shadows and reflections run together**: one frame can walk the
+  same two BVH textures for both, and the full stack matches the
+  renderer at 0.00002.
+
+### Honesty at the edges — refusals, named, per material
+
+Ray depth beyond 1 ("depth 1 travels: one traced bounce, then the
+environment"); a refracting material under ray refraction; a reflective
+material whose Normal chain would bend the rays; a reflective material
+scaling its reflection by per-pixel Specular Color; screen-space shader
+inputs anywhere in a reflective frame (a hit point has no screen
+position — `ctx.px` is None on the CPU too). Ray tracing ON with
+reflections OFF qualifies and mirrors the CPU exactly: no traced bounce
+and no env term either.
+
+### Self-test
+
+A **RAY-REFLECTED DEFERRED FRAME** section renders the whole pipeline
+both ways — ray tracing on, mirror Box, one bounce — and prints the max
+difference, the >0.01 pixel count, CPU vs GPU whole-render timings, and
+the trace + secondary-pass slice. The CPU side of that frame measures
+~1.1 s in development; the GPU side is expected in the tens of
+milliseconds. This is the section aimed at the field scene's
+eleven-second shade.
+
+### Verified
+
+Full suite green from the packaged zip, including: the reflection seam
+test against `render()` with ray tracing ON (max 0.00002, with proof the
+mirror really reflects — removing ray tracing moves it by 0.53), the
+full-stack RAY-shadows-plus-reflections test, every named refusal above,
+and the no-reflection no-env mirror case.
+
+---
+
+## [1.25.27] — 2026-07-30
+
+The reflections arc opens, on the same rhythm that carried ray shadows:
+kernel first, proven headlessly to the last bit, then measured on real
+hardware, then — next round — integrated into the deferred pass.
+
+### Added — the closest-hit kernel
+
+`hal_bvh_intersect` in `gpu/rtrace.py`: the stackless threaded walk now
+answers *which* triangle, not just *whether*. It is `bvh.intersect()`
+operation for operation:
+
+- The slab test prunes against the **live best t** — as hits shrink it,
+  whole subtrees stop qualifying, exactly as the CPU's `best_t[rays]`
+  bound does.
+- Möller–Trumbore with the identical epsilon set, strict `t < best_t`,
+  and the **original** triangle id riding the packed texture's spare
+  channel (float32 is id-exact to 2²⁴ triangles).
+- **Ties are the point.** This is what the threaded links were built for
+  back in 1.25.22: the CPU pops LIFO (right subtree first) and keeps a
+  hit only when strictly closer; within a leaf, argmin keeps the first
+  of equal minima. The links bake that exact visit order, so the
+  sequential walk agrees on every tie by construction. The test forces
+  the case outright with byte-identical duplicated triangles — several
+  ids hitting at the *same* t — and the kernel picks the CPU's winner
+  every time, including rays whose winner IS a duplicate.
+- A miss leaves t at tmax and returns id −1, exactly as the CPU leaves
+  `best_t` — the integration will read misses straight into the
+  world-colour fallback `trace()` uses.
+
+Verified headlessly at **zero mismatched hit ids and 0.0 difference in
+t, u, v** — box-random rays, forced ties, and the exact reflection shape
+`trace()` will cast (surface origins along `reflect(−V, N)`, tmax 1e30).
+
+### Added — the self-test measures it on your driver
+
+A **CLOSEST-HIT KERNEL** section: 40,000 reflection rays off real
+G-buffer surfaces, `MISMATCHED HITS` as the integer that matters, t and
+barycentric agreement, CPU vs compute timings. For scale: the CPU side
+of that query measures ~500 ms here — closest-hit cannot early-out the
+way any-hit does, which is exactly why this kernel is the one that
+matters for the field scene's eleven-second shade.
+
+### Next
+
+Reflections into the deferred pass: trace reflect rays for the pixels
+whose material reflects, shade the hit points through the same
+per-material passes (the secondary "eye" is the primary surface point),
+composite with `trace()`'s own blend — misses to the world colour, hits
+scaled by reflect × specular × reflect colour. Single bounce first,
+depth after, and the plan-level "ray tracing shades recursively on the
+CPU" refusal lifts only when the whole formula travels.
+
+---
+
+## [1.25.26] — 2026-07-30
+
+The viewport field report round. 1.25.25's rendered mode works — and the
+report named its two flaws precisely: poor fps, and updates only when the
+camera stops moving. Both trace to one design error, fixed here. The same
+report's self-test also delivered the ray arc's integration proof, now
+recorded where the UI reads it.
+
+### Fixed — the viewport updates only at rest
+
+The bug was the coalescing being too eager: every camera movement aborted
+the in-flight render. And since aborts could only land between render
+stages, each render burned most of its work before dying — so during an
+orbit, *nothing ever completed*. The preview only updated when the camera
+finally rested long enough for one render to survive. Three changes:
+
+- **Drafts always finish.** While the view is in motion (within 0.35 s of
+  its last change) the worker renders at `preview_scale × 2` — a quarter
+  of the pixels — and those frames are never aborted. An orbit now
+  streams coarse frames continuously instead of showing a frozen stale
+  one.
+- **Rest refines.** The moment the view rests, the parked draft re-kicks
+  at full preview quality; a resting viewport with its full frame kicks
+  nothing and costs zero. Entering rendered mode also counts as motion,
+  so the *first* picture arrives at draft speed and then sharpens.
+- **Aborts are back where they belong**: a full-quality refine overtaken
+  by new motion (its draft is already on screen — nothing is lost), and
+  anything belonging to a re-exported scene. And they land fast now:
+  `render()`'s progress callback ticks **between shading chunks**, not
+  just between stages, so an abort interrupts the expensive part instead
+  of politely waiting for it to finish. (F12 gets the same courtesy: a
+  cancelled render stops mid-shade, and the progress bar moves through
+  the shade stage instead of jumping over it.)
+
+### Fixed — viewport fps: the BVH was rebuilt every frame
+
+A ray-shadowed or ray-traced scene rebuilt its BVH on *every* `render()`
+call — ~0.2 s per orbit step on the field scene, for a tree that depends
+only on the mesh. `render()` now caches the BVH on the scene object
+behind a strided content fingerprint (the same idiom as every GPU upload
+cache): a viewport orbit builds it once, an animation of a still mesh
+builds it once, an edited mesh rebuilds it. Locked by test, including
+that two renders of one scene share one tree and produce identical
+frames.
+
+Expectations, honestly stated: the preview renders on the CPU (worker
+threads have no GPU context), so its ceiling is the CPU frame at draft
+resolution. The real fps answer is the ray arc finishing — reflections
+are the next stage — after which the heaviest scenes stop refusing the
+GPU path on F12, and a viewport GPU mode becomes worth designing.
+
+### Changed — the capability table records the driver proof
+
+The self-test on real hardware (RTX 5060 Ti, Vulkan) measured the
+ray-shadowed deferred frame at **0.000048 whole-frame, zero shadow-edge
+pixels flipped in 172,800, 538.7 ms → 21.6 ms**. That was also the first
+time the stackless BVH traversal ran as a *fragment* shader on a real
+driver — the while-loop walk holds there exactly as it did as compute.
+The raytrace capability row now carries those numbers; reflections and
+AO are what keep the flag NOT_YET.
+
+### Verified
+
+- The viewport test now drives the draft/refine/abort state machine with
+  an injected clock: first-entry drafts, rest refines to a frame that
+  matches `render()` + post **exactly**, motion never aborts a draft,
+  motion does abort a refine, scene exports abort everything of the old
+  scene.
+- Full suite green from the packaged zip.
+
+---
+
+## [1.25.25] — 2026-07-30
+
+Two fronts. Ray-traced shadows move into the deferred GPU pass — the first
+stage of the ray-tracing arc to ship, standing on the occlusion kernel the
+last report proved at 0 mismatched rays in 40,000 on real hardware. And the
+viewport's rendered mode, reported dead in the field, is rebuilt from the
+ground up.
+
+### Added — hard ray-traced shadows shade on the GPU
+
+Shadow Method RAY no longer refuses the deferred pass. The port is
+`visibility()`'s own RAY branch, term for term:
+
+- The BVH travels as **two textures shared by every ray light** — nodes
+  (bounds + the stackless traversal links) and leaf-ordered triangles —
+  in the same cached-upload idiom as the shadow-map atlases, keyed on a
+  content fingerprint so an unchanged mesh never re-packs or re-uploads.
+- Each ray light's visibility function is emitted with the CPU's exact
+  arithmetic: origin biased along the shading normal AND the light
+  direction by `max(ray_bias, 1e-4)`, the ray clipped at
+  `dist * (1 − 1e-3)` (1e9 for a SUN), one `hal_bvh_occluded()` call —
+  the traversal already proven against `bvh.occluded()` — and **no
+  density term**, because the CPU's RAY branch applies none.
+- The texture sides bake into the traversal as literals; the plan
+  signature fingerprints the mesh, so a changed BVH re-plans and re-bakes.
+  No new uniform plumbing anywhere.
+- Honesty at the edges: **soft ray shadows** (a light with radius under
+  more than one shadow sample) average a random stream whose sequence the
+  CPU batch layout owns — refused by name, per light. A RAY frame whose
+  job carries **no BVH** mirrors the CPU exactly (fully lit, qualifies).
+  Radius with `shadow_samples = 1` is the hard path on both devices.
+
+Seam test: the demo scene under Shadow Method RAY, GPU frame vs
+`render()` itself — **max difference 0.00001** headlessly, with proof the
+shadows are really in the picture (removing them moves the frame by 1.6).
+Run Self Test gains a **RAY-SHADOWED DEFERRED FRAME** section that renders
+the whole pipeline both ways on your driver and prints the max difference,
+a count of pixels off by more than 0.01 (where a flipped shadow-edge ray
+would land), and the CPU/GPU timings.
+
+The capability table now tells the ray story as it stands: shadows in,
+reflections next, AO after. The blanket "ray tracing shades recursively on
+the CPU" refusal still guards scenes with ray *reflections* on — that is
+the next stage of the arc, not an oversight.
+
+### Fixed — viewport rendered mode rebuilt
+
+The field report: rendered mode draws nothing at all. The old path did all
+of its work — export, render, post — **synchronously inside Blender's draw
+callback**, freezing the whole UI for seconds per redraw on a real scene,
+and it ran the GPU stages inside the viewport's own draw under Vulkan,
+which is the prime suspect for the permanent blank: any failure fell into
+a silent `return`, leaving the viewport empty forever with nothing on
+screen and nothing in the console.
+
+Rebuilt on the shape Blender's own engines use:
+
+- `view_update` exports on the main thread (where bpy access is legal) and
+  hands the bpy-free scene to a **background worker**; `view_draw` only
+  blits the newest finished frame. The UI never waits on a render again.
+- An orbit **coalesces**: a newer view aborts the in-flight render at its
+  next progress tick and re-kicks, so the preview catches up to where you
+  are instead of queueing every intermediate step.
+- The worker renders **CPU-only** (device, shading, raster, post all
+  forced to the CPU path for the preview): worker threads have no GPU
+  context, and nothing GPU-shaped ever runs inside a draw callback again.
+  The look is still the F12 look — dither, CRT, the whole post chain, at
+  1/N resolution per the existing Preview Scale setting.
+- **No silent blanks.** Every failure prints one `[Halcyon viewport]`
+  line with the traceback, once per distinct reason. While the first
+  frame renders, the region fills with the world colour instead of
+  nothing, so entering rendered mode visibly did something.
+- The blit is TRI_STRIP (the fan `draw_texture_2d` still uses leaves in
+  Blender 6.0 and was flooding consoles with one deprecation warning per
+  redraw), uploads through the buffer protocol instead of `.tolist()`,
+  composites premultiplied so Film > Transparent works, and the viewport
+  camera now carries the region's real PERSP/ORTHO type instead of
+  assuming perspective.
+
+The working half lives in a new bpy-free module, `preview.py`, and the
+suite drives the exact loop Blender will: export in, want a view, kick,
+park a frame, re-kick only when the camera or scene moved. The parked
+frame is checked against `render()` + the post chain **exactly** (max
+difference 0.0). What remains Blender-side — the draw idiom, the redraw
+tags — is deliberately thin, and every piece of it reports rather than
+blanks.
+
+### Verified
+
+- Full suite green from the packaged zip, 113 s: the new RAY-shadow seam
+  test, the headless viewport-machinery test, the flipped RAY-mode
+  negative (no BVH → fully lit → qualifies), and every existing test.
+
+---
+
+## [1.25.24] — 2026-07-30
+
+The clean console from 1.25.23 named both real problems in one screen.
+This is the F12 release: the difference between the GPU port working in a
+report and working on the render button.
+
+### Fixed — "No active GPU context found" on F12
+
+`bl_use_gpu_context = True` on the render engine. The final render runs on
+a render thread where Blender's `gpu` module has no context unless the
+engine asks for one — so every GPU stage fell back to the CPU the moment a
+real F12 ran, while twenty rounds of self-tests (operators, main thread,
+context present) measured perfectly. One class attribute; the whole
+distinction.
+
+### Fixed — a GPU switch over a CPU render
+
+The 10.7-second frame was `gpu_shading` stored OFF in the scene from an
+older version, silently, under a switch that said GPU. Two changes so that
+cannot recur: **flipping the device switch to GPU now turns the proven
+stages on** (the Debug toggles still opt out individually, and flipping to
+CPU changes nothing), and when a stage IS toggled off under the GPU
+device, the console says so in one plain line each instead of printing a
+six-month-old note about narrow scope. The device tooltip now describes
+what GPU actually does in 2026 rather than what it did in the post-only
+era.
+
+### Noted
+
+The field scene ray-traces — the deferred pass refuses it correctly and
+says so. That is not a bug; that is the ray-tracing arc's job, already
+under way: the BVH occlusion kernel is verified headless and awaiting its
+first driver numbers in the next Run Self Test.
+
+---
+
+## [1.25.23] — 2026-07-30
+
+A field report from a real render on 1.25.21: a console full of errors and
+no picture. Triage first, honestly.
+
+### Not ours — the KeyError that looks fatal
+
+`Error in bpy.app.handlers.depsgraph_update_pre[6]: KeyError: 'bpy_prop_
+collection[key]: key "Camera" not found'` — **Halcyon registers no
+application handlers at all.** That is another add-on looking a camera up
+by the literal name "Camera" and dying when a scene's camera is named
+anything else. Disable other add-ons one at a time to find it (or rename
+the camera to "Camera" as a stopgap). It fires on every scene change,
+which is what made the console look catastrophic.
+
+### Ours — the deprecation flood, silenced properly
+
+- **`use_nodes`**: Blender 5.2 warns on *every read* ahead of the 6.0
+  removal — ten materials times every export made real errors unfindable.
+  `compat.uses_nodes()` / `compat.enable_nodes()` keep the 5.x semantics
+  (a legacy material with the toggle off still renders from its flat
+  settings) while suppressing only the deprecation warning, and become
+  correct no-ops when the attribute disappears.
+- **`TRI_FAN`**: the fullscreen quad now draws as a `TRI_STRIP`. The fan
+  is deprecated and *leaves* in 6.0 — this one was a warning today and a
+  broken GPU pipeline next year. The strip cuts the quad along the other
+  diagonal, which changes nothing: a fullscreen quad's varyings are
+  affine, so interpolation is identical however the quad is split.
+
+### Still open — "no renders"
+
+Nothing in the pasted console shows a Halcyon traceback, and the engine
+prints one and reports to the UI on any render failure — so the actual
+blocker is not yet in evidence. The next report needs: the FULL console
+from one F12 (any `Traceback (most recent call last)` lines especially),
+what the Render Result window showed (black, empty, never opened), and
+whether the top-of-panel switch was on CPU or GPU for that render.
+
+---
+
+## [1.25.22] — 2026-07-30
+
+The ray-tracing arc opens — the piece 1.26.0 waits for. First kernel:
+any-hit BVH traversal, the foundation under ray shadows, reflections and
+ambient occlusion alike.
+
+### Added — the BVH occlusion kernel, and it IS bvh.occluded()
+
+The traversal is **stackless**: the verification front-end supports
+divergent while-loops but not dynamic array writes, so instead of a
+traversal stack, every node carries two links precomputed at pack time —
+`first` (the child visited first) and `miss` (where to go when a subtree
+is done or skipped). One scalar walks the whole tree. The links bake the
+CPU's *exact* LIFO order — right subtree first — which any-hit never
+needs but closest-hit ties will, so `intersect` inherits the right
+tie-breaks for free the day it ports.
+
+Everything numerical mirrors `bvh.py` to the operation: the slab test
+with its sign-losing 1e12 fallback, Möller–Trumbore with the exact
+epsilon set. The bar stayed an integer and was met: **zero mismatched
+rays** against `bvh.occluded()` on box-random rays and on the real
+shadow-ray shape (surface origins toward a light, tmax at the light) —
+plus structural checks that the threading links are the pop order.
+
+### Added — the driver measures it
+
+The self-test's compute section now ends with the arc's first hardware
+number: 40,000 shadow rays from real G-buffer surface points toward the
+demo scene's point light, mismatch count (an integer) and CPU-vs-compute
+milliseconds. When your count reads zero, ray shadows move into the
+deferred pass next — then reflections, then AO, and 1.26.0's "complete"
+gets close.
+
+---
+
+## [1.25.21] — 2026-07-30
+
+Round twenty-two delivered the number the whole port aimed at: **a full
+`render()` call with both stages on the GPU at 19.0 ms against the CPU's
+218.6 — 11.5× — at max difference 0.000048**, byte-for-byte the same
+agreement the deferred pass alone has carried for ten rounds. The
+rasteriser added zero error to the frame.
+
+The 1.26.0 decision came back: *it needs to be complete — ray tracing and
+all that.* So 1.25.X continues, the ray-tracing arc opens next, and this
+release ships the other half of the answer.
+
+### Added — the CPU/GPU switch, first thing in render properties
+
+The device choice now sits at the top of the render properties panel as a
+two-button switch, where a device choice belongs. **Choosing GPU now means
+the GPU**: the three proven stages — rasteriser, shading, post — default
+ON. Each remains a Debug-panel toggle for opting back out per stage, the
+capability table still lives there, and every qualification rule is
+unchanged: anything a frame uses that the GPU does not reproduce falls
+back per stage with the reason printed. The full suite passes with the
+new defaults — headless, every GPU path degrades to the identical CPU
+frame, which is the fallback design doing exactly what it was built for.
+
+### Next — the ray-tracing arc
+
+The BVH is already texture-shaped: flat node arrays, contiguous leaf
+ranges, precomputed Möller–Trumbore edges, and two traversal entries —
+`occluded` (any-hit, shadow rays) and `intersect` (closest-hit,
+reflections). The port follows the established doctrine: pack, traverse
+in a kernel verified headlessly against `bvh.py` itself, then measure on
+hardware. Ray shadows first, then reflections, then AO.
+
+---
+
+## [1.25.20] — 2026-07-30
+
+Round twenty-one closed the race: **0 differing pixels and 3.2 ms against
+the CPU's 23** at working size — the read-back fix was indeed 54 of the 56
+milliseconds. The compute rasteriser has earned its place, and this
+release wires it into `render()`.
+
+### Added — GPU Rasteriser, opt-in in the Debug panel
+
+With Device: GPU, **GPU Rasteriser** routes the opaque pass through the
+compute kernel: pack, dispatch, read back, and reconstruct the G-buffer
+with `fill()`'s exact conventions — including the CPU's *own* third
+barycentric (the kernel's aux image now carries `b2` rather than leaving
+it to `1−b0−b1`), and `+inf` depth at empty pixels, which the transparent
+pass depth-tests against. Subsets (the opaque/transparent split), vertex
+snap, depth precision and culling all pass through.
+
+Strictly qualified, as everything here is: Painter's depth sort, affine
+texture mode (screen-linear barycentrics not carried yet), overdraw
+debugging and banded worker renders rasterise on the CPU with the reason
+printed. With no driver at all, the frame is untouched — the fallback
+test holds that.
+
+**Both GPU stages can now run together**: raster on the GPU, shading on
+the GPU, with the CPU left holding shadow maps, sky and resolve. The
+self-test's compute section now ends with exactly that race — a full
+`render()` call, both stages on, max difference and milliseconds against
+the all-CPU frame.
+
+### Housekeeping
+
+The GPU Shading tooltip had gone stale ("normal and bump chains" listed
+as not reproduced — normal chains shipped six releases ago); it now lists
+the true scope and the true refusals.
+
+### Verification
+
+- The reconstruction locked field by field: identical tri ids, bary
+  carrying the CPU's own b2, +inf empties, identical front flags.
+- The no-driver fallback renders a byte-identical frame.
+- Kernel exactness re-held across all six scenes after the aux change.
+
+---
+
+## [1.25.19] — 2026-07-30
+
+Round twenty delivered the number the whole rasteriser arc aimed at:
+**DIFFERING PIXELS: 0 of 76800** on real hardware. The kernel is fill() on
+the driver — every pixel, every tie, every clipped edge — and `rasterise`
+flips to BOTH in the capability table with that integer as its measurement.
+
+The same report showed the honest cost: compute warm 56 ms against the
+CPU's 12.1. This release is the diagnosis and the first two fixes.
+
+### Fixed — the read-back preferred to_list()
+
+`dispatch_compute` read images back through `.to_list()` — the exact
+316 ms-class mistake this project documented in round two and then made
+again in fresh code. It now uses the buffer protocol, exactly as
+`read_target` has all along, with `to_list()` only as a last-resort
+fallback.
+
+### Fixed — the binning was a Python triple loop
+
+The per-tile triangle expansion in `pack_raster_inputs` looped in Python
+per triangle per tile. It is now fully vectorised (repeat/cumsum block
+expansion, stable sort preserving submission order per bin — the order the
+tie semantics depend on). Pack+bin at 480×360 measures **0.65 ms**
+headless.
+
+### Added — the self-test splits the milliseconds and races working size
+
+The compute-rasteriser section now prints the warm split (clip+project /
+pack+bin / upload / dispatch+read) and adds the decision race at 480×360 —
+differing pixels and CPU-vs-compute milliseconds at the size where the CPU
+spends 66 ms. The compute path earns its way into `render()` when it wins
+that race; the next report says where the remaining milliseconds live.
+
+---
+
+## [1.25.18] — 2026-07-30
+
+The probe came back all green on the first guess — `gpu.compute.dispatch`,
+compute CreateInfo, image load/store, a correct read-back — and taught one
+constraint: no storage buffers, so everything rides textures, which is the
+shape the G-buffer already had. **The compute rasteriser is built.**
+
+### Added — the kernel, and it IS fill()
+
+`gpu/craster.py`: the CPU rasteriser's exact rules as one thread per
+pixel. The design that makes exactness possible is **per-pixel sequential
+resolve**: the screen is cut into 16×16 tiles, triangles are binned per
+tile on the CPU (vectorised, submission order preserved), and every pixel
+walks its tile's bin in order with the strict `<` depth test — first
+triangle wins ties because it is literally tested first, no atomics, no
+resolve pass, nothing order-dependent. Both-inclusive edge tests, the
+CPU's clamped-bounding-box guard, perspective correction after the depth
+decision, `l2` recomputed the CPU's way rather than as `1−l0−l1`.
+
+One shared GLSL core, two thin wrappers: a fragment-style one the NumPy
+front-end runs headlessly (per tile, so the loop bound is lane-uniform)
+and the compute one the driver runs. Headless verification, the bar being
+an integer: **zero differing triangle ids** across the demo scene, both
+cull modes, mixed winding, exact depth ties and near-plane-clipped
+geometry — with barycentrics to the ulp (1.6×10⁻⁷) and depth exactly 0.
+
+One expectation died honestly on the way: merely *coplanar* geometry is
+not a depth tie at the ulp — different corners round differently, and
+both implementations agree about that. The tie test now submits
+byte-identical triangles twice, and the first submission wins every
+covered pixel.
+
+### Added — the driver path and its proof harness
+
+`device.compile_compute` / `device.dispatch_compute` wrap the exact API
+shape the probe proved, and the self-test's compute section now runs the
+real kernel on the demo scene at 320×240 and **counts differing pixels**
+against the CPU G-buffer — an integer, not a tolerance — plus CPU
+rasterise vs compute cold/warm timings. Nothing renders through the
+compute raster yet: it earns its way into `render()` only after your
+driver's count reads zero.
+
+---
+
+## [1.25.17] — 2026-07-30
+
+The rasteriser round opens — with a study and a probe rather than code,
+because the study found a decision and the decision was made deliberately.
+
+### The finding — hardware rasterisation can never match this renderer
+
+The CPU rasteriser's rules are now written down as the port's
+specification: **both-inclusive** edge tests (`e ≥ 0` all, or `e ≤ 0` all
+— shared edges are covered by both triangles and the depth test decides),
+a strict `<` depth test (first triangle wins ties, in submission order),
+perspective correction from per-corner 1/w after the depth decision, and
+the front flag from the sign of the screen area. Hardware rasterisation
+uses the top-left fill convention, its own tie-breaks and its own
+interpolation — both are correct, and they disagree at triangle edges.
+A hardware draw could therefore never reproduce the CPU frame, and "the
+GPU frame is the CPU frame" is the doctrine every round of this port has
+been measured against.
+
+### The decision — a compute rasteriser
+
+The port will be a **compute-shader port of the CPU's own algorithm**:
+the same edge functions, the same depth rule (a two-pass atomic min —
+depth first, then lowest-triangle-id at the winning depth, which
+reproduces first-triangle-wins exactly), barycentrics recomputed with the
+CPU's formula rather than read from hardware interpolators. Same
+formulas, float32 both sides; residual disagreement shrinks to sub-ulp
+edge ties.
+
+### Added — the self-test probes your Blender's compute support
+
+Whether the `gpu` module exposes compute shaders, storage buffers and
+image load/store under your Vulkan backend cannot be checked away from a
+driver — so **Run Self Test now has a GPU COMPUTE CAPABILITY section**.
+It reports what the module surface offers, attempts the most likely API
+shape step by step (CreateInfo compute setup → compile → dispatch and
+read back a known pattern), and prints failures verbatim: a miss names
+the real signature, so the next build reads it. Nothing in this section
+changes how anything renders.
+
+The capability table's `rasterise` row now states the plan and why.
+
+---
+
+## [1.25.16] — 2026-07-30
+
+Round seventeen put the environment term on hardware — the reflective box
+at the same 0.000020, five stacked features now measured in one small
+frame. The round completed the coded-shader contract: the three refusals
+left from 1.25.11 all travel now.
+
+### Added — coded shaders sample images
+
+A sampler uniform's socket names the image, and its prepared pixels ride
+the same manual-sampler machinery as every other texture — filtered with
+the scene's own filter and REPEAT wrap, which is exactly the context the
+evaluator hands the program on the CPU. The texture-call rewrite runs over
+the shader's own inlined functions, mangled sampler names included, so two
+coded shaders with an `img` each cannot collide. A missing image breaks
+the node on the CPU too (the evaluator errors), so the probe refuses those
+frames itself rather than inventing a fallback.
+
+### Added — vScreenUV and iResolution
+
+Both bake from the frame size, which joins the plan signature so a
+resolution change re-bakes. Screen coordinates derive from **vUV**, whose
+orientation every agreement test since the blended-target readback has
+proven — not from `gl_FragCoord`, whose y origin nothing headless can
+check. `gl_FragCoord` itself refuses by name: its z is the view-space
+depth on the CPU, which the fullscreen pass does not carry — the message
+points at `vScreenUV` for the xy.
+
+### Added — the front-end knows gl_FragCoord is a builtin
+
+It parsed but could not resolve a free `gl_FragCoord` (unknown
+identifier at run time). It is now bound in scope without a declaration,
+exactly as GLSL defines it — zeros when the caller supplies no fragcoord,
+the supplied values otherwise. Coded-shader previews benefit immediately.
+
+### Verification
+
+- Image-sampling coded shader under NEAREST and BILINEAR against
+  `render()` (max 0.00000 / 0.00083); the mangled sampler binding
+  asserted; the missing-image probe refusal; baked screen inputs differing
+  across resolutions; the gl_FragCoord refusal naming vScreenUV.
+- One outdated negative flipped: "a sampler uniform is refused" became
+  "a sampler uniform is carried, mangled".
+- The self-test scene is unchanged — five features already prove
+  themselves there, and the timing history stays comparable.
+
+---
+
+## [1.25.15] — 2026-07-30
+
+The INERT list — the set of surface fields that forced a frame off the GPU
+just by being non-zero — is now empty in its honest cases. Studying what
+the CPU actually does with each field found two refusals that were always
+broader than the truth.
+
+### Added — environment reflections travel
+
+The `reflect` term needed the world evaluated along the reflected ray, and
+for the plain NODES path that is three small formulas: a **solid colour**,
+the **two-colour blend**, or an **environment texture** — equirect and
+mirror-ball mappings both, sampled through the same manual bilinear
+arithmetic every other image uses, so the same prepared pixels travel.
+`R = reflect(-V, Nsurf)` — the bent, unflipped normal, exactly `ctx.N` at
+that point — and the term lands after matcap and backface, exactly where
+`shade_batch` adds it. The world spec joins the plan signature, so a sky
+edit re-plans the reflective materials.
+
+An active sky mode (BRYCE, PHYSICAL, and the rest), a world node graph and
+the ground plane refuse by name. And a reflective material with
+**Environment Reflection off is inert on the CPU** — it now shades instead
+of refusing, which the old blanket INERT rule got wrong.
+
+### Fixed — opacity and edge opacity under Transparency NONE
+
+Transparency NONE forces alpha to 1.0 *after everything* — the era's
+no-alpha-unit behaviour, already in the renderer — so under NONE neither
+opacity nor edge opacity can reach the picture, and both now shade freely.
+Under SORTED/ABUFFER the refusal stands and names what is actually
+missing: alpha compositing in the deferred target. (Materials whose
+*material-level* opacity is below 0.999 leave the opaque pass entirely
+under SORTED, so the refusal only ever concerned graph-driven opacity.)
+
+### Verification
+
+- Reflection over blend/solid/equirect/mirror-ball worlds, each against
+  `render()`; vacuity (the term changes the frame by 0.08); the
+  setting-off inert case; Bryce-sky and ground-plane refusals by name.
+- Half-opacity plus edge opacity under NONE agreeing exactly; the same
+  material under SORTED refusing by name.
+- One outdated negative flipped: "a reflective material is refused"
+  became "…under a Bryce sky is refused" — the honesty moved, not
+  vanished.
+- **The self-test box now reflects the blend sky** (reflect 0.3) — the
+  sphere-map term proves itself on your driver next run, alongside the
+  marble, the normal map and the coded floor. Four rounds of scope in one
+  small frame.
+
+---
+
+## [1.25.14] — 2026-07-30
+
+Round fifteen was the cleanest report yet — cold at 22.8 ms with the
+driver's disk cache finally holding every source, everything agreeing at
+its established numbers. The round went to the two INERT-field refusals
+that have been on the remaining-work list since round seven: **matcap**
+and the **backface override**.
+
+### Added — matcap and backface ride the deferred pass
+
+**Matcap** is the simple one: the whole lit result lerps toward one
+constant colour, after fresnel and rim and before the backface, exactly as
+`apply_surface_effects` orders it. Constancy-checked and baked like the
+other extras.
+
+**The backface override** needed something the G-buffer never carried:
+the rasteriser's front flag. The answer is geometry, not plumbing — for a
+perspective camera, projected-winding front is *exactly* the plane-side
+test against the eye, computed from the three corner positions the
+attribute texture has always held. The sign convention was **measured
+against the rasteriser, not derived**: `is_front` is screen area < 0,
+which equals plane < 0 (and the stock demo scene turns out to be entirely
+back-facing by winding, which is why two-sided lighting always mattered
+there). The seam test renders a floor with alternating winding — front and
+back sharing the frame — and pins the emitted expression textually so the
+sign cannot quietly flip back. Orthographic cameras refuse by name (the
+plane test is the perspective answer), and the camera **type** joins the
+plan signature while its position stays out, so orbits still re-plan
+nothing.
+
+### Added — the MatcapUV node
+
+Sphere-map coordinates from the view-space normal — the era's entire
+environment-reflection trick, one image carrying a whole material. Both
+outputs travel (Vector and Facing), and the degenerate guard tests the raw
+cross product instead of normalising a near-zero vector, so the straight-
+down case cannot produce NaN on a driver. The full period chain — MatcapUV
+→ Image Texture → master shader — now shades on the GPU.
+
+### Verification
+
+- Matcap at blend 0.55, exact; mixed-winding backface at max 0.00002 with
+  both facings present; the MatcapUV→texture chain exact; the ortho
+  refusal by name; 56 node types emitting.
+- What remains of the INERT list: `reflect` (needs the sky on the GPU),
+  `edge_opacity` and `opacity` (need alpha compositing the deferred target
+  does not do yet). Each still refuses by name.
+
+---
+
+## [1.25.13] — 2026-07-30
+
+Round fourteen put the integer-hash claim on hardware: red marble in
+generated coordinates under a normal map, max 0.000020 on the driver — the
+uint32-wrap-equals-int64-mask argument is now a measurement, not a proof
+sketch. Nothing needed fixing, so this round finishes what 1.25.12 started.
+
+### Added — the pattern library completes on the GPU
+
+The remaining **fourteen** period patterns shade in the deferred pass:
+**Plasma, Ripples, Starfield, Weave, Scratches, Tiles, Brick, Spiral,
+Bozo, Agate, Leopard, Onion, Bumps, Wrinkles** — every one against
+`render()` itself, worst case 4×10⁻⁵. With 1.25.12's five, all nineteen of
+Halcyon's procedural textures now run on the GPU, wired as users actually
+wire them (generated coordinates by default).
+
+Two seams were specific to this batch:
+
+- **Seeded generators bake.** Ripples' source positions and Scratches'
+  angles come from a seeded RNG the evaluator re-runs every frame — being
+  seeded, they are per-scene constants, so the emitter runs the same
+  generator once at assembly and bakes the numbers as literals. The GLSL
+  never needs the generator, and both sides read identical values down to
+  the evaluator's own `cos`/`sin` of them.
+- **The animated ones ride `hal_time`.** Plasma (palette cycling included
+  — the phase rides the raw clock, not the speed-scaled one, exactly as
+  the evaluator), Ripples and Starfield's twinkle all animate through the
+  per-frame uniform: a time change leaves every source byte-identical, so
+  an animation never recompiles a plasma. The demoscene effect, at last,
+  actually running on video hardware.
+
+Multi-output nodes carry their extras: Weave's **Thread**, Tiles' **Tile
+ID**, Brick's **Brick ID**, with the tile/brick colour composites
+(variation shading included, per-pixel) mirroring the evaluator's exactly.
+Halcyon's own Brick node travels — its per-brick id is the integer hash —
+while Blender's `ShaderNodeTexBrick` stays refused with its sin-fract
+tint named.
+
+### Verification
+
+- 55 node types now emit GLSL (was 41).
+- Fourteen materials against `render()`, plus the plasma byte-identity
+  check across a time change and its `hal_time` binding.
+- The self-test scene is unchanged this round — the marble ball already
+  proves the integer-hash stack on your driver, and the timing scenes
+  stay comparable.
+
+---
+
+## [1.25.12] — 2026-07-30
+
+Round thirteen proved the coded shader node on hardware — `Coded, Bumpy,
+Box` at max 0.000021 — and `code_node` flipped to BOTH in the capability
+table, its bar finally met. The round itself went to the piece every
+remaining-work list has called "the bulk": procedural textures. What
+decided the roster was the hash.
+
+### Added — the period pattern textures shade on the GPU
+
+Halcyon's own procedurals — **Marble, Wood, Granite, Dents, Crackle** —
+ride the integer hash in `patterns.py`: multiply-accumulate, xorshift,
+mask. That is what makes them portable at all — masking a uint32 product
+to 31 bits equals masking the CPU's exact int64 product to 31 bits,
+because 2³¹ divides 2³². The GLSL library (`gpu/procedural.py`) mirrors
+`patterns.py` line for line and is verified primitive by primitive: the
+hash is **bit-exact** over thousands of random cells; value noise, fBm,
+turbulence and Worley F1/F2 agree to ≤ 2×10⁻⁵; whole marble/wood/granite/
+dents/crackle materials match `render()` at ≤ 7×10⁻⁵.
+
+The evaluator collapses every scalar pattern parameter to its batch mean,
+so a *linked* scalar socket refuses by name — a varying chain would render
+differently on the two paths. Colours, Vector and Scale stay per-pixel on
+both sides, exactly as the evaluator keeps them.
+
+### Added — generated coordinates travel in the deferred pass
+
+Blender normalises Generated coordinates over each object's own bounding
+box, and those bounds are per-scene constants — so they bake as two lookup
+functions over the object index the tri_data texture has carried since the
+G-buffer existed: `hal_generated = (P − lo[obj]) / span[obj]`, exactly
+`ctx.generated`. This lifts the oldest refusal in the frame assembler: the
+**default wiring of every texture node** (unlinked Vector means generated,
+not UV) now qualifies instead of refusing, and coded shaders may read
+`vObject` too.
+
+### Added — the front-end learned real uint semantics
+
+The verification backbone could not check any of the above: hex literals
+with uint suffixes misparsed (`0x7fffffffu` read as 7.0 — stripping float
+suffixes from a hex literal eats its `f` digits), `uint(-7)` did not wrap,
+and 32-bit wrap arithmetic did not exist. The interpreter now carries uint
+values in int64 and wraps at 2³² after every arithmetic op, shift and
+conversion, exactly as a driver does — verified bit-for-bit against
+`patterns.hash3`. This is the enabling fix for the whole procedural tier,
+and it makes user-written hash shaders in coded nodes verifiable too.
+
+### Added — Gradient, Magic and Wave
+
+Pure arithmetic, ported whole: **Gradient** in all seven types, **Magic**
+with its baked turbulence-depth loop, **Wave** in bands and rings with
+sine/saw/triangle profiles. Wave refuses only when *distorted* — its
+distortion runs Blender-style Perlin.
+
+### Refused by name — the sin-fract family
+
+Blender's **Noise, White Noise, Voronoi, Musgrave and Brick** stay on the
+CPU, and the reason is printed rather than papered over: their hash is
+`fract(sin(x·127.1+…)·43758.5453)`, evaluated in float64 on the CPU. A
+driver's float32 `sin` decorrelates completely after that amplification —
+the GPU would render a *different pattern*, which is the worst outcome
+there is. The refusals point at the pattern textures, which do travel.
+
+### Verification
+
+- 41 node types now emit GLSL (was 32).
+- Primitives against `patterns.py` through the uint-correct front-end;
+  whole materials against `render()`; every refusal asserted by name,
+  including the linked-scalar batch-mean rule.
+- **The self-test ball is now red marble** — integer-hash pattern in the
+  ball's own generated coordinates — under its tangent-space normal map,
+  next to the coded floor: three rounds of scope proving themselves in one
+  small frame on your driver. The 480×360 timing scene stays untouched.
+
+---
+
+## [1.25.11] — 2026-07-30
+
+The capability table has called the coded shader node "the easiest piece of
+the port rather than the hardest" since the table was written — its source
+is already GLSL; only the CPU needs to compile it to NumPy. This round
+collects that debt. Round twelve's report (the first with the normal-mapped
+ball) confirmed the bend on hardware at max 0.000021 and needed no fixes,
+so the whole round went to new ground.
+
+### Added — coded shader nodes run their GLSL natively in the deferred pass
+
+The user's source is inlined into the frame shader under per-node mangled
+names — functions, structs, globals, uniforms, ins and outs alike — so two
+coded shaders sharing a uniform name cannot collide. The contract around
+the source is reproduced exactly as `n_halcyon_code` honours it:
+
+- **Uniforms become sockets.** A socket's value wins over the declared
+  default (`uniform vec3 c = vec3(…)` is stripped — Vulkan refuses
+  initialised uniforms anyway — and the socket's constant is baked, or its
+  linked chain feeds the value **per pixel** through the same emitter as
+  everything else). A uniform with no socket at all falls back to the
+  declared default, exactly as the interpreter does.
+- **Declared `in` names bind to the renderer's varyings** through the same
+  table the CPU uses: position, normal (the unflipped `ctx.N`, per 1.25.10's
+  ordering), uv, vertex colour, view, incident, camera, tangent (the
+  renderer's own orthonormal frame), and the clock. An `in` name the CPU
+  cannot bind reads zeros there and here both.
+- **`time` and `frame` ride as per-frame uniforms** like `hal_eye`, so an
+  animated coded shader re-renders without recompiling: a time change
+  leaves every source byte-identical, and the plan cache keeps its meaning.
+- **A node whose program never compiled reads zeros** — the CPU's own
+  answer — rather than refusing the frame.
+- Everything outside the contract refuses by name: image inputs, matrix and
+  exotic-type uniforms, `discard` (sixteen probe fragments cannot rule out
+  a conditional one), `mainImage` entry points, returning a value from
+  `main`, and the varyings the G-buffer honestly lacks (fragcoord,
+  view-space depth, backfacing, geonormal, uv2, generated, random).
+- **HLSL-flavoured GLSL refuses by name too**: Halcyon's own front-end
+  forgives `saturate`/`lerp`/`frac` and friends in GLSL mode, and a real
+  driver will not — "compiles in the preview, dies on the driver" is the
+  worst possible seam, so it is closed here rather than discovered there.
+  HLSL as a declared language keeps its existing refusal.
+
+`code_node` left the BLOCKING list — a coded-shader scene is no longer
+forced onto the CPU — and its capability row says precisely where it
+stands: verified against the renderer's own compiler at 0.000004, NOT_YET
+only because this table's bar for BOTH is a measurement from your driver.
+
+### Verification
+
+- The full contract in one material — helper function, initialised global,
+  socket values beating declared defaults, a MapRange chain feeding a
+  uniform per pixel, and the clock — against `render()` itself: max
+  0.00000.
+- Two coded shaders sharing a uniform name in one graph: mangled apart,
+  both agreeing with the CPU.
+- The missing-program zeros case, agreeing with the CPU's zeros.
+- Every refusal above asserted by name, including the three that render
+  happily on the forgiving CPU front-end and must still refuse the GPU.
+- Sources strip clean for CreateInfo; the full suite passes.
+- **The self-test's small deferred frame now has a coded-shader floor**
+  (checker tiles from user GLSL) alongside the normal-mapped ball — the
+  next Run Self Test measures both on your driver. The 480×360 timing
+  scene stays untouched, so its numbers remain comparable across rounds.
+
+---
+
+## [1.25.10] — 2026-07-30
+
+The wall named at the start of the round: **normal and bump chains**. The
+key that unlocked it was a fact about the CPU, not the GPU — `ctx.T` is
+never set anywhere in the renderer, so the Normal Map node always builds its
+tangent frame from the geometric normal with `orthonormal_basis`. A
+deterministic construction from data the G-buffer already carries is exactly
+reproducible in GLSL, so the whole chain travels.
+
+### Added — Normal Map chains bend the deferred normal
+
+The **Normal Map node** has a GLSL emitter (32 of 106 node types now):
+tangent space builds the frame the evaluator builds — same up-vector
+selection, same cross products — and OBJECT/WORLD read the colour as a
+world normal, both ending on the node's own Strength lerp. A chain linked
+to the **master shader's Normal socket** is emitted by the frame assembler
+through the same emitter as the colour (a texture feeding both is sampled
+once, exactly as the evaluator's node cache), then bent exactly as
+`closure_to_surface` does it: `normalize(N0 + (normalize(chain) − N0) ×
+Bump Strength)`, with a linked or constant **Bump Strength** and the full-
+strength default when the socket is absent. The probe's "the graph bends
+the shading normal" refusal lifts for precisely this case and no other — a
+normal bent on a BSDF lobe of a non-master graph still shades on the CPU
+and says why.
+
+The **Bump node** refuses with its reason instead of just its name: its
+height input needs screen-space gradients read from neighbouring pixels
+(`_screen_grad`), which a fragment shading one G-buffer texel does not
+compute yet. A new `REFUSED` table carries such reasons into both the
+fallback message and the UI's missing-node list.
+
+### Fixed — the order the normal actually flows on the CPU
+
+Porting the bend exposed a latent ordering bug in the frame shader. The CPU
+evaluates node graphs against the **unflipped** interpolated normal
+(`ctx.N`); two-sided lighting flips *inside* `light_surface`, testing the
+**bent** normal against the view; and the tangent frame is built from the
+bent normal **before** that flip. The frame shader flipped first and fed
+every chain — Fresnel, Layer Weight, Geometry, and now Normal Map — a
+normal the CPU never showed them, wrong on every back face, and built the
+anisotropy frame from the flipped normal (a negated tangent on back faces).
+`main()` now runs in the CPU's order: chains against the geometric normal,
+bend, flip the bent normal, tangent frame from the unflipped bent normal.
+The seam test's ordering proof is a back-facing, two-sided, normal-mapped
+floor — the exact pixels where flip-first disagrees — at max 0.00002.
+
+Also fixed while in the neighbourhood: **Normal Source FACE** now refuses
+the deferred pass by name. The CPU replaces the shading normal with the
+face normal *after* the graph runs — the graph still sees the smooth one —
+so the frame would need two normals per fragment where the G-buffer carries
+one. Before this it would have shaded smooth meshes wrong silently;
+`normal_source` joins the plan signature so toggling it re-plans.
+
+### Verification
+
+- Tangent-space and world-space normal maps, Strength 0.8, Bump Strength
+  0.65, against `render()` itself: max 0.00001 / 0.00000.
+- The back-face ordering proof above, plus text-level locks that the flip
+  tests the bent normal and the tangent frame reads the unflipped one.
+- Both refusals (Bump, FACE) and the non-master negative, each by name.
+- The new sources strip clean for CreateInfo under the driver-strict test's
+  own regex, and the full suite passes.
+- **The self-test's small deferred frame now wears a tangent-space normal
+  map on the ball** — the next Run Self Test proves the bend on your
+  driver, not just in the headless compiler. The 480×360 timing scene is
+  deliberately untouched so its numbers stay comparable across rounds.
+
+---
+
+## [1.25.9] — 2026-07-30
+
+Round nine was the best warm frame yet — 1.7 ms small, 6.5 ms at 480×360 —
+and it also closed the case on the wandering CPU numbers: they wandered back,
+so rounds seven and eight were the machine's mood, exactly as suspected and
+exactly why they went unclaimed.
+
+### Added — vertex colours travel in the G-buffer
+
+The attribute texture's fourth slot was reserved for a tangent nothing ever
+wrote. The mesh's painted corners live there now, all four components, and
+with them the master shader's one remaining refusal is lifted: **Vertex Color
+Mix** blends the paint over the diffuse exactly as the evaluator does — an
+unlinked socket reading the mesh's own colours, an unpainted mesh reading
+white — and the **Color Attribute node** reads the same slot. A node naming
+some *other* colour layer than the active one still refuses, by name, rather
+than quietly reading the wrong paint.
+
+The seam test paints every corner from its position — a gradient no constant
+could fake — blends it at 0.75 through the master node, and matches
+`render()` at max 0.00000, with the unpainted-mesh case proving the white
+fallback agrees too.
+
+### Changed — the composite slice was mostly a redundant mask
+
+Round nine's split showed composite as the biggest warm cost at 480×360
+(3.5 ms of 6.5). Most of it was a `where()` masking the blended readback
+against coverage — but the blend target is cleared to zero and untouched
+pixels stay zero, so the mask reproduced what the buffer already contained.
+The readback's colour planes are now taken as they are. Materials that do not
+read the paint pay nothing for the new slot either: the fetch is emitted only
+into shaders that reference it, so still-scene sources without paint are
+unchanged and every cache keeps its meaning.
+
+---
+
+## [1.25.8] — 2026-07-30
+
+Round eight held every number steady through the scope release — warm 3.4 ms
+small, 8.5 ms at 480×360, agreement to the last digit — which is what a
+regression-free release looks like from the outside. So this one takes the
+next scope wall down.
+
+### Added — surface parameters vary per pixel
+
+Until now only the base colour could vary across a surface: a texture on
+Roughness refused the whole material, which is a strange thing to explain to
+anyone who has ever textured a material. Linked sockets on the master shader
+node — Roughness, Glossiness, Specular Level, Specular Color, Metalness,
+Soften, IOR, Translucency, Anisotropy and its Rotation, Toon Size and Smooth,
+and Self-Illumination — now emit their node chains into the frame shader,
+through the same emitter as the colour so shared subexpressions are computed
+once, and the probe exempts exactly those fields from its constancy rule. One
+function decides which fields are per-pixel and both the probe and the
+assembler read it, so they cannot disagree.
+
+The seam test drives roughness, specular level, specular colour and emission
+from UV-derived chains under a Cook-Torrance model and matches `render()` at
+max 0.00000 — below display precision — with a vacuity check proving the
+variation is really in the frame (pinning the chains changes it by 0.21).
+
+Unlinked sockets bake as constants exactly as before, so still-scene shader
+sources are unchanged and every cache keeps its meaning.
+
+---
+
+## [1.25.7] — 2026-07-30
+
+Round seven closed the performance chapter: plan 0.2 ms, warm shade 7.6 ms at
+480×360 against a 195.6 ms CPU frame, agreement unchanged — which is also the
+blended compositing path proving itself on real hardware. With speed settled,
+this release is all scope, and it opens the door that mattered most.
+
+### Added — converted materials qualify for the GPU
+
+Every material the conversion buttons produce is built around the master
+shader node, and the master shader node had no GLSL emitter — so the probe
+would harvest its constants happily and the emitter would then refuse the
+node, and no converted scene ever shaded on the GPU. The emitter now knows
+it: the Diffuse Color chain is emitted per pixel, and every other socket
+rides as a probed constant, exactly as the CPU resolves them. Vertex-colour
+blending is the one thing it refuses, by name, until vertex colours travel in
+the G-buffer.
+
+### Added — rim, fresnel and sheen in the deferred pass
+
+The era's silhouette cheats and the velvet lobe are on nearly every converted
+material, and refusing them refused real scenes. When their coefficients are
+constant — which on real materials they are — they now bake and run:
+fresnel and rim as `apply_surface_effects` computes them, after emission,
+outside the reflectance model; sheen as `light_surface` computes it, per
+light, needing a light. A test proves the frame being matched visibly
+contains them (removing the three changes the frame by 0.92) and still
+matches `render()` at 0.00001.
+
+### Added — area lights in the light loop
+
+The direct math was already right: the CPU samples an area light without an
+explicit surface point exactly as a point at its centre, and the softness
+lives in the shadow term — where the map builder has always given area
+lights a six-face cube. So an area light now qualifies instead of refusing,
+and the seam test lights a converted material with sun, point, spot and a
+cube-shadowed area panel at once.
+
+Still outside, and said so by name: ray-traced shadows, fog, ray tracing,
+matcap, reflection, backface override, edge opacity, per-pixel surface
+parameters beyond the base colour, vertex-colour blending, and the trilinear
+and N64 filters.
+
+---
+
+## [1.25.6] — 2026-07-29
+
+Round six accounted for every warm millisecond — plan 4.4, pack+upload 1.0,
+draw+read 2.9, composite 5.9, of 14.3 at 480×360 — and the two big slices
+were both work being repeated on data that had not changed. Both are gone.
+
+### Changed — an unchanged scene plans once, not once per frame
+
+Planning a frame probes every material through the CPU's own closure path and
+assembles the shader sources — necessary work, but scene-dependent, and it
+was running per frame. Plans are now cached on a content signature of
+everything the plan reads: the mesh fingerprint, every material's fields and
+graph, every light's fields, the shadow maps' own fingerprints, the relevant
+settings, and which textures are prepared. A camera move hits the cache — the
+eye left the sources last release, which is what makes this possible — and a
+material edit misses it, both held by tests. The one trade is stated in the
+docstring: the constancy probes run on the first frame of a scene state
+rather than every frame, and anything that would slip past that would also
+have slipped past frame one's sixteen probe points.
+
+### Changed — one readback per frame, not one per material
+
+Each material pass read its pixels back so NumPy could mask them into the
+frame — 5.9 ms of masking and copying at 480×360. The passes now blend into a
+single target on the GPU: premultiplied alpha, each material writing only
+where its coverage is one, cleared once, read back once, however many
+materials the frame holds. If a driver objects to the blend path, the
+per-pass readback path is still there and the frame completes — slower is
+better than absent, and the agreement number in the next self-test would say
+so.
+
+Correctness is unchanged by construction where it could be checked headlessly
+— the NumPy simulation path keeps its own compositing and still matches
+`render()` on every seam test — and the blended path's agreement gets its
+verdict from the next report's numbers, like everything before it.
+
+---
+
+## [1.25.5] — 2026-07-29
+
+Round five confirmed the upload cache (warm frame 20.9 ms → 4.3 ms; 15.8 ms at
+480×360 against a 199.7 ms CPU frame) — and its timing split exposed two
+things, one of which was about to hurt.
+
+### Fixed — a moving camera would have recompiled every shader, every frame
+
+The eye was baked into the shader source like every other frame constant.
+Correct for a still; catastrophic for an animation, because the first orbit
+frame would have changed every source, and every frame after it would have
+paid the driver's shader compile — the very cost the source-hash cache exists
+to pay once. The eye is now the deferred pass's one per-frame uniform (twelve
+bytes of push constant), and a test holds the line: two camera positions,
+byte-identical shader sources, both frames matching `render()`. Nobody had
+rendered an orbit yet; the timing split is what made it visible before
+somebody did.
+
+### Changed — the warm split now covers everything
+
+Round five's split accounted for 4 ms of a 15.8 ms warm frame, which meant
+the report was measuring the pipeline and not the whole function. The
+self-test now prints plan / pack+upload / draw+read / composite, where plan is
+the per-frame qualification pass — probing materials through the CPU's own
+closure path and assembling sources — and composite is the NumPy masking that
+folds each material's pixels into the frame. Whichever of those dominates in
+round six is what gets attention next; the plan pass is scene-dependent and a
+candidate for caching, but that is a decision the numbers should make.
+
+---
+
+## [1.25.4] — 2026-07-29
+
+Round four measured the shadowed deferred pass at working size: agreement
+0.000048 at 480×360, CPU full frame 194.4 ms, GPU warm shade 30.2 ms. The
+stage that eats 72% of a CPU frame is beaten several times over — but 30 ms
+for three full-screen passes is not shading cost, it is upload cost, and most
+of it was avoidable.
+
+### Fixed — 33 MB of unchanged shadow atlas re-uploaded every frame
+
+The CPU caches its shadow maps across frames; the GPU path re-packed and
+re-uploaded them anyway — a point light's six-face cube atlas is 33 MB at the
+default size, every frame, unchanged. Uploads are now cached behind content
+fingerprints (a strided sum, the same trick the shadow cache itself uses): the
+shadow atlases, the mesh attribute and triangle-data textures, and image
+texture pixels all skip both the packing and the upload when nothing changed.
+The ids texture still uploads per frame, because the camera is in it. An
+animation now re-uploads what moved and nothing else.
+
+### Added — image textures in the deferred pass
+
+The next scope gate after shadows. The CPU samples the *prepared* pixels —
+resized, quantised, colourspace-converted at texture-prep time — so those
+exact pixels travel to the GPU, and the filter arithmetic is reproduced in the
+shader rather than left to the driver's undocumented sampler state:
+floor-based nearest, half-texel bilinear, and all four wrap modes (Repeat,
+Extend, Clip, Mirror), each matching `Texture.sample` to the texel on uvs well
+outside the unit square. The filter the CPU would resolve — the node asks, the
+period Texture Filter setting overrides — is baked per sampler. Trilinear and
+the N64 three-point filter still refuse by name (they need a mip footprint the
+deferred pass does not have), as do non-flat projections.
+
+With that, the stock demo scene — image texture, sun and cube shadows, three
+materials — shades on the GPU end to end, matching `render()` at 0.00002
+under Nearest and 0.00004 under Bilinear.
+
+### Added — the warm frame explains itself
+
+`shade_frame` now times its two halves, and the self-test prints them: pack +
+upload against draw + read back. The next report shows where the remaining
+warm milliseconds live instead of leaving it to inference.
+
+---
+
+## [1.25.3] — 2026-07-29
+
+Round three of the self-test confirmed where the time went: the 316 ms cold
+frame collapsed to 8.3 ms once the upload stopped detouring through a Python
+list, and the warm frame runs at 3.6 ms. With correctness and cost both
+measured, this release goes after the biggest thing still keeping real scenes
+off the GPU.
+
+### Added — shadow maps travel with the deferred frame
+
+Until now any frame with shadows fell back to the CPU whole, which in practice
+meant nearly every real frame. The maps the CPU has already baked — it
+rasterises them either way — now ride along to the GPU: each shadowed light's
+depth map is packed into an atlas (one cell for a sun or spot map, six for a
+point light's cube), and the shader reproduces `ShadowMap.lookup` exactly —
+the light-space matrix as baked row vectors, the same linearisation of depth,
+the slope bias, the normal offset scaled by texel size, every Vogel-disc PCF
+tap unrolled with the softness multiplied through, the same outside-the-map
+answer, the same density mix. Cube faces pick by major axis, as CubeShadow
+does.
+
+The proof is the same standard as before: a frame with sun, cube and spot
+shadows in it matches `render()` — shadows and all — to a max difference of
+0.00002 through Halcyon's own compiler, and the test also proves the shadows
+are really in the picture being matched (removing them changes the frame by
+1.69, so the agreement is not vacuous). Ray-traced shadows remain CPU-only
+and say so.
+
+### Changed — the self-test now measures the question that matters
+
+The deferred section's small frame now carries all three shadow map kinds,
+and a second measurement renders the demo scene at 480×360 — the size the
+frame-breakdown section has always used, where the CPU spends 72% of its time
+shading — and reports CPU full frame against GPU warm shade, plus agreement
+at that size. The next report answers, with numbers, what the 72% becomes.
+
+---
+
+## [1.25.2] — 2026-07-29
+
+Self-test round two came back from the RTX 5060 Ti, and both waiting stages
+measured clean. This release ships them enabled, with the numbers that earned
+it.
+
+### Enabled — the NTSC stage, at 0.00037
+
+The hardware measured the rebuilt three-draws-and-a-combine pipeline at a max
+difference of 0.00037 against the CPU path — in agreement with the 0.0004 the
+NumPy backend predicted, which is worth a sentence of its own: the headless
+verification and the driver now vouch for each other. After a year of
+UNPROVEN, composite video runs on the GPU when GPU post is on. Dot crawl is
+frame-dependent and keeps any frame using it on the CPU, whole.
+
+### Enabled — deferred GPU shading, at 0.000051
+
+The driver reproduced the renderer's own frame to a max difference of
+0.000051 over every covered pixel — sun, point and spot lights, two-sided
+lighting, flat and smooth normals, all three materials. The capability table
+now says BOTH with the number attached, and the GPU Shading switch is a
+measured choice rather than an experiment. It stays opt-in: its scope is
+still narrow (no shadows, fog, image textures, area lights, or per-pixel
+surface parameters beyond the base colour), and every frame outside that
+scope shades on the CPU and says why.
+
+### Fixed — the first GPU frame paid for a Python list
+
+The measured cold frame took 316 ms against the CPU's 31. Most of that is the
+driver compiling three 500-line shaders, which is per scene and cached — but
+a real slice was `upload()` converting every G-buffer texel into a Python
+float object via `.tolist()` before handing it to the driver. Blender's
+Buffer accepts anything with the buffer protocol, and a NumPy array is one;
+the upload is now a straight copy, with the list path kept as a fallback for
+older builds. The per-material offscreen target is also created once per
+frame rather than once per pass.
+
+### Changed — the self-test reports cold and warm frames separately
+
+A first frame compiles shaders; every frame after it does not. The deferred
+section now renders twice and prints both times, because the warm number is
+what an animation pays and the cold number is what a still pays once. Next
+report will show where the remaining time actually lives.
+
+---
+
+## [1.25.1] — 2026-07-29
+
+The first self-test report from real hardware came back for 1.25.0, and it was
+a good one: all four enabled post stages reproduced their claimed numbers to
+the last digit on an RTX 5060 Ti under Vulkan, and the frame breakdown
+measured shading at 72.2% and rasterising at 9.6% — the 71/9 split the whole
+deferred-shading plan rests on, confirmed. Two things failed, and both are
+fixed here. (This line also begins the policy that the project stays in
+1.25.x until the GPU port is complete on all fronts; 1.26.0 is reserved for
+that.)
+
+### Fixed — the driver refused every deferred shader, over a comment
+
+`strip_declarations` removes the global `uniform`/`in`/`out` lines from a
+generated shader before handing it to Blender's CreateInfo, which declares
+those resources itself. It required the semicolon to *end* the line — so the
+four G-buffer declarations that carry trailing comments slipped through, got
+declared a second time by CreateInfo, and the driver rejected the whole
+shader with an unhelpfully generic error. Halcyon's own front-end tolerates
+redeclaration, which is precisely why every headless check passed while every
+frame on real hardware failed.
+
+The strip now parses past comments, the post stages' own stripper delegates
+to it rather than agreeing to disagree, and a new test holds the strictness
+the driver holds: no stage body and no generated material pass may leave a
+single declaration standing, every baked literal must carry its decimal
+point, and no generated identifier may be a GLSL reserved word. That test is the stand-in for a real
+driver on this machine — every class of rejection hardware has actually
+produced is now checked on every run.
+
+### Fixed — the NTSC measurement skipped itself
+
+The self-test lifts the enabled-stages gate to measure the unproven NTSC
+pipeline, but the orchestrator also checks the user's own GPU Post switch —
+which the self-test never turned on. It is on for the duration of the
+measurement now. Round one reported SKIPPED because of exactly this.
+
+### Added — the self-test bisects a refused shader
+
+A driver's "Shader Compile Error" names nothing. When the deferred frame
+fails to compile, the report now compiles the same source in four layers —
+reflectance models, the dispatch, the G-buffer reader, the full material
+pass — and prints which layer the driver refused, so the next report
+localises the fault even without the console log.
+
+---
+
+## [1.25.0] — 2026-07-29
+
+### Added — deferred GPU shading, the second stage of the port
+
+The capability table has said it since it was written: shading is about 71% of
+a frame, rasterising about 9%, and the CPU's G-buffer already holds everything
+shading needs. The upload and the draw were the missing pieces, and they now
+exist. With **GPU Shading** on (Debug panel, Device set to GPU), the CPU
+rasterises as always, the G-buffer is packed into three textures, and the
+frame is shaded in one full-screen pass per material on Blender's own `gpu`
+module — the same mechanism the measured post stages run on.
+
+Some structure worth naming:
+
+- **Every frame constant is baked into the shader source** — surface values,
+  lights, the eye, the ambient — so the only uniforms are the three G-buffer
+  samplers and their sizes. Vulkan's 128-byte push-constant budget never
+  enters into it, and an unchanged scene compiles its shaders once, however
+  many frames it renders.
+- **The surface constants are not re-derived.** Each material is probed
+  through `closure_to_surface` — the renderer's own code — on fragments taken
+  from the actual frame, so what the GPU bakes is what the CPU would have
+  used, by construction.
+- **Qualification is explicit and it talks.** A frame using anything the GLSL
+  does not reproduce yet — shadows, fog, image textures, ray tracing, area
+  lights, light linking, a surface parameter that varies per pixel beyond the
+  base colour — shades on the CPU exactly as before, and the console says
+  which material or feature disqualified it, by name.
+- **The whole pipeline is verified without a GPU**, by running the same
+  shader sources through Halcyon's own GLSL front-end against the renderer's
+  actual output: max difference 0.00002 across the test frame, through
+  packing, reconstruction, probing, three light types, two-sided lighting and
+  flat-versus-smooth normals. The one thing this machine cannot execute is
+  the driver, so the stage defaults off until **Run Self Test** — which
+  gained a *GPU Deferred Shading* section that renders a real frame both ways
+  on your hardware — reports the same numbers back.
+
+### Fixed — the specular colour was applied twice, sometimes
+
+The CPU folds the specular *colour* into the reflectance model's own term —
+which is what lets Metal tint its highlight by the diffuse, as 3D Studio's
+Metal did — and the GLSL shading path multiplied by the specular colour again
+in its light loop. Invisible for a white specular, which is what every test
+used; wrong for a coloured one, and doubly wrong for Metal and Strauss. The
+dispatch now folds the tint exactly as the CPU does, and the test that should
+have caught it now uses a coloured specular.
+
+### Fixed — the GPU NTSC stage was the wrong shape entirely
+
+It blurred I and Q with one 13-tap triangle at one radius. The CPU path — the
+one every composite picture actually went through — blurs I at one radius and
+Q at twice that, because chroma bandwidth on a composite cable was not one
+number, and it blurs with a box run three times, re-padding the frame edge
+before every pass. No single pass can reproduce that; the stage is now three
+blur draws and a combine, orchestrated like the CPU's own passes, and agrees
+with the CPU path to 0.0004 through the NumPy backend. It stays disabled until
+a driver measures the same — but for the first time it has the right shape to
+be measured against.
+
+### Changed
+
+- The Debug panel's capability list now tells the truth about the deferred
+  stage: written and verified, off until measured on hardware.
+- The self-test's GPU stage table runs the NTSC measurement through the real
+  multi-pass orchestrator, and the deferred-shading section reports covered
+  pixels, max/mean difference and CPU-versus-GPU frame times.
+
+---
+
 ## [1.24.0] — 2026-07-29
 
 ### Added — the comets move

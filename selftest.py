@@ -107,14 +107,13 @@ def gpu_stages(out):
         'LENS': (dict(distortion=0.25, aberration=3.0, edges=0.0,
                       resolution=(float(w), float(h))),
                  lambda: PO.lens_distortion(img.copy(), st)),
-        'NTSC': (dict(bleed=1.0, ringing=0.5,
-                      resolution=(float(w), float(h))),
-                 lambda: PO.composite_ntsc(img.copy(), st)),
     }
 
     _p(out, f'  {"stage":9s} {"compile":9s} {"run":7s} {"max diff":>9s} '
             f'{"mean":>9s}  claimed')
     for name, src in STAGES.items():
+        if name in ('NTSC', 'NTSC_BLUR'):
+            continue                    # multi-pass: measured below as one
         claimed = VALIDATION.get(name, ('?', None))[0]
         shader, err = device.compile_stage(name, src)
         if shader is None:
@@ -142,6 +141,250 @@ def gpu_stages(out):
         mx = float(np.abs(got - want).max())
         mn = float(np.abs(got - want).mean())
         _p(out, f'  {name:9s} ok        ok      {mx:9.5f} {mn:9.5f}  {claimed}')
+
+    # NTSC runs as three blur draws and a combine -- the CPU re-pads the
+    # frame edge before each of its three box passes, and matching that
+    # exactly takes three real passes. Measured through the orchestrator,
+    # with the ENABLED gate lifted for the measurement only.
+    try:
+        from .gpu import chain, stages as _stages
+        claimed = VALIDATION.get('NTSC', ('?', None))[0]
+        saved = _stages.ENABLED
+        _stages.ENABLED = tuple(set(saved) | {'NTSC', 'NTSC_BLUR'})
+        chain.ENABLED = _stages.ENABLED
+        # the orchestrator checks the user's own switch before it will draw;
+        # this is a measurement, so the switch is on for its duration. Round
+        # one of this section reported SKIPPED because of exactly this line.
+        st.gpu_post = True
+        try:
+            got = chain.ntsc(img, st)
+        finally:
+            _stages.ENABLED = saved
+            chain.ENABLED = saved
+            st.gpu_post = False
+        if got is None:
+            _p(out, f'  {"NTSC":9s} ok        SKIPPED (see console)')
+        else:
+            want = PO.composite_ntsc(img.copy(), st)
+            mx = float(np.abs(got - want).max())
+            mn = float(np.abs(got - want).mean())
+            _p(out, f'  {"NTSC":9s} ok        ok      {mx:9.5f} {mn:9.5f}  '
+                    f'{claimed} (3 blur draws + combine)')
+    except Exception as exc:                                    # noqa: BLE001
+        _p(out, f'  {"NTSC":9s} FAILED    {type(exc).__name__}: {exc}')
+
+
+def _bisect_deferred(out, passes):
+    """Compile the frame shader's layers separately, smallest first.
+
+    A driver's 'Shader Compile Error' names nothing. Building the same source
+    up in four steps -- models, dispatch, G-buffer reader, the full pass --
+    turns one opaque failure into a chunk with a name, in the report itself.
+    """
+    from .gpu import device
+    from .gpu import gbuffer as GB
+    from .gpu import glsl_shading as GS
+
+    trivial = '\nin vec2 vUV;\nout vec4 Color;\nvoid main() {\n' \
+              '    HalcyonSurface s;\n    s.diffuse = vec3(vUV, 0.0);\n' \
+              '    Color = vec4(s.diffuse * hal_diffuse_lambert(0.5), 1.0);\n}\n'
+    dispatch = '\nin vec2 vUV;\nout vec4 Color;\nvoid main() {\n' \
+               '    HalcyonSurface s;\n    s.diffuse = vec3(vUV, 0.0);\n' \
+               '    s.specular = vec3(1.0);\n    s.glossiness = 25.0;\n' \
+               '    s.roughness = 0.3; s.soften = 0.0; s.ior = 1.45;\n' \
+               '    s.tangent = vec3(1.0, 0.0, 0.0);\n' \
+               '    s.bitangent = vec3(0.0, 1.0, 0.0);\n' \
+               '    vec4 d = hal_evaluate(3, s, vec3(0.0, 0.0, 1.0),\n' \
+               '        normalize(vec3(0.3, 0.2, 0.9)),\n' \
+               '        normalize(vec3(0.1, 0.1, 0.99)));\n' \
+               '    Color = vec4(s.diffuse * d.x + d.yzw, 1.0);\n}\n'
+    reader = '\nin vec2 vUV;\nout vec4 Color;\nvoid main() {\n' \
+             '    HalcyonFragment f = hal_read_gbuffer(vUV);\n' \
+             '    vec4 td = hal_tri_data(max(f.tri, 0.0));\n' \
+             '    Color = vec4(f.P + f.N + vec3(td.x, f.uv), \n' \
+             '                 f.covered ? 1.0 : 0.0);\n}\n'
+    gspec = {'samplers': ['hal_gb_ids', 'hal_gb_attrs', 'hal_gb_tris'],
+             'floats': ['hal_attr_side', 'hal_slot_count', 'hal_tri_side'],
+             'vec3': ['hal_eye']}
+    probes = [
+        ('reflectance models', GS.GLSL + trivial, {'samplers': []}),
+        ('model dispatch', GS.GLSL + GS.DISPATCH + dispatch, {'samplers': []}),
+        ('G-buffer reader', GB.GLSL + reader, gspec),
+        ('the full material pass', passes[0][2] if passes else '',
+         {'samplers': gspec['samplers']
+          + list(passes[0][3].get('samplers', ())) if passes
+          else gspec['samplers'],
+          'floats': gspec['floats'], 'vec3': ['hal_eye']}),
+    ]
+    for label, src, spec in probes:
+        if not src:
+            continue
+        shader, err = device.compile_dynamic(
+            'HAL_PROBE_' + label.replace(' ', '_').replace('-', '_'), src,
+            spec)
+        if shader is None:
+            _p(out, f'    {label:24s} REFUSED: {err}')
+            return                    # first failure localises it; stop there
+        _p(out, f'    {label:24s} compiles')
+    _p(out, '    every probe compiles alone -- the failure needs the '
+            'console log')
+
+
+def gpu_deferred(out):
+    """Shade real frames on the driver and compare against the CPU frames.
+
+    Two measurements. A small frame proves agreement -- shadow maps included
+    now, sun and cube and spot -- and a working-size frame answers the
+    question the port exists for: what does the stage that eats 72% of a CPU
+    frame cost once it runs on the GPU. Everything here is verified through
+    Halcyon's own compiler before it ever reaches a driver; the driver's
+    numbers are the part this machine cannot produce.
+    """
+    from .core import raster
+    from .core import render as R
+    from .core.scene import Light
+    from .core.settings import RenderSettings
+    from .gpu import device, shade as GSH
+    from .tests.scenebuild import (add_coded_floor, add_normal_mapped_ball,
+                                   demo_scene)
+
+    _p(out)
+    _p(out, LINE)
+    _p(out, 'GPU DEFERRED SHADING  (a real frame, shaded by your driver)')
+    _p(out, LINE)
+    ok, why = device.probe()
+    if not ok:
+        _p(out, f'  skipped: {why}')
+        return
+
+    w, h = 160, 120
+    st = RenderSettings()
+    st.resolution_x, st.resolution_y = w, h
+    st.aa_samples = 1
+    # shadows ON: the maps travel to the GPU now. The demo scene's own SUN
+    # and POINT keep their maps (ortho and six-face cube), and a SPOT joins
+    # for the perspective map.
+    sc = demo_scene(st, with_texture=False)
+    # the ball wears a tangent-space normal map (the chain runs on the GPU,
+    # Strength 0.8, Bump Strength 0.65) and the floor's tiles come from a
+    # coded shader node -- its GLSL inlined natively, mangled, sockets
+    # baked -- so this small frame proves both on your driver, not just in
+    # the headless compiler
+    add_normal_mapped_ball(sc)
+    add_coded_floor(sc)
+    # the box reflects the blend sky: the environment-reflection term's
+    # sphere-map arithmetic proves itself on the driver too
+    sc.materials[2].reflect_level = 0.3
+    sc.lights.append(
+        Light(type='SPOT', name='Rim', position=(-4.0, 2.5, 4.0),
+              direction=(0.55, -0.35, -0.75), color=(1.0, 0.3, 0.8),
+              energy=400.0, shadow='MAP', shadow_bias=0.02,
+              spot_size=0.9, spot_blend=0.3))
+
+    import time as _time
+    t0 = _time.perf_counter()
+    cpu_img = R.render(sc, st)
+    t_cpu = _time.perf_counter() - t0
+
+    view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+    g = raster.GBuffer(w, h)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+    job = R.ShadeJob(sc, st, R.prepare_textures(sc, st), None, view, eye,
+                     w, h)
+
+    passes, why, atlases = GSH.plan_frame(job, g)
+    if passes is None:
+        _p(out, f'  frame did not qualify: {why}')
+        return
+    _p(out, f'  {len(passes)} material pass(es): '
+            + ', '.join(p[1] for p in passes))
+
+    t0 = _time.perf_counter()
+    got, info = GSH.shade_frame(job, g)
+    t_cold = _time.perf_counter() - t0
+    if got is None:
+        _p(out, f'  FAILED: {info}')
+        _p(out, '  narrowing down which part the driver refused:')
+        _bisect_deferred(out, passes)
+        _p(out, '  (if a probe failed, the console holds the shader info '
+                'log -- copy those lines too)')
+        return
+    # the second frame is the one an animation renders: the shader compiles
+    # are cached per scene, so what remains is pack, upload, draw, read back
+    t0 = _time.perf_counter()
+    got2, _info2 = GSH.shade_frame(job, g)
+    t_warm = _time.perf_counter() - t0
+    if got2 is not None:
+        got = got2
+    cov = g.tri >= 0
+    diff = np.abs(got[cov] - cpu_img[cov][:, :3])
+    _p(out, f'  covered pixels : {int(cov.sum())}')
+    _p(out, f'  max difference : {float(diff.max()):.6f}')
+    _p(out, f'  mean difference: {float(diff.mean()):.7f}')
+    _p(out, f'  CPU frame      : {t_cpu * 1000.0:7.1f} ms (full render)')
+    _p(out, f'  GPU cold frame : {t_cold * 1000.0:7.1f} ms '
+            f'(compiles {len(passes)} shaders, then shades)')
+    _p(out, f'  GPU warm frame : {t_warm * 1000.0:7.1f} ms '
+            f'(pack + upload + {len(passes)} passes + read back)')
+    tm = dict(GSH.LAST_TIMINGS)
+    if tm:
+        _p(out, f'    of which     : {tm.get("plan_ms", 0.0):5.1f} ms plan, '
+                f'{tm.get("pack_upload_ms", 0.0):5.1f} ms pack+upload, '
+                f'{tm.get("draw_read_ms", 0.0):5.1f} ms draw+read, '
+                f'{tm.get("composite_ms", 0.0):5.1f} ms composite')
+    _p(out, '  the warm number is what an animation pays per frame; the '
+            'cold one is paid')
+    _p(out, '  once per scene. Shadow maps ride along: this frame has sun, '
+            'cube and spot')
+    _p(out, '  shadows in it, the ball is red marble (integer-hash pattern, '
+            'generated')
+    _p(out, '  coordinates) under a tangent-space normal map, the floor '
+            'tiles are a coded')
+    _p(out, '  shader node running its own GLSL natively, and the box '
+            'reflects the sky')
+
+    # ---- the number the whole port exists for: the 72% at working size
+    w2, h2 = 480, 360
+    st2 = RenderSettings()
+    st2.resolution_x, st2.resolution_y = w2, h2
+    st2.aa_samples = 1
+    sc2 = demo_scene(st2, with_texture=False)
+    sc2.lights.append(
+        Light(type='SPOT', name='Rim', position=(-4.0, 2.5, 4.0),
+              direction=(0.55, -0.35, -0.75), color=(1.0, 0.3, 0.8),
+              energy=400.0, shadow='MAP', shadow_bias=0.02,
+              spot_size=0.9, spot_blend=0.3))
+    t0 = _time.perf_counter()
+    cpu2 = R.render(sc2, st2)
+    t_cpu2 = _time.perf_counter() - t0
+    view2, _p2, vp2, eye2 = R.camera_matrices(sc2.camera, w2, h2)
+    g2 = raster.GBuffer(w2, h2)
+    raster.rasterize(sc2.mesh.verts, sc2.mesh.tris, vp2, w2, h2, gbuf=g2)
+    job2 = R.ShadeJob(sc2, st2, {}, None, view2, eye2, w2, h2)
+    got2, info2 = GSH.shade_frame(job2, g2)          # cold at this size
+    t0 = _time.perf_counter()
+    got2, info2 = GSH.shade_frame(job2, g2)
+    t_warm2 = _time.perf_counter() - t0
+    _p(out)
+    _p(out, f'  at {w2}x{h2}, shadows on (where the CPU spends 72% of its '
+            f'frame shading):')
+    if got2 is None:
+        _p(out, f'    FAILED: {info2}')
+    else:
+        cov2 = g2.tri >= 0
+        d2 = np.abs(got2[cov2] - cpu2[cov2][:, :3])
+        _p(out, f'    agreement      : max {float(d2.max()):.6f}  '
+                f'mean {float(d2.mean()):.7f}')
+        _p(out, f'    CPU full frame : {t_cpu2 * 1000.0:7.1f} ms')
+        _p(out, f'    GPU warm shade : {t_warm2 * 1000.0:7.1f} ms '
+                f'(replaces the shade stage)')
+        tm2 = dict(GSH.LAST_TIMINGS)
+        if tm2:
+            _p(out, f'    of which       : '
+                    f'{tm2.get("plan_ms", 0.0):5.1f} ms plan, '
+                    f'{tm2.get("pack_upload_ms", 0.0):5.1f} ms pack+upload, '
+                    f'{tm2.get("draw_read_ms", 0.0):5.1f} ms draw+read, '
+                    f'{tm2.get("composite_ms", 0.0):5.1f} ms composite')
 
 
 def cpu_scaling(out, heavy=False):
@@ -241,6 +484,1333 @@ def frame_breakdown(out):
     ST.report(total=time.perf_counter() - t0, printer=lambda s: _p(out, s))
 
 
+def gpu_compute(out):
+    """The compute rasteriser, run on the driver and diffed against fill().
+
+    The round-19 probe proved the API; this section now runs the actual
+    kernel -- the CPU rasteriser's exact rules, one thread per pixel over
+    CPU-binned tiles -- on the demo scene, and counts DIFFERING PIXELS
+    against the CPU G-buffer. The claim is exactness, so the number that
+    matters is an integer, not a tolerance. Nothing here changes how
+    anything renders yet: the raster still runs on the CPU until this
+    section has proven the dispatch on real hardware.
+    """
+    _p(out)
+    _p(out, LINE)
+    _p(out, 'GPU COMPUTE RASTERISER  (the last stage, diffed on your driver)')
+    _p(out, LINE)
+    from .core import raster as CR
+    from .core import render as R
+    from .core import stats as ST
+    from .core.settings import RenderSettings
+    from .gpu import craster as CRA, device
+    from .tests.scenebuild import demo_scene
+
+    ok, why = device.probe()
+    if not ok:
+        _p(out, f'  skipped: {why}')
+        return
+    import time as _time
+    w, h = 320, 240
+    st = RenderSettings()
+    st.resolution_x, st.resolution_y = w, h
+    st.aa_samples = 1
+    sc = demo_scene(st, with_texture=False)
+    view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+
+    t0 = _time.perf_counter()
+    g = CR.GBuffer(w, h)
+    CR.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+    t_cpu = _time.perf_counter() - t0
+
+    t0 = _time.perf_counter()
+    outi, err = CRA.raster_on_device(sc.mesh, vp, w, h)
+    t_gpu_cold = _time.perf_counter() - t0
+    if outi is None:
+        _p(out, f'  FAILED: {err}')
+        return
+    t0 = _time.perf_counter()
+    outi, err = CRA.raster_on_device(sc.mesh, vp, w, h)
+    t_gpu = _time.perf_counter() - t0
+
+    import numpy as np
+    ids = outi['ids']
+    aux = outi['aux']
+    tri = np.round(ids[:, :, 3]).astype(np.int32)
+    diff_tri = int((tri != g.tri).sum())
+    cov = g.tri >= 0
+    ib = np.stack([g.bary[:, :, 0], g.bary[:, :, 1],
+                   1.0 - g.bary[:, :, 0] - g.bary[:, :, 1]], -1)
+    d_b = float(np.abs(ids[:, :, :3][cov] - ib[cov]).max()) if cov.any() \
+        else 0.0
+    d_z = float(np.abs(aux[:, :, 0][cov] - g.zndc[cov]).max())
+    d_f = int((aux[:, :, 1][cov] > 0.5).astype(bool).sum()
+              - g.front[cov].sum()) if cov.any() else 0
+    _p(out, f'  frame           : {w}x{h}, {sc.mesh.tris.shape[0]} '
+            'triangles')
+    _p(out, f'  DIFFERING PIXELS: {diff_tri} of {w * h} (triangle ids)')
+    _p(out, f'  bary max diff   : {d_b:.9f}')
+    _p(out, f'  zndc max diff   : {d_z:.9f}')
+    _p(out, f'  front mismatch  : {d_f}')
+    _p(out, f'  CPU rasterise   : {t_cpu * 1000.0:7.1f} ms')
+    _p(out, f'  compute cold    : {t_gpu_cold * 1000.0:7.1f} ms '
+            '(compile + pack + dispatch + read)')
+    _p(out, f'  compute warm    : {t_gpu * 1000.0:7.1f} ms '
+            '(pack + dispatch + read back)')
+    tm = outi.get('timings') or {}
+    if tm:
+        _p(out, f'    of which      : {tm.get("clip_ms", 0.0):5.1f} ms '
+                f'clip+project, {tm.get("pack_ms", 0.0):5.1f} ms pack+bin, '
+                f'{tm.get("upload_ms", 0.0):5.1f} ms upload, '
+                f'{tm.get("dispatch_read_ms", 0.0):5.1f} ms dispatch+read')
+    if diff_tri == 0:
+        _p(out, '  the kernel IS fill(): every pixel picked the same '
+                'triangle your CPU picked')
+    else:
+        _p(out, '  nonzero differing pixels: paste this back and the next '
+                'round hunts them')
+
+    # ---- the decision number: the same race at working size
+    w2, h2 = 480, 360
+    st2 = RenderSettings()
+    st2.resolution_x, st2.resolution_y = w2, h2
+    st2.aa_samples = 1
+    sc2 = demo_scene(st2, with_texture=False)
+    _v2, _p2b, vp2, _e2 = R.camera_matrices(sc2.camera, w2, h2)
+    t0 = _time.perf_counter()
+    g2 = CR.GBuffer(w2, h2)
+    CR.rasterize(sc2.mesh.verts, sc2.mesh.tris, vp2, w2, h2, gbuf=g2)
+    t_cpu2 = _time.perf_counter() - t0
+    out2, err2 = CRA.raster_on_device(sc2.mesh, vp2, w2, h2)
+    t0 = _time.perf_counter()
+    out2, err2 = CRA.raster_on_device(sc2.mesh, vp2, w2, h2)
+    t_gpu2 = _time.perf_counter() - t0
+    _p(out)
+    if out2 is None:
+        _p(out, f'  at {w2}x{h2}: FAILED: {err2}')
+        return
+    tri2 = np.round(out2['ids'][:, :, 3]).astype(np.int32)
+    d2 = int((tri2 != g2.tri).sum())
+    _p(out, f'  at {w2}x{h2}     : {d2} differing px, CPU '
+            f'{t_cpu2 * 1000.0:.1f} ms vs compute {t_gpu2 * 1000.0:.1f} ms '
+            'warm')
+    tm2 = out2.get('timings') or {}
+    if tm2:
+        _p(out, f'    of which      : {tm2.get("clip_ms", 0.0):5.1f} ms '
+                f'clip+project, {tm2.get("pack_ms", 0.0):5.1f} ms pack+bin, '
+                f'{tm2.get("upload_ms", 0.0):5.1f} ms upload, '
+                f'{tm2.get("dispatch_read_ms", 0.0):5.1f} ms dispatch+read')
+
+    # ---- both stages together: raster AND shade on the GPU, whole frame
+    st3 = RenderSettings()
+    st3.resolution_x, st3.resolution_y = w2, h2
+    st3.aa_samples = 1
+    t0 = _time.perf_counter()
+    cpu_full = R.render(demo_scene(st3, with_texture=False), st3)
+    t_cf = _time.perf_counter() - t0
+    st4 = RenderSettings()
+    st4.resolution_x, st4.resolution_y = w2, h2
+    st4.aa_samples = 1
+    st4.render_device = 'GPU'
+    st4.gpu_shading = True
+    st4.gpu_raster = True
+    sc4 = demo_scene(st4, with_texture=False)
+    R.render(sc4, st4)                       # cold: compiles both stages
+    t0 = _time.perf_counter()
+    gpu_full = R.render(sc4, st4)
+    t_gf = _time.perf_counter() - t0
+    dful = float(np.abs(gpu_full - cpu_full).max())
+    _p(out)
+    _p(out, f'  FULL FRAME, raster + shade on GPU at {w2}x{h2}:')
+    _p(out, f'    max difference : {dful:.6f}')
+    _p(out, f'    CPU everything : {t_cf * 1000.0:7.1f} ms')
+    _p(out, f'    GPU both stages: {t_gf * 1000.0:7.1f} ms (warm, whole '
+            'render() call)')
+
+    # ---- the ray-tracing arc's first hardware number: any-hit traversal
+    _p(out)
+    _p(out, '  BVH OCCLUSION KERNEL (the ray-tracing arc begins):')
+    from .core.bvh import BVH
+    from .gpu import rtrace as RTR
+    sc5 = demo_scene(st3, with_texture=False)
+    bvh = BVH(sc5.mesh.verts, sc5.mesh.tris)
+    view5, _p5, vp5, eye5 = R.camera_matrices(sc5.camera, w2, h2)
+    g5 = CR.GBuffer(w2, h2)
+    CR.rasterize(sc5.mesh.verts, sc5.mesh.tris, vp5, w2, h2, gbuf=g5)
+    job5 = R.ShadeJob(sc5, st3, {}, None, view5, eye5, w2, h2)
+    py5, px5 = np.nonzero(g5.tri >= 0)
+    nr = min(py5.size, 40000)
+    rng5 = np.random.default_rng(9)
+    pick5 = rng5.choice(py5.size, nr, replace=False)
+    ctx5 = job5.context(g5.tri[py5, px5][pick5], g5.bary[py5, px5][pick5],
+                        px5[pick5], py5[pick5], np.ones(nr, bool),
+                        None, 0, True)
+    lp5 = np.asarray(sc5.lights[1].position, np.float32)
+    delta5 = lp5[None, :] - ctx5.P
+    dist5 = np.linalg.norm(delta5, axis=1)
+    ldir5 = (delta5 / dist5[:, None]).astype(np.float32)
+    sorg5 = (ctx5.P + ldir5 * 1e-3).astype(np.float32)
+    stmax5 = (dist5 - 2e-3).astype(np.float32)
+    t0 = _time.perf_counter()
+    want5 = bvh.occluded(sorg5, ldir5, stmax5)
+    t_cpu5 = _time.perf_counter() - t0
+    got5, err5 = RTR.occluded_on_device(bvh, sorg5, ldir5, stmax5)
+    if got5 is None:
+        _p(out, f'    FAILED: {err5}')
+        return
+    t0 = _time.perf_counter()
+    got5, err5 = RTR.occluded_on_device(bvh, sorg5, ldir5, stmax5)
+    t_gpu5 = _time.perf_counter() - t0
+    mism5 = int((got5 != want5).sum())
+    _p(out, f'    {nr} shadow rays at the point light, '
+            f'{sc5.mesh.tris.shape[0]} triangles')
+    _p(out, f'    MISMATCHED RAYS: {mism5} of {nr}  '
+            f'(CPU shadowed {int(want5.sum())})')
+    _p(out, f'    CPU occluded   : {t_cpu5 * 1000.0:7.1f} ms')
+    _p(out, f'    compute warm   : {t_gpu5 * 1000.0:7.1f} ms '
+            '(pack + upload + dispatch + read)')
+    if mism5 == 0:
+        _p(out, '    the traversal IS bvh.occluded(): the ray-shadowed '
+                'frame below stands on it')
+
+    # ---- the integration: Shadow Method RAY through the whole pipeline,
+    # rasterised AND shaded on the driver, against the CPU's own frame
+    _p(out)
+    _p(out, '  RAY-SHADOWED DEFERRED FRAME (Shadow Method RAY, whole '
+            'render):')
+    st6 = RenderSettings()
+    st6.resolution_x, st6.resolution_y = w2, h2
+    st6.aa_samples = 1
+    st6.shadows = True
+    st6.shadow_default = 'RAY'
+    t0 = _time.perf_counter()
+    cpu6 = R.render(demo_scene(st6, with_texture=False), st6)
+    t_c6 = _time.perf_counter() - t0
+    st7 = RenderSettings()
+    st7.resolution_x, st7.resolution_y = w2, h2
+    st7.aa_samples = 1
+    st7.shadows = True
+    st7.shadow_default = 'RAY'
+    st7.render_device = 'GPU'
+    st7.gpu_shading = True
+    st7.gpu_raster = True
+    sc7 = demo_scene(st7, with_texture=False)
+    R.render(sc7, st7)             # cold: compiles the traversal in-frame
+    t0 = _time.perf_counter()
+    gpu6 = R.render(sc7, st7)
+    t_g6 = _time.perf_counter() - t0
+    d6 = float(np.abs(gpu6 - cpu6).max())
+    flip6 = int((np.abs(gpu6 - cpu6).max(axis=2) > 1e-2).sum())
+    _p(out, f'    max difference : {d6:.6f}')
+    _p(out, f'    px off by >0.01: {flip6} of {w2 * h2} '
+            '(a flipped shadow-edge ray would land here)')
+    _p(out, f'    CPU everything : {t_c6 * 1000.0:7.1f} ms '
+            '(build BVH + trace + shade)')
+    _p(out, f'    GPU both stages: {t_g6 * 1000.0:7.1f} ms (warm, whole '
+            'render() call)')
+    if d6 < 6e-3:
+        _p(out, '    hard ray-traced shadows shade on your driver')
+
+    # ---- SOFT shadows + ambient occlusion: the deterministic-sampling
+    # arc, on the driver. Every jittered ray is a pure function of
+    # (pixel, sample, stream, seed) through the pattern hash and the
+    # shared unit-circle table, so both devices draw the SAME rays --
+    # the refusals this replaced were 'a random stream the CPU batch
+    # order owns' and 'ambient occlusion is not ported'
+    _p(out)
+    _p(out, '  SOFT SHADOWS + AMBIENT OCCLUSION (deterministic sampling, '
+            'whole render):')
+    st9 = RenderSettings()
+    st9.resolution_x, st9.resolution_y = w2, h2
+    st9.aa_samples = 1
+    st9.shadows = True
+    st9.shadow_default = 'RAY'
+    st9.shadow_samples = 4
+    st9.ambient_occlusion = True
+    st9.ao_samples = 4
+    st9.ao_distance = 2.0
+    st9.ao_intensity = 1.0
+    sc9 = demo_scene(st9, with_texture=False)
+    sc9.lights[1].radius = 0.8
+    sc9.materials[2].reflect_level = 0.5
+    st9.raytrace = True
+    st9.ray_depth = 1
+    t0 = _time.perf_counter()
+    cpu9 = R.render(sc9, st9)
+    t_c9 = _time.perf_counter() - t0
+    st9g = RenderSettings()
+    for f9 in ('resolution_x', 'resolution_y', 'aa_samples', 'shadows',
+               'shadow_default', 'shadow_samples', 'ambient_occlusion',
+               'ao_samples', 'ao_distance', 'ao_intensity', 'raytrace',
+               'ray_depth'):
+        setattr(st9g, f9, getattr(st9, f9))
+    st9g.render_device = 'GPU'
+    st9g.gpu_shading = True
+    st9g.gpu_raster = True
+    sc9g = demo_scene(st9g, with_texture=False)
+    sc9g.lights[1].radius = 0.8
+    sc9g.materials[2].reflect_level = 0.5
+    R.render(sc9g, st9g)                     # cold
+    t0 = _time.perf_counter()
+    gpu9 = R.render(sc9g, st9g)
+    t_g9 = _time.perf_counter() - t0
+    d9 = float(np.abs(gpu9 - cpu9).max())
+    flip9 = int((np.abs(gpu9 - cpu9).max(axis=2) > 1e-2).sum())
+    _p(out, f'    max difference : {d9:.6f}')
+    _p(out, f'    px off by >0.01: {flip9} of {w2 * h2} (a flipped '
+            'jittered ray would land here)')
+    _p(out, f'    CPU everything : {t_c9 * 1000.0:7.1f} ms')
+    _p(out, f'    GPU everything : {t_g9 * 1000.0:7.1f} ms (warm, whole '
+            'render() call)')
+    if d9 < 6e-3:
+        _p(out, '    soft penumbras and occluded creases, hash-jittered '
+                'identically on both devices -- two more refusals gone')
+
+    # ---- the reflections arc's kernel: closest-hit, on the driver
+    _p(out)
+    _p(out, '  CLOSEST-HIT KERNEL (reflections are next):')
+    from .core import mathx as _M
+    py7, px7 = np.nonzero(g5.tri >= 0)
+    nr7 = min(py7.size, 40000)
+    rng7 = np.random.default_rng(21)
+    pick7 = rng7.choice(py7.size, nr7, replace=False)
+    ctx7 = job5.context(g5.tri[py7, px7][pick7], g5.bary[py7, px7][pick7],
+                        px7[pick7], py7[pick7], np.ones(nr7, bool),
+                        None, 0, True)
+    N7 = _M.normalize(ctx7.N)
+    V7 = -_M.normalize(ctx7.I)
+    R7 = _M.reflect(-V7, N7).astype(np.float32)
+    org7 = (ctx7.P + N7 * 1e-3).astype(np.float32)
+    tmax7 = np.full(nr7, 1e30, np.float32)
+    t0 = _time.perf_counter()
+    wid7, wt7, wu7, wv7 = bvh.intersect(org7, R7, tmax7)
+    t_cpu7 = _time.perf_counter() - t0
+    got7, err7 = RTR.intersect_on_device(bvh, org7, R7, tmax7)
+    if got7 is None:
+        _p(out, f'    FAILED: {err7}')
+        return
+    t0 = _time.perf_counter()
+    got7, err7 = RTR.intersect_on_device(bvh, org7, R7, tmax7)
+    t_gpu7 = _time.perf_counter() - t0
+    gid7, gt7, gu7, gv7 = got7
+    mism7 = int((gid7 != wid7).sum())
+    both7 = (wid7 >= 0) & (gid7 == wid7)
+    dt7 = float(np.abs(gt7[both7] - wt7[both7]).max()) if both7.any() else 0.0
+    duv7 = float(max(np.abs(gu7[both7] - wu7[both7]).max(),
+                     np.abs(gv7[both7] - wv7[both7]).max())) \
+        if both7.any() else 0.0
+    _p(out, f'    {nr7} reflection rays off real surfaces, '
+            f'{sc5.mesh.tris.shape[0]} triangles')
+    _p(out, f'    MISMATCHED HITS: {mism7} of {nr7}  '
+            f'(CPU hit {int((wid7 >= 0).sum())}, ties decided by the '
+            'baked visit order)')
+    _p(out, f'    t max diff     : {dt7:.9f}   bary max diff: {duv7:.9f}')
+    _p(out, f'    CPU intersect  : {t_cpu7 * 1000.0:7.1f} ms')
+    _p(out, f'    compute warm   : {t_gpu7 * 1000.0:7.1f} ms '
+            '(pack + upload + dispatch + read)')
+    if mism7 == 0:
+        _p(out, '    the traversal IS bvh.intersect(): the reflected '
+                'frame below stands on it')
+
+    # ---- the arc's integration: one traced bounce, whole pipeline
+    _p(out)
+    _p(out, '  RAY-REFLECTED DEFERRED FRAME (ray tracing ON, one bounce, '
+            'whole render):')
+    st8 = RenderSettings()
+    st8.resolution_x, st8.resolution_y = w2, h2
+    st8.aa_samples = 1
+    st8.shadows = True
+    st8.raytrace = True
+    st8.ray_depth = 1
+    sc8 = demo_scene(st8, with_texture=False)
+    sc8.materials[2].reflect_level = 0.5      # the Box becomes a mirror
+    t0 = _time.perf_counter()
+    cpu8 = R.render(sc8, st8)
+    t_c8 = _time.perf_counter() - t0
+    st9 = RenderSettings()
+    st9.resolution_x, st9.resolution_y = w2, h2
+    st9.aa_samples = 1
+    st9.shadows = True
+    st9.raytrace = True
+    st9.ray_depth = 1
+    st9.render_device = 'GPU'
+    st9.gpu_shading = True
+    st9.gpu_raster = True
+    sc9 = demo_scene(st9, with_texture=False)
+    sc9.materials[2].reflect_level = 0.5
+    R.render(sc9, st9)          # cold: compiles primary + secondary passes
+    t0 = _time.perf_counter()
+    gpu8 = R.render(sc9, st9)
+    t_g8 = _time.perf_counter() - t0
+    d8 = float(np.abs(gpu8 - cpu8).max())
+    bad8 = np.abs(gpu8 - cpu8).max(axis=2) > 1e-2
+    flip8 = int(bad8.sum())
+    _p(out, f'    max difference : {d8:.6f}')
+    _p(out, f'    px off by >0.01: {flip8} of {w2 * h2}')
+    _p(out, f'    CPU everything : {t_c8 * 1000.0:7.1f} ms '
+            '(build BVH + trace + recursive shade)')
+    _p(out, f'    GPU everything : {t_g8 * 1000.0:7.1f} ms (warm, whole '
+            'render() call)')
+    from .gpu import shade as _GSH
+    tm8 = dict(_GSH.LAST_TIMINGS)
+    if tm8.get('reflect_ms'):
+        _p(out, f'    of which trace + secondary passes: '
+                f'{tm8["reflect_ms"]:.1f} ms')
+    if d8 < 6e-3:
+        _p(out, '    one traced bounce shades on your driver -- the '
+                'refusal this arc existed to lift is lifting')
+
+    # ---- refraction joins, in the FIELD's own shape: the Ball becomes
+    # normal-mapped WAVY glass (a master graph with a Normal chain -- the
+    # rays bend through _ray_context's CPU-exact evaluation) and the Box
+    # stays a mirror, both sweeps walking one tree in one frame
+    _p(out)
+    _p(out, '  RAY-REFRACTED DEFERRED FRAME (NOISE-into-BUMP wavy glass '
+            '+ mirror -- the exact Water anatomy, whole render):')
+    from .tests.scenebuild import ImageBuffer as _IB
+    from .tests.scenebuild import add_normal_mapped_ball as _wavy
+
+    def _glass(sc):
+        # the field's EXACT Water anatomy: Blender NOISE through a BUMP
+        # node into the master Normal socket. The noise is the sin-fract
+        # family the GLSL emitter refuses by name -- so its height image
+        # evaluates on the CPU, float64 sin and all, and the GPU takes
+        # its neighbour differences from that image by texelFetch
+        _wavy(sc)                             # full master socket list
+        gr = sc.materials[1].graph
+
+        def _sk(nm, t, d, l=None):
+            return {'name': nm, 'type': t, 'default': d, 'link': l}
+
+        gr['nodes']['noise'] = {
+            'id': 'noise', 'bl_idname': 'ShaderNodeTexNoise',
+            'props': {},
+            'inputs': [_sk('Vector', 'VECTOR', [0, 0, 0]),
+                       _sk('Scale', 'VALUE', 6.0),
+                       _sk('Detail', 'VALUE', 2.0),
+                       _sk('Roughness', 'VALUE', 0.5),
+                       _sk('Distortion', 'VALUE', 0.0)],
+            'outputs': [{'name': 'Fac', 'type': 'VALUE'},
+                        {'name': 'Color', 'type': 'RGBA'}]}
+        gr['nodes']['bump'] = {
+            'id': 'bump', 'bl_idname': 'ShaderNodeBump',
+            'props': {'invert': False},
+            'inputs': [_sk('Strength', 'VALUE', 0.8),
+                       _sk('Distance', 'VALUE', 0.6),
+                       _sk('Height', 'VALUE', 0.5, ['noise', 0]),
+                       _sk('Normal', 'VECTOR', [0, 0, 0])],
+            'outputs': [{'name': 'Normal', 'type': 'VECTOR'}]}
+        for sock in gr['nodes']['hal']['inputs']:
+            if sock['name'] == 'Normal':
+                sock['link'] = ['bump', 0]
+            if sock['name'] == 'Diffuse Color':
+                sock['link'] = None           # flat tint: the lerp needs it
+                sock['default'] = [0.2, 0.5, 0.8, 1.0]
+            if sock['name'] == 'Opacity':
+                sock['default'] = 0.4
+            if sock['name'] == 'IOR':
+                sock['default'] = 1.33
+            if sock['name'] == 'Reflection':
+                sock['default'] = 0.3         # water reflects the sky too
+        sc.materials[2].reflect_level = 0.5   # the Box stays a mirror
+        # and the sky is the field's own: BANDS -- quantised gradient,
+        # now expressed in the env term the reflections sample
+        sc.world.mode = 'BANDS'
+        sc.world.band_count = 6
+        sc.world.band_softness = 0.15
+
+    stA = RenderSettings()
+    stA.resolution_x, stA.resolution_y = w2, h2
+    stA.aa_samples = 1
+    stA.shadows = True
+    stA.raytrace = True
+    stA.ray_depth = 1
+    stA.transparency = 'NONE'
+    scA = demo_scene(stA, with_texture=False)
+    _glass(scA)
+    t0 = _time.perf_counter()
+    cpuA = R.render(scA, stA)
+    t_cA = _time.perf_counter() - t0
+    stB = RenderSettings()
+    stB.resolution_x, stB.resolution_y = w2, h2
+    stB.aa_samples = 1
+    stB.shadows = True
+    stB.raytrace = True
+    stB.ray_depth = 1
+    stB.transparency = 'NONE'
+    stB.render_device = 'GPU'
+    stB.gpu_shading = True
+    stB.gpu_raster = True
+    scB = demo_scene(stB, with_texture=False)
+    _glass(scB)
+    R.render(scB, stB)                        # cold
+    ST.reset()
+    ST.enable(True)
+    t0 = _time.perf_counter()
+    gpuA = R.render(scB, stB)
+    t_gA = _time.perf_counter() - t0
+    ST.enable(False)
+    dA = float(np.abs(gpuA - cpuA).max())
+    flipA = int((np.abs(gpuA - cpuA).max(axis=2) > 1e-2).sum())
+    _p(out, f'    max difference : {dA:.6f}')
+    _p(out, f'    px off by >0.01: {flipA} of {w2 * h2}')
+    _p(out, f'    CPU everything : {t_cA * 1000.0:7.1f} ms')
+    _p(out, f'    GPU everything : {t_gA * 1000.0:7.1f} ms (warm, whole '
+            'render() call)')
+    tmA = dict(_GSH.LAST_TIMINGS)
+    _p(out, '    shade split    : '
+            f'plan {tmA.get("plan_ms", 0.0):.1f}, '
+            f'pack+upload {tmA.get("pack_upload_ms", 0.0):.1f}, '
+            f'draw+read {tmA.get("draw_read_ms", 0.0):.1f}, '
+            f'sweeps {tmA.get("reflect_ms", 0.0):.1f} '
+            f'(of which CPU ray build '
+            f'{tmA.get("ray_build_ms", 0.0):.1f}), '
+            f'other {tmA.get("composite_ms", 0.0):.1f} ms')
+    _p(out, '    the warm frame, stage by stage (where every ms went):')
+    ST.report(total=t_gA, printer=lambda s: _p(out, '    ' + s))
+    # the frame above ran through render(): when the driver REJECTS
+    # shade_frame, render() shades on the CPU and the match still reads
+    # 0.000012 -- CPU against CPU. The reason goes to the Blender
+    # console, invisible here. So ask shade_frame directly and put the
+    # answer IN the report: if both 'shade (GPU)' and 'shade' appear in
+    # the stage table above, THIS line is why
+    try:
+        viewB, _projB, vpB, eyeB = R.camera_matrices(scB.camera, w2, h2)
+        gB = CR.GBuffer(w2, h2)
+        CR.rasterize(scB.mesh.verts, scB.mesh.tris, vpB, w2, h2, gbuf=gB)
+        texB = R.prepare_textures(scB, stB)
+        bvhB = R._cached_bvh(scB, scB.mesh)
+        jobB = R.ShadeJob(scB, stB, texB, bvhB, viewB, eyeB, w2, h2)
+        gotB, whyB = _GSH.shade_frame(jobB, gB)
+        if gotB is not None:
+            _p(out, '    shade_frame directly: OK (the driver shaded '
+                    'this frame)')
+        else:
+            _p(out, f'    shade_frame directly: FELL BACK: {whyB}')
+    except Exception as _exc:                                    # noqa: BLE001
+        _p(out, f'    shade_frame directly: probe itself failed: {_exc}')
+    if dA < 6e-3:
+        _p(out, '    NOISE-driven glass refracts through its bent rays -- '
+                'the sin-fract height evaluates on the CPU into the '
+                'pre-pass, exactly -- and the mirror reflects. The Water '
+                'anatomy works on your driver')
+        # ---- ray depth 2: the recursion tree, on the driver. Two
+        # mirrors and branching glass make mirror-in-mirror; the second
+        # bounce composites backward with the HIT material's constants
+        _p(out)
+        _p(out, '  RAY DEPTH 2 (the recursion tree, whole render):')
+        stD2 = RenderSettings()
+        stD2.resolution_x, stD2.resolution_y = w2, h2
+        stD2.aa_samples = 1
+        stD2.shadows = True
+        stD2.raytrace = True
+        stD2.ray_depth = 2
+        stD2.transparency = 'NONE'
+        scD2 = demo_scene(stD2, with_texture=False)
+        scD2.materials[2].reflect_level = 0.6
+        scD2.materials[0].reflect_level = 0.4
+        scD2.materials[1].opacity = 0.5
+        scD2.materials[1].ior = 1.2
+        t0 = _time.perf_counter()
+        cpuD2 = R.render(scD2, stD2)
+        t_cD2 = _time.perf_counter() - t0
+        stD2g = RenderSettings()
+        for fD in ('resolution_x', 'resolution_y', 'aa_samples', 'shadows',
+                   'raytrace', 'ray_depth', 'transparency'):
+            setattr(stD2g, fD, getattr(stD2, fD))
+        stD2g.render_device = 'GPU'
+        stD2g.gpu_shading = True
+        stD2g.gpu_raster = True
+        scD2g = demo_scene(stD2g, with_texture=False)
+        scD2g.materials[2].reflect_level = 0.6
+        scD2g.materials[0].reflect_level = 0.4
+        scD2g.materials[1].opacity = 0.5
+        scD2g.materials[1].ior = 1.2
+        R.render(scD2g, stD2g)               # cold
+        t0 = _time.perf_counter()
+        gpuD2 = R.render(scD2g, stD2g)
+        t_gD2 = _time.perf_counter() - t0
+        dD2 = float(np.abs(gpuD2 - cpuD2).max())
+        flipD2 = int((np.abs(gpuD2 - cpuD2).max(axis=2) > 1e-2).sum())
+        _p(out, f'    max difference : {dD2:.6f}')
+        _p(out, f'    px off by >0.01: {flipD2} of {w2 * h2}')
+        _p(out, f'    CPU everything : {t_cD2 * 1000.0:7.1f} ms')
+        _p(out, f'    GPU everything : {t_gD2 * 1000.0:7.1f} ms (warm, '
+                'whole render() call)')
+        if dD2 < 6e-3:
+            _p(out, '    mirror-in-mirror on your driver -- the ray arc '
+                    'is COMPLETE: shadows hard and soft, occlusion, '
+                    'reflections, refraction, any depth')
+        # ---- every world reflects: the env term for rich skies is
+        # evaluated by the renderer itself along the reflected rays and
+        # composited after readback -- exact for ANY world, the Bryce
+        # sky lab included. Six refusals fell to one mechanism.
+        _p(out)
+        _p(out, '  RICH WORLDS IN REFLECTIONS (the Bryce sky lab in a '
+                'mirror, whole render):')
+        from .core.scene import World as _World
+        stW = RenderSettings()
+        stW.resolution_x, stW.resolution_y = w2, h2
+        stW.aa_samples = 1
+        stW.shadows = True
+        stW.raytrace = True
+        stW.ray_depth = 1
+        scW = demo_scene(stW, with_texture=False)
+        scW.materials[2].reflect_level = 0.6
+        scW.materials[0].reflect_level = 0.3
+        scW.world = _World()
+        scW.world.mode = 'BRYCE'
+        t0 = _time.perf_counter()
+        cpuW = R.render(scW, stW)
+        t_cW = _time.perf_counter() - t0
+        stWg = RenderSettings()
+        for fW in ('resolution_x', 'resolution_y', 'aa_samples', 'shadows',
+                   'raytrace', 'ray_depth'):
+            setattr(stWg, fW, getattr(stW, fW))
+        stWg.render_device = 'GPU'
+        stWg.gpu_shading = True
+        stWg.gpu_raster = True
+        scWg = demo_scene(stWg, with_texture=False)
+        scWg.materials[2].reflect_level = 0.6
+        scWg.materials[0].reflect_level = 0.3
+        scWg.world = _World()
+        scWg.world.mode = 'BRYCE'
+        R.render(scWg, stWg)                 # cold
+        t0 = _time.perf_counter()
+        gpuW = R.render(scWg, stWg)
+        t_gW = _time.perf_counter() - t0
+        dW = float(np.abs(gpuW - cpuW).max())
+        flipW = int((np.abs(gpuW - cpuW).max(axis=2) > 1e-2).sum())
+        _p(out, f'    max difference : {dW:.6f}')
+        _p(out, f'    px off by >0.01: {flipW} of {w2 * h2}')
+        _p(out, f'    CPU everything : {t_cW * 1000.0:7.1f} ms')
+        _p(out, f'    GPU everything : {t_gW * 1000.0:7.1f} ms (warm, '
+                'whole render() call)')
+        if dW < 6e-3:
+            _p(out, '    the sky lab reflects exactly -- STARFIELD, '
+                    'BRYCE, PHYSICAL, HDRI, world graphs and the ground '
+                    'plane all travel now, evaluated by the renderer '
+                    'itself along the reflected rays')
+    elif flipA:
+        # this frame's GLSL (the bump main pass, the secondary passes of
+        # a two-sweep frame) had its FIRST real driver run when the
+        # glued-declaration fix landed -- a handful of off pixels now has
+        # several possible mechanisms. Classify the bad pixels, then
+        # re-render with ONE suspect disabled at a time: whichever
+        # variant zeroes the count names the mechanism for next round
+        _refracted_diagnosis(out, scB, stB, cpuA, gpuA, w2, h2)
+    elif flip8:
+        # localize the disagreement so the next round aims, not guesses:
+        # rebuild the frame's exact reflection rays, trace them on BOTH
+        # devices, and say whose pixels the bad ones are
+        _p(out, '    DIAGNOSIS (the numbers the next round needs):')
+        try:
+            g8 = CR.GBuffer(w2, h2)
+            CR.rasterize(sc8.mesh.verts, sc8.mesh.tris, vp5, w2, h2,
+                         gbuf=g8)
+            job8 = R.ShadeJob(sc8, st8, {}, bvh, view5, eye5, w2, h2)
+            _GSH._PLAN_CACHE.clear()
+            p8p, why8p, a8p = _GSH.plan_frame(job8, g8)
+            rp8 = (a8p or {}).get('__reflect') if p8p is not None else None
+            if rp8 is None:
+                _p(out, f'      (could not re-plan: {why8p})')
+            else:
+                py8, px8, org8, dir8 = _GSH._reflection_rays(job8, g8, rp8)
+                wid8, wt8, wu8, wv8 = bvh.intersect(
+                    org8, dir8, np.full(py8.size, 1e30, np.float32))
+                dev8, errd8 = RTR.intersect_frame(bvh, org8, dir8)
+                mirror8 = np.zeros(bad8.shape, bool)
+                mirror8[py8, px8] = True
+                on8 = int((bad8 & mirror8).sum())
+                off8 = int((bad8 & ~mirror8).sum())
+                _p(out, f'      bad px on the mirror: {on8}   '
+                        f'elsewhere: {off8}')
+                if dev8 is None:
+                    _p(out, f'      frame-ray device trace FAILED: {errd8}')
+                else:
+                    gid8 = dev8[0]
+                    tmis8 = int((gid8 != wid8).sum())
+                    _p(out, f'      frame-ray trace agreement: {tmis8} of '
+                            f'{py8.size} hit ids differ (CPU vs device, '
+                            'the exact rays)')
+                    if tmis8:
+                        fl = np.zeros(bad8.shape, bool)
+                        sel = gid8 != wid8
+                        fl[py8[sel], px8[sel]] = True
+                        _p(out, f'      bad px that are ALSO trace-'
+                                f'flipped: {int((bad8 & fl).sum())}')
+                        # the same rays through FRESH textures (the
+                        # kernel path): separates texture state from
+                        # arithmetic
+                        onv8, erron8 = RTR.intersect_on_device(
+                            bvh, org8, dir8,
+                            np.full(py8.size, 1e30, np.float32))
+                        if onv8 is not None:
+                            _p(out, '      same rays, fresh-texture '
+                                    'kernel path: '
+                                    f'{int((onv8[0] != wid8).sum())} '
+                                    'differ')
+                        # determinism: the cached path against itself
+                        dev8b, _e2 = RTR.intersect_frame(bvh, org8, dir8)
+                        if dev8b is not None:
+                            _p(out, '      cached path vs itself: '
+                                    f'{int((dev8b[0] != gid8).sum())} '
+                                    'differ (nonzero = nondeterministic)')
+                        # what the flips look like: near-t neighbours
+                        # (arithmetic) or wild values (misread data)
+                        idxs = np.nonzero(sel)[0][:3]
+                        for k in idxs:
+                            _p(out, f'      flip: cpu id {int(wid8[k])} '
+                                    f't {float(wt8[k]):.6g}  ->  dev id '
+                                    f'{int(gid8[k])} t '
+                                    f'{float(dev8[1][k]):.6g}')
+                    else:
+                        missed8 = wid8 < 0
+                        mm8 = np.zeros(bad8.shape, bool)
+                        mm8[py8[missed8], px8[missed8]] = True
+                        _p(out, '      the trace agrees ray for ray -- '
+                                'of the bad mirror px, '
+                                f'{int((bad8 & mm8).sum())} are ray '
+                                'MISSES (world_color composite) and '
+                                f'{int((bad8 & mirror8 & ~mm8).sum())} '
+                                'are hits (secondary-pass shading)')
+        except Exception as _exc:                               # noqa: BLE001
+            _p(out, f'      diagnosis itself failed: {_exc}')
+
+    # ---- TRANSPARENT LAYERS: the A-buffer's fragments shade per depth
+    # layer through the same deferred machinery -- the stage the summary
+    # line named on the field frame ('transparency shading 25.7s' of
+    # 33.7). Two glass materials at once, both faces of each, the env
+    # term on a layer, the real alpha chain, the additive merge.
+    _p(out)
+    _p(out, '  TRANSPARENT LAYERS (two-material glass, whole render):')
+    stT = RenderSettings()
+    stT.resolution_x, stT.resolution_y = w2, h2
+    stT.aa_samples = 1
+    stT.shadows = True
+    scT = demo_scene(stT, with_texture=False)
+    scT.materials[1].opacity = 0.5
+    scT.materials[1].reflect_level = 0.25
+    scT.materials[2].opacity = 0.6
+    t0 = _time.perf_counter()
+    cpuT = R.render(scT, stT)
+    t_cT = _time.perf_counter() - t0
+    stTg = RenderSettings()
+    stTg.resolution_x, stTg.resolution_y = w2, h2
+    stTg.aa_samples = 1
+    stTg.shadows = True
+    stTg.render_device = 'GPU'
+    stTg.gpu_shading = True
+    stTg.gpu_raster = True
+    stTg.layer_gpu_min_frac = 0.0        # every layer on the driver:
+    #                                      this section PROVES the GPU
+    #                                      machinery, so nothing routes
+    #                                      away from it
+    scTg = demo_scene(stTg, with_texture=False)
+    scTg.materials[1].opacity = 0.5
+    scTg.materials[1].reflect_level = 0.25
+    scTg.materials[2].opacity = 0.6
+    R.render(scTg, stTg)                     # cold: compiles the layers
+    t0 = _time.perf_counter()
+    gpuT = R.render(scTg, stTg)
+    t_gT = _time.perf_counter() - t0
+    dT = float(np.abs(gpuT - cpuT).max())
+    flipT = int((np.abs(gpuT - cpuT).max(axis=2) > 1e-2).sum())
+    _p(out, f'    max difference : {dT:.6f}')
+    _p(out, f'    px off by >0.01: {flipT} of {w2 * h2}')
+    _p(out, f'    CPU everything : {t_cT * 1000.0:7.1f} ms')
+    _p(out, f'    GPU everything : {t_gT * 1000.0:7.1f} ms (warm, whole '
+            'render() call -- the opaque frame AND every glass layer)')
+    if dT < 6e-3:
+        _p(out, '    the glass shades on your driver, layer by layer -- '
+                'the stage the 33.7s field frame spent 25.7s on')
+    else:
+        # corner the disagreement at the FRAGMENT, not the pixel: the
+        # exact CPU call the compositor makes vs the driver's layer
+        # draws, on identical sorted ranks. The histograms name the
+        # mechanism class -- alpha-only flips point at the alpha/blend
+        # path, one-rank clustering at the merge, one-material
+        # clustering at its pass, backface clustering at facing, and a
+        # nonzero driver-vs-itself count at nondeterminism.
+        try:
+            viewT, _pT, vpT, eyeT = R.camera_matrices(scT.camera, w2, h2)
+            opqT, trT = R._split_by_alpha(scT, scT.mesh, stT)
+            gT = CR.GBuffer(w2, h2)
+            CR.rasterize(scT.mesh.verts, scT.mesh.tris, vpT, w2, h2,
+                         subset=opqT, gbuf=gT,
+                         depth_bits=stT.depth_precision)
+            fT = CR.FragmentList()
+            CR.rasterize(scT.mesh.verts, scT.mesh.tris, vpT, w2, h2,
+                         cull='NONE', subset=trT, gbuf=gT, frags=fT,
+                         depth_write=False,
+                         depth_bits=stT.depth_precision)
+            jobT = R.ShadeJob(scT, stT, {}, None, viewT, eyeT, w2, h2)
+            pxT, pyT, triT, depT, barT, froT = fT.finish()
+            kT = depT <= CR.abuf_depth_limit(gT.depth[pyT, pxT])
+            pxT, pyT, triT, depT, barT, froT = (a[kT] for a in
+                                                (pxT, pyT, triT, depT,
+                                                 barT, froT))
+            centT = scT.mesh.verts[scT.mesh.tris].mean(axis=1)
+            vzT = np.abs((centT - jobT.eye[None, :])
+                         @ jobT.view[:3, :3].T)[:, 2]
+            keyT = vzT[triT].astype(np.float32)
+            pixT = pyT.astype(np.int64) * gT.width + pxT
+            oT = np.lexsort((keyT, pixT))
+            pixT, pxT, pyT, triT, barT, froT = (a[oT] for a in
+                                                (pixT, pxT, pyT, triT,
+                                                 barT, froT))
+            grT = np.zeros(pixT.size, np.int64)
+            ngT = np.nonzero(pixT[1:] != pixT[:-1])[0] + 1
+            grT[ngT] = ngT
+            np.maximum.accumulate(grT, out=grT)
+            rkT = np.arange(pixT.size, dtype=np.int64) - grT
+            cpuC = R._shade_chunked(jobT, triT, barT, pxT, pyT, froT,
+                                    None, stT)
+            _GSH._PLAN_CACHE.clear()
+            drvC, whyC = _GSH.shade_fragments_frame(jobT, gT, triT,
+                                                    barT, pxT, pyT, rkT)
+            _p(out, '    DIAGNOSIS (fragment-level, the numbers the '
+                    'next round needs):')
+            if drvC is None:
+                _p(out, f'      the driver re-shade refused: {whyC}')
+            else:
+                dC = np.abs(drvC - cpuC).max(axis=1)
+                badC = dC > 1e-2
+                _p(out, f'      fragment flips >0.01: '
+                        f'{int(badC.sum())} of {triT.size}   '
+                        f'max {float(dC.max()):.6f}')
+                if badC.any():
+                    daT = np.abs(drvC[:, 3] - cpuC[:, 3]) > 1e-2
+                    drT = np.abs(drvC[:, :3]
+                                 - cpuC[:, :3]).max(axis=1) > 1e-2
+                    _p(out, f'      channel structure: rgb-only '
+                            f'{int((badC & drT & ~daT).sum())}, '
+                            f'alpha-only '
+                            f'{int((badC & daT & ~drT).sum())}, both '
+                            f'{int((badC & daT & drT).sum())}')
+                    mTd = scT.mesh.mat_index[triT] \
+                        if scT.mesh.mat_index is not None else \
+                        np.zeros(triT.size, np.int32)
+                    _p(out, '      by rank: ' + str(
+                        {int(r): int((badC & (rkT == r)).sum())
+                         for r in np.unique(rkT[badC])}))
+                    _p(out, '      by material: ' + str(
+                        {int(m): int((badC & (mTd == m)).sum())
+                         for m in np.unique(mTd[badC])}))
+                    _p(out, f'      by facing: front '
+                            f'{int((badC & froT).sum())}, back '
+                            f'{int((badC & ~froT).sum())}')
+                    drv2, _w2d = _GSH.shade_fragments_frame(
+                        jobT, gT, triT, barT, pxT, pyT, rkT)
+                    if drv2 is not None:
+                        ndT = int((np.abs(drv2 - drvC).max(axis=1)
+                                   > 1e-4).sum())
+                        _p(out, f'      driver vs itself: {ndT} '
+                                'fragments differ (nonzero = '
+                                'nondeterministic)')
+                    for kf in np.argsort(dC)[::-1][:3]:
+                        kf = int(kf)
+                        _p(out, f'      flip: rank {int(rkT[kf])} mat '
+                                f'{int(mTd[kf])} front '
+                                f'{bool(froT[kf])}  cpu '
+                                f'{np.round(cpuC[kf], 4).tolist()}  drv '
+                                f'{np.round(drvC[kf], 4).tolist()}')
+        except Exception as _excT:                              # noqa: BLE001
+            _p(out, f'      (fragment diagnosis failed: {_excT})')
+
+    # ---- RAY-TRACED GLASS LAYERS: the field's last named refusal
+    # ('transparent layers under ray tracing recurse on the CPU',
+    # 25.1s of the 33.3s frame). Each layer's fragments are now a
+    # PRIMARY surface for the same sweeps the opaque frame runs:
+    # refraction through the glass, reflections among the mirrors, the
+    # recursion tree, the alpha chain riding untouched.
+    _p(out)
+    _p(out, '  RAY-TRACED GLASS LAYERS (glass + mirrors, ray depth 1, '
+            'whole render):')
+    stR = RenderSettings()
+    stR.resolution_x, stR.resolution_y = w2, h2
+    stR.aa_samples = 1
+    stR.shadows = True
+    stR.raytrace = True
+    stR.ray_depth = 1
+    scR = demo_scene(stR, with_texture=False)
+    scR.materials[1].opacity = 0.5
+    scR.materials[0].reflect_level = 0.2
+    scR.materials[2].reflect_level = 0.5
+    t0 = _time.perf_counter()
+    cpuR = R.render(scR, stR)
+    t_cR = _time.perf_counter() - t0
+    stRg = RenderSettings()
+    stRg.resolution_x, stRg.resolution_y = w2, h2
+    stRg.aa_samples = 1
+    stRg.shadows = True
+    stRg.raytrace = True
+    stRg.ray_depth = 1
+    stRg.render_device = 'GPU'
+    stRg.gpu_shading = True
+    stRg.gpu_raster = True
+    stRg.layer_gpu_min_frac = 0.0        # prove the machinery, not the
+    #                                      routing
+    scRg = demo_scene(stRg, with_texture=False)
+    scRg.materials[1].opacity = 0.5
+    scRg.materials[0].reflect_level = 0.2
+    scRg.materials[2].reflect_level = 0.5
+    R.render(scRg, stRg)                     # cold
+    t0 = _time.perf_counter()
+    gpuR = R.render(scRg, stRg)
+    t_gR = _time.perf_counter() - t0
+    dR = float(np.abs(gpuR - cpuR).max())
+    flipR = int((np.abs(gpuR - cpuR).max(axis=2) > 1e-2).sum())
+    _p(out, f'    max difference : {dR:.6f}')
+    _p(out, f'    px off by >0.01: {flipR} of {w2 * h2}')
+    _p(out, f'    CPU everything : {t_cR * 1000.0:7.1f} ms')
+    _p(out, f'    GPU everything : {t_gR * 1000.0:7.1f} ms (warm, whole '
+            'render() call -- opaque frame, glass layers AND their rays)')
+    if dR < 6e-3:
+        _p(out, '    the glass recurses on your driver -- the refusal '
+                'the 25-second field frames named is lifted')
+    else:
+        _p(out, '    (the fragment diagnosis in the section above '
+                'applies here too: re-run with ray tracing off to '
+                'separate the layer draw from the sweeps)')
+
+    # ---- BUMPY GLASS LAYERS: the field's last named material shape
+    # ("'Material.008': a Bump pre-pass on a transparent layer") -- the
+    # Water anatomy AS glass. Height pre-passes draw per rank over each
+    # layer's own ids (sin-fract Noise chains CPU-evaluated over the
+    # rank's virtual surface, exactly), and the CPU side now shades
+    # rank by rank with per-rank gradient fields -- the port surfaced
+    # and fixed a chunk-dependence in the OLD mixed-batch shading.
+    _p(out)
+    _p(out, '  BUMPY GLASS LAYERS (NOISE-into-BUMP glass + mirror, ray '
+            'on, whole render):')
+    from .tests.scenebuild import add_normal_mapped_ball as _add_nm
+
+    def _skB(nm, t, d, l=None):
+        return {'name': nm, 'type': t, 'default': d, 'link': l}
+
+    def _bumpy_glass(sc):
+        _add_nm(sc)
+        gB = sc.materials[1].graph
+        gB['nodes']['hnoise'] = {
+            'id': 'hnoise', 'bl_idname': 'ShaderNodeTexNoise',
+            'props': {'noise_dimensions': '3D'},
+            'inputs': [_skB('Vector', 'VECTOR', [0, 0, 0]),
+                       _skB('Scale', 'VALUE', 10.0),
+                       _skB('Detail', 'VALUE', 2.0),
+                       _skB('Roughness', 'VALUE', 0.5),
+                       _skB('Distortion', 'VALUE', 0.0)],
+            'outputs': [{'name': 'Fac', 'type': 'VALUE'},
+                        {'name': 'Color', 'type': 'RGBA'}]}
+        gB['nodes']['bump'] = {
+            'id': 'bump', 'bl_idname': 'ShaderNodeBump',
+            'props': {'invert': False},
+            'inputs': [_skB('Strength', 'VALUE', 0.8),
+                       _skB('Distance', 'VALUE', 0.6),
+                       _skB('Height', 'VALUE', 0.5, ['hnoise', 0]),
+                       _skB('Normal', 'VECTOR', [0, 0, 0])],
+            'outputs': [{'name': 'Normal', 'type': 'VECTOR'}]}
+        for s in gB['nodes']['hal']['inputs']:
+            if s['name'] == 'Normal':
+                s['link'] = ['bump', 0]
+            if s['name'] == 'Diffuse Color':
+                s['link'] = None
+                s['default'] = [0.3, 0.6, 0.9, 1.0]
+            if s['name'] == 'Opacity':
+                s['default'] = 0.5
+            if s['name'] == 'IOR':
+                s['default'] = 1.33
+        sc.materials[1].has_alpha = True
+        sc.materials[2].reflect_level = 0.5
+
+    stB2 = RenderSettings()
+    stB2.resolution_x, stB2.resolution_y = w2, h2
+    stB2.aa_samples = 1
+    stB2.shadows = True
+    stB2.raytrace = True
+    stB2.ray_depth = 1
+    scB2 = demo_scene(stB2, with_texture=False)
+    _bumpy_glass(scB2)
+    t0 = _time.perf_counter()
+    cpuB2 = R.render(scB2, stB2)
+    t_cB2 = _time.perf_counter() - t0
+    stB2g = RenderSettings()
+    stB2g.resolution_x, stB2g.resolution_y = w2, h2
+    stB2g.aa_samples = 1
+    stB2g.shadows = True
+    stB2g.raytrace = True
+    stB2g.ray_depth = 1
+    stB2g.render_device = 'GPU'
+    stB2g.gpu_shading = True
+    stB2g.gpu_raster = True
+    stB2g.layer_gpu_min_frac = 0.0       # prove the machinery, not the
+    #                                      routing
+    scB2g = demo_scene(stB2g, with_texture=False)
+    _bumpy_glass(scB2g)
+    R.render(scB2g, stB2g)                   # cold
+    t0 = _time.perf_counter()
+    gpuB2 = R.render(scB2g, stB2g)
+    t_gB2 = _time.perf_counter() - t0
+    dB2 = float(np.abs(gpuB2 - cpuB2).max())
+    flipB2 = int((np.abs(gpuB2 - cpuB2).max(axis=2) > 1e-2).sum())
+    _p(out, f'    max difference : {dB2:.6f}')
+    _p(out, f'    px off by >0.01: {flipB2} of {w2 * h2}')
+    _p(out, f'    CPU everything : {t_cB2 * 1000.0:7.1f} ms')
+    _p(out, f'    GPU everything : {t_gB2 * 1000.0:7.1f} ms (warm, '
+            'whole render() call)')
+    if dB2 < 6e-3:
+        _p(out, '    wavy glass shades, bends and recurses on your '
+                'driver -- the LAST named refusal of the field frames '
+                'is lifted')
+
+    # ---- SCISSORED LAYERS: the per-layer passes and readbacks are
+    # clipped to each layer's own bounding box (1.25.61) -- pure
+    # transport, so the SAME frame with the scissor off must match BIT
+    # FOR BIT. This is the A/B that stands the newer region-read driver
+    # path next to the proven full-frame texture read, on your driver.
+    _p(out)
+    _p(out, '  SCISSORED LAYERS (same bumpy-glass frame, scissor off '
+            'vs on):')
+    _sc_saved = getattr(_GSH, 'REGION_DRAWS', True)
+    try:
+        _GSH.REGION_DRAWS = False
+        t0 = _time.perf_counter()
+        gpuB2f = R.render(scB2g, stB2g)
+        t_fB2 = _time.perf_counter() - t0
+    finally:
+        _GSH.REGION_DRAWS = _sc_saved
+    dSc = float(np.abs(gpuB2 - gpuB2f).max())
+    _p(out, f'    scissored vs full-frame: max {dSc:.6f} '
+            f'({"BIT-IDENTICAL -- regions are pure transport" if dSc == 0.0 else "NOT identical -- the region path disagrees; turn the Debug toggle off and paste this"})')
+    _p(out, f'    full-frame render      : {t_fB2 * 1000.0:7.1f} ms '
+            f'(scissored {t_gB2 * 1000.0:.1f} ms)')
+
+    # ---- HYBRID LAYER ROUTING: the driver pays full-frame fixed costs
+    # per depth layer while the CPU pays per fragment, so sparse deep
+    # layers route to the proven per-rank CPU path (whole layers only,
+    # never split). The bumpy frame alone cannot split -- one glass
+    # ball is two layers of EXACTLY equal size (front and back faces,
+    # 8542 each on the first field run) and no threshold fits between
+    # equals -- so this frame makes the MIRROR see-through too: two
+    # transparent materials with different footprints give layers of
+    # different sizes, and a threshold between the two middle DISTINCT
+    # sizes forces a real mix, proven against both pure runs.
+    _p(out)
+    _p(out, '  HYBRID LAYER ROUTING (bumpy glass + glass mirror, '
+            'forced GPU/CPU mix):')
+
+    def _hybrid_scene(sth):
+        sch = demo_scene(sth, with_texture=False)
+        _bumpy_glass(sch)
+        sch.materials[2].opacity = 0.6      # the mirror is glass now
+        return sch
+
+    stHc = RenderSettings()
+    stHc.resolution_x, stHc.resolution_y = w2, h2
+    stHc.aa_samples = 1
+    stHc.shadows = True
+    stHc.raytrace = True
+    stHc.ray_depth = 1
+    t0 = _time.perf_counter()
+    cpuH = R.render(_hybrid_scene(stHc), stHc)
+    t_cH = _time.perf_counter() - t0
+
+    def _hybrid_gpu_settings(frac):
+        sth = RenderSettings()
+        sth.resolution_x, sth.resolution_y = w2, h2
+        sth.aa_samples = 1
+        sth.shadows = True
+        sth.raytrace = True
+        sth.ray_depth = 1
+        sth.render_device = 'GPU'
+        sth.gpu_shading = True
+        sth.gpu_raster = True
+        sth.layer_gpu_min_frac = frac
+        return sth
+
+    stH0 = _hybrid_gpu_settings(0.0)
+    t0 = _time.perf_counter()
+    gpuH = R.render(_hybrid_scene(stH0), stH0)
+    t_gH = _time.perf_counter() - t0
+    countsH = list((getattr(R, 'LAST_ROUTING', {}) or {})
+                   .get('counts', []))
+    valsH = sorted({int(c) for c in countsH if c > 0}, reverse=True)
+    if len(valsH) < 2:
+        _p(out, '    (frame cannot split -- every layer is the same '
+                f'size: {countsH})')
+    else:
+        # a threshold BETWEEN the two largest DISTINCT layer sizes:
+        # the biggest layer(s) stay on the driver, the rest route
+        thrH = (valsH[0] + valsH[1]) / 2.0
+        stH = _hybrid_gpu_settings(thrH / float(w2 * h2))
+        t0 = _time.perf_counter()
+        hybB = R.render(_hybrid_scene(stH), stH)
+        t_hB = _time.perf_counter() - t0
+        rtH = dict(getattr(R, 'LAST_ROUTING', {}) or {})
+        _p(out, f'    routed         : GPU {rtH.get("gpu_ranks", 0)} '
+                f'layers ({rtH.get("gpu_frags", 0)} frags), CPU '
+                f'{rtH.get("cpu_ranks", 0)} layers '
+                f'({rtH.get("cpu_frags", 0)} frags), threshold '
+                f'{rtH.get("thresh", 0)} of per-layer {countsH}')
+        if not rtH.get('gpu_ranks') or not rtH.get('cpu_ranks') \
+                or 'refused' in rtH:
+            _p(out, '    NOT A MIX -- the routing test is vacuous on '
+                    'this frame'
+                    + (f" (driver refused: {rtH['refused']})"
+                       if 'refused' in rtH else
+                       '; the numbers above name why'))
+        dHg = float(np.abs(hybB - gpuH).max())
+        dHc = float(np.abs(hybB - cpuH).max())
+        flHg = int((np.abs(hybB - gpuH).max(axis=2) > 1e-2).sum())
+        flHc = int((np.abs(hybB - cpuH).max(axis=2) > 1e-2).sum())
+        _p(out, f'    vs all-GPU     : max {dHg:.6f}, px off by >0.01: '
+                f'{flHg} of {w2 * h2}')
+        _p(out, f'    vs all-CPU     : max {dHc:.6f}, px off by >0.01: '
+                f'{flHc} of {w2 * h2}')
+        _p(out, f'    hybrid render  : {t_hB * 1000.0:7.1f} ms (warm '
+                f'GPU {t_gH * 1000.0:.1f}, CPU {t_cH * 1000.0:.1f})')
+        ltH = dict(getattr(_GSH, 'LAST_LAYER_TIMINGS', {}) or {})
+        if ltH:
+            sumH = (ltH.get('plan_ms', 0.0) + ltH.get('compile_ms', 0.0)
+                    + ltH.get('upload_ms', 0.0) + ltH.get('draw_ms', 0.0)
+                    + ltH.get('read_ms', 0.0) + ltH.get('sweep_ms', 0.0))
+            _p(out, f'    split accounts : buckets {sumH:.1f} ms + other '
+                    f"{ltH.get('other_ms', 0.0):.1f} ms = total "
+                    f"{ltH.get('total_ms', 0.0):.1f} ms "
+                    f"({'sound' if sumH <= ltH.get('total_ms', 0.0) + 1.0 else 'OVERLAPPING -- a bucket is double-counted'})")
+        if dHg < 6e-3 and dHc < 6e-3 and rtH.get('gpu_ranks') \
+                and rtH.get('cpu_ranks') and 'refused' not in rtH:
+            _p(out, '    the mixed frame matches both pure paths: '
+                    'routing is invisible in the picture')
+
+
+def _refracted_diagnosis(out, scB, stB, cpuA, gpuA, w2, h2):
+    """Corner the refracted frame's disagreement on the driver itself.
+
+    Headless analysis already ruled the BANDS sky OUT for this scene (a
+    band flip here moves a pixel ~0.01, the report said 0.19), which
+    leaves suspects that only the driver can separate: the shadow taps
+    inside secondary (hit) shading, the bump bend's first hardware run,
+    and the refraction sweep itself. Two instruments: classify WHERE the
+    bad pixels live (surface, ray membership, what their rays hit), then
+    re-render the same frame with one suspect disabled at a time --
+    whichever variant zeroes the count names the mechanism.
+    """
+    import numpy as np
+
+    from .core import raster as CR
+    from .core import render as R
+    from .core.settings import RenderSettings
+    from .gpu import shade as _GSH
+
+    _p(out, '    DIAGNOSIS (the numbers the next round needs):')
+    try:
+        badA = np.abs(gpuA - cpuA).max(axis=2) > 1e-2
+        viewD, _pd, vpD, eyeD = R.camera_matrices(scB.camera, w2, h2)
+        gD = CR.GBuffer(w2, h2)
+        CR.rasterize(scB.mesh.verts, scB.mesh.tris, vpD, w2, h2, gbuf=gD)
+        texD = R.prepare_textures(scB, stB)
+        bvhD = R._cached_bvh(scB, scB.mesh)
+        jobD = R.ShadeJob(scB, stB, texD, bvhD, viewD, eyeD, w2, h2)
+        miD = np.where(gD.tri >= 0,
+                       scB.mesh.mat_index[np.clip(gD.tri, 0, None)], -1)
+        names = {0: 'floor', 1: 'glass', 2: 'mirror', -1: 'miss (world)'}
+
+        def nm(m):
+            return names.get(int(m), f'mat{int(m)}')
+
+        hist = {nm(m): int((badA & (miD == m)).sum())
+                for m in np.unique(miD[badA])}
+        _p(out, f'      bad px by surface: {hist}')
+
+        # ray membership, and what the bad pixels' own rays hit -- the
+        # rays and the trace are CPU-side and proven, so this is exact
+        pD, whyD, aD = _GSH.plan_frame(jobD, gD)
+        rpD = (aD or {}).get('__reflect') if pD is not None else None
+        if rpD is None:
+            _p(out, f'      (could not re-plan to classify rays: {whyD})')
+        else:
+            for label, mk in (('reflection', _GSH._reflection_rays),
+                              ('refraction', _GSH._refraction_rays)):
+                ry, rx, ro, rd = mk(jobD, gD, rpD)
+                if ry.size == 0:
+                    continue
+                hidD, _tD, _uD, _vD = bvhD.intersect(
+                    ro, rd, np.full(ry.size, 1e30, np.float32))
+                on = badA[ry, rx]
+                hm = np.where(hidD >= 0,
+                              scB.mesh.mat_index[np.clip(hidD, 0, None)],
+                              -1)
+                hh = {nm(m): int((on & (hm == m)).sum())
+                      for m in np.unique(hm[on])} if on.any() else {}
+                _p(out, f'      bad px that are {label} px: '
+                        f'{int(on.sum())} of {ry.size}   their hits: {hh}')
+
+        # the worst three, in numbers: channel structure tells shadow
+        # flips (big, all channels, light-coloured) from tint or band
+        # errors (small, colour-shaped)
+        flat = np.abs(gpuA - cpuA).max(axis=2)
+        for k in np.argsort(flat.ravel())[::-1][:3]:
+            yy, xx = divmod(int(k), w2)
+            _p(out, f'      worst: ({yy},{xx}) on {nm(miD[yy, xx])}  '
+                    f'cpu {np.round(cpuA[yy, xx][:3], 4)}  '
+                    f'gpu {np.round(gpuA[yy, xx][:3], 4)}')
+
+        # ---- the A/B quartet: one suspect off per re-render. Counts
+        # only; the variant that reads 0 is the conviction
+        stC = RenderSettings()
+        for f in ('resolution_x', 'resolution_y', 'aa_samples', 'shadows',
+                  'raytrace', 'ray_depth', 'transparency'):
+            setattr(stC, f, getattr(stB, f))
+
+        bump_node = scB.materials[1].graph['nodes'].get('bump')
+        bump_sock = None
+        if bump_node is not None:
+            bump_sock = next((s for s in bump_node['inputs']
+                              if s['name'] == 'Strength'), None)
+
+        def _ab(tag, mutate, restore):
+            try:
+                mutate()
+                _GSH._PLAN_CACHE.clear()
+                ref = R.render(scB, stC)
+                got = R.render(scB, stB)
+                n = int((np.abs(got - ref).max(axis=2) > 1e-2).sum())
+                mx = float(np.abs(got - ref).max())
+                _p(out, f'      {tag:<26s}: {n} px off  (max {mx:.6f})')
+            except Exception as exc:                            # noqa: BLE001
+                _p(out, f'      {tag:<26s}: variant failed: {exc}')
+            finally:
+                restore()
+                _GSH._PLAN_CACHE.clear()
+
+        def _set_shadows(v):
+            stB.shadows = v
+            stC.shadows = v
+
+        def _set_strength(v):
+            scB.world.strength = v
+
+        def _set_bump(v):
+            if bump_sock is not None:
+                bump_sock['default'] = v
+
+        def _set_refract(v):
+            stB.ray_refraction = v
+            stC.ray_refraction = v
+
+        old_strength = float(getattr(scB.world, 'strength', 1.0))
+        old_bump = None if bump_sock is None else bump_sock['default']
+        _ab('shadows OFF', lambda: _set_shadows(False),
+            lambda: _set_shadows(True))
+        _ab('sky strength 0 (no env)', lambda: _set_strength(0.0),
+            lambda: _set_strength(old_strength))
+        if bump_sock is not None:
+            _ab('bump strength 0 (flat)', lambda: _set_bump(0.0),
+                lambda: _set_bump(old_bump))
+        _ab('ray refraction OFF', lambda: _set_refract(False),
+            lambda: _set_refract(True))
+    except Exception as _exc:                                   # noqa: BLE001
+        _p(out, f'      diagnosis itself failed: {_exc}')
+
+
+def _gpu_compute_probe_retired(out):
+    """The round-19 API probe, kept for reference; superseded above."""
+    _p(out)
+    _p(out, LINE)
+    _p(out, 'GPU COMPUTE CAPABILITY  (for the compute rasteriser study)')
+    _p(out, LINE)
+    from .gpu import device
+    ok, why = device.probe()
+    if not ok:
+        _p(out, f'  skipped: {why}')
+        return
+    import gpu as _gpu
+
+    # ---- what the module surface offers
+    types_attrs = sorted(a for a in dir(_gpu.types)
+                         if any(k in a.lower() for k in
+                                ('storage', 'buf', 'compute')))
+    top_attrs = sorted(a for a in dir(_gpu)
+                       if 'compute' in a.lower())
+    _p(out, f'  gpu module      : compute-ish toplevel {top_attrs or "none"}')
+    _p(out, f'  gpu.types       : {types_attrs or "none relevant"}')
+    try:
+        info = _gpu.types.GPUShaderCreateInfo()
+        info_attrs = sorted(a for a in dir(info)
+                            if any(k in a.lower() for k in
+                                   ('compute', 'local', 'storage', 'image',
+                                    'ssbo')))
+        _p(out, f'  CreateInfo      : {info_attrs or "none relevant"}')
+    except Exception as exc:                                    # noqa: BLE001
+        _p(out, f'  CreateInfo      : failed to instantiate: {exc}')
+        return
+
+    # ---- the most likely API shape, attempted step by step
+    steps = []
+
+    def step(name, fn):
+        try:
+            r = fn()
+            steps.append((name, 'ok', r))
+            return r
+        except Exception as exc:                                # noqa: BLE001
+            steps.append((name, 'FAIL', f'{type(exc).__name__}: {exc}'))
+            return None
+
+    src = '''
+void main()
+{
+    ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    imageStore(hal_out, xy, vec4(float(xy.x), float(xy.y), 7.0, 1.0));
+}
+'''
+    built = {}
+
+    def make_info():
+        ci = _gpu.types.GPUShaderCreateInfo()
+        ci.local_group_size(8, 8)
+        ci.image(0, 'RGBA32F', 'FLOAT_2D', 'hal_out',
+                 qualifiers={'WRITE'})
+        ci.compute_source(src)
+        built['info'] = ci
+        return 'local_group_size(8,8) + image(WRITE) + compute_source'
+    step('CreateInfo compute setup', make_info)
+    if built.get('info') is not None:
+        def compile_it():
+            built['shader'] = _gpu.shader.create_from_info(built['info'])
+            return 'compiled'
+        step('compile compute shader', compile_it)
+    if built.get('shader') is not None:
+        def dispatch_it():
+            tex = _gpu.types.GPUTexture((16, 16), format='RGBA32F')
+            sh = built['shader']
+            sh.bind()
+            sh.image('hal_out', tex)
+            _gpu.compute.dispatch(sh, 2, 2, 1)
+            buf = tex.read()
+            import numpy as np
+            arr = np.array(buf.to_list() if hasattr(buf, 'to_list')
+                           else buf, dtype=np.float32).reshape(16, 16, 4)
+            probe = arr[3, 5]
+            good = abs(probe[0] - 5.0) < 0.5 and abs(probe[1] - 3.0) < 0.5 \
+                and abs(probe[2] - 7.0) < 0.5
+            return (f'dispatched and read back; pixel(5,3) = '
+                    f'{probe[:3].tolist()} -> '
+                    f'{"CORRECT" if good else "unexpected"}')
+        step('dispatch + readback', dispatch_it)
+
+    for name, status, detail in steps:
+        _p(out, f'  {name:26s}: {status}  {detail}')
+    if any(s[1] == 'FAIL' for s in steps):
+        _p(out, '  a FAIL above is still an answer: the error text names '
+                'the real API,')
+        _p(out, '  and the next build reads it')
+    else:
+        _p(out, '  everything a compute rasteriser needs is present; the '
+                'port can start')
+
+
 class HALCYON_OT_selftest(Operator):
     """Measure this machine and print a report that can be pasted back"""
 
@@ -260,6 +1830,8 @@ class HALCYON_OT_selftest(Operator):
         out = []
         sections = [('environment', lambda: environment(out)),
                     ('gpu stages', lambda: gpu_stages(out)),
+                    ('gpu deferred shading', lambda: gpu_deferred(out)),
+                    ('gpu compute capability', lambda: gpu_compute(out)),
                     ('frame breakdown', lambda: frame_breakdown(out))]
         if self.include_scaling:
             sections.append(('cpu scaling', lambda: cpu_scaling(out, self.heavy)))

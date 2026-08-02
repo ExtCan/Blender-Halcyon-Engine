@@ -345,8 +345,14 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
     amb_col = LI.ambient_light(scene, settings)
     out = surf.diffuse * surf.ambient[:, None] * amb_col[None, :]
 
+    spx = getattr(ctx, 'spx', None)
+    spy = getattr(ctx, 'spy', None)
+    have_id = spx is not None and spy is not None
+
     if settings.ambient_occlusion and bvh is not None:
-        out *= ambient_occlusion(ctx.P, N, bvh, settings, rng)[:, None]
+        out *= ambient_occlusion(ctx.P, N, bvh, settings, rng,
+                                 sample_xy=(spx, spy) if have_id
+                                 else None)[:, None]
 
     # the sheen lobe's falloff, computed once rather than per light
     sheen_exp = None
@@ -360,7 +366,7 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
     clamp = float(settings.light_clamp)
 
     obj_idx = getattr(ctx, 'object_index_raw', None)
-    for light in lights:
+    for li, light in enumerate(lights):
         lit_mask = None
         excl = getattr(light, 'exclude_objects', None)
         if excl and obj_idx is not None:
@@ -372,7 +378,8 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         ndl = M.dot(N, L)
         if not np.any(ndl > 0.0) and not np.any(surf.translucency > 0):
             continue
-        vis = LI.visibility(light, ctx.P, N, L, dist, settings, bvh, rng)
+        vis = LI.visibility(light, ctx.P, N, L, dist, settings, bvh, rng,
+                            sample_xy=(spx, spy, li) if have_id else None)
         if not np.any(vis > 0.0):
             continue
         dif, spec = SH.evaluate(model, surf, N, L, V)
@@ -438,14 +445,42 @@ def apply_surface_effects(out, surf, N, V):
     return out
 
 
-def ambient_occlusion(P, N, bvh, settings, rng=None):
-    rng = rng or np.random.default_rng(settings.seed)
+def ambient_occlusion(P, N, bvh, settings, rng=None, sample_xy=None):
+    """1 = open sky, falling toward 0 in creases, over `ao_distance`.
+
+    With `sample_xy` (integer pixel identity), the cosine-weighted
+    hemisphere directions are a pure function of (pixel, sample, seed):
+    the same picture whatever the batch order or thread count, and
+    exactly reproducible by the deferred pass -- hash draws for the
+    radius, the shared unit-circle table for the angle (a driver rounds
+    sin/cos differently, and an occlusion ray is a cliff). Without an
+    identity, the legacy sequential stream still runs.
+    """
     n = P.shape[0]
     samples = max(int(settings.ao_samples), 1)
     t, b = M.orthonormal_basis(N)
     occ = np.zeros(n, np.float32)
     dist = float(settings.ao_distance)
     origin = P + N * max(settings.ray_bias, 1e-4)
+    if sample_xy is not None:
+        from . import patterns as PT
+        spx, spy = sample_xy
+        seed = int(getattr(settings, 'seed', 0) or 0)
+        for k in range(samples):
+            z = 2 * k + 8389 + 7919 * seed
+            u1 = PT.sample_u(spx, spy, z)
+            ca, sa = PT.sample_circle(PT.sample_u(spx, spy, z + 1))
+            r = np.sqrt(u1)
+            d = M.normalize(t * (r * ca)[:, None] +
+                            b * (r * sa)[:, None] +
+                            N * np.sqrt(np.maximum(np.float32(1.0) - u1,
+                                                   np.float32(0.0)))[:, None])
+            occ += bvh.occluded(origin, d,
+                                np.full(n, dist, np.float32)).astype(
+                                    np.float32)
+        ao = 1.0 - (occ / samples) * float(settings.ao_intensity)
+        return np.clip(ao, 0.0, 1.0)
+    rng = rng or np.random.default_rng(settings.seed)
     for _ in range(samples):
         u1 = rng.random(n).astype(np.float32)
         u2 = rng.random(n).astype(np.float32)
@@ -601,6 +636,10 @@ class ShadeJob:
         self._obj_matrices = None
         self._bounds = None
         self._obj_bounds = None
+        #: (mat_index, bump-node id) -> (gx, gy) full-frame gradient grids,
+        #: filled by _shade_all for materials whose chunking would otherwise
+        #: cut n_bump's screen gradients mid-material
+        self.bump_fields = {}
 
     def object_bounds(self):
         """Per-object bounding boxes, for Generated texture coordinates.
@@ -714,6 +753,13 @@ class ShadeJob:
         oi_c = np.clip(obj_idx, 0, lo.shape[0] - 1)
         ctx.generated = ((P - lo[oi_c]) / span[oi_c]).astype(np.float32)
         ctx.random = _hash1(tri_idx.astype(np.float32))
+        ctx.bump_fields = getattr(self, 'bump_fields', None)
+        # the deterministic-sampling identity: the screen pixel where one
+        # exists. Traced hits overwrite these with the pixel that spawned
+        # their ray (ShadeJob.shade's sample_xy), so a hit's soft shadows
+        # and AO draw the same streams either device would.
+        ctx.spx = np.asarray(px, np.int64) if px is not None else None
+        ctx.spy = np.asarray(py, np.int64) if py is not None else None
         return ctx
 
     def _fill_object(self, ctx, obj_idx):
@@ -742,8 +788,15 @@ class ShadeJob:
 
     # .......................................................... the shading
     def shade(self, tri_idx, bary, px=None, py=None, front=None, bary_lin=None,
-              ray_depth=0, is_camera=True, rng=None):
-        """RGBA for a set of surface samples, batched by material."""
+              ray_depth=0, is_camera=True, rng=None, sample_xy=None):
+        """RGBA for a set of surface samples, batched by material.
+
+        `sample_xy` is (spx, spy): the SAMPLING identity for surface
+        points that have no screen pixel of their own -- a traced hit
+        carries the pixel that spawned its ray, so its soft shadows and
+        ambient occlusion draw the same deterministic streams the
+        primary surface drew.
+        """
         n = tri_idx.size
         out = np.zeros((n, 4), np.float32)
         if n == 0:
@@ -751,6 +804,7 @@ class ShadeJob:
         mesh = self.scene.mesh
         mat_idx = mesh.mat_index[tri_idx] if mesh.mat_index is not None else \
             np.zeros(n, np.int32)
+        spx, spy = sample_xy if sample_xy is not None else (None, None)
         for mi in np.unique(mat_idx):
             sel = np.nonzero(mat_idx == mi)[0]
             mat = self.scene.materials[int(mi)] if int(mi) < len(self.scene.materials) \
@@ -761,6 +815,9 @@ class ShadeJob:
                                front[sel] if front is not None else None,
                                bary_lin[sel] if bary_lin is not None else None,
                                ray_depth, is_camera)
+            if spx is not None:
+                sub.spx = np.asarray(spx, np.int64)[sel]
+                sub.spy = np.asarray(spy, np.int64)[sel]
             out[sel] = self.shade_batch(sub, mat, ray_depth, rng)
         return out
 
@@ -781,6 +838,20 @@ class ShadeJob:
             return np.concatenate([rgb, surf.opacity[:, None]], 1).astype(np.float32)
 
         surf, model, nrm = closure_to_surface(cl, ctx, st, mat)
+        # Gouraud/flat split (see _shade_interpolated): hardware of the
+        # period interpolated the LIGHTING between vertices and still
+        # sampled the TEXTURE at every pixel -- `texel x vertex colour`,
+        # the MODULATE combiner. ALBEDO returns the per-pixel half,
+        # LIGHT shades the lighting half over a white surface so the two
+        # multiply back together with the texture at full resolution.
+        rate_mode = getattr(self, 'rate_mode', None)
+        if rate_mode == 'ALBEDO':
+            alb = np.asarray(surf.diffuse, np.float32)
+            return np.concatenate(
+                [alb, np.clip(surf.opacity, 0.0, 1.0)[:, None]],
+                axis=1).astype(np.float32)
+        if rate_mode == 'LIGHT':
+            surf.diffuse = np.ones_like(np.asarray(surf.diffuse, np.float32))
         if nrm is not None:
             ctx.N = M.normalize(nrm)
         if st.normal_source == 'FACE':
@@ -851,13 +922,21 @@ class ShadeJob:
             return rgb
         N = M.normalize(ctx.N)
         V = -M.normalize(ctx.I)
+        spx = getattr(ctx, 'spx', None)
+        spy = getattr(ctx, 'spy', None)
+
+        def _sxy(sel):
+            if spx is None or spy is None:
+                return None
+            return (np.asarray(spx, np.int64)[sel],
+                    np.asarray(spy, np.int64)[sel])
 
         if st.ray_reflection:
             want = np.nonzero(surf.reflect > 1e-4)[0]
             if want.size:
                 R = M.reflect(-V[want], N[want])
                 hit = self.trace(ctx.P[want] + N[want] * st.ray_bias, R,
-                                 ray_depth + 1)
+                                 ray_depth + 1, sample_xy=_sxy(want))
                 rgb[want] += (hit * surf.reflect[want, None] *
                               surf.specular[want] * surf.reflect_color[want])
 
@@ -870,14 +949,18 @@ class ShadeJob:
                 T = M.refract(-Vw, Nw, eta)
                 bad = (T * T).sum(1) < 1e-9
                 T = np.where(bad[:, None], M.reflect(-Vw, Nw), T)
-                hit = self.trace(ctx.P[want] - Nw * st.ray_bias, T, ray_depth + 1)
+                hit = self.trace(ctx.P[want] - Nw * st.ray_bias, T,
+                                 ray_depth + 1, sample_xy=_sxy(want))
                 k = ((1.0 - np.clip(surf.opacity[want], 0.0, 1.0)) *
                      np.clip(surf.refraction[want], 0.0, 1.0))[:, None]
                 rgb[want] = rgb[want] * (1.0 - k) + hit * k * surf.diffuse[want]
         return rgb
 
-    def trace(self, origin, dirs, ray_depth):
-        """Shade whatever a secondary ray hits (background if nothing)."""
+    def trace(self, origin, dirs, ray_depth, sample_xy=None):
+        """Shade whatever a secondary ray hits (background if nothing).
+
+        `sample_xy` carries the spawning pixels' identity, so the hit's
+        deterministic sampling (soft shadows, AO) follows the ray."""
         n = origin.shape[0]
         if self.bvh is None or ray_depth > self.settings.ray_depth:
             return world_color(self.scene, self.settings, dirs, self.textures, n)
@@ -894,7 +977,9 @@ class ShadeJob:
         idx = np.nonzero(hit)[0]
         bary = np.stack([1.0 - u[idx] - v[idx], u[idx], v[idx]], axis=1).astype(np.float32)
         col = self.shade(tid[idx].astype(np.int32), bary, ray_depth=ray_depth,
-                         is_camera=False)
+                         is_camera=False,
+                         sample_xy=(sample_xy[0][idx], sample_xy[1][idx])
+                         if sample_xy is not None else None)
         out[idx] = col[:, :3]
         return out
 
@@ -1057,7 +1142,7 @@ def render(scene, settings=None, progress=None, band=None):
     bvh = None
     if need_bvh and mesh is not None and mesh.tris is not None and mesh.tris.size:
         with ST.track('build BVH'):
-            bvh = BVH(mesh.verts, mesh.tris)
+            bvh = _cached_bvh(scene, mesh)
 
     with ST.track('shadow maps'):
         _build_shadows(scene, st, mesh)
@@ -1088,20 +1173,89 @@ def render(scene, settings=None, progress=None, band=None):
     # when only a band is wanted, the rasteriser is told so: otherwise every
     # worker in a pool rasterises the whole mesh for its own slice
     scissor = None
+    has_bump = any('ShaderNodeBump' in
+                   str((getattr(m, 'graph', None) or {}).get('nodes', {}))
+                   for m in getattr(scene, 'materials', ()) or ())
     if band is not None:
         scissor = (max(band[0], 0) * ss, min(band[1], H) * ss)
+        if has_bump:
+            # one CONTEXT row past the band's top: n_bump differences
+            # toward the +y neighbour, and without that row a band's
+            # last shaded row flattened its waves -- the same seam the
+            # chunk fix killed, band edition. The scissor culls whole
+            # triangles, so one extra row keeps the neighbour coverage
+            # complete; shading stays band-masked below.
+            scissor = (scissor[0], min(scissor[1] + 1, rh))
 
     flat_depth = None
     if st.depth_sort == 'PAINTERS':
         flat_depth = polygon_depths(mesh, view, eye, st.painters_key)
 
     want_overdraw = st.debug_pass == 'OVERDRAW'
-    with ST.track('rasterise'):
-        raster.rasterize(mesh.verts, mesh.tris, vp, rw, rh, cull=cull, snap=snap,
-                         depth_bits=st.depth_precision, subset=opaque, gbuf=gbuf,
-                         count_overdraw=want_overdraw, flat_depth=flat_depth,
-                         scissor=scissor,
-                         batched=False if want_overdraw else None)
+    # The compute rasteriser: the CPU's own fill rules on the GPU, measured
+    # at ZERO differing pixels on hardware. Strictly opt-in and strictly
+    # qualified -- anything it does not reproduce rasterises on the CPU
+    # exactly as before, with the reason printed. Whole-frame only.
+    rastered_on_gpu = False
+    if str(getattr(st, 'render_device', 'CPU')).upper() == 'GPU' and \
+            getattr(st, 'gpu_raster', False) and band is None and \
+            flat_depth is None and not want_overdraw:
+        if not getattr(st, 'tex_perspective', True):
+            print('[Halcyon GPU] rasterising on the CPU: affine texture '
+                  'mode needs screen-linear barycentrics the compute '
+                  'raster does not carry yet')
+        else:
+            from ..gpu import craster as _craster
+            with ST.track('rasterise (GPU)'):
+                # the GPU crossings live at the device boundary now
+                # (gpu/device.py _main): the CPU halves of this call
+                # never block the interface, the driver halves cross
+                # as millisecond bursts
+                try:
+                    ok_r, why_r = _craster.raster_into_gbuffer(
+                        mesh, vp, rw, rh, gbuf, cull=cull, snap=snap,
+                        depth_bits=st.depth_precision, subset=opaque)
+                except Exception as exc:                        # noqa: BLE001
+                    ok_r, why_r = False, str(exc)
+            if ok_r:
+                rastered_on_gpu = True
+            else:
+                print(f'[Halcyon GPU] rasterising on the CPU: {why_r}')
+    if not rastered_on_gpu:
+        with ST.track('rasterise'):
+            raster.rasterize(mesh.verts, mesh.tris, vp, rw, rh, cull=cull,
+                             snap=snap, depth_bits=st.depth_precision,
+                             subset=opaque, gbuf=gbuf,
+                             count_overdraw=want_overdraw,
+                             flat_depth=flat_depth, scissor=scissor,
+                             batched=False if want_overdraw else None)
+
+    if band is None:
+        # the two numbers behind "the depth is screwed up": what the
+        # z-buffer can resolve on THIS frame, and which surfaces were
+        # taken out of the depth-buffered pass altogether
+        _rep = depth_report(proj, gbuf, st.depth_precision,
+                            getattr(st, 'depth_sort', 'ZBUFFER'))
+        if _rep:
+            print(_rep)
+        _sp = LAST_SPLIT
+        if _sp.get('see_through'):
+            named = '; '.join(f'{n}: {w}' for n, w
+                              in list(_sp['reasons'].items())[:6])
+            more = len(_sp['reasons']) - 6
+            print(f"[Halcyon] transparency: {_sp['see_through']} of "
+                  f"{_sp['materials']} materials are see-through "
+                  f"({_sp['tris_see_through']} of {_sp['tris']} "
+                  f'triangles) -- {named}'
+                  + (f' (+{more} more)' if more > 0 else ''))
+            if opaque is not None and opaque.size == 0:
+                print('[Halcyon] transparency: NOTHING is in the '
+                      'depth-buffered pass -- every surface stacks as '
+                      'A-buffer layers instead, so solid geometry can '
+                      'show its own back faces. If these materials are '
+                      'meant to be solid, set their blend mode to '
+                      'Opaque (or Transparency to None) and the frame '
+                      'goes back through the z-buffer')
 
     if progress:
         progress(0.35, 'Shading')
@@ -1119,14 +1273,49 @@ def render(scene, settings=None, progress=None, band=None):
 
     py, px = np.nonzero(covered)
     if py.size:
-        tri_idx = gbuf.tri[py, px]
-        bary = gbuf.bary[py, px]
-        blin = gbuf.bary_lin[py, px] if gbuf.bary_lin is not None else None
-        front = gbuf.front[py, px]
-        with ST.track('shade'):
-            col = _shade_all(job, tri_idx, bary, px, py, front, blin, st)
-        img[py, px, :3] = col[:, :3]
-        img[py, px, 3] = np.maximum(img[py, px, 3], col[:, 3])
+        # Deferred GPU shading: the G-buffer just rasterised is shaded in a
+        # full-screen pass per material, on the same mechanism the post
+        # stages run on. Strictly opt-in, and strictly qualified -- a frame
+        # using anything the GLSL does not reproduce shades on the CPU
+        # exactly as before, with the reason printed rather than guessed
+        # around. Whole-frame only: a worker band re-splits the arithmetic
+        # the GPU would do in one pass anyway.
+        shaded_on_gpu = False
+        if str(getattr(st, 'render_device', 'CPU')).upper() == 'GPU' and \
+                st.gpu_shading and band is None:
+            from ..gpu import shade as _gpu_shade
+            with ST.track('shade (GPU)'):
+                try:
+                    got, why = _gpu_shade.shade_frame(job, gbuf)
+                except Exception as exc:                        # noqa: BLE001
+                    got, why = None, str(exc)
+            if got is None:
+                print(f'[Halcyon GPU] shading on the CPU: {why}')
+            else:
+                img[py, px, :3] = got[py, px]
+                img[py, px, 3] = 1.0
+                shaded_on_gpu = True
+        if not shaded_on_gpu:
+            tri_idx = gbuf.tri[py, px]
+            bary = gbuf.bary[py, px]
+            blin = gbuf.bary_lin[py, px] if gbuf.bary_lin is not None else None
+            front = gbuf.front[py, px]
+            if band is not None and has_bump:
+                # a band shades only its rows, but n_bump's gradients
+                # need the CONTEXT row the extended scissor rasterised:
+                # hand the field builder the G-buffer's FULL coverage,
+                # so a band's gradients equal the whole frame's
+                fpy, fpx = np.nonzero(gbuf.mask())
+                job.bump_field_source = (
+                    gbuf.tri[fpy, fpx], gbuf.bary[fpy, fpx], fpx, fpy,
+                    gbuf.front[fpy, fpx],
+                    gbuf.bary_lin[fpy, fpx]
+                    if gbuf.bary_lin is not None else None)
+            with ST.track('shade'):
+                col = _shade_all(job, tri_idx, bary, px, py, front, blin, st,
+                                 progress=progress)
+            img[py, px, :3] = col[:, :3]
+            img[py, px, 3] = np.maximum(img[py, px, 3], col[:, 3])
 
     with ST.track('wireframe'):
         img = apply_wireframe(job, gbuf, img, st, vp, eye, textures)
@@ -1139,7 +1328,7 @@ def render(scene, settings=None, progress=None, band=None):
                          gbuf=gbuf, frags=frags, depth_write=False,
                          flat_depth=flat_depth, scissor=scissor)
         with ST.track('transparency'):
-            img = _composite_abuffer(job, frags, gbuf, img, st)
+            img = _composite_abuffer(job, frags, gbuf, img, st, band=band)
     elif transparent is not None and transparent.size:
         raster.rasterize(mesh.verts, mesh.tris, vp, rw, rh, cull=cull, snap=snap,
                          depth_bits=st.depth_precision, subset=transparent,
@@ -1227,7 +1416,84 @@ def material_wire_size(mat, default=1.0):
 RATE_FOR_MODEL = {'GOURAUD': 'VERTEX', 'FLAT': 'FACE', 'WIREFRAME': 'PIXEL'}
 
 
-def _shade_all(job, tri_idx, bary, px, py, front, blin, st):
+def _cached_bvh(scene, mesh):
+    """The scene's BVH, rebuilt only when the mesh content changed.
+
+    A viewport orbit calls render() once per view of the SAME scene, and an
+    animation renders the same mesh for most of its frames -- rebuilding the
+    tree every call was a fifth of a second a frame on a real field scene.
+    The cache lives on the scene object (a fresh export starts clean) behind
+    a strided content fingerprint, the same idiom every GPU upload cache
+    uses: identity is useless across exports, content is not.
+    """
+    v = mesh.verts
+    stride = max(1, v.shape[0] // 512)
+    key = (int(v.shape[0]), int(mesh.tris.shape[0]),
+           round(float(v[::stride].sum()), 3),
+           round(float(np.abs(v[::stride]).sum()), 3))
+    hit = getattr(scene, '_bvh_cache', None)
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    bvh = BVH(mesh.verts, mesh.tris)
+    try:
+        scene._bvh_cache = (key, bvh)
+    except Exception:                                           # noqa: BLE001
+        pass                       # a scene that refuses attributes still renders
+    return bvh
+
+
+def _bump_height_fields(job, mat, mi, tri_m, bary_m, px_m, py_m, front_m,
+                        blin_m, chunkn):
+    """(mi, node_id) -> (gx, gy): whole-material bump gradients, pre-passed.
+
+    `n_bump` differences its height chain toward the +x/+y neighbours,
+    gated on the neighbour being shaded in the same batch -- so when a
+    material is too covered for one batch, its gradients used to cut at
+    every chunk boundary. This is the CPU's own height PRE-PASS, the
+    same idea the deferred pass proved: evaluate the height chain over
+    the material's FULL frame pixels (in bounded chunks -- heights are
+    per-pixel independent, so chunking here cannot cut anything),
+    scatter to a frame grid exactly as `_screen_grad` would, difference
+    ONCE, and let every shading chunk gather its own pixels. Bitwise the
+    same arithmetic as a whole-material batch: float32 grid, the same
+    forward differences, the same validity, the same gather.
+    """
+    from .nodeeval import VALUE, GraphEvaluator
+    graph = getattr(mat, 'graph', None)
+    nodes = (graph or {}).get('nodes', {})
+    bumps = [n for n in nodes.values()
+             if n.get('bl_idname') == 'ShaderNodeBump']
+    if not bumps:
+        return {}
+    H, W = job.height, job.width
+    fields = {}
+    for node in bumps:
+        img = np.zeros((H, W), np.float32)
+        valid = np.zeros((H, W), bool)
+        for s in range(0, int(tri_m.size), int(chunkn)):
+            e = min(s + int(chunkn), int(tri_m.size))
+            ctx = job.context(tri_m[s:e], bary_m[s:e], px_m[s:e],
+                              py_m[s:e], front_m[s:e]
+                              if front_m is not None else None,
+                              blin_m[s:e] if blin_m is not None else None,
+                              0, True)
+            ev = GraphEvaluator(graph, ctx, job.textures,
+                                getattr(mat, 'programs', None))
+            h = np.asarray(ev.input(node, 'Height', VALUE),
+                           np.float32).reshape(-1)
+            img[py_m[s:e], px_m[s:e]] = h
+            valid[py_m[s:e], px_m[s:e]] = True
+        gx = np.zeros_like(img)
+        gy = np.zeros_like(img)
+        gx[:, :-1] = np.where(valid[:, 1:] & valid[:, :-1],
+                              img[:, 1:] - img[:, :-1], 0.0)
+        gy[:-1, :] = np.where(valid[1:, :] & valid[:-1, :],
+                              img[1:, :] - img[:-1, :], 0.0)
+        fields[(int(mi), node.get('id'))] = (gx, gy)
+    return fields
+
+
+def _shade_all(job, tri_idx, bary, px, py, front, blin, st, progress=None):
     """Dispatch fragments to the right shading rate, per material.
 
     Gouraud and flat are shading *rates*, not reflectance models, so a material
@@ -1253,11 +1519,89 @@ def _shade_all(job, tri_idx, bary, px, py, front, blin, st):
         if sel.size == 0:
             continue
         if rate == 'PIXEL':
-            out[sel] = _shade_chunked(job, tri_idx[sel], bary[sel], px[sel],
-                                      py[sel], front[sel],
-                                      blin[sel] if blin is not None else None, st)
+            # ONE MATERIAL PER CHUNKED CALL. n_bump's neighbour validity
+            # is "shaded in the same batch", so a chunk boundary used to
+            # cut a material's screen gradients mid-frame: one row of the
+            # field's water shaded with flattened waves where fragment
+            # 79917 of a 480x360 frame happened to land -- the same row
+            # on every machine whose settings chunked there, and a row
+            # the GPU (whole-material pre-pass) correctly did NOT
+            # flatten. Shading per material makes the gradients a
+            # function of the picture, not of the chunk size: any
+            # material that fits MAX_CHUNK shades in one batch, and the
+            # deferred plan refuses Bump materials too covered to (they
+            # would still cut). The memory bound chunking exists for is
+            # untouched -- chunks are still capped, just never across a
+            # material's interior unless the material alone exceeds the
+            # cap.
+            sel_mats = mat_idx[sel]
+            done = 0
+            total = int(sel.size)
+            workers = resolve_threads(st)
+            for m in np.unique(sel_mats):
+                sm = sel[sel_mats == m]
+                nm = int(sm.size)
+                # a material too covered for ONE batch would have its
+                # n_bump gradients cut at every chunk boundary -- so its
+                # height chains render to whole-material gradient fields
+                # FIRST (chunked themselves: heights are per-pixel
+                # independent), and every shading chunk gathers from
+                # those. Materials that fit one batch never pay this.
+                mchunk = int(min(max(int(np.ceil(nm / max(workers * 4, 1))),
+                                     MIN_CHUNK), MAX_CHUNK))
+                mat = job.scene.materials[int(m)] \
+                    if int(m) < len(job.scene.materials) else None
+                src = getattr(job, 'bump_field_source', None)
+                if src is not None and mat is not None \
+                        and getattr(mat, 'graph', None) \
+                        and int(m) not in {k[0] for k in job.bump_fields}:
+                    # banded shading: the fields come from the G-buffer's
+                    # FULL coverage (context row included), so the band's
+                    # gradients equal the whole frame's
+                    ftri, fbary, fpx, fpy, ffront, fblin = src
+                    fm = job.scene.mesh.mat_index[ftri] \
+                        if job.scene.mesh.mat_index is not None \
+                        else np.zeros(ftri.size, np.int32)
+                    fs = np.nonzero(fm == m)[0]
+                    if fs.size:
+                        fchunk = int(min(max(
+                            int(np.ceil(fs.size / max(workers * 4, 1))),
+                            MIN_CHUNK), MAX_CHUNK))
+                        job.bump_fields.update(_bump_height_fields(
+                            job, mat, int(m), ftri[fs], fbary[fs],
+                            fpx[fs], fpy[fs],
+                            ffront[fs] if ffront is not None else None,
+                            fblin[fs] if fblin is not None else None,
+                            fchunk))
+                elif mchunk < nm and mat is not None \
+                        and getattr(mat, 'graph', None):
+                    job.bump_fields.update(_bump_height_fields(
+                        job, mat, int(m), tri_idx[sm], bary[sm], px[sm],
+                        py[sm], front[sm] if front is not None else None,
+                        blin[sm] if blin is not None else None, mchunk))
+                if progress is not None:
+                    def _prog(v, msg, _d=done, _nm=nm):
+                        # remap this material's local shade fraction into
+                        # the frame's global one, keeping the bar (and the
+                        # preview's abort ticks) monotonic
+                        local = min(max((v - 0.35) / 0.30, 0.0), 1.0)
+                        progress(0.35 + 0.30 * ((_d + local * _nm)
+                                                / max(total, 1)), msg)
+                else:
+                    _prog = None
+                out[sm] = _shade_chunked(job, tri_idx[sm], bary[sm],
+                                         px[sm], py[sm], front[sm],
+                                         blin[sm] if blin is not None
+                                         else None,
+                                         st, progress=_prog)
+                done += nm
         else:
-            out[sel] = _shade_interpolated(job, tri_idx[sel], bary[sel], rate, st)
+            out[sel] = _shade_interpolated(
+                job, tri_idx[sel], bary[sel], rate, st,
+                px[sel] if px is not None else None,
+                py[sel] if py is not None else None,
+                front[sel] if front is not None else None,
+                blin[sel] if blin is not None else None)
     return out
 
 
@@ -1276,8 +1620,14 @@ def resolve_threads(settings):
     return max(1, min(int(n), 64))
 
 
-def _shade_chunked(job, tri_idx, bary, px, py, front, blin, st):
+def _shade_chunked(job, tri_idx, bary, px, py, front, blin, st, progress=None):
     """Shade in bounded chunks, across threads when there are cores to use.
+
+    `progress` ticks between chunks. Beyond a better progress bar, it is
+    what makes a viewport render ABORTABLE mid-shade: the preview's tick
+    raises when a newer view supersedes this one, and before this the
+    abort could only land between whole stages -- which for shade meant
+    after the expensive part had already run to completion.
 
     Deferred shading makes every fragment independent, so this is a clean split.
     The workers only touch bpy-free code and read-only shared state, and NumPy
@@ -1310,6 +1660,8 @@ def _shade_chunked(job, tri_idx, bary, px, py, front, blin, st):
 
     if workers == 1 or len(starts) == 1:
         for s in starts:
+            if progress and s:
+                progress(0.35 + 0.30 * (s / n), 'Shading')
             e = min(s + chunk, n)
             out[s:e] = job.shade(tri_idx[s:e], bary[s:e], slice_of(px, s, e),
                                  slice_of(py, s, e), slice_of(front, s, e),
@@ -1323,6 +1675,8 @@ def _shade_chunked(job, tri_idx, bary, px, py, front, blin, st):
     job.prewarm()
     seed = int(getattr(st, 'seed', 0) or 0)
     for i, s in enumerate(starts):
+        if progress and s:
+            progress(0.35 + 0.30 * (s / n), 'Shading')
         e = min(s + chunk, n)
         out[s:e] = job.shade(tri_idx[s:e], bary[s:e], slice_of(px, s, e),
                              slice_of(py, s, e), slice_of(front, s, e),
@@ -1331,8 +1685,26 @@ def _shade_chunked(job, tri_idx, bary, px, py, front, blin, st):
     return out
 
 
-def _shade_interpolated(job, tri_idx, bary, rate, st=None):
+def _shade_interpolated(job, tri_idx, bary, rate, st=None,
+                        px=None, py=None, front=None, blin=None):
     """Shade at vertex or face rate, then interpolate to the fragments.
+
+    THE LIGHTING is what these rates interpolate -- not the texture.
+    Hardware that shaded per vertex still sampled the texture at every
+    pixel and multiplied: `texel x vertex colour`, the MODULATE
+    combiner every fixed-function pipeline of the era implemented, and
+    the reason a Gouraud-shaded PlayStation model shows soft banded
+    light over a SHARP texture. Halcyon evaluated the whole material
+    at the vertices instead, texture included, so a textured model
+    came out smeared across its own triangles -- the field photographed
+    exactly that on a 1209-triangle character whose preset selects
+    Gouraud. So: lighting over a WHITE surface at the vertex or face
+    rate, interpolated; albedo and alpha at the PIXEL rate; multiplied.
+
+    An untextured material is unaffected -- its albedo is one colour,
+    so multiplying it back in reproduces the old result exactly. The
+    banding and the missed highlights, which are the point of a
+    shading RATE, are untouched: they live in the lighting term.
 
     The vertex and face passes went through job.shade() directly, which meant
     they never used the thread pool -- so every preset with a Gouraud or flat
@@ -1341,15 +1713,35 @@ def _shade_interpolated(job, tri_idx, bary, rate, st=None):
     """
     mesh = job.scene.mesh
     uniq = np.unique(tri_idx)
-    col, lookup = shade_vertex_rate(job, uniq, rate, st)
+    saved = getattr(job, 'rate_mode', None)
+    try:
+        job.rate_mode = 'LIGHT'
+        col, lookup = shade_vertex_rate(job, uniq, rate, st)
+    finally:
+        job.rate_mode = saved
     if rate == 'FACE':
         order = np.searchsorted(uniq, tri_idx)
-        return col[order]
-    tris = mesh.tris[tri_idx]
-    c0 = col[lookup[tris[:, 0]]]
-    c1 = col[lookup[tris[:, 1]]]
-    c2 = col[lookup[tris[:, 2]]]
-    return (c0 * bary[:, 0:1] + c1 * bary[:, 1:2] + c2 * bary[:, 2:3]).astype(np.float32)
+        light = col[order]
+    else:
+        tris = mesh.tris[tri_idx]
+        c0 = col[lookup[tris[:, 0]]]
+        c1 = col[lookup[tris[:, 1]]]
+        c2 = col[lookup[tris[:, 2]]]
+        light = (c0 * bary[:, 0:1] + c1 * bary[:, 1:2]
+                 + c2 * bary[:, 2:3]).astype(np.float32)
+    try:
+        job.rate_mode = 'ALBEDO'
+        alb = _shade_chunked(job, tri_idx, bary, px, py, front, blin, st) \
+            if st is not None else \
+            job.shade(tri_idx, bary, px, py, front, blin)
+    finally:
+        job.rate_mode = saved
+    out = np.empty_like(light)
+    out[:, :3] = light[:, :3] * alb[:, :3]
+    # alpha comes from the PIXEL pass: a cut-out texture's edge is the
+    # one thing that must never be interpolated between vertices
+    out[:, 3] = alb[:, 3]
+    return out
 
 
 def polygon_depths(mesh, view, eye, mode='CENTROID'):
@@ -1378,6 +1770,16 @@ def polygon_depths(mesh, view, eye, mode='CENTROID'):
     return depth.astype(np.float32)
 
 
+#: how the last frame classified its materials: which went to the
+#: A-buffer and WHY. A surface in the transparent pass is rasterised
+#: with cull NONE and no depth write, so its back faces and everything
+#: behind it stack as depth layers -- correct for glass, and a very
+#: convincing "the depth is broken" for a solid character whose
+#: materials were merely FLAGGED see-through. The printed line names
+#: the flag, so the field never has to guess which pass a surface is in.
+LAST_SPLIT = {}
+
+
 def _split_by_alpha(scene, mesh, st=None):
     """Triangle indices for the opaque and the transparent passes.
 
@@ -1385,16 +1787,130 @@ def _split_by_alpha(scene, mesh, st=None):
     belongs in the depth-buffered pass with everything else. Splitting it out
     and then never shading it is what made both modes render nothing.
     """
+    LAST_SPLIT.clear()
     if mesh.mat_index is None:
         return None, np.zeros(0, np.int32)
     if st is not None and st.transparency in ('NONE', 'STIPPLE'):
         return None, np.zeros(0, np.int32)
     see_through = np.zeros(max(len(scene.materials), 1), bool)
+    reasons = {}
     for i, m in enumerate(scene.materials):
-        see_through[i] = (m.opacity < 0.999) or getattr(m, 'has_alpha', False)
+        why = None
+        if m.opacity < 0.999:
+            why = f'Opacity {float(m.opacity):.3f}'
+        elif getattr(m, 'has_alpha', False):
+            # export.py's _alpha_reason names the specific evidence --
+            # a transparent node, or which Alpha socket. A vague reason
+            # is what let a whole mis-flagged character hide for three
+            # rounds behind "flagged on export".
+            why = str(getattr(m, 'alpha_why', None)
+                      or 'flagged see-through on export')
+        see_through[i] = why is not None
+        if why is not None:
+            reasons[str(getattr(m, 'name', None) or f'material {i}')] = why
     mi = np.clip(mesh.mat_index, 0, see_through.size - 1)
     t = see_through[mi]
+    LAST_SPLIT.update(reasons=reasons, materials=int(see_through.size),
+                      see_through=int(see_through.sum()),
+                      tris=int(mesh.mat_index.size),
+                      tris_see_through=int(t.sum()))
     return np.nonzero(~t)[0].astype(np.int32), np.nonzero(t)[0].astype(np.int32)
+
+
+def depth_report(proj, gbuf, depth_bits, depth_sort='ZBUFFER'):
+    """What this frame's z-buffer can actually resolve, in world units.
+
+    "The depth is wrong" is a picture; this is the number behind it. The
+    near and far planes come back out of the projection matrix, the
+    frame's own covered depths say where the subject sits, and the
+    N-bit grid step converts to the smallest world separation two
+    surfaces can have and still be told apart THERE. Depth in a
+    perspective frame is hyperbolic: resolution falls with the SQUARE
+    of distance, so a near plane set very close spends the whole buffer
+    on empty air in front of the subject -- the classic cause of
+    surfaces tearing through each other at a normal bit depth. Returns
+    a one-line string, or None if the frame has no covered pixels.
+    """
+    cov = gbuf.tri >= 0
+    if proj is None or not cov.any():
+        return None
+    if str(depth_sort).upper() == 'PAINTERS':
+        # Painter's does not store ndc depth at all: every fragment of a
+        # polygon carries that polygon's single VIEW distance, so the
+        # buffer holds distances, not ndc values. Reading them as ndc is
+        # what made this line announce that the field's frame sat at its
+        # projection's depth asymptote -- it was reporting a scene 4.5
+        # to 5.5 units from the camera.
+        d = gbuf.depth[cov].astype(np.float64)
+        d = d[np.isfinite(d)]
+        rng = f'{d.min():.4g}..{d.max():.4g}' if d.size else 'empty'
+        return ('[Halcyon] depth: Painter\'s algorithm -- ONE depth per '
+                f'polygon (view distance {rng}), no per-pixel z-buffer, '
+                f'so the {int(depth_bits)}-bit setting does not apply. '
+                'Polygons that interpenetrate meet along an edge '
+                'instead of their true intersection, and a large '
+                'polygon can be hidden by a small nearer one: that is '
+                'the algorithm, not a fault. Depth Method -> Z-Buffer '
+                'resolves per pixel')
+    p = np.asarray(proj, np.float64)
+    a, b = float(p[2, 2]), float(p[2, 3])
+    denom_n, denom_f = a - 1.0, a + 1.0
+    if abs(denom_n) < 1e-12 or abs(denom_f) < 1e-12:
+        return None                     # orthographic: depth is linear
+    near, far = b / denom_n, b / denom_f
+    if not (0.0 < near < far):
+        return None
+    z = gbuf.zndc[cov].astype(np.float64)
+    z = z[np.isfinite(z)]
+    if z.size == 0:
+        return None
+    zlo, zhi = float(z.min()), float(z.max())
+    span = far - near
+    head = (f'[Halcyon] depth: {int(depth_bits)}-bit z-buffer, clip '
+            f'{near:.4g}..{far:.4g}, ndc z {zlo:.6f}..{zhi:.6f}')
+    # A covered pixel at or past ndc z = 1 sits AT or BEYOND the far
+    # plane. Far clipping is off by design -- period renderers drew it
+    # -- but no distance can be recovered from such a value, and the
+    # first version of this line clamped the vanishing denominator and
+    # reported the subject at 2e+14 world units away. An instrument
+    # that lies is worse than no instrument: it must say "I cannot
+    # measure this, and here is why".
+    # ndc z reaches 1 exactly AT the far plane and approaches
+    # (f+n)/(f-n) as distance runs to infinity, so a value past 1 is
+    # past the far clip (drawn anyway -- period renderers did) and a
+    # value at the asymptote carries no recoverable distance at all:
+    # in float32 that is what an enormous scene scale collapses to.
+    denom = (far + near) - z * span
+    good = denom > 1e-9
+    past = int((z > 1.0).sum())
+    if not good.any():
+        return (head + '; every covered pixel sits at this '
+                'projection\'s depth asymptote, where NO distance can '
+                'be recovered -- the geometry is effectively infinitely '
+                'far for this clip range, so the far clip needs to come '
+                'in (or the scene scale down) before depth means '
+                'anything')
+    dist = 2.0 * far * near / denom[good]
+    d_near, d_med = float(dist.min()), float(np.median(dist))
+    steps = float((1 << int(max(2, min(int(depth_bits), 32)))) - 1)
+    step_ndc = 2.0 / steps
+
+    def res_at(d):
+        # d(ndc z)/d(distance) = 2*f*n / ((f-n) * d^2)
+        return step_ndc * span * d * d / (2.0 * far * near)
+
+    tail = ''
+    if past:
+        tail += (f'; {100.0 * past / z.size:.0f}% of covered pixels are '
+                 'PAST the far clip plane (drawn anyway, but their '
+                 'depth is outside the range the buffer was set up for)')
+    if not good.all():
+        tail += (f'; {100.0 * float((~good).sum()) / good.size:.0f}% sit '
+                 'at the depth asymptote and cannot be measured at all')
+    return (head + f'; the subject sits at {d_near:.3g}..{d_med:.3g}, '
+            f'where the buffer resolves {res_at(d_near):.3g}..'
+            f'{res_at(d_med):.3g} world units -- surfaces closer '
+            'together than that cannot be told apart' + tail)
 
 
 def _spot_cones(img, scene, st, gbuf, vp, eye, w, h):
@@ -1517,7 +2033,141 @@ def _background_image(scene, st, w, h, vp, eye, uncovered=None,
     return img
 
 
-def _composite_abuffer(job, frags, gbuf, img, st):
+def _bump_materials_of(job, tri):
+    """{mi: material} for fragment materials carrying a Bump node."""
+    mesh = job.scene.mesh
+    if mesh.mat_index is None or tri.size == 0:
+        return {}
+    out = {}
+    for mi in np.unique(mesh.mat_index[tri]):
+        mi = int(mi)
+        mat = job.scene.materials[mi] \
+            if mi < len(job.scene.materials) else None
+        graph = getattr(mat, 'graph', None) if mat is not None else None
+        nodes = (graph or {}).get('nodes', {})
+        if any(n.get('bl_idname') == 'ShaderNodeBump'
+               for n in nodes.values()):
+            out[mi] = mat
+    return out
+
+
+def _shade_fragments_cpu(job, tri, bary, px, py, front, rank, st):
+    """The A-buffer fragments' CPU shading, scheduling-invariant.
+
+    A Bump node's screen gradients must be a function of the SURFACE,
+    not of the batch layout -- and for transparent fragments the surface
+    is the LAYER: one fragment per pixel per rank. Shading all ranks in
+    one mixed array made `_screen_grad`'s scatter collide (front and
+    back faces at the same pixel, last write winning by sort order) and
+    let every chunk boundary cut the waves: 539 of 1914 fragments moved
+    with the chunk size in the repro scene, by up to 2.98. So when any
+    fragment's material carries a Bump node, the fragments shade RANK
+    BY RANK with whole-material gradient fields built from each rank's
+    own fragments -- `_bump_height_fields`, the same pre-pass the opaque
+    frame runs, applied per layer. Frames without a Bump material take
+    the old single call: nothing else reads screen gradients here, and
+    per-fragment shading is proven chunking-invariant.
+    """
+    bump_mats = _bump_materials_of(job, tri)
+    if not bump_mats:
+        return _shade_chunked(job, tri, bary, px, py, front, None, st)
+    from .nodeeval import VALUE, GraphEvaluator
+    mesh = job.scene.mesh
+    mat_f = mesh.mat_index[tri] if mesh.mat_index is not None \
+        else np.zeros(tri.size, np.int32)
+
+    # heights are per-fragment pure, so each material's chain evaluates
+    # ONCE over ALL its fragments (chunked for memory); each rank then
+    # scatters ITS OWN subset and differences on the frame grid -- the
+    # same field definition, at a fraction of the evaluator cost the
+    # first per-rank version paid (the field's 33-second frame grew to
+    # 43 on exactly that; the waves' noise chain was re-running once
+    # per depth layer)
+    H, W = job.height, job.width
+    heights = {}
+    mat_idx_of = {}
+    for mi, mat in bump_mats.items():
+        idx = np.nonzero(mat_f == mi)[0]
+        if idx.size == 0:
+            continue
+        mat_idx_of[mi] = idx
+        graph = getattr(mat, 'graph', None)
+        nodes = (graph or {}).get('nodes', {})
+        for node in nodes.values():
+            if node.get('bl_idname') != 'ShaderNodeBump':
+                continue
+            hv = np.empty(idx.size, np.float32)
+            for s in range(0, int(idx.size), int(MAX_CHUNK)):
+                e = min(s + int(MAX_CHUNK), int(idx.size))
+                sub = idx[s:e]
+                ctx = job.context(tri[sub], bary[sub], px[sub], py[sub],
+                                  front[sub] if front is not None
+                                  else None, None, 0, True)
+                ev = GraphEvaluator(graph, ctx, job.textures,
+                                    getattr(mat, 'programs', None))
+                hv[s:e] = np.asarray(ev.input(node, 'Height', VALUE),
+                                     np.float32).reshape(-1)
+            heights[(mi, node.get('id'))] = hv
+
+    col = np.zeros((tri.size, 4), np.float32)
+    stash = dict(getattr(job, 'bump_fields', {}) or {})
+    try:
+        top = int(rank.max()) if rank.size else -1
+        # one stable sort finds every layer; sixteen `rank == r` scans
+        # over millions of fragments used to. Stable argsort keeps equal
+        # ranks in original index order, so each slice is bit-identical
+        # to nonzero's ascending indices.
+        rorder = np.argsort(rank, kind='stable')
+        rbounds = np.searchsorted(rank[rorder], np.arange(top + 2))
+        for r in range(top + 1):
+            sel = rorder[rbounds[r]:rbounds[r + 1]]
+            if sel.size == 0:
+                continue
+            fields = dict(stash)
+            for (mi, node_id), hv in heights.items():
+                idx = mat_idx_of[mi]
+                m = rank[idx] == r
+                if not m.any():
+                    continue
+                img = np.zeros((H, W), np.float32)
+                valid = np.zeros((H, W), bool)
+                img[py[idx[m]], px[idx[m]]] = hv[m]
+                valid[py[idx[m]], px[idx[m]]] = True
+                gx = np.zeros_like(img)
+                gy = np.zeros_like(img)
+                gx[:, :-1] = np.where(valid[:, 1:] & valid[:, :-1],
+                                      img[:, 1:] - img[:, :-1], 0.0)
+                gy[:-1, :] = np.where(valid[1:, :] & valid[:-1, :],
+                                      img[1:, :] - img[:-1, :], 0.0)
+                fields[(mi, node_id)] = (gx, gy)
+            job.bump_fields = fields
+            col[sel] = _shade_chunked(job, tri[sel], bary[sel], px[sel],
+                                      py[sel],
+                                      front[sel] if front is not None
+                                      else None, None, st)
+    finally:
+        job.bump_fields = stash
+    return col
+
+
+#: how the last GPU-gated A-buffer frame routed its depth layers --
+#: per-layer fragment counts, the threshold, and who shaded what. The
+#: printed routing line reads from it; the tests assert on it so a
+#: "hybrid" run can never silently be a pure one.
+LAST_ROUTING = {}
+
+
+def _fmt_frags(n):
+    """1234567 -> '1.2M': the routing line is read off a console."""
+    n = int(n)
+    if n >= 1000000:
+        return f'{n / 1e6:.1f}M'
+    if n >= 1000:
+        return f'{n / 1e3:.1f}k'
+    return str(n)
+
+
+def _composite_abuffer(job, frags, gbuf, img, st, band=None):
     """True A-buffer: shade every fragment, sort per pixel, composite.
 
     Two things used to make this the slowest stage in the renderer by a wide
@@ -1537,7 +2187,10 @@ def _composite_abuffer(job, frags, gbuf, img, st):
     if px.size == 0:
         return img
     opaque_z = gbuf.depth[py, px]
-    keep = depth <= opaque_z
+    # the SAME tolerant limit the collection used (raster.abuf_depth_limit):
+    # a coplanar contact must not flip on which rasteriser rounded the
+    # opaque depth's last ULP
+    keep = depth <= raster.abuf_depth_limit(opaque_z)
     if not np.any(keep):
         return img
     px, py, tri, depth, bary, front = (a[keep] for a in
@@ -1573,13 +2226,144 @@ def _composite_abuffer(job, frags, gbuf, img, st):
     limit = int(getattr(st, 'max_transparent_layers', 0) or 0)
     if limit > 0 and rank.size and int(rank.max()) >= limit:
         within = rank < limit
+        # a silent truncation reads as a rendering bug: the dropped
+        # layers simply are not drawn, so wherever nothing opaque sits
+        # behind them the BACKGROUND shows through -- black holes in
+        # the middle of solid-looking geometry. Say it, with the number
+        # and the setting that fixes it.
+        cut = int((~within).sum())
+        hit = int(np.unique(py[~within].astype(np.int64) * gbuf.width
+                            + px[~within]).size)
+        print(f'[Halcyon] transparency: the {limit}-layer cap dropped '
+              f'{cut} fragments at {hit} pixels -- those layers are '
+              'not drawn, and where nothing opaque sits behind them '
+              'the background shows through. Raise Max Transparent '
+              'Layers to draw them')
         px, py, tri, bary, front, rank = (a[within] for a in
                                           (px, py, tri, bary, front, rank))
         if px.size == 0:
             return img
 
-    with ST.track('transparency shading'):
-        col = _shade_chunked(job, tri, bary, px, py, front, None, st)
+    # Deferred GPU shading of the layers themselves: each depth layer's
+    # fragments become an ids texture and every transparent material's
+    # LAYER pass (real alpha out) draws it, exactly the opaque frame's
+    # mechanism. Same gate as the opaque pass -- opt-in, whole-frame only
+    # -- and any refusal keeps this shading on the CPU, with the reason
+    # printed. On the field frame this stage was 25.7 s of 33.7.
+    #
+    # RANK ROUTING: the driver pays full-frame FIXED costs per layer --
+    # a draw and a readback cover every pixel whether the layer holds
+    # three fragments or a million -- while the CPU path pays per
+    # FRAGMENT. The 1.25.59 field split proved it: skipping absent
+    # materials' passes moved nothing, because the cost was never the
+    # material count, it was sixteen full-frame round trips. So each
+    # layer goes to whichever path is cheaper for IT: layers below
+    # `layer_gpu_min_frac` of the frame's pixels shade on the proven
+    # per-rank CPU path. Routing is by WHOLE layer -- a rank is never
+    # split -- so both paths build their per-rank fields from complete
+    # layers and each fragment's colour is exactly what the pure run
+    # would have given it. The routing prints with per-layer counts:
+    # the field names its own distribution.
+    col = None
+    LAST_ROUTING.clear()
+    if str(getattr(st, 'render_device', 'CPU')).upper() == 'GPU' and \
+            getattr(st, 'gpu_shading', False) and band is None:
+        from ..gpu import shade as _gpu_shade
+        counts = np.bincount(rank, minlength=int(rank.max()) + 1)
+        frac = float(getattr(st, 'layer_gpu_min_frac', 0.0) or 0.0)
+        thresh = max(1, int(round(frac * gbuf.width * gbuf.height))) \
+            if frac > 0.0 else 1
+        dense = counts >= thresh
+        gsel = dense[rank]
+        n_gpu_r = int((dense & (counts > 0)).sum())
+        n_cpu_r = int((~dense & (counts > 0)).sum())
+        LAST_ROUTING.update(
+            counts=[int(c) for c in counts], thresh=int(thresh),
+            gpu_ranks=n_gpu_r, cpu_ranks=n_cpu_r,
+            gpu_frags=int(gsel.sum()),
+            cpu_frags=int(rank.size - int(gsel.sum())))
+        if not gsel.any():
+            # every layer sits below the break-even: nothing for the
+            # driver. That is a ROUTE, not a refusal -- say so calmly,
+            # and only when a driver was actually there to be skipped
+            from ..gpu import device as _gdev
+            ok, _dwhy = _gdev.probe()
+            if ok:
+                print('[Halcyon GPU] layer routing: all '
+                      f'{n_cpu_r} layers below the GPU break-even '
+                      f'({thresh} fragments); shaded on the CPU '
+                      '(routed, not refused)')
+        else:
+            with ST.track('transparency shading (GPU)'):
+                try:
+                    got, why = _gpu_shade.shade_fragments_frame(
+                        job, gbuf, tri[gsel], bary[gsel], px[gsel],
+                        py[gsel], rank[gsel])
+                except Exception as exc:                        # noqa: BLE001
+                    got, why = None, str(exc)
+            if got is None:
+                # the partition was recorded above but never ACTED on:
+                # say so in the record, or a "hybrid" that quietly fell
+                # back whole would look like a mix to the tests
+                LAST_ROUTING['refused'] = str(why)
+                print('[Halcyon GPU] transparent layers on the CPU: '
+                      f'{why}')
+            else:
+                col = np.zeros((rank.size, 4), np.float32)
+                col[gsel] = got
+                cpu_s = 0.0
+                if n_cpu_r:
+                    import time as _time
+                    csel = ~gsel
+                    t0 = _time.perf_counter()
+                    with ST.track('transparency shading (routed CPU)'):
+                        col[csel] = _shade_fragments_cpu(
+                            job, tri[csel], bary[csel], px[csel],
+                            py[csel], front[csel], rank[csel], st)
+                    cpu_s = _time.perf_counter() - t0
+                LAST_ROUTING['cpu_s'] = cpu_s
+                lt = dict(getattr(_gpu_shade, 'LAST_LAYER_TIMINGS', {})
+                          or {})
+                if lt:
+                    # the split that names the next perf target: where
+                    # the layer stage's seconds actually went. Buckets
+                    # are disjoint and `other` is the printed remainder
+                    # -- a cost the line refuses to hide.
+                    wait = max(lt.get('wall_ms', 0.0)
+                               - lt.get('exec_ms', 0.0), 0.0)
+                    scz = 100.0 * lt.get('scissor_px', 0.0) \
+                        / max(lt.get('frame_px', 0.0), 1.0)
+                    print('[Halcyon GPU] transparent split: '
+                          f"plan {lt.get('plan_ms', 0.0) / 1e3:.1f}s, "
+                          'compile '
+                          f"{lt.get('compile_ms', 0.0) / 1e3:.1f}s, "
+                          'uploads '
+                          f"{lt.get('upload_ms', 0.0) / 1e3:.1f}s "
+                          f"({lt.get('upload_mb', 0.0):.0f} MB), "
+                          f"draws {lt.get('draw_ms', 0.0) / 1e3:.1f}s, "
+                          'reads+sync '
+                          f"{lt.get('read_ms', 0.0) / 1e3:.1f}s, "
+                          f"sweeps {lt.get('sweep_ms', 0.0) / 1e3:.1f}s "
+                          '(of which CPU ray build '
+                          f"{lt.get('ray_build_ms', 0.0) / 1e3:.1f}s), "
+                          f"other {lt.get('other_ms', 0.0) / 1e3:.1f}s "
+                          f"of {lt.get('total_ms', 0.0) / 1e3:.1f}s; "
+                          f'scissor {scz:.0f}% of full frames; '
+                          f"{lt.get('ranks', 0)} of "
+                          f'{n_gpu_r + n_cpu_r} layers on the GPU; '
+                          f"marshal {lt.get('crossings', 0)} crossings, "
+                          f'{wait / 1e3:.1f}s waiting')
+                print('[Halcyon GPU] layer routing: GPU '
+                      f"{n_gpu_r} layers "
+                      f"({_fmt_frags(LAST_ROUTING['gpu_frags'])}), CPU "
+                      f"{n_cpu_r} layers "
+                      f"({_fmt_frags(LAST_ROUTING['cpu_frags'])}, "
+                      f'{cpu_s:.1f}s); per-layer frags '
+                      + ' '.join(_fmt_frags(c) for c in counts))
+    if col is None:
+        with ST.track('transparency shading'):
+            col = _shade_fragments_cpu(job, tri, bary, px, py, front,
+                                       rank, st)
     if st.alpha_bits < 8:
         levels = float(2 ** max(st.alpha_bits, 1) - 1)
         col[:, 3] = np.round(col[:, 3] * levels) / levels

@@ -71,6 +71,67 @@ def lens(image, st):
         'resolution': (float(w), float(h))})
 
 
+def ntsc(image, st, frame=0):
+    """Composite chroma bleed as the CPU does it: three blur draws, one mix.
+
+    The CPU's triple box re-pads the frame edge before every pass, so the
+    only way to match it exactly is to *run* three passes -- an intermediate
+    YIQ target ping-pongs through NTSC_BLUR and the final draw reassembles.
+    Dot crawl is frame-dependent and stays on the CPU; a frame using it falls
+    back whole, because half a composite artefact is worse than either half.
+    """
+    if not getattr(st, 'composite', False):
+        return None
+    if float(getattr(st, 'composite_dot_crawl', 0.0)) > 0.0:
+        return None
+    if 'NTSC' not in ENABLED:
+        return None
+    ok, why = available(st)
+    if not ok:
+        _warn(f'NTSC on the CPU: {why}')
+        return None
+    blur_sh, err = device.compile_stage('NTSC_BLUR', STAGES['NTSC_BLUR'])
+    final_sh, err2 = device.compile_stage('NTSC', STAGES['NTSC'])
+    if blur_sh is None or final_sh is None:
+        _warn(f'NTSC on the CPU: {err or err2}')
+        return None
+    try:
+        h, w = image.shape[:2]
+        bleed = float(st.composite_bleed)
+        ri = max(int(round(w / 320.0 * 6.0 * bleed)), 1)
+        rq = max(int(round(w / 320.0 * 12.0 * bleed)), 1)
+        if max(ri, rq) > 96:
+            _warn('NTSC on the CPU: the chroma radius exceeds the shader '
+                  'loop bound at this resolution')
+            return None
+        src_tex = device.upload(image)
+        current = src_tex
+        for step in range(3):
+            target = device.Target(w, h)
+            try:
+                out = device.draw_fullscreen(
+                    blur_sh,
+                    {'ri': float(ri), 'rq': float(rq), 'ry': 2.0,
+                     'to_yiq': 1.0 if step == 0 else 0.0,
+                     'resolution': (float(w), float(h))},
+                    {'source': current}, target)
+            finally:
+                target.free()
+            current = device.upload(out)
+        target = device.Target(w, h)
+        try:
+            out = device.draw_fullscreen(
+                final_sh,
+                {'ringing': float(st.composite_ringing)},
+                {'source': src_tex, 'blurred': current}, target)
+        finally:
+            target.free()
+        return out[:, :, :3]
+    except Exception as exc:                                    # noqa: BLE001
+        _warn(f'NTSC fell back to the CPU: {type(exc).__name__}: {exc}')
+        return None
+
+
 def crt(image, st):
     if not st.crt:
         return None

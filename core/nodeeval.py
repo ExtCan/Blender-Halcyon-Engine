@@ -1237,17 +1237,44 @@ def n_bump(ev, node):
     c = ev.ctx
     strength = ev.input(node, 'Strength', VALUE)
     dist = ev.input(node, 'Distance', VALUE)
-    height = ev.input(node, 'Height', VALUE)
     nrm = ev.input(node, 'Normal', VECTOR) if ev.has_link(node, 'Normal') else c.N
     if c.px is None or c.width <= 0:
         return {'Normal': nrm}
-    dhdx, dhdy = _screen_grad(c, height)
+    field = _bump_field_for(c, node)
+    if field is not None:
+        # a whole-material gradient pre-pass exists (built when this
+        # material is too covered for one shading batch): gather from it,
+        # so a chunk boundary can never cut the waves. The height chain
+        # is not re-evaluated here -- the field already ran it.
+        gx, gy = field
+        dhdx, dhdy = gx[c.py, c.px], gy[c.py, c.px]
+    else:
+        height = ev.input(node, 'Height', VALUE)
+        dhdx, dhdy = _screen_grad(c, height)
     t, b = M.orthonormal_basis(M.normalize(nrm))
     scale = (strength * dist)[:, None]
     invert = -1.0 if _prop(node, 'invert', False) else 1.0
     out = M.normalize(M.normalize(nrm) - invert * scale *
                       (t * dhdx[:, None] + b * dhdy[:, None]) * 20.0)
     return {'Normal': out.astype(np.float32)}
+
+
+def _bump_field_for(c, node):
+    """The whole-material gradient grids for this node, if pre-passed.
+
+    Fields are keyed by (material index, node id); the batch is
+    single-material wherever `c.px` is real, so the batch's first
+    triangle names the material.
+    """
+    fields = getattr(c, 'bump_fields', None)
+    tri = getattr(c, 'tri', None)
+    if not fields or tri is None or np.size(tri) == 0:
+        return None
+    mesh = getattr(getattr(c, 'scene', None), 'mesh', None)
+    mat_index = getattr(mesh, 'mat_index', None) if mesh is not None \
+        else None
+    mi = int(mat_index[tri[0]]) if mat_index is not None else 0
+    return fields.get((mi, node.get('id')))
 
 
 def _screen_grad(c, values):

@@ -22,7 +22,8 @@ import numpy as np
 
 from . import builtins as rt
 from .builtins import BUILTINS
-from .gtypes import BOOL, FLOAT, INT, VOID, GType, promote, swizzle_indices
+from .gtypes import (BOOL, FLOAT, INT, UINT, VOID, GType, promote,
+                     swizzle_indices)
 from .lexer import ShaderError
 
 MAX_LOOP = 4096
@@ -130,6 +131,14 @@ class Interpreter:
     def run(self, uniforms, inputs, n):
         n = int(n)
         root = Scope()
+        # gl_FragCoord is a builtin, in scope without a declaration -- as it
+        # is in GLSL. Bound first so a declared `in vec4 gl_FragCoord;`
+        # (redundant but accepted) takes the same value over it
+        fc_t = GType('float', 4)
+        fc = inputs.get('fragcoord') if inputs else None
+        root.put('gl_FragCoord',
+                 self.adapt(fc if fc is not None
+                            else np.zeros((n, 4), np.float32), fc_t, n), fc_t)
         for name, t, init, _q in self.uniforms:
             v = uniforms.get(name)
             if v is None:
@@ -330,12 +339,17 @@ class Interpreter:
                 return newv, t
             v, t = self.expr(operand, mask, scope, flags, n)
             if op == '-':
+                if t.base == 'uint':
+                    # unsigned negation wraps, exactly as on the GPU
+                    return (-np.asarray(v, np.int64)) & 0xffffffff, t
                 return -v, t
             if op == '+':
                 return v, t
             if op == '!':
                 return ~rt.to_bool(v), BOOL
             if op == '~':
+                if t.base == 'uint':
+                    return (~np.asarray(v, np.int64)) & 0xffffffff, t
                 return ~rt.to_int(v), INT
             raise ShaderError(f'unsupported unary {op!r}')
         if k == 'arr':
@@ -391,9 +405,22 @@ class Interpreter:
         elif op == '<<':
             r = rt.to_int(x) << rt.to_int(y)
         elif op == '>>':
-            r = rt.to_int(x) >> rt.to_int(y)
+            if t.base == 'uint':
+                # logical shift: the operand is already masked non-negative
+                r = np.asarray(x, np.int64) >> np.asarray(y, np.int64)
+            else:
+                r = rt.to_int(x) >> rt.to_int(y)
         else:
             raise ShaderError(f'unsupported operator {op!r}')
+        if t.base == 'uint':
+            # uint arithmetic wraps at 2^32, exactly as the driver's does.
+            # Values live in int64 so products are exact before the mask --
+            # and masking to 32 bits commutes with masking any narrower
+            # window, which is what makes hash functions portable at all
+            r = np.asarray(r)
+            if r.dtype.kind == 'f':
+                r = r.astype(np.int64)         # uint division truncates
+            r = r.astype(np.int64) & 0xffffffff
         return r, t
 
     def assign(self, node, mask, scope, flags, n):
@@ -616,7 +643,15 @@ class Interpreter:
             v = rt.sw(v, [0])
         if dst.base == 'float' and src.base != 'float':
             v = rt.to_float(v)
-        elif dst.base in ('int', 'uint') and src.base not in ('int', 'uint'):
+        elif dst.base == 'uint' and src.base != 'uint':
+            # uint(x) wraps: uint(-7) is 4294967289 on every driver
+            if src.base not in ('int', 'bool'):
+                v = rt.to_int(v)
+            v = np.asarray(v).astype(np.int64) & 0xffffffff
+        elif dst.base == 'int' and src.base == 'uint':
+            # int(u) keeps the bit pattern, as on the GPU
+            v = np.asarray(v).astype(np.int64).astype(np.uint32).astype(np.int32)
+        elif dst.base == 'int' and src.base not in ('int', 'uint'):
             v = rt.to_int(v)
         elif dst.base == 'bool' and src.base != 'bool':
             v = rt.to_bool(v)
@@ -633,18 +668,29 @@ class Interpreter:
             return [np.zeros((n, t.rows), np.float32) for _ in range(t.n)]
         if t.n == 1:
             return np.zeros(n, bool if t.base == 'bool' else
-                            np.int32 if t.base in ('int', 'uint') else np.float32)
+                            np.int64 if t.base == 'uint' else
+                            np.int32 if t.base == 'int' else np.float32)
         return np.zeros((n, t.n), np.float32)
 
     def number(self, node, n):
         raw = node[1]
-        is_int = not node[2] if len(node) > 2 else False
-        text = raw.rstrip('uUfFhH')
+        is_hex = raw[:2].lower() == '0x'
+        # hex digits include f: stripping float suffixes from a hex literal
+        # ate them ('0x7fffffff' -> '0x7'), which is how 0x7fffffffu once
+        # read as 7.0. Hex strips only integer suffixes.
+        text = raw.rstrip('uUlL') if is_hex else raw.rstrip('uUfFhHlL')
+        is_uint = raw.rstrip('lL')[-1:] in ('u', 'U')
         try:
-            if any(c in text for c in '.eE') or not node[2]:
+            if not is_hex and (any(c in text for c in '.eE') or not node[2]):
                 val = float(text)
                 return np.full(n, val, np.float32), FLOAT
             val = int(text, 0)
+            if is_uint:
+                return np.full(n, val & 0xffffffff, np.int64), UINT
+            if val > 2**31 - 1 or val < -2**31:
+                val &= 0xffffffff              # int literals wrap, as GLSL's
+                if val >= 2**31:
+                    val -= 2**32
             return np.full(n, val, np.int32), INT
         except ValueError:
             return np.zeros(n, np.float32), FLOAT

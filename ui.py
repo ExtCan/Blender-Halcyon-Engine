@@ -209,6 +209,14 @@ class HALCYON_PT_presets(HalcyonPanel, Panel):
     def draw(self, context):
         layout = self.layout
         hs = context.scene.halcyon
+        # the device switch, first thing in render properties: choosing GPU
+        # turns on every hardware-proven stage (raster, shading, post), and
+        # anything a frame uses that the GPU does not reproduce falls back
+        # per stage with the reason on the console
+        row = layout.row(align=True)
+        row.scale_y = 1.3
+        row.prop(hs, 'render_device', expand=True)
+        layout.separator()
         col = layout.column(align=True)
         col.prop(hs, 'preset', text="")
         op = col.operator('halcyon.apply_preset', icon='IMPORT')
@@ -1148,10 +1156,17 @@ class HALCYON_PT_debug(HalcyonPanel, Panel):
         box.label(text="Experimental", icon='ERROR')
         col = box.column()
         col.use_property_split = True
-        col.prop(hs, 'render_device')
+        # the device switch itself lives at the top of render properties
+        # now; this box keeps the per-stage toggles and the capability table
         if str(hs.render_device).upper() == 'GPU':
             from .gpu import capability as _cap
             from .gpu import device as _dev
+            gcol = box.column()
+            gcol.use_property_split = True
+            gcol.prop(hs, 'gpu_shading')
+            gcol.prop(hs, 'gpu_raster')
+            gcol.prop(hs, 'gpu_hold_context')
+            gcol.prop(hs, 'gpu_scissor')
             sub = box.column(align=True)
             sub.scale_y = 0.85
             sub.label(text=_dev.describe(), icon='INFO')

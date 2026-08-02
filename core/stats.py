@@ -47,6 +47,16 @@ class track:
         return False
 
 
+def top(n=3):
+    """The `n` most expensive stages so far: [(name, seconds), ...].
+
+    For the one-line frame summary that prints even when the full table
+    is off -- a 33-second render whose breakdown nobody saw is a mystery
+    that already had its answer collected."""
+    pairs = sorted(_STAGES.items(), key=lambda kv: -kv[1])
+    return [(k, v) for k, v in pairs[:max(int(n), 0)] if v > 0.0005]
+
+
 def report(total=None, printer=print):
     if not _ORDER:
         return

@@ -290,35 +290,86 @@ def export_material(mat, images, warnings):
         # Wireframe by its *node* never went through that branch, so its wire
         # width was stuck at the dataclass default with no way to change it
         m.wire_size = hs.wire_size
-    if mat.use_nodes and mat.node_tree:
+    if compat.uses_nodes(mat) and mat.node_tree:
         m.programs = {}
         m.graph = serialize_tree(mat.node_tree, images, m.programs, warnings)
-    m.has_alpha = _tree_has_alpha(mat, m)
+    m.alpha_why = _alpha_reason(mat, m)
+    m.has_alpha = m.alpha_why is not None
     return m
 
 
-def _tree_has_alpha(mat, m):
+#: nodes whose presence in a tree IS alpha, whatever the sockets say
+_ALPHA_NODES = {'ShaderNodeBsdfTransparent': 'a Transparent BSDF node',
+                'ShaderNodeBsdfGlass': 'a Glass BSDF node',
+                'ShaderNodeBsdfRefraction': 'a Refraction BSDF node',
+                'ShaderNodeHoldout': 'a Holdout node'}
+
+
+def _alpha_reason(mat, m):
+    """Why this material needs the see-through pass -- or None.
+
+    The rule that matters here: a blend MODE is a policy for handling
+    alpha, not evidence that any alpha exists. This function used to
+    return True for any `blend_method` other than OPAQUE, and the field
+    found what that costs. A Sonic model imported from a game format
+    arrived with all 25 of its materials carrying a non-opaque blend
+    mode -- as importers routinely set -- so every one of its 1209
+    triangles was classified see-through, the depth-buffered pass got
+    NOTHING, and a solid character was rendered as a stack of A-buffer
+    layers with culling off and no depth writes. Under Sorted Blend
+    that is polygon-centroid ordering, which shows exactly the classic
+    sorting errors: wedges of one surface punching through another.
+    It read as broken depth for three rounds.
+
+    So alpha must be USED, not merely permitted: an opacity below one,
+    a transparent/glass/refraction/holdout node, or an Alpha socket
+    that is linked or set below one. A material with none of those is
+    opaque whatever its blend mode says -- and blending it would have
+    blended with alpha 1.0 anyway, so nothing is lost by putting it
+    back where hidden-surface removal happens.
+
+    `blend_method` is deliberately not consulted. Halcyon's own alpha
+    lives on the master shader's sockets and is independent of EEVEE's
+    blend mode (the add-on's Glass template sets Opacity 0.12 with the
+    blend mode untouched), so reading the mode in either direction
+    would misclassify the engine's own presets.
+    """
     if m.opacity < 0.999:
-        return True
-    try:
-        if mat.blend_method not in ('OPAQUE', None):
-            return True
-    except Exception:                                           # noqa: BLE001
-        pass
+        return f'Opacity {float(m.opacity):.3f}'
     if not m.graph:
-        return False
+        return None
     for node in m.graph['nodes'].values():
-        if node['bl_idname'] in ('ShaderNodeBsdfTransparent', 'ShaderNodeBsdfGlass',
-                                 'ShaderNodeBsdfRefraction', 'ShaderNodeHoldout'):
-            return True
-        if node['bl_idname'] == 'ShaderNodeBsdfPrincipled':
+        idn = node['bl_idname']
+        if idn in _ALPHA_NODES:
+            return _ALPHA_NODES[idn] + ' in its tree'
+        if idn == 'ShaderNodeBsdfPrincipled':
             for s in node['inputs']:
-                if s['name'] == 'Alpha':
-                    if s['link'] is not None:
-                        return True
-                    if s['default'] is not None and float(s['default']) < 0.999:
-                        return True
-    return False
+                if s['name'] != 'Alpha':
+                    continue
+                if s['link'] is not None:
+                    return 'its Principled Alpha socket is linked'
+                if s['default'] is not None and float(s['default']) < 0.999:
+                    return f'Principled Alpha {float(s["default"]):.3f}'
+        if idn == 'HALCYON_ShaderNode':
+            # the master shader's own alpha lives on its sockets, and the
+            # add-on's templates put it there (Glass: Opacity 0.12) with
+            # use_override off -- so m.opacity never sees it. Without this
+            # check the engine's own glass presets exported as OPAQUE and
+            # skipped the transparent pass entirely. Edge Opacity below
+            # 1.0 is see-through at the silhouette even when Opacity is
+            # 1.0, so it counts the same way.
+            for s in node['inputs']:
+                if s['name'] not in ('Opacity', 'Edge Opacity'):
+                    continue
+                if s['link'] is not None:
+                    return f'its {s["name"]} socket is linked'
+                if s['default'] is not None and float(s['default']) < 0.999:
+                    return f'{s["name"]} {float(s["default"]):.3f}'
+    return None
+
+
+def _tree_has_alpha(mat, m):
+    return _alpha_reason(mat, m) is not None
 
 
 # -------------------------------------------------------------------- mesh
@@ -616,7 +667,7 @@ def export_scene(depsgraph, settings, warnings=None):
                         images[key] = ImageBuffer(name=key, pixels=px,
                                                   colorspace='Linear')
                 world.env_image = images.get(key)
-        if bw.use_nodes and bw.node_tree:
+        if compat.uses_nodes(bw) and bw.node_tree:
             world.graph = serialize_tree(bw.node_tree, images, {}, warnings)
     if bscene.render.use_freestyle:
         warnings.append("Freestyle is not supported; use the Wireframe shader instead")

@@ -126,6 +126,171 @@ def look_at_matrix(eye, target, up=(0, 0, 1)):
     return m
 
 
+def add_normal_mapped_ball(sc):
+    """Swap the demo ball's material for a normal-mapped master shader.
+
+    The graph is the seam this exists to exercise: an image texture through
+    a tangent-space Normal Map into the master node's Normal socket, with
+    the node's own Strength and the master's Bump Strength both off 1.0 so
+    neither lerp can hide. The image is Non-Color, as a normal map is.
+    """
+    def sk(nm, t, d, l=None):
+        return {'name': nm, 'type': t, 'default': d, 'link': l}
+
+    rng = np.random.default_rng(7)
+    nm = rng.random((10, 10, 4)).astype(np.float32)
+    nm[:, :, 2] = 0.75 + nm[:, :, 2] * 0.25    # decoded z stays >= 0.5
+    nm[:, :, 3] = 1.0
+    sc.images['nmap'] = ImageBuffer(name='nmap', pixels=nm,
+                                    colorspace='Non-Color')
+    ins = [
+        sk('Diffuse Color', 'RGBA', [0.85, 0.2, 0.15, 1.0], ['marble', 0]),
+        sk('Vertex Color', 'RGBA', [1, 1, 1, 1]),
+        sk('Vertex Color Mix', 'VALUE', 0.0),
+        sk('Diffuse Level', 'VALUE', 1.0),
+        sk('Specular Color', 'RGBA', [1, 1, 1, 1]),
+        sk('Specular Level', 'VALUE', 0.9),
+        sk('Glossiness', 'VALUE', 48.0),
+        sk('Roughness', 'VALUE', 0.3),
+        sk('Ambient', 'VALUE', 1.0),
+        sk('Self-Illumination', 'RGBA', [0, 0, 0, 1]),
+        sk('Opacity', 'VALUE', 1.0),
+        sk('IOR', 'VALUE', 1.45),
+        sk('Anisotropy', 'VALUE', 0.0),
+        sk('Anisotropic Rotation', 'VALUE', 0.0),
+        sk('Metalness', 'VALUE', 0.0),
+        sk('Soften', 'VALUE', 0.0),
+        sk('Reflection', 'VALUE', 0.0),
+        sk('Translucency', 'VALUE', 0.0),
+        sk('Toon Size', 'VALUE', 0.5),
+        sk('Toon Smooth', 'VALUE', 0.05),
+        sk('Bump Strength', 'VALUE', 0.65),
+        sk('Normal', 'VECTOR', [0, 0, 0], ['nmap', 0]),
+    ]
+    sc.materials[1] = Material(name='Bumpy', index=1, graph={
+        'output': 'out', 'nodes': {
+            # red marble carved in the ball's own generated coordinates --
+            # the integer-hash pattern library and the per-object bounds
+            # both prove themselves on the driver in this one material
+            'marble': {'id': 'marble', 'bl_idname': 'HALCYON_MarbleNode',
+                       'props': {'octaves': 5, 'axis': 'X'},
+                       'inputs': [sk('Vector', 'VECTOR', [0, 0, 0]),
+                                  sk('Scale', 'VALUE', 5.0),
+                                  sk('Turbulence', 'VALUE', 1.0),
+                                  sk('Veins', 'VALUE', 1.0),
+                                  sk('Sharpness', 'VALUE', 1.0),
+                                  sk('Color 1', 'RGBA',
+                                     [0.85, 0.2, 0.15, 1.0]),
+                                  sk('Color 2', 'RGBA',
+                                     [0.35, 0.05, 0.08, 1.0])],
+                       'outputs': [{'name': 'Color', 'type': 'RGBA'},
+                                   {'name': 'Fac', 'type': 'VALUE'}]},
+            'ntex': {'id': 'ntex', 'bl_idname': 'ShaderNodeTexImage',
+                     'props': {'image': 'nmap', 'interpolation': 'Closest'},
+                     'inputs': [sk('Vector', 'VECTOR', [0, 0, 0])],
+                     'outputs': [{'name': 'Color', 'type': 'RGBA'},
+                                 {'name': 'Alpha', 'type': 'VALUE'}]},
+            'nmap': {'id': 'nmap', 'bl_idname': 'ShaderNodeNormalMap',
+                     'props': {'space': 'TANGENT'},
+                     'inputs': [sk('Strength', 'VALUE', 0.8),
+                                sk('Color', 'RGBA', [0.5, 0.5, 1.0, 1.0],
+                                   ['ntex', 0])],
+                     'outputs': [{'name': 'Normal', 'type': 'VECTOR'}]},
+            'hal': {'id': 'hal', 'bl_idname': 'HALCYON_ShaderNode',
+                    'props': {'model': 'PHONG', 'toon_steps': 2},
+                    'inputs': ins,
+                    'outputs': [{'name': 'Surface', 'type': 'SHADER'}]},
+            'out': {'id': 'out', 'bl_idname': 'ShaderNodeOutputMaterial',
+                    'props': {},
+                    'inputs': [sk('Surface', 'SHADER', None, ['hal', 0]),
+                               sk('Displacement', 'VECTOR', [0, 0, 0])],
+                    'outputs': []}}})
+    return sc
+
+
+#: the coded floor's GLSL: bands quantised against the light, a helper
+#: function and a global, so the transform's whole surface is on the driver
+CODED_FLOOR = """\
+uniform vec3  slabA = vec3(0.5, 0.5, 0.56);
+uniform vec3  slabB = vec3(0.62, 0.6, 0.64);
+uniform float tiles = 5.0;
+
+in vec3 vPosition;
+
+out vec4 Color;
+
+float squarewave(float x) { return step(0.5, fract(x)); }
+
+void main() {
+    float cx = squarewave(vPosition.x / tiles * 4.0);
+    float cy = squarewave(vPosition.y / tiles * 4.0);
+    float checker = abs(cx - cy);
+    Color = vec4(slabA + (slabB - slabA) * checker, 1.0);
+}
+"""
+
+
+def add_coded_floor(sc):
+    """Swap the demo floor's material for a coded-shader master graph.
+
+    The tile pattern comes from the user-facing coded shader node -- its
+    GLSL inlined natively into the deferred pass, mangled, sockets baked --
+    so a Run Self Test proves that whole transform on the driver.
+    """
+    from ..shaders.compiler import compile_shader
+
+    def sk(nm, t, d, l=None):
+        return {'name': nm, 'type': t, 'default': d, 'link': l}
+
+    ins = [
+        sk('Diffuse Color', 'RGBA', [0.55, 0.55, 0.6, 1.0], ['code', 0]),
+        sk('Vertex Color', 'RGBA', [1, 1, 1, 1]),
+        sk('Vertex Color Mix', 'VALUE', 0.0),
+        sk('Diffuse Level', 'VALUE', 1.0),
+        sk('Specular Color', 'RGBA', [1, 1, 1, 1]),
+        sk('Specular Level', 'VALUE', 0.0),
+        sk('Glossiness', 'VALUE', 12.0),
+        sk('Roughness', 'VALUE', 0.5),
+        sk('Ambient', 'VALUE', 0.6),
+        sk('Self-Illumination', 'RGBA', [0, 0, 0, 1]),
+        sk('Opacity', 'VALUE', 1.0),
+        sk('IOR', 'VALUE', 1.45),
+        sk('Anisotropy', 'VALUE', 0.0),
+        sk('Anisotropic Rotation', 'VALUE', 0.0),
+        sk('Metalness', 'VALUE', 0.0),
+        sk('Soften', 'VALUE', 0.0),
+        sk('Reflection', 'VALUE', 0.0),
+        sk('Translucency', 'VALUE', 0.0),
+        sk('Toon Size', 'VALUE', 0.5),
+        sk('Toon Smooth', 'VALUE', 0.05),
+    ]
+    graph = {'output': 'out', 'nodes': {
+        'code': {'id': 'code', 'bl_idname': 'HALCYON_CodeNode',
+                 'props': {'source_text': CODED_FLOOR, 'language': 'GLSL'},
+                 'inputs': [
+                     {'name': 'Slab A', 'type': 'VECTOR', 'uniform': 'slabA',
+                      'default': [0.5, 0.5, 0.56], 'link': None},
+                     {'name': 'Slab B', 'type': 'VECTOR', 'uniform': 'slabB',
+                      'default': [0.62, 0.6, 0.64], 'link': None},
+                     {'name': 'Tiles', 'type': 'VALUE', 'uniform': 'tiles',
+                      'default': 5.0, 'link': None}],
+                 'outputs': [{'name': 'Color', 'key': 'Color',
+                              'type': 'RGBA'}]},
+        'hal': {'id': 'hal', 'bl_idname': 'HALCYON_ShaderNode',
+                'props': {'model': 'LAMBERT', 'toon_steps': 2},
+                'inputs': ins,
+                'outputs': [{'name': 'Surface', 'type': 'SHADER'}]},
+        'out': {'id': 'out', 'bl_idname': 'ShaderNodeOutputMaterial',
+                'props': {},
+                'inputs': [sk('Surface', 'SHADER', None, ['hal', 0]),
+                           sk('Displacement', 'VECTOR', [0, 0, 0])],
+                'outputs': []}}}
+    mat = Material(name='Coded', index=0, graph=graph)
+    mat.programs = {'code': compile_shader(CODED_FLOOR)}
+    sc.materials[0] = mat
+    return sc
+
+
 def demo_scene(settings=None, with_texture=True):
     """A cube, a sphere and a floor under two lights -- the classic test card."""
     st = settings or RenderSettings()

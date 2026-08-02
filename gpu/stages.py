@@ -167,11 +167,67 @@ void main()
 """
 
 # Composite chroma bleed: separable, so the horizontal blur is a fixed tap set.
+# The composite cable, structured as the CPU structures it: the chroma is
+# blurred by a box blur RUN THREE TIMES (a triple box is the CPU's fast
+# Gaussian), I and Q at DIFFERENT radii -- Q got about half the bandwidth I
+# did -- and Y sharpened against a radius-2 blur of itself for ringing. One
+# shader cannot reproduce three passes exactly, because the CPU re-pads the
+# edges before every pass; so it is three draws of NTSC_BLUR and one of NTSC,
+# orchestrated by chain.ntsc(), and each draw's edge clamp matches np.pad
+# exactly. The old single-pass version blurred both chroma channels with one
+# 13-tap triangle, which is why it never validated.
+
+NTSC_BLUR = """
+uniform sampler2D source;
+uniform float ri;
+uniform float rq;
+uniform float ry;
+uniform float to_yiq;
+uniform vec2 resolution;
+in vec2 vUV;
+out vec4 Color;
+
+vec3 rgb2yiq(vec3 c)
+{
+    return vec3(dot(c, vec3(0.299, 0.587, 0.114)),
+                dot(c, vec3(0.5959, -0.2746, -0.3213)),
+                dot(c, vec3(0.2115, -0.5227, 0.3112)));
+}
+
+vec3 fetch(vec2 uv)
+{
+    vec3 c = texture(source, uv).rgb;
+    return (to_yiq > 0.5) ? rgb2yiq(c) : c;
+}
+
+void main()
+{
+    float step_u = 1.0 / resolution.x;
+    float lo = 0.5 * step_u;
+    float hi = 1.0 - 0.5 * step_u;
+    float rmax = max(max(ri, rq), ry);
+    vec3 acc = vec3(0.0);
+    vec3 total = vec3(0.0);
+    for (int i = -96; i <= 96; i++) {
+        float k = abs(float(i));
+        if (k <= rmax) {
+            vec2 p = vec2(clamp(vUV.x + float(i) * step_u, lo, hi), vUV.y);
+            vec3 v = fetch(p);
+            vec3 w = vec3(k <= ry ? 1.0 : 0.0,
+                          k <= ri ? 1.0 : 0.0,
+                          k <= rq ? 1.0 : 0.0);
+            acc = acc + v * w;
+            total = total + w;
+        }
+    }
+    Color = vec4(acc / max(total, vec3(0.0001)), 1.0);
+}
+"""
+
 NTSC = """
 uniform sampler2D source;
-uniform float bleed;
+uniform sampler2D blurred;
 uniform float ringing;
-uniform vec2 resolution;
 in vec2 vUV;
 out vec4 Color;
 
@@ -191,19 +247,10 @@ vec3 yiq2rgb(vec3 c)
 
 void main()
 {
-    float step_u = 1.0 / resolution.x;
     vec3 centre = rgb2yiq(texture(source, vUV).rgb);
-    vec3 acc = vec3(0.0);
-    float total = 0.0;
-    for (int i = -6; i <= 6; i++) {
-        float w = 1.0 - abs(float(i)) / 7.0;
-        vec2 uv = vec2(clamp(vUV.x + float(i) * step_u * bleed, 0.0, 1.0), vUV.y);
-        acc = acc + rgb2yiq(texture(source, uv).rgb) * w;
-        total = total + w;
-    }
-    vec3 blurred = acc / max(total, 0.0001);
-    vec3 outc = vec3(centre.x, blurred.y, blurred.z);
-    outc.x = outc.x + (centre.x - blurred.x) * ringing * 2.0;
+    vec3 soft = texture(blurred, vUV).rgb;      // (Y blurred, I blurred, Q blurred)
+    vec3 outc = vec3(centre.x + (centre.x - soft.x) * ringing * 2.0,
+                     soft.y, soft.z);
     Color = vec4(clamp(yiq2rgb(outc), 0.0, 1.0), texture(source, vUV).a);
 }
 """
@@ -225,21 +272,24 @@ INTERFACE = {
     'DITHER': {'samplers': ['source'],
                'floats': ['strength', 'matrix_size'],
                'vec2': ['resolution'], 'vec3': ['levels']},
-    'NTSC': {'samplers': ['source'],
-             'floats': ['bleed', 'ringing'], 'vec2': ['resolution']},
+    'NTSC_BLUR': {'samplers': ['source'],
+                  'floats': ['ri', 'rq', 'ry', 'to_yiq'],
+                  'vec2': ['resolution']},
+    'NTSC': {'samplers': ['source', 'blurred'],
+             'floats': ['ringing']},
 }
 
 
 def body(name):
-    """The stage source with its declarations removed, for a CreateInfo build."""
-    import re
-    kept = []
-    for line in STAGES[name].splitlines():
-        stripped = line.strip()
-        if re.match(r'^(uniform|in|out)\s+\w', stripped) and stripped.endswith(';'):
-            continue
-        kept.append(line)
-    return '\n'.join(kept)
+    """The stage source with its declarations removed, for a CreateInfo build.
+
+    Delegates to the one stripper, because the two used to disagree: this one
+    also required the semicolon to end the line, and a declaration with a
+    trailing comment survived into a source whose CreateInfo already declared
+    it -- a redeclaration the driver refuses and our own front-end does not.
+    """
+    from .device import strip_declarations
+    return strip_declarations(STAGES[name])
 
 
 STAGES = {
@@ -247,6 +297,7 @@ STAGES = {
     'LENS': LENS,
     'CRT': CRT,
     'DITHER': DITHER,
+    'NTSC_BLUR': NTSC_BLUR,
     'NTSC': NTSC,
 }
 
@@ -266,7 +317,13 @@ VALIDATION = {
     'CRT': ('CLOSE', 0.03),          # 0.0113 measured
     'DITHER': ('CLOSE', 0.04),       # 0.0327 measured
     'LENS': ('CLOSE', 0.01),         # 0.00426 measured after the half-texel fix
-    'NTSC': ('UNPROVEN', None),      # no CPU reference yet
+    'NTSC': ('CLOSE', 0.001),        # 0.00037 measured on an RTX 5060 Ti
+                                     # under Vulkan, run as its real shape:
+                                     # three blur draws and a combine, I and
+                                     # Q at their own radii. Two rounds of
+                                     # self test bought this line
+    'NTSC_BLUR': ('CLOSE', 0.001),   # measured as part of the NTSC pipeline;
+                                     # never drawn on its own
 }
 
 #: stages the engine is allowed to run. Widening this needs evidence, not hope.

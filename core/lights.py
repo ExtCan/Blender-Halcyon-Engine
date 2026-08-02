@@ -377,8 +377,17 @@ def area_samples(light, count, rng):
     return out
 
 
-def visibility(light, P, N, L, dist, settings, bvh=None, rng=None):
-    """Shadow term in 0..1 (1 = fully lit)."""
+def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
+               sample_xy=None):
+    """Shadow term in 0..1 (1 = fully lit).
+
+    `sample_xy` is (spx, spy, light_index): the integer pixel identity and
+    light stream for DETERMINISTIC soft-shadow sampling. With it, every
+    jittered ray is a pure function of (pixel, sample, light, seed) --
+    the same picture whatever the batch order, thread count or device.
+    Without it (contexts that have no pixel identity), the legacy
+    sequential stream still runs.
+    """
     n = P.shape[0]
     if not settings.shadows or light.shadow == 'NONE':
         return np.ones(n, np.float32)
@@ -399,8 +408,22 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None):
             hit = bvh.occluded(origin, L, maxt)
             return (~hit).astype(np.float32)
         acc = np.zeros(n, np.float32)
-        rng = rng or np.random.default_rng(settings.seed)
         t, b = M.orthonormal_basis(L)
+        if sample_xy is not None:
+            from . import patterns as PT
+            spx, spy, li = sample_xy
+            seed = int(getattr(settings, 'seed', 0) or 0)
+            radius = np.float32(light.radius)
+            for k in range(samples):
+                z = 2 * k + 131 * int(li) + 7919 * seed
+                u1 = PT.sample_u(spx, spy, z)
+                ca, sa = PT.sample_circle(PT.sample_u(spx, spy, z + 1))
+                r = np.sqrt(u1) * radius
+                jitter = t * (r * ca)[:, None] + b * (r * sa)[:, None]
+                Lj = M.normalize(L * dist[:, None] + jitter)
+                acc += (~bvh.occluded(origin, Lj, maxt)).astype(np.float32)
+            return acc / samples
+        rng = rng or np.random.default_rng(settings.seed)
         for _ in range(samples):
             r = np.sqrt(rng.random()) * light.radius
             th = rng.random() * 2 * np.pi

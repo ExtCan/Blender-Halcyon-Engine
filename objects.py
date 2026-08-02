@@ -31,7 +31,8 @@ def _material(name, color, model='PHONG', **inputs):
     one silently repaint the first.
     """
     mat = bpy.data.materials.new(name)
-    mat.use_nodes = True
+    from . import compat
+    compat.enable_nodes(mat)
     tree = mat.node_tree
     tree.nodes.clear()
     out = tree.nodes.new('ShaderNodeOutputMaterial')

@@ -68,7 +68,9 @@ def lighting(count):
             '    vec4 ds = hal_evaluate(hal_model, s, N, L, V);',
             '    vec3 radiance = lcol * energy * atten * (1.0 / 3.14159265);',
             '    vec3 diff = s.diffuse * s.diffuse_level * ds.x;',
-            '    vec3 spec = s.specular * s.specular_level * ds.yzw;',
+            '    // the specular colour is already in ds.yzw: hal_evaluate',
+            '    // folds it, as the CPU does, so Metal can tint by diffuse',
+            '    vec3 spec = s.specular_level * ds.yzw;',
             '    return (diff + spec) * radiance;',
             '}',
             '',
@@ -178,3 +180,1185 @@ void main()
 def can_assemble(graph, light_count=0):
     src, _info = assemble(graph, light_count=light_count)
     return src is not None
+
+
+# ------------------------------------------------------------ frame shading
+#
+# The shader above proves the emitters and the models agree with the CPU at a
+# point. The one below shades a *frame*: it reads the packed G-buffer, keeps
+# to its own material's pixels, and reproduces `light_surface` -- the real
+# light loop, not a replica of it. Everything constant for the frame is baked
+# into the source as literals, which sidesteps Vulkan's push-constant budget
+# entirely: the only uniforms left are the three G-buffer samplers and their
+# sizes, and the shader is recompiled only when the scene's constants change,
+# which the compile cache already handles by hashing the source.
+
+
+def _f(x):
+    """A float literal a strict GLSL front-end cannot mistake for an int.
+
+    `%.9g` renders 6.0 as `6`, which is an *integer* literal. Implicit
+    int-to-float conversion makes that legal everywhere that matters, but a
+    baked shader full of them is one strict-profile driver away from a
+    mystery, so every literal carries its point.
+    """
+    s = f'{float(x):.9g}'
+    if 'e' not in s and 'E' not in s and '.' not in s and 'inf' not in s \
+            and 'nan' not in s:
+        s += '.0'
+    return s
+
+
+def _v3(t):
+    t = tuple(float(v) for v in t)[:3]
+    return 'vec3({}, {}, {})'.format(*(_f(v) for v in t))
+
+
+def _attenuation(light, falloff_default, eps=1e-6):
+    """GLSL for one light's distance falloff, matching lights.attenuate."""
+    mode = getattr(light, 'decay', 'DEFAULT')
+    if mode == 'DEFAULT':
+        mode = falloff_default
+    start = float(getattr(light, 'decay_start', 0.0))
+    if mode == 'NONE':
+        return '1.0'
+    d = f'max(dist - {_f(start)}, {_f(eps)})' if start > 0 else \
+        f'max(dist, {_f(eps)})'
+    if mode == 'INVERSE':
+        return f'(1.0 / {d})'
+    if mode == 'CUSTOM':
+        end = max(float(getattr(light, 'decay_end', 40.0)), start + eps)
+        return (f'clamp(1.0 - (dist - {_f(start)}) / {_f(end - start)}, '
+                f'0.0, 1.0)')
+    return f'(1.0 / ({d} * {d}))'
+
+
+def _v4(t):
+    t = tuple(float(v) for v in t)[:4]
+    return 'vec4({}, {}, {}, {})'.format(*(_f(v) for v in t))
+
+
+#: the deterministic-sampling primitives: the pattern library's integer
+#: hash under a sampling name (a material may inline PRIM_GLSL too, and a
+#: driver rejects a redefinition), plus the shared 256-entry unit-circle
+#: table as a texture fetch. The table exists because a driver's own
+#: sin/cos round differently than NumPy's, and an occlusion ray is a
+#: cliff: reading the SAME float32 data on every device keeps the jitter
+#: bit-identical, which is what keeps the averaged visibility identical.
+SAMPLING_GLSL = """
+uniform sampler2D hal_circle;
+float hal_smp_hash3(int ix, int iy, int iz)
+{
+    uint h = (uint(ix) * 374761393u + uint(iy) * 668265263u
+              + uint(iz) * 1274126177u) & 0x7fffffffu;
+    h = (h ^ (h >> 13u)) * 1274126177u;
+    return float((h ^ (h >> 16u)) & 0xffffu) / 65535.0;
+}
+vec2 hal_smp_circle(float u)
+{
+    int ai = int(u * 65535.0 + 0.5) & 255;
+    return texelFetch(hal_circle, ivec2(ai, 0), 0).rg;
+}
+"""
+
+
+def _ao_function(ao, consts):
+    """`ambient_occlusion` as GLSL: the same rays, the same average.
+
+    Cosine-weighted hemisphere directions from the hash and the circle
+    table -- the identical draws the CPU makes for this pixel, because
+    both sides compute (pixel, sample, seed) -> jitter with the same
+    integer arithmetic and the same table data. Each direction asks the
+    shared BVH traversal, and the occlusion scales the ambient term
+    exactly as `light_surface` does it.
+    """
+    w, h = consts['resolution']
+    seed = int(consts.get('seed', 0))
+    samples = max(int(ao['samples']), 1)
+    L = ['float hal_ao(vec3 P, vec3 N)',
+         '{',
+         '    vec3 up = (abs(N.z) < 0.999) ? vec3(0.0, 0.0, 1.0) '
+         ': vec3(1.0, 0.0, 0.0);',
+         '    vec3 t = normalize(cross(up, N));',
+         '    vec3 b = cross(N, t);',
+         f'    vec3 org = P + N * {_f(float(ao["bias"]))};',
+         f'    int sx = int(vUV.x * {_f(float(w))});',
+         f'    int sy = int(vUV.y * {_f(float(h))});',
+         '    float occ = 0.0;']
+    for k in range(samples):
+        z = 2 * k + 8389 + 7919 * seed
+        L += ['    {',
+              f'    float u1 = hal_smp_hash3(sx, sy, {z});',
+              f'    vec2 cs = hal_smp_circle(hal_smp_hash3(sx, sy, '
+              f'{z + 1}));',
+              '    float r = sqrt(u1);',
+              '    vec3 d = normalize(t * (r * cs.x) + b * (r * cs.y) '
+              '+ N * sqrt(max(1.0 - u1, 0.0)));',
+              f'    occ += hal_bvh_occluded(org, d, '
+              f'{_f(float(ao["distance"]))});',
+              '    }']
+    L += [f'    return clamp(1.0 - (occ / {_f(float(samples))}) * '
+          f'{_f(float(ao["intensity"]))}, 0.0, 1.0);',
+          '}']
+    return '\n'.join(L) + '\n'
+
+
+def _shadow_function(i, meta, consts):
+    """GLSL for one light's shadow term, mirroring ShadowMap.lookup exactly.
+
+    Everything is baked: the light-space matrix as four row vectors (no mat4,
+    which Halcyon's own front-end does not carry), the linearise constants,
+    the PCF offsets unrolled tap by tap with the softness already multiplied
+    in, and for a point light the six cube faces as an atlas with the face
+    chosen by the major axis, exactly as CubeShadow does. The function
+    returns the same 1 - (1 - lit) * density the CPU returns.
+
+    A ray meta emits `visibility`'s RAY branch instead: offset the origin
+    along the shading normal AND the light direction by the ray bias, clip
+    the ray just short of the light, and ask the BVH -- the same
+    `hal_bvh_occluded` the occlusion kernel proved against `bvh.occluded()`
+    ray for ray. No density term: the CPU's RAY branch applies none.
+    """
+    import numpy as np
+    from ..core.lights import _pcf_offsets
+
+    if meta.get('ray'):
+        bias = _f(float(meta['bias']))
+        samples = int(meta.get('samples', 1))
+        if samples <= 1:
+            return '\n'.join([
+                f'float hal_shadow_vis{i}(vec3 P, vec3 N, vec3 L, '
+                'float dist)',
+                '{',
+                f'    vec3 org = P + N * {bias} + L * {bias};',
+                '    float maxt = (dist > 1e8) ? 1e9 : dist * (1.0 - 1e-3);',
+                '    return 1.0 - hal_bvh_occluded(org, L, maxt);',
+                '}']) + '\n'
+        # SOFT: visibility()'s deterministic branch, sample for sample --
+        # the same hash draws, the same table angles, the same jittered
+        # rays this pixel's CPU shade would build, averaged the same way
+        w, h = consts['resolution']
+        seed = int(consts.get('seed', 0))
+        radius = _f(float(meta['radius']))
+        L = [f'float hal_shadow_vis{i}(vec3 P, vec3 N, vec3 L, float dist)',
+             '{',
+             f'    vec3 org = P + N * {bias} + L * {bias};',
+             '    float maxt = (dist > 1e8) ? 1e9 : dist * (1.0 - 1e-3);',
+             '    vec3 up = (abs(L.z) < 0.999) ? vec3(0.0, 0.0, 1.0) '
+             ': vec3(1.0, 0.0, 0.0);',
+             '    vec3 t = normalize(cross(up, L));',
+             '    vec3 b = cross(L, t);',
+             f'    int sx = int(vUV.x * {_f(float(w))});',
+             f'    int sy = int(vUV.y * {_f(float(h))});',
+             '    float acc = 0.0;']
+        for k in range(samples):
+            z = 2 * k + 131 * int(i) + 7919 * seed
+            L += ['    {',
+                  f'    float u1 = hal_smp_hash3(sx, sy, {z});',
+                  f'    vec2 cs = hal_smp_circle(hal_smp_hash3(sx, sy, '
+                  f'{z + 1}));',
+                  f'    float r = sqrt(u1) * {radius};',
+                  '    vec3 jit = t * (r * cs.x) + b * (r * cs.y);',
+                  '    vec3 Lj = normalize(L * dist + jit);',
+                  '    acc += 1.0 - hal_bvh_occluded(org, Lj, maxt);',
+                  '    }']
+        L += [f'    return acc / {_f(float(samples))};', '}']
+        return '\n'.join(L) + '\n'
+
+    faces = meta['faces']                    # list of per-face dicts
+    size = meta['size']
+    near, far, persp = meta['near'], meta['far'], meta['persp']
+    grid_w = meta['grid'][0]
+    atlas_w, atlas_h = size * meta['grid'][0], size * meta['grid'][1]
+    taps = max(int(consts.get('shadow_samples', 4)), 1)
+    soft = float(meta['softness'])
+    bias = float(meta['bias'])
+    density = float(meta['density'])
+    origin = meta['origin']
+
+    L = [f'uniform sampler2D hal_shadow{i};',
+         f'float hal_shadow_vis{i}(vec3 P, vec3 N, vec3 L)',
+         '{',
+         f'    float ndl = clamp(dot(N, L), 0.0, 1.0);',
+         f'    float slope = {_f(bias)} * (1.0 + 2.0 * (1.0 - ndl));',
+         f'    float pdist = length(P - {_v3(origin)});']
+    # texel_size, then the normal offset the CPU applies before the lookup
+    if persp:
+        L.append(f'    float texel = 2.0 * {_f(meta["extent"])} * '
+                 f'max(pdist, {_f(near)}) / {_f(size)};')
+    else:
+        L.append(f'    float texel = {_f(2.0 * meta["extent"] / size)};')
+    L += [f'    float off_amt = texel * (1.5 + 2.5 * '
+          f'sqrt(max(1.0 - ndl * ndl, 0.0))) * {_f(max(1.0, soft))};',
+          '    vec4 ph = vec4(P + N * off_amt, 1.0);']
+
+    if len(faces) > 1:
+        # cube: the face is the major axis of the vector from the light
+        L += ['    vec3 dvec = ph.xyz - ' + _v3(origin) + ';',
+              '    vec3 avec = abs(dvec);',
+              '    int face = 0;',
+              '    if (avec.x >= avec.y && avec.x >= avec.z) '
+              '{ face = dvec.x >= 0.0 ? 0 : 1; }',
+              '    else if (avec.y >= avec.z) '
+              '{ face = dvec.y >= 0.0 ? 2 : 3; }',
+              '    else { face = dvec.z >= 0.0 ? 4 : 5; }',
+              '    float clipx = 0.0; float clipy = 0.0;',
+              '    float clipz = 0.0; float clipw = 1.0;',
+              '    float cellx = 0.0; float celly = 0.0;']
+        for fi, fc in enumerate(faces):
+            vp = np.asarray(fc['vp'], np.float32)
+            L += [f'    if (face == {fi}) {{',
+                  f'        clipx = dot(ph, {_v4(vp[0])});',
+                  f'        clipy = dot(ph, {_v4(vp[1])});',
+                  f'        clipz = dot(ph, {_v4(vp[2])});',
+                  f'        clipw = dot(ph, {_v4(vp[3])});',
+                  f'        cellx = {_f((fi % grid_w) * size)};',
+                  f'        celly = {_f((fi // grid_w) * size)};',
+                  '    }']
+    else:
+        vp = np.asarray(faces[0]['vp'], np.float32)
+        L += [f'    float clipx = dot(ph, {_v4(vp[0])});',
+              f'    float clipy = dot(ph, {_v4(vp[1])});',
+              f'    float clipz = dot(ph, {_v4(vp[2])});',
+              f'    float clipw = dot(ph, {_v4(vp[3])});',
+              '    float cellx = 0.0; float celly = 0.0;']
+
+    eps = 1e-6
+    L += [f'    float w = abs(clipw) < {_f(eps)} ? {_f(eps)} : clipw;',
+          '    float nx = clipx / w;',
+          '    float ny = clipy / w;',
+          '    float nz = clipz / w;',
+          '    bool inside = abs(nx) <= 1.0 && abs(ny) <= 1.0 && nz <= 1.0']
+    if persp:
+        L[-1] += ' && clipw > 0.0;'
+    else:
+        L[-1] += ';'
+    # linearise the fragment's own depth exactly as _linearise does
+    L.append('    float zc = clamp(nz, -1.0, 1.0);')
+    if persp:
+        L.append(f'    float den = ({_f(far + near)}) - zc * {_f(far - near)};')
+        L.append(f'    den = abs(den) < {_f(eps)} ? {_f(eps)} : den;')
+        L.append(f'    float sdist = {_f(2.0 * near * far)} / den;')
+    else:
+        L.append(f'    float sdist = (zc * 0.5 + 0.5) * {_f(far - near)}'
+                 f' + {_f(near)};')
+    L += [f'    float u = (nx * 0.5 + 0.5) * {_f(size)};',
+          f'    float v = (ny * 0.5 + 0.5) * {_f(size)};',
+          '    float lit = 0.0;']
+    offs = _pcf_offsets(taps) * max(soft, 0.0)
+    for ox, oy in offs:
+        L += [f'    {{',
+              f'    float xi = clamp(floor(u + {_f(ox)}), 0.0, '
+              f'{_f(size - 1)});',
+              f'    float yi = clamp(floor(v + {_f(oy)}), 0.0, '
+              f'{_f(size - 1)});',
+              f'    vec2 suv = vec2((cellx + xi + 0.5) / {_f(atlas_w)}, '
+              f'(celly + yi + 0.5) / {_f(atlas_h)});',
+              f'    float occ = texture(hal_shadow{i}, suv).r;',
+              '    lit += (sdist - slope <= occ) ? 1.0 : 0.0;',
+              '    }']
+    L += [f'    lit /= {_f(len(offs))};',
+          '    if (!inside) { lit = 1.0; }',
+          f'    return 1.0 - (1.0 - lit) * {_f(density)};',
+          '}']
+    return '\n'.join(L) + '\n'
+
+
+def _sky_blend(x, mode):
+    """`sky._blend`, as an expression: the input is already clamped."""
+    if mode == 'SMOOTH':
+        return f'({x} * {x} * (3.0 - 2.0 * {x}))'
+    if mode == 'SHARP':
+        return f'({x} * {x})'
+    if mode == 'EASE':
+        return f'sqrt({x})'
+    return x
+
+
+def _sky_env_lines(env_spec):
+    """The GRADIENT and BANDS skies along hal_R, exactly `sky.gradient` /
+    `sky.bands` with every world constant baked.
+
+    Only the ray's z enters the formulas, so the world rotation (which
+    spins x and y) is correctly absent. Strength multiplies at the end,
+    as `evaluate` does. Bands quantise in the blend parameter with the
+    same steps/soft smoothing arithmetic, ground colour takes the same
+    below-horizon branch.
+    """
+    sp = env_spec[1]
+    bands = env_spec[0] == 'SKY_BANDS'
+    hor = _v3(sp['horizon'])
+    zen = _v3(sp['zenith'])
+    gnd = _v3(sp['ground'])
+    height = float(sp['height'])
+    inv_above = 1.0 / max(1.0 - height, 1e-3)
+    inv_below = 1.0 / max(1.0 + height, 1e-3)
+    falloff = float(sp['falloff'])
+    mode = sp['blend']
+    L = ['    float hal_sky_up = clamp(hal_R.z, -1.0, 1.0);']
+
+    def t_expr(raw, tag):
+        # clip -> pow -> blend -> (bands: quantise), returning the var name
+        L.append(f'    float hal_st{tag} = '
+                 f'{_sky_blend(f"pow({raw}, {_f(falloff)})", mode)};')
+        name = f'hal_st{tag}'
+        if not bands:
+            return name
+        steps = int(sp['steps'])
+        if steps == 1:
+            L.append(f'    float hal_sq{tag} = 0.0;')
+            return f'hal_sq{tag}'
+        soft = float(sp['soft'])
+        L.append(f'    float hal_ss{tag} = min(floor({name} * {_f(float(steps))}), '
+                 f'{_f(float(steps - 1))});')
+        if soft > 1e-4:
+            L.extend([
+                f'    float hal_sf{tag} = {name} * {_f(float(steps))} - '
+                f'floor({name} * {_f(float(steps))});',
+                f'    float hal_se{tag} = clamp((hal_sf{tag} - '
+                f'{_f(1.0 - soft)}) / {_f(max(soft, 1e-4))}, 0.0, 1.0);',
+                f'    hal_ss{tag} = min(hal_ss{tag} + hal_se{tag} * '
+                f'hal_se{tag} * (3.0 - 2.0 * hal_se{tag}), '
+                f'{_f(float(steps - 1))});'])
+        L.append(f'    float hal_sq{tag} = clamp(hal_ss{tag} / '
+                 f'{_f(float(steps - 1))}, 0.0, 1.0);')
+        return f'hal_sq{tag}'
+
+    ta = t_expr(f'clamp((hal_sky_up - {_f(height)}) * {_f(inv_above)}, '
+                '0.0, 1.0)', 'a')
+    L.append(f'    vec3 hal_env = {hor} + ({zen} - {hor}) * {ta};')
+    if sp['show_ground']:
+        tb = t_expr(f'clamp(({_f(height)} - hal_sky_up) * {_f(inv_below)}, '
+                    '0.0, 1.0)', 'b')
+        L.append(f'    if (hal_sky_up < {_f(height)}) '
+                 f'{{ hal_env = {hor} + ({gnd} - {hor}) * {tb}; }}')
+    strength = float(sp['strength'])
+    if abs(strength - 1.0) > 1e-6:
+        L.append(f'    hal_env = hal_env * {_f(strength)};')
+    return L
+
+
+#: filters the manual sampler reproduces. TRILINEAR needs a mip footprint the
+#: deferred pass does not have, and the N64 three-point filter is still CPU
+SUPPORTED_TEX_FILTERS = ('NEAREST', 'BILINEAR')
+
+
+def _block(pieces):
+    """Join GLSL pieces as LINES: newline-separated, newline-TERMINATED.
+
+    The assemblers build their source with ''.join(parts), which glues
+    adjacent blocks character to character. A block whose last line lacks
+    its newline splices onto the next block's first line -- and when both
+    halves are declarations, the spliced line matches neither the
+    stripper nor the lint (both read whole lines), survives into the
+    CreateInfo build, and the driver rejects the shader as a
+    redefinition. The field found exactly that: the Bump emitter's bare
+    `uniform sampler2D hal_bump0;` glued onto `uniform sampler2D
+    hal_shadow0;` whenever a bump material had no image textures, and
+    every bump frame silently shaded on the CPU. Every multi-line block
+    goes through here now, so no emitter has to remember its own
+    trailing newline.
+    """
+    txt = '\n'.join(pieces)
+    return txt + '\n' if txt else ''
+
+
+def _wrap_expr(var, n, mode):
+    """Index wrapping, exactly as Texture._wrap_index does it."""
+    if mode == 'REPEAT':
+        return f'mod({var}, {_f(n)})'
+    if mode == 'MIRROR':
+        return (f'(mod({var}, {_f(2 * n)}) < {_f(n)} '
+                f'? mod({var}, {_f(2 * n)}) '
+                f': {_f(2 * n - 1)} - mod({var}, {_f(2 * n)}))')
+    return f'clamp({var}, 0.0, {_f(n - 1)})'     # EXTEND, and CLIP's indices
+
+
+def _texture_sampler(name, tex, filt, wrap):
+    """A manual sampler matching Texture.sample, driver-independent.
+
+    `texture()` with driver filtering would put the sampling arithmetic in
+    the driver's hands; fetching texel centres and doing the filter in the
+    shader keeps it in ours, which is what makes the GPU pixel the CPU pixel.
+    """
+    w, h = float(tex.width), float(tex.height)
+    L = [f'uniform sampler2D {name};',
+         f'vec4 hal_fetch_{name}(float x, float y)',
+         '{',
+         f'    return texture({name}, vec2((x + 0.5) / {_f(w)}, '
+         f'(y + 0.5) / {_f(h)}));',
+         '}',
+         f'vec4 hal_sample_{name}(vec2 uv)',
+         '{']
+    if filt == 'NEAREST':
+        L += [f'    float x = floor(uv.x * {_f(w)});',
+              f'    float y = floor(uv.y * {_f(h)});',
+              f'    x = {_wrap_expr("x", w, wrap)};',
+              f'    y = {_wrap_expr("y", h, wrap)};',
+              f'    vec4 c = hal_fetch_{name}(x, y);']
+    else:
+        L += [f'    float fx = uv.x * {_f(w)} - 0.5;',
+              f'    float fy = uv.y * {_f(h)} - 0.5;',
+              '    float x0 = floor(fx);',
+              '    float y0 = floor(fy);',
+              '    float tx = fx - x0;',
+              '    float ty = fy - y0;',
+              '    float x1 = x0 + 1.0;',
+              '    float y1 = y0 + 1.0;',
+              f'    float wx0 = {_wrap_expr("x0", w, wrap)};',
+              f'    float wx1 = {_wrap_expr("x1", w, wrap)};',
+              f'    float wy0 = {_wrap_expr("y0", h, wrap)};',
+              f'    float wy1 = {_wrap_expr("y1", h, wrap)};',
+              f'    vec4 c00 = hal_fetch_{name}(wx0, wy0);',
+              f'    vec4 c10 = hal_fetch_{name}(wx1, wy0);',
+              f'    vec4 c01 = hal_fetch_{name}(wx0, wy1);',
+              f'    vec4 c11 = hal_fetch_{name}(wx1, wy1);',
+              '    vec4 c = mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);']
+    if wrap == 'CLIP':
+        L.append('    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || '
+                 'uv.y > 1.0) { c = vec4(0.0); }')
+    L += ['    return c;', '}']
+    return '\n'.join(L) + '\n'
+
+
+def resolve_tex_filter(interp, settings_filter):
+    """The filter the CPU will actually use, from n_tex_image's own logic:
+    the node asks, the period settings override."""
+    filt = {'Closest': 'NEAREST', 'Linear': 'BILINEAR', 'Cubic': 'BILINEAR',
+            'Smart': 'BILINEAR'}.get(interp, 'BILINEAR')
+    if settings_filter:
+        filt = settings_filter
+    return filt
+
+
+def _one_light_source(i, light, consts, shadowed=None, bake=None):
+    """The unrolled loop body for one light, mirroring light_surface.
+
+    AREA lights take the position branch: the CPU's sample() treats an area
+    light without an explicit surface sample exactly as a point at its
+    centre, and its softness lives in the shadow term, not the direct math.
+
+    `shadowed` is the light's shadow meta (or None): a ray meta's visibility
+    function takes the distance to the light -- in scope for a positional
+    light, 1e9 for a SUN, exactly the `dist` sample() feeds `visibility`.
+    """
+    import numpy as np
+    bake = bake or {}
+    kind = getattr(light, 'type', 'POINT')
+    col = _v3(getattr(light, 'color', (1, 1, 1)))
+    energy = float(getattr(light, 'energy', 1.0))
+    lines = ['    {']
+    if kind == 'SUN':
+        d = np.asarray(light.direction, np.float32)
+        d = d / max(float(np.linalg.norm(d)), 1e-9)
+        lines += [f'    vec3 L = {_v3(-d)};',
+                  f'    vec3 rad = {col} * {_f(energy)};']
+    else:
+        lines += [f'    vec3 delta = {_v3(light.position)} - P;',
+                  '    float dist = max(length(delta), 1e-6);',
+                  '    vec3 L = delta / dist;',
+                  f'    float att = '
+                  f'{_attenuation(light, consts["falloff_default"])};',
+                  f'    vec3 rad = {col} * ({_f(energy / (4.0 * np.pi))}'
+                  f' * att);']
+        if kind == 'SPOT':
+            sd = np.asarray(light.direction, np.float32)
+            sd = sd / max(float(np.linalg.norm(sd)), 1e-9)
+            half = float(light.spot_size) * 0.5
+            blend = max(float(light.spot_blend), 1e-4)
+            outer = np.cos(half)
+            inner = np.cos(half * (1.0 - blend))
+            lines += [
+                f'    float cosang = -dot(L, {_v3(sd)});',
+                f'    float spot_t = clamp((cosang - {_f(outer)}) / '
+                f'{_f(max(inner - outer, 1e-5))}, 0.0, 1.0);',
+                '    rad = rad * (spot_t * spot_t);']
+    if getattr(light, 'negative', False):
+        lines.append('    rad = -rad;')
+    lines.append('    vec4 ds = hal_evaluate(hal_model_i, s, N, L, V);')
+    lines.append('    vec3 contrib = vec3(0.0);')
+    if getattr(light, 'affect_diffuse', True) and \
+            not getattr(light, 'specular_only', False):
+        lines.append('    contrib += (ds.x * s.diffuse * s.diffuse_level)'
+                     ' * rad;')
+    if getattr(light, 'affect_specular', True) and \
+            not getattr(light, 'diffuse_only', False):
+        spec = 'ds.yzw'
+        if not consts.get('specular_in_gamma', True):
+            spec = 'pow(max(ds.yzw, vec3(0.0)), vec3(2.2))'
+        lines.append(f'    contrib += {spec} * s.specular_level * rad;')
+        if float(bake.get('sheen', 0.0)) > 1e-4:
+            # the velvet lobe, exactly as light_surface: scattered back at
+            # grazing angles, needing a light, vanishing face-on
+            sr = min(max(float(bake.get('sheen_roughness', 0.3)), 0.0), 1.0)
+            sheen_exp = 1.0 + (1.0 - sr) * 15.0
+            lines.append(
+                f'    contrib += {_v3(bake.get("sheen_color", (1, 1, 1)))}'
+                f' * (pow(hal_edge_vn, {_f(sheen_exp)})'
+                f' * max(dot(N, L), 0.0) * {_f(bake["sheen"])}) * rad;')
+    lines.append('    contrib *= 0.318309886;')          # 1/pi, as the CPU
+    if shadowed:
+        # the CPU order: 1/pi, then visibility, then the clamp
+        if isinstance(shadowed, dict) and shadowed.get('ray'):
+            dist_arg = '1e9' if kind == 'SUN' else 'dist'
+            lines.append(f'    contrib *= '
+                         f'hal_shadow_vis{i}(P, N, L, {dist_arg});')
+        else:
+            lines.append(f'    contrib *= hal_shadow_vis{i}(P, N, L);')
+    clamp = float(consts.get('light_clamp', 0.0))
+    if clamp > 0.0:
+        lines.append(f'    contrib = min(contrib, vec3({_f(clamp)}));')
+    lines.append('    total += contrib;')
+    lines.append('    }')
+    return lines
+
+
+#: surface fields baked from the probe, in HalcyonSurface field order
+BAKE_FIELDS = ('diffuse_level', 'specular_level', 'glossiness', 'roughness',
+               'metallic', 'anisotropy', 'aniso_rot', 'soften', 'ior',
+               'translucency', 'toon_size', 'toon_smooth', 'toon_steps',
+               'opacity')
+
+#: master-node sockets that may vary per pixel: when LINKED, the chain is
+#: emitted and assigned to the surface field; unlinked, the probed constant
+#: bakes as before. socket name -> (surface field, glsl type). This is what
+#: lets a texture drive Roughness without pushing the material off the GPU.
+PER_PIXEL_SOCKETS = {
+    'Diffuse Level': ('diffuse_level', 'float'),
+    'Specular Level': ('specular_level', 'float'),
+    'Specular Color': ('specular', 'vec3'),
+    'Glossiness': ('glossiness', 'float'),
+    'Roughness': ('roughness', 'float'),
+    'Metalness': ('metallic', 'float'),
+    'Soften': ('soften', 'float'),
+    'IOR': ('ior', 'float'),
+    'Translucency': ('translucency', 'float'),
+    'Anisotropy': ('anisotropy', 'float'),
+    'Anisotropic Rotation': ('aniso_rot', 'float'),
+    'Toon Size': ('toon_size', 'float'),
+    'Toon Smooth': ('toon_smooth', 'float'),
+    'Self-Illumination': ('emission', 'vec3'),
+}
+
+
+def master_node(graph):
+    """The HALCYON_ShaderNode feeding the output, if that is what feeds it."""
+    link = find_surface_link(graph)
+    if link is None:
+        return None
+    node = (graph or {}).get('nodes', {}).get(link[0])
+    if node is not None and node.get('bl_idname') == 'HALCYON_ShaderNode':
+        return node
+    return None
+
+
+def _replace_all(text, pairs):
+    for old, new in pairs:
+        text = text.replace(old, new)
+    return text
+
+
+def _socket(node, name):
+    """One named input socket of a node, or None."""
+    for sock in (node or {}).get('inputs', ()):
+        if sock.get('name') == name:
+            return sock
+    return None
+
+
+def master_normal_linked(graph):
+    """Whether the master node's Normal socket drives the shading normal.
+
+    The probe reads this to know that the bent normal it just watched
+    `closure_to_surface` produce is one the frame shader will bend
+    identically -- the assembler emits exactly that chain. A normal bent by
+    anything else (a BSDF lobe's Normal input on a non-master graph) still
+    moves the material to the CPU, because nothing below emits it.
+    """
+    sock = _socket(master_node(graph), 'Normal')
+    return bool(sock and sock.get('link'))
+
+
+def per_pixel_fields(graph):
+    """Surface fields the frame shader will compute per pixel for `graph`.
+
+    The probe uses this to know which constancy checks to skip -- a linked
+    Roughness varying across the frame is the point, not a disqualifier --
+    and the assembler uses it to know which chains to emit. One rule, read
+    from the graph by both sides, so they cannot disagree.
+    """
+    node = master_node(graph)
+    if node is None:
+        return {}
+    out = {}
+    for sock in node.get('inputs', ()):
+        name = sock.get('name')
+        if name in PER_PIXEL_SOCKETS and sock.get('link'):
+            field, gtype = PER_PIXEL_SOCKETS[name]
+            out[field] = (name, gtype)
+    return out
+
+
+def _assemble_height_pass(graph, mat_id, bump_node, consts, textures,
+                          programs):
+    """One Bump node's HEIGHT chain as its own full-screen pass.
+
+    Renders (height, 0, 0, keep) over the same ids texture the main pass
+    reads, so the main pass can take the CPU's exact one-sided neighbour
+    differences by texelFetch. The support machinery mirrors
+    `assemble_frame`'s own: manual texture samplers with the filter
+    arithmetic in the shader, generated coordinates from the baked
+    per-object bounds, the same replacement pass over inlined code.
+    Returns (source, binds) or (None, why).
+    """
+    from . import gbuffer as GB
+
+    em = Emitter(graph or {})
+    em.frame_mode = True
+    em.resolution = consts.get('resolution')
+    em.programs = programs if programs is not None else {}
+    try:
+        expr = em.input(bump_node, 'Height', 'float')
+        body = em.body()
+    except Unsupported as exc:
+        # a height chain the emitter cannot carry -- Blender's sin-fract
+        # Noise family above all -- does NOT refuse the material: the
+        # pre-pass is only an image, and the CPU can produce it with the
+        # renderer's own evaluator, float64 sin and all, EXACTLY. The
+        # frame pays one height evaluation over the material's pixels.
+        missing = ', '.join(sorted(em.unsupported)) or str(exc)
+        return '__CPU__', {'cpu': True, 'node': bump_node.get('id'),
+                           'why': f'{missing} evaluates on the CPU into '
+                                  'the height pre-pass',
+                           'samplers': [], 'textures': {},
+                           'frame_uniforms': [], 'uses_screen': False}
+    if em.bump_passes:
+        return None, 'a Bump node inside another Bump\'s height chain is ' \
+                     'not in the deferred pass yet'
+
+    tex_fns = []
+    tex_binds = {}
+    src = body + ('\n' if body else '')
+    replacements = []
+    for meta in em.samplers:
+        sname = meta['uniform']
+        key = meta.get('image')
+        tex = (textures or {}).get(key)
+        if meta.get('code'):
+            if tex is None:
+                return None, f"the coded shader's image '{key}' is not " \
+                             'among the prepared textures'
+            filt = str(consts.get('tex_filter', 'NEAREST'))
+            wrap = 'REPEAT'
+        else:
+            if tex is None:
+                return None, f"image '{key}' is not among the prepared " \
+                             'textures'
+            filt = resolve_tex_filter(meta.get('interpolation', 'Linear'),
+                                      consts.get('tex_filter'))
+            wrap = {'REPEAT': 'REPEAT', 'EXTEND': 'EXTEND', 'CLIP': 'CLIP',
+                    'MIRROR': 'MIRROR'}.get(meta.get('extension', 'REPEAT'),
+                                            'REPEAT')
+        if filt not in SUPPORTED_TEX_FILTERS:
+            return None, (f'the {filt} texture filter is not in the '
+                          f'deferred pass yet (Nearest and Bilinear are)')
+        tex_fns.append(_texture_sampler(sname, tex, filt, wrap))
+        tex_binds[sname] = key
+        replacements.append((f'texture({sname},', f'hal_sample_{sname}('))
+    for old, new in replacements:
+        src = src.replace(old, new)
+    inline_parts = list(em.inline)
+    if replacements:
+        inline_parts = [t if 'texture(' not in t else
+                        _replace_all(t, replacements) for t in inline_parts]
+    if 'hal_T' in src:
+        return None, 'tangent texture coordinates are not in the ' \
+                     'G-buffer yet (UV and generated coordinates are)'
+    gen_fns = ''
+    gen_line = ''
+    if 'hal_generated' in src:
+        bounds = consts.get('obj_bounds')
+        if bounds is None:
+            return None, 'generated coordinates need the per-object ' \
+                         'bounds the caller did not supply'
+        lo, span = bounds
+
+        def _sel(name, rows):
+            lines = [f'vec3 {name}(float obj)', '{']
+            for i in range(len(rows) - 1):
+                lines.append(f'    if (obj < {_f(i + 0.5)}) '
+                             f'return {_v3(rows[i])};')
+            lines.append(f'    return {_v3(rows[len(rows) - 1])};')
+            lines.append('}')
+            return '\n'.join(lines)
+
+        gen_fns = _sel('hal_gen_lo', list(lo)) + '\n' \
+            + _sel('hal_gen_span', list(span)) + '\n'
+        gen_line = ('    vec3 hal_generated = (P - hal_gen_lo(td.y)) '
+                    '/ hal_gen_span(td.y);\n')
+
+    frame_unis = sorted(em.frame_uniforms)
+    extra_unis = ''.join(f'uniform float {u};\n' for u in frame_unis)
+    parts = [GB.GLSL, gen_fns, _block(inline_parts), _block(tex_fns),
+             f"""
+in vec2 vUV;
+out vec4 Color;
+uniform vec3 hal_eye;
+{extra_unis}
+
+void main()
+{{
+    HalcyonFragment f = hal_read_gbuffer(vUV);
+    vec4 td = hal_tri_data(max(f.tri, 0.0));
+    float keep = (f.covered && abs(td.x - {_f(mat_id)}) < 0.5) ? 1.0 : 0.0;
+    vec3 P = f.P;
+    vec3 V = normalize(hal_eye - P);
+    vec3 N0 = normalize(f.N);
+    vec3 hal_P = P;
+    vec3 hal_N = N0;
+    vec3 hal_V = V;
+    vec2 hal_uv = f.uv;
+"""]
+    if gen_line:
+        parts.append(gen_line)
+    if 'hal_vcol' in src:
+        parts.append('    vec4 hal_vcol = hal_interp4(f.tri, f.bary, 3);\n')
+    parts.append(src)
+    parts.append(f'    Color = vec4({expr}, 0.0, 0.0, 1.0) * keep;\n}}')
+    return ''.join(parts), {'samplers': sorted(tex_binds),
+                            'textures': tex_binds,
+                            'frame_uniforms': frame_unis,
+                            'uses_screen': em.used_screen}
+
+
+def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
+                   shadows=None, textures=None, programs=None,
+                   secondary=False, layer=False):
+    """One material's full-screen deferred pass, as complete GLSL.
+
+    `secondary=True` assembles the pass for REFLECTION HIT points instead
+    of camera fragments. Almost nothing changes -- the CPU shades hits
+    with the same camera-eye V (`ctx.I` is always `P - eye`) -- except the
+    backface override: `trace()` builds its context with `front=None`, so
+    `surf.backfacing` never sets and the override is inert on hits. The
+    secondary pass emits no backface block for the same reason.
+
+    `layer=True` assembles the TRANSPARENT-LAYER variant: the same lit
+    surface, but the pass writes the material's REAL alpha (opacity,
+    threshold, edge-opacity blend -- shade_batch's own chain) instead of
+    the coverage flag, premultiplied by keep so disjoint materials merge
+    additively into one layer image.
+
+    `bake` carries the surface constants the probe harvested (BAKE_FIELDS
+    plus 'specular', 'ambient', 'emission', and 'diffuse' when there is no
+    graph to compute it). `consts` carries the frame constants: eye,
+    ambient_color, two_sided, specular_in_gamma, clamp_specular, light_clamp,
+    falloff_default, shadow_samples. `shadows` is a list parallel to
+    `lights`: None for an unshadowed light, or the meta dict its shadow atlas
+    was packed with.
+
+    Returns (source, binds) or (None, why). `binds` carries 'samplers' --
+    every sampler name the source declares beyond the G-buffer's own, in
+    binding order -- and 'textures', mapping the image sampler names to the
+    prepared-texture keys the caller must upload.
+    """
+    from . import gbuffer as GB
+
+    em = Emitter(graph or {})
+    em.frame_mode = True
+    em.resolution = consts.get('resolution')
+    em.secondary = secondary
+    # {} is authoritative "nothing compiled" (code nodes read as zeros, the
+    # CPU's own answer); the frame path always knows, so it never passes None
+    em.programs = programs if programs is not None else {}
+    base = None
+    body = ''
+    perpix = {}
+    perpix_exprs = {}
+    normal_expr = None
+    bump_expr = None
+    link = find_surface_link(graph)
+    if link is not None:
+        try:
+            var, vt = em.output(link[0], link[1])
+            base = em.cast(var, vt, 'vec3')
+            # linked surface-parameter sockets on the master node: their
+            # chains are emitted here, through the same emitter -- shared
+            # subexpressions and all -- and assigned per pixel below
+            perpix = per_pixel_fields(graph)
+            mnode = master_node(graph)
+            for field, (sockname, gtype) in perpix.items():
+                want = 'float' if gtype == 'float' else 'vec3'
+                perpix_exprs[field] = em.input(mnode, sockname, want)
+            # the master node's Normal chain, through the same emitter so a
+            # texture feeding both the colour and a Normal Map is sampled
+            # once, exactly as the evaluator's node cache does it
+            nsock = _socket(mnode, 'Normal')
+            if nsock is not None and nsock.get('link'):
+                normal_expr = em.input(mnode, 'Normal', 'vec3')
+                if _socket(mnode, 'Bump Strength') is not None:
+                    bump_expr = em.input(mnode, 'Bump Strength', 'float')
+                # a node missing the socket bends at full strength on the
+                # CPU (_opt defaults to 1.0); emitting nothing does the same
+            body = em.body()
+        except Unsupported as exc:
+            missing = ', '.join(sorted(em.unsupported)) or str(exc)
+            return None, f'no GLSL emitter for {missing}'
+    if base is None:
+        base = _v3(bake.get('diffuse', (0.8, 0.8, 0.8)))
+
+    # image textures: the CPU samples the *prepared* pixels -- resized,
+    # quantised, colourspace-converted -- so those exact pixels travel, and
+    # the filter arithmetic is reproduced in the shader rather than left to
+    # the driver's sampler state
+    for node in (graph or {}).get('nodes', {}).values():
+        if node.get('bl_idname') == 'ShaderNodeTexImage' and \
+                node.get('props', {}).get('projection', 'FLAT') != 'FLAT':
+            return None, (f"{node['props']['projection']} projection is not "
+                          f"in the deferred pass yet (FLAT is)")
+    tex_fns = []
+    tex_binds = {}
+    src = body + ('\n' if body else '')
+    replacements = []
+    for meta in em.samplers:
+        sname = meta['uniform']
+        key = meta.get('image')
+        tex = (textures or {}).get(key)
+        if meta.get('code'):
+            # coded-shader images sample with the scene's filter and REPEAT
+            # wrap, exactly the SCtx the evaluator hands the program. A
+            # missing image breaks the node on the CPU too, and the probe
+            # refuses those frames before this code ever runs
+            if tex is None:
+                return None, f"the coded shader's image '{key}' is not " \
+                             'among the prepared textures'
+            filt = str(consts.get('tex_filter', 'NEAREST'))
+            wrap = 'REPEAT'
+        else:
+            if tex is None:
+                return None, f"image '{key}' is not among the prepared " \
+                             'textures'
+            filt = resolve_tex_filter(meta.get('interpolation', 'Linear'),
+                                      consts.get('tex_filter'))
+            wrap = {'REPEAT': 'REPEAT', 'EXTEND': 'EXTEND', 'CLIP': 'CLIP',
+                    'MIRROR': 'MIRROR'}.get(meta.get('extension', 'REPEAT'),
+                                            'REPEAT')
+        if filt not in SUPPORTED_TEX_FILTERS:
+            return None, (f'the {filt} texture filter is not in the '
+                          f'deferred pass yet (Nearest and Bilinear are)')
+        tex_fns.append(_texture_sampler(sname, tex, filt, wrap))
+        tex_binds[sname] = key
+        # the emitter sampled with texture(); the frame pass samples with
+        # the arithmetic above, so the same pixel comes back on any driver
+        replacements.append((f'texture({sname},', f'hal_sample_{sname}('))
+    for old, new in replacements:
+        src = src.replace(old, new)
+    # coded shaders call texture() inside their own inlined functions, so
+    # the same rewrite runs over the inline blocks too
+    inline_parts = list(em.inline)
+    if replacements:
+        inline_parts = [t if 'texture(' not in t else
+                        _replace_all(t, replacements) for t in inline_parts]
+    if 'hal_T' in src:
+        return None, 'tangent texture coordinates are not in the G-buffer ' \
+                     'yet (UV and generated coordinates are)'
+    # generated coordinates: Blender normalises them over each object's own
+    # bounding box, and those bounds are per-scene constants -- so they bake
+    # as a pair of lookup functions keyed by the object index the tri_data
+    # texture already carries. Exactly ctx.generated = (P - lo[obj])/span
+    gen_fns = ''
+    gen_line = ''
+    if 'hal_generated' in src:
+        bounds = consts.get('obj_bounds')
+        if bounds is None:
+            return None, 'generated coordinates need the per-object bounds ' \
+                         'the caller did not supply'
+        lo, span = bounds
+
+        def _sel(name, rows):
+            lines = [f'vec3 {name}(float obj)', '{']
+            for i in range(len(rows) - 1):
+                lines.append(f'    if (obj < {_f(i + 0.5)}) '
+                             f'return {_v3(rows[i])};')
+            lines.append(f'    return {_v3(rows[len(rows) - 1])};')
+            lines.append('}')
+            return '\n'.join(lines)
+
+        gen_fns = _sel('hal_gen_lo', list(lo)) + '\n' \
+            + _sel('hal_gen_span', list(span)) + '\n'
+        gen_line = ('    vec3 hal_generated = (P - hal_gen_lo(td.y)) '
+                    '/ hal_gen_span(td.y);\n')
+
+    # Bump nodes recorded height pre-passes during the walk: each height
+    # chain becomes its own full-screen pass whose target the main pass
+    # reads by texelFetch. Assembled here so a chain the pre-pass cannot
+    # carry refuses the whole material, by name, before anything draws.
+    prepasses = []
+    for k, bnode in enumerate(em.bump_passes):
+        psrc, pinfo = _assemble_height_pass(graph, mat_id, bnode, consts,
+                                            textures, programs)
+        if psrc is None:
+            return None, pinfo
+        prepasses.append((f'hal_bump{k}', psrc, pinfo))
+
+    # the environment-reflection term: sphere-map the world along R, as
+    # shade_batch adds it after everything else. The world spec was decided
+    # by the plan (solid, blend, or an environment texture); its sampler
+    # joins the material's own so the same prepared pixels travel
+    env_lines = []
+    env_spec = consts.get('env')
+    if env_spec and float(bake.get('reflect', 0.0)) > 1e-4:
+        refl = float(bake.get('reflect', 0.0))    # raw, as surf.reflect is
+        rcol = _v3(bake.get('reflect_color', (1, 1, 1)))
+        env_lines.append('    vec3 hal_R = reflect(-V, Nsurf);')
+        if env_spec[0] in ('SKY_GRAD', 'SKY_BANDS'):
+            env_lines += _sky_env_lines(env_spec)
+        elif env_spec[0] in ('SOLID', 'SKY_SOLID'):
+            env_lines.append(f'    vec3 hal_env = {_v3(env_spec[1])};')
+        elif env_spec[0] == 'BLEND':
+            env_lines += [
+                '    float hal_et = clamp(hal_R.z * 0.5 + 0.5, 0.0, 1.0);',
+                f'    vec3 hal_env = {_v3(env_spec[1])} + '
+                f'({_v3(env_spec[2])} - {_v3(env_spec[1])}) * hal_et;']
+        else:
+            key = env_spec[1]
+            tex = (textures or {}).get(key)
+            if tex is None:
+                return None, 'the environment image is not among the ' \
+                             'prepared textures'
+            tex_fns.append(_texture_sampler('hal_env_tex', tex, 'BILINEAR',
+                                            'EXTEND'))
+            tex_binds['hal_env_tex'] = key
+            if env_spec[0] == 'MIRRORBALL':
+                env_lines += [
+                    '    float hal_em = 2.0 * sqrt(max(hal_R.x * hal_R.x + '
+                    'hal_R.y * hal_R.y + (hal_R.z + 1.0) * (hal_R.z + 1.0)'
+                    ', 1e-8));',
+                    '    vec2 hal_euv = vec2(hal_R.x / hal_em + 0.5, '
+                    'hal_R.y / hal_em + 0.5);']
+            else:
+                env_lines += [
+                    '    vec2 hal_euv = vec2('
+                    'atan(hal_R.y, -hal_R.x) / 6.28318530717959 + 0.5, '
+                    'atan(hal_R.z, sqrt(max(hal_R.x * hal_R.x + '
+                    'hal_R.y * hal_R.y, 1e-12))) / 3.14159265358979 + 0.5);']
+            env_lines.append('    vec3 hal_env = '
+                             'hal_sample_hal_env_tex(hal_euv).rgb;')
+        env_lines.append(f'    total += hal_env * ({_f(refl)} * s.specular'
+                         f' * {rcol});')
+
+    two_sided = bool(consts.get('two_sided', True))
+    shadows = shadows or [None] * len(lights)
+    shadow_fns = []
+    samplers = []
+    ray_any = any(s is not None and s.get('ray') for s in shadows)
+    soft_any = any(s is not None and s.get('ray')
+                   and int(s.get('samples', 1)) > 1 for s in shadows)
+    ao_spec = consts.get('ao')
+    if ray_any or ao_spec:
+        # the shared traversal, once, ahead of every hal_shadow_vis (and
+        # hal_ao) that calls it. The texture sides bake as literals: the
+        # plan signature fingerprints the mesh, so a changed BVH re-plans
+        # and re-bakes.
+        sides = consts.get('bvh_sides') or {}
+        if 'hal_bvh_side' not in sides or 'hal_btris_side' not in sides:
+            return None, 'ray shadows need the BVH textures the caller ' \
+                         'did not pack'
+        from .rtrace import TRAVERSE_GLSL
+        trav = TRAVERSE_GLSL
+        for cname in ('hal_bvh_side', 'hal_btris_side'):
+            trav = trav.replace(f'uniform float {cname};', '')
+            trav = trav.replace(cname, _f(float(sides[cname])))
+        shadow_fns.append(trav)
+        samplers += ['hal_bvh', 'hal_btris']
+    if soft_any or ao_spec:
+        # the deterministic-sampling primitives: the pattern hash under a
+        # sampling name (a material may inline the pattern library too),
+        # and the shared unit-circle table
+        shadow_fns.append(SAMPLING_GLSL)
+        samplers.append('hal_circle')
+    if ao_spec:
+        shadow_fns.append(_ao_function(ao_spec, consts))
+    for i, smeta in enumerate(shadows):
+        if smeta is not None:
+            shadow_fns.append(_shadow_function(i, smeta, consts))
+            if not smeta.get('ray'):
+                samplers.append(f'hal_shadow{i}')
+    frame_unis = sorted(em.frame_uniforms)
+    extra_unis = ''.join(f'uniform float {u};\n' for u in frame_unis)
+    # the interface declarations come FIRST: the sampling helpers and the
+    # soft-shadow/AO functions read vUV inside function bodies, and GLSL
+    # requires the declaration to precede the use in file order
+    decls = ('in vec2 vUV;\n'
+             'out vec4 Color;\n'
+             '// the per-frame scalars that are NOT baked: baking the eye '
+             'meant a moving\n'
+             '// camera changed the source every frame, and every frame '
+             'paid the driver\'s\n'
+             '// shader compile. A still pays nothing for these; an orbit '
+             'stops paying 20ms\n'
+             '// -- and a coded shader reading the clock animates without '
+             'recompiling\n'
+             'uniform vec3 hal_eye;\n'
+             + extra_unis)
+    parts = [GS.GLSL, GS.DISPATCH, GB.GLSL, decls, gen_fns,
+             _block(inline_parts), _block(tex_fns), _block(shadow_fns), f"""
+void main()
+{{
+    HalcyonFragment f = hal_read_gbuffer(vUV);
+    vec4 td = hal_tri_data(max(f.tri, 0.0));
+    float keep = (f.covered && abs(td.x - {_f(mat_id)}) < 0.5) ? 1.0 : 0.0;
+    vec3 P = f.P;
+    vec3 V = normalize(hal_eye - P);
+    vec3 N0 = normalize(f.N);
+    vec3 hal_P = P;
+    vec3 hal_N = N0;
+    vec3 hal_V = V;
+    vec2 hal_uv = f.uv;
+"""]
+    if gen_line:
+        parts.append(gen_line)
+    if 'hal_vcol' in src:
+        # three extra fetches, paid only by materials that read the paint
+        parts.append('    vec4 hal_vcol = hal_interp4(f.tri, f.bary, 3);\n')
+    parts.append(src)
+    # The order the CPU actually runs: the graph evaluates against the
+    # interpolated normal -- ctx.N, UNFLIPPED -- then closure_to_surface
+    # lerps the chain's normal toward it by Bump Strength, and only
+    # light_surface flips for two-sided lighting, testing the BENT normal
+    # against V. Flipping first (as this shader once did) fed the chains a
+    # normal the CPU never showed them, wrong on every back face.
+    if normal_expr is not None:
+        k = bump_expr if bump_expr is not None else '1.0'
+        parts.append(f'    vec3 Nsurf = normalize(N0 + '
+                     f'(normalize({normal_expr}) - N0) * ({k}));\n')
+    else:
+        parts.append('    vec3 Nsurf = N0;\n')
+    if two_sided:
+        parts.append('    float side = (dot(Nsurf, V) < 0.0) ? -1.0 : 1.0;\n'
+                     '    vec3 N = Nsurf * side;\n')
+    else:
+        parts.append('    vec3 N = Nsurf;\n')
+    lines = ['    HalcyonSurface s;',
+             f'    int hal_model_i = {int(model_index)};']
+    for name in BAKE_FIELDS:
+        if name in perpix_exprs:
+            lines.append(f'    s.{name} = {perpix_exprs[name]};')
+        else:
+            lines.append(f'    s.{name} = {_f(bake.get(name, 0.0))};')
+    lines += [
+        # the same frame mathx.orthonormal_basis builds on the CPU -- and
+        # from the same normal: shade_batch builds it from ctx.N, the bent
+        # normal BEFORE the two-sided flip. Building it from the flipped N
+        # negated the tangent on back faces, which anisotropy would notice.
+        '    vec3 up = (abs(Nsurf.z) < 0.999) ? vec3(0.0, 0.0, 1.0)'
+        ' : vec3(1.0, 0.0, 0.0);',
+        '    s.tangent = normalize(cross(up, Nsurf));',
+        '    s.bitangent = cross(Nsurf, s.tangent);',
+        f'    s.diffuse = {base};',
+        (f'    s.specular = {perpix_exprs["specular"]};'
+         if 'specular' in perpix_exprs else
+         f'    s.specular = {_v3(bake.get("specular", (1, 1, 1)))};'),
+        f'    vec3 total = s.diffuse * ({_v3(consts["ambient_color"])}'
+        f' * {_f(bake.get("ambient", 1.0))});',
+    ]
+    if consts.get('ao'):
+        # exactly light_surface's order: ambient occlusion scales the
+        # ambient term (with the post-flip N) before any light adds
+        lines.append('    total *= hal_ao(P, N);')
+    if float(bake.get('sheen', 0.0)) > 1e-4:
+        lines.append('    float hal_edge_vn = clamp(1.0 - abs(dot(N, V)), '
+                     '0.0, 1.0);')
+    for i, light in enumerate(lights):
+        lines += _one_light_source(i, light, consts,
+                                   shadowed=shadows[i], bake=bake)
+    if consts.get('clamp_specular', True):
+        lines.append('    total = min(total, vec3(64.0));')
+    if 'emission' in perpix_exprs:
+        lines.append(f'    total = total + {perpix_exprs["emission"]};')
+    else:
+        lines.append(
+            f'    total = total + {_v3(bake.get("emission", (0, 0, 0)))};')
+    # the era's silhouette cheats, exactly as apply_surface_effects: applied
+    # after emission, outside the reflectance model, the same on every model
+    if float(bake.get('fresnel', 0.0)) > 1e-4 or \
+            float(bake.get('rim', 0.0)) > 1e-4:
+        lines.append('    float hal_facing = clamp(abs(dot(N, V)), 0.0, 1.0);')
+        lines.append('    float hal_sil = 1.0 - hal_facing;')
+    if float(bake.get('fresnel', 0.0)) > 1e-4:
+        fp = max(float(bake.get('fresnel_power', 3.0)), 0.01)
+        lines.append(
+            f'    total += {_v3(bake.get("fresnel_color", (1, 1, 1)))}'
+            f' * (pow(hal_sil, {_f(fp)}) * {_f(bake["fresnel"])}'
+            f' * {_f(bake.get("specular_level", 0.5))});')
+    if float(bake.get('rim', 0.0)) > 1e-4:
+        rp = max(float(bake.get('rim_power', 3.0)), 0.01)
+        lines.append(
+            f'    total += {_v3(bake.get("rim_color", (1, 1, 1)))}'
+            f' * (pow(hal_sil, {_f(rp)}) * {_f(bake["rim"])});')
+    # matcap: the whole lit result lerps toward one colour, exactly as
+    # apply_surface_effects -- after fresnel and rim, before the backface
+    mk = min(max(float(bake.get('matcap_blend', 0.0)), 0.0), 1.0)
+    if mk > 1e-4:
+        lines.append(f'    total = total * {_f(1.0 - mk)} + '
+                     f'{_v3(bake.get("matcap", (0, 0, 0)))} * {_f(mk)};')
+    # the backface override: the rasteriser decides front by projected
+    # winding, and for a perspective camera that is exactly the plane-side
+    # test against the eye -- computed from the corner positions the
+    # G-buffer already carries. front is (plane < 0); backfacing the rest
+    kb = min(max(float(bake.get('backface_mix', 0.0)), 0.0), 1.0)
+    if secondary:
+        kb = 0.0                   # trace() shades hits with front=None
+    if kb > 1e-4:
+        lines += [
+            '    vec3 hal_bf_p0 = hal_fetch_attr(f.tri, 0, 0).xyz;',
+            '    vec3 hal_bf_pl = cross('
+            'hal_fetch_attr(f.tri, 1, 0).xyz - hal_bf_p0, '
+            'hal_fetch_attr(f.tri, 2, 0).xyz - hal_bf_p0);',
+            '    float hal_backfacing = '
+            '(dot(hal_bf_pl, hal_eye - hal_bf_p0) < 0.0) ? 0.0 : 1.0;',
+            f'    float hal_bk = {_f(kb)} * hal_backfacing;',
+            '    total = total * (1.0 - hal_bk) + '
+            f'{_v3(bake.get("backface_color", (0, 0, 0)))} * hal_bk;',
+        ]
+    lines += env_lines
+    if layer:
+        # a TRANSPARENT LAYER writes its real alpha -- the same chain
+        # shade_batch runs for SORTED/ABUFFER fragments: opacity clamped,
+        # the hard threshold, then the edge-opacity silhouette blend.
+        # rgb and alpha premultiply by KEEP only, so per-pixel-disjoint
+        # materials merge into one target as a plain sum (the driver
+        # composites them under ALPHA_PREMULT, which for disjoint
+        # writes IS that sum)
+        aexpr = perpix_exprs.get('opacity',
+                                 _f(float(bake.get('opacity', 1.0))))
+        lines.append(f'    float hal_alpha = clamp({aexpr}, 0.0, 1.0);')
+        thr = float(consts.get('alpha_threshold', 0.0))
+        if thr > 0.0:
+            lines.append(f'    hal_alpha = (hal_alpha >= {_f(thr)}) '
+                         '? hal_alpha : 0.0;')
+        eo = float(bake.get('edge_opacity', 1.0))
+        if abs(eo - 1.0) > 1e-4:
+            fp = max(float(bake.get('fresnel_power', 3.0)), 0.01)
+            lines += [
+                # the CPU tests ctx.N -- the BENT normal, before the
+                # two-sided flip (abs() makes the flip moot) -- so a
+                # Normal-Map material's silhouette matches: Nsurf, not N0
+                '    float hal_eo_f = clamp(abs(dot(Nsurf, V)), 0.0, 1.0);',
+                f'    float hal_eo_t = pow(1.0 - hal_eo_f, {_f(fp)});',
+                '    hal_alpha = clamp(hal_alpha * (1.0 - hal_eo_t) + '
+                f'{_f(eo)} * hal_eo_t, 0.0, 1.0);',
+            ]
+        lines.append('    Color = vec4(total * keep, hal_alpha * keep);')
+    else:
+        lines.append('    Color = vec4(total, 1.0) * keep;')
+    lines.append('}')
+    parts.append('\n'.join(lines))
+    return ''.join(parts), {'samplers': samplers + sorted(tex_binds)
+                            + [p[0] for p in prepasses],
+                            'textures': tex_binds,
+                            'frame_uniforms': frame_unis,
+                            'prepasses': prepasses,
+                            'uses_screen': em.used_screen
+                            or any(p[2].get('uses_screen')
+                                   for p in prepasses)}
