@@ -81,11 +81,15 @@ class Texture:
         return mips
 
     # -------------------------------------------------------------- sampling
-    def sample(self, u, v, filt=None, wrap=None, lod=None, aniso=1):
+    def sample(self, u, v, filt=None, wrap=None, lod=None, aniso=1,
+               duv=None, dvv=None, bias=0.0):
         filt = filt or self.filter
         wrap = wrap or self.wrap
         u = np.asarray(u, np.float32)
         v = np.asarray(v, np.float32)
+        if filt == 'TRILINEAR' and duv is not None and int(aniso) > 1:
+            return self._sample_aniso(u, v, duv, dvv, float(bias), wrap,
+                                      int(aniso))
         if filt == 'TRILINEAR' and lod is not None:
             return self._sample_trilinear(u, v, lod, wrap)
         if filt == 'NEAREST':
@@ -177,6 +181,39 @@ class Texture:
             out = out.copy()
             out[oob] = 0.0
         return out
+
+    def _sample_aniso(self, u, v, duv, dvv, bias, wrap, max_aniso):
+        """Hardware-style N-tap anisotropic filtering.
+
+        The pixel's screen-x and screen-y footprints in texel units pick
+        a MAJOR and a minor axis; the mip level follows the MINOR axis
+        (so the texture keeps its detail along the stretch -- the whole
+        point of anisotropy on a grazing floor), and `max_aniso`
+        trilinear taps average along the major axis in UV space.
+        Deterministic and vectorised: every pixel takes the same tap
+        count, weights uniform -- the era's box approximation of EWA,
+        honestly, rather than EWA itself.
+        """
+        tw, th = float(self.width), float(self.height)
+        vx2 = (duv[:, 0] * tw) ** 2 + (dvv[:, 0] * th) ** 2
+        vy2 = (duv[:, 1] * tw) ** 2 + (dvv[:, 1] * th) ** 2
+        lx = np.sqrt(vx2)
+        ly = np.sqrt(vy2)
+        major_x = lx >= ly
+        major = np.where(major_x, lx, ly)
+        minor = np.maximum(np.where(major_x, ly, lx), 1e-6)
+        ratio = np.clip(major / minor, 1.0, float(max(max_aniso, 1)))
+        lod = (np.log2(np.maximum(major / ratio, 1e-6)) + bias) \
+            .astype(np.float32)
+        ax_u = np.where(major_x, duv[:, 0], duv[:, 1]).astype(np.float32)
+        ax_v = np.where(major_x, dvv[:, 0], dvv[:, 1]).astype(np.float32)
+        n_taps = max(int(max_aniso), 1)
+        acc = np.zeros((u.shape[0], 4), np.float32)
+        for k in range(n_taps):
+            t = np.float32((k + 0.5) / n_taps - 0.5)
+            acc += self._sample_trilinear(u + ax_u * t, v + ax_v * t,
+                                          lod, wrap)
+        return (acc / np.float32(n_taps)).astype(np.float32)
 
     def _sample_trilinear(self, u, v, lod, wrap):
         mips = self.build_mips()

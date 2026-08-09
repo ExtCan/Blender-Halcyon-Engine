@@ -32,6 +32,33 @@ WIN20 = np.array([
     (0, 0, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255),
 ], dtype=np.float32) / 255.0
 
+#: the DMG Game Boy's four shades, darkest first -- the conventional RGB
+#: readings of the original green-tinted LCD
+GAMEBOY4 = np.array([
+    (15, 56, 15), (48, 98, 48), (139, 172, 15), (155, 188, 15),
+], dtype=np.float32) / 255.0
+
+#: the Commodore 64's 16 colours -- the community-standard "Pepto"
+#: measurements of the VIC-II's output, rounded to bytes
+C64_16 = np.array([
+    (0, 0, 0), (255, 255, 255), (104, 55, 43), (112, 164, 178),
+    (111, 61, 134), (88, 141, 67), (53, 40, 121), (184, 199, 111),
+    (111, 79, 37), (67, 57, 0), (154, 103, 89), (68, 68, 68),
+    (108, 108, 108), (154, 210, 132), (108, 94, 181), (149, 149, 149),
+], dtype=np.float32) / 255.0
+
+#: the Hardware Palette NODE's shelf: small fixed sets a shader can carry
+#: as constants on either device. RGB332 is not here -- it is pure
+#: per-channel arithmetic, no table (see nodeeval.n_halcyon_palette).
+NODE_PALETTES = {
+    'EGA': EGA16,
+    'C64': C64_16,
+    'CGA': CGA4,
+    'GAMEBOY': GAMEBOY4,
+    'GRAY4': np.stack([np.linspace(0.0, 1.0, 4, dtype=np.float32)] * 3, 1),
+    'GRAY16': np.stack([np.linspace(0.0, 1.0, 16, dtype=np.float32)] * 3, 1),
+}
+
 
 def web216():
     lv = np.array([0, 51, 102, 153, 204, 255], np.float32) / 255.0

@@ -4,8 +4,9 @@ import bpy
 from bpy.props import BoolProperty, EnumProperty, StringProperty
 from bpy.types import Operator, Panel
 
-from .core.settings import RESOLUTION_PRESETS
-from .presets.library import PRESETS, apply_preset
+from .core.settings import (RESOLUTION_GROUPS, RESOLUTION_PRESETS,
+                            resolution_label)
+from .presets.library import DEVICE_KEYS, PRESETS, apply_preset
 
 ENGINE = 'HALCYON_RENDER'
 
@@ -66,6 +67,8 @@ class HALCYON_OT_apply_preset(Operator):
                     pass
 
         for name, value in entry['settings'].items():
+            if name in DEVICE_KEYS:
+                continue                # a look never chooses the device
             if not hasattr(hs, name):
                 continue
             try:
@@ -96,7 +99,7 @@ class HALCYON_OT_set_resolution(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     key: EnumProperty(items=lambda self, ctx: [
-        (k, k.replace('_', ' ').title(), f"{v[0]}x{v[1]}")
+        (k, resolution_label(k), f"{v[0]}x{v[1]}")
         for k, v in RESOLUTION_PRESETS.items()])
 
     def execute(self, context):
@@ -243,15 +246,36 @@ class HALCYON_PT_presets(HalcyonPanel, Panel):
         draw_disclaimer(layout)
 
 
+def _resolution_group_menu(index, label, keys):
+    """One submenu per category -- Blender menus take no arguments, so each
+    category gets its own generated class."""
+
+    def draw(self, context):
+        for k in keys:
+            v = RESOLUTION_PRESETS[k]
+            aspect = "" if v[2] == v[3] else "  wide px" if v[2] > v[3] else "  tall px"
+            self.layout.operator(
+                'halcyon.set_resolution',
+                text=f"{resolution_label(k)}  ({v[0]}x{v[1]}){aspect}").key = k
+
+    return type(f'HALCYON_MT_res_group_{index}', (bpy.types.Menu,), {
+        'bl_idname': f'HALCYON_MT_res_group_{index}',
+        'bl_label': label,
+        'draw': draw,
+    })
+
+
+RESOLUTION_MENUS = tuple(_resolution_group_menu(i, label, keys)
+                         for i, (label, keys) in enumerate(RESOLUTION_GROUPS))
+
+
 class HALCYON_MT_resolutions(bpy.types.Menu):
     bl_idname = 'HALCYON_MT_resolutions'
     bl_label = "Period Resolutions"
 
     def draw(self, context):
-        for k, v in RESOLUTION_PRESETS.items():
-            self.layout.operator('halcyon.set_resolution',
-                                 text=f"{k.replace('_', ' ').title()}  "
-                                      f"({v[0]}x{v[1]})").key = k
+        for menu in RESOLUTION_MENUS:
+            self.layout.menu(menu.bl_idname)
 
 
 class HALCYON_PT_sampling(HalcyonPanel, Panel):
@@ -267,8 +291,17 @@ class HALCYON_PT_sampling(HalcyonPanel, Panel):
         sub = col.column()
         sub.active = hs.aa_mode != 'NONE'
         sub.prop(hs, 'aa_samples')
-        sub.prop(hs, 'aa_filter')
-        sub.prop(hs, 'aa_filter_width')
+        if hs.aa_mode == 'EDGE':
+            sub.prop(hs, 'aa_edge_threshold')
+        else:
+            sub.prop(hs, 'aa_filter')
+            sub.prop(hs, 'aa_filter_width')
+        col.separator()
+        col.prop(hs, 'motion_blur')
+        sub = col.column()
+        sub.active = hs.motion_blur
+        sub.prop(hs, 'motion_shutter')
+        sub.prop(hs, 'motion_steps')
         col.separator()
         col.prop(hs, 'seed')
 
@@ -403,6 +436,31 @@ class HALCYON_PT_ao(HalcyonPanel, Panel):
         col.prop(hs, 'ao_intensity')
 
 
+class HALCYON_PT_radiosity(HalcyonPanel, Panel):
+    bl_label = "Radiosity"
+    bl_parent_id = 'HALCYON_PT_lighting'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw_header(self, context):
+        self.layout.prop(context.scene.halcyon, 'radiosity', text="")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        hs = context.scene.halcyon
+        col = layout.column()
+        col.active = hs.radiosity
+        col.label(text="One bounce of colour bleed, the 1996 way",
+                  icon='INFO')
+        col.prop(hs, 'radiosity_samples')
+        col.prop(hs, 'radiosity_distance')
+        col.prop(hs, 'radiosity_intensity')
+        col.prop(hs, 'radiosity_spacing')
+        if hs.radiosity and hs.ambient_occlusion:
+            col.label(text="Supersedes Ambient Occlusion while on",
+                      icon='INFO')
+
+
 class HALCYON_PT_raytrace(HalcyonPanel, Panel):
     bl_label = "Ray Tracing"
     bl_context = "render"
@@ -422,6 +480,13 @@ class HALCYON_PT_raytrace(HalcyonPanel, Panel):
         col.prop(hs, 'ray_refraction')
         col.prop(hs, 'ray_shadows')
         col.prop(hs, 'ray_bias')
+        col.separator()
+        sub = col.column()
+        sub.active = hs.raytrace and hs.ray_reflection
+        sub.prop(hs, 'reflection_blur')
+        sub2 = sub.column()
+        sub2.active = hs.reflection_blur > 0.0
+        sub2.prop(hs, 'reflection_blur_samples')
         col.separator()
         col.prop(hs, 'env_reflection')
 
@@ -488,6 +553,12 @@ class HALCYON_PT_fog(HalcyonPanel, Panel):
         else:
             col.prop(hs, 'fog_density')
         col.prop(hs, 'fog_vertex')
+        col.separator()
+        col.prop(hs, 'fog_height')
+        sub = col.column()
+        sub.active = hs.fog_height
+        sub.prop(hs, 'fog_height_top')
+        sub.prop(hs, 'fog_height_falloff')
 
 
 class HALCYON_PT_effects(HalcyonPanel, Panel):
@@ -614,6 +685,18 @@ class HALCYON_PT_display(HalcyonPanel, Panel):
         col.prop(hs, 'pixel_grid')
         col.separator()
         col.prop(hs, 'film_transparent')
+        col.separator()
+        col.prop(hs, 'watermark')
+        if hs.watermark:
+            note = col.column(align=True)
+            note.active = False
+            note.scale_y = 0.8
+            note.label(text="%F frame  %R resolution  %V version",
+                       icon='INFO')
+            note.label(text="%D date  %T time  %S render time  "
+                            "%B Blender")
+            note.label(text="Ink: &%r &%g &%b &%y &%c &%m  "
+                            "(&%w white again)")
 
 
 class HALCYON_PT_crt(HalcyonPanel, Panel):
@@ -998,7 +1081,7 @@ def material_state(mat):
     hs = getattr(mat, 'halcyon', None)
     if hs is not None and hs.use_override:
         return hs.model, True
-    if mat.use_nodes and mat.node_tree:
+    if _uses_nodes(mat) and mat.node_tree:
         for node in mat.node_tree.nodes:
             if node.bl_idname == 'HALCYON_ShaderNode':
                 return node.model, True
@@ -1133,6 +1216,7 @@ class HALCYON_PT_debug(HalcyonPanel, Panel):
         col.use_property_split = True
         col.prop(hs, 'debug_pass')
         col.prop(hs, 'show_stats')
+        col.prop(hs, 'viewport_gpu')
         if hs.show_stats:
             note = col.row()
             note.active = False
@@ -1261,7 +1345,7 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
             return
         hs = mat.halcyon
 
-        has_master = bool(mat.use_nodes and mat.node_tree and any(
+        has_master = bool(_uses_nodes(mat) and mat.node_tree and any(
             n.bl_idname == 'HALCYON_ShaderNode' for n in mat.node_tree.nodes))
         box = layout.box()
         row = box.row()
@@ -1357,6 +1441,14 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
         sub.prop(hs, 'shadow_samples')
         sub.prop(hs, 'shadow_density')
         sub.prop(hs, 'shadow_color')
+        if light.type in ('SPOT', 'SUN'):
+            col.separator()
+            col.template_ID(hs, 'cookie', open='image.open')
+            sub = col.column()
+            sub.active = hs.cookie is not None
+            sub.prop(hs, 'cookie_strength')
+            if light.type == 'SUN':
+                sub.prop(hs, 'cookie_scale')
         col.separator()
         row = col.row(align=True)
         row.prop(hs, 'diffuse_only')
@@ -1954,6 +2046,22 @@ class HALCYON_PT_world_clouds(HalcyonPanel, Panel):
         col.prop(hs, 'cloud_shadow')
 
 
+def _uses_nodes(mat):
+    """Material.use_nodes without the 6.0 deprecation warning per redraw.
+
+    The attribute is going away because it will always be true; until it
+    does, honour it where it exists -- silently, because UI draw code runs
+    every redraw and the warning flooded the console once per panel.
+    """
+    import warnings
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', DeprecationWarning)
+            return bool(getattr(mat, 'use_nodes', True))
+    except Exception:                                           # noqa: BLE001
+        return True
+
+
 def _cpu_count():
     import os
     try:
@@ -1977,7 +2085,9 @@ def _wrap(text, width):
 
 
 CLASSES = (
-    HALCYON_OT_apply_preset, HALCYON_OT_set_resolution, HALCYON_MT_resolutions,
+    HALCYON_OT_apply_preset, HALCYON_OT_set_resolution,
+) + RESOLUTION_MENUS + (
+    HALCYON_MT_resolutions,
     HALCYON_OT_fix_view_transform,
     HALCYON_OT_sky_preset, HALCYON_OT_sky_save, HALCYON_OT_sky_load,
     HALCYON_OT_water_preset, HALCYON_OT_water_save, HALCYON_OT_water_load,
@@ -1985,7 +2095,7 @@ CLASSES = (
     HalcyonPreferences,
     HALCYON_PT_presets, HALCYON_PT_sampling, HALCYON_PT_geometry,
     HALCYON_PT_shading, HALCYON_PT_lighting, HALCYON_PT_spot_cones,
-    HALCYON_PT_shadows, HALCYON_PT_ao,
+    HALCYON_PT_shadows, HALCYON_PT_ao, HALCYON_PT_radiosity,
     HALCYON_PT_raytrace, HALCYON_PT_textures, HALCYON_PT_transparency,
     HALCYON_PT_fog, HALCYON_PT_effects, HALCYON_PT_colour, HALCYON_PT_display,
     HALCYON_PT_crt, HALCYON_PT_composite, HALCYON_PT_jpeg,

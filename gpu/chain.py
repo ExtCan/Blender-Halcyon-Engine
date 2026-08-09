@@ -19,6 +19,10 @@ def _warn(msg):
 
 
 def available(settings):
+    # defense in depth: the caller's gate checks the device too, but a
+    # second door that cannot open on the CPU device costs nothing
+    if str(getattr(settings, 'render_device', 'CPU')).upper() != 'GPU':
+        return False, 'the render device is CPU'
     if not getattr(settings, 'gpu_post', False):
         return False, 'GPU post processing is off'
     ok, why = device.probe()

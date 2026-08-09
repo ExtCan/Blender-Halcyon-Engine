@@ -744,6 +744,75 @@ PRESETS = {
             'max_lights': 8, 'transparency': 'SORTED', 'gamma': 2.2,
         },
     },
+    'PS2': {
+        'label': "PlayStation 2",
+        'category': 'CONSOLE',
+        'note': "640x448 field-rendered with the GS's famous ordered dither, "
+                "bilinear mipmaps that pop, edge antialias (the flicker "
+                "filter), accumulation trails available, and bloom bleeding "
+                "off the brights. The machine that made 'PS2 haze' a look.",
+        'settings': {
+            'resolution_x': 640, 'resolution_y': 448,
+            'aa_mode': 'EDGE', 'aa_edge_threshold': 0.08,
+            'default_model': 'PHONG', 'shading_rate': 'PIXEL',
+            'tex_filter': 'BILINEAR', 'tex_mipmap': True, 'tex_mip_bias': 0.5,
+            'tex_max_size': 256, 'tex_perspective': True,
+            'color_depth': '16', 'dither': 'BAYER4', 'dither_strength': 0.8,
+            'interlace': 'FIELDS',
+            'glow': True, 'glow_threshold': 0.8, 'glow_radius': 10.0,
+            'glow_intensity': 0.5, 'glow_quality': 'BOX',
+            'fog': True, 'fog_mode': 'LINEAR', 'fog_start': 18.0,
+            'fog_end': 90.0, 'fog_color': (0.45, 0.5, 0.58),
+            'shadows': True, 'shadow_default': 'MAP', 'shadow_map_size': 512,
+            'max_lights': 8, 'transparency': 'SORTED', 'gamma': 2.2,
+        },
+    },
+    'GAMECUBE': {
+        'label': "Nintendo GameCube",
+        'category': 'CONSOLE',
+        'note': "640x480 with clean trilinear mipmaps, per-pixel table fog "
+                "with a height layer (the Flipper's fog unit), soft shadow "
+                "maps and a gentle deflicker. The tidy one of the three.",
+        'settings': {
+            'resolution_x': 640, 'resolution_y': 480,
+            'aa_mode': 'EDGE', 'aa_edge_threshold': 0.1,
+            'default_model': 'PHONG', 'shading_rate': 'PIXEL',
+            'tex_filter': 'TRILINEAR', 'tex_mipmap': True, 'tex_aniso': 2,
+            'tex_max_size': 512, 'tex_perspective': True,
+            'color_depth': '24', 'dither': 'NONE',
+            'fog': True, 'fog_mode': 'TABLE16', 'fog_start': 12.0,
+            'fog_end': 80.0, 'fog_color': (0.5, 0.55, 0.62),
+            'fog_height': True, 'fog_height_top': 3.0,
+            'fog_height_falloff': 0.4,
+            'shadows': True, 'shadow_default': 'MAP',
+            'shadow_map_size': 1024, 'shadow_softness': 2.0,
+            'shadow_samples': 8,
+            'max_lights': 8, 'transparency': 'SORTED', 'gamma': 2.2,
+        },
+    },
+    'XBOX': {
+        'label': "Microsoft Xbox",
+        'category': 'CONSOLE',
+        'note': "640x480 with trilinear plus anisotropy, per-pixel specular "
+                "everywhere, big soft shadow maps, projected light textures "
+                "on the spots (set an image on a lamp) and a hot bloom. The "
+                "pixel-shader flex of the generation.",
+        'settings': {
+            'resolution_x': 640, 'resolution_y': 480,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4, 'aa_filter': 'BOX',
+            'default_model': 'BLINN', 'shading_rate': 'PIXEL',
+            'tex_filter': 'TRILINEAR', 'tex_mipmap': True, 'tex_aniso': 4,
+            'tex_max_size': 1024, 'tex_perspective': True,
+            'color_depth': '24', 'dither': 'NONE',
+            'glow': True, 'glow_threshold': 0.9, 'glow_radius': 14.0,
+            'glow_intensity': 0.6, 'glow_quality': 'GAUSS',
+            'specular_in_gamma': True, 'clamp_specular': False,
+            'shadows': True, 'shadow_default': 'MAP',
+            'shadow_map_size': 1024, 'shadow_softness': 1.5,
+            'shadow_samples': 8,
+            'max_lights': 8, 'transparency': 'SORTED', 'gamma': 2.2,
+        },
+    },
     'THREEDO': {
         'label': "3DO Interactive",
         'category': 'CONSOLE',
@@ -1085,13 +1154,25 @@ PRESETS = {
 }
 
 
+# The device family: where the frame computes is a property of the person's
+# machine, never of a look. A preset describes what a 1996 renderer drew, and
+# that picture is identical on either device -- so selecting one must not
+# flip the CPU/GPU switch or any of its Debug toggles. Kept as its own set
+# because apply_preset also refuses these keys from preset dicts by name:
+# preserving them from the reset is not enough if a future preset entry
+# were to list one.
+DEVICE_KEYS = frozenset({
+    'render_device', 'gpu_post', 'gpu_shading', 'gpu_raster',
+    'gpu_hold_context', 'gpu_scissor', 'layer_gpu_min_frac',
+})
+
 # Machine and pipeline settings, which describe the computer or the output
 # plumbing rather than the look. A preset has no business resetting these.
 PRESERVED = frozenset({
     'threads', 'tile_size', 'bucket_order', 'preview_scale', 'progressive',
     'show_stats', 'debug_pass', 'seed', 'jitter_seed', 'max_texture_memory',
     'film_transparent', 'use_processes', 'process_count',
-})
+}) | DEVICE_KEYS
 
 
 def reset_settings(settings, preserve=PRESERVED):
@@ -1121,6 +1202,8 @@ def apply_preset(settings, key, reset=True, preserve=PRESERVED):
     if reset:
         reset_settings(settings, preserve)
     for k, v in p['settings'].items():
+        if k in DEVICE_KEYS:
+            continue                    # a look never chooses the device
         if hasattr(settings, k):
             setattr(settings, k, v)
     return settings

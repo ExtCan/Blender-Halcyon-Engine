@@ -10,6 +10,14 @@ from .core import post
 from .core import render as core_render
 from .core import stats as ST
 
+#: the slate's render-event clock: bumped once per final render, for the
+#: session's lifetime. The rainbow escape scrolls on frame + THIS, so a
+#: still re-rendered on one timeline frame moves too -- the field ran
+#: that exact test twice and watched a timeline-only rainbow stand
+#: still. It feeds ONLY the burn-in (via stamp_info); the picture's
+#: determinism contract never sees it, exactly like %T's wall clock.
+_RENDER_SERIAL = {'n': 0}
+
 
 class HalcyonRenderEngine(bpy.types.RenderEngine):
     bl_idname = 'HALCYON_RENDER'
@@ -77,10 +85,15 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             background
         type(self).bl_use_gpu_context = hold
         from .gpu import marshal as _marshal
-        marshalled = (not granted
-                      and str(getattr(settings, 'render_device',
-                                      'CPU')).upper() == 'GPU'
-                      and not background)
+        gpu_dev = str(getattr(settings, 'render_device',
+                              'CPU')).upper() == 'GPU'
+        marshalled = not granted and gpu_dev and not background
+        # one render on the driver at a time: a GPU viewport frame
+        # mid-flight finishes first (they are sub-second), then this
+        # render owns the pipeline for its duration -- viewport frames
+        # that arrive meanwhile render on the CPU and say so
+        if gpu_dev:
+            _marshal.PIPELINE.acquire()
         if marshalled:
             _marshal.enable()
         try:
@@ -89,6 +102,8 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
         finally:
             if marshalled:
                 _marshal.disable()
+            if gpu_dev:
+                _marshal.PIPELINE.release()
 
     def _render_body(self, depsgraph, bscene, tw, th, preview, settings,
                      warnings):
@@ -142,10 +157,35 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             self.update_stats("Halcyon", msg)
 
         image = None
+        mb_steps = int(getattr(settings, 'motion_steps', 0) or 0)
+        if getattr(settings, 'motion_blur', False) and mb_steps > 1 \
+                and not preview:
+            # accumulation motion blur: the whole frame, re-exported and
+            # re-rendered at N points across the shutter, averaged -- the
+            # accumulation-buffer trails of the era, at the era's honest
+            # price of N frames. Runs in-process (each step is its own
+            # complete render; a pool inside a pass would nest pools).
+            print(f"[Halcyon] motion blur: {mb_steps} steps across a "
+                  f"{float(settings.motion_shutter):.2f}-frame shutter "
+                  f"({mb_steps} full renders, averaged)")
+            try:
+                image, scene = self._render_motion_accumulated(
+                    depsgraph, bscene, settings, warnings, on_progress)
+            except _Cancelled:
+                return
+            except Exception as exc:                            # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                if not preview:
+                    self.report({'ERROR'},
+                                f"Halcyon motion blur failed: {exc}")
+                return
         gpu_whole_frame = str(getattr(settings, 'render_device',
                                       'CPU')).upper() == 'GPU' and \
             bool(getattr(settings, 'gpu_shading', False))
-        if settings.use_processes and not preview and \
+        if image is not None:
+            pass                       # motion blur already rendered above
+        elif settings.use_processes and not preview and \
                 core_render.wanted_passes(settings):
             print("[Halcyon] extra render passes are on, so this frame renders "
                   "in-process: the worker pool sends back pixels, not buffers")
@@ -190,13 +230,27 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
 
         self.update_stats("Halcyon", "Post processing")
         try:
+            # what the burn-in tokens cannot learn from the core: the
+            # render clock so far and the host version. %S therefore
+            # reads "everything up to post", which is what a slate
+            # written DURING the frame can honestly say.
+            try:
+                import bpy as _bpy
+                _host = str(_bpy.app.version_string)
+            except Exception:                                   # noqa: BLE001
+                _host = '?'
+            _RENDER_SERIAL['n'] += 1
+            stamp_info = {'render_time': time.time() - export_started,
+                          'blender': _host,
+                          'scroll': _RENDER_SERIAL['n']}
             with ST.track('post processing'):
                 final = post.process(image, settings, frame=scene.frame,
                                      seed=settings.seed, target_size=(tw, th),
                                      allow_resize=False,
                                      depth=getattr(scene, 'last_depth', None),
                                      shaft_sources=getattr(scene, 'last_shafts',
-                                                           None))
+                                                           None),
+                                     stamp_info=stamp_info)
         except Exception as exc:                                # noqa: BLE001
             import traceback
             traceback.print_exc()
@@ -228,6 +282,48 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             print(f"[Halcyon] {elapsed:.1f}s -- top stages: {line}{tail}")
         self.update_stats("Halcyon", f"Done in {elapsed:.1f}s")
         self.update_progress(1.0)
+
+    def _render_motion_accumulated(self, depsgraph, bscene, settings,
+                                   warnings, on_progress):
+        """N complete frames across the shutter, averaged.
+
+        Each step moves Blender to a subframe with the official
+        RenderEngine.frame_set, re-exports the evaluated scene (so object,
+        camera and deformation motion all blur -- whatever animates,
+        blurs), renders it fully, and the mean is the frame. Returns
+        (image, center_scene): the center step's scene carries the depth
+        and shaft data the post chain reads, so depth of field focuses on
+        the middle of the shutter.
+        """
+        frame0 = int(bscene.frame_current)
+        n = max(int(settings.motion_steps), 2)
+        shutter = max(float(settings.motion_shutter), 0.0)
+        offs = np.linspace(-shutter * 0.5, shutter * 0.5, n)
+        center_k = int(np.argmin(np.abs(offs)))
+        acc = None
+        center_scene = None
+        try:
+            for k, off in enumerate(offs):
+                base = int(np.floor(frame0 + off))
+                sub = float(frame0 + off - base)
+                self.frame_set(base, sub)
+                scene_k = export.export_scene(depsgraph, settings, warnings)
+                img = core_render.render(
+                    scene_k, settings,
+                    progress=on_progress if k == center_k else None)
+                acc = img.astype(np.float64) if acc is None else acc + img
+                if k == center_k:
+                    center_scene = scene_k
+                self.update_stats("Halcyon",
+                                  f"Motion blur step {k + 1}/{n}")
+                if self.test_break():
+                    raise _Cancelled()
+        finally:
+            try:
+                self.frame_set(frame0, 0.0)
+            except Exception:                                   # noqa: BLE001
+                pass
+        return (acc / float(n)).astype(np.float32), center_scene
 
     # ------------------------------------------------------------------ passes
     def update_render_passes(self, scene=None, renderlayer=None):
@@ -359,6 +455,20 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
     def view_draw(self, context, depsgraph):
         import gpu
 
+        # view_draw does NOTHING with the marshal queue. Bursts cross to
+        # the main thread only in the pump's timer slices BETWEEN redraws
+        # -- 1.25.89-.91 drained them here, mid-draw, and every redraw
+        # that ran bursts mutated live driver state under Blender's
+        # compositor: the whole scene flashed rapidly whenever bursts
+        # streamed (camera motion AND refines). A time budget and a
+        # viewport-rect fence each failed to tame it; the field called
+        # it a seizure risk and the architecture was reverted. This
+        # callback only blits the newest parked frame. The one thing it
+        # does start is the persistent redraw-flag poll -- registered
+        # HERE because view_draw is guaranteed main-thread.
+        from . import preview as _preview
+        _preview.ensure_redraw_timer()
+
         vp = self._viewport()
         region = context.region
         w, h = max(int(region.width), 4), max(int(region.height), 4)
@@ -470,28 +580,16 @@ def _settings_from_scene(bscene, target_w, target_h, preview=False):
 def _viewport_settings(bscene, w, h):
     """Render settings for an interactive preview of the region.
 
-    The look stays the F12 look -- dither, CRT, the whole post chain are the
-    point of this engine -- but everything about WHERE the work runs is
-    pinned to the one shape that is safe from a viewport worker thread: the
-    CPU. The GPU stages need a GPU context, worker threads have none, and
-    the old path running them inside the draw callback is the prime suspect
-    for the viewport rendering nothing at all under Vulkan.
+    The bpy half (reading the scene) lives here; the shaping (what a
+    per-redraw render keeps and what it strips) lives in preview.py where
+    the test suite can hold it. Since 1.25.83 the device rides through:
+    the CPU/GPU switch governs the viewport exactly as it governs F12 --
+    the worker thread borrows the same marshal the F12 render thread uses,
+    so this path no longer pins render_device to the CPU.
     """
-    settings = _settings_from_scene(bscene, max(w, 4), max(h, 4))
-    scale = max(int(settings.preview_scale), 1)
-    settings.resolution_x = max(w // scale, 4)
-    settings.resolution_y = max(h // scale, 4)
-    settings.aa_mode = 'NONE'
-    settings.aa_samples = 1
-    settings.output_scale = 'NONE'
-    settings.pixel_aspect_x = settings.pixel_aspect_y = 1.0
-    settings.render_device = 'CPU'
-    settings.gpu_shading = settings.gpu_post = False
-    settings.gpu_raster = False
-    settings.use_processes = False
-    settings.show_stats = False
-    settings.progressive = False
-    return settings
+    from .preview import shape_settings
+    return shape_settings(
+        _settings_from_scene(bscene, max(w, 4), max(h, 4)), w, h)
 
 
 def _view_camera(context):

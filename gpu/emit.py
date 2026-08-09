@@ -40,6 +40,12 @@ class Emitter:
         self.programs = None       # material's compiled programs, or None
         self.frame_mode = False    # True only under assemble_frame
         self.secondary = False     # True for reflection-hit passes
+        self.camera = None         # camera TYPE ('PERSP'/'ORTHO'), stamped
+        #                            by the assemblers; None refuses the
+        #                            perspective-only answers rather than
+        #                            guessing them right
+
+        self.uv_names = ()         # the mesh's named UV maps, layer order
         self.used_screen = False   # a code node read vScreenUV/iResolution
         self.bump_passes = []      # Bump nodes needing a height pre-pass
         self._n = 0
@@ -86,9 +92,14 @@ class Emitter:
         return 'vec4({:.8g}, {:.8g}, {:.8g}, {:.8g})'.format(*seq[:4])
 
     def input(self, node, name, gtype):
-        """The GLSL expression for one input socket, linked or defaulted."""
+        """The GLSL expression for one input socket, linked or defaulted.
+
+        Matches the display name or the IDENTIFIER, exactly as the
+        evaluator's ev.input does -- the Mix node's three data types
+        share display names ('A' three times over) and only the
+        identifier ('A_Color') is unambiguous."""
         for sock in node.get('inputs', ()):
-            if sock.get('name') != name:
+            if sock.get('name') != name and sock.get('identifier') != name:
                 continue
             link = sock.get('link')
             if link:
@@ -242,19 +253,12 @@ def e_mapping(em, node, _i):
     return v, VEC3
 
 
-def e_mix_rgb(em, node, _i):
-    op = str(prop(node, 'blend_type', 'MIX')).upper()
-    fac = em.input(node, 'Fac', FLOAT)
-    a = em.input(node, 'Color1', VEC4)
-    b = em.input(node, 'Color2', VEC4)
-    f, _t = em.tmp(FLOAT, f'clamp({fac}, 0.0, 1.0)')
-    av, _t = em.tmp(VEC4, a)
-    bv, _t = em.tmp(VEC4, b)
-    # alpha is taken from the first colour, never blended -- mixing it too
-    # is invisible on an opaque scene and wrong the moment one is not
-    ac = f'{av}.rgb'
-    bc = f'{bv}.rgb'
-    table = {
+def _mix_expr_table(ac, bc, f):
+    """The MixRGB blend modes as GLSL, mirroring _mix_blend exactly.
+
+    Shared by the legacy MixRGB node and the modern Mix node's RGBA
+    mode -- one table, one parity surface."""
+    return {
         'MIX': f'{ac} + ({bc} - {ac}) * {f}',
         'ADD': f'{ac} + {bc} * {f}',
         'MULTIPLY': f'{ac} * (vec3(1.0) - vec3({f}) + vec3({f}) * {bc})',
@@ -265,12 +269,71 @@ def e_mix_rgb(em, node, _i):
         'DIVIDE': f'{ac} * (1.0 - {f}) + {f} * {ac} / max({bc}, vec3(1e-6))',
         'LIGHTEN': f'{ac} + (max({ac}, {bc}) - {ac}) * {f}',
         'DARKEN': f'{ac} + (min({ac}, {bc}) - {ac}) * {f}',
+        # per-component select, exactly np.where(ac < 0.5, lo, hi):
+        # step(0.5, ac) is 1 at ac >= 0.5, so mix(lo, hi, sel) lands the
+        # same side of the boundary the CPU does, 0.5 included
+        'OVERLAY': f'{ac} + (mix(2.0 * {ac} * {bc}, '
+                   f'vec3(1.0) - 2.0 * (vec3(1.0) - {ac}) '
+                   f'* (vec3(1.0) - {bc}), '
+                   f'step(vec3(0.5), {ac})) - {ac}) * {f}',
     }
-    expr = table.get(op)
+
+
+def e_mix_rgb(em, node, _i):
+    op = str(prop(node, 'blend_type', 'MIX')).upper()
+    fac = em.input(node, 'Fac', FLOAT)
+    a = em.input(node, 'Color1', VEC4)
+    b = em.input(node, 'Color2', VEC4)
+    f, _t = em.tmp(FLOAT, f'clamp({fac}, 0.0, 1.0)')
+    av, _t = em.tmp(VEC4, a)
+    bv, _t = em.tmp(VEC4, b)
+    # alpha is taken from the first colour, never blended -- mixing it too
+    # is invisible on an opaque scene and wrong the moment one is not
+    expr = _mix_expr_table(f'{av}.rgb', f'{bv}.rgb', f).get(op)
     if expr is None:
         raise Unsupported(f'MixRGB {op}')
     rgb, _t = em.tmp(VEC3, expr)
     if prop(node, 'use_clamp', False):
+        rgb, _t = em.tmp(VEC3, f'clamp({rgb}, 0.0, 1.0)')
+    return em.tmp(VEC4, f'vec4({rgb}, {av}.a)')
+
+
+def e_mix(em, node, _i):
+    """The modern Mix node: FLOAT and VECTOR lerp, RGBA blends.
+
+    Socket resolution goes by IDENTIFIER ('A_Color') through the same
+    helper the evaluator uses -- the node's three data types share
+    display names, and plain 'A' silently reads the FLOAT socket.
+    """
+    from ..core.nodeeval import mix_socket
+    dtype = str(prop(node, 'data_type', 'RGBA')).upper()
+    op = str(prop(node, 'blend_type', 'MIX')).upper()
+    fac = em.input(node, mix_socket(node, 'Factor', 'FLOAT'), FLOAT)
+    if prop(node, 'clamp_factor', True):
+        f, _t = em.tmp(FLOAT, f'clamp({fac}, 0.0, 1.0)')
+    else:
+        f, _t = em.tmp(FLOAT, fac)
+    if dtype == 'FLOAT':
+        a = em.input(node, mix_socket(node, 'A', dtype), FLOAT)
+        b = em.input(node, mix_socket(node, 'B', dtype), FLOAT)
+        av, _t = em.tmp(FLOAT, a)
+        bv, _t = em.tmp(FLOAT, b)
+        return em.tmp(FLOAT, f'({av} + ({bv} - {av}) * {f})')
+    if dtype == 'VECTOR':
+        a = em.input(node, mix_socket(node, 'A', dtype), VEC3)
+        b = em.input(node, mix_socket(node, 'B', dtype), VEC3)
+        av, _t = em.tmp(VEC3, a)
+        bv, _t = em.tmp(VEC3, b)
+        return em.tmp(VEC3, f'({av} + ({bv} - {av}) * {f})')
+    a = em.input(node, mix_socket(node, 'A', dtype), VEC4)
+    b = em.input(node, mix_socket(node, 'B', dtype), VEC4)
+    av, _t = em.tmp(VEC4, a)
+    bv, _t = em.tmp(VEC4, b)
+    expr = _mix_expr_table(f'{av}.rgb', f'{bv}.rgb', f).get(op)
+    if expr is None:
+        raise Unsupported(f'Mix {op}')
+    rgb, _t = em.tmp(VEC3, expr)
+    if prop(node, 'clamp_result', False):
         rgb, _t = em.tmp(VEC3, f'clamp({rgb}, 0.0, 1.0)')
     return em.tmp(VEC4, f'vec4({rgb}, {av}.a)')
 
@@ -490,11 +553,19 @@ def e_tex_image(em, node, index):
     # on a unit cube and completely different on anything else
     v = tex_vector(em, node, 'uv')
     name = f'hal_tex{len(em.samplers)}'
+    vec_linked = any(s.get('name') == 'Vector' and s.get('link')
+                     for s in node.get('inputs', ()))
     em.samplers.append({
         'uniform': name,
         'image': prop(node, 'image'),
         'interpolation': prop(node, 'interpolation', 'Linear'),
         'extension': prop(node, 'extension', 'REPEAT'),
+        # the mip footprint applies exactly where the CPU applies it: a
+        # RAW flat-projection UV lookup. A linked Vector chain (or a
+        # sphere/tube/box projection) resamples through a transform the
+        # chain rule was never applied to, and keeps the top level
+        'footprint': (not vec_linked
+                      and str(prop(node, 'projection', 'FLAT')) == 'FLAT'),
     })
     uv, _t = em.tmp(VEC3, v)
     texel, _t = em.tmp(VEC4, f'texture({name}, {uv}.xy)')
@@ -547,22 +618,120 @@ def e_hue_sat(em, node, _i):
 
 
 def e_tex_coord(em, node, index):
-    # 0 Generated, 1 Normal, 2 UV, 3 Object, 4 Camera, 5 Window, 6 Reflection
+    # 0 Generated, 1 Normal, 2 UV, 3 Object, 4 Camera, 5 Window,
+    # 6 Reflection -- each the CPU's own n_tex_coord answer:
+    #   Object: the evaluator has no per-object inverse matrices, so it
+    #           answers world P -- hal_P matches it exactly.
+    #   Camera: c.P - camera_pos, NOT hal_P (the old emitter's silent
+    #           wrong answer).
+    #   Window: (px+0.5)/size -- the fullscreen pass's own vUV is that
+    #           very number. A HIT context has no screen pixel (px is
+    #           None -> zeros on the CPU), so secondary passes emit
+    #           zeros rather than the hit's screen position.
+    if index == 4:
+        return em.tmp(VEC3, '(hal_P - hal_eye)')
+    if index == 5:
+        if em.secondary:
+            return em.tmp(VEC3, 'vec3(0.0)')
+        return em.tmp(VEC3, 'vec3(vUV, 0.0)')
     names = ['hal_generated', 'hal_N', 'vec3(hal_uv, 0.0)', 'hal_P',
-             'hal_P', 'hal_generated', 'reflect(-hal_V, hal_N)']
+             None, None, 'reflect(-hal_V, hal_N)']
     return em.tmp(VEC3, names[min(index, len(names) - 1)])
 
 
 def e_uvmap(em, node, _i):
+    # the CPU resolves the LAYER NAME: ctx.attributes['uv:'+name],
+    # falling back to the active layer when the name is empty or
+    # unknown. Two UV sets travel (the period dual-texture budget);
+    # the second rides the attribute texture's spare half.
+    name = str(prop(node, 'uv_map', '') or '')
+    if not name or not em.uv_names:
+        return em.tmp(VEC3, 'vec3(hal_uv, 0.0)')
+    if name == em.uv_names[0]:
+        return em.tmp(VEC3, 'vec3(hal_uv, 0.0)')
+    if len(em.uv_names) > 1 and name == em.uv_names[1]:
+        return em.tmp(VEC3, 'vec3(hal_uv2, 0.0)')
+    # an unknown name falls back to the active layer on the CPU too
     return em.tmp(VEC3, 'vec3(hal_uv, 0.0)')
 
 
 def e_new_geometry(em, node, index):
-    names = ['hal_P', 'hal_N', 'hal_N', 'hal_T', 'hal_P', 'hal_generated',
-             'hal_generated']
-    if index in (6, 7, 8):
-        return em.tmp(FLOAT, '0.0')
-    return em.tmp(VEC3, names[min(index, len(names) - 1)])
+    """Blender's Geometry node, output by output against `n_geometry`.
+
+    This emitter's first life mapped outputs BY INDEX from a hand-written
+    list, and the list was wrong: Tangent emitted the NORMAL, Incoming
+    emitted the POSITION, Parametric emitted GENERATED coordinates, and
+    Backfacing emitted a constant 0.0 whatever the winding -- four silent
+    CPU/GPU divergences that survived because no test ever read those
+    outputs (the R80 lesson: matrix blindness for untested sockets).
+    Outputs resolve BY NAME now, each one either the CPU's exact
+    expression or a refusal that says why:
+
+    - Tangent: ctx.T is never filled, so the CPU always builds
+      `orthonormal_basis(ctx.N)[0]` -- emitted verbatim.
+    - True Normal: the face normal is STORED per triangle on the CPU
+      (Blender's own, through the normal matrix); the G-buffer does not
+      carry it, and recomputing from corners flips on mirrored objects.
+      Refuses by name, same reason the coded shader's `geonormal` does.
+    - Incoming: the CPU returns -normalize(I) = normalize(eye - P),
+      which IS hal_V.
+    - Parametric: the CPU returns (uv, 0).
+    - Backfacing: the rasteriser decides by projected winding; for a
+      PERSPECTIVE camera that is exactly the plane-side test against the
+      eye (the measured convention the backface override pinned).
+      Orthographic refuses by name; secondary passes emit 0.0, because
+      `trace()` shades hits with front=None and the CPU keeps zeros.
+    - Random Per Island: the CPU's per-tri random is the sin-fract hash
+      a driver decorrelates -- refuses by name like the Noise family.
+    """
+    outs = node.get('outputs') or []
+    o = outs[index] if index < len(outs) else {}
+    name = o.get('name')
+    if name == 'Position':
+        return em.tmp(VEC3, 'hal_P')
+    if name == 'Normal':
+        return em.tmp(VEC3, 'hal_N')
+    if name == 'Tangent':
+        n0, _t = em.tmp(VEC3, 'normalize(hal_N)')
+        up, _t = em.tmp(VEC3, f'(abs({n0}.z) < 0.999) '
+                              f'? vec3(0.0, 0.0, 1.0) '
+                              f': vec3(1.0, 0.0, 0.0)')
+        return em.tmp(VEC3, f'normalize(cross({up}, {n0}))')
+    if name == 'Incoming':
+        return em.tmp(VEC3, 'hal_V')
+    if name == 'Parametric':
+        return em.tmp(VEC3, 'vec3(hal_uv, 0.0)')
+    if name == 'Backfacing':
+        if em.secondary:
+            # trace() builds its context with front=None; ctx.backfacing
+            # stays zeros on every hit, and this matches it
+            return em.tmp(FLOAT, '0.0')
+        if not em.frame_mode:
+            raise Unsupported('backfacing exists only in the rasterised '
+                              'frame')
+        if str(em.camera or '').upper() != 'PERSP':
+            raise Unsupported('backfacing under an orthographic camera '
+                              'is not in the deferred pass -- the '
+                              'plane-side test is the perspective '
+                              'answer; the material shades on the CPU')
+        p0, _t = em.tmp(VEC3, 'hal_fetch_attr(f.tri, 0, 0).xyz')
+        pl, _t = em.tmp(VEC3, f'cross(hal_fetch_attr(f.tri, 1, 0).xyz '
+                              f'- {p0}, hal_fetch_attr(f.tri, 2, 0).xyz '
+                              f'- {p0})')
+        return em.tmp(FLOAT, f'(dot({pl}, hal_eye - {p0}) < 0.0) '
+                             f'? 0.0 : 1.0')
+    if name == 'Pointiness':
+        return em.tmp(FLOAT, '0.0')      # zeros on the CPU too
+    if name == 'Random Per Island':
+        raise Unsupported('the per-triangle random rides the sin-fract '
+                          'hash a driver decorrelates; the material '
+                          'shades on the CPU')
+    if name == 'True Normal':
+        raise Unsupported('the face normal is stored per triangle on the '
+                          'CPU and is not in the G-buffer; the material '
+                          'shades on the CPU')
+    raise Unsupported(f'Geometry output {name!r} is not in the deferred '
+                      'pass')
 
 
 def e_layer_weight(em, node, index):
@@ -584,6 +753,16 @@ def e_layer_weight(em, node, index):
 
 def e_bsdf_glossy(em, node, _i):
     return em.tmp(VEC4, em.input(node, 'Color', VEC4))
+
+
+def e_bsdf_metallic(em, node, _i):
+    # the frame probe harvests the surface parameters through the closure;
+    # what the emitter owes is the per-pixel colour chain, same as glossy
+    return em.tmp(VEC4, em.input(node, 'Base Color', VEC4))
+
+
+def e_bsdf_specular(em, node, _i):
+    return em.tmp(VEC4, em.input(node, 'Base Color', VEC4))
 
 
 def e_bsdf_transparent(em, node, _i):
@@ -1356,6 +1535,362 @@ def e_pat_wrinkles(em, node, index):
         f'{_pat_scalar(em, node, "Crease", 1.0)})'))
 
 
+_NOISE_KIND = {'SMOOTH': 0, 'TURBULENT': 1, 'RIDGED': 2}
+_CELL_FEATURE = {'F1': 0, 'F2': 1, 'BORDER': 2, 'CELL': 3}
+
+
+def e_pat_noise(em, node, index):
+    _need_pattern(em, 'noise')
+    p = _pat_vec(em, node)
+    return _pat_output(em, node, index, (
+        f'hal_pat_noise({p}, '
+        f'{_NOISE_KIND.get(str(prop(node, "kind", "SMOOTH")), 0)}, '
+        f'{int(prop(node, "octaves", 5))}, '
+        f'{_pat_scalar(em, node, "Lacunarity", 2.0)}, '
+        f'{_pat_scalar(em, node, "Gain", 0.5)})'))
+
+
+def e_pat_cells_tex(em, node, index):
+    _need_pattern(em, 'cells')
+    p = _pat_vec(em, node)
+    res, _t = em.tmp('vec2', (
+        f'hal_pat_cells({p}, {_pat_scalar(em, node, "Randomness", 1.0)}, '
+        f'{_CELL_FEATURE.get(str(prop(node, "feature", "F1")), 0)})'))
+    outs = node.get('outputs') or []
+    o = outs[index] if index < len(outs) else {}
+    if o.get('name') == 'Cell ID':
+        return em.tmp(FLOAT, f'{res}.y')
+    return _pat_output(em, node, index, f'{res}.x')
+
+
+def e_pat_static(em, node, index):
+    _need_pattern(em, 'static')
+    p = _pat_vec(em, node)
+    if prop(node, 'animate', True):
+        em.frame_uniforms.add('hal_frame')
+        frame = 'hal_frame'
+    else:
+        frame = '0.0'
+    return _pat_output(em, node, index,
+                       f'hal_pat_static({p}, {frame})')
+
+
+# --- the retro utilities --------------------------------------------------
+#
+# Pure arithmetic start to finish, so they travel whole: the same floor,
+# fract and roundEven the CPU runs (roundEven IS np.round -- the depth
+# quantiser proved that pairing on real drivers). The two that read the
+# camera's pixel grid (Ordered Dither, Screen Info) emit the frame pass's
+# vUV form of it and mirror the CPU's px-is-None fallback in secondary
+# passes, exactly as nodeeval does on ray hits.
+
+
+def e_halcyon_posterize(em, node, _i):
+    col, _t = em.tmp(VEC4, em.input(node, 'Color', VEC4))
+    lv, _t = em.tmp(FLOAT, f'max({em.input(node, "Levels", FLOAT)}, 1.0)')
+    q, _t = em.tmp(VEC3, f'floor(clamp({col}.rgb, 0.0, 1.0) * {lv}) '
+                         f'/ max({lv} - 1.0, 1.0)')
+    return em.tmp(VEC4, f'vec4(clamp({q}, 0.0, 1.0), {col}.a)')
+
+
+#: the Bayer matrix, as arithmetic: entry (x, y) of the 2^bits square is
+#: the base-4 number whose digit for bit i (LSB outermost) is
+#: 2*(x_i XOR y_i) + y_i -- exactly the recursive [[4m, 4m+2], [4m+3,
+#: 4m+1]] construction dither.bayer() runs, so float(v)/cells equals the
+#: CPU's threshold map bit for bit (every value is a small integer over a
+#: power of two). A test holds the equality against dither.threshold_map.
+_BAYER_GLSL = """
+float hal_bayer(int px, int py, int bits, float cells)
+{
+    uint x = uint(px);
+    uint y = uint(py);
+    uint v = 0u;
+    for (int i = 0; i < bits; i++) {
+        uint xi = (x >> uint(i)) & 1u;
+        uint yi = (y >> uint(i)) & 1u;
+        v = v * 4u + (2u * (xi ^ yi) + yi);
+    }
+    return float(v) / cells;
+}
+"""
+
+
+def e_halcyon_dither(em, node, _i):
+    kind = str(prop(node, 'pattern', 'BAYER4'))
+    sizes = {'BAYER2': (1, 2), 'BAYER4': (2, 4), 'BAYER8': (3, 8)}
+    if kind not in sizes:
+        raise Unsupported('the halftone cell is a lookup table the frame '
+                          'shader does not carry; the Bayer patterns '
+                          'travel, halftone shades on the CPU')
+    col, _t = em.tmp(VEC4, em.input(node, 'Color', VEC4))
+    lv, _t = em.tmp(FLOAT, f'max({em.input(node, "Levels", FLOAT)}, 2.0)')
+    strength, _t = em.tmp(FLOAT, em.input(node, 'Strength', FLOAT))
+    if em.frame_mode and not em.secondary and \
+            getattr(em, 'resolution', None) is not None:
+        if '__bayer' not in em.once:
+            em.once.add('__bayer')
+            em.inline.append(_BAYER_GLSL)
+        bits, n = sizes[kind]
+        w, h = float(em.resolution[0]), float(em.resolution[1])
+        pix, _t = em.tmp('ivec2', f'ivec2(int(vUV.x * {_c(w)}), '
+                                  f'int(vUV.y * {_c(h)}))')
+        # px % n by mask: n is a power of two, and the pixel is never
+        # negative in the frame grid
+        t, _t = em.tmp(FLOAT,
+                       f'hal_bayer(int(uint({pix}.x) & {n - 1}u), '
+                       f'int(uint({pix}.y) & {n - 1}u), '
+                       f'{bits}, {_c(float(n * n))}) - 0.5')
+    else:
+        # ray hits shade with no pixel grid: nodeeval quantises undithered
+        # there (t = 0), and this pass does exactly that
+        t, _t = em.tmp(FLOAT, '0.0')
+    step, _t = em.tmp(FLOAT, f'1.0 / max({lv} - 1.0, 1.0)')
+    biased, _t = em.tmp(VEC3, f'{col}.rgb + vec3({t} * {strength} * {step})')
+    q, _t = em.tmp(VEC3, f'roundEven(clamp({biased}, 0.0, 1.0) '
+                         f'* ({lv} - 1.0)) / max({lv} - 1.0, 1.0)')
+    return em.tmp(VEC4, f'vec4(clamp({q}, 0.0, 1.0), {col}.a)')
+
+
+def e_halcyon_screen_info(em, node, index):
+    outs = node.get('outputs') or []
+    o = outs[index] if index < len(outs) else {}
+    name = o.get('name')
+    on_grid = (em.frame_mode and not em.secondary
+               and getattr(em, 'resolution', None) is not None)
+    if name == 'Screen UV':
+        return em.tmp(VEC3, 'vec3(vUV, 0.0)' if on_grid
+                      else 'vec3(0.0, 0.0, 0.0)')
+    if name == 'Pixel':
+        if not on_grid:
+            return em.tmp(VEC3, 'vec3(0.0, 0.0, 0.0)')
+        w, h = float(em.resolution[0]), float(em.resolution[1])
+        return em.tmp(VEC3, f'vec3(floor(vUV.x * {_c(w)}), '
+                            f'floor(vUV.y * {_c(h)}), 0.0)')
+    if name == 'Facing':
+        return em.tmp(FLOAT, 'abs(dot(normalize(hal_N), '
+                             'normalize(hal_V)))')
+    if name == 'Frame':
+        em.frame_uniforms.add('hal_frame')
+        return em.tmp(FLOAT, 'hal_frame')
+    if name == 'Time':
+        em.frame_uniforms.add('hal_time')
+        return em.tmp(FLOAT, 'hal_time')
+    raise Unsupported('view-space depth is not in the G-buffer; a material '
+                      'reading Screen Info\'s Depth shades on the CPU')
+
+
+def e_halcyon_pixelate(em, node, _i):
+    p, _t = em.tmp(VEC3, tex_vector(em, node, 'uv'))
+    parts = []
+    for axis, sock in (('x', 'Pixels X'), ('y', 'Pixels Y'),
+                       ('z', 'Pixels Z')):
+        cnt, _t = em.tmp(FLOAT, em.input(node, sock, FLOAT))
+        snapped, _t = em.tmp(
+            FLOAT, f'({cnt} >= 1.0) ? (min(floor({p}.{axis} '
+                   f'* max({cnt}, 1.0)), max({cnt}, 1.0) - 1.0) '
+                   f'+ 0.5) / max({cnt}, 1.0) : {p}.{axis}')
+        parts.append(snapped)
+    return em.tmp(VEC3, f'vec3({parts[0]}, {parts[1]}, {parts[2]})')
+
+
+def _scroll_time(em, node):
+    """The scroll clock, with the stepped-time quantise baked in."""
+    t = _pat_time(em, node)
+    fps = int(prop(node, 'fps', 0) or 0)
+    if t != '0.0' and fps > 0:
+        t, _t = em.tmp(FLOAT, f'floor({t} * {_c(float(fps))}) '
+                              f'/ {_c(float(fps))}')
+    return t
+
+
+def e_halcyon_scroll(em, node, _i):
+    p, _t = em.tmp(VEC3, tex_vector(em, node, 'uv'))
+    t = _scroll_time(em, node)
+    sx = em.input(node, 'Scroll X', FLOAT)
+    sy = em.input(node, 'Scroll Y', FLOAT)
+    spin = em.input(node, 'Spin', FLOAT)
+    ang, _t = em.tmp(FLOAT, f'{spin} * ({t} * 6.28318530717959)')
+    ca, _t = em.tmp(FLOAT, f'cos({ang})')
+    sa, _t = em.tmp(FLOAT, f'sin({ang})')
+    dx, _t = em.tmp(FLOAT, f'{p}.x - 0.5')
+    dy, _t = em.tmp(FLOAT, f'{p}.y - 0.5')
+    return em.tmp(VEC3,
+                  f'vec3(({dx} * {ca} - {dy} * {sa}) + 0.5 + {sx} * {t}, '
+                  f'({dx} * {sa} + {dy} * {ca}) + 0.5 + {sy} * {t}, '
+                  f'{p}.z)')
+
+
+def e_halcyon_scanlines(em, node, _i):
+    col, _t = em.tmp(VEC4, em.input(node, 'Color', VEC4))
+    p, _t = em.tmp(VEC3, tex_vector(em, node, 'uv'))
+    lines, _t = em.tmp(FLOAT, f'max({em.input(node, "Lines", FLOAT)}, 1.0)')
+    dark, _t = em.tmp(FLOAT, f'clamp({em.input(node, "Darkness", FLOAT)}, '
+                             f'0.0, 1.0)')
+    thick, _t = em.tmp(FLOAT, f'clamp({em.input(node, "Thickness", FLOAT)},'
+                              f' 0.0, 1.0)')
+    t = _pat_time(em, node, animated=bool(prop(node, 'animate', False)))
+    y, _t = em.tmp(FLOAT, f'{p}.y * {lines} - {t} * 6.0')
+    on, _t = em.tmp(FLOAT, f'(({y} - floor({y})) < {thick}) ? 1.0 : 0.0')
+    return em.tmp(VEC4, f'vec4({col}.rgb * (1.0 - {dark} * {on}), '
+                        f'{col}.a)')
+
+
+def _need_palette_fn(em, mode):
+    """Inline the nearest-entry search for one named palette: unrolled,
+    first-wins on ties exactly like argmin, distances summed r then g
+    then b exactly as the evaluator's axis-2 sum."""
+    from ..core.palette import NODE_PALETTES
+    pal = NODE_PALETTES[mode]
+    key = ('__pal', mode)
+    fn = f'hal_pal_{mode.lower()}'
+    if key not in em.once:
+        em.once.add(key)
+        lines = [f'vec4 {fn}(vec3 c)', '{',
+                 '    float best = 1e9;',
+                 '    float bi = 0.0;',
+                 '    vec3 bc = vec3(0.0, 0.0, 0.0);',
+                 '    vec3 e;', '    vec3 d;', '    float ds;']
+        for k, entry in enumerate(pal):
+            lines.append(f'    e = {Emitter.const(entry, VEC3)};')
+            lines.append('    d = c - e;')
+            lines.append('    ds = d.x * d.x + d.y * d.y + d.z * d.z;')
+            lines.append(f'    if (ds < best) '
+                         f'{{ best = ds; bi = {_c(float(k))}; bc = e; }}')
+        lines.append('    return vec4(bc, bi);')
+        lines.append('}')
+        em.inline.append('\n'.join(lines))
+    return fn, len(pal)
+
+
+def e_halcyon_palette(em, node, index):
+    from ..core.palette import NODE_PALETTES
+    col, _t = em.tmp(VEC4, em.input(node, 'Color', VEC4))
+    mix, _t = em.tmp(FLOAT, f'clamp({em.input(node, "Mix", FLOAT)}, '
+                            f'0.0, 1.0)')
+    src, _t = em.tmp(VEC3, f'clamp({col}.rgb, 0.0, 1.0)')
+    mode = str(prop(node, 'palette', 'EGA'))
+    outs = node.get('outputs') or []
+    o = outs[index] if index < len(outs) else {}
+    if mode == 'RGB332':
+        r, _t = em.tmp(FLOAT, f'roundEven({src}.x * 7.0)')
+        g, _t = em.tmp(FLOAT, f'roundEven({src}.y * 7.0)')
+        b, _t = em.tmp(FLOAT, f'roundEven({src}.z * 3.0)')
+        if o.get('name') == 'Index':
+            return em.tmp(FLOAT, f'({r} * 32.0 + {g} * 4.0 + {b}) / 255.0')
+        snapped, _t = em.tmp(VEC3, f'vec3({r} / 7.0, {g} / 7.0, '
+                                   f'{b} / 3.0)')
+    else:
+        if mode not in NODE_PALETTES:
+            mode = 'EGA'
+        fn, count = _need_palette_fn(em, mode)
+        res, _t = em.tmp(VEC4, f'{fn}({src})')
+        if o.get('name') == 'Index':
+            return em.tmp(FLOAT,
+                          f'{res}.w / {_c(float(max(count - 1, 1)))}')
+        snapped, _t = em.tmp(VEC3, f'{res}.rgb')
+    return em.tmp(VEC4, f'vec4({src} + ({snapped} - {src}) * {mix}, '
+                        f'{col}.a)')
+
+
+def e_halcyon_color_cycle(em, node, _i):
+    fac = em.input(node, 'Fac', FLOAT)
+    speed = em.input(node, 'Speed', FLOAT)
+    steps, _t = em.tmp(FLOAT, em.input(node, 'Steps', FLOAT))
+    t = _pat_time(em, node)
+    phase, _t = em.tmp(FLOAT, f'{speed} * {t}')
+    q, _t = em.tmp(FLOAT, f'max(floor({steps}), 1.0)')
+    ph, _t = em.tmp(FLOAT, f'({steps} >= 1.0) '
+                           f'? floor({phase} * {q}) / {q} : {phase}')
+    out, _t = em.tmp(FLOAT, f'{fac} + {ph}')
+    return em.tmp(FLOAT, f'{out} - floor({out})')
+
+
+def e_halcyon_flipbook(em, node, _i):
+    p, _t = em.tmp(VEC3, tex_vector(em, node, 'uv'))
+    cols, _t = em.tmp(FLOAT,
+                      f'max(floor({em.input(node, "Columns", FLOAT)}), '
+                      f'1.0)')
+    rows, _t = em.tmp(FLOAT,
+                      f'max(floor({em.input(node, "Rows", FLOAT)}), 1.0)')
+    rate = em.input(node, 'Rate', FLOAT)
+    offset = em.input(node, 'Cell Offset', FLOAT)
+    t = _pat_time(em, node)
+    cell0, _t = em.tmp(FLOAT, f'floor({offset} + {t} * {rate})')
+    total, _t = em.tmp(FLOAT, f'{cols} * {rows}')
+    cell, _t = em.tmp(FLOAT,
+                      f'{cell0} - {total} * floor({cell0} / {total})')
+    cy, _t = em.tmp(FLOAT, f'floor({cell} / {cols})')
+    cx, _t = em.tmp(FLOAT, f'{cell} - {cols} * {cy}')
+    return em.tmp(VEC3,
+                  f'vec3(({p}.x + {cx}) / {cols}, '
+                  f'({p}.y + ({rows} - 1.0 - {cy})) / {rows}, {p}.z)')
+
+
+def e_halcyon_uv_wave(em, node, _i):
+    p, _t = em.tmp(VEC3, tex_vector(em, node, 'uv'))
+    ax = em.input(node, 'Amplitude X', FLOAT)
+    ay = em.input(node, 'Amplitude Y', FLOAT)
+    freq = em.input(node, 'Frequency', FLOAT)
+    speed = em.input(node, 'Speed', FLOAT)
+    t = _pat_time(em, node)
+    ph, _t = em.tmp(FLOAT, f'{t} * {speed}')
+    return em.tmp(VEC3, (
+        f'vec3({p}.x + sin(({p}.y * {freq} + {ph}) '
+        f'* 6.28318530717959) * {ax}, '
+        f'{p}.y + sin(({p}.x * {freq} + {ph} + 0.25) '
+        f'* 6.28318530717959) * {ay}, {p}.z)'))
+
+
+def e_halcyon_halftone(em, node, index):
+    col, _t = em.tmp(VEC4, em.input(node, 'Color', VEC4))
+    p, _t = em.tmp(VEC3, tex_vector(em, node, 'uv'))
+    dots, _t = em.tmp(FLOAT, f'max({em.input(node, "Dots", FLOAT)}, '
+                             f'1e-3)')
+    ang, _t = em.tmp(FLOAT, f'{em.input(node, "Angle", FLOAT)} '
+                            f'* 0.017453292519943295')
+    ca, _t = em.tmp(FLOAT, f'cos({ang})')
+    sa, _t = em.tmp(FLOAT, f'sin({ang})')
+    # Rec.601 luma -- the NTSC weights, which is the period answer
+    luma, _t = em.tmp(FLOAT, f'dot(clamp({col}.rgb, 0.0, 1.0), '
+                             f'vec3(0.299, 0.587, 0.114))')
+    gx, _t = em.tmp(FLOAT, f'({p}.x * {ca} - {p}.y * {sa}) * {dots}')
+    gy, _t = em.tmp(FLOAT, f'({p}.x * {sa} + {p}.y * {ca}) * {dots}')
+    fx, _t = em.tmp(FLOAT, f'{gx} - floor({gx}) - 0.5')
+    fy, _t = em.tmp(FLOAT, f'{gy} - floor({gy}) - 0.5')
+    d, _t = em.tmp(FLOAT, f'sqrt({fx} * {fx} + {fy} * {fy})')
+    r, _t = em.tmp(FLOAT, f'0.70710678 * sqrt(max(1.0 - {luma}, 0.0))')
+    ink, _t = em.tmp(FLOAT, f'({d} < {r}) ? 1.0 : 0.0')
+    outs = node.get('outputs') or []
+    o = outs[index] if index < len(outs) else {}
+    if o.get('name') == 'Fac':
+        return ink, FLOAT
+    paper, _t = em.tmp(VEC4, em.input(node, 'Paper Color', VEC4))
+    inkc, _t = em.tmp(VEC4, em.input(node, 'Ink Color', VEC4))
+    return em.tmp(VEC4, f'vec4({paper}.rgb + ({inkc}.rgb - {paper}.rgb) '
+                        f'* {ink}, {col}.a)')
+
+
+def e_halcyon_threshold(em, node, _i):
+    fac, _t = em.tmp(FLOAT, em.input(node, 'Fac', FLOAT))
+    level, _t = em.tmp(FLOAT, em.input(node, 'Level', FLOAT))
+    smooth, _t = em.tmp(FLOAT, em.input(node, 'Smooth', FLOAT))
+    hard, _t = em.tmp(FLOAT, f'({fac} >= {level}) ? 1.0 : 0.0')
+    tt, _t = em.tmp(FLOAT,
+                    f'clamp(({fac} - ({level} - {smooth} * 0.5)) '
+                    f'/ max({smooth}, 1e-6), 0.0, 1.0)')
+    soft, _t = em.tmp(FLOAT, f'{tt} * {tt} * (3.0 - 2.0 * {tt})')
+    return em.tmp(FLOAT, f'({smooth} > 1e-6) ? {soft} : {hard}')
+
+
+def e_halcyon_quantize(em, node, _i):
+    fac = em.input(node, 'Fac', FLOAT)
+    s, _t = em.tmp(FLOAT, f'max(floor({em.input(node, "Steps", FLOAT)}), '
+                          f'1.0)')
+    q, _t = em.tmp(FLOAT, f'floor(clamp({fac}, 0.0, 1.0) * {s}) '
+                          f'/ max({s} - 1.0, 1.0)')
+    return em.tmp(FLOAT, f'clamp({q}, 0.0, 1.0)')
+
+
 def e_tex_gradient(em, node, index):
     v = tex_vector(em, node)
     p, _t = em.tmp(VEC3, v)
@@ -1577,6 +2112,24 @@ REFUSED = {
     'ShaderNodeTexVoronoi': 'its cell jitter is the same sin-fract hash',
     'ShaderNodeTexMusgrave': 'its fractal is the same sin-fract Perlin',
     'ShaderNodeTexBrick': 'its per-brick tint is the same sin-fract hash',
+    'ShaderNodeWireframe': 'the frame pass carries no per-fragment '
+                           'triangle corners; wireframe shades on the CPU',
+    'ShaderNodeVectorTransform': 'camera and object spaces need per-frame '
+                                 'matrix uniforms the deferred pass does '
+                                 'not bind yet',
+    'ShaderNodeAmbientOcclusion': 'in-graph occlusion rays are CPU-only',
+    'ShaderNodeBevel': 'in-graph geometry queries are CPU-only',
+    'ShaderNodeLightFalloff': 'falloff lives on the lamps in this renderer',
+    'ShaderNodeVolumeAbsorption': 'no volumetrics in this renderer',
+    'ShaderNodeVolumeScatter': 'no volumetrics in this renderer',
+    'ShaderNodeVolumePrincipled': 'no volumetrics in this renderer',
+    'ShaderNodeTexPointDensity': 'no volumetrics in this renderer',
+    'ShaderNodeScript': 'OSL is not in this renderer; the Coded Shader '
+                        'node is the native equivalent',
+    'HALCYON_DepthCueNode': 'per-material distance fog wants the frame\'s '
+                            'view matrix, which the deferred pass does not '
+                            'bind; Render Properties\' own Fog rides the '
+                            'readback on either device',
 }
 
 EMITTERS = {
@@ -1594,12 +2147,15 @@ EMITTERS = {
     'ShaderNodeNewGeometry': e_new_geometry,
     'ShaderNodeLayerWeight': e_layer_weight,
     'ShaderNodeBsdfGlossy': e_bsdf_glossy,
+    'ShaderNodeBsdfMetallic': e_bsdf_metallic,
+    'ShaderNodeEeveeSpecular': e_bsdf_specular,
     'ShaderNodeBsdfTransparent': e_bsdf_transparent,
     'ShaderNodeMixShader': e_mix_shader,
     'ShaderNodeAddShader': e_add_shader,
     'ShaderNodeRGB': e_rgb,
     'ShaderNodeValue': e_value,
     'ShaderNodeMixRGB': e_mix_rgb,
+    'ShaderNodeMix': e_mix,
     'ShaderNodeMath': e_math,
     'ShaderNodeMapping': e_mapping,
     'ShaderNodeVectorMath': e_vector_math,
@@ -1633,6 +2189,22 @@ EMITTERS = {
     'HALCYON_OnionNode': e_pat_onion,
     'HALCYON_BumpsNode': e_pat_bumps,
     'HALCYON_WrinklesNode': e_pat_wrinkles,
+    'HALCYON_NoiseNode': e_pat_noise,
+    'HALCYON_CellsNode': e_pat_cells_tex,
+    'HALCYON_StaticNode': e_pat_static,
+    'HALCYON_PosterizeNode': e_halcyon_posterize,
+    'HALCYON_DitherNode': e_halcyon_dither,
+    'HALCYON_ScreenInfoNode': e_halcyon_screen_info,
+    'HALCYON_PixelateNode': e_halcyon_pixelate,
+    'HALCYON_ScrollNode': e_halcyon_scroll,
+    'HALCYON_ScanlinesNode': e_halcyon_scanlines,
+    'HALCYON_PaletteNode': e_halcyon_palette,
+    'HALCYON_ColorCycleNode': e_halcyon_color_cycle,
+    'HALCYON_FlipbookNode': e_halcyon_flipbook,
+    'HALCYON_UVWaveNode': e_halcyon_uv_wave,
+    'HALCYON_HalftoneNode': e_halcyon_halftone,
+    'HALCYON_ThresholdNode': e_halcyon_threshold,
+    'HALCYON_QuantizeNode': e_halcyon_quantize,
     'ShaderNodeBsdfDiffuse': e_bsdf_diffuse,
     'ShaderNodeEmission': e_emission,
     'ShaderNodeFresnel': e_fresnel,

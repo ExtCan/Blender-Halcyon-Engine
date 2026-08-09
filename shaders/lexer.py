@@ -12,6 +12,7 @@ KEYWORDS = {
     'switch', 'case', 'default', 'true', 'false', 'void', 'precision',
     'highp', 'mediump', 'lowp', 'flat', 'smooth', 'noperspective', 'layout',
     'centroid', 'invariant', 'static', 'inline', 'cbuffer', 'register',
+    'precise',
 }
 
 TYPES = {

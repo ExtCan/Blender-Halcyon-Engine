@@ -118,6 +118,25 @@ def turbulence(p, octaves=5, lacunarity=2.0, gain=0.5):
     return total / max(norm, 1e-6)
 
 
+def ridged(p, octaves=5, lacunarity=2.0, gain=0.5):
+    """Ridged fractal: each octave folds signed noise and squares the fold.
+
+    Musgrave's ridged multifractal profile (Texturing & Modeling, in
+    period): n = 1 - |signed noise|, squared so the ridge line sharpens,
+    summed at decaying amplitude. The squaring is the character -- without
+    it this is just inverted turbulence.
+    """
+    total = np.zeros(p.shape[0], np.float32)
+    amp, norm, freq = 1.0, 0.0, 1.0
+    for _ in range(int(max(octaves, 1))):
+        s = 1.0 - np.abs(signed_noise(p * freq))
+        total += (s * s) * amp
+        norm += amp
+        amp *= gain
+        freq *= lacunarity
+    return (total / max(norm, 1e-6)).astype(np.float32)
+
+
 def worley(p, jitter=1.0, n_closest=2):
     """Distances to the nearest feature points. Returns (F1, F2, cell id)."""
     cell = np.floor(p)
@@ -142,6 +161,58 @@ def worley(p, jitter=1.0, n_closest=2):
 
 
 # ------------------------------------------------------------------ patterns
+
+
+def noise_fractal(p, kind=0, octaves=5, lacunarity=2.0, gain=0.5):
+    """The raw fractal noise field, three profiles.
+
+    kind 0 = smooth fBm, 1 = turbulence (folded, cusped), 2 = ridged
+    (folded and squared). This is the node-facing face of the integer-hash
+    noise the whole pattern library rides -- the one to reach for where
+    Blender's own Noise texture would be used, because that one's
+    sin-fract hash cannot travel to a driver and this one travels exactly.
+    """
+    k = int(kind)
+    if k == 1:
+        return turbulence(p, octaves=octaves, lacunarity=lacunarity,
+                          gain=gain)
+    if k == 2:
+        return ridged(p, octaves=octaves, lacunarity=lacunarity, gain=gain)
+    return fbm(p, octaves=octaves, lacunarity=lacunarity, gain=gain)
+
+
+def cells(p, jitter=1.0, feature=0):
+    """Worley's cellular texture (SIGGRAPH 1996 -- in period), by feature.
+
+    feature 0 = F1 (distance to the nearest point), 1 = F2, 2 = F2-F1
+    (ridges on the cell borders), 3 = the cell's own hashed id as a flat
+    shade -- the stained-glass look. Returns (fac, cell id) so the id can
+    drive per-cell variation whatever the feature.
+    """
+    f1, f2, cid = worley(p, jitter=jitter, n_closest=2)
+    k = int(feature)
+    if k == 1:
+        v = f2
+    elif k == 2:
+        v = f2 - f1
+    elif k == 3:
+        v = cid
+    else:
+        v = f1
+    return np.clip(v, 0.0, 1.0).astype(np.float32), cid.astype(np.float32)
+
+
+def tv_static(p, frame=0):
+    """Per-cell white noise, reseeded every frame -- an untuned television.
+
+    Solid like every other pattern: the cells live in the SURFACE's own
+    space (scale the vector for the set's pixel size), so the static sits
+    on an in-scene screen the way it should, not on the camera. The frame
+    number salts the hash, which is what makes it crawl.
+    """
+    c = np.floor(p)
+    return hash3(c[:, 0].astype(np.int64), c[:, 1].astype(np.int64),
+                 c[:, 2].astype(np.int64) + int(frame) * 7919)
 
 
 def marble(p, turb=1.0, octaves=5, veins=1.0, sharpness=1.0, axis=0):

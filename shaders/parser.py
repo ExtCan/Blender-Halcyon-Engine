@@ -34,7 +34,12 @@ BIN_PRECEDENCE = [
 
 QUALIFIERS = {'uniform', 'varying', 'attribute', 'in', 'out', 'inout', 'const',
               'static', 'centroid', 'flat', 'smooth', 'noperspective', 'invariant',
-              'highp', 'mediump', 'lowp', 'inline'}
+              'highp', 'mediump', 'lowp', 'inline',
+              # `precise` forbids the DRIVER from contracting the marked
+              # arithmetic (FMA, reassociation). This front-end computes
+              # strictly ordered float32 already, so accepting the
+              # qualifier and ignoring it IS its semantics here
+              'precise'}
 
 
 class Parser:
@@ -257,7 +262,8 @@ class Parser:
         t = self.tok
         if t.kind == 'type':
             return True
-        if t.kind == 'keyword' and t.value in ('const', 'static'):
+        if t.kind == 'keyword' and t.value in ('const', 'static',
+                                               'precise'):
             return True
         if t.kind == 'ident' and t.value in self.structs and \
                 self.peek().kind == 'ident':

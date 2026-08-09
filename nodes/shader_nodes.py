@@ -788,8 +788,264 @@ class HALCYON_ScreenInfoNode(Node, HalcyonNodeBase):
         self.outputs.new('NodeSocketFloat', 'Time')
 
 
+class HALCYON_PixelateNode(Node, HalcyonNodeBase):
+    """Snap a coordinate to a coarse texel grid, for chunky low-res texturing"""
+
+    bl_idname = 'HALCYON_PixelateNode'
+    bl_label = "Pixelate"
+    bl_icon = 'MOD_REMESH'
+
+    def init(self, context):
+        v = self.inputs.new('NodeSocketVector', 'Vector')
+        v.description = ("The coordinate to snap. Unlinked means the UV map, "
+                         "since fat texels live in texture space")
+        self.inputs.new('NodeSocketFloat', 'Pixels X').default_value = 64.0
+        self.inputs.new('NodeSocketFloat', 'Pixels Y').default_value = 64.0
+        z = self.inputs.new('NodeSocketFloat', 'Pixels Z')
+        z.default_value = 0.0
+        z.description = "0 leaves the third axis untouched (2D pixelation)"
+        self.outputs.new('NodeSocketVector', 'Vector')
+        self.outputs[0].description = (
+            "Each axis snapped to the centre of its cell. Feed any texture's "
+            "Vector input for instant fat texels")
+
+
+class HALCYON_ScrollNode(Node, HalcyonNodeBase):
+    """Animated UV transform: the scrolling water, lava and conveyor trick"""
+
+    bl_idname = 'HALCYON_ScrollNode'
+    bl_label = "UV Scroll"
+    bl_icon = 'ANIM'
+
+    animate: BoolProperty(name="Animate", default=True)
+    fps: IntProperty(
+        name="Steps Per Second", default=0, min=0, max=60,
+        description="0 scrolls smoothly. Above 0 the clock advances in "
+                    "steps, the way texture animation looked at the era's "
+                    "frame rates -- 15 is the classic choppy water")
+
+    def init(self, context):
+        v = self.inputs.new('NodeSocketVector', 'Vector')
+        v.description = "The coordinate to move. Unlinked means the UV map"
+        self.inputs.new('NodeSocketFloat', 'Scroll X').default_value = 0.1
+        self.inputs.new('NodeSocketFloat', 'Scroll Y').default_value = 0.0
+        s = self.inputs.new('NodeSocketFloat', 'Spin')
+        s.default_value = 0.0
+        s.description = ("Rotation about the (0.5, 0.5) UV centre, in turns "
+                         "per second")
+        self.outputs.new('NodeSocketVector', 'Vector')
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'animate')
+        layout.prop(self, 'fps')
+
+
+class HALCYON_ScanlinesNode(Node, HalcyonNodeBase):
+    """Darken alternate lines across a surface -- an in-scene CRT screen"""
+
+    bl_idname = 'HALCYON_ScanlinesNode'
+    bl_label = "Scanlines"
+    bl_icon = 'ALIGN_JUSTIFY'
+
+    animate: BoolProperty(
+        name="Roll", default=False,
+        description="Drift the lines upward over time, the way a set rolls "
+                    "when the vertical hold is off")
+
+    def init(self, context):
+        c = self.inputs.new('NodeSocketColor', 'Color')
+        c.default_value = (0.8, 0.8, 0.8, 1.0)
+        v = self.inputs.new('NodeSocketVector', 'Vector')
+        v.description = ("Where the lines live. Unlinked means the UV map -- "
+                         "a television's scanlines belong to ITS screen, "
+                         "not the camera's")
+        self.inputs.new('NodeSocketFloat', 'Lines').default_value = 240.0
+        self.inputs.new('NodeSocketFloat', 'Darkness').default_value = 0.4
+        self.inputs.new('NodeSocketFloat', 'Thickness').default_value = 0.5
+        self.outputs.new('NodeSocketColor', 'Color')
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'animate')
+
+
+class HALCYON_PaletteNode(Node, HalcyonNodeBase):
+    """Snap a colour to the nearest entry of a period hardware palette"""
+
+    bl_idname = 'HALCYON_PaletteNode'
+    bl_label = "Hardware Palette"
+    bl_icon = 'COLOR'
+
+    palette: EnumProperty(name="Palette", items=(
+        ('EGA', "EGA (16)", "The 16 colours of the EGA default palette"),
+        ('C64', "C64 (16)", "The Commodore 64's 16 colours"),
+        ('CGA', "CGA (4)", "CGA palette 1, high intensity: black, cyan, "
+                           "magenta, white"),
+        ('GAMEBOY', "Game Boy (4)", "The DMG's four shades of green"),
+        ('GRAY4', "Grayscale (4)", "Four grey levels"),
+        ('GRAY16', "Grayscale (16)", "Sixteen grey levels"),
+        ('RGB332', "RGB 3-3-2 (256)", "Each channel crushed to 3-3-2 bits "
+                                      "-- the byte-per-pixel truecolour "
+                                      "compromise"),
+    ), default='EGA')
+
+    def init(self, context):
+        c = self.inputs.new('NodeSocketColor', 'Color')
+        c.default_value = (0.8, 0.8, 0.8, 1.0)
+        self.inputs.new('NodeSocketFloat', 'Mix').default_value = 1.0
+        self.outputs.new('NodeSocketColor', 'Color')
+        idx = self.outputs.new('NodeSocketFloat', 'Index')
+        idx.description = ("The chosen entry's position, 0 to 1 -- drive a "
+                           "Color Ramp with it for palette remapping")
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'palette', text="")
+
+
+class HALCYON_ColorCycleNode(Node, HalcyonNodeBase):
+    """Rotate a ramp phase over time -- Mark Ferrari's colour cycling"""
+
+    bl_idname = 'HALCYON_ColorCycleNode'
+    bl_label = "Color Cycle"
+    bl_icon = 'FILE_REFRESH'
+
+    animate: BoolProperty(name="Animate", default=True)
+
+    def init(self, context):
+        f = self.inputs.new('NodeSocketFloat', 'Fac')
+        f.default_value = 0.0
+        f.description = ("The phase to rotate -- typically a texture's Fac, "
+                         "with a Color Ramp after this node")
+        self.inputs.new('NodeSocketFloat', 'Speed').default_value = 0.5
+        s = self.inputs.new('NodeSocketFloat', 'Steps')
+        s.default_value = 0.0
+        s.description = ("0 cycles smoothly. Above 0 the phase advances in "
+                         "that many discrete steps per revolution -- the "
+                         "palette-register waterfall")
+        self.outputs.new('NodeSocketFloat', 'Fac')
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'animate')
+
+
+class HALCYON_FlipbookNode(Node, HalcyonNodeBase):
+    """Play an N-by-M sprite sheet as an animated texture"""
+
+    bl_idname = 'HALCYON_FlipbookNode'
+    bl_label = "Flipbook"
+    bl_icon = 'RENDER_ANIMATION'
+
+    animate: BoolProperty(name="Animate", default=True)
+
+    def init(self, context):
+        v = self.inputs.new('NodeSocketVector', 'Vector')
+        v.description = "The coordinate to map into one cell. Unlinked " \
+                        "means the UV map"
+        self.inputs.new('NodeSocketFloat', 'Columns').default_value = 4.0
+        self.inputs.new('NodeSocketFloat', 'Rows').default_value = 4.0
+        r = self.inputs.new('NodeSocketFloat', 'Rate')
+        r.default_value = 8.0
+        r.description = "Cells per second. Fire and explosion sheets of " \
+                        "the era ran 8 to 15"
+        o = self.inputs.new('NodeSocketFloat', 'Cell Offset')
+        o.default_value = 0.0
+        o.description = "Which cell to start from -- or, with Animate " \
+                        "off, which cell to hold"
+        out = self.outputs.new('NodeSocketVector', 'Vector')
+        out.description = ("Feed an Image Texture's Vector. Cells read "
+                           "left to right, top row first, wrapping at "
+                           "the end")
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'animate')
+
+
+class HALCYON_UVWaveNode(Node, HalcyonNodeBase):
+    """Sine-warp a coordinate -- the underwater and heat-haze wobble"""
+
+    bl_idname = 'HALCYON_UVWaveNode'
+    bl_label = "UV Wave"
+    bl_icon = 'MOD_WAVE'
+
+    animate: BoolProperty(name="Animate", default=True)
+
+    def init(self, context):
+        v = self.inputs.new('NodeSocketVector', 'Vector')
+        v.description = "The coordinate to wobble. Unlinked means the UV map"
+        self.inputs.new('NodeSocketFloat', 'Amplitude X').default_value = 0.02
+        self.inputs.new('NodeSocketFloat', 'Amplitude Y').default_value = 0.02
+        self.inputs.new('NodeSocketFloat', 'Frequency').default_value = 8.0
+        self.inputs.new('NodeSocketFloat', 'Speed').default_value = 1.0
+        self.outputs.new('NodeSocketVector', 'Vector')
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'animate')
+
+
+class HALCYON_HalftoneNode(Node, HalcyonNodeBase):
+    """A rotated dot screen whose dots grow where the input darkens"""
+
+    bl_idname = 'HALCYON_HalftoneNode'
+    bl_label = "Halftone"
+    bl_icon = 'LIGHTPROBE_SPHERE'
+
+    def init(self, context):
+        c = self.inputs.new('NodeSocketColor', 'Color')
+        c.default_value = (0.5, 0.5, 0.5, 1.0)
+        c.description = "The shade the dots reproduce (Rec.601 luma -- " \
+                        "the NTSC weights)"
+        v = self.inputs.new('NodeSocketVector', 'Vector')
+        v.description = "Where the screen lives. Unlinked means the UV map"
+        self.inputs.new('NodeSocketFloat', 'Dots').default_value = 24.0
+        a = self.inputs.new('NodeSocketFloat', 'Angle')
+        a.default_value = 45.0
+        a.description = "Screen angle in degrees. Newsprint runs its " \
+                        "black plate at 45"
+        self.inputs.new('NodeSocketColor', 'Ink Color').default_value = \
+            (0.05, 0.05, 0.05, 1.0)
+        self.inputs.new('NodeSocketColor', 'Paper Color').default_value = \
+            (0.95, 0.93, 0.88, 1.0)
+        self.outputs.new('NodeSocketColor', 'Color')
+        self.outputs.new('NodeSocketFloat', 'Fac')
+
+
+class HALCYON_ThresholdNode(Node, HalcyonNodeBase):
+    """Cut a value into 0 or 1 at a level, with an optional soft edge"""
+
+    bl_idname = 'HALCYON_ThresholdNode'
+    bl_label = "Threshold"
+    bl_icon = 'IPO_CONSTANT'
+
+    def init(self, context):
+        self.inputs.new('NodeSocketFloat', 'Fac').default_value = 0.5
+        self.inputs.new('NodeSocketFloat', 'Level').default_value = 0.5
+        s = self.inputs.new('NodeSocketFloat', 'Smooth')
+        s.default_value = 0.0
+        s.description = "Width of the soft edge around the level. " \
+                        "0 is a hard cut"
+        self.outputs.new('NodeSocketFloat', 'Fac')
+
+
+class HALCYON_QuantizeNode(Node, HalcyonNodeBase):
+    """Posterize for a single value: snap a Fac to discrete steps"""
+
+    bl_idname = 'HALCYON_QuantizeNode'
+    bl_label = "Quantize"
+    bl_icon = 'SEQ_HISTOGRAM'
+
+    def init(self, context):
+        self.inputs.new('NodeSocketFloat', 'Fac').default_value = 0.5
+        self.inputs.new('NodeSocketFloat', 'Steps').default_value = 4.0
+        out = self.outputs.new('NodeSocketFloat', 'Fac')
+        out.description = ("The cel-band helper: quantize a lighting or "
+                           "texture Fac before it drives a Color Ramp")
+
+
 NODES = (HALCYON_ShaderNode, HALCYON_CodeNode, HALCYON_PosterizeNode,
-         HALCYON_DitherNode, HALCYON_DepthCueNode, HALCYON_ScreenInfoNode)
+         HALCYON_DitherNode, HALCYON_DepthCueNode, HALCYON_ScreenInfoNode,
+         HALCYON_PixelateNode, HALCYON_ScrollNode, HALCYON_ScanlinesNode,
+         HALCYON_PaletteNode, HALCYON_ColorCycleNode, HALCYON_FlipbookNode,
+         HALCYON_UVWaveNode, HALCYON_HalftoneNode, HALCYON_ThresholdNode,
+         HALCYON_QuantizeNode)
 OPERATORS = (HALCYON_OT_compile_shader, HALCYON_OT_new_shader_text)
 
 
@@ -811,9 +1067,14 @@ class NODE_MT_halcyon_add(bpy.types.Menu):
     bl_idname = 'NODE_MT_halcyon_add'
     bl_label = "Halcyon"
 
+    #: nodes that OPEN a group get a separator drawn above them
+    GROUP_STARTS = ('HALCYON_PosterizeNode', 'HALCYON_PixelateNode')
+
     def draw(self, context):
         layout = self.layout
         for cls in NODES:
+            if cls.bl_idname in self.GROUP_STARTS:
+                layout.separator()
             op = layout.operator('node.add_node', text=cls.bl_label,
                                  icon=getattr(cls, 'bl_icon', 'NONE'))
             op.type = cls.bl_idname

@@ -120,6 +120,54 @@ vec2 hal_pt_worley(vec3 p, float jitter)
     }
     return vec2(f1, f2);
 }
+
+// patterns.worley with the winning cell's id -- the update order mirrors
+// the CPU exactly: `closer` is decided against the OLD F1, the id follows
+// that same decision, then F1 takes the min. Left separate from the vec2
+// version so dents/crackle keep their proven source byte for byte.
+vec3 hal_pt_worley3(vec3 p, float jitter)
+{
+    vec3 cell = floor(p);
+    float f1 = 1e9;
+    float f2 = 1e9;
+    float cid = 0.0;
+    for (int dx = -1; dx <= 1; dx++) {
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                vec3 c = cell + vec3(float(dx), float(dy), float(dz));
+                float jx = hal_pt_hash3f(c, 0.0);
+                float jy = hal_pt_hash3f(c, 31.0);
+                float jz = hal_pt_hash3f(c, 71.0);
+                vec3 pt = c + vec3(jx, jy, jz) * jitter
+                          + (0.5 * (1.0 - jitter));
+                float d = length(p - pt);
+                bool closer = d < f1;
+                if (closer) { f2 = f1; }
+                else { f2 = min(f2, d); }
+                if (closer) { cid = hal_pt_hash3f(c, 137.0); }
+                f1 = min(f1, d);
+            }
+        }
+    }
+    return vec3(f1, f2, cid);
+}
+
+// patterns.ridged: fold, square, sum at decaying amplitude
+float hal_pt_ridged(vec3 p, int octaves, float lacunarity, float gain)
+{
+    float total = 0.0;
+    float amp = 1.0;
+    float norm = 0.0;
+    float freq = 1.0;
+    for (int i = 0; i < octaves; i++) {
+        float s = 1.0 - abs(hal_pt_vnoise(p * freq) * 2.0 - 1.0);
+        total = total + (s * s) * amp;
+        norm = norm + amp;
+        amp = amp * gain;
+        freq = freq * lacunarity;
+    }
+    return total / max(norm, 1e-6);
+}
 """
 
 #: pattern name -> which primitives its GLSL needs, so the assembler can
@@ -360,6 +408,36 @@ float hal_pat_wrinkles(vec3 p, int octaves, float lacunarity, float crease)
     float v = clamp(1.4 * hal_pt_turb(p, octaves, lacunarity, 0.5),
                     0.0, 1.0);
     return pow(v, max(crease, 0.01));
+}
+""",
+    # patterns.noise_fractal: the raw field, three profiles by kind
+    'noise': """
+float hal_pat_noise(vec3 p, int kind, int octaves, float lacunarity,
+                    float gain)
+{
+    if (kind == 1) { return hal_pt_turb(p, octaves, lacunarity, gain); }
+    if (kind == 2) { return hal_pt_ridged(p, octaves, lacunarity, gain); }
+    return hal_pt_fbm(p, octaves, lacunarity, gain);
+}
+""",
+    # patterns.cells: Worley by feature; returns (fac, cell id)
+    'cells': """
+vec2 hal_pat_cells(vec3 p, float jitter, int feature)
+{
+    vec3 w = hal_pt_worley3(p, jitter);
+    float v = w.x;
+    if (feature == 1) { v = w.y; }
+    if (feature == 2) { v = w.y - w.x; }
+    if (feature == 3) { v = w.z; }
+    return vec2(clamp(v, 0.0, 1.0), w.z);
+}
+""",
+    # patterns.tv_static: per-cell hash, frame-salted
+    'static': """
+float hal_pat_static(vec3 p, float frame)
+{
+    vec3 c = floor(p);
+    return hal_pt_hash3(int(c.x), int(c.y), int(c.z) + int(frame) * 7919);
 }
 """,
     # patterns.brick: running bond; (bevel ramp, brick id, inside)

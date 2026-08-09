@@ -56,6 +56,9 @@ class RenderSettings:
     # if a driver ever disagrees, turn it off and the picture is the
     # proven full-frame one
     gpu_scissor: bool = True
+    # the viewport's own device gate, for BISECTING field problems: OFF
+    # forces every viewport frame onto the CPU while F12 keeps the switch
+    viewport_gpu: bool = True
     use_processes: bool = False
     process_count: int = 0
     displacement_scale: float = 1.0
@@ -86,6 +89,12 @@ class RenderSettings:
     aa_edge_threshold: float = 0.1
     jitter: bool = False
     jitter_seed: int = 0
+    # accumulation motion blur: the frame renders motion_steps times across
+    # the shutter (re-exported at each subframe) and averages -- the
+    # accumulation-buffer trails of the era, paid for honestly at N frames
+    motion_blur: bool = False
+    motion_shutter: float = 0.5        # shutter open time, in frames
+    motion_steps: int = 5
     # ------------------------------------------------------------- geometry
     backface_cull: bool = False
     two_sided_lighting: bool = True
@@ -109,6 +118,21 @@ class RenderSettings:
     ao_distance: float = 1.0
     ao_samples: int = 8
     ao_intensity: float = 1.0
+    # one-bounce gathered ambient: the era's "Radiosity" checkbox
+    # (LightWave 5.6, MAX, POV-Ray 3). Replaces the flat ambient term with
+    # a hemisphere gather: rays that see sky return the ambient colour,
+    # rays that hit a surface return that surface's flat diffuse -- colour
+    # bleed. Supersedes plain AO while on (the gather IS occlusion-aware).
+    radiosity: bool = False
+    radiosity_samples: int = 8
+    radiosity_distance: float = 3.0
+    radiosity_intensity: float = 1.0
+    #: the era's INTERPOLATED radiosity (LightWave's shipping mode): gather
+    #: on a sparse pixel grid and blend between the points. 1 gathers every
+    #: pixel (the 1.25.95 behaviour, exact); 2 casts a quarter of the rays,
+    #: 4 a sixteenth. Softly blurred bleed -- which is what the period's
+    #: radiosity looked like -- and the same picture on either device.
+    radiosity_spacing: int = 2
     # ------------------------------------------------------------- lighting
     global_ambient: Tuple[float, float, float] = (0.05, 0.05, 0.06)
     global_ambient_level: float = 1.0
@@ -128,6 +152,12 @@ class RenderSettings:
     ray_refraction: bool = True
     ray_shadows: bool = True
     ray_bias: float = 1e-3
+    #: blurry (glossy) reflections: cone half-angle in DEGREES. 0 keeps
+    #: mirror reflections; above 0 each reflective fragment averages
+    #: `reflection_blur_samples` jittered rays -- LightWave's Reflection
+    #: Blurring, MAX's raytrace blur. The samples slider shipped in
+    #: 1.25.4x and was read by NOTHING until this pair was completed.
+    reflection_blur: float = 0.0
     reflection_blur_samples: int = 1
     env_reflection: bool = True        # sphere-map reflections when no rays
     # ------------------------------------------------------------- textures
@@ -153,6 +183,11 @@ class RenderSettings:
     fog_end: float = 40.0
     fog_density: float = 0.05
     fog_vertex: bool = False           # per-vertex fog (Voodoo/PS1 style)
+    # height fog: the fog thins with world height above fog_height_top --
+    # the layered ground mist the sixth-generation consoles drew
+    fog_height: bool = False
+    fog_height_top: float = 2.0        # world Z where the fog starts thinning
+    fog_height_falloff: float = 0.5    # how fast it thins per unit above
     # ------------------------------------------------------------- post: glow
     glow: bool = False
     glow_threshold: float = 0.85
@@ -256,22 +291,149 @@ class RenderSettings:
 
 
 RESOLUTION_PRESETS = {
-    # label: (x, y, aspect_x, aspect_y)
-    'CGA':          (320, 200, 1.0, 1.2),
-    'VGA_13H':      (320, 200, 1.0, 1.2),
-    'QVGA':         (320, 240, 1.0, 1.0),
-    'VGA':          (640, 480, 1.0, 1.0),
-    'MAC_CLASSIC':  (512, 342, 1.0, 1.0),
-    'MAC_13':       (640, 480, 1.0, 1.0),
-    'SVGA':         (800, 600, 1.0, 1.0),
-    'XGA':          (1024, 768, 1.0, 1.0),
-    'AMIGA_PAL':    (320, 256, 1.0, 1.0),
-    'AMIGA_HIRES':  (640, 512, 1.0, 1.0),
+    # key: (x, y, aspect_x, aspect_y)
+    #
+    # Pixel aspects follow the format's own standard where one exists (D1 and
+    # DV are 10:11 / 59:54 by SMPTE, the CIF family is 12:11 by H.261, SVCD
+    # 15:11 / 59:36 by its spec); where no standard names a number, the aspect
+    # is whatever fills a 4:3 tube with the mode's pixel grid, which is what
+    # the hardware actually did. Every key that ever shipped stays: keys are
+    # enum identifiers and operator arguments saved inside .blend files.
+
+    # --- televisions and broadcast
+    'NTSC_SQ':      (640, 480, 1.0, 1.0),
+    'PAL_SQ':       (768, 576, 1.0, 1.0),
     'NTSC_D1':      (720, 486, 10.0, 11.0),
     'PAL_D1':       (720, 576, 59.0, 54.0),
+    'NTSC_D1_WIDE': (720, 486, 40.0, 33.0),
+    'PAL_D1_WIDE':  (720, 576, 118.0, 81.0),
     'NTSC_TOASTER': (752, 480, 10.0, 11.0),
+    'HDTV_720':     (1280, 720, 1.0, 1.0),
+    'HDTV_1080':    (1920, 1080, 1.0, 1.0),
+
+    # --- computer monitors
+    'HERCULES':     (720, 348, 1.0, 1.55),
+    'EGA':          (640, 350, 1.0, 1.37),
+    'QVGA':         (320, 240, 1.0, 1.0),
+    'VGA':          (640, 480, 1.0, 1.0),
+    'SVGA':         (800, 600, 1.0, 1.0),
+    'XGA':          (1024, 768, 1.0, 1.0),
+    'SXGA':         (1280, 1024, 1.0, 1.0),
+    'UXGA':         (1600, 1200, 1.0, 1.0),
+    'SUN_WS':       (1152, 900, 1.0, 1.0),
+    'NEXT_MEGAPIXEL': (1120, 832, 1.0, 1.0),
+    'MAC_13':       (640, 480, 1.0, 1.0),
+    'MAC_16':       (832, 624, 1.0, 1.0),
+    'MAC_PORTRAIT': (640, 870, 1.0, 1.0),
+    'MAC_TWO_PAGE': (1152, 870, 1.0, 1.0),
+
+    # --- home computers
+    'CGA':          (320, 200, 1.0, 1.2),
+    'VGA_13H':      (320, 200, 1.0, 1.2),
+    'QUAKE':        (320, 200, 1.0, 1.2),
+    'MAC_CLASSIC':  (512, 342, 1.0, 1.0),
+    'ATARI_ST':     (320, 200, 1.0, 1.2),
+    'AMIGA_NTSC':   (320, 200, 1.0, 1.2),
+    'AMIGA_PAL':    (320, 256, 1.0, 1.0),
+    'AMIGA_HIRES':  (640, 512, 1.0, 1.0),
+
+    # --- game consoles
+    'SNES':         (256, 224, 8.0, 7.0),
+    'GENESIS':      (320, 224, 32.0, 35.0),
+    'SATURN':       (352, 240, 10.0, 11.0),
     'PSX':          (320, 240, 1.0, 1.0),
     'PSX_HI':       (512, 240, 1.0, 2.0),
     'N64':          (320, 240, 1.0, 1.0),
-    'QUAKE':        (320, 200, 1.0, 1.2),
+    'N64_HI':       (640, 480, 1.0, 1.0),
+    'DREAMCAST':    (640, 480, 1.0, 1.0),
+    'GAMECUBE':     (640, 480, 1.0, 1.0),
+    'PS2':          (640, 448, 14.0, 15.0),
+    'XBOX':         (640, 480, 1.0, 1.0),
+
+    # --- video formats
+    'QCIF':         (176, 144, 12.0, 11.0),
+    'CIF':          (352, 288, 12.0, 11.0),
+    'VCD_NTSC':     (352, 240, 10.0, 11.0),
+    'VCD_PAL':      (352, 288, 12.0, 11.0),
+    'SVCD_NTSC':    (480, 480, 15.0, 11.0),
+    'SVCD_PAL':     (480, 576, 59.0, 36.0),
+    'DV_NTSC':      (720, 480, 10.0, 11.0),
+    'DV_PAL':       (720, 576, 59.0, 54.0),
+    'QUICKTIME_160': (160, 120, 1.0, 1.0),
+
+    # --- pictures and textures
+    'QUICKTAKE':    (640, 480, 1.0, 1.0),
+    'DC120':        (1280, 960, 1.0, 1.0),
+    'PHOTOCD_BASE': (768, 512, 1.0, 1.0),
+    'PHOTOCD_4BASE': (1536, 1024, 1.0, 1.0),
+    'PHOTOCD_16BASE': (3072, 2048, 1.0, 1.0),
+    'TEXTURE_128':  (128, 128, 1.0, 1.0),
+    'TEXTURE_256':  (256, 256, 1.0, 1.0),
+    'TEXTURE_512':  (512, 512, 1.0, 1.0),
 }
+
+#: the categories the UI shows, in order. Every RESOLUTION_PRESETS key appears
+#: in exactly one group -- the test suite holds the two tables to each other.
+RESOLUTION_GROUPS = (
+    ("Televisions", ('NTSC_SQ', 'PAL_SQ', 'NTSC_D1', 'PAL_D1',
+                     'NTSC_D1_WIDE', 'PAL_D1_WIDE', 'NTSC_TOASTER',
+                     'HDTV_720', 'HDTV_1080')),
+    ("Computer Monitors", ('HERCULES', 'EGA', 'QVGA', 'VGA', 'SVGA', 'XGA',
+                           'SXGA', 'UXGA', 'SUN_WS', 'NEXT_MEGAPIXEL',
+                           'MAC_13', 'MAC_16', 'MAC_PORTRAIT',
+                           'MAC_TWO_PAGE')),
+    ("Home Computers", ('CGA', 'VGA_13H', 'QUAKE', 'MAC_CLASSIC', 'ATARI_ST',
+                        'AMIGA_NTSC', 'AMIGA_PAL', 'AMIGA_HIRES')),
+    ("Game Consoles", ('SNES', 'GENESIS', 'SATURN', 'PSX', 'PSX_HI', 'N64',
+                       'N64_HI', 'DREAMCAST', 'GAMECUBE', 'PS2', 'XBOX')),
+    ("Video Formats", ('QCIF', 'CIF', 'VCD_NTSC', 'VCD_PAL', 'SVCD_NTSC',
+                       'SVCD_PAL', 'DV_NTSC', 'DV_PAL', 'QUICKTIME_160')),
+    ("Pictures & Textures", ('QUICKTAKE', 'DC120', 'PHOTOCD_BASE',
+                             'PHOTOCD_4BASE', 'PHOTOCD_16BASE', 'TEXTURE_128',
+                             'TEXTURE_256', 'TEXTURE_512')),
+)
+
+#: display names where Title Case of the key would be wrong or unhelpful
+RESOLUTION_LABELS = {
+    'NTSC_SQ': "NTSC Square Pixel", 'PAL_SQ': "PAL Square Pixel",
+    'NTSC_D1': "NTSC D1", 'PAL_D1': "PAL D1",
+    'NTSC_D1_WIDE': "NTSC D1 Widescreen", 'PAL_D1_WIDE': "PAL D1 Widescreen",
+    'NTSC_TOASTER': "Video Toaster NTSC",
+    'HDTV_720': "HDTV 720p", 'HDTV_1080': "HDTV 1080",
+    'HERCULES': "Hercules Mono", 'EGA': "EGA", 'QVGA': "QVGA / VGA Mode X",
+    'VGA': "VGA", 'SVGA': "Super VGA", 'XGA': "XGA", 'SXGA': "SXGA",
+    'UXGA': "UXGA", 'SUN_WS': "Sun Workstation",
+    'NEXT_MEGAPIXEL': "NeXT MegaPixel",
+    'MAC_13': "Mac 13\" RGB", 'MAC_16': "Mac 16\"",
+    'MAC_PORTRAIT': "Mac Portrait", 'MAC_TWO_PAGE': "Mac Two-Page",
+    'CGA': "CGA", 'VGA_13H': "VGA Mode 13h", 'QUAKE': "Quake / DOS Games",
+    'MAC_CLASSIC': "Mac Classic", 'ATARI_ST': "Atari ST Low",
+    'AMIGA_NTSC': "Amiga NTSC Lores", 'AMIGA_PAL': "Amiga PAL Lores",
+    'AMIGA_HIRES': "Amiga PAL Hires",
+    'SNES': "Super NES", 'GENESIS': "Genesis / Mega Drive",
+    'SATURN': "Saturn", 'PSX': "PlayStation", 'PSX_HI': "PlayStation Hi-Res",
+    'N64': "Nintendo 64", 'N64_HI': "Nintendo 64 Hi-Res",
+    'DREAMCAST': "Dreamcast", 'GAMECUBE': "GameCube",
+    'PS2': "PlayStation 2", 'XBOX': "Xbox",
+    'QCIF': "QCIF Videophone", 'CIF': "CIF Videoconference",
+    'VCD_NTSC': "Video CD NTSC", 'VCD_PAL': "Video CD PAL",
+    'SVCD_NTSC': "Super Video CD NTSC", 'SVCD_PAL': "Super Video CD PAL",
+    'DV_NTSC': "DV NTSC", 'DV_PAL': "DV PAL",
+    'QUICKTIME_160': "QuickTime Web Movie",
+    'QUICKTAKE': "Apple QuickTake", 'DC120': "Kodak DC120 Megapixel",
+    'PHOTOCD_BASE': "Photo CD Base", 'PHOTOCD_4BASE': "Photo CD 4Base",
+    'PHOTOCD_16BASE': "Photo CD 16Base",
+    'TEXTURE_128': "Game Texture 128", 'TEXTURE_256': "Game Texture 256",
+    'TEXTURE_512': "Game Texture 512",
+}
+
+
+def resolution_label(key):
+    return RESOLUTION_LABELS.get(key, key.replace('_', ' ').title())
+
+
+def resolution_description(key):
+    x, y, ax, ay = RESOLUTION_PRESETS[key]
+    if ax == ay:
+        return f"{x}x{y}"
+    return f"{x}x{y}, {ax:g}:{ay:g} pixels"

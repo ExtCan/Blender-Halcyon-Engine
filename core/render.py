@@ -179,7 +179,12 @@ def closure_to_surface(cl, ctx, settings, material=None):
     rough_acc = np.zeros(n, np.float32)
     rough_w = np.zeros(n, np.float32)
     normal = None
-    halcyon = None
+    halcyon = []          # (weight, params) -- EVERY master lobe, weighted.
+    # It was one slot, last-wins, weight DISCARDED: mixing two Halcyon
+    # Shaders through a Mix Shader showed only the second whatever the Fac
+    # said, and mixing one with any BSDF ignored the BSDF entirely -- "the
+    # Mix Shader node doesn't work", said the field, about the one node
+    # every converted material in this engine flows through.
     gloss_model = None
     diff_model = None
 
@@ -189,10 +194,10 @@ def closure_to_surface(cl, ctx, settings, material=None):
             w = np.broadcast_to(w, (n,)).copy()
         col = p.get('color')
         rgb = to_color(col, n)[:, :3] if col is not None else np.ones((n, 3), np.float32)
-        if p.get('normal') is not None:
+        if p.get('normal') is not None and kind != 'HALCYON':
             normal = p['normal']
         if kind == 'HALCYON':
-            halcyon = p
+            halcyon.append((w, p))
             continue
         if kind == 'DIFFUSE':
             diff += rgb * w[:, None]
@@ -236,45 +241,78 @@ def closure_to_surface(cl, ctx, settings, material=None):
         elif kind == 'HOLDOUT':
             transp += w
 
-    if halcyon is not None:
-        p = halcyon
-        surf.diffuse = to_color(p['color'], n)[:, :3]
-        surf.diffuse_level = to_value(p['diffuse_level'], n)
-        surf.specular = to_color(p['spec_color'], n)[:, :3]
-        surf.specular_level = to_value(p['spec_level'], n)
-        surf.glossiness = np.maximum(to_value(p['glossiness'], n), 0.5)
-        surf.roughness = np.clip(to_value(p['roughness'], n), 0.0, 1.0)
-        surf.ambient = to_value(p['ambient'], n)
-        surf.emission = to_color(p['emission'], n)[:, :3]
-        surf.opacity = np.clip(to_value(p['opacity'], n), 0.0, 1.0)
-        surf.ior = np.maximum(to_value(p['ior'], n), 1.0)
-        surf.anisotropy = to_value(p['anisotropy'], n)
-        surf.aniso_rot = to_value(p['rotation'], n)
-        surf.metallic = to_value(p['metallic'], n)
-        surf.soften = to_value(p['soften'], n)
-        surf.reflect = to_value(p['reflect'], n)
-        surf.translucency = to_value(p['translucency'], n)
-        surf.toon_size = to_value(p['toon_size'], n)
-        surf.toon_smooth = to_value(p['toon_smooth'], n)
-        if p.get('toon_steps') is not None:
-            surf.toon_steps = to_value(p['toon_steps'], n)
-        for key, attr, kind in (
-                ('fresnel', 'fresnel', 'v'), ('fresnel_power', 'fresnel_power', 'v'),
-                ('fresnel_color', 'fresnel_color', 'c'), ('rim', 'rim', 'v'),
-                ('rim_power', 'rim_power', 'v'), ('rim_color', 'rim_color', 'c'),
-                ('matcap', 'matcap', 'c'), ('matcap_blend', 'matcap_blend', 'v'),
-                ('reflect_color', 'reflect_color', 'c'),
-                ('edge_opacity', 'edge_opacity', 'v'),
-                ('backface_color', 'backface_color', 'c'),
-                ('backface_mix', 'backface_mix', 'v'),
-                ('sheen', 'sheen', 'v'), ('sheen_color', 'sheen_color', 'c'),
-                ('sheen_roughness', 'sheen_roughness', 'v'),
-                ('refraction', 'refraction', 'v')):
-            if p.get(key) is not None:
-                setattr(surf, attr, to_color(p[key], n)[:, :3] if kind == 'c'
-                        else to_value(p[key], n))
-        model = p.get('model', model)
-        if p.get('normal') is not None:
+    if halcyon:
+        # Every master lobe contributes BY ITS WEIGHT: the parameters blend
+        # in material space -- which is exactly how the fixed-function era
+        # mixed looks, attribute by attribute -- so Mix Shader between two
+        # Halcyon Shaders lerps them by Fac (per pixel when Fac is driven),
+        # and a chain of mixes converges instead of last-wins. A single
+        # full-weight lobe reduces to multiplying by 1.0: every existing
+        # master material shades bit-identically.
+        plain_transl = surf.translucency
+        wsum = np.zeros(n, np.float32)
+        for hwl, _p in halcyon:
+            wsum += hwl
+        hw = np.clip(wsum, 0.0, 1.0)
+        norm_w = np.maximum(wsum, np.float32(1e-6))
+
+        def hmix(key, default, colour=False):
+            acc = np.zeros((n, 3), np.float32) if colour \
+                else np.zeros(n, np.float32)
+            for hwl, hp in halcyon:
+                v = hp.get(key)
+                v = default if v is None else v
+                s = to_color(v, n)[:, :3] if colour else to_value(v, n)
+                f = hwl / norm_w
+                acc = acc + (s * f[:, None] if colour else s * f)
+            return acc
+
+        surf.diffuse = hmix('color', (0.8, 0.8, 0.8), True)
+        surf.diffuse_level = hmix('diffuse_level', 1.0)
+        surf.specular = hmix('spec_color', (1.0, 1.0, 1.0), True)
+        surf.specular_level = hmix('spec_level', 0.5)
+        surf.glossiness = np.maximum(hmix('glossiness', 25.0), 0.5)
+        surf.roughness = np.clip(hmix('roughness', 0.3), 0.0, 1.0)
+        surf.ambient = hmix('ambient', 1.0)
+        surf.emission = hmix('emission', (0.0, 0.0, 0.0), True)
+        surf.opacity = np.clip(hmix('opacity', 1.0), 0.0, 1.0)
+        surf.ior = np.maximum(hmix('ior', 1.45), 1.0)
+        surf.anisotropy = hmix('anisotropy', 0.0)
+        surf.aniso_rot = hmix('rotation', 0.0)
+        surf.metallic = hmix('metallic', 0.0)
+        surf.soften = hmix('soften', 0.0)
+        surf.reflect = hmix('reflect', 0.0)
+        surf.translucency = hmix('translucency', 0.0)
+        surf.toon_size = hmix('toon_size', 0.5)
+        surf.toon_smooth = hmix('toon_smooth', 0.05)
+        if any(hp.get('toon_steps') is not None for _w, hp in halcyon):
+            surf.toon_steps = hmix('toon_steps', 2.0)
+        for key, attr, knd, dflt in (
+                ('fresnel', 'fresnel', 'v', 0.0),
+                ('fresnel_power', 'fresnel_power', 'v', 3.0),
+                ('fresnel_color', 'fresnel_color', 'c', (1, 1, 1)),
+                ('rim', 'rim', 'v', 0.0),
+                ('rim_power', 'rim_power', 'v', 3.0),
+                ('rim_color', 'rim_color', 'c', (1, 1, 1)),
+                ('matcap', 'matcap', 'c', (0, 0, 0)),
+                ('matcap_blend', 'matcap_blend', 'v', 0.0),
+                ('reflect_color', 'reflect_color', 'c', (1, 1, 1)),
+                ('edge_opacity', 'edge_opacity', 'v', 1.0),
+                ('backface_color', 'backface_color', 'c', (0, 0, 0)),
+                ('backface_mix', 'backface_mix', 'v', 0.0),
+                ('sheen', 'sheen', 'v', 0.0),
+                ('sheen_color', 'sheen_color', 'c', (1, 1, 1)),
+                ('sheen_roughness', 'sheen_roughness', 'v', 0.3),
+                ('refraction', 'refraction', 'v', 1.0)):
+            if any(hp.get(key) is not None for _w, hp in halcyon):
+                setattr(surf, attr, hmix(key, dflt, knd == 'c'))
+        # the model cannot blend: the HEAVIEST lobe names it, deterministic
+        heavy = max(halcyon, key=lambda t: float(np.mean(t[0])))
+        model = heavy[1].get('model', model)
+        carriers = [(hwl, hp) for hwl, hp in halcyon
+                    if hp.get('normal') is not None]
+        if carriers:
+            _w_, p = max(carriers, key=lambda t: float(np.mean(t[0])))
             normal = p['normal']
             # Bump Strength scales how far the supplied normal is allowed to
             # bend away from the surface it sits on. Done here rather than in
@@ -287,6 +325,57 @@ def closure_to_surface(cl, ctx, settings, material=None):
                     geo = M.normalize(np.asarray(ctx.N, np.float32))
                     normal = geo + (M.normalize(np.asarray(normal, np.float32))
                                     - geo) * k
+        # a mix with PLAIN lobes (a master blended against a raw BSDF):
+        # albedos blend by relative weight, levels sum toward 1, the era
+        # terms that only a master carries fade with its share, and the
+        # transparent side eats into opacity exactly as Fac says
+        others = np.any(diff_w > 1e-6) or np.any(spec_w > 1e-6) or \
+            np.any(transp > 1e-6) or np.any(emis != 0.0) or \
+            np.any(refr > 1e-6) or np.any(plain_transl > 1e-6)
+        if others:
+            if np.any(diff_w > 1e-6):
+                t = diff_w / np.maximum(hw + diff_w, 1e-6)
+                pd = diff / np.maximum(diff_w, 1e-6)[:, None]
+                surf.diffuse = surf.diffuse * (1.0 - t)[:, None] \
+                    + pd * t[:, None]
+                surf.diffuse_level = np.clip(
+                    surf.diffuse_level * hw + diff_w, 0.0, 1.0)
+            else:
+                surf.diffuse_level = surf.diffuse_level * hw
+            if np.any(spec_w > 1e-6):
+                t = spec_w / np.maximum(hw + spec_w, 1e-6)
+                ps = spec / np.maximum(spec_w, 1e-6)[:, None]
+                surf.specular = surf.specular * (1.0 - t)[:, None] \
+                    + ps * t[:, None]
+                surf.specular_level = np.clip(
+                    surf.specular_level * hw + spec_w, 0.0, 1.0)
+            else:
+                surf.specular_level = surf.specular_level * hw
+            if np.any(rough_w > 1e-6):
+                t = rough_w / np.maximum(hw + rough_w, 1e-6)
+                rp = np.clip(rough_acc / np.maximum(rough_w, 1e-6), 0.0, 1.0)
+                gp = np.minimum(np.maximum(
+                    2.0 / np.maximum(rp ** 4, 1e-5) - 2.0, 0.5), 8192.0)
+                surf.roughness = np.clip(
+                    surf.roughness * (1.0 - t) + rp * t, 0.0, 1.0)
+                surf.glossiness = surf.glossiness * (1.0 - t) + gp * t
+            surf.emission = surf.emission * hw[:, None] + emis
+            surf.opacity = np.clip(
+                1.0 - transp - (1.0 - surf.opacity) * hw, 0.0, 1.0)
+            surf.reflect = np.clip(surf.reflect * hw + refr, 0.0, 1.0)
+            surf.translucency = np.maximum(surf.translucency * hw,
+                                           plain_transl)
+            surf.ambient = 1.0 + (surf.ambient - 1.0) * hw
+            surf.edge_opacity = 1.0 + (surf.edge_opacity - 1.0) * hw
+            for a_ in ('fresnel', 'rim', 'matcap_blend', 'sheen',
+                       'backface_mix'):
+                setattr(surf, a_, getattr(surf, a_) * hw)
+            # a plain gloss side heavier than every master lobe also
+            # outvotes the model
+            if np.any(spec_w > 1e-6) and \
+                    float(np.mean(spec_w)) > float(np.mean(hw)) and \
+                    gloss_model is not None:
+                model = gloss_model
     else:
         w = np.maximum(diff_w, 1e-6)
         if np.any(diff_w > 1e-6):
@@ -342,17 +431,37 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
     # untouched. This is a units conversion, not a change to the models.
     inv_pi = np.float32(1.0 / np.pi)
 
-    amb_col = LI.ambient_light(scene, settings)
-    out = surf.diffuse * surf.ambient[:, None] * amb_col[None, :]
-
     spx = getattr(ctx, 'spx', None)
     spy = getattr(ctx, 'spy', None)
     have_id = spx is not None and spy is not None
 
-    if settings.ambient_occlusion and bvh is not None:
-        out *= ambient_occlusion(ctx.P, N, bvh, settings, rng,
-                                 sample_xy=(spx, spy) if have_id
-                                 else None)[:, None]
+    if getattr(settings, 'radiosity', False) and bvh is not None:
+        # the Radiosity checkbox: gathered ambient replaces the flat
+        # term outright, and plain AO with it -- the gather is
+        # occlusion-aware by construction (blocked sky IS the darkening,
+        # and what blocks it lends its colour instead). Frame pixels
+        # read the interpolated FIELD when spacing > 1; ray hits and
+        # vertex corners (no pixel identity, or no field) gather fully.
+        field = getattr(ctx, 'radiosity_field', None)
+        if field is not None and ctx.px is not None:
+            # SCREEN pixels (frame and transparent layers) read the
+            # cache at their own pixel; traced hits have no place in a
+            # screen-space cache and gather fully, identity intact
+            irr = radiosity_lookup(
+                field, getattr(settings, 'radiosity_spacing', 1),
+                ctx.px, ctx.py, LI.ambient_light(scene, settings))
+        else:
+            irr = radiosity_gather(ctx.P, N, bvh, scene, settings, rng,
+                                   sample_xy=(spx, spy) if have_id
+                                   else None)
+        out = surf.diffuse * surf.ambient[:, None] * irr
+    else:
+        amb_col = LI.ambient_light(scene, settings)
+        out = surf.diffuse * surf.ambient[:, None] * amb_col[None, :]
+        if settings.ambient_occlusion and bvh is not None:
+            out *= ambient_occlusion(ctx.P, N, bvh, settings, rng,
+                                     sample_xy=(spx, spy) if have_id
+                                     else None)[:, None]
 
     # the sheen lobe's falloff, computed once rather than per light
     sheen_exp = None
@@ -443,6 +552,181 @@ def apply_surface_effects(out, surf, N, V):
              np.clip(surf.backfacing, 0.0, 1.0))[:, None]
         out = out * (1.0 - k) + surf.backface_color * k
     return out
+
+
+def radiosity_albedos(scene):
+    """The per-material bleed colours, as one (M,3) float32 table.
+
+    The colour a surface LENDS its neighbours is its flat diffuse -- the
+    material's own field, which graph materials carry as their display
+    colour. Reading the textured, per-pixel albedo at every gather hit is
+    beyond both devices equally, and the era's radiosity previews used
+    flat patch colours anyway. Built once per scene and cached on it; the
+    GPU bakes THIS table into its selector so both devices bleed the same
+    numbers.
+    """
+    cached = getattr(scene, '_radiosity_albedo', None)
+    if cached is not None and cached.shape[0] == len(scene.materials):
+        return cached
+    table = np.array([tuple(getattr(m, 'diffuse', (0.8, 0.8, 0.8)))[:3]
+                      for m in scene.materials] or [(0.8, 0.8, 0.8)],
+                     np.float32)
+    scene._radiosity_albedo = table
+    return table
+
+
+#: the radiosity gather's hash-stream salt -- distinct from lights (131*li),
+#: the AO pass (8389), the AO node (6151) and reflection blur (10009)
+RADIOSITY_SALT = 9973
+
+
+def radiosity_field(job, gbuf, settings, scene, bvh):
+    """The interpolated gather: irradiance at every Nth pixel, as a grid.
+
+    LightWave's shipping radiosity was exactly this -- evaluate sparsely,
+    blend between the points -- and it is what makes the feature usable at
+    real resolutions: spacing 2 casts a quarter of the rays, 4 a
+    sixteenth. The grid lives on the RENDER-resolution pixel lattice
+    (grid point (gx, gy) at pixel (gx*N, gy*N)); each point gathers at
+    the FIRST COVERED pixel of its NxN block in row-major order, with
+    that pixel's own deterministic sampling identity -- so the GPU's grid
+    pass, walking the same blocks in the same order, draws the same rays
+    and lands the same numbers. A block with no coverage is INVALID and
+    carries zero weight at lookup; a pixel whose four corners are all
+    invalid falls back to the flat ambient colour.
+
+    Returns (Gh, Gw, 4) float32 -- rgb irradiance + validity -- or None
+    when spacing is 1 (the full-rate path, byte-for-byte the 1.25.95
+    behaviour).
+    """
+    N = max(int(getattr(settings, 'radiosity_spacing', 1)), 1)
+    if N <= 1 or bvh is None:
+        return None
+    mask = gbuf.mask()
+    rh, rw = mask.shape
+    Gw = (rw + N - 1) // N
+    Gh = (rh + N - 1) // N
+    # pad coverage to whole blocks, then order each block row-major
+    pad = np.zeros((Gh * N, Gw * N), bool)
+    pad[:rh, :rw] = mask
+    blocks = pad.reshape(Gh, N, Gw, N).transpose(0, 2, 1, 3) \
+                .reshape(Gh, Gw, N * N)
+    valid = blocks.any(axis=2)
+    first = blocks.argmax(axis=2)          # first covered, row-major
+    gy, gx = np.nonzero(valid)
+    dy, dx = np.divmod(first[gy, gx], N)
+    spy = gy * N + dy
+    spx = gx * N + dx
+    field = np.zeros((Gh, Gw, 4), np.float32)
+    if gy.size:
+        tri = gbuf.tri[spy, spx]
+        bary = gbuf.bary[spy, spx]
+        ctx = job.context(tri, bary, px=spx, py=spy)
+        Nrm = M.normalize(ctx.N)
+        irr = radiosity_gather(ctx.P, Nrm, bvh, scene, settings,
+                               sample_xy=(spx.astype(np.int64),
+                                          spy.astype(np.int64)))
+        field[gy, gx, :3] = irr
+        field[gy, gx, 3] = 1.0
+    return field
+
+
+def radiosity_lookup(field, spacing, px, py, ambient):
+    """Bilinear over the grid, validity-weighted; all-invalid -> ambient.
+
+    Pure float32 arithmetic in a fixed order: the GLSL twin runs the same
+    expressions over the same texels, so both devices blend identically.
+    """
+    N = np.float32(max(int(spacing), 1))
+    Gh, Gw = field.shape[:2]
+    fx = np.asarray(px, np.float32) / N
+    fy = np.asarray(py, np.float32) / N
+    gx0 = np.minimum(np.floor(fx), Gw - 1).astype(np.int32)
+    gy0 = np.minimum(np.floor(fy), Gh - 1).astype(np.int32)
+    gx1 = np.minimum(gx0 + 1, Gw - 1)
+    gy1 = np.minimum(gy0 + 1, Gh - 1)
+    tx = np.clip(fx - gx0, 0.0, 1.0).astype(np.float32)
+    ty = np.clip(fy - gy0, 0.0, 1.0).astype(np.float32)
+    c00 = field[gy0, gx0]
+    c10 = field[gy0, gx1]
+    c01 = field[gy1, gx0]
+    c11 = field[gy1, gx1]
+    w00 = (1.0 - tx) * (1.0 - ty) * c00[:, 3]
+    w10 = tx * (1.0 - ty) * c10[:, 3]
+    w01 = (1.0 - tx) * ty * c01[:, 3]
+    w11 = tx * ty * c11[:, 3]
+    total = w00 + w10 + w01 + w11
+    rgb = (c00[:, :3] * w00[:, None] + c10[:, :3] * w10[:, None] +
+           c01[:, :3] * w01[:, None] + c11[:, :3] * w11[:, None])
+    amb = np.asarray(ambient, np.float32)
+    safe = np.maximum(total, np.float32(1e-6))
+    out = np.where((total > 1e-6)[:, None], rgb / safe[:, None],
+                   amb[None, :])
+    return out.astype(np.float32)
+
+
+def radiosity_gather(P, N, bvh, scene, settings, rng=None, sample_xy=None):
+    """One-bounce gathered ambient: the era's Radiosity checkbox.
+
+    Cosine-weighted hemisphere rays from the same deterministic streams
+    the AO pass draws (its own salt): a ray that reaches the sky within
+    `radiosity_distance` returns the scene's ambient colour -- exactly
+    what the flat ambient term stood for -- and a ray that lands on a
+    surface returns that surface's flat diffuse scaled by
+    `radiosity_intensity` and a linear falloff over the gather distance:
+    colour bleed. Plain AO is superseded while this is on, because the
+    gather is occlusion-aware by construction (blocked sky IS the
+    darkening).
+    """
+    from . import lights as LI
+    n = P.shape[0]
+    samples = max(int(settings.radiosity_samples), 1)
+    dist = max(float(settings.radiosity_distance), 1e-4)
+    intensity = float(settings.radiosity_intensity)
+    amb = np.asarray(LI.ambient_light(scene, settings), np.float32)
+    albedo = radiosity_albedos(scene)
+    mat_index = scene.mesh.mat_index if scene.mesh is not None and \
+        getattr(scene.mesh, 'mat_index', None) is not None else None
+    t, b = M.orthonormal_basis(N)
+    origin = P + N * max(settings.ray_bias, 1e-4)
+    gather = np.zeros((n, 3), np.float32)
+    tmax = np.full(n, dist, np.float32)
+
+    def one_dir(u1, ca, sa):
+        r = np.sqrt(u1)
+        return M.normalize(t * (r * ca)[:, None] + b * (r * sa)[:, None] +
+                           N * np.sqrt(np.maximum(np.float32(1.0) - u1,
+                                                  np.float32(0.0)))[:, None])
+
+    def gather_dir(d):
+        tid, th, _u, _v = bvh.intersect(origin, d, tmax)
+        hit = (tid >= 0) & (th <= dist)
+        out = np.where(hit[:, None], np.float32(0.0), amb[None, :])
+        if np.any(hit):
+            idx = np.nonzero(hit)[0]
+            mi = mat_index[tid[idx]] if mat_index is not None else \
+                np.zeros(idx.size, np.int32)
+            mi = np.clip(mi, 0, albedo.shape[0] - 1)
+            fall = np.clip(1.0 - th[idx] / np.float32(dist), 0.0, 1.0)
+            out[idx] = albedo[mi] * (fall * np.float32(intensity))[:, None]
+        return out.astype(np.float32)
+
+    if sample_xy is not None:
+        from . import patterns as PT
+        spx, spy = sample_xy
+        seed = int(getattr(settings, 'seed', 0) or 0)
+        for k in range(samples):
+            z = 2 * k + RADIOSITY_SALT + 7919 * seed
+            u1 = PT.sample_u(spx, spy, z)
+            ca, sa = PT.sample_circle(PT.sample_u(spx, spy, z + 1))
+            gather += gather_dir(one_dir(u1, ca, sa))
+    else:
+        rng = rng or np.random.default_rng(settings.seed)
+        for _ in range(samples):
+            u1 = rng.random(n).astype(np.float32)
+            th_ = (2.0 * np.pi * rng.random(n)).astype(np.float32)
+            gather += gather_dir(one_dir(u1, np.cos(th_), np.sin(th_)))
+    return gather / np.float32(samples)
 
 
 def ambient_occlusion(P, N, bvh, settings, rng=None, sample_xy=None):
@@ -588,10 +872,16 @@ def world_color(scene, settings, dirs, textures, n=None, eye=None):
 # ------------------------------------------------------------------- fog
 
 
-def apply_fog(rgb, depth, settings, scene, vertex_rate=False):
+def apply_fog(rgb, depth, settings, scene, vertex_rate=False, P=None):
     """Distance fog. `fog_vertex` evaluates it per vertex and interpolates,
     which is how fixed-function hardware did it -- and it shows, because the
-    fog band follows the tessellation rather than the surface."""
+    fog band follows the tessellation rather than the surface.
+
+    `fog_height` scales the fog by world height: full below fog_height_top,
+    thinning exponentially above it -- the layered ground mist the
+    sixth-generation consoles drew (fog volumes on the GameCube, VU-computed
+    height fog on the PS2). Needs `P`; without it the fog stays pure
+    distance fog."""
     if not settings.fog:
         return rgb
     if settings.fog_vertex and not vertex_rate:
@@ -610,9 +900,43 @@ def apply_fog(rgb, depth, settings, scene, vertex_rate=False):
         t = np.clip((d - settings.fog_start) /
                     max(settings.fog_end - settings.fog_start, 1e-5), 0.0, 1.0)
         f = 1.0 - np.floor(t * 16.0) / 16.0
-    f = np.clip(f, 0.0, 1.0)[:, None]
+    f = np.clip(f, 0.0, 1.0)
+    if getattr(settings, 'fog_height', False) and P is not None:
+        # h = 1 below the top (full fog), exp falloff above; the fog AMOUNT
+        # (1 - f) scales by h, so high surfaces come out of the mist. Where
+        # h is exactly 1 the transmittance passes through UNTOUCHED --
+        # 1-(1-f) re-rounds f by an ulp, and an inert control must be inert
+        above = np.maximum(P[:, 2] - float(settings.fog_height_top), 0.0)
+        h = np.exp(-above * max(float(settings.fog_height_falloff), 0.0))
+        f = np.where(h >= 1.0, f, 1.0 - (1.0 - f) * h)
+    f = f[:, None]
     col = np.asarray(settings.fog_color, np.float32)[None, :]
     return (rgb * f + col * (1.0 - f)).astype(np.float32)
+
+
+def fog_for_points(job, tri_idx, bary, rgb):
+    """apply_fog for externally-shaded points, exactly as shade_batch fogs.
+
+    Fog is SEPARABLE: a lerp toward the fog colour by a factor of geometry
+    alone (view depth and world height), independent of shading. So the
+    deferred pass shades on the driver, and the CPU's OWN apply_fog runs
+    on the readback with the same P and the same ctx.depth formula --
+    the two devices agree by construction instead of by a GLSL twin of
+    four fog modes, a quantised vertex emulation and a height layer.
+
+    The caller decides WHICH points: pixel-rate surfaces fog here;
+    vertex-rate materials must NOT (their fog is already inside the
+    CPU-lit corner values, at the corner rate, exactly as the era's
+    hardware fogged per vertex).
+    """
+    st = job.settings
+    if not getattr(st, 'fog', False) or tri_idx.size == 0:
+        return rgb
+    P = job.attributes(tri_idx, bary, None)[0]
+    view_p = (P - job.eye[None, :]) @ job.view[:3, :3].T
+    depth = np.abs(view_p[:, 2]).astype(np.float32)
+    return apply_fog(np.asarray(rgb, np.float32), depth, st, job.scene,
+                     P=P)
 
 
 # --------------------------------------------------------- fragment shading
@@ -715,6 +1039,117 @@ class ShadeJob:
             if mesh.colors is not None else np.ones((tri_idx.size, 4), np.float32)
         return P, M.normalize(Ns), M.normalize(Ng), uv, uv2, col
 
+    def uv_screen_gradients(self, tri_idx, bary, uv):
+        """Analytic per-pixel screen derivatives of the interpolated UV.
+
+        (du/dx, du/dy) and (dv/dx, dv/dy) in UV units per output pixel --
+        what a hardware rasteriser reads off its 2x2 quads, computed
+        exactly instead: for perspective-correct interpolation over a
+        triangle with screen-affine barycentrics L_i (constant gradients
+        g_i) and clip w_i per vertex,
+
+            grad(uv) = W * sum_i (uv_i - uv) * g_i / w_i,   W = sum(bary*w)
+
+        Analytic beats quad differences here for three reasons the
+        engine already cares about: no seams at triangle edges, a pure
+        function of (tri, bary) so chunking and threading cannot change
+        it, and it works for A-buffer fragments the same as for opaque
+        pixels. Ray hits have no screen footprint and never call this.
+        The projection is cached per job; the accumulation jitter is a
+        pure translation, which gradients cannot see.
+        """
+        mesh = self.scene.mesh
+        cache = getattr(self, '_sgrad_cache', None)
+        if cache is None:
+            _v, _p, vp, _e = camera_matrices(self.scene.camera, self.width,
+                                             self.height)
+            verts = np.asarray(mesh.verts, np.float32)
+            clip = np.concatenate(
+                [verts, np.ones((verts.shape[0], 1), np.float32)],
+                axis=1) @ vp.T
+            w = clip[:, 3]
+            ws = np.where(np.abs(w) < 1e-9, np.float32(1e-9), w)
+            sx = (clip[:, 0] / ws * 0.5 + 0.5) * self.width
+            sy = (clip[:, 1] / ws * 0.5 + 0.5) * self.height
+            cache = (sx.astype(np.float32), sy.astype(np.float32),
+                     ws.astype(np.float32))
+            self._sgrad_cache = cache
+        sx, sy, w = cache
+        tris = mesh.tris[tri_idx]                              # (N,3)
+        p = np.stack([np.stack([sx[tris[:, i]], sy[tris[:, i]]], 1)
+                      for i in range(3)], axis=1)              # (N,3,2)
+        e1 = p[:, 1] - p[:, 0]
+        e2 = p[:, 2] - p[:, 0]
+        D = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
+        D = np.where(np.abs(D) < 1e-9, np.float32(1e-9), D)
+        g1 = np.stack([e2[:, 1], -e2[:, 0]], 1) / D[:, None]
+        g2 = np.stack([-e1[:, 1], e1[:, 0]], 1) / D[:, None]
+        g0 = -g1 - g2                                          # (N,2) each
+        wi = w[tris]                                           # (N,3)
+        Wp = (bary * wi).sum(axis=1)                           # (N,)
+        uvi = mesh.uvs[tris] if mesh.uvs is not None \
+            else np.zeros(tris.shape + (2,), np.float32)       # (N,3,2)
+        du = np.zeros((tri_idx.size, 2), np.float32)
+        dv = np.zeros((tri_idx.size, 2), np.float32)
+        for i, g in enumerate((g0, g1, g2)):
+            f = (g / wi[:, i, None]) * Wp[:, None]             # (N,2)
+            du += (uvi[:, i, 0] - uv[:, 0])[:, None] * f
+            dv += (uvi[:, i, 1] - uv[:, 1])[:, None] * f
+        return du.astype(np.float32), dv.astype(np.float32)
+
+    def wire_fields(self, tri_idx, bary):
+        """For the Wireframe node: (distance to the nearest triangle edge
+        in WORLD units, world units per output PIXEL), per fragment.
+
+        The edge distance is exact point-to-segment-line geometry on the
+        fragment's own triangle. The per-pixel scale reuses the screen
+        gradient machinery (1.25.80): world position is perspective-
+        correct in the same barycentrics as UV, so |dP/dx| falls out of
+        the identical formula -- a pure function of (tri, bary), so
+        chunks, threads and devices cannot disagree about where a wire
+        sits.
+        """
+        mesh = self.scene.mesh
+        tris = mesh.tris[tri_idx]                              # (N,3)
+        corners = np.asarray(mesh.verts, np.float32)[tris]     # (N,3,3)
+        P = (corners * bary[:, :, None]).sum(axis=1)           # (N,3)
+        dmin = None
+        for a, b in ((0, 1), (1, 2), (2, 0)):
+            A = corners[:, a]
+            E = corners[:, b] - A
+            L2 = np.maximum((E * E).sum(1), np.float32(1e-12))
+            X = np.cross(P - A, E)
+            d = np.sqrt(np.maximum((X * X).sum(1), 0.0) / L2)
+            dmin = d if dmin is None else np.minimum(dmin, d)
+        # world-per-pixel via the cached screen projection: dP/dscreen =
+        # sum_i corner_i * f_i with the SAME perspective factors the UV
+        # gradients use
+        self.uv_screen_gradients(tri_idx[:1], bary[:1],
+                                 np.zeros((1, 2), np.float32)) \
+            if getattr(self, '_sgrad_cache', None) is None else None
+        sx, sy, w = self._sgrad_cache
+        p = np.stack([np.stack([sx[tris[:, i]], sy[tris[:, i]]], 1)
+                      for i in range(3)], axis=1)              # (N,3,2)
+        e1 = p[:, 1] - p[:, 0]
+        e2 = p[:, 2] - p[:, 0]
+        D = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
+        D = np.where(np.abs(D) < 1e-9, np.float32(1e-9), D)
+        g1 = np.stack([e2[:, 1], -e2[:, 0]], 1) / D[:, None]
+        g2 = np.stack([-e1[:, 1], e1[:, 0]], 1) / D[:, None]
+        g0 = -g1 - g2
+        wi = w[tris]
+        Wp = (bary * wi).sum(axis=1)
+        dPdx = np.zeros((tri_idx.size, 3), np.float32)
+        dPdy = np.zeros((tri_idx.size, 3), np.float32)
+        for i, g in enumerate((g0, g1, g2)):
+            f = (g / wi[:, i, None]) * Wp[:, None]             # (N,2)
+            delta = corners[:, i] - P                          # (N,3)
+            dPdx += delta * f[:, 0:1]
+            dPdy += delta * f[:, 1:2]
+        wpp = 0.5 * (np.sqrt((dPdx * dPdx).sum(1))
+                     + np.sqrt((dPdy * dPdy).sum(1)))
+        return dmin.astype(np.float32), wpp.astype(np.float32)
+
     def context(self, tri_idx, bary, px=None, py=None, front=None, bary_lin=None,
                 ray_depth=0, is_camera=True):
         mesh = self.scene.mesh
@@ -727,6 +1162,14 @@ class ShadeJob:
         ctx.uv = uv
         ctx.uv2 = uv2
         ctx.vcol = col
+        # the UV Map node resolves layers BY NAME: both named sets are
+        # reachable as attributes, so 'uv:<name>' answers with the
+        # right layer instead of silently falling back to the active one
+        names = getattr(mesh, 'uv_names', None) or ()
+        if len(names) > 0 and names[0]:
+            ctx.attributes['uv:' + names[0]] = uv
+        if len(names) > 1 and names[1]:
+            ctx.attributes['uv:' + names[1]] = uv2
         ctx.I = M.normalize(P - self.eye[None, :])
         ctx.px = px
         ctx.py = py
@@ -745,6 +1188,11 @@ class ShadeJob:
             ctx.backfacing = (~front).astype(np.float32)
         view_p = (P - self.eye[None, :]) @ self.view[:3, :3].T
         ctx.depth = np.abs(view_p[:, 2]).astype(np.float32)
+        if px is not None and \
+                str(getattr(self.settings, 'tex_filter', '')) == 'TRILINEAR':
+            # the mip footprint: screen points only (a ray hit has no
+            # pixel footprint and samples the top level, as the era did)
+            ctx.duv, ctx.dvv = self.uv_screen_gradients(tri_idx, bary, uv)
         obj_idx = mesh.obj_index[tri_idx] if mesh.obj_index is not None else \
             np.zeros(n, np.int32)
         self._fill_object(ctx, obj_idx)
@@ -754,12 +1202,20 @@ class ShadeJob:
         ctx.generated = ((P - lo[oi_c]) / span[oi_c]).astype(np.float32)
         ctx.random = _hash1(tri_idx.astype(np.float32))
         ctx.bump_fields = getattr(self, 'bump_fields', None)
+        lazy = getattr(self, 'radiosity_lazy', None)
+        ctx.radiosity_field = lazy() if lazy is not None else None
         # the deterministic-sampling identity: the screen pixel where one
         # exists. Traced hits overwrite these with the pixel that spawned
         # their ray (ShadeJob.shade's sample_xy), so a hit's soft shadows
         # and AO draw the same streams either device would.
         ctx.spx = np.asarray(px, np.int64) if px is not None else None
         ctx.spy = np.asarray(py, np.int64) if py is not None else None
+        ctx.view_matrix = self.view
+        # the Wireframe node's inputs, supplied lazily: nothing is computed
+        # unless a graph actually asks (the duv/dvv lesson of 1.25.80 --
+        # give the reference its inputs, and give them only when read)
+        _job, _tri, _bary = self, tri_idx, bary
+        ctx.wire_fields = lambda: _job.wire_fields(_tri, _bary)
         return ctx
 
     def _fill_object(self, ctx, obj_idx):
@@ -882,7 +1338,7 @@ class ShadeJob:
             rgb = rgb + env * surf.reflect[:, None] * surf.specular * \
                 surf.reflect_color
 
-        rgb = apply_fog(rgb, ctx.depth, st, self.scene)
+        rgb = apply_fog(rgb, ctx.depth, st, self.scene, P=ctx.P)
         alpha = np.clip(surf.opacity, 0.0, 1.0)
         if st.alpha_threshold > 0.0:
             # a hard cutoff rather than a blend: cheaper, and what hardware
@@ -935,8 +1391,22 @@ class ShadeJob:
             want = np.nonzero(surf.reflect > 1e-4)[0]
             if want.size:
                 R = M.reflect(-V[want], N[want])
-                hit = self.trace(ctx.P[want] + N[want] * st.ray_bias, R,
-                                 ray_depth + 1, sample_xy=_sxy(want))
+                blur = float(getattr(st, 'reflection_blur', 0.0))
+                bsamples = max(int(getattr(st, 'reflection_blur_samples',
+                                           1)), 1)
+                if blur > 1e-3 and bsamples >= 1:
+                    # blurry reflections: average jittered rays in a cone
+                    # around the mirror direction -- LightWave's
+                    # Reflection Blurring, MAX's raytrace blur. The
+                    # jitter draws from the deterministic streams (own
+                    # salt), so the picture is batch- and thread-
+                    # invariant like every other sampled effect here.
+                    hit = self._blurred_reflection(
+                        ctx.P[want] + N[want] * st.ray_bias, R, N[want],
+                        blur, bsamples, ray_depth, _sxy(want))
+                else:
+                    hit = self.trace(ctx.P[want] + N[want] * st.ray_bias,
+                                     R, ray_depth + 1, sample_xy=_sxy(want))
                 rgb[want] += (hit * surf.reflect[want, None] *
                               surf.specular[want] * surf.reflect_color[want])
 
@@ -955,6 +1425,41 @@ class ShadeJob:
                      np.clip(surf.refraction[want], 0.0, 1.0))[:, None]
                 rgb[want] = rgb[want] * (1.0 - k) + hit * k * surf.diffuse[want]
         return rgb
+
+    #: reflection blur's hash-stream salt -- distinct from lights (131*li),
+    #: AO (8389), the AO node (6151) and the radiosity gather (9973)
+    BLUR_SALT = 10009
+
+    def _blurred_reflection(self, origin, R, N, blur_deg, samples,
+                            ray_depth, sxy):
+        """Average `samples` rays jittered in a cone of `blur_deg` around
+        the mirror direction R. Uniform disk in the tangent plane of R,
+        radius tan(half-angle): the standard cone jitter of the era's
+        blurry-reflection implementations. Rays bent below the surface
+        are folded back to the mirror direction rather than traced into
+        the object."""
+        from . import patterns as PT
+        n = origin.shape[0]
+        half = np.float32(np.tan(np.radians(max(blur_deg, 0.0)) * 0.5))
+        t, b = M.orthonormal_basis(R)
+        seed = int(getattr(self.settings, 'seed', 0) or 0)
+        acc = np.zeros((n, 3), np.float32)
+        for k in range(max(samples, 1)):
+            if sxy is not None:
+                z = 2 * k + self.BLUR_SALT + 7919 * seed
+                u1 = PT.sample_u(sxy[0], sxy[1], z)
+                ca, sa = PT.sample_circle(PT.sample_u(sxy[0], sxy[1],
+                                                      z + 1))
+            else:
+                u1 = self.rng.random(n).astype(np.float32)
+                th = (2.0 * np.pi * self.rng.random(n)).astype(np.float32)
+                ca, sa = np.cos(th), np.sin(th)
+            r = np.sqrt(u1) * half
+            d = M.normalize(R + t * (r * ca)[:, None] + b * (r * sa)[:, None])
+            below = M.dot(d, N) <= 0.0
+            d = np.where(below[:, None], R, d)
+            acc += self.trace(origin, d, ray_depth + 1, sample_xy=sxy)
+        return acc / np.float32(max(samples, 1))
 
     def trace(self, origin, dirs, ray_depth, sample_xy=None):
         """Shade whatever a secondary ray hits (background if nothing).
@@ -1119,12 +1624,26 @@ def render(scene, settings=None, progress=None, band=None):
     mesh = scene.mesh
     W = max(int(st.resolution_x), 1)
     H = max(int(st.resolution_y), 1)
+    if str(st.aa_mode) == 'ACCUMULATE' and int(st.aa_samples) > 1 \
+            and getattr(st, '_accum_jitter', None) is None:
+        return _render_accumulated(scene, st, progress, band)
     ss = 1
     if st.aa_mode == 'SUPERSAMPLE':
         ss = max(int(np.round(np.sqrt(max(st.aa_samples, 1)))), 1)
     rw, rh = W * ss, H * ss
 
     view, proj, vp, eye = camera_matrices(scene.camera, rw, rh)
+    jit = getattr(st, '_accum_jitter', None)
+    if jit is not None:
+        # the accumulation pass's subpixel offset, as a clip-space
+        # translation: J @ vp shifts the whole projection by a fraction of
+        # a pixel, exactly what the OpenGL accumulation buffer's
+        # glTranslate jitter did
+        J = np.eye(4, dtype=np.float32)
+        J[0, 3] = 2.0 * float(jit[0]) / rw
+        J[1, 3] = 2.0 * float(jit[1]) / rh
+        proj = (J @ proj).astype(np.float32)
+        vp = (J @ vp).astype(np.float32)
     # the water needs to know how big a pixel is before it can decide which
     # waves are too small to draw
     if getattr(scene, 'world', None) is not None:
@@ -1138,6 +1657,7 @@ def render(scene, settings=None, progress=None, band=None):
         textures = prepare_textures(scene, st)
 
     need_bvh = st.raytrace or st.ambient_occlusion or \
+        getattr(st, 'radiosity', False) or \
         (st.shadows and st.shadow_default == 'RAY')
     bvh = None
     if need_bvh and mesh is not None and mesh.tris is not None and mesh.tris.size:
@@ -1186,6 +1706,17 @@ def render(scene, settings=None, progress=None, band=None):
             # triangles, so one extra row keeps the neighbour coverage
             # complete; shading stays band-masked below.
             scissor = (scissor[0], min(scissor[1] + 1, rh))
+        rad_n = int(getattr(st, 'radiosity_spacing', 1) or 1)
+        if getattr(st, 'radiosity', False) and rad_n > 1:
+            # the interpolated gather's grid blocks must be COMPLETE
+            # inside a band, or a band's grid point could pick a
+            # different source pixel than the whole frame's and seam.
+            # A band pixel reads grid rows up to 2N-1 beyond itself
+            # (the far corner of the next grid point's block), so the
+            # scissor grows by 2N each way; the extra rows rasterise
+            # and are never shaded (band masking below is untouched).
+            scissor = (max(scissor[0] - 2 * rad_n, 0),
+                       min(scissor[1] + 2 * rad_n, rh))
 
     flat_depth = None
     if st.depth_sort == 'PAINTERS':
@@ -1204,6 +1735,23 @@ def render(scene, settings=None, progress=None, band=None):
             print('[Halcyon GPU] rasterising on the CPU: affine texture '
                   'mode needs screen-linear barycentrics the compute '
                   'raster does not carry yet')
+        elif int(getattr(st, 'depth_precision', 24)) < 24 or \
+                getattr(st, 'vertex_snap', False):
+            # measured by the feature matrix, not assumed: at 16-bit depth
+            # (and under PS1 vertex snapping) coincident surfaces land on
+            # SHARED quantised steps, and the winner of an exact depth tie
+            # falls to the driver's last bit -- 3 pixels of 6912 flipped
+            # on real hardware, the same coin-on-edge mechanism the ray
+            # tie referral cured. Until a raster tie referral exists,
+            # coarse-depth frames rasterise where the answer is the
+            # reference's own.
+            why_c = ('vertex snapping' if getattr(st, 'vertex_snap', False)
+                     else f'{int(st.depth_precision)}-bit depth')
+            print(f'[Halcyon GPU] rasterising on the CPU: {why_c} puts '
+                  'coincident surfaces on shared depth steps, where an '
+                  'exact tie falls to the driver\'s last bit (3 px '
+                  'measured at 16-bit). The CPU rasterises these frames '
+                  'until the tie referral reaches the raster')
         else:
             from ..gpu import craster as _craster
             with ST.track('rasterise (GPU)'):
@@ -1230,10 +1778,12 @@ def render(scene, settings=None, progress=None, band=None):
                              flat_depth=flat_depth, scissor=scissor,
                              batched=False if want_overdraw else None)
 
-    if band is None:
+    if band is None and not getattr(st, '_viewport', False):
         # the two numbers behind "the depth is screwed up": what the
         # z-buffer can resolve on THIS frame, and which surfaces were
-        # taken out of the depth-buffered pass altogether
+        # taken out of the depth-buffered pass altogether. Viewport frames
+        # skip the report -- at several drafts a second it is not an
+        # instrument any more, it is a firehose; F12 still prints it
         _rep = depth_report(proj, gbuf, st.depth_precision,
                             getattr(st, 'depth_sort', 'ZBUFFER'))
         if _rep:
@@ -1275,6 +1825,36 @@ def render(scene, settings=None, progress=None, band=None):
     if py.size:
         # Deferred GPU shading: the G-buffer just rasterised is shaded in a
         # full-screen pass per material, on the same mechanism the post
+        # the interpolated radiosity field, LAZILY: only actual CPU
+        # shading (full frames, bands, routed layers, the A-buffer)
+        # builds it -- a fully-GPU frame never pays the CPU grid, and
+        # the probe never shades through light_surface at all. The
+        # builder is deterministic, so whichever caller gets there
+        # first computes the same numbers any other would.
+        if getattr(st, 'radiosity', False) and bvh is not None and \
+                int(getattr(st, 'radiosity_spacing', 1) or 1) > 1:
+            import threading as _threading
+            _rad_lock = _threading.RLock()
+            _rad_box = {}
+
+            def _lazy_field(job=job, gbuf=gbuf):
+                # REENTRANT with a building sentinel: the builder's own
+                # context() call comes back through here on the same
+                # thread, and must see "no field yet", not a deadlock
+                with _rad_lock:
+                    if 'f' in _rad_box:
+                        return _rad_box['f']
+                    if _rad_box.get('busy'):
+                        return None
+                    _rad_box['busy'] = True
+                    try:
+                        _rad_box['f'] = radiosity_field(job, gbuf, st,
+                                                        scene, bvh)
+                    finally:
+                        _rad_box['busy'] = False
+                    return _rad_box['f']
+
+            job.radiosity_lazy = _lazy_field
         # stages run on. Strictly opt-in, and strictly qualified -- a frame
         # using anything the GLSL does not reproduce shades on the CPU
         # exactly as before, with the reason printed rather than guessed
@@ -1296,6 +1876,22 @@ def render(scene, settings=None, progress=None, band=None):
                 img[py, px, 3] = 1.0
                 shaded_on_gpu = True
         if not shaded_on_gpu:
+            if getattr(st, 'radiosity', False) and bvh is not None and \
+                    band is None and not getattr(st, '_viewport', False):
+                # the cost, named before it is paid: the field's first
+                # radiosity frame took 118 seconds because one refused
+                # material put the WHOLE frame -- and the gather with
+                # it -- on the CPU. Say what is about to happen and
+                # which sliders own the price.
+                _n = max(int(getattr(st, 'radiosity_spacing', 1) or 1), 1)
+                rays = int(np.count_nonzero(gbuf.mask())) * \
+                    max(int(st.radiosity_samples), 1) // (_n * _n)
+                amount = f'~{rays / 1e6:.1f}M' if rays >= 1e6 else \
+                    f'~{rays / 1e3:.0f}K'
+                print(f'[Halcyon] radiosity gathers on the CPU: '
+                      f'{amount} rays this frame. The GPU device runs '
+                      f'the gather in-shader (~40x); Gather Samples and '
+                      f'Gather Distance set the CPU cost')
             tri_idx = gbuf.tri[py, px]
             bary = gbuf.bary[py, px]
             blin = gbuf.bary_lin[py, px] if gbuf.bary_lin is not None else None
@@ -1362,12 +1958,83 @@ def render(scene, settings=None, progress=None, band=None):
         scene.last_depth = depth_m[::ss, ::ss] if ss > 1 else depth_m
     scene.last_shafts = shaft_sources(scene, st, vp)
 
+    if str(st.aa_mode) == 'EDGE':
+        # the console flicker filter: find polygon edges on the id buffer
+        # (and depth creases past the threshold) and soften ONLY those
+        # pixels with a separable 1-2-1 tent -- the Dreamcast/PS2-era
+        # "edge antialias" that smoothed silhouettes without paying for a
+        # supersampled frame
+        with ST.track('edge smooth'):
+            img = _edge_smooth(img, gbuf, st)
+
     with ST.track('resolve / downsample'):
         if band is not None:
             y0 = max(band[0], 0)
             y1 = min(band[1], H)
             return _resolve(img[y0 * ss:y1 * ss], W, y1 - y0, ss, st)
         return _resolve(img, W, H, ss, st)
+
+
+def _halton(i, b):
+    """The radical-inverse sequence: deterministic, well-spread offsets."""
+    f, r = 1.0, 0.0
+    while i > 0:
+        f /= b
+        r += f * (i % b)
+        i //= b
+    return r
+
+
+def _render_accumulated(scene, st, progress, band):
+    """The accumulation buffer: N whole frames at subpixel offsets, averaged.
+
+    Exactly what the OpenGL accumulation buffer (and the 3dfx T-buffer) did
+    for antialiasing: render the full frame N times, each time with the
+    projection nudged by a fraction of a pixel, and average. Halton offsets
+    make every run of the same scene the same picture. Each pass is a
+    complete render at output resolution, so the cost is N frames -- the
+    era's price, honestly paid.
+    """
+    n = int(np.clip(int(st.aa_samples), 2, 64))
+    acc = None
+    for k in range(n):
+        st2 = st.copy()
+        st2.aa_mode = 'NONE'
+        st2._accum_jitter = (_halton(k + 1, 2) - 0.5,
+                             _halton(k + 1, 3) - 0.5)
+        frame = render(scene, st2, progress if k == 0 else None, band=band)
+        acc = frame.astype(np.float64) if acc is None else acc + frame
+    return (acc / float(n)).astype(np.float32)
+
+
+def _edge_smooth(img, gbuf, st):
+    """Soften id-buffer edges (and deep depth creases) with a 1-2-1 tent."""
+    tri = gbuf.tri
+    edge = np.zeros(tri.shape, bool)
+    dif = tri[:, 1:] != tri[:, :-1]
+    edge[:, 1:] |= dif
+    edge[:, :-1] |= dif
+    dif = tri[1:, :] != tri[:-1, :]
+    edge[1:, :] |= dif
+    edge[:-1, :] |= dif
+    thr = float(getattr(st, 'aa_edge_threshold', 0.1))
+    if thr > 0.0:
+        d = np.nan_to_num(gbuf.depth, nan=1.0, posinf=1.0, neginf=-1.0)
+        dd = np.abs(d[:, 1:] - d[:, :-1]) > thr
+        edge[:, 1:] |= dd
+        edge[:, :-1] |= dd
+        dd = np.abs(d[1:, :] - d[:-1, :]) > thr
+        edge[1:, :] |= dd
+        edge[:-1, :] |= dd
+    if not edge.any():
+        return img
+    pad = np.pad(img, ((1, 1), (1, 1), (0, 0)), mode='edge')
+    horiz = (pad[1:-1, :-2] + 2.0 * pad[1:-1, 1:-1] + pad[1:-1, 2:]) * 0.25
+    pad = np.pad(horiz, ((1, 1), (0, 0), (0, 0)), mode='edge')
+    tent = (pad[:-2] + 2.0 * pad[1:-1] + pad[2:]) * 0.25
+    out = img.copy()
+    out[edge] = tent[edge]
+    return out.astype(np.float32)
 
 
 def material_model(mat, settings):
@@ -1416,29 +2083,42 @@ def material_wire_size(mat, default=1.0):
 RATE_FOR_MODEL = {'GOURAUD': 'VERTEX', 'FLAT': 'FACE', 'WIREFRAME': 'PIXEL'}
 
 
-def _cached_bvh(scene, mesh):
-    """The scene's BVH, rebuilt only when the mesh content changed.
+#: BVH trees by mesh CONTENT, surviving across exports. Every F12
+#: re-exports a fresh Scene, so a cache stored on the scene object -- as
+#: this one was until 1.25.82 -- could never hit: the field paid its
+#: 0.76 s tree build on every render of an UNCHANGED mesh, while the
+#: cache's own docstring said "identity is useless across exports,
+#: content is not" and then keyed on identity anyway. Small LRU: trees
+#: are mesh-sized, so a handful is plenty.
+_BVH_CACHE = {}
+_BVH_CACHE_CAP = 4
 
-    A viewport orbit calls render() once per view of the SAME scene, and an
-    animation renders the same mesh for most of its frames -- rebuilding the
-    tree every call was a fifth of a second a frame on a real field scene.
-    The cache lives on the scene object (a fresh export starts clean) behind
-    a strided content fingerprint, the same idiom every GPU upload cache
-    uses: identity is useless across exports, content is not.
+
+def _cached_bvh(scene, mesh):
+    """The mesh's BVH, rebuilt only when the mesh CONTENT changed.
+
+    The key is a strided content fingerprint of the vertices AND the
+    triangle indices (a re-topologised mesh with the same vertex sums
+    must rebuild), the same idiom every GPU upload cache uses. The store
+    is module-level so it survives the fresh Scene each export creates
+    -- an F12 of an unchanged scene, an orbit, and most animation frames
+    all skip the build.
     """
     v = mesh.verts
+    t = mesh.tris
     stride = max(1, v.shape[0] // 512)
-    key = (int(v.shape[0]), int(mesh.tris.shape[0]),
+    tstride = max(1, t.shape[0] // 512)
+    key = (int(v.shape[0]), int(t.shape[0]),
            round(float(v[::stride].sum()), 3),
-           round(float(np.abs(v[::stride]).sum()), 3))
-    hit = getattr(scene, '_bvh_cache', None)
-    if hit is not None and hit[0] == key:
-        return hit[1]
+           round(float(np.abs(v[::stride]).sum()), 3),
+           int(t[::tstride].astype(np.int64).sum()))
+    hit = _BVH_CACHE.get(key)
+    if hit is not None:
+        return hit
     bvh = BVH(mesh.verts, mesh.tris)
-    try:
-        scene._bvh_cache = (key, bvh)
-    except Exception:                                           # noqa: BLE001
-        pass                       # a scene that refuses attributes still renders
+    if len(_BVH_CACHE) >= _BVH_CACHE_CAP:
+        _BVH_CACHE.pop(next(iter(_BVH_CACHE)))
+    _BVH_CACHE[key] = bvh
     return bvh
 
 
@@ -1744,6 +2424,45 @@ def _shade_interpolated(job, tri_idx, bary, rate, st=None,
     return out
 
 
+def vertex_light_corners(job, mi, rate, st):
+    """(T*3, 4) float32: each triangle corner's lighting over WHITE.
+
+    The LIGHT half of the R66 Gouraud split, packed for the deferred
+    pass: for every triangle of material `mi`, the three corners carry
+    the full CPU lighting result -- shadows, rays, env, the silhouette
+    cheats, everything shade_batch runs -- evaluated over a white
+    surface at the vertex (or once per face, packed to all three
+    corners equal). The GPU pass interpolates these by the G-buffer's
+    own barycentrics and multiplies by its per-pixel albedo, so the
+    corner VALUES are the CPU's own numbers and the seam is the
+    interpolation arithmetic alone. Rows of triangles that belong to
+    other materials stay zero; the pass's keep test never fetches them.
+    """
+    mesh = job.scene.mesh
+    T = int(mesh.tris.shape[0])
+    out = np.zeros((T * 3, 4), np.float32)
+    if mesh.mat_index is None:
+        sel = np.arange(T, dtype=np.int64)
+    else:
+        sel = np.nonzero(np.asarray(mesh.mat_index) == mi)[0]
+    if sel.size == 0:
+        return out
+    saved = getattr(job, 'rate_mode', None)
+    try:
+        job.rate_mode = 'LIGHT'
+        col, lookup = shade_vertex_rate(job, sel, rate, st)
+    finally:
+        job.rate_mode = saved
+    if rate == 'FACE':
+        for c in range(3):
+            out[sel * 3 + c] = col
+    else:
+        tris = mesh.tris[sel]
+        for c in range(3):
+            out[sel * 3 + c] = col[lookup[tris[:, c]]]
+    return out
+
+
 def polygon_depths(mesh, view, eye, mode='CENTROID'):
     """One depth per triangle, for Painter's algorithm.
 
@@ -1987,7 +2706,34 @@ def _background_image(scene, st, w, h, vp, eye, uncovered=None,
     # a sun disc and saves the other fifteen sixteenths.
     if ss > 1 and getattr(st, 'fast_background', True):
         lw, lh = max(w // ss, 1), max(h // ss, 1)
-        low = _background_image(scene, st, lw, lh, vp, eye, None, textures, ss=1)
+        low_mask = None
+        if uncovered is not None:
+            # only the low-res blocks the mask can ever READ get evaluated:
+            # a block is needed iff any of its output pixels is uncovered,
+            # with the edge-padded bands folding into the last row/column
+            # exactly as the pad reads them. The values of every pixel the
+            # caller receives are bit-identical to evaluating the whole low
+            # buffer -- the sky is per-pixel independent -- and on a frame
+            # that is mostly geometry, most of the world evaluation (the
+            # expensive part of a rich sky) simply never runs
+            um = np.broadcast_to(uncovered, (h, w))
+            core = um[:lh * ss, :lw * ss].reshape(lh, ss, lw, ss).any((1, 3))
+            low_mask = core
+            if lw * ss < w and um[:, lw * ss:].any():
+                low_mask = low_mask.copy()
+                low_mask[:, -1] |= um[:lh * ss, lw * ss:].any(axis=1) \
+                    .reshape(lh, ss).any(1)
+            if lh * ss < h and um[lh * ss:, :].any():
+                if low_mask is core:
+                    low_mask = low_mask.copy()
+                low_mask[-1, :] |= um[lh * ss:, :lw * ss].any(axis=0) \
+                    .reshape(lw, ss).any(1)
+                if lw * ss < w and um[lh * ss:, lw * ss:].any():
+                    low_mask[-1, -1] = True
+            if not low_mask.any():
+                return img
+        low = _background_image(scene, st, lw, lh, vp, eye, low_mask,
+                                textures, ss=1)
         big = np.repeat(np.repeat(low, ss, axis=0), ss, axis=1)
         if big.shape[0] < h or big.shape[1] < w:
             big = np.pad(big, ((0, max(h - big.shape[0], 0)),

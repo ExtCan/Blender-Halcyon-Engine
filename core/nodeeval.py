@@ -543,6 +543,168 @@ def n_camera_data(ev, node):
     return {'View Vector': M.normalize(c.I), 'View Z Depth': c.depth, 'View Distance': d}
 
 
+def n_wireframe(ev, node):
+    """Distance-to-edge as a factor: 1 inside the wire width, 0 outside.
+
+    Exact geometry on the fragment's own triangle, in world units or --
+    with Pixel Size on -- in output pixels via the same perspective
+    factors the mip footprint rides. The cel-ink look this feeds is
+    exactly what the engine's own Wireframe Overlay draws post-hoc; the
+    NODE puts it in the material where a graph can colour with it.
+    """
+    c = ev.ctx
+    size = ev.input(node, 'Size', VALUE)
+    supplier = getattr(c, 'wire_fields', None)
+    if supplier is None:
+        ev.unsupported.add('ShaderNodeWireframe (this shading point has no '
+                           'triangle identity -- corner lighting reads 0)')
+        return {'Fac': np.zeros(ev.n, np.float32)}
+    cached = getattr(c, '_wire_cache', None)
+    if cached is None:
+        cached = supplier()
+        c._wire_cache = cached
+    dist, wpp = cached
+    half = np.maximum(size, 0.0) * 0.5
+    if _prop(node, 'use_pixel_size', False):
+        half = half * wpp
+    return {'Fac': (dist <= half).astype(np.float32)}
+
+
+def n_vector_transform(ev, node):
+    """World / camera / object conversions for points, vectors and normals.
+
+    Camera space is the job's own view matrix; object space is the
+    per-fragment inverse object matrix the exporter carries. Normals ride
+    the inverse transpose and come back unit length, exactly the linear
+    algebra everything else in the renderer uses.
+    """
+    c = ev.ctx
+    v = ev.input(node, 'Vector', VECTOR)
+    vt = str(_prop(node, 'vector_type', 'VECTOR'))
+    src = str(_prop(node, 'convert_from', 'WORLD'))
+    dst = str(_prop(node, 'convert_to', 'OBJECT'))
+    if src == dst:
+        return {'Vector': v}
+
+    def to_world(space):
+        if space == 'CAMERA':
+            if c.view_matrix is None:
+                return None
+            return np.linalg.inv(np.asarray(c.view_matrix,
+                                            np.float32))[None, :, :]
+        if space == 'OBJECT':
+            inv = c.object_matrix_inv
+            if inv is None:
+                ev.unsupported.add(
+                    'ShaderNodeVectorTransform (no object matrices at this '
+                    'shading point; object space reads as world)')
+                return None
+            return np.linalg.inv(inv)
+        return None                                            # WORLD
+
+    def from_world(space):
+        if space == 'CAMERA':
+            if c.view_matrix is None:
+                return None
+            return np.asarray(c.view_matrix, np.float32)[None, :, :]
+        if space == 'OBJECT':
+            inv = c.object_matrix_inv
+            if inv is None:
+                ev.unsupported.add(
+                    'ShaderNodeVectorTransform (no object matrices at this '
+                    'shading point; object space reads as world)')
+                return None
+            return inv
+        return None                                            # WORLD
+
+    A = to_world(src)
+    B = from_world(dst)
+    if A is None and B is None:
+        return {'Vector': v}
+    m = B if A is None else (A if B is None else B @ A)        # (k,4,4)
+    rot = m[:, :3, :3]
+    if vt == 'POINT':
+        out = np.einsum('nij,nj->ni', np.broadcast_to(
+            rot, (ev.n, 3, 3)), v) + np.broadcast_to(m[:, :3, 3], (ev.n, 3))
+    elif vt == 'NORMAL':
+        it = np.linalg.inv(rot).transpose(0, 2, 1)
+        out = M.normalize(np.einsum('nij,nj->ni', np.broadcast_to(
+            it, (ev.n, 3, 3)), v))
+    else:
+        out = np.einsum('nij,nj->ni', np.broadcast_to(
+            rot, (ev.n, 3, 3)), v)
+    return {'Vector': out.astype(np.float32)}
+
+
+def n_ambient_occlusion(ev, node):
+    """Per-material AO with REAL rays: the engine's own deterministic
+    cosine-hemisphere sampler (a distinct hash salt, so a material's AO
+    never correlates with the lighting pass's), against the same BVH the
+    ray features use -- built through the content cache when no ray
+    feature has built one yet. Sample count is the node's own; Distance
+    is per fragment. `inside` flips the hemisphere; `only_local` cannot
+    be honoured (the export merges objects into one mesh) and says so.
+    """
+    c = ev.ctx
+    col = ev.input(node, 'Color', RGBA)
+    dist = np.maximum(ev.input(node, 'Distance', VALUE), np.float32(1e-6))
+    nrm = ev.input(node, 'Normal', VECTOR) if ev.has_link(node, 'Normal') \
+        else c.N
+    samples = max(int(_prop(node, 'samples', 16) or 16), 1)
+    bvh = getattr(c, 'bvh', None)
+    scene = getattr(c, 'scene', None)
+    if bvh is None and scene is not None and \
+            getattr(scene, 'mesh', None) is not None:
+        from . import render as _render
+        try:
+            bvh = _render._cached_bvh(scene, scene.mesh)
+        except Exception:                                       # noqa: BLE001
+            bvh = None
+    if bvh is None:
+        ev.unsupported.add('ShaderNodeAmbientOcclusion (no geometry to '
+                           'query at this shading point -- AO reads open)')
+        ao = np.ones(ev.n, np.float32)
+    else:
+        from . import patterns as PT
+        N = M.normalize(nrm)
+        if _prop(node, 'inside', False):
+            N = -N
+        t, b = M.orthonormal_basis(N)
+        st = c.settings
+        bias = max(float(getattr(st, 'ray_bias', 1e-3) or 1e-3), 1e-4)
+        origin = c.P + N * bias
+        seed = int(getattr(st, 'seed', 0) or 0)
+        if c.spx is not None:
+            spx, spy = c.spx, c.spy
+        elif c.tri is not None:
+            spx = np.asarray(c.tri, np.int64)
+            spy = np.zeros(ev.n, np.int64)
+        else:
+            spx = spy = np.zeros(ev.n, np.int64)
+        occ = np.zeros(ev.n, np.float32)
+        for k in range(samples):
+            # salt 6151: prime, distinct from the light loop (131) and the
+            # AO PASS (8389) -- a material's dirt mask must not move when
+            # the lighting's own occlusion is toggled
+            z = 2 * k + 6151 + 7919 * seed
+            u1 = PT.sample_u(spx, spy, z)
+            ca, sa = PT.sample_circle(PT.sample_u(spx, spy, z + 1))
+            r = np.sqrt(u1)
+            d = M.normalize(t * (r * ca)[:, None] + b * (r * sa)[:, None] +
+                            N * np.sqrt(np.maximum(np.float32(1.0) - u1,
+                                                   np.float32(0.0)))[:, None])
+            occ += bvh.occluded(origin, d,
+                                dist.astype(np.float32)).astype(np.float32)
+        ao = np.clip(1.0 - occ / samples, 0.0, 1.0)
+        if _prop(node, 'only_local', False):
+            ev.unsupported.add('ShaderNodeAmbientOcclusion (Only Local: the '
+                               'export merges objects, so the whole scene '
+                               'occludes)')
+    out = col.copy()
+    out[:, :3] = out[:, :3] * ao[:, None]
+    return {'Color': out, 'AO': ao}
+
+
 def n_attribute(ev, node):
     c = ev.ctx
     name = _prop(node, 'attribute_name', '')
@@ -663,10 +825,21 @@ def n_tex_image(ev, node):
     elif proj == 'BOX':
         u, v = _box_project(vec, c.N)
     lod = None
-    if filt == 'TRILINEAR' and c.duv is not None:
+    if filt == 'TRILINEAR' and c.duv is not None \
+            and not ev.has_link(node, 'Vector') and proj == 'FLAT':
+        # the derivatives describe the RAW UV attribute: a linked Vector
+        # chain or a non-flat projection resamples through a transform
+        # the chain rule was never applied to, so those keep the top
+        # level rather than filtering with the wrong footprint
         from .texture import compute_lod
-        lod = compute_lod(c.duv, c.dvv, tex.width, tex.height,
-                          getattr(st, 'tex_mip_bias', 0.0) if st else 0.0)
+        an = int(getattr(st, 'tex_aniso', 1) or 1) if st is not None else 1
+        bias = float(getattr(st, 'tex_mip_bias', 0.0) or 0.0) \
+            if st is not None else 0.0
+        if an > 1:
+            col = tex.sample(u, v, filt=filt, wrap=wrap, aniso=an,
+                             duv=c.duv, dvv=c.dvv, bias=bias)
+            return {'Color': col, 'Alpha': col[:, 3]}
+        lod = compute_lod(c.duv, c.dvv, tex.width, tex.height, bias)
     col = tex.sample(u, v, filt=filt, wrap=wrap, lod=lod)
     return {'Color': col, 'Alpha': col[:, 3]}
 
@@ -955,24 +1128,44 @@ def n_mix_rgb(ev, node):
     return {'Color': out}
 
 
+MIX_IDENT_SUFFIX = {'FLOAT': '_Float', 'VECTOR': '_Vector',
+                    'RGBA': '_Color'}
+
+
+def mix_socket(node, base, dtype):
+    """The Mix node's socket NAME to ask for, disambiguated.
+
+    Blender's Mix node carries one A/B/Factor PER data type, all with
+    the same display name -- only the identifier ('A_Color') tells them
+    apart, and asking for plain 'A' under RGBA silently reads the FLOAT
+    socket's default instead of the user's linked colour. Real exports
+    carry identifiers; hand-built test graphs may use plain names, so
+    those still resolve.
+    """
+    ident = base + MIX_IDENT_SUFFIX.get(str(dtype), '_Color')
+    for s in node.get('inputs', []):
+        if s.get('identifier') == ident:
+            return ident
+    return base
+
+
 def n_mix(ev, node):
     dtype = _prop(node, 'data_type', 'RGBA')
     mode = _prop(node, 'blend_type', 'MIX')
     clamp_f = _prop(node, 'clamp_factor', True)
-    fac = ev.input(node, 'Factor', VALUE)
+    fac = ev.input(node, mix_socket(node, 'Factor', 'FLOAT'), VALUE)
     if clamp_f:
         fac = np.clip(fac, 0.0, 1.0)
-    ins = [s for s in node.get('inputs', [])]
     if dtype == 'FLOAT':
-        a = ev.input(node, 'A', VALUE)
-        b = ev.input(node, 'B', VALUE)
+        a = ev.input(node, mix_socket(node, 'A', dtype), VALUE)
+        b = ev.input(node, mix_socket(node, 'B', dtype), VALUE)
         return {'Result': a + (b - a) * fac}
     if dtype == 'VECTOR':
-        a = ev.input(node, 'A', VECTOR)
-        b = ev.input(node, 'B', VECTOR)
+        a = ev.input(node, mix_socket(node, 'A', dtype), VECTOR)
+        b = ev.input(node, mix_socket(node, 'B', dtype), VECTOR)
         return {'Result': a + (b - a) * fac[:, None]}
-    a = ev.input(node, 'A', RGBA)
-    b = ev.input(node, 'B', RGBA)
+    a = ev.input(node, mix_socket(node, 'A', dtype), RGBA)
+    b = ev.input(node, mix_socket(node, 'B', dtype), RGBA)
     out = _mix_blend(mode, a, b, fac)
     if _prop(node, 'clamp_result', False):
         out = np.clip(out, 0.0, 1.0)
@@ -1538,6 +1731,53 @@ def n_bsdf_glass(ev, node):
     return {'BSDF': cl}
 
 
+def n_bsdf_metallic(ev, node):
+    """Blender 4.x's Metallic BSDF: a pure conductor. The era name for that
+    is the METAL model -- tinted specular, no diffuse term."""
+    col = ev.input(node, 'Base Color', RGBA)
+    rough = ev.input(node, 'Roughness', VALUE)
+    has = {s.get('name') for s in node.get('inputs', [])}
+    aniso = ev.input(node, 'Anisotropy', VALUE) if 'Anisotropy' in has \
+        else np.zeros(ev.n, np.float32)
+    rot = ev.input(node, 'Rotation', VALUE) if 'Rotation' in has \
+        else np.zeros(ev.n, np.float32)
+    nrm = ev.input(node, 'Normal', VECTOR) if ev.has_link(node, 'Normal') else None
+    cl = Closure()
+    cl.add('GLOSSY', _w(ev), color=col, roughness=rough, normal=nrm,
+           anisotropy=aniso, rotation=rot,
+           model='WARD' if np.any(np.abs(aniso) > 1e-4) else 'METAL',
+           metallic=np.ones(ev.n, np.float32))
+    return {'BSDF': cl}
+
+
+def n_bsdf_specular(ev, node):
+    """EEVEE's Specular BSDF: the spec/gloss workflow -- base colour plus a
+    SPECULAR COLOUR and a roughness. That is the DirectX-era material
+    model this whole engine wears, so the translation is nearly literal:
+    a Lambert diffuse plus a Blinn-Phong specular tinted by the socket."""
+    base = ev.input(node, 'Base Color', RGBA)
+    spec = ev.input(node, 'Specular', RGBA)
+    rough = ev.input(node, 'Roughness', VALUE)
+    has = {s.get('name') for s in node.get('inputs', [])}
+    nrm = ev.input(node, 'Normal', VECTOR) if ev.has_link(node, 'Normal') else None
+    cl = Closure()
+    cl.add('DIFFUSE', _w(ev), color=base,
+           roughness=np.zeros(ev.n, np.float32), normal=nrm, model='LAMBERT')
+    cl.add('GLOSSY', _w(ev), color=spec, roughness=rough, normal=nrm,
+           model='BLINN_PHONG')
+    if 'Emissive Color' in has:
+        emis = ev.input(node, 'Emissive Color', RGBA)
+        if np.any(emis[:, :3] > 1e-6):
+            cl.add('EMISSION', _w(ev), color=emis,
+                   strength=np.ones(ev.n, np.float32))
+    if 'Transparency' in has:
+        transp = np.clip(ev.input(node, 'Transparency', VALUE), 0.0, 1.0)
+        if np.any(transp > 1e-4):
+            cl.add('TRANSPARENT', transp,
+                   color=np.ones((ev.n, 4), np.float32))
+    return {'BSDF': cl}
+
+
 def n_bsdf_refraction(ev, node):
     col = ev.input(node, 'Color', RGBA)
     rough = ev.input(node, 'Roughness', VALUE)
@@ -1675,6 +1915,37 @@ def n_add_shader(ev, node):
 
 def n_output_material(ev, node):
     return {}
+
+
+# ------------------------------------------- named honesty for what is NOT
+
+def _n_named(reason, outputs=None):
+    """A node this renderer will not pretend to run: the evaluation names
+    itself and WHY (surfacing in the render warnings), then produces the
+    least-wrong neutral output instead of the generic passthrough."""
+    def n(ev, node):
+        ev.unsupported.add(f"{node.get('bl_idname', '?')} ({reason})")
+        return outputs(ev, node) if outputs else ev.fallback(node)
+    return n
+
+
+_NO_VOLUME = ('volumetrics are not in this renderer; the era faked them -- '
+              'Height Fog and a spot light\'s Volumetric cone are the tools')
+
+
+def _n_empty_volume(ev, node):
+    return {'Volume': Closure()}
+
+
+def _n_bevel_out(ev, node):
+    nrm = ev.input(node, 'Normal', VECTOR) if ev.has_link(node, 'Normal') \
+        else ev.ctx.N
+    return {'Normal': nrm}
+
+
+def _n_falloff_out(ev, node):
+    s = ev.input(node, 'Strength', VALUE)
+    return {'Quadratic': s, 'Linear': s, 'Constant': s}
 
 
 # ------------------------------------------------------------- Halcyon nodes
@@ -1957,6 +2228,201 @@ def n_halcyon_screen_info(ev, node):
             'Facing': facing.astype(np.float32),
             'Frame': np.full(n, float(c.frame), np.float32),
             'Time': np.full(n, float(c.time), np.float32)}
+
+
+def n_halcyon_pixelate(ev, node):
+    """Snap each axis to the centre of a coarse cell. Counts below 1 leave
+    the axis untouched, which is what makes the Z default of 0 mean 2D.
+    The cell index clamps to count-1, standard texel addressing -- a
+    coordinate of exactly 1.0 belongs to the LAST texel, not one past."""
+    v = _tex_vector(ev, node, 'uv')
+    out = np.array(v, np.float32, copy=True)
+    for axis, name in enumerate(('Pixels X', 'Pixels Y', 'Pixels Z')):
+        cnt = ev.input(node, name, VALUE)
+        active = cnt >= 1.0
+        safe = np.maximum(cnt, 1.0)
+        snapped = (np.minimum(np.floor(v[:, axis] * safe), safe - 1.0)
+                   + 0.5) / safe
+        out[:, axis] = np.where(active, snapped, v[:, axis])
+    return {'Vector': out.astype(np.float32)}
+
+
+def _stepped_time(ctx, node):
+    """The scroll clock: ctx.time, optionally quantised to whole steps."""
+    t = float(ctx.time) if _prop(node, 'animate', True) else 0.0
+    fps = int(_prop(node, 'fps', 0) or 0)
+    if fps > 0:
+        t = np.floor(np.float32(t) * fps) / np.float32(fps)
+    return np.float32(t)
+
+
+def n_halcyon_scroll(ev, node):
+    """The era's texture animation: offset and spin the UV over time."""
+    v = _tex_vector(ev, node, 'uv')
+    t = _stepped_time(ev.ctx, node)
+    sx = ev.input(node, 'Scroll X', VALUE)
+    sy = ev.input(node, 'Scroll Y', VALUE)
+    spin = ev.input(node, 'Spin', VALUE)
+    ang = spin * (t * np.float32(2.0 * np.pi))
+    ca, sa = np.cos(ang), np.sin(ang)
+    dx = v[:, 0] - 0.5
+    dy = v[:, 1] - 0.5
+    out = np.array(v, np.float32, copy=True)
+    out[:, 0] = (dx * ca - dy * sa) + 0.5 + sx * t
+    out[:, 1] = (dx * sa + dy * ca) + 0.5 + sy * t
+    return {'Vector': out.astype(np.float32)}
+
+
+def n_halcyon_scanlines(ev, node):
+    """Alternate-line darkening in the SURFACE's own space -- an in-scene
+    CRT. The camera-space version of this look is the CRT post stage; this
+    node is for the television standing in the shot."""
+    c = ev.ctx
+    col = ev.input(node, 'Color', RGBA)
+    v = _tex_vector(ev, node, 'uv')
+    lines = np.maximum(ev.input(node, 'Lines', VALUE), 1.0)
+    dark = np.clip(ev.input(node, 'Darkness', VALUE), 0.0, 1.0)
+    thick = np.clip(ev.input(node, 'Thickness', VALUE), 0.0, 1.0)
+    t = float(c.time) if _prop(node, 'animate', False) else 0.0
+    # six lines a second when rolling -- a set with its vertical hold off
+    y = v[:, 1] * lines - np.float32(t) * 6.0
+    on = (y - np.floor(y)) < thick
+    mul = 1.0 - dark * on.astype(np.float32)
+    rgb = col[:, :3] * mul[:, None]
+    return {'Color': np.concatenate([rgb, col[:, 3:]], 1).astype(np.float32)}
+
+
+def n_halcyon_palette(ev, node):
+    """Nearest entry of a period hardware palette, or a 3-3-2 bit crush."""
+    from .palette import NODE_PALETTES
+    col = ev.input(node, 'Color', RGBA)
+    mix = np.clip(ev.input(node, 'Mix', VALUE), 0.0, 1.0)
+    mode = _prop(node, 'palette', 'EGA')
+    src = np.clip(col[:, :3].astype(np.float32), 0.0, 1.0)
+    if mode == 'RGB332':
+        r = np.round(src[:, 0] * 7.0) / np.float32(7.0)
+        g = np.round(src[:, 1] * 7.0) / np.float32(7.0)
+        b = np.round(src[:, 2] * 3.0) / np.float32(3.0)
+        snapped = np.stack([r, g, b], 1)
+        idx = (np.round(src[:, 0] * 7.0) * 32.0 + np.round(src[:, 1] * 7.0)
+               * 4.0 + np.round(src[:, 2] * 3.0)) / np.float32(255.0)
+    else:
+        pal = NODE_PALETTES.get(mode, NODE_PALETTES['EGA'])
+        d = src[:, None, :] - pal[None, :, :]
+        d = (d * d).sum(axis=2)
+        pick = np.argmin(d, axis=1)
+        snapped = pal[pick]
+        idx = pick.astype(np.float32) / np.float32(max(len(pal) - 1, 1))
+    rgb = src + (snapped - src) * mix[:, None]
+    return {'Color': np.concatenate([rgb, col[:, 3:]], 1).astype(np.float32),
+            'Index': idx.astype(np.float32)}
+
+
+def n_halcyon_flipbook(ev, node):
+    """An N-by-M sprite sheet as an animated texture -- the era's fire,
+    explosions and waterfalls. Cells read left to right, TOP row first
+    (sheets are authored top-down; UVs run bottom-up), wrapping at the
+    end."""
+    c = ev.ctx
+    v = _tex_vector(ev, node, 'uv')
+    cols = np.maximum(np.floor(ev.input(node, 'Columns', VALUE)), 1.0)
+    rows = np.maximum(np.floor(ev.input(node, 'Rows', VALUE)), 1.0)
+    rate = ev.input(node, 'Rate', VALUE)
+    offset = ev.input(node, 'Cell Offset', VALUE)
+    t = np.float32(float(c.time) if _prop(node, 'animate', True) else 0.0)
+    cell0 = np.floor(offset + t * rate)
+    total = cols * rows
+    cell = cell0 - total * np.floor(cell0 / total)
+    cy = np.floor(cell / cols)
+    cx = cell - cols * cy
+    out = np.array(v, np.float32, copy=True)
+    out[:, 0] = (v[:, 0] + cx) / cols
+    out[:, 1] = (v[:, 1] + (rows - 1.0 - cy)) / rows
+    return {'Vector': out.astype(np.float32)}
+
+
+def n_halcyon_uv_wave(ev, node):
+    """Sine-warp -- the underwater wobble, heat haze, Mode-7 waves."""
+    c = ev.ctx
+    v = _tex_vector(ev, node, 'uv')
+    ax = ev.input(node, 'Amplitude X', VALUE)
+    ay = ev.input(node, 'Amplitude Y', VALUE)
+    freq = ev.input(node, 'Frequency', VALUE)
+    speed = ev.input(node, 'Speed', VALUE)
+    t = np.float32(float(c.time) if _prop(node, 'animate', True) else 0.0)
+    ph = t * speed
+    tp = np.float32(2.0 * np.pi)
+    out = np.array(v, np.float32, copy=True)
+    out[:, 0] = v[:, 0] + np.sin((v[:, 1] * freq + ph) * tp) * ax
+    out[:, 1] = v[:, 1] + np.sin((v[:, 0] * freq + ph + 0.25) * tp) * ay
+    return {'Vector': out.astype(np.float32)}
+
+
+def n_halcyon_halftone(ev, node):
+    """A rotated dot screen: dots grow where the input darkens. The dot
+    radius is 0.7071*sqrt(1-luma), so full black covers the whole cell
+    (the corner is 0.7071 away) and white prints nothing. Luma is
+    Rec.601 -- the NTSC weights, the period answer."""
+    col = ev.input(node, 'Color', RGBA)
+    v = _tex_vector(ev, node, 'uv')
+    dots = np.maximum(ev.input(node, 'Dots', VALUE), 1e-3)
+    ang = ev.input(node, 'Angle', VALUE) * np.float32(np.pi / 180.0)
+    ca, sa = np.cos(ang), np.sin(ang)
+    src = np.clip(col[:, :3], 0.0, 1.0)
+    luma = src[:, 0] * np.float32(0.299) + src[:, 1] * np.float32(0.587) \
+        + src[:, 2] * np.float32(0.114)
+    gx = (v[:, 0] * ca - v[:, 1] * sa) * dots
+    gy = (v[:, 0] * sa + v[:, 1] * ca) * dots
+    fx = gx - np.floor(gx) - 0.5
+    fy = gy - np.floor(gy) - 0.5
+    d = np.sqrt(fx * fx + fy * fy)
+    r = np.float32(0.70710678) * np.sqrt(np.maximum(1.0 - luma, 0.0))
+    ink = (d < r).astype(np.float32)
+    paper = ev.input(node, 'Paper Color', RGBA)
+    inkc = ev.input(node, 'Ink Color', RGBA)
+    rgb = paper[:, :3] + (inkc[:, :3] - paper[:, :3]) * ink[:, None]
+    return {'Color': np.concatenate([rgb, col[:, 3:]], 1).astype(np.float32),
+            'Fac': ink}
+
+
+def n_halcyon_threshold(ev, node):
+    """0 or 1 at a level, with an optional smoothstep edge."""
+    fac = ev.input(node, 'Fac', VALUE)
+    level = ev.input(node, 'Level', VALUE)
+    smooth = ev.input(node, 'Smooth', VALUE)
+    hard = (fac >= level).astype(np.float32)
+    t = np.clip((fac - (level - smooth * 0.5)) / np.maximum(smooth, 1e-6),
+                0.0, 1.0)
+    soft = t * t * (3.0 - 2.0 * t)
+    return {'Fac': np.where(smooth > 1e-6, soft,
+                            hard).astype(np.float32)}
+
+
+def n_halcyon_quantize(ev, node):
+    """Posterize for one value, with Posterize's own arithmetic."""
+    fac = ev.input(node, 'Fac', VALUE)
+    s = np.maximum(np.floor(ev.input(node, 'Steps', VALUE)), 1.0)
+    q = np.floor(np.clip(fac, 0.0, 1.0) * s) / np.maximum(s - 1.0, 1.0)
+    return {'Fac': np.clip(q, 0.0, 1.0).astype(np.float32)}
+
+
+def n_halcyon_color_cycle(ev, node):
+    """Rotate a ramp phase over time -- palette-register colour cycling.
+
+    Put it between a texture's Fac and a Color Ramp: the ramp's colours
+    march through the pattern, which is how the era animated waterfalls
+    without moving a single vertex."""
+    c = ev.ctx
+    fac = ev.input(node, 'Fac', VALUE)
+    speed = ev.input(node, 'Speed', VALUE)
+    steps = ev.input(node, 'Steps', VALUE)
+    t = np.float32(float(c.time) if _prop(node, 'animate', True) else 0.0)
+    phase = speed * t
+    q = np.maximum(np.floor(steps), 1.0)
+    stepped = np.floor(phase * q) / q
+    phase = np.where(steps >= 1.0, stepped, phase)
+    out = fac + phase
+    return {'Fac': (out - np.floor(out)).astype(np.float32)}
 
 
 
@@ -2399,6 +2865,35 @@ def n_pat_brick(ev, node):
     return {'Color': col.astype(np.float32), 'Fac': f, 'Brick ID': bid}
 
 
+_NOISE_KIND = {'SMOOTH': 0, 'TURBULENT': 1, 'RIDGED': 2}
+_CELL_FEATURE = {'F1': 0, 'F2': 1, 'BORDER': 2, 'CELL': 3}
+
+
+def n_pat_noise(ev, node):
+    p = _pat_vec(ev, node)
+    f = PT.noise_fractal(p, _NOISE_KIND.get(_prop(node, 'kind', 'SMOOTH'), 0),
+                         int(_prop(node, 'octaves', 5)),
+                         ev.input(node, 'Lacunarity', VALUE).mean(),
+                         ev.input(node, 'Gain', VALUE).mean())
+    return _pat_out(ev, node, f)
+
+
+def n_pat_cells_tex(ev, node):
+    p = _pat_vec(ev, node)
+    f, cid = PT.cells(p, ev.input(node, 'Randomness', VALUE).mean(),
+                      _CELL_FEATURE.get(_prop(node, 'feature', 'F1'), 0))
+    out = _pat_out(ev, node, f)
+    out['Cell ID'] = cid
+    return out
+
+
+def n_pat_static(ev, node):
+    p = _pat_vec(ev, node)
+    frame = int(ev.ctx.frame) if _prop(node, 'animate', True) else 0
+    f = PT.tv_static(p, frame)
+    return _pat_out(ev, node, f)
+
+
 
 def n_halcyon_matcap_uv(ev, node):
     """Sphere-map coordinates from the view-space normal.
@@ -2429,6 +2924,37 @@ DISPATCH = {
     # input
     'ShaderNodeTexCoord': n_tex_coord,
     'ShaderNodeUVMap': n_uvmap,
+    'ShaderNodeWireframe': n_wireframe,
+    'ShaderNodeVectorTransform': n_vector_transform,
+    'ShaderNodeAmbientOcclusion': n_ambient_occlusion,
+    'ShaderNodeBevel': _n_named(
+        'needs closest-geometry queries the BVH does not answer yet; '
+        'the normal passes through unbent', _n_bevel_out),
+    'ShaderNodeLightFalloff': _n_named(
+        'falloff lives on the LAMPS in this renderer -- each light\'s own '
+        'Falloff setting, where the era put it; Strength passes through',
+        _n_falloff_out),
+    'ShaderNodeVolumeAbsorption': _n_named(_NO_VOLUME, _n_empty_volume),
+    'ShaderNodeVolumeScatter': _n_named(_NO_VOLUME, _n_empty_volume),
+    'ShaderNodeVolumePrincipled': _n_named(_NO_VOLUME, _n_empty_volume),
+    'ShaderNodeVolumeCoefficients': _n_named(_NO_VOLUME, _n_empty_volume),
+    'ShaderNodeVolumeInfo': _n_named(_NO_VOLUME),
+    'ShaderNodeTexPointDensity': _n_named(_NO_VOLUME),
+    'ShaderNodeParticleInfo': _n_named(
+        'particles are not exported; instance them as real geometry'),
+    'ShaderNodePointInfo': _n_named(
+        'point clouds are not exported; instance them as real geometry'),
+    'ShaderNodeHairInfo': _n_named(
+        'curves are not exported; convert them to a mesh'),
+    'ShaderNodeBsdfRayPortal': _n_named(
+        'a Cycles portal, with nothing here to portal to',
+        lambda ev, node: {'BSDF': Closure()}),
+    'ShaderNodeScript': _n_named(
+        'OSL is not in this renderer -- the Coded Shader node (GLSL/HLSL) '
+        'is the native equivalent'),
+    'ShaderNodeOutputAOV': _n_named(
+        'AOV outputs are not collected; the Debug panel\'s Render Pass '
+        'menu is the equivalent', lambda ev, node: {}),
     'ShaderNodeNewGeometry': n_geometry,
     'ShaderNodeObjectInfo': n_object_info,
     'ShaderNodeCameraData': n_camera_data,
@@ -2492,6 +3018,8 @@ DISPATCH = {
     # shaders
     'ShaderNodeBsdfDiffuse': n_bsdf_diffuse,
     'ShaderNodeBsdfGlossy': n_bsdf_glossy,
+    'ShaderNodeBsdfMetallic': n_bsdf_metallic,
+    'ShaderNodeEeveeSpecular': n_bsdf_specular,
     'ShaderNodeBsdfAnisotropic': n_bsdf_anisotropic,
     'ShaderNodeBsdfGlass': n_bsdf_glass,
     'ShaderNodeBsdfRefraction': n_bsdf_refraction,
@@ -2525,6 +3053,16 @@ DISPATCH = {
     'HALCYON_DitherNode': n_halcyon_dither,
     'HALCYON_DepthCueNode': n_halcyon_depth_cue,
     'HALCYON_ScreenInfoNode': n_halcyon_screen_info,
+    'HALCYON_PixelateNode': n_halcyon_pixelate,
+    'HALCYON_ScrollNode': n_halcyon_scroll,
+    'HALCYON_ScanlinesNode': n_halcyon_scanlines,
+    'HALCYON_PaletteNode': n_halcyon_palette,
+    'HALCYON_ColorCycleNode': n_halcyon_color_cycle,
+    'HALCYON_FlipbookNode': n_halcyon_flipbook,
+    'HALCYON_UVWaveNode': n_halcyon_uv_wave,
+    'HALCYON_HalftoneNode': n_halcyon_halftone,
+    'HALCYON_ThresholdNode': n_halcyon_threshold,
+    'HALCYON_QuantizeNode': n_halcyon_quantize,
     'ShaderNodeTexSky': n_tex_sky,
     'ShaderNodeTexGabor': n_tex_gabor,
     'HALCYON_MarbleNode': n_pat_marble,
@@ -2546,5 +3084,8 @@ DISPATCH = {
     'HALCYON_BumpsNode': n_pat_bumps,
     'HALCYON_WrinklesNode': n_pat_wrinkles,
     'HALCYON_BrickNode': n_pat_brick,
+    'HALCYON_NoiseNode': n_pat_noise,
+    'HALCYON_CellsNode': n_pat_cells_tex,
+    'HALCYON_StaticNode': n_pat_static,
     'HALCYON_MatcapUVNode': n_halcyon_matcap_uv,
 }

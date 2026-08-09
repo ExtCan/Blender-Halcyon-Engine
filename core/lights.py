@@ -183,6 +183,12 @@ def scene_bounds(verts):
 
 
 def _render_depth(verts, tris, vp, size, cull='NONE'):
+    # A per-map frustum cull was tried here (R87) and REVERTED on the
+    # measurement: a concentrated high-poly object sits inside most map
+    # frustums, so the cull kept ~100% of triangles and its own gather
+    # cost made the stage 15% SLOWER. The rasteriser's early discard
+    # already handles the faces that see nothing. The honest lever for
+    # high-poly shadow cost is the rasteriser's per-triangle speed.
     gb = raster.GBuffer(size, size)
     raster.rasterize(verts, tris, vp, size, size, cull=cull, gbuf=gb,
                      depth_bits=32)
@@ -249,6 +255,16 @@ def _build_shadow_maps(scene, settings, caster_tris=None):
     if tris.shape[0] == 0:
         return
     centre, radius = scene_bounds(mesh.verts)
+
+    # PLAN first (cheap geometry per map), RENDER second -- because the
+    # renders are independent: each map is its own buffer, its own depth
+    # min-compares, deterministic in isolation, so thread scheduling
+    # cannot move a bit. On a high-poly scene a point light is six full
+    # rasterisations and they used to run one after another; the
+    # rasteriser is big-array NumPy that releases the interpreter lock,
+    # which is the one shape of work threads genuinely scale on this
+    # renderer (the shading loop is not -- see the Threads tooltip).
+    jobs = []                      # (assign, vp, size) -- assign(depth)
     for light in scene.lights:
         light.shadow_map = None
         if not settings.shadows or light.type == 'AMBIENT':
@@ -267,32 +283,62 @@ def _build_shadow_maps(scene, settings, caster_tris=None):
             near = 1e-3
             far = radius * 5.0
             half = radius * 1.05
-            proj = _ortho(half, near, far)
-            vp = proj @ view
-            light.shadow_map = ShadowMap(vp, _render_depth(mesh.verts, tris, vp, size),
-                                         near, far, False, size, eye, half)
+            vp = _ortho(half, near, far) @ view
+
+            def assign(depth, light=light, vp=vp, near=near, far=far,
+                       size=size, eye=eye, half=half):
+                light.shadow_map = ShadowMap(vp, depth, near, far, False,
+                                             size, eye, half)
+            jobs.append((assign, vp, size))
         elif light.type == 'SPOT':
             d = M.normalize(np.asarray(light.direction, np.float32))
             view = _look_at_lh(pos, pos + d, np.array([0, 0, 1.0], np.float32))
             near = max(radius * 0.005, 1e-3)
             far = max(float(np.linalg.norm(centre - pos)) + radius * 1.5, near * 10)
             fov = min(max(float(light.spot_size) * 1.15, 0.05), 3.0)
-            proj = _persp(fov, 1.0, near, far)
-            vp = proj @ view
-            light.shadow_map = ShadowMap(vp, _render_depth(mesh.verts, tris, vp, size),
-                                         near, far, True, size, pos,
-                                         float(np.tan(fov * 0.5)))
+            vp = _persp(fov, 1.0, near, far) @ view
+
+            def assign(depth, light=light, vp=vp, near=near, far=far,
+                       size=size, pos=pos, fov=fov):
+                light.shadow_map = ShadowMap(vp, depth, near, far, True,
+                                             size, pos,
+                                             float(np.tan(fov * 0.5)))
+            jobs.append((assign, vp, size))
         else:
             near = max(radius * 0.005, 1e-3)
             far = max(float(np.linalg.norm(centre - pos)) + radius * 1.5, near * 10)
             proj = _persp(np.pi * 0.5, 1.0, near, far)
-            faces = []
-            for fwd, up in CUBE_DIRS:
+            slots = [None] * len(CUBE_DIRS)
+            pending = {'n': len(CUBE_DIRS)}
+            for fi, (fwd, up) in enumerate(CUBE_DIRS):
                 view = _look_at_lh(pos, pos + fwd, up)
                 vp = proj @ view
-                faces.append(ShadowMap(vp, _render_depth(mesh.verts, tris, vp, size),
-                                       near, far, True, size, pos, 1.0))
-            light.shadow_map = CubeShadow(faces, pos)
+
+                def assign(depth, light=light, vp=vp, near=near, far=far,
+                           size=size, pos=pos, fi=fi, slots=slots,
+                           pending=pending):
+                    slots[fi] = ShadowMap(vp, depth, near, far, True,
+                                          size, pos, 1.0)
+                    pending['n'] -= 1
+                    if pending['n'] == 0:
+                        light.shadow_map = CubeShadow(list(slots), pos)
+                jobs.append((assign, vp, size))
+
+    if not jobs:
+        return
+    parallel = len(jobs) > 1 and tris.shape[0] >= 50000
+    if parallel:
+        import concurrent.futures as _fut
+        import os as _os
+        workers = min(len(jobs), max((_os.cpu_count() or 2) - 1, 2))
+        with _fut.ThreadPoolExecutor(max_workers=workers) as pool:
+            depths = list(pool.map(
+                lambda j: _render_depth(mesh.verts, tris, j[1], j[2]), jobs))
+        for (assign, _vp, _s), depth in zip(jobs, depths):
+            assign(depth)
+    else:
+        for assign, vp, size in jobs:
+            assign(_render_depth(mesh.verts, tris, vp, size))
 
 
 # ------------------------------------------------------------- light sampling
@@ -328,6 +374,80 @@ def spot_falloff(light, L):
     return np.clip(t, 0.0, 1.0).astype(np.float32) ** 2
 
 
+def cookie_frame(light):
+    """(side, up, forward) unit axes for a light's projected texture.
+
+    Export fills frame_x/frame_y from the object matrix so the image turns
+    with the lamp, exactly as a slide in a projector would. A hand-built
+    light without them gets a stable derived basis.
+    """
+    f = M.normalize(np.asarray(light.direction, np.float32))
+    fx = getattr(light, 'frame_x', None)
+    fy = getattr(light, 'frame_y', None)
+    if fx is not None and fy is not None:
+        return (M.normalize(np.asarray(fx, np.float32)),
+                M.normalize(np.asarray(fy, np.float32)), f)
+    s, u = M.orthonormal_basis(f[None, :])
+    return s[0], u[0], f
+
+
+def _cookie_texture(light):
+    tex = getattr(light, '_cookie_tex', None)
+    if tex is None:
+        from .texture import Texture
+        px = getattr(light, 'cookie', None)
+        px = getattr(px, 'pixels', px)
+        tex = Texture(np.asarray(px, np.float32), name='cookie',
+                      colorspace='Non-Color')
+        try:
+            light._cookie_tex = tex
+        except Exception:                                       # noqa: BLE001
+            pass
+    return tex
+
+
+def cookie_factor(light, P, L):
+    """Per-point rgb multiplier from a light's projected texture.
+
+    The sixth-generation consoles' projective texturing: a SPOT maps its
+    full cone onto the image (the cone edge lands on the image edge, the
+    lookup clamps outside it), a SUN projects the image along its rays and
+    REPEATS it every `cookie_scale` world units -- the scrolling cloud
+    shadow of the era. Bilinear both here and in the GLSL mirror, with the
+    same texel arithmetic. Returns (N,3), all ones where the projection is
+    undefined (behind a spot). POINT and AREA lights return ones -- a
+    single 2D image has no defined mapping around a point.
+    """
+    n = P.shape[0]
+    kind = getattr(light, 'type', 'POINT')
+    if getattr(light, 'cookie', None) is None or \
+            kind not in ('SPOT', 'SUN'):
+        return np.ones((n, 3), np.float32)
+    s, u, f = cookie_frame(light)
+    tex = _cookie_texture(light)
+    strength = float(np.clip(getattr(light, 'cookie_strength', 1.0), 0.0, 1.0))
+    if kind == 'SUN':
+        scale = max(float(getattr(light, 'cookie_scale', 10.0)), 1e-6)
+        cu = (P @ s.astype(np.float32)) / scale
+        cv = (P @ u.astype(np.float32)) / scale
+        rgb = tex.sample(cu.astype(np.float32), cv.astype(np.float32),
+                         filt='BILINEAR', wrap='REPEAT')[:, :3]
+        return (1.0 + (rgb - 1.0) * strength).astype(np.float32)
+    # SPOT: direction light -> surface, expressed in the light's own frame;
+    # the full cone spans the image, so uv = d_side / (d_fwd * 2 tan(half))
+    d = -L
+    dz = d @ f.astype(np.float32)
+    tanh = max(np.tan(float(light.spot_size) * 0.5), 1e-6)
+    safe = np.maximum(dz, 1e-6) * (2.0 * tanh)
+    cu = (d @ s.astype(np.float32)) / safe + 0.5
+    cv = (d @ u.astype(np.float32)) / safe + 0.5
+    rgb = tex.sample(cu.astype(np.float32), cv.astype(np.float32),
+                     filt='BILINEAR', wrap='EXTEND')[:, :3]
+    out = 1.0 + (rgb - 1.0) * strength
+    out[dz <= 1e-6] = 1.0
+    return out.astype(np.float32)
+
+
 def sample(light, P, settings, area_sample=None):
     """Direction to the light, incoming radiance and distance.
 
@@ -341,6 +461,8 @@ def sample(light, P, settings, area_sample=None):
         L = np.broadcast_to(-d[None, :], (n, 3)).copy()
         dist = np.full(n, 1e9, np.float32)
         rad = np.broadcast_to(col * energy, (n, 3)).copy()
+        if getattr(light, 'cookie', None) is not None:
+            rad = rad * cookie_factor(light, P, L)
         return L, rad.astype(np.float32), dist
     pos = np.asarray(light.position, np.float32)
     if light.type == 'AREA' and area_sample is not None:
@@ -355,6 +477,8 @@ def sample(light, P, settings, area_sample=None):
     rad = col * (scale * att)[:, None]
     if light.type == 'SPOT':
         rad = rad * spot_falloff(light, L)[:, None]
+        if getattr(light, 'cookie', None) is not None:
+            rad = rad * cookie_factor(light, P, L)
     return L.astype(np.float32), rad.astype(np.float32), dist
 
 

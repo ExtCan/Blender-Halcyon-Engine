@@ -42,7 +42,7 @@ FEATURES = {
                   "still refuses"),
     'node_graph': (NOT_YET,
                    "the hard one, and the reason a full GPU frame is still out "
-                   "of reach: 58 node types now have a GLSL emitter, each "
+                   "of reach: 59 node types now have a GLSL emitter, each "
                    "verified against the NumPy one -- Normal Map bends the "
                    "shading normal, the Bump node renders its height chain "
                    "to a pre-pass and takes the CPU's own neighbour "
@@ -91,7 +91,12 @@ FEATURES = {
                  "mirror-in-mirror at 0.000024, 0 px of 172800. Hits "
                  "spawn their own rays and composite backward with the "
                  "hit material's constants, exactly as trace() "
-                 "recurses"),
+                 "recurses. Rays whose two nearest surfaces tie within "
+                 "float noise (coincident contact geometry -- a box "
+                 "resting on a floor) are flagged by the kernel and "
+                 "re-resolved on the CPU intersector, so the driver's "
+                 "last-bit rounding can never pick a different surface "
+                 "than the reference"),
     'lens': (BOTH, "barrel distortion and chromatic aberration, agreeing "
                    "with the CPU path to 0.004 on hardware"),
     'composite_ntsc': (BOTH, "three blur draws and a combine, exactly the "
@@ -218,9 +223,17 @@ def plan(scene, settings):
                      'hard and SOFT, ambient occlusion, ray reflections '
                      'and refraction at ANY depth, image textures, '
                      'converted master-shader materials, rim/fresnel/'
-                     'sheen and area lights included; frames outside its '
-                     'scope (fog, exotic texture filters) shade on the '
-                     'CPU and say why -- node chains may drive the '
+                     'sheen and area lights included; FOG rides the '
+                     'readback (the CPU\'s own apply_fog over the '
+                     'driver\'s pixels -- all four modes, per-vertex '
+                     'quantisation and the height layer, fogged at each '
+                     'point\'s own depth including ray hits); TRILINEAR, '
+                     'mip bias, anisotropy and the N64 3-point filter '
+                     'sample from the CPU\'s own mip atlases with its '
+                     'own footprint field (glass layers keep the '
+                     'footprint on the CPU for now, by name); anything '
+                     'else outside its scope shades on the CPU and says '
+                     'why -- node chains may drive the '
                      'surface parameters per pixel, a Normal Map chain '
                      'on the master shader bends the normal itself, '
                      'coded shader nodes run their GLSL natively, the '

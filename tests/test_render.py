@@ -4889,6 +4889,54 @@ def test_glsl_node_emitters_match_cpu():
                           col('Color2', [.1, .1, .1, 1]), val('Scale', 5.)],
                          [('Color', 'RGBA'), ('Fac', 'VALUE')]), 'vec4', 0),
     ]
+    # the modern Mix node: three data types behind DUPLICATE display
+    # names ('A' three times over) -- resolution must go by identifier,
+    # because plain 'A' silently reads the FLOAT socket's default
+    # instead of the user's linked colour. These sockets carry the real
+    # identifiers a Blender export carries.
+    def midsock(name, ident, typ, d):
+        return {'name': name, 'identifier': ident, 'type': typ,
+                'default': d, 'link': None}
+
+    def mix_inputs():
+        return [
+            midsock('Factor', 'Factor_Float', 'VALUE', .65),
+            midsock('Factor', 'Factor_Vector', 'VECTOR', [.5, .5, .5]),
+            midsock('A', 'A_Float', 'VALUE', .2),
+            midsock('B', 'B_Float', 'VALUE', .9),
+            midsock('A', 'A_Vector', 'VECTOR', [.8, -.2, .4]),
+            midsock('B', 'B_Vector', 'VECTOR', [.1, .6, -.5]),
+            midsock('A', 'A_Color', 'RGBA', [.8, .2, .4, 1.]),
+            midsock('B', 'B_Color', 'RGBA', [.1, .7, .3, 1.]),
+        ]
+
+    mix_outs = [('Result', 'VALUE'), ('Result', 'VECTOR'),
+                ('Result', 'RGBA')]
+    cases.append(('Mix FLOAT',
+                  node('ShaderNodeMix', {'data_type': 'FLOAT'},
+                       mix_inputs(), mix_outs), 'float', 0))
+    cases.append(('Mix VECTOR',
+                  node('ShaderNodeMix', {'data_type': 'VECTOR'},
+                       mix_inputs(), mix_outs), 'vec3', 1))
+    for op in ('MIX', 'ADD', 'MULTIPLY', 'SUBTRACT', 'SCREEN',
+               'DIFFERENCE', 'DIVIDE', 'LIGHTEN', 'DARKEN', 'OVERLAY'):
+        cases.append((f'Mix RGBA {op}',
+                      node('ShaderNodeMix',
+                           {'data_type': 'RGBA', 'blend_type': op,
+                            'clamp_result': True},
+                           mix_inputs(), mix_outs), 'vec4', 2))
+    # a colour-mode Mix whose COLOUR sockets are the interesting ones:
+    # if resolution fell back to the first 'A' (the float socket), this
+    # would come out grey and the parity above could not tell -- so one
+    # case pins asymmetric colours through the identifier path with the
+    # factor unclamped
+    cases.append(('Mix RGBA unclamped factor',
+                  node('ShaderNodeMix',
+                       {'data_type': 'RGBA', 'blend_type': 'MIX',
+                        'clamp_factor': False},
+                       [midsock('Factor', 'Factor_Float', 'VALUE', 1.4)]
+                       + mix_inputs()[1:], mix_outs), 'vec4', 2))
+
     # Mapping: the field named it by material ('Material.002': no GLSL
     # emitter for ShaderNodeMapping). All four vector types, the negated
     # TEXTURE inverse quirk included, with baked float32 trig
@@ -6984,13 +7032,24 @@ def test_the_viewport_preview_works_headlessly():
     check('to full quality', f3 is not None and f3.shape == (72, 96, 4),
           str(None if f3 is None else f3.shape))
 
-    # a re-exported scene aborts anything in flight and re-renders
+    # a re-exported scene aborts an in-flight REFINE (expensive work of an
+    # outdated scene) -- but a DRAFT runs to completion, or playback shows
+    # nothing: every frame's export would kill the previous frame's draft
+    # before it could park. FLIPPED in 1.25.84 (was 'aborts even a draft'):
+    # the field's animation report named the cost of the old rule.
     with vp.lock:
         vp.busy = True
         vp.abort = False
         vp._inflight_draft = True
     vp.set_scene(sc, st)
-    check('a scene export aborts even a draft (it is of the OLD scene)',
+    check('a scene export lets a DRAFT finish (playback streams)',
+          vp.abort is False)
+    with vp.lock:
+        vp.busy = True
+        vp.abort = False
+        vp._inflight_draft = False
+    vp.set_scene(sc, st)
+    check('a scene export still aborts a REFINE (outdated full frame)',
           vp.abort is True)
     with vp.lock:
         vp.busy = False
@@ -6998,6 +7057,581 @@ def test_the_viewport_preview_works_headlessly():
     vp.want(cam, 192, 144)
     check('a scene edit re-kicks the same view', vp.kick() is True)
     check('and completes', wait_done() is not None)
+
+
+def test_the_refine_invites_itself_when_the_view_rests():
+    """A parked draft must refine WITHOUT another input event.
+
+    Blender redraws only on events. A GPU draft finishes in milliseconds,
+    so its completion redraw lands INSIDE the motion window; kick()
+    declines ("parked draft is enough while moving") and nothing ever
+    asks again -- the refine waited for the next input. The field named
+    it on 1.25.83: "It doesn't always refine on stopping, however
+    pressing the middle mouse button usually fixes it" -- the MMB press
+    was the missing event. The decline now ARMS one redraw request for
+    the window's lapse. Held here: the decline arms exactly once with
+    the window's remainder, re-declines do not stack timers, the fired
+    recheck lets kick() start the REFINE, and a parked FULL frame arms
+    nothing (a resting viewport still costs zero).
+    """
+    import time as _time
+    from ..core.scene import Camera
+    from ..preview import DRAFT_WINDOW, RECHECK_SLACK, Viewport
+
+    st = base_settings(96, 72, shadows=False)
+    st.preview_scale = 2
+    sc = demo_scene(st, with_texture=False)
+
+    t = {'now': 100.0}
+    vp = Viewport(clock=lambda: t['now'])
+    armed = []
+    vp._schedule_recheck = lambda engine, delay: armed.append(delay) or True
+
+    vp.set_scene(sc, st)
+    view, proj, _v, _e = R.camera_matrices(sc.camera, 96, 72)
+    cam = Camera(matrix_world=np.linalg.inv(view).astype(np.float32),
+                 projection=proj.astype(np.float32), type='PERSP')
+    vp.want(cam, 192, 144)
+    check('the fresh view kicks a draft', vp.kick() is True)
+
+    def wait_done():
+        for _ in range(600):
+            with vp.lock:
+                if not vp.busy:
+                    return vp.frame
+            _time.sleep(0.02)
+        return None
+
+    check('the draft parked', wait_done() is not None)
+    check('nothing armed while a worker was the next step', not armed)
+
+    # the completion redraw arrives INSIDE the window (the field's case)
+    t['now'] += 0.05
+    check('kick declines: parked draft while moving', vp.kick() is False)
+    check('...and ARMS the window-lapse recheck', len(armed) == 1,
+          str(armed))
+    remain = DRAFT_WINDOW - 0.05 + RECHECK_SLACK
+    check('armed for the window remainder', abs(armed[0] - remain) < 0.01,
+          f'{armed[0]:.3f} vs {remain:.3f}')
+    check('a second redraw does not stack a second timer',
+          vp.kick() is False and len(armed) == 1, str(armed))
+
+    # the timer fires just past the lapse: _fire clears the flag and tags
+    # a redraw; the redraw calls kick(), which must now REFINE
+    t['now'] += remain
+    vp._recheck_armed = False               # what _fire does
+    check('the fired recheck starts the refine', vp.kick() is True)
+    with vp.lock:
+        was_draft = vp._inflight_draft
+    check('and it IS the refine, not another draft', was_draft is False)
+    frame = wait_done()
+    check('full quality parked without any input event',
+          frame is not None and frame.shape == (72, 96, 4),
+          str(None if frame is None else frame.shape))
+
+    # a parked FULL frame must never arm: a resting viewport costs zero
+    armed.clear()
+    check('at rest with the full frame, kick declines', vp.kick() is False)
+    check('and arms nothing', not armed)
+
+    # moved again before the timer fired: the fired redraw re-arms with
+    # the NEW window's remainder -- it converges, never orphans
+    mw2 = np.linalg.inv(view).astype(np.float32).copy()
+    mw2[0, 3] += 0.5
+    cam2 = Camera(matrix_world=mw2, projection=proj.astype(np.float32),
+                  type='PERSP')
+    vp.want(cam2, 192, 144)
+    check('the moved view drafts again', vp.kick() is True)
+    check('the moved-view draft parked', wait_done() is not None)
+    t['now'] += 0.02
+    check('inside the new window it declines again', vp.kick() is False)
+    check('and re-arms for the NEW remainder', len(armed) == 1
+          and abs(armed[0] - (DRAFT_WINDOW - 0.02 + RECHECK_SLACK)) < 0.01,
+          str(armed))
+
+
+def test_animation_playback_streams_drafts():
+    """Playback must stream: exports outpacing drafts showed NOTHING.
+
+    Every animation frame re-exports the scene, and set_scene aborted
+    ANYTHING mid-flight -- so on any scene whose draft takes longer than
+    one playback tick, each export killed the previous frame's draft
+    before it parked, and the viewport never updated until playback
+    stopped. The field named it on 1.25.83: "running an animation in the
+    viewport, it does not update in realtime." The R25 orbit bug, scene-
+    version edition, cured by the same rule: a DRAFT always runs to
+    completion (one export stale at worst), a REFINE still dies. Held
+    end to end: an export DURING a draft leaves it running, the stale
+    draft parks and counts as superseded (kick immediately re-drafts the
+    newest export while the storm holds), and once the exports stop the
+    view refines to the CURRENT scene's exact picture.
+    """
+    import time as _time
+    from ..core.scene import Camera
+    from ..preview import DRAFT_WINDOW, Viewport
+
+    st = base_settings(96, 72, shadows=False)
+    st.preview_scale = 2
+    sc = demo_scene(st, with_texture=False)
+
+    t = {'now': 200.0}
+    vp = Viewport(clock=lambda: t['now'])
+    vp._schedule_recheck = lambda engine, delay: True
+    vp.set_scene(sc, st)
+    view, proj, _v, _e = R.camera_matrices(sc.camera, 96, 72)
+    cam = Camera(matrix_world=np.linalg.inv(view).astype(np.float32),
+                 projection=proj.astype(np.float32), type='PERSP')
+    vp.want(cam, 192, 144)
+    check('frame 1 kicks a draft', vp.kick() is True)
+
+    # frame 2's export arrives WHILE the draft renders: playback tick
+    with vp.lock:
+        mid_flight = vp.busy
+    vp.set_scene(sc, st)
+    check('the export found the draft in flight', mid_flight is True)
+    check('and did NOT abort it', vp.abort is False)
+
+    def wait_done():
+        for _ in range(600):
+            with vp.lock:
+                if not vp.busy:
+                    return vp.frame
+            _time.sleep(0.02)
+        return None
+
+    frame = wait_done()
+    check('the superseded draft still parked (playback streams)',
+          frame is not None and frame.shape == (36, 48, 4),
+          str(None if frame is None else frame.shape))
+    check('but it is of the OLD export: the newest re-drafts at once',
+          vp.kick() is True)
+    check('and it is a draft (the storm still holds)',
+          vp._inflight_draft is True)
+    check('the newest export drafted', wait_done() is not None)
+
+    # the exports stop; the window lapses; the refine snaps in
+    t['now'] += DRAFT_WINDOW + 0.1
+    check('at rest the parked draft refines', vp.kick() is True)
+    frame = wait_done()
+    check('to full quality', frame is not None
+          and frame.shape == (72, 96, 4),
+          str(None if frame is None else frame.shape))
+    sc.camera = cam
+    st.resolution_x, st.resolution_y = 96, 72
+    want_img = post.process(R.render(sc, st), st, target_size=(96, 72))
+    want_img = np.asarray(want_img, np.float32)[:, :, :3]
+    d = float(np.abs(frame[:, :, :3] - want_img).max())
+    check('and it is the CURRENT scene, exactly', d == 0.0,
+          f'max difference {d}')
+
+
+def test_every_material_binds_its_own_texture():
+    """Two image-textured materials must bind TWO textures on the driver.
+
+    Sampler names are positional per material shader ('hal_tex0'...), and
+    the driver's frame-wide by-NAME map kept the first texture it saw --
+    "materials are all using the same one when they should be different",
+    said the field, and they had checked, reimported, reloaded: it was
+    never on their end. The compiler sim binds per pass BY DESIGN, so the
+    one place sim and driver diverged was exactly the bug -- no headless
+    picture could show it. Held here at the mechanism level: the real
+    plan for a two-textured-material scene carries the SAME sampler name
+    with DIFFERENT images (the collision precondition), the shipped
+    gather keyed by (pass, sampler) resolves them to their OWN uploads,
+    the old by-name semantics demonstrably collapsed them, and a shared
+    image still deduplicates to one upload underneath.
+    """
+    import types
+    from ..core import raster
+    from ..gpu import shade as GSH_
+
+    def sk(name, tp, default, link=None):
+        return {'name': name, 'identifier': name, 'type': tp,
+                'default': default, 'link': link}
+
+    def tex_graph(img_key):
+        return {'output': 'out', 'nodes': {
+            'Image Texture': {
+                'id': 'Image Texture', 'bl_idname': 'ShaderNodeTexImage',
+                'props': {'image': img_key, 'interpolation': 'Closest',
+                          'extension': 'REPEAT', 'projection': 'FLAT'},
+                'inputs': [sk('Vector', 'VECTOR', [0, 0, 0])],
+                'outputs': [{'name': 'Color', 'type': 'RGBA'},
+                            {'name': 'Alpha', 'type': 'VALUE'}]},
+            'bsdf': {'id': 'bsdf', 'bl_idname': 'ShaderNodeBsdfDiffuse',
+                     'props': {},
+                     'inputs': [sk('Color', 'RGBA', [1, 1, 1, 1],
+                                   ['Image Texture', 0]),
+                                sk('Roughness', 'VALUE', 0.0)],
+                     'outputs': [{'name': 'BSDF', 'type': 'SHADER'}]},
+            'out': {'id': 'out', 'bl_idname': 'ShaderNodeOutputMaterial',
+                    'props': {},
+                    'inputs': [sk('Surface', 'SHADER', None, ['bsdf', 0])],
+                    'outputs': []}}}
+
+    st = base_settings(96, 72)
+    st.threads = 1
+    st.render_device = 'GPU'
+    sc = demo_scene(st, with_texture=False)
+    red = np.zeros((8, 8, 4), np.float32)
+    red[..., 0] = 1.0
+    red[..., 3] = 1.0
+    blu = np.zeros((8, 8, 4), np.float32)
+    blu[..., 2] = 1.0
+    blu[..., 3] = 1.0
+    sc.images['imgA'] = types.SimpleNamespace(pixels=red, name='imgA',
+                                              colorspace='sRGB')
+    sc.images['imgB'] = types.SimpleNamespace(pixels=blu, name='imgB',
+                                              colorspace='sRGB')
+    sc.materials[1].graph = tex_graph('imgA')
+    sc.materials[2].graph = tex_graph('imgB')
+    R.render(sc, st)
+    view, _p, vp, eye = R.camera_matrices(sc.camera, 96, 72)
+    g = raster.GBuffer(96, 72)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, 96, 72, gbuf=g)
+    job = R.ShadeJob(sc, st, R.prepare_textures(sc, st), None, view, eye,
+                     96, 72)
+    GSH_._PLAN_CACHE.clear()
+    passes, why, _atlases = GSH_.plan_frame(job, g)
+    check('the two-textured scene qualifies', passes is not None, str(why))
+    if passes is None:
+        return
+
+    tex_binds = [(b, dict(b.get('textures') or {}))
+                 for _mi, _n, _s, b in passes
+                 if b.get('textures')]
+    check('two passes carry image textures', len(tex_binds) == 2,
+          str(len(tex_binds)))
+    names_a = set(tex_binds[0][1])
+    names_b = set(tex_binds[1][1])
+    check('the sampler NAMES collide across materials (the field shape)',
+          bool(names_a & names_b), f'{names_a} vs {names_b}')
+    keys = {v for _b, t in tex_binds for v in t.values()}
+    check('but the IMAGES differ', keys == {'imgA', 'imgB'}, str(keys))
+
+    # the shipped gather, driven with a recording upload
+    calls = []
+
+    def up(ik, build):
+        calls.append(ik)
+        return ('TEX', ik)
+
+    got = GSH_._gather_pass_textures([b for b, _t in tex_binds],
+                                     job.textures, up)
+    check('one entry per (pass, sampler)', len(got) == 2, str(len(got)))
+    texes = set(got.values())
+    check('each material binds ITS OWN texture', len(texes) == 2,
+          str(texes))
+
+    # the OLD by-name semantics, demonstrably the bug
+    old = {}
+    for b, t in tex_binds:
+        for sname, key in t.items():
+            if sname in old:
+                continue
+            old[sname] = key
+    check('the frame-wide by-name map would collapse them to one',
+          len(old) == 1 and len(set(old.values())) == 1, str(old))
+
+    # a SHARED image still deduplicates the actual upload underneath
+    calls.clear()
+    shared = [tex_binds[0][0],
+              {'textures': dict(tex_binds[0][1])}]
+    got2 = GSH_._gather_pass_textures(shared, job.textures, up)
+    check('a shared image maps two pass entries onto ONE upload key',
+          len(got2) == 2 and len(set(calls)) == 1,
+          f'{len(got2)} entries, {len(set(calls))} unique uploads')
+
+
+def test_viewport_bursts_stay_out_of_the_draw_loop():
+    """Bursts cross to the main thread ONLY in the pump's timer slices,
+    never inside a draw callback. 1.25.89-.91 ran viewport bursts inside
+    view_draw and the field got the whole scene flashing rapidly whenever
+    bursts streamed -- camera motion AND refines -- a seizure risk. Two
+    patches (a time budget, a viewport-rect fence) failed to tame it;
+    the architecture was reverted. This test is the structural guard:
+    the drain-mode machinery must NOT exist, view_draw must not touch
+    the marshal queue, and the plain pump must actually move work.
+    """
+    import inspect
+    from ..gpu import marshal as M
+    from . import fakeblender as FB
+    _, E = FB.install()          # engine imports bpy; headless needs the stub
+
+    # 1) the machinery is GONE, not just unused -- reintroduction fails
+    for name in ('drain', 'begin_draw_drain', 'end_draw_drain',
+                 '_POKES', 'STALE_DRAIN'):
+        check(f'marshal has no {name}', not hasattr(M, name))
+    check('no draw-drain state keys survive',
+          'draw_drain' not in M._STATE and
+          'last_draw_drain' not in M._STATE, str(M._STATE))
+
+    # 2) view_draw never touches the queue: it may start the redraw
+    #    poll, but no drain call, no _JOBS, no marshal import. Comments
+    #    are stripped first -- the one comment there EXPLAINS the revert
+    #    and names the forbidden words; only code counts.
+    src = inspect.getsource(E.HalcyonRenderEngine.view_draw)
+    code = '\n'.join(ln for ln in src.splitlines()
+                     if not ln.strip().startswith('#'))
+    for frag in ('drain', '_JOBS', 'marshal'):
+        check(f'view_draw CODE is free of "{frag}"', frag not in code)
+
+    # 3) the plain pump still moves work while marshalling is on
+    ran = []
+    M.enable()
+    try:
+        M._JOBS.put(M._Job(lambda: ran.append('a')))
+        M._JOBS.put(M._Job(lambda: ran.append('b')))
+        tick = M._pump()
+        check('the pump drains every queued burst in one slice',
+              ran == ['a', 'b'])
+        check('and keeps ticking while marshalling is on',
+              tick == M.TICK)
+    finally:
+        M.disable()
+
+    # 4) queueing work pokes nothing: run_on_main on the main thread
+    #    (this test) runs in place, and the only cross-thread signal a
+    #    finished frame sends is preview's flag-only redraw request --
+    #    the marshal itself owns no redraw side channel
+    got = M.run_on_main(lambda: 'in-place')
+    check('run_on_main still runs in place where there is no pump',
+          got == 'in-place')
+
+
+def test_the_viewport_black_guard():
+    """A GPU viewport frame that comes back suddenly black is not shown.
+
+    The field reports materials randomly turning pure black / flashing --
+    VIEWPORT only, GPU device, no material pattern, since the viewport
+    GPU arc. The headless cadence stress (alternating draft/refine sizes,
+    scene edits, warm caches vs fresh) runs CLEAN, so the mechanism lives
+    in live driver state headless cannot reproduce. Until the field's
+    guard lines name it, the viewport MEASURES: a GPU frame whose black
+    fraction jumps >20% against the last parked frame is re-shaded on
+    the CPU, kept, counted, and named on the console. Held here: stable
+    frames never trigger; an injected black frame triggers exactly once,
+    parks the REAL picture, and the count says so; the ratio then
+    converges so a genuinely dark scene stops paying.
+    """
+    import types
+    from ..core.scene import Camera
+    from .. import preview as PV
+
+    st = base_settings(96, 72, shadows=False)
+    st.threads = 1
+    st.render_device = 'GPU'
+    st.preview_scale = 1
+    sc = demo_scene(st, with_texture=False)
+    PV.shape_settings(st, 96, 72)
+    view, proj, _v, _e = R.camera_matrices(sc.camera, 96, 72)
+    cam = Camera(matrix_world=np.linalg.inv(view).astype(np.float32),
+                 projection=proj.astype(np.float32), type='PERSP')
+    vp = PV.Viewport()
+    vp.set_scene(sc, st)
+    vp.abort = False
+    key = vp._key(cam, 96, 72)
+
+    vp._render(None, sc, st, cam, 96, 72, key, vp.version, False)
+    check('a normal GPU frame parks without the guard',
+          vp.frame is not None and vp.guard_count == 0)
+    good = vp.frame.copy()
+    vp._render(None, sc, st, cam, 96, 72, key, vp.version, False)
+    check('stable frames never trigger', vp.guard_count == 0)
+
+    # inject one black frame: the driver-state stand-in
+    real = PV.core_render
+    calls = {'n': 0}
+
+    def fake_render(scene, settings, progress=None):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            return np.zeros((settings.resolution_y,
+                             settings.resolution_x, 4), np.float32)
+        return real.render(scene, settings, progress=progress)
+
+    PV.core_render = types.SimpleNamespace(render=fake_render)
+    try:
+        vp._render(None, sc, st, cam, 96, 72, key, vp.version, False)
+    finally:
+        PV.core_render = real
+    check('the injected black frame triggered the guard once',
+          vp.guard_count == 1, str(vp.guard_count))
+    check('and the frame the user sees is the REAL picture',
+          vp.frame is not None
+          and float(np.abs(vp.frame - good).max()) < 1e-5)
+    check('the guard names its device', vp.last_engaged == 'CPU (guard)')
+
+    # convergence: the parked (real) ratio is now the baseline
+    vp._render(None, sc, st, cam, 96, 72, key, vp.version, False)
+    check('the next normal frame does not re-trigger', vp.guard_count == 1)
+
+    # a PARTIAL blackout -- one material's region, under any whole-frame
+    # threshold -- must trigger through the TILE map (same view only)
+    real2 = PV.core_render
+    calls2 = {'n': 0}
+
+    def fake_partial(scene, settings, progress=None):
+        calls2['n'] += 1
+        img = real2.render(scene, settings, progress=progress)
+        if calls2['n'] == 1:
+            img = np.array(img, np.float32, copy=True)
+            # rows 24:48 x cols 24:72 = TWO full 24px tiles = 16.7% of
+            # the frame -- under the 20% whole-frame bar on purpose
+            img[24:48, 24:72, :3] = 0.0
+        return img
+
+    PV.core_render = types.SimpleNamespace(render=fake_partial)
+    try:
+        vp._render(None, sc, st, cam, 96, 72, key, vp.version, False)
+    finally:
+        PV.core_render = real2
+    check('a sub-threshold REGION blackout triggers via tiles',
+          vp.guard_count == 2, str(vp.guard_count))
+    check('and the parked frame is the real picture again',
+          vp.frame is not None
+          and float(np.abs(vp.frame - good).max()) < 1e-5)
+
+    # ...but NEVER across a camera move: tiles flip legitimately as
+    # content crosses a MOVING frame, so the tile rule is same-view-only
+    from ..core.scene import Camera as _Cam
+    mw2 = np.array(cam.matrix_world, np.float32).copy()
+    mw2[0, 3] += 0.6
+    cam2 = _Cam(matrix_world=mw2, projection=np.array(cam.projection,
+                                                      np.float32),
+                type='PERSP')
+    key2 = vp._key(cam2, 96, 72)
+    calls2['n'] = 0
+    PV.core_render = types.SimpleNamespace(render=fake_partial)
+    try:
+        vp._render(None, sc, st, cam2, 96, 72, key2, vp.version, False)
+    finally:
+        PV.core_render = real2
+    check('a moved camera does NOT tile-trigger (orbit-safe)',
+          vp.guard_count == 2, str(vp.guard_count))
+
+
+def test_the_viewport_honors_the_device_switch():
+    """The CPU/GPU switch governs the viewport exactly as it governs F12.
+
+    The viewport was pinned to the CPU its whole life because worker
+    threads have no GPU context -- the exact problem the F12 marshal
+    solved in 1.25.53, borrowed here since 1.25.83. Held headlessly:
+
+    * the marshal REFCOUNTS -- an F12 finishing mid-viewport-frame used
+      to switch marshalling off underneath the other render, whose every
+      remaining burst then fell back with a misleading reason;
+    * shape_settings passes the whole device family through untouched
+      (the old code pinned render_device='CPU' right here) while still
+      stripping what makes no sense per redraw;
+    * a GPU-device viewport frame with no driver present parks the SAME
+      pixels as the CPU frame -- the matrix doctrine, fallback equality;
+    * a busy driver (the pipeline lock held by another thread -- an F12
+      mid-flight) forces that one frame to the CPU with a named reason,
+      without touching the stored settings, and the pixels still match.
+    """
+    from ..core.scene import Camera
+    from ..gpu import marshal as M
+    from ..preview import Viewport, shape_settings
+
+    # --- the marshal refcounts
+    check('marshalling starts off', M.enabled() is False)
+    M.enable()
+    M.enable()
+    M.disable()
+    check('one render finishing must not strip the other',
+          M.enabled() is True)
+    M.disable()
+    check('the last disable switches it off', M.enabled() is False)
+    M.disable()                              # over-release must not wedge
+    M.enable()
+    check('a floor of zero: the next enable still works',
+          M.enabled() is True)
+    M.disable()
+
+    # --- shape_settings: device family untouched, per-redraw noise stripped
+    st = RenderSettings()
+    st.render_device = 'GPU'
+    st.gpu_shading = False                   # NON-default: proves passthrough
+    st.gpu_scissor = False
+    st.show_stats = True
+    st.use_processes = True
+    st.aa_mode = 'SUPERSAMPLE'
+    st.preview_scale = 1
+    shape_settings(st, 96, 72)
+    check('the device rides through', st.render_device == 'GPU')
+    check('its Debug toggles ride through in NON-default positions',
+          st.gpu_shading is False and st.gpu_scissor is False)
+    check('worker processes are stripped (a pool per draft)',
+          st.use_processes is False)
+    check('anti-aliasing is stripped', st.aa_mode == 'NONE')
+    check('the stats wish is remembered as one line per refine',
+          st.show_stats is False and st._viewport_stats is True)
+    check('viewport frames are marked (quiets the depth firehose)',
+          st._viewport is True)
+
+    # --- fallback equality: GPU device, no driver -> the CPU pixels
+    def _park(dev, hold_elsewhere=False):
+        s = RenderSettings()
+        s.render_device = dev
+        s.preview_scale = 1
+        s.threads = 1
+        s.shadows = False
+        sc = demo_scene(s, with_texture=False)
+        shape_settings(s, 96, 72)
+        view, proj, _v, _e = R.camera_matrices(sc.camera, 96, 72)
+        cam = Camera(matrix_world=np.linalg.inv(view).astype(np.float32),
+                     projection=proj.astype(np.float32), type='PERSP')
+        vp = Viewport()
+        vp.set_scene(sc, s)
+        vp.abort = False           # kick() clears this; we call _render direct
+        key = vp._key(cam, 96, 72)
+        vp._render(None, sc, s, cam, 96, 72, key, vp.version, False)
+        return vp, s
+
+    vp_cpu, _ = _park('CPU')
+    vp_gpu, st_gpu = _park('GPU')
+    check('the CPU viewport frame parked', vp_cpu.frame is not None)
+    check('the GPU-device viewport frame parked', vp_gpu.frame is not None)
+    check('the worker took the GPU path', vp_gpu.last_engaged == 'GPU')
+    d = float(np.abs(vp_cpu.frame.astype(np.float64)
+                     - vp_gpu.frame).max())
+    check('no driver: the GPU device parks the CPU pixels exactly',
+          d == 0.0, f'max difference {d}')
+    check('the marshal is off again afterwards (refcount balanced)',
+          M.enabled() is False)
+    check('the pipeline lock is free again',
+          M.PIPELINE.acquire(blocking=False))
+    M.PIPELINE.release()
+
+    # --- a busy driver: the F12 holds the pipeline, the frame goes CPU
+    import threading as _th
+    got, gate = _th.Event(), _th.Event()
+
+    def _hold():
+        M.PIPELINE.acquire()
+        got.set()
+        gate.wait(10.0)
+        M.PIPELINE.release()
+
+    thr = _th.Thread(target=_hold, daemon=True)
+    thr.start()
+    got.wait(10.0)
+    try:
+        vp_busy, st_busy = _park('GPU')
+    finally:
+        gate.set()
+        thr.join(10.0)
+    check('a busy driver still parks a frame', vp_busy.frame is not None)
+    check('that frame went to the CPU', vp_busy.last_engaged == 'CPU')
+    check('and said why, once',
+          any('driver is busy' in s for s in vp_busy._said))
+    check('the STORED settings keep their device (the copy took the hit)',
+          st_busy.render_device == 'GPU')
+    d = float(np.abs(vp_cpu.frame.astype(np.float64)
+                     - vp_busy.frame).max())
+    check('the busy-driver frame is the CPU picture exactly', d == 0.0,
+          f'max difference {d}')
 
 
 def test_the_viewport_bvh_is_cached_across_orbits():
@@ -7024,18 +7658,22 @@ def test_the_viewport_bvh_is_cached_across_orbits():
     d = _cached_bvh(sc, sc.mesh)
     check('and then caches again', d is c)
 
-    # through render() itself: two renders of one scene, one build
+    # through render() itself: two renders of one scene, one build. The
+    # cache moved to a module-level content-keyed store in 1.25.82 (the
+    # scene-attribute version could never hit across exports), so the
+    # assertions read the store, not the scene
     sc2 = demo_scene(st, with_texture=False)
     st.color_depth = '24'
     st.dither = 'NONE'
     st.output_scale = 'NONE'
+    R._BVH_CACHE.clear()
     img1 = R.render(sc2, st)
-    tree1 = getattr(sc2, '_bvh_cache', None)
+    trees1 = list(R._BVH_CACHE.values())
     img2 = R.render(sc2, st)
-    tree2 = getattr(sc2, '_bvh_cache', None)
-    check('render() populated the cache', tree1 is not None)
+    trees2 = list(R._BVH_CACHE.values())
+    check('render() populated the cache', len(trees1) == 1)
     check('the second render reused it, not rebuilt it',
-          tree2 is not None and tree1[1] is tree2[1])
+          len(trees2) == 1 and trees1 and trees2[0] is trees1[0])
     check('and the frames are identical',
           bool(np.array_equal(img1, img2)))
 
@@ -7636,7 +8274,9 @@ void main() { Color = hal_sample_hal_tex0(hal_uv_in); }
             check(f'{filt}/{wrap} matches Texture.sample off the grid',
                   e < 2e-5, f'max {e:.7f}')
 
-    # unsupported filters refuse by name
+    # the N64 filter used to refuse by name; 1.25.81 ported it (pure
+    # arithmetic, no footprint needed) -- the negative test flips, as
+    # negative tests must when scope grows
     st = base_settings(w, h, tex_filter='N64_3POINT')
     sc = demo_scene(st)
     view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
@@ -7644,9 +8284,10 @@ void main() { Color = hal_sample_hal_tex0(hal_uv_in); }
     raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
     job = R.ShadeJob(sc, st, R.prepare_textures(sc, st), None, view, eye,
                      w, h)
+    GSH._PLAN_CACHE.clear()
     p, why, _a = GSH.plan_frame(job, g)
-    check('the N64 filter is refused by name',
-          p is None and 'N64' in str(why), str(why))
+    check('the N64 filter QUALIFIES now (the refusal flipped when the '
+          'port landed)', p is not None, str(why))
 
 
 def test_generated_glsl_is_driver_strict():
@@ -9296,6 +9937,1224 @@ def test_the_pattern_library_completes_on_the_gpu():
                   [p for p in p2 if p[1] == 'Pat'][0][2] == plasma_src[2])
 
 
+def test_the_new_halcyon_nodes_travel():
+    """The new node shelf, end to end on both devices.
+
+    Eight new nodes (Fractal Noise, Cells, TV Static, Pixelate, UV Scroll,
+    Scanlines, Hardware Palette, Color Cycle) plus GPU stories for the
+    four originals: Posterize and Ordered Dither emit (roundEven IS
+    np.round -- the depth quantiser proved that pairing), Screen Info
+    emits everything but Depth, Depth Cue refuses by name. The Bayer
+    threshold is ARITHMETIC on the GPU -- digit 2*(x^y)+y per bit -- and
+    must equal dither.threshold_map bit for bit. Also the regression for
+    the round's latent bug: Dither's pattern and Depth Cue's falloff were
+    never in export.NODE_PROPS, so both dropdowns silently rendered as
+    their defaults from the day they shipped.
+    """
+    from ..core import dither as DT
+    from ..core import patterns as PT
+    from ..core import raster
+    from ..core.nodeeval import GraphEvaluator, ShadeContext
+    from ..core.palette import NODE_PALETTES
+    from ..core.settings import RenderSettings
+    from . import fakebpy
+    fakebpy.install()                  # export.py imports bpy via compat
+    from ..export import NODE_PROPS
+    from ..gpu import shade as GSH
+    from ..gpu.procedural import PRIM_GLSL
+    from ..shaders.compiler import try_compile
+    from .featurematrix import build
+
+    # ---- the new primitives against patterns.py, through the front-end
+    rng = np.random.default_rng(9)
+    pts = (rng.random((2000, 3)).astype(np.float32) * 40.0 - 20.0)
+
+    def run_prim(body):
+        src = PRIM_GLSL + f'''
+uniform vec3 pin;
+out vec4 Color;
+void main() {{ Color = vec4({body}, 0.0, 0.0, 1.0); }}'''
+        prog, err = try_compile(src)
+        check('a new primitive compiles', prog is not None, str(err))
+        if prog is None:
+            return None
+        return prog.run({'pin': pts}, {}, pts.shape[0])[0]['Color'][:, 0]
+
+    got = run_prim('hal_pt_ridged(pin, 5, 2.0, 0.5)')
+    if got is not None:
+        e = float(np.abs(got - PT.ridged(pts, 5)).max())
+        check('ridged matches patterns.py', e < 2e-4, f'max {e:.7f}')
+    f1c, f2c, idc = PT.worley(pts, 0.9)
+    for comp, want, label in (('x', f1c, 'F1'), ('y', f2c, 'F2')):
+        got = run_prim(f'hal_pt_worley3(pin, 0.9).{comp}')
+        if got is not None:
+            e = float(np.abs(got - want).max())
+            check(f'worley3 {label} matches', e < 2e-4, f'max {e:.7f}')
+    got = run_prim('hal_pt_worley3(pin, 0.9).z')
+    if got is not None:
+        # ids are hash draws spaced 1/65535 apart; the sim's float64
+        # intermediates can move the last bit, so match within a tenth
+        # of that spacing rather than bit-for-bit
+        frac = float((np.abs(got - idc) < 1e-6).mean())
+        check('worley3 carries the winning cell id', frac > 0.999,
+              f'{frac:.4f} matching')
+
+    # ---- the Bayer arithmetic against the CPU's threshold matrices
+    xs, ys = np.meshgrid(np.arange(16), np.arange(16), indexing='xy')
+    grid = np.stack([xs.ravel(), ys.ravel(),
+                     np.zeros(256)], 1).astype(np.float32)
+
+    from ..gpu.emit import _BAYER_GLSL as _BAYER_TEST_GLSL
+
+    def run_bayer(bits, n):
+        # px % n by uint mask, exactly the emitter's own form -- the
+        # front-end has no integer division to lean on
+        src = _BAYER_TEST_GLSL + f'''
+uniform vec3 pin;
+out vec4 Color;
+void main() {{ Color = vec4(hal_bayer(int(uint(int(pin.x)) & {n - 1}u),
+    int(uint(int(pin.y)) & {n - 1}u), {bits},
+    {float(n * n)!r}), 0.0, 0.0, 1.0); }}'''
+        prog, err = try_compile(src)
+        check(f'hal_bayer({n}x{n}) compiles', prog is not None, str(err))
+        if prog is None:
+            return None
+        return prog.run({'pin': grid}, {}, 256)[0]['Color'][:, 0]
+    for kind, bits, n in (('BAYER2', 1, 2), ('BAYER4', 2, 4),
+                          ('BAYER8', 3, 8)):
+        got = run_bayer(bits, n)
+        if got is None:
+            continue
+        tm = DT.threshold_map(kind, 16, 16)
+        want = tm[grid[:, 1].astype(int), grid[:, 0].astype(int)]
+        check(f'the {kind} arithmetic equals threshold_map EXACTLY',
+              bool(np.array_equal(got.astype(np.float32),
+                                  want.astype(np.float32))))
+
+    # ---- whole materials: the four matrix scenes cover every new node
+    for key in ('node Fractal Noise (ridged)',
+                'node Cells + Hardware Palette',
+                'node Pixelate + Scroll + Scanlines',
+                'node TV Static + Ordered Dither'):
+        sc, st = build(key)
+        st.color_depth = '24'
+        st.dither = 'NONE'
+        st.output_scale = 'NONE'
+        sc.time = 1.7
+        sc.frame = 12
+        w, h = st.resolution_x, st.resolution_y
+        cpu = R.render(sc, st)
+        view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+        g = raster.GBuffer(w, h)
+        raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+        job = R.ShadeJob(sc, st, {}, None, view, eye, w, h)
+        GSH._PLAN_CACHE.clear()
+        passes, why, atlases = GSH.plan_frame(job, g)
+        check(f'{key} qualifies', passes is not None, str(why))
+        if passes is None:
+            continue
+        img, _hit = GSH.simulate(job, g, passes, atlases)
+        cov = g.tri >= 0
+        err = float(np.abs(img[cov] - cpu[cov][:, :3]).max())
+        check(f'{key} is the CPU frame', err < 6e-3, f'max {err:.5f}')
+
+    # ---- refusals, each named
+    def sk(nm, t, d, l=None):
+        return {'name': nm, 'type': t, 'default': d, 'link': l}
+
+    def diffuse_graph(extra, link):
+        nodes = {'bsdf': {'id': 'bsdf',
+                          'bl_idname': 'ShaderNodeBsdfDiffuse', 'props': {},
+                          'inputs': [sk('Color', 'RGBA', [1, 1, 1, 1],
+                                        link),
+                                     sk('Roughness', 'VALUE', 0.0)],
+                          'outputs': [{'name': 'BSDF', 'type': 'SHADER'}]},
+                 'out': {'id': 'out',
+                         'bl_idname': 'ShaderNodeOutputMaterial',
+                         'props': {},
+                         'inputs': [sk('Surface', 'SHADER', None,
+                                       ['bsdf', 0]),
+                                    sk('Displacement', 'VECTOR',
+                                       [0, 0, 0])],
+                         'outputs': []}}
+        nodes.update(extra)
+        return {'output': 'out', 'nodes': nodes}
+
+    def refuses(graph, needle, label):
+        from ..core.scene import Material
+        w, h = 96, 72
+        st = base_settings(w, h)
+        sc = demo_scene(st, with_texture=False)
+        sc.materials[1] = Material(name='Ref', index=1, graph=graph)
+        view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+        g = raster.GBuffer(w, h)
+        raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+        job = R.ShadeJob(sc, st, {}, None, view, eye, w, h)
+        GSH._PLAN_CACHE.clear()
+        p, why, _a = GSH.plan_frame(job, g)
+        check(f'{label} refuses by name', p is None and needle in str(why),
+              str(why))
+
+    refuses(diffuse_graph({'cue': {
+        'id': 'cue', 'bl_idname': 'HALCYON_DepthCueNode',
+        'props': {'mode': 'LINEAR'},
+        'inputs': [sk('Color', 'RGBA', [0.8, 0.8, 0.8, 1]),
+                   sk('Fog Color', 'RGBA', [0.5, 0.55, 0.65, 1]),
+                   sk('Start', 'VALUE', 5.0), sk('End', 'VALUE', 40.0)],
+        'outputs': [{'name': 'Color', 'type': 'RGBA'}]}}, ['cue', 0]),
+        'view matrix', 'Depth Cue')
+    refuses(diffuse_graph({'dith': {
+        'id': 'dith', 'bl_idname': 'HALCYON_DitherNode',
+        'props': {'pattern': 'HALFTONE'},
+        'inputs': [sk('Color', 'RGBA', [0.8, 0.8, 0.8, 1]),
+                   sk('Levels', 'VALUE', 4.0),
+                   sk('Strength', 'VALUE', 1.0)],
+        'outputs': [{'name': 'Color', 'type': 'RGBA'}]}}, ['dith', 0]),
+        'halftone', 'the halftone dither')
+    refuses(diffuse_graph({'si': {
+        'id': 'si', 'bl_idname': 'HALCYON_ScreenInfoNode', 'props': {},
+        'inputs': [],
+        'outputs': [{'name': 'Screen UV', 'type': 'VECTOR'},
+                    {'name': 'Pixel', 'type': 'VECTOR'},
+                    {'name': 'Depth', 'type': 'VALUE'},
+                    {'name': 'Facing', 'type': 'VALUE'},
+                    {'name': 'Frame', 'type': 'VALUE'},
+                    {'name': 'Time', 'type': 'VALUE'}]}}, ['si', 2]),
+        'depth', "Screen Info's Depth")
+
+    # ---- Screen Info's Facing DOES travel
+    from ..core.scene import Material
+    w, h = 96, 72
+    st = base_settings(w, h, shadows=True)
+    st.color_depth = '24'
+    st.dither = 'NONE'
+    st.output_scale = 'NONE'
+    sc = demo_scene(st, with_texture=False)
+    sc.materials[1] = Material(name='Face', index=1, graph=diffuse_graph(
+        {'si': {'id': 'si', 'bl_idname': 'HALCYON_ScreenInfoNode',
+                'props': {}, 'inputs': [],
+                'outputs': [{'name': 'Screen UV', 'type': 'VECTOR'},
+                            {'name': 'Pixel', 'type': 'VECTOR'},
+                            {'name': 'Depth', 'type': 'VALUE'},
+                            {'name': 'Facing', 'type': 'VALUE'},
+                            {'name': 'Frame', 'type': 'VALUE'},
+                            {'name': 'Time', 'type': 'VALUE'}]}},
+        ['si', 3]))
+    cpu = R.render(sc, st)
+    view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+    g = raster.GBuffer(w, h)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+    job = R.ShadeJob(sc, st, {}, None, view, eye, w, h)
+    GSH._PLAN_CACHE.clear()
+    passes, why, atlases = GSH.plan_frame(job, g)
+    check("Screen Info's Facing qualifies", passes is not None, str(why))
+    if passes is not None:
+        img, _hit = GSH.simulate(job, g, passes, atlases)
+        cov = g.tri >= 0
+        err = float(np.abs(img[cov] - cpu[cov][:, :3]).max())
+        check('and is the CPU frame', err < 6e-3, f'max {err:.5f}')
+
+    # ---- the export-table regression: the props the evaluators read
+    for idname, want in (('HALCYON_DitherNode', ('pattern',)),
+                         ('HALCYON_DepthCueNode', ('mode',)),
+                         ('HALCYON_PaletteNode', ('palette',)),
+                         ('HALCYON_ScrollNode', ('animate', 'fps')),
+                         ('HALCYON_ScanlinesNode', ('animate',)),
+                         ('HALCYON_ColorCycleNode', ('animate',))):
+        check(f'{idname} exports {want}', NODE_PROPS.get(idname) == want,
+              str(NODE_PROPS.get(idname)))
+
+    # ---- and the CPU evaluators HONOR those props (the bug's other half)
+    n = 256
+    ctx = ShadeContext(n)
+    ctx.settings = RenderSettings()
+    grid_uv = np.stack([np.linspace(0, 1, n),
+                        np.linspace(0, 1, n) ** 1.2], 1).astype(np.float32)
+    ctx.uv = grid_uv
+    ctx.generated = np.concatenate(
+        [grid_uv, np.full((n, 1), 0.4, np.float32)], 1)
+    ctx.P = ctx.generated * 3.0
+    ctx.N = np.tile(np.array([[0, 0, 1.0]], np.float32), (n, 1))
+    ctx.I = np.tile(np.array([[0, 0, -1.0]], np.float32), (n, 1))
+    ctx.px = np.arange(n) % 64
+    ctx.py = np.arange(n) // 4
+    ctx.depth = np.linspace(2.0, 30.0, n).astype(np.float32)
+    ctx.time = 2.0
+    ctx.frame = 7
+
+    def one(idname, inputs, props, out_name):
+        graph = {'output': None,
+                 'nodes': {'t': {'id': 't', 'bl_idname': idname,
+                                 'props': props, 'inputs': inputs,
+                                 'outputs': [{'name': out_name}]}}}
+        ev = GraphEvaluator(graph, ctx)
+        got = ev.eval_output('t', 0)
+        check(f'{idname} evaluates', got is not None and not ev.errors,
+              str(ev.errors[:1]))
+        return got
+
+    dsocks = [sk('Color', 'RGBA', [0.5, 0.5, 0.5, 1]),
+              sk('Levels', 'VALUE', 4.0), sk('Strength', 'VALUE', 1.0)]
+    d_bayer = one('HALCYON_DitherNode', dsocks, {'pattern': 'BAYER2'},
+                  'Color')
+    d_half = one('HALCYON_DitherNode', dsocks, {'pattern': 'HALFTONE'},
+                 'Color')
+    check('the Dither node HONORS its exported pattern',
+          d_bayer is not None and d_half is not None and
+          float(np.abs(d_bayer - d_half).max()) > 1e-4)
+    csocks = [sk('Color', 'RGBA', [0.8, 0.8, 0.8, 1]),
+              sk('Fog Color', 'RGBA', [0.2, 0.3, 0.4, 1]),
+              sk('Start', 'VALUE', 3.0), sk('End', 'VALUE', 20.0)]
+    q_lin = one('HALCYON_DepthCueNode', csocks, {'mode': 'LINEAR'}, 'Color')
+    q_exp = one('HALCYON_DepthCueNode', csocks, {'mode': 'EXP2'}, 'Color')
+    check('the Depth Cue node HONORS its exported falloff',
+          q_lin is not None and q_exp is not None and
+          float(np.abs(q_lin - q_exp).max()) > 1e-4)
+
+    # ---- the new utilities behave, on the numbers
+    px = one('HALCYON_PixelateNode',
+             [sk('Vector', 'VECTOR', None), sk('Pixels X', 'VALUE', 8.0),
+              sk('Pixels Y', 'VALUE', 8.0), sk('Pixels Z', 'VALUE', 0.0)],
+             {}, 'Vector')
+    if px is not None:
+        check('Pixelate snaps to 8 cells',
+              len(np.unique(px[:, 0].round(6))) <= 8,
+              str(len(np.unique(px[:, 0].round(6)))))
+        check('and a zero axis passes through',
+              bool(np.array_equal(px[:, 2],
+                                  np.zeros(n, np.float32))))
+    sc_socks = [sk('Vector', 'VECTOR', None),
+                sk('Scroll X', 'VALUE', 0.25), sk('Scroll Y', 'VALUE', 0.0),
+                sk('Spin', 'VALUE', 0.0)]
+    moved = one('HALCYON_ScrollNode', sc_socks, {'animate': True, 'fps': 0},
+                'Vector')
+    if moved is not None:
+        drift = float(np.abs(moved[:, 0] - (grid_uv[:, 0] + 0.5)).max())
+        check('UV Scroll moves 0.25/s for 2s', drift < 1e-5,
+              f'max {drift:.6f}')
+    ctx.time = 2.13            # a time the 15-step clock genuinely rounds
+    stepped = one('HALCYON_ScrollNode', sc_socks,
+                  {'animate': True, 'fps': 15}, 'Vector')
+    ctx.time = 2.0
+    if stepped is not None:
+        t15 = np.floor(np.float32(2.13) * np.float32(15)) / np.float32(15)
+        check('the stepped clock is not the smooth one',
+              abs(float(t15) - 2.13) > 1e-3, f'{float(t15):.5f}')
+        drift = float(np.abs(stepped[:, 0]
+                             - (grid_uv[:, 0]
+                                + np.float32(0.25) * t15)).max())
+        check('and quantises its clock at 15 steps', drift < 1e-5,
+              f'max {drift:.6f}')
+    lines = one('HALCYON_ScanlinesNode',
+                [sk('Color', 'RGBA', [1.0, 1.0, 1.0, 1]),
+                 sk('Vector', 'VECTOR', None), sk('Lines', 'VALUE', 8.0),
+                 sk('Darkness', 'VALUE', 0.5),
+                 sk('Thickness', 'VALUE', 0.5)],
+                {'animate': False}, 'Color')
+    if lines is not None:
+        vals = set(np.round(lines[:, 0], 5))
+        check('Scanlines split the surface into lit and darkened lines',
+              vals == {0.5, 1.0}, str(sorted(vals)))
+    pal = one('HALCYON_PaletteNode',
+              [sk('Color', 'RGBA', [0.5, 0.5, 0.5, 1], None),
+               sk('Mix', 'VALUE', 1.0)], {'palette': 'GAMEBOY'}, 'Color')
+    if pal is not None:
+        table = NODE_PALETTES['GAMEBOY']
+        dmin = np.abs(pal[:, None, :3] - table[None]).max(axis=2).min(axis=1)
+        check('Hardware Palette lands ON a Game Boy entry',
+              float(dmin.max()) < 1e-6, f'max {float(dmin.max()):.7f}')
+    cyc = one('HALCYON_ColorCycleNode',
+              [sk('Fac', 'VALUE', 0.25), sk('Speed', 'VALUE', 0.5),
+               sk('Steps', 'VALUE', 0.0)], {'animate': True}, 'Fac')
+    if cyc is not None:
+        # fac 0.25 + 0.5/s * 2s = 1.25 -> wraps to 0.25
+        check('Color Cycle wraps its phase',
+              float(np.abs(cyc - 0.25).max()) < 1e-5,
+              f'{float(cyc[0]):.5f}')
+
+    # ---- the standing invariant this round establishes: EVERY Halcyon
+    # node has an evaluator AND a GPU story -- an emitter, or a refusal
+    # whose reason is written down. A node in neither table would route
+    # with a generic excuse, which is how the utilities sat for ten
+    # versions.
+    from ..core.nodeeval import DISPATCH
+    from ..gpu.emit import EMITTERS, REFUSED
+    from ..nodes import pattern_nodes as PN
+    from ..nodes import shader_nodes as SN
+    all_ids = [cls.bl_idname for cls in SN.NODES] + \
+              [f'HALCYON_{spec[0]}Node' for spec in PN.SPECS]
+    no_eval = [i for i in all_ids if i not in DISPATCH]
+    no_story = [i for i in all_ids
+                if i not in EMITTERS and i not in REFUSED]
+    check(f'all {len(all_ids)} Halcyon nodes have evaluators', not no_eval,
+          ', '.join(no_eval))
+    check('and every one has a GPU story, emitter or named refusal',
+          not no_story, ', '.join(no_story))
+
+
+def test_more_utilities_and_the_geometry_audit():
+    """Five more utilities, and the Geometry node told the truth at last.
+
+    Flipbook, UV Wave, Halftone, Threshold and Quantize each work end to
+    end on both devices. And the audit they prompted: the Geometry node's
+    GPU mapping was BY INDEX from a hand-written list, and the list was
+    wrong -- Tangent emitted the NORMAL, Incoming emitted the POSITION,
+    Parametric emitted GENERATED coordinates, Backfacing emitted 0.0
+    whatever the winding, Random Per Island emitted 0.0 where the CPU has
+    a real hash. Four silent divergences and no test reading those
+    sockets (the matrix-blindness lesson, again). Outputs resolve by
+    name now: each either the CPU's exact expression -- Backfacing is
+    the measured plane-side convention, perspective-gated like the
+    backface override -- or a refusal that says why.
+    """
+    from ..core import raster
+    from ..core.nodeeval import GraphEvaluator, ShadeContext
+    from ..core.scene import Material
+    from ..core.settings import RenderSettings
+    from ..gpu import shade as GSH
+    from .featurematrix import GEOMETRY_OUTS, build
+
+    def sk(nm, t, d, l=None):
+        return {'name': nm, 'type': t, 'default': d, 'link': l}
+
+    # ---- the three new matrix scenes, sim against render()
+    for key in ('node Flipbook + UV Wave',
+                'node Halftone + Threshold + Quantize',
+                'node Geometry (Tangent x Incoming)'):
+        sc, st = build(key)
+        st.color_depth = '24'
+        st.dither = 'NONE'
+        st.output_scale = 'NONE'
+        sc.time = 0.9
+        w, h = st.resolution_x, st.resolution_y
+        cpu = R.render(sc, st)
+        view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+        g = raster.GBuffer(w, h)
+        raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+        job = R.ShadeJob(sc, st, {}, None, view, eye, w, h)
+        GSH._PLAN_CACHE.clear()
+        passes, why, atlases = GSH.plan_frame(job, g)
+        check(f'{key} qualifies', passes is not None, str(why))
+        if passes is None:
+            continue
+        img, _hit = GSH.simulate(job, g, passes, atlases)
+        cov = g.tri >= 0
+        err = float(np.abs(img[cov] - cpu[cov][:, :3]).max())
+        check(f'{key} is the CPU frame', err < 6e-3, f'max {err:.5f}')
+
+    def geo_graph(out_index, scale=None):
+        nodes = {'geo': {'id': 'geo', 'bl_idname': 'ShaderNodeNewGeometry',
+                         'props': {}, 'inputs': [],
+                         'outputs': [dict(o) for o in GEOMETRY_OUTS]}}
+        src = ['geo', out_index]
+        if scale is not None:
+            nodes['mul'] = {'id': 'mul',
+                            'bl_idname': 'ShaderNodeVectorMath',
+                            'props': {'operation': 'MULTIPLY'},
+                            'inputs': [sk('Vector', 'VECTOR', [0, 0, 0],
+                                          src),
+                                       sk('Vector', 'VECTOR',
+                                          [scale] * 3)],
+                            'outputs': [{'name': 'Vector',
+                                         'type': 'VECTOR'}]}
+            src = ['mul', 0]
+        nodes['absn'] = {'id': 'absn', 'bl_idname': 'ShaderNodeVectorMath',
+                         'props': {'operation': 'ABSOLUTE'},
+                         'inputs': [sk('Vector', 'VECTOR', [0, 0, 0],
+                                       src)],
+                         'outputs': [{'name': 'Vector', 'type': 'VECTOR'}]}
+        nodes['bsdf'] = {'id': 'bsdf',
+                         'bl_idname': 'ShaderNodeBsdfDiffuse', 'props': {},
+                         'inputs': [sk('Color', 'RGBA', [1, 1, 1, 1],
+                                       ['absn', 0]),
+                                    sk('Roughness', 'VALUE', 0.0)],
+                         'outputs': [{'name': 'BSDF', 'type': 'SHADER'}]}
+        nodes['out'] = {'id': 'out',
+                        'bl_idname': 'ShaderNodeOutputMaterial',
+                        'props': {},
+                        'inputs': [sk('Surface', 'SHADER', None,
+                                      ['bsdf', 0]),
+                                   sk('Displacement', 'VECTOR', [0, 0, 0])],
+                        'outputs': []}
+        return {'output': 'out', 'nodes': nodes}
+
+    def run_graph(sc, st, graph, mat_index=1):
+        w, h = st.resolution_x, st.resolution_y
+        sc.materials[mat_index] = Material(name='Geo', index=mat_index,
+                                           graph=graph)
+        cpu = R.render(sc, st)
+        view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+        g = raster.GBuffer(w, h)
+        raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+        job = R.ShadeJob(sc, st, {}, None, view, eye, w, h)
+        GSH._PLAN_CACHE.clear()
+        passes, why, atlases = GSH.plan_frame(job, g)
+        if passes is None:
+            return None, why, None, None
+        img, _hit = GSH.simulate(job, g, passes, atlases)
+        return passes, why, img, (cpu, g)
+
+    # ---- every emitted Geometry output against the CPU, one at a time
+    for idx, label, scale in ((0, 'Position', 0.12), (1, 'Normal', None),
+                              (2, 'Tangent', None), (4, 'Incoming', None),
+                              (5, 'Parametric', None)):
+        st = base_settings(96, 72, shadows=True)
+        st.color_depth = '24'
+        st.dither = 'NONE'
+        st.output_scale = 'NONE'
+        sc = demo_scene(st, with_texture=False)
+        passes, why, img, rest = run_graph(sc, st, geo_graph(idx, scale))
+        check(f'Geometry {label} qualifies', passes is not None, str(why))
+        if passes is None:
+            continue
+        cpu, g = rest
+        cov = g.tri >= 0
+        err = float(np.abs(img[cov] - cpu[cov][:, :3]).max())
+        check(f'Geometry {label} is the CPU frame', err < 6e-3,
+              f'max {err:.5f}')
+
+    # ---- Backfacing on mixed winding: the plane test vs the rasteriser
+    st = base_settings(96, 72, shadows=True)
+    st.color_depth = '24'
+    st.dither = 'NONE'
+    st.output_scale = 'NONE'
+    st.two_sided_lighting = True
+    sc = demo_scene(st, with_texture=False)
+    m = sc.mesh
+    floor = np.nonzero(m.mat_index == 0)[0]
+    m.tris[floor[::2]] = m.tris[floor[::2]][:, [0, 2, 1]]
+    passes, why, img, rest = run_graph(sc, st, geo_graph(6), mat_index=0)
+    check('Geometry Backfacing qualifies on a perspective camera',
+          passes is not None, str(why))
+    if passes is not None:
+        cpu, g = rest
+        cov = g.tri >= 0
+        fronts = g.front[cov]
+        check('the fixture really shows both windings',
+              bool(fronts.any()) and bool((~fronts).any()),
+              f'{int(fronts.sum())}/{fronts.size} front')
+        err = float(np.abs(img[cov] - cpu[cov][:, :3]).max())
+        check('Backfacing is the CPU frame across both windings',
+              err < 6e-3, f'max {err:.5f}')
+
+    # ---- the refusals, named
+    def refuses(graph, needle, label, camera=None):
+        w, h = 96, 72
+        st = base_settings(w, h)
+        sc = demo_scene(st, with_texture=False)
+        if camera:
+            sc.camera.type = camera
+        sc.materials[1] = Material(name='Ref', index=1, graph=graph)
+        view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+        g = raster.GBuffer(w, h)
+        raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+        job = R.ShadeJob(sc, st, {}, None, view, eye, w, h)
+        GSH._PLAN_CACHE.clear()
+        p, why, _a = GSH.plan_frame(job, g)
+        check(f'{label} refuses by name', p is None and needle in str(why),
+              str(why))
+
+    refuses(geo_graph(6), 'orthographic',
+            'Backfacing under an orthographic camera', camera='ORTHO')
+    refuses(geo_graph(3), 'face normal', "Geometry's True Normal")
+    refuses(geo_graph(8, scale=1.0), 'sin-fract',
+            "Geometry's Random Per Island")
+
+    # ---- the new utilities behave, on the numbers
+    n = 256
+    ctx = ShadeContext(n)
+    ctx.settings = RenderSettings()
+    uv = np.stack([np.linspace(0, 1, n),
+                   np.linspace(0, 1, n) ** 1.1], 1).astype(np.float32)
+    ctx.uv = uv
+    ctx.generated = np.concatenate(
+        [uv, np.full((n, 1), 0.3, np.float32)], 1)
+    ctx.N = np.tile(np.array([[0, 0, 1.0]], np.float32), (n, 1))
+    ctx.I = np.tile(np.array([[0, 0, -1.0]], np.float32), (n, 1))
+    ctx.time = 0.0
+
+    def one(idname, inputs, props, out_name, out_index=0):
+        graph = {'output': None,
+                 'nodes': {'t': {'id': 't', 'bl_idname': idname,
+                                 'props': props, 'inputs': inputs,
+                                 'outputs': [{'name': out_name}]
+                                 if out_index == 0 else
+                                 [{'name': f'o{i}'} for i in
+                                  range(out_index)] +
+                                 [{'name': out_name}]}}}
+        ev = GraphEvaluator(graph, ctx)
+        got = ev.eval_output('t', out_index)
+        check(f'{idname} evaluates', got is not None and not ev.errors,
+              str(ev.errors[:1]))
+        return got
+
+    # Flipbook at rest: offset 5 in a 4x4 sheet is column 1, row 1 from
+    # the top -- so x lands in [0.25, 0.5) and y in [0.5, 0.75)
+    fb = one('HALCYON_FlipbookNode',
+             [sk('Vector', 'VECTOR', None), sk('Columns', 'VALUE', 4.0),
+              sk('Rows', 'VALUE', 4.0), sk('Rate', 'VALUE', 8.0),
+              sk('Cell Offset', 'VALUE', 5.0)],
+             {'animate': False}, 'Vector')
+    if fb is not None:
+        want_x = (uv[:, 0] + 1.0) / 4.0
+        want_y = (uv[:, 1] + 2.0) / 4.0
+        ok = float(np.abs(fb[:, 0] - want_x).max()
+                   + np.abs(fb[:, 1] - want_y).max())
+        check('Flipbook picks cell 5 of a 4x4 sheet', ok < 1e-6,
+              f'{ok:.7f}')
+    wv = one('HALCYON_UVWaveNode',
+             [sk('Vector', 'VECTOR', None),
+              sk('Amplitude X', 'VALUE', 0.05),
+              sk('Amplitude Y', 'VALUE', 0.0),
+              sk('Frequency', 'VALUE', 3.0), sk('Speed', 'VALUE', 1.0)],
+             {'animate': True}, 'Vector')
+    if wv is not None:
+        want = uv[:, 0] + np.sin(uv[:, 1] * np.float32(3.0)
+                                 * np.float32(2.0 * np.pi)) \
+            * np.float32(0.05)
+        err = float(np.abs(wv[:, 0] - want).max())
+        check('UV Wave is its own formula at t=0', err < 1e-6,
+              f'{err:.7f}')
+        check('and leaves y alone at zero amplitude',
+              float(np.abs(wv[:, 1] - uv[:, 1]).max()) < 1e-7)
+    ht_dark = one('HALCYON_HalftoneNode',
+                  [sk('Color', 'RGBA', [0.15, 0.15, 0.15, 1]),
+                   sk('Vector', 'VECTOR', None), sk('Dots', 'VALUE', 8.0),
+                   sk('Angle', 'VALUE', 45.0),
+                   sk('Ink Color', 'RGBA', [0, 0, 0, 1]),
+                   sk('Paper Color', 'RGBA', [1, 1, 1, 1])],
+                  {}, 'Fac', out_index=1)
+    ht_light = one('HALCYON_HalftoneNode',
+                   [sk('Color', 'RGBA', [0.85, 0.85, 0.85, 1]),
+                    sk('Vector', 'VECTOR', None), sk('Dots', 'VALUE', 8.0),
+                    sk('Angle', 'VALUE', 45.0),
+                    sk('Ink Color', 'RGBA', [0, 0, 0, 1]),
+                    sk('Paper Color', 'RGBA', [1, 1, 1, 1])],
+                   {}, 'Fac', out_index=1)
+    if ht_dark is not None and ht_light is not None:
+        check('Halftone prints more ink where the input is darker',
+              float(ht_dark.mean()) > float(ht_light.mean()),
+              f'{float(ht_dark.mean()):.3f} vs '
+              f'{float(ht_light.mean()):.3f}')
+    # Threshold and Quantize, swept across a ramp: the handlers read
+    # their sockets through ev.input, so a stub that answers by name
+    # sweeps them without wiring a driver chain
+    from ..core.nodeeval import n_halcyon_quantize as NQ
+    from ..core.nodeeval import n_halcyon_threshold as NTH
+
+    class _EvStub:
+        def __init__(self, **m):
+            self._m = m
+
+        def input(self, node, name, kind):
+            return self._m[name]
+
+    dummy = {'id': 't', 'props': {}, 'inputs': [], 'outputs': []}
+    ramp = np.linspace(0, 1, n).astype(np.float32)
+    half = np.full(n, 0.5, np.float32)
+    hard = NTH(_EvStub(Fac=ramp, Level=half,
+                       Smooth=np.zeros(n, np.float32)), dummy)['Fac']
+    check('Threshold cuts hard at the level',
+          set(np.unique(hard)) == {np.float32(0.0), np.float32(1.0)}
+          and float(hard[ramp < 0.5].max()) == 0.0
+          and float(hard[ramp >= 0.5].min()) == 1.0)
+    soft = NTH(_EvStub(Fac=ramp, Level=half,
+                       Smooth=np.full(n, 0.2, np.float32)), dummy)['Fac']
+    mid = (ramp > 0.42) & (ramp < 0.58)
+    check('Threshold smooths across the band when asked',
+          bool(((soft[mid] > 0.0) & (soft[mid] < 1.0)).any())
+          and float(soft[ramp < 0.35].max()) == 0.0
+          and float(soft[ramp > 0.65].min()) == 1.0)
+    q = NQ(_EvStub(Fac=ramp, Steps=np.full(n, 5.0, np.float32)),
+           dummy)['Fac']
+    lv = np.unique(q)
+    check('Quantize lands on exactly its steps', len(lv) == 5
+          and float(lv.min()) == 0.0 and float(lv.max()) > 0.99,
+          str(lv))
+
+
+def test_the_era_audit_round():
+    """The 90s-features audit: what was missing, dead, or lying.
+
+    The sweep of every render property against its readers found two
+    dead controls -- `reflection_blur_samples` had a UI slider and no
+    reader (the Toon Steps disease), `watermark` sat in the settings
+    table with no UI and no reader -- and one marquee absence: the era's
+    Radiosity checkbox. All three live now:
+
+    - RADIOSITY: one-bounce gathered ambient. Sky rays return the
+      ambient colour, hit rays return the hit material's flat diffuse
+      with a linear falloff -- colour bleed, deterministic streams, its
+      own salt, and the SAME gather in GLSL against the closest-hit
+      kernel with a baked albedo table.
+    - BLURRY REFLECTIONS: a cone of jittered rays averaged per
+      reflective fragment; the samples slider finally does something.
+      The deferred sweeps carry one ray per fragment, so blurry frames
+      refuse BY NAME and shade on the CPU.
+    - THE BURN-IN: watermark text stamps the final frame in a 5x7
+      bitmap font, white over a drop shadow, with %F/%R/%V tokens --
+      after every post stage, so both devices stamp identical bits.
+    """
+    from ..core import post as PP
+    from ..core import raster
+    from ..core.bvh import BVH
+    from ..gpu import shade as GSH
+
+    # ---- radiosity: bleed is real, and the GPU gathers the same rays
+    def render_pair(paint_floor=True, **rad):
+        st = base_settings(96, 72, shadows=True)
+        st.color_depth = '24'
+        st.dither = 'NONE'
+        st.output_scale = 'NONE'
+        for k, v in rad.items():
+            setattr(st, k, v)
+        sc = demo_scene(st, with_texture=False)
+        if paint_floor:
+            sc.materials[0].diffuse = (0.9, 0.05, 0.05)
+        return sc, st
+
+    sc, st = render_pair(radiosity=True, radiosity_samples=4,
+                         radiosity_distance=4.0)
+    on = R.render(sc, st)
+    sc2, st2 = render_pair()
+    off = R.render(sc2, st2)
+    red = float((on[..., 0] - off[..., 0]).sum())
+    grn = float((on[..., 1] - off[..., 1]).sum())
+    check('the red floor lends the scene red', red > 1.0,
+          f'{red:.2f}')
+    check('...and it is BLEED, not brightening', red > grn + 1.0,
+          f'red {red:.2f} vs green {grn:.2f}')
+
+    view, _proj, vp, eye = R.camera_matrices(sc.camera, 96, 72)
+    g = raster.GBuffer(96, 72)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, 96, 72, gbuf=g)
+    bvh = BVH(sc.mesh.verts, sc.mesh.tris)    # as render() built it
+    job = R.ShadeJob(sc, st, {}, bvh, view, eye, 96, 72)
+    GSH._PLAN_CACHE.clear()
+    passes, why, atlases = GSH.plan_frame(job, g)
+    check('radiosity qualifies for the deferred pass',
+          passes is not None, str(why))
+    if passes is not None:
+        img, _hit = GSH.simulate(job, g, passes, atlases)
+        cov = g.tri >= 0
+        err = float(np.abs(img[cov] - on[cov][:, :3]).max())
+        check('the GPU gathers the CPU frame', err < 6e-3,
+              f'max {err:.6f}')
+
+    # supersession: radiosity + AO on together must equal radiosity alone
+    sc3, st3 = render_pair(radiosity=True, radiosity_samples=4,
+                           radiosity_distance=4.0, ambient_occlusion=True)
+    both = R.render(sc3, st3)
+    check('radiosity supersedes plain AO, exactly',
+          bool(np.array_equal(both, on)))
+
+    # ---- blurry reflections: the dead slider lives
+    from .featurematrix import build
+    sc, st = build('blurry reflections')
+    st.color_depth = '24'
+    st.dither = 'NONE'
+    st.output_scale = 'NONE'
+    blurred = R.render(sc, st)
+    st_sharp = __import__('copy').copy(st)
+    st_sharp = type(st)(**{f.name: getattr(st, f.name)
+                           for f in __import__('dataclasses').fields(st)})
+    st_sharp.reflection_blur = 0.0
+    sharp = R.render(sc, st_sharp)
+    d_blur = float(np.abs(blurred[..., :3] - sharp[..., :3]).max())
+    check('a blur cone changes the reflection', d_blur > 0.01,
+          f'{d_blur:.4f}')
+    st_more = type(st)(**{f.name: getattr(st, f.name)
+                          for f in __import__('dataclasses').fields(st)})
+    st_more.reflection_blur_samples = 8
+    more = R.render(sc, st_more)
+    check('the SAMPLES slider finally does something (dead since it '
+          'shipped)', float(np.abs(more[..., :3]
+                                   - blurred[..., :3]).max()) > 1e-4)
+    # determinism: the jitter rides the pixel-identity streams
+    again = R.render(sc, st)
+    check('the blur is deterministic', bool(np.array_equal(blurred, again)))
+    # and the deferred pass refuses BY NAME
+    view, _proj, vp, eye = R.camera_matrices(sc.camera,
+                                             st.resolution_x,
+                                             st.resolution_y)
+    g = raster.GBuffer(st.resolution_x, st.resolution_y)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, st.resolution_x,
+                     st.resolution_y, gbuf=g)
+    job = R.ShadeJob(sc, st, {}, None, view, eye, st.resolution_x,
+                     st.resolution_y)
+    GSH._PLAN_CACHE.clear()
+    p, why, _a = GSH.plan_frame(job, g)
+    check('blurry reflections refuse by name',
+          p is None and 'jittered rays' in str(why), str(why))
+
+    # ---- the burn-in stamp. The reference is the same post chain with
+    # no watermark: post legitimately quantises and transforms, so
+    # "unchanged" means "equal to the stampless run", never "equal to
+    # the input".
+    st_empty = base_settings(96, 72)
+    img = np.full((72, 96, 4), 0.5, np.float32)
+    base = PP.process(img.copy(), st_empty, frame=37)
+    st = base_settings(96, 72)
+    st.watermark = 'A1 %F'
+    out = PP.process(img.copy(), st, frame=37)
+    diff = np.abs(out[..., :3] - base[..., :3]).max(axis=2)
+    check('the stamp marks the frame', float(diff.max()) > 0.4)
+    check('...in the bottom-left corner only',
+          float(diff[:24, :64].max()) > 0.4 and
+          float(diff[24:, :].max()) < 1e-6 and
+          float(diff[:, 64:].max()) < 1e-6,
+          f'top {float(diff[24:, :].max()):.4f}')
+    check('the token expanded to the frame number',
+          PP.stamp_text('A1 %F', st, 37) == 'A1 0037')
+    check('%R and %V expand too',
+          PP.stamp_text('%R', st, 0) == '96X72' and
+          PP.stamp_text('%V', st, 0).startswith('HALCYON 1.'))
+    out2 = PP.process(img.copy(), st, frame=37)
+    check('the stamp is deterministic', bool(np.array_equal(out, out2)))
+    st._viewport = True
+    vout = PP.process(img.copy(), st, frame=37)
+    check('the viewport never shows the burn-in',
+          bool(np.array_equal(vout, base)))
+
+    # ---- the slate tokens: date, time, render time, host version.
+    # The clock injects through `info` so the pixels are testable; the
+    # engine fills the real values at F12 time.
+    import datetime
+    fixed = datetime.datetime(1997, 8, 29, 2, 14)
+    info = {'now': fixed, 'render_time': 12.4, 'blender': '5.2.0'}
+    check('%D stamps the date',
+          PP.stamp_text('%D', st, 0, info) == '1997-08-29')
+    check('%T stamps the time of day',
+          PP.stamp_text('%T', st, 0, info) == '02:14')
+    check('%S stamps the render clock',
+          PP.stamp_text('%S', st, 0, info) == '12.4S')
+    check('...in minutes past a minute',
+          PP._stamp_seconds(192.6) == '3M13S' and
+          PP._stamp_seconds(7505) == '2H05M', PP._stamp_seconds(192.6))
+    check('%B stamps the host version',
+          PP.stamp_text('%B', st, 0, info) == 'BLENDER 5.2.0')
+    check('absent info says ? instead of guessing',
+          PP.stamp_text('%S %B', st, 0, None) == '? BLENDER ?')
+
+    # ---- the field's 118-second lesson, both halves. HALF ONE: the
+    # documented matcap workflow (Image Texture through Matcap
+    # Coordinates into the Matcap socket) refused since the override
+    # was ported -- 'matcap varies across the frame' -- and one such
+    # material put the WHOLE frame, radiosity gather included, on the
+    # CPU. The matcap COLOUR is per-pixel now.
+    from ..core.scene import ImageBuffer, Material
+    from .scenebuild import checker_image
+
+    def sk(nm, t, d, l=None):
+        return {'name': nm, 'type': t, 'default': d, 'link': l}
+
+    def matcap_master(blend_link=None):
+        ins = [
+            sk('Diffuse Color', 'RGBA', [0.6, 0.6, 0.6, 1.0]),
+            sk('Vertex Color', 'RGBA', [1, 1, 1, 1]),
+            sk('Vertex Color Mix', 'VALUE', 0.0),
+            sk('Diffuse Level', 'VALUE', 1.0),
+            sk('Specular Color', 'RGBA', [1, 1, 1, 1]),
+            sk('Specular Level', 'VALUE', 0.4),
+            sk('Glossiness', 'VALUE', 24.0),
+            sk('Roughness', 'VALUE', 0.3),
+            sk('Ambient', 'VALUE', 1.0),
+            sk('Self-Illumination', 'RGBA', [0, 0, 0, 1]),
+            sk('Opacity', 'VALUE', 1.0),
+            sk('IOR', 'VALUE', 1.45),
+            sk('Anisotropy', 'VALUE', 0.0),
+            sk('Anisotropic Rotation', 'VALUE', 0.0),
+            sk('Metalness', 'VALUE', 0.0),
+            sk('Soften', 'VALUE', 0.0),
+            sk('Reflection', 'VALUE', 0.0),
+            sk('Translucency', 'VALUE', 0.0),
+            sk('Toon Size', 'VALUE', 0.5),
+            sk('Toon Smooth', 'VALUE', 0.05),
+            sk('Matcap', 'RGBA', [0, 0, 0, 1], ['tex', 0]),
+            sk('Matcap Blend', 'VALUE', 0.55, blend_link),
+        ]
+        nodes = {
+            'muv': {'id': 'muv', 'bl_idname': 'HALCYON_MatcapUVNode',
+                    'props': {},
+                    'inputs': [sk('Scale', 'VALUE', 1.0)],
+                    'outputs': [{'name': 'Vector', 'type': 'VECTOR'},
+                                {'name': 'Facing', 'type': 'VALUE'}]},
+            'tex': {'id': 'tex', 'bl_idname': 'ShaderNodeTexImage',
+                    'props': {'image': 'eyes',
+                              'interpolation': 'Closest'},
+                    'inputs': [sk('Vector', 'VECTOR', [0, 0, 0],
+                                  ['muv', 0])],
+                    'outputs': [{'name': 'Color', 'type': 'RGBA'},
+                                {'name': 'Alpha', 'type': 'VALUE'}]},
+            'hal': {'id': 'hal', 'bl_idname': 'HALCYON_ShaderNode',
+                    'props': {'model': 'PHONG', 'toon_steps': 2},
+                    'inputs': ins,
+                    'outputs': [{'name': 'Surface', 'type': 'SHADER'}]},
+            'out': {'id': 'out', 'bl_idname': 'ShaderNodeOutputMaterial',
+                    'props': {},
+                    'inputs': [sk('Surface', 'SHADER', None, ['hal', 0]),
+                               sk('Displacement', 'VECTOR', [0, 0, 0])],
+                    'outputs': []}}
+        return {'output': 'out', 'nodes': nodes}
+
+    st = base_settings(96, 72, shadows=True)
+    st.color_depth = '24'
+    st.dither = 'NONE'
+    st.output_scale = 'NONE'
+    sc = demo_scene(st, with_texture=False)
+    sc.images['eyes'] = ImageBuffer(name='eyes', pixels=checker_image())
+    sc.materials[1] = Material(name='Eyes', index=1,
+                               graph=matcap_master())
+    cpu = R.render(sc, st)
+    view, _proj, vp, eye = R.camera_matrices(sc.camera, 96, 72)
+    g = raster.GBuffer(96, 72)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, 96, 72, gbuf=g)
+    tex = R.prepare_textures(sc, st)
+    job = R.ShadeJob(sc, st, tex, None, view, eye, 96, 72)
+    GSH._PLAN_CACHE.clear()
+    passes, why, atlases = GSH.plan_frame(job, g)
+    check("the FIELD'S OWN refusal is lifted: an image-driven matcap "
+          'qualifies', passes is not None, str(why))
+    if passes is not None:
+        img2, _hit = GSH.simulate(job, g, passes, atlases)
+        cov = g.tri >= 0
+        err = float(np.abs(img2[cov] - cpu[cov][:, :3]).max())
+        check('and the per-pixel matcap is the CPU frame', err < 6e-3,
+              f'max {err:.5f}')
+    # a varying BLEND still refuses, by name
+    lk = matcap_master(blend_link=['muv', 1])   # Facing drives the blend
+    sc.materials[1] = Material(name='Eyes', index=1, graph=lk)
+    GSH._PLAN_CACHE.clear()
+    p2, why2, _a2 = GSH.plan_frame(job, g)
+    check('a varying matcap BLEND still refuses by name',
+          p2 is None and 'matcap_blend' in str(why2), str(why2))
+
+    # HALF TWO: when the gather DOES run on the CPU, the cost is named
+    # before it is paid
+    import contextlib
+    import io
+    st = base_settings(48, 36, shadows=True)
+    st.radiosity = True
+    st.radiosity_samples = 2
+    sc = demo_scene(st, with_texture=False)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        R.render(sc, st)
+    check('the CPU gather announces its cost and its levers',
+          'radiosity gathers on the CPU' in buf.getvalue()
+          and 'Gather Samples' in buf.getvalue(),
+          buf.getvalue()[:120])
+
+
+def test_interpolated_radiosity_and_the_inked_slate():
+    """The era's own radiosity, and the slate learns colour.
+
+    INTERPOLATED RADIOSITY (LightWave's shipping mode): gather every Nth
+    pixel into a grid, blend between the points. The grid point's source
+    is the first covered pixel of its block in row-major order, gathered
+    with that pixel's own deterministic identity -- so the GPU's grid
+    pre-pass casts the identical rays and the two devices blend the same
+    field. Spacing 1 remains the full-rate 1.25.95 path, byte for byte.
+    Bands must not seam: the scissor grows by two blocks so a band's
+    grid points see complete blocks and land the whole frame's numbers.
+
+    THE INKED SLATE: `&%r/g/b/y/c/m` switch the burn-in's ink; the
+    secret `&%2204355` wears a rainbow that scrolls one character per
+    frame -- glyph cell i at frame f+1 must equal glyph cell i+1 at
+    frame f, exactly.
+    """
+    from ..core import post as PP
+    from ..core import raster
+    from ..core.bvh import BVH
+    from ..gpu import shade as GSH
+
+    def setup(spacing, samples=4):
+        st = base_settings(96, 72, shadows=True)
+        st.color_depth = '24'
+        st.dither = 'NONE'
+        st.output_scale = 'NONE'
+        st.radiosity = True
+        st.radiosity_samples = samples
+        st.radiosity_distance = 4.0
+        st.radiosity_spacing = spacing
+        sc = demo_scene(st, with_texture=False)
+        sc.materials[0].diffuse = (0.9, 0.05, 0.05)
+        return sc, st
+
+    # ---- the interpolation is real, deterministic, and CLOSE
+    sc, st = setup(2)
+    interp = R.render(sc, st)
+    sc1, st1 = setup(1)
+    full = R.render(sc1, st1)
+    d = np.abs(full[..., :3] - interp[..., :3])
+    check('spacing 2 interpolates (differs from full-rate)',
+          float(d.max()) > 1e-4, f'{float(d.max()):.4f}')
+    check('...but stays the same picture (mean)', float(d.mean()) < 0.02,
+          f'{float(d.mean()):.5f}')
+    again = R.render(*setup(2)[:1], st)
+    check('the interpolated gather is deterministic',
+          bool(np.array_equal(interp, again)))
+
+    # ---- bands must not seam: two half-frames == the whole frame
+    sc_b, st_b = setup(2)
+    whole = R.render(sc_b, st_b)
+    sc_t, st_t = setup(2)
+    top = R.render(sc_t, st_t, band=(0, 36))     # bands return their rows
+    sc_u, st_u = setup(2)
+    bot = R.render(sc_u, st_u, band=(36, 72))
+    joined = np.concatenate([top, bot], axis=0)
+    check('band halves equal the whole frame EXACTLY (no grid seam)',
+          bool(np.array_equal(joined, whole)),
+          f'shapes {top.shape}/{bot.shape} vs {whole.shape}')
+
+    # ---- the GPU field: grid pre-pass present, sim is the CPU frame
+    sc, st = setup(2)
+    cpu = R.render(sc, st)
+    view, _proj, vp, eye = R.camera_matrices(sc.camera, 96, 72)
+    g = raster.GBuffer(96, 72)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, 96, 72, gbuf=g)
+    bvh = BVH(sc.mesh.verts, sc.mesh.tris)
+    job = R.ShadeJob(sc, st, {}, bvh, view, eye, 96, 72)
+    GSH._PLAN_CACHE.clear()
+    passes, why, atlases = GSH.plan_frame(job, g)
+    check('interpolated radiosity qualifies', passes is not None,
+          str(why))
+    if passes is not None:
+        check('the grid pre-pass rides the plan',
+              '__radfield' in atlases)
+        for _mid, name, src, binds in passes:
+            check(f"pass '{name}' reads the field, not the BVH",
+                  'hal_rad_lookup' in src and
+                  'hal_bvh_intersect' not in src and
+                  'hal_radfield' in binds.get('samplers', ()))
+        img, _hit = GSH.simulate(job, g, passes, atlases)
+        cov = g.tri >= 0
+        err = float(np.abs(img[cov] - cpu[cov][:, :3]).max())
+        check('the interpolated field sim-matches the CPU frame',
+              err < 6e-3, f'max {err:.6f}')
+
+    # ---- traced hits have no place in a screen cache: with rays on,
+    # secondary passes still carry the FULL gather
+    sc, st = setup(2)
+    st.raytrace = True
+    st.ray_depth = 1
+    sc.materials[2].reflect_level = 0.5
+    cpu = R.render(sc, st)
+    view, _proj, vp, eye = R.camera_matrices(sc.camera, 96, 72)
+    g = raster.GBuffer(96, 72)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, 96, 72, gbuf=g)
+    bvh = BVH(sc.mesh.verts, sc.mesh.tris)
+    job = R.ShadeJob(sc, st, {}, bvh, view, eye, 96, 72)
+    GSH._PLAN_CACHE.clear()
+    passes, why, atlases = GSH.plan_frame(job, g)
+    check('rays + interpolated radiosity qualify', passes is not None,
+          str(why))
+    if passes is not None:
+        rplan = atlases.get('__reflect')
+        check('secondary passes keep the full gather',
+              rplan is not None and any(
+                  'hal_rad_at' in p[2] for p in rplan['secondary']))
+        img, _hit = GSH.simulate(job, g, passes, atlases)
+        cov = g.tri >= 0
+        err = float(np.abs(img[cov] - cpu[cov][:, :3]).max())
+        check('and the reflected frame sim-matches', err < 6e-3,
+              f'max {err:.6f}')
+
+    # ---- the inked slate
+    st = base_settings(96, 72)
+    img0 = np.full((72, 96, 4), 0.25, np.float32)
+    base = PP.process(img0.copy(), st, frame=0)
+    st.watermark = '&%rA'
+    red = PP.process(img0.copy(), st, frame=0)
+    diff = np.abs(red[..., :3] - base[..., :3]).sum(axis=2)
+    ys, xs = np.nonzero(diff > 0.2)
+    check('the red escape draws SOMETHING', ys.size > 0)
+    lit = red[ys, xs]
+    ink = lit[lit[:, 0] > 0.9]
+    check('...and its ink is red', ink.size > 0 and
+          float(ink[:, 1].max()) < 0.1 and float(ink[:, 2].max()) < 0.1)
+    check('the escape itself is consumed (one glyph, not four)',
+          float(xs.max()) < 4 + 6 * 2, str(int(xs.max())))
+    runs = PP._stamp_runs('&%gHI', 0)
+    check('runs carry the ink switch',
+          [c for c, _col in runs] == ['H', 'I'] and
+          runs[0][1] == (0.0, 1.0, 0.0))
+
+    # the rainbow scrolls one character per frame: cell i at frame f+1
+    # equals cell i+1 at frame f, same glyph, shifted hue
+    st.watermark = '&%2204355AAAAAAAA'
+    f0 = PP.process(img0.copy(), st, frame=10)
+    f1 = PP.process(img0.copy(), st, frame=11)
+    adv, margin = 6, 4
+    ok = True
+    for i in range(3):
+        c_next = f1[:16, margin + i * adv:margin + (i + 1) * adv]
+        c_prev = f0[:16, margin + (i + 1) * adv:margin + (i + 2) * adv]
+        if not np.array_equal(c_next, c_prev):
+            ok = False
+    check('the rainbow scrolls exactly one character per frame', ok)
+    hues = {tuple(np.round(PP._hue_rgb(k / 12.0), 5)) for k in range(12)}
+    check('twelve distinct hues around the wheel', len(hues) == 12)
+
+    # THE FIELD'S STILL: one timeline frame, rendered again and again.
+    # Keyed to the timeline alone the rainbow stands perfectly still
+    # there -- two reports in a row watched it do exactly that. The
+    # slate already prints wall-clock truths (%T, %S), so the rainbow
+    # rides the render-event clock too: 'scroll' in stamp_info, the
+    # engine's per-render serial. A serial step obeys the same shift
+    # law as a frame step...
+    s0 = PP.process(img0.copy(), st, frame=10, stamp_info={'scroll': 3})
+    s1 = PP.process(img0.copy(), st, frame=10, stamp_info={'scroll': 4})
+    ok = all(np.array_equal(
+        s1[:16, margin + i * adv:margin + (i + 1) * adv],
+        s0[:16, margin + (i + 1) * adv:margin + (i + 2) * adv])
+        for i in range(3))
+    check('a render-serial step scrolls one character, same law', ok)
+    # ...frame and serial are ONE clock, additive and bit-exact...
+    check('frame and serial share one clock',
+          np.array_equal(
+              PP.process(img0.copy(), st, frame=7,
+                         stamp_info={'scroll': 4}),
+              PP.process(img0.copy(), st, frame=0,
+                         stamp_info={'scroll': 11})))
+    # ...and no serial means the pure-frame clock, bit for bit: the
+    # headless matrix and the self-test prover pass stamp_info=None
+    # and keep every pixel they had
+    check('absent serial keeps the pure-frame clock',
+          np.array_equal(
+              PP.process(img0.copy(), st, frame=10,
+                         stamp_info={'scroll': 0}), f0))
+
+    # THE FIELD'S SECOND STRING: 'SHOT 4 %F &%c%D %T &%2204355'. The
+    # escapes are prefix inks -- they colour what FOLLOWS -- so a
+    # TRAILING egg claimed zero glyphs and the slate came back cyan
+    # with no rainbow anywhere. The egg must never resolve to nothing:
+    # left without a visible glyph of its own it takes the WHOLE line
+    # (explicit inks yield; the egg was typed to get a rainbow
+    # SOMEWHERE). Given its own glyphs it colours only those, and
+    # every other ink keeps its section.
+    import datetime as _dt
+    fixed = {'now': _dt.datetime(2026, 8, 8, 14, 32),
+             'render_time': 5.0, 'blender': '5.2.0'}
+    txt = PP.stamp_text('SHOT 4 %F &%c%D %T &%2204355', st, 4, fixed)
+    pr = PP._stamp_runs(txt, 4)
+    check('a trailing egg takes the whole line',
+          len(pr) > 20 and all(col == 'RAINBOW' for ch, col in pr
+                               if ch != ' '), str(pr[:4]))
+    pr2 = PP._stamp_runs('AB &%2204355CD', 0)
+    check('an egg with its own glyphs colours only those',
+          [col for _ch, col in pr2] == [(1.0, 1.0, 1.0)] * 3 +
+          ['RAINBOW'] * 2, str(pr2))
+    check('a trailing-spaces egg promotes too',
+          all(col == 'RAINBOW' for _ch, col in
+              PP._stamp_runs('AB&%2204355 ', 0)))
+    check('no egg, no promotion',
+          all(col == (0.0, 1.0, 1.0) for _ch, col in
+              PP._stamp_runs('&%cAB', 0)))
+    # and through process(): the promoted line is a moving RAINBOW,
+    # not one tint -- many distinct inks on a still, scrolling on the
+    # render serial exactly like any other rainbow
+    st_ref = base_settings(96, 72)
+    ref = PP.process(img0.copy(), st_ref, frame=4,
+                     stamp_info=dict(fixed, scroll=1))
+    st_f = base_settings(96, 72)
+    st_f.watermark = 'SHOT 4 %F &%c%D %T &%2204355'
+    g0 = PP.process(img0.copy(), st_f, frame=4,
+                    stamp_info=dict(fixed, scroll=1))
+    g1 = PP.process(img0.copy(), st_f, frame=4,
+                    stamp_info=dict(fixed, scroll=2))
+    d = float(np.abs(np.asarray(g0[:16], np.float64) - g1[:16]).max())
+    check('the field string scrolls per render', d > 0.2, f'{d:.3f}')
+    mask = np.abs(g0[..., :3].astype(np.float64)
+                  - ref[..., :3]).sum(axis=2) > 0.2
+    lit = g0[mask][:, :3]
+    ink = lit[lit.sum(axis=1) > 0.5]          # drop the drop shadow
+    inks = {tuple(np.round(v, 4)) for v in ink}
+    check('and wears many inks, not one cyan tint', len(inks) > 12,
+          str(len(inks)))
+
+
+def test_the_rainbow_scrolls_on_a_re_rendered_still():
+    """The field's exact test, run the field's exact way: F12, F12 again.
+
+    Two reports in a row said the rainbow does not scroll. Both were
+    stills -- every console this project has ever been sent is a single
+    F12 of one timeline frame -- and a rainbow keyed to the timeline
+    alone holds its colours BY CONSTRUCTION on a re-rendered frame. The
+    R99 answer restated that design instead of moving the pixels. The
+    slate was never inside the picture's determinism contract (%T and
+    %S print wall-clock truths into it), so the rainbow now rides the
+    engine's render serial as well. This renders the SAME timeline
+    frame twice through the real engine and demands both halves of the
+    doctrine: the slate must move, the picture must not.
+    """
+    from . import fakeblender as FB
+    FB.install()
+    from .. import engine as ENG
+    from .. import properties as props
+
+    kw = dict(watermark='&%2204355ABCDEFGH')
+    a, _p, _c = FB.run_render(props, ENG, **kw)
+    b, _p2, _c2 = FB.run_render(props, ENG, **kw)
+    check('both renders deliver a frame', a is not None and b is not None)
+    if a is None or b is None:
+        return
+    strip = 16                       # margin + glyph rows, scale 1
+    check('the picture above the slate is bit-identical across renders',
+          np.array_equal(a[strip:], b[strip:]))
+    d = float(np.abs(np.asarray(a[:strip], np.float64) - b[:strip]).max())
+    check('and the slate itself scrolled between the two renders',
+          d > 0.2, f'max stamp diff {d:.3f}')
+
+
+def test_material_passes_early_out_on_their_mask():
+    """A pass shades ONLY the pixels it owns; the picture cannot move.
+
+    Every material pass draws the full screen and used to shade every
+    pixel, multiplying by its ownership mask at the end -- harmless while
+    shading was ALU, catastrophic once it carried BVH loops. The field
+    measured the disease exactly: a 640x640 radiosity frame spent 5.0 of
+    5.8 seconds in shade because every material pass ran the 8-ray gather
+    for ALL 410k pixels. The early-out writes the same (0,0,0,0) a masked
+    pixel always wrote, so this is pure transport: the multi-material
+    radiosity frame must stay sim-identical to the CPU, and the emitted
+    source must carry the return so the fix cannot silently regress.
+    """
+    from ..core import raster
+    from ..core.bvh import BVH
+    from ..gpu import shade as GSH
+
+    st = base_settings(96, 72, shadows=True)
+    st.color_depth = '24'
+    st.dither = 'NONE'
+    st.output_scale = 'NONE'
+    st.radiosity = True
+    st.radiosity_samples = 4
+    st.radiosity_distance = 4.0
+    sc = demo_scene(st, with_texture=False)   # three materials: the shape
+    sc.materials[0].diffuse = (0.85, 0.1, 0.1)
+    cpu = R.render(sc, st)
+    view, _proj, vp, eye = R.camera_matrices(sc.camera, 96, 72)
+    g = raster.GBuffer(96, 72)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, 96, 72, gbuf=g)
+    bvh = BVH(sc.mesh.verts, sc.mesh.tris)
+    job = R.ShadeJob(sc, st, {}, bvh, view, eye, 96, 72)
+    GSH._PLAN_CACHE.clear()
+    passes, why, atlases = GSH.plan_frame(job, g)
+    check('the multi-material radiosity frame qualifies',
+          passes is not None, str(why))
+    if passes is None:
+        return
+    for _mid, name, src, _binds in passes:
+        check(f"pass '{name}' carries the early-out",
+              'if (keep < 0.5)' in src and 'return;' in src)
+    img, _hit = GSH.simulate(job, g, passes, atlases)
+    cov = g.tri >= 0
+    err = float(np.abs(img[cov] - cpu[cov][:, :3]).max())
+    check('and the early-out moved NOTHING: sim is the CPU frame',
+          err < 6e-3, f'max {err:.6f}')
+
+
 def test_matcap_and_backface_shade_on_the_gpu():
     """The last two constant-coefficient surface cheats join the frame.
 
@@ -9985,11 +11844,23 @@ def test_compute_wrappers_fetch_data_exactly():
         tail = src.split('void main()')[-1]
         check(f'the {name} compute main() reads rays only by texelFetch',
               'texelFetch' in tail and 'texture(' not in tail)
-    for name, src in (('raster', CRA.FRAGMENT_SOURCE),
-                      ('occlusion', RT.OCCLUDE_FRAGMENT),
+    # the tree fetches went texelFetch everywhere in 1.25.71 on
+    # suspicion of row-boundary misreads -- and the glass-mirror flips
+    # stayed BIT-IDENTICAL, an acquittal (the real mechanism was
+    # coincident-surface t ties; see the tie-referral test). The
+    # conversion bought zero correctness and cost the fragment shadow
+    # taps real milliseconds on the field driver, so 1.25.73 reverts
+    # the TREE to the filtered form every 0-px measurement was made
+    # with. The RAY fetches above keep texelFetch: theirs is the
+    # layout that actually misread on hardware.
+    for name, src in (('occlusion', RT.OCCLUDE_FRAGMENT),
                       ('closest-hit', RT.INTERSECT_FRAGMENT)):
-        check(f'the {name} fragment variant keeps the front-end path',
-              'texelFetch' not in src)
+        check(f'the {name} traversal reads the tree by texture()',
+              'texture(hal_bvh' in src and 'texture(hal_btris' in src
+              and 'texelFetch(hal_bvh,' not in src
+              and 'texelFetch(hal_btris,' not in src)
+    check('the raster fragment variant keeps the front-end path',
+          'texelFetch' not in CRA.FRAGMENT_SOURCE)
     # and the swap really produced compilable-shaped GLSL: the strip that
     # CreateInfo applies leaves no declarations behind
     import re
@@ -10099,6 +11970,1669 @@ def test_the_bvh_closest_hit_kernel_is_intersect():
     agree('reflection-shaped rays', 1500, want_r, got_r, rtmax)
     check('and reflections both hit geometry and escape to the sky',
           bool((want_r[0] >= 0).any()) and bool((want_r[0] < 0).any()))
+
+
+def test_coincident_surface_ties_route_to_the_cpu():
+    """The glass-mirror seam's named mechanism, and its cure.
+
+    The 1.25.72 field cross-check proved a real kernel-vs-frontend
+    divergence on exactly 1925 of 141478 sweep rays -- cached==fresh
+    (upload cache exonerated), both != frontend -- after `precise` and a
+    texelFetch conversion left the flips bit-identical (arithmetic and
+    fetches acquitted). The headless boundary census then measured every
+    decision cliff on the same recorded rays: self-hit epsilon 0,
+    inclusion grazes 0 below 1e-5, near-miss beaters 0, det cliff 0 --
+    and WINNER TIES 22106, every one the demo box's bottom face resting
+    EXACTLY coplanar on the floor (n.n = -1, plane offset 0, floor tri 0
+    vs box tris 772/773). Two surfaces at the same depth put the winner
+    in the last bit of t, and the driver's fused rounding is not
+    NumPy's: 1925 of those coin flips landed the other way,
+    deterministically. No arithmetic edit can pin that, so the kernel
+    now NAMES the ties: it tracks its two nearest accepted hits, and
+    when they sit within 1e-5 relative t (measured valley -- real ties
+    under 1e-6, the next distinct surface beyond 1e-3) it returns id
+    -2, and every wrapper re-resolves exactly those rays through
+    bvh.intersect itself. The GPU path then returns the reference's own
+    winner BY CONSTRUCTION -- ray routing, the layer-routing doctrine
+    at ray granularity. Clean geometry must flag nothing.
+    """
+    from ..core.bvh import BVH
+    from ..gpu import rtrace as RT
+
+    # the field shape in miniature: a "floor" plane with a coincident
+    # opposite-wound "box bottom" over part of it, and a catch plane
+    # below so grazing misses still land somewhere
+    verts = np.array([
+        [-2, -2, 0], [2, -2, 0], [2, 2, 0], [-2, 2, 0],     # floor
+        [-1, -1, 0], [1, -1, 0], [1, 1, 0], [-1, 1, 0],     # box bottom
+        [-3, -3, -5], [3, -3, -5], [3, 3, -5], [-3, 3, -5],  # catch
+    ], np.float32)
+    tris = np.array([
+        [0, 1, 2], [0, 2, 3],
+        [6, 5, 4], [7, 6, 4],          # reversed winding: contact plane
+        [8, 9, 10], [8, 10, 11],
+    ], np.int32)
+    bvh = BVH(verts, tris)
+
+    rng = np.random.default_rng(73)
+    n = 700
+    org = np.stack([rng.random(n) * 3.8 - 1.9,
+                    rng.random(n) * 3.8 - 1.9,
+                    np.full(n, 2.0)], 1).astype(np.float32)
+    d = np.stack([rng.normal(0, 0.08, n), rng.normal(0, 0.08, n),
+                  np.full(n, -1.0)], 1).astype(np.float32)
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+    tmax = np.full(n, 1e30, np.float32)
+
+    want = bvh.intersect(org, d, tmax)
+    got = RT.simulate_intersect(bvh, org, d, tmax)
+    routed = int(RT.LAST_TIE_ROUTED)
+    scale = 2.0 / -d[:, 2]
+    over = (np.abs(org[:, 0] + d[:, 0] * scale) < 1.0) \
+        & (np.abs(org[:, 1] + d[:, 1] * scale) < 1.0)
+    check('rays through the contact plane get flagged and referred',
+          routed > 0, f'{routed} routed, {int(over.sum())} cross it')
+    check('the referral count is the contact population, not the frame',
+          0 < routed <= int(over.sum()) + 8,
+          f'{routed} vs {int(over.sum())} rays over the contact patch')
+    check('every ray returns the reference winner EXACTLY',
+          bool((got[0] == want[0]).all()),
+          f'{int((got[0] != want[0]).sum())} of {n} differ')
+    check('referred rays carry the CPU t, u, v verbatim',
+          bool((got[1] == want[1]).all() and (got[2] == want[2]).all()
+               and (got[3] == want[3]).all()))
+
+    # clean geometry: the same rays with the contact plane LIFTED clear
+    # of the window must flag nothing and still agree
+    verts2 = verts.copy()
+    verts2[4:8, 2] = 0.25
+    bvh2 = BVH(verts2, tris)
+    want2 = bvh2.intersect(org, d, tmax)
+    got2 = RT.simulate_intersect(bvh2, org, d, tmax)
+    check('separated surfaces flag NO ties (routing costs nothing '
+          'on clean scenes)', int(RT.LAST_TIE_ROUTED) == 0,
+          f'{int(RT.LAST_TIE_ROUTED)} routed')
+    check('and the clean frame still agrees on every id',
+          bool((got2[0] == want2[0]).all()))
+
+    # the source contract: the window, the referral, the loosened prune
+    check('the kernel tracks its second-nearest accepted hit',
+          'second_t' in RT.INTERSECT_GLSL)
+    check('the kernel refers noise-window ties as id -2',
+          '-2.0' in RT.INTERSECT_GLSL
+          and 'second_t <= best_t * 1.00001' in RT.INTERSECT_GLSL)
+    check('the slab prune loosens by the same window',
+          'tn <= best_t * 1.00001' in RT.INTERSECT_GLSL)
+    check('the any-hit kernel is untouched (ties cannot flip a boolean)',
+          'second_t' not in RT.TRAVERSE_GLSL)
+
+
+def test_projected_light_textures_spot_and_sun():
+    """Sixth-generation projective texturing: the light cookie / gobo.
+
+    A SPOT projects its image through the cone like a slide projector --
+    Splinter Cell's window patterns -- and a SUN tiles its image across the
+    world as a cloud shadow. The CPU multiply lives in lights.sample, so
+    every consumer (pixel rate, Gouraud corners, layers, hits) gets it from
+    one site; the GLSL mirror writes the CPU's own bilinear texel
+    arithmetic into the light loop. Bars: a WHITE cookie and a strength-0
+    cookie are EXACTLY inert (the multiply is mix(1, rgb, s) -- both
+    collapse to 1), a patterned cookie moves the picture, the projection
+    turns with the lamp's own frame, and the simulated deferred frame
+    matches the CPU frame to the deferred bar.
+    """
+    from ..core import raster
+    from ..core.scene import Light
+    from ..gpu import shade as GSH
+
+    w, h = 160, 120
+    st = base_settings(w, h)
+    st.shadows = False
+    sc = demo_scene(st, with_texture=False)
+    ck = np.zeros((8, 8, 4), np.float32)
+    ck[:, :, 3] = 1.0
+    ck[::2, ::2, :3] = 1.0
+    ck[1::2, 1::2, :3] = 1.0
+    ck[:, :, 1] *= 0.3
+    ck[0, :, 2] = 1.0          # a blue stripe: transpose-ASYMMETRIC, so
+    ck[0, :, 0] = 0.1          # the frame-rotation check below can see
+    spot = Light(type='SPOT', name='proj', position=(0.0, -4.0, 6.0),
+                 direction=(0.0, 0.45, -0.9), color=(1.0, 1.0, 1.0),
+                 energy=800.0, spot_size=1.0, spot_blend=0.2,
+                 shadow='NONE', decay='INVERSE_SQUARE')
+    sun = Light(type='SUN', name='clouds', direction=(-0.5, 0.4, -0.75),
+                color=(1.0, 0.97, 0.9), energy=3.0, shadow='NONE')
+    sc.lights = [spot, sun]
+
+    plain = R.render(sc, st)
+    spot.cookie = ck
+    got = R.render(sc, st)
+    check('a spot cookie moves the picture',
+          float(np.abs(got - plain).max()) > 1e-2,
+          f'{float(np.abs(got - plain).max()):.4f}')
+
+    spot.cookie = np.ones((4, 4, 4), np.float32)
+    spot._cookie_tex = None
+    check('a WHITE cookie is exactly inert',
+          float(np.abs(R.render(sc, st) - plain).max()) == 0.0)
+    spot.cookie = ck
+    spot._cookie_tex = None
+    spot.cookie_strength = 0.0
+    check('strength 0 is exactly inert',
+          float(np.abs(R.render(sc, st) - plain).max()) == 0.0)
+    spot.cookie_strength = 1.0
+
+    # the projection turns with the lamp: swapping the frame axes must
+    # move the pattern (the cookie is chromatically asymmetric)
+    from ..core import lights as LI
+    s_ax, u_ax, _f = LI.cookie_frame(spot)
+    spot.frame_x, spot.frame_y = tuple(u_ax), tuple(s_ax)
+    turned = R.render(sc, st)
+    check('the projection follows the lamp frame',
+          float(np.abs(turned - got).max()) > 1e-3,
+          f'{float(np.abs(turned - got).max()):.4f}')
+    spot.frame_x = spot.frame_y = None
+
+    # sun cookie: tiles by cookie_scale, and scale changes the tiling
+    sun.cookie = ck
+    sun.cookie_scale = 3.0
+    t1 = R.render(sc, st)
+    check('a sun cookie moves the picture',
+          float(np.abs(t1 - got).max()) > 1e-2)
+    sun.cookie_scale = 6.0
+    sun._cookie_tex = None
+    check('the sun tiling follows cookie_scale',
+          float(np.abs(R.render(sc, st) - t1).max()) > 1e-3)
+    sun.cookie_scale = 3.0
+
+    # the deferred mirror: same frame through the compiled light loop
+    view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+    g = raster.GBuffer(w, h)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+    job = R.ShadeJob(sc, st, {}, None, view, eye, w, h)
+    GSH._PLAN_CACHE.clear()
+    passes, why, atlases = GSH.plan_frame(job, g)
+    check('the cookie frame qualifies for GPU shading', passes is not None,
+          str(why))
+    if passes is not None:
+        check('both cookies ride as atlases',
+              'hal_cookie0' in (atlases or {})
+              and 'hal_cookie1' in (atlases or {}),
+              str(sorted(k for k in (atlases or {})
+                         if not k.startswith('__'))))
+        cpu_img = R.render(sc, st)
+        img, hit = GSH.simulate(job, g, passes, atlases)
+        check('the simulated cookie frame ran', img is not None)
+        if img is not None:
+            cov = g.tri >= 0
+            err = float(np.abs(img[cov] - cpu_img[cov][:, :3]).max())
+            check('the GPU cookie frame is the CPU cookie frame',
+                  err < 6e-3, f'max {err:.5f} over {int(cov.sum())} px')
+
+
+def test_accumulation_and_edge_antialiasing():
+    """The two aa_mode values that were declared and dead, implemented.
+
+    ACCUMULATE is the OpenGL accumulation buffer: N whole frames at
+    deterministic Halton subpixel offsets, averaged -- so it must be
+    bit-identical run to run, soften real silhouettes, and fall back to a
+    plain render at 1 sample. EDGE is the era's flicker filter: a 1-2-1
+    tent applied ONLY at id-buffer edges and deep depth creases -- so
+    pixels away from every edge must ride through BIT-IDENTICAL.
+    """
+    w, h = 96, 72
+    st = base_settings(w, h)
+    st.shadows = False
+    sc = demo_scene(st, with_texture=False)
+    plain = R.render(sc, st)
+
+    st2 = st.copy()
+    st2.aa_mode = 'ACCUMULATE'
+    st2.aa_samples = 4
+    a1 = R.render(sc, st2)
+    a2 = R.render(sc, st2)
+    check('accumulation is deterministic',
+          float(np.abs(a1 - a2).max()) == 0.0)
+    check('accumulation softens the frame',
+          float(np.abs(a1 - plain).max()) > 1e-3,
+          f'{float(np.abs(a1 - plain).max()):.4f}')
+    st2.aa_samples = 1
+    check('one sample falls back to the plain frame',
+          float(np.abs(R.render(sc, st2) - plain).max()) == 0.0)
+
+    st3 = st.copy()
+    st3.aa_mode = 'EDGE'
+    e = R.render(sc, st3)
+    from ..core import raster as CR
+    view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+    g = CR.GBuffer(w, h)
+    CR.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+    tri = g.tri
+    edge = np.zeros(tri.shape, bool)
+    dif = tri[:, 1:] != tri[:, :-1]
+    edge[:, 1:] |= dif
+    edge[:, :-1] |= dif
+    dif = tri[1:, :] != tri[:-1, :]
+    edge[1:, :] |= dif
+    edge[:-1, :] |= dif
+    # dilate by one: the tent reads one pixel around each flagged pixel
+    grow = edge.copy()
+    grow[1:] |= edge[:-1]
+    grow[:-1] |= edge[1:]
+    grow[:, 1:] |= edge[:, :-1]
+    grow[:, :-1] |= edge[:, 1:]
+    interior = ~grow
+    d = np.abs(e - plain).max(axis=2)
+    check('edge smoothing moves edge pixels',
+          float(d[edge].max()) > 1e-3 if edge.any() else False)
+    check('pixels away from every edge ride through untouched',
+          float(d[interior].max()) == 0.0 if interior.any() else True,
+          f'max {float(d[interior].max()):.6f} off-edge')
+
+
+def test_height_fog_layers_the_mist():
+    """Ground mist: fog that thins with world height above a top plane.
+
+    Two exact controls pin the maths: a fog top ABOVE the whole scene with
+    zero falloff leaves the distance fog untouched (h = 1 everywhere), and
+    a huge falloff with the top below the scene clears the fog entirely
+    (h -> 0 makes the transmittance 1), matching the fog-off frame bit for
+    bit. Between the controls, the mist is real: the picture differs from
+    pure distance fog.
+    """
+    w, h = 96, 72
+    st = base_settings(w, h)
+    st.shadows = False
+    st.fog = True
+    st.fog_mode = 'EXP'
+    st.fog_density = 0.08
+    sc = demo_scene(st, with_texture=False)
+    fogged = R.render(sc, st)
+    st_off = st.copy()
+    st_off.fog = False
+    clear = R.render(sc, st_off)
+    check('distance fog is on for the controls',
+          float(np.abs(fogged - clear).max()) > 1e-2)
+
+    hi = st.copy()
+    hi.fog_height = True
+    hi.fog_height_top = 1e6
+    hi.fog_height_falloff = 0.0
+    check('a top above the world leaves distance fog EXACTLY',
+          float(np.abs(R.render(sc, hi) - fogged).max()) == 0.0)
+
+    lo = st.copy()
+    lo.fog_height = True
+    lo.fog_height_top = -1e6
+    lo.fog_height_falloff = 1e9
+    check('a floor-sunk top with huge falloff clears the fog EXACTLY',
+          float(np.abs(R.render(sc, lo) - clear).max()) == 0.0)
+
+    mid = st.copy()
+    mid.fog_height = True
+    mid.fog_height_top = 0.5
+    mid.fog_height_falloff = 1.5
+    m = R.render(sc, mid)
+    check('between the controls the mist is real',
+          float(np.abs(m - fogged).max()) > 1e-3
+          and float(np.abs(m - clear).max()) > 1e-3)
+
+
+def test_sixth_generation_console_presets():
+    """GameCube, PS2 and Xbox join the console shelf.
+
+    Every key each preset sets must be a real RenderSettings field (apply
+    ignores unknowns, which would turn a typo into a silent no-op preset),
+    the trio must land in the CONSOLE category, each look must lean on the
+    features that defined the machine -- the PS2's field rendering and
+    dither, the GameCube's trilinear mipmaps and layered table fog, the
+    Xbox's anisotropy -- and each preset must actually render.
+    """
+    from dataclasses import fields as _dc_fields
+
+    from ..core.settings import RenderSettings as RS
+    from ..presets.library import PRESETS
+
+    known = {f.name for f in _dc_fields(RS)}
+    for key in ('GAMECUBE', 'PS2', 'XBOX'):
+        check(f'{key} preset exists', key in PRESETS)
+        p = PRESETS.get(key) or {}
+        check(f'{key} sits on the console shelf',
+              p.get('category') == 'CONSOLE', str(p.get('category')))
+        extra = sorted(set(p.get('settings', {})) - known)
+        check(f'every {key} key is a real setting', not extra, str(extra))
+    check('the PS2 look is field-rendered and dithered',
+          PRESETS['PS2']['settings'].get('interlace') == 'FIELDS'
+          and PRESETS['PS2']['settings'].get('dither') != 'NONE')
+    check('the GameCube look mips trilinearly into layered table fog',
+          PRESETS['GAMECUBE']['settings'].get('tex_filter') == 'TRILINEAR'
+          and PRESETS['GAMECUBE']['settings'].get('fog_mode') == 'TABLE16'
+          and PRESETS['GAMECUBE']['settings'].get('fog_height') is True)
+    check('the Xbox look filters anisotropically',
+          int(PRESETS['XBOX']['settings'].get('tex_aniso', 1)) >= 2)
+    for key in ('GAMECUBE', 'PS2', 'XBOX'):
+        st = base_settings(64, 48)
+        st.apply(dict(PRESETS[key]['settings']))
+        st.resolution_x, st.resolution_y = 64, 48
+        st.aa_mode, st.aa_samples = 'NONE', 1
+        st.use_processes = False
+        sc = demo_scene(st, with_texture=False)
+        img = R.render(sc, st)
+        check(f'the {key} preset renders', img is not None
+              and np.isfinite(img).all() and img.max() > 0.01)
+
+
+def test_presets_never_touch_the_device_switch():
+    """Selecting a look must not move the CPU/GPU switch.
+
+    Where a frame computes is a property of the machine, not of the look:
+    a 1996 preset draws the identical picture on either device. Until this
+    round apply_preset(reset=True) returned render_device to its dataclass
+    default, so picking ANY preset silently flipped a GPU user back to the
+    CPU -- the field asked for exactly this fix. The whole device family
+    must survive: the switch itself, every Debug toggle under it (in
+    NON-default positions, so preservation is proven rather than
+    coincidental), and the scissor tuning knob. A preset dict that names a
+    device key is refused by name too -- preserving the reset is not
+    enough if a future entry were to list one.
+    """
+    from ..presets.library import (DEVICE_KEYS, PRESERVED, PRESETS,
+                                   apply_preset)
+
+    check('every device key is preserved from the reset',
+          DEVICE_KEYS <= PRESERVED, str(sorted(DEVICE_KEYS - PRESERVED)))
+
+    non_default = {
+        'render_device': 'GPU', 'gpu_post': False, 'gpu_shading': False,
+        'gpu_raster': False, 'gpu_hold_context': True, 'gpu_scissor': False,
+        'layer_gpu_min_frac': 0.5,
+    }
+    unknown = sorted(k for k in DEVICE_KEYS if k not in non_default)
+    check('the test covers the whole device family', not unknown,
+          str(unknown))
+    for key in sorted(PRESETS):
+        st = RenderSettings()
+        for k, v in non_default.items():
+            setattr(st, k, v)
+        apply_preset(st, key, reset=True)
+        moved = {k: getattr(st, k) for k, v in non_default.items()
+                 if getattr(st, k) != v}
+        check(f'{key} leaves the device family alone', not moved, str(moved))
+
+    # defense in depth: a preset entry naming a device key is ignored
+    PRESETS['_DEVICE_TEST'] = {
+        'label': 'x', 'category': 'CONSOLE', 'note': 'x',
+        'settings': {'render_device': 'CPU', 'gpu_shading': False,
+                     'tex_filter': 'NEAREST'},
+    }
+    try:
+        st = RenderSettings()
+        st.render_device, st.gpu_shading = 'GPU', True
+        apply_preset(st, '_DEVICE_TEST', reset=True)
+        check('a device key inside a preset dict is refused by name',
+              st.render_device == 'GPU' and st.gpu_shading is True,
+              f'{st.render_device}/{st.gpu_shading}')
+        check('the rest of that preset still applies',
+              st.tex_filter == 'NEAREST', st.tex_filter)
+    finally:
+        del PRESETS['_DEVICE_TEST']
+
+
+def test_resolution_presets_cover_the_categories():
+    """The resolution shelf: televisions, monitors, computers, consoles,
+    video formats and pictures, each key in exactly one category.
+
+    The two tables must hold each other -- every group member a real
+    preset, every preset in some group, no key twice (keys are enum
+    identifiers and operator arguments saved inside .blend files, so the
+    17 original keys must survive any reorganisation forever). Values
+    must be renderable dimensions with positive pixel aspects, D1 and DV
+    keep their broadcast aspects, and every key labels and describes
+    itself without falling over.
+    """
+    from ..core.settings import (RESOLUTION_GROUPS, RESOLUTION_PRESETS,
+                                 resolution_description, resolution_label)
+
+    grouped = [k for _label, keys in RESOLUTION_GROUPS for k in keys]
+    check('no key sits in two categories', len(grouped) == len(set(grouped)),
+          str(sorted(k for k in set(grouped) if grouped.count(k) > 1)))
+    missing = sorted(set(grouped) - set(RESOLUTION_PRESETS))
+    check('every grouped key is a real preset', not missing, str(missing))
+    orphans = sorted(set(RESOLUTION_PRESETS) - set(grouped))
+    check('every preset belongs to a category', not orphans, str(orphans))
+
+    legacy = ('CGA', 'VGA_13H', 'QVGA', 'VGA', 'MAC_CLASSIC', 'MAC_13',
+              'SVGA', 'XGA', 'AMIGA_PAL', 'AMIGA_HIRES', 'NTSC_D1',
+              'PAL_D1', 'NTSC_TOASTER', 'PSX', 'PSX_HI', 'N64', 'QUAKE')
+    lost = sorted(set(legacy) - set(RESOLUTION_PRESETS))
+    check('all 17 original keys survive', not lost, str(lost))
+
+    for label, _keys in RESOLUTION_GROUPS:
+        check(f'category "{label}" is not empty', bool(_keys))
+    for k, v in RESOLUTION_PRESETS.items():
+        x, y, ax, ay = v
+        check(f'{k} has renderable dimensions',
+              isinstance(x, int) and isinstance(y, int)
+              and 16 <= x <= 4096 and 16 <= y <= 4096
+              and ax > 0 and ay > 0, str(v))
+        check(f'{k} labels and describes itself',
+              bool(resolution_label(k)) and str(x) in
+              resolution_description(k))
+    check('D1 keeps its broadcast pixel aspect',
+          RESOLUTION_PRESETS['NTSC_D1'][2:] == (10.0, 11.0)
+          and RESOLUTION_PRESETS['PAL_D1'][2:] == (59.0, 54.0))
+    check('DV matches D1 convention',
+          RESOLUTION_PRESETS['DV_NTSC'][2:] == (10.0, 11.0)
+          and RESOLUTION_PRESETS['DV_PAL'][2:] == (59.0, 54.0))
+    check('the widescreen anamorphic pair exists',
+          RESOLUTION_PRESETS['NTSC_D1_WIDE'][2] / RESOLUTION_PRESETS['NTSC_D1_WIDE'][3] > 1.0
+          and RESOLUTION_PRESETS['PAL_D1_WIDE'][2] / RESOLUTION_PRESETS['PAL_D1_WIDE'][3] > 1.0)
+
+
+def test_high_poly_shadow_maps_build_in_parallel_and_exact():
+    """The high-poly walls, held to their bits.
+
+    At 820k triangles the profile said: shadow maps 74% of the frame
+    (seven serial rasterisations -- sun map plus six cube faces), then
+    the rasteriser's own per-triangle pipelines. Two fixes ship, both
+    REQUIRED to be invisible in the picture: the maps now build in
+    PARALLEL (each map is its own buffer of order-independent depth
+    min-compares -- big-array NumPy that releases the interpreter lock,
+    the one shape of work threads scale here), and build_screen_tris
+    dropped a 30 MB materialised identity plus two full-array copies in
+    its no-straddler fast path. A frustum cull was tried and REVERTED on
+    the measurement: a concentrated object sits inside most map
+    frustums, so it kept ~100% and cost 15%. Held here: parallel maps
+    are BIT-IDENTICAL to serial ones for sun, spot and cube lights on a
+    dense mesh, and the dense frame itself is bit-stable across the
+    shadow cache and thread counts.
+    """
+    import concurrent.futures as fut
+
+    from ..core import lights as L
+    from ..core.scene import Light
+
+    st = base_settings(96, 72)
+    st.threads = 1
+    st.shadows = True
+    st.cache_shadows = False
+    sc = demo_scene(st, with_texture=False)
+    # densify past the 50k parallel threshold: a lattice of small tris
+    rng = np.random.default_rng(11)
+    C = rng.uniform(-2.5, 2.5, (55000, 3)).astype(np.float32)
+    C[:, 2] = np.abs(C[:, 2]) * 0.8 + 0.2
+    V = (np.repeat(C, 3, 0)
+         + rng.uniform(-0.06, 0.06, (165000, 3))).astype(np.float32)
+    m = sc.mesh
+    base = m.verts.shape[0]
+    newt = np.arange(165000, dtype=np.int32).reshape(-1, 3) + base
+    m.verts = np.concatenate([m.verts, V])
+    m.normals = np.concatenate(
+        [m.normals, np.tile(np.array([[0, 0, 1.0]], np.float32),
+                            (165000, 1))])
+    if m.uvs is not None:
+        m.uvs = np.concatenate([m.uvs, np.zeros((165000, 2), np.float32)])
+    if getattr(m, 'uvs2', None) is not None:
+        m.uvs2 = np.concatenate([m.uvs2, np.zeros((165000, 2), np.float32)])
+    if m.colors is not None:
+        m.colors = np.concatenate(
+            [m.colors, np.ones((165000, 4), np.float32)])
+    m.tris = np.concatenate([m.tris, newt])
+    fn = np.cross(m.verts[newt[:, 1]] - m.verts[newt[:, 0]],
+                  m.verts[newt[:, 2]] - m.verts[newt[:, 0]])
+    fn /= np.maximum(np.linalg.norm(fn, axis=1, keepdims=True), 1e-9)
+    m.face_normals = np.concatenate([m.face_normals, fn.astype(np.float32)])
+    m.mat_index = np.concatenate(
+        [m.mat_index, np.full(newt.shape[0], 1, np.int32)])
+    m.obj_index = np.concatenate(
+        [m.obj_index, np.full(newt.shape[0], int(m.obj_index.max()),
+                              np.int32)])
+    m.smooth = np.concatenate([m.smooth, np.ones(newt.shape[0], bool)])
+    sc.lights.append(Light(type='SPOT', name='sp', position=(3.0, -4.0, 5.0),
+                           direction=(-0.4, 0.5, -0.75),
+                           color=(1.0, 1.0, 1.0), energy=300.0,
+                           shadow='MAP', spot_size=0.9, spot_blend=0.3))
+
+    check('the dense fixture crosses the parallel threshold',
+          m.tris.shape[0] >= 50000, str(m.tris.shape[0]))
+
+    class _Serial:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def map(self, fn, it):
+            return [fn(x) for x in it]
+
+    old = fut.ThreadPoolExecutor
+    fut.ThreadPoolExecutor = _Serial
+    try:
+        L._build_shadow_maps(sc, st)
+        serial = [l.shadow_map for l in sc.lights]
+    finally:
+        fut.ThreadPoolExecutor = old
+    L._build_shadow_maps(sc, st)
+    parallel = [l.shadow_map for l in sc.lights]
+
+    kinds = set()
+    for a, b, l in zip(serial, parallel, sc.lights):
+        if a is None and b is None:
+            continue
+        kinds.add(l.type)
+        if hasattr(a, 'faces'):
+            same = all(np.array_equal(x.depth, y.depth)
+                       for x, y in zip(a.faces, b.faces))
+            check(f'{l.name}: all six cube faces bit-identical', same)
+        else:
+            check(f'{l.name}: map bit-identical',
+                  np.array_equal(a.depth, b.depth))
+    check('sun, point and spot all built maps',
+          kinds >= {'SUN', 'POINT', 'SPOT'}, str(kinds))
+
+    # the dense frame end to end: cache off == cache on == threads 4
+    img1 = R.render(sc, st)
+    st.cache_shadows = True
+    img2 = R.render(sc, st)
+    st.threads = 4
+    img3 = R.render(sc, st)
+    check('the dense frame is bit-stable across the shadow cache',
+          np.array_equal(img1, img2))
+    check('and across thread counts', np.array_equal(img1, img3))
+    check('and finite with coverage', np.isfinite(img1).all()
+          and float(np.ptp(img1)) > 0.05)
+
+
+def test_the_mix_shader_mixes_masters():
+    """Mix Shader between Halcyon Shaders must actually MIX -- by Fac.
+
+    closure_to_surface kept ONE master lobe, last-wins, weight DISCARDED:
+    mixing two Halcyon Shaders showed only the second whatever Fac said,
+    and mixing one against a raw BSDF ignored the BSDF -- "the Mix Shader
+    node doesn't work", said the field, about the node every converted
+    material flows through. Masters now blend in MATERIAL SPACE by their
+    weights (attribute by attribute, exactly how the fixed-function era
+    mixed looks), per pixel when Fac is driven; the heaviest lobe names
+    the model; a plain-BSDF side folds in by relative weight; TRANSPARENT
+    eats opacity exactly as Fac says. A single full-weight master reduces
+    to multiplying by 1.0 -- every existing material shades
+    BIT-IDENTICALLY, held below at fac 0 against the pure graph.
+    """
+    from ..core import raster
+
+    def sk(name, tp, default, link=None):
+        return {'name': name, 'identifier': name, 'type': tp,
+                'default': default, 'link': link}
+
+    def master(nid, model, color, rim=0.0, opacity=1.0):
+        ins = [sk('Diffuse Color', 'RGBA', list(color)),
+               sk('Diffuse Level', 'VALUE', 1.0),
+               sk('Specular Color', 'RGBA', [1, 1, 1, 1]),
+               sk('Specular Level', 'VALUE', 0.5),
+               sk('Glossiness', 'VALUE', 40.0), sk('Roughness', 'VALUE', 0.3),
+               sk('Ambient', 'VALUE', 1.0),
+               sk('Self-Illumination', 'RGBA', [0, 0, 0, 1]),
+               sk('Opacity', 'VALUE', opacity), sk('IOR', 'VALUE', 1.45),
+               sk('Anisotropy', 'VALUE', 0.0),
+               sk('Anisotropic Rotation', 'VALUE', 0.0),
+               sk('Metalness', 'VALUE', 0.0), sk('Soften', 'VALUE', 0.0),
+               sk('Reflection', 'VALUE', 0.0),
+               sk('Translucency', 'VALUE', 0.0),
+               sk('Toon Size', 'VALUE', 0.5),
+               sk('Toon Smooth', 'VALUE', 0.05),
+               sk('Rim Amount', 'VALUE', rim),
+               sk('Normal', 'VECTOR', [0, 0, 0])]
+        return {'id': nid, 'bl_idname': 'HALCYON_ShaderNode',
+                'props': {'model': model}, 'inputs': ins,
+                'outputs': [{'name': 'Surface', 'type': 'SHADER'},
+                            {'name': 'BSDF', 'type': 'SHADER'}]}
+
+    A = lambda: master('a', 'PHONG', (1.0, 0.0, 0.0, 1.0), rim=0.8)  # noqa: E731
+    B = lambda: master('b', 'TOON', (0.0, 0.0, 1.0, 1.0))            # noqa: E731
+
+    def mix_graph(fac, link=None, second=None, extra=None):
+        nodes = {'a': A(), 'b': second if second is not None else B(),
+                 'mix': {'id': 'mix', 'bl_idname': 'ShaderNodeMixShader',
+                         'props': {},
+                         'inputs': [sk('Fac', 'VALUE', fac, link),
+                                    sk('Shader', 'SHADER', None, ['a', 0]),
+                                    sk('Shader', 'SHADER', None, ['b', 0])],
+                         'outputs': [{'name': 'Shader', 'type': 'SHADER'}]},
+                 'out': {'id': 'out',
+                         'bl_idname': 'ShaderNodeOutputMaterial', 'props': {},
+                         'inputs': [sk('Surface', 'SHADER', None,
+                                       ['mix', 0])],
+                         'outputs': []}}
+        if extra:
+            nodes.update(extra)
+        return {'output': 'out', 'nodes': nodes}
+
+    st = base_settings(96, 72, shadows=False)
+    st.threads = 1
+    sc = demo_scene(st, with_texture=False)
+    view, _p, vp, eye = R.camera_matrices(sc.camera, 96, 72)
+    g = raster.GBuffer(96, 72)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, 96, 72, gbuf=g)
+    job = R.ShadeJob(sc, st, {}, None, view, eye, 96, 72)
+    ys, xs = np.nonzero(g.mask())
+    ctx = job.context(g.tri[ys, xs], g.bary[ys, xs], px=xs, py=ys)
+
+    def surface_of(graph):
+        ev = GraphEvaluator(graph, ctx)
+        cl, _d = ev.evaluate_surface()
+        return R.closure_to_surface(cl, ctx, st)
+
+    # the Fac sweep: parameters lerp, the heaviest lobe names the model
+    d0, _m0, _ = surface_of(mix_graph(0.0))
+    dq, _mq, _ = surface_of(mix_graph(0.25))
+    dh, mh, _ = surface_of(mix_graph(0.75))
+    d1, m1, _ = surface_of(mix_graph(1.0))
+    check('fac 0 shows A', np.allclose(d0.diffuse[0], [1, 0, 0], atol=1e-6)
+          and abs(float(d0.rim[0]) - 0.8) < 1e-6)
+    check('fac 0.25 blends a quarter toward B',
+          np.allclose(dq.diffuse[0], [0.75, 0, 0.25], atol=1e-5)
+          and abs(float(dq.rim[0]) - 0.6) < 1e-5)
+    check('fac 1 shows B, rim gone',
+          np.allclose(d1.diffuse[0], [0, 0, 1], atol=1e-6)
+          and float(d1.rim[0]) < 1e-6)
+    check('the heavier lobe names the model', mh == 'TOON' and m1 == 'TOON',
+          f'{mh}/{m1}')
+
+    # bit-parity: fac 0 IS the pure A graph, field for field
+    pure = {'output': 'out', 'nodes': {
+        'a': A(), 'out': {'id': 'out',
+                          'bl_idname': 'ShaderNodeOutputMaterial',
+                          'props': {},
+                          'inputs': [sk('Surface', 'SHADER', None,
+                                        ['a', 0])],
+                          'outputs': []}}}
+    sA, mA, _ = surface_of(pure)
+    fields = ('diffuse', 'specular', 'diffuse_level', 'specular_level',
+              'glossiness', 'roughness', 'opacity', 'rim', 'emission',
+              'ambient', 'reflect', 'metallic')
+    off = [f for f in fields
+           if not np.array_equal(getattr(sA, f), getattr(d0, f))]
+    check('fac 0 is BIT-IDENTICAL to the pure master', not off, str(off))
+
+    # per-pixel Fac: a checker drives the mix, both colours present
+    chk = {'chk': {'id': 'chk', 'bl_idname': 'ShaderNodeTexChecker',
+                   'props': {},
+                   'inputs': [sk('Vector', 'VECTOR', [0, 0, 0]),
+                              sk('Color1', 'RGBA', [1, 1, 1, 1]),
+                              sk('Color2', 'RGBA', [0, 0, 0, 1]),
+                              sk('Scale', 'VALUE', 6.0)],
+                   'outputs': [{'name': 'Color', 'type': 'RGBA'},
+                               {'name': 'Fac', 'type': 'VALUE'}]}}
+    sp, _mp, _ = surface_of(mix_graph(0.5, link=['chk', 1], extra=chk))
+    reds = np.isclose(sp.diffuse[:, 0], 1.0, atol=1e-4).mean()
+    blues = np.isclose(sp.diffuse[:, 2], 1.0, atol=1e-4).mean()
+    check('a driven Fac mixes PER PIXEL (both sides present)',
+          0.05 < reds < 0.95 and 0.05 < blues < 0.95,
+          f'red {reds:.2f} blue {blues:.2f}')
+
+    # master mixed against a raw diffuse BSDF: the BSDF side counts now
+    bsdf = {'id': 'b', 'bl_idname': 'ShaderNodeBsdfDiffuse', 'props': {},
+            'inputs': [sk('Color', 'RGBA', [0.0, 1.0, 0.0, 1.0]),
+                       sk('Roughness', 'VALUE', 0.0)],
+            'outputs': [{'name': 'BSDF', 'type': 'SHADER'}]}
+    sb, _mb, _ = surface_of(mix_graph(0.5, second=bsdf))
+    check('a plain BSDF side is no longer ignored',
+          float(sb.diffuse[0, 1]) > 0.3,
+          str([round(float(v), 3) for v in sb.diffuse[0]]))
+    check('and the master side survives too', float(sb.diffuse[0, 0]) > 0.3)
+    check('the rim fades with the master share',
+          abs(float(sb.rim[0]) - 0.4) < 1e-5, f'{float(sb.rim[0]):.3f}')
+
+    # master mixed toward TRANSPARENT: opacity follows Fac exactly
+    tr = {'id': 'b', 'bl_idname': 'ShaderNodeBsdfTransparent', 'props': {},
+          'inputs': [sk('Color', 'RGBA', [1, 1, 1, 1])],
+          'outputs': [{'name': 'BSDF', 'type': 'SHADER'}]}
+    stx, _mt, _ = surface_of(mix_graph(0.75, second=tr))
+    check('mixing toward Transparent sets opacity to 1-Fac',
+          abs(float(stx.opacity[0]) - 0.25) < 1e-5,
+          f'{float(stx.opacity[0]):.3f}')
+
+    # the whole path: renders on both devices, identical headless
+    for fac, link, extra in ((0.5, None, None), (0.5, ['chk', 1], chk)):
+        st2 = base_settings(96, 72, shadows=False)
+        st2.threads = 1
+        sc2 = demo_scene(st2, with_texture=False)
+        sc2.materials[1].graph = mix_graph(fac, link=link, extra=extra)
+        cpu = R.render(sc2, st2)
+        st3 = base_settings(96, 72, shadows=False)
+        st3.threads = 1
+        st3.render_device = 'GPU'
+        sc3 = demo_scene(st3, with_texture=False)
+        sc3.materials[1].graph = mix_graph(fac, link=link, extra=extra)
+        gpu = R.render(sc3, st3)
+        d = float(np.abs(np.asarray(cpu, np.float64) - gpu).max())
+        tag = 'driven' if link else 'constant'
+        check(f'{tag}-fac master mix: device fallback equality', d == 0.0,
+              f'max {d}')
+
+    # the deferred pass: a CONSTANT-fac master mix bakes the blended
+    # constants and mixes the colour chains -- it QUALIFIES and the sim
+    # agrees; a DRIVEN fac varies baked fields, and the probe's own
+    # constancy rule routes it with the reason
+    from ..gpu import shade as GSH_
+
+    def _plan_and_sim(graph):
+        st4 = base_settings(96, 72, shadows=False)
+        st4.threads = 1
+        st4.shadows = True
+        st4.render_device = 'GPU'
+        sc4 = demo_scene(st4, with_texture=False)
+        sc4.materials[1].graph = graph
+        cpu4 = R.render(sc4, st4)
+        view4, _p4, vp4, eye4 = R.camera_matrices(sc4.camera, 96, 72)
+        g4 = raster.GBuffer(96, 72)
+        raster.rasterize(sc4.mesh.verts, sc4.mesh.tris, vp4, 96, 72,
+                         gbuf=g4)
+        job4 = R.ShadeJob(sc4, st4, R.prepare_textures(sc4, st4), None,
+                          view4, eye4, 96, 72)
+        GSH_._PLAN_CACHE.clear()
+        passes, why, atlases = GSH_.plan_frame(job4, g4)
+        if passes is None:
+            return None, why, None, None
+        img, _h = GSH_.simulate(job4, g4, passes, atlases)
+        return passes, why, cpu4, (img, g4.tri >= 0)
+
+    passes, why, cpu4, sim4 = _plan_and_sim(mix_graph(0.5))
+    check('a constant-fac master mix QUALIFIES for the deferred pass',
+          passes is not None, str(why))
+    if passes is not None:
+        img, cov = sim4
+        d = float(np.abs(np.asarray(cpu4, np.float64)[..., :3][cov]
+                         - np.asarray(img, np.float64)[..., :3][cov]).max())
+        check('and the sim shades the BLENDED look', d < 6e-3, f'max {d:.6f}')
+    passes, why, _c, _s = _plan_and_sim(mix_graph(0.5, link=['chk', 1],
+                                                  extra=chk))
+    check('a driven-fac mix routes via the constancy rule, with the reason',
+          passes is None and 'varies across the frame' in str(why),
+          str(why))
+
+
+def test_the_missing_node_shelf():
+    """The nodes the field felt were missing, each proven for what it IS.
+
+    The audit against Blender 5.2's catalogue found seven genuinely absent
+    types and a family of silent fallbacks. What ships: Metallic BSDF (the
+    METAL model -- a pure conductor was always this engine's native
+    tongue), the Specular BSDF (spec/gloss, the DirectX-era workflow,
+    mapped nearly literally onto Lambert + Blinn-Phong), Wireframe (exact
+    edge distance in world units or output pixels, from the same
+    perspective factors the mip footprint rides), Vector Transform (world/
+    camera/object for points, vectors and inverse-transpose normals), and
+    Ambient Occlusion with REAL rays -- the engine's own deterministic
+    hemisphere sampler on its own BVH, distinct hash salt. What refuses
+    now does it BY NAME with the era's reasons: volumes point at Height
+    Fog and Volumetric cones, Bevel names the missing geometry query, OSL
+    points at the Coded Shader node.
+    """
+    from ..core import convert as CV
+    from ..core import raster
+    from ..core.nodeeval import DISPATCH
+    from ..gpu import emit as EM
+    from ..tests.featurematrix import build
+
+    def sk(name, tp, default, link=None):
+        return {'name': name, 'type': tp, 'default': default, 'link': link}
+
+    # a real shading context from the demo scene
+    st = base_settings(96, 72, shadows=False)
+    st.threads = 1
+    sc = demo_scene(st, with_texture=False)
+    view, _proj, vp, eye = R.camera_matrices(sc.camera, 96, 72)
+    g = raster.GBuffer(96, 72)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, 96, 72, gbuf=g)
+    job = R.ShadeJob(sc, st, {}, None, view, eye, 96, 72)
+    ys, xs = np.nonzero(g.mask())
+    tri_idx = g.tri[ys, xs]
+    bary = g.bary[ys, xs]
+    ctx = job.context(tri_idx, bary, px=xs, py=ys)
+
+    # --- Metallic BSDF: a conductor, in the era's own words
+    node = {'id': 'm', 'bl_idname': 'ShaderNodeBsdfMetallic', 'props': {},
+            'inputs': [sk('Base Color', 'RGBA', [0.9, 0.6, 0.2, 1.0]),
+                       sk('Roughness', 'VALUE', 0.3)],
+            'outputs': [{'name': 'BSDF', 'type': 'SHADER'}]}
+    ev = GraphEvaluator({'output': None, 'nodes': {'m': node}}, ctx)
+    cl = ev.eval_output('m', 0)
+    kinds = {k for k, _w, _p in cl.items}
+    check('Metallic BSDF is one GLOSSY lobe', kinds == {'GLOSSY'},
+          str(kinds))
+    params = cl.items[0][2]
+    check('and the lobe speaks METAL', params.get('model') == 'METAL',
+          str(params.get('model')))
+    check('fully metallic', float(np.min(params['metallic'])) == 1.0)
+
+    # --- Specular BSDF: spec/gloss, nearly literal
+    node = {'id': 's', 'bl_idname': 'ShaderNodeEeveeSpecular', 'props': {},
+            'inputs': [sk('Base Color', 'RGBA', [0.2, 0.5, 0.8, 1.0]),
+                       sk('Specular', 'RGBA', [1.0, 0.9, 0.7, 1.0]),
+                       sk('Roughness', 'VALUE', 0.25),
+                       sk('Emissive Color', 'RGBA', [0.5, 0.0, 0.0, 1.0]),
+                       sk('Transparency', 'VALUE', 0.4)],
+            'outputs': [{'name': 'BSDF', 'type': 'SHADER'}]}
+    ev = GraphEvaluator({'output': None, 'nodes': {'s': node}}, ctx)
+    cl = ev.eval_output('s', 0)
+    kinds = [k for k, _w, _p in cl.items]
+    check('Specular BSDF: diffuse + specular + emission + transparency',
+          kinds == ['DIFFUSE', 'GLOSSY', 'EMISSION', 'TRANSPARENT'],
+          str(kinds))
+    check('the specular lobe is Blinn-Phong with the SOCKET colour',
+          cl.items[1][2].get('model') == 'BLINN_PHONG'
+          and abs(float(cl.items[1][2]['color'][0, 0]) - 1.0) < 1e-6)
+
+    # --- Wireframe: exact edge geometry, both size modes
+    def wire_fac(size, pixel):
+        node = {'id': 'w', 'bl_idname': 'ShaderNodeWireframe',
+                'props': {'use_pixel_size': pixel},
+                'inputs': [sk('Size', 'VALUE', size)],
+                'outputs': [{'name': 'Fac', 'type': 'VALUE'}]}
+        ev = GraphEvaluator({'output': None, 'nodes': {'w': node}}, ctx)
+        return ev.eval_output('w', 0), ev
+
+    edge_b = np.copy(bary)
+    edge_b[:, 0] = 0.0
+    edge_b[:, 1] += bary[:, 0]                     # ON the 1-2 edge exactly
+    ctx_edge = job.context(tri_idx, edge_b, px=xs, py=ys)
+    node = {'id': 'w', 'bl_idname': 'ShaderNodeWireframe', 'props': {},
+            'inputs': [sk('Size', 'VALUE', 0.01)],
+            'outputs': [{'name': 'Fac', 'type': 'VALUE'}]}
+    ev = GraphEvaluator({'output': None, 'nodes': {'w': node}}, ctx_edge)
+    on_edge = ev.eval_output('w', 0)
+    check('a point ON an edge always wires', float(on_edge.min()) == 1.0)
+    fac_small, _ = wire_fac(1e-6, False)
+    fac_huge, _ = wire_fac(1e6, False)
+    check('a vanishing size wires almost nothing',
+          fac_small.mean() < 0.5, f'{fac_small.mean():.3f}')
+    check('a huge size wires everything', float(fac_huge.min()) == 1.0)
+    fac_px, _ = wire_fac(2.0, True)
+    check('pixel-size mode answers too (finite, some wire, not all)',
+          np.isfinite(fac_px).all() and 0.0 < fac_px.mean() < 1.0,
+          f'{fac_px.mean():.3f}')
+
+    # --- Vector Transform: round trips and normals
+    def vt(vec, vtype, src, dst, c=ctx):
+        node = {'id': 'v', 'bl_idname': 'ShaderNodeVectorTransform',
+                'props': {'vector_type': vtype, 'convert_from': src,
+                          'convert_to': dst},
+                'inputs': [sk('Vector', 'VECTOR', list(vec))],
+                'outputs': [{'name': 'Vector', 'type': 'VECTOR'}]}
+        ev = GraphEvaluator({'output': None, 'nodes': {'v': node}}, c)
+        return ev.eval_output('v', 0)
+
+    p0 = np.array([1.0, 2.0, 3.0], np.float32)
+    cam = vt(p0, 'POINT', 'WORLD', 'CAMERA')
+    node = {'id': 'v', 'bl_idname': 'ShaderNodeVectorTransform',
+            'props': {'vector_type': 'POINT', 'convert_from': 'CAMERA',
+                      'convert_to': 'WORLD'},
+            'inputs': [sk('Vector', 'VECTOR', [0, 0, 0], None)],
+            'outputs': [{'name': 'Vector', 'type': 'VECTOR'}]}
+    node['inputs'][0] = sk('Vector', 'VECTOR', [0, 0, 0])
+    ev = GraphEvaluator({'output': None, 'nodes': {'v': node}}, ctx)
+    ev.cache[('src', 0)] = cam
+    node['inputs'][0]['link'] = ['src', 0]
+    back = ev.eval_output('v', 0)
+    check('a POINT round-trips world -> camera -> world',
+          float(np.abs(back - p0[None, :]).max()) < 1e-3,
+          f'{float(np.abs(back - p0[None, :]).max()):.6f}')
+    moved = vt(p0, 'POINT', 'WORLD', 'CAMERA')
+    kept = vt(p0, 'VECTOR', 'WORLD', 'CAMERA')
+    check('a VECTOR ignores the translation a POINT feels',
+          float(np.abs(moved - kept).max()) > 1e-3)
+    nrm = vt([0.0, 0.0, 1.0], 'NORMAL', 'WORLD', 'CAMERA')
+    check('a NORMAL comes back unit length',
+          float(np.abs(np.linalg.norm(nrm, axis=1) - 1.0).max()) < 1e-5)
+
+    # --- Ambient Occlusion: real rays, deterministic, box shadows floor
+    def ao_eval(c):
+        node = {'id': 'a', 'bl_idname': 'ShaderNodeAmbientOcclusion',
+                'props': {'samples': 8, 'inside': False,
+                          'only_local': False},
+                'inputs': [sk('Color', 'RGBA', [1.0, 1.0, 1.0, 1.0]),
+                           sk('Distance', 'VALUE', 2.0)],
+                'outputs': [{'name': 'Color', 'type': 'RGBA'},
+                            {'name': 'AO', 'type': 'VALUE'}]}
+        ev = GraphEvaluator({'output': None, 'nodes': {'a': node}}, c)
+        col = ev.eval_output('a', 0)
+        ao = ev.eval_output('a', 1)
+        return col, ao, ev
+
+    check('the job built no BVH of its own (rays are off)',
+          getattr(ctx, 'bvh', None) is None)
+    col1, ao1, _ = ao_eval(ctx)
+    ctx2 = job.context(tri_idx, bary, px=xs, py=ys)
+    _c2, ao2, _ = ao_eval(ctx2)
+    check('AO is deterministic: two evaluations, identical bits',
+          np.array_equal(ao1, ao2))
+    check('the scene occludes SOMEWHERE (a box sits on this floor)',
+          float(ao1.min()) < 0.9, f'min {float(ao1.min()):.3f}')
+    check('and is open somewhere else', float(ao1.max()) > 0.97,
+          f'max {float(ao1.max()):.3f}')
+    check('Color is colour times AO', np.allclose(col1[:, 0], ao1, atol=1e-6))
+
+    # --- named honesty: the family that refuses says WHY
+    for idn, frag in (('ShaderNodeVolumePrincipled', 'volumetrics'),
+                      ('ShaderNodeBevel', 'closest-geometry'),
+                      ('ShaderNodeScript', 'Coded Shader'),
+                      ('ShaderNodeLightFalloff', 'lives on the LAMPS')):
+        nd = {'id': 'x', 'bl_idname': idn, 'props': {},
+              'inputs': [sk('Strength', 'VALUE', 3.0),
+                         sk('Normal', 'VECTOR', [0, 0, 1])],
+              'outputs': [{'name': 'Quadratic', 'type': 'VALUE'},
+                          {'name': 'Normal', 'type': 'VECTOR'}]}
+        ev = GraphEvaluator({'output': None, 'nodes': {'x': nd}}, ctx)
+        ev.eval_output('x', 0)
+        check(f'{idn} names its reason',
+              any(frag in u for u in ev.unsupported),
+              str(ev.unsupported))
+    check('every named refusal is a registered handler',
+          all(k in DISPATCH for k in (
+              'ShaderNodeVolumePrincipled', 'ShaderNodeVolumeScatter',
+              'ShaderNodeVolumeAbsorption', 'ShaderNodeBevel',
+              'ShaderNodeLightFalloff', 'ShaderNodeScript',
+              'ShaderNodeOutputAOV', 'ShaderNodeBsdfRayPortal')))
+
+    # --- the GPU side. The new rows exposed a LATENT bug: the frame pass
+    # emits ONE colour chain and feeds it to the DIFFUSE term, so a raw
+    # GLOSSY graph had shaded a different picture on the driver since its
+    # emitter existed -- unseen because no matrix row ever carried a raw
+    # BSDF graph. The probe now refuses conductor and emission lobes on
+    # non-master graphs BY NAME; diffuse chains and every master-converted
+    # material keep the proven path.
+    from ..gpu import shade as GSH_
+
+    def _plan_of(sc_, st_):
+        st_.render_device = 'GPU'
+        w_, h_ = st_.resolution_x, st_.resolution_y
+        R.render(sc_, st_)                     # bakes the shadow maps
+        view_, _p_, vp_, eye_ = R.camera_matrices(sc_.camera, w_, h_)
+        g_ = raster.GBuffer(w_, h_)
+        raster.rasterize(sc_.mesh.verts, sc_.mesh.tris, vp_, w_, h_, gbuf=g_)
+        job_ = R.ShadeJob(sc_, st_, R.prepare_textures(sc_, st_), None,
+                          view_, eye_, w_, h_)
+        GSH_._PLAN_CACHE.clear()
+        return GSH_.plan_frame(job_, g_)
+
+    for key in ('node Metallic BSDF (raw graph)',
+                'node Specular BSDF (raw graph)'):
+        sc_n, st_n = build(key)
+        ok, miss = EM.can_emit(sc_n.materials[1].graph)
+        check(f'{key}: the colour chain emits', ok, str(miss))
+        p, why, _a = _plan_of(sc_n, st_n)
+        check(f'{key}: the plan routes the conductor lobe by name',
+              p is None and 'lobe rides the specular' in str(why), str(why))
+
+    sc_g, st_g = build('node Metallic BSDF (raw graph)')
+    sc_g.materials[1].graph['nodes']['bsdf'] = {
+        'id': 'bsdf', 'bl_idname': 'ShaderNodeBsdfGlossy', 'props': {},
+        'inputs': [sk('Color', 'RGBA', [0.9, 0.6, 0.2, 1.0]),
+                   sk('Roughness', 'VALUE', 0.35)],
+        'outputs': [{'name': 'BSDF', 'type': 'SHADER'}]}
+    p, why, _a = _plan_of(sc_g, st_g)
+    check('the LATENT raw-glossy wrongness is closed by the same gate',
+          p is None and 'GLOSSY' in str(why), str(why))
+
+    sc_d, st_d = build('node Metallic BSDF (raw graph)')
+    sc_d.materials[1].graph['nodes']['bsdf'] = {
+        'id': 'bsdf', 'bl_idname': 'ShaderNodeBsdfDiffuse', 'props': {},
+        'inputs': [sk('Color', 'RGBA', [0.8, 0.3, 0.3, 1.0]),
+                   sk('Roughness', 'VALUE', 0.0)],
+        'outputs': [{'name': 'BSDF', 'type': 'SHADER'}]}
+    p, why, _a = _plan_of(sc_d, st_d)
+    check('a raw DIFFUSE graph still qualifies (its colour IS the chain)',
+          p is not None, str(why))
+
+    sc_w, _st = build('node Wireframe (cel ink)')
+    ok, miss = EM.can_emit(sc_w.materials[1].graph)
+    check('the wireframe graph refuses with the reason',
+          not ok and any('triangle corners' in m for m in miss), str(miss))
+
+    # --- the conversion operator learned the spec/gloss shader too
+    p = CV.plan('ShaderNodeEeveeSpecular',
+                values={'Roughness': 0.3, 'Transparency': 0.4},
+                links={'Specular'})
+    check('convert: Specular BSDF chooses the DirectX model',
+          p['model'] == 'BLINN_PHONG', p['model'])
+    check('convert: transparency becomes opacity',
+          abs(p['extras'].get('Opacity', -1) - 0.6) < 1e-6,
+          str(p['extras']))
+    check('convert: the specular colour socket carries over',
+          ('Specular Color', 'Specular') in p['pairs'], str(p['pairs']))
+
+    # --- and the three matrix rows render on both devices identically
+    for key in ('node Metallic BSDF (raw graph)',
+                'node Specular BSDF (raw graph)',
+                'node Wireframe (cel ink)'):
+        scC, stC = build(key, 64, 48)
+        cpu = R.render(scC, stC)
+        scG, stG = build(key, 64, 48)
+        stG.render_device = 'GPU'
+        gpu = R.render(scG, stG)
+        d = float(np.abs(np.asarray(cpu, np.float64) - gpu).max())
+        check(f'{key}: headless fallback equality', d == 0.0, f'max {d}')
+        check(f'{key}: the picture is alive', float(np.ptp(cpu)) > 0.05)
+
+
+def test_every_version_stamp_agrees():
+    """A stamp that can lie is worse than no stamp.
+
+    An installed extension reports blender_manifest.toml -- that is what
+    the self-test header and every console line print through
+    version_string(). The 1.25.73 and 1.25.74 ships bumped bl_info alone;
+    the manifest kept saying 1.25.72, and the field spent two rounds
+    (rightly!) swearing it was on the latest build while the header
+    disagreed -- the proof it WAS current being a self-test section that
+    only exists in the new code. Blender parses bl_info statically and
+    the manifest is TOML, so one constant cannot serve both; the honest
+    guard is this test: the manifest, bl_info (read by AST -- importing
+    the package root needs bpy), the version.py fallback and the
+    CHANGELOG's newest entry must all name the SAME version, or the suite
+    fails before a lying zip can ship.
+    """
+    import ast
+    import os
+    import re
+
+    from .. import version as V
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    manifest = V._from_manifest()
+    check('the manifest parses a version', manifest is not None,
+          str(manifest))
+    with open(os.path.join(root, '__init__.py'), encoding='utf-8') as fh:
+        tree = ast.parse(fh.read())
+    bl = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if getattr(t, 'id', None) == 'bl_info':
+                    try:
+                        bl = tuple(ast.literal_eval(node.value)['version'])
+                    except Exception:                           # noqa: BLE001
+                        bl = None
+    check('bl_info carries a literal version', bl is not None, str(bl))
+    head = None
+    with open(os.path.join(root, 'CHANGELOG.md'), encoding='utf-8') as fh:
+        for line in fh:
+            m = re.match(r'## \[(\d+)\.(\d+)\.(\d+)\]', line.strip())
+            if m:
+                head = tuple(int(g) for g in m.groups())
+                break
+    check('the changelog opens with a versioned entry', head is not None,
+          str(head))
+    stamps = {'manifest (what an installed extension REPORTS)': manifest,
+              'bl_info': bl, 'version.py fallback': tuple(V.VERSION),
+              'changelog newest entry': head}
+    vals = {v for v in stamps.values() if v is not None}
+    check('manifest, bl_info, fallback and changelog name ONE version',
+          len(vals) == 1, str(stamps))
+    check('and version_string() reports exactly that one',
+          V.version_string() == '.'.join(str(x) for x in (manifest or ())),
+          V.version_string())
+
+
+def _matrix_run(sc, st):
+    """Render + post, exactly the engine's shape, for the feature matrix."""
+    img = R.render(sc, st)
+    return post.process(img, st, frame=1, seed=st.seed,
+                        target_size=(st.resolution_x, st.resolution_y),
+                        allow_resize=False,
+                        depth=getattr(sc, 'last_depth', None),
+                        shaft_sources=getattr(sc, 'last_shafts', None))
+
+
+def test_every_feature_survives_the_device_switch():
+    """The whole feature matrix, once per device, demanding EXACT equality.
+
+    With no driver in this environment, every GPU gate must probe, refuse
+    and land on the very same CPU code the CPU device runs -- so the two
+    devices' pictures must match bit for bit on EVERY row. Any difference
+    is a hole in the switch or the fallback plumbing (a stage that runs
+    different code by device, a fallback that loses a setting). This is
+    the headless half of the audit; the self-test's FEATURE x DEVICE
+    MATRIX renders the same rows against a real driver.
+    """
+    from .featurematrix import ROWS, build
+
+    bad = []
+    for key, _o, _s in ROWS:
+        sc, st = build(key)
+        cpu = _matrix_run(sc, st)
+        sc2, st2 = build(key)
+        st2.render_device = 'GPU'      # gpu_raster/shading/post default on
+        gpu = _matrix_run(sc2, st2)
+        same = cpu.shape == gpu.shape and bool((cpu == gpu).all())
+        if not same:
+            bad.append((key, float(np.abs(np.asarray(cpu, np.float64)
+                                          - gpu).max())
+                        if cpu.shape == gpu.shape else 'shape'))
+    check(f'all {len(ROWS)} feature rows fall back bit-exactly '
+          'without a driver', not bad, str(bad[:6]))
+    check('the matrix is not vacuous: it covered every row',
+          len(ROWS) >= 90, str(len(ROWS)))
+
+
+def test_the_device_switch_gates_every_gpu_entry():
+    """The CPU device must never knock on the GPU's door -- not probe it,
+    not attempt a stage, nothing. The audit found post doing exactly that:
+    `_gpu_stage` gated on `device != GPU AND not gpu_post`, so a CPU
+    render with the default gpu_post=True ran its post chain on any
+    driver present -- the switch said CPU while dither drew on the GPU
+    (up to 0.032 from the CPU chain, per the stage table's own claims).
+    These counters make the contract structural for all four doors:
+    probe, rasteriser, shading, post.
+    """
+    from ..gpu import chain as CH
+    from ..gpu import craster as CRA
+    from ..gpu import device as DEV
+    from ..gpu import shade as GSH
+
+    calls = {'probe': 0, 'raster': 0, 'shade': 0, 'post': 0}
+    saved = (DEV.probe, CRA.raster_into_gbuffer, GSH.shade_frame,
+             CH.try_stage)
+
+    def _probe(*a, **k):
+        calls['probe'] += 1
+        return saved[0](*a, **k)
+
+    def _raster(*a, **k):
+        calls['raster'] += 1
+        return saved[1](*a, **k)
+
+    def _shade(*a, **k):
+        calls['shade'] += 1
+        return saved[2](*a, **k)
+
+    def _stage(*a, **k):
+        calls['post'] += 1
+        return saved[3](*a, **k)
+
+    DEV.probe, CRA.raster_into_gbuffer = _probe, _raster
+    GSH.shade_frame, CH.try_stage = _shade, _stage
+    try:
+        st = base_settings(96, 72)
+        st.shadows = False
+        st.dither = 'BAYER4'           # a post stage with a GPU twin
+        st.crt = True
+        sc = demo_scene(st, with_texture=False)
+        _matrix_run(sc, st)            # render_device is CPU by default
+        cpu_calls = dict(calls)
+        check('the CPU device never touches the GPU: probe, raster, '
+              'shade and post all uncalled',
+              all(v == 0 for v in cpu_calls.values()), str(cpu_calls))
+
+        for k in calls:
+            calls[k] = 0
+        st2 = base_settings(96, 72)
+        st2.shadows = False
+        st2.dither = 'BAYER4'
+        st2.crt = True
+        st2.render_device = 'GPU'
+        sc2 = demo_scene(st2, with_texture=False)
+        _matrix_run(sc2, st2)
+        gpu_calls = dict(calls)
+        check('the GPU device knocks on every door (and falls back '
+              'cleanly here, where no driver answers)',
+              gpu_calls['raster'] >= 1 and gpu_calls['shade'] >= 1
+              and gpu_calls['post'] >= 1, str(gpu_calls))
+
+        # the per-stage toggles gate their own doors under the GPU device
+        for k in calls:
+            calls[k] = 0
+        st3 = base_settings(96, 72)
+        st3.shadows = False
+        st3.dither = 'BAYER4'
+        st3.crt = True
+        st3.render_device = 'GPU'
+        st3.gpu_raster = False
+        st3.gpu_shading = False
+        st3.gpu_post = False
+        sc3 = demo_scene(st3, with_texture=False)
+        _matrix_run(sc3, st3)
+        off_calls = dict(calls)
+        check('with all three stage toggles off, the GPU device attempts '
+              'nothing', off_calls['raster'] == 0
+              and off_calls['shade'] == 0 and off_calls['post'] == 0,
+              str(off_calls))
+    finally:
+        (DEV.probe, CRA.raster_into_gbuffer, GSH.shade_frame,
+         CH.try_stage) = saved
+
+
+def test_anisotropic_rotation_reaches_the_gpu_frame():
+    """The term the GLSL dropped: Anisotropic Rotation turns the frame.
+
+    The field's feature matrix put every model on the driver for the
+    first time and ANISOTROPIC came back 0.0627 over 405 pixels -- the
+    demo material carries aniso_rotation 0.2, the CPU's _aniso_frame
+    rotates the tangent frame by it, and the emitted GLSL never did (WARD
+    hid the same gap under one output quantum at demo parameters). The
+    assembler now rotates: baked rotations land as cos/sin literals, a
+    per-pixel chain rotates with driver trig. This test holds the sim to
+    the CPU for the exact matrix row that failed, for WARD with the
+    rotation cranked where its lobe makes the gap visible, and proves
+    the term is not vacuous: turning the rotation MOVES the highlight.
+    """
+    from ..core import raster
+    from ..gpu import shade as GSH
+    from .featurematrix import build
+
+    def sim_vs_cpu(key, tweak=None):
+        sc, st = build(key)
+        if tweak:
+            tweak(sc)
+        cpu = R.render(sc, st)
+        w, h = st.resolution_x, st.resolution_y
+        view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+        g = raster.GBuffer(w, h)
+        raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g,
+                         depth_bits=st.depth_precision)
+        R._build_shadows(sc, st, sc.mesh)
+        job = R.ShadeJob(sc, st, R.prepare_textures(sc, st), None, view,
+                         eye, w, h)
+        GSH._PLAN_CACHE.clear()
+        passes, why, atl = GSH.plan_frame(job, g)
+        if passes is None:
+            return None, why, None
+        img, _hit = GSH.simulate(job, g, passes, atl)
+        cov = g.tri >= 0
+        d = np.abs(img[cov] - cpu[cov][:, :3])
+        return float(d.max()), int((d.max(axis=1) > 1e-2).sum()), img
+
+    d1, fl1, img1 = sim_vs_cpu('model ANISOTROPIC')
+    check('the matrix row that FAILED on the field now matches',
+          d1 is not None and d1 < 1e-3, f'max {d1} ({fl1})')
+
+    def crank(sc):
+        for m in sc.materials:
+            m.aniso_rotation = 0.37
+            m.anisotropy = 0.7
+    d2, fl2, _i2 = sim_vs_cpu('model WARD', crank)
+    check('WARD under a cranked rotation matches too',
+          d2 is not None and d2 < 1e-3, f'max {d2} ({fl2})')
+
+    def zero(sc):
+        for m in sc.materials:
+            m.aniso_rotation = 0.0
+    _d3, _f3, img3 = sim_vs_cpu('model ANISOTROPIC', zero)
+    check('the rotation is not vacuous: zeroing it moves the highlight',
+          img1 is not None and img3 is not None
+          and float(np.abs(img1 - img3).max()) > 1e-2,
+          f'{float(np.abs(img1 - img3).max()) if img1 is not None and img3 is not None else -1:.4f}')
+
+    # the other matrix verdicts, pinned as refusals-by-name until ported:
+    # affine frames shade on the CPU (0.835 measured), coarse-depth and
+    # snapped frames rasterise on the CPU (quantised depth ties, 3 px)
+    # ... and the refusal must survive a WARM plan cache. The gate alone
+    # was not enough: it shipped with tex_perspective absent from the
+    # plan signature, the field matrix planned 'texture NEAREST' first
+    # (identical signature once the setting is invisible), and the
+    # affine row walked straight past the refusal into the cached valid
+    # plan -- 0.835 over 1355 px on the driver, in two consecutive
+    # pastes. A gate the signature does not fingerprint is a gate a
+    # cache hit bypasses; this orders the two plans exactly as the
+    # field's matrix did.
+    sc5, st5 = build('texture NEAREST')
+    view5, _p5, vp5, eye5 = R.camera_matrices(sc5.camera, 96, 72)
+    g5 = raster.GBuffer(96, 72)
+    raster.rasterize(sc5.mesh.verts, sc5.mesh.tris, vp5, 96, 72, gbuf=g5)
+    job5 = R.ShadeJob(sc5, st5, R.prepare_textures(sc5, st5), None,
+                      view5, eye5, 96, 72)
+    GSH._PLAN_CACHE.clear()
+    p5, why5, _a5 = GSH.plan_frame(job5, g5)
+    check('the perspective twin of the affine frame plans (cache primed)',
+          p5 is not None, str(why5))
+    sc4, st4 = build('affine mapping (PS1 warp)')
+    view4, _p4, vp4, eye4 = R.camera_matrices(sc4.camera, 96, 72)
+    g4 = raster.GBuffer(96, 72)
+    raster.rasterize(sc4.mesh.verts, sc4.mesh.tris, vp4, 96, 72, gbuf=g4)
+    job4 = R.ShadeJob(sc4, st4, R.prepare_textures(sc4, st4), None,
+                      view4, eye4, 96, 72)
+    p4, why4, _a4 = GSH.plan_frame(job4, g4)      # cache NOT cleared
+    check('affine frames refuse the deferred pass BY NAME, past a '
+          'warm cache', p4 is None and 'affine' in str(why4), str(why4))
+
+
+def test_fog_rides_the_deferred_readback():
+    """Fog no longer refuses the GPU: the readback takes apply_fog itself.
+
+    Fog is separable -- a lerp toward the fog colour by geometry alone --
+    so instead of a GLSL twin of four modes, the vertex quantisation and
+    the height layer, the deferred results take core.render.apply_fog at
+    every point the CPU fogs: frame pixels at their view depth, ray HITS
+    inside the sweep recursion at the hit's own depth (after the child
+    composites, exactly as trace() recurses), and layer fragments at the
+    gather. Vertex-rate materials SKIP the readback fog -- their corners
+    were lit through shade_batch's LIGHT path, which already fogged at
+    the corner (per-vertex fog, the era's own) -- so the Gouraud case
+    must come out BIT-identical, not merely close. This was the largest
+    R-P cluster in the field matrix (five rows) and 0.75s of the field's
+    own 1.4s fogged frame.
+    """
+    from ..core import raster
+    from ..gpu import shade as GSH
+    from .featurematrix import build
+
+    def sim_vs_cpu(key, mut=None):
+        sc, st = build(key)
+        if mut:
+            mut(sc, st)
+        cpu = R.render(sc, st)
+        w, h = st.resolution_x, st.resolution_y
+        view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+        g = raster.GBuffer(w, h)
+        raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g,
+                         depth_bits=st.depth_precision)
+        R._build_shadows(sc, st, sc.mesh)
+        bvh = R._cached_bvh(sc, sc.mesh) if st.raytrace else None
+        job = R.ShadeJob(sc, st, R.prepare_textures(sc, st), bvh, view,
+                         eye, w, h)
+        GSH._PLAN_CACHE.clear()
+        passes, why, atl = GSH.plan_frame(job, g)
+        if passes is None:
+            return None, why
+        img, _hit = GSH.simulate(job, g, passes, atl)
+        cov = g.tri >= 0
+        return float(np.abs(img[cov] - cpu[cov][:, :3]).max()), img
+
+    for key in ('fog LINEAR', 'fog EXP2', 'fog TABLE16 (fixed-function)',
+                'per-vertex fog', 'height fog (ground mist)'):
+        d, _img = sim_vs_cpu(key)
+        check(f'{key}: the deferred frame matches the CPU',
+              d is not None and d < 1e-3, str(d))
+
+    d0, img_on = sim_vs_cpu('fog LINEAR')
+    _dx, img_off = sim_vs_cpu('baseline PHONG + map shadows')
+    check('the fog is not vacuous: fogged and clear frames differ',
+          img_on is not None and img_off is not None
+          and float(np.abs(img_on - img_off).max()) > 1e-2)
+
+    def gouraud(sc, st):
+        st.shading_rate = 'VERTEX'
+    dg, _ig = sim_vs_cpu('fog LINEAR', gouraud)
+    check('vertex-rate fog is BIT-level (corners carry it; the readback '
+          'skips)', dg is not None and dg < 1e-6, str(dg))
+
+    def rayfog(sc, st):
+        st.fog = True
+        st.fog_mode = 'EXP'
+        st.fog_density = 0.08
+    dr, _ir = sim_vs_cpu('traced reflection', rayfog)
+    check('ray hits fog inside the recursion at their own depth',
+          dr is not None and dr < 1e-3, str(dr))
+
+
+def test_trilinear_mip_and_aniso_actually_filter():
+    """TRILINEAR, mip bias and anisotropy were wired to nothing.
+
+    ShadeContext.duv/dvv were initialised to None and NOTHING ever set
+    them, so `filt == 'TRILINEAR' and c.duv is not None` was always
+    False: CPU trilinear silently sampled bilinear, mips were built by
+    prepare_textures and never read, tex_mip_bias lived only inside the
+    never-taken branch, and Texture.sample accepted `aniso` and ignored
+    it -- no anisotropic path existed at all. Three settings, a UI page
+    and two console presets (GameCube, Xbox) rode on them. Found by
+    pulling the thread the matrix could not see (it compares devices,
+    not semantics; both devices rendered the same not-trilinear frame).
+
+    Now: ShadeJob.uv_screen_gradients computes ANALYTIC per-pixel screen
+    derivatives of the interpolated UV (perspective-exact, no seams at
+    triangle edges, a pure function of (tri, bary) -- so chunking,
+    threading and the A-buffer cannot change it), the context carries
+    them for every screen point, compute_lod turns them into a mip
+    level with the bias, and a new N-tap anisotropic sampler follows
+    the minor axis for its level while averaging taps along the major.
+    Ray hits have no footprint and keep the top level, as the era did.
+    Derivatives apply only to raw flat-projected UV lookups -- a linked
+    Vector chain resamples through a transform the chain rule was never
+    applied to, and keeps the top level rather than filtering wrongly.
+    """
+    from .featurematrix import build
+
+    def render(key, **kw):
+        sc, st = build(key)
+        for k, v in kw.items():
+            setattr(st, k, v)
+        return R.render(sc, st)
+
+    bil = render('texture BILINEAR')
+    tri = render('texture TRILINEAR + mips')
+    check('TRILINEAR finally differs from BILINEAR',
+          float(np.abs(tri - bil).max()) > 0.05,
+          f'{float(np.abs(tri - bil).max()):.4f}')
+
+    def shimmer(img):
+        g = img[..., :3].mean(axis=2)
+        return float(np.abs(np.diff(g[8:24, :], axis=1)).mean())
+    check('the mips smooth the receding checker (less shimmer than '
+          'bilinear)', shimmer(tri) < shimmer(bil),
+          f'{shimmer(tri):.5f} vs {shimmer(bil):.5f}')
+
+    an = render('anisotropy 4x')
+    check('anisotropy differs from plain trilinear',
+          float(np.abs(an - tri).max()) > 0.05)
+    check('aniso keeps more detail than trilinear over-blur '
+          '(minor-axis mip level)', shimmer(an) > shimmer(tri),
+          f'{shimmer(an):.5f} vs {shimmer(tri):.5f}')
+
+    sharp = render('mip bias sharp')
+    soft = render('texture TRILINEAR + mips', tex_mip_bias=2.0)
+    check('the mip bias moves the level both ways',
+          float(np.abs(sharp - soft).max()) > 0.05)
+    check('positive bias blurs, negative sharpens',
+          shimmer(sharp) > shimmer(soft),
+          f'{shimmer(sharp):.5f} vs {shimmer(soft):.5f}')
+
+    a1 = render('anisotropy 4x')
+    saved = R.MAX_CHUNK
+    try:
+        R.MAX_CHUNK = 1000
+        a2 = render('anisotropy 4x')
+    finally:
+        R.MAX_CHUNK = saved
+    check('the analytic footprint is chunk-invariant (a pure function '
+          'of tri and bary)', float(np.abs(a1 - a2).max()) == 0.0)
+    a3 = render('anisotropy 4x', threads=4)
+    check('and thread-invariant', float(np.abs(a1 - a3).max()) == 0.0)
+
+    # ray hits keep the top level: a trilinear scene with a mirror must
+    # render, deterministically, with no footprint machinery on hits
+    m1 = render('traced reflection', tex_filter='TRILINEAR',
+                tex_mipmap=True)
+    m2 = render('traced reflection', tex_filter='TRILINEAR',
+                tex_mipmap=True)
+    check('trilinear under ray tracing renders deterministically '
+          '(hits sample the top level)',
+          np.isfinite(m1).all() and float(np.abs(m1 - m2).max()) == 0.0)
+
+
+def test_exotic_filters_ride_the_deferred_pass():
+    """TRILINEAR, mip bias, anisotropy and the N64 filter on the driver.
+
+    The frame passes sample from a MIP ATLAS packed from the CPU's own
+    build_mips output, pick their level from the hal_uvgrad field -- the
+    CPU's analytic derivatives, uploaded verbatim -- and mirror
+    compute_lod, _sample_trilinear and _sample_aniso line for line in
+    GLSL (the level ladder is a select chain; nothing the front-end
+    cannot run). The N64 3-point filter is pure arithmetic and rides the
+    plain image. The footprint applies exactly where the CPU applies it:
+    raw flat-UV lookups on screen points -- so ray hits (secondary
+    passes) sample the top level as the CPU does, coded-shader images
+    stay bilinear, and a TRILINEAR-filtered height chain takes the
+    proven CPU height-image pre-pass. Glass layers refuse the footprint
+    BY NAME for now and shade on the CPU.
+    """
+    from ..core import raster
+    from ..gpu import shade as GSH
+    from .featurematrix import build
+
+    def sim_vs_cpu(key, mut=None):
+        sc, st = build(key)
+        if mut:
+            mut(sc, st)
+        cpu = R.render(sc, st)
+        w, h = st.resolution_x, st.resolution_y
+        view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+        g = raster.GBuffer(w, h)
+        raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g,
+                         depth_bits=st.depth_precision)
+        R._build_shadows(sc, st, sc.mesh)
+        bvh = R._cached_bvh(sc, sc.mesh) if st.raytrace else None
+        job = R.ShadeJob(sc, st, R.prepare_textures(sc, st), bvh, view,
+                         eye, w, h)
+        GSH._PLAN_CACHE.clear()
+        passes, why, atl = GSH.plan_frame(job, g)
+        if passes is None:
+            return None, str(why), None
+        img, _hit = GSH.simulate(job, g, passes, atl)
+        if img is None:
+            return None, str(_hit), None
+        cov = g.tri >= 0
+        d = np.abs(img[cov] - cpu[cov][:, :3])
+        return float(d.max()), int((d.max(axis=1) > 1e-2).sum()), img
+
+    imgs = {}
+    for key in ('texture TRILINEAR + mips', 'texture N64 3-point',
+                'mip bias sharp', 'anisotropy 4x'):
+        d, fl, img = sim_vs_cpu(key)
+        check(f'{key}: the deferred frame matches the CPU',
+              d is not None and d < 1e-3, f'{d} ({fl})')
+        imgs[key] = img
+    _d, _f, bil = sim_vs_cpu('texture BILINEAR')
+    check('the footprint is not vacuous: deferred trilinear differs '
+          'from deferred bilinear',
+          imgs['texture TRILINEAR + mips'] is not None and bil is not None
+          and float(np.abs(imgs['texture TRILINEAR + mips'] - bil).max())
+          > 0.05)
+    check('and anisotropy differs from plain trilinear on the driver '
+          'path', imgs['anisotropy 4x'] is not None
+          and float(np.abs(imgs['anisotropy 4x']
+                           - imgs['texture TRILINEAR + mips']).max())
+          > 0.05)
+
+    def rayfi(sc, st):
+        st.tex_filter = 'TRILINEAR'
+        st.tex_mipmap = True
+    d, fl, _img = sim_vs_cpu('traced reflection', rayfi)
+    check('ray hits sample the top level on both devices',
+          d is not None and d < 1e-3, f'{d} ({fl})')
+
+    # glass layers: the footprint refuses BY NAME (the layer passes have
+    # no field yet) and the frame still plans -- the opaque part shades
+    # on the driver while the glass shades on the CPU
+    sc, st = build('sorted glass layers')
+    st.tex_filter = 'TRILINEAR'
+    st.tex_mipmap = True
+    donor = build('texture TRILINEAR + mips')[0]
+    sc.materials[1].graph = donor.materials[0].graph
+    sc.images.update(donor.images)
+    w, h = st.resolution_x, st.resolution_y
+    view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+    opq, _trn = R._split_by_alpha(sc, sc.mesh, st)
+    g = raster.GBuffer(w, h)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, subset=opq,
+                     gbuf=g, depth_bits=st.depth_precision)
+    R._build_shadows(sc, st, sc.mesh)
+    job = R.ShadeJob(sc, st, R.prepare_textures(sc, st), None, view, eye,
+                     w, h)
+    GSH._PLAN_CACHE.clear()
+    passes, why, atl = GSH.plan_frame(job, g)
+    check('the textured-glass frame still plans its opaque passes',
+          passes is not None, str(why))
+    if passes is not None:
+        lwhy = (atl or {}).get('__layers_why')
+        check('the glass layer refusal is BY NAME',
+              (atl or {}).get('__layers') is None
+              and 'TRILINEAR' in str(lwhy), str(lwhy))
+
+
+def test_the_bvh_cache_survives_exports_and_the_sky_masks_its_blocks():
+    """The two per-frame costs that were pure waste, removed exactly.
+
+    BVH: the cache was content-keyed but stored ON the scene object --
+    and every F12 exports a fresh Scene, so it could never hit; the
+    field paid its 0.76 s build on every render of an unchanged mesh
+    while the docstring said "identity is useless across exports".
+    Now module-level: two fresh scenes with the same mesh content share
+    ONE tree (identity), a changed mesh rebuilds, answers are identical
+    through the cache, and the LRU stays bounded.
+
+    Sky: the fast-background path evaluated EVERY low-res pixel even
+    when the frame was mostly geometry. Now only the blocks the mask
+    can read get evaluated -- held BIT-IDENTICAL to the full evaluation
+    across random masks, band masks, pad-band-only masks and empty
+    masks at odd sizes and ss 2..4 (the sky is per-pixel independent,
+    so skipping unread blocks cannot move a value).
+    """
+    from ..presets.skies import apply_sky
+
+    st = base_settings(96, 72)
+    R._BVH_CACHE.clear()
+    sc1 = demo_scene(st, with_texture=False)
+    sc2 = demo_scene(st, with_texture=False)
+    b1 = R._cached_bvh(sc1, sc1.mesh)
+    b2 = R._cached_bvh(sc2, sc2.mesh)
+    check('two exports of the same mesh share ONE tree', b1 is b2)
+    sc3 = demo_scene(st, with_texture=False)
+    sc3.mesh.verts = sc3.mesh.verts + np.float32(0.01)
+    check('a changed mesh rebuilds', R._cached_bvh(sc3, sc3.mesh)
+          is not b1)
+    org = np.zeros((32, 3), np.float32)
+    org[:, 2] = 5.0
+    d = np.tile(np.array([0, 0, -1], np.float32), (32, 1))
+    r1 = b1.intersect(org, d, np.full(32, 1e30, np.float32))
+    r2 = b2.intersect(org, d, np.full(32, 1e30, np.float32))
+    check('answers through the cache are identical',
+          all(bool((a == b).all()) for a, b in zip(r1, r2)))
+    for k in range(8):
+        sck = demo_scene(st, with_texture=False)
+        sck.mesh.verts = sck.mesh.verts * np.float32(1.0 + 0.01 * (k + 1))
+        R._cached_bvh(sck, sck.mesh)
+    check('the LRU stays bounded', len(R._BVH_CACHE) <= R._BVH_CACHE_CAP,
+          str(len(R._BVH_CACHE)))
+
+    def old_fast(scene, stf, w, h, vp, eye, uncovered, ss):
+        img = np.zeros((h, w, 4), np.float32)
+        lw, lh = max(w // ss, 1), max(h // ss, 1)
+        low = R._background_image(scene, stf, lw, lh, vp, eye, None, {},
+                                  ss=1)
+        big = np.repeat(np.repeat(low, ss, axis=0), ss, axis=1)
+        if big.shape[0] < h or big.shape[1] < w:
+            big = np.pad(big, ((0, max(h - big.shape[0], 0)),
+                               (0, max(w - big.shape[1], 0)), (0, 0)),
+                         mode='edge')
+        big = big[:h, :w]
+        mask = np.broadcast_to(uncovered, (h, w))
+        img[mask] = big[mask]
+        return img
+
+    rng = np.random.default_rng(7)
+    bad = []
+    for (w, h, ss) in ((256, 192, 2), (255, 191, 2), (129, 97, 3)):
+        stf = base_settings(w, h)
+        scf = demo_scene(stf, with_texture=False)
+        apply_sky(scf.world, 'BRYCE_DEFAULT')
+        _v, _p, vp, eye = R.camera_matrices(scf.camera, w, h)
+        masks = {'random': rng.random((h, w)) < 0.3,
+                 'band': np.zeros((h, w), bool),
+                 'padonly': np.zeros((h, w), bool),
+                 'empty': np.zeros((h, w), bool)}
+        masks['band'][: h // 3] = True
+        masks['padonly'][-1, -1] = True
+        for kind, m in masks.items():
+            a = old_fast(scf, stf, w, h, vp, eye, m, ss)
+            b = R._background_image(scf, stf, w, h, vp, eye, m, {}, ss=ss)
+            if not (a.shape == b.shape and bool((a == b).all())):
+                bad.append((w, h, ss, kind))
+    check('the masked sky is BIT-IDENTICAL to the full evaluation on '
+          'every mask shape', not bad, str(bad))
 
 
 def _marshal_reset(M):
@@ -11897,6 +15431,251 @@ def test_a_shading_rate_interpolates_light_not_texture():
     said = R.depth_report(proj, gq, stq.depth_precision, 'PAINTERS') or ''
     check("Painter's mode is reported as Painter's, not as broken depth",
           "Painter's algorithm" in said and 'asymptote' not in said, said)
+
+
+def test_gouraud_frames_shade_on_the_gpu():
+    """The named refusal 'the scene shading rate is VERTEX' is lifted.
+
+    The field hit it on every render of a model whose preset selects
+    Gouraud -- which is most of the console presets -- so choosing GPU
+    bought nothing. The port is the R66 split made device-shaped: the
+    CPU lights the CORNERS of every triangle over a white surface
+    (shadows, env, the model's own formula -- its own code, so the
+    values are its own numbers) and the pass interpolates them by the
+    G-buffer's barycentrics and multiplies by the per-pixel albedo
+    chain. MODULATE, with the driver doing the per-pixel half.
+    """
+    from ..core import raster as CRg
+    from ..gpu import shade as GSH
+
+    w, h = 96, 72
+
+    def gbuffer_for(sc, st):
+        view, _p, vp, eye = R.camera_matrices(sc.camera, w, h)
+        g = CRg.GBuffer(w, h)
+        CRg.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g,
+                      depth_bits=st.depth_precision)
+        tex = R.prepare_textures(sc, st)
+        job = R.ShadeJob(sc, st, tex, None, view, eye, w, h)
+        return g, job
+
+    def seam(rate, label):
+        st = base_settings(w, h, shadows=True, shading_rate=rate)
+        sc = demo_scene(st, with_texture=True)
+        cpu = R.render(sc, st)
+        g, job = gbuffer_for(sc, st)
+        GSH._PLAN_CACHE.clear()
+        p, why, _a = GSH.plan_frame(job, g)
+        check(f'a {label} frame qualifies for the deferred pass',
+              p is not None, str(why))
+        if p is None:
+            return None
+        want = rate != 'PIXEL'
+        check(f'{label} passes carry corner light exactly when the rate '
+              'says so',
+              all(bool(b.get('vlight')) == want for _mi, _n, _s, b in p),
+              str([(mi, bool(b.get('vlight'))) for mi, _n, _s, b in p]))
+        out, _hit = GSH.simulate(job, g)
+        check(f'the {label} passes simulate', out is not None, str(_hit))
+        if out is None:
+            return None
+        yy, xx = np.nonzero(g.tri >= 0)
+        d = np.abs(out[yy, xx] - cpu[yy, xx, :3]).max(axis=1)
+        check(f'the {label} frame matches the CPU per pixel',
+              int((d > 1e-2).sum()) == 0 and float(d.max()) < 6e-3,
+              f'{int((d > 1e-2).sum())} of {yy.size} px >0.01, '
+              f'max {float(d.max()):.6f}')
+        return out
+
+    vx = seam('VERTEX', 'Gouraud')
+    fc = seam('FACE', 'flat')
+    px_out = seam('PIXEL', 'per-pixel')
+    if vx is not None and px_out is not None:
+        check('Gouraud is really a different picture (the banding the '
+              'rate exists for)',
+              float(np.abs(vx - px_out).max()) > 1e-2,
+              f'{float(np.abs(vx - px_out).max()):.4f}')
+    if vx is not None and fc is not None:
+        check('and flat differs from Gouraud',
+              float(np.abs(vx - fc).max()) > 1e-2)
+
+    # mixed rates in ONE frame: a per-material Gouraud override next to
+    # per-pixel materials -- each pass gets its own rate
+    st = base_settings(w, h, shadows=True, shading_rate='PIXEL')
+    sc = demo_scene(st, with_texture=True)
+    sc.materials[1].use_override = True
+    sc.materials[1].model = 'GOURAUD'
+    cpu = R.render(sc, st)
+    g, job = gbuffer_for(sc, st)
+    GSH._PLAN_CACHE.clear()
+    p, why, _a = GSH.plan_frame(job, g)
+    check('a mixed-rate frame qualifies', p is not None, str(why))
+    if p is not None:
+        rates = {mi: bool(b.get('vlight')) for mi, _n, _s, b in p}
+        check('exactly the Gouraud material interpolates corner light',
+              rates.get(1) is True
+              and not any(v for k, v in rates.items() if k != 1),
+              str(rates))
+        out, _hit = GSH.simulate(job, g)
+        if out is not None:
+            yy, xx = np.nonzero(g.tri >= 0)
+            d = np.abs(out[yy, xx] - cpu[yy, xx, :3]).max(axis=1)
+            check('and matches the CPU per pixel, both rates at once',
+                  int((d > 1e-2).sum()) == 0 and float(d.max()) < 6e-3,
+                  f'{int((d > 1e-2).sum())} of {yy.size} px >0.01, '
+                  f'max {float(d.max()):.6f}')
+
+    # under ray tracing a Gouraud material still refuses, BY NAME: a
+    # hit lights per pixel and the light loop has no Gouraud formula
+    st2 = base_settings(w, h, shadows=True, shading_rate='VERTEX',
+                        raytrace=True, ray_depth=1)
+    sc2 = demo_scene(st2, with_texture=True)
+    sc2.materials[2].reflect_level = 0.5
+    g2, job2 = gbuffer_for(sc2, st2)
+    job2.bvh = R._cached_bvh(sc2, sc2.mesh)
+    GSH._PLAN_CACHE.clear()
+    p2, why2, _a2 = GSH.plan_frame(job2, g2)
+    check('a ray-traced Gouraud frame refuses by name',
+          p2 is None and 'hit' in str(why2), str(why2))
+
+
+def test_texture_coordinates_and_two_uv_maps_on_the_gpu():
+    """UV Map by NAME, Texture Coordinate outputs, and Mix -- end to end.
+
+    Three gaps in one frame: the UV Map node ignored its layer name on
+    the GPU (always the active layer), the Texture Coordinate node's
+    Camera and Window outputs were silently wrong in GLSL (both
+    answered world position or generated coordinates), and the modern
+    Mix node had no emitter at all. The material here reads the SECOND
+    UV map into a checker, screen-space Window into another, and mixes
+    them -- per-pixel, against the CPU, through the whole deferred
+    stack including the attribute texture's new second-UV half.
+    """
+    from ..core import raster as CRuv
+    from ..gpu import shade as GSH
+
+    w, h = 96, 72
+
+    def sk(nm, t, d, l=None):
+        return {'name': nm, 'type': t, 'default': d, 'link': l}
+
+    def build_graph():
+        return {'output': 'out', 'nodes': {
+            'uv2': {'id': 'uv2', 'bl_idname': 'ShaderNodeUVMap',
+                    'props': {'uv_map': 'back'}, 'inputs': [],
+                    'outputs': [{'name': 'UV', 'type': 'VECTOR'}]},
+            'ck2': {'id': 'ck2', 'bl_idname': 'ShaderNodeTexChecker',
+                    'props': {},
+                    'inputs': [sk('Vector', 'VECTOR', [0, 0, 0],
+                                  ['uv2', 0]),
+                               sk('Color1', 'RGBA', [1, 1, 1, 1]),
+                               sk('Color2', 'RGBA', [0, 0, 0, 1]),
+                               sk('Scale', 'VALUE', 6.0)],
+                    'outputs': [{'name': 'Color', 'type': 'RGBA'},
+                                {'name': 'Fac', 'type': 'VALUE'}]},
+            'tc': {'id': 'tc', 'bl_idname': 'ShaderNodeTexCoord',
+                   'props': {}, 'inputs': [],
+                   'outputs': [{'name': 'Generated', 'type': 'VECTOR'},
+                               {'name': 'Normal', 'type': 'VECTOR'},
+                               {'name': 'UV', 'type': 'VECTOR'},
+                               {'name': 'Object', 'type': 'VECTOR'},
+                               {'name': 'Camera', 'type': 'VECTOR'},
+                               {'name': 'Window', 'type': 'VECTOR'},
+                               {'name': 'Reflection', 'type': 'VECTOR'}]},
+            'ckw': {'id': 'ckw', 'bl_idname': 'ShaderNodeTexChecker',
+                    'props': {},
+                    'inputs': [sk('Vector', 'VECTOR', [0, 0, 0],
+                                  ['tc', 5]),
+                               sk('Color1', 'RGBA', [0.9, 0.3, 0.1, 1]),
+                               sk('Color2', 'RGBA', [0.1, 0.3, 0.9, 1]),
+                               sk('Scale', 'VALUE', 8.0)],
+                    'outputs': [{'name': 'Color', 'type': 'RGBA'},
+                                {'name': 'Fac', 'type': 'VALUE'}]},
+            'mx': {'id': 'mx', 'bl_idname': 'ShaderNodeMix',
+                   'props': {'data_type': 'RGBA', 'blend_type': 'MIX'},
+                   'inputs': [
+                       {'name': 'Factor', 'identifier': 'Factor_Float',
+                        'type': 'VALUE', 'default': 0.5, 'link': ['ck2', 1]},
+                       {'name': 'A', 'identifier': 'A_Float',
+                        'type': 'VALUE', 'default': 0.0, 'link': None},
+                       {'name': 'B', 'identifier': 'B_Float',
+                        'type': 'VALUE', 'default': 0.0, 'link': None},
+                       {'name': 'A', 'identifier': 'A_Color',
+                        'type': 'RGBA', 'default': [0.2, 0.8, 0.3, 1],
+                        'link': ['ckw', 0]},
+                       {'name': 'B', 'identifier': 'B_Color',
+                        'type': 'RGBA', 'default': [0.8, 0.7, 0.2, 1],
+                        'link': None}],
+                   'outputs': [{'name': 'Result', 'type': 'VALUE'},
+                               {'name': 'Result', 'type': 'RGBA'}]},
+            'hal': {'id': 'hal', 'bl_idname': 'HALCYON_ShaderNode',
+                    'props': {'model': 'PHONG'},
+                    'inputs': [sk('Diffuse Color', 'RGBA',
+                                  [0.5, 0.5, 0.5, 1.0], ['mx', 1]),
+                               sk('Diffuse Level', 'VALUE', 1.0),
+                               sk('Specular Level', 'VALUE', 0.4),
+                               sk('Specular Color', 'RGBA', [1, 1, 1, 1]),
+                               sk('Glossiness', 'VALUE', 24.0),
+                               sk('Ambient', 'VALUE', 1.0),
+                               sk('Opacity', 'VALUE', 1.0)],
+                    'outputs': [{'name': 'Surface', 'type': 'SHADER'}]},
+            'out': {'id': 'out', 'bl_idname': 'ShaderNodeOutputMaterial',
+                    'props': {},
+                    'inputs': [sk('Surface', 'SHADER', None, ['hal', 0])],
+                    'outputs': []}}}
+
+    def scene():
+        st = base_settings(w, h, shadows=True)
+        sc = demo_scene(st, with_texture=False)
+        mesh = sc.mesh
+        # a SECOND uv set that is genuinely different: swapped and
+        # scaled, so reading the wrong layer is loudly visible
+        mesh.uvs2 = (mesh.uvs[:, ::-1] * 1.7 + 0.13).astype(np.float32)
+        mesh.uv_names = ['front', 'back']
+        sc.materials[1].graph = build_graph()
+        sc.materials[1].has_alpha = False
+        sc.materials[1].opacity = 1.0
+        return sc, st
+
+    sc, st = scene()
+    cpu = R.render(sc, st)
+    view, _p, vp, eye = R.camera_matrices(sc.camera, w, h)
+    g = CRuv.GBuffer(w, h)
+    CRuv.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g,
+                   depth_bits=st.depth_precision)
+    tex = R.prepare_textures(sc, st)
+    job = R.ShadeJob(sc, st, tex, None, view, eye, w, h)
+    GSH._PLAN_CACHE.clear()
+    p, why, _a = GSH.plan_frame(job, g)
+    check('the two-UV / TexCoord / Mix material qualifies',
+          p is not None, str(why))
+    if p is None:
+        return
+    out, _hit = GSH.simulate(job, g)
+    check('and simulates', out is not None, str(_hit))
+    if out is None:
+        return
+    yy, xx = np.nonzero(g.tri >= 0)
+    d = np.abs(out[yy, xx] - cpu[yy, xx, :3]).max(axis=1)
+    check('the frame matches the CPU per pixel',
+          int((d > 1e-2).sum()) == 0 and float(d.max()) < 6e-3,
+          f'{int((d > 1e-2).sum())} of {yy.size} px >0.01, '
+          f'max {float(d.max()):.6f}')
+
+    # vacuity + the negative control that PROVES the second layer is
+    # read: collapse it onto the first and the picture must move
+    mi = sc.mesh.mat_index[g.tri[yy, xx]]
+    on_mat = cpu[yy, xx][mi == 1]
+    check('the mixed material really varies across the surface',
+          float(on_mat[:, :3].std()) > 0.05,
+          f'std {float(on_mat[:, :3].std()):.4f}')
+    sc2, st2 = scene()
+    sc2.mesh.uvs2 = sc2.mesh.uvs.copy()
+    cpu2 = R.render(sc2, st2)
+    dm = float(np.abs(cpu2 - cpu).max())
+    check("collapsing the second UV map onto the first changes the "
+          'picture (the layer name is really honoured)', dm > 0.05,
+          f'max change {dm:.4f}')
 
 
 def test_the_frame_reports_what_its_depth_can_resolve():

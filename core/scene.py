@@ -73,6 +73,7 @@ class MeshData:
     normals: np.ndarray = None        # (V,3) float32 -- per corner (split)
     uvs: np.ndarray = None            # (V,2) float32
     uvs2: Optional[np.ndarray] = None  # (V,2) secondary UV
+    uv_names: Optional[list] = None    # layer names, [active, secondary]
     colors: np.ndarray = None         # (V,4) float32
     tris: np.ndarray = None           # (T,3) int32 indices into verts
     mat_index: np.ndarray = None      # (T,) int32 -> index into Scene.materials
@@ -136,6 +137,19 @@ class Light:
     exclude_objects: tuple = ()
     exclude_mode: str = 'EXCLUDE'
     ambient_only: bool = False
+    # Projected texture (gobo / cookie): sixth-generation projective
+    # texturing -- a SPOT projects its image through the cone like a slide
+    # projector, a SUN tiles it across the world perpendicular to its rays
+    # (cloud shadows). `cookie` is an (H,W,3|4) float32 array (or anything
+    # with a .pixels attribute holding one); POINT and AREA lights ignore it.
+    cookie: Any = None
+    cookie_strength: float = 1.0
+    cookie_scale: float = 10.0        # SUN only: world size of one tile
+    # the light's own X/Y axes, for oriented projection. Export fills them
+    # from the object matrix; hand-built scenes may leave them None and get
+    # a stable basis derived from the direction.
+    frame_x: Any = None
+    frame_y: Any = None
     # Runtime
     shadow_map: Any = None
 

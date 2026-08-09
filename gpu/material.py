@@ -303,6 +303,245 @@ def _ao_function(ao, consts):
     return '\n'.join(L) + '\n'
 
 
+def _rad_function(rad, consts):
+    """`radiosity_gather` as GLSL: the same rays, the same bleed.
+
+    Directions come from the identical hash draws (the gather's own
+    salt); each asks the closest-hit kernel. A miss inside the gather
+    distance returns the scene's ambient colour, a hit returns that
+    surface's flat diffuse from a baked table -- looked up through
+    hal_tri_data, whose texel already carries the material index the
+    G-buffer uses -- scaled by the linear falloff and the intensity,
+    exactly as the CPU gathers it.
+
+    The one seam is a NAMED one: the kernel reports id -2.0 when two
+    surfaces tie inside float noise (the glass-mirror lesson), and a
+    fragment shader cannot re-route single samples to the CPU the way
+    the sweeps do. A tie sample here reads the TABLE MEAN instead of
+    the winner's albedo. Gather rays stop at first hit, so the exposed
+    coplanar overlaps that made sweep ties common are occluded from
+    them; what remains is edge-grazes, single samples of N, bounded by
+    |mean - winner| / samples.
+    """
+    w, h = consts['resolution']
+    seed = int(consts.get('seed', 0))
+    samples = max(int(rad['samples']), 1)
+    dist = max(float(rad['distance']), 1e-4)
+    albedo = rad['albedo']
+    mean = [sum(c[i] for c in albedo) / max(len(albedo), 1)
+            for i in range(3)] if albedo else [0.8, 0.8, 0.8]
+    L = ['vec3 hal_rad_alb(float m)', '{']
+    for i, col in enumerate(albedo[:-1] if len(albedo) > 1 else albedo):
+        L.append(f'    if (m < {_f(i + 0.5)}) return {_v3(col)};')
+    L.append(f'    return {_v3(albedo[-1] if albedo else (0.8, 0.8, 0.8))};')
+    L.append('}')
+    L += ['vec3 hal_rad_at(vec3 P, vec3 N, int sx, int sy)',
+          '{',
+          '    vec3 up = (abs(N.z) < 0.999) ? vec3(0.0, 0.0, 1.0) '
+          ': vec3(1.0, 0.0, 0.0);',
+          '    vec3 t = normalize(cross(up, N));',
+          '    vec3 b = cross(N, t);',
+          f'    vec3 org = P + N * {_f(float(rad["bias"]))};',
+          '    vec3 gather = vec3(0.0, 0.0, 0.0);']
+    for k in range(samples):
+        z = 2 * k + int(rad['salt']) + 7919 * seed
+        L += ['    {',
+              f'    float u1 = hal_smp_hash3(sx, sy, {z});',
+              f'    vec2 cs = hal_smp_circle(hal_smp_hash3(sx, sy, '
+              f'{z + 1}));',
+              '    float r = sqrt(u1);',
+              '    vec3 d = normalize(t * (r * cs.x) + b * (r * cs.y) '
+              '+ N * sqrt(max(1.0 - u1, 0.0)));',
+              f'    vec4 hh = hal_bvh_intersect(org, d, {_f(dist)});',
+              f'    if (hh.x < -1.5) {{',
+              f'        float fall = clamp(1.0 - hh.y / {_f(dist)}, '
+              f'0.0, 1.0);',
+              f'        gather += {_v3(mean)} * (fall '
+              f'* {_f(float(rad["intensity"]))});',
+              '    } else if (hh.x < -0.5) {',
+              f'        gather += {_v3(tuple(rad["ambient"]))};',
+              '    } else {',
+              f'        float fall = clamp(1.0 - hh.y / {_f(dist)}, '
+              f'0.0, 1.0);',
+              '        float hm = hal_tri_data(hh.x).x;',
+              f'        gather += hal_rad_alb(hm) * (fall '
+              f'* {_f(float(rad["intensity"]))});',
+              '    }',
+              '    }']
+    L += [f'    return gather / {_f(float(samples))};', '}']
+    L += ['vec3 hal_rad(vec3 P, vec3 N)',
+          '{',
+          f'    int sx = int(vUV.x * {_f(float(w))});',
+          f'    int sy = int(vUV.y * {_f(float(h))});',
+          '    return hal_rad_at(P, N, sx, sy);',
+          '}']
+    return '\n'.join(L) + '\n'
+
+
+def _rad_lookup_function(rad, consts):
+    """`radiosity_lookup` as GLSL: the field's bilinear, texel for texel.
+
+    Reads the grid the radfield pre-pass drew (or, on the CPU, the grid
+    `radiosity_field` computed -- same sources, same rays, same numbers)
+    and blends four points with validity-weighted bilinear weights in
+    the exact float order the CPU uses. All four corners invalid falls
+    back to the flat ambient colour, exactly as the CPU does.
+    """
+    w, h = consts['resolution']
+    n = float(max(int(rad.get('spacing', 1)), 1))
+    gw, gh = rad['grid']
+    L = ['vec3 hal_rad_lookup()',
+         '{',
+         f'    float fx = float(int(vUV.x * {_f(float(w))})) / {_f(n)};',
+         f'    float fy = float(int(vUV.y * {_f(float(h))})) / {_f(n)};',
+         f'    float gx0 = min(floor(fx), {_f(gw - 1.0)});',
+         f'    float gy0 = min(floor(fy), {_f(gh - 1.0)});',
+         f'    float gx1 = min(gx0 + 1.0, {_f(gw - 1.0)});',
+         f'    float gy1 = min(gy0 + 1.0, {_f(gh - 1.0)});',
+         '    float tx = clamp(fx - gx0, 0.0, 1.0);',
+         '    float ty = clamp(fy - gy0, 0.0, 1.0);',
+         '    vec4 c00 = texelFetch(hal_radfield, '
+         'ivec2(int(gx0), int(gy0)), 0);',
+         '    vec4 c10 = texelFetch(hal_radfield, '
+         'ivec2(int(gx1), int(gy0)), 0);',
+         '    vec4 c01 = texelFetch(hal_radfield, '
+         'ivec2(int(gx0), int(gy1)), 0);',
+         '    vec4 c11 = texelFetch(hal_radfield, '
+         'ivec2(int(gx1), int(gy1)), 0);',
+         '    float w00 = (1.0 - tx) * (1.0 - ty) * c00.a;',
+         '    float w10 = tx * (1.0 - ty) * c10.a;',
+         '    float w01 = (1.0 - tx) * ty * c01.a;',
+         '    float w11 = tx * ty * c11.a;',
+         '    float total = w00 + w10 + w01 + w11;',
+         '    vec3 rgb = c00.rgb * w00 + c10.rgb * w10 '
+         '+ c01.rgb * w01 + c11.rgb * w11;',
+         f'    return (total > 1e-6) ? rgb / max(total, 1e-6) '
+         f': {_v3(tuple(rad["ambient"]))};',
+         '}']
+    return 'uniform sampler2D hal_radfield;\n' + '\n'.join(L) + '\n'
+
+
+def radiosity_field_pass(rad, consts, sides):
+    """The grid pre-pass: one fragment per grid point, gathering at the
+    first covered pixel of its block, row-major -- the CPU's own source
+    rule, so both devices cast identical rays. Writes (irradiance,
+    valid). Drawn once per frame at grid resolution, before every
+    material pass, and bound to them as `hal_radfield`.
+    """
+    from . import gbuffer as GB
+    from .rtrace import INTERSECT_GLSL, TRAVERSE_GLSL
+    w, h = consts['resolution']
+    n = int(max(int(rad.get('spacing', 1)), 1))
+    gw, gh = rad['grid']
+    trav = TRAVERSE_GLSL + INTERSECT_GLSL
+    for cname in ('hal_bvh_side', 'hal_btris_side'):
+        trav = trav.replace(f'uniform float {cname};', '')
+        trav = trav.replace(cname, _f(float(sides[cname])))
+    rad_fns = _rad_function(rad, consts)
+    src = '\n'.join([
+        GB.GLSL,
+        'in vec2 vUV;',
+        'out vec4 Color;',
+        'uniform vec3 hal_eye;',
+        trav,
+        SAMPLING_GLSL,
+        rad_fns,
+        'void main()',
+        '{',
+        f'    int gx = int(vUV.x * {_f(float(gw))});',
+        f'    int gy = int(vUV.y * {_f(float(gh))});',
+        # float flags, no bare bool declarations, no struct assignment:
+        # the front-end runs this too, and it carries neither
+        '    float found = 0.0;',
+        '    float fspx = 0.0;',
+        '    float fspy = 0.0;',
+        # the CPU walks the block ROW-MAJOR (dy outer, dx inner) and
+        # keeps the FIRST covered pixel; same walk, same winner
+        f'    for (int dy = 0; dy < {n}; dy++) {{',
+        f'        for (int dx = 0; dx < {n}; dx++) {{',
+        '            if (found < 0.5) {',
+        f'                int px = gx * {n} + dx;',
+        f'                int py = gy * {n} + dy;',
+        f'                if (px < {int(w)} && py < {int(h)}) {{',
+        '                    vec2 uv = vec2((float(px) + 0.5) '
+        f'/ {_f(float(w))}, (float(py) + 0.5) / {_f(float(h))});',
+        '                    HalcyonFragment c = hal_read_gbuffer(uv);',
+        '                    if (c.covered) {',
+        '                        found = 1.0;',
+        '                        fspx = float(px);',
+        '                        fspy = float(py);',
+        '                    }',
+        '                }',
+        '            }',
+        '        }',
+        '    }',
+        '    if (found < 0.5) {',
+        '        Color = vec4(0.0, 0.0, 0.0, 0.0);',
+        '        return;',
+        '    }',
+        f'    vec2 suv = vec2((fspx + 0.5) / {_f(float(w))}, '
+        f'(fspy + 0.5) / {_f(float(h))});',
+        '    HalcyonFragment f = hal_read_gbuffer(suv);',
+        '    vec3 N = normalize(f.N);',
+        '    Color = vec4(hal_rad_at(f.P, N, int(fspx), int(fspy)), 1.0);',
+        '}'])
+    binds = {'radfield': True, 'size': (int(gw), int(gh)),
+             'samplers': ['hal_gb_ids', 'hal_gb_attrs', 'hal_gb_tris',
+                          'hal_bvh', 'hal_btris', 'hal_circle'],
+             'frame_uniforms': [], 'textures': {}, 'prepasses': ()}
+    return src, binds
+
+
+def _cookie_function(i, spec):
+    """GLSL for one light's projected texture, mirroring cookie_factor.
+
+    The lookup is the CPU's own bilinear texel arithmetic written out --
+    floor, fract, per-texel wrap, two lerps -- reading the uploaded image
+    at texel centres, so both devices filter with the same float math
+    instead of trusting a driver's sampler. SPOT clamps (EXTEND: the cone
+    edge lands on the image edge), SUN wraps (REPEAT: the tiled cloud
+    shadow of the era).
+    """
+    w = float(spec['w'])
+    h = float(spec['h'])
+    if spec['kind'] == 'SUN':
+        wx = f'mod(x0, {_f(w)})'
+        wx1 = f'mod(x0 + 1.0, {_f(w)})'
+        wy = f'mod(y0, {_f(h)})'
+        wy1 = f'mod(y0 + 1.0, {_f(h)})'
+    else:
+        wx = f'clamp(x0, 0.0, {_f(w - 1.0)})'
+        wx1 = f'clamp(x0 + 1.0, 0.0, {_f(w - 1.0)})'
+        wy = f'clamp(y0, 0.0, {_f(h - 1.0)})'
+        wy1 = f'clamp(y0 + 1.0, 0.0, {_f(h - 1.0)})'
+    L = [f'uniform sampler2D hal_cookie{i};',
+         f'vec3 hal_cookie_rgb{i}(vec2 uv)',
+         '{',
+         f'    float fx = uv.x * {_f(w)} - 0.5;',
+         f'    float fy = uv.y * {_f(h)} - 0.5;',
+         '    float x0 = floor(fx);',
+         '    float y0 = floor(fy);',
+         '    float tx = fx - x0;',
+         '    float ty = fy - y0;',
+         f'    float x0w = {wx};',
+         f'    float x1w = {wx1};',
+         f'    float y0w = {wy};',
+         f'    float y1w = {wy1};',
+         f'    vec3 c00 = texture(hal_cookie{i}, vec2((x0w + 0.5) / {_f(w)}, '
+         f'(y0w + 0.5) / {_f(h)})).rgb;',
+         f'    vec3 c10 = texture(hal_cookie{i}, vec2((x1w + 0.5) / {_f(w)}, '
+         f'(y0w + 0.5) / {_f(h)})).rgb;',
+         f'    vec3 c01 = texture(hal_cookie{i}, vec2((x0w + 0.5) / {_f(w)}, '
+         f'(y1w + 0.5) / {_f(h)})).rgb;',
+         f'    vec3 c11 = texture(hal_cookie{i}, vec2((x1w + 0.5) / {_f(w)}, '
+         f'(y1w + 0.5) / {_f(h)})).rgb;',
+         '    vec3 top = c00 + (c10 - c00) * tx;',
+         '    vec3 bot = c01 + (c11 - c01) * tx;',
+         '    return top + (bot - top) * ty;',
+         '}']
+    return '\n'.join(L) + '\n'
+
+
 def _shadow_function(i, meta, consts):
     """GLSL for one light's shadow term, mirroring ShadowMap.lookup exactly.
 
@@ -538,9 +777,147 @@ def _sky_env_lines(env_spec):
     return L
 
 
-#: filters the manual sampler reproduces. TRILINEAR needs a mip footprint the
-#: deferred pass does not have, and the N64 three-point filter is still CPU
-SUPPORTED_TEX_FILTERS = ('NEAREST', 'BILINEAR')
+#: filters the manual sampler reproduces in every pass variant. TRILINEAR
+#: and anisotropy additionally need the per-pixel footprint field and the
+#: mip atlas, which the FRAME and vertex-rate passes carry (hal_uvgrad);
+#: secondary passes mirror the CPU's ray hits, which have no footprint
+#: and sample the top level. N64 3-point needs no footprint at all.
+SUPPORTED_TEX_FILTERS = ('NEAREST', 'BILINEAR', 'TRILINEAR', 'N64_3POINT')
+
+
+def mip_atlas(tex):
+    """(atlas (H2,W,4) float32, [(y0, w, h) per level]) from tex's OWN mips.
+
+    The CPU's build_mips output packed in a vertical stack -- the driver
+    samples the very texels the CPU filters, so the two trilinears can
+    only disagree by lerp rounding. Level 0 sits at y0 = 0.
+    """
+    import numpy as np
+    mips = tex.build_mips()
+    W = int(tex.width)
+    H2 = int(sum(m.shape[0] for m in mips))
+    atlas = np.zeros((H2, W, 4), np.float32)
+    levels = []
+    y = 0
+    for m in mips:
+        h, w = m.shape[:2]
+        atlas[y:y + h, :w] = m
+        levels.append((float(y), float(w), float(h)))
+        y += h
+    return atlas, levels
+
+
+def _wrap_dyn(var, dim, wrap):
+    """A wrap expression against a RUNTIME dimension (mip levels vary)."""
+    if wrap == 'REPEAT':
+        return f'({var} - floor({var} / {dim}) * {dim})'
+    if wrap == 'MIRROR':
+        return (f'(mod({var}, 2.0 * {dim}) < {dim} ? '
+                f'mod({var}, 2.0 * {dim}) : '
+                f'2.0 * {dim} - 1.0 - mod({var}, 2.0 * {dim}))')
+    return f'clamp({var}, 0.0, {dim} - 1.0)'          # EXTEND and CLIP
+
+
+def _mip_sampler(name, tex, wrap, levels, aniso, bias):
+    """GLSL for one TRILINEAR (optionally anisotropic) footprint sampler.
+
+    Mirrors Texture._sample_trilinear and _sample_aniso line for line:
+    compute_lod from the hal_uvgrad field (the CPU's OWN derivatives,
+    uploaded), a per-level manual bilinear inside the atlas stack, the
+    a + (b - a) * frac level blend, and -- under anisotropy -- the mip
+    level of the MINOR footprint axis with uniform trilinear taps along
+    the major. The level table is a select ladder: no arrays, nothing
+    the front-end cannot run.
+    """
+    w0, h0 = float(tex.width), float(tex.height)
+    n = len(levels)
+    L = [f'uniform sampler2D {name};',
+         f'vec4 hal_afetch_{name}(float x, float y)',
+         '{',
+         f'    return texture({name}, vec2((x + 0.5) / {_f(w0)}, '
+         f'(y + 0.5) / {_f(float(sum(lv[2] for lv in levels)))}));',
+         '}',
+         f'vec3 hal_mipof_{name}(float l)',
+         '{']
+    for k, (y0, lw, lh) in enumerate(levels[:-1]):
+        L.append(f'    if (l < {_f(k + 0.5)}) '
+                 f'{{ return vec3({_f(y0)}, {_f(lw)}, {_f(lh)}); }}')
+    y0, lw, lh = levels[-1]
+    L += [f'    return vec3({_f(y0)}, {_f(lw)}, {_f(lh)});',
+          '}',
+          f'vec4 hal_lvl_{name}(vec2 uv, float y0, float lw, float lh)',
+          '{',
+          '    float fx = uv.x * lw - 0.5;',
+          '    float fy = uv.y * lh - 0.5;',
+          '    float x0 = floor(fx);',
+          '    float y0i = floor(fy);',
+          '    float tx = fx - x0;',
+          '    float ty = fy - y0i;',
+          '    float x1 = x0 + 1.0;',
+          '    float y1 = y0i + 1.0;',
+          f'    float wx0 = {_wrap_dyn("x0", "lw", wrap)};',
+          f'    float wx1 = {_wrap_dyn("x1", "lw", wrap)};',
+          f'    float wy0 = {_wrap_dyn("y0i", "lh", wrap)};',
+          f'    float wy1 = {_wrap_dyn("y1", "lh", wrap)};',
+          f'    vec4 c00 = hal_afetch_{name}(wx0, y0 + wy0);',
+          f'    vec4 c10 = hal_afetch_{name}(wx1, y0 + wy0);',
+          f'    vec4 c01 = hal_afetch_{name}(wx0, y0 + wy1);',
+          f'    vec4 c11 = hal_afetch_{name}(wx1, y0 + wy1);',
+          '    vec4 top = c00 + (c10 - c00) * tx;',
+          '    vec4 bot = c01 + (c11 - c01) * tx;',
+          '    return top + (bot - top) * ty;',
+          '}',
+          f'vec4 hal_trilerp_{name}(vec2 uv, float lod)',
+          '{',
+          f'    float l = clamp(lod, 0.0, {_f(n - 1.0)});',
+          '    float l0 = floor(l);',
+          '    float f = l - l0;',
+          f'    vec3 A = hal_mipof_{name}(l0);',
+          f'    vec3 B = hal_mipof_{name}(min(l0 + 1.0, {_f(n - 1.0)}));',
+          f'    vec4 a = hal_lvl_{name}(uv, A.x, A.y, A.z);',
+          f'    vec4 b = hal_lvl_{name}(uv, B.x, B.y, B.z);',
+          '    return a + (b - a) * f;',
+          '}',
+          f'vec4 hal_sample_{name}(vec2 uv)',
+          '{',
+          '    vec4 g = texture(hal_uvgrad, vUV);']
+    if int(aniso) > 1:
+        A = float(int(aniso))
+        L += [
+            # exactly _sample_aniso: screen-x/-y footprints in texels
+            f'    float lx = sqrt((g.x * {_f(w0)}) * (g.x * {_f(w0)}) + '
+            f'(g.z * {_f(h0)}) * (g.z * {_f(h0)}));',
+            f'    float ly = sqrt((g.y * {_f(w0)}) * (g.y * {_f(w0)}) + '
+            f'(g.w * {_f(h0)}) * (g.w * {_f(h0)}));',
+            '    float mx = (lx >= ly) ? 1.0 : 0.0;',
+            '    float major = (mx > 0.5) ? lx : ly;',
+            '    float minor = max((mx > 0.5) ? ly : lx, 1e-6);',
+            f'    float ratio = clamp(major / minor, 1.0, {_f(A)});',
+            f'    float lod = log2(max(major / ratio, 1e-6)) + {_f(bias)};',
+            '    float axu = (mx > 0.5) ? g.x : g.y;',
+            '    float axv = (mx > 0.5) ? g.z : g.w;',
+            '    vec4 acc = vec4(0.0);',
+            f'    for (int k = 0; k < {int(aniso)}; k++) {{',
+            f'        float t = (float(k) + 0.5) / {_f(A)} - 0.5;',
+            f'        acc = acc + hal_trilerp_{name}(uv + vec2(axu, axv) '
+            f'* t, lod);',
+            '    }',
+            f'    vec4 c = acc / {_f(A)};']
+    else:
+        L += [
+            # exactly compute_lod: per-axis texel footprints, max, log2
+            f'    float dx = sqrt((g.x * {_f(w0)}) * (g.x * {_f(w0)}) + '
+            f'(g.y * {_f(h0)}) * (g.y * {_f(h0)}));',
+            f'    float dy = sqrt((g.z * {_f(w0)}) * (g.z * {_f(w0)}) + '
+            f'(g.w * {_f(h0)}) * (g.w * {_f(h0)}));',
+            '    float rho = max(max(dx, dy), 1e-6);',
+            f'    vec4 c = hal_trilerp_{name}(uv, log2(rho) '
+            f'+ {_f(bias)});']
+    if wrap == 'CLIP':
+        L.append('    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || '
+                 'uv.y > 1.0) { c = vec4(0.0); }')
+    L += ['    return c;', '}']
+    return '\n'.join(L) + '\n'
 
 
 def _block(pieces):
@@ -596,6 +973,33 @@ def _texture_sampler(name, tex, filt, wrap):
               f'    x = {_wrap_expr("x", w, wrap)};',
               f'    y = {_wrap_expr("y", h, wrap)};',
               f'    vec4 c = hal_fetch_{name}(x, y);']
+    elif filt == 'N64_3POINT':
+        # exactly Texture._sample_3point: the triangular filter picks the
+        # dominant corner and blends along the two edges -- three taps,
+        # the N64's own arithmetic, no footprint needed
+        L += [f'    float fx = uv.x * {_f(w)} - 0.5;',
+              f'    float fy = uv.y * {_f(h)} - 0.5;',
+              '    float x0 = floor(fx);',
+              '    float y0 = floor(fy);',
+              '    float tx = fx - x0;',
+              '    float ty = fy - y0;',
+              '    float x1 = x0 + 1.0;',
+              '    float y1 = y0 + 1.0;',
+              f'    float wx0 = {_wrap_expr("x0", w, wrap)};',
+              f'    float wx1 = {_wrap_expr("x1", w, wrap)};',
+              f'    float wy0 = {_wrap_expr("y0", h, wrap)};',
+              f'    float wy1 = {_wrap_expr("y1", h, wrap)};',
+              f'    vec4 c00 = hal_fetch_{name}(wx0, wy0);',
+              f'    vec4 c10 = hal_fetch_{name}(wx1, wy0);',
+              f'    vec4 c01 = hal_fetch_{name}(wx0, wy1);',
+              f'    vec4 c11 = hal_fetch_{name}(wx1, wy1);',
+              '    float up = ((tx + ty) > 1.0) ? 1.0 : 0.0;',
+              '    vec4 a = (up > 0.5) ? c11 : c00;',
+              '    float s = (up > 0.5) ? (1.0 - ty) : tx;',
+              '    float t = (up > 0.5) ? (1.0 - tx) : ty;',
+              '    vec4 b = (up > 0.5) ? c01 : c10;',
+              '    vec4 cc = (up > 0.5) ? c10 : c01;',
+              '    vec4 c = a + (b - a) * s + (cc - a) * t;']
     else:
         L += [f'    float fx = uv.x * {_f(w)} - 0.5;',
               f'    float fy = uv.y * {_f(h)} - 0.5;',
@@ -648,11 +1052,21 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None):
     col = _v3(getattr(light, 'color', (1, 1, 1)))
     energy = float(getattr(light, 'energy', 1.0))
     lines = ['    {']
+    ck = (consts.get('cookies') or {}).get(i)
     if kind == 'SUN':
         d = np.asarray(light.direction, np.float32)
         d = d / max(float(np.linalg.norm(d)), 1e-9)
         lines += [f'    vec3 L = {_v3(-d)};',
                   f'    vec3 rad = {col} * {_f(energy)};']
+        if ck is not None:
+            # exactly cookie_factor's SUN branch: world position projected
+            # on the light's own axes, one tile per cookie_scale units
+            lines += [
+                f'    vec2 ckuv = vec2(dot(P, {_v3(ck["side"])}) / '
+                f'{_f(ck["scale"])}, dot(P, {_v3(ck["up"])}) / '
+                f'{_f(ck["scale"])});',
+                f'    rad = rad * (vec3(1.0) + (hal_cookie_rgb{i}(ckuv) '
+                f'- vec3(1.0)) * {_f(ck["strength"])});']
     else:
         lines += [f'    vec3 delta = {_v3(light.position)} - P;',
                   '    float dist = max(length(delta), 1e-6);',
@@ -673,6 +1087,22 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None):
                 f'    float spot_t = clamp((cosang - {_f(outer)}) / '
                 f'{_f(max(inner - outer, 1e-5))}, 0.0, 1.0);',
                 '    rad = rad * (spot_t * spot_t);']
+            if ck is not None:
+                # exactly cookie_factor's SPOT branch: light->surface
+                # direction in the light's own frame, the full cone
+                # spanning the image
+                lines += [
+                    '    vec3 ckd = -L;',
+                    f'    float ckz = dot(ckd, {_v3(ck["fwd"])});',
+                    '    if (ckz > 1e-6) {',
+                    f'    float cks = max(ckz, 1e-6) * '
+                    f'{_f(2.0 * ck["tanh"])};',
+                    f'    vec2 ckuv = vec2(dot(ckd, {_v3(ck["side"])}) '
+                    f'/ cks + 0.5, dot(ckd, {_v3(ck["up"])}) / cks '
+                    f'+ 0.5);',
+                    f'    rad = rad * (vec3(1.0) + (hal_cookie_rgb{i}'
+                    f'(ckuv) - vec3(1.0)) * {_f(ck["strength"])});',
+                    '    }']
     if getattr(light, 'negative', False):
         lines.append('    rad = -rad;')
     lines.append('    vec4 ds = hal_evaluate(hal_model_i, s, N, L, V);')
@@ -738,6 +1168,14 @@ PER_PIXEL_SOCKETS = {
     'Toon Size': ('toon_size', 'float'),
     'Toon Smooth': ('toon_smooth', 'float'),
     'Self-Illumination': ('emission', 'vec3'),
+    # the matcap COLOUR is a chain by design -- the documented workflow
+    # is an Image Texture through Matcap Coordinates -- and it refused
+    # from the day the override was ported, because only this table
+    # grants per-pixel rights. The field found it the hard way: one
+    # 'Eyes' material put a whole 640x640 frame on the CPU, and the
+    # radiosity gather with it. The BLEND stays baked (varying blend
+    # still refuses by name).
+    'Matcap': ('matcap', 'vec3'),
 }
 
 
@@ -816,6 +1254,8 @@ def _assemble_height_pass(graph, mat_id, bump_node, consts, textures,
     em = Emitter(graph or {})
     em.frame_mode = True
     em.resolution = consts.get('resolution')
+    em.camera = consts.get('camera')
+    em.uv_names = tuple(consts.get('uv_names') or ())
     em.programs = programs if programs is not None else {}
     try:
         expr = em.input(bump_node, 'Height', 'float')
@@ -861,7 +1301,17 @@ def _assemble_height_pass(graph, mat_id, bump_node, consts, textures,
                                             'REPEAT')
         if filt not in SUPPORTED_TEX_FILTERS:
             return None, (f'the {filt} texture filter is not in the '
-                          f'deferred pass yet (Nearest and Bilinear are)')
+                          f'deferred pass yet')
+        if filt == 'TRILINEAR':
+            # the height pre-pass has no footprint field; the CPU height
+            # image is exact by construction, so exotic-filtered heights
+            # take that path instead of a wrong mip
+            return '__CPU__', {'cpu': True, 'node': bump_node.get('id'),
+                               'why': 'a TRILINEAR-filtered height chain '
+                                      'evaluates on the CPU into the '
+                                      'height pre-pass',
+                               'samplers': [], 'textures': {},
+                               'frame_uniforms': [], 'uses_screen': False}
         tex_fns.append(_texture_sampler(sname, tex, filt, wrap))
         tex_binds[sname] = key
         replacements.append((f'texture({sname},', f'hal_sample_{sname}('))
@@ -911,6 +1361,20 @@ void main()
     HalcyonFragment f = hal_read_gbuffer(vUV);
     vec4 td = hal_tri_data(max(f.tri, 0.0));
     float keep = (f.covered && abs(td.x - {_f(mat_id)}) < 0.5) ? 1.0 : 0.0;
+    // EARLY OUT on the ownership mask. Every material pass draws the
+    // full screen; this shader used to shade EVERY pixel and multiply
+    // by keep at the end -- harmless while shading was ALU, catastrophic
+    // once it carried BVH loops: an M-material frame ran the radiosity
+    // gather, the AO rays and every ray-shadow tap M times per pixel.
+    // The field measured it: 5.0s of a 5.8s frame. A keep=0 pixel wrote
+    // exactly (0,0,0,0) before and writes exactly (0,0,0,0) now, so the
+    // picture cannot move by a bit; nothing downstream reads implicit
+    // derivatives (mips ride the explicit footprint field), so the
+    // divergent return is safe by construction.
+    if (keep < 0.5) {{
+        Color = vec4(0.0, 0.0, 0.0, 0.0);
+        return;
+    }}
     vec3 P = f.P;
     vec3 V = normalize(hal_eye - P);
     vec3 N0 = normalize(f.N);
@@ -918,6 +1382,7 @@ void main()
     vec3 hal_N = N0;
     vec3 hal_V = V;
     vec2 hal_uv = f.uv;
+    vec2 hal_uv2 = f.uv2;
 """]
     if gen_line:
         parts.append(gen_line)
@@ -933,8 +1398,19 @@ void main()
 
 def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
                    shadows=None, textures=None, programs=None,
-                   secondary=False, layer=False):
+                   secondary=False, layer=False, vertex_rate=None):
     """One material's full-screen deferred pass, as complete GLSL.
+
+    `vertex_rate` ('VERTEX' or 'FACE') assembles the Gouraud/flat
+    variant: NO lighting is emitted at all. The CPU lights the corners
+    of every triangle over a white surface -- shadows, rays, env, the
+    model's own formula, everything shade_batch runs -- and the pass
+    fetches the three corner colours from the `hal_vlight` texture,
+    interpolates them by the G-buffer's own barycentrics, and
+    multiplies by the per-pixel albedo chain. MODULATE, the
+    fixed-function combiner: the reason a Gouraud-shaded period model
+    has soft banded light over a sharp texture, now with the driver
+    doing the per-pixel half and the CPU the per-vertex half.
 
     `secondary=True` assembles the pass for REFLECTION HIT points instead
     of camera fragments. Almost nothing changes -- the CPU shades hits
@@ -968,6 +1444,8 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     em.frame_mode = True
     em.resolution = consts.get('resolution')
     em.secondary = secondary
+    em.camera = consts.get('camera')
+    em.uv_names = tuple(consts.get('uv_names') or ())
     # {} is authoritative "nothing compiled" (code nodes read as zeros, the
     # CPU's own answer); the frame path always knows, so it never passes None
     em.programs = programs if programs is not None else {}
@@ -1018,6 +1496,8 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
                           f"in the deferred pass yet (FLAT is)")
     tex_fns = []
     tex_binds = {}
+    tex_binds_mip = {}
+    needs_uvgrad = []
     src = body + ('\n' if body else '')
     replacements = []
     for meta in em.samplers:
@@ -1045,9 +1525,36 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
                                             'REPEAT')
         if filt not in SUPPORTED_TEX_FILTERS:
             return None, (f'the {filt} texture filter is not in the '
-                          f'deferred pass yet (Nearest and Bilinear are)')
-        tex_fns.append(_texture_sampler(sname, tex, filt, wrap))
-        tex_binds[sname] = key
+                          f'deferred pass yet')
+        if filt == 'TRILINEAR':
+            # the footprint rules, exactly the CPU's: a raw flat UV
+            # lookup on a SCREEN point filters with the mip footprint; a
+            # linked Vector chain, a coded-shader image, or a ray hit
+            # (secondary pass -- no pixel footprint) samples the top
+            # level, which is what lod=None does on the CPU
+            fp = bool(meta.get('footprint')) and not meta.get('code') \
+                and not secondary
+            if fp and layer:
+                return None, ('the TRILINEAR footprint is not in the '
+                              'layer passes yet (the opaque frame has '
+                              'it); this glass shades on the CPU')
+            if fp:
+                if not needs_uvgrad:
+                    tex_fns.append('uniform sampler2D hal_uvgrad;\n')
+                _atlas_px, levels = mip_atlas(tex)
+                tex_fns.append(_mip_sampler(
+                    sname, tex, wrap, levels,
+                    int(consts.get('tex_aniso', 1) or 1),
+                    float(consts.get('tex_mip_bias', 0.0) or 0.0)))
+                tex_binds_mip[sname] = key
+                needs_uvgrad.append(sname)
+            else:
+                tex_fns.append(_texture_sampler(sname, tex, 'BILINEAR',
+                                                wrap))
+                tex_binds[sname] = key
+        else:
+            tex_fns.append(_texture_sampler(sname, tex, filt, wrap))
+            tex_binds[sname] = key
         # the emitter sampled with texture(); the frame pass samples with
         # the arithmetic above, so the same pixel comes back on any driver
         replacements.append((f'texture({sname},', f'hal_sample_{sname}('))
@@ -1147,43 +1654,99 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
         env_lines.append(f'    total += hal_env * ({_f(refl)} * s.specular'
                          f' * {rcol});')
 
+    vlight_fns = ''
+    vlight_spec = None
+    if vertex_rate:
+        tcount = int(consts.get('tri_count', 0))
+        if tcount <= 0:
+            return None, ('vertex-rate lighting needs the triangle count '
+                          'the caller did not supply')
+        import math
+        vside = int(math.ceil(math.sqrt(float(max(tcount * 3, 1)))))
+        # the same fetch-by-arithmetic every packed texture here uses:
+        # texel centres, side baked as a literal
+        vlight_fns = (
+            'uniform sampler2D hal_vlight;\n'
+            'vec3 hal_vlight_fetch(float i)\n'
+            '{\n'
+            f'    float x = mod(i, {_f(float(vside))});\n'
+            f'    float y = floor(i / {_f(float(vside))});\n'
+            '    return texture(hal_vlight, (vec2(x, y) + vec2(0.5)) / '
+            f'{_f(float(vside))}).rgb;\n'
+            '}\n')
+        vlight_spec = {'rate': str(vertex_rate), 'side': int(vside),
+                       'mat': int(mat_id)}
+        env_lines = []                     # the corners carry the env term
+
     two_sided = bool(consts.get('two_sided', True))
     shadows = shadows or [None] * len(lights)
     shadow_fns = []
     samplers = []
+    if vertex_rate:
+        # the pass lights nothing, so it carries none of the lighting
+        # support: no shadow taps, no BVH traversal, no AO -- all of it
+        # already lives in the CPU-lit corner values
+        shadows = [None] * len(lights)
     ray_any = any(s is not None and s.get('ray') for s in shadows)
     soft_any = any(s is not None and s.get('ray')
                    and int(s.get('samples', 1)) > 1 for s in shadows)
-    ao_spec = consts.get('ao')
-    if ray_any or ao_spec:
+    ao_spec = None if vertex_rate else consts.get('ao')
+    rad_spec = None if vertex_rate else consts.get('radiosity')
+    # interpolated mode: SCREEN passes read the grid field (a texel
+    # fetch), so they carry no gather and no traversal of their own;
+    # secondary passes gather fully -- a traced hit has no place in a
+    # screen-space cache, exactly as the CPU shades its hits
+    rad_field = bool(rad_spec) and not secondary and \
+        int(rad_spec.get('spacing', 1)) > 1
+    rad_gather = bool(rad_spec) and not rad_field
+    if ray_any or ao_spec or rad_gather:
         # the shared traversal, once, ahead of every hal_shadow_vis (and
-        # hal_ao) that calls it. The texture sides bake as literals: the
-        # plan signature fingerprints the mesh, so a changed BVH re-plans
-        # and re-bakes.
+        # hal_ao / hal_rad) that calls it. The texture sides bake as
+        # literals: the plan signature fingerprints the mesh, so a
+        # changed BVH re-plans and re-bakes.
         sides = consts.get('bvh_sides') or {}
         if 'hal_bvh_side' not in sides or 'hal_btris_side' not in sides:
             return None, 'ray shadows need the BVH textures the caller ' \
                          'did not pack'
-        from .rtrace import TRAVERSE_GLSL
+        from .rtrace import INTERSECT_GLSL, TRAVERSE_GLSL
         trav = TRAVERSE_GLSL
+        if rad_gather:
+            # the gather needs the CLOSEST hit (id + t), not just
+            # any-hit occlusion; the intersect kernel rides the same
+            # texel fetchers the traversal just declared
+            trav = trav + INTERSECT_GLSL
         for cname in ('hal_bvh_side', 'hal_btris_side'):
             trav = trav.replace(f'uniform float {cname};', '')
             trav = trav.replace(cname, _f(float(sides[cname])))
         shadow_fns.append(trav)
         samplers += ['hal_bvh', 'hal_btris']
-    if soft_any or ao_spec:
+    if soft_any or ao_spec or rad_gather:
         # the deterministic-sampling primitives: the pattern hash under a
         # sampling name (a material may inline the pattern library too),
         # and the shared unit-circle table
         shadow_fns.append(SAMPLING_GLSL)
         samplers.append('hal_circle')
-    if ao_spec:
+    if ao_spec and not rad_spec:
+        # radiosity supersedes plain AO exactly as light_surface does:
+        # the gather is occlusion-aware by construction
         shadow_fns.append(_ao_function(ao_spec, consts))
+    if rad_gather:
+        shadow_fns.append(_rad_function(rad_spec, consts))
+    if rad_field:
+        shadow_fns.append(_rad_lookup_function(rad_spec, consts))
+        samplers.append('hal_radfield')
     for i, smeta in enumerate(shadows):
         if smeta is not None:
             shadow_fns.append(_shadow_function(i, smeta, consts))
             if not smeta.get('ray'):
                 samplers.append(f'hal_shadow{i}')
+    if not vertex_rate:
+        # projected light textures: one lookup function per cookie light.
+        # A vertex-rate pass skips them for the same reason it skips the
+        # whole loop -- the cookie is already IN the CPU-lit corner values
+        for i, ckspec in sorted((consts.get('cookies') or {}).items()):
+            shadow_fns.append(_cookie_function(i, ckspec))
+            samplers.append(f'hal_cookie{i}')
     frame_unis = sorted(em.frame_uniforms)
     extra_unis = ''.join(f'uniform float {u};\n' for u in frame_unis)
     # the interface declarations come FIRST: the sampling helpers and the
@@ -1202,12 +1765,27 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
              'uniform vec3 hal_eye;\n'
              + extra_unis)
     parts = [GS.GLSL, GS.DISPATCH, GB.GLSL, decls, gen_fns,
-             _block(inline_parts), _block(tex_fns), _block(shadow_fns), f"""
+             _block(inline_parts), _block(tex_fns), _block(shadow_fns),
+             vlight_fns, f"""
 void main()
 {{
     HalcyonFragment f = hal_read_gbuffer(vUV);
     vec4 td = hal_tri_data(max(f.tri, 0.0));
     float keep = (f.covered && abs(td.x - {_f(mat_id)}) < 0.5) ? 1.0 : 0.0;
+    // EARLY OUT on the ownership mask. Every material pass draws the
+    // full screen; this shader used to shade EVERY pixel and multiply
+    // by keep at the end -- harmless while shading was ALU, catastrophic
+    // once it carried BVH loops: an M-material frame ran the radiosity
+    // gather, the AO rays and every ray-shadow tap M times per pixel.
+    // The field measured it: 5.0s of a 5.8s frame. A keep=0 pixel wrote
+    // exactly (0,0,0,0) before and writes exactly (0,0,0,0) now, so the
+    // picture cannot move by a bit; nothing downstream reads implicit
+    // derivatives (mips ride the explicit footprint field), so the
+    // divergent return is safe by construction.
+    if (keep < 0.5) {{
+        Color = vec4(0.0, 0.0, 0.0, 0.0);
+        return;
+    }}
     vec3 P = f.P;
     vec3 V = normalize(hal_eye - P);
     vec3 N0 = normalize(f.N);
@@ -1215,6 +1793,7 @@ void main()
     vec3 hal_N = N0;
     vec3 hal_V = V;
     vec2 hal_uv = f.uv;
+    vec2 hal_uv2 = f.uv2;
 """]
     if gen_line:
         parts.append(gen_line)
@@ -1255,43 +1834,108 @@ void main()
         ' : vec3(1.0, 0.0, 0.0);',
         '    s.tangent = normalize(cross(up, Nsurf));',
         '    s.bitangent = cross(Nsurf, s.tangent);',
+    ]
+    # Anisotropic Rotation turns the frame, exactly _aniso_frame's rotation
+    # -- the term the GLSL silently dropped until the feature matrix put
+    # every model on the driver and ANISOTROPIC came back 0.0627 off (405
+    # px): the CPU's highlight sat 72 degrees from the GPU's. A baked
+    # rotation lands as cos/sin LITERALS (same bits, no driver trig); a
+    # per-pixel chain rotates with the driver's own cos/sin, which is
+    # smooth (no decision cliff) and lands inside the deferred bar.
+    rot_baked = float(bake.get('aniso_rot', 0.0) or 0.0)
+    if 'aniso_rot' in perpix_exprs:
+        lines += [
+            '    {',
+            '    float hal_ar = s.aniso_rot * 6.2831853071795862;',
+            '    float hal_ca = cos(hal_ar);',
+            '    float hal_sa = sin(hal_ar);',
+            '    vec3 hal_t2 = s.tangent * hal_ca + s.bitangent * hal_sa;',
+            '    s.bitangent = normalize(s.tangent * (-hal_sa) '
+            '+ s.bitangent * hal_ca);',
+            '    s.tangent = normalize(hal_t2);',
+            '    }',
+        ]
+    elif abs(rot_baked) > 1e-6:
+        import numpy as _np
+        ca = float(_np.cos(rot_baked * 2.0 * _np.pi))
+        sa = float(_np.sin(rot_baked * 2.0 * _np.pi))
+        lines += [
+            '    {',
+            f'    vec3 hal_t2 = s.tangent * {_f(ca)} + s.bitangent '
+            f'* {_f(sa)};',
+            f'    s.bitangent = normalize(s.tangent * {_f(-sa)} '
+            f'+ s.bitangent * {_f(ca)});',
+            '    s.tangent = normalize(hal_t2);',
+            '    }',
+        ]
+    lines += [
         f'    s.diffuse = {base};',
         (f'    s.specular = {perpix_exprs["specular"]};'
          if 'specular' in perpix_exprs else
          f'    s.specular = {_v3(bake.get("specular", (1, 1, 1)))};'),
-        f'    vec3 total = s.diffuse * ({_v3(consts["ambient_color"])}'
-        f' * {_f(bake.get("ambient", 1.0))});',
     ]
-    if consts.get('ao'):
+    if vertex_rate:
+        # Gouraud/flat: fetch the three CPU-lit corners of THIS pixel's
+        # triangle, interpolate by the G-buffer's own perspective
+        # barycentrics (the CPU interpolates the same ones), multiply by
+        # the per-pixel albedo. Everything else the pixel path emits
+        # below -- ambient, lights, clamp, emission, the silhouette
+        # cheats, matcap, backface, env -- is already IN the corner
+        # values, computed by the renderer's own CPU code
+        lines += [
+            '    float hal_vt = max(f.tri, 0.0) * 3.0;',
+            '    vec3 hal_vl = hal_vlight_fetch(hal_vt) * f.bary.x',
+            '        + hal_vlight_fetch(hal_vt + 1.0) * f.bary.y',
+            '        + hal_vlight_fetch(hal_vt + 2.0) * f.bary.z;',
+            '    vec3 total = s.diffuse * hal_vl;',
+        ]
+    elif rad_field:
+        # interpolated radiosity: the pass blends the grid field the
+        # pre-pass gathered -- a texel fetch where the full mode walks
+        # the BVH
+        lines.append(f'    vec3 total = s.diffuse * (hal_rad_lookup()'
+                     f' * {_f(bake.get("ambient", 1.0))});')
+    elif rad_spec:
+        # the Radiosity checkbox: gathered ambient replaces the flat
+        # term, exactly light_surface's branch -- and plain AO with it
+        lines.append(f'    vec3 total = s.diffuse * (hal_rad(P, N)'
+                     f' * {_f(bake.get("ambient", 1.0))});')
+    else:
+        lines.append(
+            f'    vec3 total = s.diffuse * ({_v3(consts["ambient_color"])}'
+            f' * {_f(bake.get("ambient", 1.0))});')
+    if ao_spec and not rad_spec:
         # exactly light_surface's order: ambient occlusion scales the
         # ambient term (with the post-flip N) before any light adds
         lines.append('    total *= hal_ao(P, N);')
-    if float(bake.get('sheen', 0.0)) > 1e-4:
+    if not vertex_rate and float(bake.get('sheen', 0.0)) > 1e-4:
         lines.append('    float hal_edge_vn = clamp(1.0 - abs(dot(N, V)), '
                      '0.0, 1.0);')
-    for i, light in enumerate(lights):
+    for i, light in enumerate(() if vertex_rate else lights):
         lines += _one_light_source(i, light, consts,
                                    shadowed=shadows[i], bake=bake)
-    if consts.get('clamp_specular', True):
+    if not vertex_rate and consts.get('clamp_specular', True):
         lines.append('    total = min(total, vec3(64.0));')
-    if 'emission' in perpix_exprs:
-        lines.append(f'    total = total + {perpix_exprs["emission"]};')
-    else:
-        lines.append(
-            f'    total = total + {_v3(bake.get("emission", (0, 0, 0)))};')
+    if not vertex_rate:
+        if 'emission' in perpix_exprs:
+            lines.append(
+                f'    total = total + {perpix_exprs["emission"]};')
+        else:
+            lines.append(f'    total = total + '
+                         f'{_v3(bake.get("emission", (0, 0, 0)))};')
     # the era's silhouette cheats, exactly as apply_surface_effects: applied
     # after emission, outside the reflectance model, the same on every model
-    if float(bake.get('fresnel', 0.0)) > 1e-4 or \
-            float(bake.get('rim', 0.0)) > 1e-4:
+    if not vertex_rate and (float(bake.get('fresnel', 0.0)) > 1e-4 or
+                            float(bake.get('rim', 0.0)) > 1e-4):
         lines.append('    float hal_facing = clamp(abs(dot(N, V)), 0.0, 1.0);')
         lines.append('    float hal_sil = 1.0 - hal_facing;')
-    if float(bake.get('fresnel', 0.0)) > 1e-4:
+    if not vertex_rate and float(bake.get('fresnel', 0.0)) > 1e-4:
         fp = max(float(bake.get('fresnel_power', 3.0)), 0.01)
         lines.append(
             f'    total += {_v3(bake.get("fresnel_color", (1, 1, 1)))}'
             f' * (pow(hal_sil, {_f(fp)}) * {_f(bake["fresnel"])}'
             f' * {_f(bake.get("specular_level", 0.5))});')
-    if float(bake.get('rim', 0.0)) > 1e-4:
+    if not vertex_rate and float(bake.get('rim', 0.0)) > 1e-4:
         rp = max(float(bake.get('rim_power', 3.0)), 0.01)
         lines.append(
             f'    total += {_v3(bake.get("rim_color", (1, 1, 1)))}'
@@ -1299,9 +1943,13 @@ void main()
     # matcap: the whole lit result lerps toward one colour, exactly as
     # apply_surface_effects -- after fresnel and rim, before the backface
     mk = min(max(float(bake.get('matcap_blend', 0.0)), 0.0), 1.0)
+    if vertex_rate:
+        mk = 0.0                    # in the corners already
     if mk > 1e-4:
+        mc = perpix_exprs.get('matcap',
+                              _v3(bake.get('matcap', (0, 0, 0))))
         lines.append(f'    total = total * {_f(1.0 - mk)} + '
-                     f'{_v3(bake.get("matcap", (0, 0, 0)))} * {_f(mk)};')
+                     f'({mc}) * {_f(mk)};')
     # the backface override: the rasteriser decides front by projected
     # winding, and for a perspective camera that is exactly the plane-side
     # test against the eye -- computed from the corner positions the
@@ -1309,6 +1957,8 @@ void main()
     kb = min(max(float(bake.get('backface_mix', 0.0)), 0.0), 1.0)
     if secondary:
         kb = 0.0                   # trace() shades hits with front=None
+    if vertex_rate:
+        kb = 0.0                   # in the corners already
     if kb > 1e-4:
         lines += [
             '    vec3 hal_bf_p0 = hal_fetch_attr(f.tri, 0, 0).xyz;',
@@ -1354,11 +2004,18 @@ void main()
         lines.append('    Color = vec4(total, 1.0) * keep;')
     lines.append('}')
     parts.append('\n'.join(lines))
-    return ''.join(parts), {'samplers': samplers + sorted(tex_binds)
-                            + [p[0] for p in prepasses],
-                            'textures': tex_binds,
-                            'frame_uniforms': frame_unis,
-                            'prepasses': prepasses,
-                            'uses_screen': em.used_screen
-                            or any(p[2].get('uses_screen')
-                                   for p in prepasses)}
+    info = {'samplers': samplers
+            + (['hal_vlight'] if vlight_spec is not None else [])
+            + sorted(tex_binds) + sorted(tex_binds_mip)
+            + (['hal_uvgrad'] if needs_uvgrad else [])
+            + [p[0] for p in prepasses],
+            'textures': tex_binds,
+            'textures_mip': tex_binds_mip,
+            'needs_uvgrad': bool(needs_uvgrad),
+            'frame_uniforms': frame_unis,
+            'prepasses': prepasses,
+            'uses_screen': em.used_screen
+            or any(p[2].get('uses_screen') for p in prepasses)}
+    if vlight_spec is not None:
+        info['vlight'] = vlight_spec
+    return ''.join(parts), info

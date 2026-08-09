@@ -556,8 +556,16 @@ def upscale(rgb, st):
 
 
 def _gpu_stage(name, rgb, st):
-    """Ask the GPU chain for a stage. None means the CPU one runs."""
-    if str(getattr(st, 'render_device', 'CPU')).upper() != 'GPU' and \
+    """Ask the GPU chain for a stage. None means the CPU one runs.
+
+    The gate is DEVICE first: the CPU/GPU switch must mean what it says.
+    The original condition was `device != GPU AND not gpu_post` -- with
+    gpu_post defaulting on, a CPU-device render fell through and ran its
+    post on the driver whenever one was present, silently (the field's
+    CPU renders carried GPU dither, up to 0.032 from the CPU chain).
+    Found by the device-switch audit; now the switch gates every stage.
+    """
+    if str(getattr(st, 'render_device', 'CPU')).upper() != 'GPU' or \
             not getattr(st, 'gpu_post', False):
         return None
     try:
@@ -590,7 +598,7 @@ def fit_to(rgb, size):
 
 
 def process(image, st, frame=0, seed=0, target_size=None, allow_resize=True,
-            depth=None, shaft_sources=None):
+            depth=None, shaft_sources=None, stamp_info=None):
     """Linear RGBA framebuffer -> final display-referred RGBA.
 
     Row order is preserved; row 0 stays the bottom of the picture.
@@ -621,6 +629,8 @@ def process(image, st, frame=0, seed=0, target_size=None, allow_resize=True,
             return np.concatenate([rgb, np.clip(alpha, 0, 1)], 2).astype(np.float32)
         return rgb.astype(np.float32)
 
+    _WM_TEXT = str(getattr(st, 'watermark', '') or '')
+
     rgb = depth_of_field(rgb, depth, st)
     rgb = light_shafts(rgb, st, shaft_sources)
     rgb = glow(rgb, st)
@@ -641,6 +651,8 @@ def process(image, st, frame=0, seed=0, target_size=None, allow_resize=True,
     rgb = upscale(rgb, st)
     if target_size is not None:
         rgb = fit_to(rgb, target_size)
+    if _WM_TEXT and not getattr(st, '_viewport', False):
+        rgb = stamp(rgb, _WM_TEXT, st, frame, stamp_info)
 
     if alpha is not None:
         if alpha.shape[:2] != rgb.shape[:2]:
@@ -650,3 +662,268 @@ def process(image, st, frame=0, seed=0, target_size=None, allow_resize=True,
                               yy * (alpha.shape[0] / h))
         return np.concatenate([rgb, np.clip(alpha, 0, 1)], axis=2).astype(np.float32)
     return rgb.astype(np.float32)
+
+
+# --------------------------------------------------------------- the stamp
+#
+# The burn-in every VTR bay and render farm of the era put on frames: a
+# line of bitmap text in the corner, white over a black drop shadow. The
+# `watermark` setting shipped in the settings table long ago and was read
+# by NOTHING until this stage -- the dead-control sweep found it. Drawn
+# AFTER every post stage at the final size, as pure array writes: the
+# same bits whatever device rendered the frame, and the viewport never
+# shows it (a preview with a burn-in is noise).
+
+#: 5x7 glyphs, rows top-down, 5-bit rows. The classic terminal font
+#: shapes, defined here as data so both the renderer and the tests read
+#: identical pixels.
+_FONT57 = {
+    '0': (0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E),
+    '1': (0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E),
+    '2': (0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F),
+    '3': (0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E),
+    '4': (0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02),
+    '5': (0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E),
+    '6': (0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E),
+    '7': (0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08),
+    '8': (0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E),
+    '9': (0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C),
+    'A': (0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11),
+    'B': (0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E),
+    'C': (0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E),
+    'D': (0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C),
+    'E': (0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F),
+    'F': (0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10),
+    'G': (0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F),
+    'H': (0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11),
+    'I': (0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E),
+    'J': (0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C),
+    'K': (0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11),
+    'L': (0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F),
+    'M': (0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11),
+    'N': (0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11),
+    'O': (0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E),
+    'P': (0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10),
+    'Q': (0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D),
+    'R': (0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11),
+    'S': (0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E),
+    'T': (0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04),
+    'U': (0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E),
+    'V': (0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04),
+    'W': (0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11),
+    'X': (0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11),
+    'Y': (0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04),
+    'Z': (0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F),
+    '.': (0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C),
+    ':': (0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00),
+    '-': (0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00),
+    '_': (0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F),
+    '/': (0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10),
+    '(': (0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02),
+    ')': (0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08),
+    '%': (0x19, 0x1A, 0x02, 0x04, 0x08, 0x0B, 0x13),
+    ' ': (0, 0, 0, 0, 0, 0, 0),
+}
+
+
+def _stamp_seconds(seconds):
+    """A render duration the 5x7 font can say: 12.4S, or 3M12S past a
+    minute, or 2H05M past an hour."""
+    s = max(float(seconds), 0.0)
+    if s < 60.0:
+        return f'{s:.1f}S'
+    m, sec = divmod(int(round(s)), 60)
+    if m < 60:
+        return f'{m}M{sec:02d}S'
+    h, m = divmod(m, 60)
+    return f'{h}H{m:02d}M'
+
+
+def stamp_text(text, st, frame=0, info=None):
+    """Expand the burn-in tokens.
+
+    %F frame number    %R resolution      %V engine + version
+    %D date            %T time of day     %S render time so far
+    %B Blender version
+
+    `info` carries what the core cannot know by itself -- the render
+    duration and the host version, filled in by the engine -- plus an
+    injectable clock ('now') so the tests read fixed pixels. A token
+    whose information is genuinely absent says '?', never a guess.
+    """
+    info = info or {}
+    out = str(text)
+    if '%F' in out:
+        out = out.replace('%F', f'{int(frame):04d}')
+    if '%R' in out:
+        out = out.replace('%R', f'{int(st.resolution_x)}X'
+                                f'{int(st.resolution_y)}')
+    if '%V' in out:
+        from ..version import version_string
+        out = out.replace('%V', f'HALCYON {version_string()}')
+    if '%D' in out or '%T' in out:
+        now = info.get('now')
+        if now is None:
+            import datetime
+            now = datetime.datetime.now()
+        if '%D' in out:
+            out = out.replace('%D', now.strftime('%Y-%m-%d'))
+        if '%T' in out:
+            out = out.replace('%T', now.strftime('%H:%M'))
+    if '%S' in out:
+        rt = info.get('render_time')
+        out = out.replace('%S', _stamp_seconds(rt) if rt is not None
+                          else '?')
+    if '%B' in out:
+        out = out.replace('%B', f"BLENDER {info.get('blender', '?')}")
+    return out.upper()
+
+
+#: the slate's ink pots: `&%x` in the text switches the colour of every
+#: glyph after it. Lowercase in the manual, matched case-insensitively.
+_STAMP_COLORS = {
+    'r': (1.0, 0.0, 0.0), 'g': (0.0, 1.0, 0.0), 'b': (0.0, 0.0, 1.0),
+    'y': (1.0, 1.0, 0.0), 'c': (0.0, 1.0, 1.0), 'm': (1.0, 0.0, 1.0),
+    'w': (1.0, 1.0, 1.0),
+}
+
+#: the secret one. Glyphs after it wear a rainbow that scrolls one
+#: character to the side on every step of the slate's clock -- the
+#: timeline frame PLUS the engine's render serial, so an animation
+#: walks it and a re-rendered still walks it too. And it can never
+#: resolve to nothing: an egg left with no visible glyph of its own
+#: (the field wrote 'SHOT 4 %F &%c%D %T &%2204355' -- trailing, so it
+#: coloured zero characters and the slate stayed cyan) takes the
+#: WHOLE line instead.
+_STAMP_RAINBOW = '2204355'
+
+
+def _hue_rgb(h):
+    """A pure-arithmetic HSV(h,1,1) -> RGB, deterministic on any device."""
+    h = float(h) % 1.0
+    x = h * 6.0
+    r = min(max(abs(x - 3.0) - 1.0, 0.0), 1.0)
+    g = min(max(2.0 - abs(x - 2.0), 0.0), 1.0)
+    b = min(max(2.0 - abs(x - 4.0), 0.0), 1.0)
+    return (r, g, b)
+
+
+def _stamp_runs(text, frame=0):
+    """Split expanded text into (char, colour) pairs, eating the escapes.
+
+    `&%r` and friends switch the ink; `&%2204355` marks everything after
+    it RAINBOW -- the ink is resolved per drawn COLUMN in stamp(), a
+    smooth gradient across twelve character widths that slides one
+    character per step of the slate's clock. That clock is the timeline
+    frame plus the render serial the engine passes in stamp_info: keyed
+    to the timeline ALONE it stood perfectly still on the field's
+    re-rendered stills, twice reported. The escapes are consumed, never
+    drawn. Callers that pass no serial (the tests, the device-parity
+    provers) keep the pure-frame clock and its bit-exact pixels.
+
+    THE EGG NEVER RESOLVES TO NOTHING: prefix semantics mean a trailing
+    `&%2204355` colours zero characters -- the field wrote exactly that
+    ('SHOT 4 %F &%c%D %T &%2204355') and got an all-cyan slate with no
+    rainbow anywhere. If the egg is left with no visible glyph, the
+    whole line wears the rainbow instead (explicit inks yield -- the
+    user typed the egg wanting a rainbow SOMEWHERE). Give it its own
+    glyphs ('&%2204355WORDS') and it colours only those, and every
+    other ink keeps its section.
+    """
+    runs = []
+    color = _STAMP_COLORS['w']
+    rainbow = False
+    saw_egg = False
+    i = 0
+    up = text
+    while i < len(up):
+        if up[i:i + 2] == '&%':
+            rest = up[i + 2:]
+            if rest[:len(_STAMP_RAINBOW)] == _STAMP_RAINBOW:
+                rainbow = True
+                saw_egg = True
+                i += 2 + len(_STAMP_RAINBOW)
+                continue
+            key = rest[:1].lower()
+            if key in _STAMP_COLORS:
+                color = _STAMP_COLORS[key]
+                rainbow = False
+                i += 3
+                continue
+        runs.append((up[i], 'RAINBOW' if rainbow else color))
+        i += 1
+    if saw_egg and not any(col == 'RAINBOW' and ch != ' '
+                           for ch, col in runs):
+        # the egg claimed nothing visible: promote it to the whole
+        # line rather than vanish (see the docstring's field story)
+        runs = [(ch, 'RAINBOW') for ch, _col in runs]
+    return runs
+
+
+def stamp(rgb, text, st, frame=0, info=None):
+    """Burn `text` into the bottom-left corner, inked over a shadow."""
+    text = stamp_text(text, st, frame, info)
+    runs = _stamp_runs(text, frame)[:64]
+    # the rainbow's clock: timeline frame + render serial. The slate is
+    # the render's logbook, never part of the picture's determinism
+    # contract -- %T and %S already print wall-clock truths into it --
+    # so the rainbow advances on every render EVENT. An animation walks
+    # it a frame at a time; a still re-rendered on one timeline frame
+    # walks it too, which is exactly where the field watched it stand
+    # still. No serial in `info` means the pure-frame clock: the tests
+    # and both parity provers keep their bit-exact expectations.
+    ph = float(frame) + float((info or {}).get('scroll', 0) or 0)
+    h, w = rgb.shape[:2]
+    scale = 2 if min(w, h) >= 480 else 1
+    gw, gh, adv = 5 * scale, 7 * scale, 6 * scale
+    margin = 4 * scale
+    out = rgb.copy()
+
+    def draw(ox, oy, ink):
+        x = margin + ox
+        for ch, col in runs:
+            rows = _FONT57.get(ch, _FONT57[' '])
+            value = None
+            if ink is not None:
+                value = np.asarray((ink, ink, ink), np.float32)
+            elif col != 'RAINBOW':
+                value = np.asarray(col, np.float32)
+            for gy, bits in enumerate(rows):
+                if not bits:
+                    continue
+                # row 0 of the IMAGE is the bottom; glyph row 0 is the top
+                y = margin + oy + (gh - scale) - gy * scale
+                if y < 0 or y + scale > h:
+                    continue
+                for gx in range(5):
+                    if not (bits >> (4 - gx)) & 1:
+                        continue
+                    px = x + gx * scale
+                    if px < 0 or px + scale > w:
+                        continue
+                    if value is None:
+                        # the rainbow: a smooth gradient by COLUMN, one
+                        # full wheel across twelve character widths,
+                        # sliding one character per clock step --
+                        # visible as a rainbow on a single still, and
+                        # walking sideways on every frame AND render.
+                        # The phase joins the COLUMN LATTICE inside the
+                        # numerator (ph steps of adv px), so one clock
+                        # step IS one character advance in exact integer
+                        # arithmetic -- the scroll law holds bit-for-bit
+                        # at every phase, not just at phases where
+                        # `a/72 + b/12` happens to round kindly (phase
+                        # 13 vs 14 missed by one ulp under that form)
+                        v = _hue_rgb((px - margin + ph * adv)
+                                     / float(adv * 12))
+                        out[y:y + scale, px:px + scale, :3] = \
+                            np.asarray(v, np.float32)
+                    else:
+                        out[y:y + scale, px:px + scale, :3] = value
+            x += adv
+            if x >= w:
+                break
+
+    draw(scale, -min(scale, margin), 0.0)          # the drop shadow
+    draw(0, 0, None)                               # each glyph its ink
+    return out

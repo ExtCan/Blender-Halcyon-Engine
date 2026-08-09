@@ -32,7 +32,40 @@ import queue
 import threading
 
 _JOBS = queue.Queue()
-_STATE = {'enabled': False, 'timer': False}
+#: 'enabled' is a COUNT, not a flag: the viewport preview and an F12 render
+#: each enable marshalling for their own duration, and they overlap -- a
+#: boolean here meant the first one to finish switched marshalling off under
+#: the other, whose every remaining burst then ran on its own context-less
+#: thread and fell back to the CPU with a misleading reason. enable() and
+#: disable() nest; the pump retires only when the count reaches zero.
+#:
+#: BURSTS RUN ONLY HERE, IN TIMER SLICES -- NEVER inside a draw callback.
+#: 1.25.89-.91 moved viewport bursts into view_draw ("a legitimate
+#: drawing context") on the theory that timer-slice GPU work interleaved
+#: with the draw loop caused the field's console flood. The theory was
+#: WRONG twice over: the flood was cross-thread bpy calls (fixed in .90,
+#: field-confirmed), and executing GPU work mid-draw made the ENTIRE
+#: SCENE flash rapidly whenever bursts streamed -- during camera motion
+#: AND refines -- because every redraw that ran bursts mutated live
+#: driver state under the compositor. Two patches (a time budget, a
+#: viewport-rect fence) reduced nothing; the field called it a seizure
+#: risk. The pump timer slices between redraws, never during one, and
+#: that boundary is the safety property. Do not move bursts into a draw
+#: callback again.
+_STATE = {'enabled': 0, 'timer': False}
+_STATE_LOCK = threading.Lock()
+
+#: one render on the GPU at a time. The plan, shader and upload caches are
+#: shared module state written from whichever thread is rendering, and two
+#: renders interleaving driver bursts would thrash them -- so the F12
+#: render, the self-test and a GPU viewport frame each hold this for their
+#: driver work. F12 and the self-test acquire BLOCKING (a viewport frame is
+#: short and disposable); the viewport TRY-acquires and renders that one
+#: frame on the CPU, with the reason printed, when the driver is busy.
+#: REENTRANT because the self-test measures the viewport path while
+#: holding the lock itself, on the same thread; across threads it excludes
+#: exactly like a plain lock.
+PIPELINE = threading.RLock()
 
 #: how long a worker waits for the main thread to PICK a burst UP before
 #: falling back to the CPU. This bounds "is the main loop alive?" and
@@ -133,18 +166,22 @@ def _ensure_timer():
 
 
 def enable():
-    """Marshalling on for the duration of a render."""
-    _STATE['enabled'] = True
+    """Marshalling on for the duration of a render. Nests: every enable()
+    needs its disable(), and marshalling stays on until the LAST one."""
+    with _STATE_LOCK:
+        _STATE['enabled'] += 1
     _ensure_timer()
 
 
 def disable():
-    """Marshalling off; the timer retires itself on its next tick."""
-    _STATE['enabled'] = False
+    """One render's marshalling over; the timer retires itself on its next
+    tick once nobody is left."""
+    with _STATE_LOCK:
+        _STATE['enabled'] = max(_STATE['enabled'] - 1, 0)
 
 
 def enabled():
-    return bool(_STATE['enabled'])
+    return _STATE['enabled'] > 0
 
 
 def on_main():

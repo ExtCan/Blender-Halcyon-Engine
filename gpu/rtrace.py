@@ -11,8 +11,13 @@ The links encode the CPU's EXACT visit order. `occluded()` pushes left
 then right and pops last-in-first-out, so the right subtree is walked
 first: `first` is the right child, the right child's `miss` is its left
 sibling, and the left child's `miss` is the parent's. Any-hit results
-never depend on order, but closest-hit ties do, and the day `intersect`
-ports it will inherit the correct order for free.
+never depend on order, but closest-hit ties do -- and order turned out
+to be necessary, not sufficient: when two surfaces COINCIDE (a box
+resting on the floor), the winner comes down to the last bit of two
+almost-equal t values, and the driver's rounding is not NumPy's. Those
+rays the kernel flags (id -2) and the wrappers re-resolve on
+bvh.intersect itself; see INTERSECT_GLSL's note for the measured
+anatomy.
 
 Everything numerical mirrors bvh.py to the operation: the slab test with
 its sign-losing 1e12 fallback for near-zero direction components, and
@@ -100,6 +105,15 @@ uniform float hal_bvh_side;
 uniform sampler2D hal_btris;         // 3 texels per triangle, leaf order
 uniform float hal_btris_side;
 
+// texture() with half-texel centring, as the proven ray-shadow passes
+// always fetched. A texelFetch conversion rode one round on suspicion
+// of row-boundary misreads (the RAY texture's real, caught-on-hardware
+// scar) -- and the glass-mirror flips stayed BIT-IDENTICAL, which is
+// an acquittal: the tree fetches were never misreading. The RAY
+// fetches in the compute wrappers keep texelFetch, because theirs is
+// the layout that actually misread on hardware (95 caught flips);
+// the tree keeps the filtered form the fast path has always measured
+// 0 px against the CPU with.
 vec4 hal_bvh_texel(float index)
 {
     float x = mod(index, hal_bvh_side);
@@ -180,9 +194,25 @@ float hal_bvh_occluded(vec3 org, vec3 dir, float tmax)
 #: is. The CPU pops nodes LIFO (right subtree first) and keeps a hit only
 #: when strictly closer; within a leaf, argmin keeps the FIRST of equal
 #: minima. A sequential walk in the SAME order with the SAME strict `<`
-#: reproduces both: the first-visited of two exactly-equal hits wins, on
-#: either implementation, by construction. The original id rides texel 0's
-#: w channel (float32 is id-exact to 2^24 triangles).
+#: reproduces both -- but only down to the last bit of t, and the last
+#: bit is the driver's. The glass-mirror hunt measured the failure
+#: exactly: a box RESTING on the floor puts two coplanar triangles at
+#: the same depth, 22106 of the frame's 141478 sweep rays hit both
+#: within 1e-6 relative t, and the driver's own rounding (fused
+#: multiply-adds the front-end cannot reproduce, `precise` ignored)
+#: picked the other surface on 1925 of them -- floor on one device,
+#: glass on the other, deterministic and unfixable by arithmetic
+#: edits, which two bit-identical rounds proved. So the kernel now
+#: NAMES the ties instead of guessing: it tracks the two nearest
+#: accepted hits, and when they land within 1e-5 relative (measured
+#: valley: real ties sit under 1e-6, the next distinct surface beyond
+#: 1e-3), it returns id -2.0 -- "this decision is inside float noise"
+#: -- and the wrappers re-resolve those rays on bvh.intersect itself,
+#: the reference. Ray routing, exactly the layer-routing doctrine:
+#: route, never guess. The slab prune loosens by the same window so a
+#: tying candidate in a barely-pruned subtree still registers. The
+#: original id rides texel 0's w channel (float32 is id-exact to 2^24
+#: triangles).
 INTERSECT_GLSL = """
 vec4 hal_bvh_intersect(vec3 org, vec3 dir, float tmax)
 {
@@ -194,6 +224,7 @@ vec4 hal_bvh_intersect(vec3 org, vec3 dir, float tmax)
     float best_t = tmax;
     float best_u = 0.0;
     float best_v = 0.0;
+    float second_t = 1e30;
     float node = 0.0;
     float guard = 0.0;
     while (node > -0.5 && guard < 100000.0) {
@@ -207,9 +238,10 @@ vec4 hal_bvh_intersect(vec3 org, vec3 dir, float tmax)
                        min(t0.z, t1.z));
         float tf = min(min(max(t0.x, t1.x), max(t0.y, t1.y)),
                        max(t0.z, t1.z));
-        // the slab prunes against the LIVE best -- as it shrinks, whole
-        // subtrees stop qualifying, exactly as the CPU's best_t[rays] does
-        if (!(tf >= max(tn, 0.0) && tn <= best_t)) {
+        // the slab prunes against the LIVE best -- loosened by the tie
+        // window, so a subtree whose nearest hit can still TIE is
+        // visited and second_t stays honest
+        if (!(tf >= max(tn, 0.0) && tn <= best_t * 1.00001)) {
             node = c.w;
             continue;
         }
@@ -231,17 +263,27 @@ vec4 hal_bvh_intersect(vec3 org, vec3 dir, float tmax)
                 float v = dot(dir, q) * inv_det;
                 float t = dot(e2, q) * inv_det;
                 if (u >= -1e-6 && v >= -1e-6 && u + v <= 1.000001
-                        && t > 1e-6 && t < best_t) {
-                    best_t = t;
-                    best_id = tv0.w;
-                    best_u = u;
-                    best_v = v;
+                        && t > 1e-6) {
+                    if (t < best_t) {
+                        second_t = best_t;
+                        best_t = t;
+                        best_id = tv0.w;
+                        best_u = u;
+                        best_v = v;
+                    } else if (t < second_t) {
+                        second_t = t;
+                    }
                 }
             }
             node = c.w;
         } else {
             node = c.z;
         }
+    }
+    // two accepted surfaces inside the noise window: the winner is a
+    // coin flip this device must not call. -2.0 asks the CPU.
+    if (best_id > -0.5 && second_t <= best_t * 1.00001) {
+        return vec4(-2.0, best_t, best_u, best_v);
     }
     return vec4(best_id, best_t, best_u, best_v);
 }
@@ -334,6 +376,39 @@ void main()
 """
 
 
+#: how many rays the LAST closest-hit call re-resolved on the CPU
+#: because the kernel flagged a tie (id -2): the self-test prints it,
+#: and a nonzero count on a frame NAMES coincident contact geometry
+LAST_TIE_ROUTED = 0
+
+
+def _resolve_ties(bvh, org, dirs, tmax, ids, t, u, v):
+    """Rays the kernel flagged as noise-window ties get the CPU's answer.
+
+    The kernel returns id -2.0 when its two nearest accepted hits sit
+    within 1e-5 relative t of each other -- a decision the driver's
+    last-bit arithmetic cannot make reproducibly (the glass-mirror
+    floor/box-bottom contact plane: 1925 deterministic flips). Those
+    rays, and only those, re-run through bvh.intersect itself, so the
+    GPU path returns the reference's own winner by construction. Route,
+    never guess."""
+    global LAST_TIE_ROUTED
+    tie = ids == -2
+    LAST_TIE_ROUTED = int(tie.sum())
+    if not tie.any():
+        return ids, t, u, v
+    ci, ct, cu, cv = bvh.intersect(org[tie], dirs[tie], tmax[tie])
+    ids = ids.copy()
+    t = np.asarray(t).copy()
+    u = np.asarray(u).copy()
+    v = np.asarray(v).copy()
+    ids[tie] = ci
+    t[tie] = ct
+    u[tie] = cu
+    v[tie] = cv
+    return ids, t, u, v
+
+
 def simulate_intersect(bvh, org, dirs, tmax):
     """Closest-hit through the front-end. Returns (ids int32, t, u, v)."""
     from ..core.texture import Texture
@@ -359,8 +434,9 @@ def simulate_intersect(bvh, org, dirs, tmax):
         'hal_rtmax': tmax,
     }
     got = prog.run(uni, {}, n)[0]['Color']
-    return (np.round(got[:, 0]).astype(np.int32), got[:, 1],
-            got[:, 2], got[:, 3])
+    return _resolve_ties(bvh, org, dirs, tmax,
+                         np.round(got[:, 0]).astype(np.int32), got[:, 1],
+                         got[:, 2], got[:, 3])
 
 
 def intersect_on_device(bvh, org, dirs, tmax):
@@ -409,8 +485,9 @@ def intersect_on_device(bvh, org, dirs, tmax):
         return None, f'closest-hit dispatch failed: ' \
                      f'{type(exc).__name__}: {exc}'
     flat = out['hal_out_hits'].reshape(-1, 4)[:n]
-    return (np.round(flat[:, 0]).astype(np.int32), flat[:, 1],
-            flat[:, 2], flat[:, 3]), None
+    return _resolve_ties(bvh, org, dirs, tmax,
+                         np.round(flat[:, 0]).astype(np.int32), flat[:, 1],
+                         flat[:, 2], flat[:, 3]), None
 
 
 def intersect_frame(bvh, org, dirs, tmax=1e30):
@@ -488,8 +565,9 @@ def intersect_frame(bvh, org, dirs, tmax=1e30):
     except Exception as exc:                                    # noqa: BLE001
         return None, f'reflection trace failed: {type(exc).__name__}: {exc}'
     flat = out['hal_out_hits'].reshape(-1, 4)[:n]
-    return (np.round(flat[:, 0]).astype(np.int32), flat[:, 1],
-            flat[:, 2], flat[:, 3]), None
+    return _resolve_ties(bvh, org, dirs, tmax,
+                         np.round(flat[:, 0]).astype(np.int32), flat[:, 1],
+                         flat[:, 2], flat[:, 3]), None
 
 
 def simulate_occluded(bvh, org, dirs, tmax):

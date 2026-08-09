@@ -87,6 +87,14 @@ def pack_attributes(mesh, slot_count=SLOTS, respect_smooth=False):
         if uvs is not None:
             uv = np.asarray(uvs, np.float32)
             out[base + UV0, :2] = uv[idx] if uv.ndim == 2 else uv[tris][:, corner]
+        # the second UV map rides the SAME texel's free half: period
+        # dual-texture hardware carried exactly two UV sets, and so
+        # does the attribute layout -- no new slot, no new fetch
+        uvs2 = getattr(mesh, 'uvs2', None)
+        if uvs2 is not None:
+            uv2 = np.asarray(uvs2, np.float32)
+            out[base + UV0, 2:4] = uv2[idx] if uv2.ndim == 2 \
+                else uv2[tris][:, corner]
         # an unpainted mesh reads as white, exactly as ShadeJob.attributes
         # answers when mesh.colors is None
         if colors is not None:
@@ -171,6 +179,7 @@ struct HalcyonFragment {
     vec3  P;
     vec3  N;
     vec2  uv;
+    vec2  uv2;
     bool  covered;
 };
 
@@ -185,11 +194,13 @@ HalcyonFragment hal_read_gbuffer(vec2 screen_uv)
         f.P = vec3(0.0);
         f.N = vec3(0.0, 0.0, 1.0);
         f.uv = vec2(0.0);
+        f.uv2 = vec2(0.0);
         return f;
     }
     f.P = hal_interp(f.tri, f.bary, 0);
     f.N = normalize(hal_interp(f.tri, f.bary, 1));
     f.uv = hal_interp(f.tri, f.bary, 2).xy;
+    f.uv2 = hal_interp4(f.tri, f.bary, 2).zw;
     return f;
 }
 """

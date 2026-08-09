@@ -11,7 +11,8 @@ from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
                        StringProperty)
 from bpy.types import PropertyGroup
 
-from .core.settings import RESOLUTION_PRESETS, RenderSettings
+from .core.settings import (RESOLUTION_GROUPS, RenderSettings,
+                            resolution_description, resolution_label)
 from .core.shading import MODEL_ITEMS
 from .presets.library import preset_items
 
@@ -200,9 +201,13 @@ ENUMS = {
     'interlace': INTERLACE, 'output_scale': OUTPUT_SCALE,
     'bucket_order': BUCKET, 'debug_pass': DEBUG_PASS,
     'wire_mode': WIRE_MODE,
-    'res_preset': [('CUSTOM', "Custom", "")] +
-    [(k, k.replace('_', ' ').title(), f"{v[0]}x{v[1]}")
-     for k, v in RESOLUTION_PRESETS.items()],
+    # grouped: an item with an empty identifier is a category separator
+    'res_preset': [('CUSTOM', "Custom", "")] + [
+        item
+        for label, keys in RESOLUTION_GROUPS
+        for item in [('', label, '')] + [
+            (k, resolution_label(k), resolution_description(k)) for k in keys]
+    ],
 }
 
 # field -> (min, max, soft_min, soft_max, step/precision hints)
@@ -212,6 +217,9 @@ RANGES = {
     'depth_precision': (4, 32), 'polygon_offset': (-10.0, 10.0),
     'light_clamp': (0.0, 1000.0), 'ao_distance': (0.001, 1000.0),
     'ao_samples': (1, 256), 'ao_intensity': (0.0, 1.0),
+    'radiosity_samples': (1, 64), 'radiosity_distance': (0.01, 1000.0),
+    'radiosity_spacing': (1, 8),
+    'radiosity_intensity': (0.0, 4.0), 'reflection_blur': (0.0, 45.0),
     'global_ambient_level': (0.0, 10.0), 'max_lights': (0, 64),
     'process_count': (0, 64), 'shadow_map_size': (32, 4096), 'shadow_bias': (0.0, 10.0),
     'shadow_softness': (0.0, 32.0), 'shadow_samples': (1, 64),
@@ -221,6 +229,9 @@ RANGES = {
     'tex_affine_subdiv': (0, 64), 'alpha_bits': (1, 8),
     'alpha_threshold': (0.0, 1.0), 'fog_start': (0.0, 100000.0),
     'fog_end': (0.0, 100000.0), 'fog_density': (0.0, 10.0),
+    'fog_height_top': (-100000.0, 100000.0),
+    'fog_height_falloff': (0.0, 100.0),
+    'motion_shutter': (0.0, 4.0), 'motion_steps': (2, 64),
     'lens_distortion': (-1.0, 1.0), 'chromatic_aberration': (0.0, 8.0),
     'shaft_threshold': (0.0, 4.0), 'shaft_length': (0.0, 1.0),
     'shaft_decay': (0.5, 1.0), 'shaft_samples': (2, 128),
@@ -251,6 +262,11 @@ RANGES = {
 LABELS = {
     'aa_mode': "Anti-Aliasing", 'aa_samples': "Samples",
     'aa_filter': "Filter", 'aa_filter_width': "Filter Width",
+    'aa_edge_threshold': "Edge Depth Threshold",
+    'motion_blur': "Motion Blur", 'motion_shutter': "Shutter (frames)",
+    'motion_steps': "Blur Steps",
+    'fog_height': "Height Fog", 'fog_height_top': "Fog Top",
+    'fog_height_falloff': "Height Falloff",
     'vertex_snap': "Vertex Snapping",
     'vertex_snap_grid': "Snap Grid (px)",
     'depth_precision': "Z-Buffer Bits", 'depth_sort': "Depth Method",
@@ -270,6 +286,15 @@ LABELS = {
     'gpu_raster': "GPU Rasteriser",
     'gpu_hold_context': "Hold GPU Context (freezes UI)",
     'gpu_scissor': "Scissor Layer Passes",
+    'viewport_gpu': "Viewport GPU",
+    'radiosity': "Radiosity",
+    'radiosity_samples': "Gather Samples",
+    'radiosity_distance': "Gather Distance",
+    'radiosity_intensity': "Bleed Intensity",
+    'radiosity_spacing': "Gather Spacing",
+    'reflection_blur': "Reflection Blur",
+    'reflection_blur_samples': "Blur Samples",
+    'watermark': "Burn-In Text",
     'palette_lock': "Lock Palette", 'displacement_scale': "Displacement",
     'color_depth': "Colour Depth", 'palette_mode': "Palette",
     'palette_method': "Quantiser", 'dither': "Dither",
@@ -285,6 +310,40 @@ LABELS = {
 }
 
 DESCRIPTIONS = {
+    'radiosity': "One bounce of gathered colour bleed -- the era's "
+                 "Radiosity checkbox. Rays that see sky return the ambient "
+                 "colour; rays that land on a surface return its flat "
+                 "diffuse. Supersedes plain Ambient Occlusion while on",
+    'radiosity_samples': "Hemisphere rays gathered per pixel. 8 is the "
+                         "period look; more is smoother and slower",
+    'radiosity_distance': "How far a gather ray reaches before it counts "
+                          "as seeing sky",
+    'radiosity_intensity': "Strength of the colour a surface lends its "
+                           "neighbours",
+    'radiosity_spacing': "Gather every Nth pixel and blend between the "
+                         "points -- the interpolated mode the era "
+                         "actually shipped. 1 gathers every pixel; 2 "
+                         "casts a quarter of the rays, 4 a sixteenth",
+    'reflection_blur': "Cone angle in degrees for blurry (glossy) ray "
+                       "reflections. 0 keeps mirrors sharp. Blurry frames "
+                       "shade on the CPU -- the deferred pass traces one "
+                       "ray per fragment",
+    'reflection_blur_samples': "Jittered rays averaged per reflective "
+                               "fragment when Reflection Blur is above 0",
+    'watermark': "Burn a line of text into the corner of the final frame, "
+                 "the VTR way. Tokens: %F frame number, %R resolution, "
+                 "%V engine version, %D date, %T time of day, %S render "
+                 "time, %B Blender version. Ink colours: &%r red, "
+                 "&%g green, &%b blue, &%y yellow, &%c cyan, &%m magenta, "
+                 "&%w white again -- each colours everything after it. "
+                 "Empty means no burn-in",
+    'viewport_gpu': "Let the viewport preview use the GPU device (when the "
+                    "top switch is GPU). Turn OFF to force every viewport "
+                    "frame onto the CPU while F12 keeps the driver -- the "
+                    "bisect switch for viewport-only driver problems: if a "
+                    "glitch follows this toggle, it lives in the viewport's "
+                    "GPU path; if it stays, it never did",
+
     'spot_cones': "Draw the visible beam of every spot light whose Volumetric "
                   "value is above zero. The view ray is intersected with the "
                   "cone and a few samples are summed along whatever falls "
@@ -589,6 +648,21 @@ class HalcyonLightSettings(PropertyGroup):
     exclude_mode: EnumProperty(name="Linking", default='EXCLUDE', items=_items(
         ('EXCLUDE', "Exclude", "The collection is not lit by this lamp"),
         ('ONLY', "Only", "Nothing but the collection is lit by this lamp")))
+    cookie: PointerProperty(
+        name="Projected Texture", type=bpy.types.Image,
+        description="An image this lamp projects -- the gobo/cookie of the "
+                    "sixth-generation consoles. A Spot throws it through its "
+                    "cone like a slide projector (Splinter Cell's window "
+                    "patterns); a Sun tiles it across the world as a cloud "
+                    "shadow. Point and Area lamps ignore it")
+    cookie_strength: FloatProperty(
+        name="Projection Strength", default=1.0, min=0.0, max=1.0,
+        description="Blend between plain light (0) and the fully projected "
+                    "image (1)")
+    cookie_scale: FloatProperty(
+        name="Projection Scale", default=10.0, min=0.01,
+        description="Sun only: world size of one tile of the projected "
+                    "image, in scene units")
 
 
 def _col(name, default, desc=''):

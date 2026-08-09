@@ -8,7 +8,14 @@ reports what is actually installed.
 
 import os
 
-VERSION = (1, 25, 9)
+#: the fallback when no manifest is readable. The test suite holds this,
+#: bl_info, the manifest AND the changelog's newest entry to the same
+#: number -- the 1.25.73/74 ships bumped bl_info alone, the manifest kept
+#: reporting 1.25.72, and the field spent two rounds (rightly) insisting
+#: it was on the latest version while the stamp said otherwise. A stamp
+#: that can lie is worse than no stamp; now four must agree or the suite
+#: fails.
+VERSION = (1, 25, 101)
 
 
 def _from_manifest():

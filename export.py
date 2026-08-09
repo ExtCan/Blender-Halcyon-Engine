@@ -87,6 +87,20 @@ NODE_PROPS = {
     'HALCYON_ShaderNode': ('model', 'toon_steps', 'wire_size'),
     'ShaderNodeTexGabor': ('gabor_type',),
     'HALCYON_CodeNode': ('language', 'as_surface', 'source_text'),
+    # the retro utilities. Dither's pattern and Depth Cue's falloff were
+    # MISSING from this table from the day those nodes shipped: the
+    # evaluator read the prop, the exporter never copied it, and both
+    # dropdowns silently rendered as their defaults. A test now walks the
+    # DISPATCH handlers' _prop reads against this table so a node cannot
+    # ship half-wired again.
+    'HALCYON_DitherNode': ('pattern',),
+    'HALCYON_DepthCueNode': ('mode',),
+    'HALCYON_ScrollNode': ('animate', 'fps'),
+    'HALCYON_ScanlinesNode': ('animate',),
+    'HALCYON_PaletteNode': ('palette',),
+    'HALCYON_ColorCycleNode': ('animate',),
+    'HALCYON_FlipbookNode': ('animate',),
+    'HALCYON_UVWaveNode': ('animate',),
 }
 
 try:
@@ -401,15 +415,18 @@ def _mesh_arrays(me, matrix, mat_offset, obj_index):
 
     uvs = np.zeros((n_loops, 2), np.float32)
     uvs2 = None
+    uv_names = []
     layers = compat.uv_layers(me)
     if len(layers):
         buf = np.empty(n_loops * 2, np.float32)
         layers[0].data.foreach_get('uv', buf)
         uvs = buf.reshape(-1, 2)
+        uv_names.append(str(getattr(layers[0], 'name', '') or ''))
         if len(layers) > 1:
             buf2 = np.empty(n_loops * 2, np.float32)
             layers[1].data.foreach_get('uv', buf2)
             uvs2 = buf2.reshape(-1, 2)
+            uv_names.append(str(getattr(layers[1], 'name', '') or ''))
 
     cols = np.ones((n_loops, 4), np.float32)
     clayers = compat.color_layers(me)
@@ -465,6 +482,7 @@ def _mesh_arrays(me, matrix, mat_offset, obj_index):
     return dict(verts=pos.astype(np.float32), normals=nn.astype(np.float32),
                 uvs=uvs.astype(np.float32),
                 uvs2=uvs2.astype(np.float32) if uvs2 is not None else None,
+                uv_names=uv_names,
                 colors=cols.astype(np.float32), tris=lt.astype(np.int32),
                 mat_index=(mat_idx + mat_offset).astype(np.int32),
                 obj_index=np.full(n_tris, obj_index, np.int32),
@@ -521,10 +539,24 @@ def export_light(ob, matrix, unit_scale=1.0):
         coll = getattr(hs, 'exclude_collection', None)
         if coll is not None:
             lt.exclude_names = {o.name for o in coll.all_objects}
+        ck = getattr(hs, 'cookie', None)
+        if ck is not None and kind in ('SPOT', 'SUN'):
+            px = compat.image_pixels(ck)
+            if px is not None:
+                lt.cookie = ImageBuffer(name=ck.name_full, pixels=px,
+                                        colorspace='Non-Color')
+                lt.cookie_strength = float(getattr(hs, 'cookie_strength',
+                                                   1.0))
+                lt.cookie_scale = float(getattr(hs, 'cookie_scale', 10.0))
     else:
         lt.shadow = 'MAP' if getattr(la, 'use_shadow', True) else 'NONE'
     if not getattr(la, 'use_shadow', True):
         lt.shadow = 'NONE'
+    # the lamp's own axes, so a projected texture turns with the object
+    lt.frame_x = tuple(mw[:3, 0] / max(float(np.linalg.norm(mw[:3, 0])),
+                                       1e-9))
+    lt.frame_y = tuple(mw[:3, 1] / max(float(np.linalg.norm(mw[:3, 1])),
+                                       1e-9))
     return lt
 
 
@@ -738,6 +770,11 @@ def _concat(parts):
     mesh.normals = np.concatenate(N)
     mesh.uvs = np.concatenate(U)
     mesh.uvs2 = np.concatenate(U2) if has_uv2 else None
+    # layer NAMES, first-seen: the UV Map node resolves by name on both
+    # devices. Two sets travel -- the period dual-texture budget -- and
+    # a mesh whose objects disagree about names keeps the first pair.
+    mesh.uv_names = next((p['uv_names'] for p in parts
+                          if p.get('uv_names')), [])
     mesh.colors = np.concatenate(C)
     mesh.tris = np.concatenate(T)
     mesh.mat_index = np.concatenate(MI)

@@ -129,6 +129,49 @@ SPECS = [
      {'axis': ('enum', 'Z', AXIS, "Axis")},
      [(C, 'Color'), (F, 'Fac')]),
 
+    ('Noise', "Fractal Noise", 'MOD_OCEAN',
+     "The raw integer-hash fractal field, three profiles. Reach for this "
+     "where Blender's own Noise texture would go: that one's sin-fract hash "
+     "cannot travel to the GPU, this one travels exactly",
+     [(V, 'Vector', None), (F, 'Scale', 4.0), (F, 'Lacunarity', 2.0),
+      (F, 'Gain', 0.5), (C, 'Color 1', GREY_B), (C, 'Color 2', GREY_A)],
+     {'kind': ('enum', 'SMOOTH', (('SMOOTH', "Smooth", "Plain fBm"),
+                                  ('TURBULENT', "Turbulent",
+                                   "Folded noise; the cusps are the point"),
+                                  ('RIDGED', "Ridged",
+                                   "Folded and squared -- Musgrave's ridge "
+                                   "profile, for mountains and veins")),
+               "Profile"),
+      'octaves': ('int', 5, 1, 10, "Octaves")},
+     [(C, 'Color'), (F, 'Fac')]),
+
+    ('Cells', "Cells (Worley)", 'LIGHTPROBE_VOLUME',
+     "Worley's cellular texture (SIGGRAPH 1996): distances to scattered "
+     "feature points, or the cells themselves as flat shades",
+     [(V, 'Vector', None), (F, 'Scale', 4.0), (F, 'Randomness', 1.0),
+      (C, 'Color 1', (0.05, 0.05, 0.05, 1.0)), (C, 'Color 2', GREY_A)],
+     {'feature': ('enum', 'F1', (('F1', "F1 (Nearest)",
+                                  "Distance to the nearest point"),
+                                 ('F2', "F2 (Second)",
+                                  "Distance to the second point"),
+                                 ('BORDER', "F2 - F1",
+                                  "Ridges along the cell borders"),
+                                 ('CELL', "Cell Shade",
+                                  "Each cell a flat hashed shade -- the "
+                                  "stained-glass look")),
+                  "Feature")},
+     [(C, 'Color'), (F, 'Fac'), (F, 'Cell ID')]),
+
+    ('Static', "TV Static", 'IMAGE_ALPHA',
+     "Per-cell white noise reseeded every frame -- an untuned television. "
+     "It lives on the SURFACE (scale sets the set's pixel size), so it "
+     "sits on an in-scene screen the way it should",
+     [(V, 'Vector', None), (F, 'Scale', 64.0),
+      (C, 'Color 1', (0.02, 0.02, 0.02, 1.0)),
+      (C, 'Color 2', (0.9, 0.9, 0.9, 1.0))],
+     {'animate': ('bool', True, "Animate")},
+     [(C, 'Color'), (F, 'Fac')]),
+
     # ------------------------------------------- the POV-Ray pattern family
 
     ('Bozo', "Bozo", 'TEXTURE',

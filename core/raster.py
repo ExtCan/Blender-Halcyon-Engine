@@ -201,7 +201,10 @@ def build_screen_tris(clip, tris, width, height, snap=0.0, near_eps=1e-5,
 
     idx_in = np.nonzero(all_in)[0]
     parts_p = [cp[idx_in]]
-    parts_b = [np.broadcast_to(IDENT_BARY, (idx_in.size, 3, 3)).copy()]
+    # a broadcast VIEW, not a copy: for an all-inside mesh this was a
+    # (T,3,3) materialised identity per rasterisation -- 30 MB of writes
+    # at 800k triangles, for values np.concatenate materialises anyway
+    parts_b = [np.broadcast_to(IDENT_BARY, (idx_in.size, 3, 3))]
     parts_src = [idx_in.astype(np.int32)]
 
     for t in np.nonzero(straddle)[0]:
@@ -218,17 +221,35 @@ def build_screen_tris(clip, tris, width, height, snap=0.0, near_eps=1e-5,
         return (e, e.copy(), e.copy(), e.copy(),
                 np.zeros((0, 3, 3), np.float32), np.zeros(0, np.int32))
 
-    P = np.concatenate(parts_p, axis=0).astype(np.float32)   # (E,3,4)
-    B = np.concatenate(parts_b, axis=0).astype(np.float32)   # (E,3,3)
-    S = np.concatenate(parts_src, axis=0)
+    def _one_or_cat(parts, want):
+        # the high-poly common case is NO straddlers: one part, already
+        # the right dtype -- concatenate+astype was two full copies of
+        # a 40 MB array for nothing. Values identical either way.
+        if len(parts) == 1:
+            a = parts[0]
+            return a if a.dtype == want else a.astype(want)
+        return np.concatenate(parts, axis=0).astype(want)
+
+    P = _one_or_cat(parts_p, np.float32)                     # (E,3,4)
+    B = _one_or_cat(parts_b, np.float32)                     # (E,3,3)
+    S = parts_src[0] if len(parts_src) == 1 else np.concatenate(parts_src,
+                                                                axis=0)
 
     w = P[:, :, 3]
     w = np.where(np.abs(w) < near_eps, near_eps, w)
-    iw = (1.0 / w).astype(np.float32)
+    iw = 1.0 / w                    # float32 in, float32 out -- no copy
     ndc = P[:, :, :3] * iw[:, :, None]
-    sx = ((ndc[:, :, 0] * 0.5 + 0.5) * width).astype(np.float32)
-    sy = ((ndc[:, :, 1] * 0.5 + 0.5) * height).astype(np.float32)
-    z = ndc[:, :, 2].astype(np.float32)
+    sx = (ndc[:, :, 0] * 0.5 + 0.5) * width
+    sy = (ndc[:, :, 1] * 0.5 + 0.5) * height
+    # sx/sy/iw are fresh contiguous arrays from the arithmetic; z alone
+    # would be a strided VIEW into ndc, which every downstream gather
+    # pays for -- one contiguous copy beats many strided reads
+    z = np.ascontiguousarray(ndc[:, :, 2])
+    if sx.dtype != np.float32:      # belt and braces for exotic inputs
+        sx = sx.astype(np.float32)
+        sy = sy.astype(np.float32)
+        z = z.astype(np.float32)
+        iw = iw.astype(np.float32)
     if snap > 0.0:
         sx = np.round(sx / snap) * snap
         sy = np.round(sy / snap) * snap

@@ -76,6 +76,16 @@ SUBSURFACE = [
     ('Normal', ['Normal']),
 ]
 
+# EEVEE's Specular BSDF is the spec/gloss workflow -- the DirectX-era
+# model this engine wears natively, so the mapping is nearly literal
+SPECULAR = [
+    ('Diffuse Color', ['Base Color']),
+    ('Specular Color', ['Specular']),
+    ('Roughness', ['Roughness']),
+    ('Self-Illumination', ['Emissive Color']),
+    ('Normal', ['Normal']),
+]
+
 SOURCES = {
     'ShaderNodeBsdfPrincipled': PRINCIPLED,
     'ShaderNodeBsdfDiffuse': DIFFUSE,
@@ -90,6 +100,7 @@ SOURCES = {
     'ShaderNodeBsdfSheen': SHEEN,
     'ShaderNodeBsdfVelvet': SHEEN,
     'ShaderNodeSubsurfaceScattering': SUBSURFACE,
+    'ShaderNodeEeveeSpecular': SPECULAR,
 }
 
 # constants applied after the socket mapping, for sources whose character is not
@@ -104,6 +115,7 @@ EXTRAS = {
     'ShaderNodeBsdfMetallic': {'Diffuse Level': 0.0, 'Specular Level': 1.0,
                                'Metalness': 1.0},
     'ShaderNodeSubsurfaceScattering': {'Specular Level': 0.1},
+    'ShaderNodeEeveeSpecular': {'Specular Level': 1.0},
 }
 
 
@@ -148,6 +160,8 @@ def choose_model(idname, values=None, links=None):
         return 'TRANSLUCENT'
     if idname == 'ShaderNodeBsdfMetallic':
         return 'METAL'
+    if idname == 'ShaderNodeEeveeSpecular':
+        return 'BLINN_PHONG'
 
     aniso = abs(val('Anisotropic', 'Anisotropy'))
     if aniso > 0.01 or 'Anisotropic' in links or 'Anisotropy' in links:
@@ -221,6 +235,16 @@ def plan(idname, values=None, links=None, model='AUTO'):
             e = float(e[0]) if hasattr(e, '__len__') else float(e)
             if e > 0.0 and e != 1.0:
                 notes.append(f"emission strength {e:g} folded into the colour")
+        except (TypeError, ValueError):
+            pass
+
+    if idname == 'ShaderNodeEeveeSpecular':
+        try:
+            t = values.get('Transparency', 0.0)
+            t = float(t[0]) if hasattr(t, '__len__') else float(t)
+            if t > 0.01:
+                extras['Opacity'] = max(0.0, 1.0 - t)
+                notes.append("transparency mapped to opacity")
         except (TypeError, ValueError):
             pass
 
