@@ -13,7 +13,7 @@ Every emitter here is checked against the NumPy evaluator by running the
 generated GLSL through Halcyon's own front-end and comparing outputs.
 """
 
-FLOAT, VEC3, VEC4 = 'float', 'vec3', 'vec4'
+FLOAT, VEC2, VEC3, VEC4 = 'float', 'vec2', 'vec3', 'vec4'
 
 #: socket type in the exported graph -> GLSL type
 SOCKET_TYPE = {'VALUE': FLOAT, 'RGBA': VEC4, 'VECTOR': VEC3,
@@ -670,9 +670,10 @@ def e_new_geometry(em, node, index):
     - Tangent: ctx.T is never filled, so the CPU always builds
       `orthonormal_basis(ctx.N)[0]` -- emitted verbatim.
     - True Normal: the face normal is STORED per triangle on the CPU
-      (Blender's own, through the normal matrix); the G-buffer does not
-      carry it, and recomputing from corners flips on mirrored objects.
-      Refuses by name, same reason the coded shader's `geonormal` does.
+      (Blender's own, through the normal matrix); recomputing from
+      corners flips on mirrored objects, so it is never recomputed --
+      the hal_triaux texel carries the CPU's own normalized values,
+      fetched by triangle id (frame passes only).
     - Incoming: the CPU returns -normalize(I) = normalize(eye - P),
       which IS hal_V.
     - Parametric: the CPU returns (uv, 0).
@@ -682,7 +683,9 @@ def e_new_geometry(em, node, index):
       Orthographic refuses by name; secondary passes emit 0.0, because
       `trace()` shades hits with front=None and the CPU keeps zeros.
     - Random Per Island: the CPU's per-tri random is the sin-fract hash
-      a driver decorrelates -- refuses by name like the Noise family.
+      a driver would decorrelate -- so the CPU's own values bake into
+      the hal_triaux texel's alpha and are fetched, never recomputed
+      (frame passes only).
     """
     outs = node.get('outputs') or []
     o = outs[index] if index < len(outs) else {}
@@ -723,13 +726,26 @@ def e_new_geometry(em, node, index):
     if name == 'Pointiness':
         return em.tmp(FLOAT, '0.0')      # zeros on the CPU too
     if name == 'Random Per Island':
-        raise Unsupported('the per-triangle random rides the sin-fract '
-                          'hash a driver decorrelates; the material '
-                          'shades on the CPU')
+        # the CPU's own per-tri sin-fract values ride the hal_triaux
+        # texel's alpha (gbuffer.pack_tri_aux bakes _hash1 of the tri
+        # index) -- fetched, never recomputed, so no driver hash can
+        # decorrelate them. Frame passes only: the fetch needs f.tri.
+        if not em.frame_mode:
+            raise Unsupported('the per-triangle random needs the '
+                              'G-buffer triangle id of the deferred '
+                              'pass')
+        em.needs_triaux = True
+        return em.tmp(FLOAT, 'hal_triaux_fetch(max(f.tri, 0.0)).w')
     if name == 'True Normal':
-        raise Unsupported('the face normal is stored per triangle on the '
-                          'CPU and is not in the G-buffer; the material '
-                          'shades on the CPU')
+        # the STORED face normal rides the hal_triaux texel's rgb --
+        # the CPU's own normalize(mesh.face_normals), same bits, the
+        # exact values ctx.Ng carries. Frame passes only: f.tri again.
+        if not em.frame_mode:
+            raise Unsupported('the stored face normal needs the '
+                              'G-buffer triangle id of the deferred '
+                              'pass')
+        em.needs_triaux = True
+        return em.tmp(VEC3, 'hal_triaux_fetch(max(f.tri, 0.0)).xyz')
     raise Unsupported(f'Geometry output {name!r} is not in the deferred '
                       'pass')
 
@@ -753,6 +769,68 @@ def e_layer_weight(em, node, index):
 
 def e_bsdf_glossy(em, node, _i):
     return em.tmp(VEC4, em.input(node, 'Color', VEC4))
+
+
+def e_wireframe(em, node, _i):
+    """The Wireframe node: exact edge distance as a 0/1 factor.
+
+    ShadeJob.wire_fields, expression for expression: the world-space
+    point-to-edge distance on the fragment's own triangle (corners from
+    the attribute texture, P re-interpolated the CPU's way), and -- for
+    Pixel Size -- the world-units-per-pixel scale from the per-corner
+    screen positions the hal_vscreen texture carries (the CPU's own
+    projected sx, sy, w, baked). Works in frame AND secondary passes:
+    a hit has a triangle identity too, exactly as ctx.wire_fields does.
+    """
+    if not em.frame_mode:
+        raise Unsupported('the wireframe ink needs a triangle identity '
+                          'only the deferred passes carry')
+    size = em.input(node, 'Size', FLOAT)
+    a, _t = em.tmp(VEC3, 'hal_fetch_attr(max(f.tri, 0.0), 0, 0).xyz')
+    b, _t = em.tmp(VEC3, 'hal_fetch_attr(max(f.tri, 0.0), 1, 0).xyz')
+    c, _t = em.tmp(VEC3, 'hal_fetch_attr(max(f.tri, 0.0), 2, 0).xyz')
+    p, _t = em.tmp(VEC3, f'{a} * f.bary.x + {b} * f.bary.y '
+                         f'+ {c} * f.bary.z')
+
+    def _edge(A, B):
+        E, _e = em.tmp(VEC3, f'{B} - {A}')
+        L2, _e = em.tmp(FLOAT, f'max(dot({E}, {E}), 1e-12)')
+        X, _e = em.tmp(VEC3, f'cross({p} - {A}, {E})')
+        d, _e = em.tmp(FLOAT, f'sqrt(max(dot({X}, {X}), 0.0) / {L2})')
+        return d
+
+    d0 = _edge(a, b)
+    d1 = _edge(b, c)
+    d2 = _edge(c, a)
+    dmin, _t = em.tmp(FLOAT, f'min(min({d0}, {d1}), {d2})')
+    half, _t = em.tmp(FLOAT, f'max({size}, 0.0) * 0.5')
+    if prop(node, 'use_pixel_size', False):
+        em.needs_wirescreen = True
+        s0, _t = em.tmp(VEC4, 'hal_vscreen_fetch(max(f.tri, 0.0) * 3.0)')
+        s1, _t = em.tmp(VEC4,
+                        'hal_vscreen_fetch(max(f.tri, 0.0) * 3.0 + 1.0)')
+        s2, _t = em.tmp(VEC4,
+                        'hal_vscreen_fetch(max(f.tri, 0.0) * 3.0 + 2.0)')
+        e1, _t = em.tmp(VEC2, f'{s1}.xy - {s0}.xy')
+        e2, _t = em.tmp(VEC2, f'{s2}.xy - {s0}.xy')
+        Dd, _t = em.tmp(FLOAT, f'{e1}.x * {e2}.y - {e1}.y * {e2}.x')
+        Dc, _t = em.tmp(FLOAT, f'(abs({Dd}) < 1e-9) ? 1e-9 : {Dd}')
+        g1, _t = em.tmp(VEC2, f'vec2({e2}.y, -{e2}.x) / {Dc}')
+        g2, _t = em.tmp(VEC2, f'vec2(-{e1}.y, {e1}.x) / {Dc}')
+        g0, _t = em.tmp(VEC2, f'-{g1} - {g2}')
+        Wp, _t = em.tmp(FLOAT, f'f.bary.x * {s0}.z + f.bary.y * {s1}.z '
+                               f'+ f.bary.z * {s2}.z')
+        f0, _t = em.tmp(VEC2, f'({g0} / {s0}.z) * {Wp}')
+        f1, _t = em.tmp(VEC2, f'({g1} / {s1}.z) * {Wp}')
+        f2, _t = em.tmp(VEC2, f'({g2} / {s2}.z) * {Wp}')
+        dpx, _t = em.tmp(VEC3, f'({a} - {p}) * {f0}.x + ({b} - {p}) '
+                               f'* {f1}.x + ({c} - {p}) * {f2}.x')
+        dpy, _t = em.tmp(VEC3, f'({a} - {p}) * {f0}.y + ({b} - {p}) '
+                               f'* {f1}.y + ({c} - {p}) * {f2}.y')
+        wpp, _t = em.tmp(FLOAT, f'0.5 * (sqrt(dot({dpx}, {dpx})) '
+                                f'+ sqrt(dot({dpy}, {dpy})))')
+        half, _t = em.tmp(FLOAT, f'{half} * {wpp}')
+    return em.tmp(FLOAT, f'({dmin} <= {half}) ? 1.0 : 0.0')
 
 
 def e_bsdf_metallic(em, node, _i):
@@ -2112,8 +2190,6 @@ REFUSED = {
     'ShaderNodeTexVoronoi': 'its cell jitter is the same sin-fract hash',
     'ShaderNodeTexMusgrave': 'its fractal is the same sin-fract Perlin',
     'ShaderNodeTexBrick': 'its per-brick tint is the same sin-fract hash',
-    'ShaderNodeWireframe': 'the frame pass carries no per-fragment '
-                           'triangle corners; wireframe shades on the CPU',
     'ShaderNodeVectorTransform': 'camera and object spaces need per-frame '
                                  'matrix uniforms the deferred pass does '
                                  'not bind yet',
@@ -2147,6 +2223,7 @@ EMITTERS = {
     'ShaderNodeNewGeometry': e_new_geometry,
     'ShaderNodeLayerWeight': e_layer_weight,
     'ShaderNodeBsdfGlossy': e_bsdf_glossy,
+    'ShaderNodeWireframe': e_wireframe,
     'ShaderNodeBsdfMetallic': e_bsdf_metallic,
     'ShaderNodeEeveeSpecular': e_bsdf_specular,
     'ShaderNodeBsdfTransparent': e_bsdf_transparent,

@@ -46,6 +46,15 @@ def _sc_mirror(st):
     return sc
 
 
+def _sc_shafts(st):
+    # light shafts gate on a light's volumetric value; the demo lights
+    # carry none, so a row on the plain demo scene would smear nothing
+    # and prove nothing (found by the settings audit)
+    sc = demo_scene(st, with_texture=False)
+    sc.lights[1].volumetric = 2.0
+    return sc
+
+
 def _sc_matcap_image(st):
     """The documented matcap workflow -- an image through Matcap
     Coordinates into the Matcap socket. The field's 'Eyes' material:
@@ -518,6 +527,60 @@ def _sc_geometry_node(st):
     return sc
 
 
+def _sc_light_linked(st):
+    """Light linking, both modes at once: a magenta point EXCLUDED from
+    object 1, a cyan point lighting ONLY object 2 -- the per-object
+    masks that routed the whole frame to the CPU until the td.y ladder
+    carried light_surface's isin() decision into the light loop."""
+    sc = demo_scene(st, with_texture=False)
+    ex = Light(type='POINT', name='not-the-ball',
+               position=(-2.0, -2.5, 4.0), color=(1.0, 0.2, 1.0),
+               energy=400.0, shadow='NONE')
+    ex.exclude_objects = (1,)
+    ex.exclude_mode = 'EXCLUDE'
+    on = Light(type='POINT', name='only-the-box',
+               position=(2.5, -2.0, 3.5), color=(0.2, 1.0, 1.0),
+               energy=400.0, shadow='NONE')
+    on.exclude_objects = (2,)
+    on.exclude_mode = 'ONLY'
+    sc.lights = list(sc.lights) + [ex, on]
+    return sc
+
+
+def _sc_geometry_aux_node(st):
+    """Geometry's True Normal (abs) scaled by Random Per Island -- the
+    two outputs that refused until the hal_triaux per-tri texture baked
+    the CPU's own stored normals and sin-fract randoms."""
+    sc = demo_scene(st, with_texture=False)
+    sc.materials[1].graph = {'output': 'out', 'nodes': {
+        'geo': {'id': 'geo', 'bl_idname': 'ShaderNodeNewGeometry',
+                'props': {}, 'inputs': [],
+                'outputs': [dict(o) for o in GEOMETRY_OUTS]},
+        'absn': {'id': 'absn', 'bl_idname': 'ShaderNodeVectorMath',
+                 'props': {'operation': 'ABSOLUTE'},
+                 'inputs': [_sk('Vector', 'VECTOR', [0, 0, 0],
+                                ['geo', 3])],
+                 'outputs': [{'name': 'Vector', 'type': 'VECTOR'}]},
+        'scal': {'id': 'scal', 'bl_idname': 'ShaderNodeVectorMath',
+                 'props': {'operation': 'SCALE'},
+                 'inputs': [_sk('Vector', 'VECTOR', [0, 0, 0],
+                                ['absn', 0]),
+                            _sk('Scale', 'VALUE', 1.0, ['geo', 8])],
+                 'outputs': [{'name': 'Vector', 'type': 'VECTOR'}]},
+        'bsdf': {'id': 'bsdf', 'bl_idname': 'ShaderNodeBsdfDiffuse',
+                 'props': {},
+                 'inputs': [_sk('Color', 'RGBA', [1, 1, 1, 1],
+                                ['scal', 0]),
+                            _sk('Roughness', 'VALUE', 0.0)],
+                 'outputs': [{'name': 'BSDF', 'type': 'SHADER'}]},
+        'out': {'id': 'out', 'bl_idname': 'ShaderNodeOutputMaterial',
+                'props': {},
+                'inputs': [_sk('Surface', 'SHADER', None, ['bsdf', 0]),
+                           _sk('Displacement', 'VECTOR', [0, 0, 0])],
+                'outputs': []}}}
+    return sc
+
+
 def _sc_wireframe_node(st):
     sc = demo_scene(st, with_texture=False)
     sc.materials[1].graph = {'output': 'out', 'nodes': {
@@ -546,6 +609,7 @@ def _sc_wireframe_node(st):
 
 SCENES = {
     'demo': _sc_demo, 'textured': _sc_textured, 'mirror': _sc_mirror,
+    'shafts': _sc_shafts,
     'matcap_image': _sc_matcap_image,
     'glass': _sc_glass, 'cookie_spot': _sc_cookie_spot,
     'cookie_sun': _sc_cookie_sun, 'area': _sc_area,
@@ -559,6 +623,8 @@ SCENES = {
     'flipbook_wave_node': _sc_flipbook_wave_node,
     'halftone_chain_node': _sc_halftone_chain_node,
     'geometry_node': _sc_geometry_node,
+    'geometry_aux_node': _sc_geometry_aux_node,
+    'light_linked': _sc_light_linked,
     'ortho': _sc_ortho,
 }
 
@@ -602,6 +668,7 @@ ROWS = [
     ('negative light', {}, 'negative'),
     ('spot gobo (projected texture)', {}, 'cookie_spot'),
     ('sun cloud cookie', {}, 'cookie_sun'),
+    ('light linking (exclude + only)', {}, 'light_linked'),
     # ------------------------------------------------------------ shadows
     ('shadows off', {'shadows': False}, 'demo'),
     ('ray shadows', {'shadow_default': 'RAY'}, 'demo'),
@@ -628,6 +695,8 @@ ROWS = [
     ('node Flipbook + UV Wave', {}, 'flipbook_wave_node'),
     ('node Halftone + Threshold + Quantize', {}, 'halftone_chain_node'),
     ('node Geometry (Tangent x Incoming)', {}, 'geometry_node'),
+    ('node Geometry TrueN x island random', {},
+     'geometry_aux_node'),
     ('radiosity (one bounce)', {'radiosity': True, 'radiosity_samples': 4,
                                 'radiosity_distance': 4.0}, 'demo'),
     ('radiosity full-rate (spacing 1)',
@@ -680,7 +749,8 @@ ROWS = [
                                   'fog_height_falloff': 1.5}, 'demo'),
     # -------------------------------------------------------------- depth
     ("Painter's sort", {'depth_sort': 'PAINTERS'}, 'demo'),
-    ('z-buffer no write', {'depth_sort': 'ZBUFFER_NOWRITE'}, 'demo'),
+    ("Painter's sort, nearest-vertex key",
+     {'depth_sort': 'PAINTERS', 'painters_key': 'NEAREST'}, 'demo'),
     ('16-bit z-buffer', {'depth_precision': 16}, 'demo'),
     ('vertex snapping (PS1)', {'vertex_snap': True,
                                'vertex_snap_grid': 1.0}, 'demo'),
@@ -713,7 +783,7 @@ ROWS = [
                      'star_intensity': 0.8}, 'demo'),
     ('lens flare', {'lens_flare': True, 'flare_intensity': 0.7}, 'demo'),
     ('light shafts', {'shaft_threshold': 0.4, 'shaft_length': 0.4},
-     'demo'),
+     'shafts'),
     ('depth of field', {'dof': True, 'dof_focus': 6.0,
                         'dof_amount': 2.0}, 'demo'),
     ('lens distortion + CA', {'lens_distortion': 0.3,

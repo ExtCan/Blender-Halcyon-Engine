@@ -4,6 +4,432 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
 
 ---
 
+## [1.30.0] — 2026-08-09
+
+### The big one
+
+The rule, set when the 1.25 line began, was: stay in 1.25.X until the
+GPU port is fully complete on all fronts. "It's good, but it needs to
+be complete. Ray tracing and all that." One hundred and six releases
+later the bar is met, and the field named the milestone 1.30.
+
+The proof is the self test's FEATURE × DEVICE MATRIX — 116 rows, every
+feature the engine has, rendered by the CPU device and the GPU device
+and diffed. The verdict from the release hardware (RTX 5060 Ti,
+Vulkan, driver 610.74):
+
+    116 rows: 114 raster+shade on the driver and matched,
+    2 partially routed to the CPU by name and matched, 0 FAILED
+    every feature works with the GPU device: the driver reproduces
+    it, or the switch routes it honestly
+
+The two routed rows are Painter's algorithm — an ordered submission
+fill, kept on the CPU by design, named in the console every time it
+runs. Everything else — all 18 reflectance models, ray tracing at any
+depth with soft shadows, occlusion, reflections, refraction and blurry
+cones, radiosity, every world in every mirror, transparent layers
+under rays with bumpy glass, the texture filter shelf including the
+N64's own 3-point, PS1 vertex snap and 16-bit z through the raster tie
+referral, light linking, stipple bit-for-bit, the burn-in slate — is
+the driver's work, measured against the CPU frame at the
+0.00005-or-exact class, with the picture provably independent of chunk
+size, thread count, band count, batch order and device.
+
+### What 1.30.0 contains beyond 1.25.106
+
+- The version, which is the point.
+- ROADMAP.md rewritten: the road to "1.26.0" ended; the file now
+  records what the complete port stands on, what is impossible by
+  construction (and says so in the console), and the named roads
+  beyond — refusals that could someday lift, new machinery, and the
+  tagged GitHub release the repository still lacks.
+- No engine code changed in this release. The 1.25.106 audit round is
+  the code this milestone ships; its field report (0 FAILED, with the
+  revived rows — FLOYD at High Color actually dithering, fixed-point
+  and integer subpixel live through the referral, the shafts row
+  shafting, Painter's nearest-vertex key proving its setting — all
+  matched) is the evidence the milestone stands on.
+
+### The arc, for the record
+
+Chosen at 1.25.18: the compute-rasteriser path. Landed along the way:
+deferred shading for every model and light; the BVH kernels and the
+complete ray arc; scheduling invariance; the F12 marshal (and the
+pump-only revert that ended the flashing); transparent layers under
+rays; Gouraud/flat on the driver; fog riding the readback; the mip
+atlas and footprint field; the viewport switch; radiosity in-shader;
+the raster endgame's named tie rule and ulp-sized referral; the
+shading endgame's five last routes; and the settings audit that made
+every slider tell the truth. The console names what routes and why,
+the self test measures everything it claims, and the matrix is the
+contract: the driver reproduces it, or the switch routes it honestly.
+
+---
+
+## [1.25.106] — 2026-08-09
+
+### The settings audit — every slider proven, or fixed until it could be
+
+The field asked for in-depth checks and then named the standard: "ensure
+all sliders, values, changeable settings work and actually do what they
+say." This round is that audit, and the standing test that keeps it true.
+
+### Added
+
+- **`test_every_setting_does_what_it_says`** — the whole settings class
+  now answers to one test with five standards: a reader sweep (every
+  field must be read inside the engine), the feature matrix's 90+
+  covered fields, an A/B table (~60 fields flipped against a rendered
+  frame — the picture must change, or for caches/schedulers must NOT
+  change), behavioural checks (extra passes, texture wrap, near-plane
+  clip, motion blur through a rigged engine, palette lock across frames,
+  the worker pool returning bit-identical pixels), and a declared-infra
+  list where every exemption carries its one-line reason. The
+  accounting fails the moment a new setting is added without a home.
+- **Kawase bloom** — Glow Shape's third value now exists in the code as
+  well as the menu: the classic repeated-diagonal-tap ladder (GDC 2003),
+  visibly bloomier than either box or Gaussian.
+- **Floyd–Steinberg (and every error diffusion) at High Color** — a
+  16-bit lattice is 65,536 entries, too many to diffuse against as a
+  palette, and the old code silently fell back to a plain snap: FS+RGB565,
+  THE era pairing, quietly did nothing. The lattice is separable, so each
+  channel now diffuses against its own level ramp. The matrix's
+  'error diffusion FLOYD' row was testing a no-op; it isn't any more.
+
+### Fixed — settings that did not do what they said
+
+- **`subpixel_precision` was read by nothing.** Two presets set INTEGER
+  and nothing changed. Fixed 1/4 / Fixed 1 / Integer now land on the
+  vertex-snap grid machinery (0.25 px / 1 px / 1 px); the coarser of it
+  and PS1 Vertex Snap wins. Integer's tooltip now says honestly that it
+  shares Fixed 1's whole-pixel grid (this raster rounds; it does not
+  reproduce the PS1's truncation phase).
+- **`glow_quality` produced one glow three ways.** BOX ran the same
+  triple-box-equals-Gaussian as GAUSS; KAWASE had no branch at all. BOX
+  is now a single square box pass, KAWASE is real (above), GAUSS keeps
+  the bell.
+- **`shadow_map_size` and `shadow_bias` (render settings) were
+  unreachable.** Every light's per-light values defaulted to 512/0.02,
+  and `light.x or settings.x` never fell through — the global sliders
+  drove nothing, ever. Per-light values now default to 0 = "use the
+  render setting" (tooltips say so); a light that sets its own still
+  wins. Pictures at defaults are bit-identical.
+- **`ray_shadows` gated a state no scene can reach** (a MAP-mode light
+  with no map — but every MAP-mode light gets one built). It is now the
+  master switch for traced shadows, RAY mode included: off, tracing
+  lights cast no shadow. CPU and GPU gates changed together.
+- **`aa_edge_threshold` compared device depth**, where a whole scene
+  spans a few thousandths and the 0..1 slider could never land anywhere
+  useful — the same trap the DoF focus slider fell into before it was
+  given metres. The crease test now runs in scene units (range widened
+  to 100), and Edge AA computes the linear depth it needs.
+- **`clip_near_epsilon` claimed 1e-4 and drove nothing** — wired to the
+  rasterisers at 1e-5, the value they have always effectively run;
+  default pictures are unchanged (verified bit-identical).
+- **`painters_key`'s comment listed another setting's values**
+  (`ZBUFFER | PAINTERS | ZBUFFER_NOWRITE`); it reads
+  `CENTROID | NEAREST | FARTHEST`, and `depth_sort` got its own honest
+  comment. `ZBUFFER_NOWRITE` exists nowhere in the engine.
+- **`threads` had two tooltips**, one contradicting the other (the stale
+  one won the dict merge and promised scaling the shading loop cannot
+  deliver). The honest one remains.
+- **properties.py had two orphaned enum lines** left by the corpse
+  removal below — the add-on would not import. Caught by the new test's
+  first run; `compileall` and the import both verified clean.
+
+### Removed
+
+- **Seven corpse settings** that no code read: `jitter`, `jitter_seed`,
+  `polygon_offset`, `palette_dither_first`, `tile_size`, `bucket_order`,
+  `max_texture_memory` — removed from the dataclass, the UI and the
+  preset preserve-list. The reader sweep in the standing test keeps the
+  count at zero.
+- **The 'z-buffer no write' matrix row** — it set
+  `depth_sort='ZBUFFER_NOWRITE'`, a value no code reads and the UI never
+  offered; the row rendered the baseline twice and called it coverage.
+  Replaced with a Painter's row using the NEAREST sort key, which proves
+  `painters_key` instead. Row count stays 116.
+
+### Fixed — test scaffolding that lied about coverage
+
+- **The 'light shafts' row shafted nothing**: shafts gate on a light's
+  `volumetric` value and the demo scene has none. The row now renders a
+  scene with a volumetric light; the old row was verified vacuous
+  (bit-identical to baseline) before the fix.
+- **The capability table**'s node-graph and shading-model rows still
+  said NOT_YET in a build where all 78 node emitters and 18 models
+  dispatch in GLSL — every render printed a stale refusal note. Both now
+  read BOTH.
+
+---
+
+## [1.25.105] — 2026-08-09
+
+### Added — the GPU endgame, round three: the last shading routes fall
+
+The 1.25.104 self-test came back 0 FAILED with the tie referral proven
+on real hardware — 16-bit z and vertex snapping both RSP. That left
+four shading routes. Three fall this round; the fourth (Painter's) is
+routed by design, forever.
+
+- **SPECULAR SLOT ROUTING** (queued since the node-shelf round). The
+  frame pass emits one per-pixel colour chain, and for a raw graph it
+  landed in the diffuse slot — wrong for a lone GLOSSY lobe, so those
+  materials refused. Now the probe reads the closure: a lone raw GLOSSY
+  lobe (the Metallic BSDF) routes its chain to `s.specular` — exactly
+  where `closure_to_surface` puts it — with the untouched flat diffuse
+  baked alongside; a DIFFUSE+GLOSSY pair (the Specular BSDF) keeps the
+  chain in the diffuse slot, its glossy colour baked through the
+  existing constancy rule. Both raw-BSDF matrix rows flip from R-P to
+  RSP; parity 7e-6 and exact.
+- **THE WIREFRAME NODE'S INK.** `ShadeJob.wire_fields`, expression for
+  expression in GLSL: world-space point-to-edge distance on the
+  fragment's own triangle (corners fetched from the attribute texture,
+  P re-interpolated the CPU's way), and — for Pixel Size — the
+  world-units-per-pixel scale from `hal_vscreen`, a per-corner screen
+  texture carrying the CPU's own projected (sx, sy, w). That texture is
+  CAMERA-DEPENDENT, so it rides the per-frame road beside the footprint
+  field, never the plan's atlas cache — an orbit cannot serve stale
+  screen positions (the R78 lesson wears many costumes). Works in
+  frame AND secondary passes (a hit has a triangle identity too,
+  exactly as ctx.wire_fields does). Both units sim-match EXACTLY
+  (0.000000); the cel-ink row flips to RSP.
+- **BLURRY REFLECTIONS — the cone reaches the sweeps.** The last
+  whole-frame settings refusal. `_blurred_reflection`, sweep edition:
+  every reflective spawn — primary rays and every recursive bounce —
+  expands to the CPU's K jittered directions (same BLUR_SALT streams
+  keyed to the pixel identity that follows a ray through the whole
+  recursion, same tangent-disk construction, same below-surface fold to
+  the mirror), each set traced through the same recursion, and the K
+  per-lane values (hit colour, or the sky along the jittered ray)
+  AVERAGED before the composite — exactly the CPU's mean. Shared by
+  the driver and the headless sim, one implementation. Parity 6e-6 at
+  4 and 8 samples; the row flips to RSP.
+- The matrix after this round: **113 of 116 rows full RSP.** Still
+  routed, each by design: Painter's sort (an ORDERED fill — the sort
+  is the feature), debug pass DEPTH (data passes skip post on
+  purpose), and the raster's OVERDRAW instrument. The named
+  small-scope refusals that remain (vertex-rate materials behind
+  glass, TRILINEAR footprints in LAYER passes, per-pixel opacity under
+  stipple, DepthCue, ortho Backfacing, >64-object light links) each
+  print their reason and shade exactly on the CPU.
+- Tests: slot routing (both rows, chain-in-slot pinned structurally),
+  wireframe both units exact, the 8-sample cone, and the era-audit
+  blur negative FLIPPED to the full positive.
+
+---
+
+## [1.25.104] — 2026-08-09
+
+### Fixed — the referral's windows learn the real wobble (field round)
+
+The 1.25.103 self-test came back with the affine rows at full RSP — and
+two honest verdicts on the tie referral: `vertex snapping (PS1)` engaged
+the driver and got ONE PIXEL WRONG (0.188, past the bar), and `16-bit
+z-buffer` stayed routed. Both had the same root: the fragility windows
+were sized in the wrong units.
+
+- **The z window was measured in STEPS; the wobble lives in ULPS.** At
+  16 bits a step dwarfs the arithmetic wobble and a step-scaled window
+  merely over-marks. At 24 bits — which is what the snapping row runs —
+  the relation inverts: the cross-device depth wobble spans ~8
+  quantisation steps, and a "within 5% of a boundary" test is
+  meaningless when the value's own uncertainty is 800% of a step. The
+  field pixel flipped straight through it. The window is now a RAW
+  pre-rounding GAP between the two best candidates, scaled to the
+  arithmetic: `0.25 steps + steps·2.5e-6` — a quarter step at coarse
+  precisions, ~21 steps at 24-bit, exactly the wobble each regime
+  actually has.
+- **The `e == 0.0` carve-out trusted exactness it could not prove.**
+  An edge function of exactly zero was assumed exact (true under
+  integer snapping, where all factors are half-integers and fma cannot
+  move them) — but near-plane-CLIPPED corners are not on the snap
+  grid, and an inexact computation that happens to round to 0.0 on the
+  CPU can come back ±1ulp on the driver. The carve-out now requires
+  PROOF: all four factors of that edge exact half-integers below 2^21
+  (checked with `fract(2x)==0`), or the zero is treated as fragile
+  like any other near-zero. Snapped shared edges still refuse to flood
+  (their exactness IS provable); clipped slivers now mark.
+- **The replay went vectorised and the budget went honest.** Marked
+  pixels now replay as one NumPy pass over (pixel × bin entry) — the
+  same float32 expressions, the same named tie rule, no Python loop —
+  so the bail threshold rises from 2% to 10% of coverage. Measured on
+  the matrix rows: 16-bit marks 2 pixels of 4263, snapping marks 118
+  (2.8%) — both REPLAY now, where the old windows either missed the
+  fragile pixel entirely (the snap FAIL) or, on the driver's own
+  arithmetic, flooded past the old 2% budget (the likely 16-bit bail).
+- **A zero raw gap is fragile too.** Two coincidentally-equal depths
+  can SPLIT under driver fma, and a split is decided by depth, not the
+  tie rule — so exact ties mark. Fully-DUPLICATED geometry (the same
+  mesh submitted twice) therefore floods the referral and the frame
+  honestly falls back to the CPU raster with the count printed:
+  degenerate scenes stay correct by refusing, exactly the doctrine.
+- **One field instrument added:** every referred frame prints
+  `raster tie referral: N of M covered pixels replayed`, so the next
+  self-test paste shows the referral's size instead of leaving it to
+  inference.
+
+---
+
+## [1.25.103] — 2026-08-09
+
+### Added — the GPU endgame, round two: the raster falls in line
+
+Three raster-side routes lifted, one dead control brought to life, and
+one latent CPU bug found and fixed by the work itself.
+
+- **THE NAMED TIE RULE (and the latent bug).** Building the raster tie
+  referral exposed something older: the CPU's own two fill paths
+  DISAGREED at exact quantised depth ties. The loop fill tested
+  triangles in submission order; the batched fill draws big triangles
+  first and size-buckets the rest — so "first tested wins" meant
+  *different winners by code path*: 3 pixels of the demo scene at 16
+  bits, latent since the batched fill shipped, invisible at 24 bits
+  where exact ties never occur. The scheduling-invariance doctrine says
+  the picture cannot depend on internal order, so ties now resolve by a
+  rule with no order in it at all: **equal depth → lowest triangle id
+  wins**. Implemented identically in the loop fill, the batched
+  resolve, the compute kernel and the referral replay; the two CPU
+  paths now agree bit-for-bit at 16-bit ties (pinned by test). The only
+  pictures this changes are pixels whose winner previously depended on
+  which code path ran — pixels that were, by definition, undefined.
+- **RASTER TIE REFERRAL — 16-bit z and vertex snapping raster on the
+  driver.** With ties deterministic, the only genuinely fragile
+  decisions left are cross-device float wobble: a depth whose ROUNDING
+  sits within a sliver of a quantisation step boundary in a CLOSE
+  competition (within ~2 steps — coincident contacts), and a pixel
+  centre within a few ULPS of a triangle edge (a driver's fma
+  contraction can move an edge function across zero; the window is
+  sized to the actual product-magnitude wobble, with exactly-zero edge
+  functions carved out — under integer snapping the products are exact
+  halves and both devices compute the same exact zero, so snapped
+  shared edges do not flood the referral). The kernel MARKS those
+  pixels (aux.w) and the CPU REPLAYS just them with the fill's own
+  float32 arithmetic — the R73 ray referral, at the raster. Measured on
+  the matrix's own rows: 16-bit marks 1 pixel of 4263, snapping marks
+  0; replay + unmarked pixels equal fill() EXACTLY. A frame whose marks
+  exceed 2% of coverage falls back whole, with the count printed — the
+  referral degrades to today's behaviour, never past it. Both matrix
+  rows flip from routed (-SP) to full RSP.
+- **AFFINE RASTER CARRY — the last -S in the affine rows.** The kernel
+  already had everything the warp needs: the resolve now also emits
+  `lb = l·bw` (the screen-linear barycentrics over the ORIGINAL
+  triangle, fill()'s own bary_lin formula) into a third image, bound
+  only for affine frames. Measured against the CPU's bary_lin: 6e-8.
+  Both affine rows flip from -SP to full RSP.
+- **AFFINE SUBDIVISION LIVES.** `tex_affine_subdiv` had a UI slider, a
+  range, and a PS1 preset shipping 16 — and NOTHING read it, ever (the
+  R95 dead-enum sweep missed it; the matrix could not see a knob dead
+  equally on both devices). It is now the era's real thing: the maximum
+  screen-space edge length in pixels before a triangle splits (4-way
+  midpoint, up to six passes). Splitting happens AFTER projection and
+  snapping, which is exact for every rasteriser input — screen
+  position, 1/w, ndc z and the original-triangle weights are all
+  screen-affine, so only the screen-LINEAR interpolation (the warp
+  itself) changes: big triangles stop swimming, exactly as PS1 engines
+  tamed it. Deterministic, shared by both rasterisers, coverage
+  identical by test. The 'affine + subdivision' row and the PS1 preset
+  now do what they always claimed.
+- Tests: the raster endgame suite (affine lin to the ulp; subdivision
+  bounded, deterministic, coverage-preserving; batched==loop at 16-bit;
+  exact ties decided by the rule with the kernel equal to fill BEFORE
+  any replay; boundary marks firing on near-coincident fixtures and
+  replay landing fill()'s exact answer; mark budgets on both matrix
+  rows; no marks when the referral is off).
+- **Still routed after this round** (each honest, most permanent):
+  Painter's sort (an ORDERED fill — the sort is the feature), OVERDRAW
+  debug (an instrument), bands (workers own their rows). The remaining
+  ENDGAME work: blurry reflections (the cone in the sweeps — next),
+  vertex-rate materials through glass, TRILINEAR footprints in LAYER
+  passes, DepthCue node, ortho Backfacing.
+
+---
+
+## [1.25.102] — 2026-08-08
+
+### Added — the GPU endgame, round one: the shading-side routes fall
+
+Five features that routed WHOLE FRAMES to the CPU by name now shade on
+the driver, each by its own honest road. The feature matrix grows to
+116 rows; every new road holds sim-vs-CPU parity at the deferred bar
+(≤6e-6 on every new row) and every new gate rides the plan signature
+(warm-cache regression tests prove a primed cache cannot walk around
+any of them — the R78 rule, enforced at birth).
+
+- **CONSTANT + WIREFRAME shading models.** `light_surface` returns
+  early for these models — full-bright `diffuse × diffuse level +
+  self-illumination`, no lights, no ambient, no silhouette cheats —
+  and the pass now emits exactly that. The wires themselves were never
+  shading: `apply_wireframe` carves them on the READBACK (the same
+  separable-stage doctrine that put fog on the readback in 1.25.79),
+  and it already ran there for every GPU frame. env and rays still
+  apply (the CPU adds those after `light_surface`), so a CONSTANT
+  mirror still reflects. Both matrix rows flip from routed to RSP;
+  parity 0.000000 (CONSTANT) and 0.000000 (WIREFRAME + carve).
+- **Normal Source FACE, and the Geometry node's True Normal + Random
+  Per Island — one road for all three: `hal_triaux`.** A per-triangle
+  texture bakes the CPU's OWN values: rgb = `normalize(
+  mesh.face_normals)` (the very values ctx.Ng carries — stored, never
+  recomputed, so mirrored objects cannot flip), alpha = the per-tri
+  sin-fract random (`_hash1` of the tri index — computed ONCE by the
+  same NumPy code the CPU evaluator runs, so no driver hash can
+  decorrelate it; the exact cure the R73 doctrine prescribes). FACE
+  mode replaces the shading normal AFTER the graph runs against the
+  interpolated one — the CPU's exact order — and the two-sided flip
+  and tangent frame pick it up exactly as `light_surface` does. Two
+  Geometry outputs flip from refusals to emits; a new matrix row
+  ('node Geometry TrueN x island random') pins them; the old negative
+  tests FLIPPED to positives, as scope-growth demands.
+- **Affine texture mapping (the PS1 warp) — shading half.** The frame
+  passes re-interpolate uv from `hal_gb_idslin`, a second ids texture
+  carrying the rasteriser's OWN screen-linear barycentrics verbatim.
+  uv ONLY, exactly `attributes()`: position, normals and vertex colour
+  stay perspective-correct, ray hits keep true barycentrics on either
+  device (the CPU's trace passes `bary_lin=None`; a structural test
+  pins `hal_gb_idslin` out of every secondary source), and the Bump
+  height pre-pass reads the same warp its CPU gradient fields read.
+  Transparent layers under affine keep their named CPU fallback (the
+  per-layer ids textures carry no screen-linear set yet). Both affine
+  rows flip to RSP at 6e-6. The RASTER of an affine frame still runs
+  on the CPU (craster does not carry bary_lin yet) — that half stays
+  routed by name and is next round's work.
+- **Screen-door STIPPLE.** The refusal was the generic opacity gate;
+  under Screen Door alpha is not compositing — it is the CPU's chain
+  (clamp, hard cutoff, then keep-or-drop against `threshold_map(
+  pattern, 64, 64)`) ending in a 0/1 decision. The pass emits that
+  chain and compares the SAME baked opacity against the SAME threshold
+  texels (the CPU's map, uploaded verbatim), so the decision is
+  identical by construction — the new test demands the GPU's alpha
+  pattern equal the CPU's BIT FOR BIT, and it does. The stipple bit
+  rides the target's alpha ENCODED above the coverage floor (0.9 kept
+  / 0.6 dropped / >0.5 covered — alpha doubled as the ownership flag),
+  is decoded at readback, and travels out of band on the G-buffer to
+  the frame's alpha channel. rgb stays the full shaded colour, exactly
+  the CPU's (rgb shaded, alpha stippled) split. A varying opacity
+  under stipple still refuses by name through the constancy rule.
+- **Light linking.** `light_surface`'s per-light mask — `isin(object,
+  linked)` in ONLY or EXCLUDE mode — emits as an unrolled ladder
+  against `td.y`, the per-tri object index the tri-data texture has
+  carried all along. An exact integer float compared at ±0.5: no
+  texture, no interpolation, no decision cliff. The mask multiplies
+  after visibility and before the clamp, the CPU's exact order, and
+  hits carry it identically (ctx.object_index_raw is set for trace
+  contexts too). A new matrix row runs both modes at once; more than
+  64 linked objects refuses by name (the one honest refusal left).
+- **What still routes, named plainly** (the remaining GPU endgame):
+  the affine RASTER (craster bary_lin carry); 16-bit depth + vertex
+  snap (the raster tie referral — quantised ties fall to the driver's
+  last bit, 3px measured; the referral machinery is designed, R73
+  style, but not built); Painter's algorithm (an ORDERED fill — the
+  sort is the feature; it routes honestly, likely forever); OVERDRAW
+  debug (an instrument, honest); blurry reflections (a cone of
+  jittered rays per fragment in the sweeps); vertex-rate materials
+  seen through glass/mirrors; TRILINEAR footprints in LAYER passes;
+  per-pixel opacity/edge-opacity under stipple; DepthCue node; ortho
+  Backfacing (needs its own mixed-winding fixture proof).
+
+---
+
 ## [1.25.101] — 2026-08-08
 
 ### Fixed — the rainbow egg can never resolve to nothing

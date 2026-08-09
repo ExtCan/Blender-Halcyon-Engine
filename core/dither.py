@@ -80,6 +80,26 @@ def ordered_bits(img, bits_rgb, kind='BAYER4', strength=1.0):
     return out
 
 
+def diffusion_bits(img, bits_rgb, kind='FLOYD', strength=1.0,
+                   serpentine=True, seed=0):
+    """Error diffusion straight onto per-channel level lattices.
+
+    A High Color lattice (5-6-5 is 65,536 entries) is far too large to
+    treat as a palette, but it is separable: the nearest lattice colour is
+    the nearest level per channel, so each channel diffuses independently
+    against its own grey ramp. This is exactly what a 90s converter did
+    when it wrote Floyd-Steinberg RGB565.
+    """
+    out = np.empty_like(img)
+    for ch in range(3):
+        ramp = np.linspace(0.0, 1.0, 1 << bits_rgb[ch], dtype=np.float32)
+        pal = np.stack([ramp, ramp, ramp], axis=1)
+        mono = np.repeat(img[:, :, ch:ch + 1], 3, axis=2)
+        out[:, :, ch] = apply_dither(mono, pal, kind, strength,
+                                     serpentine, seed=seed)[:, :, 0]
+    return out
+
+
 def ordered_palette(img, palette, kind='BAYER4', strength=1.0, icm=None):
     """Ordered dithering against an arbitrary palette.
 

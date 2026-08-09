@@ -1,122 +1,110 @@
-# Halcyon — the road to 1.26.0
+# Halcyon — the road ends: 1.30.0
 
-1.26.0 is "the big one": the GPU port complete on all fronts. This file
-is the living map of the distance left. Every item below either runs on
-the GPU (proven on real hardware against the CPU frame), refuses by name
-(the frame still renders correctly on the CPU and the console says why),
-or is impossible by construction and documented as such. The engine is
-coherent at every point in between — completeness is scope, not repair.
+This file used to be called "the road to 1.26.0", and 1.26.0 was "the
+big one": the GPU port complete on all fronts. The bar was met and the
+field renamed the milestone — **1.30.0 is that release.** Every feature
+either runs on the GPU (proven on real hardware against the CPU frame),
+refuses by name (the frame still renders correctly on the CPU and the
+console says why), or is impossible by construction and documented as
+such.
 
-Updated with each release. Numbers are from the field hardware
-(RTX 5060 Ti, Vulkan) unless marked headless.
+The proof is the FEATURE × DEVICE MATRIX in the self test — 116 rows,
+every feature the engine has, rendered by both devices and diffed. The
+field verdict on the release hardware (RTX 5060 Ti, Vulkan):
 
-## Proven on hardware (done)
+    116 rows: 114 raster+shade on the driver and matched,
+    2 partially routed to the CPU by name and matched, 0 FAILED
+    every feature works with the GPU device: the driver reproduces it,
+    or the switch routes it honestly
 
-- **Post stages** — display transform, lens, CRT, dither, NTSC composite
-- **Compute rasteriser** — IS `fill()`: 0 differing pixels, both sizes
-- **Deferred shading** — 0.000048-class whole frames: all shipped
-  reflectance models, SUN/POINT/SPOT/AREA, shadow-map atlases, image
-  textures, converted master materials, per-pixel surface parameters,
-  vertex colours, matcap/backface, coded shader nodes (native GLSL),
-  all 19 integer-hash pattern textures, generated coordinates
-- **Normal chains** — Normal Map bends the shading normal; the Bump node
+The two routed rows are Painter's algorithm — ordered submission fill,
+kept on the CPU by design and named in the console every time.
+
+Numbers throughout are from the field hardware unless marked headless.
+
+## The port, complete (what the matrix stands on)
+
+- **Post stages** — display transform, lens, CRT, dither, NTSC
+  composite (dot crawl stays CPU by construction — frame-dependent
+  state — and routes the frame honestly when used)
+- **Compute rasteriser** — IS `fill()`: 0 differing pixels; the named
+  tie rule (equal depth → lowest triangle id) holds in all four
+  engines, and 16-bit z / PS1 vertex snap / fixed-point subpixel run
+  through the tie referral: the kernel marks genuinely fragile
+  decisions and the CPU replays them with its own arithmetic
+- **Deferred shading** — 0.000048-class whole frames: all 18
+  reflectance models (CONSTANT and WIREFRAME emit the shadeless early
+  return; Gouraud/flat interpolate CPU-lit corners), SUN/POINT/SPOT/
+  AREA, shadow-map atlases, image textures, converted master
+  materials, per-pixel surface parameters, vertex colours,
+  matcap/backface, coded shader nodes (native GLSL), all pattern
+  textures, generated coordinates, light linking, screen-door stipple
+  (bit-equal alpha), FACE/True-Normal/Random-Per-Island, affine
+  mapping with subdivision, specular slot routing, the Wireframe node
+- **Normal chains** — Normal Map bends the shading normal; Bump
   renders a height pre-pass and differences it the CPU's own way;
-  sin-fract Noise heights evaluate on the CPU into the pre-pass, exactly
-- **Ray tracing, ANY depth — the arc is COMPLETE on hardware** — hard
-  ray shadows, SOFT ray shadows, ambient occlusion, reflections,
-  refraction with TIR, bent rays through the chains, secondary passes
-  for every material (visible or not), deterministic hash sampling
-  identical on both devices, and the full recursion tree at ray
-  depth > 1: mirror-in-mirror measured at 0.000024, 0 px of 172800 on
-  the field driver
-- **Sky/env in reflections** — SOLID, BLEND, GRADIENT, BANDS, EQUIRECT,
-  MIRRORBALL
-- **The engine's own honesty** — the picture no longer depends on chunk
-  size, thread count, or batch order, on either device
-
-## Remaining for 1.26.0
-
-Ray arc: **DONE** — confirmed on hardware in the 1.25.45 report.
-
-Skies and worlds (env term in reflections): **DONE — confirmed on
-hardware** (the Bryce sky lab in a mirror: 0.000048, 0 px of 172800 on
-the field driver). One mechanism took the whole column: rich worlds
-(STARFIELD, BRYCE, PHYSICAL, HDRI, world graphs, the ground plane) are
-evaluated by the renderer itself along the reflected rays and
-composited after readback — exact for any world by construction.
-
-Texture filters and transparency:
-
-- [x] Transparent-layer shading (Sorted Blend / A-Buffer) — shipped in
-      1.25.50-52: each depth layer's fragments shade as a full-screen
-      deferred pass with the REAL alpha chain emitted, merged under
-      the proven blend state, gathered per fragment. Field-verified at
-      the fragment level in the 1.25.51 report: 0 of 76573 flips, max
-      0.000048 on the driver. The whole-frame residual traced to the
-      A-buffer depth tie at modeled contacts and fixed in 1.25.52
-      (raster.abuf_depth_limit — the picture no longer depends on
-      which rasteriser rounded the opaque depth's last ULP).
-- [x] Transparent layers under ray tracing — DONE in 1.25.54: each
-      rank's fragments are a virtual PRIMARY surface and `_run_sweeps`
-      walks the full recursion from it — refraction through the glass,
-      reflections, any depth, soft shadows and AO sampled from the
-      fragment's own pixel identity, rich worlds at the final depth via
-      the '__env' composite. Headless proof per fragment against the
-      compositor's own CPU call, all exact: 0 of 7303 on the field's
-      all-transparent + ray shape. CONFIRMED on hardware in the
-      1.25.54 report: 0.000012, 0 px of 172800.
-- [x] Bump pre-passes on transparent layers — DONE in 1.25.55: height
-      pre-passes draw per rank over each layer's own ids (sin-fract
-      chains CPU-evaluated over the rank's virtual surface), and the
-      CPU now shades the A-buffer rank by rank with per-rank gradient
-      fields — fixing a pre-existing chunk-dependence in transparent
-      bump shading that the port surfaced. The Water anatomy as
-      glass: 0 of 678 headless, field confirmation pending.
-      Remaining named refusal: rich worlds behind NON-ray layers.
-- [ ] TRILINEAR / N64 three-point (need a mip footprint)
-- [ ] STIPPLE alpha
-- [ ] Affine barycentric carry (`tex_perspective` off)
-
-Textures:
-
-- [ ] Gabor noise
-- [ ] TexSky node
-
-Shadows:
-
-- [ ] Cast-filtered shadows
-
-CPU-side polish (not GPU, still 1.26-adjacent):
-
-- [x] Worker-band bump/gradient seams — DONE in 1.25.48: bands
-      rasterise one context row and build gradient fields from full
-      coverage; two bands stitch to the exact whole frame (0.0). The
-      picture no longer depends on ANY internal scheduling — chunks,
-      threads, or bands.
-- [ ] Viewport GPU mode (design question — the preview is CPU by design)
-- [x] F12 UI freeze — DONE in 1.25.53: `bl_use_gpu_context` is off by
-      default; the render thread runs with no GPU context and every
-      driver burst (compile, upload, draw, read back) marshals to the
-      main thread through gpu/marshal.py, so the interface breathes
-      between bursts. Background renders hold the context automatically
-      (nothing to freeze, and `-b` may pump no timers); the Debug
-      panel's "Hold GPU Context" restores the old mode; every
-      marshalling failure falls back to the CPU frame with the reason
-      printed. Field confirmation pending.
+  sin-fract Noise heights evaluate on the CPU into the pre-pass,
+  exactly
+- **Ray tracing, ANY depth** — hard and SOFT shadows, ambient
+  occlusion, reflections, refraction with TIR, blurry (cone)
+  reflections, bent rays through the chains, secondary passes for
+  every material, deterministic hash sampling identical on both
+  devices, the full recursion tree (mirror-in-mirror 0.000024, 0 px)
+- **Radiosity** — the one-bounce gather in-shader, full-rate and
+  interpolated grid
+- **Every world reflects** — simple modes as baked GLSL; STARFIELD,
+  BRYCE, PHYSICAL, HDRI, world graphs and the ground plane evaluated
+  by the renderer itself along the reflected rays
+- **Transparent layers** — sorted blend and A-buffer shading, under
+  rays, with bump pre-passes, hybrid GPU/CPU routing invisible in the
+  picture
+- **Texture filters** — TRILINEAR, mip bias, anisotropy, N64 3-point,
+  from the CPU's own mip atlases with its own footprint field
+- **The viewport** — drafts and refines honor the device switch
+  through the F12 marshal
+- **The engine's honesty** — the picture does not depend on chunk
+  size, thread count, band count, batch order, or device; every
+  refusal is by name with the reason in the console; the settings
+  audit holds every slider to a proof (`test_every_setting_does_what_
+  it_says`)
 
 ## Impossible by construction (documented, not planned)
 
-- Error diffusion dithers (Floyd–Steinberg family) — sequential by
-  definition; the wavefront helps the CPU, no GPU formulation keeps
-  the result
+- Error diffusion dithers on the GPU — sequential by definition; the
+  wavefront helps the CPU (and since 1.25.106 High Color diffuses per
+  channel), but no GPU formulation keeps the result
 - A-buffer fragment COLLECTION — an unbounded per-pixel fragment list
-  is a different algorithm, not a port; the rasterise, depth sort,
-  rank and farthest-first composite stay CPU. (The SHADING of those
-  fragments deferred to the GPU in 1.25.50 — the list itself is what
-  stays.)
+  is a different algorithm, not a port; the shading of those fragments
+  is on the GPU, the list itself stays
 - Dot crawl (NTSC) — frame-dependent state
+- Painter's algorithm on the GPU — ordered submission fill; routed by
+  name
 
-## Beyond the GPU port
+## Beyond 1.30.0 (the next roads)
 
-- Baking, motion blur, subpixel precision / affine subdivision options
-- A tagged GitHub release
+Named refusals that could someday lift (each prints and shades on the
+CPU exactly today):
+
+- Vertex-rate materials behind glass
+- TRILINEAR footprints in LAYER passes
+- Per-pixel opacity under stipple
+- Ortho Backfacing (needs a mixed-winding ortho fixture first)
+- Light linking past 64 objects
+- Rich worlds behind NON-ray layers
+
+New machinery:
+
+- Region/border render with exact pixel-identity
+- Hybrid opaque frame (split one frame's materials across devices)
+- QTVR strip panorama camera
+- DepthCue node emitter
+- In-graph Bevel
+- Gabor noise and Sky Texture GLSL emitters (CPU evaluators exist;
+  they refuse per material today)
+- Cast-filtered shadows
+- Baking
+
+Housekeeping:
+
+- A tagged GitHub release (the repo has none; the README install link
+  points at an empty page)

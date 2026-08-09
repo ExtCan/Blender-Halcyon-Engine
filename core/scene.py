@@ -121,8 +121,11 @@ class Light:
     decay_end: float = 25.0
     # Shadowing
     shadow: str = 'MAP'               # NONE | MAP | RAY
-    shadow_map_size: int = 512
-    shadow_bias: float = 0.02
+    # 0 = inherit the render setting. The old defaults (512 / 0.02) sat in
+    # front of the global sliders and made them unreachable: `light.x or
+    # settings.x` never fell through (found by the settings audit)
+    shadow_map_size: int = 0
+    shadow_bias: float = 0.0
     shadow_softness: float = 1.0      # shadow-map blur radius in texels
     shadow_samples: int = 4
     shadow_color: tuple = (0.0, 0.0, 0.0)

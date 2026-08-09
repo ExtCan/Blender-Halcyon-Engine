@@ -458,9 +458,15 @@ def run_render(props_mod, engine_mod, **kw):
 
     Returns (image, passes, scene) -- the RGBA buffer written into Combined,
     a dict of the extra pass buffers, and the exported Halcyon scene.
+
+    `rig`, if given, is called as rig(eng, depsgraph, bscene) after the
+    engine stub is dressed and before render runs -- the hook a test uses
+    to bolt on pieces bpy normally provides (frame_set for motion blur,
+    a moving light, a ticking clock).
     """
     material = kw.pop('material', None)
     mesh = kw.pop('mesh', None)
+    rig = kw.pop('rig', None)
     depsgraph, bscene, hs, _mat = build_scene(props_mod, material, mesh, **kw)
 
     eng = engine_mod.HalcyonRenderEngine.__new__(engine_mod.HalcyonRenderEngine)
@@ -496,6 +502,8 @@ def run_render(props_mod, engine_mod, **kw):
     # Blender asks which passes exist before it builds the result
     eng.update_render_passes(bscene, bscene.view_settings)
 
+    if rig is not None:
+        rig(eng, depsgraph, bscene)
     eng.render(depsgraph)
 
     res = captured['result']

@@ -5,9 +5,14 @@ fill conventions differ at triangle edges -- so the port is the CPU's own
 algorithm as a compute kernel. The design that makes exactness POSSIBLE is
 per-pixel sequential resolve: the screen is cut into tiles, triangles are
 binned per tile on the CPU (cheap, vectorised), and every pixel walks its
-tile's bin IN SUBMISSION ORDER with the strict `<` depth test. First
-triangle wins ties because it is literally tested first, exactly as fill()
-writes first -- no atomics, no resolve pass, nothing order-dependent.
+tile's bin with the strict `<` depth test and THE NAMED TIE RULE -- equal
+depth goes to the lowest triangle id. The rule is order-free by
+construction, which is what lets this kernel, the loop fill AND the
+batched fill land the same winner: "first tested wins" silently depended
+on each path's internal order (the batched path draws big triangles
+first), and at quantised depths -- where exact ties are common -- the two
+CPU paths themselves disagreed on 3 pixels of the demo scene until the
+rule was named.
 
 Everything numerical is float32 on both sides, so agreement is to the ulp;
 the residual risk is a pixel whose edge function sits within one ulp of
@@ -57,14 +62,30 @@ float hal_rbin_entry(float i)
     return v.w;
 }
 
+uniform float hal_refer;             // 1 = mark fragile decisions (aux.w)
+
 // walk one pixel's bin in submission order; fill()'s exact rules.
-// returns (winner emitted-tri index or -1, l0, l1, depth)
-vec4 hal_raster_pixel(vec2 pix, float start, float count, float cull)
+// returns (winner emitted-tri index or -1, l0, l1, depth); `fragile`
+// comes back 1.0 when this pixel's DECISION sat inside a cross-device
+// noise window -- a candidate depth within an ulp-wobble of a
+// quantisation boundary, two candidates within a couple of quantised
+// steps of each other (coincident surfaces on shared steps), a pixel
+// centre within a sliver of a triangle edge, or a triangle at the
+// degenerate-area gate. The caller replays marked pixels with the
+// CPU's own arithmetic: the raster tie referral, exactly the ray
+// referral's shape (name the noise-window decisions, route them to
+// the reference).
+vec4 hal_raster_pixel(vec2 pix, float start, float count, float cull,
+                      out float fragile)
 {
     float best_z = 1e30;
+    float min_v = 1e30;
+    float second_v = 1e30;
     float win = -1.0;
+    float win_src = 1e30;
     float wl0 = 0.0;
     float wl1 = 0.0;
+    float frag = 0.0;
     float X = pix.x;
     float Y = pix.y;
     for (int i = 0; i < int(count); i++) {
@@ -76,7 +97,11 @@ vec4 hal_raster_pixel(vec2 pix, float start, float count, float cull)
         float xb = cb.x; float yb = cb.y;
         float xc = cc.x; float yc = cc.y;
         float ar = (xb - xa) * (yc - ya) - (xc - xa) * (yb - ya);
-        if (abs(ar) <= 1e-9) { continue; }
+        if (abs(ar) <= 1e-9) {
+            // a 1-ulp ar on the other device could clear this gate
+            if (hal_refer > 0.5 && abs(ar) > 5e-10) { frag = 1.0; }
+            continue;
+        }
         if (cull > 0.5 && cull < 1.5 && ar <= 0.0) { continue; }
         if (cull > 1.5 && ar >= 0.0) { continue; }
         // the CPU tests only pixels inside the CLAMPED bounding box
@@ -92,6 +117,51 @@ vec4 hal_raster_pixel(vec2 pix, float start, float count, float cull)
         float e0 = (xc - xb) * (Y - yb) - (yc - yb) * (X - xb);
         float e1 = (xa - xc) * (Y - yc) - (ya - yc) * (X - xc);
         float e2 = (xb - xa) * (Y - ya) - (yb - ya) * (X - xa);
+        if (hal_refer > 0.5) {
+            // sliver window: coverage flips when a driver's fma
+            // contraction moves an edge function across zero. The
+            // wobble is at most a few ulps of the PRODUCT magnitudes,
+            // so the window is sized to exactly that -- not to the
+            // area, not to a guess. An e of exactly 0.0 is carved out
+            // ONLY when the exactness is PROVABLE: all four factors of
+            // that edge exact half-integers below 2^21 (integer vertex
+            // snapping plus half-integer pixel centres), where the
+            // products and their difference are exactly representable
+            // and fma cannot move them. The first carve-out trusted
+            // e == 0.0 unconditionally, and the field flipped one
+            // snapped pixel whose zero came from INEXACT clipped
+            // corners rounding to it -- exactly the hole this test
+            // closes.
+            float d0a = xc - xb; float d0b = Y - yb;
+            float d0c = yc - yb; float d0d = X - xb;
+            float d1a = xa - xc; float d1b = Y - yc;
+            float d1c = ya - yc; float d1d = X - xc;
+            float d2a = xb - xa; float d2b = Y - ya;
+            float d2c = yb - ya; float d2d = X - xa;
+            float m0 = abs(d0a * d0b) + abs(d0c * d0d);
+            float m1 = abs(d1a * d1b) + abs(d1c * d1d);
+            float m2 = abs(d2a * d2b) + abs(d2c * d2d);
+            float x0 = (fract(abs(d0a) * 2.0) == 0.0
+                        && fract(abs(d0b) * 2.0) == 0.0
+                        && fract(abs(d0c) * 2.0) == 0.0
+                        && fract(abs(d0d) * 2.0) == 0.0
+                        && m0 < 2097152.0) ? 1.0 : 0.0;
+            float x1 = (fract(abs(d1a) * 2.0) == 0.0
+                        && fract(abs(d1b) * 2.0) == 0.0
+                        && fract(abs(d1c) * 2.0) == 0.0
+                        && fract(abs(d1d) * 2.0) == 0.0
+                        && m1 < 2097152.0) ? 1.0 : 0.0;
+            float x2 = (fract(abs(d2a) * 2.0) == 0.0
+                        && fract(abs(d2b) * 2.0) == 0.0
+                        && fract(abs(d2c) * 2.0) == 0.0
+                        && fract(abs(d2d) * 2.0) == 0.0
+                        && m2 < 2097152.0) ? 1.0 : 0.0;
+            if ((x0 < 0.5 && abs(e0) < 2.5e-7 * m0)
+                    || (x1 < 0.5 && abs(e1) < 2.5e-7 * m1)
+                    || (x2 < 0.5 && abs(e2) < 2.5e-7 * m2)) {
+                frag = 1.0;
+            }
+        }
         bool inside = (ar > 0.0)
             ? (e0 >= 0.0 && e1 >= 0.0 && e2 >= 0.0)
             : (e0 <= 0.0 && e1 <= 0.0 && e2 <= 0.0);
@@ -105,30 +175,69 @@ vec4 hal_raster_pixel(vec2 pix, float start, float count, float cull)
         // quantize_depth applies -- roundEven matches NumPy's
         // half-to-even, so both rasterisers round half-cases alike
         if (hal_zsteps > 0.5) {
-            zz = roundEven((zz * 0.5 + 0.5) * hal_zsteps)
-                 / hal_zsteps * 2.0 - 1.0;
+            float v = (zz * 0.5 + 0.5) * hal_zsteps;
+            // the RAW pre-rounding value, tracked for the fragility
+            // gate below: a cross-device winner flip requires the two
+            // best raw values to sit within the arithmetic wobble of
+            // each other -- boundary proximity alone flips nothing
+            if (hal_refer > 0.5) {
+                if (v < min_v) { second_v = min_v; min_v = v; }
+                else if (v < second_v) { second_v = v; }
+            }
+            zz = roundEven(v) / hal_zsteps * 2.0 - 1.0;
         }
         if (zz < best_z) {
             best_z = zz;
             win = e;
+            win_src = hal_rc_fetch(e * 6.0 + 1.0).w;
             wl0 = l0;
             wl1 = l1;
+        } else if (zz == best_z && win > -0.5) {
+            // THE NAMED TIE RULE, shared with both CPU fill paths:
+            // equal depth goes to the LOWEST triangle id -- order-free,
+            // so an exact quantised tie is NOT fragile by itself
+            float s = hal_rc_fetch(e * 6.0 + 1.0).w;
+            if (s < win_src) {
+                win = e;
+                win_src = s;
+                wl0 = l0;
+                wl1 = l1;
+            }
         }
     }
+    if (hal_refer > 0.5 && hal_zsteps > 0.5 && win > -0.5
+            && (second_v - min_v)
+               <= (0.25 + hal_zsteps * 2.5e-6)) {
+        // the z fragility window, in RAW value units: the depth wobble
+        // between devices is ulp-scale in zz (a few e-7), which is
+        // hal_zsteps * ~1e-7 in v units -- MANY steps at 24 bits, a
+        // fraction of one at 16. The first window was sized in STEPS
+        // and the field flipped a snapped 24-bit pixel straight through
+        // it: at fine quantisation the wobble dwarfs the step, and only
+        // a raw-gap window scaled to the arithmetic (plus a quarter
+        // step for the coarse-bits rounding case) names every fragile
+        // competition at every depth precision.
+        frag = 1.0;
+    }
+    fragile = frag;
     return vec4(win, wl0, wl1, best_z);
 }
 
 // the winner's outputs, exactly as fill() writes them: perspective-correct
 // barycentrics over the ORIGINAL triangle, the source id, the front flag
 // ids  = (b0, b1, 1-b0-b1, src_tri)  -- byte for byte what pack_ids packs
-// aux  = (zndc, front, b2, 0) -- b2 is the CPU's OWN third barycentric, so
-// the reconstructed G-buffer carries fill()'s exact value, not 1-b0-b1
-void hal_raster_resolve(vec4 winner, vec2 pix,
-                        out vec4 ids, out vec4 aux)
+// aux  = (zndc, front, b2, fragile) -- b2 is the CPU's OWN third
+// barycentric; fragile is the referral mark hal_raster_pixel raised
+// lin  = (lb0, lb1, lb2, 0) -- the SCREEN-LINEAR barycentrics over the
+// original triangle (l . bw, no perspective division): the affine
+// texture warp's own interpolants, fill()'s bary_lin
+void hal_raster_resolve(vec4 winner, vec2 pix, float fragile,
+                        out vec4 ids, out vec4 aux, out vec4 lin)
 {
     if (winner.x < -0.5) {
         ids = vec4(0.0, 0.0, 0.0, -1.0);
-        aux = vec4(1.0, 1.0, 0.0, 0.0);
+        aux = vec4(1.0, 1.0, 0.0, fragile);
+        lin = vec4(0.0);
         return;
     }
     float e = winner.x;
@@ -154,9 +263,11 @@ void hal_raster_resolve(vec4 winner, vec2 pix,
     float p1 = l1 * cb.w / invw;
     float p2 = l2 * cc.w / invw;
     vec3 b = p0 * ba.xyz + p1 * bb.xyz + p2 * bc.xyz;
+    vec3 lb = l0 * ba.xyz + l1 * bb.xyz + l2 * bc.xyz;
     float front = (ar < 0.0) ? 1.0 : 0.0;
     ids = vec4(b.x, b.y, 1.0 - b.x - b.y, ba.w);
-    aux = vec4(winner.w, front, b.z, 0.0);
+    aux = vec4(winner.w, front, b.z, fragile);
+    lin = vec4(lb, 0.0);
 }
 """
 
@@ -169,16 +280,20 @@ uniform float hal_bin_count;
 uniform float hal_cull;
 out vec4 Ids;
 out vec4 Aux;
+out vec4 Lin;
 
 void main()
 {
+    float fragile = 0.0;
     vec4 win = hal_raster_pixel(hal_pix, hal_bin_start, hal_bin_count,
-                                hal_cull);
+                                hal_cull, fragile);
     vec4 ids;
     vec4 aux;
-    hal_raster_resolve(win, hal_pix, ids, aux);
+    vec4 lin;
+    hal_raster_resolve(win, hal_pix, fragile, ids, aux, lin);
     Ids = ids;
     Aux = aux;
+    Lin = lin;
 }
 """
 
@@ -230,7 +345,7 @@ def _exact_core():
 #: compute wrapper: bin ranges per pixel from the tile texture; the driver
 #: runs this one. Images are written, samplers are read -- by texelFetch,
 #: per the note above (the tiles fetch included)
-COMPUTE_SOURCE = _exact_core() + """
+_COMPUTE_SHELL = """
 uniform sampler2D hal_rtiles;        // per tile: (start, count, 0, 0)
 uniform float hal_rtiles_w;
 uniform float hal_rtiles_h;
@@ -245,14 +360,25 @@ void main()
     vec2 pix = vec2(float(xy.x) + 0.5, float(xy.y) + 0.5);
     vec4 trange = texelFetch(hal_rtiles,
                              ivec2(xy.x / TILE_I, xy.y / TILE_I), 0);
-    vec4 win = hal_raster_pixel(pix, trange.x, trange.y, hal_cull);
+    float fragile = 0.0;
+    vec4 win = hal_raster_pixel(pix, trange.x, trange.y, hal_cull,
+                                fragile);
     vec4 ids;
     vec4 aux;
-    hal_raster_resolve(win, pix, ids, aux);
+    vec4 lin;
+    hal_raster_resolve(win, pix, fragile, ids, aux, lin);
     imageStore(hal_out_ids, xy, ids);
     imageStore(hal_out_aux, xy, aux);
+    LIN_STORE
 }
 """.replace('TILE_I', str(TILE))
+
+COMPUTE_SOURCE = _exact_core() + _COMPUTE_SHELL.replace('LIN_STORE', '')
+#: the affine variant: a third image carries the screen-linear
+#: barycentrics. A separate compiled shader because image bindings are
+#: part of the compile signature; perspective frames never pay for it.
+COMPUTE_SOURCE_LIN = _exact_core() + _COMPUTE_SHELL.replace(
+    'LIN_STORE', 'imageStore(hal_out_lin, xy, lin);')
 
 
 def _square(texels):
@@ -339,15 +465,17 @@ def pack_raster_inputs(sx, sy, iw, z, bw, src, tri_map, width, height):
 
 
 def simulate_raster(sx, sy, iw, z, bw, src, tri_map, width, height,
-                    cull='NONE', depth_bits=32):
+                    cull='NONE', depth_bits=32, refer=False):
     """Run the kernel through Halcyon's own front-end, tile by tile.
 
     Returns (tri (H,W) int32, bary (H,W,3), zndc (H,W), front (H,W) bool,
-    b2 (H,W)) -- the G-buffer the driver's dispatch would produce, computed
-    without a driver. bary[..., 2] carries the CPU's own third barycentric
-    (from aux), not 1-b0-b1. The per-tile shape keeps the kernel's loop
-    bound uniform across lanes, which is the one thing the front-end's SIMT
-    model requires.
+    b2 (H,W), lin (H,W,3), mark (H,W) bool) -- the G-buffer the driver's
+    dispatch would produce, computed without a driver. bary[..., 2]
+    carries the CPU's own third barycentric (from aux), not 1-b0-b1;
+    `lin` carries the screen-linear barycentrics (the affine warp's
+    interpolants); `mark` the referral flags when `refer`. The per-tile
+    shape keeps the kernel's loop bound uniform across lanes, which is
+    the one thing the front-end's SIMT model requires.
     """
     from ..core.texture import Texture
     from ..shaders.compiler import try_compile
@@ -363,6 +491,8 @@ def simulate_raster(sx, sy, iw, z, bw, src, tri_map, width, height,
     zndc = np.full((height, width), 1.0, np.float32)
     front = np.ones((height, width), bool)
     b2 = np.zeros((height, width), np.float32)
+    lin = np.zeros((height, width, 3), np.float32)
+    mark = np.zeros((height, width), bool)
     cull_f = {'NONE': 0.0, 'BACK': 1.0, 'FRONT': 2.0}.get(cull, 0.0)
     zsteps = float((1 << int(max(2, depth_bits))) - 1) \
         if depth_bits < 32 else 0.0
@@ -391,9 +521,12 @@ def simulate_raster(sx, sy, iw, z, bw, src, tri_map, width, height,
             uni['hal_bin_count'] = np.full(n, count, np.float32)
             uni['hal_cull'] = np.full(n, cull_f, np.float32)
             uni['hal_zsteps'] = np.full(n, zsteps, np.float32)
+            uni['hal_refer'] = np.full(n, 1.0 if refer else 0.0,
+                                       np.float32)
             outs = prog.run(uni, {}, n)[0]
             ids = outs['Ids']
             aux = outs['Aux']
+            lin_o = outs['Lin']
             yy = Y.ravel()
             xx = X.ravel()
             tri[yy, xx] = np.round(ids[:, 3]).astype(np.int32)
@@ -403,11 +536,120 @@ def simulate_raster(sx, sy, iw, z, bw, src, tri_map, width, height,
             zndc[yy, xx] = aux[:, 0]
             front[yy, xx] = aux[:, 1] > 0.5
             b2[yy, xx] = aux[:, 2]
-    return tri, bary, zndc, front, b2
+            lin[yy, xx, :] = lin_o[:, :3]
+            mark[yy, xx] = aux[:, 3] > 0.5
+    return tri, bary, zndc, front, b2, lin, mark
+
+
+def replay_pixels(pxs, pys, sx, sy, iw, z, bw, src_final,
+                  tiles, bins_flat, tw, cull, depth_bits):
+    """The raster tie referral's CPU half: re-decide marked pixels.
+
+    Vectorised over (marked pixel x bin entry) with the CPU fill's own
+    float32 expressions -- e_i, l_i = e_i * (1/ar), zz = l.z,
+    quantize_depth, and the named tie rule (equal depth -> lowest
+    triangle id) -- so the answer at a fragile pixel is the
+    reference's own, not the driver's last bit, at NumPy speed rather
+    than a Python loop's. Returns (tri, bary, lin, zndc, front) over
+    the given pixels; tri -1 where nothing covers.
+    """
+    from ..core.raster import quantize_depth
+    f32 = np.float32
+    n = int(pxs.size)
+    out_tri = np.full(n, -1, np.int32)
+    out_b = np.zeros((n, 3), np.float32)
+    out_lb = np.zeros((n, 3), np.float32)
+    out_z = np.full(n, 1.0, np.float32)
+    out_front = np.ones(n, bool)
+    if n == 0:
+        return out_tri, out_b, out_lb, out_z, out_front
+
+    starts = tiles[:, :, 0].ravel().astype(np.int64)
+    counts = tiles[:, :, 1].ravel().astype(np.int64)
+    t_idx = (pys.astype(np.int64) // TILE) * tw + \
+        (pxs.astype(np.int64) // TILE)
+    s0 = starts[t_idx]
+    cnt = counts[t_idx]
+    maxc = int(cnt.max()) if cnt.size else 0
+    if maxc == 0:
+        return out_tri, out_b, out_lb, out_z, out_front
+    lane = np.arange(maxc, dtype=np.int64)[None, :]
+    valid = lane < cnt[:, None]
+    entry = np.where(valid, s0[:, None] + lane, 0)
+    T = bins_flat[entry].astype(np.int64)               # (n, maxc)
+
+    X = (pxs.astype(np.float32) + f32(0.5))[:, None]
+    Y = (pys.astype(np.float32) + f32(0.5))[:, None]
+    xa, xb, xc = sx[T, 0], sx[T, 1], sx[T, 2]
+    ya, yb, yc = sy[T, 0], sy[T, 1], sy[T, 2]
+    ar = (xb - xa) * (yc - ya) - (xc - xa) * (yb - ya)
+    ok = valid & (np.abs(ar) > 1e-9)
+    if cull == 'BACK':
+        ok &= ar > 0.0
+    elif cull == 'FRONT':
+        ok &= ar < 0.0
+    bxmin = np.maximum(np.floor(np.minimum(np.minimum(xa, xb), xc)), 0.0)
+    bxmax = np.ceil(np.maximum(np.maximum(xa, xb), xc))
+    bymin = np.maximum(np.floor(np.minimum(np.minimum(ya, yb), yc)), 0.0)
+    bymax = np.ceil(np.maximum(np.maximum(ya, yb), yc))
+    ix = X - f32(0.5)
+    iy = Y - f32(0.5)
+    ok &= (ix >= bxmin) & (ix <= bxmax) & (iy >= bymin) & (iy <= bymax)
+    e0 = (xc - xb) * (Y - yb) - (yc - yb) * (X - xb)
+    e1 = (xa - xc) * (Y - yc) - (ya - yc) * (X - xc)
+    e2 = (xb - xa) * (Y - ya) - (yb - ya) * (X - xa)
+    pos = ar > 0.0
+    inside = np.where(pos, (e0 >= 0) & (e1 >= 0) & (e2 >= 0),
+                      (e0 <= 0) & (e1 <= 0) & (e2 <= 0))
+    ok &= inside
+    inv_area = f32(1.0) / np.where(ar == 0.0, f32(1.0), ar)
+    l0 = e0 * inv_area
+    l1 = e1 * inv_area
+    l2 = e2 * inv_area
+    zz = l0 * z[T, 0] + l1 * z[T, 1] + l2 * z[T, 2]
+    if depth_bits < 32:
+        zz = quantize_depth(zz, depth_bits)
+    src_t = src_final[T]
+
+    # the winner: minimum quantised depth, ties to the lowest triangle
+    # id, then to the earliest bin entry (submission order) -- exactly
+    # the batched resolve's stable lexsort
+    zbig = np.where(ok, zz, np.float32(np.inf))
+    zmin = zbig.min(axis=1)
+    covered = np.isfinite(zmin)
+    at_min = ok & (zbig == zmin[:, None])
+    sbig = np.where(at_min, src_t, np.int64(2**62))
+    smin = sbig.min(axis=1)
+    pick_mask = at_min & (src_t == smin[:, None])
+    pick = np.argmax(pick_mask, axis=1)                 # first True
+    rows = np.arange(n)
+    tW = T[rows, pick]
+    l0w = l0[rows, pick]
+    l1w = l1[rows, pick]
+    l2w = l2[rows, pick]
+    arw = ar[rows, pick]
+    iw0, iw1, iw2 = iw[tW, 0], iw[tW, 1], iw[tW, 2]
+    invw = l0w * iw0 + l1w * iw1 + l2w * iw2
+    invw = np.where(np.abs(invw) < 1e-20, f32(1e-20), invw)
+    p0 = l0w * iw0 / invw
+    p1 = l1w * iw1 / invw
+    p2 = l2w * iw2 / invw
+    bwt = bw[tW]                                        # (n, 3, 3)
+    P = np.stack([p0, p1, p2], axis=1).astype(np.float32)
+    L = np.stack([l0w, l1w, l2w], axis=1).astype(np.float32)
+    b_all = np.einsum('nk,nkc->nc', P, bwt).astype(np.float32)
+    lb_all = np.einsum('nk,nkc->nc', L, bwt).astype(np.float32)
+
+    out_tri[covered] = src_t[rows, pick][covered].astype(np.int32)
+    out_b[covered] = b_all[covered]
+    out_lb[covered] = lb_all[covered]
+    out_z[covered] = zmin[covered].astype(np.float32)
+    out_front[covered] = (arw < 0.0)[covered]
+    return out_tri, out_b, out_lb, out_z, out_front
 
 
 def raster_inputs_for(scene_mesh, vp, width, height, near_eps=1e-5,
-                      depth_bits=24, snap=0.0, subset=None):
+                      depth_bits=24, snap=0.0, subset=None, subdiv_px=0):
     """build_screen_tris on a mesh, exactly as rasterize() calls it.
 
     With `subset`, the triangle list is cut down and the ORIGINAL indices
@@ -424,16 +666,21 @@ def raster_inputs_for(scene_mesh, vp, width, height, near_eps=1e-5,
                                    snap=0.0, near_eps=near_eps)
     sx, sy, iw, z, bw, src = CR.build_screen_tris(
         clip, tris, width, height, snap=snap, near_eps=near_eps,
-        depth_bits=depth_bits)
+        depth_bits=depth_bits, subdiv_px=subdiv_px)
     return sx, sy, iw, z, bw, src, tri_map
 
 
 def raster_on_device(mesh, vp, width, height, cull='NONE', snap=0.0,
-                     depth_bits=24, subset=None):
+                     depth_bits=24, subset=None, subdiv_px=0,
+                     near_eps=1e-5, want_lin=False, refer=False):
     """Pack, upload, dispatch, read back: the raster on the real driver.
 
-    Returns ({'ids', 'aux', 'timings'}, None) or (None, why). `timings`
-    splits the milliseconds -- clip+project, pack+bin, upload, dispatch and
+    Returns ({'ids', 'aux', 'lin'?, 'inputs', 'timings'}, None) or
+    (None, why). `want_lin` runs the affine variant (a third image with
+    the screen-linear barycentrics); `refer` turns the fragility marks
+    on (aux.w). `inputs` carries the packed arrays so the caller can
+    run the tie-referral replay without re-packing. `timings` splits
+    the milliseconds -- clip+project, pack+bin, upload, dispatch and
     read -- because "56 ms" is a number and a split is a diagnosis.
     """
     import time as _time
@@ -442,20 +689,24 @@ def raster_on_device(mesh, vp, width, height, cull='NONE', snap=0.0,
 
     t0 = _time.perf_counter()
     sx, sy, iw, z, bw, src, tri_map = raster_inputs_for(
-        mesh, vp, width, height, depth_bits=depth_bits, snap=snap,
-        subset=subset)
+        mesh, vp, width, height, near_eps=near_eps,
+        depth_bits=depth_bits, snap=snap,
+        subset=subset, subdiv_px=subdiv_px)
     t_clip = _time.perf_counter() - t0
     t0 = _time.perf_counter()
     corners, c_side, bins, b_side, tiles, tw, th = pack_raster_inputs(
         sx, sy, iw, z, bw, src, tri_map, width, height)
     t_pack = _time.perf_counter() - t0
+    images = ('hal_out_ids', 'hal_out_aux') + \
+        (('hal_out_lin',) if want_lin else ())
     shader, err = device.compile_compute(
-        'HAL_RASTER', COMPUTE_SOURCE,
+        'HAL_RASTER_LIN' if want_lin else 'HAL_RASTER',
+        COMPUTE_SOURCE_LIN if want_lin else COMPUTE_SOURCE,
         samplers=('hal_rc', 'hal_rbins', 'hal_rtiles'),
         floats=('hal_rc_side', 'hal_rbins_side', 'hal_rtiles_w',
                 'hal_rtiles_h', 'hal_cull', 'hal_rw', 'hal_rh',
-                'hal_zsteps'),
-        images=('hal_out_ids', 'hal_out_aux'))
+                'hal_zsteps', 'hal_refer'),
+        images=images)
     if shader is None:
         return None, err
     try:
@@ -474,27 +725,36 @@ def raster_on_device(mesh, vp, width, height, cull='NONE', snap=0.0,
                       'hal_cull': cull_f,
                       'hal_rw': float(width), 'hal_rh': float(height),
                       'hal_zsteps': float((1 << int(max(2, depth_bits))) - 1)
-                      if depth_bits < 32 else 0.0},
+                      if depth_bits < 32 else 0.0,
+                      'hal_refer': 1.0 if refer else 0.0},
             samplers={'hal_rc': t_rc, 'hal_rbins': t_bins,
                       'hal_rtiles': t_tiles},
-            images=('hal_out_ids', 'hal_out_aux'))
+            images=images)
         t_run = _time.perf_counter() - t0
     except Exception as exc:                                    # noqa: BLE001
         return None, f'raster dispatch failed: {type(exc).__name__}: {exc}'
+    # src mapped exactly as the packer maps it, for the replay
+    src_final = np.asarray(src, np.int64)
+    if tri_map is not None:
+        src_final = np.asarray(tri_map, np.int64)[src_final]
     return {'ids': out['hal_out_ids'], 'aux': out['hal_out_aux'],
+            'lin': out.get('hal_out_lin') if want_lin else None,
+            'inputs': (sx, sy, iw, z, bw, src_final,
+                       tiles, bins.reshape(-1), tw),
             'timings': {'clip_ms': t_clip * 1000.0,
                         'pack_ms': t_pack * 1000.0,
                         'upload_ms': t_upload * 1000.0,
                         'dispatch_read_ms': t_run * 1000.0}}, None
 
 
-def gbuffer_into(gbuf, ids, aux):
-    """Fill a GBuffer from the kernel's two images, fill()'s conventions.
+def gbuffer_into(gbuf, ids, aux, lin=None):
+    """Fill a GBuffer from the kernel's images, fill()'s conventions.
 
     Covered pixels carry the winner; empty ones keep the CPU's own init
     values -- depth +inf (the transparent pass depth-tests against it),
     zndc 1.0, front True. b2 comes from aux, where the kernel put the
-    CPU's OWN third barycentric rather than 1-b0-b1.
+    CPU's OWN third barycentric rather than 1-b0-b1. `lin` (the affine
+    variant's third image) fills bary_lin when the gbuf carries one.
     """
     tri = np.rint(ids[:, :, 3]).astype(np.int32)
     cov = tri >= 0
@@ -505,22 +765,78 @@ def gbuffer_into(gbuf, ids, aux):
     gbuf.depth[:] = np.where(cov, aux[:, :, 0], np.inf)
     gbuf.zndc[:] = np.where(cov, aux[:, :, 0], 1.0)
     gbuf.front[:] = aux[:, :, 1] > 0.5
+    if lin is not None and gbuf.bary_lin is not None:
+        gbuf.bary_lin[:, :, :] = lin[:, :, :3]
     return gbuf
 
 
+#: referral bail-out: when fragile pixels exceed this fraction of the
+#: frame, the replay stops being a footnote and the frame falls back
+#: whole, with the count in the printed reason. The replay is fully
+#: vectorised, so the budget is generous; a frame past it is
+#: pathological (everything coincident with everything).
+REFER_BAIL_FRAC = 0.10
+
+
 def raster_into_gbuffer(mesh, vp, width, height, gbuf, cull='NONE',
-                        snap=0.0, depth_bits=24, subset=None):
+                        snap=0.0, depth_bits=24, subset=None,
+                        subdiv_px=0, near_eps=1e-5):
     """The render() hook: rasterise on the driver, reconstruct the GBuffer.
 
     Returns (True, None) on success or (False, why); the caller falls back
     to the CPU rasteriser and prints the reason. Qualification (bands,
-    Painter's, overdraw, affine texture mode) is the caller's job -- this
-    function is mechanism.
+    Painter's, overdraw) is the caller's job -- this function is
+    mechanism. Affine frames run the lin variant (bary_lin filled when
+    the gbuf carries one); quantised-depth and snapped frames run with
+    the fragility marks on, and marked pixels are REPLAYED with the CPU
+    fill's own arithmetic -- the raster tie referral. LAST_REFERRED
+    carries the replay count for the tests and the self-test.
     """
+    want_lin = gbuf.bary_lin is not None
+    refer = int(depth_bits) < 24 or float(snap) > 0.0
     out, why = raster_on_device(mesh, vp, width, height, cull=cull,
                                 snap=snap, depth_bits=depth_bits,
-                                subset=subset)
+                                subset=subset, subdiv_px=subdiv_px,
+                                near_eps=near_eps,
+                                want_lin=want_lin, refer=refer)
     if out is None:
         return False, why
-    gbuffer_into(gbuf, out['ids'], out['aux'])
+    LAST_REFERRED['count'] = 0
+    if refer:
+        mark = out['aux'][:, :, 3] > 0.5
+        n_mark = int(mark.sum())
+        if n_mark:
+            covered = max(int((np.rint(out['ids'][:, :, 3]) >= 0).sum()),
+                          1)
+            if n_mark > REFER_BAIL_FRAC * covered:
+                return False, (f'{n_mark} fragile pixels of {covered} '
+                               f'covered under quantised depth -- past '
+                               f'the referral budget, the CPU '
+                               f'rasterises this frame')
+            pys, pxs = np.nonzero(mark)
+            sx, sy, iw, z, bw, src_final, tiles, bins_flat, tw = \
+                out['inputs']
+            r_tri, r_b, r_lb, r_z, r_front = replay_pixels(
+                pxs, pys, sx, sy, iw, z, bw, src_final,
+                tiles, bins_flat, tw, cull, depth_bits)
+            ids, aux = out['ids'], out['aux']
+            ids[pys, pxs, 0] = r_b[:, 0]
+            ids[pys, pxs, 1] = r_b[:, 1]
+            ids[pys, pxs, 3] = r_tri.astype(np.float32)
+            aux[pys, pxs, 0] = np.where(r_tri >= 0, r_z, 1.0)
+            aux[pys, pxs, 1] = r_front.astype(np.float32)
+            aux[pys, pxs, 2] = r_b[:, 2]
+            if out.get('lin') is not None:
+                out['lin'][pys, pxs, :3] = r_lb
+            LAST_REFERRED['count'] = n_mark
+            # the field instrument: one line names how many pixels the
+            # referral handed back to the CPU's own arithmetic
+            print(f'[Halcyon GPU] raster tie referral: {n_mark} of '
+                  f'{covered} covered pixels replayed with the CPU '
+                  f"fill's arithmetic")
+    gbuffer_into(gbuf, out['ids'], out['aux'], out.get('lin'))
     return True, None
+
+
+#: how many pixels the last driver raster referred to the CPU replay
+LAST_REFERRED = {'count': 0}

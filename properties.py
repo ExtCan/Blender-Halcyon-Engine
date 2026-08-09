@@ -38,7 +38,10 @@ SUBPIXEL = _items(
     ('FLOAT', "Floating Point", "Modern sub-pixel accuracy"),
     ('FIXED_4', "Fixed 1/4 pixel", "Quarter-pixel snapping"),
     ('FIXED_1', "Fixed 1 pixel", "Whole-pixel vertices"),
-    ('INTEGER', "Integer", "PlayStation-style integer raster coordinates"),
+    ('INTEGER', "Integer",
+     "Integer raster coordinates -- vertices land on the whole-pixel grid, "
+     "the PS1 wobble at its coarsest. Snapping rounds rather than "
+     "truncates, so this shares Fixed 1's grid"),
 )
 DEPTH_SORT = _items(
     ('ZBUFFER', "Z-Buffer", "Per-pixel depth test. Always correct"),
@@ -164,8 +167,6 @@ WIRE_MODE = _items(
      "Only the outline and the edges where the surface turns by more than the "
      "angle below. Stays a wireframe however many triangles are behind it"),
 )
-BUCKET = _items(('HILBERT', "Hilbert", ""), ('SPIRAL', "Spiral", ""),
-                ('TOP', "Top to Bottom", ""), ('RANDOM', "Random", ""))
 LIGHT_LIMIT = _items(
     ('BRIGHTEST', "Brightest", "Keep the strongest lights"),
     ('NEAREST', "Nearest", "Keep the closest lights"),
@@ -199,7 +200,7 @@ ENUMS = {
     'palette_method': PALETTE_METHOD, 'dither': DITHER,
     'color_management': COLOR_MGMT, 'crt_mask': CRT_MASK,
     'interlace': INTERLACE, 'output_scale': OUTPUT_SCALE,
-    'bucket_order': BUCKET, 'debug_pass': DEBUG_PASS,
+    'debug_pass': DEBUG_PASS,
     'wire_mode': WIRE_MODE,
     # grouped: an item with an empty identifier is a category separator
     'res_preset': [('CUSTOM', "Custom", "")] + [
@@ -213,8 +214,8 @@ ENUMS = {
 # field -> (min, max, soft_min, soft_max, step/precision hints)
 RANGES = {
     'aa_samples': (1, 64), 'aa_filter_width': (0.1, 4.0),
-    'aa_edge_threshold': (0.0, 1.0), 'vertex_snap_grid': (0.05, 16.0),
-    'depth_precision': (4, 32), 'polygon_offset': (-10.0, 10.0),
+    'aa_edge_threshold': (0.0, 100.0), 'vertex_snap_grid': (0.05, 16.0),
+    'depth_precision': (4, 32), 
     'light_clamp': (0.0, 1000.0), 'ao_distance': (0.001, 1000.0),
     'ao_samples': (1, 256), 'ao_intensity': (0.0, 1.0),
     'radiosity_samples': (1, 64), 'radiosity_distance': (0.01, 1000.0),
@@ -251,11 +252,11 @@ RANGES = {
     'crt_vignette': (0.0, 2.0), 'composite_bleed': (0.0, 2.0),
     'composite_ringing': (0.0, 2.0), 'composite_dot_crawl': (0.0, 2.0),
     'jpeg_quality': (1, 100), 'jpeg_passes': (1, 8), 'block_size': (4, 16),
-    'tile_size': (16, 1024), 'threads': (0, 64), 'preview_scale': (1, 16),
-    'max_texture_memory': (0, 4096), 'seed': (0, 2 ** 30),
+    'threads': (0, 64), 'preview_scale': (1, 16),
+    'seed': (0, 2 ** 30),
     'wire_width': (0.1, 8.0), 'wire_angle': (0.0, 180.0), 'resolution_x': (1, 16384),
     'resolution_y': (1, 16384), 'pixel_aspect_x': (0.01, 100.0),
-    'pixel_aspect_y': (0.01, 100.0), 'jitter_seed': (0, 2 ** 30),
+    'pixel_aspect_y': (0.01, 100.0), 
     'clip_near_epsilon': (1e-6, 1.0), 'decay_start': (0.0, 10000.0),
 }
 
@@ -430,6 +431,13 @@ DESCRIPTIONS = {
                           "what scanline renderers of the era did",
     'painters_key': "Which point on a polygon decides its sort order. Changing "
                     "it moves where Painter's algorithm goes wrong",
+    'aa_edge_threshold': "Depth step, in scene units, that counts as a crease "
+                         "worth smoothing. Edge AA always softens polygon "
+                         "silhouettes; this adds interior depth breaks. 0 "
+                         "smooths silhouettes only",
+    'ray_shadows': "Master switch for ray-traced shadows. Off, lights set to "
+                   "trace (and lights with no shadow map to fall back on) "
+                   "cast no shadow at all",
     'max_transparent_layers': "How many overlapping transparent surfaces a "
                               "pixel may accumulate. Beyond a handful the "
                               "furthest ones contribute almost nothing but cost "
@@ -463,9 +471,6 @@ DESCRIPTIONS = {
     'film_transparent': "Render the background with zero alpha so it can be "
                         "composited. Off means an opaque background. Blender's "
                         "own Film > Transparent also switches this on",
-    'threads': "Worker threads used for shading. 0 follows Blender's own "
-               "Performance setting, which normally means one per core. "
-               "Shading is split into independent chunks, so this scales well",
     'preview_scale': "Viewport preview is rendered at 1/N resolution and scaled "
                      "up. Raise it for a faster, chunkier preview",
     'output_scale': "Render at 1/N of the output resolution and scale back up "
@@ -619,8 +624,14 @@ class HalcyonLightSettings(PropertyGroup):
     shadow: EnumProperty(name="Shadows", items=_items(
         ('NONE', "None", ""), ('MAP', "Shadow Map", ""),
         ('RAY', "Ray Traced", "")), default='MAP')
-    shadow_map_size: IntProperty(name="Map Size", default=512, min=32, max=4096)
-    shadow_bias: FloatProperty(name="Bias", default=0.02, min=0.0, max=10.0)
+    shadow_map_size: IntProperty(
+        name="Map Size", default=0, min=0, max=4096,
+        description="Shadow map resolution for this light. 0 uses the "
+                    "render setting's Shadow Map Size")
+    shadow_bias: FloatProperty(
+        name="Bias", default=0.0, min=0.0, max=10.0,
+        description="Depth offset that stops a surface shadowing itself. "
+                    "0 uses the render setting's Shadow Bias")
     shadow_softness: FloatProperty(name="Softness", default=1.0, min=0.0, max=32.0)
     shadow_samples: IntProperty(name="Samples", default=4, min=1, max=64)
     shadow_density: FloatProperty(name="Density", default=1.0, min=0.0, max=1.0)

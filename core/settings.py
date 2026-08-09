@@ -87,8 +87,6 @@ class RenderSettings:
     aa_filter: str = 'BOX'            # BOX | TRIANGLE | GAUSS | CATROM | MITCHELL
     aa_filter_width: float = 1.0
     aa_edge_threshold: float = 0.1
-    jitter: bool = False
-    jitter_seed: int = 0
     # accumulation motion blur: the frame renders motion_steps times across
     # the shutter (re-exported at each subframe) and averages -- the
     # accumulation-buffer trails of the era, paid for honestly at N frames
@@ -102,10 +100,12 @@ class RenderSettings:
     vertex_snap: bool = False          # PlayStation-style vertex jitter
     vertex_snap_grid: float = 1.0      # in pixels of the *output* image
     depth_precision: int = 24          # z-buffer bits (8..32); low = fighting
-    depth_sort: str = 'ZBUFFER'
-    painters_key: str = 'CENTROID'        # ZBUFFER | PAINTERS | ZBUFFER_NOWRITE
-    polygon_offset: float = 0.0
-    clip_near_epsilon: float = 1e-4
+    depth_sort: str = 'ZBUFFER'        # ZBUFFER | PAINTERS
+    painters_key: str = 'CENTROID'     # CENTROID | NEAREST | FARTHEST
+    # the camera raster's near-plane epsilon. 1e-5 IS the value
+    # the rasterisers have always run; the setting used to claim
+    # 1e-4 and drive nothing (found by the settings audit)
+    clip_near_epsilon: float = 1e-5
     # ------------------------------------------------------------- shading
     default_model: str = 'PHONG'
     force_model: str = 'NONE'          # override every material's model
@@ -209,7 +209,6 @@ class RenderSettings:
                                        # MAC256 | WIN20 | EGA16 | CGA4 | GRAY | CUSTOM
     palette_size: int = 256
     palette_method: str = 'MEDIAN_CUT'  # MEDIAN_CUT | OCTREE | POPULARITY | KMEANS
-    palette_dither_first: bool = True
     dither: str = 'NONE'               # NONE | BAYER2 | BAYER4 | BAYER8 | FLOYD | \
                                        # JJN | STUCKI | ATKINSON | BURKES | SIERRA | \
                                        # SIERRA_LITE | NOISE | HALFTONE
@@ -244,11 +243,8 @@ class RenderSettings:
     output_scale: str = 'NONE'         # NONE | NEAREST_2X | NEAREST_3X | NEAREST_4X
     pixel_grid: bool = False
     # ------------------------------------------------------------ performance
-    tile_size: int = 128
     threads: int = 1                   # 0 = auto
-    bucket_order: str = 'HILBERT'      # HILBERT | TOP | CENTER | RANDOM
     preview_scale: int = 4
-    max_texture_memory: int = 0
     progressive: bool = True
     # ------------------------------------------------------------------ misc
     seed: int = 0

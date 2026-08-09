@@ -30,14 +30,18 @@ DEPTH_BITS = {
 # ------------------------------------------------------------------ helpers
 
 
-def _blur_h(img, radius):
-    """Separable box blur, repeated 3x -- a fast, accurate Gaussian."""
+def _blur_h(img, radius, passes=3):
+    """Separable box blur; at the default three passes, an accurate Gaussian.
+
+    One pass is an honest square box -- the Glow Shape setting hands that
+    difference to the user, so the pass count is a parameter, not a constant.
+    """
     r = int(max(radius, 0))
     if r <= 0:
         return img
     out = img
     k = 2 * r + 1
-    for _ in range(3):
+    for _ in range(max(int(passes), 1)):
         pad = np.pad(out, ((0, 0), (r, r), (0, 0)), mode='edge')
         cs = np.cumsum(pad, axis=1, dtype=np.float32)
         cs = np.concatenate([np.zeros((cs.shape[0], 1, cs.shape[2]), np.float32), cs], 1)
@@ -45,11 +49,36 @@ def _blur_h(img, radius):
     return out
 
 
-def blur(img, radius):
+def blur(img, radius, passes=3):
     if radius <= 0:
         return img
-    out = _blur_h(img, radius)
-    out = np.transpose(_blur_h(np.transpose(out, (1, 0, 2)), radius), (1, 0, 2))
+    out = _blur_h(img, radius, passes)
+    out = np.transpose(_blur_h(np.transpose(out, (1, 0, 2)), radius, passes),
+                       (1, 0, 2))
+    return out.astype(np.float32)
+
+
+def _kawase(img, radius):
+    """The Kawase bloom: repeated 4-tap diagonal passes at growing offsets.
+
+    The GPU-era trick (Masaki Kawase, GDC 2003) that stood in for a wide
+    Gaussian on hardware that could not afford one: each pass averages the
+    four diagonal neighbours a little further out than the last. The result
+    spreads wider per tap than a box and carries the slightly ringed,
+    bloomier halo the technique is known for.
+    """
+    h, w = img.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    out = img
+    o, total = 0.5, 0.0
+    while total < float(radius):
+        acc = None
+        for dx, dy in ((o, o), (o, -o), (-o, o), (-o, -o)):
+            s = _resample(out, xx + dx, yy + dy)
+            acc = s if acc is None else acc + s
+        out = acc * 0.25
+        total += o
+        o += 1.0
     return out.astype(np.float32)
 
 
@@ -80,11 +109,16 @@ def glow(rgb, st):
     over = np.maximum(lum - st.glow_threshold, 0.0)[:, :, None]
     bright = rgb * (over / np.maximum(lum[:, :, None], 1e-5))
     r = max(int(st.glow_radius), 1)
-    if st.glow_quality == 'BOX':
-        b = _blur_h(np.transpose(_blur_h(np.transpose(bright, (1, 0, 2)), r),
-                                 (1, 0, 2)), r)
+    q = str(st.glow_quality)
+    # three genuinely different halos. BOX used to run the same triple box
+    # as GAUSS (identical pictures) and KAWASE had no branch at all -- all
+    # three enum values produced one glow (found by the settings audit)
+    if q == 'BOX':
+        b = blur(bright, r, passes=1)      # one square box: the flat halo
+    elif q == 'KAWASE':
+        b = _kawase(bright, r)
     else:
-        b = blur(bright, r)
+        b = blur(bright, r)                # triple box: the Gaussian bell
     return (rgb + b * st.glow_intensity).astype(np.float32)
 
 
@@ -234,11 +268,16 @@ def reduce_depth(rgb, st, seed=0):
         return PA.snap_bits(rgb, *bits)
     if kind.startswith('BAYER') or kind in ('HALFTONE', 'NOISE'):
         return DI.ordered_bits(rgb, bits, kind, strength)
-    pal = PA.cube666() if bits == (8, 8, 8) else None
     levels = [np.linspace(0, 1, 1 << b, dtype=np.float32) for b in bits]
     grid = np.stack(np.meshgrid(*levels, indexing='ij'), -1).reshape(-1, 3)
     if grid.shape[0] > 4096:
-        return PA.snap_bits(rgb, *bits)
+        # a 16-bit lattice is 65,536 entries -- too many to diffuse against
+        # as a palette, and this used to silently snap_bits instead: Floyd-
+        # Steinberg at High Color, THE era pairing, quietly did nothing
+        # (found by the settings audit). The lattice is separable, so each
+        # channel diffuses against its own level ramp instead.
+        return DI.diffusion_bits(rgb, bits, kind, strength,
+                                 st.dither_serpentine, seed=seed)
     return DI.apply_dither(rgb, grid.astype(np.float32), kind, strength,
                            st.dither_serpentine, seed=seed)
 

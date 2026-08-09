@@ -1608,6 +1608,23 @@ def shaft_sources(scene, settings, vp):
     return out
 
 
+def snap_grid(st):
+    """Screen-space vertex snap in pixels, from BOTH settings that promise it.
+
+    Fixed-Point Subpixel and PS1 Vertex Snap land on the same machinery: a
+    grid the projected vertex is rounded onto before the fill. Subpixel
+    Precision spent its whole life unread -- two presets set INTEGER and
+    nothing changed (found by the settings audit). The coarser of the two
+    requests wins. INTEGER and FIXED_1 share the whole-pixel grid: the one
+    PS1 behaviour not reproduced is truncation rather than rounding, a
+    constant half-pixel phase this raster does not carry.
+    """
+    sub = {'FIXED_4': 0.25, 'FIXED_1': 1.0, 'INTEGER': 1.0}.get(
+        str(getattr(st, 'subpixel_precision', 'FLOAT')), 0.0)
+    vs = float(st.vertex_snap_grid) if st.vertex_snap else 0.0
+    return max(vs, sub)
+
+
 def render(scene, settings=None, progress=None, band=None):
     """Render `scene`. Returns a linear (H,W,4) float32 image.
 
@@ -1673,6 +1690,13 @@ def render(scene, settings=None, progress=None, band=None):
         progress(0.05, 'Rasterising')
 
     gbuf = raster.GBuffer(rw, rh)
+    subdiv_px = int(getattr(st, 'tex_affine_subdiv', 0) or 0) \
+        if not st.tex_perspective else 0
+    # the camera raster's near-plane epsilon: a real dial now (the
+    # settings audit found it registered, ranged, tooltipped and read
+    # by NOTHING -- the rasterisers ran their 1e-5 default regardless)
+    near_eps = max(float(getattr(st, 'clip_near_epsilon', 1e-5) or 1e-5),
+                   1e-6)
     if not st.tex_perspective:
         gbuf.alloc_linear()
     frags = raster.FragmentList() if st.transparency in ('SORTED', 'ABUFFER') else None
@@ -1687,7 +1711,7 @@ def render(scene, settings=None, progress=None, band=None):
         return _resolve(img, W, H, ss, st)
 
     opaque, transparent = _split_by_alpha(scene, mesh, st)
-    snap = st.vertex_snap_grid if st.vertex_snap else 0.0
+    snap = snap_grid(st)
     cull = 'BACK' if st.backface_cull else 'NONE'
 
     # when only a band is wanted, the rasteriser is told so: otherwise every
@@ -1731,44 +1755,34 @@ def render(scene, settings=None, progress=None, band=None):
     if str(getattr(st, 'render_device', 'CPU')).upper() == 'GPU' and \
             getattr(st, 'gpu_raster', False) and band is None and \
             flat_depth is None and not want_overdraw:
-        if not getattr(st, 'tex_perspective', True):
-            print('[Halcyon GPU] rasterising on the CPU: affine texture '
-                  'mode needs screen-linear barycentrics the compute '
-                  'raster does not carry yet')
-        elif int(getattr(st, 'depth_precision', 24)) < 24 or \
-                getattr(st, 'vertex_snap', False):
-            # measured by the feature matrix, not assumed: at 16-bit depth
-            # (and under PS1 vertex snapping) coincident surfaces land on
-            # SHARED quantised steps, and the winner of an exact depth tie
-            # falls to the driver's last bit -- 3 pixels of 6912 flipped
-            # on real hardware, the same coin-on-edge mechanism the ray
-            # tie referral cured. Until a raster tie referral exists,
-            # coarse-depth frames rasterise where the answer is the
-            # reference's own.
-            why_c = ('vertex snapping' if getattr(st, 'vertex_snap', False)
-                     else f'{int(st.depth_precision)}-bit depth')
-            print(f'[Halcyon GPU] rasterising on the CPU: {why_c} puts '
-                  'coincident surfaces on shared depth steps, where an '
-                  'exact tie falls to the driver\'s last bit (3 px '
-                  'measured at 16-bit). The CPU rasterises these frames '
-                  'until the tie referral reaches the raster')
+        # affine frames run the kernel's lin variant (a third image
+        # carries the screen-linear barycentrics, fill()'s bary_lin);
+        # quantised-depth and snapped frames run with the RASTER TIE
+        # REFERRAL: the kernel marks every decision inside a
+        # cross-device noise window (a depth within an ulp-wobble of a
+        # quantisation boundary, coincident surfaces on shared steps, a
+        # pixel centre on a snapped edge) and the marked pixels are
+        # replayed with the CPU fill's own arithmetic -- the ray
+        # referral's cure, at the raster. A frame whose fragile pixels
+        # exceed the referral budget falls back whole, with the count
+        # in the printed reason.
+        from ..gpu import craster as _craster
+        with ST.track('rasterise (GPU)'):
+            # the GPU crossings live at the device boundary now
+            # (gpu/device.py _main): the CPU halves of this call
+            # never block the interface, the driver halves cross
+            # as millisecond bursts
+            try:
+                ok_r, why_r = _craster.raster_into_gbuffer(
+                    mesh, vp, rw, rh, gbuf, cull=cull, snap=snap,
+                    depth_bits=st.depth_precision, subset=opaque,
+                    subdiv_px=subdiv_px, near_eps=near_eps)
+            except Exception as exc:                            # noqa: BLE001
+                ok_r, why_r = False, str(exc)
+        if ok_r:
+            rastered_on_gpu = True
         else:
-            from ..gpu import craster as _craster
-            with ST.track('rasterise (GPU)'):
-                # the GPU crossings live at the device boundary now
-                # (gpu/device.py _main): the CPU halves of this call
-                # never block the interface, the driver halves cross
-                # as millisecond bursts
-                try:
-                    ok_r, why_r = _craster.raster_into_gbuffer(
-                        mesh, vp, rw, rh, gbuf, cull=cull, snap=snap,
-                        depth_bits=st.depth_precision, subset=opaque)
-                except Exception as exc:                        # noqa: BLE001
-                    ok_r, why_r = False, str(exc)
-            if ok_r:
-                rastered_on_gpu = True
-            else:
-                print(f'[Halcyon GPU] rasterising on the CPU: {why_r}')
+            print(f'[Halcyon GPU] rasterising on the CPU: {why_r}')
     if not rastered_on_gpu:
         with ST.track('rasterise'):
             raster.rasterize(mesh.verts, mesh.tris, vp, rw, rh, cull=cull,
@@ -1776,7 +1790,8 @@ def render(scene, settings=None, progress=None, band=None):
                              subset=opaque, gbuf=gbuf,
                              count_overdraw=want_overdraw,
                              flat_depth=flat_depth, scissor=scissor,
-                             batched=False if want_overdraw else None)
+                             batched=False if want_overdraw else None,
+                             subdiv_px=subdiv_px, near_eps=near_eps)
 
     if band is None and not getattr(st, '_viewport', False):
         # the two numbers behind "the depth is screwed up": what the
@@ -1873,7 +1888,15 @@ def render(scene, settings=None, progress=None, band=None):
                 print(f'[Halcyon GPU] shading on the CPU: {why}')
             else:
                 img[py, px, :3] = got[py, px]
-                img[py, px, 3] = 1.0
+                ga = getattr(gbuf, 'gpu_alpha', None)
+                if st.transparency == 'STIPPLE' and ga is not None:
+                    # the Screen Door: rgb is the full shaded colour and
+                    # the ordered 0/1 pattern rides the alpha -- exactly
+                    # the (rgb shaded, alpha stippled) split _shade
+                    # writes on the CPU
+                    img[py, px, 3] = ga[py, px].astype(np.float32)
+                else:
+                    img[py, px, 3] = 1.0
                 shaded_on_gpu = True
         if not shaded_on_gpu:
             if getattr(st, 'radiosity', False) and bvh is not None and \
@@ -1922,13 +1945,15 @@ def render(scene, settings=None, progress=None, band=None):
         raster.rasterize(mesh.verts, mesh.tris, vp, rw, rh, cull='NONE', snap=snap,
                          depth_bits=st.depth_precision, subset=transparent,
                          gbuf=gbuf, frags=frags, depth_write=False,
-                         flat_depth=flat_depth, scissor=scissor)
+                         flat_depth=flat_depth, scissor=scissor,
+                         subdiv_px=subdiv_px, near_eps=near_eps)
         with ST.track('transparency'):
             img = _composite_abuffer(job, frags, gbuf, img, st, band=band)
     elif transparent is not None and transparent.size:
         raster.rasterize(mesh.verts, mesh.tris, vp, rw, rh, cull=cull, snap=snap,
                          depth_bits=st.depth_precision, subset=transparent,
-                         gbuf=gbuf, flat_depth=flat_depth, scissor=scissor)
+                         gbuf=gbuf, flat_depth=flat_depth, scissor=scissor,
+                         subdiv_px=subdiv_px, near_eps=near_eps)
 
     if st.debug_pass != 'BEAUTY':
         img = _debug_pass(job, gbuf, img, st)
@@ -1939,7 +1964,7 @@ def render(scene, settings=None, progress=None, band=None):
     # Extra passes come off the same G-buffer the beauty image did, before
     # anything downsamples or quantises it.
     depth_m = None
-    if st.dof or 'Depth' in wanted_passes(st):
+    if st.dof or 'Depth' in wanted_passes(st) or str(st.aa_mode) == 'EDGE':
         with ST.track('linear depth'):
             depth_m = linear_depth(job, gbuf, eye)
     scene.last_passes = build_aux_passes(job, gbuf, st, depth_m)
@@ -1965,7 +1990,7 @@ def render(scene, settings=None, progress=None, band=None):
         # "edge antialias" that smoothed silhouettes without paying for a
         # supersampled frame
         with ST.track('edge smooth'):
-            img = _edge_smooth(img, gbuf, st)
+            img = _edge_smooth(img, gbuf, st, depth_m)
 
     with ST.track('resolve / downsample'):
         if band is not None:
@@ -2007,8 +2032,15 @@ def _render_accumulated(scene, st, progress, band):
     return (acc / float(n)).astype(np.float32)
 
 
-def _edge_smooth(img, gbuf, st):
-    """Soften id-buffer edges (and deep depth creases) with a 1-2-1 tent."""
+def _edge_smooth(img, gbuf, st, depth_m=None):
+    """Soften id-buffer edges (and deep depth creases) with a 1-2-1 tent.
+
+    The crease test runs on depth in SCENE UNITS. It used to compare the
+    raw device depth, where a whole scene spans a few thousandths and the
+    threshold's 0..1 slider could never land anywhere useful -- the same
+    trap the DoF focus slider fell into before it was given metres (found
+    by the settings audit).
+    """
     tri = gbuf.tri
     edge = np.zeros(tri.shape, bool)
     dif = tri[:, 1:] != tri[:, :-1]
@@ -2019,7 +2051,8 @@ def _edge_smooth(img, gbuf, st):
     edge[:-1, :] |= dif
     thr = float(getattr(st, 'aa_edge_threshold', 0.1))
     if thr > 0.0:
-        d = np.nan_to_num(gbuf.depth, nan=1.0, posinf=1.0, neginf=-1.0)
+        src = depth_m if depth_m is not None else gbuf.depth
+        d = np.nan_to_num(src, nan=1.0, posinf=1.0, neginf=-1.0)
         dd = np.abs(d[:, 1:] - d[:, :-1]) > thr
         edge[:, 1:] |= dd
         edge[:, :-1] |= dd
@@ -3343,8 +3376,7 @@ def apply_wireframe(job, gbuf, img, st, vp, eye, textures):
         crease = crease_edges(gbuf, mesh, float(getattr(st, 'wire_angle', 25.0)))
         dist = None
     else:
-        dist = edge_distance_exact(
-            gbuf, mesh, vp, snap=st.vertex_snap_grid if st.vertex_snap else 0.0)
+        dist = edge_distance_exact(gbuf, mesh, vp, snap=snap_grid(st))
         if dist is None:
             dist = edge_factor(gbuf)
     py, px = np.nonzero(cov)

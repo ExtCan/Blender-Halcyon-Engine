@@ -1135,6 +1135,23 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None):
                          f'hal_shadow_vis{i}(P, N, L, {dist_arg});')
         else:
             lines.append(f'    contrib *= hal_shadow_vis{i}(P, N, L);')
+    link = (consts.get('light_links') or {}).get(i)
+    if link:
+        # light linking, exactly light_surface's mask and order: 1/pi,
+        # visibility, THEN the mask, then the clamp. The ladder tests
+        # td.y (an exact integer float) against the light's linked
+        # object list -- np.isin, unrolled, no texture and no cliff.
+        # ONLY lights light just their list; EXCLUDE lights light
+        # everything else. Hits carry the same object id through
+        # hal_tri_data, exactly as ctx.object_index_raw does at hits.
+        tests = ' + '.join(f'((abs(td.y - {_f(float(o))}) < 0.5) '
+                           '? 1.0 : 0.0)'
+                           for o in link['objects'])
+        lines.append(f'    float hal_lk{i} = min({tests}, 1.0);')
+        if str(link.get('mode', 'EXCLUDE')).upper() == 'ONLY':
+            lines.append(f'    contrib *= hal_lk{i};')
+        else:
+            lines.append(f'    contrib *= (1.0 - hal_lk{i});')
     clamp = float(consts.get('light_clamp', 0.0))
     if clamp > 0.0:
         lines.append(f'    contrib = min(contrib, vec3({_f(clamp)}));')
@@ -1349,11 +1366,22 @@ def _assemble_height_pass(graph, mat_id, bump_node, consts, textures,
 
     frame_unis = sorted(em.frame_uniforms)
     extra_unis = ''.join(f'uniform float {u};\n' for u in frame_unis)
+    # affine texture mode reaches the height pre-pass too: the CPU's
+    # bump fields interpolate uv by the screen-linear barycentrics
+    # (bump_field_source carries gbuf.bary_lin), so the pre-pass reads
+    # the same warp -- uv only, exactly as the main pass
+    affine_uv = ''
+    if consts.get('affine'):
+        affine_uv = (
+            '    vec4 hal_idslin = texture(hal_gb_idslin, vUV);\n'
+            '    f.uv = hal_interp(f.tri, hal_idslin.rgb, 2).xy;\n'
+            '    f.uv2 = hal_interp4(f.tri, hal_idslin.rgb, 2).zw;\n')
     parts = [GB.GLSL, gen_fns, _block(inline_parts), _block(tex_fns),
              f"""
 in vec2 vUV;
 out vec4 Color;
 uniform vec3 hal_eye;
+{'uniform sampler2D hal_gb_idslin;' if affine_uv else ''}
 {extra_unis}
 
 void main()
@@ -1375,7 +1403,7 @@ void main()
         Color = vec4(0.0, 0.0, 0.0, 0.0);
         return;
     }}
-    vec3 P = f.P;
+{affine_uv}    vec3 P = f.P;
     vec3 V = normalize(hal_eye - P);
     vec3 N0 = normalize(f.N);
     vec3 hal_P = P;
@@ -1390,7 +1418,8 @@ void main()
         parts.append('    vec4 hal_vcol = hal_interp4(f.tri, f.bary, 3);\n')
     parts.append(src)
     parts.append(f'    Color = vec4({expr}, 0.0, 0.0, 1.0) * keep;\n}}')
-    return ''.join(parts), {'samplers': sorted(tex_binds),
+    return ''.join(parts), {'samplers': sorted(tex_binds)
+                            + (['hal_gb_idslin'] if affine_uv else []),
                             'textures': tex_binds,
                             'frame_uniforms': frame_unis,
                             'uses_screen': em.used_screen}
@@ -1682,16 +1711,25 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     shadows = shadows or [None] * len(lights)
     shadow_fns = []
     samplers = []
-    if vertex_rate:
+    # CONSTANT / WIREFRAME: light_surface returns before the light loop,
+    # the ambient term and every surface cheat -- full-bright albedo x
+    # diffuse level, plus emission. The pass carries no lighting support
+    # at all (the wires themselves are carved by apply_wireframe on the
+    # readback -- the CPU's own separable stage, fog-doctrine style).
+    # env and rays stay: the CPU applies those AFTER light_surface.
+    shadeless = bool(bake.get('__shadeless'))
+    if vertex_rate or shadeless:
         # the pass lights nothing, so it carries none of the lighting
-        # support: no shadow taps, no BVH traversal, no AO -- all of it
-        # already lives in the CPU-lit corner values
+        # support: no shadow taps, no BVH traversal, no AO -- for a
+        # vertex-rate pass all of it already lives in the CPU-lit
+        # corner values; for a shadeless one it never existed
         shadows = [None] * len(lights)
     ray_any = any(s is not None and s.get('ray') for s in shadows)
     soft_any = any(s is not None and s.get('ray')
                    and int(s.get('samples', 1)) > 1 for s in shadows)
-    ao_spec = None if vertex_rate else consts.get('ao')
-    rad_spec = None if vertex_rate else consts.get('radiosity')
+    ao_spec = None if (vertex_rate or shadeless) else consts.get('ao')
+    rad_spec = None if (vertex_rate or shadeless) \
+        else consts.get('radiosity')
     # interpolated mode: SCREEN passes read the grid field (a texel
     # fetch), so they carry no gather and no traversal of their own;
     # secondary passes gather fully -- a traced hit has no place in a
@@ -1747,6 +1785,69 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
         for i, ckspec in sorted((consts.get('cookies') or {}).items()):
             shadow_fns.append(_cookie_function(i, ckspec))
             samplers.append(f'hal_cookie{i}')
+    # the per-triangle auxiliary texture: STORED face normals + the
+    # per-tri random, the CPU's own values baked (gbuffer.pack_tri_aux).
+    # Wanted by Normal Source FACE (every pass) and by graphs reading
+    # the Geometry node's True Normal / Random Per Island (the emitter
+    # flags those). The fetch is the same packed-square arithmetic
+    # every per-tri texture here uses; the side bakes as a literal.
+    # affine texture mode: uv re-interpolates by the rasteriser's own
+    # SCREEN-LINEAR barycentrics (hal_gb_idslin) -- uv ONLY, exactly
+    # attributes(): P, N and colour stay perspective-correct. Ray hits
+    # have no screen-linear bary on either device (the CPU's trace
+    # passes bary_lin=None), so secondary passes keep true barycentrics.
+    affine_uv = ''
+    if consts.get('affine') and not secondary:
+        samplers.append('hal_gb_idslin')
+        affine_uv = (
+            '    vec4 hal_idslin = texture(hal_gb_idslin, vUV);\n'
+            '    f.uv = hal_interp(f.tri, hal_idslin.rgb, 2).xy;\n'
+            '    f.uv2 = hal_interp4(f.tri, hal_idslin.rgb, 2).zw;\n')
+    normal_face = bool(consts.get('normal_face'))
+    needs_triaux = normal_face or bool(getattr(em, 'needs_triaux', False))
+    triaux_fns = ''
+    if needs_triaux:
+        tcount = int(consts.get('tri_count', 0))
+        if tcount <= 0:
+            return None, ('the per-tri auxiliary texture needs the '
+                          'triangle count the caller did not supply')
+        import math
+        aside = int(math.ceil(math.sqrt(float(max(tcount, 1)))))
+        triaux_fns = (
+            'uniform sampler2D hal_triaux;\n'
+            'vec4 hal_triaux_fetch(float i)\n'
+            '{\n'
+            f'    float x = mod(i, {_f(float(aside))});\n'
+            f'    float y = floor(i / {_f(float(aside))});\n'
+            '    return texture(hal_triaux, (vec2(x, y) + vec2(0.5)) / '
+            f'{_f(float(aside))});\n'
+            '}\n')
+        samplers.append('hal_triaux')
+    if consts.get('stipple') and not secondary:
+        # the Screen Door threshold map (see the composite below)
+        samplers.append('hal_stipple')
+    # the per-corner screen positions for the Wireframe node's Pixel
+    # Size: (sx, sy, w) per triangle corner, the CPU's own sgrad-cache
+    # projection baked -- same packed-square fetch as every data
+    # texture here
+    wirescreen_fns = ''
+    if bool(getattr(em, 'needs_wirescreen', False)):
+        tcount = int(consts.get('tri_count', 0))
+        if tcount <= 0:
+            return None, ('the wireframe screen texture needs the '
+                          'triangle count the caller did not supply')
+        import math as _math
+        wside = int(_math.ceil(_math.sqrt(float(max(tcount * 3, 1)))))
+        wirescreen_fns = (
+            'uniform sampler2D hal_vscreen;\n'
+            'vec4 hal_vscreen_fetch(float i)\n'
+            '{\n'
+            f'    float x = mod(i, {_f(float(wside))});\n'
+            f'    float y = floor(i / {_f(float(wside))});\n'
+            '    return texture(hal_vscreen, (vec2(x, y) + vec2(0.5)) / '
+            f'{_f(float(wside))});\n'
+            '}\n')
+        samplers.append('hal_vscreen')
     frame_unis = sorted(em.frame_uniforms)
     extra_unis = ''.join(f'uniform float {u};\n' for u in frame_unis)
     # the interface declarations come FIRST: the sampling helpers and the
@@ -1763,10 +1864,13 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
              '// -- and a coded shader reading the clock animates without '
              'recompiling\n'
              'uniform vec3 hal_eye;\n'
+             + ('uniform sampler2D hal_gb_idslin;\n' if affine_uv else '')
+             + ('uniform sampler2D hal_stipple;\n'
+                if (consts.get('stipple') and not secondary) else '')
              + extra_unis)
     parts = [GS.GLSL, GS.DISPATCH, GB.GLSL, decls, gen_fns,
              _block(inline_parts), _block(tex_fns), _block(shadow_fns),
-             vlight_fns, f"""
+             vlight_fns, triaux_fns, wirescreen_fns, f"""
 void main()
 {{
     HalcyonFragment f = hal_read_gbuffer(vUV);
@@ -1786,7 +1890,7 @@ void main()
         Color = vec4(0.0, 0.0, 0.0, 0.0);
         return;
     }}
-    vec3 P = f.P;
+{affine_uv}    vec3 P = f.P;
     vec3 V = normalize(hal_eye - P);
     vec3 N0 = normalize(f.N);
     vec3 hal_P = P;
@@ -1813,6 +1917,16 @@ void main()
                      f'(normalize({normal_expr}) - N0) * ({k}));\n')
     else:
         parts.append('    vec3 Nsurf = N0;\n')
+    if normal_face:
+        # Normal Source FACE, the CPU's exact order: the graph just ran
+        # against the INTERPOLATED normal (hal_N above), and only now
+        # does the stored face normal replace the shading normal --
+        # ctx.N = ctx.Ng, as render.py does it. The texel carries the
+        # CPU's own normalized values; the two-sided flip and the
+        # tangent frame below pick the replacement up exactly as
+        # light_surface and shade_batch do.
+        parts.append('    Nsurf = hal_triaux_fetch(max(f.tri, 0.0))'
+                     '.xyz;\n')
     if two_sided:
         parts.append('    float side = (dot(Nsurf, V) < 0.0) ? -1.0 : 1.0;\n'
                      '    vec3 N = Nsurf * side;\n')
@@ -1868,12 +1982,22 @@ void main()
             '    s.tangent = normalize(hal_t2);',
             '    }',
         ]
-    lines += [
-        f'    s.diffuse = {base};',
-        (f'    s.specular = {perpix_exprs["specular"]};'
-         if 'specular' in perpix_exprs else
-         f'    s.specular = {_v3(bake.get("specular", (1, 1, 1)))};'),
-    ]
+    if str(bake.get('__slot', '')) == 'specular':
+        # the specular slot routing: a lone raw GLOSSY lobe's colour
+        # chain is the SPECULAR colour (closure_to_surface puts it in
+        # surf.specular), and the diffuse is the CPU's untouched flat
+        # constant -- the exact struct the CPU shades from
+        lines += [
+            f'    s.diffuse = {_v3(bake.get("diffuse", (0.8, 0.8, 0.8)))};',
+            f'    s.specular = {base};',
+        ]
+    else:
+        lines += [
+            f'    s.diffuse = {base};',
+            (f'    s.specular = {perpix_exprs["specular"]};'
+             if 'specular' in perpix_exprs else
+             f'    s.specular = {_v3(bake.get("specular", (1, 1, 1)))};'),
+        ]
     if vertex_rate:
         # Gouraud/flat: fetch the three CPU-lit corners of THIS pixel's
         # triangle, interpolate by the G-buffer's own perspective
@@ -1889,6 +2013,12 @@ void main()
             '        + hal_vlight_fetch(hal_vt + 2.0) * f.bary.z;',
             '    vec3 total = s.diffuse * hal_vl;',
         ]
+    elif shadeless:
+        # light_surface's early return, verbatim: diffuse x level (+
+        # emission, added by the shared block below). No ambient term,
+        # no lights, no clamp, no silhouette cheats -- the CPU never
+        # reaches apply_surface_effects for these models
+        lines.append('    vec3 total = s.diffuse * s.diffuse_level;')
     elif rad_field:
         # interpolated radiosity: the pass blends the grid field the
         # pre-pass gathered -- a texel fetch where the full mode walks
@@ -1908,13 +2038,16 @@ void main()
         # exactly light_surface's order: ambient occlusion scales the
         # ambient term (with the post-flip N) before any light adds
         lines.append('    total *= hal_ao(P, N);')
-    if not vertex_rate and float(bake.get('sheen', 0.0)) > 1e-4:
+    if not vertex_rate and not shadeless \
+            and float(bake.get('sheen', 0.0)) > 1e-4:
         lines.append('    float hal_edge_vn = clamp(1.0 - abs(dot(N, V)), '
                      '0.0, 1.0);')
-    for i, light in enumerate(() if vertex_rate else lights):
+    for i, light in enumerate(() if (vertex_rate or shadeless)
+                               else lights):
         lines += _one_light_source(i, light, consts,
                                    shadowed=shadows[i], bake=bake)
-    if not vertex_rate and consts.get('clamp_specular', True):
+    if not vertex_rate and not shadeless \
+            and consts.get('clamp_specular', True):
         lines.append('    total = min(total, vec3(64.0));')
     if not vertex_rate:
         if 'emission' in perpix_exprs:
@@ -1925,17 +2058,20 @@ void main()
                          f'{_v3(bake.get("emission", (0, 0, 0)))};')
     # the era's silhouette cheats, exactly as apply_surface_effects: applied
     # after emission, outside the reflectance model, the same on every model
-    if not vertex_rate and (float(bake.get('fresnel', 0.0)) > 1e-4 or
-                            float(bake.get('rim', 0.0)) > 1e-4):
+    if not vertex_rate and not shadeless and \
+            (float(bake.get('fresnel', 0.0)) > 1e-4 or
+             float(bake.get('rim', 0.0)) > 1e-4):
         lines.append('    float hal_facing = clamp(abs(dot(N, V)), 0.0, 1.0);')
         lines.append('    float hal_sil = 1.0 - hal_facing;')
-    if not vertex_rate and float(bake.get('fresnel', 0.0)) > 1e-4:
+    if not vertex_rate and not shadeless \
+            and float(bake.get('fresnel', 0.0)) > 1e-4:
         fp = max(float(bake.get('fresnel_power', 3.0)), 0.01)
         lines.append(
             f'    total += {_v3(bake.get("fresnel_color", (1, 1, 1)))}'
             f' * (pow(hal_sil, {_f(fp)}) * {_f(bake["fresnel"])}'
             f' * {_f(bake.get("specular_level", 0.5))});')
-    if not vertex_rate and float(bake.get('rim', 0.0)) > 1e-4:
+    if not vertex_rate and not shadeless \
+            and float(bake.get('rim', 0.0)) > 1e-4:
         rp = max(float(bake.get('rim_power', 3.0)), 0.01)
         lines.append(
             f'    total += {_v3(bake.get("rim_color", (1, 1, 1)))}'
@@ -1943,8 +2079,8 @@ void main()
     # matcap: the whole lit result lerps toward one colour, exactly as
     # apply_surface_effects -- after fresnel and rim, before the backface
     mk = min(max(float(bake.get('matcap_blend', 0.0)), 0.0), 1.0)
-    if vertex_rate:
-        mk = 0.0                    # in the corners already
+    if vertex_rate or shadeless:
+        mk = 0.0            # in the corners already / never applied
     if mk > 1e-4:
         mc = perpix_exprs.get('matcap',
                               _v3(bake.get('matcap', (0, 0, 0))))
@@ -1957,8 +2093,8 @@ void main()
     kb = min(max(float(bake.get('backface_mix', 0.0)), 0.0), 1.0)
     if secondary:
         kb = 0.0                   # trace() shades hits with front=None
-    if vertex_rate:
-        kb = 0.0                   # in the corners already
+    if vertex_rate or shadeless:
+        kb = 0.0           # in the corners already / never applied
     if kb > 1e-4:
         lines += [
             '    vec3 hal_bf_p0 = hal_fetch_attr(f.tri, 0, 0).xyz;',
@@ -2000,6 +2136,36 @@ void main()
                 f'{_f(eo)} * hal_eo_t, 0.0, 1.0);',
             ]
         lines.append('    Color = vec4(total * keep, hal_alpha * keep);')
+    elif consts.get('stipple') and not secondary:
+        # Screen Door: shade_batch's own chain -- clamp, the hard
+        # cutoff, then keep-or-drop against the CPU's threshold map
+        # (hal_stipple carries threshold_map(pattern, 64, 64) verbatim;
+        # the CPU indexes it py % 64, px % 64). The alpha channel
+        # doubles as the target's ownership flag, so the stipple bit
+        # rides ENCODED above the coverage floor: 0.6 = covered but
+        # dropped, 0.9 = covered and kept -- the readback decodes
+        # coverage at > 0.5 and the stipple bit at > 0.75, and rgb
+        # stays the full shaded colour either way, exactly the CPU's
+        # (rgb shaded, alpha 0/1) split. Ray HITS never stipple: the
+        # CPU gates on ctx.px, which a hit does not have.
+        aexpr = perpix_exprs.get('opacity',
+                                 _f(float(bake.get('opacity', 1.0))))
+        lines.append(f'    float hal_alpha = clamp({aexpr}, 0.0, 1.0);')
+        thr = float(consts.get('alpha_threshold', 0.0))
+        if thr > 0.0:
+            lines.append(f'    hal_alpha = (hal_alpha >= {_f(thr)}) '
+                         '? hal_alpha : 0.0;')
+        rw, rh = consts.get('resolution', (1.0, 1.0))
+        lines += [
+            f'    float hal_spx = mod(floor(vUV.x * {_f(float(rw))}), '
+            '64.0);',
+            f'    float hal_spy = mod(floor(vUV.y * {_f(float(rh))}), '
+            '64.0);',
+            '    float hal_sthr = texture(hal_stipple, '
+            '(vec2(hal_spx, hal_spy) + vec2(0.5)) / 64.0).r;',
+            '    hal_alpha = (hal_alpha > hal_sthr) ? 1.0 : 0.0;',
+            '    Color = vec4(total, 0.6 + 0.3 * hal_alpha) * keep;',
+        ]
     else:
         lines.append('    Color = vec4(total, 1.0) * keep;')
     lines.append('}')
@@ -2012,6 +2178,8 @@ void main()
             'textures': tex_binds,
             'textures_mip': tex_binds_mip,
             'needs_uvgrad': bool(needs_uvgrad),
+            'needs_wirescreen': bool(getattr(em, 'needs_wirescreen',
+                                             False)),
             'frame_uniforms': frame_unis,
             'prepasses': prepasses,
             'uses_screen': em.used_screen

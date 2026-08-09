@@ -40,19 +40,22 @@ FEATURES = {
                   "hardware at 0.000021 (RTX 5060 Ti, Vulkan); image "
                   "inputs, vScreenUV and iResolution travel now, and HLSL "
                   "still refuses"),
-    'node_graph': (NOT_YET,
-                   "the hard one, and the reason a full GPU frame is still out "
-                   "of reach: 59 node types now have a GLSL emitter, each "
-                   "verified against the NumPy one -- Normal Map bends the "
-                   "shading normal, the Bump node renders its height chain "
-                   "to a pre-pass and takes the CPU's own neighbour "
-                   "differences by texelFetch, coded shaders inline "
-                   "natively, and ALL nineteen period pattern textures ride "
-                   "their integer hash bit-exactly, generated coordinates "
-                   "and seeded-generator bakes included. Blender's Noise "
-                   "family refuses by name: its sin-fract hash decorrelates "
-                   "under a driver's float32 sin. Anything unported keeps "
-                   "the whole material on the CPU rather than guessing"),
+    'node_graph': (BOTH,
+                   "78 node types carry a GLSL emitter, each measured "
+                   "against the NumPy evaluator to 0.000006 in simulation "
+                   "and 115 of 116 matrix rows on real hardware. The "
+                   "evaluator was the hard piece of the port, and the "
+                   "emitters retired it -- Normal Map bends the "
+                   "shading normal, Bump renders its height chain to a "
+                   "pre-pass and takes the CPU's own neighbour differences "
+                   "by texelFetch, coded shaders inline natively, the "
+                   "Wireframe node draws exact edge distance, and ALL "
+                   "nineteen period pattern textures ride their integer "
+                   "hash bit-exactly. What refuses does so PER MATERIAL, "
+                   "by name (Blender's sin-fract Noise family above all: "
+                   "a driver's float32 sin decorrelates it), and that one "
+                   "material shades on the CPU exactly -- a node graph no "
+                   "longer moves the frame"),
     'gbuffer_upload': (BOTH,
                       "measured: the deferred pass reproduces the CPU frame "
                       "to 0.000051 max difference on real hardware (RTX 5060 "
@@ -61,7 +64,7 @@ FEATURES = {
                       "arithmetic in the shader, and unchanged uploads are "
                       "cached across frames behind content fingerprints"),
     'shading_glsl': (BOTH,
-                     "all 17 reflectance models, measured through the "
+                     "all 18 reflectance models, measured through the "
                      "deferred pass on real hardware at 0.000051 -- sun, "
                      "point and spot lights, two-sided lighting, flat and "
                      "smooth normals"),
@@ -73,13 +76,17 @@ FEATURES = {
                   "pixels of 76800 on real hardware (RTX 5060 Ti, Vulkan), "
                   "barycentrics to 3e-7, and 7x faster than the CPU at "
                   "working size -- the kernel IS fill(). Opt in as GPU "
-                  "Rasteriser in the Debug panel; frames it cannot "
-                  "reproduce (Painter's sort, affine texture mode, "
-                  "overdraw, worker bands) rasterise on the CPU and say "
-                  "why"),
-    'shading_models': (NOT_YET,
-                       "18 formulas already written down, mechanical to "
-                       "translate"),
+                  "Rasteriser in the Debug panel; affine frames carry "
+                  "their screen-linear barycentrics and quantised-depth "
+                  "frames run the tie referral; what it cannot reproduce "
+                  "(Painter's ordered fill, the overdraw instrument, "
+                  "worker bands) rasterises on the CPU and says why"),
+    'shading_models': (BOTH,
+                       "all 18 reflectance models dispatch in GLSL, "
+                       "measured through the deferred pass at 0.000051 on "
+                       "real hardware; CONSTANT and WIREFRAME emit "
+                       "light_surface's shadeless early return, and the "
+                       "Gouraud/flat rates interpolate CPU-lit corners"),
     'raytrace': (BOTH,
                  "COMPLETE, measured on real hardware (RTX 5060 Ti, "
                  "Vulkan): hard ray shadows (0.000048, 0 px), SOFT ray "

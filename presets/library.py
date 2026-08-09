@@ -1169,8 +1169,8 @@ DEVICE_KEYS = frozenset({
 # Machine and pipeline settings, which describe the computer or the output
 # plumbing rather than the look. A preset has no business resetting these.
 PRESERVED = frozenset({
-    'threads', 'tile_size', 'bucket_order', 'preview_scale', 'progressive',
-    'show_stats', 'debug_pass', 'seed', 'jitter_seed', 'max_texture_memory',
+    'threads', 'preview_scale', 'progressive',
+    'show_stats', 'debug_pass', 'seed',
     'film_transparent', 'use_processes', 'process_count',
 }) | DEVICE_KEYS
 

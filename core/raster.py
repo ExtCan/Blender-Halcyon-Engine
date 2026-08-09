@@ -65,7 +65,7 @@ def quantize_depth(zz, depth_bits):
 
 class GBuffer:
     __slots__ = ('width', 'height', 'tri', 'bary', 'bary_lin', 'depth', 'zndc',
-                 'overdraw', 'front')
+                 'overdraw', 'front', 'gpu_alpha')
 
     def __init__(self, width, height):
         self.width = int(width)
@@ -77,6 +77,9 @@ class GBuffer:
         self.front = np.ones((height, width), dtype=bool)
         self.overdraw = np.zeros((height, width), dtype=np.int32)
         self.bary_lin = None
+        # the GPU frame's decoded Screen Door alpha (shade_frame /
+        # simulate set it under Transparency STIPPLE; render.py reads it)
+        self.gpu_alpha = None
 
     def alloc_linear(self):
         """Screen-linear barycentrics -- the affine texture warp of the era."""
@@ -180,8 +183,56 @@ def _clip_near(cp, cb, near_eps):
 IDENT_BARY = np.eye(3, dtype=np.float32)
 
 
+def _subdivide_screen_tris(sx, sy, iw, z, bw, src, limit_px, max_passes=6):
+    """Affine-correction subdivision: 4-way split until edges fit the cap.
+
+    The PS1 warp gets less wrong when triangles are smaller -- period
+    engines subdivided for exactly this reason, and `tex_affine_subdiv`
+    is that dial: the maximum screen-space edge length, in pixels,
+    before a triangle splits. Splitting AFTER projection is exact for
+    every rasteriser input: screen position, 1/w, ndc z and the
+    original-triangle weights `bw` are all screen-affine, so midpoints
+    are plain averages and the perspective-correct barycentrics
+    reconstructed from any sub-triangle are the original triangle's
+    own. Only the screen-LINEAR interpolation -- the warp itself --
+    changes, which is the entire point. Deterministic and shared: both
+    rasterisers receive the same emitted list in the same order.
+    """
+    lim2 = np.float32(float(limit_px) * float(limit_px))
+    half = np.float32(0.5)
+    for _ in range(int(max_passes)):
+        e01 = (sx[:, 0] - sx[:, 1]) ** 2 + (sy[:, 0] - sy[:, 1]) ** 2
+        e12 = (sx[:, 1] - sx[:, 2]) ** 2 + (sy[:, 1] - sy[:, 2]) ** 2
+        e20 = (sx[:, 2] - sx[:, 0]) ** 2 + (sy[:, 2] - sy[:, 0]) ** 2
+        big = np.maximum(np.maximum(e01, e12), e20) > lim2
+        if not big.any():
+            break
+
+        def _split(arr):
+            # arr (E,3,...) -> midpoints m01,m12,m20 and the 4 children
+            a, b, c = arr[big, 0], arr[big, 1], arr[big, 2]
+            m01 = (a + b) * half
+            m12 = (b + c) * half
+            m20 = (c + a) * half
+            kids = np.stack([
+                np.stack([a, m01, m20], axis=1),
+                np.stack([m01, b, m12], axis=1),
+                np.stack([m20, m12, c], axis=1),
+                np.stack([m01, m12, m20], axis=1),
+            ], axis=1)                       # (Nbig, 4, 3, ...)
+            return kids.reshape((-1,) + arr.shape[1:])
+
+        stay = ~big
+        parts = []
+        for arr in (sx, sy, iw, z, bw):
+            parts.append(np.concatenate([arr[stay], _split(arr)], axis=0))
+        sx, sy, iw, z, bw = [p.astype(np.float32) for p in parts]
+        src = np.concatenate([src[stay], np.repeat(src[big], 4)], axis=0)
+    return sx, sy, iw, z, bw, src.astype(np.int32)
+
+
 def build_screen_tris(clip, tris, width, height, snap=0.0, near_eps=1e-5,
-                      depth_bits=24, clip_far=False):
+                      depth_bits=24, clip_far=False, subdiv_px=0):
     """Clip + project every triangle. Returns flat arrays ready for filling.
 
     Output arrays are per *emitted* triangle (clipping can create more than one):
@@ -190,6 +241,11 @@ def build_screen_tris(clip, tris, width, height, snap=0.0, near_eps=1e-5,
       z      (E,3) ndc z
       bw     (E,3,3) barycentric weight of each emitted corner over the original
       src    (E,)  index into `tris`
+
+    `subdiv_px` > 0 turns on affine-correction subdivision (see
+    _subdivide_screen_tris): triangles split until no screen edge
+    exceeds that many pixels. Applied AFTER vertex snapping, so the
+    PS1 combo subdivides the snapped geometry, as the era did.
     """
     tris = np.asarray(tris, dtype=np.int32)
     cp = clip[tris]                                    # (T,3,4)
@@ -253,6 +309,9 @@ def build_screen_tris(clip, tris, width, height, snap=0.0, near_eps=1e-5,
     if snap > 0.0:
         sx = np.round(sx / snap) * snap
         sy = np.round(sy / snap) * snap
+    if subdiv_px and int(subdiv_px) > 0:
+        sx, sy, iw, z, B, S = _subdivide_screen_tris(
+            sx, sy, iw, z, B, S, max(int(subdiv_px), 4))
     # depth_bits is accepted (and threaded to the fillers by rasterize)
     # but NOT applied here any more. Quantizing the VERTEX z and then
     # interpolating tilted every triangle's whole depth plane by up to
@@ -351,7 +410,20 @@ def fill(gbuf, sx, sy, iw, z, bw, src, cull='NONE', frags=None, flat_depth=None,
                 # contact survives whichever rasteriser wrote the depth
                 keep = zz < abuf_depth_limit(depth[py, px])
             else:
-                keep = zz < depth[py, px]
+                # THE NAMED TIE RULE: equal depth goes to the LOWEST
+                # triangle id. Exact ties are common the moment depth is
+                # quantised (coincident contacts land on shared steps),
+                # and the old strict `<` left the winner to whichever
+                # ORDER a code path happened to test in -- this loop
+                # tested in submission order while fill_batched drew
+                # big triangles first and size-bucketed the rest, and
+                # the two disagreed on 3 pixels of the demo scene at 16
+                # bits. A rule keyed on the triangle ID is order-free:
+                # every path (this loop, the batched resolve, the
+                # compute kernel, the referral replay) lands the same
+                # winner whatever it tested first.
+                keep = (zz < depth[py, px]) | \
+                    ((zz == depth[py, px]) & (src_tri < tri_b[py, px]))
             if not keep.any():
                 continue
             if not keep.all():
@@ -399,7 +471,7 @@ def rasterize(verts, tris, mvp, width, height, cull='NONE', snap=0.0,
               depth_bits=24, subset=None, gbuf=None, frags=None,
               depth_write=True, depth_test=True, count_overdraw=False,
               z_offset=0.0, near_eps=1e-5, batched=None, flat_depth=None,
-              scissor=None):
+              scissor=None, subdiv_px=0):
     """Convenience: project + clip + fill in one call.
 
     `batched` selects the loop-free rasteriser; None picks automatically. The
@@ -445,7 +517,8 @@ def rasterize(verts, tris, mvp, width, height, cull='NONE', snap=0.0,
                     tri_map = np.nonzero(keep_tris)[0].astype(np.int32)
 
     sx, sy, iw, z, bw, src = build_screen_tris(clip, tris, width, height, snap=snap,
-                                               near_eps=near_eps, depth_bits=depth_bits)
+                                               near_eps=near_eps, depth_bits=depth_bits,
+                                               subdiv_px=subdiv_px)
     if scissor is not None and sx.shape[0]:
         y0, y1 = scissor
         lo = sy.min(axis=1)
@@ -707,14 +780,21 @@ def fill_batched(gbuf, sx, sy, iw, z, bw, src, cull='NONE', frags=None,
 
     if depth_write:
         pix = py.astype(np.int64) * W + px
-        order = np.lexsort((zz, pix))
+        # THE NAMED TIE RULE (see fill): equal depth -> lowest triangle
+        # id. The id joins the sort key, so within this batch the
+        # winner is order-free; against depths already in the gbuf
+        # (the big-triangle pre-pass, an earlier rasterize call) the
+        # equal-depth comparison consults the stored id the same way.
+        order = np.lexsort((tri, zz, pix))
         pix_s = pix[order]
         first = np.empty(pix_s.size, bool)
         first[0] = True
         np.not_equal(pix_s[1:], pix_s[:-1], out=first[1:])
         win = order[first]
         wx, wy = px[win], py[win]
-        better = zz[win] < gbuf.depth[wy, wx]
+        d0 = gbuf.depth[wy, wx]
+        better = (zz[win] < d0) | ((zz[win] == d0)
+                                   & (tri[win] < gbuf.tri[wy, wx]))
         win = win[better]
         wx, wy = wx[better], wy[better]
         gbuf.depth[wy, wx] = zz[win]

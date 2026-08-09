@@ -520,8 +520,13 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
     if mode == 'NONE':
         return np.ones(n, np.float32)
 
-    if mode == 'RAY' or (light.shadow_map is None and bvh is not None
-                         and settings.ray_shadows):
+    # ray_shadows is the master switch for TRACED shadows: RAY-mode lights
+    # obey it too. It used to gate only the no-map fallback -- a state no
+    # ordinary scene can reach, since every MAP-mode light gets a map built
+    # -- which left the toggle effectively unreachable from the UI (found
+    # by the settings audit)
+    if settings.ray_shadows and (
+            mode == 'RAY' or (light.shadow_map is None and bvh is not None)):
         if bvh is None:
             return np.ones(n, np.float32)
         bias = max(settings.ray_bias, 1e-4)

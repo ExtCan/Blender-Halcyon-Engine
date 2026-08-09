@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "halcyon_render"
-version = "1.25.101"
+version = "1.30.0"
 name = "Halcyon Render Engine"
 tagline = "Period-accurate mid-to-late 1990s CGI, not a filter"
 maintainer = "Built by Claude with help from Mr. Emotiman <your@email.address>"

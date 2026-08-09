@@ -4635,14 +4635,17 @@ def test_device_plan_falls_back():
         check('and the deferred stage is mentioned in the notes',
               any('shading' in n.lower() for n in notes), '; '.join(notes))
         text = ' '.join(notes)
-        check('node_graph is reported as staying on the CPU',
-              'node_graph' in text)
+        # the port is complete: claiming the node graph forces a CPU frame
+        # would now be false, exactly as it became false for code_node.
+        # This check FLIPPED when node_graph reached BOTH (R106 audit)
+        check('node_graph is no longer claimed as CPU-stuck',
+              'node_graph' not in text, text)
         # the coded shader node left the blocking list: the deferred pass
         # inlines it, so claiming it forces a CPU frame would be false
         check('code_node is no longer claimed as CPU-stuck',
               'code_node' not in text, text)
-        check('the reason is given, not just the name',
-              'GLSL' in text or 'NumPy' in text)
+        check('the deferred note carries its measurement, not just a claim',
+              '0.000051' in text)
     finally:
         dev.probe = saved
 
@@ -6060,7 +6063,7 @@ def test_a_material_visible_only_in_reflections_still_travels():
 
     # the rays REALLY reach it: the frame's own refraction rays, asked
     # of the same BVH the sweeps trace
-    py, px, org, dirs = GSH._refraction_rays(job, g, rplan)
+    py, px, org, dirs, _N = GSH._refraction_rays(job, g, rplan)
     hid, _t, _u, _v = bvh.intersect(org, dirs,
                                     np.full(py.size, 1e30, np.float32))
     hit_mats = np.unique(sc.mesh.mat_index[hid[hid >= 0]])
@@ -9225,6 +9228,9 @@ def test_normal_maps_bend_the_deferred_normal():
           p is not None and any(len(e[3].get('prepasses', ())) == 1
                                 for e in p), str(why))
 
+    # FLIPPED (1.25.102): Normal Source FACE rides the hal_triaux
+    # per-tri texture now -- the plan must qualify and every pass must
+    # carry the stored-normal override
     st = base_settings(w, h)
     st.normal_source = 'FACE'
     sc = demo_scene(st, with_texture=False)
@@ -9234,8 +9240,10 @@ def test_normal_maps_bend_the_deferred_normal():
     job = R.ShadeJob(sc, st, {}, None, view, eye, w, h)
     GSH._PLAN_CACHE.clear()
     p, why, _a = GSH.plan_frame(job, g)
-    check('Normal Source FACE is refused by name',
-          p is None and 'FACE' in str(why), str(why))
+    check('Normal Source FACE qualifies via the per-tri texture',
+          p is not None and 'hal_triaux' in _a and
+          all('hal_triaux_fetch' in src for _m, _n, src, _b in p),
+          str(why))
 
     # a normal bent anywhere but the master node still moves to the CPU
     st = base_settings(w, h)
@@ -10456,9 +10464,30 @@ def test_more_utilities_and_the_geometry_audit():
 
     refuses(geo_graph(6), 'orthographic',
             'Backfacing under an orthographic camera', camera='ORTHO')
-    refuses(geo_graph(3), 'face normal', "Geometry's True Normal")
-    refuses(geo_graph(8, scale=1.0), 'sin-fract',
-            "Geometry's Random Per Island")
+
+    # True Normal and Random Per Island FLIPPED from refusals to the
+    # hal_triaux per-tri texture (the CPU's own stored normals and
+    # sin-fract randoms, baked): the plan must qualify and the pass
+    # must fetch the texel, not recompute
+    def qualifies_with_aux(graph, label):
+        w, h = 96, 72
+        st = base_settings(w, h)
+        sc = demo_scene(st, with_texture=False)
+        sc.materials[1] = Material(name='Aux', index=1, graph=graph)
+        view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+        g = raster.GBuffer(w, h)
+        raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+        job = R.ShadeJob(sc, st, {}, None, view, eye, w, h)
+        GSH._PLAN_CACHE.clear()
+        p, why, a = GSH.plan_frame(job, g)
+        check(f'{label} rides the per-tri texture now', p is not None
+              and 'hal_triaux' in a
+              and any('hal_triaux_fetch' in src for _m, _n, src, _b in p),
+              str(why))
+
+    qualifies_with_aux(geo_graph(3), "Geometry's True Normal")
+    qualifies_with_aux(geo_graph(8, scale=1.0),
+                       "Geometry's Random Per Island")
 
     # ---- the new utilities behave, on the numbers
     n = 256
@@ -10673,19 +10702,28 @@ def test_the_era_audit_round():
     # determinism: the jitter rides the pixel-identity streams
     again = R.render(sc, st)
     check('the blur is deterministic', bool(np.array_equal(blurred, again)))
-    # and the deferred pass refuses BY NAME
+    # FLIPPED (1.25.105): the deferred sweeps run the cone now -- the
+    # plan qualifies and the sim reproduces the CPU's averaged jitter
+    from ..core.bvh import BVH as _BVH
     view, _proj, vp, eye = R.camera_matrices(sc.camera,
                                              st.resolution_x,
                                              st.resolution_y)
     g = raster.GBuffer(st.resolution_x, st.resolution_y)
     raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, st.resolution_x,
                      st.resolution_y, gbuf=g)
-    job = R.ShadeJob(sc, st, {}, None, view, eye, st.resolution_x,
-                     st.resolution_y)
+    job = R.ShadeJob(sc, st, R.prepare_textures(sc, st),
+                     _BVH(sc.mesh.verts, sc.mesh.tris), view, eye,
+                     st.resolution_x, st.resolution_y)
     GSH._PLAN_CACHE.clear()
     p, why, _a = GSH.plan_frame(job, g)
-    check('blurry reflections refuse by name',
-          p is None and 'jittered rays' in str(why), str(why))
+    check('blurry reflections qualify for the deferred sweeps',
+          p is not None, str(why))
+    if p is not None:
+        simg, _hit = GSH.simulate(job, g, p, _a)
+        cov = g.tri >= 0
+        errb = float(np.abs(simg[cov] - blurred[cov][:, :3]).max())
+        check('...and the sim reproduces the CPU cone', errb < 6e-3,
+              f'max {errb:.6f}')
 
     # ---- the burn-in stamp. The reference is the same post chain with
     # no watermark: post legitimately quantises and transforms, so
@@ -11072,6 +11110,517 @@ def test_interpolated_radiosity_and_the_inked_slate():
     inks = {tuple(np.round(v, 4)) for v in ink}
     check('and wears many inks, not one cyan tint', len(inks) > 12,
           str(len(inks)))
+
+
+def test_the_last_shading_routes_fall():
+    """R105: the final three shading routes -- specular slot routing,
+    the Wireframe node's ink, and the blur cone in the sweeps.
+
+    Slot routing: a lone raw GLOSSY lobe's colour chain goes to
+    s.specular (closure_to_surface's own slot) with the flat diffuse
+    baked; the Specular BSDF's DIFFUSE+GLOSSY pair keeps the chain in
+    the diffuse slot and bakes the glossy side through the existing
+    constancy rule. The Wireframe node: ShadeJob.wire_fields expression
+    for expression -- world edge distance from the attribute texture's
+    corners, Pixel Size from the per-corner screen positions packed per
+    frame (camera-dependent, so it rides the per-frame road, never the
+    plan's atlas cache). Blurry reflections: _blurred_reflection's cone
+    in the sweeps, same salt streams, same fold, K lane values
+    averaged, recursively at every reflective spawn.
+    """
+    from .featurematrix import build
+    from ..core import raster
+    from ..core.bvh import BVH
+    from ..gpu import shade as GSH
+
+    def plan_sim(key, mutate=None):
+        sc, st = build(key)
+        st.render_device = 'GPU'
+        if mutate:
+            mutate(sc, st)
+        cpu = R.render(sc, st)
+        w, h = st.resolution_x, st.resolution_y
+        view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+        g = raster.GBuffer(w, h)
+        raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+        tex = R.prepare_textures(sc, st)
+        job = R.ShadeJob(sc, st, tex, BVH(sc.mesh.verts, sc.mesh.tris),
+                         view, eye, w, h)
+        GSH._PLAN_CACHE.clear()
+        p, why, a = GSH.plan_frame(job, g)
+        if p is None:
+            return None, why, None, cpu, g
+        img, _hit = GSH.simulate(job, g, p, a)
+        cov = g.tri >= 0
+        err = float(np.abs(img[cov] - cpu[cov][:, :3]).max())
+        return p, err, a, cpu, g
+
+    # ---- the specular slot routing (queued since the node shelf round)
+    p, err, a, _c, _g = plan_sim('node Metallic BSDF (raw graph)')
+    check('raw Metallic BSDF qualifies (slot routing)', p is not None,
+          str(err))
+    if p is not None:
+        check('...and sim-matches the CPU', err < 6e-3, f'max {err:.6f}')
+        check('...with the chain routed to s.specular',
+              any('s.specular = ' in src and '__slot' not in src
+                  for _m, _n, src, _b in p))
+    p, err, _a, _c, _g = plan_sim('node Specular BSDF (raw graph)')
+    check('raw Specular BSDF qualifies (diffuse chain + baked gloss)',
+          p is not None, str(err))
+    if p is not None:
+        check('...and sim-matches the CPU', err < 6e-3, f'max {err:.6f}')
+
+    # ---- the Wireframe node, both units
+    p, err, _a, _c, _g = plan_sim('node Wireframe (cel ink)')
+    check('the Wireframe node qualifies (world units)', p is not None,
+          str(err))
+    if p is not None:
+        check('...and sim-matches the CPU EXACTLY', err < 1e-5,
+              f'max {err:.6f}')
+
+    def _pixel_size(sc, st):
+        for _nid, nd in sc.materials[1].graph['nodes'].items():
+            if nd.get('bl_idname') == 'ShaderNodeWireframe':
+                nd['props']['use_pixel_size'] = True
+                for skt in nd['inputs']:
+                    if skt['name'] == 'Size':
+                        skt['default'] = 2.0
+    p, err, _a, _c, _g = plan_sim('node Wireframe (cel ink)',
+                                  mutate=_pixel_size)
+    check('the Wireframe node qualifies (Pixel Size)', p is not None,
+          str(err))
+    if p is not None:
+        check('...pixel-size wires sim-match EXACTLY', err < 1e-5,
+              f'max {err:.6f}')
+        check('...and the pass carries the screen texture',
+              any('hal_vscreen' in b.get('samplers', ())
+                  for _m, _n, _s, b in p))
+
+    # ---- the blur cone in the sweeps (full coverage in the era-audit
+    # test; here the structural guarantee: MORE samples change the sim
+    # exactly as they change the CPU)
+    p, err, _a, cpu8, g8 = plan_sim(
+        'blurry reflections',
+        mutate=lambda sc, st: setattr(st, 'reflection_blur_samples', 8))
+    check('an 8-sample cone qualifies and sim-matches',
+          p is not None and err < 6e-3, str(err))
+
+
+def test_the_raster_endgame():
+    """R103: the compute raster learns the last three shading-adjacent
+    tricks -- the affine carry, real subdivision, and the tie referral.
+
+    Affine: the kernel's lin image must carry fill()'s own bary_lin
+    (l . bw, no perspective) to the ulp, so the PS1 warp shades from
+    the same interpolants whichever rasteriser ran. Subdivision: the
+    once-dead tex_affine_subdiv now splits screen triangles until no
+    edge exceeds the cap -- deterministic, shared by both rasterisers,
+    exact for every rasteriser input (all are screen-affine).
+    Referral: under quantised depth and vertex snapping the kernel
+    marks every decision inside a cross-device noise window and the
+    marked pixels are REPLAYED with the CPU fill's own arithmetic --
+    the R73 ray referral, at the raster.
+    """
+    from ..core import raster
+    from ..core.scene import Camera, MeshData
+    from ..gpu import craster as CRA
+    from .scenebuild import look_at_matrix
+
+    w, h = 160, 120
+    st = base_settings(w, h)
+    sc = demo_scene(st, with_texture=True)
+    view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+
+    # ---- the affine carry: lin == fill()'s bary_lin
+    g = raster.GBuffer(w, h)
+    g.alloc_linear()
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+    sx, sy, iw, z, bw, src, tmap = CRA.raster_inputs_for(sc.mesh, vp, w, h)
+    tri, bary, zndc, front, _b2, lin, _mk = CRA.simulate_raster(
+        sx, sy, iw, z, bw, src, tmap, w, h)
+    check('affine carry: tri ids identical',
+          bool(np.array_equal(tri, g.tri)))
+    cov = g.tri >= 0
+    dl = float(np.abs(lin[cov] - g.bary_lin[cov]).max())
+    check('affine carry: the lin image IS bary_lin (to the ulp)',
+          dl < 1e-5, f'{dl:.2e}')
+    check('...and it differs from the perspective bary (not vacuous)',
+          float(np.abs(lin[cov] - bary[cov]).max()) > 1e-3)
+
+    # ---- subdivision: deterministic, bounded, shared
+    sx2, sy2, iw2, z2, bw2, src2, _tm = CRA.raster_inputs_for(
+        sc.mesh, vp, w, h, subdiv_px=12)
+    check('subdivision emits more triangles', sx2.shape[0] > sx.shape[0],
+          f'{sx.shape[0]} -> {sx2.shape[0]}')
+    e01 = np.sqrt((sx2[:, 0] - sx2[:, 1]) ** 2 + (sy2[:, 0] - sy2[:, 1]) ** 2)
+    e12 = np.sqrt((sx2[:, 1] - sx2[:, 2]) ** 2 + (sy2[:, 1] - sy2[:, 2]) ** 2)
+    e20 = np.sqrt((sx2[:, 2] - sx2[:, 0]) ** 2 + (sy2[:, 2] - sy2[:, 0]) ** 2)
+    # a pass cap exists, so the guarantee is "capped or six passes deep";
+    # on this scene six passes are plenty
+    check('...and no screen edge exceeds the cap',
+          float(np.maximum(np.maximum(e01, e12), e20).max()) <= 12.0 + 1e-3)
+    sx3, _sy3, _iw3, _z3, _bw3, _src3, _tm3 = CRA.raster_inputs_for(
+        sc.mesh, vp, w, h, subdiv_px=12)
+    check('...and the split is deterministic',
+          bool(np.array_equal(sx2, sx3)))
+    # subdivided raster == unsubdivided COVERAGE (same surfaces, same
+    # depth planes: the picture's geometry cannot move)
+    g_sub = raster.GBuffer(w, h)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g_sub,
+                     subdiv_px=12)
+    check('subdivision does not move coverage',
+          bool(np.array_equal(g_sub.tri >= 0, g.tri >= 0)))
+
+    # ---- THE NAMED TIE RULE: equal depth -> lowest triangle id.
+    # This round found the two CPU fill paths DISAGREEING at exact
+    # quantised ties (the batched path draws big triangles first, so
+    # "first tested wins" meant different winners by path -- 3 px of
+    # the demo scene at 16 bits, latent since the batched fill
+    # shipped). The rule is order-free, so loop, batched, kernel and
+    # replay all land the same winner.
+    gb16 = raster.GBuffer(w, h)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=gb16,
+                     depth_bits=16)
+    gl16 = raster.GBuffer(w, h)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=gl16,
+                     depth_bits=16, batched=False)
+    check('batched and loop fills agree at 16-bit ties (the latent '
+          'bug, pinned)', bool(np.array_equal(gb16.tri, gl16.tri)),
+          f'{int((gb16.tri != gl16.tri).sum())} differ')
+
+    # coincident IDENTICAL quads: exact ties everywhere. The tie rule
+    # decides them deterministically on every path -- ZERO referral
+    # marks needed, and the kernel equals fill exactly
+    verts = np.array([[-2, -2, 0], [2, -2, 0], [2, 2, 0], [-2, 2, 0]],
+                     np.float32)
+    tris = np.array([[0, 1, 2], [0, 2, 3],
+                     [0, 1, 2], [0, 2, 3]], np.int32)
+    mesh = MeshData(verts=verts, tris=tris)
+    cam = Camera(matrix_world=look_at_matrix((0.0, 0.0, 6.0),
+                                             (0.0, 0.0, 0.0)),
+                 lens=35.0, sensor=36.0, clip_start=0.1, clip_end=100.0)
+    _v, _p, vp2, _e = R.camera_matrices(cam, w, h)
+    g16 = raster.GBuffer(w, h)
+    raster.rasterize(mesh.verts, mesh.tris, vp2, w, h, gbuf=g16,
+                     depth_bits=16)
+    sx4, sy4, iw4, z4, bw4, src4, _tm4 = CRA.raster_inputs_for(
+        mesh, vp2, w, h, depth_bits=16)
+    tri4, _b4, z44, _f4, _bb4, _l4, mark4 = CRA.simulate_raster(
+        sx4, sy4, iw4, z4, bw4, src4, None, w, h, depth_bits=16,
+        refer=True)
+    # the kernel equals fill on every tie BEFORE any replay -- the id
+    # rule decides them. But a zero raw-depth GAP is still fragile in
+    # general (two coincidentally-equal values can SPLIT under a
+    # driver's fma, and a split is decided by depth, not the id rule),
+    # so fully-duplicated geometry floods the marks past the budget
+    # and the frame honestly bails to the CPU raster -- degenerate
+    # scenes stay correct by falling back, named
+    cov4 = int((tri4 >= 0).sum())
+    check('exact ties: kernel equals fill with no replay needed',
+          bool(np.array_equal(tri4, g16.tri)),
+          f'{int((tri4 != g16.tri).sum())} differ')
+    check('...duplicate-identical geometry floods the referral (the '
+          'honest bail)', int(mark4.sum()) > CRA.REFER_BAIL_FRAC * cov4,
+          f'{int(mark4.sum())} of {cov4}')
+    check('...and the ties all went to the lowest id',
+          set(np.unique(g16.tri[g16.tri >= 0]).tolist()) <= {0, 1})
+
+    # NEAR-coincident quads: some depths land near step boundaries in
+    # a close competition -- the one genuinely fragile class. Marks
+    # must fire there, and the replay must hand back fill()'s own
+    # answer at every one
+    verts2 = verts.copy()
+    verts2 = np.concatenate([verts2, verts2 + [0, 0, 1e-4]], 0)
+    tris2 = np.array([[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]],
+                     np.int32)
+    mesh2 = MeshData(verts=verts2.astype(np.float32), tris=tris2)
+    g16b = raster.GBuffer(w, h)
+    raster.rasterize(mesh2.verts, mesh2.tris, vp2, w, h, gbuf=g16b,
+                     depth_bits=16)
+    sx5, sy5, iw5, z5, bw5, src5, _tm5 = CRA.raster_inputs_for(
+        mesh2, vp2, w, h, depth_bits=16)
+    tri5, _b5, z55, _f5, _bb5, _l5, mark5 = CRA.simulate_raster(
+        sx5, sy5, iw5, z5, bw5, src5, None, w, h, depth_bits=16,
+        refer=True)
+    check('boundary-window marks fire on near-coincident depth',
+          bool(mark5.any()), f'{int(mark5.sum())} marked')
+    pys, pxs = np.nonzero(mark5)
+    _c5, _cs5, bins5, _bs5, tiles5, tw5, _th5 = CRA.pack_raster_inputs(
+        sx5, sy5, iw5, z5, bw5, src5, None, w, h)
+    r_tri, r_b, r_lb, r_z, r_fr = CRA.replay_pixels(
+        pxs, pys, sx5, sy5, iw5, z5, bw5,
+        np.asarray(src5, np.int64), tiles5, bins5.reshape(-1), tw5,
+        'NONE', 16)
+    tri5[pys, pxs] = r_tri
+    z55[pys, pxs] = np.where(r_tri >= 0, r_z, 1.0)
+    check('replayed + unmarked pixels equal fill() EXACTLY',
+          bool(np.array_equal(tri5, g16b.tri)),
+          f'{int((tri5 != g16b.tri).sum())} differ')
+    check("...and the replayed depths are fill()'s own",
+          bool(np.array_equal(z55[pys, pxs], g16b.zndc[pys, pxs])))
+
+    # the field predictor: on the matrix's own quantised rows the mark
+    # rate must sit inside the referral budget -- the driver REPLAYS
+    # a handful of pixels instead of bailing the frame
+    from .featurematrix import build as _mbuild
+    for row in ('16-bit z-buffer', 'vertex snapping (PS1)'):
+        scq, stq = _mbuild(row)
+        wq, hq = stq.resolution_x, stq.resolution_y
+        snapq = float(stq.vertex_snap_grid) if stq.vertex_snap else 0.0
+        bitsq = int(stq.depth_precision)
+        _vq, _pq, vpq, _eq = R.camera_matrices(scq.camera, wq, hq)
+        sxq, syq, iwq, zq, bwq, srcq, tmq = CRA.raster_inputs_for(
+            scq.mesh, vpq, wq, hq, depth_bits=bitsq, snap=snapq)
+        triq, _bq, _zq2, _fq, _bbq, _lq, markq = CRA.simulate_raster(
+            sxq, syq, iwq, zq, bwq, srcq, tmq, wq, hq,
+            depth_bits=bitsq, refer=True)
+        covq = int((triq >= 0).sum())
+        check(f'{row}: marks inside the referral budget',
+              int(markq.sum()) <= CRA.REFER_BAIL_FRAC * covq,
+              f'{int(markq.sum())} of {covq}')
+
+    # marks stay OFF when the referral is off (24-bit default road)
+    _t6, _b6, _z6, _f6, _bb6, _l6, mk6 = CRA.simulate_raster(
+        sx5, sy5, iw5, z5, bw5, src5, None, w, h, depth_bits=16,
+        refer=False)
+    check('no marks without the referral flag', not bool(mk6.any()))
+
+
+def test_the_shading_routes_fall():
+    """R102: five features that routed whole frames to the CPU by name
+    now shade on the driver, each by its own honest road.
+
+    CONSTANT/WIREFRAME: light_surface's early return emitted verbatim
+    (diffuse x level + emission), the wires carved by apply_wireframe on
+    the readback -- the fog doctrine. Normal Source FACE + Geometry's
+    True Normal / Random Per Island: the hal_triaux per-tri texture
+    carries the CPU's OWN stored normals and sin-fract randoms, fetched
+    rather than recomputed. Affine mapping: uv re-interpolates by the
+    rasteriser's own screen-linear barycentrics (hal_gb_idslin), uv
+    only, hits keep true bary. Screen Door stipple: the CPU's alpha
+    chain + its own threshold map, the 0/1 pattern decoded from an
+    encoded alpha (0.9 kept / 0.6 dropped over the 0.5 coverage floor).
+    Light linking: light_surface's isin() mask as an exact td.y ladder.
+    Every new gate rides the plan signature (R78) -- the warm-cache
+    checks at the end prove a primed cache cannot walk around any of
+    them.
+    """
+    from .featurematrix import build
+    from ..core import raster
+    from ..core.bvh import BVH
+    from ..gpu import shade as GSH
+
+    def plan_sim(key, need_bvh=True, alloc_lin=False):
+        sc, st = build(key)
+        st.render_device = 'GPU'
+        cpu = R.render(sc, st)
+        w, h = st.resolution_x, st.resolution_y
+        view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+        g = raster.GBuffer(w, h)
+        if alloc_lin or not st.tex_perspective:
+            g.alloc_linear()
+        # exactly render()'s raster: affine subdivision included, now
+        # that tex_affine_subdiv is alive (a harness that skips it
+        # shades a different G-buffer than the frame it compares to)
+        sub = int(getattr(st, 'tex_affine_subdiv', 0) or 0) \
+            if not st.tex_perspective else 0
+        raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g,
+                         subdiv_px=sub)
+        tex = R.prepare_textures(sc, st)
+        job = R.ShadeJob(sc, st, tex,
+                         BVH(sc.mesh.verts, sc.mesh.tris)
+                         if need_bvh else None, view, eye, w, h)
+        GSH._PLAN_CACHE.clear()
+        passes, why, atl = GSH.plan_frame(job, g)
+        return sc, st, cpu, g, job, passes, why, atl, (vp, eye, tex)
+
+    # ---- CONSTANT and WIREFRAME
+    sc, st, cpu, g, job, p, why, atl, _x = plan_sim('model CONSTANT')
+    check('model CONSTANT qualifies', p is not None, str(why))
+    if p is not None:
+        img, _hit = GSH.simulate(job, g, p, atl)
+        cov = g.tri >= 0
+        check('CONSTANT sim is the CPU frame',
+              float(np.abs(img[cov] - cpu[cov][:, :3]).max()) < 6e-3)
+    sc, st, cpu, g, job, p, why, atl, (vp, eye, tex) = \
+        plan_sim('model WIREFRAME')
+    check('model WIREFRAME qualifies', p is not None, str(why))
+    if p is not None:
+        img, _hit = GSH.simulate(job, g, p, atl)
+        py, px = np.nonzero(g.mask())
+        full = np.zeros((g.height, g.width, 4), np.float32)
+        full[py, px, :3] = img[py, px]
+        full[py, px, 3] = 1.0
+        full = R.apply_wireframe(job, g, full, st, vp, eye, tex)
+        cov = g.tri >= 0
+        check('WIREFRAME sim + the readback carve is the CPU frame',
+              float(np.abs(full[cov][:, :3] - cpu[cov][:, :3]).max())
+              < 6e-3)
+
+    # ---- Normal Source FACE rides hal_triaux
+    sc, st, cpu, g, job, p, why, atl, _x = plan_sim('normal source FACE')
+    check('normal source FACE qualifies', p is not None, str(why))
+    if p is not None:
+        check('...and the per-tri texture is packed', 'hal_triaux' in atl)
+        img, _hit = GSH.simulate(job, g, p, atl)
+        cov = g.tri >= 0
+        check('FACE normals sim is the CPU frame',
+              float(np.abs(img[cov] - cpu[cov][:, :3]).max()) < 6e-3)
+
+    # ---- affine: the PS1 warp on the deferred pass, uv only
+    for key in ('affine mapping (PS1 warp)', 'affine + subdivision'):
+        sc, st, cpu, g, job, p, why, atl, _x = plan_sim(key)
+        check(f'{key} qualifies', p is not None, str(why))
+        if p is None:
+            continue
+        img, _hit = GSH.simulate(job, g, p, atl)
+        cov = g.tri >= 0
+        check(f'{key} sim is the CPU frame',
+              float(np.abs(img[cov] - cpu[cov][:, :3]).max()) < 6e-3)
+        check('...the passes read the screen-linear ids',
+              all('hal_gb_idslin' in b.get('samplers', ())
+                  for _m, _n, _s, b in p))
+    # hits keep TRUE barycentrics: a reflective affine frame's secondary
+    # passes must not touch the screen-linear road
+    sc, st = build('affine mapping (PS1 warp)')
+    st.render_device = 'GPU'
+    st.raytrace, st.ray_depth = True, 1
+    sc.materials[2].reflect_level = 0.5
+    w, h = st.resolution_x, st.resolution_y
+    view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+    g = raster.GBuffer(w, h)
+    g.alloc_linear()
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+    job = R.ShadeJob(sc, st, R.prepare_textures(sc, st),
+                     BVH(sc.mesh.verts, sc.mesh.tris), view, eye, w, h)
+    GSH._PLAN_CACHE.clear()
+    p, why, atl = GSH.plan_frame(job, g)
+    check('affine + rays qualifies', p is not None, str(why))
+    if p is not None:
+        rp = atl.get('__reflect') or {}
+        check('...and hit passes keep true barycentrics',
+              all('hal_gb_idslin' not in s
+                  for _m, _n, s, _b in (rp.get('secondary') or ())))
+
+    # ---- Screen Door stipple: rgb shaded, the 0/1 pattern in alpha
+    sc, st, cpu, g, job, p, why, atl, _x = plan_sim('screen-door stipple')
+    check('screen-door stipple qualifies', p is not None, str(why))
+    if p is not None:
+        check('...the CPU threshold map is packed', 'hal_stipple' in atl)
+        img, _hit = GSH.simulate(job, g, p, atl)
+        cov = g.tri >= 0
+        check('stipple rgb sim is the CPU frame',
+              float(np.abs(img[cov] - cpu[cov][:, :3]).max()) < 6e-3)
+        check('the stipple ALPHA pattern is the CPU pattern, bit for bit',
+              g.gpu_alpha is not None and
+              bool((g.gpu_alpha[cov].astype(np.float32)
+                    == cpu[cov][:, 3]).all()))
+        check('...and it is a real screen door (some pixels dropped)',
+              0.0 < float(g.gpu_alpha[cov].mean()) < 1.0)
+    # a VARYING opacity under stipple refuses through the constancy
+    # rule -- Opacity is not a per-pixel socket, so the ordered
+    # threshold always compares the baked constant on both devices
+    sc, st = build('screen-door stipple')
+    st.render_device = 'GPU'
+    # drive opacity the honest way: a master graph whose Opacity socket
+    # takes a varying chain (Parametric length)
+    from .featurematrix import _sk
+    ins = [_sk('Diffuse Color', 'RGBA', [0.6, 0.6, 0.6, 1.0]),
+           _sk('Opacity', 'VALUE', 1.0, ['fac', 0])]
+    sc.materials[1].graph = {'output': 'out', 'nodes': {
+        'geo': {'id': 'geo', 'bl_idname': 'ShaderNodeNewGeometry',
+                'props': {}, 'inputs': [],
+                'outputs': [{'name': 'Position', 'type': 'VECTOR'},
+                            {'name': 'Normal', 'type': 'VECTOR'},
+                            {'name': 'Tangent', 'type': 'VECTOR'},
+                            {'name': 'True Normal', 'type': 'VECTOR'},
+                            {'name': 'Incoming', 'type': 'VECTOR'},
+                            {'name': 'Parametric', 'type': 'VECTOR'}]},
+        'fac': {'id': 'fac', 'bl_idname': 'ShaderNodeVectorMath',
+                'props': {'operation': 'LENGTH'},
+                'inputs': [_sk('Vector', 'VECTOR', [0, 0, 0],
+                               ['geo', 5])],
+                'outputs': [{'name': 'Value', 'type': 'VALUE'}]},
+        'hal': {'id': 'hal', 'bl_idname': 'HALCYON_ShaderNode',
+                'props': {'model': 'LAMBERT'}, 'inputs': ins,
+                'outputs': [{'name': 'Surface', 'type': 'SHADER'}]},
+        'out': {'id': 'out', 'bl_idname': 'ShaderNodeOutputMaterial',
+                'props': {},
+                'inputs': [_sk('Surface', 'SHADER', None, ['hal', 0]),
+                           _sk('Displacement', 'VECTOR', [0, 0, 0])],
+                'outputs': []}}}
+    w, h = st.resolution_x, st.resolution_y
+    view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+    g2 = raster.GBuffer(w, h)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g2)
+    job2 = R.ShadeJob(sc, st, {}, None, view, eye, w, h)
+    GSH._PLAN_CACHE.clear()
+    p2, why2, _a2 = GSH.plan_frame(job2, g2)
+    check('a varying-opacity material under stipple refuses by name',
+          p2 is None and 'varies' in str(why2), str(why2))
+
+    # ---- light linking: the td.y ladder
+    sc, st, cpu, g, job, p, why, atl, _x = plan_sim(
+        'light linking (exclude + only)')
+    check('light linking qualifies', p is not None, str(why))
+    if p is not None:
+        img, _hit = GSH.simulate(job, g, p, atl)
+        cov = g.tri >= 0
+        check('light linking sim is the CPU frame',
+              float(np.abs(img[cov] - cpu[cov][:, :3]).max()) < 6e-3)
+        check('...via the object ladder in the source',
+              any('hal_lk' in s for _m, _n, s, _b in p))
+    sc2, st2 = build('light linking (exclude + only)')
+    st2.render_device = 'GPU'
+    sc2.lights[-1].exclude_objects = tuple(range(70))
+    view, _proj, vp, eye = R.camera_matrices(sc2.camera, w, h)
+    g3 = raster.GBuffer(w, h)
+    raster.rasterize(sc2.mesh.verts, sc2.mesh.tris, vp, w, h, gbuf=g3)
+    job3 = R.ShadeJob(sc2, st2, {}, None, view, eye, w, h)
+    GSH._PLAN_CACHE.clear()
+    p3, why3, _a3 = GSH.plan_frame(job3, g3)
+    check('a 70-object linking list refuses by name',
+          p3 is None and '64' in str(why3), str(why3))
+
+    # ---- R78: every new gate is in the plan signature. Prime the
+    # cache with the QUALIFYING variant, flip one setting, and the
+    # plan must change -- a stale hit here is the affine bug of R78
+    # all over again.
+    sc, st = build('baseline PHONG + map shadows')
+    st.render_device = 'GPU'
+    w, h = st.resolution_x, st.resolution_y
+    view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+    g4 = raster.GBuffer(w, h)
+    g4.alloc_linear()
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g4)
+    tex4 = R.prepare_textures(sc, st)
+    job4 = R.ShadeJob(sc, st, tex4, None, view, eye, w, h)
+    GSH._PLAN_CACHE.clear()
+    base_p, _bw, _ba = GSH.plan_frame(job4, g4)
+    check('the warm-cache fixture qualifies', base_p is not None,
+          str(_bw))
+    flips = [('normal_source', 'FACE', 'hal_triaux_fetch'),
+             ('tex_perspective', False, 'hal_gb_idslin'),
+             ('transparency', 'STIPPLE', 'hal_stipple')]
+    for name, value, needle in flips:
+        old = getattr(st, name)
+        setattr(st, name, value)
+        p5, why5, _a5 = GSH.plan_frame(job4, g4)   # WARM cache
+        got = p5 is not None and \
+            any(needle in s for _m, _n, s, _b in p5)
+        check(f'a warm cache cannot walk around {name}', got, str(why5))
+        setattr(st, name, old)
+    # and the stipple PATTERN re-bakes the map on a warm cache
+    st.transparency = 'STIPPLE'
+    p6, _w6, a6 = GSH.plan_frame(job4, g4)
+    st.stipple_pattern = 'BAYER8' \
+        if str(getattr(st, 'stipple_pattern', '')) != 'BAYER8' else 'BAYER2'
+    p7, _w7, a7 = GSH.plan_frame(job4, g4)
+    k6 = (a6 or {}).get('hal_stipple', (None,))[0]
+    k7 = (a7 or {}).get('hal_stipple', (None,))[0]
+    check('the stipple pattern is in the signature (map key changes)',
+          p6 is not None and p7 is not None and k6 != k7,
+          f'{k6} vs {k7}')
 
 
 def test_the_rainbow_scrolls_on_a_re_rendered_still():
@@ -11643,7 +12192,7 @@ def test_the_compute_rasteriser_is_fill():
                          cull=cull)
         sx, sy, iw, z, bw, src, tmap = CRA.raster_inputs_for(sc_mesh, vp,
                                                              w, h)
-        tri, bary, zndc, front, _b2 = CRA.simulate_raster(
+        tri, bary, zndc, front, _b2, _lin, _mk = CRA.simulate_raster(
             sx, sy, iw, z, bw, src, tmap, w, h, cull=cull)
         d = int((tri != g.tri).sum())
         check(f'{label}: zero differing pixels', d == 0,
@@ -11713,7 +12262,7 @@ def test_the_compute_rasteriser_is_fill():
     g_cpu = raster.GBuffer(w, h)
     raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g_cpu)
     sx, sy, iw, z, bw, src, tmap = CRA.raster_inputs_for(sc.mesh, vp, w, h)
-    tri, bary, zndc, front, b2 = CRA.simulate_raster(
+    tri, bary, zndc, front, b2, _lin, _mk = CRA.simulate_raster(
         sx, sy, iw, z, bw, src, tmap, w, h)
     ids = np.stack([bary[:, :, 0], bary[:, :, 1],
                     1.0 - bary[:, :, 0] - bary[:, :, 1],
@@ -12202,6 +12751,11 @@ def test_accumulation_and_edge_antialiasing():
 
     st3 = st.copy()
     st3.aa_mode = 'EDGE'
+    # threshold 0 = silhouettes only, by contract -- which makes the
+    # id-edge mask below the COMPLETE rule. (The crease half now works in
+    # scene units and flags real depth breaks the old device-depth compare
+    # never could; it is proven separately just after)
+    st3.aa_edge_threshold = 0.0
     e = R.render(sc, st3)
     from ..core import raster as CR
     view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
@@ -12228,6 +12782,16 @@ def test_accumulation_and_edge_antialiasing():
     check('pixels away from every edge ride through untouched',
           float(d[interior].max()) == 0.0 if interior.any() else True,
           f'max {float(d[interior].max()):.6f} off-edge')
+    # the crease half, in scene units: a tight threshold smooths interior
+    # depth breaks the silhouette-only pass left alone
+    st4 = st.copy()
+    st4.aa_mode = 'EDGE'
+    st4.aa_edge_threshold = 0.005
+    ec = R.render(sc, st4)
+    dc = np.abs(ec - plain).max(axis=2)
+    check('a scene-unit depth threshold smooths interior creases too',
+          bool(interior.any()) and float(dc[interior].max()) > 0.0,
+          f'max {float(dc[interior].max()):.6f} on interior creases')
 
 
 def test_height_fog_layers_the_mist():
@@ -12960,14 +13524,17 @@ def test_the_missing_node_shelf():
         GSH_._PLAN_CACHE.clear()
         return GSH_.plan_frame(job_, g_)
 
+    # FLIPPED (1.25.105): the specular slot routing carries lone-GLOSSY
+    # raw graphs now -- the plan qualifies and the chain lands in
+    # s.specular, never the diffuse slot
     for key in ('node Metallic BSDF (raw graph)',
                 'node Specular BSDF (raw graph)'):
         sc_n, st_n = build(key)
         ok, miss = EM.can_emit(sc_n.materials[1].graph)
         check(f'{key}: the colour chain emits', ok, str(miss))
         p, why, _a = _plan_of(sc_n, st_n)
-        check(f'{key}: the plan routes the conductor lobe by name',
-              p is None and 'lobe rides the specular' in str(why), str(why))
+        check(f'{key}: the plan qualifies via the slot routing',
+              p is not None, str(why))
 
     sc_g, st_g = build('node Metallic BSDF (raw graph)')
     sc_g.materials[1].graph['nodes']['bsdf'] = {
@@ -12976,8 +13543,9 @@ def test_the_missing_node_shelf():
                    sk('Roughness', 'VALUE', 0.35)],
         'outputs': [{'name': 'BSDF', 'type': 'SHADER'}]}
     p, why, _a = _plan_of(sc_g, st_g)
-    check('the LATENT raw-glossy wrongness is closed by the same gate',
-          p is None and 'GLOSSY' in str(why), str(why))
+    check('a raw Glossy BSDF rides the same slot routing',
+          p is not None and any('s.specular = ' in src
+                                for _m, _n, src, _b in p), str(why))
 
     sc_d, st_d = build('node Metallic BSDF (raw graph)')
     sc_d.materials[1].graph['nodes']['bsdf'] = {
@@ -12989,10 +13557,11 @@ def test_the_missing_node_shelf():
     check('a raw DIFFUSE graph still qualifies (its colour IS the chain)',
           p is not None, str(why))
 
+    # FLIPPED (1.25.105): the Wireframe node emits now -- exact edge
+    # distance from the attribute texture's corners
     sc_w, _st = build('node Wireframe (cel ink)')
     ok, miss = EM.can_emit(sc_w.materials[1].graph)
-    check('the wireframe graph refuses with the reason',
-          not ok and any('triangle corners' in m for m in miss), str(miss))
+    check('the wireframe graph emits', ok, str(miss))
 
     # --- the conversion operator learned the spec/gloss shader too
     p = CV.plan('ShaderNodeEeveeSpecular',
@@ -13289,15 +13858,22 @@ def test_anisotropic_rotation_reaches_the_gpu_frame():
     p5, why5, _a5 = GSH.plan_frame(job5, g5)
     check('the perspective twin of the affine frame plans (cache primed)',
           p5 is not None, str(why5))
+    # FLIPPED (1.25.102): affine no longer refuses -- it re-plans past
+    # the warm cache into passes that read the screen-linear ids. The
+    # R78 property this test guards is UNCHANGED: the primed
+    # perspective plan must NOT be reused for the affine frame.
     sc4, st4 = build('affine mapping (PS1 warp)')
     view4, _p4, vp4, eye4 = R.camera_matrices(sc4.camera, 96, 72)
     g4 = raster.GBuffer(96, 72)
+    g4.alloc_linear()
     raster.rasterize(sc4.mesh.verts, sc4.mesh.tris, vp4, 96, 72, gbuf=g4)
     job4 = R.ShadeJob(sc4, st4, R.prepare_textures(sc4, st4), None,
                       view4, eye4, 96, 72)
     p4, why4, _a4 = GSH.plan_frame(job4, g4)      # cache NOT cleared
-    check('affine frames refuse the deferred pass BY NAME, past a '
-          'warm cache', p4 is None and 'affine' in str(why4), str(why4))
+    check('affine frames re-plan past a warm cache onto the '
+          'screen-linear ids',
+          p4 is not None and all('hal_gb_idslin' in b.get('samplers', ())
+                                 for _m, _n, _s, b in p4), str(why4))
 
 
 def test_fog_rides_the_deferred_readback():
@@ -15223,7 +15799,7 @@ def test_depth_quantizes_per_pixel_not_per_vertex():
 
     # the kernel's front-end mirror rounds the same way
     from ..gpu import craster as CRA
-    tri_s, _b, zndc_s, _f, _b2 = CRA.simulate_raster(
+    tri_s, _b, zndc_s, _f, _b2, _lin, _mk = CRA.simulate_raster(
         sx, sy, iw, z, bw, src, None, W, H, depth_bits=BITS)
     same = tri_s == g.tri
     check('the kernel mirror picks the same winners at 16 bits',
@@ -15804,6 +16380,453 @@ def test_the_frame_reports_what_its_depth_can_resolve():
           rec4.get('see_through') == 1
           and any('flagged' in v for v in rec4['reasons'].values()),
           str(rec4.get('reasons')))
+
+
+def test_every_setting_does_what_it_says():
+    """Every control on the settings panel is proven to control something.
+
+    The field asked for it in as many words: "ensure all sliders, values,
+    changeable settings work and actually do what they say." A tooltip is
+    a promise, and the only proof of a promise is a changed picture -- so
+    this test holds the whole settings class to one of five standards, and
+    its accounting fails the moment a NEW field is added without one:
+
+      * matrix rows    -- the feature matrix already flips it (90+ fields);
+      * A/B DIFF       -- flipping it here must CHANGE the frame;
+      * A/B EQUAL      -- flipping it must NOT change the frame (caches,
+                          schedulers and worker counts are picture-neutral
+                          by the determinism doctrine);
+      * behavioural    -- its effect is data, not pixels (extra passes,
+                          texture wrap, near-plane clip, motion blur,
+                          palette lock, the worker pool);
+      * declared infra -- device routing and viewport pacing, named and
+                          justified one line each, nothing silently exempt.
+
+    The audit that authored this found and removed seven corpse settings,
+    a tooltip that contradicted its neighbour, a near-plane epsilon that
+    claimed 1e-4 and drove nothing, a matrix row 'testing' a depth mode
+    (ZBUFFER_NOWRITE) no code has ever read, and a light-shafts row whose
+    scene had no volumetric light to shaft. This test is the reason none
+    of those can come back.
+    """
+    import dataclasses
+    import re as _re
+    from ..core import parallel as PAR
+    from ..core import palette as PA
+    from ..core import raster as RAST
+    from .featurematrix import SCENES, ROWS
+
+    fields = {f.name for f in dataclasses.fields(RenderSettings)}
+    W, H = 96, 72
+
+    # ------------------------------------------------------------ part 1
+    # the reader sweep: every field must be read somewhere in the engine
+    # (core/, gpu/, engine.py, preview.py, export.py). settings.py declares,
+    # properties.py/ui.py present, presets/ store -- none of those COUNT as
+    # a reader, which is exactly how seven corpses hid for ninety versions.
+    UI_ONLY = {'res_preset'}       # an "apply preset" selector; its tooltip
+    #                                says in as many words it only sets others
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = []
+    for base, dirs, names in os.walk(root):
+        dirs[:] = [d for d in dirs
+                   if d not in ('tests', 'presets', '__pycache__')]
+        for n in names:
+            if n.endswith('.py') and n not in ('settings.py', 'properties.py',
+                                               'ui.py'):
+                with open(os.path.join(base, n), encoding='utf8') as fh:
+                    src.append(fh.read())
+    blob = '\n'.join(src)
+    unread = sorted(f for f in fields - UI_ONLY
+                    if not _re.search(r'\b' + _re.escape(f) + r'\b', blob))
+    check('every setting has a reader inside the engine',
+          not unread, ', '.join(unread))
+
+    # ------------------------------------------------------------ part 2
+    # the A/B table. frame() renders through the same road the matrix
+    # drives -- core render, then the full post chain with the depth and
+    # shaft data the scene carried out -- so a setting from any stage of
+    # the pipeline can testify. Baselines are cached per context.
+    PA._PALETTE_CACHE.clear()
+    _cache = {}
+
+    def frame(scene_key, ov, mutate=None, mid=''):
+        st = base_settings(W, H)
+        for k, v in ov.items():
+            setattr(st, k, v)
+        sc = SCENES[scene_key](st)
+        if mutate is not None:
+            mutate(sc)
+        img = R.render(sc, st)
+        rgb = post.process(img[:, :, :3], st, frame=1, seed=st.seed,
+                           depth=getattr(sc, 'last_depth', None),
+                           shaft_sources=getattr(sc, 'last_shafts', None))
+        # alpha rides along at render resolution: the Screen Door lives
+        # ENTIRELY in the alpha plane, and a harness that drops it calls
+        # stipple_pattern dead when it is not
+        return rgb, img[:, :, 3]
+
+    def cached(scene_key, ov, mutate, mid):
+        key = (scene_key, repr(sorted(ov.items(), key=repr)), mid)
+        if key not in _cache:
+            _cache[key] = frame(scene_key, ov, mutate, mid)
+        return _cache[key]
+
+    def _same(a, b):
+        return (a[0].shape == b[0].shape and np.array_equal(a[0], b[0])
+                and np.array_equal(a[1], b[1]))
+
+    def ab(field, probe, scene_key, base, mutate=None, mid='', expect='DIFF'):
+        a = cached(scene_key, base, mutate, mid)
+        b = frame(scene_key, dict(base, **{field: probe}), mutate, mid)
+        if expect == 'SHAPE':
+            check(f"'{field}' changes the frame's shape",
+                  a[0].shape != b[0].shape, f'{a[0].shape} vs {b[0].shape}')
+        elif expect == 'EQUAL':
+            check(f"'{field}' must not move a pixel (doctrine)", _same(a, b))
+        elif expect == 'ANY':
+            check(f"'{field}' changes the frame", not _same(a, b))
+        else:
+            check(f"'{field}' changes the picture",
+                  a[0].shape == b[0].shape and not _same(a, b),
+                  '' if a[0].shape == b[0].shape
+                  else f'{a[0].shape} vs {b[0].shape}')
+
+    def _vol_spot(sc):
+        # dim enough that the beam does not clip to solid white: a saturated
+        # cone hides what density, falloff and sample count each do
+        sc.lights[-1].volumetric = 0.02
+
+    def _clear_models(sc):
+        for m in sc.materials:
+            m.model = ''                    # falls through to default_model
+
+    def _inherit_bias(sc):
+        for light in sc.lights:
+            light.shadow_bias = 0.0         # 0 = use the render setting
+
+    _DISP_GRAPH = {'output': 'out', 'nodes': {
+        'n': _wnode('n', 'ShaderNodeTexNoise', {'noise_dimensions': '3D'},
+                    [_sk('Vector', 'VECTOR', [0, 0, 0]),
+                     _sk('Scale', 'VALUE', 9.0), _sk('Detail', 'VALUE', 3.0),
+                     _sk('Roughness', 'VALUE', .5),
+                     _sk('Distortion', 'VALUE', 0.)],
+                    [{'name': 'Fac', 'type': 'VALUE'},
+                     {'name': 'Color', 'type': 'RGBA'}]),
+        'd': _wnode('d', 'ShaderNodeDisplacement', {'space': 'OBJECT'},
+                    [_sk('Height', 'VALUE', 0.0, ['n', 0]),
+                     _sk('Midlevel', 'VALUE', 0.5),
+                     _sk('Scale', 'VALUE', 1.0),
+                     _sk('Normal', 'VECTOR', [0, 0, 0])],
+                    [{'name': 'Displacement', 'type': 'VECTOR'}]),
+        'b': _wnode('b', 'ShaderNodeBsdfDiffuse', {},
+                    [_sk('Color', 'RGBA', [.8, .8, .8, 1]),
+                     _sk('Roughness', 'VALUE', 0.),
+                     _sk('Normal', 'VECTOR', [0, 0, 0])],
+                    [{'name': 'BSDF', 'type': 'SHADER'}]),
+        'out': _wnode('out', 'ShaderNodeOutputMaterial', {},
+                      [_sk('Surface', 'SHADER', None, ['b', 0]),
+                       _sk('Displacement', 'VECTOR', [0, 0, 0], ['d', 0])],
+                      [])}}
+
+    def _attach_disp(sc):
+        for m in sc.materials:
+            m.graph = _DISP_GRAPH
+
+    CONES = {'spot_cones': True}
+    AO = {'ambient_occlusion': True, 'ao_samples': 4}
+    RAD = {'radiosity': True, 'radiosity_samples': 4,
+           'radiosity_distance': 4.0}
+    DOF = {'dof': True, 'dof_focus': 6.0, 'dof_amount': 2.0}
+    SHAFT = {'shaft_threshold': 0.4, 'shaft_length': 0.4}
+    GLOW = {'glow': True, 'glow_threshold': 0.5, 'glow_intensity': 0.8}
+    STAR = {'star_filter': True, 'glow_threshold': 0.5, 'star_intensity': 0.8}
+    FLARE = {'lens_flare': True, 'flare_intensity': 0.7}
+    PALB = {'color_depth': '8', 'palette_mode': 'ADAPTIVE'}
+    DITH = {'dither': 'BAYER4', 'color_depth': '16'}
+    CRT = {'crt': True, 'crt_scanlines': 0.4, 'crt_mask': 'APERTURE',
+           'crt_curvature': 0.1}
+    NTSC = {'composite': True, 'composite_bleed': 0.7}
+    JPEG = {'jpeg_artifacts': True, 'jpeg_quality': 40}
+
+    TABLE = [
+        # field                probe               scene          base ctx
+        ('max_transparent_layers', 1,             'glass',        {}),
+        ('spot_cones',         True,              'cookie_spot',  {},
+         _vol_spot, 'vol'),
+        ('spot_cone_density',  3.0,               'cookie_spot',  CONES,
+         _vol_spot, 'vol'),
+        ('spot_cone_samples',  3,                 'cookie_spot',  CONES,
+         _vol_spot, 'vol'),
+        ('spot_cone_falloff',  0.5,               'cookie_spot',  CONES,
+         _vol_spot, 'vol'),
+        ('spot_cone_reach',    2.0,               'cookie_spot',  CONES,
+         _vol_spot, 'vol'),
+        ('displacement_scale', 0.0,               'demo',         {},
+         _attach_disp, 'disp'),
+        ('default_model',      'LAMBERT',         'demo',         {},
+         _clear_models, 'nomodel'),
+        ('lens_vignette_edges', False,            'demo',
+         {'lens_distortion': 0.3}),
+        ('shaft_decay',        0.5,               'shafts',       SHAFT),
+        ('shaft_samples',      4,                 'shafts',       SHAFT),
+        ('dof_layers',         2,                 'demo',         DOF),
+        ('dof_max_radius',     4.0,               'demo',         DOF),
+        # ss = round(sqrt(aa_samples)), and 2x2 supersampling is
+        # filter-blind: ANY symmetric kernel over two symmetric taps
+        # normalises to (1/2, 1/2). Nine samples make a 3x3 grid, whose
+        # three taps tell the kernels apart. Width needs a filter that
+        # has a shape -- BOX is width-invariant by definition
+        ('aa_filter',          'GAUSS',           'demo',  {'aa_samples': 9}),
+        ('aa_filter_width',    2.0,               'demo',
+         {'aa_samples': 9, 'aa_filter': 'GAUSS'}),
+        ('aa_edge_threshold',  0.005,             'demo',  {'aa_mode': 'EDGE'}),
+        ('ao_distance',        0.3,               'demo',         AO),
+        ('ao_intensity',       2.5,               'demo',         AO),
+        ('radiosity_intensity', 3.0,              'demo',         RAD),
+        ('global_ambient',     (0.3, 0.05, 0.05), 'demo',         {}),
+        ('global_ambient_level', 4.0,             'demo',         {}),
+        ('shadow_map_size',    32,                'demo',         {}),
+        # the demo lights set their own bias, and a per-light value wins;
+        # zeroing them is how a scene says "use the render setting"
+        ('shadow_bias',        0.5,               'demo',         {},
+         _inherit_bias, 'inhb'),
+        ('shadow_softness',    6.0,               'demo',         {}),
+        ('ray_reflection',     False,             'mirror',
+         {'raytrace': True, 'ray_depth': 1}),
+        ('ray_refraction',     False,             'glass',
+         {'raytrace': True, 'ray_depth': 2}),
+        # the master switch for traced shadows: RAY-mode lights obey it
+        # (it used to gate only an unreachable no-map fallback)
+        ('ray_shadows',        False,             'demo',
+         {'shadow_default': 'RAY'}),
+        ('ray_bias',           0.8,               'demo',
+         {'shadow_default': 'RAY'}),
+        ('stipple_pattern',    'HALFTONE',        'glass',
+         {'transparency': 'STIPPLE'}),
+        ('alpha_threshold',    0.9,               'glass',        {}),
+        ('fog_color',          (0.8, 0.1, 0.1),   'demo',
+         {'fog': True, 'fog_mode': 'LINEAR', 'fog_start': 3.0,
+          'fog_end': 12.0}),
+        ('glow_radius',        40.0,              'demo',         GLOW),
+        ('glow_quality',       'BOX',             'demo',         GLOW),
+        ('star_points',        6,                 'demo',         STAR),
+        ('star_length',        60.0,              'demo',         STAR),
+        ('star_rotation',      45.0,              'demo',         STAR),
+        ('flare_ghosts',       0,                 'demo',         FLARE),
+        ('flare_streak',       0.0,               'demo',         FLARE),
+        ('palette_size',       8,                 'demo',         PALB),
+        ('palette_method',     'OCTREE',          'demo',         PALB),
+        ('dither_strength',    0.1,               'demo',         DITH),
+        ('dither_serpentine',  False,             'demo',
+         {'dither': 'FLOYD', 'color_depth': '16'}),
+        # seed feeds the ray-shadow jitter streams; MAP soft shadows are a
+        # deterministic texel filter and never consult it
+        ('seed',               7,                 'soft',
+         {'shadow_default': 'RAY', 'shadow_samples': 8}),
+        ('color_management',   'SRGB',            'demo',         {}),
+        ('input_gamma_naive',  False,             'textured',
+         {'color_management': 'SRGB'}),
+        ('crt_mask_strength',  0.9,               'demo',         CRT),
+        ('crt_bloom',          0.8,               'demo',         CRT),
+        ('composite_ringing',  0.9,               'demo',         NTSC),
+        ('composite_dot_crawl', 0.8,              'demo',         NTSC),
+        ('jpeg_passes',        3,                 'demo',         JPEG),
+        ('block_size',         16,                'demo',         JPEG),
+        ('pixel_grid',         True,              'demo',
+         {'output_scale': '2X'}),
+        # the demo's only sharp creases are the cube's right angles: 25 and
+        # 80 degrees both keep them. 95 removes them, which is visible
+        ('wire_angle',         95.0,              'demo',
+         {'render_wire': True, 'wire_mode': 'CREASE'}),
+        ('wire_color',         (1.0, 0.2, 0.2),   'demo',
+         {'render_wire': True}),
+        ('wire_width',         3.0,               'demo',
+         {'render_wire': True}),
+    ]
+    SHAPES = [
+        ('resolution_x',   128,  'demo', {}, None, '', 'SHAPE'),
+        ('resolution_y',   96,   'demo', {}, None, '', 'SHAPE'),
+        ('output_scale',   '2X', 'demo', {}, None, '', 'SHAPE'),
+        ('pixel_aspect_x', 2.0,  'demo', {}, None, '', 'ANY'),
+        ('pixel_aspect_y', 2.0,  'demo', {}, None, '', 'ANY'),
+    ]
+    EQUALS = [
+        # optimisations and schedulers: the doctrine says the picture may
+        # not know they exist
+        ('fast_background', False, 'demo', {'aa_samples': 2}, None, '',
+         'EQUAL'),
+        ('cache_shadows',   False, 'demo', {}, None, '', 'EQUAL'),
+        ('threads',         4,     'demo', {}, None, '', 'EQUAL'),
+        ('show_stats',      True,  'demo', {}, None, '', 'EQUAL'),
+        ('palette_lock',    False, 'demo', PALB, None, '', 'EQUAL'),
+    ]
+    for row in TABLE:
+        field, probe, scene_key, base = row[:4]
+        mutate = row[4] if len(row) > 4 else None
+        mid = row[5] if len(row) > 5 else ''
+        ab(field, probe, scene_key, base, mutate, mid)
+    for field, probe, scene_key, base, mutate, mid, expect in SHAPES + EQUALS:
+        ab(field, probe, scene_key, base, mutate, mid, expect)
+
+    # ------------------------------------------------------------ part 3
+    # behavioural: effects that are data rather than pixels.
+
+    # the pass_* toggles hand the compositor real buffers
+    st = base_settings(W, H, pass_position=True, pass_uv=True,
+                       pass_object_index=True, pass_material_index=True)
+    sc = demo_scene(st, with_texture=True)
+    R.render(sc, st)
+    p = sc.last_passes or {}
+    for name in ('Position', 'UV', 'IndexOB', 'IndexMA'):
+        check(f"pass toggle delivers a '{name}' buffer", name in p)
+    if 'Position' in p:
+        check('the Position pass varies across the frame',
+              float(np.ptp(p['Position'])) > 0.0)
+    if 'UV' in p:
+        check('the UV pass varies across the frame',
+              float(np.ptp(p['UV'])) > 0.0)
+    if 'IndexMA' in p:
+        check('the IndexMA pass separates the three demo materials',
+              len(np.unique(p['IndexMA'])) >= 2)
+
+    # tex_wrap_default decides what lives outside 0..1
+    st_r = base_settings(W, H, tex_wrap_default='REPEAT')
+    st_c = base_settings(W, H, tex_wrap_default='CLIP')
+    sc_t = demo_scene(st_r, with_texture=True)
+    tex_r = R.prepare_textures(sc_t, st_r)
+    tex_c = R.prepare_textures(sc_t, st_c)
+    tname = next(iter(tex_r))
+    u = np.array([1.6], np.float32)
+    v = np.array([0.3], np.float32)
+    check('tex_wrap_default REPEAT and CLIP disagree outside 0..1',
+          not np.allclose(tex_r[tname].sample(u, v),
+                          tex_c[tname].sample(u, v)))
+
+    # clip_near_epsilon is where a polygon crossing the camera plane is cut
+    fl, n_, f_ = 1.5, 0.1, 100.0
+    mvp = np.array([[fl, 0, 0, 0], [0, fl, 0, 0],
+                    [0, 0, -(f_ + n_) / (f_ - n_), -2 * f_ * n_ / (f_ - n_)],
+                    [0, 0, -1, 0]], np.float32)
+    verts = np.array([[0, 0.8, 0.5], [-1, -0.8, -3], [1, -0.8, -3]],
+                     np.float32)
+    tris = np.array([[0, 1, 2]], np.int32)
+    cov = {}
+    for eps in (1e-5, 1.0):
+        g = RAST.GBuffer(64, 48)
+        RAST.rasterize(verts, tris, mvp, 64, 48, gbuf=g, near_eps=eps)
+        cov[eps] = int((g.tri >= 0).sum())
+    check('clip_near_epsilon moves the near-plane cut',
+          cov[1e-5] > 0 and cov[1e-5] != cov[1.0], str(cov))
+
+    # palette_lock holds frame 1's palette across an animation
+    hgrad = np.linspace(0.0, 1.0, W, dtype=np.float32)[None, :, None]
+    f_red = np.concatenate([np.repeat(hgrad, H, 0),
+                            0.2 * np.ones((H, W, 2), np.float32)], 2)
+    f_blue = np.concatenate([0.2 * np.ones((H, W, 2), np.float32),
+                             np.repeat(hgrad, H, 0)], 2)
+    st_p = base_settings(W, H, color_depth='8', palette_mode='ADAPTIVE')
+    outs = {}
+    for lock in (True, False):
+        PA._PALETTE_CACHE.clear()
+        st_p.palette_lock = lock
+        post.reduce_depth(f_red, st_p, seed=0)      # frame 1 sets the palette
+        outs[lock] = post.reduce_depth(f_blue, st_p, seed=0)
+    PA._PALETTE_CACHE.clear()
+    check('palette_lock keeps frame 1 colours on frame 2',
+          not np.array_equal(outs[True], outs[False]))
+
+    # the worker pool must hand back the exact in-process pixels. The pool
+    # honestly declines frames under 64k pixels, so this one earns its split
+    st_w = base_settings(320, 240)
+    sc_w = demo_scene(st_w, with_texture=False)
+    solo = R.render(sc_w, st_w)
+    pooled, why = PAR.render_parallel(sc_w, st_w, 2)
+    check('use_processes: the pool engages in this environment',
+          pooled is not None, str(why))
+    if pooled is not None:
+        check('use_processes: pooled pixels ARE the in-process pixels',
+              np.array_equal(pooled, solo))
+
+    # motion blur: the engine re-renders across the shutter, so a light
+    # moved by frame_set must smear -- and both knobs must matter
+    from . import fakeblender as FB
+    FB.install()
+    from .. import engine as ENG
+    from .. import properties as props
+
+    def motion_frame(**kw):
+        def rig(eng, dg, bs):
+            # move the MESH: a sun light only has a direction, so a
+            # translated sun is the classic no-op that proves nothing
+            ob = next(o for o in bs.objects if o.type == 'MESH')
+            base_m = np.array(ob.matrix_world, np.float32).copy()
+
+            def frame_set(fr, sub=0.0):
+                t = (float(fr) + float(sub)) - 1.0
+                ob.matrix_world[:3, 3] = base_m[:3, 3] + np.array(
+                    [3.0 * t, 0.0, 0.0], np.float32)
+
+                def fresh():
+                    for o in bs.objects:
+                        yield types.SimpleNamespace(
+                            object=o, matrix_world=FB._Mat(o.matrix_world),
+                            show_self=True, is_instance=False)
+                dg.object_instances = fresh()
+            eng.frame_set = frame_set
+        img, _p, _c = FB.run_render(props, ENG, rig=rig, **kw)
+        return img
+
+    still = motion_frame(motion_blur=False)
+    blur = motion_frame(motion_blur=True, motion_steps=4,
+                        motion_shutter=0.5)
+    check('motion_blur smears a light moved across the shutter',
+          still is not None and blur is not None
+          and not np.array_equal(still, blur))
+    steps6 = motion_frame(motion_blur=True, motion_steps=6,
+                          motion_shutter=0.5)
+    check('motion_steps changes the accumulation',
+          steps6 is not None and blur is not None
+          and not np.array_equal(steps6, blur))
+    wide = motion_frame(motion_blur=True, motion_steps=4,
+                        motion_shutter=1.5)
+    check('motion_shutter changes how far the smear reaches',
+          wide is not None and blur is not None
+          and not np.array_equal(wide, blur))
+
+    # ------------------------------------------------------------ part 4
+    # the accounting: every field has a home, and every name in a manual
+    # set still exists -- a renamed or new setting fails here by design.
+    rows_covered = set()
+    for _n, ov, _s in ROWS:
+        rows_covered |= set(ov)
+    ab_fields = ({r[0] for r in TABLE}
+                 | {r[0] for r in SHAPES} | {r[0] for r in EQUALS})
+    BEHAVIOURAL = {'pass_position', 'pass_uv', 'pass_object_index',
+                   'pass_material_index', 'tex_wrap_default',
+                   'clip_near_epsilon', 'motion_blur', 'motion_shutter',
+                   'motion_steps', 'palette_lock', 'use_processes'}
+    INFRA = {
+        'render_device':      'device routing: the whole device suite',
+        'gpu_shading':        'device routing: the matrix parity rows',
+        'gpu_raster':         'device routing: the raster parity rows',
+        'gpu_post':           'device routing: the post parity rows',
+        'gpu_hold_context':   'context lifecycle between renders',
+        'layer_gpu_min_frac': 'LAYER-pass scheduling threshold',
+        'gpu_scissor':        'device-side scissor; parity rows run it on',
+        'viewport_gpu':       'viewport drawing, outside the F12 contract',
+        'preview_scale':      'viewport pacing, outside the F12 contract',
+        'progressive':        'viewport pacing, outside the F12 contract',
+        'process_count':      'worker count; the pool EQUAL runs with 2',
+    }
+    homes = (rows_covered | ab_fields | BEHAVIOURAL
+             | set(INFRA) | UI_ONLY)
+    homeless = sorted(fields - homes)
+    check('every setting is proven by a matrix row, an A/B, a behavioural '
+          'check, or a declared reason', not homeless, ', '.join(homeless))
+    ghosts = sorted((homes - {'width', 'height'}) - fields - rows_covered)
+    check('no proof references a setting that no longer exists',
+          not ghosts, ', '.join(ghosts))
 
 
 def main():

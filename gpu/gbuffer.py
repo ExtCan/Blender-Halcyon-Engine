@@ -42,6 +42,25 @@ def pack_ids(gbuf):
     return out
 
 
+def pack_ids_lin(gbuf):
+    """The SCREEN-LINEAR barycentrics as a second ids texture.
+
+    Affine texture mode (the PS1 warp) interpolates uv by these instead
+    of the perspective-correct set -- the CPU's attributes() picks
+    `bary_lin` for uv exactly when tex_perspective is off, and the
+    deferred pass re-interpolates its uv from this texture the same way.
+    The channels carry the rasteriser's OWN values verbatim (all three,
+    no recomputation): the warp must be the CPU's warp bit for bit at
+    the interpolation inputs.
+    """
+    h, w = gbuf.tri.shape
+    out = np.zeros((h, w, 4), np.float32)
+    if gbuf.bary_lin is not None:
+        out[:, :, :3] = gbuf.bary_lin
+    out[:, :, 3] = gbuf.tri.astype(np.float32)
+    return out
+
+
 def pack_attributes(mesh, slot_count=SLOTS, respect_smooth=False):
     """Per-triangle vertex attributes as a texture the shader can index.
 
@@ -120,6 +139,29 @@ def pack_tri_data(mesh):
         out[:n, 0] = np.asarray(mats, np.float32)
     if objs is not None:
         out[:n, 1] = np.asarray(objs, np.float32)
+    return out.reshape(side, side, 4), side
+
+
+def pack_tri_aux(mesh):
+    """The per-triangle auxiliary texel: (face normal, per-tri random).
+
+    rgb = the CPU's OWN normalize(mesh.face_normals) -- the very values
+    ctx.Ng carries, baked rather than recomputed, so Normal Source FACE
+    and the Geometry node's True Normal read the same bits on either
+    device. a = the CPU's own per-tri random (render._hash1 of the tri
+    index) -- the sin-fract hash a driver would decorrelate, so it is
+    computed HERE, once, by the same NumPy code the CPU evaluator runs.
+    """
+    from ..core import mathx as M
+    from ..core.render import _hash1
+    tris = np.asarray(mesh.tris, np.int32)
+    n = tris.shape[0]
+    side = int(np.ceil(np.sqrt(max(n, 1))))
+    out = np.zeros((side * side, 4), np.float32)
+    fn = getattr(mesh, 'face_normals', None)
+    if fn is not None:
+        out[:n, :3] = M.normalize(np.asarray(fn, np.float32))
+    out[:n, 3] = _hash1(np.arange(n, dtype=np.float32))
     return out.reshape(side, side, 4), side
 
 

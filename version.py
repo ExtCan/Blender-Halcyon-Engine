@@ -15,7 +15,7 @@ import os
 #: it was on the latest version while the stamp said otherwise. A stamp
 #: that can lie is worse than no stamp; now four must agree or the suite
 #: fails.
-VERSION = (1, 25, 101)
+VERSION = (1, 30, 0)
 
 
 def _from_manifest():
