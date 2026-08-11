@@ -8,8 +8,10 @@ mid-to-late 1990s home-computer 3D software.
 
 Not a filter over a modern render. A scanline z-buffer rasteriser with optional
 ray tracing, the reflectance models those packages actually shipped, real
-framebuffer quantisation, and a genuine GLSL/HLSL compiler for the coded-shader
-nodes. 29,000 lines of Python and NumPy, no compiled dependencies.
+framebuffer quantisation, a genuine GLSL/HLSL compiler for the coded-shader
+nodes — and a complete GPU port of all three stages, proven against the CPU
+picture feature by feature on real hardware. 48,000 lines of Python and NumPy
+(68,000 with the test suite), no compiled dependencies.
 
 ![contact sheet](docs/halcyon_contact_sheet.png)
 
@@ -29,9 +31,8 @@ pick the zip, then tick **Halcyon Render Engine**.
 Then set **Render Properties ▸ Render Engine ▸ Halcyon**. If Blender's view
 transform is not **Standard**, the Display panel will say so and offer a button
 to fix it — Halcyon outputs display-referred pixels, so AgX or Filmic on top
-double-transforms them. Open the *Halcyon
-Presets* panel and load one — `VGA Mode 13h` or `PlayStation` show the
-character of the engine fastest.
+double-transforms them. Open the *Halcyon Presets* panel and load one —
+`VGA Mode 13h` or `PlayStation` show the character of the engine fastest.
 
 Requires Blender 5.1 or newer, and only NumPy, which Blender already ships. No
 compiled dependencies, nothing to build.
@@ -52,8 +53,9 @@ That is what CI runs, on Linux, Windows and macOS.
 
 Turn on **Developer Options** in Preferences ▸ Add-ons ▸ Halcyon, then use
 **Run Self Test** in the Debug panel. It copies a report to your clipboard
-covering your GPU, the shaders compiled on your own driver, per-stage frame
-timings and thread scaling. Nearly every bug in this engine's history was
+covering your GPU, the shaders compiled on your own driver, a 116-row
+feature-by-feature comparison of the GPU picture against the CPU's, per-stage
+frame timings and thread scaling. Nearly every bug in this engine's history was
 diagnosed from that output; almost none from a description alone.
 
 ---
@@ -74,74 +76,74 @@ selecting Flat evaluates once per face. That is where the banding and the
 faceting genuinely come from, and it is why they look right instead of merely
 blurry.
 
-**113 node types** are evaluated, including the full Principled BSDF,
-node groups (recursively), muted nodes, reroutes, all the texture and colour
-nodes, and every Math and Vector Math operation. Nodes the engine doesn't know
-pass their first matching input through and are reported as a warning rather
-than failing the render.
+**145 node types** are evaluated — audited against Blender's full surface-node
+registry, and the audit came back clean: every shader node Blender 5.x offers
+has an evaluator except Freestyle's stroke UV, which has no meaning outside
+Freestyle. That includes the full Principled BSDF, node groups (recursively),
+muted nodes, reroutes, all the texture and colour nodes, and every Math and
+Vector Math operation. Nodes the engine doesn't know pass their first matching
+input through and are reported as a warning rather than failing the render.
 
-**13 material templates** — Chrome, Gold, Brushed Metal, Glass, Shiny Plastic,
-Rubber, Polished Marble, Varnished Wood, Terrain, Cel Shaded, Velvet, Hologram
-and Wireframe. Built at runtime as recipes rather than saved node trees, so they
-always match the current nodes.
+**The master shader** carries the era's whole bag of tricks on one node —
+Fresnel, rim light, sheen, matcap, reflection tint, edge opacity, backface
+override, vertex colour mix — all applied outside the reflectance model so they
+behave the same on every one. **Bump Height** takes any greyscale texture and
+bumps it straight into the shading normal: behind the scenes it becomes a real
+Bump node between the texture and the Normal chain, so it renders identically
+on both devices by construction. The Material Properties tab drives the same
+material with plain sliders when **Override** is on — override withholds the
+node tree at export, so what the panel shows is exactly what renders.
 
-**An infinite ground plane** — solid, checker, fractal or animated ocean —
-intersected analytically in the background pass rather than built from geometry,
-exactly as POV-Ray and Bryce provided one. World Properties ▸ Halcyon World ▸
-Infinite Ground.
+New materials created while Halcyon is the active engine are **born as master
+shader materials** — the panel's New button builds one directly, and a
+strictly-guarded watcher converts factory-fresh default materials (exactly the
+two untouched default nodes; anything a person has edited is never touched).
 
-**Wireframe two ways.** All Edges draws every triangle edge, which is what
-these renderers did — and once triangles are a couple of pixels across, every
-pixel is within a pixel of an edge and the surface fills in solid. That is
-arithmetic, not a setting. Creases & Silhouette keeps only the outline and the
-edges where the surface turns, and stays one pixel wide however many triangles
-are behind it. Render Properties ▸ Shading ▸ Wireframe; the width lives on each
-material's shader node.
+**Cartoon outlines.** Ink drawn from the renderer's own G-buffer: object
+silhouettes, material borders, depth breaks and normal creases, each its own
+toggle, with width, colour, opacity and over-sky control. The ink lands at the
+*internal* resolution, so supersampling anti-aliases the line on the way down —
+clean cel edges with no line renderer. Computed from the same buffers on either
+device, so the picture cannot differ between them. Render Properties ▸ Shading
+▸ Cartoon Outlines.
 
-**Painter's Algorithm** alongside the z-buffer, comparing whole polygons rather
-than fragments, with the sorting errors that implies. **Light linking** per lamp
-by collection. **Fresnel, rim light, sheen, matcap, reflection tint, edge
-opacity and backface override** on the master shader, all applied outside the
-reflectance model so they behave the same on every one — with **Bump Strength**
-scaling how far the Normal input may bend the shading normal, and **Refraction
-Amount** gating how much of the ray traced through a transparent surface is
-used. Sheen is the one that still needs a light: it is a velvet lobe, not the
-rim cheat.
+**28 material templates** — Chrome through Wireframe on the Simple shelf;
+Water, Lava, Tile Floor, Brick Wall, Hammered Metal, Leopard, Cloth and Dead
+Channel among the Advanced. Built at runtime as recipes rather than saved node
+trees, so they always match the current nodes, and every one is rendered by the
+test suite to prove it changes the frame.
 
-**Render passes.** Depth, Normal, Position, UV, Object Index and Material
-Index, written alongside the beauty image under Blender's own names and channel
-layouts — so a Halcyon Z pass drops into a comp built for Cycles without
-rewiring. View Layer Properties ▸ Halcyon Passes. They are data: they skip the
-display chain, the palette and the dither, and Depth is a distance in scene
-units rather than normalised device depth.
-
-**Material conversion.** Three buttons in the Material panel convert the active
-material, everything on the selected objects, or the whole scene onto the
-Halcyon Shader — relinking existing textures rather than discarding them, and
-choosing the reflectance model from what the source shader actually was.
-
-**20 procedural texture nodes** of the kind these packages shipped with —
+**25 procedural texture nodes** of the kind these packages shipped —
 Marble, Wood, Granite, Dents, Crackle, Plasma, Ripples, Starfield, Weave,
-Scratches, Tiles and Spiral, plus the POV-Ray family: Bozo, Agate, Leopard,
-Onion, Bumps, Wrinkles and Brick. Solid textures, evaluated in 3D, under
-*Add > Halcyon > Halcyon Textures*. Plasma and Ripples animate.
+Scratches, Tiles, Spiral, Cells, TV Static and the POV-Ray family (Bozo, Agate,
+Leopard, Onion, Bumps, Wrinkles, Brick), plus:
 
-Each is written from its published definition rather than from something that
-looks similar. Agate's 0.77 exponent is the whole character of that pattern;
-leopard really is three sines summed and squared.
+- **Fractal Noise** — the integer-hash fractal in three profiles, on a
+  **1D, 2D, 3D or 4D lattice** with a W socket. The hash travels to the GPU
+  bit-for-bit, which Blender's own sin-fract noise cannot.
+- **Water Noise** — 1 to 12 drifting layers folded toward crests by
+  Choppiness, with animation Speed and a **Loop** that closes the cycle
+  *exactly* over Loop Frames by moving time onto a circle through the
+  lattice's fourth dimension. A looping deck breathes and shimmers in place
+  rather than drifting; that trade is stated on the node.
+- **Gradient (Shaped)** — linear, reflected, spherical, quadratic, square,
+  diamond, conical and spiral falloffs with Centre, Rotation, Scale,
+  clip/repeat/ping-pong and easing.
+- **Matcap Coordinates** — sphere-map UVs from the view-space normal, now
+  with an Offset socket and a **Centered** switch, so a Spherical gradient
+  fed the vector lands centred instead of cornered.
 
-**Period objects in the Add menu.** *Add > Halcyon*, in the 3D view: the **Utah
-teapot**, the **Cornell box** at its published millimetre measurements with an
-area lamp already placed at the ceiling panel, the **Newell teaset**, and a
-**checker ground plane** built from real alternating faces rather than a
-texture. All generated, so resolution is a knob rather than a decimation, and
-all arriving with Halcyon materials on them.
+Each pattern is written from its published definition rather than from
+something that looks similar. Agate's 0.77 exponent is the whole character of
+that pattern; leopard really is three sines summed and squared.
 
-The teapot's rotational parts are swept from its own profile with the quarter
-circle constant Newell used — 0.56, not the 0.5523 that approximates one, which
-is why the Utah teapot has always been very slightly out of round. Its handle
-and spout are swept to the published silhouette rather than lifted from the
-1975 control-point file; that distinction is in `core/geometry.py` too.
+**Colour tools with taste:** a **Color Ramp (Spaces)** node blends up to six
+stops in RGB, **OKLab**, **OKLCh** (hue taking the short way round) or HSV —
+stop colours are sockets, so they can be driven — and a **Blur** node that
+truly re-evaluates whatever is plugged into it at shifted points in the
+surface plane, procedural or image alike, at three tap qualities. Blur's
+re-run is CPU work and says so: the GPU plan refuses it by name and that
+material shades on the CPU.
 
 **Coded shader nodes.** A real compiler — preprocessor, recursive-descent
 parser, type inference, and NumPy code generation with SIMT execution masks.
@@ -165,84 +167,64 @@ void main() {
 
 That gives you a node with **Tint** and **Rim Power** sockets and a **Color**
 output. Edit the source, press Compile, and the sockets rebuild while keeping
-every link that still has somewhere to go.
+every link that still has somewhere to go. Coded shaders compile natively into
+the GPU's deferred pass too, mangled and inlined, so the same source runs on
+both devices.
 
 **Eight sky modes** — node tree, solid, gradient, **banded gradient** (the same
 blend cut into the handful of flat steps a 256-colour palette could actually
-spare for a sky), **starfield** (a backdrop, stars all the way round with no
-dome under them, and an optional nebula), Preetham physical sky, HDRI with
-rotation and tint, and a full **Bryce Sky Lab**: sky dome, sun corona, haze
-that warms toward the sun, separate ground fog, a wind-streaked stratus deck, a
-self-shadowed cumulus deck built from turbulence rather than fBm (which is where
-the cauliflower edges come from), plus a rainbow at the correct 42 degrees,
-stars and comets.
+spare for a sky), **starfield**, Preetham physical sky, HDRI with rotation and
+tint, and a full **Bryce Sky Lab**: sky dome, sun corona, haze that warms
+toward the sun, separate ground fog, a wind-streaked stratus deck, a
+self-shadowed cumulus deck built from turbulence rather than fBm (which is
+where the cauliflower edges come from), a rainbow at the correct 42 degrees,
+stars, comets that travel their own great circles off the scene's clock — and
+now a **nebula wash** under the Bryce dome as well as the starfield, because a
+night preset that sets nebula settings should get a nebula.
 
-Every control the Sky Lab and the Sky & Fog palette are documented as having is
-there, under the same name and in the same tab: Soft Sky and Custom Sky, Sun
-Glow Colour, Shadow Colour and Intensity, cloud Frequency / Amplitude /
-Turbulence, Spherical Clouds, Link Clouds to View, Fixed Cloud Plane, Base
-Height and both blends for fog and haze, Colour Perspective, Volumetric World,
-moon Softness, comets. They stack in Bryce's order too — dome, then what is
-beyond the atmosphere, then the cloud decks, then the atmosphere itself, which
-is what makes haze reach the clouds instead of stopping behind them.
-
-**The comets travel.** Each runs around a great circle of its own at Comet
-Speed, off the scene's clock, so the same frame renders the same sky anywhere —
-with Tail Length, Tail Width and Colour, and a Tail Direction that runs from
-trailing its own path, as a dust tail does, to pointing straight away from the
-sun, as an ion tail does.
-
-**43 sky presets** with a save/load format behind them — Dawn through Deep
-Space, and a pink-and-purple shelf from Rose Tinted Glasses to Synthetic
-Wonderworld, each built out of the Sky Lab's own controls so it doubles as a worked
-example of them. The list sits under the Bryce sky mode: pick one, press *Apply
-Preset*. *Save As...* writes a `.halsky` file anywhere, *Add to Library* puts one
-in the list beside the built-ins, and *Import Preset...* takes someone else's
-`.halsky` into the library without applying it. They are skies built to Bryce's
-controls, not Bryce's own preset files, which were never published.
+**303 sky presets, every one with a rendered thumbnail.** The original 43 plus
+**260 new skies in 26 authored families** — Golden Hour, Blue Hour, High Noon,
+Storm Front, Ember, Midnight Clear, Vapor Dream, Winter Overcast, Desert Dusk,
+Alien Twilight, Monsoon, Candy, Nebula Night, Fog Bank, Thunderhead, Moonrise,
+Cinema Grade, Arctic Night, Sea Dawn, Toxic, Haze Valley, Comet Watch, Cirrus
+Day, After the Rain, Noir and Spring Front — each variant carrying its own
+tooltip. The preset picker is a browsable gallery: the engine's own sky module
+drew all 303 thumbnails, and a test holds the library to it — real fields only,
+real notes, a thumbnail per key, and every preset must actually change the sky
+it is applied to. *Save As...* writes a `.halsky` anywhere, *Add to Library*
+puts one beside the built-ins. Applying a preset refreshes the rendered view
+immediately — it tags the world the way a slider does, which for a long time it
+did not.
 
 **20 water presets** in the same shape, under the water plane rather than the
-Sky Lab because that is where Bryce kept them — its Materials Library had a
-**Waters & Liquids** category and dropping one on the plane was how a picture
-got its sea. Caribbean Resort through Storm Swell, Millpond, Moonlit Water,
-Liquid Mercury and Alien Sea, saved as `.halwater`. Skies and waters own
-disjoint halves of the world, so applying one never disturbs the other. Of the
-names, *Waters & Liquids* and *Caribbean Resort* are Bryce's own; the rest are
-named for what they are.
+Sky Lab because that is where Bryce kept them. Skies and waters own disjoint
+halves of the world, so applying one never disturbs the other.
 
-**The infinite ocean** is the other half of a Bryce picture: a directional wave
-spectrum fanned off a wind direction, deep and shallow colours with the path
-length between them, and the sun's glitter path — which is the sun found in the
-distribution of wave normals rather than a highlight on a plane. *Wave Size* is
-the length of the longest train, crest to crest, from two centimetres to five
-hundred metres. The waves run all the way to the horizon and compress into a
-band of shimmer there rather than fading out, which is what Bryce's water did:
-its ocean was a procedural material on an infinite plane with nothing filtering
-it. *Horizon Shimmer* is what keeps that band reading as sea instead of as
-moiré, by taking each sample from a random point inside its pixel rather than
-the centre. *Horizon Smoothing* turns the modern behaviour back on if you want
-smooth distant water, and what it removes widens the glitter path and roughens
-the reflection instead of disappearing.
+**Nine infinite grounds** — solid, checker, fractal, **neon grid** (the
+synthwave floor, lines widening with distance so they survive minification),
+**tiles** with grout and per-tile shading, **dunes**, **snowfield** with
+sun-glints, **lava** with pulsing cracks, and the full **animated ocean**: a
+directional wave spectrum fanned off a wind direction, deep and shallow colours
+with the path length between them, and the sun's glitter found in the
+distribution of wave normals rather than painted on. All intersected
+analytically in the background pass, exactly as POV-Ray and Bryce provided one.
 
-**69 presets** across six categories — a Default that resets everything, then
-3D software (Infini-D, Ray Dream, StudioPro, 3D Studio R4 and MAX R2, trueSpace,
-LightWave, Imagine, POV-Ray 2.2 and 3.1, Bryce, ElectricImage, Softimage|3D,
-Alias PowerAnimator, Wavefront, CINEMA 4D, Real 3D, Vistapro, Animation:Master,
-Vue), home computers (VGA Mode 13h, Mac 8-bit and 1-bit, Windows 3.1 and 95,
-EGA, CGA, Hercules, Amiga OCS and AGA, Atari ST, PC-98, X68000, SVGA, Quake
-software), consoles (PlayStation and its high-res mode, Saturn, N64, Voodoo,
-Dreamcast, 3DO, Jaguar), broadcast (Video Toaster, PAL, VHS, S-Video) and early
-web (GIF, JPEG, PNG-8, CD-ROM FMV) — with handhelds and later consoles (Game
-Boy, Virtual Boy, Game Gear, SNES, Neo Geo, 32X), more home computers
-(Commodore 64, ZX Spectrum, Apple IIGS, MSX2, NeXTSTEP, SGI Indy) and the
-software renderers (Doom, RenderMan, Turbo Silver, Lightscape, AutoShade)
-alongside them.
+**72 render presets** across six categories — 3D software (Infini-D, Ray
+Dream, 3D Studio, trueSpace, LightWave, POV-Ray, Bryce, Softimage|3D and the
+rest), home computers (VGA Mode 13h through PC-98 and X68000), consoles
+(PlayStation, Saturn, N64, Voodoo, Dreamcast…), broadcast (Video Toaster, PAL,
+VHS), handhelds, and the early web (GIF, JPEG, CD-ROM FMV). Applying one
+resets everything first, so presets never accumulate.
 
-Applying a preset resets everything first, so presets never accumulate — machine
-settings like thread count and Transparent Film are preserved. **Add On Top**
-layers one deliberately.
+**Render passes** — Depth, Normal, Position, UV, Object Index and Material
+Index, written under Blender's own names and channel layouts so a Halcyon Z
+pass drops into a comp built for Cycles without rewiring.
 
-**167 settings**, all exposed. A test fails if any of them is drawn in the UI without something reading it.
+**189 settings, all exposed, all proven, all explained.** Two tests stand
+behind that sentence: one holds every setting to a proof that it changes what
+it claims to change (a matrix row, an A/B render, a behavioural check, or a
+declared reason — nothing silently exempt), and one fails the build the moment
+any property ships without a detailed tooltip.
 
 ---
 
@@ -254,6 +236,7 @@ layers one deliberately.
 supersample → rasterise z-buffer → reconstruct fragment attributes
 → evaluate node graph per material → collapse closure to a reflectance model
 → light → ray-traced reflection/refraction → A-buffer transparency → fog
+→ cartoon outline ink                  [from the G-buffer, both devices]
 → filtered downsample
 → glow / star / flare (linear light)
 → display transform
@@ -270,6 +253,28 @@ stylistic preference — a 1996 machine glowed in its framebuffer and scanned on
 its tube, and doing it in the other order looks wrong in a way that is hard to
 name but easy to see.
 
+### Determinism
+
+The same frame renders the same pixels — across runs, across thread counts,
+and across devices. That is a doctrine with machinery behind it, not a hope:
+
+- Every stochastic effect (soft shadows, AO, dither jitter) draws from an
+  integer hash that is a pure function of (pixel, sample, stream, seed), and
+  angles come from a shared 256-entry table rather than anyone's `sin`.
+- Ties are **named rules, not races**. The rasteriser resolves coverage ties
+  to the lowest triangle id; the ray tracer resolves equal-distance hits the
+  same way — the answer is a function of the candidate set, never of
+  traversal order or scheduling.
+- Where a driver's last-bit arithmetic genuinely cannot decide reproducibly —
+  a reflection ray grazing two coincident surfaces — the GPU **routes the tie
+  to the CPU** and returns the reference's own answer by construction.
+  Route, never guess.
+- Every internal data texture on the GPU is read by `texelFetch` with integer
+  coordinates, never through a sampler whose filter state the Python API
+  cannot control. That one is written in scar tissue: a filtered read of the
+  triangle-id buffer once drew a faint wireframe over every edge of a scene,
+  visible only at resolutions the test suites never rendered.
+
 ### Closures to reflectance models
 
 Blender's node graphs produce Cycles-style closures: additive, weighted lobes.
@@ -279,16 +284,18 @@ from what the tree contains. It's in `core/render.py:closure_to_surface` and
 documented there. It is an honest lossy mapping, not a pretence that the two
 systems are the same.
 
-Roughness maps to a Phong/Blinn exponent by the classic
-`2/r⁴ − 2` relation, clamped.
+Roughness maps to a Phong/Blinn exponent by the classic `2/r⁴ − 2` relation,
+clamped.
 
 ### Transparency
 
 A true A-buffer (Carpenter 1984). Every transparent fragment is shaded and
 kept; fragments are then sorted per pixel and composited by layer rank. It is
-correct through any depth of overlapping surfaces, unlike the per-object sorting
-most period renderers used — which is also available, as `Painter's Algorithm`,
-because its failures are part of the look.
+correct through any depth of overlapping surfaces, unlike the per-object
+sorting most period renderers used — which is also available, as `Painter's
+Algorithm`, because its failures are part of the look. Screen Door
+transparency punches dither-pattern holes instead: no sorting, no blending,
+pure period.
 
 ### Shadows
 
@@ -297,21 +304,32 @@ bias is a world-space number that means something. Normal-offset biasing —
 stepping off the surface by a texel or so, scaled by how obliquely the light
 hits — removes acne without the detached shadows a large depth bias causes.
 Shadow maps and shadow rays agree to within 0.0015 mean difference on the test
-scene, which is the real evidence that both are right.
+scene, which is the real evidence that both are right. Point lights get proper
+six-face cube maps, and the same depth images travel to the GPU as atlases.
 
-Point lights get proper six-face cube maps.
+### Rays
+
+The BVH builds by **binned surface-area heuristic** — a median split over a
+scene with a huge ground plane produces sibling boxes that overlap almost
+entirely, and the profiler measured shadow rays paying for both subtrees all
+the way down. The SAH tree made the field scene's shadow rays 12× faster and
+its reflection rays 6×, on both devices at once, because the GPU kernels
+traverse the same packed tree. Traversal on the CPU runs level-synchronous
+waves of (node, ray) pairs — a few dozen large array operations per query
+instead of thousands of small ones.
 
 ### The bpy boundary
 
-Everything under `core/` and `shaders/` imports NumPy and nothing else. No bpy.
-The exporter flattens node trees into plain dicts, bakes colour ramps and curve
-mappings into 256-entry LUTs, and hands over dataclasses. That boundary is why
-the whole renderer can be tested headlessly, and it is the reason the test suite
-below exists at all.
+Everything under `core/`, `shaders/` and the numerical half of `gpu/` imports
+NumPy and nothing else. No bpy. The exporter flattens node trees into plain
+dicts, bakes colour ramps and curve mappings into 256-entry LUTs, and hands
+over dataclasses. That boundary is why the whole renderer can be tested
+headlessly, and it is the reason the test suite below exists at all.
 
-`properties.py` is **generated from the `RenderSettings` dataclass**, so the UI
-cannot drift from the renderer. A test asserts every field has a matching
-property.
+`properties.py` is **generated from the `RenderSettings` dataclass**, so the
+UI cannot drift from the renderer. A test asserts every field has a matching
+property; another asserts every property has a reader inside the engine, which
+is how seven corpse settings were found and removed.
 
 ---
 
@@ -326,11 +344,20 @@ The suite covers the shader compiler (divergent control flow, loops with
 per-lane trip counts, out-parameters, early return, structs, matrices, swizzle
 assignment, discard, the preprocessor, both dialects, error reporting) and the
 renderer (geometry landing where independently projected, shadows by both
-methods agreeing, every shading model distinct, all six debug passes, affine
-texture warp, vertex snapping, A-buffer transparency, ray-traced reflection,
-node-graph evaluation including group recursion and unknown-node fallback,
-palette colour counts, the full post chain, the generated period objects,
-and all 69 presets rendering).
+methods agreeing, every shading model distinct, all debug passes, affine
+texture warp, vertex snapping, A-buffer transparency, ray-traced reflection to
+any depth, node-graph evaluation including group recursion and unknown-node
+fallback, palette colour counts, the full post chain, the generated period
+objects, all 28 templates rendering, all 303 skies applying and differing, all
+72 presets, every setting's proof, and every tooltip's existence).
+
+The GPU pipeline is tested headlessly too: the same GLSL the driver compiles
+is executed by the compiler's own NumPy backend against the same packed
+textures — raster kernel, deferred shading, ray kernels, post stages — so a
+change that would move a GPU pixel fails the suite on a machine with no GPU at
+all. The final word still belongs to hardware: **Run Self Test** renders the
+116-row feature matrix on your actual driver and reports any row where the
+two devices disagree.
 
 Set `HALCYON_DEBUG=1` to make node evaluation raise instead of falling back
 silently — useful when a material isn't doing what you expect.
@@ -351,6 +378,7 @@ Verified working:
 | Arrays | declaration, indexing, assignment, **per-lane divergent dynamic indices** |
 | Swizzles | read and write, `xyzw` / `rgba` / `stpq` |
 | Derivatives | `dFdx`, `dFdy`, `fwidth` — real screen-space differences, not stubs |
+| Textures | `texture`, `texelFetch`, `textureSize`, `textureLod`, `textureGrad` |
 | Extras | `noise3`, `fbm`, `quantize`, `posterize`, `dither4x4`, `hsv2rgb` |
 
 Divergent control flow is handled with execution masks, so different pixels
@@ -364,11 +392,55 @@ iterations.
   reaches its base case.
 - **Array constructor syntax** — `float[3](1.0, 2.0, 3.0)`. Declare and assign
   instead.
-- Geometry, tessellation and compute stages. This is a fragment-shader
-  language only.
+- Geometry, tessellation and compute *user* stages. User shaders are
+  fragment-language only (the engine's own kernels use compute internally).
 - `sampler3D`, `samplerCube`, integer textures.
 - Uniform block layout rules — `cbuffer` members are flattened to plain
   uniforms.
+
+---
+
+## GPU support
+
+**The port is complete: rasterisation, shading and post all run on the GPU**,
+through Blender's own `gpu` module — the layer EEVEE is built on, and the only
+route an add-on has. Set **Device: GPU** in Render Properties and the three
+stage toggles come on together.
+
+- **Rasterisation** runs as a compute kernel producing the same G-buffer the
+  CPU produces — triangle ids, perspective-correct barycentrics, depth at the
+  chosen precision, the affine-warp interpolants, snap and 16-bit modes
+  included. Coverage at shared edges is governed by the same watertight window
+  and canonical clip rules on all four engines (CPU loop, CPU batch, GLSL
+  kernel, NumPy replay), because a half-ulp disagreement near the near plane
+  once opened pixel-wide cracks.
+- **Deferred shading** packs the G-buffer into textures and shades one
+  full-screen pass per material, every frame constant baked into the shader
+  source. Lights, shadow atlases (cube faces included, every Vogel PCF tap
+  reproduced), image textures with the CPU's own filter arithmetic, vertex
+  colours, per-pixel surface parameters, the master shader's whole colour
+  chain, coded GLSL nodes inlined natively, and the ray sweeps — reflections
+  and refractions to any depth, traced by compute kernels against the same
+  SAH tree, with each level's secondary passes scissored to the pixels its
+  rays actually hit.
+- **Post** runs the parallel stages as GLSL, measured stage by stage on real
+  hardware before each was allowed to default on. Error-diffusion dither is
+  inherently serial and stays on the CPU, honestly.
+
+The whole matrix — 116 feature rows — is compared against the CPU picture by
+**Run Self Test** on your own driver. A row that cannot yet run on the GPU is
+*routed*: the frame says why on the console and shades that part on the CPU,
+so the picture is always right and the reason is always named. The same
+honesty applies at runtime — if the GPU path cannot deliver a frame (a driver
+hiccup, a timeout under a heavy foreign add-on), the frame renders on the CPU
+with the reason printed, never half-drawn.
+
+Frame-to-frame, unchanged uploads — shadow atlases, mesh attributes, texture
+pixels, the BVH — are cached behind content fingerprints, so an animation
+re-uploads what moved and nothing else. The console prints a per-stage split
+(raster clip/pack/dispatch/read, shade plan/upload/draw/reflect/composite, and
+inside reflect: trace, secondary draws, sky-along-misses, levels run and
+skipped), so when a frame is slow, the stage that owns the time names itself.
 
 ---
 
@@ -376,275 +448,97 @@ iterations.
 
 These are real, and I would rather write them down than have you find them.
 
-**The Blender layer is only partly validated here.** There are now two levels
-of stand-in: one that imports and registers every module, and one that actually
-*runs* a frame through `HalcyonRenderEngine.render()` — property group,
-exporter, renderer, post chain, delivery and passes — against a fake depsgraph.
-The second exists because six bugs in a row got past the first, every one of
-them a control wired up at one end and not the other. Neither can catch a
-segfault, a driver quirk or an RNA lifetime bug. It was developed without
-Blender installed. Every module is import- and registration-tested against a
-`bpy` stub (`tests/fakebpy.py`) which catches typos, bad enum defaults and
-malformed property declarations, and confirms all settings map across — but no
-stub catches everything about a live API. Three real bugs were only found by
-running it in Blender: an inverted image, a missing 1/π that whitened every
-material, and a preview crash. If something misbehaves, the traceback in
-Window ▸ Toggle System Console is the fastest way to tell me what happened.
+**The Blender layer is only partly validated here.** Two levels of stand-in
+exist: one imports and registers every module against a `bpy` stub, and one
+runs a whole frame through `HalcyonRenderEngine.render()` — property group,
+exporter, renderer, post chain, delivery and passes — against a fake
+depsgraph. Neither can catch a segfault, a driver quirk or an RNA lifetime
+bug. If something misbehaves, the traceback in Window ▸ Toggle System Console
+is the fastest way to tell me what happened.
 
-**The GPU port is two stages of three.** The post chain runs on the GPU, and
-deferred shading of the CPU's G-buffer is written, verified, and waiting on a
-hardware measurement before it defaults on; rasterisation does not. See *GPU
-support* below. Everything else is CPU, and threaded.
+**Blender's procedural textures differ slightly from Cycles.** Noise, Voronoi,
+Musgrave and Magic are independently implemented from their published
+definitions — the right kind of pattern with the right statistics, not
+bit-identical to Blender's, so a material tuned against Cycles may need a
+nudge. They also cannot travel to the GPU (their sin-fract hash decorrelates
+on a driver's float32), so they route those materials to the CPU by name.
+Halcyon's own pattern nodes ride an integer hash that is bit-exact on both
+devices — the Fractal Noise node exists precisely to be the portable
+replacement.
 
-**Procedural textures differ slightly from Cycles.** Noise, Voronoi, Musgrave
-and Magic are independently implemented from their published definitions. They
-are the right *kind* of pattern with the right statistics, but they are not
-bit-identical to Blender's, so a material tuned against Cycles will need a nudge.
+**The Sky Texture is Preetham, not Nishita.** In period, driven by the same
+sun inputs, and close enough in shape for output about to be quantised to 256
+colours. `altitude`, `air_density`, `dust_density` and `ozone_density` are
+exported but unused.
 
-**The Sky Texture is Preetham, not Nishita.** Blender's default sky option is a
-full atmospheric scattering simulation. Halcyon implements the Preetham
-analytic daylight model instead — in period, driven by the same sun elevation,
-rotation and turbidity inputs, and close enough in shape and colour for output
-that is about to be quantised to 256 colours. `altitude`, `air_density`,
-`dust_density` and `ozone_density` are exported but unused.
+**Volumetrics are screen-space.** A light's shafts are smeared from bright
+pixels, which is how it was done then. No volume is integrated.
 
-**Volumetrics are screen-space.** A light's Volumetric setting throws shafts by
-smearing bright pixels outward from its position on screen, which is how it was
-done then. No volume is integrated.
-
-**Depth of field is layered, not sampled.** The frame is split into depth slabs
-and each blurred by its circle of confusion — a handful of blurs instead of
-hundreds of rays, as compositors of the era did.
+**Depth of field is layered, not sampled.** Depth slabs, each blurred by its
+circle of confusion — a handful of blurs instead of hundreds of rays, as
+compositors of the era did.
 
 **Displacement drives a bump, not geometry.** The height becomes a normal
 perturbation from its screen-space gradient. Nothing is tessellated, which is
 also what 1990s scanline renderers did.
 
-**Ambient occlusion is not period correct** and is off by default. It's there
-because it's occasionally useful, not because a 1996 renderer had it.
+**Ambient occlusion and radiosity are not period-universal** and are off by
+default. They're there because they're occasionally useful and, in
+radiosity's case, because the era's boxes did ship it.
 
-**Motion blur, particles and hair are not supported.** Baking to texture is not
-implemented either.
+**Particles and hair are not supported.** Baking to texture is not implemented
+either. Motion blur *is* — as averaged time-offset frames across a shutter,
+which is exactly how the era faked it, at the cost of Steps extra renders.
 
 **Mesh, curve, surface, text and metaball objects render**; Blender converts
 each to triangles and Halcyon takes it from there. Grease pencil, hair curves,
 point clouds and volumes do not, and are named in the info bar rather than
-quietly left out of the picture. An object that will not convert is skipped
-with its name reported and its traceback on the console — one bad object costs
-you that object, not the frame.
+quietly left out. An object that will not convert is skipped with its name
+reported — one bad object costs you that object, not the frame.
 
 ---
 
 ## Performance
 
-The rasteriser has no per-triangle Python loop. Triangles are bucketed by
-bounding-box size and every candidate pixel in a bucket is tested in one
-vectorised sweep, with large triangles routed to a sequential path where the
-per-triangle overhead is already amortised. Measured against the reference
-implementation, on one CPU core:
+Profile first. **Developer Options ▸ Debug ▸ Timing Breakdown** prints a
+per-stage table for every frame, and the GPU path prints its own splits down
+to the reflection sweep's internals. Three rounds of optimising this engine
+were once aimed at whichever stage happened to have been profiled, and twice
+that was not the stage the frame was spending its time in. The engine now
+optimises the way it renders: measured, on the scene that hurt, with losing
+experiments written down so nobody re-fights them.
 
-| scene | before | after | |
-|---|---|---|---|
-| 782 tris, 320×240 | 0.29 s | 0.22 s | 1.3× |
-| 18.7k tris, 640×480 | 2.43 s | 0.59 s | **4.1×** |
-| 18.7k tris, 640×480 AA4 | 5.69 s | 2.20 s | **2.6×** |
+Recent measured wins on a real half-million-triangle field scene: SAH BVH —
+shadow rays **12×**, reflection rays **6×**, both devices; sky evaluation
+**1.9×** (a float64 leak and a corner-hash reuse, bit-for-bit where it
+counts); the GPU frame's composite bucket **3.7×**; all-miss reflection
+levels skipped outright.
 
-The gain grows with triangle count, which is the case that matters: the old
-path cost roughly 20 µs of Python overhead per triangle no matter how few
-pixels it covered.
+The knobs that matter, in order:
 
-Both implementations are kept, and a test asserts they are **bit-identical** —
-same triangle buffer, same depths, same barycentrics, same A-buffer fragment
-set. If they ever diverge, the fast one is wrong and the suite says so.
+1. **`aa_samples` is quadratic.** Supersample 24 renders a 5× frame each way —
+   25× the pixels. Drop to 1 while you light the scene.
+2. **`Pixel Scale` is free performance.** Renders at 1/N of the output size
+   and nearest-upscales — 16× cheaper at 4×, and more authentic than shrinking
+   a large render.
+3. **Resolution.** Also quadratic.
+4. **Ray tracing.** Reflective materials cost rays; depth multiplies them.
+   The reflect console split will tell you which part owns the time.
+5. **`shadow_map_size`.** Each map is a full rasterisation pass; a point light
+   needs six. 512 is usually plenty at these resolutions.
+6. **`preview_scale`** controls viewport resolution; the viewport also caches
+   the exported scene and only rebuilds what changed.
 
-### Threading, and why it does not help much
+### Threading, and why processes beat threads
 
-Shading runs across a thread pool, and the result is **bit-identical** at 1, 4
-and 20 threads — a test asserts that. What it is not is faster, so **Threads
-defaults to 1**. Measured on a 20-core machine at 640x480:
-
-| threads | time | speedup |
-|---|---|---|
-| 1 | 0.283 s | 1.00x |
-| 4 | 0.296 s | 0.96x |
-| 16 | 0.303 s | 0.93x |
-| 32 | 0.326 s | 0.87x |
-
-More threads are slightly *slower*. NumPy releases the interpreter lock only for
-large array operations, and the node evaluator is dominated by Python dispatch
-between small ones — so the threads contend rather than divide the work. Giving
-the pool more chunks to work with was tried, and measured worse still.
-
-This was claimed to work for several releases on the strength of reasoning
-rather than measurement, on a machine with one core where it could not have been
-observed either way. It is written down here because it is the sort of claim
-that quietly wastes someone's afternoon.
-
-**Worker processes are the answer to this**, not threads: separate interpreters
-have no shared lock at all. That path is described below.
-
-Chunking still matters even at one thread: a 3440x1440 frame at 4x
-supersampling is 79 million fragments, and building the shading context for all
-of them at once would want tens of gigabytes. Peak memory is a function of chunk
-size, not resolution.
-
-### Rendering an animation
-
-Two things matter for sequences. **Lock Palette** (on by default) builds the
-adaptive palette once and reuses it, which stops colours crawling between frames
-and skips rebuilding it every frame. The nearest-colour lookup cube it feeds is
-cached alongside it, so only the first frame pays for either.
-
-Turning **serpentine** off in the Colour Depth panel roughly halves the frame
-again: in a single scan direction the error diffusion can be processed a
-diagonal at a time rather than a pixel at a time, which is bit-identical and two
-to three times faster.
-
-A 640x480 frame at 4x supersampling with a 256-colour preset went from 6.4
-seconds to 0.51 seconds this way, almost all of it in the palette stage rather
-than the renderer.
-
-### Worker processes
-
-**Use Worker Processes** in the Performance panel splits each frame across
-separate Python interpreters. Threads only parallelise where NumPy releases the
-interpreter lock; processes have no shared lock at all. A worker is a plain
-Python with NumPy — no Blender — which is possible only because `core/` and
-`shaders/` are bpy-free.
-
-Output is bit-identical to rendering in-process. If workers cannot start, or the
-frame is too small to be worth splitting, it says why on the console and renders
-normally. Off by default, because the speedup has not been measured on hardware
-with more than one core.
-
-Post-processing still runs in Blender's own process, so this helps most on
-24-bit presets and least on heavily quantised ones where the palette stage
-dominates.
-
-### Finding out where the time goes
-
-Switch on **Developer Options** in Preferences > Add-ons > Halcyon. That reveals
-a **Debug** panel in Render Properties with the render passes, the scene dump and
-the timing breakdown.
-
-Turn on **Timing Breakdown** there and each frame prints a
-per-stage table to the system console (Window > Toggle System Console). It
-covers the export from Blender, texture preparation, shadow maps, rasterising,
-shading, post and delivery, and names the slowest stage.
-
-Use it before changing any setting. Three rounds of optimising this engine were
-aimed at whichever stage happened to have been profiled, and twice that was not
-the stage the frame was actually spending its time in.
-
-### Where the time goes now
-
-Shading, not rasterisation. The knobs that actually matter, in order:
-
-1. **`aa_samples` is quadratic.** 4× supersampling means 4× the fragments to
-   shade, not 4× the samples per fragment. Going from 1 to 4 roughly quadruples
-   the render. Most of the presets ship at 4; drop it to 1 while you light the
-   scene.
-2. **`Pixel Scale` is free performance.** It renders at 1/N of your output
-   resolution and scales back up with nearest-neighbour, so the output stays the
-   size you set while the render costs N² times less. Set the output to
-   1920×1080, Pixel Scale to 4×, and the engine renders 480×270 — 16× cheaper,
-   and more authentic than rendering at 1080p and shrinking.
-3. **Resolution.** Also quadratic, for the same reason.
-4. **`shadow_map_size`.** Each map is a full rasterisation pass, and a point
-   light needs six of them. 512 is usually plenty at these resolutions.
-5. **Ray tracing.** Off unless you want reflections. Ray-traced shadows cost
-   more than shadow maps and, as the tests show, agree with them to within
-   0.0015.
-6. **`preview_scale`** in the Performance panel controls viewport resolution.
-   Raise it for a faster preview. The viewport also caches the exported scene
-   and only rebuilds it when something actually changes, so orbiting no longer
-   re-converts every mesh per frame.
-
-### GPU support
-
-Stage one of a GPU port is live, on Blender's own `gpu` module — the layer EEVEE
-is built on. Cycles' device abstraction is C++ with precompiled kernels and is
-not exposed to Python at all, so this is the only route an add-on has.
-
-**GPU Post Processing** in the Debug panel runs the parallel post stages as GLSL.
-Measured on an RTX 5060 Ti under Vulkan against the CPU function each replaces:
-
-| stage | agreement | enabled |
-|---|---|---|
-| Display transform | 0.00001 max difference | yes |
-| CRT mask, scanlines, vignette | 0.0115 | yes |
-| Ordered dither and bit depth | 0.0327 | yes |
-| Lens distortion | 0.00426 after the half-texel fix | yes |
-| Composite NTSC | 0.00037, as three blur draws + combine | yes |
-
-A stage runs because it was measured, not because it was written, and a test
-fails if anything unproven appears in the enabled list. Blender defaults to
-**Vulkan**, where the legacy `GPUShader(vertex, fragment)` constructor does not
-exist — shaders are built from a `GPUShaderCreateInfo`, with the old constructor
-kept only as an OpenGL fallback.
-
-The NTSC stage spent a year unvalidated because it was the wrong shape: one
-triangle blur at one radius, where the CPU blurs I and Q at *different* radii
-with a box blur run three times, re-padding the frame edge before each pass.
-It is now three blur draws and a combine — the only structure that can match
-that — and the hardware measurement came back at 0.00037, in agreement with
-the 0.0004 the NumPy backend predicted. Dot crawl is frame-dependent and keeps
-a frame that uses it on the CPU.
-
-**Deferred GPU shading — stage two — is measured and enabled.** The CPU still
-rasterises; the G-buffer is packed into textures and shaded in one full-screen
-pass per material, every frame constant baked into the shader source so the
-Vulkan push-constant budget never enters into it. On an RTX 5060 Ti under
-Vulkan it reproduces the renderer's own frame to a max difference of
-**0.000051** — sun, point and spot lights, two-sided lighting, flat and smooth
-normals, all three materials of the test scene. Turn on **GPU Shading** in the
-Debug panel (Device: GPU). **Shadow maps travel with the frame**: the same
-depth images the CPU just baked are packed into an atlas per light — six cells
-for a point light's cube — with the light-space matrix, the slope bias, the
-normal offset and every Vogel PCF tap baked into the shader exactly as the CPU
-computes them, and a shadowed frame matches `render()` to the same 0.00002 the
-unshadowed one does. **Image textures travel too**: the CPU samples prepared
-pixels — resized, quantised, colourspace-converted — so those exact pixels are
-what the GPU samples, with the filter arithmetic (floor-based nearest,
-half-texel bilinear, all four wrap modes) reproduced in the shader rather than
-left to the driver's sampler state; all eight filter/wrap combinations match
-`Texture.sample` to the texel. Unchanged uploads — shadow atlases, mesh
-attributes, texture pixels — are cached across frames behind content
-fingerprints, so an animation re-uploads what moved and nothing else.
-**Converted materials qualify**: the master shader node's colour chain is
-emitted and every other socket rides as a probed constant — including the
-era's silhouette cheats, rim and fresnel, and the sheen lobe, reproduced from
-`light_surface`'s own formulas — and **area lights** join sun, point and spot
-in the loop, their softness living in the cube shadow the map builder already
-gives them. **Surface parameters vary per pixel**: a texture or node chain
-driving the master shader's Roughness, Glossiness, Specular Level or Colour,
-or Self-Illumination emits its chain into the frame shader — through the same
-emitter as the colour, sharing subexpressions — instead of pushing the
-material off the GPU. **Vertex colours travel too**, in the attribute slot the tangent
-never used — the master node's Vertex Color Mix and the Color Attribute node
-both read the same painted corners the CPU reads. Frames using anything the
-GLSL does not reproduce yet (ray-traced shadows, fog, ray tracing, the N64
-three-point filter, normal/bump chains) shade on the CPU with the reason
-printed.
-
-Honesty about the clock: the first measured frame took 316 ms against the
-CPU's 31, because a first frame pays the driver's compile of each material's
-shader plus the upload of the G-buffer. The compile is cached per scene — an
-animation pays it once, not per frame — and the upload path no longer detours
-through a Python list. The self-test reports cold and warm frames separately,
-so the number that matters for animation is the one being measured.
-
-What remains, and why:
-
-| piece | difficulty | notes |
-|---|---|---|
-| Rasterisation to a G-buffer | moderate | the last stage; there is a bit-identical CPU reference to diff against |
-| Node evaluator | hard | 29 of 113 node types have a verified GLSL emitter; the rest keep a material on the CPU |
-| A-buffer transparency | hard | needs depth peeling or per-pixel linked lists |
-| Error-diffusion dither | does not port | inherently serial, and stays on the CPU |
-
-Shading is about 71% of a typical frame and rasterising about 9%, which is why
-deferred shading came before a GPU rasteriser rather than after it.
+Shading runs across a thread pool and is **bit-identical** at any thread
+count — a test asserts it — but NumPy releases the interpreter lock only for
+large array work, so threads mostly contend. **Use Worker Processes** splits
+the frame across separate interpreters instead (possible only because `core/`
+is bpy-free), bit-identical to in-process rendering. For sequences, **Lock
+Palette** builds the adaptive palette once, and turning serpentine off lets
+the error diffusion run a diagonal at a time — bit-identical and two to three
+times faster.
 
 ---
 
@@ -655,25 +549,35 @@ halcyon/
   core/          bpy-free renderer
     mathx.py       vector maths on (N,3) arrays
     scene.py       dataclasses the renderer consumes
-    settings.py    RenderSettings — the 167 knobs
-    raster.py      clipping, z-buffer, A-buffer fragment lists
-    bvh.py         median-split BVH for rays
+    settings.py    RenderSettings — the 189 knobs
+    raster.py      clipping, z-buffer, watertight edge rules, A-buffer
+    bvh.py         binned-SAH BVH, wave traversal, order-free ties
     texture.py     sampling, mips, N64 three-point filter
     shading.py     the 18 reflectance models
     lights.py      attenuation, shadow maps, PCF, ray shadows
-    nodeeval.py    113 node types
-    patterns.py    19 solid procedural textures
-    render.py      the orchestrator
+    nodeeval.py    145 node types, the bump desugar, the space ramps
+    patterns.py    the integer-hash pattern library, 1D–4D noise
+    sky.py         eight sky modes, the Bryce dome, nine grounds
+    render.py      the orchestrator, outlines, closure translation
     post.py        glow, palettes, dither, NTSC, CRT, JPEG
     palette.py     median cut, octree, k-means, VGA/Mac/EGA/HAM
     dither.py      Bayer, Floyd-Steinberg, Stucki, Atkinson, …
     geometry.py    the Add-menu objects, generated
+  gpu/           the GPU port
+    craster.py     the compute rasteriser and its NumPy twin
+    shade.py       frame planning, deferred passes, the ray sweeps
+    material.py    GLSL assembly per material
+    emit.py        82 node emitters
+    procedural.py  the pattern library as GLSL, twin by twin
+    rtrace.py      BVH kernels, the tie referral
+    gbuffer.py     G-buffer packing and exact reconstruction
+    device.py marshal.py stages.py chain.py capability.py
   shaders/       bpy-free GLSL/HLSL compiler
     lexer.py parser.py gtypes.py builtins.py codegen.py compiler.py
-  nodes/         Blender node classes
-  presets/       the 69 render presets, 43 skies + 20 waters
-  tests/         headless test suite, bpy stub + a runnable fake Blender
-  compat.py properties.py export.py engine.py ui.py objects.py
+  nodes/         Blender node classes (master shader, patterns, ramps)
+  presets/       72 render presets, 303 skies (+ thumbs/), 20 waters
+  tests/         headless suite, bpy stub, fake Blender, feature matrix
+  compat.py properties.py export.py engine.py ui.py objects.py convert.py
 ```
 
 ---
