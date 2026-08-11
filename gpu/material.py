@@ -527,14 +527,14 @@ def _cookie_function(i, spec):
          f'    float x1w = {wx1};',
          f'    float y0w = {wy};',
          f'    float y1w = {wy1};',
-         f'    vec3 c00 = texture(hal_cookie{i}, vec2((x0w + 0.5) / {_f(w)}, '
-         f'(y0w + 0.5) / {_f(h)})).rgb;',
-         f'    vec3 c10 = texture(hal_cookie{i}, vec2((x1w + 0.5) / {_f(w)}, '
-         f'(y0w + 0.5) / {_f(h)})).rgb;',
-         f'    vec3 c01 = texture(hal_cookie{i}, vec2((x0w + 0.5) / {_f(w)}, '
-         f'(y1w + 0.5) / {_f(h)})).rgb;',
-         f'    vec3 c11 = texture(hal_cookie{i}, vec2((x1w + 0.5) / {_f(w)}, '
-         f'(y1w + 0.5) / {_f(h)})).rgb;',
+         f'    vec3 c00 = texelFetch(hal_cookie{i}, '
+         'ivec2(int(x0w), int(y0w)), 0).rgb;',
+         f'    vec3 c10 = texelFetch(hal_cookie{i}, '
+         'ivec2(int(x1w), int(y0w)), 0).rgb;',
+         f'    vec3 c01 = texelFetch(hal_cookie{i}, '
+         'ivec2(int(x0w), int(y1w)), 0).rgb;',
+         f'    vec3 c11 = texelFetch(hal_cookie{i}, '
+         'ivec2(int(x1w), int(y1w)), 0).rgb;',
          '    vec3 top = c00 + (c10 - c00) * tx;',
          '    vec3 bot = c01 + (c11 - c01) * tx;',
          '    return top + (bot - top) * ty;',
@@ -691,9 +691,8 @@ def _shadow_function(i, meta, consts):
               f'{_f(size - 1)});',
               f'    float yi = clamp(floor(v + {_f(oy)}), 0.0, '
               f'{_f(size - 1)});',
-              f'    vec2 suv = vec2((cellx + xi + 0.5) / {_f(atlas_w)}, '
-              f'(celly + yi + 0.5) / {_f(atlas_h)});',
-              f'    float occ = texture(hal_shadow{i}, suv).r;',
+              f'    float occ = texelFetch(hal_shadow{i}, '
+              'ivec2(int(cellx + xi), int(celly + yi)), 0).r;',
               '    lit += (sdist - slope <= occ) ? 1.0 : 0.0;',
               '    }']
     L += [f'    lit /= {_f(len(offs))};',
@@ -880,7 +879,10 @@ def _mip_sampler(name, tex, wrap, levels, aniso, bias):
           '}',
           f'vec4 hal_sample_{name}(vec2 uv)',
           '{',
-          '    vec4 g = texture(hal_uvgrad, vUV);']
+          '    ivec2 hal_gsz = textureSize(hal_uvgrad, 0);',
+          '    vec4 g = texelFetch(hal_uvgrad, '
+          'ivec2(clamp(vUV * vec2(hal_gsz), vec2(0.0), '
+          'vec2(hal_gsz) - vec2(1.0))), 0);']
     if int(aniso) > 1:
         A = float(int(aniso))
         L += [
@@ -1698,10 +1700,9 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
             'uniform sampler2D hal_vlight;\n'
             'vec3 hal_vlight_fetch(float i)\n'
             '{\n'
-            f'    float x = mod(i, {_f(float(vside))});\n'
-            f'    float y = floor(i / {_f(float(vside))});\n'
-            '    return texture(hal_vlight, (vec2(x, y) + vec2(0.5)) / '
-            f'{_f(float(vside))}).rgb;\n'
+            f'    int vi = int(i);\n'
+            f'    return texelFetch(hal_vlight, ivec2(vi % {vside}, '
+            f'vi / {vside}), 0).rgb;\n'
             '}\n')
         vlight_spec = {'rate': str(vertex_rate), 'side': int(vside),
                        'mat': int(mat_id)}
@@ -1800,7 +1801,10 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     if consts.get('affine') and not secondary:
         samplers.append('hal_gb_idslin')
         affine_uv = (
-            '    vec4 hal_idslin = texture(hal_gb_idslin, vUV);\n'
+            '    ivec2 hal_lsz = textureSize(hal_gb_idslin, 0);\n'
+            '    vec4 hal_idslin = texelFetch(hal_gb_idslin,\n'
+            '        ivec2(clamp(vUV * vec2(hal_lsz), vec2(0.0),\n'
+            '                    vec2(hal_lsz) - vec2(1.0))), 0);\n'
             '    f.uv = hal_interp(f.tri, hal_idslin.rgb, 2).xy;\n'
             '    f.uv2 = hal_interp4(f.tri, hal_idslin.rgb, 2).zw;\n')
     normal_face = bool(consts.get('normal_face'))
@@ -1817,10 +1821,9 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
             'uniform sampler2D hal_triaux;\n'
             'vec4 hal_triaux_fetch(float i)\n'
             '{\n'
-            f'    float x = mod(i, {_f(float(aside))});\n'
-            f'    float y = floor(i / {_f(float(aside))});\n'
-            '    return texture(hal_triaux, (vec2(x, y) + vec2(0.5)) / '
-            f'{_f(float(aside))});\n'
+            f'    int ti = int(i);\n'
+            f'    return texelFetch(hal_triaux, ivec2(ti % {aside}, '
+            f'ti / {aside}), 0);\n'
             '}\n')
         samplers.append('hal_triaux')
     if consts.get('stipple') and not secondary:
@@ -1842,10 +1845,9 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
             'uniform sampler2D hal_vscreen;\n'
             'vec4 hal_vscreen_fetch(float i)\n'
             '{\n'
-            f'    float x = mod(i, {_f(float(wside))});\n'
-            f'    float y = floor(i / {_f(float(wside))});\n'
-            '    return texture(hal_vscreen, (vec2(x, y) + vec2(0.5)) / '
-            f'{_f(float(wside))});\n'
+            f'    int wi = int(i);\n'
+            f'    return texelFetch(hal_vscreen, ivec2(wi % {wside}, '
+            f'wi / {wside}), 0);\n'
             '}\n')
         samplers.append('hal_vscreen')
     frame_unis = sorted(em.frame_uniforms)
@@ -2161,8 +2163,8 @@ void main()
             '64.0);',
             f'    float hal_spy = mod(floor(vUV.y * {_f(float(rh))}), '
             '64.0);',
-            '    float hal_sthr = texture(hal_stipple, '
-            '(vec2(hal_spx, hal_spy) + vec2(0.5)) / 64.0).r;',
+            '    float hal_sthr = texelFetch(hal_stipple, '
+            'ivec2(int(hal_spx), int(hal_spy)), 0).r;',
             '    hal_alpha = (hal_alpha > hal_sthr) ? 1.0 : 0.0;',
             '    Color = vec4(total, 0.6 + 0.3 * hal_alpha) * keep;',
         ]

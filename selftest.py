@@ -826,6 +826,38 @@ def gpu_compute(out):
                 f'{tm2.get("upload_ms", 0.0):5.1f} ms upload, '
                 f'{tm2.get("dispatch_read_ms", 0.0):5.1f} ms dispatch+read')
 
+    # ---- the field's own wall: the raster at HIGH resolutions. The split
+    # is the instrument -- "it dies at 4K" becomes "WHICH stage dies"
+    _p(out, '  HIGH-RESOLUTION RASTER (the same 782 triangles, scaled):')
+    for w3, h3 in ((1920, 1440), (3840, 2880)):
+        st3h = RenderSettings()
+        st3h.resolution_x, st3h.resolution_y = w3, h3
+        st3h.aa_samples = 1
+        sc3h = demo_scene(st3h, with_texture=False)
+        _v3, _p3b, vp3, _e3 = R.camera_matrices(sc3h.camera, w3, h3)
+        t0 = _time.perf_counter()
+        g3 = CR.GBuffer(w3, h3)
+        CR.rasterize(sc3h.mesh.verts, sc3h.mesh.tris, vp3, w3, h3, gbuf=g3)
+        t_cpu3 = _time.perf_counter() - t0
+        out3, err3 = CRA.raster_on_device(sc3h.mesh, vp3, w3, h3)
+        t0 = _time.perf_counter()
+        out3, err3 = CRA.raster_on_device(sc3h.mesh, vp3, w3, h3)
+        t_gpu3 = _time.perf_counter() - t0
+        if out3 is None:
+            _p(out, f'    {w3}x{h3}: compute FAILED: {err3} '
+                    f'(CPU {t_cpu3 * 1000.0:.0f} ms)')
+            continue
+        tri3 = np.round(out3['ids'][:, :, 3]).astype(np.int32)
+        d3 = int((tri3 != g3.tri).sum())
+        tm3 = out3.get('timings') or {}
+        _p(out, f'    {w3}x{h3}: {d3} differing px, CPU '
+                f'{t_cpu3 * 1000.0:.0f} ms vs compute '
+                f'{t_gpu3 * 1000.0:.0f} ms warm '
+                f'(clip {tm3.get("clip_ms", 0.0):.0f}, '
+                f'pack {tm3.get("pack_ms", 0.0):.0f}, '
+                f'upload {tm3.get("upload_ms", 0.0):.0f}, '
+                f'dispatch+read {tm3.get("dispatch_read_ms", 0.0):.0f} ms)')
+
     # ---- both stages together: raster AND shade on the GPU, whole frame
     st3 = RenderSettings()
     st3.resolution_x, st3.resolution_y = w2, h2

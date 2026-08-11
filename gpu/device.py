@@ -498,11 +498,15 @@ def _dispatch_compute_impl(shader, width, height, uniforms, samplers,
                                    format='RGBA32F')
         shader.image(k, tex)
         made[k] = tex
+    import time as _time
     gx = (int(width) + 7) // 8
     gy = (int(height) + 7) // 8
+    t0 = _time.perf_counter()
     gpu.compute.dispatch(shader, gx, gy, 1)
+    t_dispatch = _time.perf_counter() - t0
     out = {}
     import numpy as np
+    t0 = _time.perf_counter()
     for k, tex in made.items():
         buf = tex.read()
         # the buffer protocol, exactly as read_target: to_list() on a frame
@@ -512,5 +516,19 @@ def _dispatch_compute_impl(shader, width, height, uniforms, samplers,
             arr = np.asarray(buf, np.float32)
         except Exception:                                       # noqa: BLE001
             arr = np.array(buf.to_list(), dtype=np.float32)
-        out[k] = arr.reshape(int(height), int(width), 4)
+        # ONE contiguous copy, now: np.asarray over the driver's buffer
+        # is a VIEW of foreign memory, and every strided slice the
+        # decoder takes afterwards re-reads that memory the slow way.
+        # A memcpy costs milliseconds; leaving it out costs the decode
+        # a multiple of itself
+        out[k] = np.ascontiguousarray(
+            arr.reshape(int(height), int(width), 4))
+    LAST_DISPATCH['dispatch_ms'] = t_dispatch * 1000.0
+    LAST_DISPATCH['read_ms'] = (_time.perf_counter() - t0) * 1000.0
     return out
+
+
+#: the last compute dispatch's device-side split: how long the kernel ran
+#: vs how long reading the images back took. The raster split prints it so
+#: "dispatch+read 920 ms" stops being one unattackable number
+LAST_DISPATCH = {}

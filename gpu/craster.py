@@ -117,6 +117,14 @@ vec4 hal_raster_pixel(vec2 pix, float start, float count, float cull,
         float e0 = (xc - xb) * (Y - yb) - (yc - yb) * (X - xb);
         float e1 = (xa - xc) * (Y - yc) - (ya - yc) * (X - xc);
         float e2 = (xb - xa) * (Y - ya) - (yb - ya) * (X - xa);
+        // product magnitudes: the units float wobble is measured in.
+        // Coverage below widens by a few ulps of these, so a shared
+        // edge cannot be excluded by BOTH triangles (the watertight
+        // rule; holes along dense-mesh edges were the field's faint
+        // wireframe). The referral reuses them for its sliver window
+        float w0 = abs((xc - xb) * (Y - yb)) + abs((yc - yb) * (X - xb));
+        float w1 = abs((xa - xc) * (Y - yc)) + abs((ya - yc) * (X - xc));
+        float w2 = abs((xb - xa) * (Y - ya)) + abs((yb - ya) * (X - xa));
         if (hal_refer > 0.5) {
             // sliver window: coverage flips when a driver's fma
             // contraction moves an edge function across zero. The
@@ -138,9 +146,9 @@ vec4 hal_raster_pixel(vec2 pix, float start, float count, float cull,
             float d1c = ya - yc; float d1d = X - xc;
             float d2a = xb - xa; float d2b = Y - ya;
             float d2c = yb - ya; float d2d = X - xa;
-            float m0 = abs(d0a * d0b) + abs(d0c * d0d);
-            float m1 = abs(d1a * d1b) + abs(d1c * d1d);
-            float m2 = abs(d2a * d2b) + abs(d2c * d2d);
+            float m0 = w0;
+            float m1 = w1;
+            float m2 = w2;
             float x0 = (fract(abs(d0a) * 2.0) == 0.0
                         && fract(abs(d0b) * 2.0) == 0.0
                         && fract(abs(d0c) * 2.0) == 0.0
@@ -163,8 +171,10 @@ vec4 hal_raster_pixel(vec2 pix, float start, float count, float cull,
             }
         }
         bool inside = (ar > 0.0)
-            ? (e0 >= 0.0 && e1 >= 0.0 && e2 >= 0.0)
-            : (e0 <= 0.0 && e1 <= 0.0 && e2 <= 0.0);
+            ? (e0 >= -2.5e-7 * w0 && e1 >= -2.5e-7 * w1
+               && e2 >= -2.5e-7 * w2)
+            : (e0 <= 2.5e-7 * w0 && e1 <= 2.5e-7 * w1
+               && e2 <= 2.5e-7 * w2);
         if (!inside) { continue; }
         float inv_area = 1.0 / ar;
         float l0 = e0 * inv_area;
@@ -598,9 +608,18 @@ def replay_pixels(pxs, pys, sx, sy, iw, z, bw, src_final,
     e0 = (xc - xb) * (Y - yb) - (yc - yb) * (X - xb)
     e1 = (xa - xc) * (Y - yc) - (ya - yc) * (X - xc)
     e2 = (xb - xa) * (Y - ya) - (yb - ya) * (X - xa)
+    # the watertight window, bit-for-bit the kernel's own (raster.fill
+    # tells the story)
+    from ..core.raster import EDGE_WOBBLE as _EW
+    w0 = np.abs((xc - xb) * (Y - yb)) + np.abs((yc - yb) * (X - xb))
+    w1 = np.abs((xa - xc) * (Y - yc)) + np.abs((ya - yc) * (X - xc))
+    w2 = np.abs((xb - xa) * (Y - ya)) + np.abs((yb - ya) * (X - xa))
     pos = ar > 0.0
-    inside = np.where(pos, (e0 >= 0) & (e1 >= 0) & (e2 >= 0),
-                      (e0 <= 0) & (e1 <= 0) & (e2 <= 0))
+    inside = np.where(pos,
+                      (e0 >= _EW * -w0) & (e1 >= _EW * -w1)
+                      & (e2 >= _EW * -w2),
+                      (e0 <= _EW * w0) & (e1 <= _EW * w1)
+                      & (e2 <= _EW * w2))
     ok &= inside
     inv_area = f32(1.0) / np.where(ar == 0.0, f32(1.0), ar)
     l0 = e0 * inv_area
@@ -731,6 +750,7 @@ def raster_on_device(mesh, vp, width, height, cull='NONE', snap=0.0,
                       'hal_rtiles': t_tiles},
             images=images)
         t_run = _time.perf_counter() - t0
+        dd = dict(getattr(device, 'LAST_DISPATCH', None) or {})
     except Exception as exc:                                    # noqa: BLE001
         return None, f'raster dispatch failed: {type(exc).__name__}: {exc}'
     # src mapped exactly as the packer maps it, for the replay
@@ -744,6 +764,9 @@ def raster_on_device(mesh, vp, width, height, cull='NONE', snap=0.0,
             'timings': {'clip_ms': t_clip * 1000.0,
                         'pack_ms': t_pack * 1000.0,
                         'upload_ms': t_upload * 1000.0,
+                        'dispatch_ms': dd.get('dispatch_ms',
+                                              t_run * 1000.0),
+                        'read_ms': dd.get('read_ms', 0.0),
                         'dispatch_read_ms': t_run * 1000.0}}, None
 
 
@@ -834,9 +857,24 @@ def raster_into_gbuffer(mesh, vp, width, height, gbuf, cull='NONE',
             print(f'[Halcyon GPU] raster tie referral: {n_mark} of '
                   f'{covered} covered pixels replayed with the CPU '
                   f"fill's arithmetic")
+    import time as _time
+    t0 = _time.perf_counter()
     gbuffer_into(gbuf, out['ids'], out['aux'], out.get('lin'))
+    tm = dict(out.get('timings') or {})
+    tm['decode_ms'] = (_time.perf_counter() - t0) * 1000.0
+    if tm.get('read_ms'):
+        # the device gave the finer split; the aggregate would double-print
+        tm.pop('dispatch_read_ms', None)
+    LAST_RASTER.clear()
+    LAST_RASTER.update(tm)
     return True, None
 
 
 #: how many pixels the last driver raster referred to the CPU replay
 LAST_REFERRED = {'count': 0}
+
+#: the last driver raster's stage split in milliseconds (clip_ms, pack_ms,
+#: upload_ms, dispatch_read_ms, decode_ms) -- "218 ms" is a number, a split
+#: is a diagnosis. render.py prints it under the frame breakdown so a
+#: high-resolution F12 names which half of the road got slow
+LAST_RASTER = {}

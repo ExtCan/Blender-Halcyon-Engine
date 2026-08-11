@@ -35,6 +35,17 @@ ABUF_DEPTH_TOL_REL = np.float32(4e-6)
 ABUF_DEPTH_TOL_ABS = np.float32(1e-7)
 
 
+#: the coverage wobble window, in the units of the mechanism: float32
+#: rounding moves an edge function by a few ulps of its PRODUCT
+#: magnitudes, and the two triangles at a shared edge compute that edge
+#: with different expressions -- without the window both can exclude the
+#: same boundary pixel and the background shows through (the field's
+#: "faint wireframe on all objects" at high resolutions). One constant,
+#: four engines: loop fill, batched fill, the compute kernel, the replay.
+#: float32 ON PURPOSE -- a Python float would upcast the whole test.
+EDGE_WOBBLE = np.float32(2.5e-7)
+
+
 def abuf_depth_limit(opaque_z):
     """The keep limit for A-buffer fragments against the opaque depth."""
     return opaque_z + np.abs(opaque_z) * ABUF_DEPTH_TOL_REL \
@@ -152,10 +163,21 @@ def project(verts, mvp, width, height, snap=0.0, near_eps=1e-5):
     return clip, screen, invw, ndc[:, 2].astype(np.float32)
 
 
-def _clip_near(cp, cb, near_eps):
-    """Sutherland-Hodgman against z >= -w for one polygon.
+def _clip_poly(cp, cb, coeff, thresh):
+    """Sutherland-Hodgman against dot(clip, coeff) >= thresh, one polygon.
 
     cp: (K,4) clip positions, cb: (K,3) barycentric-over-original weights.
+    The near plane is coeff (0,0,1,1); the guard-band planes are
+    (±1,0,0,G) and (0,±1,0,G).
+
+    Every edge cut is computed in a CANONICAL direction -- from the
+    lexicographically smaller endpoint -- so the two triangles that share
+    an edge produce the bit-identical intersection point. They used to
+    walk the edge in opposite directions, and the ulp of disagreement in
+    clip space was AMPLIFIED by the perspective divide near w -> 0 into
+    multi-pixel cracks along every near-clipped shared edge: background
+    showing through the seams was the field's "faint wireframe on all
+    objects". A crack the projection can widen must not exist at all.
     """
     out_p = []
     out_b = []
@@ -163,10 +185,10 @@ def _clip_near(cp, cb, near_eps):
     for i in range(k):
         a_p, a_b = cp[i], cb[i]
         b_p, b_b = cp[(i + 1) % k], cb[(i + 1) % k]
-        fa = a_p[2] + a_p[3]
-        fb = b_p[2] + b_p[3]
-        ina = fa >= near_eps
-        inb = fb >= near_eps
+        fa = float(a_p @ coeff)
+        fb = float(b_p @ coeff)
+        ina = fa >= thresh
+        inb = fb >= thresh
         if ina:
             out_p.append(a_p)
             out_b.append(a_b)
@@ -174,10 +196,41 @@ def _clip_near(cp, cb, near_eps):
             denom = fa - fb
             if abs(denom) < 1e-12:
                 continue
-            t = fa / denom
-            out_p.append(a_p + (b_p - a_p) * t)
-            out_b.append(a_b + (b_b - a_b) * t)
+            if tuple(b_p) < tuple(a_p):
+                # canonical: interpolate from the smaller endpoint, so
+                # both triangles at this edge do the SAME arithmetic
+                t = fb / (fb - fa)
+                out_p.append(b_p + (a_p - b_p) * t)
+                out_b.append(b_b + (a_b - b_b) * t)
+            else:
+                t = fa / denom
+                out_p.append(a_p + (b_p - a_p) * t)
+                out_b.append(a_b + (b_b - a_b) * t)
     return out_p, out_b
+
+
+_NEAR_COEFF = np.array([0.0, 0.0, 1.0, 1.0], np.float32)
+
+#: the guard band, in NDC units: triangles are clipped so no vertex lands
+#: beyond GUARD screens from the viewport. Without it, a triangle that
+#: barely survives the near clip projects to coordinates in the hundreds
+#: of thousands of pixels, and the float32 edge functions lose so much
+#: precision to cancellation that interior pixels misclassify -- holes
+#: along every horizon-region edge, which the field photographed as "a
+#: faint wireframe on all objects". Every period rasteriser guard-band
+#: clipped for exactly this reason. The guard edges land 1.5+ screens
+#: outside the viewport, so visible coverage only ever CORRECTS.
+GUARD_BAND = np.float32(4.0)
+
+_GUARD_COEFFS = (np.array([-1.0, 0.0, 0.0, GUARD_BAND], np.float32),
+                 np.array([1.0, 0.0, 0.0, GUARD_BAND], np.float32),
+                 np.array([0.0, -1.0, 0.0, GUARD_BAND], np.float32),
+                 np.array([0.0, 1.0, 0.0, GUARD_BAND], np.float32))
+
+
+def _clip_near(cp, cb, near_eps):
+    """The near clip, as it always was: z >= -w plus the epsilon."""
+    return _clip_poly(cp, cb, _NEAR_COEFF, near_eps)
 
 
 IDENT_BARY = np.eye(3, dtype=np.float32)
@@ -291,6 +344,52 @@ def build_screen_tris(clip, tris, width, height, snap=0.0, near_eps=1e-5,
     S = parts_src[0] if len(parts_src) == 1 else np.concatenate(parts_src,
                                                                 axis=0)
 
+    # ---- the guard band: clip anything reaching past GUARD_BAND screens
+    # (see the constant above for why; the common all-on-screen mesh
+    # never enters this branch)
+    wP = P[:, :, 3]
+    # the four plane functions, homogeneous: f < 0 = outside that plane.
+    # A triangle whose three vertices are outside the SAME plane is
+    # outside it everywhere (f is linear), so its projection can never
+    # reach the screen: CULLED, not clipped. The field's close-up put
+    # thousands of beside-the-camera triangles into the python clip loop
+    # (clip 128 -> 1392 ms); nearly all of them die here in one
+    # vectorised test instead
+    f_xp = GUARD_BAND * wP - P[:, :, 0]
+    f_xn = GUARD_BAND * wP + P[:, :, 0]
+    f_yp = GUARD_BAND * wP - P[:, :, 1]
+    f_yn = GUARD_BAND * wP + P[:, :, 1]
+    dead = ((f_xp < 0).all(axis=1) | (f_xn < 0).all(axis=1)
+            | (f_yp < 0).all(axis=1) | (f_yn < 0).all(axis=1))
+    touches = ((f_xp < 0) | (f_xn < 0) | (f_yp < 0)
+               | (f_yn < 0)).any(axis=1)
+    need = touches & ~dead
+    if dead.any() and not need.any():
+        keep = ~dead
+        P, B, S = P[keep], B[keep], S[keep]
+    if need.any():
+        keep = ~need & ~dead
+        g_p = [P[keep]]
+        g_b = [B[keep]]
+        g_s = [S[keep]]
+        for i in np.nonzero(need)[0]:
+            poly_p, poly_b = list(P[i]), list(B[i])
+            for coeff in _GUARD_COEFFS:
+                poly_p, poly_b = _clip_poly(poly_p, poly_b, coeff, 0.0)
+                if len(poly_p) < 3:
+                    break
+            if len(poly_p) < 3:
+                continue
+            for j in range(1, len(poly_p) - 1):
+                g_p.append(np.stack([poly_p[0], poly_p[j],
+                                     poly_p[j + 1]])[None])
+                g_b.append(np.stack([poly_b[0], poly_b[j],
+                                     poly_b[j + 1]])[None])
+                g_s.append(S[i:i + 1])
+        P = np.concatenate(g_p, axis=0).astype(np.float32)
+        B = np.concatenate(g_b, axis=0).astype(np.float32)
+        S = np.concatenate(g_s, axis=0).astype(np.int32)
+
     w = P[:, :, 3]
     w = np.where(np.abs(w) < near_eps, near_eps, w)
     iw = 1.0 / w                    # float32 in, float32 out -- no copy
@@ -377,10 +476,23 @@ def fill(gbuf, sx, sy, iw, z, bw, src, cull='NONE', frags=None, flat_depth=None,
         e0 = (xc - xb) * (Y - yb) - (yc - yb) * (X - xb)
         e1 = (xa - xc) * (Y - yc) - (ya - yc) * (X - xc)
         e2 = (xb - xa) * (Y - ya) - (yb - ya) * (X - xa)
+        # WATERTIGHT coverage: the two triangles at a shared edge compute
+        # that edge with DIFFERENT float expressions, so both can land a
+        # few ulps below zero and both exclude the pixel -- background
+        # bleeding through every dense-mesh edge was the field's "faint
+        # wireframe on all objects". Coverage therefore widens by the
+        # wobble window the referral already established (2.5e-7 of the
+        # product magnitudes -- ulps of the arithmetic, R104's law);
+        # overlapped edge pixels resolve by depth and the named tie rule
+        w0 = np.abs((xc - xb) * (Y - yb)) + np.abs((yc - yb) * (X - xb))
+        w1 = np.abs((xa - xc) * (Y - yc)) + np.abs((ya - yc) * (X - xc))
+        w2 = np.abs((xb - xa) * (Y - ya)) + np.abs((yb - ya) * (X - xa))
         if ar > 0:
-            inside = (e0 >= 0) & (e1 >= 0) & (e2 >= 0)
+            inside = (e0 >= EDGE_WOBBLE * -w0) & (e1 >= EDGE_WOBBLE * -w1) \
+                & (e2 >= EDGE_WOBBLE * -w2)
         else:
-            inside = (e0 <= 0) & (e1 <= 0) & (e2 <= 0)
+            inside = (e0 <= EDGE_WOBBLE * w0) & (e1 <= EDGE_WOBBLE * w1) \
+                & (e2 <= EDGE_WOBBLE * w2)
         if not inside.any():
             continue
 
@@ -710,9 +822,18 @@ def fill_batched(gbuf, sx, sy, iw, z, bw, src, cull='NONE', frags=None,
             e0 = (xc - xb) * (Y - yb) - (yc - yb) * (X - xb)
             e1 = (xa - xc) * (Y - yc) - (ya - yc) * (X - xc)
             e2 = (xb - xa) * (Y - ya) - (yb - ya) * (X - xa)
+            # the watertight window, exactly as the loop fill and the
+            # kernel compute it (see fill() for the story)
+            w0 = np.abs((xc - xb) * (Y - yb)) + np.abs((yc - yb) * (X - xb))
+            w1 = np.abs((xa - xc) * (Y - yc)) + np.abs((ya - yc) * (X - xc))
+            w2 = np.abs((xb - xa) * (Y - ya)) + np.abs((yb - ya) * (X - xa))
             pos = (area[t] > 0)[:, None, None]
-            inside = np.where(pos, (e0 >= 0) & (e1 >= 0) & (e2 >= 0),
-                              (e0 <= 0) & (e1 <= 0) & (e2 <= 0))
+            inside = np.where(
+                pos,
+                (e0 >= EDGE_WOBBLE * -w0) & (e1 >= EDGE_WOBBLE * -w1)
+                & (e2 >= EDGE_WOBBLE * -w2),
+                (e0 <= EDGE_WOBBLE * w0) & (e1 <= EDGE_WOBBLE * w1)
+                & (e2 <= EDGE_WOBBLE * w2))
             inside &= (ox < bw_px[t][:, None, None]) & (oy < bh_px[t][:, None, None])
             if not inside.any():
                 continue

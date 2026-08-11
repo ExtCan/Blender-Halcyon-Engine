@@ -113,7 +113,12 @@ uniform float hal_btris_side;
 // fetches in the compute wrappers keep texelFetch, because theirs is
 // the layout that actually misread on hardware (95 caught flips);
 // the tree keeps the filtered form the fast path has always measured
-// 0 px against the CPU with.
+// 0 px against the CPU with. (1.30.6 note: the G-buffer's filtered ID
+// reads WERE misreading -- the faint-wireframe defect -- and went
+// texelFetch with the rest of the deferred pass. The tree stays as
+// measured: the conversion bought zero correctness there and cost the
+// field driver real milliseconds; if a ray row ever disagrees at a
+// bigger tree side, this comment is where to look first.)
 vec4 hal_bvh_texel(float index)
 {
     float x = mod(index, hal_bvh_side);

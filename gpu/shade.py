@@ -2191,7 +2191,7 @@ def shade_fragments_frame(job, gbuf, tri, bary, px, py, rank):
             # fragments spawn the same tree the opaque frame does
             from . import rtrace as RT
 
-            def draw_secondary(plist, sec_ids, level,
+            def draw_secondary(plist, sec_ids, level, hit_region=None,
                                _region=region, _x0=x0, _y0=y0):
                 tu = _time.perf_counter()
                 try:
@@ -2441,7 +2441,7 @@ def simulate_fragments(job, gbuf, tri, bary, px, py, rank):
         if rplan is not None:
             from .rtrace import simulate_intersect
 
-            def draw_secondary(plist, sec_ids, _level):
+            def draw_secondary(plist, sec_ids, _level, hit_region=None):
                 plist_progs = sec_progs['secondary'] \
                     if plist is rplan['secondary'] \
                     else sec_progs['secondary_mid']
@@ -2786,6 +2786,19 @@ def _fog_readback(job, gbuf, passes, out, hit):
     return out
 
 
+#: the reflect stage's sub-split, reset per frame by the callers that
+#: publish LAST_TIMINGS: where the sweep seconds actually go -- the GPU
+#: trace, the secondary draws+reads, the CPU sky along miss rays -- plus
+#: how many levels ran, how many were all-miss skips, and the ray count
+_SWEEP_STATS = {'trace_ms': 0.0, 'draw_ms': 0.0, 'env_ms': 0.0,
+                'levels': 0, 'skips': 0, 'rays': 0}
+
+
+def _reset_sweep_stats():
+    _SWEEP_STATS.update(trace_ms=0.0, draw_ms=0.0, env_ms=0.0,
+                        levels=0, skips=0, rays=0)
+
+
 def _run_sweeps(job, gbuf, rplan, out, draw_secondary, intersect,
                 env=None):
     """The ray recursion both backends share: `_add_raytraced`'s tree.
@@ -2816,6 +2829,7 @@ def _run_sweeps(job, gbuf, rplan, out, draw_secondary, intersect,
     def lane_add(img, hitm, dirs, py, px):
         """Per-lane traced value: the hit's colour, or the sky along
         the ray -- exactly what `trace()` returns per ray."""
+        import time as _time
         from ..core.render import world_color
         add = np.zeros((py.size, 3), np.float32)
         hitb = np.asarray(hitm, bool)
@@ -2823,8 +2837,10 @@ def _run_sweeps(job, gbuf, rplan, out, draw_secondary, intersect,
             add[hitb] = img[py[hitb], px[hitb], :3]
         miss = ~hitb
         if miss.any():
+            t0 = _time.perf_counter()
             wc = world_color(job.scene, job.settings, dirs[miss],
                              job.textures, int(miss.sum()), eye=job.eye)
+            _SWEEP_STATS['env_ms'] += (_time.perf_counter() - t0) * 1000.0
             add[miss] = np.asarray(wc, np.float32)[:, :3]
         return add
 
@@ -2847,11 +2863,30 @@ def _run_sweeps(job, gbuf, rplan, out, draw_secondary, intersect,
         return acc / np.float32(bsamples)
 
     def shade_level(level, py, px, org, dirs):
+        import time as _time
+        t0 = _time.perf_counter()
         tid, _t, u, v = intersect(org, dirs)
+        _SWEEP_STATS['trace_ms'] += (_time.perf_counter() - t0) * 1000.0
+        _SWEEP_STATS['levels'] += 1
+        _SWEEP_STATS['rays'] += int(py.size)
         sec_ids, hitm = _secondary_ids(h, w, py, px, tid, u, v)
         plist = rplan['secondary'] if level >= depth \
             else rplan['secondary_mid']
-        img = draw_secondary(plist, sec_ids, level)
+        if not hitm.any():
+            # every ray of this level missed: no secondary pass owns a
+            # pixel, so the level image is exactly zero -- skip the
+            # draws (a depth-8 sweep used to pay full-screen passes and
+            # an 800 MB readback per level to paint nothing)
+            _SWEEP_STATS['skips'] += 1
+            img = np.zeros((h, w, 3), np.float32)
+        else:
+            hy, hx = py[hitm], px[hitm]
+            hreg = (int(hx.min()), int(hy.min()),
+                    int(hx.max() - hx.min() + 1),
+                    int(hy.max() - hy.min() + 1))
+            t0 = _time.perf_counter()
+            img = draw_secondary(plist, sec_ids, level, hit_region=hreg)
+            _SWEEP_STATS['draw_ms'] += (_time.perf_counter() - t0) * 1000.0
         # the CONTRACT, enforced where both backends meet: a level image
         # is (H, W, 3). The front-end adapter returned 3 channels and the
         # driver's read-back returned 4 -- readable by either composite,
@@ -3154,7 +3189,7 @@ def simulate(job, gbuf, passes=None, atlases=None):
                                      wrap='EXTEND')
             got = prog.run(uni, {}, n)[0]['Color']
             keep = got[:, 3] > 0.5
-            got_out[keep] = got[keep, :3]
+            np.copyto(got_out, got[:, :3], where=keep[:, None])
             got_hit |= keep
             got_stip |= got[:, 3] > 0.75
         return got_out, got_hit, got_stip, None
@@ -3177,7 +3212,10 @@ def simulate(job, gbuf, passes=None, atlases=None):
     if rplan is not None:
         from .rtrace import simulate_intersect
 
-        def draw_secondary(plist, sec_ids, _level):
+        def draw_secondary(plist, sec_ids, _level, hit_region=None):
+            # the front-end shades the full frame; outside the hit box
+            # every pass keeps zero, which is what the region read
+            # returns on the driver -- the consumed pixels agree
             sec_out, _sec_hit, _sec_stip, why = run_passes(
                 plist, Texture(sec_ids, colorspace='Non-Color',
                                filt='NEAREST', wrap='EXTEND'))
@@ -3492,7 +3530,11 @@ def shade_frame(job, gbuf):
                     return None, f"drawing '{name}' failed: {exc}"
                 t_draw += _time.perf_counter() - t1
                 keep = frame[:, :, 3] > 0.5
-                out[keep] = frame[keep, :3]
+                # masked copy instead of boolean fancy indexing: the same
+                # pixels move, but no index lists are materialised -- at a
+                # supersampled frame this was most of the composite bucket
+                # (measured 3.7x at 7200^2, byte-identical)
+                np.copyto(out, frame[:, :, :3], where=keep[:, :, None])
                 hit |= keep
                 if stip:
                     gbuf.gpu_alpha |= frame[:, :, 3] > 0.75
@@ -3517,11 +3559,12 @@ def shade_frame(job, gbuf):
     # in _add_raytraced's order
     t_reflect = 0.0
     _RAY_BUILD[0] = 0.0
+    _reset_sweep_stats()
     if rplan is not None:
         t1 = _time.perf_counter()
         from . import rtrace as RT
 
-        def draw_secondary(plist, sec_ids, level):
+        def draw_secondary(plist, sec_ids, level, hit_region=None):
             try:
                 tex_sec = device.upload(sec_ids)
             except Exception as exc:                            # noqa: BLE001
@@ -3534,12 +3577,27 @@ def shade_frame(job, gbuf):
             target2 = device.Target(w, h)
             try:
                 for i2, (name, shader, bind, extra) in enumerate(sec_draw):
+                    # scissor to the hit box: a secondary pass can only
+                    # own hit pixels, and past level 1 the hits huddle in
+                    # a corner of a frame the pass used to cover whole
                     device.draw_fullscreen(shader, {**uni, **extra}
                                            if extra else uni, bind,
                                            target2, read=False,
                                            blend='ALPHA_PREMULT',
-                                           clear=(i2 == 0))
-                sec_img = device.read_target(target2)
+                                           clear=(i2 == 0),
+                                           region=hit_region)
+                if hit_region is not None and \
+                        hit_region[2] * hit_region[3] < 0.5 * w * h:
+                    # sparse hits: read the box, not the frame -- the
+                    # composite only ever looks at hit pixels, and the
+                    # rest of a cleared target is zero either way
+                    rx, ry, rw2, rh2 = hit_region
+                    sec_r = device.read_target(target2,
+                                               region=hit_region)
+                    sec_img = np.zeros((h, w, 4), np.float32)
+                    sec_img[ry:ry + rh2, rx:rx + rw2] = sec_r
+                else:
+                    sec_img = device.read_target(target2)
             except _SweepFail:
                 raise
             except Exception as exc:                            # noqa: BLE001
@@ -3579,6 +3637,14 @@ def shade_frame(job, gbuf):
         ray_build_ms=_RAY_BUILD[0],
         composite_ms=max(total - t_upload - t_draw - t_reflect, 0.0)
         * 1000.0,
-        passes=len(passes))
+        passes=len(passes),
+        # the reflect sub-split: where those milliseconds went and how
+        # much of the recursion was all-miss levels skipped outright
+        reflect_trace_ms=_SWEEP_STATS['trace_ms'],
+        reflect_draw_ms=_SWEEP_STATS['draw_ms'],
+        reflect_env_ms=_SWEEP_STATS['env_ms'],
+        reflect_levels=_SWEEP_STATS['levels'],
+        reflect_skips=_SWEEP_STATS['skips'],
+        reflect_rays=_SWEEP_STATS['rays'])
     out = _fog_readback(job, gbuf, passes, out, hit)
     return out, hit

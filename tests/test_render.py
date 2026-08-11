@@ -4295,29 +4295,78 @@ def test_material_templates():
     from ..core.shading import MODEL_ITEMS
     from ..nodes.shader_nodes import HALCYON_ShaderNode as HS
 
+    from ..nodes.pattern_nodes import SPECS
+
     models = {m[0] for m in MODEL_ITEMS}
     sockets = {n for _k, n, _d in HS.SOCKETS}
+    # what each pattern node REALLY has, from the spec table the classes
+    # are generated from -- a recipe naming a socket that is not here is
+    # the silent no-op this test exists to catch
+    ptable = {f'HALCYON_{s[0]}Node': ({n for _k, n, _d in s[4]},
+                                      {n for _k, n in s[6]},
+                                      set(s[5]))
+              for s in SPECS}
     problems = []
     for key, spec in tmpl.TEMPLATES.items():
-        for field in ('label', 'note', 'model'):
+        for field in ('label', 'note', 'model', 'category'):
             if field not in spec:
                 problems.append(f'{key}: missing {field}')
+        if spec.get('category') not in ('SIMPLE', 'ADVANCED'):
+            problems.append(f"{key}: bad category {spec.get('category')}")
         if spec.get('model') not in models:
             problems.append(f"{key}: unknown model {spec.get('model')}")
         for sock in spec.get('inputs', {}):
             if sock not in sockets:
                 problems.append(f'{key}: unknown socket {sock}')
-        for idname, _p, _i, target in spec.get('textures', []):
+        for entry in spec.get('textures', []):
+            if not isinstance(entry, dict):
+                idname, props, inputs, target = entry
+                entry = {'node': idname, 'props': props, 'inputs': inputs,
+                         'target': target}
+            idname = entry['node']
             if idname not in DISPATCH:
                 problems.append(f'{key}: {idname} has no evaluator')
-            if target not in sockets:
-                problems.append(f'{key}: unknown target {target}')
+            if entry['target'] not in sockets:
+                problems.append(f"{key}: unknown target {entry['target']}")
+            if idname in ptable:
+                pin, pout, pprops = ptable[idname]
+                for sock in entry.get('inputs', {}):
+                    if sock not in pin:
+                        problems.append(f'{key}: {idname} has no input '
+                                        f'{sock!r}')
+                for prop in entry.get('props', {}):
+                    if prop not in pprops:
+                        problems.append(f'{key}: {idname} has no prop '
+                                        f'{prop!r}')
+                want = entry.get('output')
+                if want is not None and want not in pout:
+                    problems.append(f'{key}: {idname} has no output '
+                                    f'{want!r}')
+            if entry.get('bump') is not None and \
+                    not isinstance(entry['bump'], float):
+                problems.append(f'{key}: bump strength must be a float')
     check(f'all {len(tmpl.TEMPLATES)} templates are valid', not problems,
           '; '.join(problems[:3]))
     labels = [v['label'] for v in tmpl.TEMPLATES.values()]
     check('template labels are unique', len(labels) == len(set(labels)))
     check('the menu lists every template',
           len(tmpl.template_items()) == len(tmpl.TEMPLATES))
+    # the shelf the field asked for: 15 more, in two named groups,
+    # Water and Lava among them
+    check('the shelf holds 28 templates', len(tmpl.TEMPLATES) == 28,
+          str(len(tmpl.TEMPLATES)))
+    simple = tmpl.category_keys('SIMPLE')
+    advanced = tmpl.category_keys('ADVANCED')
+    check('Simple and Advanced partition the shelf',
+          not (set(simple) & set(advanced))
+          and set(simple) | set(advanced) == set(tmpl.TEMPLATES))
+    check('Water and Lava are on it, with textures, as Advanced',
+          {'WATER', 'LAVA'} <= set(advanced)
+          and tmpl.TEMPLATES['WATER'].get('textures')
+          and tmpl.TEMPLATES['LAVA'].get('textures'))
+    check('the grouped menu class is registered alongside the operator',
+          any(getattr(c, 'bl_idname', '') == 'HALCYON_MT_material_templates'
+              for c in tmpl.CLASSES))
 
 
 def test_infinite_ground():
@@ -6634,7 +6683,7 @@ def test_ray_depth_beyond_one_shades_on_the_gpu():
     from ..gpu.rtrace import simulate_intersect
 
     def fake_draw(channels):
-        def d(_plist, sec_ids, _level):
+        def d(_plist, sec_ids, _level, hit_region=None):
             img4 = np.zeros((h, w, channels), np.float32)
             img4[:, :, 0] = (sec_ids[:, :, 3] >= 0).astype(np.float32)
             img4[:, :, 1] = 0.25
@@ -12192,8 +12241,13 @@ def test_the_compute_rasteriser_is_fill():
                          cull=cull)
         sx, sy, iw, z, bw, src, tmap = CRA.raster_inputs_for(sc_mesh, vp,
                                                              w, h)
+        # depth_bits must MATCH rasterize's default: the watertight window
+        # creates overlap pixels on shared edges whose cross-triangle z
+        # differs at the ulp, and quantisation must collapse it on BOTH
+        # sides or the harness manufactures a disagreement production
+        # never has (both production roads share st.depth_precision)
         tri, bary, zndc, front, _b2, _lin, _mk = CRA.simulate_raster(
-            sx, sy, iw, z, bw, src, tmap, w, h, cull=cull)
+            sx, sy, iw, z, bw, src, tmap, w, h, cull=cull, depth_bits=24)
         d = int((tri != g.tri).sum())
         check(f'{label}: zero differing pixels', d == 0,
               f'{d} of {w * h} differ')
@@ -16827,6 +16881,317 @@ def test_every_setting_does_what_it_says():
     ghosts = sorted((homes - {'width', 'height'}) - fields - rows_covered)
     check('no proof references a setting that no longer exists',
           not ghosts, ', '.join(ghosts))
+
+
+def test_every_material_template_renders():
+    """All 28 template recipes render through the engine and move the frame.
+
+    The validity test above proves the names; this proves the RECIPES --
+    each spec is translated into the same master-graph form the engine
+    exports from Blender (full socket list, texture nodes, the Bump chain
+    for the ones that carry one) and rendered over the demo scene. A
+    template that renders the untouched frame is a decorative dictionary
+    entry, which is what the vacuity doctrine exists to prevent. The two
+    the field named get their own promises held: Water is see-through and
+    refracts under rays (the proven Water anatomy), Lava glows.
+    """
+    from . import fakebpy
+    bpy_stub = fakebpy.install()
+    for name in ('UIList', 'AddonPreferences', 'Collection'):
+        if not hasattr(bpy_stub.types, name):
+            setattr(bpy_stub.types, name,
+                    type(name, (bpy_stub.types.Panel,), {}))
+    import importlib
+    tmpl = importlib.import_module('halcyon.templates')
+    from ..nodes.pattern_nodes import SPECS
+    from ..nodes.shader_nodes import HALCYON_ShaderNode as HS
+
+    TYPE = {'NodeSocketFloat': 'VALUE', 'NodeSocketColor': 'RGBA',
+            'NodeSocketVector': 'VECTOR'}
+    FILL = {'VALUE': 0.0, 'RGBA': [0.0, 0.0, 0.0, 1.0],
+            'VECTOR': [0.0, 0.0, 0.0]}
+    pspec = {f'HALCYON_{s[0]}Node': s for s in SPECS}
+
+    def sockval(kind, d):
+        t = TYPE[kind]
+        if d is None:
+            return t, FILL[t]
+        return t, (list(d) if hasattr(d, '__len__') else float(d))
+
+    def graph_for(spec):
+        nodes = {}
+        links = {}                    # master socket name -> ['nid', out_idx]
+        for i, entry in enumerate(spec.get('textures', [])):
+            if not isinstance(entry, dict):
+                idname, props, inputs, target = entry
+                entry = {'node': idname, 'props': props, 'inputs': inputs,
+                         'target': target}
+            nid = f't{i}'
+            socks, sprops, souts = (pspec[entry['node']][4],
+                                    pspec[entry['node']][5],
+                                    pspec[entry['node']][6])
+            tins = []
+            for kind, sname, dflt in socks:
+                t, v = sockval(kind,
+                               entry.get('inputs', {}).get(sname, dflt))
+                tins.append(_sk(sname, t, v))
+            touts = [{'name': n, 'type': TYPE[k]} for k, n in souts]
+            nodes[nid] = _wnode(nid, entry['node'],
+                                dict(entry.get('props', {})), tins, touts)
+            onames = [n for _k, n in souts]
+            oi = (onames.index(entry['output'])
+                  if entry.get('output') in onames else 0)
+            src = [nid, oi]
+            if entry.get('bump') is not None:
+                bid = f'b{i}'
+                nodes[bid] = _wnode(
+                    bid, 'ShaderNodeBump', {},
+                    [_sk('Strength', 'VALUE', float(entry['bump'])),
+                     _sk('Distance', 'VALUE', 1.0),
+                     _sk('Height', 'VALUE', 0.0, src),
+                     _sk('Normal', 'VECTOR', [0, 0, 0])],
+                    [{'name': 'Normal', 'type': 'VECTOR'}])
+                src = [bid, 0]
+            links[entry['target']] = src
+        ins = []
+        for kind, sname, dflt in HS.SOCKETS:
+            t, v = sockval(kind, spec.get('inputs', {}).get(sname, dflt))
+            ins.append(_sk(sname, t, v, links.get(sname)))
+        nodes['h'] = _wnode('h', 'HALCYON_ShaderNode',
+                            {'model': spec['model'], 'toon_steps': 2}, ins,
+                            [{'name': 'Surface', 'type': 'SHADER'}])
+        nodes['out'] = _wnode('out', 'ShaderNodeOutputMaterial', {},
+                              [_sk('Surface', 'SHADER', None, ['h', 0]),
+                               _sk('Displacement', 'VECTOR', [0, 0, 0])], [])
+        return {'output': 'out', 'nodes': nodes}
+
+    def shot(g=None, **ov):
+        st = base_settings(96, 72, **ov)
+        sc = demo_scene(st, with_texture=False)
+        if g is not None:
+            for m in sc.materials:
+                m.graph = g
+        return R.render(sc, st)
+
+    base = shot()
+    for key in sorted(tmpl.TEMPLATES):
+        spec = tmpl.TEMPLATES[key]
+        ov = {'raytrace': True, 'ray_depth': 2} if key == 'WATER' else {}
+        img = shot(graph_for(spec), **ov)
+        check(f"template '{spec['label']}' renders and moves the frame",
+              img.shape == base.shape and not np.array_equal(img, base))
+        if key in ('LAVA', 'NEON', 'DEAD_CHANNEL'):
+            check(f"...and '{spec['label']}' glows",
+                  float(img[..., :3].max()) > 0.5,
+                  f'max {float(img[..., :3].max()):.3f}')
+        if key == 'WATER':
+            check('...and the water is see-through under rays',
+                  float(img[..., 3].min()) < 0.99,
+                  f'min alpha {float(img[..., 3].min()):.3f}')
+
+
+def test_the_high_resolution_round():
+    """The field's high-res reports get their instruments and their exit.
+
+    "A faint but visible wireframe on all objects, regardless of settings"
+    reproduced as the shadow map's texels showing at high output
+    resolution: a 512 map's contact shadows turn into blocky fringes that
+    hug every silhouette, and "regardless of settings" because lights
+    saved before 1.30.1 carry per-light 512/0.02 explicitly, overriding
+    the render slider. Proven here: the raster is clean on a shadeless
+    frame, shadows-off removes the fringe, a 2048 map resolves it. This
+    test holds the three shipped pieces: the coarseness note that names
+    the trap, the adopt operator that frees old scenes, and the raster
+    split instrument for the "dies at extreme resolutions" half.
+    """
+    import contextlib
+    import io
+
+    # (a) the coarseness note fires when texels dwarf output pixels...
+    def console_of(mapsize, per_light=0):
+        st = base_settings(320, 240)
+        st.shadow_map_size = mapsize
+        sc = demo_scene(st, with_texture=False)
+        for light in sc.lights:
+            light.shadow_map_size = per_light
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            R.render(sc, st)
+        return buf.getvalue()
+
+    coarse = console_of(32)
+    check('a coarse shadow map is named in the console',
+          'px/texel' in coarse and 'blocky' in coarse,
+          coarse[-160:].replace('\n', ' '))
+    check('...and the note names the render-settings road',
+          'Shadow Map Size' in coarse)
+    fine = console_of(2048)
+    check('a fine map at the same size stays silent',
+          'px/texel' not in fine)
+    overridden = console_of(2048, per_light=32)
+    check('a per-light override is named as the thing to raise',
+          'px/texel' in overridden and 'per-light size set' in overridden
+          and 'overrides the render setting' in overridden,
+          overridden[-160:].replace('\n', ' '))
+
+    # (b) the adopt operator points lights back at the render settings
+    import types as _types
+
+    from . import fakebpy
+    bpy_stub = fakebpy.install()
+    bpy_stub.types.UIList = type('UIList', (bpy_stub.types.Panel,), {})
+    bpy_stub.types.AddonPreferences = type(
+        'AddonPreferences', (bpy_stub.types.Panel,), {})
+    import importlib
+    UI = importlib.import_module('halcyon.ui')
+
+    def fake_light(size, bias):
+        return _types.SimpleNamespace(
+            type='LIGHT',
+            data=_types.SimpleNamespace(halcyon=_types.SimpleNamespace(
+                shadow_map_size=size, shadow_bias=bias)))
+
+    lights = [fake_light(512, 0.02), fake_light(0, 0.0),
+              fake_light(1024, 0.1)]
+    ctx = _types.SimpleNamespace(
+        scene=_types.SimpleNamespace(objects=lights), light=None)
+    op = UI.HALCYON_OT_adopt_shadow_settings.__new__(
+        UI.HALCYON_OT_adopt_shadow_settings)
+    op.scope = 'SCENE'
+    reports = []
+    op.report = lambda kind, msg: reports.append(msg)
+    result = op.execute(ctx)
+    check('the adopt operator clears every per-light override',
+          result == {'FINISHED'}
+          and all(l.data.halcyon.shadow_map_size == 0
+                  and l.data.halcyon.shadow_bias == 0.0 for l in lights))
+    check('...and reports how many lights it freed',
+          reports and reports[0].startswith('2 light'))
+    check('...and is registered', any(
+        getattr(c, 'bl_idname', '') == 'halcyon.adopt_shadow_settings'
+        for c in UI.CLASSES))
+
+    # (c) the raster split instrument exists end to end: the craster
+    # records it, render prints it, and the self test carries the
+    # high-resolution section that turns "dies at 4K" into a named stage
+    import inspect
+
+    from ..gpu import craster as CRA
+    check('craster keeps the last raster split', hasattr(CRA, 'LAST_RASTER'))
+    rsrc = inspect.getsource(R)
+    check('a final render prints the split', 'raster split' in rsrc)
+    import halcyon.selftest as SELF
+    ssrc = inspect.getsource(SELF)
+    check('the self test benchmarks the raster at high resolutions',
+          'HIGH-RESOLUTION RASTER' in ssrc and '3840' in ssrc)
+
+
+def test_the_wireframe_names_itself():
+    """The overlay can never again be mistaken for a rendering bug.
+
+    The field spent two rounds hunting "a faint but visible wireframe on
+    all objects, regardless of settings" -- and the second field picture
+    showed mesh triangulation lines, which only the Wireframe Overlay
+    draws. The header printed 'wire=ALL' on EVERY render (it echoed the
+    mode, not the state), so the console never said whether the overlay
+    was actually on. Now the header says wire=OFF unless it is engaged,
+    and the overlay prints how many pixels it inked and where the
+    checkbox lives every time it draws on a final render.
+    """
+    import contextlib
+    import io
+
+    # engine header: wire=OFF when the overlay is off, the mode when on
+    from . import fakeblender as FB
+    FB.install()
+    from .. import engine as ENG
+    from .. import properties as props
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        FB.run_render(props, ENG)
+    off = buf.getvalue()
+    check("the header says wire=OFF when the overlay is off",
+          'wire=OFF' in off and 'wire=ALL' not in off)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        FB.run_render(props, ENG, render_wire=True)
+    on = buf.getvalue()
+    check('...and names the mode when it is on', 'wire=ALL' in on)
+    check('...and the overlay reports what it inked, and where the '
+          'checkbox lives',
+          'wireframe overlay: inked' in on
+          and 'Wireframe Overlay checkbox' in on, on[-200:].replace('\n', ' '))
+
+    # core render: the ink note prints there too, and only when drawing
+    st = base_settings(96, 72, render_wire=True)
+    sc = demo_scene(st, with_texture=False)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        R.render(sc, st)
+    check('the core render prints the ink note when the overlay draws',
+          'wireframe overlay: inked' in buf.getvalue())
+    st2 = base_settings(96, 72)
+    sc2 = demo_scene(st2, with_texture=False)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        R.render(sc2, st2)
+    check('...and stays silent when it does not',
+          'wireframe overlay' not in buf.getvalue())
+
+    # the perf instruments behind the 44-second shade bucket: the shade
+    # split print, the device dispatch/read subsplit, and the readback
+    # contiguity copy are all in place
+    import inspect
+
+    from ..gpu import device as DEV
+    rsrc = inspect.getsource(R)
+    check('a GPU-shaded final render prints the shade split',
+          'shade split' in rsrc and 'material' in rsrc)
+    check('the device keeps the dispatch/read subsplit',
+          hasattr(DEV, 'LAST_DISPATCH'))
+    dsrc = inspect.getsource(DEV)
+    check('readbacks are copied contiguous ONCE at the boundary',
+          'ascontiguousarray'
+          in dsrc.split('_dispatch_compute_impl', 1)[1])
+
+
+def test_the_preset_menu_never_floods_the_console():
+    """The preset enum names a real default, so RNA has nothing to warn about.
+
+    The field's console flooded with "current value '0' matches no enum in
+    'HalcyonSettings', '', 'preset'" on every redraw: the enum was a dynamic
+    callback whose items BEGIN with a category header ('', 'General', ''),
+    and a dynamic enum's unset value is index 0 -- the header's empty
+    identifier. The cure is a static list with an explicit default; this
+    holds all three parts of it in place.
+    """
+    from . import fakebpy
+    bpy_stub = fakebpy.install()
+    for name in ('UIList', 'AddonPreferences', 'Collection'):
+        if not hasattr(bpy_stub.types, name):
+            setattr(bpy_stub.types, name,
+                    type(name, (bpy_stub.types.Panel,), {}))
+    import importlib
+    P = importlib.import_module('halcyon.properties')
+
+    prop = P.HalcyonSettings.__annotations__['preset']
+    items = getattr(prop, 'items', None)
+    check('the preset enum is a static list, not a callback',
+          items is not None and not callable(items)
+          and len(items) > 70, str(type(items)))
+    if not items or callable(items):
+        return
+    ids = [i[0] for i in items]
+    check('its first entry is still a category header (the trap the '
+          'default exists for)', ids[0] == '')
+    check('and the declared default is a real preset',
+          getattr(prop, 'default', None) == 'DEFAULT' and 'DEFAULT' in ids)
+    check('every header is empty-id and every real id is a preset',
+          all((not i[0]) or (i[0] in __import__(
+              'halcyon.presets.library', fromlist=['PRESETS']).PRESETS)
+              for i in items))
 
 
 def main():

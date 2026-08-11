@@ -109,9 +109,13 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                      warnings):
 
         from .version import version_string
+        # wire= names the overlay's STATE, not just the mode: this header
+        # used to print wire=ALL on every render, engaged or not, while
+        # the field hunted a faint wireframe the overlay itself was drawing
+        wire = settings.wire_mode if settings.render_wire else 'OFF'
         print(f"[Halcyon] {version_string()} rendering "
               f"{tw}x{th}  pass={settings.debug_pass}"
-              f"  wire={settings.wire_mode}")
+              f"  wire={wire}")
         self.update_stats("Halcyon", "Exporting scene")
         ST.reset()
         ST.enable(bool(settings.show_stats))

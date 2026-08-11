@@ -414,6 +414,9 @@ class HALCYON_PT_shadows(HalcyonPanel, Panel):
         col.prop(hs, 'shadow_bias')
         col.prop(hs, 'shadow_softness')
         col.prop(hs, 'shadow_samples')
+        col.operator('halcyon.adopt_shadow_settings',
+                     text="All Lights Use These Settings",
+                     icon='FILE_REFRESH').scope = 'SCENE'
 
 
 class HALCYON_PT_ao(HalcyonPanel, Panel):
@@ -1115,6 +1118,47 @@ class HALCYON_UL_materials(bpy.types.UIList):
             layout.label(text="", icon_value=icon)
 
 
+class HALCYON_OT_adopt_shadow_settings(Operator):
+    """Point lights back at the render settings' shadow quality.
+
+    A light whose own Map Size or Bias is set overrides the render
+    sliders -- and every light saved before 1.30.1 carries the old
+    per-light defaults (512 / 0.02) explicitly, which is why raising the
+    render setting's Shadow Map Size changed nothing in older scenes.
+    This clears the per-light values to 0 = inherit.
+    """
+
+    bl_idname = 'halcyon.adopt_shadow_settings'
+    bl_label = "Use Render Shadow Settings"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    scope: EnumProperty(name="Scope", items=(
+        ('ACTIVE', "Active Light", ""),
+        ('SCENE', "Every Light in the Scene", "")), default='SCENE')
+
+    def execute(self, context):
+        if self.scope == 'ACTIVE':
+            lights = [context.light] if getattr(context, 'light', None) \
+                else []
+        else:
+            lights = [ob.data for ob in context.scene.objects
+                      if getattr(ob, 'type', '') == 'LIGHT'
+                      and getattr(ob, 'data', None) is not None]
+        n = 0
+        for light in lights:
+            hs = getattr(light, 'halcyon', None)
+            if hs is None:
+                continue
+            if hs.shadow_map_size != 0 or hs.shadow_bias != 0.0:
+                hs.shadow_map_size = 0
+                hs.shadow_bias = 0.0
+                n += 1
+        self.report({'INFO'},
+                    f"{n} light(s) now inherit the render shadow settings"
+                    if n else "Every light already inherits them")
+        return {'FINISHED'}
+
+
 class HALCYON_OT_clear_palette_cache(Operator):
     bl_idname = 'halcyon.clear_palette_cache'
     bl_label = "Rebuild Palette"
@@ -1318,10 +1362,6 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
             col = row.column(align=True)
             col.operator('object.material_slot_add', icon='ADD', text="")
             col.operator('object.material_slot_remove', icon='REMOVE', text="")
-            if len(slots) > 1:
-                col.separator()
-                col.operator('object.material_slot_select',
-                             icon='RESTRICT_SELECT_OFF', text="")
 
             slot = slots[ob.active_material_index] if len(slots) else None
             if slot is not None:
@@ -1329,6 +1369,14 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
             else:
                 layout.operator('object.material_slot_add',
                                 text="New Material Slot", icon='ADD')
+
+            # the edit-mode trio: put THIS material on the selected faces,
+            # or grab every face already wearing it
+            if slot is not None and getattr(ob, 'mode', '') == 'EDIT':
+                sub = layout.row(align=True)
+                sub.operator('object.material_slot_assign', text="Assign")
+                sub.operator('object.material_slot_select', text="Select")
+                sub.operator('object.material_slot_deselect', text="Deselect")
 
             if len(slots) > 1:
                 n_conv = sum(1 for sl in slots if material_state(sl.material)[1])
@@ -1366,8 +1414,8 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
 
         box = layout.box()
         box.label(text="Start from a template", icon='PRESET')
-        box.operator_menu_enum('halcyon.material_template', 'template',
-                               text="Material Templates", icon='MATERIAL')
+        box.menu('HALCYON_MT_material_templates',
+                 text="Material Templates", icon='MATERIAL')
 
         layout.separator()
         layout.prop(hs, 'use_override')
@@ -1437,6 +1485,14 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
         sub.active = hs.shadow != 'NONE'
         sub.prop(hs, 'shadow_map_size')
         sub.prop(hs, 'shadow_bias')
+        if hs.shadow_map_size > 0 or hs.shadow_bias > 0.0:
+            note = sub.row()
+            note.active = False
+            note.label(text="Overrides the render setting; 0 = inherit",
+                       icon='INFO')
+            sub.operator('halcyon.adopt_shadow_settings',
+                         text="Use Render Shadow Settings",
+                         icon='FILE_REFRESH').scope = 'ACTIVE'
         sub.prop(hs, 'shadow_softness')
         sub.prop(hs, 'shadow_samples')
         sub.prop(hs, 'shadow_density')
@@ -2086,6 +2142,7 @@ def _wrap(text, width):
 
 CLASSES = (
     HALCYON_OT_apply_preset, HALCYON_OT_set_resolution,
+    HALCYON_OT_adopt_shadow_settings,
 ) + RESOLUTION_MENUS + (
     HALCYON_MT_resolutions,
     HALCYON_OT_fix_view_transform,

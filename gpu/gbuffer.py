@@ -170,6 +170,20 @@ GLSL = """
 // A fragment knows which triangle covered it and where inside that triangle
 // it landed. Everything else is interpolation, which is what the CPU path
 // does too -- this is the same arithmetic, moved.
+//
+// Every read in here is texelFetch with INTEGER coordinates. These are
+// data textures -- a triangle id, an attribute atlas -- and Blender's
+// Python gpu module offers no sampler-state control, so texture() rides
+// whatever filter the backend happens to bind. A filtered tap of an ID
+// channel blends two unrelated triangle numbers into a third at every
+// screen-space edge the 2x2 kernel straddles: the wrong triangle's
+// corners are then interpolated, and the lighting kinks one pixel wide
+// along EVERY visible edge -- a faint wireframe over the whole frame.
+// Small frames land the uv exactly on texel centres and dodge it, which
+// is why the parity suites and Run Self Test never saw it; at a 7200 px
+// internal frame (1440 out, Supersample 24) the float32 uv is off-centre
+// by ulps and the lottery pays out. texelFetch has no filter to ride:
+// exact at every size, and byte-identical where texture() was right.
 
 uniform sampler2D hal_gb_ids;        // rgb = barycentric, a = triangle id
 uniform sampler2D hal_gb_attrs;      // packed per-corner attributes
@@ -178,11 +192,9 @@ uniform float     hal_slot_count;
 
 vec4 hal_fetch_attr(float tri, int corner, int slot)
 {
-    float index = (tri * 3.0 + float(corner)) * hal_slot_count + float(slot);
-    float x = mod(index, hal_attr_side);
-    float y = floor(index / hal_attr_side);
-    vec2 uv = (vec2(x, y) + vec2(0.5)) / hal_attr_side;
-    return texture(hal_gb_attrs, uv);
+    int side = int(hal_attr_side);
+    int index = (int(tri) * 3 + corner) * int(hal_slot_count) + slot;
+    return texelFetch(hal_gb_attrs, ivec2(index % side, index / side), 0);
 }
 
 // Interpolate one attribute slot across the covering triangle.
@@ -209,10 +221,9 @@ uniform float     hal_tri_side;
 
 vec4 hal_tri_data(float tri)
 {
-    float x = mod(tri, hal_tri_side);
-    float y = floor(tri / hal_tri_side);
-    vec2 uv = (vec2(x, y) + vec2(0.5)) / hal_tri_side;
-    return texture(hal_gb_tris, uv);
+    int side = int(hal_tri_side);
+    int t = int(tri);
+    return texelFetch(hal_gb_tris, ivec2(t % side, t / side), 0);
 }
 
 struct HalcyonFragment {
@@ -227,7 +238,13 @@ struct HalcyonFragment {
 
 HalcyonFragment hal_read_gbuffer(vec2 screen_uv)
 {
-    vec4 ids = texture(hal_gb_ids, screen_uv);
+    // uv arrives at texel centres (x+0.5)/W, so int() of uv*size floors to
+    // the pixel with half a texel of tolerance -- against LINEAR's blend
+    // threshold of ulps at a 7200 px frame
+    ivec2 gbsz = textureSize(hal_gb_ids, 0);
+    ivec2 gbpx = ivec2(clamp(screen_uv * vec2(gbsz),
+                             vec2(0.0), vec2(gbsz) - vec2(1.0)));
+    vec4 ids = texelFetch(hal_gb_ids, gbpx, 0);
     HalcyonFragment f;
     f.tri = ids.a;
     f.bary = ids.rgb;

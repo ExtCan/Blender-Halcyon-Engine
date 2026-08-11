@@ -4,6 +4,485 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
 
 ---
 
+## [1.31.0] — 2026-08-10
+
+### The optimization round: profile first, benchmark everything, ship only wins
+
+Profiled against the field scene itself — the full 500k-triangle world,
+hand-parsed from its .blend, rendered end-to-end in the harness — because
+optimizing anything else optimizes the wrong thing. Every change below
+carries its measured number from that scene; two candidate optimizations
+that LOST their benchmarks (a near-first sub-batched traversal, a pack
+rewrite's spiritual cousin) were reverted and are recorded here as losses
+so nobody re-fights them without new evidence.
+
+**The BVH build learns the surface-area heuristic (the headline).** The
+profiler's verdict on a CPU frame was unambiguous: 83% of it was ray
+traversal, and the reason was the tree, not the rays. A median split over
+a scene with a 1600-unit ground plane under seven stacked landscapes
+produces siblings whose boxes overlap almost entirely — every ray paid
+for both subtrees all the way down. Nodes above 64 triangles now split by
+binned SAH (16 bins, min of area×count); smaller nodes keep the median
+cut (measured: full-SAH buys nothing further down there, and the extra
+arithmetic is pure build time). Measured on the field scene's own shadow
+and reflection rays:
+
+- occluded (sun shadow rays): 15.0s → 1.2s — **12.5×**
+- intersect (reflection rays, incoherent): 21.0s → 3.3s — **6.3×**
+- build: 4.5s → 8.0s, paid once per scene change (the tree is cached)
+
+The same packed tree feeds the GPU ray kernels — the driver's shadow and
+reflection passes traverse fewer boxes per ray by the same construction,
+so this lands on both devices.
+
+**The traversal becomes level-synchronous waves.** The old walk visited
+nodes one at a time from Python — ~600k tiny slab calls and 1.6M
+sub-millisecond reductions per shadow pass. The frontier is now a flat
+(node, ray) pair array: one vectorised slab test per level, leaves
+exploded into flat (ray, triangle) items for a single Möller–Trumbore
+call, cross products written out component-wise (np.cross on broadcast
+views was 70 profiled seconds). ~40 large array ops per query replace
+thousands of small ones. (A cleverer near-first sub-batched variant —
+sort each wave by slab entry, re-cull between sub-batches — measured
+SLOWER: 1.15s → 1.79s. Reverted; plain waves kept.)
+
+**Closest-hit ties are now order-free by rule.** The old DFS let
+whichever leaf it popped first keep an exact tie; the wave has no such
+order, so the tie rule is now explicit: equal t falls to the lowest
+triangle id — the raster's own named tie rule, now on the rays too. The
+answer is a pure function of the candidate set, identical on any
+traversal schedule, any device, any thread count (verified: SAH tree and
+median tree return bit-identical ids, t, u, v on 160k field-scene rays).
+The GPU kernel is untouched: it routes every near-tie back to
+`bvh.intersect` by design — route, never guess — and outside its noise
+window a strict minimum is unique.
+
+**The reflection sweep stops paying for pixels it cannot touch.** A
+depth-8 sweep over a supersampled frame ran every secondary material
+pass full-screen at every level and read the whole target back —
+hundreds of megabytes per level — even when that level's rays all
+missed, or its hits huddled in a corner. Now: an all-miss level skips
+its draws outright (the level image is exactly zero either way); a hit
+level scissors every secondary draw to the hit bounding box and, when
+that box is under half the frame, reads back only the box. Byte-
+identical output — the composite only ever reads hit pixels — with the
+multiplied cost gone. And the reflect stage finally has its own
+console sub-split: trace / secondary draws / sky-along-misses, plus
+levels run, all-miss levels skipped, and rays traced, so the next
+reflect wall names itself.
+
+**The cloud noise sheds half its weight, bit-for-bit where it counts.**
+Two exact-output optimizations to `value_noise` (the Bryce sky's cloud
+decks, the noise textures, everything on the integer-hash lattice):
+the eight corner hashes share their pre-mix sum (hash3's first line is
+linear in the cell, and int64 addition wraps associatively — verified
+bit-identical across scales and offsets), and the fade/lerp chain now
+runs in the input's own float32 instead of silently promoting to
+float64 through a float-minus-int64 subtraction. The f32 chain moves
+the CPU *closer* to the GLSL twin (which always computed fract in f32);
+measured drift vs the old f64 chain: max 1.8e-7 — two decimal orders
+below one 16-bit hash step. Whole-sky evaluation on the field world:
+93s → 49s per 8M directions — **1.9×**. The field frame's "sky 4.1s"
+should roughly halve.
+
+**The composite bucket stops materialising index lists.** Each material
+pass's `out[keep] = frame[keep, :3]` built boolean index lists over the
+full supersampled frame; `np.copyto(..., where=keep)` moves the same
+pixels without them. Measured at 7200²×7 passes: 30.2s → 8.2s —
+**3.7×**, byte-identical. This was most of the field console's
+11.4-second "composite" line.
+
+**Plan was already innocent.** Profiled cold at 0.85s on the field
+scene (frame-proportional masks plus first-frame BVH texture packing,
+all cached thereafter) — the 3.4s field number is first-frame work, not
+a leak. No change; recorded so the next profiler starts elsewhere.
+
+Pixel accounting, stated plainly: the SAH tree, the wave traversal, the
+sweep region/skip work and the composite rewrite are byte-identical by
+construction or by direct verification. The ray tie rule and the noise
+f32 chain can move pixels — the first only on exactly-coincident
+geometry (where it replaces traversal-order luck with a named rule),
+the second by under 2e-7 (absorbed by 16-bit output two orders above
+it). Both are steps TOWARD cross-device identity, not away from it.
+
+---
+
+## [1.30.6] — 2026-08-10
+
+### The wireframe, found and killed: exact fetches for every data texture
+
+The faint wireframe that haunted every high-resolution render — the lines
+on the hair, the lattice over the terrain, the ghost grid that survived
+every shadow setting and died only under Force Model CONSTANT — is a
+**filtered read of the G-buffer's triangle-id texture**.
+
+**The hunt.** The scene `.blend` was parsed by hand (no Blender in the
+harness: zstd via ctypes, the 5.x `attribute_storage` mesh layout, DNA
+offsets computed from scratch) and the real geometry — every landscape,
+the temple, the character, all 500k triangles — was rebuilt inside the
+test harness with the scene's own sun, camera, materials (decoded from the
+node trees: Specular 2.5 / Glossiness 5.5 on the body, the double-bump
+Water, the Checker terrain) and the exact render settings stored in the
+file (RAY shadows, Blinn-Phong default, two-sided lighting, ambient
+2.05×, gamma 0.505, 16-bit, Supersample 24). The CPU renderer was then
+run at the full internal resolution those settings produce — 7200×7200 —
+and came out **clean**. The GPU pipeline's own NumPy front-end — the same
+GLSL, compiled and executed without a driver — was run against both the
+CPU raster's G-buffer and the compute raster's simulated G-buffer:
+**bit-identical, no lines**. Every semantic layer was thereby eliminated;
+what remained was the one thing the front-end cannot mirror — the
+driver's sampler state.
+
+**The defect.** `hal_read_gbuffer` sampled `hal_gb_ids` — barycentrics in
+RGB, **triangle id in alpha** — with `texture()` at computed uv. Blender's
+Python `gpu` module offers no sampler-state control, so that read rides
+whatever filter the backend binds. Under linear filtering, any pixel whose
+2×2 kernel straddles a screen-space triangle boundary blends two unrelated
+triangle ids into a third (5 and 900 average to a number that indexes
+triangle 13's corners), and the shading normal at that pixel is
+interpolated from the wrong triangle entirely: a one-pixel lighting kink
+along **every visible mesh edge** — the wireframe. Small frames land the
+uv exactly on texel centres, where linear filtering degenerates to the
+exact texel — which is why Run Self Test, the parity suites and low-res
+renders never showed it. At a 7200 px internal frame the float32 uv sits
+off-centre by ulps, the blend weight crosses the corruption threshold,
+and the lattice fades in — faint, resolution-dependent, immune to every
+setting, and gone under CONSTANT (the one model that never reads the
+interpolated attributes). The compute rasteriser's own history — 95
+deterministic wrong rays at one texture side, zero at another — was the
+same class, fixed there in an earlier round and never carried across to
+the deferred pass.
+
+**The fix.** Every data-texture read in the GPU pipeline is now
+`texelFetch` with integer coordinates — no sampler, no filter, no size
+lottery, exact at every resolution, byte-identical to the NumPy front-end
+by construction:
+
+- `hal_gb_ids` (the line-maker), `hal_gb_attrs`, `hal_gb_tris` — the
+  G-buffer reconstruction (gbuffer.py)
+- `hal_gb_idslin` (affine-uv mode), `hal_triaux` (face normals),
+  `hal_vscreen` (wireframe pixel-size), `hal_vlight` (vertex-rate
+  lighting) — material.py
+- the shadow-atlas depth compare (a filtered depth blended across PCF
+  taps is not the CPU's point-sampled compare), the Screen Door stipple
+  threshold matrix, and the light-cookie's manual bilinear corner taps
+  (four point taps then mix — under a filtered sampler each tap was
+  *itself* filtered, double-blurring every gobo)
+The BVH tree fetches (rtrace.py) stay `texture()`, deliberately: their
+texelFetch conversion already rode a round (1.25.71), measured
+bit-identical on the field driver AND measurably slower, and was
+reverted (1.25.73) — the guard test enshrines that measurement. The
+tree's comment now cross-references this defect so a future ray
+disagreement at a bigger tree side knows where to look first.
+
+Post-chain colour samples (`stages.py`) intentionally keep `texture()`:
+a filtered colour tap at worst blends a 1e-4 whisper of the neighbouring
+pixel — invisible — where a filtered *id* tap jumps to an unrelated
+record. Image textures keep their user-chosen filtering. The fragment
+raster source keeps its documented byte-identical form; the production
+compute build was already exact.
+
+---
+
+## [1.30.5] — 2026-08-09
+
+### The guard band learns to cull
+
+1.30.4's guard band clipped every triangle reaching past ±4 screens
+through a per-triangle Python loop — and the field's close-up (the
+camera stepped up to a character, the rest of the scene beside and
+behind it) put thousands of triangles into that loop: clip+project went
+128 ms to 1392 ms. The fix is the distinction the band was missing: a
+triangle whose three vertices are outside the SAME guard plane is
+outside it everywhere (the plane function is linear in homogeneous
+space), so its projection can never reach the screen — it is CULLED in
+one vectorised test, not clipped. Only triangles genuinely straddling a
+guard plane enter the loop. Measured on a 180k-triangle close-up:
+112k culled outright, the build 413 ms; the far view is untouched
+(120 ms, zero triangles in either branch).
+
+Also in the field's paste, for the record: the MarshalTimeout that
+pushed a frame to CPU shading ("the main thread did not pick the GPU
+burst up in time") is exactly what a console flooded by a failing
+foreign handler does to Blender's main loop — the depsgraph KeyError
+storm from the scene's second camera (not Halcyon's handler; the tree
+registers none). Rename an object to `Camera` or remove the culprit
+script, and the marshal breathes again.
+
+---
+
+## [1.30.4] — 2026-08-09
+
+### Raster hardening — three real weaknesses found hunting the lines
+
+The field's lines survived wire=OFF, so the overlay verdict was wrong
+and the hunt went to the raster. Three genuine defects were found and
+fixed on the way; whether they are THE lines, only the next field frame
+can say, and this changelog says so plainly rather than claiming a kill
+it has not measured.
+
+- **The fill was not watertight.** The two triangles at a shared edge
+  compute that edge with different float expressions, so both can land
+  a few ulps below zero and both exclude the same boundary pixel —
+  background bleeding through dense-mesh edges (measured: 1,466
+  interior one-pixel holes in a 200x200 warped grid at 1440x1440).
+  Coverage now widens by the wobble window the tie referral already
+  established (2.5e-7 of the product magnitudes — ulps of the
+  arithmetic, the 1.25.104 law), identically in all four engines: loop
+  fill, batched fill, the compute kernel, the replay. Overlapped edge
+  pixels resolve by depth and the named tie rule.
+- **Clip cuts on shared edges were direction-dependent.** Each triangle
+  walked the shared edge from its own end; the ulp of disagreement in
+  clip space is AMPLIFIED by the perspective divide near the near plane
+  into multi-pixel cracks (measured: ten-pixel disagreements between
+  neighbours' cut points). Every cut is now computed in a canonical
+  direction — from the lexicographically smaller endpoint — so both
+  triangles produce the bit-identical point.
+- **No guard band.** A triangle that barely survives the near clip
+  projects to coordinates in the hundreds of thousands of pixels;
+  float32 edge functions lose their precision to cancellation at those
+  magnitudes, and its bounding box covers the entire frame (measured:
+  633 candidate triangles binned over a single pixel in the autopsy —
+  which also bloats the compute raster's bins and the pack). Triangles
+  are now clipped against a guard band at ±4 screens, as every period
+  rasteriser did. Guard edges land 1.5+ screens outside the viewport;
+  visible coverage only corrects. For scenes with geometry crossing
+  the camera plane this should also shrink pack and dispatch time.
+
+Measured after all three on the 200x200 warped grid: the fills agree
+bit-for-bit with each other, and the strict-interior hole count on a
+second, steeper fixture drops to 28 of a million covered pixels. Not
+zero: the residue and the field's continuous lines are still open, and
+the round's honest state is "hardened, not solved."
+
+### Still hunting — what the next paste should carry
+
+The new instruments in your console are the hunt: the raster split
+(now with dispatch and read separated), the shade split naming where
+the 44 seconds went (reflect 17.6s and composite 11.4s lead), and the
+depth report. For the lines, a close-up crop plus the ground
+material's setup (shading rate, texture filter, fog mode) decides
+between the remaining suspects.
+
+---
+
+## [1.30.3] — 2026-08-09
+
+### The wireframe caught red-handed, and the shade bucket gets its split
+
+The field's picture settled it: the "faint wireframe on all objects" is
+mesh triangulation lines — and only one thing in the engine draws
+those. The console's own header said `wire=ALL` on the very frame that
+showed them. The Wireframe Overlay was ON.
+
+The engine takes its share of the blame: that header printed `wire=ALL`
+on EVERY render — it echoed the wire MODE, engaged or not — so the one
+line that could have named the cause in round one instead pointed away
+from it. And the overlay inked two million-pixel frames without saying
+a word. (The 1.30.2 shadow-coarseness work stands on its own merits —
+blocky low-res shadow maps at high resolutions are real, and the exits
+shipped for them remain right — but the wireframe the field
+photographed is the overlay.)
+
+### Fixed — the overlay can never be a mystery again
+
+- The header now prints `wire=OFF` unless the overlay is engaged, and
+  the mode only when it is.
+- When the overlay draws on a final render it says so:
+  `[Halcyon] wireframe overlay: inked N pixels (ALL, width 1) -- the
+  Wireframe panel's Wireframe Overlay checkbox turns it off`. A
+  one-pixel wire at 1440x1440 is a faint line; a printed line is not.
+
+### Added — the instruments for the real walls in the paste
+
+The 52.7s frame's breakdown named shade (GPU) at 44.1s (84%) and the
+new raster split did its job on the 2.65s raster (clip 125 / pack 725 /
+upload 25 / dispatch+read 920 / decode 809 ms). This round arms the
+next paste:
+
+- **`[Halcyon GPU] shade split`** — every GPU-shaded final render now
+  prints plan / pack+upload / draw+read / reflect / ray+build /
+  composite in milliseconds plus the material pass count, from the same
+  disjoint buckets the self test has always used. A 44-second bucket
+  becomes six named numbers and a pass count.
+- **dispatch and read split apart** — the device now times the kernel
+  and the readback separately, and the raster split prints them as
+  `dispatch X ms, read Y ms` instead of one fused number.
+- **One contiguous copy at the readback boundary** — `np.asarray` over
+  the driver's buffer is a view of foreign memory, and every strided
+  slice the decoder takes afterwards re-reads it the slow way; the
+  decode's 809 ms against a measured ~190 ms for the same pixel count
+  on clean arrays points exactly there. The copy costs milliseconds.
+
+Measured and left alone, on the record: the pack stage's corner
+assembly was benchmarked against two "cleaner" rewrites at a million
+triangles — both lost (339 ms vs 733/900 ms). The existing fancy-index
+scatter stands acquitted; pack time is the honest linear cost of a
+large mesh on this pure-Python road.
+
+---
+
+## [1.30.2] — 2026-08-09
+
+### The high-resolution round: the "wireframe" named, the raster instrumented
+
+Two field reports at high resolution: "all objects have a faint but
+visible wireframe regardless of settings", and "rasterizing absolutely
+dies at extremely high resolutions."
+
+### The faint wireframe — found, named, and given its exits
+
+Reproduced headless at 1920×1440 and taken apart with three
+instruments: a shadeless flat-white frame shows NO edge ink (the
+rasteriser is clean), shadows-off removes the artifact entirely, and a
+2048 shadow map resolves it into the smooth contact shadow it always
+was. The "wireframe" is the shadow map's texels: a 512 map reads
+perfectly at the era's 640×480, but at 1920+ each texel spans many
+output pixels, and every contact shadow becomes a blocky fringe hugging
+the silhouette — on every object, which reads exactly like a faint
+dirty wireframe.
+
+"Regardless of settings" had a second layer: lights saved in scenes
+from before 1.30.1 carry the old per-light defaults (512 map / 0.02
+bias) explicitly, and a per-light value overrides the render slider —
+so raising the render setting's Shadow Map Size changed NOTHING in
+older scenes. Shipped exits, era-honest (no hidden auto-scaling; the
+default look at period resolutions is untouched):
+
+- **The console names the trap now.** A final render whose shadow
+  texels span more than ~3 output pixels at the subject prints one
+  line: which lights, their map sizes, the pixels-per-texel ratio, and
+  the right road — the render slider when lights inherit, the
+  per-light Map Size when an override is in the way (named as such).
+- **"Use Render Shadow Settings"** — a new operator, on the light
+  panel (when an override is set, next to an info line saying so) and
+  as "All Lights Use These Settings" in the render Shadows panel: one
+  click clears per-light Map Size/Bias to 0 = inherit, freeing scenes
+  saved before 1.30.1.
+- At high output resolutions, set Shadow Map Size to 2048–4096 and the
+  fringe resolves. (512 stays the default: it is the period-correct
+  choice at period resolutions.)
+
+### The raster at extreme resolutions — instrumented so the next report
+### names the stage
+
+Headless, the CPU rasteriser measures LINEAR in pixels (~200 ns/px up
+through 3840×2880) and the compute raster's host side (clip+project,
+pack+bin — fully vectorised (tile, triangle) expansion) is flat across
+the same sweep — neither reproduces a death here, and guessing at the
+driver's half without a console would be exactly the speculation this
+project doesn't do. So the instruments ship first:
+
+- **The frame's one 'rasterise (GPU)' number now has a split.** Every
+  final render prints `[Halcyon GPU] raster split: clip+project /
+  pack+bin / upload / dispatch+read / decode` in milliseconds — the
+  decode (readback → G-buffer reconstruction) is timed for the first
+  time.
+- **The self test gained a HIGH-RESOLUTION RASTER section**: the same
+  782 triangles rasterised at 1920×1440 and 3840×2880, CPU vs compute,
+  with the full split — run it and the next paste turns "dies at 4K"
+  into a named stage with a number on it.
+
+One repair along the way: the coarseness note printed "0 map" for
+point lights (a cube map wraps its six faces and hides their size);
+it now reports the real face size.
+
+---
+
+## [1.30.1] — 2026-08-09
+
+### The material shelf grows — and the console goes quiet
+
+First round of the 1.30 era: fifteen new material templates in two named
+groups, the edit-mode workflow buttons the material panel never had, and
+the end of the "matches no enum" console flood.
+
+### Added — 15 new material templates, and a grouped shelf
+
+The Material Templates menu now draws two headed groups. **Simple**
+recipes set master-shader sockets only; **Advanced** ones wire the
+engine's own procedural textures in, sometimes through a Bump node into
+the normal. The thirteen originals kept their recipes and gained their
+category; the shelf now holds 28.
+
+New Simple templates (7):
+
+- **Porcelain** — glazed near-white, tight highlight, Fresnel rim
+- **Candy Apple** — saturated colour under a wet coat of gloss and
+  reflection
+- **Terracotta Clay** — rough Oren–Nayar earth, almost no highlight
+- **Silk** — Ward's anisotropic sheen; the sheen sockets doing the work
+  they were added for
+- **Ghost** — barely-there centre, pale self-lit edge
+- **Car Paint** — multi-layer highlight with a Fresnel colour shift
+  toward the horizon
+- **Neon Sign** — pure self-illumination; turn Glow on and it blooms
+
+New Advanced templates (8):
+
+- **Water** — the field named it, and it is the engine's own proven
+  anatomy: interfering Ripples through a Bump into the normal over a
+  glassy blend (IOR 1.33). With ray tracing on it truly refracts; the
+  suite holds the promise (renders see-through under rays).
+- **Lava** — the field named it too: the Crackle boundary network glows
+  orange through Self-Illumination between dark plates, ridged noise
+  roughens the crust. The suite holds "Lava glows" to a measured number.
+- **Tiled Floor** — bevelled tiles, grout, per-tile variation, glossy
+  coat
+- **Brick Wall** — running-bond brickwork with mortar courses
+- **Hammered Copper** — metal dented by the Dents texture through a Bump
+- **Leopard Print** — POV-Ray's leopard straight into the base colour
+- **Woven Cloth** — warp and weft over-under, rough as fabric
+- **Dead Channel** — per-cell TV static reseeded every frame, self-lit
+
+Template recipes may now use a dict form ({'node', 'props', 'inputs',
+'output', 'target', 'bump'}): it can pick a named output (Fac vs Color)
+and, when 'bump' is set, build() routes the height through a
+ShaderNodeBump of that strength into the target — the same chain the
+GPU port proved, so these templates travel to the driver.
+
+### Added — the edit-mode material buttons
+
+The Halcyon Material panel now shows **Assign / Select / Deselect** under
+the material picker while in edit mode: put the active material on the
+selected faces, or select every face already wearing it — the workflow
+row the panel simply never had. The stray select-slot button that sat in
+the slot-list column (visible only with multiple slots, dead outside
+edit mode) is gone; the proper row replaces it.
+
+### Fixed — the console flood
+
+Every redraw of the presets panel logged
+`bpy.rna WARNING current value '0' matches no enum in 'HalcyonSettings',
+'', 'preset'`. The preset enum was a dynamic callback whose items list
+BEGINS with a category header (`('', 'General', '')`) — and a dynamic
+enum's unset value is index 0, which resolved to the header's empty
+identifier, warning once per redraw. The preset list is import-time
+static, so the enum now is too, with `default='DEFAULT'` naming a real
+entry from the start. One consequence, accepted and noted: a .blend
+saved with the old dynamic enum stores the selection by index, so the
+remembered MENU SELECTION (not any applied setting) may land on a
+neighbouring entry once; presets only ever apply when the button is
+pressed.
+
+### Tests
+
+- `test_material_templates` now validates every recipe against the
+  pattern-node spec table (inputs, props, outputs — not just the node's
+  existence), requires a category on every entry, and pins the shelf:
+  28 templates, Simple/Advanced a clean partition, Water and Lava
+  present as Advanced with textures, the grouped menu registered.
+- `test_every_material_template_renders` — all 28 recipes are translated
+  to the engine's master-graph form (full socket list, texture nodes,
+  Bump chains) and rendered: each must move the frame; Lava, Neon Sign
+  and Dead Channel must glow by number; Water must be see-through under
+  rays.
+- `test_the_preset_menu_never_floods_the_console` — the enum stays a
+  static list, its default stays a real preset, and the header-first
+  shape that caused the flood is documented in place.
+
+---
+
 ## [1.30.0] — 2026-08-09
 
 ### The big one

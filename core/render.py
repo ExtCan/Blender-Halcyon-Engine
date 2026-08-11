@@ -1608,6 +1608,66 @@ def shaft_sources(scene, settings, vp):
     return out
 
 
+def _shadow_coarseness_note(scene, gbuf, proj, rh):
+    """One line when shadow texels dwarf output pixels -- the high-res trap.
+
+    A 512 map that reads perfectly at 640x480 turns every contact shadow
+    into a blocky fringe at 1920+ -- the field read it as "a faint
+    wireframe on all objects", and no setting they tried moved it because
+    lights carrying their own Map Size ignore the render slider. The note
+    names the coarse lights, the ratio, and both roads out.
+    """
+    try:
+        mesh = scene.mesh
+        cam = scene.camera
+        if mesh is None or mesh.verts is None or not mesh.verts.size \
+                or cam is None:
+            return
+        centre = mesh.verts.mean(axis=0)
+        eye = np.asarray(getattr(cam, 'position', (0.0, 0.0, 0.0)),
+                         np.float32)
+        dist_cam = float(np.linalg.norm(centre - eye))
+        ang, ortho_w = pixel_footprint(cam, proj, rh)
+        px_world = ortho_w if ang == 0.0 else ang * max(dist_cam, 1e-6)
+        if px_world <= 0.0:
+            return
+        coarse = []
+        for light in (scene.lights or ()):
+            sm = getattr(light, 'shadow_map', None)
+            if sm is None:
+                continue
+            origin = np.asarray(getattr(sm, 'origin', (0, 0, 0)),
+                                np.float32)
+            d = float(np.linalg.norm(centre - origin))
+            texel = float(np.asarray(sm.texel_size(
+                np.asarray([d], np.float32)))[0])
+            ratio = texel / px_world
+            if ratio > 3.0:
+                own = int(getattr(light, 'shadow_map_size', 0) or 0)
+                size = int(getattr(sm, 'size', 0) or 0)
+                if not size:                     # a cube map wraps its faces
+                    faces = getattr(sm, 'faces', None)
+                    size = int(getattr(faces[0], 'size', 0)) if faces else 0
+                coarse.append((getattr(light, 'name', '?') or '?',
+                               size, ratio, own > 0))
+        if not coarse:
+            return
+        named = ', '.join(f"'{n}' ({size} map, ~{r:.0f} px/texel"
+                          + (', per-light size set' if own else '')
+                          + ')'
+                          for n, size, r, own in coarse[:4])
+        overridden = any(own for _n, _s, _r, own in coarse)
+        road = ('raise the light\'s own Map Size (it overrides the render '
+                'setting)' if overridden else
+                'raise Shadow Map Size in the render settings, or the '
+                "light's own Map Size")
+        print(f'[Halcyon] shadows: one shadow texel spans several output '
+              f'pixels at this resolution -- contact shadows go blocky. '
+              f'{named}; {road}')
+    except Exception:                                           # noqa: BLE001
+        pass
+
+
 def snap_grid(st):
     """Screen-space vertex snap in pixels, from BOTH settings that promise it.
 
@@ -1803,6 +1863,18 @@ def render(scene, settings=None, progress=None, band=None):
                             getattr(st, 'depth_sort', 'ZBUFFER'))
         if _rep:
             print(_rep)
+        if rastered_on_gpu:
+            # the split behind the breakdown's one 'rasterise (GPU)'
+            # number: at high resolutions the interesting question is
+            # WHICH half of the road got slow, and a single bucket
+            # cannot answer it
+            from ..gpu.craster import LAST_RASTER as _LR
+            if _LR:
+                print('[Halcyon GPU] raster split: '
+                      + ', '.join(f'{k[:-3].replace("_", "+")} '
+                                  f'{v:.1f} ms'
+                                  for k, v in _LR.items()))
+        _shadow_coarseness_note(scene, gbuf, proj, rh)
         _sp = LAST_SPLIT
         if _sp.get('see_through'):
             named = '; '.join(f'{n}: {w}' for n, w
@@ -1898,6 +1970,36 @@ def render(scene, settings=None, progress=None, band=None):
                 else:
                     img[py, px, 3] = 1.0
                 shaded_on_gpu = True
+                if band is None and not getattr(st, '_viewport', False):
+                    # the split behind the one 'shade (GPU)' number --
+                    # a 44-second shade bucket cannot be attacked until
+                    # plan, upload, draw, sweeps and composite each own
+                    # their milliseconds, and the pass count is printed
+                    # (an M-material frame pays M full-screen passes)
+                    from ..gpu.shade import LAST_TIMINGS as _LT
+                    if _LT:
+                        keys = ('plan_ms', 'pack_upload_ms',
+                                'draw_read_ms', 'reflect_ms',
+                                'ray_build_ms', 'composite_ms')
+                        parts = ', '.join(
+                            f"{k[:-3].replace('_', '+')} "
+                            f'{float(_LT.get(k, 0.0)):.1f} ms'
+                            for k in keys if _LT.get(k))
+                        print(f'[Halcyon GPU] shade split: {parts}; '
+                              f"{int(_LT.get('passes', 0))} material "
+                              f'pass(es)')
+                        if _LT.get('reflect_ms'):
+                            print(
+                                '[Halcyon GPU] reflect split: trace '
+                                f"{float(_LT.get('reflect_trace_ms', 0.0)):.1f} ms, "
+                                'secondary draws '
+                                f"{float(_LT.get('reflect_draw_ms', 0.0)):.1f} ms, "
+                                'sky along misses '
+                                f"{float(_LT.get('reflect_env_ms', 0.0)):.1f} ms; "
+                                f"{int(_LT.get('reflect_levels', 0))} level(s), "
+                                f"{int(_LT.get('reflect_skips', 0))} all-miss "
+                                'level(s) skipped, '
+                                f"{int(_LT.get('reflect_rays', 0))} ray(s)")
         if not shaded_on_gpu:
             if getattr(st, 'radiosity', False) and bvh is not None and \
                     band is None and not getattr(st, '_viewport', False):
@@ -3389,6 +3491,13 @@ def apply_wireframe(job, gbuf, img, st, vp, eye, textures):
         yy, xx = py[on], px[on]
         img[yy, xx, :3] = col[None, :]
         img[yy, xx, 3] = 1.0
+        if not getattr(st, '_viewport', False) and yy.size:
+            # the overlay says so when it draws: at high resolutions a
+            # one-pixel wire is a FAINT line, and the field spent two
+            # rounds hunting one with the checkbox quietly on
+            print(f'[Halcyon] wireframe overlay: inked {yy.size} pixels '
+                  f'({st.wire_mode}, width {w:g}) -- the Wireframe '
+                  f"panel's Wireframe Overlay checkbox turns it off")
     if wire_mats:
         mat_idx = mesh.mat_index[gbuf.tri[py, px]] if mesh.mat_index is not None \
             else np.zeros(py.size, np.int32)

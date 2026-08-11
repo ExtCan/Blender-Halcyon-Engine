@@ -545,6 +545,17 @@ def _build():
     return props
 
 
+# The preset list is import-time static, so the enum is too. It used to be
+# a dynamic callback, and its first entry is a category HEADER ('', ...):
+# a dynamic enum's unset value is index 0, which resolved to the header's
+# empty identifier and made Blender log "current value '0' matches no enum"
+# on EVERY redraw of the presets panel -- the field's console flood. A
+# static list with an explicit default names a real entry from the start.
+# (Kept at module level: Blender requires static enum item strings to
+# outlive the property.)
+_PRESET_ITEMS = preset_items()
+
+
 class HalcyonSettings(PropertyGroup):
     """All Halcyon render settings, mirroring core.settings.RenderSettings."""
 
@@ -553,7 +564,8 @@ class HalcyonSettings(PropertyGroup):
     preset: EnumProperty(
         name="Preset",
         description="Load the settings of a specific 1990s renderer or machine",
-        items=lambda self, ctx: preset_items(),
+        items=_PRESET_ITEMS,
+        default='DEFAULT',
     )
     ui_tab: EnumProperty(
         name="Tab", items=_items(
