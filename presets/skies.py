@@ -847,6 +847,15 @@ ORDER = (
 )
 
 
+# ------------------------------------------------ the extended library
+try:
+    from .skies_extra import ORDER_EXTRA, SKIES_EXTRA
+    SKIES.update(SKIES_EXTRA)
+    ORDER = tuple(ORDER) + tuple(k for k in ORDER_EXTRA if k in SKIES)
+except Exception:                                               # noqa: BLE001
+    pass
+
+
 def sky_items():
     """(key, label, note) in display order, for an enum or a menu."""
     return tuple((k, SKIES[k]['label'], SKIES[k]['note'])

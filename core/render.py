@@ -1701,6 +1701,14 @@ def render(scene, settings=None, progress=None, band=None):
     mesh = scene.mesh
     W = max(int(st.resolution_x), 1)
     H = max(int(st.resolution_y), 1)
+    # sugar sockets become real nodes here, before ANY consumer reads a
+    # graph: the CPU evaluator, the GPU plan and the emitter must all see
+    # the same desugared tree or the plan's constancy scan lies
+    from .nodeeval import desugar_master_bump
+    for _m in (scene.materials or ()):
+        desugar_master_bump(getattr(_m, 'graph', None))
+    if getattr(scene, 'world', None) is not None:
+        desugar_master_bump(getattr(scene.world, 'graph', None))
     if str(st.aa_mode) == 'ACCUMULATE' and int(st.aa_samples) > 1 \
             and getattr(st, '_accum_jitter', None) is None:
         return _render_accumulated(scene, st, progress, band)
@@ -2040,6 +2048,10 @@ def render(scene, settings=None, progress=None, band=None):
 
     with ST.track('wireframe'):
         img = apply_wireframe(job, gbuf, img, st, vp, eye, textures)
+
+    if getattr(st, 'outline', False):
+        with ST.track('outline'):
+            img = apply_outline(scene, gbuf, img, st)
 
     if transparent is not None and transparent.size and frags is not None:
         if progress:
@@ -3455,6 +3467,93 @@ def _thicken(mask, radius):
         grown[:, :-1] |= out[:, 1:]
         out = grown
     return out
+
+
+def apply_outline(scene, gbuf, img, st):
+    """Ink cartoon outlines from the G-buffer, before the post chain.
+
+    The line sources are the buffers the raster already filled -- object
+    ids, material ids, depth, face normals -- compared against their
+    4-neighbourhood, so the ink lands exactly on visible boundaries and
+    creases. It runs at the INTERNAL resolution: a supersampled frame
+    anti-aliases its own ink on the way down, which is how the era's
+    software got clean cartoon lines without a line renderer.
+
+    Computed on the CPU from the same G-buffer on either device, so the
+    picture cannot differ between them by construction.
+    """
+    mesh = scene.mesh
+    tri = gbuf.tri
+    cov = tri >= 0
+    if not cov.any():
+        return img
+    safe = np.where(cov, tri, 0)
+    edge = np.zeros(tri.shape, bool)
+
+    def neigh_diff(plane, differs):
+        """OR `differs(a, b)` over the 4-neighbourhood into `edge`."""
+        e = np.zeros(tri.shape, bool)
+        e[:, 1:] |= differs(plane[:, 1:], plane[:, :-1])
+        e[:, :-1] |= differs(plane[:, :-1], plane[:, 1:])
+        e[1:, :] |= differs(plane[1:, :], plane[:-1, :])
+        e[:-1, :] |= differs(plane[:-1, :], plane[1:, :])
+        return e
+
+    if getattr(st, 'outline_objects', True) and \
+            mesh.obj_index is not None:
+        omap = np.where(cov, mesh.obj_index[safe], -1)
+        edge |= neigh_diff(omap, lambda a, b: a != b)
+    if getattr(st, 'outline_materials', False) and \
+            mesh.mat_index is not None:
+        mmap = np.where(cov, mesh.mat_index[safe], -1)
+        edge |= neigh_diff(mmap, lambda a, b: a != b)
+    if getattr(st, 'outline_depth', True):
+        thr = max(float(getattr(st, 'outline_depth_threshold', 0.02)), 1e-5)
+        dmap = np.where(cov, gbuf.depth, 1e12).astype(np.float32)
+
+        def depth_break(a, b):
+            near = np.minimum(np.abs(a), np.abs(b))
+            return (a < 1e11) & (a < b) & \
+                ((b - a) > thr * np.maximum(near, 1e-4))
+
+        edge |= neigh_diff(dmap, depth_break)
+    if getattr(st, 'outline_normals', True) and \
+            mesh.face_normals is not None:
+        fn = mesh.face_normals[safe]
+        fn = np.where(cov[:, :, None], fn, 0.0).astype(np.float32)
+        cos_lim = np.float32(np.cos(np.radians(
+            float(getattr(st, 'outline_normal_angle', 60.0)))))
+
+        def crease(a, b):
+            d = (a * b).sum(axis=-1)
+            return (d < cos_lim) & (np.abs(a).sum(-1) > 0) & \
+                (np.abs(b).sum(-1) > 0)
+
+        edge |= neigh_diff(fn, crease)
+    if not getattr(st, 'outline_over_sky', True):
+        edge &= cov
+
+    width = int(np.clip(getattr(st, 'outline_width', 1), 1, 8))
+    for _ in range(width - 1):
+        grown = edge.copy()
+        grown[:, 1:] |= edge[:, :-1]
+        grown[:, :-1] |= edge[:, 1:]
+        grown[1:, :] |= edge[:-1, :]
+        grown[:-1, :] |= edge[1:, :]
+        edge = grown
+
+    opacity = float(np.clip(getattr(st, 'outline_opacity', 1.0), 0.0, 1.0))
+    if opacity <= 0.0 or not edge.any():
+        return img
+    col = np.asarray(getattr(st, 'outline_color', (0.0, 0.0, 0.0)),
+                     np.float32)
+    m = edge & (cov if not getattr(st, 'outline_over_sky', True) else
+                np.ones_like(edge))
+    img[m, :3] = img[m, :3] * (1.0 - opacity) + col[None, :] * opacity
+    img[m, 3] = np.maximum(img[m, 3], opacity if
+                           getattr(st, 'outline_over_sky', True) else
+                           img[m, 3])
+    return img
 
 
 def apply_wireframe(job, gbuf, img, st, vp, eye, textures):

@@ -4,6 +4,102 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
 
 ---
 
+## [1.32.0] — 2026-08-10
+
+### The feature round: eighteen asks, easiest to hardest
+
+**Fixes first.**
+
+- **Sky presets apply on sight.** Applying a preset wrote dozens of
+  properties without ever tagging the world for the depsgraph, so the
+  rendered view kept the old sky until any slider was nudged. Every
+  preset operator (sky, water, render presets) now pokes the same update
+  machinery a slider pokes.
+- **The Material tab's master-shader panel now does something.** With
+  Override on, the exporter still serialised the node tree, and the graph
+  won every field except `model` — the panel's sliders moved nothing.
+  Override now withholds the graph: the material shades from exactly the
+  values the panel shows, on both devices, alpha included.
+- **The Gradient texture was hunted and acquitted** — verified exact on
+  both devices across every type through the full pipeline. The failure
+  it was blamed for is the matcap-sphere case, which the two items below
+  actually fix.
+- **Matcap Coordinates gained mapping**: a Centered switch (output around
+  the origin, so a Spherical gradient fed the vector lands centred
+  instead of cornered) and an Offset socket.
+- New materials created while Halcyon is the engine **start on the
+  master shader**: the panel's New button builds one directly, and a
+  strictly-guarded watcher converts factory-fresh default materials
+  (exactly two untouched default nodes — anything a person has edited is
+  never touched).
+
+**The master shader grew a greyscale Bump Height input.** Plug any
+texture in and its bright parts rise. Under the hood a linked Bump
+Height desugars into a real Bump node between the texture and the
+Normal chain — one proven bump implementation, both devices, verified
+to 5e-6 CPU↔GPU. Old saved files gain the socket on first refresh.
+
+**Every single setting now carries a detailed tooltip** — all 362
+properties across render settings, material override, light and world
+groups — and a test fails the build the moment a new property arrives
+without one.
+
+**New nodes, each verified CPU↔GPU ≤ 3e-6 unless stated:**
+
+- **Water Noise** — 1–12 drifting layers of 4D value noise folded toward
+  crests by Choppiness, with animation Speed and a Loop that closes the
+  cycle EXACTLY over Loop Frames by moving time onto a circle through
+  the lattice's fourth dimension (a looping deck breathes in place
+  rather than drifting; that trade is stated on the node).
+- **Gradient (Shaped)** — linear, reflected, spherical, quadratic,
+  square, diamond, conical and spiral shapes with Centre, Rotation,
+  Scale, clip/repeat/ping-pong and easing. Feeds happily from the
+  centred Matcap vector.
+- **Color Ramp (Spaces)** — up to six stops blended in RGB, OKLab,
+  OKLCh (hue the short way round) or HSV; stop colours are sockets, so
+  they can be driven.
+- **Blur** — averages its input chain over shifted evaluations in the
+  surface plane: true blur of any texture, procedural or image, at
+  three tap qualities. The re-run is CPU work and says so: the GPU plan
+  refuses it by name and the material shades on the CPU.
+- **1D/2D/3D/4D lattices** for the portable Fractal Noise node (with a
+  W socket), and Blender's own Noise texture honours its dimensions on
+  the CPU path. The 1/2/4-D value noises ride the same integer hash as
+  everything else — bit-exact between NumPy and GLSL by the same wrap
+  proof, verified to 1.6e-7.
+
+**Node coverage, audited**: every surface shader node in Blender 5.x
+has an evaluator except Freestyle's stroke UV, which has no meaning
+outside Freestyle. (The audit found nothing to add — recorded so the
+next sweep starts from evidence.)
+
+**Five new infinite grounds** join Solid/Checker/Fractal/Ocean: Neon
+Grid (the synthwave floor, lines widening with distance so they
+survive minification), Tiles (grout and per-tile shading), Dunes
+(wind-ribbed sand), Snowfield (blue hollows, sparse glints) and Lava
+(dark crust over pulsing glow).
+
+**Cartoon outlines.** Ink drawn from the renderer's own G-buffer:
+object silhouettes, material borders, depth breaks (near-side inked,
+relative threshold) and normal creases (angle threshold), each its own
+toggle, with width, colour, opacity and over-sky control. The ink lands
+at the INTERNAL resolution, so supersampling anti-aliases the line on
+the way down — clean cel edges with no line renderer. Computed on the
+CPU from the same G-buffer on either device: parity by construction.
+All eleven settings carry audit-table proofs.
+
+**260 new sky presets** (the ask was 250) in twenty-six authored
+families — Golden Hour through Blue Hour, Storm Front, Ember, Vapor
+Dream, Monsoon, Thunderhead, Arctic Night, Cinema Grade, Noir and the
+rest — every variant with its own detailed tooltip. **Every one of the
+303 presets ships a rendered thumbnail** (the engine's own sky module
+drew them all), the preset picker became a browsable gallery, and a
+test holds the library to it: real fields only, real notes, a thumbnail
+per key, and every preset must actually change the sky it is applied
+to.
+
+---
+
 ## [1.31.0] — 2026-08-10
 
 ### The optimization round: profile first, benchmark everything, ship only wins

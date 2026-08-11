@@ -251,15 +251,126 @@ class HALCYON_OT_convert_materials(Operator):
         return {'FINISHED'}
 
 
-CLASSES = (HALCYON_OT_convert_materials,)
+class HALCYON_OT_material_new(Operator):
+    """New material, born as a Halcyon Shader.
+
+    The panel's New button routes here instead of `material.new`, so a
+    material made under this engine STARTS on the master shader instead
+    of needing a convert step afterwards.
+    """
+
+    bl_idname = 'halcyon.material_new'
+    bl_label = "New Halcyon Material"
+    bl_description = ("Create a new material already built around the "
+                      "Halcyon Shader, and put it in the active slot")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        mat = bpy.data.materials.new(name="Material")
+        ob = context.object
+        if ob is not None and hasattr(ob, 'material_slots'):
+            if not len(ob.material_slots):
+                try:
+                    bpy.ops.object.material_slot_add()
+                except Exception:                               # noqa: BLE001
+                    pass
+            try:
+                ob.material_slots[ob.active_material_index].material = mat
+            except Exception:                                   # noqa: BLE001
+                pass
+        ok, msg = convert_material(mat, keep_original=False, force=True)
+        if not ok:
+            self.report({'WARNING'}, msg)
+        return {'FINISHED'}
+
+
+def _pristine_default(mat):
+    """True only for a factory-fresh material nobody has touched.
+
+    The bar is deliberately strict -- exactly the two default nodes, the
+    Principled sockets at their factory values, nothing linked, nothing
+    animated -- because the handler below rewrites what this returns True
+    for, and rewriting anything a person has edited is vandalism.
+    """
+    try:
+        if not mat.use_nodes or mat.node_tree is None:
+            return False
+        if getattr(mat, 'library', None) is not None or \
+                getattr(mat, 'override_library', None) is not None:
+            return False
+        if getattr(mat.node_tree, 'animation_data', None) is not None or \
+                getattr(mat, 'animation_data', None) is not None:
+            return False
+        nodes = list(mat.node_tree.nodes)
+        if len(nodes) != 2:
+            return False
+        kinds = sorted(n.bl_idname for n in nodes)
+        if kinds != ['ShaderNodeBsdfPrincipled', 'ShaderNodeOutputMaterial']:
+            return False
+        p = next(n for n in nodes
+                 if n.bl_idname == 'ShaderNodeBsdfPrincipled')
+        for s in p.inputs:
+            if s.is_linked:
+                return False
+        checks = (('Metallic', 0.0), ('Roughness', 0.5), ('Alpha', 1.0))
+        for name, want in checks:
+            s = p.inputs.get(name)
+            if s is not None and abs(float(s.default_value) - want) > 1e-6:
+                return False
+        bc = p.inputs.get('Base Color')
+        if bc is not None:
+            v = tuple(bc.default_value)[:3]
+            if any(abs(c - 0.8) > 1e-6 for c in v):
+                return False
+        return True
+    except Exception:                                           # noqa: BLE001
+        return False
+
+
+def _halcyon_default_material(scene, depsgraph):
+    """depsgraph_update_post: fresh default materials become Halcyon.
+
+    Registered by name so the self-test's handler audit can tell this
+    apart from a foreign add-on's watcher, and guarded three ways: only
+    under this engine, only on materials `_pristine_default` vouches for,
+    and self-terminating (a converted tree stops being pristine, so the
+    update this conversion causes matches nothing).
+    """
+    try:
+        if scene is None or scene.render.engine != 'HALCYON_RENDER':
+            return
+        for upd in depsgraph.updates:
+            mid = getattr(upd, 'id', None)
+            if mid is None or not isinstance(mid, bpy.types.Material):
+                continue
+            mat = bpy.data.materials.get(mid.name)
+            if mat is not None and _pristine_default(mat):
+                convert_material(mat, keep_original=False, force=True)
+    except Exception:                                           # noqa: BLE001
+        pass
+
+
+CLASSES = (HALCYON_OT_convert_materials, HALCYON_OT_material_new)
 
 
 def register():
     for c in CLASSES:
         bpy.utils.register_class(c)
+    try:
+        hs = bpy.app.handlers.depsgraph_update_post
+        if _halcyon_default_material not in hs:
+            hs.append(_halcyon_default_material)
+    except Exception:                                           # noqa: BLE001
+        pass
 
 
 def unregister():
+    try:
+        hs = bpy.app.handlers.depsgraph_update_post
+        while _halcyon_default_material in hs:
+            hs.remove(_halcyon_default_material)
+    except Exception:                                           # noqa: BLE001
+        pass
     for c in reversed(CLASSES):
         try:
             bpy.utils.unregister_class(c)

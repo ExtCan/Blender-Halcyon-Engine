@@ -1618,14 +1618,85 @@ _CELL_FEATURE = {'F1': 0, 'F2': 1, 'BORDER': 2, 'CELL': 3}
 
 
 def e_pat_noise(em, node, index):
-    _need_pattern(em, 'noise')
     p = _pat_vec(em, node)
+    dims = str(prop(node, 'dims', '3D'))
+    kind = _NOISE_KIND.get(str(prop(node, "kind", "SMOOTH")), 0)
+    octv = int(prop(node, "octaves", 5))
+    lac = _pat_scalar(em, node, "Lacunarity", 2.0)
+    gain = _pat_scalar(em, node, "Gain", 0.5)
+    if dims == '3D':
+        _need_pattern(em, 'noise')
+        return _pat_output(em, node, index, (
+            f'hal_pat_noise({p}, {kind}, {octv}, {lac}, {gain})'))
+    _need_pattern(em, 'noise_nd')
+    if dims == '4D':
+        w = em.input(node, 'W', FLOAT)
+        scale = em.input(node, 'Scale', FLOAT)
+        p4, _t = em.tmp(VEC4, f'vec4({p}, {w} * {scale})')
+    else:
+        p4, _t = em.tmp(VEC4, f'vec4({p}, 0.0)')
+    d = {'1D': 1, '2D': 2, '4D': 4}.get(dims, 4)
     return _pat_output(em, node, index, (
-        f'hal_pat_noise({p}, '
-        f'{_NOISE_KIND.get(str(prop(node, "kind", "SMOOTH")), 0)}, '
-        f'{int(prop(node, "octaves", 5))}, '
-        f'{_pat_scalar(em, node, "Lacunarity", 2.0)}, '
-        f'{_pat_scalar(em, node, "Gain", 0.5)})'))
+        f'hal_pat_noise_nd({p4}, {d}, {kind}, {octv}, {lac}, {gain})'))
+
+
+def e_pat_water(em, node, index):
+    from ..core.patterns import WATER_DIRS
+    _need_pattern(em, 'water')
+    p = _pat_vec(em, node)
+    t = _pat_time(em, node)
+    speed = _pat_scalar(em, node, 'Speed', 1.0)
+    chop = _pat_scalar(em, node, 'Choppiness', 0.5)
+    layers = max(1, min(int(prop(node, 'layers', 5)), 12))
+    looping = bool(prop(node, 'loop', False))
+    lf = max(int(prop(node, 'loop_frames', 48)), 1)
+    fps = int(prop(node, 'fps', 24))
+    if looping:
+        ph, _t2 = em.tmp(FLOAT, f'6.28318530717959 * fract({t} * '
+                                f'{float(fps)} / {float(lf)})')
+        lz, _t2 = em.tmp(FLOAT, f'cos({ph}) * 1.5')
+        lw, _t2 = em.tmp(FLOAT, f'sin({ph}) * 1.5')
+    else:
+        lz, lw = '0.0', '0.0'
+    total, _t2 = em.tmp(FLOAT, '0.0')
+    amp, freq, norm = 1.0, 1.0, 0.0
+    for i in range(layers):
+        ca = float(WATER_DIRS[i, 0])
+        sa = float(WATER_DIRS[i, 1])
+        rate = 0.6 + 0.13 * i
+        salt = 17.0 * i + 3.0
+        em.lines.append(
+            f'    {total} = {total} + hal_pat_water_layer({p}.xy, '
+            f'{ca!r}, {sa!r}, {freq!r}, {rate!r}, {salt!r}, '
+            f'{t}, {speed}, {chop}, {lz}, {lw}, '
+            f'{1 if looping else 0}) * {amp!r};')
+        norm += amp
+        amp *= 0.55
+        freq *= 1.9
+    return _pat_output(em, node, index,
+                       f'{total} / {max(norm, 1e-6)!r}')
+
+
+def e_pat_gradient_shaped(em, node, index):
+    _need_pattern(em, 'gradientshape')
+    v = tex_vector(em, node, 'generated')
+    centre = em.input(node, 'Center', VEC3)
+    scale = em.input(node, 'Scale', FLOAT)
+    rot = em.input(node, 'Rotation', FLOAT)
+    q0, _t = em.tmp(VEC3, f'({v} - {centre}) * {scale}')
+    ca, _t = em.tmp(FLOAT, f'cos(-{rot})')
+    sa, _t = em.tmp(FLOAT, f'sin(-{rot})')
+    q, _t = em.tmp(VEC3, f'vec3({q0}.x * {ca} - {q0}.y * {sa}, '
+                         f'{q0}.x * {sa} + {q0}.y * {ca}, {q0}.z)')
+    shapes = {'LINEAR': 0, 'REFLECTED': 1, 'SPHERICAL': 2, 'QUADRATIC': 3,
+              'SQUARE': 4, 'DIAMOND': 5, 'CONICAL': 6, 'SPIRAL': 7}
+    reps = {'NONE': 0, 'REPEAT': 1, 'PINGPONG': 2}
+    eases = {'NONE': 0, 'SMOOTH': 1, 'SHARP': 2}
+    return _pat_output(em, node, index, (
+        f'hal_pat_gradient({q}, '
+        f'{shapes.get(str(prop(node, "shape", "LINEAR")), 0)}, '
+        f'{reps.get(str(prop(node, "repeat", "NONE")), 0)}, '
+        f'{eases.get(str(prop(node, "easing", "NONE")), 0)})'))
 
 
 def e_pat_cells_tex(em, node, index):
@@ -2081,8 +2152,14 @@ def e_matcap_uv(em, node, index):
                              f'? vec3(1.0, 0.0, 0.0) : normalize({r0})')
     upv, _t = em.tmp(VEC3, f'cross(hal_V, {right})')
     scale, _t = em.tmp(FLOAT, em.input(node, 'Scale', FLOAT))
-    return em.tmp(VEC3, f'vec3(dot({n}, {right}) * 0.5 * {scale} + 0.5, '
-                        f'dot({n}, {upv}) * 0.5 * {scale} + 0.5, 0.0)')
+    # Centered + Offset, exactly `n_halcyon_matcap_uv`: origin-centred
+    # output for sphere gradients, then the artist's shift
+    centre = '0.0' if prop(node, 'centered', False) else '0.5'
+    off, _t = em.tmp(VEC3, em.input(node, 'Offset', VEC3))
+    return em.tmp(
+        VEC3,
+        f'vec3(dot({n}, {right}) * 0.5 * {scale} + {centre}, '
+        f'dot({n}, {upv}) * 0.5 * {scale} + {centre}, 0.0) + {off}')
 
 
 def e_normal_map(em, node, _i):
@@ -2208,10 +2285,73 @@ REFUSED = {
                             'readback on either device',
 }
 
+
+def e_halcyon_ramp(em, node, index):
+    """The space-blended ramp, unrolled per stop pair.
+
+    Positions and the space are props (baked); stop colours are sockets
+    (may be linked). The conversion helpers live in one include; OKLCh
+    and HSV take the short way round the hue circle exactly as the CPU.
+    """
+    _need_okramp(em)
+    fac0 = em.input(node, 'Fac', FLOAT)
+    fac, _t = em.tmp(FLOAT, f'clamp({fac0}, 0.0, 1.0)')
+    n_stops = max(2, min(int(prop(node, 'stops', 2)), 6))
+    pos = list(prop(node, 'positions', (0.0, 1.0, 0.5, 0.5, 0.5, 0.5)))
+    space = str(prop(node, 'space', 'OKLAB'))
+    ease = str(prop(node, 'easing', 'LINEAR'))
+    stops = []
+    for i in range(n_stops):
+        cvar = em.input(node, f'Color {i + 1}', VEC4)
+        stops.append((float(pos[i]), cvar))
+    stops.sort(key=lambda s: s[0])
+    sp = {'RGB': 0, 'OKLAB': 1, 'OKLCH': 2, 'HSV': 3}.get(space, 1)
+    out, _t = em.tmp(VEC3, f'({stops[0][1]}).rgb')
+    alpha, _t = em.tmp(FLOAT, f'({stops[0][1]}).a')
+    for (p0, c0), (p1, c1) in zip(stops[:-1], stops[1:]):
+        span = max(p1 - p0, 1e-6)
+        t, _t2 = em.tmp(FLOAT,
+                        f'clamp(({fac} - {p0!r}) / {span!r}, 0.0, 1.0)')
+        if ease == 'SMOOTH':
+            t2v, _t2 = em.tmp(FLOAT, f'{t} * {t} * (3.0 - 2.0 * {t})')
+            t = t2v
+        elif ease == 'CONSTANT':
+            t2v, _t2 = em.tmp(FLOAT, f'({t} >= 1.0) ? 1.0 : 0.0')
+            t = t2v
+        blend, _t2 = em.tmp(VEC3, f'hal_ramp_blend(({c0}).rgb, '
+                                  f'({c1}).rgb, {t}, {sp})')
+        em.lines.append(f'    if ({fac} >= {p0!r}) {{')
+        em.lines.append(f'        {out} = {blend};')
+        em.lines.append(f'        {alpha} = ({c0}).a + '
+                        f'(({c1}).a - ({c0}).a) * {t};')
+        em.lines.append('    }')
+    outs = node.get('outputs') or []
+    o = outs[index] if index < len(outs) else {}
+    if o.get('name') == 'Alpha':
+        return alpha, FLOAT
+    return em.tmp(VEC4, f'vec4({out}, {alpha})')
+
+
+def _need_okramp(em):
+    from .procedural import OKRAMP_GLSL
+    if '__okramp' not in em.once:
+        em.once.add('__okramp')
+        em.inline.append(OKRAMP_GLSL)
+
+
+def e_halcyon_blur(em, node, index):
+    raise Unsupported(
+        'Blur re-evaluates its input chain at shifted coordinates; that '
+        're-run is CPU-only, so this material shades on the CPU')
+
+
 EMITTERS = {
     'HALCYON_ShaderNode': e_halcyon_shader,
     'HALCYON_CodeNode': e_code_node,
+
     'HALCYON_MatcapUVNode': e_matcap_uv,
+    'HALCYON_RampNode': e_halcyon_ramp,
+    'HALCYON_BlurNode': e_halcyon_blur,
     'ShaderNodeVertexColor': e_vertex_color,
     'ShaderNodeNormalMap': e_normal_map,
     'ShaderNodeBump': e_bump,
@@ -2267,6 +2407,8 @@ EMITTERS = {
     'HALCYON_BumpsNode': e_pat_bumps,
     'HALCYON_WrinklesNode': e_pat_wrinkles,
     'HALCYON_NoiseNode': e_pat_noise,
+    'HALCYON_WaterNode': e_pat_water,
+    'HALCYON_GradientNode': e_pat_gradient_shaped,
     'HALCYON_CellsNode': e_pat_cells_tex,
     'HALCYON_StaticNode': e_pat_static,
     'HALCYON_PosterizeNode': e_halcyon_posterize,

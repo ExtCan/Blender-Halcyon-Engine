@@ -85,6 +85,8 @@ NODE_PROPS = {
     'ShaderNodeBsdfToon': ('component',),
     'ShaderNodeOutputMaterial': ('target',),
     'HALCYON_ShaderNode': ('model', 'toon_steps', 'wire_size'),
+    'HALCYON_RampNode': ('space', 'stops', 'positions', 'easing'),
+    'HALCYON_BlurNode': ('taps',),
     'ShaderNodeTexGabor': ('gabor_type',),
     'HALCYON_CodeNode': ('language', 'as_surface', 'source_text'),
     # the retro utilities. Dither's pattern and Depth Cue's falloff were
@@ -304,7 +306,15 @@ def export_material(mat, images, warnings):
         # Wireframe by its *node* never went through that branch, so its wire
         # width was stuck at the dataclass default with no way to change it
         m.wire_size = hs.wire_size
-    if compat.uses_nodes(mat) and mat.node_tree:
+    if compat.uses_nodes(mat) and mat.node_tree and \
+            not (hs is not None and hs.use_override):
+        # a material with Override on shades from the panel's own fields --
+        # THE WHOLE PANEL, not just the model. Serialising the tree anyway
+        # meant the graph won every field except `model` and the Material
+        # tab's sliders moved nothing: the "tab that doesn't do anything".
+        # With the graph withheld, the core's graphless-constants path
+        # shades from exactly the values the panel shows, on both devices,
+        # and alpha falls to the override's own Opacity above.
         m.programs = {}
         m.graph = serialize_tree(mat.node_tree, images, m.programs, warnings)
     m.alpha_why = _alpha_reason(mat, m)

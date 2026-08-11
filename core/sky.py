@@ -565,6 +565,19 @@ def bryce(world, dirs, eye=None):
     # the horizon used to stay crisp while the sky behind them hazed over.
 
     # ---- beyond the atmosphere
+    amount = float(getattr(world, 'nebula', 0.0))
+    if amount > 1e-4:
+        # the starfield mode's nebula wash, now under the Bryce dome too:
+        # a night sky with nebula settings used to silently ignore them
+        # (STARFIELD had the term, BRYCE never grew it). Same formula,
+        # same colour map, sitting behind the stars.
+        scale = max(float(getattr(world, 'nebula_scale', 2.0)), 1e-3)
+        v = turbulence(dirs * scale,
+                       octaves=int(getattr(world, 'nebula_detail', 5)))
+        v = np.clip((v - 0.35) * 2.2, 0.0, 1.0) ** 1.6
+        neb = np.asarray(getattr(world, 'nebula_color', (0.35, 0.15, 0.55)),
+                         np.float32)[None, :]
+        col = col + neb * (v * amount)[:, None]
     if world.stars:
         col = col + _stars(dirs, float(world.star_density),
                            float(world.star_brightness), int(world.cloud_seed))
@@ -1033,6 +1046,74 @@ def ground_plane(world, dirs, sky_col, eye, time=0.0, textures=None):
                           np.zeros(p.shape[0], np.float32)], 1), octaves=5)
         alt = np.asarray(world.ground_color2, np.float32)[None, :]
         col = col + (alt - col) * f[:, None]
+    elif world.ground_mode == 'GRID':
+        # the neon wireframe floor of every synthwave sleeve: thin bright
+        # lines on the base colour, glowing wider with distance so the
+        # grid survives minification instead of aliasing away
+        gx = np.abs((p[:, 0] / scale) - np.round(p[:, 0] / scale))
+        gy = np.abs((p[:, 1] / scale) - np.round(p[:, 1] / scale))
+        px_w = np.clip(dist * np.float32(
+            getattr(world, '_pixel_angle', 0.001) or 0.001) / scale,
+            0.008, 0.25)
+        line = np.maximum(1.0 - gx / px_w, 0.0) + \
+            np.maximum(1.0 - gy / px_w, 0.0)
+        line = np.clip(line, 0.0, 1.0)
+        alt = np.asarray(world.ground_color2, np.float32)[None, :]
+        col = col + (alt * 1.6 - col) * line[:, None]
+    elif world.ground_mode == 'TILES':
+        # bathhouse tiles: square cells, grout lines, a hashed per-tile
+        # shade so the floor is not one flat repeat
+        from .patterns import hash3
+        cx = np.floor(p[:, 0] / scale)
+        cy = np.floor(p[:, 1] / scale)
+        fx = p[:, 0] / scale - cx
+        fy = p[:, 1] / scale - cy
+        grout = (np.minimum(np.minimum(fx, 1.0 - fx),
+                            np.minimum(fy, 1.0 - fy)) < 0.04)
+        shade = hash3(cx.astype(np.int64), cy.astype(np.int64),
+                      np.int64(7)) * 0.25 + 0.75
+        alt = np.asarray(world.ground_color2, np.float32)[None, :]
+        col = col * shade[:, None]
+        col = np.where(grout[:, None], alt, col)
+    elif world.ground_mode == 'DESERT':
+        # wind-ribbed dunes: long sine ridges displaced by low noise,
+        # shaded by their own slope against the sun direction
+        from .patterns import fbm
+        u = p[:, 0] / scale
+        v = p[:, 1] / scale
+        warp = fbm(np.stack([u * 0.35, v * 0.35,
+                             np.zeros(p.shape[0], np.float32)], 1),
+                   octaves=3)
+        ridge = np.sin((v + warp * 2.5) * np.float32(np.pi) * 2.0)
+        rib = np.abs(ridge) ** 0.7
+        alt = np.asarray(world.ground_color2, np.float32)[None, :]
+        col = col + (alt - col) * (rib * 0.6 + warp * 0.25)[:, None]
+    elif world.ground_mode == 'SNOW':
+        # a bright field with sparse sun glints and faint blue shadowing
+        # in the hollows
+        from .patterns import fbm, hash3
+        f = fbm(np.stack([p[:, 0] / scale, p[:, 1] / scale,
+                          np.zeros(p.shape[0], np.float32)], 1), octaves=4)
+        base = np.asarray(world.ground_color, np.float32)[None, :]
+        hollow = np.asarray(world.ground_color2, np.float32)[None, :]
+        col = base + (hollow - base) * (f * 0.5)[:, None]
+        g = hash3((p[:, 0] * 37.0).astype(np.int64),
+                  (p[:, 1] * 37.0).astype(np.int64), np.int64(3))
+        glint = (g > 0.995).astype(np.float32) * \
+            np.clip(2.0 - dist * 0.02, 0.0, 1.0)
+        col = col + glint[:, None] * 0.8
+    elif world.ground_mode == 'LAVA':
+        # crusted rock over glowing cracks: inverted-crackle veins carry
+        # the second colour as EMISSIVE heat, pulsing faintly over time
+        from .patterns import turbulence
+        u = np.stack([p[:, 0] / scale, p[:, 1] / scale,
+                      np.zeros(p.shape[0], np.float32)], 1)
+        v = turbulence(u, octaves=5)
+        crack = np.clip((v - 0.62) * 6.0, 0.0, 1.0)
+        pulse = 0.85 + 0.15 * np.float32(np.sin(float(time) * 1.7))
+        glow = np.asarray(world.ground_color2, np.float32)[None, :]
+        col = col * (1.0 - crack[:, None]) + \
+            glow * (crack * 2.2 * pulse)[:, None]
 
     if world.ground_mode == 'OCEAN':
         # How much water one pixel covers. The footprint is not square: a ray

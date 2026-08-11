@@ -213,6 +213,10 @@ ENUMS = {
 
 # field -> (min, max, soft_min, soft_max, step/precision hints)
 RANGES = {
+    'outline_width': (1, 8),
+    'outline_opacity': (0.0, 1.0),
+    'outline_depth_threshold': (0.0005, 1.0),
+    'outline_normal_angle': (5.0, 179.0),
     'aa_samples': (1, 64), 'aa_filter_width': (0.1, 4.0),
     'aa_edge_threshold': (0.0, 100.0), 'vertex_snap_grid': (0.05, 16.0),
     'depth_precision': (4, 32), 
@@ -303,6 +307,15 @@ LABELS = {
     'composite': "Composite Video", 'jpeg_artifacts': "JPEG Artefacts",
     'output_scale': "Pixel Scale", 'debug_pass': "Render Pass",
     'render_wire': "Wireframe Overlay", 'wire_width': "Wire Width",
+    'outline': "Cartoon Outlines", 'outline_color': "Ink Colour",
+    'outline_width': "Ink Width", 'outline_opacity': "Ink Opacity",
+    'outline_objects': "Object Edges",
+    'outline_materials': "Material Edges",
+    'outline_depth': "Depth Breaks",
+    'outline_depth_threshold': "Depth Threshold",
+    'outline_normals': "Creases",
+    'outline_normal_angle': "Crease Angle",
+    'outline_over_sky': "Ink Silhouettes",
     'wire_color': "Wire Colour", 'wire_mode': "Edges",
     'wire_angle': "Crease Angle",
     'pass_depth': "Depth", 'pass_normal': "Normal",
@@ -311,6 +324,361 @@ LABELS = {
 }
 
 DESCRIPTIONS = {
+    # ---------------------------------------------------------- output
+    'res_preset': "Jump the output straight to a period format -- VGA, "
+                  "SVGA, broadcast -- with the pixel aspect that format "
+                  "actually used, instead of dialling four numbers",
+    'resolution_x': "Width of the rendered frame in pixels. Period software "
+                    "lived at 320-800; the engine goes as high as you like",
+    'resolution_y': "Height of the rendered frame in pixels",
+    'pixel_aspect_x': "Horizontal pixel stretch. Broadcast and mode-13h "
+                      "formats used non-square pixels; 1.0 is square",
+    'pixel_aspect_y': "Vertical pixel stretch. Set with X to reproduce a "
+                      "format's true pixel shape; 1.0 is square",
+    # ---------------------------------------------------- anti-aliasing
+    'aa_mode': "How edges are smoothed. None is the raw hard-edged raster, "
+               "Supersample renders larger and filters down (the era's "
+               "quality switch), Edge Only spends samples where geometry "
+               "ids change, Accumulation averages jittered whole frames",
+    'aa_samples': "Samples per pixel for the chosen mode. Supersample "
+                  "rounds it to a square (24 renders at 5x5); more is "
+                  "smoother and proportionally slower",
+    'aa_filter': "The downfilter shape used to combine samples. Box is the "
+                 "period default; Tent and Gauss trade a little sharpness "
+                 "for calmer edges",
+    'aa_filter_width': "Radius of the downfilter in output pixels. Wider "
+                       "is softer; 1.0 keeps each pixel to its own samples",
+    'motion_blur': "Blur moving objects across the shutter interval by "
+                   "averaging time-offset frames, as the era's renderers "
+                   "faked it -- expect the cost of Steps extra renders",
+    'motion_shutter': "How long the virtual shutter stays open, in frames. "
+                      "0.5 is a 180-degree film shutter; longer smears more",
+    'motion_steps': "Time samples across the shutter. Few steps show the "
+                    "classic stepped ghosting; many approach smooth blur "
+                    "at a render each",
+    # ------------------------------------------------------- rasteriser
+    'backface_cull': "Skip triangles facing away from the camera at the "
+                     "raster, as period hardware did. Closed meshes look "
+                     "identical and draw faster; open shells lose their "
+                     "insides",
+    'two_sided_lighting': "Light both faces of every surface: a normal "
+                          "facing away from the light flips before shading. "
+                          "How the era rendered single-sided geometry "
+                          "without black backs",
+    'subpixel_precision': "How many fractional bits vertex positions keep "
+                          "at the raster. Full precision is modern and "
+                          "steady; fewer bits snap vertices to a coarser "
+                          "grid and edges wobble as things move -- the "
+                          "PS1-era jitter, by its real mechanism",
+    'vertex_snap_grid': "Snap screen-space vertices to this fraction of a "
+                        "pixel before rasterising. 0 is off; larger steps "
+                        "give the polygon shimmer of fixed-point hardware",
+    'depth_precision': "Bits of depth buffer. 32 is exact for any scene; "
+                       "24 is the period standard; 16 brings the z-fighting "
+                       "and poke-through of budget hardware, faithfully",
+    'clip_near_epsilon': "Safety margin for the near-plane clip, in NDC "
+                         "units. Raise it only if geometry grazing the "
+                         "camera shows cracks; lowering it buys nothing",
+    # ---------------------------------------------------------- shading
+    'default_model': "The reflectance model a material gets when its node "
+                     "tree does not choose one -- the engine-wide house "
+                     "style. Each entry's tooltip describes its era",
+    'force_model': "Override EVERY material's model with one choice for "
+                   "this render -- the whole scene as wireframe, flat, or "
+                   "chalk in one switch. A diagnostic and a look in itself",
+    'shading_rate': "Where lighting is computed: every pixel (Phong-era "
+                    "per-pixel), once per vertex and interpolated "
+                    "(Gouraud, the hardware look), or once per face "
+                    "(flat). The single biggest period-look switch",
+    'normal_source': "Which normals shading uses: the mesh's smoothed "
+                     "normals, or faceted face normals everywhere -- the "
+                     "un-smoothed look of early scanline output",
+    'clamp_specular': "Cap each highlight's brightness at this value "
+                      "before it saturates the frame. 0 is uncapped; the "
+                      "era clamped to keep 8-bit channels from blowing out",
+    'light_clamp': "Cap the summed light on any surface point. Keeps "
+                   "stacked lights inside the period's dynamic range "
+                   "instead of washing to white; 0 is uncapped",
+    'ambient_occlusion': "Darken creases and contact areas with hemisphere "
+                         "rays -- not period-authentic, but period-adjacent "
+                         "grime that reads well on chunky geometry",
+    'ao_distance': "How far an occlusion ray looks for nearby geometry. "
+                   "Short keeps the effect to contact shadows; long "
+                   "darkens whole rooms",
+    'ao_samples': "Occlusion rays per pixel. More is smoother and slower; "
+                  "8 reads clean at period resolutions",
+    'ao_intensity': "Strength of the occlusion darkening. 1 is full "
+                    "effect; fractions fade it toward none",
+    'global_ambient': "Colour of the light that reaches everything from "
+                      "nowhere -- the flat ambient term every 1990s "
+                      "renderer had. Tints every unlit area",
+    'global_ambient_level': "Multiplier on the global ambient colour. The "
+                            "fastest single knob for overall scene "
+                            "brightness outside the lights themselves",
+    'light_falloff_default': "How light dims with distance when a light "
+                             "does not choose: physically correct inverse "
+                             "square, the gentler inverse, the era's "
+                             "none-at-all, or a custom start/end ramp",
+    'light_limit_mode': "Which lights survive when the scene has more than "
+                        "the Light Limit: the brightest, the nearest, or "
+                        "simply the first -- emulating fixed-function "
+                        "hardware's light slots",
+    # ---------------------------------------------------------- shadows
+    'shadows': "Master switch for all shadowing. Off is the flat, "
+               "floating look of the earliest real-time output",
+    'shadow_default': "How shadows are computed when a light does not "
+                      "choose: depth maps rendered from each light (soft, "
+                      "fast, the period standard), traced rays (hard and "
+                      "exact), or per-light choice",
+    'shadow_map_size': "Resolution of each light's depth map. Small maps "
+                       "give blocky period shadows; large maps sharpen "
+                       "contact edges. Lights can override individually",
+    'shadow_bias': "World-space offset that keeps a surface from shadowing "
+                   "itself. Too low shows acne stippling; too high "
+                   "detaches shadows from their objects (Peter Panning)",
+    'shadow_softness': "Blur radius of mapped shadows, in shadow-map "
+                       "texels. 0 is hard-edged; more taps a wider "
+                       "neighbourhood for softer penumbras",
+    'shadow_samples': "Taps per pixel for soft mapped shadows, or rays per "
+                      "pixel for soft traced shadows from area-sized "
+                      "lights. More is smoother and slower",
+    # ------------------------------------------------------ ray tracing
+    'raytrace': "Master switch for traced reflections and refractions -- "
+                "the checkbox that separated the raytracers from the "
+                "scanliners. Materials still choose their own amounts",
+    'ray_depth': "How many times a ray may bounce between mirrors or "
+                 "through glass before giving up and taking the sky. "
+                 "Two facing mirrors show this number directly",
+    'ray_reflection': "Allow traced reflections for materials that ask "
+                      "for them. Off, reflective surfaces fall back to "
+                      "the environment term",
+    'ray_refraction': "Allow traced refraction through transparent "
+                      "materials with an IOR. Off, glass becomes simple "
+                      "alpha transparency",
+    'ray_bias': "How far a spawned ray steps off its surface before "
+                "testing the world, in world units. Too low and surfaces "
+                "shadow and reflect themselves as speckle; too high and "
+                "contact detail goes missing",
+    'env_reflection': "Let materials reflect the world background where "
+                      "rays are off or exhausted -- the era's spherical "
+                      "environment map trick",
+    # --------------------------------------------------------- textures
+    'tex_filter': "How textures are sampled: Nearest is the chunky texel "
+                  "look, Bilinear smooths, Trilinear adds mip blending, "
+                  "EWA is the quality path. The single most visible "
+                  "texture-era switch",
+    'tex_mipmap': "Build and use mip pyramids so distant textures calm "
+                  "down instead of sparkling. Off reproduces the shimmer "
+                  "of software that never mipped",
+    'tex_mip_bias': "Shift mip selection sharper (negative) or blurrier "
+                    "(positive), in levels. Period hardware often biased "
+                    "sharp and lived with the noise",
+    'tex_aniso': "Maximum anisotropy for EWA filtering. Higher keeps "
+                 "floors readable at grazing angles; 1 is isotropic",
+    'tex_max_size': "Downsample any texture larger than this before use, "
+                    "as period VRAM budgets forced. 0 keeps full size",
+    'tex_quantize': "Reduce every texture to this many colours before "
+                    "sampling -- palettised texture memory, with its "
+                    "banding, exactly as shipped games had it",
+    'tex_affine_subdiv': "For affine (PS1-style) texture mapping: cut each "
+                         "triangle into this many pieces so the warp stays "
+                         "bounded. 1 is the full classic wobble",
+    'tex_wrap_default': "What textures do past their edges when the node "
+                        "does not say: repeat, mirror, clamp, or clip to "
+                        "nothing",
+    # ----------------------------------------------------- transparency
+    'transparency': "How see-through surfaces composite: sorted alpha "
+                    "blending, the A-buffer's exact per-pixel lists, or "
+                    "Screen Door's dither-pattern holes (no sorting, no "
+                    "blending, pure period)",
+    'stipple_pattern': "The hole pattern Screen Door transparency punches, "
+                       "per opacity level. Each entry is a real pattern "
+                       "family from shipped hardware",
+    'alpha_bits': "Bits of opacity resolution for the alpha channel. "
+                  "Fewer bits step smooth fades into visible bands",
+    'alpha_threshold': "Below this opacity a Screen Door pixel is simply "
+                       "skipped -- the cutoff that kept near-invisible "
+                       "surfaces from costing fill",
+    # --------------------------------------------------------------- fog
+    'fog': "Master switch for distance fog, the era's draw-distance "
+           "disguise and mood in one",
+    'fog_mode': "The fog curve: Linear between Start and End, or the two "
+                "exponential falls hardware offered. Linear is the most "
+                "controllable; Exp2 is the deepest soup",
+    'fog_color': "The colour distant geometry fades toward. Matching the "
+                 "sky hides the far clip; contrasting it makes fog a look",
+    'fog_start': "Distance where linear fog begins, in world units. "
+                 "Nearer than this is fully clear",
+    'fog_end': "Distance where linear fog saturates; beyond this "
+               "everything is fog colour",
+    'fog_density': "Steepness of the exponential fog modes. Small numbers "
+                   "haze the horizon; large ones swallow the middle ground",
+    'fog_vertex': "Compute fog per vertex and interpolate, as fixed-"
+                  "function pipelines did -- visible banding on long "
+                  "triangles, which is the point",
+    'fog_height': "Limit fog to below a world height, thinning with "
+                  "altitude -- valley mist instead of uniform soup",
+    'fog_height_top': "World height where height fog has fully thinned "
+                      "to nothing",
+    'fog_height_falloff': "How sharply height fog thins between its base "
+                          "and top. Higher hugs the ground",
+    # -------------------------------------------------------------- glow
+    'glow': "Bloom around bright areas -- the soft television halo every "
+            "period FMV had. Threshold picks what counts as bright",
+    'glow_threshold': "Brightness above which a pixel feeds the glow. "
+                      "Lower pulls midtones into the halo; higher keeps "
+                      "glow to highlights",
+    'glow_radius': "Size of the halo in pixels at output resolution",
+    'glow_intensity': "Strength of the glow added back over the frame",
+    'glow_quality': "Blur passes for the halo. More is smoother and "
+                    "slower; low counts show the period's boxy bloom",
+    'star_filter': "Cross-screen star spikes on bright points, the "
+                   "camera-filter look pasted over renders of the era",
+    'star_points': "How many spikes each star throws",
+    'star_length': "Length of the spikes in pixels",
+    'star_rotation': "Rotation of the whole star pattern, in degrees",
+    'star_intensity': "Brightness of the star spikes",
+    'lens_flare': "Draw a lens flare from the brightest light in frame -- "
+                  "ghosts, streak and all. The single most period effect "
+                  "there is",
+    'flare_intensity': "Overall strength of the flare elements",
+    'flare_ghosts': "How many aperture ghosts march across the frame "
+                    "opposite the light",
+    'flare_streak': "Strength of the horizontal anamorphic streak",
+    # ------------------------------------------------------------ colour
+    'color_depth': "Bits per pixel of the delivered frame. 24 is "
+                   "truecolor; 16 and below quantise with the exact "
+                   "banding of the era's framebuffers; HAM modes "
+                   "reproduce the Amiga's tricks precisely",
+    'palette_mode': "For palettised depths: use a fixed period palette, "
+                    "or fit one to this frame the way the era's "
+                    "converters did",
+    'palette_size': "Number of palette entries when fitting: 256 is VGA, "
+                    "16 is EGA territory",
+    'palette_method': "How the fitted palette is chosen -- median cut is "
+                      "the classic, octree the smoother",
+    'dither': "The error-spreading pattern that sells low colour depths: "
+              "ordered Bayer matrices in period sizes, or Floyd-"
+              "Steinberg diffusion",
+    'dither_strength': "How much of the quantisation error the dither "
+                       "spreads. 1 is full correction; less shows more "
+                       "banding on purpose",
+    'exposure': "Linear brightness multiplier applied before the display "
+                "curve. 1 is neutral",
+    'gamma': "The display curve's exponent. 1 is neutral; below brightens "
+             "midtones, above deepens them. Period CRTs lived near 2.2",
+    'contrast': "S-curve strength around middle grey. 0 is neutral",
+    'saturation': "Colour intensity. 1 is neutral, 0 is greyscale, above "
+                  "1 pushes toward the era's oversaturated promos",
+    'brightness': "Flat offset added to the frame after exposure. 0 is "
+                  "neutral",
+    'input_gamma_naive': "Treat texture pixels as already-linear the way "
+                         "naive period software did, instead of "
+                         "converting from sRGB. Changes every texture's "
+                         "midtones; authentic, not correct",
+    # ---------------------------------------------------------- CRT & TV
+    'crt': "Draw the frame as a CRT would show it: scanlines, phosphor "
+           "mask, bloom and curvature, each with its own control",
+    'crt_scanlines': "Darkened lines between the picture's rows. The "
+                     "strength of the CRT's most recognisable artefact",
+    'crt_mask': "The phosphor arrangement simulated: aperture grille, "
+                "slot mask or shadow mask",
+    'crt_mask_strength': "How visibly the phosphor mask dims the picture",
+    'crt_bloom': "How much bright areas bleed into neighbouring "
+                 "phosphors",
+    'crt_curvature': "Bulge of the simulated glass. 0 is flat",
+    'crt_vignette': "Darkening toward the tube's corners",
+    'composite': "Push the frame through a simulated composite video "
+                 "cable: colour bleed, ringing and dot crawl, the way "
+                 "most people actually saw this era",
+    'composite_bleed': "How far chroma smears horizontally -- the "
+                       "rainbow fringing on sharp colour edges",
+    'composite_ringing': "Ghost echoes after hard luma edges, from the "
+                         "cable's bandwidth limit",
+    'composite_dot_crawl': "The crawling checkerboard on coloured edges "
+                           "where chroma and luma interfere",
+    'interlace': "Render alternating fields with a one-frame comb offset "
+                 "on motion -- broadcast video's signature",
+    'jpeg_artifacts': "Recompress the frame as a period JPEG, 8x8 blocks "
+                      "and all -- the look of every mid-90s CD-ROM still",
+    'jpeg_quality': "The simulated JPEG quality. Lower is blockier",
+    'jpeg_passes': "Recompression generations. Each pass compounds the "
+                   "damage, as re-saved files did",
+    'block_size': "Pixelate the frame into blocks of this size after "
+                  "rendering. 1 is off; larger is chunkier",
+    'pixel_grid': "Darken the seams between output pixels, as LCD "
+                  "previews and some grabbers showed them",
+    # ------------------------------------------------------------- misc
+    'progressive': "Deliver the frame in coarse-to-fine passes while it "
+                   "renders instead of row by row -- the era's preview "
+                   "refinement, and a quicker first look now",
+    'seed': "Random seed for every stochastic effect: soft shadows, AO, "
+            "dither jitter. Same seed, same picture, every time",
+    'render_wire': "Draw the mesh's edges over the finished shading -- "
+                   "the hidden-line overlay of period modellers, at "
+                   "render quality",
+    'wire_mode': "Which edges the overlay inks: every triangle edge, "
+                 "only marked/creased ones, or silhouette and folds",
+    'wire_angle': "For angle-based wire modes: the crease angle in "
+                  "degrees above which an edge is inked",
+    'wire_color': "Colour of the inked wire edges",
+    'wire_width': "Width of the inked edges, in output pixels",
+    'outline': "Ink cartoon outlines over the frame, drawn from the "
+               "renderer's own buffers -- silhouettes, material borders, "
+               "depth breaks and creases, each its own toggle below. At "
+               "high anti-aliasing the line smooths beautifully",
+    'outline_color': "Colour of the ink. Black for classic cel work; try "
+                     "a dark tone of the scene's palette for softer looks",
+    'outline_width': "Thickness of the ink in INTERNAL pixels -- under "
+                     "Supersample the delivered line is this divided by "
+                     "the sample grid, so raise it for heavy AA",
+    'outline_opacity': "How solidly the ink covers what is under it. 1 is "
+                       "full ink; fractions tint instead of cover",
+    'outline_objects': "Ink where one object ends and another begins -- "
+                       "the silhouette lines",
+    'outline_materials': "Ink where the material changes on a surface, "
+                         "even inside one object",
+    'outline_depth': "Ink where depth jumps -- edges a silhouette test "
+                     "misses when an object overlaps itself",
+    'outline_depth_threshold': "How large a depth jump counts, as a "
+                               "fraction of the nearer distance. Smaller "
+                               "inks more overlaps; larger keeps ink to "
+                               "big steps",
+    'outline_normals': "Ink creases: edges where the surface turns harder "
+                       "than the angle below -- the cube's edges, a "
+                       "cylinder's rim",
+    'outline_normal_angle': "The crease angle in degrees. Smaller inks "
+                            "gentler turns; 90 keeps ink to hard corners",
+    'outline_over_sky': "Let the ink land on the background at object "
+                        "silhouettes, not only on other surfaces",
+    'pass_depth': "Also deliver a Depth pass: each pixel's distance from "
+                  "the camera, for compositing",
+    'pass_normal': "Also deliver a Normal pass: the shading normal per "
+                   "pixel, for relighting tricks",
+    'pass_position': "Also deliver a world Position pass per pixel",
+    'pass_uv': "Also deliver the UV coordinates per pixel",
+    'pass_object_index': "Also deliver each pixel's object index, for "
+                         "per-object masks downstream",
+    'pass_material_index': "Also deliver each pixel's material index, "
+                           "for per-material masks downstream",
+    'debug_pass': "Replace the delivered image with one internal buffer "
+                  "-- depth, normals, UVs, overdraw, wireframe -- to see "
+                  "what the renderer sees",
+    # ------------------------------------------------- layered rendering
+    'layer_gpu_min_frac': "Depth layers whose pixel share is below this "
+                          "fraction shade on the CPU rather than paying a "
+                          "GPU pass's fixed costs. 0 sends everything to "
+                          "the GPU, 1 keeps every layer on the CPU",
+    # ------------------------------------------------------ lens effects
+    'lens_vignette_edges': "Darkening toward the frame's corners from the "
+                           "simulated lens itself, independent of the CRT "
+                           "vignette",
+    'shaft_decay': "How quickly volumetric light shafts fade along their "
+                   "length. Higher dies faster",
+    'shaft_samples': "March steps per pixel for light shafts. More is "
+                     "smoother and slower",
+    'dof_max_radius': "Cap on the depth-of-field blur circle, in pixels. "
+                      "Keeps extreme defocus affordable",
     'radiosity': "One bounce of gathered colour bleed -- the era's "
                  "Radiosity checkbox. Rays that see sky return the ambient "
                  "colour; rays that land on a surface return its flat "
@@ -738,15 +1106,63 @@ def user_skies():
 _SKY_ITEMS = []
 
 
+_SKY_PREVIEWS = [None]
+
+
+def sky_previews():
+    """The thumbnail collection, loaded lazily from presets/thumbs/.
+
+    Every built-in sky ships a rendered thumbnail (the engine's own sky
+    module drew them). Never fatal: without bpy.utils.previews the enum
+    simply has no pictures.
+    """
+    if _SKY_PREVIEWS[0] is not None:
+        return _SKY_PREVIEWS[0]
+    import os
+    try:
+        import bpy.utils.previews
+        pcoll = bpy.utils.previews.new()
+        base = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), 'halcyon', 'presets', 'thumbs')
+        if not os.path.isdir(base):
+            base = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'presets', 'thumbs')
+        if os.path.isdir(base):
+            for name in os.listdir(base):
+                if name.endswith('.png'):
+                    key = name[:-4]
+                    pcoll.load(key, os.path.join(base, name), 'IMAGE')
+        _SKY_PREVIEWS[0] = pcoll
+    except Exception:                                           # noqa: BLE001
+        _SKY_PREVIEWS[0] = {}
+    return _SKY_PREVIEWS[0]
+
+
 def sky_preset_items(self=None, context=None):
     from .presets.skies import sky_items
-    items = [(k, label, note) for k, label, note in sky_items()]
+    pcoll = sky_previews()
+    items = []
+    for i, (k, label, note) in enumerate(sky_items()):
+        icon = 0
+        try:
+            if pcoll and k in pcoll:
+                icon = pcoll[k].icon_id
+        except Exception:                                       # noqa: BLE001
+            icon = 0
+        items.append((k, label, note, icon, i) if icon else (k, label, note))
     saved = user_skies()
     if saved:
         items.append(('', "Saved Skies", ''))
         for path, label in saved:
             items.append(('FILE:' + path, label, "A sky you saved"))
-    _SKY_ITEMS[:] = items
+    # a mixed 3/5-tuple list confuses Blender: normalise to 5-tuples
+    norm = []
+    for j, it in enumerate(items):
+        if len(it) == 3:
+            norm.append((it[0], it[1], it[2], 0, len(sky_items()) + j))
+        else:
+            norm.append(it)
+    _SKY_ITEMS[:] = norm
     return _SKY_ITEMS
 
 
@@ -1086,6 +1502,17 @@ class HalcyonWorldSettings(PropertyGroup):
                                "tracing demos"),
         ('NOISE', "Fractal", "Two colours mixed by fractal noise, for terrain "
                              "seen from height"),
+        ('GRID', "Neon Grid", "Glowing gridlines to the horizon -- the "
+                              "synthwave floor. The second colour is the "
+                              "line glow"),
+        ('TILES', "Tiles", "Square tiles with grout and per-tile shading. "
+                           "The second colour is the grout"),
+        ('DESERT', "Dunes", "Wind-ribbed sand ridges warped by noise, the "
+                            "second colour on the crests"),
+        ('SNOW', "Snowfield", "A bright field with blue-shadowed hollows "
+                              "and sparse sun glints"),
+        ('LAVA', "Lava", "Dark crust over glowing cracks; the second "
+                         "colour is the heat, pulsing slowly"),
         ('OCEAN', "Ocean", "Animated waves reflecting the sky, with a Fresnel "
                            "term so it mirrors at glancing angles")))
     ground_height: FloatProperty(name="Height", default=0.0, min=-1e4, max=1e4)
@@ -1159,6 +1586,240 @@ class HalcyonWorldSettings(PropertyGroup):
     env_tint: _col("Tint", (1.0, 1.0, 1.0))
     sky_blend: BoolProperty(name="Sky Gradient", default=False,
                             options={'HIDDEN'})
+
+
+#: tooltips for group properties declared inline above -- patched into the
+#: deferred property definitions below, so every control in every panel
+#: carries a real explanation without repeating boilerplate at each site
+GROUP_DOCS = {
+    'HalcyonSettings': {
+        'ui_tab': "Which page of Halcyon's settings this panel shows. "
+                  "Purely a UI switch; it changes nothing in the render",
+    },
+    'HalcyonMaterialSettings': {
+        'model': "The reflectance model this override shades with -- each "
+                 "entry's tooltip names its era and character",
+        'diffuse': "The surface's base colour under white light",
+        'diffuse_level': "How strongly the diffuse term contributes. 0 "
+                         "kills the base colour entirely",
+        'specular': "Colour of the highlight. Plastics keep it white; "
+                    "period metals tinted it to fake conductor response",
+        'specular_level': "Brightness of the highlight. 0 is fully matte",
+        'glossiness': "Tightness of the highlight: low is a broad sheen, "
+                      "high is a small hard sparkle. The classic Phong "
+                      "exponent, under its 3D Studio name",
+        'ambient_level': "How much of the scene's ambient light this "
+                         "surface accepts. The era's per-material shadow "
+                         "filler",
+        'emission': "Light the surface gives off by itself, unaffected by "
+                    "any lamp -- the Self-Illumination of the period",
+        'emission_level': "Multiplier on the emission colour",
+        'opacity': "How solid the surface is. Below 1 it composites "
+                   "through the transparency mode the render settings "
+                   "chose",
+        'ior': "Index of refraction for traced glass. 1.0 bends nothing; "
+               "1.45 is glass; 1.33 water",
+        'roughness': "Micro-surface roughness for the models that read it "
+                     "(Oren-Nayar, Cook-Torrance, Minnaert)",
+        'anisotropy': "Stretches the highlight along one direction, for "
+                      "brushed metal. 0 is round",
+        'aniso_rotation': "Rotates the stretched highlight's direction",
+        'metallic': "Blends the surface toward conductor behaviour: "
+                    "diffuse falls away and reflections take the base "
+                    "colour",
+        'reflect_level': "How much traced mirror reflection the surface "
+                         "adds. 0 is none; it costs rays above that",
+        'two_sided': "Shade back faces as if they were front faces, so "
+                     "open geometry has no black inside",
+        'shadeless': "Skip lighting entirely and show the diffuse colour "
+                     "flat -- the CONSTANT model by another switch",
+        'cast_shadow': "Whether this surface blocks light on its way to "
+                       "other surfaces",
+        'receive_shadow': "Whether other objects' shadows darken this "
+                          "surface",
+        'wire': "Draw this material's triangle edges over its shading, "
+                "per-material rather than scene-wide",
+        'wire_size': "Width of this material's inked edges, in rendered "
+                     "pixels",
+    },
+    'HalcyonLightSettings': {
+        'decay': "How this light dims with distance: physically correct "
+                 "inverse square, the gentler inverse, the era's none, or "
+                 "a custom start/end ramp",
+        'decay_start': "Distance where the custom ramp starts dimming. "
+                       "Closer than this is full brightness",
+        'decay_end': "Distance where the custom ramp reaches zero",
+        'shadow': "This light's own shadow method: depth map, traced "
+                  "rays, or none -- overriding the scene default when "
+                  "the scene is set to Per Light",
+        'shadow_softness': "Blur of this light's mapped shadow, in "
+                           "shadow-map texels. 0 is hard",
+        'shadow_samples': "Taps or rays per pixel for this light's soft "
+                          "shadows",
+        'shadow_density': "How dark this light's shadows get. 1 is full "
+                          "occlusion; less lets colour bleed through, as "
+                          "the era's fake fill lights did",
+        'shadow_color': "Colour inside this light's shadows instead of "
+                        "black -- the tinted-shadow trick of period art",
+        'diffuse_only': "This light affects only the diffuse term, "
+                        "leaving highlights untouched",
+        'specular_only': "This light affects only highlights, adding "
+                         "sparkle without lifting the surface",
+        'ambient_only': "This light adds flat ambient everywhere instead "
+                        "of directional light",
+        'exclude_mode': "Whether the collection below is kept OUT of this "
+                        "light, or is the only thing kept IN it",
+    },
+    'HalcyonWorldSettings': {
+        'mode': "What the sky IS: the material node tree, a flat colour, "
+                "a gradient, banded steps, a starfield, the Bryce sky "
+                "lab, a physical atmosphere, or an HDRI image",
+        'strength': "Multiplier on everything the sky contributes -- "
+                    "background, ambient and reflections together",
+        'ambient': "Colour of the light the world adds from every "
+                   "direction, independent of any lamp",
+        'ambient_level': "Multiplier on the world's ambient colour",
+        'color': "The flat background colour in Solid mode",
+        'horizon': "Sky colour at the horizon in Gradient and Bands "
+                   "modes",
+        'zenith': "Sky colour straight up in Gradient and Bands modes",
+        'ground_color': "Colour below the horizon when Show Ground is on",
+        'horizon_height': "Vertical position of the horizon line, as the "
+                          "ray direction's Z. 0 is level with the camera",
+        'blend_mode': "The shape of the horizon-to-zenith blend: linear, "
+                      "smooth, sharp or eased",
+        'sky_mode': "Bryce's Sky Mode: Soft Sky derives the dome from the "
+                    "sun's own colour; Custom Sky exposes the three "
+                    "colour stops directly",
+        'shadow_intensity': "Bryce's shadow-strength slider: how dark the "
+                            "sky-lab lighting draws its shadows",
+        'fog_blend_sky': "How much the fog band takes its colour from the "
+                         "sky rather than its own",
+        'fog_sun_tint': "How much the fog band warms toward the sun's "
+                        "colour near the sun",
+        'cloud_turbulence': "How hard the cloud noise is folded. Bryce's "
+                            "third cloud control: higher is stormier",
+        'fixed_cloud_plane': "Anchor the cloud pattern to the world "
+                             "rather than the view, so orbiting the "
+                             "camera does not slide the deck",
+        'stratus_frequency': "Tightness of the stratus layer's pattern",
+        'stratus_amplitude': "Contrast swing of the stratus layer about "
+                             "its cover threshold",
+        'comet_count': "How many comets streak the celestial sphere",
+        'comet_color': "Colour of the comet heads and tails",
+        'sun_elevation': "Height of the sun above the horizon, in "
+                         "radians. Near 0 is sunset; 1.57 is overhead",
+        'sun_rotation': "Compass direction of the sun, in radians",
+        'sun_color': "Colour of the sun disc and the light it throws "
+                     "into the sky model",
+        'sun_size': "Angular size of the visible sun disc",
+        'sun_intensity': "Brightness of the sun's contribution to the "
+                         "dome",
+        'sun_disc': "Whether the sun itself is drawn, or only its light",
+        'celestial': "Master switch for the celestial layer: moon, "
+                     "stars, comets",
+        'moon_color': "Colour of the moon disc drawn on the night dome",
+        'moon_size': "Angular size of the moon disc",
+        'sky_mid': "Custom Sky's middle colour stop, between horizon "
+                   "and zenith",
+        'sky_mid_height': "Where the middle stop sits between horizon "
+                          "(0) and zenith (1)",
+        'atmosphere_falloff': "How quickly the sky colour transitions "
+                              "happen with altitude. Higher hugs the "
+                              "horizon",
+        'atmosphere_color': "Overall atmospheric tint layered over the "
+                            "dome",
+        'cloud_wind_angle': "Compass direction the cloud decks drift, "
+                            "in radians",
+        'haze_color': "Colour of the horizon haze band",
+        'haze_height': "Vertical thickness of the haze band",
+        'fog_color': "Colour of the Bryce fog band at the horizon",
+        'fog_height': "Vertical thickness of the Bryce fog band",
+        'clouds': "Master switch for the cumulus cloud deck",
+        'cloud_color': "Colour of the cumulus deck's sunlit faces",
+        'cloud_shadow': "How darkly the deck shades its own undersides",
+        'cloud_cover': "How much of the sky the cumulus deck covers. "
+                       "Bryce's cover slider",
+        'cloud_density': "How solid each cloud reads against the sky "
+                         "behind it",
+        'cloud_height': "Altitude of the cumulus deck on the dome. "
+                        "Lower decks race past; higher ones sit still",
+        'cloud_detail': "Noise octaves in the cloud pattern. More is "
+                        "crinklier and slower",
+        'cloud_softness': "Softness of the cloud edges against the sky",
+        'cloud_seed': "Random seed for the cloud pattern. Change it for "
+                      "a different sky with the same settings",
+        'stratus': "Master switch for the high thin stratus layer",
+        'stratus_color': "Colour of the stratus wisps",
+        'stratus_amount': "Coverage of the stratus layer",
+        'stratus_density': "How solid the stratus wisps read",
+        'stratus_altitude': "Altitude of the stratus layer on the dome",
+        'stratus_scale': "Size of the stratus features",
+        'stratus_detail': "Noise octaves in the stratus pattern",
+        'stratus_sharpness': "Edge hardness of the stratus wisps",
+        'rainbow': "Draw a rainbow opposite the sun, as Bryce could",
+        'rainbow_intensity': "Brightness of the rainbow arc",
+        'rainbow_width': "Angular width of the rainbow band",
+        'rainbow_secondary': "Strength of the fainter, colour-reversed "
+                             "outer bow",
+        'stars': "Master switch for the star layer of night skies",
+        'star_density': "How many stars fill the sphere",
+        'star_brightness': "Brightness of the star points",
+        'nebula_color': "Colour of the faint nebula wash behind the "
+                        "stars",
+        'nebula_scale': "Size of the nebula's billows",
+        'nebula_detail': "Noise octaves in the nebula wash",
+        'ground_albedo': "How much light the physical atmosphere's "
+                         "ground bounces back into the sky",
+        'ground_mode': "What the infinite ground plane is made of -- "
+                       "each entry is its own material with its own "
+                       "controls",
+        'ground_height': "World height of the infinite ground plane",
+        'ground_scale': "Feature size of the ground material's pattern",
+        'ground_color2': "The ground material's secondary colour, where "
+                         "its pattern uses one",
+        'ocean_deep': "Water colour looking into deep water",
+        'ocean_shallow': "Water colour near the surface and crests",
+        'ocean_glitter_size': "Size of the sun-glitter sparkles on the "
+                              "water",
+        'ocean_foam_color': "Colour of the foam along wave crests",
+        'ocean_transparency': "How much the water lets the sky's "
+                              "reflection give way to its own colour",
+        'ocean_choppiness': "How steep and broken the waves are",
+        'ocean_speed': "How fast the waves animate over frames",
+        'env_image': "The image used as the world in HDRI mode",
+        'env_mapping': "How the image wraps the sphere: equirectangular, "
+                       "mirror ball, or screen-locked",
+        'env_filter': "Filtering used when sampling the environment "
+                      "image",
+        'env_tint': "Colour multiplied over the environment image",
+        'sky_blend': "Blend the lower sky toward the horizon colour for "
+                     "a softer meeting with the ground",
+    },
+}
+
+
+def _apply_group_docs():
+    """Patch GROUP_DOCS into the deferred property definitions.
+
+    Works on both the real bpy (property functions return a deferred with
+    `.keywords`) and the test fake (`_Prop.kw`), and only fills holes --
+    an inline description written at the definition site always wins.
+    """
+    for cls in (HalcyonSettings, HalcyonMaterialSettings,
+                HalcyonLightSettings, HalcyonWorldSettings):
+        docs = GROUP_DOCS.get(cls.__name__) or {}
+        for pname, desc in docs.items():
+            ann = cls.__annotations__.get(pname)
+            if ann is None:
+                continue
+            for attr in ('keywords', 'kw'):
+                kw = getattr(ann, attr, None)
+                if isinstance(kw, dict) and not kw.get('description'):
+                    kw['description'] = desc
+
+
+_apply_group_docs()
 
 
 CLASSES = (HalcyonSettings, HalcyonMaterialSettings, HalcyonLightSettings,

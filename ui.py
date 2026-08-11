@@ -28,6 +28,30 @@ class HalcyonPanel:
 # ------------------------------------------------------------------ operators
 
 
+def _poke_updated(context, *ids):
+    """Tell Blender that `ids` changed, so the rendered view redraws NOW.
+
+    A preset writes dozens of properties through plain setattr, and none of
+    those writes tags the datablock for the depsgraph -- so a Bryce sky
+    preset applied over a rendered viewport showed the OLD sky until the
+    user nudged any slider (whose update callback finally did the tagging).
+    Applying a preset must poke the same machinery a slider pokes.
+    """
+    for _id in ids:
+        if _id is None:
+            continue
+        try:
+            _id.update_tag()
+        except Exception:                                       # noqa: BLE001
+            pass
+    try:
+        scr = getattr(context, 'screen', None)
+        for area in (scr.areas if scr else ()):
+            area.tag_redraw()
+    except Exception:                                           # noqa: BLE001
+        pass
+
+
 class HALCYON_OT_apply_preset(Operator):
     bl_idname = 'halcyon.apply_preset'
     bl_label = "Apply Preset"
@@ -87,6 +111,7 @@ class HALCYON_OT_apply_preset(Operator):
             r.pixel_aspect_y = entry['settings']['pixel_aspect_y']
         if entry['settings'].get('film_transparent') is not None:
             r.film_transparent = bool(entry['settings']['film_transparent'])
+        _poke_updated(context, context.scene)
         self.report({'INFO'}, f"Applied {entry['label']}"
                               + (" (settings reset first)" if self.reset else ""))
         return {'FINISHED'}
@@ -1365,7 +1390,7 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
 
             slot = slots[ob.active_material_index] if len(slots) else None
             if slot is not None:
-                layout.template_ID(slot, 'material', new='material.new')
+                layout.template_ID(slot, 'material', new='halcyon.material_new')
             else:
                 layout.operator('object.material_slot_add',
                                 text="New Material Slot", icon='ADD')
@@ -1555,6 +1580,46 @@ class HALCYON_PT_wireframe(HalcyonPanel, Panel):
             note.label(text=line)
 
 
+class HALCYON_PT_outline(HalcyonPanel, Panel):
+    bl_label = "Cartoon Outlines"
+    bl_context = "render"
+    bl_parent_id = 'HALCYON_PT_shading'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw_header(self, context):
+        self.layout.prop(context.scene.halcyon, 'outline', text="")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        hs = context.scene.halcyon
+        col = layout.column()
+        col.active = hs.outline
+        col.prop(hs, 'outline_color')
+        col.prop(hs, 'outline_width')
+        col.prop(hs, 'outline_opacity')
+        col.separator()
+        col.prop(hs, 'outline_objects')
+        col.prop(hs, 'outline_materials')
+        col.prop(hs, 'outline_depth')
+        sub = col.column()
+        sub.active = hs.outline and hs.outline_depth
+        sub.prop(hs, 'outline_depth_threshold')
+        col.prop(hs, 'outline_normals')
+        sub = col.column()
+        sub.active = hs.outline and hs.outline_normals
+        sub.prop(hs, 'outline_normal_angle')
+        col.prop(hs, 'outline_over_sky')
+        note = layout.column(align=True)
+        note.active = False
+        note.scale_y = 0.8
+        for line in _wrap("Ink is drawn at the internal resolution: with "
+                          "Supersample on, the line anti-aliases on the "
+                          "way down. Width is internal pixels -- raise it "
+                          "under heavy AA.", 46):
+            note.label(text=line)
+
+
 # ------------------------------------------------------------- sky presets
 
 
@@ -1611,6 +1676,7 @@ class HALCYON_OT_sky_preset(Operator):
         if not ok:
             self.report({'ERROR'}, msg)
             return {'CANCELLED'}
+        _poke_updated(context, context.world, context.scene)
         self.report({'INFO'}, f"Sky: {msg}")
         return {'FINISHED'}
 
@@ -1805,6 +1871,7 @@ class HALCYON_OT_water_preset(Operator):
         if not ok:
             self.report({'ERROR'}, msg)
             return {'CANCELLED'}
+        _poke_updated(context, context.world, context.scene)
         self.report({'INFO'}, f"Water: {msg}")
         return {'FINISHED'}
 
@@ -1988,6 +2055,14 @@ class HALCYON_PT_world(HalcyonPanel, Panel):
         if hs.mode == 'BRYCE':
             box = layout.box()
             box.label(text="Sky Presets", icon='WORLD')
+            # the browsable gallery: every built-in sky ships a rendered
+            # thumbnail (drawn by the engine's own sky module), so the
+            # picker is a wall of pictures rather than 300 names
+            try:
+                box.template_icon_view(hs, 'sky_preset', show_labels=True,
+                                       scale=5.0)
+            except Exception:                                   # noqa: BLE001
+                pass
             box.prop(hs, 'sky_preset', text="")
             box.operator('halcyon.sky_preset', text="Apply Preset",
                          icon='CHECKMARK')
@@ -2159,7 +2234,8 @@ CLASSES = (
     HALCYON_PT_performance, HALCYON_PT_debug,
     HALCYON_OT_clear_palette_cache,
     HALCYON_OT_diagnostics, HALCYON_PT_material,
-    HALCYON_PT_light, HALCYON_PT_wireframe, HALCYON_PT_passes,
+    HALCYON_PT_light, HALCYON_PT_wireframe, HALCYON_PT_outline,
+    HALCYON_PT_passes,
     HALCYON_PT_world, HALCYON_PT_world_sun,
     HALCYON_PT_world_atmosphere, HALCYON_PT_world_cumulus,
     HALCYON_PT_world_stratus, HALCYON_PT_world_effects,

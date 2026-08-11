@@ -257,6 +257,21 @@ class RenderSettings:
     wire_angle: float = 25.0
     wire_color: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     wire_width: float = 1.0
+    # ------------------------------------------------- cartoon outlines
+    # ink drawn from the G-buffer's own boundaries -- object ids, material
+    # ids, depth breaks, normal creases -- at the internal resolution, so
+    # supersampling anti-aliases the line on the way down
+    outline: bool = False
+    outline_color: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    outline_width: int = 1
+    outline_opacity: float = 1.0
+    outline_objects: bool = True
+    outline_materials: bool = False
+    outline_depth: bool = True
+    outline_depth_threshold: float = 0.02
+    outline_normals: bool = True
+    outline_normal_angle: float = 60.0
+    outline_over_sky: bool = True
     show_stats: bool = False
     watermark: str = ''
     # extra outputs written alongside the beauty image, for the compositor

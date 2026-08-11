@@ -117,8 +117,13 @@ SPECS = [
 
     ('MatcapUV', "Matcap Coordinates", 'MATSPHERE',
      "Sphere-map coordinates from the view-space normal. Feed the Vector into "
-     "an Image Texture of a lit sphere, then into the shader's Matcap input",
-     [(F, 'Scale', 1.0)], {},
+     "an Image Texture of a lit sphere, then into the shader's Matcap input -- "
+     "or into a Gradient with Centered on, for a view-locked sphere gradient",
+     [(F, 'Scale', 1.0), (V, 'Offset', None)],
+     {'centered': ('bool', False,
+                   "Output around the origin (-0.5..0.5) instead of image "
+                   "space (0..1), so a Spherical gradient fed this vector "
+                   "lands centred instead of cornered")},
      [(V, 'Vector'), (F, 'Facing')]),
 
     ('Spiral', "Spiral", 'FORCE_VORTEX',
@@ -132,8 +137,12 @@ SPECS = [
     ('Noise', "Fractal Noise", 'MOD_OCEAN',
      "The raw integer-hash fractal field, three profiles. Reach for this "
      "where Blender's own Noise texture would go: that one's sin-fract hash "
-     "cannot travel to the GPU, this one travels exactly",
-     [(V, 'Vector', None), (F, 'Scale', 4.0), (F, 'Lacunarity', 2.0),
+     "cannot travel to the GPU, this one travels exactly. Dimensions picks "
+     "the lattice: 1D along X, 2D flat, 3D solid, 4D with W as a free axis "
+     "-- animate W for evolution, or drive it in a circle for a seamless "
+     "loop",
+     [(V, 'Vector', None), (F, 'Scale', 4.0), (F, 'W', 0.0),
+      (F, 'Lacunarity', 2.0),
       (F, 'Gain', 0.5), (C, 'Color 1', GREY_B), (C, 'Color 2', GREY_A)],
      {'kind': ('enum', 'SMOOTH', (('SMOOTH', "Smooth", "Plain fBm"),
                                   ('TURBULENT', "Turbulent",
@@ -142,7 +151,65 @@ SPECS = [
                                    "Folded and squared -- Musgrave's ridge "
                                    "profile, for mountains and veins")),
                "Profile"),
+      'dims': ('enum', '3D', (('1D', "1D", "Along the vector's X only"),
+                              ('2D', "2D", "The vector's X and Y"),
+                              ('3D', "3D", "The full vector -- the classic"),
+                              ('4D', "4D", "The vector plus the W socket; "
+                               "drive W over time for evolving noise")),
+               "Dimensions"),
       'octaves': ('int', 5, 1, 10, "Octaves")},
+     [(C, 'Color'), (F, 'Fac')]),
+
+    ('Water', "Water Noise", 'MOD_FLUIDSIM',
+     "Layered animated water: 1 to 12 drifting noise layers, folded toward "
+     "crests by Choppiness. Loop closes the animation exactly over Loop "
+     "Frames by moving time onto a circle through the 4D lattice -- a "
+     "looping deck breathes and shimmers in place rather than drifting, "
+     "which is the honest trade for a perfect cycle",
+     [(V, 'Vector', None), (F, 'Scale', 6.0), (F, 'Speed', 1.0),
+      (F, 'Choppiness', 0.5),
+      (C, 'Color 1', (0.04, 0.10, 0.18, 1.0)),
+      (C, 'Color 2', (0.55, 0.75, 0.85, 1.0))],
+     {'layers': ('int', 5, 1, 12, "Layers"),
+      'animate': ('bool', True, "Animate"),
+      'loop': ('bool', False, "Loop"),
+      'loop_frames': ('int', 48, 2, 1000, "Loop Frames"),
+      'fps': ('int', 24, 1, 240, "Frame Rate")},
+     [(C, 'Color'), (F, 'Fac')]),
+
+    ('Gradient', "Gradient (Shaped)", 'COLORSET_03_VEC',
+     "A gradient with a chosen SHAPE -- linear, reflected, spherical, "
+     "square, diamond, conical, spiral -- plus centre, rotation, repeat "
+     "and easing. Feed it the Matcap Coordinates node (Centered on) for a "
+     "view-locked sphere gradient, or a ramp for full colour control",
+     [(V, 'Vector', None), (F, 'Scale', 1.0), (V, 'Center', None),
+      (F, 'Rotation', 0.0),
+      (C, 'Color 1', (0.0, 0.0, 0.0, 1.0)),
+      (C, 'Color 2', (1.0, 1.0, 1.0, 1.0))],
+     {'shape': ('enum', 'LINEAR', (
+         ('LINEAR', "Linear", "Along X through the centre"),
+         ('REFLECTED', "Reflected", "Peaks at the centre line, falls both "
+          "ways"),
+         ('SPHERICAL', "Spherical", "Falls with distance from the centre"),
+         ('QUADRATIC', "Quadratic Sphere", "Spherical squared -- softer "
+          "shoulder"),
+         ('SQUARE', "Square", "Falls with chessboard distance -- square "
+          "rings"),
+         ('DIAMOND', "Diamond", "Falls with taxicab distance -- diamond "
+          "rings"),
+         ('CONICAL', "Conical", "Sweeps the angle around the centre"),
+         ('SPIRAL', "Spiral", "The conical sweep advanced by distance")),
+         "Shape"),
+      'repeat': ('enum', 'NONE', (
+          ('NONE', "Clip", "Hold 0 and 1 outside the ramp"),
+          ('REPEAT', "Repeat", "Wrap the ramp endlessly"),
+          ('PINGPONG', "Ping-Pong", "Wrap back and forth, seamlessly")),
+          "Repeat"),
+      'easing': ('enum', 'NONE', (
+          ('NONE', "Linear", "The raw ramp"),
+          ('SMOOTH', "Smooth", "Ease both ends (smoothstep)"),
+          ('SHARP', "Sharp", "Square the ramp -- fast start, slow end")),
+          "Easing")},
      [(C, 'Color'), (F, 'Fac')]),
 
     ('Cells', "Cells (Worley)", 'LIGHTPROBE_VOLUME',

@@ -1674,7 +1674,8 @@ def test_material_panel_visibility():
           'material_slots' in src and "len(slots) > 1" not in
           src.split('template_list')[0],
           'the list is still conditional')
-    check('a New control is offered', 'material.new' in src)
+    check('a New control is offered (born as a Halcyon material)',
+          'halcyon.material_new' in src)
 
 
 def _master(**over):
@@ -16604,6 +16605,31 @@ def test_every_setting_does_what_it_says():
     JPEG = {'jpeg_artifacts': True, 'jpeg_quality': 40}
 
     TABLE = [
+        # cartoon outlines: the master switch diffs on its own; each part
+        # probes against a base that isolates it
+        ('outline',            True,              'demo',         {}),
+        ('outline_color',      (1.0, 0.2, 0.2),   'demo',         {'outline': True}),
+        ('outline_width',      4,                 'demo',         {'outline': True}),
+        ('outline_opacity',    0.35,              'demo',         {'outline': True}),
+        ('outline_objects',    False,             'demo',
+         {'outline': True, 'outline_depth': False, 'outline_normals': False}),
+        ('outline_materials',  True,              'demo',
+         {'outline': True, 'outline_objects': False, 'outline_depth': False,
+          'outline_normals': False}),
+        ('outline_depth',      False,             'demo',
+         {'outline': True, 'outline_objects': False, 'outline_normals': False,
+          'outline_depth_threshold': 0.01}),
+        ('outline_depth_threshold', 0.5,          'demo',
+         {'outline': True, 'outline_objects': False, 'outline_normals': False,
+          'outline_depth_threshold': 0.01}),
+        ('outline_normals',    False,             'demo',
+         {'outline': True, 'outline_objects': False, 'outline_depth': False,
+          'outline_normal_angle': 30.0}),
+        ('outline_normal_angle', 150.0,           'demo',
+         {'outline': True, 'outline_objects': False, 'outline_depth': False,
+          'outline_normal_angle': 30.0}),
+        ('outline_over_sky',   False,             'demo',
+         {'outline': True, 'outline_width': 3}),
         # field                probe               scene          base ctx
         ('max_transparent_layers', 1,             'glass',        {}),
         ('spot_cones',         True,              'cookie_spot',  {},
@@ -17212,3 +17238,90 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
+
+
+def test_every_setting_has_a_detailed_tooltip():
+    """Every registered property carries a real description.
+
+    'Detailed tooltip' is a shipped promise now, so it is a test: every
+    property on every Halcyon property group -- render settings, material
+    override, light, world -- must carry a description of substance, not
+    an empty string and not a three-word shrug. New properties fail here
+    until they explain themselves, which is the point.
+    """
+    import importlib
+    import inspect
+
+    from . import fakebpy
+    fakebpy.install()
+    import halcyon.properties as P
+    importlib.reload(P)
+    from .fakebpy import _Prop
+
+    bare = []
+    total = 0
+    for _name, obj in vars(P).items():
+        if not (inspect.isclass(obj) and hasattr(obj, '__annotations__')):
+            continue
+        for pname, pdef in obj.__annotations__.items():
+            if not isinstance(pdef, _Prop):
+                continue
+            total += 1
+            desc = str(pdef.kw.get('description', '') or '')
+            if len(desc) < 25:
+                bare.append(f'{obj.__name__}.{pname}')
+    check(f'all {total} properties carry a detailed tooltip', not bare,
+          ', '.join(bare[:8]) + ('...' if len(bare) > 8 else ''))
+
+
+def test_the_sky_library_is_complete_and_valid():
+    """Every sky preset applies cleanly, has a note, and ships a thumbnail.
+
+    303 presets is a promise with three parts: every settings key must be
+    a real sky field (a typo would silently not apply), every entry must
+    carry a real tooltip note, and every entry must have its rendered
+    thumbnail in presets/thumbs -- because a gallery with holes reads as
+    broken. Applying each preset to a World must also actually change it
+    from the default sky (a preset that changes nothing is decoration).
+    """
+    from ..core.scene import World
+    from ..presets import skies as SK
+
+    fields = set(SK.sky_fields())
+    thumbs = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), 'presets', 'thumbs')
+    bad_keys, bare_notes, missing_thumbs, inert = [], [], [], []
+    defaults = World()
+    for key in SK.ORDER:
+        entry = SK.SKIES.get(key)
+        if entry is None:
+            bad_keys.append(key + ' (no entry)')
+            continue
+        unknown = [k for k in entry['settings'] if k not in fields]
+        if unknown:
+            bad_keys.append(f'{key}: {unknown[:3]}')
+        if len(str(entry.get('note', ''))) < 12:
+            bare_notes.append(key)
+        if not os.path.exists(os.path.join(thumbs, key + '.png')):
+            missing_thumbs.append(key)
+        w = World()
+        ok, _ = SK.apply_sky(w, key)
+        # BRYCE_DEFAULT is the one preset whose whole point is the
+        # default sky: reset-to-default IS its effect
+        changed = (not entry['settings']) or any(
+            getattr(w, f, None) != getattr(defaults, f, None)
+            for f in entry['settings'])
+        if not (ok and changed):
+            inert.append(key)
+    check(f'all {len(SK.ORDER)} presets use real sky fields', not bad_keys,
+          '; '.join(bad_keys[:4]))
+    check('every preset carries a detailed note', not bare_notes,
+          ', '.join(bare_notes[:6]))
+    check('every preset ships its thumbnail', not missing_thumbs,
+          ', '.join(missing_thumbs[:6]) +
+          (f' (+{len(missing_thumbs) - 6})' if len(missing_thumbs) > 6
+           else ''))
+    check('every preset changes the sky it is applied to', not inert,
+          ', '.join(inert[:6]))
+    check('the library holds at least 250 more skies than the original 43',
+          len(SK.ORDER) >= 293, str(len(SK.ORDER)))

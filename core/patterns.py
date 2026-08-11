@@ -75,6 +75,19 @@ def sample_circle(u):
 _HX = 374761393
 _HY = 668265263
 _HZ = 1274126177
+#: the fourth lattice constant, for 4D noise (odd, below 2^31 like the
+#: others, so the uint32-vs-int64 wrap proof covers it unchanged)
+_HW = 1911520717
+
+
+def _hash_mix(h):
+    """The shared xorshift mix: (h & mask) scrambled to a 16-bit unit float.
+
+    Every hashN is 'accumulate N lattice terms, then this' -- one mix, one
+    proof, however many dimensions feed it."""
+    h = h & 0x7fffffff
+    h = (h ^ (h >> 13)) * 1274126177
+    return ((h ^ (h >> 16)) & 0xffff).astype(np.float32) / 65535.0
 
 
 def value_noise(p):
@@ -119,6 +132,155 @@ def value_noise(p):
     y0 = x00 + (x10 - x00) * fy
     y1 = x01 + (x11 - x01) * fy
     return (y0 + (y1 - y0) * fz).astype(np.float32)
+
+
+def value_noise1(x):
+    """Linearly interpolated value noise over a 1D lattice, in 0..1."""
+    fl = np.floor(x)
+    f = x - fl
+    f = f * f * (3.0 - 2.0 * f)
+    base = fl.astype(np.int64) * _HX
+    c0 = _hash_mix(base)
+    c1 = _hash_mix(base + _HX)
+    return (c0 + (c1 - c0) * f).astype(np.float32)
+
+
+def value_noise2(p):
+    """Bilinearly interpolated value noise over a 2D lattice, in 0..1."""
+    fl = np.floor(p)
+    f = p - fl
+    f = f * f * (3.0 - 2.0 * f)
+    i = fl.astype(np.int64)
+    base = i[:, 0] * _HX + i[:, 1] * _HY
+    c00 = _hash_mix(base)
+    c10 = _hash_mix(base + _HX)
+    c01 = _hash_mix(base + _HY)
+    c11 = _hash_mix(base + _HX + _HY)
+    fx, fy = f[:, 0], f[:, 1]
+    x0 = c00 + (c10 - c00) * fx
+    x1 = c01 + (c11 - c01) * fx
+    return (x0 + (x1 - x0) * fy).astype(np.float32)
+
+
+def value_noise4(p):
+    """Quadrilinearly interpolated value noise over a 4D lattice, in 0..1.
+
+    The fourth axis is what makes seamless animation possible: a loop is a
+    CIRCLE traced through the (z, w) plane, so frame N of a loop and frame
+    0 sample the same lattice point exactly and the cycle closes without a
+    crossfade. Sixteen corners, same base-reuse trick as the 3D noise.
+    """
+    fl = np.floor(p)
+    f = p - fl
+    f = f * f * (3.0 - 2.0 * f)
+    i = fl.astype(np.int64)
+    base = i[:, 0] * _HX + i[:, 1] * _HY + i[:, 2] * _HZ + i[:, 3] * _HW
+    fx, fy, fz, fw = f[:, 0], f[:, 1], f[:, 2], f[:, 3]
+
+    def plane(off):
+        c00 = _hash_mix(base + off)
+        c10 = _hash_mix(base + off + _HX)
+        c01 = _hash_mix(base + off + _HY)
+        c11 = _hash_mix(base + off + _HX + _HY)
+        x0 = c00 + (c10 - c00) * fx
+        x1 = c01 + (c11 - c01) * fx
+        return x0 + (x1 - x0) * fy
+
+    z0w0 = plane(0)
+    z1w0 = plane(_HZ)
+    z0w1 = plane(_HW)
+    z1w1 = plane(_HZ + _HW)
+    w0 = z0w0 + (z1w0 - z0w0) * fz
+    w1 = z0w1 + (z1w1 - z0w1) * fz
+    return (w0 + (w1 - w0) * fw).astype(np.float32)
+
+
+def value_noise_nd(p):
+    """value_noise for a (N, 1|2|3|4) array, dispatched by width."""
+    d = p.shape[1] if p.ndim == 2 else 1
+    if d == 1:
+        return value_noise1(p[:, 0] if p.ndim == 2 else p)
+    if d == 2:
+        return value_noise2(p)
+    if d == 4:
+        return value_noise4(p)
+    return value_noise(p)
+
+
+def fbm_nd(p, octaves=5, lacunarity=2.0, gain=0.5):
+    """fbm over any lattice dimension 1-4."""
+    total = np.zeros(p.shape[0], np.float32)
+    amp, norm, freq = 1.0, 0.0, 1.0
+    for _ in range(int(max(octaves, 1))):
+        total += value_noise_nd(p * freq) * amp
+        norm += amp
+        amp *= gain
+        freq *= lacunarity
+    return total / max(norm, 1e-6)
+
+
+#: per-layer drift directions for the water noise: golden-angle spaced,
+#: computed once in float64 and frozen to float32 -- the GLSL twin bakes
+#: these exact values as literals, so no driver's cos can disagree
+WATER_DIRS = np.stack([
+    np.cos(2.39996322972865332 * np.arange(12) + 0.7),
+    np.sin(2.39996322972865332 * np.arange(12) + 0.7),
+], axis=1).astype(np.float32)
+
+
+def water(p2, t, layers=5, speed=1.0, choppiness=0.5, loop_frames=0,
+          fps=24.0):
+    """Layered directional water noise in 0..1.
+
+    Each layer is 4D value noise drifting along its own baked direction at
+    its own rate, folded toward crests by `choppiness`. With `loop_frames`
+    set, ALL of time moves onto a circle through the lattice's (z, w)
+    plane instead -- frame N of the loop and frame 0 sample identical
+    lattice points, so the cycle closes seamlessly. (A looping deck cannot
+    also drift: net drift over a cycle would need the lattice to repeat,
+    and it does not. The circle gives breathing, chop and shimmer that
+    loop exactly; that is the trade, stated.)
+    """
+    x = np.asarray(p2[:, 0], np.float32)
+    y = np.asarray(p2[:, 1], np.float32)
+    n = x.shape[0]
+    layers = int(max(1, min(int(layers), 12)))
+    looping = int(loop_frames) > 0
+    if looping:
+        ph = np.float32(2.0 * np.pi) * np.float32(
+            (float(t) * float(fps) / max(int(loop_frames), 1)) % 1.0)
+        cz = np.float32(np.cos(ph))
+        sw = np.float32(np.sin(ph))
+    total = np.zeros(n, np.float32)
+    norm = 0.0
+    amp = 1.0
+    freq = 1.0
+    for i in range(layers):
+        ca = WATER_DIRS[i, 0]
+        sa = WATER_DIRS[i, 1]
+        xx = (x * ca - y * sa) * np.float32(freq)
+        yy = (x * sa + y * ca) * np.float32(freq)
+        rate = np.float32(0.6 + 0.13 * i)
+        salt = np.float32(17.0 * i + 3.0)
+        if looping:
+            r = np.float32(1.5)
+            p4 = np.stack([xx, yy,
+                           np.full(n, cz * r * rate + salt, np.float32),
+                           np.full(n, sw * r * rate + salt, np.float32)],
+                          axis=1)
+        else:
+            zt = np.float32(float(t) * float(speed)) * rate + salt
+            p4 = np.stack([xx + zt * np.float32(0.35), yy,
+                           np.full(n, zt, np.float32),
+                           np.full(n, salt, np.float32)], axis=1)
+        v = value_noise4(p4)
+        fold = 1.0 - np.abs(v * 2.0 - 1.0)
+        v = v + (fold - v) * np.float32(np.clip(choppiness, 0.0, 1.0))
+        total += v * np.float32(amp)
+        norm += amp
+        amp *= 0.55
+        freq *= 1.9
+    return (total / np.float32(max(norm, 1e-6))).astype(np.float32)
 
 
 def signed_noise(p):
@@ -203,6 +365,23 @@ def noise_fractal(p, kind=0, octaves=5, lacunarity=2.0, gain=0.5):
     sin-fract hash cannot travel to a driver and this one travels exactly.
     """
     k = int(kind)
+    if p.ndim == 2 and p.shape[1] != 3:
+        # 1/2/4-D lattices ride the shared dispatcher; the three profiles
+        # rebuild from value_noise_nd with the same schedules
+        total = np.zeros(p.shape[0], np.float32)
+        amp, norm, freq = 1.0, 0.0, 1.0
+        for _ in range(int(max(octaves, 1))):
+            v = value_noise_nd(p * freq)
+            if k == 1:
+                v = np.abs(v * 2.0 - 1.0)
+            elif k == 2:
+                sfold = 1.0 - np.abs(v * 2.0 - 1.0)
+                v = sfold * sfold
+            total += v * amp
+            norm += amp
+            amp *= gain
+            freq *= lacunarity
+        return (total / max(norm, 1e-6)).astype(np.float32)
     if k == 1:
         return turbulence(p, octaves=octaves, lacunarity=lacunarity,
                           gain=gain)

@@ -1426,6 +1426,253 @@ def n_normal(ev, node):
     return {'Normal': d, 'Dot': M.dot(M.normalize(v), M.normalize(d))}
 
 
+# ------------------------------------------------ colour-space ramp helpers
+
+def _rgb_to_oklab(rgb):
+    """Linear sRGB -> OKLab (Ottosson 2020), vectorised."""
+    r, g, b = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+    l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
+    m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
+    s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
+    l = np.cbrt(np.maximum(l, 0.0))
+    m = np.cbrt(np.maximum(m, 0.0))
+    s = np.cbrt(np.maximum(s, 0.0))
+    return np.stack([
+        0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+        1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+        0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s], axis=1)
+
+
+def _oklab_to_rgb(lab):
+    L, A, B = lab[:, 0], lab[:, 1], lab[:, 2]
+    l = L + 0.3963377774 * A + 0.2158037573 * B
+    m = L - 0.1055613458 * A - 0.0638541728 * B
+    s = L - 0.0894841775 * A - 1.2914855480 * B
+    l, m, s = l * l * l, m * m * m, s * s * s
+    return np.stack([
+        +4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+        -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+        -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s], axis=1)
+
+
+def _rgb_to_hsv_np(rgb):
+    r, g, b = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+    mx = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
+    d = mx - mn
+    h = np.zeros_like(mx)
+    nz = d > 1e-12
+    rc = np.where(nz, (mx - r) / np.where(nz, d, 1.0), 0.0)
+    gc = np.where(nz, (mx - g) / np.where(nz, d, 1.0), 0.0)
+    bc = np.where(nz, (mx - b) / np.where(nz, d, 1.0), 0.0)
+    h = np.where(mx == r, bc - gc, h)
+    h = np.where(mx == g, 2.0 + rc - bc, h)
+    h = np.where((mx == b) & (mx != r) & (mx != g), 4.0 + gc - rc, h)
+    h = (h / 6.0) % 1.0
+    s = np.where(mx > 1e-12, d / np.where(mx > 1e-12, mx, 1.0), 0.0)
+    return np.stack([h, s, mx], axis=1)
+
+
+def _hsv_to_rgb_np(hsv):
+    h, s, v = hsv[:, 0] % 1.0, hsv[:, 1], hsv[:, 2]
+    i = np.floor(h * 6.0)
+    f = h * 6.0 - i
+    p = v * (1.0 - s)
+    q = v * (1.0 - s * f)
+    t = v * (1.0 - s * (1.0 - f))
+    i = i.astype(np.int64) % 6
+    r = np.choose(i, [v, q, p, p, t, v])
+    g = np.choose(i, [t, v, v, q, p, p])
+    b = np.choose(i, [p, p, t, v, v, q])
+    return np.stack([r, g, b], axis=1)
+
+
+def _ramp_blend(a_rgb, b_rgb, t, space):
+    """Blend two (N,3) colours by (N,) t in the named space."""
+    t3 = t[:, None]
+    if space == 'OKLAB':
+        return _oklab_to_rgb(_rgb_to_oklab(a_rgb) +
+                             (_rgb_to_oklab(b_rgb) -
+                              _rgb_to_oklab(a_rgb)) * t3)
+    if space == 'OKLCH':
+        la = _rgb_to_oklab(a_rgb)
+        lb = _rgb_to_oklab(b_rgb)
+        ca = np.sqrt(la[:, 1] ** 2 + la[:, 2] ** 2)
+        cb = np.sqrt(lb[:, 1] ** 2 + lb[:, 2] ** 2)
+        ha = np.arctan2(la[:, 2], la[:, 1])
+        hb = np.arctan2(lb[:, 2], lb[:, 1])
+        dh = hb - ha
+        dh = dh - np.round(dh / (2 * np.pi)) * 2 * np.pi   # short way round
+        L = la[:, 0] + (lb[:, 0] - la[:, 0]) * t
+        C = ca + (cb - ca) * t
+        H = ha + dh * t
+        return _oklab_to_rgb(np.stack([L, C * np.cos(H), C * np.sin(H)],
+                                      axis=1))
+    if space == 'HSV':
+        ha = _rgb_to_hsv_np(a_rgb)
+        hb = _rgb_to_hsv_np(b_rgb)
+        dh = hb[:, 0] - ha[:, 0]
+        dh = dh - np.round(dh)                             # short way round
+        out = ha + (hb - ha) * t3
+        out[:, 0] = (ha[:, 0] + dh * t) % 1.0
+        return _hsv_to_rgb_np(out)
+    return a_rgb + (b_rgb - a_rgb) * t3
+
+
+def n_halcyon_ramp(ev, node):
+    fac = np.clip(ev.input(node, 'Fac', VALUE), 0.0, 1.0)
+    n_stops = int(np.clip(_prop(node, 'stops', 2), 2, 6))
+    pos_raw = _prop(node, 'positions',
+                    (0.0, 1.0, 0.5, 0.5, 0.5, 0.5))
+    space = str(_prop(node, 'space', 'OKLAB'))
+    ease = str(_prop(node, 'easing', 'LINEAR'))
+    stops = []
+    for i in range(n_stops):
+        col = ev.input(node, f'Color {i + 1}', RGBA)
+        stops.append((float(pos_raw[i]), col))
+    stops.sort(key=lambda s: s[0])
+    out = stops[0][1][:, :3].copy()
+    alpha = stops[0][1][:, 3].copy()
+    for (p0, c0), (p1, c1) in zip(stops[:-1], stops[1:]):
+        span = max(p1 - p0, 1e-6)
+        t = np.clip((fac - p0) / span, 0.0, 1.0)
+        if ease == 'SMOOTH':
+            t = t * t * (3.0 - 2.0 * t)
+        elif ease == 'CONSTANT':
+            t = np.where(t >= 1.0, 1.0, 0.0)
+        seg = fac >= p0
+        blend = _ramp_blend(c0[:, :3], c1[:, :3], t, space)
+        out = np.where(seg[:, None], blend, out)
+        alpha = np.where(seg, c0[:, 3] + (c1[:, 3] - c0[:, 3]) * t, alpha)
+    col = np.concatenate([out, alpha[:, None]], axis=1).astype(np.float32)
+    return {'Color': col, 'Alpha': alpha.astype(np.float32)}
+
+
+#: blur tap tables: (dx, dy, weight) rings, deterministic and shared with
+#: any future GPU twin. Weights normalised at build
+def _blur_taps(kind):
+    if kind == 'FAST':
+        pts = [(0, 0, 2.0), (1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0),
+               (0, -1, 1.0)]
+    elif kind == 'FINE':
+        pts = [(0, 0, 2.0)]
+        for k in range(8):
+            a = 2.0 * np.pi * k / 8.0
+            pts.append((np.cos(a), np.sin(a), 1.0))
+            pts.append((0.55 * np.cos(a + 0.3927),
+                        0.55 * np.sin(a + 0.3927), 1.2))
+    else:
+        pts = [(0, 0, 2.0)]
+        for k in range(8):
+            a = 2.0 * np.pi * k / 8.0
+            pts.append((np.cos(a), np.sin(a), 1.0))
+    arr = np.asarray(pts, np.float64)
+    arr[:, 2] /= arr[:, 2].sum()
+    return arr.astype(np.float32)
+
+
+def n_halcyon_blur(ev, node):
+    """Average the linked chain over shifted evaluation points.
+
+    Each tap re-evaluates the upstream subtree with the context's texture
+    spaces (generated, uv, object, world position) shifted in the surface
+    plane -- true blur of whatever is connected. CPU-only by design; the
+    GPU plan refuses it by name and the material shades here.
+    """
+    if not ev.has_link(node, 'Color'):
+        return {'Color': ev.input(node, 'Color', RGBA)}
+    size = ev.input(node, 'Size', VALUE)
+    taps = _blur_taps(str(_prop(node, 'taps', 'MEDIUM')))
+    link = None
+    for s in node.get('inputs', ()):
+        if s.get('name') == 'Color':
+            link = s.get('link')
+    c = ev.ctx
+    from ..core import mathx as M
+    t_axis, b_axis = M.orthonormal_basis(M.normalize(c.N))
+    acc = np.zeros((ev.n, 4), np.float32)
+    for dx, dy, wgt in taps:
+        if dx == 0.0 and dy == 0.0:
+            sub_ctx = c
+        else:
+            sub_ctx = _shifted_ctx(c, t_axis, b_axis,
+                                   size * np.float32(dx),
+                                   size * np.float32(dy))
+        sub = GraphEvaluator({'output': None, 'nodes': ev.nodes}, sub_ctx,
+                             ev.images, ev.programs)
+        v = sub.eval_output(link[0], link[1])
+        acc += coerce(v, RGBA, ev.n) * np.float32(wgt)
+    return {'Color': acc.astype(np.float32)}
+
+
+def _shifted_ctx(c, t_axis, b_axis, du, dv):
+    """A shallow context copy with every texture space shifted in-plane."""
+    import copy
+    sub = copy.copy(c)
+    d3 = t_axis * du[:, None] + b_axis * dv[:, None]
+    sub.P = c.P + d3
+    sub.generated = c.generated + d3
+    sub.uv = c.uv + np.stack([du, dv], axis=1)
+    sub.uv2 = c.uv2 + np.stack([du, dv], axis=1)
+    return sub
+
+
+def desugar_master_bump(graph):
+    """Bump Height on the master shader becomes a REAL Bump node, in place.
+
+    The socket is sugar: a linked greyscale height cannot honestly grow a
+    second bump implementation on each device, so it is rewritten -- once,
+    idempotently -- into the ShaderNodeBump both backends already prove:
+    Height takes the link, Strength takes the master's Bump Strength,
+    the master's own Normal chain (if any) threads through underneath,
+    and the master's Normal input then points at the synthesized node.
+    Called at the top of every render, so the CPU evaluator, the GPU
+    plan and the emitter all see the SAME desugared tree.
+    """
+    if not graph:
+        return graph
+    nodes = graph.get('nodes')
+    if not nodes:
+        return graph
+    for nid in list(nodes.keys()):
+        nd = nodes[nid]
+        if nd.get('bl_idname') != 'HALCYON_ShaderNode':
+            continue
+        ins = nd.get('inputs') or []
+        bh = next((s for s in ins if s.get('name') == 'Bump Height'), None)
+        if bh is None or not bh.get('link'):
+            continue
+        synth = f'__bump_{nid}'
+        if synth in nodes:                        # already desugared
+            continue
+        bs = next((s for s in ins if s.get('name') == 'Bump Strength'), None)
+        nrm = next((s for s in ins if s.get('name') == 'Normal'), None)
+        strength = {'name': 'Strength', 'type': 'VALUE',
+                    'default': (bs or {}).get('default', 1.0),
+                    'link': (bs or {}).get('link')}
+        nodes[synth] = {
+            'id': synth, 'bl_idname': 'ShaderNodeBump', 'props': {},
+            'inputs': [
+                strength,
+                {'name': 'Distance', 'type': 'VALUE', 'default': 1.0,
+                 'link': None},
+                {'name': 'Height', 'type': 'VALUE', 'default': 0.5,
+                 'link': list(bh['link'])},
+                {'name': 'Normal', 'type': 'VECTOR', 'default': [0, 0, 0],
+                 'link': list(nrm['link']) if nrm and nrm.get('link')
+                 else None},
+            ],
+            'outputs': [{'name': 'Normal', 'type': 'VECTOR'}],
+        }
+        if nrm is None:
+            nrm = {'name': 'Normal', 'type': 'VECTOR', 'default': [0, 0, 0],
+                   'link': None}
+            ins.append(nrm)
+        nrm['link'] = [synth, 0]
+        bh['link'] = None            # consumed; nothing reads it downstream
+    return graph
+
+
 def n_bump(ev, node):
     c = ev.ctx
     strength = ev.input(node, 'Strength', VALUE)
@@ -2871,11 +3118,81 @@ _CELL_FEATURE = {'F1': 0, 'F2': 1, 'BORDER': 2, 'CELL': 3}
 
 def n_pat_noise(ev, node):
     p = _pat_vec(ev, node)
+    dims = str(_prop(node, 'dims', '3D'))
+    if dims == '1D':
+        p = p[:, :1]
+    elif dims == '2D':
+        p = p[:, :2]
+    elif dims == '4D':
+        w = ev.input(node, 'W', VALUE) * ev.input(node, 'Scale', VALUE)
+        p = np.concatenate([p, w[:, None].astype(np.float32)], axis=1)
     f = PT.noise_fractal(p, _NOISE_KIND.get(_prop(node, 'kind', 'SMOOTH'), 0),
                          int(_prop(node, 'octaves', 5)),
                          ev.input(node, 'Lacunarity', VALUE).mean(),
                          ev.input(node, 'Gain', VALUE).mean())
     return _pat_out(ev, node, f)
+
+
+def n_pat_water(ev, node):
+    p = _pat_vec(ev, node)
+    t = ev.ctx.time if _prop(node, 'animate', True) else 0.0
+    loop = int(_prop(node, 'loop_frames', 48)) if _prop(node, 'loop', False) \
+        else 0
+    f = PT.water(p[:, :2], float(t),
+                 layers=int(_prop(node, 'layers', 5)),
+                 speed=float(ev.input(node, 'Speed', VALUE).mean()),
+                 choppiness=float(
+                     ev.input(node, 'Choppiness', VALUE).mean()),
+                 loop_frames=loop, fps=float(_prop(node, 'fps', 24)))
+    return _pat_out(ev, node, f)
+
+
+def n_pat_gradient_shaped(ev, node):
+    c = ev.ctx
+    vec = ev.input(node, 'Vector', VECTOR) if ev.has_link(node, 'Vector') \
+        else c.generated
+    centre = ev.input(node, 'Center', VECTOR)
+    scale = ev.input(node, 'Scale', VALUE)
+    rot = ev.input(node, 'Rotation', VALUE)
+    q = (np.asarray(vec, np.float32) - np.asarray(centre, np.float32)) * \
+        scale[:, None]
+    ca, sa = np.cos(-rot), np.sin(-rot)
+    x = q[:, 0] * ca - q[:, 1] * sa
+    y = q[:, 0] * sa + q[:, 1] * ca
+    z = q[:, 2]
+    shape = str(_prop(node, 'shape', 'LINEAR'))
+    if shape == 'REFLECTED':
+        f = 1.0 - np.abs(x)
+    elif shape == 'SPHERICAL':
+        f = 1.0 - np.sqrt(x * x + y * y + z * z)
+    elif shape == 'QUADRATIC':
+        r = np.maximum(1.0 - np.sqrt(x * x + y * y + z * z), 0.0)
+        f = r * r
+    elif shape == 'SQUARE':
+        f = 1.0 - np.maximum(np.abs(x), np.abs(y))
+    elif shape == 'DIAMOND':
+        f = 1.0 - (np.abs(x) + np.abs(y))
+    elif shape == 'CONICAL':
+        f = np.arctan2(y, x) / (2.0 * np.pi) + 0.5
+    elif shape == 'SPIRAL':
+        f = np.arctan2(y, x) / (2.0 * np.pi) + 0.5 + \
+            np.sqrt(x * x + y * y)
+        f = f - np.floor(f)
+    else:
+        f = x + 0.5
+    rep = str(_prop(node, 'repeat', 'NONE'))
+    if rep == 'REPEAT':
+        f = f - np.floor(f)
+    elif rep == 'PINGPONG':
+        h = (f * 0.5 - np.floor(f * 0.5)) * 2.0    # sawtooth 0..2
+        f = 1.0 - np.abs(h - 1.0)                  # triangle 0..1..0
+    f = np.clip(f, 0.0, 1.0)
+    ease = str(_prop(node, 'easing', 'NONE'))
+    if ease == 'SMOOTH':
+        f = f * f * (3.0 - 2.0 * f)
+    elif ease == 'SHARP':
+        f = f * f
+    return _pat_out(ev, node, f.astype(np.float32))
 
 
 def n_pat_cells_tex(ev, node):
@@ -2914,8 +3231,16 @@ def n_halcyon_matcap_uv(ev, node):
     x = M.dot(N, right)
     y = M.dot(N, upv)
     scale = ev.input(node, 'Scale', VALUE)
-    uv = np.stack([x * 0.5 * scale + 0.5, y * 0.5 * scale + 0.5,
-                   np.zeros(ev.n, np.float32)], axis=1)
+    # Centered maps the sphere about the origin (-0.5..0.5) instead of
+    # image space (0..1): |vector| then measures distance from the sphere
+    # CENTRE, which is what a Spherical gradient wants. Offset shifts the
+    # result either way -- the mapping controls a matcap-driven gradient
+    # needs to land where the artist points it.
+    centre = np.float32(0.0 if _prop(node, 'centered', False) else 0.5)
+    off = ev.input(node, 'Offset', VECTOR)   # missing socket coerces to zero
+    uv = np.stack([x * 0.5 * scale + centre, y * 0.5 * scale + centre,
+                   np.zeros(ev.n, np.float32)], axis=1) + \
+        np.asarray(off, np.float32)
     return {'Vector': uv.astype(np.float32), 'Facing':
             np.clip(M.dot(N, V), 0.0, 1.0).astype(np.float32)}
 
@@ -3085,7 +3410,11 @@ DISPATCH = {
     'HALCYON_WrinklesNode': n_pat_wrinkles,
     'HALCYON_BrickNode': n_pat_brick,
     'HALCYON_NoiseNode': n_pat_noise,
+    'HALCYON_WaterNode': n_pat_water,
+    'HALCYON_GradientNode': n_pat_gradient_shaped,
     'HALCYON_CellsNode': n_pat_cells_tex,
     'HALCYON_StaticNode': n_pat_static,
     'HALCYON_MatcapUVNode': n_halcyon_matcap_uv,
+    'HALCYON_RampNode': n_halcyon_ramp,
+    'HALCYON_BlurNode': n_halcyon_blur,
 }

@@ -8,8 +8,9 @@ by the shader, not by a fixed set of slots the user has to map onto.
 """
 
 import bpy
-from bpy.props import (BoolProperty, EnumProperty, FloatProperty, IntProperty,
-                       PointerProperty, StringProperty)
+from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
+                       FloatVectorProperty, IntProperty, PointerProperty,
+                       StringProperty)
 from bpy.types import Node, NodeSocket
 
 from ..core.shading import MODEL_ITEMS
@@ -117,6 +118,11 @@ SOCKET_DOCS = {
     'Bump Strength': "Scales how far the Normal input is allowed to bend the "
                      "shading normal away from the surface. 0 ignores the bump "
                      "entirely, 1 uses it as given, above 1 exaggerates it",
+    'Bump Height': "A greyscale height field bumped straight into the shading "
+                   "normal -- plug any texture here and its bright parts rise. "
+                   "Behind the scenes this is exactly a Bump node between the "
+                   "texture and Normal, scaled by Bump Strength, so it renders "
+                   "identically on both devices. Unlinked, it does nothing",
     'Refraction Amount': "How much of the ray traced *through* a transparent "
                          "surface is used. 1 is glass; lower values keep what "
                          "is behind the surface where it is, which is how a "
@@ -167,7 +173,7 @@ SOCKET_MODELS = {
     'Edge Opacity': ALL, 'Backface Color': ALL, 'Backface Mix': ALL,
     'Vertex Color': ALL, 'Vertex Color Mix': ALL,
     'Sheen': ALL, 'Sheen Color': ALL, 'Sheen Roughness': ALL,
-    'Bump Strength': ALL, 'Refraction Amount': ALL,
+    'Bump Strength': ALL, 'Bump Height': ALL, 'Refraction Amount': ALL,
 }
 
 # measured parameters -- the ones a test verifies against the shading code
@@ -215,23 +221,23 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
 
     RELEVANT = {
         'LAMBERT': {'Diffuse Color', 'Diffuse Level', 'Ambient', 'Opacity',
-                    'Self-Illumination', 'Normal', 'Bump Strength'},
+                    'Self-Illumination', 'Normal', 'Bump Strength', 'Bump Height'},
         'GOURAUD': None, 'FLAT': None, 'PHONG': None, 'BLINN_PHONG': None,
         'BLINN': None, 'COOK_TORRANCE': None,
         'OREN_NAYAR': {'Diffuse Color', 'Diffuse Level', 'Roughness', 'Ambient',
                        'Opacity', 'Self-Illumination', 'Normal',
-                       'Bump Strength'},
+                       'Bump Strength', 'Bump Height'},
         'MINNAERT': {'Diffuse Color', 'Diffuse Level', 'Roughness', 'Ambient',
                      'Opacity', 'Self-Illumination', 'Normal',
-                     'Bump Strength'},
+                     'Bump Strength', 'Bump Height'},
         'WARD': None, 'ANISOTROPIC': None, 'METAL': None, 'STRAUSS': None,
         'MULTI_LAYER': None,
         'TOON': {'Diffuse Color', 'Diffuse Level', 'Specular Color',
                  'Specular Level', 'Toon Size', 'Toon Smooth', 'Ambient',
-                 'Opacity', 'Self-Illumination', 'Normal', 'Bump Strength'},
+                 'Opacity', 'Self-Illumination', 'Normal', 'Bump Strength', 'Bump Height'},
         'TRANSLUCENT': {'Diffuse Color', 'Diffuse Level', 'Translucency',
                         'Ambient', 'Opacity', 'Self-Illumination', 'Normal',
-                        'Bump Strength'},
+                        'Bump Strength', 'Bump Height'},
         'CONSTANT': {'Diffuse Color', 'Opacity', 'Self-Illumination'},
         'WIREFRAME': {'Diffuse Color', 'Opacity'},
     }
@@ -274,6 +280,7 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
         ('NodeSocketColor', 'Sheen Color', (1.0, 1.0, 1.0, 1.0)),
         ('NodeSocketFloat', 'Sheen Roughness', 0.3),
         ('NodeSocketFloat', 'Bump Strength', 1.0),
+        ('NodeSocketFloat', 'Bump Height', 0.5),
         ('NodeSocketFloat', 'Refraction Amount', 1.0),
     )
 
@@ -312,6 +319,25 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
               'Reflection Color', 'Edge Opacity', 'Backface Color',
               'Backface Mix', 'Sheen', 'Sheen Color', 'Sheen Roughness',
               'Refraction Amount')
+
+    def ensure_sockets(self):
+        """Create any spec socket this saved instance predates.
+
+        NOT called from update callbacks (socket topology changes there
+        are forbidden by the guard test, for good reason): the load-post
+        migration below runs it at file load, where mutation is safe --
+        so an old file gains Bump Height the moment it opens.
+        """
+        have = {s.name for s in self.inputs}
+        for kind, name, default in self.SOCKETS:
+            if name in have:
+                continue
+            try:
+                sock = self.inputs.new(kind, name)
+                if default is not None:
+                    sock.default_value = default
+            except Exception:                                   # noqa: BLE001
+                pass
 
     def refresh_sockets(self):
         keep = self.RELEVANT.get(self.model)
@@ -1040,7 +1066,129 @@ class HALCYON_QuantizeNode(Node, HalcyonNodeBase):
                            "texture Fac before it drives a Color Ramp")
 
 
-NODES = (HALCYON_ShaderNode, HALCYON_CodeNode, HALCYON_PosterizeNode,
+RAMP_SPACES = (
+    ('RGB', "RGB", "Straight-line blend in linear RGB -- the classic, "
+     "with its muddy middles between saturated complements"),
+    ('OKLAB', "OKLab", "Blend in the OKLab perceptual space: even "
+     "lightness, no muddy middles, hues that pass where you expect"),
+    ('OKLCH', "OKLCh", "OKLab in polar form: lightness and chroma blend "
+     "straight while HUE rotates the short way round -- rainbow ramps "
+     "without grey valleys"),
+    ('HSV', "HSV", "Blend hue, saturation and value separately -- the "
+     "paint-program ramp, vivid and slightly lawless"),
+)
+
+
+class HALCYON_RampNode(Node, HalcyonNodeBase):
+    """A multi-stop colour ramp that blends in a chosen colour SPACE.
+
+    Blender's own Color Ramp mixes in RGB and nothing else; this one adds
+    OKLab, OKLCh and HSV, with up to six stops whose positions live on the
+    node and whose colours are sockets -- so a stop's colour can be driven
+    by another node.
+    """
+
+    bl_idname = 'HALCYON_RampNode'
+    bl_label = "Color Ramp (Spaces)"
+    bl_icon = 'COLOR'
+    bl_width_default = 200
+
+    def _update(self, context):
+        self.refresh_stops()
+
+    space: EnumProperty(
+        name="Space", items=RAMP_SPACES, default='OKLAB', update=_update,
+        description="The colour space the blend walks through. The stops "
+                    "themselves are always plain colours; only the path "
+                    "between them changes")
+    stops: IntProperty(
+        name="Stops", default=2, min=2, max=6, update=_update,
+        description="How many colour stops the ramp uses. Each stop is a "
+                    "socket below, with its position alongside")
+    positions: FloatVectorProperty(
+        name="Positions", size=6, min=0.0, max=1.0,
+        default=(0.0, 1.0, 0.5, 0.5, 0.5, 0.5),
+        description="Where each stop sits along the ramp, 0 to 1. Stops "
+                    "are blended in position order")
+    easing: EnumProperty(
+        name="Easing", default='LINEAR', update=_update,
+        items=(('LINEAR', "Linear", "Even blend between stops"),
+               ('SMOOTH', "Smooth", "Ease in and out of every stop"),
+               ('CONSTANT', "Constant", "Hold each stop until the next -- "
+                "hard bands, the palette look")),
+        description="The blend profile between neighbouring stops")
+
+    _STOP_DEFAULTS = ((0.0, 0.0, 0.0, 1.0), (1.0, 1.0, 1.0, 1.0),
+                      (0.5, 0.5, 0.5, 1.0), (0.5, 0.5, 0.5, 1.0),
+                      (0.5, 0.5, 0.5, 1.0), (0.5, 0.5, 0.5, 1.0))
+
+    def init(self, context):
+        f = self.inputs.new('NodeSocketFloat', 'Fac')
+        f.default_value = 0.5
+        f.description = "The position sampled along the ramp"
+        for i in range(6):
+            s = self.inputs.new('NodeSocketColor', f'Color {i + 1}')
+            s.default_value = self._STOP_DEFAULTS[i]
+            s.description = (f"Stop {i + 1}'s colour. Its position is on "
+                             "the node body")
+        out = self.outputs.new('NodeSocketColor', 'Color')
+        out.description = "The blended colour at Fac, in the chosen space"
+        self.outputs.new('NodeSocketFloat', 'Alpha')
+        self.refresh_stops()
+
+    def refresh_stops(self):
+        for i in range(6):
+            name = f'Color {i + 1}'
+            for s in self.inputs:
+                if s.name == name:
+                    s.hide = bool(i >= self.stops and not s.is_linked)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'space', text="")
+        layout.prop(self, 'easing', text="")
+        layout.prop(self, 'stops')
+        col = layout.column(align=True)
+        for i in range(int(self.stops)):
+            col.prop(self, 'positions', index=i, text=f"Pos {i + 1}")
+
+
+class HALCYON_BlurNode(Node, HalcyonNodeBase):
+    """Blur whatever is plugged in, by re-sampling it at shifted points.
+
+    The input chain is evaluated several times at offsets in the surface
+    plane and averaged -- true blur of any texture, procedural or image.
+    That re-run is CPU work: a material using Blur shades on the CPU and
+    says so in the console.
+    """
+
+    bl_idname = 'HALCYON_BlurNode'
+    bl_label = "Blur"
+    bl_icon = 'PROP_CON'
+
+    taps: EnumProperty(
+        name="Quality", default='MEDIUM',
+        items=(('FAST', "Fast (5)", "Five taps -- soft, slightly boxy"),
+               ('MEDIUM', "Medium (9)", "Nine taps -- clean for most "
+                "sizes"),
+               ('FINE', "Fine (17)", "Seventeen taps -- smooth at large "
+                "sizes, at proportional cost")),
+        description="How many shifted evaluations the blur averages. More "
+                    "taps stay smooth at larger sizes and cost more")
+
+    def init(self, context):
+        c = self.inputs.new('NodeSocketColor', 'Color')
+        c.default_value = (0.5, 0.5, 0.5, 1.0)
+        c.description = "The chain to blur -- any texture or pattern"
+        s = self.inputs.new('NodeSocketFloat', 'Size')
+        s.default_value = 0.05
+        s.description = ("Blur radius, in the texture's own coordinate "
+                         "units (a fraction of the 0-1 span)")
+        out = self.outputs.new('NodeSocketColor', 'Color')
+        out.description = "The average of the shifted evaluations"
+
+
+NODES = (HALCYON_RampNode, HALCYON_BlurNode,
+         HALCYON_ShaderNode, HALCYON_CodeNode, HALCYON_PosterizeNode,
          HALCYON_DitherNode, HALCYON_DepthCueNode, HALCYON_ScreenInfoNode,
          HALCYON_PixelateNode, HALCYON_ScrollNode, HALCYON_ScanlinesNode,
          HALCYON_PaletteNode, HALCYON_ColorCycleNode, HALCYON_FlipbookNode,
@@ -1086,6 +1234,32 @@ class NODE_MT_halcyon_add(bpy.types.Menu):
 _menu_owner = None
 
 
+def _migrate_master_sockets(_arg=None):
+    """load_post: saved master nodes gain any socket their file predates.
+
+    Socket creation is forbidden inside update callbacks (the guard test
+    holds refresh_sockets to toggles only); file load is the one place
+    topology change is safe, so it happens here -- Bump Height appears on
+    old files the moment they open.
+    """
+    try:
+        trees = []
+        for mat in bpy.data.materials:
+            if getattr(mat, 'use_nodes', False) and mat.node_tree:
+                trees.append(mat.node_tree)
+        for grp in getattr(bpy.data, 'node_groups', []):
+            trees.append(grp)
+        for tree in trees:
+            for node in getattr(tree, 'nodes', []):
+                if getattr(node, 'bl_idname', '') == 'HALCYON_ShaderNode':
+                    try:
+                        node.ensure_sockets()
+                    except Exception:                           # noqa: BLE001
+                        pass
+    except Exception:                                           # noqa: BLE001
+        pass
+
+
 def register():
     global _menu_owner
     from . import pattern_nodes
@@ -1101,9 +1275,22 @@ def register():
     bpy.utils.register_class(NODE_MT_halcyon_add)
     from .. import compat
     _menu_owner = compat.register_node_menu(draw_add_menu)
+    try:
+        hs = bpy.app.handlers.load_post
+        if _migrate_master_sockets not in hs:
+            hs.append(_migrate_master_sockets)
+        _migrate_master_sockets()          # the already-open file too
+    except Exception:                                           # noqa: BLE001
+        pass
 
 
 def unregister():
+    try:
+        hs = bpy.app.handlers.load_post
+        while _migrate_master_sockets in hs:
+            hs.remove(_migrate_master_sockets)
+    except Exception:                                           # noqa: BLE001
+        pass
     from . import pattern_nodes
     pattern_nodes.unregister()
     from .. import compat
