@@ -607,6 +607,16 @@ def _gpu_stage(name, rgb, st):
     if str(getattr(st, 'render_device', 'CPU')).upper() != 'GPU' or \
             not getattr(st, 'gpu_post', False):
         return None
+    if not getattr(st, '_frame_gpu_shaded', False):
+        # the frame's shading ran on the CPU (plan refused, guard
+        # re-shade, or a path that never attempted the GPU): its post
+        # stays on the CPU too. A GPU post pass over a CPU-resident
+        # frame is upload + readback overhead for nothing -- and in
+        # five field sessions that overhead was the ONLY GPU work
+        # in flight when the device was lost right after the frame
+        # parked. GPU post now means: the frame is ALREADY on the GPU
+        # pipeline because its shading engaged.
+        return None
     try:
         from ..gpu import chain
     except Exception:                                           # noqa: BLE001

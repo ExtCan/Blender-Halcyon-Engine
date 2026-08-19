@@ -779,6 +779,10 @@ def gbuffer_into(gbuf, ids, aux, lin=None):
     CPU's OWN third barycentric rather than 1-b0-b1. `lin` (the affine
     variant's third image) fills bary_lin when the gbuf carries one.
     """
+    # (R168 note: masked-copyto and channel-pair variants of this body
+    # were benched at field size and LOST to the plain form below --
+    # the decode is memory-bandwidth-bound and numpy's where is already
+    # at the floor. Measured, kept.)
     tri = np.rint(ids[:, :, 3]).astype(np.int32)
     cov = tri >= 0
     gbuf.tri[:] = tri

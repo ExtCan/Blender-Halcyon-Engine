@@ -718,3 +718,535 @@ vec3 hal_ramp_blend(vec3 a, vec3 b, float t, int space)
     return a + (b - a) * t;
 }
 """
+
+
+# ------------------------------------------------------- Blender Internal
+# The BI texture engine's GPU twin. The GLSL is generated at import time
+# from core/bitex_tables.py, so the CPU and GPU read the SAME tables from
+# the same module -- they cannot drift apart. Algorithms match
+# core/bitex.py line for line; see that module for provenance.
+
+
+def _bitex_glsl():
+    # The tables travel as a DATA TEXTURE (hal_bitex_tab, bound once per
+    # program), not as inline const arrays: 2048 constants compiled into
+    # every material shader is exactly the kind of thing that grinds or
+    # crashes real drivers, and texelFetch of engine-made data textures
+    # is the proven R115 pattern. Layout: red channel of a 2048x1 image,
+    # hash at [0..511], hashvectf at [512..1279], hashpntf at [1280..2047]
+    # -- packed by core/bitex_tables.table_pixels(), the same module the
+    # CPU reads, so the two devices cannot drift.
+    return """
+uniform sampler2D hal_bitex_tab;
+
+// forward declarations: bi_bricontrgb calls the okramp chunk's HSV
+// pair, and the okramp chunk lands AFTER this one in the assembled
+// source. A real GLSL compiler requires declaration before use -- the
+// field driver rejected every material carrying this chunk ('the
+// driver rejected <material>: HAL_MAT_1: CreateInfo failed') while the
+// name-resolving front-end and simulator compiled it happily. The
+// prototypes make this chunk correct under ANY chunk order
+vec3 hal_rgb_to_hsv(vec3 c);
+vec3 hal_hsv_to_rgb(vec3 hsv);
+
+// clamp: texelFetch outside the texture is UNDEFINED on Vulkan -- on a
+// real driver that is a device fault, and a lost device kills Blender
+// with no crash log at all. Every table read funnels through here; an
+// index bug upstream now costs a wrong texel, never the GPU
+float bi_tab(int i) { return texelFetch(hal_bitex_tab,
+                                        ivec2(clamp(i, 0, 2047), 0), 0).r; }
+int bi_hashi(int i) { return int(bi_tab(i) + 0.5); }
+vec3 bi_hvecv(int h)
+{
+    int b = 512 + 3 * h;
+    return vec3(bi_tab(b), bi_tab(b + 1), bi_tab(b + 2));
+}
+vec3 bi_hpntv(int h)
+{
+    int b = 1280 + 3 * h;
+    return vec3(bi_tab(b), bi_tab(b + 1), bi_tab(b + 2));
+}
+
+float bi_onoise(vec3 p)
+{
+    vec3 fp = floor(p);
+    vec3 o = p - fp;
+    vec3 j = o - 1.0;
+    ivec3 ip = ivec3(fp);
+    vec3 cn_o = 1.0 - 3.0 * o * o + 2.0 * o * o * o;
+    vec3 cn_j = 1.0 - 3.0 * j * j - 2.0 * j * j * j;
+    int b00 = bi_hashi(bi_hashi(ip.x & 255) + (ip.y & 255));
+    int b10 = bi_hashi(bi_hashi((ip.x + 1) & 255) + (ip.y & 255));
+    int b01 = bi_hashi(bi_hashi(ip.x & 255) + ((ip.y + 1) & 255));
+    int b11 = bi_hashi(bi_hashi((ip.x + 1) & 255) + ((ip.y + 1) & 255));
+    int b20 = ip.z & 255, b21 = (ip.z + 1) & 255;
+    float n = 0.5;
+    vec3 h;
+    h = bi_hvecv(bi_hashi(b20 + b00));
+    n += (cn_o.x * cn_o.y * cn_o.z) * (h.x * o.x + h.y * o.y + h.z * o.z);
+    h = bi_hvecv(bi_hashi(b21 + b00));
+    n += (cn_o.x * cn_o.y * cn_j.z) * (h.x * o.x + h.y * o.y + h.z * j.z);
+    h = bi_hvecv(bi_hashi(b20 + b01));
+    n += (cn_o.x * cn_j.y * cn_o.z) * (h.x * o.x + h.y * j.y + h.z * o.z);
+    h = bi_hvecv(bi_hashi(b21 + b01));
+    n += (cn_o.x * cn_j.y * cn_j.z) * (h.x * o.x + h.y * j.y + h.z * j.z);
+    h = bi_hvecv(bi_hashi(b20 + b10));
+    n += (cn_j.x * cn_o.y * cn_o.z) * (h.x * j.x + h.y * o.y + h.z * o.z);
+    h = bi_hvecv(bi_hashi(b21 + b10));
+    n += (cn_j.x * cn_o.y * cn_j.z) * (h.x * j.x + h.y * o.y + h.z * j.z);
+    h = bi_hvecv(bi_hashi(b20 + b11));
+    n += (cn_j.x * cn_j.y * cn_o.z) * (h.x * j.x + h.y * j.y + h.z * o.z);
+    h = bi_hvecv(bi_hashi(b21 + b11));
+    n += (cn_j.x * cn_j.y * cn_j.z) * (h.x * j.x + h.y * j.y + h.z * j.z);
+    return clamp(n, 0.0, 1.0);
+}
+
+float bi_operlin(vec3 p)
+{
+    // orgPerlinNoise(): Perlin's ORIGINAL 1985 noise, Blender's exact
+    // form -- +10000 shift, hashvectf gradients, s-curve fades, the
+    // 1.5 scale. The CPU twin is bitex.org_perlin_noise
+    vec3 t = p + 10000.0;
+    ivec3 b0 = ivec3(t) & 255;
+    ivec3 b1 = (b0 + 1) & 255;
+    vec3 r0 = t - floor(t);
+    vec3 r1 = r0 - 1.0;
+    int i = bi_hashi(b0.x);
+    int j = bi_hashi(b1.x);
+    int b00 = bi_hashi(i + b0.y);
+    int b10 = bi_hashi(j + b0.y);
+    int b01 = bi_hashi(i + b1.y);
+    int b11 = bi_hashi(j + b1.y);
+    float sx = r0.x * r0.x * (3.0 - 2.0 * r0.x);
+    float sy = r0.y * r0.y * (3.0 - 2.0 * r0.y);
+    float sz = r0.z * r0.z * (3.0 - 2.0 * r0.z);
+    vec3 h;
+    float u, v, a, b, c, d;
+    h = bi_hvecv(bi_hashi(b00 + b0.z));
+    u = r0.x * h.x + r0.y * h.y + r0.z * h.z;
+    h = bi_hvecv(bi_hashi(b10 + b0.z));
+    v = r1.x * h.x + r0.y * h.y + r0.z * h.z;
+    a = u + sx * (v - u);
+    h = bi_hvecv(bi_hashi(b01 + b0.z));
+    u = r0.x * h.x + r1.y * h.y + r0.z * h.z;
+    h = bi_hvecv(bi_hashi(b11 + b0.z));
+    v = r1.x * h.x + r1.y * h.y + r0.z * h.z;
+    b = u + sx * (v - u);
+    c = a + sy * (b - a);
+    h = bi_hvecv(bi_hashi(b00 + b1.z));
+    u = r0.x * h.x + r0.y * h.y + r1.z * h.z;
+    h = bi_hvecv(bi_hashi(b10 + b1.z));
+    v = r1.x * h.x + r0.y * h.y + r1.z * h.z;
+    a = u + sx * (v - u);
+    h = bi_hvecv(bi_hashi(b01 + b1.z));
+    u = r0.x * h.x + r1.y * h.y + r1.z * h.z;
+    h = bi_hvecv(bi_hashi(b11 + b1.z));
+    v = r1.x * h.x + r1.y * h.y + r1.z * h.z;
+    b = u + sx * (v - u);
+    d = a + sy * (b - a);
+    return 1.5 * (c + sz * (d - c));
+}
+
+float bi_fade(float t) { return t * t * t * (t * (t * 6.0 - 15.0) + 10.0); }
+
+float bi_grad(int h, float x, float y, float z)
+{
+    h = h & 15;
+    float u = h < 8 ? x : y;
+    float v = h < 4 ? y : ((h == 12 || h == 14) ? x : z);
+    return (((h & 1) == 0) ? u : -u) + (((h & 2) == 0) ? v : -v);
+}
+
+float bi_nperlin(vec3 p)
+{
+    vec3 fp = floor(p);
+    ivec3 I = ivec3(fp) & 255;
+    vec3 r = p - fp;
+    vec3 f = vec3(bi_fade(r.x), bi_fade(r.y), bi_fade(r.z));
+    int A = bi_hashi(I.x) + I.y;
+    int AA = bi_hashi(A) + I.z, AB = bi_hashi(A + 1) + I.z;
+    int B = bi_hashi(I.x + 1) + I.y;
+    int BA = bi_hashi(B) + I.z, BB = bi_hashi(B + 1) + I.z;
+    return mix(mix(mix(bi_grad(bi_hashi(AA), r.x, r.y, r.z),
+                       bi_grad(bi_hashi(BA), r.x - 1.0, r.y, r.z), f.x),
+                   mix(bi_grad(bi_hashi(AB), r.x, r.y - 1.0, r.z),
+                       bi_grad(bi_hashi(BB), r.x - 1.0, r.y - 1.0, r.z), f.x), f.y),
+               mix(mix(bi_grad(bi_hashi(AA + 1), r.x, r.y, r.z - 1.0),
+                       bi_grad(bi_hashi(BA + 1), r.x - 1.0, r.y, r.z - 1.0), f.x),
+                   mix(bi_grad(bi_hashi(AB + 1), r.x, r.y - 1.0, r.z - 1.0),
+                       bi_grad(bi_hashi(BB + 1), r.x - 1.0, r.y - 1.0, r.z - 1.0), f.x), f.y), f.z);
+}
+
+float bi_cell_u(vec3 p)
+{
+    p = (p + 0.000001) * 1.00001;
+    ivec3 ip = ivec3(floor(p));
+    uint n = uint(ip.x + ip.y * 1301 + ip.z * 314159);
+    n = n ^ (n << 13u);
+    uint v = n * (n * n * 15731u + 789221u) + 1376312589u;
+    return float(v) / 4294967296.0;
+}
+
+vec3 bi_cell_v3(vec3 p)
+{
+    return vec3(bi_cell_u(p), bi_cell_u(p.yxz), bi_cell_u(p.yzx));
+}
+
+float bi_vdist(vec3 d, float e, int dtype)
+{
+    vec3 a = abs(d);
+    if (dtype == 1) { return dot(d, d); }
+    if (dtype == 2) { return a.x + a.y + a.z; }
+    if (dtype == 3) { return max(a.x, max(a.y, a.z)); }
+    if (dtype == 4) { float s = sqrt(a.x) + sqrt(a.y) + sqrt(a.z); return s * s; }
+    if (dtype == 5) { vec3 q = d * d; return sqrt(sqrt(dot(q, q))); }
+    if (dtype == 6) { e = max(e, 1e-6); return pow(pow(a.x, e) + pow(a.y, e) + pow(a.z, e), 1.0 / e); }
+    return sqrt(dot(d, d));
+}
+
+void bi_voronoi(vec3 p, float me, int dtype, out vec4 da, out vec3 pa[4])
+{
+    ivec3 base = ivec3(floor(p));
+    da = vec4(1e10);
+    pa[0] = vec3(0.0); pa[1] = vec3(0.0); pa[2] = vec3(0.0); pa[3] = vec3(0.0);
+    for (int xx = -1; xx <= 1; xx++)
+    for (int yy = -1; yy <= 1; yy++)
+    for (int zz = -1; zz <= 1; zz++) {
+        ivec3 c = base + ivec3(xx, yy, zz);
+        int hi = bi_hashi((bi_hashi((bi_hashi(c.z & 255) + c.y) & 255) + c.x) & 255);
+        vec3 pt = bi_hpntv(hi) + vec3(c);
+        float d = bi_vdist(p - pt, me, dtype);
+        if (d < da.x) {
+            da = vec4(d, da.xyz);
+            pa[3] = pa[2]; pa[2] = pa[1]; pa[1] = pa[0]; pa[0] = pt;
+        } else if (d < da.y) {
+            da.yzw = vec3(d, da.yz);
+            pa[3] = pa[2]; pa[2] = pa[1]; pa[1] = pt;
+        } else if (d < da.z) {
+            da.zw = vec2(d, da.z);
+            pa[3] = pa[2]; pa[2] = pt;
+        } else if (d < da.w) {
+            da.w = d; pa[3] = pt;
+        }
+    }
+}
+
+float bi_basis_u(int nbas, vec3 p)
+{
+    if (nbas == 0) { return bi_onoise(p); }
+    if (nbas == 1) { return 0.5 + 0.5 * bi_operlin(p); }
+    if (nbas == 2) { return 0.5 + 0.5 * bi_nperlin(p); }
+    if (nbas == 14) { return bi_cell_u(p); }
+    vec4 da; vec3 pa[4];
+    bi_voronoi(p, 2.5, 0, da, pa);
+    if (nbas == 3) { return da.x; }
+    if (nbas == 4) { return da.y; }
+    if (nbas == 5) { return da.z; }
+    if (nbas == 6) { return da.w; }
+    if (nbas == 7) { return da.y - da.x; }
+    if (nbas == 8) { return min(10.0 * (da.y - da.x), 1.0); }
+    return bi_onoise(p);
+}
+
+float bi_basis_s(int nbas, vec3 p)
+{
+    if (nbas == 1) { return bi_operlin(p); }
+    if (nbas == 2) { return bi_nperlin(p); }
+    return 2.0 * bi_basis_u(nbas, p) - 1.0;
+}
+
+float bi_gnoise(float nsize, vec3 p, int hard, int nbas)
+{
+    if (nsize != 0.0) { p /= nsize; }
+    float t = bi_basis_u(nbas, p);
+    return (hard != 0) ? abs(2.0 * t - 1.0) : t;
+}
+
+float bi_gturb(float nsize, vec3 p, int oct, int hard, int nbas)
+{
+    if (nsize != 0.0) { p /= nsize; }
+    float total = 0.0, amp = 1.0;
+    for (int i = 0; i <= oct; i++) {
+        float t = bi_basis_u(nbas, p);
+        if (hard != 0) { t = abs(2.0 * t - 1.0); }
+        total += t * amp;
+        amp *= 0.5;
+        p *= 2.0;
+    }
+    total *= float(1 << oct) / float((1 << (oct + 1)) - 1);
+    return total;
+}
+
+float bi_mg_fbm(vec3 p, float H, float lac, float oct, int nbas)
+{
+    float pwHL = pow(lac, -H), pwr = 1.0, value = 0.0;
+    int io = int(oct);
+    for (int i = 0; i < io; i++) {
+        value += bi_basis_s(nbas, p) * pwr;
+        pwr *= pwHL;
+        p *= lac;
+    }
+    float rmd = oct - floor(oct);
+    if (rmd != 0.0) { value += rmd * bi_basis_s(nbas, p) * pwr; }
+    return value;
+}
+
+float bi_mg_multifractal(vec3 p, float H, float lac, float oct, int nbas)
+{
+    float pwHL = pow(lac, -H), pwr = 1.0, value = 1.0;
+    int io = int(oct);
+    for (int i = 0; i < io; i++) {
+        value *= bi_basis_s(nbas, p) * pwr + 1.0;
+        pwr *= pwHL;
+        p *= lac;
+    }
+    float rmd = oct - floor(oct);
+    if (rmd != 0.0) { value *= rmd * bi_basis_s(nbas, p) * pwr + 1.0; }
+    return value;
+}
+
+float bi_mg_hetero(vec3 p, float H, float lac, float oct, float ofs, int nbas)
+{
+    float pwHL = pow(lac, -H), pwr = pwHL;
+    float value = ofs + bi_basis_s(nbas, p);
+    p *= lac;
+    int io = int(oct);
+    for (int i = 1; i < io; i++) {
+        value += (bi_basis_s(nbas, p) + ofs) * pwr * value;
+        pwr *= pwHL;
+        p *= lac;
+    }
+    float rmd = oct - floor(oct);
+    if (rmd != 0.0) { value += rmd * (bi_basis_s(nbas, p) + ofs) * pwr * value; }
+    return value;
+}
+
+float bi_mg_hybrid(vec3 p, float H, float lac, float oct, float ofs, float gain, int nbas)
+{
+    float pwHL = pow(lac, -H), pwr = pwHL;
+    float result = bi_basis_s(nbas, p) + ofs;
+    float weight = gain * result;
+    p *= lac;
+    int io = int(oct);
+    for (int i = 1; i < io; i++) {
+        weight = min(weight, 1.0);
+        float signal = (bi_basis_s(nbas, p) + ofs) * pwr;
+        pwr *= pwHL;
+        result += weight * signal;
+        weight *= gain * signal;
+        p *= lac;
+    }
+    float rmd = oct - floor(oct);
+    if (rmd != 0.0) { result += rmd * (bi_basis_s(nbas, p) + ofs) * pwr; }
+    return result;
+}
+
+float bi_mg_ridged(vec3 p, float H, float lac, float oct, float ofs, float gain, int nbas)
+{
+    float pwHL = pow(lac, -H), pwr = pwHL;
+    float signal = ofs - abs(bi_basis_s(nbas, p));
+    signal *= signal;
+    float result = signal;
+    int io = int(oct);
+    for (int i = 1; i < io; i++) {
+        p *= lac;
+        float weight = clamp(signal * gain, 0.0, 1.0);
+        signal = ofs - abs(bi_basis_s(nbas, p));
+        signal *= signal * weight;
+        result += signal * pwr;
+        pwr *= pwHL;
+    }
+    return result;
+}
+
+float bi_vlnoise(vec3 p, float dist, int b1, int b2)
+{
+    vec3 r = vec3(bi_basis_s(b1, p + 13.5) * dist,
+                  bi_basis_s(b1, p) * dist,
+                  bi_basis_s(b1, p - 13.5) * dist);
+    return bi_basis_s(b2, p + r);
+}
+
+float bi_wave(int wf, float a)
+{
+    if (wf == 1) {
+        float b = 6.2831853;
+        a = mod(a, b);
+        if (a < 0.0) { a += b; }
+        return a / b;
+    }
+    if (wf == 2) {
+        float b = 6.2831853;
+        return 1.0 - 2.0 * abs(floor(a * (1.0 / b) + 0.5) - a * (1.0 / b));
+    }
+    return 0.5 + 0.5 * sin(a);
+}
+
+float bi_tex_clouds(vec3 p, float nsize, int depth, int hard, int nbas)
+{
+    return bi_gturb(nsize, p, depth, hard, nbas);
+}
+
+vec3 bi_tex_clouds_col(vec3 p, float nsize, int depth, int hard, int nbas)
+{
+    return vec3(bi_gturb(nsize, p, depth, hard, nbas),
+                bi_gturb(nsize, p.yxz, depth, hard, nbas),
+                bi_gturb(nsize, p.yzx, depth, hard, nbas));
+}
+
+float bi_tex_wood(vec3 p, int stype, int wf, float nsize, float turb, int hard, int nbas)
+{
+    if (stype == 0) { return bi_wave(wf, (p.x + p.y + p.z) * 10.0); }
+    if (stype == 1) { return bi_wave(wf, length(p) * 20.0); }
+    float wi = turb * bi_gnoise(nsize, p, hard, nbas);
+    if (stype == 2) { return bi_wave(wf, (p.x + p.y + p.z) * 10.0 + wi); }
+    return bi_wave(wf, length(p) * 20.0 + wi);
+}
+
+float bi_tex_marble(vec3 p, int stype, int wf, float nsize, float turb, int depth, int hard, int nbas)
+{
+    float n = 5.0 * (p.x + p.y + p.z);
+    float mi = n + turb * bi_gturb(nsize, p, depth, hard, nbas);
+    mi = bi_wave(wf, mi);
+    if (stype == 1) { mi = sqrt(mi); }
+    else if (stype == 2) { mi = sqrt(sqrt(mi)); }
+    return mi;
+}
+
+vec4 bi_tex_magic(vec3 p, int depth, float turbul)
+{
+    float turb = turbul / 5.0;
+    float x = sin((p.x + p.y + p.z) * 5.0);
+    float y = cos((-p.x + p.y - p.z) * 5.0);
+    float z = -cos((-p.x - p.y + p.z) * 5.0);
+    if (depth > 0) {
+        x *= turb; y *= turb; z *= turb;
+        y = -cos(x - y + z) * turb;
+        if (depth > 1) { x = cos(x - y - z) * turb;
+        if (depth > 2) { z = sin(-x - y - z) * turb;
+        if (depth > 3) { x = -cos(-x + y - z) * turb;
+        if (depth > 4) { y = -sin(-x + y + z) * turb;
+        if (depth > 5) { y = -cos(-x + y + z) * turb;
+        if (depth > 6) { x = cos(x + y + z) * turb;
+        if (depth > 7) { z = sin(x + y - z) * turb;
+        if (depth > 8) { x = -cos(-x - y + z) * turb;
+        if (depth > 9) { y = -sin(x - y + z) * turb; } } } } } } } } }
+    }
+    if (turb != 0.0) {
+        turb *= 2.0;
+        x /= turb; y /= turb; z /= turb;
+    }
+    vec3 rgb = vec3(0.5 - x, 0.5 - y, 0.5 - z);
+    return vec4(rgb, (rgb.r + rgb.g + rgb.b) / 3.0);
+}
+
+float bi_tex_blend(vec3 p, int stype, int flip)
+{
+    float x = (flip != 0) ? p.y : p.x;
+    float y = (flip != 0) ? p.x : p.y;
+    if (stype == 0) { return (1.0 + x) / 2.0; }
+    if (stype == 1) { float t = (1.0 + x) / 2.0; return t < 0.0 ? 0.0 : t * t; }
+    if (stype == 2) {
+        float t = clamp((1.0 + x) / 2.0, 0.0, 1.0);
+        return 3.0 * t * t - 2.0 * t * t * t;
+    }
+    if (stype == 3) { return (2.0 + x + y) / 4.0; }
+    if (stype == 6) { return atan(y, x) / 6.2831853 + 0.5; }
+    float t = max(1.0 - sqrt(x * x + y * y + p.z * p.z), 0.0);
+    return (stype == 5) ? t * t : t;
+}
+
+float bi_tex_stucci(vec3 p, int stype, float nsize, float turb, int hard, int nbas)
+{
+    float b2 = bi_gnoise(nsize, p, hard, nbas);
+    float ofs = turb / 200.0;
+    if (stype != 0) { ofs *= b2 * b2; }
+    float tin = bi_gnoise(nsize, vec3(p.x, p.y, p.z + ofs), hard, nbas);
+    if (stype == 2) { tin = 1.0 - tin; }
+    return max(tin, 0.0);
+}
+
+float bi_tex_noise(vec3 p, int depth, float frame)
+{
+    ivec2 ip = ivec2(floor(p.xy * 10000.0));
+    uint n = uint(ip.x + ip.y * 1301 + (int(frame) + 7) * 314159);
+    n = n ^ (n << 13u);
+    uint ran = n * (n * n * 15731u + 789221u) + 1376312589u;
+    float div = 3.0;
+    uint shift = 29u;
+    float val = float((ran >> shift) & 3u);
+    for (int i = 0; i < depth; i++) {
+        shift -= 2u;
+        val *= float((ran >> shift) & 3u);
+        div *= 3.0;
+    }
+    return val / div;
+}
+
+float bi_tex_musgrave(vec3 p, int stype, float H, float lac, float oct,
+                      float ofs, float gain, float outscale, int nbas)
+{
+    if (stype == 0) { return outscale * bi_mg_multifractal(p, H, lac, oct, nbas); }
+    if (stype == 1) { return outscale * bi_mg_ridged(p, H, lac, oct, ofs, gain, nbas); }
+    if (stype == 2) { return outscale * bi_mg_hybrid(p, H, lac, oct, ofs, gain, nbas); }
+    if (stype == 4) { return outscale * bi_mg_hetero(p, H, lac, oct, ofs, nbas); }
+    return outscale * bi_mg_fbm(p, H, lac, oct, nbas);
+}
+
+vec4 bi_tex_voronoi(vec3 p, float w1, float w2, float w3, float w4,
+                    float mexp, int distm, float outscale, int coltype)
+{
+    float aw1 = abs(w1), aw2 = abs(w2), aw3 = abs(w3), aw4 = abs(w4);
+    float sc = aw1 + aw2 + aw3 + aw4;
+    if (sc != 0.0) { sc = outscale / sc; }
+    vec4 da; vec3 pa[4];
+    bi_voronoi(p, mexp, distm, da, pa);
+    float tin = sc * abs(dot(vec4(w1, w2, w3, w4), da));
+    if (coltype == 0) { return vec4(tin, tin, tin, tin); }
+    vec3 col = aw1 * bi_cell_v3(pa[0]) + aw2 * bi_cell_v3(pa[1])
+             + aw3 * bi_cell_v3(pa[2]) + aw4 * bi_cell_v3(pa[3]);
+    if (coltype >= 2) {
+        float t1 = min((da.y - da.x) * 10.0, 1.0);
+        t1 *= (coltype == 3) ? tin : sc;
+        col *= t1;
+    } else {
+        col *= sc;
+    }
+    return vec4(col, tin);
+}
+
+float bi_tex_distnoise(vec3 p, float dist, int b1, int b2)
+{
+    return bi_vlnoise(p, dist, b1, b2);
+}
+
+float bi_bricont(float tin, float bright, float contrast, int noclamp)
+{
+    tin = (tin - 0.5) * contrast + bright - 0.5;
+    if (noclamp == 0) { tin = clamp(tin, 0.0, 1.0); }
+    return tin;
+}
+
+vec3 bi_bricontrgb(vec3 rgb, float bright, float contrast, float sat,
+                   vec3 fac, int noclamp)
+{
+    rgb = fac * ((rgb - 0.5) * contrast + bright - 0.5);
+    if (noclamp == 0) { rgb = max(rgb, vec3(0.0)); }
+    if (sat != 1.0) {
+        vec3 hsv = hal_rgb_to_hsv(rgb);
+        hsv.y *= sat;
+        rgb = hal_hsv_to_rgb(hsv);
+        if (sat > 1.0 && noclamp == 0) { rgb = max(rgb, vec3(0.0)); }
+    }
+    return rgb;
+}
+
+vec3 bi_classic_texvec(vec3 v, vec3 ofs, vec3 size, int classic)
+{
+    if (classic != 0) { v = v * 2.0 - 1.0; }
+    return size * (v + ofs);
+}
+"""
+
+
+PATTERN_GLSL['bitex'] = _bitex_glsl()

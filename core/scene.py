@@ -92,6 +92,9 @@ class ObjectInfo:
     random: float = 0.0
     visible_camera: bool = True
     visible_shadow: bool = True
+    #: the classic Auto Smooth angle threshold (Object.smoothresh) the
+    #: MA_RAYBIAS terminator fix reads; 0 = none
+    smoothresh: float = 0.0
     cast_shadow: bool = True
     receive_shadow: bool = True
     holdout: bool = False
@@ -119,6 +122,9 @@ class Light:
     decay: str = 'DEFAULT'     # NONE | INVERSE | INVERSE_SQUARE | CUSTOM
     decay_start: float = 0.0
     decay_end: float = 25.0
+    decay_ld1: float = 0.0     # BI Lin/Quad sliders (att1/att2)
+    decay_ld2: float = 0.0
+    bi_sphere: bool = False    # BI's Sphere clamp at decay_end
     # Shadowing
     shadow: str = 'MAP'               # NONE | MAP | RAY
     # 0 = inherit the render setting. The old defaults (512 / 0.02) sat in
@@ -183,6 +189,10 @@ class World:
     color: tuple = (0.05, 0.05, 0.06)
     ambient: tuple = (0.0, 0.0, 0.0)
     ambient_level: float = 1.0
+    #: BI's Exposure panel (wrld_exposure_correct): 0 exposure at
+    #: range 1 is the identity. linfac/logfac derive verbatim.
+    exposure: float = 0.0
+    exposure_range: float = 1.0
     graph: Optional[Dict[str, Any]] = None
     env_image: Optional[ImageBuffer] = None
     env_mapping: str = 'EQUIRECT'     # EQUIRECT | MIRRORBALL | SCREEN

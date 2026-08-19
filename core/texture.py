@@ -38,8 +38,15 @@ class Texture:
     def to_linear(self):
         if self.colorspace == 'sRGB':
             from .mathx import srgb_to_linear
-            rgb = srgb_to_linear(self.pixels[:, :, :3])
-            self.pixels = np.concatenate([rgb, self.pixels[:, :, 3:]], axis=2)
+            # decode the CONTIGUOUS RGBA buffer and put alpha back,
+            # instead of slicing a strided (H,W,3) view: the slice
+            # forced a copy and strided arithmetic on multi-megapixel
+            # images, and alpha restored afterwards is the same bits
+            # as alpha never touched
+            rgba = self.pixels
+            out = srgb_to_linear(rgba)
+            out[:, :, 3] = rgba[:, :, 3]
+            self.pixels = np.ascontiguousarray(out)
             self.colorspace = 'Linear'
         return self
 

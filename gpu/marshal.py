@@ -15,9 +15,14 @@ Mechanics: the worker queues a callable and blocks on an event; a
 Blender's own documented cross-thread pattern -- drains the queue on the
 main thread and sets the event. Every exit stays honest:
 
-- marshalling disabled, or already on the main thread (the self-test's
-  operator, a background render), or no bpy at all (the headless test
-  suite): the callable simply runs where it was called;
+- already on the main thread (the self-test's operator, a background
+  render), or no bpy at all (the headless test suite): the callable
+  simply runs where it was called;
+- OFF the main thread inside a real Blender: the callable NEVER runs
+  in place, whatever the enable count says -- driver work on a
+  context-less worker thread is a process crash on either backend
+  (a field lesson; old OpenGL merely raised, which hid it for years).
+  It queues, or `MarshalTimeout` sends the caller to the CPU path;
 - the timer never fires (a main thread that is not pumping events):
   `MarshalTimeout` after a bounded wait, which the call sites turn into
   their usual (None, why) CPU fallback with the reason printed;
@@ -189,7 +194,7 @@ def on_main():
 
 
 def run_on_main(fn, timeout=None, what='GPU work'):
-    """fn() on the main thread when marshalling is on; in place otherwise.
+    """fn() on the main thread; in place ONLY on main or without bpy.
 
     Returns fn's result; re-raises fn's exception on the calling thread.
     The timeout bounds only the PICKUP -- how long the main loop may take
@@ -201,19 +206,32 @@ def run_on_main(fn, timeout=None, what='GPU work'):
     job is skipped if the timer fires later, so no interface ever blocks
     on work whose result was already given up on.
     """
-    if not _STATE['enabled'] or on_main():
+    if on_main():
         return fn()
     try:
         import bpy                                              # noqa: F401
     except Exception:                                           # noqa: BLE001
-        return fn()                     # headless: no main loop to borrow
-    _ensure_timer()
-    if not _STATE['timer']:
-        return fn()                     # no timers either: run in place
+        return fn()                     # headless: no main loop, no driver
+    # OFF the main thread inside a real Blender: the ONLY legal place
+    # for driver work is the main thread, no matter what the enable
+    # count says. The old fallbacks ran fn() in place here when
+    # marshalling was off or the timer was missing -- GPU calls on a
+    # context-less worker thread. Old OpenGL politely raised and made
+    # that LOOK like a clean CPU fallback (the comment above even says
+    # so); on 5.x it is a process crash on EITHER backend, landing
+    # mid-render exactly when a heavy frame streams seconds of device
+    # calls -- the field's backend-independent crash. Queue, or fail
+    # into the CPU path; never run driver work where we stand.
     import time as _time
     job = _Job(fn)
     t0 = _time.perf_counter()
     _JOBS.put(job)
+    _ensure_timer()
+    if not _STATE['timer']:
+        job.abandoned = True
+        raise MarshalTimeout(
+            f'{what}: no main-thread pump could be registered; this '
+            'work is skipped and the CPU path takes over')
     if not job.started.wait(TIMEOUT if timeout is None else timeout):
         job.abandoned = True
         if not job.started.is_set():

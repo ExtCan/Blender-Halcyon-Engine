@@ -148,8 +148,54 @@ def orthonormal_basis(n):
     return t, b
 
 
+_SRGB_LUT_256 = None
+_SRGB_LEVELS_256 = None
+
+
+def _srgb_lut():
+    """srgb_to_linear of the 256 8-bit levels, by the very same
+    expression the general path runs on a float32 vector -- so
+    LUT[k] is bit-for-bit what the formula produces for k/255."""
+    global _SRGB_LUT_256, _SRGB_LEVELS_256
+    if _SRGB_LUT_256 is None:
+        lv = np.arange(256, dtype=np.float32) / np.float32(255.0)
+        _SRGB_LEVELS_256 = lv
+        _SRGB_LUT_256 = np.where(
+            lv <= 0.04045, lv / 12.92,
+            np.power(np.maximum(lv + 0.055, 0.0) / 1.055, 2.4)
+        ).astype(np.float32)
+    return _SRGB_LUT_256
+
+
 def srgb_to_linear(c):
+    """sRGB decode. Large 8-bit-quantised inputs -- every PNG/JPG
+    texture Blender hands over is bytes/255 in float32 -- can only
+    take 256 distinct values, yet the R167 field profile measured the
+    pow() formula spending 6.7s of a 23s frame recomputing them pixel
+    by pixel. Such arrays go through a 256-entry table instead.
+
+    The gate is EXACT, not a tolerance: a candidate index is rounded
+    back to its level (the same arange/255 float32 the table was built
+    from) and accepted only where the input EQUALS that level bit for
+    bit -- so the table path is bit-identical to the formula by
+    construction. True float content, HDR, negatives, NaN all fail
+    the equality and fall through to the exact formula unchanged.
+    All-float32 arithmetic; the earlier float64 detection draft cost
+    more than the pow it saved."""
     c = np.asarray(c, dtype=np.float32)
+    if c.size >= (1 << 16):
+        flat = c.reshape(-1) if c.flags.c_contiguous else \
+            np.ascontiguousarray(c).reshape(-1)
+        lut = _srgb_lut()
+        levels = _SRGB_LEVELS_256
+        idx = flat * np.float32(255.0)
+        np.rint(idx, out=idx)
+        # no clip: an out-of-range or NaN cast lands on SOME index, and
+        # the exact-equality gate below rejects that pixel anyway
+        with np.errstate(invalid='ignore'):
+            ii = idx.astype(np.uint8)
+        if np.array_equal(levels[ii], flat):
+            return lut[ii].reshape(c.shape)
     return np.where(c <= 0.04045, c / 12.92, np.power(np.maximum(c + 0.055, 0.0) / 1.055, 2.4))
 
 

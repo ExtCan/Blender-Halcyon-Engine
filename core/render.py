@@ -83,6 +83,38 @@ def pixel_footprint(camera, proj, height):
 
 _TEX_CACHE = {}
 
+#: R170: rasterised G-buffers by content key (mesh fingerprint + exact
+#: view-projection bytes + every raster dial). An idle viewport refine
+#: and a repeated F12 re-used ~220ms of identical raster arrays per
+#: frame; a hit restores them as copies in a few milliseconds. Small on
+#: purpose: three entries covers draft+refine+F12 sizes of one scene.
+_GBUF_CACHE = {}
+_GBUF_STATS = {'hits': 0, 'misses': 0, 'bytes': 0}
+#: R172: the raster cache is bounded by BYTES, not by a slot count. The
+#: field's draft storm inserted a new key per jittered draft and the old
+#: 4-slot LRU evicted the refine and F12 entries between uses
+#: ('MISS(evicted)' on an unchanged view). Viewport entries are a few MB;
+#: F12 supersampled entries tens of MB -- a byte budget holds many of the
+#: former without letting the latter hoard memory. Count backstop stays.
+_GBUF_BUDGET_BYTES = 256 * 1024 * 1024
+_GBUF_CAP = 12
+
+
+def _gbuf_entry_bytes(ent):
+    n = 0
+    for v in ent.values():
+        if v is not None and hasattr(v, 'nbytes'):
+            n += int(v.nbytes)
+    return n
+
+
+def _gbuf_cache_pop(key):
+    ent = _GBUF_CACHE.pop(key, None)
+    if ent is not None:
+        _GBUF_STATS['bytes'] = max(
+            _GBUF_STATS['bytes'] - _gbuf_entry_bytes(ent), 0)
+    return ent
+
 
 def clear_caches():
     _TEX_CACHE.clear()
@@ -127,6 +159,22 @@ def prepare_textures(scene, settings):
             _TEX_CACHE.clear()
         _TEX_CACHE[ckey] = tex
         out[key] = tex
+    # the BI texture engine's noise tables, as a prepared texture. The
+    # GPU compiler's raw sampler (hal_bitex_tab) looks this key up at
+    # plan time and the driver uploads it like any pass texture -- and
+    # for want of this entry, EVERY material carrying a Blender Internal
+    # texture node refused its GPU pass ("engine table texture
+    # '__bitex_tables__' is not among the prepared textures") and fell
+    # back to the CPU, silently, on every GPU-device frame since the
+    # node existed. 32 KB, built once, cached forever.
+    tab = _TEX_CACHE.get('__bitex_tables__')
+    if tab is None:
+        from .bitex_tables import table_pixels
+        tab = Texture(table_pixels(), name='__bitex_tables__',
+                      colorspace='Non-Color', wrap='EXTEND',
+                      filt='NEAREST')
+        _TEX_CACHE['__bitex_tables__'] = tab
+    out['__bitex_tables__'] = tab
     return out
 
 
@@ -152,6 +200,7 @@ def closure_to_surface(cl, ctx, settings, material=None):
         surf.ambient[:] = material.ambient_level
         surf.opacity[:] = material.opacity
         surf.ior[:] = material.ior
+        surf.ray_ior[:] = material.ior   # one slider, both meanings here
         surf.roughness[:] = material.roughness
         surf.metallic[:] = material.metallic
         surf.anisotropy[:] = material.anisotropy
@@ -303,9 +352,39 @@ def closure_to_surface(cl, ctx, settings, material=None):
                 ('sheen', 'sheen', 'v', 0.0),
                 ('sheen_color', 'sheen_color', 'c', (1, 1, 1)),
                 ('sheen_roughness', 'sheen_roughness', 'v', 0.3),
-                ('refraction', 'refraction', 'v', 1.0)):
+                ('refraction', 'refraction', 'v', 1.0),
+                ('toon_size2', 'toon_size2', 'v', 0.5),
+                ('toon_smooth2', 'toon_smooth2', 'v', 0.1),
+                ('bi_fresnel', 'bi_fresnel', 'v', 0.1),
+                ('bi_fresnel_fac', 'bi_fresnel_fac', 'v', 0.5),
+                ('bi_slope', 'bi_slope', 'v', 0.1),
+                # the BI panel round
+                ('bi_transp_fresnel', 'bi_transp_fresnel', 'v', 0.0),
+                ('bi_transp_blend', 'bi_transp_blend', 'v', 1.25),
+                ('bi_spectra', 'bi_spectra', 'v', 0.0),
+                ('bi_mir_fresnel', 'bi_mir_fresnel', 'v', 0.0),
+                ('bi_mir_blend', 'bi_mir_blend', 'v', 1.25),
+                ('ray_ior', 'ray_ior', 'v', 1.45),
+                ('bi_ray_filter', 'bi_ray_filter', 'v', 1.0),
+                ('bi_cubic', 'bi_cubic', 'v', 0.0),
+                ('bi_tangent', 'bi_tangent', 'v', 0.0),
+                ('shadow_receive', 'shadow_receive', 'v', 1.0),
+                ('cast_only', 'cast_only', 'v', 0.0),
+                ('shadows_only', 'shadows_only', 'v', 0.0),
+                ('use_mist', 'use_mist', 'v', 1.0)):
             if any(hp.get(key) is not None for _w, hp in halcyon):
                 setattr(surf, attr, hmix(key, dflt, knd == 'c'))
+        # a master shader's refraction bends through its one IOR slider;
+        # only the BI node carries a separate ray IOR. Copy rather than
+        # default so a master glass at IOR 1.6 keeps bending at 1.6.
+        if not any(hp.get('ray_ior') is not None for _w, hp in halcyon):
+            surf.ray_ior = np.asarray(surf.ior, np.float32).copy()
+        # the non-numeric extras (ramp specs, light group) ride one
+        # python object; the HEAVIEST closure names it, like the model
+        if any(hp.get('bi_extras') is not None for _w, hp in halcyon):
+            surf.bi = max(halcyon,
+                          key=lambda t: float(np.mean(t[0])))[1].get(
+                              'bi_extras')
         # the model cannot blend: the HEAVIEST lobe names it, deterministic
         heavy = max(halcyon, key=lambda t: float(np.mean(t[0])))
         model = heavy[1].get('model', model)
@@ -411,8 +490,20 @@ def closure_to_surface(cl, ctx, settings, material=None):
 
 
 def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
-                  active_lights=None):
-    """Direct lighting + ambient + emission for a batch of points."""
+                  active_lights=None, extras=None, suppress_spec=False,
+                  sss=None):
+    """Direct lighting + ambient + emission for a batch of points.
+
+    `extras`, when a dict, receives the BI panel round's side channels:
+    'spec_acc' (the accumulated specular colour, for spectra),
+    'only_shadow' ((accum, count) of per-light shadow, for Shadows
+    Only). Ramp specs and the light group ride `surf.bi`.
+
+    `suppress_spec` masks the specular lobe out of the result -- the
+    SSS pre-pass's combinedflag &= ~SCE_PASS_SPEC. `sss`, when a dict
+    ({'sampled': (n,3), 'texfac': f}), REPLACES the accumulated
+    diffuse with the scatter-tree sample shaped by the material colour
+    -- the shade_lamp_loop block, verbatim."""
     n = ctx.n
     N = M.normalize(ctx.N)
     V = -M.normalize(ctx.I)
@@ -456,8 +547,22 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
                                    else None)
         out = surf.diffuse * surf.ambient[:, None] * irr
     else:
-        amb_col = LI.ambient_light(scene, settings)
-        out = surf.diffuse * surf.ambient[:, None] * amb_col[None, :]
+        if isinstance(model, str) and model.startswith('BI_MATRIX_'):
+            # verbatim shade_lamp_loop (R155): BI's ambient is a FLAT
+            # add -- shr->combined += amb * WORLD ambient -- never
+            # multiplied by the diffuse colour. That rule covers the
+            # WORLD pool only: the engine's own Global Ambient has no
+            # BI counterpart and stays diffuse-tinted, or the default
+            # (0.05, 0.05, 0.06) lifts every imported black with a
+            # blue-leaning floor (the R156 field report).
+            eng_col, wrld_col = LI.ambient_light_split(scene, settings)
+            out = (surf.diffuse * surf.ambient[:, None]
+                   * eng_col[None, :]
+                   + np.broadcast_to(wrld_col[None, :], (n, 3))
+                   * surf.ambient[:, None])
+        else:
+            amb_col = LI.ambient_light(scene, settings)
+            out = surf.diffuse * surf.ambient[:, None] * amb_col[None, :]
         if settings.ambient_occlusion and bvh is not None:
             out *= ambient_occlusion(ctx.P, N, bvh, settings, rng,
                                      sample_xy=(spx, spy) if have_id
@@ -474,8 +579,97 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         LI.select_lights(scene.lights, settings)
     clamp = float(settings.light_clamp)
 
+    # ---- the BI panel round's per-material machinery
+    bi_ex = surf.bi
+    ramp_dif = getattr(bi_ex, 'ramp_dif', None) if bi_ex else None
+    ramp_spec = getattr(bi_ex, 'ramp_spec', None) if bi_ex else None
+    group = getattr(bi_ex, 'light_group', None) if bi_ex else None
+    excl_lights = getattr(scene, 'exclusive_lights', None)
+    receive_off = np.any(surf.shadow_receive < 0.5)
+    want_only = extras is not None and np.any(surf.shadows_only > 0.5)
+    want_spec_acc = extras is not None and (
+        np.any(surf.bi_spectra > 0.0)
+        or (ramp_spec is not None and ramp_spec.get('input') == 'RESULT'))
+    # RESULT ramps read the whole accumulated colour, so those materials
+    # keep diffuse and specular apart and clamp once at the end (BI had
+    # no per-light clamp at all)
+    # R164: BI's world Exposure -- wrld_exposure_correct runs on the
+    # accumulated DIFFUSE ("has no spec!") and on SPEC separately,
+    # BEFORE ambient/emit join combined, and never in the SSS pre-pass
+    # (the C gates on !R.sss_points; suppress_spec marks exactly that)
+    _wrld = getattr(scene, 'world', None)
+    w_exp = float(getattr(_wrld, 'exposure', 0.0) or 0.0) \
+        if _wrld is not None else 0.0
+    w_rng = float(getattr(_wrld, 'exposure_range', 1.0) or 1.0) \
+        if _wrld is not None else 1.0
+    exposure_on = (w_exp != 0.0 or w_rng != 1.0) and not suppress_spec
+
+    # SSS REPLACES the accumulated diffuse after all lights, exactly
+    # shade_lamp_loop -- so an SSS material (and an exposed world)
+    # rides the same separated bookkeeping the RESULT ramps use
+    track_result = (
+        (ramp_dif is not None and ramp_dif.get('input') == 'RESULT')
+        or (ramp_spec is not None and ramp_spec.get('input') == 'RESULT')
+        or (sss is not None) or exposure_on)
+    diff_acc = np.zeros((n, 3), np.float32) if track_result else None
+    spec_acc = np.zeros((n, 3), np.float32) \
+        if (track_result or want_spec_acc) else None
+    only_accum = np.zeros(n, np.float32) if want_only else None
+    only_ir = 0.0
+    ndv_g = M.dot(N, V) if (ramp_dif is not None
+                            or ramp_spec is not None) else None
+
+    def _band(spec_r, fac):
+        from .bitex import colorband_eval
+        return colorband_eval(spec_r['stops'], np.asarray(fac, np.float32),
+                              int(spec_r.get('ipotype', 0)))
+
     obj_idx = getattr(ctx, 'object_index_raw', None)
+
+    # R164: shade_one_light's phongcorr (the shadow-bias terminator
+    # fix), three branches verbatim: HEMI/AREA pass untouched; RAYBIAS
+    # on a smooth face against the object's Auto Smooth threshold;
+    # else Material.sbias against shadowed lamps. The face R_SMOOTH
+    # flag rides a geometric proxy here (interpolated normal differs
+    # from the face normal), noted divergence for flat-but-bumped
+    # faces under RAYBIAS.
+    pc_sbias = float(getattr(bi_ex, 'sbias', 0.0) or 0.0) \
+        if bi_ex else 0.0
+    pc_raybias = bool(getattr(bi_ex, 'raybias', False)) if bi_ex else False
+    pc_wanted = settings.shadows and (pc_sbias != 0.0 or pc_raybias)
+    pc_smooth = None
+    pc_thresh = None
+    if pc_wanted and pc_raybias:
+        ng = M.normalize(np.asarray(ctx.Ng, np.float32))
+        pc_smooth = np.abs(M.dot(ng, N)) < np.float32(1.0 - 1e-6)
+        if obj_idx is not None and getattr(scene, 'objects', None):
+            sres = np.array([float(getattr(o, 'smoothresh', 0.0) or 0.0)
+                             for o in scene.objects], np.float32)
+            pc_thresh = sres[np.clip(np.asarray(obj_idx, np.int64), 0,
+                                     len(sres) - 1)]
+        else:
+            pc_thresh = np.zeros(n, np.float32)
+
+    def _pcurve(inp, th):
+        # (inp - t)/(inp*(1 - t)) above the threshold, 0 below -- the
+        # C's exact shape (guarded against the degenerate t >= 1)
+        th = np.minimum(th, np.float32(1.0 - 1e-6))
+        num = inp - th
+        den = inp * (1.0 - th)
+        return np.where(inp > th,
+                        num / np.where(np.abs(den) > 1e-20, den, 1.0),
+                        0.0).astype(np.float32)
+
     for li, light in enumerate(lights):
+        lname = getattr(light, 'name', None)
+        if group is not None:
+            # the material's Light Group: only its lamps light this
+            if lname not in group:
+                continue
+        elif excl_lights and lname in excl_lights:
+            # a lamp claimed by some material's EXCLUSIVE group lights
+            # nothing else
+            continue
         lit_mask = None
         excl = getattr(light, 'exclude_objects', None)
         if excl and obj_idx is not None:
@@ -485,24 +679,119 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
                 continue
         L, rad, dist = LI.sample(light, ctx.P, settings)
         ndl = M.dot(N, L)
-        if not np.any(ndl > 0.0) and not np.any(surf.translucency > 0):
+        if not np.any(ndl > 0.0) and not np.any(surf.translucency > 0) \
+                and getattr(light, 'type', '') != 'HEMI':
+            # the hemi WRAP lights faces the dot product writes off
             continue
+        # the shaders run BEFORE the shadow query, because their own
+        # gates -- the C's gates, transcribed -- decide which samples
+        # can receive ANY contribution from this lamp. A shadow ray
+        # for a sample whose diffuse AND specular are both zero
+        # multiplies nothing: shade_one_light's Blinn returns 0 below
+        # nl=0.01, CookTorr/Phong below nh=0, Lambert below inp=0, so
+        # the whole back side of a character never needed its five
+        # sun-shadow rays. Exact by construction: the mask IS "the
+        # result reads vis here", not a heuristic. Shadows Only
+        # accumulation (only_accum) reads vis at every sample, so its
+        # presence disables the skip for the batch.
+        dif, spec = SH.evaluate(model, surf, N, L, V)
+        need = None
+        if only_accum is None and getattr(light, 'type', '') != 'HEMI':
+            need = (dif != 0.0) | (spec != 0.0).any(axis=1)
+            if lit_mask is not None:
+                need &= lit_mask         # excluded objects contribute 0
+            if not need.any():
+                continue
         vis = LI.visibility(light, ctx.P, N, L, dist, settings, bvh, rng,
-                            sample_xy=(spx, spy, li) if have_id else None)
+                            sample_xy=(spx, spy, li) if have_id else None,
+                            mask=need)
+        if only_accum is not None:
+            smode = light.shadow if settings.shadow_default == 'PER_LIGHT' \
+                else settings.shadow_default
+            if settings.shadows and light.shadow != 'NONE' and \
+                    smode != 'NONE':
+                dark = 1.0 - vis
+                if lit_mask is not None:
+                    dark = dark * lit_mask
+                only_accum += dark
+                only_ir += 1.0
+        if receive_off:
+            # Shadow > Receive off: shadows never darken this material
+            vis = np.where(surf.shadow_receive > 0.5, vis, 1.0)
         if not np.any(vis > 0.0):
             continue
-        dif, spec = SH.evaluate(model, surf, N, L, V)
+        if getattr(light, 'type', '') == 'HEMI':
+            # BI's Hemi lamp REPLACES the shaders: diffuse is the
+            # 0.5+0.5*N.L wrap, specular a wrapped half-vector pow --
+            # 2.79 shade_one_light's LA_HEMI branches, both lobes
+            ndl_h = M.dot(N, L)
+            dif = (0.5 * ndl_h + 0.5).astype(np.float32)
+            h_h = M.normalize(L + V)
+            t_h = 0.5 * M.dot(N, h_h) + 0.5
+            # verbatim (R155): t = spec(t, shi->har) -- the integer-bit
+            # spec() table, not a float pow
+            sp_h = SH.bi_spec_pow(t_h, surf.glossiness)
+            spec = sp_h[:, None] * surf.specular
         if light.negative:
             rad = -rad
-        contrib = np.zeros((n, 3), np.float32)
+        dcontrib = np.zeros((n, 3), np.float32)
+        scontrib = np.zeros((n, 3), np.float32)
         if light.affect_diffuse and not light.specular_only:
-            contrib += (dif[:, None] * surf.diffuse *
+            dcol = surf.diffuse
+            if ramp_dif is not None and ramp_dif.get('input') != 'RESULT':
+                inp = ramp_dif.get('input', 'SHADER')
+                if inp == 'ENERGY':
+                    lum = (0.3 * rad[:, 0] + 0.58 * rad[:, 1] +
+                           0.11 * rad[:, 2])
+                    fac_in = dif * vis * lum
+                elif inp == 'NORMAL':
+                    # +N.V: facing reads the band's RIGHT end, grazing
+                    # its LEFT -- pinned by the field's own 2.79 files
+                    # (edge-darkening bands: black alpha at pos 0).
+                    # fresnel_fac is sign-symmetric and never pinned it
+                    fac_in = ndv_g
+                else:                       # SHADER
+                    fac_in = dif
+                band = _band(ramp_dif, fac_in)
+                dcol = SH.bi_ramp_blend(
+                    ramp_dif.get('blend', 'MIX'), surf.diffuse,
+                    band[:, 3] * float(ramp_dif.get('factor', 1.0)),
+                    band[:, :3])
+            dcontrib = (dif[:, None] * dcol *
                         surf.diffuse_level[:, None]) * rad
         if light.affect_specular and not light.diffuse_only:
             sp = spec
+            if ramp_spec is not None and ramp_spec.get('input') != 'RESULT':
+                # recover the shader scalar from evaluate's coloured
+                # return (spec = scalar * specular colour); a black
+                # specular colour has no recoverable scalar and stays
+                # dark, ramp or no ramp
+                mx = surf.specular.max(axis=1)
+                idx = surf.specular.argmax(axis=1)
+                sr = spec[np.arange(n), idx]
+                sfac = np.where(mx > 1e-9, sr / np.maximum(mx, 1e-9), 0.0)
+                inp = ramp_spec.get('input', 'SHADER')
+                if inp == 'ENERGY':
+                    lum = (0.3 * rad[:, 0] + 0.58 * rad[:, 1] +
+                           0.11 * rad[:, 2])
+                    fac_in = sfac * vis * lum
+                elif inp == 'NORMAL':
+                    # +N.V: facing reads the band's RIGHT end, grazing
+                    # its LEFT -- pinned by the field's own 2.79 files
+                    # (edge-darkening bands: black alpha at pos 0).
+                    # fresnel_fac is sign-symmetric and never pinned it
+                    fac_in = ndv_g
+                else:                       # SHADER
+                    fac_in = sfac
+                band = _band(ramp_spec, fac_in)
+                scol = SH.bi_ramp_blend(
+                    ramp_spec.get('blend', 'MIX'), surf.specular,
+                    band[:, 3] * float(ramp_spec.get('factor', 1.0)),
+                    band[:, :3])
+                sp = sfac[:, None] * scol
             if not settings.specular_in_gamma:
                 sp = np.power(np.maximum(sp, 0.0), 2.2)
-            contrib += sp * surf.specular_level[:, None] * rad
+            scontrib = sp * surf.specular_level[:, None] * rad
             if sheen_exp is not None:
                 # velvet: light scattered back at grazing angles, so the lobe
                 # lives at the silhouette and vanishes face-on. It still needs
@@ -510,14 +799,130 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
                 # the same look and needs none.
                 sh = (np.power(edge_vn, sheen_exp) *
                       np.maximum(ndl, 0.0) * surf.sheen)
-                contrib += surf.sheen_color * sh[:, None] * rad
-        contrib *= inv_pi
-        contrib *= vis[:, None]
+                scontrib = scontrib + surf.sheen_color * sh[:, None] * rad
+        # phongcorr multiplies the diffuse contribution only (i = is *
+        # phongcorr); the ramps read the PRE-correction shader value
+        # (add_to_diffuse's third argument is `is`), which fac_in
+        # above already did
+        if pc_wanted and light.type not in ('HEMI', 'AREA'):
+            smode = light.shadow if settings.shadow_default == 'PER_LIGHT' \
+                else settings.shadow_default
+            lamp_shadowed = smode in ('MAP', 'RAY') \
+                and light.shadow != 'NONE'
+            pc = np.ones(n, np.float32)
+            done = np.zeros(n, bool)
+            if pc_raybias and lamp_shadowed and smode == 'RAY' \
+                    and pc_smooth is not None:
+                m = pc_smooth
+                if np.any(m):
+                    pc = np.where(m, _pcurve(ndl, pc_thresh), pc)
+                    done = m
+            if pc_sbias != 0.0 and lamp_shadowed:
+                m2 = ~done
+                if np.any(m2):
+                    pc = np.where(
+                        m2, _pcurve(ndl, np.float32(pc_sbias)), pc)
+            # MA_SHADOW is per material: pixels not receiving shadows
+            # keep phongcorr = 1, exactly the C's outer gate
+            pc = np.where(surf.shadow_receive > 0.5, pc, 1.0)
+            dcontrib *= pc[:, None]
+        # R164: the lamp's SHADOW COLOUR -- shade_one_light adds
+        # lashdw*(i_noshad - i) back to the DIFFUSE (never the spec):
+        # equivalently the diffuse sees vis + shadow_color*(1 - vis)
+        # per channel. Black keeps the classic full shadow.
+        _shcol = np.asarray(getattr(light, 'shadow_color',
+                                    (0.0, 0.0, 0.0)), np.float32)
+        if float(_shcol.max()) > 0.0:
+            dcontrib *= inv_pi * (vis[:, None]
+                                  + _shcol[None, :]
+                                  * (1.0 - vis[:, None]))
+        else:
+            dcontrib *= inv_pi * vis[:, None]
+        scontrib *= inv_pi * vis[:, None]
+        if suppress_spec:
+            # the SSS pre-pass: combinedflag &= ~SCE_PASS_SPEC -- the
+            # lobe never reaches the stored point colour
+            scontrib = np.zeros_like(dcontrib)
         if lit_mask is not None:
-            contrib *= lit_mask[:, None]
+            dcontrib *= lit_mask[:, None]
+            scontrib *= lit_mask[:, None]
+        if track_result:
+            diff_acc += dcontrib
+            spec_acc += scontrib
+        else:
+            contrib = dcontrib + scontrib
+            if clamp > 0.0:
+                contrib = np.minimum(contrib, clamp)
+            out += contrib
+            if spec_acc is not None:
+                spec_acc += scontrib
+
+    if track_result:
+        if ramp_dif is not None and ramp_dif.get('input') == 'RESULT':
+            fac_in = (0.3 * diff_acc[:, 0] + 0.58 * diff_acc[:, 1] +
+                      0.11 * diff_acc[:, 2])
+            band = _band(ramp_dif, fac_in)
+            diff_acc = SH.bi_ramp_blend(
+                ramp_dif.get('blend', 'MIX'), diff_acc,
+                band[:, 3] * float(ramp_dif.get('factor', 1.0)),
+                band[:, :3])
+        if ramp_spec is not None and ramp_spec.get('input') == 'RESULT':
+            fac_in = (0.3 * spec_acc[:, 0] + 0.58 * spec_acc[:, 1] +
+                      0.11 * spec_acc[:, 2])
+            band = _band(ramp_spec, fac_in)
+            spec_acc = SH.bi_ramp_blend(
+                ramp_spec.get('blend', 'MIX'), spec_acc,
+                band[:, 3] * float(ramp_spec.get('factor', 1.0)),
+                band[:, :3])
+        if sss is not None:
+            # shade_lamp_loop's SSS block, verbatim: the scattered
+            # radiance replaces the accumulated diffuse, shaped by the
+            # material colour per sss_texfac (shr->col = the textured
+            # colour, invalpha = 1/col[3])
+            sampled = np.asarray(sss['sampled'], np.float32)
+            texfac = float(sss.get('texfac', 0.0))
+            alpha = np.asarray(surf.opacity, np.float32)
+            invalpha = np.where(alpha > np.finfo(np.float32).eps,
+                                1.0 / np.maximum(alpha, 1e-30), 1.0)
+            if texfac == 0.0:
+                col = surf.diffuse * invalpha[:, None]
+            elif texfac == 1.0:
+                col = np.broadcast_to(
+                    invalpha[:, None], (n, 3)).astype(np.float32)
+            else:
+                col = np.power(
+                    np.maximum(surf.diffuse * invalpha[:, None], 0.0),
+                    np.float32(1.0 - texfac))
+            diff_acc = sampled * col
+        if exposure_on:
+            # wrld_exposure_correct, letters from the original 2003
+            # commit (unchanged through 2.79, removed 2.8):
+            #   linfac = 1 + pow(2*exp + 0.5, -10)
+            #   logfac = log((linfac-1)/linfac) / range
+            #   col    = linfac * (1 - exp(col * logfac))
+            # The C corrects the DIFFUSE total ("has no spec!") and
+            # SPEC separately, AFTER the SSS replacement, BEFORE
+            # ambient and emit join -- exactly this spot.
+            linfac = np.float32(1.0 + (2.0 * w_exp + 0.5) ** -10.0)
+            logfac = np.float32(
+                np.log((linfac - 1.0) / linfac)
+                / (w_rng if abs(w_rng) > 1e-6 else 1e-6))
+            diff_acc = (linfac
+                        * (1.0 - np.exp(diff_acc * logfac))).astype(
+                            np.float32)
+            spec_acc = (linfac
+                        * (1.0 - np.exp(spec_acc * logfac))).astype(
+                            np.float32)
+        light_part = diff_acc + spec_acc
         if clamp > 0.0:
-            contrib = np.minimum(contrib, clamp)
-        out += contrib
+            light_part = np.minimum(light_part, clamp)
+        out += light_part
+
+    if extras is not None:
+        if spec_acc is not None:
+            extras['spec_acc'] = spec_acc
+        if only_accum is not None:
+            extras['only_shadow'] = (only_accum, only_ir)
 
     if settings.clamp_specular:
         out = np.minimum(out, 64.0)
@@ -964,6 +1369,12 @@ class ShadeJob:
         #: filled by _shade_all for materials whose chunking would otherwise
         #: cut n_bump's screen gradients mid-material
         self.bump_fields = {}
+        #: mat_index -> (ScatterTree, params) filled by _sss_prepare;
+        #: sss_prepass marks the point-collection render (spec masked
+        #: out of combined, no tree sampling -- sample_sss returns 0
+        #: in 2.79's preprocess too)
+        self.sss_trees = {}
+        self.sss_prepass = False
 
     def object_bounds(self):
         """Per-object bounding boxes, for Generated texture coordinates.
@@ -1162,6 +1573,10 @@ class ShadeJob:
         ctx.uv = uv
         ctx.uv2 = uv2
         ctx.vcol = col
+        # BI stripped the vertex-colour material modes when the mesh had
+        # no colour layer (convertblender.c); the ones-filled default
+        # above must never read as painted white
+        ctx.has_vcol = mesh.colors is not None
         # the UV Map node resolves layers BY NAME: both named sets are
         # reachable as attributes, so 'uv:<name>' answers with the
         # right layer instead of silently falling back to the active one
@@ -1283,6 +1698,15 @@ class ShadeJob:
         cl = None
         discard = None
         disp = None
+        if self.sss_prepass and getattr(ctx, 'backfacing', None) \
+                is not None:
+            # the pre-pass shades the BACK layer with flipped normals,
+            # exactly shade_sample_sss's shade_input_flip_normals --
+            # unconditionally, before the graph reads any texco
+            bf = np.asarray(ctx.backfacing) > 0.5
+            if np.any(bf):
+                ctx.N = np.where(bf[:, None], -ctx.N, ctx.N)
+                ctx.Ng = np.where(bf[:, None], -ctx.Ng, ctx.Ng)
         if mat is not None and mat.graph:
             ev = GraphEvaluator(mat.graph, ctx, self.textures, mat.programs)
             cl, disp = ev.evaluate_surface()
@@ -1325,8 +1749,35 @@ class ShadeJob:
         # so the backface override had nothing to key off
         if getattr(ctx, 'backfacing', None) is not None:
             surf.backfacing = np.asarray(ctx.backfacing, np.float32)
+        extras = {} if (np.any(surf.bi_spectra > 0.0)
+                        or np.any(surf.shadows_only > 0.5)) else None
+        # the SSS main-pass sample: shi->co was CAMERA space, so the
+        # tree is queried there; nothing samples during the pre-pass
+        # (2.79's sample_sss returns 0 before the tree exists)
+        sss_arg = None
+        if self.sss_trees and mat is not None and not self.sss_prepass:
+            entry = self.sss_trees.get(int(getattr(mat, 'index', -1)))
+            if entry is not None:
+                tree, sparams = entry
+                vm = np.asarray(self.view, np.float32)
+                p_cam = ctx.P @ vm[:3, :3].T + vm[:3, 3]
+                sss_arg = {'sampled': tree.sample(p_cam),
+                           'texfac': sparams['texfac']}
         rgb = light_surface(surf, model, ctx, self.scene, st, self.bvh,
-                            rng if rng is not None else self.rng, self.lights)
+                            rng if rng is not None else self.rng, self.lights,
+                            extras=extras, suppress_spec=self.sss_prepass,
+                            sss=sss_arg)
+
+        if np.any(surf.bi_mir_fresnel != 0.0):
+            # Mirror > Fresnel: 2.79 scales ray_mirror by fresnel_fac
+            # (view, vn, Blend, Fresnel) before any ray leaves. view is
+            # eye->surface, so the argument is -N.V; a Blend above 1
+            # turns the gradient the classic way (grazing reflects).
+            ndv = M.dot(M.normalize(ctx.N), -M.normalize(ctx.I))
+            mirf = SH.bi_fresnel_fac(-ndv, surf.bi_mir_blend,
+                                     surf.bi_mir_fresnel)
+            surf.reflect = (surf.reflect *
+                            np.clip(mirf, 0.0, 1.0)).astype(np.float32)
 
         if st.raytrace and ray_depth < st.ray_depth:
             rgb = self._add_raytraced(rgb, surf, ctx, ray_depth)
@@ -1338,8 +1789,29 @@ class ShadeJob:
             rgb = rgb + env * surf.reflect[:, None] * surf.specular * \
                 surf.reflect_color
 
-        rgb = apply_fog(rgb, ctx.depth, st, self.scene, P=ctx.P)
+        if np.any(surf.use_mist < 0.5):
+            # Options > Use Mist off: the material ignores the fog
+            fogged = apply_fog(rgb.copy(), ctx.depth, st, self.scene,
+                               P=ctx.P)
+            rgb = np.where((surf.use_mist > 0.5)[:, None], fogged, rgb)
+        else:
+            rgb = apply_fog(rgb, ctx.depth, st, self.scene, P=ctx.P)
         alpha = np.clip(surf.opacity, 0.0, 1.0)
+        if np.any(surf.bi_transp_fresnel != 0.0):
+            # Transparency > Fresnel REPLACES the alpha slider outright,
+            # exactly 2.79's shade_lamp_loop
+            ndv = M.dot(M.normalize(ctx.N), -M.normalize(ctx.I))
+            fr = SH.bi_fresnel_fac(-ndv, surf.bi_transp_blend,
+                                   surf.bi_transp_fresnel)
+            alpha = np.where(surf.bi_transp_fresnel != 0.0,
+                             np.clip(fr, 0.0, 1.0), alpha)
+        if extras is not None and np.any(surf.bi_spectra > 0.0) and \
+                'spec_acc' in extras:
+            # Transparency > Specular: highlights turn opaque --
+            # t = spectra * max(spec), alpha = (1-t)*alpha + t
+            t = np.clip(extras['spec_acc'].max(axis=1) * surf.bi_spectra,
+                        0.0, 1.0)
+            alpha = (1.0 - t) * alpha + t
         if st.alpha_threshold > 0.0:
             # a hard cutoff rather than a blend: cheaper, and what hardware
             # without an alpha unit actually did with cut-out textures
@@ -1361,8 +1833,55 @@ class ShadeJob:
             alpha = np.where(alpha > np.asarray(thr, np.float32), 1.0, 0.0)
         elif st.transparency == 'NONE':
             alpha = np.ones_like(alpha)
+        if extras is not None and 'only_shadow' in extras and \
+                np.any(surf.shadows_only > 0.5):
+            # Shadow > Shadows Only: the classic catcher. The material
+            # renders black at the mean of its lamps' shadow, exactly
+            # 2.79's shade_only_shadow: alpha = mat_alpha * accum/ir
+            accum, ir = extras['only_shadow']
+            catch = np.clip(surf.opacity, 0.0, 1.0) * \
+                (accum / ir if ir > 0.0 else np.zeros_like(accum))
+            only = surf.shadows_only > 0.5
+            alpha = np.where(only, np.clip(catch, 0.0, 1.0), alpha)
+            rgb = np.where(only[:, None], 0.0, rgb).astype(np.float32)
+        if np.any(surf.cast_only > 0.5) and \
+                bool(getattr(ctx, 'is_camera_ray', True)):
+            # Shadow > Cast Only: invisible to the CAMERA, while shadow
+            # maps and secondary rays keep seeing the geometry
+            alpha = np.where(surf.cast_only > 0.5, 0.0, alpha)
         if discard is not None:
             alpha = np.where(np.asarray(discard).reshape(-1)[:alpha.size], 0.0, alpha)
+        # R164: MA_OBCOLOR modulates the WHOLE combined at the very
+        # end of shade_lamp_loop (after emit and spec joined), alpha
+        # under transparency -- and an SSS material with its tree
+        # built SKIPS the modulation, the C's own sss_pass_done gate
+        bi_x = getattr(surf, 'bi', None)
+        # sss_pass_done quirk kept: an SSS-flagged material skips the
+        # modulation once its tree exists AND when the scene switch is
+        # off (done = baking || !R_SSS || tree) -- but never in its
+        # own pre-pass, where the tree is not built yet
+        _skip_obcol = (bi_sss_params(mat) is not None) and (
+            sss_arg is not None
+            or (not getattr(self.settings, 'sss', True)
+                and not self.sss_prepass))
+        if bi_x is not None and getattr(bi_x, 'use_obcolor', False) \
+                and not _skip_obcol:
+            oi = getattr(ctx, 'object_index_raw', None)
+            if oi is not None and getattr(self.scene, 'objects', None):
+                cols = np.array([tuple(getattr(o, 'color',
+                                               (1, 1, 1, 1)))[:4]
+                                 for o in self.scene.objects],
+                                np.float32)
+                oc = cols[np.clip(np.asarray(oi, np.int64), 0,
+                                  len(cols) - 1)]
+                oc[:, 3] = np.clip(oc[:, 3], 0.0, 1.0)
+                rgb = rgb * oc[:, :3]
+                if bool(getattr(mat, 'graph', None)) and any(
+                        nd.get('props', {}).get('use_transparency')
+                        for nd in mat.graph.get('nodes', {}).values()
+                        if nd.get('bl_idname')
+                        == 'HALCYON_BIMaterialNode'):
+                    alpha = alpha * oc[:, 3]
         return np.concatenate([rgb, alpha[:, None]], axis=1).astype(np.float32)
 
     def _add_raytraced(self, rgb, surf, ctx, ray_depth):
@@ -1414,7 +1933,10 @@ class ShadeJob:
             want = np.nonzero(surf.opacity < 0.999)[0]
             if want.size:
                 Nw, Vw = N[want], V[want]
-                ior = np.maximum(surf.ior[want], 1e-3)
+                # the RAY IOR: a master shader's one slider, or the BI
+                # node's own transparency IOR (Blinn's Refr is spectral,
+                # not refractive, on that node)
+                ior = np.maximum(surf.ray_ior[want], 1e-3)
                 eta = np.where(M.dot(Nw, Vw) < 0, ior, 1.0 / ior)
                 T = M.refract(-Vw, Nw, eta)
                 bad = (T * T).sum(1) < 1e-9
@@ -1423,7 +1945,11 @@ class ShadeJob:
                                  ray_depth + 1, sample_xy=_sxy(want))
                 k = ((1.0 - np.clip(surf.opacity[want], 0.0, 1.0)) *
                      np.clip(surf.refraction[want], 0.0, 1.0))[:, None]
-                rgb[want] = rgb[want] * (1.0 - k) + hit * k * surf.diffuse[want]
+                # BI's Filter slider: 0 passes light untinted, 1 tints
+                # by the material colour (the master's old fixed look)
+                f = np.clip(surf.bi_ray_filter[want], 0.0, 1.0)[:, None]
+                tint = 1.0 + f * (surf.diffuse[want] - 1.0)
+                rgb[want] = rgb[want] * (1.0 - k) + hit * k * tint
         return rgb
 
     #: reflection blur's hash-stream salt -- distinct from lights (131*li),
@@ -1490,12 +2016,22 @@ class ShadeJob:
 
 
 def bump_from_height(ctx, height, strength=1.0):
-    """Perturb the normal from a height field, using screen derivatives.
+    """Perturb the normal from a height field, using screen derivatives
+    normalised to WORLD slope.
 
     The node graph's Displacement output was computed and thrown away. Actually
     displacing geometry means tessellating it, which no 1990s scanline renderer
     did either -- they turned the height into a normal perturbation and called
     it bump mapping, which is what this does.
+
+    The gradient is height-per-WORLD-UNIT, not height-per-pixel: the
+    raw pixel difference halves every time the resolution doubles, so
+    the same material bumped twice as deep in a draft as in the refine
+    (and deeper again at F12) -- the field's 'better bump' report. The
+    per-pixel world footprint comes from the same neighbour grid the
+    heights use, so the normalisation costs one more gather; Blender
+    Internal differentiated in texture space with a fixed step and was
+    resolution-independent for the same reason.
     """
     if ctx.px is None or ctx.py is None or ctx.width is None:
         return None
@@ -1509,6 +2045,8 @@ def bump_from_height(ctx, height, strength=1.0):
     seen = np.zeros((hh, w), bool)
     grid[py, px] = h
     seen[py, px] = True
+    pgrid = np.zeros((hh, w, 3), np.float32)
+    pgrid[py, px] = np.asarray(ctx.P, np.float32)
     # one-sided differences where the neighbour is missing, so silhouettes do
     # not invent a gradient out of empty space
     right = np.zeros_like(grid)
@@ -1519,12 +2057,34 @@ def bump_from_height(ctx, height, strength=1.0):
     up[:-1, :] = grid[1:, :]
     ok_u = np.zeros_like(seen)
     ok_u[:-1, :] = seen[1:, :]
-    dx = np.where(ok_r, right - grid, 0.0)[py, px]
-    dy = np.where(ok_u, up - grid, 0.0)[py, px]
+    pright = np.zeros_like(pgrid)
+    pright[:, :-1] = pgrid[:, 1:]
+    pup = np.zeros_like(pgrid)
+    pup[:-1, :] = pgrid[1:, :]
+    # the world size of one pixel step, from the SAME neighbours the
+    # height differences use; a missing neighbour keeps step 0 and the
+    # gradient stays 0 there exactly as before
+    step_r = np.linalg.norm(np.where(ok_r[:, :, None],
+                                     pright - pgrid, 0.0),
+                            axis=2)[py, px]
+    step_u = np.linalg.norm(np.where(ok_u[:, :, None],
+                                     pup - pgrid, 0.0),
+                            axis=2)[py, px]
+    dx = np.where(ok_r, right - grid, 0.0)[py, px] \
+        / np.maximum(step_r, 1e-6)
+    dy = np.where(ok_u, up - grid, 0.0)[py, px] \
+        / np.maximum(step_u, 1e-6)
+    dx = np.where(step_r > 1e-6, dx, 0.0)
+    dy = np.where(step_u > 1e-6, dy, 0.0)
 
     N = M.normalize(ctx.N)
     t, b = M.orthonormal_basis(N)
-    k = float(strength) * 8.0
+    # 0.5: the world-slope scale that keeps a strength-1.0 bump in the
+    # same visual class the old per-pixel 8.0 gave at the proven demo
+    # framing (~0.06 world units per pixel there, 8 x 0.06 = 0.5) --
+    # the LOOK at the golden sizes is preserved, and now it holds at
+    # every other size too
+    k = float(strength) * 0.5
     return M.normalize(N - t * (dx * k)[:, None] - b * (dy * k)[:, None])
 
 
@@ -1570,15 +2130,186 @@ def shade_vertex_rate(job, tri_subset, rate, st=None):
 # --------------------------------------------------------------- main entry
 
 
+def bi_node_props(mat):
+    """The BI material node's props dict from a material's graph, or None."""
+    graph = getattr(mat, 'graph', None) if mat is not None else None
+    if not graph:
+        return None
+    for node in graph.get('nodes', {}).values():
+        if node.get('bl_idname') == 'HALCYON_BIMaterialNode':
+            return node.get('props', {})
+    return None
+
+
+def bi_sss_params(mat):
+    """The BI node's Subsurface Scattering panel, or None when off."""
+    props = bi_node_props(mat)
+    if not props or not props.get('sss_enable'):
+        return None
+    return {'scale': float(props.get('sss_scale', 0.1) or 0.1),
+            'radius': tuple(props.get('sss_radius', (1.0, 1.0, 1.0))),
+            'color': tuple(props.get('sss_color', (1.0, 1.0, 1.0))),
+            'ior': float(props.get('sss_ior', 1.3)),
+            'error': float(props.get('sss_error', 0.05)),
+            'colfac': float(props.get('sss_colfac', 1.0)),
+            'texfac': float(props.get('sss_texfac', 0.0)),
+            'front': float(props.get('sss_front', 1.0)),
+            'back': float(props.get('sss_back', 1.0))}
+
+
+def _sss_prepare(scene, st, job, view, W, H):
+    """BI's SSS pre-pass, per material: sss_create_tree_mat's shape.
+
+    2.79 re-rendered the scene once per SSS material with OSA off,
+    z-buffering the material's OWN faces into a front layer (nearest)
+    and a back layer (farthest), shaded each covered pixel with
+    specular masked out of combined, and stored (position, colour,
+    pixel area x alpha) points -- back points with NEGATED area. The
+    octree over those points answers the main pass. Same here: the
+    front/back layers come from two subset rasterisations (the back
+    one through a flipped-z projection), the shading reuses the exact
+    frame machinery in prepass mode, the pixel areas are
+    shade_input_calc_viewco's own derivative construction, and
+    everything lives in CAMERA space, where shi->co lived."""
+    from . import sss as SSS
+    mesh = scene.mesh
+    if mesh is None or mesh.tris is None or not mesh.tris.size:
+        return
+    if not getattr(st, 'sss', True):
+        return
+    mats = {}
+    for i, m in enumerate(scene.materials or ()):
+        p = bi_sss_params(m)
+        if p is not None:
+            mats[i] = p
+    if not mats:
+        return
+    from . import raster as RA
+    _view, proj, vp, _eye = camera_matrices(scene.camera, W, H)
+    ortho = str(getattr(scene.camera, 'type', 'PERSP')) == 'ORTHO'
+    flip = np.diag([1.0, 1.0, -1.0, 1.0]).astype(np.float32) @ vp
+    vm = np.asarray(view, np.float32)
+    with ST.track('SSS preprocessing'):
+        for mi, params in mats.items():
+            sel = np.nonzero(mesh.mat_index == mi)[0] \
+                if mesh.mat_index is not None else \
+                np.arange(mesh.tris.shape[0])
+            if sel.size == 0:
+                continue
+            gf = RA.GBuffer(W, H)
+            RA.rasterize(mesh.verts, mesh.tris, vp, W, H, subset=sel,
+                         gbuf=gf)
+            gb = RA.GBuffer(W, H)
+            RA.rasterize(mesh.verts, mesh.tris, flip, W, H, subset=sel,
+                         gbuf=gb)
+            yy, xx = np.mgrid[0:H, 0:W]
+            covf = gf.tri >= 0
+            # the tile pass skips a back sample identical to the front
+            # one (a single-sided face is one point, not two)
+            covb = (gb.tri >= 0) & ~(covf & (gb.tri == gf.tri))
+            parts = []
+            for gbuf, cov, is_back in ((gf, covf, False),
+                                       (gb, covb, True)):
+                if not np.any(cov):
+                    continue
+                tri = gbuf.tri[cov].astype(np.int64)
+                bary = gbuf.bary[cov]
+                px = xx[cov].astype(np.int64)
+                py = yy[cov].astype(np.int64)
+                tv = mesh.verts[mesh.tris[tri]]
+                nrm = np.cross(tv[:, 1] - tv[:, 0], tv[:, 2] - tv[:, 0])
+                cent = tv.mean(axis=1)
+                facing = ((job.eye[None, :] - cent) * nrm).sum(axis=1) \
+                    > 0.0
+                job.sss_prepass = True
+                try:
+                    out = job.shade(tri, bary, px, py, front=facing,
+                                    sample_xy=(px, py))
+                finally:
+                    job.sss_prepass = False
+                P = (bary[:, :, None] * tv).sum(axis=1)
+                P_cam = P @ vm[:3, :3].T + vm[:3, 3]
+                v1_cam = tv[:, 0] @ vm[:3, :3].T + vm[:3, 3]
+                n_cam = nrm @ vm[:3, :3].T
+                nl = np.linalg.norm(n_cam, axis=1, keepdims=True)
+                n_cam = n_cam / np.maximum(nl, 1e-20)
+                area = SSS.pixel_areas(P_cam, n_cam, v1_cam,
+                                       px + 0.5, py + 0.5, proj, W, H,
+                                       ortho)
+                area = area * np.clip(out[:, 3], 0.0, None)
+                if is_back:
+                    area = -area
+                parts.append((P_cam.astype(np.float32),
+                              out[:, :3].astype(np.float32),
+                              area.astype(np.float32)))
+            if not parts:
+                continue
+            co = np.concatenate([p[0] for p in parts])
+            colr = np.concatenate([p[1] for p in parts])
+            ar = np.concatenate([p[2] for p in parts])
+            ss3 = SSS.settings_for(params)
+            tree = SSS.ScatterTree(ss3, params['scale'],
+                                   params['error'], co, colr, ar)
+            job.sss_trees[mi] = (tree, params)
+            # the GPU twin: the tree as a raw data texture (with the
+            # world->camera rows embedded, so the pass source stays
+            # camera-independent and the plan cache never needs the
+            # camera). Registered among the prepared textures under a
+            # reserved key -- the frame pass binds it exactly as the
+            # BI noise tables bind.
+            try:
+                from .texture import Texture as _Tex
+                packed = tree.pack_gpu(vm[:3, :4].ravel())
+                job.textures[f'__sss_tree_{mi}__'] = _Tex(
+                    packed, name=f'__sss_tree_{mi}__',
+                    colorspace='Non-Color', filt='NEAREST',
+                    wrap='EXTEND')
+            except Exception:                                   # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+
+
+def collect_exclusive_lights(scene):
+    """Lamp names claimed by any material's EXCLUSIVE light group.
+
+    BI's Exclusive flag: a lamp in such a group lights ONLY materials
+    naming that group. Collected once per render onto the scene, read
+    by every light loop."""
+    names = set()
+    for mat in (scene.materials or []):
+        props = bi_node_props(mat)
+        if props and props.get('light_group_exclusive') and \
+                props.get('light_group_lights'):
+            names.update(props['light_group_lights'])
+    scene.exclusive_lights = frozenset(names) if names else None
+
+
 def _build_shadows(scene, st, mesh):
     if not (st.shadows and st.shadow_default in ('MAP', 'PER_LIGHT')):
         return
-    cast = None
+    keep_tri = None
     if mesh is not None and mesh.obj_index is not None and scene.objects:
         keep = np.array([o.cast_shadow for o in scene.objects], bool)
         if not keep.all():
-            cast = np.nonzero(keep[np.clip(mesh.obj_index, 0,
-                                           len(scene.objects) - 1)])[0]
+            keep_tri = keep[np.clip(mesh.obj_index, 0,
+                                    len(scene.objects) - 1)]
+    if mesh is not None and mesh.mat_index is not None and scene.materials:
+        # the BI node's Shadow > Cast: a material can pull its
+        # triangles out of every caster set
+        mkeep = []
+        any_off = False
+        for m in scene.materials:
+            props = bi_node_props(m)
+            on = bool(props.get('shadow_cast', True)) if props else True
+            mkeep.append(on)
+            any_off = any_off or not on
+        if any_off:
+            mt = np.array(mkeep, bool)[np.clip(mesh.mat_index, 0,
+                                               len(scene.materials) - 1)]
+            keep_tri = mt if keep_tri is None else (keep_tri & mt)
+    cast = None
+    if keep_tri is not None and not keep_tri.all():
+        cast = np.nonzero(keep_tri)[0]
     LI.build_shadow_maps(scene, st, cast)
 
 
@@ -1685,6 +2416,34 @@ def snap_grid(st):
     return max(vs, sub)
 
 
+def _apply_material_override(scene, st):
+    """Material Override: the scene with every material a plain matte.
+
+    A shallow scene copy whose material list is rebuilt as graphless
+    Lambert surfaces in the override colour -- same names, same indices,
+    so meshes, passes and per-material machinery are untouched.
+    Geometry, lights and shadows stay real; textures and shading graphs
+    are simply not there, which is what a clay test render is. Both
+    devices see the SAME plain materials, so CPU/GPU parity holds by
+    construction (a graphless constant material is the GPU plan's
+    easiest case).
+    """
+    mode = str(getattr(st, 'material_override', 'NONE') or 'NONE').upper()
+    if mode == 'NONE':
+        return scene
+    import copy as _copy
+    col = tuple(float(c) for c in
+                (getattr(st, 'override_color', None) or (0.7, 0.7, 0.7)))
+    from .scene import Material as _Mat
+    out = _copy.copy(scene)
+    out.materials = [
+        _Mat(name=getattr(m, 'name', f'mat{i}'),
+             index=getattr(m, 'index', i), model='LAMBERT',
+             diffuse=col, specular_level=0.0)
+        for i, m in enumerate(scene.materials or [])]
+    return out
+
+
 def render(scene, settings=None, progress=None, band=None):
     """Render `scene`. Returns a linear (H,W,4) float32 image.
 
@@ -1698,6 +2457,8 @@ def render(scene, settings=None, progress=None, band=None):
     row 0 as the top and must flip first.
     """
     st = settings or scene.settings
+    scene = _apply_material_override(scene, st)
+    collect_exclusive_lights(scene)
     mesh = scene.mesh
     W = max(int(st.resolution_x), 1)
     H = max(int(st.resolution_y), 1)
@@ -1782,6 +2543,17 @@ def render(scene, settings=None, progress=None, band=None):
     snap = snap_grid(st)
     cull = 'BACK' if st.backface_cull else 'NONE'
 
+    # BI subsurface scattering: the per-material point-cloud pre-pass
+    # (2.79's make_sss_tree), before any beauty pixel shades. Runs at
+    # the BASE resolution with no supersampling, exactly the OSA-off
+    # pre-render sss_create_tree_mat performed.
+    try:
+        _sss_prepare(scene, st, job, view, W, H)
+    except Exception:                                           # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        job.sss_trees = {}
+
     # when only a band is wanted, the rasteriser is told so: otherwise every
     # worker in a pool rasterises the whole mesh for its own slice
     scissor = None
@@ -1815,12 +2587,68 @@ def render(scene, settings=None, progress=None, band=None):
         flat_depth = polygon_depths(mesh, view, eye, st.painters_key)
 
     want_overdraw = st.debug_pass == 'OVERDRAW'
+    # ---- the G-buffer cache (R170): a redraw with an unchanged camera,
+    # mesh and raster settings re-rasterised ~220ms of identical arrays
+    # on every viewport refine (85% of an idle refine) and every
+    # repeated F12. The key is CONTENT -- mesh fingerprint, the exact
+    # view-projection bytes, sizes, and every dial the rasteriser reads
+    # -- so an orbit, a deform or a settings change misses honestly.
+    # Cached: the plain z-buffer case only (no Painter's, no A-buffer
+    # fragments, no overdraw census, no bands); restored by copy into
+    # the fresh GBuffer, never shared.
+    # (frags is NOT a condition: the transparent subset rasterises in
+    # its own later stage -- the main raster's G-buffer covers the
+    # opaque subset only, which the key fingerprints via `_sub`)
+    gbuf_ckey = None
+    # R171: the field's viewport missed this cache on every refine while
+    # the headless twin hit -- so a miss now NAMES the key component (or
+    # the eligibility gate) that broke it, and the viewport split line
+    # prints it. One pasted `gbuf MISS(vp)` beats a round of guessing.
+    if band is not None:
+        _GBUF_STATS['last'] = 'off(band)'
+    elif flat_depth is not None:
+        _GBUF_STATS['last'] = 'off(painters)'
+    elif want_overdraw:
+        _GBUF_STATS['last'] = 'off(overdraw)'
+    else:
+        try:
+            from ..gpu.shade import _mesh_key as _gk
+            _sub = 'all' if opaque is None else \
+                (int(opaque.size), int(opaque[::17].astype(np.int64).sum()))
+            gbuf_ckey = (_gk(mesh), np.asarray(vp, np.float32).tobytes(),
+                         rw, rh, cull, float(snap),
+                         int(st.depth_precision), int(subdiv_px),
+                         float(near_eps), gbuf.bary_lin is not None, _sub)
+        except Exception:                                       # noqa: BLE001
+            gbuf_ckey = None
+            _GBUF_STATS['last'] = 'off(keyfail)'
+    _gb_hit = _GBUF_CACHE.get(gbuf_ckey) if gbuf_ckey is not None else None
+    rastered_from_cache = False
+    if _gb_hit is not None:
+        with ST.track('rasterise (cached)'):
+            _GBUF_CACHE[gbuf_ckey] = _GBUF_CACHE.pop(gbuf_ckey)  # LRU touch
+            gbuf.tri[:] = _gb_hit['tri']
+            gbuf.bary[:] = _gb_hit['bary']
+            gbuf.depth[:] = _gb_hit['depth']
+            gbuf.zndc[:] = _gb_hit['zndc']
+            gbuf.front[:] = _gb_hit['front']
+            if _gb_hit.get('bary_lin') is not None and \
+                    gbuf.bary_lin is not None:
+                gbuf.bary_lin[:] = _gb_hit['bary_lin']
+            _GBUF_STATS['hits'] += 1
+            _GBUF_STATS['last'] = 'HIT'
+            # keep the per-resolution last-seen key current, so the NEXT
+            # miss diffs against what actually rendered last
+            _GBUF_STATS.setdefault('lastkey', {})[(rw, rh)] = gbuf_ckey
+        rastered_from_cache = True
+
     # The compute rasteriser: the CPU's own fill rules on the GPU, measured
     # at ZERO differing pixels on hardware. Strictly opt-in and strictly
     # qualified -- anything it does not reproduce rasterises on the CPU
     # exactly as before, with the reason printed. Whole-frame only.
     rastered_on_gpu = False
-    if str(getattr(st, 'render_device', 'CPU')).upper() == 'GPU' and \
+    if not rastered_from_cache and \
+            str(getattr(st, 'render_device', 'CPU')).upper() == 'GPU' and \
             getattr(st, 'gpu_raster', False) and band is None and \
             flat_depth is None and not want_overdraw:
         # affine frames run the kernel's lin variant (a third image
@@ -1851,7 +2679,7 @@ def render(scene, settings=None, progress=None, band=None):
             rastered_on_gpu = True
         else:
             print(f'[Halcyon GPU] rasterising on the CPU: {why_r}')
-    if not rastered_on_gpu:
+    if not rastered_from_cache and not rastered_on_gpu:
         with ST.track('rasterise'):
             raster.rasterize(mesh.verts, mesh.tris, vp, rw, rh, cull=cull,
                              snap=snap, depth_bits=st.depth_precision,
@@ -1860,6 +2688,70 @@ def render(scene, settings=None, progress=None, band=None):
                              flat_depth=flat_depth, scissor=scissor,
                              batched=False if want_overdraw else None,
                              subdiv_px=subdiv_px, near_eps=near_eps)
+    if gbuf_ckey is not None and not rastered_from_cache:
+        # store copies -- the live gbuf is written by later stages
+        # (gpu_alpha, wireframe) and must never alias the cache
+        _GBUF_STATS['misses'] += 1
+        # name WHICH component moved since the last key seen at this
+        # resolution (draft and refine sizes tracked apart)
+        _prev = _GBUF_STATS.setdefault('lastkey', {}).get((rw, rh))
+        if _prev is None:
+            _GBUF_STATS['last'] = 'MISS(first)'
+        else:
+            _names = ('mesh', 'vp', 'rw', 'rh', 'cull', 'snap', 'depth',
+                      'subdiv', 'eps', 'lin', 'subset')
+            _diff = [n for n, a, b in zip(_names, _prev, gbuf_ckey)
+                     if a != b]
+            if 'vp' in _diff:
+                # R172: name WHICH matrix elements moved and by how
+                # much. The field pastes MISS(vp) on an untouched view;
+                # 'm03+2ulp' is float jitter to hunt down, 'm03+1.2e-1'
+                # is a real move (the user navigating) -- one word
+                # settles which
+                try:
+                    _a = np.frombuffer(_prev[1],
+                                       np.float32).reshape(4, 4)
+                    _b = np.frombuffer(gbuf_ckey[1],
+                                       np.float32).reshape(4, 4)
+                    _rr, _cc = np.nonzero(_a != _b)
+                    _els = []
+                    for _r0, _c0 in list(zip(_rr, _cc))[:4]:
+                        _d = float(_b[_r0, _c0]) - float(_a[_r0, _c0])
+                        _sp0 = float(np.spacing(np.abs(
+                            _a[_r0, _c0]) + np.float32(1e-30)))
+                        _ul = abs(_d) / max(_sp0, 1e-45)
+                        _sgn = '+' if _d >= 0 else '-'
+                        _els.append(
+                            f'm{_r0}{_c0}{_sgn}'
+                            + (f'{_ul:.0f}ulp' if _ul < 1000
+                               else f'{abs(_d):.1e}'))
+                    if len(_rr) > 4:
+                        _els.append(f'+{len(_rr) - 4}')
+                    _diff[_diff.index('vp')] = \
+                        'vp[' + ','.join(_els) + ']'
+                except Exception:                   # noqa: BLE001
+                    pass
+            _GBUF_STATS['last'] = \
+                'MISS(' + ('+'.join(_diff) or 'evicted') + ')'
+        _GBUF_STATS['lastkey'][(rw, rh)] = gbuf_ckey
+        while len(_GBUF_STATS['lastkey']) > 8:      # resize churn bound
+            _GBUF_STATS['lastkey'].pop(
+                next(iter(_GBUF_STATS['lastkey'])))
+        _ent = {
+            'tri': gbuf.tri.copy(), 'bary': gbuf.bary.copy(),
+            'depth': gbuf.depth.copy(), 'zndc': gbuf.zndc.copy(),
+            'front': gbuf.front.copy(),
+            'bary_lin': None if gbuf.bary_lin is None
+            else gbuf.bary_lin.copy()}
+        _nb = _gbuf_entry_bytes(_ent)
+        if not _GBUF_CACHE:
+            _GBUF_STATS['bytes'] = 0    # resync after an outside clear()
+        while _GBUF_CACHE and (
+                len(_GBUF_CACHE) >= _GBUF_CAP
+                or _GBUF_STATS['bytes'] + _nb > _GBUF_BUDGET_BYTES):
+            _gbuf_cache_pop(next(iter(_GBUF_CACHE)))
+        _GBUF_CACHE[gbuf_ckey] = _ent
+        _GBUF_STATS['bytes'] += _nb
 
     if band is None and not getattr(st, '_viewport', False):
         # the two numbers behind "the depth is screwed up": what the
@@ -1966,6 +2858,15 @@ def render(scene, settings=None, progress=None, band=None):
                     got, why = None, str(exc)
             if got is None:
                 print(f'[Halcyon GPU] shading on the CPU: {why}')
+                try:
+                    # the field's missing WHY: five GPU-device sessions
+                    # showed CPU shading inside GPU frames and the log
+                    # never said what refused. Now it does
+                    from .. import fault_note
+                    fault_note(f'GPU plan refused: {why}'[:220],
+                               key='plan-no', limit=3)
+                except Exception:                               # noqa: BLE001
+                    pass
             else:
                 img[py, px, :3] = got[py, px]
                 ga = getattr(gbuf, 'gpu_alpha', None)
@@ -1978,6 +2879,12 @@ def render(scene, settings=None, progress=None, band=None):
                 else:
                     img[py, px, 3] = 1.0
                 shaded_on_gpu = True
+                try:
+                    from .. import fault_note
+                    fault_note('GPU shading engaged', key='plan-yes',
+                               limit=3)
+                except Exception:                               # noqa: BLE001
+                    pass
                 if band is None and not getattr(st, '_viewport', False):
                     # the split behind the one 'shade (GPU)' number --
                     # a 44-second shade bucket cannot be attacked until
@@ -1993,6 +2900,26 @@ def render(scene, settings=None, progress=None, band=None):
                             f"{k[:-3].replace('_', '+')} "
                             f'{float(_LT.get(k, 0.0)):.1f} ms'
                             for k in keys if _LT.get(k))
+                        if _LT.get('burst_draw_ms') or \
+                                _LT.get('burst_read_ms'):
+                            # R175b: inside the burst crossing --
+                            # submission overhead vs the readback wait
+                            # (the GPU actually executing)
+                            parts += (
+                                ' (burst: submit '
+                                f"{float(_LT.get('burst_draw_ms', 0.0)):.0f}"
+                                ' + gpu/read '
+                                f"{float(_LT.get('burst_read_ms', 0.0)):.0f}"
+                                ')')
+                        if _LT.get('compile_ms'):
+                            # cold frames are COMPILATION, and the line
+                            # says so instead of hiding it in composite
+                            parts += (
+                                f"; shader compile "
+                                f"{int(_LT.get('compile_n', 0))}x "
+                                f"{float(_LT.get('compile_ms', 0.0)):.0f}"
+                                ' ms (first frame per plan; cached '
+                                'after)')
                         print(f'[Halcyon GPU] shade split: {parts}; '
                               f"{int(_LT.get('passes', 0))} material "
                               f'pass(es)')
@@ -2008,6 +2935,13 @@ def render(scene, settings=None, progress=None, band=None):
                                 f"{int(_LT.get('reflect_skips', 0))} all-miss "
                                 'level(s) skipped, '
                                 f"{int(_LT.get('reflect_rays', 0))} ray(s)")
+        # what post.process gates its GPU stages on: a frame whose
+        # shading ran on the CPU keeps its post on the CPU too. The GPU
+        # post pass over a CPU-resident frame was always upload +
+        # readback overhead for nothing -- and in the field it was the
+        # ONLY GPU work in five sessions that ended in a silent device
+        # loss right after the frame parked
+        st._frame_gpu_shaded = shaded_on_gpu
         if not shaded_on_gpu:
             if getattr(st, 'radiosity', False) and bvh is not None and \
                     band is None and not getattr(st, '_viewport', False):
@@ -2204,8 +3138,26 @@ def material_model(mat, settings):
         for node in mat.graph.get('nodes', {}).values():
             if node.get('bl_idname') == 'HALCYON_ShaderNode':
                 return node.get('props', {}).get('model', settings.default_model)
+            if node.get('bl_idname') == 'HALCYON_BIMaterialNode':
+                return bi_matrix_model(node.get('props', {}))
         return getattr(mat, 'model', None) if getattr(mat, 'model', None) else None
     return getattr(mat, 'model', None) or settings.default_model
+
+
+def bi_matrix_model(props):
+    """The BI material node's props -> its packed model string.
+
+    Shadeless wins outright (BI's toggle bypassed every lamp); otherwise
+    'BI_MATRIX_{d}_{s}' carries the two menu choices in DNA order.
+    """
+    from .shading import BI_DIFF_ORDER, BI_SPEC_ORDER
+    if props.get('shadeless'):
+        return 'CONSTANT'
+    d = props.get('diff_shader', 'LAMBERT')
+    s = props.get('spec_shader', 'COOKTORR')
+    di = BI_DIFF_ORDER.index(d) if d in BI_DIFF_ORDER else 0
+    si = BI_SPEC_ORDER.index(s) if s in BI_SPEC_ORDER else 0
+    return f'BI_MATRIX_{di}_{si}'
 
 
 def material_wire_size(mat, default=1.0):
@@ -2834,16 +3786,33 @@ def _spot_cones(img, scene, st, gbuf, vp, eye, w, h):
 
 
 def _background_image(scene, st, w, h, vp, eye, uncovered=None,
-                      textures=None, ss=1):
+                      textures=None, ss=1, force_world=False):
     """World colour through the camera rays that miss geometry.
 
     Shading only the uncovered pixels matters: on a full-frame scene this is
     nearly the whole cost of the background pass, and it is entirely wasted
     work when something is drawn over the top of it.
+
+    `force_world` evaluates the world even under a transparent film --
+    the WIREFRAME model's see-through pixels are a Halcyon feature with
+    its own contract (the world shows behind the wires, alpha marks the
+    wire itself), not part of the 2.79 frame-fill contract below.
     """
     img = np.zeros((h, w, 4), np.float32)
     # An opaque film is the default; Blender's Film > Transparent (and the
     # matching Halcyon toggle) is what makes the background punch through.
+    if getattr(st, 'film_transparent', False) and not force_world:
+        # 2.79's transparent film (R_ALPHAPREMUL) carries NO sky at all:
+        # the uncovered pixels are premultiplied (0,0,0,0), full stop.
+        # The old path spent a quarter of the field's 3.1s GPU frame
+        # evaluating a world colour into the rgb of pixels whose alpha
+        # is zero -- values 2.79 never wrote, that no viewer shows, and
+        # that leaked into whatever post read rgb regardless of alpha
+        # (a glow could bloom an invisible sky). Zeros are both the
+        # exact 2.79 contract and free. The AA resolve stays premul-
+        # correct: edge pixels blend toward coverage-weighted colour,
+        # which is what a premultiplied frame means.
+        return img
     bg_alpha = 0.0 if getattr(st, 'film_transparent', False) else 1.0
 
     # Supersampling multiplies the number of background rays by ss squared, and
@@ -2880,7 +3849,7 @@ def _background_image(scene, st, w, h, vp, eye, uncovered=None,
             if not low_mask.any():
                 return img
         low = _background_image(scene, st, lw, lh, vp, eye, low_mask,
-                                textures, ss=1)
+                                textures, ss=1, force_world=force_world)
         big = np.repeat(np.repeat(low, ss, axis=0), ss, axis=1)
         if big.shape[0] < h or big.shape[1] < w:
             big = np.pad(big, ((0, max(h - big.shape[0], 0)),
@@ -3618,7 +4587,8 @@ def apply_wireframe(job, gbuf, img, st, vp, eye, textures):
                 clear = np.zeros((gbuf.height, gbuf.width), bool)
                 clear[yy, xx] = True
                 behind = _background_image(scene, st, gbuf.width, gbuf.height,
-                                           vp, eye, clear, textures)
+                                           vp, eye, clear, textures,
+                                           force_world=True)
                 img[yy, xx, :3] = behind[yy, xx, :3]
                 img[yy, xx, 3] = 0.0 if getattr(st, 'film_transparent', False) \
                     else 1.0

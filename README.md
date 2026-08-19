@@ -4,14 +4,17 @@
 > scammed. Please demand your money back and report the seller.**
 
 A from-scratch render engine for Blender that reproduces the output of
-mid-to-late 1990s home-computer 3D software.
+mid-to-late 1990s home-computer 3D software — and, as of this release,
+**opens your old Blender 2.79-and-earlier .blend files with their Blender
+Internal materials intact**. Append a scene saved twenty years ago and it
+arrives looking like it did: shaders, textures, lamps, world and all.
 
 Not a filter over a modern render. A scanline z-buffer rasteriser with optional
 ray tracing, the reflectance models those packages actually shipped, real
 framebuffer quantisation, a genuine GLSL/HLSL compiler for the coded-shader
 nodes — and a complete GPU port of all three stages, proven against the CPU
-picture feature by feature on real hardware. 48,000 lines of Python and NumPy
-(68,000 with the test suite), no compiled dependencies.
+picture feature by feature on real hardware. 63,000 lines of Python and NumPy
+(92,000 with the test suite), no compiled dependencies.
 
 ![contact sheet](docs/halcyon_contact_sheet.png)
 
@@ -57,6 +60,55 @@ covering your GPU, the shaders compiled on your own driver, a 116-row
 feature-by-feature comparison of the GPU picture against the CPU's, per-stage
 frame timings and thread scaling. Nearly every bug in this engine's history was
 diagnosed from that output; almost none from a description alone.
+
+---
+
+## Blender 2.79 appending — the headline feature
+
+Blender removed the Internal engine in 2.80, and every .blend saved before
+then carries materials modern Blender silently drops. Halcyon brings them
+back, two ways:
+
+**File ▸ Import ▸ Legacy Scene (.blend)** appends a 2.79-or-earlier file
+through Blender's own loader — constraints, custom normals, modifiers, vertex
+groups, parenting, animation and every object type arrive exactly as
+File ▸ Append would bring them — while Halcyon reads the same file directly
+for everything that loader drops:
+
+- **Blender Internal materials, rebuilt one to one.** Diffuse and specular
+  shader pairs (all the Internal menu's models), hardness, ramps with their
+  inputs, blends and factors, mirror with Fresnel, transparency in Z and
+  raytrace modes, emit, ambient, translucency, Shadeless, Shadows Only,
+  ray-bias and shadow-bias terminator fixes, object colour, light groups —
+  every panel field accounted for, transcribed against the 2.79 source code
+  rather than approximated from memory.
+- **All eighteen texture slots per material**, with their mappings,
+  projections, influences and blend modes — and the procedural textures
+  arrive on the **BI Texture node**, a port of the original texture engine:
+  Clouds, Wood, Marble, Magic, Blend, Stucci, Noise, Musgrave, Voronoi and
+  Distorted Noise over the original noise bases and lookup tables,
+  colorbands included, verified CPU-against-GPU in the suite. Packed images
+  unpack and travel; image sequences keep their settings.
+- **Lamps with their real energies.** 2.79's lamp math — distance falloffs,
+  sphere clipping, spot blends in cosine space, the quadratic sliders —
+  is applied from the file's own DNA, so a scene lit for Internal is not a
+  washed-out or pitch-black surprise. Ray and buffer shadows both convert,
+  bias and softness included; pre-2.70 spot sizes convert their degrees.
+- **The world comes along**: horizon and zenith as a Halcyon gradient sky,
+  ambient into the lighting, mist as fog with its falloff, exposure and
+  range, and the file's own colour-management settings mapped onto the
+  engine's pipeline (a 2.4x-era file renders bytes-in bytes-out, exactly
+  as it did).
+- **The file's own framing**: render size, percentage, transparent film,
+  and the saved "Selected Objects Only" state are honoured; hidden objects
+  can come along or stay home, by checkbox.
+
+**Plain File ▸ Append works too.** A watcher recognises a pre-2.80 file the
+moment Blender finishes appending from it and fixes the lamps automatically —
+no special import path required, and a **Fix Appended Lamps** button in the
+Lighting panel covers anything appended before Halcyon was enabled. Every
+import writes a full log to a text datablock, so what was converted — and
+anything that could not be — is named, not guessed at.
 
 ---
 
@@ -225,6 +277,12 @@ behind that sentence: one holds every setting to a proof that it changes what
 it claims to change (a matrix row, an A/B render, a behavioural check, or a
 declared reason — nothing silently exempt), and one fails the build the moment
 any property ships without a detailed tooltip.
+
+**Legacy import: any 2.79-or-earlier .blend, materials included** — the
+headline feature, described in full above: File ▸ Import ▸ Legacy Scene, the
+automatic fix-up on plain File ▸ Append, Blender Internal materials and all
+eighteen texture slots rebuilt one to one, lamps with their real energies,
+and the old world as sky, ambient and fog.
 
 ---
 
@@ -508,11 +566,19 @@ that was not the stage the frame was spending its time in. The engine now
 optimises the way it renders: measured, on the scene that hurt, with losing
 experiments written down so nobody re-fights them.
 
-Recent measured wins on a real half-million-triangle field scene: SAH BVH —
-shadow rays **12×**, reflection rays **6×**, both devices; sky evaluation
-**1.9×** (a float64 leak and a corner-hash reuse, bit-for-bit where it
-counts); the GPU frame's composite bucket **3.7×**; all-miss reflection
-levels skipped outright.
+Recent measured wins on real field scenes, every one pixel-identical by
+test: a 25-material, 171-object character file that first rendered in
+**8:48** now renders warm in **0.7 s** — the arc that got there: SAH BVH
+(shadow rays **12×**, reflection rays **6×**, both devices), light and
+material values moved into textures so lamp and slider edits re-upload a
+texel instead of recompiling shaders (and same-structure materials now
+share one compiled shader), a G-buffer cache so an unchanged camera never
+re-rasterises, a per-object mesh-export cache driven by Blender's own
+update reports so an unchanged scene exports in a millisecond, the BVH
+persisted to disk across sessions under a content digest, the frame's
+draw calls batched into one main-thread crossing inside one render pass,
+and shadow rays skipped exactly where a lamp contributes nothing. Losing
+experiments are written down next to the wins so nobody re-fights them.
 
 The knobs that matter, in order:
 
@@ -577,7 +643,10 @@ halcyon/
   nodes/         Blender node classes (master shader, patterns, ramps)
   presets/       72 render presets, 303 skies (+ thumbs/), 20 waters
   tests/         headless suite, bpy stub, fake Blender, feature matrix
-  compat.py properties.py export.py engine.py ui.py objects.py convert.py
+  legacy_import.py   the 2.79 reader: DNA parser, BI material mapping
+  append_watch.py    the automatic lamp fix on plain File ▸ Append
+  compat.py properties.py export.py engine.py preview.py ui.py
+  objects.py convert.py templates.py selftest.py
 ```
 
 ---

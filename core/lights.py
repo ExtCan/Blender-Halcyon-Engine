@@ -202,50 +202,82 @@ def clear_shadow_cache():
     _SHADOW_CACHE.clear()
 
 
-def _shadow_signature(scene, settings, caster_tris):
-    """Cheap fingerprint of everything a shadow map depends on."""
+def _shadow_base_signature(scene, settings, caster_tris):
+    """Fingerprint of what EVERY shadow map depends on: the geometry,
+    the shadow settings and the caster set -- everything except the
+    light itself."""
     mesh = scene.mesh
     v = mesh.verts
     step = max(1, v.shape[0] // 512)
     geo = (v.shape[0], float(v[::step].sum()), float(v[::step, 0].dot(
         np.arange(v[::step].shape[0], dtype=np.float32))))
-    lights = tuple(
-        (l.type, tuple(np.round(l.position, 5)), tuple(np.round(l.direction, 5)),
-         round(float(l.spot_size), 5), l.shadow, int(l.shadow_map_size))
-        for l in scene.lights)
-    return (geo, lights, settings.shadows, settings.shadow_default,
+    return (geo, settings.shadows, settings.shadow_default,
             int(settings.shadow_map_size),
-            None if caster_tris is None else int(caster_tris.size))
+            # size AND sum: two caster sets of equal count (say, two
+            # same-sized materials toggling Shadow > Cast) must not
+            # collide in the cache
+            None if caster_tris is None else
+            (int(caster_tris.size), int(caster_tris.sum())))
+
+
+def _light_shadow_signature(light):
+    """The one light's own contribution to its map: pose and lens.
+
+    Colour and energy are deliberately absent -- they tint the LIGHT,
+    never the depth -- so palette edits ride the cache untouched."""
+    return (light.type, tuple(np.round(light.position, 5)),
+            tuple(np.round(light.direction, 5)),
+            round(float(light.spot_size), 5), light.shadow,
+            int(light.shadow_map_size))
 
 
 def build_shadow_maps(scene, settings, caster_tris=None):
     """Bake a shadow map (or cube) for every light that wants one.
 
-    Each map is a full rasterisation pass, and a point light needs six. None of
-    it changes while the lights and geometry hold still, which for most of an
-    animation is all of it.
+    Each map is a full rasterisation pass, and a point light needs six.
+    None of it changes while the lights and geometry hold still, which
+    for most of an animation is all of it. The cache is PER LIGHT:
+    the old whole-list fingerprint meant nudging ONE lamp of fifteen
+    re-rasterised every map in the scene ('if I wanted to move
+    lights... it will lag like crazy'); now only the moved lamp's own
+    map rebuilds, and a colour or energy edit rebuilds nothing at all.
     """
     if getattr(settings, 'cache_shadows', True) and scene.mesh is not None \
             and scene.mesh.verts is not None and scene.mesh.verts.size:
         try:
-            sig = _shadow_signature(scene, settings, caster_tris)
+            base = _shadow_base_signature(scene, settings, caster_tris)
         except Exception:                                       # noqa: BLE001
-            sig = None
-        if sig is not None:
-            hit = _SHADOW_CACHE.get(sig)
-            if hit is not None:
-                for light, sm in zip(scene.lights, hit):
-                    light.shadow_map = sm
-                return
-            _build_shadow_maps(scene, settings, caster_tris)
-            if len(_SHADOW_CACHE) > 4:
-                _SHADOW_CACHE.clear()
-            _SHADOW_CACHE[sig] = [l.shadow_map for l in scene.lights]
+            base = None
+        if base is not None:
+            misses = []
+            for i, light in enumerate(scene.lights):
+                try:
+                    key = (base, _light_shadow_signature(light))
+                except Exception:                               # noqa: BLE001
+                    misses.append((i, None))
+                    continue
+                hit = _SHADOW_CACHE.get(key)
+                if hit is not None:
+                    light.shadow_map = hit
+                else:
+                    misses.append((i, key))
+            if misses:
+                _build_shadow_maps(scene, settings, caster_tris,
+                                   only={i for i, _k in misses})
+                for i, key in misses:
+                    sm = scene.lights[i].shadow_map
+                    if key is not None and sm is not None:
+                        if len(_SHADOW_CACHE) > 64:
+                            _SHADOW_CACHE.clear()
+                        _SHADOW_CACHE[key] = sm
             return
     _build_shadow_maps(scene, settings, caster_tris)
 
 
-def _build_shadow_maps(scene, settings, caster_tris=None):
+def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
+    """Build maps for every map-needing light, or -- with `only`, a set
+    of light indices -- just those, leaving the rest untouched (the
+    per-light cache hands the untouched ones their parked maps)."""
     mesh = scene.mesh
     if mesh is None or mesh.verts is None or mesh.tris is None:
         return
@@ -265,7 +297,9 @@ def _build_shadow_maps(scene, settings, caster_tris=None):
     # which is the one shape of work threads genuinely scale on this
     # renderer (the shading loop is not -- see the Threads tooltip).
     jobs = []                      # (assign, vp, size) -- assign(depth)
-    for light in scene.lights:
+    for li, light in enumerate(scene.lights):
+        if only is not None and li not in only:
+            continue
         light.shadow_map = None
         if not settings.shadows or light.type == 'AMBIENT':
             continue
@@ -350,28 +384,82 @@ def attenuate(light, dist, settings=None):
         mode = settings.light_falloff_default
     start = float(light.decay_start)
     if mode == 'NONE':
-        return np.ones_like(dist)
+        att = np.ones_like(dist)
+        if getattr(light, 'bi_sphere', False):
+            # LA_SPHERE applies OUTSIDE the falloff switch in the C --
+            # even a Constant-falloff lamp clips at its Distance
+            D = max(float(light.decay_end), EPS)
+            t = D - np.maximum(dist, 0.0)
+            att = np.where(t <= 0.0, 0.0, att * t / D)
+        return att.astype(np.float32)
     d = np.maximum(dist - start, EPS) if start > 0 else np.maximum(dist, EPS)
     if mode == 'INVERSE':
         att = 1.0 / d
     elif mode == 'CUSTOM':
         end = max(float(light.decay_end), start + EPS)
         att = np.clip(1.0 - (dist - start) / (end - start), 0.0, 1.0)
+    elif mode == 'BI_LINEAR':
+        # Blender Internal's Inverse Linear: D / (D + d), where D is
+        # the lamp's Distance (decay_end). Bounded at 1, halves at D --
+        # the curve every classic file was lit against, and nothing
+        # like an unbounded 1/d
+        D = max(float(light.decay_end), EPS)
+        att = D / (D + np.maximum(dist, 0.0))
+    elif mode == 'BI_SQUARE':
+        # Blender Internal's Inverse Square, verbatim from 2.79's
+        # lamp_get_visibility (R155): D / (D + d*d). The C annotates it
+        # as the r12045 'hack' itself -- a true inverse square would be
+        # D^2/(D^2+d^2), which is what this shipped as until the source
+        # was letter-checked: 3-4x too bright over the field's typical
+        # D=25 rigs.
+        D = max(float(light.decay_end), EPS)
+        att = D / (D + np.maximum(dist, 0.0) ** 2)
+    elif mode == 'BI_SLIDERS':
+        # verbatim: D/(D+ld1*d) * D^2/(D^2+ld2*d^2), each factor only
+        # when its slider is positive -- the 2.4x Quad lamp's att1/att2
+        D = max(float(light.decay_end), EPS)
+        ld1 = float(getattr(light, 'decay_ld1', 0.0) or 0.0)
+        ld2 = float(getattr(light, 'decay_ld2', 0.0) or 0.0)
+        att = np.ones_like(dist)
+        if ld1 > 0.0:
+            att = att * (D / (D + ld1 * np.maximum(dist, 0.0)))
+        if ld2 > 0.0:
+            att = att * ((D * D) / (D * D + ld2
+                                    * np.maximum(dist, 0.0) ** 2))
     else:
         att = 1.0 / (d * d)
+    if getattr(light, 'bi_sphere', False):
+        # LA_SPHERE, verbatim: *= (D - d)/D, hard zero past the lamp's
+        # Distance
+        D = max(float(light.decay_end), EPS)
+        t = D - np.maximum(dist, 0.0)
+        att = np.where(t <= 0.0, 0.0, att * t / D)
     return att.astype(np.float32)
 
 
 def spot_falloff(light, L):
-    """L points surface -> light, so the cone test uses -L."""
+    """L points surface -> light, so the cone test uses -L.
+
+    Blender Internal's spot, verbatim from lamp_get_visibility (R155):
+    spotsi = cos(spot_size/2) is the hard cutoff; the blend band is
+    spotbl = (1-spotsi)*spot_blend wide IN COSINE UNITS with a
+    smoothstep across it; and the whole cone then MULTIPLIES by the
+    raw cosine, so a spot dims toward its own edge even outside the
+    blend band. The old shape (a squared smoothstep between two
+    invented cosines) was both too dark in the band and missing the
+    cosine roll-off -- the field's spot rigs read wrong both ways."""
     d = M.normalize(np.asarray(light.direction, np.float32))
-    cosang = -M.dot(L, np.broadcast_to(d[None, :], L.shape))
-    half = float(light.spot_size) * 0.5
-    outer = np.cos(half)
-    blend = max(float(light.spot_blend), 1e-4)
-    inner = np.cos(half * (1.0 - blend))
-    t = (cosang - outer) / max(inner - outer, 1e-5)
-    return np.clip(t, 0.0, 1.0).astype(np.float32) ** 2
+    inpr = -M.dot(L, np.broadcast_to(d[None, :], L.shape))
+    spotsi = np.float32(np.cos(float(light.spot_size) * 0.5))
+    spotbl = np.float32((1.0 - spotsi) * float(light.spot_blend))
+    t = inpr - spotsi
+    if spotbl != 0.0:
+        i = np.clip(t / spotbl, 0.0, 1.0)
+        soft = np.where(t < spotbl, 3.0 * i * i - 2.0 * i * i * i, 1.0)
+    else:
+        soft = np.ones_like(inpr)
+    fac = np.where(inpr <= spotsi, 0.0, soft * inpr)
+    return fac.astype(np.float32)
 
 
 def cookie_frame(light):
@@ -456,7 +544,10 @@ def sample(light, P, settings, area_sample=None):
     n = P.shape[0]
     col = np.asarray(light.color, np.float32)[None, :]
     energy = float(light.energy)
-    if light.type == 'SUN':
+    if light.type in ('SUN', 'HEMI'):
+        # HEMI is directional exactly like SUN -- what changes is the
+        # SHADING (the 0.5+0.5*N.L wrap, in light_surface), not the
+        # geometry. BI hemis had no distance and no falloff.
         d = M.normalize(np.asarray(light.direction, np.float32))
         L = np.broadcast_to(-d[None, :], (n, 3)).copy()
         dist = np.full(n, 1e9, np.float32)
@@ -473,12 +564,17 @@ def sample(light, P, settings, area_sample=None):
     dist = np.sqrt(np.maximum((delta * delta).sum(axis=1), EPS)).astype(np.float32)
     L = delta / dist[:, None]
     att = attenuate(light, dist, settings)
+    if light.type == 'SPOT':
+        att = att * spot_falloff(light, L)
+    if str(getattr(light, 'decay', '')).startswith('BI_') or \
+            getattr(light, 'bi_sphere', False):
+        # lamp_get_visibility's tail, verbatim (R155): a combined
+        # visifac at or below 0.001 is snapped to zero
+        att = np.where(att <= 0.001, 0.0, att)
     scale = energy / (4.0 * np.pi)
     rad = col * (scale * att)[:, None]
-    if light.type == 'SPOT':
-        rad = rad * spot_falloff(light, L)[:, None]
-        if getattr(light, 'cookie', None) is not None:
-            rad = rad * cookie_factor(light, P, L)
+    if light.type == 'SPOT' and getattr(light, 'cookie', None) is not None:
+        rad = rad * cookie_factor(light, P, L)
     return L.astype(np.float32), rad.astype(np.float32), dist
 
 
@@ -502,7 +598,7 @@ def area_samples(light, count, rng):
 
 
 def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
-               sample_xy=None):
+               sample_xy=None, mask=None):
     """Shadow term in 0..1 (1 = fully lit).
 
     `sample_xy` is (spx, spy, light_index): the integer pixel identity and
@@ -511,8 +607,18 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
     the same picture whatever the batch order, thread count or device.
     Without it (contexts that have no pixel identity), the legacy
     sequential stream still runs.
+
+    `mask`, when given, marks the samples whose shadow term is actually
+    READ by the caller (a sample whose diffuse and specular are both
+    zero multiplies vis into nothing); traced rays are skipped outside
+    it and those samples report fully lit. The pictures are identical
+    -- the mask must only ever exclude samples whose contribution is
+    zero -- and the caller owns that proof.
     """
     n = P.shape[0]
+    if light.type == 'HEMI':
+        # BI never shadowed hemi lamps ("hemi doesn't support shadows")
+        return np.ones(n, np.float32)
     if not settings.shadows or light.shadow == 'NONE':
         return np.ones(n, np.float32)
     mode = light.shadow if settings.shadow_default == 'PER_LIGHT' else \
@@ -534,7 +640,7 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
         maxt = np.where(dist > 1e8, 1e9, dist * (1.0 - 1e-3))
         samples = max(1, int(settings.shadow_samples)) if light.radius > 0 else 1
         if samples == 1:
-            hit = bvh.occluded(origin, L, maxt)
+            hit = bvh.occluded(origin, L, maxt, mask=mask)
             return (~hit).astype(np.float32)
         acc = np.zeros(n, np.float32)
         t, b = M.orthonormal_basis(L)
@@ -550,7 +656,8 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
                 r = np.sqrt(u1) * radius
                 jitter = t * (r * ca)[:, None] + b * (r * sa)[:, None]
                 Lj = M.normalize(L * dist[:, None] + jitter)
-                acc += (~bvh.occluded(origin, Lj, maxt)).astype(np.float32)
+                acc += (~bvh.occluded(origin, Lj, maxt,
+                                      mask=mask)).astype(np.float32)
             return acc / samples
         rng = rng or np.random.default_rng(settings.seed)
         for _ in range(samples):
@@ -558,7 +665,8 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
             th = rng.random() * 2 * np.pi
             jitter = t * (r * np.cos(th)) + b * (r * np.sin(th))
             Lj = M.normalize(L * dist[:, None] + jitter)
-            acc += (~bvh.occluded(origin, Lj, maxt)).astype(np.float32)
+            acc += (~bvh.occluded(origin, Lj, maxt,
+                                  mask=mask)).astype(np.float32)
         return acc / samples
 
     sm = light.shadow_map
@@ -597,12 +705,29 @@ def select_lights(lights, settings, centre=None):
     return [active[i] for i in order[:limit]]
 
 
-def ambient_light(scene, settings):
-    amb = np.asarray(settings.global_ambient, np.float32) * settings.global_ambient_level
+def ambient_light_split(scene, settings):
+    """(engine_part, world_part) of the ambient pool.
+
+    The split matters to the BI material node: Blender Internal's
+    ambient rule -- a FLAT add, untinted by the diffuse colour -- is
+    about the WORLD's ambient (and ambient-type lights, which model
+    the same thing). The engine's own Global Ambient setting has no
+    BI counterpart: flat-adding it lifted every imported black by the
+    default (0.05, 0.05, 0.06) -- the field's 'blueish tint to the
+    dark parts' -- so it keeps the classic diffuse-tinted behaviour
+    on every model."""
+    eng = np.asarray(settings.global_ambient, np.float32) \
+        * settings.global_ambient_level
+    wrld = np.zeros(3, np.float32)
     if scene.world is not None:
-        amb = amb + np.asarray(scene.world.ambient, np.float32) * \
+        wrld = wrld + np.asarray(scene.world.ambient, np.float32) * \
             scene.world.ambient_level
     for l in scene.lights:
         if l.type == 'AMBIENT' or l.ambient_only:
-            amb = amb + np.asarray(l.color, np.float32) * l.energy
-    return amb.astype(np.float32)
+            wrld = wrld + np.asarray(l.color, np.float32) * l.energy
+    return eng.astype(np.float32), wrld.astype(np.float32)
+
+
+def ambient_light(scene, settings):
+    eng, wrld = ambient_light_split(scene, settings)
+    return (eng + wrld).astype(np.float32)

@@ -128,15 +128,36 @@ def enable_nodes(datablock):
             datablock.use_nodes = True
 
 
-def evaluated_meshes(depsgraph):
+def evaluated_meshes(depsgraph, skip=None):
     """Yield (object, evaluated mesh, matrix, is_temporary), one at a time.
 
-    Two Blender rules govern this, and breaking either is a hard crash rather
-    than an exception:
+    `skip(original, matrix)` -> True short-circuits an object BEFORE its
+    depsgraph evaluation: the caller gets (original, None, matrix,
+    False) and serves the geometry from its own cache (R171's export
+    cache). The whole point is skipping `evaluated_get` + `to_mesh` --
+    the measured cost of an unchanged 171-object export.
+
+    THREE Blender rules govern this, and breaking any of them is a hard
+    crash rather than an exception:
 
     * The instance iterator must not be live while `to_mesh()` runs, because
       converting allocates depsgraph-owned data and can invalidate it under
       us. So the instance list is snapshotted first.
+    * NOTHING reached through a DepsgraphObjectInstance may outlive the
+      iteration step -- not even the EVALUATED Object it points at. The
+      old snapshot kept those evaluated pointers and called `to_mesh()`
+      on them afterwards; the first conversion that allocates (a curve,
+      a text) can reallocate evaluated storage and dangle the pointers
+      held for every LATER item. It survived for months because a
+      dangling pointer usually still reads intact memory -- until a
+      render worker and a shadow-map pool churned the allocator hard
+      enough to recycle the block, which is why the field crash landed
+      only "while the renderer is actually running". The faulthandler
+      log named this exact line. The snapshot therefore keeps each
+      instance's ORIGINAL object -- a stable, bmain-owned ID -- and
+      re-resolves the evaluated object through `evaluated_get()` at use
+      time, so every `to_mesh()` runs on a pointer the CURRENT
+      depsgraph just handed out.
     * A mesh from `to_mesh()` belongs to the object, not to the caller. The
       next `to_mesh()` on that same object frees it, and so does
       `to_mesh_clear()`. Converting every object up front and reading them
@@ -151,26 +172,42 @@ def evaluated_meshes(depsgraph):
     and metaballs are the ones that allocate, and they are the ones it broke.
     """
     try:
-        instances = [(i.object, i.matrix_world.copy(), i.show_self)
-                     for i in depsgraph.object_instances]
+        instances = []
+        for i in depsgraph.object_instances:
+            ob = i.object
+            if ob is None or not i.show_self:
+                continue
+            if ob.type not in GEOMETRY_TYPES:
+                continue
+            # .original is the bmain-owned datablock: the ONE reference
+            # that stays valid after this iteration step ends
+            orig = getattr(ob, 'original', None) or ob
+            instances.append((orig, i.matrix_world.copy()))
     except Exception:                                           # noqa: BLE001
         return
     live = None
     try:
-        for ob, matrix_world, show_self in instances:
-            if ob is None or ob.type not in GEOMETRY_TYPES or not show_self:
-                continue
+        for orig, matrix_world in instances:
             if live is not None:
                 free_mesh(live)
                 live = None
+            if skip is not None:
+                try:
+                    if skip(orig, matrix_world):
+                        yield orig, None, matrix_world, False
+                        continue
+                except Exception:                               # noqa: BLE001
+                    pass
             try:
-                me = ob.to_mesh()
+                getter = getattr(orig, 'evaluated_get', None)
+                ev = getter(depsgraph) if getter is not None else orig
+                me = ev.to_mesh()
             except Exception:                                   # noqa: BLE001
                 continue
             if me is None:
                 continue
-            live = ob
-            yield ob, me, matrix_world, True
+            live = ev
+            yield ev, me, matrix_world, True
     finally:
         # runs on exhaustion, on an early break, and on close()
         if live is not None:

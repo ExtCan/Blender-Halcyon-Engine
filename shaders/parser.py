@@ -489,6 +489,21 @@ class Parser:
             return e
         if t.kind in ('ident', 'type'):
             name = self.next().value
+            if t.kind == 'type' and self.at('['):
+                # array constructor: float[4](a, b, c, d)
+                self.next()
+                if not self.at(']'):
+                    self.parse_assign()          # declared size (informative)
+                self.expect(']')
+                self.expect('(')
+                args = []
+                if not self.at(')'):
+                    while True:
+                        args.append(self.parse_assign())
+                        if not self.accept(','):
+                            break
+                self.expect(')')
+                return ('arrinit', name, args)
             if self.at('('):
                 self.next()
                 args = []

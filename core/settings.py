@@ -115,6 +115,10 @@ class RenderSettings:
     clamp_specular: bool = True
     light_clamp: float = 0.0           # 0 = off
     ambient_occlusion: bool = False
+    sss: bool = True                   # BI's R_SSS master switch
+    # workflow, not shading: the append watch (classic lamps fixed the
+    # moment File > Append brings them in). Read by append_watch.py.
+    auto_fix_appended_lamps: bool = True
     ao_distance: float = 1.0
     ao_samples: int = 8
     ao_intensity: float = 1.0
@@ -245,7 +249,12 @@ class RenderSettings:
     # ------------------------------------------------------------ performance
     threads: int = 1                   # 0 = auto
     preview_scale: int = 4
+    orbit_scale: int = 0               # motion drafts: 0 = auto budget,
+    #                                    N = fixed 1/N of the region
     progressive: bool = True
+    material_override: str = 'NONE'    # NONE | CLAY: every material a
+    #                                    plain matte for test renders
+    override_color: tuple = (0.7, 0.7, 0.7)
     # ------------------------------------------------------------------ misc
     seed: int = 0
     render_wire: bool = False

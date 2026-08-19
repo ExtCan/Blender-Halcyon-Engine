@@ -352,37 +352,124 @@ TEMPLATES = {
 }
 
 
-def build(mat, key):
-    """Replace a material's tree with the named template."""
-    spec = TEMPLATES.get(key)
-    if spec is None:
-        return False, f'unknown template {key!r}'
-    if not mat.use_nodes:
+def _shader_input(shader, key):
+    """A shader input by IDENTIFIER first, then display name.
+
+    The BI Material node shows BI's labels (Hardness, Refr, Alpha)
+    over master-compatible identifiers (Glossiness, IOR, Opacity);
+    specs and texture targets speak identifiers, so look there first.
+    """
+    for s in shader.inputs:
+        if getattr(s, 'identifier', None) == key:
+            return s
+    return shader.inputs.get(key)
+
+
+def _set_socket(sock, value):
+    if sock is None or not hasattr(sock, 'default_value'):
+        return
+    try:
+        if hasattr(sock.default_value, '__len__') and hasattr(value,
+                                                              '__len__'):
+            n = min(len(sock.default_value), len(value))
+            for i in range(n):
+                sock.default_value[i] = value[i]
+        elif hasattr(sock.default_value, '__len__'):
+            for i in range(len(sock.default_value)):
+                sock.default_value[i] = float(value)
+        else:
+            sock.default_value = value if not isinstance(value,
+                                                         (int, float)) \
+                else float(value)
+    except (TypeError, ValueError):
+        pass
+
+
+def build_spec(mat, spec):
+    """Replace a material's tree with a spec-described one.
+
+    The spec is the TEMPLATES shape: {'model', 'inputs', 'textures'}.
+    Texture entries take the documented keys plus the extended set the
+    legacy importer emits: 'coords' (UV/Generated/Object via a Texture
+    Coordinate node), 'mapping' ({'location','scale'} through a Mapping
+    node -- offset and size the way Blender Internal applied them),
+    'mix' ({'fac','blend','base'}: a MixRGB against the base colour, the
+    slot's own influence factor as the mix factor), 'scale_fac' (a Math
+    multiply for value channels under full influence), and 'invert'
+    (the old negative-influence toggle).
+    """
+    from . import compat as _compat
+    if not _compat.uses_nodes(mat):
+        # the WRITE is not deprecated (and is required in 5.x to turn
+        # a flat legacy material into a node one); only the read warns
         mat.use_nodes = True
     tree = mat.node_tree
     tree.nodes.clear()
 
     out = tree.nodes.new('ShaderNodeOutputMaterial')
     out.location = (320, 0)
-    shader = tree.nodes.new('HALCYON_ShaderNode')
-    shader.location = (0, 0)
-    shader.model = spec['model']
+    bi = spec.get('bi')
+    if bi:
+        # the BI Material node: the whole 2.79 panel, 1:1. Props first
+        # (stops into their collections), THEN refresh_sockets so the
+        # panel toggles decide visibility, THEN the socket values.
+        shader = tree.nodes.new('HALCYON_BIMaterialNode')
+        shader.location = (0, 0)
+        for k, v in bi.items():
+            if k in ('ramp_dif_stops', 'ramp_spec_stops'):
+                which = 'dif' if k == 'ramp_dif_stops' else 'spec'
+                ipo = bi.get(f'ramp_{which}_ipo', 0)
+                if hasattr(shader, 'set_ramp_stops'):
+                    # populates the gradient widget AND the fallback
+                    # rows in one go
+                    shader.set_ramp_stops(which, v, ipo)
+                    continue
+                coll = shader.dif_stops if k == 'ramp_dif_stops' \
+                    else shader.spec_stops
+                try:
+                    coll.clear()
+                    for stop in v:
+                        s = coll.add()
+                        s.position = float(stop[0])
+                        s.color = (float(stop[1]), float(stop[2]),
+                                   float(stop[3]), float(stop[4]))
+                except Exception:                               # noqa: BLE001
+                    pass
+                continue
+            if k == 'ramp_dif_ipo' or k == 'ramp_spec_ipo':
+                # the spec carries do_colorband's integer; the node
+                # prop is the enum
+                ipo_names = ('LINEAR', 'EASE', 'B_SPLINE', 'CARDINAL',
+                             'CONSTANT')
+                try:
+                    setattr(shader, k, ipo_names[int(v)]
+                            if 0 <= int(v) < 5 else 'LINEAR')
+                except (TypeError, ValueError):
+                    pass
+                continue
+            if k == 'light_group_lights':
+                continue        # export re-resolves from the collection
+            try:
+                setattr(shader, k, v)
+            except (TypeError, ValueError):
+                pass
+        try:
+            shader.refresh_sockets()
+        except Exception:                                       # noqa: BLE001
+            pass
+    else:
+        shader = tree.nodes.new('HALCYON_ShaderNode')
+        shader.location = (0, 0)
+        shader.model = spec['model']
 
     for name, value in spec.get('inputs', {}).items():
-        sock = shader.inputs.get(name)
-        if sock is None or not hasattr(sock, 'default_value'):
-            continue
-        try:
-            if hasattr(sock.default_value, '__len__'):
-                n = min(len(sock.default_value), len(value))
-                for i in range(n):
-                    sock.default_value[i] = value[i]
-            else:
-                sock.default_value = float(value)
-        except (TypeError, ValueError):
-            pass
+        _set_socket(_shader_input(shader, name), value)
 
     y = 200
+    coord_node = None
+    matcap_nodes = {}       # MATCAP_NORMAL / MATCAP_REFLECT -> node
+    uvmap_nodes = {}        # named UV layer -> its UV Map node
+    last_link = {}          # target socket name -> last source socket
     for entry in spec.get('textures', []):
         if not isinstance(entry, dict):
             idname, props, inputs, target = entry
@@ -393,38 +480,302 @@ def build(mat, key):
         except Exception:                                       # noqa: BLE001
             continue
         node.location = (-320, y)
-        y -= 260
         for k, v in entry.get('props', {}).items():
+            if k == 'stops' and hasattr(node, 'stops'):
+                # a colorband: (pos, r, g, b, a) tuples into the node's
+                # own stop collection
+                try:
+                    node.stops.clear()
+                    for stop in v:
+                        s = node.stops.add()
+                        s.position = float(stop[0])
+                        s.color = (float(stop[1]), float(stop[2]),
+                                   float(stop[3]), float(stop[4]))
+                except (TypeError, ValueError, AttributeError):
+                    pass
+                continue
             if hasattr(node, k):
                 try:
                     setattr(node, k, v)
                 except (TypeError, ValueError):
                     pass
         for k, v in entry.get('inputs', {}).items():
-            sock = node.inputs.get(k)
-            if sock is not None and hasattr(sock, 'default_value'):
+            _set_socket(node.inputs.get(k), v)
+
+        # ---- coordinate plumbing: TexCoord (shared) -> Mapping -> Vector
+        vec_dst = node.inputs.get('Vector')
+        coords = entry.get('coords')
+        uv_layer = entry.get('uv_layer')
+        if vec_dst is not None and coords == 'UV' and uv_layer:
+            # the slot names its UV layer: a UV Map node (shared per
+            # name) instead of the TexCoord's active-layer output --
+            # through the Mapping fold when the slot carries one
+            un = uvmap_nodes.get(uv_layer)
+            if un is None:
                 try:
-                    if hasattr(sock.default_value, '__len__') and \
-                            hasattr(v, '__len__'):
-                        n = min(len(sock.default_value), len(v))
-                        for i in range(n):
-                            sock.default_value[i] = v[i]
+                    un = tree.nodes.new('ShaderNodeUVMap')
+                    un.location = (-880, -500 - 120 * len(uvmap_nodes))
+                    un.uv_map = uv_layer
+                    uvmap_nodes[uv_layer] = un
+                except Exception:                               # noqa: BLE001
+                    un = None
+            if un is not None:
+                try:
+                    mp = entry.get('mapping')
+                    if mp:
+                        mnode = tree.nodes.new('ShaderNodeMapping')
+                        mnode.location = (-640, y)
+                        _set_socket(mnode.inputs.get('Location'),
+                                    mp.get('location', (0, 0, 0)))
+                        _set_socket(mnode.inputs.get('Scale'),
+                                    mp.get('scale', (1, 1, 1)))
+                        tree.links.new(un.outputs['UV'],
+                                       mnode.inputs['Vector'])
+                        tree.links.new(mnode.outputs['Vector'], vec_dst)
                     else:
-                        sock.default_value = v
-                except (TypeError, ValueError):
+                        tree.links.new(un.outputs['UV'], vec_dst)
+                except Exception:                               # noqa: BLE001
                     pass
+        elif vec_dst is not None and isinstance(coords, str) and \
+                coords.startswith('MATCAP'):
+            # BI's Nor and Refl coords: the Matcap Coordinates node,
+            # one per source kind, shared across slots like TexCoord
+            key = coords
+            mnode = matcap_nodes.get(key)
+            if mnode is None:
+                try:
+                    mnode = tree.nodes.new('HALCYON_MatcapUVNode')
+                    mnode.location = (-880, -260 if key.endswith(
+                        'REFLECT') else -380)
+                    mnode.source = 'REFLECTION' \
+                        if key == 'MATCAP_REFLECT' else 'NORMAL'
+                    matcap_nodes[key] = mnode
+                except Exception:                               # noqa: BLE001
+                    mnode = None
+            if mnode is not None:
+                try:
+                    mp = entry.get('mapping')
+                    if mp:
+                        # the slot's Offset/Size window applies to REFL
+                        # coords too -- texco_mapping runs the same
+                        # size*(uv-0.5)+ofs+0.5 fold whatever the
+                        # coordinate source (the Mask's env map lived
+                        # in a 0.7x0.8 window at +1.15 the import
+                        # never applied)
+                        mpn = tree.nodes.new('ShaderNodeMapping')
+                        mpn.location = (-640, y)
+                        _set_socket(mpn.inputs.get('Location'),
+                                    mp.get('location', (0, 0, 0)))
+                        _set_socket(mpn.inputs.get('Scale'),
+                                    mp.get('scale', (1, 1, 1)))
+                        tree.links.new(mnode.outputs['Vector'],
+                                       mpn.inputs['Vector'])
+                        tree.links.new(mpn.outputs['Vector'], vec_dst)
+                    else:
+                        tree.links.new(mnode.outputs['Vector'], vec_dst)
+                except Exception:                               # noqa: BLE001
+                    pass
+        elif vec_dst is not None and (coords or entry.get('mapping')):
+            if coord_node is None:
+                coord_node = tree.nodes.new('ShaderNodeTexCoord')
+                coord_node.location = (-880, 0)
+            src_out = coord_node.outputs.get(coords or 'Generated')
+            if src_out is not None:
+                try:
+                    mp = entry.get('mapping')
+                    if mp:
+                        mnode = tree.nodes.new('ShaderNodeMapping')
+                        mnode.location = (-640, y)
+                        _set_socket(mnode.inputs.get('Location'),
+                                    mp.get('location', (0, 0, 0)))
+                        _set_socket(mnode.inputs.get('Scale'),
+                                    mp.get('scale', (1, 1, 1)))
+                        tree.links.new(src_out, mnode.inputs['Vector'])
+                        tree.links.new(mnode.outputs['Vector'], vec_dst)
+                    else:
+                        tree.links.new(src_out, vec_dst)
+                except Exception:                               # noqa: BLE001
+                    pass
+
         src = None
         want = entry.get('output')
         if want is not None:
             src = node.outputs.get(want)
         if src is None and node.outputs:
             src = node.outputs[0]
-        dst = shader.inputs.get(entry['target'])
+        dst = _shader_input(shader, entry['target'])
         if dst is None or src is None:
+            y -= 260
             continue
         try:
+            if entry.get('invert'):
+                inv = tree.nodes.new('ShaderNodeInvert')
+                inv.location = (-200, y - 60)
+                tree.links.new(src, inv.inputs['Color'])
+                src = inv.outputs['Color']
+            mix = entry.get('mix')
+            vb = entry.get('vblend')
+            rgbb = entry.get('rgbblend')
+            scale_fac = entry.get('scale_fac')
             strength = entry.get('bump')
-            if strength is not None:
+
+            def _wire_slot_flags(dst_node, spec_d):
+                """The MTex texflag props + the Color/Alpha feeds an
+                RGB-yielding texture needs (band clouds, images). The
+                Alpha wire follows BI's alpha law: only a texture that
+                actually EXPOSES alpha (a colorband, or an image with
+                Use Alpha) feeds it; otherwise the input stays at its
+                default 1.0, exactly imagewrap's ta = 1."""
+                for k in ('tex_rgb', 'rgbtoint', 'negative', 'alphamix',
+                          'map_alpha', 'calc_alpha', 'neg_alpha'):
+                    if k in spec_d and hasattr(dst_node, k):
+                        try:
+                            setattr(dst_node, k, bool(spec_d[k]))
+                        except (TypeError, ValueError):
+                            pass
+                if spec_d.get('tex_rgb'):
+                    csrc = node.outputs.get('Color')
+                    cdst = dst_node.inputs.get('Color')
+                    if csrc is not None and cdst is not None:
+                        tree.links.new(csrc, cdst)
+                    if spec_d.get('img_alpha', True):
+                        asrc = node.outputs.get('Alpha')
+                        adst = dst_node.inputs.get('Alpha')
+                        if asrc is not None and adst is not None:
+                            tree.links.new(asrc, adst)
+
+            if rgbb is not None:
+                # a BI colour channel: texture_rgb_blend as the BI
+                # Color Influence node -- the texture supplies tcol
+                # and a per-pixel factor when it yields RGB, only the
+                # factor when it does not (the SLOT colour is tcol
+                # then), and Base chains slot to slot
+                cn = tree.nodes.new('HALCYON_BIRGBBlendNode')
+                cn.location = (-140, y)
+                try:
+                    cn.blend = rgbb.get('blend', 'MIX')
+                except (TypeError, ValueError):
+                    pass
+                _wire_slot_flags(cn, rgbb)
+                prev = last_link.get(entry['target'])
+                if prev is not None:
+                    tree.links.new(prev, cn.inputs['Base'])
+                else:
+                    _set_socket(cn.inputs.get('Base'),
+                                rgbb.get('base', (0.8, 0.8, 0.8, 1.0)))
+                fsrc = node.outputs.get('Fac')
+                if fsrc is not None:
+                    tree.links.new(fsrc, cn.inputs['Intensity'])
+                elif not rgbb.get('tex_rgb'):
+                    tree.links.new(src, cn.inputs['Intensity'])
+                _set_socket(cn.inputs.get('Factor'),
+                            float(rgbb.get('factor', 1.0)))
+                _set_socket(cn.inputs.get('Slot Color'),
+                            tuple(rgbb.get('slot_color', (1, 0, 1)))
+                            + (1.0,))
+                tree.links.new(cn.outputs['Color'], dst)
+                last_link[entry['target']] = cn.outputs['Color']
+            elif vb is not None:
+                # a BI value channel: texture_value_blend as the BI
+                # Influence node -- Base chains slot to slot in the
+                # channel's own units; hardness scales /128 in, x128
+                # out with BI's 1..511 clamp
+                infl = tree.nodes.new('HALCYON_BIInfluenceNode')
+                infl.location = (-140, y)
+                try:
+                    infl.blend = vb.get('blend', 'MIX')
+                except (TypeError, ValueError):
+                    pass
+                _wire_slot_flags(infl, vb)
+                prev = last_link.get(entry['target'])
+                if prev is not None:
+                    tree.links.new(prev, infl.inputs['Base'])
+                else:
+                    _set_socket(infl.inputs.get('Base'),
+                                float(vb.get('base', 0.0)))
+                tree.links.new(src, infl.inputs['Intensity'])
+                _set_socket(infl.inputs.get('Factor'),
+                            float(vb.get('factor', 1.0)))
+                _set_socket(infl.inputs.get('DVar'),
+                            float(vb.get('dvar', 1.0)))
+                out_sock = infl.outputs['Value']
+                last_link[entry['target']] = out_sock
+                scale = float(vb.get('scale', 1.0))
+                if abs(scale - 1.0) > 1e-9:
+                    mul = tree.nodes.new('ShaderNodeMath')
+                    mul.location = (-70, y)
+                    try:
+                        mul.operation = 'MULTIPLY'
+                    except (TypeError, ValueError):
+                        pass
+                    _set_socket(mul.inputs[1], scale)
+                    tree.links.new(out_sock, mul.inputs[0])
+                    out_sock = mul.outputs[0]
+                cl = vb.get('clamp')
+                if cl:
+                    for op, val in (('MAXIMUM', cl[0]), ('MINIMUM',
+                                                         cl[1])):
+                        mnode2 = tree.nodes.new('ShaderNodeMath')
+                        mnode2.location = (-30, y)
+                        try:
+                            mnode2.operation = op
+                        except (TypeError, ValueError):
+                            pass
+                        _set_socket(mnode2.inputs[1], float(val))
+                        tree.links.new(out_sock, mnode2.inputs[0])
+                        out_sock = mnode2.outputs[0]
+                tree.links.new(out_sock, dst)
+            elif mix is not None:
+                mixn = tree.nodes.new('ShaderNodeMixRGB')
+                mixn.location = (-140, y)
+                if hasattr(mixn, 'blend_type'):
+                    try:
+                        mixn.blend_type = mix.get('blend', 'MIX')
+                    except (TypeError, ValueError):
+                        pass
+                _set_socket(mixn.inputs.get('Fac'), mix.get('fac', 1.0))
+                prev = last_link.get(entry['target'])
+                if prev is not None:
+                    # BI stacks texture slots: each blends ONTO the
+                    # previous slot's result. Setting Color1 to the
+                    # static base here instead used to RE-link the
+                    # shader input, and Blender keeps only the last
+                    # link -- every earlier slot's chain went dark
+                    # (the field's 'mixed textures aren't plugged in')
+                    tree.links.new(prev, mixn.inputs['Color1'])
+                else:
+                    _set_socket(mixn.inputs.get('Color1'),
+                                mix.get('base', (0.8, 0.8, 0.8, 1.0)))
+                tree.links.new(src, mixn.inputs['Color2'])
+                tree.links.new(mixn.outputs['Color'], dst)
+                last_link[entry['target']] = mixn.outputs['Color']
+            elif scale_fac is not None:
+                mul = tree.nodes.new('ShaderNodeMath')
+                mul.location = (-140, y)
+                try:
+                    mul.operation = 'MULTIPLY'
+                except (TypeError, ValueError):
+                    pass
+                _set_socket(mul.inputs[1], float(scale_fac))
+                tree.links.new(src, mul.inputs[0])
+                src2 = mul.outputs[0]
+                prev = last_link.get(entry['target'])
+                if prev is not None:
+                    # a second contribution to the same scalar input
+                    # (several bump slots): sum them, as BI's influence
+                    # stack summed its normal perturbations
+                    add = tree.nodes.new('ShaderNodeMath')
+                    add.location = (-70, y)
+                    try:
+                        add.operation = 'ADD'
+                    except (TypeError, ValueError):
+                        pass
+                    tree.links.new(prev, add.inputs[0])
+                    tree.links.new(src2, add.inputs[1])
+                    src2 = add.outputs[0]
+                tree.links.new(src2, dst)
+                last_link[entry['target']] = src2
+            elif strength is not None:
                 # the proven anatomy: height -> Bump -> normal. The engine
                 # renders the height chain to a pre-pass and differences it
                 # the CPU's own way, so this travels to the GPU exactly
@@ -436,13 +787,38 @@ def build(mat, key):
                 tree.links.new(src, bump.inputs['Height'])
                 tree.links.new(bump.outputs['Normal'], dst)
             else:
+                prev = last_link.get(entry['target'])
+                if prev is not None and entry.get('style') != 'color':
+                    add = tree.nodes.new('ShaderNodeMath')
+                    add.location = (-70, y)
+                    try:
+                        add.operation = 'ADD'
+                    except (TypeError, ValueError):
+                        pass
+                    tree.links.new(prev, add.inputs[0])
+                    tree.links.new(src, add.inputs[1])
+                    src = add.outputs[0]
+                # a colour slot lands here only at full influence with
+                # MIX blending, where BI's result IS the texture -- it
+                # replaces the running chain rather than adding to it
                 tree.links.new(src, dst)
+                last_link[entry['target']] = src
         except Exception:                                       # noqa: BLE001
             pass
+        y -= 260
 
     tree.links.new(shader.outputs['Surface'], out.inputs['Surface'])
     shader.refresh_sockets()
     mat.halcyon.use_override = False
+    return shader
+
+
+def build(mat, key):
+    """Replace a material's tree with the named template."""
+    spec = TEMPLATES.get(key)
+    if spec is None:
+        return False, f'unknown template {key!r}'
+    build_spec(mat, spec)
     return True, f'{mat.name}: {spec["label"]}'
 
 

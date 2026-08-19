@@ -51,7 +51,7 @@ def lighting(count):
             '{',
             '    vec3 L;',
             '    float atten = 1.0;',
-            '    if (kind == 0) {',
+            '    if (kind == 0 || kind == 3) {',
             '        L = normalize(-ldir);',
             '    } else {',
             '        vec3 d = lpos - P;',
@@ -65,7 +65,11 @@ def lighting(count):
             '                           0.0, 1.0);',
             '        }',
             '    }',
-            '    vec4 ds = hal_evaluate(hal_model, s, N, L, V);',
+            '    vec4 ds = (kind == 3)',
+            '        ? vec4(0.5 * dot(N, L) + 0.5, s.specular',
+            '               * pow(max(0.5 * dot(N, normalize(L + V))',
+            '                         + 0.5, 0.0), s.glossiness))',
+            '        : hal_evaluate(hal_model, s, N, L, V);',
             '    vec3 radiance = lcol * energy * atten * (1.0 / 3.14159265);',
             '    vec3 diff = s.diffuse * s.diffuse_level * ds.x;',
             '    // the specular colour is already in ds.yzw: hal_evaluate',
@@ -100,7 +104,11 @@ def surface_setup(indent='    '):
     """GLSL that fills a HalcyonSurface from the material uniforms."""
     fields = ('diffuse_level', 'specular_level', 'glossiness', 'roughness',
               'metallic', 'anisotropy', 'aniso_rot', 'soften', 'ior',
-              'translucency', 'toon_size', 'toon_smooth', 'opacity')
+              'translucency', 'toon_size', 'toon_smooth', 'toon_size2',
+              'toon_smooth2', 'bi_fresnel', 'bi_fresnel_fac', 'bi_slope',
+              'bi_transp_fresnel', 'bi_transp_blend', 'bi_spectra',
+              'bi_cubic', 'bi_tangent', 'shadow_receive', 'cast_only',
+              'shadows_only', 'opacity')
     lines = [f'{indent}HalcyonSurface s;']
     for f in fields:
         lines.append(f'{indent}s.{f} = hal_{f};')
@@ -124,6 +132,19 @@ uniform float hal_translucency;
 uniform float hal_toon_size;
 uniform float hal_toon_smooth;
 uniform float hal_toon_steps;
+uniform float hal_toon_size2;
+uniform float hal_toon_smooth2;
+uniform float hal_bi_fresnel;
+uniform float hal_bi_fresnel_fac;
+uniform float hal_bi_slope;
+uniform float hal_bi_transp_fresnel;
+uniform float hal_bi_transp_blend;
+uniform float hal_bi_spectra;
+uniform float hal_bi_cubic;
+uniform float hal_bi_tangent;
+uniform float hal_shadow_receive;
+uniform float hal_cast_only;
+uniform float hal_shadows_only;
 uniform float hal_opacity;
 uniform vec3  hal_specular_tint;
 """
@@ -177,6 +198,45 @@ void main()
     return src, em.samplers
 
 
+def declaration_order_violations(source):
+    """Function names CALLED before any declaration of them: [(name,
+    call line, declaration line)].
+
+    Real GLSL compilers require every function declared before use;
+    Halcyon's own front-end and simulator resolve calls by NAME at run
+    time and shrug at order. That one divergence cost the field five
+    rounds: the bitex chunk called the okramp chunk's HSV pair, the
+    okramp chunk landed later in the assembly, and the driver rejected
+    every material carrying a Blender Internal texture node while
+    every headless check passed. This scan is the wall against the
+    whole class -- run it over ASSEMBLED pass sources in tests.
+    """
+    import re
+    types_ = r'(?:void|float|int|uint|bool|[iub]?vec[234]|mat[234])'
+    decl_re = re.compile(rf'^\s*{types_}\s+(\w+)\s*\(', re.M)
+    lines = source.splitlines()
+    declared_at = {}
+    decl_lines = set()
+    for m in decl_re.finditer(source):
+        ln = source.count('\n', 0, m.start()) + 1
+        declared_at.setdefault(m.group(1), ln)
+        decl_lines.add((m.group(1), ln))
+    call_re = re.compile(r'\b(\w+)\s*\(')
+    out = []
+    flagged = set()
+    for i, line in enumerate(lines, 1):
+        code = line.split('//', 1)[0]
+        for m in call_re.finditer(code):
+            name = m.group(1)
+            d = declared_at.get(name)
+            if d is None or name in flagged:
+                continue
+            if i < d and (name, i) not in decl_lines:
+                out.append((name, i, d))
+                flagged.add(name)
+    return out
+
+
 def can_assemble(graph, light_count=0):
     src, _info = assemble(graph, light_count=light_count)
     return src is not None
@@ -209,27 +269,199 @@ def _f(x):
     return s
 
 
+def _mv(consts, x):
+    """A per-MATERIAL value literal, marked for the texel lifter.
+
+    R174: material constants baked as literals made every material its
+    own shader -- 25 compiles, and every slider drag a recompile. Under
+    consts['__mark_values'] the value is wrapped in a hal_MV() marker;
+    the lifter in shade.py pulls every marker into the hal_mats texture
+    and materials with the same STRUCTURE share one compiled shader.
+    Values that GATE code generation (a sheen crossing zero, a shadeless
+    flag) are read python-side and stay structure, exactly as before.
+    Non-finite values stay literal."""
+    s = _f(x)
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return s
+    if consts.get('__mark_values') and f == f and abs(f) != float('inf'):
+        return f'hal_MV({s})'
+    return s
+
+
+def _mv3(consts, t):
+    return 'vec3({}, {}, {})'.format(*(_mv(consts, v) for v in t))
+
+
+_MV_RE = None
+
+
+def _lift_marked_values(src):
+    """Replace every hal_MV(<literal>) with hal_mv(<index>); return values.
+
+    The marker body is always a plain float literal (written by _f or the
+    Emitter), so a paren-free regex is exact. Index order is source
+    order, which is deterministic for a given structure -- the atlas row
+    and the shader agree by construction."""
+    global _MV_RE
+    if _MV_RE is None:
+        import re
+        _MV_RE = re.compile(r'hal_MV\(([^()]*)\)')
+    vals = []
+
+    def _sub(m):
+        vals.append(float(m.group(1)))
+        return f'hal_mv({len(vals) - 1})'
+
+    return _MV_RE.sub(_sub, src), vals
+
+
 def _v3(t):
     t = tuple(float(v) for v in t)[:3]
     return 'vec3({}, {}, {})'.format(*(_f(v) for v in t))
 
 
-def _attenuation(light, falloff_default, eps=1e-6):
-    """GLSL for one light's distance falloff, matching lights.attenuate."""
+#: texels per light in the hal_lights texture (R169). Layout:
+#:   t0 = (position.xyz,            energy_pre [signed; /4pi for
+#:                                   point-family, raw for SUN/HEMI])
+#:   t1 = (L or spot dir .xyz,      spotsi = cos(spot_size/2))
+#:   t2 = (colour.rgb,              spotbl = (1 - spotsi) * blend)
+#:   t3 = (decay t3x, t3y, ld1, ld2) -- per decay mode: CUSTOM stores
+#:        (start, end - start); the BI modes and SPHERE store
+#:        (start, D = max(end, eps)); NONE/INVERSE/default (start, 0)
+#: The values a user tweaks while lighting live HERE, not in shader
+#: source: a lamp edit re-uploads one tiny texture instead of
+#: recompiling every material pass (the field's 45-second viewport
+#: refine and 30-second cold F12 were exactly that recompile storm).
+#: STRUCTURE -- light count, types, decay modes, shadow modes, which
+#: sliders are nonzero -- still bakes, still re-plans when it changes.
+LIGHT_TEXEL_STRIDE = 4
+
+
+def pack_light_texels(lights):
+    """The per-light value texture, (1, n*STRIDE, 4) float32.
+
+    Every value is np.float32 of the SAME python expression the old
+    literal bake evaluated, so the arithmetic downstream sees the same
+    numbers to within the literal's own %.9g decimal rounding -- and
+    the CPU's exact float32 values, which is what parity is against.
+    """
+    import numpy as np
+    n = max(len(lights), 1)
+    out = np.zeros((1, n * LIGHT_TEXEL_STRIDE, 4), np.float32)
+    for i, light in enumerate(lights):
+        b = i * LIGHT_TEXEL_STRIDE
+        kind = getattr(light, 'type', 'POINT')
+        sign = -1.0 if getattr(light, 'negative', False) else 1.0
+        energy = float(getattr(light, 'energy', 1.0))
+        if kind in ('SUN', 'HEMI'):
+            d = np.asarray(light.direction, np.float32)
+            d = d / max(float(np.linalg.norm(d)), 1e-9)
+            out[0, b + 1, :3] = -d
+            out[0, b + 0, 3] = np.float32(sign * energy)
+        else:
+            out[0, b + 0, :3] = np.asarray(
+                getattr(light, 'position', (0, 0, 0)), np.float32)
+            out[0, b + 0, 3] = np.float32(sign * energy / (4.0 * np.pi))
+            if kind == 'SPOT':
+                sd = np.asarray(light.direction, np.float32)
+                sd = sd / max(float(np.linalg.norm(sd)), 1e-9)
+                out[0, b + 1, :3] = sd
+                spotsi = float(np.cos(float(light.spot_size) * 0.5))
+                out[0, b + 1, 3] = np.float32(spotsi)
+                out[0, b + 2, 3] = np.float32(
+                    (1.0 - spotsi) * float(light.spot_blend))
+        out[0, b + 2, :3] = np.asarray(
+            getattr(light, 'color', (1, 1, 1)), np.float32)
+        eps = 1e-6
+        mode = getattr(light, 'decay', 'DEFAULT')
+        start = float(getattr(light, 'decay_start', 0.0))
+        out[0, b + 3, 0] = np.float32(start)
+        if mode == 'CUSTOM':
+            end = max(float(getattr(light, 'decay_end', 40.0)),
+                      start + eps)
+            out[0, b + 3, 1] = np.float32(end - start)
+        else:
+            out[0, b + 3, 1] = np.float32(
+                max(float(getattr(light, 'decay_end', 25.0)), eps))
+        out[0, b + 3, 2] = np.float32(
+            float(getattr(light, 'decay_ld1', 0.0) or 0.0))
+        out[0, b + 3, 3] = np.float32(
+            float(getattr(light, 'decay_ld2', 0.0) or 0.0))
+    return out
+
+
+def _lref(i, texel, comp):
+    """The GLSL expression reading one packed light value."""
+    return f'hal_ltex({i * LIGHT_TEXEL_STRIDE + texel}).{comp}'
+
+
+def _attenuation(light, falloff_default, eps=1e-6, refs=None):
+    """GLSL for one light's distance falloff, matching lights.attenuate.
+
+    With `refs` (the light-texel expressions: {'D', 'start'}), the
+    VALUES come from the hal_lights texture and only the branch
+    structure bakes -- dragging the lamp Distance slider re-uploads a
+    texel instead of recompiling the pass."""
+    expr = _attenuation_curve(light, falloff_default, eps, refs=refs)
+    if getattr(light, 'bi_sphere', False):
+        # LA_SPHERE, verbatim (R155): *= (D-d)/D with a hard zero past
+        # the lamp Distance -- applied OUTSIDE the falloff switch, so
+        # even a Constant lamp clips (exactly lights.attenuate)
+        D = refs['D'] if refs else _f(max(
+            float(getattr(light, 'decay_end', 25.0)), eps))
+        return (f'((max(dist, 0.0) < {D}) ? ({expr} '
+                f'* (({D} - max(dist, 0.0)) / {D})) : 0.0)')
+    return expr
+
+
+def _attenuation_curve(light, falloff_default, eps=1e-6, refs=None):
     mode = getattr(light, 'decay', 'DEFAULT')
     if mode == 'DEFAULT':
         mode = falloff_default
     start = float(getattr(light, 'decay_start', 0.0))
+    s_ref = refs['start'] if refs else _f(start)
     if mode == 'NONE':
         return '1.0'
-    d = f'max(dist - {_f(start)}, {_f(eps)})' if start > 0 else \
+    d = f'max(dist - {s_ref}, {_f(eps)})' if start > 0 else \
         f'max(dist, {_f(eps)})'
     if mode == 'INVERSE':
         return f'(1.0 / {d})'
     if mode == 'CUSTOM':
+        if refs:
+            # refs['D'] carries (end - start), packed as one float32
+            return (f'clamp(1.0 - (dist - {s_ref}) / {refs["D"]}, '
+                    f'0.0, 1.0)')
         end = max(float(getattr(light, 'decay_end', 40.0)), start + eps)
         return (f'clamp(1.0 - (dist - {_f(start)}) / {_f(end - start)}, '
                 f'0.0, 1.0)')
+    D = refs['D'] if refs else _f(max(
+        float(getattr(light, 'decay_end', 25.0)), eps))
+    if mode == 'BI_LINEAR':
+        # Blender Internal's D/(D+d), D from the lamp Distance
+        return f'({D} / ({D} + max(dist, 0.0)))'
+    if mode == 'BI_SQUARE':
+        # verbatim lamp_get_visibility (R155): D / (D + d*d) -- the
+        # r12045 'hack' the C itself annotates, NOT a true inverse
+        # square D^2/(D^2+d^2). The first cut assumed the tidy form;
+        # the fetched source says otherwise.
+        return (f'({D} / ({D} '
+                '+ max(dist, 0.0) * max(dist, 0.0)))')
+    if mode == 'BI_SLIDERS':
+        # verbatim: D/(D+ld1*d) * D^2/(D^2+ld2*d^2), each factor only
+        # when its slider is positive (the 2.4x Quad lamp's att1/att2)
+        ld1 = float(getattr(light, 'decay_ld1', 0.0) or 0.0)
+        ld2 = float(getattr(light, 'decay_ld2', 0.0) or 0.0)
+        ld1_r = refs['ld1'] if refs else _f(ld1)
+        ld2_r = refs['ld2'] if refs else _f(ld2)
+        parts = []
+        if ld1 > 0.0:
+            parts.append(f'({D} / ({D} + {ld1_r} * dist))')
+        if ld2 > 0.0:
+            parts.append(f'(({D} * {D}) / (({D} * {D}) '
+                         f'+ {ld2_r} * dist * dist))')
+        return ' * '.join(parts) if parts else '1.0'
     return f'(1.0 / ({d} * {d}))'
 
 
@@ -615,7 +847,8 @@ def _shadow_function(i, meta, consts):
     density = float(meta['density'])
     origin = meta['origin']
 
-    L = [f'uniform sampler2D hal_shadow{i};',
+    voff = int(meta.get('voff', 0))
+    L = ['uniform sampler2D hal_shadowpack;',
          f'float hal_shadow_vis{i}(vec3 P, vec3 N, vec3 L)',
          '{',
          f'    float ndl = clamp(dot(N, L), 0.0, 1.0);',
@@ -652,7 +885,7 @@ def _shadow_function(i, meta, consts):
                   f'        clipz = dot(ph, {_v4(vp[2])});',
                   f'        clipw = dot(ph, {_v4(vp[3])});',
                   f'        cellx = {_f((fi % grid_w) * size)};',
-                  f'        celly = {_f((fi // grid_w) * size)};',
+                  f'        celly = {_f((fi // grid_w) * size + voff)};',
                   '    }']
     else:
         vp = np.asarray(faces[0]['vp'], np.float32)
@@ -660,7 +893,7 @@ def _shadow_function(i, meta, consts):
               f'    float clipy = dot(ph, {_v4(vp[1])});',
               f'    float clipz = dot(ph, {_v4(vp[2])});',
               f'    float clipw = dot(ph, {_v4(vp[3])});',
-              '    float cellx = 0.0; float celly = 0.0;']
+              f'    float cellx = 0.0; float celly = {_f(voff)};']
 
     eps = 1e-6
     L += [f'    float w = abs(clipw) < {_f(eps)} ? {_f(eps)} : clipw;',
@@ -691,7 +924,7 @@ def _shadow_function(i, meta, consts):
               f'{_f(size - 1)});',
               f'    float yi = clamp(floor(v + {_f(oy)}), 0.0, '
               f'{_f(size - 1)});',
-              f'    float occ = texelFetch(hal_shadow{i}, '
+              '    float occ = texelFetch(hal_shadowpack, '
               'ivec2(int(cellx + xi), int(celly + yi)), 0).r;',
               '    lit += (sdist - slope <= occ) ? 1.0 : 0.0;',
               '    }']
@@ -1037,7 +1270,7 @@ def resolve_tex_filter(interp, settings_filter):
     return filt
 
 
-def _one_light_source(i, light, consts, shadowed=None, bake=None):
+def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
     """The unrolled loop body for one light, mirroring light_surface.
 
     AREA lights take the position branch: the CPU's sample() treats an area
@@ -1051,15 +1284,26 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None):
     import numpy as np
     bake = bake or {}
     kind = getattr(light, 'type', 'POINT')
-    col = _v3(getattr(light, 'color', (1, 1, 1)))
+    # R169: the light's VALUES come from the hal_lights texture (see
+    # LIGHT_TEXEL_STRIDE), so a lamp edit re-uploads a texel instead of
+    # changing this source and recompiling every pass. Only STRUCTURE
+    # bakes below: the light's type, decay mode, which sliders are
+    # nonzero, shadow mode, cookies, linking.
+    use_tx = bool(consts.get('light_texels', True))
+    col = _lref(i, 2, 'rgb') if use_tx else \
+        _v3(getattr(light, 'color', (1, 1, 1)))
     energy = float(getattr(light, 'energy', 1.0))
     lines = ['    {']
     ck = (consts.get('cookies') or {}).get(i)
-    if kind == 'SUN':
+    if kind in ('SUN', 'HEMI'):
         d = np.asarray(light.direction, np.float32)
         d = d / max(float(np.linalg.norm(d)), 1e-9)
-        lines += [f'    vec3 L = {_v3(-d)};',
-                  f'    vec3 rad = {col} * {_f(energy)};']
+        if use_tx:
+            lines += [f'    vec3 L = {_lref(i, 1, "xyz")};',
+                      f'    vec3 rad = {col} * {_lref(i, 0, "w")};']
+        else:
+            lines += [f'    vec3 L = {_v3(-d)};',
+                      f'    vec3 rad = {col} * {_f(energy)};']
         if ck is not None:
             # exactly cookie_factor's SUN branch: world position projected
             # on the light's own axes, one tile per cookie_scale units
@@ -1070,25 +1314,59 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None):
                 f'    rad = rad * (vec3(1.0) + (hal_cookie_rgb{i}(ckuv) '
                 f'- vec3(1.0)) * {_f(ck["strength"])});']
     else:
-        lines += [f'    vec3 delta = {_v3(light.position)} - P;',
+        mode_bi = str(getattr(light, 'decay', '')).startswith('BI_') or \
+            getattr(light, 'bi_sphere', False)
+        refs = None
+        if use_tx:
+            refs = {'D': _lref(i, 3, 'y'), 'start': _lref(i, 3, 'x'),
+                    'ld1': _lref(i, 3, 'z'), 'ld2': _lref(i, 3, 'w')}
+        pos = _lref(i, 0, 'xyz') if use_tx else _v3(light.position)
+        e_pre = _lref(i, 0, 'w') if use_tx else \
+            _f(energy / (4.0 * np.pi))
+        lines += [f'    vec3 delta = {pos} - P;',
                   '    float dist = max(length(delta), 1e-6);',
                   '    vec3 L = delta / dist;',
                   f'    float att = '
-                  f'{_attenuation(light, consts["falloff_default"])};',
-                  f'    vec3 rad = {col} * ({_f(energy / (4.0 * np.pi))}'
-                  f' * att);']
+                  f'{_attenuation(light, consts["falloff_default"], refs=refs)};']
+        if mode_bi and kind != 'SPOT':
+            # lamp_get_visibility's tail: visifac <= 0.001 snaps to 0
+            lines.append('    att = (att <= 0.001) ? 0.0 : att;')
+        lines += [f'    vec3 rad = {col} * ({e_pre} * att);']
         if kind == 'SPOT':
+            # BI's spot, verbatim (R155): hard cutoff at spotsi, a
+            # smoothstep across spotbl = (1-spotsi)*blend in cosine
+            # units, then the whole cone multiplied by the raw cosine
             sd = np.asarray(light.direction, np.float32)
             sd = sd / max(float(np.linalg.norm(sd)), 1e-9)
-            half = float(light.spot_size) * 0.5
-            blend = max(float(light.spot_blend), 1e-4)
-            outer = np.cos(half)
-            inner = np.cos(half * (1.0 - blend))
+            spotsi = float(np.cos(float(light.spot_size) * 0.5))
+            spotbl = (1.0 - spotsi) * float(light.spot_blend)
+            sd_r = _lref(i, 1, 'xyz') if use_tx else _v3(sd)
+            si_r = _lref(i, 1, 'w') if use_tx else _f(spotsi)
+            bl_r = _lref(i, 2, 'w') if use_tx else _f(spotbl)
             lines += [
-                f'    float cosang = -dot(L, {_v3(sd)});',
-                f'    float spot_t = clamp((cosang - {_f(outer)}) / '
-                f'{_f(max(inner - outer, 1e-5))}, 0.0, 1.0);',
-                '    rad = rad * (spot_t * spot_t);']
+                f'    float cosang = -dot(L, {sd_r});',
+                f'    float spot_t = cosang - {si_r};',
+                '    float spot_f = 0.0;',
+                '    if (spot_t > 0.0) {']
+            if spotbl != 0.0:
+                # whether a blend EXISTS is structure; its width is a
+                # texel (crossing zero re-plans, dragging it does not)
+                lines += [
+                    f'        float spot_i = clamp(spot_t / '
+                    f'{bl_r}, 0.0, 1.0);',
+                    f'        float spot_s = (spot_t < {bl_r}) ? '
+                    '(3.0 * spot_i * spot_i - 2.0 * spot_i * spot_i '
+                    '* spot_i) : 1.0;',
+                    '        spot_f = spot_s * cosang;']
+            else:
+                lines += ['        spot_f = cosang;']
+            lines += ['    }']
+            if mode_bi:
+                # the combined visifac (att * spot) snaps at 0.001,
+                # exactly the CPU's sample()
+                lines.append('    spot_f = ((att * spot_f) <= 0.001) '
+                             '? 0.0 : spot_f;')
+            lines.append('    rad = rad * spot_f;')
             if ck is not None:
                 # exactly cookie_factor's SPOT branch: light->surface
                 # direction in the light's own frame, the full cone
@@ -1105,38 +1383,176 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None):
                     f'    rad = rad * (vec3(1.0) + (hal_cookie_rgb{i}'
                     f'(ckuv) - vec3(1.0)) * {_f(ck["strength"])});',
                     '    }']
-    if getattr(light, 'negative', False):
+    if getattr(light, 'negative', False) and not use_tx:
+        # texel mode folds the sign into the packed energy (float32
+        # negation is exact), so toggling Negative never recompiles
         lines.append('    rad = -rad;')
-    lines.append('    vec4 ds = hal_evaluate(hal_model_i, s, N, L, V);')
-    lines.append('    vec3 contrib = vec3(0.0);')
+    bi = bi or {}
+    rd = bi.get('ramp_dif')
+    rs_ = bi.get('ramp_spec')
+    if kind == 'HEMI':
+        # BI's Hemi replaces the shaders on BOTH lobes, exactly
+        # light_surface's override: the 0.5+0.5*N.L wrap and a wrapped
+        # half-vector pow through the surface's own hardness and tint
+        lines += [
+            '    float hal_hd = 0.5 * dot(N, L) + 0.5;',
+            '    float hal_ht = 0.5 * dot(N, normalize(L + V)) + 0.5;',
+            # verbatim (R155): t = spec(t, shi->har) -- the integer-bit
+            # spec() table, same as the CPU override
+            '    vec4 ds = vec4(hal_hd, s.specular '
+            '* hal_bi_spec_pow(hal_ht, s.glossiness));']
+    else:
+        lines.append(
+            '    vec4 ds = hal_evaluate(hal_model_i, s, N, L, V);')
+    # the shadow term -- evaluated AFTER the shaders, exactly the CPU's
+    # R167 order (SH.evaluate before visibility), and R177 adds the
+    # CPU's own skip to the twin: the traversal runs ONLY where this
+    # lamp actually contributes (some shader channel nonzero AND the
+    # attenuated radiance nonzero). A gated-out pixel keeps hal_sv at
+    # 1.0 and contributes zero through every term that reads it -- the
+    # ramp ENERGY factor, the shadow-colour tint, the receive fold --
+    # so the picture cannot move; only the wasted BVH walks and map
+    # taps stop. Shadows Only materials never reach this pass (they
+    # refuse the GPU by name), so the gate needs no exception.
+    if shadowed:
+        if isinstance(shadowed, dict) and shadowed.get('ray'):
+            dist_arg = '1e9' if kind == 'SUN' else 'dist'
+            _sv_call = f'hal_shadow_vis{i}(P, N, L, {dist_arg})'
+        else:
+            _sv_call = f'hal_shadow_vis{i}(P, N, L)'
+        lines += [
+            '    float hal_sv = 1.0;',
+            '    if ((abs(ds.x) + abs(ds.y) + abs(ds.z) + abs(ds.w)) '
+            '!= 0.0',
+            '            && (abs(rad.x) + abs(rad.y) + abs(rad.z)) '
+            '!= 0.0) {',
+            f'        hal_sv = {_sv_call};',
+            # Shadow > Receive off: shadows never darken this material
+            # -- folds to a no-op at the baked default of 1.0 (and a
+            # skipped pixel's 1.0 folds to 1.0 identically)
+            '        hal_sv = 1.0 - s.shadow_receive '
+            '+ s.shadow_receive * hal_sv;',
+            '    }']
+    else:
+        lines.append('    float hal_sv = 1.0;')
+    lines.append('    vec3 hal_dcon = vec3(0.0);')
+    lines.append('    vec3 hal_scon = vec3(0.0);')
     if getattr(light, 'affect_diffuse', True) and \
             not getattr(light, 'specular_only', False):
-        lines.append('    contrib += (ds.x * s.diffuse * s.diffuse_level)'
-                     ' * rad;')
+        if rd is not None and rd.get('input') != 'RESULT':
+            # the diffuse ramp, per light, exactly add_to_diffuse: the
+            # band recolours the DIFFUSE COLOUR, the shader scalar stays
+            fac = {'ENERGY': '(ds.x * hal_sv * '
+                             'dot(rad, vec3(0.3, 0.58, 0.11)))',
+                   'NORMAL': '(dot(N, V))'}.get(
+                       rd.get('input', 'SHADER'), 'ds.x')
+            bidx = _ramp_blend_index(rd.get('blend', 'MIX'))
+            lines += [
+                f'    vec4 hal_bd = hal_biband_dif({fac});',
+                f'    vec3 hal_dcol = hal_ramp_blend({bidx}, s.diffuse, '
+                f'hal_bd.a * {_mv(consts, float(rd.get("factor", 1.0)))}, '
+                'hal_bd.rgb);',
+                '    hal_dcon += (ds.x * hal_dcol * s.diffuse_level)'
+                ' * rad;']
+        else:
+            lines.append('    hal_dcon += (ds.x * s.diffuse * '
+                         's.diffuse_level) * rad;')
     if getattr(light, 'affect_specular', True) and \
             not getattr(light, 'diffuse_only', False):
         spec = 'ds.yzw'
+        if rs_ is not None and rs_.get('input') != 'RESULT':
+            # recover the shader scalar from the coloured return (spec =
+            # scalar * specular colour; argmax channel, ties to red,
+            # exactly the CPU's np.argmax) -- a black specular colour
+            # has no recoverable scalar and stays dark
+            lines += [
+                '    float hal_smx = max(s.specular.r, '
+                'max(s.specular.g, s.specular.b));',
+                '    float hal_sr = (s.specular.r >= s.specular.g && '
+                's.specular.r >= s.specular.b) ? ds.y : '
+                '((s.specular.g >= s.specular.b) ? ds.z : ds.w);',
+                '    float hal_sfac = (hal_smx > 1e-9) ? '
+                'hal_sr / max(hal_smx, 1e-9) : 0.0;']
+            fac = {'ENERGY': '(hal_sfac * hal_sv * '
+                             'dot(rad, vec3(0.3, 0.58, 0.11)))',
+                   'NORMAL': '(dot(N, V))'}.get(
+                       rs_.get('input', 'SHADER'), 'hal_sfac')
+            bidx = _ramp_blend_index(rs_.get('blend', 'MIX'))
+            lines += [
+                f'    vec4 hal_bs = hal_biband_spec({fac});',
+                f'    vec3 hal_scol = hal_ramp_blend({bidx}, s.specular, '
+                f'hal_bs.a * {_mv(consts, float(rs_.get("factor", 1.0)))}, '
+                'hal_bs.rgb);',
+                '    vec3 hal_sp = hal_sfac * hal_scol;']
+            spec = 'hal_sp'
         if not consts.get('specular_in_gamma', True):
-            spec = 'pow(max(ds.yzw, vec3(0.0)), vec3(2.2))'
-        lines.append(f'    contrib += {spec} * s.specular_level * rad;')
+            spec = f'pow(max({spec}, vec3(0.0)), vec3(2.2))'
+        lines.append(f'    hal_scon += {spec} * s.specular_level * rad;')
         if float(bake.get('sheen', 0.0)) > 1e-4:
             # the velvet lobe, exactly as light_surface: scattered back at
             # grazing angles, needing a light, vanishing face-on
             sr = min(max(float(bake.get('sheen_roughness', 0.3)), 0.0), 1.0)
             sheen_exp = 1.0 + (1.0 - sr) * 15.0
             lines.append(
-                f'    contrib += {_v3(bake.get("sheen_color", (1, 1, 1)))}'
-                f' * (pow(hal_edge_vn, {_f(sheen_exp)})'
-                f' * max(dot(N, L), 0.0) * {_f(bake["sheen"])}) * rad;')
-    lines.append('    contrib *= 0.318309886;')          # 1/pi, as the CPU
-    if shadowed:
-        # the CPU order: 1/pi, then visibility, then the clamp
-        if isinstance(shadowed, dict) and shadowed.get('ray'):
-            dist_arg = '1e9' if kind == 'SUN' else 'dist'
-            lines.append(f'    contrib *= '
-                         f'hal_shadow_vis{i}(P, N, L, {dist_arg});')
+                f'    hal_scon += '
+                f'{_mv3(consts, bake.get("sheen_color", (1, 1, 1)))}'
+                f' * (pow(hal_edge_vn, {_mv(consts, sheen_exp)})'
+                f' * max(dot(N, L), 0.0) * {_mv(consts, bake["sheen"])})'
+                ' * rad;')
+    # R164: shade_one_light's phongcorr -- the sbias branch: diffuse-
+    # only, raw N.L threshold, receive-folded exactly like the CPU's
+    # shadow_receive gate. R167 adds the RAYBIAS branch's twin: on
+    # smooth pixels of a RAY-shadowed lamp the curve runs against the
+    # object's Auto Smooth threshold (per-tri hal_sres), with the
+    # CPU _pcurve's exact guards (threshold capped below 1, the
+    # degenerate denominator falling back to 1); flat pixels keep the
+    # sbias curve (or 1), exactly light_surface's done-mask order.
+    sb = float((bi or {}).get('sbias', 0.0) or 0.0)
+    _smode = getattr(light, 'shadow', 'NONE') \
+        if str(consts.get('shadow_default', 'PER_LIGHT')) == 'PER_LIGHT' \
+        else str(consts.get('shadow_default'))
+    rb = bool((bi or {}).get('raybias')) and shadowed is not None \
+        and bool((shadowed or {}).get('ray')) and _smode == 'RAY' \
+        and kind not in ('HEMI', 'AREA')
+    if rb:
+        lines += [
+            '    float hal_thr = min(hal_pc_thr, 1.0 - 1e-6);',
+            '    float hal_pden = dot(N, L) * (1.0 - hal_thr);',
+            '    float hal_pcr = (dot(N, L) > hal_thr)'
+            ' ? ((dot(N, L) - hal_thr)'
+            ' / ((abs(hal_pden) > 1e-20) ? hal_pden : 1.0)) : 0.0;']
+        if sb != 0.0:
+            lines += [
+                f'    float hal_pcs = (dot(N, L) > {_mv(consts, sb)})'
+                f' ? ((dot(N, L) - {_mv(consts, sb)})'
+                f' / (dot(N, L) * {_mv(consts, 1.0 - sb)})) : 0.0;',
+                '    float hal_pc = mix(hal_pcs, hal_pcr, hal_pc_sm);']
         else:
-            lines.append(f'    contrib *= hal_shadow_vis{i}(P, N, L);')
+            lines += [
+                '    float hal_pc = mix(1.0, hal_pcr, hal_pc_sm);']
+        lines += [
+            '    hal_pc = 1.0 - s.shadow_receive'
+            ' + s.shadow_receive * hal_pc;',
+            '    hal_dcon *= hal_pc;']
+    elif sb != 0.0 and shadowed is not None and kind not in ('HEMI',
+                                                             'AREA'):
+        lines += [
+            f'    float hal_pc = (dot(N, L) > {_mv(consts, sb)})'
+            f' ? ((dot(N, L) - {_mv(consts, sb)})'
+            f' / (dot(N, L) * {_mv(consts, 1.0 - sb)})) : 0.0;',
+            '    hal_pc = 1.0 - s.shadow_receive'
+            ' + s.shadow_receive * hal_pc;',
+            '    hal_dcon *= hal_pc;']
+    # R164: the lamp's SHADOW COLOUR tints the shadowed diffuse
+    # (lashdw*(i_noshad - i) added back); spec keeps the plain factor
+    _shc = tuple(getattr(light, 'shadow_color', (0.0, 0.0, 0.0))
+                 or (0.0, 0.0, 0.0))
+    if max(_shc) > 0.0:
+        lines.append(f'    hal_dcon *= 0.318309886 * (vec3(hal_sv)'
+                     f' + {_v3(_shc)} * (1.0 - hal_sv));')
+    else:
+        lines.append('    hal_dcon *= 0.318309886 * hal_sv;')
+    lines.append('    hal_scon *= 0.318309886 * hal_sv;')
     link = (consts.get('light_links') or {}).get(i)
     if link:
         # light linking, exactly light_surface's mask and order: 1/pi,
@@ -1150,23 +1566,138 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None):
                            '? 1.0 : 0.0)'
                            for o in link['objects'])
         lines.append(f'    float hal_lk{i} = min({tests}, 1.0);')
-        if str(link.get('mode', 'EXCLUDE')).upper() == 'ONLY':
-            lines.append(f'    contrib *= hal_lk{i};')
-        else:
-            lines.append(f'    contrib *= (1.0 - hal_lk{i});')
-    clamp = float(consts.get('light_clamp', 0.0))
-    if clamp > 0.0:
-        lines.append(f'    contrib = min(contrib, vec3({_f(clamp)}));')
-    lines.append('    total += contrib;')
+        mask = f'hal_lk{i}' if str(link.get('mode', 'EXCLUDE')).upper() \
+            == 'ONLY' else f'(1.0 - hal_lk{i})'
+        lines.append(f'    hal_dcon *= {mask};')
+        lines.append(f'    hal_scon *= {mask};')
+    if bi.get('need_spec_acc'):
+        # the unclamped specular accumulation, for spectra and the
+        # RESULT spec ramp -- exactly the CPU's spec_acc
+        lines.append('    hal_spec_acc += hal_scon;')
+    if bi.get('result_mode'):
+        # RESULT ramps read the whole accumulated colour: parts stay
+        # apart, the clamp waits for the end (BI had none per light)
+        lines.append('    hal_dacc += hal_dcon;')
+        lines.append('    hal_sacc += hal_scon;')
+    else:
+        lines.append('    vec3 contrib = hal_dcon + hal_scon;')
+        clamp = float(consts.get('light_clamp', 0.0))
+        if clamp > 0.0:
+            lines.append(f'    contrib = min(contrib, vec3({_f(clamp)}));')
+        lines.append('    total += contrib;')
     lines.append('    }')
     return lines
+
+
+def _ramp_blend_index(name):
+    """A BI ramp blend mode name -> its MA_RAMP_* DNA index."""
+    from ..core.shading import BI_RAMP_BLEND_ORDER
+    try:
+        return BI_RAMP_BLEND_ORDER.index(str(name))
+    except ValueError:
+        return 0
+
+
+def _bi_graph_props(graph):
+    """The BI material node's props from a graph dict, or None."""
+    if not graph:
+        return None
+    for node in graph.get('nodes', {}).values():
+        if node.get('bl_idname') == 'HALCYON_BIMaterialNode':
+            return node.get('props', {})
+    return None
+
+
+def _bi_ramp_spec(props, prefix):
+    """One ramp's spec dict from the BI node's props, or None.
+
+    The same parse n_bi_material runs for the CPU closure, so both
+    devices read the identical stops, input, blend, factor and ipo."""
+    if not props or not props.get(f'use_{prefix}'):
+        return None
+    stops = props.get(f'{prefix}_stops')
+    if not stops:
+        return None
+    return {'stops': [tuple(float(x) for x in s) for s in stops],
+            'input': props.get(f'{prefix}_input', 'SHADER'),
+            'blend': props.get(f'{prefix}_blend', 'MIX'),
+            'factor': float(props.get(f'{prefix}_factor', 1.0)),
+            'ipotype': int(props.get(f'{prefix}_ipo', 0))}
+
+
+def _colorband_glsl(name, stops, ipo):
+    """A colorband as one GLSL function, `vec4 name(float)`.
+
+    The body is the bitex emitter's unroll verbatim (the proven twin of
+    core.bitex.colorband_eval), wrapped as a callable so the light loop
+    can read the band per light."""
+    n = len(stops)
+    if n == 0:
+        return f'vec4 {name}(float tin) {{ return vec4(0.0); }}'
+    if n == 1:
+        s = stops[0]
+        return (f'vec4 {name}(float tin) {{ return vec4({_f(s[1])}, '
+                f'{_f(s[2])}, {_f(s[3])}, {_f(s[4])}); }}')
+    arr = ', '.join(f'vec4({_f(s[1])}, {_f(s[2])}, {_f(s[3])}, {_f(s[4])})'
+                    for s in stops)
+    pos = ', '.join(_f(s[0]) for s in stops)
+    ipo = int(ipo)
+    return f"""vec4 {name}(float tin)
+{{
+    vec4 cbc[{n}] = vec4[{n}]({arr});
+    float cbp[{n}] = float[{n}]({pos});
+    vec4 cb = vec4(0.0);
+    int a = 0;
+    while (a < {n} && cbp[a] <= tin) {{ a++; }}
+    int ir = (a < {n}) ? a : {n} - 1;
+    int il = (a > 0) ? a - 1 : 0;
+    float rpos = (a >= {n}) ? 1.0 : cbp[ir];
+    float lpos = (a <= 0) ? 0.0 : cbp[il];
+    vec4 rcol = cbc[ir];
+    vec4 lcol = cbc[il];
+    float span = lpos - rpos;
+    float fac = (abs(span) > 1e-9) ? (tin - rpos) / span
+                                   : ((a >= {n}) ? 1.0 : 0.0);
+    int ipo = {ipo};
+    if (ipo == 4) {{ cb = lcol; }}
+    else if (ipo == 2 || ipo == 3) {{
+        int i0 = (a >= {n} - 1) ? ir : min(ir + 1, {n} - 1);
+        int i3 = (a < 2) ? il : max(il - 1, 0);
+        vec4 c0 = cbc[i0]; vec4 c1 = rcol;
+        vec4 c2 = lcol; vec4 c3 = cbc[i3];
+        float t = clamp(fac, 0.0, 1.0);
+        float t2 = t * t; float t3 = t2 * t;
+        vec4 res;
+        if (ipo == 3) {{
+            res = (0.5 * t3 - 0.5 * t2) * c3
+                + (-1.5 * t3 + 2.0 * t2 + 0.5 * t) * c2
+                + (1.5 * t3 - 2.5 * t2 + 1.0) * c1
+                + (-0.5 * t3 + t2 - 0.5 * t) * c0;
+        }} else {{
+            res = (0.16666666 * t3) * c3
+                + (-0.5 * t3 + 0.5 * t2 + 0.5 * t + 0.16666666) * c2
+                + (0.5 * t3 - t2 + 0.66666666) * c1
+                + (-0.16666666 * t3 + 0.5 * t2 - 0.5 * t + 0.16666666)
+                  * c0;
+        }}
+        cb = clamp(res, 0.0, 1.0);
+    }} else {{
+        float f2 = clamp(fac, 0.0, 1.0);
+        if (ipo == 1) {{ f2 = 3.0 * f2 * f2 - 2.0 * f2 * f2 * f2; }}
+        cb = (1.0 - f2) * rcol + f2 * lcol;
+    }}
+    return cb;
+}}"""
 
 
 #: surface fields baked from the probe, in HalcyonSurface field order
 BAKE_FIELDS = ('diffuse_level', 'specular_level', 'glossiness', 'roughness',
                'metallic', 'anisotropy', 'aniso_rot', 'soften', 'ior',
                'translucency', 'toon_size', 'toon_smooth', 'toon_steps',
-               'opacity')
+               'toon_size2', 'toon_smooth2', 'bi_fresnel', 'bi_fresnel_fac',
+               'bi_slope', 'bi_transp_fresnel', 'bi_transp_blend',
+               'bi_spectra', 'bi_cubic', 'bi_tangent', 'shadow_receive',
+               'cast_only', 'shadows_only', 'opacity')
 
 #: master-node sockets that may vary per pixel: when LINKED, the chain is
 #: emitted and assigned to the surface field; unlinked, the probed constant
@@ -1199,12 +1730,17 @@ PER_PIXEL_SOCKETS = {
 
 
 def master_node(graph):
-    """The HALCYON_ShaderNode feeding the output, if that is what feeds it."""
+    """The master node feeding the output, if that is what feeds it.
+
+    Two nodes qualify: the Halcyon Shader and the BI Material node --
+    the second speaks the same surface vocabulary through its socket
+    IDENTIFIERS, so every probe and bake below works on both."""
     link = find_surface_link(graph)
     if link is None:
         return None
     node = (graph or {}).get('nodes', {}).get(link[0])
-    if node is not None and node.get('bl_idname') == 'HALCYON_ShaderNode':
+    if node is not None and node.get('bl_idname') in (
+            'HALCYON_ShaderNode', 'HALCYON_BIMaterialNode'):
         return node
     return None
 
@@ -1216,9 +1752,15 @@ def _replace_all(text, pairs):
 
 
 def _socket(node, name):
-    """One named input socket of a node, or None."""
+    """One named input socket of a node, or None.
+
+    Matches the display name OR the identifier: the BI Material node
+    shows Blender Internal's own labels (Hardness, Refr, Alpha) while
+    carrying master-shader identifiers underneath, and every seam that
+    reads sockets goes through here or the evaluator, which already
+    matches both."""
     for sock in (node or {}).get('inputs', ()):
-        if sock.get('name') == name:
+        if sock.get('name') == name or sock.get('identifier') == name:
             return sock
     return None
 
@@ -1248,11 +1790,48 @@ def per_pixel_fields(graph):
     if node is None:
         return {}
     out = {}
+    emit_sock = None
+    color_linked = False
     for sock in node.get('inputs', ()):
         name = sock.get('name')
-        if name in PER_PIXEL_SOCKETS and sock.get('link'):
-            field, gtype = PER_PIXEL_SOCKETS[name]
+        ident = sock.get('identifier')
+        if (ident or name) == 'Emit' or name == 'Emit':
+            emit_sock = sock
+        if (ident == 'Diffuse Color' or name == 'Color'
+                or name == 'Diffuse Color') and sock.get('link'):
+            color_linked = True
+        # the BI Material node shows Blender Internal's own labels
+        # (Hardness, Spec, Ref) over master-shader IDENTIFIERS -- the
+        # grant must match either, like _socket and em.input do. Matching
+        # the display name alone silently revoked per-pixel rights from
+        # every renamed socket: the field's mask material put its whole
+        # frame on the CPU over a granted, emittable Glossiness chain
+        # ('glossiness varies across the frame'), five minutes a frame.
+        key = name if name in PER_PIXEL_SOCKETS else \
+            (ident if ident in PER_PIXEL_SOCKETS else None)
+        if key is not None and sock.get('link'):
+            field, gtype = PER_PIXEL_SOCKETS[key]
+            # hand consumers the socket's real display name: em.input
+            # and _socket match name-or-identifier, so either works,
+            # but the name is what the graph actually shows
             out[field] = (name, gtype)
+    # BI's Emit is a FLOAT that glows the DIFFUSE CHAIN's colour:
+    # emission = base.rgb * emit (+ the Vertex Color Light add). It has
+    # no vec3 master socket, so the generic table can never grant it --
+    # and an EMIT texture slot (or a textured colour under a nonzero
+    # Emit) pushed the whole frame onto the CPU by the constancy rule
+    # ('emission varies across the frame': the field's Red material,
+    # every viewport re-render at region resolution). The assembler
+    # synthesizes the product from the SAME emitted chains.
+    if node.get('bl_idname') == 'HALCYON_BIMaterialNode' \
+            and 'emission' not in out and emit_sock is not None:
+        p = node.get('props', {})
+        emit_linked = bool(emit_sock.get('link'))
+        emit_default = float(emit_sock.get('default') or 0.0)
+        base_varies = color_linked or bool(p.get('vcol_paint'))
+        if emit_linked or (abs(emit_default) > 1e-9 and base_varies) \
+                or bool(p.get('vcol_light')):
+            out['emission'] = ('Emit', 'bi_emit')
     return out
 
 
@@ -1275,6 +1854,7 @@ def _assemble_height_pass(graph, mat_id, bump_node, consts, textures,
     em.resolution = consts.get('resolution')
     em.camera = consts.get('camera')
     em.uv_names = tuple(consts.get('uv_names') or ())
+    em.has_vcol = bool(consts.get('has_vcol'))
     em.programs = programs if programs is not None else {}
     try:
         expr = em.input(bump_node, 'Height', 'float')
@@ -1294,6 +1874,16 @@ def _assemble_height_pass(graph, mat_id, bump_node, consts, textures,
     if em.bump_passes:
         return None, 'a Bump node inside another Bump\'s height chain is ' \
                      'not in the deferred pass yet'
+    if getattr(em, 'used_shading_lib', False):
+        # the chain called into the shading library (a ramp-delegating
+        # BI colour blend), which the height pre-pass does not carry --
+        # the CPU produces the pre-pass image exactly instead
+        return '__CPU__', {'cpu': True, 'node': bump_node.get('id'),
+                           'why': 'a shading-library call in the height '
+                                  'chain evaluates on the CPU into the '
+                                  'height pre-pass',
+                           'samplers': [], 'textures': {},
+                           'frame_uniforms': [], 'uses_screen': False}
 
     tex_fns = []
     tex_binds = {}
@@ -1303,6 +1893,15 @@ def _assemble_height_pass(graph, mat_id, bump_node, consts, textures,
         sname = meta['uniform']
         key = meta.get('image')
         tex = (textures or {}).get(key)
+        if meta.get('raw'):
+            # an engine data texture (the BI noise tables): the shader
+            # declares the sampler itself and reads with texelFetch, so
+            # only the binding is needed here
+            if tex is None:
+                return None, f"engine table texture '{key}' is not " \
+                             'among the prepared textures'
+            tex_binds[sname] = key
+            continue
         if meta.get('code'):
             if tex is None:
                 return None, f"the coded shader's image '{key}' is not " \
@@ -1473,10 +2072,12 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
 
     em = Emitter(graph or {})
     em.frame_mode = True
+    em.mark_values = bool(consts.get('__mark_values'))
     em.resolution = consts.get('resolution')
     em.secondary = secondary
     em.camera = consts.get('camera')
     em.uv_names = tuple(consts.get('uv_names') or ())
+    em.has_vcol = bool(consts.get('has_vcol'))
     # {} is authoritative "nothing compiled" (code nodes read as zeros, the
     # CPU's own answer); the frame path always knows, so it never passes None
     em.programs = programs if programs is not None else {}
@@ -1497,6 +2098,21 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
             perpix = per_pixel_fields(graph)
             mnode = master_node(graph)
             for field, (sockname, gtype) in perpix.items():
+                if gtype == 'bi_emit':
+                    # BI emission = the diffuse chain's colour times the
+                    # Emit float (n_bi_material verbatim), sharing the
+                    # already-emitted base chain -- textures sample once.
+                    # Vertex Color Light adds vcol.rgb * vcol.a when the
+                    # mesh actually carries a layer, exactly the CPU's
+                    # has_vcol gate.
+                    e_expr = em.input(mnode, sockname, 'float')
+                    expr = f'({base} * {e_expr})'
+                    if (mnode.get('props', {}).get('vcol_light')
+                            and em.has_vcol):
+                        expr = (f'({expr} + hal_vcol.rgb '
+                                f'* hal_vcol.w)')
+                    perpix_exprs[field] = expr
+                    continue
                 want = 'float' if gtype == 'float' else 'vec3'
                 perpix_exprs[field] = em.input(mnode, sockname, want)
             # the master node's Normal chain, through the same emitter so a
@@ -1525,6 +2141,13 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
                 node.get('props', {}).get('projection', 'FLAT') != 'FLAT':
             return None, (f"{node['props']['projection']} projection is not "
                           f"in the deferred pass yet (FLAT is)")
+    if bake.get('__sss'):
+        # the scatter tree rides a raw data texture, exactly the BI
+        # noise tables' mechanism: the SSS library declares the
+        # sampler, the plan binds the prepared texture by key
+        em.samplers.append({'uniform': 'hal_sss_tree',
+                            'image': bake['__sss']['key'],
+                            'raw': True})
     tex_fns = []
     tex_binds = {}
     tex_binds_mip = {}
@@ -1535,6 +2158,15 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
         sname = meta['uniform']
         key = meta.get('image')
         tex = (textures or {}).get(key)
+        if meta.get('raw'):
+            # an engine data texture (the BI noise tables): the shader
+            # declares the sampler itself and reads with texelFetch, so
+            # only the binding is needed here
+            if tex is None:
+                return None, f"engine table texture '{key}' is not " \
+                             'among the prepared textures'
+            tex_binds[sname] = key
+            continue
         if meta.get('code'):
             # coded-shader images sample with the scene's filter and REPEAT
             # wrap, exactly the SCtx the evaluator hands the program. A
@@ -1647,7 +2279,7 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     env_spec = consts.get('env')
     if env_spec and float(bake.get('reflect', 0.0)) > 1e-4:
         refl = float(bake.get('reflect', 0.0))    # raw, as surf.reflect is
-        rcol = _v3(bake.get('reflect_color', (1, 1, 1)))
+        rcol = _mv3(consts, bake.get('reflect_color', (1, 1, 1)))
         env_lines.append('    vec3 hal_R = reflect(-V, Nsurf);')
         if env_spec[0] in ('SKY_GRAD', 'SKY_BANDS'):
             env_lines += _sky_env_lines(env_spec)
@@ -1682,7 +2314,8 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
                     'hal_R.y * hal_R.y, 1e-12))) / 3.14159265358979 + 0.5);']
             env_lines.append('    vec3 hal_env = '
                              'hal_sample_hal_env_tex(hal_euv).rgb;')
-        env_lines.append(f'    total += hal_env * ({_f(refl)} * s.specular'
+        env_lines.append(f'    total += hal_env * '
+                         f'({_mv(consts, refl)} * s.specular'
                          f' * {rcol});')
 
     vlight_fns = ''
@@ -1712,6 +2345,32 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     shadows = shadows or [None] * len(lights)
     shadow_fns = []
     samplers = []
+    # ---- the BI panel round: ramps, the light group, spectra -- all
+    # read from the material's own node props, generated per material
+    bi_props = _bi_graph_props(graph)
+    bi_meta = {}
+    if bi_props and not vertex_rate:
+        rd = _bi_ramp_spec(bi_props, 'ramp_dif')
+        rs_ = _bi_ramp_spec(bi_props, 'ramp_spec')
+        need_spec_acc = (float(bake.get('bi_spectra', 0.0)) > 0.0
+                         or (rs_ is not None
+                             and rs_.get('input') == 'RESULT'))
+        result_mode = ((rd is not None and rd.get('input') == 'RESULT')
+                       or (rs_ is not None
+                           and rs_.get('input') == 'RESULT'))
+        bi_meta = {'ramp_dif': rd, 'ramp_spec': rs_,
+                   'need_spec_acc': need_spec_acc,
+                   'result_mode': result_mode,
+                   # R164: the sbias terminator fix rides per light
+                   'sbias': float(bi_props.get('sbias', 0.0) or 0.0),
+                   # R167: the RAYBIAS branch's twin (probe-granted)
+                   'raybias': bool(bake.get('__raybias'))}
+        if rd is not None:
+            shadow_fns.append(_colorband_glsl(
+                'hal_biband_dif', rd['stops'], rd.get('ipotype', 0)))
+        if rs_ is not None:
+            shadow_fns.append(_colorband_glsl(
+                'hal_biband_spec', rs_['stops'], rs_.get('ipotype', 0)))
     # CONSTANT / WIREFRAME: light_surface returns before the light loop,
     # the ambient term and every surface cheat -- full-bright albedo x
     # diffuse level, plus emission. The pass carries no lighting support
@@ -1719,6 +2378,29 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     # readback -- the CPU's own separable stage, fog-doctrine style).
     # env and rays stay: the CPU applies those AFTER light_surface.
     shadeless = bool(bake.get('__shadeless'))
+    if bake.get('__sss') and not vertex_rate and not shadeless:
+        # SSS replaces the accumulated diffuse AFTER all lights
+        # (shade_lamp_loop's block), so the pass rides the same
+        # separated dif/spec bookkeeping the RESULT ramps use, and the
+        # gather library joins the source
+        if not bi_meta:
+            bi_meta = {'ramp_dif': None, 'ramp_spec': None,
+                       'need_spec_acc': False, 'result_mode': True}
+        else:
+            bi_meta['result_mode'] = True
+        bi_meta['sss'] = bake['__sss']
+        shadow_fns.append(GS.SSS_GLSL)
+    # R164: BI's world Exposure corrects the accumulated DIFFUSE and
+    # SPEC separately before ambient/emit join -- every material rides
+    # the separated bookkeeping while it is active, non-BI included
+    _wexp = consts.get('world_exposure')
+    if _wexp and not vertex_rate and not shadeless:
+        if not bi_meta:
+            bi_meta = {'ramp_dif': None, 'ramp_spec': None,
+                       'need_spec_acc': False, 'result_mode': True}
+        else:
+            bi_meta['result_mode'] = True
+        bi_meta['exposure'] = _wexp
     if vertex_rate or shadeless:
         # the pass lights nothing, so it carries none of the lighting
         # support: no shadow taps, no BVH traversal, no AO -- for a
@@ -1774,11 +2456,17 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     if rad_field:
         shadow_fns.append(_rad_lookup_function(rad_spec, consts))
         samplers.append('hal_radfield')
+    mapped_shadow = False
     for i, smeta in enumerate(shadows):
         if smeta is not None:
             shadow_fns.append(_shadow_function(i, smeta, consts))
             if not smeta.get('ray'):
-                samplers.append(f'hal_shadow{i}')
+                mapped_shadow = True
+    if mapped_shadow:
+        # every mapped light reads the ONE combined atlas: eight
+        # per-light samplers put real materials at the driver's
+        # 16-sampler fragment cliff (the field's rejected compile)
+        samplers.append('hal_shadowpack')
     if not vertex_rate:
         # projected light textures: one lookup function per cookie light.
         # A vertex-rate pass skips them for the same reason it skips the
@@ -1808,7 +2496,23 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
             '    f.uv = hal_interp(f.tri, hal_idslin.rgb, 2).xy;\n'
             '    f.uv2 = hal_interp4(f.tri, hal_idslin.rgb, 2).zw;\n')
     normal_face = bool(consts.get('normal_face'))
-    needs_triaux = normal_face or bool(getattr(em, 'needs_triaux', False))
+    # R167: the RAYBIAS terminator twin reads the stored face normal
+    # (hal_triaux) and the per-tri Auto Smooth threshold (hal_sres) --
+    # frame passes only: a ray hit has no G-buffer triangle id. A
+    # SECONDARY pass emits a STUB instead (the correction omitted, the
+    # pass marked): the planner builds hit passes for every material
+    # whenever ray tracing is on, but runs them only when something
+    # reflective or refractive exists -- and only THEN does the stub
+    # refuse the plan by name. A mirror-free frame (the field frame)
+    # rides the GPU whole.
+    raybias_on = bool(bake.get('__raybias')) and bool(bi_meta.get('raybias'))
+    raybias_stub = False
+    if raybias_on and secondary:
+        raybias_on = False
+        raybias_stub = True
+        bi_meta['raybias'] = False
+    needs_triaux = normal_face or bool(getattr(em, 'needs_triaux', False)) \
+        or raybias_on
     triaux_fns = ''
     if needs_triaux:
         tcount = int(consts.get('tri_count', 0))
@@ -1826,6 +2530,34 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
             f'ti / {aside}), 0);\n'
             '}\n')
         samplers.append('hal_triaux')
+    if raybias_on:
+        tcount = int(consts.get('tri_count', 0))
+        if tcount <= 0:
+            return None, ('the per-tri smoothresh texture needs the '
+                          'triangle count the caller did not supply')
+        import math as _m2
+        sside = int(_m2.ceil(_m2.sqrt(float(max(tcount, 1)))))
+        triaux_fns += (
+            'uniform sampler2D hal_sres;\n'
+            'vec4 hal_sres_fetch(float i)\n'
+            '{\n'
+            f'    int si = int(i);\n'
+            f'    return texelFetch(hal_sres, ivec2(si % {sside}, '
+            f'si / {sside}), 0);\n'
+            '}\n')
+        samplers.append('hal_sres')
+    # R169: the per-light VALUE texture -- one row of texels the light
+    # loop fetches instead of baked literals, so lamp edits re-upload
+    # instead of recompiling (see LIGHT_TEXEL_STRIDE)
+    if lights and not (vertex_rate or shadeless) and \
+            bool(consts.get('light_texels', True)):
+        triaux_fns += (
+            'uniform sampler2D hal_lights;\n'
+            'vec4 hal_ltex(int t)\n'
+            '{\n'
+            '    return texelFetch(hal_lights, ivec2(t, 0), 0);\n'
+            '}\n')
+        samplers.append('hal_lights')
     if consts.get('stipple') and not secondary:
         # the Screen Door threshold map (see the composite below)
         samplers.append('hal_stipple')
@@ -1877,7 +2609,7 @@ void main()
 {{
     HalcyonFragment f = hal_read_gbuffer(vUV);
     vec4 td = hal_tri_data(max(f.tri, 0.0));
-    float keep = (f.covered && abs(td.x - {_f(mat_id)}) < 0.5) ? 1.0 : 0.0;
+    float keep = (f.covered && abs(td.x - {_mv(consts, mat_id)}) < 0.5) ? 1.0 : 0.0;
     // EARLY OUT on the ownership mask. Every material pass draws the
     // full screen; this shader used to shade EVERY pixel and multiply
     // by keep at the end -- harmless while shading was ALU, catastrophic
@@ -1903,8 +2635,11 @@ void main()
 """]
     if gen_line:
         parts.append(gen_line)
-    if 'hal_vcol' in src:
-        # three extra fetches, paid only by materials that read the paint
+    if 'hal_vcol' in src or any('hal_vcol' in str(v)
+                                for v in perpix_exprs.values()):
+        # three extra fetches, paid only by materials that read the
+        # paint -- including a Vertex Color Light emission term whose
+        # only vcol read lives in a per-pixel expression, not in src
         parts.append('    vec4 hal_vcol = hal_interp4(f.tri, f.bary, 3);\n')
     parts.append(src)
     # The order the CPU actually runs: the graph evaluates against the
@@ -1940,7 +2675,9 @@ void main()
         if name in perpix_exprs:
             lines.append(f'    s.{name} = {perpix_exprs[name]};')
         else:
-            lines.append(f'    s.{name} = {_f(bake.get(name, 0.0))};')
+            # R174: the whole surface struct rides the material texels
+            lines.append(f'    s.{name} = '
+                         f'{_mv(consts, bake.get(name, 0.0))};')
     lines += [
         # the same frame mathx.orthonormal_basis builds on the CPU -- and
         # from the same normal: shade_batch builds it from ctx.N, the bent
@@ -1977,10 +2714,10 @@ void main()
         sa = float(_np.sin(rot_baked * 2.0 * _np.pi))
         lines += [
             '    {',
-            f'    vec3 hal_t2 = s.tangent * {_f(ca)} + s.bitangent '
-            f'* {_f(sa)};',
-            f'    s.bitangent = normalize(s.tangent * {_f(-sa)} '
-            f'+ s.bitangent * {_f(ca)});',
+            f'    vec3 hal_t2 = s.tangent * {_mv(consts, ca)} '
+            f'+ s.bitangent * {_mv(consts, sa)};',
+            f'    s.bitangent = normalize(s.tangent * {_mv(consts, -sa)} '
+            f'+ s.bitangent * {_mv(consts, ca)});',
             '    s.tangent = normalize(hal_t2);',
             '    }',
         ]
@@ -1990,7 +2727,8 @@ void main()
         # surf.specular), and the diffuse is the CPU's untouched flat
         # constant -- the exact struct the CPU shades from
         lines += [
-            f'    s.diffuse = {_v3(bake.get("diffuse", (0.8, 0.8, 0.8)))};',
+            f'    s.diffuse = '
+            f'{_mv3(consts, bake.get("diffuse", (0.8, 0.8, 0.8)))};',
             f'    s.specular = {base};',
         ]
     else:
@@ -1998,7 +2736,8 @@ void main()
             f'    s.diffuse = {base};',
             (f'    s.specular = {perpix_exprs["specular"]};'
              if 'specular' in perpix_exprs else
-             f'    s.specular = {_v3(bake.get("specular", (1, 1, 1)))};'),
+             f'    s.specular = '
+             f'{_mv3(consts, bake.get("specular", (1, 1, 1)))};'),
         ]
     if vertex_rate:
         # Gouraud/flat: fetch the three CPU-lit corners of THIS pixel's
@@ -2026,16 +2765,26 @@ void main()
         # pre-pass gathered -- a texel fetch where the full mode walks
         # the BVH
         lines.append(f'    vec3 total = s.diffuse * (hal_rad_lookup()'
-                     f' * {_f(bake.get("ambient", 1.0))});')
+                     f' * {_mv(consts, bake.get("ambient", 1.0))});')
     elif rad_spec:
         # the Radiosity checkbox: gathered ambient replaces the flat
         # term, exactly light_surface's branch -- and plain AO with it
         lines.append(f'    vec3 total = s.diffuse * (hal_rad(P, N)'
-                     f' * {_f(bake.get("ambient", 1.0))});')
+                     f' * {_mv(consts, bake.get("ambient", 1.0))});')
+    elif int(model_index) >= 100:
+        # verbatim shade_lamp_loop (R155/R156): BI's flat ambient rule
+        # covers the WORLD pool only; the engine's Global Ambient stays
+        # diffuse-tinted, exactly light_surface's BI branch
+        eng = consts.get('ambient_engine', consts['ambient_color'])
+        wrld = consts.get('ambient_world', (0.0, 0.0, 0.0))
+        lines.append(
+            f'    vec3 total = s.diffuse * ({_v3(eng)}'
+            f' * {_mv(consts, bake.get("ambient", 1.0))})'
+            f' + {_v3(wrld)} * {_mv(consts, bake.get("ambient", 1.0))};')
     else:
         lines.append(
             f'    vec3 total = s.diffuse * ({_v3(consts["ambient_color"])}'
-            f' * {_f(bake.get("ambient", 1.0))});')
+            f' * {_mv(consts, bake.get("ambient", 1.0))});')
     if ao_spec and not rad_spec:
         # exactly light_surface's order: ambient occlusion scales the
         # ambient term (with the post-flip N) before any light adds
@@ -2044,10 +2793,109 @@ void main()
             and float(bake.get('sheen', 0.0)) > 1e-4:
         lines.append('    float hal_edge_vn = clamp(1.0 - abs(dot(N, V)), '
                      '0.0, 1.0);')
+    if bi_meta.get('need_spec_acc'):
+        lines.append('    vec3 hal_spec_acc = vec3(0.0);')
+    if bi_meta.get('result_mode'):
+        lines.append('    vec3 hal_dacc = vec3(0.0);')
+        lines.append('    vec3 hal_sacc = vec3(0.0);')
+    # R167: the RAYBIAS terminator twin's per-pixel inputs, once before
+    # the light loop -- light_surface's pc_smooth (the interpolated
+    # normal differs from the STORED face normal: the same texel FACE
+    # normal mode reads, the same bits the CPU's ctx.Ng carries) and
+    # pc_thresh (the object's Auto Smooth threshold, per triangle)
+    if raybias_on and not (vertex_rate or shadeless):
+        lines += [
+            '    float hal_pc_thr = hal_sres_fetch(max(f.tri, 0.0)).x;',
+            '    float hal_pc_sm = (abs(dot(hal_triaux_fetch('
+            'max(f.tri, 0.0)).xyz, N)) < (1.0 - 1e-6)) ? 1.0 : 0.0;']
+    # the material's Light Group (and other materials' EXCLUSIVE
+    # groups): a skipped lamp simply emits no block, per material --
+    # exactly light_surface's continue
+    bi_group = frozenset(bi_props.get('light_group_lights') or ()) \
+        if bi_props else frozenset()
+    excl_names = frozenset(consts.get('exclusive_lights') or ())
     for i, light in enumerate(() if (vertex_rate or shadeless)
                                else lights):
+        lname = getattr(light, 'name', None)
+        if bi_group:
+            if lname not in bi_group:
+                continue
+        elif excl_names and lname in excl_names:
+            continue
         lines += _one_light_source(i, light, consts,
-                                   shadowed=shadows[i], bake=bake)
+                                   shadowed=shadows[i], bake=bake,
+                                   bi=bi_meta)
+    if bi_meta.get('result_mode'):
+        # the RESULT ramps: band and blend the whole accumulation, then
+        # one clamp -- exactly light_surface's track_result tail
+        rd = bi_meta.get('ramp_dif')
+        if rd is not None and rd.get('input') == 'RESULT':
+            bidx = _ramp_blend_index(rd.get('blend', 'MIX'))
+            lines += [
+                '    float hal_drfac = dot(hal_dacc, '
+                'vec3(0.3, 0.58, 0.11));',
+                '    vec4 hal_bdr = hal_biband_dif(hal_drfac);',
+                f'    hal_dacc = hal_ramp_blend({bidx}, hal_dacc, '
+                f'hal_bdr.a * {_mv(consts, float(rd.get("factor", 1.0)))}, '
+                'hal_bdr.rgb);']
+        rs_ = bi_meta.get('ramp_spec')
+        if rs_ is not None and rs_.get('input') == 'RESULT':
+            bidx = _ramp_blend_index(rs_.get('blend', 'MIX'))
+            lines += [
+                '    float hal_srfac = dot(hal_sacc, '
+                'vec3(0.3, 0.58, 0.11));',
+                '    vec4 hal_bsr = hal_biband_spec(hal_srfac);',
+                f'    hal_sacc = hal_ramp_blend({bidx}, hal_sacc, '
+                f'hal_bsr.a * {_mv(consts, float(rs_.get("factor", 1.0)))}, '
+                'hal_bsr.rgb);']
+        if bi_meta.get('need_spec_acc'):
+            # spectra reads the POST-ramp accumulation, as the CPU's
+            # extras['spec_acc'] does
+            lines.append('    hal_spec_acc = hal_sacc;')
+        if bi_meta.get('sss'):
+            # shade_lamp_loop's SSS block: the gathered scatter
+            # REPLACES the accumulated diffuse, shaped by the material
+            # colour per sss_texfac (invalpha = 1/col[3], the pow
+            # midpoint) -- exactly light_surface's CPU tail
+            texfac = float(bi_meta['sss'].get('texfac', 0.0))
+            lines.append('    vec3 hal_sssrad = hal_sss_sample(P);')
+            lines.append('    float hal_sssia = '
+                         '(s.opacity > 1.1920929e-07) '
+                         '? 1.0 / s.opacity : 1.0;')
+            if texfac == 0.0:
+                col_expr = 's.diffuse * hal_sssia'
+            elif texfac == 1.0:
+                col_expr = 'vec3(hal_sssia)'
+            else:
+                col_expr = (f'pow(max(s.diffuse * hal_sssia, '
+                            f'vec3(0.0)), '
+                            f'vec3({_mv(consts, 1.0 - texfac)}))')
+            lines.append(f'    hal_dacc = hal_sssrad * ({col_expr});')
+        if bi_meta.get('exposure'):
+            # wrld_exposure_correct, the 2003 letters: diffuse total
+            # and spec separately, AFTER the SSS replacement, BEFORE
+            # ambient and emit join -- baked linfac/logfac constants
+            import numpy as _np
+            _we, _wr = bi_meta['exposure']
+            _lin = float(1.0 + (2.0 * float(_we) + 0.5) ** -10.0)
+            _log = float(_np.log((_lin - 1.0) / _lin)
+                         / (float(_wr) if abs(float(_wr)) > 1e-6
+                            else 1e-6))
+            lines += [
+                f'    hal_dacc = {_f(_lin)} * (vec3(1.0)'
+                f' - exp(hal_dacc * {_f(_log)}));',
+                f'    hal_sacc = {_f(_lin)} * (vec3(1.0)'
+                f' - exp(hal_sacc * {_f(_log)}));']
+            if bi_meta.get('need_spec_acc'):
+                # spectra reads the POST-exposure spec, as the CPU's
+                # extras['spec_acc'] does (assigned after the tail)
+                lines.append('    hal_spec_acc = hal_sacc;')
+        lines.append('    vec3 hal_lpart = hal_dacc + hal_sacc;')
+        clamp_l = float(consts.get('light_clamp', 0.0))
+        if clamp_l > 0.0:
+            lines.append(f'    hal_lpart = min(hal_lpart, '
+                         f'vec3({_f(clamp_l)}));')
+        lines.append('    total += hal_lpart;')
     if not vertex_rate and not shadeless \
             and consts.get('clamp_specular', True):
         lines.append('    total = min(total, vec3(64.0));')
@@ -2057,7 +2905,7 @@ void main()
                 f'    total = total + {perpix_exprs["emission"]};')
         else:
             lines.append(f'    total = total + '
-                         f'{_v3(bake.get("emission", (0, 0, 0)))};')
+                         f'{_mv3(consts, bake.get("emission", (0, 0, 0)))};')
     # the era's silhouette cheats, exactly as apply_surface_effects: applied
     # after emission, outside the reflectance model, the same on every model
     if not vertex_rate and not shadeless and \
@@ -2069,15 +2917,18 @@ void main()
             and float(bake.get('fresnel', 0.0)) > 1e-4:
         fp = max(float(bake.get('fresnel_power', 3.0)), 0.01)
         lines.append(
-            f'    total += {_v3(bake.get("fresnel_color", (1, 1, 1)))}'
-            f' * (pow(hal_sil, {_f(fp)}) * {_f(bake["fresnel"])}'
-            f' * {_f(bake.get("specular_level", 0.5))});')
+            f'    total += '
+            f'{_mv3(consts, bake.get("fresnel_color", (1, 1, 1)))}'
+            f' * (pow(hal_sil, {_mv(consts, fp)})'
+            f' * {_mv(consts, bake["fresnel"])}'
+            f' * {_mv(consts, bake.get("specular_level", 0.5))});')
     if not vertex_rate and not shadeless \
             and float(bake.get('rim', 0.0)) > 1e-4:
         rp = max(float(bake.get('rim_power', 3.0)), 0.01)
         lines.append(
-            f'    total += {_v3(bake.get("rim_color", (1, 1, 1)))}'
-            f' * (pow(hal_sil, {_f(rp)}) * {_f(bake["rim"])});')
+            f'    total += {_mv3(consts, bake.get("rim_color", (1, 1, 1)))}'
+            f' * (pow(hal_sil, {_mv(consts, rp)})'
+            f' * {_mv(consts, bake["rim"])});')
     # matcap: the whole lit result lerps toward one colour, exactly as
     # apply_surface_effects -- after fresnel and rim, before the backface
     mk = min(max(float(bake.get('matcap_blend', 0.0)), 0.0), 1.0)
@@ -2085,9 +2936,9 @@ void main()
         mk = 0.0            # in the corners already / never applied
     if mk > 1e-4:
         mc = perpix_exprs.get('matcap',
-                              _v3(bake.get('matcap', (0, 0, 0))))
-        lines.append(f'    total = total * {_f(1.0 - mk)} + '
-                     f'({mc}) * {_f(mk)};')
+                              _mv3(consts, bake.get('matcap', (0, 0, 0))))
+        lines.append(f'    total = total * {_mv(consts, 1.0 - mk)} + '
+                     f'({mc}) * {_mv(consts, mk)};')
     # the backface override: the rasteriser decides front by projected
     # winding, and for a perspective camera that is exactly the plane-side
     # test against the eye -- computed from the corner positions the
@@ -2105,10 +2956,29 @@ void main()
             'hal_fetch_attr(f.tri, 2, 0).xyz - hal_bf_p0);',
             '    float hal_backfacing = '
             '(dot(hal_bf_pl, hal_eye - hal_bf_p0) < 0.0) ? 0.0 : 1.0;',
-            f'    float hal_bk = {_f(kb)} * hal_backfacing;',
+            f'    float hal_bk = {_mv(consts, kb)} * hal_backfacing;',
             '    total = total * (1.0 - hal_bk) + '
-            f'{_v3(bake.get("backface_color", (0, 0, 0)))} * hal_bk;',
+            f'{_mv3(consts, bake.get("backface_color", (0, 0, 0)))}'
+            ' * hal_bk;',
         ]
+    # R164: MA_OBCOLOR modulates the WHOLE combined at the very end of
+    # shade_lamp_loop -- an unrolled ladder over the objects whose
+    # colour is not white, selected by the G-buffer's own object id
+    # (td.y), exactly the light-linking ladder's mechanism
+    _obc = bake.get('__obcolor')
+    if _obc and not vertex_rate and not shadeless:
+        sel = ' + '.join(
+            f'((abs(td.y - {_f(float(oi))}) < 0.5)'
+            f' ? {_v3(c)} : vec3(0.0))'
+            for oi, c in _obc)
+        anyhit = ' + '.join(
+            f'((abs(td.y - {_f(float(oi))}) < 0.5) ? 1.0 : 0.0)'
+            for oi, c in _obc)
+        lines += [
+            f'    float hal_obhit = min({anyhit}, 1.0);',
+            f'    vec3 hal_obc = ({sel})'
+            ' + vec3(1.0 - hal_obhit);',
+            '    total = total * hal_obc;']
     lines += env_lines
     if layer:
         # a TRANSPARENT LAYER writes its real alpha -- the same chain
@@ -2119,8 +2989,24 @@ void main()
         # composites them under ALPHA_PREMULT, which for disjoint
         # writes IS that sum)
         aexpr = perpix_exprs.get('opacity',
-                                 _f(float(bake.get('opacity', 1.0))))
+                                 _mv(consts,
+                                     float(bake.get('opacity', 1.0))))
         lines.append(f'    float hal_alpha = clamp({aexpr}, 0.0, 1.0);')
+        if abs(float(bake.get('bi_transp_fresnel', 0.0))) > 0.0:
+            # Transparency > Fresnel REPLACES the alpha slider, exactly
+            # shade_batch's chain (and 2.79's)
+            lines.append(
+                '    hal_alpha = clamp(hal_bi_fresnel_fac('
+                '-dot(Nsurf, V), s.bi_transp_blend, '
+                's.bi_transp_fresnel), 0.0, 1.0);')
+        if float(bake.get('bi_spectra', 0.0)) > 0.0 and \
+                bi_meta.get('need_spec_acc'):
+            # Transparency > Specular: highlights turn opaque
+            lines += [
+                '    float hal_spt = clamp(max(hal_spec_acc.r, '
+                'max(hal_spec_acc.g, hal_spec_acc.b)) * s.bi_spectra, '
+                '0.0, 1.0);',
+                '    hal_alpha = (1.0 - hal_spt) * hal_alpha + hal_spt;']
         thr = float(consts.get('alpha_threshold', 0.0))
         if thr > 0.0:
             lines.append(f'    hal_alpha = (hal_alpha >= {_f(thr)}) '
@@ -2133,9 +3019,10 @@ void main()
                 # two-sided flip (abs() makes the flip moot) -- so a
                 # Normal-Map material's silhouette matches: Nsurf, not N0
                 '    float hal_eo_f = clamp(abs(dot(Nsurf, V)), 0.0, 1.0);',
-                f'    float hal_eo_t = pow(1.0 - hal_eo_f, {_f(fp)});',
+                f'    float hal_eo_t = pow(1.0 - hal_eo_f, '
+                f'{_mv(consts, fp)});',
                 '    hal_alpha = clamp(hal_alpha * (1.0 - hal_eo_t) + '
-                f'{_f(eo)} * hal_eo_t, 0.0, 1.0);',
+                f'{_mv(consts, eo)} * hal_eo_t, 0.0, 1.0);',
             ]
         lines.append('    Color = vec4(total * keep, hal_alpha * keep);')
     elif consts.get('stipple') and not secondary:
@@ -2151,7 +3038,8 @@ void main()
         # (rgb shaded, alpha 0/1) split. Ray HITS never stipple: the
         # CPU gates on ctx.px, which a hit does not have.
         aexpr = perpix_exprs.get('opacity',
-                                 _f(float(bake.get('opacity', 1.0))))
+                                 _mv(consts,
+                                     float(bake.get('opacity', 1.0))))
         lines.append(f'    float hal_alpha = clamp({aexpr}, 0.0, 1.0);')
         thr = float(consts.get('alpha_threshold', 0.0))
         if thr > 0.0:
@@ -2172,11 +3060,20 @@ void main()
         lines.append('    Color = vec4(total, 1.0) * keep;')
     lines.append('}')
     parts.append('\n'.join(lines))
-    info = {'samplers': samplers
-            + (['hal_vlight'] if vlight_spec is not None else [])
-            + sorted(tex_binds) + sorted(tex_binds_mip)
-            + (['hal_uvgrad'] if needs_uvgrad else [])
-            + [p[0] for p in prepasses],
+    all_samplers = (samplers
+                    + (['hal_vlight'] if vlight_spec is not None else [])
+                    + sorted(tex_binds) + sorted(tex_binds_mip)
+                    + (['hal_uvgrad'] if needs_uvgrad else [])
+                    + [p[0] for p in prepasses])
+    if len(all_samplers) + 3 > 16:
+        # the three G-buffer samplers ride every pass; 16 is the
+        # fragment-sampler floor real drivers guarantee. Refusing HERE,
+        # by name and by count, beats the field's alternative: the
+        # driver rejecting the compile with 'Shader Compile Error' and
+        # the whole frame silently falling back
+        return None, (f'needs {len(all_samplers) + 3} texture samplers; '
+                      'drivers guarantee 16')
+    info = {'samplers': all_samplers,
             'textures': tex_binds,
             'textures_mip': tex_binds_mip,
             'needs_uvgrad': bool(needs_uvgrad),
@@ -2188,4 +3085,38 @@ void main()
             or any(p[2].get('uses_screen') for p in prepasses)}
     if vlight_spec is not None:
         info['vlight'] = vlight_spec
-    return ''.join(parts), info
+    if raybias_stub:
+        # this hit pass is INCOMPLETE (Ray Bias omitted): valid to
+        # build, fatal to run -- the planner refuses by name if any
+        # reflective or refractive material would execute it
+        info['raybias_secondary_stub'] = True
+    src = ''.join(parts)
+    if consts.get('__mark_values'):
+        # R174: pull every marked material VALUE out of the source and
+        # into the hal_mats texture row this pass will be handed
+        # (hal_mrow). Two materials with the same STRUCTURE now produce
+        # byte-identical sources -- one driver compile serves them all,
+        # and a slider drag re-uploads a texel row instead of
+        # recompiling. The values are the same float32 bits either way.
+        src, mvals = _lift_marked_values(src)
+        if 'hal_MV(' in src:
+            # cannot happen by construction; refusing beats handing the
+            # driver an undefined symbol
+            return None, ('internal: a material-value marker survived '
+                          'the lift')
+        if mvals:
+            if len(all_samplers) + 4 > 16:
+                return None, (f'needs {len(all_samplers) + 4} texture '
+                              'samplers; drivers guarantee 16')
+            decl = ('uniform sampler2D hal_mats;\n'
+                    'uniform float hal_mrow;\n'
+                    'float hal_mv(int t)\n'
+                    '{\n'
+                    '    return texelFetch(hal_mats, '
+                    'ivec2(t, int(hal_mrow)), 0).r;\n'
+                    '}\n')
+            src = src.replace('void main()', decl + 'void main()', 1)
+            info['samplers'] = list(info['samplers']) + ['hal_mats']
+            info['frame_uniforms'] = list(frame_unis) + ['hal_mrow']
+            info['mat_values'] = mvals
+    return src, info

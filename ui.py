@@ -219,14 +219,19 @@ def _version():
 
 class HALCYON_OT_fix_view_transform(Operator):
     bl_idname = 'halcyon.fix_view_transform'
-    bl_label = "Set View Transform to Standard"
-    bl_description = ("Halcyon hands Blender pixels that are already "
-                      "display-referred; a second view transform double-applies")
+    bl_label = "Disable Blender's Color Management (Raw)"
+    bl_description = ("Halcyon's output is display-referred and this panel "
+                      "is its whole grading chain. ANY Blender view "
+                      "transform regrades it a second time -- even "
+                      "'Standard', which encodes for scene-linear data "
+                      "and washes the render grey. Raw shows the "
+                      "engine's pixels untouched")
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        context.scene.view_settings.view_transform = 'Standard'
-        self.report({'INFO'}, "View transform set to Standard")
+        from .engine import _pin_display
+        _pin_display(context.scene)
+        self.report({'INFO'}, "Blender color management disabled (Raw)")
         return {'FINISHED'}
 
 
@@ -368,6 +373,9 @@ class HALCYON_PT_shading(HalcyonPanel, Panel):
         col.prop(hs, 'shading_rate')
         col.prop(hs, 'default_model')
         col.prop(hs, 'force_model')
+        col.prop(hs, 'material_override')
+        if str(getattr(hs, 'material_override', 'NONE')) != 'NONE':
+            col.prop(hs, 'override_color')
         col.prop(hs, 'normal_source')
         col.prop(hs, 'displacement_scale')
         col.separator()
@@ -388,11 +396,23 @@ class HALCYON_PT_lighting(HalcyonPanel, Panel):
         col.prop(hs, 'global_ambient')
         col.prop(hs, 'global_ambient_level')
         col.separator()
+        col.prop(hs, 'sss', text="Subsurface Scattering")
+        col.separator()
         col.prop(hs, 'max_lights')
         sub = col.column()
         sub.active = hs.max_lights > 0
         sub.prop(hs, 'light_limit_mode')
         col.prop(hs, 'light_falloff_default')
+        # the repair for lamps brought in via plain File > Append:
+        # Blender's own append converts 2.79 energies to its modern
+        # units (every sun arrives at 1.0 W). The watch stamps the
+        # classic file's OWN values back on automatically the moment
+        # they arrive; the button does the same by hand for scenes
+        # appended before the watch existed (or with it off)
+        col.separator()
+        col.prop(hs, 'auto_fix_appended_lamps',
+                 text="Auto-Fix Appended Lamps")
+        col.operator('halcyon.fix_appended_lamps', icon='LIGHT')
 
 
 class HALCYON_PT_spot_cones(HalcyonPanel, Panel):
@@ -685,17 +705,20 @@ class HALCYON_PT_display(HalcyonPanel, Panel):
     def draw(self, context):
         layout = self.layout
         view = getattr(context.scene, 'view_settings', None)
-        if view is not None and getattr(view, 'view_transform', 'Standard') \
-                not in ('Standard', 'Raw'):
+        if view is not None and getattr(view, 'view_transform', 'Raw') \
+                != 'Raw':
             box = layout.box()
             box.alert = True
             box.label(text=f"Blender's view transform is "
                            f"{view.view_transform}", icon='ERROR')
             col = box.column(align=True)
             col.scale_y = 0.8
-            for line in _wrap("Halcyon already outputs display-referred pixels, "
-                              "so a second transform on top will wash them out. "
-                              "Set it to Standard.", 44):
+            for line in _wrap("Blender's color management regrades "
+                              "Halcyon's display-referred output -- even "
+                              "Standard washes it grey. This panel is the "
+                              "engine's own grading; Blender's should be "
+                              "Raw (the engine pins it on the next "
+                              "update).", 44):
                 col.label(text=line)
             box.operator('halcyon.fix_view_transform', icon='FILE_REFRESH')
             layout.separator()
@@ -808,6 +831,7 @@ class HALCYON_PT_performance(HalcyonPanel, Panel):
         row.label(text=f"{_cpu_count()} logical cores detected", icon='INFO')
         col.separator()
         col.prop(hs, 'preview_scale')
+        col.prop(hs, 'orbit_scale')
 
 
 
@@ -1113,6 +1137,9 @@ def material_state(mat):
         for node in mat.node_tree.nodes:
             if node.bl_idname == 'HALCYON_ShaderNode':
                 return node.model, True
+            if node.bl_idname == 'HALCYON_BIMaterialNode':
+                return ('CONSTANT' if node.shadeless else
+                        f'BI {node.diff_shader}/{node.spec_shader}'), True
         for node in mat.node_tree.nodes:
             if node.bl_idname == 'HALCYON_CodeNode':
                 return 'CODED', True
@@ -1419,7 +1446,8 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
         hs = mat.halcyon
 
         has_master = bool(_uses_nodes(mat) and mat.node_tree and any(
-            n.bl_idname == 'HALCYON_ShaderNode' for n in mat.node_tree.nodes))
+            n.bl_idname in ('HALCYON_ShaderNode', 'HALCYON_BIMaterialNode')
+            for n in mat.node_tree.nodes))
         box = layout.box()
         row = box.row()
         row.label(text="Halcyon Shader" if has_master else "Convert Material",
@@ -1536,6 +1564,8 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
         row.prop(hs, 'specular_only')
         col.prop(hs, 'negative')
         col.prop(hs, 'ambient_only')
+        if light.type == 'SUN':
+            col.prop(hs, 'hemi')
         col.prop(hs, 'volumetric')
         col.separator()
         col.prop(hs, 'exclude_collection')
@@ -2144,6 +2174,11 @@ class HALCYON_PT_world(HalcyonPanel, Panel):
         col.label(text="Ambient")
         col.prop(hs, 'ambient')
         col.prop(hs, 'ambient_level')
+        col.separator()
+        col.label(text="Exposure (Blender Internal)")
+        row = col.row(align=True)
+        row.prop(hs, 'exposure')
+        row.prop(hs, 'exposure_range', text="Range")
 
 
 class HALCYON_PT_world_clouds(HalcyonPanel, Panel):

@@ -19,6 +19,66 @@ from .core import stats as ST
 _RENDER_SERIAL = {'n': 0}
 
 
+#: one-shot latches for the pin warnings, per session
+_PIN_FAILED = {}
+
+
+def _pin_display(scene):
+    """Blender's color management is OFF under Halcyon.
+
+    The engine is display-referred: its Display settings (exposure,
+    gamma, presets, the CRT chain) are the ONLY grading. Any view
+    transform regrades the output a second time -- AgX crushed the
+    field's 2%% sheens into a flat black body, and 'Standard' turned
+    out to be an sRGB encode for scene-linear data that washed every
+    render grey. 'Raw' passes the numbers straight to the screen, and
+    the engine pins it on every render and viewport update while it
+    is the active engine, so no preset or new file drifts back."""
+    scene = getattr(scene, 'original', None) or scene
+    try:
+        vs = scene.view_settings
+        if getattr(vs, 'view_transform', None) != 'Raw':
+            try:
+                vs.view_transform = 'Raw'
+            except (TypeError, ValueError):
+                # a build whose OCIO config renamed/removed 'Raw': say
+                # so ONCE, loudly -- the field's 'still extremely dark'
+                # is exactly what an unpinned AgX looks like, and a
+                # silent pass here hid it
+                if not _PIN_FAILED.get('said'):
+                    _PIN_FAILED['said'] = True
+                    have = []
+                    try:
+                        prop = vs.bl_rna.properties['view_transform']
+                        have = [i.identifier for i in prop.enum_items]
+                    except Exception:                       # noqa: BLE001
+                        pass
+                    print("[Halcyon] WARNING: this Blender build refused "
+                          "view_transform 'Raw'"
+                          + (f' (available: {have})' if have else '')
+                          + ' -- Blender will REGRADE every Halcyon '
+                          'render. Pick the closest pass-through '
+                          'transform manually in Render Properties > '
+                          'Color Management.')
+        if getattr(vs, 'look', 'None') != 'None':
+            try:
+                vs.look = 'None'
+            except (TypeError, ValueError):
+                pass
+        if getattr(vs, 'exposure', 0.0) != 0.0:
+            vs.exposure = 0.0
+        if getattr(vs, 'gamma', 1.0) != 1.0:
+            vs.gamma = 1.0
+    except Exception:                                           # noqa: BLE001
+        pass
+    try:
+        ds = scene.display_settings
+        if getattr(ds, 'display_device', 'sRGB') != 'sRGB':
+            ds.display_device = 'sRGB'
+    except Exception:                                           # noqa: BLE001
+        pass
+
+
 class HalcyonRenderEngine(bpy.types.RenderEngine):
     bl_idname = 'HALCYON_RENDER'
     bl_label = "Halcyon"
@@ -61,13 +121,23 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
         self._vp = None
 
     def __del__(self):
-        vp = getattr(self, '_vp', None)
-        if vp is not None:
-            vp.abort = True
+        # Blender frees the engine's StructRNA before Python collects
+        # the wrapper, and then ANY attribute access raises
+        # ReferenceError ('StructRNA of type HalcyonRenderEngine has
+        # been removed') as console noise. Teardown here is
+        # best-effort: reach the abort flag if the wrapper still
+        # works, stay silent if it does not.
+        try:
+            vp = getattr(self, '_vp', None)
+            if vp is not None:
+                vp.abort = True
+        except BaseException:                                   # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------ final render
     def render(self, depsgraph):
         bscene = depsgraph.scene
+        _pin_display(bscene)
         tw, th = self._target_size(bscene)
         preview = bool(getattr(self, 'is_preview', False))
         settings = _settings_from_scene(bscene, tw, th, preview)
@@ -116,6 +186,22 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
         print(f"[Halcyon] {version_string()} rendering "
               f"{tw}x{th}  pass={settings.debug_pass}"
               f"  wire={wire}")
+        # the display truth, every render: if Blender is still regrading
+        # (the pin refused, or something re-set it between the pin and
+        # now), the console says so INSTEAD of the picture silently
+        # coming out dark or washed
+        try:
+            _orig = getattr(bscene, 'original', None) or bscene
+            _vt = str(getattr(_orig.view_settings, 'view_transform', '?'))
+            _lk = str(getattr(_orig.view_settings, 'look', 'None'))
+            if _vt != 'Raw' or _lk not in ('None', 'NONE'):
+                print(f"[Halcyon] WARNING: view transform is '{_vt}' "
+                      f"(look '{_lk}') -- Blender is regrading this "
+                      "render on top of Halcyon's own display "
+                      "settings. It will look darker or washed "
+                      "compared to the engine's true output.")
+        except Exception:                                   # noqa: BLE001
+            pass
         self.update_stats("Halcyon", "Exporting scene")
         ST.reset()
         ST.enable(bool(settings.show_stats))
@@ -130,6 +216,27 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             if not preview:
                 self.report({'ERROR'}, f"Halcyon export failed: {exc}")
             return
+        if not preview:
+            _es = getattr(export, 'EXPORT_SPLIT', None) or {}
+            if _es.get('total_ms'):
+                _cc = int(_es.get('cached', 0))
+                _dup = int(_es.get('cached_dup', 0))
+                _dirt = ''
+                if _es.get('dirt_all'):
+                    _dirt = f", dirt ALL({_es['dirt_all']})"
+                elif _es.get('dirt_n'):
+                    _dirt = f", dirt {int(_es['dirt_n'])}u"
+                print('[Halcyon] export split: '
+                      f"meshes {int(_es.get('meshes', 0))}x "
+                      f"{_es.get('mesh_ms', 0.0):.0f} ms"
+                      + (f" ({_cc} cached"
+                         + (f", {_dup} dup" if _dup else '')
+                         + f" {_es.get('cached_ms', 0.0):.0f} ms)"
+                         if _cc else '') + _dirt + ', '
+                      f"materials {int(_es.get('mats', 0))}x "
+                      f"{_es.get('mat_ms', 0.0):.0f} ms, "
+                      f"concat {_es.get('concat_ms', 0.0):.0f} ms, "
+                      f"other {_es.get('other_ms', 0.0):.0f} ms")
 
         # the device plan needs the exported scene, so it runs after the export
         # rather than before it, where `scene` did not yet exist -- the
@@ -410,7 +517,11 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                 [final, np.ones(final.shape[:2] + (1,), np.float32)], axis=2)
         if final.shape[0] != h or final.shape[1] != w:
             final = post.fit_to(final, (w, h))
-        final = np.nan_to_num(final, nan=0.0, posinf=1.0, neginf=0.0)
+        # scrub non-finite values only when any exist: nan_to_num
+        # unconditionally rewrote 10M floats per delivered frame, and a
+        # finished frame is finite in every ordinary render
+        if not np.isfinite(final).all():
+            final = np.nan_to_num(final, nan=0.0, posinf=1.0, neginf=0.0)
 
         result = self.begin_result(0, 0, w, h)
         try:
@@ -419,7 +530,10 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             layer = result.layers[0].passes["Combined"]
             # Both buffers are bottom-row-first: the rasteriser maps NDC y = -1
             # to row 0, and Blender's rect expects the bottom row first.
-            flat = np.ascontiguousarray(final.reshape(-1, 4))
+            # ONE flat float32 buffer: foreach_set's single-memcpy fast
+            # path wants an unambiguous 1-D typed buffer; anything it
+            # has to iterate is 10M Python float conversions
+            flat = np.ascontiguousarray(final, np.float32).reshape(-1)
             expected = w * h * 4
             if flat.size != expected:                    # belt and braces
                 flat = np.resize(flat, expected)
@@ -427,6 +541,11 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                 layer.rect.foreach_set(flat)
             except Exception:                                   # noqa: BLE001
                 layer.rect = flat.reshape(-1, 4).tolist()
+            try:
+                from . import fault_note
+                fault_note(f'F12 render delivered ({w}x{h})', key='f12')
+            except Exception:                                   # noqa: BLE001
+                pass
         finally:
             self.end_result(result)
 
@@ -444,12 +563,54 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
     def view_update(self, context, depsgraph):
         vp = self._viewport()
         try:
+            _pin_display(depsgraph.scene)
+        except Exception:                                       # noqa: BLE001
+            pass
+        try:
             region = getattr(context, 'region', None)
             w = int(getattr(region, 'width', 0) or 0) or 640
             h = int(getattr(region, 'height', 0) or 0) or 480
             settings = _viewport_settings(depsgraph.scene, w, h)
+            kind = _classify_updates(depsgraph) if vp.has_scene() \
+                else 'full'
+            if kind == 'none':
+                # nothing renderable changed: keep the parked export.
+                # Blender fires view_update for EVERY depsgraph poke --
+                # selections, UI state, other add-ons' timers -- and the
+                # field runs several add-ons that poke constantly. Each
+                # poke was a full 100-object re-export (~2 s on the real
+                # file) followed by a draft+refine cascade; the session
+                # read as 'incredibly laggy' while standing still.
+                # Settings edits still land (the cheap half), and a
+                # same-settings poke costs nothing at all
+                vp.set_settings(settings)
+                self.tag_redraw()
+                return
+            if kind == 'lights':
+                # a light moved or changed its values: re-export the
+                # LIGHTS ONLY into a shallow next scene that shares the
+                # meshes, materials and images with the parked export.
+                # Dragging a lamp used to run the full main-thread
+                # re-export (~2 s on the field's file) EVERY drag tick
+                # -- 'Blender will freeze up' -- for data no lamp can
+                # change. Sharing the objects also keeps every identity
+                # cache warm downstream (BVH, textures, shadow maps).
+                try:
+                    scene = export.export_lights_into(vp.scene,
+                                                      depsgraph)
+                    vp.set_scene(scene, settings)
+                    self.tag_redraw()
+                    return
+                except Exception:                               # noqa: BLE001
+                    pass                    # fall through: full export
             scene = export.export_scene(depsgraph, settings)
             vp.set_scene(scene, settings)
+            try:
+                from . import fault_note
+                fault_note('viewport export delivered to the worker',
+                           key='vp-export')
+            except Exception:                                   # noqa: BLE001
+                pass
         except Exception:                                       # noqa: BLE001
             import traceback
             vp.complain('the viewport export failed',
@@ -495,6 +656,21 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             self.bind_display_space_shader(depsgraph.scene)
             _draw_texture(tex, w, h)
             self.unbind_display_space_shader()
+            # the redraw completed: advance the screen grave's clock --
+            # the ONLY thing that retires replaced blit textures and
+            # evicted blit batches (readback epochs cannot; see
+            # device.bury_screen)
+            try:
+                from .gpu import device as _dev
+                _dev.draw_tick()
+            except Exception:                                   # noqa: BLE001
+                pass
+            try:
+                from . import fault_note
+                fault_note('viewport frame drawn to screen',
+                           key='vp-blit', limit=3)
+            except Exception:                                   # noqa: BLE001
+                pass
         except Exception:                                       # noqa: BLE001
             import traceback
             vp.complain('drawing the viewport frame failed',
@@ -505,6 +681,67 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             from .preview import Viewport
             self._vp = Viewport()
         return self._vp
+
+
+#: datablock type names whose update means the EXPORT is stale. Anything
+#: else (Screen, WindowManager, Scene pokes with no geometry flag,
+#: another add-on's property churn) re-renders at most, never re-exports.
+_RENDER_ID_TYPES = frozenset((
+    'Object', 'Mesh', 'Curve', 'SurfaceCurve', 'TextCurve', 'MetaBall',
+    'Material', 'Light', 'World', 'Image', 'Armature', 'Lattice',
+    'GreasePencil', 'Volume', 'PointCloud', 'Collection', 'Key',
+))
+
+
+#: light DATA arrives as its concrete subclass -- type(uid).__name__ is
+#: 'SunLight', never 'Light' -- so the generic name alone never matched
+_LIGHT_ID_TYPES = frozenset((
+    'Light', 'SunLight', 'PointLight', 'SpotLight', 'AreaLight',
+))
+
+
+def _classify_updates(depsgraph):
+    """'none' | 'lights' | 'full' -- what this depsgraph poke invalidates.
+
+    'lights' means every render-relevant update is a lamp: light data
+    (colour, energy, spot angle -- arriving as the concrete subclass,
+    SunLight et al) or a light OBJECT's transform. Those re-export
+    through the cheap lights-only path; anything else that touches the
+    render re-exports fully, and pure UI churn not at all."""
+    try:
+        ups = list(getattr(depsgraph, 'updates', ()) or ())
+    except Exception:                                           # noqa: BLE001
+        return 'full'
+    if not ups:
+        # no update list at all: assume the worst, export
+        return 'full'
+    touched = False
+    lights_only = True
+    for u in ups:
+        uid = getattr(u, 'id', None)
+        tname = type(uid).__name__ if uid is not None else ''
+        if tname in _LIGHT_ID_TYPES:
+            touched = True
+            continue
+        if tname == 'Object' and getattr(uid, 'type', '') == 'LIGHT':
+            touched = True
+            continue
+        if tname in _RENDER_ID_TYPES:
+            touched = True
+            lights_only = False
+            continue
+        if getattr(u, 'is_updated_geometry', False) or \
+                getattr(u, 'is_updated_transform', False):
+            touched = True
+            lights_only = False
+    if not touched:
+        return 'none'
+    return 'lights' if lights_only else 'full'
+
+
+def _updates_touch_render(depsgraph):
+    """True when a depsgraph update invalidates the exported scene."""
+    return _classify_updates(depsgraph) != 'none'
 
 
 class _Cancelled(Exception):
@@ -613,6 +850,19 @@ def _view_camera(context):
         clip_end=float(getattr(space, 'clip_end', 1000.0) or 1000.0))
 
 
+#: the viewport blit batches, cached per region size FOR THE SESSION. A
+#: batch built per REDRAW died at function exit with its draw still
+#: queued in Blender's Vulkan render graph (executed at the swap, later)
+#: -- dead geometry in the barrier walk, the field's first crashlog. It
+#: also explains why the crash never cared whether materials planned
+#: onto the GPU: this blit runs on every rendered-view redraw
+#: regardless. Burying the old batch on every size change was the
+#: weaker successor of the same mistake -- draft and refine ALTERNATE
+#: sizes several times a second, so the graveyard was fed screen-drawn
+#: geometry continuously. Sizes in a session are few; every one is kept.
+_BLIT = {'batches': {}}
+
+
 def _draw_texture(tex, w, h):
     """Blit a texture over the region.
 
@@ -625,10 +875,21 @@ def _draw_texture(tex, w, h):
     import gpu
     from gpu_extras.batch import batch_for_shader
     shader = gpu.shader.from_builtin('IMAGE')
-    batch = batch_for_shader(
-        shader, 'TRI_STRIP',
-        {'pos': ((0, 0), (w, 0), (0, h), (w, h)),
-         'texCoord': ((0, 0), (1, 0), (0, 1), (1, 1))})
+    batches = _BLIT['batches']
+    batch = batches.get((w, h))
+    if batch is None:
+        batch = batch_for_shader(
+            shader, 'TRI_STRIP',
+            {'pos': ((0, 0), (w, 0), (0, h), (w, h)),
+             'texCoord': ((0, 0), (1, 0), (0, 1), (1, 1))})
+        if len(batches) >= 16:
+            # a continuously resized viewport: the eldest sizes park in
+            # the SCREEN grave (redraw-clocked), never freed while their
+            # draws can still be queued
+            from .gpu import device as _dev
+            for k in list(batches)[:8]:
+                _dev.bury_screen(batches.pop(k))
+        batches[(w, h)] = batch
     gpu.state.blend_set('ALPHA_PREMULT')
     try:
         shader.uniform_sampler('image', tex)
@@ -735,9 +996,38 @@ def disable_compatible_panels():
     _patched.clear()
 
 
+try:
+    from bpy.app.handlers import persistent as _persistent
+except Exception:                                               # noqa: BLE001
+    def _persistent(f):
+        return f
+
+
+@_persistent
+def _pin_display_handler(*_args):
+    """Main-thread pin: render()/view_update see EVALUATED scenes,
+    where writes may not stick. This runs on depsgraph updates and
+    file loads and pins the ORIGINAL whenever Halcyon is active."""
+    try:
+        for scene in bpy.data.scenes:
+            if getattr(scene.render, 'engine', '') == 'HALCYON_RENDER':
+                _pin_display(scene)
+    except Exception:                                           # noqa: BLE001
+        pass
+
+
 def register():
     bpy.utils.register_class(HalcyonRenderEngine)
     enable_compatible_panels()
+    try:
+        import bpy.app.handlers as _h
+        if _pin_display_handler not in _h.depsgraph_update_post:
+            _h.depsgraph_update_post.append(_pin_display_handler)
+        if _pin_display_handler not in _h.load_post:
+            _h.load_post.append(_pin_display_handler)
+        _pin_display_handler()             # the already-open file too
+    except Exception:                                           # noqa: BLE001
+        pass
 
 
 def unregister():
@@ -747,6 +1037,13 @@ def unregister():
     except Exception:                                           # noqa: BLE001
         pass
     disable_compatible_panels()
+    try:
+        import bpy.app.handlers as _h
+        for hl in (_h.depsgraph_update_post, _h.load_post):
+            if _pin_display_handler in hl:
+                hl.remove(_pin_display_handler)
+    except Exception:                                           # noqa: BLE001
+        pass
     try:
         bpy.utils.unregister_class(HalcyonRenderEngine)
     except Exception:                                           # noqa: BLE001

@@ -53,6 +53,12 @@ DRAFT_WINDOW = 0.35
 #: drafts render at preview_scale * this -- a quarter of the pixels
 DRAFT_FACTOR = 2
 
+#: the most pixels a DRAFT may cost, whatever the pixel size: motion
+#: frames exist to be fluid, and the divisor grows until they fit.
+#: ~64k pixels is the 352x144-class frame the field machine renders at
+#: a few frames a second through the full pipeline
+DRAFT_BUDGET_PX = 64_000
+
 #: how far past the window's lapse the armed recheck fires -- enough that
 #: the clock has definitely crossed it, small enough to feel instant
 RECHECK_SLACK = 0.05
@@ -88,6 +94,9 @@ def ensure_redraw_timer():
         import bpy as _bpy
 
         def _poll():
+            import sys
+            if getattr(sys, 'is_finalizing', lambda: False)():
+                return None             # interpreter teardown: unregister
             if _REDRAW['want']:
                 _REDRAW['want'] = False
                 eng = _REDRAW.get('engine')
@@ -96,6 +105,14 @@ def ensure_redraw_timer():
                         eng.tag_redraw()
                     except Exception:                           # noqa: BLE001
                         _REDRAW['engine'] = None
+            # the ONE guaranteed main-thread heartbeat: parked GPU
+            # objects (replaced blit textures, evicted uploads) release
+            # here once their in-flight window has passed
+            try:
+                from .gpu import device as _dev
+                _dev.collect()
+            except BaseException:                               # noqa: BLE001
+                pass
             return 0.03
 
         _bpy.app.timers.register(_poll, first_interval=0.03,
@@ -187,6 +204,35 @@ class Viewport:
         self._black_tiles_prev = None  # per-tile black map of the same
         self._black_key = None    # the view key those stats belong to
         self.guard_count = 0      # GPU frames the black guard re-shaded
+        self._split_said = False  # first refine prints its split once
+
+    def __del__(self):
+        # leaving rendered view destroys the engine and this viewport;
+        # the blit texture's last draw can still be queued in the Vulkan
+        # render graph, so it parks in the screen grave (released after
+        # later redraws, or swept to the wall-clock graveyard at reset),
+        # never freed by direct GC. During INTERPRETER
+        # FINALIZATION (Blender exit) this does nothing at all: imports
+        # and even exception machinery are half-dismantled there, and an
+        # exception escaping a __del__ at that point is exactly the
+        # unraisable-error crash a field exit log showed.
+        try:
+            import sys
+            if getattr(sys, 'is_finalizing', lambda: False)():
+                return
+            from .gpu import device as _dev
+            _dev.bury_screen(self._tex)
+            self._tex = None
+            try:
+                from . import fault_note
+                # places 'the user left rendered view' on the timeline,
+                # so a later fatal is not pinned on the viewport
+                fault_note('viewport engine destroyed (left rendered '
+                           'view)', key='vp-bye', limit=3)
+            except Exception:                                   # noqa: BLE001
+                pass
+        except BaseException:                                   # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------- reporting
     def complain(self, what, detail=''):
@@ -201,6 +247,14 @@ class Viewport:
 
     # ------------------------------------------------------------ main thread
     def set_scene(self, scene, settings):
+        # material EXCLUSIVE light groups bind at scene arrival, so the
+        # viewport's light loops (CPU draft and GPU frame alike) read
+        # the same set F12 collects at render entry
+        try:
+            from .core.render import collect_exclusive_lights
+            collect_exclusive_lights(scene)
+        except Exception:                                       # noqa: BLE001
+            pass
         with self.lock:
             self.scene = scene
             self.settings = settings
@@ -219,6 +273,36 @@ class Viewport:
             if self.busy and not self._inflight_draft:
                 self.abort = True
             self._last_change = self.clock()   # an edit storm drafts too
+
+    def has_scene(self):
+        with self.lock:
+            return self.scene is not None
+
+    @staticmethod
+    def _settings_sig(st):
+        return tuple(sorted((k, repr(v)) for k, v in vars(st).items()
+                            if not k.startswith('_')))
+
+    def set_settings(self, settings):
+        """Settings may have changed, the scene did not: keep the parked
+        export, and re-render ONLY if the settings really differ.
+
+        The cheap half of set_scene, for view_update calls whose
+        depsgraph updates touch nothing renderable (the field runs
+        add-ons that poke the depsgraph constantly; every poke was a
+        full 100-object re-export followed by a draft+refine cascade).
+        An identical-settings poke now costs nothing at all.
+        """
+        with self.lock:
+            if self.settings is not None and \
+                    self._settings_sig(settings) == \
+                    self._settings_sig(self.settings):
+                return
+            self.settings = settings
+            self.version += 1
+            if self.busy and not self._inflight_draft:
+                self.abort = True
+            self._last_change = self.clock()
 
     def want(self, camera, w, h):
         """Record the view the draw side asked for.
@@ -349,7 +433,24 @@ class Viewport:
                                                False)
             scale = max(int(getattr(settings, 'preview_scale', 1)), 1)
             if draft:
-                scale *= DRAFT_FACTOR
+                orbit = int(getattr(settings, 'orbit_scale', 0) or 0)
+                if orbit > 0:
+                    # the user chose their motion pixel size outright
+                    scale = orbit
+                else:
+                    scale *= DRAFT_FACTOR
+                    # Auto: a draft exists to keep MOTION fluid, so it
+                    # gets a pixel BUDGET, not a fixed divisor. At
+                    # Pixel Size X1 a half-res draft of a 1409x577
+                    # region is 204k pixels -- measured at ~0.5-1 s a
+                    # frame on the real file, a 1-2 fps slideshow the
+                    # field called 'incredibly laggy'. The divisor
+                    # grows until the draft fits the budget; the
+                    # REFINE still honours the user's pixel size
+                    # exactly, so rest quality is untouched
+                    while (max(int(w) // scale, 4)
+                           * max(int(h) // scale, 4)) > DRAFT_BUDGET_PX:
+                        scale += 1
             settings.resolution_x = max(int(w) // scale, 4)
             settings.resolution_y = max(int(h) // scale, 4)
             if camera is not None:
@@ -383,7 +484,28 @@ class Viewport:
                     raise Cancelled()
 
             t0 = time.perf_counter()
+            try:
+                from . import fault_note
+                fault_note(
+                    f'viewport render started '
+                    f'({settings.resolution_x}x{settings.resolution_y} '
+                    f'device={getattr(settings, "render_device", "?")} '
+                    f'{"draft" if draft else "refine"})', key='vp-start')
+            except Exception:                                   # noqa: BLE001
+                pass
+            marshal.acct_reset()      # per-frame crossing/wait accounting
             img = core_render.render(scene, settings, progress=tick)
+            try:
+                from . import fault_note
+                # splits the crash window: a fatal AFTER this line is in
+                # post/guard/park on the worker's own arrays; a fatal
+                # between 'readback completed' and this line is inside
+                # the render's GPU stage or its return to the worker
+                fault_note('render returned to the worker '
+                           f'({self.last_engaged})', key='vp-back',
+                           limit=3)
+            except Exception:                                   # noqa: BLE001
+                pass
             img = post.process(img, settings,
                                target_size=(settings.resolution_x,
                                             settings.resolution_y))
@@ -415,9 +537,21 @@ class Viewport:
                     # an ungated tile guard would misfire on every orbit
                     flips = int(((ptiles < 0.5) & (tiles > 0.9)).sum())
                 jumped = prev is not None and blk - prev > 0.20
-                if jumped or flips >= 2:
+                # THE FIRST-FRAME HOLE, closed: with no previous frame to
+                # compare against, a 100%-black first GPU frame parked
+                # unchallenged -- and a session that crashes or is closed
+                # before frame two shows the user NOTHING, ever. The
+                # field lived inside this hole for an entire arc: every
+                # session was a first frame. A first GPU frame that is
+                # near-TOTALLY black re-shades on the CPU like any other
+                # guard hit; a legitimately empty scene re-shades once,
+                # comes back just as black, and converges.
+                first_black = prev is None and blk >= 0.97
+                if jumped or flips >= 2 or first_black:
                     self.guard_count += 1
-                    why = (f'{blk * 100.0:.0f}% black where the previous '
+                    why = (f'{blk * 100.0:.0f}% black on the very first '
+                           'GPU frame' if first_black else
+                           f'{blk * 100.0:.0f}% black where the previous '
                            f'frame was {(prev or 0.0) * 100.0:.0f}%'
                            if jumped else
                            f'{flips} regions newly black')
@@ -445,13 +579,84 @@ class Viewport:
                 self._black_prev, self._black_tiles_prev = \
                     _black_measure(img)
                 self._black_key = key
-            if not draft and getattr(settings, '_viewport_stats', False):
-                print(f'[Halcyon viewport] refine '
-                      f'{settings.resolution_x}x{settings.resolution_y} '
-                      f'in {time.perf_counter() - t0:.2f}s on '
-                      f'{self.last_engaged} '
-                      f'(census: {_REDRAW["flags"]} redraw flags, '
-                      f'guard {self.guard_count})')
+            stats_on = getattr(settings, '_viewport_stats', False)
+            if not draft and (stats_on or not self._split_said):
+                # the split prints for the FIRST refine of a session
+                # even without Show Stats: the one line that names the
+                # slow stage must not depend on a toggle nobody found
+                self._split_said = True
+                if stats_on:
+                    print(f'[Halcyon viewport] refine '
+                          f'{settings.resolution_x}x'
+                          f'{settings.resolution_y} '
+                          f'in {time.perf_counter() - t0:.2f}s on '
+                          f'{self.last_engaged} '
+                          f'(census: {_REDRAW["flags"]} redraw flags, '
+                          f'guard {self.guard_count})')
+                # the field's performance instrument: where the frame's
+                # milliseconds actually went. Same doctrine as the crash
+                # milestones -- one pasted line beats a round of guessing
+                try:
+                    parts = []
+                    from .gpu.shade import LAST_TIMINGS as _LT
+                    for k in ('plan_ms', 'pack_upload_ms', 'draw_read_ms',
+                              'reflect_ms', 'composite_ms'):
+                        if _LT.get(k):
+                            parts.append(f"{k[:-3]} {float(_LT[k]):.0f}")
+                    if _LT.get('burst_draw_ms') or \
+                            _LT.get('burst_read_ms'):
+                        # R175b: submission vs GPU-execution halves of
+                        # the draw burst, measured inside the crossing
+                        parts.append(
+                            f"burst "
+                            f"{float(_LT.get('burst_draw_ms', 0.0)):.0f}"
+                            f"+{float(_LT.get('burst_read_ms', 0.0)):.0f}")
+                    if _LT.get('compile_ms'):
+                        # the 45-second first refine, named: driver
+                        # shader compilation, once per plan
+                        parts.append(
+                            f"COMPILE {int(_LT.get('compile_n', 0))}x "
+                            f"{float(_LT['compile_ms']):.0f}")
+                    from .gpu.craster import LAST_RASTER as _LR
+                    rtot = sum(float(v) for v in _LR.values()
+                               if isinstance(v, (int, float)))
+                    if rtot:
+                        parts.append(f'raster {rtot:.0f}')
+                    # R171: whether THIS refine's rasterisation came from
+                    # the G-buffer cache, and if not, which key component
+                    # (or gate) broke it -- the field misses, the
+                    # headless twin hits, and this word is the difference
+                    from .core.render import _GBUF_STATS as _GS
+                    if _GS.get('last'):
+                        parts.append(f"gbuf {_GS['last']}")
+                    # R172: the LAST export's split, viewport edition --
+                    # F12 already prints it; the viewport's own
+                    # view_update exports were invisible, and whether
+                    # THEY hit the mesh cache is half the field question
+                    from . import export as _EXP
+                    _es = getattr(_EXP, 'EXPORT_SPLIT', None) or {}
+                    if _es.get('total_ms'):
+                        _d = ''
+                        if _es.get('dirt_all'):
+                            _d = f" dirt ALL({_es['dirt_all']})"
+                        elif _es.get('dirt_n'):
+                            _d = f" dirt {int(_es['dirt_n'])}u"
+                        parts.append(
+                            f"export meshes {int(_es.get('meshes', 0))}x "
+                            f"{_es.get('mesh_ms', 0.0):.0f}"
+                            f" (+{int(_es.get('cached', 0))} cached)"
+                            + _d)
+                    acct = marshal.acct()
+                    if acct.get('crossings'):
+                        wait = max(acct['wall_ms'] - acct['exec_ms'], 0.0)
+                        parts.append(
+                            f"marshal {acct['crossings']}x "
+                            f"exec {acct['exec_ms']:.0f} wait {wait:.0f}")
+                    if parts:
+                        print('[Halcyon viewport] split (ms): '
+                              + ', '.join(parts) + '. Paste this line.')
+                except Exception:                               # noqa: BLE001
+                    pass
             img = np.asarray(img, np.float32)
             if img.ndim != 3 or img.shape[2] not in (3, 4):
                 raise ValueError(f'viewport frame has shape {img.shape}')
@@ -463,6 +668,17 @@ class Viewport:
                 self.frame = np.ascontiguousarray(img)
                 self.done_key = (key, version, draft)
                 self.busy = False
+            try:
+                from . import fault_note
+                blk_pct = (self._black_prev or 0.0) * 100.0
+                fault_note(
+                    f'viewport frame parked '
+                    f'({settings.resolution_x}x{settings.resolution_y} '
+                    f'{"draft" if draft else "refine"} on '
+                    f'{self.last_engaged}, {blk_pct:.0f}% black)',
+                    key='vp-frame')
+            except Exception:                                   # noqa: BLE001
+                pass
         except Cancelled:
             with self.lock:
                 self.busy = False     # the next draw kicks the newer view
@@ -495,7 +711,22 @@ class Viewport:
 
     # ------------------------------------------------------------ draw thread
     def texture(self, gpu):
-        """The newest frame as a GPUTexture, rebuilt only when it changed."""
+        """The newest frame as a GPUTexture, rebuilt only when it changed.
+
+        The REPLACED texture is never dropped here: the previous redraw's
+        display-space draw of it may still sit queued in Blender's Vulkan
+        render graph, and destroying it mid-flight is a driver access
+        violation at the next swap (the field crash, verbatim: nvoglv64
+        under vkCmdPipelineBarrier the moment rendered view opened on a
+        heavy scene -- a refine burst churns several of these a second).
+        It parks in the SCREEN grave and releases only after a full
+        swapchain depth of later redraws (device.draw_tick) -- readback
+        epochs never retire it, because a readback proves our offscreen
+        subgraph flushed, not Blender's screen-draw stream. And nothing
+        collects HERE: this runs inside the draw callback, mid-recording,
+        the worst possible moment to hand the driver a free().
+        """
+        from .gpu import device as _dev
         with self.lock:
             frame = self.frame
             fid = id(frame)
@@ -507,8 +738,14 @@ class Viewport:
             buf = gpu.types.Buffer('FLOAT', flat.shape[0], flat)
         except (TypeError, ValueError):
             buf = gpu.types.Buffer('FLOAT', flat.shape[0], flat.tolist())
+        _dev.bury_screen(self._tex)
         self._tex = gpu.types.GPUTexture((iw, ih), format='RGBA32F', data=buf)
         self._tex_id = fid
+        # the upload's SOURCE rides the same redraw clock as the texture:
+        # Vulkan records, and if the backend consumes staging data at
+        # flush, `flat`/`buf` dying at return would hand the deferred
+        # upload freed pages
+        _dev.bury_screen((flat, buf))
         return self._tex
 
     def draw_placeholder(self, depsgraph):

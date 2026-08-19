@@ -44,7 +44,10 @@ INERT_FIELDS = (('edge_opacity', 1.0), ('opacity', 1.0))
 #: nearly every converted material, so refusing them refused real scenes.
 EXTRA_SCALARS = ('fresnel', 'fresnel_power', 'rim', 'rim_power',
                  'sheen', 'sheen_roughness', 'matcap_blend', 'backface_mix',
-                 'reflect', 'refraction', 'edge_opacity')
+                 'reflect', 'refraction', 'edge_opacity',
+                 # the BI panel round's CPU-consumed ray constants
+                 'ray_ior', 'bi_ray_filter', 'bi_mir_fresnel',
+                 'bi_mir_blend', 'use_mist')
 EXTRA_COLORS = ('fresnel_color', 'rim_color', 'sheen_color', 'matcap',
                 'backface_color', 'reflect_color')
 
@@ -59,6 +62,13 @@ SHADELESS_MODELS = frozenset({'WIREFRAME', 'CONSTANT'})
 
 def _model_index(model):
     from ..core.shading import MODEL_ITEMS
+    if isinstance(model, str) and model.startswith('BI_MATRIX_'):
+        # the BI material node: 100 + diffuse*10 + spec, decoded by the
+        # GLSL dispatch's matrix branch
+        try:
+            return 100 + int(model[10]) * 10 + int(model[12])
+        except (ValueError, IndexError):
+            return None
     for i, item in enumerate(MODEL_ITEMS):
         if item[0] == model:
             return i
@@ -164,6 +174,21 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
                     'on the driver)')
     if mat is not None and getattr(mat, 'shadeless', False):
         return None, None, 'shadeless materials take the early CPU path'
+    from ..core.render import bi_sss_params
+    _sssp = bi_sss_params(mat) if mat is not None else None
+    if _sssp is not None and getattr(st, 'sss', True):
+        # the octree gather HAS a GLSL twin (hal_sss_sample: the tree
+        # as a data texture, stackless hit/miss traversal in the C's
+        # own visit order -- measured at float32 exactness against the
+        # CPU tree). The pass needs the pre-pass tree; without one the
+        # frame refuses by name rather than silently skipping the
+        # scatter.
+        entry = (getattr(job, 'sss_trees', None) or {}).get(int(mi))
+        if entry is None:
+            return None, None, ('uses Blender Internal subsurface '
+                                'scattering but the pre-pass tree is '
+                                'missing; the material shades on the '
+                                'CPU')
 
     surf, model, nrm = closure_to_surface(cl, ctx, st, mat)
     if nrm is not None:
@@ -302,6 +327,67 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
         bake['diffuse'] = tuple(float(v)
                                 for v in np.asarray(surf.diffuse)[0])
         bake['__slot'] = 'specular'
+    if _sssp is not None and getattr(st, 'sss', True):
+        # the assembler binds the tree texture and emits the diffuse
+        # replacement (shade_lamp_loop's block); texfac shapes the col
+        bake['__sss'] = {'texfac': float(_sssp.get('texfac', 0.0)),
+                         'key': f'__sss_tree_{int(mi)}__'}
+    # R164: the terminator fix and the object-colour modulation
+    from ..core.render import bi_node_props as _bnp
+    _bip = _bnp(mat) if mat is not None else None
+    if _bip:
+        if _bip.get('raybias') and st.shadows and \
+                any(getattr(l, 'shadow', 'NONE') == 'RAY'
+                    or str(getattr(st, 'shadow_default', '')) == 'RAY'
+                    for l in job.lights):
+            # R167: the RAYBIAS terminator fix HAS its GLSL twin now --
+            # the per-face smooth proxy reads the stored face normal
+            # from hal_triaux, the object's Auto Smooth threshold rides
+            # a per-tri hal_sres texel, and the curve is the sbias
+            # branch's, guarded like the CPU's _pcurve. (This refusal
+            # was the field's 8:48 frame: THREE materials in
+            # a 2013-era file carry MA_RAYBIAS, and the whole frame's
+            # shading fell back to the CPU for a correction the GPU can
+            # run exactly.) Secondary passes still refuse in the
+            # assembler: ray hits carry no G-buffer triangle id to
+            # fetch the texels by.
+            if getattr(job.scene.mesh, 'face_normals', None) is None:
+                return None, None, ('Ray Bias terminator correction '
+                                    'needs stored face normals this '
+                                    'mesh does not carry; the material '
+                                    'shades on the CPU')
+            bake['__raybias'] = True
+        if _bip.get('use_obcolor'):
+            _sss_done = _sssp is not None and (
+                (getattr(job, 'sss_trees', None) or {}).get(int(mi))
+                is not None or not getattr(st, 'sss', True))
+            if not _sss_done:
+                if any(nd.get('props', {}).get('use_transparency')
+                       for nd in (mat.graph or {}).get('nodes',
+                                                       {}).values()
+                       if nd.get('bl_idname')
+                       == 'HALCYON_BIMaterialNode'):
+                    return None, None, ('Object Color with '
+                                        'transparency modulates the '
+                                        'alpha per object; the '
+                                        'material shades on the CPU')
+                colored = [
+                    (i, tuple(np.clip(np.asarray(
+                        getattr(o, 'color', (1, 1, 1, 1)),
+                        np.float32)[:3], 0.0, None)))
+                    for i, o in enumerate(
+                        getattr(job.scene, 'objects', ()) or ())
+                    if tuple(np.round(np.asarray(
+                        getattr(o, 'color', (1, 1, 1, 1)),
+                        np.float32)[:3], 6)) != (1.0, 1.0, 1.0)]
+                if len(colored) > 24:
+                    return None, None, (f'Object Color with '
+                                        f'{len(colored)} coloured '
+                                        'objects exceeds the ladder; '
+                                        'the material shades on the '
+                                        'CPU')
+                if colored:
+                    bake['__obcolor'] = colored
     return bake, idx, None
 
 
@@ -393,6 +479,12 @@ def _shadow_meta(light, st, bvh=None):
     if not getattr(st, 'shadows', True) or \
             getattr(light, 'shadow', 'MAP') == 'NONE':
         return None, None, None
+    if getattr(light, 'type', '') == 'HEMI':
+        # BI never shadowed hemi lamps and the CPU's visibility()
+        # returns unconditional ones for them -- a tap here referenced
+        # variables the HEMI branch never declares (latent compile
+        # break, found by the R164 phongcorr test)
+        return None, None, None
     mode = light.shadow if st.shadow_default == 'PER_LIGHT' else \
         st.shadow_default
     if mode == 'NONE':
@@ -463,33 +555,69 @@ def _shadow_meta(light, st, bvh=None):
 
 
 def _light_sig(l):
+    """One light's contribution to the plan signature.
+
+    R169: the light's tweakable VALUES -- position, direction, colour,
+    energy, spot cone, decay distances, the Negative sign -- ride the
+    hal_lights texture now and are deliberately ABSENT here, so a lamp
+    edit is a plan-cache HIT plus a texel re-upload instead of the
+    recompile storm the field measured at 45 seconds per viewport
+    refine. What stays is STRUCTURE: everything that changes the
+    emitted source. Two exceptions keep their values: a MAP-shadowed
+    light bakes its light-space matrices into the shadow function
+    (moving it re-plans -- its map rebuilt anyway), and a cookie light
+    bakes its projection axes from the direction.
+    """
+    import numpy as np
     t = lambda v: tuple(round(float(x), 6) for x in v)
-    return (l.type, t(getattr(l, 'position', (0, 0, 0))),
-            t(getattr(l, 'direction', (0, 0, -1))),
-            t(getattr(l, 'color', (1, 1, 1))),
-            round(float(getattr(l, 'energy', 1.0)), 6),
-            getattr(l, 'decay', 'DEFAULT'),
-            round(float(getattr(l, 'decay_start', 0.0)), 6),
-            round(float(getattr(l, 'decay_end', 40.0)), 6),
-            round(float(getattr(l, 'spot_size', 0.0)), 6),
-            round(float(getattr(l, 'spot_blend', 0.0)), 6),
-            getattr(l, 'shadow', 'MAP'), bool(getattr(l, 'negative', False)),
-            # light linking bakes a per-light object ladder into the
-            # pass source (R78: a bake the plan reads MUST be in the
-            # signature)
-            tuple(sorted(getattr(l, 'exclude_objects', ()) or ())),
-            str(getattr(l, 'exclude_mode', 'EXCLUDE')),
-            round(float(getattr(l, 'shadow_bias', 0.0)), 6),
-            round(float(getattr(l, 'shadow_softness', 1.0)), 6),
-            round(float(getattr(l, 'shadow_density', 1.0)), 6),
-            round(float(getattr(l, 'radius', 0.0)), 6),
-            # a projected texture bakes its frame, strength and size into
-            # the pass, and its pixels ride the upload cache: swap or edit
-            # the image and the plan must rebuild
-            (None if getattr(l, 'cookie', None) is None else
-             (round(float(getattr(l, 'cookie_strength', 1.0)), 6),
-              round(float(getattr(l, 'cookie_scale', 10.0)), 6),
-              _cookie_sig(l))))
+    spotsi = float(np.cos(float(getattr(l, 'spot_size', 0.0)) * 0.5))
+    spotbl = (1.0 - spotsi) * float(getattr(l, 'spot_blend', 0.0))
+    baked_map = getattr(l, 'shadow_map', None) is not None
+    cookie = getattr(l, 'cookie', None)
+    sig = (l.type,
+           getattr(l, 'decay', 'DEFAULT'),
+           # attenuation STRUCTURE: which factors exist (their widths
+           # and distances are texels)
+           float(getattr(l, 'decay_start', 0.0)) > 0.0,
+           float(getattr(l, 'decay_ld1', 0.0) or 0.0) > 0.0,
+           float(getattr(l, 'decay_ld2', 0.0) or 0.0) > 0.0,
+           bool(getattr(l, 'bi_sphere', False)),
+           spotbl != 0.0,
+           getattr(l, 'shadow', 'MAP'),
+           # per-lobe gates emit different blocks (and were MISSING
+           # from the old signature -- a latent stale-plan bug, fixed
+           # in passing)
+           bool(getattr(l, 'affect_diffuse', True)),
+           bool(getattr(l, 'affect_specular', True)),
+           bool(getattr(l, 'specular_only', False)),
+           bool(getattr(l, 'diffuse_only', False)),
+           # light linking bakes a per-light object ladder into the
+           # pass source (R78: a bake the plan reads MUST be in the
+           # signature)
+           tuple(sorted(getattr(l, 'exclude_objects', ()) or ())),
+           str(getattr(l, 'exclude_mode', 'EXCLUDE')),
+           # the soft-ray shadow function bakes the radius and sample
+           # unroll; the shadow colour folds into every light block
+           round(float(getattr(l, 'radius', 0.0)), 6),
+           t(getattr(l, 'shadow_color', (0, 0, 0))))
+    if baked_map:
+        sig += ('map',
+                t(getattr(l, 'position', (0, 0, 0))),
+                t(getattr(l, 'direction', (0, 0, -1))),
+                round(float(getattr(l, 'spot_size', 0.0)), 6),
+                round(float(getattr(l, 'shadow_bias', 0.0)), 6),
+                round(float(getattr(l, 'shadow_softness', 1.0)), 6),
+                round(float(getattr(l, 'shadow_density', 1.0)), 6))
+    if cookie is not None:
+        # a projected texture bakes its frame, strength and size into
+        # the pass, and its pixels ride the upload cache: swap or edit
+        # the image and the plan must rebuild
+        sig += ('cookie',
+                t(getattr(l, 'direction', (0, 0, -1))),
+                round(float(getattr(l, 'cookie_strength', 1.0)), 6),
+                round(float(getattr(l, 'cookie_scale', 10.0)), 6),
+                _cookie_sig(l))
+    return sig
 
 
 def _cookie_sig(l):
@@ -562,6 +690,10 @@ def _plan_sig(job, mkey):
     if world is not None:
         world_sig = (tuple(getattr(world, 'ambient', (0, 0, 0))),
                      float(getattr(world, 'ambient_level', 0.0)),
+                     # exposure bakes linfac/logfac into every pass
+                     float(getattr(world, 'exposure', 0.0) or 0.0),
+                     float(getattr(world, 'exposure_range', 1.0)
+                           or 1.0),
                      # the environment-reflection term reads these; a sky
                      # edit must re-plan the reflective materials
                      str(getattr(world, 'mode', 'NODES')),
@@ -589,7 +721,11 @@ def _plan_sig(job, mkey):
          if hasattr(getattr(l, 'shadow_map', None), 'faces') else
          ('map', round(float(l.shadow_map.depth[::23].sum()), 3)))
         for l in scene.lights)
-    return (mkey, st_sig, world_sig, shadow_sig,
+    obcol_sig = tuple(
+        tuple(np.round(np.asarray(getattr(o, 'color', (1, 1, 1, 1)),
+                                  np.float32), 5))
+        for o in (getattr(scene, 'objects', ()) or ()))
+    return (mkey, st_sig, world_sig, shadow_sig, obcol_sig,
             # whether a BVH exists decides the RAY branch (lit vs traced),
             # and its content is the mesh's, which mkey already fingerprints
             getattr(job, 'bvh', None) is not None,
@@ -599,14 +735,51 @@ def _plan_sig(job, mkey):
             # coded shaders may bake the frame size (vScreenUV/iResolution)
             (int(job.width), int(job.height)),
             tuple(_light_sig(l) for l in scene.lights),
+            # R169: WHICH lights the max_lights cap selects (and their
+            # order) is structure -- selection ranks by energy, and the
+            # values left the per-light signatures, so the chosen SET
+            # must be fingerprinted on its own or an energy tweak that
+            # flips the cap's choice would reuse a plan indexed for
+            # different lamps
+            _selection_sig(scene, st),
             tuple(_mat_sig(m) for m in scene.materials),
             tuple(sorted(job.textures or {})))
+
+
+def _selection_sig(scene, st):
+    from ..core import lights as LI
+    try:
+        sel = LI.select_lights(scene.lights, st)
+        ids = {id(l) for l in sel}
+        return tuple(i for i, l in enumerate(scene.lights)
+                     if id(l) in ids)
+    except Exception:                                           # noqa: BLE001
+        return tuple(range(len(scene.lights or ())))
 
 
 #: the last few plans, keyed by scene signature. A plan re-probes materials
 #: through the CPU's closure path and assembles ~500-line sources; a held
 #: still scene was paying that every frame, and it measured 4.4 ms of a
 #: 14.3 ms warm frame at 480x360.
+#: R174: material-value texels on/off (the test suite A/Bs this; there is
+#: no user option -- the values are the same float32 bits either way)
+MATERIAL_TEXELS = True
+
+
+def _pool_tag(tag, src, spec):
+    """One shader NAME per distinct (source, interface) -- the pool.
+
+    device.compile_dynamic caches on (name, hash(source)); with material
+    values lifted into texels, same-structure materials produce
+    byte-identical sources, and giving them the same NAME makes the
+    whole pool one compile. The interface is hashed in defensively --
+    equal sources imply equal declared uniforms, but a hash is cheaper
+    than the proof staying true forever."""
+    h = abs(hash((src, tuple(spec.get('samplers', ())),
+                  tuple(spec.get('floats', ())))))
+    return f'{tag}_P{h:x}'
+
+
 _PLAN_CACHE = {}
 
 
@@ -639,6 +812,23 @@ def plan_frame(job, gbuf, use_cache=True):
             sig = None
         hit = _PLAN_CACHE.get(sig) if sig is not None else None
         if hit is not None:
+            h_passes, h_why, h_atlases = hit
+            if h_atlases and 'hal_lights' in h_atlases:
+                # R169: the light VALUES are per-frame data, not part
+                # of the plan -- a cache hit reuses every source and
+                # every other atlas, but the hal_lights texture repacks
+                # from the CURRENT lamps (this is the whole point: a
+                # lamp edit lands here, as a hit plus one tiny upload,
+                # instead of a 25-shader recompile storm)
+                from ..core import lights as _LI2
+                from .material import pack_light_texels as _plt
+                _arr = _plt(_LI2.select_lights(job.scene.lights,
+                                               job.settings))
+                h_atlases = dict(h_atlases)
+                h_atlases['hal_lights'] = (('lights', _arr.tobytes()),
+                                           lambda a=_arr: a)
+                hit = (h_passes, h_why, h_atlases)
+                _PLAN_CACHE[sig] = hit
             return hit
 
     st = job.settings
@@ -707,7 +897,7 @@ def plan_frame(job, gbuf, use_cache=True):
 
     lights = LI.select_lights(scene.lights, st)
     for l in lights:
-        if l.type not in ('SUN', 'POINT', 'SPOT', 'AREA'):
+        if l.type not in ('SUN', 'HEMI', 'POINT', 'SPOT', 'AREA'):
             return None, f'{l.type} lights are not in the GLSL light loop', {}
         if len(getattr(l, 'exclude_objects', ()) or ()) > 64:
             # linking emits a per-light object ladder against td.y (an
@@ -719,13 +909,46 @@ def plan_frame(job, gbuf, use_cache=True):
 
     # shadow maps: the same maps the CPU just baked, packed for the GPU
     shadows, atlases = [], {}
+    shadow_parts = []
     for i, l in enumerate(lights):
         meta, atlas, why = _shadow_meta(l, st, getattr(job, 'bvh', None))
         if why is not None:
             return None, f"light '{getattr(l, 'name', i)}': {why}", {}
         shadows.append(meta)
         if atlas is not None:
-            atlases[f'hal_shadow{i}'] = atlas
+            shadow_parts.append((i, atlas))
+    if shadow_parts:
+        # ONE combined atlas for every mapped light, stacked by rows.
+        # Eight per-light samplers put the field's heavier materials AT
+        # the 16-sampler fragment cliff (12 material samplers + the
+        # G-buffer's three), and the real driver rejected the compile:
+        # 'the driver rejected <material>: HAL_MAT_1: CreateInfo failed' --
+        # the refusal milestone that ended five rounds of guessing.
+        # Every light's cell arithmetic is already baked as literals,
+        # so packing costs one added row offset per light and frees
+        # seven sampler slots on an eight-light scene.
+        voff = 0
+        keys, packs = [], []
+        for i, (akey, abuild) in shadow_parts:
+            m = shadows[i]
+            ph = int(m['size']) * int(m['grid'][1])
+            pw = int(m['size']) * int(m['grid'][0])
+            m['voff'] = voff
+            keys.append(akey)
+            packs.append((voff, ph, pw, abuild))
+            voff += ph
+        total_h = voff
+        total_w = max(pw for _v, _h, pw, _b in packs)
+
+        def build_pack(_packs=tuple(packs), _th=total_h, _tw=total_w):
+            out = np.zeros((_th, _tw, 4), np.float32)
+            for v, ph, pw, b in _packs:
+                px = b()
+                out[v:v + ph, :pw] = px[:, :pw]
+            return out
+
+        atlases['hal_shadowpack'] = (('shadowpack',) + tuple(keys),
+                                     build_pack)
 
     # projected light textures (gobos): the image rides along per light,
     # in the same cached-upload idiom, and the light loop samples it with
@@ -807,15 +1030,31 @@ def plan_frame(job, gbuf, use_cache=True):
         mat_ids = np.zeros(0, np.int64)
 
     from ..core import render as _CR
+    _amb_eng, _amb_wrld = LI.ambient_light_split(scene, st)
     consts = {
         'ambient_color': tuple(float(v) for v in LI.ambient_light(scene, st)),
+        # the split the BI material node's flat-ambient rule needs:
+        # engine Global Ambient stays diffuse-tinted, only the WORLD
+        # part flat-adds (see light_surface's BI branch)
+        'ambient_engine': tuple(float(v) for v in _amb_eng),
+        'ambient_world': tuple(float(v) for v in _amb_wrld),
         'two_sided': bool(getattr(st, 'two_sided_lighting', True)),
         'specular_in_gamma': bool(getattr(st, 'specular_in_gamma', True)),
         'clamp_specular': bool(getattr(st, 'clamp_specular', True)),
         'light_clamp': float(getattr(st, 'light_clamp', 0.0)),
         'falloff_default': str(getattr(st, 'light_falloff_default',
                                        'INVERSE_SQUARE')),
+        # lamp names claimed by materials' EXCLUSIVE light groups,
+        # collected by render.collect_exclusive_lights at render entry
+        'exclusive_lights': tuple(sorted(
+            getattr(scene, 'exclusive_lights', None) or ())),
         'shadow_samples': int(getattr(st, 'shadow_samples', 4)),
+        # the per-lamp shadow MODE resolution the CPU runs (smode =
+        # light.shadow under PER_LIGHT, the override otherwise): the
+        # RAYBIAS terminator branch fires only for smode == 'RAY'
+        # lamps, exactly light_surface's gate. Already in the plan
+        # signature's settings fingerprint.
+        'shadow_default': str(getattr(st, 'shadow_default', 'PER_LIGHT')),
         'tex_filter': str(getattr(st, 'tex_filter', 'NEAREST')),
         'tex_aniso': int(getattr(st, 'tex_aniso', 1) or 1),
         'tex_mip_bias': float(getattr(st, 'tex_mip_bias', 0.0) or 0.0),
@@ -824,6 +1063,22 @@ def plan_frame(job, gbuf, use_cache=True):
         'obj_bounds': job.object_bounds(),
         # the frame size, for coded shaders reading vScreenUV/iResolution
         'resolution': (float(job.width), float(job.height)),
+        # the world->camera transform, baked into SSS passes: the
+        # scatter tree lives in camera space, where shi->co lived
+        'view_rows': tuple(
+            float(v) for v in
+            np.asarray(job.view, np.float32)[:3, :4].ravel()),
+        # BI's world Exposure (wrld_exposure_correct): active when
+        # exp != 0 or range != 1; the assembler bakes linfac/logfac
+        'world_exposure': (
+            (float(getattr(scene.world, 'exposure', 0.0) or 0.0),
+             float(getattr(scene.world, 'exposure_range', 1.0) or 1.0))
+            if getattr(scene, 'world', None) is not None
+            and (float(getattr(scene.world, 'exposure', 0.0) or 0.0)
+                 != 0.0
+                 or float(getattr(scene.world, 'exposure_range', 1.0)
+                          or 1.0) != 1.0)
+            else None),
         # the camera TYPE (already in the plan signature): the emitters'
         # perspective-only answers -- Geometry's Backfacing plane test --
         # gate on it, exactly as the backface override does
@@ -862,6 +1117,7 @@ def plan_frame(job, gbuf, use_cache=True):
         if getattr(scene.mesh, 'tris', None) is not None else 0,
         # the mesh's named UV layers, for the UV Map node's resolution
         'uv_names': tuple(getattr(scene.mesh, 'uv_names', None) or ()),
+        'has_vcol': getattr(scene.mesh, 'colors', None) is not None,
         # the BVH texture sides, baked into the traversal source when any
         # light shadows by ray; None otherwise
         'bvh_sides': bvh_sides,
@@ -870,6 +1126,12 @@ def plan_frame(job, gbuf, use_cache=True):
         'seed': int(getattr(st, 'seed', 0) or 0),
         # the transparent-layer alpha chain's hard cutoff
         'alpha_threshold': float(getattr(st, 'alpha_threshold', 0.0)),
+        # R174: material VALUES ride the hal_mats texture (assemble_frame
+        # marks them, lifts them, and hands the row back in
+        # info['mat_values']). Same-structure materials share one
+        # compiled shader; a slider drag re-uploads a texel row. The
+        # module flag exists for the A/B in the test suite.
+        '__mark_values': MATERIAL_TEXELS,
         'ao': {
             'samples': max(int(getattr(st, 'ao_samples', 8)), 1),
             'distance': float(getattr(st, 'ao_distance', 1.0)),
@@ -1002,10 +1264,21 @@ def plan_frame(job, gbuf, use_cache=True):
             if 'diffuse_flat' not in bake:
                 return f"'{_mat_name(mi)}' tints its refraction by a " \
                        'base colour that varies per pixel'
+            if abs(float(bake.get('bi_transp_fresnel', 0.0))) > 0.0:
+                # fresnel alpha makes the refraction lerp view-dependent
+                return f"'{_mat_name(mi)}' refracts through a Fresnel " \
+                       'alpha on the CPU'
         if float(bake.get('reflect', 0.0)) > 1e-4:
             if 'specular' in per_pixel_fields(graph):
                 return f"'{_mat_name(mi)}' scales its reflection by a " \
                        'per-pixel Specular Color on the CPU'
+            if abs(float(bake.get('bi_mir_fresnel', 0.0))) > 0.0 and \
+                    ray_depth >= 2:
+                # the composite applies the view factor at the PRIMARY
+                # surface; a bounce chain needs it at every hit
+                return f"'{_mat_name(mi)}' mirrors through Fresnel at " \
+                       f'ray depth {int(ray_depth)} on the CPU (the ' \
+                       'view factor composes per bounce)'
         return None
 
     def _collect_ray_terms(mi, bake):
@@ -1026,14 +1299,27 @@ def plan_frame(job, gbuf, use_cache=True):
                              np.float32)
                 * np.asarray(bake.get('reflect_color', (1.0, 1.0, 1.0)),
                              np.float32))
+            if abs(float(bake.get('bi_mir_fresnel', 0.0))) > 0.0:
+                # Mirror > Fresnel: view-dependent, applied per pixel at
+                # the composite (the CPU applies it to surf.reflect
+                # before _add_raytraced -- same maths, same place in
+                # the chain)
+                mir_fres[mi] = (float(bake['bi_mir_fresnel']),
+                                float(bake.get('bi_mir_blend', 1.25)))
         if getattr(st, 'ray_refraction', True) and \
                 float(bake.get('opacity', 1.0)) < 0.999:
             op = min(max(float(bake['opacity']), 0.0), 1.0)
+            # BI's Filter: 0 passes light untinted, 1 tints by the base
+            # colour -- exactly _add_raytraced's lerp toward white
+            f = min(max(float(bake.get('bi_ray_filter', 1.0)), 0.0), 1.0)
+            dif = tuple(1.0 + f * (float(v) - 1.0)
+                        for v in bake['diffuse_flat'])
             refractive[mi] = {
                 'k': (1.0 - op)
                 * min(max(float(bake.get('refraction', 1.0)), 0.0), 1.0),
-                'diffuse': tuple(float(v) for v in bake['diffuse_flat']),
-                'ior': max(float(bake.get('ior', 1.45)), 1e-3),
+                'diffuse': dif,
+                'ior': max(float(bake.get('ray_ior',
+                                          bake.get('ior', 1.45))), 1e-3),
             }
 
     passes = []
@@ -1041,6 +1327,7 @@ def plan_frame(job, gbuf, use_cache=True):
     secondary_mid = []
     reflective = {}
     refractive = {}
+    mir_fres = {}
     cpu_env = {'primary': {}, 'hit': {}}
     any_screen = False
     rng = np.random.default_rng(19)
@@ -1058,6 +1345,17 @@ def plan_frame(job, gbuf, use_cache=True):
                                                py[pick], px[pick])
         if bake is None:
             return None, f"'{_mat_name(mi)}': {why}", {}
+        # the BI panel round's honest CPU-only flags
+        if float(bake.get('cast_only', 0.0)) > 0.5:
+            return None, f"'{_mat_name(mi)}' is Cast Only: peeling the " \
+                         'camera surface shades on the CPU', {}
+        if float(bake.get('shadows_only', 0.0)) > 0.5:
+            return None, f"'{_mat_name(mi)}' is Shadows Only: the " \
+                         'shadow catcher shades on the CPU', {}
+        if float(bake.get('use_mist', 1.0)) < 0.5 and \
+                bool(getattr(st, 'fog', False)):
+            return None, f"'{_mat_name(mi)}' opts out of mist; fogged " \
+                         'frames shade it on the CPU', {}
         if float(bake.get('backface_mix', 0.0)) > 1e-4 and \
                 str(getattr(scene.camera, 'type', 'PERSP')).upper() != \
                 'PERSP':
@@ -1259,6 +1557,18 @@ def plan_frame(job, gbuf, use_cache=True):
             return None, 'screen-space shader inputs shade reflection ' \
                          'hits on the CPU (a hit point has no screen ' \
                          'position)', {}
+        # R167: a Ray Bias material's hit pass is a STUB (the
+        # correction has no triangle id on hits). Stubs may EXIST --
+        # the planner builds hit passes whenever ray tracing is on --
+        # but the moment something reflective or refractive would
+        # actually run one, the whole plan refuses by name, exactly
+        # the pre-twin behaviour for mirrored scenes.
+        for p in list(secondary) + list(secondary_mid):
+            if (p[3] or {}).get('raybias_secondary_stub'):
+                return None, (f"'{p[1]}' (as a reflection): Ray Bias "
+                              'terminator correction has no triangle '
+                              'id on ray hits; the material shades on '
+                              'the CPU'), {}
         rplan = {'secondary': secondary,
                  'secondary_mid': secondary_mid,
                  'depth': int(ray_depth),
@@ -1267,6 +1577,7 @@ def plan_frame(job, gbuf, use_cache=True):
                  'reflective': sorted(reflective),
                  'refract': refractive,
                  'refractive': sorted(refractive),
+                 'mir_fres': dict(mir_fres),
                  'bias': float(getattr(st, 'ray_bias', 1e-3))}
         atlases['__reflect'] = rplan
 
@@ -1299,6 +1610,62 @@ def plan_frame(job, gbuf, use_cache=True):
         akey = ('triaux',) + _mesh_key(mesh)
         atlases['hal_triaux'] = (akey,
                                  lambda m=mesh: GB.pack_tri_aux(m)[0])
+
+    if any('hal_sres' in (b.get('samplers') or ())
+           for b in _pass_binds()):
+        # R167: each triangle's object Auto Smooth threshold, for the
+        # RAYBIAS terminator twin -- per-tri because the object count
+        # is unbounded (the field file carries 109), where a uniform
+        # ladder like obcolor's would cap out. Values join the cache
+        # key: Auto Smooth edits must repack without a mesh edit.
+        from . import gbuffer as GB2
+        mesh2 = scene.mesh
+        sres_obj = np.array(
+            [float(getattr(o, 'smoothresh', 0.0) or 0.0)
+             for o in (getattr(scene, 'objects', None) or ())],
+            np.float32)
+        if sres_obj.size == 0:
+            sres_obj = np.zeros(1, np.float32)
+        oidx = np.clip(np.asarray(
+            getattr(mesh2, 'obj_index', None)
+            if getattr(mesh2, 'obj_index', None) is not None
+            else np.zeros(mesh2.tris.shape[0], np.int64),
+            np.int64), 0, sres_obj.size - 1)
+        per_tri = sres_obj[oidx]
+        akey = ('sres', per_tri.tobytes()) + _mesh_key(scene.mesh)
+        atlases['hal_sres'] = (akey,
+                               lambda v=per_tri: GB2.pack_tri_scalar(v))
+
+    if any('hal_lights' in (b.get('samplers') or ())
+           for b in _pass_binds()):
+        # R169: the per-light VALUE texture. The cache key carries the
+        # packed bytes, so a lamp edit re-uploads this one tiny texture
+        # -- and nothing else: the pass sources no longer contain the
+        # values, so the plan above was a cache HIT.
+        from .material import pack_light_texels
+        _lt_arr = pack_light_texels(lights)
+        atlases['hal_lights'] = (('lights', _lt_arr.tobytes()),
+                                 lambda a=_lt_arr: a)
+
+    # R174: the per-MATERIAL value texture. Every pass that lifted values
+    # gets a row (hal_mrow rides its binds as 'mat_row'); the walk order
+    # here is the pass construction order, deterministic per plan, and
+    # the same binds objects live in the cached plan -- a HIT returns
+    # rows and texture together, values already proven unchanged by the
+    # signature.
+    _mat_rows = []
+    for b in _pass_binds():
+        mv = b.get('mat_values')
+        if mv:
+            b['mat_row'] = len(_mat_rows)
+            _mat_rows.append(mv)
+    if _mat_rows:
+        _mw = max(len(r) for r in _mat_rows)
+        _ma = np.zeros((len(_mat_rows), _mw, 4), np.float32)
+        for _ri, _row in enumerate(_mat_rows):
+            _ma[_ri, :len(_row), 0] = np.asarray(_row, np.float32)
+        atlases['hal_mats'] = (('mats', _ma.tobytes()),
+                               lambda a=_ma: a)
 
     if any('hal_stipple' in (b.get('samplers') or ())
            for b in _pass_binds()):
@@ -1407,8 +1774,18 @@ def _mesh_key(mesh):
     """
     v = mesh.verts
     stride = max(1, v.shape[0] // 512)
-    parts = [int(v.shape[0]), int(mesh.tris.shape[0]),
-             round(float(v[::stride].sum()), 3)]
+    tris = np.asarray(mesh.tris)
+    tstride = max(1, tris.shape[0] // 512)
+    parts = [int(v.shape[0]), int(tris.shape[0]),
+             round(float(v[::stride].sum()), 3),
+             # ORDER-SENSITIVE triangle fingerprint (R170): a winding
+             # flip permutes each triangle's indices and a plain sum
+             # never notices -- the G-buffer cache served a culled
+             # frame for its mirror, and the tri/attr upload caches
+             # carried the same latent hole. Weighting the three
+             # corners differently makes any reorder change the key.
+             int((tris[::tstride].astype(np.int64)
+                  * np.array([[1, 3, 7]], np.int64)).sum())]
     nrm = getattr(mesh, 'normals', None)
     if nrm is not None:
         parts.append(round(float(np.asarray(nrm)[::stride].sum()), 3))
@@ -1704,8 +2081,36 @@ def _composite_reflections(job, gbuf, rplan, out, py, px, dirs, hit,
     scale = np.zeros((py.size, 3), np.float32)
     for mi, sc in rplan['scale'].items():
         scale[m == mi] = np.asarray(sc, np.float32)
-    out[py, px] = out[py, px] + add * scale
+    fac = _mirror_fresnel_factors(job, gbuf, rplan, py, px, m)
+    out[py, px] = out[py, px] + add * scale * fac[:, None]
     return out
+
+
+def _mirror_fresnel_factors(job, gbuf, rplan, py, px, mat_px):
+    """Per-pixel Mirror > Fresnel multipliers for the reflect composite.
+
+    Ones where no fresnel-mirrored material sits. The normal is the
+    SHADING normal through `_ray_context` -- the same bent N the CPU
+    scales surf.reflect with -- so a normal-mapped fresnel mirror
+    matches by construction. Depth >= 2 plans refuse fresnel mirrors
+    outright (a bounce chain would need the factor at every hit), so
+    this only ever runs against the primary surface."""
+    mf = rplan.get('mir_fres') or {}
+    fac = np.ones(py.size, np.float32)
+    if not mf:
+        return fac
+    from ..core import mathx as M
+    from ..core.shading import bi_fresnel_fac
+    for mi, (fres, blend) in mf.items():
+        sel = np.nonzero(mat_px == int(mi))[0]
+        if sel.size == 0:
+            continue
+        ctx, N = _ray_context(job, gbuf, py[sel], px[sel])
+        ndv = (N * (-M.normalize(ctx.I))).sum(1)
+        f = bi_fresnel_fac(-ndv, np.full(sel.size, blend, np.float32),
+                           np.full(sel.size, fres, np.float32))
+        fac[sel] = np.clip(f, 0.0, 1.0)
+    return fac
 
 
 def _no_layer_plan_why(job, atlases, tri):
@@ -1931,8 +2336,8 @@ def shade_fragments_frame(job, gbuf, tri, bary, px, py, rank):
                            'hal_tri_side']
                 + list(binds.get('frame_uniforms', ())),
                 'vec3': ['hal_eye']}
-        shader, err = device.compile_dynamic(f'HAL_TMAT_{mat_id}', src,
-                                             spec)
+        shader, err = device.compile_dynamic(
+            _pool_tag('HAL_TMAT', src, spec), src, spec)
         if shader is None:
             return None, f"the driver rejected '{name}' (layer): {err}"
         bind = {'hal_gb_attrs': tex_attrs, 'hal_gb_tris': tex_tris}
@@ -1952,6 +2357,8 @@ def shade_fragments_frame(job, gbuf, tri, bary, px, py, rank):
                 extra[u] = float(getattr(job.scene, 'time', 0.0))
             elif u == 'hal_frame':
                 extra[u] = float(getattr(job.scene, 'frame', 0))
+            elif u == 'hal_mrow':
+                extra[u] = float(binds.get('mat_row', 0))
         # the Bump height pre-passes: the same shaders the opaque frame
         # compiles (same names, same sources -- cache hits), drawn per
         # RANK below so the neighbour differences ride each layer's own
@@ -2000,8 +2407,8 @@ def shade_fragments_frame(job, gbuf, tri, bary, px, py, rank):
                                     'hal_tri_side']
                          + list(binds.get('frame_uniforms', ())),
                          'vec3': ['hal_eye']}
-                shader, err = device.compile_dynamic(f'{tag2}_{mat_id}',
-                                                     src, spec2)
+                shader, err = device.compile_dynamic(
+                    _pool_tag(tag2, src, spec2), src, spec2)
                 if shader is None:
                     return None, f"the driver rejected '{name}' " \
                                  f'(hit): {err}'
@@ -2021,6 +2428,8 @@ def shade_fragments_frame(job, gbuf, tri, bary, px, py, rank):
                         extra[u] = float(getattr(job.scene, 'time', 0.0))
                     elif u == 'hal_frame':
                         extra[u] = float(getattr(job.scene, 'frame', 0))
+                    elif u == 'hal_mrow':
+                        extra[u] = float(binds.get('mat_row', 0))
                 sec_draws[which2].append((name, shader, bind, extra))
     tm['compile_ms'] = (_time.perf_counter() - t_compile) * 1000.0
 
@@ -2154,8 +2563,20 @@ def shade_fragments_frame(job, gbuf, tri, bary, px, py, rank):
         if pools['layer'] is None:
             pools['layer'] = device.Target(w, h)
         target = pools['layer']
-        first_draw = True
         try:
+            # ALPHA_PREMULT -- the SAME blend every proven
+            # multi-material one-target merge uses (the opaque frame,
+            # the secondary sweeps). Materials are disjoint per pixel,
+            # so out = src + dst*(1-src.a) IS the plain sum the
+            # front-end's `acc += got` does: at a material's own
+            # pixels dst is 0; everywhere else src is vec4(0) with
+            # src.a 0, leaving dst intact. The first field run of
+            # this path used ADDITIVE_PREMULT -- the engine's only
+            # never-proven blend state -- and mismatched 1036 px;
+            # never stand new driver state under a new feature when
+            # a proven state computes the same thing.
+            # R175: the rank's passes and its readback in ONE crossing.
+            _rank_burst = []
             for mat_id, name, shader, bind, extra, prepasses in built:
                 if mat_id not in rank_mats:
                     continue
@@ -2163,25 +2584,13 @@ def shade_fragments_frame(job, gbuf, tri, bary, px, py, rank):
                 b['hal_gb_ids'] = tex_ids
                 for uname, _ps, _pb in prepasses:
                     b[uname] = pre_tex[(mat_id, uname)]
-                # ALPHA_PREMULT -- the SAME blend every proven
-                # multi-material one-target merge uses (the opaque frame,
-                # the secondary sweeps). Materials are disjoint per pixel,
-                # so out = src + dst*(1-src.a) IS the plain sum the
-                # front-end's `acc += got` does: at a material's own
-                # pixels dst is 0; everywhere else src is vec4(0) with
-                # src.a 0, leaving dst intact. The first field run of
-                # this path used ADDITIVE_PREMULT -- the engine's only
-                # never-proven blend state -- and mismatched 1036 px;
-                # never stand new driver state under a new feature when
-                # a proven state computes the same thing.
-                device.draw_fullscreen(shader, {**uni, **extra} if extra
-                                       else uni, b, target, read=False,
-                                       blend='ALPHA_PREMULT',
-                                       clear=first_draw, region=region)
-                first_draw = False
-            tr = _time.perf_counter()
-            img = device.read_target(target, region)
-            tm['read_ms'] += (_time.perf_counter() - tr) * 1000.0
+                _rank_burst.append(
+                    (shader, {**uni, **extra} if extra else uni, b,
+                     target, 'ALPHA_PREMULT', not _rank_burst, region))
+            # the fused burst counts under draw_ms (the outer window);
+            # read_ms keeps only reads that still cross alone
+            img = device.draw_many(_rank_burst, read=target,
+                                   read_region=region)
         except Exception as exc:                                # noqa: BLE001
             return _fail(f'layer {r} draw failed: {exc}')
         tm['draw_ms'] += (_time.perf_counter() - t0) * 1000.0 \
@@ -2208,18 +2617,16 @@ def shade_fragments_frame(job, gbuf, tri, bary, px, py, rank):
                     pools['sec'] = device.Target(w, h)
                 t2 = pools['sec']
                 try:
+                    # R175: the sweep's passes + readback, one crossing
+                    _sec_burst = []
                     for i2, (nm2, sh2, bd2, ex2) in enumerate(drawn):
                         b2 = dict(bd2)
                         b2['hal_gb_ids'] = tex_sec
-                        device.draw_fullscreen(sh2, {**uni, **ex2}
-                                               if ex2 else uni, b2, t2,
-                                               read=False,
-                                               blend='ALPHA_PREMULT',
-                                               clear=(i2 == 0),
-                                               region=_region)
-                    tr2 = _time.perf_counter()
-                    sec_r = device.read_target(t2, _region)
-                    tm['read_ms'] += (_time.perf_counter() - tr2) * 1000.0
+                        _sec_burst.append(
+                            (sh2, {**uni, **ex2} if ex2 else uni, b2,
+                             t2, 'ALPHA_PREMULT', i2 == 0, _region))
+                    sec_r = device.draw_many(_sec_burst, read=t2,
+                                             read_region=_region)
                 except _SweepFail:
                     raise
                 except Exception as exc:                        # noqa: BLE001
@@ -2362,6 +2769,8 @@ def simulate_fragments(job, gbuf, tri, bary, px, py, rank):
         uni2['hal_frame'] = np.full(n, float(getattr(job.scene,
                                                      'frame', 0)),
                                     np.float32)
+        uni2['hal_mrow'] = np.full(n, float(binds2.get('mat_row', 0)),
+                                   np.float32)
         uni2['vUV'] = uv
         return uni2
 
@@ -3152,6 +3561,9 @@ def simulate(job, gbuf, passes=None, atlases=None):
                                   np.float32)
         uni['hal_frame'] = np.full(n, float(getattr(job.scene, 'frame', 0)),
                                    np.float32)
+        # R174: this pass's row in the hal_mats value texture
+        uni['hal_mrow'] = np.full(n, float(binds.get('mat_row', 0)),
+                                  np.float32)
         uni['vUV'] = uv
         return uni
 
@@ -3260,6 +3672,7 @@ def shade_frame(job, gbuf):
     import time as _time
     from . import gbuffer as GB
     t_all = _time.perf_counter()
+    _compile_before = device.compile_stats()
     t0 = _time.perf_counter()
     mesh = job.scene.mesh
     mkey = _mesh_key(mesh)
@@ -3337,8 +3750,8 @@ def shade_frame(job, gbuf):
                                'hal_tri_side']
                     + list(binds.get('frame_uniforms', ())),
                     'vec3': ['hal_eye']}
-            shader, err = device.compile_dynamic(f'{tag}_{mat_id}', src,
-                                                 spec)
+            shader, err = device.compile_dynamic(_pool_tag(tag, src, spec),
+                                                 src, spec)
             if shader is None:
                 return None, f"the driver rejected '{name}': {err}"
             bind = {'hal_gb_ids': ids_tex, 'hal_gb_attrs': tex_attrs,
@@ -3365,6 +3778,8 @@ def shade_frame(job, gbuf):
                     extra[u] = float(getattr(job.scene, 'time', 0.0))
                 elif u == 'hal_frame':
                     extra[u] = float(getattr(job.scene, 'frame', 0))
+                elif u == 'hal_mrow':
+                    extra[u] = float(binds.get('mat_row', 0))
             built.append((name, shader, bind, extra))
         return built, None
 
@@ -3480,6 +3895,7 @@ def shade_frame(job, gbuf):
         return None, err
 
     t_draw = 0.0
+    _burst_snap = {}
     target = device.Target(w, h)
     try:
         # every pass blends into the one target -- each material writes only
@@ -3489,11 +3905,19 @@ def shade_frame(job, gbuf):
         # 14.3 ms warm frame; this is that line item, removed.
         t1 = _time.perf_counter()
         try:
-            for i, (name, shader, bind, extra) in enumerate(plan_draw):
-                device.draw_fullscreen(shader, {**uni, **extra} if extra
-                                       else uni, bind, target, read=False,
-                                       blend='ALPHA_PREMULT', clear=(i == 0))
-            got = device.read_target(target)
+            # R175: every pass and the readback in ONE marshal crossing
+            # -- the same commands in the same order, none of the
+            # per-pass queue sleeps (was ~14 ms of latency per pass)
+            got = device.draw_many(
+                [(shader, {**uni, **extra} if extra else uni, bind,
+                  target, 'ALPHA_PREMULT', i == 0, None)
+                 for i, (name, shader, bind, extra)
+                 in enumerate(plan_draw)],
+                read=target)
+            # snapshot NOW: the sweeps and layer ranks run their own
+            # bursts before LAST_TIMINGS is written, and this pair must
+            # describe the OPAQUE frame's burst
+            _burst_snap = dict(device.LAST_BURST)
         except Exception as exc:                                # noqa: BLE001
             # a driver that objects to the blend path gets the readback
             # path, not a CPU frame: slower is better than absent
@@ -3576,28 +4000,28 @@ def shade_frame(job, gbuf):
                 raise _SweepFail(str(err))
             target2 = device.Target(w, h)
             try:
-                for i2, (name, shader, bind, extra) in enumerate(sec_draw):
-                    # scissor to the hit box: a secondary pass can only
-                    # own hit pixels, and past level 1 the hits huddle in
-                    # a corner of a frame the pass used to cover whole
-                    device.draw_fullscreen(shader, {**uni, **extra}
-                                           if extra else uni, bind,
-                                           target2, read=False,
-                                           blend='ALPHA_PREMULT',
-                                           clear=(i2 == 0),
-                                           region=hit_region)
-                if hit_region is not None and \
-                        hit_region[2] * hit_region[3] < 0.5 * w * h:
-                    # sparse hits: read the box, not the frame -- the
-                    # composite only ever looks at hit pixels, and the
-                    # rest of a cleared target is zero either way
+                # scissor to the hit box: a secondary pass can only own
+                # hit pixels, and past level 1 the hits huddle in a
+                # corner of a frame the pass used to cover whole.
+                # R175: all sweeps and the readback in one crossing.
+                _sparse = hit_region is not None and \
+                    hit_region[2] * hit_region[3] < 0.5 * w * h
+                sec_r = device.draw_many(
+                    [(shader, {**uni, **extra} if extra else uni, bind,
+                      target2, 'ALPHA_PREMULT', i2 == 0, hit_region)
+                     for i2, (name, shader, bind, extra)
+                     in enumerate(sec_draw)],
+                    read=target2,
+                    read_region=hit_region if _sparse else None)
+                if _sparse:
+                    # sparse hits: the box crossed the bus, not the
+                    # frame -- the composite only ever looks at hit
+                    # pixels, and the rest of a cleared target is zero
                     rx, ry, rw2, rh2 = hit_region
-                    sec_r = device.read_target(target2,
-                                               region=hit_region)
                     sec_img = np.zeros((h, w, 4), np.float32)
                     sec_img[ry:ry + rh2, rx:rx + rw2] = sec_r
                 else:
-                    sec_img = device.read_target(target2)
+                    sec_img = sec_r
             except _SweepFail:
                 raise
             except Exception as exc:                            # noqa: BLE001
@@ -3628,15 +4052,32 @@ def shade_frame(job, gbuf):
         t_reflect = _time.perf_counter() - t1
 
     total = _time.perf_counter() - t_all
+    # driver compilations that happened INSIDE this frame: the field's
+    # 33.9s cold frame reported 'composite 19656 ms' -- which was the
+    # driver compiling 25 material shaders in the untimed gap where
+    # build_draws runs. Named now, and subtracted from composite so
+    # that bucket means what it says.
+    _cn1, _cms1 = device.compile_stats()
+    compile_ms = max(_cms1 - _compile_before[1], 0.0)
+    compile_n = max(_cn1 - _compile_before[0], 0)
     LAST_TIMINGS.clear()
     LAST_TIMINGS.update(
         plan_ms=t_plan * 1000.0,
         pack_upload_ms=t_upload * 1000.0,
         draw_read_ms=t_draw * 1000.0,
+        # R175b: measured INSIDE the burst crossing -- submission vs
+        # the readback wait (= the GPU actually executing). This pair
+        # names whether a slow draw+read is main-thread overhead or
+        # real driver work. Snapshotted at the opaque burst, before the
+        # sweeps run bursts of their own.
+        burst_draw_ms=float(_burst_snap.get('draw_ms', 0.0)),
+        burst_read_ms=float(_burst_snap.get('read_ms', 0.0)),
         reflect_ms=t_reflect * 1000.0,
         ray_build_ms=_RAY_BUILD[0],
-        composite_ms=max(total - t_upload - t_draw - t_reflect, 0.0)
-        * 1000.0,
+        compile_ms=compile_ms,
+        compile_n=compile_n,
+        composite_ms=max((total - t_upload - t_draw - t_reflect) * 1000.0
+                         - compile_ms, 0.0),
         passes=len(passes),
         # the reflect sub-split: where those milliseconds went and how
         # much of the recursion was all-miss levels skipped outright

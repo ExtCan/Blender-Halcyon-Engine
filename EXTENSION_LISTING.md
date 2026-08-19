@@ -27,6 +27,16 @@ vertices to integer screen coordinates and drops perspective correction, so
 textures swim across polygons the way they did. The Amiga HAM modes reproduce
 hold-and-modify properly, fringing and all.
 
+**New in this release: open your Blender 2.79 scenes.** File ▸ Import ▸
+Legacy Scene (.blend) — or a plain File ▸ Append — brings a
+2.79-or-earlier file in whole: the Blender Internal materials rebuild one
+to one (shader pairs, ramps, mirror, transparency, all eighteen texture
+slots, the original procedural textures on a ported BI Texture engine),
+lamps arrive with their true 2.79 energies and falloffs, shadows convert
+in both ray and buffer forms, and the old world comes along as sky,
+ambient and fog. Transcribed against the 2.79 source code and proven by
+the test suite, not approximated.
+
 ## What you get
 
 **18 shading models**, each implemented from its published formulation —

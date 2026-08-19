@@ -26,7 +26,9 @@ NEVER = 'NEVER'
 #: feature -> (support, one-line reason)
 FEATURES = {
     # --- proven on hardware
-    'display_transform': (BOTH, "exposure, gamma, contrast and saturation"),
+    'display_transform': (BOTH, "exposure, the view-transform curve "
+                          "(sRGB/Filmic/Reinhard), gamma, contrast and "
+                          "saturation"),
     'ordered_dither': (BOTH, "Bayer patterns and bit-depth quantisation"),
     'crt': (BOTH, "phosphor mask, scanlines and vignette"),
 

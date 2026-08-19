@@ -46,8 +46,19 @@ class Emitter:
         #                            guessing them right
 
         self.uv_names = ()         # the mesh's named UV maps, layer order
+        self.has_vcol = False      # the mesh HAS a colour layer: BI
+        #                            stripped vertex-colour modes when
+        #                            none existed (convertblender.c),
+        #                            and the ones-filled default plane
+        #                            must never read as painted white
         self.used_screen = False   # a code node read vScreenUV/iResolution
         self.bump_passes = []      # Bump nodes needing a height pre-pass
+        self.mark_values = False   # R174: wrap graph constants in hal_MV()
+        #                            markers so the material-texel lifter
+        #                            can pull them out of the source; set
+        #                            ONLY by assemble_frame, so height
+        #                            passes, worlds and every other
+        #                            Emitter user emit plain literals
         self._n = 0
 
     # ---------------------------------------------------------------- helpers
@@ -76,20 +87,37 @@ class Emitter:
             return f'vec4({var}, 1.0)'
         return var
 
-    @staticmethod
-    def const(value, gtype):
+    def const(self, value, gtype):
+        m = self._m
         if gtype == FLOAT:
             try:
                 v = float(value[0]) if hasattr(value, '__len__') else float(value)
             except (TypeError, ValueError):
                 v = 0.0
-            return f'{v:.8g}'
+            return m(v)
         seq = list(value) if hasattr(value, '__len__') else [float(value)] * 3
         while len(seq) < 4:
             seq.append(1.0)
         if gtype == VEC3:
-            return 'vec3({:.8g}, {:.8g}, {:.8g})'.format(*seq[:3])
-        return 'vec4({:.8g}, {:.8g}, {:.8g}, {:.8g})'.format(*seq[:4])
+            return 'vec3({}, {}, {})'.format(*map(m, seq[:3]))
+        return 'vec4({}, {}, {}, {})'.format(*map(m, seq[:4]))
+
+    def _m(self, v):
+        """One float, marked as a liftable VALUE when the flag is up.
+
+        Graph constants -- socket defaults, RGB/Value nodes, computed
+        node centres -- are exactly what differs between two materials
+        with the same STRUCTURE. Marked, the material-texel lifter pulls
+        them into the hal_mats texture and identical skeletons share one
+        compiled shader. Non-finite floats stay literal (structure)."""
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            f = 0.0
+        s = f'{f:.8g}'
+        if self.mark_values and f == f and abs(f) != float('inf'):
+            return f'hal_MV({s})'
+        return s
 
     def input(self, node, name, gtype):
         """The GLSL expression for one input socket, linked or defaulted.
@@ -549,6 +577,13 @@ def e_tex_image(em, node, index):
     `extension` are carried as declarations so the sampler can be configured
     to match what the CPU path does.
     """
+    # no image assigned: the CPU (n_tex_image) returns opaque black --
+    # emit exactly that, and register NO sampler. Refusing here sent the
+    # WHOLE frame plan to the CPU over a node that renders a constant.
+    if not prop(node, 'image'):
+        if index == 1:
+            return em.tmp(FLOAT, '1.0')
+        return em.tmp(VEC4, 'vec4(0.0, 0.0, 0.0, 1.0)')
     # an image texture defaults to UV, not generated -- the two are the same
     # on a unit cube and completely different on anything else
     v = tex_vector(em, node, 'uv')
@@ -618,8 +653,8 @@ def e_hue_sat(em, node, _i):
 
 
 def e_tex_coord(em, node, index):
-    # 0 Generated, 1 Normal, 2 UV, 3 Object, 4 Camera, 5 Window,
-    # 6 Reflection -- each the CPU's own n_tex_coord answer:
+    # Generated / Normal / UV / Object / Camera / Window / Reflection --
+    # each the CPU's own n_tex_coord answer:
     #   Object: the evaluator has no per-object inverse matrices, so it
     #           answers world P -- hal_P matches it exactly.
     #   Camera: c.P - camera_pos, NOT hal_P (the old emitter's silent
@@ -628,15 +663,28 @@ def e_tex_coord(em, node, index):
     #           very number. A HIT context has no screen pixel (px is
     #           None -> zeros on the CPU), so secondary passes emit
     #           zeros rather than the hit's screen position.
-    if index == 4:
+    # Dispatch by the serialized output NAME first: the CPU evaluator
+    # resolves links by name (n_tex_coord returns a name-keyed dict), so
+    # the GPU must read the SAME source or the two devices shade
+    # different pictures. Position is only the fallback for a nameless
+    # graph.
+    outs = node.get('outputs') or ()
+    name = ''
+    if index < len(outs):
+        name = str(outs[index].get('name') or '').strip().lower()
+    if not name:
+        name = ['generated', 'normal', 'uv', 'object', 'camera', 'window',
+                'reflection'][min(index, 6)]
+    if name == 'camera':
         return em.tmp(VEC3, '(hal_P - hal_eye)')
-    if index == 5:
+    if name == 'window':
         if em.secondary:
             return em.tmp(VEC3, 'vec3(0.0)')
         return em.tmp(VEC3, 'vec3(vUV, 0.0)')
-    names = ['hal_generated', 'hal_N', 'vec3(hal_uv, 0.0)', 'hal_P',
-             None, None, 'reflect(-hal_V, hal_N)']
-    return em.tmp(VEC3, names[min(index, len(names) - 1)])
+    table = {'generated': 'hal_generated', 'normal': 'hal_N',
+             'uv': 'vec3(hal_uv, 0.0)', 'object': 'hal_P',
+             'reflection': 'reflect(-hal_V, hal_N)'}
+    return em.tmp(VEC3, table.get(name, 'hal_generated'))
 
 
 def e_uvmap(em, node, _i):
@@ -1241,6 +1289,33 @@ def e_halcyon_shader(em, node, _i):
     return base, VEC4
 
 
+def e_bi_material(em, node, _i):
+    """The BI material node, as the deferred pass needs it: its colour.
+
+    Same contract as the Halcyon master: every other socket is a
+    surface parameter the frame probe harvests through
+    closure_to_surface (baked when constant, refused by name when
+    varying); the emitter owes the frame the Diffuse Color chain.
+    Options > Vertex Color Paint replaces an UNLINKED colour with the
+    mesh vertex colours, exactly n_bi_material's CPU read (a linked
+    chain is the artist's own business and wins)."""
+    p = node.get('props', {})
+    linked = False
+    for sock in node.get('inputs', ()):
+        nm = sock.get('identifier') or sock.get('name')
+        if nm == 'Diffuse Color' or sock.get('name') == 'Color':
+            linked = bool(sock.get('link'))
+            break
+    if p.get('vcol_paint') and not linked and em.has_vcol:
+        # verbatim shade_color (R164): the paint ALPHA-LERPS over the
+        # base colour, never replaces it outright
+        base = em.input(node, 'Diffuse Color', VEC4)
+        return em.tmp(VEC4, f'vec4(({base}).rgb * (1.0 - hal_vcol.a) '
+                            '+ hal_vcol.rgb * hal_vcol.a, '
+                            f'({base}).a)')
+    return em.tmp(VEC4, em.input(node, 'Diffuse Color', VEC4))
+
+
 def e_vertex_color(em, node, _i):
     """The mesh's painted colour, straight from the G-buffer.
 
@@ -1311,6 +1386,377 @@ def _pat_output(em, node, index, f):
     a, _t = em.tmp(VEC4, em.input(node, 'Color 1', VEC4))
     b, _t = em.tmp(VEC4, em.input(node, 'Color 2', VEC4))
     return em.tmp(VEC4, f'{a} + ({b} - {a}) * {fac}')
+
+
+_LUM709 = 'vec3(0.2126, 0.7152, 0.0722)'
+
+
+def _e_bi_slot_tin(em, node, tin, want_rgb=False):
+    """The slot prelude, exactly `_bi_slot_prelude`: RGBToIntensity
+    collapses the Color chain to Rec.709 luminance, Negative inverts.
+    All flags are node constants, so only the taken path is emitted.
+    Returns (tin_expr, rgb_expr_or_None, alpha_expr_or_None, is_rgb)."""
+    is_rgb = bool(prop(node, 'tex_rgb', False))
+    rgb = alpha = None
+    if is_rgb:
+        col = em.tmp(VEC4, em.input(node, 'Color', VEC4))[0]
+        rgb = em.tmp(VEC3, f'{col}.rgb')[0]
+        alpha = em.tmp(FLOAT, em.input(node, 'Alpha', FLOAT))[0]
+        # imagewrap's alpha law, verbatim (R158), same as the CPU
+        if bool(prop(node, 'calc_alpha', False)):
+            alpha = em.tmp(FLOAT, f'max({rgb}.r, max({rgb}.g, '
+                           f'{rgb}.b))')[0]
+        if bool(prop(node, 'neg_alpha', False)):
+            alpha = em.tmp(FLOAT, f'1.0 - {alpha}')[0]
+        if bool(prop(node, 'rgbtoint', False)):
+            tin = em.tmp(FLOAT, f'dot({rgb}, {_LUM709})')[0]
+            is_rgb = False
+            rgb = alpha = None
+    if bool(prop(node, 'negative', False)):
+        if is_rgb:
+            rgb = em.tmp(VEC3, f'vec3(1.0) - {rgb}')[0]
+        tin = em.tmp(FLOAT, f'1.0 - {tin}')[0]
+    return tin, rgb, alpha, is_rgb
+
+
+def e_bi_influence(em, node, _i):
+    """BI's value-channel influence, exactly `n_bi_influence`.
+
+    The blend mode is a node constant; the scalars arrive as
+    expressions, so a linked Factor keeps its per-pixel sign flip.
+    The slot prelude runs first: an RGB-yielding texture drives the
+    channel by luminance (or alpha under AlphaMix), never raw tin."""
+    base = em.tmp(FLOAT, em.input(node, 'Base', FLOAT))[0]
+    tin = em.tmp(FLOAT, em.input(node, 'Intensity', FLOAT))[0]
+    tin, rgb, alpha, is_rgb = _e_bi_slot_tin(em, node, tin)
+    if is_rgb:
+        tin = alpha if bool(prop(node, 'alphamix', False)) \
+            else em.tmp(FLOAT, f'dot({rgb}, {_LUM709})')[0]
+    fac = em.tmp(FLOAT, em.input(node, 'Factor', FLOAT))[0]
+    dvar = em.tmp(FLOAT, em.input(node, 'DVar', FLOAT))[0]
+    mode = prop(node, 'blend', 'MIX')
+    facg = em.tmp(FLOAT, f'abs({fac})')[0]
+    fact0 = em.tmp(FLOAT, f'{tin} * {facg}')[0]
+    fact = em.tmp(FLOAT,
+                  f'({fac} < 0.0) ? (1.0 - {fact0}) : {fact0}')[0]
+    facm = em.tmp(FLOAT,
+                  f'({fac} < 0.0) ? {fact0} : (1.0 - {fact0})')[0]
+    if mode == 'MIX':
+        expr = f'{fact} * {dvar} + {facm} * {base}'
+    elif mode == 'MUL':
+        expr = f'(1.0 - {facg} + {fact} * {dvar}) * {base}'
+    elif mode == 'SCREEN':
+        expr = (f'1.0 - (1.0 - {facg} + {fact} * (1.0 - {dvar}))'
+                f' * (1.0 - {base})')
+    elif mode == 'SUB':
+        expr = f'-{fact} * {dvar} + {base}'
+    elif mode == 'ADD':
+        expr = f'{fact} * {dvar} + {base}'
+    elif mode == 'DIV':
+        expr = (f'({dvar} != 0.0) ? ({facm} * {base} + {fact} * {base}'
+                f' / {dvar}) : 0.0')
+    elif mode == 'DIFF':
+        expr = f'{facm} * {base} + {fact} * abs({dvar} - {base})'
+    elif mode == 'DARK':
+        # verbatim 2.79 (R155): min(out,tex)*fact + out*facm
+        expr = f'min({base}, {dvar}) * {fact} + {base} * {facm}'
+    elif mode == 'LIGHT':
+        expr = f'max({fact} * {dvar}, {base})'
+    elif mode == 'OVERLAY':
+        expr = (f'({base} < 0.5) '
+                f'? ({base} * (1.0 - {facg} + 2.0 * {fact} * {dvar})) '
+                f': (1.0 - (1.0 - {facg} + 2.0 * {fact}'
+                f' * (1.0 - {dvar})) * (1.0 - {base}))')
+    elif mode == 'SOFT':
+        # verbatim 2.79 (R155): the last (base*scf) term is UNSCALED
+        scf = em.tmp(FLOAT,
+                     f'1.0 - (1.0 - {dvar}) * (1.0 - {base})')[0]
+        expr = (f'{facm} * {base} + {fact} * ((1.0 - {base})'
+                f' * {dvar} * {base}) + ({base} * {scf})')
+    elif mode == 'LINEAR':
+        expr = (f'({dvar} > 0.5) '
+                f'? ({base} + {fact} * (2.0 * ({dvar} - 0.5))) '
+                f': ({base} + {fact} * (2.0 * {dvar} - 1.0))')
+    else:
+        expr = '0.0'
+    return em.tmp(FLOAT, expr)
+
+
+def e_bi_rgb_blend(em, node, _i):
+    """BI's colour-channel influence, exactly `n_bi_rgb_blend`.
+
+    texture_rgb_blend per channel: tcol is the Color chain for an
+    RGB-yielding texture (its alpha the per-pixel factor) and the Slot
+    Color otherwise (the intensity the factor). The blend mode is a
+    node constant, so only its expression is emitted; the four
+    ramp_blend-delegating modes call the shading library's own
+    hal_ramp_blend, which every shading pass already carries."""
+    from ..core.shading import BI_RAMP_BLEND_ORDER
+    base = em.tmp(VEC3, f'({em.input(node, "Base", VEC4)}).rgb')[0]
+    tin = em.tmp(FLOAT, em.input(node, 'Intensity', FLOAT))[0]
+    tin, rgb, alpha, is_rgb = _e_bi_slot_tin(em, node, tin)
+    if is_rgb:
+        tcol = rgb
+        if bool(prop(node, 'map_alpha', False)):
+            if bool(prop(node, 'alphamix', False)):
+                tin = alpha
+        else:
+            tin = alpha
+    else:
+        tcol = em.tmp(VEC3,
+                      f'({em.input(node, "Slot Color", VEC4)}).rgb')[0]
+    facg = em.tmp(FLOAT, em.input(node, 'Factor', FLOAT))[0]
+    fact = em.tmp(FLOAT, f'{tin} * {facg}')[0]
+    facm = em.tmp(FLOAT, f'1.0 - {fact}')[0]
+    mode = prop(node, 'blend', 'MIX')
+    if mode == 'MIX':
+        expr = f'{fact} * {tcol} + {facm} * {base}'
+    elif mode == 'MUL':
+        # verbatim 2.79 (R155): the rgb fn's MUL/SCREEN/OVERLAY use
+        # facm = 1 - fact, NOT 1 - facg (that is the VALUE twin's shape)
+        expr = f'(vec3({facm}) + {fact} * {tcol}) * {base}'
+    elif mode == 'SCREEN':
+        expr = (f'vec3(1.0) - (vec3({facm}) + {fact} '
+                f'* (vec3(1.0) - {tcol})) * (vec3(1.0) - {base})')
+    elif mode == 'SUB':
+        expr = f'-{fact} * {tcol} + {base}'
+    elif mode == 'ADD':
+        expr = f'{fact} * {tcol} + {base}'
+    elif mode == 'DIV':
+        div = em.tmp(VEC3, f'{facm} * {base} + {fact} * {base} '
+                     f'/ mix(vec3(1.0), {tcol}, '
+                     f'vec3(notEqual({tcol}, vec3(0.0))))')[0]
+        expr = (f'mix({base}, {div}, '
+                f'vec3(notEqual({tcol}, vec3(0.0))))')
+    elif mode == 'DIFF':
+        expr = f'{facm} * {base} + {fact} * abs({tcol} - {base})'
+    elif mode == 'DARK':
+        # verbatim: min(out,tex)*fact + out*facm -- mix toward min
+        expr = f'min({base}, {tcol}) * {fact} + {base} * {facm}'
+    elif mode == 'LIGHT':
+        expr = f'max({fact} * {tcol}, {base})'
+    elif mode == 'OVERLAY':
+        low = em.tmp(VEC3, f'{base} * (vec3({facm}) '
+                     f'+ 2.0 * {fact} * {tcol})')[0]
+        high = em.tmp(VEC3, f'vec3(1.0) - (vec3({facm}) '
+                      f'+ 2.0 * {fact} * (vec3(1.0) - {tcol})) '
+                      f'* (vec3(1.0) - {base})')[0]
+        expr = f'mix({low}, {high}, step(vec3(0.5), {base}))'
+    elif mode in ('HUE', 'SAT', 'VAL', 'COLOR', 'SOFT', 'LINEAR'):
+        em.used_shading_lib = True
+        idx = BI_RAMP_BLEND_ORDER.index(mode)
+        expr = f'hal_ramp_blend({idx}, {base}, {fact}, {tcol})'
+    else:
+        expr = base
+    out = em.tmp(VEC3, expr)[0]
+    return em.tmp(VEC4, f'vec4({out}, 1.0)')
+
+
+def e_bi_texture(em, node, index):
+    """The Blender Internal texture node on the GPU: every setting is a
+    literal at emit time, so each node compiles to a direct call into
+    the bitex GLSL library (whose tables are generated from the same
+    module the CPU reads). The colorband is unrolled inline from the
+    node's own stops."""
+    from ..core.bitex import (TEX_BLEND, TEX_CLOUDS, TEX_DISTNOISE,
+                              TEX_MAGIC, TEX_MARBLE, TEX_MUSGRAVE,
+                              TEX_NOISE, TEX_STUCCI, TEX_VORONOI,
+                              TEX_WOOD, node_params)
+    _need_pattern(em, 'bitex')
+    _need_okramp(em)
+    key = ('__bitex_tab',)
+    if key not in em.once:
+        em.once.add(key)
+        # the tables ride a data texture, bound like any image but raw:
+        # no filter wrapper, texelFetch straight into the red channel
+        em.samplers.append({'uniform': 'hal_bitex_tab',
+                            'image': '__bitex_tables__', 'raw': True})
+
+    props = {k: prop(node, k) for k in (
+        'tex_type', 'noise_basis', 'noise_basis2', 'wave', 'hard_noise',
+        'noise_size', 'noise_depth', 'turbulence', 'clouds_color',
+        'wood_type', 'marble_type', 'blend_type', 'blend_flip',
+        'stucci_type', 'musgrave_type', 'mg_h', 'mg_lacunarity',
+        'mg_octaves', 'mg_offset', 'mg_gain', 'ns_outscale', 'vn_w1',
+        'vn_w2', 'vn_w3', 'vn_w4', 'vn_mexp', 'vn_distm', 'vn_coltype',
+        'dist_amount', 'bright', 'contrast', 'saturation', 'rgb_factors',
+        'use_clamp', 'classic_space', 'tex_offset', 'tex_size',
+        'use_colorband', 'coba_ipotype', 'coba')}
+    if props.get('use_clamp') is None:
+        props['use_clamp'] = True
+    if props.get('classic_space') is None:
+        props['classic_space'] = True
+    p = node_params(props)
+
+    def F(v):
+        return f'{float(v):.8f}'
+
+    ofs = props.get('tex_offset') or (0.0, 0.0, 0.0)
+    size = props.get('tex_size') or (1.0, 1.0, 1.0)
+    v = tex_vector(em, node, 'generated')
+    tv, _t = em.tmp(VEC3, (
+        f'bi_classic_texvec({v}, '
+        f'vec3({F(ofs[0])}, {F(ofs[1])}, {F(ofs[2])}), '
+        f'vec3({F(size[0])}, {F(size[1])}, {F(size[2])}), '
+        f'{1 if props.get("classic_space", True) else 0})'))
+
+    tt = p['type']
+    ns, dep = F(p['noisesize']), int(p['noisedepth'])
+    hard = int(p['noisetype'])
+    nb, nb2 = int(p['noisebasis']), int(p['noisebasis2'])
+    rgb_expr = None
+    if tt in (TEX_MUSGRAVE, TEX_VORONOI, TEX_DISTNOISE):
+        # multitex() pre-scales only these three by 1/noisesize
+        inv = 1.0 / (p['noisesize'] if p['noisesize'] != 0 else 1e-6)
+        tv, _t = em.tmp(VEC3, f'{tv} * {F(inv)}')
+    if tt == TEX_CLOUDS:
+        tin, _t = em.tmp(FLOAT,
+                         f'bi_tex_clouds({tv}, {ns}, {dep}, {hard}, {nb})')
+        if p['stype'] == 1:
+            rgb_expr, _t = em.tmp(VEC3, (
+                f'bi_tex_clouds_col({tv}, {ns}, {dep}, {hard}, {nb})'))
+    elif tt == TEX_WOOD:
+        tin, _t = em.tmp(FLOAT, (
+            f'bi_tex_wood({tv}, {p["stype"]}, {nb2}, {ns}, '
+            f'{F(p["turbul"])}, {hard}, {nb})'))
+    elif tt == TEX_MARBLE:
+        tin, _t = em.tmp(FLOAT, (
+            f'bi_tex_marble({tv}, {p["stype"]}, {nb2}, {ns}, '
+            f'{F(p["turbul"])}, {dep}, {hard}, {nb})'))
+    elif tt == TEX_MAGIC:
+        m4, _t = em.tmp(VEC4, f'bi_tex_magic({tv}, {dep}, '
+                              f'{F(p["turbul"])})')
+        tin, _t = em.tmp(FLOAT, f'{m4}.a')
+        rgb_expr, _t = em.tmp(VEC3, f'{m4}.rgb')
+    elif tt == TEX_BLEND:
+        flip = 1 if (p['flag'] & 2) else 0
+        tin, _t = em.tmp(FLOAT, f'bi_tex_blend({tv}, {p["stype"]}, '
+                                f'{flip})')
+    elif tt == TEX_STUCCI:
+        tin, _t = em.tmp(FLOAT, (
+            f'bi_tex_stucci({tv}, {p["stype"]}, {ns}, '
+            f'{F(p["turbul"])}, {hard}, {nb})'))
+    elif tt == TEX_NOISE:
+        em.frame_uniforms.add('hal_frame')
+        tin, _t = em.tmp(FLOAT, f'bi_tex_noise({tv}, {dep}, hal_frame)')
+    elif tt == TEX_MUSGRAVE:
+        tin, _t = em.tmp(FLOAT, (
+            f'bi_tex_musgrave({tv}, {p["stype"]}, {F(p["mg_H"])}, '
+            f'{F(p["mg_lacunarity"])}, {F(p["mg_octaves"])}, '
+            f'{F(p["mg_offset"])}, {F(p["mg_gain"])}, '
+            f'{F(p["ns_outscale"])}, {nb})'))
+    elif tt == TEX_VORONOI:
+        v4, _t = em.tmp(VEC4, (
+            f'bi_tex_voronoi({tv}, {F(p["vn_w1"])}, {F(p["vn_w2"])}, '
+            f'{F(p["vn_w3"])}, {F(p["vn_w4"])}, {F(p["vn_mexp"])}, '
+            f'{p["vn_distm"]}, {F(p["ns_outscale"])}, '
+            f'{p["vn_coltype"]})'))
+        tin, _t = em.tmp(FLOAT, f'{v4}.a')
+        if p['vn_coltype']:
+            rgb_expr, _t = em.tmp(VEC3, f'{v4}.rgb')
+    elif tt == TEX_DISTNOISE:
+        tin, _t = em.tmp(FLOAT, (
+            f'bi_tex_distnoise({tv}, {F(p["dist_amount"])}, {nb}, '
+            f'{nb2})'))
+    else:
+        tin, _t = em.tmp(FLOAT, '0.0')
+
+    # ---- colorband, unrolled from the node's stops
+    alpha = '1.0'
+    coba = p.get('coba')
+    if (p['flag'] & 1) and coba:
+        ipo = int(p.get('coba_ipotype', 0))
+        cb, _t = em.tmp(VEC4, 'vec4(0.0)')
+        n = len(coba)
+        if n == 1:
+            s = coba[0]
+            em.lines.append(f'{cb} = vec4({F(s[1])}, {F(s[2])}, '
+                            f'{F(s[3])}, {F(s[4])});')
+        else:
+            arr = ', '.join(
+                f'vec4({F(s[1])}, {F(s[2])}, {F(s[3])}, {F(s[4])})'
+                for s in coba)
+            pos = ', '.join(F(s[0]) for s in coba)
+            # array declarations use the `vec4 name[N]` form, never
+            # `vec4[N] name`: both are GLSL, but the second is the form
+            # shader translators (and Halcyon's own front-end, the
+            # headless proof) are least likely to accept
+            em._n += 1
+            cbc = f'_v{em._n}'
+            em.lines.append(f'    vec4 {cbc}[{n}] = vec4[{n}]({arr});')
+            em._n += 1
+            cbp = f'_v{em._n}'
+            em.lines.append(f'    float {cbp}[{n}] = float[{n}]({pos});')
+            body = (
+                '{\n'
+                '    int a = 0;\n'
+                f'    while (a < {n} && {cbp}[a] <= {tin}) {{ a++; }}\n'
+                f'    int ir = (a < {n}) ? a : {n} - 1;\n'
+                '    int il = (a > 0) ? a - 1 : 0;\n'
+                f'    float rpos = (a >= {n}) ? 1.0 : {cbp}[ir];\n'
+                f'    float lpos = (a <= 0) ? 0.0 : {cbp}[il];\n'
+                f'    vec4 rcol = {cbc}[ir];\n'
+                f'    vec4 lcol = {cbc}[il];\n'
+                '    float span = lpos - rpos;\n'
+                f'    float fac = (abs(span) > 1e-9) ? ({tin} - rpos) / span\n'
+                f'                                   : ((a >= {n}) ? 1.0 : 0.0);\n'
+                f'    int ipo = {ipo};\n'
+                f'    if (ipo == 4) {{ {cb} = lcol; }}\n'
+                '    else if (ipo == 2 || ipo == 3) {\n'
+                f'        int i0 = (a >= {n} - 1) ? ir : min(ir + 1, {n} - 1);\n'
+                '        int i3 = (a < 2) ? il : max(il - 1, 0);\n'
+                f'        vec4 c0 = {cbc}[i0]; vec4 c1 = rcol;\n'
+                f'        vec4 c2 = lcol; vec4 c3 = {cbc}[i3];\n'
+                '        float t = clamp(fac, 0.0, 1.0);\n'
+                '        float t2 = t * t; float t3 = t2 * t;\n'
+                '        vec4 res;\n'
+                '        if (ipo == 3) {\n'
+                '            res = (0.5 * t3 - 0.5 * t2) * c3\n'
+                '                + (-1.5 * t3 + 2.0 * t2 + 0.5 * t) * c2\n'
+                '                + (1.5 * t3 - 2.5 * t2 + 1.0) * c1\n'
+                '                + (-0.5 * t3 + t2 - 0.5 * t) * c0;\n'
+                '        } else {\n'
+                '            res = (0.16666666 * t3) * c3\n'
+                '                + (-0.5 * t3 + 0.5 * t2 + 0.5 * t + 0.16666666) * c2\n'
+                '                + (0.5 * t3 - t2 + 0.66666666) * c1\n'
+                '                + (-0.16666666 * t3 + 0.5 * t2 - 0.5 * t + 0.16666666) * c0;\n'
+                '        }\n'
+                f'        {cb} = clamp(res, 0.0, 1.0);\n'
+                '    } else {\n'
+                '        float f2 = clamp(fac, 0.0, 1.0);\n'
+                '        if (ipo == 1) { f2 = 3.0 * f2 * f2 - 2.0 * f2 * f2 * f2; }\n'
+                f'        {cb} = (1.0 - f2) * rcol + f2 * lcol;\n'
+                '    }\n'
+                '}')
+            em.lines.append(body)
+        rgb_expr, _t = em.tmp(VEC3, f'{cb}.rgb')
+        alpha, _t = em.tmp(FLOAT, f'{cb}.a')
+
+    # ---- BRICONT(RGB)
+    noclamp = 1 if (p['flag'] & 1024) else 0
+    rf = props.get('rgb_factors') or (1.0, 1.0, 1.0)
+    if rgb_expr is not None:
+        rgb_expr, _t = em.tmp(VEC3, (
+            f'bi_bricontrgb({rgb_expr}, {F(p["bright"])}, '
+            f'{F(p["contrast"])}, {F(p["saturation"])}, '
+            f'vec3({F(rf[0])}, {F(rf[1])}, {F(rf[2])}), {noclamp})'))
+        if not noclamp:
+            tin, _t = em.tmp(FLOAT, f'clamp({tin}, 0.0, 1.0)')
+    else:
+        tin, _t = em.tmp(FLOAT, (
+            f'bi_bricont({tin}, {F(p["bright"])}, {F(p["contrast"])}, '
+            f'{noclamp})'))
+
+    outs = node.get('outputs') or []
+    o = outs[index] if index < len(outs) else {}
+    name = o.get('name')
+    if name == 'Fac':
+        return tin, FLOAT
+    if name == 'Alpha':
+        return alpha, FLOAT
+    if rgb_expr is not None:
+        return em.tmp(VEC4, f'vec4({rgb_expr}, {alpha})')
+    return em.tmp(VEC4, f'vec4({tin}, {tin}, {tin}, 1.0)')
 
 
 _AXIS = {'X': 0, 'Y': 1, 'Z': 2}
@@ -1413,7 +1859,7 @@ def e_pat_ripples(em, node, index):
     total, _t = em.tmp(FLOAT, '0.0')
     for _ in range(n):
         c = (rng.random(3).astype(np.float32) - 0.5) * 2.0
-        d, _t = em.tmp(FLOAT, f'length({p} - {Emitter.const(c, VEC3)})')
+        d, _t = em.tmp(FLOAT, f'length({p} - {em.const(c, VEC3)})')
         total, _t = em.tmp(FLOAT,
                            f'{total} + sin({d} * max({freq}, 1e-3) - {tt})'
                            f' * exp(-{d} * max({decay}, 0.0))')
@@ -1900,7 +2346,14 @@ def _need_palette_fn(em, mode):
                  '    vec3 bc = vec3(0.0, 0.0, 0.0);',
                  '    vec3 e;', '    vec3 d;', '    float ds;']
         for k, entry in enumerate(pal):
-            lines.append(f'    e = {Emitter.const(entry, VEC3)};')
+            # a FIXED node palette is STRUCTURE, not a per-material
+            # value: formatted exactly as the old class-level const did,
+            # never marked for the R174 lifter
+            _pe = list(entry)
+            while len(_pe) < 3:
+                _pe.append(1.0)
+            lines.append('    e = vec3({:.8g}, {:.8g}, {:.8g});'.format(
+                *_pe[:3]))
             lines.append('    d = c - e;')
             lines.append('    ds = d.x * d.x + d.y * d.y + d.z * d.z;')
             lines.append(f'    if (ds < best) '
@@ -2151,6 +2604,12 @@ def e_matcap_uv(em, node, index):
     right, _t = em.tmp(VEC3, f'(dot({r0}, {r0}) < 1e-8) '
                              f'? vec3(1.0, 0.0, 0.0) : normalize({r0})')
     upv, _t = em.tmp(VEC3, f'cross(hal_V, {right})')
+    # source REFLECTION projects the mirror direction, exactly
+    # n_halcyon_matcap_uv -- BI's texco Refl
+    if prop(node, 'source', 'NORMAL') == 'REFLECTION':
+        p3, _t = em.tmp(VEC3, f'reflect(-hal_V, {n})')
+    else:
+        p3 = n
     scale, _t = em.tmp(FLOAT, em.input(node, 'Scale', FLOAT))
     # Centered + Offset, exactly `n_halcyon_matcap_uv`: origin-centred
     # output for sphere gradients, then the artist's shift
@@ -2158,8 +2617,8 @@ def e_matcap_uv(em, node, index):
     off, _t = em.tmp(VEC3, em.input(node, 'Offset', VEC3))
     return em.tmp(
         VEC3,
-        f'vec3(dot({n}, {right}) * 0.5 * {scale} + {centre}, '
-        f'dot({n}, {upv}) * 0.5 * {scale} + {centre}, 0.0) + {off}')
+        f'vec3(dot({p3}, {right}) * 0.5 * {scale} + {centre}, '
+        f'dot({p3}, {upv}) * 0.5 * {scale} + {centre}, 0.0) + {off}')
 
 
 def e_normal_map(em, node, _i):
@@ -2347,6 +2806,7 @@ def e_halcyon_blur(em, node, index):
 
 EMITTERS = {
     'HALCYON_ShaderNode': e_halcyon_shader,
+    'HALCYON_BIMaterialNode': e_bi_material,
     'HALCYON_CodeNode': e_code_node,
 
     'HALCYON_MatcapUVNode': e_matcap_uv,
@@ -2387,6 +2847,9 @@ EMITTERS = {
     'ShaderNodeTexGradient': e_tex_gradient,
     'ShaderNodeTexMagic': e_tex_magic,
     'ShaderNodeTexWave': e_tex_wave,
+    'HALCYON_BITextureNode': e_bi_texture,
+    'HALCYON_BIInfluenceNode': e_bi_influence,
+    'HALCYON_BIRGBBlendNode': e_bi_rgb_blend,
     'HALCYON_MarbleNode': e_pat_marble,
     'HALCYON_WoodNode': e_pat_wood,
     'HALCYON_GraniteNode': e_pat_granite,

@@ -7,7 +7,7 @@ printed once.
 """
 
 from . import device
-from .stages import ENABLED, MASK_KINDS, STAGES
+from .stages import CM_MODES, ENABLED, MASK_KINDS, STAGES
 
 _WARNED = set()
 
@@ -60,7 +60,8 @@ def display(image, st):
     return try_stage('DISPLAY', image, st, {
         'exposure': float(st.exposure), 'brightness': float(st.brightness),
         'contrast': float(st.contrast), 'saturation': float(st.saturation),
-        'gamma': max(float(st.gamma), 1e-3)})
+        'gamma': max(float(st.gamma), 1e-3),
+        'cm_mode': CM_MODES.get(str(st.color_management), 0)})
 
 
 def lens(image, st):

@@ -69,6 +69,7 @@ class ShadeContext:
         self.uv = np.zeros((n, 2), np.float32)
         self.uv2 = np.zeros((n, 2), np.float32)
         self.vcol = np.ones((n, 4), np.float32)
+        self.has_vcol = False      # a REAL colour layer fed vcol
         self.object_loc = z3.copy()
         self.object_color = np.ones((n, 4), np.float32)
         self.object_index = np.zeros(n, np.float32)
@@ -1636,7 +1637,8 @@ def desugar_master_bump(graph):
         return graph
     for nid in list(nodes.keys()):
         nd = nodes[nid]
-        if nd.get('bl_idname') != 'HALCYON_ShaderNode':
+        if nd.get('bl_idname') not in ('HALCYON_ShaderNode',
+                                       'HALCYON_BIMaterialNode'):
             continue
         ins = nd.get('inputs') or []
         bh = next((s for s in ins if s.get('name') == 'Bump Height'), None)
@@ -2282,6 +2284,160 @@ def n_halcyon_shader(ev, node):
         model=model,
     )
     cl.add('HALCYON', _w(ev), **kw)
+    return {'Surface': cl, 'BSDF': cl}
+
+
+def n_bi_material(ev, node):
+    """The BI material node: Blender Internal's material panel as one
+    node, with the diffuse and specular shader menus kept INDEPENDENT.
+
+    Builds the same 'HALCYON' closure the master shader builds, with
+    the model packed as 'BI_MATRIX_{d}_{s}' (or CONSTANT under
+    Shadeless) and BI's own controls riding the closure: Hardness in
+    glossiness, Refr in ior, Oren roughness or Minnaert Darkness in
+    roughness, WardIso's Slope in bi_slope, the specular Toon pair in
+    toon_size2/toon_smooth2, the diffuse-Fresnel pair in
+    bi_fresnel/bi_fresnel_fac. Emit is BI's float: it emits the
+    DIFFUSE CHAIN's colour, textures included, times the slider.
+    """
+    import types as _types
+    from .render import bi_matrix_model
+    p = node.get('props', {})
+    model = bi_matrix_model(p)
+    diff = p.get('diff_shader', 'LAMBERT')
+
+    base = ev.input(node, 'Diffuse Color', RGBA)
+    if p.get('vcol_paint') and not ev.has_link(node, 'Diffuse Color') \
+            and getattr(ev.ctx, 'has_vcol', False):
+        # Options > Vertex Color Paint, verbatim shade_color (R164):
+        # the paint ALPHA-LERPS over the base colour --
+        # r = r*(1-vcol.a) + vcol.rgb*vcol.a -- it never replaces it
+        # outright (the old code did, wrong wherever the paint layer
+        # carries alpha). A LINKED colour chain is the artist's own
+        # business and wins; no colour layer -> BI stripped the mode.
+        mesh_col = getattr(ev.ctx, 'vcol', None)
+        if mesh_col is not None:
+            vc = coerce(mesh_col, RGBA, ev.n)
+            na = 1.0 - vc[:, 3:4]
+            base = base.copy()
+            base[:, :3] = base[:, :3] * na + vc[:, :3] * vc[:, 3:4]
+    emit = ev.input(node, 'Emit', VALUE)
+    emission = base[:, :3] * emit[:, None]
+    if p.get('vcol_light') and getattr(ev.ctx, 'has_vcol', False):
+        # Options > Vertex Color Light: vcol.rgb * vcol.a joins the
+        # emit term, 2.79's additional-lighting add. No colour layer ->
+        # BI stripped the mode, so no ones-white glow either
+        mesh_col = getattr(ev.ctx, 'vcol', None)
+        if mesh_col is not None:
+            vc = coerce(mesh_col, RGBA, ev.n)
+            emission = emission + vc[:, :3] * vc[:, 3:4]
+    if diff == 'MINNAERT':
+        rough = ev.input(node, 'Darkness', VALUE)
+    else:
+        rough = ev.input(node, 'Roughness', VALUE)
+
+    # ---- the transparency panel
+    use_transp = bool(p.get('use_transparency', False))
+    transp_mode = p.get('transp_mode', 'Z_TRANSPARENCY')
+    if use_transp:
+        opacity = ev.input(node, 'Opacity', VALUE)
+        t_fres = ev.input(node, 'Transp Fresnel', VALUE)
+        t_blend = ev.input(node, 'Transp Blend', VALUE)
+        spectra = ev.input(node, 'Transp Specular', VALUE)
+    else:
+        # panel off: the material is opaque, sliders inert -- exactly
+        # the greyed-out 2.79 panel
+        opacity = 1.0
+        t_fres = 0.0
+        t_blend = 1.25
+        spectra = 0.0
+    refraction = 1.0 if (use_transp and transp_mode == 'RAYTRACE') else 0.0
+
+    # ---- the mirror panel
+    use_mirror = bool(p.get('use_mirror', False))
+    if use_mirror:
+        reflect = ev.input(node, 'Reflection', VALUE)
+        m_fres = ev.input(node, 'Mirror Fresnel', VALUE)
+        m_blend = ev.input(node, 'Mirror Blend', VALUE)
+    else:
+        reflect = 0.0
+        m_fres = 0.0
+        m_blend = 1.25
+
+    # ---- the non-numeric extras: ramps and the light group
+    def _ramp(prefix):
+        if not p.get(f'use_{prefix}'):
+            return None
+        stops = p.get(f'{prefix}_stops')
+        if not stops:
+            return None
+        return {'stops': [tuple(float(x) for x in s) for s in stops],
+                'input': p.get(f'{prefix}_input', 'SHADER'),
+                'blend': p.get(f'{prefix}_blend', 'MIX'),
+                'factor': float(p.get(f'{prefix}_factor', 1.0)),
+                'ipotype': int(p.get(f'{prefix}_ipo', 0))}
+
+    ramp_dif = _ramp('ramp_dif')
+    ramp_spec = _ramp('ramp_spec')
+    group = p.get('light_group_lights') or None
+    # R164: the shade_one_light terminator fix and the object-colour
+    # modulation ride the extras too
+    sbias = float(p.get('sbias', 0.0) or 0.0)
+    raybias = bool(p.get('raybias'))
+    use_obcolor = bool(p.get('use_obcolor'))
+    bi_extras = None
+    if ramp_dif or ramp_spec or group or sbias != 0.0 or raybias \
+            or use_obcolor:
+        bi_extras = _types.SimpleNamespace(
+            ramp_dif=ramp_dif, ramp_spec=ramp_spec,
+            light_group=frozenset(group) if group else None,
+            sbias=sbias, raybias=raybias, use_obcolor=use_obcolor)
+
+    cl = Closure()
+    cl.add(
+        'HALCYON', _w(ev),
+        color=base,
+        diffuse_level=ev.input(node, 'Diffuse Level', VALUE),
+        spec_color=ev.input(node, 'Specular Color', RGBA),
+        spec_level=ev.input(node, 'Specular Level', VALUE),
+        glossiness=ev.input(node, 'Glossiness', VALUE),
+        roughness=rough,
+        ior=ev.input(node, 'IOR', VALUE),
+        bi_slope=ev.input(node, 'Slope', VALUE),
+        toon_size=ev.input(node, 'Toon Size', VALUE),
+        toon_smooth=ev.input(node, 'Toon Smooth', VALUE),
+        toon_size2=ev.input(node, 'Spec Toon Size', VALUE),
+        toon_smooth2=ev.input(node, 'Spec Toon Smooth', VALUE),
+        bi_fresnel=ev.input(node, 'BI Fresnel', VALUE),
+        bi_fresnel_fac=ev.input(node, 'BI Fresnel Factor', VALUE),
+        ambient=ev.input(node, 'Ambient', VALUE),
+        emission=emission,
+        opacity=opacity,
+        bi_transp_fresnel=t_fres,
+        bi_transp_blend=t_blend,
+        bi_spectra=spectra,
+        refraction=refraction,
+        ray_ior=_opt(ev, node, 'Ray IOR', VALUE, 1.3)
+        if use_transp and transp_mode == 'RAYTRACE' else 1.45,
+        bi_ray_filter=_opt(ev, node, 'Filter', VALUE, 0.0)
+        if use_transp and transp_mode == 'RAYTRACE' else 1.0,
+        reflect=reflect,
+        reflect_color=_opt(ev, node, 'Reflection Color', RGBA, (1, 1, 1)),
+        bi_mir_fresnel=m_fres,
+        bi_mir_blend=m_blend,
+        translucency=ev.input(node, 'Translucency', VALUE),
+        bi_cubic=1.0 if p.get('use_cubic') else 0.0,
+        bi_tangent=1.0 if p.get('use_tangent_v') else 0.0,
+        shadow_receive=1.0 if p.get('shadow_receive', True) else 0.0,
+        cast_only=1.0 if p.get('shadow_cast_only') else 0.0,
+        shadows_only=1.0 if p.get('shadow_only') else 0.0,
+        use_mist=1.0 if p.get('use_mist', True) else 0.0,
+        bi_extras=bi_extras,
+        bump_strength=_opt(ev, node, 'Bump Strength', VALUE, 1.0),
+        normal=ev.input(node, 'Normal', VECTOR)
+        if ev.has_link(node, 'Normal') else None,
+        model=model,
+    )
     return {'Surface': cl, 'BSDF': cl}
 
 
@@ -3228,8 +3384,12 @@ def n_halcyon_matcap_uv(ev, node):
     if degenerate.any():
         right[degenerate] = np.array([1.0, 0.0, 0.0], np.float32)
     upv = np.cross(V, right)
-    x = M.dot(N, right)
-    y = M.dot(N, upv)
+    # source REFLECTION projects the mirror direction instead of the
+    # normal -- BI's texco Refl, the env-map chrome trick
+    P3 = M.reflect(-V, N) if _prop(node, 'source', 'NORMAL') == \
+        'REFLECTION' else N
+    x = M.dot(P3, right)
+    y = M.dot(P3, upv)
     scale = ev.input(node, 'Scale', VALUE)
     # Centered maps the sphere about the origin (-0.5..0.5) instead of
     # image space (0..1): |vector| then measures distance from the sphere
@@ -3243,6 +3403,180 @@ def n_halcyon_matcap_uv(ev, node):
         np.asarray(off, np.float32)
     return {'Vector': uv.astype(np.float32), 'Facing':
             np.clip(M.dot(N, V), 0.0, 1.0).astype(np.float32)}
+
+
+
+
+def _bi_slot_prelude(ev, node, tin):
+    """do_material_tex's texture-output stage, per slot.
+
+    Runs BEFORE the channel split, exactly as the C does: RGBToIntensity
+    collapses an RGB result to its Rec.709 luminance and clears the RGB
+    flag; Negative inverts whatever is left. Returns (tin, rgb, alpha,
+    is_rgb) -- `rgb`/`alpha` are None unless the slot's texture yields
+    colour (`tex_rgb` prop, set by the importer from the texture kind
+    and its colorband, mirroring multitex's TEX_RGB return)."""
+    from .bitex import rec709_lum
+    is_rgb = bool(_prop(node, 'tex_rgb', False))
+    rgb = alpha = None
+    if is_rgb:
+        col = ev.input(node, 'Color', RGBA)
+        rgb = col[:, :3]
+        alpha = ev.input(node, 'Alpha', VALUE)
+        # imagewrap's alpha law, verbatim (R158): CALCALPHA replaces
+        # the alpha with max(r,g,b); NEGALPHA inverts whatever was
+        # decided. (No Use Alpha at all leaves the input at its
+        # default 1.0 -- the importer simply does not wire it.)
+        if bool(_prop(node, 'calc_alpha', False)):
+            alpha = rgb.max(axis=1).astype(np.float32)
+        if bool(_prop(node, 'neg_alpha', False)):
+            alpha = (1.0 - alpha).astype(np.float32)
+        if bool(_prop(node, 'rgbtoint', False)):
+            tin = rec709_lum(rgb)
+            is_rgb = False
+            rgb = alpha = None
+    if bool(_prop(node, 'negative', False)):
+        if is_rgb:
+            rgb = (1.0 - rgb).astype(np.float32)
+        tin = (1.0 - tin).astype(np.float32)
+    return tin, rgb, alpha, is_rgb
+
+
+def n_bi_influence(ev, node):
+    """BI's value-channel influence: texture_value_blend as a node.
+
+    Vectorized element-for-element against bitex.texture_value_blend
+    (the scalar reference transcription), so a linked Factor or DVar
+    behaves per pixel and constants match the C exactly. The slot
+    prelude runs first: an RGB-yielding texture (colorband clouds, an
+    image) drives a value channel by its Rec.709 LUMINANCE -- or its
+    alpha under AlphaMix -- never by the raw pre-band intensity; the
+    field's porcelain mask lost its banded marbling to
+    exactly that difference."""
+    base = ev.input(node, 'Base', VALUE)
+    tin = ev.input(node, 'Intensity', VALUE)
+    tin, rgb, alpha, is_rgb = _bi_slot_prelude(ev, node, tin)
+    if is_rgb:
+        from .bitex import rec709_lum
+        tin = alpha if bool(_prop(node, 'alphamix', False)) \
+            else rec709_lum(rgb)
+    fac = ev.input(node, 'Factor', VALUE)
+    dvar = ev.input(node, 'DVar', VALUE)
+    mode = _prop(node, 'blend', 'MIX')
+    facg = np.abs(fac)
+    fact0 = tin * facg
+    facm0 = 1.0 - fact0
+    flip = fac < 0.0
+    fact = np.where(flip, facm0, fact0)
+    facm = np.where(flip, fact0, facm0)
+    if mode == 'MIX':
+        out = fact * dvar + facm * base
+    elif mode == 'MUL':
+        out = (1.0 - facg + fact * dvar) * base
+    elif mode == 'SCREEN':
+        out = 1.0 - (1.0 - facg + fact * (1.0 - dvar)) * (1.0 - base)
+    elif mode == 'SUB':
+        out = -fact * dvar + base
+    elif mode == 'ADD':
+        out = fact * dvar + base
+    elif mode == 'DIV':
+        out = np.where(dvar != 0.0,
+                       facm * base + fact * base
+                       / np.where(dvar != 0.0, dvar, 1.0), 0.0)
+    elif mode == 'DIFF':
+        out = facm * base + fact * np.abs(dvar - base)
+    elif mode == 'DARK':
+        # verbatim 2.79 (R155): min(out,tex)*fact + out*facm
+        out = np.minimum(base, dvar) * fact + base * facm
+    elif mode == 'LIGHT':
+        col = fact * dvar
+        out = np.where(col > base, col, base)
+    elif mode == 'OVERLAY':
+        low = base * (1.0 - facg + 2.0 * fact * dvar)
+        high = 1.0 - (1.0 - facg + 2.0 * fact * (1.0 - dvar)) \
+            * (1.0 - base)
+        out = np.where(base < 0.5, low, high)
+    elif mode == 'SOFT':
+        # verbatim 2.79 (R155): the last (base*scf) term is UNSCALED
+        scf = 1.0 - (1.0 - dvar) * (1.0 - base)
+        out = facm * base + fact * ((1.0 - base) * dvar * base) \
+            + (base * scf)
+    elif mode == 'LINEAR':
+        out = np.where(dvar > 0.5,
+                       base + fact * (2.0 * (dvar - 0.5)),
+                       base + fact * (2.0 * dvar - 1.0))
+    else:
+        out = np.zeros_like(base)
+    return {'Value': np.asarray(out, np.float32)}
+
+
+def n_bi_rgb_blend(ev, node):
+    """BI's colour-channel influence: texture_rgb_blend as a node.
+
+    do_material_tex's colour mapping, exactly: after the slot prelude,
+    an RGB-yielding texture supplies tcol and its per-pixel factor is
+    the texture's ALPHA (unless the same slot also maps Alpha without
+    AlphaMix, where the intensity stays); an intensity texture
+    supplies only the factor, and tcol is the SLOT's own colour --
+    the swatch in the Influence panel, not the texture. The old
+    import sent the grey texture through a MixRGB at a constant
+    factor: the per-pixel modulation BI puts in the FACTOR was lost,
+    and the slot colour never existed."""
+    from .bitex import texture_rgb_blend
+    base = ev.input(node, 'Base', RGBA)[:, :3]
+    tin = ev.input(node, 'Intensity', VALUE)
+    tin, rgb, alpha, is_rgb = _bi_slot_prelude(ev, node, tin)
+    if is_rgb:
+        tcol = rgb
+        if bool(_prop(node, 'map_alpha', False)):
+            if bool(_prop(node, 'alphamix', False)):
+                tin = alpha
+        else:
+            tin = alpha
+    else:
+        slot = ev.input(node, 'Slot Color', RGBA)
+        tcol = slot[:, :3]
+    fac = float(np.asarray(ev.input(node, 'Factor', VALUE)).reshape(-1)[0])
+    mode = _prop(node, 'blend', 'MIX')
+    out = texture_rgb_blend(tcol, base, tin, np.float32(fac), mode)
+    a = np.ones(out.shape[0], np.float32)
+    return {'Color': np.concatenate([out, a[:, None]],
+                                    axis=1).astype(np.float32)}
+
+
+def n_bi_texture(ev, node):
+    """The Blender Internal texture node: core/bitex.py evaluated at the
+    node's classic-space coordinates. Colour textures return their RGB;
+    intensity textures return grey, exactly as BI presented them."""
+    from . import bitex as BX
+    props = {k: _prop(node, k) for k in (
+        'tex_type', 'noise_basis', 'noise_basis2', 'wave', 'hard_noise',
+        'noise_size', 'noise_depth', 'turbulence', 'clouds_color',
+        'wood_type', 'marble_type', 'blend_type', 'blend_flip',
+        'stucci_type', 'musgrave_type', 'mg_h', 'mg_lacunarity',
+        'mg_octaves', 'mg_offset', 'mg_gain', 'ns_outscale', 'vn_w1',
+        'vn_w2', 'vn_w3', 'vn_w4', 'vn_mexp', 'vn_distm', 'vn_coltype',
+        'dist_amount', 'bright', 'contrast', 'saturation', 'rgb_factors',
+        'use_clamp', 'classic_space', 'tex_offset', 'tex_size',
+        'use_colorband', 'coba_ipotype', 'coba')}
+    if props.get('use_clamp') is None:
+        props['use_clamp'] = True
+    if props.get('classic_space') is None:
+        props['classic_space'] = True
+    params = BX.node_params(props)
+    vec = _tex_vector(ev, node, 'generated')
+    tv = BX.classic_texvec(vec, props.get('tex_offset') or (0, 0, 0),
+                           props.get('tex_size') or (1, 1, 1),
+                           bool(props.get('classic_space', True)))
+    tin, rgba = BX.evaluate(params, tv, frame=int(ev.ctx.frame))
+    if rgba is not None:
+        col = rgba
+        alpha = rgba[:, 3]
+    else:
+        col = np.stack([tin, tin, tin, np.ones_like(tin)], axis=1)
+        alpha = np.ones_like(tin)
+    return {'Color': col.astype(np.float32), 'Fac': tin.astype(np.float32),
+            'Alpha': alpha.astype(np.float32)}
 
 
 DISPATCH = {
@@ -3373,6 +3707,10 @@ DISPATCH = {
     'NodeGroupOutput': n_group_output,
     # Halcyon
     'HALCYON_ShaderNode': n_halcyon_shader,
+    'HALCYON_BIMaterialNode': n_bi_material,
+    'HALCYON_BITextureNode': n_bi_texture,
+    'HALCYON_BIInfluenceNode': n_bi_influence,
+    'HALCYON_BIRGBBlendNode': n_bi_rgb_blend,
     'HALCYON_CodeNode': n_halcyon_code,
     'HALCYON_PosterizeNode': n_halcyon_posterize,
     'HALCYON_DitherNode': n_halcyon_dither,

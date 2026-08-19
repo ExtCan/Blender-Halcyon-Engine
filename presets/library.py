@@ -26,8 +26,57 @@ PRESETS = {
     },
 
     # ------------------------------------------------------------- software
+    'BLENDER_INTERNAL': {
+        'label': "Blender Internal 2.79 (2017)",
+        'category': 'SOFTWARE',
+        'note': "The renderer the classic .blend files were made for. "
+                "BI's own Lambert/CookTorr default, per-lamp shadows "
+                "exactly as each lamp authored them (Ray, a spot's "
+                "Buffer, or none at all), ray depth 2, Mitchell "
+                "anti-aliasing and Blender's soft dither. 2.79 "
+                "rendered scene-linear and showed it through the "
+                "scene's 'Default' view -- the sRGB display encode -- "
+                "so this preset runs the same two pipeline ends: "
+                "sRGB textures linearize on load, and the sRGB curve "
+                "grades the final frame. Pair it with a legacy import "
+                "for the closest match to the original render. BI "
+                "defaulted to 8 AA samples; 4 here renders 4x the "
+                "pixels instead of 9x -- raise it if the edges matter "
+                "more than the wait.",
+        'settings': {
+            'default_model': 'BI_COOKTORR', 'shading_rate': 'PIXEL',
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'aa_filter': 'MITCHELL',
+            # PER_LIGHT: the import stamps each lamp with 2.79's own
+            # rule (spot+buffer -> map, the Ray bit -> traced, neither
+            # -> NO shadow). Forcing RAY here shadowed lamps BI never
+            # shadowed AND built a BVH into every viewport update --
+            # the field's 'preset cripples rendering time'.
+            'shadows': True, 'shadow_default': 'PER_LIGHT',
+            'raytrace': True, 'ray_depth': 2,
+            'ray_reflection': True, 'ray_refraction': True,
+            'transparency': 'SORTED',
+            'tex_filter': 'TRILINEAR', 'tex_perspective': True,
+            'color_depth': '24', 'dither': 'NOISE',
+            # 2.79's REAL pipeline (the file DNA says so: view
+            # transform 'Default' on an sRGB display): linear render,
+            # sRGB display encode. SRGB here is Halcyon's OWN curve --
+            # Blender stays pinned to Raw, so nothing double-grades
+            # (the R153 grey wash was Blender's 'Standard' stacked on
+            # engine output). input_gamma_naive False is the matching
+            # input end: sRGB textures linearize on load, exactly as
+            # BI sampled them. DNA colours are already linear.
+            # specular_in_gamma True: BI added specular in linear
+            # light like everything else; False's pow-2.2 crush is a
+            # 2.4x-era emulation, not 2.79.
+            'color_management': 'SRGB', 'input_gamma_naive': False,
+            'gamma': 1.0, 'specular_in_gamma': True,
+            'global_ambient': (0.0, 0.0, 0.0),
+            'fog': False, 'glow': False,
+        },
+    },
     'INFINID_4': {
-        'label': "Specular Infini-D 4",
+        'label': "Specular Infini-D 4 (1995)",
         'category': 'SOFTWARE',
         'note': "Mac Phong renderer, 1995. Clean 24-bit output, soft shadow maps, "
                 "no ambient occlusion and a slightly hot specular.",
@@ -45,7 +94,7 @@ PRESETS = {
         },
     },
     'RAY_DREAM_5': {
-        'label': "Ray Dream Studio 5",
+        'label': "Ray Dream Studio 5 (1996)",
         'category': 'SOFTWARE',
         'note': "Ray-traced reflections and a glossy plastic default. "
                 "Gaussian AA, slight glow on highlights.",
@@ -61,7 +110,7 @@ PRESETS = {
         },
     },
     'STRATA_PRO': {
-        'label': "Strata StudioPro 1.75",
+        'label': "Strata StudioPro 1.75 (1995)",
         'category': 'SOFTWARE',
         'note': "The chrome-and-marble Mac look: hard ray-traced reflections, "
                 "sharp shadows, a cross-screen star filter on the highlights.",
@@ -76,7 +125,7 @@ PRESETS = {
         },
     },
     'MAX_R2': {
-        'label': "3D Studio MAX R2",
+        'label': "3D Studio MAX R2 (1997)",
         'category': 'SOFTWARE',
         'note': "Blinn default with the Soften parameter, shadow maps, and the "
                 "characteristic slightly grey ambient.",
@@ -91,7 +140,7 @@ PRESETS = {
         },
     },
     'STUDIO_R4': {
-        'label': "3D Studio R4 (DOS)",
+        'label': "3D Studio R4, DOS (1994)",
         'category': 'SOFTWARE',
         'note': "The 320x200 VGA workhorse. Phong, 8 lights maximum, "
                 "256 colours with an adaptive palette.",
@@ -108,7 +157,7 @@ PRESETS = {
         },
     },
     'TRUESPACE_2': {
-        'label': "trueSpace 2",
+        'label': "trueSpace 2 (1995)",
         'category': 'SOFTWARE',
         'note': "Fast Phong scanline with hard shadow maps and 16-bit colour.",
         'settings': {
@@ -121,7 +170,7 @@ PRESETS = {
         },
     },
     'LIGHTWAVE_56': {
-        'label': "LightWave 5.6",
+        'label': "LightWave 5.6 (1998)",
         'category': 'SOFTWARE',
         'note': "Broadcast-quality scanline: sharp AA, ray-traced shadows, "
                 "the classic Toaster-era specular.",
@@ -136,7 +185,7 @@ PRESETS = {
         },
     },
     'IMAGINE_3': {
-        'label': "Imagine 3.0 (Amiga)",
+        'label': "Imagine 3.0, Amiga (1994)",
         'category': 'SOFTWARE',
         'note': "HAM8 framebuffer, Phong shading, the fringing on colour "
                 "transitions that hold-and-modify always produced.",
@@ -151,7 +200,7 @@ PRESETS = {
         },
     },
     'POVRAY_31': {
-        'label': "POV-Ray 3.1",
+        'label': "POV-Ray 3.1 (1998)",
         'category': 'SOFTWARE',
         'note': "Pure ray tracer: hard shadows, mirror reflections, "
                 "no ambient occlusion and a flat ambient term.",
@@ -166,7 +215,7 @@ PRESETS = {
         },
     },
     'BRYCE_2': {
-        'label': "Bryce 2",
+        'label': "Bryce 2 (1996)",
         'category': 'SOFTWARE',
         'note': "Hazy terrain look: heavy linear fog, soft key light, "
                 "gentle bloom.",
@@ -184,7 +233,7 @@ PRESETS = {
 
     # ---------------------------------------------------- more software
     'ELECTRIC_IMAGE': {
-        'label': "ElectricImage 2.9",
+        'label': "ElectricImage 2.9 (1996)",
         'category': 'SOFTWARE',
         'note': "The high-end Mac scanline renderer. Very clean edges, tight "
                 "speculars, 24-bit output and no visible dither.",
@@ -199,7 +248,7 @@ PRESETS = {
         },
     },
     'SOFTIMAGE_3D': {
-        'label': "Softimage|3D",
+        'label': "Softimage|3D (1994)",
         'category': 'SOFTWARE',
         'note': "Film-house scanline: heavy anti-aliasing, ray-traced shadows, "
                 "restrained specular. The look of mid-90s effects work.",
@@ -213,7 +262,7 @@ PRESETS = {
         },
     },
     'ALIAS_POWER': {
-        'label': "Alias PowerAnimator",
+        'label': "Alias PowerAnimator (1993)",
         'category': 'SOFTWARE',
         'note': "SGI workstation output: Blinn surfaces, clean ray tracing, "
                 "and the slightly cool cast of an Indigo monitor.",
@@ -226,7 +275,7 @@ PRESETS = {
         },
     },
     'WAVEFRONT': {
-        'label': "Wavefront Advanced Visualizer",
+        'label': "Wavefront Advanced Visualizer (1988)",
         'category': 'SOFTWARE',
         'note': "Early-90s SGI scanline. Hard shadow maps, Phong highlights, "
                 "no ambient occlusion of any kind.",
@@ -240,7 +289,7 @@ PRESETS = {
         },
     },
     'CINEMA4D_4': {
-        'label': "CINEMA 4D v4",
+        'label': "CINEMA 4D v4 (1996)",
         'category': 'SOFTWARE',
         'note': "The Amiga-descended PC release. Fast scanline, soft shadow "
                 "maps, 24-bit, slightly warm.",
@@ -253,7 +302,7 @@ PRESETS = {
         },
     },
     'REAL3D': {
-        'label': "Real 3D 2 (Amiga)",
+        'label': "Real 3D 2, Amiga (1993)",
         'category': 'SOFTWARE',
         'note': "Amiga ray tracer with hard shadows and mirror reflections, "
                 "written to a 24-bit framebuffer.",
@@ -267,7 +316,7 @@ PRESETS = {
         },
     },
     'VISTAPRO': {
-        'label': "Vistapro",
+        'label': "Vistapro (1991)",
         'category': 'SOFTWARE',
         'note': "Fractal landscape generator: flat Lambert terrain, heavy "
                 "distance haze, 256 colours.",
@@ -283,7 +332,7 @@ PRESETS = {
         },
     },
     'ANIMATION_MASTER': {
-        'label': "Hash Animation:Master",
+        'label': "Hash Animation:Master (1996)",
         'category': 'SOFTWARE',
         'note': "Spline modeller with a soft, plasticky shader and gentle "
                 "toon-adjacent falloff.",
@@ -297,7 +346,7 @@ PRESETS = {
         },
     },
     'POVRAY_2': {
-        'label': "POV-Ray 2.2",
+        'label': "POV-Ray 2.2 (1993)",
         'category': 'SOFTWARE',
         'note': "The earlier ray tracer: no area lights, hard shadows, and a "
                 "completely flat ambient term.",
@@ -312,7 +361,7 @@ PRESETS = {
         },
     },
     'VUE_DESPRIT': {
-        'label': "Vue d'Esprit 2",
+        'label': "Vue d'Esprit 2 (1997)",
         'category': 'SOFTWARE',
         'note': "Bryce's rival: atmospheric outdoor scenes, soft light, "
                 "strong haze and a warm cast.",
@@ -330,7 +379,7 @@ PRESETS = {
 
     # ---------------------------------------------------- more platforms
     'ATARI_ST': {
-        'label': "Atari ST",
+        'label': "Atari ST (1985)",
         'category': 'PLATFORM',
         'note': "320x200 in 16 colours chosen from 512. Chunky, and dithered "
                 "to death.",
@@ -348,7 +397,7 @@ PRESETS = {
     },
     # ---- handhelds and later consoles -------------------------------------
     'GAME_BOY': {
-        'label': "Game Boy",
+        'label': "Game Boy (1989)",
         'category': 'CONSOLE',
         'note': "160x144 in four shades. No colour, no shadows, and a screen "
                 "small enough that everything had to read as silhouette.",
@@ -363,7 +412,7 @@ PRESETS = {
         },
     },
     'VIRTUAL_BOY': {
-        'label': "Virtual Boy",
+        'label': "Virtual Boy (1995)",
         'category': 'CONSOLE',
         'note': "384x224 in four levels of red on black. The only console that "
                 "shipped a palette with one hue in it.",
@@ -379,7 +428,7 @@ PRESETS = {
         },
     },
     'GAME_GEAR': {
-        'label': "Game Gear",
+        'label': "Game Gear (1990)",
         'category': 'CONSOLE',
         'note': "160x144 from a 4096-colour master palette, on a backlit "
                 "screen that smeared everything it showed.",
@@ -396,7 +445,7 @@ PRESETS = {
         },
     },
     'SNES': {
-        'label': "Super Nintendo",
+        'label': "Super Nintendo (1990)",
         'category': 'CONSOLE',
         'note': "256x224. Polygons on this hardware came from a chip on the "
                 "cartridge, so they were few, flat and unfiltered.",
@@ -413,7 +462,7 @@ PRESETS = {
         },
     },
     'NEO_GEO': {
-        'label': "Neo Geo",
+        'label': "Neo Geo (1990)",
         'category': 'CONSOLE',
         'note': "320x224 from 65,536 colours. The most expensive way to see a "
                 "sprite in 1990.",
@@ -428,7 +477,7 @@ PRESETS = {
         },
     },
     'SEGA_32X': {
-        'label': "Sega 32X",
+        'label': "Sega 32X (1994)",
         'category': 'CONSOLE',
         'note': "Two extra processors bolted on top of a Mega Drive, and "
                 "32,768 colours to show for it.",
@@ -446,7 +495,7 @@ PRESETS = {
 
     # ---- home computers ----------------------------------------------------
     'C64': {
-        'label': "Commodore 64",
+        'label': "Commodore 64 (1982)",
         'category': 'PLATFORM',
         'note': "160x200 in sixteen fixed colours, half of them barely "
                 "distinguishable. Wide pixels, because the mode was.",
@@ -462,7 +511,7 @@ PRESETS = {
         },
     },
     'ZX_SPECTRUM': {
-        'label': "ZX Spectrum",
+        'label': "ZX Spectrum (1982)",
         'category': 'PLATFORM',
         'note': "256x192 from fifteen colours. The real machine allowed two "
                 "per character cell, which is why everything on it looked "
@@ -478,7 +527,7 @@ PRESETS = {
         },
     },
     'APPLE_IIGS': {
-        'label': "Apple IIGS",
+        'label': "Apple IIGS (1986)",
         'category': 'PLATFORM',
         'note': "320x200, sixteen colours a line chosen from 4096. Gentler "
                 "than the PC palettes of the same year.",
@@ -494,7 +543,7 @@ PRESETS = {
         },
     },
     'MSX2': {
-        'label': "MSX2",
+        'label': "MSX2 (1985)",
         'category': 'PLATFORM',
         'note': "256x212 in 256 colours. Japan's home standard, and better at "
                 "this than anything sold in the West that year.",
@@ -509,7 +558,7 @@ PRESETS = {
         },
     },
     'NEXTSTEP': {
-        'label': "NeXTSTEP",
+        'label': "NeXTSTEP (1989)",
         'category': 'PLATFORM',
         'note': "Two-bit greyscale on a large, sharp display. Everything the "
                 "MegaPixel monitor showed was four shades and no apology.",
@@ -523,7 +572,7 @@ PRESETS = {
         },
     },
     'SGI_INDY': {
-        'label': "SGI Indy",
+        'label': "SGI Indy (1993)",
         'category': 'PLATFORM',
         'note': "The workstation everything else was compared against: full "
                 "24-bit colour, smooth shading and no palette at all.",
@@ -539,7 +588,7 @@ PRESETS = {
 
     # ---- software renderers ------------------------------------------------
     'DOOM': {
-        'label': "Doom software",
+        'label': "Doom software (1993)",
         'category': 'PLATFORM',
         'note': "320x200 in 256 colours with light levels quantised into "
                 "bands. The bands are the shading model, not an artefact.",
@@ -556,7 +605,7 @@ PRESETS = {
         },
     },
     'RENDERMAN': {
-        'label': "RenderMan",
+        'label': "RenderMan (1988)",
         'category': 'SOFTWARE',
         'note': "What the film houses used while everyone else argued about "
                 "palettes. Full colour, clean edges, and time to spare.",
@@ -571,7 +620,7 @@ PRESETS = {
         },
     },
     'TURBO_SILVER': {
-        'label': "Turbo Silver",
+        'label': "Turbo Silver (1987)",
         'category': 'SOFTWARE',
         'note': "The Amiga raytracer that became Imagine. Hard shadows, hard "
                 "reflections, and a HAM palette doing its best underneath.",
@@ -588,7 +637,7 @@ PRESETS = {
         },
     },
     'LIGHTSCAPE': {
-        'label': "Lightscape",
+        'label': "Lightscape (1994)",
         'category': 'SOFTWARE',
         'note': "Radiosity, when that meant hours of solving before anything "
                 "appeared. Soft, indirect, and short of hard shadows.",
@@ -604,7 +653,7 @@ PRESETS = {
         },
     },
     'AUTOSHADE': {
-        'label': "AutoShade",
+        'label': "AutoShade (1987)",
         'category': 'SOFTWARE',
         'note': "AutoCAD's renderer, when rendering meant filling each face "
                 "with one colour and calling it a day.",
@@ -618,7 +667,7 @@ PRESETS = {
         },
     },
     'AMIGA_AGA': {
-        'label': "Amiga AGA 256",
+        'label': "Amiga AGA 256 (1992)",
         'category': 'PLATFORM',
         'note': "The AGA chipset: 256 colours from a 24-bit master palette at "
                 "320x256 PAL.",
@@ -633,7 +682,7 @@ PRESETS = {
         },
     },
     'CGA': {
-        'label': "CGA 4 colour",
+        'label': "CGA 4 colour (1981)",
         'category': 'PLATFORM',
         'note': "Cyan, magenta, white and black. The most punishing palette "
                 "the PC ever shipped.",
@@ -649,7 +698,7 @@ PRESETS = {
         },
     },
     'HERCULES': {
-        'label': "Hercules mono",
+        'label': "Hercules mono (1982)",
         'category': 'PLATFORM',
         'note': "720x348 in one bit. Everything is dither pattern.",
         'settings': {
@@ -662,7 +711,7 @@ PRESETS = {
         },
     },
     'MAC_1BIT': {
-        'label': "Macintosh 1-bit",
+        'label': "Macintosh 1-bit (1984)",
         'category': 'PLATFORM',
         'note': "512x342 black and white with Atkinson dither -- the kernel "
                 "Bill Atkinson wrote for exactly this screen.",
@@ -675,7 +724,7 @@ PRESETS = {
         },
     },
     'PC98': {
-        'label': "NEC PC-98",
+        'label': "NEC PC-98 (1982)",
         'category': 'PLATFORM',
         'note': "640x400 in 16 colours from 4096. The Japanese business PC "
                 "that ran a surprising number of 3D demos.",
@@ -690,7 +739,7 @@ PRESETS = {
         },
     },
     'X68000': {
-        'label': "Sharp X68000",
+        'label': "Sharp X68000 (1987)",
         'category': 'PLATFORM',
         'note': "512x512 in 65536 colours. The best-looking 16-bit home "
                 "computer there was.",
@@ -703,7 +752,7 @@ PRESETS = {
         },
     },
     'WIN31': {
-        'label': "Windows 3.1 (16 colour)",
+        'label': "Windows 3.1, 16 colour (1992)",
         'category': 'PLATFORM',
         'note': "640x480 on the VGA system palette. Every 1992 screenshot.",
         'settings': {
@@ -715,7 +764,7 @@ PRESETS = {
         },
     },
     'SVGA_HICOLOR': {
-        'label': "SVGA High Colour",
+        'label': "SVGA High Colour (1995)",
         'category': 'PLATFORM',
         'note': "800x600 in 16-bit. The 1995 upgrade everyone saved up for.",
         'settings': {
@@ -729,7 +778,7 @@ PRESETS = {
 
     # ----------------------------------------------------- more consoles
     'DREAMCAST': {
-        'label': "Sega Dreamcast",
+        'label': "Sega Dreamcast (1998)",
         'category': 'CONSOLE',
         'note': "640x480 with proper perspective correction, bilinear filtering "
                 "and per-pixel fog. The end of the era.",
@@ -745,7 +794,7 @@ PRESETS = {
         },
     },
     'PS2': {
-        'label': "PlayStation 2",
+        'label': "PlayStation 2 (2000)",
         'category': 'CONSOLE',
         'note': "640x448 field-rendered with the GS's famous ordered dither, "
                 "bilinear mipmaps that pop, edge antialias (the flicker "
@@ -768,7 +817,7 @@ PRESETS = {
         },
     },
     'GAMECUBE': {
-        'label': "Nintendo GameCube",
+        'label': "Nintendo GameCube (2001)",
         'category': 'CONSOLE',
         'note': "640x480 with clean trilinear mipmaps, per-pixel table fog "
                 "with a height layer (the Flipper's fog unit), soft shadow "
@@ -791,7 +840,7 @@ PRESETS = {
         },
     },
     'XBOX': {
-        'label': "Microsoft Xbox",
+        'label': "Microsoft Xbox (2001)",
         'category': 'CONSOLE',
         'note': "640x480 with trilinear plus anisotropy, per-pixel specular "
                 "everywhere, big soft shadow maps, projected light textures "
@@ -814,7 +863,7 @@ PRESETS = {
         },
     },
     'THREEDO': {
-        'label': "3DO Interactive",
+        'label': "3DO Interactive (1993)",
         'category': 'CONSOLE',
         'note': "Cel-based hardware: warped textures, no z-buffer, 320x240 "
                 "with visible seams between quads.",
@@ -829,7 +878,7 @@ PRESETS = {
         },
     },
     'JAGUAR': {
-        'label': "Atari Jaguar",
+        'label': "Atari Jaguar (1993)",
         'category': 'CONSOLE',
         'note': "Gouraud-shaded flat-lit polygons at 320x240, 16-bit, no "
                 "texture filtering.",
@@ -843,7 +892,7 @@ PRESETS = {
         },
     },
     'PSX_HIRES': {
-        'label': "PlayStation (high-res)",
+        'label': "PlayStation high-res (1994)",
         'category': 'CONSOLE',
         'note': "512x240 mode: the same warping and snapping, twice the "
                 "horizontal detail. Used for menus and FMV overlays.",
@@ -863,7 +912,7 @@ PRESETS = {
 
     # --------------------------------------------------- more broadcast
     'VHS': {
-        'label': "VHS tape",
+        'label': "VHS tape (1976)",
         'category': 'BROADCAST',
         'note': "Third-generation dub: chroma smeared into next week, ringing, "
                 "dot crawl and interlace.",
@@ -881,7 +930,7 @@ PRESETS = {
         },
     },
     'SVIDEO': {
-        'label': "S-Video",
+        'label': "S-Video (1987)",
         'category': 'BROADCAST',
         'note': "Luma and chroma kept apart: no dot crawl, only a little "
                 "chroma softening. The good cable.",
@@ -899,7 +948,7 @@ PRESETS = {
 
     # --------------------------------------------------------- more web
     'CD_ROM_FMV': {
-        'label': "CD-ROM full-motion video",
+        'label': "CD-ROM full-motion video (1992)",
         'category': 'WEB',
         'note': "Cinepak-era video: tiny, blocky, quantised and doubled up to "
                 "fill the window.",
@@ -915,7 +964,7 @@ PRESETS = {
         },
     },
     'WEB_PNG8': {
-        'label': "PNG-8 sprite",
+        'label': "PNG-8 sprite (1996)",
         'category': 'WEB',
         'note': "Small adaptive-palette PNG with a hard alpha edge, as used "
                 "for every rendered button on the early web.",
@@ -932,7 +981,7 @@ PRESETS = {
 
     # ------------------------------------------------------------- platforms
     'VGA_13H': {
-        'label': "VGA Mode 13h",
+        'label': "VGA Mode 13h (1987)",
         'category': 'PLATFORM',
         'note': "320x200 in 256 colours on a 1.2:1 pixel. The DOS demo look.",
         'settings': {
@@ -947,7 +996,7 @@ PRESETS = {
         },
     },
     'MAC_8BIT': {
-        'label': "Macintosh 8-bit",
+        'label': "Macintosh 8-bit (1987)",
         'category': 'PLATFORM',
         'note': "512x342 on the System palette, ordered dither, 1:1 pixels.",
         'settings': {
@@ -960,7 +1009,7 @@ PRESETS = {
         },
     },
     'WIN95': {
-        'label': "Windows 95 (8-bit)",
+        'label': "Windows 95, 8-bit (1995)",
         'category': 'PLATFORM',
         'note': "640x480 with the 20 reserved system colours plus a halftone "
                 "palette -- the look of a screenshot from 1996.",
@@ -973,7 +1022,7 @@ PRESETS = {
         },
     },
     'EGA': {
-        'label': "EGA 16 colour",
+        'label': "EGA 16 colour (1984)",
         'category': 'PLATFORM',
         'note': "The 16-colour IBM palette with heavy error diffusion. "
                 "Almost all of the image is dither pattern.",
@@ -989,7 +1038,7 @@ PRESETS = {
         },
     },
     'AMIGA_OCS': {
-        'label': "Amiga OCS 32 colour",
+        'label': "Amiga OCS 32 colour (1985)",
         'category': 'PLATFORM',
         'note': "320x256 PAL, 32 colours from a 12-bit master palette.",
         'settings': {
@@ -1003,7 +1052,7 @@ PRESETS = {
         },
     },
     'QUAKE_SW': {
-        'label': "Quake software renderer",
+        'label': "Quake software renderer (1996)",
         'category': 'PLATFORM',
         'note': "Affine-ish texture mapping on a 256-colour palette with "
                 "no filtering and heavy light-map style falloff.",
@@ -1023,7 +1072,7 @@ PRESETS = {
 
     # -------------------------------------------------------------- consoles
     'PSX': {
-        'label': "PlayStation",
+        'label': "PlayStation (1994)",
         'category': 'CONSOLE',
         'note': "Integer vertex snapping, affine texture warp, no z-buffer "
                 "sorting, 15-bit colour with ordered dither.",
@@ -1041,7 +1090,7 @@ PRESETS = {
         },
     },
     'SATURN': {
-        'label': "Sega Saturn",
+        'label': "Sega Saturn (1994)",
         'category': 'CONSOLE',
         'note': "Quad-based renderer: flat-ish shading, no perspective "
                 "correction, 15-bit output, visible seams.",
@@ -1056,7 +1105,7 @@ PRESETS = {
         },
     },
     'N64': {
-        'label': "Nintendo 64",
+        'label': "Nintendo 64 (1996)",
         'category': 'CONSOLE',
         'note': "Three-point filtered textures at 64x64, aggressive fog, "
                 "16-bit framebuffer with the RDP's dither.",
@@ -1074,7 +1123,7 @@ PRESETS = {
         },
     },
     'VOODOO': {
-        'label': "3dfx Voodoo Graphics",
+        'label': "3dfx Voodoo Graphics (1996)",
         'category': 'CONSOLE',
         'note': "Bilinear filtering, 16-bit colour with the 22-bit "
                 "post-filter, table fog. The 1997 accelerated look.",
@@ -1092,7 +1141,7 @@ PRESETS = {
 
     # ------------------------------------------------------------- broadcast
     'TOASTER': {
-        'label': "Video Toaster / NTSC",
+        'label': "Video Toaster / NTSC (1990)",
         'category': 'BROADCAST',
         'note': "D1 NTSC with non-square pixels, composite chroma bleed, "
                 "interlace and a CRT.",
@@ -1110,7 +1159,7 @@ PRESETS = {
         },
     },
     'PAL_TV': {
-        'label': "PAL broadcast",
+        'label': "PAL broadcast (1967)",
         'category': 'BROADCAST',
         'note': "720x576 with PAL pixel aspect and a softer composite.",
         'settings': {
@@ -1127,7 +1176,7 @@ PRESETS = {
 
     # ------------------------------------------------------------------ web
     'WEB_GIF': {
-        'label': "Web-safe GIF (216)",
+        'label': "Web-safe GIF, 216 colours (1996)",
         'category': 'WEB',
         'note': "The 216-colour browser palette with ordered dither. "
                 "Every 1997 splash page.",
@@ -1140,7 +1189,7 @@ PRESETS = {
         },
     },
     'WEB_JPEG': {
-        'label': "Early web JPEG",
+        'label': "Early web JPEG (1995)",
         'category': 'WEB',
         'note': "Small, over-compressed, heavily blocked -- 28.8k modem era.",
         'settings': {

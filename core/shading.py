@@ -94,6 +94,21 @@ MODEL_ITEMS = (
     ('WIREFRAME', "Wireframe",
      "Draws the triangle edges only and leaves the rest of the surface "
      "see-through. Width comes from the material's Wire Size"),
+    ('BI_COOKTORR', "CookTorr (Blender Internal)",
+     "Blender Internal's default highlight, transcribed from 2.79: a "
+     "half-vector lobe raised to Glossiness (Hardness), divided by "
+     "(0.1 + N.V) so it brightens toward grazing view. The renderer "
+     "classic .blend files were lit for; legacy imports use it"),
+    ('BI_PHONG', "Phong (Blender Internal)",
+     "Blender Internal's Phong, transcribed from 2.79 -- which was "
+     "always the HALF-VECTOR lobe pow(N.H, Hardness), not the "
+     "reflection-vector Phong of the textbooks. Legacy imports use it "
+     "for materials that chose Phong"),
+    ('BI_BLINN', "Blinn (Blender Internal)",
+     "Blender Internal's Blinn, transcribed from 2.79: Torrance-"
+     "Sparrow geometry with BI's own refraction-index Fresnel and a "
+     "Gaussian half-angle lobe whose width comes from Hardness. IOR "
+     "is BI's Refr slider. Legacy imports use it for Blinn materials"),
 )
 
 
@@ -109,7 +124,22 @@ class Surface:
                  'rim', 'rim_power', 'rim_color',
                  'matcap', 'matcap_blend', 'reflect_color',
                  'edge_opacity', 'backface_color', 'backface_mix',
-                 'sheen', 'sheen_color', 'sheen_roughness', 'refraction')
+                 'sheen', 'sheen_color', 'sheen_roughness', 'refraction',
+                 # the BI material node's own controls: the specular
+                 # Toon pair, the diffuse-Fresnel pair, WardIso's Slope
+                 'toon_size2', 'toon_smooth2', 'bi_fresnel',
+                 'bi_fresnel_fac', 'bi_slope',
+                 # the BI panel round: transparency Fresnel/Blend and
+                 # spectra, mirror Fresnel/Blend, the ray-transparency
+                 # IOR and Filter, Cubic and Tangent shading, the
+                 # shadow flags, the mist gate -- and `bi`, one python
+                 # object per batch carrying the non-numeric material
+                 # extras (ramp specs, light group)
+                 'bi_transp_fresnel', 'bi_transp_blend', 'bi_spectra',
+                 'bi_mir_fresnel', 'bi_mir_blend', 'ray_ior',
+                 'bi_ray_filter', 'bi_cubic', 'bi_tangent',
+                 'shadow_receive', 'cast_only', 'shadows_only',
+                 'use_mist', 'bi')
 
     def __init__(self, n):
         self.n = n
@@ -133,6 +163,27 @@ class Surface:
         self.toon_size = one * 0.5
         self.toon_smooth = one * 0.05
         self.toon_steps = one * 2.0
+        self.toon_size2 = one * 0.5      # the BI node's spec Toon pair
+        self.toon_smooth2 = one * 0.1
+        self.bi_fresnel = one * 0.1      # BI diffuse-Fresnel grad/fac
+        self.bi_fresnel_fac = one * 0.5
+        self.bi_slope = one * 0.1        # BI WardIso Slope (rms)
+        # ---- the BI panel round's fields; every default reproduces the
+        # engine's behaviour before the field existed
+        self.bi_transp_fresnel = np.zeros(n, f32)   # 0 = plain alpha
+        self.bi_transp_blend = one * 1.25
+        self.bi_spectra = np.zeros(n, f32)
+        self.bi_mir_fresnel = np.zeros(n, f32)      # 0 = flat mirror
+        self.bi_mir_blend = one * 1.25
+        self.ray_ior = one * 1.45        # refraction bend (master: = ior)
+        self.bi_ray_filter = one.copy()  # 1 = full diffuse tint (master)
+        self.bi_cubic = np.zeros(n, f32)
+        self.bi_tangent = np.zeros(n, f32)
+        self.shadow_receive = one.copy()
+        self.cast_only = np.zeros(n, f32)
+        self.shadows_only = np.zeros(n, f32)
+        self.use_mist = one.copy()
+        self.bi = None                   # per-batch material extras
         self.reflect = np.zeros(n, f32)
         self.tangent = None
         self.bitangent = None
@@ -205,20 +256,25 @@ def diffuse_lambert(ndl, **_):
 
 
 def diffuse_oren_nayar(ndl, ndv, l, v, n, roughness, **_):
+    """2.79's OrenNayar_Diff, verbatim (R155): nv clamps at 0 (View_A
+    caps at pi/2), the projected-vector cosine floors at 0, and the
+    smaller angle is scaled by 0.95 before tan -- the C's own guard
+    against the tangent shooting to infinity."""
     s2 = roughness * roughness
     a = 1.0 - 0.5 * s2 / (s2 + 0.33)
     b = 0.45 * s2 / (s2 + 0.09)
     nl = np.clip(ndl, -1.0, 1.0)
-    nv = np.clip(ndv, -1.0, 1.0)
+    nv = np.maximum(np.clip(ndv, -1.0, 1.0), 0.0)
     ti = np.arccos(np.clip(nl, -1.0, 1.0))
     tr = np.arccos(np.clip(nv, -1.0, 1.0))
     alpha = np.maximum(ti, tr)
-    beta = np.minimum(ti, tr)
+    beta = np.minimum(ti, tr) * 0.95
     lp = l - n * nl[:, None]
     vp = v - n * nv[:, None]
     cos_dphi = np.clip(M.dot(M.normalize(lp), M.normalize(vp)), -1.0, 1.0)
-    return np.maximum(nl, 0.0) * (a + b * np.maximum(cos_dphi, 0.0) *
-                                  np.sin(alpha) * np.tan(beta))
+    return (np.maximum(nl, 0.0) * (a + b * np.maximum(cos_dphi, 0.0) *
+                                   np.sin(alpha) * np.tan(beta))
+            ).astype(np.float32)
 
 
 def diffuse_minnaert(ndl, ndv, darkness=1.0, **_):
@@ -337,6 +393,337 @@ def spec_aniso_blinn(ndl, ndh, h, n, t, b, gloss, aniso, **_):
     return np.where(ndl > 0.0, lobe * norm * 8.0, 0.0).astype(np.float32)
 
 
+def bi_spec_pow(inp, gloss):
+    """2.79's spec(): the integer-bit square-multiply power, verbatim.
+
+    Not pow(x, n): b1 = x*x floors at 0.01 before the bit ladder, b1
+    zeroes below 0.001 twice on the way up, an EVEN hardness drops the
+    x^1 factor, and bit 256 squares once more. Hardness itself is
+    shi->har -- a SHORT -- so the per-pixel float chain truncates to an
+    integer here, exactly where the C's assignment did. The 0.01 floor
+    is visible: it brightens the dim tail of low-hardness highlights
+    (the porcelain range) over what a plain power gives."""
+    inp = np.asarray(inp, np.float32)
+    hard = np.asarray(np.floor(np.asarray(gloss, np.float32)),
+                      np.int32)
+    x = np.clip(inp, 0.0, 1.0)
+    out = np.where((hard & 1) == 0, np.float32(1.0), x)
+    b1 = np.maximum(x * x, np.float32(0.01))
+    out = np.where((hard & 2) != 0, out * b1, out)
+    b1 = b1 * b1
+    out = np.where((hard & 4) != 0, out * b1, out)
+    b1 = b1 * b1
+    out = np.where((hard & 8) != 0, out * b1, out)
+    b1 = b1 * b1
+    out = np.where((hard & 16) != 0, out * b1, out)
+    b1 = b1 * b1
+    b1 = np.where(b1 < 0.001, np.float32(0.0), b1)
+    out = np.where((hard & 32) != 0, out * b1, out)
+    b1 = b1 * b1
+    out = np.where((hard & 64) != 0, out * b1, out)
+    b1 = b1 * b1
+    out = np.where((hard & 128) != 0, out * b1, out)
+    b1 = np.where(b1 < 0.001, np.float32(0.0), b1)
+    out = np.where((hard & 256) != 0, out * (b1 * b1), out)
+    return np.where(inp >= 1.0, np.float32(1.0),
+                    np.where(inp <= 0.0, np.float32(0.0),
+                             out)).astype(np.float32)
+
+
+def spec_bi_cooktorr(ndl, ndv, ndh, gloss, **_):
+    """Blender Internal's CookTorr_Spec, verbatim from 2.79 (R155).
+
+    spec(N.H, hardness) / (0.1 + N.V) -- the divisor is the whole
+    character: the same highlight brightens up to 10x toward grazing
+    view. The C has NO N.L gate (spec can sit past the terminator,
+    a quirk BI shipped for its whole life) and no upper clamp; nh < 0
+    returns 0, nv < 0 clamps to 0."""
+    nv = np.maximum(ndv, 0.0)
+    out = bi_spec_pow(ndh, gloss) / (0.1 + nv)
+    return np.where(ndh < 0.0, np.float32(0.0), out).astype(np.float32)
+
+
+def spec_bi_phong(ndl, ndh, gloss, **_):
+    """Blender Internal's Phong_Spec, verbatim from 2.79 (R155): the
+    HALF-vector lobe through spec(); rslt <= 0 returns 0, and there is
+    no N.L gate in the C."""
+    return np.where(ndh > 0.0, bi_spec_pow(ndh, gloss),
+                    np.float32(0.0)).astype(np.float32)
+
+
+def spec_bi_blinn(ndl, ndv, ndh, vdh, gloss, ior, **_):
+    """Blender Internal's Blinn_Spec, transcribed term for term.
+
+    Hardness maps onto a Gaussian half-angle width exactly as BI did
+    (sqrt(1/hard) under 100, 10/hard above), the geometry term is
+    Torrance-Sparrow's, and the Fresnel is BI's own refraction-index
+    form. Returns 0 below refrac 1, as BI did."""
+    refrac = np.maximum(np.asarray(ior, np.float32), 0.0)
+    # spec_power arrives as (float)shi->har -- an INT-truncated short
+    sp = np.maximum(np.floor(np.asarray(gloss, np.float32)), 1.0)
+    spow = np.where(sp < 100.0, np.sqrt(1.0 / sp), 10.0 / sp)
+    nh = np.maximum(ndh, 0.0)
+    nv = np.maximum(ndv, 0.01)
+    nl = np.maximum(ndl, 0.0)
+    vh = np.maximum(vdh, 0.01)
+    # the C's geometry pick is a STRICT-compare chain: g stays 0.0 on
+    # ties (verbatim R155) -- a<b&&a<c, elif b<a&&b<c, elif c<a&&c<b
+    a = np.ones_like(nh)
+    b = 2.0 * nh * nv / vh
+    c = 2.0 * nh * nl / vh
+    g = np.where((a < b) & (a < c), a,
+                 np.where((b < a) & (b < c), b,
+                          np.where((c < a) & (c < b), c,
+                                   np.float32(0.0))))
+    p = np.sqrt(np.maximum(refrac * refrac + vh * vh - 1.0, 0.0))
+    f = ((p - vh) ** 2 / (p + vh) ** 2) * \
+        (1.0 + ((vh * (p + vh) - 1.0) ** 2
+                / (vh * (p - vh) + 1.0) ** 2))
+    ang = np.arccos(np.clip(nh, -1.0, 1.0))
+    out = f * g * np.exp(-(ang * ang)
+                         / np.maximum(2.0 * spow * spow, 1e-8))
+    # verbatim gates: refrac < 1 -> 0, nl <= 0.01 -> 0, nh < 0 -> 0,
+    # negative result -> 0; NO upper clamp in the C
+    out = np.where((refrac >= 1.0) & (ndl > 0.01) & (ndh >= 0.0),
+                   out, 0.0)
+    return np.maximum(out, 0.0).astype(np.float32)
+
+
+def bi_fresnel_fac(t1, grad, fac):
+    """Blender Internal's fresnel_fac(), transcribed: t1 is view.vn."""
+    fac = np.asarray(fac, np.float32)
+    t2 = np.where(t1 > 0.0, 1.0 + t1, 1.0 - t1)
+    t2 = grad + (1.0 - grad) * M.safe_pow(t2, fac)
+    out = np.clip(t2, 0.0, 1.0)
+    return np.where(fac == 0.0, 1.0, out).astype(np.float32)
+
+
+def diffuse_bi_fresnel(ndl, grad, fac, **_):
+    """BI's Fresnel diffuse, transcribed: fresnel_fac(lv, vn, ...) with
+    lv pointing LAMP to surface, so view.vn = -N.L. It REPLACES the
+    cosine outright -- the classic BI look where grazing lights glow."""
+    return bi_fresnel_fac(-np.asarray(ndl, np.float32), grad, fac)
+
+
+def diffuse_bi_toon(ndl, size, smooth, **_):
+    """BI's Toon_Diff, transcribed: a hard angular band on acos(N.L)."""
+    ang = np.arccos(np.clip(ndl, -1.0, 1.0))
+    sm = np.asarray(smooth, np.float32)
+    ramp = np.where(sm <= 0.0, 0.0,
+                    1.0 - (ang - size) / np.maximum(sm, 1e-9))
+    out = np.where(ang < size, 1.0,
+                   np.where(ang >= size + sm, 0.0, ramp))
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
+def diffuse_bi_minnaert(ndl, ndv, darkness, **_):
+    """BI's Minnaert_Diff, verbatim (R155), BOTH branches: darkness <=
+    1 darkens toward the rim via pow(max(nv*nl, 0.1), dark-1); above 1
+    it brightens the rim via pow(1.001 - nv, dark-1) -- 1.001, the C's
+    own constant."""
+    nl = np.maximum(ndl, 0.0)
+    nv = np.maximum(ndv, 0.0)
+    dk = np.asarray(darkness, np.float32)
+    low = nl * M.safe_pow(np.maximum(nv * nl, 0.1), dk - 1.0)
+    high = nl * M.safe_pow(np.maximum(1.001 - nv, 1e-6), dk - 1.0)
+    return np.where(dk <= 1.0, low, high).astype(np.float32)
+
+
+def spec_bi_toon(ndl, ndh, size, smooth, **_):
+    """BI's Toon_Spec, verbatim: the angular band on acos(N.H). The C
+    has no N.L gate -- the band shows wherever the half-vector allows,
+    exactly like the other BI speculars."""
+    ang = np.arccos(np.clip(ndh, -1.0, 1.0))
+    sm = np.asarray(smooth, np.float32)
+    ramp = np.where(sm <= 0.0, 0.0,
+                    1.0 - (ang - size) / np.maximum(sm, 1e-9))
+    out = np.where(ang < size, 1.0,
+                   np.where(ang >= size + sm, 0.0, ramp))
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
+def spec_bi_wardiso(ndl, ndv, ndh, rms, **_):
+    """BI's WardIso_Spec, verbatim from 2.79 (R155): an isotropic
+    Gaussian on tan(acos(N.H)) with the Slope (rms) width. The C
+    CLAMPS nl/nv/nh to 0.001 -- it never gates, so even a backfacing
+    light keeps a (vanishing) term -- and applies no upper clamp."""
+    nh = np.maximum(ndh, 0.001)
+    nv = np.maximum(ndv, 0.001)
+    nl = np.maximum(ndl, 0.001)
+    alpha = np.maximum(np.asarray(rms, np.float32), 0.001)
+    angle = np.tan(np.arccos(np.clip(nh, -1.0, 1.0)))
+    out = nl * (1.0 / (4.0 * np.pi * alpha * alpha)) * \
+        (np.exp(-(angle * angle) / (alpha * alpha))
+         / np.sqrt(np.maximum(nv * nl, 1e-8)))
+    return out.astype(np.float32)
+
+
+#: the BI material node's shader menus, in DNA order: the model string
+#: 'BI_MATRIX_{d}_{s}' carries one digit from each
+BI_DIFF_ORDER = ('LAMBERT', 'OREN_NAYAR', 'TOON', 'MINNAERT', 'FRESNEL')
+BI_SPEC_ORDER = ('COOKTORR', 'PHONG', 'BLINN', 'TOON', 'WARDISO')
+
+
+def bi_matrix_terms(model, surf, n, l, v, ndl, ndv, ndh, vdh):
+    """(diffuse, specular scalar) for a BI material node's shader pair.
+
+    The node keeps Blender Internal's diffuse and specular menus
+    INDEPENDENT -- the 5x5 matrix one collapsed 'model' never could --
+    and every branch is the transcribed 2.79 formula. Field packing:
+    roughness carries Oren-Nayar roughness or Minnaert darkness (the
+    diffuse menu chooses one), bi_slope carries WardIso's Slope,
+    toon_size2/toon_smooth2 the specular Toon pair, glossiness the
+    Hardness, ior the Refr slider."""
+    di = int(model[10])
+    si = int(model[12])
+    if di == 1:
+        dif = diffuse_oren_nayar(ndl, ndv, l, v, n, surf.roughness)
+    elif di == 2:
+        dif = diffuse_bi_toon(ndl, surf.toon_size, surf.toon_smooth)
+    elif di == 3:
+        dif = diffuse_bi_minnaert(ndl, ndv, surf.roughness)
+    elif di == 4:
+        dif = diffuse_bi_fresnel(ndl, surf.bi_fresnel,
+                                 surf.bi_fresnel_fac)
+    else:
+        dif = np.maximum(ndl, 0.0)
+    if si == 1:
+        spec = spec_bi_phong(ndl, ndh, surf.glossiness)
+    elif si == 2:
+        spec = spec_bi_blinn(ndl, ndv, ndh, vdh, surf.glossiness,
+                             surf.ior)
+    elif si == 3:
+        spec = spec_bi_toon(ndl, ndh, surf.toon_size2, surf.toon_smooth2)
+    elif si == 4:
+        spec = spec_bi_wardiso(ndl, ndv, ndh, surf.bi_slope)
+    else:
+        spec = spec_bi_cooktorr(ndl, ndv, ndh, surf.glossiness)
+    return dif, spec
+
+
+def bi_cubic(dif):
+    """BI's Cubic Interpolation: smoothstep on the diffuse term.
+
+    Transcribed with 2.79's own guard -- only values strictly inside
+    (0, 1) are reshaped, so a Fresnel diffuse sitting at exactly 1.0
+    or a negative pre-clamp term passes through untouched."""
+    dif = np.asarray(dif, np.float32)
+    inside = (dif > 0.0) & (dif < 1.0)
+    return np.where(inside, 3.0 * dif * dif - 2.0 * dif * dif * dif,
+                    dif).astype(np.float32)
+
+
+def bi_tangent_normal(t, l):
+    """BI's Tangent Shading: the per-light fake normal.
+
+    2.79 builds cross(lv, tang) then cross(tang, that) -- algebraically
+    L - T*(T.L), the light direction stripped of its along-strand
+    component -- and shades with it in place of the surface normal.
+    Returns the normalized fake normal (falls back to L where the
+    light runs exactly along the tangent)."""
+    t = np.asarray(t, np.float32)
+    l = np.asarray(l, np.float32)
+    n_eff = l - t * M.dot(t, l)[:, None]
+    length = np.sqrt(np.maximum((n_eff * n_eff).sum(1), 1e-18))
+    return (n_eff / length[:, None]).astype(np.float32)
+
+
+#: BI ramp_blend() mode names, in MA_RAMP_* DNA order (material.c)
+BI_RAMP_BLEND_ORDER = ('MIX', 'ADD', 'MULT', 'SUB', 'SCREEN', 'DIV',
+                       'DIFF', 'DARK', 'LIGHT', 'OVERLAY', 'DODGE',
+                       'BURN', 'HUE', 'SAT', 'VAL', 'COLOR', 'SOFT',
+                       'LINEAR')
+
+#: BI ramp input names, in MA_RAMP_IN_* DNA order
+BI_RAMP_INPUT_ORDER = ('SHADER', 'ENERGY', 'NORMAL', 'RESULT')
+
+
+def bi_ramp_blend(mode, col, fac, rampcol):
+    """2.79's ramp_blend() (blenkernel material.c), vectorized.
+
+    col (N,3) is blended toward rampcol (N,3) by fac (N,); every mode
+    is the C transcribed, including the per-channel conditionals and
+    the achromatic guards on HUE/COLOR (a grey ramp colour leaves the
+    base untouched) and SAT (a grey base keeps its grey)."""
+    col = np.asarray(col, np.float32).copy()
+    rc = np.asarray(rampcol, np.float32)
+    fac = np.asarray(fac, np.float32)
+    if fac.ndim == 1:
+        fac = fac[:, None]
+    facm = 1.0 - fac
+    if mode == 'MIX':
+        return (facm * col + fac * rc).astype(np.float32)
+    if mode == 'ADD':
+        return (col + fac * rc).astype(np.float32)
+    if mode == 'MULT':
+        return (col * (facm + fac * rc)).astype(np.float32)
+    if mode == 'SCREEN':
+        return (1.0 - (facm + fac * (1.0 - rc)) *
+                (1.0 - col)).astype(np.float32)
+    if mode == 'OVERLAY':
+        low = col * (facm + 2.0 * fac * rc)
+        high = 1.0 - (facm + 2.0 * fac * (1.0 - rc)) * (1.0 - col)
+        return np.where(col < 0.5, low, high).astype(np.float32)
+    if mode == 'SUB':
+        return (col - fac * rc).astype(np.float32)
+    if mode == 'DIV':
+        # per channel: only where the ramp colour is nonzero
+        out = facm * col + fac * col / np.where(rc != 0.0, rc, 1.0)
+        return np.where(rc != 0.0, out, col).astype(np.float32)
+    if mode == 'DIFF':
+        return (facm * col + fac * np.abs(col - rc)).astype(np.float32)
+    if mode == 'DARK':
+        tmp = rc + (1.0 - rc) * facm
+        return np.minimum(col, tmp).astype(np.float32)
+    if mode == 'LIGHT':
+        return np.maximum(col, fac * rc).astype(np.float32)
+    if mode == 'DODGE':
+        tmp = 1.0 - fac * rc
+        lifted = np.where(tmp <= 0.0, 1.0,
+                          np.minimum(col / np.where(tmp <= 0.0, 1.0, tmp),
+                                     1.0))
+        return np.where(col != 0.0, lifted, col).astype(np.float32)
+    if mode == 'BURN':
+        tmp = facm + fac * rc
+        burned = np.where(tmp <= 0.0, 0.0,
+                          np.clip(1.0 - (1.0 - col) /
+                                  np.where(tmp <= 0.0, 1.0, tmp), 0.0, 1.0))
+        return burned.astype(np.float32)
+    if mode in ('HUE', 'SAT', 'VAL', 'COLOR'):
+        rh, rs, rv = M.rgb_to_hsv(col[:, 0], col[:, 1], col[:, 2])
+        ch, cs, cv = M.rgb_to_hsv(rc[:, 0], rc[:, 1], rc[:, 2])
+        f1 = fac[:, 0]
+        fm1 = 1.0 - f1
+        if mode == 'HUE':
+            tr, tg, tb = M.hsv_to_rgb(ch, rs, rv)
+            mixed = (facm * col +
+                     fac * np.stack([tr, tg, tb], 1)).astype(np.float32)
+            return np.where((cs != 0.0)[:, None], mixed,
+                            col).astype(np.float32)
+        if mode == 'SAT':
+            tr, tg, tb = M.hsv_to_rgb(rh, fm1 * rs + f1 * cs, rv)
+            out = np.stack([tr, tg, tb], 1)
+            return np.where((rs != 0.0)[:, None], out,
+                            col).astype(np.float32)
+        if mode == 'VAL':
+            tr, tg, tb = M.hsv_to_rgb(rh, rs, fm1 * rv + f1 * cv)
+            return np.stack([tr, tg, tb], 1).astype(np.float32)
+        # COLOR: ramp hue+sat over base value, achromatic-guarded
+        tr, tg, tb = M.hsv_to_rgb(ch, cs, rv)
+        mixed = (facm * col +
+                 fac * np.stack([tr, tg, tb], 1)).astype(np.float32)
+        return np.where((cs != 0.0)[:, None], mixed, col).astype(np.float32)
+    if mode == 'SOFT':
+        scr = 1.0 - (1.0 - rc) * (1.0 - col)
+        return (facm * col +
+                fac * ((1.0 - col) * rc * col +
+                       col * scr)).astype(np.float32)
+    if mode == 'LINEAR':
+        return (col + fac * np.where(rc > 0.5, 2.0 * (rc - 0.5),
+                                     2.0 * rc - 1.0)).astype(np.float32)
+    return col.astype(np.float32)
+
+
 def spec_toon(ndl, rdv, size, smooth, **_):
     ang = np.arccos(np.clip(rdv, -1.0, 1.0)) / (np.pi * 0.5)
     lim = np.clip(1.0 - size, 0.0, 1.0)
@@ -392,6 +779,37 @@ def evaluate(model, surf, n, l, v, ndl_raw=None):
 
     if model in ('CONSTANT', 'WIREFRAME'):
         return zero, np.zeros((surf.n, 3), np.float32)
+
+    if isinstance(model, str) and model.startswith('BI_MATRIX_'):
+        # the BI material node: independent diffuse and specular menus,
+        # every branch a transcribed 2.79 formula
+        if np.any(surf.bi_tangent > 0.5) and surf.tangent is not None:
+            # Tangent Shading: 2.79 swaps the surface normal for
+            # cross(tang, cross(lv, tang)) -- the light direction
+            # stripped of its along-tangent component -- per light,
+            # for BOTH lobes
+            n_t = bi_tangent_normal(surf.tangent, l)
+            on = (surf.bi_tangent > 0.5)[:, None]
+            n_eff = np.where(on, n_t, n)
+            ndl = M.dot(n_eff, l)
+            ndv = M.dot(n_eff, v)
+            ndh = M.dot(n_eff, h)
+            n_use = n_eff
+        else:
+            n_use = n
+        dif, spec = bi_matrix_terms(model, surf, n_use, l, v,
+                                    ndl, ndv, ndh, vdh)
+        if np.any(surf.translucency > 0.0):
+            # BI's translucency: the SAME diffuse shader, evaluated
+            # through the flipped normal, scaled by the slider -- for
+            # every shader, not just a dedicated model
+            dif_back, _sb = bi_matrix_terms(model, surf, -n_use, l, v,
+                                            -ndl, -ndv, -ndh, vdh)
+            dif = dif + np.clip(surf.translucency, 0.0, 1.0) * dif_back
+        if np.any(surf.bi_cubic > 0.5):
+            dif = np.where(surf.bi_cubic > 0.5, bi_cubic(dif), dif)
+        spec = _soften(spec, ndl, surf.soften)
+        return dif, spec[:, None] * surf.specular
 
     # ---- diffuse term
     if model == 'OREN_NAYAR':
@@ -452,6 +870,15 @@ def evaluate(model, surf, n, l, v, ndl_raw=None):
         cs = white + met[:, None] * (1.0 - _strauss_fresnel(ndl)[:, None]) * \
             (surf.diffuse - white)
         return dif * rn, spec[:, None] * cs
+    elif model == 'BI_COOKTORR':
+        spec = spec_bi_cooktorr(ndl, ndv, ndh, gloss)
+        spec_col = surf.specular
+    elif model == 'BI_PHONG':
+        spec = spec_bi_phong(ndl, ndh, gloss)
+        spec_col = surf.specular
+    elif model == 'BI_BLINN':
+        spec = spec_bi_blinn(ndl, ndv, ndh, vdh, gloss, surf.ior)
+        spec_col = surf.specular
     elif model == 'MULTI_LAYER':
         s1 = spec_blinn_phong(ndl, ndh, gloss)
         s2 = spec_blinn_phong(ndl, ndh, np.maximum(gloss * 0.15, 1.0))

@@ -68,6 +68,18 @@ FALLOFF = _items(
     ('INVERSE', "Inverse", "1/d"),
     ('INVERSE_SQUARE', "Inverse Square", "1/d^2, physically correct"),
     ('CUSTOM', "Custom Range", "Linear ramp between start and end"),
+    ('BI_LINEAR', "Inverse Linear (Blender Internal)",
+     "Blender Internal's D/(D+d): bounded at 1, half strength at the "
+     "Falloff End distance. The default curve classic .blend files "
+     "were lit against; legacy imports use it"),
+    ('BI_SQUARE', "Inverse Square (Blender Internal)",
+     "Blender Internal's D/(D+d*d), exactly as 2.79 shipped it (the "
+     "source's own comment calls it a hack, and keeps it). For "
+     "classic files that chose Inverse Square"),
+    ('BI_SLIDERS', "Lin/Quad Sliders (Blender Internal)",
+     "Blender Internal's slider falloff: D/(D+lin*d) times "
+     "D^2/(D^2+quad*d^2), each factor only while its slider is "
+     "above zero -- the 2.4x Quad lamp's att1/att2 pair"),
 )
 SHADOW_MODE = _items(
     ('NONE', "None", "No shadows"),
@@ -202,6 +214,10 @@ ENUMS = {
     'interlace': INTERLACE, 'output_scale': OUTPUT_SCALE,
     'debug_pass': DEBUG_PASS,
     'wire_mode': WIRE_MODE,
+    'material_override': _items(
+        ('NONE', "Off", "Materials render as authored"),
+        ('CLAY', "Clay", "Every material becomes one plain matte "
+         "surface -- lights, shadows and geometry stay real")),
     # grouped: an item with an empty identifier is a category separator
     'res_preset': [('CUSTOM', "Custom", "")] + [
         item
@@ -256,7 +272,7 @@ RANGES = {
     'crt_vignette': (0.0, 2.0), 'composite_bleed': (0.0, 2.0),
     'composite_ringing': (0.0, 2.0), 'composite_dot_crawl': (0.0, 2.0),
     'jpeg_quality': (1, 100), 'jpeg_passes': (1, 8), 'block_size': (4, 16),
-    'threads': (0, 64), 'preview_scale': (1, 16),
+    'threads': (0, 64), 'preview_scale': (1, 16), 'orbit_scale': (0, 16),
     'seed': (0, 2 ** 30),
     'wire_width': (0.1, 8.0), 'wire_angle': (0.0, 180.0), 'resolution_x': (1, 16384),
     'resolution_y': (1, 16384), 'pixel_aspect_x': (0.01, 100.0),
@@ -285,6 +301,9 @@ LABELS = {
     'threads': "Threads", 'film_transparent': "Transparent Film",
     'cache_shadows': "Cache Shadow Maps", 'show_stats': "Timing Breakdown",
     'fast_background': "Fast Background",
+    'orbit_scale': "Orbit Pixel Size",
+    'material_override': "Material Override",
+    'override_color': "Override Colour",
     'use_processes': "Use Worker Processes", 'process_count': "Processes",
     'gpu_post': "GPU Post Processing", 'render_device': "Device",
     'gpu_shading': "GPU Shading",
@@ -426,6 +445,17 @@ DESCRIPTIONS = {
     # ---------------------------------------------------------- shadows
     'shadows': "Master switch for all shadowing. Off is the flat, "
                "floating look of the earliest real-time output",
+    'sss': "Master switch for Blender Internal subsurface scattering "
+           "(2.79's R_SSS): materials with SSS enabled pre-render a "
+           "point cloud and gather the dipole, on either device",
+    'auto_fix_appended_lamps':
+        "When File > Append (or a drag-and-drop) brings in lights from "
+        "a classic .blend (2.79 and earlier), immediately stamp the "
+        "file's own Blender Internal values onto them -- energy, "
+        "colour, falloff, shadow rule -- instead of Blender's watt "
+        "conversion (which lands every classic sun at 1.0). Receipts "
+        "go to a '<file> lamp fix log' text datablock. The Fix "
+        "Appended Lamps button below does the same by hand",
     'shadow_default': "How shadows are computed when a light does not "
                       "choose: depth maps rendered from each light (soft, "
                       "fast, the period standard), traced rays (hard and "
@@ -841,6 +871,15 @@ DESCRIPTIONS = {
                         "own Film > Transparent also switches this on",
     'preview_scale': "Viewport preview is rendered at 1/N resolution and scaled "
                      "up. Raise it for a faster, chunkier preview",
+    'orbit_scale': "Pixel size for MOTION frames only -- orbiting, panning, "
+                   "edits mid-stream. Auto (0) keeps motion frames under a "
+                   "fixed pixel budget however large the region; a number "
+                   "renders them at exactly 1/N. The resting refine always "
+                   "uses Pixel Size",
+    'material_override': "Render every material as a plain matte surface for "
+                         "test renders -- geometry, lights and shadows stay "
+                         "real, textures and shading graphs are ignored",
+    'override_color': "The matte colour Material Override renders with",
     'output_scale': "Render at 1/N of the output resolution and scale back up "
                     "with nearest-neighbour. The output stays the size you set, "
                     "and the render costs N squared times less",
@@ -859,7 +898,8 @@ DESCRIPTIONS = {
                   "fixed-function pipelines. Zero means unlimited",
 }
 
-COLOR_FIELDS = {'global_ambient', 'fog_color', 'wire_color'}
+COLOR_FIELDS = {'global_ambient', 'fog_color', 'wire_color',
+                'override_color'}
 
 
 def _build():
@@ -1001,6 +1041,19 @@ class HalcyonLightSettings(PropertyGroup):
         default='DEFAULT')
     decay_start: FloatProperty(name="Falloff Start", default=0.0, min=0.0)
     decay_end: FloatProperty(name="Falloff End", default=25.0, min=0.0)
+    decay_ld1: FloatProperty(
+        name="Linear Slider", default=0.0, min=0.0, max=1.0,
+        description="BI's Lin slider (att1): active under the "
+                    "Lin/Quad Sliders falloff while above zero")
+    decay_ld2: FloatProperty(
+        name="Quad Slider", default=0.0, min=0.0, max=1.0,
+        description="BI's Quad slider (att2): active under the "
+                    "Lin/Quad Sliders falloff while above zero")
+    bi_sphere: BoolProperty(
+        name="Sphere", default=False,
+        description="BI's Sphere clamp: the light fades linearly to "
+                    "zero at its Falloff End and never reaches past "
+                    "it, whatever the falloff curve")
     shadow: EnumProperty(name="Shadows", items=_items(
         ('NONE', "None", ""), ('MAP', "Shadow Map", ""),
         ('RAY', "Ray Traced", "")), default='MAP')
@@ -1020,6 +1073,12 @@ class HalcyonLightSettings(PropertyGroup):
     negative: BoolProperty(name="Negative", default=False,
                            description="Subtract light instead of adding it, as "
                                        "3D Studio and LightWave allowed")
+    hemi: BoolProperty(
+        name="Hemisphere (BI Hemi)", default=False,
+        description="Shade this Sun as Blender Internal's Hemi lamp: "
+                    "the 0.5+0.5*N.L wrap on the diffuse, a wrapped "
+                    "half-vector highlight, no shadows -- the dome "
+                    "light 2.79 had and Blender since 2.8 does not")
     diffuse_only: BoolProperty(name="Diffuse Only", default=False)
     specular_only: BoolProperty(name="Specular Only", default=False)
     ambient_only: BoolProperty(name="Ambient Only", default=False)
@@ -1239,6 +1298,15 @@ class HalcyonWorldSettings(PropertyGroup):
                             description="Spin the sky around the vertical axis")
     ambient: _col("Ambient", (0.0, 0.0, 0.0))
     ambient_level: FloatProperty(name="Ambient Level", default=1.0, min=0.0, max=8.0)
+    exposure: FloatProperty(
+        name="Exposure", default=0.0, min=0.0, max=1.0,
+        description="Blender Internal's world Exposure: a soft "
+                    "1-exp curve on the lit result (0 with Range 1 "
+                    "is off) -- wrld_exposure_correct, verbatim")
+    exposure_range: FloatProperty(
+        name="Range", default=1.0, min=0.2, max=5.0,
+        description="The input value that maps to white under the "
+                    "exposure curve, exactly 2.79's Range slider")
 
     color: _col("Colour", (0.05, 0.05, 0.06))
     horizon: _col("Horizon", (0.55, 0.65, 0.80))

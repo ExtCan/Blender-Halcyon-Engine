@@ -116,14 +116,23 @@ SPECS = [
      {}, [(C, 'Color'), (F, 'Fac'), (F, 'Tile ID')]),
 
     ('MatcapUV', "Matcap Coordinates", 'MATSPHERE',
-     "Sphere-map coordinates from the view-space normal. Feed the Vector into "
-     "an Image Texture of a lit sphere, then into the shader's Matcap input -- "
-     "or into a Gradient with Centered on, for a view-locked sphere gradient",
+     "Sphere-map coordinates from the view-space normal or reflection. "
+     "Feed the Vector into an Image Texture of a lit sphere, then into "
+     "the shader's Matcap input -- or into a Gradient with Centered on, "
+     "for a view-locked sphere gradient",
      [(F, 'Scale', 1.0), (V, 'Offset', None)],
      {'centered': ('bool', False,
                    "Output around the origin (-0.5..0.5) instead of image "
                    "space (0..1), so a Spherical gradient fed this vector "
-                   "lands centred instead of cornered")},
+                   "lands centred instead of cornered"),
+      'source': ('enum', 'NORMAL',
+                 (('NORMAL', "Normal",
+                   "Project the view-space NORMAL -- the classic matcap, "
+                   "BI's texco Nor"),
+                  ('REFLECTION', "Reflection",
+                   "Project the view-space REFLECTION vector -- the "
+                   "env-map chrome trick, BI's texco Refl")),
+                 "Source")},
      [(V, 'Vector'), (F, 'Facing')]),
 
     ('Spiral', "Spiral", 'FORCE_VORTEX',
@@ -365,11 +374,18 @@ class NODE_MT_halcyon_textures(bpy.types.Menu):
                                  icon=getattr(cls, 'bl_icon', 'NONE'))
             op.type = cls.bl_idname
             op.use_transform = True
+        layout.separator()
+        op = layout.operator('node.add_node', text="BI Texture",
+                             icon='TEXTURE')
+        op.type = 'HALCYON_BITextureNode'
+        op.use_transform = True
 
 
 def register():
     for cls in NODES:
         bpy.utils.register_class(cls)
+    from . import bitex_node
+    bitex_node.register()
     bpy.utils.register_class(NODE_MT_halcyon_textures)
 
 
@@ -378,6 +394,8 @@ def unregister():
         bpy.utils.unregister_class(NODE_MT_halcyon_textures)
     except Exception:                                           # noqa: BLE001
         pass
+    from . import bitex_node
+    bitex_node.unregister()
     for cls in reversed(NODES):
         try:
             bpy.utils.unregister_class(cls)

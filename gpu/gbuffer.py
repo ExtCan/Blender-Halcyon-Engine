@@ -165,6 +165,19 @@ def pack_tri_aux(mesh):
     return out.reshape(side, side, 4), side
 
 
+def pack_tri_scalar(values):
+    """One float per triangle, in the SAME packed-square layout (and
+    therefore the same fetch arithmetic) as the tri-aux texture. R167:
+    carries each triangle's object Auto Smooth threshold for the
+    RAYBIAS terminator fix's GLSL twin."""
+    v = np.asarray(values, np.float32).ravel()
+    n = v.size
+    side = int(np.ceil(np.sqrt(max(n, 1))))
+    out = np.zeros((side * side, 4), np.float32)
+    out[:n, 0] = v
+    return out.reshape(side, side, 4)
+
+
 GLSL = """
 // --- G-buffer reconstruction -------------------------------------------
 // A fragment knows which triangle covered it and where inside that triangle
@@ -192,8 +205,14 @@ uniform float     hal_slot_count;
 
 vec4 hal_fetch_attr(float tri, int corner, int slot)
 {
+    // clamp: an UNCOVERED pixel carries tri = -1, and a neighbour tap
+    // (uv gradients at a silhouette edge) can land on one -- a negative
+    // index through %// makes texelFetch undefined, and on Vulkan an
+    // undefined fetch is a device fault that kills Blender with no
+    // crash log. Clamped, it reads texel zero and the ids test masks it
     int side = int(hal_attr_side);
-    int index = (int(tri) * 3 + corner) * int(hal_slot_count) + slot;
+    int index = clamp((int(tri) * 3 + corner) * int(hal_slot_count)
+                      + slot, 0, side * side - 1);
     return texelFetch(hal_gb_attrs, ivec2(index % side, index / side), 0);
 }
 
@@ -221,8 +240,9 @@ uniform float     hal_tri_side;
 
 vec4 hal_tri_data(float tri)
 {
+    // clamped for the same reason as hal_fetch_attr: tri = -1 exists
     int side = int(hal_tri_side);
-    int t = int(tri);
+    int t = clamp(int(tri), 0, side * side - 1);
     return texelFetch(hal_gb_tris, ivec2(t % side, t / side), 0);
 }
 

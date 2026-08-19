@@ -301,6 +301,16 @@ class Interpreter:
             t = promote(at, bt)
             return rt.sel(cb, self.coerce(a, at, t, n),
                           self.coerce(b, bt, t, n)), t
+        if k == 'arrinit':
+            from .gtypes import BY_NAME
+            et = BY_NAME.get(node[1])
+            if et is None:
+                raise ShaderError(f'unknown array element type {node[1]!r}')
+            vals = []
+            for arg in node[2]:
+                v, vt = self.expr(arg, mask, scope, flags, n)
+                vals.append(self.coerce(v, vt, et, n))
+            return vals, GType(et.base, et.n, et.rows, len(vals), et.struct)
         if k == 'call':
             return self.call(node, mask, scope, flags, n)
         if k == 'member':
@@ -538,6 +548,10 @@ class Interpreter:
         writeback = []
         for i, p in enumerate(params):
             direction, ptype, pname = p[0], p[1], p[2]
+            if len(p) > 3 and p[3]:
+                # array parameter: vec3 pa[4]
+                ptype = GType(ptype.base, ptype.n, ptype.rows, p[3],
+                              ptype.struct)
             if i < len(args):
                 v, vt = self.expr(args[i], mask, scope, flags, n)
                 v = self.coerce(v, vt, ptype, n)
@@ -601,10 +615,21 @@ class Interpreter:
         if bt.array:
             if const is not None:
                 return base[max(0, min(const, len(base) - 1))], bt.elem()
-            idx = rt.to_int(i)
+            idx = np.clip(np.reshape(rt.to_int(i), (-1,)).astype(np.int64),
+                          0, len(base) - 1)
+            # constant-element arrays (lookup tables, unrolled colorbands)
+            # gather in one indexing op instead of a 512-way select chain
+            first = base[0]
+            if all(np.ndim(e) == np.ndim(first)
+                   and np.shape(e) == np.shape(first) for e in base):
+                if np.ndim(first) == 0:
+                    return np.asarray(base)[idx], bt.elem()
+                if np.ndim(first) == 1 and bt.n > 1 \
+                        and np.shape(first)[0] == bt.n:
+                    return np.asarray(base)[idx], bt.elem()
             out = base[0]
             for j in range(1, len(base)):
-                out = rt.sel(np.reshape(idx, (-1,)) == j, base[j], out)
+                out = rt.sel(idx == j, base[j], out)
             return out, bt.elem()
         if bt.is_matrix:
             col = base[max(0, min(const or 0, len(base) - 1))]

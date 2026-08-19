@@ -21,12 +21,27 @@ uniform float brightness;
 uniform float contrast;
 uniform float saturation;
 uniform float gamma;
+uniform int cm_mode;
 in vec2 vUV;
 out vec4 Color;
 void main()
 {
     vec4 texel = texture(source, vUV);
     vec3 c = texel.rgb * exposure;
+    // the view-transform curve, exactly core/post.display_transform:
+    // 1 FILMIC, 2 REINHARD, 3 SRGB (the piecewise OETF -- 2.79's
+    // 'Default' view). 0 is the period-correct no-op. Before this
+    // uniform the GPU stage silently SKIPPED the curve whenever
+    // color_management was set: a live CPU/GPU divergence.
+    if (cm_mode == 1) { c = c / (c + vec3(0.6)); }
+    if (cm_mode == 2) { c = c / (vec3(1.0) + c); }
+    if (cm_mode == 3) {
+        c = clamp(c, vec3(0.0), vec3(1.0));
+        vec3 hi = 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4))
+                  - vec3(0.055);
+        vec3 lo = c * 12.92;
+        c = mix(hi, lo, step(c, vec3(0.0031308)));
+    }
     c = c + vec3(brightness);
     c = (c - vec3(0.5)) * (1.0 + contrast) + vec3(0.5);
     c = max(c, vec3(0.0));
@@ -262,7 +277,8 @@ void main()
 INTERFACE = {
     'DISPLAY': {'samplers': ['source'],
                 'floats': ['exposure', 'brightness', 'contrast',
-                           'saturation', 'gamma']},
+                           'saturation', 'gamma'],
+                'ints': ['cm_mode']},
     'LENS': {'samplers': ['source'],
              'floats': ['distortion', 'aberration', 'edges'],
              'vec2': ['resolution']},
@@ -331,3 +347,7 @@ ENABLED = tuple(k for k, (grade, _tol) in VALIDATION.items()
                 if grade in ('EXACT', 'CLOSE'))
 
 MASK_KINDS = {'NONE': 0, 'APERTURE': 1, 'SLOT': 2, 'SHADOW': 3}
+
+#: color_management -> the DISPLAY stage's cm_mode uniform, matching
+#: core/post.display_transform branch for branch
+CM_MODES = {'NONE': 0, 'FILMIC': 1, 'REINHARD': 2, 'SRGB': 3}

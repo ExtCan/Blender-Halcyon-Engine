@@ -4,6 +4,3156 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
 
 ---
 
+## [1.36.0] — 2026-08-19
+
+### The release: your Blender 2.79 scenes, appended whole
+
+This release rolls the last year of rounds into one number, and its
+headline is the feature the whole 1.33–1.35 line built toward:
+**Blender 2.79-and-earlier .blend appending, Blender Internal
+materials included.**
+
+**What appending now means.** File ▸ Import ▸ Legacy Scene (.blend)
+appends any pre-2.80 file through Blender's own loader — objects,
+modifiers, constraints, custom normals, animation, parenting — while
+Halcyon reads the same file's DNA directly for everything modern
+Blender drops: the complete Blender Internal material system (shader
+pairs, hardness, ramps, mirror, transparency, emit, translucency,
+Shadeless, Shadows Only, both terminator-bias fixes, object colour,
+light groups), all eighteen texture slots with the BI Texture node —
+a port of the original procedural texture engine, colorbands, noise
+bases and lookup tables included — lamps with 2.79's own energy and
+falloff math so old lighting arrives at its true brightness, ray and
+buffer shadows, pre-2.70 spot conversions, the world as gradient sky
++ ambient + mist-as-fog, the file's colour management mapped onto the
+engine's pipeline, its render framing, and its saved selection.
+Plain **File ▸ Append works too**: a watcher recognises a pre-2.80
+source the moment Blender finishes appending and fixes the lamps
+automatically, and a Fix Appended Lamps button covers scenes appended
+before Halcyon was enabled. Every import writes a full log to a text
+datablock. All of it is transcribed against the 2.79 source code and
+held to it by the suite — exactness over plausibility, everywhere.
+
+**The performance line, field-measured on one 171-object,
+25-material character scene:** first render of the arc **8:48.98**;
+this release renders the same frame warm in **0.70 s**, with the
+viewport refining in a third of a second. The machinery behind that
+is described round by round below — the SAH BVH and its new on-disk
+persistence, light and material value texels with pooled shader
+compiles, the G-buffer and mesh-export caches driven by Blender's
+own update reports, single-crossing draw bursts, and shadow rays
+that skip exactly where a lamp contributes nothing — every step
+pixel-identical by test, refusals by name, no shortcuts.
+
+Also in this release: the BVH cache now prints one line naming what
+it did — `loaded from cache in N ms`, or `built in N s; cached for
+the next session`, or the exact reason a save failed — so a cold
+frame that rebuilt says why in the paste instead of leaving it to
+guesswork.
+
+---
+
+## [1.35.54] — 2026-08-19
+
+### The viewport stops re-exporting the world on every collection tick
+
+Every viewport paste since the export cache shipped carried the same
+two words: `dirt ALL(Collection)`. Blender tags collections on
+perfectly ordinary edits, each tag hit the cache's unknown-means-
+dirty rule, and every view_update paid a full 171-object re-export —
+~280 ms of the field's refine cycle, every cycle, for updates that
+almost never mean anything to a mesh.
+
+The fix is not a special case for Collection — it is removing the
+reason collections ever mattered. The only things a collection or
+view-layer toggle can change about a CACHED object are its evaluated
+flags: holdout, visibility, colour, pass index. Those are now read
+FRESH from the evaluated object on every cached reuse — an
+`evaluated_get` is a pointer lookup and six RNA reads per object
+cost about a millisecond for the whole scene — so a holdout toggle
+or a colour edit lands with no dirt at all, and the stored snapshot
+remains only as a fallback for environments without a depsgraph.
+With the flags always live, Collection and ViewLayer updates join
+Scene in the ignored set. Geometry that genuinely depends on a
+collection (a node tree's collection input) re-evaluates its OBJECT,
+whose own update dirties it — the same dependency propagation the
+cache already trusts for images and textures. Everything
+unrecognised still flushes whole; unknown still means dirty.
+
+The warm viewport's view_update export should now read
+`meshes 0x 0 ms (171 cached)` like the warm F12 does — the last
+standing full-export path, closed.
+
+For the record from the same field paste: the 1.35.53 cold frame's
+`compile 19x 14075 ms` and `submit 8827` were the one-time cost of
+that release changing every shader source (the shadow gate) — the
+driver rebuilds its cache once per new source set; and that cold
+frame was also the BVH cache's build-and-save session. Both costs
+die on the following session. The warm F12 reached 0.698 s, with
+the shadow gate's skip visible as `gpu/read 396 → 308`.
+
+### Tests
+
+New pins: a cached reuse serves fresh evaluated flags (colour, pass
+index) with zero dirt; a Collection update is ignored; an
+unrecognised type (Key) still flushes whole and is named. The
+existing snapshot-parity, dirt and retry pins all hold unchanged.
+
+---
+
+## [1.35.53] — 2026-08-19
+
+### The tree survives the session; the shadow rays learn the CPU's skip
+
+1.35.52's burst instrument returned a clean verdict: warm
+`(burst: submit 0 + gpu/read 396)` — submission overhead is gone and
+the remaining draw time is the GPU genuinely executing, dominated by
+the in-shader ray-shadow traversals. And the cold frame's leader
+stood plainly named: `build BVH 2.5 s`, 49% of a 5.2-second frame,
+rebuilding a tree that is a pure function of the mesh — every
+session, same file, same tree. This release takes both.
+
+**The BVH persists across sessions.** The tree arrays now cache to
+disk under a content digest — the mesh's exact vertex and triangle
+bytes, every build constant, and a BUILD_VERSION that changes
+whenever the algorithm does. A reopened session loads the very
+arrays the build produced: the loader recomputes the cheap per-
+triangle derivations with the same numpy expressions and installs
+the same tree, bit-identical in every array the traversal reads —
+pinned by test down to identical intersect() and occluded() answers.
+The profile put the 2.5 s in Python recursion overhead (65,000
+`_build` calls); the load is ~90 ms at the same scale. Corruption,
+truncation, or a version mismatch rebuild silently — the cache is
+never load-bearing; small meshes never touch the disk; the
+directory prunes itself (8 files / 768 MB, LRU).
+
+**The GLSL twin gains the CPU's own shadow-ray skip.** R167
+reordered the CPU: evaluate the shaders first, trace shadow rays
+only where the lamp actually contributes. The GPU twin had kept
+visibility-first, paying a BVH walk on every pixel of every
+ray-shadowed lamp — backfacing and out-of-cone pixels included,
+five suns deep on the field file. The twin now evaluates the shader
+channels, then gates the traversal (and the shadow-map taps) on
+"any channel nonzero AND radiance nonzero" — a gated-out pixel
+keeps its visibility at 1.0 and contributes zero through every term
+that reads it (the ramp ENERGY factor, the shadow-colour tint, the
+receive fold), so the picture cannot move by a bit; only the wasted
+walks stop. Shadows Only materials never reach the GPU path, so the
+gate needs no exception. Parity pinned at 0.0 on the doctrine
+preset's ray-shadowed frame, exactly as before the reorder.
+
+### Tests
+
+The BVH cache suite pins: one file per build, a bit-identical loaded
+tree across all 21 arrays, identical traversal answers, silent
+rebuild on corruption, BUILD_VERSION in the digest, and the
+small-mesh disk skip. The shadow-gate suite pins the emitted order
+(shaders before traversal, at the call site), the gate's presence,
+and CPU parity under the Blender Internal preset. The savez
+temp-name trap (an empty file shadowing the real data) died in
+verification before it ever shipped.
+
+---
+
+## [1.35.52] — 2026-08-18
+
+### The render pass stops breaking between draws
+
+1.35.51's field paste proved the burst worked — the viewport's
+marshal count collapsed from 32 crossings to 8 — and proved the
+theory behind it wrong: `draw+read` stayed at ~370 ms. The ~14 ms per
+pass was never queue latency; it lives INSIDE the crossing. The next
+suspect up the stack is the framebuffer bracket: every draw wrapped
+itself in its own `offscreen.bind()`/unbind, and on the Vulkan
+backend a framebuffer switch can end the render pass and flush —
+twenty-five times per frame, into the same target.
+
+Consecutive draws into the same target now share ONE offscreen
+activation: the burst walks its draw list in runs of identical
+targets, binds once per run, and issues the same draws with the same
+per-draw state — blend, scissor, first-pass clear — inside it. Same
+commands, same order, one render pass; the pixels cannot move.
+
+And because one theory has already died to this number, the burst
+now measures itself from the inside: the split line grows a
+`(burst: submit N + gpu/read M)` pair — submission overhead on the
+main thread vs the readback wait, which is the GPU actually
+executing. Whatever the next paste shows, it names the half that is
+slow instead of leaving it to arithmetic.
+
+### Tests
+
+The device-layer pins now cover the bind discipline: five
+same-target draws share exactly one bind with order, clears and
+blends intact and the readback last; a mixed-target burst binds once
+per RUN (A, B, A); the burst instrument records both halves; a
+read-less burst reads nothing; a failing draw still raises out to
+the compositing fallback.
+
+---
+
+## [1.35.51] — 2026-08-18
+
+### Twenty-six round-trips become one
+
+1.35.50's field paste put the warm frame at 0.756 s with one stage
+owning 60% of it: `shade draw+read 371 ms` — twenty-five material
+passes at ~14 ms each on hardware that draws each pass in well under
+a millisecond. The arithmetic pointed away from the GPU entirely:
+every pass was its own marshal crossing. The render worker queued one
+draw, went to sleep, waited for the main loop's next pickup, woke,
+and queued the next — twenty-five draws plus the readback, twenty-six
+round-trips of queue latency per frame, none of it driver work.
+
+`device.draw_many` now submits a whole pass sequence and its readback
+inside ONE main-thread crossing: the same commands, in the same
+order, against the same targets — the driver sees an identical
+stream, so the pixels cannot move by a bit; only the sleeping stops.
+The opaque frame's 25-pass composite, every ray-bounce sweep at every
+depth, and each transparent layer's rank now cross once each. The
+main thread is held no longer than before — draws are non-blocking
+submissions, and the readback (the only wait) already ran whole in a
+single crossing. A failure inside a burst surfaces exactly where the
+old per-pass loop raised it, so every fallback (the per-pass readback
+path above all) behaves unchanged.
+
+Also confirmed by the same paste, for the record: the compile pool
+landed (`shader compile 19x` — the scene's 25 materials carry 19
+distinct structures), and the viewport's `gbuf MISS(vp[m00-2.4e-03,
+…])` decode showed centi-scale rotation deltas — a real view motion
+between refines, not float jitter. A moving view re-rasterising is
+the cache working as specified. The cold frame's leader is now
+`build BVH 2.5 s`, queued as its own round.
+
+### Tests
+
+The burst contract is pinned at the device layer: one crossing
+carries every draw and the readback; draws run in order with the
+first-pass clear, the blend, and the scissor regions intact and no
+per-draw reads; the readback comes last, region and all; a read-less
+burst reads nothing; and a failing draw raises out of the burst
+exactly like the old loop, keeping the compositing fallback
+reachable.
+
+---
+
+## [1.35.50] — 2026-08-18
+
+### Material values ride a texture; material structures share a shader
+
+With the export wall down, the field's warm frame is almost all
+`shade draw_read`, and its cold session is almost all `shader compile
+25x 19797 ms` — because every material pass baked its constants into
+its GLSL as literals. Twenty-five materials meant twenty-five
+distinct sources, twenty-five driver compiles, and a recompile for
+every slider drag. The R169 light texels solved exactly this for
+lamps; this release does it for materials.
+
+**The mechanism.** Every per-material VALUE the assembler emits — the
+whole surface struct (diffuse, specular, hardness, opacity, all of
+BAKE_FIELDS), the graph's own constants (socket defaults, RGB/Value
+nodes), ramp factors, sheen/rim/fresnel/matcap/backface constants,
+the terminator-fix sbias curve, the anisotropic rotation's baked
+cos/sin, the environment reflect scale, even the pass's ownership id
+— is marked at generation, lifted out of the finished source, and
+packed into one row of the new `hal_mats` texture (`hal_mrow` selects
+the row at draw). What remains is the material's STRUCTURE: two
+materials that differ only by values now produce byte-identical
+sources, and the pooled shader name turns the pair into ONE driver
+compile. On the R170 measurement that is 13 pass sources → 8 distinct
+on one field file; the cold first-session compile storm shrinks by
+the same ratio, and a value edit re-uploads a texel row where it used
+to recompile a shader.
+
+**Exactness.** The lifted values are the same float32 bits the
+literals carried, fetched from a texture instead of compiled in —
+parity is pinned at 2.9e-06 against the CPU on the test scene, at the
+original values, after a value edit, and with the whole mechanism
+switched off (the literal road remains, byte-identical to 1.35.49,
+as the A/B in the suite). Values that GATE code generation — a sheen
+crossing zero, shadeless, a spot blend appearing — are read
+python-side and stay structural: crossing a gate changes the source
+and replans honestly, exactly as before. Colour-band ramp STOPS stay
+baked this round (their arrays sit in constant-index initializers);
+materials differing only in ramp stops still split, named here so it
+cannot pass for pooled.
+
+Height pre-passes keep per-material sources this round. The plan
+signature still fingerprints material values, so a value edit
+replans — but every compile in that replan is now a cache hit; the
+per-material plan cache that would skip the re-assembly too is the
+natural next step and stays queued.
+
+### Tests
+
+A new suite pins the whole road: same-structure materials produce
+byte-identical masked sources with distinct value rows and a shared
+pooled shader name; the hal_mats atlas registers; no marker survives
+the lift; parity holds through the texels; a hardness edit keeps the
+masked source (the compile pools) while the texels and the picture
+change; a structure change still splits the source; and the
+texels-off literal road builds, fetches nothing, and holds the same
+parity. Every existing GPU seam, layer, raybias and field-law test
+runs against the lifted sources unchanged.
+
+---
+
+## [1.35.49] — 2026-08-18
+
+### The renderer stops flushing its own cache
+
+1.35.48's dirt instrument earned its keep on the first paste: the
+warm F12 read `dirt ALL(flush)` and the viewport read
+`dirt ALL(Scene)` — the export cache was working perfectly and being
+flushed wholesale before every single render, twice over, by two
+different reflexes of my own.
+
+**The flush was the render itself.** Every still F12 fires
+`frame_change` on the CURRENT frame — the render pipeline re-sets
+the frame it is about to draw — and the R171 handler treated any
+frame_change as an animation step and flushed both pools. A
+re-evaluation of the same (frame, subframe) has identical time
+inputs and cannot change anything the depsgraph does not list, so
+the handler now compares against the last (frame, subframe) seen per
+scene: the same frame walks the depsgraph's own update list through
+the ordinary targeted dirt (almost always empty), and only a REAL
+frame step — an animation render, playback, scrubbing — still
+flushes whole, exactly as before.
+
+**Scene updates stop meaning panic.** Blender fires a Scene update
+around every render, file load and plenty of UI activity, and Scene
+sat in the unknown-means-dirty bucket — so the pools died every time
+the user so much as rendered. Scene's one lever that can change
+evaluated mesh geometry is the Simplify block, and that is now
+FINGERPRINTED directly: every export reads
+use_simplify/subdivision/particle/volume levels and flushes both
+pools the moment the fingerprint moves — which catches a Simplify
+change MORE reliably than update reports (it flushes whether or not
+an update ever fired), while the noisy Scene updates are ignored.
+Collection, ViewLayer, node-group and every other unrecognised
+update still flush whole; unknown still means dirty.
+
+With both reflexes fixed, the warm F12's `meshes 150x 286 ms` should
+finally read `meshes 0x (171 cached)` — export down from a third of
+the frame to materials + concat.
+
+### Tests
+
+New pins: a same-frame frame_change (a still F12) does not flush and
+the export after it serves the whole pool warm; its listed updates
+still dirty targeted; a real frame step flushes whole with
+`dirt ALL(frame)`; a Scene update is ignored; flipping Simplify
+flushes at the next export with `dirt ALL(simplify)` named on the
+split; an unrecognised type (Collection) still flushes and is named.
+
+---
+
+## [1.35.48] — 2026-08-18
+
+### The field's first cache paste, answered — and an exactness hole closed before it could bite
+
+1.35.47's instruments came back with three findings in one paste, and
+this release acts on all of them.
+
+**The export cache is keyed on the OBJECT now, not the datablock.**
+Writing up the field's `21 cached 0 ms` (same-frame duplicate
+instances, deduped on the very first export — confirmed headlessly)
+exposed a hole in my own R171 key: entries were keyed on the DATA
+session identity, but modifier stacks are per-object — two objects
+sharing one mesh can evaluate to different geometry at the same
+matrix, and one could have served the other's arrays (and the first
+object's ObjectInfo snapshot: its colour, pass index, visibility,
+smoothresh). No field frame is known to have crossed that line; it is
+closed before one does. Entries key on the object's session identity
+(name as the stub fallback), each entry remembers its datablock's uid
+separately, and the invalidation is now two-lane: an Object update
+dirties that object, a direct Mesh/Curve edit dirties every user
+object through the remembered data uid — even if the depsgraph did
+not list all the users. Objects sharing a datablock cache separately,
+by test; one data edit still drops them all.
+
+**The fixed cap is gone; a stale sweep and a byte budget replace it.**
+The field's warm F12 read `150x live (21 cached)` — the previous
+F12's pool was gone. The arithmetic named the killer: viewport pool
+(171) + render pool (171) overflowed the 256-entry cap, so every
+asset-browser-poked viewport re-export between two F12s churned the
+render pool dead through plain LRU. Fixed caps that silently evict
+the other pool are exactly the kind of trap the doctrine forbids.
+Now: each export sweeps ITS OWN mode's untouched entries only once
+they outnumber the live set 2:1 (dead matrix keys from dragged
+instancers, emptied scenes), the other mode's pool is never touched,
+and total memory is bounded by BYTES (512 MB of cached arrays, LRU)
+with an 8192-entry backstop. The G-buffer raster cache got the same
+treatment: the draft storm inserted a new key per jittered draft and
+the old 4-slot LRU evicted the refine and F12 entries between uses —
+the field's `MISS(evicted)` on an unchanged view. It is byte-bounded
+now (256 MB, 12-entry backstop), so viewport-sized entries number in
+the dozens while F12 supersample giants still cannot hoard.
+
+**Both instruments dig one level deeper.** `MISS(vp)` now decodes the
+moved matrix elements: `gbuf MISS(vp[m03+2ulp])` is float jitter to
+hunt down; `gbuf MISS(vp[m03+2.5e-01,+9])` is a real navigation. The
+export split now separates same-frame dups from real warmth
+(`21 cached, 21 dup`) and names the dirt each export consumed —
+`dirt 150u` for targeted updates, `dirt ALL(Scene)` naming the ID
+type that flushed the pool, `dirt ALL(flush)` for undo/load/frame
+changes. And the viewport split line now carries the last export's
+split too (`export meshes 2x 0 (+169 cached)`), because whether the
+viewport's own view_update exports hit the mesh cache was half the
+field question and entirely invisible.
+
+One paste of the next warm F12 and two refines now separates every
+remaining hypothesis: real warmth vs dup dedup, cap eviction (gone)
+vs update-storm dirt (named by type), float jitter vs real motion.
+
+### Tests
+
+New pins: shared-datablock objects cache separately and one data
+dirty drops both; object-token targeted dirt; same-frame dup
+counting; the stale sweep bounds a mode's pool at 2:1 and never
+touches the other mode; the dirt diagnosis reaches the split
+(`dirt ALL(flush)` after the flush handler); the vp decode names
+moved matrix elements on an orbit. The 1.35.47 pins all hold under
+the new keying, unchanged in meaning.
+
+---
+
+## [1.35.47] — 2026-08-18
+
+### The unchanged object stops exporting — and the viewport raster tells on itself
+
+1.35.46's split named the warm frame's last two walls in the field's
+own paste: `export split: meshes 171x 332 ms` (74% of a 0.495 s warm
+F12) and `raster 198–220 ms` on every refine — the G-buffer cache
+hitting at F12 (`rasterise (cached) 0.002s`) but missing in the
+viewport, where the identical headless run hits. This release takes
+the first wall down and instruments the second.
+
+**The mesh export cache.** Every F12 and every geometry `view_update`
+pushed all 171 unchanged objects through `evaluated_get` + `to_mesh`
++ eleven `foreach_get` walks per frame, rebuilding arrays identical
+to the last frame's. Each object's finished export arrays are now
+cached, keyed on the data-block's session identity, the depsgraph
+MODE, and the exact world-matrix bytes — and invalidated by
+Blender's own update reports: a `depsgraph_update_post` handler
+dirties an object's data on ANY update touching it (a transform, an
+edit, even a selection tick), geometry data-block edits dirty every
+instance, and any update the handler does not recognise — a Scene
+change (Simplify!), a collection toggle, a geometry-node tree, a
+shape key — flushes the whole cache. Undo, redo, file load and frame
+changes flush it whole too. Unknown means dirty; the cache can be
+wrong in only one direction, slower.
+
+Exactness holds to the bit. The key carries the depsgraph mode
+because render and viewport depsgraphs evaluate DIFFERENT meshes
+from the same data (`show_render` vs `show_viewport` modifiers,
+render-level subdivision) — the two sides warm separately and can
+never serve each other a wrong mesh. Material and object index
+arrays are REBUILT on every reuse from stored slot names, so
+material list order and object numbering come out identical to a
+fully live export — pinned by test, `np.array_equal` across every
+channel. Materials themselves are never cached: they re-export
+fresh every frame (they are cheap — `materials 26x 10 ms` — and
+they are what gets tweaked between renders), resolved by unique
+name and pushed through `evaluated_get` so driven values stay
+driven. A stored slot name that no longer resolves (a material
+renamed since the store) sends that one object down a live RETRY
+path in the exact list position the cache reserved for it, and the
+refreshed entry heals on the next frame. The F12 split now reports
+the reuse: `meshes 6x 12 ms (165 cached 3 ms)`. On the field file
+that is the 332 ms wall down to single-digit milliseconds once
+warm — and the same cache serves the viewport's geometry
+re-exports.
+
+Without its handlers (a failed registration, a headless stub) the
+cache never arms and every export runs the full live path,
+unchanged.
+
+**The G-buffer miss instrument.** The viewport split line now ends
+with one more word: `gbuf HIT`, or `gbuf MISS(<component>)` naming
+exactly which key component moved since the last frame at that
+resolution — `mesh`, `vp`, sizes, any raster dial, the opaque
+subset — or `off(<gate>)` naming the eligibility gate (Painter's,
+bands, the overdraw census). The field's refines re-rasterise
+~210 ms that the headless twin serves from cache; the next pasted
+split line will name the component that differs, instead of a
+round of guessing. The cache also holds 4 entries now (draft,
+refine, F12 and one spare) so draft/refine alternation cannot
+evict the F12 key.
+
+### Tests
+
+The suite pins the whole cache: a second export serves every mesh
+from the cache bit-identically with ObjectInfo numbering and
+snapshots intact; materials still export fresh (same order, new
+objects); a dirtied data uid re-exports its object only; the
+all-dirty flag and the flush handlers flush whole; a moved object
+misses by matrix key; the rename→RETRY→heal cycle; viewport and
+render modes warm separate entries; the update handler's semantics
+per ID type (Object targeted, Mesh targeted, Material ignored,
+Scene flushes); and `register()` under a handler-less bpy stays
+safely disarmed. The G-buffer instrument is pinned end to end:
+`HIT` after an identical re-render, `MISS(vp)` after an orbit,
+`MISS(mesh)` after an edit, `off(painters)` under Painter's, and
+the real viewport path printing `gbuf HIT` on the second identical
+refine.
+
+---
+
+## [1.35.46] — 2026-08-18
+
+### The idle refine stops re-rasterising — and every number gets a name
+
+The field confirmed 1.35.45's arc: refines went from 45 seconds to
+0.23–0.33s, warm F12 to 0.75s (from the original 8:48), and the new
+instrument printed the last cold wall in plain text — `shader
+compile 25x 9328 ms`. The splits also showed where the remaining
+steady-state time hides, and this release takes the largest piece:
+
+**The G-buffer cache.** An idle viewport refine spent ~85% of its
+time (raster 200–290 ms) re-rasterising arrays identical to the
+previous refine's — same camera, same mesh, same dials. The
+rasterised G-buffer is now cached on CONTENT: the mesh fingerprint,
+the exact view-projection bytes, sizes, and every dial the
+rasteriser reads (cull, snap, depth precision, the affine
+subdivision cap, the near epsilon, the opaque subset). A hit
+restores copies in milliseconds and is pixel-identical by test; an
+orbit, a mesh edit or a settings change misses honestly. Painter's,
+overdraw-census and band frames stay outside it. Repeated same-
+camera F12s skip their raster too.
+
+**The export split.** At 0.36s of a 0.75s warm frame, "export scene"
+was the new slowest stage and a single number. The F12 console now
+prints `export split: meshes Nx X ms, materials Mx Y ms, concat Z
+ms, other W ms` so the next paste aims the next fix.
+
+**The import census.** The field's log said `lamp stage reached: 0
+lamp object(s) among 157 appended` — the instrument that proved the
+old mystery, now finishing the job: the line carries a full kind
+histogram AND the import options (`lights= selected= hidden=`), so
+"why zero lamps" is answered by the line itself instead of a round
+of questions.
+
+**Console noise.** `Material.use_nodes` deprecation warnings (25 per
+legacy import; slated for removal in Blender 6.0) are gone — the
+importer and the template writer go through the compat shim that
+reads the value without the warning.
+
+Also measured this round, logged for the next: collapsing material
+shaders by pooling their constants (the lamp-texel treatment applied
+to materials) would reduce the field file's 13 distinct sources to
+8 — worthwhile for cold compiles and material-tweak stalls, and
+scoped as its own release.
+
+New coverage: the G-buffer cache laws (identical second render hits
+and is pixel-identical; orbit and mesh edits miss; Painter's stays
+outside).
+
+---
+
+## [1.35.45] — 2026-08-18
+
+### The recompile storm — the viewport's real enemy, named and defused
+
+The field's pastes drew the map: warm F12 at 1.46s, but the FIRST
+render after any settings change took 33.9s, and the first viewport
+refine 45.2s. The split lines mislabelled the cause — "composite
+19656 ms" was actually the driver compiling 25 material shaders in an
+untimed gap (`build_draws` runs between the timers), and cold
+draw+read carried the pipeline half of the same storm. Worse: light
+VALUES were baked into shader source and fingerprinted by the plan
+signature, so EVERY lamp tweak — dragging an energy slider, moving a
+sun — invalidated every pass and re-paid the storm. That is what
+"horrendously slow" while lighting a scene was.
+
+**Lamp values live in a texture now, not in shader source.** Every
+per-light value the emitter used to bake as a literal — position,
+direction, colour, energy (Negative folded into its sign), spot cone
+cosine and blend width, decay start/distance and the classic Dist1/
+Dist2 sliders — rides a one-row `hal_lights` texture the light loop
+fetches (the eye precedent: "baking the eye meant a moving camera
+paid the driver's shader compile every frame", applied to lamps).
+The values are `np.float32` of the same expressions the literals
+evaluated — the CPU's exact numbers, which is what parity measures
+against. STRUCTURE still bakes and still re-plans honestly: light
+count and types, decay modes, which sliders are nonzero, whether a
+spot has a blend, shadow modes, light linking, cookies — and a
+MAP-shadowed lamp's move still re-plans (its matrices bake into the
+shadow function; its map rebuilt anyway). RAY-shadowed lamps — the
+field scenes' entire rigs — have value-free shadow code, so every
+tweak of theirs is storm-free.
+
+The plan signature drops the texel-ized values and gains three
+honesty fixes found in the audit: the `max_lights` cap's CHOICE of
+lamps is fingerprinted on its own (selection ranks by energy, which
+left the signature); the per-lobe gates (This Layer Only-style
+affect flags) and the R164 shadow colour join it — both were baked
+into source but MISSING from the signature, latent stale-plan bugs.
+On a cache hit the light texture repacks fresh from the current
+lamps — the hit path serving stale values was caught by the new
+test's first run.
+
+**What a lamp edit costs now:** a plan-cache hit plus one tiny
+texture upload. Proven on the field file itself: every sun's energy,
+colour and direction tweaked at once → same plan object, fresh
+texels, parity against a fresh CPU render at mean 9.9e-08, picture
+genuinely moved.
+
+**And the storm is measurable now.** The device layer counts every
+driver compilation and its wall time; the F12 shade split and the
+viewport split line print `shader compile Nx MMMM ms` (labelled
+"first frame per plan; cached after"), and compile time is
+subtracted from the composite bucket so it means what it says. The
+next cold paste will name itself.
+
+New coverage: `test_light_texel_cache` (texel parity across sun/
+point/spot with negative, BI_SQUARE, sliders+sphere and blend; the
+everything-tweaked cache-hit law with values landing; the
+structural-change re-plan law), plus the field-scene proof in the
+round log.
+
+---
+
+## [1.35.44] — 2026-08-18
+
+### 8:48 → 3.1s confirmed in the field — now the 3.1s gets attacked
+
+The pasted breakdown of the first GPU-riding field frame (3.097s
+warm, deferred parity 0.000051, 14 passes) named its own next walls,
+and two of them fall here:
+
+**Background/sky: 0.750s → ~0.** The frame's film is TRANSPARENT —
+and 2.79's transparent film (R_ALPHAPREMUL) carries no sky at all:
+the uncovered pixels are premultiplied (0,0,0,0), full stop. The
+engine was evaluating the world colour into the rgb of pixels whose
+alpha is zero — values 2.79 never wrote, that no viewer shows, and
+that whatever post reads rgb regardless of alpha (a glow, a bloom)
+could wrongly pick up. A transparent film now writes exact zeros and
+skips the world evaluation entirely — a quarter of the field frame,
+and a semantic *correction* toward 2.79, not just a speedup. The AA
+resolve stays premultiplied-correct: edge pixels blend toward
+coverage-weighted colour, which is what a premultiplied frame means.
+(Opaque films are untouched.)
+
+**Deliver to Blender: the copy path tightened.** The finished frame
+now crosses as one flat contiguous float32 buffer — foreach_set's
+single-memcpy fast path — instead of an (N,4) shape it may have had
+to iterate, and the non-finite scrub (an unconditional rewrite of
+10M floats) runs only when a non-finite value actually exists. The
+remainder of that 0.609s bucket is Blender's own result processing,
+outside the add-on's reach.
+
+**Measured and deliberately NOT changed:** the GPU raster's decode
+and pack stages were benchmarked at field size against masked-copyto
+and channel-pair variants — the existing plain form won (the decode
+is memory-bandwidth-bound; numpy's `where` is already at the floor),
+so the code keeps it, with the bench recorded in a comment. The
+supersample boundary itself (raster readback, ids upload, resolve
+all carrying 4× pixels at AA 4) is the next structural target,
+alongside the first-render warmup (shader compile + texture prep —
+the field's "20-something seconds" first press) and the viewport
+arc.
+
+New pin: a transparent film's uncovered pixels are exact
+premultiplied zeros.
+
+---
+
+## [1.35.43] — 2026-08-18
+
+### The 8:48 frame — profiled on the real file, and the wall had a name
+
+The field's character render took 8:48.98. The scene, read straight
+from the uploaded .blend: 1600×1600, 39,682 triangles, 15 Blender
+Internal materials, and five SUN lamps every one of which carries RAY
+shadows. Profiled headlessly at field shape, 84% of the frame was two
+things: shadow rays through the BVH, and sRGB texture decode. And the
+reason the GPU never helped was a single find:
+
+**Three of the file's materials carry 2.79's MA_RAYBIAS flag** —
+'Black', 'Shadeless_B' and a third body material — and R164's honest refusal
+("no GLSL twin") routed the ENTIRE frame's shading to the CPU, every
+render, regardless of the device switch. The fix is not to drop the
+refusal but to build the twin:
+
+**Ray Bias now rides the GPU.** The per-face smooth proxy reads the
+stored face normal from the tri-aux texel (the same bits ctx.Ng
+carries), the object's Auto Smooth threshold rides a new per-triangle
+`hal_sres` texture (109 objects in the field file — an unrolled
+uniform ladder would cap out), and the correction curve is the sbias
+branch's with the CPU `_pcurve`'s exact guards. Parity at the sbias
+bar on the demo scene, and on the field scene itself: mean 1.1e-07
+over the covered pixels (the single 1.1e-04 pixel predates this round
+— proven by re-running with the flag stripped — and belongs to the
+documented traversal float-order class). Frame passes only: a ray hit
+has no G-buffer triangle id, so a scene with actual mirrors refuses
+by name exactly as before — hit passes are built as marked stubs and
+only refuse when something reflective or refractive would run them.
+**The field file now plans on the GPU whole: 14 passes, zero
+refusals, ray shadows on the driver.**
+
+### The CPU path: three exact-by-construction speedups
+
+Every change is REQUIRED bit-identical, and proven so on the field
+frame itself (pixel-for-pixel equality against the pre-change build):
+
+- **BVH, unrolled and direction-specialised.** The slab test's
+  3-wide axis reductions (45k generic ufunc reductions per frame)
+  are unrolled over contiguous per-axis columns — same values, same
+  pairwise order, identical bits. Sun shadow rays — all sharing ONE
+  direction — take a new uniform lane: three scalar inverses instead
+  of an (N,3) gather, and the Möller-Trumbore terms that depend only
+  on (direction, triangle) — the P vector, the determinant — are
+  computed once per query and gathered per item. Measured on the
+  field mesh: sun occlusion 3.4×, incoherent rays 2.3×, closest-hit
+  2.2×, outputs identical to the old code in every case (uniform,
+  random, axis-parallel, masked, finite-range).
+- **Shadow rays trace only where they are read.** The shaders run
+  BEFORE the shadow query, and their own transcribed C gates (Blinn
+  zero below nl=0.01, CookTorr/Phong below nh=0, Lambert below
+  inp=0) decide which samples can receive anything from the lamp; a
+  sample whose diffuse and specular are both zero multiplies vis
+  into nothing, so its five sun rays never needed to exist. Exact by
+  construction — the mask IS "the result reads vis here" — with
+  Shadows Only accumulation disabling the skip for its batch, and a
+  suite pin proving the full-tracing frame pixel-identical.
+- **8-bit sRGB decode through a table.** Every PNG/JPG texture is
+  bytes/255 in float; the pow formula was recomputing 256 possible
+  values per 50M pixels. The 256-entry table is built by the same
+  expression on the same dtype, and the gate is EXACT: each value is
+  accepted only if it bit-equals its reconstructed 8-bit level — one
+  poisoned ulp anywhere rejects the whole table path. Float, HDR,
+  negative and NaN content fall through to the formula unchanged.
+  (Texture prep remains a first-render-per-session cost; it is
+  cached across F12s.)
+
+Container measurements at field shape (800×800 with 2× supersample,
+a quarter of the field pixel count): shade 14.5s → 4.8s (3.0×),
+frame 22.9s → 13.3s with texture prep noise included. The real
+speed story on the field machine is the routing fix above: with the
+device switch on GPU, the shading that took the whole 8:48 now
+belongs to the driver that rendered the 1.30 era's frames in tens of
+milliseconds.
+
+New coverage: `test_bi_field_frame_speed_laws` (occlusion lanes vs
+closest-hit truth, mask semantics, decode-table bit-identity and its
+exact gate, traced-ray accounting with the pixel-identity law), Ray
+Bias GPU parity + the threshold-0 identity + the mirror-scene
+refusal, and the sres/no-rays scaffolding in the tail test.
+
+---
+
+## [1.35.42] — 2026-08-18
+
+### The append watch — classic lamps fixed the moment they arrive
+
+The field's verdict on 1.35.41's manual fixer: *"It works, BUT it
+needs to happen when appending... convenience/ease of use is key."*
+Done. The fix now runs itself.
+
+**Auto-Fix Appended Lamps** (Render Properties > Lighting, on by
+default). Halcyon now listens on Blender's `blend_import_post`
+handler — it fires after every File > Append, drag-and-drop, asset
+drop, and script append alike (contract verified against the current
+Blender source: one `BlendImportContext` argument whose
+`import_items` carry the actual imported IDs and, decisively, the
+source file each came from). When lights arrive from a classic
+.blend, the watch reads that file and stamps its own Blender
+Internal values onto exactly the lights that just landed — energy
+(suns ×π, point-family ×4π²), colour, falloff with its distances,
+per-lamp shadow rule, shadow colour, mode bits, spot cone — through
+the very same core as the manual fixer and the legacy importer (one
+function for every route, so they cannot disagree). Receipts land in
+the console and the same version-stamped `<file> lamp fix log`.
+
+The watch stays out of the way unless every gate passes: the scene's
+engine is Halcyon (appending a classic prop into an Eevee project is
+never touched), the toggle is on, the import is an append (links are
+library-owned and read-only), and the source file provably predates
+2.80 — a 12-byte header sniff, through gzip for 2.4x-era saves;
+Zstandard files are modern by definition. Per item, `KEEP_LINKED`
+and `REUSE_LOCAL` are skipped: a reused local light already lives in
+your scene, and whatever you have done to it since is yours. A lamp
+that arrives as both an Object item and its Light-data item is
+recognised as ONE lamp; a data-section append (a bare Light with no
+object) still matches through the lamp-data name pool. The handler
+is `@persistent` and can never raise into Blender's import
+machinery. The manual button remains for scenes appended before the
+watch existed.
+
+### A second field import log: a truncation, instrumented
+
+The field's uploaded import log ends mid-list — after the x-ray
+header but before its pairing lines and the lamp receipts — an
+absence the code's two receipt branches cannot both produce, which
+means the text-datablock write died partway and the old
+one-fence-around-a-loop writer swallowed it. Three changes make that
+class of failure impossible to miss again:
+
+- **Hardened log writer** (importer, fixer, and watch alike): the
+  whole payload writes in ONE call; on failure it falls back to
+  per-line writes where only the offending line is replaced by a
+  marker NAMING the exception. Every log now ends with a
+  `log complete (N lines)` terminator — a log without it IS
+  truncated, no guessing.
+- **Unconditional lamp-stage line** in the import log
+  (`lamp stage reached: N lamp object(s) among M appended`) — the
+  stage now always leaves a trace, before any receipt logic runs.
+- **Fenced console prints**: a print that a Windows console codepage
+  rejects can no longer abort an import (it falls back to
+  backslash-escaped ASCII).
+
+Also noted from the same log, open for a future round: the file
+parses with 0 of 165 objects carrying material pointers (the name
+ladder converted all 26 materials regardless — this is the x-ray
+doing its job, not a conversion failure).
+
+New coverage: the header sniff (classic, gzip-wrapped, modern,
+Zstandard, garbage), the item filter (links, kept/reused items,
+meshes, missing ids, missing paths), the handler end-to-end against
+the fixture (values, shadow rule, receipts, Object+Light dedup, the
+data-section append), all four gates, idempotence, crash-proofing
+against malformed contexts, registration/unregistration, the
+poison-line writer fallback, and the new unconditional import-log
+lines.
+
+---
+
+## [1.35.41] — 2026-08-18
+
+### Fix Appended Lamps — the repair for plain File > Append
+
+The persistent every-lamp-reads-1.0 field reports have a route no
+Halcyon code ever touches: Blender's own **File > Append**. Its
+machinery converts every 2.79 lamp to modern units — appended suns
+arrive at exactly 1.0 W, the file's energies gone — and none of the
+importer rounds could ever have helped, because the importer never
+ran.
+
+**New: Render Properties > Lighting > "Fix Appended Lamps (2.79)".**
+Point it at the original classic .blend *after* appending. It reads
+the file with Halcyon's own parser and stamps the file's values onto
+the scene's lights through the exact same conversion the legacy
+importer uses (`_apply_lamp_bi` — one function, both routes, so they
+cannot disagree): BI energy (suns and hemis ×π, point-family ×4π²),
+colour, falloff type with its distances and the classic Dist1/Dist2
+sliders, the Sphere clamp, the per-lamp shadow rule (buffer→MAP,
+Ray→RAY, neither→NONE, hemis never), the shadow colour, Negative /
+No Diffuse / No Specular mode bits, and spot size and blend.
+Nothing else in the scene is touched.
+
+Matching is the material matcher's exact-first ladder, on object
+names before lamp-data names: the appended name tries verbatim
+first (classic files legitimately contain their own `Lamp.001`),
+then the `.001` rename suffixes come off one at a time — so a lamp
+renamed by an append collision still finds its file original, and a
+hand-renamed object can still match through its data name.
+
+The run leaves a version-stamped log (`<file> lamp fix log` in the
+text editor) with one receipt per light — `Spot.001: file energy
+1.5 -> 59.22 (matched file object 'Spot')` — plus every light that
+matched nothing, by name, alongside the lamp names the file actually
+offers. Lights that share one light datablock but match different
+file lamps are called out. An energy write that does not stick still
+raises the named readback warning from 1.35.36.
+
+**Optional: "Scene Pipeline Too"** (off by default) also applies the
+file's render pipeline exactly as the importer would — the scene's
+view transform onto Halcyon's colour management (2.79's 'Default'
+view is the sRGB display encode, the 1.35.35 discovery), frame size,
+and the transparent-sky flag — for scenes that were assembled
+entirely through plain appends.
+
+New headless coverage drives the operator end-to-end against the
+fixture file: the exact-name match, the `.001` rename, multi-suffix
+walks, the data-name fallback, unmatched reporting, the
+Selected-Lights-Only filter, the untouched-by-default scene
+pipeline, and both empty-scene cancels.
+
+---
+
+## [1.35.40] — 2026-08-18
+
+### The rest of shade_lamp_loop's tail, letter-true — and a vertex-paint fix
+
+Five features of Blender Internal's per-pixel tail that had never
+been transcribed, each taken from the archived 2.79 source (with two
+new targeted fetches), each running on BOTH devices at float32
+exactness unless refused by name.
+
+**World Exposure/Range.** The letters come from the original 2003
+commit that introduced them (confirmed untouched until their 2.8
+removal): `linfac = 1 + (2·exp + 0.5)^-10`, `logfac =
+log((linfac−1)/linfac)/range`, and the curve `linfac·(1 −
+e^{c·logfac})`. Position pinned from the 2.79 call site: it corrects
+the accumulated DIFFUSE ("has no spec!") and SPEC separately —
+observable, since the curve is non-additive — after the SSS
+replacement, before ambient and emit join, and never in the SSS
+pre-pass (`!R.sss_points`). The world panel gains the two sliders,
+the importer reads them from the file, and the GPU passes bake the
+factors as constants (float32-exact parity, 1.9e-7).
+
+**The shadow-bias terminator fix (phongcorr).** `shade_one_light`'s
+three branches verbatim: HEMI and AREA lamps pass untouched; a
+RAYBIAS material on a smooth face fades diffuse below the object's
+Auto Smooth threshold; otherwise `Material.sbias` does the same
+against any shadowed lamp — `(N·L − bias)/(N·L·(1 − bias))`, zero
+below. Unshadowed lamps skip it entirely, exactly the C's `shb ||
+LA_SHAD_RAY` gate. The sbias branch runs in GLSL too (parity
+1.2e-7); the RAYBIAS branch reads per-face smoothness and refuses
+the GPU by name. (The face R_SMOOTH flag rides a geometric proxy —
+interpolated normal differing from the face normal — noted
+divergence for flat-shaded-but-bumped faces under RAYBIAS.) The
+importer maps `sbias`, `MA_RAYBIAS` (0x400000) and the object's
+`smoothresh` (stashed as a custom property; 5.x objects no longer
+carry the field).
+
+**The lamp's Shadow Colour.** `lashdw·(i_noshad − i)` added back to
+the diffuse — equivalently the shadowed diffuse sees `vis +
+shadow_color·(1 − vis)` per channel, while spec keeps the plain
+factor, exactly the C. The Light's existing Shadow Colour property
+finally does what it says; the importer carries the lamp's
+`shdwr/g/b`. GPU parity 1.3e-7.
+
+**MA_OBCOLOR.** The object colour modulates the WHOLE combined at
+the very end of the tail (after emit and spec joined), and alpha
+under transparency — with the C's own quirk kept: an SSS-flagged
+material skips the modulation whenever `sss_pass_done` says so
+(tree built, or the scene switch off — but never in its own
+pre-pass, so the scattered points DO carry the tint). On the GPU
+the modulation rides an unrolled object-id ladder (the
+light-linking mechanism); transparency or more than 24 coloured
+objects refuse by name. The importer reads `Object.col` and the
+`shade_flag` bit; parity 6.0e-8.
+
+**Vertex Color Paint was WRONG — fixed.** `shade_color` alpha-lerps
+the paint over the base colour (`r·(1−a) + vcol·a`); the import had
+the paint REPLACING the base outright, diverging wherever the paint
+layer carries alpha. Both devices corrected.
+
+Also: hemi lamps no longer emit GPU shadow taps (a latent compile
+break — BI never shadowed hemis and the CPU returns full lit; the
+new phongcorr test found it), mist imports its true CURVE
+(quadratic / linear / inverse-quadratic from `mistype`) with the
+unsupported Height falloff warned by name, and `do_material_tex`
+plus `zbuffill_sss` were re-probed and remain beyond the fetch
+window — still open, still logged.
+
+New tests: the exposure letters and separated-correction pin with
+frame parity, all phongcorr branches (curve shape, terminator
+softening, unshadowed skip, HEMI pass, Ray Bias refusal), shadow
+colour tint direction and parity, obcolor tint/parity/refusals and
+the sss_pass_done quirk, the vertex-paint lerp, and the import
+chain for every new field.
+
+---
+
+## [1.35.39] — 2026-08-18
+
+### SSS on the GPU: the octree walks in GLSL, float32-exact
+
+The 1.35.38 release refused the GPU plan for SSS materials — "no
+GLSL twin exists". The field asked the right question: the engine
+already traverses a BVH in fragment shaders for traced shadows and
+ships raw data textures to them (the BI noise tables), and an octree
+gather is the same class of work. So the twin now exists, and the
+refusal is gone.
+
+**The tree rides a data texture.** `ScatterTree.pack_gpu` flattens
+the pre-pass octree — aggregates, Rd tables, dipole parameters and
+points — into one float32 texture, bound through the exact mechanism
+the noise tables use. The world→camera rows are embedded in the
+texture too, so the pass SOURCE stays camera-independent: an orbit
+re-plans nothing (the plan cache deliberately excludes the camera),
+and the texture is rebuilt with each pre-pass anyway.
+
+**The traversal is stackless.** The kernels support divergent
+while-loops but not dynamic array writes (the BVH's own constraint),
+so the nodes are linearised in preorder — the C's own 0..7 child
+visit order — with hit/miss links: descend follows the hit link,
+skip-and-aggregate follows the miss link. The C's 'self' chain
+(SUBNODE_INDEX matches along the path force descent past the error
+criterion) becomes a per-node box built from the ancestors' split
+half-spaces, `>=` on the upper side exactly like SUBNODE_INDEX;
+collapsed cells contributed no split and therefore no half-space,
+matching the C, where the collapse is invisible to the traversal.
+The three-branch Rd lookup, the front/back lobes, the weight and
+colour normalisation and the max-combine all run per pixel in the
+shader.
+
+**In the deferred pass**, an SSS material rides the same separated
+diffuse/specular bookkeeping the RESULT ramps use, and the gathered
+scatter replaces the accumulated diffuse — `shade_lamp_loop`'s
+block, with the texfac shaping — before the clamp and the emission
+add. A frame whose pre-pass has not run still refuses by name (the
+plan-before-prepare guard), and the scene-level switch still
+restores plain shading exactly.
+
+Measured through the shader front-end: the GLSL octree walk equals
+the CPU tree **4.5e-8** point for point, and the full SSS frame
+matches the CPU render at **6.0e-7** — float32 exactness, the same
+standard as the emission chain. The node's and the switch's "CPU
+only" notes are gone.
+
+Tests updated and extended: the missing-tree refusal, the packed
+texture registration, the plan acceptance, frame parity, the direct
+GLSL-vs-tree twin, and the no-SSS control alongside all of 1.35.38's
+pins. Suite green.
+
+---
+
+## [1.35.38] — 2026-08-18
+
+### Subsurface Scattering: 2.79's two-pass point-cloud dipole, transcribed
+
+Blender Internal's SSS is now in the shader — the real algorithm from
+`sss.c`, fetched verbatim this round and archived, not an
+approximation borrowed from a modern renderer.
+
+**The pipeline, exactly BI's.** Per SSS material, a pre-pass renders
+the material's OWN faces at base resolution with no supersampling
+(2.79 turned OSA off): a front layer (nearest surface) and a back
+layer (farthest, through a flipped-depth rasterisation), each pixel
+shaded by the full light loop with the specular lobe masked out of
+combined — shadows, AO and textures included — and stored as a point
+carrying position, colour, and pixel area × alpha, the back layer's
+area NEGATED. The pixel area is `shade_input_calc_viewco`'s own
+derivative construction: `min(true footprint, 2 × the ortho
+footprint)`, perspective and orthographic branches both. An octree
+over those points (8-point leaves, depth 15, the single-subnode
+collapse, radiance-weighted node positions) answers the main pass:
+the `area+backarea > error·dist²` acceptance walks the hierarchy,
+front and back lobes gather separately, normalise by their Rd sums,
+scale by the per-channel reflectance, and combine as `max(front,
+back)`. In the beauty pass the sampled scatter REPLACES the
+accumulated diffuse, shaped by the material colour per the Texture
+slider — `shade_lamp_loop`'s block, line for line, including the
+1/alpha and the `pow(col, 1-texfac)` midpoint.
+
+**The parameters, quirks kept.** `scatter_settings_new` transcribed
+with its secant solve for the reduced albedo, both Rd lookup tables
+(the fine squared-distance table and the coarse far table — the far
+table's step is 2.79's own accuracy and is pinned as such), and the
+shipping source's operator-precedence quirk: `Fdr =
+-1.440f/ior*ior + ...` parses as `(-1.440/ior)*ior = -1.440`, so the
+diffuse Fresnel term BI actually rendered with all those years is
+the one this port computes. Points and queries live in camera space,
+where `shi->co` lived, so even the octree's split planes follow the
+camera exactly as BI's did.
+
+**Import and UI.** The parser reads the whole Subsurface Scattering
+panel from the DNA (`sss_flag/scale/radius/col/ior/error/colfac/
+texfac/front/back`); a material with the panel enabled lands every
+field on the BI node, which grew the matching properties and panel
+section. The Lighting panel gains the scene-level master switch —
+2.79's `R_SSS` — on by default; off restores plain shading exactly.
+
+**Determinism and the GPU.** Two renders of the same frame produce
+identical pixels. There is no GLSL twin for a hierarchical point
+gather, so a frame containing an SSS material refuses the GPU plan
+BY NAME (`uses Blender Internal subsurface scattering; the material
+shades on the CPU`) rather than shading a different picture —
+remove the material or disable the switch and the frame plans onto
+the GPU as before. One documented divergence from a byte-compare
+with 2.79: NumPy batches the gather sums, so float addition order
+differs in the last digits — the same class of difference every
+vectorised sum in the engine already carries.
+
+The field files carry no SSS materials (all six say `sss_flag 0`),
+so nothing about their look or speed changes — this is the shader
+growing the panel it was missing.
+
+New tests: the parameter derivation (Fdr quirk pinned to its
+collapsed value, secant root, colfac blend, the 0.99 clamp), table
+semantics (fine-table accuracy, far-table interpolation pinned to
+the table itself, exact fallthrough), octree-vs-brute-force
+convergence at error→0 and the 0.05 approximation band, backweight
+silencing, the pixel-footprint construction (facing wall = world
+footprint, grazing capped at 2×ortho), the full-frame behaviours
+(changes the picture, deterministic, texfac responds, master switch
+restores exactly), the GPU refusal by name with the no-SSS control,
+pre-pass front/back point collection, and the DNA→spec→node→engine
+import chain.
+
+---
+
+## [1.35.37] — 2026-08-17
+
+### The performance round: the GPU takes the whole frame, and light edits stop freezing Blender
+
+Three separate costs were stacking up on every interactive session,
+and each one is gone.
+
+**1. The Red material was pushing entire frames off the GPU.** BI's
+Emit is a float that glows the diffuse chain's colour — emission =
+base.rgb × emit — and it had no per-pixel grant in the deferred
+pass, so any EMIT texture slot (or a nonzero Emit on a textured
+colour) refused the WHOLE frame by the constancy rule: `'Red':
+emission varies across the frame`. Every viewport refine and every
+F12 of such a scene ran single-process CPU NumPy at full
+resolution. The grant now exists (`Emit` on the BI node), and the
+assembler synthesizes the exact product from the already-emitted
+chains — textures sample once, the Vertex Color Light add rides
+along when the mesh carries paint, and GPU-vs-CPU parity on
+emission-driven frames measures at float32 exactness (~7e-7).
+**All six field .blend files now PLAN onto the GPU in full** —
+previously every one of them fell to the CPU over this.
+
+**2. Dragging a lamp re-exported the whole scene, every drag tick,
+on the main thread.** view_update now classifies what actually
+changed. A light edit — data or transform — re-exports the LIGHTS
+ONLY into a shallow next scene that shares the meshes, materials
+and images with the parked export by identity, so the BVH, texture
+and shadow caches underneath stay warm. The full re-export
+(~seconds of main-thread stall per tick on a real scene: "Blender
+will freeze up") no longer runs for anything a lamp can change.
+Two real bugs fell out of the classification: light DATA arrives
+as its concrete subclass (`SunLight`, never `Light`), which the
+old name check missed — so a colour edit was not re-exporting AT
+ALL (stale lamp values until the next unrelated poke); and a lamp
+transform was indistinguishable from a mesh transform, which is
+why it re-exported everything.
+
+**3. Moving one lamp re-rasterised every shadow map in the scene.**
+The shadow cache fingerprinted the whole light list, so nudging one
+of fifteen lamps invalidated all fifteen maps (a point lamp is six
+rasterisations each). The cache is now PER LIGHT: moving a lamp
+rebuilds that lamp's map alone, and colour/energy edits rebuild
+nothing — depth never depended on them.
+
+What this means in practice: on a GPU machine, viewport refines and
+F12s of the field files move from CPU NumPy to the deferred GPU
+path (the same jump that took the five-minute frame to seconds in
+R154), light dragging costs a lights-only export (microseconds of
+export instead of seconds), a moved lamp pays one shadow map, and a
+recoloured lamp pays only a re-shade. On a CPU-only machine the
+warm-cache re-render measured 7x faster than cold in the new test
+scene, on top of the export savings.
+
+New tests: the emission grant table (linked Emit, constant-Emit ×
+textured-colour, zero-Emit non-grant, flat-colour non-grant,
+Vertex Color Light), both emission frames planned AND matched
+against the CPU, update classification (subclass light data, lamp
+vs mesh transforms, UI churn, empty list), export_lights_into
+(fresh lights, shared-identity everything else), and the per-light
+shadow cache semantics through real renders.
+
+---
+
+## [1.35.36] — 2026-08-17
+
+### Every sun reads 1.0: the import now leaves receipts — and Hidden Layers import
+
+The field re-imported with each update and still saw **every lamp at
+energy 1.0** — which is exactly Blender's own append default for
+suns, i.e. what the file looks like when Halcyon's lamp enrichment
+never lands. The parsed file's suns carry energies of 2.0–4.0, the
+enrichment math is verbatim-tested, and the shared apply function is
+used by both import routes — so the failure lives in the one stretch
+no harness had ever executed: the **appended branch of the import
+operator itself** (the test bpy has no `bpy.data.libraries`, so
+every previous test silently exercised the fallback branch).
+
+That branch is now under test end-to-end: a stub library hands the
+operator lamps at Blender's default 1.0, exactly like a real append,
+and the suite asserts the file's energies override them, the shadow
+rule lands, the scene pipeline applies, and the import completes.
+
+And the import can no longer fail silently, whatever the cause on a
+given machine:
+
+- **Receipts.** Every enriched lamp writes a line to the import log:
+  `Spot: file energy 1.5 -> 59.22`. If lamps were appended and NO
+  receipt appears, the log says that instead, loudly. The log (text
+  editor → `<file> import log`, and the console) now opens with the
+  running version — `Halcyon 1.35.36: parsed …` — so a stale
+  install, the other way this symptom arises, is visible at a
+  glance. (Blender does not hot-reload an updated add-on: after
+  installing a new zip, restart Blender.)
+- **Readback.** The energy write is verified by reading the property
+  back; a value that does not stick is a named warning, never a
+  mystery.
+- **Fencing.** The material-conversion stage is fenced so a crash
+  there can no longer starve the lamp enrichment and scene-pipeline
+  stages after it — tested by injecting a planning crash and
+  asserting the lamps still get their energies.
+
+**Hidden Layers.** New import option, off by default. 2.79 files
+stash alternate parts and spare light rigs on switched-off layers
+(ten of one field file's fifteen suns live there); the importer
+previously could not bring them at all. With the option on they
+import **hidden from both viewport and render** — exactly how 2.79
+treated them, so the default F12 look is unchanged — ready to unhide
+per part. Works on both import routes; the log lists what arrived
+hidden.
+
+Also: the Lights option's description no longer claims lamps arrive
+"through Blender's own conversion" — that text predated 1.35.33.
+
+If your suns still read 1.0 on 1.35.36: open the import log and read
+the receipt line — it now tells you which of the three cases you are
+in (no receipt, receipt-but-refused, or a stale install banner).
+
+---
+
+## [1.35.35] — 2026-08-17
+
+### "I think the Gamma might be different" — it was. The file's own DNA says which one.
+
+The user confirmed their bright, neutral 2.79 reference render is an
+F12 of the exact .blend, unmodified. Halcyon's render of the same
+file was uniformly dark. The answer was sitting in the scene block
+of every one of the six field files, unparsed until now:
+
+    display_device = 'sRGB'   view_transform = 'Default'
+    look = 'None'   exposure = 0.0   gamma = 1.0
+
+2.79 renders Blender Internal **scene-linear** and shows the frame
+through the scene's OCIO view; 'Default' on an sRGB display is the
+**piecewise sRGB encode**. A linear 0.2 displays as ~0.48. Halcyon
+computed the same arithmetic and then showed the floats raw — the
+whole frame sat ~2 stops crushed, exactly the "lights are dark on
+import" symptom across R152–R157. Those rounds fixed real bugs
+(units, falloffs, presets, appender), but this was the structural
+one underneath.
+
+**The pipeline, now imported from the file itself.** The parser
+reads the scene's `view_settings`/`display_settings` and its
+embedded `RenderData`; `scene_settings_map` turns them into Halcyon
+settings; the importer applies them on both routes:
+
+- `view_transform 'Default'` → Halcyon's own `color_management
+  SRGB` (the final frame runs through the exact piecewise OETF) and
+  `input_gamma_naive False` (sRGB-tagged textures linearize on
+  load, exactly as BI sampled them). Material, lamp and slot
+  colours are already linear in the DNA — untouched, which is why
+  only the two pipeline ends move.
+- `display_device 'None'` (author turned CM off) → `NONE` + naive
+  inputs; a pre-2.5 file with no OCIO block → the same,
+  period-correct. View `'Raw'` → linear inputs, no encode.
+  Unimplemented views (e.g. Filmic) warn **by name** and fall back
+  to the sRGB encode. OCIO exposure maps as stops (×2^e).
+- Blender itself stays pinned to **Raw** — nothing double-grades.
+  (The 1.35.28 grey wash was Blender's 'Standard' stacked on top of
+  engine output; this is Halcyon's own single encode, with the
+  matching input end.)
+
+**The frame settings travel too.** `R.xsch/ysch/size` → scene
+resolution (the field file's own frame is 1920×1920 @50% = 960×960 —
+the reference render's exact size), and `alphamode 1
+(R_ALPHAPREMUL)` → Transparent Film. The reference F12's "white
+background" was a transparent PNG on a white viewer; the file's sky
+is black and its film is transparent, and now so is the import's.
+
+**The GPU display stage was silently skipping the curve.** The
+DISPLAY shader had no view-transform branch at all: any user
+setting SRGB/Filmic/Reinhard with GPU post got a different frame
+than the CPU. It now takes a `cm_mode` uniform and mirrors
+`core/post.display_transform` branch for branch — verified exact
+(0.0) through the shader front-end for all four modes.
+
+**The Blender Internal preset** now carries the true pipeline:
+`color_management SRGB`, `input_gamma_naive False` (with
+`specular_in_gamma True` and `gamma 1.0` unchanged — the curve is
+the piecewise OETF, not a power lift, and BI adds specular in
+linear light like everything else).
+
+With the file's camera, frame, pipeline and transparent film, the
+field render now reproduces the 2.79 reference: bright
+porcelain face, blue crown reflection, visible cloth texture on the
+body, white-on-viewer background — 2.1s at 960×960.
+
+New tests: the DNA parse (view/display/RenderData through the 2.79
+fixture, absent on the 2.49 one), every mapping edge (device None,
+view Raw, Filmic warns by name, stops exposure), the exact OETF
+values and round-trip, `_apply_scene_pipeline` field-for-field, the
+DISPLAY shader's four cm_mode branches against the CPU, and the
+preset doctrine pins updated to the true pipeline plus an
+encode-lifts-the-sheen check.
+
+---
+
+## [1.35.34] — 2026-08-17
+
+### The invisible matcap: four defects between a REFL slot and the screen
+
+The character's mask wears its chrome through a classic BI env-map
+trick — an image mapped to **Refl** coordinates, windowed by the
+slot's offset/size, with most of the image transparent so only the
+streak highlights land. Comparing the field's 2.79 render against
+Halcyon's showed the matcap missing entirely. The chain from the
+.blend to the shader had four independent breaks; each one alone was
+enough to erase it.
+
+**1. The image ALPHA LAW (verbatim `imagewrap`).** BI only reads an
+image's alpha channel when the texture sets **Use Alpha**
+(`imaflag & TEX_USEALPHA`, and not Calculate). With **Calculate
+Alpha** (`TEX_CALCALPHA`) it *derives* alpha as `max(r,g,b)`; with
+NEITHER flag the file's channel is **ignored** and `ta = 1.0`; and
+`Tex.flag & TEX_NEGALPHA` inverts the result. The importer wired the
+image's real alpha output unconditionally — so the mask's
+streaks-on-transparency env map (alpha ≈ 0 nearly everywhere, and
+its texture does not set Use Alpha) multiplied itself out of the
+frame. The parser now reads `Tex.imaflag`, the converter emits
+`img_alpha` / `calc_alpha` / `neg_alpha`, the Alpha input is wired
+only when BI would actually read it, and both influence nodes (and
+their GPU emitters) implement Calculate and Negative alpha exactly.
+The parser-side fixture now carries 2.79's `default_tex` imaflag
+(INTERPOL|USEALPHA|MIPMAP = 7) like every real file does.
+
+**2. The mapping FOLD was wrong.** `texco_mapping` (fetched verbatim
+this round) computes `texvec = size*(uv - 0.5) + ofs + 0.5` for
+image textures — the offset applies OUTSIDE the size product. Folded
+into a Mapping node (`scale*uv + location`) that is
+`Location = ofs + (1 - size)/2`; the old fold
+`(size*ofs - size + 1)/2` multiplied the offset by the size and only
+coincided at ofs=0 or size=2. The mask's window (size 0.7×0.8,
+offset +1.15 on Y) landed in the wrong part of the image. The stale
+test pinning the old law now pins the verbatim one, with values that
+distinguish the two on both axes.
+
+**3. REFL slots never got their window at all.** The build routed
+matcap coordinates straight from the Matcap UV node into the image,
+dropping the slot's offset/size entirely — `texco_mapping` runs the
+same fold whatever the coordinate source. The MATCAP branch now
+threads MatcapUV → Mapping(window) → image Vector whenever the slot
+carries one.
+
+**4. Headless fakes dropped pattern-node input DEFAULTS.** The test
+suite's fake pattern nodes created inputs at zero, so a serialized
+Matcap UV node carried Scale=0 and every headless matcap flattened
+to one dead texel — invisible in every probe, masking the three real
+bugs above. The fake constructor now applies the spec defaults and
+typed outputs, same class of fix as the R151 `_NODE_ATTRS` one.
+
+Also parsed this round: `Tex.imaflag`, the MTex projection axes
+(`projx/projy/projz`, warned when swizzled), and the World gather
+bits (`mode`, AO energy/mix/colour fields) — the field's six .blends
+all carry `mode=32`: no environment light, no AO, no mist.
+
+New regression tests: the alpha-law combinations through the
+converter, the fold law on distinguishing values, the REFL
+mapping-window wiring, conditional Alpha wiring both ways, and the
+fake-default guard (serialized MatcapUV Scale must be 1.0). Full
+suite green, CPU/GPU parity holds.
+
+---
+
+## [1.35.33] — 2026-08-17
+
+### "My render doesn't look like yours": the Blender Internal preset was a fossil, and the appender lit lamps its own way
+
+The field ran default settings plus the Blender Internal preset and
+got the pure-black body back, dark lights, and crippled render and
+viewport times. All three were the preset — written before the
+display-referred rounds and never audited since:
+
+- **`specular_in_gamma: False`** crushed every specular through
+  pow 2.2. A 1% sheen — the puppet body's entire shading — goes to
+  0.00004: pure black. Now True (display-referred, the R152 rule).
+- **`color_management: 'SRGB'`** re-encoded the engine's
+  display-referred output — the same class of mistake as R153's
+  'Standard'. Now NONE.
+- **`shadow_default: 'RAY'`** forced traced shadows onto every lamp
+  — including lamps BI never shadowed at all — and pushed a BVH
+  build into every viewport update. Now **PER_LIGHT**, because the
+  import now stamps each lamp with 2.79's own shadow rule (below).
+- **8 AA samples** round to a 3x3 supersample — NINE times the
+  pixels through every stage. Now 4 (an honest 2x2); the note says
+  BI's default was 8 and the slider is right there.
+- The preset's default material is now BI's own CookTorr
+  (`BI_COOKTORR`), not the physically-normalised Cook-Torrance.
+
+A doctrine test now pins every one of these fields AND renders a
+near-black BI body under the full preset, CPU against GPU at
+0.00000, asserting the 1% sheen survives.
+
+**Per-lamp shadows, 2.79's own rule.** shade_one_light +
+convertblender, verbatim: a shadow buffer exists only for a SPOT
+with the buffer bit and wins there; otherwise the Ray bit traces;
+otherwise the lamp casts NO shadow at all. Every import used to
+arrive as MAP-shadowed — lamps BI never shadowed darkened the field's
+scenes. Both bits set at once (common in 2.4x-era files) resolves
+exactly as the C did: spots keep their buffer, everything else rides
+the ray bit.
+
+**The appender now lights lamps identically to the parser.** The
+append route — the production path, since it lets Blender pose
+armatures — still carried its own lamp code: Blender's watt-converted
+energy kept as-is, a plain unbounded INVERSE falloff (several times
+darker than BI's bounded curve at working distances), no sliders, no
+sphere, no mode bits, and a latent NameError. Both routes now run ONE
+shared function (`_apply_lamp_bi`): the file's own energy through the
+BI-exact conversion, the BI falloff curves, the shadow rule, the mode
+bits. A regression drives the same parsed lamp down both routes and
+asserts every field lands identical. THIS was 'my render doesn't
+look like yours' — the probes here always took the parser route.
+
+---
+
+## [1.35.32] — 2026-08-17
+
+### The blueish darks: the flat-ambient rule grabbed the wrong pool
+
+1.35.31's letter-true BI ambient — a FLAT add, untinted by the
+diffuse colour — was applied to the WHOLE ambient pool, and Halcyon's
+pool has two parts: the world's ambient (BI's own concept, black in
+the field files) and the engine's Global Ambient setting, whose cosy
+default is (0.05, 0.05, 0.06). Flat-adding that default put a dim,
+slightly BLUE floor under every dark surface of every BI material —
+the field read it immediately as 'a blueish tint to the dark parts',
+and a pixel probe of the shipped render measured the neck at almost
+exactly the default's value.
+
+Now the two pools split, on both devices: only the WORLD ambient
+(plus ambient-type lights, which model the same thing) flat-adds,
+exactly `combined += amb * world` in shade_lamp_loop; the engine's
+Global Ambient keeps its classic diffuse-tinted behaviour on every
+model, so a black body stays black under it. Imported scenes already
+zero the Global Ambient outright (BI had exactly one ambient — the
+world's), so a fresh import renders the darks exactly as 2.79
+authored them: black, plus whatever specular the lamps put there.
+
+The regression pins both halves: a near-black BI material under the
+default Global Ambient stays black; a world ambient flat-adds
+whatever the diffuse colour is; and a frame carrying BOTH pools
+matches CPU-to-GPU at 0.00000.
+
+---
+
+## [1.35.31] — 2026-08-17
+
+### The 2.79 source harvest: every lamp curve and shading formula, letter-verified
+
+The user approved fetching Blender 2.79b's render source, and this
+release audits Halcyon's every transcription against the verbatim C —
+now archived alongside the project so no future round depends on a
+fetch. The harvest covers `texture_rgb_blend`, `texture_value_blend`,
+`lamp_get_visibility`, `shade_one_light`, `shade_lamp_loop`, `spec()`
+and all ten shader functions, the ramp machinery, area-lamp energy,
+mist, and the world/ambient assembly.
+
+**Lamps, against the C** (a one-point harness now proves every case
+to three decimals, CPU and GPU):
+
+- **Inverse Square was wrong**: 2.79 ships `D/(D+d*d)` — the source's
+  own comment calls it a hack and keeps it — not the tidy
+  `D^2/(D^2+d^2)` Halcyon assumed. Every lamp in all five field files
+  carries this falloff: they rendered 3–4x too bright wherever the
+  hidden coloured rigs are enabled.
+- **The spot cone was invented**: BI cuts at cos(size/2), blends
+  across `(1-spotsi)*blend` in COSINE units with a real smoothstep,
+  and then multiplies the whole cone by the raw cosine — a spot dims
+  toward its own edge everywhere, not just in the blend band. The old
+  curve (a squared smoothstep between two invented cosines) was ~40%
+  dark off-axis and ~7x dark inside the blend band.
+- **New, letter-true**: the Lin/Quad Sliders falloff (att1/att2, the
+  2.4x Quad lamp), the Sphere clamp (hard zero at the lamp Distance,
+  applied outside the falloff switch exactly as the C does), the
+  0.001 visifac snap, and the per-lamp mode bits — Negative,
+  No Diffuse, No Specular — wired to the engine's existing flags.
+  Only Shadow, This Layer Only, and square spot cones warn by name.
+- Sun/Hemi/point-linear/constant were verified EXACT as shipped: the
+  pi-accounting between the import (suns x pi, points x 4pi^2) and
+  the engine's watt units cancels to BI's `is * visifac * energy *
+  lampcol` to the last digit.
+
+**Shading, against the C:**
+
+- `spec()` is now the real thing: BI's integer-bit square-multiply
+  power — the 0.01 first-square floor, both 0.001 zeroings, the
+  even-hardness x^1 drop, bit 256 — with hardness truncated to an
+  integer exactly where `shi->har` (a short) did. CookTorr, Phong,
+  and the Hemi lamp's wrapped lobe all run it, on both devices. The
+  0.01 floor visibly brightens the dim tail of low-hardness
+  highlights — the porcelain range the field character lives in.
+- The BI speculars keep 2.79's quirks: **no N.L gate** on CookTorr/
+  Phong/Toon (spec past the terminator, as BI always drew it),
+  WardIso CLAMPS N.L at 0.001 instead of gating, Blinn's geometry
+  term is the C's strict-compare chain (ties leave g = 0), its
+  spec_power is the truncated hardness, and no invented upper clamps
+  anywhere.
+- Oren-Nayar gains the C's `b *= 0.95` tangent guard and the nv >= 0
+  clamp; Minnaert's bright branch uses the C's 1.001 (not 1.0001).
+- `texture_rgb_blend`'s MUL/SCREEN/OVERLAY use **facm = 1 - fact**
+  (the multiplied factor) — the 1.35.30 assumption that the value
+  twin's `1 - facg` carried over was wrong, exactly the two-character
+  question that release flagged for source verification. DARK is a
+  mix-toward-min in BOTH functions (`min(out,tex)*fact + out*facm`),
+  and the value twin's SOFT leaves its final `(out*scf)` term
+  UNSCALED — 2.79 ships it that way. CPU, GLSL and the scalar
+  references all corrected together, with the old sweeps rewritten
+  against inline transcriptions of the fetched C.
+- BI's ambient is a FLAT add (`combined += amb * world ambient`),
+  never tinted by the diffuse colour — the BI node's materials now do
+  the same on both devices.
+
+**The 'still extremely dark' report**: the harness proves every lamp
+formula lands on the C to the last digit, and the field file rendered
+through the file's own camera now matches the 2.79 reference shot in
+level and character. What darkness remains on a field machine is
+Blender regrading the output — so the render header now prints the
+ACTIVE view transform with a loud warning whenever it is not Raw, and
+a build that refuses 'Raw' outright says so once with the list of
+transforms it does have, instead of failing silently into AgX.
+
+---
+
+## [1.35.30] — 2026-08-17
+
+### The specular import is now texture_rgb_blend — and the five-minute render was a one-line grant bug
+
+The field side-by-side (2.79's finely-marbled porcelain mask vs
+Halcyon's waxy constant sheen, at three hundred times the render
+time) decomposed into two defects, one semantic and one clerical.
+
+**The five minutes.** `per_pixel_fields` — the one table that grants
+a linked master-node socket the right to vary per pixel on the GPU —
+matched socket DISPLAY names only. The BI Material node shows
+Blender Internal's own labels over master identifiers ('Hardness'
+over Glossiness, 'Spec' over Specular Level), so every renamed
+socket silently lost its grant: the mask's clouds-driven
+hardness chain hit the constancy probe, refused by name
+('glossiness varies across the frame'), and the whole frame fell to
+the CPU — five minutes on a machine carrying an RTX. The grant now
+matches name OR identifier, exactly like `_socket` and the emitter
+always did. The same frame plans onto the GPU and the simulator
+matches the CPU render to 0.00000 with both chains live.
+
+**The waxy sheen.** Colour channels (Color, Specular Color, Mirror
+Color) rode a ShaderNodeMixRGB at a CONSTANT factor — ramp_blend
+maths, the texture's grey as the colour. Blender Internal's colour
+channels are `texture_rgb_blend`: the channel blends toward `tcol`
+by a PER-PIXEL factor (the texture's intensity — or its ALPHA when
+it yields RGB) times the influence slider, and for an intensity
+texture `tcol` is the SLOT's own colour swatch (BI's pink default),
+which no import ever carried. Value channels had the sibling gap:
+an RGB-yielding texture (a colorband above all) drives its channel
+by the colour's Rec.709 LUMINANCE, never the raw pre-band noise —
+the mask's marbling lives entirely in that difference, because its
+band remaps a soft cloud into steep porcelain veins.
+
+- **New node: BI Color Influence (HALCYON_BIRGBBlendNode)** —
+  texture_rgb_blend transcribed per channel, all 16 modes
+  (HUE/SAT/VAL/COLOR and SOFT/LINEAR delegate to ramp_blend on a
+  copy of the base, exactly as the C does; DIV keeps the base on a
+  zero channel, where the value twin returns 0 — both asymmetries
+  deliberate and documented). Inputs: Base, Color, Intensity,
+  Alpha, Factor, Slot Color. CPU evaluator and GLSL emitter are
+  element-for-element twins.
+- **The BI Influence node grew the slot prelude**: new Color/Alpha
+  inputs and tex_rgb / rgbtoint / negative / alphamix flags —
+  do_material_tex's texture-output stage in DNA order
+  (RGBToIntensity collapses to Rec.709 luminance and clears the RGB
+  flag, Negative inverts what is left, AlphaMix reads the alpha).
+  Old graphs carry none of the flags and behave exactly as before.
+- **The importer wires it all from the file's own DNA**: MTex now
+  reads the slot colour (r/g/b) and texflag; colour channels emit
+  the new node with the slot colour, the DNA blend mode and the
+  flags; value channels carry the same flags so banded/RGB textures
+  collapse to luminance; a Stencil slot warns by name until the
+  chaining imports. Images feed Color AND Alpha (their alpha is
+  BI's per-pixel factor for colour channels, ta = 1 for opaque
+  formats — the old constant-factor result, now for the right
+  reason).
+- The mask file's numbers, drilled value by value: 'Black'
+  (CLOUDS + colorband + RGBToIntensity, slot colour BLACK,
+  COLSPEC|HAR at MUL, hardfac 0.95) now renders hardness
+  85·(0.05 + 0.95·lum(band)) — 4.25..73 across the cloth — and
+  specular colour ZERO (tcol is the slot colour; black times
+  anything is black), both BI's own answers. 'Mask' (har 130, band
+  at 0.925) spans ~11..38: the porcelain sheen with its veins.
+  'Red' spans 20..98. The GPU plan ACCEPTS the frame.
+- The height pre-pass falls back to its exact CPU image when a
+  colour-influence chain inside a height graph calls the shading
+  library it does not carry — a refusal-free degrade, same as the
+  Noise family.
+
+One transcription note, recorded here as the working evidence base:
+`texture_rgb_blend`'s MUL/SCREEN/OVERLAY use facm = 1 − facg (the
+slider, not the multiplied factor), matching the verified value-twin
+sibling and the classic field behaviour (multiply-mapping a
+procedural at full influence visibly modulates; against a black slot
+colour it blacks out). A letter-for-letter check against 2.79's
+render_texture.c is queued for the moment the source fetch is
+approved; every mode the five field files exercise (BLEND, MUL) is
+already pinned by their own renders.
+
+---
+
+## [1.35.29] — 2026-08-17
+
+### Blender's color management is now OFF under Halcyon — 1.35.28 was wrong
+
+1.35.28 pinned the view transform to 'Standard', reasoning that a
+display-referred engine needs no regrade. The field proved that wrong
+within the hour: 'Standard' is not a no-op — it is the sRGB ENCODE
+for scene-linear data, and applied to Halcyon's already-encoded
+output it lifts and washes everything grey. The setting that actually
+shows the engine's pixels untouched is **Raw**, and it is no longer
+the user's job to hold it there:
+
+- The ENGINE pins Raw (sRGB display, no look, neutral exposure and
+  gamma) on every render, every viewport update, every depsgraph
+  poke and every file load, whenever Halcyon is the active engine —
+  through the ORIGINAL scene datablock, so it sticks. Switch a scene
+  to Halcyon and Blender's color management is simply out of the
+  loop; the Display panel (exposure, gamma, presets, the CRT chain)
+  is the one and only grading.
+- The 2.79 importer sets the same thing.
+- The Display panel's warning box and its one-click fix now say and
+  do Raw; the old advice to use Standard is retired.
+
+With the regrade gone, the Display presets read as authored again,
+and the character's black body keeps its CookTorr rim sheen — the
+1% specular colour whose grazing boost is the only shading a
+black-on-black material has.
+
+---
+
+## [1.35.28] — 2026-08-17
+
+### "Lights much too dark" and the unshaded black body were ONE bug
+
+Blender Internal was display-referred: its numbers WERE the pixels.
+Blender 5.x re-grades every render through the scene's view transform
+— AgX by default — which darkens the field's deliberately small lamp
+energies (0.4, 0.03) wholesale and crushes the 2% specular sheen that
+is ALL the shading a black-diffuse, near-black-specular body has.
+The engine itself was already display-referred (gamma 1, naive input)
+— the regrade happened after it. **Imports now pin the scene's color
+management to Standard** (sRGB display, no look, exposure 0, gamma 1),
+so the engine's output reaches the screen the way BI's did.
+
+### The Hemi lamp is back
+
+2.79's dome light, gone from Blender since 2.8, is a real Halcyon
+light type again: the 0.5+0.5·N·L wrap on the diffuse and a wrapped
+half-vector highlight through the material's own hardness — 2.79's
+LA_HEMI branches, which REPLACED the shader menus — with no shadows,
+exactly as BI refused to cast them. CPU and GPU frames match to
+0.00e+00. In the UI it rides a Sun lamp with a **Hemisphere (BI
+Hemi)** toggle (Blender has no hemi data type to hang it on); the
+2.79 importer sets it automatically, retiring the old
+"Hemi imported as Sun" approximation and its warning.
+
+### Purple Guy's blood, verified
+
+The headless verification probe now mirrors the exporter's
+named-UV-layer promotion (and its fake Mix/Math nodes carry real
+blend modes), so the reference renders exercise exactly what Blender
+builds: the blood splatter reads its own 'Blood' layer and lands on
+the muzzle and brow, on a purple face, under the file's own three
+suns.
+
+---
+
+## [1.35.27] — 2026-08-17
+
+### Purple Guy's face, and everything it taught
+
+Compared head-on against the field's own 2.79 screenshot of
+the field's five test files, three more import truths surfaced — each one a
+class, not a case.
+
+**Hidden layers no longer render.** 2.79 drew only objects on the
+scene's visible layers; the import brought EVERYTHING, which lit the
+field's scene with five hidden coloured lamps (the header says
+Lamps: 3 — the file agrees) and floated a hidden hand into frame.
+The parser now reads the scene's layer mask, and the importer skips
+hidden-layer objects by default (an include-hidden switch remains).
+Each of the five field files keeps exactly its deliberate lamp rig.
+
+**The RENDER-active UV layer, and layers by NAME.** The head
+sampled a white region of the fur map because both the parser and
+the exporter took a layer by ORDER (the edit-active one), not the
+render-active layer BI actually sampled — and the head's blood
+splatter names its own layer ('Blood'), which the importer used to
+throw away ("active UV stands in"). The parser now walks the mesh's
+CustomData for EVERY UV layer with its name and the render-active
+index; the exporter puts the render-active layer first; slots that
+name a layer get a real UV Map node; and a node-referenced second
+name is promoted into the merged mesh's name slot so the by-name
+lookup lands on the right rows per object. Face: purple. Blood: on
+the mouth.
+
+**The importer's world and lamp maths, held.** The all-black paper
+sky and the three-sun rig now reproduce the reference frame's
+darkness — the earlier brightness was hidden lamps plus a stand-in
+world in the verification probe, not the importer.
+
+(Also: the headless verification harness's fake Mix and Math nodes
+now carry blend_type/operation, so probe renders exercise the same
+multiply chains Blender builds — the white face persisted in the
+probe alone through exactly that gap. Probe renders still show rest
+poses: armature evaluation belongs to Blender, and the real import
+path has it.)
+
+---
+
+## [1.35.26] — 2026-08-17
+
+### The five-blend field round: every reported import defect, root-caused
+
+Verified end to end against the field's own five 2.79 files: all 72
+materials now convert and render
+recognisably — the porcelain mask, the bowtie, the suit
+actually purple.
+
+**Texture coordinates were scrambled at the constants.** The MTex
+texco table did not match 2.79's DNA (UV=16 was right by pure luck):
+REFL-coordinate env maps — the chrome and matcap trick — routed to
+Object space and sampled garbage, OBJECT slots landed in Generated,
+ORCO in Global. The table now carries the DNA values, and every
+coordinate mode routes: **Refl and Nor become Matcap Coordinates**
+(the node grew a Source switch: view-space Normal, the classic
+matcap, or view-space Reflection, the env-chrome trick — both
+devices), Orco→Generated, Object→Object, Global→Object with its
+note, Window→Window. This one bug was BOTH reported symptoms: the
+"white self-illumination" was emit-mapped env maps sampled at
+garbage coordinates, and several "pure black materials" were chrome
+whose reflections never arrived.
+
+**Value channels now ride BI's real maths.** A BI value influence
+(Hardness, Emit, Alpha, Spec, Ref, Ambient, Translucency, Ray
+Mirror) never pushed the texture INTO the slider: 2.79's
+`texture_value_blend` blends the channel's value toward the slot's
+**DVar** slider by texture-intensity × the SIGNED factor, in the
+slot's blend mode — and hardness runs it in /128 units with a 1..511
+clamp. All of that is now a node: **BI Influence**
+(Base/Intensity/Factor/DVar, all twelve value-blend modes, the
+negative-factor flip, HUE-family = zero exactly as the C left it),
+built automatically for every imported value slot, chained slot to
+slot, exact on both devices. The field file's clouds-driven hardness
+and every glossy toy plastic read correctly for the first time.
+The parser also now reads per-channel factors it silently defaulted
+before (colspec/mirror/ambient/displacement, and 2.4x's varfac).
+
+**Original Perlin is real.** The STDPERLIN basis is Perlin's 1985
+noise — Blender's exact `orgPerlinNoise`, the +10000 domain shift,
+hashvectf gradients, the 1.5 scale — over the hash tables the engine
+carried all along. CPU and GPU twins match to 0.00e+00; the
+Improved-Perlin fallback and its import warning are gone.
+
+**Vertex colours cannot ghost-glow.** BI stripped the vertex-colour
+material modes when a mesh had no colour layer (convertblender.c);
+the engine now does the same on both devices, so the ones-filled
+default plane can never read as painted white or as full
+self-illumination.
+
+**The ramps got their gradient.** The BI Material node's diffuse and
+specular ramps now edit as a real colour-band widget (the 2.79
+panel's own control) instead of position/colour rows — imported
+ramps arrive with the gradient already populated; the rows remain as
+a fallback and the engine reads whichever exists.
+
+---
+
+## [1.35.25] — 2026-08-17
+
+### The importer now builds BI Material nodes
+
+Importing a 2.79 file finally produces the node the last two rounds
+built. Every converted material arrives as a **BI Material** node with
+both shader menus set from the file — no more collapsing the pair onto
+one model, and every compromise of the old path is deleted along with
+its warning: Oren-Nayar-with-a-highlight keeps BOTH terms now, Fresnel
+diffuse is the real Fresnel shader (not "Lambert plus rim"), Minnaert
+Darkness and Oren Roughness and WardIso's Slope travel RAW in BI
+units, and Blinn finally reads the file's actual Refr slider (it had
+been silently defaulting to 4.0 — a parse gap this round closed).
+Only Wire still routes to the master shader, which owns Wireframe.
+
+The parser reads the rest of the material block: the mode bitfield
+(Shadeless, Tangent Shading, vertex-colour modes, Use Mist, the
+shadow flags including Cast Only and Shadows Only, Traceable),
+shade_flag's Cubic Interpolation, the whole Transparency panel
+(the 2.5+ checkbox bit — phantom-class files carry Z-method bits even
+on opaque defaults, so the method alone must not count; pre-2.5 files
+have no checkbox and the method IS the switch — plus Fresnel, Blend,
+spectra, Filter and the ray IOR), the Mirror panel's Fresnel pair,
+both material **colorband ramps** (stops, input, blend, factor,
+interpolation — via the same pointer-chase the texture bands use, and
+only when BI's checkbox was actually on: bands persist after the
+toggle goes off), and the material's **light group**, resolved to
+lamp names straight out of the .blend, with Exclusive.
+
+### The field's own files pinned a sign
+
+The user's 2.79 scenes carry Normal-input diffuse ramps shaped
+black-alpha-1-at-0 fading to alpha 0 — full-strength edge-darkening
+rims on three materials (and two Shader-input specular ramps
+besides). Under the literal view·normal transcription those bands
+would paint the whole surface black; the artist's intent is
+unambiguous, and `fresnel_fac` is symmetric in the dot's sign so the
+fresnel paths never pinned the convention. Normal-input ramps now
+read +N·V — facing samples the band's right end, grazing its left —
+and a regression test renders the field's exact band shape to hold
+the direction forever.
+
+### Fixed: the BI node's Translucency was inert
+
+BI evaluated translucency through the SAME diffuse shader with the
+normal flipped — for every shader, not a dedicated model. The matrix
+models now do exactly that, on both devices, exact to 0.00e+00 across
+all 25 pairs — and a light behind the surface shows through, as it
+always did in 2.79. (The socket existed since 1.35.23 but did
+nothing on matrix models; the converter wiring translucency values
+into real files exposed it.)
+
+---
+
+## [1.35.24] — 2026-08-16
+
+### The BI panel round: the options the node was missing
+
+The BI Material node now carries the REST of 2.79's material panel,
+organised the way the old panels were. Everything below acts on both
+devices unless marked; where the GPU honestly cannot follow, the plan
+refuses BY NAME and the CPU renders it — never a silently different
+picture.
+
+**Diffuse & Specular ramps.** Both colorband ramps, transcribed from
+`ramp_blend()` in 2.79's material.c: all 18 blend modes (Mix through
+Linear, including the HSV modes with their achromatic guards), all
+four inputs (Shader, Energy, Normal, Result), Factor, and the five
+band interpolations. Stops are edited right on the node. Ramped
+frames hold CPU↔GPU parity to 1e-5.
+
+**Shading.** Cubic Interpolation (2.79's smoothstep with its
+strictly-inside guard) and Tangent Shading (the per-light fake
+normal, cross(tang, cross(lv, tang)) — the anisotropic strand
+trick), both lobes, both devices.
+
+**Transparency panel.** The toggle gates everything, exactly like the
+greyed 2.79 panel. Z Transparency and Raytrace modes (Mask is not
+carried — it masked the scanline sky). Fresnel + Blend REPLACE the
+alpha slider with the view-angle fade, exactly `fresnel_fac`;
+Specular (spectra) turns highlights opaque on transparent surfaces.
+Raytrace mode refracts through its own Ray IOR — finally split from
+Blinn's spectral Refr slider — and Filter tints the refraction from
+untinted (0, BI's default) to fully coloured (1, the master
+shader's old fixed look; master materials are unchanged).
+
+**Mirror panel.** The toggle gates Reflectivity and Mirror Color, and
+Fresnel + Blend shape the reflection by view angle. GPU frames match
+the CPU at ray depth 1; deeper plans refuse by name (the view factor
+composes per bounce).
+
+**Shadow panel.** Receive (shadows never darken the material),
+Cast (the material's faces leave every shadow map — with the shadow
+cache now fingerprinting the caster SET, not just its size),
+Cast Only (camera-invisible, still casting, still in reflections),
+and Shadows Only — the classic shadow catcher: black at the mean of
+its lamps' shadow, transparent in the open, exactly 2.79's
+`shade_only_shadow`. Cast Only and Shadows Only shade on the CPU by
+name; Receive and Cast ride both devices.
+
+**Options.** Use Mist (per-material fog opt-out; fogged GPU frames
+with an opted-out material refuse by name), Vertex Color Paint
+(vertex colours replace an unlinked base colour), Vertex Color Light
+(vcol × alpha joins the emit term), and Light Groups: name a
+collection and only its lamps light the material, with Exclusive
+claiming those lamps away from everything else — per-material light
+loops on both devices.
+
+### Deferred, with reasons
+
+Subsurface Scattering (BI's two-pass lightmap diffusion is an engine
+feature, not a material flag — its own round), Strand (no hair
+system), Mask transparency, Receive Transparent and Casting Alpha
+(depth-only shadow maps), per-material ray Depth/Max Dist/Fade
+To/Gloss (the global Raytrace settings carry these), Face Textures
+(dead even in 2.79), Object Color, Pass Index, Full Oversampling,
+Sky/Invert Z/Z Offset.
+
+---
+
+## [1.35.23] — 2026-08-16
+
+### The second master shader: BI Material
+
+A new node — **Add > Halcyon > BI Material** — presents Blender
+Internal's material panel as one node, with the diffuse and specular
+shader menus INDEPENDENT, exactly as 2.79 had them. Five diffuse
+shaders (Lambert, Oren-Nayar, Toon, Minnaert, Fresnel) cross five
+specular shaders (CookTorr, Phong, Blinn, Toon, WardIso): all 25
+pairings work, every branch a transcription of 2.79's
+`shadeoutput.c`. The sliders carry BI's own names and defaults —
+Hardness 50, Refr 4.0, Darkness, Slope, the specular Toon Size/Smooth
+pair, Fresnel/Factor — plus the Halcyon extras (Ambient, Reflection,
+Translucency, Bump) so it composes with everything the master shader
+already does. A Shadeless toggle gives BI's flat unlit look.
+
+New transcribed formulas this round: Minnaert (both darkness
+branches), the Fresnel DIFFUSE shader (`fresnel_fac` replacing the
+cosine outright — the classic grazing-light glow), BI's Toon diffuse
+and Toon specular (hard angular bands, not the Halcyon Toon's
+step quantizer), and WardIso (with BI's N·L gate and 0.1 slope
+floor). These join last round's CookTorr/Phong/Blinn trio to
+complete the matrix.
+
+The node rides the full pipeline: CPU and GPU frames, texture
+stacks, bump, shadows, fog — the evaluator matches sockets by
+identifier so all existing machinery treats it as a master shader.
+GPU parity is exact: all 25 pairs match the CPU reference to
+0.00e+00 in the shader simulator, and three full frame renders
+(Lambert+CookTorr, Oren-Nayar+WardIso, Minnaert+Blinn) match the
+CPU frame to the last pixel.
+
+### Fixed: a GLSL decode that meant different things to different machines
+
+The node's shader-pair decode was first written `(model - 100) / 10`
+— integer division on a real driver, float division in the parity
+simulator, so the simulator read pair 3/4 as "3.4" and shaded
+Lambert+CookTorr instead. Rewritten floor-style so both semantics
+produce the same digits. Caught by the new 25-pair parity sweep
+before it ever reached a device — this is exactly the divergence
+class the simulator exists to catch.
+
+---
+
+## [1.35.22] — 2026-08-13
+
+### Every preset names its year
+
+All 72 hardware and software presets now carry a release year in the
+label — "Bryce 2 (1996)", "Sega Saturn (1994)", "PAL broadcast
+(1967)". Software presets date the exact VERSION they emulate
+(LightWave 5.6 is 1998, not LightWave's 1990 debut); hardware and
+formats date the introduction of the machine or standard. Only
+"Halcyon Default" has none, being a reset rather than a product.
+
+
+
+### The 2.79 fidelity pass: BI's own formulas, transcribed
+
+The field asked for accurate material values. Measured against
+Blender Internal's own source, the converter was approximating in
+four places; all four now run BI's actual math.
+
+**The BI specular trio.** BI's default combo (Lambert + CookTorr)
+mapped onto Halcyon's textbook Cook-Torrance — a Beckmann microfacet
+driven by Roughness and IOR that IGNORES Hardness entirely. The real
+file's materials span hardness 2..462, and every one rendered the
+same fixed-width lobe. Three new models transcribe 2.79's
+shadeoutput.c term for term:
+
+- `BI_COOKTORR`: pow(N.H, hardness) / (0.1 + N.V) — the divisor is
+  the whole character, an 11x brightening toward grazing view no
+  textbook lobe has;
+- `BI_PHONG`: pow(N.H, hardness) — BI's 'Phong' was always the
+  half-vector lobe;
+- `BI_BLINN`: BI's Torrance-Sparrow with its refraction-index
+  Fresnel and Gaussian half-angle width (the Refr slider rides in as
+  IOR).
+
+Legacy imports now route CookTorr/Phong/Blinn materials to them;
+Hardness finally drives the highlight the way the file was authored.
+The CPU/GLSL model sweep covers all three exactly, and the real
+file's frame holds compiler-twin parity.
+
+**BI falloff curves.** The importer's lamps decayed as an unbounded
+1/d with a 4*pi*D*E/3 energy shim that matched BI at exactly one
+distance. Lamp falloff_type is now parsed from the .blend, and two
+new per-light curves implement BI's own bounded forms: Inverse
+Linear D/(D+d) and Inverse Square D^2/(D^2+d^2), half strength
+exactly at the lamp's Distance. Import energy is converted for
+Halcyon's unit conventions (suns x pi, point-family x 4pi^2) instead
+of shimmed.
+
+**One ambient, the world's.** BI had exactly one ambient term: the
+world's colour times each material's Amb slider. Halcyon ADDS a
+scene-level global ambient, and its cosy 0.05 default was a wash the
+original render never had. Legacy imports zero it; the world's own
+ambient (usually black in 2.79 files) is now the whole story.
+
+**Resolution-independent bump.** The height field differentiated in
+SCREEN space: the same material bumped twice as deep in a draft as
+in the refine, and deeper again at F12. The gradient is now
+height-per-world-unit, normalised by each pixel's world footprint
+from the same neighbour grid — depth measured identical (0.5%)
+across a resolution doubling, where before it halved.
+
+Re-import the .blend to pick all of this up: models, falloff and
+energy apply at conversion time.
+
+
+
+### Orbit Pixel Size, Clay override, a Blender Internal preset
+
+Field suggestions, shipped:
+
+- **Orbit Pixel Size** (Performance panel). Motion frames get their
+  own pixel size: Auto (the default) keeps them under the fixed pixel
+  budget however large the region; a number renders them at exactly
+  1/N. The resting refine always uses Pixel Size, exactly as before —
+  the two dials the field asked for by name.
+- **Material Override: Clay** (Shading panel). Every material renders
+  as one plain matte surface — geometry, lights and shadows stay
+  real, textures and graphs are ignored. Built at the scene seam, so
+  the CPU and GPU see the same plain materials and parity holds by
+  construction.
+- **Blender Internal (2.79) preset.** Lambert + CookTorr, ray-traced
+  shadows and mirrors, 8-sample Mitchell AA, sRGB with a soft dither:
+  the renderer the classic files were made for, one click.
+
+Two fixes from the same report:
+
+- The performance split now prints for the FIRST refine of every
+  session even without Show Stats — the one line that names the slow
+  stage must not depend on a toggle nobody found. (It is also in the
+  Timing Breakdown toggle for every refine after.)
+- The `ReferenceError: StructRNA ... has been removed` console noise
+  on quitting rendered view is gone: Blender frees the engine wrapper
+  before Python collects it, and teardown now stays silent when the
+  wrapper is already dead.
+
+Still on the list from this round of suggestions: tiled final
+renders, and a dedicated pass over 2.79 material VALUE fidelity
+(specular intensity curves, bump depth) against Blender Internal's
+own formulas.
+
+
+
+### The viewport stops paying for pixels and pokes nobody asked for
+
+GPU shading engaged in the field for the first time — and the next
+report was 'incredibly laggy' at Pixel Size X1. Measured on the real
+file at the field's region size: a refine at X1 is ~3.6 s of work and
+the raster alone is ~1.9 s; a HALF-res draft is still 204k pixels at
+~0.5-1 s — a 1-2 fps slideshow during motion. And every depsgraph
+poke (the field runs add-ons that poke constantly) re-exported all
+100 objects (~2 s) and restarted the draft+refine cascade, so the
+viewport lagged while standing still.
+
+Three fixes:
+
+- **Drafts get a pixel BUDGET, not a divisor.** Motion frames exist
+  to be fluid: the draft divisor now grows until the frame fits
+  ~64k pixels (the 352x144 class the field machine renders at a few
+  frames a second), whatever the pixel size. The REFINE honours the
+  user's Pixel Size exactly, so rest quality is untouched.
+- **Depsgraph pokes that touch nothing renderable no longer
+  re-export.** Only updates naming renderable datablocks (objects,
+  meshes, materials, lights, images, transforms, geometry) invalidate
+  the exported scene. Anything else lands as a settings check — and
+  an identical-settings poke now costs exactly nothing.
+- **The field gains a performance instrument.** With Show Stats on,
+  every refine prints its millisecond split — plan, pack+upload,
+  draw+read, composite, raster, and the marshal's crossing count with
+  exec vs wait time. One pasted line beats a round of guessing; it is
+  the crash-milestone doctrine, applied to speed.
+
+
+
+### Declared before use: the actual compile error, found and walled off
+
+The 1.35.17 field log repeated the same refusal — one material, Shader
+Compile Error — so the sampler cliff was real but not the blocker.
+The blocker is embarrassing and exact: the bitex GLSL chunk's
+`bi_bricontrgb` calls `hal_rgb_to_hsv` / `hal_hsv_to_rgb`, which are
+defined in the okramp chunk — and the okramp chunk lands AFTER the
+bitex chunk in the assembled source. Real GLSL compilers require
+every function declared before use; Halcyon's own front-end and
+simulator resolve calls by NAME at run time and never noticed. One
+divergence, five rounds: every material carrying a Blender Internal
+texture node was rejected by the driver while every headless check
+passed.
+
+Fixed with two forward declarations at the top of the bitex chunk —
+correct under any chunk order — and walled off for good with a
+declaration-order audit (`declaration_order_violations`): a lexical
+scan any assembled pass must survive, now part of the test suite. It
+flags the exact field bug on the old source (both HSV calls, by line
+number) and passes clean on every pass of the real scene and the
+field-cube case.
+
+With the compile unblocked, the sampler headroom of 1.35.17 and the
+tables of 1.35.15 finally line up: the next GPU-device session should
+be the first to log `GPU shading engaged`.
+
+
+
+### One shadow atlas for every light: off the 16-sampler cliff
+
+The refusal milestone paid for itself on its first outing. The field
+log named the blocker verbatim:
+
+    GPU plan refused: the driver rejected '<material>': HAL_MAT_1:
+    CreateInfo failed: Shader Compile Error
+
+The GLSL library survives a line-by-line audit and the sim compiles
+everything — the SOURCE is fine. The INTERFACE was not: real drivers
+guarantee 16 fragment texture samplers, and the heavier materials
+were standing on that exact cliff. That material: eight per-light shadow
+samplers + the BI table + three images + the three G-buffer samplers
+= 15, before the draft pass adds its stipple and sampling atlases.
+One texture over the line and the driver rejects the whole compile —
+which is precisely the class of failure a permissive front-end and a
+sampler-blind simulator can never see.
+
+So mapped shadows now travel as ONE combined atlas for the whole
+frame: every light's cell arithmetic was already baked as literals,
+so packing costs one added row offset per light and frees seven
+sampler slots on an eight-light scene. The field file's worst
+material drops from 16 samplers to 9-of-16; the parity twin is
+unchanged to the last digit (mean 1e-06 on the real scene — same
+texels, same arithmetic, one texture).
+
+And the cliff itself is now a NAMED refusal instead of a driver
+mystery: a pass that would need more than 16 samplers refuses at
+assembly with 'needs N texture samplers; drivers guarantee 16' —
+by count, in the log, before the driver ever sees it.
+
+
+
+### GPU work only where it earns its risk; the log states the WHY
+
+The 1.35.15 field session repeated the exact silent-death shape: a
+survived worker AV in CPU shading INSIDE the GPU-device frame, the
+frame parked through the guard, then a device loss before the first
+blit ever completed — and this time the missing shutdown marker
+PROVES the end was abnormal. Two facts follow. First, the GPU plan is
+still refusing in the field for a reason the log has never stated.
+Second, with shading refused, the only GPU work in flight in every
+one of these dying sessions was the display/post chain — GPU work
+that buys nothing over a CPU-resident frame.
+
+Both addressed:
+
+- **The refusal reason is now a milestone.** `GPU plan refused: ...`
+  (first three, verbatim) and `GPU shading engaged` land in the
+  forensics log. Five sessions of guessing why the field falls back
+  end with the next log naming the material and the reason.
+- **GPU post now requires GPU shading.** render() records whether the
+  frame's shading actually engaged the GPU, and post.process gates
+  every GPU stage on it. A CPU-shaded frame — plan refusal, guard
+  re-shade, CPU device — keeps its post on the CPU end to end: no
+  upload, no readback, no render-graph work for a dither pass the CPU
+  does exactly. In the current field state this removes ALL GPU work
+  from the session until the plan qualifies, which contains the
+  device loss to the one path where the GPU is actually earning
+  something. The display-chain stage shaders were audited for
+  out-of-bounds surfaces while at it: pure float arithmetic, no
+  indexed fetches — clean.
+
+
+
+### The BI texture node reaches the GPU; no fetch can kill the device
+
+The user called it twice: "I think it's the texture node. I tried
+using it on a normal cube and it crashed." The 1.35.14 log agreed —
+CLOUDS evaluating on the CPU inside a GPU-device frame, then a silent
+death no log could catch: black screen, Blender's crash dialog,
+blender.crash.txt never written. That silence is the signature of a
+Vulkan DEVICE LOSS — a GPU-side fault kills the device and the
+process without ever running a crash handler.
+
+Two defects, both fixed:
+
+**The noise tables were never provided.** The emitter declares the BI
+texture node's table sampler (`hal_bitex_tab`, image key
+`__bitex_tables__`) — and nothing anywhere registered that key, so
+every material carrying a BI texture node refused its GPU pass
+("engine table texture ... is not among the prepared textures") and
+silently fell back to the CPU. On every GPU-device frame. Since the
+node existed. The tables now ride prepare_textures() as a 32 KB
+prepared texture, built once and cached; the field-cube case is a
+test — a CLOUDS material must QUALIFY for the GPU plan and match the
+CPU exactly (it does: max 0.00000), and the real file's frame still
+holds parity at a mean of 1e-06.
+
+**Out-of-bounds texelFetch could kill the device.** On Vulkan an OOB
+texelFetch is undefined behaviour, and on real drivers it is a device
+fault — the exact silent-death shape. Every computed-index fetch in
+the GLSL is now clamped at its choke point:
+
+- `bi_tab()` — all BI table reads, clamped to the table;
+- `hal_fetch_attr()` / `hal_tri_data()` — the G-buffer fetches, where
+  an UNCOVERED pixel legitimately carries triangle id -1 and a
+  neighbour tap (uv gradients at a silhouette edge) can land on one:
+  a negative index through `%`/`/` was an undefined fetch waiting on
+  every object outline;
+- the sampling, cookie, shadow-atlas and radiosity-field fetches were
+  audited and were already masked, wrapped or clamped by
+  construction; the exact-raster compute kernels (F12 path) keep
+  their count guards.
+
+A wrong texel is a wrong pixel the parity tests can see; a dead
+device was forty minutes of guessing. The clamp buys the first and
+abolishes the second.
+
+
+
+### The log learns to say goodbye
+
+The 1.35.13 field log carried the milestone this arc has been chasing:
+`GPU readback completed (epoch 1)` → `render returned to the worker
+(GPU)` → `viewport frame parked` — the first COMPLETE GPU round-trip
+on the field machine, with no fatal anywhere in it. (The ~1,350
+access violations around it are the familiar external storm: main
+thread, no Python frames, running from session start before Halcyon
+did anything, Blender's own UI draws in the occasional stacks — all
+survived.)
+
+But the log then simply STOPPED after the parked frame, and there was
+no way to tell a crash from an orderly quit. Two markers close that
+last forensic gap:
+
+- `addon unregistered (clean shutdown)` — written at the top of
+  unregister(), which every orderly Blender quit (and add-on disable)
+  runs. A log that ends WITHOUT this line now positively means the
+  process died abnormally: crash, driver device-loss kill, or freeze.
+- `viewport engine destroyed (left rendered view)` — places leaving
+  rendered view on the timeline, so a later fatal is never pinned on
+  a viewport that was already gone.
+
+The parked frame read `98% black` — through the guard's CPU re-shade,
+which the CPU device independently corroborates (its frames from the
+same angle parked 99-100% black): the current viewport angle is
+looking at genuine darkness, not the GPU-black pathology. The guard's
+first-frame cross-check fired once, as designed, and converges.
+
+
+
+### Everything handed to the driver now outlives the transfer
+
+1.35.12's GPU session still died — but somewhere NEW, which is what a
+correct fix looks like from inside a stack of bugs. The fatal moved
+off the barrier walk and into plain NumPy on the render worker
+(np.clip, `<invalid frame>` beneath it) moments after
+`GPU readback completed (epoch 1)`. A ufunc over owned memory only
+faults when the heap itself has been damaged — so the suspect list is
+every remaining spot where memory crosses the Python/driver boundary
+with mismatched lifetimes.
+
+Audit result: the read sites were copied in 1.35.12, but three
+classes of SOURCE data still died at function exit while Vulkan may
+not have consumed them — Vulkan RECORDS commands and executes at
+flush, so anything a recorded transfer references must live until
+proof:
+
+- image-upload staging (`Buffer` + the flat array behind it): now
+  parks in the graveyard until a readback proves the graph that
+  carried the upload executed;
+- the viewport blit texture's staging: parks in the SCREEN grave and
+  rides the same eight-redraw clock as the texture it filled;
+- readback Buffers themselves: the pixels were already copied out,
+  but the Buffer's pages could be reused by the allocator while a
+  late transfer might still land — they park too.
+
+If a lazily-consumed staging buffer was being read (or written) after
+Python freed it, the allocator had every right to hand those pages to
+the render worker — whose next innocent NumPy call then walked
+corrupted memory. That is exactly the shape of the field fatal, and
+of the earlier survived worker AVs.
+
+The forensics log also gains the window-splitting milestone
+`render returned to the worker (...)`: a fatal between
+`GPU readback completed` and this line is inside the GPU stage or its
+return; a fatal after it is in post/guard/park on the worker's own
+arrays. Whatever happens next session, the log now names the half.
+
+
+
+### Mixed textures plugged in; the GPU stops freeing while it records
+
+The first render sessions surfaced two field reports: materials with
+several texture slots showed their extra textures UNPLUGGED in the
+shader editor, and the GPU device crashed — with the correct suspicion
+that textures were involved.
+
+**Mixed textures.** Blender Internal stacks texture slots: each colour
+slot blends ONTO the result of the slot before it. The converter
+instead wired every MixRGB's Color1 to the static base colour — and
+since Blender keeps ONE link per input, each slot's link to Diffuse
+Color replaced the previous slot's, leaving every earlier chain
+dangling. On the real file that took out the suit itself: its base texture
+at full MIX, then the phantom grunge layer MULTIPLYed over it,
+rendered as base-colour murk with no suit texture. Mix chains now
+link Color1 from the running result (the first mix still takes the
+base colour), full-influence MIX slots replace the chain exactly as
+BI's arithmetic does, and value channels keep their summing. The fake
+node tree used by the tests now models Blender's one-link-per-input
+rule, which is the divergence that had let this pass. Verified on the
+real file: all 19 materials, zero dangling nodes, and the GPU compiler
+twin matches the CPU frame to a mean of 1e-06 with the new chains.
+
+**The GPU crash.** The 1.35.11 log put two native access violations —
+no Python frames: the Vulkan submission thread — immediately after
+`GPU readback completed (epoch 1)`, the first readback of the GPU
+phase. That epoch 'proved' the CPU-phase blit textures retirable, but
+a readback only proves OUR offscreen subgraph flushed; Vulkan's render
+graph prunes to the read's dependencies, and Blender's screen-draw
+stream is a different subgraph. Freeing happened mid-recording, on
+exactly the scenes that upload textures (one collect per image upload;
+the real file runs eleven) — the reported texture correlation.
+
+Three policies close it:
+
+- a SCREEN grave: objects whose last use was drawn to the screen (the
+  parked-frame blit texture, blit batches) retire on a redraw clock —
+  eight completed view_draw calls, a full swapchain depth behind any
+  frame in flight — never on readback epochs;
+- nothing frees while commands are being recorded: image uploads and
+  the draw callback no longer collect at all (the persistent timer,
+  between redraws, is the one mid-session collector left), and the
+  per-size blit batch is cached for the session instead of being
+  buried on every draft/refine size flip;
+- every GPU readback now returns an OWNED copy instead of a NumPy view
+  of the driver's buffer — a 1.35.10 log caught a worker thread taking
+  an access violation inside a fetch from exactly such a view (and the
+  old 'one contiguous copy' comment was wrong: ascontiguousarray of a
+  contiguous view copies nothing).
+
+
+
+### The first frame was exempt from the black-frame guard
+
+1.35.10 delivered the first complete session on the user's machine:
+import, export, a completed GPU readback, a parked frame, no crash —
+and no image. The scene itself is fine: a headless CPU render of the
+same .blend produces a correct picture (mean luminance 0.19, 17%
+black). The prime suspect is the long-known GPU-device pathology the
+black-frame guard exists for — materials coming back pure black on
+the GPU device — striking on the FIRST frame, where the guard had a
+hole: it compared each frame against the PREVIOUS parked frame, so
+with no previous frame there was no comparison, and a 100%-black
+first frame parked unchallenged. Every fresh session is a first
+frame; the one frame the guard never checked was the one every
+session showed.
+
+Closed: a first GPU frame that is ≥97% black now triggers the guard
+on its own — no previous frame needed — and is re-shaded on the CPU
+before parking, exactly like any later blackout.
+
+The forensics log now states frame content outright instead of
+leaving it to inference:
+
+- the park milestone reports the parked frame's black fraction —
+  `viewport frame parked (352x144 draft on GPU, 3% black)` — so a
+  blank screen and a black frame can no longer be confused;
+- a new `viewport frame drawn to screen` milestone (first three
+  draws) confirms the parked frame reached Blender's draw path, so
+  "parked but never displayed" and "displayed but black" are now
+  distinguishable from the log alone.
+
+Immediate workaround if the pathology is confirmed: setting
+Halcyon's render device to CPU bypasses the GPU shading path
+entirely and shows the image directly.
+
+The guard-hole fix is locked by a new test: a fresh viewport whose
+very first GPU frame comes back all black must trigger the guard
+exactly once and park a frame with real content in it.
+
+
+
+### Offscreens never die mid-session: the target pool
+
+1.35.9's flush epochs did not end it: the same fatal read, at the same
+display stage, now on the main 5.2 install — with a log otherwise
+clean. With time-based release gone and proof-based release in place,
+the remaining suspect class narrows to the one destructive operation
+still in the hot path: `GPUOffScreen.free()`. Both field dumps died
+walking WRITE barriers — the barrier class that belongs to render
+targets.
+
+So render targets are now POOLED for the session and never destroyed
+mid-run. `Target.free()` returns the offscreen to a per-size pool for
+reuse; a session touches only a handful of distinct sizes (draft,
+refine, F12, the post chain), so the pool is small and bounded, with
+overflow past the per-size cap going to the flush-epoch graveyard —
+never straight to the driver. Only reset() sends the pool to the
+graveyard at teardown. Reuse is safe by construction: the offscreen
+stays alive, every stage fully overwrites it, and command order is
+preserved on the one queue.
+
+The forensics log also gains the discriminating milestone: the first
+three completed GPU readbacks are recorded (`GPU readback completed
+(epoch N)`). If a fatal read ever appears WITHOUT one of these before
+it, the very first offscreen readback is what dies — pointing at the
+platform layer, with "GPU Post Processing off" and the CPU device as
+the documented mitigations. Completions before a crash would mean the
+question stays with lifetimes between flushes.
+
+Suite: the pool semantics are pinned headlessly — freed targets are
+reused rather than destroyed, concurrent targets get fresh offscreens,
+per-size overflow is buried not freed, and reset() retires the pool
+through the graveyard.
+
+---
+
+## [1.35.9] — 2026-08-13
+
+### The clean-install crash: time was the wrong ruler for the graveyard
+
+The field ran the decisive experiment — a fresh Blender 5.1.1 with
+ONLY Halcyon — and the log came back pristine: no exception noise at
+all, import OK, export OK, `viewport render started (352x150 GPU
+draft)`, then ONE fatal access violation with full Python frames on
+both threads. The native report completes it: the Vulkan submission
+thread died reading a nulled image inside `add_image_write_barriers`
+while the main thread sat in Halcyon's own display-stage readback,
+flushing the render graph. Ours, cleanly reproduced, no more noise to
+hide behind.
+
+**The flaw.** The 1.35.3 graveyard released parked GPU objects after a
+one-second afterlife, on the theory that queued commands flush within
+a swap. On Vulkan they do not: commands recorded early in a frame sit
+in the render graph until the frame's FINAL readback submits them all
+at once — and the first draft frame of a 19-material scene, thick
+with shader compiles, runs longer than one second. Mid-frame, an
+upload burst ran collect(); intermediate post-chain targets buried
+earlier in the SAME frame hit their deadline; their images were
+destroyed while the graph still referenced them; the end-of-frame
+flush walked its barriers into freed memory. Every earlier partial fix
+(the blit churn, the batches, the marshal) removed a real hazard — but
+this clock was wrong underneath all of them.
+
+**The fix: flush epochs.** A readback that RETURNS data is proof that
+everything recorded before it has fully executed — so that is now the
+graveyard's ruler. Every completed read (pass readbacks, region reads,
+compute readbacks) ticks a flush epoch; a parked object releases only
+once it was buried BEFORE a completed flush — exact on Vulkan, exact
+on OpenGL, and immediate rather than a second late. Wall time survives
+only as a ten-second fallback for read-free sessions, where the swap
+chain has drained the queue hundreds of times over, plus an emergency
+bound on the parked list itself that never touches current-epoch
+entries.
+
+Suite: the graveyard tests now pin the epoch semantics — nothing
+releases without proof, a flush retires exactly what preceded it, the
+fallback still reaps read-free sessions, and current-epoch entries
+survive every ordinary collect.
+
+---
+
+## [1.35.8] — 2026-08-13
+
+### The narrated log worked; the import's disk round-trip is gone
+
+The first 1.35.7 field log read exactly as designed: import OK, export
+OK — then a fatal access violation on the render worker at a plain
+`.astype()` return inside the BI texture evaluator, with no milestone
+after it. An allocation-and-copy of ordinary size does not fault on
+its own: that is a VICTIM site, reached after something else already
+damaged the process heap. The pattern across every log so far points
+the same way — each crash lands at an allocation moment, and the one
+native-heavy sequence present FIRST in every crashed session is the
+import's image round-trip: write the packed PNG to %TEMP%, load it
+back from disk, repack it. Both 1.35.6 logs show (handled) access
+violations raised exactly there — a freshly-written file in the temp
+folder is precisely what antivirus filters and memory-mapped loading
+fight over.
+
+So the round-trip is gone. Packed images now pack STRAIGHT FROM
+MEMORY: `bpy.data.images.new` + `Image.pack(data=...)` — no temp file,
+no disk load, no filesystem at all. The old route survives only as the
+fallback for a bpy without `pack(data=)`.
+
+The log also gains one more milestone: `viewport render started`, with
+the resolution, DEVICE and draft/refine stage — so the next tail (if
+there ever is one) says which device the worker was shading for and
+which phase died, not just where.
+
+If a crash still lands after this build: switch Halcyon's render
+device to CPU in the render properties and retry — with the disk
+round-trip gone and the GPU path bypassed, what remains draws the line
+between this add-on and the machine underneath it.
+
+---
+
+## [1.35.7] — 2026-08-13
+
+### The log learns to tell survived exceptions from the fatal one
+
+The first 1.35.6 field log taught a Windows subtlety: faulthandler
+prints every FIRST-CHANCE access violation as "Windows fatal
+exception" — including ones a driver or the OS raises and HANDLES as
+part of normal operation (guarded probes during driver init, guard
+pages under memory-mapped file loading, antivirus filters, DLL paging)
+— after which the application carries on. The field's log shows
+exactly that shape: entries with no Python frames at all, two passing
+through a perfectly legal `bpy.data.images.load()` during import, one
+inside numpy's own import machinery — and the log kept RECORDING after
+each of them, which a dead process cannot do.
+
+So the log now narrates. Timestamped `OK:` milestones are written into
+the same file at the moments that matter — legacy import completed
+(with the full stage line), viewport export delivered to the worker,
+viewport frame parked (size, draft/refine, device), F12 frame
+delivered — each capped so per-frame sites cannot flood the file. The
+reading rule is now printed in the header: an exception entry is fatal
+only when no milestone ever follows it. One glance at the tail answers
+what three rounds of crashlogs could not: what was the last thing that
+WORKED.
+
+---
+
+## [1.35.6] — 2026-08-13
+
+### The faulthandler log worked: one stale pointer, named by line
+
+1.35.5's crash forensics paid off on their very first outing. The
+field's `halcyon_faulthandler.log` shows the access violation on the
+main thread at `compat.py:167` — `me = ob.to_mesh()` inside
+`evaluated_meshes` during the viewport export — while the render
+worker and fourteen shadow-map threads crunched the previous frame.
+
+**The bug.** `evaluated_meshes` snapshots the depsgraph instance list
+before converting (its own docstring explains why the iterator must
+not be live during `to_mesh()`). But the snapshot stored the
+EVALUATED object pointers — references Blender documents as invalid
+beyond the iteration step. The first conversion that allocates (a
+curve, a text; the imported file carries ten curve objects) can
+reallocate evaluated storage and dangle the pointers held for every
+LATER item; the next `to_mesh()` reads freed memory. It survived for
+months because a dangling pointer usually still reads intact memory —
+until a render worker plus a shadow pool churned the allocator hard
+enough to recycle the block mid-export. That is why every report said
+"fine until the renderer is actually running", on either backend: the
+renderer never held the knife, it just made the coroner arrive on
+time.
+
+**The fix.** The snapshot now keeps each instance's ORIGINAL object —
+a stable, bmain-owned ID — plus its matrix, and re-resolves the
+evaluated object through `evaluated_get()` at use time, so every
+`to_mesh()` runs on a pointer the current depsgraph just handed out.
+The other `object_instances` user (the light loop) already reads
+within the iteration step and stays as it is.
+
+Suite: a fake depsgraph models the reallocation (every conversion
+bumps an epoch; a stale-epoch `to_mesh()` trips a guard). Under the
+old code only the first object survived conversion; the test pins
+that all geometry objects convert exactly once, each on a
+freshly-resolved pointer.
+
+---
+
+## [1.35.5] — 2026-08-12
+
+### Backend-independent: the marshal could run GPU work on the worker
+
+The field killed the last theory cleanly: the crash reproduces on BOTH
+Vulkan and OpenGL, mid-render — "fine until the renderer is actually
+running". Nothing backend-specific survives that test. The scene
+itself was exonerated headlessly the same day: the real file's full
+geometry (110 k triangles, 73 objects), all 19 converted materials,
+every packed image and all 14 lamps render clean through the CPU core
+at 2560×1440.
+
+What remained was the one piece of code that decides WHERE driver work
+runs. The marshal's escape hatches did this:
+
+```
+if not enabled or on_main():  return fn()   # in place
+if no timer could register:   return fn()   # in place
+```
+
+"In place", on a render worker streaming device calls, means texture
+uploads, shader compiles and draws executed on a thread with NO GPU
+context. The module's own comment records the original observation:
+when marshalling switched off under a live worker, its bursts "fell
+back to the CPU with a misleading reason" — because OLD OpenGL
+politely raised an error without a context, and the call sites caught
+it. That politeness was the only thing standing between those escape
+hatches and a segfault. Modern Blender extends no such courtesy on
+either backend: driver work on a context-less thread is a process
+crash, landing exactly when a heavy frame streams seconds of device
+calls — a light scene crosses in milliseconds and near-never hits the
+window; the imported file always does.
+
+Off the main thread inside a real Blender, `run_on_main` now NEVER
+executes the callable in place, whatever the enable count says: the
+burst queues to the main-thread pump, and if no pump can register it
+raises `MarshalTimeout`, which every call site already turns into the
+named CPU fallback. The suite pins the property with a real
+cross-thread test: a burst queued with marshalling OFF still executes
+on the main thread, and an unpumpable main loop yields MarshalTimeout
+with the callable never having run.
+
+Also new: **crash forensics**. The add-on enables Python's
+`faulthandler` into `%TEMP%/halcyon_faulthandler.log` — if any native
+crash happens with Halcyon loaded, that file now records the exact
+Python line active on every thread at the moment of death, turning the
+next crash report (if there ever is one) into a one-round diagnosis.
+
+---
+
+## [1.35.4] — 2026-08-12
+
+### The second crashlog found the object 1.35.3 missed: the batches
+
+Same exception, different witness. This time the main thread was caught
+red-handed inside Halcyon's own work — `GPU_texture_read` under a
+Python timer (the marshal pump reading a pass result back) — while the
+submission thread died in the same `vkCmdPipelineBarrier`. So the
+textures were no longer the corpse (the 1.35.3 graveyard holds them);
+something ELSE recorded into the render graph was dying before the
+flush.
+
+It was the **vertex batches**. Two sites built a `batch_for_shader`
+quad, drew it, and dropped it at function exit:
+
+- **Every material pass.** The multi-pass composite deliberately skips
+  per-pass readbacks (one readback per frame, however many materials) —
+  which on Vulkan means the draw is only RECORDED at that point. The
+  batch died at return; its vertex buffer was destroyed before the draw
+  ever executed. A 16-material frame queued sixteen draws over dead
+  geometry, and the barrier walk crashed the instant the final readback
+  flushed the graph.
+- **Every viewport redraw.** The blit that puts Halcyon's frame on
+  screen built a fresh batch per redraw and dropped it with the draw
+  still queued for the swap. This one runs regardless of whether any
+  material planned onto the GPU — which is why no amount of material
+  fixing could stop the crash.
+
+Both are now cached for exactly as long as they can be referenced: the
+full-screen quad lives per shader (the cache entry holds the shader
+too, so it can never outlive the code that draws with it; reset()
+buries entries through the graveyard), and the viewport blit batch
+lives per region size, its predecessor buried on resize.
+
+With textures, offscreens, shaders AND batches now lifetime-managed,
+every category of GPU object Halcyon creates outlives any command that
+references it.
+
+A third field log showed a separate crash at Blender EXIT, inside
+Python's own finalization (an unraisable exception in a teardown
+callback). The graveyard's teardown paths — the viewport destructor
+and the persistent collection timer — are now inert during interpreter
+finalization: they check `sys.is_finalizing()` and do nothing, and the
+timer unregisters itself. Nothing of Halcyon runs code while the
+interpreter is being dismantled.
+
+---
+
+## [1.35.3] — 2026-08-12
+
+### The crash itself: a Vulkan use-after-free, fixed with a graveyard
+
+The field sent the actual crashlog, and it named the killer precisely:
+`EXCEPTION_ACCESS_VIOLATION` inside `nvoglv64.dll` under
+`vkCmdPipelineBarrier`, on Blender's own
+`VKDevice::submission_runner` thread, while the main thread waited in
+the swap-buffer flush. Halcyon's Python thread was parked, idle. That
+stack means one thing: a GPU resource was DESTROYED while Blender's
+Vulkan render graph still held queued commands referencing it.
+
+**Why Halcyon, why now.** Blender 5.x's Vulkan backend records draw
+commands into a render graph and executes them later, on a submission
+thread. Halcyon — written against years of OpenGL, where the driver
+defers deletion internally — dropped GPU objects the moment it was
+done with them:
+
+- the viewport blit texture was REPLACED (and its predecessor freed)
+  on every changed frame — a refine burst churns several a second;
+- the upload cache evicted 32 textures at once when it crossed 64
+  entries — and the imported file's frame legitimately wants ~40
+  textures at once (14 shadow atlases, a dozen images, the G-buffer
+  set), so the first heavy frame evicted textures the SAME frame's
+  queued passes still referenced;
+- offscreen targets were freed immediately after their last use.
+
+On OpenGL, all of that was safe, which is why months of field use
+never saw it. On Vulkan, each one hands the render graph a dead image;
+the crash lands at the next swap. It did not matter whether the
+materials planned onto the GPU — the blit churn alone was fatal, which
+is why 1.35.1 and 1.35.2 crashed identically.
+
+**The fix: nothing dies while it can still be in flight.** A deferred
+reclamation list (the graveyard) now stands between Halcyon and the
+driver. Replaced blit textures, evicted uploads, retired offscreens,
+and reset-cleared shaders are PARKED, not freed; they release on the
+main thread one full second later — generations beyond any queued
+command's lifetime — with a hard cap so a churn burst cannot hold
+VRAM. The upload-cache cap also rises 64 → 96 so a heavy frame's
+working set never triggers mid-frame eviction at all, and leaving
+rendered view retires the blit texture through the same graveyard
+(engine teardown was the same hazard on exit).
+
+Suite: the graveyard mechanics are proven headlessly — parked objects
+survive collection until expiry, expire on time, overflow releases
+oldest-first, force-collect drains, and reset() buries instead of
+freeing.
+
+If rendered view still crashes on this build, switch Blender to the
+OpenGL backend (Preferences > System > Display Backend) and report —
+that isolates the remaining fault to the Vulkan layer with one move.
+
+---
+
+## [1.35.2] — 2026-08-12
+
+### The rendered-view crash, reproduced and fixed
+
+"As soon as it loads into rendered view it crashes." The uploaded 2.79
+file made the whole failure reproducible headlessly: the converted
+materials were built exactly as the importer builds them, and the same
+frame the viewport would render was pushed through the real planning,
+assembly and shading code on both devices.
+
+**The chain that crashed.** The file holds NINE texture slots whose
+image datablocks are empty — no file path, no packed data (old projects
+accumulate these). 1.35.1 was the first build that converted those
+materials at all, and each empty slot became an Image Texture node with
+no image. In rendered view, the GPU frame planner refused each such
+material ("image 'None' is not among the prepared textures") — and one
+refused material sends the ENTIRE frame plan back to the CPU. So the
+viewport quietly fell into full-resolution CPU rendering of a
+19-material, 12-texture, 14-light scene on every redraw: a memory and
+time cliff that lands exactly at "loads into rendered view, then dies".
+
+**The fixes, innermost first:**
+
+- **Empty image slots now map to nothing.** Blender Internal adds
+  nothing for an imageless texture — the old conversion emitted a
+  black-sampling node instead, which also DARKENED the colour chain
+  (diffuse mixed toward black at full factor). Skipped with a named
+  warning now; the affected materials render their true colours.
+- **An imageless Image Texture node emits the CPU's own constants**
+  (opaque black, alpha one) and registers no sampler, instead of
+  refusing the plan. Hand-built imageless nodes are now GPU-safe too.
+- **Colorband GLSL declares arrays as `vec4 name[N]`.** The previous
+  `vec4[N] name` form is real GLSL but Halcyon's own shader front-end
+  could not parse it — meaning the headless proof had NEVER actually
+  compiled a colorband material's frame pass. It does now, and the
+  colorband unroll is numerically proven against the CPU (9.8e-07).
+- **Texture Coordinate outputs dispatch by NAME on the GPU**, the CPU
+  evaluator's own rule. Positional dispatch could read a different
+  source than the CPU the moment a graph's socket names and positions
+  disagree (caught sampling an image at the shading normal).
+- **BI texture props tolerate None** (a graph serialized by an older
+  build stays loadable after new props are added).
+
+**The proof.** The user's actual file, end to end, headlessly: all 19
+materials plan onto the GPU (16 passes for the 16 on-screen ones), every
+pass compiles in the engine's own front-end, and the GPU frame matches
+the CPU frame at mean 0.00000 (max 0.04 on isolated shadow-edge
+pixels). Before the fixes the same frame refused planning entirely.
+
+New suite coverage: imageless emit constants and no-sampler rule,
+name-keyed Texture Coordinate dispatch, colorband array form + compile +
+CPU parity, and empty-slot mapping (skip, warning, siblings intact).
+
+---
+
+## [1.35.1] — 2026-08-12
+
+### Debugged against a real file: pointers lead, names follow
+
+The field sent two things: a log where twelve materials named
+`Material.001`..`Material.012` were skipped ("no BI material of this
+name in the classic file"), and then an actual 2.79 .blend. The file
+settled every open question at once.
+
+**The name bug.** The old lookup stripped `.001`-style suffixes
+UNCONDITIONALLY before matching, assuming they were append renames. But
+classic files legitimately contain those names — Blender's own default
+material names, and the uploaded file really holds both `RedWire` and
+`RedWire.001` as *different materials* (and an `Endo 2.001` with no
+`Endo 2` beside it). So the strip skipped default-named materials
+entirely, and silently converted `RedWire.001` with `RedWire`'s
+settings. Matching now tries the EXACT appended name first, then strips
+one suffix at a time (`A.001.002` → `A.001` → `A`) — the twelve skipped
+materials and both look-alikes now convert, and with them the image
+textures they carried.
+
+**The pointer path is now the primary route.** Held as diagnostics-only
+since 1.34.2, it proved itself on the real file: 152 of 152 material
+slots resolved index-precisely (and the packed PNGs inside them parsed
+byte-perfect, magic numbers and all). Slot pointers are immune to
+append renames — only position can tell `RedWire` from `RedWire.001`
+with certainty — so conversion now follows them first, with the
+exact-first name ladder catching whatever the pointer walk missed. The
+x-ray block still prints when conversion had to ride on names alone,
+because one field file somehow parses zero object→material pointers and
+that file is still wanted.
+
+**One load per picture.** A classic image feeding several materials'
+worth of channels used to load once per channel entry (the real file:
+28 entries from 11 distinct pictures). An import-wide cache now loads
+each image exactly once.
+
+**The log says more.** The summary line now reads like
+`converted 19 (19 via slot pointers, 0 by name); 11 texture images
+resolved`, and a name-route match that needed a suffix strip is noted
+per material — silent wrong-matches can no longer hide.
+
+New suite coverage: the name ladder (exact-first, one-strip-at-a-time,
+short numeric tails untouched), look-alike classic names, pointer-led
+planning under renames, name fallback when pointers are absent,
+unmatched reporting, and one-conversion-per-datablock dedup.
+
+---
+
+## [1.35.0] — 2026-08-12
+
+### The crash, the packed images, and the channels 1.34.2 still missed
+
+Three field reports, three fixes.
+
+**The crash after appending.** 1.34.2 was the first build whose
+conversions actually landed — which put BI Texture nodes in front of
+the renderer for the first time, and two things nothing in the headless
+suite could see went wrong at once:
+
+- The CPU evaluator took the whole pixel field in one bite. Voronoi's
+  neighbourhood search is a 27x blow-up of its input; at render
+  resolution inside the bump pre-pass that is gigabytes of temporaries,
+  and a machine that starts swapping mid-render dies looking exactly
+  like a crash. Evaluation is now sliced (~20 MB peak per slice, same
+  numbers to the last float — the suite proves the seam).
+- The GPU twin inlined all three noise tables as 2048 compile-time
+  constants into every material shader — the kind of thing real
+  drivers grind on or fall over. The tables now travel as a DATA
+  texture (`hal_bitex_tab`, bound once per program, read with
+  texelFetch — the engine's proven pattern), packed by the same module
+  the CPU reads so the devices cannot drift. Parity re-proven through
+  the texture path: identical numbers.
+
+**Packed images.** 2.79 projects habitually packed their textures INTO
+the .blend — so there is nothing on disk to load, and modern Blender
+does not bring the images across because nothing it keeps still
+references them. The classic reader now extracts packed image bytes
+from the file itself (Image → PackedFile → the raw bytes); the importer
+writes them to the temp folder, loads them, and packs them straight
+into the CURRENT file, so the import owns its textures. Unpacked paths
+walk a ladder: resolved against the legacy file's folder, as stored,
+bare filename beside the legacy file, bare filename in textures/ beside
+it — and the log lists what was tried when nothing matched.
+
+**The missing influence channels.** Slots mapping to mirror colour,
+ambient or displacement were skipped as "no channel" — on real
+materials that read as missing procedurals. Now: mirror colour →
+Reflection Color (mixed, like the other colour channels), ambient →
+Ambient (scaled), displacement → the bump input (Halcyon has no
+displacement; keeping the detail visible beats dropping it, and the
+log says so). Warp still has no counterpart and still says so plainly.
+
+**Multiple bump slots now ALL arrive.** The one-Bump-Height rule
+dropped every normal-mapped slot after the first; several textures
+perturbing the surface is ordinary BI practice. Each slot now carries
+its own strength as a multiply and the contributions SUM into Bump
+Height — the tree reads exactly like the influence stack it came from.
+
+---
+
+## [1.34.2] — 2026-08-12
+
+### Field log analysed: conversion now matches materials BY NAME
+
+The 1.34.1 import log did its job. On the field file it read:
+`parsed 222 objects, 30 BI materials (23 with texture slots); planned
+222; appended 222; converted 0 — NO material slots matched`. So the
+classic reader parses the file correctly (the materials and their
+texture slots are all there), the appender appends everything, and the
+failure is confined to one link: pairing appended objects' material
+SLOTS with the parsed slot POINTERS. The offset engine itself was
+cross-checked this round against real Blender DNA — all 993 structs
+size-verified — so the pointer pipeline's failure on real files is in
+bookkeeping this side of the parse, and it needs the actual file to
+pin down.
+
+Conversion no longer waits for that:
+
+- **Materials now convert by NAME.** Material names are unique inside
+  a .blend — Blender enforces it — and an append only suffixes .001
+  when the current file already had the name, so stripping the suffix
+  recovers the classic name deterministically. Every distinct material
+  on the appended objects is matched to its parsed BI data by name and
+  converted in place. This path touches none of the slot-pointer
+  bookkeeping, so the field file's 30 materials (23 with texture
+  slots) convert regardless of what broke there.
+- **The slot-pointer path stays on as an X-ray**: the log now counts
+  how many parsed objects carry material pointers, compares
+  pointer-matches against name-matches, and prints a five-object
+  pairing dump (appended slot count vs parsed kind and pointers)
+  whenever they disagree — the exact evidence needed to fix the
+  pointer path for good.
+- Materials on appended objects with no same-named BI material in the
+  classic file are noted and left as appended.
+
+---
+
+## [1.34.1] — 2026-08-12
+
+### Field report: materials arriving unconverted — hardening + a diagnosis kit
+
+A real-file import arrived as bare diffuse-with-a-colour materials: the
+appender did its half, the conversion half silently did nothing. The
+fixtures can't reproduce it yet, so this release does two things: fixes
+the one silent-zero mechanism found by audit, and makes every stage of
+the importer report itself so the failing stage names itself on the next
+run.
+
+- **Cross-datablock pointer hops now resolve through an ID-only map.**
+  Every datablock is alive at save time, so ID old-pointers never
+  collide with each other — but real files DO write some DATA blocks
+  from reused temporaries, and such a block can carry the same old
+  pointer as a datablock written later. The old first-wins global map
+  would then shadow the Tex or Image behind garbage: the texture slot
+  silently dropped, or read as noise. Material→Tex and Tex→Image hops
+  now look in the ID-block map first; the fixture gained a case where a
+  Base DATA block shadows the image texture's TE pointer — the scene's
+  own span still finds its Base AND the material still finds its Tex,
+  which is the whole trust-order working.
+- **The importer reports per-stage counts** — parsed objects, parsed BI
+  materials (and how many carry texture slots), planned, appended,
+  slot-matched, converted — in the status report AND in a text
+  datablock (`<file> import log`, in Blender's text editor), because on
+  Windows the console is hidden and warnings must not be. A zero at any
+  stage now names itself instead of shrugging.
+- **One bad material can no longer kill the run**: each conversion is
+  isolated; a failure prints its traceback, notes itself in the log,
+  and leaves that material as appended while the rest convert.
+- **BI node materials are detected and noted**: a 2.79 material using
+  Blender Internal's own node tree converts from its flat fallback
+  values, with a plain warning (BI node trees are not translated).
+- **A no-Blender diagnosis tool**:
+  `python3 -m halcyon.core.blend279 old_file.blend` prints the whole
+  parse — every object with its selection and slot materials, every
+  material with its shader pair, mode bits and texture slots, every
+  slot's texture kind, image path and colorband. If an import ever
+  looks wrong, this output pinpoints where the reader and the file
+  disagree.
+
+---
+
+## [1.34.0] — 2026-08-12
+
+### The legacy append, rebuilt: Blender's own loader + the original texture engine
+
+1.33.0 read old files itself and rebuilt objects from the parsed data —
+which silently lost everything the parser didn't carry: constraints,
+custom normals, modifiers, vertex groups, parenting, animation, and any
+object type beyond meshes, lamps and cameras. And its material
+conversion translated BI procedurals into *lookalike* Halcyon patterns.
+Both wrongs are gone. The importer is rebuilt around a simple truth:
+Blender's own append machinery already loads old objects perfectly — it
+only drops the Blender Internal data. So each side now does the half it
+is good at.
+
+**Objects arrive through `bpy.data.libraries.load`** — the actual
+appender. Meshes keep their normals and vertex groups; constraints,
+modifiers, parenting and animation come across; every object type
+loads (empties, curves, text, armatures, lattices — all of it), run
+through Blender's own version conversion. Dependencies the appender
+pulls in (a parent outside a selected-only request, a constraint
+target) are linked rather than orphaned. If Blender itself cannot read
+a file (some pre-2.5 relics), the old direct-rebuild path remains as a
+loud fallback that says exactly what cannot survive it.
+
+**The Blender Internal texture engine is now IN Halcyon** — not
+approximated, ported:
+
+- `core/bitex.py` re-implements the 2.79 texture code from verbatim
+  transcriptions of the published source: Clouds, Wood, Marble, Magic,
+  Blend, Stucci, Noise, Musgrave (all five fractals), Voronoi (four
+  feature weights, seven distance metrics, three colour modes) and
+  Distorted Noise, over the original noise bases — Blender Original,
+  Improved Perlin, Voronoi F1/F2/F3/F4/F2-F1/Crackle and Cell Noise —
+  with the original lookup tables. All three tables (the 256-entry
+  permutation, the 256 gradient vectors, the 256 voronoi feature
+  points) were transcribed from Blender's own noise.c and verified by
+  independent double-transcription; the gradient table's unit-norm
+  property checks every triplet, and the permutation is validated
+  outright. Brightness/contrast/saturation and the per-channel RGB
+  factors apply exactly as BRICONT/BRICONTRGB did, colorbands evaluate
+  exactly as do_colorband did (linear, ease, constant, B-spline,
+  cardinal — with the real key-basis weights and the real edge
+  behaviour), and the noisesize pre-scale hits exactly the three types
+  multitex() pre-scaled (Musgrave, Voronoi, Distorted Noise) and no
+  others.
+- **A new node: BI Texture** (`HALCYON_BITextureNode`), the whole
+  engine behind one node. Every classic parameter is a property with a
+  real tooltip; the colorband arrives as an editable stop collection;
+  Offset/Size apply the exact Map Input arithmetic (`size*(co+ofs)`,
+  offset FIRST) in the classic -1..1 texture space, with a Classic
+  Space toggle for feeding modern coordinates. In the Add menu under
+  Halcyon Textures — it is a perfectly good hand tool for chasing the
+  authentic look, not just an import artifact.
+- **The GPU twin is generated from the same tables module the CPU
+  reads** — they cannot drift. Proven in the suite through the engine's
+  own shader compiler: thirteen configurations across every basis and
+  every texture family, max CPU↔GPU deviation 2e-6 (1.9e-5 on crackle's
+  near-ties, 1.6e-6 on marble — the float32 edge cases are documented
+  in the test).
+- **The shader compiler grew real array support** to carry the tables:
+  GLSL array constructors (`float[4](...)`), const global arrays,
+  array-typed function parameters (the declared size was parsed but
+  ignored — fixed), and a single-gather fast path for constant-element
+  array indexing that replaces a 512-way select chain.
+
+**The material conversion now emits the real thing.** Procedural slots
+become BI Texture nodes with the Tex block's fields verbatim — type,
+stype, wave, both noise bases, hard/soft, size, depth, turbulence,
+the Musgrave five, the Voronoi seven, distortion, brightness/contrast/
+saturation/RGB factors, clamp, and the colorband with its
+interpolation. The mtex offset/size ride ON the node (no Mapping node
+needed, no arithmetic reinterpretation). Image slots keep
+ShaderNodeTexImage — with the Mapping arithmetic CORRECTED: BI ran
+`uv*2-1 → +ofs → *size → *0.5+0.5`, which folds to Scale=size,
+Location=(size*ofs−size+1)/2; the 1.33.0 form (Location=ofs) was
+wrong for any offset or size off default.
+
+**Slot resolution is now matbits/colbits-correct.** An object-level
+material only overrides the data's where the file says that slot is
+object-linked (matbits in 2.5x, colbits in 2.4x) — 1.33.0's
+non-null-wins heuristic mis-assigned materials on objects using mixed
+linking. The parser also reads Curve and MetaBall material arrays, so
+materials on curves and text convert too, and lists every object type
+with its saved selection state.
+
+**Parser additions:** the full Tex field set, ColorBand/CBData blocks
+(stops position-sorted, interpolation and colour-mode read),
+`geometry=False` mode for the appender path (materials, slots,
+selection, lamps, cameras, world — no vertex extraction), and the
+`type_code` on every object.
+
+**Known departures, stated plainly:**
+
+- BI's Noise texture rolled new random numbers every render by design;
+  Halcyon's is seeded per pixel and frame — same look, reproducible
+  renders (determinism doctrine).
+- The 'Original Perlin' basis (STDPERLIN) renders as Improved Perlin
+  until its private tables are carried over; the import warns when a
+  file actually uses it (it was never the default, and files using it
+  are rare).
+- HSV/HSL colorband blending approximates in RGB, with a warning.
+
+**Testing:** the fixtures gained a colorband (3 stops, ease), a
+matbits case that DEFEATS the old heuristic (object slots filled in
+both positions, matbits allowing only one), an Empty, a Curve with its
+own material slot, and colbits-era DNA; the suite gained the BI engine
+structural checks, the thirteen-case GPU parity proof, appender
+planning/slot-matching tests (including a .001-rename case), and the
+geometry=False mode. 150+ legacy checks total, all green, plus the
+full render and shader suites.
+
+---
+
+## [1.33.0] — 2026-08-12
+
+### Legacy append: any 2.79-or-earlier .blend, materials included
+
+**File > Import > Legacy .blend (2.79 and earlier).** Modern Blender
+appends the objects from an old file and silently drops everything that
+made a Blender Internal material what it was — the diffuse/specular
+shader pair, hardness, mirror, and all eighteen texture slots with their
+mappings and influences. The fields still sit in the file; the loader
+just stopped reading them. So Halcyon reads them itself.
+
+- **A classic .blend reader, no Blender involved** (`core/blend279.py`).
+  Parses the format directly: 12-byte header, 4- or 8-byte pointers,
+  either endianness, gzip-compressed files (the old Compress option),
+  block headers, and the file's own DNA catalogue — every struct offset
+  is computed from the DNA the file carries, so a 2.49 file with its
+  24-byte ID names and MFace/TFace meshes decodes as correctly as a 2.79
+  one with MPoly/MLoop and 66-byte names. Integer fields read at the
+  width the file declares (`Base.flag` changed width across eras;
+  `Camera.type` is a char in 2.79) rather than the width anyone assumed.
+  Old pointers are only unique per allocation lifetime and real files
+  reuse them, so blocks resolve through pointer maps scoped to the ID
+  block they follow — the same discipline that killed the R115 material
+  mix-up, now applied at the file level. Refuses 2.80+ files with an
+  explanation (a modern file appends normally — it has no Internal
+  materials to save).
+- **What it extracts:** meshes (verts, normals, quads/tris/ngons,
+  per-face material indices, loop UVs, loop colours — MPoly/MLoop era
+  and MFace era both, with MTFace *and* the 2.4x TFace for UVs), object
+  world matrices and layer bits, the saved SELECTION (Scene base list,
+  flag & 1 — "append what I had picked" works decades later), material
+  slot overrides at the object level, lamps, cameras, the world, and
+  every Internal material field the conversion consumes.
+- **The material conversion** (`core/blend279_map.py`, bpy-free and
+  headlessly tested). BI's hardness IS a cosine exponent, which is what
+  Glossiness is — it maps across untouched. The shader pair collapses
+  onto one Halcyon model by letting the distinctive half win: Toon wins
+  outright (diffuse params or specular params, whichever pair BI used);
+  Minnaert and Oren-Nayar hold when the material is matte, but a strong
+  highlight keeps the highlight (the specular model wins, with a note —
+  BI shaded the two terms independently and a Halcyon model is a
+  package; the visible term wins). Fresnel diffuse becomes Lambert plus
+  the Fresnel rim sockets. Shadeless → Constant, Wire → Wireframe.
+  Alpha only becomes Opacity when BI had transparency ON (ZTransp or
+  RayTransp); RayTransp brings its IOR and Refraction Amount along.
+  Ray mirror becomes Reflection with its colour and Fresnel; emit
+  scales the base colour into Self-Illumination; Minnaert darkness,
+  Oren-Nayar roughness and Ward rms each land on the Roughness socket
+  in their own scale.
+- **Texture slots become real node graphs.** A colour influence under
+  1.0 becomes a MixRGB against the base colour in the slot's own blend
+  mode (all sixteen BI blend modes mapped); a value influence becomes a
+  Math multiply; the old negative-influence toggle becomes an Invert
+  node. UV/Orco/Object/Global coordinates come through a shared Texture
+  Coordinate node, and a slot's ofs/size become a Mapping node applied
+  exactly as BI applied them. Normal influence lands on the master
+  shader's own Bump Height input with norfac as Bump Strength.
+- **Procedurals translate to the engine's own textures**, sized by the
+  1/noisesize rule (BI sized features, Halcyon sets frequency — the
+  defaults land on each other exactly): Clouds → Fractal Noise (hard
+  noise → the Turbulent profile — both are folded noise), Marble →
+  Marble (stype's soft/sharp/sharper as the Sharpness ladder), Wood →
+  Wood, Blend → Gradient (Shaped) (QUAD is the ramp squared and EASE is
+  a smoothstep, which are exactly the node's Sharp and Smooth easings;
+  Diag is the linear ramp at 45°; Sphere/Halo → Spherical/Quadratic),
+  Voronoi → Cells, Magic → the stock Magic node, Musgrave → Ridged
+  fractal noise, and BI's Noise — true per-pixel static reseeded every
+  frame — becomes the TV Static node, which is the same idea twenty-five
+  years later. Stucci and Distorted Noise are approximated with a note;
+  EnvMap slots are skipped with one (Reflection does that job now).
+  Image slots load their files ('//' resolved against the LEGACY file's
+  folder, missing files warned about, the node imported without them).
+- **Lamps arrive on Halcyon's own decay model:** BI's inverse-linear
+  falloff translated onto INVERSE decay with the energy matched at half
+  the lamp's falloff distance (a 2.79 default lamp lands near 100 W,
+  which is where Blender's own defaults live). Spot size and blend come
+  across — in RADIANS, converting from degrees for pre-2.70 files,
+  because 2.70 changed the unit and a converter that forgets this makes
+  every old spotlight a floodlight. Hemi becomes Sun, loudly. Cameras
+  keep lens, sensor width, clip range and ortho flag.
+- **The old world can come along** (off by default — it edits the scene
+  rather than adding to it): horizon/zenith as a Halcyon GRADIENT sky
+  (Blend off = solid horizon, as BI drew it), ambient colour, and mist
+  as linear fog over the same range.
+- Everything lands in a new collection named after the file, selected,
+  with per-material notes printed to the console and a one-line summary
+  in the status bar.
+- `templates.build_spec()` extracted from the template builder and
+  extended (coordinate plumbing, MixRGB influence, Math multiply,
+  Invert) — templates and the legacy importer now build trees through
+  one code path.
+
+**Testing** (the suite runs without Blender, as always):
+
+- A fixture writer (`tests/legacy_fixture.py`) that emits REAL
+  classic-encoded .blend files — genuine block headers and a genuine
+  DNA1 catalogue (SDNA/NAME/TYPE/TLEN/STRC), with authentic 2.79 struct
+  and field names — plus a deliberately hostile detail: two DATA blocks
+  in different ID spans sharing ONE old pointer, which a flat-map reader
+  decodes as garbage without noticing. Two eras are written (2.79
+  MPoly/MLoop and 2.4x MFace/TFace with name[24] IDs and the short
+  factor set), in 4- and 8-byte pointer flavours, both endiannesses,
+  and gzip.
+- 100+ checks: geometry/UV/colour/material-index exactness, selection
+  flags, matrix translation, slot overrides, the sparse mtex array, the
+  pointer collision, era-absent fields returning None (not garbage),
+  the degree/radian spot conversion both sides of 2.70, every shader
+  pair, every procedural translation, channel routing (mix factors,
+  varfac fallback, negative influence, multi-influence slots, the
+  one-Bump-Height rule), and the built node trees themselves — nodes,
+  links, socket values — verified against a fake tree fed from the real
+  master-shader socket table.
+- Fixture-caught bug, recorded so it stays caught: struct sizes were
+  being looked up with the struct-list index instead of the type index
+  (`tlens[sidx[...]]`), which happened to agree for early structs and
+  shredded everything after them. The fixture's first parse caught it;
+  `slen()` now owns that lookup.
+
+---
+
 ## [1.32.0] — 2026-08-10
 
 ### The feature round: eighteen asks, easiest to hardest

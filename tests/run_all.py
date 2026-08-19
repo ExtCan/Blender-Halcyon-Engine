@@ -14,7 +14,7 @@ import numpy as np
 
 
 def run_tests():
-    from . import test_render, test_shaders
+    from . import test_legacy, test_render, test_shaders
     rc = 0
     print('=' * 66)
     print('SHADER COMPILER')
@@ -25,6 +25,11 @@ def run_tests():
     print('RENDERER')
     print('=' * 66)
     rc |= test_render.main()
+    print()
+    print('=' * 66)
+    print('LEGACY IMPORT')
+    print('=' * 66)
+    rc |= test_legacy.main()
     return rc
 
 

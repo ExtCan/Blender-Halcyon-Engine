@@ -10,6 +10,7 @@ import bpy
 from bpy.props import BoolProperty, EnumProperty, StringProperty
 from bpy.types import Operator
 
+from . import compat
 from .core.convert import MASTER_NODE, plan
 
 OUTPUT_NODES = ('ShaderNodeOutputMaterial',)
@@ -293,7 +294,10 @@ def _pristine_default(mat):
     for, and rewriting anything a person has edited is vandalism.
     """
     try:
-        if not mat.use_nodes or mat.node_tree is None:
+        # compat.uses_nodes: the same read without the 6.0 deprecation
+        # warning -- this line alone printed it 25 times per legacy
+        # import in the field console
+        if not compat.uses_nodes(mat) or mat.node_tree is None:
             return False
         if getattr(mat, 'library', None) is not None or \
                 getattr(mat, 'override_library', None) is not None:
