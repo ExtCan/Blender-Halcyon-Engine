@@ -1749,6 +1749,296 @@ def n_normal_map(ev, node):
     return {'Normal': out.astype(np.float32)}
 
 
+def _wang32(u):
+    """Wang's 32-bit integer hash, exactly as the GLSL twin computes it.
+
+    Runs in uint32 with wrapping multiplies on both sides, so the CPU
+    and the driver produce the SAME float for the same object id.
+    """
+    u = np.asarray(u, np.uint32)
+    with np.errstate(over='ignore'):
+        u = (u ^ np.uint32(61)) ^ (u >> np.uint32(16))
+        u = u * np.uint32(9)
+        u = u ^ (u >> np.uint32(4))
+        u = u * np.uint32(0x27d4eb2d)
+        u = u ^ (u >> np.uint32(15))
+    return u
+
+
+def _wang01(u):
+    return (( _wang32(u) & np.uint32(0xFFFFFF)).astype(np.float32)
+            / np.float32(16777216.0))
+
+
+def n_halcyon_normal_map(ev, node):
+    """The multi-flavour normal map: tangent/object/world, OpenGL/DirectX."""
+    c = ev.ctx
+    col = ev.input(node, 'Color', RGBA)
+    strength = ev.input(node, 'Strength', VALUE)[:, None]
+    n = M.normalize(c.N)
+    rgb = np.array(col[:, :3], np.float32, copy=True)
+    if _prop(node, 'map_type', 'OPENGL') == 'DIRECTX':
+        # DirectX maps store green pointing DOWN; flipping the channel
+        # before decode is the whole difference between the two formats
+        rgb[:, 1] = 1.0 - rgb[:, 1]
+    tn = rgb * 2.0 - 1.0
+    space = _prop(node, 'space', 'TANGENT')
+    if space in ('OBJECT', 'WORLD'):
+        out = M.normalize(tn)
+    else:
+        t = c.T if c.T is not None else M.orthonormal_basis(n)[0]
+        t = M.normalize(t)
+        b = np.cross(n, t)
+        out = M.normalize(t * tn[:, 0:1] + b * tn[:, 1:2] + n * tn[:, 2:3])
+    out = M.normalize(n + (out - n) * strength)
+    return {'Normal': out.astype(np.float32)}
+
+
+def n_halcyon_normal_mix(ev, node):
+    """Two normals into one: Detail (reoriented), Add (UDN) or Mix."""
+    c = ev.ctx
+    n0 = M.normalize(c.N)
+    a = M.normalize(ev.input(node, 'Base', VECTOR)) \
+        if ev.has_link(node, 'Base') else n0
+    b = M.normalize(ev.input(node, 'Detail', VECTOR)) \
+        if ev.has_link(node, 'Detail') else n0
+    f = np.clip(ev.input(node, 'Factor', VALUE), 0.0, 1.0)[:, None]
+    mode = _prop(node, 'mode', 'DETAIL')
+    if mode == 'MIX':
+        out = a + (b - a) * f
+    elif mode == 'ADD':
+        # UDN in world clothes: the detail's tilt away from the surface,
+        # added to the base
+        out = a + (b - n0) * f
+    else:
+        # DETAIL: rotate b by the rotation carrying the surface normal
+        # onto the base normal (Rodrigues), so the detail map rides the
+        # base map instead of fighting it
+        axis = np.cross(n0, a)
+        s = np.linalg.norm(axis, axis=1, keepdims=True)
+        cth = np.sum(n0 * a, axis=1, keepdims=True)
+        safe = s > 1e-6
+        ax = np.where(safe, axis / np.maximum(s, 1e-12), 0.0)
+        # Rodrigues: v cos + (k x v) sin + k (k.v)(1 - cos)
+        kxb = np.cross(ax, b)
+        kdb = np.sum(ax * b, axis=1, keepdims=True)
+        rb = b * cth + kxb * s + ax * kdb * (1.0 - cth)
+        rb = np.where(safe, rb, np.where(cth >= 0.0, b, -b))
+        out = a + (M.normalize(rb) - a) * f
+    return {'Normal': M.normalize(out).astype(np.float32)}
+
+
+def n_halcyon_altitude_slope(ev, node):
+    """Bryce's terrain trio: world height, steepness, compass facing.
+
+    R202: the optional Noise input wobbles Altitude, Factor and Slope
+    with spatial value noise -- the ragged snowline. At 0 (and on
+    every node saved before the input existed) the three outputs are
+    bit for bit the old ones.
+    """
+    c = ev.ctx
+    mn = ev.input(node, 'Minimum', VALUE)
+    mx = ev.input(node, 'Maximum', VALUE)
+    alt = c.P[:, 2].astype(np.float32)
+    span = np.where(np.abs(mx - mn) < 1e-9, 1e-9, mx - mn)
+    fac = np.clip((alt - mn) / span, 0.0, 1.0)
+    n = M.normalize(c.N)
+    slope = (1.0 - np.abs(n[:, 2])).astype(np.float32)
+    orient = (np.arctan2(n[:, 1], n[:, 0]) / (2.0 * np.pi) + 0.5) \
+        .astype(np.float32)
+    amt = np.maximum(ev.input(node, 'Noise', VALUE), 0.0)
+    if np.any(amt > 0.0):
+        from . import patterns as PT
+        nsc = np.maximum(ev.input(node, 'Noise Scale', VALUE), 1e-4)
+        wob = ((PT.value_noise((c.P * nsc[:, None]).astype(np.float32))
+                - 0.5) * amt).astype(np.float32)
+        alt = (alt + wob * span).astype(np.float32)
+        fac = np.clip(fac + wob, 0.0, 1.0)
+        slope = np.clip(slope + wob, 0.0, 1.0).astype(np.float32)
+    return {'Altitude': alt, 'Factor': fac.astype(np.float32),
+            'Slope': slope, 'Orientation': orient}
+
+
+def n_halcyon_facing(ev, node):
+    """Facing ratio, incidence and a Schlick Fresnel, as bare masks."""
+    c = ev.ctx
+    power = np.maximum(ev.input(node, 'Power', VALUE), 0.01)
+    ior = np.maximum(ev.input(node, 'IOR', VALUE), 1.0001)
+    ndv = np.clip(np.abs(M.dot(M.normalize(c.N), -M.normalize(c.I))),
+                  0.0, 1.0)
+    facing = np.power(1.0 - ndv, power).astype(np.float32)
+    f0 = ((ior - 1.0) / (ior + 1.0)) ** 2
+    fres = (f0 + (1.0 - f0) * np.power(1.0 - ndv, 5.0)).astype(np.float32)
+    return {'Facing': facing, 'Incidence': ndv.astype(np.float32),
+            'Fresnel': fres}
+
+
+def _irid_hue6(h):
+    """The branchless hue wheel: h in [0,1) -> (n,3) rgb.
+
+    The exact formula the GLSL twin uses (clamp(|mod(h*6+k,6)-3|-1)),
+    so the two devices walk the same rainbow."""
+    k = np.array([0.0, 4.0, 2.0], np.float32)
+    return np.clip(np.abs(np.mod(h[:, None] * 6.0 + k[None, :], 6.0)
+                          - 3.0) - 1.0, 0.0, 1.0).astype(np.float32)
+
+
+#: thin-film wavelength ratios: 700nm red as 1, green 700/546,
+#: blue 700/435 -- the fringes order themselves like a real film's
+_IRID_WAVE = (1.0, 1.282051282051282, 1.6091954022988506)
+
+
+def n_halcyon_iridescent(ev, node):
+    """R202: view-angle iridescence, four types, both devices.
+
+    Everything runs off t = 1 - |N.V| (0 facing the camera, 1 at the
+    rim), the same incidence the Facing node measures."""
+    c = ev.ctx
+    mode = _prop(node, 'mode', 'SPECTRUM')
+    shift = ev.input(node, 'Shift', VALUE)
+    scale = ev.input(node, 'Scale', VALUE)
+    sat = np.clip(ev.input(node, 'Saturation', VALUE), 0.0, 1.0)
+    ndv = np.clip(np.abs(M.dot(M.normalize(c.N), -M.normalize(c.I))),
+                  0.0, 1.0)
+    t = (1.0 - ndv).astype(np.float32)
+    if mode == 'PEARL':
+        tint = ev.input(node, 'Tint', RGBA)[:, :3]
+        p = np.power(t, 1.0 / np.maximum(scale, 0.05))[:, None] \
+            .astype(np.float32)
+        kiss = (_irid_hue6(np.mod(shift + t * 0.5, 1.0)) - 0.5)
+        rgb = (1.0 + (tint - 1.0) * p) \
+            * (1.0 + 0.3 * sat[:, None] * kiss * p)
+        rgb = np.clip(rgb, 0.0, None)
+    else:
+        phase = (shift + t * scale).astype(np.float32)
+        if mode == 'OIL':
+            from . import patterns as PT
+            nsc = np.maximum(ev.input(node, 'Noise Scale', VALUE), 1e-4)
+            phase = phase + (PT.value_noise(
+                (c.P * nsc[:, None]).astype(np.float32)) - 0.5) * 2.0
+        if mode in ('THIN_FILM', 'OIL'):
+            w = np.array(_IRID_WAVE, np.float32)
+            rgb = 0.5 + 0.5 * np.cos(2.0 * np.pi * 1.5
+                                     * phase[:, None] * w[None, :])
+        else:                                   # SPECTRUM
+            rgb = _irid_hue6(np.mod(phase, 1.0))
+        grey = rgb.mean(axis=1, keepdims=True)
+        rgb = grey + (rgb - grey) * sat[:, None]
+    a = np.ones((ev.n, 1), np.float32)
+    return {'Color': np.concatenate([rgb.astype(np.float32), a], axis=1),
+            'Factor': t}
+
+
+def n_halcyon_switch(ev, node):
+    sw = ev.input(node, 'Switch', VALUE)
+    a = ev.input(node, 'A', RGBA)
+    b = ev.input(node, 'B', RGBA)
+    return {'Color': np.where((sw > 0.5)[:, None], b, a).astype(np.float32)}
+
+
+def n_halcyon_random_per_object(ev, node):
+    """One stable random per object -- the id hashed, never re-rolled."""
+    c = ev.ctx
+    seed = ev.input(node, 'Seed', VALUE)
+    # floor(x + 0.5), NOT rint: the GLSL twin rounds this way, and
+    # banker's rounding on a .5 seed would diverge the two devices
+    idx = np.floor(np.asarray(c.object_index, np.float64) + 0.5) \
+        .astype(np.int64)
+    sd = np.floor(np.asarray(seed, np.float64) + 0.5).astype(np.int64)
+    u = ((idx + sd * 7919) & 0xFFFFFFFF).astype(np.uint32)
+    val = _wang01(u)
+    r = _wang01(u ^ np.uint32(1757225451))
+    g = _wang01(u ^ np.uint32(48610963))
+    b = _wang01(u ^ np.uint32(2524743835))
+    col = np.stack([r, g, b, np.ones_like(val)], axis=1)
+    return {'Value': val, 'Color': col.astype(np.float32)}
+
+
+def n_halcyon_levels(ev, node):
+    col = ev.input(node, 'Color', RGBA)
+    black = ev.input(node, 'Black', VALUE)[:, None]
+    white = ev.input(node, 'White', VALUE)[:, None]
+    gamma = np.maximum(ev.input(node, 'Gamma', VALUE), 1e-3)[:, None]
+    omin = ev.input(node, 'Out Min', VALUE)[:, None]
+    omax = ev.input(node, 'Out Max', VALUE)[:, None]
+    span = np.where(np.abs(white - black) < 1e-6, 1e-6, white - black)
+    t = np.clip((col[:, :3] - black) / span, 0.0, 1.0)
+    t = np.power(t, 1.0 / gamma)
+    rgb = omin + (omax - omin) * t
+    return {'Color': np.concatenate([rgb, col[:, 3:]], 1).astype(np.float32)}
+
+
+def n_halcyon_smooth_step(ev, node):
+    v = ev.input(node, 'Value', VALUE)
+    a = ev.input(node, 'From Min', VALUE)
+    b = ev.input(node, 'From Max', VALUE)
+    span = np.where(np.abs(b - a) < 1e-9, 1e-9, b - a)
+    t = np.clip((v - a) / span, 0.0, 1.0)
+    interp = _prop(node, 'interp', 'SMOOTH')
+    if interp == 'SMOOTHER':
+        t = t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+    elif interp == 'SMOOTH':
+        t = t * t * (3.0 - 2.0 * t)
+    return {'Value': t.astype(np.float32)}
+
+
+_SHUFFLE_PICK = {'R': 0, 'G': 1, 'B': 2, 'A': 3}
+
+
+def n_halcyon_channel_shuffle(ev, node):
+    col = ev.input(node, 'Color', RGBA)
+    out = np.empty_like(col)
+    for i, key in enumerate(('out_r', 'out_g', 'out_b', 'out_a')):
+        pick = str(_prop(node, key, 'RGBA'[i]))
+        if pick == 'ZERO':
+            out[:, i] = 0.0
+        elif pick == 'ONE':
+            out[:, i] = 1.0
+        else:
+            out[:, i] = col[:, _SHUFFLE_PICK.get(pick, i)]
+    return {'Color': out.astype(np.float32)}
+
+
+def n_halcyon_distance_mask(ev, node):
+    c = ev.ctx
+    start = ev.input(node, 'Start', VALUE)
+    end = ev.input(node, 'End', VALUE)
+    d = np.linalg.norm(c.P - np.asarray(c.camera_pos, np.float32)[None, :],
+                       axis=1).astype(np.float32)
+    span = np.where(np.abs(end - start) < 1e-9, 1e-9, end - start)
+    fac = np.clip((d - start) / span, 0.0, 1.0).astype(np.float32)
+    return {'Factor': fac, 'Distance': d}
+
+
+def n_halcyon_step_time(ev, node):
+    c = ev.ctx
+    step = np.maximum(ev.input(node, 'Step Frames', VALUE), 1.0)
+    frame = np.full(c.n, float(c.frame), np.float32)
+    held = np.floor(frame / step) * step
+    phase = (frame - held) / step
+    return {'Frame': held.astype(np.float32),
+            'Phase': phase.astype(np.float32)}
+
+
+def n_halcyon_wave(ev, node):
+    v = ev.input(node, 'Value', VALUE)
+    freq = ev.input(node, 'Frequency', VALUE)
+    ph = ev.input(node, 'Phase', VALUE)
+    mn = ev.input(node, 'Minimum', VALUE)
+    mx = ev.input(node, 'Maximum', VALUE)
+    t = v * freq + ph
+    wave = _prop(node, 'wave', 'SINE')
+    if wave == 'SQUARE':
+        w = ((t - np.floor(t)) < 0.5).astype(np.float32)
+    elif wave == 'TRIANGLE':
+        w = 1.0 - np.abs(2.0 * (t - np.floor(t)) - 1.0)
+    elif wave == 'SAW':
+        w = t - np.floor(t)
+    else:
+        w = 0.5 + 0.5 * np.sin(t * (2.0 * np.pi))
+    return {'Value': (mn + (mx - mn) * w).astype(np.float32)}
+
+
 def n_displacement(ev, node):
     h = ev.input(node, 'Height', VALUE)
     scale = ev.input(node, 'Scale', VALUE)
@@ -2219,6 +2509,12 @@ def _opt(ev, node, name, kind, default):
     return np.full(n, float(default), np.float32)
 
 
+#: blend-menu identifiers -> the integer codes the shading code decodes.
+#: 0 is always the pre-1.38 behaviour: Add for fresnel/rim, Mix for matcap
+_LAYER_BLEND_CODE = {'ADD': 0.0, 'MIX': 1.0, 'MULTIPLY': 2.0, 'SCREEN': 3.0}
+_MATCAP_BLEND_CODE = {'MIX': 0.0, 'ADD': 1.0, 'MULTIPLY': 2.0, 'SCREEN': 3.0}
+
+
 def n_halcyon_shader(ev, node):
     p = node.get('props', {})
     model = p.get('model', 'PHONG')
@@ -2280,6 +2576,15 @@ def n_halcyon_shader(ev, node):
         # into. It still has to reach the surface, which for four releases it
         # did not: the shading code read the default 2 whatever the node said.
         toon_steps=float(p.get('toon_steps', 2) or 2),
+        # the silhouette cheats' blend menus: node properties like Toon
+        # Steps (a mode has no business being a socket), packed as the
+        # small integers apply_surface_effects and the GPU pass decode
+        fresnel_blend=float(_LAYER_BLEND_CODE.get(
+            str(p.get('fresnel_blend', 'ADD')), 0.0)),
+        rim_blend=float(_LAYER_BLEND_CODE.get(
+            str(p.get('rim_blend', 'ADD')), 0.0)),
+        matcap_mode=float(_MATCAP_BLEND_CODE.get(
+            str(p.get('matcap_mode', 'MIX')), 0.0)),
         normal=ev.input(node, 'Normal', VECTOR) if ev.has_link(node, 'Normal') else None,
         model=model,
     )
@@ -3289,6 +3594,14 @@ def n_pat_noise(ev, node):
     return _pat_out(ev, node, f)
 
 
+def n_pat_caustics(ev, node):
+    p = _pat_vec(ev, node)
+    t = ev.ctx.time if _prop(node, 'animate', True) else 0.0
+    speed = float(ev.input(node, 'Speed', VALUE).mean())
+    f = PT.caustic_web(p[:, 0], p[:, 1], time=float(t) * speed, period=8)
+    return _pat_out(ev, node, f)
+
+
 def n_pat_water(ev, node):
     p = _pat_vec(ev, node)
     t = ev.ctx.time if _prop(node, 'animate', True) else 0.0
@@ -3749,10 +4062,25 @@ DISPATCH = {
     'HALCYON_BrickNode': n_pat_brick,
     'HALCYON_NoiseNode': n_pat_noise,
     'HALCYON_WaterNode': n_pat_water,
+    'HALCYON_CausticsNode': n_pat_caustics,
     'HALCYON_GradientNode': n_pat_gradient_shaped,
     'HALCYON_CellsNode': n_pat_cells_tex,
     'HALCYON_StaticNode': n_pat_static,
     'HALCYON_MatcapUVNode': n_halcyon_matcap_uv,
     'HALCYON_RampNode': n_halcyon_ramp,
     'HALCYON_BlurNode': n_halcyon_blur,
+    # the 1.38 workflow nodes
+    'HALCYON_NormalMapNode': n_halcyon_normal_map,
+    'HALCYON_NormalMixNode': n_halcyon_normal_mix,
+    'HALCYON_AltitudeSlopeNode': n_halcyon_altitude_slope,
+    'HALCYON_FacingNode': n_halcyon_facing,
+    'HALCYON_IridescentNode': n_halcyon_iridescent,
+    'HALCYON_SwitchNode': n_halcyon_switch,
+    'HALCYON_RandomPerObjectNode': n_halcyon_random_per_object,
+    'HALCYON_LevelsNode': n_halcyon_levels,
+    'HALCYON_SmoothStepNode': n_halcyon_smooth_step,
+    'HALCYON_ChannelShuffleNode': n_halcyon_channel_shuffle,
+    'HALCYON_DistanceMaskNode': n_halcyon_distance_mask,
+    'HALCYON_StepTimeNode': n_halcyon_step_time,
+    'HALCYON_WaveNode': n_halcyon_wave,
 }

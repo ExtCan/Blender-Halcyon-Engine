@@ -4,6 +4,1356 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
 
 ---
 
+## [1.52.0] — 2026-08-24
+
+### The public release
+
+This version is the public cut: no engine changes over 1.51.0 — the
+documentation now tells the truth about the engine as it stands. The
+README, the extension listing and the roadmap had fallen several eras
+behind (the listing still warned there was *no GPU support*; the GPU
+port has been complete and matrix-proven since 1.30.0). All three are
+rewritten against live counts pulled from the code, not from memory.
+
+**Release highlights since the last documented milestone**, for anyone
+arriving from an old version — each with its full story in the entries
+below:
+
+- **The Bryce 1995 material library, decoded** (1.48–1.49): the
+  MetaTools `.mat` container format cracked end to end — preview
+  thumbnails, material channel records, texture colour tables — and 46
+  presets rebuilt on the shelf from their stored bytes, refractive
+  indices and all. The Pre-Made menu in the shader editor serves them
+  in ten families beside the engine's own 28.
+- **The infinite floors joined the scene** (1.49): grounds take real
+  lighting — sun angle, lamp falloff, cast shadows from geometry —
+  with a Scene Lighting dial whose zero restores the old flat look bit
+  for bit; every visible tone got its own dial; a picked material can
+  paint the plane to the horizon.
+- **Weather** (1.45): rain, snow, embers and ash as a deterministic
+  screen-space particle field over any finished frame.
+- **Terrain** (1.46–1.47): Add ▸ Halcyon ▸ Terrain generates seven
+  landforms — mountain, hills, canyon, dunes with a wind direction,
+  crater, volcano, plateau — ready-wired to Altitude & Slope.
+- **The image-as-palette road** (1.47): force any render through the
+  colours of a picked image, and turn any image into a one-pixel-per-
+  colour palette table from the image editor.
+- **The Iridescent node** (1.47), the Altitude & Slope noise socket,
+  the master shader's sockets regrouped the way hands expect, and 20
+  new Bryce-shaped ocean presets in the water library.
+- **Renderer honesty fixes** (1.49–1.51): sub-half-opacity surfaces no
+  longer vanish in blended transparency; a camera under a scaled
+  import rig no longer poisons fog, clip and depth-of-field distances
+  (the picture composed identically, the *metrics* lied — the console
+  now names both conditions); and the ColorRamp/curve family runs in
+  GLSL, so a terrain graded through a ColorRamp stays on the GPU.
+
+The four version stamps, the 410-entry package manifest and the full
+suite (3,327 checks) stand behind this cut exactly as they stand behind
+every other.
+
+---
+
+## [1.51.0] — 2026-08-24
+
+### The ColorRamp joins the GPU — no more whole-frame CPU fallbacks over one node
+
+**Field report: "GPU shading could not run this frame; it shaded on the
+CPU — 'Mountain': no GLSL emitter for ShaderNodeValToRGB."** A terrain
+graded through a ColorRamp — the most natural Altitude & Slope
+companion there is — knocked every frame back to the CPU, because the
+ramp had no GLSL twin. It has one now, and so does its whole family:
+**ShaderNodeValToRGB** (the ColorRamp, Color and Alpha outputs both),
+**ShaderNodeFloatCurve**, and **ShaderNodeRGBCurve** (combined curve
+then per-channel, exactly the CPU's order).
+
+These are all baked-LUT nodes: the export already samples every ramp
+and curve into a 256-entry table — every interpolation mode, ease
+curve and HSV path included — and the CPU interpolates that table. The
+GLSL twins inline the *same* table as a constant array and reproduce
+the CPU's sampling index for index, so parity is table-exact by
+construction: the deferred frame and the CPU frame agree to a few
+millionths across all three nodes, verified against the Altitude &
+Slope graph the field report came from.
+
+---
+
+## [1.50.0] — 2026-08-24
+
+### The fog was right; the camera was lying about distance
+
+**Field report: "The fog is not right" — an imported .3DS pagoda scene
+rendered as a flat sheet of fog colour on F12 while the viewport looked
+exactly as intended.** The fog arithmetic was never wrong. The camera
+was. It sat under the import's `$$$DUMMY`/`Fbx__Root` rig, whose
+parents carry unit scale, so the camera's world matrix had a scaled
+basis — and inverting that matrix put the scale into every
+camera-space depth. The *picture* composes identically (the projection
+divides the scale back out, which is what made this invisible), but
+every **metric** consumer read multiplied distances: fog start/end,
+the clip planes, z-buffer precision, depth of field. With the subject
+reading several times farther than it is, everything sat past Fog End
+and the frame rendered as pure fog colour. The viewport disagreed
+because Blender's camera-view matrix is rigid — its own renderers
+ignore camera object scale entirely.
+
+**Halcyon now does what Blender does: camera object scale is stripped
+at the source.** The export normalises the camera basis (translation
+kept, handedness kept — a mirrored camera stays mirrored), and
+`camera_matrices` guards the same way for cameras built in code, so
+panorama strips, stereo eyes, fog, clip and DoF all read true world
+distances. A camera that is already rigid passes through **bitwise
+untouched** — every existing scene renders bit for bit. When scale is
+stripped, the console says so once, with the measured factor.
+
+**And the console now names this failure before you have to.** When
+fog is on and ≥90% of the covered frame sits at or past Fog End, the
+render prints the numbers — how much of the frame is pure fog colour,
+where the nearest surface actually is — and points at the two causes
+(a scaled camera, or Start/End tuned for different distances), instead
+of leaving a beige rectangle to be diagnosed by eye.
+
+---
+
+## [1.49.0] — 2026-08-24
+
+### The 1995 materials, decoded to the byte — and the floors join the scene
+
+**The Bryce library is no longer a recreation. It is a decode.** The
+field's verdict on 1.48's preview-derived materials — "very
+disappointing… nothing like they do in Bryce… 1 to 1, not 'eh close
+enough'" — was right, and the answer was to stop estimating and crack
+the material records themselves. `core/brycemat.py` now decodes the
+976-byte C3dBaseMaterial record in every preset: five channel colours
+(diffuse, ambient, specular, the per-channel specular *coefficients*,
+transparent), six channel levels (diffuse, ambient, specular,
+transparency, reflection, bump), the metallic flag, and the refractive
+index. The layout was pinned by diffing the teaching presets against
+their own 1995 manual text: Specularity Lesson #1's "coefficients of
+12, 12, and 12" is byte-exact at offset 468, Warm Gold's "the object
+itself is red, but the ambient orange" names two colour slots outright,
+and the Light→Heavy Glass ladder walks the index through
+1.12/1.20/1.42/1.52/1.68 — with Water at 1.33 and Diamond at 2.55, as
+saved. Texture records (3dTxt_TxtData) decode too: palette colours,
+frequency triples, octave counts, amplitude/offset, and the Classic
+Checkerboard's 45° diamond spin sitting in plain double precision.
+`Extra Metal.mat` turned out to be a 68k Mac save — every float
+big-endian — and the parser now detects byte order per record, which is
+how *nice copper* finally reads as copper.
+
+**All 46 shelf presets rebuilt from the decoded values.** Diffuse
+colours are the stored bytes, not sampled pixels; speculars carry the
+coefficient tint (Lesson #2's red-shifted highlight renders red);
+glasses refract at their true 1995 indices; Kryptonite is the
+ReptilianStone texture it always was — anisotropic crackle scales in
+the exact purple/deep-green/mint palette from its own colour table,
+with the stored bump of 0.31. The 1995 previews still serve, but only
+as the *arbiter*: they choose which texture component paints and which
+palette colours dominate; the values themselves come from the records.
+Preset notes now quote the original library descriptions.
+
+**Sub-half-opacity surfaces vanished — fixed.** Found because the
+decoded Standard Glass refused to appear: the hard alpha test
+(`alpha_threshold`) applied in *every* transparency mode at a default
+of 0.5, so any fragment under half opacity was dropped outright rather
+than blended — thin glass, ghosts and light smoke simply never drew in
+Sorted and A-Buffer frames. It now defaults to 0 (blended transparency
+blends); raise it deliberately for classic cut-out alpha — foliage
+cards, chain-link — which is what the dial was always for. Frames that
+relied on the old accidental cutoff will change: their sub-0.5-alpha
+surfaces come back.
+
+### The infinite floors answer the scene
+
+**"The infinite floors don't react to lighting either." Now they do.**
+The analytic ground plane takes real scene lighting: every lamp's
+contribution against the plane's normal — Lambert for sun, point and
+spot with their classic falloffs, the wrap term for hemis, the Stokes
+form factor for area lamps — with **cast shadows from scene geometry**,
+ray-traced or shadow-mapped, whichever each lamp already uses. An
+object resting on the floor finally grounds itself with a shadow. The
+new **Scene Lighting** dial blends from the old self-lit flat look (0 —
+those pixels bit for bit) to fully lit (1, the new default). The
+self-luminous parts are protected: lava heat, neon grout past glow 1,
+and EMISSION closures on a Material ground ride outside the blend, so a
+shadow across a lava field never dims the molten glow. A scene with no
+lamps at all keeps the old picture exactly — there is nothing to react
+to. Soft-shadow jitter on the plane takes its sampling identity from
+the quantised world position, so the same frame is the same picture
+whatever the batch order or device. Because the default is *lit*,
+existing scenes with lamps will see their floors change — that is the
+point — and Scene Lighting 0 restores the old look bitwise. OCEAN keeps
+its own sun-and-sky model and is untouched.
+
+**"If they have multiple colors, you can't change them." Fixed with
+dials.** SNOW's sun glints wear a colour (**Glint Colour**) and a
+strength (**Sparkle**) — they were hardcoded white at a fixed 0.8.
+LAVA's drifting embers earned their own **Ember Colour** separate from
+the crack glow. DESERT's dune-crest strength (**Ridge Strength**) was
+baked at 0.6; it is a slider now. Every default reproduces the old
+picture bit for bit, with one disclosed exception: lava ember cores are
+clipped separately from the crack glow now, so where both saturated
+together an ember can burn slightly brighter than the old summed clip.
+
+### Also
+
+- The material-ball comparison stage used for the library sheets now
+  reproduces the 1995 preview stage itself — deep blue dome, thin
+  chartreuse horizon band, neutral grey floor — with the colours
+  sampled off a decoded preview's own background pixels, and the floor
+  lit by the new ground lighting exactly as Bryce lit its own.
+
+---
+
+## [1.48.0] — 2026-08-24
+
+### The Bryce library, properly parsed — and the Pre-Made shelf grows up
+
+**The Iridescent node works now.** Field find, and an embarrassing
+one: the node's Type enum was never registered in the exporter's
+node-property table, so every mode rendered as Rainbow Sweep — which
+also deadened Tint (Pearl's dial) and Noise Scale (Oil's). Fixed, and
+closed as a CLASS: a new audit test holds every node's properties to
+an entry in that table or a declared reason, so no future node can
+ship with dead dials.
+
+**The Bryce3D 1995 .mat files, cracked.** The supplied preset
+collection (34 category files, 610 presets) parses for real now:
+the CCmF container's record directory, the class registry, the
+preset names and descriptions, and — the treasure — every material's
+96×96 PREVIEW RENDER, decoded from MetaTools' 'rle2' codec
+(byte RLE over four delta-coded colour planes; confirmed by decoding
+Polished Silver to its chrome sphere reflecting the preview stage's
+sky). The parser ships as core/brycemat.py. Said plainly: the binary
+channel scalars hide behind a reference graph that only partially
+decodes, so the recreations are built from each material's own 1995
+preview pixels (measured for colour, gloss, reflectivity,
+transparency) plus its original description — the material's true
+look, from the material's own render.
+
+**Forty-six 1995 presets recreated**, named exactly as MetaTools
+shipped them: Polished/Brushed Gold and Silver, Bumpy and Pitted
+Gold, Mirror, Metallic Chrome, Nice Copper, Rustic Iron; Light
+through Heavy Glass, Crystal, Diamond, Smoked/Rose/Green/Aqua Glass;
+Sandstone, Pitted Granite, Wet Rock, the classic Marbles, Riverbed,
+Kryptonite; Light/Bleached/Walnut/Polished Walnut/Warped Wood;
+Caribbean Resort and Deep Blue as object waters; Mercury Surface,
+Bryce Cola, Glowing Water; Summer Clouds, Wispy Afternoon, Smoke
+Stack, Night Clouds; Arizona, Grassy Peaks, First Snow, Grand
+Canyon, Volcano Heart.
+
+**The Pre-Made shelf, rebuilt to the field's spec.** It lives INSIDE
+the Halcyon menu now (Shader Editor > Add > Halcyon > Pre-Made),
+organized into family submenus — Metal, Mineral, Glass, Water,
+Liquid, Wood, Cloud & Fog, Terrain, Surfaces, Effects. And clicking
+an entry behaves like an Add menu should: NO dialog, and the node
+cluster drops in BESIDE what is already there — nothing cleared,
+nothing re-linked, the new nodes arrive selected and offset clear of
+the existing ones, and the material output is taken only if it was
+sitting empty. The template shelf stands at 74.
+
+**The engine's own recipes, un-amateured.** Thirteen upgraded with
+the master shader's full optics: chrome with a cold mirror stack and
+real fresnel colour, gold whose reflection stays gold, glass with the
+true refraction chain, velvet on the sheen kit it always deserved,
+rubber and clay with micro-relief bump textures, candy and car paint
+under deep clearcoats, marble/wood/brushed metal with polished-depth
+values.
+
+**The infinite ground, reworked.** Field finds, all three: the panel
+NEVER SHOWED most modes' controls (why Tiles and Lava "couldn't be
+edited") — every mode's dials draw now. **Tiles** gained Grout Width,
+Grout Glow and Tile Variance (defaults are the old floor, bit for
+bit) — and thin glowing grout IS the synthwave floor, so the
+redundant **Neon Grid mode is retired** (old exports still render,
+as exactly that thin-glow tiling; re-pick Tiles in old files).
+**Lava** was rebuilt outright: plates of darkened crust split by
+ridged fissures, heat bleeding smoothly from every crack, ember
+freckles, and Crack Width / Glow / Pulse dials where there were none.
+And a new **Material** ground type: pick any material and its node
+graph paints the plane to the horizon, evaluated at the ground's own
+world points.
+
+---
+
+## [1.47.0] — 2026-08-24
+
+### Ten asks, one round: terrains, palettes, iridescence, and the real Waters & Liquids
+
+**Six new terrain types.** The Terrain operator grew a Type menu:
+**Mountain** (the 1.46 fractal, bit for bit), **Rolling Hills**,
+**Canyon** (a high mesa with winding channels carved out of it),
+**Dunes** (directional sand waves with a wind Direction dial),
+**Crater** (raised rim, sunken floor), **Volcano** (the cone with its
+caldera bitten out), and **Plateau** (hard-shouldered table-land).
+Island falloff, terracing and sea level compose with every one, and
+every one is deterministic per seed.
+
+**An image as the render's palette.** Palette mode **Custom** now does
+what its tooltip always promised: pick a **Palette Image** and the
+whole frame is forced through that image's colours — at ANY colour
+depth, with every dither mode riding along. Extraction is
+deterministic (distinct colours at 8-bit precision, luma-sorted,
+median-cut down to Palette Size if the image carries more).
+
+**Make Palette Table.** Image editor > Image > Make Palette Table
+turns any picture into a one-colour-per-pixel table image — max
+colours, sort order (dark-to-light, around the wheel, most-used
+first), and grid columns are yours. Feed the table straight to the
+Palette Image slot and the render lives inside it.
+
+**Altitude & Slope grows Noise.** Two new inputs (Noise, Noise Scale)
+wobble Altitude, Factor and Slope with spatial value noise — ragged
+snowlines and rock bands instead of hard contour lines. 0 is bitwise
+the old node, saved files gain the inputs on load, and the GPU twin
+matches the CPU to the usual tolerance.
+
+**The master shader regroups.** Reflection Colour and Refraction
+Amount now sit directly beside Reflection; Bump Strength and Bump
+Height directly under Normal (the bump IS a normal edit). And the
+Fresnel / Rim / Matcap blend menus moved from the top of the node to
+DIRECTLY BELOW their own amount sliders — each amount is now a
+blend-carrying socket that draws its menu underneath while the effect
+is live. Saved files migrate at load (links and values preserved,
+per-socket and best-effort; a socket that can't swap keeps the old
+top-of-node menu, so nothing is ever lost).
+
+**New: the Iridescent node.** Four types: **Rainbow Sweep** (the hue
+wheel across the facing angle — 90s logo chrome), **Thin Film**
+(soap-bubble interference at real wavelength ratios), **Pearl**
+(white face rolling to a Tint at the rim), and **Oil Slick** (thin
+film swirled by surface noise). Shift, Scale, Saturation, Tint and
+Noise Scale dials; a Factor output carrying the rim mask; identical
+on CPU and GPU.
+
+**The real Waters & Liquids.** The field supplied the actual Bryce 2
+library file (MetaTools CCmF, December 1995), and its full roster was
+mined out of it: all thirty presets — Deep Blue, Mercury Surface,
+Dull Mirror, Nighttime Lake, Oasis, New Age Whale Picture, Placido
+Domingo, Mr. Bubble, Still and Deep, Xanades Lake, Swirling Water,
+Rose Water, Waves of Reflection, Shiny and Still, Bright Bubble,
+Foamy Seawater, Iceberg, Pollution Waterfall, Glowing Water, That
+Thing From Abyss, Narcissus Pool, Backyard Pool, Santraginus V,
+Bryce Cola, Deep Sea, Atlantic, Nice Water, Turbulence — joining the
+Black Lagoon and Caribbean Resort already on the shelf. Names exactly
+as 1995 shipped them, in the library's own order, each translated to
+Halcyon's ocean dials from its original description (quoted in every
+note). The water shelf stands at 48.
+
+**Pre-Made, in the Shader Editor.** Material templates moved out of
+the Material panel to where a person building a material actually
+stands: **Shader Editor > Add > Pre-Made**, split into **Bryce** (the
+material-lab recipes — terrains, waters, stones, woods, metals) and
+**Halcyon** (the engine's own surface set). A note in the old panel
+points the way.
+
+---
+
+## [1.46.0] — 2026-08-24
+
+### The quality-of-life round: a mountain, a clock, and two missing looks
+
+**New: Add > Halcyon > Terrain.** The fractal heightfield the Altitude
+& Slope node was always waiting for. A quad-lattice mountain with the
+Bryce Terrain Editor's dials: Size, Divisions, Height, Feature Scale,
+Detail and Roughness (fBm octaves and gain), **Ridged** (blend from
+rolling hills to the knife-edged crests Bryce is remembered for),
+**Island Falloff** (the mountain ends inside the grid instead of
+slicing off at the edge), **Terraces** (quantised shelves with
+smoothed risers), **Sea Level** (a flat water table for the ocean
+plane to meet), Seed, and Smooth Shading. The same seed builds the
+same mountain on every machine — hash-lattice noise, no RNG state
+anywhere. It arrives wearing the Bryce terrain material, wired for
+you: Altitude & Slope's Factor drives a four-stop colour ramp (shore
+grass, dry scrub, bare rock, snowcap) and its Slope pulls steep faces
+to stone through a Mix — every node standard and editable, and the
+whole chain shades identically on the CPU and the GPU simulator.
+Pair it with the Bryce sky and the new Bryce still preset.
+
+**Animation ETA.** Every frame of an animation render now prints its
+time and the estimated completion: `animation frame 12/250 in 8.3s --
+~33m 04s to go, done around 15:42` (and the finished tally on the
+last frame; the same line lands in Blender's status display). The
+estimate knows the caches make later frames faster: the first frame
+pays for shadow maps, BVHs and compiled shaders that the rest reuse,
+so the estimator takes the lower median of the last five frames — the
+warm-up is forgotten as soon as ONE steady frame exists, and a lone
+hiccup mid-run never becomes the prediction. Frame steps count real
+frames, not scene numbers.
+
+**Two looks the shelf was missing.** The audit found PlayStation, N64
+and Saturn already on the shelf; these join them: **SGI broadcast CGI
+(1994)** — the Saturday-morning television pipeline: big-iron SGI
+frames at D1 NTSC with non-square pixels, 9x supersampling, plastic
+Phong characters, hard map shadows, broadcast-legal colour and a
+light interlace blend — and **Bryce still (overnight render)** — the
+postcard you queued at midnight and collected at breakfast: 800x600,
+9x Catmull-Rom AA, soft ray shadows at 16 samples, a breath of
+exponential haze, gentle bloom, colour turned up a notch.
+
+**Under the hood.** `terrain()` lives in the bpy-free core
+(core/geometry.py) and is pinned headlessly: lattice manifoldness,
+determinism, every dial, and the material chain rendered through the
+engine's own node road with the Altitude factor proven live. The ETA
+estimator and formatter are pure functions with their cache-awareness
+under test. Both new presets validate and render with the rest of the
+shelf (75 looks now).
+
+---
+
+## [1.45.0] — 2026-08-23
+
+### Weather, and every halo colour finds its own voice
+
+**New: Weather, in World Properties.** A particle overlay that falls
+IN FRONT of the whole picture — geometry, halos and sky alike — and
+never replaces the sky it weathers. Four kinds: **Rain** (streaked
+drops added as light — pick a green colour for acid rain), **Snow**
+(soft flakes composited over the frame), **Embers** (glowing motes —
+set Angle to 180° so they rise, and try Glow and Flicker), and **Ash**
+(grey fallout drift). Highly customizable: Density, Size, Speed,
+Angle (0° falls straight down, 180° rises, anything between sweeps
+the diagonal), Drift (per-particle sideways wobble on hashed phases),
+Colour, Opacity, up to four parallax Layers (nearest largest, fastest,
+brightest), Streak length for rain, Glow, Flicker, and a Seed that
+re-deals every path. Everything is a pure function of (seed, layer,
+particle, time): the same frame is the same storm on every render,
+across devices, refine passes and supersample factors. Sizes, speeds
+and streaks are resolution-true against the 480-line reference, and
+the particle count follows the OUTPUT size, so density reads the same
+at every resolution. Sky-only scenes weather through the same early
+path that once ate the halos and the flares; the panorama draws its
+weather once, across the finished stitch, never per strip; the worker
+pool steps aside exactly as it does for halos. `NONE` is
+bitwise-neutral — every existing scene renders untouched. One
+disclosed bound: a splat's kernel window caps at 8 px, so a 4K
+blizzard stays inside the performance envelope (a 1080p four-layer
+storm costs ~0.1 s).
+
+**Halo rays and bolts wear their own colours.** New Ray Colour and
+Bolt Colour dials. Until you SET one, that element follows the Line
+Colour exactly as it always did — unset dials ship nothing, so every
+existing scene keeps its look bit for bit (scenes mixing lines with
+rays or bolts can shift by float-rounding only, under one part in a
+million, from the split colour adds; alpha still reads the summed
+coverage, so translucency is unchanged).
+
+**Master HSV shift for every coloured option.** Hue Shift, Saturation
+Shift and Value Shift re-tint the WHOLE halo family together — body,
+gradient end, colour ramp, image, rings, lines, rays and bolts (the
+scalar colours through colorsys, the image and ramp through the same
+matrix twin). Keyframe Hue Shift and the halo cycles the wheel. The
+defaults (0 / 1 / 1) are exactly neutral, and an explicit Saturation
+Shift of 0 really greys — no `or`-default swallows it. The Random
+Hue/Sat/Val jitter now scatters every coloured option too, trim
+included, so a confetti halo's rings and lines follow their body —
+the one deliberate change to existing pictures, and only where
+Random HSV was already dialed in on a halo wearing coloured trim.
+
+**Every animated halo effect owns a Speed.** Pulse Speed, Flicker
+Speed, Noise Speed, Bolt Speed and Gradient Noise Speed each scale
+the master Anim Speed for their effect alone (Spin already IS its own
+rate). All default 1.0 — bit-for-bit the single-clock pictures — and
+0 truly FREEZES an effect. Flicker Speed rescales the frame counter:
+1 re-rolls every frame (the classic sparkle), 0.5 every other frame,
+0 holds one roll forever. Fixed on the way through: Anim Speed 0 used
+to snap silently back to 1 (`or`-default); it now genuinely freezes
+the clock, which is what a zero on a speed dial says.
+
+**Under the hood.** `weather_overlay` lives in the bpy-free core
+(core/sky.py) with deterministic Wang-hash particles and a deferred
+single-bincount splat resolver; new World fields auto-export through
+the generic field loop; the test suite pins every new dial, the
+bitwise-neutral defaults (with rays and bolts live), the
+follow-the-line-colour fallbacks, the freeze-at-zero clocks, and the
+whole weather kit including the sky-only road and NONE's neutrality.
+
+---
+
+## [1.44.0] — 2026-08-23
+
+### The ramp live-updates, and the gradient family grows
+
+**The live-update fix (field find).** Editing the halo colour ramp
+changed nothing until something else poked the scene. The ramp
+widget lives on a node UNLINKED from any output -- deliberately, so
+shading never sees it -- and Blender therefore tags only the node
+tree when you edit it, never the material. The viewport's own dirt
+gate (the one that keeps UI churn from re-exporting the scene) did
+not count a bare node-tree update as renderable, so the poke
+classified as nothing and the parked frame stood. Node-tree edits
+re-export now: drag a ramp stop and the halos follow live. (This
+also covers any future widget that rides a hidden node.)
+
+**Five gradient sweeps, all with adjustable noise.** The gradient --
+two-colour or colour ramp alike -- now sweeps: **Centre Out**
+(radial, the classic), **Angular** (the conic wheel),
+**Horizontal**, **Vertical**, and **Diagonal**. The linear sweeps
+live in the halo's own frame, so Rotation turns them and Spin
+animates them. And a **Gradient Noise** dial wobbles the sweep
+coordinate with animated value noise -- turbulent colour bands,
+marbled fire, boiling rainbows -- sharing Noise Scale and Anim
+Speed with the energy kit; the angular sweep wraps its wobble so
+the wheel stays seamless. Everything is deterministic in
+(seed, time) and an exact no-op at the defaults: the old radial and
+angular pictures are bit-for-bit untouched.
+
+Suite: every sweep pinned distinct, noise pinned wobbling and
+animating on all of them, the old sweeps pinned bitwise, and the
+viewport dirt classifier now has its own test -- a bare
+ShaderNodeTree update must re-export, pure UI churn must not.
+
+---
+
+## [1.43.0] — 2026-08-23
+
+### The halo energy kit: images, noise, bolts, rays, shockwaves,
+### colour ramps -- and halos on curves
+
+**An image IS the halo now.** Set Shape to Image and pick a picture:
+its alpha carves the silhouette, its colours are the glow -- the
+HaloTex idea 2.79 had, native and per-vertex. HSV scatter still
+applies (a matrix twin recolours the whole sprite per halo), and
+lines, rings, bolts and rays draw on top.
+
+**The energy blast.** A Noise dial carves and boosts the core with
+animated value noise -- a boiling plasma ball at Noise 1, a living
+flicker at 0.3 -- composing with every shape and the image. Noise
+Scale sets how fine it boils; Anim Speed drives it.
+
+**Electric bolts.** A Bolts count grows jagged arcs radiating from
+the centre: each one wiggles as it travels outward and RE-STRIKES
+eight times per animation second, a pure function of (seed, bolt,
+time) -- same frame, same lightning, forever. Bolt Width rides the
+same resolution-true units as Line Width. Bolts glow through hollow
+centres, so Ring + Bolts is the classic electric halo.
+
+**Even Rays and Even Rings.** Rays draws EVENLY spaced needle spikes
+-- the symmetric starburst the hashed Lines can't make -- with a
+sharpness dial, riding the line colour and turning with Rotation and
+Spin. Even Rings spaces the rings evenly out from the centre:
+shockwaves, instead of 2.79's hashed radii (still the default).
+
+**Three more shapes.** Square, a solid five-point Star, and the
+Heart. Twelve shapes now, all through the hardness ladder and the
+whole effects stack.
+
+**Colour ramps and gradient types.** The gradient can now follow a
+real colour ramp -- one click adds Blender's own ramp widget to the
+halo material (it lives on a hidden node the shading never sees, and
+exports as a small LUT) -- and both the ramp and the two-colour
+gradient sweep either RADIALLY (centre to rim) or ANGULARLY (a full
+conic turn: the rainbow wheel). HSV scatter recolours the whole
+ramp per halo, keeping each halo one palette.
+
+**Halos on curves, confirmed and pinned.** A curve wearing a halo
+material glows at every evaluated point -- a bare curve (no bevel)
+is the clean point-string; the collector reads vertices and needs no
+faces, and the suite now pins that contract directly.
+
+Everything new is an exact no-op at its defaults: every existing
+halo picture is bit-for-bit untouched. (One fix from the build: the
+image sampler read the un-broadcast axes and drew a stripe; caught
+on the contact sheet, fixed, and the suite renders an image halo
+now.)
+
+---
+
+## [1.42.0] — 2026-08-23
+
+### Halo lines hold their width at any resolution, and the shape
+### shelf doubles
+
+**The width fix (field find).** The line and ring windows were RAW
+PIXELS -- 2.79's own convention -- so a 1080p render drew
+proportionally thinner hairlines than a 480p one, and a supersampled
+frame thinner still: the same material looked different at every
+output size. The windows now scale with frame height against the
+era's own 480-line reference. The same scene keeps the same look at
+any resolution and under any supersample; a 480-line render is
+bit-for-bit the old picture, and Line Width / Ring Width dials mean
+the same thing everywhere. (Tiny previews floor at half the classic
+width so they never lose their lines.)
+
+**Four more shapes.** Triangle, Pentagon and Octagon (one
+regular-polygon metric, vertices on the halo circle) and Cross (a
+plus-sign glow, bright along both axes, tapering at the rim) join
+Disc, Ring, Hexagon and Diamond. Every shape still runs the
+hardness ladder, rings, lines, star, gradient and the animation
+kit.
+
+**Aspect and Rotation.** Aspect stretches the halo -- every shape,
+the lines and the star together -- from tall slivers to wide
+anamorphic streaks (Aspect 4 with a few Lines is the classic lens
+streak). Rotation turns the whole anisotropic kit statically; Spin
+still animates on top with its per-halo phase. Both are exact
+no-ops at their defaults: every existing halo picture is untouched
+bit for bit.
+
+Suite: every new dial pinned, the defaults pinned bitwise, and a
+new test renders the same halo at 240 and 480 lines and holds the
+line coverage fraction equal across them.
+
+---
+
+## [1.41.2] — 2026-08-23
+
+### The sky-only scene can flare now
+
+The field did the natural thing: a fresh scene with nothing but a
+sky, a sun and a camera, to see the lens flare on its own. That
+scene has no triangles -- and the renderer's early sky path (the
+same one that hid halo-only scenes until 1.41.0) returned before
+the flare sources were ever computed. A geometry-less frame could
+not flare, or cast light shafts, no matter how the sun was aimed.
+
+The early path now computes both -- flare anchors and shaft sources
+-- against an all-far depth buffer, which is the honest answer for
+a frame that is all sky: every visibility tap is open. The suite
+pins the sky-only sun registering at full intensity and the kit
+drawing on the bare background.
+
+With this, the three ways a flare could silently not-exist are all
+closed: the viewport post not receiving sources (1.41.1), the
+anchor being out of frame with nothing saying so (1.41.1's live
+panel answer), and the empty test scene never computing sources at
+all (here). Aim the sun so its sky spot is in shot -- the lamp
+panel tells you when it is -- and the flare draws, mesh or no mesh,
+F12 or viewport.
+
+---
+
+## [1.41.1] — 2026-08-23
+
+### The lens flare you can actually find
+
+The field set the Lens Flare dial, looked at the rendered viewport,
+and saw nothing -- twice over, for two separate reasons, both fixed.
+
+**The rendered viewport never drew them.** The viewport runs its own
+post call, and that call never passed the flare sources the render
+had already computed -- so the F12 frame flared and the viewport
+stayed bare, which is exactly where everyone looks first. The
+viewport's post now receives the sources: dial up a flare, see it
+live.
+
+**The panel now answers the real question.** A flare draws at its
+LAMP's place in the frame -- and a Sun's place is its spot in the
+sky, which sits inside a surprisingly narrow window (a 42mm lens
+sees about 12 degrees above the view axis). The flare block now
+computes it live against the render camera and says one of three
+things: the anchor is IN the frame, OUTSIDE it (aim the camera at
+the lamp -- for a Sun, tilt it so it shines toward the camera), or
+BEHIND the camera. No more guessing from a tooltip.
+
+The recipe, for the record: point lamps flare when the lamp itself
+is in shot and unobstructed; a Sun flares when its sky spot is in
+shot AND lands on open sky (geometry in front of the sun hides it
+-- that fade is the feature). The suite now pins a sky-anchored
+Sun registering its flare, the viewport post handing sources over,
+and the panel's live answer.
+
+---
+
+## [1.41.0] — 2026-08-23
+
+### The halo expansion, a flare that explains itself, and resolution
+### presets where you look for them
+
+Field-driven, all three.
+
+**The halo kit grows.** Everything in 1.40.0's halo materials stays
+bitwise-identical at the defaults; around it:
+
+- **Shape** — Disc (the classic), Ring (a hollow ring, using 2.79's
+  own flare-circle formula verbatim), Hexagon (the lens-iris look),
+  Diamond (a four-pointed sparkle). Every shape still runs the
+  hardness ladder, rings, lines and star.
+- **Line Width and Ring Width** — thickness dials for the streaks
+  and circles; 1.0 is the classic hairline and the old picture.
+- **Gradient** — halo colour at the centre, Edge Colour at the rim.
+- **Random Hue / Saturation / Value** — per-halo colour scatter
+  hashed off the seed: confetti clouds from one material, exactly
+  repeatable, each halo keeping one hue family across its gradient.
+- **Animation** — Pulse breathes each halo's size on its own hashed
+  phase (a cloud shimmers instead of throbbing in sync; Anim Speed
+  sets the rate), Flicker jitters brightness per frame per halo (the
+  90s sparkle), Spin turns the lines, star and shaped cores over
+  scene time. All of it is a pure function of (seed, time, frame):
+  identical across runs, devices and batch order.
+
+**The lens flare now explains itself.** The dial's panel says the
+thing the field asked: the flare draws where THIS LAMP is visible in
+frame -- put the lamp (or the sun's spot in the sky) in shot, and it
+fades exactly as the lamp slips behind geometry. Nothing changed in
+the maths; the knowledge moved into the UI.
+
+**Resolution presets, in Output Properties.** The period-resolution
+menu moved from the render panel to the Output tab, next to
+Blender's own Format fields -- where everyone looks for resolution.
+Two new categories join the six: **Panoramas & 360** (QTVR Cylinder
+Classic, 4:1 cylinder panoramas at 2K/4K/8K for the Panoramic
+camera, and 2:1 environment footprints at 1K through 8K) and
+**Modern & General** (QHD, 4K UHD, Cinema Flat and Scope, square and
+9:16 social sizes, A4 print at 150 and 300 dpi). The Output panel
+also reads back the current size and reminds you to pair a
+Panoramic camera with a panorama preset.
+
+**Fixed in the same round (field find):** halos only appeared when
+some OTHER mesh was in the scene. A scene of nothing but halo
+objects -- the classic sparkle setup, a vertex cloud and a camera --
+has no triangles at all, and the renderer's early sky path returned
+before the halo splat ever ran. Halos now draw over the bare
+background, mesh or no mesh, with an all-far depth buffer as the
+honest z-test.
+
+Suite: the halo test now pins every new dial AND pins the whole kit
+at its defaults bitwise against the 1.40 pictures; a new test pins
+the geometry-less halo frame; the preset test holds the grown tables
+to each other (the renderable-dimension cap rose to 8192 for the 8K
+panoramas).
+
+---
+
+## [1.40.1] — 2026-08-23
+
+### The rendered-view crash: fixed at the root, fenced at the driver,
+### and made impossible to reintroduce
+
+The field's faulthandler log told the whole story. On entering
+rendered view with 1.40.0, every material pass was rejected by the
+driver -- `CreateInfo failed: Shader Compile Error` -- the viewport
+fell to 95%-black frames, and after a storm of failed shader creates
+Blender died in native code.
+
+**The root.** The new area-lamp form factor reads the lamp's
+Distance and direction from the per-light value texture (so dragging
+them never recompiles -- the R169 rule). Its GLSL function is
+emitted in the shadow-function block of the assembled shader, but
+the value texture's reader, `hal_ltex`, is DEFINED later in the
+file. GLSL requires declaration before use in file order. The real
+compiler enforced that; Halcyon's own GLSL simulator -- which
+resolves names after parsing -- never did, so all 2,916 headless
+checks passed while every real-driver compile of an area-lamp scene
+failed. Any scene with an area lamp hit it, in every material pass.
+The fix is one line of GLSL: a `hal_ltex` prototype ahead of the
+form-factor functions. (Emission is also now gated exactly like the
+light loop, so a shadeless pass never carries a function whose texel
+reads could trouble a strict linker.)
+
+**The fence.** A source the driver refuses is now REMEMBERED (keyed
+like the compile cache) and refuses from memory on every later ask
+-- the crash sequence was the very same bad source re-handed to the
+driver several times a second until the GPU module gave out. A
+scene edit changes the source, changes the key, and earns a fresh
+try; a device reset clears the memo entirely.
+
+**The guarantee.** The suite now runs the driver's declaration-order
+rule itself: a linter walks the exact assembled fragment sources for
+the shapes that emit every function family (area lamps under ray and
+map shadows, cookie/caustic lamps, plain) and fails on any call that
+precedes its declaration. Verified with teeth: with the fix removed,
+the linter reports precisely the field's failure -- `hal_ltex called
+before its declaration` -- on precisely the area-lamp shapes, and
+nothing else. This whole class of simulator-blind, driver-only
+compile error is now a headless test failure.
+
+No pictures change in this release: the CPU road never had the bug,
+and the GPU road now compiles the same source the simulator proved.
+
+---
+
+## [1.40.0] — 2026-08-23
+
+### The period round: flares, caustics, stereo, panoramas, true area
+### lamps, halo materials and lightmap baking
+
+Seven features the mid-90s toolbox had and Halcyon did not. All of
+them are here now, and the ones 2.79 owned are transcribed from its
+source, not approximated.
+
+**Per-lamp lens flares.** Every lamp grows a Lens Flare dial (any
+type). The kit is the Video Post / LightWave anatomy in linear light:
+hot core with a tight spike, chromatic halo rings, a star of streaks
+(count and scale yours to set), and soft hexagonal aperture ghosts
+marching through frame centre. The flare anchors on the LAMP -- a
+Sun at its vanishing point, visible only through sky -- and fades by
+its source's actual visibility, sampled against the frame's own
+z-buffer, so it dies exactly as the lamp slips behind geometry. This
+is the thing the image-space post flare (still there, unchanged)
+cannot do: that one chases any bright pixel; this one belongs to its
+light. Deterministic, drawn after shafts and glow, and the worker
+pool steps aside for it by name.
+
+**Caustics.** The animated pool-light web -- the writhing bright cell
+edges every 90s pool floor, water cave and nightclub logo was lit
+with. Turn the Caustics dial on a Spot (projects it through the cone)
+or a Sun (tiles it seamlessly across the whole world -- the pattern
+is periodic by construction). Scale and Speed dials; animated by the
+frame; baked per frame into a procedural cookie that rides the
+ordinary projected-texture road, so the CPU and GPU agree by
+construction (measured parity 1.8e-5). A real cookie image on the
+lamp still wins. And the same web is a texture node -- Caustics, in
+the Halcyon Patterns shelf -- with its own GPU twin (parity 1.4e-5:
+the hunt found one wrong XOR literal five decimal digits deep).
+
+**Stereo pairs.** Render Settings > Stereo 3D: Anaglyph (red/cyan),
+Side-by-Side, and Cross-eyed. Two parallel eyes separated by Eye
+Distance along the camera's own right axis, each with the off-axis
+frustum shift that puts the Convergence distance at zero parallax --
+translate-and-shift, the period method, no vertical parallax and no
+keystone. The shift rides the same clip-space fold the accumulation
+jitter uses, so every AA mode composes with it. Eye Distance zero is
+the mono frame BITWISE. Aux passes keep the left (reference) eye.
+
+**The panorama camera.** Set the camera type to Panoramic and the
+frame becomes a full 360-degree QTVR-style cylinder: sixteen rotated
+strips sharing ONE eye (speculars and fresnel stay continuous across
+the joins), each resampled onto the drum with the exact planar-to-
+cylindrical mapping. Strip seams measure BELOW the frame's ordinary
+neighbour-pixel difference -- the stitch is invisible -- and column
+zero meets the last column exactly: it closes. Wide aspect plus a
+short lens is the classic recipe (the vertical field is the lens's
+own). Panorama outranks stereo -- QTVR was mono -- and the screen-
+space extras that assume one planar view (shafts, flares, DoF, the
+aux passes) are cleared rather than stitched wrong.
+
+**Area lamps illuminate like 2.79's, exactly.** The named deferral
+from 1.39.0, paid in full. An area lamp's light now comes from
+Blender Internal's own `area_lamp_energy` -- the Stokes contour
+integral over the rectangle's four corners, in doubles, exactly the
+C (we compiled 2.79's function and pinned ours against it to four
+decimals). Size, orientation, tilt and the lamp's Distance all speak
+through it: `inp = pow(stokes * dist^2/area, gamma)`. The form
+factor REPLACES the diffuse cosine and MULTIPLIES the specular,
+per shade_one_light; Lambert, Oren-Nayar and Minnaert take it as
+the C passed it (Oren-Nayar through its own nl/realnl split -- the
+angles keep the true dot), while Toon and Fresnel never saw it in
+2.79 and still don't. lamp_get_visibility gives area lamps visifac
+1.0 -- no falloff switch -- so the decay menu is gone from the area
+lamp panel, replaced by what 2.79 actually had: Distance (the
+normalisation) and Gamma (the pow). Backside dark, single-sided,
+translucency lit by the flipped-normal contour. The GPU twin runs
+the same contour with a float32-stable angle form (worst measured
+frame deviation 9.5e-5), the lamp's Distance and direction ride the
+value texture (drags never recompile), and imported 2.79 area lamps
+now read la->dist and la->k into exactly these dials.
+
+**Halo materials.** The other material type. Tick Halo on a material
+and the mesh's VERTICES render as depth-tested billboard glows --
+loose vertices very much included, because a cloud of points wearing
+a halo material was THE way to do sparks, fairy dust, star fields
+and warp trails. The whole 2.79 kit, transcribed from
+shadeHaloFloat: the hardness ladder (below 20 squares the falloff;
+30/40/50 each soften a step), Rings and Lines walking the same
+hashvectf table at the same seed arithmetic (seed1 + running vertex
+index, mod 256), the Star pinch, Extreme Alpha's squared alpha, Soft
+intersection fading by visible depth, and the Add slider blending
+from alpha-over to pure addition via addalphaAddfacFloat's own
+formula. Shaded halos take the lamp sum at their centre. Halos sort
+far-to-near and composite before transparency, exactly BI's tile
+order -- glass in front of a glow covers it. Particle systems and
+point clouds wearing a halo material contribute their points too
+(API-guarded: if this Blender build has no legacy particles, nothing
+breaks). Imported 2.79 halo materials map the whole panel --
+material_type through the overloaded mode bits, ring colour from
+Mirror, line colour from Specular. Named honestly: halo textures and
+per-halo flares are not imported (warnings say so; the per-lamp
+flare kit covers flares), and mist does not touch halos because the
+engine shades no surface mist either.
+
+**Lightmap baking.** Material tab > Bake: bake Combined Lighting or
+Ambient Occlusion into the active object's UV layout, at 128 to
+2048, with margin dilation so bilinear lookups never bleed the void.
+The UV islands go through the engine's own rasteriser (same seams,
+same coverage rules as the frame), and every covered texel is shaded
+by the ordinary CPU core -- same lamps, same shadow maps and rays,
+same material graphs, same deterministic per-texel sampling -- with
+the view pinned along the surface normal, exactly what 2.79's Full
+Render bake did, so no camera's speculars get frozen into a wall.
+The result lands as a new image datablock, ready to save or wire
+into a Shadeless material.
+
+### Also in this round
+
+- The stereo/panorama/flare/halo frames all skip the worker pool BY
+  NAME (each prints why: they need the whole frame's buffers).
+- Adaptive AA refine passes save and restore the flare sources with
+  the other aux state; refine masks restrict halo splats, so refine
+  passes keep paying only for their pixels.
+- Oren-Nayar under ordinary lamps is bit-for-bit unchanged by the
+  realnl split (the two arguments are the same number there).
+- Fixed in passing: an imported lamp's Lin/Quad sliders and Sphere
+  bit briefly applied only to area lamps during this round's
+  development; the suite's appender-parity test caught it before
+  ship.
+
+Suite: all sections, plus eight new tests pinning every feature
+above (the area pin is 2.79's own C, compiled and run). Determinism:
+every new picture is bitwise-stable across runs, and stereo at eye
+distance zero, panorama-with-stereo-set, gamma-on-toon and halo-free
+frames are bitwise-identical to their old pictures.
+
+---
+
+## [1.39.0] — 2026-08-23
+
+### Light sizes work, Hemi is proven, and every positional lamp can
+### cast a real beam
+
+Four field reports, four answers.
+
+**"Changing light sizes doesn't actually work."** Correct, and for
+three separate reasons. A SUN's size is an ANGLE (Blender's
+`light.angle`) — the soft-shadow sampler treated it as a world-space
+disc on a ray a billion units long, an angular change of one part in
+ten billion: nothing. An AREA lamp's size is its rectangle — the
+sampler read `shadow_soft_size`, which area lamps do not carry: zero,
+nothing. And under SHADOW MAPS (the default), no size reached the
+blur at all — only ray shadows ever read one. Now: a SUN tilts its
+shadow rays inside its own angular cone; an AREA lamp samples real
+points on its rectangle or ellipse, so penumbras follow the lamp's
+true shape, size and orientation; and every sized lamp blurs its
+shadow map through a size-derived texel radius stamped on the map at
+build time — with the lamp's size in the map cache key, because the
+per-light cache was serving stale blurs. Size zero remains
+bit-identical to every old picture, the samplers are deterministic
+(pixel-hash streams), and the GPU twins reproduce every new sampler
+ray for ray — pinned at 4e-6 in the suite. One honest deferral, named:
+AREA lamps still ILLUMINATE from their centre (BI's rectangle form
+factor is its own round); their size now drives shadows and the beam.
+
+**"I'm not entirely sure Hemi works properly."** It does, and now the
+suite proves it rather than asserts it: directional (position ignored
+entirely), the 0.5+0.5·N·L wrap lighting the far side, the wrapped
+half-vector specular, no shadows whatever the lamp's shadow mode says,
+and the GPU branch shading the same picture.
+
+**"The spotlight volume cone isn't layered properly and doesn't stop
+at meshes."** Both true. The beam pass ran BEFORE shading, and the
+shading loop's per-pixel assignment overwrote every beam pixel that
+crossed a surface — beams only ever survived against the sky. It also
+clipped the beam against raw NDC depth (a number near 0.98) as if it
+were metres, cutting every beam a hair from the camera wherever
+geometry stood. The beam now composites over the FINISHED frame, cut
+by the exact per-pixel distance reconstructed through the inverse
+view-projection at the z-buffer's own precision. And the new **Beam
+Occlusion** toggle (per lamp, off by default — it costs a shadow ray
+per march sample) traces each sample back to the lamp through the
+BVH, so a mesh between the lamp and the air carves its shadow through
+the visible beam: the beam STOPS.
+
+**"All lights aside from Sun and Hemi should have volumetric
+support."** They do now. POINT lamps cast a bounded spherical glow
+(analytic ray–sphere segment, the same midpoint march, a smooth fade
+so the sphere's edge never draws itself); AREA lamps cast a
+soft-edged slab beam swept from their rectangle or ellipse, falling
+off along its length. Both honour Custom Range as their reach, both
+layer against depth, both take Beam Occlusion, and both live behind
+the same Volumetric slider — which stays available on a SUN too,
+where it drives the screen-space light shafts it always drove.
+
+### Tests
+
+Sizes: sun-angle/area-rect/point-map response with size-zero pinned
+bitwise, shape sensitivity (disk vs square), determinism, and GPU
+sample parity for every new sampler. Hemi: the five properties above
+plus GPU parity. Volumes: beams layer over covered pixels, only ever
+add, deterministic; occlusion carves and never brightens; POINT and
+AREA volumes draw and stay finite; a SUN adds no in-air beam; the
+composite site, BVH gate and panel toggle pinned in source.
+
+---
+
+## [1.38.2] — 2026-08-21
+
+### Refine passes pay only for their pixels
+
+The 1.38.1 field frame proved the design: 21.4% → 2.7% flagged, 317s
+→ 14.4s warm. Its breakdown also priced what the refine passes still
+waste. Each of the three passes re-ran the CPU height pre-passes over
+EVERY pixel of their materials (1.5s × 3 = 4.5s of a 14.4s frame) and
+evaluated the whole sky (0.6s × 3), then threw away everything outside
+the 2.7% mask.
+
+Neither is computed any more. A refine pass's CPU height image is
+evaluated only inside the mask grown by one pixel — the bump emitter
+fetches exactly three texels per shaded pixel, all inside that region,
+so the computed texels carry the full image's values bit for bit and
+the uncomputed ones are never read (pinned in the suite by direct
+comparison). The sky evaluates only at flagged sky pixels — per-pixel
+independent, therefore identical where it is kept. Expected on the
+field scene: roughly 14.4s → ~8-9s warm.
+
+The composite split also now names WHO and WHY when a height pre-pass
+runs on the CPU — `prepass N ms [3x, 3 cpu -- 'Material': the
+refusing ingredient; ...]` — because the base frame still pays its
+full 1.5s once, and the next structural move (emitting those chains)
+starts from their names.
+
+---
+
+## [1.38.1] — 2026-08-21
+
+### Adaptive AA learns from its first field frame
+
+The first adaptive render in the field carried two verdicts at once.
+The shader-name fix is confirmed: `shader compile 17x 43 ms` where the
+driver used to pay twenty seconds — the pipeline caches finally match
+across sessions, and the composite mystery is named (three CPU height
+pre-passes at 1.3s, next on the list). But the adaptive pass itself
+billed 306 of the frame's 317 seconds, and both causes were this
+engine's own bad calls, shipped five days ago.
+
+**The mask flagged 21% of the frame.** Two criteria were wrong. The
+depth test compared neighbouring depths against the threshold — but a
+smooth floor running away from the camera has a large depth SLOPE at
+every pixel, so whole surfaces read as one long crease. The test now
+uses the second difference — curvature — which is ~zero on any smooth
+surface however steep, and spikes at a real step or fold. And the
+colour-contrast criterion flagged texture detail across open surfaces
+— detail the mip chain already anti-aliases, so re-rendering it three
+times sharpened nothing. Contrast now works only within two pixels of
+a geometric flag, where it still catches the soft side of a
+silhouette, glints and seams. The reference scene's mask fell from a
+fifth of the frame to the low single digits.
+
+**The refine passes were chained to the CPU.** 1.38.0 reasoned that a
+full-screen GPU pass over a few percent of a frame was overhead, and
+kept refine shading on the CPU. The field priced that theory: on a
+scene whose base frame shades on the GPU in 2.9 seconds, the CPU paid
+~130 microseconds per flagged pixel — rays, bump fields and texture
+footprints, per pixel, in Python — for 306 seconds across three
+passes. Refine passes now shade on the SAME device as the base frame:
+the full-screen pass runs, the masked pixels are kept, and the whole
+frame stays on one device (which is also stricter determinism than
+1.38.0's GPU-base/CPU-refine mix). The console prints one shade split
+per frame — the base one — instead of four.
+
+Expected on the field scene: base ~6-9s plus a few seconds per refine
+pass instead of a hundred, with the mask a fraction of the size.
+
+### Tests
+
+The bitwise contract is unchanged and still held (unflagged = base
+exactly; flagged = the float64 average of unrestricted jittered
+renders). The device pin now points the RIGHT way — refine passes
+take the deferred branch — plus new pins: curvature not slope,
+contrast confined to the edge band, one shade split per frame.
+
+---
+
+## [1.38.0] — 2026-08-21
+
+### The ocean gets authority, the stars get a size, the nodes get a toolbox
+
+Eight requests, one release.
+
+**The infinite ocean plane is no longer a backdrop.** It had three
+structural problems. Rays that dipped below the horizon by less than a
+threshold were declared level, leaving a bright sliver of sky between
+the water and the horizon — every downward ray now hits. The wave
+phase ran in float32, which keeps about seven digits, so by a few tens
+of thousands of units the far water was the cosine of rounding noise —
+the phase now accumulates in float64 and wraps before the cosine, so
+the swell survives to the (smoothly capped) horizon. And the big one:
+the plane existed only in the background pass, so any object below the
+water line drew fully in front of it — a boat sat ON the ocean like a
+sticker and nothing could ever wade. The plane now covers geometry
+beneath it, re-evaluated through the same world path the background
+uses (ocean, chequer, haze, cloud shadows — one source of truth), with
+the ocean's own Transparency deciding how much of a drowned object
+ghosts through before the water column swallows it. Everything above
+the water line rides through bit for bit; a transparent film skips the
+plane entirely, exactly as 2.79's film contract says.
+
+**Stars have a fixed angular size, with an Old Stars escape hatch.**
+The Bryce star layer lit every pixel of a starred grid cell — a SQUARE
+whose size followed the render resolution: one or two pixels at
+320x240, nine-pixel blocks at 1920. The starfield mode measured its
+star discs in 3D grid space, where the sky sphere cuts every cell at a
+different depth, so sizes came out essentially random. Both layers now
+draw round stars of fixed ANGULAR size — Star Size means the same
+thing at every resolution, in every direction, and the Bryce layer
+reads the same dial. The **Old Stars** toggle (both modes) restores
+the pre-1.38 drawing verbatim, pinned bit-for-bit in the suite, for
+scenes tuned to the blocky look.
+
+**The EEVEE/Cycles converter stops burning materials white.** Since
+Blender 4.0 a default Principled BSDF carries a WHITE Emission Color
+at strength ZERO; the converter copied the colour and only wrote a
+console note about the strength — so nearly every converted material
+glowed white. Emission Strength now folds for real, in every case:
+strength 0 drops the colour entirely, constants multiply through, a
+linked colour gains a real multiply node carrying the constant, and a
+node-driven strength gains a multiply fed by its own link.
+
+**Convert to Blender Internal buttons.** The material panel's convert
+box grows a second set — This Material / Selected Objects / Whole
+Scene — that rebuilds materials around the BI Material node instead of
+the master shader: Blender Internal's own diffuse/specular pairs, for
+scenes that want the 2.79 model outright. The mapping is 2.79-shaped
+and bpy-free (testable): hardness from roughness through the
+renderer's own curve clamped to BI's 511, emission through the Emit
+float, alpha through the transparency panel (Raytrace mode when an IOR
+rides along), rough surfaces onto Oren-Nayar, metals tinting the
+highlight with the base colour the way the era did it, and an Emission
+shader becoming Shadeless — which is exactly what Shadeless was for.
+Texture and normal chains relink, never reset.
+
+**Fresnel, rim and matcap get blend menus.** Each silhouette cheat now
+chooses how it lands on the lit result: Add, Mix, Multiply or Screen
+(matcap defaults to Mix, the others to Add — the defaults reproduce
+every existing scene bit for bit, pinned). The menus appear on the
+node only while the effect is in use, and the GPU pass shades every
+mode identically to the CPU — the simulator holds all four to exact
+equality in the suite.
+
+**Twelve new nodes.** Two for the normal-map workflow: **Normal Map+**
+decodes tangent/object/world-space maps in both channel conventions —
+OpenGL (Y+) and DirectX (Y−), the single dropdown that fixes every
+"my bumps look inverted" map — and **Normal Mix** combines two normal
+chains like the Mix node combines colours: Detail (reoriented, the
+way engines layer a detail map over a base), Add (the UDN-style tilt
+sum), or Mix. Ten utilities: **Altitude & Slope** (Bryce's
+terrain-material trio: world height remapped, steepness, compass
+facing), **Facing** (facing ratio, incidence and a Schlick Fresnel as
+bare masks), **Switch** (hard A/B), **Random Per Object** (a stable
+hash of the object id — same uint32 arithmetic on both devices, so
+CPU and GPU agree to the bit), **Levels** (black/white point, gamma,
+output range), **Smooth Step** (linear/Hermite/quintic remap),
+**Channel Shuffle**, **Distance Mask** (Depth Cue's factor, bare),
+**Stepped Time** (hold the clock every N frames — animating on twos),
+and **Waveform** (sine/square/triangle/saw oscillator). Every one
+evaluates on the CPU, emits GLSL for the deferred pass, and is held
+to simulator parity in the suite.
+
+**The Master Shader panel shows only what the model reads.** The
+socket table already knew which inputs each reflectance model actually
+shades with (measured by perturbation, held by a test); the models the
+old visibility table left open now derive from it. A Phong node no
+longer offers Roughness, Toon Size or Translucency; Ward keeps its
+anisotropy pair; linked sockets always stay visible.
+
+### Tests
+
+The plane's whole contract (no sliver, finite far field, above-water
+bitwise, drowned coverage, transparency dial, film skip, under-camera
+fallback); Old Stars pinned bit-for-bit against the historical
+functions; all seven converter emission cases plus the multiply-node
+markers; the BI plan's mappings and the three panel buttons; blend
+defaults bitwise-identical to 1.37 plus all four modes at exact
+simulator parity; all twelve nodes registered on both devices, each
+changing the picture and each at simulator parity; the model-derived
+socket sets for Phong/Ward/Blinn/Toon.
+
+---
+
+## [1.37.0] — 2026-08-19
+
+### Adaptive anti-aliasing: the Bryce pass
+
+The field remembered it exactly right: Bryce rendered the picture,
+then a line swept down the image anti-aliasing it — a second pass
+that re-sampled only the pixels that needed it. POV-Ray shipped the
+same idea as `+A`. That method is now Anti-Aliasing → **Adaptive
+(Edge Pass)**, and it exists because Supersample's price is
+quadratic: Samples 16 renders SIXTEEN times the output pixels
+whether they alias or not, which on a 1920×1920 frame is a
+59-million-pixel bill for edges that occupy a few percent of the
+picture.
+
+Adaptive renders the frame once at output resolution — on whatever
+device the settings chose, GPU included — then finds the pixels
+that can alias and re-renders ONLY those at Halton subpixel
+offsets, averaging all samples in float64. Four period-correct
+criteria flag a pixel, every one a neighbour comparison: object-id
+silhouettes (object ids, not triangle ids — a dense mesh is all
+triangle edges and none of them alias), the sky boundary, depth
+creases past Edge Depth Threshold (the same dial, same scene
+units, as Edge Only), and a fixed colour contrast — the POV-Ray
+criterion, which catches what ids cannot see: texture detail,
+shadow terminators, specular glints. The contrast threshold is a
+constant, not a setting; every adaptive renderer of the era
+shipped exactly one number there.
+
+The refine passes still rasterise the whole frame (a jittered
+projection must re-decide coverage, or the silhouette it is
+refining would be the old silhouette) and still fill the whole
+sky, but shading — the cost — runs only at the flagged pixels, on
+the CPU (a full-screen deferred pass over a few percent of a frame
+is overhead, not speed; the console prints the flagged count and
+pass count). Every unflagged pixel ships the base frame's value
+bit for bit. The mode is deterministic by construction — the mask
+is a pure function of the base frame, the offsets are Halton — and
+the worker pool is skipped by name for it, because a pooled band
+cannot see edges across its seam and identical frames are the
+contract.
+
+What it buys on the field's numbers: Samples 4 quality at the
+edges for the price of ONE full frame plus three passes over a few
+percent of it — instead of four times the pixels; Samples 16
+quality at the edges without the 16× pixel bill that took a
+38-minute render to say no to.
+
+### Tests
+
+The whole contract is pinned bitwise: unflagged pixels equal the
+base frame exactly; flagged pixels equal the float64 average of
+the base sample and n−1 UNRESTRICTED whole-frame jittered renders
+— proving the mask restriction changed nothing any refined pixel
+sees; deterministic across runs; one sample falls back to the
+plain frame; and the wiring pins hold (enum registered, engine
+pool skip, no deferred GPU branch inside a refine pass, bump
+context handed over, viewport never runs it).
+
+---
+
+## [1.36.4] — 2026-08-19
+
+### Shader names stop changing between sessions
+
+The 1.36.3 paste held a win, a verdict, and an alarm. The win: the
+BVH cache finally spoke — `loaded from cache in 62 ms` where 1.9
+seconds of rebuild used to be. The verdict: the composite split
+pointed at `other 5452`, and the height pre-passes — CPU height
+evaluations that ran unattributed in exactly that window — are the
+prime suspect, so they now own their milliseconds in the split
+(`prepass N ms [Mx, K cpu]`). The alarm: the driver paid its full
+~20-second shader compile AND ~14 seconds of pipeline creation a
+SECOND session running, for byte-identical sources.
+
+That alarm is this release. The pooled shader names introduced with
+the material texels were built on Python's `hash()` — which is
+salted per process — so every Blender session presented the same
+shaders under brand-new names, and whatever the driver and Blender
+key their shader and pipeline caches on, the names never matched
+twice. The tag is now a stable digest of the source and its
+interface: the same shader carries the same name in every session,
+forever, pinned in the suite against a precomputed digest so a
+session-dependent ingredient can never sneak back in. If the salted
+name was what defeated the caches, the second session from now pays
+milliseconds; if the cost remains, the theory is dead and the next
+paste says so.
+
+### Tests
+
+The pooled tag equals its precomputed cross-session digest and moves
+when the source or interface moves; the prepass bucket rides the
+proven timing plumbing; every GPU pin holds.
+
+---
+
+## [1.36.3] — 2026-08-19
+
+### The frame is back on the GPU — and the two numbers left over get named
+
+1.36.2's field frame confirmed the sampler fix: `device: GPU`, no
+refusal, 996 seconds down to 79 — most of which was the one-time
+driver toll (`shader compile 17x 21293 ms` plus 13.3 s of first-use
+pipeline creation, both dead once the driver's cache warms). Two
+findings in the same paste get acted on here.
+
+**The BVH disk cache never had a chance.** `build BVH 1.9 s` printed
+no cache line, and the reason was structural: the render pipeline's
+own builder (`_cached_bvh`, the in-session identity cache) constructed
+`BVH()` directly — the R177 disk cache wrapped `make_bvh`, which the
+F12 path never calls. Every session rebuilt the same tree while the
+cache sat empty. The builder now routes THROUGH the disk-cache road:
+the in-session cache stays on top, the cross-session load underneath,
+and the instrument line finally speaks. Pinned by test at the
+pipeline's own entry point: a fresh session loads the identical tree.
+
+**The 23-second composite names its parts.** At 16x supersample the
+shade split's `composite` bucket — a residual, total minus the named
+stages — held 23.4 s of CPU work over 59-megapixel arrays with no
+further breakdown. It now prints its measured parts whenever it
+crosses a second: `composite N ms (own A + env B + fog C + other D)`
+— `own` is the readback's masking and layout, `env`/`fog` are the
+CPU-composite terms, and whatever hides in `other` is the next
+round's named target instead of a guess.
+
+### Tests
+
+The BVH suite now pins the render pipeline's own builder writing and
+loading the disk cache; the composite split rides the proven timing
+plumbing and every existing GPU pin holds.
+
+---
+
+## [1.36.2] — 2026-08-19
+
+### The sampler guard asks the driver instead of assuming its worst case
+
+1.36.1's new interface warning did its job on the very next field
+frame, and what it named was a bug of this engine's own making, twice
+over: `needs 17 texture samplers; drivers guarantee 16`, the
+warning said, naming the scene's heaviest material — and with that,
+an entire 4x-supersampled frame shaded on the CPU for sixteen
+minutes.
+
+Twice over, because both halves were self-inflicted. The material
+value texture (1.35.50) added one sampler to every material pass —
+which is exactly what pushed a 16-sampler material to 17. And the
+pass guard compared against the GL/Vulkan *guaranteed minimum* of 16
+as if it were the hardware, on a card whose actual fragment-sampler
+limit is 32. The guard exists to pre-empt a driver rejection;
+pre-empting it at half the driver's real capacity is not caution, it
+is a bug.
+
+The guard now asks: `device.max_fragment_samplers()` queries the
+driver's own limit once per session (floor 16 — the answer can widen
+the road, never narrow it below the spec; headless stays 16), the
+plan carries it, and every sampler-count refusal names the queried
+number, so the console line reads true for the machine it ran on.
+On desktop hardware the 17-sampler material now rides the GPU with
+room to spare, and the field frame goes back to the sub-second class.
+
+For hardware that truly stops at 16, the whole-frame CPU fallback on
+a single over-budget material remains the honest behaviour today;
+merging the engine's three small data textures into one (saving two
+samplers on every pass) and per-material CPU routing are the queued
+next steps of that story.
+
+### Tests
+
+New pins: headless the queried limit is exactly the spec floor and is
+cached; a choked limit refuses a normal pass BY THE QUERIED NUMBER
+("this driver provides 6"); the same pass builds under the driver's
+real limit — the field fix in miniature.
+
+---
+
+## [1.36.1] — 2026-08-19
+
+### The expensive frame announces itself
+
+A field render sat for thirty-eight minutes with no explanation. Two
+things had happened at once, and both were visible only as console
+lines nobody had open: the frame was set to Anti-Aliasing Samples 16
+— a 4x4 grid, sixteen times the output pixels rendered internally —
+and something in the scene had kept GPU shading from running, so all
+sixteen-fold of it shaded on the CPU.
+
+Both verdicts now land in Blender's own interface. Before the render
+starts, a supersample of 9x or more reports the pixel bill and the
+lever ("Samples 16 renders 16x the output pixels (3840x3840
+internally). The period default is 4"), and the console always prints
+the internal resolution. After the frame, if GPU shading was wanted
+and could not run, the refusal reason lands as a report — visible in
+the status bar and the Info log — instead of only in the console.
+ESC has always cancelled between progress ticks; now the wait it
+interrupts is at least a named one.
+
+### Tests
+
+The engine-level suite pins all of it: a Samples-16 frame warns with
+the pixel bill, the period-default 4 stays quiet, a GPU frame that
+falls to the CPU reports the verdict with its reason, and both frames
+still deliver correct pixels.
+
+---
+
 ## [1.36.0] — 2026-08-19
 
 ### The release: your Blender 2.79 scenes, appended whole

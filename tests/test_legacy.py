@@ -3141,3 +3141,93 @@ def main():
 if __name__ == '__main__':
     import sys
     sys.exit(main())
+
+
+def test_halo_material_import():
+    """R191: MA_TYPE_HALO imports as the halo panel -- the overloaded
+    mode bits read through material_type, counts gated by their bits,
+    ring colour from Mirror, line colour from Specular."""
+    from ..core import blend279 as B
+    from ..core import blend279_map as M
+
+    md = {'name': 'Sparkle', 'material_type': 1, 'hasize': 0.31,
+          'har': 63, 'add': 0.8, 'alpha': 0.9, 'r': 1.0, 'g': 0.6,
+          'b': 0.2, 'seed1': 300, 'ringc': 5, 'linec': 9, 'starc': 6,
+          'mode': (B.MA_HALO_RINGS | B.MA_STAR | B.MA_HALO_XALPHA
+                   | B.MA_HALOTEX),
+          'specr': 0.9, 'specg': 0.8, 'specb': 0.7,
+          'mirr': 0.2, 'mirg': 0.4, 'mirb': 1.0,
+          'diff_shader': 0, 'spec_shader': 0}
+    s = M.material_spec(md, 279)
+    h = s['halo']
+    check('a halo material maps to the halo spec', h is not None)
+    check('size, hardness, add, alpha survive',
+          h['size'] == 0.31 and h['hardness'] == 63
+          and abs(h['add'] - 0.8) < 1e-6 and abs(h['alpha'] - 0.9) < 1e-6)
+    check('the seed wraps at 256 exactly as RE_inithalo',
+          h['seed'] == 300 % 256)
+    check('counts ride only when their bit is on',
+          h['rings'] == 5 and h['lines'] == 0 and h['star_points'] == 6)
+    check('ring colour is the Mirror colour',
+          h['ring_color'] == (0.2, 0.4, 1.0))
+    check('line colour is the Specular colour',
+          h['line_color'] == (0.9, 0.8, 0.7))
+    check('Extreme Alpha reads its overloaded bit',
+          h['xalpha'] and not h['soft'])
+    check('HaloTex is declined by name',
+          any('HaloTex' in w for w in s['warnings']))
+
+    # the OVERLOAD: the same bits on a SURFACE material stay surface
+    s2 = M.material_spec({'name': 'Plain', 'material_type': 0,
+                          'mode': B.MA_HALO_RINGS | B.MA_STAR,
+                          'diff_shader': 0, 'spec_shader': 0}, 279)
+    check('surface materials never read the halo aliases',
+          s2['halo'] is None and s2['inputs'])
+
+    # the parser reads the halo fields
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(M.__file__)))
+    psrc = open(os.path.join(root, 'core', 'blend279.py'),
+                encoding='utf-8').read()
+    check("blend279 reads material_type, hasize, seed1, ringc/linec/"
+          "starc", "'material_type': 'h'" in psrc
+          and "'hasize': 'f'" in psrc and "'seed1': 'h'" in psrc)
+
+
+def test_halo_points_need_no_faces():
+    """R198: halos on CURVES. A bare curve's evaluated mesh is verts
+    and edges with zero polygons; the halo collector reads vertices
+    only, so every point of the curve glows. The contract is pinned
+    with a stub mesh shaped exactly like that conversion."""
+    import types
+
+    import numpy as np
+
+    from .. import export as EX
+
+    verts = np.array([[0, 0, 0], [1, 0, 0.5], [2, 0, 1.5]], np.float32)
+
+    class _Verts:
+        def __len__(self):
+            return len(verts)
+
+        def foreach_get(self, name, buf):
+            assert name == 'co'
+            buf[:] = verts.ravel()
+
+    me = types.SimpleNamespace(vertices=_Verts())
+    hs = types.SimpleNamespace(halo=True, halo_puno=False)
+    slot = types.SimpleNamespace(halcyon=hs)
+    mw = np.eye(4, dtype=np.float32)
+    mw[0, 3] = 10.0
+    pts = EX._collect_halo_points(me, mw, [slot])
+    check('a no-faces mesh still yields its halo points',
+          pts is not None and len(pts) == 1
+          and pts[0]['pos'].shape == (3, 3))
+    check('the points are world-transformed',
+          bool(np.allclose(pts[0]['pos'][:, 0],
+                           verts[:, 0] + 10.0)))
+    plain = types.SimpleNamespace(halcyon=types.SimpleNamespace(
+        halo=False))
+    check('a surface material collects nothing',
+          EX._collect_halo_points(me, mw, [plain]) is None)

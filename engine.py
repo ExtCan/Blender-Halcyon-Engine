@@ -119,6 +119,11 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
         self._draw_data = None
         self._last_hash = None
         self._vp = None
+        # R201: the animation clock. Blender builds one engine instance
+        # per render JOB and calls render() once per frame of an
+        # animation, so per-frame durations kept on the instance start
+        # fresh with every animation and never leak across jobs
+        self._anim_times = []
 
     def __del__(self):
         # Blender frees the engine's StructRNA before Python collects
@@ -261,6 +266,34 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
         except Exception:                                       # noqa: BLE001
             pass
 
+        # R180: the supersample bill, printed and REPORTED before the wait.
+        # The field lost 38 minutes to Samples 16 (a 4x4 = 16x-pixel
+        # internal frame) on a scene that had also fallen off the GPU --
+        # and the only warnings were console lines. The cost of a sampling
+        # choice belongs where the choice is made.
+        if not preview:
+            try:
+                import numpy as _np
+                _ssf = 1
+                if str(settings.aa_mode) == 'SUPERSAMPLE':
+                    _ssf = max(int(_np.round(_np.sqrt(
+                        max(int(settings.aa_samples), 1)))), 1)
+                if _ssf > 1:
+                    print(f"[Halcyon] internal resolution "
+                          f"{tw * _ssf}x{th * _ssf} -- Samples "
+                          f"{int(settings.aa_samples)} supersamples "
+                          f"{_ssf}x{_ssf} = {_ssf * _ssf}x the output "
+                          f"pixels")
+                if _ssf * _ssf >= 9:
+                    self.report(
+                        {'WARNING'},
+                        f"Samples {int(settings.aa_samples)} renders "
+                        f"{_ssf * _ssf}x the output pixels "
+                        f"({tw * _ssf}x{th * _ssf} internally). The "
+                        f"period default is 4 (a 2x2 grid)")
+            except Exception:                                   # noqa: BLE001
+                pass
+
         def on_progress(frac, msg):
             if self.test_break():
                 raise _Cancelled()
@@ -310,6 +343,56 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             print("[Halcyon] worker pool skipped: GPU Shading renders "
                   "whole frames in-process (a pooled band would shade on "
                   "the CPU). Turn GPU Shading off to use the pool instead")
+        elif settings.use_processes and not preview and \
+                str(settings.aa_mode) == 'ADAPTIVE' and \
+                int(settings.aa_samples) > 1:
+            # adaptive AA flags its edge pixels off the WHOLE base
+            # frame; a pooled band cannot see across its seam, so the
+            # same scene would flag (and refine) different pixels
+            # banded than whole -- and identical frames are the
+            # contract. In-process it is: the refine passes only shade
+            # a few percent of the frame anyway
+            print("[Halcyon] worker pool skipped: Adaptive anti-aliasing "
+                  "reads edges off the whole base frame, so the frame "
+                  "renders in-process (base + edge refine passes)")
+        elif settings.use_processes and not preview and \
+                str(getattr(getattr(scene, 'camera', None), 'type', '')
+                    ) == 'PANO':
+            # the panorama is sixteen rotated strip renders resampled
+            # onto one cylinder; a pooled band of the output has no
+            # meaning before the stitch exists
+            print("[Halcyon] worker pool skipped: the panorama camera "
+                  "renders rotated strips in-process and stitches them")
+        elif settings.use_processes and not preview and \
+                str(getattr(settings, 'stereo_mode', 'NONE')) != 'NONE':
+            # each eye is its own whole frame; a pooled band would render
+            # one mono slice
+            print("[Halcyon] worker pool skipped: stereo renders each eye "
+                  "as a whole frame in-process")
+        elif settings.use_processes and not preview and \
+                getattr(scene, 'halos', None):
+            # a halo is splatted against the WHOLE frame's z-buffer in
+            # frame coordinates; a pooled band's buffer starts at its
+            # own y and every glow would land shifted
+            print("[Halcyon] worker pool skipped: halo materials splat "
+                  "against the whole frame's depth, so the frame "
+                  "renders in-process")
+        elif settings.use_processes and not preview and \
+                any(float(getattr(l, 'flare', 0.0)) > 0.0
+                    for l in (getattr(scene, 'lights', None) or ())):
+            # a flare's visibility is sampled off the whole frame's
+            # z-buffer, which a pooled band never holds
+            print("[Halcyon] worker pool skipped: lens flares sample "
+                  "their lamp's visibility off the whole frame's depth, "
+                  "so the frame renders in-process")
+        elif settings.use_processes and not preview and \
+                str(getattr(getattr(scene, 'world', None), 'weather',
+                            'NONE') or 'NONE') != 'NONE':
+            # R200: weather particles splat in whole-frame coordinates,
+            # exactly like the halos above
+            print("[Halcyon] worker pool skipped: the weather overlay "
+                  "splats in whole-frame coordinates, so the frame "
+                  "renders in-process")
         elif settings.use_processes and not preview:
             from .core import parallel as _par
             n = int(settings.process_count) or _resolve_cpus()
@@ -339,6 +422,25 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                 self.report({'ERROR'}, f"Halcyon render failed: {exc}")
             return
 
+        # R180: the GPU verdict, in the interface. A frame that fell to
+        # the CPU used to say so in one console line; at a supersampled
+        # resolution that silence cost the field 38 minutes. The reason
+        # now lands in Blender's own report system, visible in the
+        # status bar and the Info log without a console.
+        if not preview:
+            try:
+                from .core.render import LAST_GPU_VERDICT as _V
+                if _V.get('wanted') and not _V.get('engaged'):
+                    _why = str(_V.get('why') or '').strip()
+                    self.report(
+                        {'WARNING'},
+                        "GPU shading could not run this frame; it shaded "
+                        "on the CPU"
+                        + (f" -- {_why[:160]}" if _why else '')
+                        + ". The console has the full reason")
+            except Exception:                                   # noqa: BLE001
+                pass
+
         self.update_stats("Halcyon", "Post processing")
         try:
             # what the burn-in tokens cannot learn from the core: the
@@ -361,6 +463,9 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                                      depth=getattr(scene, 'last_depth', None),
                                      shaft_sources=getattr(scene, 'last_shafts',
                                                            None),
+                                     flare_sources=getattr(scene,
+                                                           'last_flares',
+                                                           None),
                                      stamp_info=stamp_info)
         except Exception as exc:                                # noqa: BLE001
             import traceback
@@ -379,6 +484,22 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             for w in set(warnings) | set(getattr(scene, 'unsupported', ()) or ()):
                 self.report({'WARNING'}, str(w))
         elapsed = time.time() - export_started
+        if not preview and getattr(self, 'is_animation', False):
+            # R201: the animation ETA -- per-frame time and when the
+            # whole run will be done, printed after every frame
+            try:
+                self._anim_times.append(float(elapsed))
+                line = _anim_eta_line(
+                    self._anim_times,
+                    int(getattr(bscene, 'frame_start', 1)),
+                    int(getattr(bscene, 'frame_end', 1)),
+                    int(getattr(bscene, 'frame_step', 1) or 1),
+                    int(getattr(bscene, 'frame_current', 1)))
+                if line:
+                    print(f"[Halcyon] {line}")
+                    self.update_stats("Halcyon", line)
+            except Exception:                                   # noqa: BLE001
+                pass
         if settings.show_stats:
             ST.report(total=elapsed)
         # the one-line answer to "where did this frame go", printed for
@@ -690,6 +811,12 @@ _RENDER_ID_TYPES = frozenset((
     'Object', 'Mesh', 'Curve', 'SurfaceCurve', 'TextCurve', 'MetaBall',
     'Material', 'Light', 'World', 'Image', 'Armature', 'Lattice',
     'GreasePencil', 'Volume', 'PointCloud', 'Collection', 'Key',
+    # R199 field find: editing the halo colour ramp -- a node UNLINKED
+    # from any output -- updates only the ShaderNodeTree id; Blender
+    # tags the owning Material only when shading is affected. The ramp
+    # widget therefore never live-updated: the poke classified 'none'
+    # and the parked export stood. Any node-tree edit re-exports now
+    'ShaderNodeTree', 'NodeTree', 'GeometryNodeTree',
 ))
 
 
@@ -698,6 +825,56 @@ _RENDER_ID_TYPES = frozenset((
 _LIGHT_ID_TYPES = frozenset((
     'Light', 'SunLight', 'PointLight', 'SpotLight', 'AreaLight',
 ))
+
+
+def _anim_frame_cost(times):
+    """The per-frame seconds an animation ETA should multiply by.
+
+    R201: the first frame pays for what the rest reuse -- shadow maps,
+    BVHs, mesh caches, compiled shaders -- so a plain mean drags the
+    warm-up cost into every later prediction. The LOWER median of the
+    last five frames forgets the warm-up the moment one steady frame
+    exists, and still absorbs a single hiccup frame later in the run
+    (one slow outlier among steady neighbours never becomes the
+    estimate)."""
+    if not times:
+        return 0.0
+    recent = sorted(times[-5:])
+    return float(recent[(len(recent) - 1) // 2])
+
+
+def _fmt_span(sec):
+    """Seconds as a human span: 42s, 3m 05s, 1h 12m."""
+    sec = max(float(sec), 0.0)
+    if sec < 60.0:
+        return f'{sec:.0f}s'
+    m, s = divmod(int(round(sec)), 60)
+    if m < 60:
+        return f'{m}m {s:02d}s'
+    h, m = divmod(m, 60)
+    return f'{h}h {m:02d}m'
+
+
+def _anim_eta_line(times, start, end, step, current, now=None):
+    """One console line of animation progress and estimated completion.
+
+    Pure of bpy and clock-injectable (`now` for the tests): the engine
+    passes its per-frame durations and the scene's frame range, and
+    gets back either "frame K/N in Xs -- ~R to go, done around H:MM"
+    or the final tally line on the last frame."""
+    step = max(int(step), 1)
+    total = max((int(end) - int(start)) // step + 1, 1)
+    done = min(max((int(current) - int(start)) // step + 1, 1), total)
+    this = times[-1] if times else 0.0
+    if done >= total:
+        return (f'animation finished: {total} frame'
+                f'{"s" if total != 1 else ""} in '
+                f'{_fmt_span(sum(times))}')
+    left = (total - done) * _anim_frame_cost(times)
+    t_now = time.time() if now is None else float(now)
+    clock = time.strftime('%H:%M', time.localtime(t_now + left))
+    return (f'animation frame {done}/{total} in {this:.1f}s -- '
+            f'~{_fmt_span(left)} to go, done around {clock}')
 
 
 def _classify_updates(depsgraph):

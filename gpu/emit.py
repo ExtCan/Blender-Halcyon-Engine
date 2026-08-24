@@ -2086,6 +2086,54 @@ def e_pat_noise(em, node, index):
         f'hal_pat_noise_nd({p4}, {d}, {kind}, {octv}, {lac}, {gain})'))
 
 
+_CAUSTIC_GLSL = """
+float hal_caustic(vec2 uv, float t, float per)
+{
+    vec2 ci = floor(uv);
+    vec2 cf = uv - ci;
+    float f1 = 1e9; float f2 = 1e9;
+    for (int oy = -1; oy <= 1; oy++)
+    for (int ox = -1; ox <= 1; ox++) {
+        float cx = mod(ci.x + float(ox), per);
+        cx = (cx < 0.0) ? cx + per : cx;
+        float cy = mod(ci.y + float(oy), per);
+        cy = (cy < 0.0) ? cy + per : cy;
+        uint h = uint(int(cx + 0.5)) + uint(int(cy + 0.5)) * uint(int(per + 0.5));
+        float a1 = hal_wang01(h ^ 2654435769u);
+        float a2 = hal_wang01(h ^ 2246822507u);
+        float ph = hal_wang01(h ^ 3266489909u) * 6.2831853;
+        vec2 p = vec2(0.5 + (0.22 + 0.2 * a1) * cos(ph + t),
+                      0.5 + (0.22 + 0.2 * a2) * sin(ph + t));
+        vec2 dv = vec2(float(ox), float(oy)) + p - cf;
+        float d = dot(dv, dv);
+        float nf1 = min(f1, d);
+        f2 = min(f2, max(f1, d));
+        f1 = nf1;
+    }
+    float edge = sqrt(max(f2, 0.0)) - sqrt(max(f1, 0.0));
+    float web = clamp(1.0 - edge * 3.2, 0.0, 1.0);
+    return web * web * web;
+}
+"""
+
+
+def e_pat_caustics(em, node, index):
+    """The pool-light web on the GPU: the CPU's caustic_web, hash for
+    hash -- the same uint32 Wang mix, the same wrapped lattice."""
+    if '__wang' not in em.once:
+        em.once.add('__wang')
+        em.inline.append(_WANG_GLSL)
+    if '__caustic' not in em.once:
+        em.once.add('__caustic')
+        em.inline.append(_CAUSTIC_GLSL)
+    p = _pat_vec(em, node)
+    t = _pat_time(em, node)
+    speed = _pat_scalar(em, node, 'Speed', 1.0)
+    f, _t2 = em.tmp(FLOAT,
+                    f'hal_caustic(({p}).xy, ({t}) * ({speed}), 8.0)')
+    return _pat_output(em, node, index, f)
+
+
 def e_pat_water(em, node, index):
     from ..core.patterns import WATER_DIRS
     _need_pattern(em, 'water')
@@ -2651,6 +2699,315 @@ def e_normal_map(em, node, _i):
     return em.tmp(VEC3, f'normalize({n} + ({out} - {n}) * {strength})')
 
 
+def e_halcyon_normal_map(em, node, _i):
+    """The multi-flavour normal map: e_normal_map plus the DirectX flip."""
+    col = em.input(node, 'Color', VEC4)
+    strength = em.input(node, 'Strength', FLOAT)
+    cv, _t = em.tmp(VEC4, col)
+    if str(prop(node, 'map_type', 'OPENGL')) == 'DIRECTX':
+        rgbv, _t = em.tmp(VEC3, f'vec3({cv}.r, 1.0 - {cv}.g, {cv}.b)')
+    else:
+        rgbv, _t = em.tmp(VEC3, f'{cv}.rgb')
+    tn, _t = em.tmp(VEC3, f'{rgbv} * 2.0 - 1.0')
+    n, _t = em.tmp(VEC3, 'normalize(hal_N)')
+    if str(prop(node, 'space', 'TANGENT')) in ('OBJECT', 'WORLD'):
+        out, _t = em.tmp(VEC3, f'normalize({tn})')
+    else:
+        up, _t = em.tmp(VEC3, f'(abs({n}.z) < 0.999) '
+                              f'? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0)')
+        t, _t = em.tmp(VEC3, f'normalize(cross({up}, {n}))')
+        b, _t = em.tmp(VEC3, f'cross({n}, {t})')
+        out, _t = em.tmp(VEC3, f'normalize({t} * {tn}.x + {b} * {tn}.y '
+                               f'+ {n} * {tn}.z)')
+    return em.tmp(VEC3, f'normalize({n} + ({out} - {n}) * {strength})')
+
+
+def e_halcyon_normal_mix(em, node, _i):
+    """Two normals into one, exactly as `nodeeval.n_halcyon_normal_mix`."""
+    def _in(name):
+        sock = next((s for s in node.get('inputs', ())
+                     if s.get('name') == name), None)
+        if sock and sock.get('link'):
+            return em.tmp(VEC3, f'normalize({em.input(node, name, VEC3)})')[0]
+        return em.tmp(VEC3, 'normalize(hal_N)')[0]
+
+    n0, _t = em.tmp(VEC3, 'normalize(hal_N)')
+    a = _in('Base')
+    b = _in('Detail')
+    f, _t = em.tmp(FLOAT,
+                   f'clamp({em.input(node, "Factor", FLOAT)}, 0.0, 1.0)')
+    mode = str(prop(node, 'mode', 'DETAIL'))
+    if mode == 'MIX':
+        out, _t = em.tmp(VEC3, f'{a} + ({b} - {a}) * {f}')
+    elif mode == 'ADD':
+        out, _t = em.tmp(VEC3, f'{a} + ({b} - {n0}) * {f}')
+    else:
+        axis, _t = em.tmp(VEC3, f'cross({n0}, {a})')
+        s, _t = em.tmp(FLOAT, f'length({axis})')
+        cth, _t = em.tmp(FLOAT, f'dot({n0}, {a})')
+        ax, _t = em.tmp(VEC3, f'({s} > 1e-6) ? {axis} / max({s}, 1e-12) '
+                              f': vec3(0.0)')
+        rb, _t = em.tmp(VEC3,
+                        f'{b} * {cth} + cross({ax}, {b}) * {s} '
+                        f'+ {ax} * dot({ax}, {b}) * (1.0 - {cth})')
+        rb2, _t = em.tmp(VEC3, f'({s} > 1e-6) ? normalize({rb}) '
+                               f': (({cth} >= 0.0) ? {b} : -{b})')
+        out, _t = em.tmp(VEC3, f'{a} + ({rb2} - {a}) * {f}')
+    return em.tmp(VEC3, f'normalize({out})')
+
+
+def e_halcyon_altitude_slope(em, node, index):
+    """Bryce's terrain trio, off the fragment's own P and N.
+
+    R202: when the Noise input is live (linked, or defaulted above 0)
+    the three masks are wobbled by the same value noise the CPU uses
+    -- hal_pt_vnoise IS patterns.value_noise. A node without the
+    input, or with it at 0, emits exactly the old expressions.
+    """
+    n, _t = em.tmp(VEC3, 'normalize(hal_N)')
+    noisy = any(s.get('name') == 'Noise'
+                and (s.get('link')
+                     or float(s.get('default') or 0.0) > 0.0)
+                for s in node.get('inputs', ()))
+    wob = None
+    if noisy and index in (0, 1, 2):
+        _need_prims(em)
+        amt = em.input(node, 'Noise', FLOAT)
+        nsc = em.input(node, 'Noise Scale', FLOAT)
+        wob, _t = em.tmp(FLOAT,
+                         f'(hal_pt_vnoise(hal_P * max({nsc}, 1e-4)) '
+                         f'- 0.5) * max({amt}, 0.0)')
+    if index == 0:
+        if wob is None:
+            return em.tmp(FLOAT, 'hal_P.z')
+        mn0 = em.input(node, 'Minimum', FLOAT)
+        mx0 = em.input(node, 'Maximum', FLOAT)
+        mn0v, _t = em.tmp(FLOAT, mn0)
+        span0, _t = em.tmp(FLOAT, f'(abs(({mx0}) - {mn0v}) < 1e-9) '
+                                  f'? 1e-9 : (({mx0}) - {mn0v})')
+        return em.tmp(FLOAT, f'(hal_P.z + {wob} * {span0})')
+    if index == 1:
+        mn = em.input(node, 'Minimum', FLOAT)
+        mx = em.input(node, 'Maximum', FLOAT)
+        mnv, _t = em.tmp(FLOAT, mn)
+        span, _t = em.tmp(FLOAT, f'(abs(({mx}) - {mnv}) < 1e-9) '
+                                 f'? 1e-9 : (({mx}) - {mnv})')
+        base, _t = em.tmp(FLOAT,
+                          f'clamp((hal_P.z - {mnv}) / {span}, 0.0, 1.0)')
+        if wob is None:
+            return base, FLOAT
+        return em.tmp(FLOAT, f'clamp({base} + {wob}, 0.0, 1.0)')
+    if index == 2:
+        if wob is None:
+            return em.tmp(FLOAT, f'(1.0 - abs({n}.z))')
+        return em.tmp(FLOAT,
+                      f'clamp((1.0 - abs({n}.z)) + {wob}, 0.0, 1.0)')
+    return em.tmp(FLOAT,
+                  f'(atan({n}.y, {n}.x) / 6.2831853071795864769 + 0.5)')
+
+
+def e_halcyon_facing(em, node, index):
+    ndv, _t = em.tmp(FLOAT, 'clamp(abs(dot(normalize(hal_N), '
+                            'normalize(hal_V))), 0.0, 1.0)')
+    if index == 1:
+        return ndv, FLOAT
+    if index == 0:
+        power = em.input(node, 'Power', FLOAT)
+        return em.tmp(FLOAT,
+                      f'pow(1.0 - {ndv}, max({power}, 0.01))')
+    ior, _t = em.tmp(FLOAT, f'max({em.input(node, "IOR", FLOAT)}, 1.0001)')
+    f0, _t = em.tmp(FLOAT, f'(({ior} - 1.0) / ({ior} + 1.0)) '
+                           f'* (({ior} - 1.0) / ({ior} + 1.0))')
+    return em.tmp(FLOAT,
+                  f'({f0} + (1.0 - {f0}) * pow(1.0 - {ndv}, 5.0))')
+
+
+def e_halcyon_iridescent(em, node, index):
+    """R202: the Iridescent node's GPU twin -- same hue wheel, same
+    wavelength ratios, same noise lattice as the CPU."""
+    ndv, _t = em.tmp(FLOAT, 'clamp(abs(dot(normalize(hal_N), '
+                            'normalize(hal_V))), 0.0, 1.0)')
+    t, _t2 = em.tmp(FLOAT, f'(1.0 - {ndv})')
+    if index == 1:
+        return t, FLOAT
+    mode = str(prop(node, 'mode', 'SPECTRUM'))
+    shift = em.input(node, 'Shift', FLOAT)
+    scale = em.input(node, 'Scale', FLOAT)
+    sat, _t3 = em.tmp(FLOAT,
+                      f'clamp({em.input(node, "Saturation", FLOAT)}, '
+                      f'0.0, 1.0)')
+
+    def hue6(hexpr):
+        v, _tt = em.tmp(VEC3,
+                        f'clamp(abs(mod(vec3(({hexpr}) * 6.0) '
+                        f'+ vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, '
+                        f'0.0, 1.0)')
+        return v
+
+    if mode == 'PEARL':
+        tint = em.input(node, 'Tint', VEC4)
+        p, _t4 = em.tmp(FLOAT,
+                        f'pow({t}, 1.0 / max({scale}, 0.05))')
+        kiss = hue6(f'mod(({shift}) + {t} * 0.5, 1.0)')
+        rgb, _t5 = em.tmp(
+            VEC3,
+            f'max((vec3(1.0) + (({tint}).rgb - vec3(1.0)) * {p}) '
+            f'* (vec3(1.0) + 0.3 * {sat} * ({kiss} - vec3(0.5)) '
+            f'* {p}), vec3(0.0))')
+        return em.tmp(VEC4, f'vec4({rgb}, 1.0)')
+    phase, _t6 = em.tmp(FLOAT, f'(({shift}) + {t} * ({scale}))')
+    if mode == 'OIL':
+        _need_prims(em)
+        nsc = em.input(node, 'Noise Scale', FLOAT)
+        phase, _t7 = em.tmp(
+            FLOAT,
+            f'({phase} + (hal_pt_vnoise(hal_P * max({nsc}, 1e-4)) '
+            f'- 0.5) * 2.0)')
+    if mode in ('THIN_FILM', 'OIL'):
+        rgb, _t8 = em.tmp(
+            VEC3,
+            f'(vec3(0.5) + 0.5 * cos(9.42477796076938 * {phase} '
+            f'* vec3(1.0, 1.282051282051282, 1.6091954022988506)))')
+    else:
+        rgb = hue6(f'mod({phase}, 1.0)')
+    grey, _t9 = em.tmp(FLOAT,
+                       f'(({rgb}.x + {rgb}.y + {rgb}.z) / 3.0)')
+    out, _ta = em.tmp(VEC3,
+                      f'(vec3({grey}) + ({rgb} - vec3({grey})) * {sat})')
+    return em.tmp(VEC4, f'vec4({out}, 1.0)')
+
+
+def e_halcyon_switch(em, node, _i):
+    sw = em.input(node, 'Switch', FLOAT)
+    a = em.input(node, 'A', VEC4)
+    b = em.input(node, 'B', VEC4)
+    return em.tmp(VEC4, f'((({sw}) > 0.5) ? ({b}) : ({a}))')
+
+
+_WANG_GLSL = """
+float hal_wang01(uint u)
+{
+    u = (u ^ 61u) ^ (u >> 16u);
+    u = u * 9u;
+    u = u ^ (u >> 4u);
+    u = u * 668265261u;
+    u = u ^ (u >> 15u);
+    return float(u & 16777215u) / 16777216.0;
+}
+"""
+
+
+def e_halcyon_random_per_object(em, node, index):
+    """The object id (td.y, an exact integer float) hashed on the driver
+    with the CPU's own uint32 Wang mix -- the SAME float either side."""
+    if em.secondary:
+        raise Unsupported('per-object random reads the object id, which '
+                          'hit shading does not carry; the material '
+                          'shades on the CPU in reflections')
+    if '__wang' not in em.once:
+        em.once.add('__wang')
+        em.inline.append(_WANG_GLSL)
+    seed = em.input(node, 'Seed', FLOAT)
+    u, _t = em.tmp('uint',
+                   f'uint(int(floor(td.y + 0.5)) '
+                   f'+ int(floor(({seed}) + 0.5)) * 7919)')
+    if index == 0:
+        return em.tmp(FLOAT, f'hal_wang01({u})')
+    r, _t = em.tmp(FLOAT, f'hal_wang01({u} ^ 1757225451u)')
+    g, _t = em.tmp(FLOAT, f'hal_wang01({u} ^ 48610963u)')
+    b, _t = em.tmp(FLOAT, f'hal_wang01({u} ^ 2524743835u)')
+    return em.tmp(VEC4, f'vec4({r}, {g}, {b}, 1.0)')
+
+
+def e_halcyon_levels(em, node, _i):
+    col, _t = em.tmp(VEC4, em.input(node, 'Color', VEC4))
+    black, _t = em.tmp(FLOAT, em.input(node, 'Black', FLOAT))
+    white = em.input(node, 'White', FLOAT)
+    gamma, _t = em.tmp(FLOAT, f'max({em.input(node, "Gamma", FLOAT)}, 1e-3)')
+    omin, _t = em.tmp(FLOAT, em.input(node, 'Out Min', FLOAT))
+    omax, _t = em.tmp(FLOAT, em.input(node, 'Out Max', FLOAT))
+    span, _t = em.tmp(FLOAT, f'(abs(({white}) - {black}) < 1e-6) '
+                             f'? 1e-6 : (({white}) - {black})')
+    t, _t = em.tmp(VEC3, f'clamp(({col}.rgb - vec3({black})) / {span}, '
+                         f'0.0, 1.0)')
+    t2, _t = em.tmp(VEC3, f'pow({t}, vec3(1.0 / {gamma}))')
+    return em.tmp(VEC4, f'vec4(vec3({omin}) + ({omax} - {omin}) * {t2}, '
+                        f'{col}.a)')
+
+
+def e_halcyon_smooth_step(em, node, _i):
+    v = em.input(node, 'Value', FLOAT)
+    a, _t = em.tmp(FLOAT, em.input(node, 'From Min', FLOAT))
+    b = em.input(node, 'From Max', FLOAT)
+    span, _t = em.tmp(FLOAT, f'(abs(({b}) - {a}) < 1e-9) '
+                             f'? 1e-9 : (({b}) - {a})')
+    t, _t = em.tmp(FLOAT, f'clamp((({v}) - {a}) / {span}, 0.0, 1.0)')
+    interp = str(prop(node, 'interp', 'SMOOTH'))
+    if interp == 'SMOOTHER':
+        return em.tmp(FLOAT,
+                      f'({t} * {t} * {t} * ({t} * ({t} * 6.0 - 15.0) '
+                      f'+ 10.0))')
+    if interp == 'SMOOTH':
+        return em.tmp(FLOAT, f'({t} * {t} * (3.0 - 2.0 * {t}))')
+    return t, FLOAT
+
+
+def e_halcyon_channel_shuffle(em, node, _i):
+    col, _t = em.tmp(VEC4, em.input(node, 'Color', VEC4))
+    parts = []
+    for i, key in enumerate(('out_r', 'out_g', 'out_b', 'out_a')):
+        pick = str(prop(node, key, 'RGBA'[i]))
+        if pick == 'ZERO':
+            parts.append('0.0')
+        elif pick == 'ONE':
+            parts.append('1.0')
+        else:
+            parts.append(f'{col}.{pick.lower() if pick != "A" else "a"}')
+    return em.tmp(VEC4, f'vec4({parts[0]}, {parts[1]}, {parts[2]}, '
+                        f'{parts[3]})')
+
+
+def e_halcyon_distance_mask(em, node, index):
+    d, _t = em.tmp(FLOAT, 'length(hal_P - hal_eye)')
+    if index == 1:
+        return d, FLOAT
+    start, _t = em.tmp(FLOAT, em.input(node, 'Start', FLOAT))
+    end = em.input(node, 'End', FLOAT)
+    span, _t = em.tmp(FLOAT, f'(abs(({end}) - {start}) < 1e-9) '
+                             f'? 1e-9 : (({end}) - {start})')
+    return em.tmp(FLOAT, f'clamp(({d} - {start}) / {span}, 0.0, 1.0)')
+
+
+def e_halcyon_step_time(em, node, index):
+    em.frame_uniforms.add('hal_frame')
+    step, _t = em.tmp(FLOAT,
+                      f'max({em.input(node, "Step Frames", FLOAT)}, 1.0)')
+    held, _t = em.tmp(FLOAT, f'floor(hal_frame / {step}) * {step}')
+    if index == 0:
+        return held, FLOAT
+    return em.tmp(FLOAT, f'((hal_frame - {held}) / {step})')
+
+
+def e_halcyon_wave(em, node, _i):
+    v = em.input(node, 'Value', FLOAT)
+    freq = em.input(node, 'Frequency', FLOAT)
+    ph = em.input(node, 'Phase', FLOAT)
+    mn, _t = em.tmp(FLOAT, em.input(node, 'Minimum', FLOAT))
+    mx = em.input(node, 'Maximum', FLOAT)
+    t, _t = em.tmp(FLOAT, f'(({v}) * ({freq}) + ({ph}))')
+    wave = str(prop(node, 'wave', 'SINE'))
+    if wave == 'SQUARE':
+        w, _t = em.tmp(FLOAT, f'((({t} - floor({t})) < 0.5) ? 1.0 : 0.0)')
+    elif wave == 'TRIANGLE':
+        w, _t = em.tmp(FLOAT, f'(1.0 - abs(2.0 * ({t} - floor({t})) - 1.0))')
+    elif wave == 'SAW':
+        w, _t = em.tmp(FLOAT, f'({t} - floor({t}))')
+    else:
+        w, _t = em.tmp(FLOAT,
+                       f'(0.5 + 0.5 * sin({t} * 6.2831853071795864769))')
+    return em.tmp(FLOAT, f'({mn} + (({mx}) - {mn}) * {w})')
+
+
 def e_bump(em, node, _i):
     """Blender's Bump node, exactly as `nodeeval.n_bump`.
 
@@ -2804,6 +3161,113 @@ def e_halcyon_blur(em, node, index):
         're-run is CPU-only, so this material shades on the CPU')
 
 
+# --------------------------------------------------- baked-LUT nodes (R206)
+#
+# ColorRamp and the curve nodes are all LUT nodes on the CPU: the export
+# samples the ramp/curve into a 256-entry table (compat.sample_ramp /
+# sample_curve) and nodeeval.lut_eval linearly interpolates it -- every
+# interpolation mode, ease and HSV path is already baked into the table.
+# The GLSL twins inline THE SAME table as a const array and reproduce
+# lut_eval index-for-index: clamp to 0..1, scale by K-1, floor, lerp to
+# the next entry. Parity is table-exact by construction.
+#
+# The field find behind this: 'Mountain' (an Altitude & Slope terrain
+# graded through a ColorRamp) knocked every frame back to the CPU with
+# "no GLSL emitter for ShaderNodeValToRGB".
+
+
+def _emit_lut_f(em, values):
+    """Declare float NAME[K] = float[K](...) and return (name, K)."""
+    k = len(values)
+    em._n += 1
+    name = f'_v{em._n}'
+    lits = ', '.join(f'{float(v):.8f}' for v in values)
+    em.lines.append(f'    float {name}[{k}] = float[{k}]({lits});')
+    return name, k
+
+
+def _emit_lut_v4(em, rows):
+    """Declare vec4 NAME[K] = vec4[K](...) and return (name, K)."""
+    k = len(rows)
+    em._n += 1
+    name = f'_v{em._n}'
+    lits = ', '.join(
+        'vec4(' + ', '.join(f'{float(c):.8f}' for c in row[:4]) + ')'
+        for row in rows)
+    em.lines.append(f'    vec4 {name}[{k}] = vec4[{k}]({lits});')
+    return name, k
+
+
+def _lut_sample(em, lut, k, t, kind):
+    """lut_eval's GLSL twin: clamp, scale by K-1, floor, lerp."""
+    x, _t = em.tmp(FLOAT, f'clamp({t}, 0.0, 1.0) * {float(k - 1):.1f}')
+    em._n += 1
+    i0 = f'_v{em._n}'
+    em.lines.append(f'    int {i0} = int(floor({x}));')
+    em._n += 1
+    i1 = f'_v{em._n}'
+    em.lines.append(f'    int {i1} = min({i0} + 1, {k - 1});')
+    return em.tmp(kind, f'mix({lut}[{i0}], {lut}[{i1}], '
+                        f'{x} - float({i0}))')
+
+
+def e_val_to_rgb(em, node, index):
+    """ShaderNodeValToRGB (the ColorRamp), from its baked 256-row LUT."""
+    fac = em.input(node, 'Fac', FLOAT)
+    lut = prop(node, 'lut')
+    if not lut:
+        # the CPU's no-table fallback: greyscale of the factor
+        col, _t = em.tmp(VEC4, f'vec4({fac}, {fac}, {fac}, 1.0)')
+        alpha, tk = em.tmp(FLOAT, '1.0')
+    else:
+        name, k = _emit_lut_v4(em, lut)
+        col, _t = _lut_sample(em, name, k, fac, VEC4)
+        alpha, tk = em.tmp(FLOAT, f'({col}).a')
+    outs = node.get('outputs') or []
+    o = outs[index] if index < len(outs) else {}
+    if o.get('name') == 'Alpha':
+        return alpha, FLOAT
+    return col, VEC4
+
+
+def e_float_curve(em, node, index):
+    """ShaderNodeFloatCurve: val + (lut(val) - val) * factor."""
+    val = em.input(node, 'Value', FLOAT)
+    fac = em.input(node, 'Factor', FLOAT)
+    lut = prop(node, 'lut')
+    if not lut:
+        return em.tmp(FLOAT, f'{val}')
+    rows = [r[0] if isinstance(r, (list, tuple)) else r for r in lut]
+    name, k = _emit_lut_f(em, rows)
+    smp, _t = _lut_sample(em, name, k, val, FLOAT)
+    return em.tmp(FLOAT, f'{val} + ({smp} - {val}) * ({fac})')
+
+
+def e_rgb_curve(em, node, index):
+    """ShaderNodeRGBCurve: combined curve, then each channel's own.
+
+    The LUT is (256, 4): column 0 the combined C curve, columns 1..3
+    the per-channel curves -- v = C(col.ch); out.ch = CH(v), exactly
+    nodeeval.n_rgb_curve. Alpha passes through; Fac lerps at the end.
+    """
+    col = em.input(node, 'Color', VEC4)
+    fac = em.input(node, 'Fac', FLOAT)
+    lut = prop(node, 'lut')
+    if not lut:
+        return em.tmp(VEC4, f'{col}')
+    name, k = _emit_lut_v4(em, lut)
+    chans = []
+    for ch, sw in enumerate(('r', 'g', 'b')):
+        v, _t = _lut_sample(em, name, k, f'({col}).{sw}', VEC4)
+        comb, _t = em.tmp(FLOAT, f'({v}).x')
+        o, _t = _lut_sample(em, name, k, comb, VEC4)
+        oc, _t = em.tmp(FLOAT, f'({o}).{"xyzw"[ch + 1]}')
+        chans.append(oc)
+    out, _t = em.tmp(VEC4, f'vec4({chans[0]}, {chans[1]}, {chans[2]}, '
+                           f'({col}).a)')
+    return em.tmp(VEC4, f'{col} + ({out} - {col}) * ({fac})')
+
+
 EMITTERS = {
     'HALCYON_ShaderNode': e_halcyon_shader,
     'HALCYON_BIMaterialNode': e_bi_material,
@@ -2871,10 +3335,24 @@ EMITTERS = {
     'HALCYON_WrinklesNode': e_pat_wrinkles,
     'HALCYON_NoiseNode': e_pat_noise,
     'HALCYON_WaterNode': e_pat_water,
+    'HALCYON_CausticsNode': e_pat_caustics,
     'HALCYON_GradientNode': e_pat_gradient_shaped,
     'HALCYON_CellsNode': e_pat_cells_tex,
     'HALCYON_StaticNode': e_pat_static,
     'HALCYON_PosterizeNode': e_halcyon_posterize,
+    'HALCYON_NormalMapNode': e_halcyon_normal_map,
+    'HALCYON_NormalMixNode': e_halcyon_normal_mix,
+    'HALCYON_AltitudeSlopeNode': e_halcyon_altitude_slope,
+    'HALCYON_FacingNode': e_halcyon_facing,
+    'HALCYON_IridescentNode': e_halcyon_iridescent,
+    'HALCYON_SwitchNode': e_halcyon_switch,
+    'HALCYON_RandomPerObjectNode': e_halcyon_random_per_object,
+    'HALCYON_LevelsNode': e_halcyon_levels,
+    'HALCYON_SmoothStepNode': e_halcyon_smooth_step,
+    'HALCYON_ChannelShuffleNode': e_halcyon_channel_shuffle,
+    'HALCYON_DistanceMaskNode': e_halcyon_distance_mask,
+    'HALCYON_StepTimeNode': e_halcyon_step_time,
+    'HALCYON_WaveNode': e_halcyon_wave,
     'HALCYON_DitherNode': e_halcyon_dither,
     'HALCYON_ScreenInfoNode': e_halcyon_screen_info,
     'HALCYON_PixelateNode': e_halcyon_pixelate,
@@ -2892,6 +3370,11 @@ EMITTERS = {
     'ShaderNodeFresnel': e_fresnel,
     'ShaderNodeTexImage': e_tex_image,
     'NodeReroute': e_reroute,
+    # R206: the baked-LUT nodes -- ColorRamp knocked whole frames off
+    # the GPU ("no GLSL emitter for ShaderNodeValToRGB")
+    'ShaderNodeValToRGB': e_val_to_rgb,
+    'ShaderNodeFloatCurve': e_float_curve,
+    'ShaderNodeRGBCurve': e_rgb_curve,
 }
 
 

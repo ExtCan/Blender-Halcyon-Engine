@@ -27,15 +27,20 @@ vertices to integer screen coordinates and drops perspective correction, so
 textures swim across polygons the way they did. The Amiga HAM modes reproduce
 hold-and-modify properly, fringing and all.
 
-**New in this release: open your Blender 2.79 scenes.** File ▸ Import ▸
-Legacy Scene (.blend) — or a plain File ▸ Append — brings a
-2.79-or-earlier file in whole: the Blender Internal materials rebuild one
-to one (shader pairs, ramps, mirror, transparency, all eighteen texture
-slots, the original procedural textures on a ported BI Texture engine),
-lamps arrive with their true 2.79 energies and falloffs, shadows convert
-in both ray and buffer forms, and the old world comes along as sky,
-ambient and fog. Transcribed against the 2.79 source code and proven by
-the test suite, not approximated.
+**Open your Blender 2.79 scenes.** File ▸ Import ▸ Legacy Scene (.blend) — or
+a plain File ▸ Append — brings a 2.79-or-earlier file in whole: the Blender
+Internal materials rebuild one to one (shader pairs, ramps, mirror,
+transparency, all eighteen texture slots, the original procedural textures on
+a ported BI Texture engine), lamps arrive with their true 2.79 energies and
+falloffs, shadows convert in both ray and buffer forms, and the old world
+comes along as sky, ambient and fog. Transcribed against the 2.79 source code
+and proven by the test suite, not approximated.
+
+**The Bryce 1995 material library, decoded.** The original preset collection's
+`.mat` files were cracked byte by byte — material channel records, colour
+tables, refractive indices — and 46 presets sit on the Pre-Made shelf carrying
+the exact numbers Bryce saved in December 1995, notes quoting the original
+library text.
 
 ## What you get
 
@@ -44,47 +49,84 @@ Lambert, Gouraud, Flat, Phong, Blinn-Phong, Blinn, Cook-Torrance, Oren-Nayar,
 Minnaert, Ward, Anisotropic, Metal, Strauss, Multi-Layer, Toon, Translucent,
 Constant and Wireframe.
 
-**52 presets** across six categories. Infini-D, Ray Dream, StudioPro, 3D Studio
-R4 and MAX, trueSpace, LightWave, Imagine, POV-Ray, Bryce, ElectricImage,
-Softimage|3D, Alias PowerAnimator, Wavefront, CINEMA 4D, Real 3D, Vistapro,
-Animation:Master, Vue. VGA Mode 13h, EGA, CGA, Hercules, Macintosh 8-bit and
-1-bit, Windows 3.1 and 95, Amiga OCS and AGA, Atari ST, PC-98, X68000, SVGA,
-Quake software. PlayStation, Saturn, N64, Voodoo, Dreamcast, 3DO, Jaguar. Video
-Toaster, PAL, VHS, S-Video. Web GIF, JPEG, PNG-8, CD-ROM FMV.
+**75 render presets** across six categories. Infini-D, Ray Dream, StudioPro,
+3D Studio R4 and MAX, trueSpace, LightWave, Imagine, POV-Ray, Bryce,
+ElectricImage, Softimage|3D, Alias PowerAnimator, Wavefront, CINEMA 4D, Real
+3D, Vistapro, Animation:Master, Vue. VGA Mode 13h, EGA, CGA, Hercules,
+Macintosh 8-bit and 1-bit, Windows 3.1 and 95, Amiga OCS and AGA, Atari ST,
+PC-98, X68000, SVGA, Quake software. PlayStation, Saturn, N64, Voodoo,
+Dreamcast, 3DO, Jaguar. Video Toaster, PAL, VHS, S-Video. Web GIF, JPEG,
+PNG-8, CD-ROM FMV. Applying one resets everything first, so presets never
+accumulate.
 
-**105 Blender node types** are evaluated, including the full Principled BSDF and
-recursive node groups. Nodes the engine does not recognise pass through and
-report a warning rather than failing the render.
+**167 Blender node types** are evaluated, including the full Principled BSDF
+and recursive node groups. Nodes the engine does not recognise pass through
+and report a warning rather than failing the render.
+
+**74 material templates** in the shader editor's Pre-Made menu, sorted into
+ten families — the engine's own 28 plus the 46 decoded Bryce 1995 presets.
+Picking one adds its nodes beside your graph rather than replacing it.
+
+**26 procedural texture nodes** of the kind these packages shipped — Marble,
+Wood, Granite, Dents, Crackle, Plasma, Ripples, Caustics, Starfield, Weave,
+Scratches, Tiles, Spiral, Cells, TV Static, the POV-Ray family (Bozo, Agate,
+Leopard, Onion, Bumps, Wrinkles, Brick), a 1D–4D Fractal Noise whose integer
+hash is bit-exact on CPU and GPU, an animated Water Noise with an exact loop,
+a shaped Gradient, and Matcap Coordinates. Solid textures, evaluated in 3D,
+so a shape carved out of marble has veins running through it.
 
 **Coded shader nodes.** A real GLSL and HLSL compiler — preprocessor,
 recursive-descent parser, type inference, and code generation with SIMT
-execution masks, so different pixels genuinely take different branches. Declare
-`uniform float rimPower = 2.5;` and a Rim Power socket appears on the node,
-defaulted to 2.5. Declare an output and an output socket appears.
+execution masks, so different pixels genuinely take different branches.
+Declare `uniform float rimPower = 2.5;` and a Rim Power socket appears on the
+node, defaulted to 2.5. Coded shaders compile natively into the GPU's
+deferred pass too, so the same source runs on both devices.
 
-**12 procedural textures** of the kind these packages shipped with — Marble,
-Wood, Granite, Dents, Crackle, Plasma, Ripples, Starfield, Weave, Scratches,
-Tiles and Spiral. Solid textures, evaluated in 3D, so a shape carved out of
-marble has veins running through it. Plasma and Ripples animate.
+**Eight sky modes** — node tree, solid, gradient, banded gradient, starfield,
+Preetham physical sky, HDRI, and a full Bryce Sky Lab: sky dome, sun corona,
+haze, ground fog, a wind-streaked stratus deck, a self-shadowed cumulus deck
+built from turbulence, a rainbow at the correct 42 degrees, stars, comets and
+a nebula wash. **303 sky presets** with rendered thumbnails in a browsable
+gallery, and **48 water presets** under the water plane, where Bryce kept
+them.
 
-**Six sky modes** — node tree, solid, gradient, Preetham physical sky, HDRI, and
-a full Bryce atmosphere with sky dome, sun corona, haze, a wind-streaked stratus
-deck, a self-shadowed cumulus deck built from turbulence, a rainbow at the
-correct 42 degrees, and stars.
+**Nine infinite grounds that answer the scene's lighting** — checker, tiles
+(thin glowing grout is the synthwave floor), dunes, snowfield, lava, an
+animated ocean with a directional wave spectrum, and a Material mode that
+paints any node graph to the horizon. Sun angle, lamp falloff and cast
+shadows from geometry land on the plane; a Scene Lighting dial returns the
+old self-lit look exactly.
 
-**Material conversion.** Three buttons convert the active material, everything on
-the selected objects, or the whole scene onto the Halcyon shader — relinking
-existing textures rather than discarding them, and choosing a reflectance model
-from what the source shader actually was.
+**Weather** — rain, snow, embers and ash over any finished frame,
+deterministic and stable under timeline scrubbing.
+
+**A terrain generator** — seven landforms from mountain to volcano, wired for
+the Altitude & Slope node, with a ColorRamp downstream making the classic
+snow-line in two nodes.
+
+**Halo materials** — the era's glow sprites against the frame's own depth:
+images, noise, rays, star spikes, lightning bolts, shockwaves, halos along
+curves, and lens flares that check their lamp's visibility.
 
 **Output that lands in the right decade.** Colour depth from 32-bit down to
 1-bit, real VGA, Macintosh, EGA, CGA and web-safe palettes, four adaptive
-quantisers, seven error-diffusion kernels plus ordered dither, composite NTSC
-encoding with chroma bleed and dot crawl, CRT aperture grille and shadow masks,
-interlacing, and a genuine 8×8 DCT round-trip for JPEG artefacts.
+quantisers, seven error-diffusion kernels plus ordered dither — or force the
+whole frame through the colours of any image you pick — composite NTSC
+encoding with chroma bleed and dot crawl, CRT aperture grille and shadow
+masks, interlacing, and a genuine 8×8 DCT round-trip for JPEG artefacts.
 
-132 settings in total, and 17 period resolutions with their correct pixel
-aspects.
+**198 settings, all proven.** One test holds every setting to evidence that
+it changes what it claims to change; another fails the build if any property
+ships without a real tooltip.
+
+## GPU support
+
+**The GPU port is complete** — rasterisation, deferred shading and post all
+run through Blender's own `gpu` module. Set Device: GPU in Render Properties.
+A 116-row feature matrix in the built-in Self Test compares the GPU picture
+against the CPU's on your own driver; anything that cannot run on the GPU is
+routed to the CPU **by name**, with the reason printed, and the picture stays
+right. Frame-to-frame caches mean an animation re-uploads only what moved.
 
 ## Getting started
 
@@ -96,54 +138,42 @@ aspects.
    on top double-transforms them
 4. On an existing scene, use **Convert Whole Scene** in the Material panel
 
-Applying a preset resets everything first, so presets never accumulate. Machine
-settings like thread count are preserved.
-
 ## Performance
 
-Shading runs across threads, and **Pixel Scale** is the cheapest large win: it
-renders at 1/N of your output resolution and scales back up with
-nearest-neighbour, so the output stays the size you set while the render costs
-N² times less. Set the output to 1920×1080 with Pixel Scale at 4× and the engine
-renders 480×270 — which is more authentic than rendering at 1080p anyway.
-
-After that, `aa_samples` is the setting that costs the most: it is quadratic, and
-most presets ship at 4.
+**Pixel Scale** is the cheapest large win: it renders at 1/N of your output
+resolution and scales back up with nearest-neighbour — set 1920×1080 with
+Pixel Scale 4× and the engine renders 480×270, which is more authentic than
+rendering at 1080p anyway. After that, `aa_samples` costs the most (it is
+quadratic) — or switch to Adaptive anti-aliasing, which re-samples only the
+edges. **Use Worker Processes** splits a frame across interpreters,
+bit-identical to in-process. The Timing Breakdown prints a per-stage table
+when you want to know where a slow frame spends its time.
 
 ## Requirements
 
 Blender 5.1 or newer. No compiled dependencies — it uses only NumPy, which
-Blender already ships.
+Blender already ships. Developed and tested against Blender 5.2.
 
-## Please read before installing
+## Honest limitations
 
-This is a CPU renderer written in Python. It is not fast, and there is **no GPU
-support**. A 640×480 frame takes seconds to low minutes depending on the scene.
-Use the period resolutions and Pixel Scale and it is perfectly usable; expect
-1080p at high sample counts to be slow.
-
-Other things it does not do:
-
-- No volumetrics, depth of field, motion blur, particles or hair
-- Displacement is evaluated but does not tessellate geometry
-- Procedural noise is independently implemented from published definitions, so
-  it is the right kind of pattern but not bit-identical to Cycles — a material
-  tuned against Cycles will need a nudge
-- The Sky Texture node uses the Preetham analytic model rather than Blender's
-  Nishita atmospheric simulation
-- Ambient occlusion is available but off by default, because it is not period
-  correct
-
-Developed and tested against Blender 5.2. Blender 5.1 is supported but has not
-been tested directly; earlier versions are not supported.
+- Volumetrics are screen-space light shafts; no volume is integrated
+- Depth of field is layered (depth slabs by circle of confusion), not sampled
+- Motion blur averages time-offset frames across a shutter — the era's way
+- Displacement drives a bump, not tessellation
+- Particles and hair are not supported; halo materials cover the classic
+  glow-sprite look
+- Blender's own procedural noises are re-implemented from their published
+  definitions — the right pattern, not bit-identical to Cycles, and they
+  shade on the CPU by name; Halcyon's own pattern nodes are the portable,
+  bit-exact replacements
+- The Sky Texture node is Preetham, not Nishita
 
 ## Reporting problems
 
-There is a **Halcyon Diagnostics** button at the bottom of the Performance panel.
-It prints the scene as the engine actually receives it — every node with its
-properties and links, the world mode, materials, lights and resolved settings —
-to the system console (**Window ▸ Toggle System Console**). Including that output
-with a bug report makes almost anything diagnosable in one pass.
+Turn on **Developer Options**, then **Run Self Test** in the Debug panel: it
+copies a report covering your GPU, the shaders compiled on your driver, the
+116-row CPU/GPU feature comparison and per-stage timings. Nearly every bug in
+this engine's history was diagnosed from that output.
 
 ## Credits
 

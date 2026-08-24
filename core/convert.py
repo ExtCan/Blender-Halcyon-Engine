@@ -220,6 +220,7 @@ def plan(idname, values=None, links=None, model='AUTO'):
                 pass
             break
 
+    scale_links = {}
     if idname == 'ShaderNodeBsdfPrincipled':
         try:
             t = values.get('Transmission Weight', values.get('Transmission', 0.0))
@@ -230,13 +231,17 @@ def plan(idname, values=None, links=None, model='AUTO'):
                 notes.append("transmission mapped to opacity and reflection")
         except (TypeError, ValueError):
             pass
-        try:
-            e = values.get('Emission Strength', 0.0)
-            e = float(e[0]) if hasattr(e, '__len__') else float(e)
-            if e > 0.0 and e != 1.0:
-                notes.append(f"emission strength {e:g} folded into the colour")
-        except (TypeError, ValueError):
-            pass
+
+    if idname in ('ShaderNodeBsdfPrincipled', 'ShaderNodeEmission'):
+        # Emission Strength actually FOLDS now. The old code noted "strength
+        # folded into the colour" and then copied Emission Color alone --
+        # and since 4.0 Principled defaults to a WHITE emission colour at
+        # strength ZERO, every default material converted to a self-lit
+        # white one. This was the bright-white converter bug.
+        pairs, extras2, more, sl = _fold_emission(idname, values, links, pairs)
+        extras.update(extras2)
+        notes.extend(more)
+        scale_links.update(sl)
 
     if idname == 'ShaderNodeEeveeSpecular':
         try:
@@ -250,4 +255,258 @@ def plan(idname, values=None, links=None, model='AUTO'):
 
     chosen = choose_model(idname, values, links) if model == 'AUTO' else model
     return {'model': chosen, 'pairs': pairs, 'extras': extras, 'notes': notes,
-            'source': idname}
+            'scale_links': scale_links, 'source': idname}
+
+
+#: which socket carries the emission colour / strength, per source node
+_EMIT_COLOR = {'ShaderNodeBsdfPrincipled': ('Emission Color', 'Emission'),
+               'ShaderNodeEmission': ('Color',)}
+_EMIT_STRENGTH = {'ShaderNodeBsdfPrincipled': ('Emission Strength',),
+                  'ShaderNodeEmission': ('Strength',)}
+
+
+def _fold_emission(idname, values, links, pairs):
+    """Fold Emission Strength into Self-Illumination, for real.
+
+    Four cases, each exact:
+    - strength constant 0: emission is OFF. The colour -- whatever it says,
+      and since Blender 4.0 it says white by default -- must not be carried.
+    - strength constant, colour constant: the product is the emission.
+    - strength constant (not 1), colour LINKED: the link is kept and marked
+      for a multiply node so the strength still applies.
+    - strength LINKED: the link pair is kept and marked for a multiply node
+      fed by the strength link itself.
+    Returns (pairs, extras, notes, scale_links).
+    """
+    extras, notes, scale_links = {}, [], {}
+    col_aliases = _EMIT_COLOR.get(idname, ())
+    str_aliases = _EMIT_STRENGTH.get(idname, ())
+    emit_pairs = [(t, a) for (t, a) in pairs
+                  if t == 'Self-Illumination' and a in col_aliases]
+    if not emit_pairs:
+        return pairs, extras, notes, scale_links
+
+    s_alias = next((a for a in str_aliases if a in links), None)
+    if s_alias is not None:
+        # dynamic strength: keep the colour link and multiply by the
+        # strength link at the material side
+        scale_links['Self-Illumination'] = ('LINK', s_alias)
+        notes.append("emission strength is node-driven; a multiply node "
+                     "carries it")
+        return pairs, extras, notes, scale_links
+
+    s = 1.0
+    for a in str_aliases:
+        if a in values:
+            try:
+                v = values[a]
+                s = float(v[0]) if hasattr(v, '__len__') else float(v)
+            except (TypeError, ValueError):
+                s = 1.0
+            break
+
+    col_alias = next((a for (t, a) in emit_pairs), None)
+    col_linked = col_alias in links if col_alias is not None else False
+
+    if s <= 0.0:
+        # emission off: drop the colour entirely, however white it is
+        pairs = [(t, a) for (t, a) in pairs
+                 if not (t == 'Self-Illumination' and a in col_aliases)]
+        extras['Self-Illumination'] = (0.0, 0.0, 0.0, 1.0)
+        if col_linked or _nonblack(values.get(col_alias)):
+            notes.append("emission strength is 0; the emission colour "
+                         "was dropped")
+        return pairs, extras, notes, scale_links
+
+    if col_linked:
+        if abs(s - 1.0) > 1e-6:
+            scale_links['Self-Illumination'] = ('VALUE', s)
+            notes.append(f"emission strength {s:g} carried by a multiply "
+                         "node")
+        return pairs, extras, notes, scale_links
+
+    c = values.get(col_alias)
+    if c is not None and abs(s - 1.0) > 1e-6:
+        try:
+            cc = [float(x) for x in (c if hasattr(c, '__len__') else (c,) * 3)]
+            while len(cc) < 3:
+                cc.append(cc[-1])
+            pairs = [(t, a) for (t, a) in pairs
+                     if not (t == 'Self-Illumination' and a in col_aliases)]
+            extras['Self-Illumination'] = (cc[0] * s, cc[1] * s, cc[2] * s,
+                                           1.0)
+            notes.append(f"emission strength {s:g} folded into the colour")
+        except (TypeError, ValueError):
+            pass
+    return pairs, extras, notes, scale_links
+
+
+def _nonblack(c):
+    try:
+        if c is None:
+            return False
+        if hasattr(c, '__len__'):
+            return any(float(x) > 1e-6 for x in list(c)[:3])
+        return float(c) > 1e-6
+    except (TypeError, ValueError):
+        return False
+
+
+# ------------------------------------------------- conversion TO BI material
+
+BI_NODE = 'HALCYON_BIMaterialNode'
+
+
+def _f1(values, *names, default=0.0):
+    for n in names:
+        if n in values:
+            try:
+                v = values[n]
+                return float(v[0]) if hasattr(v, '__len__') else float(v)
+            except (TypeError, ValueError):
+                return default
+    return default
+
+
+def _c3(values, *names, default=None):
+    for n in names:
+        if n in values:
+            v = values[n]
+            try:
+                if hasattr(v, '__len__'):
+                    cc = [float(x) for x in list(v)[:3]]
+                    while len(cc) < 3:
+                        cc.append(cc[-1])
+                    return tuple(cc)
+                return (float(v),) * 3
+            except (TypeError, ValueError):
+                return default
+    return default
+
+
+def bi_plan(idname, values=None, links=None):
+    """How a Blender shader maps onto the BI material node. bpy-free.
+
+    Returns {'props': node properties, 'sockets': {BI socket name: value},
+    'links': [(BI socket name, source socket alias)], 'notes': [...]}.
+    The mapping follows what 2.79's own importer would have done in
+    reverse: hardness from roughness through the renderer's own curve
+    (clamped to BI's 1..511), emission through the Emit float against
+    the diffuse chain, alpha through the transparency panel, and an
+    Emission shader becoming a Shadeless material -- which is exactly
+    what Shadeless was for.
+    """
+    values = values or {}
+    links = set(links or ())
+    props = {'diff_shader': 'LAMBERT', 'spec_shader': 'COOKTORR'}
+    sockets = {}
+    out_links = []
+    notes = []
+
+    def link_or_value(bi_name, aliases, value=None):
+        for a in aliases:
+            if a in links:
+                out_links.append((bi_name, a))
+                return True
+        if value is not None:
+            sockets[bi_name] = value
+        return False
+
+    if idname == 'ShaderNodeEmission':
+        props['shadeless'] = True
+        c = _c3(values, 'Color', default=(0.8, 0.8, 0.8))
+        s = _f1(values, 'Strength', default=1.0)
+        linked = link_or_value('Color', ['Color'],
+                               tuple(min(x * s, 1.0) for x in c) + (1.0,))
+        if linked and abs(s - 1.0) > 1e-6:
+            notes.append(f"emission strength {s:g} cannot scale a linked "
+                         "colour on a shadeless material")
+        elif not linked and s > 1.0:
+            notes.append("shadeless clamps at 1; emission brighter than "
+                         "that is a light, not a material")
+        notes.append("Emission became Shadeless -- BI's flat, unlit colour")
+        return {'props': props, 'sockets': sockets, 'links': out_links,
+                'notes': notes}
+
+    base_aliases = ['Base Color', 'Color']
+    base = _c3(values, *base_aliases, default=(0.8, 0.8, 0.8))
+    link_or_value('Color', base_aliases, tuple(base) + (1.0,))
+    sockets['Intensity'] = 1.0   # Principled's diffuse is Color x 1
+
+    if idname in ('ShaderNodeBsdfGlossy', 'ShaderNodeBsdfAnisotropic',
+                  'ShaderNodeBsdfMetallic'):
+        # a pure mirror shader: all highlight, no diffuse
+        sockets['Intensity'] = 0.0
+        sockets['Specular Color'] = tuple(base) + (1.0,)
+        sockets['Specular Intensity'] = 1.0
+        notes.append("glossy source: diffuse off, highlight carries the "
+                     "colour")
+    if idname == 'ShaderNodeBsdfTranslucent':
+        sockets['Translucency'] = 1.0
+        sockets['Specular Intensity'] = 0.0
+
+    rough = _f1(values, 'Roughness', default=0.5)
+    if 'Roughness' in links:
+        notes.append("a node-driven Roughness cannot become a Hardness "
+                     "exponent; the constant default was used")
+    hard = glossiness_from_roughness(rough)
+    sockets['Hardness'] = max(1.0, min(hard, 511.0))
+    if hard > 511.0:
+        notes.append("hardness clamped to BI's 511 ceiling")
+    if rough > 0.6 and idname in ('ShaderNodeBsdfPrincipled',
+                                  'ShaderNodeBsdfDiffuse'):
+        props['diff_shader'] = 'OREN_NAYAR'
+        sockets['Roughness'] = rough
+        notes.append("rough surface: Oren-Nayar diffuse")
+
+    spec = _f1(values, 'Specular IOR Level', 'Specular', default=0.5)
+    if 'Specular Intensity' not in sockets:
+        link_or_value('Specular Intensity',
+                      ['Specular IOR Level', 'Specular'], spec)
+    else:
+        spec = sockets['Specular Intensity']
+
+    metal = _f1(values, 'Metallic', default=0.0)
+    if metal > 0.5 or 'Metallic' in links:
+        # BI has no metalness; the era's move was tinting the highlight
+        # with the base colour and dropping the diffuse
+        sockets['Specular Color'] = tuple(base) + (1.0,)
+        sockets['Intensity'] = max(0.0, 1.0 - metal) \
+            if 'Metallic' not in links else 0.0
+        sockets['Specular Intensity'] = max(spec, 0.8)
+        notes.append("BI has no metalness; the highlight is tinted with "
+                     "the base colour instead")
+
+    # emission -> Emit, BI's float against the diffuse chain
+    e_col = _c3(values, 'Emission Color', 'Emission', default=(0.0, 0.0, 0.0))
+    e_str = _f1(values, 'Emission Strength', default=1.0)
+    if 'Emission Strength' in links or \
+            any(a in links for a in ('Emission Color', 'Emission')):
+        notes.append("node-driven emission has no BI equivalent; Emit "
+                     "stayed 0")
+    elif e_col is not None and e_str > 0.0 and _nonblack(e_col):
+        base_m = max(sum(base) / 3.0, 1e-3)
+        emit_m = sum(e_col) / 3.0
+        sockets['Emit'] = min(e_str * emit_m / base_m, 20.0)
+        if any(abs(e_col[i] - base[i]) > 0.05 for i in range(3)):
+            notes.append("BI's Emit glows in the diffuse colour; a "
+                         "different emission tint cannot be carried")
+
+    alpha = _f1(values, 'Alpha', default=1.0)
+    if 'Alpha' in links:
+        props['use_transparency'] = True
+        out_links.append(('Alpha', 'Alpha'))
+    elif alpha < 1.0 - 1e-6:
+        props['use_transparency'] = True
+        sockets['Alpha'] = alpha
+
+    ior = _f1(values, 'IOR', default=0.0)
+    if props.get('use_transparency') and ior > 1.0 + 1e-6:
+        props['transp_mode'] = 'RAYTRACE'
+        sockets['Ray IOR'] = min(max(ior, 1.0), 5.0)
+        notes.append("transparency with an IOR: BI Raytrace mode")
+
+    if 'Normal' in links:
+        out_links.append(('Normal', 'Normal'))
+    return {'props': props, 'sockets': sockets, 'links': out_links,
+            'notes': notes}

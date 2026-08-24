@@ -35,7 +35,13 @@ def camera_matrices(camera, width, height):
         mw = np.eye(4, dtype=np.float32)
         mw[2, 3] = 8.0
     else:
-        mw = np.asarray(camera.matrix_world, np.float32)
+        # R205: strip object scale from the camera basis. A camera under
+        # a scaled parent (the .3DS/FBX $$$DUMMY rigs) composes the same
+        # picture but multiplies every camera-space DEPTH by 1/S -- fog,
+        # clip and DoF all read wrong distances. Blender ignores camera
+        # scale; so does Halcyon now. Rigid matrices pass through
+        # bitwise untouched.
+        mw = M.rigid_camera_matrix(camera.matrix_world)
     view = np.linalg.inv(mw).astype(np.float32)
     eye = mw[:3, 3].astype(np.float32)
     if camera is not None and camera.projection is not None:
@@ -88,6 +94,13 @@ _TEX_CACHE = {}
 #: and a repeated F12 re-used ~220ms of identical raster arrays per
 #: frame; a hit restores them as copies in a few milliseconds. Small on
 #: purpose: three entries covers draft+refine+F12 sizes of one scene.
+#: R180: whether the LAST in-process frame wanted GPU shading, whether it
+#: got it, and why not -- so the ENGINE can put the verdict in Blender's
+#: own UI. The field lost 38 minutes to a frame that silently shaded on
+#: the CPU at 16x supersample: the reason was one console line nobody had
+#: open. A refusal that expensive belongs in the interface.
+LAST_GPU_VERDICT = {'wanted': False, 'engaged': False, 'why': ''}
+
 _GBUF_CACHE = {}
 _GBUF_STATS = {'hits': 0, 'misses': 0, 'bytes': 0}
 #: R172: the raster cache is bounded by BYTES, not by a slot count. The
@@ -340,11 +353,14 @@ def closure_to_surface(cl, ctx, settings, material=None):
                 ('fresnel', 'fresnel', 'v', 0.0),
                 ('fresnel_power', 'fresnel_power', 'v', 3.0),
                 ('fresnel_color', 'fresnel_color', 'c', (1, 1, 1)),
+                ('fresnel_blend', 'fresnel_blend', 'v', 0.0),
                 ('rim', 'rim', 'v', 0.0),
                 ('rim_power', 'rim_power', 'v', 3.0),
                 ('rim_color', 'rim_color', 'c', (1, 1, 1)),
+                ('rim_blend', 'rim_blend', 'v', 0.0),
                 ('matcap', 'matcap', 'c', (0, 0, 0)),
                 ('matcap_blend', 'matcap_blend', 'v', 0.0),
+                ('matcap_mode', 'matcap_mode', 'v', 0.0),
                 ('reflect_color', 'reflect_color', 'c', (1, 1, 1)),
                 ('edge_opacity', 'edge_opacity', 'v', 1.0),
                 ('backface_color', 'backface_color', 'c', (0, 0, 0)),
@@ -680,8 +696,11 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         L, rad, dist = LI.sample(light, ctx.P, settings)
         ndl = M.dot(N, L)
         if not np.any(ndl > 0.0) and not np.any(surf.translucency > 0) \
-                and getattr(light, 'type', '') != 'HEMI':
-            # the hemi WRAP lights faces the dot product writes off
+                and getattr(light, 'type', '') not in ('HEMI', 'AREA'):
+            # the hemi WRAP lights faces the dot product writes off --
+            # and an area lamp's Stokes energy can be positive where
+            # the centre dot is not (the rectangle extends past the
+            # point's horizon), so it never takes this shortcut
             continue
         # the shaders run BEFORE the shadow query, because their own
         # gates -- the C's gates, transcribed -- decide which samples
@@ -694,7 +713,22 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         # result reads vis here", not a heuristic. Shadows Only
         # accumulation (only_accum) reads vis at every sample, so its
         # presence disables the skip for the batch.
-        dif, spec = SH.evaluate(model, surf, N, L, V)
+        area_nd = area_nd_back = None
+        if getattr(light, 'type', '') == 'AREA':
+            # BI's area lamp: the Stokes form factor becomes the
+            # diffuse shader's input and multiplies the specular --
+            # size, orientation and distance all speak through it
+            if np.any(surf.translucency > 0):
+                area_nd, area_nd_back = LI.area_inp(light, ctx.P, N,
+                                                    want_back=True)
+            else:
+                area_nd = LI.area_inp(light, ctx.P, N)
+        dif, spec = SH.evaluate(model, surf, N, L, V,
+                                area_ndl=area_nd,
+                                area_ndl_back=area_nd_back)
+        if area_nd is not None:
+            # shade_one_light's area lamp correction: specfac *= inp
+            spec = spec * area_nd[:, None]
         need = None
         if only_accum is None and getattr(light, 'type', '') != 'HEMI':
             need = (dif != 0.0) | (spec != 0.0).any(axis=1)
@@ -930,6 +964,34 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
     return apply_surface_effects(out, surf, N, V)
 
 
+def _blend_layer(out, color, f, mode):
+    """One silhouette layer onto the lit result, by its blend mode.
+
+    Mode 0 is Add -- the only behaviour that existed before 1.38, kept
+    bit for bit on its own fast path. 1 Mix, 2 Multiply, 3 Screen. The
+    factor is clamped for the bounded modes and left free for Add,
+    exactly as the original addition left it free.
+    """
+    fcol = color * f[:, None]
+    mi = np.rint(np.asarray(mode, np.float32)).astype(np.int32) \
+        if mode is not None else np.zeros(1, np.int32)
+    if not np.any(mi):
+        return out + fcol
+    fc = np.clip(f, 0.0, 1.0)[:, None]
+    res = out + fcol
+    if np.any(mi == 1):
+        res = np.where((mi == 1)[:, None],
+                       out * (1.0 - fc) + color * fc, res)
+    if np.any(mi == 2):
+        res = np.where((mi == 2)[:, None],
+                       out * (1.0 - fc * (1.0 - color)), res)
+    if np.any(mi == 3):
+        res = np.where((mi == 3)[:, None],
+                       1.0 - (1.0 - out) * (1.0 - np.clip(fcol, 0.0, 1.0)),
+                       res)
+    return res
+
+
 def apply_surface_effects(out, surf, N, V):
     """Fresnel, rim, matcap, reflection tint and backface override.
 
@@ -942,15 +1004,31 @@ def apply_surface_effects(out, surf, N, V):
 
     if np.any(surf.fresnel > 1e-4):
         f = np.power(edge, np.maximum(surf.fresnel_power, 0.01)) * surf.fresnel
-        out = out + surf.fresnel_color * (f * surf.specular_level)[:, None]
+        out = _blend_layer(out, surf.fresnel_color, f * surf.specular_level,
+                           getattr(surf, 'fresnel_blend', None))
 
     if np.any(surf.rim > 1e-4):
         r = np.power(edge, np.maximum(surf.rim_power, 0.01)) * surf.rim
-        out = out + surf.rim_color * r[:, None]
+        out = _blend_layer(out, surf.rim_color, r,
+                           getattr(surf, 'rim_blend', None))
 
     if np.any(surf.matcap_blend > 1e-4):
-        k = np.clip(surf.matcap_blend, 0.0, 1.0)[:, None]
-        out = out * (1.0 - k) + surf.matcap * k
+        k = np.clip(surf.matcap_blend, 0.0, 1.0)
+        mm = getattr(surf, 'matcap_mode', None)
+        mi = np.rint(np.asarray(mm, np.float32)).astype(np.int32) \
+            if mm is not None else np.zeros(1, np.int32)
+        kc = k[:, None]
+        out2 = out * (1.0 - kc) + surf.matcap * kc     # 0: Mix, the original
+        if np.any(mi == 1):
+            out2 = np.where((mi == 1)[:, None], out + surf.matcap * kc, out2)
+        if np.any(mi == 2):
+            out2 = np.where((mi == 2)[:, None],
+                            out * (1.0 - kc * (1.0 - surf.matcap)), out2)
+        if np.any(mi == 3):
+            out2 = np.where((mi == 3)[:, None],
+                            1.0 - (1.0 - out) *
+                            (1.0 - np.clip(surf.matcap * kc, 0.0, 1.0)), out2)
+        out = out2
 
     if np.any(surf.backface_mix > 1e-4) and surf.backfacing is not None:
         k = (np.clip(surf.backface_mix, 0.0, 1.0) *
@@ -1207,6 +1285,92 @@ def _with_normal(ctx, nrm):
 
 
 # ---------------------------------------------------------- world / horizon
+
+
+def _make_ground_light(scene, st, bvh, lts):
+    """R204: per-point irradiance callback for the infinite ground plane.
+
+    "The infinite floors don't react to lighting either." The analytic
+    plane is background, not geometry, so no light ever reached it. This
+    closure is how it reaches it now: for the plane's hit points it sums
+    the ambient pool and every lamp -- Lambert against the plane's
+    straight-up normal (the wrap term for hemis, the Stokes form factor
+    for area lamps, the classic falloffs via `lights.sample`) -- and
+    shadows each lamp with the SAME machinery geometry uses
+    (`lights.visibility`: ray-traced against the BVH or looked up in the
+    lamp's shadow map), so an object standing on the floor finally casts
+    onto it. Determinism: soft-shadow jitter takes its pixel identity
+    from the QUANTISED WORLD POSITION -- a pure function of the point,
+    so the same frame is the same picture whatever the batch order,
+    chunking or device, exactly as the doctrine demands.
+    """
+    from . import lights as LI
+    amb = LI.ambient_light(scene, st)
+    # the same watts-to-radiance conversion light_surface applies to
+    # every lobe -- without it the floor renders pi times brighter than
+    # the geometry standing on it (measured, not guessed: a grey mesh
+    # plane and a grey ground at the same height must match)
+    inv_pi = np.float32(1.0 / np.pi)
+
+    def fn(P):
+        n = P.shape[0]
+        P = np.asarray(P, np.float32)
+        up = np.zeros((n, 3), np.float32)
+        up[:, 2] = 1.0
+        acc = np.broadcast_to(amb[None, :].astype(np.float32),
+                              (n, 3)).copy()
+        # world-position pixel identity for deterministic soft shadows
+        spx = np.floor(P[:, 0].astype(np.float64) * 64.0).astype(np.int64)
+        spy = np.floor(P[:, 1].astype(np.float64) * 64.0).astype(np.int64)
+        for li, light in enumerate(lts):
+            try:
+                L, rad, dist = LI.sample(light, P, st)
+                if light.type == 'HEMI':
+                    # BI hemis wrap: 0.5 + 0.5 * N.L, never negative
+                    ndl = np.clip(0.5 + 0.5 * L[:, 2], 0.0, 1.0)
+                elif light.type == 'AREA':
+                    ndl = np.clip(np.asarray(
+                        LI.area_inp(light, P, up), np.float32), 0.0, None)
+                else:
+                    ndl = np.clip(L[:, 2], 0.0, 1.0)
+                face = ndl > 0.0
+                if not face.any():
+                    continue
+                vis = LI.visibility(light, P, up, L, dist, st, bvh,
+                                    sample_xy=(spx, spy, li), mask=face)
+                acc += rad * (ndl * vis * inv_pi)[:, None]
+            except Exception:                                   # noqa: BLE001
+                continue
+        return acc
+    return fn
+
+
+def _stash_ground_light(scene, st, bvh):
+    """Hand the ground plane the scene's lighting for this frame.
+
+    Refreshed every frame (lamps move); cleared to None first so a stale
+    closure from an earlier frame can never light a later one. A scene
+    with no lamps hands no callback at all -- there is nothing for the
+    floor to react to, and the picture stays exactly what it always was.
+    """
+    world = getattr(scene, 'world', None)
+    if world is None:
+        return
+    try:
+        world._ground_light = None
+        if not getattr(world, 'ground_plane', False):
+            return
+        if str(getattr(world, 'ground_mode', 'SOLID')) == 'OCEAN':
+            return
+        if float(getattr(world, 'ground_lighting', 1.0) or 0.0) <= 0.0:
+            return
+        from . import lights as LI
+        lts = LI.select_lights(getattr(scene, 'lights', []) or [], st)
+        if not lts:
+            return
+        world._ground_light = _make_ground_light(scene, st, bvh, lts)
+    except Exception:                                           # noqa: BLE001
+        world._ground_light = None
 
 
 def world_color(scene, settings, dirs, textures, n=None, eye=None):
@@ -2339,6 +2503,132 @@ def shaft_sources(scene, settings, vp):
     return out
 
 
+def _synth_caustic_cookies(scene):
+    """Bake the animated pool-light web into each caustic lamp's cookie.
+
+    The pattern is procedural but the DELIVERY is the ordinary cookie
+    road: a small periodic tile rendered by the CPU this frame and set
+    as the lamp's cookie image, so the CPU shader and the GPU's cookie
+    sampler read the SAME texels -- parity by construction, no second
+    GLSL implementation of the light path. A real image cookie on the
+    lamp always wins; the tile is deterministic in (frame time, scale,
+    speed), and seamless, so a SUN tiles it across the world without a
+    join.
+    """
+    lights = getattr(scene, 'lights', None) or ()
+    if not any(float(getattr(l, 'caustics', 0.0)) > 0.0 for l in lights):
+        return
+    from . import patterns as PT
+    from .scene import ImageBuffer
+    t = float(getattr(scene, 'time', 0.0))
+    for light in lights:
+        c = float(getattr(light, 'caustics', 0.0))
+        kind = str(getattr(light, 'type', '')).upper()
+        if c <= 0.0 or kind not in ('SPOT', 'SUN'):
+            continue
+        if getattr(light, 'cookie', None) is not None and \
+                not getattr(light, '_caustic_cookie', False):
+            continue                     # a real image cookie wins
+        size = 256
+        scale = max(float(getattr(light, 'caustics_scale', 4.0)), 0.05)
+        speed = float(getattr(light, 'caustics_speed', 1.0))
+        per = 8
+        ax = (np.arange(size, dtype=np.float32) + 0.5) / size
+        if kind == 'SPOT':
+            # `scale` cells across the cone's image
+            u = ax[None, :] * min(scale, float(per))
+            v = ax[:, None] * min(scale, float(per))
+        else:
+            # one tile spans the full periodic lattice -- seamless
+            u = ax[None, :] * per
+            v = ax[:, None] * per
+        uu = np.broadcast_to(u, (size, size))
+        vv = np.broadcast_to(v, (size, size))
+        web = PT.caustic_web(uu, vv, time=t * speed, period=per)
+        # energy-neutral-ish: mean stays near 1, crests overdrive
+        val = np.maximum(1.0 + (web - 0.35) * 1.6 * min(c, 4.0), 0.0)
+        px = np.repeat(val[:, :, None], 3, axis=2).astype(np.float32)
+        light.cookie = ImageBuffer(name=f'__caustics_{light.name}',
+                                   pixels=px, colorspace='Non-Color')
+        light.cookie_strength = 1.0
+        if kind == 'SUN':
+            light.cookie_scale = scale   # world units per tile
+        light._caustic_cookie = True
+        light._cookie_tex = None         # the CPU sampler re-reads it
+
+
+#: the fixed tap pattern a flare's visibility is sampled with: a 13-point
+#: disc, deterministic, the same on every device
+_FLARE_TAPS = ((0.0, 0.0), (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
+               (0.7, 0.7), (-0.7, 0.7), (0.7, -0.7), (-0.7, -0.7),
+               (0.4, 0.0), (-0.4, 0.0), (0.0, 0.4), (0.0, -0.4))
+
+
+def _flare_sources(scene, st, gbuf, vp):
+    """Screen anchors for the per-lamp lens flares, with visibility.
+
+    Every Video Post flare of the era faded as its source slipped
+    behind geometry -- that behaviour IS the feature, and it is what
+    the image-space post flare (which chases any bright pixel) cannot
+    do. The source's screen disc is sampled against the z-buffer in
+    NDC -- the same space both were projected through, so no
+    reconstruction and no unit traps -- and the covered fraction scales
+    every element. A SUN anchors at its vanishing point and is visible
+    only through sky.
+    """
+    out = []
+    lights = getattr(scene, 'lights', None) or ()
+    if not any(float(getattr(l, 'flare', 0.0)) > 0.0 for l in lights):
+        return out
+    h, w = gbuf.depth.shape
+    for light in lights:
+        fi = float(getattr(light, 'flare', 0.0))
+        if fi <= 0.0:
+            continue
+        if str(getattr(light, 'type', '')).upper() == 'SUN':
+            d = M.normalize(np.asarray(light.direction, np.float32))
+            clip = np.append(-d, 0.0).astype(np.float32) @ vp.T
+            z_l = np.inf                 # at infinity: only sky shows it
+        else:
+            pos = np.asarray(light.position, np.float32)
+            clip = np.append(pos, 1.0).astype(np.float32) @ vp.T
+            z_l = None
+        if clip[3] <= 1e-6:
+            continue                     # behind the camera
+        ndc = clip[:3] / clip[3]
+        if abs(ndc[0]) > 1.4 or abs(ndc[1]) > 1.4:
+            continue                     # far enough off-frame to matter not
+        if z_l is None:
+            z_l = float(ndc[2])
+        px = (float(ndc[0]) * 0.5 + 0.5) * (w - 1)
+        py = (float(ndc[1]) * 0.5 + 0.5) * (h - 1)
+        rad = max(2.0, 0.008 * min(w, h)
+                  * float(getattr(light, 'flare_scale', 1.0)))
+        vis = 0
+        for ox, oy in _FLARE_TAPS:
+            x = int(round(px + ox * rad))
+            y = int(round(py + oy * rad))
+            if x < 0 or x >= w or y < 0 or y >= h:
+                vis += 1                 # off-frame taps count as open sky
+                continue
+            zs = float(gbuf.depth[y, x])
+            if not np.isfinite(zs):
+                vis += 1                 # sky
+            elif np.isfinite(z_l) and z_l <= zs + 1e-7:
+                vis += 1                 # the lamp is nearer than the surface
+        frac = vis / float(len(_FLARE_TAPS))
+        if frac <= 0.0:
+            continue
+        out.append({'x': float(ndc[0]), 'y': float(ndc[1]),
+                    'color': tuple(float(c) for c in light.color),
+                    'intensity': fi * frac,
+                    'scale': float(getattr(light, 'flare_scale', 1.0)),
+                    'streaks': int(getattr(light, 'flare_streaks', 6)),
+                    'rings': int(getattr(light, 'flare_rings', 1)),
+                    'ghosts': int(getattr(light, 'flare_ghosts', 6))})
+    return out
+
+
 def _shadow_coarseness_note(scene, gbuf, proj, rh):
     """One line when shadow texels dwarf output pixels -- the high-res trap.
 
@@ -2470,9 +2760,23 @@ def render(scene, settings=None, progress=None, band=None):
         desugar_master_bump(getattr(_m, 'graph', None))
     if getattr(scene, 'world', None) is not None:
         desugar_master_bump(getattr(scene.world, 'graph', None))
+    _synth_caustic_cookies(scene)
+    # PANO outranks stereo: QTVR panoramas were mono deliverables, and an
+    # off-axis frustum shift has no honest meaning on a stitched cylinder
+    if scene.camera is not None and \
+            str(getattr(scene.camera, 'type', 'PERSP')) == 'PANO' and \
+            not getattr(st, '_pano_strip', False) and band is None and \
+            not getattr(st, '_viewport', False):
+        return _render_panorama(scene, st, progress)
+    if str(getattr(st, 'stereo_mode', 'NONE')) != 'NONE' and \
+            getattr(st, '_stereo', None) is None and band is None and \
+            not getattr(st, '_pano_strip', False) and \
+            not getattr(st, '_viewport', False):
+        return _render_stereo(scene, st, progress)
     if str(st.aa_mode) == 'ACCUMULATE' and int(st.aa_samples) > 1 \
             and getattr(st, '_accum_jitter', None) is None:
         return _render_accumulated(scene, st, progress, band)
+    LAST_GPU_VERDICT.update(wanted=False, engaged=False, why='')
     ss = 1
     if st.aa_mode == 'SUPERSAMPLE':
         ss = max(int(np.round(np.sqrt(max(st.aa_samples, 1)))), 1)
@@ -2480,14 +2784,22 @@ def render(scene, settings=None, progress=None, band=None):
 
     view, proj, vp, eye = camera_matrices(scene.camera, rw, rh)
     jit = getattr(st, '_accum_jitter', None)
-    if jit is not None:
+    ster = getattr(st, '_stereo', None)
+    if jit is not None or ster is not None:
         # the accumulation pass's subpixel offset, as a clip-space
         # translation: J @ vp shifts the whole projection by a fraction of
         # a pixel, exactly what the OpenGL accumulation buffer's
-        # glTranslate jitter did
+        # glTranslate jitter did. A stereo eye rides the same matrix:
+        # its off-axis frustum IS a clip-space x translation, sized so
+        # the convergence plane lands at zero parallax
         J = np.eye(4, dtype=np.float32)
-        J[0, 3] = 2.0 * float(jit[0]) / rw
-        J[1, 3] = 2.0 * float(jit[1]) / rh
+        if jit is not None:
+            J[0, 3] = 2.0 * float(jit[0]) / rw
+            J[1, 3] = 2.0 * float(jit[1]) / rh
+        if ster is not None:
+            s_off, conv = ster
+            J[0, 3] += float(proj[0, 0]) * float(s_off) / max(float(conv),
+                                                              1e-4)
         proj = (J @ proj).astype(np.float32)
         vp = (J @ vp).astype(np.float32)
     # the water needs to know how big a pixel is before it can decide which
@@ -2504,7 +2816,8 @@ def render(scene, settings=None, progress=None, band=None):
 
     need_bvh = st.raytrace or st.ambient_occlusion or \
         getattr(st, 'radiosity', False) or \
-        (st.shadows and st.shadow_default == 'RAY')
+        (st.shadows and st.shadow_default == 'RAY') or \
+        _volume_occlusion_wanted(scene, st)
     bvh = None
     if need_bvh and mesh is not None and mesh.tris is not None and mesh.tris.size:
         with ST.track('build BVH'):
@@ -2512,6 +2825,10 @@ def render(scene, settings=None, progress=None, band=None):
 
     with ST.track('shadow maps'):
         _build_shadows(scene, st, mesh)
+    # R204: the infinite floor answers the scene's lamps now -- built
+    # after the BVH and the shadow maps so its cast shadows can use
+    # whichever of the two each lamp uses
+    _stash_ground_light(scene, st, bvh)
     if False:
         pass
 
@@ -2534,6 +2851,38 @@ def render(scene, settings=None, progress=None, band=None):
 
     if mesh is None or mesh.tris is None or mesh.tris.size == 0:
         img = _background_image(scene, st, rw, rh, vp, eye, None, textures)
+        if band is None:
+            # R194/R195 field finds: this early path returned before
+            # ANY of the whole-frame extras were computed. A scene of
+            # nothing but halo objects drew no halos; a scene of
+            # nothing but a sky, a sun and a camera -- the natural way
+            # to test a lens flare -- could never flare, because
+            # last_flares was never set. An all-far depth buffer is
+            # the honest z-test for a geometry-less frame (every tap
+            # is open sky), and the same buffer serves the halo splat
+            g_empty = raster.GBuffer(rw, rh)
+            if getattr(scene, 'halos', None):
+                with ST.track('halos'):
+                    img = _draw_halos(img, scene, st, g_empty,
+                                      view, proj, rw, rh,
+                                      sel_mask=getattr(st, '_refine_mask',
+                                                       None))
+            # R200: a sky-only scene can rain too -- the same early
+            # path that once ate the halos and the flares
+            wd_w = getattr(scene, 'world', None)
+            if wd_w is not None and \
+                    str(getattr(wd_w, 'weather', 'NONE')
+                        or 'NONE') != 'NONE' and \
+                    not getattr(st, '_pano_strip', False):
+                from . import sky as SKY
+                with ST.track('weather'):
+                    img = SKY.weather_overlay(
+                        img, wd_w, rw, rh,
+                        time=float(getattr(scene, 'time', 0.0)),
+                        out_wh=(W, H),
+                        sel_mask=getattr(st, '_refine_mask', None))
+            scene.last_shafts = shaft_sources(scene, st, vp)
+            scene.last_flares = _flare_sources(scene, st, g_empty, vp)
         if band is not None:
             y0, y1 = max(band[0], 0), min(band[1], H)
             return _resolve(img[y0 * ss:y1 * ss], W, y1 - y0, ss, st)
@@ -2763,6 +3112,14 @@ def render(scene, settings=None, progress=None, band=None):
                             getattr(st, 'depth_sort', 'ZBUFFER'))
         if _rep:
             print(_rep)
+        if getattr(st, 'fog', False):
+            # R205: when the whole subject sits past Fog End, the frame
+            # comes out as flat fog colour -- say so with the numbers,
+            # instead of leaving "the fog is not right" to be diagnosed
+            # from a beige rectangle
+            _note = fog_coverage_note(proj, gbuf, st)
+            if _note:
+                print(_note)
         if rastered_on_gpu:
             # the split behind the breakdown's one 'rasterise (GPU)'
             # number: at high resolutions the interesting question is
@@ -2802,11 +3159,34 @@ def render(scene, settings=None, progress=None, band=None):
         keep = np.zeros(rh, bool)
         keep[max(band[0], 0) * ss:min(band[1], H) * ss] = True
         covered &= keep[:, None]
+    _rm = getattr(st, '_refine_mask', None)
+    if _rm is not None:
+        # an adaptive-AA refine pass: shade ONLY the flagged edge
+        # pixels. The raster above still ran whole-frame (the jittered
+        # projection decides anew which pixels geometry covers) and the
+        # background below still fills every uncovered pixel (a masked
+        # sky pixel needs its correctly-jittered sky) -- what the mask
+        # cuts is the expensive part, per-fragment shading. Everything
+        # this pass computes outside the mask is discarded by the
+        # accumulation in _adaptive_refine, so restricting `covered`
+        # here changes no masked pixel's value
+        covered &= _rm
+    _bg_un = (~covered) & (keep[:, None] if band is not None else True)
+    if _rm is not None:
+        # a refine pass keeps only its flagged pixels; sky computed
+        # anywhere else is discarded by the accumulation, so it is not
+        # computed. The values at flagged sky pixels are per-pixel
+        # independent and therefore identical to a full evaluation --
+        # this took the field's sky bucket from a full evaluation per
+        # pass to a sliver
+        _bg_un = _bg_un & _rm
     with ST.track('background / sky'):
-        img = _background_image(scene, st, rw, rh, vp, eye,
-                                (~covered) & (keep[:, None] if band is not None
-                                              else True), textures, ss=ss)
-    _spot_cones(img, scene, st, gbuf, vp, eye, rw, rh)
+        img = _background_image(scene, st, rw, rh, vp, eye, _bg_un,
+                                textures, ss=ss)
+    # (volumetric light beams composite AFTER shading now -- they are in
+    # front of geometry, and drawing them here had the shading loop's
+    # img[py, px] assignment overwrite every beam pixel that crossed a
+    # surface: the field's beams only ever showed against the sky)
 
     py, px = np.nonzero(covered)
     if py.size:
@@ -2850,6 +3230,17 @@ def render(scene, settings=None, progress=None, band=None):
         shaded_on_gpu = False
         if str(getattr(st, 'render_device', 'CPU')).upper() == 'GPU' and \
                 st.gpu_shading and band is None:
+            # Adaptive refine passes (_rm set) take this branch too --
+            # 1.38.0 gated them onto the CPU, reasoning that a
+            # full-screen pass over a few percent of a frame was
+            # overhead. The field measured the truth: the CPU pays for
+            # rays, bump fields and texture footprints PER PIXEL at
+            # ~130us each while the GPU's whole-frame pass is seconds
+            # flat -- three CPU refine passes cost 306s of a 317s
+            # frame. The full-screen draw shades everything and the
+            # masked assignment below keeps only the flagged pixels;
+            # base and refines now also shade on the SAME device
+            LAST_GPU_VERDICT.update(wanted=True, engaged=False, why='')
             from ..gpu import shade as _gpu_shade
             with ST.track('shade (GPU)'):
                 try:
@@ -2857,6 +3248,7 @@ def render(scene, settings=None, progress=None, band=None):
                 except Exception as exc:                        # noqa: BLE001
                     got, why = None, str(exc)
             if got is None:
+                LAST_GPU_VERDICT['why'] = str(why or '')
                 print(f'[Halcyon GPU] shading on the CPU: {why}')
                 try:
                     # the field's missing WHY: five GPU-device sessions
@@ -2879,14 +3271,19 @@ def render(scene, settings=None, progress=None, band=None):
                 else:
                     img[py, px, 3] = 1.0
                 shaded_on_gpu = True
+                LAST_GPU_VERDICT['engaged'] = True
                 try:
                     from .. import fault_note
                     fault_note('GPU shading engaged', key='plan-yes',
                                limit=3)
                 except Exception:                               # noqa: BLE001
                     pass
-                if band is None and not getattr(st, '_viewport', False):
+                if band is None and _rm is None and \
+                        not getattr(st, '_viewport', False):
                     # the split behind the one 'shade (GPU)' number --
+                    # (refine passes shade through here too but stay
+                    # quiet: three extra splits per frame would drown
+                    # the one that describes the base picture) --
                     # a 44-second shade bucket cannot be attacked until
                     # plan, upload, draw, sweeps and composite each own
                     # their milliseconds, and the pass count is printed
@@ -2900,6 +3297,29 @@ def render(scene, settings=None, progress=None, band=None):
                             f"{k[:-3].replace('_', '+')} "
                             f'{float(_LT.get(k, 0.0)):.1f} ms'
                             for k in keys if _LT.get(k))
+                        if float(_LT.get('composite_ms', 0.0)) > 1000.0:
+                            # R182/R183: a composite over a second names
+                            # its measured parts; 'other' is the hunt
+                            # list, and the height pre-passes own their
+                            # milliseconds (cpu count called out)
+                            _pw = str(_LT.get('prepass_whys', '') or '')
+                            parts += (
+                                ' (composite: own '
+                                f"{float(_LT.get('c_own_ms', 0.0)):.0f}"
+                                ' + env '
+                                f"{float(_LT.get('c_env_ms', 0.0)):.0f}"
+                                ' + fog '
+                                f"{float(_LT.get('c_fog_ms', 0.0)):.0f}"
+                                ' + prepass '
+                                f"{float(_LT.get('prepass_ms', 0.0)):.0f}"
+                                f" [{int(_LT.get('prepass_n', 0))}x, "
+                                f"{int(_LT.get('prepass_cpu', 0))} cpu"
+                                + (f' -- {_pw}' if _pw and
+                                   int(_LT.get('prepass_cpu', 0)) else '')
+                                + ']'
+                                ' + other '
+                                f"{float(_LT.get('c_other_ms', 0.0)):.0f}"
+                                ')')
                         if _LT.get('burst_draw_ms') or \
                                 _LT.get('burst_read_ms'):
                             # R175b: inside the burst crossing --
@@ -2963,11 +3383,14 @@ def render(scene, settings=None, progress=None, band=None):
             bary = gbuf.bary[py, px]
             blin = gbuf.bary_lin[py, px] if gbuf.bary_lin is not None else None
             front = gbuf.front[py, px]
-            if band is not None and has_bump:
+            if (band is not None or _rm is not None) and has_bump:
                 # a band shades only its rows, but n_bump's gradients
                 # need the CONTEXT row the extended scissor rasterised:
                 # hand the field builder the G-buffer's FULL coverage,
-                # so a band's gradients equal the whole frame's
+                # so a band's gradients equal the whole frame's. An
+                # adaptive refine pass has the same shape -- a shaded
+                # SUBSET whose gradients must equal the full frame's --
+                # so it hands over full coverage for the same reason
                 fpy, fpx = np.nonzero(gbuf.mask())
                 job.bump_field_source = (
                     gbuf.tri[fpy, fpx], gbuf.bary[fpy, fpx], fpx, fpy,
@@ -2987,6 +3410,19 @@ def render(scene, settings=None, progress=None, band=None):
         with ST.track('outline'):
             img = apply_outline(scene, gbuf, img, st)
 
+    with ST.track('ground plane over geometry'):
+        img = _plane_over_geometry(img, scene, st, job, gbuf, eye, textures)
+
+    if getattr(scene, 'halos', None) and band is None:
+        # exactly BI's tile order: solid z-buffer, then halos against
+        # it, then the transparent faces composite OVER the halos.
+        # Never on a band: a band's buffer starts at its own y and the
+        # frame-coordinate splats would land shifted (the pool skips
+        # halo scenes; this guard keeps a direct banded call honest)
+        with ST.track('halos'):
+            img = _draw_halos(img, scene, st, gbuf, view, proj, rw, rh,
+                              sel_mask=_rm)
+
     if transparent is not None and transparent.size and frags is not None:
         if progress:
             progress(0.65, 'Transparency')
@@ -3003,6 +3439,28 @@ def render(scene, settings=None, progress=None, band=None):
                          gbuf=gbuf, flat_depth=flat_depth, scissor=scissor,
                          subdiv_px=subdiv_px, near_eps=near_eps)
 
+    with ST.track('volumetric lights'):
+        img = _light_volumes(img, scene, st, gbuf, vp, eye, rw, rh, bvh,
+                             sel_mask=_rm)
+
+    if band is None and str(st.debug_pass) == 'BEAUTY' and \
+            not getattr(st, '_pano_strip', False):
+        # R200: the Weather overlay -- in front of geometry, halos,
+        # beams and sky alike (the lens flares composite later still,
+        # in post: a flare lives IN the lens, rain in the world).
+        # Never on a band (frame-coordinate splats; the engine pool
+        # skips weather scenes) and never per pano strip -- the
+        # stitcher draws it once on the finished panorama
+        wd_w = getattr(scene, 'world', None)
+        if wd_w is not None and \
+                str(getattr(wd_w, 'weather', 'NONE') or 'NONE') != 'NONE':
+            from . import sky as SKY
+            with ST.track('weather'):
+                img = SKY.weather_overlay(
+                    img, wd_w, rw, rh,
+                    time=float(getattr(scene, 'time', 0.0)),
+                    out_wh=(W, H), sel_mask=_rm)
+
     if st.debug_pass != 'BEAUTY':
         img = _debug_pass(job, gbuf, img, st)
 
@@ -3012,7 +3470,8 @@ def render(scene, settings=None, progress=None, band=None):
     # Extra passes come off the same G-buffer the beauty image did, before
     # anything downsamples or quantises it.
     depth_m = None
-    if st.dof or 'Depth' in wanted_passes(st) or str(st.aa_mode) == 'EDGE':
+    if st.dof or 'Depth' in wanted_passes(st) or \
+            str(st.aa_mode) in ('EDGE', 'ADAPTIVE'):
         with ST.track('linear depth'):
             depth_m = linear_depth(job, gbuf, eye)
     scene.last_passes = build_aux_passes(job, gbuf, st, depth_m)
@@ -3030,6 +3489,7 @@ def render(scene, settings=None, progress=None, band=None):
         # slider allows far behind the whole scene and blurred the lot.
         scene.last_depth = depth_m[::ss, ::ss] if ss > 1 else depth_m
     scene.last_shafts = shaft_sources(scene, st, vp)
+    scene.last_flares = _flare_sources(scene, st, gbuf, vp)
 
     if str(st.aa_mode) == 'EDGE':
         # the console flicker filter: find polygon edges on the id buffer
@@ -3040,12 +3500,345 @@ def render(scene, settings=None, progress=None, band=None):
         with ST.track('edge smooth'):
             img = _edge_smooth(img, gbuf, st, depth_m)
 
+    if str(st.aa_mode) == 'ADAPTIVE' and int(st.aa_samples) > 1 and \
+            band is None and _rm is None and \
+            getattr(st, '_accum_jitter', None) is None and \
+            not getattr(st, '_viewport', False):
+        # the Bryce/POV-Ray second pass: the frame above is the base
+        # render, and only its EDGE pixels get re-sampled. Guards: a
+        # refine pass must never recurse (_rm), a jittered pass is
+        # already someone's sub-sample (_accum_jitter), a pooled band
+        # cannot see across its seam (band -- the engine skips the pool
+        # for this mode), and the viewport forces aa NONE anyway
+        with ST.track('adaptive AA'):
+            img = _adaptive_refine(scene, st, img, gbuf, mesh, depth_m,
+                                   progress)
+
     with ST.track('resolve / downsample'):
         if band is not None:
             y0 = max(band[0], 0)
             y1 = min(band[1], H)
             return _resolve(img[y0 * ss:y1 * ss], W, y1 - y0, ss, st)
         return _resolve(img, W, H, ss, st)
+
+
+def bake_lightmap(scene, st, obj_index=None, size=512, mode='COMBINED',
+                  margin=4, progress=None):
+    """R192: bake lighting into UV space -- the era's lightmap road.
+
+    Rasterises the object's active-UV layout through the engine's own
+    rasteriser (UVs as an orthographic vertex position: the seams,
+    coverage rules and barycentrics are exactly the frame's), then
+    shades every covered texel's WORLD position with the ordinary CPU
+    shading core -- same lamps, same shadow maps and rays, same
+    material graphs, same deterministic per-texel sampling streams --
+    with the view pinned along the surface normal, exactly what 2.79's
+    Full Render bake did (a lightmap must not freeze one camera's
+    speculars into the wall). AO mode bakes the ambient-occlusion
+    term alone, white where open. `margin` texels of edge dilation
+    keep bilinear lookups from bleeding the empty background in.
+
+    Returns ((size, size, 4) float32 bottom-row-first, None) or
+    (None, why-string). Pure core -- the operator wraps it.
+    """
+    mesh = scene.mesh
+    if mesh is None or mesh.tris is None or not len(mesh.tris):
+        return None, 'the scene has no geometry to bake'
+    if mesh.uvs is None:
+        return None, 'the object has no UV layer to bake into'
+    if obj_index is not None and mesh.obj_index is not None:
+        sel = np.nonzero(mesh.obj_index == int(obj_index))[0]
+        if sel.size == 0:
+            return None, 'the object has no faces in the scene'
+    else:
+        sel = None
+    size = max(int(size), 8)
+
+    from .nodeeval import desugar_master_bump
+    for _m in (scene.materials or ()):
+        desugar_master_bump(getattr(_m, 'graph', None))
+    collect_exclusive_lights(scene)
+    textures = prepare_textures(scene, st)
+    _build_shadows(scene, st, mesh)
+    bvh = None
+    try:
+        bvh = _cached_bvh(scene, mesh)
+    except Exception:                                           # noqa: BLE001
+        bvh = None
+
+    # the UV layout as geometry: u,v in [0,1] -> NDC through identity
+    uv = np.asarray(mesh.uvs, np.float32)
+    verts_uv = np.zeros((uv.shape[0], 3), np.float32)
+    verts_uv[:, 0] = uv[:, 0] * 2.0 - 1.0
+    verts_uv[:, 1] = uv[:, 1] * 2.0 - 1.0
+    g = raster.GBuffer(size, size)
+    raster.rasterize(verts_uv, mesh.tris, np.eye(4, dtype=np.float32),
+                     size, size, cull='NONE', gbuf=g, subset=sel)
+    covered = g.tri >= 0
+    if not covered.any():
+        return None, 'no UV-mapped faces landed inside the 0..1 tile'
+
+    ys, xs = np.nonzero(covered)
+    tri_idx = g.tri[covered].astype(np.int64)
+    bary = g.bary[covered]
+    if progress:
+        progress(0.2, f'Baking {tri_idx.size} texels')
+
+    eye = np.zeros(3, np.float32)
+    if scene.camera is not None and scene.camera.matrix_world is not None:
+        eye = np.asarray(scene.camera.matrix_world,
+                         np.float32)[:3, 3].copy()
+    job = ShadeJob(scene, st, textures, bvh,
+                   np.eye(4, dtype=np.float32), eye, size, size)
+    out = np.zeros((size, size, 4), np.float32)
+    flat = np.zeros((tri_idx.size, 4), np.float32)
+    mat_idx = mesh.mat_index[tri_idx] if mesh.mat_index is not None \
+        else np.zeros(tri_idx.size, np.int32)
+    px_f = xs.astype(np.float32)
+    py_f = ys.astype(np.float32)
+    done = 0
+    for mi in np.unique(mat_idx):
+        s2 = np.nonzero(mat_idx == mi)[0]
+        mat = scene.materials[int(mi)] \
+            if int(mi) < len(scene.materials) else None
+        sub = job.context(tri_idx[s2], bary[s2], px_f[s2], py_f[s2],
+                          np.ones(s2.size, bool), None, 0, True)
+        sub.spx = xs[s2].astype(np.int64)
+        sub.spy = ys[s2].astype(np.int64)
+        # the bake view: straight down the normal, per texel
+        Nn = M.normalize(sub.N)
+        sub.I = (-Nn).astype(np.float32)
+        if mode == 'AO':
+            if bvh is None:
+                occ = np.ones(s2.size, np.float32)
+            else:
+                occ = ambient_occlusion(sub.P, Nn, bvh, st,
+                                        rng=job.rng,
+                                        sample_xy=(sub.spx, sub.spy))
+            flat[s2, 0] = flat[s2, 1] = flat[s2, 2] = occ
+            flat[s2, 3] = 1.0
+        else:
+            col = job.shade_batch(sub, mat)
+            flat[s2] = col
+            flat[s2, 3] = 1.0
+        done += s2.size
+        if progress:
+            progress(0.2 + 0.7 * done / max(tri_idx.size, 1), 'Baking')
+    out[ys, xs] = flat
+
+    # seam margin: grow the island edges outward so bilinear samples
+    # never read the void
+    cov = covered.copy()
+    for _ in range(max(int(margin), 0)):
+        grow = np.zeros_like(cov)
+        acc = np.zeros_like(out)
+        cnt = np.zeros((size, size), np.float32)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                src = cov[max(-dy, 0):size - max(dy, 0),
+                          max(-dx, 0):size - max(dx, 0)]
+                dsty = slice(max(dy, 0), size - max(-dy, 0))
+                dstx = slice(max(dx, 0), size - max(-dx, 0))
+                srcy = slice(max(-dy, 0), size - max(dy, 0))
+                srcx = slice(max(-dx, 0), size - max(dx, 0))
+                acc[dsty, dstx] += np.where(src[:, :, None],
+                                            out[srcy, srcx], 0.0)
+                cnt[dsty, dstx] += src
+                grow[dsty, dstx] |= src
+        fill = grow & ~cov & (cnt > 0)
+        out[fill] = acc[fill] / cnt[fill][:, None]
+        cov |= fill
+    if progress:
+        progress(1.0, 'Baked')
+    return out, None
+
+
+def _rot_axis3(axis, ang):
+    """Rodrigues: the 3x3 rotation of `ang` radians about a unit axis."""
+    ax = np.asarray(axis, np.float32)
+    c, s = float(np.cos(ang)), float(np.sin(ang))
+    x, y, z = float(ax[0]), float(ax[1]), float(ax[2])
+    K = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]], np.float32)
+    return (np.eye(3, dtype=np.float32) * c + s * K
+            + (1.0 - c) * np.outer(ax, ax)).astype(np.float32)
+
+
+def _render_panorama(scene, st, progress):
+    """The QTVR cylinder: a full 360-degree panorama from one eye point.
+
+    A cylindrical projection cannot come out of a linear rasteriser, so
+    the drum is rendered as rotated planar STRIPS -- all sharing the
+    same eye, which keeps every view-dependent term (speculars,
+    fresnel, reflections) continuous across the joins -- and each strip
+    is then resampled onto the cylinder with the exact planar-to-
+    cylindrical mapping, bilinear, deterministic. Sixteen strips of
+    22.5 degrees, rendered with ~35% horizontal overscan so the
+    resample never reads outside its strip.
+
+    The output maps column to azimuth linearly across 360 degrees and
+    row to tan(elevation) through the camera's own vertical field.
+    Screen-space extras that assume one planar view -- light shafts,
+    lens flares, DoF and the aux passes -- are cleared rather than
+    stitched wrong; a panorama is a backdrop deliverable, exactly as
+    QTVR was.
+    """
+    import copy as _copy
+    W = max(int(st.resolution_x), 1)
+    H = max(int(st.resolution_y), 1)
+    cam = scene.camera
+    mw = np.asarray(cam.matrix_world, np.float32)
+    up = mw[:3, 1] / max(float(np.linalg.norm(mw[:3, 1])), 1e-9)
+    lens = float(getattr(cam, 'lens', 50.0) or 50.0)
+    sensor = float(getattr(cam, 'sensor', 36.0) or 36.0)
+    fov_x = 2.0 * np.arctan(sensor * 0.5 / max(lens, 1e-3))
+    aspect = W / max(H, 1)
+    tan_vh = float(np.tan(fov_x * 0.5) / max(aspect, 1e-6))
+    near = float(getattr(cam, 'clip_start', 0.1) or 0.1)
+    far = float(getattr(cam, 'clip_end', 1000.0) or 1000.0)
+
+    n_strips = 16
+    hstrip = 2.0 * np.pi / n_strips
+    tan_hh = float(np.tan(hstrip * 0.5)) * 1.10
+    tan_vs = tan_vh / float(np.cos(hstrip * 0.5)) * 1.04
+    ws = int(np.ceil(W / n_strips * 1.35))
+    hs = int(np.ceil(H * 1.15))
+    cols_per = W / float(n_strips)
+
+    # borrow the raster's own _persp so the strips live on exactly the
+    # clip conventions every other camera in the engine uses:
+    # proj[1,1] = 1/tan_vs and proj[0,0] = 1/tan_hh
+    proj = LI._persp(2.0 * np.arctan(tan_vs), tan_hh / tan_vs, near, far)
+
+    out = np.zeros((H, W, 4), np.float32)
+    jj = (np.arange(H, dtype=np.float32) + 0.5) / H * 2.0 - 1.0
+    tanel = jj * tan_vh
+    for k in range(n_strips):
+        if progress:
+            progress(0.05 + 0.9 * (k / n_strips),
+                     f'Panorama strip {k + 1}/{n_strips}')
+        phi_c = (k + 0.5) * hstrip - np.pi
+        cam2 = _copy.copy(cam)
+        m2 = mw.copy()
+        m2[:3, :3] = _rot_axis3(up, -phi_c) @ mw[:3, :3]
+        cam2.matrix_world = m2
+        cam2.projection = proj.copy()
+        cam2.type = 'PERSP'
+        sc2 = _copy.copy(scene)
+        sc2.camera = cam2
+        st2 = st.copy()
+        st2.resolution_x = ws
+        st2.resolution_y = hs
+        st2._pano_strip = True
+        frame = render(sc2, st2, None, band=None)
+        fh, fw = frame.shape[:2]
+
+        i0 = int(np.floor(k * cols_per))
+        i1 = int(np.floor((k + 1) * cols_per)) if k + 1 < n_strips else W
+        cols = np.arange(i0, i1, dtype=np.float32)
+        phi = (cols + 0.5) / W * (2.0 * np.pi) - np.pi
+        dphi = phi - phi_c
+        sx = np.tan(dphi) / tan_hh                       # strip ndc x
+        sec = 1.0 / np.cos(dphi)
+        sy = (tanel[:, None] * sec[None, :]) / tan_vs    # strip ndc y
+        px = (sx * 0.5 + 0.5) * fw - 0.5
+        py = (sy * 0.5 + 0.5) * fh - 0.5
+        pxg = np.broadcast_to(px[None, :], sy.shape)
+        x0 = np.clip(np.floor(pxg), 0, fw - 2).astype(np.int32)
+        y0 = np.clip(np.floor(py), 0, fh - 2).astype(np.int32)
+        tx = np.clip(pxg - x0, 0.0, 1.0).astype(np.float32)[:, :, None]
+        ty = np.clip(py - y0, 0.0, 1.0).astype(np.float32)[:, :, None]
+        c00 = frame[y0, x0]
+        c10 = frame[y0, x0 + 1]
+        c01 = frame[y0 + 1, x0]
+        c11 = frame[y0 + 1, x0 + 1]
+        out[:, i0:i1] = (c00 * (1 - tx) * (1 - ty) + c10 * tx * (1 - ty)
+                         + c01 * (1 - tx) * ty + c11 * tx * ty)
+
+    # planar screen-space extras cannot be stitched honestly
+    scene.last_passes = None
+    scene.last_depth = None
+    scene.last_shafts = []
+    scene.last_flares = []
+    out = out.astype(np.float32)
+    # R200: weather falls ONCE across the finished panorama -- each
+    # strip skipped it (st2._pano_strip), or sixteen copies of the
+    # same storm would tile the sweep
+    wd_w = getattr(scene, 'world', None)
+    if wd_w is not None and \
+            str(getattr(wd_w, 'weather', 'NONE') or 'NONE') != 'NONE':
+        from . import sky as SKY
+        with ST.track('weather'):
+            out = SKY.weather_overlay(
+                out, wd_w, W, H,
+                time=float(getattr(scene, 'time', 0.0)), out_wh=(W, H))
+    return out
+
+
+def _render_stereo(scene, st, progress):
+    """Two eyes, one picture: the era's stereo pair modes.
+
+    Parallel cameras separated by Eye Distance along the camera's own
+    right axis, each with the off-axis frustum shift that puts the
+    Convergence distance at zero parallax -- translate-and-shift, the
+    method with no vertical parallax and no keystone, which is why the
+    stereo photography of the period used it. ANAGLYPH combines the
+    classic way (left eye's red, right eye's green and blue -- view
+    with red/cyan glasses); SBS packs squeezed left|right half-frames;
+    CROSS swaps them for the cross-eyed viewer. The auxiliary passes
+    and shafts keep the LEFT eye's, the reference eye.
+    """
+    import copy as _copy
+    d = float(getattr(st, 'stereo_eye_distance', 0.065))
+    conv = max(float(getattr(st, 'stereo_convergence', 8.0)), 1e-3)
+    mw = np.asarray(scene.camera.matrix_world, np.float32)
+    right = mw[:3, 0] / max(float(np.linalg.norm(mw[:3, 0])), 1e-9)
+
+    def eye_frame(sign, prog):
+        cam2 = _copy.copy(scene.camera)
+        mw2 = mw.copy()
+        mw2[:3, 3] = mw2[:3, 3] + right * (sign * d * 0.5)
+        cam2.matrix_world = mw2
+        sc2 = _copy.copy(scene)
+        sc2.camera = cam2
+        st2 = st.copy()
+        # the eye moved +s along right, so straight-ahead points slide
+        # -x in its view; the frustum shifts to put Convergence back at
+        # ndc x = 0 (derivation in the J block above)
+        st2._stereo = (-sign * d * 0.5, conv)
+        frame = render(sc2, st2, prog, band=None)
+        # aux passes land on the shallow copy's shared attributes; the
+        # LEFT eye (rendered first) is the reference, so its values are
+        # captured before the right eye overwrites them
+        return frame, (getattr(sc2, 'last_passes', None),
+                       getattr(sc2, 'last_depth', None),
+                       getattr(sc2, 'last_shafts', None),
+                       getattr(sc2, 'last_flares', None))
+
+    left, aux = eye_frame(-1.0, progress)
+    right_f, _aux_r = eye_frame(+1.0, None)
+    (scene.last_passes, scene.last_depth, scene.last_shafts,
+     scene.last_flares) = aux
+
+    mode = str(getattr(st, 'stereo_mode', 'NONE'))
+    if mode == 'ANAGLYPH':
+        out = right_f.copy()
+        out[:, :, 0] = left[:, :, 0]
+        out[:, :, 3] = np.maximum(left[:, :, 3], right_f[:, :, 3])
+        return out.astype(np.float32)
+    # squeezed halves: every other column, nearest-neighbour -- the
+    # period pack, deterministic
+    lh = left[:, ::2, :]
+    rh = right_f[:, ::2, :]
+    w_half = min(lh.shape[1], rh.shape[1])
+    lh, rh = lh[:, :w_half], rh[:, :w_half]
+    pair = (rh, lh) if mode == 'CROSS' else (lh, rh)
+    out = np.concatenate(pair, axis=1)
+    if out.shape[1] < left.shape[1]:            # odd width: pad the seam
+        out = np.pad(out, ((0, 0), (0, left.shape[1] - out.shape[1]),
+                           (0, 0)), mode='edge')
+    return out[:, :left.shape[1]].astype(np.float32)
 
 
 def _halton(i, b):
@@ -3078,6 +3871,151 @@ def _render_accumulated(scene, st, progress, band):
         frame = render(scene, st2, progress if k == 0 else None, band=band)
         acc = frame.astype(np.float64) if acc is None else acc + frame
     return (acc / float(n)).astype(np.float32)
+
+
+#: what the last adaptive-AA frame decided, for the console line and the
+#: tests: pixels flagged, pixels total, passes run (0 pixels = base
+#: frame shipped as-is), and the boolean mask itself
+LAST_ADAPTIVE = {}
+
+#: the fixed colour-contrast criterion, in linear luma between
+#: neighbours. POV-Ray's +A default is 0.3 over 0..3 summed channels;
+#: this is the same order of strictness expressed on one channel
+_ADAPTIVE_CONTRAST = 0.06
+
+
+def _adaptive_mask(img, gbuf, mesh, st, depth_m):
+    """The pixels the adaptive refine passes re-sample.
+
+    The geometric criteria flag both pixels of a differing pair (the
+    _edge_smooth convention -- a stair-step aliases on both sides):
+
+    - OBJECT-id silhouettes -- object ids, NOT triangle ids: a dense
+      mesh is all triangle edges inside a surface that does not alias
+      at all, and flagging them would refine the whole frame
+    - the sky boundary (covered against uncovered)
+    - depth CURVATURE past Edge Depth Threshold: the second
+      difference, not the first. The field's first frame flagged 21%
+      of the picture, and most of it was smooth floor seen at a graze
+      -- a surface running away from the camera has a large depth
+      SLOPE at every pixel, which the old step test read as one long
+      crease. Its curvature is ~zero; a real step or fold spikes it.
+      Same dial, same scene units, honest meaning
+    - colour contrast at a FIXED threshold (the POV-Ray +A criterion,
+      one number, never a dial), but only within two pixels of a
+      geometric flag. Contrast in the open field is texture detail,
+      and texture detail is already anti-aliased by the mip chain --
+      re-rendering it three times sharpens nothing. At the edges it
+      still does its job: it catches the soft side of a silhouette,
+      glints and seams the id test half-missed
+    """
+    tri = gbuf.tri
+    if mesh is not None and getattr(mesh, 'obj_index', None) is not None:
+        ids = np.where(tri >= 0, mesh.obj_index[np.clip(tri, 0, None)], -1)
+    else:
+        ids = np.where(tri >= 0, 0, -1)
+    geo = np.zeros(tri.shape, bool)
+    dif = ids[:, 1:] != ids[:, :-1]
+    geo[:, 1:] |= dif
+    geo[:, :-1] |= dif
+    dif = ids[1:, :] != ids[:-1, :]
+    geo[1:, :] |= dif
+    geo[:-1, :] |= dif
+    thr = float(getattr(st, 'aa_edge_threshold', 0.1))
+    if thr > 0.0:
+        src = depth_m if depth_m is not None else gbuf.depth
+        d = np.nan_to_num(src, nan=1.0, posinf=1.0, neginf=-1.0)
+        cx = np.abs(d[:, :-2] - 2.0 * d[:, 1:-1] + d[:, 2:]) > thr
+        geo[:, 1:-1] |= cx
+        cy = np.abs(d[:-2, :] - 2.0 * d[1:-1, :] + d[2:, :]) > thr
+        geo[1:-1, :] |= cy
+    # the band the contrast criterion is allowed to work in: the
+    # geometric flags grown by two pixels each way
+    band = geo.copy()
+    for _ in range(2):
+        grown = band.copy()
+        grown[1:] |= band[:-1]
+        grown[:-1] |= band[1:]
+        grown[:, 1:] |= band[:, :-1]
+        grown[:, :-1] |= band[:, 1:]
+        band = grown
+    lum = (0.2126 * img[..., 0] + 0.7152 * img[..., 1]
+           + 0.0722 * img[..., 2])
+    lum = np.nan_to_num(lum, nan=0.0, posinf=1.0, neginf=0.0)
+    cont = np.zeros(tri.shape, bool)
+    dd = np.abs(lum[:, 1:] - lum[:, :-1]) > _ADAPTIVE_CONTRAST
+    cont[:, 1:] |= dd
+    cont[:, :-1] |= dd
+    dd = np.abs(lum[1:, :] - lum[:-1, :]) > _ADAPTIVE_CONTRAST
+    cont[1:, :] |= dd
+    cont[:-1, :] |= dd
+    return geo | (cont & band)
+
+
+def _adaptive_refine(scene, st, img, gbuf, mesh, depth_m, progress):
+    """The Bryce anti-aliasing pass: re-render ONLY the edge pixels.
+
+    What the field remembered of Bryce -- render the picture, then a
+    line sweeps down anti-aliasing it -- and what POV-Ray's +A did on
+    every trace: the base frame is sample 1, taken at the pixel
+    centre, and passes 2..n re-render at Halton subpixel offsets with
+    `_refine_mask` set, so the rasteriser still runs whole-frame (the
+    jitter re-decides coverage) but SHADING -- the cost -- runs only
+    at the flagged pixels. Flagged pixels average all n samples in
+    float64; every other pixel keeps the base frame's value bitwise.
+
+    Deterministic by construction: the mask is a pure function of the
+    base frame and the offsets are Halton, so the same scene renders
+    the same picture on every run. The refine passes shade on the SAME
+    device the settings chose -- 1.38.0 forced them onto the CPU on
+    the theory that a full-screen pass over a few percent of a frame
+    was overhead, and the field's first frame billed 306 of its 317
+    seconds to exactly that theory. The base frame's GPU verdict is
+    preserved for the engine's report either way.
+    """
+    n = int(np.clip(int(st.aa_samples), 2, 64))
+    mask = _adaptive_mask(img, gbuf, mesh, st, depth_m)
+    count = int(np.count_nonzero(mask))
+    total = int(mask.size)
+    LAST_ADAPTIVE.clear()
+    LAST_ADAPTIVE.update(pixels=count, total=total,
+                         passes=(n - 1) if count else 0, mask=mask)
+    if not count:
+        print('[Halcyon] adaptive AA: no edge pixels flagged; the base '
+              'frame ships as-is')
+        return img
+    print(f'[Halcyon] adaptive AA: {count} of {total} pixels flagged '
+          f'({100.0 * count / max(total, 1):.1f}%), {n - 1} refine '
+          f'pass(es) for Samples {n}')
+    # the sub-renders overwrite scene.last_passes/depth/shafts (each is
+    # a complete render) and reset LAST_GPU_VERDICT at entry; the BASE
+    # frame's are the real ones, so they are put back afterwards
+    _saved = (getattr(scene, 'last_passes', None),
+              getattr(scene, 'last_depth', None),
+              getattr(scene, 'last_shafts', None),
+              getattr(scene, 'last_flares', None))
+    _verdict = dict(LAST_GPU_VERDICT)
+    acc = img[mask].astype(np.float64)
+    try:
+        for k in range(1, n):
+            if progress:
+                progress(0.85 + 0.13 * (k / float(n - 1)),
+                         f'Anti-aliasing pass {k}/{n - 1} '
+                         f'({count} edge pixels)')
+            st2 = st.copy()
+            st2.aa_mode = 'NONE'
+            st2._accum_jitter = (_halton(k, 2) - 0.5,
+                                 _halton(k, 3) - 0.5)
+            st2._refine_mask = mask
+            acc += render(scene, st2, None, band=None)[mask]
+    finally:
+        (scene.last_passes, scene.last_depth, scene.last_shafts,
+         scene.last_flares) = _saved
+        LAST_GPU_VERDICT.clear()
+        LAST_GPU_VERDICT.update(_verdict)
+    out = img.copy()
+    out[mask] = (acc / float(n)).astype(np.float32)
+    return out
 
 
 def _edge_smooth(img, gbuf, st, depth_m=None):
@@ -3214,7 +4152,12 @@ def _cached_bvh(scene, mesh):
     hit = _BVH_CACHE.get(key)
     if hit is not None:
         return hit
-    bvh = BVH(mesh.verts, mesh.tris)
+    # R182: THROUGH the disk-cache road, not around it. This site built
+    # BVH() directly, so the R177 cross-session cache -- wrapped around
+    # make_bvh -- never saw a single F12: the field rebuilt the same
+    # 2.5 s tree every session while the cache sat empty, and the
+    # instrument line never printed because this path never spoke.
+    bvh = BVH.cached(mesh.verts, mesh.tris)
     if len(_BVH_CACHE) >= _BVH_CACHE_CAP:
         _BVH_CACHE.pop(next(iter(_BVH_CACHE)))
     _BVH_CACHE[key] = bvh
@@ -3731,58 +4674,983 @@ def depth_report(proj, gbuf, depth_bits, depth_sort='ZBUFFER'):
             'together than that cannot be told apart' + tail)
 
 
-def _spot_cones(img, scene, st, gbuf, vp, eye, w, h):
-    """Add the visible beam of each spot light over the whole frame.
+def fog_coverage_note(proj, gbuf, settings):
+    """One console line when the fog swallows the frame.
 
-    Unlike the background this runs on every pixel, not just uncovered ones: a
-    beam is in front of whatever it crosses, and stops at it rather than behind
-    it. The depth buffer is what cuts it short.
+    R205: a scene whose geometry all sits past Fog End renders as a
+    flat sheet of fog colour -- correct arithmetic, useless picture,
+    and from the output alone indistinguishable from a broken renderer
+    (the field diagnosed it as "the fog is not right"). This names the
+    numbers: how much of the covered frame is at FULL fog, and where
+    Fog End sits against the subject. Distance-mode fog only (LINEAR /
+    TABLE16 read Start/End; the EXP modes have no end to compare).
+    Returns the line, or None when there is nothing to warn about.
+    """
+    mode = str(getattr(settings, 'fog_mode', 'LINEAR'))
+    if mode not in ('LINEAR', 'TABLE16'):
+        return None
+    cov = gbuf.tri >= 0
+    if proj is None or not cov.any():
+        return None
+    p = np.asarray(proj, np.float64)
+    a, b = float(p[2, 2]), float(p[2, 3])
+    if abs(a - 1.0) < 1e-12 or abs(a + 1.0) < 1e-12:
+        return None                     # orthographic
+    near, far = b / (a - 1.0), b / (a + 1.0)
+    if not (0.0 < near < far):
+        return None
+    z = gbuf.zndc[cov].astype(np.float64)
+    z = z[np.isfinite(z)]
+    if z.size == 0:
+        return None
+    denom = (far + near) - z * (far - near)
+    good = denom > 1e-9
+    end = float(getattr(settings, 'fog_end', 0.0))
+    if end <= 0.0:
+        return None
+    dist = np.where(good, 2.0 * far * near / np.maximum(denom, 1e-9),
+                    np.inf)
+    frac = float((dist >= end).mean())
+    if frac < 0.9:
+        return None
+    d_near = float(dist[np.isfinite(dist)].min()) \
+        if np.isfinite(dist).any() else float('inf')
+    return ('[Halcyon] fog: '
+            f'{100.0 * frac:.0f}% of the covered frame sits at or past '
+            f'Fog End ({end:.4g}) and renders as PURE fog colour -- the '
+            f'nearest surface is already {d_near:.4g} away. If the '
+            'viewport looks right and this render does not, or the '
+            'numbers above look several times too large, check the '
+            'camera for scaled parents (now stripped automatically) or '
+            'move Fog Start/End out to the scene\'s real distances')
+
+
+#: the volumetric marchers by lamp type. SUN and HEMI are deliberately
+#: absent: an infinite directional beam has no apex to glow from, and
+#: 2.79 gave neither a halo
+_VOLUME_KINDS = ('SPOT', 'POINT', 'AREA')
+
+
+def _volume_occlusion_wanted(scene, st):
+    """True when any drawn beam asked to be shadowed (needs the BVH)."""
+    if not getattr(st, 'spot_cones', False):
+        return False
+    return any(float(getattr(l, 'volumetric', 0.0)) > 0.0
+               and getattr(l, 'volumetric_occlusion', False)
+               for l in (getattr(scene, 'lights', None) or ())
+               if str(getattr(l, 'type', '')).upper() in _VOLUME_KINDS)
+
+
+def _halo_noise2(u, v, ti, seed):
+    """One slice of lattice value noise: corners wang-hashed, smooth
+    lerp. Pure function of (u, v, integer time slice, seed)."""
+    from .patterns import _wang01p
+    x0 = np.floor(u)
+    y0 = np.floor(v)
+    fx = u - x0
+    fy = v - y0
+    fx = fx * fx * (3.0 - 2.0 * fx)
+    fy = fy * fy * (3.0 - 2.0 * fy)
+
+    def corner(dx, dy):
+        hh = ((x0 + dx).astype(np.int64) * 73856093
+              ^ (y0 + dy).astype(np.int64) * 19349663
+              ^ np.int64(ti) * 83492791
+              ^ np.int64(seed) * 15485863)
+        return _wang01p((hh & 0xFFFFFFFF).astype(np.uint32))
+
+    n00, n10 = corner(0, 0), corner(1, 0)
+    n01, n11 = corner(0, 1), corner(1, 1)
+    return ((n00 * (1 - fx) + n10 * fx) * (1 - fy)
+            + (n01 * (1 - fx) + n11 * fx) * fy)
+
+
+def _halo_fbm(u, v, t, seed):
+    """Two-octave animated value noise: two integer time slices
+    cross-faded, so it writhes continuously and deterministically."""
+    tf = float(np.floor(t))
+    tt = float(t) - tf
+
+    def one(ti):
+        return (_halo_noise2(u, v, ti, seed)
+                + 0.5 * _halo_noise2(u * 2.13 + 7.7, v * 2.13 + 3.1,
+                                     ti, seed + 11)) / 1.5
+
+    return one(int(tf)) * (1.0 - tt) + one(int(tf) + 1) * tt
+
+
+def _halo_hsv_mat(dh, s_scale, v_scale):
+    """A 3x3 colour matrix: hue rotation about the grey axis, then
+    saturation (lerp to luma) and value scaling -- the array-sized
+    twin of the per-colour colorsys jitter."""
+    ang = dh * 2.0 * np.pi
+    c, s = np.cos(ang), np.sin(ang)
+    ax = 1.0 / np.sqrt(3.0)
+    K = np.array([[0, -ax, ax], [ax, 0, -ax], [-ax, ax, 0]], np.float64)
+    rot = (np.eye(3) * c + s * K
+           + (1.0 - c) * np.full((3, 3), 1.0 / 3.0))
+    luma = np.array([[0.299, 0.587, 0.114]] * 3, np.float64)
+    sat = luma + (np.eye(3) - luma) * s_scale
+    return (rot @ sat * v_scale).astype(np.float32)
+
+
+def _halo_image_tex(spec):
+    """The halo's image as a Texture, cached on the image buffer."""
+    img = spec.get('image')
+    if img is None:
+        return None
+    tex = getattr(img, '_halo_tex', None)
+    if tex is None:
+        from .texture import Texture
+        px = getattr(img, 'pixels', img)
+        tex = Texture(np.asarray(px, np.float32), name='halo',
+                      colorspace='Non-Color', wrap='EXTEND',
+                      filt='BILINEAR')
+        try:
+            img._halo_tex = tex
+        except Exception:                                       # noqa: BLE001
+            pass
+    return tex
+
+
+def _halo_hash01(idx, salt):
+    """Per-halo deterministic random in [0,1): Wang mix of the seed.
+
+    The same hash family the caustics use, so a halo's flicker, pulse
+    phase and colour jitter are pure functions of (seed, salt) --
+    identical across runs, devices and batch orders."""
+    from .patterns import _wang01p
+    u = (np.asarray(idx, np.int64) & 0xFFFFFFFF).astype(np.uint32)
+    return _wang01p(u ^ np.uint32(salt))
+
+
+def _halo_speed(spec, key):
+    """An animation-speed dial read the honest way.
+
+    R200: every animated halo effect gained its own Speed multiplier
+    on the master Animation Speed. A missing key means 1.0 (old spec
+    dicts keep their exact pixels: x * 1.0 is exact in IEEE), and a
+    key that is PRESENT keeps its value even at 0.0 -- speed zero
+    means FROZEN, which the old `or 1.0` idiom silently turned back
+    into full speed."""
+    v = spec.get(key)
+    return 1.0 if v is None else float(v)
+
+
+def _draw_halos(img, scene, st, gbuf, view, proj, w, h, sel_mask=None):
+    """BI's halo materials: every vertex a depth-tested billboard glow.
+
+    The transcription of the 2.79 pipeline, function for function:
+    make_render_halos (a halo per vertex per halo-material slot, seed
+    running from the material's own), project_renderdata (the radius
+    measured by displacing the VIEW-space position one hasize along x
+    and reprojecting; the depth-soften range zd by displacing it one
+    hasize along -z), verghalo (painter's order, far to near), and
+    shadeHaloFloat itself -- hardness ladder, rings and lines off
+    hashvectf at the material seed, the star-points pinch, Extreme
+    Alpha's squared alpha, the soft/plain depth softening -- blended
+    by addalphaAddfacFloat, where Add slides the destination weight
+    from alpha-over (0) to pure addition (1).
+
+    Differences owned by name: depth runs in float32 NDC rather than
+    the C's 24-bit ints (same formulas, more digits); the C read
+    hashvectf[ofs%768 + 1] one float past the table for some seeds --
+    undefined memory in the C, a deterministic wrap here; mist and
+    halo textures are not applied (the engine shades no surface mist
+    either); Flare on a halo material draws no extra flare (the
+    per-LAMP lens flare kit covers flares); `puno` scales by the
+    world-frame facing term (the C mixed an object-space normal into
+    a view-space dot -- frame soup this transcription declines to
+    reproduce). Shaded halos take the per-halo constant lamp sum of
+    render_lighting_halo -- constant per halo in the C too, since
+    every lamp term reads only the halo's own centre.
+    """
+    halos = getattr(scene, 'halos', None)
+    if not halos:
+        return img
+    from .bitex_tables import HASHVECTF
+    hv = HASHVECTF
+    hvn = hv.shape[0]
+    mats = scene.materials or ()
+    vm = np.asarray(view, np.float32)
+    pm = np.asarray(proj, np.float32)
+    persp = abs(float(pm[3, 2])) > 0.5
+
+    def _zdist(zn):
+        """haloZtoDist: NDC z back to camera-plane distance."""
+        if persp:
+            den = zn + float(pm[2, 2])
+            den = np.where(np.abs(den) < 1e-12, 1e-12, den)
+            return float(pm[2, 3]) / den
+        return (float(pm[2, 3]) - zn) / min(float(pm[2, 2]), -1e-12)
+
+    # ---- gather every halo point with its projection ----------------
+    drawn = []
+    eye_w = np.linalg.inv(vm)[:3, 3]
+    for grp in halos:
+        mi = int(grp.get('mat', -1))
+        m = mats[mi] if 0 <= mi < len(mats) else None
+        spec = getattr(m, 'halo', None) if m is not None else None
+        if not spec:
+            continue
+        pos = np.asarray(grp.get('pos'), np.float32)
+        if pos is None or pos.size == 0:
+            continue
+        pos = pos.reshape(-1, 3)
+        n = pos.shape[0]
+        base_size = float(spec.get('size', 0.5))
+        sizes = grp.get('sizes')
+        sizes = (np.asarray(sizes, np.float32).reshape(-1)
+                 if sizes is not None else np.full(n, base_size, np.float32))
+        seeds = grp.get('seeds')
+        seeds = (np.asarray(seeds, np.int64).reshape(-1)
+                 if seeds is not None
+                 else int(spec.get('seed', 0)) + np.arange(n, dtype=np.int64))
+        if bool(spec.get('puno')) and grp.get('normals') is not None:
+            # MA_HALOPUNO: only rear-facing verts glow, scaled by the
+            # facing cosine to the fourth
+            nor = np.asarray(grp['normals'], np.float32).reshape(-1, 3)
+            vdir = pos - eye_w[None, :]
+            vdir /= np.maximum(np.linalg.norm(vdir, axis=1), 1e-9)[:, None]
+            zn_f = (nor * vdir).sum(axis=1)
+            sizes = np.where(zn_f >= 0.0, 0.0,
+                             sizes * zn_f * zn_f * zn_f * zn_f)
+        pulse = float(spec.get('pulse', 0.0) or 0.0)
+        if pulse > 0.0:
+            # R194: each halo breathes on its own phase (hashed off its
+            # seed), so a cloud shimmers instead of throbbing in sync.
+            # R200: Pulse Speed scales the master clock for this effect
+            # alone (x1 is bit-for-bit the single-clock road), and a
+            # speed of 0 now really FREEZES instead of snapping to 1
+            spd = _halo_speed(spec, 'anim_speed') \
+                * _halo_speed(spec, 'pulse_speed')
+            t_s = float(getattr(scene, 'time', 0.0))
+            ph = _halo_hash01(seeds, 0x51ED2701)
+            sizes = (sizes * (1.0 + 0.5 * pulse * np.sin(
+                2.0 * np.pi * (t_s * spd + ph)))).astype(np.float32)
+        vco = pos @ vm[:3, :3].T + vm[:3, 3]
+        hoco = vco @ pm[:3, :3].T + pm[:3, 3]
+        ww = vco @ pm[3, :3].T + pm[3, 3]
+        ok = (ww > 1e-6) & (sizes != 0.0)
+        if not ok.any():
+            continue
+        xs = 0.5 * w * (1.0 + hoco[:, 0] / np.where(ok, ww, 1.0))
+        ys = 0.5 * h * (1.0 + hoco[:, 1] / np.where(ok, ww, 1.0))
+        zs = hoco[:, 2] / np.where(ok, ww, 1.0)
+        # "we clip halos less critical": centre within twice the frame
+        ok &= (np.abs(hoco[:, 0] / np.where(ok, ww, 1.0)) < 2.0) & \
+              (np.abs(hoco[:, 1] / np.where(ok, ww, 1.0)) < 2.0)
+        # radius: displace one hasize along view x, reproject
+        v2 = vco.copy()
+        v2[:, 0] += sizes
+        h2 = v2 @ pm[:3, :3].T + pm[:3, 3]
+        w2 = v2 @ pm[3, :3].T + pm[3, 3]
+        rad = np.abs(xs - 0.5 * w * (1.0 + h2[:, 0] /
+                                     np.where(np.abs(w2) > 1e-6, w2, 1.0)))
+        # depth range: displace one hasize away, reproject
+        v3 = vco.copy()
+        v3[:, 2] -= sizes
+        h3 = v3 @ pm[:3, :3].T + pm[:3, 3]
+        w3 = v3 @ pm[3, :3].T + pm[3, 3]
+        zd = np.abs(zs - h3[:, 2] / np.where(np.abs(w3) > 1e-6, w3, 1.0))
+        ok &= rad > 1e-6
+        idx = np.nonzero(ok)[0]
+        for i in idx:
+            drawn.append((float(zs[i]), mi, float(xs[i]), float(ys[i]),
+                          float(rad[i]), float(zd[i]), int(seeds[i]),
+                          float(sizes[i]), np.asarray(pos[i])))
+    if not drawn:
+        return img
+    # verghalo: descending zs -- far halos first, near composite over
+    drawn.sort(key=lambda t: (-t[0], t[1], t[2], t[3]))
+
+    zbuf = gbuf.zndc
+    out = img
+    shaded_cache = {}
+    # R197 field find: the line/ring windows were RAW PIXELS -- 2.79's
+    # own convention -- so a 1080p render drew proportionally thinner
+    # hairlines than a 480p one, and a supersampled frame thinner
+    # still. The windows now scale with frame height against the era's
+    # own 480-line reference: the same scene keeps the same look at
+    # any resolution and under any supersample, and a 480-line render
+    # is bit-for-bit the old picture. Floored so tiny previews keep
+    # their lines
+    wscale = max(float(h) / 480.0, 0.5)
+    for zs, mi, xs, ys, rad, zd, seed, hasize, wpos in drawn:
+        spec = mats[mi].halo
+        alpha0 = float(np.clip(spec.get('alpha', 1.0), 0.0, 1.0))
+        flick = float(spec.get('flicker', 0.0) or 0.0)
+        if flick > 0.0:
+            # R194: per-frame per-halo brightness jitter -- the 90s
+            # sparkle. Deterministic in (seed, frame). R200: Flicker
+            # Speed rescales the frame counter (x1 is floor(frame),
+            # the old integer bit for bit; 0.5 re-rolls every other
+            # frame, 2 rolls twice as fast on fractional frames)
+            fs_f = _halo_speed(spec, 'flicker_speed')
+            fr_i = int(np.floor(
+                float(getattr(scene, 'frame', 0)) * fs_f))
+            h01 = float(_halo_hash01(np.array([seed * 1013 + fr_i],
+                                              np.int64), 0xA511E9B3)[0])
+            alpha0 *= max(1.0 - flick * h01, 0.0)
+        if alpha0 == 0.0:
+            continue
+        # R197: the halo's own frame -- static Rotation plus Spin share
+        # one turn, and Aspect squashes the rotated x (a turned ellipse
+        # when both are set). Coverage, rings, gradient and every shape
+        # metric live in these coordinates; at the defaults they ARE
+        # the plain pixel offsets, bit for bit
+        rot_b = float(spec.get('rotation', 0.0) or 0.0)
+        spin = float(spec.get('spin', 0.0) or 0.0)
+        aspect = min(max(float(spec.get('aspect', 1.0) or 1.0), 0.05),
+                     20.0)
+        ext = rad * max(aspect, 1.0)
+        x0 = max(int(np.floor(xs - ext)), 0)
+        x1 = min(int(np.ceil(xs + ext)) + 1, w)
+        y0 = max(int(np.floor(ys - ext)), 0)
+        y1 = min(int(np.ceil(ys + ext)) + 1, h)
+        if x0 >= x1 or y0 >= y1:
+            continue
+        xn = np.arange(x0, x1, dtype=np.float32)[None, :] - np.float32(xs)
+        yn = np.arange(y0, y1, dtype=np.float32)[:, None] - np.float32(ys)
+        if spin != 0.0 or rot_b != 0.0:
+            ang_s = rot_b
+            if spin != 0.0:
+                t_s = float(getattr(scene, 'time', 0.0))
+                ph_s = float(_halo_hash01(np.array([seed], np.int64),
+                                          0x7F4A7C15)[0])
+                ang_s = ang_s + spin * t_s + ph_s * 2.0 * np.pi
+            ca_s, sa_s = float(np.cos(ang_s)), float(np.sin(ang_s))
+            xn_r = ca_s * xn + sa_s * yn
+            yn_r = -sa_s * xn + ca_s * yn
+        else:
+            xn_r, yn_r = xn, yn
+        xa = xn_r / np.float32(aspect) if aspect != 1.0 else xn_r
+        ya = yn_r
+        distsq = xa * xa + ya * ya
+        radsq = rad * rad
+        shape = str(spec.get('shape', 'DISC') or 'DISC')
+        img_rgb = None
+        img_a = None
+        if shape == 'IMAGE':
+            tex_i = _halo_image_tex(spec)
+            if tex_i is None:
+                shape = 'DISC'
+            else:
+                # R198: the image IS the halo -- its alpha the shaped
+                # intensity, its colours the glow, exactly the role
+                # 2.79's HaloTex played. Coverage is the image square
+                # the FULL grid: xa/ya are broadcast axes (1,W)/(H,1)
+                # and sampling them raw collapses one dimension into
+                # a stripe
+                uu, vv = np.broadcast_arrays(
+                    (xa / max(rad, 1e-12)) * 0.5 + 0.5,
+                    (ya / max(rad, 1e-12)) * 0.5 + 0.5)
+                flat = tex_i.sample(
+                    np.clip(uu, 0.0, 1.0).ravel().astype(np.float32),
+                    np.clip(vv, 0.0, 1.0).ravel().astype(np.float32),
+                    filt='BILINEAR', wrap='EXTEND')
+                rgba_i = np.asarray(flat, np.float32).reshape(
+                    uu.shape + (flat.shape[-1],))
+                out_i = (uu < 0.0) | (uu > 1.0) | (vv < 0.0) | (vv > 1.0)
+                a_ch = rgba_i[..., 3] if rgba_i.shape[-1] > 3 \
+                    else np.ones(uu.shape, np.float32)
+                img_a = np.where(out_i, 0.0, a_ch).astype(np.float32)
+                img_rgb = rgba_i[..., :3]
+        if shape == 'IMAGE':
+            inside = np.maximum(np.abs(xa), np.abs(ya)) < rad
+        else:
+            inside = distsq < radsq
+        if sel_mask is not None:
+            inside &= sel_mask[y0:y1, x0:x1]
+        if not inside.any():
+            continue
+        zz = zbuf[y0:y1, x0:x1]
+        soft = bool(spec.get('soft'))
+        if not soft:
+            inside &= zz > zs
+            if not inside.any():
+                continue
+        alpha = np.full(distsq.shape, alpha0, np.float32)
+        if soft:
+            # MA_HALO_SOFT: how much of the halo's depth is in front
+            seg = hasize * np.sqrt(np.maximum(
+                1.0 - distsq / max(radsq, 1e-12), 0.0))
+            depth2 = 2.0 * seg
+            dfz = _zdist(zz) - _zdist(np.float32(zs))
+            soften = np.where(dfz < seg,
+                              (seg + dfz) / np.maximum(depth2, 1e-12),
+                              1.0)
+            alpha *= np.clip(soften, 0.0, 1.0)
+            inside &= depth2 > 1e-12
+            inside &= alpha > 0.0
+        else:
+            # the old softening: geometry within zd behind the centre
+            zde = max(zd, 1e-12)
+            t_soft = (zz - zs) / zde
+            near_geo = zs > (zz - zd)
+            alpha = np.where(near_geo,
+                             alpha * np.sqrt(np.sqrt(
+                                 np.maximum(t_soft, 0.0))),
+                             alpha)
+        if not inside.any():
+            continue
+        radist = np.sqrt(distsq)
+        ringf = np.zeros_like(distsq)
+        ringc = int(spec.get('rings', 0) or 0)
+        rw_ = max(float(spec.get('ring_width', 1.0) or 1.0), 1e-3) * wscale
+        if ringc:
+            even_r = bool(spec.get('rings_even'))
+            ofs = seed
+            for k_r in range(ringc):
+                if even_r:
+                    # R198: evenly spaced crisp circles -- shockwaves
+                    fac = np.abs(1.0 * (rad * ((k_r + 1.0)
+                                               / (ringc + 1.0))
+                                        - radist)) / rw_
+                else:
+                    r0 = hv[ofs % hvn]
+                    r1 = hv[(ofs % hvn + 1) % hvn]
+                    fac = np.abs(r1 * (rad * abs(r0) - radist)) / rw_
+                ringf += np.where(fac < 1.0, 1.0 - fac, 0.0)
+                ofs += 2
+        # clamped into the ladder's domain: every value at or past 1
+        # lands on zero brightness either way (1 - min(dist,1) = 0 and
+        # the rungs are monotone on [0,1]), and the aspect-extended
+        # rect corners otherwise push sin past pi into sqrt(negative)
+        dist = np.minimum(distsq / max(radsq, 1e-12), 1.0)
+        if shape == 'RING':
+            # HA_FLARECIRC, verbatim: the centre pushed to the rim
+            dist = 0.5 + np.abs(dist - 0.5)
+        elif shape == 'HEX':
+            hxm = np.maximum(np.abs(ya),
+                             np.abs(xa) * 0.8660254
+                             + np.abs(ya) * 0.5) / max(rad, 1e-12)
+            # clamped into the ladder's own [0,1] domain -- the disc
+            # metric never left it, these metrics can at the corners
+            dist = np.minimum(hxm * hxm, 1.0)
+        elif shape == 'DIAMOND':
+            dmm = (np.abs(xa) + np.abs(ya)) / max(rad, 1e-12)
+            dist = np.minimum(dmm * dmm, 1.0)
+        elif shape in ('TRIANGLE', 'PENTAGON', 'OCTAGON'):
+            # the regular-polygon radial metric: vertices on the halo
+            # circle, edges pulled in by cos of the half-segment
+            nsides = {'TRIANGLE': 3, 'PENTAGON': 5, 'OCTAGON': 8}[shape]
+            seg2 = 2.0 * np.pi / nsides
+            th = np.arctan2(ya, xa)
+            rr = np.cos(np.mod(th, seg2) - seg2 * 0.5) \
+                / np.cos(seg2 * 0.5)
+            pmm = radist * rr / max(rad, 1e-12)
+            dist = np.minimum(pmm * pmm, 1.0)
+        elif shape == 'CROSS':
+            # a plus-sign glow: bright along both axes, tapering to
+            # nothing at the halo edge
+            cmm = (np.minimum(np.abs(xa), np.abs(ya)) * 2.2
+                   + np.maximum(np.abs(xa), np.abs(ya))) \
+                / max(rad, 1e-12)
+            dist = np.minimum(cmm * cmm, 1.0)
+        elif shape == 'SQUARE':
+            sqm = np.maximum(np.abs(xa), np.abs(ya)) / max(rad, 1e-12)
+            dist = np.minimum(sqm * sqm, 1.0)
+        elif shape == 'STAR':
+            # a solid five-point star: the boundary radius runs from
+            # the outer points to an inner waist, linear in angle
+            seg5 = 2.0 * np.pi / 5.0
+            thf = np.abs(np.mod(np.arctan2(ya, xa) + np.pi * 0.5,
+                                seg5) - seg5 * 0.5) / (seg5 * 0.5)
+            bound = 0.38 + (1.0 - 0.38) * (1.0 - thf)
+            stm = radist / (max(rad, 1e-12) * bound)
+            dist = np.minimum(stm * stm, 1.0)
+        elif shape == 'HEART':
+            # the classic implicit heart, radial falloff inside it
+            hx = xa / (max(rad, 1e-12) * 0.82)
+            hy = ya / (max(rad, 1e-12) * 0.82) + 0.32
+            f_h = ((hx * hx + hy * hy - 1.0) ** 3
+                   - hx * hx * hy * hy * hy)
+            dist = np.where(f_h < 0.0,
+                            np.minimum((radist / max(rad, 1e-12)) ** 2
+                                       * 0.8, 1.0), 1.0)
+        _hd = spec.get('hardness', 50)
+        hard = int(_hd) if _hd is not None else 50
+        if hard >= 30:
+            dist = np.sqrt(dist)
+            if hard >= 40:
+                dist = np.sin(dist * (np.pi * 0.5))
+                if hard >= 50:
+                    dist = np.sqrt(dist)
+        elif hard < 20:
+            dist = dist * dist
+        dist = np.where(dist < 1.0, 1.0 - dist, 0.0)
+        if img_a is not None:
+            # image authority: its alpha replaces the shaped falloff
+            # (the hardness ladder is the disc's law, not the image's)
+            dist = img_a
+        noise_amt = float(spec.get('noise', 0.0) or 0.0)
+        if noise_amt > 0.0:
+            # R198: the energy-blast modulator -- animated value noise
+            # carving and boosting the shaped core; composes with
+            # every shape and the image
+            nsc = max(float(spec.get('noise_scale', 4.0) or 4.0), 0.2)
+            spd_n = _halo_speed(spec, 'anim_speed') \
+                * _halo_speed(spec, 'noise_speed')
+            t_n = float(getattr(scene, 'time', 0.0)) * spd_n
+            nse = _halo_fbm(xa / max(rad, 1e-12) * nsc + 17.31,
+                            ya / max(rad, 1e-12) * nsc + 9.77,
+                            t_n, seed)
+            dist = np.clip(dist * (1.0 - noise_amt
+                                   + noise_amt * (0.35 + 1.3 * nse)),
+                           0.0, 1.3).astype(np.float32)
+        linef = np.zeros_like(distsq)
+        linec = int(spec.get('lines', 0) or 0)
+        lw_ = max(float(spec.get('line_width', 1.0) or 1.0), 1e-3) * wscale
+        if linec:
+            ofs = seed
+            for _ in range(linec):
+                r0 = hv[ofs % hvn]
+                r1 = hv[(ofs % hvn + 1) % hvn]
+                fac = np.abs(xa * r0 + ya * r1) / lw_
+                linef += np.where(fac < 1.0, 1.0 - fac, 0.0)
+                ofs += 3
+            linef = linef * dist
+        starpoints = int(spec.get('star_points', 0) or 0)
+        if starpoints:
+            angle = np.arctan2(ya, xa) * (1.0 + 0.25 * starpoints)
+            co = np.cos(angle)
+            si = np.sin(angle)
+            ang2 = (co * xa + si * ya) * (co * ya - si * xa)
+            ster = np.abs(ang2)
+            big = ster > 1.0
+            ster2 = np.where(big, rad / np.maximum(ster, 1e-12), 1.0)
+            dist = np.where(big & (ster2 < 1.0),
+                            dist * np.sqrt(np.maximum(ster2, 0.0)), dist)
+        raysc = int(spec.get('rays', 0) or 0)
+        rayf = None
+        if raysc:
+            # R198: EVEN rays -- the symmetric starburst the hashed
+            # Lines can't make; sharper exponent, thinner spikes.
+            # R200: their own accumulator, so Ray Colour can differ
+            # from Line Colour (unset, it follows the lines -- old
+            # scenes keep their look)
+            sharp = max(float(spec.get('ray_sharp', 8.0) or 8.0), 0.5)
+            th_r = np.arctan2(ya, xa)
+            rayf = (np.power(np.abs(np.cos(th_r * raysc * 0.5)), sharp)
+                    * np.maximum(1.0 - radist / max(rad, 1e-12), 0.0))
+        boltc = int(spec.get('bolts', 0) or 0)
+        boltf = None
+        if boltc:
+            # R198: electric arcs -- each bolt is an angular path that
+            # wiggles with radius and RE-STRIKES eight times per
+            # animation second (the angle rehashes), pure function of
+            # (seed, bolt, time). R200: their own accumulator and
+            # colour (following the lines while unset), and Bolt
+            # Speed scales strike rate and writhe together
+            bw_ = max(float(spec.get('bolt_width', 1.0) or 1.0),
+                      0.05) * wscale
+            spd_b = _halo_speed(spec, 'anim_speed') \
+                * _halo_speed(spec, 'bolt_speed')
+            t_b = float(getattr(scene, 'time', 0.0)) * spd_b
+            fr_b = int(np.floor(t_b * 8.0))
+            th_p = np.arctan2(ya, xa)
+            rr_n = radist / max(rad, 1e-12)
+            taper_b = np.maximum(1.0 - rr_n, 0.0)
+            boltf = np.zeros_like(distsq)
+            for b in range(boltc):
+                a0 = float(_halo_hash01(
+                    np.array([seed * 131 + b * 7919 + fr_b * 104729],
+                             np.int64), 0x8DA6B343)[0]) * 2.0 * np.pi
+                wig = (_halo_fbm(rr_n * 6.0 + b * 3.7,
+                                 np.full_like(rr_n, b * 1.3),
+                                 t_b * 2.0, seed + b) - 0.5) * 0.9
+                dth = np.mod(th_p - a0 - wig + np.pi,
+                             2.0 * np.pi) - np.pi
+                arc = np.maximum(1.0 - np.abs(dth) * radist
+                                 / (bw_ * 2.0), 0.0)
+                boltf = boltf + arc * taper_b
+        # rays and bolts glow where the core may not (a ring's hollow
+        # centre); classic lines carry dist and change nothing here.
+        # The summed field is the coverage the single-accumulator
+        # road used -- the live mask and the alpha add read the SUM,
+        # only the colour adds split per element
+        totf = linef
+        if rayf is not None:
+            totf = totf + rayf
+        if boltf is not None:
+            totf = totf + boltf
+        live = inside & ((dist > 0.00001) | (totf > 0.00001))
+        if not live.any():
+            continue
+        dist = dist * alpha
+        ringf = ringf * dist
+        linef = linef * alpha
+        if rayf is not None:
+            rayf = rayf * alpha
+        if boltf is not None:
+            boltf = boltf * alpha
+        totf = totf * alpha
+        col_r = np.asarray(spec.get('color', (0.8, 0.8, 0.8)), np.float32)
+        col2_r = np.asarray(spec.get('color2', (0.0, 0.0, 0.0)),
+                            np.float32)
+        rh_ = float(spec.get('rand_hue', 0.0) or 0.0)
+        rs2 = float(spec.get('rand_sat', 0.0) or 0.0)
+        rv_ = float(spec.get('rand_val', 0.0) or 0.0)
+        # R200: the master Hue/Sat/Val Shift dials -- one deliberate,
+        # keyframable re-tint of EVERY coloured option (body, gradient
+        # end, ramp, image, rings, lines, rays, bolts). The per-halo
+        # random jitter (R194) folds into the same transform, and now
+        # scatters every coloured option too, so a confetti halo's
+        # trim follows its body. At the defaults (0 / 1 / 1, no
+        # jitter) no colour is touched -- bit for bit the old road
+        hs_ = float(spec.get('hue_shift', 0.0) or 0.0)
+        _ss = spec.get('sat_shift')
+        ss_m = 1.0 if _ss is None else max(float(_ss), 0.0)
+        _vs = spec.get('val_shift')
+        vs_m = 1.0 if _vs is None else max(float(_vs), 0.0)
+        dh_a = hs_
+        s_a = ss_m
+        v_a = vs_m
+        if rh_ > 0.0 or rs2 > 0.0 or rv_ > 0.0:
+            j1 = float(_halo_hash01(np.array([seed], np.int64),
+                                    0x2545F491)[0])
+            j2 = float(_halo_hash01(np.array([seed], np.int64),
+                                    0x9E3779B9)[0])
+            j3 = float(_halo_hash01(np.array([seed], np.int64),
+                                    0x85EBCA6B)[0])
+            dh_a = dh_a + (j1 - 0.5) * rh_
+            s_a = s_a * (1.0 + (j2 - 0.5) * 2.0 * rs2)
+            v_a = v_a * max(1.0 + (j3 - 0.5) * 2.0 * rv_, 0.0)
+        adj_on = dh_a != 0.0 or s_a != 1.0 or v_a != 1.0
+
+        def _adj(c):
+            # scalar colours ride colorsys; images and ramp LUTs take
+            # the matrix twin (_halo_hsv_mat) with the SAME dh/s/v
+            if not adj_on:
+                return c
+            import colorsys as _cs
+            hh, ss, vv = _cs.rgb_to_hsv(float(c[0]), float(c[1]),
+                                        float(c[2]))
+            hh = (hh + dh_a) % 1.0
+            ss = min(max(ss * s_a, 0.0), 1.0)
+            vv = max(vv * v_a, 0.0)
+            return np.asarray(_cs.hsv_to_rgb(hh, ss, vv), np.float32)
+        col_r = _adj(col_r)
+        col2_r = _adj(col2_r)
+        xalpha = bool(spec.get('xalpha'))
+        ca = dist * dist if xalpha else dist
+        ramp = spec.get('ramp')
+        gtype = str(spec.get('gradient_type', 'RADIAL') or 'RADIAL')
+
+        def _grad_t():
+            # R199: the gradient sweep family. Coordinates are the
+            # halo's OWN (rotated, aspected) frame, so Rotation turns
+            # a linear gradient with the halo. Adjustable noise
+            # wobbles the coordinate -- turbulent bands; ANGULAR
+            # wraps its wobble so the wheel stays seamless
+            if gtype == 'ANGULAR':
+                t_g = (np.arctan2(ya, xa) / (2.0 * np.pi) + 0.5)
+            elif gtype == 'HORIZONTAL':
+                t_g = np.clip((xa / max(rad, 1e-12)) * 0.5 + 0.5,
+                              0.0, 1.0)
+            elif gtype == 'VERTICAL':
+                t_g = np.clip((ya / max(rad, 1e-12)) * 0.5 + 0.5,
+                              0.0, 1.0)
+            elif gtype == 'DIAGONAL':
+                t_g = np.clip(((xa + ya)
+                               / (max(rad, 1e-12) * 1.4142135))
+                              * 0.5 + 0.5, 0.0, 1.0)
+            else:                              # RADIAL: centre out
+                t_g = np.clip(radist / max(rad, 1e-12), 0.0, 1.0)
+            gn = float(spec.get('gradient_noise', 0.0) or 0.0)
+            if gn > 0.0:
+                nsc_g = max(float(spec.get('noise_scale', 4.0)
+                                  or 4.0), 0.2)
+                spd_g = _halo_speed(spec, 'anim_speed') \
+                    * _halo_speed(spec, 'grad_noise_speed')
+                t_t = float(getattr(scene, 'time', 0.0)) * spd_g
+                wob = _halo_fbm(xa / max(rad, 1e-12) * nsc_g + 31.7,
+                                ya / max(rad, 1e-12) * nsc_g + 5.9,
+                                t_t, seed + 77)
+                if gtype == 'ANGULAR':
+                    t_g = np.mod(t_g + (wob - 0.5) * gn, 1.0)
+                else:
+                    t_g = np.clip(t_g + (wob - 0.5) * gn, 0.0, 1.0)
+            return t_g.astype(np.float32)
+
+        if img_rgb is not None:
+            # the image's own colours, shifted and jittered by the
+            # matrix twin of the per-colour HSV transform
+            rgbv = img_rgb
+            if adj_on:
+                m3 = _halo_hsv_mat(dh_a, s_a, v_a)
+                rgbv = np.clip(rgbv @ m3.T, 0.0, None)
+            crgb = dist[:, :, None] * rgbv
+        elif ramp is not None and bool(spec.get('gradient')):
+            # R198: the colour ramp -- RADIAL rides the radius,
+            # ANGULAR sweeps the full turn (conic)
+            lut = np.asarray(ramp, np.float32).reshape(-1, 4)[:, :3]
+            if adj_on:
+                m3 = _halo_hsv_mat(dh_a, s_a, v_a)
+                lut = np.clip(lut @ m3.T, 0.0, None)
+            tt1 = _grad_t()
+            fpos = np.clip(tt1, 0.0, 1.0) * (len(lut) - 1)
+            i0 = np.floor(fpos).astype(np.int32)
+            i1 = np.minimum(i0 + 1, len(lut) - 1)
+            fr2 = (fpos - i0)[:, :, None]
+            crgb = dist[:, :, None] * (lut[i0] * (1.0 - fr2)
+                                       + lut[i1] * fr2)
+        elif bool(spec.get('gradient')):
+            # R194: centre colour to edge colour, through whichever
+            # sweep the gradient type asks (R199)
+            tt = _grad_t()[:, :, None]
+            crgb = dist[:, :, None] * (col_r[None, None, :] * (1.0 - tt)
+                                       + col2_r[None, None, :] * tt)
+        else:
+            crgb = dist[:, :, None] * col_r[None, None, :]
+        if bool(spec.get('shaded')) and (scene.lights or ()):
+            # render_lighting_halo: every term reads the halo centre
+            # only, so the lamp sum is one number per halo (vn is the
+            # zero vector for a plain halo: inp = 1 - |0| = 1)
+            key = tuple(np.round(wpos, 5))
+            lit = shaded_cache.get(key)
+            if lit is None:
+                p1 = wpos.reshape(1, 3).astype(np.float32)
+                acc = np.zeros(3, np.float32)
+                for lgt in scene.lights:
+                    if getattr(lgt, 'ambient_only', False):
+                        continue
+                    try:
+                        _L, radl, _d = LI.sample(lgt, p1, st)
+                    except Exception:
+                        continue
+                    # inp = 1 - |vn.lv| with vn the zero vector -> 1;
+                    # a HEMI's 0.5*i+0.5 also lands on 1
+                    acc += np.maximum(radl[0], 0.0)
+                lit = np.maximum(acc, 0.0)
+                shaded_cache[key] = lit
+            crgb = crgb * lit[None, None, :]
+        # R200: each element's colour add is its own (rays and bolts
+        # no longer ride the line colour once theirs is set; unset
+        # keys fall back to it, keeping old scenes). The alpha add
+        # reads the SUMMED field -- exactly what the single
+        # accumulator fed it, so translucency is unchanged
+        lc = int(spec.get('lines', 0) or 0)
+        if np.any(totf != 0.0):
+            lcol = _adj(np.asarray(spec.get('line_color',
+                                            (1.0, 1.0, 1.0)),
+                                   np.float32))
+            if lc and np.any(linef != 0.0):
+                crgb += linef[:, :, None] * lcol[None, None, :]
+            if rayf is not None and np.any(rayf != 0.0):
+                rcv = spec.get('ray_color')
+                ray_col = lcol if rcv is None \
+                    else _adj(np.asarray(rcv, np.float32))
+                crgb += rayf[:, :, None] * ray_col[None, None, :]
+            if boltf is not None and np.any(boltf != 0.0):
+                bcv = spec.get('bolt_color')
+                bolt_col = lcol if bcv is None \
+                    else _adj(np.asarray(bcv, np.float32))
+                crgb += boltf[:, :, None] * bolt_col[None, None, :]
+            ca = ca + (totf * totf if xalpha else totf)
+        if ringc and np.any(ringf != 0.0):
+            rcol = _adj(np.asarray(spec.get('ring_color',
+                                            (1.0, 1.0, 1.0)),
+                                   np.float32))
+            crgb += ringf[:, :, None] * rcol[None, None, :]
+            ca = ca + (ringf * ringf if xalpha else ringf)
+        ca = np.minimum(ca, 1.0).astype(np.float32)
+        crgb = crgb.astype(np.float32)
+        # addalphaAddfacFloat: dest weight slides with Add
+        addfac = float(np.clip(spec.get('add', 0.0), 0.0, 1.0))
+        mfac = (1.0 - ca * (1.0 - addfac)).astype(np.float32)
+        lv = live
+        sub = out[y0:y1, x0:x1]
+        sub_rgb = sub[:, :, :3]
+        sub_a = sub[:, :, 3]
+        sub_rgb[lv] = (mfac[lv, None] * sub_rgb[lv] + crgb[lv])
+        sub_a[lv] = mfac[lv] * sub_a[lv] + ca[lv]
+    return out
+
+
+def _light_volumes(img, scene, st, gbuf, vp, eye, w, h, bvh=None,
+                   sel_mask=None):
+    """Composite every volumetric lamp's beam over the finished frame.
+
+    This used to run BEFORE shading, where the shading loop's
+    img[py, px] assignment overwrote every beam pixel that crossed
+    geometry -- beams only ever survived against the sky. It also
+    clipped the beam against the raw NDC z (a number in [0.97, 0.99]
+    on the field scene) as if it were metres, cutting every beam a
+    hair from the camera wherever geometry stood. Now it runs over the
+    finished frame, and the per-pixel distance is the surface point
+    reconstructed through the inverse view-projection -- the exact
+    distance, at the z-buffer's own precision.
+
+    SPOT marches its cone, POINT a bounded sphere glow, AREA a
+    soft-edged slab beam; a lamp with Beam Occlusion set traces each
+    march sample back to the lamp through the BVH, which is what makes
+    a beam STOP at a mesh in its way. `sel_mask` (an adaptive refine
+    pass) restricts everything to the flagged pixels -- the values
+    there are identical to a full evaluation, per-pixel independence
+    again.
     """
     if not getattr(st, 'spot_cones', False):
-        return
-    lights = [l for l in (scene.lights or ())
-              if str(getattr(l, 'type', '')).upper() == 'SPOT'
+        return img
+    lights = [l for l in (getattr(scene, 'lights', None) or ())
+              if str(getattr(l, 'type', '')).upper() in _VOLUME_KINDS
               and float(getattr(l, 'volumetric', 0.0)) > 0.0]
     if not lights:
-        return
+        return img
     from . import cones as CONES
-    with ST.track('spot cones'):
-        inv = np.linalg.inv(vp).astype(np.float32)
-        yy, xx = np.mgrid[0:h, 0:w]
-        nx = (xx.ravel().astype(np.float32) + 0.5) / w * 2.0 - 1.0
-        ny = (yy.ravel().astype(np.float32) + 0.5) / h * 2.0 - 1.0
-        one = np.ones(nx.size, np.float32)
-        world = np.stack([nx, ny, one, one], axis=1) @ inv.T
-        world = world[:, :3] / np.where(np.abs(world[:, 3:4]) < 1e-9, 1e-9,
-                                        world[:, 3:4])
-        dirs = M.normalize(world - eye[None, :])
+    inv = np.linalg.inv(np.asarray(vp, np.float64)).astype(np.float32)
+    yy, xx = np.mgrid[0:h, 0:w]
+    nx = (xx.ravel().astype(np.float32) + 0.5) / w * 2.0 - 1.0
+    ny = (yy.ravel().astype(np.float32) + 0.5) / h * 2.0 - 1.0
+    zz = gbuf.depth.reshape(-1).astype(np.float32)
+    sel = None
+    if sel_mask is not None:
+        sel = np.asarray(sel_mask, bool).reshape(-1)
+        if not sel.any():
+            return img
+        nx, ny, zz = nx[sel], ny[sel], zz[sel]
+    npx = nx.size
+    one = np.ones(npx, np.float32)
+    far = np.stack([nx, ny, one, one], axis=1) @ inv.T
+    far = far[:, :3] / np.where(np.abs(far[:, 3:4]) < 1e-9, 1e-9,
+                                far[:, 3:4])
+    dirs = M.normalize(far - eye[None, :])
+    covered = np.isfinite(zz)
+    dist = np.full(npx, np.inf, np.float32)
+    if covered.any():
+        hit_h = np.stack([nx[covered], ny[covered], zz[covered],
+                          one[covered]], axis=1) @ inv.T
+        hit = hit_h[:, :3] / np.where(np.abs(hit_h[:, 3:4]) < 1e-9, 1e-9,
+                                      hit_h[:, 3:4])
+        dist[covered] = np.linalg.norm(hit - eye[None, :], axis=1)
 
-        depth = gbuf.depth.reshape(-1).astype(np.float32)
-        # the z-buffer holds view depth; the beam needs distance along the ray
-        forward = M.normalize(np.asarray(scene.camera.forward, np.float32)
-                              [None, :])[0] if hasattr(scene.camera, 'forward') \
-            else None
-        if forward is not None:
-            cosang = np.abs(np.einsum('ij,j->i', dirs, forward))
-            dist = np.where(np.isfinite(depth),
-                            depth / np.maximum(cosang, 1e-4), np.inf)
-        else:
-            dist = np.where(np.isfinite(depth), depth, np.inf)
+    reach = float(getattr(st, 'spot_cone_reach', 64.0))
+    marchers = {'SPOT': CONES.spot_cone, 'POINT': CONES.point_glow,
+                'AREA': CONES.area_beam}
+    add = np.zeros((npx, 3), np.float32)
+    for light in lights:
+        kind = str(getattr(light, 'type', '')).upper()
+        occ = None
+        if getattr(light, 'volumetric_occlusion', False) and bvh is not None:
+            lpos = np.asarray(light.position, np.float32)
 
-        reach = float(getattr(st, 'spot_cone_reach', 64.0))
-        add = np.zeros((nx.size, 3), np.float32)
-        for light in lights:
-            scatter = CONES.spot_cone(
-                eye, dirs, dist, light,
-                samples=int(getattr(st, 'spot_cone_samples', 12)),
-                density=float(getattr(st, 'spot_cone_density', 1.0))
-                * float(light.volumetric),
-                falloff=float(getattr(st, 'spot_cone_falloff', 2.0)),
-                max_distance=reach)
-            if scatter.any():
-                col = np.asarray(light.color, np.float32)[None, :]
-                add += scatter[:, None] * col * float(light.energy) / np.pi
+            def occ(p, live, lpos=lpos):
+                out = np.zeros(p.shape[0], bool)
+                if not live.any():
+                    return out
+                delta = lpos[None, :] - p[live]
+                dl = np.sqrt(np.maximum((delta * delta).sum(axis=1), 1e-12))
+                dl_dir = delta / dl[:, None]
+                out[live] = bvh.occluded(p[live] + dl_dir * 1e-3, dl_dir,
+                                         dl * (1.0 - 1e-3))
+                return out
+        reach_l = reach
+        if str(getattr(light, 'decay', '')) == 'CUSTOM':
+            # Custom Range's end is the lamp's own idea of how far it
+            # reaches; the beam honours it rather than growing a dial
+            reach_l = min(reach, max(float(getattr(light, 'decay_end',
+                                                   reach)), 1e-3))
+        scatter = marchers[kind](
+            eye, dirs, dist, light,
+            samples=int(getattr(st, 'spot_cone_samples', 12)),
+            density=float(getattr(st, 'spot_cone_density', 1.0))
+            * float(light.volumetric),
+            falloff=float(getattr(st, 'spot_cone_falloff', 2.0)),
+            max_distance=reach_l, occlude=occ)
+        if scatter.any():
+            col = np.asarray(light.color, np.float32)[None, :]
+            add += scatter[:, None] * col * float(light.energy) / np.pi
+    if sel is None:
         img[:, :, :3] += add.reshape(h, w, 3)
+    else:
+        flat = img.reshape(-1, 4)
+        flat[sel, :3] += add
+    return img
+
+
+def _plane_over_geometry(img, scene, st, job, gbuf, eye, textures):
+    """The world's analytic ground/ocean plane, in FRONT of what it hides.
+
+    The plane used to exist only in the background pass, which made it a
+    BACKDROP: any geometry, however far below the water line, drew fully
+    in front of it. A boat sat ON the ocean like a sticker, a character
+    could never wade, and the floor of every Bryce scene was something
+    objects hovered against rather than stood in. Bryce's water was real
+    scene geometry and hid what sank; this pass gives the analytic plane
+    the same authority.
+
+    The test is exact and cheap: with the camera above the plane, a
+    surface point below it is FURTHER along its own view ray than the
+    plane crossing, always -- so coverage is just "is the shaded point
+    under the plane". Those pixels are re-evaluated through the same
+    world path the background uses (ocean, chequer, haze, cloud shadows,
+    everything -- one source of truth), and the ocean lets the drowned
+    geometry show through its own Transparency: the deeper the point
+    sits, the more the water column absorbs it, until only water is
+    left. Deterministic per pixel, so worker bands and adaptive-AA
+    refine passes reproduce it bit for bit.
+
+    Known edges, stated rather than hidden: the plane still writes no
+    depth or object id (it is a background-family surface, as it always
+    was), a transparent surface above the water over a drowned opaque
+    one composites after this and stays visible, and a camera at or
+    below the plane keeps the old backdrop-only behaviour. A
+    transparent film skips the plane entirely -- the 2.79 contract says
+    the world does not draw there at all.
+    """
+    w = getattr(scene, 'world', None)
+    if w is None or not getattr(w, 'ground_plane', False) or eye is None:
+        return img
+    if str(getattr(w, 'mode', 'NODES')) == 'NODES':
+        return img            # the analytic plane belongs to the sky models
+    if getattr(st, 'film_transparent', False):
+        return img
+    ey = np.asarray(eye, np.float32)
+    gh = float(getattr(w, 'ground_height', 0.0))
+    if not (float(ey[2]) > gh):
+        return img            # at or under the plane: backdrop only, as before
+    cov = gbuf.mask()
+    py, px = np.nonzero(cov)
+    if py.size == 0:
+        return img
+    ctx = job.context(gbuf.tri[py, px], gbuf.bary[py, px], px, py)
+    P = np.asarray(ctx.P, np.float32)
+    under = P[:, 2] < gh
+    if not under.any():
+        return img
+    py, px, P = py[under], px[under], P[under]
+    delta = P - ey[None, :]
+    dist_geo = np.linalg.norm(delta, axis=1)
+    dist_geo = np.maximum(dist_geo, 1e-6)
+    dirs = delta / dist_geo[:, None]
+    # eye above, point below: the ray's z step is strictly negative and
+    # the plane crossing sits strictly inside the segment
+    t = (gh - float(ey[2])) / np.minimum(dirs[:, 2], -1e-9)
+    t = np.clip(t, 0.0, dist_geo)
+    plane_col = world_color(scene, st, dirs, textures or {}, dirs.shape[0],
+                            eye=ey)
+    out = img[py, px, :3]
+    through = None
+    if str(getattr(w, 'ground_mode', 'SOLID')) == 'OCEAN':
+        trans = float(np.clip(getattr(w, 'ocean_transparency', 0.25),
+                              0.0, 1.0))
+        if trans > 0.0:
+            # what the surface transmits (down the normal, mirror at a
+            # graze) times what the water column lets survive -- a fixed
+            # absorption length, because Bryce's water swallowed things
+            # fast and a second dial for it would be a pointless option
+            facing_down = np.clip(-dirs[:, 2], 0.0, 1.0)
+            path = np.maximum(dist_geo - t, 0.0)
+            absorb = np.exp(-path / 4.0).astype(np.float32)
+            through = (trans * facing_down * absorb).astype(np.float32)
+    if through is None:
+        img[py, px, :3] = plane_col
+    else:
+        img[py, px, :3] = plane_col * (1.0 - through)[:, None] + \
+            out * through[:, None]
+    img[py, px, 3] = np.maximum(img[py, px, 3], 1.0)
+    return img
 
 
 def _background_image(scene, st, w, h, vp, eye, uncovered=None,

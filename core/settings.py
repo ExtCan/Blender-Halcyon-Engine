@@ -82,7 +82,7 @@ class RenderSettings:
     pixel_aspect_x: float = 1.0
     pixel_aspect_y: float = 1.0
     # ------------------------------------------------------------- sampling
-    aa_mode: str = 'SUPERSAMPLE'      # NONE | SUPERSAMPLE | EDGE | ACCUMULATE
+    aa_mode: str = 'SUPERSAMPLE'      # NONE | SUPERSAMPLE | EDGE | ADAPTIVE | ACCUMULATE
     aa_samples: int = 1               # supersample factor (1..8)
     aa_filter: str = 'BOX'            # BOX | TRIANGLE | GAUSS | CATROM | MITCHELL
     aa_filter_width: float = 1.0
@@ -93,6 +93,12 @@ class RenderSettings:
     motion_blur: bool = False
     motion_shutter: float = 0.5        # shutter open time, in frames
     motion_steps: int = 5
+    # ------------------------------------------------------------- stereo
+    # parallel cameras with an off-axis (asymmetric-frustum) shift, so
+    # the convergence plane sits at zero parallax with no vertical error
+    stereo_mode: str = 'NONE'          # NONE | ANAGLYPH | SBS | CROSS
+    stereo_eye_distance: float = 0.065
+    stereo_convergence: float = 8.0
     # ------------------------------------------------------------- geometry
     backface_cull: bool = False
     two_sided_lighting: bool = True
@@ -178,7 +184,12 @@ class RenderSettings:
     transparency: str = 'SORTED'       # NONE | STIPPLE | SORTED | ABUFFER
     stipple_pattern: str = 'BAYER4'
     alpha_bits: int = 8                # 1 = binary stencil alpha
-    alpha_threshold: float = 0.5
+    # R204: the hard alpha test now defaults OFF. At its old default of
+    # 0.5 the cutoff applied in EVERY transparency mode, so a glass at
+    # 0.4 opacity simply vanished from Sorted and A-Buffer frames --
+    # blended transparency should blend. Raise it for classic cut-out
+    # alpha (foliage cards, chain-link fences).
+    alpha_threshold: float = 0.0
     # --------------------------------------------------------------- depth cue
     fog: bool = False
     fog_mode: str = 'LINEAR'           # LINEAR | EXP | EXP2 | TABLE16
@@ -213,6 +224,11 @@ class RenderSettings:
                                        # MAC256 | WIN20 | EGA16 | CGA4 | GRAY | CUSTOM
     palette_size: int = 256
     palette_method: str = 'MEDIAN_CUT'  # MEDIAN_CUT | OCTREE | POPULARITY | KMEANS
+    #: R202: CUSTOM palette mode's colours, extracted from the picked
+    #: palette image at export (tuple of (r,g,b) floats, luma-sorted,
+    #: deterministic). Empty = no image picked; CUSTOM then behaves as
+    #: it always did (adaptive), so nothing existing changes.
+    palette_colors: tuple = ()
     dither: str = 'NONE'               # NONE | BAYER2 | BAYER4 | BAYER8 | FLOYD | \
                                        # JJN | STUCKI | ATKINSON | BURKES | SIERRA | \
                                        # SIERRA_LITE | NOISE | HALFTONE
@@ -390,6 +406,29 @@ RESOLUTION_PRESETS = {
     'TEXTURE_128':  (128, 128, 1.0, 1.0),
     'TEXTURE_256':  (256, 256, 1.0, 1.0),
     'TEXTURE_512':  (512, 512, 1.0, 1.0),
+
+    # --- panoramas and 360 (R194): pair the wide ones with the
+    # Panoramic camera; the 2:1 sizes are the standard environment-
+    # texture footprints
+    'QTVR_CLASSIC': (2496, 768, 1.0, 1.0),
+    'PANO_2K':      (2048, 512, 1.0, 1.0),
+    'PANO_4K':      (4096, 1024, 1.0, 1.0),
+    'PANO_8K':      (8192, 2048, 1.0, 1.0),
+    'ENV_1K':       (1024, 512, 1.0, 1.0),
+    'ENV_2K':       (2048, 1024, 1.0, 1.0),
+    'ENV_4K':       (4096, 2048, 1.0, 1.0),
+    'ENV_8K':       (8192, 4096, 1.0, 1.0),
+
+    # --- modern and general (R194)
+    'QHD_1440':     (2560, 1440, 1.0, 1.0),
+    'UHD_4K':       (3840, 2160, 1.0, 1.0),
+    'CINEMA_FLAT':  (1998, 1080, 1.0, 1.0),
+    'CINEMA_SCOPE': (2048, 858, 1.0, 1.0),
+    'SQUARE_1K':    (1024, 1024, 1.0, 1.0),
+    'SOCIAL_SQUARE': (1080, 1080, 1.0, 1.0),
+    'SOCIAL_STORY': (1080, 1920, 1.0, 1.0),
+    'A4_150':       (1754, 1240, 1.0, 1.0),
+    'A4_300':       (3508, 2480, 1.0, 1.0),
 }
 
 #: the categories the UI shows, in order. Every RESOLUTION_PRESETS key appears
@@ -411,6 +450,11 @@ RESOLUTION_GROUPS = (
     ("Pictures & Textures", ('QUICKTAKE', 'DC120', 'PHOTOCD_BASE',
                              'PHOTOCD_4BASE', 'PHOTOCD_16BASE', 'TEXTURE_128',
                              'TEXTURE_256', 'TEXTURE_512')),
+    ("Panoramas & 360", ('QTVR_CLASSIC', 'PANO_2K', 'PANO_4K', 'PANO_8K',
+                         'ENV_1K', 'ENV_2K', 'ENV_4K', 'ENV_8K')),
+    ("Modern & General", ('QHD_1440', 'UHD_4K', 'CINEMA_FLAT',
+                          'CINEMA_SCOPE', 'SQUARE_1K', 'SOCIAL_SQUARE',
+                          'SOCIAL_STORY', 'A4_150', 'A4_300')),
 )
 
 #: display names where Title Case of the key would be wrong or unhelpful
@@ -445,6 +489,16 @@ RESOLUTION_LABELS = {
     'PHOTOCD_16BASE': "Photo CD 16Base",
     'TEXTURE_128': "Game Texture 128", 'TEXTURE_256': "Game Texture 256",
     'TEXTURE_512': "Game Texture 512",
+    'QTVR_CLASSIC': "QTVR Cylinder Classic",
+    'PANO_2K': "Panorama 2K (4:1)", 'PANO_4K': "Panorama 4K (4:1)",
+    'PANO_8K': "Panorama 8K (4:1)",
+    'ENV_1K': "Environment 1K (2:1)", 'ENV_2K': "Environment 2K (2:1)",
+    'ENV_4K': "Environment 4K (2:1)", 'ENV_8K': "Environment 8K (2:1)",
+    'QHD_1440': "QHD 1440p", 'UHD_4K': "4K UHD",
+    'CINEMA_FLAT': "Cinema Flat 1.85:1", 'CINEMA_SCOPE': "Cinema Scope 2.39:1",
+    'SQUARE_1K': "Square 1024", 'SOCIAL_SQUARE': "Social Square 1080",
+    'SOCIAL_STORY': "Social Story 9:16",
+    'A4_150': "A4 Print 150dpi", 'A4_300': "A4 Print 300dpi",
 }
 
 

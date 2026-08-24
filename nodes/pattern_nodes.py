@@ -169,6 +169,17 @@ SPECS = [
       'octaves': ('int', 5, 1, 10, "Octaves")},
      [(C, 'Color'), (F, 'Fac')]),
 
+    ('Caustics', "Caustics", 'OUTLINER_OB_LIGHTPROBE',
+     "The pool-light web: bright Voronoi cell edges, each cell's point "
+     "slowly orbiting so the web writhes. Every 1990s pool floor, ocean "
+     "shallows and water dungeon was this pattern; the matching lamp "
+     "setting projects the same web as a light cookie",
+     [(V, 'Vector', None), (F, 'Scale', 6.0), (F, 'Speed', 1.0),
+      (C, 'Color 1', (0.02, 0.10, 0.16, 1.0)),
+      (C, 'Color 2', (0.75, 0.95, 1.0, 1.0))],
+     {'animate': ('bool', True, "Animate")},
+     [(C, 'Color'), (F, 'Fac')]),
+
     ('Water', "Water Noise", 'MOD_FLUIDSIM',
      "Layered animated water: 1 to 12 drifting noise layers, folded toward "
      "crests by Choppiness. Loop closes the animation exactly over Loop "

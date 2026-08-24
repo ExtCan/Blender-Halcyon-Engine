@@ -2042,7 +2042,8 @@ def test_add_menu_is_complete():
 
     ops = [c for c in objects.CLASSES
            if c.__name__.startswith('HALCYON_OT_')]
-    check('the Add menu has the four period objects', len(ops) == 4,
+    # four period objects + the R201 Terrain
+    check('the Add menu has the five period objects', len(ops) == 5,
           ', '.join(c.bl_idname for c in ops))
 
     src = inspect.getsource(objects.VIEW3D_MT_halcyon_add.draw)
@@ -3574,6 +3575,14 @@ def test_sky_presets():
         if not ok:
             broke.append(f'{key}: {msg}')
             continue
+        # the probe declares its resolution, as every real consumer does:
+        # 4000 rays over a sphere is a very coarse display, and since 1.38
+        # stars have a real angular size, a probe this sparse would miss a
+        # faint star layer entirely (two skies differing only in stars
+        # probed as equal). The coarse pixel angle fattens each star to
+        # the probe's own sampling density -- exactly what the star floor
+        # is for
+        w._pixel_angle = 0.01
         col = SKY.evaluate(w, d)
         if not np.isfinite(col).all():
             broke.append(f'{key}: not finite')
@@ -6487,7 +6496,8 @@ def test_material_templates():
           len(tmpl.template_items()) == len(tmpl.TEMPLATES))
     # the shelf the field asked for: 15 more, in two named groups,
     # Water and Lava among them
-    check('the shelf holds 28 templates', len(tmpl.TEMPLATES) == 28,
+    # 28 engine recipes + the 46 parsed Bryce 1995 presets (R203)
+    check('the shelf holds 74 templates', len(tmpl.TEMPLATES) == 74,
           str(len(tmpl.TEMPLATES)))
     simple = tmpl.category_keys('SIMPLE')
     advanced = tmpl.category_keys('ADVANCED')
@@ -6814,6 +6824,23 @@ def test_bvh_disk_cache():
         B.make_bvh(mesh)
         check('a mesh under the threshold skips the disk entirely',
               not os.listdir(tmpdir))
+
+        # R182: the RENDER pipeline's own builder routes through the
+        # disk cache too -- it built BVH() directly, so the field
+        # rebuilt the same 2.5 s tree every session while the cache
+        # sat empty and the instrument line never printed
+        B.CACHE_MIN_TRIS = 100
+        R._BVH_CACHE.clear()
+        b1 = R._cached_bvh(None, mesh)
+        files2 = [f for f in os.listdir(tmpdir) if f.endswith('.npz')]
+        check('the render pipeline\'s _cached_bvh WRITES the disk '
+              'cache', len(files2) == 1, str(files2))
+        R._BVH_CACHE.clear()          # force past the in-session cache
+        b2 = R._cached_bvh(None, mesh)
+        check('...and a fresh session LOADS the identical tree '
+              'through it',
+              np.array_equal(b1.left, b2.left)
+              and np.array_equal(b1.order, b2.order))
     finally:
         B.BVH._cache_dir = old_dir
         B.CACHE_MIN_TRIS = old_min
@@ -11628,6 +11655,50 @@ def test_text_objects_export_without_losing_the_frame():
           str(cap.get('reports')))
 
 
+def test_expensive_frames_warn_in_the_interface():
+    """R180: a 38-minute surprise must announce itself BEFORE the wait.
+
+    The field hit F12 on a supersampled frame that had also fallen off
+    the GPU, and the only clues -- the 16x pixel bill and the CPU
+    routing -- were console lines nobody had open. Both now land in
+    Blender's own report system: a WARNING naming the internal
+    resolution and the sampling lever before the render, and a WARNING
+    with the refusal reason when a GPU frame shades on the CPU."""
+    from . import fakeblender as FB
+    props, engine = FB.install()
+
+    # Samples 16 = a 4x4 grid = 16x the pixels: reported up front
+    img, _passes, cap = FB.run_render(props, engine,
+                                      mesh=FB.cube_mesh(),
+                                      aa_mode='SUPERSAMPLE',
+                                      aa_samples=16)
+    reps = cap.get('reports') or []
+    check('a 16x supersample frame WARNS with the pixel bill and the '
+          'lever', any('16x the output pixels' in r for r in reps),
+          str(reps))
+    check('...and the frame still renders',
+          img is not None and bool(np.isfinite(img).all()))
+
+    # Samples 4 (the period default) stays quiet
+    img2, _p2, cap2 = FB.run_render(props, engine, mesh=FB.cube_mesh(),
+                                    aa_mode='SUPERSAMPLE', aa_samples=4)
+    reps2 = cap2.get('reports') or []
+    check('the period-default Samples 4 warns about nothing',
+          not any('output pixels' in r for r in reps2), str(reps2))
+
+    # a GPU frame that cannot run on the GPU says so IN THE INTERFACE
+    img3, _p3, cap3 = FB.run_render(props, engine, mesh=FB.cube_mesh(),
+                                    render_device='GPU',
+                                    gpu_shading=True)
+    reps3 = cap3.get('reports') or []
+    check('a GPU frame that shaded on the CPU reports the verdict '
+          'where the user can see it',
+          any('GPU shading could not run' in r for r in reps3),
+          str(reps3))
+    check('...and still delivers the CPU frame',
+          img3 is not None and bool(np.isfinite(img3).all()))
+
+
 def test_normal_maps_bend_the_deferred_normal():
     """A Normal Map chain on the master shader must shade on the GPU.
 
@@ -13486,6 +13557,87 @@ def test_mesh_export_cache():
         EX._DIRTY_ALL_BY = None
         EX._LAST_FRAME.clear()
         EX._SCENE_GEO_SIG = None
+
+
+def test_pool_tags_are_stable_across_sessions():
+    """R183: the pooled shader NAME is a stable digest, not hash().
+
+    Python's hash() is salted per process, so the same shader arrived
+    under a NEW name every Blender session -- and the field paid the
+    driver's full ~20 s compile plus ~14 s of pipeline creation twice
+    running for byte-identical sources. The tag is pinned against a
+    PRECOMPUTED digest: if a session-dependent ingredient ever sneaks
+    back in, this fails on the very next run."""
+    from ..gpu.shade import _pool_tag
+    t = _pool_tag('HAL_MAT', 'void main(){}',
+                  {'samplers': ['a', 'b'], 'floats': ['t']})
+    check('the pooled tag equals its precomputed cross-session digest',
+          t == 'HAL_MAT_Pd052e84ac6f4567f', t)
+    check('...and differs when the source differs',
+          _pool_tag('HAL_MAT', 'void main(){ }',
+                    {'samplers': ['a', 'b'], 'floats': ['t']}) != t)
+    check('...and when the interface differs',
+          _pool_tag('HAL_MAT', 'void main(){}',
+                    {'samplers': ['a'], 'floats': ['t', 'b']}) != t)
+
+
+def test_sampler_limit_is_the_drivers_own():
+    """R181: the pass guard asks the driver, not the spec's worst case.
+
+    One field material needed 17 fragment samplers; the guard assumed
+    the guaranteed minimum (16) and pushed an entire 4x-supersampled
+    frame onto the CPU for 16 minutes -- on a card whose real limit is
+    32. device.max_fragment_samplers() queries the driver (floor 16,
+    cached, 16 headless), the plan carries it in consts, and the
+    refusal message names the QUERIED number so the field paste reads
+    true."""
+    from ..core import raster as _ras
+    from ..core.bvh import make_bvh as _mk
+    from ..core.scene import Light as _L5
+    from ..gpu import device as DV
+    from ..gpu import shade as GSH
+    from .scenebuild import demo_scene
+
+    lim = DV.max_fragment_samplers()
+    check('headless, the queried limit is exactly the spec floor',
+          lim == 16, str(lim))
+    check('...and it is cached for the session',
+          DV._STATE.get('max_frag_samplers') == 16)
+
+    st = RenderSettings()
+    w, h = 96, 72
+    st.resolution_x, st.resolution_y = w, h
+    st.aa_mode = 'NONE'
+    st.output_scale = 'NONE'
+    st.fog = False
+    sc = demo_scene(st, with_texture=True)
+    sc.lights = [_L5(type='SUN', name='K', direction=(0.3, 0.4, -0.86),
+                     energy=3.0, decay='NONE', shadow='RAY')]
+    bvh = _mk(sc.mesh)
+    view, _p, vp, eye = R.camera_matrices(sc.camera, w, h)
+    g = _ras.GBuffer(w, h)
+    _ras.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+    job = R.ShadeJob(sc, st, R.prepare_textures(sc, st), bvh, view,
+                     eye, w, h)
+    try:
+        # choke the limit below a normal textured ray-shadowed pass:
+        # the refusal must name the QUERIED number
+        DV._STATE['max_frag_samplers'] = 6
+        GSH._PLAN_CACHE.clear()
+        passes, why, _a = GSH.plan_frame(job, g)
+        check('under a choked limit the pass refuses BY THE QUERIED '
+              'NUMBER', passes is None
+              and 'this driver provides 6' in str(why), str(why))
+        # and a WIDER limit lets the same pass build -- the field fix:
+        # a 17-sampler material on a 32-sampler card rides the GPU
+        DV._STATE['max_frag_samplers'] = 32
+        GSH._PLAN_CACHE.clear()
+        passes2, why2, _a2 = GSH.plan_frame(job, g)
+        check('the same pass BUILDS under the driver\'s real limit',
+              passes2 is not None, str(why2))
+    finally:
+        DV._STATE.pop('max_frag_samplers', None)
+        GSH._PLAN_CACHE.clear()
 
 
 def test_material_value_texels():
@@ -16246,6 +16398,104 @@ def test_accumulation_and_edge_antialiasing():
           f'max {float(dc[interior].max()):.6f} on interior creases')
 
 
+def test_adaptive_antialiasing_refines_only_the_edges():
+    """ADAPTIVE: render once, then re-sample ONLY the edge pixels.
+
+    The Bryce anti-aliasing sweep / POV-Ray +A, and its whole contract
+    is provable bitwise. (1) Every unflagged pixel ships the base
+    frame's value untouched -- the base IS the aa-NONE frame. (2) Every
+    flagged pixel equals the float64 average of the base sample and n-1
+    UNRESTRICTED whole-frame jittered renders -- which proves the
+    _refine_mask restriction (shading a few percent of the frame)
+    changed nothing any masked pixel sees: raster, background, bump
+    context and the shade itself are position-pure. (3) Deterministic
+    across runs. (4) One sample falls back to the plain frame. Plus the
+    wiring pins: the enum is registered, the engine skips the worker
+    pool (a band cannot see edges across its seam), a refine pass never
+    takes the deferred GPU branch, and the UI draws the threshold dial.
+    """
+    w, h = 96, 72
+    st = base_settings(w, h)
+    st.shadows = False
+    sc = demo_scene(st, with_texture=False)
+    plain = R.render(sc, st)
+
+    st2 = st.copy()
+    st2.aa_mode = 'ADAPTIVE'
+    st2.aa_samples = 4
+    a1 = R.render(sc, st2)
+    a2 = R.render(sc, st2)
+    la = dict(R.LAST_ADAPTIVE)
+    mask = la.get('mask')
+    check('the frame reports its adaptive decision',
+          mask is not None and la.get('passes') == 3
+          and la.get('pixels', 0) > 0
+          and la.get('pixels') == int(np.count_nonzero(mask)),
+          str({k: v for k, v in la.items() if k != 'mask'}))
+    check('adaptive AA is deterministic across runs',
+          float(np.abs(a1 - a2).max()) == 0.0)
+    if mask is None:
+        return
+    check('the mask flags edges, not the frame',
+          0 < int(mask.sum()) < mask.size,
+          f'{int(mask.sum())} of {mask.size}')
+    check('every unflagged pixel ships the base frame BITWISE',
+          bool(np.array_equal(a1[~mask], plain[~mask])))
+    # the strong half: flagged pixels equal the average of the base
+    # sample and three UNRESTRICTED full jittered renders, bitwise --
+    # so shading only the flagged pixels changed none of their values
+    acc = plain[mask].astype(np.float64)
+    for k in range(1, 4):
+        stj = st.copy()
+        stj.aa_mode = 'NONE'
+        stj._accum_jitter = (R._halton(k, 2) - 0.5, R._halton(k, 3) - 0.5)
+        acc += R.render(sc, stj)[mask]
+    expect = (acc / 4.0).astype(np.float32)
+    check('every flagged pixel equals the full-render average BITWISE',
+          bool(np.array_equal(a1[mask], expect)),
+          f'max delta {float(np.abs(a1[mask] - expect).max()):.2e}')
+    check('flagged pixels actually moved (edges got softer)',
+          float(np.abs(a1[mask] - plain[mask]).max()) > 1e-3)
+    st2.aa_samples = 1
+    check('one sample falls back to the plain frame bitwise',
+          bool(np.array_equal(R.render(sc, st2), plain)))
+
+    # wiring pins, against the shipped source
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+
+    def _src(name):
+        with open(os.path.join(root, name), encoding='utf-8') as fh:
+            return fh.read()
+
+    check('the mode is registered in the enum',
+          "('ADAPTIVE', \"Adaptive (Edge Pass)\"" in _src('properties.py'))
+    check('the settings comment names the mode',
+          'NONE | SUPERSAMPLE | EDGE | ADAPTIVE | ACCUMULATE'
+          in _src(os.path.join('core', 'settings.py')))
+    check('the UI draws the threshold dial for the mode',
+          "aa_mode in ('EDGE', 'ADAPTIVE')" in _src('ui.py'))
+    check('the engine skips the worker pool for the mode',
+          "str(settings.aa_mode) == 'ADAPTIVE'" in _src('engine.py'))
+    rsrc = _src(os.path.join('core', 'render.py'))
+    # R186: refine passes shade on the SAME device as the base frame.
+    # 1.38.0 pinned the opposite (CPU-only refines) and the field
+    # billed 306 of 317 seconds to it; the pin now points the other way
+    check('a refine pass shades on the settings own device',
+          'st.gpu_shading and band is None:' in rsrc
+          and 'st.gpu_shading and band is None and _rm is None'
+          not in rsrc)
+    check('refine passes keep the console quiet (one shade split per '
+          'frame)', 'band is None and _rm is None and' in rsrc)
+    check('a refine pass hands bump its full-coverage context',
+          '(band is not None or _rm is not None) and has_bump' in rsrc)
+    check('the mask tests depth curvature, not slope',
+          '2.0 * d[:, 1:-1]' in rsrc)
+    check('contrast only works the geometric edge band',
+          'cont & band' in rsrc)
+    check('the viewport never runs an adaptive pass',
+          "settings.aa_mode = 'NONE'" in _src('preview.py'))
+
+
 def test_height_fog_layers_the_mist():
     """Ground mist: fog that thins with world height above a top plane.
 
@@ -16429,7 +16679,9 @@ def test_resolution_presets_cover_the_categories():
         x, y, ax, ay = v
         check(f'{k} has renderable dimensions',
               isinstance(x, int) and isinstance(y, int)
-              and 16 <= x <= 4096 and 16 <= y <= 4096
+              # 8192 admits the R194 8K panorama/environment presets;
+              # the cap still catches a mistyped extra digit
+              and 16 <= x <= 8192 and 16 <= y <= 8192
               and ax > 0 and ay > 0, str(v))
         check(f'{k} labels and describes itself',
               bool(resolution_label(k)) and str(x) in
@@ -20306,7 +20558,15 @@ def test_every_setting_does_what_it_says():
                    'motion_steps', 'palette_lock', 'use_processes',
                    # R162: proven by test_bi_subsurface_scattering's
                    # master-switch check (off == plain shading exactly)
-                   'sss'}
+                   'sss',
+                   # R190: proven by test_stereo_modes (mode shapes,
+                   # eye distance zero bitwise, convergence shift)
+                   'stereo_mode', 'stereo_eye_distance',
+                   'stereo_convergence',
+                   # R202: proven by test_image_palette_road (every
+                   # pixel forced onto the image's colours; empty ==
+                   # the old Custom road bitwise)
+                   'palette_colors'}
     INFRA = {
         'render_device':      'device routing: the whole device suite',
         'gpu_shading':        'device routing: the matrix parity rows',
@@ -20365,7 +20625,10 @@ def test_every_material_template_renders():
     from ..nodes.shader_nodes import HALCYON_ShaderNode as HS
 
     TYPE = {'NodeSocketFloat': 'VALUE', 'NodeSocketColor': 'RGBA',
-            'NodeSocketVector': 'VECTOR'}
+            'NodeSocketVector': 'VECTOR',
+            # R202: the blend-carrying amount sockets are floats to
+            # every road outside the panel
+            'HALCYON_BlendValueSocket': 'VALUE'}
     FILL = {'VALUE': 0.0, 'RGBA': [0.0, 0.0, 0.0, 1.0],
             'VECTOR': [0.0, 0.0, 0.0]}
     pspec = {f'HALCYON_{s[0]}Node': s for s in SPECS}
@@ -21540,3 +21803,3235 @@ def test_the_sky_library_is_complete_and_valid():
           ', '.join(inert[:6]))
     check('the library holds at least 250 more skies than the original 43',
           len(SK.ORDER) >= 293, str(len(SK.ORDER)))
+
+
+# ==================================================== the 1.38 feature round
+
+
+def test_the_infinite_plane_now_has_authority():
+    """The ocean/ground plane: no horizon sliver, no fp32 far-field rot,
+    and -- the structural half -- it HIDES geometry below it.
+
+    The plane used to be a backdrop: every object drew fully in front of
+    it, however deep it sat. Now a surface point under the plane is
+    covered by it (with the ocean's own Transparency deciding how much
+    of the drowned object ghosts through), while everything above the
+    line rides through BITWISE. A transparent film skips the plane
+    entirely (the 2.79 contract), and a camera under the plane keeps the
+    old backdrop behaviour.
+    """
+    from ..core import sky as SKY
+    from ..core.scene import World
+
+    # 1) every downward ray hits: the old dz < -1e-5 threshold left a
+    # bright sliver of sky between the water and the horizon
+    w3 = World()
+    w3.mode = 'GRADIENT'
+    w3.ground_plane = True
+    w3.ground_mode = 'OCEAN'
+    w3.ground_height = 0.0
+    w3.ground_fade = 0.0
+    eye = np.array([0.0, 0.0, 2.0], np.float32)
+    zs = -np.logspace(-8, -0.3, 2000).astype(np.float32)[::-1]
+    dirs = np.stack([np.ones_like(zs), np.zeros_like(zs), zs], 1)
+    dirs /= np.linalg.norm(dirs, axis=1)[:, None]
+    col = SKY.evaluate(w3, dirs, eye=eye, time=0.0)
+    sky_only = SKY.evaluate(World(mode='GRADIENT'), dirs, eye=None)
+    hit_all = np.abs(col - sky_only).max(1) > 1e-5
+    check('every downward ray lands on the water (no horizon sliver)',
+          bool(hit_all.all()), f'{int((~hit_all).sum())} missed')
+    check('the far field is finite and sane',
+          bool(np.isfinite(col).all()))
+
+    # 2) the water covers geometry below it
+    st = base_settings(128, 96)
+    st.shadows = False
+    sc = demo_scene(st, with_texture=False)
+    wd = sc.world
+    wd.mode = 'GRADIENT'
+    base = R.render(sc, st)
+    wd.ground_plane = True
+    wd.ground_mode = 'OCEAN'
+    wd.ground_height = 0.9
+    watered = R.render(sc, st)
+    check('the water pass is deterministic',
+          bool(np.array_equal(watered, R.render(sc, st))))
+    from ..core import raster as CR
+    view, _p, vp, eye2 = R.camera_matrices(sc.camera, 128, 96)
+    g = CR.GBuffer(128, 96)
+    CR.rasterize(sc.mesh.verts, sc.mesh.tris, vp, 128, 96, gbuf=g)
+    job = R.ShadeJob(sc, st, {}, None, view, eye2, 128, 96)
+    py, px = np.nonzero(g.mask())
+    ctx = job.context(g.tri[py, px], g.bary[py, px], px, py)
+    above = ctx.P[:, 2] >= 0.9
+    d = np.abs(watered - base).max(2)[py, px]
+    check('geometry above the water line rides through BITWISE',
+          float(d[above].max()) == 0.0 if above.any() else True,
+          f'max {float(d[above].max()):.2e}')
+    check('geometry below the water line is covered by it',
+          bool((~above).any()) and float(d[~above].mean()) > 0.05,
+          f'mean {float(d[~above].mean()):.4f}')
+    wd.ocean_transparency = 0.0
+    opaque = R.render(sc, st)
+    wd.ocean_transparency = 1.0
+    clear = R.render(sc, st)
+    check('Transparency decides how much of the drowned object survives',
+          float(np.abs(opaque - clear).max()) > 1e-3)
+    st2 = st.copy()
+    st2.film_transparent = True
+    wd.ocean_transparency = 0.25
+    ft = R.render(sc, st2)
+    wd.ground_plane = False
+    ft_bare = R.render(sc, st2)
+    wd.ground_plane = True
+    check('a transparent film never draws the plane over geometry',
+          bool(np.array_equal(ft, ft_bare)))
+    # camera under the plane: old backdrop-only behaviour
+    wd.ground_height = 50.0
+    under = R.render(sc, st)
+    wd.ground_plane = False
+    plain_sky = R.render(sc, st)
+    wd.ground_plane = True
+    dcov = np.abs(under - plain_sky).max(2)[py, px]
+    check('a camera below the plane keeps the backdrop behaviour '
+          '(covered pixels untouched)', float(dcov.max()) == 0.0,
+          f'{float(dcov.max()):.2e}')
+
+
+def test_stars_have_a_fixed_angular_size():
+    """Stars are round points of fixed ANGULAR size; Old Stars restores
+    the pre-1.38 drawing bit for bit.
+
+    The old Bryce layer lit every pixel of a starred grid cell -- a
+    square whose size followed the render resolution (nine-pixel blocks
+    at 1920); the old starfield measured its disc in 3D cell space where
+    the sky sphere cuts every cell at a different depth, so sizes came
+    out arbitrary. Both are kept, verbatim, behind the Old Stars toggle.
+    """
+    from ..core import sky as SKY
+    from ..core.patterns import starfield as _old_pattern
+    from ..core.scene import World
+
+    rng = np.random.default_rng(11)
+    d = rng.normal(size=(120000, 3)).astype(np.float32)
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+
+    w = World()
+    w.mode = 'STARFIELD'
+    w.color = (0.0, 0.0, 0.0)
+    w.star_brightness = 1.0
+    w.star_density = 0.6
+    new = SKY.starfield(w, d)
+    check('the new stars are deterministic',
+          bool(np.array_equal(new, SKY.starfield(w, d))))
+    w.old_stars = True
+    old = SKY.starfield(w, d)
+    w.old_stars = False
+    check('Old Stars draws a different sky', 
+          float(np.abs(new - old).max()) > 1e-3)
+    # the old path must be the historical function VERBATIM
+    scale = 60.0 + 0.6 * 340.0
+    mag = _old_pattern(d * scale, 0.6, 0.35, 0.0, 0.0)
+    tint = SKY._hash3f_dirs(d * scale)
+    warm = np.array([1.0, 0.86, 0.70], np.float32)
+    cool = np.array([0.74, 0.84, 1.0], np.float32)
+    star_col = cool[None, :] + (warm - cool)[None, :] * tint[:, None]
+    expect = (np.zeros((d.shape[0], 3), np.float32)
+              + star_col * (mag * 1.0)[:, None]).astype(np.float32)
+    check('Old Stars is the pre-1.38 drawing bit for bit',
+          bool(np.array_equal(old, expect)))
+
+    # Bryce layer: old = cell-sized squares (a large lit fraction of the
+    # sky); new = small discs (an order of magnitude less), sized by the
+    # shared Star Size dial. The pixel angle is pinned so the floor
+    # (which exists for coarse probes) is not what gets measured here
+    up = d[d[:, 2] > 0.3]
+    w2 = World()
+    w2._pixel_angle = 0.0008
+    b_new = np.asarray(SKY._stars(up, 0.7, 2.0, 5, world=w2))
+    w2.old_stars = True
+    b_old = np.asarray(SKY._stars(up, 0.7, 2.0, 5, world=w2))
+    w2.old_stars = False
+    lit_new = float((b_new.max(1) > 0.05).mean())
+    lit_old = float((b_old.max(1) > 0.05).mean())
+    check('old Bryce stars were squares covering whole cells',
+          lit_old > lit_new * 3.0, f'old {lit_old:.4f} new {lit_new:.4f}')
+    w2.star_size = 0.9
+    b_big = np.asarray(SKY._stars(up, 0.7, 2.0, 5, world=w2))
+    check('Star Size now drives the Bryce stars too',
+          float((np.asarray(b_big).max(1) > 0.05).mean()) > lit_new,
+          'bigger size, more lit sky')
+    # and with NO pixel angle at all, stars still exist at some size --
+    # the floor that keeps preset thumbnails and probes from going empty
+    w3 = World()
+    b_floor = np.asarray(SKY._stars(up, 0.7, 2.0, 5, world=w3))
+    check('unstamped callers still see stars (the fallback floor)',
+          float((b_floor.max(1) > 0.05).mean()) > 0.0)
+    # the World carries the toggle and the settings expose it
+    from ..core.scene import World as _W
+    check('old_stars lives on the World with the right default',
+          getattr(_W(), 'old_stars', None) is False)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    src = open(os.path.join(root, 'properties.py'), encoding='utf-8').read()
+    check('the toggle is registered for the panel', 'old_stars' in src)
+    srcui = open(os.path.join(root, 'ui.py'), encoding='utf-8').read()
+    check('both star sections draw it',
+          srcui.count("prop(hs, 'old_stars')") >= 2)
+
+
+def test_the_converter_stops_burning_materials_white():
+    """Emission Strength folds for REAL -- the bright-white-materials bug.
+
+    Since Blender 4.0 a default Principled carries a WHITE Emission
+    Color at strength ZERO; the converter copied the colour and ignored
+    the strength, so every converted material glowed white. Every case
+    is now exact: strength 0 drops the colour, constants multiply,
+    a linked colour gains a multiply node (marked in the plan), a linked
+    strength rides a multiply fed by its own link.
+    """
+    from ..core.convert import plan
+
+    p = plan('ShaderNodeBsdfPrincipled',
+             values={'Base Color': [0.8, 0.2, 0.2, 1.0],
+                     'Emission Color': [1.0, 1.0, 1.0, 1.0],
+                     'Emission Strength': 0.0})
+    si = [a for (t, a) in p['pairs'] if t == 'Self-Illumination']
+    check('a white emission at strength 0 is dropped entirely',
+          si == [] and p['extras'].get('Self-Illumination')
+          == (0.0, 0.0, 0.0, 1.0), str(p['extras'].get('Self-Illumination')))
+
+    p2 = plan('ShaderNodeBsdfPrincipled',
+              values={'Emission Color': [1.0, 0.5, 0.0, 1.0],
+                      'Emission Strength': 2.0})
+    check('constant strength multiplies into the constant colour',
+          p2['extras'].get('Self-Illumination') == (2.0, 1.0, 0.0, 1.0),
+          str(p2['extras'].get('Self-Illumination')))
+
+    p3 = plan('ShaderNodeBsdfPrincipled',
+              values={'Emission Strength': 3.0}, links={'Emission Color'})
+    check('a linked colour gets a VALUE multiply marker',
+          p3['scale_links'].get('Self-Illumination') == ('VALUE', 3.0),
+          str(p3['scale_links']))
+
+    p4 = plan('ShaderNodeBsdfPrincipled',
+              values={},
+              links={'Emission Color', 'Emission Strength'})
+    check('a linked strength gets a LINK multiply marker',
+          p4['scale_links'].get('Self-Illumination')
+          == ('LINK', 'Emission Strength'), str(p4['scale_links']))
+
+    p5 = plan('ShaderNodeBsdfPrincipled',
+              values={'Emission Color': [0.2, 0.0, 0.0, 1.0],
+                      'Emission Strength': 1.0})
+    check('strength 1 with a constant colour is the classic straight copy',
+          [a for (t, a) in p5['pairs'] if t == 'Self-Illumination']
+          == ['Emission Color'] and 'Self-Illumination' not in p5['extras'])
+
+    p6 = plan('ShaderNodeEmission', values={'Color': [0.0, 1.0, 0.0, 1.0],
+                                            'Strength': 5.0})
+    check('the Emission node folds its Strength the same way',
+          p6['extras'].get('Self-Illumination') == (0.0, 5.0, 0.0, 1.0))
+
+    p7 = plan('ShaderNodeBsdfPrincipled', values={'Emission': [0, 0, 0, 1]})
+    check('the 3.x Emission socket path is untouched',
+          [a for (t, a) in p7['pairs'] if t == 'Self-Illumination']
+          == ['Emission'] and not p7['scale_links'])
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    src = open(os.path.join(root, 'convert.py'), encoding='utf-8').read()
+    check('the surgery consumes the scale markers',
+          "p.get('scale_links')" in src and '_new_multiply' in src)
+
+
+def test_convert_to_blender_internal():
+    """The Convert-to-BI buttons: a bpy-free plan, 2.79-shaped.
+
+    Hardness from roughness through the renderer's own curve clamped to
+    BI's 511, emission through Emit, alpha through the transparency
+    panel (Raytrace when an IOR rides along), an Emission shader
+    becoming Shadeless -- which is exactly what Shadeless was for.
+    """
+    from ..core.convert import bi_plan
+
+    p = bi_plan('ShaderNodeBsdfPrincipled',
+                values={'Base Color': [0.8, 0.6, 0.4, 1.0],
+                        'Roughness': 0.5, 'Specular IOR Level': 0.5,
+                        'Emission Color': [1, 1, 1, 1],
+                        'Emission Strength': 0.0, 'Alpha': 1.0})
+    check('a default Principled maps to Lambert/CookTorr',
+          p['props']['diff_shader'] == 'LAMBERT'
+          and p['props']['spec_shader'] == 'COOKTORR')
+    check('roughness 0.5 becomes hardness 30 through the shared curve',
+          abs(p['sockets']['Hardness'] - 30.0) < 0.5,
+          str(p['sockets']['Hardness']))
+    check('zero-strength white emission never reaches Emit',
+          'Emit' not in p['sockets'])
+
+    p2 = bi_plan('ShaderNodeBsdfPrincipled',
+                 values={'Roughness': 0.2, 'Metallic': 1.0, 'Alpha': 0.5,
+                         'IOR': 1.45, 'Base Color': [0.9, 0.7, 0.3, 1]},
+                 links={'Base Color', 'Normal'})
+    check('links carry: colour and normal chains relink onto the BI node',
+          ('Color', 'Base Color') in p2['links']
+          and ('Normal', 'Normal') in p2['links'])
+    check('semi-transparency with an IOR opens the Raytrace panel',
+          p2['props'].get('use_transparency') is True
+          and p2['props'].get('transp_mode') == 'RAYTRACE')
+    check('metal tints the highlight with the base colour',
+          p2['sockets'].get('Specular Color', (0,) * 4)[:3]
+          == (0.9, 0.7, 0.3))
+
+    p3 = bi_plan('ShaderNodeEmission',
+                 values={'Color': [1, 0.2, 0.2, 1], 'Strength': 1.0})
+    check('an Emission shader becomes Shadeless',
+          p3['props'].get('shadeless') is True
+          and p3['sockets'].get('Color', (0,) * 4)[:3] == (1.0, 0.2, 0.2))
+
+    p4 = bi_plan('ShaderNodeBsdfGlossy',
+                 values={'Color': [0.9, 0.9, 1.0, 1], 'Roughness': 0.1})
+    check('a glossy shader goes all-highlight',
+          p4['sockets'].get('Intensity') == 0.0
+          and p4['sockets'].get('Specular Intensity') == 1.0
+          and p4['sockets'].get('Hardness') == 511.0)
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    src = open(os.path.join(root, 'convert.py'), encoding='utf-8').read()
+    check('the operator exists and converts through the plan',
+          "bl_idname = 'halcyon.convert_to_bi'" in src
+          and 'convert_material_to_bi' in src)
+    srcui = open(os.path.join(root, 'ui.py'), encoding='utf-8').read()
+    check('the panel draws all three scopes',
+          srcui.count("operator('halcyon.convert_to_bi'") == 3)
+
+
+def _master_graph_138(props_extra=None, ins_extra=(), extra_nodes=None,
+                      normal_feed=None):
+    def sk(nm, t, dflt, l=None):
+        return {'name': nm, 'type': t, 'default': dflt, 'link': l}
+    ins = [sk('Diffuse Color', 'RGBA', [0.6, 0.5, 0.4, 1.0]),
+           sk('Diffuse Level', 'VALUE', 1.0),
+           sk('Specular Color', 'RGBA', [1, 1, 1, 1]),
+           sk('Specular Level', 'VALUE', 0.6),
+           sk('Glossiness', 'VALUE', 30.0),
+           sk('Ambient', 'VALUE', 1.0),
+           sk('Opacity', 'VALUE', 1.0)]
+    ins += [dict(s) for s in ins_extra]
+    if normal_feed is not None:
+        ins.append(sk('Normal', 'VECTOR', [0, 0, 0], list(normal_feed)))
+    props = {'model': 'PHONG', 'toon_steps': 2}
+    props.update(props_extra or {})
+    nodes = dict(extra_nodes or {})
+    nodes['hal'] = {'id': 'hal', 'bl_idname': 'HALCYON_ShaderNode',
+                    'props': props, 'inputs': ins,
+                    'outputs': [{'name': 'Surface', 'type': 'SHADER'}]}
+    nodes['out'] = {'id': 'out', 'bl_idname': 'ShaderNodeOutputMaterial',
+                    'props': {},
+                    'inputs': [sk('Surface', 'SHADER', None, ['hal', 0])],
+                    'outputs': []}
+    return {'output': 'out', 'nodes': nodes}
+
+
+def _parity_138(sc, st, name, expect_refusal=None):
+    from ..core import raster as CR
+    from ..gpu import shade as GSH
+    w, h = st.resolution_x, st.resolution_y
+    cpu = R.render(sc, st)
+    view, _p, vp, eye = R.camera_matrices(sc.camera, w, h)
+    g = CR.GBuffer(w, h)
+    CR.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+    job = R.ShadeJob(sc, st, {}, None, view, eye, w, h)
+    GSH._PLAN_CACHE.clear()
+    passes, why, atlases = GSH.plan_frame(job, g)
+    if passes is None:
+        check(f'{name} planned onto the GPU', False, str(why))
+        return cpu
+    img, _hit = GSH.simulate(job, g, passes, atlases)
+    cov = g.tri >= 0
+    err = float(np.abs(img[cov] - cpu[cov][:, :3]).max())
+    check(f'{name}: the GPU shades the CPU picture', err < 6e-3,
+          f'max {err:.6f}')
+    return cpu
+
+
+def test_layer_blend_modes():
+    """Fresnel/rim/matcap blend menus: defaults change NOTHING, the new
+    modes change the picture, and the GPU shades every one identically.
+    """
+    st = base_settings(96, 72)
+    st.shadows = False
+    st.transparency = 'NONE'
+
+    def sk(nm, t, dflt, l=None):
+        return {'name': nm, 'type': t, 'default': dflt, 'link': l}
+    fx = (sk('Rim Amount', 'VALUE', 0.8), sk('Rim Power', 'VALUE', 2.0),
+          sk('Rim Light', 'RGBA', [0.2, 0.6, 1.0, 1.0]),
+          sk('Fresnel', 'VALUE', 0.5),
+          sk('Matcap', 'RGBA', [0.9, 0.1, 0.6, 1.0]),
+          sk('Matcap Blend', 'VALUE', 0.4))
+
+    def frame(props):
+        sc = demo_scene(st, with_texture=False)
+        sc.materials[1].graph = _master_graph_138(props, fx)
+        return sc
+
+    # the defaults are the pre-1.38 behaviour BITWISE: no props at all
+    # vs the explicit historical identifiers
+    a = R.render(frame({}), st)
+    b = R.render(frame({'fresnel_blend': 'ADD', 'rim_blend': 'ADD',
+                        'matcap_mode': 'MIX'}), st)
+    check('the default blend menus reproduce the old picture bitwise',
+          bool(np.array_equal(a, b)))
+
+    frames = {}
+    for mode in ('ADD', 'MIX', 'MULTIPLY', 'SCREEN'):
+        sc = frame({'fresnel_blend': mode, 'rim_blend': mode,
+                    'matcap_mode': mode if mode != 'ADD' else 'ADD'})
+        frames[mode] = _parity_138(sc, st, f'blend {mode}')
+    pairs = [('ADD', 'MIX'), ('MIX', 'MULTIPLY'), ('MULTIPLY', 'SCREEN')]
+    for x, y in pairs:
+        check(f'{x} and {y} shade differently',
+              float(np.abs(frames[x] - frames[y]).max()) > 1e-3)
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    src = open(os.path.join(root, 'gpu', 'shade.py'),
+               encoding='utf-8').read()
+    check('the GPU probe harvests the blend codes',
+          "'fresnel_blend', 'rim_blend', 'matcap_mode'" in src)
+    srcx = open(os.path.join(root, 'export.py'), encoding='utf-8').read()
+    check('the exporter serializes the blend menus',
+          "'fresnel_blend', 'rim_blend', 'matcap_mode'" in srcx)
+
+
+def test_the_twelve_new_nodes():
+    """Every 1.38 node: registered on both devices, does something, and
+    the GPU simulator reproduces the CPU picture for each.
+    """
+    from ..core.nodeeval import DISPATCH
+    from ..gpu import emit as EM
+    from . import fakebpy
+    fakebpy.install()
+    import importlib
+    sn = importlib.import_module('halcyon.nodes.shader_nodes')
+
+    new = ('HALCYON_NormalMapNode', 'HALCYON_NormalMixNode',
+           'HALCYON_AltitudeSlopeNode', 'HALCYON_FacingNode',
+           'HALCYON_SwitchNode', 'HALCYON_RandomPerObjectNode',
+           'HALCYON_LevelsNode', 'HALCYON_SmoothStepNode',
+           'HALCYON_ChannelShuffleNode', 'HALCYON_DistanceMaskNode',
+           'HALCYON_StepTimeNode', 'HALCYON_WaveNode')
+    have = {c.bl_idname for c in sn.NODES}
+    missing = [n for n in new if n not in have]
+    check('all twelve nodes are in the Add menu', not missing,
+          ', '.join(missing))
+    check('all twelve evaluate on the CPU',
+          all(n in DISPATCH for n in new),
+          ', '.join(n for n in new if n not in DISPATCH))
+    emit_table = getattr(EM, 'NODE_EMITTERS', None) or \
+        getattr(EM, 'EMITTERS', None)
+    if emit_table is None:
+        srcp = open(EM.__file__, encoding='utf-8').read()
+        ok = all(f"'{n}': e_" in srcp for n in new)
+        check('all twelve emit GLSL', ok)
+    else:
+        check('all twelve emit GLSL',
+              all(n in emit_table for n in new),
+              ', '.join(n for n in new if n not in emit_table))
+
+    st = base_settings(96, 72)
+    st.shadows = False
+    st.transparency = 'NONE'
+
+    def sk(nm, t, dflt, l=None):
+        return {'name': nm, 'type': t, 'default': dflt, 'link': l}
+
+    def wnode(nid, idn, props, ins, outs):
+        return {'id': nid, 'bl_idname': idn, 'props': props, 'inputs': ins,
+                'outputs': outs}
+
+    def diffuse_feed(name, nodes, feed):
+        sc = demo_scene(st, with_texture=False)
+        g = _master_graph_138(extra_nodes={n['id']: n for n in nodes})
+        # rewire Diffuse Color onto the node under test
+        for s in g['nodes']['hal']['inputs']:
+            if s['name'] == 'Diffuse Color':
+                s['link'] = list(feed)
+        sc.materials[1].graph = g
+        cpu = _parity_138(sc, st, name)
+        sc0 = demo_scene(st, with_texture=False)
+        sc0.materials[1].graph = _master_graph_138()
+        plain = R.render(sc0, st)
+        check(f'{name} changes the picture',
+              float(np.abs(cpu - plain).max()) > 1e-4)
+
+    diffuse_feed('Levels',
+                 [wnode('lv', 'HALCYON_LevelsNode', {},
+                        [sk('Color', 'RGBA', [0.6, 0.5, 0.4, 1.0]),
+                         sk('Black', 'VALUE', 0.1),
+                         sk('White', 'VALUE', 0.8),
+                         sk('Gamma', 'VALUE', 1.8),
+                         sk('Out Min', 'VALUE', 0.05),
+                         sk('Out Max', 'VALUE', 0.95)],
+                        [{'name': 'Color', 'type': 'RGBA'}])], ('lv', 0))
+    diffuse_feed('Facing + Switch',
+                 [wnode('fc', 'HALCYON_FacingNode', {},
+                        [sk('Power', 'VALUE', 2.0), sk('IOR', 'VALUE', 1.6)],
+                        [{'name': 'Facing', 'type': 'VALUE'},
+                         {'name': 'Incidence', 'type': 'VALUE'},
+                         {'name': 'Fresnel', 'type': 'VALUE'}]),
+                  wnode('sw', 'HALCYON_SwitchNode', {},
+                        [sk('Switch', 'VALUE', 0.0, ['fc', 2]),
+                         sk('A', 'RGBA', [0.8, 0.1, 0.1, 1]),
+                         sk('B', 'RGBA', [0.1, 0.1, 0.9, 1])],
+                        [{'name': 'Color', 'type': 'RGBA'}])], ('sw', 0))
+    diffuse_feed('Altitude & Slope',
+                 [wnode('alt', 'HALCYON_AltitudeSlopeNode', {},
+                        [sk('Minimum', 'VALUE', 0.0),
+                         sk('Maximum', 'VALUE', 2.0)],
+                        [{'name': 'Altitude', 'type': 'VALUE'},
+                         {'name': 'Factor', 'type': 'VALUE'},
+                         {'name': 'Slope', 'type': 'VALUE'},
+                         {'name': 'Orientation', 'type': 'VALUE'}]),
+                  wnode('sw2', 'HALCYON_SwitchNode', {},
+                        [sk('Switch', 'VALUE', 0.0, ['alt', 1]),
+                         sk('A', 'RGBA', [0.2, 0.7, 0.2, 1]),
+                         sk('B', 'RGBA', [0.9, 0.9, 0.9, 1])],
+                        [{'name': 'Color', 'type': 'RGBA'}])], ('sw2', 0))
+    diffuse_feed('Random Per Object',
+                 [wnode('rnd', 'HALCYON_RandomPerObjectNode', {},
+                        [sk('Seed', 'VALUE', 3.0)],
+                        [{'name': 'Value', 'type': 'VALUE'},
+                         {'name': 'Color', 'type': 'RGBA'}])], ('rnd', 1))
+    diffuse_feed('Distance Mask',
+                 [wnode('dm', 'HALCYON_DistanceMaskNode', {},
+                        [sk('Start', 'VALUE', 4.0), sk('End', 'VALUE', 8.0)],
+                        [{'name': 'Factor', 'type': 'VALUE'},
+                         {'name': 'Distance', 'type': 'VALUE'}]),
+                  wnode('sw3', 'HALCYON_SwitchNode', {},
+                        [sk('Switch', 'VALUE', 0.0, ['dm', 0]),
+                         sk('A', 'RGBA', [0.9, 0.2, 0.2, 1]),
+                         sk('B', 'RGBA', [0.2, 0.2, 0.9, 1])],
+                        [{'name': 'Color', 'type': 'RGBA'}])], ('sw3', 0))
+    diffuse_feed('Stepped Time + Waveform + Smooth Step + Shuffle',
+                 [wnode('st1', 'HALCYON_StepTimeNode', {},
+                        [sk('Step Frames', 'VALUE', 4.0)],
+                        [{'name': 'Frame', 'type': 'VALUE'},
+                         {'name': 'Phase', 'type': 'VALUE'}]),
+                  wnode('wv', 'HALCYON_WaveNode', {'wave': 'TRIANGLE'},
+                        [sk('Value', 'VALUE', 0.0, ['st1', 1]),
+                         sk('Frequency', 'VALUE', 1.0),
+                         sk('Phase', 'VALUE', 0.25),
+                         sk('Minimum', 'VALUE', 0.1),
+                         sk('Maximum', 'VALUE', 0.9)],
+                        [{'name': 'Value', 'type': 'VALUE'}]),
+                  wnode('ss', 'HALCYON_SmoothStepNode', {'interp': 'SMOOTHER'},
+                        [sk('Value', 'VALUE', 0.5, ['wv', 0]),
+                         sk('From Min', 'VALUE', 0.0),
+                         sk('From Max', 'VALUE', 1.0)],
+                        [{'name': 'Value', 'type': 'VALUE'}]),
+                  wnode('sh', 'HALCYON_ChannelShuffleNode',
+                        {'out_r': 'B', 'out_g': 'R', 'out_b': 'ONE',
+                         'out_a': 'A'},
+                        [sk('Color', 'RGBA', [0.7, 0.3, 0.1, 1.0])],
+                        [{'name': 'Color', 'type': 'RGBA'}]),
+                  wnode('sw4', 'HALCYON_SwitchNode', {},
+                        [sk('Switch', 'VALUE', 0.0, ['ss', 0]),
+                         sk('A', 'RGBA', [0.3, 0.3, 0.3, 1], ['sh', 0]),
+                         sk('B', 'RGBA', [0.9, 0.8, 0.1, 1])],
+                        [{'name': 'Color', 'type': 'RGBA'}])], ('sw4', 0))
+
+    # the normal pair, fed through the master's Normal input
+    def normal_feed(name, nodes, feed):
+        sc = demo_scene(st, with_texture=False)
+        g = _master_graph_138(extra_nodes={n['id']: n for n in nodes},
+                              normal_feed=feed)
+        sc.materials[1].graph = g
+        return _parity_138(sc, st, name)
+
+    nm = wnode('nm', 'HALCYON_NormalMapNode',
+               {'space': 'TANGENT', 'map_type': 'OPENGL'},
+               [sk('Color', 'RGBA', [0.85, 0.3, 1.0, 1.0]),
+                sk('Strength', 'VALUE', 1.0)],
+               [{'name': 'Normal', 'type': 'VECTOR'}])
+    ogl = normal_feed('Normal Map+ (OpenGL)', [nm], ('nm', 0))
+    nm_dx = dict(nm)
+    nm_dx['props'] = {'space': 'TANGENT', 'map_type': 'DIRECTX'}
+    dx = normal_feed('Normal Map+ (DirectX)', [nm_dx], ('nm', 0))
+    check('the DirectX flip changes the shading',
+          float(np.abs(ogl - dx).max()) > 1e-3)
+    nm2 = wnode('nm2', 'HALCYON_NormalMapNode',
+                {'space': 'TANGENT', 'map_type': 'OPENGL'},
+                [sk('Color', 'RGBA', [0.3, 0.75, 1.0, 1.0]),
+                 sk('Strength', 'VALUE', 1.0)],
+                [{'name': 'Normal', 'type': 'VECTOR'}])
+    prev = None
+    for mode in ('DETAIL', 'ADD', 'MIX'):
+        mixn = wnode('mix', 'HALCYON_NormalMixNode', {'mode': mode},
+                     [sk('Base', 'VECTOR', [0, 0, 1], ['nm', 0]),
+                      sk('Detail', 'VECTOR', [0, 0, 1], ['nm2', 0]),
+                      sk('Factor', 'VALUE', 0.7)],
+                     [{'name': 'Normal', 'type': 'VECTOR'}])
+        f = normal_feed(f'Normal Mix ({mode})', [nm, nm2, mixn], ('mix', 0))
+        if prev is not None:
+            check(f'Normal Mix {mode} differs from the previous mode',
+                  float(np.abs(f - prev).max()) > 1e-4)
+        prev = f
+
+
+def test_master_shader_hides_what_the_model_ignores():
+    """Every model now derives its socket set from the MEASURED table.
+
+    RELEVANT's explicit sets stay authoritative where they exist; the
+    models it left open (None) used to show every socket -- a PHONG node
+    offered Roughness, Toon Size and Translucency, none of which it
+    reads. Those now derive from SOCKET_MODELS, which a separate test
+    re-measures against the shading code.
+    """
+    from . import fakebpy
+    fakebpy.install()
+    import importlib
+    sn = importlib.import_module('halcyon.nodes.shader_nodes')
+    cls = sn.HALCYON_ShaderNode
+
+    def derived(model):
+        keep = cls.RELEVANT.get(model)
+        if keep is None:
+            keep = {name for _k, name, _d in cls.SOCKETS
+                    if sn.SOCKET_MODELS.get(name) == sn.ALL
+                    or (sn.SOCKET_MODELS.get(name)
+                        and model in sn.SOCKET_MODELS[name])}
+        return set(keep) | set(cls.ALWAYS)
+
+    phong = derived('PHONG')
+    for gone in ('Roughness', 'Toon Size', 'Toon Smooth', 'Translucency',
+                 'Anisotropy', 'Anisotropic Rotation', 'IOR'):
+        check(f'PHONG hides {gone}', gone not in phong)
+    check('PHONG keeps Glossiness', 'Glossiness' in phong)
+    ward = derived('WARD')
+    check('WARD keeps Roughness and Anisotropy',
+          'Roughness' in ward and 'Anisotropy' in ward)
+    check('BLINN keeps IOR', 'IOR' in derived('BLINN'))
+    check('TOON keeps its band controls',
+          {'Toon Size', 'Toon Smooth'} <= derived('TOON'))
+    body = __import__('inspect').getsource(cls.refresh_sockets)
+    check('refresh_sockets derives the open models from SOCKET_MODELS',
+          'SOCKET_MODELS' in body)
+    check('the blend menus ride the node',
+          all(k in getattr(cls, '__annotations__', {})
+              for k in ('fresnel_blend', 'rim_blend', 'matcap_mode')))
+
+
+def test_refine_passes_pay_only_for_their_pixels():
+    """R187: the per-refine-pass overheads the field priced, cut exactly.
+
+    A refine pass keeps only its flagged pixels, so (1) the sky is
+    evaluated only at flagged sky pixels, and (2) a CPU height pre-pass
+    image is evaluated only inside the mask grown by one -- the bump
+    emitter's three taps per shaded pixel all land there, so the
+    computed texels carry the full image's values BIT FOR BIT and the
+    uncomputed ones are never read. The full-frame path is untouched.
+    """
+    from ..core import raster as CR
+    from ..core.nodeeval import desugar_master_bump
+    from ..gpu import shade as GSH
+
+    st = base_settings(96, 72)
+    st.shadows = False
+    st.transparency = 'NONE'
+    sc = demo_scene(st, with_texture=False)
+
+    def sk(nm, t, dflt, l=None):
+        return {'name': nm, 'type': t, 'default': dflt, 'link': l}
+    g = {'output': 'out', 'nodes': {
+        'noi': {'id': 'noi', 'bl_idname': 'ShaderNodeTexNoise',
+                'props': {},
+                'inputs': [sk('Vector', 'VECTOR', [0, 0, 0]),
+                           sk('Scale', 'VALUE', 6.0),
+                           sk('Detail', 'VALUE', 2.0),
+                           sk('Roughness', 'VALUE', 0.5),
+                           sk('Distortion', 'VALUE', 0.0)],
+                'outputs': [{'name': 'Fac', 'type': 'VALUE'},
+                            {'name': 'Color', 'type': 'RGBA'}]},
+        'hal': {'id': 'hal', 'bl_idname': 'HALCYON_ShaderNode',
+                'props': {'model': 'PHONG', 'toon_steps': 2},
+                'inputs': [sk('Diffuse Color', 'RGBA', [0.6, 0.5, 0.4, 1]),
+                           sk('Diffuse Level', 'VALUE', 1.0),
+                           sk('Ambient', 'VALUE', 1.0),
+                           sk('Bump Strength', 'VALUE', 1.0),
+                           sk('Bump Height', 'VALUE', 0.5, ['noi', 0])],
+                'outputs': [{'name': 'Surface', 'type': 'SHADER'}]},
+        'out': {'id': 'out', 'bl_idname': 'ShaderNodeOutputMaterial',
+                'props': {},
+                'inputs': [sk('Surface', 'SHADER', None, ['hal', 0])],
+                'outputs': []}}}
+    sc.materials[1].graph = g
+    desugar_master_bump(g)
+    check('the bump sugar desugared for the pre-pass',
+          '__bump_hal' in g['nodes'])
+
+    w, h = 96, 72
+    view, _p, vp, eye = R.camera_matrices(sc.camera, w, h)
+    gb = CR.GBuffer(w, h)
+    CR.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=gb)
+    job = R.ShadeJob(sc, st, {}, None, view, eye, w, h)
+    full = GSH._cpu_height_image(job, gb, 1, '__bump_hal')
+    check('the full height image has content',
+          float(np.abs(full[..., 0]).max()) > 0.0
+          and int((full[..., 3] > 0.5).sum()) > 0)
+
+    # a mask over part of the material's pixels
+    mask = np.zeros((h, w), bool)
+    mby, mbx = np.nonzero(full[..., 3] > 0.5)
+    keep_every = max(mby.size // 40, 1)
+    mask[mby[::keep_every], mbx[::keep_every]] = True
+    st2 = st.copy()
+    st2._refine_mask = mask
+    job2 = R.ShadeJob(sc, st2, {}, None, view, eye, w, h)
+    rest = GSH._cpu_height_image(job2, gb, 1, '__bump_hal')
+
+    grow = mask.copy()
+    grow[1:] |= mask[:-1]
+    grow[:-1] |= mask[1:]
+    grow[:, 1:] |= mask[:, :-1]
+    grow[:, :-1] |= mask[:, 1:]
+    inside = grow & (full[..., 3] > 0.5)
+    check('inside the grown mask the restricted image IS the full image',
+          bool(np.array_equal(rest[inside], full[inside])),
+          f'{int(inside.sum())} texels compared')
+    outside = ~grow
+    check('outside it nothing was computed at all',
+          float(np.abs(rest[outside]).max()) == 0.0)
+    check('the restricted pass computed a fraction of the texels',
+          int((rest[..., 3] > 0.5).sum()) < int((full[..., 3] > 0.5).sum()))
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    rsrc = open(os.path.join(root, 'core', 'render.py'),
+                encoding='utf-8').read()
+    check('the sky evaluates only at flagged pixels in a refine pass',
+          '_bg_un = _bg_un & _rm' in rsrc)
+    ssrc = open(os.path.join(root, 'gpu', 'shade.py'),
+                encoding='utf-8').read()
+    check('the split names WHO and WHY each CPU pre-pass ran',
+          "LAST_TIMINGS['prepass_whys']" in ssrc
+          and 'prepass_whys' in rsrc)
+
+
+def test_light_sizes_actually_work():
+    """R188: the field's four-item lighting round, pinned.
+
+    SUN's size is an ANGLE and now tilts its shadow rays inside that
+    cone; AREA samples real points on its rectangle (penumbras follow
+    the lamp's true shape); every sized lamp blurs its SHADOW MAP too,
+    through a size-derived texel radius stamped on the map at build --
+    with the lamp's size in the map cache key, because a cached map was
+    serving its stale blur. Size zero stays bitwise-identical to the
+    old pictures, and the GPU twins reproduce every new sampler
+    exactly.
+    """
+    from ..core.scene import Light
+    from ..core import raster as CR
+    from ..gpu import shade as GSH
+    from ..core.bvh import BVH
+
+    def st_(**kw):
+        s = base_settings(96, 72)
+        s.transparency = 'NONE'
+        for k, v in kw.items():
+            setattr(s, k, v)
+        return s
+
+    # --- ray shadows
+    st = st_(shadows=True, shadow_default='RAY', ray_shadows=True,
+             shadow_samples=6)
+    sc = demo_scene(st, with_texture=False)
+    sc.lights = [Light(type='SUN', direction=(0.3, -0.4, -0.85), energy=3.0,
+                       radius=0.0, shadow='RAY')]
+    hard = R.render(sc, st)
+    sc.lights[0].radius = 0.25
+    soft = R.render(sc, st)
+    check('a SUN angle softens its ray shadows',
+          float(np.abs(soft - hard).max()) > 1e-3)
+    check('soft sun shadows are deterministic',
+          bool(np.array_equal(soft, R.render(sc, st))))
+    sc.lights[0].radius = 0.0
+    check('angle zero is the old picture bitwise',
+          bool(np.array_equal(R.render(sc, st), hard)))
+
+    sc2 = demo_scene(st, with_texture=False)
+    sc2.lights = [Light(type='AREA', position=(1.5, 2.5, 4.0),
+                        direction=(-0.3, -0.5, -0.8), energy=900.0,
+                        area_size=(0.01, 0.01), area_x=(1, 0, 0),
+                        area_y=(0, 1, 0), shadow='RAY')]
+    small = R.render(sc2, st)
+    sc2.lights[0].area_size = (3.0, 3.0)
+    big = R.render(sc2, st)
+    check('an AREA size softens its ray shadows',
+          float(np.abs(big - small).max()) > 1e-3)
+    sc2.lights[0].area_shape = 'DISK'
+    disk = R.render(sc2, st)
+    check('the shape matters too (disk vs square sampling)',
+          float(np.abs(disk - big).max()) > 1e-5)
+
+    # --- map shadows
+    stm = st_(shadows=True, shadow_default='MAP', shadow_map_size=256)
+    sc3 = demo_scene(stm, with_texture=False)
+    sc3.lights = [Light(type='POINT', position=(1.5, 2.5, 4.0),
+                        energy=900.0, radius=0.0, shadow='MAP')]
+    m_hard = R.render(sc3, stm)
+    sc3.lights[0].radius = 1.2
+    m_soft = R.render(sc3, stm)
+    check('a POINT radius blurs its shadow MAP now',
+          float(np.abs(m_soft - m_hard).max()) > 1e-3)
+    sc3.lights[0].radius = 0.0
+    check('radius zero maps are the old picture bitwise (cache keyed '
+          'on size)', bool(np.array_equal(R.render(sc3, stm), m_hard)))
+    sm = sc3.lights[0].shadow_map
+    check('the size-derived blur is stamped on the built map',
+          hasattr(sm, 'soft_extra'))
+
+    # --- GPU twins agree, sample for sample
+    def parity(lights, name, ray=False):
+        s = st_(shadows=True,
+                shadow_default='RAY' if ray else 'MAP',
+                ray_shadows=ray, shadow_samples=4, shadow_map_size=256)
+        scp = demo_scene(s, with_texture=False)
+        scp.lights = lights
+        cpu = R.render(scp, s)
+        view, _p, vp, eye = R.camera_matrices(scp.camera, 96, 72)
+        g = CR.GBuffer(96, 72)
+        CR.rasterize(scp.mesh.verts, scp.mesh.tris, vp, 96, 72, gbuf=g)
+        bvh = BVH.cached(scp.mesh.verts, scp.mesh.tris) if ray else None
+        job = R.ShadeJob(scp, s, {}, bvh, view, eye, 96, 72)
+        GSH._PLAN_CACHE.clear()
+        passes, why, atlases = GSH.plan_frame(job, g)
+        check(f'{name} plans onto the GPU', passes is not None, str(why))
+        if passes is None:
+            return
+        img, _hit = GSH.simulate(job, g, passes, atlases)
+        cov = g.tri >= 0
+        err = float(np.abs(img[cov] - cpu[cov][:, :3]).max())
+        check(f'{name}: GPU shades the CPU picture', err < 6e-3,
+              f'max {err:.6f}')
+
+    parity([Light(type='SUN', direction=(0.3, -0.4, -0.85), energy=3.0,
+                  radius=0.3, shadow='RAY')], 'soft-sun rays', ray=True)
+    parity([Light(type='AREA', position=(1.5, 2.5, 4.0),
+                  direction=(-0.3, -0.5, -0.8), energy=900.0,
+                  area_size=(2.0, 1.0), area_x=(1, 0, 0), area_y=(0, 1, 0),
+                  shadow='RAY')], 'soft-area rays', ray=True)
+    parity([Light(type='POINT', position=(1.5, 2.5, 4.0), energy=900.0,
+                  radius=1.2, shadow='MAP')], 'sized point map')
+
+
+def test_hemi_is_a_proper_hemisphere_lamp():
+    """The Hemi audit the field asked for, as pins.
+
+    Directional (position ignored), the 0.5+0.5*N.L wrap on the diffuse
+    (the far side still receives light), the wrapped half-vector
+    specular, no shadows ever, no distance falloff -- and the GPU
+    branch shades the same picture.
+    """
+    from ..core.scene import Light
+    from ..core import raster as CR
+    from ..gpu import shade as GSH
+
+    st = base_settings(96, 72)
+    st.transparency = 'NONE'
+    st.shadows = True
+    sc = demo_scene(st, with_texture=False)
+    sc.lights = [Light(type='HEMI', direction=(0.2, -0.3, -0.93),
+                       energy=1.5, shadow='NONE')]
+    h1 = R.render(sc, st)
+    check('hemi lights the scene', float(h1[..., :3].mean()) > 0.01)
+    sc.lights[0].position = (50.0, 50.0, 50.0)
+    check('hemi ignores its position entirely',
+          bool(np.array_equal(h1, R.render(sc, st))))
+    sc.lights[0].direction = (-0.2, 0.3, 0.93)
+    h3 = R.render(sc, st)
+    check('the wrap lights the far side too',
+          float(h3[..., :3].mean()) > 0.005)
+    check('but direction still matters',
+          float(np.abs(h3 - h1).max()) > 1e-4)
+    sc.lights[0].direction = (0.2, -0.3, -0.93)
+    sc.lights[0].shadow = 'MAP'
+    check('hemi never shadows, whatever its shadow mode says',
+          bool(np.array_equal(h1, R.render(sc, st))))
+
+    view, _p, vp, eye = R.camera_matrices(sc.camera, 96, 72)
+    g = CR.GBuffer(96, 72)
+    CR.rasterize(sc.mesh.verts, sc.mesh.tris, vp, 96, 72, gbuf=g)
+    job = R.ShadeJob(sc, st, {}, None, view, eye, 96, 72)
+    GSH._PLAN_CACHE.clear()
+    passes, why, atlases = GSH.plan_frame(job, g)
+    check('a hemi frame plans onto the GPU', passes is not None, str(why))
+    if passes is not None:
+        img, _hit = GSH.simulate(job, g, passes, atlases)
+        cov = g.tri >= 0
+        err = float(np.abs(img[cov] - h1[cov][:, :3]).max())
+        check('the GPU hemi is the CPU hemi', err < 6e-3, f'max {err:.6f}')
+
+
+def test_light_volumes_layer_and_stop():
+    """R188: beams composite over GEOMETRY, stop at meshes when asked,
+    and every positional lamp type can cast one.
+
+    The old pass ran before shading (the shading loop overwrote every
+    beam pixel that crossed a surface -- beams only survived against
+    sky) and clipped against raw NDC z as if it were metres. Now the
+    beam composites over the finished frame with the exact
+    reconstructed distance, POINT casts a bounded glow, AREA a
+    soft-edged slab, and Beam Occlusion traces each march sample back
+    to the lamp so a wall in the way carves the beam.
+    """
+    from ..core import raster as CR
+    from ..core.scene import Light
+
+    st = base_settings(160, 120)
+    st.shadows = False
+    st.spot_cones = True
+    off_st = st.copy()
+    off_st.spot_cones = False
+
+    sc = demo_scene(st, with_texture=False)
+    sc.lights.append(Light(type='SPOT', position=(0, 4.5, 2.2),
+                           direction=(0, -1, -0.25), color=(1, 0.9, 0.7),
+                           energy=800.0, spot_size=0.8, spot_blend=0.25,
+                           volumetric=1.5))
+    on = R.render(sc, st)
+    off = R.render(sc, off_st)
+    d = (on - off)[:, :, :3].sum(2)
+    view, _p, vp, eye = R.camera_matrices(sc.camera, 160, 120)
+    g = CR.GBuffer(160, 120)
+    CR.rasterize(sc.mesh.verts, sc.mesh.tris, vp, 160, 120, gbuf=g)
+    cov = g.mask()
+    check('the beam layers OVER geometry now',
+          int((d[cov] > 1e-4).sum()) > 100,
+          f'{int((d[cov] > 1e-4).sum())} covered px lit')
+    check('a beam only ever adds light', float(d.min()) >= -1e-6)
+    check('beams are deterministic', bool(np.array_equal(on, R.render(sc, st))))
+
+    sc.lights[-1].volumetric_occlusion = True
+    occ = R.render(sc, st)
+    cut = (on - occ)[:, :, :3].sum(2)
+    check('Beam Occlusion carves the beam where meshes block the lamp',
+          int((cut > 1e-4).sum()) > 0, f'{int((cut > 1e-4).sum())} px')
+    check('occlusion never brightens anything',
+          float((occ - on)[:, :, :3].max()) < 1e-5)
+
+    for kind, extra in (('POINT', {}),
+                        ('AREA', {'area_size': (1.2, 0.8),
+                                  'area_x': (1, 0, 0),
+                                  'area_y': (0, 0, 1)})):
+        sc2 = demo_scene(st, with_texture=False)
+        sc2.lights.append(Light(type=kind, position=(0, 2.5, 2.0),
+                                direction=(0, -0.5, -0.8),
+                                color=(0.6, 0.8, 1.0), energy=600.0,
+                                volumetric=1.5, **extra))
+        v_on = R.render(sc2, st)
+        v_off = R.render(sc2, off_st)
+        dd = (v_on - v_off)[:, :, :3].sum(2)
+        check(f'a {kind} lamp casts a volume',
+              int((dd > 1e-4).sum()) > 50, f'{int((dd > 1e-4).sum())} px')
+        check(f'the {kind} volume only adds and stays finite',
+              float(dd.min()) >= -1e-6 and bool(np.isfinite(v_on).all()))
+
+    # a SUN never marches a beam (its volumetric drives the post shafts)
+    sc3 = demo_scene(st, with_texture=False)
+    sun = [l for l in sc3.lights if l.type == 'SUN']
+    base = R.render(sc3, off_st)
+    if sun:
+        sun[0].volumetric = 2.0
+        with_sun = R.render(sc3, st)
+        dd = np.abs(with_sun - base)[:, :, :3]
+        check('a SUN adds no in-air beam (shafts are the post pass)',
+              float(dd.max()) < 1e-5, f'{float(dd.max()):.6f}')
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    src = open(os.path.join(root, 'core', 'render.py'),
+               encoding='utf-8').read()
+    check('the volume composite runs after shading',
+          '_light_volumes(img, scene, st, gbuf, vp, eye, rw, rh, bvh'
+          in src)
+    check('beam occlusion is in the BVH gate',
+          '_volume_occlusion_wanted(scene, st)' in src)
+    srcu = open(os.path.join(root, 'ui.py'), encoding='utf-8').read()
+    check('the lamp panel offers Beam Occlusion for the beam kinds',
+          "'volumetric_occlusion'" in srcu)
+
+
+# --------------------------------------------------- R190: the period round
+
+
+def test_period_lens_flares():
+    """R190: per-lamp lens flares -- anchored, occlusion-faded, drawn by
+    the post kit, deterministic, and skipped by the worker pool."""
+    st = base_settings(96, 72)
+    st.transparency = 'NONE'
+    sc = demo_scene(st, with_texture=False)
+    # a point lamp hanging in clear sky ahead of the camera
+    from ..core.scene import Light
+    sc.lights = [Light(type='POINT', name='Glow',
+                       position=(0.0, 3.0, 4.0), energy=600.0,
+                       flare=2.0, flare_scale=1.0, shadow='NONE')]
+    img = R.render(sc, st)
+    srcs = getattr(sc, 'last_flares', None)
+    check('a flaring lamp registers a flare source',
+          bool(srcs) and len(srcs) >= 1)
+    inten = float(srcs[0].get('intensity', 0.0)) if srcs else 0.0
+    check('the visible lamp has flare intensity', inten > 0.0)
+    # hidden below the floor: the flare fades with its lamp
+    sc.lights[0].position = (-1.6, 4.4, -1.3)
+    R.render(sc, st)
+    hid = getattr(sc, 'last_flares', None) or []
+    hidden_i = float(hid[0].get('intensity', 0.0)) if hid else 0.0
+    check('the flare dies as its lamp slips behind geometry',
+          hidden_i < inten)
+    sc.lights[0].position = (0.0, 3.0, 4.0)
+    rgb = img[:, :, :3].copy()
+    flared = post.lamp_flares(rgb.copy(), st, srcs)
+    check('the flare kit draws over the frame',
+          float(np.abs(flared - rgb).max()) > 1e-4)
+    check('the flare kit is deterministic',
+          bool(np.array_equal(post.lamp_flares(rgb.copy(), st, srcs),
+                              flared)))
+    # no flare dial -> no sources
+    sc.lights[0].flare = 0.0
+    R.render(sc, st)
+    check('a lamp without the dial registers nothing',
+          not getattr(sc, 'last_flares', None))
+    # R195: a SUN anchored on open sky registers -- the field aimed
+    # suns for a round and saw nothing (the anchor was outside the
+    # narrow vertical field, or over geometry) and the viewport post
+    # never received the sources at all
+    fwd = np.array([0.0, -0.2, 0.9]) - np.array([5.2, -6.4, 3.6])
+    fwd /= np.linalg.norm(fwd)
+    spot = fwd + np.array([0.0, 0.0, 1.0]) * 0.16
+    spot /= np.linalg.norm(spot)
+    sc2 = demo_scene(st, with_texture=False)
+    sc2.lights = [Light(type='SUN', name='Glare',
+                        direction=tuple(-spot), energy=1.2, flare=2.2,
+                        shadow='NONE')]
+    R.render(sc2, st)
+    sun_srcs = getattr(sc2, 'last_flares', None) or []
+    check('a SUN with its sky spot in frame registers a flare',
+          len(sun_srcs) == 1
+          and float(sun_srcs[0]['intensity']) > 1.0)
+
+    # R196 field find: a scene of nothing but a sky, a sun and a
+    # camera -- the natural way to TEST a flare -- has no triangles,
+    # and the early sky path returned before last_flares was ever
+    # computed. The geometry-less frame must flare too
+    from ..core.scene import Camera, Scene, World
+    from .scenebuild import look_at_matrix
+    cam3 = Camera(matrix_world=look_at_matrix((0, 0, 1.6), (0, 8, 4.0)))
+    fwd3 = np.array([0.0, 8.0, 2.4])
+    fwd3 /= np.linalg.norm(fwd3)
+    sc3 = Scene(mesh=None, materials=[], objects=[],
+                lights=[Light(type='SUN', name='Sun',
+                              direction=tuple(-fwd3), energy=2.0,
+                              flare=2.5, shadow='NONE')],
+                camera=cam3,
+                world=World(sky_blend=True,
+                            horizon=(0.55, 0.65, 0.85),
+                            zenith=(0.25, 0.4, 0.75)),
+                settings=st)
+    sc3.images = {}
+    img3 = R.render(sc3, st)
+    sky_srcs = getattr(sc3, 'last_flares', None) or []
+    check('a sky-only scene (no mesh at all) flares its sun',
+          len(sky_srcs) == 1
+          and float(sky_srcs[0]['intensity']) > 2.0)
+    drawn3 = post.lamp_flares(img3[:, :, :3].copy(), st, sky_srcs)
+    check('and the kit draws on the bare sky',
+          float(np.abs(drawn3 - img3[:, :, :3]).max()) > 1e-3)
+
+    # the pool must not band a flared frame
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    esrc = open(os.path.join(root, 'engine.py'), encoding='utf-8').read()
+    check('the worker pool skips flared frames',
+          "lens flares sample" in esrc)
+    # R195: the rendered viewport's post call hands the sources over
+    psrc = open(os.path.join(root, 'preview.py'), encoding='utf-8').read()
+    check('the rendered viewport draws the lamp flares',
+          psrc.count('flare_sources=') >= 2)
+    usrc2 = open(os.path.join(root, 'ui.py'), encoding='utf-8').read()
+    check('the lamp panel answers whether the anchor is in frame',
+          'world_to_camera_view' in usrc2)
+
+
+def test_caustic_cookies():
+    """R190: the animated pool-light web, baked per frame into a lamp
+    cookie through the ordinary cookie road."""
+    from ..core import patterns as PT
+    from ..core.scene import Light
+
+    # the pattern is periodic-8: seamless tiling is a fact, not a hope
+    u = np.linspace(0.0, 2.0, 33, dtype=np.float32)
+    v = np.full_like(u, 0.37)
+    a = PT.caustic_web(u, v, 1.25)
+    b = PT.caustic_web(u + 8.0, v, 1.25)
+    check('the web tiles seamlessly (period 8)',
+          float(np.abs(a - b).max()) < 1e-5)
+    c = PT.caustic_web(u, v, 2.5)
+    check('the web animates', float(np.abs(a - c).max()) > 1e-4)
+
+    st = base_settings(96, 72)
+    st.transparency = 'NONE'
+    sc = demo_scene(st, with_texture=False)
+    sc.lights = [Light(type='SPOT', name='Pool',
+                       position=(0.0, 0.0, 6.0), direction=(0, 0, -1),
+                       energy=900.0, spot_size=1.2, spot_blend=0.15,
+                       caustics=2.0, caustics_scale=4.0,
+                       caustics_speed=1.0, shadow='NONE')]
+    base = R.render(sc, st)
+    check('a caustic lamp wears a synthesized cookie',
+          getattr(sc.lights[0], 'cookie', None) is not None
+          and getattr(sc.lights[0], '_caustic_cookie', False))
+    sc2 = demo_scene(st, with_texture=False)
+    sc2.lights = [Light(type='SPOT', name='Pool',
+                        position=(0.0, 0.0, 6.0), direction=(0, 0, -1),
+                        energy=900.0, spot_size=1.2, spot_blend=0.15,
+                        shadow='NONE')]
+    plain = R.render(sc2, st)
+    check('the web lights the floor',
+          float(np.abs(base - plain)[:, :, :3].max()) > 1e-3)
+    sc.frame = 10
+    sc.time = 10 / 24.0
+    moved = R.render(sc, st)
+    check('the web writhes over frames',
+          float(np.abs(moved - base)[:, :, :3].max()) > 1e-4)
+    sc.frame = 1
+    sc.time = 0.0
+    again = R.render(sc, st)
+    check('caustics are deterministic', bool(np.array_equal(again, base)))
+
+
+def test_stereo_modes():
+    """R190: the era's stereo pairs -- parallel eyes, off-axis
+    convergence, ANAGLYPH/SBS/CROSS packing, mono at zero eye
+    distance BITWISE."""
+    st = base_settings(96, 72)
+    st.transparency = 'NONE'
+    sc = demo_scene(st, with_texture=False)
+    mono = R.render(sc, st)
+
+    st.stereo_mode = 'ANAGLYPH'
+    st.stereo_eye_distance = 0.0
+    st.stereo_convergence = 8.0
+    zero = R.render(demo_scene(st, with_texture=False), st)
+    check('zero eye distance collapses to mono bitwise',
+          bool(np.array_equal(zero, mono)))
+
+    st.stereo_eye_distance = 0.12
+    ana = R.render(demo_scene(st, with_texture=False), st)
+    check('anaglyph differs from mono once the eyes part',
+          float(np.abs(ana - mono).max()) > 1e-4)
+    check('anaglyph is deterministic',
+          bool(np.array_equal(R.render(demo_scene(st, with_texture=False),
+                                       st), ana)))
+
+    # convergence moves the zero-parallax plane: the frame must shift
+    st.stereo_convergence = 3.0
+    ana2 = R.render(demo_scene(st, with_texture=False), st)
+    check('Convergence shifts the parallax',
+          float(np.abs(ana2 - ana).max()) > 1e-4)
+    st.stereo_convergence = 8.0
+
+    st.stereo_mode = 'SBS'
+    sbs = R.render(demo_scene(st, with_texture=False), st)
+    st.stereo_mode = 'CROSS'
+    cross = R.render(demo_scene(st, with_texture=False), st)
+    w = st.resolution_x
+    check('CROSS swaps the SBS halves',
+          bool(np.array_equal(sbs[:, :w // 2], cross[:, w // 2:]))
+          and bool(np.array_equal(sbs[:, w // 2:], cross[:, :w // 2])))
+    st.stereo_mode = 'NONE'
+
+
+def test_panorama_camera():
+    """R190: the QTVR cylinder -- 360 degrees of rotated strips sharing
+    one eye, stitched with the exact planar-to-cylindrical resample.
+    Orientation, seams, closure and determinism all pinned."""
+    st = base_settings(256, 96)
+    st.transparency = 'NONE'
+    sc = demo_scene(st, with_texture=True)
+    mono = R.render(sc, st)
+    sc.camera.type = 'PANO'
+    pano = R.render(sc, st)
+    W, H = st.resolution_x, st.resolution_y
+    check('the panorama fills the asked-for frame',
+          pano.shape == (H, W, 4) and bool(np.isfinite(pano).all()))
+    check('the panorama is deterministic',
+          bool(np.array_equal(R.render(sc, st), pano)))
+    check('planar aux passes are cleared, not stitched wrong',
+          sc.last_passes is None and sc.last_depth is None
+          and sc.last_shafts == [] and sc.last_flares == [])
+
+    rgbP, rgbM = pano[:, :, :3], mono[:, :, :3]
+    mc = rgbM[:, W // 2 - 1:W // 2 + 1].mean(axis=1)
+    errs = np.array([np.abs(rgbP[:, c] - mc).mean() for c in range(W)])
+    best = int(errs.argmin())
+    check('the mono centre column lands at the pano centre',
+          abs(best - W // 2) <= 2, f'at {best} of {W}')
+    off = W // 8
+    mr = rgbM[:, W // 2 + off]
+    errs_r = np.array([np.abs(rgbP[:, c] - mr).mean() for c in range(W)])
+    check('right of centre stays right of centre (no mirror)',
+          int(errs_r.argmin()) > W // 2)
+    c = W // 2
+    check('the pano is upright',
+          float(np.abs(rgbP[:, c] - mc).mean())
+          < float(np.abs(rgbP[::-1, c] - mc).mean()))
+    d = np.abs(np.diff(rgbP, axis=1)).mean(axis=(0, 2))
+    joins = [int(np.floor(k * W / 16.0)) for k in range(1, 16)]
+    join_d = np.array([d[j - 1] for j in joins])
+    check('strip joins are invisible',
+          float(join_d.mean()) <= float(d.mean()) * 3.0 + 0.02,
+          f'join {join_d.mean():.5f} vs {d.mean():.5f}')
+    wrap = float(np.abs(rgbP[:, 0] - rgbP[:, -1]).mean())
+    check('the cylinder closes at 360 degrees',
+          wrap <= float(d.mean()) * 4.0 + 0.02, f'{wrap:.5f}')
+
+    # PANO outranks stereo: a QTVR pano is a mono deliverable
+    st.stereo_mode = 'ANAGLYPH'
+    st.stereo_eye_distance = 0.1
+    pano2 = R.render(sc, st)
+    st.stereo_mode = 'NONE'
+    check('PANO outranks stereo (mono cylinder either way)',
+          bool(np.array_equal(pano2, pano)))
+    sc.camera.type = 'PERSP'
+
+
+def test_area_form_factor():
+    """R190: BI's area lamp energy, verbatim -- the Stokes contour of
+    area_lamp_energy in doubles, scaled dist^2/A, shaped by Gamma,
+    replacing the diffuse cosine and multiplying the specular. The
+    numeric pin is the C itself, compiled and run."""
+    from ..core import lights as LI
+    from ..core import raster as CR
+    from ..core.bvh import BVH
+    from ..core.scene import Light
+    from ..gpu import shade as GSH
+
+    def mk(sz, dist=25.0, k=1.0, pos=(0, 0, 4)):
+        return Light(type='AREA', position=pos, direction=(0, 0, -1),
+                     area_size=(sz, sz), area_x=(1, 0, 0),
+                     area_y=(0, 1, 0), decay_end=dist, area_gamma=k)
+
+    P = np.array([[0, 0, 0]], np.float32)
+    N = np.array([[0, 0, 1]], np.float32)
+    inp = float(LI.area_inp(mk(1.0), P, N)[0])
+    # area_lamp_energy compiled verbatim at this exact geometry
+    # returns 0.122452; times areasize 625
+    check('the Stokes contour matches the compiled C',
+          abs(inp - 76.5325) < 1e-2, f'{inp:.4f}')
+    far = float(LI.area_inp(mk(1.0, pos=(0, 0, 16)), P, N)[0])
+    check('far field falls as 2*(dist/d)^2',
+          abs(far * 256 / 625 - 2.0) < 0.01, f'{far * 256 / 625:.4f}')
+    tiny = float(LI.area_inp(mk(0.01), P, N)[0])
+    check('size to zero lands on the point-equivalent limit',
+          abs(tiny - 78.125) < 0.01, f'{tiny:.4f}')
+    check('behind the lamp plane nothing arrives',
+          float(LI.area_inp(mk(1.0, pos=(0, 0, -1)), P, N)[0]) == 0.0)
+    edge = Light(type='AREA', position=(0, 0, 4), direction=(1, 0, 0),
+                 area_size=(1, 1), area_x=(0, 1, 0), area_y=(0, 0, 1),
+                 decay_end=25.0)
+    check('an edge-on panel lights nothing',
+          float(LI.area_inp(edge, P, N)[0]) == 0.0)
+    g1 = float(LI.area_inp(mk(1.0), P, N)[0])
+    gh = float(LI.area_inp(mk(1.0, k=0.5), P, N)[0])
+    check('Gamma shapes the energy as pow',
+          abs(gh - np.sqrt(g1)) < 1e-3, f'{gh:.4f} vs sqrt {np.sqrt(g1):.4f}')
+    f, bk = LI.area_inp(mk(1.0), P, N, want_back=True)
+    f2 = LI.area_inp(mk(1.0), P, -N)
+    check('the translucency twin is the flipped-normal energy',
+          bool(np.allclose(bk, f2)) and float(bk[0]) == 0.0)
+    # lamp_get_visibility gives AREA visifac 1.0: no falloff switch
+    _L, rad4, _d = LI.sample(mk(1.0), P, base_settings())
+    _L, rad16, _d = LI.sample(mk(1.0, pos=(0, 0, 16)), P, base_settings())
+    check('an area lamp has NO distance attenuation of its own',
+          bool(np.allclose(rad4, rad16)))
+
+    # frame road: the picture obeys size, orientation, Distance
+    st = base_settings(96, 72)
+    st.transparency = 'NONE'
+    st.shadows = False
+    sc = demo_scene(st, with_texture=False)
+    sc.lights = [Light(type='AREA', name='Panel', position=(0, 0, 6),
+                       direction=(0, 0, -1), area_size=(2, 2),
+                       area_x=(1, 0, 0), area_y=(0, 1, 0),
+                       decay_end=8.0, energy=40.0, shadow='NONE')]
+    a = R.render(sc, st)
+    sc.lights[0].decay_end = 16.0
+    b = R.render(sc, st)
+    check('the Distance dial scales as dist^2',
+          float(b[:, :, :3].max() / max(a[:, :, :3].max(), 1e-9)) > 3.5)
+    sc.lights[0].decay_end = 8.0
+    sc.lights[0].direction = (1, 0, 0)
+    sc.lights[0].area_x = (0, 1, 0)
+    sc.lights[0].area_y = (0, 0, 1)
+    edge_f = R.render(sc, st)
+    check('an edge-on panel darkens the frame',
+          float(edge_f[:, :, :3].mean()) < float(a[:, :, :3].mean()) * 0.6)
+
+    # the 2.79 quirk: Toon and Fresnel diffuse never saw inp. With
+    # every surface toon-diffuse and specular off, Gamma must change
+    # NOTHING anywhere -- bitwise
+    sc.lights[0].direction = (0, 0, -1)
+    sc.lights[0].area_x = (1, 0, 0)
+    sc.lights[0].area_y = (0, 1, 0)
+    for _m in sc.materials:
+        _m.model = 'BI_MATRIX_2_1'
+        _m.specular_level = 0.0
+    qa = R.render(sc, st)
+    sc.lights[0].area_gamma = 0.5
+    qb = R.render(sc, st)
+    sc.lights[0].area_gamma = 1.0
+    check('BI Toon diffuse ignores the form factor (the C quirk)',
+          bool(np.array_equal(qa, qb)))
+
+    # GPU twins: unshadowed and ray-shadowed parity
+    def parity(sc_, st_, name, with_bvh=False):
+        w, h = st_.resolution_x, st_.resolution_y
+        cpu = R.render(sc_, st_)
+        view, _p, vp, eye = R.camera_matrices(sc_.camera, w, h)
+        g = CR.GBuffer(w, h)
+        CR.rasterize(sc_.mesh.verts, sc_.mesh.tris, vp, w, h, gbuf=g)
+        bvh = BVH(sc_.mesh.verts, sc_.mesh.tris) if with_bvh else None
+        job = R.ShadeJob(sc_, st_, {}, bvh, view, eye, w, h)
+        GSH._PLAN_CACHE.clear()
+        passes, why, atl = GSH.plan_frame(job, g)
+        if passes is None:
+            check(f'{name} planned onto the GPU', False, str(why))
+            return
+        img, _hit = GSH.simulate(job, g, passes, atl)
+        cov = g.tri >= 0
+        err = float(np.abs(img[cov] - cpu[cov][:, :3]).max())
+        check(f'{name}: GPU twin shades the C', err < 6e-3,
+              f'max {err:.6f}')
+
+    sc.materials[0].model = 'LAMBERT'
+    sc.materials[1].model = 'BI_MATRIX_1_1'   # Oren: the nl/realnl split
+    sc.materials[1].translucency = 0.5
+    parity(sc, st, 'area form factor, unshadowed')
+    st2 = base_settings(96, 72)
+    st2.transparency = 'NONE'
+    st2.shadows = True
+    st2.shadow_default = 'RAY'
+    st2.ray_shadows = True
+    st2.shadow_samples = 4
+    sc2 = demo_scene(st2, with_texture=False)
+    sc2.lights = [Light(type='AREA', name='Panel',
+                        position=(1.5, 2.5, 4.0),
+                        direction=(-0.3, -0.5, -0.8), energy=60.0,
+                        area_size=(1.5, 1.5), area_x=(1, 0, 0),
+                        area_y=(0, 1, 0), decay_end=10.0, shadow='RAY')]
+    parity(sc2, st2, 'area form factor under ray shadows',
+           with_bvh=True)
+
+
+def test_halo_materials():
+    """R191: BI's halo materials -- vertices as depth-tested billboard
+    glows, the shadeHaloFloat kit transcribed: hardness ladder, rings,
+    lines, star pinch, Extreme Alpha, soft intersections, the Add
+    blend, seeds off hashvectf."""
+    from ..core.scene import Light, Material
+
+    st = base_settings(128, 96)
+    st.transparency = 'NONE'
+
+    def frame(pts=None, **hk):
+        sc = demo_scene(st, with_texture=False)
+        spec = {'size': 0.6, 'hardness': 50, 'add': 0.5, 'alpha': 1.0,
+                'color': (1.0, 0.7, 0.3), 'seed': 3, 'rings': 0,
+                'lines': 0, 'star_points': 0, 'xalpha': False,
+                'soft': False, 'shaded': False}
+        spec.update(hk)
+        m = Material(name='G', index=len(sc.materials), halo=spec)
+        sc.materials.append(m)
+        if pts is None:
+            pts = np.array([[0.0, 0.6, 1.9], [-0.4, 1.0, 1.4]],
+                           np.float32)
+        sc.halos = [{'mat': m.index, 'pos': pts}]
+        return sc, R.render(sc, st)
+
+    scb, base = frame()
+    plain_sc = demo_scene(st, with_texture=False)
+    plain = R.render(plain_sc, st)
+    check('halos draw over the frame',
+          float(np.abs(base - plain)[:, :, :3].max()) > 0.05)
+    _s, again = frame()
+    check('halos are deterministic', bool(np.array_equal(again, base)))
+    _s, buried = frame(pts=np.array([[1.4, -0.4, 0.9]], np.float32))
+    check('a halo buried inside the cube draws nothing',
+          float(np.abs(buried - plain)[:, :, :3].max()) < 1e-6)
+    for name, kw in (('the hardness ladder', {'hardness': 0}),
+                     ('rings', {'rings': 4}),
+                     ('lines', {'lines': 8}),
+                     ('the star pinch', {'star_points': 5}),
+                     ('Extreme Alpha', {'xalpha': True}),
+                     ('soft intersections', {'soft': True}),
+                     ('the Add blend', {'add': 1.0})):
+        _s, v = frame(**kw)
+        check(f'{name} changes the halo',
+              float(np.abs(v - base)[:, :, :3].max()) > 1e-4)
+    _s, r1 = frame(rings=4)
+    _s, r2 = frame(rings=4, seed=9)
+    check('the seed walks the hash table',
+          float(np.abs(r2 - r1)[:, :, :3].max()) > 1e-4)
+    _s, lit = frame(shaded=True)
+    check('Shaded halos take the lamps at their centre',
+          float(np.abs(lit - base)[:, :, :3].max()) > 1e-4)
+
+    # ---- R194: the expansion kit. Every dial speaks, and the whole
+    # kit at its defaults is the 1.40 picture BITWISE
+    _s, rich = frame(rings=3, lines=8)
+    _s, neutral = frame(rings=3, lines=8, shape='DISC', line_width=1.0,
+                        ring_width=1.0, gradient=False,
+                        color2=(0, 0, 0), rand_hue=0.0, rand_sat=0.0,
+                        rand_val=0.0, pulse=0.0, flicker=0.0, spin=0.0,
+                        anim_speed=1.0, aspect=1.0, rotation=0.0,
+                        noise=0.0, noise_scale=4.0, bolts=0,
+                        bolt_width=1.0, rays=0, ray_sharp=8.0,
+                        rings_even=False, gradient_type='RADIAL',
+                        ramp=None, image=None, gradient_noise=0.0,
+                        # R200: the colour split, HSV shift and clocks
+                        ray_color=None, bolt_color=None, hue_shift=0.0,
+                        sat_shift=1.0, val_shift=1.0, pulse_speed=1.0,
+                        flicker_speed=1.0, noise_speed=1.0,
+                        bolt_speed=1.0, grad_noise_speed=1.0)
+    check('the expansion kit at defaults is bitwise-neutral',
+          bool(np.array_equal(neutral, rich)))
+    # the same promise with rays and bolts LIVE: the split
+    # accumulators at default keys are the old picture
+    _s, rich2 = frame(rings=3, lines=8, rays=6, bolts=2)
+    _s, neutral2 = frame(rings=3, lines=8, rays=6, bolts=2,
+                         ray_color=None, bolt_color=None, hue_shift=0.0,
+                         sat_shift=1.0, val_shift=1.0, pulse_speed=1.0,
+                         flicker_speed=1.0, noise_speed=1.0,
+                         bolt_speed=1.0, grad_noise_speed=1.0)
+    check('the R200 keys at defaults are bitwise-neutral around live '
+          'rays and bolts', bool(np.array_equal(neutral2, rich2)))
+    for name, kw in (('Line Width', {'lines': 8, 'line_width': 3.0}),
+                     ('Ring Width', {'rings': 3, 'ring_width': 3.0}),
+                     ('the Ring shape (FLARECIRC verbatim)',
+                      {'shape': 'RING'}),
+                     ('the Hexagon shape', {'shape': 'HEX'}),
+                     ('the Diamond shape', {'shape': 'DIAMOND'}),
+                     ('the Triangle shape', {'shape': 'TRIANGLE'}),
+                     ('the Pentagon shape', {'shape': 'PENTAGON'}),
+                     ('the Octagon shape', {'shape': 'OCTAGON'}),
+                     ('the Cross shape', {'shape': 'CROSS'}),
+                     ('Aspect', {'aspect': 3.0}),
+                     # a bare disc is rotation-symmetric: the turn is
+                     # seen through the lines it carries around
+                     ('Rotation', {'lines': 8, 'rotation': 0.7}),
+                     ('the gradient',
+                      {'gradient': True, 'color2': (0.1, 0.3, 1.0)}),
+                     ('the Square shape', {'shape': 'SQUARE'}),
+                     ('the solid Star shape', {'shape': 'STAR'}),
+                     ('the Heart shape', {'shape': 'HEART'}),
+                     ('the energy Noise', {'noise': 1.0}),
+                     ('electric Bolts', {'bolts': 5}),
+                     ('even Rays', {'rays': 12}),
+                     ('Even Rings', {'rings': 3, 'rings_even': True}),
+                     ('the Angular gradient',
+                      {'gradient': True, 'gradient_type': 'ANGULAR',
+                       'color2': (0.1, 0.2, 1.0)}),
+                     ('the colour-ramp LUT',
+                      {'gradient': True,
+                       'ramp': [[1, 0, 0, 1], [0, 1, 0, 1],
+                                [0, 0, 1, 1]]}),
+                     ('the Horizontal sweep',
+                      {'gradient': True, 'gradient_type': 'HORIZONTAL',
+                       'color2': (0.1, 0.2, 1.0)}),
+                     ('the Vertical sweep',
+                      {'gradient': True, 'gradient_type': 'VERTICAL',
+                       'color2': (0.1, 0.2, 1.0)}),
+                     ('the Diagonal sweep',
+                      {'gradient': True, 'gradient_type': 'DIAGONAL',
+                       'color2': (0.1, 0.2, 1.0)}),
+                     ('Gradient Noise',
+                      {'gradient': True, 'color2': (0.1, 0.2, 1.0),
+                       'gradient_noise': 0.8}),
+                     ('Random Hue', {'rand_hue': 1.0}),
+                     ('Random Saturation', {'rand_sat': 1.0}),
+                     ('Random Value', {'rand_val': 1.0})):
+        ref = rich if ('lines' in kw or 'rings' in kw) else base
+        refkw = {k: v for k, v in kw.items()}
+        _s, v = frame(**refkw)
+        check(f'{name} changes the halo',
+              float(np.abs(v - ref)[:, :, :3].max()) > 1e-4)
+
+    def framet(t=0.0, fr=1, **hk):
+        sc = demo_scene(st, with_texture=False)
+        spec = {'size': 0.6, 'hardness': 50, 'add': 0.5, 'alpha': 1.0,
+                'color': (1.0, 0.7, 0.3), 'seed': 3, 'rings': 0,
+                'lines': 8, 'star_points': 0, 'xalpha': False,
+                'soft': False, 'shaded': False}
+        spec.update(hk)
+        m = Material(name='G', index=len(sc.materials), halo=spec)
+        sc.materials.append(m)
+        sc.halos = [{'mat': m.index,
+                     'pos': np.array([[0.0, 0.6, 1.9],
+                                      [-0.4, 1.0, 1.4]], np.float32)}]
+        sc.time = t
+        sc.frame = fr
+        return R.render(sc, st)
+
+    p1, p2 = framet(t=0.0, pulse=0.6), framet(t=0.35, pulse=0.6)
+    check('Pulse breathes over scene time',
+          float(np.abs(p2 - p1).max()) > 1e-4)
+    f1, f2 = framet(fr=1, flicker=0.8), framet(fr=2, flicker=0.8)
+    check('Flicker jitters per frame',
+          float(np.abs(f2 - f1).max()) > 1e-4)
+    s1, s2 = framet(t=0.1, spin=2.0), framet(t=0.4, spin=2.0)
+    check('Spin turns the lines over time',
+          float(np.abs(s2 - s1).max()) > 1e-4)
+    check('the animated kit is deterministic',
+          bool(np.array_equal(framet(t=0.35, fr=2, pulse=0.6,
+                                     flicker=0.8, spin=2.0,
+                                     rand_hue=0.7),
+                              framet(t=0.35, fr=2, pulse=0.6,
+                                     flicker=0.8, spin=2.0,
+                                     rand_hue=0.7))))
+
+    # ---- R200: rays and bolts wear their OWN colours. Unset, they
+    # follow the Line Colour exactly as they always did
+    _s, ray_w = frame(rays=12, line_color=(0.2, 0.9, 1.0))
+    _s, ray_same = frame(rays=12, line_color=(0.2, 0.9, 1.0),
+                         ray_color=(0.2, 0.9, 1.0))
+    check('an unset Ray Colour follows the Line Colour bitwise',
+          bool(np.array_equal(ray_w, ray_same)))
+    _s, ray_r = frame(rays=12, line_color=(0.2, 0.9, 1.0),
+                      ray_color=(1.0, 0.1, 0.1))
+    check('Ray Colour recolours the rays on their own',
+          float(np.abs(ray_r - ray_w)[:, :, :3].max()) > 1e-4)
+    _s, bolt_w = frame(bolts=4, line_color=(0.2, 0.9, 1.0))
+    _s, bolt_same = frame(bolts=4, line_color=(0.2, 0.9, 1.0),
+                          bolt_color=(0.2, 0.9, 1.0))
+    check('an unset Bolt Colour follows the Line Colour bitwise',
+          bool(np.array_equal(bolt_w, bolt_same)))
+    _s, bolt_g = frame(bolts=4, line_color=(0.2, 0.9, 1.0),
+                       bolt_color=(0.1, 1.0, 0.1))
+    check('Bolt Colour recolours the bolts on their own',
+          float(np.abs(bolt_g - bolt_w)[:, :, :3].max()) > 1e-4)
+    _s, mixed = frame(lines=8, rays=12, bolts=4,
+                      line_color=(0.2, 0.9, 1.0),
+                      ray_color=(1.0, 0.1, 0.1),
+                      bolt_color=(0.1, 1.0, 0.1))
+    _s, mono = frame(lines=8, rays=12, bolts=4,
+                     line_color=(0.2, 0.9, 1.0))
+    check('three elements carry three colours in one halo',
+          float(np.abs(mixed - mono)[:, :, :3].max()) > 1e-4)
+
+    # ---- R200: the master HSV shift moves EVERY coloured option --
+    # trim included -- and 0 / 1 / 1 is identity (an explicit 0
+    # saturation must not be swallowed by an `or` default)
+    _s, trim = frame(rings=3, lines=8, rays=6, bolts=2,
+                     ring_color=(1.0, 0.3, 0.8),
+                     line_color=(0.2, 0.9, 1.0))
+    for nm, kw in (('Hue Shift', {'hue_shift': 0.35}),
+                   ('Saturation Shift 0 (grey)', {'sat_shift': 0.0}),
+                   ('Saturation Shift 2', {'sat_shift': 2.0}),
+                   ('Value Shift', {'val_shift': 2.5})):
+        _s, v = frame(rings=3, lines=8, rays=6, bolts=2,
+                      ring_color=(1.0, 0.3, 0.8),
+                      line_color=(0.2, 0.9, 1.0), **kw)
+        check(f'{nm} moves the whole halo family',
+              float(np.abs(v - trim)[:, :, :3].max()) > 1e-4)
+    # the random jitter reaches the trim now too (R200): jittered
+    # rings differ from unjittered rings even with a grey body
+    _s, jr1 = frame(rings=3, ring_color=(1.0, 0.2, 0.2),
+                    color=(0.5, 0.5, 0.5))
+    _s, jr2 = frame(rings=3, ring_color=(1.0, 0.2, 0.2),
+                    color=(0.5, 0.5, 0.5), rand_hue=1.0)
+    check('Random Hue scatters the ring colour too',
+          float(np.abs(jr2 - jr1)[:, :, :3].max()) > 1e-4)
+
+    # ---- R200: every animated effect owns a Speed. x1 is the master
+    # clock bitwise (in the neutral kit above); here each dial moves
+    # its own effect, and 0 FREEZES it
+    for nm, on_kw, spd_kw in (
+            ('Pulse Speed', {'pulse': 0.6}, {'pulse_speed': 3.0}),
+            ('Noise Speed', {'noise': 1.0}, {'noise_speed': 4.0}),
+            ('Bolt Speed', {'bolts': 4}, {'bolt_speed': 5.0}),
+            ('Gradient Noise Speed',
+             {'gradient': True, 'color2': (0.1, 0.2, 1.0),
+              'gradient_noise': 0.8}, {'grad_noise_speed': 6.0})):
+        a1 = framet(t=0.37, **on_kw)
+        a2 = framet(t=0.37, **on_kw, **spd_kw)
+        check(f'{nm} re-times its effect',
+              float(np.abs(a2 - a1).max()) > 1e-4)
+    # floor(frame * 0.25): frames 5 and 6 share roll 1; frame 9 rolls 2
+    fs1 = framet(fr=5, flicker=0.8, flicker_speed=0.25)
+    fs2 = framet(fr=6, flicker=0.8, flicker_speed=0.25)
+    check('Flicker Speed 0.25 holds the roll across neighbour frames',
+          bool(np.array_equal(fs1, fs2)))
+    fs3 = framet(fr=9, flicker=0.8, flicker_speed=0.25)
+    check('...and still re-rolls across the quarter boundary',
+          float(np.abs(fs3 - fs1).max()) > 1e-4)
+    z1 = framet(t=0.3, noise=1.0, anim_speed=0.0)
+    z2 = framet(t=0.9, noise=1.0, anim_speed=0.0)
+    check('Anim Speed 0 truly freezes (the old `or` idiom snapped it '
+          'back to 1)', bool(np.array_equal(z1, z2)))
+    z3 = framet(t=0.3, bolts=4, bolt_speed=0.0)
+    z4 = framet(t=0.9, bolts=4, bolt_speed=0.0)
+    check('Bolt Speed 0 freezes the strike', bool(np.array_equal(z3, z4)))
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    esrc = open(os.path.join(root, 'engine.py'), encoding='utf-8').read()
+    check('the worker pool skips halo frames',
+          'halo materials splat' in esrc)
+    xsrc = open(os.path.join(root, 'export.py'), encoding='utf-8').read()
+    check('the exporter collects halo vertices',
+          '_collect_halo_points' in xsrc and
+          '_collect_extra_halos' in xsrc)
+    check('halo materials draw no faces',
+          'draws NO faces' in xsrc)
+    usrc = open(os.path.join(root, 'ui.py'), encoding='utf-8').read()
+    check('the material panel carries the halo kit',
+          "'halo_size'" in usrc and "'halo_hardness'" in usrc)
+
+
+def test_lightmap_bake():
+    """R192: the lightmap bake -- UV layout through the engine's own
+    rasteriser, texels shaded by the ordinary CPU core with the view
+    pinned along the normal, margin-dilated, deterministic."""
+    st = base_settings(96, 72)
+    st.transparency = 'NONE'
+    st.shadows = True
+    st.shadow_default = 'RAY'
+    st.ray_shadows = True
+    st.shadow_samples = 4
+    sc = demo_scene(st, with_texture=False)
+    img, why = R.bake_lightmap(sc, st, obj_index=1, size=96,
+                               mode='COMBINED', margin=4)
+    check('the ball bakes', why is None and img is not None
+          and img.shape == (96, 96, 4))
+    check('the bake is finite', bool(np.isfinite(img).all()))
+    cov = float((img[:, :, 3] > 0).mean())
+    check('the UV islands cover texels', cov > 0.3, f'{cov:.2f}')
+    img2, _ = R.bake_lightmap(sc, st, obj_index=1, size=96,
+                              mode='COMBINED', margin=4)
+    check('the bake is deterministic', bool(np.array_equal(img, img2)))
+    ao, whya = R.bake_lightmap(sc, st, obj_index=1, size=96, mode='AO',
+                               margin=4)
+    check('AO bakes too', whya is None)
+    lit = ao[:, :, 0][ao[:, :, 3] > 0]
+    check('AO has structure (the floor occludes the underside)',
+          float(lit.min()) < 0.9 and float(lit.max()) > 0.95,
+          f'{float(lit.min()):.2f}..{float(lit.max()):.2f}')
+    check('COMBINED and AO are different bakes',
+          float(np.abs(ao - img).max()) > 1e-3)
+    # margin: shrink the island into the tile so there ARE edges to grow
+    shr = demo_scene(st, with_texture=False)
+    shr.mesh.uvs = shr.mesh.uvs * 0.5 + 0.25
+    s0, _ = R.bake_lightmap(shr, st, obj_index=1, size=96,
+                            mode='COMBINED', margin=0)
+    s4, _ = R.bake_lightmap(shr, st, obj_index=1, size=96,
+                            mode='COMBINED', margin=4)
+    check('margin dilates the island edges',
+          int((s4[:, :, 3] > 0).sum()) > int((s0[:, :, 3] > 0).sum()))
+    nud = demo_scene(st, with_texture=False)
+    nud.mesh.uvs = None
+    _n, whyn = R.bake_lightmap(nud, st, obj_index=0, size=32)
+    check('a mesh without UVs says why', _n is None and 'UV' in whyn)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    csrc = open(os.path.join(root, 'convert.py'), encoding='utf-8').read()
+    check('the operator is registered',
+          'HALCYON_OT_bake_lightmap' in csrc
+          and 'halcyon.bake_lightmap' in csrc)
+    usrc = open(os.path.join(root, 'ui.py'), encoding='utf-8').read()
+    check('the panel offers the bake', 'bake_lightmap' in usrc)
+
+
+def test_glsl_declares_before_use():
+    """R193: the driver's declaration-order rule, run by the suite.
+
+    The field crash: every material pass of an area-lamp scene failed
+    the driver's compile because the area form factor read hal_ltex
+    before its definition in the assembled file -- an order the
+    SIMULATOR never minded, so every headless parity test passed while
+    the real GPU refused the frame and Blender died in the retry
+    storm. The linter enforces the driver's rule over the exact
+    assembled sources, for the shapes that emit every function family:
+    area lamps under ray and map shadows, cookies, caustics, plain.
+    """
+    from ..core import raster as CR
+    from ..core.bvh import BVH
+    from ..core.scene import Light
+    from ..gpu import material as GM
+    from ..gpu import shade as GSH
+
+    # the linter has teeth: a call before its declaration is caught
+    bad = 'void hal_a() { hal_b(); }\nfloat hal_b() { return 1.0; }\n'
+    check('the linter catches a call before its declaration',
+          len(GM.lint_declaration_order(bad)) == 1)
+    good = 'float hal_b();\nvoid hal_a() { hal_b(); }\n' \
+           'float hal_b() { return 1.0; }\n'
+    check('a prototype satisfies the rule',
+          GM.lint_declaration_order(good) == [])
+
+    def sources(lights, **kw):
+        st = base_settings(64, 48)
+        st.transparency = 'NONE'
+        for k, v in kw.items():
+            setattr(st, k, v)
+        sc = demo_scene(st, with_texture=False)
+        sc.lights = lights
+        w, h = st.resolution_x, st.resolution_y
+        view, _p, vp, eye = R.camera_matrices(sc.camera, w, h)
+        g = CR.GBuffer(w, h)
+        CR.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+        bvh = BVH(sc.mesh.verts, sc.mesh.tris)
+        job = R.ShadeJob(sc, st, {}, bvh, view, eye, w, h)
+        GSH._PLAN_CACHE.clear()
+        passes, why, _atl = GSH.plan_frame(job, g)
+        if passes is None:
+            return None, why
+        return [p[2] for p in passes], None
+
+    shapes = {
+        'area lamp, ray shadows': ([
+            Light(type='AREA', name='P', position=(1.5, 2.5, 4.0),
+                  direction=(-0.3, -0.5, -0.8), energy=60.0,
+                  area_size=(1.5, 1.5), area_x=(1, 0, 0),
+                  area_y=(0, 1, 0), decay_end=10.0, shadow='RAY')],
+            dict(shadows=True, shadow_default='RAY', ray_shadows=True,
+                 shadow_samples=4)),
+        'area lamp, map shadows': ([
+            Light(type='AREA', name='P', position=(1.5, 2.5, 4.0),
+                  direction=(-0.3, -0.5, -0.8), energy=60.0,
+                  area_size=(1.5, 1.5), area_x=(1, 0, 0),
+                  area_y=(0, 1, 0), decay_end=10.0, shadow='MAP')],
+            dict(shadows=True, shadow_default='MAP',
+                 shadow_map_size=128)),
+        'caustic spot (cookie road)': ([
+            Light(type='SPOT', name='Pool', position=(0, 0, 6),
+                  direction=(0, 0, -1), energy=900.0, spot_size=1.2,
+                  spot_blend=0.15, caustics=2.0, shadow='NONE')],
+            dict(shadows=False)),
+        'plain sun': ([
+            Light(type='SUN', name='Key', direction=(-0.6, 0.4, -0.5),
+                  energy=3.0, shadow='NONE')],
+            dict(shadows=False)),
+    }
+    for name, (lights, kw) in shapes.items():
+        srcs, why = sources(lights, **kw)
+        if srcs is None:
+            check(f'{name}: planned onto the GPU', False, str(why))
+            continue
+        bad_hits = []
+        for s in srcs:
+            bad_hits += GM.lint_declaration_order(s)
+        check(f'{name}: every call follows its declaration',
+              not bad_hits, '; '.join(bad_hits[:3]))
+
+    # the refusal memo: a source the driver refused once refuses from
+    # memory -- the field crash was the same bad source re-handed to
+    # the driver on every draft until the GPU module died
+    from ..gpu import device as DV
+    key = ('HAL_TEST_MEMO', hash('not a shader'))
+    DV._STATE['failed'][key] = 'remembered refusal'
+    got, why2 = DV.compile_dynamic('HAL_TEST_MEMO', 'not a shader',
+                                   {'samplers': ()})
+    check('a refused source refuses from memory, never re-touching '
+          'the driver', got is None and why2 == 'remembered refusal')
+    DV._STATE['failed'].pop(key, None)
+    DV.reset()
+    check('a device reset grants known-bad sources their retry',
+          not DV._STATE['failed'])
+
+
+def test_halos_need_no_other_geometry():
+    """R194 field find: a scene of nothing but halo objects -- the
+    classic sparkle setup, a vertex cloud and a camera -- has no
+    triangles, and the early sky path returned before the splat ran.
+    Halos now draw over the bare background, mesh or no mesh."""
+    from .scenebuild import look_at_matrix
+    from ..core.scene import Camera, Material, MeshData, Scene, World
+
+    st = base_settings(96, 72)
+    st.transparency = 'NONE'
+    m = Material(name='G', index=0, halo={
+        'size': 0.5, 'hardness': 50, 'add': 0.6, 'alpha': 1.0,
+        'color': (0.4, 1.0, 0.6), 'seed': 3, 'rings': 0, 'lines': 9,
+        'star_points': 0, 'xalpha': False, 'soft': False,
+        'shaded': False, 'line_color': (0.8, 1.0, 0.9)})
+    cam = Camera(matrix_world=look_at_matrix((0, -6, 1.5), (0, 0, 1.2)))
+    ang = np.linspace(0, 2 * np.pi, 10, endpoint=False)
+    pts = np.stack([1.6 * np.cos(ang), 0.4 * np.sin(ang),
+                    1.2 + 0.5 * np.sin(3 * ang)], 1).astype(np.float32)
+    sc = Scene(mesh=None, materials=[m], objects=[], lights=[],
+               camera=cam, world=World(color=(0.02, 0.02, 0.05)),
+               settings=st)
+    sc.images = {}
+    sc.halos = [{'mat': 0, 'pos': pts}]
+    img = R.render(sc, st)
+    check('a halo-only scene draws its glows',
+          float(img[:, :, :3].max()) > 0.3)
+    check('the geometry-less frame is deterministic',
+          bool(np.array_equal(img, R.render(sc, st))))
+    sc.mesh = MeshData(verts=np.zeros((0, 3), np.float32),
+                       tris=np.zeros((0, 3), np.int32))
+    img2 = R.render(sc, st)
+    check('an empty-triangle mesh draws them too',
+          float(img2[:, :, :3].max()) > 0.3)
+    bg = Scene(mesh=None, materials=[], objects=[], lights=[],
+               camera=cam, world=World(color=(0.02, 0.02, 0.05)),
+               settings=st)
+    bg.images = {}
+    d = np.abs(img[:, :, :3] - R.render(bg, st)[:, :, :3])
+    check('the glows are ON the background, not instead of it',
+          float(d.max()) > 0.3 and float(d.min()) < 1e-6)
+
+
+def test_halo_lines_hold_their_width_across_resolutions():
+    """R197 field find: the line/ring windows were raw pixels (2.79's
+    own convention), so a 1080p render drew proportionally thinner
+    hairlines than a 480p one and a supersampled frame thinner still.
+    The windows now scale with frame height against the 480-line
+    reference: the fraction of the halo the lines cover must hold
+    across resolutions."""
+    from ..core.scene import Material
+
+    def line_frac(h_res):
+        w_res = h_res * 4 // 3
+        st = base_settings(w_res, h_res)
+        st.transparency = 'NONE'
+
+        def one(**hk):
+            sc = demo_scene(st, with_texture=False)
+            spec = {'size': 0.6, 'hardness': 50, 'add': 0.5,
+                    'alpha': 1.0, 'color': (1.0, 0.7, 0.3), 'seed': 3,
+                    'rings': 0, 'lines': 8, 'star_points': 0,
+                    'xalpha': False, 'soft': False, 'shaded': False}
+            spec.update(hk)
+            m = Material(name='G', index=len(sc.materials), halo=spec)
+            sc.materials.append(m)
+            sc.halos = [{'mat': m.index,
+                         'pos': np.array([[0.0, 0.6, 1.9]], np.float32)}]
+            return R.render(sc, st)
+
+        with_l = one()
+        without = one(lines=0)
+        gone = one(lines=0, alpha=0.0)
+        d = np.abs(with_l - without)[:, :, :3].max(axis=2)
+        halo_px = float((np.abs(without - gone)[:, :, :3].max(axis=2)
+                         > 1e-4).sum())
+        return float((d > 0.02).sum()) / max(halo_px, 1.0)
+
+    f1, f2 = line_frac(240), line_frac(480)
+    check('line coverage holds from 240p to 480p',
+          abs(f1 - f2) < 0.35 * max(f1, f2, 1e-6),
+          f'{f1:.3f} vs {f2:.3f}')
+
+
+def test_image_halos_and_the_energy_kit_animate():
+    """R198: an image IS the halo (alpha the shape, colours the glow),
+    noise writhes, bolts re-strike -- all deterministic in
+    (seed, time, frame)."""
+    from ..core.scene import ImageBuffer, Material
+
+    st = base_settings(128, 96)
+    st.transparency = 'NONE'
+
+    def frame(extra=None, t=0.0):
+        sc = demo_scene(st, with_texture=False)
+        spec = {'size': 0.8, 'hardness': 50, 'add': 0.5, 'alpha': 1.0,
+                'color': (1.0, 0.7, 0.3), 'seed': 3, 'rings': 0,
+                'lines': 0, 'star_points': 0, 'xalpha': False,
+                'soft': False, 'shaded': False}
+        if extra:
+            spec.update(extra)
+        m = Material(name='G', index=len(sc.materials), halo=spec)
+        sc.materials.append(m)
+        sc.halos = [{'mat': m.index,
+                     'pos': np.array([[0.0, 0.6, 1.9]], np.float32)}]
+        sc.time = t
+        return R.render(sc, st)
+
+    base = frame()
+    px = np.zeros((32, 32, 4), np.float32)
+    px[8:24, 8:24] = [0.2, 1.0, 0.4, 1.0]
+    buf = ImageBuffer(name='sprite', pixels=px)
+    imgf = frame({'shape': 'IMAGE', 'image': buf})
+    check('an image draws as the halo',
+          float(np.abs(imgf - base)[:, :, :3].max()) > 1e-3)
+    check('the image halo is deterministic',
+          bool(np.array_equal(frame({'shape': 'IMAGE', 'image': buf}),
+                              imgf)))
+    n1 = frame({'noise': 1.0}, t=0.1)
+    n2 = frame({'noise': 1.0}, t=0.6)
+    check('the energy noise writhes over time',
+          float(np.abs(n2 - n1).max()) > 1e-4)
+    b1 = frame({'bolts': 5}, t=0.1)
+    b2 = frame({'bolts': 5}, t=0.4)
+    check('the bolts re-strike over time',
+          float(np.abs(b2 - b1).max()) > 1e-4)
+    check('bolts glow through a hollow ring centre',
+          float(np.abs(frame({'shape': 'RING', 'bolts': 6})
+                       - frame({'shape': 'RING'}))[:, :, :3].max())
+          > 1e-3)
+
+
+def test_node_tree_edits_reach_the_viewport():
+    """R199 field find: editing the halo colour ramp -- an UNLINKED
+    node -- updates only the ShaderNodeTree id, Blender never tags the
+    Material (shading is unaffected), and the viewport's dirt gate
+    classified the poke 'none': the ramp widget never live-updated.
+    Node-tree updates classify as renderable now."""
+    import types
+
+    from . import fakebpy
+    fakebpy.install()
+    from .. import engine as ENG
+
+    def dg(*type_names):
+        ups = []
+        for tn in type_names:
+            uid = type(tn, (), {})()
+            ups.append(types.SimpleNamespace(
+                id=uid, is_updated_geometry=False,
+                is_updated_transform=False))
+        return types.SimpleNamespace(updates=ups)
+
+    check('a bare node-tree edit re-exports (the ramp widget)',
+          ENG._classify_updates(dg('ShaderNodeTree')) == 'full')
+    check('a material edit still re-exports',
+          ENG._classify_updates(dg('Material')) == 'full')
+    check('pure UI churn still exports nothing',
+          ENG._classify_updates(dg('Screen', 'WindowManager')) == 'none')
+
+
+def test_weather_overlay():
+    """R200: the Weather system -- rain, snow, embers, ash falling in
+    front of the finished picture. Deterministic hash particles, layer
+    parallax, resolution-true sizes; NONE is bitwise-neutral, and a
+    sky-only scene weathers through the same early path that once ate
+    the halos and the flares."""
+    import dataclasses as _dc
+
+    from ..core import scene as SC
+    from ..core import sky as SKY
+
+    st = base_settings(128, 96)
+    st.transparency = 'NONE'
+
+    def frame(t=0.6, **wk):
+        sc = demo_scene(st, with_texture=False)
+        for k, v in wk.items():
+            setattr(sc.world, k, v)
+        sc.time = t
+        return R.render(sc, st)
+
+    plain = frame()
+    none_w = frame(weather='NONE')
+    check('Weather NONE is bitwise-neutral',
+          bool(np.array_equal(none_w, plain)))
+    base = frame(weather='RAIN', weather_density=4.0)
+    check('rain falls across the frame',
+          float(np.abs(base - plain)[:, :, :3].max()) > 1e-3)
+    check('the storm is deterministic',
+          bool(np.array_equal(frame(weather='RAIN', weather_density=4.0),
+                              base)))
+    for kind in ('SNOW', 'EMBERS', 'ASH'):
+        v = frame(weather=kind, weather_density=4.0)
+        check(f'{kind.title()} draws its own weather',
+              float(np.abs(v - plain)[:, :, :3].max()) > 1e-3)
+    check('time moves the weather',
+          float(np.abs(frame(t=1.4, weather='RAIN', weather_density=4.0)
+                       - base).max()) > 1e-4)
+
+    # every dial speaks, against the same rain
+    for nm, kw in (('Density', {'weather_density': 8.0}),
+                   ('Size', {'weather_size': 3.0}),
+                   ('Speed', {'weather_speed': 4.0}),
+                   ('Angle', {'weather_angle': 2.2}),
+                   ('Drift', {'weather_drift': 2.0}),
+                   ('Colour', {'weather_color': (0.2, 1.0, 0.2)}),
+                   ('Opacity', {'weather_opacity': 0.3}),
+                   ('Layers', {'weather_layers': 1}),
+                   ('Streak', {'weather_streak': 4.0}),
+                   ('Glow', {'weather_glow': 1.0}),
+                   ('Flicker', {'weather_flicker': 1.0}),
+                   ('Seed', {'weather_seed': 77})):
+        wk = dict(weather='RAIN', weather_density=4.0)
+        wk.update(kw)
+        v = frame(**wk)
+        check(f'weather {nm} changes the storm',
+              float(np.abs(v - base).max()) > 1e-5)
+    sn_a = frame(weather='SNOW', weather_density=4.0)
+    sn_b = frame(weather='SNOW', weather_density=4.0, weather_size=3.0)
+    check('weather Size grows the flakes',
+          float(np.abs(sn_b - sn_a).max()) > 1e-5)
+
+    # the sky-only early path rains too (the halo/flare lesson, R195)
+    def sky_only(**wk):
+        sc = demo_scene(st, with_texture=False)
+        sc.mesh = None
+        for k, v in wk.items():
+            setattr(sc.world, k, v)
+        sc.time = 0.6
+        return R.render(sc, st)
+
+    check('a sky-only scene still rains',
+          float(np.abs(sky_only(weather='RAIN', weather_density=4.0)
+                       - sky_only())[:, :, :3].max()) > 1e-3)
+
+    # additive kinds add light; matter kinds can DARKEN a bright frame
+    sc_dark = frame(weather='ASH', weather_density=6.0,
+                    weather_color=(0.05, 0.05, 0.05),
+                    weather_opacity=1.0)
+    check('ash composites over (it can darken)',
+          float((sc_dark - plain)[:, :, :3].min()) < -1e-3)
+    add_r = frame(weather='EMBERS', weather_density=6.0,
+                  weather_color=(1.0, 0.5, 0.1), weather_opacity=1.0)
+    check('embers only add light',
+          float((add_r - plain)[:, :, :3].min()) > -1e-4)
+
+    # the World dataclass carries the fields and the settings group
+    # mirrors them by name -- the generic export loop's contract
+    need = {'weather', 'weather_density', 'weather_size',
+            'weather_speed', 'weather_angle', 'weather_drift',
+            'weather_color', 'weather_opacity', 'weather_layers',
+            'weather_streak', 'weather_glow', 'weather_flicker',
+            'weather_seed'}
+    wf = {f.name for f in _dc.fields(SC.World)}
+    check('the core World carries every weather field', need <= wf,
+          str(sorted(need - wf)))
+    from . import fakebpy
+    fakebpy.install()
+    from .. import properties as PR
+    ann = set(getattr(PR.HalcyonWorldSettings, '__annotations__', {}))
+    check('the world settings mirror them (the generic loop exports '
+          'them)', need <= ann, str(sorted(need - ann)))
+    check('the kind list is the shipped one',
+          tuple(SKY.WEATHER_KINDS) == ('NONE', 'RAIN', 'SNOW',
+                                       'EMBERS', 'ASH'))
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    esrc = open(os.path.join(root, 'engine.py'), encoding='utf-8').read()
+    check('the worker pool skips weather frames',
+          'weather overlay' in esrc)
+    usrc = open(os.path.join(root, 'ui.py'), encoding='utf-8').read()
+    check('the world panel carries the weather kit',
+          "'weather_density'" in usrc and "'weather_angle'" in usrc)
+    rsrc = open(os.path.join(root, 'core', 'render.py'),
+                encoding='utf-8').read()
+    check('the panorama draws weather once, after the stitch',
+          'weather falls ONCE across the finished panorama' in rsrc)
+
+
+def test_terrain_generator():
+    """R201: Add > Halcyon > Terrain. The fractal heightfield the
+    Altitude & Slope node was always waiting for: deterministic
+    hash-lattice mountains, Bryce dials (ridge blend, island falloff,
+    terracing, sea level), a clean quad lattice, and the terrain
+    material chain -- Altitude -> ramp -> slope-to-rock mix -> shader
+    -- rendering on the engine's own node road."""
+    from ..core import geometry as GEO
+    from ..core.scene import Material
+    from .scenebuild import _mesh_concat, look_at_matrix
+
+    v, f = GEO.terrain(divisions=32)
+    ok, why = GEO.is_manifoldish(v, f)
+    check('the terrain lattice is clean', ok, why)
+    check('the terrain is deterministic',
+          v == GEO.terrain(divisions=32)[0])
+    check('the seed re-deals the mountain',
+          v != GEO.terrain(divisions=32, seed=9)[0])
+    z0 = np.array([p[2] for p in v])
+    check('the mountain has relief',
+          float(z0.max() - z0.min()) > 0.5, f'{z0.max() - z0.min():.3f}')
+    ei = np.array([p[2] for p in GEO.terrain(divisions=32,
+                                             island=0.5)[0]]).reshape(33, 33)
+    check('island falloff pins the rim to zero',
+          float(np.abs(ei[0]).max()) < 1e-5
+          and float(np.abs(ei[-1]).max()) < 1e-5
+          and float(np.abs(ei[:, 0]).max()) < 1e-5)
+    check('...with the middle still mountainous',
+          float(ei[10:23, 10:23].max()) > 0.05)
+    sv = np.array([p[2] for p in GEO.terrain(divisions=32, height=6.0,
+                                             sea_level=0.4)[0]])
+    check('sea level floors the valleys at its fraction',
+          abs(float(sv.min()) - 0.4 * 6.0) < 1e-5, f'{sv.min():.4f}')
+    tz = np.array([p[2] for p in GEO.terrain(divisions=32,
+                                             terraces=5)[0]])
+    check('terracing changes the relief',
+          float(np.abs(tz - z0).max()) > 1e-3)
+    r0 = np.array([p[2] for p in GEO.terrain(divisions=32,
+                                             ridge=0.0)[0]])
+    r1 = np.array([p[2] for p in GEO.terrain(divisions=32,
+                                             ridge=1.0)[0]])
+    check('the ridged blend reshapes the crests',
+          float(np.abs(r1 - r0).max()) > 0.1)
+
+    # ---- the Bryce material chain renders: Altitude & Slope ->
+    # colour ramp -> slope-to-rock Mix -> shader, on the core road
+    def sk(nm, t, d, l=None):
+        return {'name': nm, 'type': t, 'default': d, 'link': l}
+
+    def terrain_scene(alt_max):
+        st = base_settings(128, 96)
+        st.transparency = 'NONE'
+        sc = demo_scene(st, with_texture=False)
+        tv, tf = GEO.terrain(size=14.0, divisions=48, height=4.0,
+                             seed=3)
+        V = np.asarray(tv, np.float32)
+        T = []
+        for (a, b, c, d) in tf:
+            T.append((a, b, c))
+            T.append((a, c, d))
+        T = np.asarray(T, np.int32)
+        # smooth per-vertex normals off the faces, so Slope grades
+        e1 = V[T[:, 1]] - V[T[:, 0]]
+        e2 = V[T[:, 2]] - V[T[:, 0]]
+        fn = np.cross(e1, e2)
+        N = np.zeros_like(V)
+        for k in range(3):
+            np.add.at(N, T[:, k], fn)
+        ln = np.linalg.norm(N, axis=1, keepdims=True)
+        N = (N / np.where(ln < 1e-12, 1.0, ln)).astype(np.float32)
+        UV = np.zeros((V.shape[0], 2), np.float32)
+        mesh = _mesh_concat([(V, N, UV, T, 0, 0)])
+        mesh.smooth = np.ones(T.shape[0], bool)
+        sc.mesh = mesh
+        lut = [[0.2, 0.28, 0.12, 1.0]] * 11 \
+            + [[0.36, 0.30, 0.20, 1.0]] * 9 \
+            + [[0.38, 0.36, 0.34, 1.0]] * 7 \
+            + [[0.92, 0.94, 0.97, 1.0]] * 5
+        ins = [sk('Diffuse Color', 'RGBA', [0.5, 0.5, 0.5, 1],
+                  ['mix', 0]),
+               sk('Diffuse Level', 'VALUE', 1.0),
+               sk('Specular Level', 'VALUE', 0.05),
+               sk('Ambient', 'VALUE', 0.6),
+               sk('Opacity', 'VALUE', 1.0)]
+        graph = {'output': 'out', 'nodes': {
+            'alt': {'id': 'alt',
+                    'bl_idname': 'HALCYON_AltitudeSlopeNode',
+                    'props': {},
+                    'inputs': [sk('Minimum', 'VALUE', 0.0),
+                               sk('Maximum', 'VALUE', alt_max)],
+                    'outputs': [{'name': 'Altitude', 'type': 'VALUE'},
+                                {'name': 'Factor', 'type': 'VALUE'},
+                                {'name': 'Slope', 'type': 'VALUE'},
+                                {'name': 'Orientation',
+                                 'type': 'VALUE'}]},
+            'ramp': {'id': 'ramp', 'bl_idname': 'ShaderNodeValToRGB',
+                     'props': {'lut': lut},
+                     'inputs': [sk('Fac', 'VALUE', 0.5, ['alt', 1])],
+                     'outputs': [{'name': 'Color', 'type': 'RGBA'},
+                                 {'name': 'Alpha', 'type': 'VALUE'}]},
+            'mix': {'id': 'mix', 'bl_idname': 'ShaderNodeMix',
+                    'props': {'data_type': 'RGBA',
+                              'blend_type': 'MIX',
+                              'clamp_factor': True},
+                    'inputs': [sk('Factor', 'VALUE', 0.0, ['alt', 2]),
+                               sk('A', 'RGBA', [1, 0, 1, 1],
+                                  ['ramp', 0]),
+                               sk('B', 'RGBA',
+                                  [0.33, 0.31, 0.30, 1.0])],
+                    'outputs': [{'name': 'Result', 'type': 'RGBA'}]},
+            'hal': {'id': 'hal', 'bl_idname': 'HALCYON_ShaderNode',
+                    'props': {'model': 'LAMBERT', 'toon_steps': 2},
+                    'inputs': ins,
+                    'outputs': [{'name': 'Surface', 'type': 'SHADER'}]},
+            'out': {'id': 'out',
+                    'bl_idname': 'ShaderNodeOutputMaterial',
+                    'props': {},
+                    'inputs': [sk('Surface', 'SHADER', None,
+                                  ['hal', 0]),
+                               sk('Displacement', 'VECTOR', [0, 0, 0])],
+                    'outputs': []}}}
+        sc.materials[0] = Material(name='TerrainMat', index=0,
+                                   graph=graph)
+        cam = sc.camera
+        cam.matrix_world = look_at_matrix((16.0, -16.0, 10.0),
+                                          (0.0, 0.0, 1.5))
+        return sc, st
+
+    sc1, st1 = terrain_scene(4.0)
+    img1 = R.render(sc1, st1)
+    check('the terrain-material scene renders',
+          float(np.abs(np.asarray(img1)).sum()) > 0)
+    sc2, st2 = terrain_scene(4000.0)
+    img2 = R.render(sc2, st2)
+    check('the Altitude factor is live in the chain (Maximum moves '
+          'the bands)',
+          float(np.abs(np.asarray(img1) - np.asarray(img2)).max())
+          > 1e-3)
+
+    # the operator, the material builder and the menu are wired
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    osrc = open(os.path.join(root, 'objects.py'), encoding='utf-8').read()
+    check('the Terrain operator exists',
+          "bl_idname = 'halcyon.add_terrain'" in osrc)
+    check('the operator builds the Bryce material',
+          '_terrain_material' in osrc
+          and 'HALCYON_AltitudeSlopeNode' in osrc)
+    check('the Add menu lists the Terrain',
+          'HALCYON_OT_add_terrain.bl_idname' in osrc)
+    check('the operator registers',
+          'HALCYON_OT_add_terrain, VIEW3D_MT_halcyon_add' in osrc)
+
+
+def test_animation_eta():
+    """R201: per-frame time and estimated completion during animation
+    renders -- and the estimate knows the caches make later frames
+    faster (the warm-up frame is forgotten as soon as one steady frame
+    exists; a lone hiccup never becomes the prediction)."""
+    from . import fakebpy
+    fakebpy.install()
+    from .. import engine as ENG
+
+    check('one warm-up frame is all the information there is',
+          ENG._anim_frame_cost([30.0]) == 30.0)
+    check('the estimate forgets the warm-up after ONE steady frame',
+          ENG._anim_frame_cost([30.0, 8.0]) == 8.0)
+    check('a lone hiccup mid-run never becomes the estimate',
+          ENG._anim_frame_cost([8.0, 9.0, 50.0, 8.0, 8.0]) == 8.0)
+    check('only the recent frames vote (a run that sped up trusts '
+          'the new pace)',
+          ENG._anim_frame_cost([60.0] * 20 + [8.0, 8.0, 8.0, 8.0,
+                                              8.0]) == 8.0)
+    check('spans format like a human wrote them',
+          (ENG._fmt_span(42), ENG._fmt_span(185), ENG._fmt_span(4325))
+          == ('42s', '3m 05s', '1h 12m'))
+    line = ENG._anim_eta_line([30.0, 8.0], 1, 250, 1, 2, now=0.0)
+    check('the mid-run line carries frame, time and remainder',
+          line.startswith('animation frame 2/250 in 8.0s')
+          and '33m 04s to go' in line and 'done around' in line, line)
+    check('the last frame prints the tally instead',
+          ENG._anim_eta_line([30.0, 8.0, 8.0], 1, 3, 1, 3)
+          == 'animation finished: 3 frames in 46s')
+    check('frame steps count real frames, not scene numbers',
+          ENG._anim_eta_line([5.0, 5.0, 5.0, 5.0], 1, 20, 5, 16)
+          == 'animation finished: 4 frames in 20s')
+    stepped = ENG._anim_eta_line([5.0, 5.0], 1, 20, 5, 6, now=0.0)
+    check('...and mid-run with a step too',
+          stepped.startswith('animation frame 2/4'), stepped)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    esrc = open(os.path.join(root, 'engine.py'), encoding='utf-8').read()
+    check('the render body prints the ETA on animation frames',
+          '_anim_eta_line(' in esrc and 'is_animation' in esrc)
+    check('the clock lives on the engine instance (fresh per job)',
+          '_anim_times = []' in esrc)
+
+
+def test_the_asked_look_presets_exist():
+    """R201 QoL: the one-click looks the field asked for by name --
+    PlayStation, N64, Saturn, SGI broadcast, Bryce still -- all on the
+    shelf (the first three were already there; the audit added the
+    broadcast pipeline and the overnight Bryce postcard)."""
+    from ..core.settings import RenderSettings
+
+    for key in ('PSX', 'N64', 'SATURN', 'SGI_BROADCAST', 'BRYCE_STILL',
+                'BRYCE_2'):
+        check(f'{key} is on the preset shelf', key in PRESETS)
+    st = apply_preset(RenderSettings(), 'SGI_BROADCAST')
+    check('SGI broadcast is D1 NTSC with broadcast-legal colour',
+          (st.resolution_x, st.resolution_y) == (720, 486)
+          and str(st.interlace) == 'BLEND'
+          and abs(float(st.saturation) - 0.9) < 1e-6)
+    st2 = apply_preset(RenderSettings(), 'BRYCE_STILL')
+    check('the Bryce still is the overnight render: 9x AA, soft ray '
+          'shadows, a breath of haze',
+          int(st2.aa_samples) == 9 and str(st2.shadow_default) == 'RAY'
+          and bool(st2.fog) and bool(st2.glow))
+
+
+def _r202_graph_scene(nodes_extra, link_from, mat_index=1,
+                      diffuse=(0.9, 0.6, 0.2, 1.0), level_link=None):
+    """A demo scene whose material `mat_index` shades from a dict
+    graph: the R202 node checks share this one builder."""
+    from ..core.scene import Material
+
+    def sk(nm, t, d, l=None):
+        return {'name': nm, 'type': t, 'default': d, 'link': l}
+
+    st = base_settings(96, 72)
+    st.transparency = 'NONE'
+    sc = demo_scene(st, with_texture=False)
+    ins = [sk('Diffuse Color', 'RGBA', list(diffuse), link_from),
+           sk('Diffuse Level', 'VALUE', 1.0, level_link),
+           sk('Specular Level', 'VALUE', 0.2),
+           sk('Glossiness', 'VALUE', 30.0),
+           sk('Ambient', 'VALUE', 0.6),
+           sk('Opacity', 'VALUE', 1.0)]
+    nodes = {
+        'hal': {'id': 'hal', 'bl_idname': 'HALCYON_ShaderNode',
+                'props': {'model': 'LAMBERT', 'toon_steps': 2},
+                'inputs': ins,
+                'outputs': [{'name': 'Surface', 'type': 'SHADER'}]},
+        'out': {'id': 'out', 'bl_idname': 'ShaderNodeOutputMaterial',
+                'props': {},
+                'inputs': [sk('Surface', 'SHADER', None, ['hal', 0]),
+                           sk('Displacement', 'VECTOR', [0, 0, 0])],
+                'outputs': []}}
+    nodes.update(nodes_extra)
+    sc.materials[mat_index] = Material(
+        name='T', index=mat_index,
+        graph={'output': 'out', 'nodes': nodes})
+    return sc, st
+
+
+def _r202_gpu_parity(sc, st, label):
+    """CPU frame vs GPU simulator on the covered fragments."""
+    from ..gpu import shade as GSH
+    from ..core import raster as CR
+    w, h = st.resolution_x, st.resolution_y
+    cpu = R.render(sc, st)
+    view, _p, vp, eye = R.camera_matrices(sc.camera, w, h)
+    g = CR.GBuffer(w, h)
+    CR.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+    job = R.ShadeJob(sc, st, {}, None, view, eye, w, h)
+    GSH._PLAN_CACHE.clear()
+    passes, why, atl = GSH.plan_frame(job, g)
+    check(f'{label} plans onto the GPU', passes is not None, str(why))
+    if passes is None:
+        return cpu, None
+    img, _hit = GSH.simulate(job, g, passes, atl)
+    cov = g.tri >= 0
+    err = float(np.abs(img[cov] - np.asarray(cpu)[cov][:, :3]).max())
+    check(f'{label}: GPU twin matches the CPU', err < 6e-3,
+          f'max {err:.6f}')
+    return cpu, err
+
+
+def test_terrain_types():
+    """R202: the terrain grows six new landforms beside the R201
+    mountain -- hills, canyon, dunes (with a wind direction), crater,
+    volcano, plateau -- every one a clean lattice, deterministic, and
+    distinct; MOUNTAIN stays the R201 output bit for bit."""
+    from ..core import geometry as GEO
+
+    base = GEO.terrain(divisions=32)
+    check('the default kind IS the R201 mountain bitwise',
+          GEO.terrain(divisions=32, kind='MOUNTAIN') == base)
+    prev = {'MOUNTAIN': np.array([p[2] for p in base[0]])}
+    for k in ('HILLS', 'CANYON', 'DUNES', 'CRATER', 'VOLCANO',
+              'PLATEAU'):
+        v, f = GEO.terrain(divisions=32, kind=k)
+        ok, why = GEO.is_manifoldish(v, f)
+        check(f'{k.title()} builds a clean lattice', ok, why)
+        z = np.array([p[2] for p in v])
+        check(f'{k.title()} has relief',
+              float(z.max() - z.min()) > 0.3,
+              f'{z.max() - z.min():.3f}')
+        check(f'{k.title()} is deterministic',
+              v == GEO.terrain(divisions=32, kind=k)[0])
+        for nm, pz in prev.items():
+            check(f'{k.title()} differs from {nm.title()}',
+                  bool((z != pz).any()))
+        prev = {k: z}
+    d1 = GEO.terrain(divisions=24, kind='DUNES', direction=0.0)[0]
+    d2 = GEO.terrain(divisions=24, kind='DUNES', direction=1.2)[0]
+    check('the Dunes wind Direction turns the ridges', d1 != d2)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    osrc = open(os.path.join(root, 'objects.py'), encoding='utf-8').read()
+    check('the operator offers the Type menu',
+          "'MOUNTAIN', \"Mountain\"" in osrc
+          and "'VOLCANO', \"Volcano\"" in osrc)
+
+
+def test_image_palette_road():
+    """R202: an image AS the render's palette, and the operator that
+    turns any image into a one-colour-per-pixel table. The core road
+    is shared; Custom mode with no image keeps its old behaviour."""
+    from ..core import post
+    from ..core.palette import palette_from_pixels, palette_table_layout
+
+    img4 = np.zeros((4, 4, 4), np.float32)
+    img4[..., 3] = 1.0
+    img4[0, :, :3] = (1, 0, 0)
+    img4[1, :, :3] = (0, 1, 0)
+    img4[2, :, :3] = (0, 0, 1)
+    img4[3, :, :3] = (1, 1, 0)
+    p = palette_from_pixels(img4)
+    check('distinct colours dedupe to one entry each', p.shape == (4, 3))
+    check('extraction is deterministic',
+          bool(np.array_equal(palette_from_pixels(img4), p)))
+    rnd = np.random.RandomState(7).rand(48, 48, 4).astype(np.float32)
+    rnd[..., 3] = 1.0
+    check('over-cap images median-cut down to the cap',
+          palette_from_pixels(rnd, cap=16).shape == (16, 3))
+    tr = img4.copy()
+    tr[3, :, 3] = 0.0
+    check('transparent padding pixels are skipped',
+          palette_from_pixels(tr).shape == (3, 3))
+    for srt in ('LUMA', 'HUE', 'FREQ'):
+        check(f'{srt} sort returns the same colours',
+              sorted(map(tuple, palette_from_pixels(img4, sort=srt)
+                         .tolist()))
+              == sorted(map(tuple, p.tolist())))
+    check('table layout: squarest grid and explicit columns',
+          palette_table_layout(17) == (5, 4)
+          and palette_table_layout(9, 3) == (3, 3)
+          and palette_table_layout(4) == (2, 2))
+
+    st = base_settings(96, 72)
+    st.transparency = 'NONE'
+    frame = np.asarray(R.render(demo_scene(st, with_texture=False), st))
+    st2 = base_settings(96, 72)
+    st2.palette_mode = 'CUSTOM'
+    st2.palette_colors = ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+                          (1.0, 1.0, 0.0), (1.0, 1.0, 1.0))
+    out = np.asarray(post.process(frame.copy(), st2, frame=1, seed=0))
+    pal = np.asarray(st2.palette_colors, np.float32)
+    d = np.min(((out[:, :, :3].reshape(-1, 3)[:, None, :]
+                 - pal[None, :, :]) ** 2).sum(-1), axis=1)
+    check('the whole frame is FORCED onto the image palette',
+          float(d.max()) < 1e-6, f'max dev {d.max():.3g}')
+    st3 = base_settings(96, 72)
+    st3.palette_mode = 'CUSTOM'
+    st4 = base_settings(96, 72)
+    st4.palette_mode = 'CUSTOM'
+    st4.palette_colors = ()
+    check('Custom with no image picked keeps its old adaptive road',
+          bool(np.array_equal(
+              np.asarray(post.process(frame.copy(), st3, frame=1,
+                                      seed=0)),
+              np.asarray(post.process(frame.copy(), st4, frame=1,
+                                      seed=0)))))
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    csrc = open(os.path.join(root, 'convert.py'), encoding='utf-8').read()
+    check('the Make Palette Table operator exists',
+          "bl_idname = 'halcyon.palette_table'" in csrc)
+    check('...in the Image editor menu',
+          'IMAGE_MT_image' in csrc)
+    psrc = open(os.path.join(root, 'properties.py'),
+                encoding='utf-8').read()
+    check('the Palette Image property feeds the render road',
+          'palette_image' in psrc and 'palette_from_pixels' in psrc)
+    usrc = open(os.path.join(root, 'ui.py'), encoding='utf-8').read()
+    check('the colour panel offers the image picker under Custom',
+          "template_ID(hs, 'palette_image'" in usrc)
+
+
+def test_altitude_slope_noise():
+    """R202: the Altitude & Slope node's optional Noise -- ragged
+    band edges. 0 (and the sockets absent entirely) is bitwise the
+    old node; live noise moves the picture identically on both
+    devices."""
+    def sk(nm, t, d, l=None):
+        return {'name': nm, 'type': t, 'default': d, 'link': l}
+
+    def alt_nodes(amt, with_sockets=True):
+        ins = [sk('Minimum', 'VALUE', 0.0), sk('Maximum', 'VALUE', 2.0)]
+        if with_sockets:
+            ins += [sk('Noise', 'VALUE', amt),
+                    sk('Noise Scale', 'VALUE', 5.0)]
+        return {'alt': {
+            'id': 'alt', 'bl_idname': 'HALCYON_AltitudeSlopeNode',
+            'props': {}, 'inputs': ins,
+            'outputs': [{'name': 'Altitude', 'type': 'VALUE'},
+                        {'name': 'Factor', 'type': 'VALUE'},
+                        {'name': 'Slope', 'type': 'VALUE'},
+                        {'name': 'Orientation', 'type': 'VALUE'}]}}
+
+    sc0, st0 = _r202_graph_scene(alt_nodes(0.0), None,
+                                 level_link=['alt', 1])
+    at_zero = np.asarray(R.render(sc0, st0))
+    sc_n, st_n = _r202_graph_scene(alt_nodes(0.0, with_sockets=False),
+                                   None, level_link=['alt', 1])
+    check('Noise 0 is bitwise the socket-less node',
+          bool(np.array_equal(np.asarray(R.render(sc_n, st_n)),
+                              at_zero)))
+    sc1, st1 = _r202_graph_scene(alt_nodes(0.6), None,
+                                 level_link=['alt', 1])
+    cpu1, _err = _r202_gpu_parity(sc1, st1, 'altitude noise')
+    check('the noise moves the bands',
+          not np.array_equal(np.asarray(cpu1), at_zero))
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    nsrc = open(os.path.join(root, 'nodes', 'shader_nodes.py'),
+                encoding='utf-8').read()
+    check('old saved nodes gain the inputs at load',
+          "'HALCYON_AltitudeSlopeNode')" in nsrc
+          and 'def ensure_sockets' in nsrc)
+
+
+def test_iridescent_node():
+    """R202: the Iridescent node -- four types, CPU and GPU in
+    lockstep, the Factor output the rim mask."""
+    def sk(nm, t, d, l=None):
+        return {'name': nm, 'type': t, 'default': d, 'link': l}
+
+    OUTS = [{'name': 'Color', 'type': 'RGBA'},
+            {'name': 'Factor', 'type': 'VALUE'}]
+
+    frames = {}
+    for mode in ('SPECTRUM', 'THIN_FILM', 'PEARL', 'OIL'):
+        nodes = {'ir': {'id': 'ir',
+                        'bl_idname': 'HALCYON_IridescentNode',
+                        'props': {'mode': mode},
+                        'inputs': [sk('Shift', 'VALUE', 0.1),
+                                   sk('Scale', 'VALUE', 2.0),
+                                   sk('Saturation', 'VALUE', 1.0),
+                                   sk('Tint', 'RGBA',
+                                      [0.85, 0.72, 0.9, 1.0]),
+                                   sk('Noise Scale', 'VALUE', 6.0)],
+                        'outputs': OUTS}}
+        sc, st = _r202_graph_scene(nodes, ['ir', 0])
+        cpu, _err = _r202_gpu_parity(sc, st, f'iridescent {mode}')
+        frames[mode] = np.asarray(cpu)
+    pairs = [('SPECTRUM', 'THIN_FILM'), ('THIN_FILM', 'PEARL'),
+             ('PEARL', 'OIL'), ('SPECTRUM', 'OIL')]
+    for a, b in pairs:
+        check(f'{a} and {b} are different looks',
+              float(np.abs(frames[a] - frames[b]).max()) > 1e-3)
+    # the Factor output is the rim mask: drive Diffuse Level with it
+    nodes = {'ir': {'id': 'ir', 'bl_idname': 'HALCYON_IridescentNode',
+                    'props': {'mode': 'SPECTRUM'},
+                    'inputs': [sk('Shift', 'VALUE', 0.0),
+                               sk('Scale', 'VALUE', 1.0),
+                               sk('Saturation', 'VALUE', 1.0),
+                               sk('Tint', 'RGBA', [1, 1, 1, 1]),
+                               sk('Noise Scale', 'VALUE', 6.0)],
+                    'outputs': OUTS}}
+    scf, stf = _r202_graph_scene(nodes, None, level_link=['ir', 1])
+    plain_sc, plain_st = _r202_graph_scene({}, None)
+    check('the Factor output masks like a rim',
+          not np.array_equal(np.asarray(R.render(scf, stf)),
+                             np.asarray(R.render(plain_sc, plain_st))))
+    from . import fakebpy
+    fakebpy.install()
+    from ..nodes import shader_nodes as SN
+    check('the node registers and reaches the Add menu',
+          any(c.__name__ == 'HALCYON_IridescentNode' for c in SN.NODES))
+    docs = [d for _k, n, _d in SN.HALCYON_IridescentNode.SOCKETS
+            for d in [SN.HALCYON_IridescentNode._DOCS.get(n, '')]]
+    check('every input carries a real tooltip',
+          all(len(d) >= 25 for d in docs))
+
+
+def test_master_shader_regroup():
+    """R202: the master node's panel regroups -- Reflection Colour and
+    Refraction beside Reflection, the Bump pair beside Normal -- and
+    the three blend menus ride their own amount sockets (custom socket
+    type), with load-time migration for saved files."""
+    from . import fakebpy
+    fakebpy.install()
+    from ..nodes import shader_nodes as SN
+
+    names = [n for _k, n, _d in SN.HALCYON_ShaderNode.SOCKETS]
+    i = {n: k for k, n in enumerate(names)}
+    check('Reflection Colour sits directly after Reflection',
+          i['Reflection Color'] == i['Reflection'] + 1)
+    check('Refraction Amount sits directly after them',
+          i['Refraction Amount'] == i['Reflection Color'] + 1)
+    check('the Bump pair follows Normal',
+          i['Bump Strength'] == i['Normal'] + 1
+          and i['Bump Height'] == i['Bump Strength'] + 1)
+    kinds = {n: k for k, n, _d in SN.HALCYON_ShaderNode.SOCKETS}
+    for nm in ('Fresnel', 'Rim Amount', 'Matcap Blend'):
+        check(f"'{nm}' is a blend-carrying socket",
+              kinds[nm] == 'HALCYON_BlendValueSocket')
+    check('the socket type registers',
+          any(c.__name__ == 'HALCYON_BlendValueSocket'
+              for c in SN.OPERATORS))
+    check('the socket draws the menu below the amount',
+          hasattr(SN.HALCYON_BlendValueSocket, 'draw')
+          and 'blend_prop' in SN.HALCYON_BlendValueSocket.__annotations__)
+    check('saved nodes migrate at load (swap + regroup)',
+          hasattr(SN.HALCYON_ShaderNode, 'upgrade_blend_sockets')
+          and hasattr(SN.HALCYON_ShaderNode, 'sort_sockets'))
+    import inspect
+    mig = inspect.getsource(SN._migrate_master_sockets)
+    check('the load-post walk runs both migrations',
+          'upgrade_blend_sockets' in mig and 'sort_sockets' in mig)
+    draw = inspect.getsource(SN.HALCYON_ShaderNode.draw_buttons)
+    check('an unmigrated float socket keeps the old top menu',
+          '_legacy' in draw)
+
+
+def test_bryce_waters_roster():
+    """R202: the field supplied the actual Bryce 2 Waters & Liquids
+    library file, and its thirty-preset roster now ships -- names as
+    1995 shipped them, notes quoting the originals."""
+    from ..presets.waters import ORDER, WATERS, apply_water
+    from ..core.scene import World
+
+    roster = ('DEEP_BLUE', 'MERCURY_SURFACE', 'DULL_MIRROR',
+              'NIGHTTIME_LAKE', 'OASIS', 'NEW_AGE_WHALE_PICTURE',
+              'PLACIDO_DOMINGO', 'MR_BUBBLE', 'STILL_AND_DEEP',
+              'XANADES_LAKE', 'SWIRLING_WATER', 'ROSE_WATER',
+              'WAVES_OF_REFLECTION', 'SHINY_AND_STILL',
+              'BRIGHT_BUBBLE', 'FOAMY_SEAWATER', 'ICEBERG',
+              'POLLUTION_WATERFALL', 'GLOWING_WATER',
+              'THAT_THING_FROM_ABYSS', 'NARCISSUS_POOL',
+              'BACKYARD_POOL', 'SANTRAGINUS_V', 'BRYCE_COLA',
+              'DEEP_SEA', 'ATLANTIC', 'NICE_WATER', 'TURBULENCE')
+    missing = [k for k in roster if k not in WATERS]
+    check('all twenty-eight mined presets ship', not missing,
+          str(missing[:4]))
+    check('with Black Lagoon and Caribbean Resort, the thirty are '
+          'complete', 'BLACK_LAGOON' in WATERS
+          and 'CARIBBEAN_RESORT' in WATERS)
+    check('the order list carries them', set(roster) <= set(ORDER))
+    bad = []
+    for k in roster:
+        w = World()
+        ok, _msg = apply_water(w, k)
+        if not ok or not w.ground_plane or w.ground_mode != 'OCEAN':
+            bad.append(k)
+    check('every one applies as a live ocean', not bad, str(bad[:4]))
+    quoted = sum(1 for k in roster if '1995' in WATERS[k]['note']
+                 or 'library' in WATERS[k]['note'])
+    check('the notes quote the 1995 descriptions', quoted >= 26,
+          f'{quoted} of {len(roster)}')
+    # distinctness: no two mined presets share identical settings
+    sigs = [tuple(sorted(WATERS[k]['settings'].items())) for k in roster]
+    check('no two are the same water', len(set(sigs)) == len(sigs))
+
+
+def test_premade_menu():
+    """R203 rework (field): Pre-Made lives INSIDE the Halcyon node
+    menu, one submenu per material family; clicking inserts the
+    cluster ADDITIVELY -- no dialog, nothing replaced, the output
+    taken only when it was empty."""
+    from . import fakebpy
+    fakebpy.install()
+    from .. import templates as T
+
+    fams = [f for f, _l in T.FAMILIES]
+    for want in ('METAL', 'MINERAL', 'GLASS', 'WATER', 'LIQUID',
+                 'WOOD'):
+        check(f'the {want.title()} family the field named exists',
+              want in fams)
+    allk = sorted(set(sum((T.family_keys(f) for f in fams), [])))
+    check('every template lands in exactly one family',
+          allk == sorted(T.TEMPLATES))
+    check('one submenu class per family registers',
+          all(any(c.__name__ == f'NODE_MT_halcyon_premade_{f.lower()}'
+                  for c in T.CLASSES) for f in fams))
+    import inspect
+    reg = inspect.getsource(T.register)
+    check('Pre-Made no longer bolts onto the bare Add menu',
+          'NODE_MT_add' not in reg)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    nsrc = open(os.path.join(root, 'nodes', 'shader_nodes.py'),
+                encoding='utf-8').read()
+    check('...it lives inside the Halcyon menu instead',
+          "layout.menu('NODE_MT_halcyon_premade'" in nsrc)
+    op = inspect.getsource(T.HALCYON_OT_material_template)
+    check('the operator lost its popup dialog',
+          'invoke_props_dialog' not in op)
+    check('...and inserts additively', 'clear=False' in op)
+    usrc = open(os.path.join(root, 'ui.py'), encoding='utf-8').read()
+    check('the Material-panel template box is gone',
+          'Start from a template' not in usrc)
+
+    # the additive contract, pinned in build_spec itself: the
+    # non-clear road records what existed, reuses the active output,
+    # links only an UNLINKED Surface, and offsets/selects only the
+    # fresh nodes
+    bs = inspect.getsource(T.build_spec)
+    check('the insert road never clears the tree',
+          'if clear:' in bs and 'tree.nodes.clear()' in bs)
+    check('...reuses the existing active output', 'existing_out' in bs)
+    check('...takes the output only when unlinked',
+          'not surf_in.is_linked' in bs)
+    check('...moves and selects only the fresh nodes',
+          'n.name not in pre' in bs)
+
+
+def test_every_node_prop_reaches_the_renderer():
+    """R203 field find, closed as a CLASS: the Iridescent node's Type
+    enum was never in export.NODE_PROPS, so changing it did nothing --
+    and Tint and Noise Scale (mode-gated) died with it. This audit
+    holds every registered Halcyon node's scalar/enum annotations to
+    an entry in NODE_PROPS or a declared non-shading reason."""
+    from . import fakebpy
+    fakebpy.install()
+    from ..nodes import shader_nodes as SN
+    from ..export import NODE_PROPS
+
+    #: props that deliberately never serialize -- each with its reason
+    NOT_SHADING = {
+        ('HALCYON_BIMaterialNode', 'ramp_dif_ipo'):
+            'read via the ipo_map special case in _node_props',
+        ('HALCYON_BIMaterialNode', 'ramp_spec_ipo'):
+            'read via the ipo_map special case in _node_props',
+        ('HALCYON_BIMaterialNode', 'dif_ramp_tex'):
+            'gradient-widget bookkeeping; stops serialize instead',
+        ('HALCYON_BIMaterialNode', 'spec_ramp_tex'):
+            'gradient-widget bookkeeping; stops serialize instead',
+        ('HALCYON_CodeNode', 'needs_rebuild'):
+            'compile bookkeeping; the compiled program ships',
+        ('HALCYON_CodeNode', 'error'): 'compile diagnostics, UI only',
+        ('HALCYON_CodeNode', 'warn'): 'compile diagnostics, UI only',
+        ('HALCYON_CodeNode', 'auto_compile'):
+            'editor behaviour toggle; the program ships either way',
+    }
+    dead = []
+    for cls in SN.NODES:
+        idn = cls.bl_idname
+        listed = set(NODE_PROPS.get(idn, ()))
+        for name, prop in getattr(cls, '__annotations__', {}).items():
+            kind = getattr(prop, 'kind', '')
+            if kind not in ('EnumProperty', 'IntProperty',
+                            'FloatProperty', 'BoolProperty',
+                            'StringProperty'):
+                continue
+            if name in listed or (idn, name) in NOT_SHADING:
+                continue
+            dead.append(f'{idn}.{name}')
+    check('every node property serializes or declares why not',
+          not dead, ', '.join(dead))
+    check('the Iridescent mode is in the table (the field find)',
+          'mode' in NODE_PROPS.get('HALCYON_IridescentNode', ()))
+
+
+def test_ground_types_rework():
+    """R203: the Tile dials exist and hold their old defaults bitwise,
+    Neon Grid retired into thin-glow tiles (old exports still render),
+    the Lava rebuild answers to its dials, and a picked material
+    paints the MATERIAL ground."""
+    from ..core import sky as SKY
+    from ..core.scene import World
+
+    dirs = []
+    for gx in np.linspace(-0.8, 0.8, 12):
+        for gy in (0.4, 0.7, 1.0):
+            d = np.array([gx, gy, -0.35], np.float32)
+            dirs.append(d / np.linalg.norm(d))
+    dirs = np.asarray(dirs, np.float32)
+    sky_col = np.full((len(dirs), 3), 0.4, np.float32)
+    eye = np.array([0.0, 0.0, 2.0], np.float32)
+
+    def shade(**kw):
+        w = World(ground_plane=True, **kw)
+        return SKY.ground_plane(w, dirs, sky_col.copy(), eye, time=0.5)
+
+    tiles0 = shade(ground_mode='TILES')
+    check('Tiles at the new dials\' defaults is bitwise the old floor',
+          bool(np.array_equal(tiles0,
+                              shade(ground_mode='TILES',
+                                    ground_grout=0.04,
+                                    ground_tile_shade=0.25,
+                                    ground_grout_glow=1.0))))
+    for nm, kw in (('Grout Width', {'ground_grout': 0.2}),
+                   ('Grout Glow', {'ground_grout': 0.2,
+                                   'ground_grout_glow': 3.0}),
+                   ('Tile Variance', {'ground_tile_shade': 1.0})):
+        check(f'{nm} changes the tiles',
+              not np.array_equal(tiles0, shade(ground_mode='TILES',
+                                               **kw)))
+    grid = shade(ground_mode='GRID')
+    check('an old GRID export still renders (as thin-glow tiles)',
+          not np.array_equal(grid, sky_col)
+          and not np.array_equal(grid, tiles0))
+    lava0 = shade(ground_mode='LAVA')
+    check('the rebuilt lava draws', not np.array_equal(lava0, sky_col))
+    for nm, kw in (('Crack Width', {'ground_crack_width': 1.5}),
+                   ('Lava Glow', {'ground_glow': 4.0}),
+                   ('Heat Pulse', {'ground_pulse': 1.0})):
+        check(f'{nm} changes the lava',
+              not np.array_equal(lava0, shade(ground_mode='LAVA', **kw)))
+
+    g = {'output': 'out', 'nodes': {
+        'hal': {'id': 'hal', 'bl_idname': 'HALCYON_ShaderNode',
+                'props': {'model': 'CONSTANT', 'toon_steps': 2},
+                'inputs': [{'name': 'Diffuse Color', 'type': 'RGBA',
+                            'default': [0.9, 0.3, 0.1, 1.0],
+                            'link': None},
+                           {'name': 'Opacity', 'type': 'VALUE',
+                            'default': 1.0, 'link': None}],
+                'outputs': [{'name': 'Surface', 'type': 'SHADER'}]},
+        'out': {'id': 'out', 'bl_idname': 'ShaderNodeOutputMaterial',
+                'props': {},
+                'inputs': [{'name': 'Surface', 'type': 'SHADER',
+                            'default': None, 'link': ['hal', 0]}],
+                'outputs': []}}}
+    matg = shade(ground_mode='MATERIAL', ground_graph=g,
+                 ground_fade=0.0)
+    hitrow = matg[np.abs(matg - 0.4).sum(axis=1) > 1e-4]
+    check('the MATERIAL ground wears the picked graph',
+          len(hitrow) > 0
+          and float(np.abs(hitrow
+                           - np.array([0.9, 0.3, 0.1])).max()) < 1e-3)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    psrc = open(os.path.join(root, 'properties.py'),
+                encoding='utf-8').read()
+    check('the Neon Grid enum entry is retired',
+          "'GRID', \"Neon Grid\"" not in psrc)
+    check('the ground panel finally shows the mode dials',
+          "'ground_grout'" in
+          open(os.path.join(root, 'ui.py'), encoding='utf-8').read())
+    xsrc = open(os.path.join(root, 'export.py'), encoding='utf-8').read()
+    check('the export serializes the picked ground material',
+          'ground_graph' in xsrc and 'ground_material' in xsrc)
+
+
+def test_lut_nodes_on_gpu():
+    """R206: 'Mountain': no GLSL emitter for ShaderNodeValToRGB -- the
+    ColorRamp (and its LUT-node family) knocked whole frames off the
+    GPU. All three are baked-LUT nodes on the CPU (the export samples
+    ramp and curves into 256-entry tables; lut_eval interpolates), so
+    the GLSL twins inline the same table and match table-exactly."""
+    import math as _m
+
+    def sk(nm, t, d, l=None):
+        return {'name': nm, 'type': t, 'default': d, 'link': l}
+
+    OUTS = [{'name': 'Altitude', 'type': 'VALUE'},
+            {'name': 'Factor', 'type': 'VALUE'},
+            {'name': 'Slope', 'type': 'VALUE'},
+            {'name': 'Orientation', 'type': 'VALUE'}]
+    alt = {'id': 'alt', 'bl_idname': 'HALCYON_AltitudeSlopeNode',
+           'props': {},
+           'inputs': [sk('Minimum', 'VALUE', -1.0),
+                      sk('Maximum', 'VALUE', 2.0),
+                      sk('Noise', 'VALUE', 0.3),
+                      sk('Noise Scale', 'VALUE', 3.0)],
+           'outputs': OUTS}
+    lut = [[0.5 + 0.5 * _m.sin(i / 40.0),
+            0.5 + 0.5 * _m.sin(i / 25.0 + 2.0),
+            0.5 + 0.5 * _m.cos(i / 33.0),
+            0.2 + 0.8 * (i / 255.0)] for i in range(256)]
+    ramp = {'id': 'ramp', 'bl_idname': 'ShaderNodeValToRGB',
+            'props': {'lut': lut},
+            'inputs': [sk('Fac', 'VALUE', 0.5, ['alt', 1])],
+            'outputs': [{'name': 'Color', 'type': 'RGBA'},
+                        {'name': 'Alpha', 'type': 'VALUE'}]}
+
+    # the field's Mountain shape: altitude factor graded by a ColorRamp
+    sc, st = _r202_graph_scene({'alt': alt, 'ramp': ramp}, ['ramp', 0])
+    _r202_gpu_parity(sc, st, 'ColorRamp over Altitude & Slope')
+    # its Alpha output too
+    sc, st = _r202_graph_scene({'alt': alt, 'ramp': ramp}, None,
+                               level_link=['ramp', 1])
+    _r202_gpu_parity(sc, st, 'the ColorRamp Alpha output')
+
+    flut = [0.5 - 0.5 * _m.cos(_m.pi * i / 255.0) for i in range(256)]
+    fc = {'id': 'fc', 'bl_idname': 'ShaderNodeFloatCurve',
+          'props': {'lut': flut},
+          'inputs': [sk('Factor', 'VALUE', 0.8),
+                     sk('Value', 'VALUE', 0.0, ['alt', 1])],
+          'outputs': [{'name': 'Value', 'type': 'VALUE'}]}
+    sc, st = _r202_graph_scene({'alt': alt, 'fc': fc}, None,
+                               level_link=['fc', 0])
+    _r202_gpu_parity(sc, st, 'Float Curve')
+
+    clut = [[min(1.0, (i / 255.0) ** 0.8), (i / 255.0) ** 1.5,
+             0.5 + 0.5 * _m.sin(i / 30.0), i / 255.0]
+            for i in range(256)]
+    rc = {'id': 'rc', 'bl_idname': 'ShaderNodeRGBCurve',
+          'props': {'lut': clut},
+          'inputs': [sk('Fac', 'VALUE', 0.9),
+                     sk('Color', 'RGBA', [1, 1, 1, 1], ['ramp', 0])],
+          'outputs': [{'name': 'Color', 'type': 'RGBA'}]}
+    sc, st = _r202_graph_scene({'alt': alt, 'ramp': ramp, 'rc': rc},
+                               ['rc', 0])
+    _r202_gpu_parity(sc, st, 'RGB Curve')
+
+    from ..gpu import emit as EM
+    for nm in ('ShaderNodeValToRGB', 'ShaderNodeFloatCurve',
+               'ShaderNodeRGBCurve'):
+        check(f'{nm} is a registered GLSL emitter', nm in EM.EMITTERS)
+
+
+def test_fog_camera_scale():
+    """R205: "The fog is not right." A camera under a scaled import rig
+    ($$$DUMMY parents) carried the scale in its matrix basis; the
+    picture composed identically but every camera-space DEPTH was
+    multiplied by the inverse scale, so fog (and clip, and DoF) read
+    wrong distances and the F12 frame drowned in fog colour while the
+    viewport -- whose camera-view matrix Blender keeps rigid -- looked
+    right. Camera object scale is stripped now, exactly as Blender's
+    own renderers do; rigid matrices pass through bitwise untouched."""
+    from ..core import mathx as MX
+    from ..core.scene import Light, Material
+    from .scenebuild import _mesh_concat, demo_scene, look_at_matrix
+    from .scenebuild import sphere as mk_sphere
+
+    def hills(n=40, size=400.0):
+        xs = np.linspace(-size / 2, size / 2, n).astype(np.float32)
+        ys = np.linspace(-20.0, size, n).astype(np.float32)
+        gx, gy = np.meshgrid(xs, ys)
+        h = (np.sin(gx * 0.05) * np.cos(gy * 0.04) * 3.0
+             + np.sin(gy * 0.02) * 4.0).astype(np.float32)
+        V = np.stack([gx, gy, h], -1).reshape(-1, 3)
+        idx = np.arange(n * n).reshape(n, n)
+        q = np.stack([idx[:-1, :-1], idx[1:, :-1], idx[1:, 1:],
+                      idx[:-1, 1:]], -1).reshape(-1, 4)
+        T = np.concatenate([q[:, [0, 1, 2]], q[:, [0, 2, 3]]]) \
+            .astype(np.int32)
+        N = np.tile(np.array([[0, 0, 1.0]], np.float32), (V.shape[0], 1))
+        return (V.astype(np.float32), N,
+                np.zeros((V.shape[0], 2), np.float32), T, 0, 0)
+
+    st = base_settings(160, 120)
+    st.fog = True
+    st.fog_mode = 'TABLE16'
+    st.fog_start = 62.76
+    st.fog_end = 174.25
+    st.fog_color = (0.82, 0.80, 0.76)
+    st.shadows = False
+    st.raytrace = False
+    sc = demo_scene(st, with_texture=False)
+    sc.mesh = _mesh_concat([hills(),
+                            mk_sphere(centre=(0.0, 100.0, 8.0),
+                                      radius=6.0, mat=1, obj=1)])
+    m0 = Material(name='grass', index=0)
+    m0.diffuse = (0.35, 0.55, 0.25)
+    m1 = Material(name='pag', index=1)
+    m1.diffuse = (0.6, 0.1, 0.1)
+    sc.materials = [m0, m1]
+    sc.lights = [Light(type='SUN', name='K', direction=(-0.4, 0.5, -0.7),
+                       color=(1, 1, 1), energy=3.5, shadow='NONE')]
+    w = sc.world
+    w.mode = 'GRADIENT'
+    w.horizon = (0.75, 0.74, 0.7)
+    w.zenith = (0.45, 0.5, 0.6)
+    w.ground_plane = False
+    M0 = look_at_matrix((0.0, -30.0, 10.0), (0.0, 100.0, 6.0))
+    sc.camera.clip_end = 500.0
+
+    sc.camera.matrix_world = M0
+    clean = np.asarray(R.render(sc, st))
+    # the fog behaves: the near ground is clear, the far sphere partial
+    im = np.clip(clean, 0, 1)[::-1, :, :3]
+    gnd = im[int(im.shape[0] * 0.96), im.shape[1] // 2]
+    check('near ground shows through the fog (green, not fog colour)',
+          gnd[1] > gnd[0] and gnd[1] > 0.4, str(gnd.round(3)))
+
+    # the field's camera: a 0.1-scaled parent baked into the basis
+    Ms = np.array(M0, np.float32).copy()
+    Ms[:3, :3] *= 0.1
+    sc.camera.matrix_world = Ms
+    check('a camera under a scaled rig renders bit for bit like the '
+          'clean camera', bool(np.array_equal(clean,
+                                              np.asarray(R.render(sc, st)))))
+    # non-uniform parent scale: still the same picture
+    Mn = np.array(M0, np.float32).copy()
+    Mn[:3, 0] *= 0.1
+    Mn[:3, 1] *= 3.0
+    Mn[:3, 2] *= 0.5
+    sc.camera.matrix_world = Mn
+    check('non-uniform parent scale renders bit for bit too',
+          bool(np.array_equal(clean, np.asarray(R.render(sc, st)))))
+
+    # the helper's contract
+    rm = MX.rigid_camera_matrix(M0)
+    check('a rigid camera matrix passes through bitwise untouched',
+          bool(np.array_equal(np.asarray(M0, np.float32), rm)))
+    neg = np.array(M0, np.float32).copy()
+    neg[:3, :3] *= -2.0
+    rn = MX.rigid_camera_matrix(neg)
+    check('a mirrored camera keeps its handedness',
+          float(np.sign(np.linalg.det(rn[:3, :3])))
+          == float(np.sign(np.linalg.det(neg[:3, :3]))))
+    cols = np.sqrt((rn[:3, :3] ** 2).sum(axis=0))
+    check('the stripped basis is unit length',
+          float(np.abs(cols - 1.0).max()) < 1e-5)
+
+    # the console names a fog-swallowed frame with its numbers
+    from ..core.raster import GBuffer, rasterize
+    view, proj, vp, eye = R.camera_matrices(sc.camera, 160, 120)
+    g = GBuffer(160, 120)
+    rasterize(sc.mesh.verts, sc.mesh.tris, vp, 160, 120, gbuf=g)
+    st_far = base_settings(160, 120)
+    st_far.fog = True
+    st_far.fog_mode = 'TABLE16'
+    st_far.fog_start = 1.0
+    st_far.fog_end = 3.0
+    note = R.fog_coverage_note(proj, g, st_far)
+    check('a frame past Fog End earns the console warning',
+          note is not None and 'PURE fog colour' in note, str(note)[:60])
+    check('an honest fog range stays silent',
+          R.fog_coverage_note(proj, g, st) is None)
+    # export-side: the scale strip is wired into the Blender export too
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    xsrc = open(os.path.join(root, 'export.py'), encoding='utf-8').read()
+    check('the export strips camera scale at the source',
+          'rigid_camera_matrix' in xsrc)
+
+
+def test_ground_lighting():
+    """R204: "If they have multiple colors, you can't change them" and
+    "The infinite floors don't react to lighting either." Every visible
+    tone has a dial now (snow glints, lava embers, dune crests), and the
+    plane answers the scene's lamps -- sun angle, lamp falloff, cast
+    shadows -- with Scene Lighting 0 restoring the old flat pixels bit
+    for bit."""
+    from ..core import sky as SKY
+    from ..core.scene import Light, Material, World
+    from .scenebuild import _mesh_concat, demo_scene, look_at_matrix
+    from .scenebuild import sphere as mk_sphere
+
+    dirs = []
+    for gx in np.linspace(-0.8, 0.8, 12):
+        for gy in (0.4, 0.7, 1.0):
+            d = np.array([gx, gy, -0.35], np.float32)
+            dirs.append(d / np.linalg.norm(d))
+    dirs = np.asarray(dirs, np.float32)
+    sky_col = np.full((len(dirs), 3), 0.4, np.float32)
+    eye = np.array([0.0, 0.0, 2.0], np.float32)
+
+    def shade(fn=None, _dirs=None, _sky=None, **kw):
+        w = World(ground_plane=True, **kw)
+        if fn is not None:
+            w._ground_light = fn
+        d = dirs if _dirs is None else _dirs
+        s = sky_col if _sky is None else _sky
+        return SKY.ground_plane(w, d, s.copy(), eye, time=0.5)
+
+    # snow glints and lava embers are SPARSE freckles -- a dial check
+    # needs enough rays on the floor to be sure of catching some
+    rng = np.random.default_rng(11)
+    wide = rng.normal(size=(4000, 3)).astype(np.float32)
+    wide /= np.linalg.norm(wide, axis=1, keepdims=True)
+    wide[:, 2] = -np.abs(wide[:, 2]) - 0.05
+    wide /= np.linalg.norm(wide, axis=1, keepdims=True)
+    wide_sky = np.full((len(wide), 3), 0.4, np.float32)
+
+    # ---- the new colour dials, neutral at their defaults
+    for mode, dial, dflt, turned in (
+            ('SNOW', 'ground_sparkle', 1.0, 0.0),
+            ('SNOW', 'ground_color3', (1.0, 1.0, 1.0), (1.0, 0.1, 0.1)),
+            ('LAVA', 'ground_color3', (1.0, 1.0, 1.0), (0.2, 0.4, 1.0)),
+            ('DESERT', 'ground_ridge', 0.6, 0.05)):
+        base = shade(ground_mode=mode, _dirs=wide, _sky=wide_sky)
+        check(f'{mode} {dial} at its default is the old picture bitwise',
+              bool(np.array_equal(base, shade(ground_mode=mode,
+                                              _dirs=wide, _sky=wide_sky,
+                                              **{dial: dflt}))))
+        check(f'{mode} {dial} changes the picture when turned',
+              not np.array_equal(base, shade(ground_mode=mode,
+                                             _dirs=wide, _sky=wide_sky,
+                                             **{dial: turned})))
+
+    # ---- Scene Lighting: 0 is the old flat road bitwise, even with a
+    # callback attached; without a callback nothing changes at any dial
+    lit_cb = (lambda p: np.full((p.shape[0], 3), 0.25, np.float32))
+    flat = shade(ground_mode='CHECKER')
+    check('no callback means the old picture at any Scene Lighting',
+          bool(np.array_equal(flat, shade(ground_mode='CHECKER',
+                                          ground_lighting=1.0))))
+    check('Scene Lighting 0 is the old picture even with lamps around',
+          bool(np.array_equal(flat, shade(fn=lit_cb, ground_mode='CHECKER',
+                                          ground_lighting=0.0))))
+    lit = shade(fn=lit_cb, ground_mode='CHECKER', ground_lighting=1.0)
+    check('the lit floor is a different floor',
+          not np.array_equal(flat, lit))
+    half = shade(fn=lit_cb, ground_mode='CHECKER', ground_lighting=0.5)
+    check('Scene Lighting blends between flat and lit',
+          not np.array_equal(half, flat) and not np.array_equal(half, lit))
+
+    # ---- self-luminous parts survive a pitch-black scene: lava heat
+    # and neon grout keep glowing where a plain floor goes out
+    dark = (lambda p: np.zeros((p.shape[0], 3), np.float32))
+    solid_dark = shade(fn=dark, ground_mode='SOLID', ground_fade=0.0,
+                       ground_lighting=1.0)
+    lava_dark = shade(fn=dark, ground_mode='LAVA', ground_fade=0.0,
+                      ground_lighting=1.0, ground_glow=2.0)
+    neon_dark = shade(fn=dark, ground_mode='TILES', ground_fade=0.0,
+                      ground_lighting=1.0, ground_grout=0.2,
+                      ground_grout_glow=1.6)
+    check('an unlit plain floor goes dark',
+          float(solid_dark.max()) < 1e-5)
+    check('lava keeps glowing in the dark (heat is emission)',
+          float(lava_dark.max()) > 0.05)
+    check('the neon grid keeps burning in the dark (glow past 1 is '
+          'emission)', float(neon_dark.max()) > 0.05)
+
+    # ---- the full pipeline: a sphere resting on the plane under a sun
+    def stage(lighting, sun_dir=(-0.5, 0.35, -0.75)):
+        st = base_settings(140, 104)
+        st.raytrace = True
+        st.shadows = True
+        st.ray_shadows = True
+        sc = demo_scene(st, with_texture=False)
+        sc.mesh = _mesh_concat([mk_sphere(centre=(0.0, 0.0, 1.0),
+                                          radius=1.0, mat=0, obj=0)])
+        sc.mesh.smooth = np.ones(sc.mesh.tris.shape[0], bool)
+        sc.materials = [Material(name='ball', index=0)]
+        sc.lights = [Light(type='SUN', name='Key', direction=sun_dir,
+                           color=(1.0, 0.98, 0.92), energy=5.0,
+                           shadow='RAY')]
+        w = sc.world
+        w.mode = 'GRADIENT'
+        w.ground_plane = True
+        w.ground_mode = 'SOLID'
+        w.ground_height = 0.0
+        w.ground_color = (0.5, 0.5, 0.45)
+        w.ground_fade = 0.0
+        w.ground_lighting = lighting
+        sc.camera.matrix_world = look_at_matrix((0.0, -3.4, 1.9),
+                                                (0.0, 0.0, 0.8))
+        return np.asarray(R.render(sc, st))[:, :, :3]
+
+    lit_a = stage(1.0)
+    check('the rendered floor is deterministic under lighting',
+          bool(np.array_equal(lit_a, stage(1.0))))
+    check('the sun''s angle finally moves the floor',
+          not np.array_equal(lit_a, stage(1.0, (0.55, -0.3, -0.3))))
+    check('Scene Lighting 0 turns the render back flat',
+          not np.array_equal(lit_a, stage(0.0)))
+    # the sphere's shadow: with the key sun from up-left-behind, the
+    # ground to the sphere's lower-left darkens against its mirror
+    h, wdt = lit_a.shape[:2]
+    left = float(lit_a[int(h * 0.82):, :int(wdt * 0.3)].mean())
+    right = float(lit_a[int(h * 0.82):, int(wdt * 0.7):].mean())
+    shadowed = min(left, right)
+    open_g = max(left, right)
+    check('the sphere finally casts a shadow on the infinite floor',
+          shadowed < open_g * 0.92, f'{shadowed:.4f} vs {open_g:.4f}')
+
+    # ---- the dials and the switch reached the UI and the props
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    ui_src = open(os.path.join(root, 'ui.py'), encoding='utf-8').read()
+    p_src = open(os.path.join(root, 'properties.py'),
+                 encoding='utf-8').read()
+    for nm in ('ground_lighting', 'ground_color3', 'ground_sparkle',
+               'ground_ridge'):
+        check(f'{nm} reached the world props', f'{nm}:' in p_src)
+        check(f'{nm} reached the ground panel', f"'{nm}'" in ui_src)
+
+
+def test_bryce_mat_parser():
+    """R203: the .mat crack -- the CCmF container parses, the rle2
+    preview codec decodes, and the recreated library ships named,
+    categorized and renderable."""
+    from .. import templates as T
+    from ..core import brycemat as BM
+
+    # a tiny synthetic rle2 stream: header + runs + literals,
+    # delta-coded planes -- round-trips through the decoder
+    plane_a = bytes([0]) * 9216
+    r = bytes([100]) * 9216
+    dg = bytes([10]) * 9216
+    db = bytes([246]) * 9216          # -10 mod 256
+    raw = plane_a + r + dg + db
+
+    def rle_pack(data):
+        out = bytearray()
+        i = 0
+        while i < len(data):
+            j = i
+            while j < len(data) and j - i < 127 and data[j] == data[i]:
+                j += 1
+            out += bytes([j - i, data[i]])
+            i = j
+        return bytes(out)
+
+    payload = b'rle2' + b'\x00' * 60 + rle_pack(raw)
+    rgb = BM.decode_preview(payload)
+    check('the rle2 decoder round-trips a synthetic preview',
+          rgb.shape == (96, 96, 3)
+          and abs(float(rgb[50, 50, 0]) - 100 / 255) < 1e-3
+          and abs(float(rgb[50, 50, 1]) - 110 / 255) < 1e-3
+          and abs(float(rgb[50, 50, 2]) - 100 / 255) < 1e-3)
+    a = BM.analyze_preview(rgb)
+    check('the analyzer measures the flat field sanely',
+          a is not None and abs(a['diffuse'][0] - 100 / 255) < 0.02)
+
+    b95 = [k for k in T.TEMPLATES if k.startswith('B95_')]
+    check('the recreated 1995 library ships in force', len(b95) >= 40,
+          str(len(b95)))
+    fam_of = {k: T.family_of(k) for k in b95}
+    check('every 1995 entry carries a real family',
+          all(f in dict(T.FAMILIES) for f in fam_of.values()))
+    for k in ('B95_POLISHED_GOLD', 'B95_POLISHED_SILVER',
+              'B95_STANDARD_GLASS', 'B95_WALNUT_WOOD',
+              'B95_MERCURY_SURFACE', 'B95_SUMMER_CLOUDS'):
+        check(f'{k} is on the shelf', k in T.TEMPLATES)
+    gold = T.TEMPLATES['B95_POLISHED_GOLD']['inputs']['Diffuse Color']
+    check('the parsed gold is warm (its own preview pixels say so)',
+          gold[0] > gold[2] + 0.2)
+    check('the parser module is in the shipped core',
+          hasattr(BM, 'parse_mat') and hasattr(BM, '_rle2'))
+
+    # ---- R204: the material-record decoder, against synthetic blobs
+    # built to the cracked layout (colours f32 LE at 300/356/412/468/
+    # 524, scalars at 580..884, 'brtx' magic 28 bytes before a
+    # textured slot). The layout itself was pinned against the 1995
+    # manual text; this pins the DECODER against the layout.
+    import struct as _st
+
+    def mat_blob(end='<', tex_slots=()):
+        b = bytearray(976)
+        vals = {300: (0.5, 0.25, 0.125), 356: (1.0, 0.5, 0.0),
+                412: (1.0, 1.0, 1.0), 468: (0.047, 0.047, 0.047),
+                524: (0.9, 0.8, 0.7), 872: (0.1, 0.2, 0.3)}
+        for off, c in vals.items():
+            b[off:off + 12] = _st.pack(end + '3f', *c)
+        for off, v in ((580, 0.784), (620, 0.196), (660, 0.674),
+                       (700, 0.937), (740, 0.27), (780, 0.31),
+                       (820, 1.0), (860, 0.5), (884, 1.52)):
+            b[off:off + 4] = _st.pack(end + 'f', v)
+        for off in tex_slots:
+            b[off - 28:off - 24] = b'xtrb'
+        return bytes(b)
+
+    m = BM.decode_material(mat_blob('<', tex_slots=(300, 780)))
+    check('the decoder reads every channel colour',
+          abs(m['diffuse_color'][0] - 0.5) < 1e-6
+          and abs(m['ambient_color'][1] - 0.5) < 1e-6
+          and abs(m['specular_coef'][0] - 0.047) < 1e-6)
+    check('the decoder reads every channel level',
+          abs(m['diffuse'] - 0.784) < 1e-6
+          and abs(m['transparency'] - 0.937) < 1e-6
+          and abs(m['reflection'] - 0.27) < 1e-6
+          and abs(m['bump'] - 0.31) < 1e-6)
+    check('the refractive index and the metallic flag decode',
+          abs(m['ior'] - 1.52) < 1e-5 and m['metallic'] == 1.0)
+    check('the brtx magic marks the textured channels',
+          m['textured'] == {'diffuse_color', 'bump'})
+    mb = BM.decode_material(mat_blob('>'))
+    check('a 68k save (big-endian floats) decodes identically',
+          abs(mb['diffuse_color'][0] - 0.5) < 1e-6
+          and abs(mb['ior'] - 1.52) < 1e-5 and mb['endian'] == '>')
+
+    def tex_blob(end='<'):
+        b = bytearray(1588)
+        b[8:15] = b'woodA19'
+        b[276:300] = _st.pack(end + '3d', 0.8, 0.8, 0.8)
+        for base in (500, 596):
+            b[base + 36:base + 48] = _st.pack(end + '3i', 17, 17, 17)
+            b[base + 56:base + 64] = _st.pack(end + '2f', 0.86, -0.18)
+            b[base + 64:base + 68] = _st.pack(end + 'i', 6)
+            b[base + 84:base + 88] = _st.pack(end + 'i', 3)
+            for k, (r, g, bl) in enumerate(((255, 198, 127),
+                                            (152, 82, 53),
+                                            (99, 0, 0))):
+                q = bytes((bl, g, r, 0)) if end == '<' else \
+                    bytes((0, r, g, bl))
+                b[base + 72 + 4 * k:base + 76 + 4 * k] = q
+        b[680:688] = _st.pack(end + 'd', 45.0)
+        return bytes(b)
+
+    for e_ in ('<', '>'):
+        t = BM.decode_texture(tex_blob(e_))
+        c0 = t['components'][0]
+        check(f'the texture record decodes ({e_!r} save): name, freq, '
+              'octaves, palette, rotation',
+              t['name'] == 'woodA19' and c0['freq'] == (17, 17, 17)
+              and c0['octaves'] == 6
+              and abs(c0['colors'][0][0] - 1.0) < 1e-3
+              and abs(c0['colors'][1][0] - 152 / 255) < 1e-3
+              and abs(t['rotation'] - 45.0) < 1e-9)
+
+    # the shelf now carries the decoded values, not estimates: the
+    # glass ladder's refractive indices are the 1995 numbers
+    for key, ior in (('B95_LIGHT_GLASS', 1.12),
+                     ('B95_STANDARD_GLASS', 1.52),
+                     ('B95_HEAVY_GLASS', 1.68),
+                     ('B95_CRYSTAL', 1.88), ('B95_DIAMOND', 2.55)):
+        got = T.TEMPLATES[key]['inputs'].get('IOR')
+        check(f'{key} refracts at its stored 1995 index',
+              got is not None and abs(got - ior) < 1e-3, str(got))
+    kr = T.TEMPLATES['B95_KRYPTONITE']
+    check('Kryptonite is its decoded ReptilianStone self: crackle '
+          'scales in the stored green',
+          any(t['node'] == 'HALCYON_CrackleNode'
+              for t in kr.get('textures', ()))
+          and any(t['inputs'].get('Color 1', (0, 0, 0, 0))[1] > 0.3
+                  for t in kr.get('textures', ())))
+    check('the full parse entry point ships',
+          hasattr(BM, 'parse_mat_full')
+          and hasattr(BM, 'decode_material')
+          and hasattr(BM, 'decode_texture'))

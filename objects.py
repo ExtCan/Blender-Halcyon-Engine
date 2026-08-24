@@ -296,6 +296,201 @@ class HALCYON_OT_add_checker_plane(_AddBase):
         return {'FINISHED'}
 
 
+# ----------------------------------------------------------- the terrain
+
+
+def _terrain_material(name, height):
+    """R201: the Bryce terrain material, wired to Altitude & Slope.
+
+    The node shipped in an earlier round with nothing to stand on; the
+    Terrain operator is what it was built to paint. Factor (height,
+    normalised 0..Maximum) drives a colour ramp -- shore grass up
+    through rock to snow -- and Slope pulls steep faces toward bare
+    rock through a Mix, so cliffs stay stone whatever their altitude.
+    All standard nodes plus the two Halcyon ones, fully editable
+    afterwards, and the whole chain evaluates identically on the CPU
+    and the GPU simulator (both roads already speak every node here).
+    """
+    mat = bpy.data.materials.new(name)
+    from . import compat
+    compat.enable_nodes(mat)
+    tree = mat.node_tree
+    tree.nodes.clear()
+    out = tree.nodes.new('ShaderNodeOutputMaterial')
+    out.location = (720, 0)
+    try:
+        shader = tree.nodes.new('HALCYON_ShaderNode')
+        alt = tree.nodes.new('HALCYON_AltitudeSlopeNode')
+    except RuntimeError:
+        # engine nodes unregistered -- a plain matte stand-in so the
+        # operator still delivers a mountain rather than an error
+        shader = tree.nodes.new('ShaderNodeBsdfDiffuse')
+        shader.inputs['Color'].default_value = (0.35, 0.32, 0.28, 1.0)
+        tree.links.new(shader.outputs[0], out.inputs['Surface'])
+        mat.diffuse_color = (0.35, 0.32, 0.28, 1.0)
+        return mat
+    shader.location = (480, 0)
+    shader.model = 'LAMBERT'
+    alt.location = (-260, 0)
+    for nm, val in (('Minimum', 0.0), ('Maximum', float(height))):
+        s = alt.inputs.get(nm)
+        if s is not None:
+            s.default_value = val
+    ramp = tree.nodes.new('ShaderNodeValToRGB')
+    ramp.location = (0, 120)
+    cr = ramp.color_ramp
+    # four stops: shore grass, dry scrub, bare rock, snowcap
+    stops = ((0.0, (0.20, 0.28, 0.12, 1.0)),
+             (0.35, (0.36, 0.30, 0.20, 1.0)),
+             (0.62, (0.38, 0.36, 0.34, 1.0)),
+             (0.85, (0.92, 0.94, 0.97, 1.0)))
+    while len(cr.elements) > 1:
+        cr.elements.remove(cr.elements[-1])
+    cr.elements[0].position = stops[0][0]
+    cr.elements[0].color = stops[0][1]
+    for pos, col in stops[1:]:
+        el = cr.elements.new(pos)
+        el.color = col
+    mix = tree.nodes.new('ShaderNodeMix')
+    mix.location = (260, 40)
+    try:
+        mix.data_type = 'RGBA'
+        mix.clamp_factor = True
+    except AttributeError:
+        pass
+
+    def _mix_in(nm, ty):
+        for s in mix.inputs:
+            if s.name == nm and (ty is None or s.type == ty):
+                return s
+        return None
+
+    rock = _mix_in('B', 'RGBA')
+    if rock is not None:
+        rock.default_value = (0.33, 0.31, 0.30, 1.0)
+    tree.links.new(alt.outputs['Factor'], ramp.inputs['Fac'])
+    a_in = _mix_in('A', 'RGBA')
+    if a_in is not None:
+        tree.links.new(ramp.outputs['Color'], a_in)
+    f_in = _mix_in('Factor', 'VALUE')
+    if f_in is not None:
+        tree.links.new(alt.outputs['Slope'], f_in)
+    dc = shader.inputs.get('Diffuse Color')
+    if dc is not None:
+        res = None
+        for s in mix.outputs:
+            if s.name == 'Result' and s.type == 'RGBA':
+                res = s
+                break
+        tree.links.new(res if res is not None
+                       else mix.outputs[0], dc)
+    sl = shader.inputs.get('Specular Level')
+    if sl is not None and hasattr(sl, 'default_value'):
+        sl.default_value = 0.05
+    shader.refresh_sockets()
+    tree.links.new(shader.outputs['Surface'], out.inputs['Surface'])
+    mat.diffuse_color = (0.38, 0.36, 0.34, 1.0)
+    return mat
+
+
+class HALCYON_OT_add_terrain(_AddBase):
+    """A fractal mountain with the Bryce material already on it --
+    altitude bands from shore to snow, steep faces pulled to rock"""
+
+    bl_idname = 'halcyon.add_terrain'
+    bl_label = "Terrain"
+
+    kind: EnumProperty(
+        name="Type", default='MOUNTAIN',
+        description="The landform this terrain grows into; every type "
+                    "still takes the island, terrace and sea dials",
+        items=[
+            ('MOUNTAIN', "Mountain",
+             "The fractal peak -- rolling fBm blended toward ridged "
+             "crests by the Ridged dial"),
+            ('HILLS', "Rolling Hills",
+             "Soft pastureland, no crests at all"),
+            ('CANYON', "Canyon",
+             "A high mesa with winding channels carved out of it"),
+            ('DUNES', "Dunes",
+             "Directional sand waves; the Direction dial turns the "
+             "wind that laid them"),
+            ('CRATER', "Crater",
+             "One great ringed impact: raised rim, sunken floor"),
+            ('VOLCANO', "Volcano",
+             "The cone with its caldera bitten out of the top"),
+            ('PLATEAU', "Plateau",
+             "Hard-shouldered table-land, flat on top"),
+        ])
+    direction: FloatProperty(
+        name="Direction", default=0.0, min=-6.2832, max=6.2832,
+        subtype='ANGLE',
+        description="Turns the Dunes' wind (and is free for any kind "
+                    "that later wants a bearing)")
+    size: FloatProperty(
+        name="Size", default=24.0, min=0.1, max=10000.0,
+        description="Width of the terrain grid in scene units")
+    divisions: IntProperty(
+        name="Divisions", default=96, min=2, max=512,
+        description="Grid squares along each side; 96 is a Bryce-era "
+                    "mountain, 256 a modern one")
+    height: FloatProperty(
+        name="Height", default=6.0, min=0.0, max=1000.0,
+        description="Peak altitude of the fractal at full strength")
+    feature_scale: FloatProperty(
+        name="Feature Scale", default=10.0, min=0.1, max=1000.0,
+        description="Metres per large noise feature -- bigger numbers "
+                    "mean broader, calmer mountains")
+    octaves: IntProperty(
+        name="Detail", default=6, min=1, max=12,
+        description="Fractal detail levels; each adds finer bumps at "
+                    "half the strength set by Roughness")
+    roughness: FloatProperty(
+        name="Roughness", default=0.5, min=0.05, max=0.95,
+        description="How much each finer detail level contributes -- "
+                    "low is rolling hills, high is crumpled rock")
+    ridge: FloatProperty(
+        name="Ridged", default=0.5, min=0.0, max=1.0,
+        description="Blend from smooth rolling fBm (0) to the "
+                    "knife-edged ridged crests Bryce is remembered "
+                    "for (1)")
+    island: FloatProperty(
+        name="Island Falloff", default=0.4, min=0.0, max=1.0,
+        description="Fades the height to zero toward the grid edge so "
+                    "the mountain ends inside the grid instead of "
+                    "slicing off at the boundary; 0 disables")
+    terraces: IntProperty(
+        name="Terraces", default=0, min=0, max=64,
+        description="Above zero, quantises the height into this many "
+                    "shelves with smoothed risers -- Bryce's "
+                    "terracing; 0 is off")
+    sea_level: FloatProperty(
+        name="Sea Level", default=0.0, min=0.0, max=0.95,
+        description="Flattens everything below this fraction of the "
+                    "height into a floor -- the water table an ocean "
+                    "plane sits on; 0 is off")
+    seed: IntProperty(
+        name="Seed", default=0, min=0, max=100000,
+        description="Re-deals the mountain; the same seed builds the "
+                    "same mountain on every machine")
+    smooth: BoolProperty(
+        name="Smooth Shading", default=True,
+        description="Smooth-shade the grid so slopes grade instead of "
+                    "facet; turn off for the flat-shaded early look")
+
+    def execute(self, context):
+        verts, faces = GEO.terrain(
+            self.size, self.divisions, self.height, self.feature_scale,
+            self.octaves, self.roughness, self.ridge, self.island,
+            self.terraces, self.sea_level, self.seed,
+            kind=self.kind, direction=self.direction)
+        label = self.kind.title().replace('_', ' ')
+        mat = _terrain_material(label, max(float(self.height), 1e-3))
+        _new_object(context, label, verts, faces, (mat,),
+                    smooth=self.smooth)
+        return {'FINISHED'}
+
+
 # -------------------------------------------------------------- the menu
 
 
@@ -311,6 +506,9 @@ class VIEW3D_MT_halcyon_add(Menu):
         layout.operator(HALCYON_OT_add_cornell_box.bl_idname, icon='MESH_CUBE')
         layout.operator(HALCYON_OT_add_checker_plane.bl_idname,
                         icon='MESH_GRID')
+        layout.separator()
+        layout.operator(HALCYON_OT_add_terrain.bl_idname,
+                        icon='RNDCURVE')
 
 
 def draw_add_menu(self, context):
@@ -322,7 +520,7 @@ def draw_add_menu(self, context):
 
 CLASSES = (HALCYON_OT_add_teapot, HALCYON_OT_add_teaset,
            HALCYON_OT_add_cornell_box, HALCYON_OT_add_checker_plane,
-           VIEW3D_MT_halcyon_add)
+           HALCYON_OT_add_terrain, VIEW3D_MT_halcyon_add)
 
 
 def register():

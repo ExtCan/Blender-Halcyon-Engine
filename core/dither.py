@@ -217,7 +217,15 @@ def error_diffusion_wavefront(img, palette, kind='FLOYD', strength=1.0, icm=None
     nmax = n - 1
 
     for x, y in _wavefronts(w, h, b):
-        c = buf[y, x]
+        # R202: the working value is CLAMPED before quantising and
+        # before the error -- diffusion against a palette that cannot
+        # reach a hue (a sunset table under a blue sky) used to let
+        # the un-representable error accumulate along the scan into
+        # smears that erased the picture. Bounded error per pixel is
+        # what the era's converters did, and it caps the artefact at
+        # ordinary dither texture. Kept bit-identical to the
+        # sequential road below, which clamps the same way.
+        c = np.clip(buf[y, x], 0.0, 1.0)
         q = np.clip(c * n, 0, nmax).astype(np.int32)
         k = lut[(q[:, 0] << (2 * bits)) | (q[:, 1] << bits) | q[:, 2]]
         idx_map[y, x] = k
@@ -282,9 +290,23 @@ def error_diffusion(img, palette, kind='FLOYD', strength=1.0, serpentine=True,
             flip = 1
         for x in xs:
             o = base + x * 3
+            # R202: clamp before quantise AND before the error (the
+            # wavefront twin does the same) -- see the note there
             r = flat[o]
             g = flat[o + 1]
             b = flat[o + 2]
+            if r < 0.0:
+                r = 0.0
+            elif r > 1.0:
+                r = 1.0
+            if g < 0.0:
+                g = 0.0
+            elif g > 1.0:
+                g = 1.0
+            if b < 0.0:
+                b = 0.0
+            elif b > 1.0:
+                b = 1.0
 
             ri = int(r * n)
             gi = int(g * n)

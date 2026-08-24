@@ -81,7 +81,7 @@ DEFAULT_REACH = 64.0
 
 
 def spot_cone(origin, rays, depth, light, samples=12, density=1.0,
-              falloff=2.0, edge=None, max_distance=0.0):
+              falloff=2.0, edge=None, max_distance=0.0, occlude=None):
     """Scattered light along each view ray for one spot light.
 
     `origin` is (1,3) or (N,3), `rays` are unit view directions (N,3), `depth`
@@ -140,8 +140,162 @@ def spot_cone(origin, rays, depth, light, samples=12, density=1.0,
         ang = ang * ang * (3.0 - 2.0 * ang)
 
         atten = 1.0 / np.maximum(np.power(dist, falloff), EPS)
-        total += np.where(live, ang * atten, 0.0).astype(np.float32)
+        contrib = np.where(live, ang * atten, 0.0)
+        if occlude is not None:
+            # beam shadowing: a sample the lamp cannot reach scatters
+            # nothing -- the option that makes the beam STOP at a mesh
+            contrib = np.where(occlude(p, live & (contrib > 0.0)),
+                               0.0, contrib)
+        total += contrib.astype(np.float32)
 
+    return (total * (span / steps) * density * np.where(live, 1.0, 0.0)
+            ).astype(np.float32)
+
+
+def point_glow(origin, rays, depth, light, samples=12, density=1.0,
+               falloff=2.0, max_distance=0.0, occlude=None):
+    """Scattered light around a POINT lamp: the omni volume glow.
+
+    The beam region is a sphere: `max_distance` bounds it (a light's
+    Custom Range end narrows it further at the caller), the view ray's
+    segment inside it is found analytically, and the same midpoint march
+    the spot cone uses integrates 1/d^falloff with a smooth fade to the
+    sphere's edge so the boundary never draws itself.
+    """
+    n = rays.shape[0]
+    centre = np.asarray(light.position, np.float32)
+    R = max_distance if max_distance > 0.0 else DEFAULT_REACH
+    if origin.ndim == 1:
+        origin = origin[None, :]
+    if origin.shape[0] == 1:
+        origin = np.repeat(origin, n, axis=0)
+
+    oc = origin - centre[None, :]
+    b = np.einsum('ij,ij->i', rays, oc)
+    c0 = np.einsum('ij,ij->i', oc, oc) - R * R
+    disc = b * b - c0
+    hit = disc > 0.0
+    sq = np.sqrt(np.maximum(disc, 0.0))
+    t0 = np.maximum(-b - sq, 0.0)
+    t1 = -b + sq
+    limit = np.where(np.isfinite(depth), depth, t1)
+    t1 = np.minimum(t1, limit)
+    span = np.where(hit, t1 - t0, 0.0)
+    span = np.nan_to_num(span, nan=0.0, posinf=0.0, neginf=0.0)
+    live = hit & (span > EPS)
+    if not live.any():
+        return np.zeros(n, np.float32)
+
+    steps = max(int(samples), 1)
+    offsets = (np.arange(steps, dtype=np.float32) + 0.5) / steps
+    total = np.zeros(n, np.float32)
+    for off in offsets:
+        t = t0 + span * off
+        p = origin + rays * t[:, None]
+        d = p - centre[None, :]
+        dist = np.sqrt(np.maximum(np.einsum('ij,ij->i', d, d), EPS))
+        fade = np.clip(1.0 - (dist / R) * (dist / R), 0.0, 1.0)
+        atten = fade / np.maximum(np.power(dist, falloff), EPS)
+        contrib = np.where(live, atten, 0.0)
+        if occlude is not None:
+            contrib = np.where(occlude(p, live & (contrib > 0.0)),
+                               0.0, contrib)
+        total += contrib.astype(np.float32)
+    return (total * (span / steps) * density * np.where(live, 1.0, 0.0)
+            ).astype(np.float32)
+
+
+def area_beam(origin, rays, depth, light, samples=12, density=1.0,
+              falloff=2.0, max_distance=0.0, occlude=None):
+    """Scattered light in front of an AREA lamp: a soft-edged slab beam.
+
+    The beam is the lamp's rectangle (or ellipse) swept along its
+    facing direction -- an open box, intersected as three slab pairs in
+    the lamp's own frame, marched like the cone. The cross-section
+    fades over a margin proportional to the lamp's size, so the beam
+    reads as light, not as geometry; falloff runs on the distance
+    travelled from the panel.
+    """
+    n = rays.shape[0]
+    pos = np.asarray(light.position, np.float32)
+    f = M.normalize(np.asarray(light.direction, np.float32)[None, :])[0]
+    ax = np.asarray(getattr(light, 'area_x', (1, 0, 0)), np.float32)
+    ax = ax / max(float(np.linalg.norm(ax)), 1e-9)
+    ay = np.asarray(getattr(light, 'area_y', (0, 1, 0)), np.float32)
+    ay = ay / max(float(np.linalg.norm(ay)), 1e-9)
+    asz = getattr(light, 'area_size', (1.0, 1.0))
+    hx = max(float(asz[0]) * 0.5, 1e-4)
+    hy = max(float(asz[1]) * 0.5, 1e-4)
+    margin = 0.35 * max(hx, hy)
+    reach = max_distance if max_distance > 0.0 else DEFAULT_REACH
+    disk = str(getattr(light, 'area_shape', 'SQUARE')) in ('DISK', 'ELLIPSE')
+
+    if origin.ndim == 1:
+        origin = origin[None, :]
+    if origin.shape[0] == 1:
+        origin = np.repeat(origin, n, axis=0)
+
+    # ray in the lamp frame
+    q = origin - pos[None, :]
+    qu = q @ ax
+    qv = q @ ay
+    qz = q @ f
+    du = rays @ ax
+    dv = rays @ ay
+    dz = rays @ f
+
+    def _slab(o, d, lo, hi):
+        safe = np.where(np.abs(d) < 1e-9, 1e-9, d)
+        ta = (lo - o) / safe
+        tb = (hi - o) / safe
+        t_in = np.minimum(ta, tb)
+        t_out = np.maximum(ta, tb)
+        flat = np.abs(d) < 1e-9
+        inside = (o >= lo) & (o <= hi)
+        t_in = np.where(flat, np.where(inside, -np.inf, np.inf), t_in)
+        t_out = np.where(flat, np.where(inside, np.inf, -np.inf), t_out)
+        return t_in, t_out
+
+    ui, uo = _slab(qu, du, -(hx + margin), hx + margin)
+    vi, vo = _slab(qv, dv, -(hy + margin), hy + margin)
+    zi, zo = _slab(qz, dz, 0.0, reach)
+    t0 = np.maximum(np.maximum(ui, vi), np.maximum(zi, 0.0))
+    t1 = np.minimum(np.minimum(uo, vo), zo)
+    limit = np.where(np.isfinite(depth), depth, reach * 4.0)
+    t1 = np.minimum(t1, limit)
+    span = t1 - t0
+    span = np.nan_to_num(span, nan=0.0, posinf=0.0, neginf=0.0)
+    live = span > EPS
+    if not live.any():
+        return np.zeros(n, np.float32)
+
+    steps = max(int(samples), 1)
+    offsets = (np.arange(steps, dtype=np.float32) + 0.5) / steps
+    total = np.zeros(n, np.float32)
+    for off in offsets:
+        t = t0 + span * off
+        u = qu + du * t
+        v = qv + dv * t
+        z = qz + dz * t
+        if disk:
+            e = np.sqrt(np.maximum((u / hx) ** 2 + (v / hy) ** 2, EPS))
+            lat = np.clip((1.0 + margin / max(hx, hy) - e)
+                          / max(margin / max(hx, hy), 1e-6), 0.0, 1.0)
+        else:
+            eu = np.clip(1.0 - (np.abs(u) - hx) / margin, 0.0, 1.0)
+            ev = np.clip(1.0 - (np.abs(v) - hy) / margin, 0.0, 1.0)
+            lat = np.minimum(eu, ev)
+        lat = lat * lat * (3.0 - 2.0 * lat)
+        fwd = np.clip(z / max(reach * 0.05, 1e-6), 0.0, 1.0)   # soft start
+        atten = 1.0 / np.maximum(np.power(np.maximum(z, EPS), falloff), EPS)
+        end_fade = np.clip(1.0 - (z / reach) * (z / reach), 0.0, 1.0)
+        contrib = np.where(live & (z > 0.0),
+                           lat * fwd * end_fade * atten, 0.0)
+        if occlude is not None:
+            p = origin + rays * t[:, None]
+            contrib = np.where(occlude(p, live & (contrib > 0.0)),
+                               0.0, contrib)
+        total += contrib.astype(np.float32)
     return (total * (span / steps) * density * np.where(live, 1.0, 0.0)
             ).astype(np.float32)
 

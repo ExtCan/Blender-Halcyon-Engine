@@ -28,6 +28,28 @@ from . import fakebpy
 # --------------------------------------------------------------- properties
 
 
+class _LiveGroup(types.SimpleNamespace):
+    """A PropertyGroup instance with Blender's is_property_set semantics.
+
+    Blender keeps a per-property "has been written" flag: defaults are
+    NOT set, values assigned by a user (or a script) ARE. The exporter
+    leans on that for the follow-the-line-colour fallbacks, so the
+    stand-in tracks assignments the same way -- live()'s default fill
+    doesn't count, overrides and later assignments do."""
+
+    def __init__(self):
+        object.__setattr__(self, '_set_names', set())
+        object.__setattr__(self, '_track', False)
+
+    def __setattr__(self, k, v):
+        object.__setattr__(self, k, v)
+        if self._track and not k.startswith('_'):
+            self._set_names.add(k)
+
+    def is_property_set(self, k):
+        return k in self._set_names
+
+
 def live(cls, **overrides):
     """An instance of a registered PropertyGroup with its defaults filled in.
 
@@ -36,7 +58,7 @@ def live(cls, **overrides):
     setting could ever have been tested -- which is exactly the layer the bugs
     were in.
     """
-    obj = types.SimpleNamespace()
+    obj = _LiveGroup()
     for name, prop in getattr(cls, '__annotations__', {}).items():
         kw = getattr(prop, 'kw', {})
         default = kw.get('default')
@@ -46,6 +68,7 @@ def live(cls, **overrides):
         if default is None and getattr(prop, 'kind', '') == 'PointerProperty':
             default = None
         setattr(obj, name, default)
+    object.__setattr__(obj, '_track', True)
     for k, v in overrides.items():
         setattr(obj, k, v)
     # the methods the add-on calls on the group, bound to this stand-in

@@ -488,3 +488,194 @@ def is_manifoldish(verts, faces):
     if bad:
         return False, f'{len(bad)} edge(s) shared by more than two faces'
     return True, f'{len(verts)} verts, {len(faces)} faces'
+
+
+# ------------------------------------------------------------ the terrain
+
+
+def terrain(size=24.0, divisions=96, height=6.0, feature_scale=10.0,
+            octaves=6, roughness=0.5, ridge=0.5, island=0.4,
+            terraces=0, sea_level=0.0, seed=0, kind='MOUNTAIN',
+            direction=0.0):
+    """R201: the Bryce mountain -- a fractal heightfield as a grid mesh.
+
+    The Altitude & Slope node shipped with nothing to stand on: this is
+    the terrain that node was built to paint. A (divisions+1)^2 vertex
+    grid, displaced by a blend of smooth fBm (rolling hills) and RIDGED
+    fractal (the knife-edged crests Bryce terrains are remembered for),
+    with the shaping dials the Terrain Editor had:
+
+    - `feature_scale`: metres per large noise feature -- bigger numbers
+      mean broader mountains.
+    - `octaves` / `roughness`: detail levels and how much each level
+      contributes (fBm gain).
+    - `ridge`: 0 is all rolling fBm, 1 is all ridged crest.
+    - `island`: fades the height to zero toward the grid's edge with a
+      smoothstep ring -- a mountain that ENDS inside the grid instead
+      of slicing off at the boundary. 0 disables.
+    - `terraces`: N > 0 quantises the height into N shelves with a
+      smoothed riser between them -- Bryce's terracing.
+    - `sea_level`: fraction of the height range flattened into a floor
+      -- the water table the ocean plane sits on.
+    - `seed`: re-deals the mountain; the same seed is the same mountain
+      on every machine (hash-lattice noise, no RNG state anywhere).
+    - `kind` (R202): the terrain TYPE. MOUNTAIN is the R201 fractal
+      exactly; HILLS is soft pasture; CANYON a cut mesa; DUNES
+      directional sand waves (turned by `direction`, radians); CRATER
+      one great ringed impact; VOLCANO a cone with its caldera bitten
+      out; PLATEAU hard-shouldered table-land. Island, terracing and
+      sea level compose with every kind.
+
+    Returns (verts, faces) as plain lists: quads, counter-clockwise
+    seen from above, ready for `validate` and `from_pydata`.
+    """
+    import numpy as np
+
+    from . import patterns as PT
+
+    divisions = max(int(divisions), 2)
+    n1 = divisions + 1
+    size = float(size)
+    height = float(height)
+    fs = max(float(feature_scale), 1e-3)
+    step = size / divisions
+    half = size * 0.5
+
+    cc = np.arange(n1, dtype=np.float32) * step - half
+    gx, gy = np.meshgrid(cc, cc, indexing='xy')
+    xs = gx.ravel()
+    ys = gy.ravel()
+
+    # the seed walks the noise DOMAIN: two Wang-hashed offsets plus a
+    # third-axis shelf, so seeds are uncorrelated, not slid copies
+    from .patterns import _wang01p
+    s = np.uint32(int(seed) & 0xFFFFFFFF)
+    ox = float(_wang01p(np.array([s ^ np.uint32(0x2545F491)],
+                                 np.uint32))[0]) * 512.0
+    oy = float(_wang01p(np.array([s ^ np.uint32(0x9E3779B9)],
+                                 np.uint32))[0]) * 512.0
+    oz = float(int(seed) % 97) * 7.13
+    p = np.stack([xs / fs + ox, ys / fs + oy,
+                  np.full_like(xs, oz)], axis=1).astype(np.float32)
+
+    octs = max(int(octaves), 1)
+    gain = min(max(float(roughness), 0.05), 0.95)
+    rg = min(max(float(ridge), 0.0), 1.0)
+    kind = str(kind or 'MOUNTAIN').upper()
+
+    def _smooth(t):
+        t = np.clip(t, 0.0, 1.0)
+        return t * t * (3.0 - 2.0 * t)
+
+    if kind == 'HILLS':
+        # R202: pure rolling fBm, softened once more -- pastureland
+        h = _smooth(PT.fbm(p, octaves=octs, gain=gain))
+    elif kind == 'CANYON':
+        # a high mesa with winding cuts carved OUT of it: the ridged
+        # fractal's crest lines widened into channels, strata texture
+        # over the tops and sharper walls down the cuts
+        mesa = (0.55 + 0.45 * _smooth(
+            PT.fbm(p * 0.5 + 3.7, octaves=max(octs - 2, 1),
+                   gain=gain))) \
+            * (0.92 + 0.16 * (PT.fbm(p * 3.1 + 17.9, octaves=octs,
+                                     gain=gain) - 0.5))
+        r = PT.ridged(p, octaves=octs, gain=gain)
+        cut = _smooth((r - 0.58) / 0.16)
+        wash = (PT.fbm(p * 2.2 + 71.3, octaves=octs, gain=gain)
+                - 0.5) * 0.08
+        h = np.clip(mesa * (1.0 - 0.9 * cut) + wash * cut, 0.0, None)
+    elif kind == 'DUNES':
+        # directional sand waves: a triangle wave across the wind
+        # axis, its crests wobbled and its amplitude breathing with
+        # low-frequency noise. `direction` turns the wind
+        ca, sa = float(np.cos(direction)), float(np.sin(direction))
+        along = (xs * ca + ys * sa) / fs
+        wob = (PT.fbm(p * 0.7 + 11.3, octaves=max(octs - 2, 1),
+                      gain=gain) - 0.5) * 2.2
+        tphase = np.mod(along * 1.5 + wob, 1.0)
+        tri = 1.0 - np.abs(2.0 * tphase - 1.0)
+        env = 0.35 + 0.65 * PT.fbm(p * 0.35 + 27.1,
+                                   octaves=max(octs - 3, 1), gain=gain)
+        ripple = (PT.fbm(p * 4.0 + 43.9, octaves=max(octs - 3, 1),
+                         gain=gain) - 0.5) * 0.06
+        h = np.power(tri, 1.5) * env * 0.75 + ripple
+    elif kind == 'CRATER':
+        # one great ring -- but a REAL one: the rim radius wanders
+        # with angle noise (no impact ever cut a compass circle), its
+        # height varies along the ring, ejecta roughens the apron and
+        # rubble breaks the floor
+        rr = np.sqrt(xs * xs + ys * ys) / max(half, 1e-6)
+        rwob = (PT.fbm(p * 1.5 + 53.7, octaves=max(octs - 2, 1),
+                       gain=gain) - 0.5)
+        rw = rr * (1.0 + rwob * 0.22)
+        rim_h = 0.55 + 0.45 * PT.fbm(p * 2.0 + 7.9,
+                                     octaves=max(octs - 2, 1),
+                                     gain=gain)
+        rim = np.exp(-np.square((rw - 0.55) / 0.075)) * rim_h
+        floor_m = _smooth((0.48 - rw) / 0.18)
+        base = _smooth((rw - 0.5) / 0.5) * 0.20
+        ejecta = (PT.fbm(p * 1.2 + 17.3, octaves=octs, gain=gain)
+                  - 0.5) * 0.22 * _smooth((rw - 0.45) / 0.3)
+        rubble = (PT.fbm(p * 2.3 + 91.1, octaves=octs, gain=gain)
+                  - 0.5) * 0.14 * floor_m
+        h = np.clip(rim + base + ejecta + rubble
+                    - floor_m * 0.34 + 0.20, 0.0, None)
+    elif kind == 'VOLCANO':
+        # a stratovolcano: steep upper cone, deep bitten caldera,
+        # ridged lava flanks and radial gullying worn down the sides
+        rr = np.sqrt(xs * xs + ys * ys) / max(half, 1e-6)
+        cone = np.power(np.clip(1.0 - rr * 1.05, 0.0, None), 1.4)
+        caldera = np.exp(-np.square(rr / 0.13)) * 0.8
+        th = np.arctan2(ys, xs)
+        gully = np.abs(np.sin(th * 7.0
+                              + (PT.fbm(p * 0.9 + 31.7,
+                                        octaves=max(octs - 3, 1),
+                                        gain=gain) - 0.5) * 6.0))
+        flank = (PT.ridged(p * 1.3, octaves=octs, gain=gain)
+                 - 0.5) * 0.28
+        h = np.clip(cone * (1.0 - 0.16 * gully) - caldera, 0.0, None) \
+            * 1.05 + flank * np.clip(cone, 0.0, 1.0)
+        h = np.clip(h, 0.0, None)
+    elif kind == 'PLATEAU':
+        # table-land: fBm pushed through a hard shoulder, flat on top
+        f = PT.fbm(p, octaves=octs, gain=gain)
+        top = _smooth((f - 0.45) / 0.12)
+        h = top * 0.72 + f * 0.18
+    else:                                       # MOUNTAIN, the R201 road
+        h = PT.fbm(p, octaves=octs, gain=gain)
+        if rg > 0.0:
+            h = h * (1.0 - rg) \
+                + PT.ridged(p, octaves=octs, gain=gain) * rg
+    h = np.clip(h, 0.0, None)
+
+    isl = min(max(float(island), 0.0), 1.0)
+    if isl > 0.0:
+        # radial smoothstep ring: full height inside (1-island) of the
+        # half-size, zero at the corner-safe edge radius
+        r = np.sqrt(xs * xs + ys * ys) / half
+        t = np.clip((1.0 - r) / max(isl, 1e-6), 0.0, 1.0)
+        h = h * (t * t * (3.0 - 2.0 * t))
+
+    steps = int(terraces)
+    if steps > 0:
+        # Bryce terracing: quantise with a smoothed riser so shelves
+        # read as strata, not stair-step aliasing
+        tq = h * steps
+        fl = np.floor(tq)
+        fr = tq - fl
+        h = (fl + fr * fr * (3.0 - 2.0 * fr)) / steps
+
+    sea = min(max(float(sea_level), 0.0), 0.95)
+    if sea > 0.0:
+        h = np.maximum(h, sea)
+
+    zs = (h * height).astype(np.float32)
+    verts = [(float(xs[i]), float(ys[i]), float(zs[i]))
+             for i in range(n1 * n1)]
+    faces = []
+    for r in range(divisions):
+        row = r * n1
+        for c in range(divisions):
+            a = row + c
+            faces.append((a, a + 1, a + n1 + 1, a + n1))
+    return verts, faces

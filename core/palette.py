@@ -480,3 +480,68 @@ def ham_encode(rgb, bits=8):
             cur = np.asarray(cand, np.float32).copy()
             out[y, x] = cur
     return out, base
+
+
+# ------------------------------------------------- R202: image palettes
+
+
+def palette_from_pixels(pixels, cap=256, sort='LUMA'):
+    """An image AS the palette: its distinct colours, deterministic.
+
+    The road both R202 features share -- the render's Custom palette
+    mode and the Make Palette Table operator. Colours are read at
+    8-bit precision (dedup on floats is a lottery), fully transparent
+    pixels are skipped (a table's padding), and the result is sorted
+    for determinism: LUMA (dark to light, the classic palette strip),
+    HUE (around the wheel), or FREQ (most-used first). Over `cap`
+    distinct colours the set is median-cut down to cap -- the honest
+    reduction, printed nowhere because the caller shows the count.
+
+    Returns (n, 3) float32 in 0..1, n >= 1.
+    """
+    px = np.asarray(pixels, np.float32)
+    px = px.reshape(-1, px.shape[-1]) if px.ndim > 1 else px.reshape(-1, 1)
+    if px.shape[1] >= 4:
+        px = px[px[:, 3] > 0.5]
+    if px.shape[0] == 0:
+        return np.zeros((1, 3), np.float32)
+    rgb = np.clip(px[:, :3], 0.0, 1.0)
+    q = np.round(rgb * 255.0).astype(np.int32)
+    key = (q[:, 0] << 16) | (q[:, 1] << 8) | q[:, 2]
+    uniq, counts = np.unique(key, return_counts=True)
+    cols = np.stack([(uniq >> 16) & 255, (uniq >> 8) & 255, uniq & 255],
+                    axis=1).astype(np.float32) / 255.0
+    cap = max(int(cap), 1)
+    if len(cols) > cap:
+        cols = build_palette(cols, cap, 'MEDIAN_CUT', 0)
+        counts = np.ones(len(cols), np.int64)
+    if sort == 'FREQ' and len(counts) == len(cols):
+        order = np.argsort(-counts, kind='stable')
+    elif sort == 'HUE':
+        mx = cols.max(axis=1)
+        mn = cols.min(axis=1)
+        d = np.where(mx - mn < 1e-9, 1.0, mx - mn)
+        r, g, b = cols[:, 0], cols[:, 1], cols[:, 2]
+        h = np.where(mx == r, (g - b) / d,
+                     np.where(mx == g, 2.0 + (b - r) / d,
+                              4.0 + (r - g) / d))
+        h = np.mod(h / 6.0, 1.0)
+        h = np.where(mx - mn < 1e-9, 2.0, h)   # greys after the wheel
+        lum = cols @ np.array([0.299, 0.587, 0.114], np.float32)
+        order = np.lexsort((lum, h))
+    else:                                       # LUMA
+        lum = cols @ np.array([0.299, 0.587, 0.114], np.float32)
+        order = np.lexsort((cols[:, 2], cols[:, 1], cols[:, 0], lum))
+    return cols[order].astype(np.float32)
+
+
+def palette_table_layout(n, columns=0):
+    """(columns, rows) for a one-colour-per-pixel table image.
+
+    0 columns picks the squarest grid; a strip is columns=n."""
+    n = max(int(n), 1)
+    if int(columns) > 0:
+        c = min(int(columns), n)
+    else:
+        c = int(np.ceil(np.sqrt(n)))
+    return c, int(np.ceil(n / c))

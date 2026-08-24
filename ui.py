@@ -271,8 +271,6 @@ class HALCYON_PT_presets(HalcyonPanel, Panel):
             for line in _wrap(entry['note'], 46):
                 box.label(text=line)
         layout.separator()
-        layout.menu('HALCYON_MT_resolutions', icon='OUTPUT')
-        layout.separator()
         draw_disclaimer(layout)
 
 
@@ -299,13 +297,76 @@ RESOLUTION_MENUS = tuple(_resolution_group_menu(i, label, keys)
                          for i, (label, keys) in enumerate(RESOLUTION_GROUPS))
 
 
+class HALCYON_OT_halo_ramp(Operator):
+    """R198: give a halo material its colour ramp widget.
+
+    A ColorRamp cannot live on a PropertyGroup, so the widget rides a
+    dedicated, UNLINKED ColorRamp node stashed in the material's node
+    tree -- the serializer only walks from the output, so shading
+    never sees it, and the exporter samples it into a small LUT."""
+
+    bl_idname = 'halcyon.halo_ramp'
+    bl_label = "Add Halo Colour Ramp"
+    bl_description = ("Add a colour ramp to this halo material -- the "
+                      "gradient then follows the ramp instead of the "
+                      "two colours")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    remove: BoolProperty(default=False, options={'HIDDEN'})
+
+    @classmethod
+    def poll(cls, context):
+        return context.material is not None
+
+    def execute(self, context):
+        mat = context.material
+        if not mat.use_nodes:
+            mat.use_nodes = True
+        tree = mat.node_tree
+        node = tree.nodes.get('__halo_ramp')
+        if self.remove:
+            if node is not None:
+                tree.nodes.remove(node)
+            return {'FINISHED'}
+        if node is None:
+            node = tree.nodes.new('ShaderNodeValToRGB')
+            node.name = '__halo_ramp'
+            node.label = "Halo Ramp"
+            node.location = (-600, -600)
+        return {'FINISHED'}
+
+
 class HALCYON_MT_resolutions(bpy.types.Menu):
     bl_idname = 'HALCYON_MT_resolutions'
-    bl_label = "Period Resolutions"
+    bl_label = "Resolution Presets"
 
     def draw(self, context):
         for menu in RESOLUTION_MENUS:
             self.layout.menu(menu.bl_idname)
+
+
+class HALCYON_PT_output(HalcyonPanel, Panel):
+    """R194: the resolution presets live with Blender's own Format
+    fields now -- the Output tab is where everyone looks for them."""
+
+    bl_label = "Halcyon Output"
+    bl_context = "output"
+
+    def draw(self, context):
+        layout = self.layout
+        r = context.scene.render
+        layout.menu('HALCYON_MT_resolutions', icon='OUTPUT')
+        row = layout.row()
+        row.active = False
+        row.label(text=f"Current: {r.resolution_x} x {r.resolution_y}"
+                       + ("" if r.pixel_aspect_x == r.pixel_aspect_y
+                          else "  (shaped pixels)"))
+        cam = context.scene.camera
+        if cam is not None and getattr(cam.data, 'type', '') == 'PANO':
+            note = layout.column()
+            note.active = False
+            note.label(text="Panoramic camera: pair with a Panoramas "
+                            "& 360 preset", icon='INFO')
 
 
 class HALCYON_PT_sampling(HalcyonPanel, Panel):
@@ -321,11 +382,20 @@ class HALCYON_PT_sampling(HalcyonPanel, Panel):
         sub = col.column()
         sub.active = hs.aa_mode != 'NONE'
         sub.prop(hs, 'aa_samples')
-        if hs.aa_mode == 'EDGE':
+        if hs.aa_mode in ('EDGE', 'ADAPTIVE'):
+            # both flag edge pixels off the depth buffer; neither runs
+            # the downfilter (Edge tents in place, Adaptive averages
+            # its own samples), so the filter rows would be dead knobs
             sub.prop(hs, 'aa_edge_threshold')
         else:
             sub.prop(hs, 'aa_filter')
             sub.prop(hs, 'aa_filter_width')
+        col.separator()
+        col.prop(hs, 'stereo_mode')
+        sub = col.column()
+        sub.active = hs.stereo_mode != 'NONE'
+        sub.prop(hs, 'stereo_eye_distance')
+        sub.prop(hs, 'stereo_convergence')
         col.separator()
         col.prop(hs, 'motion_blur')
         sub = col.column()
@@ -676,11 +746,29 @@ class HALCYON_PT_colour(HalcyonPanel, Panel):
         col.prop(hs, 'color_depth')
         indexed = hs.color_depth in ('8', '4', 'HAM8', 'HAM6')
         sub = col.column()
-        sub.active = indexed
+        # R202: a non-adaptive palette (Custom included) forces itself
+        # at ANY depth, so the controls only dim while they truly idle
+        sub.active = indexed or hs.palette_mode != 'ADAPTIVE'
         sub.prop(hs, 'palette_mode')
+        if hs.palette_mode == 'CUSTOM':
+            sub.template_ID(hs, 'palette_image', open='image.open')
+            note = sub.row()
+            note.active = False
+            if getattr(hs, 'palette_image', None) is not None:
+                iw, ih = tuple(hs.palette_image.size)[:2]
+                note.label(text=f"{iw}x{ih} image -- its colours become "
+                                "the whole frame's palette",
+                           icon='COLOR')
+            else:
+                note.label(text="Pick an image (Image editor > Image > "
+                                "Make Palette Table builds one)",
+                           icon='INFO')
+        s2a = sub.column()
+        # the size doubles as the Custom image's colour cap
+        s2a.active = hs.palette_mode in ('ADAPTIVE', 'CUSTOM')
+        s2a.prop(hs, 'palette_size')
         s2 = sub.column()
         s2.active = hs.palette_mode == 'ADAPTIVE'
-        s2.prop(hs, 'palette_size')
         s2.prop(hs, 'palette_method')
         s2.prop(hs, 'palette_lock')
         if hs.palette_lock:
@@ -859,15 +947,51 @@ class HALCYON_PT_world_ground(HalcyonPanel, Panel):
         col.active = hs.ground_plane
         col.prop(hs, 'ground_mode')
         col.prop(hs, 'ground_height')
-        col.prop(hs, 'ground_color')
-        if hs.ground_mode in ('CHECKER', 'NOISE'):
+        if hs.ground_mode != 'MATERIAL':
+            col.prop(hs, 'ground_color')
+        # R203 field find: every two-colour mode owns the second
+        # colour, and every mode's dials draw -- Tiles and Lava were
+        # UNEDITABLE because this panel never showed their controls
+        if hs.ground_mode in ('CHECKER', 'NOISE', 'TILES', 'DESERT',
+                              'SNOW', 'LAVA'):
             col.prop(hs, 'ground_color2')
         if hs.ground_mode != 'SOLID':
             col.prop(hs, 'ground_scale')
-        if hs.ground_mode == 'OCEAN':
+        if hs.ground_mode == 'TILES':
+            col.prop(hs, 'ground_grout')
+            col.prop(hs, 'ground_grout_glow')
+            col.prop(hs, 'ground_tile_shade')
+            note = col.row()
+            note.active = False
+            note.label(text="Thin grout + glow above 1 = the neon "
+                            "grid floor", icon='INFO')
+        elif hs.ground_mode == 'LAVA':
+            # R204: embers earned their own colour
+            col.prop(hs, 'ground_color3', text="Ember Colour")
+            col.prop(hs, 'ground_crack_width')
+            col.prop(hs, 'ground_glow')
+            col.prop(hs, 'ground_pulse')
+        elif hs.ground_mode == 'SNOW':
+            # R204: the glints earned a colour and a strength
+            col.prop(hs, 'ground_color3', text="Glint Colour")
+            col.prop(hs, 'ground_sparkle')
+        elif hs.ground_mode == 'DESERT':
+            col.prop(hs, 'ground_ridge')
+        elif hs.ground_mode == 'MATERIAL':
+            col.template_ID(hs, 'ground_material')
+            note = col.row()
+            note.active = False
+            note.label(text="The material's node graph paints the "
+                            "plane to the horizon", icon='INFO')
+        elif hs.ground_mode == 'OCEAN':
             col.prop(hs, 'ocean_choppiness')
             col.prop(hs, 'ocean_speed')
         col.separator()
+        # R204 field find: the floors ignored every lamp in the scene.
+        # This dial hands them to the lighting; OCEAN keeps its own
+        # sun-and-sky model and doesn't need it
+        if hs.ground_mode != 'OCEAN':
+            col.prop(hs, 'ground_lighting')
         col.prop(hs, 'ground_fade')
         if not hs.ground_plane:
             note = layout.column(align=True)
@@ -1099,6 +1223,8 @@ class HALCYON_PT_world_effects(_BrycePanel, Panel):
         sub.active = hs.stars
         sub.prop(hs, 'star_density')
         sub.prop(hs, 'star_brightness')
+        sub.prop(hs, 'star_size')
+        sub.prop(hs, 'old_stars')
         col.separator()
         col.prop(hs, 'comets')
         sub = col.column()
@@ -1465,10 +1591,37 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
         op.scope = 'SCENE'
         box.label(text="Textures are relinked, not discarded", icon='INFO')
 
+        col = box.column(align=True)
+        col.label(text="To Blender Internal:", icon='SHADING_SOLID')
+        op = col.operator('halcyon.convert_to_bi', text="This Material",
+                          icon='MATERIAL')
+        op.scope = 'ACTIVE'
+        op = col.operator('halcyon.convert_to_bi', text="Selected Objects",
+                          icon='RESTRICT_SELECT_OFF')
+        op.scope = 'SELECTED'
+        op = col.operator('halcyon.convert_to_bi', text="Whole Scene",
+                          icon='SCENE_DATA')
+        op.scope = 'SCENE'
+
+        # R202: the template shelf moved to the Shader Editor's Add
+        # menu (Add > Pre-Made > Bryce / Halcyon) -- a note points the
+        # way for anyone who reaches for it here
+        note = layout.row()
+        note.active = False
+        note.label(text="Templates: Shader Editor > Add > Pre-Made",
+                   icon='PRESET')
+
         box = layout.box()
-        box.label(text="Start from a template", icon='PRESET')
-        box.menu('HALCYON_MT_material_templates',
-                 text="Material Templates", icon='MATERIAL')
+        box.label(text="Bake", icon='RENDER_STILL')
+        col = box.column(align=True)
+        op = col.operator('halcyon.bake_lightmap', text="Bake Lightmap",
+                          icon='LIGHT_SUN')
+        op.mode = 'COMBINED'
+        op = col.operator('halcyon.bake_lightmap',
+                          text="Bake Ambient Occlusion", icon='SHADING_RENDERED')
+        op.mode = 'AO'
+        box.label(text="Into the active UV layout, as a new image",
+                  icon='INFO')
 
         layout.separator()
         layout.prop(hs, 'use_override')
@@ -1508,6 +1661,119 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
         if hs.wire or hs.model == 'WIREFRAME':
             col.prop(hs, 'wire_size')
 
+        # ---- Halo: BI's other material type, never gated by Override
+        layout.separator()
+        hcol = layout.column()
+        hcol.prop(hs, 'halo')
+        if hs.halo:
+            sub = hcol.column()
+            sub.prop(hs, 'halo_shape')
+            if hs.halo_shape == 'IMAGE':
+                sub.template_ID(hs, 'halo_image', open='image.open')
+            row = sub.row(align=True)
+            row.prop(hs, 'halo_aspect')
+            row.prop(hs, 'halo_rotation')
+            sub.prop(hs, 'halo_color')
+            sub.prop(hs, 'halo_gradient')
+            if hs.halo_gradient:
+                row = sub.row(align=True)
+                row.prop(hs, 'halo_gradient_type', text="")
+                row.prop(hs, 'halo_gradient_noise')
+                if hs.halo_gradient_noise > 0.0:
+                    sub.prop(hs, 'halo_grad_noise_speed')
+                ramp_node = None
+                if mat is not None and mat.use_nodes and mat.node_tree:
+                    ramp_node = mat.node_tree.nodes.get('__halo_ramp')
+                if ramp_node is not None:
+                    sub.template_color_ramp(ramp_node, 'color_ramp',
+                                            expand=True)
+                    op = sub.operator('halcyon.halo_ramp',
+                                      text="Remove Ramp (use the two "
+                                           "colours)", icon='X')
+                    op.remove = True
+                else:
+                    sub.prop(hs, 'halo_color2')
+                    op = sub.operator('halcyon.halo_ramp',
+                                      text="Use a Colour Ramp instead",
+                                      icon='COLOR')
+                    op.remove = False
+            row = sub.row(align=True)
+            row.prop(hs, 'halo_noise')
+            row.prop(hs, 'halo_noise_scale')
+            if hs.halo_noise > 0.0:
+                sub.prop(hs, 'halo_noise_speed')
+            row = sub.row(align=True)
+            row.prop(hs, 'halo_bolts')
+            row.prop(hs, 'halo_bolt_width')
+            if hs.halo_bolts:
+                row = sub.row(align=True)
+                row.prop(hs, 'halo_bolt_color', text="")
+                row.prop(hs, 'halo_bolt_speed')
+            row = sub.row(align=True)
+            row.prop(hs, 'halo_rays')
+            row.prop(hs, 'halo_ray_sharp')
+            if hs.halo_rays:
+                sub.prop(hs, 'halo_ray_color', text="Ray Colour")
+            sub.prop(hs, 'halo_alpha')
+            sub.prop(hs, 'halo_size')
+            sub.prop(hs, 'halo_hardness')
+            sub.prop(hs, 'halo_add')
+            sub.prop(hs, 'halo_seed')
+            row = sub.row(align=True)
+            row.prop(hs, 'halo_rand_hue', text="Hue")
+            row.prop(hs, 'halo_rand_sat', text="Sat")
+            row.prop(hs, 'halo_rand_val', text="Val")
+            row = sub.row(align=True)
+            row.prop(hs, 'halo_hue_shift', text="Hue Shift")
+            row.prop(hs, 'halo_sat_shift', text="Sat")
+            row.prop(hs, 'halo_val_shift', text="Val")
+            row = sub.row(align=True)
+            row.prop(hs, 'halo_pulse')
+            row.prop(hs, 'halo_flicker')
+            if hs.halo_pulse > 0.0 or hs.halo_flicker > 0.0:
+                row = sub.row(align=True)
+                psub = row.row()
+                psub.active = hs.halo_pulse > 0.0
+                psub.prop(hs, 'halo_pulse_speed')
+                fsub = row.row()
+                fsub.active = hs.halo_flicker > 0.0
+                fsub.prop(hs, 'halo_flicker_speed')
+            row = sub.row(align=True)
+            row.prop(hs, 'halo_spin')
+            row.prop(hs, 'halo_anim_speed')
+            row = sub.row(align=True)
+            row.prop(hs, 'halo_rings')
+            rsub = row.row()
+            rsub.active = hs.halo_rings
+            rsub.prop(hs, 'halo_ring_count', text="")
+            if hs.halo_rings:
+                sub.prop(hs, 'halo_ring_color')
+                sub.prop(hs, 'halo_ring_width')
+                sub.prop(hs, 'halo_rings_even')
+            row = sub.row(align=True)
+            row.prop(hs, 'halo_lines')
+            lsub = row.row()
+            lsub.active = hs.halo_lines
+            lsub.prop(hs, 'halo_line_count', text="")
+            if hs.halo_lines:
+                sub.prop(hs, 'halo_line_color')
+                sub.prop(hs, 'halo_line_width')
+            row = sub.row(align=True)
+            row.prop(hs, 'halo_star')
+            ssub = row.row()
+            ssub.active = hs.halo_star
+            ssub.prop(hs, 'halo_star_tips', text="")
+            row = sub.row(align=True)
+            row.prop(hs, 'halo_xalpha')
+            row.prop(hs, 'halo_soft')
+            row = sub.row(align=True)
+            row.prop(hs, 'halo_shaded')
+            row.prop(hs, 'halo_puno')
+            note = sub.row()
+            note.active = False
+            note.label(text="The mesh's vertices render as glows; "
+                            "its faces do not draw", icon='INFO')
+
 
 class HALCYON_PT_light(HalcyonPanel, Panel):
     bl_label = "Halcyon Light"
@@ -1526,10 +1792,19 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
         col.prop(light, 'color')
         col.prop(light, 'energy')
         col.separator()
-        col.prop(hs, 'decay')
-        if hs.decay == 'CUSTOM':
-            col.prop(hs, 'decay_start')
-            col.prop(hs, 'decay_end')
+        if light.type == 'AREA':
+            # no decay menu for an area lamp: 2.79's lamp_get_visibility
+            # skipped its falloff switch for LA_AREA, and so does the
+            # engine -- distance speaks only through the form factor.
+            # The BI pair instead: Distance (la->dist, the dist^2/A
+            # normalisation) and Gamma (la->k, its pow shaping)
+            col.prop(hs, 'decay_end', text="Distance")
+            col.prop(hs, 'area_gamma')
+        else:
+            col.prop(hs, 'decay')
+            if hs.decay == 'CUSTOM':
+                col.prop(hs, 'decay_start')
+                col.prop(hs, 'decay_end')
         if light.type == 'SPOT':
             col.prop(hs, 'hotspot')
         col.separator()
@@ -1567,6 +1842,71 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
         if light.type == 'SUN':
             col.prop(hs, 'hemi')
         col.prop(hs, 'volumetric')
+        if light.type in ('SPOT', 'POINT', 'AREA'):
+            # the in-air beam kinds; a SUN's volumetric drives the
+            # screen-space shafts instead (no apex to march from)
+            sub = col.column()
+            sub.active = hs.volumetric > 0.0
+            sub.prop(hs, 'volumetric_occlusion')
+        col.separator()
+        col.prop(hs, 'flare')
+        sub = col.column()
+        sub.active = hs.flare > 0.0
+        sub.prop(hs, 'flare_scale')
+        row = sub.row(align=True)
+        row.prop(hs, 'flare_streaks')
+        row.prop(hs, 'flare_rings')
+        row.prop(hs, 'flare_ghosts')
+        if hs.flare > 0.0:
+            note = sub.column()
+            note.active = False
+            note.label(text="Draws where THIS LAMP is visible in "
+                            "frame, and fades", icon='INFO')
+            note.label(text="as it hides. A Sun flares at its spot in "
+                            "the sky.", icon='BLANK1')
+            # R195: the live answer -- is the flare's anchor in the
+            # render camera's frame RIGHT NOW? The field set the dial
+            # and saw nothing; this line says why before a render does
+            status = None
+            try:
+                from bpy_extras import object_utils as _ou
+                from mathutils import Vector as _V
+                cam = context.scene.camera
+                ob = context.object
+                if cam is not None and ob is not None:
+                    if light.type == 'SUN':
+                        d = (ob.matrix_world.to_3x3()
+                             @ _V((0.0, 0.0, -1.0))).normalized()
+                        pt = cam.matrix_world.translation - d * 1000.0
+                    else:
+                        pt = ob.matrix_world.translation
+                    co = _ou.world_to_camera_view(context.scene, cam, pt)
+                    if co.z <= 0.0:
+                        status = ("Anchor is BEHIND the render camera "
+                                  "-- no flare", 'ERROR')
+                    elif -0.2 <= co.x <= 1.2 and -0.2 <= co.y <= 1.2:
+                        status = ("Anchor is in the render camera's "
+                                  "frame", 'CHECKMARK')
+                    else:
+                        status = ("Anchor is OUTSIDE the render "
+                                  "camera's frame -- no flare", 'ERROR')
+            except Exception:                                   # noqa: BLE001
+                status = None
+            if status:
+                srow = sub.row()
+                srow.label(text=status[0], icon=status[1])
+                if light.type == 'SUN' and status[1] == 'ERROR':
+                    hint = sub.row()
+                    hint.active = False
+                    hint.label(text="Tilt the sun so it shines TOWARD "
+                                    "the camera's view", icon='BLANK1')
+        if light.type in ('SPOT', 'SUN'):
+            col.separator()
+            col.prop(hs, 'caustics')
+            sub = col.column()
+            sub.active = hs.caustics > 0.0
+            sub.prop(hs, 'caustics_scale')
+            sub.prop(hs, 'caustics_speed')
         col.separator()
         col.prop(hs, 'exclude_collection')
         sub = col.column()
@@ -2147,6 +2487,7 @@ class HALCYON_PT_world(HalcyonPanel, Panel):
             col.prop(hs, 'star_brightness')
             col.prop(hs, 'star_size')
             col.prop(hs, 'star_twinkle')
+            col.prop(hs, 'old_stars')
             col.separator()
             col.prop(hs, 'nebula')
             sub = col.column()
@@ -2212,6 +2553,54 @@ class HALCYON_PT_world_clouds(HalcyonPanel, Panel):
         col.prop(hs, 'cloud_shadow')
 
 
+class HALCYON_PT_world_weather(HalcyonPanel, Panel):
+    """R200: the Weather overlay -- rain, snow, embers, ash falling in
+    front of the picture, under any sky mode (it weathers the sky, it
+    never replaces it)."""
+    bl_label = "Weather"
+    bl_parent_id = 'HALCYON_PT_world'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.engine == ENGINE and context.world is not None
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        hs = context.world.halcyon
+        col = layout.column()
+        col.prop(hs, 'weather')
+        if str(hs.weather) == 'NONE':
+            return
+        col.prop(hs, 'weather_color')
+        col.prop(hs, 'weather_opacity')
+        col.separator()
+        col.prop(hs, 'weather_density')
+        col.prop(hs, 'weather_size')
+        col.prop(hs, 'weather_layers')
+        col.separator()
+        col.prop(hs, 'weather_speed')
+        col.prop(hs, 'weather_angle')
+        col.prop(hs, 'weather_drift')
+        if str(hs.weather) == 'RAIN':
+            col.prop(hs, 'weather_streak')
+        row = col.row(align=True)
+        row.prop(hs, 'weather_glow')
+        row.prop(hs, 'weather_flicker')
+        col.prop(hs, 'weather_seed')
+        if str(hs.weather) == 'RAIN':
+            note = col.row()
+            note.active = False
+            note.label(text="Acid rain: pick a green colour",
+                       icon='INFO')
+        elif str(hs.weather) == 'EMBERS':
+            note = col.row()
+            note.active = False
+            note.label(text="Set Angle to 180° so embers rise",
+                       icon='INFO')
+
+
 def _uses_nodes(mat):
     """Material.use_nodes without the 6.0 deprecation warning per redraw.
 
@@ -2252,9 +2641,10 @@ def _wrap(text, width):
 
 CLASSES = (
     HALCYON_OT_apply_preset, HALCYON_OT_set_resolution,
+    HALCYON_OT_halo_ramp,
     HALCYON_OT_adopt_shadow_settings,
 ) + RESOLUTION_MENUS + (
-    HALCYON_MT_resolutions,
+    HALCYON_MT_resolutions, HALCYON_PT_output,
     HALCYON_OT_fix_view_transform,
     HALCYON_OT_sky_preset, HALCYON_OT_sky_save, HALCYON_OT_sky_load,
     HALCYON_OT_water_preset, HALCYON_OT_water_save, HALCYON_OT_water_load,
@@ -2274,7 +2664,7 @@ CLASSES = (
     HALCYON_PT_world, HALCYON_PT_world_sun,
     HALCYON_PT_world_atmosphere, HALCYON_PT_world_cumulus,
     HALCYON_PT_world_stratus, HALCYON_PT_world_effects,
-    HALCYON_PT_world_ground,
+    HALCYON_PT_world_ground, HALCYON_PT_world_weather,
 )
 
 

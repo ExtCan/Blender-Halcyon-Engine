@@ -6,12 +6,14 @@ picture got its sea. A plane with twenty controls and no library is the same
 problem the Sky Lab had.
 
 **What these are.** Waters built out of Halcyon's own ocean controls, tuned to
-the conditions they are named for. **What they are not:** Bryce's preset files.
-Those shipped inside the application and no published list of them survives.
-Two things here *are* Bryce's and are used deliberately: the category name
-Waters & Liquids, and **Caribbean Resort**, which a period tutorial places
-second along the top row of it. Every other name is the obvious name for the
-thing, not a claim about what Bryce shipped.
+the conditions they are named for. The first twenty are Halcyon's own names
+for obvious conditions. **The R202 group is different**: the field supplied
+the actual Bryce 2 library file (WatersLiquids.mat, MetaTools CCmF container,
+December 1995), and its full thirty-preset roster was mined out of it -- the
+names ARE Bryce's, in the library's own order, and each entry's note quotes
+the material's original 1995 description, which is what the translation to
+Halcyon's ocean dials was built from (the binary channel payloads did not
+decode; the descriptions did).
 
 bpy-free, like everything else the renderer reads. A preset is a plain dict of
 World field names to values, so saving one is `json.dump` and loading one is
@@ -296,6 +298,334 @@ WATERS = {
                        ocean_transparency=0.30, ocean_glitter=1.4,
                        ocean_glitter_size=0.5, ground_fade=220.0),
     },
+
+    # ------------------------------------------- R202: Waters & Liquids
+    #
+    # The field handed over the actual Bryce 2 library file
+    # (WatersLiquids.mat, MetaTools CCmF, December 1995) and its full
+    # roster was mined out of it: THIRTY presets, names and original
+    # descriptions intact. The docstring's old claim that no list
+    # survives is dead -- the list is right here, in library order.
+    # (The binary channel payloads did not decode; each translation
+    # below is built from the material's OWN 1995 description, quoted
+    # in its note.) Black Lagoon and Caribbean Resort already lived
+    # above; the other twenty-eight follow, named exactly as shipped.
+    'DEEP_BLUE': {
+        'label': "Deep Blue",
+        'note': "1995: 'Water highly transparent with altitude-"
+                "sensitive colors; blues get stronger as light "
+                "penetrates deeper'",
+        'settings': _w(ocean_deep=(0.010, 0.055, 0.180),
+                       ocean_shallow=(0.10, 0.30, 0.55),
+                       ocean_transparency=0.55, ocean_wave_scale=1.0,
+                       ocean_choppiness=0.18, ocean_glitter=1.0,
+                       ocean_glitter_size=0.25, ground_fade=160.0),
+    },
+    'MERCURY_SURFACE': {
+        'label': "Mercury Surface",
+        'note': "1995: 'Little transparency, but heavy reflection' -- "
+                "the metal poured flat",
+        'settings': _w(ocean_deep=(0.30, 0.31, 0.33),
+                       ocean_shallow=(0.55, 0.56, 0.58),
+                       ocean_transparency=0.02, ocean_wave_scale=0.6,
+                       ocean_choppiness=0.12, ocean_spread=0.3,
+                       ocean_glitter=2.6, ocean_glitter_size=0.45,
+                       ground_fade=220.0),
+    },
+    'DULL_MIRROR': {
+        'label': "Dull Mirror",
+        'note': "1995: 'Good for distance water... not as much "
+                "transparency or reflection'",
+        'settings': _w(ocean_deep=(0.10, 0.13, 0.16),
+                       ocean_shallow=(0.28, 0.33, 0.38),
+                       ocean_transparency=0.06, ocean_wave_scale=1.2,
+                       ocean_choppiness=0.15, ocean_glitter=0.4,
+                       ocean_glitter_size=0.3,
+                       ocean_horizon_smooth=0.5, ground_fade=260.0),
+    },
+    'NIGHTTIME_LAKE': {
+        'label': "Nighttime Lake",
+        'note': "1995: 'Deep blue, soft reflections make for serene "
+                "images'",
+        'settings': _w(ocean_deep=(0.008, 0.016, 0.045),
+                       ocean_shallow=(0.03, 0.06, 0.14),
+                       ocean_transparency=0.05, ocean_wave_scale=0.8,
+                       ocean_choppiness=0.06, ocean_speed=0.5,
+                       ocean_glitter=0.5, ocean_glitter_size=0.12,
+                       ground_fade=200.0),
+    },
+    'OASIS': {
+        'label': "Oasis",
+        'note': "1995: 'Heavy ambience and transparency almost make a "
+                "mirage-like appearance'",
+        'settings': _w(ocean_deep=(0.06, 0.22, 0.20),
+                       ocean_shallow=(0.30, 0.55, 0.45),
+                       ocean_transparency=0.50, ocean_wave_scale=0.35,
+                       ocean_choppiness=0.08, ocean_detail=6,
+                       ocean_glitter=1.2, ocean_glitter_size=0.2,
+                       ground_fade=80.0),
+    },
+    'NEW_AGE_WHALE_PICTURE': {
+        'label': "New Age Whale Picture",
+        'note': "1995: 'Heavy transparency with color shift as depth "
+                "increases' -- the airbrushed poster sea",
+        'settings': _w(ocean_deep=(0.10, 0.05, 0.30),
+                       ocean_shallow=(0.10, 0.45, 0.50),
+                       ocean_transparency=0.60, ocean_wave_scale=1.4,
+                       ocean_choppiness=0.22, ocean_glitter=1.3,
+                       ocean_glitter_size=0.3, ground_fade=180.0),
+    },
+    'PLACIDO_DOMINGO': {
+        'label': "Placido Domingo",
+        'note': "1995: 'Highly reflective water with minor surface "
+                "perturbations... good for distant lakes'",
+        'settings': _w(ocean_deep=(0.05, 0.08, 0.11),
+                       ocean_shallow=(0.16, 0.22, 0.28),
+                       ocean_transparency=0.04, ocean_wave_scale=0.5,
+                       ocean_choppiness=0.08, ocean_spread=0.25,
+                       ocean_glitter=1.2, ocean_glitter_size=0.2,
+                       ocean_horizon_smooth=0.5, ground_fade=280.0),
+    },
+    'MR_BUBBLE': {
+        'label': "Mr. Bubble",
+        'note': "1995: 'Nice transparent bubble texture with magenta "
+                "specular coefficients' -- pink foam and all",
+        'settings': _w(ocean_deep=(0.28, 0.10, 0.18),
+                       ocean_shallow=(0.60, 0.30, 0.42),
+                       ocean_transparency=0.35, ocean_wave_scale=0.4,
+                       ocean_choppiness=0.30, ocean_detail=7,
+                       ocean_foam=0.55,
+                       ocean_foam_color=(0.97, 0.80, 0.90),
+                       ocean_glitter=1.5, ocean_glitter_size=0.35,
+                       ground_fade=90.0),
+    },
+    'STILL_AND_DEEP': {
+        'label': "Still and Deep",
+        'note': "1995: 'Still and very transparent, use this to show "
+                "off textures in the mud underneath the surface'",
+        'settings': _w(ocean_deep=(0.04, 0.09, 0.10),
+                       ocean_shallow=(0.14, 0.26, 0.26),
+                       ocean_transparency=0.70, ocean_wave_scale=0.9,
+                       ocean_choppiness=0.04, ocean_speed=0.4,
+                       ocean_glitter=0.6, ocean_glitter_size=0.15,
+                       ground_fade=70.0),
+    },
+    'XANADES_LAKE': {
+        'label': "Xanades Lake",
+        'note': "1995: 'Reflective, transparent, and mildly turbulent "
+                "-- the water from Eric's beautiful Xanades Fjord "
+                "scene'",
+        'settings': _w(ocean_deep=(0.03, 0.12, 0.13),
+                       ocean_shallow=(0.12, 0.34, 0.33),
+                       ocean_transparency=0.35, ocean_wave_scale=1.1,
+                       ocean_choppiness=0.30, ocean_spread=0.6,
+                       ocean_glitter=1.4, ocean_glitter_size=0.28,
+                       ground_fade=190.0),
+    },
+    'SWIRLING_WATER': {
+        'label': "Swirling Water",
+        'note': "1995: 'Lower frequency gives more texture to water "
+                "surface' -- the big slow shapes",
+        'settings': _w(ocean_deep=(0.03, 0.10, 0.14),
+                       ocean_shallow=(0.12, 0.30, 0.36),
+                       ocean_transparency=0.20, ocean_wave_scale=2.6,
+                       ocean_choppiness=0.42, ocean_detail=6,
+                       ocean_speed=0.7, ocean_glitter=1.1,
+                       ocean_glitter_size=0.35, ground_fade=170.0),
+    },
+    'ROSE_WATER': {
+        'label': "Rose Water",
+        'note': "1995: 'As its name implies, a rose colored water "
+                "which is almost perfectly still'",
+        'settings': _w(ocean_deep=(0.30, 0.10, 0.14),
+                       ocean_shallow=(0.65, 0.35, 0.42),
+                       ocean_transparency=0.18, ocean_wave_scale=0.8,
+                       ocean_choppiness=0.04, ocean_speed=0.4,
+                       ocean_glitter=0.9, ocean_glitter_size=0.2,
+                       ground_fade=150.0),
+    },
+    'WAVES_OF_REFLECTION': {
+        'label': "Waves of Reflection",
+        'note': "1995: 'Almost completely reflective with a nice wave "
+                "texture'",
+        'settings': _w(ocean_deep=(0.06, 0.09, 0.12),
+                       ocean_shallow=(0.20, 0.26, 0.32),
+                       ocean_transparency=0.02, ocean_wave_scale=1.3,
+                       ocean_choppiness=0.35, ocean_glitter=2.2,
+                       ocean_glitter_size=0.4, ground_fade=240.0),
+    },
+    'SHINY_AND_STILL': {
+        'label': "Shiny and Still",
+        'note': "1995: 'Another very reflective and still water "
+                "texture...'",
+        'settings': _w(ocean_deep=(0.07, 0.10, 0.12),
+                       ocean_shallow=(0.22, 0.27, 0.31),
+                       ocean_transparency=0.03, ocean_wave_scale=0.7,
+                       ocean_choppiness=0.05, ocean_glitter=1.8,
+                       ocean_glitter_size=0.2,
+                       ocean_horizon_smooth=0.4, ground_fade=260.0),
+    },
+    'BRIGHT_BUBBLE': {
+        'label': "Bright Bubble",
+        'note': "1995: 'A mildly wavy texture with moderate "
+                "transparency and little reflectivity'",
+        'settings': _w(ocean_deep=(0.14, 0.30, 0.38),
+                       ocean_shallow=(0.40, 0.60, 0.68),
+                       ocean_transparency=0.40, ocean_wave_scale=0.6,
+                       ocean_choppiness=0.24, ocean_foam=0.25,
+                       ocean_glitter=0.4, ocean_glitter_size=0.3,
+                       ground_fade=110.0),
+    },
+    'FOAMY_SEAWATER': {
+        'label': "Foamy Seawater",
+        'note': "From the 1995 library: the whitecap sea, foam riding "
+                "every crest",
+        'settings': _w(ocean_deep=(0.04, 0.10, 0.09),
+                       ocean_shallow=(0.16, 0.30, 0.27),
+                       ocean_transparency=0.12, ocean_wave_scale=1.2,
+                       ocean_choppiness=0.50, ocean_spread=0.7,
+                       ocean_foam=0.85,
+                       ocean_foam_color=(0.94, 0.97, 0.96),
+                       ocean_glitter=1.2, ocean_glitter_size=0.35,
+                       ground_fade=180.0),
+    },
+    'ICEBERG': {
+        'label': "Iceberg",
+        'note': "1995: 'Steer clear on the open seas...' -- pale polar "
+                "water with an icy sheen",
+        'settings': _w(ocean_deep=(0.04, 0.10, 0.14),
+                       ocean_shallow=(0.55, 0.70, 0.75),
+                       ocean_transparency=0.15, ocean_wave_scale=1.0,
+                       ocean_choppiness=0.24, ocean_foam=0.40,
+                       ocean_foam_color=(0.92, 0.96, 0.98),
+                       ocean_glitter=1.6, ocean_glitter_size=0.25,
+                       ground_fade=200.0),
+    },
+    'POLLUTION_WATERFALL': {
+        'label': "Pollution Waterfall",
+        'note': "1995: 'High altitude areas are a polluted brown "
+                "color. Low areas are reflective and clear. Add to a "
+                "waterfall terrain for interesting effects'",
+        'settings': _w(ocean_deep=(0.10, 0.08, 0.04),
+                       ocean_shallow=(0.35, 0.30, 0.15),
+                       ocean_transparency=0.15, ocean_wave_scale=0.8,
+                       ocean_choppiness=0.32, ocean_foam=0.30,
+                       ocean_foam_color=(0.60, 0.55, 0.40),
+                       ocean_glitter=0.7, ocean_glitter_size=0.3,
+                       ground_fade=120.0),
+    },
+    'GLOWING_WATER': {
+        'label': "Glowing Water",
+        'note': "1995: 'From the labs at Area 51' -- radioactive "
+                "green, sparkling more than water should",
+        'settings': _w(ocean_deep=(0.02, 0.25, 0.08),
+                       ocean_shallow=(0.25, 0.80, 0.35),
+                       ocean_transparency=0.30, ocean_wave_scale=0.7,
+                       ocean_choppiness=0.20, ocean_sparkle=2.0,
+                       ocean_glitter=2.6, ocean_glitter_size=0.3,
+                       ground_fade=140.0),
+    },
+    'THAT_THING_FROM_ABYSS': {
+        'label': "That Thing From Abyss",
+        'note': "1995: 'You know... that alien water thing?' -- black-"
+                "teal and far too transparent for comfort",
+        'settings': _w(ocean_deep=(0.00, 0.10, 0.12),
+                       ocean_shallow=(0.04, 0.24, 0.28),
+                       ocean_transparency=0.65, ocean_wave_scale=1.0,
+                       ocean_choppiness=0.10, ocean_speed=0.6,
+                       ocean_glitter=0.8, ocean_glitter_size=0.2,
+                       ground_fade=130.0),
+    },
+    'NARCISSUS_POOL': {
+        'label': "Narcissus Pool",
+        'note': "1995: 'Get lost in your own reflection' -- the "
+                "stillest mirror in the library",
+        'settings': _w(ocean_deep=(0.06, 0.08, 0.10),
+                       ocean_shallow=(0.18, 0.22, 0.26),
+                       ocean_transparency=0.01, ocean_wave_scale=0.5,
+                       ocean_choppiness=0.02, ocean_speed=0.3,
+                       ocean_glitter=0.6, ocean_glitter_size=0.15,
+                       ocean_horizon_smooth=0.6, ground_fade=300.0),
+    },
+    'BACKYARD_POOL': {
+        'label': "Backyard Pool",
+        'note': "1995: 'A very aqua colored water. Just add a diving "
+                "board!'",
+        'settings': _w(ocean_deep=(0.05, 0.35, 0.45),
+                       ocean_shallow=(0.25, 0.65, 0.70),
+                       ocean_transparency=0.30, ocean_wave_scale=0.3,
+                       ocean_choppiness=0.12, ocean_detail=6,
+                       ocean_sparkle=1.5, ocean_glitter=1.6,
+                       ocean_glitter_size=0.22, ground_fade=60.0),
+    },
+    'SANTRAGINUS_V': {
+        'label': "Santraginus V",
+        'note': "1995: '...or a cool frosty Pan Galactic Gargle "
+                "Blaster' -- the seas whose marble-sanded beaches the "
+                "Guide recommends",
+        'settings': _w(ocean_deep=(0.10, 0.20, 0.30),
+                       ocean_shallow=(0.45, 0.62, 0.75),
+                       ocean_transparency=0.25, ocean_wave_scale=0.8,
+                       ocean_choppiness=0.28, ocean_foam=0.50,
+                       ocean_foam_color=(0.95, 0.97, 1.0),
+                       ocean_glitter=2.0, ocean_glitter_size=0.3,
+                       ground_fade=150.0),
+    },
+    'BRYCE_COLA': {
+        'label': "Bryce Cola",
+        'note': "1995: '...for those especially bad caffeine days' -- "
+                "cola-dark with a cream-coloured head",
+        'settings': _w(ocean_deep=(0.06, 0.03, 0.01),
+                       ocean_shallow=(0.30, 0.15, 0.05),
+                       ocean_transparency=0.12, ocean_wave_scale=0.5,
+                       ocean_choppiness=0.20, ocean_foam=0.60,
+                       ocean_foam_color=(0.90, 0.80, 0.65),
+                       ocean_glitter=1.0, ocean_glitter_size=0.25,
+                       ground_fade=90.0),
+    },
+    'DEEP_SEA': {
+        'label': "Deep Sea",
+        'note': "1995: 'Dark and flat, it is cold and lonely here...'",
+        'settings': _w(ocean_deep=(0.005, 0.02, 0.04),
+                       ocean_shallow=(0.02, 0.07, 0.11),
+                       ocean_transparency=0.08, ocean_wave_scale=1.5,
+                       ocean_choppiness=0.08, ocean_speed=0.5,
+                       ocean_glitter=0.3, ocean_glitter_size=0.2,
+                       ground_fade=320.0),
+    },
+    'ATLANTIC': {
+        'label': "Atlantic",
+        'note': "1995: 'A nice oceanic material with little bumpiness. "
+                "Nice day on the open sea!'",
+        'settings': _w(ocean_deep=(0.02, 0.08, 0.15),
+                       ocean_shallow=(0.10, 0.26, 0.40),
+                       ocean_transparency=0.15, ocean_wave_scale=1.1,
+                       ocean_choppiness=0.28, ocean_glitter=1.2,
+                       ocean_glitter_size=0.3, ground_fade=210.0),
+    },
+    'NICE_WATER': {
+        'label': "Nice Water",
+        'note': "1995: 'A calm watery surface with moderate waves can "
+                "be had with this fine material'",
+        'settings': _w(ocean_deep=(0.03, 0.10, 0.16),
+                       ocean_shallow=(0.14, 0.32, 0.42),
+                       ocean_transparency=0.20, ocean_wave_scale=0.9,
+                       ocean_choppiness=0.22, ocean_glitter=1.1,
+                       ocean_glitter_size=0.25, ground_fade=170.0),
+    },
+    'TURBULENCE': {
+        'label': "Turbulence",
+        'note': "1995: 'Another dark and brooding water' -- slate "
+                "grey and restless",
+        'settings': _w(ocean_deep=(0.03, 0.05, 0.07),
+                       ocean_shallow=(0.14, 0.18, 0.22),
+                       ocean_transparency=0.10, ocean_wave_scale=1.2,
+                       ocean_choppiness=0.55, ocean_spread=0.8,
+                       ocean_speed=1.3, ocean_foam=0.35,
+                       ocean_foam_color=(0.75, 0.78, 0.80),
+                       ocean_glitter=0.9, ocean_glitter_size=0.35,
+                       ground_fade=230.0),
+    },
 }
 
 
@@ -307,6 +637,16 @@ ORDER = (
     'MILLPOND', 'MOUNTAIN_LAKE', 'SWIMMING_POOL', 'BLACK_LAGOON',
     'GLACIAL_MELT',
     'MOONLIT_WATER', 'SUNSET_OCEAN', 'LIQUID_MERCURY', 'ALIEN_SEA',
+    # R202: the Bryce 2 Waters & Liquids roster, in the library file's
+    # own order (Black Lagoon and Caribbean Resort already sit above)
+    'DEEP_BLUE', 'MERCURY_SURFACE', 'DULL_MIRROR', 'NIGHTTIME_LAKE',
+    'OASIS', 'NEW_AGE_WHALE_PICTURE', 'PLACIDO_DOMINGO', 'MR_BUBBLE',
+    'STILL_AND_DEEP', 'XANADES_LAKE', 'SWIRLING_WATER', 'ROSE_WATER',
+    'WAVES_OF_REFLECTION', 'SHINY_AND_STILL', 'BRIGHT_BUBBLE',
+    'FOAMY_SEAWATER', 'ICEBERG', 'POLLUTION_WATERFALL', 'GLOWING_WATER',
+    'THAT_THING_FROM_ABYSS', 'NARCISSUS_POOL', 'BACKYARD_POOL',
+    'SANTRAGINUS_V', 'BRYCE_COLA', 'DEEP_SEA', 'ATLANTIC', 'NICE_WATER',
+    'TURBULENCE',
 )
 
 

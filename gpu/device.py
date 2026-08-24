@@ -14,7 +14,18 @@ engine has always worked without this and must continue to.
 
 import sys
 
-_STATE = {'checked': False, 'available': False, 'reason': '', 'shaders': {}}
+_STATE = {'checked': False, 'available': False, 'reason': '', 'shaders': {},
+          # R193: sources the driver REFUSED, keyed like the success
+          # cache. The field crash sequence was a refusal retried on
+          # every viewport draft -- identical source, identical
+          # CreateInfo failure, several times a second -- until the GPU
+          # module died in native code. A source that failed once now
+          # refuses from memory and never touches the driver again
+          # (scene edits change the source, change the key, and retry
+          # naturally). Bounded; reset_gpu clears it with the rest.
+          'failed': {}}
+
+_FAILED_CAP = 64
 
 
 def _main(what, fn):
@@ -35,12 +46,15 @@ def _main(what, fn):
 
 def reset():
     _STATE.update(checked=False, available=False, reason='')
+    _STATE.pop('max_frag_samplers', None)
     # shaders, batches and cached textures go to the graveyard, not
     # straight to the driver -- a reset can arrive while queued commands
     # still reference them
     for sh in _STATE['shaders'].values():
         bury(sh)
     _STATE['shaders'].clear()
+    # a reset is a new driver world: known-bad sources get their retry
+    _STATE.get('failed', {}).clear()
     for entry in _STATE.get('batches', {}).values():
         bury(entry[1])
     _STATE.get('batches', {}).clear()
@@ -144,11 +158,20 @@ def compile_dynamic(name, fragment, spec):
     hit = _STATE['shaders'].get(key)
     if hit is not None:
         return hit, None
+    failed = _STATE['failed'].get(key)
+    if failed is not None:
+        # refuse from memory: re-handing a known-bad source to the
+        # driver is how the field session died (R193)
+        return None, failed
     import time as _t
     t0 = _t.perf_counter()
     out = _main(f'compiling {name}', lambda: _compile_dynamic_miss(
         key, name, fragment, spec))
     _count_compile(t0)
+    if out[0] is None and out[1]:
+        if len(_STATE['failed']) >= _FAILED_CAP:
+            _STATE['failed'].pop(next(iter(_STATE['failed'])))
+        _STATE['failed'][key] = out[1]
     return out
 
 
@@ -580,6 +603,37 @@ def draw_fullscreen(shader, uniforms, samplers, target, read=True,
     """
     return _main('a full-screen pass', lambda: _draw_fullscreen_impl(
         shader, uniforms, samplers, target, read, blend, clear, region))
+
+
+def max_fragment_samplers():
+    """The driver's REAL fragment-sampler limit, floor 16, cached.
+
+    R181: the pass-assembly guard used the GL/Vulkan guaranteed minimum
+    (16) as if it were the hardware -- and one field material that
+    needed 17 pushed an entire supersampled frame onto the CPU for
+    16 minutes, on a card whose actual limit is 32. The guard exists to
+    pre-empt a driver rejection; asking the driver beats assuming its
+    worst case. Anything under 16, unqueryable, or headless stays 16 --
+    the spec floor -- so the answer can widen the road but never
+    narrow it wrongly.
+    """
+    hit = _STATE.get('max_frag_samplers')
+    if hit is not None:
+        return hit
+
+    def _query():
+        try:
+            import gpu
+            n = int(gpu.capabilities.max_textures_frag_get())
+            return max(n, 16)
+        except Exception:                                   # noqa: BLE001
+            return 16
+    try:
+        got = _main('the sampler-limit query', _query)
+    except Exception:                                       # noqa: BLE001
+        got = 16
+    _STATE['max_frag_samplers'] = int(got)
+    return _STATE['max_frag_samplers']
 
 
 def draw_many(draws, read=None, read_region=None):

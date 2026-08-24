@@ -60,6 +60,14 @@ class Material:
     wire: bool = False
     wire_size: float = 1.0
     face_texture: bool = False
+    # Halo material (R191): BI's MA_TYPE_HALO. None = ordinary surface;
+    # a dict turns the mesh's VERTICES into depth-tested billboard
+    # glows (shadeHaloFloat, transcribed). Keys, 2.79 names in parens:
+    # size (hasize), hardness (har), add (add, 0..1), seed (seed1),
+    # alpha (alpha), color (r,g,b), rings/lines/star_points (ringc/
+    # linec/starc; 0 = off), line_color (spec rgb), ring_color (mir
+    # rgb), xalpha, soft, shaded, puno (the mode bits).
+    halo: Optional[Dict[str, Any]] = None
     # Cached compiled coded-shader programs keyed by node name.
     programs: Dict[str, Any] = field(default_factory=dict)
     # Filled by the renderer: node names that could not be evaluated.
@@ -118,6 +126,8 @@ class Light:
     area_shape: str = 'SQUARE'
     area_x: tuple = (1.0, 0.0, 0.0)
     area_y: tuple = (0.0, 1.0, 0.0)
+    # BI's area lamp Gamma (la->k): shapes pow(stokes*areasize, k)
+    area_gamma: float = 1.0
     # 90s-style decay
     decay: str = 'DEFAULT'     # NONE | INVERSE | INVERSE_SQUARE | CUSTOM
     decay_start: float = 0.0
@@ -143,6 +153,25 @@ class Light:
     affect_diffuse: bool = True
     affect_specular: bool = True
     volumetric: float = 0.0
+    # Beam Occlusion: march samples the lamp cannot reach scatter
+    # nothing, so the visible beam STOPS at a mesh in its way. Costs a
+    # shadow ray per march sample, so it is a per-lamp choice
+    volumetric_occlusion: bool = False
+    # Lens flare: the Video Post / LightWave anatomy, anchored on THIS
+    # lamp's screen position and faded by its visibility -- unlike the
+    # image-space post flare, which chases any bright pixel
+    flare: float = 0.0                # element intensity; 0 = no flare
+    flare_scale: float = 1.0
+    flare_streaks: int = 6            # star spokes (0 = none)
+    flare_rings: int = 1              # chromatic halo rings (0 = none)
+    flare_ghosts: int = 6             # aperture ghosts along the axis
+    # Caustics: the animated pool-light web, baked per frame into a
+    # procedural cookie -- SPOT projects it through the cone, SUN tiles
+    # it across the world (seamlessly; the pattern is periodic)
+    caustics: float = 0.0
+    caustics_scale: float = 4.0       # SPOT: cells across the cone;
+    #                                   SUN: world units per tile
+    caustics_speed: float = 1.0
     exclude_objects: tuple = ()
     exclude_mode: str = 'EXCLUDE'
     ambient_only: bool = False
@@ -314,6 +343,9 @@ class World:
     # starfield mode: stars all the way round, with no dome under them
     star_size: float = 0.35
     star_twinkle: float = 0.0
+    # the pre-1.38 star drawing: cell-sized squares whose pixel size
+    # followed the render resolution. Off = fixed-angular-size discs
+    old_stars: bool = False
     nebula: float = 0.0
     nebula_color: tuple = (0.35, 0.15, 0.55)
     nebula_scale: float = 2.0
@@ -327,11 +359,35 @@ class World:
     # HDRI
     # an infinite ground plane, intersected analytically in the background
     ground_plane: bool = False
-    ground_mode: str = 'SOLID'          # SOLID|CHECKER|NOISE|OCEAN
+    # SOLID|CHECKER|NOISE|TILES|DESERT|SNOW|LAVA|OCEAN|MATERIAL
+    # ('GRID' from old exports still renders, as thin-glow TILES)
+    ground_mode: str = 'SOLID'
     ground_height: float = 0.0
     ground_scale: float = 2.0
     ground_color2: tuple = (0.55, 0.52, 0.48)
     ground_fade: float = 60.0
+    # R203: the tile dials the field could not reach, the lava rebuild
+    # dials, and the material-ground graph (serialized at export from
+    # the picked material; programs ride beside it)
+    ground_grout: float = 0.04
+    ground_tile_shade: float = 0.25
+    ground_grout_glow: float = 1.0
+    ground_crack_width: float = 0.35
+    ground_glow: float = 1.0
+    ground_pulse: float = 0.15
+    # R204: the colours the field could see but not touch, and the
+    # lighting dial that lets the plane answer the scene's lamps.
+    # ground_color3 is the third tone (snow glints, lava embers);
+    # ground_sparkle scales the snow glitter; ground_ridge is the
+    # desert crest strength that used to be baked at 0.6; and
+    # ground_lighting blends flat-emissive (0, the old pixels
+    # bitwise) toward fully lit by sun, lamps and cast shadows (1).
+    ground_color3: tuple = (1.0, 1.0, 1.0)
+    ground_sparkle: float = 1.0
+    ground_ridge: float = 0.6
+    ground_lighting: float = 1.0
+    ground_graph: Optional[Dict[str, Any]] = None
+    ground_programs: Optional[Dict[str, Any]] = None
     ocean_choppiness: float = 0.35
     ocean_speed: float = 1.0
     # the water, the other half of a Bryce picture
@@ -357,6 +413,26 @@ class World:
     mist_color: tuple = (0.5, 0.55, 0.6)
     mist_falloff: str = 'LINEAR'      # LINEAR | QUADRATIC | INVERSE_QUADRATIC
     mist_intensity: float = 1.0
+    # ------------------------------------------------ R200: Weather
+    # a deterministic screen-space particle overlay IN FRONT of the
+    # picture -- rain, snow, embers, ash -- composited over geometry
+    # and sky alike, never replacing either. Angle 0 falls straight
+    # down; pi rises straight up; between is the diagonal. All pure
+    # functions of (seed, layer, particle, time): identical across
+    # runs, devices, refine passes and supersample factors
+    weather: str = 'NONE'             # NONE|RAIN|SNOW|EMBERS|ASH
+    weather_density: float = 1.0
+    weather_size: float = 1.0
+    weather_speed: float = 1.0
+    weather_angle: float = 0.0
+    weather_drift: float = 0.2
+    weather_color: tuple = (0.85, 0.90, 1.0)
+    weather_opacity: float = 0.8
+    weather_layers: int = 3
+    weather_streak: float = 1.0
+    weather_glow: float = 0.0
+    weather_flicker: float = 0.0
+    weather_seed: int = 0
 
 
 @dataclass
@@ -372,6 +448,14 @@ class Scene:
     fps: float = 24.0
     time: float = 0.0
     unit_scale: float = 1.0
+    #: R191 halo points: list of groups, each {'mat': material index,
+    #: 'pos': (n,3) float32 world positions, 'seeds': (n,) ints
+    #: (ma->seed1 + running vertex index, exactly make_render_halos),
+    #: 'sizes': (n,) float32 (None = the material's size), 'normals':
+    #: (n,3) world vertex normals (only when the material's puno asks
+    #: for facing-scaled sizes)}. Built by the exporter from every
+    #: mesh/particle/point-cloud object wearing a halo material.
+    halos: Optional[List[Dict[str, Any]]] = None
 
     def tri_count(self):
         return 0 if self.mesh is None or self.mesh.tris is None else len(self.mesh.tris)

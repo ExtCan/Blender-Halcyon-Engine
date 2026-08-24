@@ -415,6 +415,47 @@ def material_spec(mat, version=279):
     spec = _i(mat.get('spec_shader'))
     model = None
     bi = None
+    halo = None
+
+    if _i(mat.get('material_type')) == B.MA_TYPE_HALO:
+        # R191: the OTHER material type. The mode bits are the halo
+        # aliases here (DNA overloads them; material_type picks the
+        # reading). Counts ride only when their bit is on, exactly
+        # RE_inithalo's `if (mode & MA_STAR) starpoints = starc`
+        halo = {
+            'size': _f(mat.get('hasize'), 0.5),
+            'hardness': max(_i(mat.get('har'), 50), 0),
+            'add': _f(mat.get('add'), 0.0),
+            'alpha': _f(mat.get('alpha'), 1.0),
+            'color': (_f(mat.get('r'), 0.8), _f(mat.get('g'), 0.8),
+                      _f(mat.get('b'), 0.8)),
+            'seed': _i(mat.get('seed1')) % 256,
+            'rings': _i(mat.get('ringc'), 4)
+                     if mode & B.MA_HALO_RINGS else 0,
+            'lines': _i(mat.get('linec'), 12)
+                     if mode & B.MA_HALO_LINES else 0,
+            'star_points': _i(mat.get('starc'), 4)
+                           if mode & B.MA_STAR else 0,
+            'line_color': (_f(mat.get('specr'), 1.0),
+                           _f(mat.get('specg'), 1.0),
+                           _f(mat.get('specb'), 1.0)),
+            'ring_color': (_f(mat.get('mirr'), 1.0),
+                           _f(mat.get('mirg'), 1.0),
+                           _f(mat.get('mirb'), 1.0)),
+            'xalpha': bool(mode & B.MA_HALO_XALPHA),
+            'soft': bool(mode & B.MA_HALO_SOFT),
+            'shaded': bool(mode & B.MA_HALO_SHADE),
+            'puno': bool(mode & B.MA_HALOPUNO),
+        }
+        if mode & B.MA_HALOTEX:
+            warnings.append(f'{name}: halo textures (HaloTex) are not '
+                            'imported; the halo draws its plain colour')
+        if mode & B.MA_HALO_FLARE:
+            warnings.append(f'{name}: halo lens flares are not '
+                            "imported; use a lamp's own Lens Flare "
+                            'instead')
+        return {'name': name, 'model': None, 'bi': None, 'halo': halo,
+                'inputs': {}, 'textures': [], 'warnings': warnings}
 
     r, g, b = _f(mat.get('r'), 0.8), _f(mat.get('g'), 0.8), \
         _f(mat.get('b'), 0.8)
@@ -738,8 +779,8 @@ def material_spec(mat, version=279):
             warnings.append(f'{name}: a texture slot maps to no channel '
                             'Halcyon shades with; slot skipped')
 
-    return {'name': name, 'model': model, 'bi': bi, 'inputs': inputs,
-            'textures': textures, 'warnings': warnings}
+    return {'name': name, 'model': model, 'bi': bi, 'halo': None,
+            'inputs': inputs, 'textures': textures, 'warnings': warnings}
 
 
 #: Lamp.mode bits (DNA_lamp_types.h)
@@ -822,6 +863,9 @@ def lamp_map(la, version=279):
         out['area_size'] = _f(la.get('area_size'), 1.0)
         out['area_size_y'] = _f(la.get('area_sizey'),
                                 _f(la.get('area_size'), 1.0))
+        # la->k, the 2.79 area lamp's Gamma: shapes the form factor
+        # as pow(intens * areasize, k) in area_lamp_energy_multisample
+        out['area_gamma'] = _f(la.get('k'), 1.0)
     return out
 
 

@@ -120,9 +120,9 @@ class Surface:
                  'opacity', 'diffuse_level', 'specular_level', 'translucency',
                  'toon_size', 'toon_smooth', 'toon_steps', 'reflect', 'model',
                  'tangent', 'bitangent', 'backfacing',
-                 'fresnel', 'fresnel_power', 'fresnel_color',
-                 'rim', 'rim_power', 'rim_color',
-                 'matcap', 'matcap_blend', 'reflect_color',
+                 'fresnel', 'fresnel_power', 'fresnel_color', 'fresnel_blend',
+                 'rim', 'rim_power', 'rim_color', 'rim_blend',
+                 'matcap', 'matcap_blend', 'matcap_mode', 'reflect_color',
                  'edge_opacity', 'backface_color', 'backface_mix',
                  'sheen', 'sheen_color', 'sheen_roughness', 'refraction',
                  # the BI material node's own controls: the specular
@@ -198,6 +198,13 @@ class Surface:
         self.rim_color = np.ones((n, 3), np.float32)
         self.matcap = np.zeros((n, 3), np.float32)
         self.matcap_blend = np.zeros(n, np.float32)
+        # how each silhouette cheat lands on the lit result. 0 keeps the
+        # historical behaviour (Add for fresnel/rim, Mix for matcap);
+        # 1/2/3 are Mix-or-Add / Multiply / Screen, decoded in
+        # apply_surface_effects and mirrored by the GPU pass
+        self.fresnel_blend = np.zeros(n, np.float32)
+        self.rim_blend = np.zeros(n, np.float32)
+        self.matcap_mode = np.zeros(n, np.float32)
         self.reflect_color = np.ones((n, 3), np.float32)
         self.edge_opacity = np.ones(n, np.float32)
         self.backface_color = np.zeros((n, 3), np.float32)
@@ -255,15 +262,23 @@ def diffuse_lambert(ndl, **_):
     return np.maximum(ndl, 0.0)
 
 
-def diffuse_oren_nayar(ndl, ndv, l, v, n, roughness, **_):
+def diffuse_oren_nayar(ndl, ndv, l, v, n, roughness, realnl=None, **_):
     """2.79's OrenNayar_Diff, verbatim (R155): nv clamps at 0 (View_A
     caps at pi/2), the projected-vector cosine floors at 0, and the
     smaller angle is scaled by 0.95 before tan -- the C's own guard
-    against the tangent shooting to infinity."""
+    against the tangent shooting to infinity.
+
+    `realnl` is the C's own split (R190): OrenNayar_Diff takes an area
+    lamp's `inp` as its first argument but recomputes `realnl = n.l`
+    inside, gates on BOTH (realnl <= 0 and nl < 0 each return 0), and
+    builds every angle and projection from realnl -- inp survives only
+    as the outer factor `i = nl * (...)`. Without it (everywhere but
+    an area lamp) the two are the same number and the arithmetic is
+    bit-for-bit the old road."""
     s2 = roughness * roughness
     a = 1.0 - 0.5 * s2 / (s2 + 0.33)
     b = 0.45 * s2 / (s2 + 0.09)
-    nl = np.clip(ndl, -1.0, 1.0)
+    nl = np.clip(ndl if realnl is None else realnl, -1.0, 1.0)
     nv = np.maximum(np.clip(ndv, -1.0, 1.0), 0.0)
     ti = np.arccos(np.clip(nl, -1.0, 1.0))
     tr = np.arccos(np.clip(nv, -1.0, 1.0))
@@ -272,8 +287,14 @@ def diffuse_oren_nayar(ndl, ndv, l, v, n, roughness, **_):
     lp = l - n * nl[:, None]
     vp = v - n * nv[:, None]
     cos_dphi = np.clip(M.dot(M.normalize(lp), M.normalize(vp)), -1.0, 1.0)
-    return (np.maximum(nl, 0.0) * (a + b * np.maximum(cos_dphi, 0.0) *
-                                   np.sin(alpha) * np.tan(beta))
+    if realnl is None:
+        outer = np.maximum(nl, 0.0)
+    else:
+        # if (realnl <= 0.0f) return 0.0f; if (nl < 0.0f) return 0.0f;
+        outer = np.where((nl > 0.0) & (np.asarray(ndl) >= 0.0),
+                         ndl, 0.0).astype(np.float32)
+    return (outer * (a + b * np.maximum(cos_dphi, 0.0) *
+                     np.sin(alpha) * np.tan(beta))
             ).astype(np.float32)
 
 
@@ -564,7 +585,8 @@ BI_DIFF_ORDER = ('LAMBERT', 'OREN_NAYAR', 'TOON', 'MINNAERT', 'FRESNEL')
 BI_SPEC_ORDER = ('COOKTORR', 'PHONG', 'BLINN', 'TOON', 'WARDISO')
 
 
-def bi_matrix_terms(model, surf, n, l, v, ndl, ndv, ndh, vdh):
+def bi_matrix_terms(model, surf, n, l, v, ndl, ndv, ndh, vdh,
+                    area_ndl=None):
     """(diffuse, specular scalar) for a BI material node's shader pair.
 
     The node keeps Blender Internal's diffuse and specular menus
@@ -573,20 +595,32 @@ def bi_matrix_terms(model, surf, n, l, v, ndl, ndv, ndh, vdh):
     roughness carries Oren-Nayar roughness or Minnaert darkness (the
     diffuse menu chooses one), bi_slope carries WardIso's Slope,
     toon_size2/toon_smooth2 the specular Toon pair, glossiness the
-    Hardness, ior the Refr slider."""
+    Hardness, ior the Refr slider.
+
+    `area_ndl`, when given, is an AREA lamp's form-factor energy (the
+    `inp` shade_one_light computes before the diffuse dispatch). It
+    replaces the dot for exactly the shaders whose C took `inp` as an
+    argument -- Lambert, Oren-Nayar, Minnaert. Toon_Diff and
+    Fresnel_Diff took only the raw vectors, so under an area lamp they
+    never saw the form factor: the quirk is kept. Specular gates keep
+    the true dots too (the C's spec functions compute their own);
+    the caller multiplies the finished specular by `inp`."""
     di = int(model[10])
     si = int(model[12])
+    nd = ndl if area_ndl is None else area_ndl
     if di == 1:
-        dif = diffuse_oren_nayar(ndl, ndv, l, v, n, surf.roughness)
+        dif = diffuse_oren_nayar(
+            nd, ndv, l, v, n, surf.roughness,
+            realnl=(ndl if area_ndl is not None else None))
     elif di == 2:
         dif = diffuse_bi_toon(ndl, surf.toon_size, surf.toon_smooth)
     elif di == 3:
-        dif = diffuse_bi_minnaert(ndl, ndv, surf.roughness)
+        dif = diffuse_bi_minnaert(nd, ndv, surf.roughness)
     elif di == 4:
         dif = diffuse_bi_fresnel(ndl, surf.bi_fresnel,
                                  surf.bi_fresnel_fac)
     else:
-        dif = np.maximum(ndl, 0.0)
+        dif = np.maximum(nd, 0.0)
     if si == 1:
         spec = spec_bi_phong(ndl, ndh, surf.glossiness)
     elif si == 2:
@@ -760,12 +794,21 @@ def _strauss_g(x, k):
 # ------------------------------------------------------------------ driver
 
 
-def evaluate(model, surf, n, l, v, ndl_raw=None):
+def evaluate(model, surf, n, l, v, ndl_raw=None, area_ndl=None,
+             area_ndl_back=None):
     """Evaluate one light for `model`.
 
     n, l, v: (N,3) unit vectors. l points from surface *toward* the light,
     v points from surface toward the eye.
     Returns (diffuse (N,), specular (N,3)).
+
+    `area_ndl` is an AREA lamp's form-factor energy (lights.area_inp):
+    it stands in for the diffuse cosine the way shade_one_light's
+    `inp` did, while specular keeps its own true-dot gates -- the
+    caller multiplies the returned specular by the same energy
+    (specfac *= inp, the C's area lamp correction). `area_ndl_back`
+    is the flipped-normal twin, consumed by BI translucency's
+    negated-normal rerun.
     """
     ndl = M.dot(n, l) if ndl_raw is None else ndl_raw
     ndv = M.dot(n, v)
@@ -798,32 +841,39 @@ def evaluate(model, surf, n, l, v, ndl_raw=None):
         else:
             n_use = n
         dif, spec = bi_matrix_terms(model, surf, n_use, l, v,
-                                    ndl, ndv, ndh, vdh)
+                                    ndl, ndv, ndh, vdh,
+                                    area_ndl=area_ndl)
         if np.any(surf.translucency > 0.0):
             # BI's translucency: the SAME diffuse shader, evaluated
             # through the flipped normal, scaled by the slider -- for
             # every shader, not just a dedicated model
             dif_back, _sb = bi_matrix_terms(model, surf, -n_use, l, v,
-                                            -ndl, -ndv, -ndh, vdh)
+                                            -ndl, -ndv, -ndh, vdh,
+                                            area_ndl=area_ndl_back)
             dif = dif + np.clip(surf.translucency, 0.0, 1.0) * dif_back
         if np.any(surf.bi_cubic > 0.5):
             dif = np.where(surf.bi_cubic > 0.5, bi_cubic(dif), dif)
         spec = _soften(spec, ndl, surf.soften)
         return dif, spec[:, None] * surf.specular
 
-    # ---- diffuse term
+    # ---- diffuse term (an AREA lamp's form factor stands in for the
+    # cosine, exactly as shade_one_light's `inp` reassignment did)
+    ndl_d = ndl if area_ndl is None else area_ndl
     if model == 'OREN_NAYAR':
-        dif = diffuse_oren_nayar(ndl, ndv, l, v, n, surf.roughness)
+        dif = diffuse_oren_nayar(
+            ndl_d, ndv, l, v, n, surf.roughness,
+            realnl=(ndl if area_ndl is not None else None))
     elif model == 'MINNAERT':
-        dif = diffuse_minnaert(ndl, ndv, 1.0 + surf.roughness * 2.0)
+        dif = diffuse_minnaert(ndl_d, ndv, 1.0 + surf.roughness * 2.0)
     elif model == 'TOON':
-        dif = diffuse_toon(ndl, surf.toon_size, surf.toon_smooth, surf.toon_steps)
+        dif = diffuse_toon(ndl_d, surf.toon_size, surf.toon_smooth, surf.toon_steps)
     elif model == 'TRANSLUCENT':
-        dif = np.maximum(ndl, 0.0) + np.maximum(-ndl, 0.0) * surf.translucency
+        back_d = (-ndl) if area_ndl_back is None else area_ndl_back
+        dif = np.maximum(ndl_d, 0.0) + np.maximum(back_d, 0.0) * surf.translucency
     elif model == 'STRAUSS':
-        dif = np.maximum(ndl, 0.0)
+        dif = np.maximum(ndl_d, 0.0)
     else:
-        dif = np.maximum(ndl, 0.0)
+        dif = np.maximum(ndl_d, 0.0)
 
     # ---- specular term
     if model in ('LAMBERT', 'OREN_NAYAR', 'MINNAERT', 'TRANSLUCENT'):

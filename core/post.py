@@ -149,6 +149,99 @@ def star_filter(rgb, st):
     return (rgb + acc * st.star_intensity).astype(np.float32)
 
 
+def lamp_flares(rgb, st, sources):
+    """Per-lamp lens flares: the Video Post / LightWave anatomy.
+
+    Each source (built by the renderer with its screen anchor and its
+    VISIBILITY fraction) draws the classic kit in linear light: a hot
+    core with a tight spike, chromatic halo rings, a rotatable star of
+    streaks, and a march of soft hexagonal aperture ghosts along the
+    line through frame centre. Everything is a pure function of the
+    source list -- deterministic, no thresholds, no image feedback --
+    and every element is scaled by the source's visibility, so a flare
+    dies exactly as its lamp slips behind geometry, which is the whole
+    period behaviour.
+    """
+    if not sources:
+        return rgb
+    h, w = rgb.shape[:2]
+    m = float(min(w, h))
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    cx, cy = (w - 1) * 0.5, (h - 1) * 0.5
+    out = rgb
+    add = np.zeros_like(rgb)
+    for src in sources:
+        inten = float(src.get('intensity', 0.0))
+        if inten <= 0.0:
+            continue
+        scale = max(float(src.get('scale', 1.0)), 0.05)
+        sx = (float(src['x']) * 0.5 + 0.5) * (w - 1)
+        sy = (float(src['y']) * 0.5 + 0.5) * (h - 1)
+        col = np.asarray(src.get('color', (1, 1, 1)), np.float32)
+        col = col / max(float(col.max()), 1e-6)
+        nx = (xx - sx) / (m * scale)
+        ny = (yy - sy) / (m * scale)
+        nd = np.sqrt(nx * nx + ny * ny)
+
+        # the hot core and its tight spike
+        elem = np.exp(-(nd / 0.05) ** 2) * 0.9 \
+            + np.exp(-(nd / 0.012) ** 2) * 1.6
+        acc = col[None, None, :] * elem[:, :, None]
+
+        # chromatic halo rings: each channel's ring lands at a slightly
+        # different radius, which is what smeared the era's halos into
+        # little rainbows
+        for k in range(max(int(src.get('rings', 0)), 0)):
+            rr = 0.14 + 0.11 * k
+            for ci, off in enumerate((-0.008, 0.0, 0.008)):
+                band = np.exp(-(((nd - (rr + off)) / 0.014) ** 2))
+                acc[:, :, ci] += band * (0.22 / (1.0 + k)) * col[ci]
+
+        # the star: N spokes, fixed base rotation, bright near the
+        # source and fading along their length
+        n_st = max(int(src.get('streaks', 0)), 0)
+        if n_st > 0:
+            base = 0.4363                     # ~25 degrees, the classic tilt
+            for i in range(min(n_st, 16)):
+                th = base + i * (2.0 * np.pi / n_st)
+                ux, uy = np.cos(th), np.sin(th)
+                proj = nx * ux + ny * uy
+                perp = np.abs(nx * uy - ny * ux)
+                spoke = np.exp(-(perp / 0.006) ** 2) \
+                    * np.exp(-np.maximum(proj, 0.0) / 0.45)
+                spoke = np.where(proj > 0.0, spoke, 0.0)
+                acc += col[None, None, :] * (spoke * 0.35)[:, :, None]
+
+        # aperture ghosts marching through the frame centre: soft
+        # hexagons, deterministic sizes and tints per index
+        n_gh = max(int(src.get('ghosts', 0)), 0)
+        tints = np.array([[1.0, 0.72, 0.45], [0.45, 0.8, 1.0],
+                          [0.8, 1.0, 0.6], [1.0, 0.55, 0.9],
+                          [0.6, 0.62, 1.0], [1.0, 0.95, 0.6]], np.float32)
+        spread = (0.35, 0.62, 0.9, 1.2, 1.55, 1.95, 0.5, 0.76, 1.05,
+                  1.38, 1.75, 2.2)
+        for g in range(min(n_gh, len(spread))):
+            t = spread[g]
+            gx = sx + (cx - sx) * t
+            gy = sy + (cy - sy) * t
+            hsh = (g * 2654435761) % 977
+            r_g = (0.02 + 0.03 * (hsh / 977.0)) * m * scale
+            dxg = xx - gx
+            dyg = yy - gy
+            # soft hexagon: the largest of three axis projections
+            a0 = np.abs(dxg)
+            a1 = np.abs(dxg * 0.5 + dyg * 0.8660254)
+            a2 = np.abs(dxg * 0.5 - dyg * 0.8660254)
+            dhex = np.maximum(a0, np.maximum(a1, a2))
+            iris = np.clip((r_g - dhex) / (0.35 * r_g), 0.0, 1.0)
+            iris = iris * iris * (3.0 - 2.0 * iris)
+            tint = tints[g % len(tints)] * col
+            acc += tint[None, None, :] * (iris * (0.5 / (1.0 + g)))[:, :, None]
+
+        add += acc * inten
+    return (out + add).astype(np.float32)
+
+
 def lens_flare(rgb, st):
     """Ghost images of the bright spots mirrored through the frame centre."""
     if not st.lens_flare or st.flare_intensity <= 0:
@@ -210,6 +303,13 @@ def _palette_for(st, size, rgb, seed, mode=None):
     Locking it is both faster and steadier, which is why it defaults to on.
     """
     mode = mode or st.palette_mode
+    if mode == 'CUSTOM':
+        # R202: the image IS the palette. Extracted at export from the
+        # picked Palette Image (deterministic, luma-sorted); with no
+        # image picked, CUSTOM keeps its old adaptive behaviour
+        cols = getattr(st, 'palette_colors', None)
+        if cols:
+            return np.asarray(cols, np.float32).reshape(-1, 3)
     if mode != 'ADAPTIVE' or not getattr(st, 'palette_lock', True):
         return PA.get_palette(mode, size, rgb.reshape(-1, 3),
                               st.palette_method, seed)
@@ -647,7 +747,8 @@ def fit_to(rgb, size):
 
 
 def process(image, st, frame=0, seed=0, target_size=None, allow_resize=True,
-            depth=None, shaft_sources=None, stamp_info=None):
+            depth=None, shaft_sources=None, flare_sources=None,
+            stamp_info=None):
     """Linear RGBA framebuffer -> final display-referred RGBA.
 
     Row order is preserved; row 0 stays the bottom of the picture.
@@ -685,6 +786,7 @@ def process(image, st, frame=0, seed=0, target_size=None, allow_resize=True,
     rgb = glow(rgb, st)
     rgb = star_filter(rgb, st)
     rgb = lens_flare(rgb, st)
+    rgb = lamp_flares(rgb, st, flare_sources)
     gpu_out = _gpu_stage('display', rgb, st)
     rgb = gpu_out if gpu_out is not None else display_transform(rgb, st)
     rgb = reduce_depth(rgb, st, seed)

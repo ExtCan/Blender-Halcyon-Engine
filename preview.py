@@ -507,8 +507,17 @@ class Viewport:
             except Exception:                                   # noqa: BLE001
                 pass
             img = post.process(img, settings,
+                               frame=getattr(scene, 'frame', 0),
+                               seed=getattr(settings, 'seed', 0),
                                target_size=(settings.resolution_x,
-                                            settings.resolution_y))
+                                            settings.resolution_y),
+                               # R195: the per-lamp flares draw in the
+                               # rendered viewport too -- the field set
+                               # the dial, looked exactly here, and saw
+                               # nothing because this call never passed
+                               # the sources the render had computed
+                               flare_sources=getattr(scene, 'last_flares',
+                                                     None))
             # THE BLACK-FRAME GUARD (a field instrument): the field reports
             # materials randomly turning pure black / flashing, VIEWPORT
             # only, GPU device -- and the headless cadence stress runs
@@ -568,8 +577,12 @@ class Viewport:
                     scene.settings = retry
                     img = core_render.render(scene, retry, progress=tick)
                     img = post.process(img, retry,
+                                       frame=getattr(scene, 'frame', 0),
+                                       seed=getattr(retry, 'seed', 0),
                                        target_size=(retry.resolution_x,
-                                                    retry.resolution_y))
+                                                    retry.resolution_y),
+                                       flare_sources=getattr(
+                                           scene, 'last_flares', None))
                     self.last_engaged = 'CPU (guard)'
                     blk, tiles = _black_measure(img)
                 self._black_prev = blk

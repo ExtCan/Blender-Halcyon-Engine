@@ -231,6 +231,30 @@ PRESETS = {
         },
     },
 
+    'BRYCE_STILL': {
+        'label': "Bryce still (overnight render)",
+        'category': 'SOFTWARE',
+        'note': "The postcard: the render you queued at midnight and "
+                "collected at breakfast. High supersampling, soft ray "
+                "shadows, a breath of haze and bloom, colour turned up "
+                "a notch. Pair it with the Bryce sky and a Terrain.",
+        'settings': {
+            'resolution_x': 800, 'resolution_y': 600,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 9,
+            'aa_filter': 'CATROM',
+            'default_model': 'LAMBERT',
+            'shadows': True, 'shadow_default': 'RAY',
+            'ray_shadows': True, 'shadow_softness': 2.0,
+            'shadow_samples': 16,
+            'fog': True, 'fog_mode': 'EXP', 'fog_density': 0.008,
+            'fog_color': (0.66, 0.74, 0.85),
+            'glow': True, 'glow_intensity': 0.22,
+            'glow_threshold': 0.8,
+            'color_depth': '24', 'dither': 'NONE',
+            'gamma': 2.2, 'saturation': 1.15,
+        },
+    },
+
     # ---------------------------------------------------- more software
     'ELECTRIC_IMAGE': {
         'label': "ElectricImage 2.9 (1996)",
@@ -1156,6 +1180,27 @@ PRESETS = {
             'crt_mask': 'APERTURE', 'crt_mask_strength': 0.2,
             'crt_vignette': 0.25, 'gamma': 2.2, 'glow': True,
             'glow_intensity': 0.3,
+        },
+    },
+    'SGI_BROADCAST': {
+        'label': "SGI broadcast CGI (1994)",
+        'category': 'BROADCAST',
+        'note': "The Saturday-morning television pipeline: big-iron SGI "
+                "frames at D1 NTSC, plastic Phong characters, hard map "
+                "shadows, broadcast-legal colour and a light interlace "
+                "blend. ReBoot on your engine.",
+        'settings': {
+            'resolution_x': 720, 'resolution_y': 486,
+            'pixel_aspect_x': 10.0, 'pixel_aspect_y': 11.0,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 9,
+            'aa_filter': 'CATROM',
+            'default_model': 'PHONG', 'specular_in_gamma': True,
+            'shadows': True, 'shadow_default': 'MAP',
+            'shadow_map_size': 1024, 'shadow_softness': 1.0,
+            'shadow_samples': 4,
+            'global_ambient': (0.10, 0.10, 0.12),
+            'color_depth': '24', 'interlace': 'BLEND',
+            'gamma': 2.2, 'saturation': 0.9, 'dither': 'NONE',
         },
     },
     'PAL_TV': {

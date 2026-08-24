@@ -67,7 +67,7 @@ class ShadowMap:
     """One depth image rendered from a light."""
 
     __slots__ = ('vp', 'depth', 'near', 'far', 'persp', 'size', 'origin',
-                 'extent')
+                 'extent', 'soft_extra')
 
     def __init__(self, vp, zndc, near, far, persp, size, origin, extent=1.0):
         self.vp = vp
@@ -78,6 +78,9 @@ class ShadowMap:
         self.size = int(size)
         self.origin = np.asarray(origin, np.float32)
         self.depth = self._linearise(zndc)
+        # extra PCF blur, in texels, derived from the LAMP'S OWN SIZE at
+        # build time (see soft_size_texels) -- 0 keeps the classic blur
+        self.soft_extra = 0.0
 
     def _linearise(self, z):
         z = np.clip(np.asarray(z, np.float32), -1.0, 1.0)
@@ -145,11 +148,12 @@ def _pcf_offsets(n):
 class CubeShadow:
     """Six ShadowMaps for an omnidirectional light."""
 
-    __slots__ = ('faces', 'origin')
+    __slots__ = ('faces', 'origin', 'soft_extra')
 
     def __init__(self, faces, origin):
         self.faces = faces
         self.origin = np.asarray(origin, np.float32)
+        self.soft_extra = 0.0
 
     def texel_size(self, dist):
         return self.faces[0].texel_size(dist)
@@ -224,11 +228,18 @@ def _light_shadow_signature(light):
     """The one light's own contribution to its map: pose and lens.
 
     Colour and energy are deliberately absent -- they tint the LIGHT,
-    never the depth -- so palette edits ride the cache untouched."""
+    never the depth -- so palette edits ride the cache untouched. The
+    lamp's SIZE is present: it does not move a depth texel either, but
+    the built map carries soft_extra (the size-derived blur) stamped at
+    build time, and the field proved a cached map serves a stale one --
+    dragging Radius did nothing until something else rebuilt the map."""
+    asz = getattr(light, 'area_size', (0.0, 0.0))
     return (light.type, tuple(np.round(light.position, 5)),
             tuple(np.round(light.direction, 5)),
             round(float(light.spot_size), 5), light.shadow,
-            int(light.shadow_map_size))
+            int(light.shadow_map_size),
+            round(float(getattr(light, 'radius', 0.0)), 6),
+            round(float(asz[0]), 6), round(float(asz[1]), 6))
 
 
 def build_shadow_maps(scene, settings, caster_tris=None):
@@ -288,6 +299,41 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
         return
     centre, radius = scene_bounds(mesh.verts)
 
+    def _soft_world(light, dist):
+        """The lamp's size as a world-space blur radius at `dist` away.
+
+        SUN's size is an ANGLE (Blender's light.angle), so its world
+        radius grows with distance; AREA uses half the mean edge;
+        POINT/SPOT use the radius directly. This is what makes the size
+        dials WORK under shadow maps: the field report was that only
+        the spot cone visibly responded to size, because the ray path
+        read radius and the map path read nothing.
+        """
+        kind = str(getattr(light, 'type', 'POINT')).upper()
+        if kind == 'SUN':
+            return float(np.tan(float(getattr(light, 'radius', 0.0))
+                                * 0.5)) * float(dist)
+        if kind == 'AREA':
+            asz = getattr(light, 'area_size', (0.0, 0.0))
+            return 0.25 * (float(asz[0]) + float(asz[1]))
+        return float(getattr(light, 'radius', 0.0))
+
+    def _stamp_soft(sm, light, rep_dist):
+        """Store the size-derived extra blur, in texels, on the map.
+
+        Computed once at build with the scene centre as the
+        representative receiver -- the era's buffer shadows were a
+        constant blur, and a constant is what both devices can agree
+        on exactly. Capped so a huge lamp cannot smear the whole map.
+        """
+        first = sm.faces[0] if hasattr(sm, 'faces') else sm
+        eff = _soft_world(light, rep_dist)
+        if eff <= 0.0:
+            return
+        texel = float(np.asarray(first.texel_size(
+            np.asarray([rep_dist], np.float32))).reshape(-1)[0])
+        sm.soft_extra = float(min(eff / max(texel, 1e-9) * 0.5, 24.0))
+
     # PLAN first (cheap geometry per map), RENDER second -- because the
     # renders are independent: each map is its own buffer, its own depth
     # min-compares, deterministic in isolation, so thread scheduling
@@ -323,6 +369,8 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
                        size=size, eye=eye, half=half):
                 light.shadow_map = ShadowMap(vp, depth, near, far, False,
                                              size, eye, half)
+                _stamp_soft(light.shadow_map, light,
+                            float(np.linalg.norm(centre - eye)))
             jobs.append((assign, vp, size))
         elif light.type == 'SPOT':
             d = M.normalize(np.asarray(light.direction, np.float32))
@@ -337,6 +385,8 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
                 light.shadow_map = ShadowMap(vp, depth, near, far, True,
                                              size, pos,
                                              float(np.tan(fov * 0.5)))
+                _stamp_soft(light.shadow_map, light,
+                            float(np.linalg.norm(centre - pos)))
             jobs.append((assign, vp, size))
         else:
             near = max(radius * 0.005, 1e-3)
@@ -356,6 +406,8 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
                     pending['n'] -= 1
                     if pending['n'] == 0:
                         light.shadow_map = CubeShadow(list(slots), pos)
+                        _stamp_soft(light.shadow_map, light,
+                                    float(np.linalg.norm(centre - pos)))
                 jobs.append((assign, vp, size))
 
     if not jobs:
@@ -563,7 +615,15 @@ def sample(light, P, settings, area_sample=None):
         delta = pos[None, :] - P
     dist = np.sqrt(np.maximum((delta * delta).sum(axis=1), EPS)).astype(np.float32)
     L = delta / dist[:, None]
-    att = attenuate(light, dist, settings)
+    if light.type == 'AREA':
+        # lamp_get_visibility SKIPS its falloff switch for LA_AREA:
+        # visifac stays 1.0, and every bit of an area lamp's distance
+        # behaviour lives in the form factor (area_inp) instead --
+        # dist^2/A times the Stokes contour. Decay dials, Sphere and
+        # the 0.001 snap never applied to area lamps in 2.79
+        att = np.ones_like(dist)
+    else:
+        att = attenuate(light, dist, settings)
     if light.type == 'SPOT':
         att = att * spot_falloff(light, L)
     if str(getattr(light, 'decay', '')).startswith('BI_') or \
@@ -576,6 +636,89 @@ def sample(light, P, settings, area_sample=None):
     if light.type == 'SPOT' and getattr(light, 'cookie', None) is not None:
         rad = rad * cookie_factor(light, P, L)
     return L.astype(np.float32), rad.astype(np.float32), dist
+
+
+def area_inp(light, P, N, want_back=False):
+    """BI's area lamp energy -- shadeoutput.c area_lamp_energy, verbatim.
+
+    The Stokes contour integral over the rectangle's four corners, in
+    DOUBLE precision exactly as the C (the acos of near-parallel unit
+    vectors is why BI used doubles here): for each edge, the arc angle
+    times the normal's projection on the edge plane's normal. The sum
+    replaces N.L as the diffuse shader input `inp`, and the specular
+    term is multiplied by it -- shade_one_light's LA_AREA branches.
+
+    Scaled and shaped as area_lamp_energy_multisample at one sample
+    (the 2.79 default, and the exact integral -- the jittered tiles
+    only Monte-Carlo the same quantity):
+
+        inp = pow(stokes * areasize, k),  areasize = dist^2 / (sx*sy)
+
+    with `dist` the lamp's Distance (decay_end) and `k` the 2.79 area
+    lamp's Gamma. A point behind the lamp's plane gets 0 (single
+    sided). DISK/ELLIPSE shapes use their bounding rectangle -- the
+    era formula only knows corners. lamp_get_visibility gives an area
+    lamp visifac 1.0 (its falloff switch is skipped): the ONLY
+    distance behaviour an area lamp has is this form factor's.
+
+    Returns (n,) float32; with `want_back`, (front, back) where back
+    is the same energy through the flipped normal -- BI's translucency
+    reruns the whole lamp loop with vn negated, and the Stokes sum is
+    linear in vn so both sides fall out of one contour.
+    """
+    n = P.shape[0]
+    pos = np.asarray(light.position, np.float64)
+    d = np.asarray(light.direction, np.float64)
+    d = d / max(float(np.linalg.norm(d)), 1e-12)          # lar->vec
+    ax = np.asarray(getattr(light, 'area_x', None)
+                    if getattr(light, 'area_x', None) is not None
+                    else (1.0, 0.0, 0.0), np.float64)
+    ay = np.asarray(getattr(light, 'area_y', None)
+                    if getattr(light, 'area_y', None) is not None
+                    else (0.0, 1.0, 0.0), np.float64)
+    asz = getattr(light, 'area_size', (1.0, 1.0))
+    sx = max(float(asz[0]), 1e-6)
+    sy = max(float(asz[1]) if len(asz) > 1 else float(asz[0]), 1e-6)
+    hx, hy = ax * (sx * 0.5), ay * (sy * 0.5)
+    # area_lamp_vectors' corner order: -x-y, -x+y, +x+y, +x-y
+    corners = (pos - hx - hy, pos - hx + hy,
+               pos + hx + hy, pos + hx - hy)
+    P64 = P.astype(np.float64)
+    vec = []
+    for c in corners:
+        v = P64 - c[None, :]                              # VECSUB(v, co, area)
+        v /= np.maximum(np.sqrt((v * v).sum(axis=1)), 1e-300)[:, None]
+        vec.append(v)
+    # BI shades in a flipped frame: shade_input_set_normals negates
+    # normals to lie ALONG the view ray (dot(facenor, view) >= 0 with
+    # view camera->point), so shade_one_light's vn points AWAY from
+    # the viewer and lv runs lamp->surface. Symmetric dots cancel the
+    # flips, but the Stokes contour sees vn bare: entering with
+    # Halcyon's outward N and BI's corner winding lands exactly one
+    # sign off. vn = -N is the C's own frame (proven by compiling
+    # area_lamp_energy verbatim: vn toward the lamp gives 0, away
+    # gives the positive contour).
+    vn = -N.astype(np.float64)
+    fac = np.zeros(n, np.float64)
+    for i in range(4):
+        a, b = vec[i], vec[(i + 1) % 4]
+        cr = np.cross(a, b)
+        cr /= np.maximum(np.sqrt((cr * cr).sum(axis=1)), 1e-300)[:, None]
+        # saacos_d: acos clamped into its domain
+        ang = np.arccos(np.clip((a * b).sum(axis=1), -1.0, 1.0))
+        fac += ang * (vn * cr).sum(axis=1)
+    dist = max(float(getattr(light, 'decay_end', 25.0)), 1e-6)
+    areasize = dist * dist / (sx * sy)
+    k = float(getattr(light, 'area_gamma', 1.0) or 1.0)
+    # single sided: behind the lamp's plane nothing arrives
+    front = ((P64 - pos[None, :]) * d[None, :]).sum(axis=1) >= 0.0
+    inp = np.power(np.maximum(fac, 0.0) * areasize, k)
+    inp = np.where(front, inp, 0.0).astype(np.float32)
+    if not want_back:
+        return inp
+    binp = np.power(np.maximum(-fac, 0.0) * areasize, k)
+    binp = np.where(front, binp, 0.0).astype(np.float32)
+    return inp, binp
 
 
 def area_samples(light, count, rng):
@@ -638,34 +781,91 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
         bias = max(settings.ray_bias, 1e-4)
         origin = P + N * bias + L * bias
         maxt = np.where(dist > 1e8, 1e9, dist * (1.0 - 1e-3))
-        samples = max(1, int(settings.shadow_samples)) if light.radius > 0 else 1
+        kind = str(getattr(light, 'type', 'POINT')).upper()
+        # what "size" means per lamp: SUN's is an ANGLE, AREA's is its
+        # rectangle, POINT/SPOT a world radius. The old code read
+        # light.radius for all of them -- for a SUN that jittered a
+        # 1e9-unit-long direction by a few hundredths of a unit (an
+        # angle of ~3e-11: nothing), and for an AREA it read Blender's
+        # shadow_soft_size, which area lamps do not carry (0: nothing).
+        # This is why "changing light sizes doesn't actually work".
+        area_hx = area_hy = 0.0
+        if kind == 'AREA':
+            asz = getattr(light, 'area_size', (0.0, 0.0))
+            area_hx, area_hy = float(asz[0]) * 0.5, float(asz[1]) * 0.5
+            soft_on = area_hx > 0.0 or area_hy > 0.0
+        else:
+            soft_on = float(light.radius) > 0.0
+        samples = max(1, int(settings.shadow_samples)) if soft_on else 1
         if samples == 1:
             hit = bvh.occluded(origin, L, maxt, mask=mask)
             return (~hit).astype(np.float32)
         acc = np.zeros(n, np.float32)
         t, b = M.orthonormal_basis(L)
+        if kind == 'AREA':
+            ax = np.asarray(light.area_x, np.float32)
+            ax = ax / max(float(np.linalg.norm(ax)), 1e-9)
+            ay = np.asarray(light.area_y, np.float32)
+            ay = ay / max(float(np.linalg.norm(ay)), 1e-9)
+            lpos = np.asarray(light.position, np.float32)
+            disk = str(getattr(light, 'area_shape', 'SQUARE')) \
+                in ('DISK', 'ELLIPSE')
+
+        def _soft_ray(u1, u2):
+            """(Lj, mt): one soft-shadow ray per pixel from two uniforms.
+
+            AREA aims at a real point on the rectangle (or ellipse) --
+            penumbras follow the lamp's true shape and size; SUN tilts
+            the direction inside its angular disc; POINT/SPOT jitter the
+            target inside a world-space sphere of the radius, exactly
+            the classic behaviour.
+            """
+            if kind == 'AREA':
+                if disk:
+                    rr = np.sqrt(u1)
+                    ca_, sa_ = PT.sample_circle(u2) if sample_xy is not None \
+                        else (np.cos(u2 * 2.0 * np.pi),
+                              np.sin(u2 * 2.0 * np.pi))
+                    uu, vv = rr * ca_, rr * sa_
+                else:
+                    uu, vv = u1 * 2.0 - 1.0, u2 * 2.0 - 1.0
+                ps = lpos[None, :] + ax[None, :] * (area_hx * uu)[:, None] \
+                    + ay[None, :] * (area_hy * vv)[:, None]
+                delta = ps - P
+                ds = np.sqrt(np.maximum((delta * delta).sum(axis=1), EPS))
+                return delta / ds[:, None], ds * (1.0 - 1e-3)
+            ca_, sa_ = PT.sample_circle(u2) if sample_xy is not None \
+                else (np.cos(u2 * 2.0 * np.pi), np.sin(u2 * 2.0 * np.pi))
+            if kind == 'SUN':
+                # the size is Blender's light.angle: tilt the ray inside
+                # that cone, which is what a sun's size IS
+                r = np.sqrt(u1) * np.float32(
+                    np.tan(float(light.radius) * 0.5))
+                jitter = t * (r * ca_)[:, None] + b * (r * sa_)[:, None]
+                return M.normalize(L + jitter), maxt
+            r = np.sqrt(u1) * np.float32(light.radius)
+            jitter = t * (r * ca_)[:, None] + b * (r * sa_)[:, None]
+            return M.normalize(L * dist[:, None] + jitter), maxt
+
         if sample_xy is not None:
             from . import patterns as PT
             spx, spy, li = sample_xy
             seed = int(getattr(settings, 'seed', 0) or 0)
-            radius = np.float32(light.radius)
             for k in range(samples):
                 z = 2 * k + 131 * int(li) + 7919 * seed
                 u1 = PT.sample_u(spx, spy, z)
-                ca, sa = PT.sample_circle(PT.sample_u(spx, spy, z + 1))
-                r = np.sqrt(u1) * radius
-                jitter = t * (r * ca)[:, None] + b * (r * sa)[:, None]
-                Lj = M.normalize(L * dist[:, None] + jitter)
-                acc += (~bvh.occluded(origin, Lj, maxt,
+                u2 = PT.sample_u(spx, spy, z + 1)
+                Lj, mt = _soft_ray(u1, u2)
+                acc += (~bvh.occluded(origin, Lj, mt,
                                       mask=mask)).astype(np.float32)
             return acc / samples
+        from . import patterns as PT                            # noqa: F811
         rng = rng or np.random.default_rng(settings.seed)
         for _ in range(samples):
-            r = np.sqrt(rng.random()) * light.radius
-            th = rng.random() * 2 * np.pi
-            jitter = t * (r * np.cos(th)) + b * (r * np.sin(th))
-            Lj = M.normalize(L * dist[:, None] + jitter)
-            acc += (~bvh.occluded(origin, Lj, maxt,
+            u1 = np.full(n, rng.random(), np.float32)
+            u2 = np.full(n, rng.random(), np.float32)
+            Lj, mt = _soft_ray(u1, u2)
+            acc += (~bvh.occluded(origin, Lj, mt,
                                   mask=mask)).astype(np.float32)
         return acc / samples
 
@@ -675,7 +875,8 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
     bias = float(light.shadow_bias or settings.shadow_bias)
     ndl = np.clip(M.dot(N, L), 0.0, 1.0)
     slope = bias * (1.0 + 2.0 * (1.0 - ndl))
-    soft = max(float(light.shadow_softness) * settings.shadow_softness, 0.0)
+    soft = max(float(light.shadow_softness) * settings.shadow_softness, 0.0) \
+        + float(getattr(sm, 'soft_extra', 0.0) or 0.0)
     # normal offset: step off the surface by a texel or so, scaled by how
     # obliquely the light hits. Removes acne without the detached shadows a
     # large constant depth bias produces.

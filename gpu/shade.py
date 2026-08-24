@@ -44,6 +44,7 @@ INERT_FIELDS = (('edge_opacity', 1.0), ('opacity', 1.0))
 #: nearly every converted material, so refusing them refused real scenes.
 EXTRA_SCALARS = ('fresnel', 'fresnel_power', 'rim', 'rim_power',
                  'sheen', 'sheen_roughness', 'matcap_blend', 'backface_mix',
+                 'fresnel_blend', 'rim_blend', 'matcap_mode',
                  'reflect', 'refraction', 'edge_opacity',
                  # the BI panel round's CPU-consumed ray constants
                  'ray_ior', 'bi_ray_filter', 'bi_mir_fresnel',
@@ -500,14 +501,38 @@ def _shadow_meta(light, st, bvh=None):
             # features the plan has already refused), and without one the
             # RAY branch returns fully lit. Mirror that: no shadow term.
             return None, None, None
+        kind = str(getattr(light, 'type', 'POINT')).upper()
+        area = None
+        if kind == 'AREA':
+            asz = getattr(light, 'area_size', (0.0, 0.0))
+            hx, hy = float(asz[0]) * 0.5, float(asz[1]) * 0.5
+            soft_on = hx > 0.0 or hy > 0.0
+            if soft_on:
+                ax = np.asarray(getattr(light, 'area_x', (1, 0, 0)),
+                                np.float32)
+                ax = ax / max(float(np.linalg.norm(ax)), 1e-9)
+                ay = np.asarray(getattr(light, 'area_y', (0, 1, 0)),
+                                np.float32)
+                ay = ay / max(float(np.linalg.norm(ay)), 1e-9)
+                area = {'pos': tuple(float(v) for v in light.position),
+                        'ax': tuple(float(v) for v in ax),
+                        'ay': tuple(float(v) for v in ay),
+                        'hx': hx, 'hy': hy,
+                        'disk': str(getattr(light, 'area_shape', 'SQUARE'))
+                        in ('DISK', 'ELLIPSE')}
+        else:
+            soft_on = float(getattr(light, 'radius', 0.0)) > 0.0
         samples = max(1, int(getattr(st, 'shadow_samples', 1))) \
-            if float(getattr(light, 'radius', 0.0)) > 0.0 else 1
+            if soft_on else 1
         # soft ray shadows travel now: the jitter is a pure function of
         # (pixel, sample, light, seed) through the pattern hash and the
-        # shared unit-circle table, so both devices draw the SAME rays
+        # shared unit-circle table, so both devices draw the SAME rays.
+        # SUN carries its size as an ANGLE and AREA as its rectangle --
+        # the same per-kind meaning visibility() gives them on the CPU
         meta = {'ray': True,
                 'bias': max(float(getattr(st, 'ray_bias', 1e-3)), 1e-4),
                 'radius': float(getattr(light, 'radius', 0.0)),
+                'kind': kind, 'area': area,
                 'samples': int(samples)}
         return meta, None, None
     if sm is None:
@@ -542,7 +567,8 @@ def _shadow_meta(light, st, bvh=None):
 
     bias = float(getattr(light, 'shadow_bias', 0.0) or st.shadow_bias)
     soft = max(float(getattr(light, 'shadow_softness', 1.0))
-               * float(st.shadow_softness), 0.0)
+               * float(st.shadow_softness), 0.0) \
+        + float(getattr(sm, 'soft_extra', 0.0) or 0.0)
     meta = {
         'faces': [{'vp': np.asarray(f.vp, np.float32)} for f in faces_sm],
         'size': size, 'near': float(first.near), 'far': float(first.far),
@@ -600,6 +626,19 @@ def _light_sig(l):
            # unroll; the shadow colour folds into every light block
            round(float(getattr(l, 'radius', 0.0)), 6),
            t(getattr(l, 'shadow_color', (0, 0, 0))))
+    if str(getattr(l, 'type', '')).upper() == 'AREA':
+        # the AREA soft-ray twin bakes the rectangle -- centre, axes,
+        # half-sizes, shape -- as literals (the radius precedent), so
+        # all of them are structure
+        sig += ('area',
+                t(getattr(l, 'area_size', (0.0, 0.0))),
+                t(getattr(l, 'area_x', (1, 0, 0))),
+                t(getattr(l, 'area_y', (0, 1, 0))),
+                t(getattr(l, 'position', (0, 0, 0))),
+                str(getattr(l, 'area_shape', 'SQUARE')),
+                # the form factor bakes Gamma (and emits no pow at the
+                # 1.0 default); its distance and direction are texels
+                round(float(getattr(l, 'area_gamma', 1.0) or 1.0), 6))
     if baked_map:
         sig += ('map',
                 t(getattr(l, 'position', (0, 0, 0))),
@@ -766,6 +805,12 @@ def _selection_sig(scene, st):
 MATERIAL_TEXELS = True
 
 
+def _sampler_limit():
+    """The driver's fragment-sampler limit, through the device layer."""
+    from . import device
+    return device.max_fragment_samplers()
+
+
 def _pool_tag(tag, src, spec):
     """One shader NAME per distinct (source, interface) -- the pool.
 
@@ -774,10 +819,22 @@ def _pool_tag(tag, src, spec):
     byte-identical sources, and giving them the same NAME makes the
     whole pool one compile. The interface is hashed in defensively --
     equal sources imply equal declared uniforms, but a hash is cheaper
-    than the proof staying true forever."""
-    h = abs(hash((src, tuple(spec.get('samplers', ())),
-                  tuple(spec.get('floats', ())))))
-    return f'{tag}_P{h:x}'
+    than the proof staying true forever.
+
+    R183: the digest is a STABLE hash, not Python's session-salted
+    hash(). The salted name meant the same shader arrived under a NEW
+    name every Blender session -- and the field paid the driver's full
+    compile (~20 s) and pipeline build (~14 s) twice running for
+    byte-identical sources. Whatever a driver or Blender keys its disk
+    caches on, a name that never changes can only help -- and it makes
+    console lines comparable across sessions."""
+    import hashlib
+    h = hashlib.blake2b(digest_size=8)
+    h.update(src.encode('utf-8', 'replace'))
+    for part in tuple(spec.get('samplers', ())) + ('|',) + \
+            tuple(spec.get('floats', ())):
+        h.update(str(part).encode('utf-8', 'replace'))
+    return f'{tag}_P{h.hexdigest()}'
 
 
 _PLAN_CACHE = {}
@@ -1132,6 +1189,9 @@ def plan_frame(job, gbuf, use_cache=True):
         # compiled shader; a slider drag re-uploads a texel row. The
         # module flag exists for the A/B in the test suite.
         '__mark_values': MATERIAL_TEXELS,
+        # R181: the pass guard checks against the DRIVER'S sampler
+        # limit, not the spec floor (a session constant; 16 headless)
+        'max_samplers': _sampler_limit(),
         'ao': {
             'samples': max(int(getattr(st, 'ao_samples', 8)), 1),
             'distance': float(getattr(st, 'ao_distance', 1.0)),
@@ -1881,13 +1941,51 @@ def _cpu_height_image(job, gbuf, mat_id, node_id):
     evaluator comes from the frame's shared per-material cache, so when
     the ray sweeps already ran the chain (or will), the heights are
     computed once.
+
+    An ADAPTIVE REFINE pass evaluates only the flagged pixels and their
+    one-pixel surround. The bump emitter fetches this image at exactly
+    three texels per shaded pixel -- the pixel and its +x / +y
+    neighbours -- and a refine pass shades only inside its mask, so
+    every fetched texel lies inside the mask grown by one. Every texel
+    outside it is never read; computing it was the single biggest cost
+    of the field's first fast adaptive frame (a full height evaluation
+    per material, per pass: 1.5 seconds times three passes of a
+    14-second frame). The values at the computed texels are the full
+    image's values bit for bit, so the picture cannot move.
     """
     from ..core.nodeeval import VALUE
     h, w = gbuf.tri.shape
     img = np.zeros((h, w, 4), np.float32)
-    py, px, _ctx, ev = _mat_eval(job, gbuf, mat_id)
-    if py.size == 0 or ev is None:
-        return img
+    rm = getattr(job.settings, '_refine_mask', None)
+    if rm is None:
+        py, px, _ctx, ev = _mat_eval(job, gbuf, mat_id)
+        if py.size == 0 or ev is None:
+            return img
+    else:
+        grow = rm.copy()
+        grow[1:] |= rm[:-1]
+        grow[:-1] |= rm[1:]
+        grow[:, 1:] |= rm[:, :-1]
+        grow[:, :-1] |= rm[:, 1:]
+        mesh = job.scene.mesh
+        covered = gbuf.tri >= 0
+        m = np.where(covered, mesh.mat_index[gbuf.tri], -1) \
+            if mesh.mat_index is not None else \
+            np.where(covered, 0, -1)
+        py, px = np.nonzero((m == int(mat_id)) & grow)
+        if py.size == 0:
+            return img
+        from ..core.nodeeval import GraphEvaluator
+        ctx = job.context(gbuf.tri[py, px], gbuf.bary[py, px], px, py,
+                          np.ones(py.size, bool), None, 0, True)
+        mat0 = job.scene.materials[mat_id] \
+            if mat_id < len(job.scene.materials) else None
+        graph0 = getattr(mat0, 'graph', None) if mat0 is not None else None
+        ev = GraphEvaluator(graph0, ctx, job.textures,
+                            getattr(mat0, 'programs', None)) \
+            if graph0 else None
+        if ev is None:
+            return img
     mat = job.scene.materials[mat_id] \
         if mat_id < len(job.scene.materials) else None
     graph = getattr(mat, 'graph', None) if mat is not None else None
@@ -3790,13 +3888,29 @@ def shade_frame(job, gbuf):
     # bump height pre-passes draw FIRST, each into its own target, so
     # build_draws can bind their colour textures into the main passes.
     # Fragment renders one, fragment samples it: no stage crossing.
+    # R183: this block was UNATTRIBUTED -- it ran between the upload and
+    # draw windows and its cost (a CPU height evaluation is seconds at a
+    # supersampled resolution) landed in the composite residual as
+    # 'other'. It owns its milliseconds now, cpu-vs-gpu counted.
+    _t_pre = _time.perf_counter()
+    _pre_n = _pre_cpu = 0
+    _pre_whys = []
     prepass_targets = []
     for mat_id, name, _src, binds in passes:
         for uname, psrc, pbinds in (binds.get('prepasses') or ()):
             if pbinds.get('cpu'):
                 # the emitter refused this height chain; the renderer's
-                # own evaluator produces the image instead, exactly
+                # own evaluator produces the image instead, exactly.
+                # WHO and WHY are recorded for the split: the field's
+                # composite cost is these passes, and naming the
+                # refusing ingredient is what makes it fixable
                 try:
+                    _pre_n += 1
+                    _pre_cpu += 1
+                    _why = str(pbinds.get('why', '') or '')
+                    _why = _why.replace(' evaluates on the CPU into the '
+                                        'height pre-pass', '')
+                    _pre_whys.append(f"'{name}': {_why}"[:90])
                     himg = _cpu_height_image(job, gbuf, mat_id,
                                              pbinds['node'])
                     prepass_tex[(mat_id, uname)] = device.upload(himg)
@@ -3805,6 +3919,7 @@ def shade_frame(job, gbuf):
                         t.free()
                     return None, f"'{name}' CPU height pass failed: {exc}"
                 continue
+            _pre_n += 1
             spec = {'samplers': ['hal_gb_ids', 'hal_gb_attrs',
                                  'hal_gb_tris']
                     + list(pbinds.get('samplers', ())),
@@ -3846,6 +3961,7 @@ def shade_frame(job, gbuf):
                     t.free()
                 return None, f"'{name}' height pass failed: {exc}"
             prepass_tex[(mat_id, uname)] = device.target_texture(tgt)
+    _pre_ms = (_time.perf_counter() - _t_pre) * 1000.0
 
     radfield = atlases.get('__radfield')
     if radfield is not None:
@@ -3896,6 +4012,7 @@ def shade_frame(job, gbuf):
 
     t_draw = 0.0
     _burst_snap = {}
+    _c_own = _c_env = 0.0
     target = device.Target(w, h)
     try:
         # every pass blends into the one target -- each material writes only
@@ -3928,6 +4045,7 @@ def shade_frame(job, gbuf):
             'STIPPLE'
         if got is not None:
             t_draw = _time.perf_counter() - t1
+            _tc0 = _time.perf_counter()
             hit = got[:, :, 3] > 0.5
             # no masking needed: the target was cleared to zero and the
             # blend leaves untouched pixels at zero, so the colour planes
@@ -3939,6 +4057,7 @@ def shade_frame(job, gbuf):
                 # 0.9 = kept, 0.6 = dropped; decoded here and carried
                 # out of band on the G-buffer for the frame's alpha
                 gbuf.gpu_alpha = got[:, :, 3] > 0.75
+            _c_own = (_time.perf_counter() - _tc0) * 1000.0
         else:
             out = np.zeros((h, w, 3), np.float32)
             hit = np.zeros((h, w), bool)
@@ -3971,11 +4090,13 @@ def shade_frame(job, gbuf):
     # baked GLSL paths, the renderer's own world_color along the
     # reflected rays, added exactly where the CPU adds it (last)
     env_plan = atlases.get('__env')
+    _tc1 = _time.perf_counter()
     try:
         out = _apply_cpu_env_primary(job, gbuf,
                                      (env_plan or {}).get('primary'), out)
     except Exception as exc:                                    # noqa: BLE001
         return None, f'the environment composite failed: {exc}'
+    _c_env = (_time.perf_counter() - _tc1) * 1000.0
 
     # the traced bounces: rays off the reflective then refractive pixels,
     # closest hits shaded by the SAME materials through their secondary
@@ -4087,5 +4208,21 @@ def shade_frame(job, gbuf):
         reflect_levels=_SWEEP_STATS['levels'],
         reflect_skips=_SWEEP_STATS['skips'],
         reflect_rays=_SWEEP_STATS['rays'])
+    # R182: the composite bucket is a RESIDUAL (total minus the named
+    # stages), and the field's 16x-supersampled frame put 23 seconds in
+    # it. Name the measured parts so the residual's own residual is the
+    # suspect list, not the whole bucket.
+    LAST_TIMINGS['c_own_ms'] = _c_own
+    LAST_TIMINGS['c_env_ms'] = _c_env
+    LAST_TIMINGS['prepass_ms'] = _pre_ms
+    LAST_TIMINGS['prepass_n'] = _pre_n
+    LAST_TIMINGS['prepass_cpu'] = _pre_cpu
+    LAST_TIMINGS['prepass_whys'] = '; '.join(
+        sorted(set(_pre_whys)))[:220]
+    LAST_TIMINGS['c_other_ms'] = max(
+        float(LAST_TIMINGS.get('composite_ms', 0.0)) - _c_own - _c_env
+        - _pre_ms, 0.0)
+    _tcf = _time.perf_counter()
     out = _fog_readback(job, gbuf, passes, out, hit)
+    LAST_TIMINGS['c_fog_ms'] = (_time.perf_counter() - _tcf) * 1000.0
     return out, hit

@@ -84,7 +84,8 @@ NODE_PROPS = {
     'ShaderNodeCombineColor': ('mode',),
     'ShaderNodeBsdfToon': ('component',),
     'ShaderNodeOutputMaterial': ('target',),
-    'HALCYON_ShaderNode': ('model', 'toon_steps', 'wire_size'),
+    'HALCYON_ShaderNode': ('model', 'toon_steps', 'wire_size',
+                           'fresnel_blend', 'rim_blend', 'matcap_mode'),
     'HALCYON_BIMaterialNode': (
         'diff_shader', 'spec_shader', 'shadeless',
         # the BI panel round: sorted by panel
@@ -116,6 +117,17 @@ NODE_PROPS = {
     # DISPATCH handlers' _prop reads against this table so a node cannot
     # ship half-wired again.
     'HALCYON_DitherNode': ('pattern',),
+    'HALCYON_NormalMapNode': ('space', 'map_type'),
+    'HALCYON_NormalMixNode': ('mode',),
+    # R203 field find: the Iridescent node shipped WITHOUT this entry,
+    # so its Type never reached the renderer -- every mode rendered as
+    # Rainbow Sweep, which also deadened Tint (Pearl's) and Noise
+    # Scale (Oil's). A guard test now audits every node's annotations
+    # against this table so the class of bug is closed, not the case
+    'HALCYON_IridescentNode': ('mode',),
+    'HALCYON_SmoothStepNode': ('interp',),
+    'HALCYON_ChannelShuffleNode': ('out_r', 'out_g', 'out_b', 'out_a'),
+    'HALCYON_WaveNode': ('wave',),
     'HALCYON_BIInfluenceNode': ('blend', 'tex_rgb', 'rgbtoint',
                                 'negative', 'alphamix', 'calc_alpha',
                                 'neg_alpha'),
@@ -402,6 +414,112 @@ def export_material(mat, images, warnings):
         # Wireframe by its *node* never went through that branch, so its wire
         # width was stuck at the dataclass default with no way to change it
         m.wire_size = hs.wire_size
+        if getattr(hs, 'halo', False):
+            # R191: BI's halo material -- the whole panel in one spec.
+            # Counts are 0 when their toggle is off, exactly the 2.79
+            # mode-bit-gates-count arrangement
+            m.halo = {
+                'size': float(hs.halo_size),
+                'hardness': int(hs.halo_hardness),
+                'add': float(hs.halo_add),
+                'alpha': float(hs.halo_alpha),
+                'color': tuple(hs.halo_color),
+                'seed': int(hs.halo_seed),
+                'rings': int(hs.halo_ring_count) if hs.halo_rings else 0,
+                'lines': int(hs.halo_line_count) if hs.halo_lines else 0,
+                'star_points': int(hs.halo_star_tips) if hs.halo_star
+                               else 0,
+                'ring_color': tuple(hs.halo_ring_color),
+                'line_color': tuple(hs.halo_line_color),
+                'xalpha': bool(hs.halo_xalpha),
+                'soft': bool(hs.halo_soft),
+                'shaded': bool(hs.halo_shaded),
+                'puno': bool(hs.halo_puno),
+                # R194: the expansion kit -- all neutral at defaults
+                'shape': str(getattr(hs, 'halo_shape', 'DISC')),
+                'line_width': float(getattr(hs, 'halo_line_width', 1.0)),
+                'ring_width': float(getattr(hs, 'halo_ring_width', 1.0)),
+                'gradient': bool(getattr(hs, 'halo_gradient', False)),
+                'color2': tuple(getattr(hs, 'halo_color2',
+                                        (0.0, 0.0, 0.0))),
+                'rand_hue': float(getattr(hs, 'halo_rand_hue', 0.0)),
+                'rand_sat': float(getattr(hs, 'halo_rand_sat', 0.0)),
+                'rand_val': float(getattr(hs, 'halo_rand_val', 0.0)),
+                'pulse': float(getattr(hs, 'halo_pulse', 0.0)),
+                'flicker': float(getattr(hs, 'halo_flicker', 0.0)),
+                'spin': float(getattr(hs, 'halo_spin', 0.0)),
+                'anim_speed': float(getattr(hs, 'halo_anim_speed', 1.0)),
+                'aspect': float(getattr(hs, 'halo_aspect', 1.0)),
+                'rotation': float(getattr(hs, 'halo_rotation', 0.0)),
+                # R198: the energy kit
+                'noise': float(getattr(hs, 'halo_noise', 0.0)),
+                'noise_scale': float(getattr(hs, 'halo_noise_scale',
+                                             4.0)),
+                'bolts': int(getattr(hs, 'halo_bolts', 0)),
+                'bolt_width': float(getattr(hs, 'halo_bolt_width', 1.0)),
+                'rays': int(getattr(hs, 'halo_rays', 0)),
+                'ray_sharp': float(getattr(hs, 'halo_ray_sharp', 8.0)),
+                'rings_even': bool(getattr(hs, 'halo_rings_even',
+                                           False)),
+                'gradient_type': str(getattr(hs, 'halo_gradient_type',
+                                             'RADIAL')),
+                'gradient_noise': float(getattr(hs,
+                                                'halo_gradient_noise',
+                                                0.0)),
+                # R200: master HSV shift and the per-effect clocks --
+                # all exactly neutral at 0 / 1 / 1 and x1.0
+                'hue_shift': float(getattr(hs, 'halo_hue_shift', 0.0)),
+                'sat_shift': float(getattr(hs, 'halo_sat_shift', 1.0)),
+                'val_shift': float(getattr(hs, 'halo_val_shift', 1.0)),
+                'pulse_speed': float(getattr(hs, 'halo_pulse_speed',
+                                             1.0)),
+                'flicker_speed': float(getattr(hs,
+                                               'halo_flicker_speed',
+                                               1.0)),
+                'noise_speed': float(getattr(hs, 'halo_noise_speed',
+                                             1.0)),
+                'bolt_speed': float(getattr(hs, 'halo_bolt_speed',
+                                            1.0)),
+                'grad_noise_speed': float(getattr(
+                    hs, 'halo_grad_noise_speed', 1.0)),
+            }
+            # R200: Ray/Bolt Colour ship only once the artist has SET
+            # them -- untouched, the key stays absent and the core
+            # keeps riding the Line Colour, so every existing scene
+            # renders exactly as before the dials existed
+            for pk, sk in (('ray_color', 'halo_ray_color'),
+                           ('bolt_color', 'halo_bolt_color')):
+                try:
+                    if hs.is_property_set(sk):
+                        m.halo[pk] = tuple(getattr(hs, sk))
+                except Exception:                               # noqa: BLE001
+                    pass
+            # the image halo: the picture rides the scene's image pool
+            himg = getattr(hs, 'halo_image', None)
+            if himg is not None and \
+                    str(getattr(hs, 'halo_shape', '')) == 'IMAGE':
+                try:
+                    key = himg.name_full
+                    if key not in images:
+                        px = compat.image_pixels(himg)
+                        if px is not None:
+                            images[key] = ImageBuffer(name=key,
+                                                      pixels=px)
+                    m.halo['image'] = images.get(key)
+                except Exception:                               # noqa: BLE001
+                    pass
+            # the colour ramp, sampled into a small LUT (the widget
+            # lives on the hidden '__halo_ramp' node)
+            try:
+                if getattr(hs, 'halo_gradient', False) and \
+                        compat.uses_nodes(mat) and mat.node_tree:
+                    rn = mat.node_tree.nodes.get('__halo_ramp')
+                    if rn is not None:
+                        cr = rn.color_ramp
+                        m.halo['ramp'] = [tuple(cr.evaluate(i / 31.0))
+                                          for i in range(32)]
+            except Exception:                                   # noqa: BLE001
+                pass
     if compat.uses_nodes(mat) and mat.node_tree and \
             not (hs is not None and hs.use_override):
         # a material with Override on shades from the panel's own fields --
@@ -670,6 +788,8 @@ def export_light(ob, matrix, unit_scale=1.0):
         lt.area_shape = la.shape
         lt.area_x = tuple(mw[:3, 0])
         lt.area_y = tuple(mw[:3, 1])
+        if hs is not None:
+            lt.area_gamma = float(getattr(hs, 'area_gamma', 1.0) or 1.0)
     if hs is not None:
         lt.decay = hs.decay
         lt.decay_start = hs.decay_start
@@ -690,6 +810,15 @@ def export_light(ob, matrix, unit_scale=1.0):
         lt.ambient_only = hs.ambient_only
         lt.hotspot = hs.hotspot
         lt.volumetric = hs.volumetric
+        lt.volumetric_occlusion = getattr(hs, 'volumetric_occlusion', False)
+        lt.flare = float(getattr(hs, 'flare', 0.0))
+        lt.flare_scale = float(getattr(hs, 'flare_scale', 1.0))
+        lt.flare_streaks = int(getattr(hs, 'flare_streaks', 6))
+        lt.flare_rings = int(getattr(hs, 'flare_rings', 1))
+        lt.flare_ghosts = int(getattr(hs, 'flare_ghosts', 6))
+        lt.caustics = float(getattr(hs, 'caustics', 0.0))
+        lt.caustics_scale = float(getattr(hs, 'caustics_scale', 4.0))
+        lt.caustics_speed = float(getattr(hs, 'caustics_speed', 1.0))
         lt.exclude_mode = getattr(hs, 'exclude_mode', 'EXCLUDE')
         coll = getattr(hs, 'exclude_collection', None)
         if coll is not None:
@@ -1152,6 +1281,146 @@ def export_lights_into(parked, depsgraph):
     return scene
 
 
+def _collect_halo_points(me, matrix, slots):
+    """R191: the raw VERTICES of a mesh wearing halo materials.
+
+    make_render_halos reads mvert directly -- every vertex, loose ones
+    included (the classic halo workflow is a mesh of nothing but
+    vertices) -- once per halo-material slot, so a mesh with two halo
+    slots glows twice, exactly as 2.79 did. Returns None when no slot
+    is a halo, else per-slot dicts of world positions (and world
+    normals when the material's Vertex Normal scaling asks)."""
+    halo_slots = [si for si, s in enumerate(slots)
+                  if s is not None
+                  and getattr(getattr(s, 'halcyon', None), 'halo', False)]
+    if not halo_slots:
+        return None
+    try:
+        n = len(me.vertices)
+    except Exception:                                           # noqa: BLE001
+        return None
+    if n == 0:
+        return None
+    co = np.empty(n * 3, np.float32)
+    me.vertices.foreach_get('co', co)
+    mw = np.asarray(matrix, np.float32)
+    pos = (co.reshape(-1, 3) @ mw[:3, :3].T + mw[:3, 3]).astype(np.float32)
+    out = []
+    for si in halo_slots:
+        hs = getattr(slots[si], 'halcyon', None)
+        entry = {'slot': si, 'pos': pos}
+        if getattr(hs, 'halo_puno', False):
+            no = np.empty(n * 3, np.float32)
+            try:
+                me.vertices.foreach_get('normal', no)
+                nw = no.reshape(-1, 3) @ np.linalg.inv(mw[:3, :3])
+                nw /= np.maximum(np.linalg.norm(nw, axis=1),
+                                 1e-9)[:, None]
+                entry['normals'] = nw.astype(np.float32)
+            except Exception:                                   # noqa: BLE001
+                pass
+        out.append(entry)
+    return out
+
+
+def _halo_groups_from(points, remap, materials):
+    """Slot-local halo points -> final scene groups with running seeds."""
+    groups = []
+    for entry in points or ():
+        si = int(entry['slot'])
+        mi = int(remap[min(si, len(remap) - 1)])
+        m = materials[mi] if 0 <= mi < len(materials) else None
+        spec = getattr(m, 'halo', None) if m is not None else None
+        if not spec:
+            continue
+        n = entry['pos'].shape[0]
+        base = int(spec.get('seed', 0))
+        groups.append({'mat': mi, 'pos': entry['pos'],
+                       # seed1 + running vertex index, mod 256 at use
+                       # exactly as RE_inithalo stores seed % 256
+                       'seeds': (base + np.arange(n, dtype=np.int64)) % 256,
+                       'normals': entry.get('normals')})
+    return groups
+
+
+def _collect_extra_halos(depsgraph, mat_lookup, materials, images,
+                         halo_groups, warnings):
+    """Particles and point clouds as halos, API-guarded.
+
+    BI rendered particles through the same halo road when their
+    material was a halo. Blender 5.x may or may not still carry the
+    legacy particle API, so every touch is getattr-guarded: if the
+    API is gone this collects nothing and says nothing. Point-cloud
+    objects contribute their points the same way."""
+    import numpy as _np
+    for inst in depsgraph.object_instances:
+        ob = inst.object
+        if ob is None or not getattr(inst, 'show_self', True):
+            continue
+        mw = _np.asarray(inst.matrix_world, _np.float32)
+        # ---- legacy particle systems ----
+        for ps in (getattr(ob, 'particle_systems', None) or ()):
+            try:
+                st_ = ps.settings
+                mslot = int(getattr(st_, 'material', 1)) - 1
+                slots = list(getattr(ob, 'material_slots', ()) or ())
+                mat = slots[mslot].material if 0 <= mslot < len(slots) \
+                    else None
+                hs = getattr(mat, 'halcyon', None) if mat else None
+                if not getattr(hs, 'halo', False):
+                    continue
+                locs = [tuple(p.location) for p in ps.particles
+                        if getattr(p, 'alive_state', 'ALIVE') == 'ALIVE']
+                if not locs:
+                    continue
+                key = mat.name_full
+                if key not in mat_lookup:
+                    mat_lookup[key] = len(materials)
+                    materials.append(export_material(mat, images,
+                                                     warnings))
+                mi = mat_lookup[key]
+                spec = materials[mi].halo or {}
+                pos = _np.asarray(locs, _np.float32)
+                n = pos.shape[0]
+                base = int(spec.get('seed', 0))
+                halo_groups.append({
+                    'mat': mi, 'pos': pos,
+                    'seeds': (base + _np.arange(n, dtype=_np.int64))
+                             % 256,
+                    'normals': None})
+            except Exception:                                   # noqa: BLE001
+                continue
+        # ---- point clouds ----
+        if getattr(ob, 'type', '') == 'POINTCLOUD':
+            try:
+                slots = list(getattr(ob, 'material_slots', ()) or ())
+                mat = slots[0].material if slots else None
+                hs = getattr(mat, 'halcyon', None) if mat else None
+                if not getattr(hs, 'halo', False):
+                    continue
+                attr = ob.data.attributes.get('position')
+                n = len(attr.data)
+                co = _np.empty(n * 3, _np.float32)
+                attr.data.foreach_get('vector', co)
+                pos = (co.reshape(-1, 3) @ mw[:3, :3].T
+                       + mw[:3, 3]).astype(_np.float32)
+                key = mat.name_full
+                if key not in mat_lookup:
+                    mat_lookup[key] = len(materials)
+                    materials.append(export_material(mat, images,
+                                                     warnings))
+                mi = mat_lookup[key]
+                spec = materials[mi].halo or {}
+                base = int(spec.get('seed', 0))
+                halo_groups.append({
+                    'mat': mi, 'pos': pos,
+                    'seeds': (base + _np.arange(n, dtype=_np.int64))
+                             % 256,
+                    'normals': None})
+            except Exception:                                   # noqa: BLE001
+                continue
+
+
 def export_scene(depsgraph, settings, warnings=None):
     """Evaluated depsgraph -> Scene."""
     import time as _time
@@ -1163,6 +1432,7 @@ def export_scene(depsgraph, settings, warnings=None):
     objects = []
     lights = []
     parts = []
+    halo_groups = []
     _t_all = _time.perf_counter()
     _sp = {'mesh_ms': 0.0, 'mat_ms': 0.0, 'meshes': 0, 'mats': 0,
            'cached': 0, 'cached_ms': 0.0, 'cached_dup': 0}
@@ -1248,6 +1518,9 @@ def export_scene(depsgraph, settings, warnings=None):
             data['mat_index'] = remap[np.clip(raw, 0, len(remap) - 1)]
             data['obj_index'] = np.full(len(raw), obj_index, np.int32)
             parts.append(data)
+            if ent.get('halos'):
+                halo_groups += _halo_groups_from(ent['halos'], remap,
+                                                 materials)
             # R178: the ObjectInfo fields are read FRESH from the
             # evaluated object -- an evaluated_get is a pointer lookup,
             # and six RNA reads per object cost ~1 ms for a whole
@@ -1288,6 +1561,7 @@ def export_scene(depsgraph, settings, warnings=None):
             obj_index = len(objects)
             _t0 = _time.perf_counter()
             data = _mesh_arrays(me, matrix, 0, obj_index)
+            halo_pts = _collect_halo_points(me, matrix, slots)
             _sp['mesh_ms'] += (_time.perf_counter() - _t0) * 1000.0
             _sp['meshes'] += 1
         except Exception as exc:                                # noqa: BLE001
@@ -1300,7 +1574,13 @@ def export_scene(depsgraph, settings, warnings=None):
                             f"not be exported ({type(exc).__name__}: {exc}) "
                             f"and is missing from the render")
             continue
+        if halo_pts:
+            halo_groups += _halo_groups_from(halo_pts, remap, materials)
         if data is None:
+            if halo_pts:
+                # a mesh of nothing but vertices wearing a halo
+                # material IS a render -- the classic sparkle object
+                continue
             if getattr(ob, 'type', 'MESH') in compat.ALLOCATING_TYPES:
                 # the usual reason a text object is invisible: it converted,
                 # but to outlines rather than to faces
@@ -1325,6 +1605,7 @@ def export_scene(depsgraph, settings, warnings=None):
                                   for s in slots],
                     'data_uid': getattr(getattr(_orig, 'data', None),
                                         'session_uid', None),
+                    'halos': halo_pts,
                     'info': info})
                 _touched.add(_ck)
         idx = np.clip(data['mat_index'], 0, len(remap) - 1)
@@ -1347,6 +1628,7 @@ def export_scene(depsgraph, settings, warnings=None):
             getter = getattr(r_ob, 'evaluated_get', None)
             ev = getter(depsgraph) if getter is not None else r_ob
             me = ev.to_mesh()
+            r_halo_pts = None
             if me is not None:
                 slots = list(me.materials) if me.materials else [None]
                 _t0 = _time.perf_counter()
@@ -1363,6 +1645,10 @@ def export_scene(depsgraph, settings, warnings=None):
                      for s in slots], np.int32)
                 _t0 = _time.perf_counter()
                 data = _mesh_arrays(me, r_matrix, 0, obj_index)
+                r_halo_pts = _collect_halo_points(me, r_matrix, slots)
+                if r_halo_pts:
+                    halo_groups += _halo_groups_from(r_halo_pts, remap,
+                                                     materials)
                 _sp['mesh_ms'] += (_time.perf_counter() - _t0) * 1000.0
                 _sp['meshes'] += 1
                 info = _info_snapshot(ev)
@@ -1437,15 +1723,58 @@ def export_scene(depsgraph, settings, warnings=None):
             lt.exclude_objects = tuple(sorted(
                 name_to_index[n] for n in names if n in name_to_index))
 
+    # R191: particles and point clouds wearing halo materials
+    try:
+        _collect_extra_halos(depsgraph, mat_lookup, materials, images,
+                             halo_groups, warnings)
+    except Exception:                                           # noqa: BLE001
+        pass
+
     _t0 = _time.perf_counter()
     mesh = _concat([p for p in parts if p is not None])
     _sp['concat_ms'] = (_time.perf_counter() - _t0) * 1000.0
+
+    # R191: a halo material draws NO faces -- 2.79 turned the mesh into
+    # halos and never converted its geometry. Drop the soup triangles
+    # wearing a halo material (vertices stay; unreferenced is harmless)
+    if halo_groups and mesh is not None and \
+            getattr(mesh, 'tris', None) is not None and len(mesh.tris):
+        _is_halo = np.array([1 if getattr(m, 'halo', None) else 0
+                             for m in materials], bool)
+        if _is_halo.any():
+            _keep = ~_is_halo[np.clip(mesh.mat_index, 0,
+                                      len(materials) - 1)]
+            if not _keep.all():
+                mesh.tris = mesh.tris[_keep]
+                mesh.mat_index = mesh.mat_index[_keep]
+                mesh.obj_index = mesh.obj_index[_keep]
+                if getattr(mesh, 'face_normals', None) is not None:
+                    mesh.face_normals = mesh.face_normals[_keep]
+                if getattr(mesh, 'smooth', None) is not None:
+                    mesh.smooth = mesh.smooth[_keep]
 
     cam_ob = bscene.camera
     camera = Camera()
     if cam_ob is not None:
         cam = cam_ob.data
-        camera.matrix_world = np.asarray(cam_ob.matrix_world, np.float32)
+        # R205: strip object scale from the camera at the source. A
+        # camera under a scaled import rig ($$$DUMMY chains) carries the
+        # parents' unit scale in matrix_world; the picture composes the
+        # same but fog, clip and depth of field read distances
+        # multiplied by the inverse scale -- the field's pagoda drowned
+        # in fog colour on F12 while the viewport (whose camera-view
+        # matrix Blender keeps rigid) looked right. Blender's renderers
+        # ignore camera scale; Halcyon does too, saying so once.
+        _raw_mw = np.asarray(cam_ob.matrix_world, np.float32)
+        from .core import mathx as _mx
+        camera.matrix_world = _mx.rigid_camera_matrix(_raw_mw)
+        if camera.matrix_world is not _raw_mw:
+            _sc = np.sqrt((_raw_mw[:3, :3] ** 2).sum(axis=0))
+            print(f"[Halcyon] camera '{getattr(cam_ob, 'name', '?')}' "
+                  f"carries object scale ~{float(_sc.mean()):.4g} from "
+                  "its parents; ignored for rendering (fog, clip and "
+                  "depth of field read true distances), exactly as "
+                  "Blender's own renderers do")
         camera.type = cam.type
         camera.lens = float(getattr(cam, 'lens', 50.0))
         camera.sensor = float(getattr(cam, 'sensor_width', 36.0))
@@ -1485,6 +1814,21 @@ def export_scene(depsgraph, settings, warnings=None):
                         images[key] = ImageBuffer(name=key, pixels=px,
                                                   colorspace='Linear')
                 world.env_image = images.get(key)
+            # R203: the material-ground road -- the picked material's
+            # tree serialized onto the world, programs beside it, so
+            # the bpy-free plane can wear it
+            gm = getattr(hs, 'ground_material', None)
+            if gm is not None and str(world.ground_mode) == 'MATERIAL':
+                try:
+                    if compat.uses_nodes(gm) and gm.node_tree:
+                        progs = {}
+                        world.ground_graph = serialize_tree(
+                            gm.node_tree, images, progs, warnings)
+                        world.ground_programs = progs
+                except Exception:                               # noqa: BLE001
+                    warnings.append(
+                        f"Ground material '{gm.name}' could not "
+                        "serialize; the plane falls back to Solid")
         if compat.uses_nodes(bw) and bw.node_tree:
             world.graph = serialize_tree(bw.node_tree, images, {}, warnings)
     if bscene.render.use_freestyle:
@@ -1521,6 +1865,7 @@ def export_scene(depsgraph, settings, warnings=None):
                lights=lights, camera=camera, world=world, settings=settings,
                frame=bscene.frame_current, fps=bscene.render.fps,
                time=bscene.frame_current / max(bscene.render.fps, 1))
+    sc.halos = halo_groups or None
     sc.images = images
     sc.warnings = warnings
     # R170: the export split -- at 0.36s of a 0.75s warm F12, "export"

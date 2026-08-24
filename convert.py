@@ -7,11 +7,12 @@ comes out with that same texture in Diffuse Color.
 """
 
 import bpy
-from bpy.props import BoolProperty, EnumProperty, StringProperty
+from bpy.props import (BoolProperty, EnumProperty, IntProperty,
+                       StringProperty)
 from bpy.types import Operator
 
 from . import compat
-from .core.convert import MASTER_NODE, plan
+from .core.convert import BI_NODE, MASTER_NODE, bi_plan, plan
 
 OUTPUT_NODES = ('ShaderNodeOutputMaterial',)
 
@@ -154,6 +155,37 @@ def convert_material(mat, model='AUTO', keep_original=True, force=False):
             except (TypeError, ValueError):
                 pass
 
+    # links the plan marked as needing a scale -- emission strength being
+    # folded into a LINKED emission colour goes through a real multiply
+    # node, so the strength applies exactly instead of being a console note
+    for target, spec in (p.get('scale_links') or {}).items():
+        dst = master.inputs.get(target)
+        if dst is None or not dst.is_linked or source is None:
+            continue
+        try:
+            upstream = dst.links[0].from_socket
+            mul, fac, in_a, in_b, out_c = _new_multiply(tree)
+            if mul is None:
+                continue
+            mul.location = (master.location.x - 200, master.location.y - 260)
+            mul.label = "Emission Strength"
+            fac.default_value = 1.0
+            tree.links.new(upstream, in_a)
+            kind, val = spec
+            wired = False
+            if kind == 'LINK':
+                s_sock = source.inputs.get(val)
+                if s_sock is not None and s_sock.is_linked:
+                    tree.links.new(s_sock.links[0].from_socket, in_b)
+                    wired = True
+                elif s_sock is not None:
+                    val = float(getattr(s_sock, 'default_value', 1.0) or 0.0)
+            if not wired:
+                in_b.default_value = (float(val), float(val), float(val), 1.0)
+            tree.links.new(out_c, dst)   # replaces the direct link
+        except Exception:                                       # noqa: BLE001
+            pass
+
     try:
         tree.links.new(master.outputs['Surface'], out.inputs['Surface'])
     except Exception as exc:                                    # noqa: BLE001
@@ -173,6 +205,50 @@ def convert_material(mat, model='AUTO', keep_original=True, force=False):
     if notes:
         msg += " (" + "; ".join(notes[:2]) + ")"
     return True, msg
+
+
+def _new_multiply(tree):
+    """A colour-multiply node on whichever Mix node this Blender has.
+
+    Returns (node, fac_socket, a_socket, b_socket, out_socket) or a None
+    node. The modern ShaderNodeMix hides its per-type sockets behind
+    identifiers, so they are found by identifier first and by socket type
+    as the fallback; the legacy ShaderNodeMixRGB is the second try for
+    older builds.
+    """
+    try:
+        n = tree.nodes.new('ShaderNodeMix')
+        n.data_type = 'RGBA'
+        n.blend_type = 'MULTIPLY'
+        a = b = None
+        for s in n.inputs:
+            ident = getattr(s, 'identifier', '')
+            if ident in ('A_Color', 'A'):
+                a = s
+            elif ident in ('B_Color', 'B'):
+                b = s
+        if a is None or b is None:
+            cols = [s for s in n.inputs if getattr(s, 'type', '') == 'RGBA']
+            if len(cols) >= 2:
+                a, b = cols[0], cols[1]
+        out = None
+        for s in n.outputs:
+            if getattr(s, 'type', '') == 'RGBA':
+                out = s
+                break
+        fac = n.inputs[0]
+        if a is not None and b is not None and out is not None:
+            return n, fac, a, b, out
+        tree.nodes.remove(n)
+    except Exception:                                           # noqa: BLE001
+        pass
+    try:
+        n = tree.nodes.new('ShaderNodeMixRGB')
+        n.blend_type = 'MULTIPLY'
+        return (n, n.inputs['Fac'], n.inputs['Color1'], n.inputs['Color2'],
+                n.outputs['Color'])
+    except Exception:                                           # noqa: BLE001
+        return None, None, None, None, None
 
 
 def _materials_for(context, scope):
@@ -231,6 +307,171 @@ class HALCYON_OT_convert_materials(Operator):
             try:
                 ok, msg = convert_material(mat, self.model, self.keep_original,
                                            self.force)
+            except Exception as exc:                            # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                ok, msg = False, f"{mat.name}: {exc}"
+            print("[Halcyon convert]", msg)
+            if ok:
+                done += 1
+            elif 'already uses' in msg:
+                skipped += 1
+            else:
+                failed += 1
+        parts = [f"{done} converted"]
+        if skipped:
+            parts.append(f"{skipped} already converted")
+        if failed:
+            parts.append(f"{failed} failed")
+        self.report({'INFO' if not failed else 'WARNING'},
+                    "Halcyon: " + ", ".join(parts) + " (details in console)")
+        return {'FINISHED'}
+
+
+def convert_material_to_bi(mat, keep_original=True, force=False):
+    """Rebuild `mat` around the BI Material node. Returns (ok, message).
+
+    The same relink-not-reset contract as convert_material: whatever fed
+    the source shader's Base Color arrives in the BI node's Color, the
+    normal chain arrives in Normal, and the constants go through
+    bi_plan's 2.79-shaped mapping.
+    """
+    if mat is None:
+        return False, "no material"
+    compat.enable_nodes(mat)
+    tree = mat.node_tree
+    if tree is None:
+        return False, f"{mat.name}: no node tree"
+
+    existing = [n for n in tree.nodes if n.bl_idname == BI_NODE]
+    if existing and not force:
+        return False, f"{mat.name}: already uses the BI Material node"
+
+    out = _active_output(tree)
+    if out is None:
+        out = tree.nodes.new('ShaderNodeOutputMaterial')
+        out.location = (400, 0)
+
+    source, notes = _surface_source(out)
+    if source is not None and source.bl_idname == BI_NODE and not force:
+        return False, f"{mat.name}: already uses the BI Material node"
+    if source is None:
+        values, links = {}, set()
+        src_id = 'ShaderNodeBsdfPrincipled'
+        notes.append("no source shader found; started from defaults")
+    else:
+        values, links = _gather(source)
+        src_id = source.bl_idname
+
+    p = bi_plan(src_id, values, links)
+    notes.extend(p['notes'])
+
+    node = tree.nodes.new(BI_NODE)
+    for k, v in p['props'].items():
+        try:
+            setattr(node, k, v)
+        except (AttributeError, TypeError, ValueError):
+            pass
+    if source is not None:
+        node.location = (source.location.x, source.location.y)
+        node.label = f"from {source.bl_label}"
+    else:
+        node.location = (out.location.x - 260, out.location.y)
+
+    carried = 0
+    for name, value in p['sockets'].items():
+        sock = node.inputs.get(name)
+        if sock is None or not hasattr(sock, 'default_value'):
+            continue
+        try:
+            if hasattr(sock.default_value, '__len__') and \
+                    hasattr(value, '__len__'):
+                n = min(len(sock.default_value), len(value))
+                for i in range(n):
+                    sock.default_value[i] = value[i]
+            elif hasattr(sock.default_value, '__len__'):
+                for i in range(3):
+                    sock.default_value[i] = float(value)
+            else:
+                sock.default_value = float(value[0]) \
+                    if hasattr(value, '__len__') else float(value)
+            carried += 1
+        except (TypeError, ValueError, IndexError):
+            pass
+    for bi_name, alias in p['links']:
+        dst = node.inputs.get(bi_name)
+        src_sock = source.inputs.get(alias) if source is not None else None
+        if dst is None or src_sock is None or not src_sock.is_linked:
+            continue
+        try:
+            tree.links.new(src_sock.links[0].from_socket, dst)
+            carried += 1
+        except Exception:                                       # noqa: BLE001
+            pass
+
+    try:
+        tree.links.new(node.outputs['Surface'], out.inputs['Surface'])
+    except Exception as exc:                                    # noqa: BLE001
+        return False, f"{mat.name}: could not link output ({exc})"
+
+    if source is not None:
+        if keep_original:
+            source.location = (source.location.x, source.location.y - 340)
+            source.label = "replaced by BI Material"
+            source.mute = True
+        else:
+            tree.nodes.remove(source)
+
+    node.refresh_sockets()
+    mat.halcyon.use_override = False
+    msg = (f"{mat.name}: BI {p['props'].get('diff_shader', 'LAMBERT')}"
+           f"/{p['props'].get('spec_shader', 'COOKTORR')}, "
+           f"{carried} inputs carried")
+    if notes:
+        msg += " (" + "; ".join(notes[:2]) + ")"
+    return True, msg
+
+
+class HALCYON_OT_convert_to_bi(Operator):
+    """Convert materials to the Blender Internal material node.
+
+    The 2.79 look, chosen deliberately: the BI Material node shades with
+    Blender Internal's own diffuse/specular pairs, so a scene aiming at
+    the 2.79 render gets the exact model instead of a translation onto
+    the master shader.
+    """
+
+    bl_idname = 'halcyon.convert_to_bi'
+    bl_label = "Convert to Blender Internal"
+    bl_description = ("Rebuild materials around the BI Material node -- "
+                      "Blender Internal's diffuse and specular shaders, "
+                      "with textures and normal chains relinked")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    scope: EnumProperty(name="Scope", default='ACTIVE', items=(
+        ('ACTIVE', "Active Material", "Only the active material slot"),
+        ('SELECTED', "Selected Objects", "Every material on the selection"),
+        ('SCENE', "Whole Scene", "Every material in the scene"),
+    ))
+    keep_original: BoolProperty(
+        name="Keep Original Shader", default=True,
+        description="Mute the old shader and move it aside instead of "
+                    "deleting it, so the conversion can be inspected")
+    force: BoolProperty(
+        name="Reconvert", default=False,
+        description="Convert again even if the material already uses the "
+                    "BI Material node")
+
+    def execute(self, context):
+        mats = _materials_for(context, self.scope)
+        if not mats:
+            self.report({'WARNING'}, "No materials found for that scope")
+            return {'CANCELLED'}
+        done, skipped, failed = 0, 0, 0
+        for mat in mats:
+            try:
+                ok, msg = convert_material_to_bi(mat, self.keep_original,
+                                                 self.force)
             except Exception as exc:                            # noqa: BLE001
                 import traceback
                 traceback.print_exc()
@@ -354,12 +595,182 @@ def _halcyon_default_material(scene, depsgraph):
         pass
 
 
-CLASSES = (HALCYON_OT_convert_materials, HALCYON_OT_material_new)
+class HALCYON_OT_bake_lightmap(Operator):
+    """Bake the active object's lighting into a UV-space image."""
+
+    bl_idname = 'halcyon.bake_lightmap'
+    bl_label = "Bake Lightmap"
+    bl_description = ("Bake this object's lighting (or ambient "
+                      "occlusion) into its active UV layout through the "
+                      "Halcyon CPU core -- same lamps, shadows and "
+                      "materials as the frame, view pinned along the "
+                      "normal, the way lightmaps were made")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: EnumProperty(name="Bake", default='COMBINED', items=(
+        ('COMBINED', "Combined Lighting",
+         "Full direct lighting with shadows, ambient and emission"),
+        ('AO', "Ambient Occlusion",
+         "The occlusion term alone, white where open sky reaches"),
+    ))
+    size: EnumProperty(name="Size", default='512', items=(
+        ('128', "128", ""), ('256', "256", ""), ('512', "512", ""),
+        ('1024', "1024", ""), ('2048', "2048", "")))
+    margin: bpy.props.IntProperty(
+        name="Margin", default=4, min=0, max=32,
+        description="Texels of island-edge dilation, so bilinear "
+                    "lookups never bleed the empty background")
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return ob is not None and getattr(ob, 'type', '') in (
+            'MESH', 'CURVE', 'SURFACE', 'FONT', 'META')
+
+    def execute(self, context):
+        import numpy as np
+
+        from . import export as EX
+        from .core import render as core_render
+        from .core.settings import RenderSettings
+
+        ob = context.active_object
+        hs = getattr(context.scene, 'halcyon', None)
+        st = hs.to_settings() if hs is not None else RenderSettings()
+        size = int(self.size)
+        st.resolution_x = st.resolution_y = size
+        depsgraph = context.evaluated_depsgraph_get()
+        warnings = []
+        sc = EX.export_scene(depsgraph, st, warnings)
+        obj_index = None
+        for i, info in enumerate(sc.objects or ()):
+            if getattr(info, 'name', None) == ob.name:
+                obj_index = i
+                break
+        if obj_index is None:
+            self.report({'ERROR'},
+                        f"'{ob.name}' exported no renderable faces")
+            return {'CANCELLED'}
+        img, why = core_render.bake_lightmap(
+            sc, st, obj_index=obj_index, size=size, mode=self.mode,
+            margin=int(self.margin))
+        if img is None:
+            self.report({'ERROR'}, f"Bake failed: {why}")
+            return {'CANCELLED'}
+        suffix = '_ao' if self.mode == 'AO' else '_lightmap'
+        name = f'{ob.name}{suffix}'
+        bimg = bpy.data.images.get(name)
+        if bimg is None:
+            bimg = bpy.data.images.new(name, size, size, alpha=True,
+                                       float_buffer=True)
+        elif tuple(bimg.size) != (size, size):
+            bimg.scale(size, size)
+        # engine images are bottom-row-first -- Blender's pixel order
+        bimg.pixels.foreach_set(
+            np.ascontiguousarray(img, np.float32).ravel())
+        bimg.update()
+        self.report({'INFO'},
+                    f"Baked {self.mode.title()} for '{ob.name}' into "
+                    f"image '{name}' ({size}x{size})")
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+
+class HALCYON_OT_palette_table(Operator):
+    """R202: turn any image into a colour-palette table -- a new image
+    with ONE PIXEL PER DISTINCT COLOUR, laid out as a grid. Feed the
+    table to Render Properties > Colour > Palette Image (Custom mode)
+    and the whole render is forced through those colours"""
+
+    bl_idname = 'halcyon.palette_table'
+    bl_label = "Make Palette Table"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    max_colors: IntProperty(
+        name="Max Colours", default=256, min=1, max=4096,
+        description="Distinct colours beyond this are median-cut down "
+                    "to fit; 256 is the classic VGA table")
+    sort: EnumProperty(
+        name="Sort", default='LUMA',
+        description="The order the table's pixels are laid out in",
+        items=[('LUMA', "Dark to Light",
+                "Sorted by luminance -- the classic palette strip"),
+               ('HUE', "Around the Wheel",
+                "Sorted by hue, greys at the end"),
+               ('FREQ', "Most Used First",
+                "Sorted by how often each colour appears in the "
+                "source image")])
+    columns: IntProperty(
+        name="Columns", default=0, min=0, max=4096,
+        description="Table width in pixels; 0 picks the squarest "
+                    "grid, and the colour count makes a strip")
+
+    @classmethod
+    def poll(cls, context):
+        sp = getattr(context, 'space_data', None)
+        return getattr(sp, 'image', None) is not None or \
+            getattr(context, 'edit_image', None) is not None
+
+    def execute(self, context):
+        import numpy as np
+
+        from .core.palette import palette_from_pixels, \
+            palette_table_layout
+        sp = getattr(context, 'space_data', None)
+        src = getattr(sp, 'image', None) or \
+            getattr(context, 'edit_image', None)
+        if src is None:
+            self.report({'ERROR'}, "No image open in this editor")
+            return {'CANCELLED'}
+        px = compat.image_pixels(src)
+        if px is None:
+            self.report({'ERROR'},
+                        f"'{src.name}' has no readable pixels")
+            return {'CANCELLED'}
+        cols = palette_from_pixels(px, self.max_colors, self.sort)
+        n = len(cols)
+        cw, chh = palette_table_layout(n, self.columns)
+        name = f"{src.name} Palette"
+        img = bpy.data.images.new(name, width=cw, height=chh,
+                                  alpha=True, float_buffer=False)
+        buf = np.zeros((chh * cw, 4), np.float32)
+        buf[:n, :3] = cols
+        buf[:n, 3] = 1.0
+        # top row first, the way a palette strip reads: flip rows into
+        # Blender's bottom-first buffer
+        grid = buf.reshape(chh, cw, 4)[::-1].reshape(-1)
+        img.pixels.foreach_set(grid)
+        img.update()
+        try:
+            if sp is not None and hasattr(sp, 'image'):
+                sp.image = img
+        except Exception:                                       # noqa: BLE001
+            pass
+        self.report({'INFO'},
+                    f"'{name}': {n} colour{'s' if n != 1 else ''} as a "
+                    f"{cw}x{chh} table; pick it as the Palette Image "
+                    f"to force the render through it")
+        return {'FINISHED'}
+
+
+def _draw_palette_table_menu(self, context):
+    self.layout.separator()
+    self.layout.operator('halcyon.palette_table', icon='COLOR')
+
+
+CLASSES = (HALCYON_OT_convert_materials, HALCYON_OT_convert_to_bi,
+           HALCYON_OT_material_new, HALCYON_OT_bake_lightmap,
+           HALCYON_OT_palette_table)
 
 
 def register():
     for c in CLASSES:
         bpy.utils.register_class(c)
+    menu = getattr(bpy.types, 'IMAGE_MT_image', None)
+    if menu is not None and hasattr(menu, 'append'):
+        menu.append(_draw_palette_table_menu)
     try:
         hs = bpy.app.handlers.depsgraph_update_post
         if _halcyon_default_material not in hs:
@@ -369,6 +780,12 @@ def register():
 
 
 def unregister():
+    menu = getattr(bpy.types, 'IMAGE_MT_image', None)
+    if menu is not None and hasattr(menu, 'remove'):
+        try:
+            menu.remove(_draw_palette_table_menu)
+        except Exception:                                       # noqa: BLE001
+            pass
     try:
         hs = bpy.app.handlers.depsgraph_update_post
         while _halcyon_default_material in hs:

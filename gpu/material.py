@@ -372,6 +372,20 @@ def pack_light_texels(lights):
                 out[0, b + 1, 3] = np.float32(spotsi)
                 out[0, b + 2, 3] = np.float32(
                     (1.0 - spotsi) * float(light.spot_blend))
+            elif kind == 'AREA':
+                # the form factor's value road: facing direction and
+                # the dist^2/(sx*sy) normalisation (area_lamp_vectors'
+                # areasize at one sample) -- Distance drags re-upload
+                # this texel instead of recompiling
+                ad = np.asarray(light.direction, np.float32)
+                ad = ad / max(float(np.linalg.norm(ad)), 1e-9)
+                out[0, b + 1, :3] = ad
+                asz = getattr(light, 'area_size', (1.0, 1.0))
+                a_sx = max(float(asz[0]), 1e-6)
+                a_sy = max(float(asz[1]) if len(asz) > 1
+                           else float(asz[0]), 1e-6)
+                a_d = max(float(getattr(light, 'decay_end', 25.0)), 1e-6)
+                out[0, b + 1, 3] = np.float32(a_d * a_d / (a_sx * a_sy))
         out[0, b + 2, :3] = np.asarray(
             getattr(light, 'color', (1, 1, 1)), np.float32)
         eps = 1e-6
@@ -774,6 +788,130 @@ def _cookie_function(i, spec):
     return '\n'.join(L) + '\n'
 
 
+def lint_declaration_order(src):
+    """R193: every hal_* call must follow a declaration of its name.
+
+    GLSL requires declaration before use in FILE ORDER, and the real
+    driver enforces it -- the simulator, which resolves names after
+    parsing, never did. The field found the gap: the area form
+    factor's texel reads called hal_ltex from the shadow-function
+    block, whose definition lands later in the assembly; every
+    material pass of every area-lamp scene failed CreateInfo, and the
+    refusal storm ended in a native crash. This walk is the suite's
+    stand-in for the driver's rule: it returns a list of
+    '<name> called at <pos> before its declaration at <pos>' strings,
+    empty when the source is honest. Only hal_-prefixed functions are
+    judged -- built-ins carry no declaration in the source.
+    """
+    import re
+    # comments out first, preserving offsets line-for-line is not
+    # needed -- positions only order the report
+    clean = re.sub(r'//[^\n]*', '', src)
+    clean = re.sub(r'/\*.*?\*/', '', clean, flags=re.S)
+    decl_re = re.compile(
+        r'\b(?:void|float|int|bool|uint|vec[234]|ivec[234]|uvec[234]'
+        r'|mat[234])\s+(hal_\w+)\s*\(')
+    first_decl = {}
+    decl_spans = []
+    for m in decl_re.finditer(clean):
+        name = m.group(1)
+        decl_spans.append((m.start(1), m.end(1)))
+        if name not in first_decl:
+            first_decl[name] = m.start(1)
+    spans = set()
+    for a, b in decl_spans:
+        spans.add(a)
+    out = []
+    for m in re.finditer(r'\b(hal_\w+)\s*\(', clean):
+        name = m.group(1)
+        pos = m.start(1)
+        if pos in spans:
+            continue                      # this IS a declaration head
+        d = first_decl.get(name)
+        if d is not None and pos < d:
+            out.append(f'{name} called at {pos} before its '
+                       f'declaration at {d}')
+    return out
+
+
+def _area_function(i, light, consts):
+    """vec2 hal_area_inp{i}(P, N): BI's area lamp energy, both sides.
+
+    The GLSL twin of lights.area_inp -- ONE Stokes contour over the
+    rectangle's corners, front and flipped-normal energies read off
+    its sign (the sum is linear in the normal). The edge angle is
+    2*asin(||a-b||/2), mathematically acos(dot(a,b)) but stable in
+    float32 where acos of a near-1 dot sheds digits -- the C could
+    afford plain acos because area_lamp_energy ran in doubles.
+
+    Corners derive in-shader from the texel POSITION plus literal
+    half-extent offsets, so dragging the lamp re-uploads a texel; the
+    facing direction and the dist^2/(sx*sy) normalisation ride texel 1
+    (pack_light_texels), so Distance drags stay recompile-free too.
+    Size, axes and Gamma are structure and recompile, like the shadow
+    twin's own geometry bakes.
+    """
+    import numpy as np
+    use_tx = bool(consts.get('light_texels', True))
+    ax = np.asarray(getattr(light, 'area_x', None)
+                    if getattr(light, 'area_x', None) is not None
+                    else (1.0, 0.0, 0.0), np.float64)
+    ay = np.asarray(getattr(light, 'area_y', None)
+                    if getattr(light, 'area_y', None) is not None
+                    else (0.0, 1.0, 0.0), np.float64)
+    asz = getattr(light, 'area_size', (1.0, 1.0))
+    sx = max(float(asz[0]), 1e-6)
+    sy = max(float(asz[1]) if len(asz) > 1 else float(asz[0]), 1e-6)
+    hx = (ax * (sx * 0.5)).astype(np.float32)
+    hy = (ay * (sy * 0.5)).astype(np.float32)
+    if use_tx:
+        pos = _lref(i, 0, 'xyz')
+        vdir = _lref(i, 1, 'xyz')
+        asize = _lref(i, 1, 'w')
+    else:
+        d = np.asarray(light.direction, np.float32)
+        d = d / max(float(np.linalg.norm(d)), 1e-9)
+        dist = max(float(getattr(light, 'decay_end', 25.0)), 1e-6)
+        pos = _v3(light.position)
+        vdir = _v3(d)
+        asize = _f(dist * dist / (sx * sy))
+    k = float(getattr(light, 'area_gamma', 1.0) or 1.0)
+    L = [f'vec2 hal_area_inp{i}(vec3 P, vec3 N)',
+         '{',
+         f'    vec3 hp = {pos};',
+         f'    vec3 hax = {_v3(hx)};',
+         f'    vec3 hay = {_v3(hy)};',
+         # area_lamp_vectors' corner order: -x-y, -x+y, +x+y, +x-y
+         '    vec3 av0 = normalize(P - (hp - hax - hay));',
+         '    vec3 av1 = normalize(P - (hp - hax + hay));',
+         '    vec3 av2 = normalize(P - (hp + hax + hay));',
+         '    vec3 av3 = normalize(P - (hp + hax - hay));',
+         # BI shades with normals flipped along the view ray; the
+         # contour sees the normal bare, so -N is the C's own frame
+         # (core/lights.area_inp has the derivation and the compiled
+         # proof)
+         '    vec3 avn = -N;',
+         '    float fac = 0.0;',
+         '    vec3 acr; float acl;']
+    for a, b in ((0, 1), (1, 2), (2, 3), (3, 0)):
+        L += [f'    acr = cross(av{a}, av{b});',
+              '    acl = max(length(acr), 1e-30);',
+              f'    fac += (2.0 * asin(clamp(0.5 * length(av{a} - av{b}),'
+              ' 0.0, 1.0))) * (dot(avn, acr) / acl);']
+    L += [f'    float afront = (dot(P - hp, {vdir}) >= 0.0) '
+          '? 1.0 : 0.0;',
+          f'    float aas = {asize};',
+          '    float af = max(fac, 0.0) * aas;',
+          '    float ab = max(-fac, 0.0) * aas;']
+    if abs(k - 1.0) > 1e-9:
+        # pow(0, k) is undefined territory on real drivers
+        L += [f'    af = (af > 0.0) ? pow(af, {_f(k)}) : 0.0;',
+              f'    ab = (ab > 0.0) ? pow(ab, {_f(k)}) : 0.0;']
+    L += ['    return vec2(af, ab) * afront;',
+          '}']
+    return '\n'.join(L) + '\n'
+
+
 def _shadow_function(i, meta, consts):
     """GLSL for one light's shadow term, mirroring ShadowMap.lookup exactly.
 
@@ -807,9 +945,14 @@ def _shadow_function(i, meta, consts):
                 '}']) + '\n'
         # SOFT: visibility()'s deterministic branch, sample for sample --
         # the same hash draws, the same table angles, the same jittered
-        # rays this pixel's CPU shade would build, averaged the same way
+        # rays this pixel's CPU shade would build, averaged the same way.
+        # Three shapes, matching _soft_ray on the CPU: AREA aims at real
+        # points on its rectangle (or ellipse), SUN tilts inside its
+        # angular disc, POINT/SPOT jitter the target in a world sphere
         w, h = consts['resolution']
         seed = int(consts.get('seed', 0))
+        kind = str(meta.get('kind', 'POINT')).upper()
+        area = meta.get('area')
         radius = _f(float(meta['radius']))
         L = [f'float hal_shadow_vis{i}(vec3 P, vec3 N, vec3 L, float dist)',
              '{',
@@ -824,15 +967,48 @@ def _shadow_function(i, meta, consts):
              '    float acc = 0.0;']
         for k in range(samples):
             z = 2 * k + 131 * int(i) + 7919 * seed
-            L += ['    {',
-                  f'    float u1 = hal_smp_hash3(sx, sy, {z});',
-                  f'    vec2 cs = hal_smp_circle(hal_smp_hash3(sx, sy, '
-                  f'{z + 1}));',
-                  f'    float r = sqrt(u1) * {radius};',
-                  '    vec3 jit = t * (r * cs.x) + b * (r * cs.y);',
-                  '    vec3 Lj = normalize(L * dist + jit);',
-                  '    acc += 1.0 - hal_bvh_occluded(org, Lj, maxt);',
-                  '    }']
+            if kind == 'AREA' and area is not None:
+                L += ['    {',
+                      f'    float u1 = hal_smp_hash3(sx, sy, {z});',
+                      f'    float u2 = hal_smp_hash3(sx, sy, {z + 1});']
+                if area['disk']:
+                    L += ['    float rr = sqrt(u1);',
+                          '    vec2 cs = hal_smp_circle(u2);',
+                          '    float uu = rr * cs.x;',
+                          '    float vv = rr * cs.y;']
+                else:
+                    L += ['    float uu = u1 * 2.0 - 1.0;',
+                          '    float vv = u2 * 2.0 - 1.0;']
+                L += [f'    vec3 ps = {_v3(area["pos"])} + '
+                      f'{_v3(area["ax"])} * ({_f(area["hx"])} * uu) + '
+                      f'{_v3(area["ay"])} * ({_f(area["hy"])} * vv);',
+                      '    vec3 dl = ps - P;',
+                      '    float ds = max(length(dl), 1e-6);',
+                      '    vec3 Lj = dl / ds;',
+                      '    float mt = ds * (1.0 - 1e-3);',
+                      '    acc += 1.0 - hal_bvh_occluded(org, Lj, mt);',
+                      '    }']
+            elif kind == 'SUN':
+                tanh = _f(float(np.tan(float(meta['radius']) * 0.5)))
+                L += ['    {',
+                      f'    float u1 = hal_smp_hash3(sx, sy, {z});',
+                      f'    vec2 cs = hal_smp_circle(hal_smp_hash3(sx, sy, '
+                      f'{z + 1}));',
+                      f'    float r = sqrt(u1) * {tanh};',
+                      '    vec3 jit = t * (r * cs.x) + b * (r * cs.y);',
+                      '    vec3 Lj = normalize(L + jit);',
+                      '    acc += 1.0 - hal_bvh_occluded(org, Lj, maxt);',
+                      '    }']
+            else:
+                L += ['    {',
+                      f'    float u1 = hal_smp_hash3(sx, sy, {z});',
+                      f'    vec2 cs = hal_smp_circle(hal_smp_hash3(sx, sy, '
+                      f'{z + 1}));',
+                      f'    float r = sqrt(u1) * {radius};',
+                      '    vec3 jit = t * (r * cs.x) + b * (r * cs.y);',
+                      '    vec3 Lj = normalize(L * dist + jit);',
+                      '    acc += 1.0 - hal_bvh_occluded(org, Lj, maxt);',
+                      '    }']
         L += [f'    return acc / {_f(float(samples))};', '}']
         return '\n'.join(L) + '\n'
 
@@ -1325,10 +1501,17 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
             _f(energy / (4.0 * np.pi))
         lines += [f'    vec3 delta = {pos} - P;',
                   '    float dist = max(length(delta), 1e-6);',
-                  '    vec3 L = delta / dist;',
-                  f'    float att = '
-                  f'{_attenuation(light, consts["falloff_default"], refs=refs)};']
-        if mode_bi and kind != 'SPOT':
+                  '    vec3 L = delta / dist;']
+        if kind == 'AREA':
+            # lamp_get_visibility skips its falloff switch for LA_AREA:
+            # visifac stays 1.0 and distance speaks only through the
+            # form factor -- exactly the CPU sample()'s area branch
+            lines.append('    float att = 1.0;')
+        else:
+            lines.append(
+                f'    float att = '
+                f'{_attenuation(light, consts["falloff_default"], refs=refs)};')
+        if mode_bi and kind not in ('SPOT', 'AREA'):
             # lamp_get_visibility's tail: visifac <= 0.001 snaps to 0
             lines.append('    att = (att <= 0.001) ? 0.0 : att;')
         lines += [f'    vec3 rad = {col} * ({e_pre} * att);']
@@ -1401,6 +1584,16 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
             # spec() table, same as the CPU override
             '    vec4 ds = vec4(hal_hd, s.specular '
             '* hal_bi_spec_pow(hal_ht, s.glossiness));']
+    elif kind == 'AREA':
+        # BI's area lamp: the Stokes energy stands in for the diffuse
+        # cosine and multiplies the finished specular (shade_one_light:
+        # inp = area_lamp_energy_multisample, then specfac *= inp).
+        # .y is the flipped-normal twin, consumed by BI translucency
+        lines += [
+            f'    vec2 hal_ainp = hal_area_inp{i}(P, N);',
+            '    vec4 ds = hal_evaluate2(hal_model_i, s, N, L, V, '
+            'hal_ainp.x, hal_ainp.y, 1.0);',
+            '    ds.yzw *= hal_ainp.x;']
     else:
         lines.append(
             '    vec4 ds = hal_evaluate(hal_model_i, s, N, L, V);')
@@ -2026,6 +2219,30 @@ void main()
                             'uses_screen': em.used_screen}
 
 
+def _layer_blend_lines(lines, consts, mode, var, f_expr, col_expr):
+    """One silhouette layer in GLSL, by its blend code.
+
+    The exact twin of core.render._blend_layer: 0 Add (the pre-1.38
+    behaviour, kept in its historic single-line form), 1 Mix, 2
+    Multiply, 3 Screen -- factor clamped for the bounded modes, free
+    for Add, the layer product clamped for Screen, all as the CPU does.
+    """
+    if mode == 1:
+        lines.append(f'    float {var} = clamp({f_expr}, 0.0, 1.0);')
+        lines.append(f'    total = total * (1.0 - {var}) + '
+                     f'{col_expr} * {var};')
+    elif mode == 2:
+        lines.append(f'    float {var} = clamp({f_expr}, 0.0, 1.0);')
+        lines.append(f'    total = total * (vec3(1.0) - {var} * '
+                     f'(vec3(1.0) - {col_expr}));')
+    elif mode == 3:
+        lines.append(f'    float {var} = {f_expr};')
+        lines.append(f'    total = vec3(1.0) - (vec3(1.0) - total) * '
+                     f'(vec3(1.0) - clamp({col_expr} * {var}, 0.0, 1.0));')
+    else:
+        lines.append(f'    total += {col_expr} * {f_expr};')
+
+
 def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
                    shadows=None, textures=None, programs=None,
                    secondary=False, layer=False, vertex_rate=None):
@@ -2474,6 +2691,24 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
         for i, ckspec in sorted((consts.get('cookies') or {}).items()):
             shadow_fns.append(_cookie_function(i, ckspec))
             samplers.append(f'hal_cookie{i}')
+        # BI's area lamp form factor: one Stokes-contour function per
+        # AREA light, consumed by _one_light_source's evaluate2 road.
+        # Gated exactly like the light loop (a shadeless pass emits no
+        # caller, and an uncalled body still has to LINK its hal_ltex
+        # reference on strict drivers). The prototype comes first:
+        # these functions read the light-value texture, whose
+        # definition lands AFTER shadow_fns in the assembly -- GLSL
+        # wants declaration before use in file order, and the FIELD's
+        # driver enforced what the simulator never did (R193: every
+        # material pass rejected, 95% black, then the crash)
+        if not shadeless:
+            _area_lights = [
+                (i, _al) for i, _al in enumerate(lights)
+                if getattr(_al, 'type', 'POINT') == 'AREA']
+            if _area_lights and bool(consts.get('light_texels', True)):
+                shadow_fns.append('vec4 hal_ltex(int t);\n')
+            for i, _al in _area_lights:
+                shadow_fns.append(_area_function(i, _al, consts))
     # the per-triangle auxiliary texture: STORED face normals + the
     # per-tri random, the CPU's own values baked (gbuffer.pack_tri_aux).
     # Wanted by Normal Source FACE (every pass) and by graphs reading
@@ -2916,29 +3151,44 @@ void main()
     if not vertex_rate and not shadeless \
             and float(bake.get('fresnel', 0.0)) > 1e-4:
         fp = max(float(bake.get('fresnel_power', 3.0)), 0.01)
-        lines.append(
-            f'    total += '
-            f'{_mv3(consts, bake.get("fresnel_color", (1, 1, 1)))}'
-            f' * (pow(hal_sil, {_mv(consts, fp)})'
+        _layer_blend_lines(
+            lines, consts, int(round(float(bake.get('fresnel_blend', 0.0)))),
+            'hal_frf',
+            f'(pow(hal_sil, {_mv(consts, fp)})'
             f' * {_mv(consts, bake["fresnel"])}'
-            f' * {_mv(consts, bake.get("specular_level", 0.5))});')
+            f' * {_mv(consts, bake.get("specular_level", 0.5))})',
+            _mv3(consts, bake.get('fresnel_color', (1, 1, 1))))
     if not vertex_rate and not shadeless \
             and float(bake.get('rim', 0.0)) > 1e-4:
         rp = max(float(bake.get('rim_power', 3.0)), 0.01)
-        lines.append(
-            f'    total += {_mv3(consts, bake.get("rim_color", (1, 1, 1)))}'
-            f' * (pow(hal_sil, {_mv(consts, rp)})'
-            f' * {_mv(consts, bake["rim"])});')
-    # matcap: the whole lit result lerps toward one colour, exactly as
-    # apply_surface_effects -- after fresnel and rim, before the backface
+        _layer_blend_lines(
+            lines, consts, int(round(float(bake.get('rim_blend', 0.0)))),
+            'hal_rmf',
+            f'(pow(hal_sil, {_mv(consts, rp)})'
+            f' * {_mv(consts, bake["rim"])})',
+            _mv3(consts, bake.get('rim_color', (1, 1, 1))))
+    # matcap: the whole lit result lands by its blend menu, exactly as
+    # apply_surface_effects -- after fresnel and rim, before the backface.
+    # Mode 0 (Mix) is the pre-1.38 behaviour verbatim
     mk = min(max(float(bake.get('matcap_blend', 0.0)), 0.0), 1.0)
     if vertex_rate or shadeless:
         mk = 0.0            # in the corners already / never applied
     if mk > 1e-4:
         mc = perpix_exprs.get('matcap',
                               _mv3(consts, bake.get('matcap', (0, 0, 0))))
-        lines.append(f'    total = total * {_mv(consts, 1.0 - mk)} + '
-                     f'({mc}) * {_mv(consts, mk)};')
+        mmode = int(round(float(bake.get('matcap_mode', 0.0))))
+        if mmode == 1:
+            lines.append(f'    total = total + ({mc}) * {_mv(consts, mk)};')
+        elif mmode == 2:
+            lines.append(f'    total = total * (vec3(1.0) - '
+                         f'{_mv(consts, mk)} * (vec3(1.0) - ({mc})));')
+        elif mmode == 3:
+            lines.append(f'    total = vec3(1.0) - (vec3(1.0) - total) * '
+                         f'(vec3(1.0) - clamp(({mc}) * {_mv(consts, mk)}, '
+                         f'0.0, 1.0));')
+        else:
+            lines.append(f'    total = total * {_mv(consts, 1.0 - mk)} + '
+                         f'({mc}) * {_mv(consts, mk)};')
     # the backface override: the rasteriser decides front by projected
     # winding, and for a perspective camera that is exactly the plane-side
     # test against the eye -- computed from the corner positions the
@@ -3065,14 +3315,17 @@ void main()
                     + sorted(tex_binds) + sorted(tex_binds_mip)
                     + (['hal_uvgrad'] if needs_uvgrad else [])
                     + [p[0] for p in prepasses])
-    if len(all_samplers) + 3 > 16:
-        # the three G-buffer samplers ride every pass; 16 is the
-        # fragment-sampler floor real drivers guarantee. Refusing HERE,
-        # by name and by count, beats the field's alternative: the
-        # driver rejecting the compile with 'Shader Compile Error' and
-        # the whole frame silently falling back
+    _slim = int(consts.get('max_samplers', 16))
+    if len(all_samplers) + 3 > _slim:
+        # the three G-buffer samplers ride every pass. The limit is the
+        # DRIVER'S OWN answer (device.max_fragment_samplers -- 32 on
+        # desktop hardware), not the spec's worst case: a field
+        # material needing 17 spent 16 minutes on the CPU under the
+        # assumed 16, on a card that provides twice that. Refusing
+        # HERE, by name and by count, still beats the driver rejecting
+        # the compile -- but only past the real cliff.
         return None, (f'needs {len(all_samplers) + 3} texture samplers; '
-                      'drivers guarantee 16')
+                      f'this driver provides {_slim}')
     info = {'samplers': all_samplers,
             'textures': tex_binds,
             'textures_mip': tex_binds_mip,
@@ -3105,9 +3358,9 @@ void main()
             return None, ('internal: a material-value marker survived '
                           'the lift')
         if mvals:
-            if len(all_samplers) + 4 > 16:
+            if len(all_samplers) + 4 > _slim:
                 return None, (f'needs {len(all_samplers) + 4} texture '
-                              'samplers; drivers guarantee 16')
+                              f'samplers; this driver provides {_slim}')
             decl = ('uniform sampler2D hal_mats;\n'
                     'uniform float hal_mrow;\n'
                     'float hal_mv(int t)\n'

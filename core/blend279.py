@@ -71,6 +71,19 @@ MA_GROUP_NOLAY = 0x10000000   # light-group Exclusive
 MA_CUBIC = 1
 # mode2 bits
 MA_CASTSHADOW = 1
+# R191: the halo material. material_type 1 = MA_TYPE_HALO, and its
+# mode bits OVERLOAD the surface ones by design (DNA_material_types.h
+# defines both names on the same values; material_type disambiguates)
+MA_TYPE_HALO = 1
+MA_HALO_SOFT = 16
+MA_HALO_RINGS = 256
+MA_HALO_LINES = 512
+MA_HALO_XALPHA = 1024
+MA_STAR = 0x800
+MA_HALOTEX = 0x1000
+MA_HALOPUNO = 0x2000
+MA_HALO_SHADE = 0x4000
+MA_HALO_FLARE = 0x8000
 
 OB_MESH, OB_LAMP_279, OB_CAMERA_279 = 1, 10, 11
 
@@ -593,7 +606,12 @@ def _material(bf, span, doff):
         'sss_radius': 'f3', 'sss_col': 'f3', 'sss_error': 'f',
         'sss_scale': 'f', 'sss_ior': 'f', 'sss_colfac': 'f',
         'sss_texfac': 'f', 'sss_front': 'f', 'sss_back': 'f',
-        'sss_flag': 'h'})
+        'sss_flag': 'h',
+        # R191: the Halo material panel (make_render_halos /
+        # RE_inithalo read these)
+        'material_type': 'h', 'hasize': 'f', 'add': 'f',
+        'seed1': 'h', 'ringc': 'h', 'linec': 'h', 'starc': 'h',
+        'flarec': 'h'})
     mt['name'] = bf.id_name('Material', doff)
 
     # the material's own colorbands (the texture ones follow the Tex)

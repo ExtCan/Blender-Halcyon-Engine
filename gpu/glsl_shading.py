@@ -115,22 +115,29 @@ DIFFUSE = """
 float hal_diffuse_lambert(float ndl) { return max(ndl, 0.0); }
 
 float hal_diffuse_oren_nayar(float ndl, float ndv, vec3 l, vec3 v, vec3 n,
-                             float roughness)
+                             float roughness, float realnl)
 {
     // verbatim 2.79 (R155): nv clamps at 0 (View_A caps at pi/2) and
-    // the smaller angle scales by 0.95 before tan -- the C's guard
+    // the smaller angle scales by 0.95 before tan -- the C's guard.
+    // R190: the C's own nl/realnl split -- angles, projections and
+    // both gates run on realnl (the true dot), while the first
+    // argument (an area lamp's inp) survives only as the outer
+    // factor. Callers everywhere else pass the same dot twice and
+    // land on the old digits exactly.
     float s2 = roughness * roughness;
     float A = 1.0 - 0.5 * s2 / (s2 + 0.33);
     float B = 0.45 * s2 / (s2 + 0.09);
+    float rl = clamp(realnl, -1.0, 1.0);
     float nv = max(clamp(ndv, -1.0, 1.0), 0.0);
-    vec3 lp = normalize(l - n * ndl);
+    vec3 lp = normalize(l - n * rl);
     vec3 vp = normalize(v - n * nv);
     float cosphi = max(dot(lp, vp), 0.0);
-    float ti = acos(clamp(ndl, -1.0, 1.0));
+    float ti = acos(clamp(rl, -1.0, 1.0));
     float tr = acos(nv);
     float alpha = max(ti, tr);
     float beta = min(ti, tr) * 0.95;
-    return max(ndl, 0.0) * (A + B * cosphi * sin(alpha) * tan(beta));
+    float outer = (rl > 0.0 && ndl >= 0.0) ? max(ndl, 0.0) : 0.0;
+    return outer * (A + B * cosphi * sin(alpha) * tan(beta));
 }
 
 float hal_diffuse_minnaert(float ndl, float ndv, float darkness)
@@ -548,27 +555,40 @@ GLSL = COMMON + DIFFUSE + SPECULAR
 #: vec4(diffuse, specular.rgb).
 DISPATCH = """
 float hal_bi_matrix_diffuse(int di, HalcyonSurface s, vec3 n, vec3 l,
-                            vec3 v, float ndl, float ndv)
+                            vec3 v, float ndl, float ndl_q, float ndv)
 {
     // the BI node's diffuse ladder, callable twice: once forward, once
-    // through the flipped normal for BI's translucency
+    // through the flipped normal for BI's translucency. `ndl` feeds
+    // the shaders whose C took `inp` as an argument (Lambert,
+    // Oren-Nayar, Minnaert); `ndl_q` is the raw dot for Toon and
+    // Fresnel, which took only vectors and never saw an area lamp's
+    // form factor -- the 2.79 quirk, kept
     if (di == 1) {
-        return hal_diffuse_oren_nayar(ndl, ndv, l, v, n, s.roughness);
+        return hal_diffuse_oren_nayar(ndl, ndv, l, v, n, s.roughness,
+                                      ndl_q);
     }
     if (di == 2) {
-        return hal_diffuse_bi_toon(ndl, s.toon_size, s.toon_smooth);
+        return hal_diffuse_bi_toon(ndl_q, s.toon_size, s.toon_smooth);
     }
     if (di == 3) {
         return hal_diffuse_bi_minnaert(ndl, ndv, s.roughness);
     }
     if (di == 4) {
-        return hal_diffuse_bi_fresnel(ndl, s.bi_fresnel,
+        return hal_diffuse_bi_fresnel(ndl_q, s.bi_fresnel,
                                       s.bi_fresnel_fac);
     }
     return hal_diffuse_lambert(ndl);
 }
 
-vec4 hal_evaluate(int model, HalcyonSurface s, vec3 n, vec3 l, vec3 v)
+// The shared shader ladder. `ndl_d` stands in for the diffuse cosine
+// (an AREA lamp passes its Stokes form-factor energy, everything else
+// the true dot); `back_d` is its flipped-normal twin for translucent
+// backsides; `area_on` marks the area road so the BI matrix keeps its
+// per-shader inp/raw-dot split. Specular gates always keep true dots
+// -- the C's spec functions compute their own -- and the caller
+// multiplies the finished specular by the area energy (specfac *= inp).
+vec4 hal_evaluate2(int model, HalcyonSurface s, vec3 n, vec3 l, vec3 v,
+                   float ndl_d, float back_d, float area_on)
 {
     float ndl = dot(n, l);
     float ndv = dot(n, v);
@@ -589,42 +609,43 @@ vec4 hal_evaluate(int model, HalcyonSurface s, vec3 n, vec3 l, vec3 v)
     vec3 tint = s.specular;
 
     if (model == 0) {                       // LAMBERT
-        d = hal_diffuse_lambert(ndl);
+        d = hal_diffuse_lambert(ndl_d);
     } else if (model == 1 || model == 2) {  // GOURAUD, FLAT
         // shading RATES, not models: the maths is Blinn-Phong, what differs is
         // how often the shader is invoked, which the caller decides
-        d = hal_diffuse_lambert(ndl);
+        d = hal_diffuse_lambert(ndl_d);
         sp = hal_spec_blinn_phong(ndl, ndh, s.glossiness);
     } else if (model == 3) {                // PHONG
-        d = hal_diffuse_lambert(ndl);
+        d = hal_diffuse_lambert(ndl_d);
         sp = hal_spec_phong(ndl, rdv, s.glossiness);
     } else if (model == 4) {                // BLINN_PHONG
-        d = hal_diffuse_lambert(ndl);
+        d = hal_diffuse_lambert(ndl_d);
         sp = hal_spec_blinn_phong(ndl, ndh, s.glossiness);
     } else if (model == 5) {                // BLINN
-        d = hal_diffuse_lambert(ndl);
+        d = hal_diffuse_lambert(ndl_d);
         sp = hal_spec_blinn(ndl, ndv, ndh, vdh, s.glossiness, s.ior);
     } else if (model == 6) {                // COOK_TORRANCE
-        d = hal_diffuse_lambert(ndl);
+        d = hal_diffuse_lambert(ndl_d);
         sp = hal_spec_cook_torrance(ndl, ndv, ndh, vdh, s.roughness, s.ior);
     } else if (model == 7) {                // OREN_NAYAR
-        d = hal_diffuse_oren_nayar(ndl, ndv, l, v, n, s.roughness);
+        d = hal_diffuse_oren_nayar(ndl_d, ndv, l, v, n, s.roughness,
+                                   ndl);
     } else if (model == 8) {                // MINNAERT
-        d = hal_diffuse_minnaert(ndl, ndv, 1.0 + s.roughness * 2.0);
+        d = hal_diffuse_minnaert(ndl_d, ndv, 1.0 + s.roughness * 2.0);
     } else if (model == 9) {                // WARD
         // driven by roughness, not by the Phong exponent: Ward is a Gaussian
         // on the slope distribution and takes its widths directly
-        d = hal_diffuse_lambert(ndl);
+        d = hal_diffuse_lambert(ndl_d);
         float rough = max(s.roughness, 0.02);
         float an = clamp(s.anisotropy, -0.99, 0.99);
         sp = hal_spec_ward(ndl, ndv, h, n, s.tangent, s.bitangent,
                            rough * (1.0 + an), rough * (1.0 - an));
     } else if (model == 10) {               // ANISOTROPIC
-        d = hal_diffuse_lambert(ndl);
+        d = hal_diffuse_lambert(ndl_d);
         sp = hal_spec_aniso_blinn(ndl, ndh, h, n, s.tangent, s.bitangent,
                                   s.glossiness, s.anisotropy);
     } else if (model == 11) {               // METAL
-        d = hal_diffuse_lambert(ndl);
+        d = hal_diffuse_lambert(ndl_d);
         sp = hal_spec_cook_torrance(ndl, ndv, ndh, vdh,
                                     max(1.0 / max(s.glossiness, 1.0), 0.02),
                                     s.ior);
@@ -634,7 +655,7 @@ vec4 hal_evaluate(int model, HalcyonSurface s, vec3 n, vec3 l, vec3 v)
         vec2 st = hal_spec_strauss(ndl, ndv, rdv, smooth_s, 1.0 - s.opacity);
         // the diffuse is scaled by rn, and the metal tint uses a plain
         // 1 - |N.L| falloff rather than the Strauss F term
-        d = hal_diffuse_lambert(ndl) * st.y;
+        d = hal_diffuse_lambert(ndl_d) * st.y;
         sp = st.x;
         float m = clamp(s.metallic, 0.0, 1.0);
         float fr = clamp(1.0 - abs(ndl), 0.0, 1.0);
@@ -642,12 +663,12 @@ vec4 hal_evaluate(int model, HalcyonSurface s, vec3 n, vec3 l, vec3 v)
         // Strauss returns before the soften pass on the CPU
         return vec4(d, tint * sp);
     } else if (model == 13) {               // MULTI_LAYER
-        d = hal_diffuse_lambert(ndl);
+        d = hal_diffuse_lambert(ndl_d);
         sp = hal_spec_blinn_phong(ndl, ndh, s.glossiness)
              + hal_spec_blinn_phong(ndl, ndh, max(s.glossiness * 0.15, 1.0))
                * 0.35;
     } else if (model == 14) {               // TOON
-        d = hal_diffuse_toon(ndl, s.toon_size, s.toon_smooth, s.toon_steps);
+        d = hal_diffuse_toon(ndl_d, s.toon_size, s.toon_smooth, s.toon_steps);
         sp = hal_spec_toon(ndl, rdv, s.toon_size * 0.5, s.toon_smooth);
     } else if (model == 15) {               // TRANSLUCENT
         d = hal_diffuse_lambert(ndl)
@@ -655,13 +676,13 @@ vec4 hal_evaluate(int model, HalcyonSurface s, vec3 n, vec3 l, vec3 v)
     } else if (model == 16) {               // CONSTANT
         d = 0.0;                            // unlit: emission is added later
     } else if (model == 18) {               // BI_COOKTORR
-        d = hal_diffuse_lambert(ndl);
+        d = hal_diffuse_lambert(ndl_d);
         sp = hal_spec_bi_cooktorr(ndl, ndv, ndh, s.glossiness);
     } else if (model == 19) {               // BI_PHONG
-        d = hal_diffuse_lambert(ndl);
+        d = hal_diffuse_lambert(ndl_d);
         sp = hal_spec_bi_phong(ndl, ndh, s.glossiness);
     } else if (model == 20) {               // BI_BLINN
-        d = hal_diffuse_lambert(ndl);
+        d = hal_diffuse_lambert(ndl_d);
         sp = hal_spec_bi_blinn(ndl, ndv, ndh, vdh, s.glossiness, s.ior);
     } else if (model >= 100) {              // the BI MATERIAL NODE:
         // 100 + diffuse*10 + spec, both menus in DNA order. Every
@@ -681,13 +702,15 @@ vec4 hal_evaluate(int model, HalcyonSurface s, vec3 n, vec3 l, vec3 v)
             ndv = dot(n_use, v);
             ndh = dot(n_use, h);
         }
-        d = hal_bi_matrix_diffuse(di, s, n_use, l, v, ndl, ndv);
+        float nd_bi = (area_on > 0.5) ? ndl_d : ndl;
+        float bk_bi = (area_on > 0.5) ? back_d : -ndl;
+        d = hal_bi_matrix_diffuse(di, s, n_use, l, v, nd_bi, ndl, ndv);
         if (s.translucency > 0.0) {
             // BI's translucency: the same diffuse shader through the
             // flipped normal, scaled by the slider
             d += clamp(s.translucency, 0.0, 1.0)
                  * hal_bi_matrix_diffuse(di, s, -n_use, l, v,
-                                         -ndl, -ndv);
+                                         bk_bi, -ndl, -ndv);
         }
         if (s.bi_cubic > 0.5) { d = hal_bi_cubic(d); }
         if (si == 1) {
@@ -704,11 +727,17 @@ vec4 hal_evaluate(int model, HalcyonSurface s, vec3 n, vec3 l, vec3 v)
             sp = hal_spec_bi_cooktorr(ndl, ndv, ndh, s.glossiness);
         }
     } else {
-        d = hal_diffuse_lambert(ndl);
+        d = hal_diffuse_lambert(ndl_d);
     }
 
     sp = hal_soften(sp, ndl, s.soften);
     return vec4(d, tint * sp);
+}
+
+vec4 hal_evaluate(int model, HalcyonSurface s, vec3 n, vec3 l, vec3 v)
+{
+    float hal_e_nl = dot(n, l);
+    return hal_evaluate2(model, s, n, l, v, hal_e_nl, -hal_e_nl, 0.0);
 }
 """
 

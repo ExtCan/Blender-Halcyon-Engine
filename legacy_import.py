@@ -144,6 +144,48 @@ def _convert_material(bmat, mdict, version, blend_dir, warnings,
     """
     spec = blend279_map.material_spec(mdict, version)
     warnings.extend(spec['warnings'])
+    if spec.get('halo'):
+        # R191: MA_TYPE_HALO -- the whole material IS the halo panel.
+        # No node tree to build; the exporter reads these props and
+        # turns the mesh's vertices into glows
+        h = spec['halo']
+        hs = getattr(bmat, 'halcyon', None)
+        if hs is not None:
+            try:
+                hs.halo = True
+                hs.halo_size = float(h['size'])
+                hs.halo_hardness = int(min(max(h['hardness'], 0), 127))
+                hs.halo_add = float(min(max(h['add'], 0.0), 1.0))
+                hs.halo_alpha = float(min(max(h['alpha'], 0.0), 1.0))
+                hs.halo_color = tuple(
+                    min(max(c, 0.0), 1.0) for c in h['color'])
+                hs.halo_seed = int(h['seed'])
+                hs.halo_rings = h['rings'] > 0
+                if h['rings'] > 0:
+                    hs.halo_ring_count = int(min(h['rings'], 24))
+                hs.halo_lines = h['lines'] > 0
+                if h['lines'] > 0:
+                    hs.halo_line_count = int(min(h['lines'], 250))
+                hs.halo_star = h['star_points'] > 0
+                if h['star_points'] > 0:
+                    hs.halo_star_tips = int(
+                        min(max(h['star_points'], 3), 50))
+                hs.halo_ring_color = tuple(
+                    min(max(c, 0.0), 1.0) for c in h['ring_color'])
+                hs.halo_line_color = tuple(
+                    min(max(c, 0.0), 1.0) for c in h['line_color'])
+                hs.halo_xalpha = bool(h['xalpha'])
+                hs.halo_soft = bool(h['soft'])
+                hs.halo_shaded = bool(h['shaded'])
+                hs.halo_puno = bool(h['puno'])
+            except (AttributeError, TypeError, ValueError) as exc:
+                warnings.append(f"{spec['name']}: halo panel did not "
+                                f'apply cleanly ({exc})')
+        try:
+            bmat.diffuse_color = tuple(h['color']) + (1.0,)
+        except (AttributeError, TypeError, ValueError):
+            pass
+        return bmat, 0
     n_images = 0
     for entry in spec['textures']:
         image = entry.pop('image', None)
@@ -424,6 +466,15 @@ def _apply_lamp_bi(light, lm, warnings=None):
             hs.decay_ld1 = float(lm.get('ld1') or 0.0)
             hs.decay_ld2 = float(lm.get('ld2') or 0.0)
             hs.bi_sphere = bool(lm.get('sphere'))
+        except (AttributeError, TypeError, ValueError):
+            pass
+    if lm['type'] == 'AREA':
+        # la->k, the area lamp's Gamma: rides into the form factor as
+        # pow(stokes * dist^2/A, k). The Distance already landed in
+        # decay_end above -- for an area lamp that IS the areasize
+        # normalisation distance, its only 2.79 meaning
+        try:
+            hs.area_gamma = float(lm.get('area_gamma', 1.0) or 1.0)
         except (AttributeError, TypeError, ValueError):
             pass
     # the lamp mode bits BI's loop honoured: Negative subtracts, No

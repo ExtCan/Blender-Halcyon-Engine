@@ -153,13 +153,25 @@ def starfield(world, dirs):
 
     bright = float(getattr(world, 'star_brightness', 0.8))
     if bright > 1e-4:
-        from .patterns import starfield as _star_pattern
         size = float(getattr(world, 'star_size', 0.35))
-        scale = 60.0 + float(getattr(world, 'star_density', 0.5)) * 340.0
-        mag = _star_pattern(dirs * scale,
-                            float(getattr(world, 'star_density', 0.5)),
-                            size, float(getattr(world, 'star_twinkle', 0.0)),
-                            float(getattr(world, '_time', 0.0)))
+        density = float(getattr(world, 'star_density', 0.5))
+        scale = 60.0 + density * 340.0
+        if getattr(world, 'old_stars', False):
+            # the pre-1.38 stars, kept verbatim behind the switch: the
+            # disc was measured in 3D grid space, where the sky sphere
+            # cuts each cell at a different depth, so star sizes came
+            # out essentially random and grew with render resolution
+            from .patterns import starfield as _star_pattern
+            mag = _star_pattern(dirs * scale, density,
+                                size,
+                                float(getattr(world, 'star_twinkle', 0.0)),
+                                float(getattr(world, '_time', 0.0)))
+        else:
+            mag = _star_discs(dirs, scale, density, size,
+                              float(getattr(world, 'star_twinkle', 0.0)),
+                              float(getattr(world, '_time', 0.0)),
+                              seed=0, thresh_k=0.25,
+                              min_ang=_star_floor(world))
         # stars are not all white: hot ones read blue, cool ones amber, and a
         # single hash per cell is enough to say which
         tint = _hash3f_dirs(dirs * scale)
@@ -168,6 +180,76 @@ def starfield(world, dirs):
         star_col = cool[None, :] + (warm[None, :] - cool[None, :]) * tint[:, None]
         col = col + star_col * (mag * bright)[:, None]
     return col.astype(np.float32)
+
+
+def _star_floor(world):
+    """The smallest angular radius worth drawing: just over half a pixel.
+
+    Without a floor, a correctly sized star at a preview resolution can
+    fall entirely between the sample points and the sky goes empty; the
+    era's stars were never smaller than the pixel that carried them.
+    A renderer stamps the real pixel angle onto the world before
+    evaluating; a caller that has none (preset thumbnails, probes,
+    reflection rays before the stamp) gets the pixel of the era's
+    640x480 at a standard lens, so stars exist at SOME size everywhere
+    rather than being points of measure zero.
+    """
+    ang = float(getattr(world, '_pixel_angle', 0.0) or 0.0)
+    if ang <= 0.0:
+        ang = 0.003                     # ~one 350-line pixel at a 60-deg fov
+    return ang * 0.6
+
+
+def _star_discs(dirs, scale, density, size, twinkle, time, seed=0,
+                thresh_k=0.25, min_ang=0.0):
+    """Round stars of a FIXED angular size, whatever the resolution.
+
+    The old drawing measured stars in grid units. For the Bryce layer
+    that meant the whole grid cell lit up -- a star was a square whose
+    pixel size followed the render resolution, so a sky tuned at 320x240
+    turned into a field of blocks at 1920. For the starfield mode the
+    disc was measured in 3D cell space, where the sky sphere cuts every
+    cell at a different depth, so sizes came out arbitrary.
+
+    Here a star is a point ON the sky -- the cell's hashed centre,
+    projected to the unit sphere -- and its disc is measured as an angle
+    between directions. Star Size 0.35 means 0.35 of a grid cell's
+    angular width, at every resolution, in every direction.
+    """
+    p = dirs * scale
+    cell = np.floor(p)
+    ix = cell[:, 0].astype(np.int64)
+    iy = cell[:, 1].astype(np.int64)
+    iz = cell[:, 2].astype(np.int64) + int(seed)
+    h = _hash3(ix, iy, iz)
+    thresh = 1.0 - np.clip(density, 0.0, 1.0) * float(thresh_k)
+    mag = np.where(h > thresh, (h - thresh) / max(1.0 - thresh, 1e-4),
+                   np.float32(0.0)).astype(np.float32)
+    live = mag > 0.0
+    if not live.any():
+        return np.zeros(dirs.shape[0], np.float32)
+    # the star's own direction: its cell's hashed interior point, pushed
+    # out to the unit sky
+    centre = cell[live] + np.stack([_hash3(ix[live], iy[live], iz[live] + 11),
+                                    _hash3(ix[live], iy[live], iz[live] + 23),
+                                    _hash3(ix[live], iy[live], iz[live] + 47)],
+                                   axis=1)
+    s = M.normalize(centre.astype(np.float32))
+    d_ang = np.linalg.norm(dirs[live] - s, axis=1)   # chord ~ angle out here
+    rad = max(float(size), 1e-3) * 0.5 / max(float(scale), 1e-3)
+    rad = max(rad, float(min_ang))
+    # a solid core with a half-radius fade, not a soft cone: the era's
+    # stars were hard points of light, and a linear falloff across the
+    # whole disc reads as a blob
+    disc = np.clip((1.0 - d_ang / rad) * 2.0, 0.0, 1.0)
+    m = mag[live] * disc
+    if twinkle > 0.0:
+        phase = _hash3(ix[live], iy[live], iz[live] + 91) * (2.0 * np.pi)
+        m = m * (1.0 - twinkle * 0.5 *
+                 (1.0 + np.sin(time * 3.0 + phase)) * 0.5)
+    out = np.zeros(dirs.shape[0], np.float32)
+    out[live] = np.clip(m, 0.0, 1.0)
+    return out
 
 
 def _hash3f_dirs(p):
@@ -364,19 +446,33 @@ def _rainbow(dirs, sun, intensity, radius, width, secondary):
     return out
 
 
-def _stars(dirs, density, brightness, seed):
+def _stars(dirs, density, brightness, seed, world=None):
     if brightness <= 0.0:
         return 0.0
-    p = dirs * (140.0 + density * 260.0)
-    cell = np.floor(p)
-    h = _hash3(cell[:, 0].astype(np.int64), cell[:, 1].astype(np.int64),
-               cell[:, 2].astype(np.int64) + int(seed))
-    thresh = 1.0 - np.clip(density, 0.0, 1.0) * 0.06
-    hit = h > thresh
-    mag = np.zeros(dirs.shape[0], np.float32)
-    if hit.any():
-        frac = (h[hit] - thresh) / max(1.0 - thresh, 1e-4)
-        mag[hit] = frac * brightness
+    scale = 140.0 + density * 260.0
+    if world is not None and getattr(world, 'old_stars', False):
+        # the pre-1.38 drawing, verbatim: every pixel in a starred cell
+        # lit up, so a star was a SQUARE the size of the cell -- one or
+        # two pixels at 320x240, a nine-pixel block at 1920. Kept as Old
+        # Stars for scenes tuned to it.
+        p = dirs * scale
+        cell = np.floor(p)
+        h = _hash3(cell[:, 0].astype(np.int64), cell[:, 1].astype(np.int64),
+                   cell[:, 2].astype(np.int64) + int(seed))
+        thresh = 1.0 - np.clip(density, 0.0, 1.0) * 0.06
+        hit = h > thresh
+        mag = np.zeros(dirs.shape[0], np.float32)
+        if hit.any():
+            frac = (h[hit] - thresh) / max(1.0 - thresh, 1e-4)
+            mag[hit] = frac * brightness
+    else:
+        size = float(getattr(world, 'star_size', 0.35)) \
+            if world is not None else 0.35
+        mag = _star_discs(dirs, scale, density, size,
+                          twinkle=0.0, time=0.0, seed=int(seed),
+                          thresh_k=0.06,
+                          min_ang=_star_floor(world) if world is not None
+                          else 0.0) * brightness
     mag = mag * np.clip(dirs[:, 2] * 4.0, 0.0, 1.0)
     tint = np.stack([mag, mag * 0.97, mag * 0.9], axis=1)
     return tint.astype(np.float32)
@@ -580,7 +676,8 @@ def bryce(world, dirs, eye=None):
         col = col + neb * (v * amount)[:, None]
     if world.stars:
         col = col + _stars(dirs, float(world.star_density),
-                           float(world.star_brightness), int(world.cloud_seed))
+                           float(world.star_brightness), int(world.cloud_seed),
+                           world=world)
     if float(getattr(world, 'comets', 0.0)) > 0.0:
         col = col + _comets(dirs, sun, world, float(world.comets),
                             int(getattr(world, 'comet_count', 3)),
@@ -876,6 +973,16 @@ def _wave_normal(p, world, time, lod=None):
     lost = np.zeros_like(x)
     freq, weight = 1.0, 1.0
     rng = np.random.default_rng(int(world.cloud_seed) + 4242)
+    # The phase runs in float64 and is wrapped BEFORE the cosine. Sample
+    # positions near the horizon run to hundreds of thousands of units, and
+    # float32 keeps about seven digits: by a few tens of thousands the phase
+    # had no fractional part left at all, so the far water was cos() of
+    # rounding noise -- a band of garbage that moved with the camera. Double
+    # precision carries the position out to the cap, and the wrap hands the
+    # cosine a small, exact angle.
+    x64 = x.astype(np.float64)
+    y64 = y.astype(np.float64)
+    two_pi = 2.0 * np.pi
     for i in range(octaves):
         # each train fans further off the wind as it gets shorter, which is
         # what makes a swell read as a swell and chop read as chop
@@ -886,8 +993,9 @@ def _wave_normal(p, world, time, lod=None):
         # together at the origin and the sea reads as corrugated iron, which
         # is exactly what showed up once the waves were small enough to see
         start = rng.random() * 6.28318
-        phase = (x * kx + y * ky) * freq + t * (1.0 + i * 0.3) * np.sqrt(freq) \
-            + start
+        phase = np.mod((x64 * kx + y64 * ky) * freq
+                       + t * (1.0 + i * 0.3) * np.sqrt(freq) + start,
+                       two_pi).astype(np.float32)
         w = weight
         if lod is not None and smooth > 0.0:
             # fade a train out as its wavelength approaches the pixel
@@ -1020,12 +1128,27 @@ def ground_plane(world, dirs, sky_col, eye, time=0.0, textures=None):
     without that it reads as a flat sheet rather than as ground going away.
     """
     dz = dirs[:, 2]
-    below = dz < -1e-5
+    # every ray that dips below the plane hits it. The old -1e-5 threshold
+    # left a sliver of rays -- a band a few pixels tall at the horizon --
+    # that pointed down but were declared "level", so the sky showed
+    # through in a bright line between the water and the horizon. The
+    # distance is capped instead: past the cap the haze owns the pixel
+    # anyway, and the cap is approached smoothly so no seam is drawn.
+    below = dz < 0.0
     if not below.any():
         return sky_col
     eye = np.asarray(eye, np.float32)
     t = np.full(dirs.shape[0], -1.0, np.float32)
-    t[below] = (float(world.ground_height) - eye[2]) / dz[below]
+    t_cap = np.float32(5.0e5)
+    with np.errstate(divide='ignore', over='ignore'):
+        raw = (float(world.ground_height) - eye[2]) / \
+            np.minimum(dz[below], np.float32(-1e-12)).astype(np.float64)
+    raw = np.where(raw > 0.0, raw, -1.0)
+    # smooth approach to the cap, the _dome_project treatment: the plane
+    # keeps receding but never runs off to infinity, so float32 never
+    # sees a coordinate it cannot hold
+    t[below] = np.where(raw > 0.0,
+                        (t_cap * raw / (t_cap + raw)), -1.0).astype(np.float32)
     hit = below & (t > 0.0)
     if not hit.any():
         return sky_col
@@ -1035,6 +1158,11 @@ def ground_plane(world, dirs, sky_col, eye, time=0.0, textures=None):
     col = np.broadcast_to(np.asarray(world.ground_color, np.float32)[None, :],
                           (p.shape[0], 3)).copy()
     scale = max(float(world.ground_scale), 1e-3)
+    # R204: modes with a self-luminous part split it out so the scene
+    # lighting stage can shade the surface without dimming the glow.
+    # None means "col is all there is" (diffuse) and costs nothing.
+    g_diff = None
+    g_emit = None
 
     if world.ground_mode == 'CHECKER':
         cell = np.floor(p[:, 0] / scale) + np.floor(p[:, 1] / scale)
@@ -1046,35 +1174,51 @@ def ground_plane(world, dirs, sky_col, eye, time=0.0, textures=None):
                           np.zeros(p.shape[0], np.float32)], 1), octaves=5)
         alt = np.asarray(world.ground_color2, np.float32)[None, :]
         col = col + (alt - col) * f[:, None]
-    elif world.ground_mode == 'GRID':
-        # the neon wireframe floor of every synthwave sleeve: thin bright
-        # lines on the base colour, glowing wider with distance so the
-        # grid survives minification instead of aliasing away
-        gx = np.abs((p[:, 0] / scale) - np.round(p[:, 0] / scale))
-        gy = np.abs((p[:, 1] / scale) - np.round(p[:, 1] / scale))
-        px_w = np.clip(dist * np.float32(
-            getattr(world, '_pixel_angle', 0.001) or 0.001) / scale,
-            0.008, 0.25)
-        line = np.maximum(1.0 - gx / px_w, 0.0) + \
-            np.maximum(1.0 - gy / px_w, 0.0)
-        line = np.clip(line, 0.0, 1.0)
-        alt = np.asarray(world.ground_color2, np.float32)[None, :]
-        col = col + (alt * 1.6 - col) * line[:, None]
-    elif world.ground_mode == 'TILES':
+    elif world.ground_mode in ('TILES', 'GRID'):
         # bathhouse tiles: square cells, grout lines, a hashed per-tile
-        # shade so the floor is not one flat repeat
+        # shade. R203: the grout WIDTH and the per-tile shade variance
+        # are real dials now (the field could not edit either), the
+        # grout can GLOW past 1 (which is the synthwave floor -- the
+        # separate Neon Grid mode retired into exactly this: thin
+        # bright grout), and old exports still saying GRID render as
+        # that thin-glow tiling rather than falling to a flat sheet
         from .patterns import hash3
+        legacy_grid = world.ground_mode == 'GRID'
+        gw = 0.012 if legacy_grid else float(
+            getattr(world, 'ground_grout', 0.04) or 0.0)
+        gw = min(max(gw, 0.0), 0.45)
+        vari = 0.0 if legacy_grid else min(max(float(
+            getattr(world, 'ground_tile_shade', 0.25) or 0.0), 0.0), 1.0)
+        gglow = 1.6 if legacy_grid else max(float(
+            getattr(world, 'ground_grout_glow', 1.0) or 0.0), 0.0)
         cx = np.floor(p[:, 0] / scale)
         cy = np.floor(p[:, 1] / scale)
         fx = p[:, 0] / scale - cx
         fy = p[:, 1] / scale - cy
-        grout = (np.minimum(np.minimum(fx, 1.0 - fx),
-                            np.minimum(fy, 1.0 - fy)) < 0.04)
+        edge = np.minimum(np.minimum(fx, 1.0 - fx),
+                          np.minimum(fy, 1.0 - fy))
+        grout = edge < gw
         shade = hash3(cx.astype(np.int64), cy.astype(np.int64),
-                      np.int64(7)) * 0.25 + 0.75
-        alt = np.asarray(world.ground_color2, np.float32)[None, :]
+                      np.int64(7)) * vari + (1.0 - vari)
+        alt = np.asarray(world.ground_color2, np.float32)[None, :] \
+            * np.float32(gglow)
         col = col * shade[:, None]
         col = np.where(grout[:, None], alt, col)
+        if gglow > 1.0:
+            # the grout's glow past 1 is SELF-lit: under scene lighting
+            # the neon floor keeps burning inside cast shadows, exactly
+            # as a neon floor should. The first 1.0 of it stays diffuse
+            # (a lit tile floor with bright paint), the excess rides as
+            # emission outside the lighting blend.
+            base2 = np.asarray(world.ground_color2, np.float32)[None, :]
+            tiles_lit = np.broadcast_to(
+                np.asarray(world.ground_color, np.float32)[None, :],
+                col.shape) * shade[:, None]
+            g_diff = np.where(grout[:, None],
+                              np.broadcast_to(base2, col.shape), tiles_lit)
+            g_emit = np.where(grout[:, None],
+                              base2 * np.float32(gglow - 1.0),
+                              np.float32(0.0))
     elif world.ground_mode == 'DESERT':
         # wind-ribbed dunes: long sine ridges displaced by low noise,
         # shaded by their own slope against the sun direction
@@ -1087,10 +1231,16 @@ def ground_plane(world, dirs, sky_col, eye, time=0.0, textures=None):
         ridge = np.sin((v + warp * 2.5) * np.float32(np.pi) * 2.0)
         rib = np.abs(ridge) ** 0.7
         alt = np.asarray(world.ground_color2, np.float32)[None, :]
-        col = col + (alt - col) * (rib * 0.6 + warp * 0.25)[:, None]
+        # R204: the crest strength is a dial (0.6 was baked in)
+        rs_ = min(max(float(getattr(world, 'ground_ridge', 0.6)
+                            or 0.0), 0.0), 1.0)
+        col = col + (alt - col) * (rib * rs_ + warp * 0.25)[:, None]
     elif world.ground_mode == 'SNOW':
         # a bright field with sparse sun glints and faint blue shadowing
-        # in the hollows
+        # in the hollows. R204 field find: the glints were a hardcoded
+        # white -- a colour you could SEE but not change. They wear
+        # ground_color3 now, with a Sparkle amount dial; the defaults
+        # (white, 1.0) are the old field bit for bit
         from .patterns import fbm, hash3
         f = fbm(np.stack([p[:, 0] / scale, p[:, 1] / scale,
                           np.zeros(p.shape[0], np.float32)], 1), octaves=4)
@@ -1099,21 +1249,139 @@ def ground_plane(world, dirs, sky_col, eye, time=0.0, textures=None):
         col = base + (hollow - base) * (f * 0.5)[:, None]
         g = hash3((p[:, 0] * 37.0).astype(np.int64),
                   (p[:, 1] * 37.0).astype(np.int64), np.int64(3))
+        spark = max(float(getattr(world, 'ground_sparkle', 1.0)
+                          or 0.0), 0.0)
         glint = (g > 0.995).astype(np.float32) * \
             np.clip(2.0 - dist * 0.02, 0.0, 1.0)
-        col = col + glint[:, None] * 0.8
+        gcol = np.asarray(tuple(getattr(world, 'ground_color3',
+                                        (1.0, 1.0, 1.0)))[:3],
+                          np.float32)[None, :]
+        col = col + glint[:, None] * (0.8 * spark) * gcol
     elif world.ground_mode == 'LAVA':
-        # crusted rock over glowing cracks: inverted-crackle veins carry
-        # the second colour as EMISSIVE heat, pulsing faintly over time
-        from .patterns import turbulence
+        # R203 rebuild (field: "just looks bad and can't be edited").
+        # A real lava field now: plates of darkened crust separated by
+        # ridged fissures, heat BLEEDING outward from every crack (the
+        # old hard threshold drew hairlines on a flat sheet), embers
+        # freckling the hot zones, and three dials -- Crack Width,
+        # Glow, Pulse -- where there were none.
+        from .patterns import fbm, ridged, turbulence
+        cw = min(max(float(getattr(world, 'ground_crack_width', 0.35)
+                           or 0.35), 0.02), 2.0)
+        gs = max(float(getattr(world, 'ground_glow', 1.0) or 0.0), 0.0)
+        pu = min(max(float(getattr(world, 'ground_pulse', 0.15)
+                           or 0.0), 0.0), 1.0)
         u = np.stack([p[:, 0] / scale, p[:, 1] / scale,
                       np.zeros(p.shape[0], np.float32)], 1)
-        v = turbulence(u, octaves=5)
-        crack = np.clip((v - 0.62) * 6.0, 0.0, 1.0)
-        pulse = 0.85 + 0.15 * np.float32(np.sin(float(time) * 1.7))
+        rid = ridged(u * 0.9, octaves=5)
+        # fissure field: the ridge crests, widened by the dial; the
+        # heat term falls off SMOOTHLY away from each crack
+        fis = np.clip((rid - (0.72 - cw * 0.25)) / max(cw * 0.22, 1e-3),
+                      0.0, 1.0)
+        heat = fis * fis
+        bleed = np.clip((rid - (0.72 - cw * 0.6)) / max(cw * 0.6, 1e-3),
+                        0.0, 1.0) ** 2 * 0.45
+        # crust: the base colour broken into plates, darker between
+        crust_v = fbm(u * 1.7 + 31.0, octaves=4)
+        crust = col * (0.55 + 0.6 * crust_v)[:, None]
+        pulse = 1.0 - pu + pu * np.float32(
+            0.5 + 0.5 * np.sin(float(time) * 1.7))
         glow = np.asarray(world.ground_color2, np.float32)[None, :]
-        col = col * (1.0 - crack[:, None]) + \
-            glow * (crack * 2.2 * pulse)[:, None]
+        # R204: the embers wear their own colour (ground_color3 as a
+        # tint on the glow; white = exactly the old picture)
+        etint = np.asarray(tuple(getattr(world, 'ground_color3',
+                                         (1.0, 1.0, 1.0)))[:3],
+                           np.float32)[None, :]
+        emb = fbm(u * 6.3 + 77.7, octaves=3)
+        ember = np.clip((emb - 0.78) * 8.0, 0.0, 1.0) * heat
+        core_hot = np.clip(heat * 2.4 + bleed, 0.0, 3.2) * gs * pulse
+        emb_hot = np.clip(ember * 1.5, 0.0, 3.2) * gs * pulse
+        # R204: the molten glow is EMISSION -- scene lighting shades the
+        # crust plates but a shadow across lava never dims the heat
+        lava_d = crust * (1.0 - np.clip(heat + bleed, 0.0, 1.0))[:, None]
+        lava_e1 = glow * core_hot[:, None]
+        lava_e2 = glow * etint * emb_hot[:, None]
+        col = lava_d + lava_e1 + lava_e2
+        g_diff, g_emit = lava_d, lava_e1 + lava_e2
+    elif world.ground_mode == 'MATERIAL':
+        # R203: the ground wears a MATERIAL -- the picked material's
+        # node graph, evaluated at the plane's own points (P on the
+        # plane, N straight up, the view ray as incidence, UVs tiled
+        # by Scale). Whatever the graph says the surface looks like,
+        # the plane looks like, to the horizon.
+        g = getattr(world, 'ground_graph', None)
+        if g:
+            from .nodeeval import (Closure, GraphEvaluator,
+                                   ShadeContext, to_color, to_value)
+            n_pts = p.shape[0]
+            ctx = ShadeContext(n_pts)
+            ctx.P = p.astype(np.float32)
+            up_n = np.zeros((n_pts, 3), np.float32)
+            up_n[:, 2] = 1.0
+            ctx.N = up_n
+            ctx.Ng = up_n.copy()
+            ctx.I = dirs[hit].astype(np.float32)
+            ctx.uv = (p[:, :2] / scale).astype(np.float32)
+            ctx.generated = (ctx.P / scale).astype(np.float32)
+            ctx.time = float(time)
+            try:
+                ev = GraphEvaluator(
+                    g, ctx, textures or {},
+                    getattr(world, 'ground_programs', None) or {})
+                cl, _op = ev.evaluate_surface()
+                if isinstance(cl, Closure) and cl.items:
+                    acc = np.zeros((n_pts, 3), np.float32)
+                    eacc = None
+                    for kind, wgt, pr in cl.items:
+                        c3 = to_color(pr.get('color'), n_pts)[:, :3]
+                        st = pr.get('strength')
+                        s = (to_value(st, n_pts)[:, None]
+                             if st is not None else 1.0)
+                        wv = np.asarray(wgt, np.float32).reshape(-1)
+                        if wv.shape[0] != n_pts:
+                            wv = np.broadcast_to(wv, (n_pts,))
+                        term = c3 * s * wv[:, None]
+                        # R204: EMISSION closures are self-lit -- the
+                        # scene lighting stage must not shadow them
+                        if str(kind).upper() == 'EMISSION':
+                            eacc = term if eacc is None else eacc + term
+                        else:
+                            acc += term
+                    col = acc if eacc is None else acc + eacc
+                    g_diff, g_emit = acc, eacc
+            except Exception:                                   # noqa: BLE001
+                pass
+
+    # ------------------------------------------------- R204: scene lighting
+    # "The infinite floors don't react to lighting either." Now they do.
+    # The renderer hands the plane a callback (world._ground_light) that
+    # returns per-point irradiance: the ambient pool plus every lamp's
+    # contribution against the plane's straight-up normal -- Lambert for
+    # sun/point/spot, the wrap term for hemis, the Stokes form factor for
+    # area lamps -- with cast shadows from scene geometry (ray-traced or
+    # shadow-mapped, whichever the lamp uses). Scene Lighting blends from
+    # the old self-lit flat look (0, those pixels bit for bit -- this
+    # whole stage is skipped) to fully lit (1). Self-luminous parts (lava
+    # heat, neon grout past 1, EMISSION closures) ride outside the blend:
+    # a shadow across them never dims the glow. OCEAN keeps its own
+    # sun-and-sky model and never enters. When the scene has no lamps at
+    # all the renderer hands no callback: nothing to react to, and the
+    # picture stays exactly what it always was.
+    if world.ground_mode != 'OCEAN':
+        lit = min(max(float(getattr(world, 'ground_lighting', 1.0)
+                            or 0.0), 0.0), 1.0)
+        light_fn = getattr(world, '_ground_light', None)
+        if lit > 0.0 and light_fn is not None:
+            try:
+                irr = light_fn(p)
+            except Exception:                                   # noqa: BLE001
+                irr = None
+            if irr is not None:
+                d_part = col if g_diff is None else g_diff
+                col = d_part * (np.float32(1.0 - lit) +
+                                np.float32(lit) *
+                                np.asarray(irr, np.float32))
+                if g_emit is not None:
+                    col = col + g_emit
 
     if world.ground_mode == 'OCEAN':
         # How much water one pixel covers. The footprint is not square: a ray
@@ -1207,3 +1475,200 @@ def evaluate(world, dirs, textures=None, strength=True, eye=None,
         col = ground_plane(world, dirs, col.astype(np.float32), eye, time,
                            textures)
     return col.astype(np.float32)
+
+
+# ---------------------------------------------------------------- weather
+
+
+def _wthr01(idx, salt):
+    """Deterministic per-particle random in [0,1): the Wang mix the
+    halos and caustics use, so a drop's path is a pure function of
+    (seed, layer, particle) -- identical across runs and devices."""
+    from .patterns import _wang01p
+    u = (np.asarray(idx, np.int64) & 0xFFFFFFFF).astype(np.uint32)
+    return _wang01p(u ^ np.uint32(salt))
+
+
+#: the styles: how each kind splats and composites. RAIN and EMBERS
+#: are light (additive, the era's sprite weather); SNOW and ASH are
+#: matter (alpha-over). Acid rain is RAIN wearing a green colour.
+WEATHER_KINDS = ('NONE', 'RAIN', 'SNOW', 'EMBERS', 'ASH')
+
+
+def weather_overlay(img, world, w, h, time=0.0, out_wh=None,
+                    sel_mask=None):
+    """R200: the Weather overlay -- rain, snow, embers, ash.
+
+    A screen-space particle field composited IN FRONT of the finished
+    frame (geometry, halos and sky alike -- weather never replaces the
+    sky, it falls in front of it). Every particle's position is a pure
+    function of (weather_seed, layer, index, time): the same frame
+    renders identically across runs, devices, refine passes and
+    supersample factors, and scrubbing the timeline is stable because
+    nothing integrates -- position is evaluated, not stepped.
+
+    Layers give parallax: layer 0 is nearest (largest, fastest,
+    brightest), each deeper layer smaller, slower and dimmer by the
+    same factor. Angle 0 falls straight DOWN the screen, pi rises
+    (embers), anything between is the diagonal; Drift wobbles each
+    particle across its travel line on its own hashed phase. Speed,
+    sizes, streak lengths and drift amplitudes are resolution-true
+    (scaled by frame height against the 480-line reference), so the
+    same scene keeps the same look at any resolution and under any
+    supersample.
+
+    `out_wh` is the OUTPUT frame size (before supersampling): the
+    particle count is derived from it, never from the internal buffer,
+    so a supersampled render draws the same drops in the same places,
+    only sharper. `sel_mask` (a refine pass) composites only the
+    flagged pixels -- values there are identical to a full pass,
+    per-pixel independence as everywhere else in the engine.
+
+    Returns img (modified in place where weather lands). NONE, zero
+    density and zero opacity all return the buffer untouched --
+    bitwise-neutral, and every existing scene has exactly that.
+    """
+    kind = str(getattr(world, 'weather', 'NONE') or 'NONE').upper()
+    if kind == 'NONE' or kind not in WEATHER_KINDS:
+        return img
+    dens = float(getattr(world, 'weather_density', 1.0) or 0.0)
+    op = float(np.clip(getattr(world, 'weather_opacity', 0.8), 0.0, 1.0))
+    if dens <= 0.0 or op <= 0.0:
+        return img
+    size = max(float(getattr(world, 'weather_size', 1.0) or 1.0), 0.05)
+    speed = max(float(getattr(world, 'weather_speed', 1.0) or 0.0), 0.0)
+    ang = float(getattr(world, 'weather_angle', 0.0) or 0.0)
+    drift = max(float(getattr(world, 'weather_drift', 0.2) or 0.0), 0.0)
+    col = np.asarray(tuple(getattr(world, 'weather_color',
+                                   (0.85, 0.90, 1.0)))[:3], np.float32)
+    layers = int(np.clip(int(getattr(world, 'weather_layers', 3) or 1),
+                         1, 4))
+    streak = max(float(getattr(world, 'weather_streak', 1.0) or 0.0), 0.0)
+    glow = float(np.clip(getattr(world, 'weather_glow', 0.0), 0.0, 1.0))
+    flick = float(np.clip(getattr(world, 'weather_flicker', 0.0),
+                          0.0, 1.0))
+    seed = int(getattr(world, 'weather_seed', 0) or 0)
+    t = float(time)
+    ow, oh = out_wh if out_wh is not None else (w, h)
+    # resolution-true units against the era's 480-line reference, the
+    # same convention the halo line widths settled on (R197)
+    rs = max(float(h) / 480.0, 0.25)
+    # count follows the OUTPUT area, capped for the perf ultimatum --
+    # a fuller sky comes from Density, not from megapixels
+    n0 = int(round(dens * 150.0 * (float(ow) * float(oh))
+                   / (640.0 * 480.0)))
+    n0 = int(np.clip(n0, 1, 4000))
+    dx_s, dy_s = float(np.sin(ang)), float(np.cos(ang))   # screen dirs
+    field = _WthrField(h, w)
+    for L in range(layers):
+        fk = 1.0 / (1.0 + 0.65 * L)
+        n = max(int(round(n0 * (0.7 + 0.3 * fk))), 1)
+        idx = np.arange(n, dtype=np.int64) * 4 + L * 1048573 \
+            + seed * 8191
+        bx = _wthr01(idx, 0x2545F491)          # base x fraction
+        by = _wthr01(idx + 1, 0x9E3779B9)      # base y fraction
+        ph = _wthr01(idx + 2, 0x85EBCA6B)      # drift phase
+        ph2 = _wthr01(idx + 3, 0xA511E9B3)     # flicker phase
+        spd_px = speed * 340.0 * rs * fk
+        # rows run bottom-first, so "down the screen" is -y in rows
+        x = bx * w + dx_s * spd_px * t
+        y = by * h - dy_s * spd_px * t
+        if drift > 0.0:
+            wob = np.sin(2.0 * np.pi * (t * 0.35 + ph)) \
+                * drift * 34.0 * rs * fk
+            x = x + wob * dy_s
+            y = y + wob * dx_s
+        x = np.mod(x, float(w))
+        y = np.mod(y, float(h))
+        bri = np.full(n, op * (0.45 + 0.55 * fk), np.float32)
+        if flick > 0.0:
+            tw = 0.5 + 0.5 * np.sin(2.0 * np.pi * (t * 3.1 + ph2))
+            bri = bri * (1.0 - flick * tw).astype(np.float32)
+        r_core = max(size * (2.6 if kind in ('SNOW', 'ASH') else 1.1)
+                     * rs * fk, 0.55)
+        if kind == 'RAIN' and streak > 0.0:
+            # the streak: samples back along the travel line, the
+            # tail fading -- the classic sprite rain stroke, drawn
+            # thin (a 3x3 window per sample keeps a storm cheap).
+            # A bigger drop trails a longer stroke: Size scales the
+            # length too (x1.0 at the default -- neutral), which is
+            # also what keeps the dial honest when the radius floor
+            # engages at preview resolutions
+            slen = streak * 15.0 * rs * fk * (0.6 + 0.4 * size)
+            ns = max(int(min(6.0 + streak * 6.0, 22.0)), 2)
+            jf = np.arange(ns, dtype=np.float32) / float(ns - 1)
+            sx = x[:, None] - dx_s * slen * jf[None, :]
+            sy = y[:, None] + dy_s * slen * jf[None, :]
+            sw = (bri[:, None] * (1.0 - 0.75 * jf[None, :])
+                  / (0.45 * ns)).astype(np.float32)
+            _wthr_splat(field, sx.ravel(), sy.ravel(), sw.ravel(),
+                        max(r_core * 0.35, 0.55))
+        else:
+            _wthr_splat(field, x, y, bri, r_core)
+        if glow > 0.0:
+            _wthr_splat(field, x, y, bri * 0.22 * glow, r_core * 3.0)
+    ca = np.clip(field.resolve(), 0.0, 1.0)
+    if sel_mask is not None:
+        ca = ca * np.asarray(sel_mask, np.float32)
+    live = ca > 0.0
+    if not live.any():
+        return img
+    # composite only where weather actually landed -- rain covers a
+    # few percent of the frame, and dense whole-frame arithmetic here
+    # was most of the overlay's cost
+    cav = ca[live][:, None]
+    rgb = img[:, :, :3]
+    a = img[:, :, 3]
+    if kind in ('RAIN', 'EMBERS'):
+        rgb[live] += cav * col[None, :]
+    else:
+        rgb[live] = rgb[live] * (1.0 - cav) + cav * col[None, :]
+    a[live] += ca[live] * (1.0 - a[live])
+    return img
+
+
+class _WthrField:
+    """Deferred splat accumulator: every layer's (index, weight) pairs
+    pool up and ONE bincount resolves them -- the scatter is the
+    overlay's hot path and bincount amortises beautifully."""
+
+    def __init__(self, h, w):
+        self.h, self.w = h, w
+        self.idx = []
+        self.wgt = []
+
+    def resolve(self):
+        if not self.idx:
+            return np.zeros((self.h, self.w), np.float32)
+        flat = np.concatenate(self.idx)
+        wts = np.concatenate(self.wgt)
+        return np.bincount(flat, weights=wts,
+                           minlength=self.h * self.w) \
+            .reshape(self.h, self.w).astype(np.float32)
+
+
+def _wthr_splat(field, x, y, wgt, radius):
+    """Queue quadratic-bump splats, vectorised over (particle, kernel
+    offset). Radius is in pixels; the kernel window is capped at 8 px
+    (a 17x17 tap ceiling per splat) so a 4K frame full of snow stays
+    inside the performance envelope -- the one disclosed bound on the
+    resolution-true scaling. No sqrt on the hot path."""
+    h, w = field.h, field.w
+    r = float(min(max(radius, 0.4), 8.0))
+    R = max(int(np.ceil(r)), 1)
+    offs = np.arange(-R, R + 1, dtype=np.float32)
+    oy, ox = np.meshgrid(offs, offs, indexing='ij')
+    ox = ox.ravel()[None, :]
+    oy = oy.ravel()[None, :]
+    xi = np.floor(x).astype(np.int32)[:, None] + ox.astype(np.int32)
+    yi = np.floor(y).astype(np.int32)[:, None] + oy.astype(np.int32)
+    fx = (np.asarray(x, np.float32)[:, None] - np.float32(0.5)) - xi
+    fy = (np.asarray(y, np.float32)[:, None] - np.float32(0.5)) - yi
+    d2 = (fx * fx + fy * fy) * np.float32(1.0 / (r * r))
+    kw = np.maximum(np.float32(1.0) - d2, np.float32(0.0))
+    kw = kw * kw * np.asarray(wgt, np.float32)[:, None]
+    ok = (xi >= 0) & (xi < w) & (yi >= 0) & (yi < h) & (kw > 0.0)
+    if not ok.any():
+        return
+    field.idx.append(yi[ok].astype(np.int64) * w + xi[ok])
+    field.wgt.append(kw[ok].astype(np.float64))

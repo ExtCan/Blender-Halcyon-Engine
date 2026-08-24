@@ -254,6 +254,40 @@ def safe_pow(x, e):
     return np.power(np.maximum(x, 0.0), e)
 
 
+def rigid_camera_matrix(mw):
+    """A camera matrix with any object scale stripped from its basis.
+
+    R205 field find: a .3DS pagoda scene rendered as nothing but fog
+    colour while the viewport looked right. The camera sat under the
+    import's $$$DUMMY hierarchy, whose parents carry unit scale -- so
+    `matrix_world`'s basis vectors were not unit length, and inverting
+    it put that scale into every camera-space depth. The PICTURE
+    composes identically (the projection divides the scale back out),
+    but every METRIC consumer -- fog distance, clip planes, z
+    precision, depth of field -- read distances multiplied by 1/S.
+    Blender's own renderers ignore camera object scale entirely, and
+    its camera-view viewport matrix is rigid, which is exactly why the
+    viewport disagreed with F12.
+
+    Basis columns are divided by their own lengths (translation kept,
+    handedness kept -- a negatively-scaled camera stays mirrored, as
+    Blender draws it). A matrix that is ALREADY rigid passes through
+    IDENTICALLY -- not renormalised within an ulp, untouched -- so
+    every existing scene renders bit for bit.
+    """
+    m = np.asarray(mw, np.float32)
+    if m.shape != (4, 4):
+        return m
+    lens = np.sqrt((m[:3, :3] * m[:3, :3]).sum(axis=0))
+    if not np.all(np.isfinite(lens)) or np.any(lens < 1e-9):
+        return m
+    if float(np.abs(lens - 1.0).max()) < 1e-4:
+        return m                       # rigid already: bitwise untouched
+    out = m.copy()
+    out[:3, :3] = m[:3, :3] / lens[None, :]
+    return out
+
+
 def look_at(eye, target, up=(0, 0, 1)):
     """Build a Blender-style camera matrix_world (camera looks down -Z)."""
     eye = np.asarray(eye, np.float32)

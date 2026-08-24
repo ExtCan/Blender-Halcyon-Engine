@@ -195,6 +195,50 @@ def _models_using(socket_name, relevant=None, all_models=None):
     return f"affects {pretty}"
 
 
+class HALCYON_BlendValueSocket(NodeSocket):
+    """R202: a float amount whose blend-mode menu rides DIRECTLY under
+    it -- the Fresnel/Rim/Matcap menus used to sit at the top of the
+    node, a screen away from the sliders they belong to. The socket
+    exports as a plain VALUE (the kind map's fallback), so the render
+    roads never see the difference."""
+
+    bl_idname = 'HALCYON_BlendValueSocket'
+    bl_label = "Amount + Blend"
+
+    default_value: FloatProperty(
+        name="Amount", default=0.0, min=0.0, soft_max=1.0,
+        description="The effect's strength; its blend menu sits "
+                    "directly below while the effect is live")
+    blend_prop: StringProperty(
+        default='',
+        description="Name of the node enum drawn under the amount")
+
+    def draw(self, context, layout, node, text):
+        col = layout.column(align=True)
+        if self.is_output or self.is_linked:
+            col.label(text=text)
+        else:
+            col.prop(self, 'default_value', text=text)
+        bp = str(getattr(self, 'blend_prop', '') or '')
+        if bp and hasattr(node, bp):
+            try:
+                live = node._effect_active(self.name)
+            except (AttributeError, TypeError):
+                live = True
+            if live:
+                col.prop(node, bp, text="")
+
+    def draw_color(self, context, node):
+        # the float socket's grey, because that is what this is
+        return (0.63, 0.63, 0.63, 1.0)
+
+
+#: which node enum each blend-carrying amount socket draws
+_BLEND_SOCKET_PROPS = {'Fresnel': 'fresnel_blend',
+                       'Rim Amount': 'rim_blend',
+                       'Matcap Blend': 'matcap_mode'}
+
+
 class HALCYON_ShaderNode(Node, HalcyonNodeBase):
     """A 1990s reflectance model with its own controls"""
 
@@ -209,6 +253,31 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
     model: EnumProperty(name="Model", items=[(a, b, c) for a, b, c in MODEL_ITEMS],
                         default='PHONG', update=_update)
     toon_steps: IntProperty(name="Toon Steps", default=2, min=1, max=16)
+
+    # how each silhouette cheat lands on the lit result. The defaults are
+    # the behaviour every scene already has: fresnel and rim ADD, matcap
+    # MIXES -- so old files render identically
+    _LAYER_BLENDS = (
+        ('ADD', "Add", "Added on top of the lit result"),
+        ('MIX', "Mix", "Blends the result toward the effect colour"),
+        ('MULTIPLY', "Multiply", "Darkens the result by the effect"),
+        ('SCREEN', "Screen", "Brightens like projected light, never clips"),
+    )
+    _MATCAP_BLENDS = (
+        ('MIX', "Mix", "Blends the result toward the matcap"),
+        ('ADD', "Add", "Added on top of the lit result"),
+        ('MULTIPLY', "Multiply", "Darkens the result by the matcap"),
+        ('SCREEN', "Screen", "Brightens like projected light, never clips"),
+    )
+    fresnel_blend: EnumProperty(
+        name="Fresnel Blend", items=_LAYER_BLENDS, default='ADD',
+        description="How the Fresnel layer combines with the shaded surface")
+    rim_blend: EnumProperty(
+        name="Rim Blend", items=_LAYER_BLENDS, default='ADD',
+        description="How the rim light combines with the shaded surface")
+    matcap_mode: EnumProperty(
+        name="Matcap Blend", items=_MATCAP_BLENDS, default='MIX',
+        description="How the matcap combines with the shaded surface")
     wire_size: FloatProperty(
         name="Wire Size", default=1.0, min=0.05, max=16.0,
         description="Width of the drawn edge, in rendered pixels. A material "
@@ -245,6 +314,12 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
         'WIREFRAME': {'Diffuse Color', 'Opacity'},
     }
 
+    # R202: the order is the panel. Reflection's inputs sit together
+    # with Refraction Amount right beside them; Normal leads straight
+    # into the two Bump inputs (the bump IS a normal edit); the three
+    # blend-carrying amounts are HALCYON_BlendValueSocket so their
+    # blend menu draws directly below the slider. `sort_sockets` walks
+    # saved nodes into this order at file load.
     SOCKETS = (
         ('NodeSocketColor', 'Diffuse Color', (0.8, 0.8, 0.8, 1.0)),
         ('NodeSocketFloat', 'Diffuse Level', 1.0),
@@ -261,19 +336,22 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
         ('NodeSocketFloat', 'Opacity', 1.0),
         ('NodeSocketFloat', 'IOR', 1.45),
         ('NodeSocketFloat', 'Reflection', 0.0),
+        ('NodeSocketColor', 'Reflection Color', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketFloat', 'Refraction Amount', 1.0),
         ('NodeSocketFloat', 'Translucency', 0.0),
         ('NodeSocketFloat', 'Toon Size', 0.5),
         ('NodeSocketFloat', 'Toon Smooth', 0.05),
         ('NodeSocketVector', 'Normal', None),
-        ('NodeSocketFloat', 'Fresnel', 0.0),
+        ('NodeSocketFloat', 'Bump Strength', 1.0),
+        ('NodeSocketFloat', 'Bump Height', 0.5),
+        ('HALCYON_BlendValueSocket', 'Fresnel', 0.0),
         ('NodeSocketFloat', 'Fresnel Power', 3.0),
         ('NodeSocketColor', 'Fresnel Color', (1.0, 1.0, 1.0, 1.0)),
         ('NodeSocketColor', 'Rim Light', (1.0, 1.0, 1.0, 1.0)),
-        ('NodeSocketFloat', 'Rim Amount', 0.0),
+        ('HALCYON_BlendValueSocket', 'Rim Amount', 0.0),
         ('NodeSocketFloat', 'Rim Power', 3.0),
         ('NodeSocketColor', 'Matcap', (0.0, 0.0, 0.0, 1.0)),
-        ('NodeSocketFloat', 'Matcap Blend', 0.0),
-        ('NodeSocketColor', 'Reflection Color', (1.0, 1.0, 1.0, 1.0)),
+        ('HALCYON_BlendValueSocket', 'Matcap Blend', 0.0),
         ('NodeSocketFloat', 'Edge Opacity', 1.0),
         ('NodeSocketColor', 'Backface Color', (0.0, 0.0, 0.0, 1.0)),
         ('NodeSocketFloat', 'Backface Mix', 0.0),
@@ -282,9 +360,6 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
         ('NodeSocketFloat', 'Sheen', 0.0),
         ('NodeSocketColor', 'Sheen Color', (1.0, 1.0, 1.0, 1.0)),
         ('NodeSocketFloat', 'Sheen Roughness', 0.3),
-        ('NodeSocketFloat', 'Bump Strength', 1.0),
-        ('NodeSocketFloat', 'Bump Height', 0.5),
-        ('NodeSocketFloat', 'Refraction Amount', 1.0),
     )
 
     def init(self, context):
@@ -297,6 +372,11 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
                     pass
             if name in ('Glossiness',):
                 sock.default_value = 25.0
+            if name in _BLEND_SOCKET_PROPS:
+                try:
+                    sock.blend_prop = _BLEND_SOCKET_PROPS[name]
+                except (AttributeError, TypeError):
+                    pass
             self._document(sock, name)
         self.outputs.new('NodeSocketShader', 'Surface')
         self.outputs[0].description = (
@@ -339,16 +419,71 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
                 sock = self.inputs.new(kind, name)
                 if default is not None:
                     sock.default_value = default
+                if name in _BLEND_SOCKET_PROPS:
+                    sock.blend_prop = _BLEND_SOCKET_PROPS[name]
             except Exception:                                   # noqa: BLE001
                 pass
 
+    def upgrade_blend_sockets(self):
+        """R202, load-time only: swap the three blend-carrying amounts
+        to HALCYON_BlendValueSocket, preserving value and links.
+
+        Per-socket and best-effort: a socket that cannot be swapped is
+        LEFT ALONE and keeps the old top-of-node menu (draw_buttons
+        falls back for exactly that case), so a failure here can never
+        cost anyone a connection."""
+        tree = self.id_data
+        for nm, bp in _BLEND_SOCKET_PROPS.items():
+            s = self.inputs.get(nm)
+            if s is None or \
+                    getattr(s, 'bl_idname', '') == 'HALCYON_BlendValueSocket':
+                continue
+            try:
+                val = float(getattr(s, 'default_value', 0.0))
+                froms = [ln.from_socket for ln in getattr(s, 'links', ())]
+                self.inputs.remove(s)
+                ns = self.inputs.new('HALCYON_BlendValueSocket', nm)
+                ns.default_value = val
+                ns.blend_prop = bp
+                self._document(ns, nm)
+                for f in froms:
+                    tree.links.new(f, ns)
+            except Exception:                                   # noqa: BLE001
+                pass
+
+    def sort_sockets(self):
+        """Walk this saved node's inputs into the SOCKETS order --
+        R202 regrouped Reflection/Refraction and Normal/Bump, and an
+        old file should see the same panel a new one does. Load-time
+        only, like every other topology change."""
+        order = [name for _k, name, _d in self.SOCKETS]
+        for target, name in enumerate(order):
+            if target >= len(self.inputs):
+                break
+            idx = next((i for i, s in enumerate(self.inputs)
+                        if s.name == name), None)
+            if idx is not None and idx != target:
+                try:
+                    self.inputs.move(idx, target)
+                except Exception:                               # noqa: BLE001
+                    pass
+
     def refresh_sockets(self):
         keep = self.RELEVANT.get(self.model)
-        if keep is not None:
-            keep = set(keep) | set(self.ALWAYS)
+        if keep is None:
+            # models the RELEVANT table left open used to show every
+            # socket -- a PHONG node offered Roughness, Toon Size and
+            # Translucency, none of which its model reads. The measured
+            # SOCKET_MODELS table (a test re-derives it by perturbing
+            # each input) already knows exactly which sockets each model
+            # shades with, so the panel now shows those and only those
+            keep = {name for _k, name, _d in self.SOCKETS
+                    if SOCKET_MODELS.get(name) == ALL
+                    or (SOCKET_MODELS.get(name)
+                        and self.model in SOCKET_MODELS[name])}
+        keep = set(keep) | set(self.ALWAYS)
         for sock in self.inputs:
-            sock.hide = bool(keep is not None and sock.name not in keep
-                             and not sock.is_linked)
+            sock.hide = bool(sock.name not in keep and not sock.is_linked)
             self._document(sock, sock.name)
 
     def model_description(self):
@@ -357,12 +492,37 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
                 return desc
         return ""
 
+    def _effect_active(self, name):
+        try:
+            s = self.inputs.get(name)
+            if s is None:
+                return False
+            if s.is_linked:
+                return True
+            v = getattr(s, 'default_value', 0.0)
+            return float(v) > 1e-4
+        except (TypeError, ValueError):
+            return False
+
     def draw_buttons(self, context, layout):
         layout.prop(self, 'model', text="")
         if self.model == 'TOON':
             layout.prop(self, 'toon_steps')
         if self.model == 'WIREFRAME':
             layout.prop(self, 'wire_size')
+        # R202: each blend menu draws directly under its own amount
+        # slider (the HALCYON_BlendValueSocket does it); a socket the
+        # load migration could not swap keeps the old top-of-node menu
+        def _legacy(nm):
+            s = self.inputs.get(nm)
+            return s is not None and \
+                getattr(s, 'bl_idname', '') != 'HALCYON_BlendValueSocket'
+        if self._effect_active('Fresnel') and _legacy('Fresnel'):
+            layout.prop(self, 'fresnel_blend')
+        if self._effect_active('Rim Amount') and _legacy('Rim Amount'):
+            layout.prop(self, 'rim_blend')
+        if self._effect_active('Matcap Blend') and _legacy('Matcap Blend'):
+            layout.prop(self, 'matcap_mode')
         used = sum(1 for _k, n, _d in self.SOCKETS
                    if SOCKET_MODELS.get(n) == ALL
                    or (SOCKET_MODELS.get(n) and self.model in SOCKET_MODELS[n]))
@@ -373,6 +533,10 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
 
     def draw_buttons_ext(self, context, layout):
         layout.prop(self, 'model', text="")
+        col = layout.column(align=True)
+        col.prop(self, 'fresnel_blend')
+        col.prop(self, 'rim_blend')
+        col.prop(self, 'matcap_mode')
         box = layout.box()
         col = box.column(align=True)
         col.scale_y = 0.8
@@ -2055,6 +2219,370 @@ class HALCYON_BIMaterialNode(Node, HalcyonNodeBase):
             box.prop(self, 'sss_error')
 
 
+# ===================================================== normal-map workflow
+
+
+class HALCYON_NormalMapNode(Node, HalcyonNodeBase):
+    """Decode a normal map of any common flavour into a shading normal"""
+
+    bl_idname = 'HALCYON_NormalMapNode'
+    bl_label = "Normal Map+"
+    bl_icon = 'NORMALS_FACE'
+
+    space: EnumProperty(name="Space", default='TANGENT', items=(
+        ('TANGENT', "Tangent Space",
+         "The blue-ish maps baked against the surface -- the usual kind"),
+        ('OBJECT', "Object Space",
+         "Rainbow maps whose colours are directions in the model itself"),
+        ('WORLD', "World Space", "Directions in world axes")))
+    map_type: EnumProperty(name="Type", default='OPENGL', items=(
+        ('OPENGL', "OpenGL (Y+)",
+         "Green points up -- Blender, Maya, and most bakers"),
+        ('DIRECTX', "DirectX (Y-)",
+         "Green points down -- 3ds Max, Unreal, many game rips. If your "
+         "bumps look inverted, the map is the other type")))
+
+    def init(self, context):
+        c = self.inputs.new('NodeSocketColor', 'Color')
+        c.default_value = (0.5, 0.5, 1.0, 1.0)
+        s = self.inputs.new('NodeSocketFloat', 'Strength')
+        s.default_value = 1.0
+        self.outputs.new('NodeSocketVector', 'Normal')
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'space', text="")
+        layout.prop(self, 'map_type', text="")
+
+
+class HALCYON_NormalMixNode(Node, HalcyonNodeBase):
+    """Combine two normals -- the Mix node's job, for normal chains"""
+
+    bl_idname = 'HALCYON_NormalMixNode'
+    bl_label = "Normal Mix"
+    bl_icon = 'ORIENTATION_NORMAL'
+
+    mode: EnumProperty(name="Mode", default='DETAIL', items=(
+        ('DETAIL', "Detail",
+         "Reorient the second normal onto the first -- base map plus "
+         "detail map, the way engines layer them"),
+        ('ADD', "Add",
+         "Sum the two tilts away from the surface. Cheaper, cruder, and "
+         "what most 1990s tools did when they did anything"),
+        ('MIX', "Mix", "Fade between the two normals by the factor")))
+
+    def init(self, context):
+        self.inputs.new('NodeSocketVector', 'Base')
+        self.inputs.new('NodeSocketVector', 'Detail')
+        f = self.inputs.new('NodeSocketFloat', 'Factor')
+        f.default_value = 1.0
+        self.outputs.new('NodeSocketVector', 'Normal')
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'mode', text="")
+
+
+# ========================================================== utility nodes
+
+
+class HALCYON_AltitudeSlopeNode(Node, HalcyonNodeBase):
+    """World height, steepness and facing -- Bryce's terrain-material trio"""
+
+    bl_idname = 'HALCYON_AltitudeSlopeNode'
+    bl_label = "Altitude & Slope"
+    bl_icon = 'RNDCURVE'
+
+    #: R202: the optional noise -- spatial value noise wobbling the
+    #: three masks, so altitude bands get the ragged natural edge a
+    #: hard height line never has. 0 is exactly the old node.
+    SOCKETS = (('NodeSocketFloat', 'Minimum', 0.0),
+               ('NodeSocketFloat', 'Maximum', 10.0),
+               ('NodeSocketFloat', 'Noise', 0.0),
+               ('NodeSocketFloat', 'Noise Scale', 4.0))
+
+    def init(self, context):
+        for kind, name, default in self.SOCKETS:
+            s = self.inputs.new(kind, name)
+            s.default_value = default
+        try:
+            self.inputs['Noise'].description = (
+                "Wobbles Altitude, Factor and Slope with spatial value "
+                "noise -- ragged snowlines and rock bands instead of "
+                "hard height contours; 0 is off")
+            self.inputs['Noise Scale'].description = (
+                "World-units-per-cell frequency of the band noise; "
+                "higher is finer raggedness")
+        except (AttributeError, TypeError):
+            pass
+        self.outputs.new('NodeSocketFloat', 'Altitude')
+        self.outputs.new('NodeSocketFloat', 'Factor')
+        self.outputs.new('NodeSocketFloat', 'Slope')
+        self.outputs.new('NodeSocketFloat', 'Orientation')
+
+    def ensure_sockets(self):
+        """Old saved nodes gain the R202 noise inputs at file load."""
+        have = {s.name for s in self.inputs}
+        for kind, name, default in self.SOCKETS:
+            if name in have:
+                continue
+            try:
+                s = self.inputs.new(kind, name)
+                s.default_value = default
+            except Exception:                                   # noqa: BLE001
+                pass
+
+
+class HALCYON_FacingNode(Node, HalcyonNodeBase):
+    """View-angle masks: facing ratio, incidence and a Fresnel curve"""
+
+    bl_idname = 'HALCYON_FacingNode'
+    bl_label = "Facing"
+    bl_icon = 'MATSPHERE'
+
+    def init(self, context):
+        p = self.inputs.new('NodeSocketFloat', 'Power')
+        p.default_value = 1.0
+        i = self.inputs.new('NodeSocketFloat', 'IOR')
+        i.default_value = 1.45
+        self.outputs.new('NodeSocketFloat', 'Facing')
+        self.outputs.new('NodeSocketFloat', 'Incidence')
+        self.outputs.new('NodeSocketFloat', 'Fresnel')
+
+
+class HALCYON_IridescentNode(Node, HalcyonNodeBase):
+    """R202: view-angle iridescence -- the colour that will not sit
+    still. Four types: a pure rainbow sweep, physical-ish thin-film
+    interference (the soap bubble), pearl nacre, and an oil slick
+    whose film thickness swirls with surface noise. Deterministic on
+    both devices; plug Color into a diffuse or specular input and
+    Factor wherever the rim mask helps."""
+
+    bl_idname = 'HALCYON_IridescentNode'
+    bl_label = "Iridescent"
+    bl_icon = 'NODE_MATERIAL'
+
+    mode: EnumProperty(
+        name="Type", default='SPECTRUM',
+        description="Which iridescence this node makes; each entry "
+                    "names its optical character",
+        items=[
+            ('SPECTRUM', "Rainbow Sweep",
+             "The pure hue wheel swept across the facing angle -- the "
+             "90s logo chrome"),
+            ('THIN_FILM', "Thin Film",
+             "Soap-bubble interference: per-channel cosines at real "
+             "wavelength ratios, so the fringes order themselves the "
+             "way a real film's do"),
+            ('PEARL', "Pearl",
+             "Nacre: white face rolling to the Tint at the rim, with "
+             "a soft spectral kiss riding the turn"),
+            ('OIL', "Oil Slick",
+             "Thin film whose thickness swirls with surface noise -- "
+             "the parking-lot rainbow"),
+        ])
+
+    SOCKETS = (('NodeSocketFloat', 'Shift', 0.0),
+               ('NodeSocketFloat', 'Scale', 1.0),
+               ('NodeSocketFloat', 'Saturation', 1.0),
+               ('NodeSocketColor', 'Tint', (0.72, 0.48, 0.85, 1.0)),
+               ('NodeSocketFloat', 'Noise Scale', 6.0))
+
+    _DOCS = {
+        'Shift': "Slides the whole colour cycle around; keyframe it "
+                 "and the rainbow crawls across the surface",
+        'Scale': "How many colour cycles fit across the facing angle "
+                 "(the film's thickness, for the physical types)",
+        'Saturation': "1 is the full colour; toward 0 the fringes "
+                      "fade into the surface neutrally",
+        'Tint': "The Pearl type's rim colour; the face stays white",
+        'Noise Scale': "The Oil Slick's swirl frequency in world "
+                       "units; higher is a tighter marbling",
+    }
+
+    def init(self, context):
+        for kind, name, default in self.SOCKETS:
+            s = self.inputs.new(kind, name)
+            if default is not None:
+                try:
+                    s.default_value = default
+                except (TypeError, ValueError):
+                    pass
+            try:
+                s.description = self._DOCS.get(name, '')
+            except (AttributeError, TypeError):
+                pass
+        self.outputs.new('NodeSocketColor', 'Color')
+        self.outputs.new('NodeSocketFloat', 'Factor')
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'mode', text="")
+
+
+class HALCYON_SwitchNode(Node, HalcyonNodeBase):
+    """Hard A/B selector -- anything above one half picks B"""
+
+    bl_idname = 'HALCYON_SwitchNode'
+    bl_label = "Switch"
+    bl_icon = 'ARROW_LEFTRIGHT'
+
+    def init(self, context):
+        s = self.inputs.new('NodeSocketFloat', 'Switch')
+        s.default_value = 0.0
+        a = self.inputs.new('NodeSocketColor', 'A')
+        a.default_value = (0.0, 0.0, 0.0, 1.0)
+        b = self.inputs.new('NodeSocketColor', 'B')
+        b.default_value = (1.0, 1.0, 1.0, 1.0)
+        self.outputs.new('NodeSocketColor', 'Color')
+
+
+class HALCYON_RandomPerObjectNode(Node, HalcyonNodeBase):
+    """A stable random value and colour per object, for cheap variation"""
+
+    bl_idname = 'HALCYON_RandomPerObjectNode'
+    bl_label = "Random Per Object"
+    bl_icon = 'FORCE_TURBULENCE'
+
+    def init(self, context):
+        s = self.inputs.new('NodeSocketFloat', 'Seed')
+        s.default_value = 0.0
+        self.outputs.new('NodeSocketFloat', 'Value')
+        self.outputs.new('NodeSocketColor', 'Color')
+
+
+class HALCYON_LevelsNode(Node, HalcyonNodeBase):
+    """Black point, white point, gamma -- the Levels dialog as a node"""
+
+    bl_idname = 'HALCYON_LevelsNode'
+    bl_label = "Levels"
+    bl_icon = 'SEQ_HISTOGRAM'
+
+    def init(self, context):
+        c = self.inputs.new('NodeSocketColor', 'Color')
+        c.default_value = (0.8, 0.8, 0.8, 1.0)
+        b = self.inputs.new('NodeSocketFloat', 'Black')
+        b.default_value = 0.0
+        w = self.inputs.new('NodeSocketFloat', 'White')
+        w.default_value = 1.0
+        g = self.inputs.new('NodeSocketFloat', 'Gamma')
+        g.default_value = 1.0
+        om = self.inputs.new('NodeSocketFloat', 'Out Min')
+        om.default_value = 0.0
+        ox = self.inputs.new('NodeSocketFloat', 'Out Max')
+        ox.default_value = 1.0
+        self.outputs.new('NodeSocketColor', 'Color')
+
+
+class HALCYON_SmoothStepNode(Node, HalcyonNodeBase):
+    """Remap a value's range to 0..1, with a choice of easing"""
+
+    bl_idname = 'HALCYON_SmoothStepNode'
+    bl_label = "Smooth Step"
+    bl_icon = 'IPO_EASE_IN_OUT'
+
+    interp: EnumProperty(name="Easing", default='SMOOTH', items=(
+        ('SMOOTH', "Smooth", "Hermite smoothstep"),
+        ('SMOOTHER', "Smoother", "Perlin's quintic -- flat at both ends"),
+        ('LINEAR', "Linear", "A straight clamped ramp")))
+
+    def init(self, context):
+        v = self.inputs.new('NodeSocketFloat', 'Value')
+        v.default_value = 0.5
+        a = self.inputs.new('NodeSocketFloat', 'From Min')
+        a.default_value = 0.0
+        b = self.inputs.new('NodeSocketFloat', 'From Max')
+        b.default_value = 1.0
+        self.outputs.new('NodeSocketFloat', 'Value')
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'interp', text="")
+
+
+class HALCYON_ChannelShuffleNode(Node, HalcyonNodeBase):
+    """Reorder a colour's channels -- the compositor's Shuffle, at shade time"""
+
+    bl_idname = 'HALCYON_ChannelShuffleNode'
+    bl_label = "Channel Shuffle"
+    bl_icon = 'COLOR'
+
+    _CH = (('R', "R", ""), ('G', "G", ""), ('B', "B", ""), ('A', "A", ""),
+           ('ZERO', "0", ""), ('ONE', "1", ""))
+    out_r: EnumProperty(name="R", items=_CH, default='R')
+    out_g: EnumProperty(name="G", items=_CH, default='G')
+    out_b: EnumProperty(name="B", items=_CH, default='B')
+    out_a: EnumProperty(name="A", items=_CH, default='A')
+
+    def init(self, context):
+        c = self.inputs.new('NodeSocketColor', 'Color')
+        c.default_value = (0.8, 0.8, 0.8, 1.0)
+        self.outputs.new('NodeSocketColor', 'Color')
+
+    def draw_buttons(self, context, layout):
+        row = layout.row(align=True)
+        row.prop(self, 'out_r', text="")
+        row.prop(self, 'out_g', text="")
+        row.prop(self, 'out_b', text="")
+        row.prop(self, 'out_a', text="")
+
+
+class HALCYON_DistanceMaskNode(Node, HalcyonNodeBase):
+    """0 to 1 by camera distance -- Depth Cue's factor, free for anything"""
+
+    bl_idname = 'HALCYON_DistanceMaskNode'
+    bl_label = "Distance Mask"
+    bl_icon = 'DRIVER_DISTANCE'
+
+    def init(self, context):
+        s = self.inputs.new('NodeSocketFloat', 'Start')
+        s.default_value = 5.0
+        e = self.inputs.new('NodeSocketFloat', 'End')
+        e.default_value = 50.0
+        self.outputs.new('NodeSocketFloat', 'Factor')
+        self.outputs.new('NodeSocketFloat', 'Distance')
+
+
+class HALCYON_StepTimeNode(Node, HalcyonNodeBase):
+    """Hold the clock every N frames -- animating on twos, as a node"""
+
+    bl_idname = 'HALCYON_StepTimeNode'
+    bl_label = "Stepped Time"
+    bl_icon = 'KEYFRAME_HLT'
+
+    def init(self, context):
+        s = self.inputs.new('NodeSocketFloat', 'Step Frames')
+        s.default_value = 2.0
+        self.outputs.new('NodeSocketFloat', 'Frame')
+        self.outputs.new('NodeSocketFloat', 'Phase')
+
+
+class HALCYON_WaveNode(Node, HalcyonNodeBase):
+    """A waveform oscillator: sine, square, triangle or saw of any input"""
+
+    bl_idname = 'HALCYON_WaveNode'
+    bl_label = "Waveform"
+    bl_icon = 'FORCE_HARMONIC'
+
+    wave: EnumProperty(name="Wave", default='SINE', items=(
+        ('SINE', "Sine", "Smooth oscillation"),
+        ('SQUARE', "Square", "Hard on/off, the blink"),
+        ('TRIANGLE', "Triangle", "Linear rise and fall"),
+        ('SAW', "Saw", "Linear rise, instant drop")))
+
+    def init(self, context):
+        v = self.inputs.new('NodeSocketFloat', 'Value')
+        v.default_value = 0.0
+        f = self.inputs.new('NodeSocketFloat', 'Frequency')
+        f.default_value = 1.0
+        p = self.inputs.new('NodeSocketFloat', 'Phase')
+        p.default_value = 0.0
+        mn = self.inputs.new('NodeSocketFloat', 'Minimum')
+        mn.default_value = 0.0
+        mx = self.inputs.new('NodeSocketFloat', 'Maximum')
+        mx.default_value = 1.0
+        self.outputs.new('NodeSocketFloat', 'Value')
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'wave', text="")
+
+
 NODES = (HALCYON_RampNode, HALCYON_BlurNode,
          HALCYON_ShaderNode, HALCYON_BIMaterialNode,
          HALCYON_BIInfluenceNode, HALCYON_BIRGBBlendNode,
@@ -2063,11 +2591,18 @@ NODES = (HALCYON_RampNode, HALCYON_BlurNode,
          HALCYON_PixelateNode, HALCYON_ScrollNode, HALCYON_ScanlinesNode,
          HALCYON_PaletteNode, HALCYON_ColorCycleNode, HALCYON_FlipbookNode,
          HALCYON_UVWaveNode, HALCYON_HalftoneNode, HALCYON_ThresholdNode,
-         HALCYON_QuantizeNode)
+         HALCYON_QuantizeNode,
+         HALCYON_NormalMapNode, HALCYON_NormalMixNode,
+         HALCYON_AltitudeSlopeNode, HALCYON_FacingNode,
+         HALCYON_IridescentNode, HALCYON_SwitchNode,
+         HALCYON_RandomPerObjectNode, HALCYON_LevelsNode,
+         HALCYON_SmoothStepNode, HALCYON_ChannelShuffleNode,
+         HALCYON_DistanceMaskNode, HALCYON_StepTimeNode, HALCYON_WaveNode)
 #: HalcyonBIRampStop is a PropertyGroup, not a node: it registers here,
 #: BEFORE the node whose CollectionProperty points at it, and stays out
 #: of the Add menu (which lists NODES only)
-OPERATORS = (HalcyonBIRampStop, HALCYON_OT_bi_ramp_stop,
+OPERATORS = (HALCYON_BlendValueSocket,
+             HalcyonBIRampStop, HALCYON_OT_bi_ramp_stop,
              HALCYON_OT_bi_ramp_gradient,
              HALCYON_OT_compile_shader, HALCYON_OT_new_shader_text)
 
@@ -2091,10 +2626,18 @@ class NODE_MT_halcyon_add(bpy.types.Menu):
     bl_label = "Halcyon"
 
     #: nodes that OPEN a group get a separator drawn above them
-    GROUP_STARTS = ('HALCYON_PosterizeNode', 'HALCYON_PixelateNode')
+    GROUP_STARTS = ('HALCYON_PosterizeNode', 'HALCYON_PixelateNode',
+                    'HALCYON_NormalMapNode', 'HALCYON_AltitudeSlopeNode')
 
     def draw(self, context):
         layout = self.layout
+        # R203: the Pre-Made shelf lives at the top of the Halcyon
+        # menu, where the field asked for it
+        try:
+            layout.menu('NODE_MT_halcyon_premade', icon='PRESET')
+            layout.separator()
+        except Exception:                                       # noqa: BLE001
+            pass
         for cls in NODES:
             if cls.bl_idname in self.GROUP_STARTS:
                 layout.separator()
@@ -2126,10 +2669,20 @@ def _migrate_master_sockets(_arg=None):
             trees.append(grp)
         for tree in trees:
             for node in getattr(tree, 'nodes', []):
-                if getattr(node, 'bl_idname', '') in (
-                        'HALCYON_ShaderNode', 'HALCYON_BIMaterialNode'):
+                idn = getattr(node, 'bl_idname', '')
+                if idn in ('HALCYON_ShaderNode', 'HALCYON_BIMaterialNode',
+                           'HALCYON_AltitudeSlopeNode'):
                     try:
                         node.ensure_sockets()
+                    except Exception:                           # noqa: BLE001
+                        pass
+                if idn == 'HALCYON_ShaderNode':
+                    # R202: the three blend menus move down beside
+                    # their sliders, and the panel regroups -- both
+                    # only ever at load, where topology is safe
+                    try:
+                        node.upgrade_blend_sockets()
+                        node.sort_sockets()
                     except Exception:                           # noqa: BLE001
                         pass
     except Exception:                                           # noqa: BLE001

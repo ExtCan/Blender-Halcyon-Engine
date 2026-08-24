@@ -25,7 +25,20 @@ AA_MODE = _items(
     ('NONE', "None", "One sample per pixel -- hard, aliased edges"),
     ('SUPERSAMPLE', "Supersample", "Render larger and filter down"),
     ('EDGE', "Edge Only", "Extra samples only where geometry IDs differ"),
+    ('ADAPTIVE', "Adaptive (Edge Pass)",
+     "Render once, then re-sample only the edge pixels -- the Bryce / "
+     "POV-Ray anti-aliasing pass, at a fraction of Supersample's cost"),
     ('ACCUMULATE', "Accumulation Buffer", "Jittered passes averaged together"),
+)
+STEREO_MODE = _items(
+    ('NONE', "None", "One camera, one picture"),
+    ('ANAGLYPH', "Anaglyph (Red/Cyan)",
+     "Left eye in red, right eye in green and blue -- the classic "
+     "cardboard-glasses stereo of every 90s magazine cover"),
+    ('SBS', "Side by Side",
+     "Squeezed left|right half-frames in one picture"),
+    ('CROSS', "Cross-Eyed",
+     "Right|left half-frames, for free-viewing by crossing your eyes"),
 )
 AA_FILTER = _items(
     ('BOX', "Box", "Flat average -- what most 1990s renderers used"),
@@ -199,6 +212,7 @@ RENDER_DEVICE = _items(
 
 ENUMS = {
     'render_device': RENDER_DEVICE,
+    'stereo_mode': STEREO_MODE,
     'aa_mode': AA_MODE, 'aa_filter': AA_FILTER, 'subpixel_precision': SUBPIXEL,
     'depth_sort': DEPTH_SORT, 'painters_key': PAINTERS_KEY, 'shading_rate': SHADING_RATE,
     'default_model': [(a, b, c) for a, b, c in MODEL_ITEMS],
@@ -233,6 +247,7 @@ RANGES = {
     'outline_opacity': (0.0, 1.0),
     'outline_depth_threshold': (0.0005, 1.0),
     'outline_normal_angle': (5.0, 179.0),
+    'stereo_eye_distance': (0.001, 2.0), 'stereo_convergence': (0.05, 500.0),
     'aa_samples': (1, 64), 'aa_filter_width': (0.1, 4.0),
     'aa_edge_threshold': (0.0, 100.0), 'vertex_snap_grid': (0.05, 16.0),
     'depth_precision': (4, 32), 
@@ -281,6 +296,8 @@ RANGES = {
 }
 
 LABELS = {
+    'stereo_mode': "Stereo", 'stereo_eye_distance': "Eye Distance",
+    'stereo_convergence': "Convergence",
     'aa_mode': "Anti-Aliasing", 'aa_samples': "Samples",
     'aa_filter': "Filter", 'aa_filter_width': "Filter Width",
     'aa_edge_threshold': "Edge Depth Threshold",
@@ -358,15 +375,26 @@ DESCRIPTIONS = {
     'aa_mode': "How edges are smoothed. None is the raw hard-edged raster, "
                "Supersample renders larger and filters down (the era's "
                "quality switch), Edge Only spends samples where geometry "
-               "ids change, Accumulation averages jittered whole frames",
+               "ids change, Adaptive renders once then re-samples just "
+               "the edge pixels (Bryce's second pass), Accumulation "
+               "averages jittered whole frames",
     'aa_samples': "Samples per pixel for the chosen mode. Supersample "
                   "rounds it to a square (24 renders at 5x5); more is "
-                  "smoother and proportionally slower",
+                  "smoother and proportionally slower. Adaptive pays "
+                  "this price only at edge pixels",
     'aa_filter': "The downfilter shape used to combine samples. Box is the "
                  "period default; Tent and Gauss trade a little sharpness "
                  "for calmer edges",
     'aa_filter_width': "Radius of the downfilter in output pixels. Wider "
                        "is softer; 1.0 keeps each pixel to its own samples",
+    'stereo_mode': "Render two eyes and combine them: red/cyan anaglyph "
+                   "or a side-by-side pair. Parallel cameras with an "
+                   "off-axis frustum, so vertical parallax never appears",
+    'stereo_eye_distance': "Distance between the two cameras, in scene "
+                           "units. Human-scale scenes want ~0.065",
+    'stereo_convergence': "Distance at which the two views line up "
+                          "exactly (zero parallax). Nearer objects pop "
+                          "out of the screen, farther ones sink in",
     'motion_blur': "Blur moving objects across the shutter interval by "
                    "averaging time-offset frames, as the era's renderers "
                    "faked it -- expect the cost of Steps extra renders",
@@ -526,9 +554,11 @@ DESCRIPTIONS = {
                        "family from shipped hardware",
     'alpha_bits': "Bits of opacity resolution for the alpha channel. "
                   "Fewer bits step smooth fades into visible bands",
-    'alpha_threshold': "Below this opacity a Screen Door pixel is simply "
-                       "skipped -- the cutoff that kept near-invisible "
-                       "surfaces from costing fill",
+    'alpha_threshold': "Hard opacity cutoff: below this a pixel is "
+                       "dropped outright instead of blended -- the "
+                       "classic cut-out alpha test for foliage cards "
+                       "and fences. 0 disables it so thin glass and "
+                       "smoke blend properly",
     # --------------------------------------------------------------- fog
     'fog': "Master switch for distance fog, the era's draw-distance "
            "disguise and mood in one",
@@ -829,10 +859,13 @@ DESCRIPTIONS = {
                           "what scanline renderers of the era did",
     'painters_key': "Which point on a polygon decides its sort order. Changing "
                     "it moves where Painter's algorithm goes wrong",
-    'aa_edge_threshold': "Depth step, in scene units, that counts as a crease "
-                         "worth smoothing. Edge AA always softens polygon "
-                         "silhouettes; this adds interior depth breaks. 0 "
-                         "smooths silhouettes only",
+    'aa_edge_threshold': "Depth break, in scene units, that counts as a "
+                         "crease worth extra samples. Both edge modes always "
+                         "treat silhouettes; this adds interior breaks. Edge "
+                         "Only tests the step between neighbours; Adaptive "
+                         "tests the curvature, so a smooth floor running "
+                         "away from the camera is never mistaken for one "
+                         "long crease. 0 treats silhouettes only",
     'ray_shadows': "Master switch for ray-traced shadows. Off, lights set to "
                    "trace (and lights with no shadow map to fall back on) "
                    "cast no shadow at all",
@@ -902,12 +935,21 @@ COLOR_FIELDS = {'global_ambient', 'fog_color', 'wire_color',
                 'override_color'}
 
 
+#: dataclass fields that are DERIVED at export rather than edited as
+#: properties -- each one's UI lives elsewhere (palette_colors is read
+#: out of the picked Palette Image; a generated FloatVector of size 0
+#: would not even register)
+_DERIVED_FIELDS = {'palette_colors'}
+
+
 def _build():
     """Turn the dataclass into a dict of bpy properties."""
     import dataclasses
     props = {}
     for f in dataclasses.fields(RenderSettings):
         name = f.name
+        if name in _DERIVED_FIELDS:
+            continue
         default = f.default
         label = LABELS.get(name, name.replace('_', ' ').title())
         desc = DESCRIPTIONS.get(name, '')
@@ -980,6 +1022,14 @@ class HalcyonSettings(PropertyGroup):
             ('SAMPLING', "Sampling", ""), ('SHADING', "Shading", ""),
             ('OUTPUT', "Output", ""), ('DISPLAY', "Display", "")),
         default='SAMPLING')
+    palette_image: PointerProperty(
+        name="Palette Image", type=bpy.types.Image,
+        description="R202: with Palette set to Custom, the whole "
+                    "render is forced through THIS image's colours -- "
+                    "point it at a palette table (Image editor > Image "
+                    "> Make Palette Table builds one from any picture) "
+                    "or at any small image whose colours you want the "
+                    "frame to live in")
 
     def to_settings(self):
         """Copy into a plain RenderSettings for the bpy-free renderer."""
@@ -992,6 +1042,24 @@ class HalcyonSettings(PropertyGroup):
             if isinstance(f.default, tuple):
                 v = tuple(v)
             setattr(st, f.name, v)
+        # R202: the image-as-palette road. Custom palette mode reads
+        # the picked image's own colours into the quantiser's palette
+        # -- the whole render is then FORCED through those colours,
+        # which is what the enum item always promised
+        if str(st.palette_mode) == 'CUSTOM':
+            img = getattr(self, 'palette_image', None)
+            if img is not None:
+                try:
+                    from . import compat
+                    from .core.palette import palette_from_pixels
+                    px = compat.image_pixels(img)
+                    if px is not None:
+                        st.palette_colors = tuple(
+                            map(tuple,
+                                palette_from_pixels(px,
+                                                    int(st.palette_size))))
+                except Exception:                               # noqa: BLE001
+                    pass
         return st
 
 
@@ -1031,6 +1099,270 @@ class HalcyonMaterialSettings(PropertyGroup):
     receive_shadow: BoolProperty(name="Receive Shadows", default=True)
     wire: BoolProperty(name="Wireframe", default=False)
     wire_size: FloatProperty(name="Wire Size", default=1.0, min=0.1, max=16.0)
+    # ---- Halo material (R191): Blender Internal's MA_TYPE_HALO ----
+    halo: BoolProperty(
+        name="Halo", default=False,
+        description="Render this material as Blender Internal halos: "
+                    "the mesh's vertices become depth-tested billboard "
+                    "glows instead of surfaces -- the 90s way to do "
+                    "sparks, fairy dust, star fields and energy effects")
+    halo_size: FloatProperty(
+        name="Halo Size", default=0.5, min=0.0, max=100.0,
+        description="World-space radius of each glow (2.79's HaloSize)")
+    halo_hardness: IntProperty(
+        name="Hardness", default=50, min=0, max=127,
+        description="Falloff shape, 2.79's exact ladder: below 20 "
+                    "squares the falloff, 30/40/50 each soften it a "
+                    "step further")
+    halo_add: FloatProperty(
+        name="Add", default=0.0, min=0.0, max=1.0,
+        description="Slides the blend from alpha-over (0) to pure "
+                    "additive glow (1) -- 2.79's Add slider")
+    halo_alpha: FloatProperty(
+        name="Alpha", default=1.0, min=0.0, max=1.0,
+        description="The halo's own opacity (2.79's material Alpha)")
+    halo_color: FloatVectorProperty(
+        name="Halo Colour", subtype='COLOR', size=3,
+        default=(0.8, 0.8, 0.8), min=0.0, max=1.0,
+        description="The glow's own colour -- 2.79 read the material's "
+                    "base colour for this")
+    halo_seed: IntProperty(
+        name="Seed", default=0, min=0, max=255,
+        description="Starting seed for the rings and lines hash -- "
+                    "each vertex walks on from it, exactly 2.79")
+    halo_rings: BoolProperty(
+        name="Rings", default=False,
+        description="Concentric circles around each halo")
+    halo_ring_count: IntProperty(
+        name="Ring Count", default=4, min=1, max=24,
+        description="How many concentric circles each halo draws, "
+                    "placed by the seed hash")
+    halo_ring_color: FloatVectorProperty(
+        name="Ring Colour", subtype='COLOR', size=3,
+        default=(1.0, 1.0, 1.0), min=0.0, max=1.0,
+        description="2.79 took this from the material's Mirror colour")
+    halo_lines: BoolProperty(
+        name="Lines", default=False,
+        description="Random radial streaks through each halo")
+    halo_line_count: IntProperty(
+        name="Line Count", default=12, min=1, max=250,
+        description="How many radial streaks cross each halo, "
+                    "directions drawn from the seed hash")
+    halo_line_color: FloatVectorProperty(
+        name="Line Colour", subtype='COLOR', size=3,
+        default=(1.0, 1.0, 1.0), min=0.0, max=1.0,
+        description="2.79 took this from the material's Specular colour")
+    halo_star: BoolProperty(
+        name="Star", default=False,
+        description="Pinch each halo into a star shape")
+    halo_star_tips: IntProperty(
+        name="Star Tips", default=4, min=3, max=50,
+        description="Points on the star the halo is pinched into "
+                    "(4 was the classic lens sparkle)")
+    halo_shape: EnumProperty(
+        name="Shape", default='DISC',
+        description="The glow's core silhouette; every shape still "
+                    "runs the hardness ladder and the effects",
+        items=_items(
+            ('DISC', "Disc", "The classic round glow, 2.79's own core"),
+            ('RING', "Ring", "A hollow ring -- the centre pushed to the "
+                             "rim by 2.79's own flare-circle formula"),
+            ('HEX', "Hexagon", "A soft six-sided glow, the lens-iris "
+                               "look of the era's flare kits"),
+            ('DIAMOND', "Diamond", "A four-pointed soft diamond sparkle"),
+            ('TRIANGLE', "Triangle", "A soft three-sided glow, vertex "
+                                     "up under zero rotation"),
+            ('PENTAGON', "Pentagon", "A soft five-sided iris glow"),
+            ('OCTAGON', "Octagon", "A soft eight-sided iris glow"),
+            ('CROSS', "Cross", "A plus-sign glow, bright along both "
+                               "axes and tapering at the rim"),
+            ('SQUARE', "Square", "A soft axis-aligned square glow"),
+            ('STAR', "Star", "A solid five-point star, points on the "
+                             "halo circle"),
+            ('HEART', "Heart", "The classic heart, radial glow inside"),
+            ('IMAGE', "Image", "An image IS the halo: its alpha the "
+                               "shape, its colours the glow -- the "
+                               "HaloTex idea, native")))
+    halo_image: PointerProperty(
+        name="Halo Image", type=bpy.types.Image,
+        description="The picture drawn as the halo when Shape is "
+                    "Image; alpha carves the silhouette")
+    halo_noise: FloatProperty(
+        name="Noise", default=0.0, min=0.0, max=1.0,
+        description="Animated value noise carving and boosting the "
+                    "core -- the energy-blast writhe; composes with "
+                    "every shape and the image")
+    halo_noise_scale: FloatProperty(
+        name="Noise Scale", default=4.0, min=0.2, max=32.0,
+        description="Cells of noise across the halo; higher is "
+                    "finer boiling")
+    halo_bolts: IntProperty(
+        name="Bolts", default=0, min=0, max=24,
+        description="Electric arcs radiating from the centre, each "
+                    "wiggling with radius and re-striking eight times "
+                    "per animation second")
+    halo_bolt_width: FloatProperty(
+        name="Bolt Width", default=1.0, min=0.05, max=8.0,
+        description="Thickness of the electric arcs, in the same "
+                    "resolution-true units as Line Width")
+    halo_bolt_color: FloatVectorProperty(
+        name="Bolt Colour", subtype='COLOR', size=3,
+        default=(1.0, 1.0, 1.0), min=0.0, max=1.0,
+        description="The electric arcs' own colour; until you set it, "
+                    "bolts follow the Line Colour as they always did")
+    halo_rays: IntProperty(
+        name="Rays", default=0, min=0, max=64,
+        description="EVENLY spaced rays -- the symmetric starburst "
+                    "the hashed Lines cannot make; they turn with "
+                    "Rotation and Spin")
+    halo_ray_sharp: FloatProperty(
+        name="Ray Sharpness", default=8.0, min=0.5, max=64.0,
+        description="How needle-thin the even rays are; higher is "
+                    "sharper spikes")
+    halo_ray_color: FloatVectorProperty(
+        name="Ray Colour", subtype='COLOR', size=3,
+        default=(1.0, 1.0, 1.0), min=0.0, max=1.0,
+        description="The even rays' own colour; until you set it, "
+                    "rays follow the Line Colour as they always did")
+    halo_rings_even: BoolProperty(
+        name="Even Rings", default=False,
+        description="Space the rings evenly out from the centre -- "
+                    "shockwaves -- instead of hashing their radii the "
+                    "2.79 way")
+    halo_gradient_type: EnumProperty(
+        name="Gradient Type", default='RADIAL',
+        description="How the gradient (or colour ramp) sweeps the "
+                    "halo; linear sweeps turn with Rotation and Spin",
+        items=_items(
+            ('RADIAL', "Centre Out (Radial)",
+             "Centre to rim along the radius"),
+            ('ANGULAR', "Angular", "A full turn around the centre -- "
+                                   "the conic sweep"),
+            ('HORIZONTAL', "Horizontal",
+             "Left to right across the halo"),
+            ('VERTICAL', "Vertical", "Bottom to top across the halo"),
+            ('DIAGONAL', "Diagonal", "Corner to corner at 45 degrees")))
+    halo_gradient_noise: FloatProperty(
+        name="Gradient Noise", default=0.0, min=0.0, max=1.0,
+        description="Wobbles the gradient coordinate with animated "
+                    "noise -- turbulent colour bands; Noise Scale sets "
+                    "the cell size, Anim Speed drives it, and the "
+                    "angular sweep wraps seamlessly")
+    halo_aspect: FloatProperty(
+        name="Aspect", default=1.0, min=0.05, max=20.0,
+        description="Stretches the halo horizontally (above 1) or "
+                    "vertically (below 1) -- with Rotation, a turned "
+                    "anamorphic streak; applies to every shape, the "
+                    "lines and the star")
+    halo_rotation: FloatProperty(
+        name="Rotation", default=0.0, min=-6.2832, max=6.2832,
+        subtype='ANGLE',
+        description="Static turn of the shape, lines and star about "
+                    "the centre; Spin animates on top of it")
+    halo_line_width: FloatProperty(
+        name="Line Width", default=1.0, min=0.05, max=8.0,
+        description="Thickness of the radial streaks; 1.0 is the "
+                    "classic hairline")
+    halo_ring_width: FloatProperty(
+        name="Ring Width", default=1.0, min=0.05, max=8.0,
+        description="Thickness of the concentric rings; 1.0 is the "
+                    "classic thin circle")
+    halo_gradient: BoolProperty(
+        name="Gradient", default=False,
+        description="Blend from the halo colour at the centre to the "
+                    "Edge Colour at the rim")
+    halo_color2: FloatVectorProperty(
+        name="Edge Colour", subtype='COLOR', size=3,
+        default=(0.0, 0.0, 0.0), min=0.0, max=1.0,
+        description="The rim end of the gradient; the halo colour "
+                    "holds the centre")
+    halo_rand_hue: FloatProperty(
+        name="Random Hue", default=0.0, min=0.0, max=1.0,
+        description="Per-halo hue scatter off the seed -- confetti "
+                    "clouds from one material, deterministic per "
+                    "vertex; it scatters every coloured option, trim "
+                    "included")
+    halo_rand_sat: FloatProperty(
+        name="Random Saturation", default=0.0, min=0.0, max=1.0,
+        description="Per-halo saturation scatter off the seed, over "
+                    "every coloured option")
+    halo_rand_val: FloatProperty(
+        name="Random Value", default=0.0, min=0.0, max=1.0,
+        description="Per-halo brightness scatter off the seed, over "
+                    "every coloured option")
+    halo_hue_shift: FloatProperty(
+        name="Hue Shift", default=0.0, min=-1.0, max=1.0,
+        description="Turns the hue of EVERY coloured option together "
+                    "-- body, gradient end, ramp, image, rings, "
+                    "lines, rays and bolts; a full turn is 1.0, and "
+                    "keyframing it cycles the whole halo through the "
+                    "wheel")
+    halo_sat_shift: FloatProperty(
+        name="Saturation Shift", default=1.0, min=0.0, max=2.0,
+        description="Scales the saturation of every coloured option "
+                    "together; 0 drains the halo to grey, above 1 "
+                    "over-saturates")
+    halo_val_shift: FloatProperty(
+        name="Value Shift", default=1.0, min=0.0, max=4.0,
+        description="Scales the brightness of every coloured option "
+                    "together; keyframable for fades that keep the "
+                    "alpha shape")
+    halo_pulse: FloatProperty(
+        name="Pulse", default=0.0, min=0.0, max=1.0,
+        description="Each halo's size breathes over time on its own "
+                    "hashed phase, so a cloud shimmers instead of "
+                    "throbbing in sync")
+    halo_flicker: FloatProperty(
+        name="Flicker", default=0.0, min=0.0, max=1.0,
+        description="Per-frame per-halo brightness jitter -- the 90s "
+                    "sparkle; deterministic in (seed, frame)")
+    halo_spin: FloatProperty(
+        name="Spin", default=0.0, min=-16.0, max=16.0,
+        description="Turns the lines, star and shaped cores about the "
+                    "centre, in radians per second of scene time")
+    halo_anim_speed: FloatProperty(
+        name="Anim Speed", default=1.0, min=0.0, max=8.0,
+        description="The master clock every animated halo effect "
+                    "rides -- Pulse, Noise, Bolts and Gradient Noise "
+                    "all scale by it; 0 freezes them all in place")
+    halo_pulse_speed: FloatProperty(
+        name="Pulse Speed", default=1.0, min=0.0, max=20.0,
+        description="Scales the Pulse breathing alone, on top of the "
+                    "master Anim Speed; 0 freezes just the pulse")
+    halo_flicker_speed: FloatProperty(
+        name="Flicker Speed", default=1.0, min=0.0, max=20.0,
+        description="How often the Flicker re-rolls: 1 is every "
+                    "frame (the classic sparkle), 0.5 every other "
+                    "frame, 0 holds one roll forever")
+    halo_noise_speed: FloatProperty(
+        name="Noise Speed", default=1.0, min=0.0, max=20.0,
+        description="Scales the core Noise writhe alone, on top of "
+                    "the master Anim Speed; 0 freezes the boil")
+    halo_bolt_speed: FloatProperty(
+        name="Bolt Speed", default=1.0, min=0.0, max=20.0,
+        description="Scales the electric arcs alone -- strike rate "
+                    "and writhe together -- on top of the master "
+                    "Anim Speed; 0 freezes the strike")
+    halo_grad_noise_speed: FloatProperty(
+        name="Gradient Noise Speed", default=1.0, min=0.0, max=20.0,
+        description="Scales the Gradient Noise wobble alone, on top "
+                    "of the master Anim Speed; 0 freezes the bands")
+    halo_xalpha: BoolProperty(
+        name="Extreme Alpha", default=False,
+        description="Square the alpha for a hotter core (MA_HALO_XALPHA)")
+    halo_soft: BoolProperty(
+        name="Soft", default=False,
+        description="Soften halos where they intersect geometry by how "
+                    "much of their depth is visible (MA_HALO_SOFT)")
+    halo_shaded: BoolProperty(
+        name="Shaded", default=False,
+        description="Tint each halo by the scene's lamps at its centre "
+                    "(MA_HALO_SHADE)")
+    halo_puno: BoolProperty(
+        name="Vertex Normal", default=False,
+        description="Scale each halo by its vertex normal's facing -- "
+                    "rear-facing verts glow, camera-facing ones vanish "
+                    "(MA_HALOPUNO)")
 
 
 class HalcyonLightSettings(PropertyGroup):
@@ -1085,11 +1417,61 @@ class HalcyonLightSettings(PropertyGroup):
     hotspot: FloatProperty(name="Hotspot", default=0.0, min=0.0, max=3.1416,
                            description="Inner cone angle, the 3D Studio "
                                        "hotspot/falloff pair")
+    area_gamma: FloatProperty(
+        name="Gamma", default=1.0, min=0.01, max=2.0,
+        description="Blender Internal's area lamp Gamma (la->k): shapes "
+                    "the form-factor energy as pow(intensity, gamma). "
+                    "1.0 is linear; below softens the falloff across "
+                    "the lit field, above sharpens it")
     volumetric: FloatProperty(
         name="Volumetric", default=0.0, min=0.0, max=4.0,
-        description="Scatters light along the view ray toward this lamp, "
-                    "giving the shafts and haze a bright source throws through "
-                    "an atmosphere")
+        description="Scatters light along the view ray toward this lamp. "
+                    "Spot lamps cast their visible cone, point lamps a "
+                    "bounded glow, area lamps a soft-edged slab beam -- all "
+                    "layered against the scene's depth; a Sun (no apex to "
+                    "march from) drives the screen-space light shafts "
+                    "instead")
+    volumetric_occlusion: BoolProperty(
+        name="Beam Occlusion", default=False,
+        description="Trace each beam sample back to the lamp, so the "
+                    "visible beam stops at a mesh in its way instead of "
+                    "shining through it. Costs a shadow ray per sample "
+                    "per pixel inside the beam")
+    flare: FloatProperty(
+        name="Lens Flare", default=0.0, min=0.0, max=4.0,
+        description="Draw this lamp's lens flare: hot core, chromatic "
+                    "halo rings, a star of streaks and aperture ghosts "
+                    "marching through frame centre -- the Video Post kit. "
+                    "Anchored on the lamp and faded by its visibility, so "
+                    "the flare dies as the lamp slips behind geometry")
+    flare_scale: FloatProperty(
+        name="Flare Scale", default=1.0, min=0.05, max=4.0,
+        description="Size of every flare element, relative to the frame")
+    flare_streaks: IntProperty(
+        name="Streaks", default=6, min=0, max=16,
+        description="Star spokes radiating from the source. 0 for none; "
+                    "6 and 8 were the era's favourites")
+    flare_rings: IntProperty(
+        name="Rings", default=1, min=0, max=4,
+        description="Chromatic halo rings around the source")
+    flare_ghosts: IntProperty(
+        name="Ghosts", default=6, min=0, max=12,
+        description="Aperture ghosts along the line through frame centre")
+    caustics: FloatProperty(
+        name="Caustics", default=0.0, min=0.0, max=4.0,
+        description="Project the animated pool-light web through this "
+                    "lamp -- the writhing bright cell edges every 1990s "
+                    "pool floor and water cave was lit with. A spot casts "
+                    "it through its cone; a sun tiles it seamlessly "
+                    "across the world. A real cookie image on the lamp "
+                    "takes priority")
+    caustics_scale: FloatProperty(
+        name="Caustic Scale", default=4.0, min=0.05, max=64.0,
+        description="Spot: how many cells across the cone. Sun: world "
+                    "units covered by one seamless tile")
+    caustics_speed: FloatProperty(
+        name="Caustic Speed", default=1.0, min=0.0, max=8.0,
+        description="How fast the caustic web writhes over the frames")
     exclude_collection: PointerProperty(
         name="Light Linking", type=bpy.types.Collection,
         description="A collection this lamp treats specially. Every 1990s "
@@ -1537,6 +1919,14 @@ class HalcyonWorldSettings(PropertyGroup):
                     "single-pixel points, which is what these looked like")
     star_twinkle: FloatProperty(name="Twinkle", default=0.0, min=0.0, max=1.0,
                                 description="Animated flicker, per star")
+    old_stars: BoolProperty(
+        name="Old Stars", default=False,
+        description="Draw stars the pre-1.38 way: each star fills its whole "
+                    "grid cell, so its pixel size follows the render "
+                    "resolution (blocky squares at high resolutions, and "
+                    "arbitrary sizes in Starfield mode). Off, every star is "
+                    "a round point of fixed angular size. On for scenes "
+                    "tuned to the old look")
     nebula: FloatProperty(
         name="Nebula", default=0.0, min=0.0, max=4.0,
         description="Turbulent cloud behind the stars. Zero leaves plain space")
@@ -1570,19 +1960,69 @@ class HalcyonWorldSettings(PropertyGroup):
                                "tracing demos"),
         ('NOISE', "Fractal", "Two colours mixed by fractal noise, for terrain "
                              "seen from height"),
-        ('GRID', "Neon Grid", "Glowing gridlines to the horizon -- the "
-                              "synthwave floor. The second colour is the "
-                              "line glow"),
-        ('TILES', "Tiles", "Square tiles with grout and per-tile shading. "
-                           "The second colour is the grout"),
+        ('TILES', "Tiles", "Square tiles with grout width, glow and "
+                           "per-tile shading dials. Thin glowing grout IS "
+                           "the synthwave neon floor (the old Neon Grid "
+                           "entry retired into this)"),
         ('DESERT', "Dunes", "Wind-ribbed sand ridges warped by noise, the "
                             "second colour on the crests"),
         ('SNOW', "Snowfield", "A bright field with blue-shadowed hollows "
                               "and sparse sun glints"),
-        ('LAVA', "Lava", "Dark crust over glowing cracks; the second "
-                         "colour is the heat, pulsing slowly"),
+        ('LAVA', "Lava", "Plates of darkened crust split by ridged "
+                         "fissures, heat bleeding out of every crack -- "
+                         "Crack Width, Glow and Pulse dials"),
         ('OCEAN', "Ocean", "Animated waves reflecting the sky, with a Fresnel "
-                           "term so it mirrors at glancing angles")))
+                           "term so it mirrors at glancing angles"),
+        ('MATERIAL', "Material", "The plane wears a material you pick: its "
+                                 "node graph is evaluated across the "
+                                 "infinite ground, tiled by Scale")))
+    ground_material: PointerProperty(
+        name="Ground Material", type=bpy.types.Material,
+        description="R203: the material the infinite plane wears in "
+                    "Material mode -- its node graph paints the ground "
+                    "to the horizon")
+    ground_grout: FloatProperty(
+        name="Grout Width", default=0.04, min=0.0, max=0.45,
+        description="Width of the grout line as a fraction of one "
+                    "tile; near zero with a glowing colour is the neon "
+                    "grid floor")
+    ground_tile_shade: FloatProperty(
+        name="Tile Variance", default=0.25, min=0.0, max=1.0,
+        description="Per-tile brightness scatter so the floor is not "
+                    "one flat repeat; 0 makes every tile identical")
+    ground_grout_glow: FloatProperty(
+        name="Grout Glow", default=1.0, min=0.0, max=8.0,
+        description="Multiplies the grout colour; above 1 the lines "
+                    "GLOW -- the synthwave floor lives around 1.6")
+    ground_crack_width: FloatProperty(
+        name="Crack Width", default=0.35, min=0.02, max=2.0,
+        description="How wide the lava fissures split, with the heat "
+                    "bleed scaling along")
+    ground_glow: FloatProperty(
+        name="Lava Glow", default=1.0, min=0.0, max=8.0,
+        description="Strength of the heat pouring out of the lava "
+                    "cracks and embers")
+    ground_pulse: FloatProperty(
+        name="Heat Pulse", default=0.15, min=0.0, max=1.0,
+        description="How much the lava's glow breathes over time; 0 "
+                    "holds it steady")
+    ground_color3: _col("Third Colour", (1.0, 1.0, 1.0),
+                        "The ground's third tone where the surface has "
+                        "one: the colour of snow glints and of the "
+                        "lava's drifting embers")
+    ground_sparkle: FloatProperty(
+        name="Sparkle", default=1.0, min=0.0, max=4.0,
+        description="Strength of the snowfield's sun glints; 0 turns "
+                    "the glitter off entirely")
+    ground_ridge: FloatProperty(
+        name="Ridge Strength", default=0.6, min=0.0, max=1.0,
+        description="How strongly the desert's dune crests pull toward "
+                    "the second colour; 0 flattens the ripple away")
+    ground_lighting: FloatProperty(
+        name="Scene Lighting", default=1.0, min=0.0, max=1.0,
+        description="How much the infinite ground answers the scene's "
+                    "sun and lamps, including shadows cast by objects; "
+                    "0 is the old self-lit flat look")
     ground_height: FloatProperty(name="Height", default=0.0, min=-1e4, max=1e4)
     ground_scale: FloatProperty(name="Scale", default=2.0, min=0.001, max=1e4)
     ground_color2: _col("Second Colour", (0.55, 0.52, 0.48))
@@ -1654,6 +2094,79 @@ class HalcyonWorldSettings(PropertyGroup):
     env_tint: _col("Tint", (1.0, 1.0, 1.0))
     sky_blend: BoolProperty(name="Sky Gradient", default=False,
                             options={'HIDDEN'})
+    # ------------------------------------------------ R200: Weather
+    weather: EnumProperty(
+        name="Weather", default='NONE',
+        description="A particle overlay falling in front of the whole "
+                    "picture -- it never replaces the sky, it weathers "
+                    "it. Deterministic: the same frame is the same "
+                    "storm on every render",
+        items=_items(
+            ('NONE', "None", "No weather overlay; the picture exactly "
+                             "as it was"),
+            ('RAIN', "Rain", "Streaked drops added as light -- the "
+                             "era's sprite rain; pick a green colour "
+                             "for acid rain"),
+            ('SNOW', "Snow", "Soft flakes composited over the picture; "
+                             "raise Drift for the tumble"),
+            ('EMBERS', "Embers", "Glowing motes added as light -- set "
+                                 "Angle to 180 degrees so they rise, "
+                                 "and try Glow and Flicker"),
+            ('ASH', "Ash", "Grey flakes composited over the picture, "
+                           "the fallout drift; slow Speed suits it")))
+    weather_density: FloatProperty(
+        name="Density", default=1.0, min=0.0, max=10.0,
+        description="How many particles fill the frame; the count "
+                    "follows the output size, so density reads the "
+                    "same at every resolution")
+    weather_size: FloatProperty(
+        name="Size", default=1.0, min=0.05, max=8.0,
+        description="Particle size, resolution-true against the "
+                    "480-line reference like the halo widths")
+    weather_speed: FloatProperty(
+        name="Speed", default=1.0, min=0.0, max=10.0,
+        description="How fast the particles travel across the screen; "
+                    "0 hangs them in the air")
+    weather_angle: FloatProperty(
+        name="Angle", default=0.0, min=-6.2832, max=6.2832,
+        subtype='ANGLE',
+        description="Direction of travel: 0 falls straight down, 180 "
+                    "degrees rises (embers), anything between is the "
+                    "diagonal sweep")
+    weather_drift: FloatProperty(
+        name="Drift", default=0.2, min=0.0, max=4.0,
+        description="Sideways wobble across the travel line, each "
+                    "particle on its own hashed phase -- snow tumbles, "
+                    "rain streaks straight at 0")
+    weather_color: _col("Colour", (0.85, 0.90, 1.0),
+                        "The particles' colour: cold white for rain "
+                        "and snow, sickly green for acid rain, hot "
+                        "orange for embers, grey for ash")
+    weather_opacity: FloatProperty(
+        name="Opacity", default=0.8, min=0.0, max=1.0,
+        description="How strongly the weather covers (or lights up) "
+                    "what is behind it; 0 switches it off entirely")
+    weather_layers: IntProperty(
+        name="Layers", default=3, min=1, max=4,
+        description="Parallax depth: layer 1 is nearest -- largest, "
+                    "fastest, brightest -- and each deeper layer "
+                    "recedes")
+    weather_streak: FloatProperty(
+        name="Streak", default=1.0, min=0.0, max=6.0,
+        description="Rain only: how long each drop's stroke trails "
+                    "behind it; 0 draws round drops")
+    weather_glow: FloatProperty(
+        name="Glow", default=0.0, min=0.0, max=1.0,
+        description="A soft halo of light around each particle -- "
+                    "embers and fireflies want it, snow does not")
+    weather_flicker: FloatProperty(
+        name="Flicker", default=0.0, min=0.0, max=1.0,
+        description="Each particle's brightness pulses on its own "
+                    "hashed phase -- the ember twinkle")
+    weather_seed: IntProperty(
+        name="Seed", default=0, min=0, max=10000,
+        description="Re-deals every particle's path; the same seed is "
+                    "the same storm, always")
 
 
 #: tooltips for group properties declared inline above -- patched into the

@@ -4,17 +4,21 @@
 > scammed. Please demand your money back and report the seller.**
 
 A from-scratch render engine for Blender that reproduces the output of
-mid-to-late 1990s home-computer 3D software — and, as of this release,
-**opens your old Blender 2.79-and-earlier .blend files with their Blender
-Internal materials intact**. Append a scene saved twenty years ago and it
-arrives looking like it did: shaders, textures, lamps, world and all.
+mid-to-late 1990s home-computer 3D software. It **opens your old Blender
+2.79-and-earlier .blend files with their Blender Internal materials
+intact** — append a scene saved twenty years ago and it arrives looking
+like it did: shaders, textures, lamps, world and all. And it carries the
+**Bryce 1995 material library, decoded from the original `.mat` files** —
+not recreated by eye: the MetaTools container format was cracked byte by
+byte, and every channel value, colour table and refractive index on the
+shelf is the number Bryce saved in December 1995.
 
 Not a filter over a modern render. A scanline z-buffer rasteriser with optional
 ray tracing, the reflectance models those packages actually shipped, real
 framebuffer quantisation, a genuine GLSL/HLSL compiler for the coded-shader
 nodes — and a complete GPU port of all three stages, proven against the CPU
-picture feature by feature on real hardware. 63,000 lines of Python and NumPy
-(92,000 with the test suite), no compiled dependencies.
+picture feature by feature on real hardware. 73,000 lines of Python and NumPy
+(105,000 with the test suite), no compiled dependencies.
 
 ![contact sheet](docs/halcyon_contact_sheet.png)
 
@@ -128,13 +132,16 @@ selecting Flat evaluates once per face. That is where the banding and the
 faceting genuinely come from, and it is why they look right instead of merely
 blurry.
 
-**145 node types** are evaluated — audited against Blender's full surface-node
+**167 node types** are evaluated — audited against Blender's full surface-node
 registry, and the audit came back clean: every shader node Blender 5.x offers
 has an evaluator except Freestyle's stroke UV, which has no meaning outside
 Freestyle. That includes the full Principled BSDF, node groups (recursively),
 muted nodes, reroutes, all the texture and colour nodes, and every Math and
 Vector Math operation. Nodes the engine doesn't know pass their first matching
 input through and are reported as a warning rather than failing the render.
+A second audit stands behind the first: every property a Halcyon node
+declares must reach the renderer — a node whose dial changes nothing fails
+the build with the dial named.
 
 **The master shader** carries the era's whole bag of tricks on one node —
 Fresnel, rim light, sheen, matcap, reflection tint, edge opacity, backface
@@ -159,16 +166,33 @@ clean cel edges with no line renderer. Computed from the same buffers on either
 device, so the picture cannot differ between them. Render Properties ▸ Shading
 ▸ Cartoon Outlines.
 
-**28 material templates** — Chrome through Wireframe on the Simple shelf;
-Water, Lava, Tile Floor, Brick Wall, Hammered Metal, Leopard, Cloth and Dead
-Channel among the Advanced. Built at runtime as recipes rather than saved node
-trees, so they always match the current nodes, and every one is rendered by the
-test suite to prove it changes the frame.
+**74 material templates on the Pre-Made shelf** — Add ▸ Pre-Made in the
+shader editor, sorted into ten families (Metal, Mineral, Glass, Water,
+Liquid, Wood, Cloud, Terrain, Surfaces, Effects). Picking one drops its
+nodes beside your existing graph rather than replacing it. The engine's
+own 28 — Chrome through Wireframe, Water, Lava, Tile Floor, Brick Wall,
+Hammered Metal, Leopard, Cloth, Dead Channel — plus:
 
-**25 procedural texture nodes** of the kind these packages shipped —
-Marble, Wood, Granite, Dents, Crackle, Plasma, Ripples, Starfield, Weave,
-Scratches, Tiles, Spiral, Cells, TV Static and the POV-Ray family (Bozo, Agate,
-Leopard, Onion, Bumps, Wrinkles, Brick), plus:
+**The Bryce 1995 library, decoded — 46 presets.** The original preset
+collection ships as MetaTools CCmF containers, and Halcyon's parser
+(`core/brycemat.py`) cracks them completely: the RLE preview thumbnails,
+the 976-byte material records (diffuse/ambient/specular colours, the
+per-channel specular coefficients, transparency, reflection, bump, the
+metallic flag, the refractive index — pinned by diffing the teaching
+presets against their own 1995 manual text), and the texture records
+with their exact colour tables, frequencies and octave counts. Polished
+Gold through Kryptonite carry the stored numbers: the glass ladder
+refracts at 1.12/1.52/1.68, Water at 1.33, Diamond at 2.55, and
+Kryptonite is the anisotropic reptilian-scale crackle its own colour
+table says it is. Preset notes quote the original library descriptions.
+Built at runtime as recipes rather than saved node trees, so they always
+match the current nodes, and every one is rendered by the test suite to
+prove it changes the frame.
+
+**26 procedural texture nodes** of the kind these packages shipped —
+Marble, Wood, Granite, Dents, Crackle, Plasma, Ripples, Caustics, Starfield,
+Weave, Scratches, Tiles, Spiral, Cells, TV Static and the POV-Ray family
+(Bozo, Agate, Leopard, Onion, Bumps, Wrinkles, Brick), plus:
 
 - **Fractal Noise** — the integer-hash fractal in three profiles, on a
   **1D, 2D, 3D or 4D lattice** with a W socket. The hash travels to the GPU
@@ -248,20 +272,62 @@ puts one beside the built-ins. Applying a preset refreshes the rendered view
 immediately — it tags the world the way a slider does, which for a long time it
 did not.
 
-**20 water presets** in the same shape, under the water plane rather than the
-Sky Lab because that is where Bryce kept them. Skies and waters own disjoint
-halves of the world, so applying one never disturbs the other.
+**48 water presets** in the same shape, under the water plane rather than the
+Sky Lab because that is where Bryce kept them — including a Bryce-1995-shaped
+ocean set. Skies and waters own disjoint halves of the world, so applying one
+never disturbs the other.
 
-**Nine infinite grounds** — solid, checker, fractal, **neon grid** (the
-synthwave floor, lines widening with distance so they survive minification),
-**tiles** with grout and per-tile shading, **dunes**, **snowfield** with
-sun-glints, **lava** with pulsing cracks, and the full **animated ocean**: a
-directional wave spectrum fanned off a wind direction, deep and shallow colours
-with the path length between them, and the sun's glitter found in the
-distribution of wave normals rather than painted on. All intersected
-analytically in the background pass, exactly as POV-Ray and Bryce provided one.
+**Nine infinite grounds, and they answer the scene's lighting** — solid,
+checker, fractal, **tiles** with grout width, grout glow and per-tile
+shading (thin bright grout past glow 1 *is* the synthwave neon floor),
+**dunes** with a ridge-strength dial, **snowfield** with sun-glints in
+their own colour and sparkle amount, **lava** with pulsing cracks, ember
+colour and crack-width dials, a **Material** ground that evaluates any
+picked material's node graph to the horizon, and the full **animated
+ocean**: a directional wave spectrum fanned off a wind direction, deep
+and shallow colours with the path length between them, and the sun's
+glitter found in the distribution of wave normals rather than painted
+on. All intersected analytically in the background pass, exactly as
+POV-Ray and Bryce provided one — and, unlike theirs, lit by the scene:
+every lamp's falloff, the hemi wrap, the area-lamp form factor, and
+**cast shadows from geometry**, ray-traced or shadow-mapped per lamp,
+with a Scene Lighting dial whose zero restores the self-lit flat look
+bit for bit. The self-luminous parts — lava heat, neon grout — keep
+burning inside shadows.
 
-**72 render presets** across six categories — 3D software (Infini-D, Ray
+**Weather** — rain, snow, embers and ash as a screen-space particle
+field composited in front of the finished frame, layered for parallax,
+resolution-true, and a pure function of (seed, layer, index, time): the
+same frame renders identically across runs, devices and supersample
+factors, and scrubbing the timeline is stable because nothing
+integrates.
+
+**A terrain generator** — Add ▸ Halcyon ▸ Terrain drops a fractal
+heightfield in seven landforms (mountain, hills, canyon, dunes with a
+wind direction, crater, volcano, plateau), deterministic per seed and
+ready-wired to the **Altitude & Slope** node, which grades a material by
+height and steepness — with an optional noise socket to roughen the band
+edges, and a ColorRamp downstream is the classic snow-line in two nodes.
+
+**Halo materials** — the era's glow sprites, splatted against the
+frame's own depth: images, noise breakup, colour ramps over radius,
+rays, star spikes, lightning bolts, shockwave rings, halos along curve
+objects, and lens flares that sample their lamp's visibility off the
+z-buffer. A sky-only scene can flare; a halo behind a wall cannot.
+
+**Animation, told honestly** — sequence renders print per-frame time and
+a completion estimate that knows the first frame pays for the caches the
+rest reuse (shadow maps, BVHs, compiled shaders), so the ETA converges
+on the truth instead of the warm-up cost.
+
+**The image-as-palette road** — point the quantiser at any image and the
+whole render is forced through that image's colours; an image-editor
+operator turns any picture into a one-pixel-per-colour palette table to
+feed it. Both dither roads clamp before they quantise and before they
+diffuse, so an unrepresentable hue becomes the nearest palette colour
+instead of a smear.
+
+**75 render presets** across six categories — 3D software (Infini-D, Ray
 Dream, 3D Studio, trueSpace, LightWave, POV-Ray, Bryce, Softimage|3D and the
 rest), home computers (VGA Mode 13h through PC-98 and X68000), consoles
 (PlayStation, Saturn, N64, Voodoo, Dreamcast…), broadcast (Video Toaster, PAL,
@@ -272,7 +338,7 @@ resets everything first, so presets never accumulate.
 Index, written under Blender's own names and channel layouts so a Halcyon Z
 pass drops into a comp built for Cycles without rewiring.
 
-**189 settings, all exposed, all proven, all explained.** Two tests stand
+**198 settings, all exposed, all proven, all explained.** Two tests stand
 behind that sentence: one holds every setting to a proof that it changes what
 it claims to change (a matrix row, an A/B render, a behavioural check, or a
 declared reason — nothing silently exempt), and one fails the build the moment
@@ -406,8 +472,8 @@ methods agreeing, every shading model distinct, all debug passes, affine
 texture warp, vertex snapping, A-buffer transparency, ray-traced reflection to
 any depth, node-graph evaluation including group recursion and unknown-node
 fallback, palette colour counts, the full post chain, the generated period
-objects, all 28 templates rendering, all 303 skies applying and differing, all
-72 presets, every setting's proof, and every tooltip's existence).
+objects, all 74 templates rendering, all 303 skies applying and differing, all
+75 presets, every setting's proof, and every tooltip's existence).
 
 The GPU pipeline is tested headlessly too: the same GLSL the driver compiles
 is executed by the compiler's own NumPy backend against the same packed
@@ -582,8 +648,12 @@ experiments are written down next to the wins so nobody re-fights them.
 
 The knobs that matter, in order:
 
-1. **`aa_samples` is quadratic.** Supersample 24 renders a 5× frame each way —
-   25× the pixels. Drop to 1 while you light the scene.
+1. **`aa_samples` is quadratic — under Supersample.** Supersample 24 renders a
+   5× frame each way — 25× the pixels. Drop to 1 while you light the scene, or
+   switch Anti-Aliasing to **Adaptive (Edge Pass)**: it renders the frame once,
+   then re-samples only the edge pixels (Bryce's anti-aliasing sweep, POV-Ray's
+   `+A`), which buys Supersample-grade silhouettes for a few percent of the
+   cost.
 2. **`Pixel Scale` is free performance.** Renders at 1/N of the output size
    and nearest-upscales — 16× cheaper at 4×, and more authentic than shrinking
    a large render.
@@ -615,25 +685,28 @@ halcyon/
   core/          bpy-free renderer
     mathx.py       vector maths on (N,3) arrays
     scene.py       dataclasses the renderer consumes
-    settings.py    RenderSettings — the 189 knobs
+    settings.py    RenderSettings — the 198 knobs
     raster.py      clipping, z-buffer, watertight edge rules, A-buffer
     bvh.py         binned-SAH BVH, wave traversal, order-free ties
     texture.py     sampling, mips, N64 three-point filter
     shading.py     the 18 reflectance models
     lights.py      attenuation, shadow maps, PCF, ray shadows
-    nodeeval.py    145 node types, the bump desugar, the space ramps
+    nodeeval.py    167 node types, the bump desugar, the space ramps
     patterns.py    the integer-hash pattern library, 1D–4D noise
-    sky.py         eight sky modes, the Bryce dome, nine grounds
+    sky.py         eight sky modes, the Bryce dome, nine LIT grounds,
+                   the weather overlay
     render.py      the orchestrator, outlines, closure translation
     post.py        glow, palettes, dither, NTSC, CRT, JPEG
     palette.py     median cut, octree, k-means, VGA/Mac/EGA/HAM
     dither.py      Bayer, Floyd-Steinberg, Stucki, Atkinson, …
-    geometry.py    the Add-menu objects, generated
+    geometry.py    the Add-menu objects, the seven terrains
+    brycemat.py    the Bryce 1995 .mat decoder — container, previews,
+                   material records, texture colour tables
   gpu/           the GPU port
     craster.py     the compute rasteriser and its NumPy twin
     shade.py       frame planning, deferred passes, the ray sweeps
     material.py    GLSL assembly per material
-    emit.py        82 node emitters
+    emit.py        103 node emitters
     procedural.py  the pattern library as GLSL, twin by twin
     rtrace.py      BVH kernels, the tie referral
     gbuffer.py     G-buffer packing and exact reconstruction
@@ -641,7 +714,7 @@ halcyon/
   shaders/       bpy-free GLSL/HLSL compiler
     lexer.py parser.py gtypes.py builtins.py codegen.py compiler.py
   nodes/         Blender node classes (master shader, patterns, ramps)
-  presets/       72 render presets, 303 skies (+ thumbs/), 20 waters
+  presets/       75 render presets, 303 skies (+ thumbs/), 48 waters
   tests/         headless suite, bpy stub, fake Blender, feature matrix
   legacy_import.py   the 2.79 reader: DNA parser, BI material mapping
   append_watch.py    the automatic lamp fix on plain File ▸ Append

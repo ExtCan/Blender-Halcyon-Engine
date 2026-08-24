@@ -390,6 +390,70 @@ def noise_fractal(p, kind=0, octaves=5, lacunarity=2.0, gain=0.5):
     return fbm(p, octaves=octaves, lacunarity=lacunarity, gain=gain)
 
 
+def _wang32p(u):
+    """Wang's uint32 mix, wrapping exactly as the GLSL twin does."""
+    u = np.asarray(u, np.uint32)
+    with np.errstate(over='ignore'):
+        u = (u ^ np.uint32(61)) ^ (u >> np.uint32(16))
+        u = u * np.uint32(9)
+        u = u ^ (u >> np.uint32(4))
+        u = u * np.uint32(668265261)
+        u = u ^ (u >> np.uint32(15))
+    return u
+
+
+def _wang01p(u):
+    return ((_wang32p(u) & np.uint32(0xFFFFFF)).astype(np.float32)
+            / np.float32(16777216.0))
+
+
+def caustic_web(u, v, time=0.0, period=8):
+    """The pool-light web: bright Voronoi edges, animated, PERIODIC.
+
+    Every 1990s pool, ocean floor and dungeon water gag was this
+    pattern: the second-minus-first Voronoi distance inverted so the
+    CELL EDGES glow -- the web -- with each cell's point slowly
+    orbiting so the web writhes. The lattice wraps every `period`
+    cells, so a SUN can tile it across the world without a seam, and
+    the hash is the uint32 Wang mix so the GLSL twin lands on the
+    same float for the same cell.
+    """
+    u = np.asarray(u, np.float32)
+    v = np.asarray(v, np.float32)
+    iu = np.floor(u).astype(np.int64)
+    iv = np.floor(v).astype(np.int64)
+    fu = (u - iu).astype(np.float32)
+    fv = (v - iv).astype(np.float32)
+    per = max(int(period), 2)
+    f1 = np.full(u.shape, 1e9, np.float32)
+    f2 = np.full(u.shape, 1e9, np.float32)
+    t = np.float32(time)
+    for oy in (-1, 0, 1):
+        for ox in (-1, 0, 1):
+            cx = ((iu + ox) % per).astype(np.uint32)
+            cy = ((iv + oy) % per).astype(np.uint32)
+            h = cx + cy * np.uint32(per)
+            a1 = _wang01p(h ^ np.uint32(0x9E3779B9))
+            a2 = _wang01p(h ^ np.uint32(0x85EBCA6B))
+            ph = _wang01p(h ^ np.uint32(0xC2B2AE35)) * np.float32(6.2831853)
+            # the point orbits its cell centre: radius from one hash,
+            # phase from another, everyone at the same gentle rate
+            px = 0.5 + (0.22 + 0.2 * a1) * np.cos(ph + t)
+            py = 0.5 + (0.22 + 0.2 * a2) * np.sin(ph + t)
+            dx = (ox + px - fu).astype(np.float32)
+            dy = (oy + py - fv).astype(np.float32)
+            d = dx * dx + dy * dy
+            # branch-free F1/F2 update, written the same way in the
+            # GLSL twin so the two sides run the identical operations
+            nf1 = np.minimum(f1, d)
+            f2 = np.minimum(f2, np.maximum(f1, d))
+            f1 = nf1
+    edge = np.sqrt(np.maximum(f2, 0.0)) - np.sqrt(np.maximum(f1, 0.0))
+    web = np.clip(1.0 - edge * 3.2, 0.0, 1.0)
+    web = web * web * web
+    return web.astype(np.float32)
+
+
 def cells(p, jitter=1.0, feature=0):
     """Worley's cellular texture (SIGGRAPH 1996 -- in period), by feature.
 
