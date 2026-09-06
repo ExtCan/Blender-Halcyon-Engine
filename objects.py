@@ -12,8 +12,8 @@ that cannot be -- meshes, materials, operators and the menu.
 
 import bpy
 from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
-                       FloatVectorProperty, IntProperty)
-from bpy.types import Menu, Operator
+                       FloatVectorProperty, IntProperty, PointerProperty)
+from bpy.types import Menu, Operator, Panel, PropertyGroup
 
 from . import templates
 from .core import geometry as GEO
@@ -97,6 +97,11 @@ def _new_object(context, name, verts, faces, materials=(), face_material=None,
             poly.use_smooth = True
 
     ob = bpy.data.objects.new(name, mesh)
+    return _present_object(context, ob)
+
+
+def _present_object(context, ob):
+    """Link a built object, drop it at the cursor, hand it over selected."""
     collection = context.collection or context.scene.collection
     collection.objects.link(ob)
     cursor = getattr(getattr(context, 'scene', None), 'cursor', None)
@@ -491,6 +496,778 @@ class HALCYON_OT_add_terrain(_AddBase):
         return {'FINISHED'}
 
 
+# ---------------------------------------------------------------- fur
+
+
+def _fur_material(name, density, root_color, tip_color):
+    """The classic shell-fur graph, wired from real nodes.
+
+    Hair Info ▸ Intercept feeds two chains: a ColorRamp grades root to
+    tip colour, and a Math ▸ Greater Than tests the Fur Tufts field
+    against the shell height. Fur Tufts is the texture shell fur
+    actually reads (R209): ROUND strand cross-sections whose height
+    peaks at each tuft's centre, so every shell up the stack keeps a
+    smaller disc and the tufts taper into strand tips -- not the square
+    same-width columns a flat per-cell hash gave. The material is
+    marked Hair Geometry so Hair Info reads the shells' colour layer.
+    """
+    mat = bpy.data.materials.new(name)
+    from . import compat
+    compat.enable_nodes(mat)
+    tree = mat.node_tree
+    tree.nodes.clear()
+    out = tree.nodes.new('ShaderNodeOutputMaterial')
+    out.location = (620, 0)
+    shader = tree.nodes.new('HALCYON_ShaderNode')
+    shader.location = (330, 0)
+    try:
+        shader.model = 'OREN_NAYAR'
+    except Exception:                                           # noqa: BLE001
+        pass
+    hair = tree.nodes.new('ShaderNodeHairInfo')
+    hair.location = (-380, 60)
+    ramp = tree.nodes.new('ShaderNodeValToRGB')
+    ramp.location = (-120, 180)
+    try:
+        el = ramp.color_ramp.elements
+        el[0].position = 0.0
+        el[0].color = tuple(root_color) + (1.0,)
+        el[1].position = 1.0
+        el[1].color = tuple(tip_color) + (1.0,)
+    except Exception:                                           # noqa: BLE001
+        pass
+    tuft = tree.nodes.new('HALCYON_FurTuftsNode')
+    tuft.location = (-380, -220)
+    try:
+        tuft.inputs['Scale'].default_value = float(density)
+    except Exception:                                           # noqa: BLE001
+        pass
+    # the tuft pattern MUST be sampled in UV space: every shell copies
+    # the base mesh's UVs, so the same tuft lands on the same spot of
+    # every shell and the stack reads as standing fur. Generated
+    # coordinates differ per shell (they are inflated copies) and the
+    # tufts would shear apart.
+    texco = tree.nodes.new('ShaderNodeTexCoord')
+    texco.location = (-620, -220)
+    gt = tree.nodes.new('ShaderNodeMath')
+    gt.location = (-120, -160)
+    gt.operation = 'GREATER_THAN'
+    links = tree.links
+    links.new(hair.outputs['Intercept'], ramp.inputs['Fac'])
+    links.new(ramp.outputs['Color'], shader.inputs['Diffuse Color'])
+    try:
+        links.new(texco.outputs['UV'], tuft.inputs['Vector'])
+    except Exception:                                           # noqa: BLE001
+        pass
+    ht_out = tuft.outputs.get('Height') or tuft.outputs[-1]
+    links.new(ht_out, gt.inputs[0])
+    links.new(hair.outputs['Intercept'], gt.inputs[1])
+    links.new(gt.outputs['Value'], shader.inputs['Opacity'])
+    links.new(shader.outputs['Surface'], out.inputs['Surface'])
+    try:
+        mat.halcyon.strand = True
+        # shells over shells over the base coat would blanket the body
+        # in its own cast shadow (shadow rays see geometry, not the
+        # alpha-tested tufts) -- the era's shell fur cast none either
+        mat.halcyon.cast_shadow = False
+        # R211: hard tuft alpha is PUNCH-THROUGH -- it resolves in the
+        # z-buffer and shades once, never as sorted blend layers. This
+        # is the whole difference between fur that renders at opaque
+        # speed and fur that drowns the frame in layer compositing
+        mat.halcyon.alpha_mode = 'CLIP'
+    except Exception:                                           # noqa: BLE001
+        pass
+    mat.diffuse_color = tuple(root_color) + (1.0,)
+    return mat
+
+
+class HALCYON_OT_add_fur_shells(_AddBase):
+    """Grow shell fur on the active mesh -- the era's other hair:
+    stacked inflated copies wearing alpha-tested tufts, the Dreamcast
+    and GameCube fur look. Uses the Hair Info node's strand convention,
+    so the auto-built material is an ordinary node graph you can edit"""
+
+    bl_idname = 'halcyon.add_fur_shells'
+    bl_label = "Fur Shells (from Active)"
+
+    shells: IntProperty(
+        name="Shells", default=16, min=2, max=64,
+        description="How many stacked copies build the pelt; the era "
+                    "ran 8 to 16 -- more layers slice each tuft's taper "
+                    "finer, and cost fill")
+    length: FloatProperty(
+        name="Length", default=0.25, min=0.001, max=100.0,
+        description="Fur length in scene units, root surface to the "
+                    "outermost shell")
+    curve: FloatProperty(
+        name="Packing", default=1.0, min=0.25, max=4.0,
+        description="Shell spacing bias -- above 1 packs the shells "
+                    "toward the root where fur is densest")
+    density: FloatProperty(
+        name="Tuft Density", default=48.0, min=1.0, max=512.0,
+        description="Strand cross-sections per UV unit -- the Fur "
+                    "Tufts texture's Scale; higher is finer, denser "
+                    "fur")
+    comb: FloatVectorProperty(
+        name="Comb", default=(0.0, 0.0, -0.05), subtype='TRANSLATION',
+        description="World-space lean the shells droop into "
+                    "quadratically -- gravity, or a parting")
+    root_color: FloatVectorProperty(
+        name="Root Colour", subtype='COLOR', size=3, min=0.0, max=1.0,
+        default=(0.16, 0.10, 0.06),
+        description="Fur colour at the skin, usually the darker end")
+    tip_color: FloatVectorProperty(
+        name="Tip Colour", subtype='COLOR', size=3, min=0.0, max=1.0,
+        default=(0.65, 0.48, 0.28),
+        description="Fur colour at the tips, catching the light")
+
+    @classmethod
+    def poll(cls, context):
+        ob = getattr(context, 'active_object', None)
+        return (context.mode == 'OBJECT' and ob is not None
+                and getattr(ob, 'type', '') == 'MESH')
+
+    def execute(self, context):
+        src = context.active_object
+        mat = _fur_material(f"{src.name} Fur", self.density,
+                            tuple(self.root_color),
+                            tuple(self.tip_color))
+        ob, warn = _fur_realize(context, src,
+                                dict(shells=int(self.shells),
+                                     length=float(self.length),
+                                     curve=float(self.curve),
+                                     comb=tuple(self.comb)), mat=mat)
+        if ob is None:
+            self.report({'ERROR'}, warn or 'the fur mesh failed to build')
+            return {'CANCELLED'}
+        if warn:
+            self.report({'WARNING'}, warn)
+        # hand the pelt its live settings: the same dials, editable in
+        # Object Properties from now on (R211)
+        fs = getattr(ob, 'halcyon_fur', None)
+        if fs is not None:
+            global _FUR_BUSY
+            _FUR_BUSY = True
+            try:
+                fs.is_fur = True
+                fs.source = src
+                fs.shells = int(self.shells)
+                fs.length = float(self.length)
+                fs.curve = float(self.curve)
+                fs.density = float(self.density)
+                fs.comb = tuple(self.comb)
+                fs.root_color = tuple(self.root_color)
+                fs.tip_color = tuple(self.tip_color)
+            finally:
+                _FUR_BUSY = False
+        return {'FINISHED'}
+
+
+# ------------------------------------------- live fur settings (R211)
+#
+# "The settings for the shell (layers, length, etc) should be in the
+# object's Object Properties for easy editing and changing." They are:
+# the Add operator stores its dials on the object, a panel in Object
+# Properties edits them, and every edit re-grows the shells through the
+# SAME builder the operator used -- one road, no drift.
+
+
+def _read_source_mesh(src):
+    """verts / normals / tris / first-seen per-vertex UVs off a mesh
+    object, numpy-fast -- the exporter-shaped arrays fur_shells eats."""
+    import numpy as np
+    me = src.data
+    me.calc_loop_triangles()
+    nv = len(me.vertices)
+    verts = np.empty(nv * 3, np.float32)
+    me.vertices.foreach_get('co', verts)
+    normals = np.empty(nv * 3, np.float32)
+    me.vertices.foreach_get('normal', normals)
+    tris = np.empty(len(me.loop_triangles) * 3, np.int32)
+    me.loop_triangles.foreach_get('vertices', tris)
+    uvs = None
+    if me.uv_layers.active is not None:
+        uvs = np.zeros((nv, 2), np.float32)
+        seen = np.zeros(nv, bool)
+        layer = me.uv_layers.active.data
+        for loop in me.loops:
+            vi = loop.vertex_index
+            if not seen[vi]:
+                uvs[vi] = layer[loop.index].uv[:]
+                seen[vi] = True
+    return (verts.reshape(-1, 3), normals.reshape(-1, 3),
+            tris.reshape(-1, 3), uvs)
+
+
+def _fur_shell_mesh(name, sv, st_, materials):
+    """A shell mesh datablock on the ONE proven road, then VERIFIED.
+
+    R214: 1.55.0 built this by hand (vertices.add + loop offsets via
+    foreach_set) for slider speed, and on real Blender that road
+    produced a corrupt mesh the stub suite could never see -- the field
+    rendered a black pelt for it. Every other Halcyon object has always
+    built through from_pydata, so the fur does too, and then the
+    triangles are READ BACK and compared to what was asked for: a build
+    that cannot prove its own connectivity raises instead of shipping.
+    Returns (mesh, problem_or_None)."""
+    import numpy as np
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata([tuple(v) for v in sv], [], [tuple(t) for t in st_])
+    mesh.update()
+    problem = None
+    try:
+        mesh.calc_loop_triangles()
+        nv = len(mesh.vertices)
+        nt = len(mesh.loop_triangles)
+        if nv != len(sv) or nt != len(st_):
+            problem = (f'the mesh built {nv} vertices / {nt} triangles '
+                       f'where {len(sv)} / {len(st_)} were asked for')
+        else:
+            back = np.empty(nt * 3, np.int32)
+            mesh.loop_triangles.foreach_get('vertices', back)
+            if not np.array_equal(back.reshape(-1, 3),
+                                  np.asarray(st_, np.int32)):
+                problem = ('the mesh connectivity read back differently '
+                           'than it was written')
+    except Exception:                                           # noqa: BLE001
+        # a stub bpy (the test suite) may not carry loop_triangles;
+        # real Blender always does, and real Blender is where the
+        # verification matters
+        problem = None
+    for m in materials:
+        if m is not None:
+            mesh.materials.append(m)
+    try:
+        import numpy as _np
+        mesh.polygons.foreach_set(
+            'use_smooth', _np.ones(len(mesh.polygons), bool))
+    except Exception:                                           # noqa: BLE001
+        for poly in mesh.polygons:
+            poly.use_smooth = True
+    return mesh, problem
+
+
+def _apply_fur_layers(mesh, sc, suv, has_uv):
+    """The strand colour layer and the copied UVs; returns a warning
+    string when the colour layer could not be written -- and READS THE
+    LAYER BACK (R214): a colour layer that silently zeroes is exactly a
+    black pelt with every shell dense (intercept 0 passes every alpha
+    test and wears the root colour), which is what the field got."""
+    import numpy as np
+    warn = None
+    try:
+        attr = mesh.color_attributes.new(name='HalcyonFur',
+                                         type='FLOAT_COLOR',
+                                         domain='POINT')
+        attr.data.foreach_set('color', sc.reshape(-1))
+        try:
+            mesh.color_attributes.render_color_index = 0
+            mesh.color_attributes.active_color_index = 0
+        except Exception:                                       # noqa: BLE001
+            pass
+        try:
+            back = np.zeros(int(sc.size), np.float32)
+            attr.data.foreach_get('color', back)
+            if not np.allclose(back, np.asarray(sc, np.float32).ravel(),
+                               atol=1e-5):
+                warn = ('the fur colour layer failed its read-back '
+                        'verification; Hair Info would read wrong '
+                        'strand data')
+        except Exception:                                       # noqa: BLE001
+            pass  # a stub bpy; real Blender verifies
+    except Exception:                                           # noqa: BLE001
+        warn = ("could not write the fur colour layer; the Hair Info "
+                "node will read zeros")
+    # (UV layers are copied loop-exactly by _copy_uv_layers now -- the
+    # old first-seen-per-vertex write smeared every seam)
+    return warn
+
+
+# ------------------------------------------- the pelt wears its source (R215)
+#
+# "The fur shells don't copy vertex groups, vertex colors, modifiers,
+# shape-keys, etc. When they should." They should: a pelt that cannot
+# follow its body is a prop. Everything below tiles the source's
+# per-vertex data across the shell stack (shell k vertex = k*nv + v),
+# and remaps per-corner data through the triangulation
+# (pelt loop (k, t, c) = source loop_triangles[t].loops[c]).
+
+#: modifiers that change the vertex count or topology cannot ride the
+#: pelt -- its strand colour layer is baked per vertex. Everything that
+#: only MOVES vertices (or edits weights) copies across; an Armature
+#: with the copied vertex groups is what makes fur follow a rig.
+_FUR_MOD_SKIP = frozenset({
+    'ARRAY', 'BEVEL', 'BOOLEAN', 'BUILD', 'DECIMATE', 'EDGE_SPLIT',
+    'MASK', 'MIRROR', 'MULTIRES', 'REMESH', 'SCREW', 'SKIN', 'SOLIDIFY',
+    'SUBSURF', 'TRIANGULATE', 'VOLUME_TO_MESH', 'WELD', 'WIREFRAME',
+    'NODES', 'EXPLODE', 'OCEAN', 'PARTICLE_INSTANCE', 'PARTICLE_SYSTEM',
+    'FLUID'})
+
+
+def _copy_uv_layers(mesh, src_me, count, lt_loops):
+    """EVERY source UV layer, exactly. The old road copied one layer by
+    first-seen-per-vertex, which smeared every UV seam; the pelt loop
+    (shell k, tri t, corner c) corresponds to source loop
+    loop_triangles[t].loops[c], so the copy can be loop-exact."""
+    import numpy as np
+    made = 0
+    try:
+        active = src_me.uv_layers.active
+        for layer in src_me.uv_layers:
+            data = np.empty(len(src_me.loops) * 2, np.float32)
+            layer.data.foreach_get('uv', data)
+            per_shell = data.reshape(-1, 2)[lt_loops]
+            nl = mesh.uv_layers.new(name=layer.name)
+            nl.data.foreach_set(
+                'uv', np.tile(per_shell, (count, 1)).ravel())
+            if active is not None and layer.name == active.name:
+                try:
+                    mesh.uv_layers.active = nl
+                except Exception:                               # noqa: BLE001
+                    pass
+            made += 1
+    except Exception:                                           # noqa: BLE001
+        pass
+    return made
+
+
+def _copy_color_attributes(mesh, src_me, count, lt_loops):
+    """The source's own colour layers ride along (point domain tiled by
+    vertex, corner domain remapped through the triangulation), so
+    Vertex Color and Attribute nodes keep painting the pelt.
+    'HalcyonFur' stays the strand layer and is never shadowed."""
+    import numpy as np
+    made = 0
+    try:
+        for a in (getattr(src_me, 'color_attributes', None) or ()):
+            if a.name == 'HalcyonFur':
+                continue
+            if a.domain == 'POINT':
+                data = np.empty(len(src_me.vertices) * 4, np.float32)
+                a.data.foreach_get('color', data)
+                out = np.tile(data.reshape(-1, 4), (count, 1))
+            elif a.domain == 'CORNER':
+                data = np.empty(len(src_me.loops) * 4, np.float32)
+                a.data.foreach_get('color', data)
+                out = np.tile(data.reshape(-1, 4)[lt_loops], (count, 1))
+            else:
+                continue
+            try:
+                na = mesh.color_attributes.new(
+                    name=a.name, type='FLOAT_COLOR', domain=a.domain)
+                na.data.foreach_set('color', out.ravel())
+                made += 1
+            except Exception:                                   # noqa: BLE001
+                pass
+    except Exception:                                           # noqa: BLE001
+        pass
+    return made
+
+
+def _copy_vertex_groups(ob, src, count, nv):
+    """Every source vertex group, weights tiled across the shells --
+    with these in place, a copied Armature modifier deforms the pelt
+    exactly as it deforms the skin."""
+    made = 0
+    try:
+        weights = {g.index: [] for g in src.vertex_groups}
+        if not weights:
+            return 0
+        for v in src.data.vertices:
+            for ge in v.groups:
+                if ge.weight > 0.0 and ge.group in weights:
+                    weights[ge.group].append((v.index, ge.weight))
+        for g in src.vertex_groups:
+            vg = ob.vertex_groups.new(name=g.name)
+            for vi, w in weights.get(g.index, ()):
+                vg.add([k * nv + vi for k in range(count)], w,
+                       'REPLACE')
+            made += 1
+    except Exception:                                           # noqa: BLE001
+        pass
+    return made
+
+
+def _copy_shape_keys(ob, src, count, nv, base_co):
+    """Source shape keys, re-grown on the stack: every shell vertex
+    moves by its base vertex's key delta. First-order follow -- the
+    shells translate with the surface rather than re-deriving their
+    normals, which is how the era's fur rode a morphing face. Key
+    values and slider ranges copy; drivers are yours to re-point."""
+    import numpy as np
+    made = 0
+    try:
+        kb_src = getattr(getattr(src.data, 'shape_keys', None),
+                         'key_blocks', None)
+        if not kb_src or len(kb_src) < 2:
+            return 0
+        b = np.empty(nv * 3, np.float32)
+        kb_src[0].data.foreach_get('co', b)
+        b = b.reshape(-1, 3)
+        ob.shape_key_add(name=kb_src[0].name, from_mix=False)
+        pelt = np.asarray(base_co, np.float32)
+        for kb in kb_src[1:]:
+            c = np.empty(nv * 3, np.float32)
+            kb.data.foreach_get('co', c)
+            delta = c.reshape(-1, 3) - b
+            sk = ob.shape_key_add(name=kb.name, from_mix=False)
+            sk.data.foreach_set(
+                'co', (pelt + np.tile(delta, (count, 1))).ravel())
+            try:
+                sk.slider_min = kb.slider_min
+                sk.slider_max = kb.slider_max
+                sk.value = kb.value
+            except Exception:                                   # noqa: BLE001
+                pass
+            made += 1
+    except Exception:                                           # noqa: BLE001
+        pass
+    return made
+
+
+def _copy_modifiers(ob, src):
+    """Deforming modifiers ride the pelt -- Armature above all.
+    Anything that changes the vertex count is skipped BY NAME, because
+    the strand colour layer is baked per vertex."""
+    copied, skipped = [], []
+    try:
+        for mod in src.modifiers:
+            if mod.type in _FUR_MOD_SKIP:
+                skipped.append(f'{mod.name} ({mod.type})')
+                continue
+            try:
+                new = ob.modifiers.new(mod.name, mod.type)
+                if new is None:
+                    skipped.append(f'{mod.name} ({mod.type})')
+                    continue
+                for pr in mod.bl_rna.properties:
+                    ident = pr.identifier
+                    if getattr(pr, 'is_readonly', False) or \
+                            ident in ('type', 'name'):
+                        continue
+                    try:
+                        setattr(new, ident, getattr(mod, ident))
+                    except Exception:                           # noqa: BLE001
+                        pass
+                copied.append(mod.name)
+            except Exception:                                   # noqa: BLE001
+                skipped.append(getattr(mod, 'name', '?'))
+    except Exception:                                           # noqa: BLE001
+        pass
+    return copied, skipped
+
+
+def _dress_from_source(ob, mesh, src, count, base_co):
+    """Everything of the source's that the pelt should keep wearing.
+
+    Re-run whole on every rebuild: the pelt is DERIVED, so its groups,
+    keys and modifiers are cleared and re-copied from the source --
+    hand-added ones belong on the source, where the pelt inherits them.
+    Returns console notes (skipped modifiers, by name)."""
+    import numpy as np
+    notes = []
+    src_me = src.data
+    nv = len(src_me.vertices)
+    try:
+        src_me.calc_loop_triangles()
+        lt = np.empty(len(src_me.loop_triangles) * 3, np.int32)
+        src_me.loop_triangles.foreach_get('loops', lt)
+    except Exception:                                           # noqa: BLE001
+        lt = None
+    if lt is not None:
+        _copy_uv_layers(mesh, src_me, count, lt)
+        _copy_color_attributes(mesh, src_me, count, lt)
+    try:
+        ob.vertex_groups.clear()
+    except Exception:                                           # noqa: BLE001
+        pass
+    try:
+        for m in list(ob.modifiers):
+            ob.modifiers.remove(m)
+    except Exception:                                           # noqa: BLE001
+        pass
+    _copy_vertex_groups(ob, src, count, nv)
+    _copy_shape_keys(ob, src, count, nv, base_co)
+    _copied, skipped = _copy_modifiers(ob, src)
+    if skipped:
+        notes.append('modifiers not copied (they change the vertex '
+                     'count the strand layer is baked for): '
+                     + ', '.join(skipped))
+    try:
+        # the pelt belongs to its body: follow object-level animation
+        ob.parent = src
+        ob.matrix_world = src.matrix_world.copy()
+    except Exception:                                           # noqa: BLE001
+        pass
+    return notes
+
+
+def _fur_realize(context, src, params, ob=None, mat=None):
+    """Grow (ob None) or re-grow (ob given) a fur-shell object from its
+    source mesh. One builder for the operator AND the live panel."""
+    verts, normals, tris, uvs = _read_source_mesh(src)
+    sv, st_, _sn, suv, sc = GEO.fur_shells(
+        verts, normals, tris, count=int(params['shells']),
+        length=float(params['length']), curve=float(params['curve']),
+        comb=tuple(params['comb']), uvs=uvs)
+    if ob is None:
+        mats = (mat,) if mat is not None else ()
+        name = f"{src.name} Fur Shells"
+    else:
+        mats = tuple(ob.data.materials)
+        name = ob.data.name
+    mesh, problem = _fur_shell_mesh(name, sv, st_, mats)
+    warn = _apply_fur_layers(mesh, sc, suv, uvs is not None)
+    if problem is not None or (warn and 'verification' in warn):
+        # R214: a build that fails its own read-back NEVER replaces a
+        # working pelt or ships silently -- the field wore a black fur
+        # ball for a corrupt build that was only checked by counting
+        why = problem or warn
+        try:
+            bpy.data.meshes.remove(mesh)
+        except Exception:                                       # noqa: BLE001
+            pass
+        if ob is not None:
+            return ob, (f'the rebuilt mesh failed verification '
+                        f'({why}); the existing pelt is untouched')
+        return None, f'the fur mesh failed verification ({why})'
+    if ob is None:
+        ob = bpy.data.objects.new(f"{src.name} Fur Shells", mesh)
+        _present_object(context, ob)
+    else:
+        old = ob.data
+        old_name = old.name
+        ob.data = mesh
+        try:
+            if old.users == 0:
+                bpy.data.meshes.remove(old)
+                mesh.name = old_name
+        except Exception:                                       # noqa: BLE001
+            pass
+    # R215: the pelt wears its source -- UV layers (loop-exact), colour
+    # layers, vertex groups, shape keys, deforming modifiers, parenting
+    for note in _dress_from_source(ob, mesh, src, int(params['shells']),
+                                   sv):
+        print(f'[Halcyon] fur: {note}')
+    try:
+        ob.matrix_world = src.matrix_world.copy()
+    except Exception:                                           # noqa: BLE001
+        pass
+    return ob, warn
+
+
+def _fur_retune_material(ob, density, root, tip):
+    """Push density and colours into the pelt's own fur material --
+    node edits, no rebuild needed."""
+    mat = None
+    for m in list(getattr(ob.data, 'materials', []) or []):
+        if m is not None and getattr(getattr(m, 'halcyon', None),
+                                     'strand', False):
+            mat = m
+            break
+    if mat is None or getattr(mat, 'node_tree', None) is None:
+        return
+    try:
+        # R219: re-assert the era flags on every retune/rebuild, so
+        # Rebuild From Source is the one cure the health warnings can
+        # always name. Shell fur casts NO shadow (a pelt that casts
+        # blankets its own lower layers and the body -- the black-pelt
+        # field report) and wears punch-through alpha, both period-
+        # correct and both cheap.
+        mat.halcyon.cast_shadow = False
+        mat.halcyon.alpha_mode = 'CLIP'
+    except Exception:                                           # noqa: BLE001
+        pass
+    for nd in mat.node_tree.nodes:
+        bid = getattr(nd, 'bl_idname', '')
+        if bid == 'HALCYON_FurTuftsNode':
+            try:
+                nd.inputs['Scale'].default_value = float(density)
+            except Exception:                                   # noqa: BLE001
+                pass
+        elif bid == 'ShaderNodeValToRGB':
+            try:
+                el = nd.color_ramp.elements
+                el[0].color = tuple(root) + (1.0,)
+                el[-1].color = tuple(tip) + (1.0,)
+            except Exception:                                   # noqa: BLE001
+                pass
+    try:
+        mat.diffuse_color = tuple(root) + (1.0,)
+    except Exception:                                           # noqa: BLE001
+        pass
+
+
+#: re-entrancy guard: the operator filling the panel's fields, and the
+#: rebuild itself, must not re-trigger the update callbacks
+_FUR_BUSY = False
+
+
+def _fur_geo_update(self, context):
+    global _FUR_BUSY
+    if _FUR_BUSY or not self.is_fur:
+        return
+    ob = self.id_data
+    src = self.source
+    if src is None or getattr(src, 'type', '') != 'MESH' or src is ob:
+        return
+    _FUR_BUSY = True
+    try:
+        _ob, warn = _fur_realize(
+            context, src,
+            dict(shells=self.shells, length=self.length,
+                 curve=self.curve, comb=tuple(self.comb)), ob=ob)
+        if warn:
+            print(f'[Halcyon] fur: {warn}')
+    except Exception:                                           # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+    finally:
+        _FUR_BUSY = False
+
+
+def _fur_mat_update(self, context):
+    global _FUR_BUSY
+    if _FUR_BUSY or not self.is_fur:
+        return
+    _FUR_BUSY = True
+    try:
+        _fur_retune_material(self.id_data, self.density,
+                             tuple(self.root_color),
+                             tuple(self.tip_color))
+    except Exception:                                           # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+    finally:
+        _FUR_BUSY = False
+
+
+class HalcyonFurSettings(PropertyGroup):
+    """The fur-shell dials, living on the pelt object itself."""
+
+    is_fur: BoolProperty(default=False, options={'HIDDEN'})
+    source: PointerProperty(
+        type=bpy.types.Object, name="Source",
+        poll=lambda self, ob: getattr(ob, 'type', '') == 'MESH',
+        update=_fur_geo_update,
+        description="The mesh the shells grow from. Edit it, then "
+                    "Rebuild From Source to re-grow the pelt on the "
+                    "new shape")
+    shells: IntProperty(
+        name="Shells", default=16, min=2, max=64,
+        update=_fur_geo_update,
+        description="How many stacked copies build the pelt; the era "
+                    "ran 8 to 16 -- more layers slice each tuft's "
+                    "taper finer, and cost fill")
+    length: FloatProperty(
+        name="Length", default=0.25, min=0.001, max=100.0,
+        update=_fur_geo_update,
+        description="Fur length in scene units, root surface to the "
+                    "outermost shell")
+    curve: FloatProperty(
+        name="Packing", default=1.0, min=0.25, max=4.0,
+        update=_fur_geo_update,
+        description="Shell spacing bias -- above 1 packs the shells "
+                    "toward the root where fur is densest")
+    comb: FloatVectorProperty(
+        name="Comb", default=(0.0, 0.0, -0.05), subtype='TRANSLATION',
+        update=_fur_geo_update,
+        description="World-space lean the shells droop into "
+                    "quadratically -- gravity, or a parting")
+    density: FloatProperty(
+        name="Tuft Density", default=48.0, min=1.0, max=512.0,
+        update=_fur_mat_update,
+        description="Strand cross-sections per UV unit -- the Fur "
+                    "Tufts texture's Scale; higher is finer, denser "
+                    "fur")
+    root_color: FloatVectorProperty(
+        name="Root Colour", subtype='COLOR', size=3, min=0.0, max=1.0,
+        default=(0.16, 0.10, 0.06), update=_fur_mat_update,
+        description="Fur colour at the skin, usually the darker end")
+    tip_color: FloatVectorProperty(
+        name="Tip Colour", subtype='COLOR', size=3, min=0.0, max=1.0,
+        default=(0.65, 0.48, 0.28), update=_fur_mat_update,
+        description="Fur colour at the tips, catching the light")
+
+
+class HALCYON_OT_fur_rebuild(Operator):
+    """Re-grow the shells from the source mesh as it is NOW -- picking
+    up sculpts, edits and new UVs the live dials cannot see"""
+
+    bl_idname = 'halcyon.fur_rebuild'
+    bl_label = "Rebuild From Source"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        ob = getattr(context, 'object', None)
+        return (ob is not None
+                and getattr(getattr(ob, 'halcyon_fur', None),
+                            'is_fur', False))
+
+    def execute(self, context):
+        global _FUR_BUSY
+        ob = context.object
+        fs = ob.halcyon_fur
+        src = fs.source
+        if src is None or getattr(src, 'type', '') != 'MESH':
+            self.report({'WARNING'}, "the fur has no source mesh -- "
+                                     "pick one in the panel")
+            return {'CANCELLED'}
+        _FUR_BUSY = True
+        try:
+            _ob, warn = _fur_realize(
+                context, src,
+                dict(shells=fs.shells, length=fs.length,
+                     curve=fs.curve, comb=tuple(fs.comb)), ob=ob)
+            _fur_retune_material(ob, fs.density, tuple(fs.root_color),
+                                 tuple(fs.tip_color))
+        finally:
+            _FUR_BUSY = False
+        if warn:
+            self.report({'ERROR'} if 'verification' in warn
+                        else {'WARNING'}, warn)
+        return {'FINISHED'}
+
+
+class HALCYON_PT_fur(Panel):
+    """Object Properties > Halcyon Fur: the pelt's live dials."""
+
+    bl_label = "Halcyon Fur"
+    bl_idname = 'HALCYON_PT_fur'
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = 'object'
+
+    @classmethod
+    def poll(cls, context):
+        ob = getattr(context, 'object', None)
+        return (ob is not None
+                and getattr(getattr(ob, 'halcyon_fur', None),
+                            'is_fur', False))
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        fs = context.object.halcyon_fur
+        layout.prop(fs, 'source')
+        src = fs.source
+        if src is None or getattr(src, 'type', '') != 'MESH':
+            layout.label(text="No source mesh -- the dials cannot "
+                              "re-grow the pelt", icon='ERROR')
+        col = layout.column(align=True)
+        col.prop(fs, 'shells')
+        col.prop(fs, 'length')
+        col.prop(fs, 'curve')
+        col.prop(fs, 'comb')
+        col = layout.column(align=True)
+        col.prop(fs, 'density')
+        col.prop(fs, 'root_color')
+        col.prop(fs, 'tip_color')
+        layout.operator(HALCYON_OT_fur_rebuild.bl_idname,
+                        icon='FILE_REFRESH')
+
+
 # -------------------------------------------------------------- the menu
 
 
@@ -509,6 +1286,8 @@ class VIEW3D_MT_halcyon_add(Menu):
         layout.separator()
         layout.operator(HALCYON_OT_add_terrain.bl_idname,
                         icon='RNDCURVE')
+        layout.operator(HALCYON_OT_add_fur_shells.bl_idname,
+                        icon='STRANDS')
 
 
 def draw_add_menu(self, context):
@@ -518,14 +1297,19 @@ def draw_add_menu(self, context):
     self.layout.menu(VIEW3D_MT_halcyon_add.bl_idname, icon='SHADING_RENDERED')
 
 
-CLASSES = (HALCYON_OT_add_teapot, HALCYON_OT_add_teaset,
+CLASSES = (HalcyonFurSettings, HALCYON_OT_add_teapot,
+           HALCYON_OT_add_teaset,
            HALCYON_OT_add_cornell_box, HALCYON_OT_add_checker_plane,
-           HALCYON_OT_add_terrain, VIEW3D_MT_halcyon_add)
+           HALCYON_OT_add_terrain, HALCYON_OT_add_fur_shells,
+           HALCYON_OT_fur_rebuild, HALCYON_PT_fur,
+           VIEW3D_MT_halcyon_add)
 
 
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
+    # the pelt's live dials live on the OBJECT (R211)
+    bpy.types.Object.halcyon_fur = PointerProperty(type=HalcyonFurSettings)
     menu = getattr(bpy.types, 'VIEW3D_MT_add', None)
     if menu is not None and hasattr(menu, 'append'):
         menu.append(draw_add_menu)
@@ -538,6 +1322,10 @@ def unregister():
             menu.remove(draw_add_menu)
         except Exception:                                       # noqa: BLE001
             pass
+    try:
+        del bpy.types.Object.halcyon_fur
+    except Exception:                                           # noqa: BLE001
+        pass
     for cls in reversed(CLASSES):
         try:
             bpy.utils.unregister_class(cls)

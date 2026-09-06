@@ -1,6 +1,7 @@
 # Halcyon Render Engine
 
-**Period-accurate mid-to-late 1990s CGI, not a filter**
+**A from-scratch render engine for the looks Cycles can't do — every 3D era
+before physically-based rendering, and 2D down to the wire**
 
 ---
 
@@ -12,110 +13,106 @@ modify and share it. Nobody is entitled to charge you for it.
 
 ---
 
-Halcyon is a complete render engine that reproduces what 3D software looked like
-when it ran on a home computer. Not a post-processing filter over a modern
-render — a scanline z-buffer rasteriser with optional ray tracing, the
-reflectance models those packages actually shipped, and real framebuffer
-quantisation at the end of it.
+Halcyon is a complete render engine, not a post-processing filter over a
+modern render: its own scanline z-buffer rasteriser with optional ray tracing,
+the reflectance models the old packages actually shipped, real framebuffer
+quantisation, a genuine GLSL/HLSL compiler for coded-shader nodes, and a
+complete GPU port held to the CPU picture pixel for pixel. Python and NumPy
+only — nothing compiled — and the whole engine runs headless without Blender
+for its 5,000-check test suite.
 
-The difference shows. Gouraud and Flat are treated as *shading rates*, not
-reflectance models, because that is what they were: selecting Gouraud evaluates
-lighting once per vertex and interpolates the colour across the triangle. That
-is where the banding genuinely comes from, and it is why it looks right rather
-than merely blurred. Transparency uses a true A-buffer. PlayStation mode snaps
-vertices to integer screen coordinates and drops perspective correction, so
-textures swim across polygons the way they did. The Amiga HAM modes reproduce
-hold-and-modify properly, fringing and all.
+**Three roads, one engine.**
 
-**Open your Blender 2.79 scenes.** File ▸ Import ▸ Legacy Scene (.blend) — or
-a plain File ▸ Append — brings a 2.79-or-earlier file in whole: the Blender
-Internal materials rebuild one to one (shader pairs, ramps, mirror,
-transparency, all eighteen texture slots, the original procedural textures on
-a ported BI Texture engine), lamps arrive with their true 2.79 energies and
-falloffs, shadows convert in both ray and buffer forms, and the old world
-comes along as sky, ambient and fog. Transcribed against the 2.79 source code
-and proven by the test suite, not approximated.
+**The eras.** Ninety render presets, each what its target actually did:
+Infini-D, Ray Dream, 3D Studio R4 and MAX, trueSpace, LightWave, Imagine,
+POV-Ray, Bryce, Softimage, Alias, RenderMan; VGA, EGA, CGA, the Mac 1-bit and
+8-bit palettes, Amiga OCS/AGA/HAM, Atari ST, PC-98, X68000; PlayStation,
+Saturn, N64, Voodoo, Dreamcast; NTSC, VHS, the early web. Gouraud and Flat are
+treated as *shading rates*, not reflectance models, because that is what they
+were — selecting Gouraud evaluates lighting once per vertex and interpolates,
+which is where the banding genuinely comes from. PlayStation mode snaps
+vertices and drops perspective correction, so textures swim across polygons
+the way they did. The Amiga HAM modes reproduce hold-and-modify properly,
+fringing and all. Applying a preset resets everything first, so presets never
+accumulate.
 
-**The Bryce 1995 material library, decoded.** The original preset collection's
-`.mat` files were cracked byte by byte — material channel records, colour
-tables, refractive indices — and 46 presets sit on the Pre-Made shelf carrying
-the exact numbers Bryce saved in December 1995, notes quoting the original
-library text.
+**The libraries.** Open your Blender 2.79 scenes: File ▸ Import ▸ Legacy Scene
+(.blend) — or a plain File ▸ Append — brings a 2.79-or-earlier file in whole,
+its Blender Internal materials rebuilt one to one (shader pairs, ramps,
+mirror, transparency, all eighteen texture slots, the original procedural
+textures on a ported BI Texture engine), lamps at their true 2.79 energies
+and falloffs, shadows in both ray and buffer forms, the old world as sky,
+ambient and fog — transcribed against the 2.79 source and proven by the test
+suite. The Bryce 1995 material library's `.mat` files were decoded byte by
+byte, and 46 presets sit on the Pre-Made shelf carrying the numbers Bryce
+saved in December 1995. And 3ds Max's material and map library — the Standard
+material's eight shaders, the Raytrace material, Blend / Double Sided /
+Top-Bottom / Shellac / Composite, the maps, utilities and coordinate
+rollouts, a shelf of thirty-five nodes — runs on Max's own algorithms, reimplemented on Halcyon's own tables
+(no Autodesk code or data ships), with a 3ds Max 2012 render preset.
+
+**The 2D road.** A Cartoon Shader — paint, not light, with the Golden Age,
+UPA, Xerox-line, Saturday-morning, 90s feature, wartime noir and modern flat
+eras on a menu — and an Anime Shader with kage tones, the hair shine, the
+airbrush, a six-decade Style menu, and compatibility modes that decode real
+game texture conventions (ArcSys, Genshin, ZZZ). An ink pass drawn from the
+shared G-buffer: clean, brush and pencil lines that taper, roughen, drift,
+skip and boil, the inker's weight by the light, Arc System Works' vertex-colour
+line control. 2D media converters that turn the lit cel into hatching, pencil
+scribble, stipple, charcoal, ink wash, paint strokes and paper. Painted
+backdrops on a world-fixed panel and painted grounds laid in brush strokes.
+And the film the cel went through: the three-strip camera's records and
+filters, the timed print curve, impure dyes, dye-transfer registration, the
+silver key, then grain by size and clump, dust on the cel, the negative and
+the print, hairs in the gate, scratches, cue marks, gate weave, flicker,
+frames held on twos and threes.
 
 ## What you get
 
-**18 shading models**, each implemented from its published formulation —
+**32 shading models**, each implemented from its published formulation —
 Lambert, Gouraud, Flat, Phong, Blinn-Phong, Blinn, Cook-Torrance, Oren-Nayar,
 Minnaert, Ward, Anisotropic, Metal, Strauss, Multi-Layer, Toon, Translucent,
-Constant and Wireframe.
+Constant, Wireframe, Anime, Cartoon, Oren-Nayar-Blinn, the whole Blender
+Internal diffuse/specular matrix, and 3ds Max's own eight.
 
-**75 render presets** across six categories. Infini-D, Ray Dream, StudioPro,
-3D Studio R4 and MAX, trueSpace, LightWave, Imagine, POV-Ray, Bryce,
-ElectricImage, Softimage|3D, Alias PowerAnimator, Wavefront, CINEMA 4D, Real
-3D, Vistapro, Animation:Master, Vue. VGA Mode 13h, EGA, CGA, Hercules,
-Macintosh 8-bit and 1-bit, Windows 3.1 and 95, Amiga OCS and AGA, Atari ST,
-PC-98, X68000, SVGA, Quake software. PlayStation, Saturn, N64, Voodoo,
-Dreamcast, 3DO, Jaguar. Video Toaster, PAL, VHS, S-Video. Web GIF, JPEG,
-PNG-8, CD-ROM FMV. Applying one resets everything first, so presets never
-accumulate.
-
-**167 Blender node types** are evaluated, including the full Principled BSDF
-and recursive node groups. Nodes the engine does not recognise pass through
-and report a warning rather than failing the render.
-
-**74 material templates** in the shader editor's Pre-Made menu, sorted into
-ten families — the engine's own 28 plus the 46 decoded Bryce 1995 presets.
-Picking one adds its nodes beside your graph rather than replacing it.
-
-**26 procedural texture nodes** of the kind these packages shipped — Marble,
-Wood, Granite, Dents, Crackle, Plasma, Ripples, Caustics, Starfield, Weave,
-Scratches, Tiles, Spiral, Cells, TV Static, the POV-Ray family (Bozo, Agate,
-Leopard, Onion, Bumps, Wrinkles, Brick), a 1D–4D Fractal Noise whose integer
-hash is bit-exact on CPU and GPU, an animated Water Noise with an exact loop,
-a shaped Gradient, and Matcap Coordinates. Solid textures, evaluated in 3D,
-so a shape carved out of marble has veins running through it.
+**243 node types** are evaluated — every shader node Blender 5.x offers (the
+full Principled BSDF, recursive node groups, every Math and Vector Math
+operation) plus Halcyon's own 137: the master shader with the era's whole bag
+of tricks on one node, 34 procedural textures, the 2D media, thirty utilities
+and vector warps, the BI Texture and BI Material nodes, the 3DS Max shelf.
+Nodes the engine does not recognise pass through and report a warning rather
+than failing the render.
 
 **Coded shader nodes.** A real GLSL and HLSL compiler — preprocessor,
 recursive-descent parser, type inference, and code generation with SIMT
 execution masks, so different pixels genuinely take different branches.
 Declare `uniform float rimPower = 2.5;` and a Rim Power socket appears on the
-node, defaulted to 2.5. Coded shaders compile natively into the GPU's
-deferred pass too, so the same source runs on both devices.
+node. Coded shaders compile natively into the GPU's deferred pass too.
 
-**Eight sky modes** — node tree, solid, gradient, banded gradient, starfield,
-Preetham physical sky, HDRI, and a full Bryce Sky Lab: sky dome, sun corona,
-haze, ground fog, a wind-streaked stratus deck, a self-shadowed cumulus deck
-built from turbulence, a rainbow at the correct 42 degrees, stars, comets and
-a nebula wash. **303 sky presets** with rendered thumbnails in a browsable
-gallery, and **48 water presets** under the water plane, where Bryce kept
-them.
+**113 material templates** on the Pre-Made shelf in fourteen families — the
+engine's own recipes, the 46 decoded Bryce presets, the cel, cartoon, media
+and volume shelves. Picking one adds its nodes beside your graph.
 
-**Nine infinite grounds that answer the scene's lighting** — checker, tiles
-(thin glowing grout is the synthwave floor), dunes, snowfield, lava, an
-animated ocean with a directional wave spectrum, and a Material mode that
-paints any node graph to the horizon. Sun angle, lamp falloff and cast
-shadows from geometry land on the plane; a Scene Lighting dial returns the
-old self-lit look exactly.
+**Real volumes** — a mesh whose material links a Volume chain marches as a
+container: per-channel Beer-Lambert, single scatter from the scene's own
+lamps and shadows (god rays included), eight scattering models, mesh-shaped
+containers, voxels, smoke grids, and the cel dials for stylized fog.
 
-**Weather** — rain, snow, embers and ash over any finished frame,
-deterministic and stable under timeline scrubbing.
-
-**A terrain generator** — seven landforms from mountain to volcano, wired for
-the Altitude & Slope node, with a ColorRamp downstream making the classic
-snow-line in two nodes.
-
-**Halo materials** — the era's glow sprites against the frame's own depth:
-images, noise, rays, star spikes, lightning bolts, shockwaves, halos along
-curves, and lens flares that check their lamp's visibility.
+**Nine sky modes** — node tree, solid, gradient, banded, starfield, Preetham,
+HDRI, a full Bryce Sky Lab, and the painted backdrop — with **303 sky
+presets** in a thumbnail gallery, **48 water presets**, and **nine infinite
+grounds that answer the scene's lighting**. Weather, a seven-landform terrain
+generator, halo materials and lens flares against the frame's own depth.
 
 **Output that lands in the right decade.** Colour depth from 32-bit down to
 1-bit, real VGA, Macintosh, EGA, CGA and web-safe palettes, four adaptive
-quantisers, seven error-diffusion kernels plus ordered dither — or force the
-whole frame through the colours of any image you pick — composite NTSC
-encoding with chroma bleed and dot crawl, CRT aperture grille and shadow
-masks, interlacing, and a genuine 8×8 DCT round-trip for JPEG artefacts.
+quantisers, seven error-diffusion kernels plus ordered dither, any image as a
+palette, composite NTSC encoding with chroma bleed and dot crawl, CRT masks,
+interlacing, and a genuine 8×8 DCT round-trip for JPEG artefacts. **140
+resolution presets** from the NES's 8:7 pixel to 8K and the 35 mm scan
+formats.
 
-**198 settings, all proven.** One test holds every setting to evidence that
+**291 settings, all proven.** One test holds every setting to evidence that
 it changes what it claims to change; another fails the build if any property
 ships without a real tooltip.
 
@@ -126,17 +123,19 @@ run through Blender's own `gpu` module. Set Device: GPU in Render Properties.
 A 116-row feature matrix in the built-in Self Test compares the GPU picture
 against the CPU's on your own driver; anything that cannot run on the GPU is
 routed to the CPU **by name**, with the reason printed, and the picture stays
-right. Frame-to-frame caches mean an animation re-uploads only what moved.
+right. Same frame, same numbers, on either device, in any band, on any worker.
 
 ## Getting started
 
 1. Set **Render Properties ▸ Render Engine ▸ Halcyon**
 2. Open the **Halcyon Presets** panel and load one — *VGA Mode 13h* or
-   *PlayStation* show the character of the engine fastest
+   *PlayStation* show the character of the engine fastest; *Cel: 1940s
+   Technicolor feature* with a Cartoon template shows the other road
 3. If the Display panel warns that Blender's view transform is not Standard,
    press the button it offers. Halcyon outputs display-referred pixels, so AgX
    on top double-transforms them
-4. On an existing scene, use **Convert Whole Scene** in the Material panel
+4. On an existing scene, use **Convert Whole Scene** in the Material panel;
+   for a 2.79 file, File ▸ Import ▸ Legacy Scene or a plain Append
 
 ## Performance
 
@@ -156,17 +155,20 @@ Blender already ships. Developed and tested against Blender 5.2.
 
 ## Honest limitations
 
-- Volumetrics are screen-space light shafts; no volume is integrated
 - Depth of field is layered (depth slabs by circle of confusion), not sampled
 - Motion blur averages time-offset frames across a shutter — the era's way
 - Displacement drives a bump, not tessellation
-- Particles and hair are not supported; halo materials cover the classic
-  glow-sprite look
+- Hair renders as tapered strand ribbons (particle and Curves hair) or as
+  shell-textured fur; emitter particles render as halos or as instances
 - Blender's own procedural noises are re-implemented from their published
   definitions — the right pattern, not bit-identical to Cycles, and they
   shade on the CPU by name; Halcyon's own pattern nodes are the portable,
   bit-exact replacements
 - The Sky Texture node is Preetham, not Nishita
+- The film stages run on the CPU on both device roads, once per frame, so
+  the two roads see the same numbers
+- The 3ds Max shelf reproduces Max's algorithms and controls, not a Max
+  scene's exact random tables — the character, not the pattern
 
 ## Reporting problems
 

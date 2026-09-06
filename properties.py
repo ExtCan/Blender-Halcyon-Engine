@@ -13,6 +13,14 @@ from bpy.types import PropertyGroup
 
 from .core.settings import (RESOLUTION_GROUPS, RenderSettings,
                             resolution_description, resolution_label)
+from .core import shading as _shading
+from .core.ink import (INK_COLOR_ITEMS, INK_GRADIENT_ITEMS, INK_STYLE_ITEMS,
+                       INK_TEXTURE_ITEMS)
+from .core.lines import INK_ANCHOR_ITEMS
+from .core.film import FILM_GRADE_ITEMS, FILM_PROCESS_ITEMS
+from .core.wear import FILM_SCRATCH_SIDE_ITEMS
+from .core.sky import PAINTED_LOOK_ITEMS, PAINTED_LOOKS
+from .core.gouache import BG_DIRECTION_ITEMS
 from .core.shading import MODEL_ITEMS
 from .presets.library import preset_items
 
@@ -211,6 +219,18 @@ RENDER_DEVICE = _items(
 )
 
 ENUMS = {
+    # R233: the painted background road
+    'bg_direction': _items(*BG_DIRECTION_ITEMS),
+    'ink_style': _items(*INK_STYLE_ITEMS),
+    'ink_texture': _items(*INK_TEXTURE_ITEMS),
+    # R234: the inker's line
+    'ink_anchor': _items(*INK_ANCHOR_ITEMS),
+    'film_grade': _items(*FILM_GRADE_ITEMS),
+    # R236: the colour process
+    'film_process': _items(*FILM_PROCESS_ITEMS),
+    'film_scratch_side': _items(*FILM_SCRATCH_SIDE_ITEMS),
+    'ink_color_mode': _items(*INK_COLOR_ITEMS),
+    'ink_gradient': _items(*INK_GRADIENT_ITEMS),
     'render_device': RENDER_DEVICE,
     'stereo_mode': STEREO_MODE,
     'aa_mode': AA_MODE, 'aa_filter': AA_FILTER, 'subpixel_precision': SUBPIXEL,
@@ -244,6 +264,54 @@ ENUMS = {
 # field -> (min, max, soft_min, soft_max, step/precision hints)
 RANGES = {
     'outline_width': (1, 8),
+    'ink_reference_height': (0, 8640), 'ink_taper': (0.0, 1.0),
+    'ink_interior_scale': (0.0, 2.0), 'ink_weight_noise': (0.0, 1.0),
+    'ink_weight_scale': (2.0, 400.0), 'ink_shadow_side': (0.0, 1.0),
+    'ink_boil': (0.0, 16.0), 'ink_boil_fps': (0, 60),
+    'ink_boil_scale': (2.0, 400.0), 'ink_pencil_strokes': (1, 6),
+    'ink_pencil_spread': (0.0, 12.0), 'ink_grain': (0.0, 1.0),
+    'ink_fill_darken': (0.0, 1.0),
+    # R231: the drawn line
+    'ink_end_taper': (0.0, 1.0), 'ink_end_length': (1.0, 200.0),
+    'ink_roughness': (0.0, 1.0), 'ink_roughness_scale': (1.0, 64.0),
+    'ink_drift': (0.0, 8.0), 'ink_gaps': (0.0, 1.0),
+    'ink_texture_amount': (0.0, 1.0),
+    # R234: the inker's line
+    'outline_form_threshold': (0.02, 5.0), 'outline_shadow_level': (-0.5, 0.9),
+    'outline_tone_threshold': (0.02, 1.0),
+    'ink_isophote': (0.0, 1.0), 'ink_isophote_range': (2.0, 200.0),
+    'ink_smooth': (0.0, 6.0), 'ink_pressure': (0.0, 1.0),
+    'ink_overshoot': (0.0, 40.0),
+    # R230: the era looks
+    'film_grade_amount': (0.0, 1.0), 'film_softness': (0.0, 6.0),
+    # R236: the colour process
+    'film_process_amount': (0.0, 1.0), 'film_exposure': (-3.0, 3.0),
+    'film_gamma': (0.8, 3.0), 'film_density': (1.0, 3.5),
+    'film_filters': (-0.3, 0.6),
+    'film_dye_purity': (0.0, 1.0), 'film_key': (0.0, 1.0),
+    'film_halation': (0.0, 1.0), 'film_halation_radius': (2.0, 64.0),
+    'film_register': (0.0, 4.0),
+    'film_grain_size': (0.3, 8.0), 'film_grain_clump': (0.0, 1.0),
+    'film_grain_chroma': (0.0, 1.0), 'film_dust_size': (0.3, 8.0),
+    'film_dust_negative': (0.0, 1.0), 'film_dust_cel': (0.0, 1.0),
+    'film_hairs': (0.0, 1.0), 'film_hair_length': (10.0, 600.0),
+    'film_hair_width': (0.5, 6.0), 'film_hair_hold': (1, 240),
+    'film_scratches': (0.0, 1.0), 'film_scratch_width': (0.5, 8.0),
+    'film_scratch_hold': (1, 2000), 'film_reel': (0.0, 22.0),
+    'film_weave': (0.0, 8.0), 'film_dust': (0.0, 1.0),
+    'film_grain': (0.0, 1.0), 'film_flicker': (0.0, 1.0),
+    'film_hold': (1, 4), 'film_halftone': (0.0, 1.0),
+    'film_halftone_pitch': (2.0, 40.0), 'film_misregister': (0.0, 6.0),
+    'film_bleed': (0.0, 4.0),
+    # R233: the painted background road
+    'bg_paint': (0.0, 1.0), 'bg_stroke_size': (2.0, 200.0),
+    'bg_stroke_length': (1.0, 8.0), 'bg_angle': (-180.0, 180.0),
+    'bg_spread': (0.0, 1.0), 'bg_bristles': (0.0, 1.0),
+    'bg_variation': (0.0, 1.0), 'bg_smooth': (0.0, 12.0),
+    'bg_paper': (0.0, 1.0), 'setback': (0.0, 16.0),
+    'setback_start': (0.0, 10000.0), 'setback_range': (0.01, 10000.0),
+    'volume_steps': (4, 256),
+    'fog_bands': (0, 16),
     'outline_opacity': (0.0, 1.0),
     'outline_depth_threshold': (0.0005, 1.0),
     'outline_normal_angle': (5.0, 179.0),
@@ -352,6 +420,57 @@ LABELS = {
     'outline_normals': "Creases",
     'outline_normal_angle': "Crease Angle",
     'outline_over_sky': "Ink Silhouettes",
+    'outline_marked': "Marked Edges",
+    'ink_style': "Line Style", 'ink_reference_height': "True To Height",
+    'ink_taper': "Depth Taper", 'ink_interior_scale': "Interior Scale",
+    'ink_weight_noise': "Weight Noise", 'ink_weight_scale': "Weight Scale",
+    'ink_shadow_side': "Shadow Side", 'ink_boil': "Boil",
+    'ink_boil_fps': "Boil Rate", 'ink_boil_scale': "Boil Scale",
+    'ink_pencil_strokes': "Pencil Strokes", 'ink_pencil_spread': "Pencil Spread",
+    'ink_grain': "Grain", 'ink_color_mode': "Line Colour",
+    'ink_fill_darken': "Fill Darken", 'ink_color2': "Ink Colour 2",
+    'ink_end_taper': "End Taper", 'ink_end_length': "End Length",
+    'ink_roughness': "Roughness", 'ink_roughness_scale': "Roughness Scale",
+    'ink_drift': "Drift", 'ink_gaps': "Gaps",
+    'ink_texture': "Line Texture", 'ink_texture_amount': "Texture Amount",
+    'outline_form': "Form Lines", 'outline_form_threshold': "Form Threshold",
+    'outline_shadow': "Shadow Lines", 'outline_shadow_level': "Shadow Level",
+    'outline_tone': "Tone Lines", 'outline_tone_threshold': "Tone Threshold",
+    'ink_isophote': "Light Weight", 'ink_isophote_range': "Light Range",
+    'ink_smooth': "Smooth", 'ink_pressure': "Pressure",
+    'ink_overshoot': "Overshoot", 'ink_anchor': "Anchor",
+    'film_grade': "Film Stock", 'film_grade_amount': "Stock Amount",
+    'film_process': "Colour Process", 'film_process_amount': "Process Amount",
+    'film_exposure': "Exposure", 'film_gamma': "Print Gamma",
+    'film_density': "Dye Density", 'film_filters': "Filter Sharpness",
+    'film_dye_purity': "Dye Purity",
+    'film_key': "Silver Key", 'film_halation': "Halation",
+    'film_halation_radius': "Halation Radius", 'film_register': "Register",
+    'film_grain_size': "Grain Size", 'film_grain_clump': "Grain Clump",
+    'film_grain_chroma': "Grain Chroma", 'film_dust_size': "Dust Size",
+    'film_dust_negative': "Negative Dust", 'film_dust_cel': "Cel Dust",
+    'film_hairs': "Hairs", 'film_hair_length': "Hair Length",
+    'film_hair_width': "Hair Width", 'film_hair_hold': "Hair Hold",
+    'film_scratches': "Scratches", 'film_scratch_width': "Scratch Width",
+    'film_scratch_hold': "Scratch Hold", 'film_scratch_side': "Scratch Side",
+    'film_reel': "Reel Length",
+    'film_softness': "Softness", 'film_weave': "Gate Weave",
+    'film_dust': "Dust & Hairs", 'film_grain': "Grain",
+    'film_flicker': "Flicker", 'film_hold': "Shoot On",
+    'film_halftone': "Halftone", 'film_halftone_pitch': "Halftone Pitch",
+    'film_misregister': "Paint Misregistration", 'film_bleed': "Paint Bleed",
+    # R233: the painted background road
+    'bg_paint': "Brush Strokes", 'bg_stroke_size': "Stroke Size",
+    'bg_stroke_length': "Stroke Length", 'bg_direction': "Stroke Direction",
+    'bg_angle': "Stroke Angle", 'bg_spread': "Spread",
+    'bg_bristles': "Bristles", 'bg_variation': "Variation",
+    'bg_smooth': "Base Smoothing", 'bg_paper': "Board",
+    'setback': "Setback", 'setback_start': "Setback Start",
+    'setback_range': "Setback Range", 'setback_sky': "Setback the Sky",
+    'ink_gradient': "Gradient",
+    'volume_steps': "Volume Steps",
+    'volume_shadows': "Volume Shadows",
+    'fog_bands': "Fog Bands",
     'wire_color': "Wire Colour", 'wire_mode': "Edges",
     'wire_angle': "Crease Angle",
     'pass_depth': "Depth", 'pass_normal': "Normal",
@@ -366,7 +485,8 @@ DESCRIPTIONS = {
                   "actually used, instead of dialling four numbers",
     'resolution_x': "Width of the rendered frame in pixels. Period software "
                     "lived at 320-800; the engine goes as high as you like",
-    'resolution_y': "Height of the rendered frame in pixels",
+    'resolution_y': "Height of the rendered frame in pixels. With the "
+                    "pixel aspect pair this sets the picture's true shape",
     'pixel_aspect_x': "Horizontal pixel stretch. Broadcast and mode-13h "
                       "formats used non-square pixels; 1.0 is square",
     'pixel_aspect_y': "Vertical pixel stretch. Set with X to reproduce a "
@@ -576,6 +696,10 @@ DESCRIPTIONS = {
     'fog_vertex': "Compute fog per vertex and interpolate, as fixed-"
                   "function pipelines did -- visible banding on long "
                   "triangles, which is the point",
+    'fog_bands': "Quantize the fog into this many hard depth steps -- "
+                 "distance reads as flat painted planes, the anime "
+                 "background trick (and the PS1's own coarse fog "
+                 "tables). 0 keeps the fog smooth",
     'fog_height': "Limit fog to below a world height, thinning with "
                   "altitude -- valley mist instead of uniform soup",
     'fog_height_top': "World height where height fog has fully thinned "
@@ -594,14 +718,18 @@ DESCRIPTIONS = {
                     "slower; low counts show the period's boxy bloom",
     'star_filter': "Cross-screen star spikes on bright points, the "
                    "camera-filter look pasted over renders of the era",
-    'star_points': "How many spikes each star throws",
-    'star_length': "Length of the spikes in pixels",
+    'star_points': "How many spikes each star throws. 4 is the classic "
+                   "cross-screen filter; 6 and 8 the denser gauzes",
+    'star_length': "Length of the spikes in pixels at output resolution "
+                   "-- longer reads as a heavier filter on the lens",
     'star_rotation': "Rotation of the whole star pattern, in degrees",
-    'star_intensity': "Brightness of the star spikes",
+    'star_intensity': "Brightness of the star spikes relative to the "
+                      "highlight that threw them",
     'lens_flare': "Draw a lens flare from the brightest light in frame -- "
                   "ghosts, streak and all. The single most period effect "
                   "there is",
-    'flare_intensity': "Overall strength of the flare elements",
+    'flare_intensity': "Overall strength of the flare elements -- glow, "
+                       "ghosts and streak all scale together from here",
     'flare_ghosts': "How many aperture ghosts march across the frame "
                     "opposite the light",
     'flare_streak': "Strength of the horizontal anamorphic streak",
@@ -646,8 +774,10 @@ DESCRIPTIONS = {
     'crt_mask_strength': "How visibly the phosphor mask dims the picture",
     'crt_bloom': "How much bright areas bleed into neighbouring "
                  "phosphors",
-    'crt_curvature': "Bulge of the simulated glass. 0 is flat",
-    'crt_vignette': "Darkening toward the tube's corners",
+    'crt_curvature': "Bulge of the simulated glass. 0 is flat; more bows "
+                     "the picture and its scanlines outward like a tube",
+    'crt_vignette': "Darkening toward the tube's corners, the way a real "
+                    "shadow-mask CRT fell off at its edges",
     'composite': "Push the frame through a simulated composite video "
                  "cable: colour bleed, ringing and dot crawl, the way "
                  "most people actually saw this era",
@@ -681,7 +811,8 @@ DESCRIPTIONS = {
                  "only marked/creased ones, or silhouette and folds",
     'wire_angle': "For angle-based wire modes: the crease angle in "
                   "degrees above which an edge is inked",
-    'wire_color': "Colour of the inked wire edges",
+    'wire_color': "Colour the wireframe's edges are inked in, drawn over "
+                  "whatever the surface renders beneath them",
     'wire_width': "Width of the inked edges, in output pixels",
     'outline': "Ink cartoon outlines over the frame, drawn from the "
                "renderer's own buffers -- silhouettes, material borders, "
@@ -711,6 +842,331 @@ DESCRIPTIONS = {
                             "gentler turns; 90 keeps ink to hard corners",
     'outline_over_sky': "Let the ink land on the background at object "
                         "silhouettes, not only on other surfaces",
+    'outline_marked': "Draw the edges YOU marked as interior ink lines: "
+                      "Freestyle edge marks, edges marked Sharp, and "
+                      "creased edges all draw, hidden-line-removed "
+                      "against the z-buffer -- the hand-inked interior "
+                      "detail a screen-space edge detector cannot find",
+    'ink_style': "How the line is drawn. Clean: a crisp even line, the "
+                 "trace machine and the xerox -- the 80s cel. Brush: a "
+                 "soft bleeding edge, ink from a brush on cel. Pencil: "
+                 "several offset strokes with grain, a sketch. Any style "
+                 "dial off its default moves the ink to the distance-field "
+                 "road, which anti-aliases the line",
+    'ink_reference_height': "0: line widths are internal pixels. N: widths "
+                            "are true to an N-line frame -- a width-2 line "
+                            "at 480 is a width-4 line at 960, so a 4K frame "
+                            "keeps the same line, not a hairline",
+    'ink_taper': "Thick near, thin far: the line's width follows distance "
+                 "from the camera -- 1 doubles the nearest line and thins "
+                 "the farthest to nothing, the brush inker's perspective. "
+                 "0 keeps every line its set width",
+    'ink_interior_scale': "Width of the interior lines -- creases, material "
+                          "breaks, marked edges -- relative to the "
+                          "silhouette. 0.5 is the classic thick-outer, "
+                          "thin-inner drawing; 1 is even",
+    'ink_weight_noise': "Thick-and-thin along the line, as the hand's "
+                        "pressure on a brush: the width wanders by up to "
+                        "this fraction of itself over Weight Scale pixels",
+    'ink_weight_scale': "The screen distance, in pixels, over which the "
+                        "Weight Noise wanders",
+    'ink_shadow_side': "Thicker on the shadow side: the line grows by up "
+                       "to this fraction where the surface turns away from "
+                       "the key lamp -- the underlit line of comics and "
+                       "some 80s anime",
+    'ink_boil': "The hand-traced wobble: the finished line is displaced by "
+                "a noise field up to this many pixels, and the field steps "
+                "at Boil Rate -- so the line boils frame to frame the way "
+                "cels traced by different hands did. 0 is still",
+    'ink_boil_fps': "How many times a second the boil field changes: 12 is "
+                    "on twos at 24 fps (the classic), 8 is on threes, 24 "
+                    "boils every frame, 0 holds one static wobble",
+    'ink_boil_scale': "The screen size, in pixels, of the boil's wobbles -- "
+                      "small for a nervous line, large for a slow drift",
+    'ink_pencil_strokes': "Pencil style: how many offset strokes make each "
+                          "line -- 2 is a doubled line, 4 a scribble",
+    'ink_pencil_spread': "Pencil style: how far, in pixels, the strokes "
+                         "scatter from the true line",
+    'ink_grain': "Per-pixel grain in the line's coverage -- the tooth of "
+                 "paper under pencil, the dry brush. 0 is solid ink",
+    'ink_color_mode': "Where the line's colour comes from: the ink colour, "
+                      "the fill it outlines darkened (the self-coloured "
+                      "line of hand-inked features and iro-trace anime), "
+                      "or a gradient to Ink Colour 2",
+    'ink_fill_darken': "From Fill: how much darker than the surface the "
+                       "line is -- 0 is the fill colour itself, 1 is black",
+    'ink_color2': "The Gradient line colour's far end -- lines blend "
+                  "from Line Colour to this along the gradient's axis",
+    # R231: the drawn line
+    'ink_end_taper': "The brush lifts and lands: the line thins toward every "
+                     "stroke end and junction -- where a contour stops, "
+                     "meets another or vanishes behind an object -- to 15 "
+                     "percent of its width at 1. Each end is found on the "
+                     "line itself, so a closed silhouette keeps its weight",
+    'ink_end_length': "How far from a stroke end the thinning reaches, in "
+                      "pixels (True To Height scales it)",
+    'ink_roughness': "Edge irregularity: three octaves of noise on the "
+                     "line's width, in PATCHES -- a slow field decides "
+                     "where the line gets rough, so it is occasionally "
+                     "rough rather than uniformly hairy",
+    'ink_roughness_scale': "The coarsest roughness scale in pixels; the two "
+                           "finer octaves halve it twice",
+    'ink_drift': "The hand drifts: the line's centre wanders in and out of "
+                 "the true contour by up to this many pixels, on the Weight "
+                 "Scale noise, the same on both sides of the line",
+    'ink_gaps': "Dry-brush skips: the line breaks where a slow noise runs "
+                "high, more readily where the stroke is already thin",
+    'ink_texture': "What the body of the line is made of: solid ink, the "
+                   "brush's streaks running along the stroke, or the "
+                   "charcoal stick's soft bloom and paper tooth",
+    'ink_texture_amount': "How strongly the texture works the lines over "
+                          "-- 0 leaves solid ink, 1 is the full breakup",
+    # R234: the inker's line (core/lines.py)
+    'outline_form': "Form lines: ink the valleys of the surface's facing -- "
+                    "the fold of a cheek, the crease of a concave form, the "
+                    "places an artist draws a line where no edge is (image-"
+                    "space suggestive contours). Interior lines, at the "
+                    "Interior Scale",
+    'outline_form_threshold': "How sharp a fold must be to earn a form line: "
+                              "lower finds gentler folds (and more of them), "
+                              "higher keeps only the deep creases",
+    'outline_shadow': "Shadow lines: ink the terminator -- the line where the "
+                      "key lamp's light stops on each object, at the Shadow "
+                      "Level -- as a cel inker traced the painter's shadow "
+                      "boundary. Interior lines, at the Interior Scale",
+    'outline_shadow_level': "Where the light stops, as the surface's cosine to "
+                            "the key lamp (0 is the geometric terminator, 0.1 "
+                            "a little into the light). Shared by Shadow "
+                            "Lines and the Light Weight",
+    'outline_tone': "Tone lines: ink wherever the shaded frame's tone steps "
+                    "-- the shadow's edge, a cast shadow's outline, a "
+                    "painted highlight's rim, a texture's edge -- found by a "
+                    "flow-guided difference of Gaussians along the local "
+                    "edge direction, one pixel wide on the dark side. "
+                    "Interior lines, at the Interior Scale",
+    'outline_tone_threshold': "The smallest tone step (as a fraction of the "
+                              "display range) that draws a tone line: lower "
+                              "finds softer gradations, higher keeps only "
+                              "the hard steps",
+    'ink_isophote': "The inker's thick-and-thin by the light (the isophote "
+                    "distance): each silhouette point walks inward along the "
+                    "surface toward where the light returns, and the line is "
+                    "as heavy as that walk is long -- heavy on a broad "
+                    "shadowed flank, a quarter width on the lit side and on "
+                    "thin features, heavier near than far. 0 is off, 1 the "
+                    "full effect",
+    'ink_isophote_range': "The walk, in pixels, that earns the full line "
+                          "width (True To Height scales it): shorter makes "
+                          "every shadowed edge heavy, longer reserves the "
+                          "heavy line for the broadest forms",
+    'ink_smooth': "Draw the line along a smoothed contour instead of the "
+                  "pixel staircase: the width, in pixels, of the smoothing "
+                  "-- a pen's curve on a low-polygon silhouette. Corners "
+                  "are kept sharp. 0 follows the pixels exactly",
+    'ink_pressure': "The pen bears down through a curve and pauses at a "
+                    "corner: the line grows by up to one and a half widths "
+                    "where the contour turns, a blob at every corner. 0 is "
+                    "an even hand",
+    'ink_overshoot': "Lines run past their ends, past the corner where two "
+                     "meet and across the junction where a chain arrives, "
+                     "by up to this many pixels, tapering -- the crossed "
+                     "corners of a 1940s drawing. About half the ends "
+                     "overshoot, each by its own hashed amount, fixed to "
+                     "the point on the surface so animation holds",
+    'ink_anchor': "Where the line's noises (weight, roughness, drift, gaps) "
+                  "live: on the screen, as a cel traced over a still "
+                  "camera, or on the surface under the line, so they "
+                  "travel with the object and a moving camera does not "
+                  "make them swim",
+    # R236: the colour process
+    'film_process': "The colour process the cel went through -- the camera's "
+                    "black-and-white records through their filters, the "
+                    "print's dyes with their own impurities, the silver key "
+                    "and the registration of the dye layers. Three-strip / "
+                    "successive exposure is the 1935-55 Technicolor cartoon; "
+                    "Two-colour is Cinecolor and the 1930s two-strip. Runs "
+                    "before the Film Stock grade, on the linear frame",
+    'film_process_amount': "How much of the printed frame shows over the "
+                           "render's own colour",
+    'film_exposure': "The timer's printer light, in stops: 0 prints a white "
+                     "cel clear; down prints the whole frame denser and "
+                     "darker (the rich print), up thinner and paler, the "
+                     "highlights running into the matrix's knee at clear",
+    'film_gamma': "The contrast of the negative-and-print chain: the slope "
+                  "of the straight line in log exposure. 1.5 is the "
+                  "theatre's dense print in a dark room; 1.2-1.3 is that "
+                  "print as a telecine shows it on a screen",
+    'film_density': "The dyes' maximum density (a black's D-max): higher "
+                    "prints deeper blacks and richer saturated colours; the "
+                    "silver key adds to it",
+    'film_filters': "The taking filters' sharpness: sharp-cutting filters "
+                    "separate the three records further than the eye "
+                    "separates the colours -- the three-strip's more-than-"
+                    "life saturation -- while overlapping filters (below 0) "
+                    "muddy them. A white cel exposes every record alike "
+                    "whatever the setting",
+    'film_dye_purity': "0 is the imbibition dyes as documented -- a cyan that "
+                       "also eats some green and blue, a magenta that eats "
+                       "red and blue, a yellow that eats green -- balanced "
+                       "so greys stay neutral and only colours shift (reds "
+                       "deep, greens toward cyan, blues toward purple); 1 is "
+                       "the process's ideal dyes with no cross-talk. The "
+                       "two-colour dyes' green absorptions are the process, "
+                       "not an impurity, and stay",
+    'film_key': "The silver key image printed from the green record under "
+                "the dyes (the later three-strip prints): extra density in "
+                "the shadows, deeper blacks, a harder look",
+    'film_halation': "Light scattered in the negative's base: each record's "
+                     "bright areas veil their surroundings in that record's "
+                     "own colour, over Halation Radius pixels",
+    'film_halation_radius': "How far, in pixels, the halation's veil reaches",
+    'film_register': "The dye-transfer registration error, in pixels: every "
+                     "dye layer but the first lands its own hair off, "
+                     "independently per frame, so every edge -- the ink "
+                     "line included -- carries a coloured fringe. The honest "
+                     "misregistration of a printed cartoon",
+    # R237: the print's wear
+    'film_grain_size': "The emulsion's grains' width in pixels at 1080 lines "
+                       "(scaled with the frame's height): grains finer than "
+                       "a pixel average down and show less, a pixel or wider "
+                       "each show whole",
+    'film_grain_clump': "The share of the grain that lies in clumps three "
+                        "grains wide -- a coarse, pushed stock; 0 is an even "
+                        "fine grain",
+    'film_grain_chroma': "How much each record's grain is its own: 0 is one "
+                         "sheet of grain for every record (a black-and-white "
+                         "negative's), 1 gives each record its own sheet -- "
+                         "coloured grain, the way three separate negatives "
+                         "print",
+    'film_dust_size': "The specks' mean radius in pixels at 1080 lines, "
+                      "scaled with the frame's height; each speck its own "
+                      "size and its own ragged edge",
+    'film_dust_negative': "The share of the dust that sat on the negative "
+                          "at printing: those specks blocked the printer "
+                          "light and print clear -- and on a three-strip "
+                          "print in one record's missing colour",
+    'film_dust_cel': "The share of the dust that sat on the cel or the "
+                     "platen glass under the rostrum camera: dark grey "
+                     "under the lights, and the same specks on every frame "
+                     "photographed from the same cel (a hold)",
+    'film_hairs': "Hairs caught in the projector gate: about this many in "
+                  "the gate at any time (up to four), each anchored at the "
+                  "aperture's edge and dancing for its run of frames",
+    'film_hair_length': "A hair's length in pixels at 1080 lines, scaled "
+                        "with the frame's height; each hair its own length "
+                        "around it",
+    'film_hair_width': "A hair's width in pixels at 1080 lines, scaled with "
+                       "the frame's height",
+    'film_hair_hold': "About how many frames a hair stays in the gate before "
+                      "it is gone; each hair its own run around it",
+    'film_scratches': "Scratches the transport left on the print: about this "
+                      "many running at any time (up to three), each the "
+                      "length of the frame at one place with a slow wander",
+    'film_scratch_width': "A scratch's width in pixels at 1080 lines, scaled "
+                          "with the frame's height",
+    'film_scratch_hold': "About how many frames a scratch runs before it "
+                         "ends; each scratch its own run around it",
+    'film_scratch_side': "Which side of the film the scratches are on: the "
+                         "emulsion side takes the dye away (a bright line -- "
+                         "neutral on a dye-transfer print, one dye's colour "
+                         "on a two-colour print, blue on a chromogenic one), "
+                         "the base side scatters the lamp (a dark line)",
+    'film_reel': "The reel's length in minutes, for the projectionist's cue "
+                 "marks: a scraped circle top right, four frames long, eight "
+                 "seconds before every reel's end (the motor cue) and again "
+                 "one second before it (the changeover). 0 is no cue marks",
+    # R230: the era looks
+    'film_grade': "The film stock the cel was photographed on, as a colour "
+                  "response in linear light: Technicolor's purified "
+                  "primaries and cyan shadows, a faded 70s Eastmancolor "
+                  "print, the 80s telecine, a VHS dub, or black-and-white "
+                  "panchromatic negative. Each entry's tooltip says what "
+                  "it does",
+    'film_grade_amount': "How much of the stock's response is applied: 1 "
+                         "the full grade, 0 none",
+    'film_softness': "The rostrum camera and optical printer's softness: "
+                     "a Gaussian of this many pixels (sigma) over the "
+                     "whole frame, before the print's dust and grain",
+    'film_weave': "Gate weave: the whole frame shifts by up to this many "
+                  "pixels per frame -- a slow wander plus a per-frame "
+                  "jitter, decided by the frame number and the seed, so "
+                  "a frame always weaves the same way",
+    'film_dust': "Dust, dirt and the odd hair on the print: a density -- "
+                 "1 is about forty specks on a 1080p frame, scaling with "
+                 "the frame's area -- placed by the frame's own hash so "
+                 "the sequence twinkles as a projected print does",
+    'film_grain': "Emulsion grain: a per-pixel, per-frame noise, seven "
+                  "parts luminance to three parts colour, multiplying the "
+                  "linear frame. The same frame is always the same sheet",
+    'film_flicker': "Projector flicker: the frame's exposure wanders by up "
+                    "to 12 percent at 1, per frame, by the frame's hash",
+    'film_hold': "Shoot on ones, twos or threes: 2 photographs every "
+                 "drawing for two frames, 3 for three. A held frame is "
+                 "not rendered again -- the key frame's picture is "
+                 "photographed again, film stages fresh (grain, dust, "
+                 "weave still move) -- so an animation on twos renders in "
+                 "half the time. Render the sequence from its start: a "
+                 "frame whose key frame was not rendered in this session "
+                 "renders fresh and says so",
+    'film_halftone': "Ben-Day / newsprint dots on the finished frame: four "
+                     "ink screens at the classic angles (cyan 15, magenta "
+                     "75, yellow 0, black 45 degrees), dots sized by each "
+                     "ink's coverage at the cell centre, laid "
+                     "subtractively. 1 is the full print, 0 none",
+    'film_halftone_pitch': "The dot screen's cell size in output pixels -- "
+                           "the distance between dot centres",
+    'film_misregister': "Paint misregistration: the painted colour slides "
+                        "by up to this many pixels per frame (by the "
+                        "frame's hash) BEFORE the ink lines are drawn, so "
+                        "the lines land where the drawing put them over "
+                        "paint that missed. A stylisation -- a real cel's "
+                        "paint sat behind its own ink; the printed "
+                        "cartoon's honest misregistration is the Colour "
+                        "Process's Register",
+    'film_bleed': "Paint bleed: the painted colour softens by this many "
+                  "pixels (sigma) before the ink lines are drawn, the paint "
+                  "soaking under and past the line; the lines stay crisp",
+    # R233: the painted background road
+    'bg_paint': "The painted background: how much of a Background "
+                "material's lit colour is laid down as brush strokes -- "
+                "particles fixed on the surface, drawn far to near as "
+                "strokes of a screen-constant size over an abstracted "
+                "base (Meier 1996). 0 leaves the surface as rendered",
+    'bg_stroke_size': "The brush's width in output pixels; strokes keep "
+                      "this size at any distance, the way a painter's "
+                      "brush does, and there are about as many as the "
+                      "frame needs at this spacing",
+    'bg_stroke_length': "How long a stroke is, as a multiple of its width",
+    'bg_direction': "Which way the strokes run: along the colour's "
+                    "contours, along the surface's silhouette, or at a "
+                    "fixed angle",
+    'bg_angle': "The stroke angle, degrees off horizontal -- the Fixed "
+                "Angle direction, and the fallback where a contour or a "
+                "silhouette has no direction",
+    'bg_spread': "How far each stroke may turn from its direction, up to "
+                 "forty-five degrees, by its own hash",
+    'bg_bristles': "Bristle streaks across each stroke, lighter and darker "
+                   "lines along its length",
+    'bg_variation': "How much each stroke lightens or darkens its colour "
+                    "by its own hash -- the impasto's value jitter",
+    'bg_smooth': "The abstracted base the strokes are painted over: a "
+                 "Gaussian of this many pixels on the Background pixels "
+                 "only (a cel beside them never bleeds in). It shows "
+                 "between strokes",
+    'bg_paper': "The board's tooth over the painting, in screen space",
+    'setback': "The Fleischer setback: the lens on the miniature set behind "
+               "the cel. The Background materials (and the sky) soften "
+               "by eye distance up to this many pixels (sigma) while the "
+               "cels stay sharp. 0 is off",
+    'setback_start': "The eye distance at which the setback's softness "
+                     "begins, in scene units",
+    'setback_range': "The distance over which the softness climbs from "
+                     "nothing to Setback",
+    'setback_sky': "Soften the sky at the setback's far end too -- the "
+                   "painted backdrop behind the miniature",
+    'ink_gradient': "What the Gradient runs along: distance from the "
+                    "camera, the height of the frame, or the key lamp's "
+                    "lit-to-shadow turn",
     'pass_depth': "Also deliver a Depth pass: each pixel's distance from "
                   "the camera, for compositing",
     'pass_normal': "Also deliver a Normal pass: the shading normal per "
@@ -786,6 +1242,17 @@ DESCRIPTIONS = {
     'spot_cone_falloff': "How fast scattering fades with distance from the "
                          "lamp. 2 is inverse-square; lower carries further",
     'spot_cone_reach': "How far a beam is drawn when nothing stops it",
+    'volume_steps': "March samples through every VOLUME CONTAINER -- a "
+                    "mesh whose material output links a Volume chain "
+                    "(Halcyon Volume, Principled Volume, Volume "
+                    "Scatter/Absorption). More steps resolve finer "
+                    "density detail; low counts band, and the banding "
+                    "is the era's own slicing artefact",
+    'volume_shadows': "Let lamps be shadowed INSIDE volume containers, "
+                      "through each lamp's own shadow road -- what "
+                      "carves god-rays and cloud self-shading out of "
+                      "the scattered light. Off is faster and evenly "
+                      "lit",
     'threads': "How many threads share the shading work. Measured on a 20-core "
                "machine this is neutral at best and about 3% slower at worst, "
                "because NumPy releases the interpreter lock only for large "
@@ -932,7 +1399,7 @@ DESCRIPTIONS = {
 }
 
 COLOR_FIELDS = {'global_ambient', 'fog_color', 'wire_color',
-                'override_color'}
+                'override_color', 'ink_color2'}
 
 
 #: dataclass fields that are DERIVED at export rather than edited as
@@ -1017,6 +1484,29 @@ class HalcyonSettings(PropertyGroup):
         items=_PRESET_ITEMS,
         default='DEFAULT',
     )
+    convert_detection: EnumProperty(
+        name="Shader Detection", default='AUTO',
+        items=(('AUTO', "Automatic",
+                "Pick the Halcyon model from each material's source "
+                "shader (Principled roughness becomes Glossiness, "
+                "Glass becomes Blinn, Toon becomes Toon...)"),
+               ('SET', "Set Shader",
+                "Force one chosen Halcyon model onto every converted "
+                "material, whatever it was before")),
+        description="How Convert to Halcyon chooses the shading model")
+    # a STATIC items list, built once at import from the same table the
+    # master node's own menu reads. Blender refuses an EnumProperty
+    # that has both an items CALLBACK and a default ("'default' cannot
+    # be set when 'items' is a function" -- the 1.62.0 enable failure),
+    # and a callback that imported the add-on by the literal name
+    # 'halcyon' would have broken anyway under an extension's mangled
+    # package name. Static items have neither problem, and the enum
+    # identifiers are stable strings safe to save in a .blend.
+    convert_model: EnumProperty(
+        name="Model", default='PHONG',
+        items=tuple((a, b, c) for a, b, c in _shading.MODEL_ITEMS),
+        description="The model every conversion gets when Shader "
+                    "Detection is Set Shader")
     ui_tab: EnumProperty(
         name="Tab", items=_items(
             ('SAMPLING', "Sampling", ""), ('SHADING', "Shading", ""),
@@ -1069,6 +1559,37 @@ class HalcyonMaterialSettings(PropertyGroup):
     use_override: BoolProperty(
         name="Halcyon Shader", default=False,
         description="Shade this material with a fixed model instead of its node tree")
+    strand: BoolProperty(
+        name="Hair Geometry", default=False,
+        description="This material dresses hair: the mesh's colour "
+                    "layer carries strand data (red = root-to-tip "
+                    "intercept, green = per-strand random, blue = "
+                    "length, alpha = thickness) and the Hair Info "
+                    "node reads it. Set automatically on fur-shell "
+                    "and exported-hair materials; set it by hand on "
+                    "any custom hair mesh built to the same layout")
+    alpha_mode: EnumProperty(
+        name="Alpha Mode",
+        items=[('BLEND', "Blend",
+                "Sorted, composited transparency layers -- for glass "
+                "and anything genuinely translucent. Every covered "
+                "pixel shades once per layer, so deep stacks cost "
+                "real time"),
+               ('CLIP', "Clip (Punch-Through)",
+                "The era's cut-out alpha test: the alpha is compared "
+                "against the threshold and the surface is either "
+                "fully there or fully absent. Its pixels resolve in "
+                "the z-buffer and shade ONCE -- no layers, no "
+                "sorting, no per-layer GPU passes -- which is why "
+                "fur, foliage, fences and cut-out sprites were cheap "
+                "on 1990s hardware. Fur Shells materials use this "
+                "automatically")],
+        default='BLEND',
+        description="How this material's alpha reaches the frame")
+    alpha_clip: FloatProperty(
+        name="Clip Threshold", default=0.5, min=0.0, max=1.0,
+        description="Alpha at or above this renders solid; below it, "
+                    "nothing renders at all")
     model: EnumProperty(name="Model", items=[(a, b, c) for a, b, c in MODEL_ITEMS],
                         default='PHONG')
     diffuse: FloatVectorProperty(name="Diffuse", subtype='COLOR', size=3,
@@ -1097,6 +1618,68 @@ class HalcyonMaterialSettings(PropertyGroup):
     shadeless: BoolProperty(name="Shadeless", default=False)
     cast_shadow: BoolProperty(name="Cast Shadows", default=True)
     receive_shadow: BoolProperty(name="Receive Shadows", default=True)
+    # R233: the cel or the painting
+    paint_mode: EnumProperty(
+        name="Paint Mode", default='CEL', items=_items(
+            ('CEL', "Cel",
+             "Painted on celluloid: flat paint under the ink line, as "
+             "every material was until now"),
+            ('BACKGROUND', "Background",
+             "The background painting: the lit colour laid down as "
+             "brush strokes fixed on the surface (Render Properties > "
+             "Display > Painted Backgrounds), no ink unless Ink says "
+             "Always, softened by the setback")),
+        description="Cel or background painting -- which department "
+                    "painted this surface")
+    # R220: per-material ink -- this material's say over the cartoon
+    # outline pass, which until now was one global render setting
+    ink_mode: EnumProperty(
+        name="Ink", default='INHERIT', items=_items(
+            ('INHERIT', "Follow Render Setting",
+             "Ink exactly as the render's Cartoon Outlines switch says "
+             "-- the pre-R220 behaviour"),
+            ('ON', "Always Ink",
+             "This material's edges draw ink even when the render "
+             "switch is off -- one inked character in a plain scene"),
+            ('OFF', "Never Ink",
+             "No ink ever lands on this material's pixels -- glass, "
+             "effects and skies stay clean in an inked scene")),
+        description="Whether the cartoon outline pass inks this "
+                    "material's pixels")
+    ink_use_color: BoolProperty(
+        name="Own Ink Colour", default=False,
+        description="Ink this material's edges with its own colour "
+                    "instead of the render's global Ink Colour -- "
+                    "coloured line art, per material")
+    ink_color: FloatVectorProperty(
+        name="Ink Colour", subtype='COLOR', size=3,
+        default=(0.0, 0.0, 0.0), min=0.0, max=1.0,
+        description="This material's line colour, used when Own Ink "
+                    "Colour is on")
+    ink_width: IntProperty(
+        name="Ink Width", default=0, min=0, max=8,
+        description="This material's line width in pixels; 0 inherits "
+                    "the render's global Ink Width")
+    # R239: the Guilty Gear line control -- the mesh's vertex colours
+    # steer the line per vertex, exactly the convention Arc System
+    # Works teaches for their inverted-hull outlines
+    ink_vc: EnumProperty(
+        name="Line Control", default='OFF', items=_items(
+            ('OFF', "Off",
+             "The line ignores the mesh's vertex colours"),
+            ('ARCSYS', "Vertex Colour (ArcSys)",
+             "The Guilty Gear convention on this material's vertex "
+             "colours: ALPHA multiplies the line's width -- 0.5 is the "
+             "width as set, 1 doubles it, 0 erases the line at that "
+             "vertex (a glove's rim, a sleeve's opening); BLUE holds "
+             "interior and marked lines back until the surface turns "
+             "toward its silhouette -- the nose line that only draws "
+             "in profile (their hull's depth push, read by facing). "
+             "Silhouettes always keep their line. Paint on the "
+             "mesh's first colour layer")),
+        description="Per-vertex say over this material's ink, painted "
+                    "in the mesh's vertex colours (Arc System Works' "
+                    "own outline convention)")
     wire: BoolProperty(name="Wireframe", default=False)
     wire_size: FloatProperty(name="Wire Size", default=1.0, min=0.1, max=16.0)
     # ---- Halo material (R191): Blender Internal's MA_TYPE_HALO ----
@@ -1132,7 +1715,8 @@ class HalcyonMaterialSettings(PropertyGroup):
                     "each vertex walks on from it, exactly 2.79")
     halo_rings: BoolProperty(
         name="Rings", default=False,
-        description="Concentric circles around each halo")
+        description="Concentric circles around each halo, placed by the "
+                    "seed hash -- BI's Rings flag")
     halo_ring_count: IntProperty(
         name="Ring Count", default=4, min=1, max=24,
         description="How many concentric circles each halo draws, "
@@ -1143,7 +1727,8 @@ class HalcyonMaterialSettings(PropertyGroup):
         description="2.79 took this from the material's Mirror colour")
     halo_lines: BoolProperty(
         name="Lines", default=False,
-        description="Random radial streaks through each halo")
+        description="Random radial streaks through each halo, directions "
+                    "drawn from the seed hash -- BI's Lines flag")
     halo_line_count: IntProperty(
         name="Line Count", default=12, min=1, max=250,
         description="How many radial streaks cross each halo, "
@@ -1154,7 +1739,8 @@ class HalcyonMaterialSettings(PropertyGroup):
         description="2.79 took this from the material's Specular colour")
     halo_star: BoolProperty(
         name="Star", default=False,
-        description="Pinch each halo into a star shape")
+        description="Pinch each halo into a star with the Star Tips "
+                    "point count -- BI's Star flag")
     halo_star_tips: IntProperty(
         name="Star Tips", default=4, min=3, max=50,
         description="Points on the star the halo is pinched into "
@@ -1453,7 +2039,8 @@ class HalcyonLightSettings(PropertyGroup):
                     "6 and 8 were the era's favourites")
     flare_rings: IntProperty(
         name="Rings", default=1, min=0, max=4,
-        description="Chromatic halo rings around the source")
+        description="How many chromatic halo rings circle the source, "
+                    "each fringed a different hue")
     flare_ghosts: IntProperty(
         name="Ghosts", default=6, min=0, max=12,
         description="Aperture ghosts along the line through frame centre")
@@ -1486,7 +2073,10 @@ class HalcyonLightSettings(PropertyGroup):
                     "sixth-generation consoles. A Spot throws it through its "
                     "cone like a slide projector (Splinter Cell's window "
                     "patterns); a Sun tiles it across the world as a cloud "
-                    "shadow. Point and Area lamps ignore it")
+                    "shadow; a Point wraps it around itself like a pierced "
+                    "lantern; an Area carries it on its face like a printed "
+                    "gel. The lamp's Angle/Radius slider softens the "
+                    "projection, exactly as a bigger source would")
     cookie_strength: FloatProperty(
         name="Projection Strength", default=1.0, min=0.0, max=1.0,
         description="Blend between plain light (0) and the fully projected "
@@ -1495,6 +2085,30 @@ class HalcyonLightSettings(PropertyGroup):
         name="Projection Scale", default=10.0, min=0.01,
         description="Sun only: world size of one tile of the projected "
                     "image, in scene units")
+    cookie_extend: EnumProperty(
+        name="Extension", default='AUTO', items=_items(
+            ('AUTO', "Era Default",
+             "What each projection always did: a Sun tiles its cloud "
+             "shadow, a Spot and an Area clamp at the image edge, a "
+             "Point wraps around its own seam"),
+            ('REPEAT', "Repeat", "Tile the image endlessly"),
+            ('EXTEND', "Extend", "The edge pixels continue forever"),
+            ('CLIP', "Clip",
+             "Outside the image there is nothing -- the projector's "
+             "gate: at full strength, no light past the slide")),
+        description="How the projected image continues past its edges")
+    cookie_filter: EnumProperty(
+        name="Interpolation", default='BILINEAR', items=_items(
+            ('BILINEAR', "Bilinear",
+             "The era's four-texel blend -- the default, and what every "
+             "projection used before this was a choice"),
+            ('CLOSEST', "Closest",
+             "One texel, hard edges -- the pixelated slide"),
+            ('CUBIC', "Cubic",
+             "A smooth sixteen-texel B-spline -- never overshoots, so "
+             "the projection cannot ring")),
+        description="How texels of the projected image are blended, "
+                    "identically on both devices")
 
 
 def _col(name, default, desc=''):
@@ -1650,6 +2264,19 @@ def water_preset_items(self=None, context=None):
     return _WATER_ITEMS
 
 
+def _painted_look_changed(self, context):
+    """R233: the Look menu writes its dials onto the world (Custom writes
+    nothing), exactly the Cartoon node's Era road."""
+    look = PAINTED_LOOKS.get(str(self.paint_look))
+    if not look:
+        return
+    for k, v in look.items():
+        try:
+            setattr(self, k, v)
+        except (TypeError, ValueError, AttributeError):
+            pass
+
+
 class HalcyonWorldSettings(PropertyGroup):
     sky_preset: EnumProperty(
         name="Sky Preset", items=sky_preset_items,
@@ -1673,11 +2300,18 @@ class HalcyonWorldSettings(PropertyGroup):
         ('BRYCE', "Bryce Atmosphere",
          "Layered sky: gradient, sun glow, haze band and a fractal cloud deck"),
         ('PHYSICAL', "Physical Sky", "Preetham analytic daylight"),
-        ('HDRI', "Image / HDRI", "Wrap an image around the scene")))
+        ('HDRI', "Image / HDRI", "Wrap an image around the scene"),
+        ('PAINTED', "Painted Backdrop",
+         "A background painting on a flat panel in front of the camera: "
+         "the gradient brushed in gouache, painted clouds, the board's "
+         "tooth, a watercolour granulation -- a pan crosses it, a tilt "
+         "climbs it, the way the animation stand's background did")))
     strength: FloatProperty(name="Strength", default=1.0, min=0.0, max=64.0)
     rotation: FloatProperty(name="Rotation", default=0.0, min=-6.2832, max=6.2832,
                             subtype='ANGLE',
-                            description="Spin the sky around the vertical axis")
+                            description="Spin the whole sky around the "
+                                        "vertical axis -- line the sun, "
+                                        "clouds and stars up with the shot")
     ambient: _col("Ambient", (0.0, 0.0, 0.0))
     ambient_level: FloatProperty(name="Ambient Level", default=1.0, min=0.0, max=8.0)
     exposure: FloatProperty(
@@ -1695,7 +2329,9 @@ class HalcyonWorldSettings(PropertyGroup):
     zenith: _col("Zenith", (0.10, 0.25, 0.65))
     ground_color: _col("Ground", (0.18, 0.15, 0.12))
     show_ground: BoolProperty(name="Ground Plane", default=False,
-                              description="Colour everything below the horizon")
+                              description="Draw the ground half of the dome: "
+                                          "everything below the horizon takes "
+                                          "the ground colouring instead of sky")
     horizon_height: FloatProperty(name="Horizon Height", default=0.0,
                                   min=-1.0, max=1.0)
     gradient_falloff: FloatProperty(name="Falloff", default=1.0, min=0.01, max=8.0,
@@ -1704,6 +2340,76 @@ class HalcyonWorldSettings(PropertyGroup):
     blend_mode: EnumProperty(name="Blend", default='LINEAR', items=_items(
         ('LINEAR', "Linear", ""), ('SMOOTH', "Smooth", ""),
         ('SHARP', "Sharp", ""), ('EASE', "Ease", "")))
+
+    # ------------------------------------------------ R233: the painted sky
+    paint_look: EnumProperty(
+        name="Look", default='CUSTOM', items=_items(*PAINTED_LOOK_ITEMS),
+        update=_painted_look_changed,
+        description="A background department's sky, written onto the dials "
+                    "below when chosen (Custom writes nothing)")
+    paint_angle: FloatProperty(
+        name="Panel Direction", default=90.0, min=-360.0, max=360.0,
+        description="Where the painting stands, in degrees round from +X "
+                    "(90 = +Y, in front of Blender's default camera). Aim "
+                    "it at the camera; directions behind it get the plain "
+                    "gradient, the back of the stage")
+    paint_seed: IntProperty(name="Seed", default=0, min=0, max=9999,
+                            description="Random seed for the brushwork -- "
+                                        "another painting of the same sky, "
+                                        "every stroke falling differently")
+    paint_streaks: FloatProperty(
+        name="Streaks", default=0.35, min=0.0, max=1.0,
+        description="The brush's streaks across the gradient: value noise "
+                    "stretched along the stroke direction")
+    paint_streak_scale: FloatProperty(
+        name="Streak Scale", default=12.0, min=0.5, max=80.0,
+        description="How many streaks fit across 45 degrees of view -- "
+                    "higher is finer, tighter brushwork")
+    paint_streak_angle: FloatProperty(
+        name="Stroke Angle", default=0.0, min=-90.0, max=90.0,
+        description="The brush direction, degrees off horizontal")
+    paint_dabs: FloatProperty(
+        name="Dabs", default=0.0, min=0.0, max=1.0,
+        description="Impasto dabs over the streaks -- the Paint Strokes "
+                    "field on the panel. The costly part of the sky: about "
+                    "five times the rest")
+    paint_dab_scale: FloatProperty(name="Dab Scale", default=10.0, min=0.5,
+                                   max=60.0,
+                                   description="How many dabs fit across 45 "
+                                               "degrees of view -- higher is "
+                                               "smaller, busier impasto")
+    paint_clouds: FloatProperty(
+        name="Clouds", default=0.35, min=0.0, max=1.0,
+        description="Cloud coverage: how much of the deck the shapes fill")
+    paint_cloud_scale: FloatProperty(name="Cloud Scale", default=2.2,
+                                     min=0.2, max=12.0,
+                                     description="How many cloud shapes fit "
+                                                 "across 45 degrees of view -- "
+                                                 "lower is fewer, grander forms")
+    paint_cloud_softness: FloatProperty(
+        name="Cloud Softness", default=0.3, min=0.0, max=1.0,
+        description="The edge: 0 a dry brush's ragged edge, 1 an airbrush")
+    paint_cloud_color: _col("Cloud Colour", (0.97, 0.96, 0.93),
+                            "The lit top of a painted cloud, the colour "
+                            "the brush laid where the light falls")
+    paint_cloud_shadow: _col("Cloud Shadow", (0.58, 0.60, 0.70),
+                             "The shadowed underside of a painted cloud, "
+                             "mixed in by the cloud's own vertical shape")
+    paint_cloud_height: FloatProperty(
+        name="Cloud Height", default=0.05, min=-1.0, max=2.0,
+        description="Where the deck begins above the horizon, in tangent "
+                    "units (0 the horizon, 1 forty-five degrees up)")
+    paint_paper: FloatProperty(
+        name="Board", default=0.3, min=0.0, max=1.0,
+        description="The board's tooth showing through the paint")
+    paint_paper_scale: FloatProperty(
+        name="Board Scale", default=8.0, min=0.5, max=60.0,
+        description="The board's tooth and the granulation: cells across "
+                    "45 degrees of view")
+    paint_wash: FloatProperty(
+        name="Granulation", default=0.25, min=0.0, max=1.0,
+        description="Watercolour granulation: pigment settling into the "
+                    "tooth, as a pigment density on the colour")
 
     # ------------------------------------------------------ Bryce's Sky Lab
     sky_mode: EnumProperty(name="Sky Mode", default='CUSTOM', items=_items(
@@ -1805,7 +2511,9 @@ class HalcyonWorldSettings(PropertyGroup):
                             subtype='ANGLE')
     sun_intensity: FloatProperty(name="Sun Intensity", default=1.0, min=0.0, max=64.0)
     sun_glow: FloatProperty(name="Sun Glow", default=0.35, min=0.0, max=1.0,
-                            description="Width of the halo around the sun")
+                            description="Width of the halo hugging the sun "
+                                        "disc -- the bright inner glow before "
+                                        "the corona takes over")
     sun_disc: BoolProperty(name="Sun Disc", default=True)
 
     celestial: EnumProperty(name="Body", default='SUN', items=_items(
@@ -1855,7 +2563,9 @@ class HalcyonWorldSettings(PropertyGroup):
                     "sampled from the same noise so a shadow always lands "
                     "under a cloud")
     sun_corona: FloatProperty(name="Corona", default=1.0, min=0.0, max=4.0,
-                              description="Strength of the wide outer halo")
+                              description="Strength of the wide outer halo "
+                                          "far beyond the glow -- hazy "
+                                          "daylight skies wear more of it")
 
     haze_color: _col("Haze Colour", (0.82, 0.86, 0.92))
     haze_density: FloatProperty(name="Haze", default=0.45, min=0.0, max=1.0,
@@ -1918,7 +2628,9 @@ class HalcyonWorldSettings(PropertyGroup):
         description="Diameter of a star within its cell. Small values give "
                     "single-pixel points, which is what these looked like")
     star_twinkle: FloatProperty(name="Twinkle", default=0.0, min=0.0, max=1.0,
-                                description="Animated flicker, per star")
+                                description="Animated flicker, hashed per "
+                                            "star so each twinkles on its own "
+                                            "rhythm; 0 holds them all steady")
     old_stars: BoolProperty(
         name="Old Stars", default=False,
         description="Draw stars the pre-1.38 way: each star fills its whole "
@@ -2033,7 +2745,10 @@ class HalcyonWorldSettings(PropertyGroup):
                     "than as ground going away")
     ocean_wind_angle: FloatProperty(name="Wind Direction", default=0.6,
                                     min=-6.2832, max=6.2832, subtype='ANGLE',
-                                    description="Waves run mostly with the wind")
+                                    description="Compass direction the wind "
+                                                "blows from; the wave trains "
+                                                "run mostly with it, fanned "
+                                                "out by Spread")
     ocean_spread: FloatProperty(
         name="Spread", default=0.6, min=0.0, max=1.0,
         description="How far the shorter waves fan off the wind. 0 is a "
@@ -2047,7 +2762,9 @@ class HalcyonWorldSettings(PropertyGroup):
                     "the ground Scale, which is the chequerboard's and has "
                     "nothing to do with water")
     ocean_detail: IntProperty(name="Wave Detail", default=5, min=1, max=10,
-                              description="How many wave trains are summed")
+                              description="How many wave trains are summed. "
+                                          "More trains break the swell's "
+                                          "repetition; each costs a little")
     ocean_sparkle: FloatProperty(
         name="Horizon Shimmer", default=1.0, min=0.0, max=1.0,
         description="Where a pixel covers many waves, take the sample from a "
@@ -2194,7 +2911,8 @@ GROUP_DOCS = {
                          "filler",
         'emission': "Light the surface gives off by itself, unaffected by "
                     "any lamp -- the Self-Illumination of the period",
-        'emission_level': "Multiplier on the emission colour",
+        'emission_level': "Multiplier on the emission colour -- how far "
+                          "past its base shade the surface glows",
         'opacity': "How solid the surface is. Below 1 it composites "
                    "through the transparency mode the render settings "
                    "chose",
@@ -2287,20 +3005,23 @@ GROUP_DOCS = {
         'stratus_amplitude': "Contrast swing of the stratus layer about "
                              "its cover threshold",
         'comet_count': "How many comets streak the celestial sphere",
-        'comet_color': "Colour of the comet heads and tails",
+        'comet_color': "Colour of the comet heads and the tails they "
+                       "drag across the celestial sphere",
         'sun_elevation': "Height of the sun above the horizon, in "
                          "radians. Near 0 is sunset; 1.57 is overhead",
         'sun_rotation': "Compass direction of the sun, in radians",
         'sun_color': "Colour of the sun disc and the light it throws "
                      "into the sky model",
-        'sun_size': "Angular size of the visible sun disc",
+        'sun_size': "Angular size of the visible sun disc. The real sun "
+                    "spans about half a degree; bigger reads as cinema",
         'sun_intensity': "Brightness of the sun's contribution to the "
                          "dome",
         'sun_disc': "Whether the sun itself is drawn, or only its light",
         'celestial': "Master switch for the celestial layer: moon, "
                      "stars, comets",
         'moon_color': "Colour of the moon disc drawn on the night dome",
-        'moon_size': "Angular size of the moon disc",
+        'moon_size': "Angular size of the moon disc on the night dome; "
+                     "the real moon spans about half a degree",
         'sky_mid': "Custom Sky's middle colour stop, between horizon "
                    "and zenith",
         'sky_mid_height': "Where the middle stop sits between horizon "
@@ -2312,8 +3033,10 @@ GROUP_DOCS = {
                             "dome",
         'cloud_wind_angle': "Compass direction the cloud decks drift, "
                             "in radians",
-        'haze_color': "Colour of the horizon haze band",
-        'haze_height': "Vertical thickness of the haze band",
+        'haze_color': "Colour of the haze band hugging the horizon, "
+                      "lightening the dome where it meets the ground",
+        'haze_height': "Vertical thickness of the haze band -- how far "
+                       "up the dome the horizon's milkiness climbs",
         'fog_color': "Colour of the Bryce fog band at the horizon",
         'fog_height': "Vertical thickness of the Bryce fog band",
         'clouds': "Master switch for the cumulus cloud deck",
@@ -2331,25 +3054,37 @@ GROUP_DOCS = {
         'cloud_seed': "Random seed for the cloud pattern. Change it for "
                       "a different sky with the same settings",
         'stratus': "Master switch for the high thin stratus layer",
-        'stratus_color': "Colour of the stratus wisps",
-        'stratus_amount': "Coverage of the stratus layer",
-        'stratus_density': "How solid the stratus wisps read",
+        'stratus_color': "Colour of the high thin stratus wisps drawn "
+                         "over the dome",
+        'stratus_amount': "Coverage of the stratus layer: how much of "
+                          "the sky its thin wisps veil",
+        'stratus_density': "How solid the stratus wisps read against "
+                           "the sky -- low is a breath, high a sheet",
         'stratus_altitude': "Altitude of the stratus layer on the dome",
-        'stratus_scale': "Size of the stratus features",
-        'stratus_detail': "Noise octaves in the stratus pattern",
-        'stratus_sharpness': "Edge hardness of the stratus wisps",
+        'stratus_scale': "Size of the stratus features across the dome "
+                         "-- lower stretches them into long banners",
+        'stratus_detail': "Noise octaves in the stratus pattern. More "
+                          "is stringier and a little slower",
+        'stratus_sharpness': "Edge hardness of the stratus wisps: soft "
+                             "veils at 0, torn-paper streaks at 1",
         'rainbow': "Draw a rainbow opposite the sun, as Bryce could",
-        'rainbow_intensity': "Brightness of the rainbow arc",
-        'rainbow_width': "Angular width of the rainbow band",
+        'rainbow_intensity': "Brightness of the rainbow arc against the "
+                             "sky -- keep it faint to sit in the light",
+        'rainbow_width': "Angular width of the rainbow band -- the real "
+                         "bow spans about two degrees of sky",
         'rainbow_secondary': "Strength of the fainter, colour-reversed "
                              "outer bow",
         'stars': "Master switch for the star layer of night skies",
-        'star_density': "How many stars fill the sphere",
-        'star_brightness': "Brightness of the star points",
+        'star_density': "How many stars fill the celestial sphere -- "
+                        "from a handful of bright ones to a deep field",
+        'star_brightness': "Brightness of the star points against the "
+                           "night dome, before any twinkle plays on them",
         'nebula_color': "Colour of the faint nebula wash behind the "
                         "stars",
-        'nebula_scale': "Size of the nebula's billows",
-        'nebula_detail': "Noise octaves in the nebula wash",
+        'nebula_scale': "Size of the nebula wash's billows behind the "
+                        "stars -- lower is one broad band of colour",
+        'nebula_detail': "Noise octaves in the nebula wash. More folds "
+                         "finer filaments into the colour",
         'ground_albedo': "How much light the physical atmosphere's "
                          "ground bounces back into the sky",
         'ground_mode': "What the infinite ground plane is made of -- "
@@ -2359,15 +3094,19 @@ GROUP_DOCS = {
         'ground_scale': "Feature size of the ground material's pattern",
         'ground_color2': "The ground material's secondary colour, where "
                          "its pattern uses one",
-        'ocean_deep': "Water colour looking into deep water",
+        'ocean_deep': "Water colour looking straight into deep water, "
+                      "where the surface stops reflecting sky",
         'ocean_shallow': "Water colour near the surface and crests",
         'ocean_glitter_size': "Size of the sun-glitter sparkles on the "
                               "water",
-        'ocean_foam_color': "Colour of the foam along wave crests",
+        'ocean_foam_color': "Colour of the foam along the wave crests, "
+                            "brightening where the water breaks",
         'ocean_transparency': "How much the water lets the sky's "
                               "reflection give way to its own colour",
-        'ocean_choppiness': "How steep and broken the waves are",
-        'ocean_speed': "How fast the waves animate over frames",
+        'ocean_choppiness': "How steep and broken the waves are. Calm "
+                            "rollers at 0, whitecap-ready peaks at full",
+        'ocean_speed': "How fast the waves animate over frames -- a "
+                       "multiplier on the sea's clock; 0 freezes it",
         'env_image': "The image used as the world in HDRI mode",
         'env_mapping': "How the image wraps the sphere: equirectangular, "
                        "mirror ball, or screen-locked",

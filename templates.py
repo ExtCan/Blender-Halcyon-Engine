@@ -25,8 +25,421 @@ import bpy
 from bpy.props import EnumProperty
 from bpy.types import Menu, Operator
 
+from .core.shading import ANIME_STYLE_PRESETS, CARTOON_ERA_PRESETS
+
+
+def _cartoon_recipe(era, label, note, paint):
+    """R228: one Cartoon Shader template per era, generated FROM the
+    node's own era table so the shelf and the Era menu can never drift
+    apart -- the recipe drops the node with its era and shadow mode set
+    and every preset socket written explicitly (the template validator
+    pins them equal to the table)."""
+    preset = CARTOON_ERA_PRESETS[era]
+    inputs = {k: v for k, v in preset.items() if k != 'shadow_mode'}
+    inputs['Paint Color'] = paint
+    return {'label': label, 'category': 'SIMPLE', 'family': 'CARTOON',
+            'note': note,
+            'cartoon': {'era': era, 'shadow_mode': preset['shadow_mode']},
+            'inputs': inputs}
+
 # (model, {socket: value}, [(texture node, {props}, {socket: value}, target)])
 TEMPLATES = {
+    # ---------------------------------------------- R224: cel & anime
+    'CEL_SKIN': {
+        'label': "Cel Skin",
+        'category': 'SIMPLE',
+        'family': 'CEL',
+        'note': "The anime face trio: warm base, blush shadow, plum "
+                "second tone, tiny sharp highlight. Three tones on",
+        'anime': {'compat': 'GENERIC', 'tones': 'THREE'},
+        'inputs': {'Diffuse Color': (0.99, 0.83, 0.74, 1.0),
+                   'Shadow 1 Color': (0.95, 0.61, 0.55, 1.0),
+                   'Shadow 1 Threshold': 0.52,
+                   'Shadow 1 Softness': 0.02,
+                   'Shadow 2 Color': (0.74, 0.42, 0.52, 1.0),
+                   'Shadow 2 Threshold': 0.30,
+                   'Shadow 2 Softness': 0.03,
+                   'Specular Level': 0.35, 'Specular Size': 0.05,
+                   'Specular Sharpness': 0.02,
+                   'Rim Color': (1.0, 0.93, 0.85, 1.0),
+                   'Rim Amount': 0.25, 'Rim Power': 3.0,
+                   'Ambient': 0.35},
+    },
+    'CEL_CLOTH': {
+        'label': "Cel Cloth",
+        'category': 'SIMPLE',
+        'family': 'CEL',
+        'note': "Flat costume cloth: one soft-edged tone, no highlight "
+                "-- the band does all the work",
+        'anime': {'compat': 'GENERIC', 'tones': 'TWO'},
+        'inputs': {'Diffuse Color': (0.36, 0.45, 0.72, 1.0),
+                   'Shadow 1 Color': (0.55, 0.48, 0.80, 1.0),
+                   'Shadow 1 Threshold': 0.48,
+                   'Shadow 1 Softness': 0.06,
+                   'Specular Level': 0.0, 'Ambient': 0.3},
+    },
+    'CEL_METAL': {
+        'label': "Cel Metal",
+        'category': 'SIMPLE',
+        'family': 'CEL',
+        'note': "Anime armour: dark cool tones and one big razor "
+                "highlight -- the stepped gleam is the metal",
+        'anime': {'compat': 'GENERIC', 'tones': 'THREE'},
+        'inputs': {'Diffuse Color': (0.62, 0.66, 0.74, 1.0),
+                   'Shadow 1 Color': (0.42, 0.45, 0.60, 1.0),
+                   'Shadow 1 Threshold': 0.55,
+                   'Shadow 1 Softness': 0.02,
+                   'Shadow 2 Color': (0.25, 0.26, 0.42, 1.0),
+                   'Shadow 2 Threshold': 0.32,
+                   'Shadow 2 Softness': 0.02,
+                   'Specular Color': (1.0, 1.0, 1.0, 1.0),
+                   'Specular Level': 1.0, 'Specular Size': 0.28,
+                   'Specular Sharpness': 0.02,
+                   'Rim Amount': 0.35, 'Rim Power': 2.2,
+                   'Ambient': 0.3},
+    },
+    'CEL_ARCSYS': {
+        'label': "Cel ArcSys Starter",
+        'category': 'SIMPLE',
+        'family': 'CEL',
+        'note': "ArcSys mode armed: wire the game's ILM map into Game "
+                "Texture and its SSS map into Detail Texture and the "
+                "channels mean what they meant at home",
+        'anime': {'compat': 'ARCSYS', 'tones': 'TWO',
+                  'use_vertex_ao': True},
+        'inputs': {'Diffuse Color': (0.85, 0.82, 0.80, 1.0),
+                   'Shadow 1 Color': (0.62, 0.55, 0.68, 1.0),
+                   'Shadow 1 Threshold': 0.5,
+                   'Shadow 1 Softness': 0.02,
+                   'Specular Level': 0.6, 'Ambient': 0.3},
+    },
+    'CEL_GENSHIN': {
+        'label': "Cel HoYo Starter",
+        'category': 'SIMPLE',
+        'family': 'CEL',
+        'note': "GENSHIN mode armed: wire the character lightmap into "
+                "Game Texture -- and the packed ramp texture into "
+                "Shadow Ramp, where the lightmap's alpha (the material "
+                "id) picks each region's row by itself",
+        'anime': {'compat': 'GENSHIN', 'tones': 'TWO',
+                  'emission_alpha': True},
+        'inputs': {'Diffuse Color': (0.90, 0.86, 0.84, 1.0),
+                   'Shadow 1 Color': (0.72, 0.58, 0.62, 1.0),
+                   'Shadow 1 Threshold': 0.5,
+                   'Shadow 1 Softness': 0.03,
+                   'Specular Level': 0.5, 'Ambient': 0.35,
+                   # emission waits for the texture: alpha-is-emission
+                   # over an UNWIRED base (alpha 1) would glow the
+                   # whole surface -- raise it once the maps are in
+                   'Emission Strength': 0.0},
+    },
+    # ---------------------------------------------- R229: the 80s anime
+    'CEL_80S_HAIR': {
+        'label': "Cel 80s Hair",
+        'category': 'SIMPLE',
+        'family': 'CEL',
+        'note': "The OVA-era hair: two hard tones, the angel-ring shine "
+                "band waving across the crown with a thinner second "
+                "band, iro-trace lines in the hair's own tone",
+        'anime': {'compat': 'GENERIC', 'tones': 'TWO',
+                  'line_source': 'IRO'},
+        'inputs': {'Diffuse Color': (0.36, 0.30, 0.62, 1.0),
+                   'Shadow 1 Color': (0.58, 0.46, 0.74, 1.0),
+                   'Shadow 1 Threshold': 0.5,
+                   'Shadow 1 Softness': 0.01,
+                   'Specular Level': 0.0, 'Ambient': 0.3,
+                   'Hair Shine': 0.9,
+                   'Hair Shine Color': (0.95, 0.94, 1.0, 1.0),
+                   'Hair Shine Height': 0.76, 'Hair Shine Width': 0.07,
+                   'Hair Shine Wave': 0.035, 'Hair Shine Waves': 7.0,
+                   'Hair Shine Softness': 0.01,
+                   'Hair Shine Second': 0.13,
+                   'Shadow Smoothing': 0.35,
+                   'Line Darken': 0.6},
+    },
+    'CEL_80S_SKIN': {
+        'label': "Cel 80s Skin",
+        'category': 'SIMPLE',
+        'family': 'CEL',
+        'note': "The OVA-era face: one hard warm tone with an airbrushed "
+                "gradation against its edge, rounded shadow shapes, "
+                "iro-trace lines in the skin's own tone",
+        'anime': {'compat': 'GENERIC', 'tones': 'TWO',
+                  'airbrush_side': 'LIT', 'line_source': 'IRO'},
+        'inputs': {'Diffuse Color': (0.99, 0.85, 0.74, 1.0),
+                   'Shadow 1 Color': (0.90, 0.62, 0.56, 1.0),
+                   'Shadow 1 Threshold': 0.5,
+                   'Shadow 1 Softness': 0.015,
+                   'Specular Level': 0.0, 'Ambient': 0.35,
+                   'Airbrush': 0.7,
+                   'Airbrush Color': (0.92, 0.66, 0.62, 1.0),
+                   'Airbrush Width': 0.3,
+                   'Shadow Smoothing': 0.3,
+                   'Line Darken': 0.5},
+    },
+    # ---------------------------------------------- R238: the cel's light
+    'CEL_CAMERA_KEY': {
+        'label': "Cel Camera Key",
+        'category': 'SIMPLE',
+        'family': 'CEL',
+        'note': "The drawing's light: one key fixed to the camera from the "
+                "screen's upper left wherever the camera goes, the hair's "
+                "and the chin's shadows marched in the frame, a crisp depth "
+                "rim on the lit edge. Turn the sun's shadow off for "
+                "shadows that agree with the key",
+        'anime': {'compat': 'GENERIC', 'tones': 'TWO',
+                  'light_source': 'CAMERA', 'rim_mode': 'SCREEN',
+                  'rim_side': 'LIT'},
+        'inputs': {'Diffuse Color': (0.99, 0.84, 0.74, 1.0),
+                   'Shadow 1 Color': (0.92, 0.62, 0.58, 1.0),
+                   'Shadow 1 Threshold': 0.5,
+                   'Shadow 1 Softness': 0.015,
+                   'Specular Level': 0.0, 'Ambient': 0.35,
+                   'Light Azimuth': 35.0, 'Light Elevation': 30.0,
+                   'Screen Shadow': 1.0, 'Screen Shadow Length': 24.0,
+                   'Rim Color': (1.0, 0.97, 0.92, 1.0),
+                   'Rim Amount': 0.6, 'Rim Width': 3.0,
+                   'Shadow Smoothing': 0.3},
+    },
+    'CEL_ANIME_FACE': {
+        'label': "Cel Anime Face",
+        'category': 'SIMPLE',
+        'family': 'CEL',
+        'note': "The anime face rule: the face shaded as one plane facing "
+                "the viewer (Shadow Smoothing toward the camera), lit by "
+                "the camera key, with only the hair's and the nose's "
+                "shadows on it -- marched from the frame's depth",
+        'anime': {'compat': 'GENERIC', 'tones': 'TWO',
+                  'light_source': 'CAMERA', 'smooth_shape': 'CAMERA'},
+        'inputs': {'Diffuse Color': (0.99, 0.86, 0.78, 1.0),
+                   'Shadow 1 Color': (0.93, 0.66, 0.62, 1.0),
+                   'Shadow 1 Threshold': 0.5,
+                   'Shadow 1 Softness': 0.01,
+                   'Specular Level': 0.0, 'Ambient': 0.35,
+                   'Light Azimuth': 25.0, 'Light Elevation': 20.0,
+                   'Screen Shadow': 1.0, 'Screen Shadow Length': 16.0,
+                   'Shadow Smoothing': 0.85},
+    },
+    # R239: the SDF face -- the drawn terminator, from the Xrd study
+    'CEL_SDF_FACE': {
+        'label': "Cel SDF Face",
+        'category': 'SIMPLE',
+        'family': 'CEL',
+        'note': "The modern anime face: the terminator is DRAWN in a "
+                "map and sweeps with the key's angle about the head's "
+                "own frame, never found on the normals. A spherical "
+                "gradient stands in for the game's face SDF here -- "
+                "link the game's own map into Face Shadow (SDF) for "
+                "the real thing (Guilty Gear's and the HoYo titles' "
+                "convention, mirrored across the face's centre line)",
+        'anime': {'compat': 'GENERIC', 'tones': 'TWO',
+                  'light_source': 'CAMERA', 'face_forward': 'NEG_Y',
+                  'face_up': 'POS_Z'},
+        'textures': [{'node': 'HALCYON_GradientNode',
+                      'props': {'shape': 'SPHERICAL', 'easing': 'SMOOTH'},
+                      'inputs': {'Center': (0.5, 0.45, 0.0),
+                                 'Scale': 1.3},
+                      'output': 'Fac', 'target': 'Face Shadow (SDF)'}],
+        'inputs': {'Diffuse Color': (0.99, 0.86, 0.78, 1.0),
+                   'Shadow 1 Color': (0.93, 0.66, 0.62, 1.0),
+                   'Shadow 1 Threshold': 0.5,
+                   'Shadow 1 Softness': 0.02,
+                   'Specular Level': 0.0, 'Ambient': 0.35,
+                   'Light Azimuth': 35.0, 'Light Elevation': 25.0},
+    },
+    # ---------------------------------------------- R228: cartoon eras
+    'CARTOON_GOLDEN': _cartoon_recipe(
+        'GOLDEN_40S', "Cartoon Golden Age",
+        "Feature-era paint under a transparent shadow cel: a partial "
+        "darkening with a faintly airbrushed edge and rounded forms. "
+        "Pair with the Brush ink style",
+        (0.96, 0.86, 0.72, 1.0)),
+    'CARTOON_UPA': _cartoon_recipe(
+        'UPA_50S', "Cartoon UPA Modern",
+        "Graphic 1950s flat colour: a bold contrasting second paint "
+        "for the shadow, hard-edged, shapes simplified toward the form",
+        (0.98, 0.62, 0.20, 1.0)),
+    'CARTOON_XEROX': _cartoon_recipe(
+        'XEROX_60S', "Cartoon Xerox Era",
+        "Muted 1960s tones: a desaturated painted shadow, hard-edged. "
+        "Pair with the Pencil ink style for the xeroxed line",
+        (0.72, 0.68, 0.60, 1.0)),
+    'CARTOON_SATURDAY': _cartoon_recipe(
+        'SATURDAY_70S', "Cartoon Saturday Morning",
+        "Limited television animation: flat paint and nothing else -- "
+        "no shadow tone, no highlight",
+        (0.35, 0.55, 0.85, 1.0)),
+    'CARTOON_FEATURE_90S': _cartoon_recipe(
+        'FEATURE_90S', "Cartoon 90s Feature",
+        "Digital ink-and-paint: a soft-edged painted shadow, rounded "
+        "forms and a small painted highlight dot",
+        (0.85, 0.35, 0.40, 1.0)),
+    'CARTOON_TV_90S': _cartoon_recipe(
+        'TV_90S', "Cartoon 90s TV",
+        "The high-contrast television look: a deep painted shadow "
+        "pushed onto the lit side, hard-edged, no highlight",
+        (0.55, 0.55, 0.62, 1.0)),
+    # R240: the ends of the century
+    'CARTOON_NOIR_40S': _cartoon_recipe(
+        'NOIR_40S', "Cartoon Wartime Noir",
+        "The dark 40s theatrical short: a deep transparent shadow "
+        "pass pushed onto the lit side, dead hard, forms rounded. "
+        "Made for a hard side key and dark paints",
+        (0.46, 0.50, 0.62, 1.0)),
+    'CARTOON_FLAT_10S': _cartoon_recipe(
+        'FLAT_10S', "Cartoon Modern Flat",
+        "The modern flat TV cartoon: one barely-darker cool tone in "
+        "a small shadow region over heavily simplified forms. Pair "
+        "with a thin, dead-even line",
+        (0.99, 0.72, 0.34, 1.0)),
+    # R242: the Max study -- Ink 'n Paint at its own defaults, the light
+    # blue Max painted every new Ink 'n Paint material
+    'CARTOON_INK_N_PAINT': _cartoon_recipe(
+        'INK_N_PAINT', "Ink 'n Paint (3ds Max)",
+        "3ds Max's Ink 'n Paint at its defaults: the Lighted light blue, "
+        "the Shaded tone at 70 percent, two paint levels, no highlight. "
+        "Set the material's ink to 2-4 pixels for Max's Ink Width",
+        (0.60, 0.72, 0.87, 1.0)),
+    # R240: the OVA glamour pass, generated FROM the Anime Shader's
+    # style table so the shelf and the Style menu can never drift
+    'ANIME_OVA_80S': {
+        'label': "Anime 80s OVA",
+        'category': 'SIMPLE',
+        'family': 'CEL',
+        'note': "The video market's richest cel dressing: two kage "
+                "tones, a Fresnel rim as the painted edge-light, a "
+                "double hair shine and airbrush against both sides of "
+                "the shadow edge -- the Anime Shader's 80s OVA style "
+                "as a one-click material",
+        'anime': {'compat': 'GENERIC', 'tones': 'THREE',
+                  'airbrush_side': 'BOTH'},
+        'inputs': dict(
+            {k: v for k, v in ANIME_STYLE_PRESETS['OVA_80S'].items()
+             if k != '__props'},
+            **{'Diffuse Color': (0.93, 0.76, 0.66, 1.0),
+               'Specular Color': (1.0, 0.97, 0.92, 1.0)}),
+    },
+    # R238: the feature cel's rounded rendering under the drawing's own key
+    'CARTOON_ROUNDED_FEATURE': dict(
+        _cartoon_recipe(
+            'GOLDEN_40S', "Cartoon Rounded Feature",
+            "The feature cel rounded: the Golden Age paint and shadow cel "
+            "with an airbrushed gradation against the shadow edge, lit by "
+            "one key fixed to the camera, the contact shadows drawn in the "
+            "frame",
+            (0.96, 0.62, 0.30, 1.0)),
+        cartoon={'era': 'GOLDEN_40S', 'shadow_mode': 'TRANSPARENT',
+                 'light_source': 'CAMERA', 'airbrush_side': 'LIT'},
+        inputs=dict(
+            {k: v for k, v in CARTOON_ERA_PRESETS['GOLDEN_40S'].items()
+             if k != 'shadow_mode'},
+            **{'Paint Color': (0.96, 0.62, 0.30, 1.0),
+               'Light Azimuth': 35.0, 'Light Elevation': 30.0,
+               'Screen Shadow': 0.8, 'Screen Shadow Length': 24.0,
+               'Airbrush': 0.6, 'Airbrush Color': (0.98, 0.72, 0.52, 1.0),
+               'Airbrush Width': 0.3})),
+    # ---------------------------------------------- R224: volumes
+    'VOL_FOG_BANK': {
+        'label': "Fog Bank (Container)",
+        'category': 'SIMPLE',
+        'family': 'VOLUME',
+        'note': "Drop on a box and the box IS the fog: marched "
+                "absorption and scatter, the scene's own lamps and "
+                "shadows inside it",
+        'volume': True,
+        'inputs': {'Density': 0.35,
+                   'Color': (0.82, 0.84, 0.88, 1.0)},
+    },
+    'VOL_GOD_RAYS': {
+        'label': "God Ray Chamber (Container)",
+        'category': 'SIMPLE',
+        'family': 'VOLUME',
+        'note': "Forward-scattering haze: back-light it with a "
+                "shadow-casting lamp and the shadows carve visible "
+                "rays through the box",
+        'volume': True,
+        'inputs': {'Density': 0.55, 'Anisotropy': 0.5,
+                   'Color': (0.85, 0.84, 0.80, 1.0)},
+    },
+    'VOL_CEL_FOG': {
+        'label': "Cel Fog (Container)",
+        'category': 'SIMPLE',
+        'family': 'VOLUME',
+        'note': "The stylized set: banded scatter, violet shadow tint "
+                "-- a shadowed volume takes a colour, never darkness",
+        'volume': True,
+        'inputs': {'Density': 0.5, 'Bands': 3.0,
+                   'Shadow Tint': (0.45, 0.25, 0.6, 1.0),
+                   'Tint Amount': 1.0,
+                   'Color': (0.85, 0.85, 0.9, 1.0)},
+    },
+    'VOL_EMBER_GLOW': {
+        'label': "Ember Glow (Container)",
+        'category': 'ADVANCED',
+        'family': 'VOLUME',
+        'note': "A Cells chain clumps the density and the emission "
+                "burns inside it -- the era's fire volume, no sim "
+                "needed",
+        'volume': True,
+        'inputs': {'Density': 0.8,
+                   'Color': (0.35, 0.22, 0.15, 1.0),
+                   'Emission Color': (1.0, 0.45, 0.14, 1.0),
+                   'Emission Strength': 1.6},
+        'textures': [{'node': 'HALCYON_CellsNode',
+                      'props': {},
+                      'inputs': {'Scale': 3.0},
+                      'output': 'Fac',
+                      'target': 'Density'}],
+    },
+    # ---------------------------------------------- R225: models + shapes
+    'VOL_FIRE': {
+        'label': "Fire, Combustion (Container)",
+        'category': 'ADVANCED',
+        'family': 'VOLUME',
+        'note': "3D Studio's Fire Effect on the Combustion model: a "
+                "turbulent Bozo chain shapes the flames, sparse tongues "
+                "burn the outer orange, the dense core the inner yellow "
+                "-- self-lit, additive, on the mesh's own shape",
+        'volume': {'model': 'COMBUSTION', 'shape': 'MESH'},
+        'inputs': {'Density': 1.4,
+                   'Color': (1.0, 0.28, 0.04, 1.0),
+                   'Emission Color': (1.0, 0.92, 0.55, 1.0),
+                   'Absorption': 0.12,
+                   'Edge Threshold': 0.3, 'Edge Softness': 0.18},
+        'textures': [{'node': 'HALCYON_BozoNode',
+                      'props': {},
+                      'inputs': {'Scale': 2.5, 'Turbulence': 0.6},
+                      'output': 'Fac',
+                      'target': 'Density'}],
+    },
+    'VOL_MURK': {
+        'label': "Murky Air (Container)",
+        'category': 'SIMPLE',
+        'family': 'VOLUME',
+        'note': "POV-Ray's mie_murky media: thick dirty air that shows "
+                "every lamp as a tight halo and keeps the rest dim -- "
+                "the smoke-filled bar, the dungeon torch",
+        'volume': {'model': 'MURKY'},
+        'inputs': {'Density': 0.45,
+                   'Color': (0.72, 0.68, 0.62, 1.0)},
+    },
+    'VOL_VOXEL_CLOUD': {
+        'label': "Voxel Cloud (Container)",
+        'category': 'ADVANCED',
+        'family': 'VOLUME',
+        'note': "A Cells chain read on a 12-cube lattice: the blocky "
+                "voxel cloud of the era's grid volumetrics, cel-banded, "
+                "the sphere gizmo rounding it off",
+        'volume': {'model': 'HG', 'shape': 'SPHERE', 'voxels': 12},
+        'inputs': {'Density': 0.9, 'Bands': 4.0,
+                   'Edge Threshold': 0.35, 'Edge Softness': 0.08,
+                   'Color': (0.9, 0.9, 0.95, 1.0)},
+        'textures': [{'node': 'HALCYON_CellsNode',
+                      'props': {},
+                      'inputs': {'Scale': 2.0},
+                      'output': 'Fac',
+                      'target': 'Density'}],
+    },
     # ------------------------------------------------------------- simple
     'CHROME': {
         'label': "Chrome",
@@ -359,8 +772,8 @@ TEMPLATES = {
     'LEOPARD': {
         'label': "Leopard Print",
         'category': 'ADVANCED',
-        'note': "POV-Ray's leopard spots straight into the base colour, with "
-                "a soft fabric highlight",
+        'note': "Rosette print straight into the base colour -- broken dark "
+                "rings on tan with a soft fabric highlight",
         'model': 'BLINN_PHONG',
         'inputs': {'Specular Level': 0.15, 'Glossiness': 20.0},
         'textures': [{'node': 'HALCYON_LeopardNode',
@@ -390,6 +803,203 @@ TEMPLATES = {
         'textures': [{'node': 'HALCYON_StaticNode',
                       'inputs': {'Scale': 48.0},
                       'output': 'Color', 'target': 'Self-Illumination'}],
+    },
+
+    # ------------------------------------------- R232: the 2D media
+    # The hand's marks as ready materials. The drawings are SHADELESS
+    # (Constant) so nothing but the medium carries the tone, and their
+    # tone is the Screen Info Facing -- face-on paper, silhouettes dark --
+    # so a 3D form reads as a drawing at once on either device. Screen
+    # space puts the marks on the camera's paper. Boil is left at 0 (a
+    # still drawing); set it to 2 for the boiling drawings of a 40s short.
+    'MEDIA_HATCHED': {
+        'label': "Hatched Ink Drawing",
+        'category': 'ADVANCED',
+        'family': 'MEDIA',
+        'note': "Pen cross-hatching on the camera's paper, three layers "
+                "filling in toward the silhouettes: a Facing tone through "
+                "the Hatching converter, shadeless",
+        'model': 'CONSTANT',
+        'inputs': {'Specular Level': 0.0},
+        'textures': [{'node': 'HALCYON_HatchingNode',
+                      'props': {'space': 'SCREEN', 'layers': 3},
+                      'inputs': {'Scale': 60.0, 'Width': 0.4,
+                                 'Length': 5.0, 'Wobble': 0.6,
+                                 'Breaks': 0.25},
+                      'tone': 'FACING',
+                      'output': 'Color', 'target': 'Diffuse Color'}],
+    },
+    'MEDIA_PENCIL': {
+        'label': "Pencil Sketch",
+        'category': 'ADVANCED',
+        'family': 'MEDIA',
+        'note': "Graphite scribble on the camera's paper, two shallow "
+                "layers, the tooth showing through the light strokes",
+        'model': 'CONSTANT',
+        'inputs': {'Specular Level': 0.0},
+        'textures': [{'node': 'HALCYON_ScribbleNode',
+                      'props': {'space': 'SCREEN', 'layers': 2},
+                      'inputs': {'Scale': 45.0, 'Width': 0.3, 'Curl': 0.5,
+                                 'Pressure': 0.75, 'Grain': 0.6},
+                      'tone': 'FACING',
+                      'output': 'Color', 'target': 'Diffuse Color'}],
+    },
+    'MEDIA_CHARCOAL': {
+        'label': "Charcoal Study",
+        'category': 'ADVANCED',
+        'family': 'MEDIA',
+        'note': "Charcoal on toned paper, streaked and smudged, the form "
+                "filling toward its edges",
+        'model': 'CONSTANT',
+        'inputs': {'Specular Level': 0.0},
+        'textures': [{'node': 'HALCYON_CharcoalNode',
+                      'props': {'space': 'SCREEN'},
+                      'inputs': {'Scale': 5.0, 'Angle': 25.0, 'Grain': 0.6,
+                                 'Streak': 0.6, 'Smudge': 0.5,
+                                 'Color 1': (0.80, 0.76, 0.68, 1.0),
+                                 'Color 2': (0.10, 0.09, 0.09, 1.0)},
+                      'tone': 'FACING',
+                      'output': 'Color', 'target': 'Diffuse Color'}],
+    },
+    'MEDIA_STIPPLE': {
+        'label': "Stippled Ink",
+        'category': 'ADVANCED',
+        'family': 'MEDIA',
+        'note': "Pen stippling on the camera's paper, dots crowding toward "
+                "the silhouettes, a finer lattice closing the darks",
+        'model': 'CONSTANT',
+        'inputs': {'Specular Level': 0.0},
+        'textures': [{'node': 'HALCYON_StippleNode',
+                      'props': {'space': 'SCREEN'},
+                      'inputs': {'Scale': 120.0, 'Size': 0.65,
+                                 'Jitter': 0.85, 'Fine': 1.0},
+                      'tone': 'FACING',
+                      'output': 'Color', 'target': 'Diffuse Color'}],
+    },
+    'MEDIA_WASH': {
+        'label': "Ink Wash",
+        'category': 'ADVANCED',
+        'family': 'MEDIA',
+        'note': "Three indigo washes with pooled edges and granulation, "
+                "the darkest at the silhouettes -- a sumi-e brush pass",
+        'model': 'CONSTANT',
+        'inputs': {'Specular Level': 0.0},
+        'textures': [{'node': 'HALCYON_WashNode',
+                      'props': {'space': 'SCREEN', 'levels': 3},
+                      'inputs': {'Scale': 3.0, 'Pooling': 0.7,
+                                 'Granulation': 0.45, 'Bleed': 0.5},
+                      'tone': 'FACING',
+                      'output': 'Color', 'target': 'Diffuse Color'}],
+    },
+    'MEDIA_GOUACHE': {
+        'label': "Gouache Background",
+        'category': 'ADVANCED',
+        'family': 'MEDIA',
+        'note': "Brush dabs in the object's own space, bristled and "
+                "varied, over a warm canvas -- a painted background plane "
+                "for a 40s cel. Lit, so the set's lamps still fall on it",
+        'model': 'LAMBERT',
+        'inputs': {'Specular Level': 0.0, 'Ambient': 0.6},
+        'textures': [{'node': 'HALCYON_PaintStrokesNode',
+                      'inputs': {'Scale': 8.0, 'Angle': 20.0,
+                                 'Length': 2.6, 'Width': 0.85,
+                                 'Spread': 0.45, 'Bristles': 0.6,
+                                 'Variation': 0.35,
+                                 'Color 1': (0.80, 0.72, 0.58, 1.0),
+                                 'Color 2': (0.36, 0.48, 0.52, 1.0)},
+                      'output': 'Color', 'target': 'Diffuse Color'}],
+    },
+    # R235: media 2 -- the direction field, the indication, the crowd,
+    # the blender
+    'MEDIA_FORM_HATCHED': {
+        'label': "Form Hatching",
+        'category': 'ADVANCED',
+        'family': 'MEDIA',
+        'note': "Pen hatching that wraps the form: the strokes follow the "
+                "silhouette-parallel tangent (Direction: Form), twelve "
+                "coherent lane fields cross-faded, three layers filling in "
+                "toward the silhouettes on the camera's paper",
+        'model': 'CONSTANT',
+        'inputs': {'Specular Level': 0.0},
+        'textures': [{'node': 'HALCYON_HatchingNode',
+                      'props': {'space': 'SCREEN', 'layers': 3,
+                                'direction': 'FORM'},
+                      'inputs': {'Scale': 60.0, 'Width': 0.4,
+                                 'Length': 5.0, 'Wobble': 0.5,
+                                 'Breaks': 0.25},
+                      'tone': 'FACING',
+                      'output': 'Color', 'target': 'Diffuse Color'}],
+    },
+    'MEDIA_INDICATED': {
+        'label': "Indicated Hatching",
+        'category': 'ADVANCED',
+        'family': 'MEDIA',
+        'note': "Winkenbach's indication: the hatching is drawn only where "
+                "the form turns from the eye -- an inverted Facing feeds "
+                "Indication -- so the paper stays bare where the eye fills "
+                "the form in itself; strokes wrap the form",
+        'model': 'CONSTANT',
+        'inputs': {'Specular Level': 0.0},
+        'textures': [{'node': 'HALCYON_HatchingNode',
+                      'props': {'space': 'SCREEN', 'layers': 3,
+                                'direction': 'FORM'},
+                      'inputs': {'Scale': 60.0, 'Width': 0.4,
+                                 'Length': 5.0, 'Wobble': 0.5,
+                                 'Breaks': 0.25},
+                      'tone': 'FACING', 'indication': 'EDGES',
+                      'output': 'Color', 'target': 'Diffuse Color'}],
+    },
+    'MEDIA_COUNTED_STIPPLE': {
+        'label': "Counted Stipple",
+        'category': 'ADVANCED',
+        'family': 'MEDIA',
+        'note': "Secord's stippling: dots of one size whose number carries "
+                "the tone, a nested crowd that only ever adds dots as the "
+                "tone darkens -- the classic pen-and-ink stipple",
+        'model': 'CONSTANT',
+        'inputs': {'Specular Level': 0.0},
+        'textures': [{'node': 'HALCYON_StippleNode',
+                      'props': {'space': 'SCREEN', 'placement': 'COUNT'},
+                      'inputs': {'Scale': 110.0, 'Size': 0.8,
+                                 'Jitter': 0.9},
+                      'tone': 'FACING',
+                      'output': 'Color', 'target': 'Diffuse Color'}],
+    },
+    'MEDIA_SMUDGED_PENCIL': {
+        'label': "Smudged Pencil",
+        'category': 'ADVANCED',
+        'family': 'MEDIA',
+        'note': "Graphite scribble worked over with a tortillon: the "
+                "strokes lose half their contrast and a soft halo fills "
+                "the gaps -- Sousa and Buchanan's blender -- the strokes "
+                "wrapping the form",
+        'model': 'CONSTANT',
+        'inputs': {'Specular Level': 0.0},
+        'textures': [{'node': 'HALCYON_ScribbleNode',
+                      'props': {'space': 'SCREEN', 'layers': 2,
+                                'direction': 'FORM'},
+                      'inputs': {'Scale': 45.0, 'Width': 0.3, 'Curl': 0.4,
+                                 'Pressure': 0.75, 'Grain': 0.6,
+                                 'Blend': 0.6},
+                      'tone': 'FACING',
+                      'output': 'Color', 'target': 'Diffuse Color'}],
+    },
+    'MEDIA_PAPER': {
+        'label': "Drawing Paper",
+        'category': 'ADVANCED',
+        'family': 'MEDIA',
+        'note': "Cold-pressed paper: tooth, fibres and mottle in the "
+                "colour and, through a Bump, in the sheet's own relief",
+        'model': 'LAMBERT',
+        'inputs': {'Specular Level': 0.02, 'Glossiness': 6.0},
+        'textures': [{'node': 'HALCYON_PaperNode',
+                      'inputs': {'Scale': 6.0, 'Tooth': 0.6, 'Fibres': 0.35,
+                                 'Mottle': 0.4},
+                      'output': 'Color', 'target': 'Diffuse Color'},
+                     {'node': 'HALCYON_PaperNode',
+                      'inputs': {'Scale': 6.0, 'Tooth': 0.6, 'Fibres': 0.35,
+                                 'Mottle': 0.4},
+                      'output': 'Fac', 'target': 'Normal', 'bump': 0.15}],
     },
 
     # ------------------------------------------- R204: Bryce 1995
@@ -1660,6 +2270,46 @@ def build_spec(mat, spec, clear=True, offset=(0.0, 0.0), select=False):
             shader.refresh_sockets()
         except Exception:                                       # noqa: BLE001
             pass
+    elif spec.get('anime') is not None:
+        # R224: a cel recipe drops the Anime Shader with its mode preset
+        shader = tree.nodes.new('HALCYON_AnimeShaderNode')
+        shader.location = (0, 0)
+        for k, v in (spec.get('anime') or {}).items():
+            try:
+                setattr(shader, k, v)
+            except (TypeError, ValueError):
+                pass
+    elif spec.get('cartoon') is not None:
+        # R228: a cartoon recipe drops the Cartoon Shader with its era
+        # and shadow mode; the era's update writes the preset sockets,
+        # and the recipe's explicit inputs land on top (they are the
+        # same values, pinned equal by the template validator)
+        shader = tree.nodes.new('HALCYON_CartoonNode')
+        shader.location = (0, 0)
+        cprops = spec.get('cartoon') or {}
+        for k in ('era', 'shadow_mode', 'rim_blend',
+                  # R238: the cel's light and the airbrush menus
+                  'light_source', 'rim_mode', 'rim_side', 'smooth_shape',
+                  'airbrush_side'):
+            if k in cprops:
+                try:
+                    setattr(shader, k, cprops[k])
+                except (TypeError, ValueError):
+                    pass
+    elif spec.get('volume'):
+        # R224: a volume recipe drops the Halcyon Volume node and links
+        # the OUTPUT'S VOLUME socket -- the mesh becomes a container.
+        # R225: a dict-valued 'volume' carries the node's Model/Shape/
+        # Voxels presets
+        shader = tree.nodes.new('HALCYON_VolumeNode')
+        shader.location = (0, 0)
+        vprops = spec.get('volume')
+        if isinstance(vprops, dict):
+            for k, v in vprops.items():
+                try:
+                    setattr(shader, k, v)
+                except (TypeError, ValueError):
+                    pass
     else:
         shader = tree.nodes.new('HALCYON_ShaderNode')
         shader.location = (0, 0)
@@ -1672,6 +2322,7 @@ def build_spec(mat, spec, clear=True, offset=(0.0, 0.0), select=False):
     coord_node = None
     matcap_nodes = {}       # MATCAP_NORMAL / MATCAP_REFLECT -> node
     uvmap_nodes = {}        # named UV layer -> its UV Map node
+    facing_node = None      # R232: the media converters' shared tone
     last_link = {}          # target socket name -> last source socket
     for entry in spec.get('textures', []):
         if not isinstance(entry, dict):
@@ -1797,6 +2448,44 @@ def build_spec(mat, spec, clear=True, offset=(0.0, 0.0), select=False):
                         tree.links.new(mnode.outputs['Vector'], vec_dst)
                     else:
                         tree.links.new(src_out, vec_dst)
+                except Exception:                               # noqa: BLE001
+                    pass
+
+        # R232: a media converter's TONE -- 'FACING' links the Screen
+        # Info node's Facing (|N.V|: 1 face-on, 0 at the silhouette) so
+        # the drawing darkens toward its edges, the sketch look, on both
+        # devices; one Screen Info node is shared by every slot
+        tone_dst = node.inputs.get('Tone')
+        if tone_dst is not None and entry.get('tone') == 'FACING':
+            if facing_node is None:
+                try:
+                    facing_node = tree.nodes.new('HALCYON_ScreenInfoNode')
+                    facing_node.location = (-880, 320)
+                except Exception:                               # noqa: BLE001
+                    facing_node = None
+            if facing_node is not None:
+                try:
+                    tree.links.new(facing_node.outputs['Facing'], tone_dst)
+                except Exception:                               # noqa: BLE001
+                    pass
+
+        # R235: 'EDGES' indication -- the same Facing, inverted, into the
+        # medium's Indication: detail where the form turns from the eye
+        ind_dst = node.inputs.get('Indication')
+        if ind_dst is not None and entry.get('indication') == 'EDGES':
+            if facing_node is None:
+                try:
+                    facing_node = tree.nodes.new('HALCYON_ScreenInfoNode')
+                    facing_node.location = (-880, 320)
+                except Exception:                               # noqa: BLE001
+                    facing_node = None
+            if facing_node is not None:
+                try:
+                    inv = tree.nodes.new('ShaderNodeInvert')
+                    inv.location = (-640, 320)
+                    tree.links.new(facing_node.outputs['Facing'],
+                                   inv.inputs['Color'])
+                    tree.links.new(inv.outputs['Color'], ind_dst)
                 except Exception:                               # noqa: BLE001
                     pass
 
@@ -2010,15 +2699,19 @@ def build_spec(mat, spec, clear=True, offset=(0.0, 0.0), select=False):
             pass
         y -= 260
 
-    surf_in = out.inputs.get('Surface') if out is not None else None
+    out_sock = 'Volume' if spec.get('volume') else 'Surface'
+    surf_in = out.inputs.get(out_sock) if out is not None else None
     if clear or (surf_in is not None and not surf_in.is_linked):
         # replacing, or dropping into an empty stage: take the output.
-        # An occupied Surface is someone's work -- leave it alone
+        # An occupied socket is someone's work -- leave it alone
         try:
-            tree.links.new(shader.outputs['Surface'], surf_in)
+            tree.links.new(shader.outputs[out_sock], surf_in)
         except Exception:                                       # noqa: BLE001
             pass
-    shader.refresh_sockets()
+    try:
+        shader.refresh_sockets()
+    except Exception:                                           # noqa: BLE001
+        pass
     mat.halcyon.use_override = False
     if not clear:
         dx, dy = float(offset[0]), float(offset[1])
@@ -2064,6 +2757,10 @@ FAMILIES = (
     ('LIQUID', "Liquid"),
     ('WOOD', "Wood"),
     ('CLOUD', "Cloud & Fog"),
+    ('CEL', "Cel & Anime"),
+    ('CARTOON', "Cartoon"),
+    ('MEDIA', "2D Media"),
+    ('VOLUME', "Volumes"),
     ('TERRAIN', "Terrain"),
     ('SURFACES', "Surfaces"),
     ('EFFECTS', "Effects"),

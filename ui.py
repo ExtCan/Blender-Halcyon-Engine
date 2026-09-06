@@ -509,6 +509,18 @@ class HALCYON_PT_spot_cones(HalcyonPanel, Panel):
         note.scale_y = 0.8
         note.label(text="Each spot light's own Volumetric value", icon='INFO')
         note.label(text="decides whether it has a beam, and how strong.")
+        # R222: the real volumes -- always live; a scene without volume
+        # containers pays nothing, so there is no master switch to forget
+        layout.separator()
+        vcol = layout.column()
+        vcol.prop(context.scene.halcyon, 'volume_steps')
+        vcol.prop(context.scene.halcyon, 'volume_shadows')
+        vnote = vcol.column(align=True)
+        vnote.active = False
+        vnote.scale_y = 0.8
+        vnote.label(text="A mesh whose material output links a Volume",
+                    icon='INFO')
+        vnote.label(text="chain marches as a container inside its bound.")
 
 
 class HALCYON_PT_shadows(HalcyonPanel, Panel):
@@ -671,6 +683,7 @@ class HALCYON_PT_fog(HalcyonPanel, Panel):
         else:
             col.prop(hs, 'fog_density')
         col.prop(hs, 'fog_vertex')
+        col.prop(hs, 'fog_bands')
         col.separator()
         col.prop(hs, 'fog_height')
         sub = col.column()
@@ -881,6 +894,149 @@ class HALCYON_PT_composite(HalcyonPanel, Panel):
         col.prop(hs, 'composite_dot_crawl')
         col.separator()
         col.prop(hs, 'interlace')
+
+
+class HALCYON_PT_film(HalcyonPanel, Panel):
+    """R230: the era looks -- the cel photographed and printed."""
+    bl_label = "Cel Film"
+    bl_parent_id = 'HALCYON_PT_display'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        hs = context.scene.halcyon
+        col = layout.column()
+        # R236: the colour process -- records, dyes, key, registration
+        box = layout.box()
+        box.label(text="Colour Process", icon='SEQ_CHROMA_SCOPE')
+        bc = box.column()
+        bc.prop(hs, 'film_process')
+        sub = bc.column()
+        sub.active = hs.film_process != 'NONE'
+        sub.prop(hs, 'film_process_amount')
+        sub.prop(hs, 'film_exposure')
+        sub.prop(hs, 'film_gamma')
+        sub.prop(hs, 'film_density')
+        sub.prop(hs, 'film_filters')
+        sub.prop(hs, 'film_dye_purity')
+        sub.prop(hs, 'film_key')
+        row = sub.row(align=True)
+        row.prop(hs, 'film_halation')
+        row.prop(hs, 'film_halation_radius')
+        sub.prop(hs, 'film_register')
+        col = layout.column()
+        col.prop(hs, 'film_grade')
+        sub = col.column()
+        sub.active = hs.film_grade != 'NONE'
+        sub.prop(hs, 'film_grade_amount')
+        col.separator()
+        col.prop(hs, 'film_softness')
+        col.prop(hs, 'film_weave')
+        col.prop(hs, 'film_flicker')
+        col.separator()
+        col.prop(hs, 'film_hold')
+        col.separator()
+        # R237: the print's wear -- grain, dust, hairs, scratches, cues
+        box = layout.box()
+        box.label(text="Print Wear", icon='MOD_NOISE')
+        bc = box.column()
+        bc.prop(hs, 'film_grain')
+        sub = bc.column()
+        sub.active = hs.film_grain > 0.0
+        sub.prop(hs, 'film_grain_size')
+        sub.prop(hs, 'film_grain_clump')
+        sub.prop(hs, 'film_grain_chroma')
+        bc.separator()
+        bc.prop(hs, 'film_dust')
+        sub = bc.column()
+        sub.active = hs.film_dust > 0.0
+        sub.prop(hs, 'film_dust_size')
+        sub.prop(hs, 'film_dust_negative')
+        sub.prop(hs, 'film_dust_cel')
+        bc.separator()
+        bc.prop(hs, 'film_hairs')
+        sub = bc.column()
+        sub.active = hs.film_hairs > 0.0
+        row = sub.row(align=True)
+        row.prop(hs, 'film_hair_length')
+        row.prop(hs, 'film_hair_width')
+        sub.prop(hs, 'film_hair_hold')
+        bc.separator()
+        bc.prop(hs, 'film_scratches')
+        sub = bc.column()
+        sub.active = hs.film_scratches > 0.0
+        sub.prop(hs, 'film_scratch_side')
+        row = sub.row(align=True)
+        row.prop(hs, 'film_scratch_width')
+        row.prop(hs, 'film_scratch_hold')
+        bc.separator()
+        bc.prop(hs, 'film_reel')
+        box = layout.box()
+        box.label(text="Paint", icon='COLOR')
+        bc = box.column()
+        bc.prop(hs, 'film_misregister')
+        bc.prop(hs, 'film_bleed')
+        box = layout.box()
+        box.label(text="Print", icon='TEXTURE')
+        bc = box.column()
+        bc.prop(hs, 'film_halftone')
+        sub = bc.column()
+        sub.active = hs.film_halftone > 0.0
+        sub.prop(hs, 'film_halftone_pitch')
+        note = layout.column(align=True)
+        note.active = False
+        note.scale_y = 0.8
+        for line in _wrap("Every stage is a pure function of the frame "
+                          "number and the seed: the same frame renders "
+                          "the same bits on either device. Shoot On 2 or "
+                          "3 skips the held frames' renders entirely -- "
+                          "render sequences from their first frame.", 46):
+            note.label(text=line)
+
+
+class HALCYON_PT_backgrounds(HalcyonPanel, Panel):
+    """R233: the painted background road and the Fleischer setback."""
+    bl_label = "Painted Backgrounds"
+    bl_parent_id = 'HALCYON_PT_display'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        hs = context.scene.halcyon
+        col = layout.column()
+        col.prop(hs, 'bg_paint')
+        sub = col.column()
+        sub.active = hs.bg_paint > 0.0
+        sub.prop(hs, 'bg_stroke_size')
+        sub.prop(hs, 'bg_stroke_length')
+        sub.prop(hs, 'bg_direction')
+        row = sub.row(align=True)
+        row.prop(hs, 'bg_angle')
+        row.prop(hs, 'bg_spread', text="Spread")
+        sub.prop(hs, 'bg_bristles')
+        sub.prop(hs, 'bg_variation')
+        sub.prop(hs, 'bg_smooth')
+        sub.prop(hs, 'bg_paper')
+        box = layout.box()
+        box.label(text="Setback", icon='VIEW_CAMERA')
+        bc = box.column()
+        bc.prop(hs, 'setback')
+        sub = bc.column()
+        sub.active = hs.setback > 0.0
+        sub.prop(hs, 'setback_start')
+        sub.prop(hs, 'setback_range')
+        sub.prop(hs, 'setback_sky')
+        note = layout.column(align=True)
+        note.active = False
+        note.scale_y = 0.8
+        for line in _wrap("Materials whose Paint Mode is Background take "
+                          "the road: strokes fixed on the surface, drawn "
+                          "far to near at a screen-constant size, no ink "
+                          "unless the material says Always. Cel materials "
+                          "stay sharp over the setback.", 46):
+            note.label(text=line)
 
 
 class HALCYON_PT_jpeg(HalcyonPanel, Panel):
@@ -1266,6 +1422,9 @@ def material_state(mat):
             if node.bl_idname == 'HALCYON_BIMaterialNode':
                 return ('CONSTANT' if node.shadeless else
                         f'BI {node.diff_shader}/{node.spec_shader}'), True
+            if node.bl_idname in ('HALCYON_MaxStandardNode',
+                                  'HALCYON_MaxRaytraceNode'):
+                return f'3ds Max {node.shader_type}', True
         for node in mat.node_tree.nodes:
             if node.bl_idname == 'HALCYON_CodeNode':
                 return 'CODED', True
@@ -1572,23 +1731,34 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
         hs = mat.halcyon
 
         has_master = bool(_uses_nodes(mat) and mat.node_tree and any(
-            n.bl_idname in ('HALCYON_ShaderNode', 'HALCYON_BIMaterialNode')
+            n.bl_idname in ('HALCYON_ShaderNode', 'HALCYON_BIMaterialNode',
+                            'HALCYON_MaxStandardNode', 'HALCYON_MaxRaytraceNode')
             for n in mat.node_tree.nodes))
         box = layout.box()
         row = box.row()
         row.label(text="Halcyon Shader" if has_master else "Convert Material",
                   icon='CHECKMARK' if has_master else 'NODE_MATERIAL')
+        hal = context.scene.halcyon
+        det = box.column(align=True)
+        det.prop(hal, 'convert_detection', text="Detection")
+        if hal.convert_detection == 'SET':
+            det.prop(hal, 'convert_model', text="")
+        _model = 'AUTO' if hal.convert_detection == 'AUTO' \
+            else hal.convert_model
         col = box.column(align=True)
         op = col.operator('halcyon.convert_materials', text="Convert This Material",
                           icon='MATERIAL')
         op.scope = 'ACTIVE'
         op.force = has_master
+        op.model = _model
         op = col.operator('halcyon.convert_materials',
                           text="Convert Selected Objects", icon='RESTRICT_SELECT_OFF')
         op.scope = 'SELECTED'
+        op.model = _model
         op = col.operator('halcyon.convert_materials', text="Convert Whole Scene",
                           icon='SCENE_DATA')
         op.scope = 'SCENE'
+        op.model = _model
         box.label(text="Textures are relinked, not discarded", icon='INFO')
 
         col = box.column(align=True)
@@ -1624,6 +1794,34 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
                   icon='INFO')
 
         layout.separator()
+        # R208: hair geometry -- the strand convention switch
+        layout.prop(hs, 'strand')
+        row = layout.row(align=True)
+        row.prop(hs, 'alpha_mode', text="Alpha")
+        if hs.alpha_mode == 'CLIP':
+            row.prop(hs, 'alpha_clip', text="")
+        # R219: shadow flags apply to EVERY material, node-shaded or
+        # overridden -- they sat in the override column below, greyed
+        # out for the node materials that needed them most (fur shells)
+        row = layout.row(align=True)
+        row.prop(hs, 'cast_shadow')
+        row.prop(hs, 'receive_shadow')
+        # R220: this material's say over the cartoon outline pass
+        # R233: the cel or the painting
+        row = layout.row(align=True)
+        row.prop(hs, 'paint_mode', text="Paint Mode")
+        row = layout.row(align=True)
+        row.prop(hs, 'ink_mode', text="Ink")
+        if hs.ink_mode != 'OFF':
+            row = layout.row(align=True)
+            row.prop(hs, 'ink_use_color', text="")
+            sub = row.row(align=True)
+            sub.active = hs.ink_use_color
+            sub.prop(hs, 'ink_color', text="")
+            row.prop(hs, 'ink_width')
+            # R239: the Guilty Gear vertex-colour line control
+            row = layout.row(align=True)
+            row.prop(hs, 'ink_vc', text="Line Control")
         layout.prop(hs, 'use_override')
         if not hs.use_override:
             layout.label(text="Using this material's node tree", icon='NODETREE')
@@ -1654,9 +1852,6 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
         row = col.row(align=True)
         row.prop(hs, 'two_sided')
         row.prop(hs, 'shadeless')
-        row = col.row(align=True)
-        row.prop(hs, 'cast_shadow')
-        row.prop(hs, 'receive_shadow')
         col.prop(hs, 'wire')
         if hs.wire or hs.model == 'WIREFRAME':
             col.prop(hs, 'wire_size')
@@ -1825,14 +2020,22 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
         sub.prop(hs, 'shadow_samples')
         sub.prop(hs, 'shadow_density')
         sub.prop(hs, 'shadow_color')
-        if light.type in ('SPOT', 'SUN'):
-            col.separator()
-            col.template_ID(hs, 'cookie', open='image.open')
-            sub = col.column()
-            sub.active = hs.cookie is not None
-            sub.prop(hs, 'cookie_strength')
-            if light.type == 'SUN':
-                sub.prop(hs, 'cookie_scale')
+        # R219: every lamp kind projects its cookie -- Spot through the
+        # cone, Sun tiled, Point wrapped around, Area off its face
+        col.separator()
+        col.template_ID(hs, 'cookie', open='image.open')
+        sub = col.column()
+        sub.active = hs.cookie is not None
+        sub.prop(hs, 'cookie_strength')
+        if light.type == 'SUN':
+            sub.prop(hs, 'cookie_scale')
+        sub.prop(hs, 'cookie_extend')
+        sub.prop(hs, 'cookie_filter')
+        if hs.cookie is not None:
+            note = sub.row()
+            note.active = False
+            note.label(text="The lamp's Angle/Radius softens the "
+                            "projection", icon='INFO')
         col.separator()
         row = col.row(align=True)
         row.prop(hs, 'diffuse_only')
@@ -1979,14 +2182,89 @@ class HALCYON_PT_outline(HalcyonPanel, Panel):
         sub = col.column()
         sub.active = hs.outline and hs.outline_normals
         sub.prop(hs, 'outline_normal_angle')
+        # R220: the artist's own marked edges as interior ink
+        col.prop(hs, 'outline_marked')
+        # R234: the inker's line -- three more sources
+        row = col.row(align=True)
+        row.prop(hs, 'outline_form')
+        sub = row.row(align=True)
+        sub.active = hs.outline and hs.outline_form
+        sub.prop(hs, 'outline_form_threshold', text="")
+        row = col.row(align=True)
+        row.prop(hs, 'outline_shadow')
+        sub = row.row(align=True)
+        sub.active = hs.outline and (hs.outline_shadow or hs.ink_isophote > 0)
+        sub.prop(hs, 'outline_shadow_level', text="")
+        row = col.row(align=True)
+        row.prop(hs, 'outline_tone')
+        sub = row.row(align=True)
+        sub.active = hs.outline and hs.outline_tone
+        sub.prop(hs, 'outline_tone_threshold', text="")
         col.prop(hs, 'outline_over_sky')
+        # R227: the ink style pack -- the box every dial of the
+        # 40s-brush / 80s-trace contrast lives in
+        box = layout.box()
+        box.active = hs.outline
+        box.label(text="Line Style", icon='RNDCURVE')
+        bc = box.column()
+        bc.prop(hs, 'ink_style')
+        if hs.ink_style == 'PENCIL':
+            row = bc.row(align=True)
+            row.prop(hs, 'ink_pencil_strokes')
+            row.prop(hs, 'ink_pencil_spread')
+        bc.prop(hs, 'ink_reference_height')
+        bc.prop(hs, 'ink_taper')
+        bc.prop(hs, 'ink_interior_scale')
+        bc.prop(hs, 'ink_shadow_side')
+        row = bc.row(align=True)
+        row.prop(hs, 'ink_weight_noise')
+        row.prop(hs, 'ink_weight_scale')
+        row = bc.row(align=True)
+        row.prop(hs, 'ink_boil')
+        row.prop(hs, 'ink_boil_fps')
+        row.prop(hs, 'ink_boil_scale')
+        bc.prop(hs, 'ink_grain')
+        # R231: the drawn line -- ends, roughness, drift, gaps, texture
+        row = bc.row(align=True)
+        row.prop(hs, 'ink_end_taper')
+        row.prop(hs, 'ink_end_length')
+        row = bc.row(align=True)
+        row.prop(hs, 'ink_roughness')
+        row.prop(hs, 'ink_roughness_scale')
+        row = bc.row(align=True)
+        row.prop(hs, 'ink_drift')
+        row.prop(hs, 'ink_gaps')
+        row = bc.row(align=True)
+        row.prop(hs, 'ink_texture', text="")
+        if hs.ink_texture != 'SOLID':
+            row.prop(hs, 'ink_texture_amount')
+        # R234: the inker's line -- the light weight, the stroke road,
+        # the anchor
+        row = bc.row(align=True)
+        row.prop(hs, 'ink_isophote')
+        row.prop(hs, 'ink_isophote_range')
+        row = bc.row(align=True)
+        row.prop(hs, 'ink_smooth')
+        row.prop(hs, 'ink_pressure')
+        row.prop(hs, 'ink_overshoot')
+        bc.prop(hs, 'ink_anchor')
+        bc.prop(hs, 'ink_color_mode')
+        if hs.ink_color_mode == 'FILL':
+            bc.prop(hs, 'ink_fill_darken')
+        elif hs.ink_color_mode == 'GRADIENT':
+            bc.prop(hs, 'ink_color2')
+            bc.prop(hs, 'ink_gradient')
         note = layout.column(align=True)
         note.active = False
         note.scale_y = 0.8
         for line in _wrap("Ink is drawn at the internal resolution: with "
                           "Supersample on, the line anti-aliases on the "
                           "way down. Width is internal pixels -- raise it "
-                          "under heavy AA.", 46):
+                          "under heavy AA, or set True To Height. Any "
+                          "Line Style dial off its default draws from a "
+                          "distance field: anti-aliased, per-pixel "
+                          "width; the defaults are the plain mask line.",
+                          46):
             note.label(text=line)
 
 
@@ -2456,6 +2734,38 @@ class HALCYON_PT_world(HalcyonPanel, Panel):
         m = hs.mode
         if m == 'SOLID':
             col.prop(hs, 'color')
+        elif m == 'PAINTED':
+            # R233: the painted backdrop
+            col.prop(hs, 'paint_look')
+            col.prop(hs, 'paint_angle')
+            col.prop(hs, 'paint_seed')
+            col.separator()
+            col.prop(hs, 'horizon')
+            col.prop(hs, 'zenith')
+            col.prop(hs, 'gradient_falloff')
+            col.prop(hs, 'blend_mode')
+            col.prop(hs, 'horizon_height')
+            box = layout.box()
+            box.label(text="Brush", icon='COLOR')
+            box.prop(hs, 'paint_streaks')
+            box.prop(hs, 'paint_streak_scale')
+            box.prop(hs, 'paint_streak_angle')
+            row = box.row(align=True)
+            row.prop(hs, 'paint_dabs')
+            row.prop(hs, 'paint_dab_scale', text="Scale")
+            box = layout.box()
+            box.label(text="Clouds", icon='MOD_FLUIDSIM')
+            box.prop(hs, 'paint_clouds')
+            box.prop(hs, 'paint_cloud_scale')
+            box.prop(hs, 'paint_cloud_softness')
+            box.prop(hs, 'paint_cloud_height')
+            box.prop(hs, 'paint_cloud_color')
+            box.prop(hs, 'paint_cloud_shadow')
+            box = layout.box()
+            box.label(text="Board", icon='FILE_TEXT')
+            box.prop(hs, 'paint_paper')
+            box.prop(hs, 'paint_paper_scale')
+            box.prop(hs, 'paint_wash')
         elif m in ('GRADIENT', 'BANDS', 'BRYCE'):
             if m == 'BRYCE':
                 col.prop(hs, 'sky_mode')
@@ -2504,7 +2814,7 @@ class HALCYON_PT_world(HalcyonPanel, Panel):
             col.prop(hs, 'turbidity')
             col.prop(hs, 'ground_albedo')
 
-        if m in ('GRADIENT', 'BANDS', 'BRYCE', 'PHYSICAL'):
+        if m in ('GRADIENT', 'BANDS', 'BRYCE', 'PHYSICAL', 'PAINTED'):
             col.separator()
             col.prop(hs, 'show_ground')
             sub = col.column()
@@ -2655,7 +2965,8 @@ CLASSES = (
     HALCYON_PT_shadows, HALCYON_PT_ao, HALCYON_PT_radiosity,
     HALCYON_PT_raytrace, HALCYON_PT_textures, HALCYON_PT_transparency,
     HALCYON_PT_fog, HALCYON_PT_effects, HALCYON_PT_colour, HALCYON_PT_display,
-    HALCYON_PT_crt, HALCYON_PT_composite, HALCYON_PT_jpeg,
+    HALCYON_PT_crt, HALCYON_PT_composite, HALCYON_PT_film,
+    HALCYON_PT_backgrounds, HALCYON_PT_jpeg,
     HALCYON_PT_performance, HALCYON_PT_debug,
     HALCYON_OT_clear_palette_cache,
     HALCYON_OT_diagnostics, HALCYON_PT_material,

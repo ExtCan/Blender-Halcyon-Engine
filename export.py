@@ -5,6 +5,8 @@ renderer testable headlessly, and it is why node trees are flattened into dicts
 here rather than walked live during shading.
 """
 
+import re
+
 import numpy as np
 
 from . import compat
@@ -84,8 +86,31 @@ NODE_PROPS = {
     'ShaderNodeCombineColor': ('mode',),
     'ShaderNodeBsdfToon': ('component',),
     'ShaderNodeOutputMaterial': ('target',),
+    'HALCYON_AnimeShaderNode': ('compat', 'tones', 'use_vertex_ao',
+                                'emission_alpha', 'rim_blend',
+                                'matcap_mode',
+                                # R229: the 80s additions' menus
+                                'airbrush_side', 'line_source',
+                                # R238: the cel's light
+                                'light_source', 'rim_mode', 'rim_side',
+                                'smooth_shape',
+                                # R239: the SDF face shadow's frame
+                                'face_forward', 'face_up',
+                                # R241: the hair pass's wave shape
+                                'hair_shine_shape'),
+    # R225: the volume master's law, container shape and voxel lattice
+    'HALCYON_VolumeNode': ('model', 'shape', 'voxels'),
+    # R228: the cartoon master's shadow mode (the Era menu is a preset
+    # applicator: it writes the sockets, which serialize by themselves)
+    'HALCYON_CartoonNode': ('shadow_mode', 'rim_blend',
+                            # R238: the cel's light and the airbrush
+                            'light_source', 'rim_mode', 'rim_side',
+                            'smooth_shape', 'airbrush_side',
+                            # R241: the hair pass's wave shape
+                            'hair_shine_shape'),
     'HALCYON_ShaderNode': ('model', 'toon_steps', 'wire_size',
-                           'fresnel_blend', 'rim_blend', 'matcap_mode'),
+                           'fresnel_blend', 'rim_blend', 'matcap_mode',
+                           'faceted'),
     'HALCYON_BIMaterialNode': (
         'diff_shader', 'spec_shader', 'shadeless',
         # the BI panel round: sorted by panel
@@ -146,12 +171,21 @@ NODE_PROPS = {
 try:
     from .nodes.pattern_nodes import NODE_PROPS as _PATTERN_PROPS
     NODE_PROPS.update(_PATTERN_PROPS)
+    from .nodes.shader_nodes import FAMILY_NODE_PROPS as _FAM_PROPS
+    NODE_PROPS.update(_FAM_PROPS)
 except Exception:                                               # noqa: BLE001
     pass
 
 try:
     from .nodes.bitex_node import BI_NODE_PROPS as _BI_PROPS
     NODE_PROPS['HALCYON_BITextureNode'] = _BI_PROPS
+except Exception:                                               # noqa: BLE001
+    pass
+
+try:
+    # R242: the 3DS Max shelf's menus travel with their nodes
+    from .nodes.max_nodes import NODE_PROPS as _MAX_PROPS
+    NODE_PROPS.update(_MAX_PROPS)
 except Exception:                                               # noqa: BLE001
     pass
 
@@ -302,6 +336,37 @@ def _compile_node(node):
 # ------------------------------------------------------------- tree flatten
 
 
+#: an identifier carrying a suffix ('Shader_001', 'A_Color', 'Socket_3',
+#: 'From_Min_FLOAT3', 'Color.001') is a DISAMBIGUATOR, not a name
+_IDENT_DECORATED = re.compile(r'[._]')
+
+
+def canonical_socket_name(sock):
+    """The socket name Halcyon's evaluators and emitters key on.
+
+    R226 field find ("the Blender default textures just make the
+    volume vanish"): Blender 4/5 renamed many DISPLAY names -- the
+    texture nodes' "Fac" outputs are "Factor" now, so are the Fresnel,
+    Wireframe and Attribute factors and the Mix Shader's factor input
+    -- while keeping each socket's IDENTIFIER, the Python-API-stable
+    name, exactly as it was. Every Halcyon evaluator and GLSL emitter
+    keys its outputs by the classic names, and the graph was
+    serialized by display name: under 5.x a Noise Texture's Factor
+    output resolved to NOTHING, read zero, and a volume fed by it
+    vanished (a surface fed by it went black, a mix went to its
+    second input). A plain identifier that differs from the display
+    name IS the classic name: use it. A decorated identifier is a
+    disambiguator ('Shader_001', the Mix node's 'A_Color', a group's
+    'Socket_3'): those keep the display name, which the evaluators
+    match by name OR identifier for inputs.
+    """
+    name = str(getattr(sock, 'name', '') or '')
+    ident = str(getattr(sock, 'identifier', '') or '')
+    if ident and ident != name and not _IDENT_DECORATED.search(ident):
+        return ident
+    return name
+
+
 def serialize_tree(tree, images, programs, warnings, output_type='OUTPUT_MATERIAL',
                    depth=0):
     """Flatten a node tree into plain dicts. Groups recurse."""
@@ -337,7 +402,8 @@ def serialize_tree(tree, images, programs, warnings, output_type='OUTPUT_MATERIA
                     oi = 0
                 link = [from_node.name, oi]
             entry['inputs'].append({
-                'name': sock.name,
+                'name': canonical_socket_name(sock),
+                'label': sock.name,
                 'identifier': getattr(sock, 'identifier', sock.name),
                 'type': socket_kind(sock),
                 'default': socket_default(sock),
@@ -348,7 +414,8 @@ def serialize_tree(tree, images, programs, warnings, output_type='OUTPUT_MATERIA
             })
         for sock in node.outputs:
             entry['outputs'].append({
-                'name': sock.name,
+                'name': canonical_socket_name(sock),
+                'label': sock.name,
                 'identifier': getattr(sock, 'identifier', sock.name),
                 'type': socket_kind(sock),
                 'key': getattr(sock, 'halcyon_key', None),
@@ -398,8 +465,6 @@ def export_material(mat, images, warnings):
         m.reflect_level = hs.reflect_level
         m.two_sided = hs.two_sided
         m.shadeless = hs.shadeless
-        m.cast_shadow = hs.cast_shadow
-        m.receive_shadow = hs.receive_shadow
         m.wire = hs.wire
     else:
         try:
@@ -414,6 +479,30 @@ def export_material(mat, images, warnings):
         # Wireframe by its *node* never went through that branch, so its wire
         # width was stuck at the dataclass default with no way to change it
         m.wire_size = hs.wire_size
+        # R219: the SURFACE FLAGS ride with every material, node-shaded or
+        # overridden. They lived inside the override branch above, so a
+        # NODE material -- which is what every fur pelt wears -- exported
+        # with the dataclass defaults no matter what the panel said:
+        # cast_shadow stayed True and sixteen stacked shells blanketed
+        # their own lower layers and the body in cast shadow ("the lower
+        # layers of the pelt are black, and the original model is very
+        # dark"), and alpha_mode stayed BLEND so the R211 punch-through
+        # never rode the z-pass in the field. These are flags about how
+        # the surface meets the frame, not shading parameters -- the
+        # override toggle was never meant to gate them.
+        m.cast_shadow = hs.cast_shadow
+        m.receive_shadow = hs.receive_shadow
+        m.alpha_mode = str(getattr(hs, 'alpha_mode', 'BLEND'))
+        m.alpha_clip = float(getattr(hs, 'alpha_clip', 0.5))
+        # R220: per-material ink rides the same unconditional road
+        m.ink_mode = str(getattr(hs, 'ink_mode', 'INHERIT') or 'INHERIT')
+        m.ink_use_color = bool(getattr(hs, 'ink_use_color', False))
+        m.ink_color = tuple(getattr(hs, 'ink_color', (0.0, 0.0, 0.0)))
+        m.ink_width = int(getattr(hs, 'ink_width', 0))
+        # R239: the Guilty Gear vertex-colour line control
+        m.ink_vc = str(getattr(hs, 'ink_vc', 'OFF') or 'OFF')
+        # R233: the cel or the painting
+        m.paint_mode = str(getattr(hs, 'paint_mode', 'CEL') or 'CEL')
         if getattr(hs, 'halo', False):
             # R191: BI's halo material -- the whole panel in one spec.
             # Counts are 0 when their toggle is off, exactly the 2.79
@@ -531,6 +620,14 @@ def export_material(mat, images, warnings):
         # and alpha falls to the override's own Opacity above.
         m.programs = {}
         m.graph = serialize_tree(mat.node_tree, images, m.programs, warnings)
+    # R208: a material marked Hair Geometry (the fur-shell material, or
+    # any custom hair mesh) shades with the strand convention -- the
+    # colour layer carries intercept/random/length/thickness and Hair
+    # Info reads it. The flag rides the graph so both devices see it.
+    if hs is not None and getattr(hs, 'strand', False):
+        m.strand = True
+        if m.graph:
+            m.graph['strand'] = True
     m.alpha_why = _alpha_reason(mat, m)
     m.has_alpha = m.alpha_why is not None
     return m
@@ -620,6 +717,28 @@ def _alpha_reason(mat, m):
                 if s['default'] is not None and float(s['default']) < 0.999:
                     return f'{s["name"]} {float(s["default"]):.3f}'
             continue
+        if idn in ('HALCYON_MaxStandardNode', 'HALCYON_MaxRaytraceNode'):
+            # R243: Max's materials -- Opacity is a percentage, Falloff
+            # fades it by the view angle, Raytrace's Transparency colour
+            # is its see-through amount
+            for s in node['inputs']:
+                sname = s.get('identifier') or s['name']
+                if sname == 'Max Opacity':
+                    if s['link'] is not None:
+                        return 'its Opacity socket is linked'
+                    if s['default'] is not None and float(s['default']) < 99.9:
+                        return f'Opacity {float(s["default"]):.1f} percent'
+                elif sname == 'Max Falloff Amount':
+                    if s['link'] is not None or (
+                            s['default'] is not None and float(s['default']) > 0.0):
+                        return 'its Opacity Falloff fades the surface'
+                elif sname == 'Max Transparency':
+                    if s['link'] is not None:
+                        return 'its Transparency socket is linked'
+                    d = s['default']
+                    if d is not None and max(float(v) for v in list(d)[:3]) > 1e-3:
+                        return 'Raytrace Transparency above black'
+            continue
         if idn == 'HALCYON_ShaderNode':
             # the master shader's own alpha lives on its sockets, and the
             # add-on's templates put it there (Glass: Opacity 0.12) with
@@ -645,6 +764,86 @@ def _tree_has_alpha(mat, m):
 
 
 # -------------------------------------------------------------------- mesh
+
+
+def _check_fur_strand_health(ob, me, data, warnings):
+    """R216: "The shells are still black." Say WHY, at export, by name.
+
+    A pelt built by 1.55.0..1.57.x carries a corrupt mesh in the .blend
+    -- the fast-path builder zeroed the strand colour layer, and a mesh
+    is DATA: upgrading the add-on does not heal what is already built.
+    At intercept 0 every shell passes its alpha test and wears the root
+    colour, which is exactly a dense black pelt. This check reads the
+    pelt the renderer is about to wear and names the failure in the
+    console, so a field paste pins the cause in one line:
+    - the strand layer is MISSING (never built / stripped),
+    - the strand layer is SHADOWED (another colour attribute sits at
+      index 0, so the export reads the wrong layer as strand data), or
+    - the strand layer reads ALL ZEROS (the pre-1.58 corrupt build).
+    The cure for all three is the same and is printed with the warning:
+    Rebuild From Source on 1.58+, which builds via from_pydata and
+    verifies the layer by reading it back.
+    """
+    try:
+        if not getattr(getattr(ob, 'halcyon_fur', None), 'is_fur', False):
+            return
+        if not isinstance(data, dict):
+            return
+        layers = compat.color_layers(me)
+        names = [str(getattr(a, 'name', '') or '') for a in layers]
+        why = None
+        if 'HalcyonFur' not in names:
+            why = ("its strand colour layer 'HalcyonFur' is MISSING from "
+                   "the mesh")
+        elif names[0] != 'HalcyonFur':
+            why = (f"its strand colour layer is SHADOWED -- "
+                   f"'{names[0]}' sits first and the export reads that "
+                   f"as strand data")
+        else:
+            cols = data.get('colors')
+            if cols is not None and cols.size and \
+                    float(np.abs(np.asarray(cols)[:, :3]).max()) < 1e-6:
+                why = ('its strand colour layer reads ALL ZEROS -- the '
+                       'corrupt pre-1.58 mesh build, still in the .blend')
+        # R219: a pelt whose tuft material CASTS is its own eclipse --
+        # sixteen stacked shells drop cast shadow on every layer beneath
+        # them and on the body, and the field reads it as "the lower
+        # layers of the pelt are black, and the original model is very
+        # dark" no matter how strong the light. The builder turns the
+        # flag off (the era's shell fur was never in a shadow map), but
+        # a hand-made tuft material, or one edited back on, still can.
+        try:
+            for slot_mat in [s.material for s in
+                             getattr(ob, 'material_slots', [])
+                             if getattr(s, 'material', None) is not None]:
+                mh = getattr(slot_mat, 'halcyon', None)
+                if mh is not None and getattr(mh, 'strand', False) and \
+                        getattr(mh, 'cast_shadow', True):
+                    cmsg = (f"fur pelt '{getattr(ob, 'name', '?')}': its "
+                            f"tuft material "
+                            f"'{getattr(slot_mat, 'name', '?')}' has Cast "
+                            f"Shadows ON, so the stacked shells blanket "
+                            f"their own lower layers and the body in cast "
+                            f"shadow -- a black pelt under any light. "
+                            f"Untick Cast Shadows on that material, or "
+                            f"press Rebuild From Source")
+                    print(f'[Halcyon] {cmsg}')
+                    warnings.append(cmsg)
+                    break
+        except Exception:                                       # noqa: BLE001
+            pass
+        if why is None:
+            return
+        msg = (f"fur pelt '{getattr(ob, 'name', '?')}': {why}. At "
+               f"intercept 0 every shell passes its alpha test and "
+               f"wears the root colour: a dense BLACK pelt. Select the "
+               f"pelt and press Rebuild From Source (Object Properties "
+               f"> Halcyon Fur), or nudge any fur dial, to re-grow it "
+               f"verified")
+        print(f'[Halcyon] {msg}')
+        warnings.append(msg)
+    except Exception:                                           # noqa: BLE001
+        pass
 
 
 def _mesh_arrays(me, matrix, mat_offset, obj_index):
@@ -744,6 +943,41 @@ def _mesh_arrays(me, matrix, mat_offset, obj_index):
         ln = np.linalg.norm(fn, axis=1, keepdims=True)
         fn = fn / np.where(ln < 1e-12, 1.0, ln)
 
+    # R220: the artist's marked edges (Sharp, creases, Freestyle edge
+    # marks -- UV seams deliberately excluded, they mark unwrapping,
+    # not looks), folded into a per-TRIANGLE bitmask: bit k set = the
+    # edge opposite corner k is marked. The ink pass measures each
+    # pixel's exact distance to its own triangle's marked slots, so
+    # hidden-line removal is the z-buffer's own verdict and the mask
+    # concatenates like any other per-tri array. A mesh with no marks
+    # exports None and costs one boolean sweep.
+    ink_mask = None
+    try:
+        ie = compat.edge_ink_arrays(me)
+        if ie is not None:
+            eidx, eflags = ie
+            drawn = (eflags & (2 | 4 | 8)) != 0
+            if drawn.any():
+                eidx = eidx[drawn].astype(np.int64)
+                stride = np.int64(max(n_verts, 1))
+                key = np.minimum(eidx[:, 0], eidx[:, 1]) * stride \
+                    + np.maximum(eidx[:, 0], eidx[:, 1])
+                ov = lv[lt].astype(np.int64)          # (T,3) original ids
+
+                def _pk(a, b):
+                    return np.minimum(a, b) * stride + np.maximum(a, b)
+
+                ink_mask = (
+                    np.isin(_pk(ov[:, 1], ov[:, 2]), key).astype(np.uint8)
+                    | (np.isin(_pk(ov[:, 2], ov[:, 0]), key)
+                       .astype(np.uint8) << 1)
+                    | (np.isin(_pk(ov[:, 0], ov[:, 1]), key)
+                       .astype(np.uint8) << 2))
+                if not ink_mask.any():
+                    ink_mask = None
+    except Exception:                                           # noqa: BLE001
+        ink_mask = None
+
     return dict(verts=pos.astype(np.float32), normals=nn.astype(np.float32),
                 uvs=uvs.astype(np.float32),
                 uvs2=uvs2.astype(np.float32) if uvs2 is not None else None,
@@ -751,7 +985,8 @@ def _mesh_arrays(me, matrix, mat_offset, obj_index):
                 colors=cols.astype(np.float32), tris=lt.astype(np.int32),
                 mat_index=(mat_idx + mat_offset).astype(np.int32),
                 obj_index=np.full(n_tris, obj_index, np.int32),
-                face_normals=fn.astype(np.float32), smooth=smooth)
+                face_normals=fn.astype(np.float32), smooth=smooth,
+                ink_tri_mask=ink_mask)
 
 
 # ------------------------------------------------------------------- lights
@@ -824,7 +1059,9 @@ def export_light(ob, matrix, unit_scale=1.0):
         if coll is not None:
             lt.exclude_names = {o.name for o in coll.all_objects}
         ck = getattr(hs, 'cookie', None)
-        if ck is not None and kind in ('SPOT', 'SUN'):
+        if ck is not None:
+            # R219: every lamp kind projects (the old gate let only
+            # SPOT and SUN through -- "Gobos only work with Sun")
             px = compat.image_pixels(ck)
             if px is not None:
                 lt.cookie = ImageBuffer(name=ck.name_full, pixels=px,
@@ -832,6 +1069,10 @@ def export_light(ob, matrix, unit_scale=1.0):
                 lt.cookie_strength = float(getattr(hs, 'cookie_strength',
                                                    1.0))
                 lt.cookie_scale = float(getattr(hs, 'cookie_scale', 10.0))
+                lt.cookie_extend = str(getattr(hs, 'cookie_extend',
+                                               'AUTO') or 'AUTO')
+                lt.cookie_filter = str(getattr(hs, 'cookie_filter',
+                                               'BILINEAR') or 'BILINEAR')
     else:
         lt.shadow = 'MAP' if getattr(la, 'use_shadow', True) else 'NONE'
     if not getattr(la, 'use_shadow', True):
@@ -1166,6 +1407,52 @@ def _empty_part():
                 smooth=z(0, bool))
 
 
+def _smoke_grid(ob, warnings=None):
+    """R223: a fluid DOMAIN's density voxels, read defensively.
+
+    Mantaflow exposes the cached grids as flat float sequences on the
+    domain settings; a domain whose cache is not baked (or a build that
+    hides the attribute) reads None, with the reason in the warnings --
+    the volume marcher then runs on the node chain alone.
+    """
+    try:
+        for mod in getattr(ob, 'modifiers', ()) or ():
+            if getattr(mod, 'type', '') != 'FLUID':
+                continue
+            if str(getattr(mod, 'fluid_type', '')) != 'DOMAIN':
+                continue
+            ds = getattr(mod, 'domain_settings', None)
+            if ds is None:
+                return None
+            res = tuple(int(v) for v in
+                        getattr(ds, 'domain_resolution', ()) or ())
+            if len(res) != 3 or min(res) < 1:
+                return None
+            try:
+                dens = np.asarray(list(ds.density_grid), np.float32)
+            except Exception:                                   # noqa: BLE001
+                dens = None
+            want = res[0] * res[1] * res[2]
+            if dens is None or dens.size != want:
+                if warnings is not None:
+                    warnings.append(
+                        f"smoke domain '{getattr(ob, 'name', '?')}': no "
+                        f"readable density grid (is the sim baked?) -- "
+                        f"the volume marches on its node chain alone")
+                return None
+            flame = None
+            try:
+                fl = np.asarray(list(ds.flame_grid), np.float32)
+                if fl.size == want:
+                    flame = fl
+            except Exception:                                   # noqa: BLE001
+                flame = None
+            return {'res': res, 'density': dens, 'flame': flame}
+    except Exception:                                           # noqa: BLE001
+        return None
+    return None
+
+
 def _info_snapshot(ob):
     """The ObjectInfo fields, read from the evaluated object."""
     return dict(
@@ -1177,7 +1464,8 @@ def _info_snapshot(ob):
         cast_shadow=getattr(ob, 'visible_shadow', True),
         holdout=getattr(ob, 'is_holdout', False),
         smoothresh=float(ob.get('halcyon_smoothresh', 0.0))
-        if hasattr(ob, 'get') else 0.0)
+        if hasattr(ob, 'get') else 0.0,
+        smoke_grid=_smoke_grid(ob))
 
 
 def _info_object(info, matrix):
@@ -1187,7 +1475,8 @@ def _info_object(info, matrix):
         color=info['color'], index=info['index'], random=info['random'],
         visible_camera=info['visible_camera'],
         cast_shadow=info['cast_shadow'], holdout=info['holdout'],
-        smoothresh=info['smoothresh'])
+        smoothresh=info['smoothresh'],
+        smoke_grid=info.get('smoke_grid'))
 
 
 def register():
@@ -1341,6 +1630,199 @@ def _halo_groups_from(points, remap, materials):
                        'seeds': (base + np.arange(n, dtype=np.int64)) % 256,
                        'normals': entry.get('normals')})
     return groups
+
+
+def _strand_material(mat, mat_lookup, materials, images, warnings):
+    """The hair CLONE of a material: same graph, marked as strand.
+
+    Hair ribbons carry their strand data in the colour layer; the Hair
+    Info node needs to know the difference between hair geometry and a
+    mesh that merely has vertex paint. The material clone carries
+    `strand=True` and its GRAPH root carries `'strand': True` -- the
+    CPU evaluator and the GLSL emitter both read the graph flag, so
+    the whole thing travels inside data that already flows to both
+    devices. The original material is untouched: a mesh wearing it
+    renders exactly as before.
+    """
+    key = ((mat.name_full if mat is not None else '__default__')
+           + '::strand')
+    if key in mat_lookup:
+        return mat_lookup[key]
+    exported = export_material(mat, images, warnings)
+    try:
+        exported.strand = True
+        if getattr(exported, 'graph', None):
+            exported.graph['strand'] = True
+        exported.name = (getattr(exported, 'name', 'Material')
+                         + '.strand')
+    except Exception:                                           # noqa: BLE001
+        pass
+    mat_lookup[key] = len(materials)
+    materials.append(exported)
+    return mat_lookup[key]
+
+
+def _collect_hair_parts(depsgraph, bscene, mat_lookup, materials, images,
+                        objects, parts, warnings):
+    """R208: hair renders. Particle-system hair and Curves objects both
+    become camera-facing ribbon meshes (core.geometry.hair_ribbons --
+    the primitive BI rendered strands as), wearing a strand-flagged
+    clone of the emitter's material so its full node graph runs on the
+    hair, Hair Info included. Every bpy touch is getattr-guarded: an
+    API this Blender does not carry contributes nothing and breaks
+    nothing.
+    """
+    from .core import geometry as _geo
+
+    cam = getattr(bscene, 'camera', None)
+    try:
+        eye = tuple(np.asarray(cam.matrix_world, np.float32)[:3, 3]) \
+            if cam is not None else (0.0, 0.0, 0.0)
+    except Exception:                                           # noqa: BLE001
+        eye = (0.0, 0.0, 0.0)
+
+    def _push_part(strands, widths, uv_roots, mat, ob, label):
+        if not strands:
+            return
+        try:
+            root_w, tip_w = widths
+            v, t, n, uv, c = _geo.hair_ribbons(
+                strands, eye, root_width=root_w, tip_width=tip_w,
+                uv_roots=uv_roots,
+                seed=abs(hash(label)) % 65536)
+            if not len(t):
+                return
+            mi = _strand_material(mat, mat_lookup, materials, images,
+                                  warnings)
+            obj_index = len(objects)
+            fn = np.zeros((t.shape[0], 3), np.float32)
+            a = v[t[:, 1]] - v[t[:, 0]]
+            b = v[t[:, 2]] - v[t[:, 0]]
+            fx = np.cross(a, b)
+            ln = np.sqrt((fx * fx).sum(1, keepdims=True))
+            fn = (fx / np.maximum(ln, 1e-12)).astype(np.float32)
+            parts.append({
+                'verts': v, 'normals': n, 'uvs': uv, 'uvs2': None,
+                'colors': c, 'tris': t,
+                'mat_index': np.full(t.shape[0], mi, np.int32),
+                'obj_index': np.full(t.shape[0], obj_index, np.int32),
+                'face_normals': fn,
+                'smooth': np.ones(t.shape[0], bool),
+                'uv_names': []})
+            info = _info_snapshot(ob)
+            objects.append(_info_object(info, np.eye(4,
+                                                     dtype=np.float32)))
+        except Exception as exc:                                # noqa: BLE001
+            warnings.append(f"hair on '{getattr(ob, 'name', '?')}' "
+                            f"could not be exported "
+                            f"({type(exc).__name__}: {exc})")
+
+    for inst in depsgraph.object_instances:
+        ob = inst.object
+        if ob is None or not getattr(inst, 'show_self', True):
+            continue
+
+        # ---- legacy particle-system hair ----
+        for ps in (getattr(ob, 'particle_systems', None) or ()):
+            try:
+                st_ = ps.settings
+                if str(getattr(st_, 'type', '')) != 'HAIR':
+                    continue
+                step = int(getattr(st_, 'render_step', 3))
+                steps = (1 << max(min(step, 7), 1)) + 1
+                n_par = len(getattr(ps, 'particles', ()) or ())
+                n_child = len(getattr(ps, 'child_particles', ()) or ())
+                total = n_par + n_child \
+                    if str(getattr(st_, 'child_type', 'NONE')) != 'NONE' \
+                    and n_child else n_par
+                if total == 0:
+                    continue
+                strands = []
+                uv_roots = []
+                mod = next((m for m in getattr(ob, 'modifiers', ())
+                            if getattr(m, 'type', '')
+                            == 'PARTICLE_SYSTEM'
+                            and getattr(m, 'particle_system', None)
+                            and m.particle_system.name == ps.name),
+                           None)
+                for i in range(total):
+                    pts = []
+                    for k in range(steps):
+                        co = ps.co_hair(ob, particle_no=i, step=k)
+                        pts.append((co[0], co[1], co[2]))
+                    P = np.asarray(pts, np.float32)
+                    if not np.isfinite(P).all() or \
+                            float(np.abs(np.diff(P, axis=0)).sum()) \
+                            < 1e-9:
+                        continue
+                    strands.append(P)
+                    uvr = None
+                    if mod is not None and i < n_par:
+                        try:
+                            uvr = tuple(ps.uv_on_emitter(
+                                mod, particle=ps.particles[i],
+                                particle_no=i, uv_no=0))[:2]
+                        except Exception:                       # noqa: BLE001
+                            uvr = None
+                    uv_roots.append(uvr if uvr is not None
+                                    else (float(i) / max(total, 1), 0.0))
+                if not strands:
+                    continue
+                rscale = float(getattr(st_, 'radius_scale', 0.01)
+                               or 0.01)
+                root_w = float(getattr(st_, 'root_radius', 1.0)
+                               or 1.0) * rscale
+                tip_w = float(getattr(st_, 'tip_radius', 0.0)
+                              or 0.0) * rscale
+                mslot = int(getattr(st_, 'material', 1)) - 1
+                slots = list(getattr(ob, 'material_slots', ()) or ())
+                mat = slots[mslot].material \
+                    if 0 <= mslot < len(slots) else None
+                _push_part(strands, (root_w, tip_w), uv_roots, mat, ob,
+                           f'{ob.name}/{ps.name}')
+            except Exception as exc:                            # noqa: BLE001
+                warnings.append(
+                    f"hair system on '{getattr(ob, 'name', '?')}' could "
+                    f"not be exported ({type(exc).__name__}: {exc})")
+
+        # ---- Curves-object hair (the sculptable kind) ----
+        if getattr(ob, 'type', '') == 'CURVES':
+            try:
+                cd = ob.data
+                pos_attr = cd.attributes.get('position')
+                npts = len(pos_attr.data)
+                co = np.empty(npts * 3, np.float32)
+                pos_attr.data.foreach_get('vector', co)
+                co = co.reshape(-1, 3)
+                mw = np.asarray(inst.matrix_world, np.float32)
+                co = (co @ mw[:3, :3].T + mw[:3, 3]).astype(np.float32)
+                ncur = len(getattr(cd, 'curves', ()) or ())
+                offs = np.empty(ncur + 1, np.int32)
+                try:
+                    cd.curve_offset_data.foreach_get('value', offs)
+                except Exception:                               # noqa: BLE001
+                    counts = npts // max(ncur, 1)
+                    offs = (np.arange(ncur + 1) * counts).astype(np.int32)
+                strands = [co[offs[i]:offs[i + 1]]
+                           for i in range(ncur)
+                           if offs[i + 1] - offs[i] >= 2]
+                rad = 0.005
+                try:
+                    r_attr = cd.attributes.get('radius')
+                    if r_attr is not None and len(r_attr.data):
+                        rr = np.empty(len(r_attr.data), np.float32)
+                        r_attr.data.foreach_get('value', rr)
+                        rad = float(np.median(rr)) or 0.005
+                except Exception:                               # noqa: BLE001
+                    pass
+                slots = list(getattr(ob, 'material_slots', ()) or ())
+                mat = slots[0].material if slots else None
+                _push_part(strands, (rad * 2.0, rad * 0.4), None, mat,
+                           ob, f'{ob.name}/curves')
+            except Exception as exc:                            # noqa: BLE001
+                warnings.append(
+                    f"hair curves '{getattr(ob, 'name', '?')}' could "
+                    f"not be exported ({type(exc).__name__}: {exc})")
 
 
 def _collect_extra_halos(depsgraph, mat_lookup, materials, images,
@@ -1561,6 +2043,7 @@ def export_scene(depsgraph, settings, warnings=None):
             obj_index = len(objects)
             _t0 = _time.perf_counter()
             data = _mesh_arrays(me, matrix, 0, obj_index)
+            _check_fur_strand_health(ob, me, data, warnings)
             halo_pts = _collect_halo_points(me, matrix, slots)
             _sp['mesh_ms'] += (_time.perf_counter() - _t0) * 1000.0
             _sp['meshes'] += 1
@@ -1727,6 +2210,14 @@ def export_scene(depsgraph, settings, warnings=None):
     try:
         _collect_extra_halos(depsgraph, mat_lookup, materials, images,
                              halo_groups, warnings)
+    except Exception:                                           # noqa: BLE001
+        pass
+
+    # R208: hair -- particle-system strands and Curves objects become
+    # camera-facing ribbons wearing a strand-flagged material clone
+    try:
+        _collect_hair_parts(depsgraph, bscene, mat_lookup, materials,
+                            images, objects, parts, warnings)
     except Exception:                                           # noqa: BLE001
         pass
 
@@ -1951,4 +2442,13 @@ def _concat(parts):
     mesh.obj_index = np.concatenate(OI)
     mesh.face_normals = np.concatenate(FN)
     mesh.smooth = np.concatenate(S)
+    # R220: the marked-edge tri masks ride alongside like smooth --
+    # per-tri, so no rebasing; .get() keeps parts from a pre-R220 mesh
+    # cache legal, and a part without marks contributes zeros
+    IM = [p.get('ink_tri_mask') for p in parts]
+    if any(m is not None for m in IM):
+        mesh.ink_tri_mask = np.concatenate(
+            [m if m is not None
+             else np.zeros(p['tris'].shape[0], np.uint8)
+             for m, p in zip(IM, parts)])
     return mesh

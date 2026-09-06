@@ -78,6 +78,87 @@ def color_layers(mesh):
     return []
 
 
+def _edge_attr_bools(mesh, name, count):
+    """A boolean edge attribute by name, or None. 4.x moved several
+    edge flags (freestyle marks above all) into generic attributes."""
+    import numpy as np
+    try:
+        attrs = getattr(mesh, 'attributes', None)
+        a = attrs.get(name) if attrs is not None else None
+        if a is None or getattr(a, 'domain', '') != 'EDGE':
+            return None
+        out = np.zeros(count, bool)
+        a.data.foreach_get('value', out)
+        return out
+    except Exception:                                           # noqa: BLE001
+        return None
+
+
+def edge_ink_arrays(mesh):
+    """R220: the artist's marked edges, as (indices (E,2) int32,
+    flags (E,) uint8) -- or None when nothing is marked.
+
+    Flag bits: 1 = UV seam, 2 = marked sharp, 4 = creased (> 0),
+    8 = Freestyle edge mark. Each source is read down whichever road
+    this Blender offers -- edge booleans, or the attribute the flag
+    moved into -- and a mesh with no marks costs one boolean sweep and
+    returns None, so unmarked scenes pay nothing.
+    """
+    import numpy as np
+    edges = getattr(mesh, 'edges', None)
+    n = len(edges) if edges is not None else 0
+    if not n:
+        return None
+    flags = np.zeros(n, np.uint8)
+    try:
+        b = np.zeros(n, bool)
+        edges.foreach_get('use_seam', b)
+        flags |= b.astype(np.uint8) * 1
+    except Exception:                                           # noqa: BLE001
+        pass
+    try:
+        b = np.zeros(n, bool)
+        edges.foreach_get('use_edge_sharp', b)
+        flags |= b.astype(np.uint8) * 2
+    except Exception:                                           # noqa: BLE001
+        pass
+    crease = None
+    try:
+        attrs = getattr(mesh, 'attributes', None)
+        a = attrs.get('crease_edge') if attrs is not None else None
+        if a is not None and getattr(a, 'domain', '') == 'EDGE':
+            crease = np.zeros(n, np.float32)
+            a.data.foreach_get('value', crease)
+    except Exception:                                           # noqa: BLE001
+        crease = None
+    if crease is None:
+        try:
+            cl = getattr(mesh, 'edge_creases', None)
+            if cl:
+                crease = np.zeros(n, np.float32)
+                cl[0].data.foreach_get('value', crease)
+        except Exception:                                       # noqa: BLE001
+            crease = None
+    if crease is not None:
+        flags |= (crease > 1e-6).astype(np.uint8) * 4
+    fs = _edge_attr_bools(mesh, 'freestyle_edge', n)
+    if fs is None:
+        try:
+            b = np.zeros(n, bool)
+            edges.foreach_get('use_freestyle_mark', b)
+            fs = b
+        except Exception:                                       # noqa: BLE001
+            fs = None
+    if fs is not None:
+        flags |= fs.astype(np.uint8) * 8
+    if not flags.any():
+        return None
+    idx = np.empty(n * 2, np.int32)
+    edges.foreach_get('vertices', idx)
+    keep = flags != 0
+    return idx.reshape(-1, 2)[keep], flags[keep]
+
+
 # ------------------------------------------------------------------ objects
 
 
@@ -306,12 +387,19 @@ def image_pixels(image):
 
 
 def register_node_menu(draw_fn):
-    """4.0+ removed nodeitems_utils; append to the Add menu instead."""
+    """4.0+ removed nodeitems_utils; draw into the Add menu directly.
+
+    R242: PREPENDED, so Halcyon is the first entry of the Add menu
+    rather than the last (the field's ask); a Blender build without
+    prepend on the menu class falls back to append."""
     import bpy as _bpy
     for menu_name in ('NODE_MT_add', 'NODE_MT_category_shader_output'):
         menu = getattr(_bpy.types, menu_name, None)
         if menu is not None:
-            menu.append(draw_fn)
+            if hasattr(menu, 'prepend'):
+                menu.prepend(draw_fn)
+            else:
+                menu.append(draw_fn)
             return menu_name
     return None
 

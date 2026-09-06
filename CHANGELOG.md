@@ -4,6 +4,2797 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
 
 ---
 
+## [1.86.2] — 2026-09-06
+
+### The GitHub round — the documentation rewritten against live counts, four preview sheets
+
+No engine change: every frame renders bitwise 1.86.1. The repository's
+face was written for the engine of 1.52 and had drifted a long way from
+the engine of 1.86.
+
+- **README** rewritten at the top for what the engine is now — the
+  three roads (the eras, the libraries, the 2D road) — with every count
+  taken from the live tree: 32 shading models, 243 node types
+  evaluated, 90 render presets, 140 resolution presets, 113 templates
+  in fourteen families, nine sky modes, 291 settings, the 5,373-check
+  suite, about 99,000 lines. The Layout section names the modules that
+  exist (celfield, ink, lines, media, gouache, film, wear, maxmaps,
+  bitex, blend279, volume, sss, glsl_shading, interp, max_nodes …).
+- **Four preview sheets in `docs/`**, rendered by the engine itself on
+  one subject so the looks compare: `halcyon_contact_sheet.png` (sixteen
+  panels across the whole range), `halcyon_eras.png` (twenty of the
+  ninety presets), `halcyon_2d.png` (cartoon eras, anime styles, the
+  line, the media, the film process) and `halcyon_libraries.png`
+  (Blender Internal, Bryce 1995, 3ds Max). The old contact sheet is
+  replaced.
+- **EXTENSION_LISTING** and **ROADMAP** brought to 1.86: the listing's
+  "honest limitations" no longer claims screen-space volumetrics or 74
+  templates; the roadmap carries the arcs from 1.53 to 1.86 and the
+  refusals as they stand.
+
+---
+
+## [1.86.1] — 2026-09-06
+
+### The enable that failed — an icon Blender does not have
+
+The field's first 1.86.0 report was Blender refusing the add-on at
+register: `validating class: enum "MOD_WOOD" not found in ('NONE',
+'CHAR_NOTDEF', …)`. The Wood (Max) node's `bl_icon` named an icon
+that does not exist — chosen from memory in 1.86.0 — and Blender
+validates every class's icon against its enum, so the whole add-on
+would not enable. The 1.54.0 lesson ('OUTLINER_OB_HAIR') had a
+census for exactly this, but the census read the pattern shelf's
+SPECS and the shader nodes and never the 3DS Max shelf's SPECS
+column, which is where the icon lived.
+
+- **Wood (Max)** wears `MOD_SCREW` (rings about an axis; in the
+  enum). No other icon in the add-on was wrong: every class
+  `bl_icon`, every `icon=` argument, every shelf SPECS column and
+  every menu family was audited against the enum.
+- **The enum itself ships with the tests**: the field's paste is
+  Blender 5.2's whole icon enum (1033 identifiers), now
+  `tests/blender_icons.py`. The icon census reads it as the vetted
+  list, and reads EVERY icon table — the pattern, shader and 3DS
+  Max shelves, the material classes, the menu families and their
+  cross-family references — so no shelf column is a blind spot
+  again. The hand-vetted record stays as a pinned subset.
+- **The bpy stub validates icons at register_class**, exactly as
+  Blender does (`validating class: enum "X" not found …`), so the
+  headless registration test fails the way the field's enable
+  failed, before a zip is built.
+- Nothing else changed: every frame renders bitwise 1.86.0.
+
+---
+
+## [1.86.0] — 2026-09-05
+
+### The Max study, second reading — Max's own algorithms, on Halcyon's own tables
+
+The field supplied its Max 2012 MetaSL shader library — Autodesk's
+own ports of every Max map and of the eight Standard shaders — with
+*"I don't know if these are of any use to you, but hopefully they
+will be."* They were: 1.85.0 had built the shelf from the reference's
+CONTROLS; this round rebuilds it on the ALGORITHMS, read from those
+files and reimplemented. **No Autodesk code or data ships in
+Halcyon**: Max reads its permutation, gradient and random tables from
+data files, and every table value here is a pure function of its
+index through Halcyon's integer hash (a test scans maxmaps for any
+data block or file read). The maps have Max's character, controls and
+defaults on Halcyon's own lattice.
+
+- **The noise every 3D map rides**: Perlin's 1989 gradient noise on
+  Max's 512 lattice exactly as max_texutil carries it (the +10000
+  setup, the s-curve, the eight corner dots), in 3D (`noise3`) and 4D
+  (`noise4`, the Noise map's Phase as its fourth axis), plus
+  `noise3DS` (boosted 1.65 and clamped) and `NOISE` (its 0..1 remap).
+  The CPU reads the tables materialised once (1024 permutations, unit
+  gradients, the 10000-entry cell tables); the GPU computes the same
+  hash inline; the twin tests pin them equal to 1e-7.
+- **Cellular** is Max's own: Poisson point counts per lattice cell
+  (mean three, at most eight — the 27-cell search, SQUARED distances,
+  Circular reading the nearest point over Spread, Chips the gap
+  between the two nearest over half of it), the fractal sum by
+  lacunarity 2 − Roughness with a fractional iteration, a
+  **Variation** control (each cell's colour scaled by its own random),
+  a **Cell ID** output. Max's costliest map, here as there: the CPU
+  walks all nine candidate points per cell without a branch (points
+  past a cell's count sit at 1e16 so they never win), the GPU breaks
+  at the count, both land on the same points.
+- **Dent, Planet and Wood** ride Max's 20-periodic 21³ linear value
+  noise (the "dent noise"); **Smoke** (octaves drifted by their own
+  velocities, 2.4× per octave), **Speckle** (six octaves capped),
+  **Splat** (the product of smoothsteps), **Stucco** (the knee curve),
+  **Swirl** (the twisted UV, the unclamped colour overshoot Max's arms
+  have), **Marble** (the seventeen-band veins, 500× the point),
+  **Perlin Marble** (Levels of turbulence into sin(x + 4 turb − 3),
+  the thirteen-knot Catmull-Rom over the two colours and their
+  Saturation tones), **Checker** (Max's parity rule — two checks per
+  tile — and the integrated Soften), **Tiles** (Max's mortar
+  geometry: gap over 100, brick width 1/(count + mortar), the
+  box-stepped bands; **Line Shift**, **Random Shift**, **Color
+  Variance** added), **Waves** (the C runtime's rand() walk — srand(1)
+  gives 41, 18467, 6334… and a test pins it — so a Max seed places
+  Max's wave sets), and the **Gradient Ramp**'s eleven shapes (Linear,
+  Radial, Box, Diagonal, Four Corner, Pong, Spiral, Sweep, Tartan,
+  Normal, Mapped) on a three-flag ramp. Five maps new on the shelf:
+  Marble, Perlin Marble, Wood, Dent, Gradient Ramp (28 nodes).
+- **Sizes are Max's Size** (coordinate over Size; 0 reads 0.0001 as
+  Max guards it) at Max's own defaults divided by 100 — Max sizes its
+  maps for a hundred-unit object, Halcyon's generated coordinates
+  span one — so the default look is Max's on a unit box; the 2D maps
+  take a **Tiling**. Max's Smoke velocities and every random are
+  Halcyon's hash, so a Max scene's exact pattern is not reproduced,
+  only its character (DISCLOSED); Tiles' Line Shift follows the
+  documentation (half a tile at 0.5) rather than the port's
+  0.5 + shift, and Holes is a literal percentage of tiles.
+- **Falloff**: Max's exact Fresnel equation (which is NOT the textbook
+  dielectric at normal incidence — 0.0319 at IOR 1.6 where the
+  textbook reads 0.0533; Halcyon follows Max because Max's Falloff
+  does, and a test says so); **Distance Blend** in Max's order (Side
+  inside Near, Front past Far, the tweener between) with
+  **Extrapolate**; **Shadow / Light** (how much lamp light lands
+  here — the Light Meter's road, so it shades on the CPU and the GPU
+  refuses it by name). Camera X/Y and Local axes are not built
+  (DISCLOSED; View and the world axes are).
+- **Output** in max_base_Output's order: RGB Level, RGB Offset by the
+  alpha, **Output Amount** (colour and alpha), Invert, Clamp (now off
+  by default, as Max), **Alpha From RGB**; **Mask** scales the alpha
+  with the colour. Mix / Blend / Top-Bottom ride Max's mixing curve.
+- **The eight Standard shaders** as new master models, appended as
+  24..31 so no code moves, each labelled "(3ds Max)": **Phong**
+  (R·L to 2^(10 g)), **Blinn** (N·H to 4 × 2^(10 g)), **Metal**
+  (Cook-Torrance with Beckmann at 1 − g, the geometric term, the
+  Fresnel of the diffuse's own intensity; the diffuse dimmed by
+  1 − Specular Level), **Anisotropic** (Max's Gaussian lobe on world Z
+  projected onto the surface, Anisotropy and Anisotropic Rotation),
+  **Multi-Layer** (Max's Oren-Nayar under two of those lobes — the
+  second from new **Specular Color 2 / Specular Level 2 / Glossiness
+  2 / Anisotropy 2 / Anisotropic Rotation 2** sockets — the second
+  showing through what the first leaves), **Oren-Nayar-Blinn** (Max's
+  Oren-Nayar WITH its interreflection term, which carries the colour
+  inside the diffuse: the evaluator may now return a coloured diffuse,
+  and the GPU loop reads it from `hal_dif_rgb`, the diffuse socket
+  for every other model, bit for bit), **Strauss** (Glossiness and
+  Metalness alone, Opacity as its transparency; Specular Level does
+  not apply, and the light loop skips it for the level-free models —
+  a bitwise pin) and **Translucent** (Blinn under Lambert, a new
+  **Translucent Color** lit from either side). Max's Glossiness is the
+  master's percent over 100, Specular Level the master's own,
+  **Soften** folds the cosine BEFORE the power as Max does. DISCLOSED:
+  Strauss's and Multi-Layer's light-colour mixes are taken for a
+  white lamp; Translucent's hemisphere sums are taken per lamp; Max's
+  object-space tangent is world Z here; Ambient Color, Reflection
+  Dimming and Self-Illumination as a value remain unbuilt. The old
+  PHONG…TRANSLUCENT models are untouched and render bitwise.
+- **The simulator's float32 discipline**: a Python literal inside a
+  GLSL vector constructor (`vec3(h, 0.0, 0.0)`), `float(u)` of a uint
+  hash, and a float binding could all promote a lane to float64 — a
+  precision no GPU has, which a Max noise twin exposed by drifting
+  1e-3 through a zero-weighted term. Constructors, coercions and
+  bindings now hold float32, and a test pins a hash-fed sum to the
+  bit. Every GLSL twin in the suite is the stricter for it.
+- **CPU cost**: the noise maps run their octaves 16k points at a
+  time (their temporaries stay in cache — measured, halving the
+  frame-sized cost); Cellular is Max's algorithm at Max's cost (about
+  3 µs a point a pass, spread over the workers).
+- Tests: `test_max_second_reading` (~150 checks: every table, every
+  twin, every node on both devices, the shaders' laws, neutrality
+  against 1.85.0), `test_max_study` carried to the new signatures.
+
+### Max's own material panels as nodes, the last maps, and the 2012 preset
+
+The field's second ask, mid-round: *"Add brand new Shader nodes
+dedicated to being 1 to 1 with 3DS Max's Shader nodes. Similar to
+our Master Shader, or the Blender Internal Shader, but for 3DS Max.
+Add nodes for the missing textures/utils/vectors. Add a render preset
+for 3DS Max 2012."*
+
+- **Standard (3ds Max)** — Max's Standard material as one node, 1:1
+  with its rollouts: Shader Basic Parameters (**Wire** → Halcyon's
+  wireframe road, **Faceted**, the eight-shader menu), the chosen
+  shader's own rollout (**Ambient / Diffuse / Specular** with the
+  **Ambient = Diffuse** lock — Halcyon carries the ambient colour's
+  intensity as the ambient level, DISCLOSED — **Self-Illumination**
+  as a percentage, Max's exact lerp: the surface glows with its own
+  diffuse by that share and its shading dims by the same, or as the
+  **Self-Illum Color** added; **Opacity**, **Specular Level**,
+  **Glossiness**, **Soften**, and each shader's extras — **Diffuse
+  Level**, **Roughness**, **Anisotropy**, **Orientation** in degrees,
+  the second layer, **Metalness**, **Translucent Color**), the
+  Extended Parameters with a road here (**Opacity Falloff** In/Out
+  and Amount — the opacity varies by the view angle, so it shades on
+  the CPU and the GPU refuses by name — **Index of Refraction**) and
+  the Maps that have one (**Diffuse** with **Diffuse Map Amount**,
+  **Bump** with **Bump Amount** — Max's 30 is strength 1 —
+  **Reflection** as an amount, traced). The sockets show Max's labels
+  and units over master-compatible IDENTIFIERS where the unit
+  matches and `Max …` identifiers where the evaluator converts
+  (percent / 100, degrees / 360), the BI Material node's idiom — so
+  the bake and frame machinery treat the node exactly as the master,
+  and a **linked percentage chain earns no per-pixel grant** (the
+  probe refuses by name rather than the GPU shading a Specular Level
+  of 60 as 6000 percent; found by the test, fixed in the grant).
+  The node at Blinn renders **bitwise the master at MAX_BLINN** with
+  the values converted, a pinned test. DISCLOSED as unbuilt: 2-Sided,
+  Face Map, Opacity Type, Filter Color, Reflection Dimming, Wire
+  size and units, SuperSampling, Dynamics.
+- **Raytrace (3ds Max)** — Shading (Phong, Blinn, Metal,
+  Oren-Nayar-Blinn, Anisotropic), **Ambient**, **Diffuse**,
+  **Reflect** (a colour: its brightest channel is the traced
+  reflection's amount, its hue the tint), **Luminosity** (the glow,
+  added), **Transparency** (a colour: its intensity is the
+  see-through amount, 1 − mean), **Index of Refr**, the Specular
+  Highlight and the Bump slot; the exporter reads Opacity, Falloff
+  and Transparency as alpha reasons. DISCLOSED as unbuilt: Extended
+  Parameters (Extra Lighting, Translucency, Fluorescence, Color
+  Density, Fog, reflection attenuation), Environment and the map
+  slots' amounts.
+- **Gradient (Max)** on tex_gradient's own algorithm: three colours
+  (Color 3 at the bottom through Color 2 at its Position to Color 1
+  at the top — Max's order), Linear or Radial, **Noise Amount** of
+  Max's noise3 at **Noise Size** (20 / size, +1) with Phase as the
+  third axis — Regular, or Fractal / Turbulence octaves at doubling
+  frequency with a fractional level counting by its fraction — then
+  the **Threshold Low / High** through Max's `sramp` with **Smooth**
+  rounding the corners.
+- **Composite Map (Max)** (the Composite material stays under
+  Materials): Layer 1 and up to four layers over it, each with
+  **Opacity**, a **Mask** and one of Max's **twenty-five blend
+  modes** in Max's order (Normal, Average, Addition and Subtract
+  unclamped as Max's, Darken, Multiply, Color Burn, Linear Burn,
+  Lighten, Screen, Color Dodge, Linear Dodge, Spotlight, Spotlight
+  Blend, Overlay, Soft Light, Hard Light, Pin Light, Hard Mix,
+  Difference, Exclusion, Hue, Saturation, Color, Value — the last
+  four through Max's HSL), landed by Max's "over": the layer
+  un-premultiplied, its alpha times the mask times the opacity, the
+  blend where both are present, the layer alone where only it is,
+  the result alone where only it is, over the union alpha; a result
+  short of full alpha premultiplied at the end, as Max's. An unlinked
+  layer is Max's empty slot and is skipped, as is a layer at
+  Opacity 0. (Max's port assigns the whole colour from one channel in
+  Color Dodge — a port bug; the per-channel form is built.)
+- **Color Correction (Max)** in Max's order: **Channels** (Normal,
+  Monochrome, Invert, or Custom with a source per output channel from
+  Max's eleven — a channel, its inverse, mono, one, zero), then in
+  Max's own HSL (its CalcHue / CalcSat / CalcLum and their inverse,
+  the `rotate` wrap with its truncated span count) the **Hue Shift**
+  in degrees, **Saturation** added as a percentage, the hue pulled
+  toward the **Hue Tint**'s by **Strength**; then **Lightness** —
+  Standard's **Brightness / Contrast** about mid-grey or Advanced's
+  **Gain** (percent), **Gamma** about the **Pivot**, **Lift** —
+  every control mappable per pixel. DISCLOSED: Max's separate
+  per-channel R/G/B Advanced controls are not built (Advanced applies
+  to RGB together).
+- **Vertex Color (Max)**: the mesh's painted colour as Max's Vertex
+  Color channel or its Vertex Alpha, **Sub Channel** All / Red /
+  Green / Blue, a **Channel Name** for a named colour attribute (the
+  active layer is the one the G-buffer carries, so a named layer
+  shades on the CPU, refused by name as Blender's own node is).
+  DISCLOSED: Max's Vertex Illumination channel has no Blender
+  counterpart.
+- **XYZ Coordinates (Max)** — the 3D map Coordinates rollout on
+  Max's own matrix order: the source (Object XYZ, World XYZ, the
+  explicit map channel, the vertex colour channel, or Halcyon's
+  generated bounds — what every 3D map reads unlinked, kept and
+  labelled as not a Max source), **Offset**, **Angle** X/Y/Z in
+  degrees (X, then Y, then Z) and **Tiling** — the scale leaving the
+  turned offset alone, exactly as Max's `Scale(s, trans=FALSE)` does.
+- **The object frame reaches the GPU.** Object XYZ needs the
+  object's own coordinates, which the GPU road never carried — and
+  the Texture Coordinate node's **Object** output had been answering
+  world position there while the CPU answered object space: a silent
+  split on any moved or turned object, against the doctrine. The
+  material now bakes the per-object inverse matrices as row lookups
+  by object index (the same mechanism as the Generated bounds, in
+  the main pass and the height pre-pass), `hal_object` reads the
+  world position through them exactly as the CPU's einsum, and a
+  test renders moved objects on both devices. Frames of unmoved
+  objects are unchanged.
+- **3ds Max 2012, Default Scanline (2011)** render preset: 640×480
+  square pixels, the Standard material's Blinn for anything without
+  a material, anti-aliasing with the Area filter (a pixel-wide box
+  over 4×4 samples is the nearest this engine has to Max's
+  1.5-pixel area — DISCLOSED), Filter Maps (pyramidal texture
+  filtering), shadow maps at 512 with Sample Range 4, black ambient
+  (Max 2012's environment ambient), the raytracer's global depth of
+  9, no light limit, and NO gamma/LUT correction — 2012 shipped with
+  it off, so the frame is the linear light on a 24-bit output with
+  no dither. 90 presets.
+- The shelf: 35 nodes (18 textures, 8 utilities, 2 vector nodes, the
+  two material nodes and the five compound materials). Maps of Max's
+  library still without a node: Bitmap (Blender's Image Texture),
+  Combustion, Particle Age / MBlur, Flat Mirror, Raytrace, Reflect/
+  Refract, Thin Wall Refraction, Normal Bump (Blender's Normal Map),
+  Camera Map Per Pixel, Substance.
+- The node maker takes a string property, a labelled enum (a rewired
+  channel or a layer's blend would be unreadable bare) and **show
+  rules**: a socket or menu shown only under a menu value, a linked
+  socket always staying — Color Correction shows Standard's OR
+  Advanced's lightness controls and the rewire menus only under
+  Custom; Falloff shows its type's distances or IOR; Gradient Ramp
+  its Mapped input only when Mapped — Max's rollouts, not a wall of
+  every control.
+- Tests: `test_max_shelf_completion` (170 checks: the material nodes
+  on both devices and their laws, every new twin bit-exact, the
+  blend modes, the maps on both devices, the object frame on moved
+  objects, the preset), the shelf census carried to 35. Suite green.
+
+---
+
+## [1.85.0] — 2026-09-05
+
+### The Max study — 3ds Max's materials and maps, and the Add menu put in order
+
+The field's ask: *"Going back to the 3D stuff, try to add as much
+stuff (material) from 3DS Max as possible. And in the Add menu,
+categorize and submenu the texture nodes better, and move the Matcap
+coords into the vectors submenu, also put the BI texture in the BI
+submenu. Move Halcyon submenu to the top of the add menu"* — then:
+*"The 3DS Max utils, vectors, textures, etc, should be in a 3DS Max
+submenu in Halcyon."* The 3ds Max 2012 reference was read rollout by
+rollout (Standard's shaders and Extended Parameters, Raytrace,
+Matte/Shadow, Ink 'n Paint, the compound materials, the map
+library); Autodesk never published the algorithms, so every map
+below reproduces Max's CONTROLS — names, ranges, defaults — and
+builds the look those controls produced from Halcyon's own
+integer-hash primitives, with a GLSL twin written line for line.
+
+- **The 3DS Max submenu** (Add ▸ Halcyon ▸ 3DS Max), four families:
+  - *Materials*: **Blend** (Material 1/2 by Mix Amount or a linked
+    mask; Use Curve with the Lower/Upper transition zone), **Double
+    Sided** (Facing and Back materials; Translucency lets each show
+    through the other — the face's side is the stored face normal
+    against the view on both devices, not the raster flag), **Top/
+    Bottom** (by the shading normal's world up; Position and Blend),
+    **Shellac** (the Shellac material's colour ADDED over the Base by
+    Color Blend), **Composite** (the Base and four layers, each
+    Additive by its Amount 0..2 or Mix by its Amount 0..1). All ride
+    the closure road as Mix Shader does: colours per pixel, parameters
+    by share, a per-pixel parameter refusing the GPU by name. Pinned:
+    Blend at a constant amount is BITWISE the Mix Shader at that Fac;
+    one bare side is that material alone; Shellac at 0 is the Base and
+    at 1 is the Add Shader, bitwise; Composite bare is the Base.
+    DISCLOSED: Max's Subtractive composite mode has no lobe form and is
+    not built (the menu offers Additive and Mix); Top/Bottom reads
+    world up only (Max's Local coordinates are not built); Matte/Shadow
+    and the Raytrace material's own dials (Fluorescence, Color Density,
+    Fog, Extra Lighting) are not built this round.
+  - *Textures*: **Noise** (Regular / Fractal / Turbulence; Levels as
+    a FLOAT — the octave past the integer part enters at a fraction,
+    so animating Levels is smooth; Low / High thresholds; Phase),
+    **Cellular** (Circular or Chips — a Chebyshev-metric Worley for
+    the plates; Spread; Fractal with Iterations and Roughness; the
+    Low / Mid / High cut into Cell Color and the two Division Colors),
+    **Smoke** (Iterations, Phase, Exponent), **Speckle**, **Splat**
+    (Iterations, Threshold), **Stucco** (Thickness, Threshold),
+    **Swirl** (Center X/Y, Twist, Swirl Intensity, Swirl Amount,
+    Constant Detail, Color Contrast, Random Seed), **Planet** (three
+    water colours by depth, five land colours by height, Ocean %,
+    Island Factor, Blend, seed), **Waves** (Num Wave Sets, Wave
+    Radius, Wave Len Min/Max, Amplitude, Phase, 3D/2D distribution,
+    seed), **Checker** (Soften), **Tiles** (Stack, Running, English
+    and Flemish bonds; Horizontal/Vertical Count and Gap; Holes %;
+    Fade Variance; seed; a Tile ID output), **Falloff** (Perpendicular
+    / Parallel, Towards / Away, Fresnel by IOR, Distance Blend with
+    Near/Far; against the view or a world axis). DISCLOSED: Falloff's
+    Shadow/Light type is not built; Max's Dent, Marble, Wood, Gradient
+    Ramp and Perlin Marble are not duplicated — Halcyon's Dents (the
+    3D Studio one), Marble, Wood, Gradient (Shaped) and Color Ramp
+    already cover them.
+  - *Utilities*: **Mix** (with the mixing curve), **RGB Tint**,
+    **Output** (RGB Level, RGB Offset, Invert, Clamp), **Mask**
+    (Invert Mask; the mask as an Alpha output), **RGB Multiply**
+    (Alpha From Map 1 / Map 2 / Multiply).
+  - *Vectors*: **Coordinates** — Max's Coordinates rollout: source
+    (Explicit Map Channel, Planar from Object XYZ, Planar from World
+    XYZ, Screen), Offset U/V, Tiling U/V about the map's centre,
+    Mirror U/V, Angle W (its trig baked as the CPU's own float32).
+    DISCLOSED: Face Map coordinates are not built (the shading
+    context carries no barycentrics yet).
+- **Every map's GLSL twin is held to its NumPy original** at 2000
+  random points (bit-exact for the lattice maps, ≤ 2e-3 where a
+  driver's trig enters), and every node to the CPU frame on the
+  deferred pass (≤ 1e-4).
+- **The master shader**: **Oren-Nayar-Blinn** (Max's matte shader —
+  the rough diffuse under 3D Studio MAX's Blinn highlight, appended
+  as model 23 so no GLSL code moves; the socket tables and the
+  measurement test know it), and **Faceted** (Max's flag: the stored
+  face normal replaces the shading normal for that material, whatever
+  the model — the GPU substitutes hal_triaux after its bend, the
+  CPU's order; the probe grants it). DISCLOSED for next time: Max's
+  Multi-Layer second-lobe controls, Self-Illumination as a value,
+  Ambient Color, Reflection Dimming, Translucent Color.
+- **Ink 'n Paint** as a Cartoon era (Shaded 70 percent of Lighted as
+  a transparent shadow cel, two paint levels, no highlight) and a
+  shelf recipe with Max's light-blue default paint (templates 113,
+  eras 9).
+- **The Add menu**: the Halcyon entry is PREPENDED (first in the Add
+  menu, a separator after it); the Textures menu is categorised —
+  Noise & Fractal; Stone, Wood & Organic; Tiles & Fabric; Sky, Water
+  & Effects; 2D Media — with a census holding every pattern node to
+  exactly one category; Matcap Coordinates draws in the Vector family
+  and the BI Texture in the Blender Internal family (families may now
+  reference nodes other modules own, by id, label and icon; the census
+  resolves them). Pattern-node checkboxes and counts draw with their
+  names (an unlabeled checkbox was unreadable).
+- **The one engine change**: an Add Shader of two Halcyon masters
+  averaged their colours on the CPU while the GPU summed its colour
+  chains — a silent divergence (parity 0.61) the Shellac road exposed.
+  The CPU now sums: a weight total past 1 scales the blended colour by
+  that total, so the two devices agree (parity 2e-6) and Shellac /
+  Composite Additive mean what Max meant. Every mix (weights summing
+  to 1) holds bitwise, pinned against the 1.84.0 engine.
+- Tests: `test_max_study` (~120 checks), the Add-menu census rewritten
+  for the categorised shelf and the cross-family references, the
+  tooltip enforcement extended to the Max shelf. Suite green.
+
+---
+
+## [1.84.0] — 2026-09-03
+
+### The hair pass, the film scans and the tooltips
+
+The field's ask, all three parts: *"Add more resolutions. Upgrade and
+detail the hair section of the anime/cartoon shaders. Ensure every
+option has detailed useful tooltips."* Every addition is inert at its
+default: a 1.83.0 file renders bitwise on both masters.
+
+- **The hair pass.** The angel ring's edge takes a **Hair Shine
+  Shape** menu on both cel masters: *Smooth Wave* (the sine edge it
+  always had — old files land here and render unchanged), *Zigzag*
+  (the hard "W" highlight of 90s TV cels), *Scallop* (round petals in
+  a run, the shoujo dressing), *Step* (square battlements, the early
+  digital look). All four are period-matched waves in the same -1..1
+  frame, so switching shapes moves no band edges — only the wave's
+  voice changes.
+- **Hair Shine Angle** (degrees): turns the wave's phase around the
+  head. The band stays at its height; the notches walk around the
+  silhouette — stagger two characters' rings without touching
+  anything else.
+- **Hair Shine Follow** (0..1): how much the band rides the key
+  light's height. 0 is the painted band that ignores lighting — the
+  default, and exactly the old behaviour. 1 lifts and lowers the band
+  with the key's elevation (a fixed-key cel master reads its own
+  Light Elevation; a scene-lit one reads the sun's or hemi's height).
+  DISCLOSED: a purely positional lamp (a point light with no
+  direction) has no height for the band to read, so Follow is inert
+  under one — the band stays painted rather than guessing.
+- **Hair Shine Second Color**: the echo band below the main ring
+  carries its own tint, multiplied over the Hair Shine Color. White
+  is bitwise the old copy-the-colour behaviour.
+- **The Cartoon master takes the whole hair bag** — the same eleven
+  sockets the Anime Shader carries, the same code path, because the
+  American tradition airbrushed hair highlights too. All eleven sit
+  at inert defaults on old files.
+- **GPU parity**: every new road renders identically on both devices
+  (shape and key selection bake statically; the second tint rides
+  per-pixel, so it can be textured). DISCLOSED: the Follow lift
+  rounds through float32 in a slightly different order on the GPU;
+  the difference stays inside the engine's parity tolerance and the
+  suite pins it there.
+- **24 more resolution presets** (140 total). A new **Film Scans**
+  group: 35 mm Full Aperture 2K (2048×1556) and 4K (4096×3112),
+  Academy 2K (1828×1332), Super 16 2K (2048×1234), and CinemaScope
+  2K (1828×1556 at 2:1 anamorphic pixel aspect — render spherical,
+  and the un-squeeze is in the pixels, exactly how scope scans
+  store). Home computers: Amstrad CPC, VIC-20 (its fat 46:33
+  pixels), Atari ST Medium and High Mono, Sharp X68000, NEC PC-88.
+  Consoles and handhelds: TurboGrafx-16 (8:7), 3DO, Game Gear,
+  Atari Lynx, WonderSwan. Desktop and modern: XGA+, HD Laptop 1366,
+  HD+ 1600×900, WQXGA, QSXGA, Social Portrait 4:5, Super Ultrawide
+  DQHD, Ultrawide 5K2K.
+- **Tooltips everywhere.** Every socket on the Anime, Cartoon and
+  Volume masters, every property and enum entry on every shader and
+  pattern node, and every render, material, light and world setting
+  now carries a written tooltip of substance. Old files gain the
+  socket tips the moment they load (the load-time migration applies
+  the doc tables). The suite enforces the bar from here on — a new
+  option without a real tooltip is a failing test
+  (`test_tooltips_everywhere`, and the settings test's bar rose to
+  40 characters).
+- Tests: `test_hair_pass` (shapes pairwise distinct, the angle
+  turns the notch, Follow moves the band's centroid with the sun
+  and holds it at 0, the tint touches only the echo band and white
+  is bitwise nothing, the Cartoon ring, GPU parity on four new
+  roads, and bitwise 1.83.0 neutrality for old graphs on both
+  masters), `test_tooltips_everywhere`. Suite green.
+
+---
+
+## [1.83.0] — 2026-09-03
+
+### The preset expansion — more cartoon and anime looks, the accuracy homework done here
+
+The field's ask: *"Add more cartoon/anime presets, etc. I generally
+don't really know what exactly is needed for accuracy because I'm a
+3D guy, not a 2D guy."* So the 2D homework lives in this entry: each
+preset below says what it imitates and why its numbers are what they
+are. Nothing in the engine changed this round — only tables, menus
+and recipes — and a default scene renders bitwise the 1.82.0 frame.
+
+- **The Anime Shader's Style menu** (`ANIME_STYLE_PRESETS`, the
+  Cartoon Era applicator's pattern): writes the tone sockets and the
+  tone menus to a named decade's starting point, edit freely after.
+  The kage colours are multiply TINTS on the material's own paint —
+  the cel painter picked the shadow colour one step down from each
+  local colour, so a tint serves every palette. Every style writes
+  the SAME full sweep of sockets and menus (switching styles leaves
+  no leftovers), and never touches paints, textures or the key's
+  angle. The six:
+  - *80s Film Feature* — the 35 mm theatrical look: ONE restrained
+    warm-grey kage (0.74, 0.64, 0.66) with the optical printer's
+    slight edge softness (0.03); matte paint (specular 0 — cel paint
+    has no gloss); a wide, gentle hair sheen (0.3 at width 0.10, low
+    wave) rather than a hard ring; a breath of airbrush inside the
+    shadow edge (0.2, shadow side) — features could afford the extra
+    cel work; ambient a touch up (0.4, the fuller backgrounds).
+  - *80s TV* — the broadcast cel: the same two-band machinery cut
+    HARD (0.008 — ink and paint, no optical gentling on a TV
+    schedule), the kage leaning cool violet (0.64, 0.52, 0.62), and
+    the classic angel-ring: shine 0.6, width 0.07, six visible waves.
+    No airbrush, no rim — the schedule allowed neither.
+  - *80s OVA* — the video market sold detail: THREE tones (a second
+    deeper kage at 0.26), a Fresnel rim as the painted edge-light
+    (0.35 at power 2.0), a double hair shine (second band 0.5),
+    airbrush on BOTH sides of the edge (0.35), and a small tight
+    specular (0.3) for the era's glossy hair and metal.
+  - *90s TV* — late cel: the kage cooler and more saturated (0.58,
+    0.46, 0.66), edges a shade harder (0.006), faces held a touch
+    brighter (bias +0.03), and the hair band bolder and simpler —
+    three deep waves instead of six shallow ones.
+  - *2000s Digital* — digital ink and paint: dead-hard bands (0.004
+    — no gate, no optics), the kage slightly desaturated the way the
+    early RGB palettes ran (0.66, 0.58, 0.70), a crisp thin waveless
+    hair band, a small tight specular. The film-side pair below
+    keeps the chain clean.
+  - *Modern* — the current pipeline: a gently softened single tone
+    (0.02), warm-shifted kage (0.76, 0.66, 0.72), Shadow Smoothing
+    0.25, and the R238/R239 machinery turned on: the camera key, the
+    depth rim on the lit edge (0.45 at 3 px), the marched contact
+    shadows (0.5 over 20 px).
+- **Two more Cartoon eras**: *Wartime Noir (1940s)* — the dark
+  theatrical action short: the transparent shadow cel exposed DEEP
+  (amount 0.85, a cool 0.40, 0.38, 0.52 multiply), pushed well onto
+  the lit side (threshold 0.60) with a dead-hard edge — drama first;
+  *Modern Flat (2010s)* — one barely-darker cool tone (0.82, 0.79,
+  0.90) in a SMALL region (threshold 0.42), hard-edged, over heavily
+  simplified forms (smoothing 0.55) — the thin-uniform-line era.
+- **Five more Cel & Film render presets**: *1920s silent (worn
+  nitrate)* — MONO grade, heavy weave and flicker, coarse clumped
+  grain, dirt, hairs, base scratches, and Reel Length 15 so the
+  projectionist's cue discs actually appear; shadows off (the 20s
+  painted none) under a heavy boiling brush line. *1980s anime
+  feature (35 mm)* — fine coloured grain, gentle softness, the
+  telecine's slight warmth (TV_80S grade at 0.4), a thin steady
+  resolution-true line, on twos. *2000s digital ink and paint* — NO
+  film in the chain at all (every wear dial 0), a slight SD master
+  softness, held on threes. *Modern digital anime (1080p)* — clean
+  but for the compositor's one fine monochrome grain sheet (0.06 at
+  size 0.8, chroma 0), on twos. *Modern flat TV (1080p)* — nothing
+  filmed anywhere, a dead-even vector line. Each preset's note names
+  the Style or Era to pair with.
+- **Three shelf recipes** (112): *Cartoon Wartime Noir* and *Cartoon
+  Modern Flat* ride the era helper (generated FROM the era table, so
+  the shelf and the menu cannot drift); *Anime 80s OVA* is generated
+  from the Style table the same way, with the validator's own check
+  pinning them equal.
+- **Tests**: `test_preset_expansion` — the tables' shape (every key
+  a real socket, every style the same full sweep); the applicator
+  writes and CUSTOM writes nothing; the Modern style turns the
+  pipeline on and the next style turns it back; EVERY anime style
+  and EVERY cartoon era renders pairwise-distinctly on the demo
+  scene (vacuity doctrine: a preset that renders like another is a
+  decorative dictionary entry); the five presets' semantic pins (the
+  silent print's cue discs, the digital chain's clean zeroes, the
+  modern master's one sheet); the shelf-table equality; and the
+  default frame bitwise the 1.82.0 engine's.
+
+Still open, disclosed: the style tables describe the TONE DRESSING
+only — paints, textures, line style and film chain stay yours (the
+render presets carry the film half, and their notes say which pairs
+belong together); the decade names are shorthands for conventions,
+not claims about any one studio; no style sets the SDF face map (it
+needs a map of your character).
+
+---
+
+## [1.82.0] — 2026-09-03
+
+### The Xrd study — the Guilty Gear techniques, from the sources
+
+The field sent the sources: Noggi's two videos and style summary, his
+starter kit, and behind them the primary documents both draw from —
+Junya Motomura's GDC talk on Guilty Gear Xrd and Arc System Works'
+own "Toon Line Control Techniques" deck. This round implements what
+Halcyon was missing from them, and proves what it already had.
+
+- **Line Control** (Material Properties ▸ the Ink row, both roads):
+  the ASW convention on the mesh's vertex colours, read at the pixel
+  that owns the line. **ALPHA multiplies the width** — 0.5 is the
+  width as set (their own baseline), 1 doubles it, 0 erases the seed
+  outright so the neighbouring line flows past (their glove-rim and
+  sleeve-opening trick). **BLUE holds interior and marked lines back**
+  until the surface turns toward its silhouette — their hull's
+  depth-offset trick read as facing (draw when |n·v| ≤ 1 − blue): the
+  nose line that only appears in profile. Silhouette seeds are exempt,
+  exactly as a pushed-back hull still rims the silhouette; the deck's
+  GREEN (distance compensation) is deliberately not read — a
+  screen-space line already holds its width, which is that channel's
+  whole purpose. A controlled material routes onto the distance-field
+  road (alpha 0.5 everywhere reproduces the styled line to a
+  millionth); a mesh without a colour layer controls nothing; OFF
+  everywhere is bitwise the 1.81.0 engine.
+- **Vertex Colour AO under every mode**: the GDC talk's words are "a
+  channel from the Vertex Colors as an offset on the Threshold" — not
+  a game-texture feature. The checkbox now works under GENERIC,
+  GENSHIN and ZZZ exactly as it always did under the ArcSys lineage
+  (white neutral, painted-down red forces the tone into shadow), on
+  both devices. Before, outside the ArcSys modes it was a dial that
+  changed nothing, which the audit doctrine exists to forbid. The
+  ArcSys branch keeps its 1.62 float order, so old files' pixels do
+  not move.
+- **Face Shadow (SDF)** (the Anime Shader, both devices): the modern
+  anime face — Guilty Gear's and the HoYo titles' shared convention,
+  the starter kit's own headline shader. Link the face's shadow map
+  (the game's, or any chain — it bakes once to a 256² field, exactly
+  the ramp road's idiom) and the map REPLACES the lambert wrap in the
+  lamp loop: lit where the field outweighs the key's horizontal angle
+  about the face's frame (angle/π), the map mirrored across the
+  face's centre line for the other side, the terminator sweeping as
+  the light or the head turns — drawn, never found on the normals.
+  The band thresholds, softness, ramp, airbrush, cast shadows and
+  R238 screen shadows all still apply on top; Shadow Bias and the
+  vertex AO stand down (the map IS the authored bias). **Face
+  Forward / Face Up** name the head's axes; the frame follows the
+  first object wearing the material (a face material is one head's —
+  the games' own arrangement), normalised so a scaled rig keeps its
+  directions. On the GPU the baked map rides a `hal_facesdf` atlas
+  and the frame bakes as literals — a turned head is a changed mesh,
+  which re-plans anyway.
+- **The X factor, proved**: hand-edited custom split normals were
+  already honoured — the exporter reads corner normals (4.1's
+  `corner_normals`, with the `calc_normals_split` fallback), so
+  Blender's Data Transfer from a proxy sphere, the Normal Edit
+  modifier and hand-sculpted normals reach both devices. New tests
+  pin it: a cube given a sphere's corner normals shades round under
+  the cel, and the ink pixels stand still under the transfer —
+  Motomura's dual-normal-set problem (lighting normals vs hull
+  normals) solves itself on a post-process line. The kit's Light
+  Rotation Catcher is likewise moot here: Halcyon's materials are
+  handed the lamps themselves, and R238's fixed keys go further.
+- **Template** (109): *Cel SDF Face* — a spherical gradient standing
+  in for the game's face SDF, under the camera key; link the real map
+  for the real thing.
+- **Exporter**: the material's `ink_vc`, the Anime node's
+  `face_forward` / `face_up`; old files grow the face socket at load
+  and shade bitwise as before.
+- **Tests**: `test_xrd_study` — the layer alone moves nothing; alpha
+  0.5 the width as set, 1 double, 0 erased; blue holds interior lines
+  and leaves the silhouette; band invariance in three bands; GENERIC
+  occlusion (paint forces shadow, white neutral to a hundred-
+  thousandth, the layer alone nothing) with GPU twins under GENERIC
+  and GENSHIN; the face bake's laws (square, 0..1, cached, unlinked
+  none); a frontal key lights the whole cel and a key nearly behind
+  shadows it, monotone in between, mirrored per side, the frame
+  following its named axes, band-invariant, GPU twins with the atlas
+  sampled; the sphered cube and the still ink; 1.81 scenes bitwise
+  (colour layer present; ARCSYS + occlusion).
+
+Still open, disclosed: the line control reads the mesh's FIRST colour
+layer (the exporter's own convention); blue gates by smooth-normal
+facing, not a true hull depth push — a deliberate translation; the
+face frame is per material, not per object (two heads sharing a face
+material share a frame — split the material, as the games do); the
+face map's sampling assumes the face UV island is authored mirrored
+about u = 0.5, the games' own convention; no SDF authoring tool ships
+— the maps come from the game or any node chain.
+
+---
+
+## [1.81.0] — 2026-09-01
+
+### The cel's light — shading light, screen shadows, the depth rim, smoothing shapes, the cartoon airbrush
+
+The field's ask: *"some general Cartoon and Anime shading things for
+the 2D stuff — mainly to get better shadows, better lighting, accurate
+to the style shading."* A hand-drawn cel is not lit by lamps in a
+room: the key is decided per shot (usually from the screen's upper
+left) and every character is lit by it the same way whatever the set
+does; its cast shadows are DRAWN shapes — the hair's across the brow,
+the chin's on the neck, the feet's on the ground — crisp and close;
+and the silhouette carries a rim of light where it turns from the key
+or the backlight. The 3D-anime pipelines rebuilt each of these on
+purpose (the character light, screen-space shadows, the depth rim),
+and this round gives the Cartoon and Anime Shaders the same three, in
+a new module `core/celfield.py`, on both devices.
+
+- **Shading Light** (both cel masters): *Scene Lamps* — as before,
+  every lamp its own tone verdict; *Camera Key* — one key fixed to the
+  camera by **Light Azimuth** and **Light Elevation** about the screen
+  (0/0 the light from the viewer, +azimuth from the screen's left,
+  +elevation from above; the defaults 35/30 the drawing's upper-left
+  key), composed on the camera's axes each frame so the character is
+  lit the same way on screen wherever the camera goes; *World Key* —
+  fixed in the world (azimuth from +X counter-clockwise, elevation
+  above the horizon). Under a fixed key the key's radiance is π: the
+  lit tone is the paint as painted, the shadow tone the shadow colour,
+  and the scene's lamps only CAST — the visibility is the most any
+  shadow-casting lamp that reaches the object gives (a lamp with its
+  shadow off, or a hemi, contributes nothing; no caster at all is
+  full light), so the sun's map still falls across the cel.
+- **Screen Shadow** and **Screen Shadow Length** (both masters): the
+  drawn contact shadow, marched from the frame's own depth. From the
+  pixel's view-space point the march steps toward the key — every
+  pixel out to forty, every second pixel beyond, to Length pixels at
+  1080 lines — and reads the frame's depth plane (eroded a pixel, so a
+  ray grazing a silhouette cannot flicker between hit and miss) at each
+  step: an occluder nearer than the ray by more than the tolerance
+  (1.5 px of world size at the pixel's depth, growing a quarter pixel
+  per pixel marched, plus twice the receiver's own slope) and by less
+  than the thickness (the larger of 2.5 march lengths and a quarter of
+  the depth, fading over its last third rather than cutting — a cut
+  tore a long shadow's far edge into teeth) shadows the pixel by
+  Screen Shadow. Under a fixed key it multiplies the key's visibility;
+  under Scene Lamps it rides the KEY lamp (the first lamp that is not
+  ambient) and no other.
+- **Rim Mode ▸ Depth Rim**, **Rim Width**, **Rim Side** (both
+  masters): the anime rim. The neighbour Rim Width pixels along the
+  screen-space depth gradient is farther than the surface itself could
+  carry it (3 px of world size per pixel of width, plus twice the
+  steepest one-sided step — a steep flat face is no silhouette, a
+  cube's crease is not) → the pixel is inside a silhouette, and Rim
+  Amount paints the Rim Color there by Rim Blend, as the Fresnel rim
+  does; the side by the key's screen direction against the gradient
+  (Lit Side, Shadow Side, Both), each side fading in from a tenth of
+  the dot against it to three tenths with it.
+- **Smoothing Shape** (both masters): Shadow Smoothing bends the
+  normal toward a *Sphere* (as before), an upright *Cylinder* (the
+  radial direction with the vertical zeroed — the terminator runs
+  straight down a limb or a torso), or *Facing the Camera* (the view
+  vector — the anime face rule: the face one lit plane with only the
+  cast and screen shadows on it).
+- **The Cartoon Shader's Airbrush** — **Airbrush**, **Airbrush
+  Color**, **Airbrush Width** and **Airbrush Side** (Lit, Shadow,
+  Both): the Anime Shader's gradation law against the cartoon's own
+  Shadow Threshold — the lit tone tinted toward the colour in a band
+  above the edge, the shadow tone blended toward it below.
+- **The cel field** (`celfield.compute`): the screen shadow and the
+  depth rim are one whole-frame pass over the G-buffer computed on the
+  CPU before shading, per band across the render's workers, on first
+  use (`job.cel_lazy`; a frame with no material reading it never
+  pays), and read per pixel by BOTH devices — the CPU at the shading
+  context, the GPU from a `hal_celfield` texture fetched at the
+  fragment's pixel — the radiosity field's road, so the two roads see
+  the same numbers by construction. Every pixel marches by ITS
+  material's dials and its own key, so one field serves every cel
+  material at once; a band reads `reach_rows` past its edge. The
+  consumers guard on the field's own depth (a thousandth, relative):
+  a transparent layer over an opaque surface reads nothing of the
+  surface's shadow. Cost: everything is read off the depth plane and
+  the pixel grid in view space (no vertex gathers), one gather per
+  march step — about a second per million cel pixels at the default
+  length on the two-core container, `cel field` in the printed split;
+  a viewport draft at its 64k-pixel budget pays a few tens of
+  milliseconds, the refine the frame's share.
+- **GPU**: the camera's axes ride as frame uniforms (`hal_cam_right`,
+  `hal_cam_up`, `hal_cam_back`) and the key's own-frame vector as a
+  marked colour, so an orbit re-plans nothing; the lamp loop under a
+  fixed key emits shadow-only blocks and the key's block after them;
+  the field sampler joins the opaque frame pass (layer and secondary
+  passes read no field); the airbrush and the shapes are the same
+  operations as the CPU's. Parity on every case is the CPU's picture.
+- **Templates** (108): *Cel Camera Key* (the upper-left camera key,
+  the marched shadows, a lit-side depth rim), *Cel Anime Face* (the
+  face plane facing the camera under the camera key, the hair's shadow
+  marched), *Cartoon Rounded Feature* (the Golden Age paint under the
+  camera key with an airbrushed edge and the contact shadows drawn).
+- **Exporter**: the cel masters' `light_source`, `rim_mode`,
+  `rim_side`, `smooth_shape` and the Cartoon's `airbrush_side` travel;
+  old files grow the sockets at load. Every 1.80 file renders bitwise
+  as before — the old nodes, the defaults and the scene's casters are
+  pinned against the 1.80.0 engine.
+- **Tests**: `test_cel_light` — the key's own frame (azimuth and
+  elevation on both keys, the camera's axes orthonormal, a viewer key
+  composing to the world direction toward the camera), a camera key
+  ignoring the sun and following the camera (two cameras on opposite
+  sides of the set: a world key from +Y screen-right from one and
+  screen-left from the other), the casters still casting, the anime
+  key the cartoon's; the field's laws (deterministic, in 0..1, nothing
+  off the surface, its depth the context's, cel pixels only, a longer
+  march at least the shorter's, no field at the defaults, the guard);
+  the screen shadow's pixels the shadow tone and nothing else moved,
+  by amount, band-invariant in three bands (as the camera key with it
+  and the depth rim); the rim within its width of an object edge, the
+  sides splitting and Both their union, the rim colour painted where
+  the rim is full; the shapes differing and the camera shape one lit
+  plane; the airbrush on the lit side and on the shadow side; GPU
+  twins for eleven cases per node and the two airbrushes; the sockets,
+  the exporter, the templates.
+
+Still open, disclosed: a scene caster's shadow and a fixed key
+disagree in direction unless the caster is aligned with the key (or
+its shadow turned off — the templates say so); the march samples the
+eroded depth plane, so a thing a single pixel wide casts nothing; one
+key per material, not per object; a ground's far horizon is a
+silhouette to the depth rim (keep the rim on the characters);
+transparent layers read no field; the field is a CPU pass — a march
+on the GPU would spare the refine its second at the price of the two
+roads' identical numbers, and is the next item if the field asks.
+
+---
+
+## [1.80.0] — 2026-08-31
+
+### The print's wear — the 40s arc, the last front: grain, dust, hairs, scratches, cue marks
+
+The field's verdict on 1.73: *"The grain and hairs need to be much more
+customizable and interesting."* 1.73 had one grain (white noise per
+pixel, seven parts luminance) and one dust (specks and the odd hair,
+one frame each). This round rebuilds the print's wear as what happened
+to the film, each thing where it happened, in a new module
+`core/wear.py`, and moves the chain into the order the light met it:
+
+- **The chain** (`film.process_linear`): dust on the cel under the
+  rostrum camera → the camera's optics (Softness) → the colour process
+  (with the negative's dust, the grain, the emulsion's scratches and
+  the cue marks inside it) → the stock grade → the same wear on a print
+  that went through no process → dirt on the print → the gate's weave →
+  the hairs in the projector gate → the lamp's flicker. Softness now
+  runs BEFORE the grade (the optics are before the stock) — a 1.73 file
+  with both set differs by the blur's commuting with the curve. The
+  defaults, the bare process, the grade alone, the softness alone and
+  the weave and flicker are bitwise the 1.79.0 engine's (pinned).
+- **Grain** (`wear.grain_sheets`, `grain_sigma`): the negative's silver
+  printed through. The emulsion is a random sheet of grains **Grain
+  Size** pixels wide (white triangular noise blurred to the size and
+  renormalised to unit variance analytically — the same factor at any
+  frame size), a **Grain Clump** share of it in clumps three grains
+  wide, and each record its own sheet by **Grain Chroma** (0 one sheet
+  for every record — a black-and-white negative's; 1 each its own —
+  coloured grain, the way three separate negatives print). The noise
+  is DENSITY noise on the dye amount, RMS = Grain × 0.4 × min(size, 1)
+  × sqrt(a (1 − a)): strongest where half the grains developed, nothing
+  at the clear gate and at D-max — a print's whites and blacks are
+  clean — and grains finer than a pixel average down. Under the
+  process it rides each record's dye before the dyes are laid; with no
+  process the frame's own channels are read as a print's transmittance
+  (a density scale of 2.4) and the noise applied mean-preserving. Sizes
+  are given at 1080 lines and scale with the frame's height, like the
+  ink's widths. About 100 ms at 1080p at the default size; a larger
+  size adds the blur, Clump a second one.
+- **Dust**, three populations by two shares: **Cel Dust** sat on the
+  cel or the platen glass — dark grey under the lights and placed by
+  the hold's KEY frame, so every frame photographed from one cel
+  carries the same specks (the engine hands the post chain
+  `key_frame`); **Negative Dust** blocked the printer light through one
+  record — no dye there, a clear speck (the transmittance raised to
+  1 − coverage, invisible where the print is white), and under the
+  three-strip process ONE record's colour missing (a coloured speck);
+  the rest is dirt on the print, opaque and fresh per frame. **Dust
+  Size** sets the mean radius; every speck its own size and, above a
+  couple of pixels, its own ragged edge.
+- **Hairs** (`wear.hairs`, `hair_points`): caught in the projector gate
+  — anchored at a hashed point on a hashed edge of the aperture,
+  reaching inward as a cubic curve with two hashed bends and a lean,
+  swaying (lattice noise over the frames) and fluttering (the frame's
+  hash) about the anchor, dark and soft-edged, applied AFTER the weave
+  (the gate does not weave). The slot model (`wear._alive`): four
+  slots, each in epochs of one **Hair Hold**; slot k is busy with
+  probability clip(4·Hairs − k, 0, 1), so Hairs 0.25 keeps one hair in
+  the gate nearly always and 1.0 four; a busy slot holds its hair
+  0.6–1.4 holds. **Hair Length**, **Hair Width** in pixels at 1080
+  lines.
+- **Scratches** (`wear.scratch_columns`): the transport's — vertical,
+  the frame's height, at one hashed place with a slow wander and a
+  per-frame jitter, its strength wandering along its length, three
+  slots on the same model with **Scratch Hold**. **Scratch Side**:
+  EMULSION takes the dye away — a dye-transfer print's one gelatin
+  layer loses all its dyes together (a bright neutral line, the silver
+  key with them), a duplitized two-colour print, dyed on both sides,
+  loses one side's dye (a coloured line), and with no process the frame
+  is read as a chromogenic print that loses its yellow first, magenta
+  next, cyan last (the blue scratch); BASE scatters the lamp (a soft
+  dark line, 45 percent at full depth). **Scratch Width** in pixels at
+  1080 lines.
+- **Cue marks** (`wear.cue_patch`): the projectionist's. **Reel
+  Length** in minutes; at `fps` (the scene's, handed through
+  `post.process`) the motor cue starts eight seconds before every
+  reel's end and the changeover cue one second and four frames before
+  it, each four frames long: a scraped disc top right, 3.5 percent of
+  the frame's width across, clear (the transmittance raised to
+  1 − coverage) with the burr of its rim darkening.
+- **Engine**: `post.process(..., key_frame, fps)`; the hold cache's
+  fingerprint now skips EVERY post film dial (keeps the paint stages
+  and the transparency), so a film dial changed mid-sequence no longer
+  refuses the hold.
+- **Presets**: the eight filmed Cel & Film presets carry their wear —
+  the 1930s black-and-white one sheet of coarse clumped grain, dirt,
+  hairs and base scratches; the Technicolor feature three records' fine
+  grain, dust on the cel, a hair now and then; the Fleischer print a
+  touch coarser; Cinecolor's grain on both sides and its scratches one
+  side's colour; the two-strip survivor the roughest; the 16 mm TV
+  print coarser coloured grain; the OVA clean; VHS the film's grain
+  under the tape's noise. No preset sets cue marks: Reel Length is the
+  user's.
+- **Settings** (15 new): `film_grain_size`, `film_grain_clump`,
+  `film_grain_chroma`, `film_dust_size`, `film_dust_negative`,
+  `film_dust_cel`, `film_hairs`, `film_hair_length`, `film_hair_width`,
+  `film_hair_hold`, `film_scratches`, `film_scratch_width`,
+  `film_scratch_hold`, `film_scratch_side`, `film_reel` — a Print Wear
+  box on the Cel Film panel, fifteen audit rows, the tooltips.
+- **Tests**: `test_print_wear` — unit-variance sheets blurred or not,
+  size as neighbour correlation, clump as block variance, chroma 0/1,
+  the frame's own sheet; the density law's zeros and maximum, its
+  proportions; a plain frame's mean kept, the clear gate clean, mono
+  and colour; under the process a white cel nearly clean relative to
+  its light; cel dust held with the key frame, negative dust clear and
+  neutral (coloured under the process, nothing else moved), dirt dark;
+  the slot model's counts (about four at 1.0, about one at 0.25), runs
+  of 7–17 frames at hold 12 in order; a hair anchored at the edge and
+  dancing; hairs darken and nothing else; the IB scratch bright,
+  neutral, full-height at one place; the two-colour one coloured; the
+  chromogenic one blue; the base one dark; a scratch's wander and its
+  runs; the cue marks' frames at 24 and 12 fps, their place, none
+  without a reel; film_on; the hold fingerprint; five post chains
+  bitwise the 1.79.0 engine's; the presets; the panel.
+
+Still open, disclosed: the grain sheets are Gaussian blobs, not the
+emulsion's crystal shapes (T-grain vs cubic); one Dust Size law for
+cel, negative and print; hairs are curves of one width (no fibre
+texture); a scratch is a line (no emulsion tearing at its edges); cue
+marks are scraped circles only (no punched or inked variants); the
+projector's gate edge and vignetting are not modelled.
+
+---
+
+## [1.79.0] — 2026-08-31
+
+### The colour process — the 40s arc, the film look rebuilt
+
+The field's verdict on 1.73: *"the filmlook presets need work (and the
+coloured ones don't really work well, it doesn't look like the cartoons
+do)."* 1.73 graded the frame — a matrix, a gain, a contrast, a
+saturation. This round walks the process a 1940s cartoon actually went
+through, in order, on the linear frame (`film.colour_process`, before
+the stock grade, which is untouched):
+
+- **The records.** The successive-exposure camera shot each drawing
+  three times through red, green and blue filters onto one black-and-
+  white negative; the three-strip camera split the light — the same
+  three records either way. `_M_CAM` is the filters' response with
+  their cross-talk (a red record sees eight percent of the green), rows
+  summing to one; before it, **Filter Sharpness** (`film_filters`) is
+  the taking filters' cut — sharp-cutting filters separate the records
+  further than the eye separates the colours (the analysis matrix
+  (1 + 2s) I − s J, rows summing to one, a record never seeing less than
+  no light): the three-strip's more-than-life saturation, from the
+  filters and not from a saturation dial; below zero the filters
+  overlap and muddy. A white cel exposes every record alike whatever
+  the setting (pinned).
+- **Halation** (`film_halation`, `film_halation_radius`): light
+  scattered in the negative's base veils each record's surroundings
+  with that record's own light — a quarter-size Gaussian veil added to
+  the record before the curve.
+- **The curve** (`print_curve`): the timed print's characteristic in
+  density — the Hurter–Driffield straight line of slope Print Gamma
+  (`film_gamma`) in log exposure, D = gamma · log10((1 + 1/E0) /
+  (1 + E/E0)) with E0 = 1 / (10^(D_max/gamma) − 1), so the timer's
+  light prints a white cel clear, no light prints D_max
+  (`film_density`) and the toe between is the H&D toe where the dye
+  runs out — the same toe whatever the gamma (pinned) — and over-white
+  exposures roll into the matrix's knee at clear (a soft knee of 0.04
+  D) rather than negative dye. A mid grey prints at 0.18^gamma lifted a
+  hair by the toe: 1.5 is the theatre's dense print in a dark room,
+  1.2–1.3 that print as a telecine shows it on a screen (the default
+  1.3). **Exposure** (`film_exposure`) is the timer's printer light in
+  stops: down prints the whole frame denser and darker — the rich print
+  — up thinner and paler with the highlights running into the knee.
+  The first cut of this round pivoted the line on a mid grey with a
+  shoulder above a transmittance of 0.5; on a bright cel that put the
+  whole picture on the shoulder and printed it pale. A print is timed
+  to its white; the line is pinned there.
+- **The dyes** (`_DYES`, `_dye_matrix`): cyan from the red record,
+  magenta from the green, yellow from the blue, each with its unwanted
+  absorptions — cyan (1, .22, .10), magenta (.14, 1, .30), yellow (.02,
+  .10, 1) — and the printer's balance B solved from A^T B = 1 so a grey
+  scale prints neutral (pinned: a grey ramp's channel spread under
+  2e-3) and only colours shift: a pure red, green or blue prints
+  darker than under ideal dyes, greens lean cyan, blues toward purple.
+  `film_dye_purity` walks the documented dyes toward the process's
+  *ideal* ones (`_DYES_IDEAL`): three that each absorb their own third,
+  or for two-colour a blue-green and a red-orange that split the green
+  between them — the two-colour dyes' green absorptions are the
+  process, not an impurity, and a two-colour grey stays near neutral
+  at any purity (pinned). Default purity 0.5: the imbibition dyes were
+  chosen for their purity; 0 is the chromogenic-grade impurities.
+- **The key** (`film_key`): the silver image printed from the green
+  record under the dyes (the later three-strip prints) — density in
+  the shadows, deeper blacks (pinned: the shadows darken more than the
+  highlights).
+- **Registration** (`film_register`, pixels): every dye layer but the
+  first lands a hair off, its own (dx, dy) per frame from the frame's
+  hash — every edge fringed in colour, the ink line included. The
+  honest misregistration of a printed cartoon; the 1.73 paint
+  misregistration's tooltip now says it is a stylisation.
+- **The projector**: the screen's white is the clear gate — a white cel
+  on a normally timed print, the knee's hair of dye and all — so a
+  print printed down is darker on the screen, as it is.
+- **Two-colour** (`film_process` TWO_COLOUR): the same chain with two
+  records (red-orange 0.78 R + 0.22 G, blue-green 0.40 G + 0.60 B) and
+  two dyes (blue-green (1, .50, .15), red-orange (.05, .60, 1)); the
+  balance is least-squares, so a grey leans a little — the two-colour
+  print's own cast — and there is no true green (pinned: a pure green
+  prints olive, red and blue both up).
+- **Presets**: the 1940s Technicolor feature takes the process
+  (exposure −0.1, gamma 1.35, density 2.4, filters .3, purity .5, key
+  .3, halation .12, register .5) and drops the grade; new *Cel: 1941
+  Fleischer (Superman)* (a hard dense print: a third of a stop down,
+  gamma 1.5, density 2.8, filters .35, key .5, halation .25), *Cel:
+  1940s Cinecolor short* and *Cel: early-30s two-strip Technicolor*
+  (two-colour, softer, grainier, the print a hair off register). Nine
+  Cel & Film presets.
+- **Settings**: `film_process`, `film_process_amount`, `film_exposure`,
+  `film_gamma`, `film_density`, `film_filters`, `film_dye_purity`,
+  `film_key`, `film_halation`, `film_halation_radius`, `film_register`
+  — a Colour Process box at the top of the Cel Film panel, eleven audit
+  rows, the tooltips. `film_on` counts the process.
+- **Tests**: `test_colour_process` — the curve's clear white, its mid
+  grey at 0.18^gamma, monotony, D-max at no light, the same toe at
+  gamma 1; the dye amount is the printed density; a grey ramp neutral
+  and ordered below itself; the documented dyes darken the primaries
+  and ideal dyes do not; purity leaves greys alone; sharp filters
+  saturate and overlapping ones muddy, a white cel white through any;
+  the key's shadows; a stop over and under; the amount; two-colour's
+  olive green and near-neutral grey at any purity; registration
+  fringes at edges only, deterministic per frame; halation veils the
+  near dark more than the far; NONE the identity; the four process
+  presets; the post chain at the defaults and under the 1.73 grade
+  bitwise the 1.78.0 engine's; the panel.
+
+Still open, disclosed: the records are a matrix on the rendered RGB,
+not spectral (a paint's reflectance curve is not known to the
+renderer); the cel paints' own palette — the studios' formulated
+paints — is not modelled (a Cartoon-material era sets colours, the
+process prints them); the halation is one radius for all three
+records; grain is still the 1.73 grain — the next front.
+
+---
+
+## [1.78.0] — 2026-08-31
+
+### Media 2 — the 40s arc, the second media front
+
+The Imitation Study's second media rank, in the order the field chose:
+the marks learn the form, the artist's indication, the stippler's
+count and the pencil's blender. Every default is the previous release
+bitwise; every twin is held to `core/media.py` on random points and
+whole materials against `render()`.
+
+- **Direction** (Hatching, Pencil Scribble: `direction` ANGLE | FORM |
+  SLOPE). FORM strokes follow the silhouette-parallel tangent N × V,
+  SLOPE the view projected onto the tangent plane (`media.tangent_2d`,
+  the matcap frame on the camera's paper — right = up × V, up' = V ×
+  right — or the world x, y in Vector / View space), plus the Angle.
+  A per-pixel rotation of the lanes would break them (a lane index is
+  `floor` of a rotated coordinate), so the field is BINNED: twelve
+  coherent lane fields at 15-degree steps (`media.bin_rotations`, baked
+  cos/sin literals on both devices, 12 × layers), and a pixel between
+  two bins cross-fades them by a smoothstep of the last third of its
+  bin (`media.blend_bins`, summed f0·(1 − w) + f1·w exactly as the
+  emitter writes it). The GLSL twin selects the bin's literals with a
+  ternary chain per layer and calls the medium twice. A sphere wraps
+  in latitude under FORM and spokes under SLOPE; a face-on point has
+  no slope and reads bin 0.
+- **Indication** (a per-pixel socket on Hatching, Pencil Scribble,
+  Stipple, Charcoal, Ink Wash; default 1): tone′ = 1 − (1 − tone) ·
+  indication on both roads — Winkenbach & Salesin's indication as a
+  mask. A node saved before the socket reads 1 (`_md_tone` checks the
+  socket exists; the emitter likewise), and grows the socket at file
+  load: every pattern node has `ensure_sockets` now (missing inputs
+  appended at the spec's default and moved into the spec's order), and
+  the load-post migration calls it on every Halcyon node that has one.
+- **Placement** (Stipple: `placement` SIZE | COUNT). COUNT is Secord's
+  stippling: dots of ONE size (Size cells, the SIZE placement's own)
+  whose number carries the tone — three nested lattices at 4, 2 and 1
+  cells' spacing (1, 4 and 16 dots per four-cell block) each hand their
+  dots a rank in their own range of [0, 1) (`media._COUNT_LEVELS`:
+  [0, 1/21), [1/21, 5/21), [5/21, 1)), coarse first; a dot shows where
+  its rank is below the darkness, so the count is proportional to the
+  darkness, a darkening tone only ever ADDS dots (pinned), the full
+  crowd is one dot per cell and the crowd is evenly spread at every
+  density. The last fifth of the range swells the dots to black as
+  before.
+- **Blend** (Pencil Scribble, Charcoal; default 0): Sousa & Buchanan's
+  blender. On the scribble the deposit becomes mix(deposit, max(line ·
+  pressure / 2, halo), blend) with a triangular halo 2.5 half-widths
+  wide at half the pressure's tone — the stroke keeps half its contrast
+  and the graphite pushed out of it greys the gaps; on the charcoal the
+  tooth flattens toward its mean by 0.6·blend and the threshold's width
+  grows by 0.4·blend — an even tone where the peaks speckled.
+- **The front-end is a driver now** (`shaders/codegen.user_call`): a
+  call with the wrong number of arguments is a ShaderError. It used to
+  zero-fill the missing ones — the compiler's-forgiveness lesson in its
+  purest form: a stale twin call in a test compiled here and would have
+  failed on the hardware. Found because this round's new parameters
+  made the old hand-written calls short.
+- **Shelf**: Form Hatching, Indicated Hatching (an inverted Facing into
+  Indication — the builder's new `'indication': 'EDGES'` hook), Counted
+  Stipple, Smudged Pencil — 105 templates, the 2D Media family eleven.
+- **Tests**: `test_media_2` (the tangents and bins against the twins,
+  FORM across / SLOPE along a sphere's radius, an integer bin is its
+  field bitwise, a half bin the mean, the wrap; the blended scribble,
+  the counted stipple and the blended charcoal twins on random points;
+  the count law — a darker tone only adds dots, bare paper empty, full
+  dark closed; the blender's mid-tones and the stump's flattening;
+  blend 0 and SIZE bitwise 1.75; eight materials through the deferred
+  pass; Indication 0 / 1 / absent; five media bitwise the 1.77.0
+  engine; the four recipes and the Indication wiring), the family and
+  count pins.
+
+Still open, disclosed: FORM and SLOPE read the matcap frame, so a
+rolled camera's roll is not in the direction on the camera's paper; in
+Vector and View space the tangent's world x and y are read, which is
+the generated coordinates' own axes and nothing else; the tonal art
+map's SCALE nesting (a Vector-space hatching keeping its screen density
+as the object recedes) is not built — it needs the pixel footprint on
+both roads; Bousseau's two paper scales are the Paper node's Tooth and
+Mottle since 1.75.
+
+---
+
+## [1.77.0] — 2026-08-31
+
+### The inker's line — the 40s arc, line arc 2
+
+The field chose this front from the Imitation Study: *"the outlines look
+artificial... old cartoon outlines are dynamic and occasionally rough."*
+1.74 gave the line a brush's body; this round gives it an inker's
+judgement, three more things to draw, and a pen's path instead of the
+pixel staircase. New module `core/lines.py`; every dial off by default
+and the defaults bitwise the previous release, whole engine.
+
+- **Light Weight** (`ink_isophote`, `ink_isophote_range`, and the
+  shared `outline_shadow_level`): Goodwin, Vollick & Hertzmann's
+  isophote distance (NPAR 2007). Every silhouette seed walks inward
+  along the projection of its own smooth normal (or, where the normal
+  faces the camera — a face-on step — away from the neighbours it
+  differs from), one pixel a step, until n·l of the key lamp reaches
+  the Shadow Level, the object ends, or the depth steps; the width is
+  a quarter at zero and eases to full at Light Range, blended by the
+  amount. One measurement gives the thick shadowed flank, the thin lit
+  edge, the thin thin-feature and the perspective. Gathered at the
+  seeds and the pixels the walk visits, never a frame-wide field: 36 ms
+  for 9k seeds at 1080p.
+- **Three line sources** (`outline_form` / `outline_form_threshold`,
+  `outline_shadow` / `outline_shadow_level`, `outline_tone` /
+  `outline_tone_threshold`), all interior seed classes (the Interior
+  Scale, both roads, no style dial needed). FORM LINES: the facing
+  |n·v| smoothed two pixels, its Hessian's larger eigenvalue as the
+  valley's depth, Steger's sub-pixel test for the pixel that holds the
+  valley's floor, both walls (σ + 1 px out along the eigenvector) on
+  the seed's own object — DeCarlo's image-space suggestive contours,
+  one pixel wide, never on the silhouette's fall-off. SHADOW LINES:
+  the dark pixel with a lit four-neighbour of its own object at the
+  Shadow Level — the terminator. TONE LINES: the display-gamma
+  luminance of the shaded frame; the edge flow from the smoothed
+  structure tensor's minor eigenvector; a DoG (σ against 1.6σ, 0.98)
+  run along the flow (2.5σ each way) and thinned across it to its
+  darkest pixel; a seed where the response is below 0.11 × Tone
+  Threshold (a unit step reads −0.11, so the dial IS the step) and the
+  brighter side of the step, two pixels out along the gradient, is the
+  seed's own object. The run and the thinning are computed only where
+  the DoG is already a quarter of the way dark — a per-pixel gate;
+  0.5 s at 1080p. Tone lines read the shaded frame, so a band shades
+  its context rows for them (as From Fill does).
+- **The stroke road** (`ink_smooth`, `ink_pressure`, `ink_overshoot`).
+  `contour_graph` reads the thinned contour as a graph — each pixel's
+  eight-ring split into RUNS of set neighbours (two runs: a path pixel;
+  one: an end; three: a junction; one-pixel spurs pruned) — and every
+  step after is local to that graph, bounded in chain steps, so a band
+  computes what the frame computes. Smooth: Taubin's λ/μ smoothing
+  (0.5 / −0.53, 2σ² iterations) of the pixel positions, ends and
+  junctions fixed, and CORNERS PINNED — the corner is found first on an
+  8-iteration copy as a local peak of the chain's net turning, so a box
+  keeps its corners while its staircase edges straighten. Pressure: the
+  net turning (the SIGNED angle between the runs on either side,
+  averaged six passes along the chain with its sign, so a staircase's
+  jog cancels, a curve keeps its rate and a corner its whole angle)
+  grows the width up to 1.5× — a blob at every corner, the pen's pause.
+  Overshoot: every true end off the frame border, every chain arriving
+  at a junction, and both edges of every corner run past along the
+  tangent of a four-step walk back, tapering as √(1 − s/L), about six
+  in ten of them, each by 50–100 % of the dial hashed from the end's
+  WORLD position (coherent frame to frame without a previous frame).
+  The chains, midpoints and stubs are drawn back as seeds with a
+  deterministic winner per pixel, each carrying its ORIGIN pixel and a
+  width factor; `ink.apply` reads every width, colour, depth and n·l at
+  the origin and the factor at the seed, and the interior chain becomes
+  one-sided (its centre on the seed) like every other chain. 87 ms for
+  9k seeds at 1080p.
+- **Anchor** (`ink_anchor`, SCREEN | SURFACE). With SURFACE the hand's
+  noises — Weight Noise, Roughness (both octaves), Drift, Gaps — are
+  sampled at the surface point under the line (the nearest seed's
+  origin; the pixel's own point off any line; the nearest interior seed
+  where one is nearer), three slices of the lattice noise as a 3-D
+  field, scaled so the screen dial keeps its size at that pixel's depth:
+  the noise travels with the object and a moving camera does not make
+  it swim. A rigid move of scene and camera leaves the Screen anchor's
+  line where it was and moves the Surface anchor's with the world; the
+  test pins both.
+- **Fixed on the way**: the shadow-side weight and the Light gradient
+  read FACE normals (a smooth sphere's shadow-side line was faceted)
+  and read a point lamp's rotation as its direction (meaningless); both
+  now read the smooth normal the shading read and the lamp's true
+  direction per pixel (`lines.ndl_field`). A scene with those dials on
+  a point lamp draws differently — better — and the defaults are
+  untouched.
+- **The band's reach**: `render._ink_reach_rows` adds the isophote's
+  range, the road's iterations (smoothing, the turning's 18 steps, the
+  overshoot's walk and stub), and the sources' kernels on both roads
+  (`lines.road_rows`, `lines.source_rows`); every new dial is pinned
+  band-invariant bitwise at three bands, on the mask road and the style
+  road, and the whole inker's lot together.
+- **Presets**: the 1930s and 1940s Cel presets take the light weight,
+  a little smoothing, pressure, overshoot and the surface anchor.
+- **Cost** at 1080p, 9k silhouette seeds: isophote 36 ms, stroke road
+  87 ms, form lines 190 ms, shadow lines 13 ms, tone lines ~480 ms
+  (plus the interior chamfer they wake). Also `ink.bilinear_at` gathers
+  a 2-D field flat now (bitwise the same values, twice the speed).
+- **Tests**: `test_inkers_line` (64 checks: the graph on synthetic
+  chains, a staircase's zero net turning, a corner's peak and its
+  pinning, stubs and their taper and origin, a T's overshoot; the
+  isophote walk's sides and range; every source's seeds where they
+  belong and nowhere else, a unit step's single tone line; the road's
+  dials; the anchors under a rigid move; band invariance for each dial
+  and the lot; determinism; the 1.76.1 engine bitwise at the defaults
+  and under the 1.74 dials; the presets, the panel, the reach), 13
+  audit rows (with a side-lit key and a folded ball as mutates), the
+  tooltips.
+
+Still open, disclosed: the tone lines see every tone step, textures and
+highlights included (that is XDoG; a shading-only line is Shadow
+Lines); the isophote walks a straight line in the image, not the
+surface's geodesic; a corner's overshoot needs the corner to be a peak
+of the chain's turning (a rounded corner is a curve and gets pressure
+instead); the Surface anchor's noise foreshortens with the surface (a
+texture would too); interior chains under the road move by up to half
+a pixel toward the pixel grid's centre.
+
+---
+
+## [1.76.1] — 2026-08-31
+
+### The stroke budget is the frame's
+
+Found by reading the road again after 1.76.0 went out: the painted
+background road's stroke budget (`MAX_STROKES`, the cut that keeps a
+giant ground plane from asking for a million particles) summed the
+projected areas of the Background triangles the G-BUFFER showed. A
+pooled band's G-buffer shows fewer triangles than the frame, so on a
+frame past the budget a band would have cut its sequences differently
+from the whole frame and painted different strokes — a seam only a
+1080p background at a stroke size under five pixels could reach, and
+none of 1.76.0's pins reached it. The budget now sums every Background
+triangle of the mesh (a camera-only number), and only the triangles the
+G-buffer shows are expanded; a test forces the budget down until the
+cut engages and holds a banded frame bitwise against the whole. Nothing
+else moved.
+
+---
+
+## [1.76.0] — 2026-08-31
+
+### The painted backdrop, the painted background road, the setback — the 40s arc, front 3
+
+The study written against the pagoda render (the Halcyon Imitation
+Study) named its first tell: the sky, a flat tint in a frame that was
+otherwise drawn. This round paints it, paints the ground, and puts the
+lens on the miniature.
+
+- **World ▸ Painted Backdrop** (`sky.painted`, World mode `PAINTED`). A
+  background painting on a flat panel one unit in front of the camera,
+  `paint_angle` degrees round from +X: a direction's panel point is its
+  tangent coordinate (d·r / d·f, d.z / d·f) — exact arithmetic, no seam
+  in front — so a pan crosses the painting and a tilt climbs it, the
+  way the animation stand's background did, and directions behind the
+  panel fade to the plain gradient over the last ten degrees of grazing.
+  On the panel, in the painter's order: the gradient (horizon, zenith,
+  falloff, blend — the GRADIENT mode's own dials); the clouds — a
+  three-octave field stretched ×2.4 so a cloud is a shape, a dry-brush
+  or airbrush edge by Softness, coverage biased above the horizon by
+  Cloud Height, lit on top and shadowed beneath by the coarsest
+  octave's vertical difference; the brush's streaks (value noise
+  stretched along Stroke Angle, two octaves); optional impasto Dabs (the
+  1.75 Paint Strokes field, the costly part); the board's tooth; and a
+  watercolour granulation as pigment density in Bousseau's law
+  C′ = C − (C − C²)(d − 1). Four looks on the Look menu (Gouache Day,
+  Watercolour Dusk, Fleischer Night, Storyboard) write their dials the
+  way the Cartoon node's Era does. Evaluated per direction on the CPU
+  on both device roads like every rich sky (`_background_image`), so it
+  is exact by construction; the deferred pass's reflections take the
+  CPU road (`_env_world`). Cost: about the Bryce sky's (~100 ms per
+  144k directions; the dabs five times that).
+- **Paint Mode on every material** (`Material.paint_mode`, CEL |
+  BACKGROUND). CEL is everything that shipped before, bitwise.
+  BACKGROUND takes the **painted background road** (`core/gouache.py`,
+  Display ▸ Painted Backgrounds): the Background pixels' lit colour is
+  abstracted (a masked Gaussian, Base Smoothing) and laid down as brush
+  strokes Meier's way — for every visible Background triangle a hashed
+  particle sequence fixed on the surface, cut to n = projected area /
+  (0.85 · stroke size)² with the last particle fading in over its
+  fraction, so a camera that comes closer adds strokes at the END of
+  every sequence and never moves one already there; visibility by the
+  particle's own triangle or a same-object neighbour within one percent
+  of the eye distance; drawn far to near (ties by triangle then index)
+  as rounded rectangles Stroke Size by Stroke Length in screen pixels,
+  each dab's size its own hash, its direction along the base colour's
+  contours (Follow the Colour), across the surface normal's screen
+  direction (Follow the Surface) or at Stroke Angle, turned by Spread,
+  bristle-streaked across, drying toward its end, lightened or darkened
+  by Variation; the board's tooth over it. Strokes paint only Background
+  and sky pixels — a cel in front is never touched — and the ink is
+  suppressed on a Background material unless its Ink says Always.
+- **The setback** (`gouache.setback`): the Fleischer stereoptical lens.
+  Background materials (and the sky, Setback the Sky) soften by eye
+  distance from Setback Start over Setback Range up to Setback pixels of
+  sigma, as a mip blend of three masked Gaussians, while the cels stay
+  sharp — the normalised convolution never bleeds across a cel's edge.
+- **Both** run once on the CPU from the shared G-buffer in the render()
+  tail before the ink, on either device road; the band scissor and the
+  shaded context rows grow by the longest stroke's reach plus the blurs'
+  taps (`gouache.reach_rows`), so a pooled band paints the frame's
+  strokes bitwise. 14 settings, ENUMS/RANGES/LABELS/DESCRIPTIONS, 14
+  audit rows (the demo's floor painted by a mutate), a Painted
+  Backgrounds panel, a Paint Mode row on the material panel, the export.
+- **View space for the media** (`media.view_coords`, the Space menu's
+  third item). The eye-to-point direction, L1-normalised (abs, add,
+  divide — no sqrt, so both devices reach the same bits from the same P
+  and eye) and octahedrally unfolded onto the unit square, lower
+  hemisphere folded into the corners: continuous but at the nadir. A
+  function of the direction alone, so a point twice as far along the
+  same ray lands the same marks; turn the camera and the marks stay on
+  the scene — Lucas Pope's Obra Dinn cure for the shower door, only a
+  dolly swims them. GLSL twin `hal_md_view`; parity on all four
+  hashed media through `render()`.
+- Tests: `test_view_space`, `test_painted_sky` (every dial marks the
+  sky, the zero-dial painting is the gradient bitwise, the back of the
+  stage, the turned panel, continuity, the four looks, the frame band-
+  invariant, the env route), `test_painted_backgrounds` (the road off by
+  default, the ink suppression and its Always override, a cel pixel
+  never touched, no spill to the far sky, determinism and the seed,
+  band invariance ×6 bitwise, every dial, Meier's particles fixed on the
+  surface and their sequences lengthening for a closer camera, the
+  setback softening a checker's far rows and leaving its near rows
+  bitwise, the sky flag, neutrality vs 1.75.0's whole engine).
+
+Still open, disclosed: the painting stands on one panel — a camera that
+turns right round sees the plain gradient behind it (aim the panel, or
+paint two worlds); the stroke road is per-frame particles, so a camera
+DOLLY grows and shrinks the strokes' spacing between frames (their
+positions hold); the background strokes are opaque dabs — no wet
+edges, no glazing; the setback softens by distance only (no focus
+plane, no bokeh shape); the Meier road costs about a second per 1080p
+frame of full-frame background, single-threaded (the pool divides it).
+
+---
+
+## [1.75.0] — 2026-08-31
+
+### The 2D media — the 40s arc, front 2
+
+The verdict's second sentence: *"There should be textures/converters
+specifically for 2D-looking things. Like Paint strokes, pencil
+skribbling, charcoals, inking, etc."* Seven texture nodes on the
+Halcyon Textures shelf, written in `core/media.py` with GLSL twins in
+`gpu/procedural.py` line for line:
+
+- **Five converters on a per-pixel Tone** (lightness, 1 = bare paper —
+  a Shader to RGB luminance, a Screen Info Facing, a dot with a light
+  direction; unlinked, a dial, and the node is a plain texture).
+  *Hatching*: layers of lanes fill in as the tone darkens (layer k from
+  darkness k/L, thickening over the next 1/L — the tonal art map,
+  continuous), each lane a stroke with its own hashed wobble, pressure,
+  pen width and dry breaks, drawn in lifted segments of Length, every
+  lane swelling to solid over the last fifth. *Pencil Scribble*: the
+  lanes bent by a two-octave domain warp (Curl; past 1 it folds into
+  loops), fanned over 70 degrees, the graphite catching an 18-cell tooth
+  so light pressure speckles and heavy fills. *Stipple*: dots on a
+  jittered lattice present where the cell hash falls below the darkness
+  (density carries the tone), growing with it, a second lattice at
+  twice the frequency in the darks, the dots merging to solid at the
+  end. *Charcoal*: the stick deposits on a four-part tooth (three noise
+  octaves and the paper's own cell grain, stretched to span the tone
+  range), peaks first, streaked along Angle, smudged by a slow thumb and
+  banded by the stick's pressure — both scaled by 4d(1−d) so bare paper
+  stays bare and solid black stays solid. *Ink Wash*: Levels flat
+  washes, each adding its share where the bleed-wandered darkness
+  passes its threshold, pigment pooling inside every edge (squared
+  rim), two-octave granulation.
+- **Two textures.** *Paint Strokes*: one dab per cell of a jittered
+  lattice, a rounded rectangle Length by Width (each dab's own size
+  hashed), turned off Angle by a hashed SLOPE up to tan(45° · Spread)
+  (no driver's sin decides an edge), bristle-streaked on two octaves
+  across, drying toward the end; the two highest-ORDER dabs covering a
+  pixel composite over the canvas — a two-deep painter's algorithm, so a
+  soft edge shows the dab beneath rather than a canvas halo. Color 2 is
+  the paint (link the lit colour and the strokes carry it), Fac the
+  premultiplied paint value, Stroke ID the winner's hash. *Paper*:
+  tooth, fibres (two directions), mottle, as a height.
+- **Space, Seed, Boil** on every node. *Vector*: the Vector input
+  (generated when unlinked) — the marks on the surface. *Screen*: the
+  camera's own paper, (px + .5)/H and (py + .5)/H times Scale, so Scale
+  is cells across the frame's height at any resolution; zeros off the
+  pixel grid (a ray hit), as the Window coordinate answers. *Boil* N:
+  the salt's key is frame // N, so the drawing holds N frames and is
+  redrawn on the next key, like the line's boil; *Seed* folds in. The
+  salt is 16-bit integer arithmetic on both devices — on the GPU the
+  key is `floor((frame + .5) / N)`, the half keeping a driver's 2.5-ulp
+  division clear of every whole frame, and no integer division is asked
+  of any front-end (the simulator's `int / int` is a float).
+- **Exact on the GPU.** `value_noise2s` — value noise on the z = salt
+  plane of the 3D lattice (four corners, the salt on the third lattice
+  constant) — joins the primitives; the seven twins are held against
+  the NumPy originals on random points (max 1e-4) and whole materials
+  against `render()` in both spaces, with a linked per-pixel tone and a
+  boil. Every scalar derived from a dial is derived in float32 in the
+  same operation order on both sides (a dial that reaches a floor — the
+  charcoal's streak stretch — cannot afford a double-rounded Python
+  float), and every angle that reaches a floor (the lanes, the brush
+  direction, the charcoal axis) is baked to float32 cos/sin from the
+  SAME float32 socket value the CPU read and emitted as a round-trip
+  literal. A linked dial refuses by name; the boil rides `hal_frame`
+  (a frame change keeps the source byte-identical).
+- **Seven 2D Media shelf recipes**: Hatched Ink Drawing, Pencil Sketch,
+  Charcoal Study, Stippled Ink, Ink Wash — shadeless, on the camera's
+  paper, their Tone the Screen Info Facing (the builder's new `tone`
+  hook wires it, so the drawing darkens toward its silhouettes on
+  either device) — plus a lit Gouache Background and Drawing Paper with
+  its own bump relief.
+- Band-invariant bitwise in both spaces; the same frame the same marks;
+  a textured frame at the defaults bitwise the previous release's
+  (whole engine, from the 1.74.0 zip).
+
+Still open, disclosed: Shader to RGB, the natural lit-tone source, is a
+CPU road (the deferred pass has no closure to convert) — a Facing, a
+Layer Weight or a dotted light direction is the GPU tone; the marks in
+Screen space swim under a moving object (the shower door) unless they
+boil; the media are per-material — the painted BACKGROUND road (a
+screen-space painterly treatment with the ink suppressed) is the next
+front.
+
+---
+
+## [1.74.0] — 2026-08-31
+
+### The drawn line — the 40s arc, front 1
+
+Your verdict on the cel arc opened the next one: *"The outlines are
+decent, but definitely need work. They look artificial. If you look at
+old cartoons, the outlines are dynamic and occasionally rough."* The
+distance-field ink road (1.70) drew a line whose weight was a plane of
+smooth factors; a hand's line begins and ends, wanders, breaks and has
+a body. Five new dials in the Line Style box, all on that road:
+
+- **End Taper / End Length** — the brush lifts and lands. Stroke ends
+  are found on the contour itself: the silhouette seed is thinned from
+  its 4-connected staircase to an 8-connected line (two passes, one
+  per staircase orientation, so a 2x2 block thins to an L rather than
+  a hole), and the pixels with one neighbour (ends) or three or more
+  (junctions) seed a third chamfer field; the half-width falls toward
+  them over End Length to 15 percent. A segment has two ends, a T its
+  junction and three ends, a closed loop none — so a lone silhouette
+  keeps its weight and a line that vanishes behind another object
+  thins where it meets that object's contour, exactly where an inker
+  lifted the brush.
+- **Roughness / Roughness Scale** — three octaves of value noise on the
+  width, gated by a slow patch field: the line is occasionally rough,
+  not uniformly hairy.
+- **Drift** — the line's centre wanders in and out of the true contour
+  on the Weight Scale noise, the same field on both sides so the line
+  stays one stroke.
+- **Gaps** — dry-brush skips: short breaks (a 4-pixel noise) where the
+  field runs high, more readily where the stroke is already thin. The
+  rate is a gap rate, never a missing edge.
+- **Line Texture / Texture Amount** — *Brush Streaks*: lighter streaks
+  running ALONG the stroke; the along coordinate is the SOURCE pixel's
+  position on a canonical tangent (from the distance field's gradient,
+  sign-fixed) and the across coordinate the signed distance, so the
+  streaks run parallel to the line, at fixed offsets, unbroken through
+  its centre. *Charcoal*: a soft bloom around a dark core (a wider
+  transition than the brush's) and the paper's tooth — a fine grain and
+  a coarser blotch — breaking the body.
+- **Band-invariant, deterministic, neutral.** Every field is a hash of
+  (pixel, phase, seed); the band scissor's reach grows by End Length,
+  drift and the charcoal bloom so a stroke end past a band thins the
+  line inside it exactly as the whole frame does and the scissor's own
+  cut never reads as an end inside the band. Every default is the
+  previous release's line bitwise (pinned against 1.73.0's whole
+  engine from the zip, plain and brush).
+- The **Cel & Film presets** draw with the new dials: the 30s and 40s
+  brushes lift, roughen in patches, skip and streak; the 70s xeroxed
+  line drops out; the comic pen tapers its ends.
+
+Still open, disclosed: the line is heavier at nothing yet — a corner's
+pause and a curve's pressure are the next dynamics; overshoot past
+junctions is not drawn; the streak texture reads best from width 4 up.
+
+---
+
+## [1.73.0] — 2026-08-31
+
+### The era looks — the cel photographed and printed
+
+The cel arc's fourth and last front, in your order. Three rounds built
+the cel itself — the ink, the Western paint, the 80s anime dials; this
+one photographs it. A new module, `core/film.py`, and a **Cel Film**
+panel under Display, every stage a pure function of the frame number
+and the seed (the same frame, the same bits, on either device and in
+any pooled band), every default off (the frame is bitwise the previous
+release's, whole engine and post chain):
+
+- **Film Stock** — the stock's colour response in linear light, before
+  the display encode: *Technicolor* (the three-strip's purified,
+  saturated primaries, deep reds, cyan-leaning shadows, a firm
+  contrast), *Eastmancolor faded* (the 70s syndication print: magenta
+  cast, lifted blacks, softened contrast and saturation), *Video
+  1980s* (the telecine: slightly warm, less saturated, highlights held),
+  *VHS dub* (low saturation, milky blacks, dim highlights), *Black and
+  white* (panchromatic, red-weighted). **Stock Amount** mixes it.
+- **Softness** — the rostrum camera's optics, a Gaussian of sigma
+  pixels (direct taps in a fixed order, so a band blurs bitwise what
+  the frame blurs).
+- **Gate Weave** — the whole frame shifted by this frame's registration
+  error: a slow wander plus a per-frame jitter, bounded by the dial,
+  vertical a touch larger as a claw-fed gate has it.
+- **Dust & Hairs** — dirt (opaque), clear scratches (they let the lamp
+  through) and the odd hair, by density per film AREA (about forty
+  specks on a 1080p frame at 1, never fewer than one), placed by the
+  frame's hash so the sequence twinkles.
+- **Grain** — the emulsion: a per-pixel, per-frame triangular hash,
+  seven parts luminance to three parts colour, mean-preserving, growing
+  with the dial; the same frame is always the same sheet.
+- **Flicker** — the projector lamp: one uniform exposure per frame,
+  within 12 percent at 1.
+- **Shoot On** 2 or 3 — the animator's economy made literal. A held
+  frame is NOT rendered: the engine photographs the key frame's cel
+  again (kept from the last key frame of the session, at this size and
+  these settings — a film dial does not invalidate it, any other
+  setting does) and runs the film stages per frame, so grain, dust and
+  weave keep moving over a held drawing exactly as the camera saw them.
+  An animation on twos renders in half the time. Render sequences from
+  their first frame: a frame whose key frame is missing renders fresh
+  and says so in the console.
+- **Paint** (before the ink, both ink roads, band-invariant bitwise):
+  **Paint Misregistration** slides the painted colour by this frame's
+  placement error under lines that stay where the drawing put them;
+  **Paint Bleed** softens the paint under and past the line — the
+  hand-laid cel, the mis-registration and bleed deferred from 1.71.0.
+- **Print**: **Halftone** lays four ink screens at the classic angles
+  (cyan 15°, magenta 75°, yellow 0°, black 45°) on the finished frame,
+  each dot's area its ink's coverage at the cell (dark dots below 50
+  percent, the classic inverted white dots above), one-pixel
+  anti-aliasing, full under-colour removal — every grey reproduced
+  within a percent, black solid, white clean, red red; **Halftone
+  Pitch** is the cell in pixels.
+- **Six Cel & Film render presets** (81 now, a seventh category): 1930s
+  black-and-white (mono, soft, weaving, dusty, flickering, on twos, a
+  boiling brush line), 1940s Technicolor feature (on twos, brush ink),
+  1970s Saturday morning (the faded print on threes through the
+  composite chain and a CRT), 1980s OVA on LaserDisc (the telecine
+  grade, on twos, a thin true-to-height line), 1980s TV anime on VHS
+  (the VHS grade under the composite chain, on threes), and the comic
+  print (the dot screen, heavy misregistration, on ones).
+- **Cost**, measured at 1080p: the full Technicolor chain (stock,
+  softness, weave, dust, grain, flicker) about 0.35 s; the dot screen
+  about 0.5 s. Each stage is skipped at its default.
+
+Still open from this front, disclosed: the film stages run on the CPU
+on both device roads (a GPU twin would need a post stage of its own);
+the hold cache keeps ONE key frame, so a sequence rendered out of order
+holds nothing; the halftone's four screens are the classic angles, not
+a menu.
+
+---
+
+## [1.72.0] — 2026-08-31
+
+### The 80s anime additions — the Anime Shader's third front
+
+The cel arc's third front, in your order. The Anime Shader was built
+for the 2000s-2020s 3D-anime look; the 80s OVA cel had four things it
+did not: the hair shine band, the airbrushed tone edge, simplified
+shadow shapes, and coloured trace lines. All four now, every one
+neutral at its default (a node saved before them shades bitwise as it
+did; old files grow the sockets at load):
+
+- **Hair Shine** — the angel ring. A band of the shine colour across
+  the object at a fraction of its own height (Hair Shine Height), Hair
+  Shine Width wide, its edge waving around the object (Wave amplitude,
+  Waves per turn), on the camera-facing surface and fading only on
+  the underside — light-independent, because on the cel it was painted
+  at a position, not lit: the band's pixels are the shine colour
+  bitwise under a 10x lamp. Hair Shine Second puts a thinner band that
+  far below. Reads the same per-object bounds Generated coordinates
+  use (height and azimuth), on both devices.
+- **Airbrush** — the cel painter's soft gradation against the first
+  shadow edge. Lit side: the tone multiplies toward the airbrush
+  colour just above the edge and fades out toward full light; Shadow
+  side: the shadow tone blends toward it approaching the edge from
+  below; Both. Airbrush Width in light units. Rides the ramp road too.
+- **Shadow Smoothing** — the Cartoon Shader's inker's road, shared: the
+  terminator bends toward a sphere around the object.
+- **Line Colour** menu — *Ink Settings* (as before), *Iro-Trace*: this
+  material's ink line in its own shaded colour per pixel, darkened by
+  Line Darken (hair lines in the hair's tone, skin lines in the skin's
+  — it runs the distance-field ink road, band-invariant bitwise), or
+  *Line Color Socket*: the socket's value as the material's constant
+  line colour (both roads; a linked chain is not read, and the tooltip
+  says so — lines are inked per material).
+- **GPU twins** for all of it — per-pixel Hair Shine, Hair Shine Color,
+  Airbrush and Airbrush Color chains included — at float32 noise; a
+  chain into a band-geometry socket refuses by name.
+- **Two shelf recipes** on Cel & Anime: **Cel 80s Hair** (two hard
+  tones, the shine band with its second, iro-trace) and **Cel 80s
+  Skin** (one warm tone with the lit-side airbrush, rounded shadows,
+  iro-trace). 94 templates.
+- **A latent fix on the per-material ink road (1.64).** On the mask
+  road a silhouette seed pair used to belong to each pixel's OWN
+  material, so the far side of every silhouette — the sky, the floor
+  behind a ball — seeded the sky's or the floor's class: a material's
+  coloured or widened line was half the global line on its outer side,
+  and a floor with Ink off still drew a horizon line through the sky
+  class. Now the nearer side owns the pair, exactly as the style road's
+  one-sided seed does. Scenes where every material inherits are bitwise
+  untouched (the single-class road); scenes with per-material ink
+  colour, width or Ink off change at their silhouettes only.
+
+Still open from this front, disclosed: the hair shine's height and
+azimuth are the object's bounding box, so a hair object whose box
+includes the body sits the ring lower than expected — the Height dial
+absorbs it; a per-pixel Line Color chain is not read (lines are inked
+per material).
+
+---
+
+## [1.71.0] — 2026-08-31
+
+### The Cartoon Shader — the Western master
+
+The cel arc's second front, in the order you set: *"Again it's focused
+on Anime AND Cartoons... A 40s Looney Tunes cartoon is vastly
+different to an 80s anime."* The Anime Shader is bands of light with
+coloured shadows; a Western cartoon is not lit at all — it is
+**painted**. A third master node, **Cartoon Shader** (Add ▸ Halcyon ▸
+Shading), and a **Cartoon (Paint)** model on the master shader's menu
+that runs it at its defaults:
+
+- **Paint, not light.** The colour is flat and the same under every
+  lamp whatever its energy — a 40 W lamp paints the cel a 2 W lamp
+  paints, bitwise. No ambient term, no specular lobe, no lamp energy
+  in the paint unless **Lamp Influence** asks for it (0 pure paint, 1
+  the lamps' energy and colour modulating the LIT paint — the one road
+  back toward lit shading, linear in energy; the shadow tone is a
+  colour and stays one whatever the lamps do).
+- **One painted shadow tone, by mode.** *Transparent Cel*: paint ×
+  Shadow Color by Shadow Amount — the Golden Age shadow cel, a second
+  exposure through a tinted overlay. *Painted*: Shadow Color replaces
+  the paint, a second flat paint — UPA and the television decades.
+  *None*: flat paint everywhere, limited animation at its cheapest.
+- **Shadow Threshold / Softness.** Where the edge falls on the wrapped
+  light term (0.5 is the terminator; higher pushes the shadow onto the
+  lit side), and how airbrushed it is (0 is exactly two colours).
+- **Shadow Smoothing** — the inker's simplification: the shading
+  normal bends toward a sphere around the object's bound, so the
+  terminator sweeps a form as one clean shape instead of following
+  every bump. A sphere is its own smoothed self (bitwise); a cube gets
+  a curved terminator across a flat face. Reads the same per-object
+  bounds Generated coordinates use, on both devices.
+- **The highlight is a painted dot**, its own colour, never a
+  reflection: Highlight Size is its radius (the dot opens at
+  N·H > 1 − size²/2, so 0.3 is about a 17-degree dot and 1.0 a
+  60-degree cap, never the whole hemisphere), Highlight Softness
+  feathers it, and it lands only
+  inside the lit region of the lamp that makes it — a specular-only
+  lamp still paints its dot over the shadow tone.
+- **The strongest lamp's verdict.** Across lamps a region is lit if
+  any lamp reaches it (max, never a sum), so the paint never
+  brightens past paint. Cast shadows, light linking, negative and
+  specular-/diffuse-only lamps, Receive off, rim, emission and
+  opacity all ride the shared roads.
+- **The Era menu** writes the sockets and the shadow mode to a named
+  starting point and leaves them yours: Golden Age (1930s-40s) — a
+  transparent cel darkening the paint part-way, a faintly airbrushed
+  edge, rounded forms; UPA Modern (1950s) — a bold contrasting second
+  paint, hard-edged, shapes simplified; Xerox Era (1960s-70s) — muted
+  desaturated tones, hard-edged (pair with the Pencil ink style);
+  Saturday Morning (1970s-80s) — flat paint and nothing else; 90s
+  Feature — a soft-edged painted shadow, rounded forms, a small
+  highlight dot; 90s TV (Dark Deco) — a deep painted shadow pushed
+  onto the lit side. Each preset's tooltip says what it imitates.
+- **GPU twin, by construction.** The lamp lines accumulate the same
+  verdicts, the assembly tail composes the same paint, the smoothing
+  reads the same bounds table (forced into the pass when the dial is
+  up); parity holds at float32 noise on every road tested — the three
+  modes, the dot, the smoothing, Lamp Influence, cast shadows, two
+  lamps, light linking, rim, the master's model, and per-pixel chains
+  into Shadow Color, Shadow Amount, Shadow Threshold, Shadow
+  Smoothing, Highlight Color, Highlight Size and Lamp Influence. A
+  chain into Shadow Softness or Highlight Softness refuses the driver
+  BY NAME (`cartoon_soft varies across the frame`) and shades on the
+  CPU exactly.
+- **Six Cartoon templates** on a new **Cartoon** family of the
+  Pre-Made shelf (92 now, thirteen families) — one per era, generated
+  from the node's own era table so the shelf and the Era menu can
+  never drift apart (the test pins them equal).
+- **Neutral by construction, pinned two ways.** Nothing changes for a
+  scene without a cartoon material: the test suite now imports the
+  PREVIOUS release's whole engine from the shipped zip (when it sits
+  beside the package) and renders the demo scene with both — bitwise
+  equal — and the master shader hides the dials the paint ignores.
+  Every other model's lamp loop is untouched (the CARTOON branch is a
+  `continue` they never reach).
+
+Still open from this front, disclosed: paint mis-registration and
+bleed (the ink-and-paint offset) ride the era-looks front with the
+film effects; the smoothing centre is the object's bounding-box
+centre, so a whole character smooths as one ball — split it into parts
+for per-part rounding.
+
+---
+
+## [1.70.0] — 2026-08-31
+
+### The ink style pack — the 40s brush and the 80s trace machine
+
+The cel arc's first front, as you ordered it: *"let's continue with the
+cel shading stuff. Again it's focused on Anime AND Cartoons... A 40s
+Looney Tunes cartoon is vastly different to an 80s anime."* The ink
+pass had one kind of line — a mask, dilated to an integer width, one
+colour: the trace machine. A hand-inked brush line is another thing
+entirely, and the difference lives in the line. The Cartoon Outlines
+panel grew a **Line Style** box (all defaults are the old mask line,
+bitwise — pinned against 1.69.1's own `apply_outline` run on the same
+buffers):
+
+- **The distance-field road** (`core/ink.py`). Any style dial off its
+  default draws the line from a (5,7,11) chamfer distance transform of
+  the boundary seeds — two row-vectorised passes, 0.07 s at 1080p,
+  within 0.4 px of Euclidean inside 20 px — with a nearest-seed
+  feature map so a pixel on the sky side of a silhouette knows which
+  surface pixel owns its line. The line's half-width is a plane, the
+  coverage is anti-aliased, and everything past the transform runs on
+  the band of pixels a line can reach, not the frame. Width w on this
+  road is the mask road's 2w−1 pixels (a style switch never thins a
+  line); width 1 becomes a true one-pixel line.
+- **Line Style**: Clean (the crisp trace-machine / xerox edge), Brush
+  (a soft bleeding edge, ink on cel), Pencil (offset strokes with
+  grain: Pencil Strokes, Pencil Spread).
+- **Depth Taper** — thick near, thin far, the brush inker's
+  perspective (1 doubles the nearest line and thins the farthest to
+  nothing); its near/far range is the mesh's own depth extent, never
+  the frame's pixels, so pooled bands taper alike.
+- **Interior Scale** — creases, material breaks and marked edges at
+  their own width: 0.5 is the classic thick-outer, thin-inner drawing.
+- **Weight Noise / Weight Scale** — thick-and-thin along the line as
+  the hand's pressure on a brush.
+- **Shadow Side** — thicker where the surface turns from the key lamp,
+  the underlit line of comics and some 80s anime.
+- **Boil / Boil Rate / Boil Scale** — the hand-traced wobble: the
+  finished line is displaced by a noise field that steps on a clock —
+  12 a second is on twos at 24 fps, 8 is on threes, 0 holds one static
+  wobble. Deterministic per (pixel, tick, seed): frame 2 of a two is
+  bitwise frame 1.
+- **Grain** — the tooth of paper, the dry brush.
+- **Line Colour**: the ink colour; **From Fill** (the surface's own
+  colour darkened by Fill Darken — Disney's hand-inked self-coloured
+  lines, the iro-trace of 80s anime); **Gradient** to Ink Colour 2 by
+  Depth, Vertical or Light.
+- **True To Height** — widths true to an N-line frame: a width-2 line
+  at 480 is a width-4 line at 960, so a 4K frame keeps the line
+  instead of a hairline ("better scaling", as filed).
+- **A latent band seam, fixed.** A pooled band's scissor culled the
+  triangles outside its rows, so an outline seeded in the row just
+  past the band was missing from the band's edge rows — a seam between
+  every pair of pooled bands under a thick line, there since the
+  outline pass shipped, found by the style pack's band pin. The
+  scissor keeps the ink's reach in context rows now (as the bump road
+  keeps its one), and a From Fill line shades them too. Band renders
+  are the whole frame's rows, bitwise, on both ink roads.
+- Seventeen settings, each with a reader, a tooltip, a range and an
+  A/B row in the settings audit.
+
+---
+
+## [1.69.1] — 2026-08-31
+
+### Textures drive volume density — the Blender 5.x socket rename, closed
+
+Field, the same morning: *"I can't use textures to control the density
+properly, the textures only work as if it were a surface rather than a
+volume... the Blender default textures just make the volume vanish."*
+
+- **The vanish, root cause.** Blender 4/5 renamed the texture nodes'
+  "Fac" DISPLAY name to "Factor" — and the Fresnel, Wireframe and
+  Attribute factors, the Mix Shader's factor input — while keeping each
+  socket's IDENTIFIER, the Python-API-stable name, as 'Fac'. Halcyon
+  serialized graphs by display name; every evaluator and GLSL emitter
+  keys outputs by the classic name; under 5.x a Noise Texture's Factor
+  output resolved to NOTHING, read zero, and a volume fed by it
+  vanished — and a surface fed by it went black, silently. The export
+  now canonicalises a plain identifier that differs from the display
+  name to the name Halcyon keys on ('Fac' behind "Factor"), keeping
+  decorated identifiers ('Shader_001', the Mix node's 'A_Color', a
+  group's 'Socket_3') on their display names; the display name rides
+  along as `label`. Both devices read the canonical name, so the fix
+  lands on the GPU road too.
+- **The evaluator's own net.** `eval_output` resolves an output by
+  name, then by identifier, then by the classic/renamed alias pair
+  ('Factor'/'Fac', 'Value'/'Val'), then by position — for graphs built
+  by importers and hand — and an output that still resolves to nothing
+  is NAMED in a new `unresolved` set instead of reading zero in
+  silence.
+- **Nothing zeroes silently now.** The volume march prints a chain's
+  problems by name, once per frame per container material (`volume
+  'Fog': its chain has problems -- ShaderNodeTexNoise 'Noise Texture':
+  output 'Factor' has no value here -- reads 0`) and files them where
+  Blender's report reads; and the CPU surface road prints the
+  evaluator failures it had been collecting and discarding since the
+  first release (the GPU road always refused those by name).
+- **"As if it were a surface."** A volume sample handed the graph a
+  bare context: Window and Camera coordinates read zero, Object read
+  world space, the clock stood at frame 1 (an animated density chain
+  froze — the R222 changelog promised it would animate), Object Info
+  knew nothing. Every camera ray IS a pixel, so the march now carries
+  the pixel identity, the eye, the clock and the container's object
+  down to each sample: **Texture Coordinate ▸ Window projects an image
+  from the camera through the fog** (a drawn cloud, lit and shadowed as
+  a volume — 2D down to the wire), **Object** follows the container's
+  matrix, scrolling and clocked chains animate, Object Info reads the
+  container. A 2D image with no Vector still extrudes along the box's
+  Z (Flat reads the Generated XY — the same planar slab Cycles gives
+  a volume), and **Box projection in a volume averages the three axis
+  projections** into one solid texture from a single tile (there is
+  no normal to pick a face by; the unlinked Vector reads the full
+  Generated coordinate here so all three axes see the image) — the
+  era's trick for a 3D texture out of a 2D image.
+- Blender's own procedurals — Noise, Voronoi, Wave, Magic, Checker,
+  Gradient, Brick, White Noise — shape volume density in 3D now, and
+  the suite pins a 5.x-shaped tree (a "Factor"/'Fac' Noise into the
+  Halcyon Volume's Density) through the exporter to a rendered fog.
+
+---
+
+## [1.69.0] — 2026-08-31
+
+### Volume models, mesh-shaped containers, voxels — and round area lamps
+
+The morning after the volumes: *"there should be multiple volume shader
+models, like the regular master shader. Also there's no voxel count,
+all volumes are cubes regardless of the model, and the Area light
+doesn't actually adapt to the shape of the light."* Four answers.
+
+- **Model** on the Halcyon Volume node — eight scattering laws.
+  **Henyey-Greenstein** (the default: bitwise the old march),
+  **Uniform**, **Dual Lobe (Clouds)** (a forward lobe at Anisotropy and
+  a back lobe at half of it, negated — silver lining and back-glow),
+  POV-Ray's three media types **Rayleigh** (1 + cos²), **Mie Haze**
+  (1 + 9u⁸) and **Mie Murky** (1 + 50u³², a 51× forward spike), and two
+  UNLIT atmospherics from 3D Studio: **Volume Fog** (the fog colour
+  composited by density — integrating Color × density × T along the
+  ray IS Color × (1 − T), the atmospheric's own blend; no lamps) and
+  **Combustion** (the Fire Effect: Color is the sparse OUTER flame,
+  Emission Color the dense INNER one, the ramp driven by density,
+  brightness following density as 3DS's own "Density sets the opacity
+  and brightness"; Absorption sets how much the flames hide, 0 = pure
+  additive fire). Every lit phase is normalised to integrate to one
+  over the sphere (closed forms: 16π/3, 8π, 332π/33), so Color stays
+  the single-scatter albedo whichever law is picked — POV's own factors
+  are unnormalised and its media brighten by type; the shapes are
+  POV's, the energy is consistent. The suite integrates every law
+  numerically and pins the unlit pair against a lamp change, bitwise.
+- **Shape** — what the ray marches. **Mesh** is the new default: the
+  container's own faces, depth-peeled by the engine's rasteriser (every
+  fragment of the container collected without a depth test, sorted per
+  pixel, read as a state machine — a front face opens a span, the next
+  back face closes it; a same-facing run at a shared edge collapses to
+  its first fragment; a pixel whose nearest fragment is a BACK face
+  starts inside the container). The camera rays ARE the pixels, which
+  is why rasterising beats casting: one small raster pass instead of
+  two million BVH walks (a per-container BVH was built first and cost
+  15 s at 1080p; the raster road costs about one). Up to four solid
+  spans per pixel, so a torus keeps its hole and a concave cloud
+  marches its gaps as air; a mesh that IS its bounding box (every fog
+  cube, every smoke domain) takes the slab road — bitwise what 1.66
+  marched, so no existing scene moves. **Box**, **Sphere** and
+  **Cylinder** are the era's atmospheric gizmos fitted to the bound
+  (world axes; the tooltip says to pick Mesh for a rotated shape).
+  This is a user-requested look change for non-box containers: a
+  sphere mesh with a fog material was a fog cube in 1.66–1.68 and is a
+  fog sphere now.
+- **Voxels** — 0 reads the density and colour chains at each march
+  sample (unchanged, bitwise); N reads them at the centres of an
+  N×N×N lattice over the bound, the sample's own position included
+  (so a Bozo fed world coordinates blocks up exactly like one fed
+  Generated), and a smoke grid snaps to the same lattice. The blocky
+  voxel volume of the era's grid volumetrics, and a stylized look in
+  its own right; the tooltip asks for Volume Steps above 2N.
+- **Area lamps light by their shape.** The soft shadows and beam cones
+  already followed Disk/Ellipse; the form factor — the ILLUMINATION —
+  ran BI's Stokes contour over the bounding rectangle for every shape,
+  which is why switching a lamp to Disk changed nothing visible under
+  shadow maps. The contour now runs over an equal-area 16-gon for the
+  round shapes (radius scaled by √(2π / (K sin(2π/K))), so the polygon's
+  area equals the ellipse's; it agrees with a 512-gon reference to
+  1e-5), normalised by the emitting area (π/4 of the rectangle) so a
+  disc and a square of the same size throw the same far-field energy —
+  BI's area lamp is total-power-like — and differ only in shape. The
+  rectangle shapes keep BI's four corners bitwise (the compiled-C pin
+  stands); the GLSL twin bakes the polygon's corners as literal offsets
+  from the position texel, and the parity pins hold both round shapes
+  unshadowed and under soft ray shadows to 2e-5.
+- Three volume recipes on the shelf (86): **Fire, Combustion** (a
+  turbulent Bozo chain on the Combustion model), **Murky Air** (Mie
+  murky) and **Voxel Cloud** (a Cells chain on a 12-cube lattice inside
+  the sphere gizmo, cel-banded). The template builder and validator
+  learned the dict-valued `volume` recipe that presets Model/Shape/
+  Voxels, checked against the shared item tables.
+- Export: the three node properties travel (`NODE_PROPS`); the node's
+  menus read the same tables the evaluator keys on, so the two cannot
+  drift.
+
+---
+
+## [1.68.0] — 2026-08-31
+
+### The shelf round — cel and volumes, one click deep
+
+The overnight run's last course: the ledger item *"74 templates, zero
+anime"* closes, and the night's volume work lands on the shelf beside
+it. Nine new Pre-Made recipes in two new families (the shelf holds 83):
+
+- **Cel & Anime** — the Anime Shader pre-dialled: **Cel Skin** (the
+  warm three-tone face trio with blush and plum shadows), **Cel
+  Cloth** (one soft band, no highlight), **Cel Metal** (dark cool
+  tones under one razor gleam), and two game starters with their
+  compat modes armed — **Cel ArcSys Starter** (vertex AO on; wire the
+  ILM into Game Texture, the SSS into Detail) and **Cel HoYo Starter**
+  (alpha-emission on; wire the lightmap into Game Texture and the
+  packed ramp into Shadow Ramp, where the material id picks each
+  region's row by itself).
+- **Volumes** — the Halcyon Volume node dropped already wired to the
+  output's VOLUME socket, so the mesh you assign it to IS a container:
+  **Fog Bank**, **God Ray Chamber** (forward-scattering haze for
+  back-lit shadow rays), **Cel Fog** (banded scatter + violet shadow
+  tint, the stylized set), and **Ember Glow** (a Cells chain clumping
+  emissive fire density — the era's fire volume, no sim needed).
+- The template machinery learned the two recipe kinds: the builder
+  drops the right node and links the right output socket, and the
+  suite's template validator and every-template-renders sweep validate
+  the new kinds against their own nodes' socket tables — a cel recipe
+  naming a socket the Anime Shader lacks fails the build by name,
+  exactly like the master-shader recipes always have.
+
+---
+
+## [1.67.0] — 2026-08-31
+
+### The volume round, part two — the named residuals fall
+
+1.66.0 shipped with four honest limits on the ledger. Three of them
+lasted one night.
+
+- **Smoke sims are a density source.** A container object carrying a
+  baked fluid DOMAIN now feeds its Mantaflow density grid into the
+  march: trilinear voxels multiplying whatever the node chain says
+  (Density 1 = the raw sim, a Cells chain on top stylizes it). Read
+  defensively at export — an unbaked cache or a build that hides the
+  grid reads nothing and says why in the render warnings, and the
+  volume falls back to its node chain. The suite pins the export road
+  on a stub domain, the trilinear corners exactly, and the law that an
+  all-zero grid renders bit-for-bit the no-volume frame.
+- **Containers split per object.** Two fog boxes sharing one material
+  used to become one joint bounding box that marched the empty air
+  between them; they are two containers now, each its own bound.
+- **Traced rays pass through containers.** A fog box in a mirror used
+  to reflect as an empty surface; reflection and refraction rays now
+  step past container geometry and take whatever stands behind it
+  (bounded at eight hops, free when the scene has no volumes). The
+  era's mirrors never saw the volume fog either — the reflection does
+  not re-march the volume, and says so here.
+- **Banded depth fog** (`Fog Bands`, Depth Cue panel, default 0 =
+  bitwise the smooth fog): the fog transmittance quantized into hard
+  cel steps, so distance reads as flat painted planes — the anime
+  background trick, and the PS1's own coarse fog tables. Rides every
+  fog mode, height fog included, on both devices.
+- Fixed in passing: a latent `np.eye(4, np.float32)` crash (dtype
+  passed as the column count) on scenes whose objects carry no world
+  matrix — hand-built scenes only; export always fills matrices.
+
+---
+
+## [1.66.0] — 2026-08-30
+
+### Volumes — the real kind, and the cel kind
+
+*"If you could do both actual volumes and stylized volumes, that would
+be amazing."* Both, in one road. Until now "volumetrics" meant the
+screen-space fakes (shafts, beam cones, Height Fog) and the ledger
+carried the scope line "no volume renderer exists at all." It exists.
+
+- **Volume containers.** A mesh whose Material Output links a
+  **Volume** chain becomes a container: every camera ray marches the
+  container's bounding box — the era's volume gizmos were boxes and
+  spheres (3D Studio's Volume Fog, POV-Ray's media, Bryce's clouds all
+  shaped density inside a simple bound) — accumulating **per-channel
+  Beer-Lambert absorption** and **single scatter** from the scene's
+  own lamps. The lamp loop is the standard one: falloffs, spot cones,
+  gobos, light linking and per-lamp shadows all arrive through the
+  same roads every surface uses — a shadowed lamp carves god-rays
+  through the fog, and a Volume Shadows switch (on by default) trades
+  them away for speed. Henyey-Greenstein anisotropy; emission glows.
+  The container itself is a bound, not geometry: it draws no surface
+  and casts no shadow.
+- **The density is a node chain.** Whatever feeds Density is evaluated
+  by the renderer's own graph evaluator at every march sample, with
+  Generated coordinates spanning the box — a Bozo/Cells/Marble chain
+  shapes clouds exactly the way the era's procedural volumes worked,
+  and an animated chain animates. Blender's own volume nodes march
+  too: **Principled Volume** (color/density/anisotropy/emission),
+  **Volume Scatter**, **Volume Absorption** (whose colour tints the
+  transmittance per channel — proven in the suite against the exact
+  sigma ratio).
+- **The stylized half** lives on the new **Halcyon Volume** node
+  (Add ▸ Halcyon ▸ Shading): *Edge Threshold / Softness* cut hard
+  anime cloud edges out of a soft density field; *Bands* posterizes
+  the scattered light into cel steps; *Shadow Tint* applies the anime
+  rule to volumes — a shadowed region of the fog takes a **colour**,
+  never just darkness. All neutral at their defaults.
+- Fixed-count midpoint marching (Volume Steps, default 48): no jitter,
+  deterministic per pixel — bands, worker splits and refine passes
+  reproduce it bit for bit; low counts band, and the banding is the
+  era's own slicing artefact. Fully-absorbed rays stop paying
+  (early-out under 1e-4 transmittance). Computed once on the CPU over
+  the shared buffers in the render tail on BOTH devices — the outline
+  doctrine; the devices cannot disagree.
+- Proven in the suite: pure absorption matches Beer's law analytically
+  behind the slab (0.5368 vs 0.5368); coloured absorption holds the
+  exact 8:1 sigma ratio in log space; a volume-free scene is bitwise
+  untouched; the march is deterministic; every dial changes the frame.
+- Named limits, on the ledger: traced reflection rays still see a
+  container as an empty surface; overlapping containers composite in
+  material order rather than mixing; a fluid-sim smoke grid is not yet
+  a density source; mixing several volume closures through shader-mix
+  nodes takes the first volume node it finds.
+- Also filed this round, per the field: the ink style backlog —
+  stroke displacement (optionally animated), a pencil look, gradient
+  strokes, resolution-true width scaling.
+
+---
+
+## [1.65.0] — 2026-08-30
+
+### The ramp shading road — the Anime Shader learns to read the games' ramps
+
+The stylized road's second round, and the ledger's highest-leverage
+item: *"a true ramp means sampling a texture by the light term inside
+the lamp loop, a road the architecture does not have."* Now it does.
+
+- **Shadow Ramp** (new Anime Shader input): link a texture — the
+  game's own ramp image, a ColorRamp, any chain — and the tone bands
+  come from the RAMP instead of the two-tone sliders. The chain is
+  baked once into a 256×16 LUT (`bake_anime_ramp`, cached and keyed on
+  the chain and its image pixels) and the lamp loop samples it by the
+  light term: shadow side, transition and lit side are all painted in
+  the ramp, exactly the games' own convention. The tone sliders stand
+  down while a ramp is linked (the tooltip says so); unlink it and the
+  R218 two-tone road returns, bit for bit.
+- **Ramp Row** (new input): picks the row (v) of a multi-row ramp.
+  Under **GENSHIN** compat with a Game Texture linked and no explicit
+  row, the texture's **alpha — the material id, exactly where the game
+  keeps it — picks the row automatically**: the per-row character
+  ramps that R218 disclosed as "not travelling to a two-tone node"
+  travel now.
+- Both devices sample the SAME baked texels: the CPU's
+  `_anime_ramp_sample` (endpoint-mapped bilinear — u=0 lands exactly
+  on the first texel, u=1 the last, so the painted ends ARE the shadow
+  floor and the lit ceiling) is written out in GLSL against one packed
+  `hal_animeramp` atlas. Parity across the ramp roads — fixed row,
+  swept row, per-pixel GENSHIN row — holds at one millionth. A caller
+  with no image dict (a bare plan road) can never clobber a real bake.
+- Proven laws in the suite: an ALL-WHITE ramp is bit-for-bit the
+  white-tones two-tone road (tint exactly 1 down both); a rampless
+  graph is bit-for-bit the R218 road; edited ramp pixels re-bake;
+  unchanged chains are cache hits.
+- Disclosed limit: the ramp bakes once per chain change — a
+  clock-driven ramp chain bakes its first frame rather than
+  re-sweeping every frame.
+
+---
+
+## [1.64.0] — 2026-08-30
+
+### The ink arc — line art gets an artist
+
+The first round of the stylized road ("*THE ultimate stylized render
+engine — 2D down to the wire*"). 2D reads as 2D because of its lines,
+and until now Halcyon's cartoon outlines were one global render
+setting: one colour, one width, everything or nothing, and only the
+edges a screen-space detector could find. Both limits fall, on both
+devices (the ink pass is computed once from the shared G-buffer, so
+the devices cannot disagree — as ever).
+
+- **Per-material ink.** Every material's panel gains an Ink row:
+  *Follow Render Setting* (the default — bitwise the old behaviour),
+  *Always Ink* (this material outlines even with the global switch
+  off: one inked character in a plain scene), *Never Ink* (glass and
+  effects stay clean in an inked scene). Beside it, *Own Ink Colour*
+  and a per-material *Ink Width* (0 inherits the globals) — coloured
+  line art, per material. The pass now runs whenever the global switch
+  OR any Always-Ink material asks for it. A scene where every material
+  inherits takes the pre-R220 single-class road, verbatim.
+- **Marked Edges** (Cartoon Outlines panel, off by default): the edges
+  YOU marked draw as interior ink — Freestyle edge marks, edges marked
+  Sharp, and creased edges, read down whichever road this Blender
+  offers (edge flags or the attributes they moved into). UV seams are
+  deliberately excluded — they mark unwrapping, not looks. Hidden-line
+  removal is the z-buffer's own verdict: each pixel measures its exact
+  projected distance to its *own* winning triangle's marked edges (the
+  wireframe overlay's arithmetic, aimed at the artist's edges), so a
+  marked edge behind a wall simply is not there, with no bias dial to
+  tune and no line rasteriser to disagree with the raster. Ink lands
+  at the internal resolution and anti-aliases on the way down with
+  everything else. Width follows the same convention as the global
+  dilation (width w ≈ a 2w−1 pixel line) and honours the per-material
+  width.
+- The exporter now carries a per-triangle marked-edge bitmask
+  (`ink_tri_mask`), built once per mesh and cached with the R171 mesh
+  cache; a mesh with no marks exports nothing and costs one boolean
+  sweep. This is also the first half of the Array node's deferred
+  seam/crease/sharp layouts — the flags now leave Blender; the UV-space
+  layout road remains open on the ledger.
+- Settings audit: `outline_marked` proven by an A/B row (a mutate
+  stamps marks onto the demo mesh); tooltips on every new control.
+
+---
+
+## [1.63.0] — 2026-08-30
+
+### Fur: the black pelt was its own shadow — and the fix un-blankets it
+
+*"There's a lot of black even with powerful lighting… the lower layers
+of the pelt are black, and the original model is very dark."* Root
+cause found at the export line, not in the fur: the surface flags
+(`Cast Shadows`, `Receive Shadows`, the Alpha mode and its threshold)
+were only exported inside the **Override** branch — and a fur pelt's
+tuft material is a **node** material, so the builder's
+`cast_shadow = False` and punch-through alpha never left Blender.
+Sixteen stacked shells cast full opaque-quad shadows (shadow maps and
+shadow rays see geometry, never the alpha holes) onto every layer
+beneath them and onto the body. In the round's miniature of the field
+frame, a casting shell at the default fur length darkens the picture
+almost five-fold; carrying the flag lifts the blanket entirely.
+
+- The four surface flags now travel with **every** material, node-shaded
+  or overridden. Untouched materials export the same defaults as before
+  — bitwise-neutral — while materials whose flags were set (every fur
+  pelt since R208) finally act on them. Existing pelts heal on their
+  next render, no rebuild needed.
+- `Cast Shadows` / `Receive Shadows` moved out of the override-dimmed
+  column in the material panel; they sit beside the Alpha row now,
+  live for node materials.
+- R211's punch-through alpha rides the z-pass in the field at last
+  (it, too, was gated behind Override on export).
+- The fur health net gains a fourth voice: a pelt whose tuft material
+  has Cast Shadows ON is named at export, with the cure ("untick Cast
+  Shadows, or press Rebuild From Source"). Rebuild From Source and
+  every retune re-assert the era flags, so the named cure always works.
+
+### Gobos: every lamp kind projects, and the projection grew its dials
+
+*"Gobos only work with Sun, which is wrong. It should work with all
+lights. The Angle slider should effect how blurry it is… It repeats
+the image, which should be optional. The image interpolation should be
+changable (bilinear, cubic, closest, etc)."* All four, on both devices:
+
+- **Every lamp kind projects.** A Spot throws its image through the
+  cone (as before); a Sun/Hemi tiles it along its rays (as before); a
+  **Point** wraps it around itself lat-long — a pierced lantern; an
+  **Area** carries it on its face like a printed gel and throws it
+  forward. The export gate that let only Spot and Sun through is gone,
+  and the cookie box now shows for every lamp.
+- **The Angle/Radius slider focuses the projection.** The lamp's
+  source size — Angle on a Sun/Hemi, Radius on the others — softens
+  its gobo exactly as a bigger source would. The blur is baked into
+  the projected image ONCE per change by a triple-box gaussian (three
+  running-sum passes, so a huge radius costs the same as a small one)
+  and the GPU uploads those same texels: the devices cannot disagree.
+  Radius 0 is bit-for-bit the old image. *Disclosed look change:* a
+  Sun exports its Angle as this radius (it always did, for soft ray
+  shadows), so an existing sun gobo at Blender's default 0.526° gains
+  a ~1-texel softening; set Angle to 0 for razor sharp.
+- **Extension is a choice.** `Era Default` keeps what each projection
+  always did (Sun tiles, Spot/Area clamp, Point wraps); `Repeat`,
+  `Extend`, `Clip` override it. Clip is the projector's gate: outside
+  the slide, at full strength, no light.
+- **Interpolation is a choice.** `Bilinear` (the default, unchanged),
+  `Closest` (one texel, the pixelated slide), `Cubic` (a sixteen-texel
+  uniform B-spline — non-negative weights, so a projection can never
+  overshoot or ring). The CPU Texture sampler and the GLSL mirror run
+  the same texel arithmetic; the round's parity matrix holds every
+  kind × filter × extension to a few millionths.
+- The plan signature learned the cookie's roll axes in passing —
+  rolling a lamp about its own beam used to serve a stale projection
+  frame on the GPU.
+- Caustic lamps are exempt from the focus blur: the animated web
+  re-bakes each frame and stays crisp, exactly as before.
+
+Field verdicts recorded from R218: Height Fog works, the resolution
+presets work, the Set Conversions work.
+
+---
+
+## [1.62.1] — 2026-08-29
+
+### Enable hotfix: the converter's Model picker registers
+
+*"HalcyonSettings registration error: 'convert_model' EnumProperty
+could not register"* — 1.62.0 would not enable. Blender refuses an
+EnumProperty that has BOTH an items callback and a default (the
+swallowed "previous error" says "'default' cannot be set when 'items'
+is a function"), and the new Set Shader model picker declared exactly
+that. Its callback carried a second landmine besides: it imported the
+add-on by the literal name `halcyon`, which an installed extension is
+not called (extensions load under `bl_ext.<repo>.halcyon`).
+
+The picker's items are now a STATIC tuple built at import from the
+same MODEL_ITEMS table the master node's menu reads — no callback, so
+the default is legal, the identifiers are stable strings safe inside
+a .blend, and no self-import happens at draw time. And the test
+stub's EnumProperty now enforces Blender's rule verbatim, so the
+suite fails with Blender's own words if the idiom ever returns — the
+same treatment the icon census and the callback-arg-count net got. A
+sweep also pins that no shipped module imports the add-on by its
+source name. Same disease family as 1.54.1 and 1.60.1: a Blender-side
+registration rule the headless stub could not see; each one caught is
+now enforced forever.
+
+No pixel changes: the Anime Shader, the presets and the converter are
+exactly 1.62.0's.
+
+---
+
+## [1.62.0] — 2026-08-29
+
+### The Anime Shader, shader detection, 116 resolution formats
+
+*(1.61.0 is withdrawn: its Cycles/EEVEE bridge was reverted on field
+direction — "Halcyon additions should be for Halcyon only" — and the
+version number is skipped so no update path ever confuses the two
+builds. This release is 1.60.1 plus the new work; the texture, vector
+and utility nodes are exactly the fully-custom-code nodes they always
+were.)*
+
+**The Anime Shader.** A second master node, built for the 3D-anime
+look: N·L wrapped to 0..1 and cut into two or three tone bands whose
+shadow COLOURS multiply the base — a shadow is a colour, never a
+darkness — with a stepped cel highlight (size, sharpness, mask), rim
+light, matcap, drawn line art, per-material Light Response, ambient
+and emission roads, normal/bump input, and the silhouette bag shared
+with the master. Twenty-six sockets, seven compatibility modes.
+
+The Compatibility menu decodes real game texture conventions, each
+mode's tooltip naming its source:
+
+- **ArcSys (Guilty Gear Xrd / Strive) and Dragon Ball FighterZ** — the
+  ILM map per the published shader recreations of the GDC 2015
+  pipeline: R specular intensity, G shadow bias, B highlight size, A
+  drawn line art; the Detail Texture is the SSS map tinting the first
+  shadow; vertex-colour RED forces regions into shadow (the Xrd
+  painters' baked occlusion), by checkbox.
+- **Genshin Impact** — the HoYo character lightmap per the PrimoToon
+  shader source: R specular/metal mask (0.9+ reads metal and boosts
+  the highlight), G occlusion into the shadow decision, B inverted
+  highlight threshold, A material id (per-id ramp rows do not travel
+  to a tone node — split materials as the game does). The
+  alpha-is-emission convention rides a checkbox.
+- **Zenless Zone Zero** — per the modding guides: lightmap R carries
+  the shadow configuration, G metallic, B gloss; the material map's B
+  is specular.
+- **DBZ: Kakarot and DB: Sparking! Zero** — served by the
+  ArcSys-lineage decode their looks descend from, with per-game tone
+  placement. Their exact channel dumps are not publicly documented,
+  and the tooltips say so rather than inventing them.
+
+The model shades identically on CPU and GPU — the deferred pass grew
+the banded lamp composition and per-pixel ILM/lightmap decode chains,
+and the suite holds all eight configurations to the CPU picture at
+5e-6. Existing materials are untouched: the model is new, every other
+model's arithmetic is byte-identical.
+
+**Convert to Halcyon: shader detection.** The Material panel's
+converter grew a Detection switch — Automatic keeps reading the source
+shader (Toon becomes Toon, Glass becomes Blinn), Set Shader forces one
+chosen model onto everything it converts, any of the nineteen
+including the new Anime/Cel.
+
+**116 resolution presets.** Forty-one new formats across the eight
+categories, every one a real format's numbers: NES at its true 8:7 PPU
+pixel, Game Boy, GBA, DS, PSP, Neo Geo, CPS-2 arcade, Virtual Boy; ZX
+Spectrum, C64, MSX, Apple II hi-res, Atari 8-bit, BBC Micro Mode 0
+with its double-tall pixels, NEC PC-9801, Amiga hires-lace; WXGA
+through QXGA; DVD, HDV's anamorphic 1440×1080, DVCPRO HD; bake
+textures to 4K and the Sony Mavica; DCI 2K/4K cinema, 5K, 8K,
+ultrawide 21:9, vertical 9:16, A3 and US-Letter print.
+
+---
+
+## [1.60.1] — 2026-08-27
+
+### Enable hotfix: the generated nodes register
+
+*"expected Node, HALCYON_LightMeterNode class \"init\" function to
+have 2 args, found 4"* — 1.60.0 would not enable. Blender's class
+validation counts EVERY named parameter of a callback, defaulted extras
+included, and the thirty generated family nodes captured their spec
+tables through default arguments (`init(self, context, _ins=ins,
+_outs=outs)`): legal Python, fine in the test stub, refused by Blender
+at register — the same disease as 1.54.1's unvetted icon, a Blender-side
+validation the headless stub could not see.
+
+Two fixes, shipped together. The generated families now capture their
+specs through real closures, so `init` is exactly `(self, context)` and
+`draw_buttons` exactly `(self, context, layout)`. And the test stub's
+`register_class` now runs Blender's own arg-count check, per base type
+(Node, NodeSocket, Operator, Menu, Panel, RenderEngine), refusing with
+Blender's exact message — so every registration test guards every class
+in the add-on from here on. A census test sweeps all ~115 registered
+classes through the net; all pass, and the field failure is pinned
+verbatim as a regression.
+
+No pixel changes anywhere: the same sockets and properties build, only
+the function signatures moved.
+
+---
+
+## [1.60.0] — 2026-08-27
+
+### Thirty new nodes, live animated bakes, true leopard
+
+Six field reports in one round.
+
+**The master shader's fresnel/rimlight/matcap colours update every
+frame now.** *"...which means animated textures don't work properly."*
+They didn't: the GPU plan cache had no clock, so a material whose
+colours moved with time kept replaying the values probed on the first
+frame. The plan signature now carries the frame clock — but only when
+the scene actually holds a time-driven node, so still scenes keep
+their cached plan — and image content rides the signature too, so a
+painted-on texture re-probes. Values re-probe per frame into the texel
+atlas while every GLSL source stays byte-identical: nothing recompiles,
+nothing stutters, and the test suite pins all three laws (the picture
+moves, the sources don't, still scenes stay cached).
+
+**15 Shader utility nodes.** Light Meter — *"a light node that will
+detect when a mesh is lit for glow in the dark materials"* — reads the
+lamp list at shading time: Fac out for how lit the point is, Color out
+carrying the mixed lamp colour, an Exposure dial, and an optional
+shadow test through the ray tree. It reads lamps at shade time, so the
+GPU plan refuses it by name and that material shades on the CPU —
+stated, not silent. Beside it: Timer, Oscillator, Counter, Pulse,
+Gate, Selector, Color Key, Measure, Step Ramp, Wobble, Frame Blend,
+Blackbody, Compare and On Frame. Every one has a CPU evaluator and a
+GPU emitter (or a named refusal), enforced by the standing census.
+
+**15 Shader vector nodes.** Array — *"straight line, follow seams,
+follow crease, follow sharp, circle, square, polygon, star, etc, ideal
+for decal image textures"* — lays a decal's UVs out along a line,
+grid, circle, square, polygon or star with per-copy jitter, rotation
+and random pick. Following seams, creases or sharp edges needs mesh
+edge flags the exporter does not carry yet; the node says so on its
+tooltip rather than faking it, and the modes will land when the flags
+do. Beside it: Mirror Tile, Kaleidoscope, Polar, Twirl, Lens, Ripple
+Warp, Wave Warp, Tile Random, Snap, Shear, Orbit, Region, Projector
+and Spin. CPU/GPU parity proven for the family (rounding audited:
+GLSL floor(x+0.5) half-up on both devices, never banker's rounding).
+
+**The Add menu is families now.** Add ▸ Halcyon opens Pre-Made, then
+Shading, Blender Internal, Utilities, Vector, Retro Screen and
+Textures submenus — 92 nodes sorted where a person would look. A new
+census test proves every registered node reachable from exactly one
+family, every family icon on the vetted 5.2 list.
+
+**Leopard is leopard now.** *"The leopard print doesn't look remotely
+like real leopard print."* It didn't — it was POV-Ray's leopard,
+three sines summed and squared, a polka-dot lattice. The node now
+draws true rosettes: per jittered cell, a handful of thick dark arcs
+curved around a hashed radius (each arc hashed for length, slip and
+presence), a warmer patch inside, the odd small solid spot between,
+and a gentle integer-hash domain warp bending every ring organic.
+Three colour sockets (ground, ring, new Interior), a Jitter dial, and
+Break widening the ring gaps; Fac carries the ring mask for bump or
+opacity work. The GLSL twin lands on identical cells (same integer
+lattice as Worley, GLSL-mod written out on the CPU side), parity 2e-5.
+This is a deliberate look change to the Leopard node and template.
+
+**The black shells, named at the source.** *"The shells are still
+black (work on this last)."* The 1.58 builder verifies itself and
+1.59 keeps the strand layer unshadowed — but a pelt BUILT by
+1.55–1.57 carries the corrupt mesh in the .blend itself, where no
+add-on upgrade reaches, and at intercept 0 every shell passes its
+alpha test wearing the root colour: dense black fur. The export now
+reads the pelt it is about to render and names the failure in the
+console — strand layer MISSING, SHADOWED by another colour attribute,
+or ALL ZEROS (the corrupt build) — with the cure in the same line:
+Rebuild From Source on the pelt's Object Properties panel. If a pelt
+still renders black on 1.60.0, the console says exactly why.
+
+Suite grows to ~3420 checks; new coverage: animated-bake refresh (three
+laws), shader add-menu census, fur strand health (all three signatures),
+rosette leopard through the full pattern sweep and template render.
+
+---
+
+## [1.59.0] — 2026-08-26
+
+### The pelt wears its source
+
+*"The fur shells don't copy vertex groups, vertex colors, modifiers,
+shape-keys, etc. When they should."* They should — a pelt that cannot
+follow its body is a prop, not fur. Every build and every rebuild now
+dresses the pelt from its source, through the one shared road:
+
+**Vertex groups**, weights tiled across the shells — so a copied
+**Armature modifier** (deforming modifiers all ride along) bends the
+fur exactly as it bends the skin. Rigged fur follows the rig.
+
+**Shape keys**, re-grown on the stack: each shell vertex moves by its
+base vertex's key delta, values and slider ranges copied. First-order
+follow — the shells translate with the surface — which is how the
+era's fur rode a morphing face.
+
+**Every UV layer, copied loop-exactly** through the triangulation map
+(pelt corner → source loop). The old road copied one layer by
+first-seen-per-vertex, which smeared every UV seam; seams survive now,
+and multi-layer setups keep both layers.
+
+**The source's own colour layers** (point and corner domain), so
+Vertex Color and Attribute nodes keep painting the pelt. The
+HalcyonFur strand layer stays reserved.
+
+**Parenting**: the pelt parents to its source, so object-level
+animation carries it along.
+
+Modifiers that change the vertex count (Subsurf, Mirror, Array,
+Geometry Nodes, …) are skipped BY NAME in the console — the strand
+colour layer is baked per vertex, so topology must match. Rebuilds
+clear the pelt's derived groups, keys and modifiers and re-copy them
+fresh, never duplicating; put hand additions on the source, where the
+pelt inherits them.
+
+---
+
+## [1.58.0] — 2026-08-26
+
+### The black pelt: the fur mesh build could corrupt, and now proves itself
+
+*"Having increased the length of the hair, it's gone from being brown
+to pure black."* The length was innocent: changing it made the addon
+REBUILD the shell mesh, and the rebuild went through a hand-built
+fast-path constructor added in 1.55.0 (vertices.add + loop offsets by
+foreach_set) that misbehaves on real Blender's current mesh API — the
+strand colour layer came out effectively zeroed. Zero intercepts are
+exactly a black pelt: every shell passes the alpha test at full tuft
+width (dense), and every shell wears the root colour (dark). It also
+explains that frame's 7.9M punch-through fragments — a dense pelt is
+many times the fragments of a tapering one. The stub test suite can
+never see real mesh internals, and the build's only self-check counted
+elements instead of reading content. Three changes:
+
+**One proven road.** The fur mesh now builds through `from_pydata`,
+the same call every other Halcyon object has always used — including
+on this field's own machine.
+
+**The build proves itself.** After building, the triangles are read
+back and compared to what was asked for, and the strand colour layer
+is read back and compared to what was written. A mismatch is a named
+error, never a silent wrong pelt.
+
+**A failed rebuild never replaces a working pelt.** If verification
+fails during a live-dial rebuild, the existing mesh is kept untouched
+and the panel reports why; a failed fresh build cancels the operator
+with the reason.
+
+A pelt already rebuilt black by 1.55.0–1.57.0 carries the corrupt mesh
+in the .blend: after updating, nudge any fur dial (or press Rebuild
+From Source) and it re-grows correctly.
+
+---
+
+## [1.57.0] — 2026-08-26
+
+### Speed must not hinge on a dropdown
+
+The field's console paste told the whole story in one missing line:
+there was no punch-through line at all. The fur material had been
+built by an older Halcyon, carried **Alpha Mode: Blend**, and 1.56.0
+politely respected that — so the frame spent 77 of its 81 seconds
+blend-compositing an alpha chain that only ever says 0 or 1, dropped
+231k fragments at the 16-layer cap on the way, and the GPU refused the
+layers ("opacity varies across the frame"). The field's verdict:
+*"The crippled rendertime shouldn't hinge on alpha blend modes, it
+should be good regardless."* Correct. Two changes:
+
+**Binary alpha is detected, and takes the fast road unasked.** When a
+material's alpha chain ends in a Math comparison (Greater Than, Less
+Than, Compare), its output is provably 0 or 1 — and for binary alpha
+the blend road and the z-buffer produce the identical picture, except
+the blend road also sorts, caps layers, and falls off the GPU. So the
+engine promotes such materials to punch-through automatically,
+whatever Alpha Mode says, and prints a line naming each one. Every
+fur material ever built by the Fur Shells operator — including ones
+from old scenes, which is exactly what the field was rendering — ends
+in that comparison. The field frame reproduced here: **9.7s → 3.6s
+first render, 0.5s unchanged**, and the picture is pixel-identical to
+the *uncapped* A-buffer truth (the old road's frame actually differed
+from the truth at 433 pixels — its own layer cap and sort errors; the
+fast road has neither). Alpha Mode: Clip remains meaningful for
+chains that are not provably binary (an image's soft alpha you want
+hard) and for its threshold dial.
+
+**Genuine fractional transparency reaches the GPU now.** For real
+translucency — the part that must blend — a linked Opacity chain is
+now a per-pixel grant to the driver, like Roughness or Glossiness
+always were: the layer passes emit the chain and composite the same
+per-pixel alpha the CPU computes, instead of refusing with "opacity
+varies across the frame; only the base colour may vary per pixel" and
+sending every layer to the CPU. Blend is for glass; it is no longer a
+cripple. (Screen Door keeps a per-pixel chain on the CPU, by name:
+its keep/drop against the ordered map is a cliff where a driver's
+last-bit rounding flips whole pixels — the suite proved it before it
+could ship.)
+
+---
+
+## [1.56.0] — 2026-08-25
+
+### The punch-through resolve rebuilt — the field was right, it was a calculation problem
+
+*"Still causes immense slow down and crippled render time, I feel it
+might be a calculation problem."* It was — three of them, all in
+1.55.0's own profile, where the punch-through stage was still 93% of
+the frame:
+
+**It re-resolved unchanged frames.** A viewport refine re-renders the
+same frame; the resolve recomputed an identical answer every time —
+8.7 seconds per *idle* refresh at draft resolution on a 24-shell test
+pelt. The whole result is memoised now, keyed on the same content the
+G-buffer cache already trusts (mesh and camera fingerprints) plus the
+clip chains' own content hash, threshold, and the frame number: an
+unchanged frame replays a handful of scatters. Idle refine on that
+pelt: **8.7s → 0.5s.** Orbiting, scrubbing and edits miss the memo
+honestly and re-resolve.
+
+**It materialised millions of fragments to keep thousands.** The
+resolve collected every clip fragment into a list, sorted the lot, and
+walked ranks. The alpha test now runs INSIDE the rasteriser — where
+the era's hardware ran it — against a live z-buffer seeded with the
+tolerant limit of the opaque depth: clip triangles rasterise
+near-first in depth-ordered chunks, each candidate that passes the
+live depth test evaluates its alpha chain, survivors write z at once —
+so everything behind an already-solid tuft dies at the depth test
+without ever being evaluated, and nothing is ever listed or sorted.
+The z-buffer's own tie rule makes the winner order-free: the suite
+holds the new road **pixel-identical to the uncapped A-buffer
+reference**, same as before.
+
+**It built full shading contexts for a two-attribute chain.** Every
+alpha evaluation interpolated positions, smooth and geometric normals,
+both UV sets, colours, and a normalised view vector; the fur chain
+reads a UV and a colour layer. Attribute interpolation is need-driven
+now: the chain is analysed statically (unknown node types
+conservatively get everything), and the fur chain's context is two
+interpolations instead of six plus a normalise. A chain the analysis
+under-serves is caught by the evaluator's own error record and redone
+with the full context — loud fallback, never silent wrong pixels. Two
+nodes (Texture Coordinate, Hair Info) learned to compute only the
+outputs their context can support instead of dying on ones nobody
+asked for.
+
+The fur ball benchmark, 640×560, 16 shells, CPU: blend 17.3s →
+1.55.0 clip 9.3s → **7.4s moving, 0.9s idle**. The 307k-triangle,
+24-shell pelt at 480×360: **6.6s moving, 0.5s idle** (was 9.1s / 8.7s).
+Same pixels, bit for bit, both devices.
+
+---
+
+## [1.55.0] — 2026-08-25
+
+### Punch-through alpha, and fur dials in Object Properties
+
+Two field reports, one round: *"Opacity/Transparency cripples render
+time (both viewport and render)"* and *"the settings for the shell
+(layers, length, etc) should be in the object's Object Properties."*
+
+**Alpha Mode: Clip (punch-through) — the era's cut-out alpha, and its
+speed.** The blend road shades EVERY transparent fragment as a sorted,
+composited layer: a 16-shell pelt is up to sixteen full shading passes
+per pixel on the CPU, and sixteen full-frame draw+readback round trips
+per frame on the GPU — that is the cripple, and 1.53.0's fur drove
+straight into it. But fur alpha is binary: a pixel is inside a tuft or
+it is not. Hard alpha belongs to the z-buffer, which is exactly how
+Dreamcast-era hardware drew fur, fences, foliage and sprites for free.
+
+Materials now carry **Alpha Mode** (Blend / Clip) with a clip
+threshold. A Clip material's triangles resolve visibility BEFORE
+shading: each fragment evaluates only its material's alpha chain (no
+lights, no full shade), nearest-first per pixel with z-feedback so a
+pixel stops at its first solid fragment, and the survivors join the
+depth-buffered pass under the raster's own tie rule — shaded once,
+never layered, never sorted, never capped. The suite holds the clip
+picture **pixel-identical to the uncapped A-buffer reference** on
+hard-alpha scenes, and the GPU twin to 2e-6 — while the fur ball's
+CPU frame drops 17.5s → 9.3s, and the GPU frame plan stops refusing
+fur materials outright (1.53.0 fur pushed the ENTIRE viewport frame to
+the CPU: "the material uses opacity, which needs the alpha compositing
+the deferred target does not do"; a clip material now plans onto the
+GPU with zero layer passes). At default settings the blend road also
+silently dropped fragments past the 16-layer cap — clip renders them
+all, correctly, faster.
+
+The hard 0/1 law applies on every road — camera pass, blend layers,
+ray hits — so reflections agree about the holes. A CLIP material whose
+alpha cannot be lifted out as one chain (BI slot alpha, transparent
+BSDF mixes, an Edge Opacity silhouette, affine texture mode) stays on
+the blend road **by name** in the render log, hard alpha still
+enforced. Fur Shells materials ship on Clip automatically; existing
+Blend materials are untouched — the mode defaults to Blend and the
+frame is bitwise identical unless you switch.
+
+**Object Properties ▸ Halcyon Fur.** The Fur Shells operator now
+stores its dials on the pelt object, and a panel in Object Properties
+edits them live: shells, length, packing and comb re-grow the shell
+geometry as you drag (through the SAME builder the operator used — one
+road, no drift, numpy-fast mesh construction); tuft density and
+root/tip colours retune the material's nodes in place. A **Rebuild
+From Source** button re-reads the source mesh for sculpts, edits and
+new UVs, and the source itself is a pickable pointer on the panel.
+
+---
+
+## [1.54.1] — 2026-08-24
+
+### Hotfix: 1.54.0 could not enable — a dead icon name
+
+**"The addon won't load, I can't enable it."** The new Fur Tufts node
+declared `bl_icon = 'OUTLINER_OB_HAIR'` — an icon Blender removed in
+3.3's hair→curves rename — and real Blender validates that enum at
+`register_class`, so registration of the node refused the entire
+enable. The field's error paste named it exactly:
+`validating class: enum "OUTLINER_OB_HAIR" not found in (…)`.
+
+Both dead-icon sites are fixed to `STRANDS` (verified present in the
+field's own 5.2 icon enum, and it is the strand-hair icon): the Fur
+Tufts node's `bl_icon`, and the Add ▸ Halcyon ▸ Fur Shells menu row —
+the latter shipped in 1.53.0 and would have broken the menu's draw the
+first time it was opened.
+
+**Why 3367 green checks missed a one-line loader break:** the suite
+runs on a bpy stub, and a stub can never know Blender's icon enum — it
+accepted the dead name where Blender refuses it. The suite now carries
+the defence it lacked: an **icon census** holding every icon identifier
+the addon uses — `icon=` kwargs, class `bl_icon`s, and the pattern
+table's icon column read off the real generated classes — to a vetted
+whitelist frozen from the field's Blender 5.2 enum (78 in use, all
+verified). An unvetted icon now fails the suite instead of the field's
+enable, and `OUTLINER_OB_HAIR` is pinned out by name.
+
+No pixel changes: icons are UI-only, and the fur ball renders
+bit-identically to 1.54.0.
+
+---
+
+## [1.54.0] — 2026-08-24
+
+### Shell fur tapers now — the Fur Tufts texture
+
+**The field was right: 1.53.0's fur shells were square columns of
+constant width.** The tuft test thresholded a flat per-cell hash (TV
+Static) against the shell height, and a flat threshold can only decide
+*whether* a whole cell survives a layer — never *how much* of it — so
+tufts kept their full square footprint on every shell they reached and
+then vanished whole. Real shell fur (the Dreamcast/GameCube technique,
+and every modern writeup of it) reads a texture whose greyscale value
+IS the strand's height at that point of its **round cross-section** —
+peak at the tuft's centre, zero at its rim — so each layer's alpha test
+keeps a smaller disc and the stack closes into strand tips.
+
+**New procedural: Fur Tufts** (the pattern family grows to 27). Each
+2D cell grows at most one round tuft at a jittered centre; **Height**
+falls radially from the tuft's peak as `(1 − (d/r)²)^Taper`, so
+thresholding it against Hair Info ▸ Intercept yields cross-sections
+that start big and shrink per layer — exactly the strand silhouette.
+**Coverage** gates cells out for patchy pelts, **Variation** varies
+tuft heights so tips break up naturally, **Taper** reshapes the cone,
+and **Random** hands each strand its own hash for colour variation.
+The Color output ramps the node's two colours by the field. The suite
+holds the geometry to the mathematics: cross-sections are discs
+(π/4 bounding-box fill, aspect 1.00), their area follows the analytic
+shrink law `πr²(1 − t/H)` to a hundredth, and every threshold up the
+stack keeps strictly less fur. Sampled in the XY plane because tufts
+live in UV space, on the same integer-hash lattice as the other
+patterns — the GLSL twin agrees with the CPU to float rounding, and
+the Random output bit-for-bit.
+
+**Fur Shells now wires it.** The auto-built material tests Fur Tufts ▸
+Height against the intercept instead of a Static hash; the default
+shell count rises 12 → 16 so each tuft's taper is sliced finer, at the
+era-authentic top of the range. Existing 1.53.0 fur materials keep
+rendering as built — the new texture arrives when a new fur object is
+grown.
+
+---
+
+## [1.53.0] — 2026-08-24
+
+### Hair renders — strands, particles, and a fur-shell generator
+
+**"Particles and hair are not supported" leaves the limitations list.**
+Three roads land at once, all speaking one strand convention, all with
+the full node graph running on the hair.
+
+**Particle-system hair and Curves-object hair render as strands.** The
+export turns each strand into the primitive Blender Internal rendered
+strands as: a camera-facing ribbon, tapering from the system's root
+radius to its tip, children included, root UVs inherited from the
+emitter so image textures paint hair the way 2.79 painted it. The
+strand's shading data rides the mesh's own colour layer — red is the
+root-to-tip intercept, green a per-strand random, blue the strand
+length, alpha the local thickness — and the ribbons wear a
+strand-flagged clone of the emitter's material, so the original
+material and every mesh wearing it render exactly as before. Emitter
+particles were already covered: halo-material particles splat as halos
+(1.41), and object/collection instancing arrives through the
+depsgraph like any other instance.
+
+**The Hair Info node is real now.** It read as "curves are not
+exported" before; it now reports Intercept, Random, Length, Thickness
+and Is Strand from the strand convention, on both devices — the GLSL
+twin reads the same colour interpolant, and the suite holds CPU and
+GPU to a zero-difference pelt. On a non-hair material it reports open
+air, exactly as Blender does. A ColorRamp on Intercept is the classic
+root-to-tip grade in one node.
+
+**Add ▸ Halcyon ▸ Fur Shells — the era's other hair.** Shell texturing,
+as the Dreamcast and GameCube drew fur: the active mesh is stacked into
+N inflated copies (spacing bias toward the root, a quadratic comb lean
+for gravity or a parting), each shell carrying its height in the same
+intercept channel — so one Hair Info node serves strands and shells
+alike. The operator wires the classic material automatically from
+ordinary nodes you can edit: a hashed tuft pattern tested against the
+shell height (tufts survive as far up as their hash reaches — that IS
+shell fur), and a root-to-tip ColorRamp. Root/tip colours, tuft
+density, shell count, length and comb are operator options.
+
+**Any custom mesh can join.** A new **Hair Geometry** switch on the
+material panel marks any material as strand-dressed: build geometry to
+the colour convention by hand and Hair Info reads it. The fur-shell
+and exported-hair materials set it automatically.
+
+**By-product: Cast Shadows finally reaches ray shadows.** The fur
+proved it: a pelt whose shells cast shadows blankets its own body in
+darkness, and turning the material's Cast Shadows off did nothing on
+the ray road — the caster mask (object Visibility ▸ Shadow, the BI
+node's Shadow ▸ Cast, and the plain material flag) was honoured only
+at shadow-map bake time. It now rides the BVH's any-hit as a cast
+filter, so ray shadows and shadow maps finally agree about who casts.
+The GPU routes ray shadows to the CPU by name when a caster is
+excluded (its GLSL any-hit has no filter), so the picture stays right
+on both devices. Fur-shell materials ship with Cast Shadows off, as
+the era's shell fur did.
+
+---
+
 ## [1.52.0] — 2026-08-24
 
 ### The public release

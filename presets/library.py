@@ -13,6 +13,7 @@ CATEGORIES = (
     ('CONSOLE', "Game Consoles"),
     ('BROADCAST', "Video & Broadcast"),
     ('WEB', "Early Web"),
+    ('CEL', "Cel & Film"),
 )
 
 PRESETS = {
@@ -137,6 +138,42 @@ PRESETS = {
             'shadow_samples': 8, 'global_ambient': (0.12, 0.12, 0.12),
             'specular_in_gamma': True, 'color_depth': '24',
             'tex_filter': 'BILINEAR', 'gamma': 2.2,
+        },
+    },
+    'MAX_2012': {
+        'label': "3ds Max 2012, Default Scanline (2011)",
+        'category': 'SOFTWARE',
+        'note': "The Default Scanline Renderer as 3ds Max 2012 shipped it, "
+                "at its own defaults: 640x480 square pixels, the Standard "
+                "material's Blinn shader for anything without a material "
+                "(the '(3ds Max)' models and the Standard / Raytrace nodes "
+                "carry the rest), anti-aliasing on with the Area filter "
+                "(a pixel-wide box over 4x4 samples is the nearest this "
+                "engine has to Max's 1.5-pixel area), Filter Maps on "
+                "(pyramidal texture filtering), shadow maps at Max's 512 "
+                "with its Sample Range of 4, no ambient light (Max 2012's "
+                "environment ambient is black), the raytracer's global "
+                "depth of 9 for Raytrace materials, and NO gamma/LUT "
+                "correction -- Max 2012 shipped with it off, so the frame "
+                "is the linear light itself on a 24-bit output with no "
+                "dither. No light limit, no fog, no glow.",
+        'settings': {
+            'resolution_x': 640, 'resolution_y': 480,
+            'pixel_aspect_x': 1.0, 'pixel_aspect_y': 1.0,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4, 'aa_filter': 'BOX',
+            'aa_filter_width': 1.0,
+            'default_model': 'MAX_BLINN', 'shading_rate': 'PIXEL',
+            'specular_in_gamma': True,
+            'shadows': True, 'shadow_default': 'MAP', 'shadow_map_size': 512,
+            'shadow_bias': 0.02, 'shadow_softness': 4.0, 'shadow_samples': 8,
+            'global_ambient': (0.0, 0.0, 0.0), 'max_lights': 0,
+            'raytrace': True, 'ray_depth': 9,
+            'ray_reflection': True, 'ray_refraction': True,
+            'transparency': 'SORTED',
+            'tex_filter': 'TRILINEAR', 'tex_mipmap': True, 'tex_perspective': True,
+            'color_depth': '24', 'dither': 'NONE',
+            'gamma': 1.0, 'color_management': 'NONE', 'input_gamma_naive': True,
+            'fog': False, 'glow': False,
         },
     },
     'STUDIO_R4': {
@@ -1243,6 +1280,472 @@ PRESETS = {
             'default_model': 'PHONG', 'color_depth': '24',
             'jpeg_artifacts': True, 'jpeg_quality': 22, 'jpeg_passes': 2,
             'shadows': True, 'gamma': 2.2, 'output_scale': '2X',
+        },
+    },
+
+    # ------------------------------------------------------- cel & film
+    # R230: the era looks -- the cel photographed and printed. Each entry
+    # sets the ink, the film stages and the shooting rhythm of a period;
+    # the materials (Cartoon Shader eras, the Anime Shader's 80s dials)
+    # come from the Pre-Made shelf. Pixel-rate cel shading throughout.
+    'CEL_MONO_30S': {
+        'label': "Cel: 1930s black-and-white",
+        'category': 'CEL',
+        'note': "The panchromatic short: b/w stock, a soft optical print "
+                "that weaves in the gate, dust and grain on every frame, "
+                "a flickering lamp, shot on twos. Brush ink with a boil.",
+        'settings': {
+            'resolution_x': 960, 'resolution_y': 720,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'CARTOON', 'shading_rate': 'PIXEL',
+            'shadows': True, 'shadow_default': 'MAP',
+            'outline': True, 'outline_width': 3, 'ink_style': 'BRUSH',
+            'ink_taper': 0.4, 'ink_weight_noise': 0.35, 'ink_boil': 1.2,
+            'ink_boil_fps': 12,
+            # R231: the drawn line -- the 30s brush lifts and lands, gets
+            # rough in patches, skips on the dry bits
+            'ink_end_taper': 0.55, 'ink_end_length': 14.0,
+            'ink_roughness': 0.5, 'ink_roughness_scale': 6.0,
+            'ink_drift': 0.8, 'ink_gaps': 0.15,
+            'ink_texture': 'STREAKS', 'ink_texture_amount': 0.35,
+            # R234: the inker's line -- heavy on the shadowed flank, the
+            # pen pausing at corners and running past them, the hand's
+            # noises fixed to the drawing
+            'ink_isophote': 0.55, 'ink_isophote_range': 24.0,
+            'ink_smooth': 1.0, 'ink_pressure': 0.35, 'ink_overshoot': 5.0,
+            'ink_anchor': 'SURFACE',
+            'film_grade': 'MONO', 'film_grade_amount': 1.0,
+            'film_softness': 0.9, 'film_weave': 0.6, 'film_dust': 0.45,
+            'film_grain': 0.35, 'film_flicker': 0.12, 'film_hold': 2,
+            # R237: one black-and-white negative's grain, coarse and
+            # clumped; a print that has been through many gates
+            'film_grain_size': 1.6, 'film_grain_clump': 0.4,
+            'film_grain_chroma': 0.0, 'film_dust_size': 1.8,
+            'film_dust_negative': 0.3, 'film_dust_cel': 0.3,
+            'film_hairs': 0.3, 'film_hair_length': 110.0,
+            'film_hair_width': 1.6, 'film_hair_hold': 14,
+            'film_scratches': 0.4, 'film_scratch_width': 1.4,
+            'film_scratch_hold': 72, 'film_scratch_side': 'BASE',
+            'film_misregister': 0.6, 'film_bleed': 0.3,
+            'color_depth': '24', 'gamma': 2.2,
+        },
+    },
+    'CEL_TECHNICOLOR_40S': {
+        'label': "Cel: 1940s Technicolor feature",
+        'category': 'CEL',
+        'note': "The three-strip print: purified saturated primaries, a "
+                "gentle optical softness, light gate weave and grain, a "
+                "little dust, shot on twos. Brush ink with taper.",
+        'settings': {
+            'resolution_x': 1440, 'resolution_y': 1080,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'CARTOON', 'shading_rate': 'PIXEL',
+            'shadows': True, 'shadow_default': 'MAP',
+            'outline': True, 'outline_width': 3, 'ink_style': 'BRUSH',
+            'ink_taper': 0.45, 'ink_weight_noise': 0.3,
+            # R231: the drawn line
+            'ink_end_taper': 0.6, 'ink_end_length': 14.0,
+            'ink_roughness': 0.4, 'ink_roughness_scale': 6.0,
+            'ink_drift': 0.7, 'ink_gaps': 0.1,
+            'ink_texture': 'STREAKS', 'ink_texture_amount': 0.4,
+            # R234: the inker's line
+            'ink_isophote': 0.6, 'ink_isophote_range': 28.0,
+            'ink_smooth': 1.2, 'ink_pressure': 0.4, 'ink_overshoot': 6.0,
+            'ink_anchor': 'SURFACE',
+            # R236: the process itself, not a grade -- three records, the
+            # dye-transfer print with its impurities and key, the dye
+            # layers a hair off register, halation in the negative
+            'film_process': 'THREE_STRIP', 'film_process_amount': 1.0,
+            'film_exposure': -0.1, 'film_gamma': 1.35, 'film_density': 2.4,
+            'film_filters': 0.3, 'film_dye_purity': 0.5, 'film_key': 0.3,
+            'film_halation': 0.12, 'film_halation_radius': 14.0,
+            'film_register': 0.5,
+            'film_grade': 'NONE', 'film_grade_amount': 1.0,
+            'film_softness': 0.6, 'film_weave': 0.3, 'film_dust': 0.2,
+            'film_grain': 0.2, 'film_flicker': 0.04, 'film_hold': 2,
+            # R237: three records' own grain, fine; dust on the cel
+            # under the rostrum camera; a hair now and then
+            'film_grain_size': 1.1, 'film_grain_clump': 0.15,
+            'film_grain_chroma': 0.7, 'film_dust_size': 1.4,
+            'film_dust_negative': 0.3, 'film_dust_cel': 0.35,
+            'film_hairs': 0.12, 'film_hair_length': 90.0,
+            'film_hair_width': 1.4, 'film_hair_hold': 12,
+            'film_scratches': 0.15, 'film_scratch_width': 1.1,
+            'film_scratch_hold': 60, 'film_scratch_side': 'EMULSION',
+            'film_misregister': 0.0, 'film_bleed': 0.25,
+            'color_depth': '24', 'gamma': 2.2,
+        },
+    },
+    'CEL_FLEISCHER_41': {
+        'label': "Cel: 1941 Fleischer (Superman)",
+        'category': 'CEL',
+        'note': "The Famous / Fleischer three-strip short: a hard, deep "
+                "print -- heavy silver key, high dye density, the records "
+                "held a third of a stop under -- halation glowing off the "
+                "lit deco planes, the dye layers a hair off, shot on twos. "
+                "Pair with the Cartoon Shader's Golden Age era and dark "
+                "paints.",
+        'settings': {
+            'resolution_x': 1440, 'resolution_y': 1080,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'CARTOON', 'shading_rate': 'PIXEL',
+            'shadows': True, 'shadow_default': 'MAP',
+            'outline': True, 'outline_width': 4, 'ink_style': 'BRUSH',
+            'ink_taper': 0.4, 'ink_weight_noise': 0.25,
+            'ink_end_taper': 0.5, 'ink_end_length': 16.0,
+            'ink_roughness': 0.3, 'ink_roughness_scale': 6.0,
+            'ink_drift': 0.5, 'ink_gaps': 0.05,
+            'ink_texture': 'STREAKS', 'ink_texture_amount': 0.3,
+            'ink_isophote': 0.75, 'ink_isophote_range': 32.0,
+            'ink_smooth': 1.2, 'ink_pressure': 0.45, 'ink_overshoot': 5.0,
+            'ink_anchor': 'SURFACE',
+            'film_process': 'THREE_STRIP', 'film_process_amount': 1.0,
+            'film_exposure': -0.3, 'film_gamma': 1.5, 'film_density': 2.8,
+            'film_filters': 0.35, 'film_dye_purity': 0.5, 'film_key': 0.5,
+            'film_halation': 0.25, 'film_halation_radius': 18.0,
+            'film_register': 0.6,
+            'film_grade': 'NONE',
+            'film_softness': 0.5, 'film_weave': 0.35, 'film_dust': 0.25,
+            'film_grain': 0.25, 'film_flicker': 0.05, 'film_hold': 2,
+            # R237: the dense print's grain a touch coarser, the key's
+            # silver in it; dust on the cel and the setback glass
+            'film_grain_size': 1.3, 'film_grain_clump': 0.25,
+            'film_grain_chroma': 0.6, 'film_dust_size': 1.5,
+            'film_dust_negative': 0.25, 'film_dust_cel': 0.4,
+            'film_hairs': 0.15, 'film_hair_length': 100.0,
+            'film_hair_width': 1.5, 'film_hair_hold': 12,
+            'film_scratches': 0.2, 'film_scratch_width': 1.2,
+            'film_scratch_hold': 72, 'film_scratch_side': 'EMULSION',
+            'film_bleed': 0.2,
+            'color_depth': '24', 'gamma': 2.2,
+        },
+    },
+    'CEL_CINECOLOR_40S': {
+        'label': "Cel: 1940s Cinecolor short",
+        'category': 'CEL',
+        'note': "The two-colour bipack process on a duplitized print: "
+                "red-orange and blue-green records, no true green or "
+                "violet -- skies cyan, foliage olive, skin salmon -- the "
+                "two sides of the print a hair off register, a softer "
+                "grainier print than Technicolor, shot on twos.",
+        'settings': {
+            'resolution_x': 1440, 'resolution_y': 1080,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'CARTOON', 'shading_rate': 'PIXEL',
+            'shadows': True, 'shadow_default': 'MAP',
+            'outline': True, 'outline_width': 3, 'ink_style': 'BRUSH',
+            'ink_taper': 0.35, 'ink_weight_noise': 0.25,
+            'ink_end_taper': 0.5, 'ink_end_length': 14.0,
+            'ink_roughness': 0.35, 'ink_drift': 0.6, 'ink_gaps': 0.1,
+            'ink_texture': 'STREAKS', 'ink_texture_amount': 0.35,
+            'ink_isophote': 0.5, 'ink_smooth': 1.0, 'ink_pressure': 0.3,
+            'ink_overshoot': 4.0, 'ink_anchor': 'SURFACE',
+            'film_process': 'TWO_COLOUR', 'film_process_amount': 1.0,
+            'film_exposure': -0.1, 'film_gamma': 1.3, 'film_density': 2.2,
+            'film_filters': 0.3, 'film_dye_purity': 0.0, 'film_key': 0.0,
+            'film_halation': 0.15, 'film_halation_radius': 14.0,
+            'film_register': 0.8,
+            'film_grade': 'NONE',
+            'film_softness': 0.8, 'film_weave': 0.4, 'film_dust': 0.3,
+            'film_grain': 0.3, 'film_flicker': 0.06, 'film_hold': 2,
+            # R237: two records' own grain on the duplitized print, its
+            # emulsion scratches one side's colour
+            'film_grain_size': 1.4, 'film_grain_clump': 0.3,
+            'film_grain_chroma': 0.8, 'film_dust_size': 1.6,
+            'film_dust_negative': 0.35, 'film_dust_cel': 0.3,
+            'film_hairs': 0.2, 'film_hair_length': 100.0,
+            'film_hair_width': 1.5, 'film_hair_hold': 12,
+            'film_scratches': 0.3, 'film_scratch_width': 1.3,
+            'film_scratch_hold': 72, 'film_scratch_side': 'EMULSION',
+            'film_bleed': 0.25,
+            'color_depth': '24', 'gamma': 2.2,
+        },
+    },
+    'CEL_TWO_STRIP_30S': {
+        'label': "Cel: early-30s two-strip Technicolor",
+        'category': 'CEL',
+        'note': "The 1930-32 two-colour cartoon (the ComiColor and the "
+                "first Silly Symphonies before three-strip): a bright, "
+                "thin two-dye print, the whites open, everything else "
+                "red-orange and blue-green, a soft weaving print with "
+                "dust and grain, shot on twos.",
+        'settings': {
+            'resolution_x': 960, 'resolution_y': 720,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'CARTOON', 'shading_rate': 'PIXEL',
+            'shadows': True, 'shadow_default': 'MAP',
+            'outline': True, 'outline_width': 3, 'ink_style': 'BRUSH',
+            'ink_taper': 0.4, 'ink_weight_noise': 0.3, 'ink_boil': 1.0,
+            'ink_boil_fps': 12,
+            'ink_end_taper': 0.55, 'ink_end_length': 14.0,
+            'ink_roughness': 0.45, 'ink_drift': 0.8, 'ink_gaps': 0.15,
+            'ink_texture': 'STREAKS', 'ink_texture_amount': 0.35,
+            'ink_isophote': 0.5, 'ink_smooth': 1.0, 'ink_pressure': 0.35,
+            'ink_overshoot': 5.0, 'ink_anchor': 'SURFACE',
+            'film_process': 'TWO_COLOUR', 'film_process_amount': 1.0,
+            'film_exposure': 0.0, 'film_gamma': 1.2, 'film_density': 2.0,
+            'film_filters': 0.2, 'film_dye_purity': 0.0, 'film_key': 0.0,
+            'film_halation': 0.2, 'film_halation_radius': 16.0,
+            'film_register': 0.9,
+            'film_grade': 'NONE',
+            'film_softness': 1.0, 'film_weave': 0.6, 'film_dust': 0.5,
+            'film_grain': 0.4, 'film_flicker': 0.1, 'film_hold': 2,
+            # R237: a surviving print -- coarse clumped grain, dirt,
+            # hairs, base scratches the length of the reel
+            'film_grain_size': 1.8, 'film_grain_clump': 0.45,
+            'film_grain_chroma': 0.7, 'film_dust_size': 2.0,
+            'film_dust_negative': 0.3, 'film_dust_cel': 0.25,
+            'film_hairs': 0.35, 'film_hair_length': 120.0,
+            'film_hair_width': 1.7, 'film_hair_hold': 16,
+            'film_scratches': 0.5, 'film_scratch_width': 1.5,
+            'film_scratch_hold': 96, 'film_scratch_side': 'BASE',
+            'film_bleed': 0.3,
+            'color_depth': '24', 'gamma': 2.2,
+        },
+    },
+    'CEL_TV_70S': {
+        'label': "Cel: 1970s Saturday morning",
+        'category': 'CEL',
+        'note': "Limited television animation on a faded syndication "
+                "print: the Eastmancolor cast, a soft print, shot on "
+                "threes, then the composite broadcast chain -- chroma "
+                "bleed, a CRT. Clean xeroxed ink.",
+        'settings': {
+            'resolution_x': 640, 'resolution_y': 480,
+            'pixel_aspect_x': 10.0, 'pixel_aspect_y': 11.0,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'CARTOON', 'shading_rate': 'PIXEL',
+            'shadows': True, 'shadow_default': 'MAP',
+            'outline': True, 'outline_width': 2, 'ink_style': 'CLEAN',
+            'ink_grain': 0.25,
+            # R231: the xeroxed line drops out in patches
+            'ink_roughness': 0.3, 'ink_roughness_scale': 4.0,
+            'ink_gaps': 0.12,
+            'film_grade': 'EASTMAN_70S', 'film_grade_amount': 1.0,
+            'film_softness': 0.7, 'film_weave': 0.25, 'film_dust': 0.15,
+            'film_grain': 0.2, 'film_flicker': 0.03, 'film_hold': 3,
+            # R237: a 16 mm print on the telecine -- coarser coloured
+            # grain, the odd emulsion scratch
+            'film_grain_size': 1.8, 'film_grain_clump': 0.3,
+            'film_grain_chroma': 0.8, 'film_dust_size': 1.6,
+            'film_dust_negative': 0.2, 'film_dust_cel': 0.2,
+            'film_hairs': 0.08, 'film_hair_length': 80.0,
+            'film_hair_width': 1.4, 'film_hair_hold': 10,
+            'film_scratches': 0.12, 'film_scratch_width': 1.1,
+            'film_scratch_hold': 48, 'film_scratch_side': 'EMULSION',
+            'film_misregister': 0.5, 'film_bleed': 0.2,
+            'composite': True, 'composite_bleed': 1.2,
+            'composite_ringing': 0.4, 'crt': True, 'crt_scanlines': 0.15,
+            'crt_vignette': 0.25, 'color_depth': '24', 'gamma': 2.2,
+        },
+    },
+    'CEL_OVA_80S': {
+        'label': "Cel: 1980s OVA (LaserDisc)",
+        'category': 'CEL',
+        'note': "The straight-to-video anime on a clean disc: the telecine "
+                "grade, a touch of optical softness and grain, the gate "
+                "barely moving, shot on twos. A thin clean trace line -- "
+                "pair with the Anime Shader's 80s dials.",
+        'settings': {
+            'resolution_x': 960, 'resolution_y': 720,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'ANIME', 'shading_rate': 'PIXEL',
+            'shadows': True, 'shadow_default': 'MAP',
+            'outline': True, 'outline_width': 2, 'ink_style': 'CLEAN',
+            'ink_reference_height': 720,
+            'film_grade': 'TV_80S', 'film_grade_amount': 1.0,
+            'film_softness': 0.45, 'film_weave': 0.15, 'film_dust': 0.06,
+            'film_grain': 0.14, 'film_flicker': 0.0, 'film_hold': 2,
+            # R237: a clean 35 mm negative on the telecine -- fine grain
+            'film_grain_size': 1.0, 'film_grain_clump': 0.1,
+            'film_grain_chroma': 0.6, 'film_dust_size': 1.2,
+            'film_dust_negative': 0.5, 'film_dust_cel': 0.15,
+            'film_hairs': 0.0, 'film_scratches': 0.0,
+            'film_misregister': 0.3, 'film_bleed': 0.15,
+            'color_depth': '24', 'gamma': 2.2,
+        },
+    },
+    'CEL_VHS_80S': {
+        'label': "Cel: 1980s TV anime (VHS)",
+        'category': 'CEL',
+        'note': "The broadcast episode taped off air: the VHS grade under "
+                "the composite chain, soft, grainy, shot on threes with "
+                "the dust of a well-played tape's print.",
+        'settings': {
+            'resolution_x': 640, 'resolution_y': 480,
+            'pixel_aspect_x': 10.0, 'pixel_aspect_y': 11.0,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'ANIME', 'shading_rate': 'PIXEL',
+            'shadows': True, 'shadow_default': 'MAP',
+            'outline': True, 'outline_width': 2, 'ink_style': 'CLEAN',
+            'film_grade': 'VHS', 'film_grade_amount': 1.0,
+            'film_softness': 1.0, 'film_weave': 0.2, 'film_dust': 0.1,
+            'film_grain': 0.25, 'film_flicker': 0.05, 'film_hold': 3,
+            # R237: the film's grain under the tape's own noise
+            'film_grain_size': 1.4, 'film_grain_clump': 0.2,
+            'film_grain_chroma': 0.5, 'film_dust_size': 1.4,
+            'film_dust_negative': 0.3, 'film_dust_cel': 0.1,
+            'film_hairs': 0.05, 'film_hair_length': 80.0,
+            'film_hair_width': 1.4, 'film_hair_hold': 10,
+            'film_scratches': 0.1, 'film_scratch_width': 1.1,
+            'film_scratch_hold': 48, 'film_scratch_side': 'EMULSION',
+            'film_misregister': 0.4, 'film_bleed': 0.2,
+            'composite': True, 'composite_bleed': 2.0,
+            'composite_ringing': 0.8, 'composite_dot_crawl': 0.8,
+            'interlace': 'BLEND', 'crt': True, 'crt_scanlines': 0.2,
+            'crt_vignette': 0.35, 'color_depth': '24', 'gamma': 2.2,
+        },
+    },
+    # R240: five more decades, both traditions
+    'CEL_SILENT_20S': {
+        'label': "Cel: 1920s silent (worn nitrate)",
+        'category': 'CEL',
+        'note': "The rubber-hose short on a print that has run a "
+                "thousand times: black-and-white, heavy weave and "
+                "flicker, coarse clumped grain, dirt and hairs and "
+                "base scratches everywhere, the projectionist's cue "
+                "discs at every reel's end. A heavy boiling brush "
+                "line. Pair with flat grey paints and the Saturday "
+                "Morning era (no shadow tone -- the 20s painted "
+                "none).",
+        'settings': {
+            'resolution_x': 768, 'resolution_y': 576,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'CARTOON', 'shading_rate': 'PIXEL',
+            'shadows': False,
+            'outline': True, 'outline_width': 4, 'ink_style': 'BRUSH',
+            'ink_taper': 0.35, 'ink_weight_noise': 0.45,
+            'ink_boil': 1.6, 'ink_boil_fps': 12,
+            'ink_end_taper': 0.5, 'ink_end_length': 12.0,
+            'ink_roughness': 0.6, 'ink_roughness_scale': 5.0,
+            'ink_drift': 1.0, 'ink_gaps': 0.2,
+            'ink_texture': 'STREAKS', 'ink_texture_amount': 0.4,
+            'ink_smooth': 0.8, 'ink_pressure': 0.3,
+            'ink_overshoot': 4.0, 'ink_anchor': 'SURFACE',
+            'film_grade': 'MONO', 'film_grade_amount': 1.0,
+            'film_softness': 1.1, 'film_weave': 0.9, 'film_dust': 0.7,
+            'film_grain': 0.45, 'film_flicker': 0.22, 'film_hold': 2,
+            'film_grain_size': 2.0, 'film_grain_clump': 0.5,
+            'film_grain_chroma': 0.0, 'film_dust_size': 2.0,
+            'film_dust_negative': 0.35, 'film_dust_cel': 0.4,
+            'film_hairs': 0.5, 'film_hair_length': 130.0,
+            'film_hair_width': 1.8, 'film_hair_hold': 10,
+            'film_scratches': 0.6, 'film_scratch_width': 1.6,
+            'film_scratch_hold': 36, 'film_scratch_side': 'BASE',
+            'film_reel': 15.0,
+            'color_depth': '24', 'gamma': 2.2,
+        },
+    },
+    'CEL_ANIME_MOVIE_80S': {
+        'label': "Cel: 1980s anime feature (35mm)",
+        'category': 'CEL',
+        'note': "The theatrical anime feature on a well-kept 35 mm "
+                "print: fine coloured grain, a gentle optical "
+                "softness, the gate barely moving, the telecine's "
+                "slight warmth, shot on twos. A thin steady trace "
+                "line. Pair with the Anime Shader's 80s Film Feature "
+                "style.",
+        'settings': {
+            'resolution_x': 1440, 'resolution_y': 1080,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'ANIME', 'shading_rate': 'PIXEL',
+            'shadows': True, 'shadow_default': 'MAP',
+            'outline': True, 'outline_width': 2, 'ink_style': 'CLEAN',
+            'ink_reference_height': 1080, 'ink_taper': 0.2,
+            'film_grade': 'TV_80S', 'film_grade_amount': 0.4,
+            'film_softness': 0.5, 'film_weave': 0.12, 'film_dust': 0.08,
+            'film_grain': 0.16, 'film_flicker': 0.02, 'film_hold': 2,
+            'film_grain_size': 1.0, 'film_grain_clump': 0.1,
+            'film_grain_chroma': 0.6, 'film_dust_size': 1.2,
+            'film_dust_negative': 0.4, 'film_dust_cel': 0.2,
+            'film_hairs': 0.04, 'film_hair_length': 80.0,
+            'film_hair_width': 1.3, 'film_hair_hold': 12,
+            'film_scratches': 0.06, 'film_scratch_width': 1.0,
+            'film_scratch_hold': 96, 'film_scratch_side': 'EMULSION',
+            'film_misregister': 0.25, 'film_bleed': 0.2,
+            'color_depth': '24', 'gamma': 2.2,
+        },
+    },
+    'CEL_DIGITAL_00S': {
+        'label': "Cel: 2000s digital ink and paint",
+        'category': 'CEL',
+        'note': "The digital transition: no film in the chain at all "
+                "-- no grain, no weave, no dust, dead-hard paint "
+                "edges under a clean thin line, held on threes for "
+                "television, only a slight master softness from the "
+                "SD finish. Pair with the Anime Shader's 2000s "
+                "Digital style.",
+        'settings': {
+            'resolution_x': 960, 'resolution_y': 720,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'ANIME', 'shading_rate': 'PIXEL',
+            'shadows': True, 'shadow_default': 'MAP',
+            'outline': True, 'outline_width': 2, 'ink_style': 'CLEAN',
+            'ink_reference_height': 720,
+            'film_softness': 0.25, 'film_hold': 3,
+            'color_depth': '24', 'gamma': 2.2,
+        },
+    },
+    'CEL_ANIME_MODERN': {
+        'label': "Cel: modern digital anime (1080p)",
+        'category': 'CEL',
+        'note': "The current pipeline: a clean 1080p master with the "
+                "compositor's faint film-emulation grain laid over "
+                "it (one fine monochrome sheet), shot on twos, a "
+                "thin resolution-true line. Pair with the Anime "
+                "Shader's Modern style -- the camera key, the depth "
+                "rim and the marched contact shadows live there.",
+        'settings': {
+            'resolution_x': 1920, 'resolution_y': 1080,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'ANIME', 'shading_rate': 'PIXEL',
+            'shadows': True, 'shadow_default': 'MAP',
+            'outline': True, 'outline_width': 2, 'ink_style': 'CLEAN',
+            'ink_reference_height': 1080,
+            'film_grain': 0.06, 'film_grain_size': 0.8,
+            'film_grain_clump': 0.0, 'film_grain_chroma': 0.0,
+            'film_hold': 2,
+            'color_depth': '24', 'gamma': 2.2,
+        },
+    },
+    'CEL_FLAT_10S': {
+        'label': "Cartoon: modern flat TV (1080p)",
+        'category': 'CEL',
+        'note': "The modern flat TV cartoon: a crisp digital 1080p "
+                "frame, a thin dead-even vector line (no taper, no "
+                "noise, no boil), nothing filmed anywhere in the "
+                "chain, shot on twos. Pair with the Cartoon Shader's "
+                "Modern Flat era and bright paints.",
+        'settings': {
+            'resolution_x': 1920, 'resolution_y': 1080,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'CARTOON', 'shading_rate': 'PIXEL',
+            'shadows': True, 'shadow_default': 'MAP',
+            'outline': True, 'outline_width': 3, 'ink_style': 'CLEAN',
+            'ink_reference_height': 1080,
+            'film_hold': 2,
+            'color_depth': '24', 'gamma': 2.2,
+        },
+    },
+    'COMIC_PRINT': {
+        'label': "Comic print (Ben-Day dots)",
+        'category': 'CEL',
+        'note': "The newsstand page: four-colour dot screens at the classic "
+                "angles, the paint slipping off register under a heavy "
+                "clean line, a little bleed. Not film: shot on ones, no "
+                "grain, no weave.",
+        'settings': {
+            'resolution_x': 1200, 'resolution_y': 900,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'CARTOON', 'shading_rate': 'PIXEL',
+            'shadows': True, 'shadow_default': 'MAP',
+            'outline': True, 'outline_width': 4, 'ink_style': 'CLEAN',
+            # R231: the comic inker's pen -- thick-and-thin, ends lifted
+            'ink_end_taper': 0.7, 'ink_end_length': 18.0,
+            'ink_weight_noise': 0.3, 'ink_drift': 0.5,
+            'film_halftone': 1.0, 'film_halftone_pitch': 5.0,
+            'film_misregister': 1.5, 'film_bleed': 0.4,
+            'film_hold': 1, 'color_depth': '24', 'gamma': 2.2,
         },
     },
 }

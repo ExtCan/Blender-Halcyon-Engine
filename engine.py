@@ -301,8 +301,34 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             self.update_stats("Halcyon", msg)
 
         image = None
+        # R230: shooting on twos or threes -- a held frame photographs
+        # the key frame's cel again instead of rendering it; the film
+        # stages in the post chain still run per frame
+        _hold = int(getattr(settings, 'film_hold', 1) or 1)
+        _hold_key = int(scene.frame)
+        _held = None
+        if _hold > 1 and not preview:
+            _hold_key, _held = hold_lookup(
+                str(getattr(bscene, 'name', '')), int(scene.frame),
+                int(getattr(bscene, 'frame_start', 1)), _hold, (tw, th),
+                settings)
+            if _held is not None:
+                image = _held['image']
+                scene.last_depth = _held.get('depth')
+                scene.last_shafts = _held.get('shafts')
+                scene.last_flares = _held.get('flares')
+                print(f"[Halcyon] shoot on {_hold}s: frame {int(scene.frame)}"
+                      f" holds frame {_hold_key} (not rendered again)")
+            elif _hold_key != int(scene.frame):
+                print(f"[Halcyon] shoot on {_hold}s: frame {int(scene.frame)}"
+                      f" would hold frame {_hold_key}, which this session "
+                      "has not rendered at this size and these settings "
+                      "-- rendered fresh (render the sequence from its "
+                      "first frame for the holds)")
         mb_steps = int(getattr(settings, 'motion_steps', 0) or 0)
-        if getattr(settings, 'motion_blur', False) and mb_steps > 1 \
+        if image is not None:
+            pass                       # a held frame: nothing to render
+        elif getattr(settings, 'motion_blur', False) and mb_steps > 1 \
                 and not preview:
             # accumulation motion blur: the whole frame, re-exported and
             # re-rendered at N points across the shutter, averaged -- the
@@ -421,6 +447,15 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             if not preview:
                 self.report({'ERROR'}, f"Halcyon render failed: {exc}")
             return
+        if _hold > 1 and not preview and _held is None \
+                and _hold_key == int(scene.frame):
+            # a freshly rendered KEY frame: the held frames after it
+            # photograph this cel
+            hold_store(str(getattr(bscene, 'name', '')), int(scene.frame),
+                       (tw, th), settings, image,
+                       getattr(scene, 'last_depth', None),
+                       getattr(scene, 'last_shafts', None),
+                       getattr(scene, 'last_flares', None))
 
         # R180: the GPU verdict, in the interface. A frame that fell to
         # the CPU used to say so in one console line; at a supersampled
@@ -460,6 +495,9 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                 final = post.process(image, settings, frame=scene.frame,
                                      seed=settings.seed, target_size=(tw, th),
                                      allow_resize=False,
+                                     key_frame=_hold_key,
+                                     fps=float(getattr(scene, 'fps', 24.0)
+                                               or 24.0),
                                      depth=getattr(scene, 'last_depth', None),
                                      shaft_sources=getattr(scene, 'last_shafts',
                                                            None),
@@ -919,6 +957,59 @@ def _classify_updates(depsgraph):
 def _updates_touch_render(depsgraph):
     """True when a depsgraph update invalidates the exported scene."""
     return _classify_updates(depsgraph) != 'none'
+
+
+#: R230: the frame hold -- the last KEY frame's rendered cel, so a held
+#: frame photographs it again instead of rendering. One entry: sequences
+#: render in order. Keyed on the scene, the key frame, the size and the
+#: settings' fingerprint (the film stages' own dials excluded: they run
+#: per frame either way).
+_HOLD_CACHE = {}
+
+
+def _hold_fingerprint(settings):
+    import dataclasses
+    # every film_* dial but the paint stages (misregister and bleed run
+    # at render time, before the ink) and the transparency: the post
+    # chain's film runs per frame either way
+    keep = {'film_misregister', 'film_bleed', 'film_transparent'}
+    skip = {'threads', 'process_count', 'use_processes'}
+    parts = []
+    for f in dataclasses.fields(settings):
+        if f.name in skip or (f.name.startswith('film_')
+                              and f.name not in keep):
+            continue
+        v = getattr(settings, f.name)
+        parts.append((f.name, repr(v)))
+    return hash(tuple(parts))
+
+
+def hold_lookup(scene_name, frame, start, hold, size, settings):
+    """(key_frame, cached) for `frame`: cached is the key frame's cel
+    when this session rendered it at this size with these settings,
+    else None. A key frame itself never looks anything up."""
+    from .core.film import hold_key
+    key = hold_key(frame, start, hold)
+    if key == int(frame):
+        return key, None
+    entry = _HOLD_CACHE.get('last')
+    if not entry:
+        return key, None
+    if entry['scene'] != scene_name or entry['frame'] != key \
+            or entry['size'] != tuple(size) \
+            or entry['fp'] != _hold_fingerprint(settings):
+        return key, None
+    return key, entry
+
+
+def hold_store(scene_name, frame, size, settings, image, depth, shafts,
+               flares):
+    """Remember a key frame's cel (and the data the post chain reads)
+    for the held frames that follow it."""
+    _HOLD_CACHE['last'] = {
+        'scene': scene_name, 'frame': int(frame), 'size': tuple(size),
+        'fp': _hold_fingerprint(settings), 'image': image, 'depth': depth,
+        'shafts': shafts, 'flares': flares}
 
 
 class _Cancelled(Exception):
