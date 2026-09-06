@@ -26,7 +26,17 @@ def _mkprop(name):
         if name == 'EnumProperty':
             items = kw.get('items')
             if callable(items):
-                pass
+                # Blender's own rule, verbatim: a callback for items
+                # may NOT be combined with a default -- registration
+                # dies with "'default' cannot be set when 'items' is a
+                # function", swallowed into "EnumProperty could not
+                # register (see previous error)". The 1.62.0 enable
+                # failure, now caught at test time.
+                if kw.get('default') is not None:
+                    raise ValueError(
+                        "EnumProperty(...): 'default' cannot be set "
+                        "when 'items' is a function (Blender refuses "
+                        "this at registration)")
             elif items is not None:
                 idents = [i[0] for i in items]
                 d = kw.get('default')
@@ -122,6 +132,7 @@ class _Types(types.ModuleType):
         self.World = World
         self.NODE_MT_add = type('NODE_MT_add', (Menu,), {
             'append': classmethod(lambda cls, fn: None),
+            'prepend': classmethod(lambda cls, fn: None),
             'remove': classmethod(lambda cls, fn: None)})
 
     def __getattr__(self, name):
@@ -140,7 +151,79 @@ utils = types.ModuleType('bpy.utils')
 _registered = []
 
 
+#: Blender's RNA validation counts EVERY named parameter of a callback --
+#: defaulted extras included. `init(self, context, _ins=ins)` is legal
+#: Python and registers fine in a naive stub, then Blender refuses the
+#: class: 'expected Node, X class "init" function to have 2 args, found
+#: 4' (the R216 field paste). The stub now runs the same check, per base
+#: type, so the suite catches the disease on ANY class, forever.
+_CALLBACK_ARGS = (
+    ('Node', {'init': 2, 'copy': 2, 'free': 1, 'update': 1,
+              'draw_label': 1, 'draw_buttons': 3, 'draw_buttons_ext': 3,
+              'poll': 2}),
+    ('NodeSocket', {'draw': 5, 'draw_color': 3}),
+    ('Operator', {'execute': 2, 'invoke': 3, 'modal': 3, 'draw': 2,
+                  'check': 2, 'cancel': 2, 'poll': 2}),
+    ('Menu', {'draw': 2, 'poll': 2}),
+    ('Panel', {'draw': 2, 'draw_header': 2, 'poll': 2}),
+    ('RenderEngine', {'render': 2, 'update': 3, 'view_update': 3,
+                      'view_draw': 3}),
+)
+
+
+def _validate_callback_args(cls):
+    import types as _t
+    base_map = {'Node': Node, 'NodeSocket': NodeSocket,
+                'Operator': Operator, 'Menu': Menu, 'Panel': Panel,
+                'RenderEngine': RenderEngine}
+    table = None
+    base_name = None
+    for name, tab in _CALLBACK_ARGS:
+        if issubclass(cls, base_map[name]):
+            table = tab
+            base_name = name
+            break
+    if table is None:
+        return
+    for fn_name, want in table.items():
+        raw = None
+        for c in cls.__mro__:
+            if c in base_map.values() or c is object:
+                break                       # the stub bases define none
+            if fn_name in c.__dict__:
+                raw = c.__dict__[fn_name]
+                break
+        if raw is None:
+            continue
+        if isinstance(raw, (classmethod, staticmethod)):
+            raw = raw.__func__
+        if not isinstance(raw, _t.FunctionType):
+            continue
+        found = raw.__code__.co_argcount
+        if found != want:
+            raise TypeError(
+                f'validating class: expected {base_name}, {cls.__name__} '
+                f'class "{fn_name}" function to have {want} args, '
+                f'found {found}')
+
+
+def _validate_icon(cls):
+    """R244: Blender validates a class's bl_icon against its icon enum
+    at register_class ('validating class: enum "MOD_WOOD" not found in
+    (...)' was the field's enable failure). The stub reads the same enum
+    (blender_icons.ICONS, the field's own paste) and refuses the same way."""
+    icon = getattr(cls, 'bl_icon', None)
+    if icon is None:
+        return
+    from .blender_icons import ICONS
+    if icon not in ICONS:
+        raise ValueError(f'validating class: enum "{icon}" not found in the '
+                         f'Blender 5.2 icon enum ({cls.__name__}.bl_icon)')
+
+
 def register_class(cls):
+    _validate_callback_args(cls)
+    _validate_icon(cls)
     _registered.append(cls)
     ann = getattr(cls, '__annotations__', {})
     for k, v in ann.items():

@@ -1360,6 +1360,11 @@ _NODE_TABLE = {
                                 ('Slot Color', 'RGBA')],
                                [('Color', 'RGBA')]),
     'ShaderNodeUVMap': ([], [('UV', 'VECTOR')]),
+    # R232: the media converters' tone source
+    'HALCYON_ScreenInfoNode': ([], [('Screen UV', 'VECTOR'),
+                                    ('Pixel', 'VECTOR'), ('Depth', 'VALUE'),
+                                    ('Facing', 'VALUE'), ('Frame', 'VALUE'),
+                                    ('Time', 'VALUE')]),
 }
 
 #: default prop values real nodes carry (see _FNode)
@@ -1492,6 +1497,11 @@ class _FNode:
                     self, name, {'NodeSocketColor': 'RGBA',
                                  'NodeSocketVector': 'VECTOR'}
                     .get(kind, 'VALUE')))
+            # the spec's own props, at their defaults: build_spec sets
+            # only attributes the node HAS (R232: a recipe's Space and
+            # Layers must land on the fake as they do on the real node)
+            for key, pspec in spec[5].items():
+                setattr(self, key, pspec[1])
         else:
             ins, outs = _NODE_TABLE.get(idname, ([], []))
             for name, kind in ins:
@@ -2016,8 +2026,10 @@ def test_frame_emit_semantics():
           and 'hal_N' not in em3.body())
     em4 = Emitter(tgraph)
     em4.output('t', 2)
-    check('tex-coord output 2 named Object emits world P',
-          'hal_P' in em4.body())
+    # R243: Object is the object's own frame (hal_object, the baked
+    # per-object inverse rows), no longer world P
+    check('tex-coord output 2 named Object emits the object frame',
+          'hal_object' in em4.body() and 'hal_P' not in em4.body())
 
     # ---- 3: the colorband unroll, form and numbers
     coba = [(0.0, 0.05, 0.02, 0.4, 0.0), (0.32, 0.9, 0.25, 0.1, 0.5),

@@ -531,48 +531,263 @@ def cookie_frame(light):
     return s[0], u[0], f
 
 
-def _cookie_texture(light):
-    tex = getattr(light, '_cookie_tex', None)
-    if tex is None:
-        from .texture import Texture
-        px = getattr(light, 'cookie', None)
-        px = getattr(px, 'pixels', px)
-        tex = Texture(np.asarray(px, np.float32), name='cookie',
-                      colorspace='Non-Color')
+#: R219: the extension each projection always had, before it was a
+#: choice -- SUN/HEMI tile their cloud shadow, a SPOT's cone edge lands
+#: on the image edge and clamps, a POINT's lat-long wraps around its own
+#: seam, an AREA's face clamps at its border.
+_COOKIE_AUTO_EXTEND = {'SUN': 'REPEAT', 'HEMI': 'REPEAT',
+                       'SPOT': 'EXTEND', 'POINT': 'REPEAT',
+                       'AREA': 'EXTEND'}
+
+
+def cookie_extend(light):
+    """The light's resolved cookie extension: REPEAT, EXTEND or CLIP."""
+    mode = str(getattr(light, 'cookie_extend', 'AUTO') or 'AUTO').upper()
+    if mode == 'AUTO':
+        return _COOKIE_AUTO_EXTEND.get(getattr(light, 'type', 'POINT'),
+                                       'EXTEND')
+    return mode
+
+
+def cookie_filter(light):
+    """The light's cookie filter, in the Texture sampler's vocabulary."""
+    f = str(getattr(light, 'cookie_filter', 'BILINEAR')
+            or 'BILINEAR').upper()
+    return 'NEAREST' if f == 'CLOSEST' else f
+
+
+def cookie_blur_uv(light):
+    """Per-axis focus-blur radius in UV units, from the lamp's SOURCE
+    size -- the slider the lamp already has (R219 field: "The Angle
+    slider should effect how blurry it is").
+
+    A big light source smears anything it projects; the mapping per
+    projection, with `radius` the exported Angle (SUN/HEMI, radians,
+    full diameter) or Radius (others, scene units):
+
+    - SUN/HEMI: the slide floats one tile above the world, so an
+      angular radius a spreads each point by tan(a) of a tile:
+      tan(radius/2).
+    - SPOT: the gate sits one unit down the throw and spans
+      2*tan(spot_size/2); a source disc of radius r seen across it:
+      r / (2*tan(spot_size/2)).
+    - POINT: the source's angular radius from one unit away, over the
+      lat-long span: atan(r)/2pi across, atan(r)/pi down.
+    - AREA: the printed gel is the size of the face; the source radius
+      over the face: r/size_x, r/size_y.
+
+    0 (the dataclass default) means razor sharp -- and bitwise exactly
+    the pre-R219 image, because a sub-texel sigma collapses the box
+    widths to 1 and the preparation returns the source array untouched.
+    """
+    r = float(getattr(light, 'radius', 0.0) or 0.0)
+    if r <= 0.0:
+        return (0.0, 0.0)
+    kind = getattr(light, 'type', 'POINT')
+    if kind in ('SUN', 'HEMI'):
+        b = float(np.tan(min(r, 3.0) * 0.5))
+        return (b, b)
+    if kind == 'SPOT':
+        tanh = max(np.tan(float(getattr(light, 'spot_size', 1.2)) * 0.5),
+                   1e-6)
+        b = r / (2.0 * float(tanh))
+        return (b, b)
+    if kind == 'POINT':
+        a = float(np.arctan(r))
+        return (a / (2.0 * np.pi), a / np.pi)
+    if kind == 'AREA':
         try:
-            light._cookie_tex = tex
+            sx, sy = (float(v) for v in
+                      getattr(light, 'area_size', (1.0, 1.0))[:2])
         except Exception:                                       # noqa: BLE001
-            pass
+            sx = sy = 1.0
+        return (r / max(sx, 1e-6), r / max(sy, 1e-6))
+    return (0.0, 0.0)
+
+
+def _box_passes(sigma):
+    """Three box half-widths that together approximate a gaussian of
+    `sigma` texels -- the classic triple-box, integer widths, O(n) at
+    ANY radius (the R167 rule: a huge Angle costs the same as a small
+    one). Returns a list of ODD box widths; all 1 = identity."""
+    if sigma < 0.58:
+        return [1, 1, 1]
+    n = 3.0
+    wi = np.sqrt(12.0 * sigma * sigma / n + 1.0)
+    wl = int(np.floor(wi))
+    if wl % 2 == 0:
+        wl -= 1
+    wl = max(wl, 1)
+    wu = wl + 2
+    mi = (12.0 * sigma * sigma - n * wl * wl - 4.0 * n * wl - 3.0 * n) \
+        / (-4.0 * wl - 4.0)
+    m = int(round(mi))
+    m = min(max(m, 0), 3)
+    return [wl] * m + [wu] * (3 - m)
+
+
+def _box1d(a, width, axis, pad_mode):
+    """One box pass along `axis` via a float64 running sum -- exact,
+    deterministic, radius-independent cost."""
+    if width <= 1:
+        return a
+    n = a.shape[axis]
+    half = min((width - 1) // 2, n)
+    w = 2 * half + 1
+    pad = [(0, 0)] * a.ndim
+    pad[axis] = (half, half)
+    kw = {'mode': pad_mode}
+    if pad_mode == 'constant':
+        kw['constant_values'] = 0.0
+    padded = np.pad(a, pad, **kw)
+    c = np.cumsum(padded, axis=axis, dtype=np.float64)
+    zshape = list(c.shape)
+    zshape[axis] = 1
+    c = np.concatenate([np.zeros(zshape, np.float64), c], axis=axis)
+    hi = [slice(None)] * a.ndim
+    lo = [slice(None)] * a.ndim
+    hi[axis] = slice(w, w + n)
+    lo[axis] = slice(0, n)
+    return ((c[tuple(hi)] - c[tuple(lo)]) / float(w)).astype(np.float32)
+
+
+_COOKIE_PAD = {'REPEAT': 'wrap', 'EXTEND': 'edge', 'CLIP': 'constant'}
+
+
+def cookie_pixels(light):
+    """The image a lamp actually projects -- prepared ONCE and shared
+    verbatim by the CPU sampler and the GPU upload, so both devices read
+    identical texels (the determinism doctrine applied to gobos).
+
+    Preparation is the focus blur: the lamp's source size (Angle /
+    Radius) smeared into the image itself by the triple-box gaussian,
+    padded in the light's own extension mode so a tiling cloud shadow
+    blurs across its seam and a projector gate darkens toward its edge.
+    Cached on the light, keyed on the source pixels and every dial that
+    shapes the result; a caustic lamp's synthesized web is exempt (it
+    re-bakes every frame and stays crisp, exactly as before R219).
+    Returns an (H,W,C) float32 array, or None without a cookie.
+    """
+    ck = getattr(light, 'cookie', None)
+    if ck is None:
+        return None
+    src = getattr(ck, 'pixels', ck)
+    px = np.asarray(src, np.float32)
+    if px.ndim == 2:
+        px = px[:, :, None]
+    if getattr(light, '_caustic_cookie', False):
+        bu = bv = 0.0
+    else:
+        bu, bv = cookie_blur_uv(light)
+    ext = cookie_extend(light)
+    key = (px.shape, round(float(px[::7, ::7].sum()), 6),
+           round(float(bu), 9), round(float(bv), 9), ext)
+    prep = getattr(light, '_cookie_prep', None)
+    if isinstance(prep, tuple) and prep[0] == key:
+        return prep[1]
+    h, w = px.shape[:2]
+    su = float(bu) * w * 0.5
+    sv = float(bv) * h * 0.5
+    if su < 0.29 and sv < 0.29:
+        out = px                       # identity: the pre-R219 bytes
+    else:
+        pad = _COOKIE_PAD.get(ext, 'edge')
+        out = px
+        for bw in _box_passes(su):
+            out = _box1d(out, bw, 1, pad)
+        for bw in _box_passes(sv):
+            out = _box1d(out, bw, 0, pad)
+    try:
+        light._cookie_prep = (key, out)
+    except Exception:                                           # noqa: BLE001
+        pass
+    return out
+
+
+def _cookie_texture(light):
+    px = cookie_pixels(light)
+    key = getattr(light, '_cookie_prep', (None, None))[0]
+    ct = getattr(light, '_cookie_tex', None)
+    if isinstance(ct, tuple) and ct[0] == key:
+        return ct[1]
+    from .texture import Texture
+    tex = Texture(np.asarray(px, np.float32), name='cookie',
+                  colorspace='Non-Color')
+    try:
+        light._cookie_tex = (key, tex)
+    except Exception:                                           # noqa: BLE001
+        pass
     return tex
 
 
 def cookie_factor(light, P, L):
     """Per-point rgb multiplier from a light's projected texture.
 
-    The sixth-generation consoles' projective texturing: a SPOT maps its
-    full cone onto the image (the cone edge lands on the image edge, the
-    lookup clamps outside it), a SUN projects the image along its rays and
-    REPEATS it every `cookie_scale` world units -- the scrolling cloud
-    shadow of the era. Bilinear both here and in the GLSL mirror, with the
-    same texel arithmetic. Returns (N,3), all ones where the projection is
-    undefined (behind a spot). POINT and AREA lights return ones -- a
-    single 2D image has no defined mapping around a point.
+    The sixth-generation consoles' projective texturing, one mapping per
+    lamp kind (R219: ALL of them project):
+
+    - SPOT maps its full cone onto the image -- the cone edge lands on
+      the image edge, a slide projector (Splinter Cell's windows).
+    - SUN/HEMI project along their rays and tile every `cookie_scale`
+      world units -- the scrolling cloud shadow of the era.
+    - POINT wraps the image around itself lat-long, seam at the back:
+      a pierced lantern, a disco ball.
+    - AREA carries the image on its face like a printed gel and throws
+      it straight forward, one face-width wide.
+
+    Filter and extension are the light's cookie_filter/cookie_extend
+    (CLIP reads zero outside the slide: the projector's gate, so at
+    strength 1 there is no light past the image). The GLSL mirror
+    writes out the same texel arithmetic. Returns (N,3), all ones where
+    the projection is undefined (behind a spot or an area's face).
     """
     n = P.shape[0]
     kind = getattr(light, 'type', 'POINT')
-    if getattr(light, 'cookie', None) is None or \
-            kind not in ('SPOT', 'SUN'):
+    if getattr(light, 'cookie', None) is None:
         return np.ones((n, 3), np.float32)
     s, u, f = cookie_frame(light)
     tex = _cookie_texture(light)
+    wrap = cookie_extend(light)
+    filt = cookie_filter(light)
     strength = float(np.clip(getattr(light, 'cookie_strength', 1.0), 0.0, 1.0))
-    if kind == 'SUN':
+    if kind in ('SUN', 'HEMI'):
         scale = max(float(getattr(light, 'cookie_scale', 10.0)), 1e-6)
         cu = (P @ s.astype(np.float32)) / scale
         cv = (P @ u.astype(np.float32)) / scale
         rgb = tex.sample(cu.astype(np.float32), cv.astype(np.float32),
-                         filt='BILINEAR', wrap='REPEAT')[:, :3]
+                         filt=filt, wrap=wrap)[:, :3]
         return (1.0 + (rgb - 1.0) * strength).astype(np.float32)
+    if kind == 'POINT':
+        # light -> surface direction in the lamp's own frame, unrolled
+        # to lat-long: u around the forward axis (atan2, seam at the
+        # back), v from the equator (asin) -- both land inside [0,1]
+        d = -L
+        dx = d @ s.astype(np.float32)
+        dy = d @ u.astype(np.float32)
+        dz = d @ f.astype(np.float32)
+        cu = np.arctan2(dx, dz) * np.float32(1.0 / (2.0 * np.pi)) + 0.5
+        cv = np.arcsin(np.clip(dy, -1.0, 1.0)) * np.float32(1.0 / np.pi) \
+            + 0.5
+        rgb = tex.sample(cu.astype(np.float32), cv.astype(np.float32),
+                         filt=filt, wrap=wrap)[:, :3]
+        return (1.0 + (rgb - 1.0) * strength).astype(np.float32)
+    if kind == 'AREA':
+        # parallel throw off the face: offset in the lamp plane over the
+        # face size; behind the face the projection is undefined
+        try:
+            sx, sy = (float(v) for v in
+                      getattr(light, 'area_size', (1.0, 1.0))[:2])
+        except Exception:                                       # noqa: BLE001
+            sx = sy = 1.0
+        rel = P - np.asarray(light.position, np.float32)[None, :]
+        dz = rel @ f.astype(np.float32)
+        cu = (rel @ s.astype(np.float32)) / max(sx, 1e-6) + 0.5
+        cv = (rel @ u.astype(np.float32)) / max(sy, 1e-6) + 0.5
+        rgb = tex.sample(cu.astype(np.float32), cv.astype(np.float32),
+                         filt=filt, wrap=wrap)[:, :3]
+        out = 1.0 + (rgb - 1.0) * strength
+        out[dz <= 1e-6] = 1.0
+        return out.astype(np.float32)
     # SPOT: direction light -> surface, expressed in the light's own frame;
     # the full cone spans the image, so uv = d_side / (d_fwd * 2 tan(half))
     d = -L
@@ -582,7 +797,7 @@ def cookie_factor(light, P, L):
     cu = (d @ s.astype(np.float32)) / safe + 0.5
     cv = (d @ u.astype(np.float32)) / safe + 0.5
     rgb = tex.sample(cu.astype(np.float32), cv.astype(np.float32),
-                     filt='BILINEAR', wrap='EXTEND')[:, :3]
+                     filt=filt, wrap=wrap)[:, :3]
     out = 1.0 + (rgb - 1.0) * strength
     out[dz <= 1e-6] = 1.0
     return out.astype(np.float32)
@@ -633,15 +848,83 @@ def sample(light, P, settings, area_sample=None):
         att = np.where(att <= 0.001, 0.0, att)
     scale = energy / (4.0 * np.pi)
     rad = col * (scale * att)[:, None]
-    if light.type == 'SPOT' and getattr(light, 'cookie', None) is not None:
+    if getattr(light, 'cookie', None) is not None:
+        # R219: every lamp kind projects -- SPOT through its cone,
+        # POINT wrapped around itself, AREA off its face
         rad = rad * cookie_factor(light, P, L)
     return L.astype(np.float32), rad.astype(np.float32), dist
+
+
+#: R225: a DISK/ELLIPSE area lamp's contour is a regular polygon with
+#: this many corners, scaled to the ellipse's exact AREA (see
+#: area_corners). 16 keeps the polygon within 1% of the disc's radius
+#: everywhere (max radial deviation 1 - cos(pi/16) = 1.9% before the
+#: equal-area scale, +-1% after) at four times the rectangle's cost;
+#: the GPU twin bakes the same corners as literals.
+AREA_DISC_SIDES = 16
+
+
+def area_is_disc(light):
+    """True for the round area shapes (Blender's DISK and ELLIPSE)."""
+    return str(getattr(light, 'area_shape', 'SQUARE')).upper() \
+        in ('DISK', 'ELLIPSE')
+
+
+def area_emit_area(light):
+    """The lamp's EMITTING area: sx*sy for the rectangles, pi/4*sx*sy
+    for the ellipses. The form factor's dist^2/A normalisation divides
+    by this, so a disc and a square of the same size throw the same
+    far-field energy (BI's area lamp is total-power-like: its energy
+    does not grow with its size) and differ only in SHAPE."""
+    asz = getattr(light, 'area_size', (1.0, 1.0))
+    sx = max(float(asz[0]), 1e-6)
+    sy = max(float(asz[1]) if len(asz) > 1 else float(asz[0]), 1e-6)
+    if area_is_disc(light):
+        return sx * sy * (np.pi * 0.25)
+    return sx * sy
+
+
+def area_corners(light, dtype=np.float64):
+    """The lamp face's corners (K, 3) in BI's contour winding.
+
+    A SQUARE/RECTANGLE lamp is area_lamp_vectors' four corners in its
+    order (-x-y, -x+y, +x+y, +x-y) -- the exact arithmetic the
+    rectangle road always used. R225: a DISK/ELLIPSE lamp is a regular
+    AREA_DISC_SIDES-gon in the same winding (angles falling from 225
+    degrees), stretched by the two half-sizes and scaled by
+    sqrt(2 pi / (K sin(2 pi / K))) so the polygon's area equals the
+    ellipse's -- the Stokes contour of that polygon IS the disc's
+    energy to within the polygon's radial error, and the far field
+    matches the true disc exactly. "The Area light doesn't actually
+    adapt to the shape of the light" -- now the illumination does,
+    the way the soft shadows and beam cones already did.
+    """
+    pos = np.asarray(light.position, dtype)
+    ax = np.asarray(getattr(light, 'area_x', None)
+                    if getattr(light, 'area_x', None) is not None
+                    else (1.0, 0.0, 0.0), dtype)
+    ay = np.asarray(getattr(light, 'area_y', None)
+                    if getattr(light, 'area_y', None) is not None
+                    else (0.0, 1.0, 0.0), dtype)
+    asz = getattr(light, 'area_size', (1.0, 1.0))
+    sx = max(float(asz[0]), 1e-6)
+    sy = max(float(asz[1]) if len(asz) > 1 else float(asz[0]), 1e-6)
+    hx, hy = ax * dtype(sx * 0.5), ay * dtype(sy * 0.5)
+    if not area_is_disc(light):
+        return np.stack((pos - hx - hy, pos - hx + hy,
+                         pos + hx + hy, pos + hx - hy))
+    k = AREA_DISC_SIDES
+    scale = np.sqrt(2.0 * np.pi / (k * np.sin(2.0 * np.pi / k)))
+    th = 1.25 * np.pi - np.arange(k, dtype=np.float64) * (2.0 * np.pi / k)
+    cs = (np.cos(th) * scale).astype(dtype)
+    sn = (np.sin(th) * scale).astype(dtype)
+    return pos[None, :] + hx[None, :] * cs[:, None] + hy[None, :] * sn[:, None]
 
 
 def area_inp(light, P, N, want_back=False):
     """BI's area lamp energy -- shadeoutput.c area_lamp_energy, verbatim.
 
-    The Stokes contour integral over the rectangle's four corners, in
+    The Stokes contour integral over the lamp face's corners, in
     DOUBLE precision exactly as the C (the acos of near-parallel unit
     vectors is why BI used doubles here): for each edge, the arc angle
     times the normal's projection on the edge plane's normal. The sum
@@ -652,13 +935,16 @@ def area_inp(light, P, N, want_back=False):
     (the 2.79 default, and the exact integral -- the jittered tiles
     only Monte-Carlo the same quantity):
 
-        inp = pow(stokes * areasize, k),  areasize = dist^2 / (sx*sy)
+        inp = pow(stokes * areasize, k),  areasize = dist^2 / A
 
-    with `dist` the lamp's Distance (decay_end) and `k` the 2.79 area
-    lamp's Gamma. A point behind the lamp's plane gets 0 (single
-    sided). DISK/ELLIPSE shapes use their bounding rectangle -- the
-    era formula only knows corners. lamp_get_visibility gives an area
-    lamp visifac 1.0 (its falloff switch is skipped): the ONLY
+    with `dist` the lamp's Distance (decay_end), A the face's emitting
+    area (area_emit_area) and `k` the 2.79 area lamp's Gamma. A point
+    behind the lamp's plane gets 0 (single sided). The rectangle
+    shapes run BI's four corners bitwise; R225: DISK/ELLIPSE run the
+    same contour over the equal-area polygon of area_corners, so a
+    round lamp lights like a round lamp (the era formula only knew
+    corners, so it gets more of them). lamp_get_visibility gives an
+    area lamp visifac 1.0 (its falloff switch is skipped): the ONLY
     distance behaviour an area lamp has is this form factor's.
 
     Returns (n,) float32; with `want_back`, (front, back) where back
@@ -670,19 +956,7 @@ def area_inp(light, P, N, want_back=False):
     pos = np.asarray(light.position, np.float64)
     d = np.asarray(light.direction, np.float64)
     d = d / max(float(np.linalg.norm(d)), 1e-12)          # lar->vec
-    ax = np.asarray(getattr(light, 'area_x', None)
-                    if getattr(light, 'area_x', None) is not None
-                    else (1.0, 0.0, 0.0), np.float64)
-    ay = np.asarray(getattr(light, 'area_y', None)
-                    if getattr(light, 'area_y', None) is not None
-                    else (0.0, 1.0, 0.0), np.float64)
-    asz = getattr(light, 'area_size', (1.0, 1.0))
-    sx = max(float(asz[0]), 1e-6)
-    sy = max(float(asz[1]) if len(asz) > 1 else float(asz[0]), 1e-6)
-    hx, hy = ax * (sx * 0.5), ay * (sy * 0.5)
-    # area_lamp_vectors' corner order: -x-y, -x+y, +x+y, +x-y
-    corners = (pos - hx - hy, pos - hx + hy,
-               pos + hx + hy, pos + hx - hy)
+    corners = area_corners(light)
     P64 = P.astype(np.float64)
     vec = []
     for c in corners:
@@ -700,15 +974,16 @@ def area_inp(light, P, N, want_back=False):
     # gives the positive contour).
     vn = -N.astype(np.float64)
     fac = np.zeros(n, np.float64)
-    for i in range(4):
-        a, b = vec[i], vec[(i + 1) % 4]
+    nc = len(vec)
+    for i in range(nc):
+        a, b = vec[i], vec[(i + 1) % nc]
         cr = np.cross(a, b)
         cr /= np.maximum(np.sqrt((cr * cr).sum(axis=1)), 1e-300)[:, None]
         # saacos_d: acos clamped into its domain
         ang = np.arccos(np.clip((a * b).sum(axis=1), -1.0, 1.0))
         fac += ang * (vn * cr).sum(axis=1)
     dist = max(float(getattr(light, 'decay_end', 25.0)), 1e-6)
-    areasize = dist * dist / (sx * sy)
+    areasize = dist * dist / area_emit_area(light)
     k = float(getattr(light, 'area_gamma', 1.0) or 1.0)
     # single sided: behind the lamp's plane nothing arrives
     front = ((P64 - pos[None, :]) * d[None, :]).sum(axis=1) >= 0.0
@@ -738,6 +1013,19 @@ def area_samples(light, count, rng):
             u, v = r * np.cos(th), r * np.sin(th)
         out.append(pos + ax * u + ay * v)
     return out
+
+
+def casts_shadow(light, settings):
+    """Whether `visibility` could return anything but ones for this
+    lamp: its early-outs, as a predicate (R238: the fixed key folds
+    the casters' visibility in and skips the rest)."""
+    if str(getattr(light, 'type', '')).upper() == 'HEMI':
+        return False
+    if not settings.shadows or getattr(light, 'shadow', 'NONE') == 'NONE':
+        return False
+    mode = light.shadow if settings.shadow_default == 'PER_LIGHT' else \
+        settings.shadow_default
+    return mode != 'NONE'
 
 
 def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
@@ -781,6 +1069,10 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
         bias = max(settings.ray_bias, 1e-4)
         origin = P + N * bias + L * bias
         maxt = np.where(dist > 1e8, 1e9, dist * (1.0 - 1e-3))
+        # R208: the per-triangle caster mask (object Visibility >
+        # Shadow, BI Shadow > Cast, Material.cast_shadow) -- the same
+        # mask the shadow-map bake honours, as a BVH cast filter
+        cast = getattr(settings, '_shadow_cast_tri', None)
         kind = str(getattr(light, 'type', 'POINT')).upper()
         # what "size" means per lamp: SUN's is an ANGLE, AREA's is its
         # rectangle, POINT/SPOT a world radius. The old code read
@@ -798,7 +1090,7 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
             soft_on = float(light.radius) > 0.0
         samples = max(1, int(settings.shadow_samples)) if soft_on else 1
         if samples == 1:
-            hit = bvh.occluded(origin, L, maxt, mask=mask)
+            hit = bvh.occluded(origin, L, maxt, mask=mask, cast=cast)
             return (~hit).astype(np.float32)
         acc = np.zeros(n, np.float32)
         t, b = M.orthonormal_basis(L)
@@ -856,8 +1148,8 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
                 u1 = PT.sample_u(spx, spy, z)
                 u2 = PT.sample_u(spx, spy, z + 1)
                 Lj, mt = _soft_ray(u1, u2)
-                acc += (~bvh.occluded(origin, Lj, mt,
-                                      mask=mask)).astype(np.float32)
+                acc += (~bvh.occluded(origin, Lj, mt, mask=mask,
+                                      cast=cast)).astype(np.float32)
             return acc / samples
         from . import patterns as PT                            # noqa: F811
         rng = rng or np.random.default_rng(settings.seed)
@@ -865,8 +1157,8 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
             u1 = np.full(n, rng.random(), np.float32)
             u2 = np.full(n, rng.random(), np.float32)
             Lj, mt = _soft_ray(u1, u2)
-            acc += (~bvh.occluded(origin, Lj, mt,
-                                  mask=mask)).astype(np.float32)
+            acc += (~bvh.occluded(origin, Lj, mt, mask=mask,
+                                  cast=cast)).astype(np.float32)
         return acc / samples
 
     sm = light.shadow_map

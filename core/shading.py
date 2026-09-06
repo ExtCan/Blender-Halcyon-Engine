@@ -109,7 +109,387 @@ MODEL_ITEMS = (
      "Sparrow geometry with BI's own refraction-index Fresnel and a "
      "Gaussian half-angle lobe whose width comes from Hardness. IOR "
      "is BI's Refr slider. Legacy imports use it for Blinn materials"),
+    ('ANIME', "Anime / Cel",
+     "The 2000s-2020s cel look: N.L wrapped to 0..1, cut into two or "
+     "three hard-edged tone bands whose SHADOW COLOURS multiply the "
+     "base (a shadow is a colour, not a darkness), with a stepped "
+     "highlight. The dedicated Anime Shader node carries the full "
+     "control set and the game compatibility modes; picking this on "
+     "the master shader runs the same bands at their defaults"),
+    ('CARTOON', "Cartoon (Paint)",
+     "The Western cel: the colour is PAINT, not light -- flat, the "
+     "same under every lamp -- with one painted shadow tone where the "
+     "key lamps do not reach (a transparent shadow cel over the paint, "
+     "or a second flat paint), a painted highlight dot, and a shadow "
+     "shape smoothed toward a sphere the way an inker simplifies. The "
+     "Cartoon Shader node carries the controls and the era presets; "
+     "picking this on the master shader runs it at its defaults"),
+    ('OREN_NAYAR_BLINN', "Oren-Nayar-Blinn",
+     "3ds Max's matte shader: Oren-Nayar's rough diffuse (Roughness) "
+     "under 3D Studio MAX's Blinn highlight (Glossiness, IOR) -- fabric, "
+     "terra cotta, clay with a sheen. The one Max shader Halcyon lacked "
+     "until R242; with Roughness at 0 it is plain Blinn"),
+    # ---- R243: 3ds Max's eight Standard shaders on Max's own light
+    # loops (the field's ports of shaders/stdmtl2), appended so no
+    # code moves. Glossiness and Specular Level read as Max's percent
+    # over 100; Soften is Max's; the frame is world Z projected onto
+    # the surface (Max's object Z), turned by Anisotropic Rotation
+    ('MAX_PHONG', "Phong (3ds Max)",
+     "3ds Max's Phong exactly: the reflected eye ray against the light "
+     "raised to 2^(10 Glossiness), Soften folding the cosine before the "
+     "power, Lambert beneath. The Standard material's plastic"),
+    ('MAX_BLINN', "Blinn (3ds Max)",
+     "3ds Max's Blinn exactly: the half-vector cosine raised to "
+     "4 x 2^(10 Glossiness), Soften folding it first, Lambert beneath. "
+     "The Standard material's default shader"),
+    ('MAX_METAL', "Metal (3ds Max)",
+     "3ds Max's Metal exactly: Cook-Torrance with the Beckmann slope "
+     "1 - Glossiness, the geometric term, and a Fresnel from the "
+     "diffuse colour's own intensity, so the highlight takes the "
+     "metal's colour; the diffuse dims by Specular Level"),
+    ('MAX_ANISOTROPIC', "Anisotropic (3ds Max)",
+     "3ds Max's Anisotropic exactly: the Gaussian highlight stretched "
+     "by Anisotropy along a frame turned by Anisotropic Rotation, "
+     "Glossiness its width, Diffuse Level the Lambert beneath"),
+    ('MAX_MULTI_LAYER', "Multi-Layer (3ds Max)",
+     "3ds Max's Multi-Layer exactly: Max's Oren-Nayar diffuse "
+     "(Roughness) under two anisotropic highlights -- the first from "
+     "Specular Color / Level / Glossiness / Anisotropy / Rotation, the "
+     "second from their '2' sockets, the second showing through what "
+     "the first leaves"),
+    ('MAX_OREN_NAYAR_BLINN', "Oren-Nayar-Blinn (3ds Max)",
+     "3ds Max's Oren-Nayar-Blinn exactly: Max's Oren-Nayar diffuse "
+     "with its interreflection term (Roughness, Diffuse Level) under "
+     "Max's Blinn highlight (Glossiness, Soften)"),
+    ('MAX_STRAUSS', "Strauss (3ds Max)",
+     "3ds Max's Strauss exactly: Glossiness and Metalness alone -- the "
+     "highlight 3/(1 - Glossiness) sharp, its colour sliding from the "
+     "light's to the diffuse by Metalness and Strauss's Fresnel, the "
+     "diffuse dimmed by both; Opacity is Strauss's transparency. "
+     "Specular Level does not apply (Max has none here)"),
+    ('MAX_TRANSLUCENT', "Translucent (3ds Max)",
+     "3ds Max's Translucent exactly: Blinn under Lambert, and the "
+     "Translucent Color lit by every lamp's light from either side, "
+     "darkening where the diffuse is already lit -- Max's leaf and "
+     "lampshade shader (the hemisphere sums are taken per lamp here)"),
 )
+
+#: models whose highlight the light loop must NOT scale by Specular
+#: Level: Strauss has no such dial in Max, and Multi-Layer applies its two
+#: levels lobe by lobe inside the model
+LEVEL_FREE_MODELS = frozenset({'MAX_STRAUSS', 'MAX_MULTI_LAYER'})
+MAX_MODELS = frozenset({'MAX_PHONG', 'MAX_BLINN', 'MAX_METAL', 'MAX_ANISOTROPIC',
+                        'MAX_MULTI_LAYER', 'MAX_OREN_NAYAR_BLINN', 'MAX_STRAUSS',
+                        'MAX_TRANSLUCENT'})
+
+#: R228: the Cartoon Shader's shadow modes -- how its one painted
+#: shadow tone lands on the paint. The closure carries the code as a
+#: float (cartoon_mode: 0, 1, 2) so both devices read one number.
+CARTOON_SHADOW_MODE_ITEMS = (
+    ('TRANSPARENT', "Transparent Cel",
+     "The shadow is a tinted cel laid OVER the paint: paint x Shadow "
+     "Color, by Shadow Amount. The Golden Age shadow cel (a second "
+     "exposure through a tinted overlay) and every airbrushed-tone look"),
+    ('PAINTED', "Painted",
+     "The shadow is a second flat paint: Shadow Color replaces the paint "
+     "by Shadow Amount, whatever the paint was. UPA, the TV decades, "
+     "the 90s features"),
+    ('NONE', "None",
+     "No shadow tone at all: the paint is flat everywhere, lit or not. "
+     "Limited animation's cheapest look; the highlight dot still lands"),
+)
+
+#: R228: the era presets. Each writes the node's sockets and its shadow
+#: mode (the node's Era menu applies one; the Cartoon templates drop
+#: them ready-made). The values are STARTING POINTS that name what they
+#: imitate -- the sockets stay editable afterwards. Socket names are
+#: the Cartoon node's own; 'shadow_mode' is the node prop.
+CARTOON_ERA_ITEMS = (
+    ('CUSTOM', "Custom", "No preset: the sockets are yours"),
+    ('GOLDEN_40S', "Golden Age (1930s-40s)",
+     "Feature-era cel paint under a transparent shadow cel: the shadow "
+     "darkens the paint part-way (a second exposure through a tinted "
+     "overlay), edges slightly airbrushed, forms rounded, no highlight"),
+    ('UPA_50S', "UPA Modern (1950s)",
+     "Graphic flat colour: the shadow is a second paint in a bold "
+     "contrasting hue, hard-edged, shapes simplified toward the form"),
+    ('XEROX_60S', "Xerox Era (1960s-70s)",
+     "Muted flat painted tones under scratchy xeroxed lines: the "
+     "shadow is a desaturated second paint, hard-edged, lightly "
+     "rounded. Pair with the Pencil ink style"),
+    ('SATURDAY_70S', "Saturday Morning (1970s-80s)",
+     "Limited television animation: flat paint and nothing else -- no "
+     "shadow tone, no highlight"),
+    ('FEATURE_90S', "90s Feature",
+     "Digital ink-and-paint features: a painted shadow tone with a "
+     "soft edge, forms rounded, and a small painted highlight dot"),
+    ('TV_90S', "90s TV (Dark Deco)",
+     "The high-contrast television look: a deep painted shadow, "
+     "hard-edged, pushed well onto the lit side, no highlight"),
+    # R240: two more eras, from the ends of the century
+    ('NOIR_40S', "Wartime Noir (1940s)",
+     "The dark theatrical short: the shadow cel exposed deep and "
+     "pushed well onto the lit side for drama, its edge dead hard, "
+     "forms rounded, no highlight -- the look of the 40s action and "
+     "superhero shorts, made for a hard key and dark paints"),
+    ('FLAT_10S', "Modern Flat (2010s)",
+     "The modern digital TV cartoon: flat fills with one barely-darker "
+     "cool tone in a small shadow region, hard-edged, forms heavily "
+     "simplified, no highlight -- the thin-uniform-line era; pair "
+     "with a clean, even ink"),
+    ('INK_N_PAINT', "Ink 'n Paint (3ds Max)",
+     "3ds Max's Ink 'n Paint material at its defaults: two Paint Levels "
+     "(lit and a Shaded tone at 70 percent of the paint -- a transparent "
+     "shadow cel, not a second paint), a hard split, no highlight, no "
+     "smoothing -- the look of every Max cartoon test render since 2002; "
+     "pair with the material's ink at 2 to 4 pixels"),
+)
+
+CARTOON_ERA_PRESETS = {
+    'GOLDEN_40S': {
+        'shadow_mode': 'TRANSPARENT',
+        'Shadow Color': (0.62, 0.56, 0.58, 1.0), 'Shadow Amount': 0.55,
+        'Shadow Threshold': 0.48, 'Shadow Softness': 0.06,
+        'Shadow Smoothing': 0.4, 'Highlight Size': 0.0,
+        'Highlight Softness': 0.02, 'Lamp Influence': 0.0},
+    'UPA_50S': {
+        'shadow_mode': 'PAINTED',
+        'Shadow Color': (0.32, 0.22, 0.48, 1.0), 'Shadow Amount': 1.0,
+        'Shadow Threshold': 0.5, 'Shadow Softness': 0.0,
+        'Shadow Smoothing': 0.6, 'Highlight Size': 0.0,
+        'Highlight Softness': 0.02, 'Lamp Influence': 0.0},
+    'XEROX_60S': {
+        'shadow_mode': 'PAINTED',
+        'Shadow Color': (0.50, 0.44, 0.44, 1.0), 'Shadow Amount': 0.8,
+        'Shadow Threshold': 0.5, 'Shadow Softness': 0.0,
+        'Shadow Smoothing': 0.2, 'Highlight Size': 0.0,
+        'Highlight Softness': 0.02, 'Lamp Influence': 0.0},
+    'SATURDAY_70S': {
+        'shadow_mode': 'NONE',
+        'Shadow Color': (0.55, 0.45, 0.62, 1.0), 'Shadow Amount': 1.0,
+        'Shadow Threshold': 0.5, 'Shadow Softness': 0.0,
+        'Shadow Smoothing': 0.0, 'Highlight Size': 0.0,
+        'Highlight Softness': 0.02, 'Lamp Influence': 0.0},
+    'FEATURE_90S': {
+        'shadow_mode': 'PAINTED',
+        'Shadow Color': (0.42, 0.34, 0.50, 1.0), 'Shadow Amount': 0.9,
+        'Shadow Threshold': 0.5, 'Shadow Softness': 0.05,
+        'Shadow Smoothing': 0.25, 'Highlight Size': 0.3,
+        'Highlight Softness': 0.01, 'Lamp Influence': 0.0},
+    'TV_90S': {
+        'shadow_mode': 'PAINTED',
+        'Shadow Color': (0.18, 0.16, 0.26, 1.0), 'Shadow Amount': 1.0,
+        'Shadow Threshold': 0.56, 'Shadow Softness': 0.0,
+        'Shadow Smoothing': 0.3, 'Highlight Size': 0.0,
+        'Highlight Softness': 0.02, 'Lamp Influence': 0.0},
+    # R240: the wartime noir short -- a deep transparent shadow pass
+    # pushed onto the lit side, dead hard; and the modern flat TV
+    # cartoon -- one barely-darker cool tone in a small region over
+    # heavily simplified forms
+    'NOIR_40S': {
+        'shadow_mode': 'TRANSPARENT',
+        'Shadow Color': (0.40, 0.38, 0.52, 1.0), 'Shadow Amount': 0.85,
+        'Shadow Threshold': 0.60, 'Shadow Softness': 0.0,
+        'Shadow Smoothing': 0.35, 'Highlight Size': 0.0,
+        'Highlight Softness': 0.02, 'Lamp Influence': 0.0},
+    'FLAT_10S': {
+        'shadow_mode': 'TRANSPARENT',
+        'Shadow Color': (0.82, 0.79, 0.90, 1.0), 'Shadow Amount': 1.0,
+        'Shadow Threshold': 0.42, 'Shadow Softness': 0.0,
+        'Shadow Smoothing': 0.55, 'Highlight Size': 0.0,
+        'Highlight Softness': 0.02, 'Lamp Influence': 0.0},
+    # R242: Max's Ink 'n Paint defaults -- Shaded = 70% of Lighted (a
+    # transparent 0.7 grey over the paint), Paint Levels 2 (one hard
+    # split at the lambert's half), Highlight off, no smoothing
+    'INK_N_PAINT': {
+        'shadow_mode': 'TRANSPARENT',
+        'Shadow Color': (0.70, 0.70, 0.70, 1.0), 'Shadow Amount': 1.0,
+        'Shadow Threshold': 0.5, 'Shadow Softness': 0.0,
+        'Shadow Smoothing': 0.0, 'Highlight Size': 0.0,
+        'Highlight Softness': 0.02, 'Lamp Influence': 0.0},
+}
+
+
+#: R241: the hair shine wave's shape -- how the band's edge travels
+#: around the head. Each is a period-matched wave in -1..1, so a shape
+#: swap keeps the band's height and reach.
+HAIR_SHINE_SHAPE_ITEMS = (
+    ('SMOOTH', "Smooth Wave",
+     "The classic angel ring: the band's edge swings around the head "
+     "as a smooth sine -- the 80s TV convention, drawn with a soft "
+     "hand"),
+    ('ZIGZAG', "Zigzag",
+     "The serrated highlight: straight teeth instead of a swing -- "
+     "the late-90s TV and game convention, drawn with a ruler; pair "
+     "with a low Softness for the crisp look"),
+    ('SCALLOP', "Scallop",
+     "Round arcs bulging downward with sharp cusps between them -- "
+     "the scalloped ring of the shoujo tradition, each tooth a little "
+     "drawn arc"),
+    ('STEP', "Step",
+     "The band jumps between two levels with no slope at all -- the "
+     "blocky digital highlight of the 2000s, cut in straight "
+     "segments"),
+)
+
+#: R240: the Anime Shader's Style menu -- the same applicator idea as
+#: the Cartoon Shader's Era menu, for the anime tradition's own
+#: decades. Every socket value is a starting point the artist edits
+#: freely afterwards; the shadow colours are multiply TINTS on the
+#: material's own paint (the cel painter's kage colour picked one step
+#: down from the local colour), so one style serves every palette.
+#: Each style writes the SAME full set of sockets and menus, so
+#: switching styles never leaves the last one's leftovers behind.
+ANIME_STYLE_ITEMS = (
+    ('CUSTOM', "Custom", "No preset: the sockets are yours"),
+    ('MOVIE_80S', "80s Film Feature",
+     "The 35 mm theatrical feature: one restrained warm-grey shadow "
+     "tone with the optical printer's slight softness, matte paint "
+     "(no specular), a wide gentle sheen across the hair, a breath of "
+     "airbrush inside the shadow edge -- the painterly end of the cel "
+     "era"),
+    ('TV_80S', "80s TV",
+     "The broadcast cel: one hard cool-violet shadow tone cut at the "
+     "terminator, and the classic angel-ring hair band waving around "
+     "the head -- no airbrush, no rim; the schedule allowed neither"),
+    ('OVA_80S', "80s OVA",
+     "The video market's glamour pass: TWO shadow tones (a deeper "
+     "second kage), a Fresnel rim as the painted edge-light, a double "
+     "hair shine and airbrushed gradations against both sides of the "
+     "shadow edge -- the richest cel dressing of the era"),
+    ('TV_90S', "90s TV",
+     "The late-cel broadcast look: one shadow tone pushed cooler and "
+     "more saturated, its edge a shade harder than the 80s, the hair "
+     "band bolder and simpler (fewer, deeper waves), faces held a "
+     "touch brighter"),
+    ('DIGITAL_00S', "2000s Digital",
+     "Digital ink and paint: dead-hard tone bands (no gate or optics "
+     "to soften them), the kage slightly desaturated the way the "
+     "early RGB palettes ran, a crisp thin hair band with no wave, "
+     "a small tight specular"),
+    ('MODERN_20S', "Modern (2010s-20s)",
+     "The current digital pipeline: a gently softened single tone, "
+     "warm-shifted kage, a depth rim on the lit edge, the drawn "
+     "contact shadows marched in the frame, and the key fixed to the "
+     "camera -- the character lit the same way in every shot"),
+)
+
+ANIME_STYLE_PRESETS = {
+    'MOVIE_80S': {
+        '__props': {'tones': 'TWO', 'airbrush_side': 'SHADOW',
+                    'light_source': 'SCENE', 'rim_mode': 'FRESNEL',
+                    'rim_side': 'LIT'},
+        'Shadow 1 Color': (0.74, 0.64, 0.66, 1.0),
+        'Shadow 1 Threshold': 0.5, 'Shadow 1 Softness': 0.03,
+        'Shadow 2 Color': (0.46, 0.36, 0.44, 1.0),
+        'Shadow 2 Threshold': 0.24, 'Shadow 2 Softness': 0.03,
+        'Shadow Bias': 0.0, 'Specular Level': 0.0,
+        'Specular Size': 0.12, 'Specular Sharpness': 0.05,
+        'Rim Amount': 0.0, 'Rim Power': 2.5,
+        'Hair Shine': 0.3, 'Hair Shine Height': 0.75,
+        'Hair Shine Width': 0.10, 'Hair Shine Wave': 0.02,
+        'Hair Shine Waves': 4.0, 'Hair Shine Softness': 0.02,
+        'Hair Shine Second': 0.0,
+        'Airbrush': 0.2, 'Airbrush Width': 0.35,
+        'Shadow Smoothing': 0.15, 'Screen Shadow': 0.0,
+        'Screen Shadow Length': 24.0, 'Rim Width': 4.0,
+        'Ambient': 0.4, 'Light Response': 1.0},
+    'TV_80S': {
+        '__props': {'tones': 'TWO', 'airbrush_side': 'LIT',
+                    'light_source': 'SCENE', 'rim_mode': 'FRESNEL',
+                    'rim_side': 'LIT'},
+        'Shadow 1 Color': (0.64, 0.52, 0.62, 1.0),
+        'Shadow 1 Threshold': 0.5, 'Shadow 1 Softness': 0.008,
+        'Shadow 2 Color': (0.42, 0.30, 0.44, 1.0),
+        'Shadow 2 Threshold': 0.24, 'Shadow 2 Softness': 0.008,
+        'Shadow Bias': 0.0, 'Specular Level': 0.0,
+        'Specular Size': 0.12, 'Specular Sharpness': 0.05,
+        'Rim Amount': 0.0, 'Rim Power': 2.5,
+        'Hair Shine': 0.6, 'Hair Shine Height': 0.78,
+        'Hair Shine Width': 0.07, 'Hair Shine Wave': 0.035,
+        'Hair Shine Waves': 6.0, 'Hair Shine Softness': 0.008,
+        'Hair Shine Second': 0.0,
+        'Airbrush': 0.0, 'Airbrush Width': 0.35,
+        'Shadow Smoothing': 0.1, 'Screen Shadow': 0.0,
+        'Screen Shadow Length': 24.0, 'Rim Width': 4.0,
+        'Ambient': 0.35, 'Light Response': 1.0},
+    'OVA_80S': {
+        '__props': {'tones': 'THREE', 'airbrush_side': 'BOTH',
+                    'light_source': 'SCENE', 'rim_mode': 'FRESNEL',
+                    'rim_side': 'LIT'},
+        'Shadow 1 Color': (0.68, 0.55, 0.66, 1.0),
+        'Shadow 1 Threshold': 0.52, 'Shadow 1 Softness': 0.01,
+        'Shadow 2 Color': (0.42, 0.32, 0.50, 1.0),
+        'Shadow 2 Threshold': 0.26, 'Shadow 2 Softness': 0.01,
+        'Shadow Bias': 0.0, 'Specular Level': 0.3,
+        'Specular Size': 0.10, 'Specular Sharpness': 0.03,
+        'Rim Amount': 0.35, 'Rim Power': 2.0,
+        'Hair Shine': 0.8, 'Hair Shine Height': 0.78,
+        'Hair Shine Width': 0.07, 'Hair Shine Wave': 0.03,
+        'Hair Shine Waves': 6.0, 'Hair Shine Softness': 0.01,
+        'Hair Shine Second': 0.5,
+        'Airbrush': 0.35, 'Airbrush Width': 0.4,
+        'Shadow Smoothing': 0.15, 'Screen Shadow': 0.0,
+        'Screen Shadow Length': 24.0, 'Rim Width': 4.0,
+        'Ambient': 0.35, 'Light Response': 1.0},
+    'TV_90S': {
+        '__props': {'tones': 'TWO', 'airbrush_side': 'LIT',
+                    'light_source': 'SCENE', 'rim_mode': 'FRESNEL',
+                    'rim_side': 'LIT'},
+        'Shadow 1 Color': (0.58, 0.46, 0.66, 1.0),
+        'Shadow 1 Threshold': 0.5, 'Shadow 1 Softness': 0.006,
+        'Shadow 2 Color': (0.38, 0.28, 0.46, 1.0),
+        'Shadow 2 Threshold': 0.24, 'Shadow 2 Softness': 0.006,
+        'Shadow Bias': 0.03, 'Specular Level': 0.0,
+        'Specular Size': 0.12, 'Specular Sharpness': 0.05,
+        'Rim Amount': 0.0, 'Rim Power': 2.5,
+        'Hair Shine': 0.5, 'Hair Shine Height': 0.78,
+        'Hair Shine Width': 0.055, 'Hair Shine Wave': 0.05,
+        'Hair Shine Waves': 3.0, 'Hair Shine Softness': 0.006,
+        'Hair Shine Second': 0.0,
+        'Airbrush': 0.0, 'Airbrush Width': 0.35,
+        'Shadow Smoothing': 0.1, 'Screen Shadow': 0.0,
+        'Screen Shadow Length': 24.0, 'Rim Width': 4.0,
+        'Ambient': 0.35, 'Light Response': 1.0},
+    'DIGITAL_00S': {
+        '__props': {'tones': 'TWO', 'airbrush_side': 'LIT',
+                    'light_source': 'SCENE', 'rim_mode': 'FRESNEL',
+                    'rim_side': 'LIT'},
+        'Shadow 1 Color': (0.66, 0.58, 0.70, 1.0),
+        'Shadow 1 Threshold': 0.5, 'Shadow 1 Softness': 0.004,
+        'Shadow 2 Color': (0.46, 0.38, 0.54, 1.0),
+        'Shadow 2 Threshold': 0.24, 'Shadow 2 Softness': 0.004,
+        'Shadow Bias': 0.0, 'Specular Level': 0.25,
+        'Specular Size': 0.08, 'Specular Sharpness': 0.02,
+        'Rim Amount': 0.0, 'Rim Power': 2.5,
+        'Hair Shine': 0.5, 'Hair Shine Height': 0.78,
+        'Hair Shine Width': 0.05, 'Hair Shine Wave': 0.01,
+        'Hair Shine Waves': 2.0, 'Hair Shine Softness': 0.004,
+        'Hair Shine Second': 0.0,
+        'Airbrush': 0.0, 'Airbrush Width': 0.35,
+        'Shadow Smoothing': 0.1, 'Screen Shadow': 0.0,
+        'Screen Shadow Length': 24.0, 'Rim Width': 4.0,
+        'Ambient': 0.35, 'Light Response': 1.0},
+    'MODERN_20S': {
+        '__props': {'tones': 'TWO', 'airbrush_side': 'LIT',
+                    'light_source': 'CAMERA', 'rim_mode': 'SCREEN',
+                    'rim_side': 'LIT'},
+        'Shadow 1 Color': (0.76, 0.66, 0.72, 1.0),
+        'Shadow 1 Threshold': 0.48, 'Shadow 1 Softness': 0.02,
+        'Shadow 2 Color': (0.52, 0.42, 0.52, 1.0),
+        'Shadow 2 Threshold': 0.24, 'Shadow 2 Softness': 0.02,
+        'Shadow Bias': 0.0, 'Specular Level': 0.0,
+        'Specular Size': 0.12, 'Specular Sharpness': 0.05,
+        'Rim Amount': 0.45, 'Rim Power': 2.5,
+        'Hair Shine': 0.35, 'Hair Shine Height': 0.76,
+        'Hair Shine Width': 0.08, 'Hair Shine Wave': 0.02,
+        'Hair Shine Waves': 4.0, 'Hair Shine Softness': 0.02,
+        'Hair Shine Second': 0.0,
+        'Airbrush': 0.0, 'Airbrush Width': 0.35,
+        'Shadow Smoothing': 0.25, 'Screen Shadow': 0.5,
+        'Screen Shadow Length': 20.0, 'Rim Width': 3.0,
+        'Ambient': 0.4, 'Light Response': 1.0},
+}
 
 
 class Surface:
@@ -123,8 +503,39 @@ class Surface:
                  'fresnel', 'fresnel_power', 'fresnel_color', 'fresnel_blend',
                  'rim', 'rim_power', 'rim_color', 'rim_blend',
                  'matcap', 'matcap_blend', 'matcap_mode', 'reflect_color',
-                 'edge_opacity', 'backface_color', 'backface_mix',
+                 'edge_opacity', 'backface_color', 'backface_mix', 'alpha_clip',
                  'sheen', 'sheen_color', 'sheen_roughness', 'refraction',
+                 # the anime/cel master (R218): tone bands, their
+                 # colours, the decoded game-texture drivers
+                 'anime_shadow1', 'anime_shadow2', 'anime_th1',
+                 'anime_soft1', 'anime_th2', 'anime_soft2',
+                 'anime_bias', 'anime_tones', 'anime_spec_size',
+                 'anime_sharp', 'anime_mask', 'anime_gain',
+                 # R221: the baked Shadow Ramp spec (a python object,
+                 # riding like `bi`) and its per-pixel row pick
+                 'anime_ramp', 'anime_ramp_row',
+                 # R239: the material index the SDF face road resolves
+                 # its frame from (-1 = none; the face spec itself
+                 # rides anime_ramp's extras object)
+                 'material_index',
+                 # R229: the 80s additions -- the hair shine band, the
+                 # airbrush gradation (the shadow smoothing rides
+                 # cartoon_smooth, shared with the paint master)
+                 'anime_shine', 'anime_shine_color', 'anime_shine_h',
+                 'anime_shine_w', 'anime_shine_wave', 'anime_shine_waves',
+                 'anime_shine_soft', 'anime_shine_second',
+                 # R241: the hair pass -- the wave's shape, the phase
+                 # around the head, the band riding the key's height,
+                 # the second band's own tint
+                 'anime_shine_shape', 'anime_shine_angle',
+                 'anime_shine_follow', 'anime_shine_color2',
+                 'anime_air', 'anime_air_color', 'anime_air_width',
+                 'anime_air_side',
+                 # the cartoon/paint master (R228)
+                 'cartoon_shadow', 'cartoon_amount', 'cartoon_th',
+                 'cartoon_soft', 'cartoon_smooth', 'cartoon_hl_color',
+                 'cartoon_hl_size', 'cartoon_hl_soft', 'cartoon_mode',
+                 'cartoon_lamp',
                  # the BI material node's own controls: the specular
                  # Toon pair, the diffuse-Fresnel pair, WardIso's Slope
                  'toon_size2', 'toon_smooth2', 'bi_fresnel',
@@ -139,7 +550,18 @@ class Surface:
                  'bi_mir_fresnel', 'bi_mir_blend', 'ray_ior',
                  'bi_ray_filter', 'bi_cubic', 'bi_tangent',
                  'shadow_receive', 'cast_only', 'shadows_only',
-                 'use_mist', 'bi')
+                 'use_mist', 'bi',
+                 # R238: the cel's light -- the material's key (scene
+                 # lamps / camera / world, and the key's own-frame
+                 # vector), the screen shadow, the depth rim, the
+                 # smoothing shape
+                 'cel_light', 'cel_dir', 'cel_ss', 'cel_ss_len',
+                 'cel_rim_mode', 'cel_rim_width', 'cel_rim_side',
+                 'cel_shape',
+                 # R243: Multi-Layer's second highlight and the
+                 # Translucent shader's colour
+                 'specular2', 'specular_level2', 'glossiness2',
+                 'anisotropy2', 'aniso_rot2', 'translucent_color')
 
     def __init__(self, n):
         self.n = n
@@ -193,6 +615,61 @@ class Surface:
         self.fresnel = np.zeros(n, np.float32)
         self.fresnel_power = np.full(n, 3.0, np.float32)
         self.fresnel_color = np.ones((n, 3), np.float32)
+        # anime/cel fields -- inert on every other model
+        self.anime_shadow1 = np.full((n, 3), (0.62, 0.44, 0.48), f32)
+        self.anime_shadow2 = np.full((n, 3), (0.38, 0.26, 0.38), f32)
+        self.anime_th1 = one * 0.5
+        self.anime_soft1 = one * 0.04
+        self.anime_th2 = one * 0.22
+        self.anime_soft2 = one * 0.04
+        self.anime_bias = np.zeros(n, f32)
+        self.anime_tones = one * 2.0
+        self.anime_spec_size = one * 0.12
+        self.anime_sharp = one * 0.05
+        self.anime_mask = one.copy()
+        self.anime_gain = one.copy()
+        # R238: the cel's light, inert at the defaults (scene lamps, no
+        # screen shadow, the Fresnel rim, the sphere)
+        self.cel_light = np.zeros(n, f32)
+        self.cel_dir = np.full((n, 3), (0.0, 0.0, 1.0), f32)
+        self.cel_ss = np.zeros(n, f32)
+        self.cel_ss_len = one * 24.0
+        self.cel_rim_mode = np.zeros(n, f32)
+        self.cel_rim_width = one * 4.0
+        self.cel_rim_side = np.zeros(n, f32)
+        self.cel_shape = np.zeros(n, f32)
+        self.anime_ramp = None
+        self.anime_ramp_row = np.zeros(n, f32)
+        self.material_index = -1
+        # R229: the 80s additions, all off by default
+        self.anime_shine = np.zeros(n, f32)
+        self.anime_shine_color = np.ones((n, 3), f32)
+        self.anime_shine_h = one * 0.78
+        self.anime_shine_w = one * 0.06
+        self.anime_shine_wave = one * 0.03
+        self.anime_shine_waves = one * 6.0
+        self.anime_shine_soft = one * 0.01
+        self.anime_shine_second = np.zeros(n, f32)
+        # R241: the hair pass, all neutral at the 1.83 behaviour
+        self.anime_shine_shape = np.zeros(n, f32)
+        self.anime_shine_angle = np.zeros(n, f32)
+        self.anime_shine_follow = np.zeros(n, f32)
+        self.anime_shine_color2 = np.ones((n, 3), f32)
+        self.anime_air = np.zeros(n, f32)
+        self.anime_air_color = np.full((n, 3), (0.82, 0.62, 0.62), f32)
+        self.anime_air_width = one * 0.35
+        self.anime_air_side = np.zeros(n, f32)
+        # cartoon/paint fields -- inert on every other model (R228)
+        self.cartoon_shadow = np.full((n, 3), (0.55, 0.45, 0.62), f32)
+        self.cartoon_amount = one.copy()
+        self.cartoon_th = one * 0.5
+        self.cartoon_soft = one * 0.02
+        self.cartoon_smooth = np.zeros(n, f32)
+        self.cartoon_hl_color = np.ones((n, 3), f32)
+        self.cartoon_hl_size = np.zeros(n, f32)
+        self.cartoon_hl_soft = one * 0.02
+        self.cartoon_mode = np.zeros(n, f32)
+        self.cartoon_lamp = np.zeros(n, f32)
         self.rim = np.zeros(n, np.float32)
         self.rim_power = np.full(n, 3.0, np.float32)
         self.rim_color = np.ones((n, 3), np.float32)
@@ -207,6 +684,9 @@ class Surface:
         self.matcap_mode = np.zeros(n, np.float32)
         self.reflect_color = np.ones((n, 3), np.float32)
         self.edge_opacity = np.ones(n, np.float32)
+        # R211 punch-through: >= 0 is the material's CLIP threshold; the
+        # shading law then forces alpha to exactly 0 or 1. -1 = BLEND
+        self.alpha_clip = np.full(n, -1.0, np.float32)
         self.backface_color = np.zeros((n, 3), np.float32)
         self.backface_mix = np.zeros(n, np.float32)
         # a velvet lobe, added in the light loop rather than inside a model:
@@ -217,6 +697,15 @@ class Surface:
         self.sheen_roughness = np.full(n, 0.3, np.float32)
         # how much of the ray traced through a transparent surface is kept
         self.refraction = np.ones(n, np.float32)
+        # R243: the Max Multi-Layer's second highlight, Max's defaults
+        # (a second, wider lobe off until its level is raised), and the
+        # Translucent shader's colour (black = no translucency)
+        self.specular2 = np.full((n, 3), 0.9, np.float32)
+        self.specular_level2 = np.zeros(n, np.float32)
+        self.glossiness2 = np.full(n, 25.0, np.float32)
+        self.anisotropy2 = np.zeros(n, np.float32)
+        self.aniso_rot2 = np.zeros(n, np.float32)
+        self.translucent_color = np.zeros((n, 3), np.float32)
         self.model = 'PHONG'
 
 
@@ -794,6 +1283,268 @@ def _strauss_g(x, k):
 # ------------------------------------------------------------------ driver
 
 
+# ------------------------------------------- R243: 3ds Max's own shaders
+# The field's own ports of Max's Standard shaders (read for the
+# algorithms; nothing of them ships), followed per light: Max's
+# `lcolor` is the lamp's incident light, which
+# the loop multiplies in afterwards; `vdir` is the ray from the eye, so
+# Max's -dot(N, vdir) is our N.V and Max's L - vdir our L + V. Every
+# function takes the caller's unit vectors: n, l (to the light), v (to
+# the eye).
+
+def max_soften(c, ndl, soft):
+    """maxSoften: the cosine scaled by r (2 - r), r = N.L / Soften, where
+    N.L falls under Soften -- BEFORE the power, as Max applies it."""
+    soft = np.asarray(soft, np.float32)
+    r = ndl / np.maximum(soft, np.float32(1e-6))
+    fold = np.where((soft > 0.0) & (ndl < soft), r * (np.float32(2.0) - r), 1.0)
+    return (c * fold).astype(np.float32)
+
+
+def max_gloss(gloss):
+    """Max's Glossiness in 0..1: the master's percent over 100."""
+    return np.clip(np.asarray(gloss, np.float32) / np.float32(100.0), 0.0, 1.0)
+
+
+def max_spec_phong(ndl, rdv, gloss, soft):
+    """maxphong2: pow(R.L, 2^(10 g)) after Soften, where R.L > 0."""
+    e = np.power(np.float32(2.0), max_gloss(gloss) * np.float32(10.0))
+    c = max_soften(np.maximum(rdv, 0.0), ndl, soft)
+    return np.where(rdv > 0.0, np.power(c, e), 0.0).astype(np.float32)
+
+
+def max_spec_blinn(ndl, ndh, gloss, soft):
+    """maxBlinn2: pow(N.H, 4 x 2^(10 g)) after Soften, where N.H > 0."""
+    e = np.power(np.float32(2.0), max_gloss(gloss) * np.float32(10.0)) * np.float32(4.0)
+    c = max_soften(np.maximum(ndh, 0.0), ndl, soft)
+    return np.where(ndh > 0.0, np.power(c, e), 0.0).astype(np.float32)
+
+
+def max_oren_nayar(ndl, ndv, l, v, n, rough, rho):
+    """max_OrenNayarIllum exactly: the full Oren-Nayar with its
+    interreflection term. `rough` is Max's Diffuse Roughness in 0..1
+    (times pi/2 inside), `rho` the diffuse colour (N, 3). Returns the
+    coloured diffuse (N, 3), clamped to 0..1 as Max clamps it."""
+    f32 = np.float32
+    rough = np.asarray(rough, f32) * f32(np.pi * 0.5)
+    NL = np.asarray(ndl, f32)
+    a = np.where(NL < 0.9999, np.arccos(np.clip(NL, -1.0, 1.0)), 0.0).astype(f32)
+    a = np.clip(a, -np.pi * 0.49, np.pi * 0.49).astype(f32)
+    NV = np.asarray(ndv, f32)
+    vv = np.where((NV < 0.0)[:, None], -v, v)
+    NV = np.abs(NV)
+    b = np.where(NV < 0.9999, np.arccos(np.clip(NV, -1.0, 1.0)), 0.0).astype(f32)
+    swap = b > a
+    a2 = np.where(swap, b, a)
+    b2 = np.where(swap, a, b)
+    a, b = a2.astype(f32), b2.astype(f32)
+    tanV = vv - n * NV[:, None]
+    tanL = l - n * NL[:, None]
+    w = np.sqrt((tanV * tanV).sum(1)) * np.sqrt((tanL * tanL).sum(1))
+    cosDPhi = np.where(np.abs(w) >= 0.0004,
+                       (tanV * tanL).sum(1) / np.where(np.abs(w) >= 0.0004, w, 1.0), 1.0)
+    cosDPhi = np.clip(cosDPhi, -1.0, 1.0).astype(f32)
+    bc = np.where(cosDPhi >= 0.0, -b, b) * f32(2.0 / np.pi)
+    bCube = (bc * bc * bc).astype(f32)
+    sigma2 = np.sqrt(rough).astype(f32)
+    sigma3 = sigma2 / (sigma2 + f32(0.09))
+    c1 = f32(1.0) - f32(0.5) * (sigma2 / (sigma2 + f32(0.33)))
+    c2 = f32(0.45) * sigma3 * (np.sin(a) - bCube)
+    c3 = f32(0.125) * sigma3 * np.sqrt(np.maximum(f32(4.0) * a * b / f32(2.0 * np.pi), 0.0))
+    tanB = np.clip(np.tan(b), -100.0, 100.0)
+    tanAB = np.clip(np.tan((a + b) * f32(0.5)), -100.0, 100.0)
+    l1 = (c1 + c2 * cosDPhi * tanB + c3 * (f32(1.0) - np.abs(cosDPhi)) * tanAB).astype(f32)
+    l2 = (f32(0.17) * (sigma2 / (sigma2 + f32(0.13)))
+          * (f32(1.0) - cosDPhi * np.sqrt(np.maximum(f32(2.0) * b / f32(np.pi), 0.0)))).astype(f32)
+    rho = np.clip(np.asarray(rho, f32)[:, :3], 0.0, 1.0)
+    out = l1[:, None] * rho + l2[:, None] * np.sqrt(rho)
+    return np.clip(out, 0.0, 1.0).astype(f32)
+
+
+def max_tangent(n):
+    """max_get_tangent: world Z (Max's object Z) projected onto the
+    surface, world Y where the surface faces Z."""
+    U = np.zeros_like(n)
+    U[:, 2] = 1.0
+    UN = M.dot(U, n)
+    flip = UN > 0.9999
+    U[flip] = (0.0, 1.0, 0.0)
+    UN = M.dot(U, n)
+    return M.normalize(U - n * UN[:, None])
+
+
+def max_rotate_about(t, n, ang):
+    """rotate_vector: t turned about n by ang radians (Rodrigues)."""
+    ca = np.cos(ang)[:, None]
+    sa = np.sin(ang)[:, None]
+    return (t * ca + M.cross(n, t) * sa + n * (M.dot(n, t) * (1.0 - ca[:, 0]))[:, None]).astype(np.float32)
+
+
+def max_gauss_highlight(n, l, v, ndl, gloss, aniso, orient, t):
+    """max_gauss_high_light exactly: the anisotropic Gaussian lobe of
+    the Anisotropic and Multi-Layer shaders. gloss in 0..1, aniso in
+    0..1, orient in turns (Halcyon's Anisotropic Rotation)."""
+    f32 = np.float32
+    asz = (f32(1.0) - gloss) * f32(0.5 - 0.015)
+    ax = np.maximum(f32(0.015) + asz, 0.0)
+    ay = np.maximum(f32(0.015) + asz * (f32(1.0) - aniso), 0.0)
+    h = M.normalize(l + v)
+    NH = M.dot(n, h)
+    NV = np.maximum(M.dot(n, v), f32(0.001))
+    NL = np.asarray(ndl, f32)
+    g = np.minimum(f32(1.0) / np.sqrt(np.maximum(NL * NV, f32(1e-12))), f32(3.0))
+    ang = np.asarray(orient, f32) * f32(2.0 * np.pi)
+    t1 = np.where((np.abs(ang) > 1e-9)[:, None], max_rotate_about(t, n, ang), t)
+    b = M.cross(t1, n)
+    x = M.dot(h, t1) / np.maximum(ax, f32(1e-6))
+    y = M.dot(h, b) / np.maximum(ay, f32(1e-6))
+    e = np.exp(f32(-2.0) * (x * x + y * y) / (f32(1.0) + NH))
+    norm = f32(1.0 / (4.0 * np.pi * 0.03))
+    out = norm * g * e * f32(0.5)
+    return np.where(NH > 0.0, out, 0.0).astype(f32)
+
+
+def max_fres_metal(c, k):
+    b = k * k + np.float32(1.0)
+    c2 = c * c
+    rpl = (b * c2 - np.float32(2.0) * c + 1.0) / (b * c2 + np.float32(2.0) * c + 1.0)
+    rpp = (b - np.float32(2.0) * c + c2) / (b + np.float32(2.0) * c + c2)
+    return (np.float32(0.5) * (rpl + rpp)).astype(np.float32)
+
+
+def max_spec_metal(n, l, v, ndl, ndv, gloss, diffuse):
+    """maxMetal2: Cook-Torrance with Beckmann at m = 1 - g, the G term,
+    and the Fresnel of the diffuse colour's intensity; returns the
+    COLOURED lobe (N, 3) before Specular Level."""
+    f32 = np.float32
+    r = np.clip(f32(1.0) - gloss, 0.00001, 0.99999)
+    m2inv = f32(1.0) / (r * r)
+    h = M.normalize(l + v)
+    LH = M.dot(l, h)
+    NH = M.dot(n, h)
+    VH = M.dot(v, h)
+    NV = np.asarray(ndv, f32)
+    NL = np.asarray(ndl, f32)
+    G = np.where(NV < NL, f32(2.0) * NV * NH, f32(2.0) * NL * NH) / np.where(VH != 0.0, VH, 1.0)
+    fav0 = np.minimum((diffuse[:, 0] + diffuse[:, 1] + diffuse[:, 2]) * f32(1.0 / 3.0), f32(0.9999))
+    kav = f32(2.0) * np.sqrt(np.maximum(fav0, 0.0)) / np.sqrt(np.maximum(f32(1.0) - fav0, 1e-6))
+    fav = max_fres_metal(LH, kav)
+    t = (fav - fav0) / np.maximum(f32(1.0) - fav0, 1e-6)
+    fcol = (f32(1.0) - t)[:, None] * diffuse[:, :3] + t[:, None]
+    sec2 = f32(1.0) / np.maximum(NH * NH, f32(1e-12))
+    D = f32(0.5 / np.pi) * sec2 * sec2 * m2inv * np.exp((f32(1.0) - sec2) * m2inv)
+    G = np.minimum(G, f32(1.0))
+    Rs = D * G / (NV + f32(0.05))
+    ok = (NV >= 0.0) & (NH > 0.0) & (G > 0.0)
+    return np.where(ok[:, None], fcol * Rs[:, None], 0.0).astype(f32)
+
+
+def _max_strauss_F(x):
+    KF = 1.12
+    xb = np.clip(x, 0.0, 1.0)
+    xkf = 1.0 / ((xb - KF) * (xb - KF))
+    return ((xkf - 1.0 / (KF * KF)) / (1.0 / ((1.0 - KF) ** 2) - 1.0 / (KF * KF))).astype(np.float32)
+
+
+def _max_strauss_G(x):
+    KG = 1.01
+    xb = np.clip(x, 0.0, 1.0)
+    xkg = 1.0 / ((xb - KG) * (xb - KG))
+    return ((1.0 / ((1.0 - KG) ** 2) - xkg) / (1.0 / ((1.0 - KG) ** 2) - 1.0 / (KG * KG))).astype(np.float32)
+
+
+def max_strauss(n, l, v, ndl, ndv, gloss, metal, opacity, diffuse):
+    """maxStrauss2 per light: returns (diffuse factor, coloured highlight)
+    -- the highlight's light-colour mix taken for a white lamp (the
+    loop multiplies the lamp's colour in afterwards)."""
+    f32 = np.float32
+    g3 = gloss * gloss * gloss
+    d = f32(1.0) - metal * gloss
+    rd = (f32(1.0) - metal * g3) * opacity
+    rn = opacity - (f32(1.0) - g3) * opacity
+    h_e = np.where(gloss >= 1.0, f32(600.0), f32(3.0) / np.maximum(f32(1.0) - gloss, 1e-6))
+    NL = np.asarray(ndl, f32)
+    NV = np.asarray(ndv, f32)
+    dif = np.maximum(NL, 0.0) * d * rd
+    R = l - n * (f32(2.0) * NL)[:, None]
+    RV = M.dot(M.normalize(R), v)
+    RV = np.where(NL < f32(0.15), RV * max_soften(np.ones_like(NL), NL, f32(0.15)), RV)
+    s = f32(1.3) * np.power(np.maximum(-RV, 0.0), h_e)
+    a = np.arccos(np.clip(NL, -1.0, 1.0)) / f32(0.5 * np.pi)
+    b = np.arccos(np.clip(NV, -1.0, 1.0)) / f32(0.5 * np.pi)
+    fa = _max_strauss_F(a)
+    j = fa * _max_strauss_G(a) * _max_strauss_G(b)
+    rj = np.where(rn > 0.0, np.clip(rn + (rn + f32(0.1)) * j, 0.0, 1.0), rn)
+    white = np.ones_like(diffuse[:, :3])
+    Cs = white + (metal * (f32(1.0) - fa))[:, None] * (diffuse[:, :3] - white)
+    spec = np.where(((RV < 0.0) & (NL >= 0.0))[:, None], (s * rj)[:, None] * Cs, 0.0)
+    return dif.astype(f32), spec.astype(f32)
+
+
+def evaluate_max(model, surf, n, l, v, ndl, ndv, ndh, rdv):
+    """The eight Max shaders: (diffuse, specular) per light -- diffuse a
+    scalar for the Lambert ones and a COLOUR (N, 3) where Max's
+    diffuse carries its own colour (the Oren-Nayar pair, Translucent);
+    specular the coloured lobe before Specular Level."""
+    f32 = np.float32
+    g = max_gloss(surf.glossiness)
+    NL = np.maximum(ndl, 0.0).astype(f32)
+    lit = ndl >= 0.0
+    if model == 'MAX_PHONG':
+        sp = max_spec_phong(ndl, rdv, surf.glossiness, surf.soften)
+        return NL, (np.where(lit, sp, 0.0)[:, None] * surf.specular).astype(f32)
+    if model == 'MAX_BLINN':
+        sp = max_spec_blinn(ndl, ndh, surf.glossiness, surf.soften)
+        return NL, (np.where(lit, sp, 0.0)[:, None] * surf.specular).astype(f32)
+    if model == 'MAX_METAL':
+        spec = max_spec_metal(n, l, v, ndl, ndv, g, surf.diffuse)
+        omabs = np.maximum(f32(1.0) - np.abs(np.minimum(surf.specular_level, f32(9.99))), 0.0)
+        return (NL * omabs).astype(f32), np.where(lit[:, None], spec, 0.0).astype(f32)
+    if model == 'MAX_ANISOTROPIC':
+        t = max_tangent(n)
+        gs = max_gauss_highlight(n, l, v, NL, g, np.clip(surf.anisotropy, 0.0, 1.0),
+                                 surf.aniso_rot, t)
+        return NL, (np.where(lit, NL * gs, 0.0)[:, None] * surf.specular).astype(f32)
+    if model == 'MAX_MULTI_LAYER':
+        dif = max_oren_nayar(ndl, ndv, l, v, n, np.clip(surf.roughness, 0.0, 1.0), surf.diffuse)
+        dif = dif * NL[:, None]
+        t = max_tangent(n)
+        g1 = max_gauss_highlight(n, l, v, NL, g, np.clip(surf.anisotropy, 0.0, 1.0),
+                                 surf.aniso_rot, t)
+        g2 = max_gauss_highlight(n, l, v, NL, max_gloss(surf.glossiness2),
+                                 np.clip(surf.anisotropy2, 0.0, 1.0), surf.aniso_rot2, t)
+        # Max: spec1 = clamp(NL g1 level1 spec1 light), spec2 = NL g2
+        # level2 spec2 light; the sum spec1 + (1 - spec1) spec2. Both
+        # levels apply HERE (the model is level-free in the loop, so a
+        # first lobe at level 0 still lets the second show); the first
+        # lobe's clamp is taken before the lamp's colour
+        s1 = np.clip((NL * g1 * np.minimum(surf.specular_level, f32(9.99)))[:, None]
+                     * surf.specular, 0.0, 1.0)
+        s2 = (NL * g2 * np.minimum(surf.specular_level2, f32(9.99)))[:, None] * surf.specular2
+        spec = s1 + (f32(1.0) - s1) * s2
+        return np.where(lit[:, None], dif, 0.0).astype(f32), np.where(lit[:, None], spec, 0.0).astype(f32)
+    if model == 'MAX_OREN_NAYAR_BLINN':
+        dif = max_oren_nayar(ndl, ndv, l, v, n, np.clip(surf.roughness, 0.0, 1.0), surf.diffuse)
+        dif = dif * NL[:, None]
+        sp = max_spec_blinn(ndl, ndh, surf.glossiness, surf.soften)
+        return np.where(lit[:, None], dif, 0.0).astype(f32), \
+            (np.where(lit, sp, 0.0)[:, None] * surf.specular).astype(f32)
+    if model == 'MAX_STRAUSS':
+        dif, spec = max_strauss(n, l, v, ndl, ndv, g, np.clip(surf.metallic, 0.0, 1.0),
+                                np.clip(surf.opacity, 0.0, 1.0), surf.diffuse)
+        return dif, spec
+    if model == 'MAX_TRANSLUCENT':
+        # Blinn without Soften; the translucent colour lit from either
+        # side, per lamp: T (front + back - N.L)(1 - N.L) with unit lamp
+        # energy inside the darkening term (Max sums all lamps first)
+        sp = max_spec_blinn(ndl, ndh, surf.glossiness, np.zeros_like(ndl))
+        back = (ndl < 0.0).astype(f32)
+        trans = surf.translucent_color * ((f32(1.0) + back - NL) * (f32(1.0) - NL))[:, None]
+        dif = surf.diffuse * NL[:, None] + np.maximum(trans, 0.0)
+        return dif.astype(f32), (np.where(lit, sp, 0.0)[:, None] * surf.specular).astype(f32)
+    raise ValueError(model)
+
+
 def evaluate(model, surf, n, l, v, ndl_raw=None, area_ndl=None,
              area_ndl_back=None):
     """Evaluate one light for `model`.
@@ -822,6 +1573,23 @@ def evaluate(model, surf, n, l, v, ndl_raw=None, area_ndl=None,
 
     if model in ('CONSTANT', 'WIREFRAME'):
         return zero, np.zeros((surf.n, 3), np.float32)
+
+    if model in MAX_MODELS:
+        # R243: Max's own light loops, their own Soften inside
+        ndl_m = ndl if area_ndl is None else area_ndl
+        return evaluate_max(model, surf, n, l, v, ndl_m, ndv, ndh, rdv)
+
+    if model in ('ANIME', 'CARTOON'):
+        # the cel bands need the SHADOW term inside their step input,
+        # so the banding happens in the lamp loop (render._anime_lamp,
+        # and the cartoon's lit accumulation) where visibility exists.
+        # evaluate hands back the wrapped cosine 0..1 -- the games'
+        # half-Lambert -- and no specular (the stepped highlight is
+        # the loop's too, it needs N.H).
+        ndl_a = ndl if area_ndl is None else area_ndl
+        wrap = np.clip(ndl_a * np.float32(0.5) + np.float32(0.5),
+                       0.0, 1.0).astype(np.float32)
+        return wrap, np.zeros((surf.n, 3), np.float32)
 
     if isinstance(model, str) and model.startswith('BI_MATRIX_'):
         # the BI material node: independent diffuse and specular menus,
@@ -859,7 +1627,7 @@ def evaluate(model, surf, n, l, v, ndl_raw=None, area_ndl=None,
     # ---- diffuse term (an AREA lamp's form factor stands in for the
     # cosine, exactly as shade_one_light's `inp` reassignment did)
     ndl_d = ndl if area_ndl is None else area_ndl
-    if model == 'OREN_NAYAR':
+    if model in ('OREN_NAYAR', 'OREN_NAYAR_BLINN'):
         dif = diffuse_oren_nayar(
             ndl_d, ndv, l, v, n, surf.roughness,
             realnl=(ndl if area_ndl is not None else None))
@@ -885,7 +1653,7 @@ def evaluate(model, surf, n, l, v, ndl_raw=None, area_ndl=None,
     elif model in ('BLINN_PHONG', 'GOURAUD', 'FLAT'):
         spec = spec_blinn_phong(ndl, ndh, gloss)
         spec_col = surf.specular
-    elif model == 'BLINN':
+    elif model in ('BLINN', 'OREN_NAYAR_BLINN'):
         spec = spec_blinn(ndl, ndv, ndh, vdh, gloss, surf.ior)
         spec_col = surf.specular
     elif model == 'COOK_TORRANCE':

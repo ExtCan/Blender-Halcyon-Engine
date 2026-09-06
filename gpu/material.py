@@ -71,10 +71,18 @@ def lighting(count):
             '                         + 0.5, 0.0), s.glossiness))',
             '        : hal_evaluate(hal_model, s, N, L, V);',
             '    vec3 radiance = lcol * energy * atten * (1.0 / 3.14159265);',
-            '    vec3 diff = s.diffuse * s.diffuse_level * ds.x;',
+            # R243: a Max shader whose diffuse carries its own colour
+            # leaves it in hal_dif_rgb (the hemi override never runs
+            # hal_evaluate, so it reads the diffuse socket)
+            '    vec3 dcol = (kind == 3) ? s.diffuse : hal_dif_rgb;',
+            '    vec3 diff = dcol * s.diffuse_level * ds.x;',
             '    // the specular colour is already in ds.yzw: hal_evaluate',
             '    // folds it, as the CPU does, so Metal can tint by diffuse',
-            '    vec3 spec = s.specular_level * ds.yzw;',
+            # R243: the level-free models (Strauss, Multi-Layer) scale by
+            # nothing here, exactly the CPU loop
+            f'    float lvl = ({_level_free_test("hal_model")}) ? 1.0 '
+            ': s.specular_level;',
+            '    vec3 spec = lvl * ds.yzw;',
             '    return (diff + spec) * radiance;',
             '}',
             '',
@@ -160,6 +168,14 @@ def find_surface_link(graph):
         if sock.get('name') == 'Surface' and sock.get('link'):
             return sock['link']
     return None
+
+
+def _level_free_test(var):
+    """R243: a GLSL test for the models the light loop must not scale by
+    Specular Level (shading.LEVEL_FREE_MODELS), by index."""
+    from ..core.shading import LEVEL_FREE_MODELS, MODEL_ITEMS
+    idx = [k for k, m in enumerate(MODEL_ITEMS) if m[0] in LEVEL_FREE_MODELS]
+    return ' || '.join(f'{var} == {k}' for k in idx) or 'false'
 
 
 def assemble(graph, model_index=0, light_count=0):
@@ -317,6 +333,39 @@ def _lift_marked_values(src):
     return _MV_RE.sub(_sub, src), vals
 
 
+def _object_frame(src, consts):
+    """R243: the object's own frame on the GPU. `hal_object` reads the
+    world position through the per-object inverse matrix, baked as
+    three row-lookup functions by object index -- exactly the CPU's
+    n_tex_coord einsum (inv[:3, :3] . P + inv[:3, 3]). Returns the
+    functions and the line, or ('', '') when no chain reads it, or
+    (None, why) when the caller supplied no matrices."""
+    if 'hal_object' not in src:
+        return '', ''
+    mats = consts.get('obj_inv')
+    if mats is None:
+        return None, 'object coordinates need the per-object matrices ' \
+                     'the caller did not supply'
+    rows = [[], [], []]
+    for m in mats:
+        for r in range(3):
+            rows[r].append(tuple(float(x) for x in m[r][:4]))
+
+    def _sel(name, vals):
+        lines = [f'vec4 {name}(float obj)', '{']
+        for i in range(len(vals) - 1):
+            lines.append(f'    if (obj < {_f(i + 0.5)}) return vec4('
+                         + ', '.join(_f(x) for x in vals[i]) + ');')
+        lines.append('    return vec4(' + ', '.join(_f(x) for x in vals[-1]) + ');')
+        lines.append('}')
+        return '\n'.join(lines)
+    fns = '\n'.join(_sel(f'hal_obj_r{r}', rows[r]) for r in range(3)) + '\n'
+    line = ('    vec3 hal_object = vec3(dot(hal_obj_r0(td.y), vec4(P, 1.0)), '
+            'dot(hal_obj_r1(td.y), vec4(P, 1.0)), '
+            'dot(hal_obj_r2(td.y), vec4(P, 1.0)));\n')
+    return fns, line
+
+
 def _v3(t):
     t = tuple(float(v) for v in t)[:3]
     return 'vec3({}, {}, {})'.format(*(_f(v) for v in t))
@@ -380,12 +429,12 @@ def pack_light_texels(lights):
                 ad = np.asarray(light.direction, np.float32)
                 ad = ad / max(float(np.linalg.norm(ad)), 1e-9)
                 out[0, b + 1, :3] = ad
-                asz = getattr(light, 'area_size', (1.0, 1.0))
-                a_sx = max(float(asz[0]), 1e-6)
-                a_sy = max(float(asz[1]) if len(asz) > 1
-                           else float(asz[0]), 1e-6)
+                from ..core.lights import area_emit_area
                 a_d = max(float(getattr(light, 'decay_end', 25.0)), 1e-6)
-                out[0, b + 1, 3] = np.float32(a_d * a_d / (a_sx * a_sy))
+                # R225: divided by the face's EMITTING area (pi/4 of
+                # the rectangle for the round shapes), as the CPU
+                out[0, b + 1, 3] = np.float32(
+                    a_d * a_d / area_emit_area(light))
         out[0, b + 2, :3] = np.asarray(
             getattr(light, 'color', (1, 1, 1)), np.float32)
         eps = 1e-6
@@ -667,6 +716,20 @@ def _rad_lookup_function(rad, consts):
     return 'uniform sampler2D hal_radfield;\n' + '\n'.join(L) + '\n'
 
 
+def _cel_lookup_function(consts):
+    """R238: the cel field at this fragment's own pixel -- the screen
+    shadow in .r, the depth rim in .g -- exactly celfield.lookup for
+    the opaque G-buffer surface (which this pass is by construction)."""
+    w, h = consts['resolution']
+    L = ['vec4 hal_cel_at()',
+         '{',
+         f'    int sx = int(vUV.x * {_f(float(w))});',
+         f'    int sy = int(vUV.y * {_f(float(h))});',
+         '    return texelFetch(hal_celfield, ivec2(sx, sy), 0);',
+         '}']
+    return 'uniform sampler2D hal_celfield;\n' + '\n'.join(L) + '\n'
+
+
 def radiosity_field_pass(rad, consts, sides):
     """The grid pre-pass: one fragment per grid point, gathering at the
     first covered pixel of its block, row-major -- the CPU's own source
@@ -741,50 +804,102 @@ def radiosity_field_pass(rad, consts, sides):
 def _cookie_function(i, spec):
     """GLSL for one light's projected texture, mirroring cookie_factor.
 
-    The lookup is the CPU's own bilinear texel arithmetic written out --
-    floor, fract, per-texel wrap, two lerps -- reading the uploaded image
-    at texel centres, so both devices filter with the same float math
-    instead of trusting a driver's sampler. SPOT clamps (EXTEND: the cone
-    edge lands on the image edge), SUN wraps (REPEAT: the tiled cloud
-    shadow of the era).
+    The lookup is the CPU Texture sampler's own texel arithmetic written
+    out -- floor, fract, per-texel wrap, the lerps or the B-spline
+    weights -- reading the uploaded image at texel centres, so both
+    devices filter with the same float math instead of trusting a
+    driver's sampler. R219: the wrap comes from the light's resolved
+    extension (REPEAT tiles, EXTEND clamps, CLIP returns zero outside
+    the slide -- the projector's gate) and the filter from its
+    interpolation choice (CLOSEST / BILINEAR / CUBIC), exactly the
+    combinations _sample_nearest / _sample_bilinear / _sample_bicubic
+    run on the prepared pixels.
     """
     w = float(spec['w'])
     h = float(spec['h'])
-    if spec['kind'] == 'SUN':
-        wx = f'mod(x0, {_f(w)})'
-        wx1 = f'mod(x0 + 1.0, {_f(w)})'
-        wy = f'mod(y0, {_f(h)})'
-        wy1 = f'mod(y0 + 1.0, {_f(h)})'
-    else:
-        wx = f'clamp(x0, 0.0, {_f(w - 1.0)})'
-        wx1 = f'clamp(x0 + 1.0, 0.0, {_f(w - 1.0)})'
-        wy = f'clamp(y0, 0.0, {_f(h - 1.0)})'
-        wy1 = f'clamp(y0 + 1.0, 0.0, {_f(h - 1.0)})'
+    ext = spec.get('extend', 'EXTEND' if spec['kind'] != 'SUN'
+                  else 'REPEAT')
+    filt = spec.get('filter', 'BILINEAR')
+
+    def wrap(expr, n):
+        if ext == 'REPEAT':
+            return f'mod({expr}, {_f(n)})'
+        return f'clamp({expr}, 0.0, {_f(n - 1.0)})'
+
+    def fetch(xe, ye):
+        return (f'texelFetch(hal_cookie{i}, ivec2(int({xe}), '
+                f'int({ye})), 0).rgb')
+
     L = [f'uniform sampler2D hal_cookie{i};',
          f'vec3 hal_cookie_rgb{i}(vec2 uv)',
-         '{',
-         f'    float fx = uv.x * {_f(w)} - 0.5;',
-         f'    float fy = uv.y * {_f(h)} - 0.5;',
-         '    float x0 = floor(fx);',
-         '    float y0 = floor(fy);',
-         '    float tx = fx - x0;',
-         '    float ty = fy - y0;',
-         f'    float x0w = {wx};',
-         f'    float x1w = {wx1};',
-         f'    float y0w = {wy};',
-         f'    float y1w = {wy1};',
-         f'    vec3 c00 = texelFetch(hal_cookie{i}, '
-         'ivec2(int(x0w), int(y0w)), 0).rgb;',
-         f'    vec3 c10 = texelFetch(hal_cookie{i}, '
-         'ivec2(int(x1w), int(y0w)), 0).rgb;',
-         f'    vec3 c01 = texelFetch(hal_cookie{i}, '
-         'ivec2(int(x0w), int(y1w)), 0).rgb;',
-         f'    vec3 c11 = texelFetch(hal_cookie{i}, '
-         'ivec2(int(x1w), int(y1w)), 0).rgb;',
-         '    vec3 top = c00 + (c10 - c00) * tx;',
-         '    vec3 bot = c01 + (c11 - c01) * tx;',
-         '    return top + (bot - top) * ty;',
-         '}']
+         '{']
+    if ext == 'CLIP':
+        # the CPU zeroes every out-of-square lookup after sampling;
+        # returning early is the same value for less work
+        L.append('    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || '
+                 'uv.y > 1.0) return vec3(0.0);')
+    if filt == 'NEAREST':
+        # _sample_nearest: floor(u*w), no half-texel shift
+        L += [f'    float x0 = floor(uv.x * {_f(w)});',
+              f'    float y0 = floor(uv.y * {_f(h)});',
+              f'    float x0w = {wrap("x0", w)};',
+              f'    float y0w = {wrap("y0", h)};',
+              f'    return {fetch("x0w", "y0w")};',
+              '}']
+        return '\n'.join(L) + '\n'
+    L += [f'    float fx = uv.x * {_f(w)} - 0.5;',
+          f'    float fy = uv.y * {_f(h)} - 0.5;',
+          '    float x0 = floor(fx);',
+          '    float y0 = floor(fy);',
+          '    float tx = fx - x0;',
+          '    float ty = fy - y0;']
+    if filt == 'CUBIC':
+        # _sample_bicubic: uniform B-spline weights, sixteen fetches,
+        # rows summed in x then weighted in y -- the same order, the
+        # same 1/6 factors
+        L += ['    float tx2 = tx * tx;',
+              '    float tx3 = tx2 * tx;',
+              '    float ty2 = ty * ty;',
+              '    float ty3 = ty2 * ty;',
+              '    float wx0 = (1.0 - 3.0 * tx + 3.0 * tx2 - tx3) '
+              '* 0.16666667;',
+              '    float wx1 = (4.0 - 6.0 * tx2 + 3.0 * tx3) '
+              '* 0.16666667;',
+              '    float wx2 = (1.0 + 3.0 * tx + 3.0 * tx2 - 3.0 * tx3) '
+              '* 0.16666667;',
+              '    float wx3 = tx3 * 0.16666667;',
+              '    float wy0 = (1.0 - 3.0 * ty + 3.0 * ty2 - ty3) '
+              '* 0.16666667;',
+              '    float wy1 = (4.0 - 6.0 * ty2 + 3.0 * ty3) '
+              '* 0.16666667;',
+              '    float wy2 = (1.0 + 3.0 * ty + 3.0 * ty2 - 3.0 * ty3) '
+              '* 0.16666667;',
+              '    float wy3 = ty3 * 0.16666667;']
+        for k in range(4):
+            L.append(f'    float xw{k} = '
+                     f'{wrap(f"x0 + {_f(k - 1.0)}", w)};')
+        L.append('    vec3 acc = vec3(0.0);')
+        for j in range(4):
+            L.append(f'    float yw{j} = '
+                     f'{wrap(f"y0 + {_f(j - 1.0)}", h)};')
+            row = ' + '.join(
+                f'{fetch(f"xw{k}", f"yw{j}")} * wx{k}' for k in range(4))
+            L.append(f'    acc = acc + ({row}) * wy{j};')
+        L += ['    return acc;', '}']
+        return '\n'.join(L) + '\n'
+    # BILINEAR -- the pre-R219 body, wrap generalized
+    L += [f'    float x0w = {wrap("x0", w)};',
+          f'    float x1w = {wrap("x0 + 1.0", w)};',
+          f'    float y0w = {wrap("y0", h)};',
+          f'    float y1w = {wrap("y0 + 1.0", h)};',
+          f'    vec3 c00 = {fetch("x0w", "y0w")};',
+          f'    vec3 c10 = {fetch("x1w", "y0w")};',
+          f'    vec3 c01 = {fetch("x0w", "y1w")};',
+          f'    vec3 c11 = {fetch("x1w", "y1w")};',
+          '    vec3 top = c00 + (c10 - c00) * tx;',
+          '    vec3 bot = c01 + (c11 - c01) * tx;',
+          '    return top + (bot - top) * ty;',
+          '}']
     return '\n'.join(L) + '\n'
 
 
@@ -852,6 +967,7 @@ def _area_function(i, light, consts):
     twin's own geometry bakes.
     """
     import numpy as np
+    from ..core import lights as LI
     use_tx = bool(consts.get('light_texels', True))
     ax = np.asarray(getattr(light, 'area_x', None)
                     if getattr(light, 'area_x', None) is not None
@@ -864,6 +980,7 @@ def _area_function(i, light, consts):
     sy = max(float(asz[1]) if len(asz) > 1 else float(asz[0]), 1e-6)
     hx = (ax * (sx * 0.5)).astype(np.float32)
     hy = (ay * (sy * 0.5)).astype(np.float32)
+    disc = LI.area_is_disc(light)
     if use_tx:
         pos = _lref(i, 0, 'xyz')
         vdir = _lref(i, 1, 'xyz')
@@ -874,18 +991,30 @@ def _area_function(i, light, consts):
         dist = max(float(getattr(light, 'decay_end', 25.0)), 1e-6)
         pos = _v3(light.position)
         vdir = _v3(d)
-        asize = _f(dist * dist / (sx * sy))
+        asize = _f(dist * dist / LI.area_emit_area(light))
     k = float(getattr(light, 'area_gamma', 1.0) or 1.0)
     L = [f'vec2 hal_area_inp{i}(vec3 P, vec3 N)',
          '{',
-         f'    vec3 hp = {pos};',
-         f'    vec3 hax = {_v3(hx)};',
-         f'    vec3 hay = {_v3(hy)};',
-         # area_lamp_vectors' corner order: -x-y, -x+y, +x+y, +x-y
-         '    vec3 av0 = normalize(P - (hp - hax - hay));',
-         '    vec3 av1 = normalize(P - (hp - hax + hay));',
-         '    vec3 av2 = normalize(P - (hp + hax + hay));',
-         '    vec3 av3 = normalize(P - (hp + hax - hay));',
+         f'    vec3 hp = {pos};']
+    if not disc:
+        # area_lamp_vectors' corner order: -x-y, -x+y, +x+y, +x-y
+        L += [f'    vec3 hax = {_v3(hx)};',
+              f'    vec3 hay = {_v3(hy)};',
+              '    vec3 av0 = normalize(P - (hp - hax - hay));',
+              '    vec3 av1 = normalize(P - (hp - hax + hay));',
+              '    vec3 av2 = normalize(P - (hp + hax + hay));',
+              '    vec3 av3 = normalize(P - (hp + hax - hay));']
+        nc = 4
+    else:
+        # R225: the round shapes' equal-area polygon (lights.
+        # area_corners), each corner a literal OFFSET from the texel
+        # position so the lamp still drags recompile-free
+        pos64 = np.asarray(light.position, np.float64)
+        offs = (LI.area_corners(light) - pos64[None, :]).astype(np.float32)
+        nc = offs.shape[0]
+        for c in range(nc):
+            L.append(f'    vec3 av{c} = normalize(P - (hp + {_v3(offs[c])}));')
+    L += [
          # BI shades with normals flipped along the view ray; the
          # contour sees the normal bare, so -N is the C's own frame
          # (core/lights.area_inp has the derivation and the compiled
@@ -893,7 +1022,8 @@ def _area_function(i, light, consts):
          '    vec3 avn = -N;',
          '    float fac = 0.0;',
          '    vec3 acr; float acl;']
-    for a, b in ((0, 1), (1, 2), (2, 3), (3, 0)):
+    for a in range(nc):
+        b = (a + 1) % nc
         L += [f'    acr = cross(av{a}, av{b});',
               '    acl = max(length(acr), 1e-30);',
               f'    fac += (2.0 * asin(clamp(0.5 * length(av{a} - av{b}),'
@@ -1446,6 +1576,274 @@ def resolve_tex_filter(interp, settings_filter):
     return filt
 
 
+def _cel_composition(lines, bake, consts, affect_diffuse, affect_specular,
+                     link_c=None, link_i=None):
+    """R218/R228/R238: the cel models' composition for ONE light block
+    whose `ds` (the wrapped cosine), `hal_sv` (visibility), `rad`, `L`
+    and `V` are in scope -- the cartoon's strongest-verdict
+    accumulation or the anime's banded tint, the stepped highlight,
+    the airbrush. Shared by the scene's lamps and the fixed key.
+    `link_c` is the light's link entry (objects, mode) for the
+    cartoon's mask; `link_i` the anime's (index for its mask name).
+    Returns True when the block was closed (the cartoon path)."""
+    anime = bool(bake.get('__anime'))
+    if bake.get('__cartoon'):
+        # R228: the paint keeps the STRONGEST lamp's verdict, exactly
+        # light_surface's CARTOON branch -- lit term = clamp(wrap) x
+        # vis (x the light-link mask), max over lamps; the lamp's
+        # radiance only through the Lamp Influence energy; the
+        # highlight gate on the wrapped half-vector, inside this lamp's
+        # own lit step. The generic tail is bypassed: the block closes
+        # here.
+        if link_c:
+            tests = ' + '.join(f'((abs(td.y - {_f(float(o))}) < 0.5) '
+                               '? 1.0 : 0.0)'
+                               for o in link_c['objects'])
+            lines.append(f'    float hal_clk = min({tests}, 1.0);')
+            if str(link_c.get('mode', 'EXCLUDE')).upper() == 'ONLY':
+                lines.append('    float hal_cm = hal_clk;')
+            else:
+                lines.append('    float hal_cm = 1.0 - hal_clk;')
+        else:
+            lines.append('    float hal_cm = 1.0;')
+        lines.append('    float hal_cxr = clamp(ds.x, 0.0, 1.0) '
+                     '* hal_sv * hal_cm;')
+        if affect_diffuse:
+            lines.append('    float hal_cx = hal_cxr;')
+        else:
+            lines.append('    float hal_cx = 0.0;')
+        lines += [
+            '    hal_cart_lit = max(hal_cart_lit, hal_cx);',
+            '    hal_cart_rad += rad * hal_cx * 0.318309886;',
+        ]
+        if affect_specular:
+            lines += [
+                '    vec3 hal_ch = normalize(L + V);',
+                '    float hal_csn = clamp(dot(N, hal_ch) * 0.5 + 0.5, '
+                '0.0, 1.0);',
+                '    float hal_chs = clamp(s.cartoon_hl_size, 0.0, 1.0);',
+                '    float hal_ced = 1.0 - 0.25 * hal_chs * hal_chs;',
+                '    float hal_cts = clamp((hal_csn - (hal_ced '
+                '- s.cartoon_hl_soft)) / max(2.0 * s.cartoon_hl_soft, '
+                '1e-6), 0.0, 1.0);',
+                '    float hal_cg = hal_cts * hal_cts '
+                '* (3.0 - 2.0 * hal_cts);',
+                '    hal_cg = (s.cartoon_hl_size > 1e-6) ? hal_cg : 0.0;',
+                '    float hal_ctl = clamp((hal_cxr - (s.cartoon_th '
+                '- s.cartoon_soft)) / max(2.0 * s.cartoon_soft, 1e-6), '
+                '0.0, 1.0);',
+                '    hal_ctl = hal_ctl * hal_ctl * (3.0 - 2.0 * hal_ctl);',
+                '    hal_cart_hl = max(hal_cart_hl, hal_cg * hal_ctl);',
+            ]
+        lines.append('    }')
+        return True
+    if anime:
+        # R218: the cel composition, exactly render._anime_lamp -- the
+        # shadow term inside the band input, tint multiplying the base,
+        # the stepped highlight on the wrapped half-vector, 1/pi and
+        # the per-material gain folded here. The generic assembly and
+        # its 1/pi-times-vis tail are bypassed below.
+        lines += [
+            '    vec3 hal_arad = rad * s.anime_gain;',
+            '    float hal_ax = clamp(ds.x + s.anime_bias, 0.0, 1.0)'
+            ' * hal_sv;',
+        ]
+        fspec = bake.get('__anime_face')
+        if fspec:
+            # R239: the SDF face shadow -- the map's field against the
+            # light's horizontal angle about the face's frame REPLACES
+            # the lambert wrap, exactly render._anime_lamp's face road:
+            # same projection, same acos, same endpoint-mapped bilinear
+            # on the same uploaded texels, the side mirrored across the
+            # face's centre line
+            ffw = _v3(fspec['fwd'])
+            fup = _v3(fspec['up'])
+            frt = _v3(fspec['right'])
+            fw = float(fspec['w'])
+            fh = float(fspec['h'])
+            fv0 = float(fspec['v0'])
+            lines += [
+                f'    vec3 hal_flh = L - {fup} * dot(L, {fup});',
+                '    float hal_fln = max(length(hal_flh), 1e-9);',
+                '    hal_flh = hal_flh / hal_fln;',
+                f'    float hal_fct = clamp(dot(hal_flh, {ffw}), '
+                '-1.0, 1.0);',
+                '    float hal_ft = acos(hal_fct) * 0.318309873;',
+                f'    float hal_fsde = dot(hal_flh, {frt});',
+                '    float hal_fu = (hal_fsde >= 0.0) ? hal_uv.x '
+                ': (1.0 - hal_uv.x);',
+                f'    float hal_ffx = clamp(hal_fu, 0.0, 1.0) '
+                f'* {_f(fw - 1.0)};',
+                f'    float hal_ffy = clamp(hal_uv.y, 0.0, 1.0) '
+                f'* {_f(fh - 1.0)};',
+                '    float hal_fx0 = floor(hal_ffx);',
+                '    float hal_fy0 = floor(hal_ffy);',
+                '    float hal_ftx = hal_ffx - hal_fx0;',
+                '    float hal_fty = hal_ffy - hal_fy0;',
+                f'    float hal_fx1 = min(hal_fx0 + 1.0, {_f(fw - 1.0)});',
+                f'    float hal_fy1 = min(hal_fy0 + 1.0, {_f(fh - 1.0)});',
+                f'    float hal_fc00 = texelFetch(hal_facesdf, '
+                f'ivec2(int(hal_fx0), int(hal_fy0 + {_f(fv0)})), 0).r;',
+                f'    float hal_fc10 = texelFetch(hal_facesdf, '
+                f'ivec2(int(hal_fx1), int(hal_fy0 + {_f(fv0)})), 0).r;',
+                f'    float hal_fc01 = texelFetch(hal_facesdf, '
+                f'ivec2(int(hal_fx0), int(hal_fy1 + {_f(fv0)})), 0).r;',
+                f'    float hal_fc11 = texelFetch(hal_facesdf, '
+                f'ivec2(int(hal_fx1), int(hal_fy1 + {_f(fv0)})), 0).r;',
+                '    float hal_ftop = hal_fc00 + (hal_fc10 - hal_fc00)'
+                ' * hal_ftx;',
+                '    float hal_fbot = hal_fc01 + (hal_fc11 - hal_fc01)'
+                ' * hal_ftx;',
+                '    float hal_fval = hal_ftop + (hal_fbot - hal_ftop)'
+                ' * hal_fty;',
+                '    hal_ax = clamp(0.5 + (hal_fval - hal_ft), '
+                '0.0, 1.0) * hal_sv;',
+            ]
+        rspec = bake.get('__anime_ramp')
+        if rspec:
+            # R221: the tint IS the baked ramp, sampled by the light
+            # term with _anime_ramp_sample's own endpoint-mapped
+            # bilinear arithmetic on the SAME uploaded texels
+            rw = float(rspec['w'])
+            rh = float(rspec['h'])
+            rv0 = float(rspec['v0'])
+            lines += [
+                f'    float hal_rfx = clamp(hal_ax, 0.0, 1.0) '
+                f'* {_f(rw - 1.0)};',
+                f'    float hal_rfy = clamp(s.anime_ramp_row, 0.0, '
+                f'1.0) * {_f(rh - 1.0)};',
+                '    float hal_rx0 = floor(hal_rfx);',
+                '    float hal_ry0 = floor(hal_rfy);',
+                '    float hal_rtx = hal_rfx - hal_rx0;',
+                '    float hal_rty = hal_rfy - hal_ry0;',
+                f'    float hal_rx1 = min(hal_rx0 + 1.0, {_f(rw - 1.0)});',
+                f'    float hal_ry1 = min(hal_ry0 + 1.0, {_f(rh - 1.0)});',
+                f'    vec3 hal_rc00 = texelFetch(hal_animeramp, '
+                f'ivec2(int(hal_rx0), int(hal_ry0 + {_f(rv0)})), 0).rgb;',
+                f'    vec3 hal_rc10 = texelFetch(hal_animeramp, '
+                f'ivec2(int(hal_rx1), int(hal_ry0 + {_f(rv0)})), 0).rgb;',
+                f'    vec3 hal_rc01 = texelFetch(hal_animeramp, '
+                f'ivec2(int(hal_rx0), int(hal_ry1 + {_f(rv0)})), 0).rgb;',
+                f'    vec3 hal_rc11 = texelFetch(hal_animeramp, '
+                f'ivec2(int(hal_rx1), int(hal_ry1 + {_f(rv0)})), 0).rgb;',
+                '    vec3 hal_rtop = hal_rc00 + (hal_rc10 - hal_rc00)'
+                ' * hal_rtx;',
+                '    vec3 hal_rbot = hal_rc01 + (hal_rc11 - hal_rc01)'
+                ' * hal_rtx;',
+                '    vec3 hal_tint = hal_rtop + (hal_rbot - hal_rtop)'
+                ' * hal_rty;',
+            ]
+        else:
+            lines += [
+            '    float hal_t1 = clamp((hal_ax - (s.anime_th1 '
+            '- s.anime_soft1)) / max(2.0 * s.anime_soft1, 1e-6), '
+            '0.0, 1.0);',
+            '    float hal_b1 = hal_t1 * hal_t1 '
+            '* (3.0 - 2.0 * hal_t1);',
+            '    float hal_t2 = clamp((hal_ax - (s.anime_th2 '
+            '- s.anime_soft2)) / max(2.0 * s.anime_soft2, 1e-6), '
+            '0.0, 1.0);',
+            '    float hal_b2 = hal_t2 * hal_t2 '
+            '* (3.0 - 2.0 * hal_t2);',
+            '    float hal_t3 = clamp(s.anime_tones - 2.0, 0.0, 1.0);',
+            '    vec3 hal_sh3 = s.anime_shadow2 + (s.anime_shadow1 '
+            '- s.anime_shadow2) * hal_b2;',
+            '    vec3 hal_shade = s.anime_shadow1 + (hal_sh3 '
+            '- s.anime_shadow1) * hal_t3;',
+            '    vec3 hal_tint = hal_shade + (vec3(1.0) - hal_shade)'
+            ' * hal_b1;',
+            ]
+        if 'anime_air' in perpix_names(bake) or \
+                float(bake.get('anime_air', 0.0) or 0.0) > 1e-6:
+            # R229: render._anime_airbrush, the same operations -- the
+            # lit-side multiply toward the airbrush colour just above
+            # the first threshold, the shadow-side blend toward it
+            # just below, by side code (0 lit, 1 shadow, 2 both)
+            lines += _airbrush_lines('hal_tint', 'hal_ax', 's.anime_th1')
+        if affect_diffuse:
+            lines.append('    hal_dcon = (s.diffuse * hal_tint '
+                         '* s.diffuse_level) * hal_arad '
+                         '* 0.318309886;')
+        if affect_specular:
+            lines += [
+                '    vec3 hal_ah = normalize(L + V);',
+                '    float hal_asn = clamp(dot(N, hal_ah) * 0.5 '
+                '+ 0.5, 0.0, 1.0);',
+                '    float hal_aed = 1.0 - clamp(s.anime_spec_size, '
+                '0.0, 1.0);',
+                '    float hal_ts = clamp((hal_asn - (hal_aed '
+                '- s.anime_sharp)) / max(2.0 * s.anime_sharp, 1e-6), '
+                '0.0, 1.0);',
+                '    float hal_ag = hal_ts * hal_ts '
+                '* (3.0 - 2.0 * hal_ts);',
+                '    hal_scon = ((hal_ag * s.anime_mask * hal_sv) '
+                '* s.specular * s.specular_level) * hal_arad '
+                '* 0.318309886;',
+            ]
+    return False
+
+
+def _airbrush_lines(tint_var, x_var, th_expr):
+    """R229/R238: render._anime_airbrush's operations on `tint_var`
+    against the band input `x_var` at the edge `th_expr` -- the anime
+    master's first threshold, or the cartoon's."""
+    return [
+        '    float hal_aam = clamp(s.anime_air, 0.0, 1.0);',
+        '    float hal_awd = max(s.anime_air_width, 1e-4);',
+        f'    float hal_agl = (1.0 - hal_sstep({th_expr}, '
+        f'{th_expr} + hal_awd, {x_var})) '
+        f'* hal_sstep({th_expr} - 1e-4, {th_expr}, {x_var});',
+        f'    float hal_ags = hal_sstep({th_expr} - hal_awd, '
+        f'{th_expr}, {x_var}) * (1.0 - hal_sstep({th_expr}, '
+        f'{th_expr} + 1e-4, {x_var}));',
+        '    float hal_asd = floor(s.anime_air_side + 0.5);',
+        '    float hal_akl = hal_aam * hal_agl '
+        '* ((hal_asd != 1.0) ? 1.0 : 0.0);',
+        '    float hal_aks = hal_aam * hal_ags '
+        '* ((hal_asd != 0.0) ? 1.0 : 0.0);',
+        f'    {tint_var} = {tint_var} * (vec3(1.0) '
+        f'+ (s.anime_air_color - vec3(1.0)) * hal_akl);',
+        f'    {tint_var} = {tint_var} + (s.anime_air_color - {tint_var}) '
+        '* hal_aks;',
+    ]
+
+
+def _cel_key_source(consts, bake):
+    """R238: the fixed key's own block, after the lamps -- exactly
+    light_surface's cel_mode > 0 tail: the key's world direction (the
+    camera's axes times the material's own-frame vector, in that
+    order, or the world vector itself), a radiance of pi (the lit tone
+    is the colour as painted), the strongest caster's visibility
+    (hal_vkey, -1 when no caster reached the object: lit) times the
+    screen shadow, then the cel composition a lamp gets."""
+    lines = ['    {']
+    mode = int(round(float(bake.get('cel_light', 0.0))))
+    if mode == 1:
+        lines.append('    vec3 L = normalize(hal_cam_right * s.cel_dir.x '
+                     '+ hal_cam_up * s.cel_dir.y '
+                     '+ hal_cam_back * s.cel_dir.z);')
+    else:
+        lines.append('    vec3 L = normalize(s.cel_dir);')
+    lines += ['    vec3 rad = vec3(3.14159265);',
+              '    float hal_sv = (hal_vkey >= 0.0) ? hal_vkey : 1.0;']
+    if bake.get('__cel_field') and float(bake.get('cel_ss', 0.0) or 0.0) > 1e-6:
+        lines.append('    hal_sv = hal_sv * (1.0 - hal_cel.r '
+                     '* clamp(s.cel_ss, 0.0, 1.0));')
+    lines += ['    vec4 ds = hal_evaluate(hal_model_i, s, N, L, V);',
+              '    vec3 hal_dcon = vec3(0.0);',
+              '    vec3 hal_scon = vec3(0.0);']
+    closed = _cel_composition(lines, bake, consts, True, True)
+    if closed:
+        return lines
+    lines.append('    vec3 contrib = hal_dcon + hal_scon;')
+    clamp = float(consts.get('light_clamp', 0.0))
+    if clamp > 0.0:
+        lines.append(f'    contrib = min(contrib, vec3({_f(clamp)}));')
+    lines.append('    total += contrib;')
+    lines.append('    }')
+    return lines
+
+
 def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
     """The unrolled loop body for one light, mirroring light_surface.
 
@@ -1566,6 +1964,35 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
                     f'    rad = rad * (vec3(1.0) + (hal_cookie_rgb{i}'
                     f'(ckuv) - vec3(1.0)) * {_f(ck["strength"])});',
                     '    }']
+        if ck is not None and kind == 'POINT':
+            # exactly cookie_factor's POINT branch: light->surface
+            # direction in the lamp's own frame, unrolled lat-long --
+            # atan2 around the forward axis, asin from the equator
+            lines += [
+                '    vec3 ckd = -L;',
+                f'    float ckx = dot(ckd, {_v3(ck["side"])});',
+                f'    float cky = dot(ckd, {_v3(ck["up"])});',
+                f'    float ckz = dot(ckd, {_v3(ck["fwd"])});',
+                '    vec2 ckuv = vec2(atan(ckx, ckz) * '
+                f'{_f(float(np.float32(1.0 / (2.0 * np.pi))))} + 0.5, '
+                'asin(clamp(cky, -1.0, 1.0)) * '
+                f'{_f(float(np.float32(1.0 / np.pi)))} + 0.5);',
+                f'    rad = rad * (vec3(1.0) + (hal_cookie_rgb{i}(ckuv) '
+                f'- vec3(1.0)) * {_f(ck["strength"])});']
+        if ck is not None and kind == 'AREA':
+            # exactly cookie_factor's AREA branch: parallel throw off
+            # the face, offset in the lamp plane over the face size;
+            # behind the face the projection is undefined (factor 1)
+            lines += [
+                '    vec3 ckrel = -delta;',
+                f'    float ckz = dot(ckrel, {_v3(ck["fwd"])});',
+                '    if (ckz > 1e-6) {',
+                f'    vec2 ckuv = vec2(dot(ckrel, {_v3(ck["side"])}) / '
+                f'{_f(ck["sx"])} + 0.5, dot(ckrel, {_v3(ck["up"])}) / '
+                f'{_f(ck["sy"])} + 0.5);',
+                f'    rad = rad * (vec3(1.0) + (hal_cookie_rgb{i}(ckuv) '
+                f'- vec3(1.0)) * {_f(ck["strength"])});',
+                '    }']
     if getattr(light, 'negative', False) and not use_tx:
         # texel mode folds the sign into the packed energy (float32
         # negation is exact), so toggling Negative never recompiles
@@ -1578,6 +2005,9 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
         # light_surface's override: the 0.5+0.5*N.L wrap and a wrapped
         # half-vector pow through the surface's own hardness and tint
         lines += [
+            # R243: the override never runs hal_evaluate, so the coloured
+            # diffuse slot reads the diffuse socket
+            '    hal_dif_rgb = s.diffuse;',
             '    float hal_hd = 0.5 * dot(N, L) + 0.5;',
             '    float hal_ht = 0.5 * dot(N, normalize(L + V)) + 0.5;',
             # verbatim (R155): t = spec(t, shi->har) -- the integer-bit
@@ -1607,6 +2037,33 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
     # so the picture cannot move; only the wasted BVH walks and map
     # taps stop. Shadows Only materials never reach this pass (they
     # refuse the GPU by name), so the gate needs no exception.
+    if bake.get('__cel_key'):
+        # R238: under a fixed key the scene's lamps only CAST their
+        # shadows -- exactly light_surface's cel_mode > 0 branch: no
+        # block at all for a lamp with no shadow term; a caster's
+        # visibility (the CPU's own call, no contribution gate: the
+        # mask is the link) joins the strongest-caster accumulator, -1
+        # where the lamp does not reach this object
+        if not shadowed:
+            return []
+        if isinstance(shadowed, dict) and shadowed.get('ray'):
+            dist_arg = '1e9' if kind == 'SUN' else 'dist'
+            _sv_call = f'hal_shadow_vis{i}(P, N, L, {dist_arg})'
+        else:
+            _sv_call = f'hal_shadow_vis{i}(P, N, L)'
+        lines.append(f'    float hal_svk = {_sv_call};')
+        link = (consts.get('light_links') or {}).get(i)
+        if link:
+            tests = ' + '.join(f'((abs(td.y - {_f(float(o))}) < 0.5) '
+                               '? 1.0 : 0.0)'
+                               for o in link['objects'])
+            lines.append(f'    float hal_lk{i} = min({tests}, 1.0);')
+            mask = f'hal_lk{i}' if str(link.get('mode', 'EXCLUDE')).upper() \
+                == 'ONLY' else f'(1.0 - hal_lk{i})'
+            lines.append(f'    hal_svk = ({mask} > 0.5) ? hal_svk : -1.0;')
+        lines.append('    hal_vkey = max(hal_vkey, hal_svk);')
+        lines.append('    }')
+        return lines
     if shadowed:
         if isinstance(shadowed, dict) and shadowed.get('ray'):
             dist_arg = '1e9' if kind == 'SUN' else 'dist'
@@ -1628,9 +2085,27 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
             '    }']
     else:
         lines.append('    float hal_sv = 1.0;')
+    if bake.get('__cel_field') and int(consts.get('cel_key_index', -1)) == i \
+            and float(bake.get('cel_ss', 0.0) or 0.0) > 1e-6:
+        # R238: the screen shadow rides the scene's key lamp, after the
+        # receive fold, exactly light_surface's order
+        lines.append('    hal_sv = hal_sv * (1.0 - hal_cel.r '
+                     '* clamp(s.cel_ss, 0.0, 1.0));')
     lines.append('    vec3 hal_dcon = vec3(0.0);')
     lines.append('    vec3 hal_scon = vec3(0.0);')
-    if getattr(light, 'affect_diffuse', True) and \
+    anime = bool(bake.get('__anime'))
+    if bake.get('__cartoon') or anime:
+        link_c = (consts.get('light_links') or {}).get(i)
+        closed = _cel_composition(
+            lines, bake, consts,
+            getattr(light, 'affect_diffuse', True)
+            and not getattr(light, 'specular_only', False),
+            getattr(light, 'affect_specular', True)
+            and not getattr(light, 'diffuse_only', False),
+            link_c=link_c if bake.get('__cartoon') else None)
+        if closed:
+            return lines
+    if not anime and getattr(light, 'affect_diffuse', True) and \
             not getattr(light, 'specular_only', False):
         if rd is not None and rd.get('input') != 'RESULT':
             # the diffuse ramp, per light, exactly add_to_diffuse: the
@@ -1648,9 +2123,11 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
                 '    hal_dcon += (ds.x * hal_dcol * s.diffuse_level)'
                 ' * rad;']
         else:
-            lines.append('    hal_dcon += (ds.x * s.diffuse * '
+            # R243: hal_dif_rgb is s.diffuse for every model but the Max
+            # shaders whose diffuse carries its own colour
+            lines.append('    hal_dcon += (ds.x * hal_dif_rgb * '
                          's.diffuse_level) * rad;')
-    if getattr(light, 'affect_specular', True) and \
+    if not anime and getattr(light, 'affect_specular', True) and \
             not getattr(light, 'diffuse_only', False):
         spec = 'ds.yzw'
         if rs_ is not None and rs_.get('input') != 'RESULT':
@@ -1680,7 +2157,12 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
             spec = 'hal_sp'
         if not consts.get('specular_in_gamma', True):
             spec = f'pow(max({spec}, vec3(0.0)), vec3(2.2))'
-        lines.append(f'    hal_scon += {spec} * s.specular_level * rad;')
+        if bake.get('__level_free'):
+            # R243: Strauss has no Specular Level in Max, Multi-Layer
+            # applies its two levels inside -- the loop scales by nothing
+            lines.append(f'    hal_scon += {spec} * rad;')
+        else:
+            lines.append(f'    hal_scon += {spec} * s.specular_level * rad;')
         if float(bake.get('sheen', 0.0)) > 1e-4:
             # the velvet lobe, exactly as light_surface: scattered back at
             # grazing angles, needing a light, vanishing face-on
@@ -1740,12 +2222,13 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
     # (lashdw*(i_noshad - i) added back); spec keeps the plain factor
     _shc = tuple(getattr(light, 'shadow_color', (0.0, 0.0, 0.0))
                  or (0.0, 0.0, 0.0))
-    if max(_shc) > 0.0:
-        lines.append(f'    hal_dcon *= 0.318309886 * (vec3(hal_sv)'
-                     f' + {_v3(_shc)} * (1.0 - hal_sv));')
-    else:
-        lines.append('    hal_dcon *= 0.318309886 * hal_sv;')
-    lines.append('    hal_scon *= 0.318309886 * hal_sv;')
+    if not anime:
+        if max(_shc) > 0.0:
+            lines.append(f'    hal_dcon *= 0.318309886 * (vec3(hal_sv)'
+                         f' + {_v3(_shc)} * (1.0 - hal_sv));')
+        else:
+            lines.append('    hal_dcon *= 0.318309886 * hal_sv;')
+        lines.append('    hal_scon *= 0.318309886 * hal_sv;')
     link = (consts.get('light_links') or {}).get(i)
     if link:
         # light linking, exactly light_surface's mask and order: 1/pi,
@@ -1780,6 +2263,13 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
         lines.append('    total += contrib;')
     lines.append('    }')
     return lines
+
+
+def perpix_names(bake):
+    """R229: the per-pixel field names the assembler recorded on the
+    bake (so the lamp lines can gate their structure on 'this field
+    varies' as well as 'this constant is nonzero')."""
+    return frozenset((bake or {}).get('__perpix') or ())
 
 
 def _ramp_blend_index(name):
@@ -1890,13 +2380,45 @@ BAKE_FIELDS = ('diffuse_level', 'specular_level', 'glossiness', 'roughness',
                'toon_size2', 'toon_smooth2', 'bi_fresnel', 'bi_fresnel_fac',
                'bi_slope', 'bi_transp_fresnel', 'bi_transp_blend',
                'bi_spectra', 'bi_cubic', 'bi_tangent', 'shadow_receive',
-               'cast_only', 'shadows_only', 'opacity')
+               'cast_only', 'shadows_only', 'opacity',
+               # the anime/cel drivers (R218)
+               'anime_th1', 'anime_soft1', 'anime_th2', 'anime_soft2',
+               'anime_bias', 'anime_tones', 'anime_spec_size',
+               'anime_sharp', 'anime_mask', 'anime_gain',
+               # R221: the ramp row pick (the LUT itself rides an atlas)
+               'anime_ramp_row',
+               # the cartoon/paint drivers (R228)
+               'cartoon_amount', 'cartoon_th', 'cartoon_soft',
+               'cartoon_smooth', 'cartoon_hl_size', 'cartoon_hl_soft',
+               'cartoon_mode', 'cartoon_lamp',
+               # the 80s anime additions (R229)
+               'anime_shine', 'anime_shine_h', 'anime_shine_w',
+               'anime_shine_wave', 'anime_shine_waves', 'anime_shine_soft',
+               'anime_shine_second',
+               # R241: the hair pass
+               'anime_shine_shape', 'anime_shine_angle',
+               'anime_shine_follow',
+               'anime_air', 'anime_air_width',
+               'anime_air_side',
+               # R238: the cel's light (the key's vector rides
+               # EXTRA_COLORS as cel_dir)
+               'cel_light', 'cel_ss', 'cel_ss_len', 'cel_rim_mode',
+               'cel_rim_width', 'cel_rim_side', 'cel_shape',
+               # R243: the Max Multi-Layer's second highlight
+               'specular_level2', 'glossiness2', 'anisotropy2', 'aniso_rot2')
 
 #: master-node sockets that may vary per pixel: when LINKED, the chain is
 #: emitted and assigned to the surface field; unlinked, the probed constant
 #: bakes as before. socket name -> (surface field, glsl type). This is what
 #: lets a texture drive Roughness without pushing the material off the GPU.
 PER_PIXEL_SOCKETS = {
+    # R213: a linked Opacity chain travels to the GPU -- the layer and
+    # stipple passes consume it as their alpha (the plumbing always
+    # could; the grant was missing), so genuine fractional transparency
+    # stops refusing the driver with 'opacity varies across the frame'.
+    # Punch-through materials never need it (their visibility resolves
+    # in the z-pass), but Strauss reads 1-opacity per pixel either way.
+    'Opacity': ('opacity', 'float'),
     'Diffuse Level': ('diffuse_level', 'float'),
     'Specular Level': ('specular_level', 'float'),
     'Specular Color': ('specular', 'vec3'),
@@ -1919,6 +2441,36 @@ PER_PIXEL_SOCKETS = {
     # radiosity gather with it. The BLEND stays baked (varying blend
     # still refuses by name).
     'Matcap': ('matcap', 'vec3'),
+    # the anime master's own per-pixel rights (R218): each maps one
+    # socket onto one surface field, so the generic machinery carries
+    # a texture-driven tone or bias without pushing the frame off the
+    # GPU. (Game Texture and Detail Texture decode to SEVERAL fields
+    # and ride the bespoke branch in per_pixel_fields instead.)
+    'Shadow Bias': ('anime_bias', 'float'),
+    'Shadow 1 Color': ('anime_shadow1', 'vec3'),
+    'Shadow 2 Color': ('anime_shadow2', 'vec3'),
+    'Specular Size': ('anime_spec_size', 'float'),
+    'Light Response': ('anime_gain', 'float'),
+    'Ramp Row': ('anime_ramp_row', 'float'),
+    # the cartoon master's per-pixel rights (R228): the sockets the CPU
+    # reads RAW or clamps inside the same arithmetic the lamp lines
+    # repeat (the two softness sockets are floored at the node and stay
+    # baked -- a varying one refuses by name)
+    'Shadow Color': ('cartoon_shadow', 'vec3'),
+    'Shadow Amount': ('cartoon_amount', 'float'),
+    'Shadow Threshold': ('cartoon_th', 'float'),
+    'Shadow Smoothing': ('cartoon_smooth', 'float'),
+    'Highlight Color': ('cartoon_hl_color', 'vec3'),
+    'Highlight Size': ('cartoon_hl_size', 'float'),
+    'Lamp Influence': ('cartoon_lamp', 'float'),
+    # the 80s anime additions (R229): the amounts and colours are read
+    # raw (or re-clamped in the same arithmetic); the band geometry and
+    # the widths stay baked
+    'Hair Shine': ('anime_shine', 'float'),
+    'Hair Shine Color': ('anime_shine_color', 'vec3'),
+    'Hair Shine Second Color': ('anime_shine_color2', 'vec3'),
+    'Airbrush': ('anime_air', 'float'),
+    'Airbrush Color': ('anime_air_color', 'vec3'),
 }
 
 
@@ -1933,7 +2485,10 @@ def master_node(graph):
         return None
     node = (graph or {}).get('nodes', {}).get(link[0])
     if node is not None and node.get('bl_idname') in (
-            'HALCYON_ShaderNode', 'HALCYON_BIMaterialNode'):
+            'HALCYON_ShaderNode', 'HALCYON_AnimeShaderNode',
+            'HALCYON_CartoonNode', 'HALCYON_BIMaterialNode',
+            # R243: Max's Standard and Raytrace materials, the BI idiom
+            'HALCYON_MaxStandardNode', 'HALCYON_MaxRaytraceNode'):
         return node
     return None
 
@@ -1956,6 +2511,14 @@ def _socket(node, name):
         if sock.get('name') == name or sock.get('identifier') == name:
             return sock
     return None
+
+
+def master_faceted(graph):
+    """R242: True when the master node wears Max's Faceted flag -- the
+    assembler then substitutes the stored face normal for this
+    material, the CPU's closure_to_surface twin."""
+    mn = master_node(graph) if graph else None
+    return bool(mn is not None and (mn.get('props') or {}).get('faceted'))
 
 
 def master_normal_linked(graph):
@@ -2002,6 +2565,14 @@ def per_pixel_fields(graph):
         # ('glossiness varies across the frame'), five minutes a frame.
         key = name if name in PER_PIXEL_SOCKETS else \
             (ident if ident in PER_PIXEL_SOCKETS else None)
+        if ident and str(ident).startswith('Max '):
+            # R243: the Max material nodes' percentage and degree
+            # sockets carry 'Max ...' identifiers because the evaluator
+            # converts their units (percent / 100, degrees / 360); the
+            # raw chain is not the master's field, so it earns no grant
+            # -- a linked one makes the probe refuse by name instead of
+            # the GPU shading a Specular Level of 60 as 6000 percent
+            key = None
         if key is not None and sock.get('link'):
             field, gtype = PER_PIXEL_SOCKETS[key]
             # hand consumers the socket's real display name: em.input
@@ -2016,6 +2587,61 @@ def per_pixel_fields(graph):
     # ('emission varies across the frame': the field's Red material,
     # every viewport re-render at region resolution). The assembler
     # synthesizes the product from the SAME emitted chains.
+    if node.get('bl_idname') == 'HALCYON_AnimeShaderNode':
+        # R218: the game maps decode to SEVERAL fields, per compat
+        # mode -- each becomes a per-pixel expression the assembler
+        # synthesizes from the SAME emitted chains (textures sample
+        # once). The probe reads the same table, so constancy checks
+        # skip exactly the fields the shader will compute per pixel.
+        p = node.get('props', {})
+        mode = str(p.get('compat', 'GENERIC'))
+        game_linked = det_linked = base_alpha = False
+        for sock in node.get('inputs', ()):
+            nm = sock.get('name')
+            if nm == 'Game Texture' and sock.get('link'):
+                game_linked = True
+            if nm == 'Detail Texture' and sock.get('link'):
+                det_linked = True
+            if nm == 'Diffuse Color' and sock.get('link'):
+                base_alpha = True
+        if game_linked and mode in ('ARCSYS', 'DBFZ', 'KAKAROT',
+                                    'SPARKING'):
+            out['anime_mask'] = ('Game Texture', 'anime_arcsys_mask')
+            out['anime_bias'] = ('Game Texture', 'anime_arcsys_bias')
+            out['anime_spec_size'] = ('Game Texture',
+                                      'anime_arcsys_size')
+        elif game_linked and mode == 'GENSHIN':
+            out['anime_mask'] = ('Game Texture', 'anime_hoyo_mask')
+            out['anime_bias'] = ('Game Texture', 'anime_hoyo_bias')
+            out['anime_spec_size'] = ('Game Texture', 'anime_hoyo_size')
+            # R221: with a ramp linked and no explicit row, the game
+            # texture's alpha (the material id) picks the ramp row --
+            # exactly n_anime_shader's wiring
+            ramp_linked = row_linked = False
+            for sock in node.get('inputs', ()):
+                if sock.get('name') == 'Shadow Ramp' and \
+                        sock.get('link'):
+                    ramp_linked = True
+                if sock.get('name') == 'Ramp Row' and sock.get('link'):
+                    row_linked = True
+            if ramp_linked and not row_linked:
+                out['anime_ramp_row'] = ('Game Texture',
+                                         'anime_hoyo_row')
+        elif game_linked and mode == 'ZZZ':
+            out['anime_mask'] = ('Game Texture', 'anime_zzz_mask')
+            out['anime_bias'] = ('Game Texture', 'anime_zzz_bias')
+            out['anime_spec_size'] = ('Game Texture', 'anime_zzz_size')
+        if det_linked and mode in ('ARCSYS', 'DBFZ', 'KAKAROT',
+                                   'SPARKING'):
+            out['anime_shadow1'] = ('Detail Texture', 'anime_sss')
+        if bool(p.get('emission_alpha')) and base_alpha:
+            out['emission'] = ('Diffuse Color', 'anime_emit')
+        if bool(p.get('use_vertex_ao')):
+            # the vertex-red push needs no chain, but the bias field
+            # must go per-pixel so the term lands. R239: EVERY mode --
+            # the GDC convention is not the ArcSys lineage's alone
+            if 'anime_bias' not in out:
+                out['anime_bias'] = ('Shadow Bias', 'anime_vao_only')
     if node.get('bl_idname') == 'HALCYON_BIMaterialNode' \
             and 'emission' not in out and emit_sock is not None:
         p = node.get('props', {})
@@ -2157,6 +2783,11 @@ def _assemble_height_pass(graph, mat_id, bump_node, consts, textures,
             + _sel('hal_gen_span', list(span)) + '\n'
         gen_line = ('    vec3 hal_generated = (P - hal_gen_lo(td.y)) '
                     '/ hal_gen_span(td.y);\n')
+    obj_fns, obj_line = _object_frame(src, consts)
+    if obj_fns is None:
+        return None, obj_line
+    gen_fns += obj_fns
+    gen_line += obj_line
 
     frame_unis = sorted(em.frame_uniforms)
     extra_unis = ''.join(f'uniform float {u};\n' for u in frame_unis)
@@ -2175,6 +2806,9 @@ def _assemble_height_pass(graph, mat_id, bump_node, consts, textures,
 in vec2 vUV;
 out vec4 Color;
 uniform vec3 hal_eye;
+uniform vec3 hal_cam_right;
+uniform vec3 hal_cam_up;
+uniform vec3 hal_cam_back;
 {'uniform sampler2D hal_gb_idslin;' if affine_uv else ''}
 {extra_unis}
 
@@ -2286,6 +2920,47 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     prepared-texture keys the caller must upload.
     """
     from . import gbuffer as GB
+    from ..core.shading import MODEL_ITEMS as _MI
+
+    # R218: the anime/cel model swaps the lamp assembly for the banded
+    # composition; the flag rides bake so _one_light_source sees it
+    _anime_idx = next((k for k, m in enumerate(_MI)
+                       if m[0] == 'ANIME'), -1)
+    bake = dict(bake or {})
+    bake['__anime'] = int(model_index) == _anime_idx
+    # R228: the cartoon/paint model -- the lamp lines accumulate the
+    # strongest lamp's verdict, the assembly tail composes the paint
+    _cartoon_idx = next((k for k, m in enumerate(_MI)
+                         if m[0] == 'CARTOON'), -1)
+    bake['__cartoon'] = int(model_index) == _cartoon_idx
+    # R243: the Max shaders the light loop must not scale by Specular
+    # Level (shading.LEVEL_FREE_MODELS), by index
+    from ..core.shading import LEVEL_FREE_MODELS as _LF
+    bake['__level_free'] = any(k == int(model_index) for k, m in enumerate(_MI)
+                               if m[0] in _LF)
+    # R221: this material's packed Shadow Ramp (atlas offsets),
+    # when the scene collection found one
+    bake['__anime_ramp'] = (consts.get('anime_ramps')
+                            or {}).get(mat_id)
+    # R239: this material's packed SDF face map (atlas offsets + the
+    # face's frame, resolved per frame from the first object wearing
+    # the material -- a moved head is a moved mesh, which re-plans
+    # anyway)
+    bake['__anime_face'] = (consts.get('anime_faces')
+                            or {}).get(mat_id)
+    # R238: the cel's light -- a fixed key swaps the lamp loop for the
+    # shadow-only lamps plus the key's own block; the cel field (screen
+    # shadow, depth rim) is read by the opaque frame pass alone (a
+    # layer over the surface and a hit off it read nothing, exactly
+    # the CPU's depth guard)
+    _cel_model = bool(bake['__anime']) or bool(bake['__cartoon'])
+    bake['__cel_key'] = _cel_model and \
+        int(round(float(bake.get('cel_light', 0.0) or 0.0))) > 0
+    bake['__cel_field'] = _cel_model and not secondary and not layer \
+        and bool(consts.get('cel_field')) and (
+            float(bake.get('cel_ss', 0.0) or 0.0) > 1e-6
+            or (float(bake.get('cel_rim_mode', 0.0) or 0.0) > 0.5
+                and float(bake.get('rim', 0.0) or 0.0) > 1e-4))
 
     em = Emitter(graph or {})
     em.frame_mode = True
@@ -2314,7 +2989,68 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
             # subexpressions and all -- and assigned per pixel below
             perpix = per_pixel_fields(graph)
             mnode = master_node(graph)
+            bake['__perpix'] = frozenset(perpix)
             for field, (sockname, gtype) in perpix.items():
+                if gtype.startswith('anime_'):
+                    p = mnode.get('props', {})
+                    mode = str(p.get('compat', 'GENERIC'))
+                    kk = {'KAKAROT': ' + 0.06', 'SPARKING': ' - 0.04'} \
+                        .get(mode, '')
+                    vao = ''
+                    if bool(p.get('use_vertex_ao')) and em.has_vcol:
+                        vao = ' + (hal_vcol.r - 1.0) * 2.0'
+                    sb = em.input(mnode, 'Shadow Bias', 'float')
+                    ss = em.input(mnode, 'Specular Size', 'float')
+                    if gtype == 'anime_vao_only':
+                        expr = f'({sb}{vao})'
+                    elif gtype == 'anime_emit':
+                        e_str = em.input(mnode, 'Emission Strength',
+                                         'float')
+                        base4 = em.input(mnode, 'Diffuse Color', 'vec4')
+                        expr = (f'(({base4}).rgb * clamp(({base4}).a '
+                                f'- 0.03, 0.0, 1.0) * {e_str} + '
+                                + em.input(mnode, 'Self-Illumination',
+                                           'vec3')
+                                + f' * {e_str})')
+                    elif gtype == 'anime_sss':
+                        det = em.input(mnode, 'Detail Texture', 'vec4')
+                        s1 = em.input(mnode, 'Shadow 1 Color', 'vec3')
+                        expr = f'({s1} * ({det}).rgb)'
+                    else:
+                        game = em.input(mnode, 'Game Texture', 'vec4')
+                        fam, part = gtype.split('_')[1], \
+                            gtype.split('_')[2]
+                        if fam == 'arcsys':
+                            table = {
+                                'mask': f'({game}).r',
+                                'bias': f'({sb} + (({game}).g * 2.0 '
+                                        f'- 1.0){kk}{vao})',
+                                'size': f'({ss} * clamp(({game}).b '
+                                        f'* 2.0, 0.0, 2.0))'}
+                        elif fam == 'hoyo':
+                            table = {
+                                'mask': f'(({game}).r + ((({game}).r '
+                                        f'> 0.9) ? 0.6 : 0.0))',
+                                'bias': f'({sb} + (({game}).g - 0.5) '
+                                        f'* 2.0{vao})',
+                                'size': f'({ss} * clamp(1.03 '
+                                        f'- ({game}).b, 0.0, 1.0) '
+                                        f'* 2.0)',
+                                # R221: the material id picks the row
+                                'row': f'clamp(({game}).a, 0.0, 1.0)'}
+                        else:
+                            det4 = em.input(mnode, 'Detail Texture',
+                                            'vec4')
+                            table = {
+                                'mask': f'clamp(({game}).g '
+                                        f'+ ({det4}).b, 0.0, 1.5)',
+                                'bias': f'({sb} + (({game}).r - 0.5) '
+                                        f'* 2.0{vao})',
+                                'size': f'({ss} * clamp(({game}).b '
+                                        f'* 2.0, 0.0, 2.0))'}
+                        expr = table[part]
+                    perpix_exprs[field] = expr
+                    continue
                 if gtype == 'bi_emit':
                     # BI emission = the diffuse chain's colour times the
                     # Emit float (n_bi_material verbatim), sharing the
@@ -2455,7 +3191,20 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     # texture already carries. Exactly ctx.generated = (P - lo[obj])/span
     gen_fns = ''
     gen_line = ''
-    if 'hal_generated' in src:
+    # R228: the cartoon's shape smoothing reads the same per-object
+    # bounds table, so it forces the lookup functions in even when no
+    # chain reads Generated coordinates
+    _cartoon_gen = (bool(bake.get('__cartoon'))
+                    or bool(bake.get('__anime'))) and (
+        'cartoon_smooth' in perpix_exprs
+        or float(bake.get('cartoon_smooth', 0.0) or 0.0) > 1e-6)
+    # R229: the hair shine band reads Generated (its height) and the
+    # bounds centre (its azimuth); R241: the cartoon wears it too
+    _shine_gen = (bool(bake.get('__anime'))
+                  or bool(bake.get('__cartoon'))) and (
+        'anime_shine' in perpix_exprs
+        or float(bake.get('anime_shine', 0.0) or 0.0) > 1e-6)
+    if 'hal_generated' in src or _cartoon_gen or _shine_gen:
         bounds = consts.get('obj_bounds')
         if bounds is None:
             return None, 'generated coordinates need the per-object bounds ' \
@@ -2473,8 +3222,14 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
 
         gen_fns = _sel('hal_gen_lo', list(lo)) + '\n' \
             + _sel('hal_gen_span', list(span)) + '\n'
-        gen_line = ('    vec3 hal_generated = (P - hal_gen_lo(td.y)) '
-                    '/ hal_gen_span(td.y);\n')
+        if 'hal_generated' in src or _shine_gen:
+            gen_line = ('    vec3 hal_generated = (P - hal_gen_lo(td.y)) '
+                        '/ hal_gen_span(td.y);\n')
+    obj_fns, obj_line = _object_frame(src, consts)
+    if obj_fns is None:
+        return None, obj_line
+    gen_fns += obj_fns
+    gen_line += obj_line
 
     # Bump nodes recorded height pre-passes during the walk: each height
     # chain becomes its own full-screen pass whose target the main pass
@@ -2673,6 +3428,9 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     if rad_field:
         shadow_fns.append(_rad_lookup_function(rad_spec, consts))
         samplers.append('hal_radfield')
+    if bake.get('__cel_field') and not vertex_rate:
+        shadow_fns.append(_cel_lookup_function(consts))
+        samplers.append('hal_celfield')
     mapped_shadow = False
     for i, smeta in enumerate(shadows):
         if smeta is not None:
@@ -2691,6 +3449,17 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
         for i, ckspec in sorted((consts.get('cookies') or {}).items()):
             shadow_fns.append(_cookie_function(i, ckspec))
             samplers.append(f'hal_cookie{i}')
+        # R221: the packed anime Shadow Ramp atlas -- one sampler shared
+        # by every ramped material's lamp loop (declared ahead of the
+        # light functions, the R193 declaration-order law)
+        if consts.get('anime_ramps'):
+            shadow_fns.append('uniform sampler2D hal_animeramp;\n')
+            samplers.append('hal_animeramp')
+        # R239: the packed SDF face maps -- one sampler shared by every
+        # face material's lamp loop
+        if consts.get('anime_faces'):
+            shadow_fns.append('uniform sampler2D hal_facesdf;\n')
+            samplers.append('hal_facesdf')
         # BI's area lamp form factor: one Stokes-contour function per
         # AREA light, consumed by _one_light_source's evaluate2 road.
         # Gated exactly like the light loop (a shadeless pass emits no
@@ -2731,6 +3500,11 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
             '    f.uv = hal_interp(f.tri, hal_idslin.rgb, 2).xy;\n'
             '    f.uv2 = hal_interp4(f.tri, hal_idslin.rgb, 2).zw;\n')
     normal_face = bool(consts.get('normal_face'))
+    # R242: Max's Faceted on the master node -- this material alone
+    # shades by its stored face normal (closure_to_surface's twin)
+    _mn = master_node(graph) if graph else None
+    if _mn is not None and bool((_mn.get('props') or {}).get('faceted')):
+        normal_face = True
     # R167: the RAYBIAS terminator twin reads the stored face normal
     # (hal_triaux) and the per-tri Auto Smooth threshold (hal_sres) --
     # frame passes only: a ray hit has no G-buffer triangle id. A
@@ -2833,6 +3607,10 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
              '// -- and a coded shader reading the clock animates without '
              'recompiling\n'
              'uniform vec3 hal_eye;\n'
+             # R238: the camera's axes, for a key fixed to the camera
+             'uniform vec3 hal_cam_right;\n'
+             'uniform vec3 hal_cam_up;\n'
+             'uniform vec3 hal_cam_back;\n'
              + ('uniform sampler2D hal_gb_idslin;\n' if affine_uv else '')
              + ('uniform sampler2D hal_stipple;\n'
                 if (consts.get('stipple') and not secondary) else '')
@@ -2974,6 +3752,78 @@ void main()
              f'    s.specular = '
              f'{_mv3(consts, bake.get("specular", (1, 1, 1)))};'),
         ]
+    lines += [
+        (f'    s.anime_shadow1 = {perpix_exprs["anime_shadow1"]};'
+         if 'anime_shadow1' in perpix_exprs else
+         f'    s.anime_shadow1 = '
+         f'{_mv3(consts, bake.get("anime_shadow1", (0.62, 0.44, 0.48)))};'),
+        (f'    s.anime_shadow2 = {perpix_exprs["anime_shadow2"]};'
+         if 'anime_shadow2' in perpix_exprs else
+         f'    s.anime_shadow2 = '
+         f'{_mv3(consts, bake.get("anime_shadow2", (0.38, 0.26, 0.38)))};'),
+        # R228: the cartoon paint tones
+        (f'    s.cartoon_shadow = {perpix_exprs["cartoon_shadow"]};'
+         if 'cartoon_shadow' in perpix_exprs else
+         f'    s.cartoon_shadow = '
+         f'{_mv3(consts, bake.get("cartoon_shadow", (0.55, 0.45, 0.62)))};'),
+        (f'    s.cartoon_hl_color = {perpix_exprs["cartoon_hl_color"]};'
+         if 'cartoon_hl_color' in perpix_exprs else
+         f'    s.cartoon_hl_color = '
+         f'{_mv3(consts, bake.get("cartoon_hl_color", (1.0, 1.0, 1.0)))};'),
+        # R229: the 80s anime tones
+        (f'    s.anime_shine_color = {perpix_exprs["anime_shine_color"]};'
+         if 'anime_shine_color' in perpix_exprs else
+         f'    s.anime_shine_color = '
+         f'{_mv3(consts, bake.get("anime_shine_color", (1.0, 1.0, 1.0)))};'),
+        # R241: the second band's own tint
+        (f'    s.anime_shine_color2 = {perpix_exprs["anime_shine_color2"]};'
+         if 'anime_shine_color2' in perpix_exprs else
+         f'    s.anime_shine_color2 = '
+         f'{_mv3(consts, bake.get("anime_shine_color2", (1.0, 1.0, 1.0)))};'),
+        (f'    s.anime_air_color = {perpix_exprs["anime_air_color"]};'
+         if 'anime_air_color' in perpix_exprs else
+         f'    s.anime_air_color = '
+         f'{_mv3(consts, bake.get("anime_air_color", (0.82, 0.62, 0.62)))};'),
+        # R243: the Max Multi-Layer's second highlight colour and the
+        # Max Translucent's colour (constants: the probe refuses a chain)
+        f'    s.specular2 = '
+        f'{_mv3(consts, bake.get("specular2", (0.9, 0.9, 0.9)))};',
+        f'    s.translucent_color = '
+        f'{_mv3(consts, bake.get("translucent_color", (0.0, 0.0, 0.0)))};',
+        # R238: the key's own-frame vector (per material, never per pixel)
+        f'    s.cel_dir = '
+        f'{_mv3(consts, bake.get("cel_dir", (0.0, 0.0, 1.0)))};',
+    ]
+    if (bool(bake.get('__cartoon')) or bool(bake.get('__anime'))) \
+            and not vertex_rate and (
+            'cartoon_smooth' in perpix_exprs
+            or float(bake.get('cartoon_smooth', 0.0) or 0.0) > 1e-6):
+        # R228: render.cartoon_smooth_normal -- the shading normal mixed
+        # toward the normal of a sphere around the object's bounding-box
+        # centre, from the SAME per-object bounds Generated coordinates
+        # read (hal_gen_lo/span, keyed by td.y), BEFORE ambient, the
+        # lamps, the shadow queries and the silhouette cheats -- exactly
+        # where light_surface bends it
+        # R238: the shape -- 0 the sphere, 1 an upright cylinder (the
+        # radial with no z), 2 the camera (the normal bent toward V)
+        shp = int(round(float(bake.get('cel_shape', 0.0) or 0.0)))
+        if shp == 1:
+            tgt = ['    vec3 hal_crel = P - hal_ccen;',
+                   '    vec3 hal_csph = normalize(vec3(hal_crel.x, '
+                   'hal_crel.y, 0.0));']
+        elif shp == 2:
+            tgt = ['    vec3 hal_csph = V;']
+        else:
+            tgt = ['    vec3 hal_csph = normalize(P - hal_ccen);']
+        lines += [
+            '    {',
+            '    vec3 hal_ccen = hal_gen_lo(td.y) '
+            '+ hal_gen_span(td.y) * 0.5;',
+        ] + tgt + [
+            '    N = normalize(N + (hal_csph - N) '
+            '* clamp(s.cartoon_smooth, 0.0, 1.0));',
+            '    }',
+        ]
     if vertex_rate:
         # Gouraud/flat: fetch the three CPU-lit corners of THIS pixel's
         # triangle, interpolate by the G-buffer's own perspective
@@ -3033,6 +3883,29 @@ void main()
     if bi_meta.get('result_mode'):
         lines.append('    vec3 hal_dacc = vec3(0.0);')
         lines.append('    vec3 hal_sacc = vec3(0.0);')
+    cartoon_on = bool(bake.get('__cartoon')) and not (vertex_rate
+                                                      or shadeless)
+    if cartoon_on:
+        # R228: the paint accumulators light_surface's CARTOON branch
+        # keeps -- the strongest lit verdict, the strongest highlight
+        # gate, the Lamp Influence energy
+        lines += [
+            '    float hal_cart_lit = 0.0;',
+            '    float hal_cart_hl = 0.0;',
+            '    vec3 hal_cart_rad = vec3(0.0);',
+        ]
+    cel_key_on = bool(bake.get('__cel_key')) and not (vertex_rate
+                                                      or shadeless)
+    cel_field_on = bool(bake.get('__cel_field')) and not (vertex_rate
+                                                          or shadeless)
+    if cel_field_on:
+        # R238: the frame's cel field at this pixel (.r screen shadow,
+        # .g depth rim), once before the lamps
+        lines.append('    vec4 hal_cel = hal_cel_at();')
+    if cel_key_on:
+        # R238: the strongest caster's visibility, -1 until a caster
+        # reaches this object -- light_surface's vis_acc
+        lines.append('    float hal_vkey = -1.0;')
     # R167: the RAYBIAS terminator twin's per-pixel inputs, once before
     # the light loop -- light_surface's pc_smooth (the interpolated
     # normal differs from the STORED face normal: the same texel FACE
@@ -3060,6 +3933,9 @@ void main()
         lines += _one_light_source(i, light, consts,
                                    shadowed=shadows[i], bake=bake,
                                    bi=bi_meta)
+    if cel_key_on:
+        # R238: the fixed key's own block, after the casters
+        lines += _cel_key_source(consts, bake)
     if bi_meta.get('result_mode'):
         # the RESULT ramps: band and blend the whole accumulation, then
         # one clamp -- exactly light_surface's track_result tail
@@ -3131,6 +4007,126 @@ void main()
             lines.append(f'    hal_lpart = min(hal_lpart, '
                          f'vec3({_f(clamp_l)}));')
         lines.append('    total += hal_lpart;')
+    if cartoon_on:
+        # R228: render._cartoon_compose, the same operations in the
+        # same order -- the shadow tone by mode (0 transparent cel, 1
+        # painted, 2 none), the lit paint under Lamp Influence, the lit
+        # step between them, the highlight painted OVER, then the
+        # diffuse level. The paint REPLACES the accumulation: no
+        # ambient, no lamp energy unless asked.
+        lines += [
+            '    float hal_ct0 = clamp((hal_cart_lit - (s.cartoon_th '
+            '- s.cartoon_soft)) / max(2.0 * s.cartoon_soft, 1e-6), '
+            '0.0, 1.0);',
+            '    float hal_ct = hal_ct0 * hal_ct0 * (3.0 - 2.0 * hal_ct0);',
+            '    float hal_camt = clamp(s.cartoon_amount, 0.0, 1.0);',
+            '    vec3 hal_ctrans = s.diffuse * (vec3(1.0) '
+            '+ (s.cartoon_shadow - vec3(1.0)) * hal_camt);',
+            '    vec3 hal_cpaint = s.diffuse + (s.cartoon_shadow '
+            '- s.diffuse) * hal_camt;',
+            '    vec3 hal_cshade = (s.cartoon_mode > 1.5) ? s.diffuse : '
+            '((s.cartoon_mode > 0.5) ? hal_cpaint : hal_ctrans);',
+            '    float hal_cli = clamp(s.cartoon_lamp, 0.0, 1.0);',
+            '    vec3 hal_clit = s.diffuse * (1.0 - hal_cli) '
+            '+ s.diffuse * hal_cart_rad * hal_cli;',
+            '    vec3 hal_cbase = hal_cshade + (hal_clit - hal_cshade) '
+            '* hal_ct;',
+        ]
+        if 'anime_air' in perpix_exprs or \
+                float(bake.get('anime_air', 0.0) or 0.0) > 1e-6:
+            # R238: the airbrush against the paint's shadow edge --
+            # render._cartoon_compose's call, on the cartoon threshold
+            lines += _airbrush_lines('hal_cbase', 'hal_cart_lit',
+                                     's.cartoon_th')
+        lines += [
+            '    float hal_chk = clamp(hal_cart_hl, 0.0, 1.0);',
+            '    hal_cbase = hal_cbase + (s.cartoon_hl_color - hal_cbase) '
+            '* hal_chk;',
+            '    total = hal_cbase * s.diffuse_level;',
+        ]
+    if (bool(bake.get('__anime')) or bool(bake.get('__cartoon'))) \
+            and not (vertex_rate or shadeless) and (
+            'anime_shine' in perpix_exprs
+            or float(bake.get('anime_shine', 0.0) or 0.0) > 1e-6):
+        # R229: render._anime_hair_shine -- the band at a fraction of
+        # the object's height (hal_generated.z), its edge waving with
+        # the azimuth about the bounds centre, on the camera-facing
+        # surface, fading only on the underside; a thinner second band
+        # below; painted OVER the banded result. R241 (the hair pass):
+        # the CARTOON master wears it too; the wave's shape and phase,
+        # the follow toward the key's height and the second band's own
+        # tint -- the same operations render.py runs, the shape and
+        # the key picked STATICALLY per material (props and lamp
+        # types, never per pixel)
+        shape_i = int(round(float(bake.get('anime_shine_shape', 0.0)
+                                  or 0.0)))
+        if shape_i == 1:
+            wav_l = ['    float hal_hq = hal_harg * 0.159154937 - 0.25;',
+                     '    float hal_hwv = 4.0 * abs(hal_hq '
+                     '- floor(hal_hq) - 0.5) - 1.0;']
+        elif shape_i == 2:
+            wav_l = ['    float hal_hwv = 1.0 - 2.0 '
+                     '* abs(sin(hal_harg * 0.5));']
+        elif shape_i == 3:
+            wav_l = ['    float hal_hwv = (sin(hal_harg) >= 0.0) '
+                     '? 1.0 : -1.0;']
+        else:
+            wav_l = ['    float hal_hwv = sin(hal_harg);']
+        kz_expr = None
+        if float(bake.get('anime_shine_follow', 0.0) or 0.0) > 1e-6:
+            _clm = int(round(float(bake.get('cel_light', 0.0) or 0.0)))
+            if _clm == 1:
+                kz_expr = ('(hal_cam_right.z * s.cel_dir.x '
+                           '+ hal_cam_up.z * s.cel_dir.y '
+                           '+ hal_cam_back.z * s.cel_dir.z)')
+            elif _clm == 2:
+                kz_expr = 'normalize(s.cel_dir).z'
+            else:
+                _ki = int(consts.get('cel_key_index', -1))
+                if 0 <= _ki < len(lights) and str(getattr(
+                        lights[_ki], 'type', '')).upper() in ('SUN',
+                                                              'HEMI'):
+                    kz_expr = _lref(_ki, 1, 'z')
+        hh_line = '    float hal_hh = s.anime_shine_h' + (
+            f' + s.anime_shine_follow * (0.35 * {kz_expr});'
+            if kz_expr else ';')
+        lines += [
+            '    {',
+            '    vec3 hal_hcen = hal_gen_lo(td.y) '
+            '+ hal_gen_span(td.y) * 0.5;',
+            '    float hal_haz = atan(P.y - hal_hcen.y, P.x - hal_hcen.x);',
+            '    float hal_ht = hal_generated.z;',
+            '    float hal_ham = clamp(s.anime_shine, 0.0, 1.0);',
+            '    float hal_hw = max(s.anime_shine_w, 1e-4) * 0.5;',
+            '    float hal_hs = max(s.anime_shine_soft, 1e-4);',
+            '    float hal_harg = s.anime_shine_waves * hal_haz '
+            '+ s.anime_shine_angle * 0.0174532924;',
+        ] + wav_l + [
+            hh_line,
+            '    float hal_h0 = hal_hh + s.anime_shine_wave * hal_hwv;',
+            '    float hal_hb1 = hal_sstep(hal_h0 - hal_hw - hal_hs, '
+            'hal_h0 - hal_hw + hal_hs, hal_ht) '
+            '* (1.0 - hal_sstep(hal_h0 + hal_hw - hal_hs, '
+            'hal_h0 + hal_hw + hal_hs, hal_ht));',
+            '    float hal_h2 = hal_h0 - s.anime_shine_second;',
+            '    float hal_hw2 = hal_hw * 0.5;',
+            '    float hal_hb2 = hal_sstep(hal_h2 - hal_hw2 - hal_hs, '
+            'hal_h2 - hal_hw2 + hal_hs, hal_ht) '
+            '* (1.0 - hal_sstep(hal_h2 + hal_hw2 - hal_hs, '
+            'hal_h2 + hal_hw2 + hal_hs, hal_ht)) * 0.85;',
+            '    float hal_hb2m = (s.anime_shine_second > 1e-6) '
+            '? hal_hb2 : 0.0;',
+            '    float hal_hb = max(hal_hb1, hal_hb2m);',
+            '    float hal_hf = hal_sstep(0.0, 0.35, dot(N, V));',
+            '    float hal_hu = hal_sstep(-0.3, 0.1, N.z);',
+            '    float hal_hk = hal_ham * hal_hb * hal_hf * hal_hu;',
+            '    vec3 hal_hcol = (hal_hb2m > hal_hb1) '
+            '? s.anime_shine_color * s.anime_shine_color2 '
+            ': s.anime_shine_color;',
+            '    total = total * (1.0 - hal_hk) '
+            '+ hal_hcol * hal_hk;',
+            '    }',
+        ]
     if not vertex_rate and not shadeless \
             and consts.get('clamp_specular', True):
         lines.append('    total = min(total, vec3(64.0));')
@@ -3161,11 +4157,19 @@ void main()
     if not vertex_rate and not shadeless \
             and float(bake.get('rim', 0.0)) > 1e-4:
         rp = max(float(bake.get('rim_power', 3.0)), 0.01)
+        if float(bake.get('cel_rim_mode', 0.0) or 0.0) > 0.5 and (
+                bool(bake.get('__anime')) or bool(bake.get('__cartoon'))):
+            # R238: the depth rim -- the cel field's mask times Rim
+            # Amount, in place of the Fresnel power (zero where the
+            # pass reads no field: a layer, a hit -- the CPU's own)
+            rim_expr = (f'(hal_cel.g * {_mv(consts, bake["rim"])})'
+                        if cel_field_on else '0.0')
+        else:
+            rim_expr = (f'(pow(hal_sil, {_mv(consts, rp)})'
+                        f' * {_mv(consts, bake["rim"])})')
         _layer_blend_lines(
             lines, consts, int(round(float(bake.get('rim_blend', 0.0)))),
-            'hal_rmf',
-            f'(pow(hal_sil, {_mv(consts, rp)})'
-            f' * {_mv(consts, bake["rim"])})',
+            'hal_rmf', rim_expr,
             _mv3(consts, bake.get('rim_color', (1, 1, 1))))
     # matcap: the whole lit result lands by its blend menu, exactly as
     # apply_surface_effects -- after fresnel and rim, before the backface.
@@ -3274,6 +4278,12 @@ void main()
                 '    hal_alpha = clamp(hal_alpha * (1.0 - hal_eo_t) + '
                 f'{_mv(consts, eo)} * hal_eo_t, 0.0, 1.0);',
             ]
+        ac = float(bake.get('alpha_clip', -1.0))
+        if ac >= 0.0:
+            # R211 punch-through law, exactly the CPU's: a CLIP material
+            # is fully there or fully absent, after the whole chain
+            lines.append(f'    hal_alpha = (hal_alpha >= '
+                         f'{_f(max(ac, 1e-6))}) ? 1.0 : 0.0;')
         lines.append('    Color = vec4(total * keep, hal_alpha * keep);')
     elif consts.get('stipple') and not secondary:
         # Screen Door: shade_batch's own chain -- clamp, the hard
@@ -3295,6 +4305,10 @@ void main()
         if thr > 0.0:
             lines.append(f'    hal_alpha = (hal_alpha >= {_f(thr)}) '
                          '? hal_alpha : 0.0;')
+        ac = float(bake.get('alpha_clip', -1.0))
+        if ac >= 0.0:
+            lines.append(f'    hal_alpha = (hal_alpha >= '
+                         f'{_f(max(ac, 1e-6))}) ? 1.0 : 0.0;')
         rw, rh = consts.get('resolution', (1.0, 1.0))
         lines += [
             f'    float hal_spx = mod(floor(vUV.x * {_f(float(rw))}), '

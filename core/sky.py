@@ -15,7 +15,7 @@ from . import mathx as M
 from .patterns import fbm, hash3 as _hash3, turbulence, value_noise as _value_noise
 
 MODES = ('NODES', 'SOLID', 'GRADIENT', 'BANDS', 'STARFIELD', 'BRYCE',
-         'PHYSICAL', 'HDRI')
+         'PHYSICAL', 'HDRI', 'PAINTED')
 
 
 def _rotate_z(d, angle):
@@ -126,6 +126,197 @@ def bands(world, dirs):
         b = quantise(_blend(np.power(below, falloff), world.blend_mode))[:, None]
         sky = np.where(up[:, None] < height, hor + (gnd - hor) * b, sky)
     return sky.astype(np.float32)
+
+
+# ------------------------------------------------------- R233: painted sky
+
+#: the painted sky's era looks: World field values the Look menu writes
+#: (CUSTOM writes nothing). Named after the background departments they
+#: imitate, not after any studio's own colour keys.
+PAINTED_LOOKS = {
+    'GOUACHE_DAY': {
+        'horizon': (0.60, 0.74, 0.80), 'zenith': (0.20, 0.40, 0.74),
+        'gradient_falloff': 0.55, 'blend_mode': 'SMOOTH',
+        'paint_streaks': 0.35, 'paint_streak_scale': 12.0,
+        'paint_streak_angle': 0.0, 'paint_dabs': 0.0,
+        'paint_clouds': 0.4, 'paint_cloud_scale': 2.2,
+        'paint_cloud_softness': 0.25,
+        'paint_cloud_color': (0.99, 0.98, 0.95),
+        'paint_cloud_shadow': (0.60, 0.63, 0.75), 'paint_cloud_height': 0.05,
+        'paint_paper': 0.3, 'paint_paper_scale': 8.0, 'paint_wash': 0.2,
+    },
+    'WATERCOLOUR_DUSK': {
+        'horizon': (0.93, 0.72, 0.52), 'zenith': (0.30, 0.34, 0.56),
+        'gradient_falloff': 0.5, 'blend_mode': 'SMOOTH',
+        'paint_streaks': 0.2, 'paint_streak_scale': 9.0,
+        'paint_streak_angle': 0.0, 'paint_dabs': 0.0,
+        'paint_clouds': 0.35, 'paint_cloud_scale': 1.6,
+        'paint_cloud_softness': 0.6,
+        'paint_cloud_color': (0.98, 0.84, 0.72),
+        'paint_cloud_shadow': (0.52, 0.42, 0.56), 'paint_cloud_height': 0.0,
+        'paint_paper': 0.45, 'paint_paper_scale': 7.0, 'paint_wash': 0.6,
+    },
+    'FLEISCHER_NIGHT': {
+        'horizon': (0.075, 0.065, 0.095), 'zenith': (0.010, 0.012, 0.030),
+        'gradient_falloff': 0.8, 'blend_mode': 'SMOOTH',
+        'paint_streaks': 0.35, 'paint_streak_scale': 10.0,
+        'paint_streak_angle': -8.0, 'paint_dabs': 0.0,
+        'paint_clouds': 0.5, 'paint_cloud_scale': 1.8,
+        'paint_cloud_softness': 0.1,
+        'paint_cloud_color': (0.115, 0.105, 0.140),
+        'paint_cloud_shadow': (0.018, 0.018, 0.032), 'paint_cloud_height': 0.05,
+        'paint_paper': 0.2, 'paint_paper_scale': 8.0, 'paint_wash': 0.15,
+    },
+    'STORYBOARD': {
+        'horizon': (0.90, 0.89, 0.86), 'zenith': (0.72, 0.72, 0.70),
+        'gradient_falloff': 1.0, 'blend_mode': 'LINEAR',
+        'paint_streaks': 0.25, 'paint_streak_scale': 14.0,
+        'paint_streak_angle': 4.0, 'paint_dabs': 0.0,
+        'paint_clouds': 0.3, 'paint_cloud_scale': 2.0,
+        'paint_cloud_softness': 0.05,
+        'paint_cloud_color': (0.96, 0.96, 0.94),
+        'paint_cloud_shadow': (0.62, 0.62, 0.60), 'paint_cloud_height': 0.05,
+        'paint_paper': 0.4, 'paint_paper_scale': 9.0, 'paint_wash': 0.1,
+    },
+}
+
+PAINTED_LOOK_ITEMS = (
+    ('CUSTOM', "Custom", "Your own dials"),
+    ('GOUACHE_DAY', "Gouache Day",
+     "A feature background department's daytime sky: opaque gouache, "
+     "brushed flat, cumulus with a shadowed underside"),
+    ('WATERCOLOUR_DUSK', "Watercolour Dusk",
+     "A 1930s short's sky: a wet wash from warm horizon to cool zenith, "
+     "soft clouds, the paper's granulation showing"),
+    ('FLEISCHER_NIGHT', "Fleischer Night",
+     "The Superman sky: near-black deco gradient, heavy low cloud, the "
+     "brush dragged diagonally, a dark palette"),
+    ('STORYBOARD', "Storyboard",
+     "Grey wash on toothy board, dry-brushed clouds -- the sky a story "
+     "sketch has"),
+)
+
+
+def apply_painted_look(world, key):
+    """Write a look's dials onto the world (CUSTOM writes nothing)."""
+    look = PAINTED_LOOKS.get(str(key))
+    if not look:
+        return False
+    for k, v in look.items():
+        setattr(world, k, v)
+    return True
+
+
+def painted(world, dirs):
+    """A background painting on a flat panel in front of the camera.
+
+    The panel faces the camera `paint_angle` degrees round from +X, one
+    unit away, so a direction's panel point is its tangent coordinate
+    (d.r / d.f, d.z / d.f) -- exact arithmetic, no seam in front, the
+    picture crossed by a pan and climbed by a tilt the way the animation
+    stand's background was. Directions behind the panel fade to the plain
+    gradient over the last 10 degrees of grazing, the back of the stage.
+
+    On the panel, in the order the painter worked: the gradient in flat
+    colour, the clouds (a four-octave field thresholded by coverage,
+    biased above the horizon, its edge dry-brushed or airbrushed by
+    Softness, lit on top and shadowed beneath by the field's own vertical
+    difference), the brush's streaks (value noise stretched along the
+    stroke direction, two octaves), optional impasto dabs (the 1.75 Paint
+    Strokes field, the costly part), the board's tooth, and a watercolour
+    granulation as pigment density in Bousseau's law
+    C' = C - (C - C^2)(d - 1).
+    """
+    from . import media as MD
+    base = gradient(world, dirs)
+    ang = np.radians(float(getattr(world, 'paint_angle', 90.0)))
+    fx, fy = np.float32(np.cos(ang)), np.float32(np.sin(ang))
+    d = dirs.astype(np.float32)
+    df = d[:, 0] * fx + d[:, 1] * fy
+    dfc = np.maximum(df, np.float32(0.08))
+    x = (d[:, 0] * fy - d[:, 1] * fx) / dfc
+    y = d[:, 2] / dfc
+    salt = MD.salt_for(int(getattr(world, 'paint_seed', 0)), 0, 0)
+    col = base.copy()
+
+    # ---- clouds
+    cover = float(np.clip(getattr(world, 'paint_clouds', 0.35), 0.0, 1.0))
+    if cover > 0.0:
+        cs = np.float32(max(float(getattr(world, 'paint_cloud_scale', 2.2)),
+                            0.05))
+        soft = float(np.clip(getattr(world, 'paint_cloud_softness', 0.3),
+                             0.0, 1.0))
+        height = float(getattr(world, 'paint_cloud_height', 0.2))
+
+        def field(px, py, k):
+            # three octaves, stretched: the summed noises crowd the middle
+            # and a cloud is a SHAPE, not a haze
+            f = (MD._n2(px * cs, py * cs, salt, k) * 0.55
+                 + MD._n2(px * cs * 2.0, py * cs * 2.0, salt, k + 1) * 0.3
+                 + MD._n2(px * cs * 4.0, py * cs * 4.0, salt, k + 2) * 0.15)
+            return (f - 0.5) * 2.4 + 0.5
+        c = field(x, y, 10)
+        # the edge: a dry brush leaves it ragged, an airbrush smooth
+        c = c + (1.0 - soft) * 0.16 * (MD._n2(x * cs * 9.0, y * cs * 9.0,
+                                              salt, 14) - 0.5)
+        hb = MD.smoothstep(height - 0.2, height + 0.1, y)
+        thr = 1.0 - 0.9 * cover * hb
+        e = 0.01 + soft * 0.10
+        cov = MD.smoothstep(thr - e, thr + e, c)
+        # lit on top, shadowed beneath: the coarsest octave's vertical
+        # difference says which side of the blob this is
+        c1 = MD._n2(x * cs, y * cs, salt, 10)
+        cu1 = MD._n2(x * cs, (y + np.float32(0.3) / cs) * cs, salt, 10)
+        bottom = MD.smoothstep(-0.03, 0.06, cu1 - c1)
+        lit = np.asarray(getattr(world, 'paint_cloud_color',
+                                 (0.97, 0.96, 0.93)), np.float32)[None, :]
+        shd = np.asarray(getattr(world, 'paint_cloud_shadow',
+                                 (0.58, 0.60, 0.70)), np.float32)[None, :]
+        ccol = lit + (shd - lit) * (bottom * 0.85)[:, None]
+        col = col + (ccol - col) * (cov * 0.95)[:, None]
+
+    # ---- the brush: streaks along the stroke direction
+    streaks = float(np.clip(getattr(world, 'paint_streaks', 0.5), 0.0, 1.0))
+    sc = np.float32(max(float(getattr(world, 'paint_streak_scale', 12.0)),
+                        0.05))
+    c0, s0 = MD.rotation(float(getattr(world, 'paint_streak_angle', 0.0)))
+    u = x * c0 + y * s0
+    v = -x * s0 + y * c0
+    if streaks > 0.0:
+        st1 = MD._n2(u * sc * 0.3, v * sc * 2.5, salt, 20)
+        st2 = MD._n2(u * sc * 0.9, v * sc * 7.0, salt, 21)
+        streak = st1 * 0.65 + st2 * 0.35 - 0.5
+        col = col * (1.0 + streaks * 0.5 * streak)[:, None]
+    dabs = float(np.clip(getattr(world, 'paint_dabs', 0.0), 0.0, 1.0))
+    if dabs > 0.0:
+        ds = np.float32(max(float(getattr(world, 'paint_dab_scale', 10.0)),
+                            0.05))
+        val, alpha, _sid = MD.paint_strokes(x * ds, y * ds, (c0, s0), 2.6,
+                                            0.85, MD.paint_slope(0.9), 0.6,
+                                            0.3, salt + 1)
+        col = col * (1.0 + dabs * 0.5 * (val - 1.0) * alpha)[:, None]
+
+    # ---- the board and the water
+    paper = float(np.clip(getattr(world, 'paint_paper', 0.3), 0.0, 1.0))
+    ps = np.float32(max(float(getattr(world, 'paint_paper_scale', 8.0)), 0.05))
+    if paper > 0.0:
+        # the board: two tooth octaves and one run of fibres
+        t1 = MD._n2(x * ps, y * ps, salt, 40)
+        t2 = MD._n2(x * ps * 2.6, y * ps * 2.6, salt, 41)
+        fb = MD._n2(x * ps * 0.15, y * ps * 1.8, salt, 42)
+        tooth = t1 * 0.55 + t2 * 0.3 + fb * 0.15
+        col = col * (1.0 + paper * 0.8 * (tooth - 0.5))[:, None]
+    wash = float(np.clip(getattr(world, 'paint_wash', 0.25), 0.0, 1.0))
+    if wash > 0.0:
+        g = MD._n2(x * ps * 1.4, y * ps * 1.4, salt, 30)
+        dens = (1.0 + wash * 1.6 * (g - 0.5))[:, None]
+        cc = np.clip(col, 0.0, 1.0)
+        col = cc - (cc - cc * cc) * (dens - 1.0)
+
+    # ---- the back of the stage
+    w = MD.smoothstep(0.0, 0.18, df)[:, None]
+    out = base + (col - base) * w
+    return np.clip(out, 0.0, None).astype(np.float32)
 
 
 def starfield(world, dirs):
@@ -1467,6 +1658,8 @@ def evaluate(world, dirs, textures=None, strength=True, eye=None,
         col = physical(world, dirs)
     elif mode == 'HDRI':
         col = hdri(world, dirs, textures or {})
+    elif mode == 'PAINTED':
+        col = painted(world, dirs)
     else:
         return None                      # caller falls back to the node graph
     if strength:

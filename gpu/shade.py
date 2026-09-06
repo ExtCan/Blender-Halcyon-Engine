@@ -48,9 +48,24 @@ EXTRA_SCALARS = ('fresnel', 'fresnel_power', 'rim', 'rim_power',
                  'reflect', 'refraction', 'edge_opacity',
                  # the BI panel round's CPU-consumed ray constants
                  'ray_ior', 'bi_ray_filter', 'bi_mir_fresnel',
-                 'bi_mir_blend', 'use_mist')
-EXTRA_COLORS = ('fresnel_color', 'rim_color', 'sheen_color', 'matcap',
-                'backface_color', 'reflect_color')
+                 'bi_mir_blend', 'use_mist',
+                 # R211 punch-through: >= 0 is the CLIP threshold; the
+                 # layer/stipple chains emit the CPU's hard 0/1 law
+                 'alpha_clip')
+EXTRA_COLORS = ('anime_shine_color2',
+                # R243: the Max Multi-Layer's second highlight colour, the
+                # Max Translucent's colour
+                'specular2', 'translucent_color',
+                'fresnel_color', 'rim_color', 'sheen_color', 'matcap',
+                'backface_color', 'reflect_color',
+                # the anime tone colours (R218)
+                'anime_shadow1', 'anime_shadow2',
+                # the cartoon paint tones (R228)
+                'cartoon_shadow', 'cartoon_hl_color',
+                # the 80s anime additions (R229)
+                'anime_shine_color', 'anime_air_color',
+                # R238: the cel's key, in its own frame
+                'cel_dir')
 
 #: models the GLSL dispatch reproduces at pixel rate. GOURAUD and FLAT are
 #: shading rates (the corner-light road carries them); WIREFRAME and
@@ -82,6 +97,57 @@ def _constant(arr, tol=1e-5):
         return True, 0.0
     spread = float(np.ptp(a, axis=0).max()) if a.ndim > 1 else float(np.ptp(a))
     return spread <= tol, spread
+
+
+def _cel_field_of(job, gbuf):
+    """R238: the frame's cel field -- the render's own lazy builder when
+    the job carries one, else computed here from the job's camera (a
+    job built by hand, as the parity harness does), None when no
+    material reads it."""
+    lazy = getattr(job, 'cel_lazy', None)
+    if lazy is not None:
+        return lazy()
+    from ..core import celfield as CF
+    if not CF.field_on(job.scene, job.settings):
+        return None
+    from ..core.render import camera_matrices
+    view, proj, vp, _eye = camera_matrices(job.scene.camera, job.width,
+                                           job.height)
+    field = CF.compute(job.scene, job.scene.mesh, gbuf, view, proj, vp,
+                       getattr(job.scene, 'camera', None), job.settings)
+    job.cel_lazy = lambda f=field: f
+    return field
+
+
+def _cel_atlas_entry(field):
+    """R238: the cel field as an upload-cached texture entry: .r the
+    screen shadow, .g the depth rim, keyed on the field's own bytes
+    (a frame's field is per-frame data, like the lamps' values)."""
+    import zlib
+    ss = np.asarray(field['ss'], np.float32)
+    rim = np.asarray(field['rim'], np.float32)
+    key = ('celfield', int(ss.shape[1]), int(ss.shape[0]),
+           int(zlib.adler32(ss.tobytes())), int(zlib.adler32(rim.tobytes())))
+
+    def _build(_ss=ss, _rim=rim):
+        img = np.zeros(_ss.shape + (4,), np.float32)
+        img[..., 0] = _ss
+        img[..., 1] = _rim
+        img[..., 3] = 1.0
+        return img
+
+    return key, _build
+
+
+def _cam_uniforms(job):
+    """R238: the camera's (right, up, back) axes as frame uniforms --
+    a key fixed to the camera composes its direction on them in the
+    shader, so an orbit changes three uniforms and re-plans nothing."""
+    from ..core.celfield import camera_axes
+    r, u, b = camera_axes(getattr(job.scene, 'camera', None))
+    return {'hal_cam_right': tuple(float(v) for v in r),
+            'hal_cam_up': tuple(float(v) for v in u),
+            'hal_cam_back': tuple(float(v) for v in b)}
 
 
 def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
@@ -196,9 +262,11 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
         # a bent normal qualifies exactly when the frame shader will bend
         # it identically: the master node's Normal chain, which the
         # assembler emits. Any other source of one still shades on the CPU.
-        from .material import master_normal_linked
-        if not master_normal_linked(getattr(mat, 'graph', None)
-                                    if mat is not None else None):
+        from .material import master_faceted, master_normal_linked
+        _g = getattr(mat, 'graph', None) if mat is not None else None
+        # R242: Max's Faceted bends it to the stored face normal, which
+        # the assembler substitutes (hal_triaux) exactly as the CPU does
+        if not master_normal_linked(_g) and not master_faceted(_g):
             return None, None, ('the graph bends the shading normal outside '
                                 "the master shader's Normal socket")
     rate = str(RATE_FOR_MODEL.get(model, st.shading_rate))
@@ -238,6 +306,15 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
             # alpha is forced to 1.0 after everything on the CPU, so these
             # fields cannot reach the picture; the GPU writes 1.0 too
             continue
+        if name == 'opacity' and mat is not None:
+            from ..core.scene import clip_road
+            if clip_road(mat)[0] is not None:
+                # R211/R213 punch-through: this material's visibility
+                # is resolved in the z-pass BEFORE shading and the law
+                # forces alpha to 1 at every promoted pixel, so the
+                # opacity chain cannot reach the picture through the
+                # frame pass -- it is inert here by construction
+                continue
         if stipple_mode and name == 'opacity':
             # Screen Door: opacity feeds the ordered threshold, not a
             # blend -- the frame pass emits the CPU's own chain (clamp,
@@ -253,10 +330,10 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
             return None, None, f'the material uses {name}, which needs the ' \
                                f'alpha compositing the deferred target ' \
                                f'does not do (Transparency NONE shades it)'
-    # (a genuinely varying opacity under Screen Door refuses through the
-    # BAKE_FIELDS constancy rule below -- 'opacity varies across the
-    # frame' -- because Opacity is not a per-pixel socket; the ordered
-    # threshold compares the baked constant on both devices)
+    # (R213: Opacity is a per-pixel socket now -- a linked chain is
+    # emitted and both devices threshold the same per-pixel alpha; an
+    # opacity varying WITHOUT a granted chain still refuses through the
+    # BAKE_FIELDS constancy rule below)
 
     bake = {'__rate': rate}
     if rate == 'PIXEL' and model in SHADELESS_MODELS:
@@ -268,6 +345,15 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
     perpix = set(per_pixel_fields(getattr(mat, 'graph', None)
                                   if mat is not None else None))
     for name in BAKE_FIELDS:
+        if name == 'opacity' and name in perpix and stipple_mode:
+            # R213 scope: the layer road takes the per-pixel Opacity
+            # chain (compositing is continuous; an ulp is an ulp), but
+            # Screen Door thresholds it against the ordered map -- a
+            # keep/drop CLIFF where a driver's last-bit rounding flips
+            # whole pixels. Cliffs refuse by name here.
+            return None, None, ('a per-pixel Opacity under Screen Door '
+                                'is a keep/drop cliff; the frame shades '
+                                'on the CPU, by name')
         if name in perpix:
             continue
         ok, spread = _constant(getattr(surf, name))
@@ -436,7 +522,7 @@ def _env_world(job):
             spec['soft'] = float(np.clip(getattr(world, 'band_softness',
                                                  0.0), 0.0, 1.0))
         return ('SKY_BANDS' if mode == 'BANDS' else 'SKY_GRAD', spec), None
-    if mode in ('STARFIELD', 'BRYCE', 'PHYSICAL', 'HDRI'):
+    if mode in ('STARFIELD', 'BRYCE', 'PHYSICAL', 'HDRI', 'PAINTED'):
         # rich skies take the CPU-composite path: the env term is the
         # LAST rgb term the CPU adds (fog frames refuse), and every
         # pixel it applies to is CPU-known -- so the renderer evaluates
@@ -495,6 +581,14 @@ def _shadow_meta(light, st, bvh=None):
     # shadows, RAY mode included (see lights.shadow)
     if getattr(st, 'ray_shadows', True) and (
             mode == 'RAY' or (sm is None and bvh is not None)):
+        # R208: the caster mask (Material.cast_shadow and friends) is a
+        # BVH cast filter on the CPU; the GLSL any-hit has no filter,
+        # so a frame with excluded casters routes its ray shadows to
+        # the CPU by name rather than shadowing with the wrong casters
+        if getattr(st, '_shadow_cast_tri', None) is not None:
+            return None, None, ('a material or object opts out of '
+                                'shadow casting; ray shadows honour '
+                                'the caster mask on the CPU')
         # exactly `visibility`'s RAY branch, decided per light
         if bvh is None:
             # the CPU only builds a BVH for shadow_default RAY (or the ray
@@ -650,11 +744,19 @@ def _light_sig(l):
     if cookie is not None:
         # a projected texture bakes its frame, strength and size into
         # the pass, and its pixels ride the upload cache: swap or edit
-        # the image and the plan must rebuild
+        # the image and the plan must rebuild. R219: the roll axes are
+        # baked literals too (rolling a lamp about its beam kept the
+        # direction and served a stale frame -- fixed in passing), and
+        # the extension/filter choices change the emitted lookup
         sig += ('cookie',
                 t(getattr(l, 'direction', (0, 0, -1))),
+                t(getattr(l, 'frame_x', None) or (0.0,)),
+                t(getattr(l, 'frame_y', None) or (0.0,)),
                 round(float(getattr(l, 'cookie_strength', 1.0)), 6),
                 round(float(getattr(l, 'cookie_scale', 10.0)), 6),
+                str(getattr(l, 'cookie_extend', 'AUTO') or 'AUTO'),
+                str(getattr(l, 'cookie_filter', 'BILINEAR')
+                    or 'BILINEAR'),
                 _cookie_sig(l))
     return sig
 
@@ -682,6 +784,43 @@ def _mat_sig(m):
             round(float(getattr(m, 'emission_level', 0.0)), 6),
             round(float(getattr(m, 'ior', 1.45)), 6),
             hash(repr(graph)) if graph else None)
+
+
+#: R216: node types whose output moves with the CLOCK. A material
+#: carrying one bakes probed constants (a rim colour fed by an
+#: Oscillator, a matcap crossfaded by Frame Blend) that are only right
+#: for the frame that probed them -- so the plan signature gains the
+#: frame for such scenes, values re-probe, and the SOURCES stay
+#: byte-identical (they carry texels, not literals): fresh values,
+#: zero recompiles. The field's report: "fresnel/rimlight/matcap
+#: colors don't update every frame".
+_TIME_NODES = frozenset({
+    'HALCYON_TimerNode', 'HALCYON_OscillatorNode', 'HALCYON_CounterNode',
+    'HALCYON_PulseNode', 'HALCYON_WobbleNode', 'HALCYON_FrameBlendNode',
+    'HALCYON_OnFrameNode', 'HALCYON_ColorCycleNode',
+    'HALCYON_FlipbookNode', 'HALCYON_StepTimeNode', 'HALCYON_WaveNode',
+    'HALCYON_ScrollNode'})
+#: these honour an 'animate' prop (default on)
+_TIME_NODES_ANIMATE = frozenset({
+    'HALCYON_StaticNode', 'HALCYON_WaterNode', 'HALCYON_CausticsNode',
+    'HALCYON_PlasmaNode', 'HALCYON_RipplesNode', 'HALCYON_UVWaveNode',
+    'HALCYON_RippleWarpNode', 'HALCYON_WaveWarpNode',
+    'HALCYON_OrbitNode', 'HALCYON_SpinNode'})
+
+
+def _scene_time_dependent(scene):
+    for m in (getattr(scene, 'materials', ()) or ()):
+        g = getattr(m, 'graph', None)
+        if not g:
+            continue
+        for nd in (g.get('nodes', {}) or {}).values():
+            bid = nd.get('bl_idname', '')
+            if bid in _TIME_NODES:
+                return True
+            if bid in _TIME_NODES_ANIMATE and \
+                    (nd.get('props') or {}).get('animate', True):
+                return True
+    return False
 
 
 def _plan_sig(job, mkey):
@@ -764,7 +903,22 @@ def _plan_sig(job, mkey):
         tuple(np.round(np.asarray(getattr(o, 'color', (1, 1, 1, 1)),
                                   np.float32), 5))
         for o in (getattr(scene, 'objects', ()) or ()))
-    return (mkey, st_sig, world_sig, shadow_sig, obcol_sig,
+    # R216: image CONTENT joins the signature (a strided sum per image)
+    # -- an image sequence advancing, or a repainted texture, must
+    # re-plan so the mip atlases re-upload; a name alone hid both
+    tex_sig = ()
+    try:
+        tex_sig = tuple(sorted(
+            (str(k), float(np.asarray(v.pixels)[::173, ::173].sum()))
+            for k, v in (getattr(job, 'textures', {}) or {}).items()
+            if getattr(v, 'pixels', None) is not None))
+    except Exception:                                           # noqa: BLE001
+        tex_sig = ()
+    clock = (int(getattr(scene, 'frame', 0)),
+             round(float(getattr(scene, 'time', 0.0)), 6)) \
+        if _scene_time_dependent(scene) else None
+    return (mkey, st_sig, world_sig, shadow_sig, obcol_sig, tex_sig,
+            clock,
             # whether a BVH exists decides the RAY branch (lit vs traced),
             # and its content is the mesh's, which mkey already fingerprints
             getattr(job, 'bvh', None) is not None,
@@ -886,6 +1040,16 @@ def plan_frame(job, gbuf, use_cache=True):
                                            lambda a=_arr: a)
                 hit = (h_passes, h_why, h_atlases)
                 _PLAN_CACHE[sig] = hit
+            if h_atlases and 'hal_celfield' in h_atlases:
+                # R238: the cel field is per-frame data too (the camera
+                # and the frame's own G-buffer shape it): a hit
+                # recomputes it from THIS frame and re-uploads
+                _cf = _cel_field_of(job, gbuf)
+                if _cf is not None:
+                    h_atlases = dict(h_atlases)
+                    h_atlases['hal_celfield'] = _cel_atlas_entry(_cf)
+                    hit = (h_passes, h_why, h_atlases)
+                    _PLAN_CACHE[sig] = hit
             return hit
 
     st = job.settings
@@ -1013,9 +1177,14 @@ def plan_frame(job, gbuf, use_cache=True):
     cookies = {}
     for i, l in enumerate(lights):
         ck = getattr(l, 'cookie', None)
-        if ck is None or l.type not in ('SPOT', 'SUN'):
+        if ck is None:
             continue
-        px = np.asarray(getattr(ck, 'pixels', ck), np.float32)
+        # R219: the PREPARED pixels -- source-size blur already baked in
+        # by the shared road the CPU sampler reads, so both devices
+        # sample identical texels; and every lamp kind projects now
+        px = LI.cookie_pixels(l)
+        if px is None:
+            continue
         if px.ndim == 2:
             px = px[:, :, None]
         if px.shape[2] < 4:
@@ -1028,6 +1197,11 @@ def plan_frame(job, gbuf, use_cache=True):
                 px.shape[0], float(px[::7, ::7].sum()))
         atlases[f'hal_cookie{i}'] = (ckey, (lambda p=px: p))
         s_ax, u_ax, f_ax = LI.cookie_frame(l)
+        try:
+            a_sx, a_sy = (float(v) for v in
+                          getattr(l, 'area_size', (1.0, 1.0))[:2])
+        except Exception:                                       # noqa: BLE001
+            a_sx = a_sy = 1.0
         cookies[i] = {
             'kind': l.type,
             'side': tuple(float(v) for v in s_ax),
@@ -1039,7 +1213,97 @@ def plan_frame(job, gbuf, use_cache=True):
             'strength': float(np.clip(getattr(l, 'cookie_strength', 1.0),
                                       0.0, 1.0)),
             'w': int(px.shape[1]), 'h': int(px.shape[0]),
+            'extend': LI.cookie_extend(l),
+            'filter': LI.cookie_filter(l),
+            'sx': max(a_sx, 1e-6), 'sy': max(a_sy, 1e-6),
         }
+
+    # R221: the anime Shadow Ramps -- bake (idempotent, cache-keyed) and
+    # pack every ramped material's LUT into one atlas, offsets by scene
+    # material index order. The lamp loop samples the SAME texels the
+    # CPU's _anime_ramp_sample reads, so the devices cannot disagree.
+    anime_ramps = {}
+    ramp_luts = []
+    from ..core.nodeeval import bake_anime_ramp
+    for mi_, m in enumerate(getattr(job.scene, 'materials', ()) or ()):
+        g = getattr(m, 'graph', None)
+        if not g or 'HALCYON_AnimeShaderNode' not in str(
+                g.get('nodes', {})):
+            continue
+        try:
+            spec = bake_anime_ramp(g, job.textures, job.settings)
+        except Exception:                                       # noqa: BLE001
+            spec = None
+        if spec is None:
+            continue
+        lut = spec['lut']
+        anime_ramps[mi_] = {'v0': sum(l.shape[0] for l in ramp_luts),
+                            'w': int(lut.shape[1]),
+                            'h': int(lut.shape[0])}
+        ramp_luts.append(lut)
+    if ramp_luts:
+        rkey = ('animeramp', len(ramp_luts),
+                tuple(round(float(l[::5, ::7].sum()), 4)
+                      for l in ramp_luts))
+
+        def build_ramps(_ls=tuple(ramp_luts)):
+            stack = np.concatenate(_ls, axis=0)
+            return np.concatenate(
+                [stack, np.ones(stack.shape[:2] + (1,), np.float32)],
+                axis=2)
+
+        atlases['hal_animeramp'] = (rkey, build_ramps)
+
+    # R239: the SDF face maps -- bake (idempotent, cache-keyed) and
+    # pack every face material's LUT into one atlas; the face's frame
+    # (from the first object wearing the material) bakes as literals,
+    # exactly the values render.face_frame hands the CPU lamp loop
+    anime_faces = {}
+    face_luts = []
+    from ..core.nodeeval import bake_face_sdf, face_frame
+    for mi_, m in enumerate(getattr(job.scene, 'materials', ()) or ()):
+        g = getattr(m, 'graph', None)
+        if not g or 'HALCYON_AnimeShaderNode' not in str(
+                g.get('nodes', {})):
+            continue
+        try:
+            fsp = bake_face_sdf(g, job.textures, job.settings)
+        except Exception:                                       # noqa: BLE001
+            fsp = None
+        if fsp is None:
+            continue
+        nd_f = next((nd for nd in g.get('nodes', {}).values()
+                     if nd.get('bl_idname') == 'HALCYON_AnimeShaderNode'),
+                    {})
+        p_f = nd_f.get('props', {})
+        fr = face_frame(job.scene, mi_,
+                        str(p_f.get('face_forward', 'NEG_Y')),
+                        str(p_f.get('face_up', 'POS_Z')))
+        if fr is None:
+            continue
+        lut_f = fsp['lut']
+        anime_faces[mi_] = {
+            'v0': sum(l.shape[0] for l in face_luts),
+            'w': int(lut_f.shape[1]), 'h': int(lut_f.shape[0]),
+            'fwd': tuple(float(v) for v in fr[0]),
+            'up': tuple(float(v) for v in fr[1]),
+            'right': tuple(float(v) for v in fr[2])}
+        face_luts.append(lut_f)
+    if face_luts:
+        fkey = ('facesdf', len(face_luts),
+                tuple(round(float(l[::5, ::7].sum()), 4)
+                      for l in face_luts),
+                tuple(sorted((k, sp['fwd'], sp['up'])
+                             for k, sp in anime_faces.items())))
+
+        def build_faces(_ls=tuple(face_luts)):
+            stack = np.concatenate(_ls, axis=0)
+            img = np.zeros(stack.shape + (4,), np.float32)
+            img[..., 0] = stack
+            img[..., 3] = 1.0
+            return img
+
+        atlases['hal_facesdf'] = (fkey, build_faces)
 
     # ray shadows: the BVH rides along as two textures shared by every ray
     # light, in the same cached-upload idiom as the map atlases, with the
@@ -1068,6 +1332,19 @@ def plan_frame(job, gbuf, use_cache=True):
             return img
 
         atlases['hal_circle'] = (('circle256', 1), _build_circle)
+
+    # R238: the cel field (the cel materials' screen shadow and depth
+    # rim), computed on the CPU from this frame's G-buffer -- the
+    # material passes read it per pixel as hal_celfield. The scene's
+    # key lamp (lines.key_light: the first non-ambient) carries the
+    # screen shadow under Scene Lamps
+    _cel_field = _cel_field_of(job, gbuf)
+    if _cel_field is not None:
+        atlases['hal_celfield'] = _cel_atlas_entry(_cel_field)
+    from ..core.lines import key_light as _key_light
+    _klight = _key_light(scene)
+    _cel_key_index = next((i for i, l in enumerate(lights)
+                           if l is _klight), -1)
 
     covered = gbuf.tri >= 0
     if covered.any():
@@ -1118,8 +1395,14 @@ def plan_frame(job, gbuf, use_cache=True):
         # per-object bounds for Generated coordinates: derived from the mesh,
         # which the plan signature already fingerprints
         'obj_bounds': job.object_bounds(),
+        # R243: the per-object inverse matrices, for Object coordinates
+        # (the Texture Coordinate node's Object output, Max's Object XYZ)
+        'obj_inv': job.object_matrices(),
         # the frame size, for coded shaders reading vScreenUV/iResolution
         'resolution': (float(job.width), float(job.height)),
+        # R238: the cel field rides this frame; the scene's key lamp
+        'cel_field': _cel_field is not None,
+        'cel_key_index': int(_cel_key_index),
         # the world->camera transform, baked into SSS passes: the
         # scatter tree lives in camera space, where shi->co lived
         'view_rows': tuple(
@@ -1227,6 +1510,9 @@ def plan_frame(job, gbuf, use_cache=True):
         # projected light textures: per-light frame/size/strength for the
         # loop's GLSL, keyed by light index (empty dict = none in the frame)
         'cookies': cookies,
+        # R221: packed anime Shadow Ramp offsets, keyed by material index
+        'anime_ramps': anime_ramps,
+        'anime_faces': anime_faces,
     }
 
     from .material import per_pixel_fields
@@ -1490,6 +1776,18 @@ def plan_frame(job, gbuf, use_cache=True):
                     float(getattr(m_l, 'opacity', 1.0)) < 0.999
                     or getattr(m_l, 'has_alpha', False)):
                 continue
+            if m_l is not None:
+                # R211/R213 punch-through: a material on the clip road
+                # (Alpha Mode Clip, or a Blend chain that provably
+                # yields only 0/1) never reaches the A-buffer -- its
+                # pixels resolve in the z-pass and shade with the
+                # OPAQUE frame -- so a layer pass for it would compile
+                # for nothing. One that could NOT lift its alpha out
+                # (refused, by name, in the render log) still blends:
+                # keep its layer pass.
+                from ..core.scene import clip_road
+                if clip_road(m_l)[0] is not None:
+                    continue
             mine_l = np.nonzero(m_all == mi)[0]
             try:
                 if mine_l.size:
@@ -2378,7 +2676,8 @@ def shade_fragments_frame(job, gbuf, tri, bary, px, py, rank):
     tside = holder.get('tside', int(tex_tris.width))
     uni = {'hal_attr_side': float(side), 'hal_slot_count': 4.0,
            'hal_tri_side': float(tside),
-           'hal_eye': tuple(float(v) for v in job.eye)}
+           'hal_eye': tuple(float(v) for v in job.eye),
+           **_cam_uniforms(job)}
 
     radfield = (atlases or {}).get('__radfield')
     if radfield is not None:
@@ -2394,7 +2693,7 @@ def shade_fragments_frame(job, gbuf, tri, bary, px, py, rank):
             rspec = {'samplers': list(rbinds.get('samplers', ())),
                      'floats': ['hal_attr_side', 'hal_slot_count',
                                 'hal_tri_side'],
-                     'vec3': ['hal_eye']}
+                     'vec3': ['hal_eye', 'hal_cam_right', 'hal_cam_up', 'hal_cam_back']}
             rshader, rerr = device.compile_dynamic('HAL_RADFIELD', rsrc,
                                                    rspec)
             if rshader is None:
@@ -2433,7 +2732,7 @@ def shade_fragments_frame(job, gbuf, tri, bary, px, py, rank):
                 'floats': ['hal_attr_side', 'hal_slot_count',
                            'hal_tri_side']
                 + list(binds.get('frame_uniforms', ())),
-                'vec3': ['hal_eye']}
+                'vec3': ['hal_eye', 'hal_cam_right', 'hal_cam_up', 'hal_cam_back']}
         shader, err = device.compile_dynamic(
             _pool_tag('HAL_TMAT', src, spec), src, spec)
         if shader is None:
@@ -2472,7 +2771,7 @@ def shade_fragments_frame(job, gbuf, tri, bary, px, py, rank):
                      'floats': ['hal_attr_side', 'hal_slot_count',
                                 'hal_tri_side']
                      + list(pbinds.get('frame_uniforms', ())),
-                     'vec3': ['hal_eye']}
+                     'vec3': ['hal_eye', 'hal_cam_right', 'hal_cam_up', 'hal_cam_back']}
             pshader, perr = device.compile_dynamic(
                 f'HAL_BUMP_{mat_id}_{uname}', psrc, pspec)
             if pshader is None:
@@ -2504,7 +2803,7 @@ def shade_fragments_frame(job, gbuf, tri, bary, px, py, rank):
                          'floats': ['hal_attr_side', 'hal_slot_count',
                                     'hal_tri_side']
                          + list(binds.get('frame_uniforms', ())),
-                         'vec3': ['hal_eye']}
+                         'vec3': ['hal_eye', 'hal_cam_right', 'hal_cam_up', 'hal_cam_back']}
                 shader, err = device.compile_dynamic(
                     _pool_tag(tag2, src, spec2), src, spec2)
                 if shader is None:
@@ -2862,6 +3161,9 @@ def simulate_fragments(job, gbuf, tri, bary, px, py, rank):
         uni2['hal_eye'] = np.tile(np.asarray(job.eye,
                                              np.float32)[None, :],
                                   (n, 1))
+        for _cn, _cv in _cam_uniforms(job).items():
+            uni2[_cn] = np.tile(np.asarray(_cv, np.float32)[None, :],
+                                (n, 1))
         uni2['hal_time'] = np.full(n, float(getattr(job.scene, 'time',
                                                     0.0)), np.float32)
         uni2['hal_frame'] = np.full(n, float(getattr(job.scene,
@@ -3557,6 +3859,8 @@ def _sim_radfield(radfield, job, ids_arr, tex_by_name, side, tside):
     runi['hal_tri_side'] = np.full(gn, float(tside), np.float32)
     runi['hal_eye'] = np.tile(np.asarray(job.eye, np.float32)[None, :],
                               (gn, 1))
+    for _cn, _cv in _cam_uniforms(job).items():
+        runi[_cn] = np.tile(np.asarray(_cv, np.float32)[None, :], (gn, 1))
     runi['vUV'] = guv
     try:
         rout = rprog.run(runi, {}, gn)[0]['Color']
@@ -3654,6 +3958,8 @@ def simulate(job, gbuf, passes=None, atlases=None):
         uni['hal_tri_side'] = np.full(n, float(tside), np.float32)
         uni['hal_eye'] = np.tile(np.asarray(job.eye, np.float32)[None, :],
                                  (n, 1))
+        for _cn, _cv in _cam_uniforms(job).items():
+            uni[_cn] = np.tile(np.asarray(_cv, np.float32)[None, :], (n, 1))
         # per-frame scalars a coded shader may read; unused are inert
         uni['hal_time'] = np.full(n, float(getattr(job.scene, 'time', 0.0)),
                                   np.float32)
@@ -3847,7 +4153,7 @@ def shade_frame(job, gbuf):
                     'floats': ['hal_attr_side', 'hal_slot_count',
                                'hal_tri_side']
                     + list(binds.get('frame_uniforms', ())),
-                    'vec3': ['hal_eye']}
+                    'vec3': ['hal_eye', 'hal_cam_right', 'hal_cam_up', 'hal_cam_back']}
             shader, err = device.compile_dynamic(_pool_tag(tag, src, spec),
                                                  src, spec)
             if shader is None:
@@ -3883,7 +4189,8 @@ def shade_frame(job, gbuf):
 
     uni = {'hal_attr_side': float(side), 'hal_slot_count': 4.0,
            'hal_tri_side': float(tside),
-           'hal_eye': tuple(float(v) for v in job.eye)}
+           'hal_eye': tuple(float(v) for v in job.eye),
+           **_cam_uniforms(job)}
 
     # bump height pre-passes draw FIRST, each into its own target, so
     # build_draws can bind their colour textures into the main passes.
@@ -3926,7 +4233,7 @@ def shade_frame(job, gbuf):
                     'floats': ['hal_attr_side', 'hal_slot_count',
                                'hal_tri_side']
                     + list(pbinds.get('frame_uniforms', ())),
-                    'vec3': ['hal_eye']}
+                    'vec3': ['hal_eye', 'hal_cam_right', 'hal_cam_up', 'hal_cam_back']}
             shader, err = device.compile_dynamic(
                 f'HAL_BUMP_{mat_id}_{uname}', psrc, spec)
             if shader is None:
@@ -3973,7 +4280,7 @@ def shade_frame(job, gbuf):
         rspec = {'samplers': list(rbinds.get('samplers', ())),
                  'floats': ['hal_attr_side', 'hal_slot_count',
                             'hal_tri_side'],
-                 'vec3': ['hal_eye']}
+                 'vec3': ['hal_eye', 'hal_cam_right', 'hal_cam_up', 'hal_cam_back']}
         rshader, rerr = device.compile_dynamic('HAL_RADFIELD', rsrc, rspec)
         if rshader is None:
             for t in prepass_targets:

@@ -428,7 +428,7 @@ def build_screen_tris(clip, tris, width, height, snap=0.0, near_eps=1e-5,
 
 def fill(gbuf, sx, sy, iw, z, bw, src, cull='NONE', frags=None, flat_depth=None,
          depth_write=True, depth_test=True, count_overdraw=False,
-         tri_offset=0, z_offset=0.0, tri_map=None, depth_bits=32):
+         tri_offset=0, z_offset=0.0, tri_map=None, depth_bits=32, frag_test=None):
     """Fill emitted triangles into a GBuffer (and/or a FragmentList).
 
     cull: 'NONE' | 'BACK' | 'FRONT'
@@ -556,6 +556,21 @@ def fill(gbuf, sx, sy, iw, z, bw, src, cull='NONE', frags=None, flat_depth=None,
             src_tri = int(tri_map[int(src[t])])
         is_front = ar < 0.0
 
+        if frag_test is not None:
+            # R212 punch-through: the alpha test lives INSIDE the
+            # raster, exactly where the era's hardware ran it -- a
+            # fragment that fails never touches the depth buffer, and
+            # one behind an already-written solid never gets evaluated
+            keep_a = frag_test(
+                np.full(px.size, src_tri, np.int32), px, py, b,
+                np.full(px.size, is_front, bool))
+            if not keep_a.any():
+                continue
+            if not keep_a.all():
+                px, py, zz, b = (px[keep_a], py[keep_a], zz[keep_a],
+                                 b[keep_a])
+                l0, l1, l2 = l0[keep_a], l1[keep_a], l2[keep_a]
+
         if count_overdraw:
             np.add.at(gbuf.overdraw, (py, px), 1)
 
@@ -583,7 +598,7 @@ def rasterize(verts, tris, mvp, width, height, cull='NONE', snap=0.0,
               depth_bits=24, subset=None, gbuf=None, frags=None,
               depth_write=True, depth_test=True, count_overdraw=False,
               z_offset=0.0, near_eps=1e-5, batched=None, flat_depth=None,
-              scissor=None, subdiv_px=0):
+              scissor=None, subdiv_px=0, frag_test=None):
     """Convenience: project + clip + fill in one call.
 
     `batched` selects the loop-free rasteriser; None picks automatically. The
@@ -645,12 +660,12 @@ def rasterize(verts, tris, mvp, width, height, cull='NONE', snap=0.0,
         fill_batched(gbuf, sx, sy, iw, z, bw, src, cull=cull, frags=frags,
                      flat_depth=flat_depth, depth_write=depth_write,
                      depth_test=depth_test, z_offset=z_offset, tri_map=tri_map,
-                     depth_bits=depth_bits)
+                     depth_bits=depth_bits, frag_test=frag_test)
     else:
         fill(gbuf, sx, sy, iw, z, bw, src, cull=cull, frags=frags,
              flat_depth=flat_depth, depth_write=depth_write,
              depth_test=depth_test, count_overdraw=count_overdraw,
-             z_offset=z_offset, tri_map=tri_map, depth_bits=depth_bits)
+             z_offset=z_offset, tri_map=tri_map, depth_bits=depth_bits, frag_test=frag_test)
     return gbuf
 
 
@@ -733,7 +748,7 @@ LARGE_TRI_PX = 16384         # a 128x128 box; above this the loop amortises fine
 def fill_batched(gbuf, sx, sy, iw, z, bw, src, cull='NONE', frags=None,
                  flat_depth=None, depth_write=True, depth_test=True, tri_offset=0,
                  z_offset=0.0, tri_map=None, max_batch_px=4_000_000,
-                 depth_bits=32):
+                 depth_bits=32, frag_test=None):
     """Same result as fill(), without the per-triangle Python loop.
 
     Small triangles are bucketed by bounding-box size class -- separately in
@@ -782,7 +797,7 @@ def fill_batched(gbuf, sx, sy, iw, z, bw, src, cull='NONE', frags=None,
                         depth_write=depth_write,
                         depth_test=depth_test, tri_offset=tri_offset,
                         z_offset=z_offset, tri_map=tri_map,
-                        depth_bits=depth_bits)
+                        depth_bits=depth_bits, frag_test=frag_test)
 
     idx_all = np.nonzero(live & ~big)[0]
     if idx_all.size == 0:
@@ -795,7 +810,7 @@ def fill_batched(gbuf, sx, sy, iw, z, bw, src, cull='NONE', frags=None,
             bw[idx_all], src[idx_all], cull=cull, frags=frags,
             depth_write=depth_write, depth_test=depth_test,
             tri_offset=tri_offset, z_offset=z_offset, tri_map=tri_map,
-            depth_bits=depth_bits)
+            depth_bits=depth_bits, frag_test=frag_test)
 
     wc = _size_classes(bw_px[idx_all])
     hc = _size_classes(bh_px[idx_all])
@@ -875,6 +890,20 @@ def fill_batched(gbuf, sx, sy, iw, z, bw, src, cull='NONE', frags=None,
             P = np.stack([l0 * iw0 / invw, l1 * iw1 / invw, l2 * iw2 / invw], axis=1)
             bwt = bw[t][ti]
             b = np.einsum('nk,nkc->nc', P, bwt)
+
+            if frag_test is not None:
+                # R212: alpha-tested rasterisation (see fill). The mask
+                # runs after the z candidacy test, so fragments behind
+                # solid ground never pay a chain evaluation
+                fr = (area[t] < 0.0)[ti]
+                keep_a = frag_test(src_tri, px, py, b, fr)
+                if not keep_a.any():
+                    continue
+                if not keep_a.all():
+                    ti, l0, l1, l2 = (ti[keep_a], l0[keep_a],
+                                      l1[keep_a], l2[keep_a])
+                    px, py, zz = px[keep_a], py[keep_a], zz[keep_a]
+                    src_tri, b = src_tri[keep_a], b[keep_a]
 
             px_all.append(px)
             py_all.append(py)

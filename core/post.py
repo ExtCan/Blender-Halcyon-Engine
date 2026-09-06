@@ -748,7 +748,7 @@ def fit_to(rgb, size):
 
 def process(image, st, frame=0, seed=0, target_size=None, allow_resize=True,
             depth=None, shaft_sources=None, flare_sources=None,
-            stamp_info=None):
+            stamp_info=None, key_frame=None, fps=24.0):
     """Linear RGBA framebuffer -> final display-referred RGBA.
 
     Row order is preserved; row 0 stays the bottom of the picture.
@@ -787,8 +787,15 @@ def process(image, st, frame=0, seed=0, target_size=None, allow_resize=True,
     rgb = star_filter(rgb, st)
     rgb = lens_flare(rgb, st)
     rgb = lamp_flares(rgb, st, flare_sources)
+    # R230: the cel photographed -- stock, optics, gate, dust, grain,
+    # flicker -- on the linear frame, before the display encode
+    from . import film as FILM
+    rgb = FILM.process_linear(rgb, st, frame, seed, key_frame=key_frame,
+                              fps=fps)
     gpu_out = _gpu_stage('display', rgb, st)
     rgb = gpu_out if gpu_out is not None else display_transform(rgb, st)
+    # R230: the print's dot screen, on the display-referred frame
+    rgb = FILM.halftone(rgb, st)
     rgb = reduce_depth(rgb, st, seed)
     gpu_out = _gpu_stage('ntsc', rgb, st)
     rgb = gpu_out if gpu_out is not None else composite_ntsc(rgb, st, frame)

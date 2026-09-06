@@ -592,16 +592,27 @@ class Interpreter:
                 return out, GType('struct', 1, 1, 0, name)
             return None
         parts = []
+        ptypes = []
         for a in args:
             v, vt = self.expr(a, mask, scope, flags, n)
             parts.append(v)
+            ptypes.append(vt)
         if t.is_matrix:
             return rt.mat(t.n, t.rows, *parts), t
         if t.n == 1:
+            # R243: the argument's REAL type, so float(u) of a uint hash
+            # converts; assuming float here left the integer in place and
+            # the division after it ran in float64 -- a precision no GPU
+            # has, and a twin drift the tiles map finally showed
             v = parts[0] if parts else np.zeros(n, np.float32)
-            src = FLOAT
+            src = ptypes[0] if ptypes else FLOAT
             return self.coerce(v, src, t, n), t
-        return rt.vec(t.n, *parts), t
+        v = rt.vec(t.n, *parts)
+        if t.base in ('int', 'uint'):
+            v = rt.to_int(v)
+        elif t.base == 'bool':
+            v = rt.to_bool(v)
+        return v, t
 
     # ------------------------------------------------------------ helpers
     def subscript(self, base, bt, i, n):
@@ -657,7 +668,14 @@ class Interpreter:
         return out
 
     def coerce(self, value, src, dst, n):
-        if src is dst or dst.base == 'struct' or dst.array or dst.is_matrix:
+        if dst.base == 'struct' or dst.array or dst.is_matrix:
+            return value
+        if src is dst:
+            # the same declared type can still carry the wrong dtype (a
+            # float64 that slipped in through numpy promotion): a float
+            # destination is float32, full stop
+            if dst.base == 'float' and np.asarray(value).dtype != np.float32:
+                return rt.to_float(value)
             return value
         v = value
         if dst.n > 1 and src.n == 1:
@@ -735,6 +753,8 @@ class Interpreter:
         arr = rt.bc(v, n)
         if t.n > 1 and (np.ndim(arr) == 1 or np.shape(arr)[-1] != t.n):
             arr = rt.splat(rt.sw(arr, [0]) if np.ndim(arr) > 1 else arr, t.n)
+        if t.base == 'float' and np.asarray(arr).dtype != np.float32:
+            arr = rt.to_float(arr)
         return arr
 
     def varying(self, name, t, n):

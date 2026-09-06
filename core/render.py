@@ -205,6 +205,9 @@ def closure_to_surface(cl, ctx, settings, material=None):
     surf = SH.Surface(n)
     model = None
     if material is not None:
+        # R239: the SDF face road resolves its frame from the material
+        # (light_surface reads this; -1 = no material at hand)
+        surf.material_index = int(getattr(material, 'index', -1))
         surf.diffuse[:] = np.asarray(material.diffuse, np.float32)[None, :]
         surf.specular[:] = np.asarray(material.specular, np.float32)[None, :]
         surf.glossiness[:] = material.glossiness
@@ -212,6 +215,19 @@ def closure_to_surface(cl, ctx, settings, material=None):
         surf.diffuse_level[:] = material.diffuse_level
         surf.ambient[:] = material.ambient_level
         surf.opacity[:] = material.opacity
+        _thr_pt = None
+        if getattr(material, 'has_alpha', False) or \
+                str(getattr(material, 'alpha_mode', 'BLEND')) == 'CLIP':
+            from .scene import clip_road as _clip_road
+            _thr_pt = _clip_road(material)[0]
+        if _thr_pt is not None or \
+                str(getattr(material, 'alpha_mode', 'BLEND')) == 'CLIP':
+            # R211/R213 punch-through: the law below forces hard 0/1
+            # alpha -- an identity on the provably-binary chains the
+            # auto road promotes, the requested semantics under CLIP
+            surf.alpha_clip[:] = float(
+                _thr_pt if _thr_pt is not None
+                else getattr(material, 'alpha_clip', 0.5))
         surf.ior[:] = material.ior
         surf.ray_ior[:] = material.ior   # one slider, both meanings here
         surf.roughness[:] = material.roughness
@@ -330,6 +346,15 @@ def closure_to_surface(cl, ctx, settings, material=None):
             return acc
 
         surf.diffuse = hmix('color', (0.8, 0.8, 0.8), True)
+        # R242: ADDITIVE master lobes (Add Shader, the Max Shellac and
+        # Composite roads) SUM their colours -- the parameters still
+        # blend by share, but a weight total past 1 scales the colour
+        # by that total, exactly the colour-chain sum the GPU emits for
+        # an Add. A mix (weights summing to 1) multiplies by nothing,
+        # so every existing frame holds bitwise.
+        over = wsum > np.float32(1.000001)
+        if np.any(over):
+            surf.diffuse = surf.diffuse * np.where(over, wsum, 1.0)[:, None]
         surf.diffuse_level = hmix('diffuse_level', 1.0)
         surf.specular = hmix('spec_color', (1.0, 1.0, 1.0), True)
         surf.specular_level = hmix('spec_level', 0.5)
@@ -371,6 +396,14 @@ def closure_to_surface(cl, ctx, settings, material=None):
                 ('refraction', 'refraction', 'v', 1.0),
                 ('toon_size2', 'toon_size2', 'v', 0.5),
                 ('toon_smooth2', 'toon_smooth2', 'v', 0.1),
+                # R243: the Max Multi-Layer's second highlight and the
+                # Translucent shader's colour
+                ('spec_color2', 'specular2', 'c', (0.9, 0.9, 0.9)),
+                ('spec_level2', 'specular_level2', 'v', 0.0),
+                ('glossiness2', 'glossiness2', 'v', 25.0),
+                ('anisotropy2', 'anisotropy2', 'v', 0.0),
+                ('rotation2', 'aniso_rot2', 'v', 0.0),
+                ('translucent_color', 'translucent_color', 'c', (0, 0, 0)),
                 ('bi_fresnel', 'bi_fresnel', 'v', 0.1),
                 ('bi_fresnel_fac', 'bi_fresnel_fac', 'v', 0.5),
                 ('bi_slope', 'bi_slope', 'v', 0.1),
@@ -384,6 +417,62 @@ def closure_to_surface(cl, ctx, settings, material=None):
                 ('bi_ray_filter', 'bi_ray_filter', 'v', 1.0),
                 ('bi_cubic', 'bi_cubic', 'v', 0.0),
                 ('bi_tangent', 'bi_tangent', 'v', 0.0),
+                ('anime_shadow1', 'anime_shadow1', 'c',
+                 (0.62, 0.44, 0.48)),
+                ('anime_shadow2', 'anime_shadow2', 'c',
+                 (0.38, 0.26, 0.38)),
+                ('anime_th1', 'anime_th1', 'v', 0.5),
+                ('anime_soft1', 'anime_soft1', 'v', 0.04),
+                ('anime_th2', 'anime_th2', 'v', 0.22),
+                ('anime_soft2', 'anime_soft2', 'v', 0.04),
+                ('anime_bias', 'anime_bias', 'v', 0.0),
+                ('anime_tones', 'anime_tones', 'v', 2.0),
+                ('anime_spec_size', 'anime_spec_size', 'v', 0.12),
+                ('anime_sharp', 'anime_sharp', 'v', 0.05),
+                ('anime_mask', 'anime_mask', 'v', 1.0),
+                ('anime_gain', 'anime_gain', 'v', 1.0),
+                ('anime_ramp_row', 'anime_ramp_row', 'v', 0.0),
+                # R229: the 80s additions
+                ('anime_shine', 'anime_shine', 'v', 0.0),
+                ('anime_shine_color', 'anime_shine_color', 'c', (1, 1, 1)),
+                ('anime_shine_h', 'anime_shine_h', 'v', 0.78),
+                ('anime_shine_w', 'anime_shine_w', 'v', 0.06),
+                ('anime_shine_wave', 'anime_shine_wave', 'v', 0.03),
+                ('anime_shine_waves', 'anime_shine_waves', 'v', 6.0),
+                ('anime_shine_soft', 'anime_shine_soft', 'v', 0.01),
+                ('anime_shine_second', 'anime_shine_second', 'v', 0.0),
+                # R241: the hair pass
+                ('anime_shine_shape', 'anime_shine_shape', 'v', 0.0),
+                ('anime_shine_angle', 'anime_shine_angle', 'v', 0.0),
+                ('anime_shine_follow', 'anime_shine_follow', 'v', 0.0),
+                ('anime_shine_color2', 'anime_shine_color2', 'c',
+                 (1, 1, 1)),
+                ('anime_air', 'anime_air', 'v', 0.0),
+                ('anime_air_color', 'anime_air_color', 'c',
+                 (0.82, 0.62, 0.62)),
+                ('anime_air_width', 'anime_air_width', 'v', 0.35),
+                ('anime_air_side', 'anime_air_side', 'v', 0.0),
+                # the cartoon/paint master (R228)
+                ('cartoon_shadow', 'cartoon_shadow', 'c',
+                 (0.55, 0.45, 0.62)),
+                ('cartoon_amount', 'cartoon_amount', 'v', 1.0),
+                ('cartoon_th', 'cartoon_th', 'v', 0.5),
+                ('cartoon_soft', 'cartoon_soft', 'v', 0.02),
+                ('cartoon_smooth', 'cartoon_smooth', 'v', 0.0),
+                ('cartoon_hl_color', 'cartoon_hl_color', 'c', (1, 1, 1)),
+                ('cartoon_hl_size', 'cartoon_hl_size', 'v', 0.0),
+                ('cartoon_hl_soft', 'cartoon_hl_soft', 'v', 0.02),
+                ('cartoon_mode', 'cartoon_mode', 'v', 0.0),
+                ('cartoon_lamp', 'cartoon_lamp', 'v', 0.0),
+                # R238: the cel's light
+                ('cel_light', 'cel_light', 'v', 0.0),
+                ('cel_dir', 'cel_dir', 'c', (0.0, 0.0, 1.0)),
+                ('cel_ss', 'cel_ss', 'v', 0.0),
+                ('cel_ss_len', 'cel_ss_len', 'v', 24.0),
+                ('cel_rim_mode', 'cel_rim_mode', 'v', 0.0),
+                ('cel_rim_width', 'cel_rim_width', 'v', 4.0),
+                ('cel_rim_side', 'cel_rim_side', 'v', 0.0),
+                ('cel_shape', 'cel_shape', 'v', 0.0),
                 ('shadow_receive', 'shadow_receive', 'v', 1.0),
                 ('cast_only', 'cast_only', 'v', 0.0),
                 ('shadows_only', 'shadows_only', 'v', 0.0),
@@ -401,6 +490,11 @@ def closure_to_surface(cl, ctx, settings, material=None):
             surf.bi = max(halcyon,
                           key=lambda t: float(np.mean(t[0])))[1].get(
                               'bi_extras')
+        # R221: the baked Shadow Ramp rides the same one-object idiom
+        if any(hp.get('anime_extras') is not None for _w, hp in halcyon):
+            surf.anime_ramp = max(
+                halcyon, key=lambda t: float(np.mean(t[0])))[1].get(
+                    'anime_extras')
         # the model cannot blend: the HEAVIEST lobe names it, deterministic
         heavy = max(halcyon, key=lambda t: float(np.mean(t[0])))
         model = heavy[1].get('model', model)
@@ -420,6 +514,11 @@ def closure_to_surface(cl, ctx, settings, material=None):
                     geo = M.normalize(np.asarray(ctx.N, np.float32))
                     normal = geo + (M.normalize(np.asarray(normal, np.float32))
                                     - geo) * k
+        # R242: Max's Faceted flag on the heaviest lobe -- the stored
+        # face normal replaces the shading normal, bump and all (the
+        # GPU substitutes hal_triaux after its bend, the same order)
+        if heavy[1].get('faceted'):
+            normal = np.asarray(ctx.Ng, np.float32)
         # a mix with PLAIN lobes (a master blended against a raw BSDF):
         # albedos blend by relative weight, levels sum toward 1, the era
         # terms that only a master carries fade with its share, and the
@@ -505,6 +604,312 @@ def closure_to_surface(cl, ctx, settings, material=None):
 # ----------------------------------------------------------------- lighting
 
 
+def _anime_smooth(e0, e1, x):
+    """smoothstep with running edges, written out so the GLSL twin is
+    the same three operations."""
+    t = np.clip((x - e0) / np.maximum(e1 - e0, 1e-6), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _anime_ramp_sample(lut, u, v):
+    """R221: the baked ramp LUT, endpoint-mapped bilinear on both axes
+    -- u=0 lands exactly on the first texel, u=1 on the last, so the
+    ramp's painted ends ARE the shadow floor and the lit ceiling. The
+    GPU writes out the same arithmetic on the same uploaded texels."""
+    h, w = lut.shape[:2]
+    fx = np.clip(u, 0.0, 1.0) * np.float32(w - 1)
+    fy = np.clip(v, 0.0, 1.0) * np.float32(h - 1)
+    x0 = np.floor(fx).astype(np.int64)
+    y0 = np.floor(fy).astype(np.int64)
+    tx = (fx - x0).astype(np.float32)[:, None]
+    ty = (fy - y0).astype(np.float32)[:, None]
+    x1 = np.minimum(x0 + 1, w - 1)
+    y1 = np.minimum(y0 + 1, h - 1)
+    c00 = lut[y0, x0]
+    c10 = lut[y0, x1]
+    c01 = lut[y1, x0]
+    c11 = lut[y1, x1]
+    top = c00 + (c10 - c00) * tx
+    bot = c01 + (c11 - c01) * tx
+    return top + (bot - top) * ty
+
+
+def _anime_lamp(surf, wrap, vis, rad, N, L, V, affect_diffuse,
+                affect_specular):
+    """One lamp of the cel model (R218): the shadow term lives INSIDE
+    the band input, so a cast shadow pushes a pixel into its tone band
+    instead of darkening it -- a shadow is a COLOUR here. The tint
+    multiplies the base per lamp; the stepped highlight gates on the
+    wrapped half-vector. Both come back pre-divided by pi so lamp
+    energies mean what they mean on every other model."""
+    inv_pi = np.float32(1.0 / np.pi)
+    rad = rad * surf.anime_gain[:, None]
+    x = np.clip(wrap + surf.anime_bias, 0.0, 1.0) * vis
+    _extras = getattr(surf, 'anime_ramp', None)
+    face = _extras.get('face') if isinstance(_extras, dict) else None
+    if isinstance(face, dict) and face.get('on') \
+            and face.get('frame') is not None:
+        # R239: the SDF face shadow -- the anime face's terminator is
+        # DRAWN in a map, not found on the normals. The map's field
+        # against the light's horizontal angle about the face's own
+        # frame replaces the lambert wrap (bias included: the map IS
+        # the authored bias); the side mirrors across the face's
+        # centre line; the cast and screen shadows still multiply.
+        fwd, up, rgt = face['frame']
+        L3 = np.asarray(L, np.float32)
+        if L3.ndim == 1:
+            L3 = L3[None, :]
+        Lh = L3 - up[None, :] * (L3 @ up)[:, None]
+        ln = np.sqrt((Lh * Lh).sum(1))
+        Lh = Lh / np.maximum(ln, np.float32(1e-9))[:, None]
+        ct = np.clip(Lh @ fwd, -1.0, 1.0)
+        t_f = np.arccos(ct).astype(np.float32) * np.float32(1.0 / np.pi)
+        side_f = Lh @ rgt
+        val = np.where(side_f >= 0.0, face['val'][:, 0],
+                       face['val'][:, 1]).astype(np.float32)
+        x = (np.clip(np.float32(0.5) + (val - t_f), 0.0, 1.0)
+             * vis).astype(np.float32)
+    ramp = getattr(surf, 'anime_ramp', None)
+    if isinstance(ramp, dict) and ramp.get('ramp') is not None:
+        # R221: the ramp shading road -- the tint IS the baked ramp,
+        # sampled by the light term: shadow side, transition and lit
+        # side all painted in the texture, exactly the games' own
+        # convention. The tone sliders stand down while a ramp is
+        # connected (the node's tooltip says so).
+        tint = _anime_ramp_sample(ramp['ramp']['lut'], x,
+                                  surf.anime_ramp_row)
+    else:
+        b1 = _anime_smooth(surf.anime_th1 - surf.anime_soft1,
+                           surf.anime_th1 + surf.anime_soft1, x)
+        b2 = _anime_smooth(surf.anime_th2 - surf.anime_soft2,
+                           surf.anime_th2 + surf.anime_soft2, x)
+        t3 = np.clip(surf.anime_tones - 2.0, 0.0, 1.0)
+        shade3 = surf.anime_shadow2 + \
+            (surf.anime_shadow1 - surf.anime_shadow2) * b2[:, None]
+        shade = surf.anime_shadow1 + \
+            (shade3 - surf.anime_shadow1) * t3[:, None]
+        tint = shade + (1.0 - shade) * b1[:, None]
+    if np.any(surf.anime_air > 1e-6):
+        # R229: the airbrush gradation -- the cel painter's soft tone
+        # against the hard band edge. LIT side: the tint multiplies
+        # toward the airbrush colour just above the first threshold,
+        # fading out toward full light; SHADOW side: the shadow tone
+        # blends toward the airbrush colour approaching the edge from
+        # below. Same three operations on the GPU.
+        tint = _anime_airbrush(surf, tint, x)
+    dcontrib = np.zeros((surf.n, 3), np.float32)
+    scontrib = np.zeros((surf.n, 3), np.float32)
+    if affect_diffuse:
+        dcontrib = (surf.diffuse * tint
+                    * surf.diffuse_level[:, None] * rad) * inv_pi
+    if affect_specular:
+        h = M.normalize(L + V)
+        sndh = np.clip(M.dot(N, h) * np.float32(0.5) + np.float32(0.5),
+                       0.0, 1.0)
+        edge = 1.0 - np.clip(surf.anime_spec_size, 0.0, 1.0)
+        gate = _anime_smooth(edge - surf.anime_sharp,
+                             edge + surf.anime_sharp, sndh)
+        sp = gate * surf.anime_mask * vis
+        scontrib = (sp[:, None] * surf.specular
+                    * surf.specular_level[:, None] * rad) * inv_pi
+    return dcontrib, scontrib
+
+
+
+def cartoon_smooth_normal(N, ctx, amount, shape=None, V=None):
+    """R228: the inker's simplification -- the shading normal mixed
+    toward the normal of a SPHERE around the object's bounding-box
+    centre, so a face's shadow terminator sweeps as one clean shape
+    instead of following every bump. Reads the same per-object bounds
+    Generated coordinates use (both devices carry them); a context
+    without object ids (a traced hit, a vertex corner) keeps its
+    normal. R238 adds the shape: 1 an upright CYLINDER through the
+    bounds (the radial normal with no z: the terminator runs straight
+    down a limb), 2 the CAMERA (the normal bent toward the viewer: the
+    surface reads as one plane facing the camera -- the anime face)."""
+    if not np.any(amount > 1e-6):
+        return N
+    k = np.clip(amount, 0.0, 1.0)[:, None].astype(np.float32)
+    code = np.rint(np.asarray(shape, np.float32)).astype(np.int32) \
+        if shape is not None else np.zeros(1, np.int32)
+    if np.all(code == 2) and V is not None:
+        return M.normalize(N + (np.asarray(V, np.float32) - N) * k)
+    bounds = getattr(ctx, 'obj_bounds', None)
+    oi = getattr(ctx, 'object_index_raw', None)
+    if bounds is None or oi is None or ctx.P is None:
+        if V is not None and np.any(code == 2):
+            tgt = np.where((code == 2)[:, None] if code.size > 1
+                           else np.full((N.shape[0], 1), bool(code[0] == 2)),
+                           np.asarray(V, np.float32), N)
+            return M.normalize(N + (tgt - N) * k)
+        return N
+    lo, span = bounds
+    idx = np.clip(np.asarray(oi, np.int64), 0, lo.shape[0] - 1)
+    centre = lo[idx] + span[idx] * np.float32(0.5)
+    rel = np.asarray(ctx.P, np.float32) - centre
+    sph = M.normalize(rel)
+    if np.any(code == 1):
+        flat = rel.copy()
+        flat[:, 2] = 0.0
+        cyl = M.normalize(flat)
+        sel = (code == 1)[:, None] if code.size > 1 else \
+            np.full((N.shape[0], 1), bool(code[0] == 1))
+        sph = np.where(sel, cyl, sph)
+    if np.any(code == 2) and V is not None:
+        sel = (code == 2)[:, None] if code.size > 1 else \
+            np.full((N.shape[0], 1), bool(code[0] == 2))
+        sph = np.where(sel, np.asarray(V, np.float32), sph)
+    return M.normalize(N + (sph - N) * k)
+
+
+def _cartoon_compose(surf, lit, hl, rad_acc):
+    """R228: the paint composition after the lamp loop. `lit` is the
+    strongest lamp's lit term (max over lamps of wrap * vis), `hl` the
+    strongest highlight gate, `rad_acc` the summed lamp radiance times
+    the lit term over pi (the Lamp Influence energy).
+
+    Written out so the GLSL twin is the same operations: the shadow
+    tone by mode (0 transparent cel: paint x mix(1, shadow, amount);
+    1 painted: mix(paint, shadow, amount); 2 none), the LIT paint
+    modulated by Lamp Influence (the shadow tone is a colour and stays
+    one -- the lamps' energy only ever reaches the lit side), the lit
+    step between them, the highlight painted OVER the result, then the
+    diffuse level."""
+    paint = surf.diffuse
+    t = _anime_smooth(surf.cartoon_th - surf.cartoon_soft,
+                      surf.cartoon_th + surf.cartoon_soft, lit)[:, None]
+    amt = np.clip(surf.cartoon_amount, 0.0, 1.0)[:, None]
+    mode = np.rint(surf.cartoon_mode).astype(np.int32)
+    transparent = paint * (1.0 + (surf.cartoon_shadow - 1.0) * amt)
+    painted = paint + (surf.cartoon_shadow - paint) * amt
+    shade = np.where((mode == 1)[:, None], painted, transparent)
+    shade = np.where((mode >= 2)[:, None], paint, shade)
+    li = np.clip(surf.cartoon_lamp, 0.0, 1.0)[:, None]
+    lit_col = paint * (1.0 - li) + paint * rad_acc * li
+    base = shade + (lit_col - shade) * t
+    if np.any(surf.anime_air > 1e-6):
+        # R238: the airbrush gradation against the paint's shadow edge,
+        # the Anime Shader's own operations on the cartoon's threshold
+        base = _anime_airbrush(surf, base, lit, th=surf.cartoon_th)
+    hk = np.clip(hl, 0.0, 1.0)[:, None]
+    base = base + (surf.cartoon_hl_color - base) * hk
+    return (base * surf.diffuse_level[:, None]).astype(np.float32)
+
+
+def _anime_airbrush(surf, tint, x, th=None):
+    """R229: the airbrush gradation on one lamp's tint. `x` is the
+    band input (wrap + bias, times vis). Side code 0 LIT, 1 SHADOW,
+    2 BOTH. Written out so the GLSL twin is the same operations.
+    R238: `th` names the edge (the cartoon's threshold when the paint
+    master airbrushes); the Anime Shader's first threshold otherwise."""
+    amt = np.clip(surf.anime_air, 0.0, 1.0)
+    width = np.maximum(surf.anime_air_width, 1e-4)
+    th = surf.anime_th1 if th is None else th
+    side = np.rint(surf.anime_air_side)
+    ac = surf.anime_air_color
+    # lit side: 1 at the edge, 0 a `width` above it, only above the edge
+    g_lit = (1.0 - _anime_smooth(th, th + width, x)) \
+        * _anime_smooth(th - np.float32(1e-4), th, x)
+    # shadow side: 0 deep in shadow, 1 at the edge, only below the edge
+    g_sh = _anime_smooth(th - width, th, x) \
+        * (1.0 - _anime_smooth(th, th + np.float32(1e-4), x))
+    lit_on = (side != 1).astype(np.float32)
+    sh_on = (side != 0).astype(np.float32)
+    k_lit = (amt * g_lit * lit_on)[:, None]
+    k_sh = (amt * g_sh * sh_on)[:, None]
+    out = tint * (1.0 + (ac - 1.0) * k_lit)
+    out = out + (ac - out) * k_sh
+    return out.astype(np.float32)
+
+
+def _anime_hair_shine(out, surf, ctx, N, V, key_z=None):
+    """R229: the hair shine band -- the 80s "angel ring": a band of
+    the shine colour painted across the object at a fraction of its
+    height, its edge waving around the object, on the upward- and
+    camera-facing surface, light-independent (it was painted on the
+    cel at a position, not lit). A thinner second band can sit below.
+    Reads the same per-object bounds Generated coordinates use; a
+    context without them (a vertex corner, a traced hit off the
+    G-buffer) paints nothing. R241 (the hair pass): the wave has a
+    SHAPE menu and a phase (Hair Shine Angle); Hair Shine Follow
+    lifts the band by the key's world height (`key_z`, the caller's
+    directional key: a scene sun or hemi, or the material's fixed
+    key; None -- a positional key -- leaves the band painted where it
+    is); the second band wears its own tint over the shine colour.
+    R241 also runs it for the CARTOON master -- the highlight cel
+    over the paint."""
+    if not np.any(surf.anime_shine > 1e-6):
+        return out
+    gen = getattr(ctx, 'generated', None)
+    bounds = getattr(ctx, 'obj_bounds', None)
+    oi = getattr(ctx, 'object_index_raw', None)
+    if gen is None or bounds is None or oi is None or ctx.P is None:
+        return out
+    lo, span = bounds
+    idx = np.clip(np.asarray(oi, np.int64), 0, lo.shape[0] - 1)
+    centre = lo[idx] + span[idx] * np.float32(0.5)
+    P = np.asarray(ctx.P, np.float32)
+    az = np.arctan2(P[:, 1] - centre[:, 1], P[:, 0] - centre[:, 0]) \
+        .astype(np.float32)
+    t = np.asarray(gen, np.float32)[:, 2]
+    amt = np.clip(surf.anime_shine, 0.0, 1.0)
+    w = np.maximum(surf.anime_shine_w, 1e-4) * np.float32(0.5)
+    s = np.maximum(surf.anime_shine_soft, 1e-4)
+    # R241: the hair pass. The wave's ARGUMENT gains a phase (Hair
+    # Shine Angle turns the teeth around the head), its SHAPE is the
+    # menu's (each a period-matched wave in -1..1, code 0 the 1.72
+    # sine bitwise), and the band's HEIGHT rides the key's world
+    # height by Hair Shine Follow (the ring is redrawn shifted when
+    # the key moves, as a per-cut drawing would be). Every new dial
+    # at zero reproduces the 1.83 arithmetic exactly.
+    arg = (surf.anime_shine_waves * az
+           + surf.anime_shine_angle * np.float32(np.pi / 180.0)) \
+        .astype(np.float32)
+    shape = int(round(float(np.asarray(surf.anime_shine_shape,
+                                       np.float32).reshape(-1)[0])))
+    if shape == 1:                                   # zigzag: triangle
+        q = arg * np.float32(1.0 / (2.0 * np.pi)) - np.float32(0.25)
+        wav = (np.float32(4.0) * np.abs(q - np.floor(q)
+                                        - np.float32(0.5))
+               - np.float32(1.0)).astype(np.float32)
+    elif shape == 2:                                 # scallop: arcs
+        wav = (np.float32(1.0)
+               - np.float32(2.0) * np.abs(np.sin(arg * np.float32(0.5)))
+               ).astype(np.float32)
+    elif shape == 3:                                 # step: square
+        wav = np.where(np.sin(arg) >= 0.0, np.float32(1.0),
+                       np.float32(-1.0)).astype(np.float32)
+    else:                                            # smooth: the sine
+        wav = np.sin(arg).astype(np.float32)
+    hh = surf.anime_shine_h
+    if key_z is not None:
+        hh = hh + surf.anime_shine_follow * np.float32(0.35 * key_z)
+    h0 = hh + surf.anime_shine_wave * wav
+    band1 = _anime_smooth(h0 - w - s, h0 - w + s, t) \
+        * (1.0 - _anime_smooth(h0 + w - s, h0 + w + s, t))
+    second = surf.anime_shine_second
+    h2 = h0 - second
+    w2 = w * np.float32(0.5)
+    band2 = _anime_smooth(h2 - w2 - s, h2 - w2 + s, t) \
+        * (1.0 - _anime_smooth(h2 + w2 - s, h2 + w2 + s, t)) \
+        * np.float32(0.85)
+    band2m = np.where(second > 1e-6, band2, 0.0)
+    band = np.maximum(band1, band2m)
+    facing = _anime_smooth(np.float32(0.0), np.float32(0.35), M.dot(N, V))
+    # the ring circles the head: sides and top carry it in full, only
+    # the underside fades it out
+    upward = _anime_smooth(np.float32(-0.3), np.float32(0.1), N[:, 2])
+    k = (amt * band * facing * upward)[:, None]
+    # R241: where the SECOND band owns the pixel, its own tint
+    # multiplies the shine colour (white = the 1.83 colour bitwise)
+    col = np.where((band2m > band1)[:, None],
+                   surf.anime_shine_color * surf.anime_shine_color2,
+                   surf.anime_shine_color).astype(np.float32)
+    # painted OVER: out*(1-k) + shine*k, so a full band is the shine
+    # colour bitwise whatever lay beneath (a 10x lamp included)
+    return (out * (1.0 - k) + col * k).astype(np.float32)
+
+
 def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
                   active_lights=None, extras=None, suppress_spec=False,
                   sss=None):
@@ -529,6 +934,81 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
 
     if model in ('CONSTANT', 'WIREFRAME'):
         return surf.diffuse * surf.diffuse_level[:, None] + surf.emission
+    # R238: the cel's light -- the material's key (0 the scene's lamps,
+    # 1 a key fixed to the camera, 2 a key fixed to the world), the
+    # screen shadow and the depth rim read from the frame's cel field
+    # at this batch's own pixels, the smoothing shape
+    cel_mode = 0
+    cel_ss_term = None
+    cel_rim = None
+    cel_key = None
+    cel_L = None
+    vis_acc = None
+    if model in ('CARTOON', 'ANIME'):
+        from . import celfield as CF
+        from . import lines as LN
+        # R228: the inker's shadow-shape smoothing, before any lamp
+        # (R229: the Anime Shader shares the road; R238 the shape)
+        N = cartoon_smooth_normal(N, ctx, surf.cartoon_smooth,
+                                  shape=surf.cel_shape, V=V)
+        # R239: the SDF face road's frame -- resolved once per batch
+        # from the first object wearing the material (the games' own
+        # arrangement: a face material is one head's)
+        extras_r = getattr(surf, 'anime_ramp', None)
+        face_r = extras_r.get('face') if isinstance(extras_r, dict) \
+            else None
+        if isinstance(face_r, dict) and face_r.get('on') \
+                and face_r.get('frame') is None \
+                and not face_r.get('resolved'):
+            from . import nodeeval as _NE
+            mi_r = int(getattr(surf, 'material_index', -1))
+            if mi_r >= 0:
+                face_r['frame'] = _NE.face_frame(
+                    scene, mi_r, face_r['fwd_axis'], face_r['up_axis'])
+            face_r['resolved'] = True
+        cel_mode = int(round(float(np.asarray(surf.cel_light,
+                                              np.float32).reshape(-1)[0])))
+        ss_px, rim_px = CF.lookup(getattr(ctx, 'cel_field', None),
+                                  getattr(ctx, 'spx', None),
+                                  getattr(ctx, 'spy', None),
+                                  getattr(ctx, 'depth', None))
+        if ss_px is not None and np.any(surf.cel_ss > 1e-6):
+            cel_ss_term = (1.0 - ss_px * np.clip(surf.cel_ss, 0.0, 1.0)
+                           ).astype(np.float32)
+        if rim_px is not None:
+            cel_rim = rim_px
+        if cel_mode > 0:
+            d0 = np.asarray(surf.cel_dir, np.float32).reshape(-1, 3)[0]
+            cel_L = np.broadcast_to(
+                CF.world_key(cel_mode, d0, getattr(scene, 'camera', None)),
+                (n, 3)).astype(np.float32).copy()
+            vis_acc = np.full(n, -1.0, np.float32)
+        else:
+            cel_key = LN.key_light(scene)
+    # R241: the hair pass's key height -- Hair Shine Follow lifts the
+    # band by the key's world z. Directional keys only: the material's
+    # fixed key, or a scene SUN / HEMI key lamp; a positional key
+    # leaves the band painted where it is (the tooltip says so).
+    hair_key_z = None
+    if model in ('CARTOON', 'ANIME') \
+            and np.any(surf.anime_shine > 1e-6) \
+            and np.any(surf.anime_shine_follow > 1e-6):
+        if cel_mode > 0 and cel_L is not None:
+            hair_key_z = float(np.asarray(cel_L, np.float32)
+                               .reshape(-1, 3)[0, 2])
+        else:
+            _kl = cel_key
+            if _kl is not None and str(getattr(_kl, 'type', '')).upper() \
+                    in ('SUN', 'HEMI'):
+                _kd = np.asarray(getattr(_kl, 'direction', (0, 0, -1)),
+                                 np.float32)
+                _kn = float(np.linalg.norm(_kd))
+                if _kn > 1e-9:
+                    hair_key_z = float(-_kd[2] / _kn)
+    if model == 'CARTOON':
+        cart_lit = np.zeros(n, np.float32)
+        cart_hl = np.zeros(n, np.float32)
+        cart_rad = np.zeros((n, 3), np.float32)
 
     # Lambertian BRDF normalisation. Light energy arrives in Blender's watt-based
     # units, and Cycles divides reflected radiance by pi; without this every
@@ -693,9 +1173,28 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
             lit_mask = inside if light.exclude_mode == 'ONLY' else ~inside
             if not lit_mask.any():
                 continue
+        if cel_mode > 0:
+            # R238: under a fixed key the scene's lamps only CAST their
+            # shadows: the strongest visibility among the casters that
+            # reach this object is the key's own (no caster: lit)
+            if not LI.casts_shadow(light, settings):
+                continue
+            L_c, _rad_c, dist_c = LI.sample(light, ctx.P, settings)
+            vis_c = LI.visibility(light, ctx.P, N, L_c, dist_c, settings,
+                                  bvh, rng,
+                                  sample_xy=(spx, spy, li) if have_id
+                                  else None,
+                                  mask=lit_mask)
+            if lit_mask is not None:
+                vis_c = np.where(lit_mask, vis_c, -1.0).astype(np.float32)
+            vis_acc = np.maximum(vis_acc, vis_c)
+            continue
         L, rad, dist = LI.sample(light, ctx.P, settings)
         ndl = M.dot(N, L)
         if not np.any(ndl > 0.0) and not np.any(surf.translucency > 0) \
+                and model not in ('ANIME', 'CARTOON') \
+                and not (model == 'MAX_TRANSLUCENT'
+                         and np.any(surf.translucent_color > 0)) \
                 and getattr(light, 'type', '') not in ('HEMI', 'AREA'):
             # the hemi WRAP lights faces the dot product writes off --
             # and an area lamp's Stokes energy can be positive where
@@ -726,6 +1225,14 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         dif, spec = SH.evaluate(model, surf, N, L, V,
                                 area_ndl=area_nd,
                                 area_ndl_back=area_nd_back)
+        # R243: a Max shader whose diffuse carries its own colour (the
+        # Oren-Nayar pair, Translucent) returns it as (N, 3); the scalar
+        # every other road reads is its mean, and the contribution
+        # takes the colour as given instead of the diffuse socket
+        dif_rgb = None
+        if np.ndim(dif) == 2:
+            dif_rgb = dif
+            dif = dif.mean(axis=1).astype(np.float32)
         if area_nd is not None:
             # shade_one_light's area lamp correction: specfac *= inp
             spec = spec * area_nd[:, None]
@@ -752,6 +1259,9 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         if receive_off:
             # Shadow > Receive off: shadows never darken this material
             vis = np.where(surf.shadow_receive > 0.5, vis, 1.0)
+        if cel_ss_term is not None and light is cel_key:
+            # R238: the screen shadow rides the key lamp's visibility
+            vis = (vis * cel_ss_term).astype(np.float32)
         if not np.any(vis > 0.0):
             continue
         if getattr(light, 'type', '') == 'HEMI':
@@ -768,6 +1278,67 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
             spec = sp_h[:, None] * surf.specular
         if light.negative:
             rad = -rad
+        if model == 'CARTOON':
+            # R228: the paint keeps the STRONGEST lamp's verdict -- a
+            # region is lit if any lamp reaches it -- and the lamp's
+            # energy only matters through Lamp Influence
+            x_raw = np.clip(dif, 0.0, 1.0) * vis
+            if lit_mask is not None:
+                x_raw = x_raw * lit_mask
+            x = x_raw if (light.affect_diffuse
+                          and not light.specular_only) \
+                else np.zeros_like(x_raw)
+            cart_lit = np.maximum(cart_lit, x)
+            cart_rad += rad * x[:, None] * inv_pi
+            if light.affect_specular and not light.diffuse_only \
+                    and not suppress_spec:
+                # the painted dot: gated on the wrapped half-vector,
+                # and confined to THIS lamp's own lit step (a
+                # highlight sits inside the lit region of the form,
+                # never in the shadow tone; a specular-only lamp keeps
+                # its own verdict for the gate)
+                h_c = M.normalize(L + V)
+                sndh = np.clip(M.dot(N, h_c) * np.float32(0.5)
+                               + np.float32(0.5), 0.0, 1.0)
+                # Highlight Size is the dot's RADIUS: the gate opens at
+                # N.H > 1 - size^2/2, so the dot's angular radius grows
+                # about linearly with the dial (0.3 ~ 17 degrees, 0.5 ~
+                # 29, 1.0 a 60-degree cap -- never the whole hemisphere)
+                # -- in wrapped units that edge is 1 - size^2/4
+                hs_c = np.clip(surf.cartoon_hl_size, 0.0, 1.0)
+                edge_c = 1.0 - np.float32(0.25) * hs_c * hs_c
+                gate = _anime_smooth(edge_c - surf.cartoon_hl_soft,
+                                     edge_c + surf.cartoon_hl_soft, sndh)
+                gate = np.where(surf.cartoon_hl_size > 1e-6, gate, 0.0)
+                t_l = _anime_smooth(surf.cartoon_th - surf.cartoon_soft,
+                                    surf.cartoon_th + surf.cartoon_soft,
+                                    x_raw)
+                cart_hl = np.maximum(cart_hl, gate * t_l)
+            continue
+        if model == 'ANIME':
+            # the cel composition: bands, tints and the stepped
+            # highlight, with vis folded into the band input; the
+            # generic tail multiplies are bypassed below
+            dcontrib, scontrib = _anime_lamp(
+                surf, dif, vis, rad, N, L, V,
+                light.affect_diffuse and not light.specular_only,
+                light.affect_specular and not light.diffuse_only)
+            if suppress_spec:
+                scontrib = np.zeros_like(dcontrib)
+            if lit_mask is not None:
+                dcontrib *= lit_mask[:, None]
+                scontrib *= lit_mask[:, None]
+            if track_result:
+                diff_acc += dcontrib
+                spec_acc += scontrib
+            else:
+                contrib = dcontrib + scontrib
+                if clamp > 0.0:
+                    contrib = np.minimum(contrib, clamp)
+                out += contrib
+                if spec_acc is not None:
+                    spec_acc += scontrib
+            continue
         dcontrib = np.zeros((n, 3), np.float32)
         scontrib = np.zeros((n, 3), np.float32)
         if light.affect_diffuse and not light.specular_only:
@@ -791,8 +1362,11 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
                     ramp_dif.get('blend', 'MIX'), surf.diffuse,
                     band[:, 3] * float(ramp_dif.get('factor', 1.0)),
                     band[:, :3])
-            dcontrib = (dif[:, None] * dcol *
-                        surf.diffuse_level[:, None]) * rad
+            if dif_rgb is not None:
+                dcontrib = (dif_rgb * surf.diffuse_level[:, None]) * rad
+            else:
+                dcontrib = (dif[:, None] * dcol *
+                            surf.diffuse_level[:, None]) * rad
         if light.affect_specular and not light.diffuse_only:
             sp = spec
             if ramp_spec is not None and ramp_spec.get('input') != 'RESULT':
@@ -825,7 +1399,12 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
                 sp = sfac[:, None] * scol
             if not settings.specular_in_gamma:
                 sp = np.power(np.maximum(sp, 0.0), 2.2)
-            scontrib = sp * surf.specular_level[:, None] * rad
+            if model in SH.LEVEL_FREE_MODELS:
+                # R243: Strauss has no Specular Level in Max, Multi-Layer
+                # applies its two levels inside -- the loop scales by nothing
+                scontrib = sp * rad
+            else:
+                scontrib = sp * surf.specular_level[:, None] * rad
             if sheen_exp is not None:
                 # velvet: light scattered back at grazing angles, so the lobe
                 # lives at the silhouette and vanishes face-on. It still needs
@@ -958,10 +1537,63 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         if only_accum is not None:
             extras['only_shadow'] = (only_accum, only_ir)
 
+    if cel_mode > 0:
+        # R238: the fixed key lights the cel once, at the energy of the
+        # paint (a radiance of pi: the lit tone is the colour as
+        # painted), through the strongest caster's visibility and the
+        # screen shadow -- the same composition a lamp gets
+        vis_key = np.where(vis_acc >= 0.0, vis_acc, 1.0).astype(np.float32)
+        if cel_ss_term is not None:
+            vis_key = (vis_key * cel_ss_term).astype(np.float32)
+        wrap_k = np.clip(M.dot(N, cel_L) * np.float32(0.5) + np.float32(0.5),
+                         0.0, 1.0).astype(np.float32)
+        rad_k = np.full((n, 3), np.float32(np.pi), np.float32)
+        if model == 'ANIME':
+            dcontrib, scontrib = _anime_lamp(surf, wrap_k, vis_key, rad_k,
+                                             N, cel_L, V, True,
+                                             not suppress_spec)
+            if track_result:
+                diff_acc += dcontrib
+                spec_acc += scontrib
+            else:
+                contrib = dcontrib + scontrib
+                if clamp > 0.0:
+                    contrib = np.minimum(contrib, clamp)
+                out += contrib
+                if spec_acc is not None:
+                    spec_acc += scontrib
+        else:
+            x_k = (wrap_k * vis_key).astype(np.float32)
+            cart_lit = x_k
+            cart_rad = (rad_k * x_k[:, None] * inv_pi).astype(np.float32)
+            if not suppress_spec:
+                h_k = M.normalize(cel_L + V)
+                sndh_k = np.clip(M.dot(N, h_k) * np.float32(0.5)
+                                 + np.float32(0.5), 0.0, 1.0)
+                hs_k = np.clip(surf.cartoon_hl_size, 0.0, 1.0)
+                edge_k = 1.0 - np.float32(0.25) * hs_k * hs_k
+                gate_k = _anime_smooth(edge_k - surf.cartoon_hl_soft,
+                                       edge_k + surf.cartoon_hl_soft, sndh_k)
+                gate_k = np.where(surf.cartoon_hl_size > 1e-6, gate_k, 0.0)
+                t_k = _anime_smooth(surf.cartoon_th - surf.cartoon_soft,
+                                    surf.cartoon_th + surf.cartoon_soft, x_k)
+                cart_hl = (gate_k * t_k).astype(np.float32)
+    if model == 'CARTOON':
+        # R228: paint replaces the whole accumulation -- no ambient, no
+        # lamp energy (unless Lamp Influence asks), one shadow tone
+        out = _cartoon_compose(surf, cart_lit, cart_hl, cart_rad)
+        # R241: the highlight cel over the paint -- the same hair
+        # shine band the Anime Shader wears (inert until its sockets
+        # say otherwise, so every older cartoon is bitwise)
+        out = _anime_hair_shine(out, surf, ctx, N, V, hair_key_z)
+    if model == 'ANIME':
+        # R229: the hair shine band, painted OVER the banded result
+        # (before emission and the silhouette cheats, like the paint)
+        out = _anime_hair_shine(out, surf, ctx, N, V, hair_key_z)
     if settings.clamp_specular:
         out = np.minimum(out, 64.0)
     out = out + surf.emission
-    return apply_surface_effects(out, surf, N, V)
+    return apply_surface_effects(out, surf, N, V, rim_field=cel_rim)
 
 
 def _blend_layer(out, color, f, mode):
@@ -992,12 +1624,15 @@ def _blend_layer(out, color, f, mode):
     return res
 
 
-def apply_surface_effects(out, surf, N, V):
+def apply_surface_effects(out, surf, N, V, rim_field=None):
     """Fresnel, rim, matcap, reflection tint and backface override.
 
     These sit outside the reflectance model on purpose: they are the artistic
     cheats every package of the era offered on top of whichever shader you
     picked, so they behave the same on Lambert as on Cook-Torrance.
+    R238: `rim_field` is the cel field's depth rim at this batch's pixels;
+    a cel material whose Rim mode is SCREEN takes it in place of the
+    Fresnel power.
     """
     facing = np.clip(np.abs(M.dot(N, V)), 0.0, 1.0)
     edge = 1.0 - facing
@@ -1009,6 +1644,11 @@ def apply_surface_effects(out, surf, N, V):
 
     if np.any(surf.rim > 1e-4):
         r = np.power(edge, np.maximum(surf.rim_power, 0.01)) * surf.rim
+        screen = getattr(surf, 'cel_rim_mode', None)
+        if screen is not None and np.any(screen > 0.5):
+            rf = np.zeros_like(r) if rim_field is None \
+                else np.asarray(rim_field, np.float32) * surf.rim
+            r = np.where(screen > 0.5, rf, r).astype(np.float32)
         out = _blend_layer(out, surf.rim_color, r,
                            getattr(surf, 'rim_blend', None))
 
@@ -1470,6 +2110,14 @@ def apply_fog(rgb, depth, settings, scene, vertex_rate=False, P=None):
                     max(settings.fog_end - settings.fog_start, 1e-5), 0.0, 1.0)
         f = 1.0 - np.floor(t * 16.0) / 16.0
     f = np.clip(f, 0.0, 1.0)
+    fb = int(getattr(settings, 'fog_bands', 0) or 0)
+    if fb >= 2:
+        # R223: banded depth fog -- the transmittance quantized to cel
+        # steps, so distance reads as flat painted planes (the anime
+        # background trick, and the PS1's own coarse fog tables).
+        # Round-to-band, so near surfaces stay clear and the far end
+        # saturates instead of everything sliding one band down
+        f = np.floor(f * fb + 0.5) / fb
     if getattr(settings, 'fog_height', False) and P is not None:
         # h = 1 below the top (full fog), exp falloff above; the fog AMOUNT
         # (1 - f) scales by h, so high surfaces come out of the mist. Where
@@ -1571,6 +2219,23 @@ class ShadeJob:
         self._obj_bounds = (lo, np.maximum(hi - lo, 1e-6))
         return self._obj_bounds
 
+    def object_matrices(self):
+        """Per-object inverse world matrices (n_obj, 4, 4), for object-space
+        texture coordinates -- built once, shared by the CPU contexts and
+        baked into the GPU material (R243)."""
+        if self._obj_matrices is None:
+            objs = self.scene.objects
+            if objs:
+                mats = []
+                for o in objs:
+                    m = o.matrix_world
+                    mats.append(np.linalg.inv(np.asarray(m, np.float32))
+                                if m is not None else np.eye(4, dtype=np.float32))
+                self._obj_matrices = np.stack(mats)
+            else:
+                self._obj_matrices = np.eye(4, dtype=np.float32)[None]
+        return self._obj_matrices
+
     def prewarm(self):
         """Build the lazily-cached tables before any worker thread starts.
 
@@ -1588,31 +2253,53 @@ class ShadeJob:
             for o in self.scene.objects:
                 m = o.matrix_world
                 mats.append(np.linalg.inv(np.asarray(m, np.float32))
-                            if m is not None else np.eye(4, np.float32))
+                            if m is not None else np.eye(4, dtype=np.float32))
             self._obj_matrices = np.stack(mats)
 
     # ..................................................... attribute fetch
-    def attributes(self, tri_idx, bary, bary_lin=None):
+    def attributes(self, tri_idx, bary, bary_lin=None, need=None):
+        """Interpolated surface attributes; `need` (a set of 'P', 'N',
+        'Ng', 'uv', 'uv2', 'vcol') skips what a caller will not read --
+        the punch-through alpha pass (R212) interpolates two fields
+        instead of six. None = everything, exactly as before."""
         mesh = self.scene.mesh
         tris = mesh.tris
-        P = raster.fetch(mesh.verts, tris, tri_idx, bary)
-        smooth = mesh.smooth[tri_idx] if mesh.smooth is not None else None
-        if mesh.normals is not None:
-            Ns = raster.fetch(mesh.normals, tris, tri_idx, bary)
-        else:
-            Ns = mesh.face_normals[tri_idx]
-        Ng = mesh.face_normals[tri_idx] if mesh.face_normals is not None else Ns
-        if smooth is not None:
-            Ns = np.where(smooth[:, None], Ns, Ng)
+        want = (lambda k: need is None or k in need)
+        P = raster.fetch(mesh.verts, tris, tri_idx, bary) \
+            if want('P') else None
+        Ns = Ng = None
+        if want('N') or want('Ng'):
+            smooth = mesh.smooth[tri_idx] if mesh.smooth is not None \
+                else None
+            if mesh.normals is not None:
+                Ns = raster.fetch(mesh.normals, tris, tri_idx, bary)
+            else:
+                Ns = mesh.face_normals[tri_idx]
+            Ng = mesh.face_normals[tri_idx] \
+                if mesh.face_normals is not None else Ns
+            if smooth is not None:
+                Ns = np.where(smooth[:, None], Ns, Ng)
+            Ns = M.normalize(Ns)
+            Ng = M.normalize(Ng)
         ub = bary_lin if (bary_lin is not None and not self.settings.tex_perspective) \
             else bary
-        uv = raster.fetch(mesh.uvs, tris, tri_idx, ub) if mesh.uvs is not None \
-            else np.zeros((tri_idx.size, 2), np.float32)
-        uv2 = raster.fetch(mesh.uvs2, tris, tri_idx, ub) \
-            if getattr(mesh, 'uvs2', None) is not None else uv
-        col = raster.fetch(mesh.colors, tris, tri_idx, bary) \
-            if mesh.colors is not None else np.ones((tri_idx.size, 4), np.float32)
-        return P, M.normalize(Ns), M.normalize(Ng), uv, uv2, col
+        uv = None
+        if want('uv'):
+            uv = raster.fetch(mesh.uvs, tris, tri_idx, ub) \
+                if mesh.uvs is not None \
+                else np.zeros((tri_idx.size, 2), np.float32)
+        uv2 = None
+        if want('uv2'):
+            uv2 = raster.fetch(mesh.uvs2, tris, tri_idx, ub) \
+                if getattr(mesh, 'uvs2', None) is not None \
+                else (uv if uv is not None
+                      else np.zeros((tri_idx.size, 2), np.float32))
+        col = None
+        if want('vcol'):
+            col = raster.fetch(mesh.colors, tris, tri_idx, bary) \
+                if mesh.colors is not None \
+                else np.ones((tri_idx.size, 4), np.float32)
+        return P, Ns, Ng, uv, uv2, col
 
     def uv_screen_gradients(self, tri_idx, bary, uv):
         """Analytic per-pixel screen derivatives of the interpolated UV.
@@ -1726,10 +2413,17 @@ class ShadeJob:
         return dmin.astype(np.float32), wpp.astype(np.float32)
 
     def context(self, tri_idx, bary, px=None, py=None, front=None, bary_lin=None,
-                ray_depth=0, is_camera=True):
+                ray_depth=0, is_camera=True, need=None):
         mesh = self.scene.mesh
         n = tri_idx.size
-        P, Ns, Ng, uv, uv2, col = self.attributes(tri_idx, bary, bary_lin)
+        if need is not None:
+            # attribute closures: I and depth derive from P, generated
+            # from P and the object bounds
+            need = set(need)
+            if 'I' in need or 'generated' in need or 'depth' in need:
+                need.add('P')
+        P, Ns, Ng, uv, uv2, col = self.attributes(tri_idx, bary,
+                                                  bary_lin, need=need)
         ctx = ShadeContext(n)
         ctx.P = P
         ctx.N = Ns
@@ -1745,11 +2439,12 @@ class ShadeJob:
         # reachable as attributes, so 'uv:<name>' answers with the
         # right layer instead of silently falling back to the active one
         names = getattr(mesh, 'uv_names', None) or ()
-        if len(names) > 0 and names[0]:
+        if len(names) > 0 and names[0] and uv is not None:
             ctx.attributes['uv:' + names[0]] = uv
-        if len(names) > 1 and names[1]:
+        if len(names) > 1 and names[1] and uv2 is not None:
             ctx.attributes['uv:' + names[1]] = uv2
-        ctx.I = M.normalize(P - self.eye[None, :])
+        ctx.I = M.normalize(P - self.eye[None, :]) \
+            if P is not None else None
         ctx.px = px
         ctx.py = py
         ctx.width = self.width
@@ -1765,9 +2460,12 @@ class ShadeJob:
         ctx.bvh = self.bvh
         if front is not None:
             ctx.backfacing = (~front).astype(np.float32)
-        view_p = (P - self.eye[None, :]) @ self.view[:3, :3].T
-        ctx.depth = np.abs(view_p[:, 2]).astype(np.float32)
-        if px is not None and \
+        if P is not None:
+            view_p = (P - self.eye[None, :]) @ self.view[:3, :3].T
+            ctx.depth = np.abs(view_p[:, 2]).astype(np.float32)
+        else:
+            ctx.depth = None
+        if px is not None and uv is not None and \
                 str(getattr(self.settings, 'tex_filter', '')) == 'TRILINEAR':
             # the mip footprint: screen points only (a ray hit has no
             # pixel footprint and samples the top level, as the era did)
@@ -1776,13 +2474,21 @@ class ShadeJob:
             np.zeros(n, np.int32)
         self._fill_object(ctx, obj_idx)
         ctx.object_index_raw = obj_idx
-        lo, span = self.object_bounds()
-        oi_c = np.clip(obj_idx, 0, lo.shape[0] - 1)
-        ctx.generated = ((P - lo[oi_c]) / span[oi_c]).astype(np.float32)
+        if P is not None:
+            lo, span = self.object_bounds()
+            oi_c = np.clip(obj_idx, 0, lo.shape[0] - 1)
+            ctx.generated = ((P - lo[oi_c]) / span[oi_c]).astype(np.float32)
+            # R228: the cartoon's shape smoothing reads the same bounds
+            ctx.obj_bounds = (lo, span)
+        else:
+            ctx.generated = None
         ctx.random = _hash1(tri_idx.astype(np.float32))
         ctx.bump_fields = getattr(self, 'bump_fields', None)
         lazy = getattr(self, 'radiosity_lazy', None)
         ctx.radiosity_field = lazy() if lazy is not None else None
+        # R238: the cel field (screen shadow, depth rim), lazily too
+        cel_lazy = getattr(self, 'cel_lazy', None)
+        ctx.cel_field = cel_lazy() if cel_lazy is not None else None
         # the deterministic-sampling identity: the screen pixel where one
         # exists. Traced hits overwrite these with the pixel that spawned
         # their ray (ShadeJob.shade's sample_xy), so a hit's soft shadows
@@ -1816,7 +2522,7 @@ class ShadeJob:
             for o in objs:
                 m = o.matrix_world
                 mats.append(np.linalg.inv(np.asarray(m, np.float32))
-                            if m is not None else np.eye(4, np.float32))
+                            if m is not None else np.eye(4, dtype=np.float32))
             self._obj_matrices = np.stack(mats)
         ctx._obj_mats = self._obj_matrices
         ctx._obj_idx = oi
@@ -1985,6 +2691,18 @@ class ShadeJob:
                                           -M.normalize(ctx.I))), 0.0, 1.0)
             t = np.power(1.0 - facing, np.maximum(surf.fresnel_power, 0.01))
             alpha = np.clip(alpha * (1.0 - t) + surf.edge_opacity * t, 0.0, 1.0)
+        if np.any(surf.alpha_clip >= 0.0):
+            # R211 punch-through: a CLIP material is either fully there
+            # or fully absent -- the era's cut-out alpha test, and the
+            # SAME hard law on every road (camera pass, blend layers,
+            # ray hits), so whichever road drew the surface agrees on
+            # where its holes are
+            cm = surf.alpha_clip >= 0.0
+            alpha = np.where(
+                cm,
+                np.where(alpha >= np.maximum(surf.alpha_clip, 1e-6),
+                         1.0, 0.0),
+                alpha).astype(np.float32)
         if st.transparency == 'STIPPLE' and ctx.px is not None:
             # keep or drop each pixel outright against an ordered threshold --
             # no blending, exactly as hardware without an alpha unit managed it
@@ -2151,6 +2869,17 @@ class ShadeJob:
             acc += self.trace(origin, d, ray_depth + 1, sample_xy=sxy)
         return acc / np.float32(max(samples, 1))
 
+    def _volume_mats(self):
+        """R223: the frame's volume-container material indices, once."""
+        vm = getattr(self, '_vol_mats_cache', None)
+        if vm is None:
+            from .volume import material_is_volume
+            vm = frozenset(
+                i for i, m in enumerate(self.scene.materials or [])
+                if material_is_volume(m))
+            self._vol_mats_cache = vm
+        return vm
+
     def trace(self, origin, dirs, ray_depth, sample_xy=None):
         """Shade whatever a secondary ray hits (background if nothing).
 
@@ -2161,6 +2890,32 @@ class ShadeJob:
             return world_color(self.scene, self.settings, dirs, self.textures, n)
         tmax = np.full(n, 1e30, np.float32)
         tid, t, u, v = self.bvh.intersect(origin, dirs, tmax)
+        # R223: traced rays pass THROUGH volume containers -- a fog box
+        # in a mirror used to reflect as an empty black surface. The
+        # era's mirrors never saw the volume fog either, so the ray
+        # steps past the container and takes whatever stands behind it
+        # (bounded, and free when the scene has no containers).
+        vol_mats = self._volume_mats()
+        if vol_mats and self.scene.mesh.mat_index is not None:
+            org = None
+            vlist = np.fromiter(vol_mats, np.int32)
+            for _ in range(8):
+                hitm = tid >= 0
+                if not hitm.any():
+                    break
+                redo = hitm.copy()
+                redo[hitm] = np.isin(
+                    self.scene.mesh.mat_index[tid[hitm]], vlist)
+                if not redo.any():
+                    break
+                if org is None:
+                    org = np.array(origin, np.float32, copy=True)
+                ri = np.nonzero(redo)[0]
+                org[ri] = org[ri] + dirs[ri] * (t[ri][:, None] + 1e-4)
+                tid2, t2, u2, v2 = self.bvh.intersect(
+                    org[ri], dirs[ri],
+                    np.full(ri.size, 1e30, np.float32))
+                tid[ri], t[ri], u[ri], v[ri] = tid2, t2, u2, v2
         hit = tid >= 0
         out = np.zeros((n, 3), np.float32)
         miss = np.nonzero(~hit)[0]
@@ -2448,9 +3203,17 @@ def collect_exclusive_lights(scene):
     scene.exclusive_lights = frozenset(names) if names else None
 
 
-def _build_shadows(scene, st, mesh):
-    if not (st.shadows and st.shadow_default in ('MAP', 'PER_LIGHT')):
-        return
+def _caster_keep_tri(scene, mesh):
+    """Per-triangle caster mask, or None when everything casts.
+
+    Three voices agree per triangle: the OBJECT's Visibility > Shadow
+    toggle, the BI node's Shadow > Cast, and (R208) the plain
+    Material.cast_shadow flag -- which fur-shell materials turn off so
+    a pelt does not blanket its own body in cast shadow. One mask
+    serves shadow maps (the casters are simply left out of the bake)
+    and ray shadows (the BVH's any-hit skips the triangles by cast
+    filter), so the two shadow roads finally agree about who casts.
+    """
     keep_tri = None
     if mesh is not None and mesh.obj_index is not None and scene.objects:
         keep = np.array([o.cast_shadow for o in scene.objects], bool)
@@ -2458,19 +3221,31 @@ def _build_shadows(scene, st, mesh):
             keep_tri = keep[np.clip(mesh.obj_index, 0,
                                     len(scene.objects) - 1)]
     if mesh is not None and mesh.mat_index is not None and scene.materials:
-        # the BI node's Shadow > Cast: a material can pull its
-        # triangles out of every caster set
+        from .volume import material_is_volume as _miv
         mkeep = []
         any_off = False
         for m in scene.materials:
             props = bi_node_props(m)
             on = bool(props.get('shadow_cast', True)) if props else True
+            on = on and bool(getattr(m, 'cast_shadow', True))
+            # R222: a volume container's bound never casts -- the fog
+            # inside scatters light, the box around it is not geometry
+            on = on and not _miv(m)
             mkeep.append(on)
             any_off = any_off or not on
         if any_off:
             mt = np.array(mkeep, bool)[np.clip(mesh.mat_index, 0,
                                                len(scene.materials) - 1)]
             keep_tri = mt if keep_tri is None else (keep_tri & mt)
+    if keep_tri is not None and keep_tri.all():
+        return None
+    return keep_tri
+
+
+def _build_shadows(scene, st, mesh):
+    if not (st.shadows and st.shadow_default in ('MAP', 'PER_LIGHT')):
+        return
+    keep_tri = _caster_keep_tri(scene, mesh)
     cast = None
     if keep_tri is not None and not keep_tri.all():
         cast = np.nonzero(keep_tri)[0]
@@ -2814,6 +3589,19 @@ def render(scene, settings=None, progress=None, band=None):
     with ST.track('prepare textures'):
         textures = prepare_textures(scene, st)
 
+    # R221: bake any Anime Shader's linked Shadow Ramp into its LUT
+    # here, once, before shading -- the lamp loop samples it and the
+    # GPU uploads the same texels (cache-keyed, so an unchanged ramp
+    # costs one fingerprint)
+    from .nodeeval import bake_anime_ramp
+    for _m in (scene.materials or ()):
+        g = getattr(_m, 'graph', None)
+        if g and 'HALCYON_AnimeShaderNode' in str(g.get('nodes', {})):
+            try:
+                bake_anime_ramp(g, textures, st)
+            except Exception:                                   # noqa: BLE001
+                pass
+
     need_bvh = st.raytrace or st.ambient_occlusion or \
         getattr(st, 'radiosity', False) or \
         (st.shadows and st.shadow_default == 'RAY') or \
@@ -2825,6 +3613,13 @@ def render(scene, settings=None, progress=None, band=None):
 
     with ST.track('shadow maps'):
         _build_shadows(scene, st, mesh)
+    # R208: the caster mask travels to the RAY shadow road too (the
+    # maps already honour it at bake time). visibility() reads it off
+    # the settings and hands it to the BVH's any-hit as a cast filter,
+    # so a fur pelt with Cast Shadows off stops blanketing its own
+    # body. Refreshed every frame; None when everything casts.
+    st._shadow_cast_tri = _caster_keep_tri(
+        scene, mesh) if st.shadows and st.ray_shadows else None
     # R204: the infinite floor answers the scene's lamps now -- built
     # after the BVH and the shadow maps so its cast shadows can use
     # whichever of the two each lamp uses
@@ -2909,8 +3704,30 @@ def render(scene, settings=None, progress=None, band=None):
     has_bump = any('ShaderNodeBump' in
                    str((getattr(m, 'graph', None) or {}).get('nodes', {}))
                    for m in getattr(scene, 'materials', ()) or ())
+    # R227: the ink's REACH in rows. A band's scissor culls the
+    # triangles outside its rows, and an outline seeded in the row
+    # just past the band used to be missing from the band's edge rows
+    # -- a seam between every pair of pooled bands under a thick line,
+    # there since the outline pass shipped (found by the style pack's
+    # band pin). The scissor keeps that many context rows now, exactly
+    # as the bump road keeps its one
+    ink_reach = _ink_reach_rows(scene, st) \
+        if (getattr(st, 'outline', False) or _ink_forced(scene)) else 0
+    # R233: the painted background road's strokes, blur and setback
+    # read past a band the same way (core/gouache.py names the rows)
+    from . import gouache as GOU
+    _gou_on = GOU.on(scene, st)
+    if _gou_on:
+        ink_reach += GOU.reach_rows(scene, st, ss)
+    # R238: the cel field's march and rim read past a band the same way
+    from . import celfield as _CFR
+    if _CFR.field_on(scene, st):
+        ink_reach += _CFR.reach_rows(scene, st, rh)
     if band is not None:
         scissor = (max(band[0], 0) * ss, min(band[1], H) * ss)
+        if ink_reach:
+            scissor = (max(scissor[0] - ink_reach, 0),
+                       min(scissor[1] + ink_reach, rh))
         if has_bump:
             # one CONTEXT row past the band's top: n_bump differences
             # toward the +y neighbour, and without that row a band's
@@ -3102,6 +3919,22 @@ def render(scene, settings=None, progress=None, band=None):
         _GBUF_CACHE[gbuf_ckey] = _ent
         _GBUF_STATS['bytes'] += _nb
 
+    # ---- R211 punch-through: CLIP materials resolve their alpha here,
+    # against the freshly rastered opaque depth, and the survivors JOIN
+    # the depth-buffered pass -- shaded once, never layered. The blend
+    # road below only ever sees what stayed translucent. (Runs after
+    # the g-buffer cache stores its clean opaque copy: promotion is
+    # deterministic and re-applies on every hit.)
+    if frags is not None and transparent is not None and transparent.size:
+        clip_sub, transparent, _clip_plans = _clip_partition(
+            scene, mesh, st, transparent,
+            affine=gbuf.bary_lin is not None)
+        if clip_sub is not None and clip_sub.size:
+            with ST.track('punch-through'):
+                _promote_clip(job, gbuf, vp, st, clip_sub, _clip_plans,
+                              snap, flat_depth, scissor, subdiv_px,
+                              near_eps, ckey=gbuf_ckey)
+
     if band is None and not getattr(st, '_viewport', False):
         # the two numbers behind "the depth is screwed up": what the
         # z-buffer can resolve on THIS frame, and which surfaces were
@@ -3150,6 +3983,26 @@ def render(scene, settings=None, progress=None, band=None):
                       'meant to be solid, set their blend mode to '
                       'Opaque (or Transparency to None) and the frame '
                       'goes back through the z-buffer')
+        _cl = LAST_CLIP
+        if _cl.get('materials'):
+            print('[Halcyon] punch-through: '
+                  f"{_cl['materials']} material(s) resolved "
+                  f"{_fmt_frags(_cl.get('fragments', 0))} fragments in "
+                  'the z-pass '
+                  f"({_fmt_frags(_cl.get('kept', 0))} kept, "
+                  f"{_fmt_frags(_cl.get('promoted', 0))} pixels won) -- "
+                  'those layers never reach the blend road'
+                  + (f"; cache {_cl['cache']}"
+                     if _cl.get('cache') in ('HIT', 'MISS') else ''))
+        for _nm in (_cl.get('auto') or ()):
+            print(f"[Halcyon] punch-through: '{_nm}' has provably "
+                  'binary alpha (its chain ends in a comparison) -- '
+                  'promoted off the blend road automatically; the '
+                  'picture is identical, the layers and their cap '
+                  'are not paid')
+        for _nm, _why in (_cl.get('refused') or {}).items():
+            print(f"[Halcyon] punch-through: '{_nm}' stays on the "
+                  f'blend road -- {_why}')
 
     if progress:
         progress(0.35, 'Shading')
@@ -3158,6 +4011,18 @@ def render(scene, settings=None, progress=None, band=None):
     if band is not None:
         keep = np.zeros(rh, bool)
         keep[max(band[0], 0) * ss:min(band[1], H) * ss] = True
+        if ink_reach and (str(getattr(st, 'ink_color_mode', 'FIXED')
+                                  ).upper() == 'FILL'
+                          or _scene_has_iro(scene)
+                          or _paint_reach_rows(st) > 0
+                          or _gou_on
+                          or getattr(st, 'outline_tone', False)):
+            # a From Fill line (R229: or an Iro-Trace material's) reads
+            # the SHADED colour of the surface pixel that owns it, which
+            # may sit in the context rows: shade those too, so the
+            # band's line is the frame's
+            keep[max(max(band[0], 0) * ss - ink_reach, 0):
+                 min(min(band[1], H) * ss + ink_reach, rh)] = True
         covered &= keep[:, None]
     _rm = getattr(st, '_refine_mask', None)
     if _rm is not None:
@@ -3222,6 +4087,35 @@ def render(scene, settings=None, progress=None, band=None):
                     return _rad_box['f']
 
             job.radiosity_lazy = _lazy_field
+        # R238: the cel field -- the screen shadow and the depth rim of
+        # the cel materials, one whole-frame pass over the G-buffer's own
+        # depth, computed on first use (the GPU road builds it before its
+        # passes and uploads it; a frame with no cel dial reading it
+        # never pays). Deterministic: whoever gets there first computes
+        # the same numbers any other would.
+        from . import celfield as _CF
+        if _CF.field_on(scene, st):
+            import threading as _cthreading
+            _cel_lock = _cthreading.RLock()
+            _cel_box = {}
+
+            def _lazy_cel(job=job, gbuf=gbuf, view=view, proj=proj, vp=vp):
+                with _cel_lock:
+                    if 'f' in _cel_box:
+                        return _cel_box['f']
+                    if _cel_box.get('busy'):
+                        return None
+                    _cel_box['busy'] = True
+                    try:
+                        with ST.track('cel field'):
+                            _cel_box['f'] = _CF.compute(
+                                scene, mesh, gbuf, view, proj, vp,
+                                getattr(scene, 'camera', None), st)
+                    finally:
+                        _cel_box['busy'] = False
+                    return _cel_box['f']
+
+            job.cel_lazy = _lazy_cel
         # stages run on. Strictly opt-in, and strictly qualified -- a frame
         # using anything the GLSL does not reproduce shades on the CPU
         # exactly as before, with the reason printed rather than guessed
@@ -3406,9 +4300,22 @@ def render(scene, settings=None, progress=None, band=None):
     with ST.track('wireframe'):
         img = apply_wireframe(job, gbuf, img, st, vp, eye, textures)
 
-    if getattr(st, 'outline', False):
+    if _gou_on:
+        # R233: the painted background road -- strokes over the
+        # Background materials and the setback's softness, before the
+        # ink so the cels' lines land crisp over the painting. One CPU
+        # pass from the shared G-buffer on either device road
+        with ST.track('painted backgrounds'):
+            img = GOU.apply(scene, gbuf, img, st, vp, view, eye,
+                            frame=int(getattr(scene, 'frame', 0) or 0),
+                            seed=int(getattr(st, 'seed', 0) or 0),
+                            ss=float(gbuf.tri.shape[0])
+                            / float(max(int(st.resolution_y), 1)))
+
+    if getattr(st, 'outline', False) or _ink_forced(scene):
         with ST.track('outline'):
-            img = apply_outline(scene, gbuf, img, st)
+            img = apply_outline(scene, gbuf, img, st, vp, proj=proj,
+                                eye=eye)
 
     with ST.track('ground plane over geometry'):
         img = _plane_over_geometry(img, scene, st, job, gbuf, eye, textures)
@@ -3442,6 +4349,38 @@ def render(scene, settings=None, progress=None, band=None):
     with ST.track('volumetric lights'):
         img = _light_volumes(img, scene, st, gbuf, vp, eye, rw, rh, bvh,
                              sel_mask=_rm)
+
+    with ST.track('volume containers'):
+        # R222: real marched volumes -- containers composite over the
+        # finished frame, depth-clipped, on BOTH devices (the outline
+        # doctrine: one CPU pass over the shared buffers). R225: a
+        # pooled BAND marches only its own rows -- every pixel's march
+        # is a pure function of the pixel (whole-lane shadow draws per
+        # (volume, step, lamp)), so the band's values are the whole
+        # frame's, and N workers no longer march the frame N times
+        from . import volume as VOL
+        _vol_sel = _rm
+        if band is not None:
+            _bm = np.zeros((rh, rw), bool)
+            _bm[keep] = True
+            _vol_sel = _bm if _rm is None else (_bm & _rm)
+        img = VOL.march(img, scene, st, gbuf, vp, eye, rw, rh, bvh,
+                        sel_mask=_vol_sel, textures=textures, view=view)
+
+    if band is None and _rm is None and getattr(job, 'unsupported', None):
+        # R226: the CPU road's evaluator failures, BY NAME. The GPU road
+        # refuses a material whose chain the evaluator cannot run and
+        # says so; the CPU road collected the same notes and printed
+        # NOTHING -- a node that raised shaded a plausible pass-through
+        # in silence. Once per frame, never per band or refine pass
+        msg = ('node evaluator: ' + '; '.join(sorted(job.unsupported)))
+        print('[Halcyon] ' + msg)
+        try:
+            lst = getattr(scene, 'unsupported', None)
+            if isinstance(lst, list) and msg not in lst:
+                lst.append(msg)
+        except Exception:                                       # noqa: BLE001
+            pass
 
     if band is None and str(st.debug_pass) == 'BEAUTY' and \
             not getattr(st, '_pano_strip', False):
@@ -4078,6 +5017,16 @@ def material_model(mat, settings):
                 return node.get('props', {}).get('model', settings.default_model)
             if node.get('bl_idname') == 'HALCYON_BIMaterialNode':
                 return bi_matrix_model(node.get('props', {}))
+            if node.get('bl_idname') in ('HALCYON_MaxStandardNode',
+                                         'HALCYON_MaxRaytraceNode'):
+                # R243: Max's material nodes name their model by shader
+                # type (Wire takes the wireframe road)
+                from ..nodes.max_nodes import MAX_MODEL_FOR
+                pr = node.get('props', {})
+                if pr.get('wire'):
+                    return 'WIREFRAME'
+                return MAX_MODEL_FOR.get(str(pr.get('shader_type', 'BLINN')),
+                                         'MAX_BLINN')
         return getattr(mat, 'model', None) if getattr(mat, 'model', None) else None
     return getattr(mat, 'model', None) or settings.default_model
 
@@ -4552,8 +5501,21 @@ def _split_by_alpha(scene, mesh, st=None):
     if mesh.mat_index is None:
         return None, np.zeros(0, np.int32)
     if st is not None and st.transparency in ('NONE', 'STIPPLE'):
+        # R222: even with transparency off, a volume container's
+        # triangles stay out of the raster -- they are the marcher's
+        # bound, never a surface
+        from .volume import material_is_volume as _miv
+        vmask = np.array([_miv(m) for m in scene.materials] or [False],
+                         bool)
+        if vmask.any():
+            mi0 = np.clip(mesh.mat_index, 0, vmask.size - 1)
+            keep = ~vmask[mi0]
+            LAST_SPLIT.update(tris_volume=int((~keep).sum()))
+            return np.nonzero(keep)[0].astype(np.int32), \
+                np.zeros(0, np.int32)
         return None, np.zeros(0, np.int32)
     see_through = np.zeros(max(len(scene.materials), 1), bool)
+    is_vol = np.zeros(max(len(scene.materials), 1), bool)
     reasons = {}
     for i, m in enumerate(scene.materials):
         why = None
@@ -4569,14 +5531,370 @@ def _split_by_alpha(scene, mesh, st=None):
         see_through[i] = why is not None
         if why is not None:
             reasons[str(getattr(m, 'name', None) or f'material {i}')] = why
+        # R222: a volume container draws NO surface -- its triangles are
+        # only the marcher's bound, in neither raster pass
+        from .volume import material_is_volume
+        if material_is_volume(m):
+            is_vol[i] = True
+            reasons[str(getattr(m, 'name', None) or f'material {i}')] = \
+                'volume container (marched, no surface)'
     mi = np.clip(mesh.mat_index, 0, see_through.size - 1)
     t = see_through[mi]
+    vol_t = is_vol[mi]
     LAST_SPLIT.update(reasons=reasons, materials=int(see_through.size),
                       see_through=int(see_through.sum()),
                       tris=int(mesh.mat_index.size),
-                      tris_see_through=int(t.sum()))
-    return np.nonzero(~t)[0].astype(np.int32), np.nonzero(t)[0].astype(np.int32)
+                      tris_see_through=int(t.sum()),
+                      tris_volume=int(vol_t.sum()))
+    return (np.nonzero(~t & ~vol_t)[0].astype(np.int32),
+            np.nonzero(t & ~vol_t)[0].astype(np.int32))
 
+
+#: R211: what the last frame's punch-through stage did -- materials on
+#: the clip road, refusals by name, fragment counts, pixels promoted.
+#: The report line reads from it; tests hold it so the fast road can
+#: never silently be the slow one.
+LAST_CLIP = {}
+
+
+def _clip_partition(scene, mesh, st, transparent, affine=False):
+    """Split the see-through subset into punch-through and blend tris.
+
+    A CLIP material whose alpha is one evaluable chain (scene.clip_socket)
+    leaves the blend road entirely: its triangles resolve visibility in
+    `_promote_clip` and join the depth-buffered pass. Anything CLIP that
+    cannot lift its alpha out stays on the blend road -- by name -- where
+    the shading law still delivers the hard 0/1. Returns
+    (clip_tris_or_None, blend_tris, plans).
+    """
+    from .scene import clip_road
+    LAST_CLIP.clear()
+    if transparent is None or transparent.size == 0:
+        return None, transparent, {}
+    plans, refused, auto = {}, {}, []
+    for i, m in enumerate(scene.materials):
+        name = str(getattr(m, 'name', None) or f'material {i}')
+        thr, kind, nd, extra, note = clip_road(m)
+        if thr is None:
+            # a CLIP material that cannot lift its alpha refuses BY
+            # NAME; a plain Blend material is simply on its own road
+            if str(getattr(m, 'alpha_mode', 'BLEND')) == 'CLIP':
+                refused[name] = str(note)
+            continue
+        if affine:
+            refused[name] = ('affine texturing shades layers from '
+                             'screen-linear coordinates the promoted '
+                             'pass does not carry')
+            continue
+        plans[i] = (kind, nd, extra, float(thr))
+        if note == 'binary alpha, detected':
+            # R213: a Blend material whose alpha chain provably yields
+            # only 0 or 1 -- the blend road and the z-buffer give the
+            # IDENTICAL picture, so it takes the fast road unasked.
+            # Old scenes' fur materials are exactly this
+            auto.append(name)
+    LAST_CLIP.update(refused=refused, materials=len(plans), auto=auto)
+    if not plans:
+        return None, transparent, plans
+    mi = np.clip(mesh.mat_index[transparent], 0,
+                 max(len(scene.materials), 1) - 1)
+    is_clip = np.isin(mi, np.array(sorted(plans), np.int64))
+    clip_sub = transparent[is_clip]
+    blend_sub = transparent[~is_clip]
+    return (clip_sub if clip_sub.size else None), blend_sub, plans
+
+
+def _chain_attr_needs(graph, node, sockname):
+    """Which context attributes an alpha chain can touch, statically.
+
+    Walks the nodes reachable from `node`'s `sockname` input. Every
+    node type in the whitelist declares what it reads; ONE unknown node
+    returns None, which means "build the full context" -- lean is an
+    optimisation, never a semantics. The fur chain (TexCoord ▸ UV,
+    Fur Tufts, Hair Info, Greater Than) resolves to {uv, vcol}: two
+    interpolations instead of six plus a view-vector normalise."""
+    nodes = (graph or {}).get('nodes', {}) or {}
+    pure = {
+        'ShaderNodeMath', 'ShaderNodeVectorMath', 'ShaderNodeValToRGB',
+        'ShaderNodeRGB', 'ShaderNodeValue', 'ShaderNodeMixRGB',
+        'ShaderNodeMix', 'ShaderNodeInvert', 'ShaderNodeGamma',
+        'ShaderNodeBrightContrast', 'ShaderNodeHueSaturation',
+        'ShaderNodeRGBToBW', 'ShaderNodeSeparateColor',
+        'ShaderNodeCombineColor', 'ShaderNodeSeparateRGB',
+        'ShaderNodeCombineRGB', 'ShaderNodeSeparateXYZ',
+        'ShaderNodeCombineXYZ', 'ShaderNodeSeparateHSV',
+        'ShaderNodeCombineHSV', 'ShaderNodeMapRange', 'ShaderNodeClamp',
+        'ShaderNodeMapping', 'ShaderNodeFloatCurve',
+        'ShaderNodeRGBCurve', 'ShaderNodeVectorCurve',
+    }
+    # the 26 pattern nodes that read only their Vector (or, unlinked,
+    # the generated coordinates) -- Matcap reads N/I and is NOT here
+    pat = {f'HALCYON_{k}Node' for k in (
+        'Marble', 'Wood', 'Granite', 'Dents', 'Crackle', 'Plasma',
+        'Ripples', 'Starfield', 'Weave', 'Scratches', 'Tiles', 'Spiral',
+        'Noise', 'Caustics', 'Water', 'Gradient', 'Cells', 'Static',
+        'FurTufts', 'Bozo', 'Agate', 'Leopard', 'Onion', 'Bumps',
+        'Wrinkles', 'Brick')}
+    texco = ({'generated'}, {'N'}, {'uv'}, {'P'}, {'P'}, {'P'},
+             {'N', 'I'})
+    needs = set()
+    seen = set()
+
+    def walk(nid, out_idx):
+        if (nid, out_idx) in seen:
+            return True
+        seen.add((nid, out_idx))
+        nd = nodes.get(nid)
+        if nd is None:
+            return False
+        bid = nd.get('bl_idname', '')
+        if bid == 'ShaderNodeTexCoord':
+            if not (0 <= out_idx < len(texco)):
+                return False
+            needs.update(texco[out_idx])
+            return True
+        if bid == 'ShaderNodeHairInfo':
+            needs.add('vcol')
+            return True
+        if bid == 'ShaderNodeVertexColor':
+            needs.add('vcol')
+            return True
+        if bid == 'ShaderNodeUVMap':
+            needs.update(('uv', 'uv2'))
+            return True
+        if bid in pat:
+            vec_linked = any(sk.get('name') == 'Vector' and sk.get('link')
+                             for sk in nd.get('inputs', ()))
+            if not vec_linked:
+                needs.add('generated')
+        elif bid not in pure:
+            return False
+        for sk in nd.get('inputs', ()):
+            link = sk.get('link')
+            if link and not walk(link[0], int(link[1])
+                                 if len(link) > 1 else 0):
+                return False
+        return True
+
+    for sk in (node or {}).get('inputs', ()):
+        if sk.get('name') != sockname:
+            continue
+        link = sk.get('link')
+        if not link:
+            return set()
+        return needs if walk(link[0], int(link[1])
+                             if len(link) > 1 else 0) else None
+    return None
+
+
+#: R212: the punch-through memo. A viewport refine re-renders an
+#: UNCHANGED frame; recomputing an identical resolve for it was most of
+#: the field's "still crippled". Keyed on the same content the G-buffer
+#: cache trusts, plus the clip side's own fingerprint and the frame.
+_CLIP_CACHE = {}
+_CLIP_CAP = 6
+
+
+def _clip_fingerprint(scene, clip_tris, plans):
+    parts = [int(clip_tris.size),
+             int(clip_tris[::257].astype(np.int64).sum())]
+    for mi in sorted(plans):
+        kind, nd, extra, thr = plans[mi]
+        mat = scene.materials[mi]
+        if kind == 'const':
+            sig = float(extra)
+        else:
+            g = getattr(mat, 'graph', None) or {}
+            nodes = g.get('nodes', {}) or {}
+            bits = []
+            stack = [(nd.get('id'), None)]
+            seen = set()
+            while stack:
+                nid, _o = stack.pop()
+                if nid in seen or nid not in nodes:
+                    continue
+                seen.add(nid)
+                d = nodes[nid]
+                bits.append((nid, d.get('bl_idname', ''),
+                             repr(sorted((d.get('props') or {}).items())),
+                             tuple((sk.get('name'),
+                                    repr(sk.get('default')),
+                                    tuple(sk.get('link') or ()))
+                                   for sk in d.get('inputs', ()))))
+                for sk in d.get('inputs', ()):
+                    if sk.get('link'):
+                        stack.append((sk['link'][0], None))
+            sig = hash(repr(sorted(bits)))
+        parts.append((mi, kind, float(thr), sig))
+    return tuple(parts)
+
+
+def _promote_clip(job, gbuf, vp, st, clip_tris, plans, snap, flat_depth,
+                  scissor, subdiv_px, near_eps, ckey=None):
+    """Resolve CLIP visibility with alpha-tested rasterisation (R212).
+
+    The 1.55.0 road collected every clip fragment into a list, sorted
+    millions to keep thousands, and built full shading contexts to
+    evaluate a two-attribute chain -- the field was right to call it a
+    calculation problem. Now the test runs INSIDE the raster, the way
+    the era's hardware ran it: clip triangles rasterise near-first in
+    depth-ordered chunks against a live z-buffer seeded with the
+    tolerant limit of the opaque depth, each candidate fragment
+    evaluates ONLY its alpha chain over ONLY the attributes that chain
+    can read, survivors write z immediately -- so everything behind an
+    already-solid tuft dies at the depth test unevaluated. No fragment
+    lists, no global sort. The winner per pixel is the same one the old
+    road picked (nearest solid, ties to the lowest triangle id): the
+    z-buffer IS that rule. And because an unchanged frame resolves to
+    the same answer, the whole result is memoised: an idle viewport
+    refine replays six scatters instead of re-resolving a pelt.
+    """
+    from .nodeeval import VALUE, GraphEvaluator
+    mesh = job.scene.mesh
+    key = None
+    if ckey is not None:
+        key = (ckey, _clip_fingerprint(job.scene, clip_tris, plans),
+               int(job.scene.frame), float(job.scene.time))
+        hit = _CLIP_CACHE.get(key)
+        if hit is not None:
+            _CLIP_CACHE[key] = _CLIP_CACHE.pop(key)      # LRU touch
+            wy, wx = hit['wy'], hit['wx']
+            gbuf.depth[wy, wx] = hit['depth']
+            gbuf.zndc[wy, wx] = hit['depth']
+            gbuf.tri[wy, wx] = hit['tri']
+            gbuf.bary[wy, wx] = hit['bary']
+            gbuf.front[wy, wx] = hit['front']
+            LAST_CLIP.update(hit['stats'])
+            LAST_CLIP['cache'] = 'HIT'
+            return
+    LAST_CLIP['cache'] = 'MISS' if ckey is not None else 'off'
+
+    # the clip depth pass: its own buffer, seeded at the TOLERANT limit
+    # of the opaque depth so coplanar shell-meets-skin contacts promote
+    # exactly as a blend layer would have composited
+    cg = raster.GBuffer(gbuf.width, gbuf.height)
+    cg.depth[:] = raster.abuf_depth_limit(gbuf.depth)
+    cg.zndc[:] = cg.depth
+
+    thr_of = np.zeros(max(len(job.scene.materials), 1), np.float32)
+    for mi, (_k, _n, _x, t_) in plans.items():
+        thr_of[mi] = max(float(t_), 1e-6)
+    lean = {}
+    for mi, (kind, nd, extra, _t) in plans.items():
+        if kind == 'node':
+            mat = job.scene.materials[mi]
+            lean[mi] = _chain_attr_needs(getattr(mat, 'graph', None),
+                                         nd, str(extra))
+    stats = {'offered': 0, 'evaluated': 0}
+    mat_index = mesh.mat_index
+
+    def frag_test(tri_ids, px, py, bary, front):
+        keep = np.zeros(tri_ids.size, bool)
+        stats['offered'] += int(tri_ids.size)
+        mat_f = mat_index[tri_ids] if mat_index is not None \
+            else np.zeros(tri_ids.size, np.int32)
+        for mi, (kind, nd, extra, _t) in plans.items():
+            idx = np.nonzero(mat_f == mi)[0]
+            if idx.size == 0:
+                continue
+            if kind == 'const':
+                a = np.full(idx.size, float(extra), np.float32)
+            else:
+                mat = job.scene.materials[mi]
+                graph = getattr(mat, 'graph', None)
+                a = np.empty(idx.size, np.float32)
+                stats['evaluated'] += int(idx.size)
+                for s0 in range(0, int(idx.size), int(MAX_CHUNK)):
+                    e0 = min(s0 + int(MAX_CHUNK), int(idx.size))
+                    sub = idx[s0:e0]
+                    val = None
+                    if lean.get(mi) is not None:
+                        # the evaluator NEVER raises out of a node: it
+                        # records the error and falls back -- so a lean
+                        # context that starved a node shows up in
+                        # ev.errors, not as an exception. Check, and
+                        # redo with everything. Loud fallback, never
+                        # silent wrong pixels.
+                        try:
+                            ctx = job.context(tri_ids[sub], bary[sub],
+                                              px[sub], py[sub],
+                                              front[sub], None, 0, True,
+                                              need=lean[mi])
+                            ev = GraphEvaluator(
+                                graph, ctx, job.textures,
+                                getattr(mat, 'programs', None))
+                            val = np.asarray(
+                                ev.input(nd, str(extra), VALUE),
+                                np.float32).reshape(-1)
+                            if ev.errors:
+                                val = None
+                        except Exception:               # noqa: BLE001
+                            val = None
+                        if val is None:
+                            lean[mi] = None
+                    if val is None:
+                        ctx = job.context(tri_ids[sub], bary[sub],
+                                          px[sub], py[sub], front[sub],
+                                          None, 0, True)
+                        ev = GraphEvaluator(graph, ctx, job.textures,
+                                           getattr(mat, 'programs',
+                                                   None))
+                        val = np.asarray(
+                            ev.input(nd, str(extra), VALUE),
+                            np.float32).reshape(-1)
+                    a[s0:e0] = val
+            if st.alpha_threshold > 0.0:
+                # the global hard cutoff runs FIRST in the shading law;
+                # promoted visibility must agree with the shaded alpha
+                a = np.where(a >= st.alpha_threshold, a, 0.0)
+            keep[idx] = a >= thr_of[mi]
+        return keep
+
+    # near-first depth-ordered chunks: the clip z tightens between
+    # chunks, so far fragments die before evaluation. Order affects
+    # only HOW MUCH is evaluated -- the z-buffer's tie rule makes the
+    # winner order-free, chunking included
+    cent = mesh.verts[mesh.tris[clip_tris]].mean(axis=1)
+    wrow = vp[3, :3]
+    zkey = cent @ wrow + vp[3, 3]
+    order = np.argsort(zkey, kind='stable')
+    n_chunks = int(min(24, max(1, order.size // 4096)))
+    for ch in np.array_split(order, n_chunks):
+        if ch.size == 0:
+            continue
+        raster.rasterize(mesh.verts, mesh.tris, vp, job.width,
+                         job.height, cull='NONE', snap=snap,
+                         depth_bits=st.depth_precision,
+                         subset=clip_tris[ch], gbuf=cg,
+                         depth_write=True, flat_depth=flat_depth,
+                         scissor=scissor, subdiv_px=subdiv_px,
+                         near_eps=near_eps, frag_test=frag_test)
+
+    win = cg.mask()
+    n_win = int(win.sum())
+    LAST_CLIP.update(fragments=stats['offered'],
+                     evaluated=stats['evaluated'],
+                     kept=n_win, promoted=n_win)
+    if n_win == 0:
+        return
+    wy, wx = np.nonzero(win)
+    gbuf.depth[wy, wx] = cg.depth[wy, wx]
+    gbuf.zndc[wy, wx] = cg.depth[wy, wx]
+    gbuf.tri[wy, wx] = cg.tri[wy, wx]
+    gbuf.bary[wy, wx] = cg.bary[wy, wx]
+    gbuf.front[wy, wx] = cg.front[wy, wx]
+    if key is not None:
+        while len(_CLIP_CACHE) >= _CLIP_CAP:
+            _CLIP_CACHE.pop(next(iter(_CLIP_CACHE)))
+        _CLIP_CACHE[key] = {
+            'wy': wy.copy(), 'wx': wx.copy(),
+            'depth': cg.depth[wy, wx].copy(),
+            'tri': cg.tri[wy, wx].copy(),
+            'bary': cg.bary[wy, wx].copy(),
+            'front': cg.front[wy, wx].copy(),
+            'stats': {'fragments': stats['offered'],
+                      'evaluated': stats['evaluated'],
+                      'kept': n_win, 'promoted': n_win}}
 
 def depth_report(proj, gbuf, depth_bits, depth_sort='ZBUFFER'):
     """What this frame's z-buffer can actually resolve, in world units.
@@ -6240,6 +7558,64 @@ def edge_distance_exact(gbuf, mesh, vp, snap=0.0):
     return out
 
 
+def marked_edge_distance(gbuf, mesh, vp, snap=0.0):
+    """R220: distance in pixels from each covered pixel to the nearest
+    MARKED edge of its own triangle -- Freestyle marks, Sharp, creases,
+    carried per triangle as `MeshData.ink_tri_mask` (bit k = the edge
+    opposite corner k). The same exact projected-vertex arithmetic as
+    edge_distance_exact, restricted to the marked slots; hidden-line
+    removal comes free, because only the z-winning triangle's own pixels
+    can ever measure small. Returns (H,W) float32, 1e9 where no marked
+    edge is near, or None when the mesh carries no marks."""
+    if mesh is None or mesh.tris is None or mesh.verts is None or \
+            getattr(mesh, 'ink_tri_mask', None) is None:
+        return None
+    from . import raster as _raster
+    try:
+        _clip, screen, _invw, _z = _raster.project(
+            np.asarray(mesh.verts, np.float32), vp, gbuf.width, gbuf.height,
+            snap=snap)
+    except Exception:                                           # noqa: BLE001
+        return None
+    cov = gbuf.mask()
+    py, px = np.nonzero(cov)
+    out = np.full((gbuf.height, gbuf.width), 1e9, np.float32)
+    if py.size == 0:
+        return out
+    tid = gbuf.tri[py, px]
+    mbits = np.asarray(mesh.ink_tri_mask, np.uint8)[tid]
+    hit = mbits != 0
+    if not hit.any():
+        return out
+    py, px, tid, mbits = py[hit], px[hit], tid[hit], mbits[hit]
+    tri = np.asarray(mesh.tris, np.int32)[tid]
+    p0 = screen[tri[:, 0]]
+    p1 = screen[tri[:, 1]]
+    p2 = screen[tri[:, 2]]
+    qx = px.astype(np.float32) + 0.5
+    qy = py.astype(np.float32) + 0.5
+    area2 = ((p1[:, 0] - p0[:, 0]) * (p2[:, 1] - p0[:, 1])
+             - (p2[:, 0] - p0[:, 0]) * (p1[:, 1] - p0[:, 1]))
+    safe = np.where(np.abs(area2) < 1e-9, 1e-9, area2)
+    l0 = ((p1[:, 1] - p2[:, 1]) * (qx - p2[:, 0])
+          + (p2[:, 0] - p1[:, 0]) * (qy - p2[:, 1])) / safe
+    l1 = ((p2[:, 1] - p0[:, 1]) * (qx - p2[:, 0])
+          + (p0[:, 0] - p2[:, 0]) * (qy - p2[:, 1])) / safe
+    l2 = 1.0 - l0 - l1
+    a2 = np.abs(area2)
+    d0 = np.abs(l0) * a2 / np.maximum(np.linalg.norm(p1 - p2, axis=1), 1e-6)
+    d1 = np.abs(l1) * a2 / np.maximum(np.linalg.norm(p2 - p0, axis=1), 1e-6)
+    d2 = np.abs(l2) * a2 / np.maximum(np.linalg.norm(p0 - p1, axis=1), 1e-6)
+    big = np.float32(1e9)
+    d = np.minimum(np.minimum(
+        np.where(mbits & 1, d0, big),
+        np.where(mbits & 2, d1, big)),
+        np.where(mbits & 4, d2, big))
+    d = np.where(np.isfinite(d), d, 0.0)
+    out[py, px] = d.astype(np.float32)
+    return out
+
+
 def crease_edges(gbuf, mesh, angle_deg=25.0):
     """Pixels on a silhouette or on an edge where the surface turns.
 
@@ -6306,7 +7682,102 @@ def _thicken(mask, radius):
     return out
 
 
-def apply_outline(scene, gbuf, img, st):
+def _ink_forced(scene):
+    """R220: True when any material says Always Ink -- the outline pass
+    then runs even with the global switch off."""
+    return any(str(getattr(m, 'ink_mode', 'INHERIT')).upper() == 'ON'
+               for m in (getattr(scene, 'materials', None) or ()))
+
+
+def _scene_has_iro(scene):
+    """R229: whether any material inks in its own colour (Iro-Trace)."""
+    from . import ink as INK
+    return any(m[0] == 'IRO' for m in INK.scene_iro(scene))
+
+
+def INK_EYE(vp):
+    """R234: the camera position from the view-projection, for a
+    caller without the eye (core/ink._eye_from_vp)."""
+    from . import ink as INK
+    return INK._eye_from_vp(vp)
+
+
+def _paint_reach_rows(st):
+    """R230: how many internal rows the paint stages (misregistration,
+    bleed) read past a band."""
+    from . import film as FILM
+    ss = float(max(int(getattr(st, 'aa_samples', 1) or 1), 1)) * 4.0
+    return FILM.paint_reach(st, ss)
+
+
+def _ink_reach_rows(scene, st):
+    """R227: how many rows past a band an ink line can reach -- the
+    context the band's scissor (and, for From Fill, its shading) must
+    keep so a pooled band draws the whole frame's line. R230: the paint
+    stages' reach rides on top."""
+    from . import ink as INK
+    mats = getattr(scene, 'materials', None) or []
+    g_width = int(np.clip(getattr(st, 'outline_width', 1), 1, 8))
+    widths = [int(np.clip(int(getattr(m, 'ink_width', 0) or 0) or g_width,
+                          1, 8)) for m in mats] + [g_width]
+    w_max = float(max(widths))
+    if INK.styled_on(st, scene):
+        ref = int(getattr(st, 'ink_reference_height', 0) or 0)
+        rs = 1.0
+        if ref > 0:
+            rs = float(int(st.resolution_y) * max(int(getattr(
+                st, 'aa_samples', 1) or 1), 1) * 4) / float(ref)
+            # generous: whatever the internal height turns out to be,
+            # a reach a few rows too long only costs a few rows
+        h_max = max(w_max * rs - 0.5, 0.5) \
+            * (1.0 + float(np.clip(getattr(st, 'ink_taper', 0.0), 0, 1))) \
+            * (1.0 + float(np.clip(getattr(st, 'ink_shadow_side', 0.0),
+                                   0, 1))) \
+            * (1.0 + float(np.clip(getattr(st, 'ink_weight_noise', 0.0),
+                                   0, 1))) \
+            * (1.0 + float(np.clip(getattr(st, 'ink_roughness', 0.0),
+                                   0, 1))) \
+            + float(max(getattr(st, 'ink_drift', 0.0), 0.0)) * rs
+        # R239: the vertex-colour line control can double a width
+        if any(str(getattr(m, 'ink_vc', 'OFF') or 'OFF').upper() != 'OFF'
+               for m in mats):
+            h_max = h_max * 2.0
+        if str(getattr(st, 'ink_texture', 'SOLID')).upper() == 'CHARCOAL':
+            h_max = h_max * 1.1 + 1.0
+        # R231: a stroke end past the band thins the line inside it over
+        # End Length, and the scissor's own cut must not read as an end
+        # inside the band: the reach covers the whole taper
+        if float(getattr(st, 'ink_end_taper', 0.0)) > 0.0:
+            h_max += float(max(getattr(st, 'ink_end_length', 12.0), 1.0)) \
+                * rs
+        spread = float(max(getattr(st, 'ink_pencil_spread', 1.5), 0.0)) \
+            if str(getattr(st, 'ink_style', 'CLEAN')).upper() == 'PENCIL' \
+            else 0.0
+        # R234: the pressure's boost, the isophote's walk, the stroke
+        # road's chain operations (core/lines.py names its rows)
+        h_max *= 1.0 + 1.5 * float(np.clip(getattr(st, 'ink_pressure', 0.0),
+                                           0, 1))
+        reach = h_max + float(max(getattr(st, 'ink_boil', 0.0), 0.0)) \
+            + spread + 3.0
+        if float(getattr(st, 'ink_isophote', 0.0)) > 0.0:
+            reach += float(max(getattr(st, 'ink_isophote_range', 24.0),
+                               1.0)) * rs + 2.0
+        from . import lines as LN
+        reach += LN.road_rows(st, rs) + LN.source_rows(st, rs)
+        return int(np.ceil(reach)) + _paint_reach_rows(st)
+    # the mask road: a seed dilated w-1 each way, marked ink w wide.
+    # R234: the new line sources read past a band on this road too
+    from . import lines as LN
+    rs_m = 1.0
+    ref_m = int(getattr(st, 'ink_reference_height', 0) or 0)
+    if ref_m > 0:
+        rs_m = float(int(st.resolution_y) * max(int(getattr(
+            st, 'aa_samples', 1) or 1), 1) * 4) / float(ref_m)
+    return int(w_max) + 1 + int(np.ceil(LN.source_rows(st, rs_m))) \
+        + _paint_reach_rows(st)
+
+
+def apply_outline(scene, gbuf, img, st, vp=None, proj=None, eye=None):
     """Ink cartoon outlines from the G-buffer, before the post chain.
 
     The line sources are the buffers the raster already filled -- object
@@ -6315,6 +7786,15 @@ def apply_outline(scene, gbuf, img, st):
     creases. It runs at the INTERNAL resolution: a supersampled frame
     anti-aliases its own ink on the way down, which is how the era's
     software got clean cartoon lines without a line renderer.
+
+    R220 grew it two ways, both neutral at defaults. Marked Edges draws
+    the edges the ARTIST marked (Freestyle marks, Sharp, creases) as
+    interior ink, by exact per-pixel distance to the pixel's own
+    triangle's marked edges -- hidden-line removal is the z-buffer's own
+    verdict. And every material now has a say: Ink mode (inherit /
+    always / never), its own ink colour, its own width. A scene where
+    every material inherits takes the pre-R220 single-class road,
+    bitwise.
 
     Computed on the CPU from the same G-buffer on either device, so the
     picture cannot differ between them by construction.
@@ -6325,7 +7805,23 @@ def apply_outline(scene, gbuf, img, st):
     if not cov.any():
         return img
     safe = np.where(cov, tri, 0)
-    edge = np.zeros(tri.shape, bool)
+    # R230: the paint before the ink -- misregistration and bleed move
+    # and soften the painted colour; the lines below land crisp where
+    # the drawing put them. Internal-resolution amplitudes scale by the
+    # supersample factor so the dials mean output pixels.
+    from . import film as FILM
+    if float(getattr(st, 'film_misregister', 0.0)) > 0.0 or \
+            float(getattr(st, 'film_bleed', 0.0)) > 1e-3:
+        _ss = float(tri.shape[0]) / float(max(int(st.resolution_y), 1))
+        img = FILM.misregister_and_bleed(
+            img, st, frame=int(getattr(scene, 'frame', 0) or 0),
+            seed=int(getattr(st, 'seed', 0) or 0), ss=_ss)
+    # R227: the seeds keep their KIND -- silhouette (object, depth and
+    # sky boundaries) apart from interior (material breaks, creases) --
+    # for the style road's thick-outer / thin-inner line; the mask roads
+    # read their union, bitwise what they always read
+    edge_sil = np.zeros(tri.shape, bool)
+    edge_int = np.zeros(tri.shape, bool)
 
     def neigh_diff(plane, differs):
         """OR `differs(a, b)` over the 4-neighbourhood into `edge`."""
@@ -6336,24 +7832,24 @@ def apply_outline(scene, gbuf, img, st):
         e[:-1, :] |= differs(plane[:-1, :], plane[1:, :])
         return e
 
+    dmap = np.where(cov, gbuf.depth, 1e12).astype(np.float32)
     if getattr(st, 'outline_objects', True) and \
             mesh.obj_index is not None:
         omap = np.where(cov, mesh.obj_index[safe], -1)
-        edge |= neigh_diff(omap, lambda a, b: a != b)
+        edge_sil |= neigh_diff(omap, lambda a, b: a != b)
     if getattr(st, 'outline_materials', False) and \
             mesh.mat_index is not None:
         mmap = np.where(cov, mesh.mat_index[safe], -1)
-        edge |= neigh_diff(mmap, lambda a, b: a != b)
+        edge_int |= neigh_diff(mmap, lambda a, b: a != b)
     if getattr(st, 'outline_depth', True):
         thr = max(float(getattr(st, 'outline_depth_threshold', 0.02)), 1e-5)
-        dmap = np.where(cov, gbuf.depth, 1e12).astype(np.float32)
 
         def depth_break(a, b):
             near = np.minimum(np.abs(a), np.abs(b))
             return (a < 1e11) & (a < b) & \
                 ((b - a) > thr * np.maximum(near, 1e-4))
 
-        edge |= neigh_diff(dmap, depth_break)
+        edge_sil |= neigh_diff(dmap, depth_break)
     if getattr(st, 'outline_normals', True) and \
             mesh.face_normals is not None:
         fn = mesh.face_normals[safe]
@@ -6366,30 +7862,278 @@ def apply_outline(scene, gbuf, img, st):
             return (d < cos_lim) & (np.abs(a).sum(-1) > 0) & \
                 (np.abs(b).sum(-1) > 0)
 
-        edge |= neigh_diff(fn, crease)
+        edge_int |= neigh_diff(fn, crease)
+    # R234: three more interior sources (core/lines.py) -- form lines
+    # (the valleys of the facing), shadow lines (the terminator at the
+    # Shadow Level) and tone lines (flow-guided DoG of the shaded
+    # frame). Each keeps off the silhouette's own neighbourhood; each
+    # is a plain seed class, so both roads draw it
+    want_form = bool(getattr(st, 'outline_form', False))
+    want_shadow = bool(getattr(st, 'outline_shadow', False))
+    want_tone = bool(getattr(st, 'outline_tone', False))
+    if want_form or want_shadow or want_tone:
+        from . import lines as LN
+        _rs = 1.0
+        _ref = int(getattr(st, 'ink_reference_height', 0) or 0)
+        if _ref > 0:
+            _rs = float(tri.shape[0]) / float(_ref)
+        _N = LN.surface_normals(mesh, gbuf, cov)
+        _P = LN.surface_points(mesh, gbuf, cov)
+        _omap = np.where(cov, mesh.obj_index[safe], -1) \
+            if mesh.obj_index is not None else np.where(cov, 0, -1)
+        if want_form:
+            _eye = np.asarray(eye, np.float32) if eye is not None else \
+                INK_EYE(vp)
+            _ndv = LN.ndv_field(mesh, gbuf, cov, _eye, N=_N, P=_P) \
+                .reshape(tri.shape)
+            _thr = float(max(getattr(st, 'outline_form_threshold', 0.3),
+                             0.0)) * 0.01 / (_rs * _rs)
+            _sig = 2.0 * _rs
+            edge_int |= LN.form_seeds(
+                _ndv, cov, LN.dilate8(edge_sil, int(np.ceil(_sig))),
+                _sig, _thr, omap=_omap)
+        if want_shadow:
+            _ndl = LN.ndl_field(scene, mesh, gbuf, cov, N=_N, P=_P) \
+                .reshape(tri.shape)
+            _lvl = float(np.clip(getattr(st, 'outline_shadow_level', 0.1),
+                                 -1.0, 1.0))
+            edge_int |= LN.shadow_seeds(_ndl, cov, _omap, _lvl,
+                                        LN.dilate8(edge_sil, 1))
+        if want_tone:
+            _tthr = float(max(getattr(st, 'outline_tone_threshold', 0.15),
+                              0.0)) * 0.11
+            edge_int |= LN.tone_seeds(img, cov,
+                                      LN.dilate8(edge_sil, max(int(_rs), 1)),
+                                      1.2 * _rs, _tthr, omap=_omap)
+    edge = edge_sil | edge_int
     if not getattr(st, 'outline_over_sky', True):
         edge &= cov
 
-    width = int(np.clip(getattr(st, 'outline_width', 1), 1, 8))
-    for _ in range(width - 1):
-        grown = edge.copy()
-        grown[:, 1:] |= edge[:, :-1]
-        grown[:, :-1] |= edge[:, 1:]
-        grown[1:, :] |= edge[:-1, :]
-        grown[:-1, :] |= edge[1:, :]
-        edge = grown
-
     opacity = float(np.clip(getattr(st, 'outline_opacity', 1.0), 0.0, 1.0))
-    if opacity <= 0.0 or not edge.any():
+    g_width = int(np.clip(getattr(st, 'outline_width', 1), 1, 8))
+    g_col = np.asarray(getattr(st, 'outline_color', (0.0, 0.0, 0.0)),
+                       np.float32)
+    over_sky = getattr(st, 'outline_over_sky', True)
+
+    def _dilate(mask, steps):
+        for _ in range(steps):
+            grown = mask.copy()
+            grown[:, 1:] |= mask[:, :-1]
+            grown[:, :-1] |= mask[:, 1:]
+            grown[1:, :] |= mask[:-1, :]
+            grown[:-1, :] |= mask[1:, :]
+            mask = grown
+        return mask
+
+    mats = getattr(scene, 'materials', None) or []
+    g_on = bool(getattr(st, 'outline', False))
+    modes = [str(getattr(m, 'ink_mode', 'INHERIT') or 'INHERIT').upper()
+             for m in mats]
+    # R233: a Background painting has no ink line unless the material
+    # says Always -- an inheriting Background material reads as OFF
+    modes = ['OFF' if (md == 'INHERIT' and str(getattr(
+        m, 'paint_mode', 'CEL')).upper() == 'BACKGROUND') else md
+        for md, m in zip(modes, mats)]
+    m_on = [True if md == 'ON' else False if md == 'OFF' else g_on
+            for md in modes]
+    m_w = [int(np.clip(int(getattr(m, 'ink_width', 0) or 0) or g_width,
+                       1, 8)) for m in mats]
+    m_col = [tuple(np.asarray(getattr(m, 'ink_color', (0, 0, 0)),
+                              np.float32))
+             if getattr(m, 'ink_use_color', False) else tuple(g_col)
+             for m in mats]
+    # R229: the Anime Shader's Line Colour menu -- CUSTOM is a per-
+    # material constant (both roads), IRO the surface's own colour per
+    # pixel (the style road; styled_on(st, scene) routes there)
+    from . import ink as INK
+    iro_rows = INK.scene_iro(scene)
+    for i_m, (imode, icol, _idk) in enumerate(iro_rows):
+        if imode == 'CUSTOM' and icol is not None:
+            m_col[i_m] = tuple(np.asarray(icol, np.float32))
+
+    md = None
+    if getattr(st, 'outline_marked', False) and vp is not None and \
+            getattr(mesh, 'ink_tri_mask', None) is not None:
+        md = marked_edge_distance(gbuf, mesh, vp, snap=snap_grid(st))
+
+    if INK.styled_on(st, scene):
+        # R227: the style road -- distance fields, planes of width and
+        # colour, the brush / pencil / boil / gradient dials. Opt-in by
+        # any dial (R229: or an Iro-Trace material); the mask roads
+        # below are untouched
+        n_m = len(mats)
+        pmat = np.where(cov, mesh.mat_index[safe]
+                        if mesh.mat_index is not None else 0, n_m)
+        pmat = np.clip(pmat, 0, n_m)
+        on_lut = np.array(m_on + [g_on], bool)
+        on_plane = on_lut[pmat]
+        off_lut = np.array([md_ == 'OFF' for md_ in modes] + [False], bool)
+        # the silhouette seed is ONE-SIDED: the nearer pixel of every
+        # boundary (the object in front owns its line; the sky never
+        # seeds), so the distance field's feature is always a surface
+        # pixel with a material
+        sil_seed = np.zeros(tri.shape, bool)
+        sil_own = edge_sil & cov & on_plane
+        for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+            a = (slice(max(dy, 0), tri.shape[0] + min(dy, 0)),
+                 slice(max(dx, 0), tri.shape[1] + min(dx, 0)))
+            b = (slice(max(-dy, 0), tri.shape[0] + min(-dy, 0)),
+                 slice(max(-dx, 0), tri.shape[1] + min(-dx, 0)))
+            nearer = dmap[a] <= dmap[b]
+            sil_seed[a] |= sil_own[a] & (nearer | ~cov[b])
+        int_seed = edge_int & cov & on_plane
+        md_on = None
+        if md is not None:
+            md_on = np.where(on_plane, md, np.float32(1e9))
+        # R239: the Guilty Gear line control -- ASW's own convention on
+        # the mesh's vertex colours, read at the seed's OWN pixel (the
+        # pixel that owns the line): ALPHA times the width (0.5 the
+        # width as set, 0 erases the seed outright so the neighbouring
+        # line flows past, 1 doubles); BLUE holds interior and marked
+        # lines back until the surface turns toward its silhouette
+        # (their hull's depth push, read as facing) -- silhouette seeds
+        # are exempt, exactly as a pushed-back hull still rims the
+        # silhouette. A mesh without a colour layer controls nothing.
+        vc_a = None
+        vc_lut = np.array(
+            [str(getattr(m, 'ink_vc', 'OFF') or 'OFF').upper() == 'ARCSYS'
+             for m in mats] + [False])
+        if vc_lut.any() and getattr(mesh, 'colors', None) is not None:
+            on_vc = vc_lut[pmat] & cov
+            if on_vc.any():
+                HH, WW = cov.shape
+                vidx = np.nonzero(on_vc.reshape(-1))[0]
+                t_vc = gbuf.tri.reshape(-1)[vidx]
+                t_vc = np.where(t_vc >= 0, t_vc, 0)
+                tv_vc = mesh.tris[t_vc]
+                b_vc = gbuf.bary.reshape(-1, 3)[vidx]
+                C_vc = np.asarray(mesh.colors, np.float32)
+                a_v = (C_vc[tv_vc[:, 0], 3] * b_vc[:, 0]
+                       + C_vc[tv_vc[:, 1], 3] * b_vc[:, 1]
+                       + C_vc[tv_vc[:, 2], 3] * b_vc[:, 2])
+                blu_v = (C_vc[tv_vc[:, 0], 2] * b_vc[:, 0]
+                         + C_vc[tv_vc[:, 1], 2] * b_vc[:, 1]
+                         + C_vc[tv_vc[:, 2], 2] * b_vc[:, 2])
+                vc_a = np.ones(HH * WW, np.float32)
+                vc_a[vidx] = np.clip(a_v, 0.0, 1.0) * np.float32(2.0)
+                erase = np.zeros(HH * WW, bool)
+                erase[vidx] = a_v <= np.float32(0.05)
+                er2 = erase.reshape(HH, WW)
+                sil_seed &= ~er2
+                int_seed &= ~er2
+                if md_on is not None:
+                    md_on = np.where(er2, np.float32(1e9), md_on)
+                held = vidx[blu_v > np.float32(1e-3)]
+                if held.size and eye is not None:
+                    from . import lines as _LN2
+                    P_h, N_h = _LN2.surface_attrs(mesh, gbuf, held)
+                    V_h = np.asarray(eye, np.float32)[None, :] - P_h
+                    lnv = np.sqrt((V_h * V_h).sum(1))
+                    V_h = V_h / np.maximum(lnv, np.float32(1e-9))[:, None]
+                    ndv_h = np.abs((N_h * V_h).sum(1))
+                    hb = np.clip(blu_v[blu_v > np.float32(1e-3)], 0.0, 1.0)
+                    gate = np.zeros(HH * WW, bool)
+                    gate[held] = ndv_h > (np.float32(1.0) - hb)
+                    g2 = gate.reshape(HH, WW)
+                    int_seed &= ~g2
+                    if md_on is not None:
+                        md_on = np.where(g2, np.float32(1e9), md_on)
+        iro_lut = np.array([idk if imode == 'IRO' else -1.0
+                            for imode, _c, idk in iro_rows] + [-1.0],
+                           np.float32)
+        plane = {'cov': cov, 'pmat': pmat, 'on': on_lut,
+                 'off': off_lut[pmat],
+                 'iro': iro_lut if np.any(iro_lut >= 0.0) else None,
+                 'vc_a': vc_a,
+                 'width': np.array(m_w + [g_width], np.float32),
+                 'color': np.array(m_col + [tuple(g_col)], np.float32),
+                 'g_color': g_col, 'opacity': opacity, 'over_sky': over_sky}
+        return INK.apply(scene, gbuf, img, st, (sil_seed, int_seed, md_on),
+                         plane, vp=vp, proj=proj, eye=eye)
+
+    plain = md is None and all(
+        md_ == 'INHERIT' for md_ in modes) and not any(
+        getattr(m, 'ink_use_color', False) for m in mats) and not any(
+        int(getattr(m, 'ink_width', 0) or 0) for m in mats) and not any(
+        imode == 'CUSTOM' for imode, _c, _d in iro_rows)
+    if plain:
+        # the pre-R220 single-class road, verbatim -- every material
+        # inherits and no marked ink is in play, so the classed walk
+        # below would reproduce these exact operations anyway
+        edge = _dilate(edge, g_width - 1)
+        if opacity <= 0.0 or not edge.any():
+            return img
+        m = edge & (cov if not over_sky else np.ones_like(edge))
+        img[m, :3] = img[m, :3] * (1.0 - opacity) + g_col[None, :] * opacity
+        img[m, 3] = np.maximum(img[m, 3], opacity if over_sky else
+                               img[m, 3])
         return img
-    col = np.asarray(getattr(st, 'outline_color', (0.0, 0.0, 0.0)),
-                     np.float32)
-    m = edge & (cov if not getattr(st, 'outline_over_sky', True) else
-                np.ones_like(edge))
-    img[m, :3] = img[m, :3] * (1.0 - opacity) + col[None, :] * opacity
-    img[m, 3] = np.maximum(img[m, 3], opacity if
-                           getattr(st, 'outline_over_sky', True) else
-                           img[m, 3])
+
+    if opacity <= 0.0:
+        return img
+    # ---- the classed road: each pixel's WINNING material decides its
+    # ink (on/off, width, colour); the sky class inherits the globals
+    n_m = len(mats)
+    pmat = np.where(cov, mesh.mat_index[safe]
+                    if mesh.mat_index is not None else 0, n_m)
+    on_lut = np.array(m_on + [g_on], bool)
+    w_lut = np.array(m_w + [g_width], np.int32)
+    off_lut = np.array([md_ == 'OFF' for md_ in modes] + [False], bool)
+    col_lut = np.array(m_col + [tuple(g_col)], np.float32)
+    pmat = np.clip(pmat, 0, n_m)
+    off_plane = off_lut[pmat]
+    # R229: a SILHOUETTE seed pair belongs to its NEARER side -- the
+    # surface the line is drawn around owns both pixels' class (width
+    # and colour), exactly as the style road's one-sided seed does.
+    # Until now the far side of every silhouette (the sky, the floor
+    # behind a ball) seeded ITS OWN class, so a per-material coloured
+    # or widened line was half the global line on its outer side.
+    # Interior seeds (material breaks, creases) keep their own pixel's
+    # class: each material inks its side of a shared edge.
+    owner = pmat
+    if edge_sil.any():
+        best = dmap.copy()
+        own = pmat.copy()
+        for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+            a = (slice(max(dy, 0), dmap.shape[0] + min(dy, 0)),
+                 slice(max(dx, 0), dmap.shape[1] + min(dx, 0)))
+            b = (slice(max(-dy, 0), dmap.shape[0] + min(-dy, 0)),
+                 slice(max(-dx, 0), dmap.shape[1] + min(-dx, 0)))
+            nearer = dmap[b] < best[a]
+            best[a] = np.where(nearer, dmap[b], best[a])
+            own[a] = np.where(nearer, pmat[b], own[a])
+        owner = np.where(edge_sil, own, pmat)
+
+    paint = np.zeros(edge.shape, bool)
+    col_plane = np.zeros(edge.shape + (3,), np.float32)
+    classes = {}
+    for i in range(n_m + 1):
+        if not on_lut[i]:
+            continue
+        classes.setdefault((int(w_lut[i]), tuple(col_lut[i])),
+                           []).append(i)
+    for (w_c, col_c), ids in sorted(classes.items()):
+        in_class = np.isin(owner, ids)
+        seed = edge & in_class
+        mask_c = _dilate(seed, w_c - 1) if seed.any() else \
+            np.zeros_like(seed)
+        if md is not None:
+            # marked interior ink: already width-shaped by distance,
+            # matched to the dilation convention (w -> 2w-1 pixels)
+            mask_c |= in_class & (md < np.float32(w_c - 0.5))
+        if not mask_c.any():
+            continue
+        mask_c &= ~off_plane
+        if not over_sky:
+            mask_c &= cov
+        paint |= mask_c
+        col_plane[mask_c] = np.asarray(col_c, np.float32)
+    if not paint.any():
+        return img
+    img[paint, :3] = img[paint, :3] * (1.0 - opacity) \
+        + col_plane[paint] * opacity
+    img[paint, 3] = np.maximum(img[paint, 3], opacity if over_sky else
+                               img[paint, 3])
     return img
 
 

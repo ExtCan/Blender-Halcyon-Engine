@@ -21,6 +21,8 @@ import numpy as np
 STRICT = False
 
 from . import patterns as PT
+from . import maxmaps as MX
+from . import media as MD
 
 from . import mathx as M
 from .texture import Texture, env_equirect_uv, env_sphere_uv
@@ -90,6 +92,10 @@ class ShadeContext:
         self.random = np.zeros(n, np.float32)
         self.is_camera_ray = True
         self.ray_depth = 0
+        #: R226: a VOLUME sample (no surface, no normal) -- image Box
+        #: projection averages its three axes here instead of picking
+        #: a face by a normal that does not exist
+        self.is_volume = False
         self.settings = None
         self.images = {}
         self.attributes = {}
@@ -373,6 +379,13 @@ def wavelength_to_rgb(nm):
 # ------------------------------------------------------------- the evaluator
 
 
+#: Blender's renamed display names beside their classic identifiers --
+#: the evaluators key by the classic side; a graph serialized by the
+#: other side still resolves
+_OUTPUT_ALIASES = {'Factor': 'Fac', 'Fac': 'Factor', 'Value': 'Val',
+                   'Val': 'Value'}
+
+
 class GraphEvaluator:
     def __init__(self, graph, ctx, images=None, programs=None):
         self.graph = graph or {}
@@ -383,6 +396,10 @@ class GraphEvaluator:
         self.images = images if images is not None else {}
         self.programs = programs if programs is not None else {}
         self.unsupported = set()
+        #: R226: outputs that resolved to NO value (a renamed socket, a
+        #: key the evaluator never produces) -- they read zero, and the
+        #: roads that own the picture print these by name
+        self.unresolved = set()
         self.errors = []
         self.depth = 0
 
@@ -417,7 +434,10 @@ class GraphEvaluator:
     def eval_output(self, node_id, out_index):
         key = (node_id, out_index)
         if key in self.cache:
-            return self.cache[key]
+            v = self.cache[key]
+            if v is None:
+                self._note_unresolved(node_id, out_index)
+            return v
         node = self.nodes.get(node_id)
         if node is None:
             return None
@@ -443,11 +463,40 @@ class GraphEvaluator:
             vals = {}
         outs = node.get('outputs', [])
         for i, o in enumerate(outs):
-            v = vals.get(o.get('name')) if isinstance(vals, dict) else None
-            if v is None and isinstance(vals, dict):
-                v = vals.get(i)
+            v = None
+            if isinstance(vals, dict):
+                # R226: by serialized name, then by the socket's
+                # IDENTIFIER (Blender's API-stable name -- "Factor" is
+                # 'Fac' underneath), then the classic/renamed alias
+                # pair, then position. The export canonicalises names
+                # to the identifier already; this is the net for graphs
+                # built elsewhere (importers, hand graphs, old scenes)
+                nm = o.get('name')
+                for k in (nm, o.get('identifier'), _OUTPUT_ALIASES.get(nm),
+                          i):
+                    if k is None:
+                        continue
+                    v = vals.get(k)
+                    if v is not None:
+                        break
             self.cache[(node_id, i)] = v
-        return self.cache.get(key)
+        v = self.cache.get(key)
+        if v is None and vals:
+            # the requested output has NO value: it will read zero. Say
+            # so by name instead of shading a silent black (the field's
+            # vanished volume). A node that RAISED is already in
+            # `unsupported` with its reason
+            self._note_unresolved(node_id, out_index)
+        return v
+
+    def _note_unresolved(self, node_id, out_index):
+        node = self.nodes.get(node_id) or {}
+        outs = node.get('outputs', [])
+        nm = outs[out_index].get('name') if out_index < len(outs) \
+            else f'#{out_index}'
+        self.unresolved.add(
+            f"{node.get('bl_idname', '?')} '{node_id}': output '{nm}' "
+            f"has no value here -- reads 0")
 
     def eval_node(self, node):
         fn = DISPATCH.get(node.get('bl_idname'))
@@ -496,21 +545,37 @@ def _prop(node, name, default=None):
 
 
 def n_tex_coord(ev, node):
+    # R212: a lean context (the punch-through alpha pass) carries only
+    # the attributes the chain can read; every output here computes
+    # only from what is PRESENT, so asking for UV cannot die on the
+    # Object output's missing positions. A missing field's output is
+    # simply absent -- consuming it is a real error, computing past it
+    # is not. Full contexts (every ordinary render) are unchanged.
     c = ev.ctx
-    gen = c.generated
-    obj = c.P
-    if c.object_matrix_inv is not None:
-        obj = np.einsum('nij,nj->ni', c.object_matrix_inv[:, :3, :3], c.P) + \
-            c.object_matrix_inv[:, :3, 3]
-    cam = c.P - c.camera_pos[None, :]
+    out = {}
+    if c.generated is not None:
+        out['Generated'] = c.generated
+    if c.N is not None:
+        out['Normal'] = c.N
+    if c.uv is not None:
+        out['UV'] = np.concatenate(
+            [c.uv, np.zeros((c.n, 1), np.float32)], 1)
+    if c.P is not None:
+        obj = c.P
+        if c.object_matrix_inv is not None:
+            obj = np.einsum('nij,nj->ni',
+                            c.object_matrix_inv[:, :3, :3], c.P) + \
+                c.object_matrix_inv[:, :3, 3]
+        out['Object'] = obj
+        out['Camera'] = c.P - c.camera_pos[None, :]
     win = np.zeros((c.n, 3), np.float32)
     if c.px is not None and c.width:
         win[:, 0] = (c.px + 0.5) / c.width
         win[:, 1] = (c.py + 0.5) / c.height
-    refl = M.reflect(M.normalize(c.I), M.normalize(c.N))
-    return {'Generated': gen, 'Normal': c.N, 'UV': np.concatenate(
-        [c.uv, np.zeros((c.n, 1), np.float32)], 1), 'Object': obj,
-        'Camera': cam, 'Window': win, 'Reflection': refl}
+    out['Window'] = win
+    if c.I is not None and c.N is not None:
+        out['Reflection'] = M.reflect(M.normalize(c.I), M.normalize(c.N))
+    return out
 
 
 def n_uvmap(ev, node):
@@ -824,6 +889,20 @@ def n_tex_image(ev, node):
         u = np.arctan2(vec[:, 1], vec[:, 0]) / (2 * np.pi) + 0.5
         v = vec[:, 2] * 0.5 + 0.5
     elif proj == 'BOX':
+        if getattr(c, 'is_volume', False):
+            # R226: a volume has no normal to pick a face by -- the
+            # three axis projections average into one solid texture
+            # from a single tile (the era's trick for a 3D texture
+            # out of a 2D image). An unlinked Vector reads the full
+            # Generated coordinate here: the flat road's (u, v, 0)
+            # would leave two of the three axes reading one row
+            if not ev.has_link(node, 'Vector') and c.generated is not None:
+                vec = c.generated
+            cols = [tex.sample(vec[:, a], vec[:, b], filt=filt, wrap=wrap)
+                    for a, b in ((1, 2), (0, 2), (0, 1))]
+            col = ((cols[0] + cols[1] + cols[2])
+                   * np.float32(1.0 / 3.0)).astype(np.float32)
+            return {'Color': col, 'Alpha': col[:, 3]}
         u, v = _box_project(vec, c.N)
     lod = None
     if filt == 'TRILINEAR' and c.duv is not None \
@@ -1269,6 +1348,38 @@ def n_rgb_to_bw(ev, node):
     return {'Val': M.luminance(col[:, :3])}
 
 
+def n_hair_info(ev, node):
+    """R208: hair strands are real geometry here -- camera-facing ribbons
+    (or fur shells) whose colour layer carries the strand data by one
+    convention: r = intercept, g = per-strand random, b = length,
+    a = thickness. The exporter marks a hair material's graph with
+    'strand': True; on any other material this node reports open air
+    (Is Strand 0, everything else neutral), exactly as Blender does on
+    non-hair geometry."""
+    c = ev.ctx
+    n = c.n
+    # R212: under a lean context (punch-through alpha pass) c.N may be
+    # absent; Tangent Normal then simply is not offered -- consuming a
+    # missing output is an error, computing past it is not
+    if not (ev.graph or {}).get('strand'):
+        z = np.zeros(n, np.float32)
+        out = {'Is Strand': z, 'Intercept': z,
+               'Length': z, 'Thickness': z,
+               'Random': z}
+        if c.N is not None:
+            out['Tangent Normal'] = to_color(c.N, n)
+        return out
+    col = to_color(c.vcol, n)
+    out = {'Is Strand': np.ones(n, np.float32),
+           'Intercept': col[:, 0].astype(np.float32),
+           'Length': col[:, 2].astype(np.float32),
+           'Thickness': col[:, 3].astype(np.float32),
+           'Random': col[:, 1].astype(np.float32)}
+    if c.N is not None:
+        out['Tangent Normal'] = to_color(c.N, n)
+    return out
+
+
 def n_blackbody(ev, node):
     t = ev.input(node, 'Temperature', VALUE)
     rgb = blackbody(t)
@@ -1637,21 +1748,33 @@ def desugar_master_bump(graph):
         return graph
     for nid in list(nodes.keys()):
         nd = nodes[nid]
-        if nd.get('bl_idname') not in ('HALCYON_ShaderNode',
-                                       'HALCYON_BIMaterialNode'):
+        idn = nd.get('bl_idname')
+        if idn not in ('HALCYON_ShaderNode', 'HALCYON_BIMaterialNode',
+                       'HALCYON_MaxStandardNode', 'HALCYON_MaxRaytraceNode'):
             continue
         ins = nd.get('inputs') or []
-        bh = next((s for s in ins if s.get('name') == 'Bump Height'), None)
+
+        def _find(label):
+            return next((s for s in ins if s.get('name') == label
+                         or s.get('identifier') == label), None)
+        bh = _find('Bump Height')
         if bh is None or not bh.get('link'):
             continue
         synth = f'__bump_{nid}'
         if synth in nodes:                        # already desugared
             continue
-        bs = next((s for s in ins if s.get('name') == 'Bump Strength'), None)
-        nrm = next((s for s in ins if s.get('name') == 'Normal'), None)
-        strength = {'name': 'Strength', 'type': 'VALUE',
-                    'default': (bs or {}).get('default', 1.0),
-                    'link': (bs or {}).get('link')}
+        bs = _find('Bump Strength')
+        nrm = _find('Normal')
+        if idn in ('HALCYON_MaxStandardNode', 'HALCYON_MaxRaytraceNode'):
+            # R243: Max's Bump Amount spinner (30 = Halcyon's 1) is the
+            # strength -- a node property, so a constant
+            strength = {'name': 'Strength', 'type': 'VALUE',
+                        'default': float(nd.get('props', {}).get('bump_amount', 30)) / 30.0,
+                        'link': None}
+        else:
+            strength = {'name': 'Strength', 'type': 'VALUE',
+                        'default': (bs or {}).get('default', 1.0),
+                        'link': (bs or {}).get('link')}
         nodes[synth] = {
             'id': synth, 'bl_idname': 'ShaderNodeBump', 'props': {},
             'inputs': [
@@ -2456,6 +2579,789 @@ def n_output_material(ev, node):
     return {}
 
 
+
+# ===================================================== R242: the Max study
+# 3ds Max's maps, utilities, coordinates and compound materials. The maps
+# ride maxmaps.py (each with a GLSL twin); the materials compose closures
+# with per-pixel weights the way Mix Shader does, so the GPU road's rules
+# for mixed masters apply unchanged (colours per pixel, parameters by
+# share, a varying parameter refusing by name).
+
+def _mx_mean(ev, node, name, default=0.0):
+    """A Max control: the socket's batch mean (patterns' own rule)."""
+    v = ev.input(node, name, VALUE)
+    return float(v.mean()) if v is not None and np.size(v) else float(default)
+
+
+def _mx_size_vec(ev, node, name='Size'):
+    """Max's 3D map coordinate: the vector over Size (0 -> 0.0001, as
+    Max guards it). Size is a batch constant, the patterns' own rule."""
+    size = _mx_mean(ev, node, name, 1.0)
+    if size == 0.0:
+        size = 0.0001
+    v = np.asarray(_tex_vector(ev, node, 'generated'), np.float32)
+    return (v / np.float32(size)).astype(np.float32)
+
+
+def _mx_tile_vec(ev, node):
+    """Max's 2D map coordinate: the UV (or the linked vector) times
+    Tiling -- Max's Tiling U and V together."""
+    v = np.asarray(_tex_vector(ev, node, 'uv'), np.float32)
+    return (v * np.float32(_mx_mean(ev, node, 'Tiling', 1.0))).astype(np.float32)
+
+
+def n_mx_noise(ev, node):
+    p = _mx_size_vec(ev, node)
+    kind = {'REGULAR': 0, 'FRACTAL': 1, 'TURBULENCE': 2}.get(
+        str(_prop(node, 'kind', 'REGULAR')), 0)
+    f = MX.mx_noise(p, kind, _mx_mean(ev, node, 'Levels', 3.0),
+                    _mx_mean(ev, node, 'Low', 0.0), _mx_mean(ev, node, 'High', 1.0),
+                    _mx_mean(ev, node, 'Phase', 0.0))
+    return _pat_out(ev, node, f)
+
+
+def n_mx_cellular(ev, node):
+    p = _mx_size_vec(ev, node)
+    u, fid = MX.mx_cellular(p, str(_prop(node, 'chips', 'CIRCULAR')) == 'CHIPS',
+                            _mx_mean(ev, node, 'Spread', 0.5),
+                            bool(_prop(node, 'fractal', False)),
+                            float(_prop(node, 'iterations', 3)),
+                            _mx_mean(ev, node, 'Roughness', 0.0))
+    fid = fid % 10000
+    col = MX.cellular_colors(u, fid, ev.input(node, 'Cell Color', RGBA),
+                             ev.input(node, 'Division Color 1', RGBA),
+                             ev.input(node, 'Division Color 2', RGBA),
+                             _mx_mean(ev, node, 'Low', 0.0),
+                             _mx_mean(ev, node, 'Mid', 0.5),
+                             _mx_mean(ev, node, 'High', 1.0),
+                             _mx_mean(ev, node, 'Variation', 0.0))
+    return {'Color': col, 'Fac': np.clip(u, 0.0, 1.0).astype(np.float32),
+            'Cell ID': fid.astype(np.float32)}
+
+
+def n_mx_smoke(ev, node):
+    p = _mx_size_vec(ev, node)
+    f = MX.mx_smoke(p, int(_prop(node, 'iterations', 5)),
+                    _mx_mean(ev, node, 'Phase', 0.0),
+                    _mx_mean(ev, node, 'Exponent', 1.5))
+    return _pat_out(ev, node, f)
+
+
+def n_mx_speckle(ev, node):
+    return _pat_out(ev, node, MX.mx_speckle(_mx_size_vec(ev, node)))
+
+
+def n_mx_splat(ev, node):
+    p = _mx_size_vec(ev, node)
+    f = MX.mx_splat(p, int(_prop(node, 'iterations', 4)),
+                    _mx_mean(ev, node, 'Threshold', 0.2))
+    return _pat_out(ev, node, f)
+
+
+def n_mx_stucco(ev, node):
+    p = _mx_size_vec(ev, node)
+    f = MX.mx_stucco(p, _mx_mean(ev, node, 'Thickness', 0.15),
+                     _mx_mean(ev, node, 'Threshold', 0.57))
+    return _pat_out(ev, node, f)
+
+
+def n_mx_marble(ev, node):
+    p = _mx_size_vec(ev, node)
+    return _pat_out(ev, node, MX.mx_marble(p, _mx_mean(ev, node, 'Vein Width', 0.025)))
+
+
+def n_mx_perlin_marble(ev, node):
+    p = _mx_size_vec(ev, node)
+    csp = MX.mx_perlin_marble(p, int(round(_mx_mean(ev, node, 'Levels', 8.0))))
+    col = MX.perlin_marble_colors(csp, ev.input(node, 'Color 1', RGBA),
+                                  ev.input(node, 'Color 2', RGBA),
+                                  _mx_mean(ev, node, 'Saturation 1', 85.0) / 100.0,
+                                  _mx_mean(ev, node, 'Saturation 2', 70.0) / 100.0)
+    return {'Color': col, 'Fac': csp}
+
+
+def n_mx_wood(ev, node):
+    p = _mx_size_vec(ev, node, 'Grain Thickness')
+    f = MX.mx_wood(p, _mx_mean(ev, node, 'Radial Noise', 1.0),
+                   _mx_mean(ev, node, 'Axial Noise', 1.0))
+    return _pat_out(ev, node, f)
+
+
+def n_mx_dent(ev, node):
+    p = _mx_size_vec(ev, node)
+    f = MX.mx_dent(p, _mx_mean(ev, node, 'Strength', 20.0),
+                   int(_prop(node, 'iterations', 2)))
+    return _pat_out(ev, node, f)
+
+
+def n_mx_swirl(ev, node):
+    p = _mx_tile_vec(ev, node)
+    v = MX.mx_swirl(p, _mx_mean(ev, node, 'Center X', -0.5),
+                    _mx_mean(ev, node, 'Center Y', -0.5),
+                    _mx_mean(ev, node, 'Twist', 1.0),
+                    _mx_mean(ev, node, 'Swirl Intensity', 2.0),
+                    _mx_mean(ev, node, 'Swirl Amount', 1.0),
+                    int(round(_mx_mean(ev, node, 'Constant Detail', 4.0))),
+                    _mx_mean(ev, node, 'Color Contrast', 0.4),
+                    float(_prop(node, 'seed', 0)))
+    # Max's rule: the swirl colour by the UNCLAMPED value over the base,
+    # the result clamped -- so the arms overshoot into pure colour
+    base = ev.input(node, 'Base Color', RGBA)
+    swirl = ev.input(node, 'Swirl Color', RGBA)
+    col = np.clip(swirl * v[:, None] + base * (1.0 - v)[:, None], 0.0, 1.0)
+    col[:, 3] = 1.0
+    return {'Color': col.astype(np.float32),
+            'Fac': np.clip(v, 0.0, 1.0).astype(np.float32)}
+
+
+_PLANET_COLS = ('Water 1', 'Water 2', 'Water 3', 'Land 1', 'Land 2',
+                'Land 3', 'Land 4', 'Land 5')
+
+
+def n_mx_planet(ev, node):
+    p = _mx_size_vec(ev, node, 'Continent Size')
+    e = MX.mx_planet(p, _mx_mean(ev, node, 'Island Factor', 0.5))
+    cols = [ev.input(node, nm, RGBA) for nm in _PLANET_COLS]
+    col = MX.planet_colors(e, cols, _mx_mean(ev, node, 'Ocean %', 60.0),
+                           bool(_prop(node, 'blend', False)))
+    return {'Color': col, 'Elevation': e}
+
+
+def n_mx_waves(ev, node):
+    p = np.asarray(_tex_vector(ev, node, 'generated'), np.float32)
+    f = MX.mx_waves(p, int(_prop(node, 'sets', 3)),
+                    _mx_mean(ev, node, 'Wave Radius', 10.0),
+                    _mx_mean(ev, node, 'Wave Len Min', 0.5),
+                    _mx_mean(ev, node, 'Wave Len Max', 0.5),
+                    _mx_mean(ev, node, 'Amplitude', 1.0),
+                    _mx_mean(ev, node, 'Phase', 0.0),
+                    bool(_prop(node, 'dist3d', True)),
+                    int(_prop(node, 'seed', 30159)))
+    return _pat_out(ev, node, f)
+
+
+def n_mx_checker(ev, node):
+    p = _mx_tile_vec(ev, node)
+    return _pat_out(ev, node, MX.mx_checker(p, _mx_mean(ev, node, 'Soften', 0.0)))
+
+
+def n_mx_tiles(ev, node):
+    p = _mx_tile_vec(ev, node)
+    pat = MX.TILE_PATTERNS.index(str(_prop(node, 'pattern', 'RUNNING'))) \
+        if str(_prop(node, 'pattern', 'RUNNING')) in MX.TILE_PATTERNS else 1
+    mask, tid, fade = MX.mx_tiles(
+        p, pat, _mx_mean(ev, node, 'Horizontal Count', 4.0),
+        _mx_mean(ev, node, 'Vertical Count', 4.0),
+        _mx_mean(ev, node, 'Horizontal Gap', 0.5),
+        _mx_mean(ev, node, 'Vertical Gap', 0.5),
+        _mx_mean(ev, node, 'Line Shift', 0.5),
+        _mx_mean(ev, node, 'Random Shift', 0.0),
+        _mx_mean(ev, node, 'Holes', 0.0),
+        _mx_mean(ev, node, 'Fade Variance', 0.05),
+        _mx_mean(ev, node, 'Color Variance', 0.0),
+        int(_prop(node, 'seed', 33862)))
+    tile = ev.input(node, 'Tile Color', RGBA).copy()
+    grout = ev.input(node, 'Grout Color', RGBA)
+    tile[:, :3] *= fade[:, None]
+    col = grout + (tile - grout) * mask[:, None]
+    return {'Color': np.clip(col, 0.0, 1.0).astype(np.float32), 'Fac': mask,
+            'Tile ID': tid}
+
+
+def n_mx_gradient_ramp(ev, node):
+    p = _mx_tile_vec(ev, node)
+    kind = str(_prop(node, 'gradient_type', 'LINEAR'))
+    k = MX.GRAD_TYPES.index(kind) if kind in MX.GRAD_TYPES else 3
+    c = ev.ctx
+    ndv = M.dot(M.normalize(np.asarray(c.N, np.float32)),
+                -M.normalize(np.asarray(c.I, np.float32))).astype(np.float32)
+    u = MX._mod(p[:, 0], 1.0)
+    v = MX._mod(p[:, 1], 1.0)
+    a = MX.mx_gradient_ramp(u, v, k, ndv, ev.input(node, 'Mapped', VALUE))
+    pos = np.float32(min(max(_mx_mean(ev, node, 'Color 2 Position', 0.5), 1e-4), 1.0 - 1e-4))
+    c1 = ev.input(node, 'Color 1', RGBA)
+    c2 = ev.input(node, 'Color 2', RGBA)
+    c3 = ev.input(node, 'Color 3', RGBA)
+    t1 = np.clip(a / pos, 0.0, 1.0)[:, None]
+    t2 = np.clip((a - pos) / (np.float32(1.0) - pos), 0.0, 1.0)[:, None]
+    col = np.where(a[:, None] < pos, c1 + (c2 - c1) * t1, c2 + (c3 - c2) * t2)
+    return {'Color': col.astype(np.float32), 'Fac': a}
+
+
+def _mx_light_fac(ev, node):
+    """Falloff's Shadow / Light: the Light Meter's Lambert sum against
+    the lamp list (no exposure), averaged over RGB -- Max's IllumAccumulate."""
+    out = n_u16_light_meter(ev, {'bl_idname': 'HALCYON_LightMeterNode',
+                                 'inputs': [{'name': 'Exposure', 'default': 1.0}],
+                                 'props': {'shadows': True}})
+    col = out['Color']
+    return ((col[:, 0] + col[:, 1] + col[:, 2]) / np.float32(3.0)).astype(np.float32)
+
+
+def n_mx_falloff(ev, node):
+    c = ev.ctx
+    n = M.normalize(np.asarray(c.N, np.float32))
+    view = -M.normalize(np.asarray(c.I, np.float32))
+    d = str(_prop(node, 'direction', 'VIEW'))
+    if d == 'WORLD_X':
+        dv = np.zeros_like(n); dv[:, 0] = 1.0
+    elif d == 'WORLD_Y':
+        dv = np.zeros_like(n); dv[:, 1] = 1.0
+    elif d == 'WORLD_Z':
+        dv = np.zeros_like(n); dv[:, 2] = 1.0
+    else:
+        dv = view
+    ndd = M.dot(n, dv).astype(np.float32)
+    kind = str(_prop(node, 'falloff_type', 'PERP_PARALLEL'))
+    extrapolate = bool(_prop(node, 'extrapolate', False))
+    if kind == 'TOWARDS_AWAY':
+        t = np.float32(1.0) - np.float32(0.5) * (ndd + np.float32(1.0))
+    elif kind == 'FRESNEL':
+        ior = np.maximum(ev.input(node, 'IOR', VALUE), 1.0).astype(np.float32)
+        t = MX.max_fresnel(M.dot(n, view), ior)
+    elif kind == 'SHADOW_LIGHT':
+        t = _mx_light_fac(ev, node)
+    elif kind == 'DISTANCE':
+        near = ev.input(node, 'Near Distance', VALUE).astype(np.float32)
+        far = ev.input(node, 'Far Distance', VALUE).astype(np.float32)
+        dist = np.sqrt(((np.asarray(c.P, np.float32) - c.camera_pos[None, :]) ** 2).sum(axis=1)).astype(np.float32)
+        span = far - near
+        t = np.where(span != 0.0, (far - dist) / np.where(span != 0.0, span, 1.0),
+                     np.float32(10000.0)).astype(np.float32)
+        if not extrapolate:
+            t = np.where(dist <= near, np.float32(1.0),
+                         np.where(dist > far, np.float32(0.0), t)).astype(np.float32)
+    else:
+        t = np.float32(1.0) - np.abs(ndd)
+    if not (kind == 'DISTANCE' and extrapolate):
+        t = np.clip(t, 0.0, 1.0)
+    t = t.astype(np.float32)
+    front = ev.input(node, 'Front', RGBA)
+    side = ev.input(node, 'Side', RGBA)
+    return {'Color': (front + (side - front) * t[:, None]).astype(np.float32),
+            'Fac': t}
+
+
+def n_mx_mix(ev, node):
+    fac = np.clip(ev.input(node, 'Mix Amount', VALUE), 0.0, 1.0)
+    if _prop(node, 'use_curve', False):
+        fac = MX.mix_curve(_mx_mean(ev, node, 'Lower', 0.3),
+                           _mx_mean(ev, node, 'Upper', 0.7), fac)
+    a = ev.input(node, 'Color 1', RGBA)
+    b = ev.input(node, 'Color 2', RGBA)
+    return {'Color': (a + (b - a) * fac[:, None]).astype(np.float32),
+            'Fac': fac.astype(np.float32)}
+
+
+def n_mx_rgbtint(ev, node):
+    c = ev.input(node, 'Color', RGBA)
+    r = ev.input(node, 'R Tint', RGBA)
+    g = ev.input(node, 'G Tint', RGBA)
+    b = ev.input(node, 'B Tint', RGBA)
+    out = c.copy()
+    out[:, :3] = (r[:, :3] * c[:, 0:1] + g[:, :3] * c[:, 1:2]
+                  + b[:, :3] * c[:, 2:3])
+    return {'Color': out.astype(np.float32)}
+
+
+def n_mx_output(ev, node):
+    """max_base_Output in Max's order: Level, Offset by alpha, Output
+    Amount, Invert, Clamp, Alpha From RGB."""
+    c = ev.input(node, 'Color', RGBA).copy()
+    level = ev.input(node, 'RGB Level', VALUE)[:, None]
+    offset = ev.input(node, 'RGB Offset', VALUE)[:, None]
+    amount = ev.input(node, 'Output Amount', VALUE)[:, None]
+    rgb = c[:, :3] * level + offset * c[:, 3:4]
+    alpha = c[:, 3:4]
+    rgb = rgb * amount
+    alpha = alpha * amount
+    if _prop(node, 'invert', False):
+        rgb = 1.0 - rgb
+    if _prop(node, 'clamp', False):
+        rgb = np.clip(rgb, 0.0, 1.0)
+        alpha = np.clip(alpha, 0.0, 1.0)
+    if _prop(node, 'alpha_from_rgb', False):
+        alpha = (rgb[:, 0:1] + rgb[:, 1:2] + rgb[:, 2:3]) / 3.0
+    c[:, :3] = rgb
+    c[:, 3:4] = alpha
+    fac = rgb[:, 0] * 0.2126 + rgb[:, 1] * 0.7152 + rgb[:, 2] * 0.0722
+    return {'Color': c.astype(np.float32), 'Fac': fac.astype(np.float32)}
+
+
+def n_mx_mask(ev, node):
+    m = np.clip(ev.input(node, 'Mask', VALUE), 0.0, 1.0)
+    if _prop(node, 'invert_mask', False):
+        m = 1.0 - m
+    c = ev.input(node, 'Map', RGBA).copy()
+    c *= m[:, None]
+    return {'Color': c.astype(np.float32), 'Alpha': m.astype(np.float32)}
+
+
+def n_mx_rgbmultiply(ev, node):
+    a = ev.input(node, 'Color 1', RGBA)
+    b = ev.input(node, 'Color 2', RGBA)
+    out = a * b
+    mode = str(_prop(node, 'alpha_from', 'MULTIPLY'))
+    alpha = a[:, 3] if mode == 'MAP1' else (b[:, 3] if mode == 'MAP2'
+                                            else a[:, 3] * b[:, 3])
+    out[:, 3] = alpha
+    return {'Color': out.astype(np.float32), 'Alpha': alpha.astype(np.float32)}
+
+
+def n_mx_coords(ev, node):
+    c = ev.ctx
+    src = str(_prop(node, 'source', 'MAP_CHANNEL'))
+    if ev.has_link(node, 'Vector'):
+        v = ev.input(node, 'Vector', VECTOR)
+    elif src == 'OBJECT_XYZ':
+        v = c.generated
+    elif src == 'WORLD_XYZ':
+        v = c.P
+    elif src == 'SCREEN':
+        v = np.zeros((c.n, 3), np.float32)
+        if c.px is not None and c.width:
+            v[:, 0] = (c.px + 0.5) / c.width
+            v[:, 1] = (c.py + 0.5) / c.height
+    else:
+        v = np.concatenate([c.uv, np.zeros((c.n, 1), np.float32)], 1)
+    v = np.asarray(v, np.float32)
+    u = (v[:, 0] + _mx_mean(ev, node, 'Offset U', 0.0) - 0.5) \
+        * _mx_mean(ev, node, 'Tiling U', 1.0) + 0.5
+    w = (v[:, 1] + _mx_mean(ev, node, 'Offset V', 0.0) - 0.5) \
+        * _mx_mean(ev, node, 'Tiling V', 1.0) + 0.5
+    ang = np.float32(_mx_mean(ev, node, 'Angle W', 0.0)) * np.float32(0.0174532924)
+    ca, sa = np.float32(np.cos(ang)), np.float32(np.sin(ang))
+    du, dw = (u - 0.5).astype(np.float32), (w - 0.5).astype(np.float32)
+    u = du * ca - dw * sa + 0.5
+    w = du * sa + dw * ca + 0.5
+    if _prop(node, 'mirror_u', False):
+        t = np.mod(u, 2.0)
+        u = np.where(t < 1.0, t, 2.0 - t)
+    if _prop(node, 'mirror_v', False):
+        t = np.mod(w, 2.0)
+        w = np.where(t < 1.0, t, 2.0 - t)
+    return {'Vector': np.stack([u, w, v[:, 2]], 1).astype(np.float32)}
+
+
+# R243: the remaining maps -- Gradient, the Composite map, Color
+# Correction, Vertex Color and the 3D Coordinates rollout.
+
+def n_mx_gradient(ev, node):
+    p = _mx_tile_vec(ev, node)
+    u = MX._mod(p[:, 0], 1.0)
+    v = MX._mod(p[:, 1], 1.0)
+    amount = _mx_mean(ev, node, 'Noise Amount', 0.0)
+    if amount > 0.0:
+        size = _mx_mean(ev, node, 'Noise Size', 1.0)
+        size1 = np.float32(0.0) if size == 0.0 else np.float32(20.0 / size)
+        q = np.stack([u * size1 + np.float32(1.0), v * size1 + np.float32(1.0),
+                      np.full(u.shape[0], np.float32(_mx_mean(ev, node, 'Noise Phase', 0.0)),
+                              np.float32)], 1).astype(np.float32)
+        kind = {'REGULAR': 0, 'FRACTAL': 1, 'TURBULENCE': 2}.get(
+            str(_prop(node, 'kind', 'REGULAR')), 0)
+        levels = min(max(_mx_mean(ev, node, 'Noise Levels', 4.0), 1.0), 10.0)
+        noise = MX.mx_gradient_noise(q, kind, levels,
+                                     _mx_mean(ev, node, 'Threshold Low', 0.0),
+                                     _mx_mean(ev, node, 'Threshold High', 1.0),
+                                     _mx_mean(ev, node, 'Threshold Smooth', 0.0))
+    else:
+        amount = 0.0
+        noise = np.zeros(u.shape[0], np.float32)
+    shape = 1 if str(_prop(node, 'shape', 'LINEAR')) == 'RADIAL' else 0
+    a = MX.mx_gradient(u, v, shape, amount, noise)
+    pos = min(max(_mx_mean(ev, node, 'Color 2 Position', 0.5), 0.0), 1.0)
+    col = MX.gradient_colors(a, pos, ev.input(node, 'Color 1', RGBA),
+                             ev.input(node, 'Color 2', RGBA),
+                             ev.input(node, 'Color 3', RGBA))
+    return {'Color': col, 'Fac': a}
+
+
+def n_mx_composite_map(ev, node):
+    res = np.zeros((ev.n, 4), np.float32)
+    for k in range(1, 6):
+        name = f'Layer {k}'
+        if k > 1 and not ev.has_link(node, name):
+            continue                       # Max's empty slot
+        opacity = _mx_mean(ev, node, f'Opacity {k}', 100.0)
+        if opacity == 0.0:
+            continue
+        fg = ev.input(node, name, RGBA)
+        mask = np.clip(ev.input(node, f'Mask {k}', VALUE), 0.0, 1.0).astype(np.float32)
+        mode = str(_prop(node, f'blend{k}', 'NORMAL')) if k > 1 else 'NORMAL'
+        m = MX.BLEND_MODES.index(mode) if mode in MX.BLEND_MODES else 0
+        res = MX.composite_layer(res, fg, opacity, mask, m)
+    res = MX.composite_finish(res)
+    return {'Color': res, 'Alpha': res[:, 3].copy()}
+
+
+_CC_PRESETS = {'NORMAL': (0, 1, 2, 3), 'MONO': (8, 8, 8, 3),
+               'INVERT': (4, 5, 6, 3)}
+
+
+def _mx_rewire(node):
+    preset = str(_prop(node, 'channels', 'NORMAL'))
+    if preset in _CC_PRESETS:
+        return _CC_PRESETS[preset]
+    out = []
+    for key, dflt in (('rewire_r', 'RED'), ('rewire_g', 'GREEN'),
+                      ('rewire_b', 'BLUE'), ('rewire_a', 'ALPHA')):
+        v = str(_prop(node, key, dflt))
+        out.append(MX.REWIRE.index(v) if v in MX.REWIRE else MX.REWIRE.index(dflt))
+    return tuple(out)
+
+
+def n_mx_color_correction(ev, node):
+    c = ev.input(node, 'Color', RGBA)
+    out = MX.color_correction(
+        c, _mx_rewire(node),
+        ev.input(node, 'Hue Shift', VALUE), ev.input(node, 'Saturation', VALUE),
+        ev.input(node, 'Hue Tint', RGBA), ev.input(node, 'Strength', VALUE),
+        str(_prop(node, 'lightness', 'STANDARD')) == 'ADVANCED',
+        ev.input(node, 'Brightness', VALUE), ev.input(node, 'Contrast', VALUE),
+        ev.input(node, 'Gain', VALUE), ev.input(node, 'Gamma', VALUE),
+        ev.input(node, 'Pivot', VALUE), ev.input(node, 'Lift', VALUE))
+    fac = ((out[:, 0] + out[:, 1] + out[:, 2]) / np.float32(3.0)).astype(np.float32)
+    return {'Color': out, 'Fac': fac}
+
+
+def n_mx_vertex_color(ev, node):
+    c = ev.ctx
+    name = str(_prop(node, 'layer_name', '') or '')
+    col = c.attributes.get('col:' + name, c.vcol) if name else c.vcol
+    col = to_color(col, c.n).astype(np.float32)
+    if str(_prop(node, 'channel', 'VERTEX_COLOR')) == 'VERTEX_ALPHA':
+        rgb = np.repeat(col[:, 3:4], 3, 1)
+    else:
+        rgb = col[:, :3]
+    sub = str(_prop(node, 'sub_channel', 'ALL'))
+    k = {'RED': 0, 'GREEN': 1, 'BLUE': 2}.get(sub)
+    if k is not None:
+        rgb = np.repeat(rgb[:, k:k + 1], 3, 1)
+    out = np.concatenate([rgb, np.ones((c.n, 1), np.float32)], 1).astype(np.float32)
+    fac = ((rgb[:, 0] + rgb[:, 1] + rgb[:, 2]) / np.float32(3.0)).astype(np.float32)
+    return {'Color': out, 'Fac': fac}
+
+
+def _mx_rot_x(v, ca, sa):
+    return np.stack([v[:, 0], v[:, 1] * ca - v[:, 2] * sa,
+                     v[:, 1] * sa + v[:, 2] * ca], 1).astype(np.float32)
+
+
+def _mx_rot_y(v, ca, sa):
+    return np.stack([v[:, 2] * sa + v[:, 0] * ca, v[:, 1],
+                     v[:, 2] * ca - v[:, 0] * sa], 1).astype(np.float32)
+
+
+def _mx_rot_z(v, ca, sa):
+    return np.stack([v[:, 0] * ca - v[:, 1] * sa,
+                     v[:, 0] * sa + v[:, 1] * ca, v[:, 2]], 1).astype(np.float32)
+
+
+def _mx_xyz_trig(ev, node):
+    """The three angles' cosines and sines, in float32 as the emitter
+    bakes them."""
+    out = []
+    for axis in 'XYZ':
+        ang = np.float32(_mx_mean(ev, node, f'Angle {axis}', 0.0)) * np.float32(0.0174532924)
+        out.append((np.float32(np.cos(ang)), np.float32(np.sin(ang))))
+    return out
+
+
+def n_mx_xyz_coords(ev, node):
+    c = ev.ctx
+    src = str(_prop(node, 'xyz_source', 'OBJECT_XYZ'))
+    if ev.has_link(node, 'Vector'):
+        v = ev.input(node, 'Vector', VECTOR)
+    elif src == 'WORLD_XYZ':
+        v = c.P
+    elif src == 'MAP_CHANNEL':
+        v = np.concatenate([c.uv, np.zeros((c.n, 1), np.float32)], 1)
+    elif src == 'VERTEX_COLOR':
+        v = to_color(c.vcol, c.n)[:, :3]
+    elif src == 'GENERATED':
+        v = c.generated
+    else:
+        v = c.P
+        if c.object_matrix_inv is not None:
+            v = np.einsum('nij,nj->ni', c.object_matrix_inv[:, :3, :3], c.P) \
+                + c.object_matrix_inv[:, :3, 3]
+    v = np.asarray(v, np.float32)
+    offs = np.tile(np.array([[_mx_mean(ev, node, 'Offset X', 0.0),
+                              _mx_mean(ev, node, 'Offset Y', 0.0),
+                              _mx_mean(ev, node, 'Offset Z', 0.0)]], np.float32), (c.n, 1))
+    tile = np.array([_mx_mean(ev, node, 'Tiling X', 1.0),
+                     _mx_mean(ev, node, 'Tiling Y', 1.0),
+                     _mx_mean(ev, node, 'Tiling Z', 1.0)], np.float32)
+    (cx, sx), (cy, sy), (cz, sz) = _mx_xyz_trig(ev, node)
+
+    def turn(q):
+        return _mx_rot_z(_mx_rot_y(_mx_rot_x(q, cx, sx), cy, sy), cz, sz)
+    out = turn(v) * tile[None, :] + turn(offs)
+    return {'Vector': out.astype(np.float32)}
+
+
+def _mx_shader(ev, node, name):
+    cl = ev.input(node, name, SHADER)
+    return cl if isinstance(cl, Closure) else Closure()
+
+
+def _mx_weighted(a, wa, b, wb):
+    out = Closure()
+    for kind, w, p in a.items:
+        out.items.append((kind, w * wa, p))
+    for kind, w, p in b.items:
+        out.items.append((kind, w * wb, p))
+    return out
+
+
+def n_mx_blend(ev, node):
+    fac = np.clip(ev.input(node, 'Mix Amount', VALUE), 0.0, 1.0)
+    if _prop(node, 'use_curve', False):
+        fac = MX.mix_curve(_mx_mean(ev, node, 'Lower', 0.25),
+                           _mx_mean(ev, node, 'Upper', 0.75), fac)
+    fac = fac.astype(np.float32)
+    return {'Surface': _mx_weighted(_mx_shader(ev, node, 'Material 1'), 1.0 - fac,
+                                    _mx_shader(ev, node, 'Material 2'), fac)}
+
+
+def n_mx_doublesided(ev, node):
+    t = np.clip(ev.input(node, 'Translucency', VALUE), 0.0, 1.0).astype(np.float32)
+    # the geometric truth, not the raster flag: a face is toward the
+    # camera when its STORED face normal points at the eye (the GPU
+    # twin reads the same normal from hal_triaux)
+    c = ev.ctx
+    facing = M.dot(M.normalize(np.asarray(c.Ng, np.float32)),
+                   -M.normalize(np.asarray(c.I, np.float32))) > 0.0
+    wf = np.where(facing, 1.0 - t, t).astype(np.float32)
+    return {'Surface': _mx_weighted(_mx_shader(ev, node, 'Facing'), wf,
+                                    _mx_shader(ev, node, 'Back'), 1.0 - wf)}
+
+
+def n_mx_topbottom(ev, node):
+    n = M.normalize(np.asarray(ev.ctx.N, np.float32))
+    up = (0.5 + 0.5 * n[:, 2]).astype(np.float32)
+    pos = _mx_mean(ev, node, 'Position', 0.5)
+    blend = max(_mx_mean(ev, node, 'Blend', 0.0), 0.0)
+    tt = MX.mix_curve(pos - blend * 0.5, pos + blend * 0.5, up)
+    return {'Surface': _mx_weighted(_mx_shader(ev, node, 'Top'), tt,
+                                    _mx_shader(ev, node, 'Bottom'), 1.0 - tt)}
+
+
+def n_mx_shellac(ev, node):
+    k = np.maximum(ev.input(node, 'Color Blend', VALUE), 0.0).astype(np.float32)
+    return {'Surface': _mx_weighted(_mx_shader(ev, node, 'Base'), 1.0,
+                                    _mx_shader(ev, node, 'Shellac'), k)}
+
+
+def n_mx_composite(ev, node):
+    result = _mx_shader(ev, node, 'Base')
+    for i in (1, 2, 3, 4):
+        layer = _mx_shader(ev, node, f'Material {i}')
+        if not len(layer):
+            continue
+        amt = np.maximum(ev.input(node, f'Amount {i}', VALUE), 0.0).astype(np.float32)
+        if str(_prop(node, f'mode{i}', 'MIX')) == 'ADD':
+            result = _mx_weighted(result, 1.0, layer, np.minimum(amt, 2.0))
+        else:
+            a = np.minimum(amt, 1.0)
+            result = _mx_weighted(result, 1.0 - a, layer, a)
+    return {'Surface': result}
+
+
+
+# ------------------------------------------------ R243: the Max materials
+# Max's Standard and Raytrace materials as nodes: Max's controls in
+# Max's units, converted here into the master's closure so both devices
+# shade them through the "(3ds Max)" models. Percentages over 100,
+# Orientation degrees to turns, the Self-Illumination lerp, Opacity
+# Falloff by the view angle, the map amounts.
+
+def _mx_pct(ev, node, ident, default):
+    return (np.clip(_opt(ev, node, ident, VALUE, default), 0.0, 999.0)
+            / np.float32(100.0)).astype(np.float32)
+
+
+def _mx_socket_default(node, ident, fallback):
+    for s in node.get('inputs', ()):
+        if s.get('identifier') == ident or s.get('name') == ident:
+            d = s.get('default')
+            return fallback if d is None else d
+    return fallback
+
+
+def _mx_diffuse(ev, node, amount_pct):
+    """Max's Diffuse map slot: the swatch, or the map lerped over it by
+    the slot's Amount (lerpColorMap)."""
+    base = ev.input(node, 'Diffuse Color', RGBA)
+    amt = float(np.clip(amount_pct, 0.0, 100.0)) / 100.0
+    if ev.has_link(node, 'Diffuse Color') and amt < 1.0:
+        sw = coerce(_mx_socket_default(node, 'Diffuse Color', (0.588, 0.588, 0.588, 1.0)),
+                    RGBA, ev.n)
+        base = sw + np.float32(amt) * (base - sw)
+    return base.astype(np.float32)
+
+
+def _mx_ambient_level(ev, node, base, locked):
+    """Max's Ambient colour as the master's ambient level: with the
+    Ambient/Diffuse lock it is the diffuse (level 1); unlocked, the
+    colour's intensity over the diffuse's (a scale, disclosed)."""
+    if locked:
+        return np.ones(ev.n, np.float32)
+    amb = _opt(ev, node, 'Max Ambient', RGBA, (0.588, 0.588, 0.588, 1.0))
+    ia = amb[:, :3].mean(axis=1)
+    ib = np.maximum(base[:, :3].mean(axis=1), 1e-4)
+    return np.clip(ia / ib, 0.0, 2.0).astype(np.float32)
+
+
+def _mx_opacity_falloff(ev, node, opacity, direction, amount_pct):
+    """max_GetEffOpacity: opacity (1 - amount d), d = |N.V| for In and
+    1 - |N.V| for Out."""
+    amt = np.clip(amount_pct, 0.0, 1.0)
+    if not np.any(amt > 0.0):
+        return opacity
+    c = ev.ctx
+    d = np.abs(M.dot(M.normalize(np.asarray(c.N, np.float32)),
+                     -M.normalize(np.asarray(c.I, np.float32)))).astype(np.float32)
+    if str(direction) == 'OUT':
+        d = np.float32(1.0) - d
+    return (opacity * (np.float32(1.0) - amt * d)).astype(np.float32)
+
+
+def n_max_standard(ev, node):
+    from ..nodes.max_nodes import MAX_MODEL_FOR
+    p = node.get('props', {})
+    stype = str(p.get('shader_type', 'BLINN'))
+    model = 'WIREFRAME' if p.get('wire') else MAX_MODEL_FOR.get(stype, 'MAX_BLINN')
+    base = _mx_diffuse(ev, node, float(p.get('diffuse_map_amount', 100)))
+    si = np.clip(_mx_pct(ev, node, 'Max Self-Illum', 0.0), 0.0, 1.0)
+    if p.get('self_illum_color'):
+        emission = _opt(ev, node, 'Max Self-Illum Color', RGBA, (0, 0, 0, 1))[:, :3]
+        color = base
+    else:
+        # Max: selfIllumOut = si diffuse; diffIllumOut *= 1 - si
+        emission = (base[:, :3] * si[:, None]).astype(np.float32)
+        color = base.copy()
+        color[:, :3] = base[:, :3] * (np.float32(1.0) - si)[:, None]
+    opacity = _mx_opacity_falloff(
+        ev, node, np.clip(_mx_pct(ev, node, 'Max Opacity', 100.0), 0.0, 1.0),
+        p.get('falloff', 'IN'), _mx_pct(ev, node, 'Max Falloff Amount', 0.0))
+    kw = dict(
+        color=color.astype(np.float32),
+        diffuse_level=_mx_pct(ev, node, 'Max Diffuse Level', 100.0),
+        spec_color=_opt(ev, node, 'Specular Color', RGBA, (0.9, 0.9, 0.9, 1.0)),
+        spec_level=_mx_pct(ev, node, 'Max Specular Level', 0.0),
+        glossiness=np.clip(_opt(ev, node, 'Glossiness', VALUE, 10.0), 0.0, 100.0),
+        roughness=np.clip(_mx_pct(ev, node, 'Max Roughness', 0.0), 0.0, 1.0),
+        ambient=_mx_ambient_level(ev, node, base, bool(p.get('ad_lock', True))),
+        emission=emission.astype(np.float32),
+        opacity=opacity,
+        ior=np.maximum(_opt(ev, node, 'IOR', VALUE, 1.5), 1.0),
+        anisotropy=np.clip(_mx_pct(ev, node, 'Max Anisotropy', 50.0), 0.0, 1.0),
+        rotation=(_opt(ev, node, 'Max Orientation', VALUE, 0.0) / np.float32(360.0)).astype(np.float32),
+        metallic=np.clip(_mx_pct(ev, node, 'Max Metalness', 0.0), 0.0, 1.0),
+        soften=np.clip(_opt(ev, node, 'Soften', VALUE, 0.1), 0.0, 1.0),
+        reflect=np.clip(_mx_pct(ev, node, 'Max Reflection', 0.0), 0.0, 1.0),
+        reflect_color=_opt(ev, node, 'Reflection Color', RGBA, (1, 1, 1, 1)),
+        translucency=np.zeros(ev.n, np.float32),
+        spec_color2=_opt(ev, node, 'Specular Color 2', RGBA, (0.9, 0.9, 0.9, 1.0)),
+        spec_level2=_mx_pct(ev, node, 'Max Specular Level 2', 0.0),
+        glossiness2=np.clip(_opt(ev, node, 'Glossiness 2', VALUE, 25.0), 0.0, 100.0),
+        anisotropy2=np.clip(_mx_pct(ev, node, 'Max Anisotropy 2', 0.0), 0.0, 1.0),
+        rotation2=(_opt(ev, node, 'Max Orientation 2', VALUE, 0.0) / np.float32(360.0)).astype(np.float32),
+        translucent_color=_opt(ev, node, 'Translucent Color', RGBA, (0, 0, 0, 1)),
+        bump_strength=np.full(ev.n, float(p.get('bump_amount', 30)) / 30.0, np.float32),
+        normal=ev.input(node, 'Normal', VECTOR) if ev.has_link(node, 'Normal') else None,
+        model=model,
+        faceted=bool(p.get('faceted', False)),
+    )
+    cl = Closure()
+    cl.add('HALCYON', _w(ev), **kw)
+    return {'Surface': cl, 'BSDF': cl}
+
+
+def n_max_raytrace(ev, node):
+    from ..nodes.max_nodes import MAX_MODEL_FOR
+    p = node.get('props', {})
+    stype = str(p.get('shader_type', 'PHONG'))
+    model = MAX_MODEL_FOR.get(stype, 'MAX_PHONG')
+    base = ev.input(node, 'Diffuse Color', RGBA)
+    refl = _opt(ev, node, 'Max Reflect Color', RGBA, (0, 0, 0, 1))
+    ri = np.clip(refl[:, :3].max(axis=1), 0.0, 1.0).astype(np.float32)
+    rcol = np.ones_like(refl)
+    nz = ri > 1e-6
+    rcol[nz, :3] = refl[nz, :3] / ri[nz, None]
+    transp = _opt(ev, node, 'Max Transparency', RGBA, (0, 0, 0, 1))
+    ti = np.clip(transp[:, :3].mean(axis=1), 0.0, 1.0).astype(np.float32)
+    amb = _opt(ev, node, 'Max Ambient', RGBA, (0, 0, 0, 1))
+    ia = amb[:, :3].mean(axis=1)
+    ib = np.maximum(base[:, :3].mean(axis=1), 1e-4)
+    kw = dict(
+        color=base.astype(np.float32),
+        diffuse_level=_mx_pct(ev, node, 'Max Diffuse Level', 100.0),
+        spec_color=_opt(ev, node, 'Specular Color', RGBA, (1, 1, 1, 1)),
+        spec_level=_mx_pct(ev, node, 'Max Specular Level', 50.0),
+        glossiness=np.clip(_opt(ev, node, 'Glossiness', VALUE, 40.0), 0.0, 100.0),
+        roughness=np.clip(_mx_pct(ev, node, 'Max Roughness', 0.0), 0.0, 1.0),
+        ambient=np.clip(ia / ib, 0.0, 2.0).astype(np.float32),
+        emission=_opt(ev, node, 'Max Luminosity', RGBA, (0, 0, 0, 1))[:, :3].astype(np.float32),
+        opacity=(np.float32(1.0) - ti).astype(np.float32),
+        ior=np.maximum(_opt(ev, node, 'IOR', VALUE, 1.55), 1.0),
+        anisotropy=np.clip(_mx_pct(ev, node, 'Max Anisotropy', 50.0), 0.0, 1.0),
+        rotation=(_opt(ev, node, 'Max Orientation', VALUE, 0.0) / np.float32(360.0)).astype(np.float32),
+        metallic=np.zeros(ev.n, np.float32),
+        soften=np.clip(_opt(ev, node, 'Soften', VALUE, 0.1), 0.0, 1.0),
+        reflect=ri,
+        reflect_color=rcol.astype(np.float32),
+        translucency=np.zeros(ev.n, np.float32),
+        refraction=np.ones(ev.n, np.float32),
+        bump_strength=np.full(ev.n, float(p.get('bump_amount', 30)) / 30.0, np.float32),
+        normal=ev.input(node, 'Normal', VECTOR) if ev.has_link(node, 'Normal') else None,
+        model=model,
+        faceted=bool(p.get('faceted', False)),
+    )
+    cl = Closure()
+    cl.add('HALCYON', _w(ev), **kw)
+    return {'Surface': cl, 'BSDF': cl}
+
+
+MAX_FUNCS = {
+    'HALCYON_MaxNoiseNode': n_mx_noise,
+    'HALCYON_MaxCellularNode': n_mx_cellular,
+    'HALCYON_MaxSmokeNode': n_mx_smoke,
+    'HALCYON_MaxSpeckleNode': n_mx_speckle,
+    'HALCYON_MaxSplatNode': n_mx_splat,
+    'HALCYON_MaxStuccoNode': n_mx_stucco,
+    'HALCYON_MaxMarbleNode': n_mx_marble,
+    'HALCYON_MaxPerlinMarbleNode': n_mx_perlin_marble,
+    'HALCYON_MaxWoodNode': n_mx_wood,
+    'HALCYON_MaxDentNode': n_mx_dent,
+    'HALCYON_MaxGradientRampNode': n_mx_gradient_ramp,
+    'HALCYON_MaxSwirlNode': n_mx_swirl,
+    'HALCYON_MaxPlanetNode': n_mx_planet,
+    'HALCYON_MaxWavesNode': n_mx_waves,
+    'HALCYON_MaxCheckerNode': n_mx_checker,
+    'HALCYON_MaxTilesNode': n_mx_tiles,
+    'HALCYON_MaxFalloffNode': n_mx_falloff,
+    'HALCYON_MaxMixNode': n_mx_mix,
+    'HALCYON_MaxRGBTintNode': n_mx_rgbtint,
+    'HALCYON_MaxOutputNode': n_mx_output,
+    'HALCYON_MaxMaskNode': n_mx_mask,
+    'HALCYON_MaxRGBMultiplyNode': n_mx_rgbmultiply,
+    'HALCYON_MaxCoordsNode': n_mx_coords,
+    'HALCYON_MaxGradientNode': n_mx_gradient,
+    'HALCYON_MaxCompositeMapNode': n_mx_composite_map,
+    'HALCYON_MaxColorCorrectionNode': n_mx_color_correction,
+    'HALCYON_MaxVertexColorNode': n_mx_vertex_color,
+    'HALCYON_MaxXYZCoordsNode': n_mx_xyz_coords,
+    'HALCYON_MaxBlendNode': n_mx_blend,
+    'HALCYON_MaxDoubleSidedNode': n_mx_doublesided,
+    'HALCYON_MaxTopBottomNode': n_mx_topbottom,
+    'HALCYON_MaxShellacNode': n_mx_shellac,
+    'HALCYON_MaxCompositeNode': n_mx_composite,
+    'HALCYON_MaxStandardNode': n_max_standard,
+    'HALCYON_MaxRaytraceNode': n_max_raytrace,
+}
+
 # ------------------------------------------- named honesty for what is NOT
 
 def _n_named(reason, outputs=None):
@@ -2468,8 +3374,12 @@ def _n_named(reason, outputs=None):
     return n
 
 
-_NO_VOLUME = ('volumetrics are not in this renderer; the era faked them -- '
-              'Height Fog and a spot light\'s Volumetric cone are the tools')
+#: R222: volume nodes are REAL now -- but only on the Material
+#: Output's Volume socket, where the container marcher reads them.
+#: Evaluated as a SURFACE they still shade nothing, and say why.
+_NO_VOLUME = ('this is a VOLUME node -- link it to the Material '
+              "Output's Volume socket and the mesh becomes a marched "
+              'volume container (R222); it shades no surface')
 
 
 def _n_empty_volume(ev, node):
@@ -2499,12 +3409,14 @@ def _opt(ev, node, name, kind, default):
     doing nothing.
     """
     for sock in node.get('inputs', ()):
-        if sock.get('name') == name:
+        # R243: by display name OR identifier (the BI and Max material
+        # nodes label their sockets their own way over master identifiers)
+        if sock.get('name') == name or sock.get('identifier') == name:
             return ev.input(node, name, kind)
     n = ev.n
     if kind == RGBA:
         out = np.ones((n, 4), np.float32)
-        out[:, :3] = np.asarray(default, np.float32)
+        out[:, :3] = np.asarray(default, np.float32)[:3]
         return out
     return np.full(n, float(default), np.float32)
 
@@ -2548,6 +3460,14 @@ def n_halcyon_shader(ev, node):
         ior=ev.input(node, 'IOR', VALUE),
         anisotropy=ev.input(node, 'Anisotropy', VALUE),
         rotation=ev.input(node, 'Anisotropic Rotation', VALUE),
+        # R243: the Max Multi-Layer's second highlight, the Max
+        # Translucent's colour (absent on a node saved before them)
+        spec_color2=_opt(ev, node, 'Specular Color 2', RGBA, (0.9, 0.9, 0.9)),
+        spec_level2=_opt(ev, node, 'Specular Level 2', VALUE, 0.0),
+        glossiness2=_opt(ev, node, 'Glossiness 2', VALUE, 25.0),
+        anisotropy2=_opt(ev, node, 'Anisotropy 2', VALUE, 0.0),
+        rotation2=_opt(ev, node, 'Anisotropic Rotation 2', VALUE, 0.0),
+        translucent_color=_opt(ev, node, 'Translucent Color', RGBA, (0, 0, 0)),
         metallic=ev.input(node, 'Metalness', VALUE),
         soften=ev.input(node, 'Soften', VALUE),
         reflect=ev.input(node, 'Reflection', VALUE),
@@ -2587,9 +3507,618 @@ def n_halcyon_shader(ev, node):
             str(p.get('matcap_mode', 'MIX')), 0.0)),
         normal=ev.input(node, 'Normal', VECTOR) if ev.has_link(node, 'Normal') else None,
         model=model,
+        # R242: Max's Faceted -- the face normal replaces the shading
+        # normal for this material (closure_to_surface reads it)
+        faceted=bool(p.get('faceted', False)),
     )
     cl.add('HALCYON', _w(ev), **kw)
     return {'Surface': cl, 'BSDF': cl}
+
+
+#: R221: the ramp LUT's sweep resolution -- 256 samples across the
+#: light term, 16 rows down the row axis. Endpoint-mapped (u=0 is the
+#: first texel, u=1 the last), so a ramp's ends land exactly.
+ANIME_RAMP_W = 256
+ANIME_RAMP_H = 16
+
+
+def _anime_ramp_sig(graph, images):
+    """A cheap fingerprint of everything that can change the baked
+    ramp: the graph's nodes (arrays summarized) and the pixels of any
+    image the graph names. Over-invalidation is harmless -- the bake
+    is 4096 samples."""
+    bits = []
+    for nid in sorted((graph.get('nodes') or {})):
+        nd = graph['nodes'][nid]
+        props = []
+        for k in sorted(nd.get('props', {})):
+            v = nd['props'][k]
+            if isinstance(v, np.ndarray):
+                props.append((k, v.shape, round(float(v.sum()), 4)))
+            else:
+                props.append((k, str(v)))
+            if k == 'image' and images and v in images:
+                px = getattr(images[v], 'pixels', None)
+                if px is None:
+                    px = images[v]
+                try:
+                    a = np.asarray(px)
+                    props.append(('px', a.shape,
+                                  round(float(a[::13].sum()), 3)))
+                except Exception:                               # noqa: BLE001
+                    pass
+        ins = tuple((s.get('name'), str(s.get('default')),
+                     tuple(s.get('link') or ()))
+                    for s in nd.get('inputs', ()))
+        bits.append((nid, nd.get('bl_idname'), tuple(props), ins))
+    return hash(tuple(bits))
+
+
+#: R239: the SDF face-shadow bake's side (a square LUT swept over UV)
+FACE_SDF_N = 256
+
+#: R239: the face frame's axis menu -- object-space unit vectors
+FACE_AXES = {
+    'POS_X': (1.0, 0.0, 0.0), 'NEG_X': (-1.0, 0.0, 0.0),
+    'POS_Y': (0.0, 1.0, 0.0), 'NEG_Y': (0.0, -1.0, 0.0),
+    'POS_Z': (0.0, 0.0, 1.0), 'NEG_Z': (0.0, 0.0, -1.0),
+}
+
+#: the axis menus for the node's Face Forward / Face Up properties
+FACE_AXIS_ITEMS = (
+    ('POS_X', "+X", "The object's +X axis"),
+    ('NEG_X', "-X", "The object's -X axis"),
+    ('POS_Y', "+Y", "The object's +Y axis"),
+    ('NEG_Y', "-Y", "The object's -Y axis (a Blender character built "
+                    "facing the front view faces -Y)"),
+    ('POS_Z', "+Z", "The object's +Z axis"),
+    ('NEG_Z', "-Z", "The object's -Z axis"),
+)
+
+
+def _face_sdf_sample(lut, u, v):
+    """R239: the face LUT, endpoint-mapped bilinear -- exactly
+    _anime_ramp_sample's arithmetic on one channel, so the GPU's
+    written-out twin reads the same texels the same way."""
+    h, w = lut.shape[:2]
+    fx = np.clip(u, 0.0, 1.0) * np.float32(w - 1)
+    fy = np.clip(v, 0.0, 1.0) * np.float32(h - 1)
+    x0 = np.floor(fx).astype(np.int64)
+    y0 = np.floor(fy).astype(np.int64)
+    tx = (fx - x0).astype(np.float32)
+    ty = (fy - y0).astype(np.float32)
+    x1 = np.minimum(x0 + 1, w - 1)
+    y1 = np.minimum(y0 + 1, h - 1)
+    c00 = lut[y0, x0]
+    c10 = lut[y0, x1]
+    c01 = lut[y1, x0]
+    c11 = lut[y1, x1]
+    top = c00 + (c10 - c00) * tx
+    bot = c01 + (c11 - c01) * tx
+    return (top + (bot - top) * ty).astype(np.float32)
+
+
+def face_frame(scene, mat_index, fwd_axis, up_axis):
+    """R239: the face's frame for one material -- the FIRST object
+    wearing it names it (the games' own arrangement: a face material
+    is one head's), its world rotation columns normalised so a scaled
+    rig keeps its directions. Returns (forward, up, right) float32
+    unit rows, or None when nothing wears the material. right =
+    normalize(cross(up, forward)), then up is squared back to
+    normalize(cross(forward, right)) so a sheared rig cannot fold the
+    frame."""
+    mesh = getattr(scene, 'mesh', None)
+    if mesh is None or getattr(mesh, 'mat_index', None) is None:
+        return None
+    sel = np.asarray(mesh.mat_index) == int(mat_index)
+    if not sel.any():
+        return None
+    oi = 0
+    if getattr(mesh, 'obj_index', None) is not None:
+        oi = int(np.asarray(mesh.obj_index)[np.argmax(sel)])
+    objs = getattr(scene, 'objects', None) or []
+    mw = None
+    if 0 <= oi < len(objs):
+        mw = getattr(objs[oi], 'matrix_world', None)
+    R3 = np.eye(3, dtype=np.float32) if mw is None \
+        else np.asarray(mw, np.float32)[:3, :3]
+    ln = np.sqrt((R3 * R3).sum(0))
+    R3 = R3 / np.where(ln < 1e-12, 1.0, ln)[None, :]
+    fwd = (R3 @ np.asarray(FACE_AXES.get(str(fwd_axis).upper(),
+                                         FACE_AXES['NEG_Y']),
+                           np.float32)).astype(np.float32)
+    up = (R3 @ np.asarray(FACE_AXES.get(str(up_axis).upper(),
+                                        FACE_AXES['POS_Z']),
+                          np.float32)).astype(np.float32)
+    rgt = np.cross(up, fwd).astype(np.float32)
+    lr = float(np.sqrt((rgt * rgt).sum()))
+    if lr < 1e-6:
+        return None
+    rgt = rgt / np.float32(lr)
+    up2 = np.cross(fwd, rgt).astype(np.float32)
+    lu = float(np.sqrt((up2 * up2).sum()))
+    up2 = up2 / np.float32(max(lu, 1e-9))
+    return (fwd, up2, rgt)
+
+
+def bake_face_sdf(graph, images, settings=None):
+    """R239: the SDF face shadow's bake, on the ramp road's own
+    pattern. Whatever feeds the Anime Shader's 'Face Shadow (SDF)'
+    input -- the game's own face map, a gradient chain, anything -- is
+    resolved ONCE into a (256,256) float LUT by sweeping UV across it
+    (the red channel is the field), cached on the graph and keyed on
+    the chain and its image pixels. The CPU lamp loop samples it, the
+    GPU uploads the SAME texels.
+
+    Returns the {'lut', 'sig'} spec, or None (and clears the cache)
+    when no Anime Shader has a linked Face Shadow (SDF).
+    """
+    nodes = (graph or {}).get('nodes') or {}
+    target = None
+    for nd in nodes.values():
+        if nd.get('bl_idname') != 'HALCYON_AnimeShaderNode':
+            continue
+        sock = next((s for s in nd.get('inputs', ())
+                     if s.get('name') == 'Face Shadow (SDF)'), None)
+        if sock is not None and sock.get('link'):
+            target = nd
+            break
+    if target is None:
+        if isinstance(graph, dict):
+            graph.pop('__face_sdf_lut', None)
+        return None
+    cached = graph.get('__face_sdf_lut')
+    if not images and isinstance(cached, dict):
+        return cached
+    sig = _anime_ramp_sig(graph, images or {})
+    if isinstance(cached, dict) and cached.get('sig') == sig:
+        return cached
+    n = FACE_SDF_N * FACE_SDF_N
+    ctx = ShadeContext(n)
+    uu = np.tile(np.linspace(0.0, 1.0, FACE_SDF_N, dtype=np.float32),
+                 FACE_SDF_N)
+    vv = np.repeat(np.linspace(0.0, 1.0, FACE_SDF_N, dtype=np.float32),
+                   FACE_SDF_N)
+    ctx.uv[:, 0] = uu
+    ctx.uv[:, 1] = vv
+    ctx.uv2 = ctx.uv.copy()
+    ctx.generated[:, 0] = uu
+    ctx.generated[:, 1] = vv
+    ctx.settings = settings
+    sub = GraphEvaluator(graph, ctx, images=images or {})
+    col = coerce(sub.input(target, 'Face Shadow (SDF)', RGBA), RGBA, n)
+    lut = np.ascontiguousarray(
+        col[:, 0].reshape(FACE_SDF_N, FACE_SDF_N).astype(np.float32))
+    spec = {'lut': lut, 'sig': sig}
+    graph['__face_sdf_lut'] = spec
+    return spec
+
+
+def bake_anime_ramp(graph, images, settings=None):
+    """R221: the ramp shading road's bake. Whatever feeds the Anime
+    Shader's Shadow Ramp input -- an image of the game's own ramp
+    texture, a ColorRamp, any chain -- is resolved ONCE into a
+    (16,256,3) LUT by sweeping UV across it: u is the light term the
+    lamp loop will look up, v the row. The LUT is cached on the graph
+    and keyed on the chain and its image pixels, the CPU lamp loop
+    samples it, and the GPU uploads the SAME texels -- the cookie
+    doctrine applied to shading.
+
+    Returns the {'lut', 'sig'} spec, or None (and clears the cache)
+    when no Anime Shader has a linked Shadow Ramp.
+    """
+    nodes = (graph or {}).get('nodes') or {}
+    target = None
+    for nd in nodes.values():
+        if nd.get('bl_idname') != 'HALCYON_AnimeShaderNode':
+            continue
+        sock = next((s for s in nd.get('inputs', ())
+                     if s.get('name') == 'Shadow Ramp'), None)
+        if sock is not None and sock.get('link'):
+            target = nd
+            break
+    if target is None:
+        if isinstance(graph, dict):
+            graph.pop('__anime_ramp_lut', None)
+        return None
+    cached = graph.get('__anime_ramp_lut')
+    if not images and isinstance(cached, dict):
+        # a caller with no image dict (a bare plan road) must never
+        # clobber a bake made with the real pixels -- the cached LUT is
+        # the shared-texels contract between the devices
+        return cached
+    sig = _anime_ramp_sig(graph, images or {})
+    if isinstance(cached, dict) and cached.get('sig') == sig:
+        return cached
+    n = ANIME_RAMP_W * ANIME_RAMP_H
+    ctx = ShadeContext(n)
+    uu = np.tile(np.linspace(0.0, 1.0, ANIME_RAMP_W, dtype=np.float32),
+                 ANIME_RAMP_H)
+    vv = np.repeat(((np.arange(ANIME_RAMP_H, dtype=np.float32) + 0.5)
+                    / ANIME_RAMP_H), ANIME_RAMP_W)
+    ctx.uv[:, 0] = uu
+    ctx.uv[:, 1] = vv
+    ctx.uv2 = ctx.uv.copy()
+    ctx.generated[:, 0] = uu
+    ctx.generated[:, 1] = vv
+    ctx.settings = settings
+    sub = GraphEvaluator(graph, ctx, images=images or {})
+    col = coerce(sub.input(target, 'Shadow Ramp', RGBA), RGBA, n)
+    lut = np.ascontiguousarray(
+        col[:, :3].reshape(ANIME_RAMP_H, ANIME_RAMP_W, 3)
+        .astype(np.float32))
+    spec = {'lut': lut, 'sig': sig}
+    graph['__anime_ramp_lut'] = spec
+    return spec
+
+
+def n_anime_shader(ev, node):
+    """R218: the anime/cel master shader.
+
+    Two or three hard tone bands whose shadow COLOURS multiply the
+    base, a stepped highlight, and a compatibility mode that decodes
+    the texture conventions of the 3D-anime pipelines the field named.
+    The channel semantics were taken from the shader recreations and
+    modding documentation of those games (ArcSys ILM and SSS maps from
+    the Xrd lineage; the HoYo lightmap conventions from PrimoToon's
+    source; ZZZ from its modding guides). Kakarot and Sparking Zero
+    are served by the ArcSys-lineage decode they descend from -- their
+    exact channel dumps are not publicly documented, and the mode says
+    so in its tooltip rather than inventing one.
+
+    Every decoded driver lands in the closure as an anime_* key, so
+    the shading model itself is mode-blind -- and the master's whole
+    silhouette bag (rim, fresnel, matcap, edge opacity) rides along
+    unchanged because those keys are shared."""
+    p = node.get('props', {})
+    mode = str(p.get('compat', 'GENERIC'))
+    cl = Closure()
+
+    base = ev.input(node, 'Diffuse Color', RGBA)
+    line = ev.input(node, 'Line Art', RGBA)
+    game = ev.input(node, 'Game Texture', RGBA)
+    det = ev.input(node, 'Detail Texture', RGBA)
+    n = ev.n
+
+    shadow1 = ev.input(node, 'Shadow 1 Color', RGBA)[:, :3]
+    shadow2 = ev.input(node, 'Shadow 2 Color', RGBA)[:, :3]
+    bias = ev.input(node, 'Shadow Bias', VALUE)
+    spec_level = ev.input(node, 'Specular Level', VALUE)
+    spec_size = ev.input(node, 'Specular Size', VALUE)
+    mask = np.ones(n, np.float32)
+    base_rgb = base[:, :3] * line[:, :3]
+
+    if mode in ('ARCSYS', 'DBFZ', 'KAKAROT', 'SPARKING'):
+        # the Xrd lineage, from the recreations: ILM.r = specular
+        # intensity, ILM.g = shadow bias (0.5 neutral), ILM.b =
+        # highlight size, ILM.a = the drawn line art; the SSS map's
+        # rgb is the first shadow tint
+        mask = game[:, 0]
+        bias = bias + (game[:, 1] * 2.0 - 1.0)
+        spec_size = spec_size * np.clip(game[:, 2] * 2.0, 0.0, 2.0)
+        base_rgb = base_rgb * game[:, 3:4]
+        if ev.has_link(node, 'Detail Texture'):
+            shadow1 = shadow1 * det[:, :3]
+        if bool(p.get('use_vertex_ao', False)):
+            vc = getattr(ev.ctx, 'vcol', None)
+            if vc is not None:
+                vr = coerce(vc, RGBA, n)[:, 0]
+                # white is neutral; painted-down red forces the tone
+                # into shadow, the Xrd occlusion convention (kept HERE,
+                # before the lineage nudges, so a 1.81 file's float
+                # order -- and its pixels -- do not move)
+                bias = bias + (vr - 1.0) * 2.0
+        if mode == 'KAKAROT':
+            # the CC2 look sits a touch lighter and softer than the
+            # fighters; a lineage tuning, stated in the tooltip
+            bias = bias + 0.06
+        if mode == 'SPARKING':
+            bias = bias - 0.04
+    elif mode == 'GENSHIN':
+        # PrimoToon's decode: lightmap.r is the specular/metal mask
+        # (0.9+ reads metal), .g the occlusion fed into the shadow
+        # decision, .b the inverted highlight threshold, .a the
+        # material id (per-row ramps do not travel to a two-tone node;
+        # split materials as the game does and set the tones per part)
+        mask = game[:, 0]
+        bias = bias + (game[:, 1] - 0.5) * 2.0
+        spec_size = spec_size * np.clip(1.03 - game[:, 2], 0.0, 1.0) \
+            * 2.0
+        metal = (game[:, 0] > 0.9).astype(np.float32)
+        mask = mask + metal * 0.6
+    elif mode == 'ZZZ':
+        # the ZZZ modding guides: lightmap.r carries the shadow/
+        # outline configuration, .g metallic, .b gloss; the material
+        # map's .b is specular
+        bias = bias + (game[:, 0] - 0.5) * 2.0
+        mask = np.clip(game[:, 1] + det[:, 2], 0.0, 1.5)
+        spec_size = spec_size * np.clip(game[:, 2] * 2.0, 0.0, 2.0)
+
+    # R239: the vertex occlusion works under EVERY mode -- the GDC
+    # talk's own words are "a channel from the Vertex Colors as an
+    # offset on the Threshold", and a hand-painted model without any
+    # game texture (mode GENERIC) is exactly where an artist paints it.
+    # White is neutral; painted-down red forces the tone into shadow,
+    # the Xrd occlusion convention. (Before R239 the checkbox only
+    # worked under the ArcSys-lineage modes -- elsewhere it was a dial
+    # that changed nothing, which the audit doctrine exists to forbid.
+    # The ArcSys branch above keeps its own copy in its 1.62 float
+    # order, so no old file's pixels move.)
+    if bool(p.get('use_vertex_ao', False)) and \
+            mode not in ('ARCSYS', 'DBFZ', 'KAKAROT', 'SPARKING'):
+        vc = getattr(ev.ctx, 'vcol', None)
+        if vc is not None:
+            vr = coerce(vc, RGBA, n)[:, 0]
+            bias = bias + (vr - 1.0) * 2.0
+
+    emission = ev.input(node, 'Self-Illumination', RGBA)[:, :3] \
+        * ev.input(node, 'Emission Strength', VALUE)[:, None]
+    if bool(p.get('emission_alpha', False)):
+        # the HoYo convention: the base texture's alpha is the
+        # emission mask
+        emission = emission + base_rgb * np.clip(
+            base[:, 3] - 0.03, 0.0, 1.0)[:, None] \
+            * ev.input(node, 'Emission Strength', VALUE)[:, None]
+
+    tones = 3.0 if str(p.get('tones', 'TWO')) == 'THREE' else 2.0
+
+    # R221: the ramp shading road. A linked Shadow Ramp bakes to a LUT
+    # (see bake_anime_ramp) and REPLACES the tone sliders in the lamp
+    # loop: the shadow side, the transition and the lit side all come
+    # from the ramp itself, sampled by the light term. The Ramp Row
+    # socket picks the row; under GENSHIN with a Game Texture and no
+    # explicit row, the texture's alpha -- the material id, exactly
+    # where the game keeps it -- picks the row instead.
+    # R239: the SDF face shadow -- the anime face's DRAWN terminator.
+    # A linked Face Shadow (SDF) map replaces the lambert wrap in the
+    # lamp loop's band input: the map's field against the key's
+    # horizontal angle about the face's own frame, mirrored across the
+    # face's centre line for the other side, the games' convention
+    # (Guilty Gear's and the HoYo titles'). Both u and 1-u are sampled
+    # here once; the lamp loop picks a side per light.
+    face_spec = None
+    if ev.has_link(node, 'Face Shadow (SDF)'):
+        face_spec = bake_face_sdf(ev.graph, ev.images,
+                                  getattr(ev.ctx, 'settings', None))
+    if face_spec is not None:
+        lut_f = face_spec['lut']
+        uu_f = np.clip(ev.ctx.uv[:, 0], 0.0, 1.0)
+        vv_f = np.clip(ev.ctx.uv[:, 1], 0.0, 1.0)
+        face_val = np.stack([
+            _face_sdf_sample(lut_f, uu_f, vv_f),
+            _face_sdf_sample(lut_f, np.float32(1.0) - uu_f, vv_f)], 1)
+        face = {'on': True, 'val': face_val,
+                'fwd_axis': str(p.get('face_forward', 'NEG_Y')),
+                'up_axis': str(p.get('face_up', 'POS_Z')),
+                'frame': None}
+    else:
+        face = None
+
+    ramp_spec = None
+    row = None
+    if ev.has_link(node, 'Shadow Ramp'):
+        ramp_spec = bake_anime_ramp(ev.graph, ev.images,
+                                    getattr(ev.ctx, 'settings', None))
+    if ramp_spec is not None:
+        if ev.has_link(node, 'Ramp Row'):
+            row = ev.input(node, 'Ramp Row', VALUE)
+        elif mode == 'GENSHIN' and ev.has_link(node, 'Game Texture'):
+            row = game[:, 3]
+        else:
+            row = _opt(ev, node, 'Ramp Row', VALUE, 0.0)
+
+    kw = dict(
+        color=np.concatenate([base_rgb, base[:, 3:4]], 1),
+        diffuse_level=np.ones(n, np.float32),
+        spec_color=ev.input(node, 'Specular Color', RGBA),
+        spec_level=spec_level,
+        glossiness=np.full(n, 25.0, np.float32),
+        ambient=ev.input(node, 'Ambient', VALUE),
+        emission=emission,
+        opacity=ev.input(node, 'Opacity', VALUE),
+        anime_shadow1=shadow1,
+        anime_shadow2=shadow2,
+        anime_th1=ev.input(node, 'Shadow 1 Threshold', VALUE),
+        anime_soft1=np.maximum(
+            ev.input(node, 'Shadow 1 Softness', VALUE), 1e-4),
+        anime_th2=ev.input(node, 'Shadow 2 Threshold', VALUE),
+        anime_soft2=np.maximum(
+            ev.input(node, 'Shadow 2 Softness', VALUE), 1e-4),
+        anime_bias=bias,
+        anime_tones=np.full(n, tones, np.float32),
+        anime_spec_size=spec_size,
+        anime_sharp=np.maximum(
+            ev.input(node, 'Specular Sharpness', VALUE), 1e-4),
+        anime_mask=mask,
+        anime_gain=_opt(ev, node, 'Light Response', VALUE, 1.0),
+        # R229: the 80s additions -- every socket optional, so a
+        # material saved before them shades exactly as it did
+        anime_shine=np.clip(_opt(ev, node, 'Hair Shine', VALUE, 0.0),
+                            0.0, 1.0),
+        anime_shine_color=_opt(ev, node, 'Hair Shine Color', RGBA,
+                               (1, 1, 1))[:, :3],
+        anime_shine_h=_opt(ev, node, 'Hair Shine Height', VALUE, 0.78),
+        anime_shine_w=np.maximum(
+            _opt(ev, node, 'Hair Shine Width', VALUE, 0.06), 1e-4),
+        anime_shine_wave=_opt(ev, node, 'Hair Shine Wave', VALUE, 0.03),
+        anime_shine_waves=_opt(ev, node, 'Hair Shine Waves', VALUE, 6.0),
+        anime_shine_soft=np.maximum(
+            _opt(ev, node, 'Hair Shine Softness', VALUE, 0.01), 1e-4),
+        anime_shine_second=np.maximum(
+            _opt(ev, node, 'Hair Shine Second', VALUE, 0.0), 0.0),
+        # R241: the hair pass -- shape, phase, follow, the second tint
+        anime_shine_shape=float(_HAIR_SHAPE_CODE.get(
+            str(p.get('hair_shine_shape', 'SMOOTH')).upper(), 0.0)),
+        anime_shine_angle=_opt(ev, node, 'Hair Shine Angle', VALUE, 0.0),
+        anime_shine_follow=np.clip(
+            _opt(ev, node, 'Hair Shine Follow', VALUE, 0.0), 0.0, 1.0),
+        anime_shine_color2=_opt(ev, node, 'Hair Shine Second Color',
+                                RGBA, (1, 1, 1))[:, :3],
+        anime_air=np.clip(_opt(ev, node, 'Airbrush', VALUE, 0.0), 0.0, 1.0),
+        anime_air_color=_opt(ev, node, 'Airbrush Color', RGBA,
+                             (0.82, 0.62, 0.62))[:, :3],
+        anime_air_width=np.maximum(
+            _opt(ev, node, 'Airbrush Width', VALUE, 0.35), 1e-4),
+        anime_air_side=float(_AIRBRUSH_SIDE_CODE.get(
+            str(p.get('airbrush_side', 'LIT')), 0.0)),
+        cartoon_smooth=np.clip(
+            _opt(ev, node, 'Shadow Smoothing', VALUE, 0.0), 0.0, 1.0),
+        rim=_opt(ev, node, 'Rim Amount', VALUE, 0.0),
+        rim_power=_opt(ev, node, 'Rim Power', VALUE, 2.5),
+        rim_color=_opt(ev, node, 'Rim Color', RGBA, (1, 1, 1)),
+        matcap=_opt(ev, node, 'Matcap', RGBA, (0, 0, 0)),
+        matcap_blend=_opt(ev, node, 'Matcap Blend', VALUE, 0.0),
+        rim_blend=float(_LAYER_BLEND_CODE.get(
+            str(p.get('rim_blend', 'ADD')), 0.0)),
+        matcap_mode=float(_MATCAP_BLEND_CODE.get(
+            str(p.get('matcap_mode', 'MIX')), 0.0)),
+        normal=ev.input(node, 'Normal', VECTOR)
+        if ev.has_link(node, 'Normal') else None,
+        bump_strength=_opt(ev, node, 'Bump Strength', VALUE, 1.0),
+        model='ANIME',
+    )
+    kw.update(_cel_keys(ev, node, p))
+    if ramp_spec is not None or face is not None:
+        # R239: the face spec rides the same one-object extras idiom
+        # the ramp does
+        kw['anime_extras'] = {'ramp': ramp_spec, 'face': face}
+        if ramp_spec is not None:
+            kw['anime_ramp_row'] = np.clip(coerce(row, VALUE, n), 0.0, 1.0)
+    cl.add('HALCYON', _w(ev), **kw)
+    return {'Surface': cl, 'BSDF': cl}
+
+
+#: R228: the Cartoon node's shadow modes, as the closure's float code
+_CARTOON_MODE_CODE = {'TRANSPARENT': 0.0, 'PAINTED': 1.0, 'NONE': 2.0}
+#: R229: the Anime node's airbrush side, as the closure's float code
+_AIRBRUSH_SIDE_CODE = {'LIT': 0.0, 'SHADOW': 1.0, 'BOTH': 2.0}
+#: R241: the hair shine wave's shape, as the closure's float code
+_HAIR_SHAPE_CODE = {'SMOOTH': 0.0, 'ZIGZAG': 1.0, 'SCALLOP': 2.0,
+                    'STEP': 3.0}
+
+
+def n_cartoon_shader(ev, node):
+    """R228: the cartoon/paint master -- the Western cel.
+
+    The colour is PAINT: flat, the same under every lamp. A single
+    painted shadow tone lands where the key lamps do not reach, either
+    as a transparent shadow cel over the paint (the 1940s double
+    exposure: paint x shadow colour) or as a second flat paint (UPA and
+    the TV decades); the shadow shape can be smoothed toward a sphere
+    the way an inker simplifies; a highlight is a painted dot, not a
+    reflection. The era menu on the node presets the sockets; the
+    render reads only the sockets and the shadow mode.
+
+    Everything lands in the closure as cartoon_* keys; the master's
+    silhouette bag (rim, matcap, edge opacity) rides along unchanged."""
+    p = node.get('props', {})
+    cl = Closure()
+    n = ev.n
+    paint = ev.input(node, 'Paint Color', RGBA)
+    emission = ev.input(node, 'Self-Illumination', RGBA)[:, :3] \
+        * ev.input(node, 'Emission Strength', VALUE)[:, None]
+    kw = dict(
+        color=paint,
+        diffuse_level=np.ones(n, np.float32),
+        spec_color=np.ones((n, 4), np.float32),
+        spec_level=np.zeros(n, np.float32),
+        glossiness=np.full(n, 25.0, np.float32),
+        ambient=np.zeros(n, np.float32),
+        emission=emission,
+        opacity=ev.input(node, 'Opacity', VALUE),
+        cartoon_shadow=ev.input(node, 'Shadow Color', RGBA)[:, :3],
+        cartoon_amount=ev.input(node, 'Shadow Amount', VALUE),
+        cartoon_th=ev.input(node, 'Shadow Threshold', VALUE),
+        cartoon_soft=np.maximum(ev.input(node, 'Shadow Softness', VALUE),
+                                1e-4),
+        cartoon_smooth=np.clip(ev.input(node, 'Shadow Smoothing', VALUE),
+                               0.0, 1.0),
+        cartoon_hl_color=ev.input(node, 'Highlight Color', RGBA)[:, :3],
+        cartoon_hl_size=np.clip(ev.input(node, 'Highlight Size', VALUE),
+                                0.0, 1.0),
+        cartoon_hl_soft=np.maximum(
+            ev.input(node, 'Highlight Softness', VALUE), 1e-4),
+        cartoon_mode=float(_CARTOON_MODE_CODE.get(
+            str(p.get('shadow_mode', 'TRANSPARENT')), 0.0)),
+        cartoon_lamp=np.clip(ev.input(node, 'Lamp Influence', VALUE),
+                             0.0, 1.0),
+        rim=_opt(ev, node, 'Rim Amount', VALUE, 0.0),
+        rim_power=_opt(ev, node, 'Rim Power', VALUE, 2.5),
+        rim_color=_opt(ev, node, 'Rim Color', RGBA, (1, 1, 1)),
+        rim_blend=float(_LAYER_BLEND_CODE.get(
+            str(p.get('rim_blend', 'ADD')), 0.0)),
+        normal=ev.input(node, 'Normal', VECTOR)
+        if ev.has_link(node, 'Normal') else None,
+        model='CARTOON',
+        # R238: the airbrush against the paint's shadow edge, the Anime
+        # Shader's own bag (every socket optional: an older file's
+        # material shades exactly as it did)
+        anime_air=np.clip(_opt(ev, node, 'Airbrush', VALUE, 0.0), 0.0, 1.0),
+        anime_air_color=_opt(ev, node, 'Airbrush Color', RGBA,
+                             (0.82, 0.62, 0.62))[:, :3],
+        anime_air_width=np.maximum(
+            _opt(ev, node, 'Airbrush Width', VALUE, 0.35), 1e-4),
+        anime_air_side=float(_AIRBRUSH_SIDE_CODE.get(
+            str(p.get('airbrush_side', 'LIT')), 0.0)),
+        # R241: the hair pass on the paint master -- the highlight cel
+        # over the paint, the Anime Shader's whole hair bag (every
+        # socket optional: an older cartoon shades exactly as it did)
+        anime_shine=np.clip(_opt(ev, node, 'Hair Shine', VALUE, 0.0),
+                            0.0, 1.0),
+        anime_shine_color=_opt(ev, node, 'Hair Shine Color', RGBA,
+                               (1, 1, 1))[:, :3],
+        anime_shine_h=_opt(ev, node, 'Hair Shine Height', VALUE, 0.78),
+        anime_shine_w=np.maximum(
+            _opt(ev, node, 'Hair Shine Width', VALUE, 0.06), 1e-4),
+        anime_shine_wave=_opt(ev, node, 'Hair Shine Wave', VALUE, 0.03),
+        anime_shine_waves=_opt(ev, node, 'Hair Shine Waves', VALUE, 6.0),
+        anime_shine_soft=np.maximum(
+            _opt(ev, node, 'Hair Shine Softness', VALUE, 0.01), 1e-4),
+        anime_shine_second=np.maximum(
+            _opt(ev, node, 'Hair Shine Second', VALUE, 0.0), 0.0),
+        anime_shine_shape=float(_HAIR_SHAPE_CODE.get(
+            str(p.get('hair_shine_shape', 'SMOOTH')).upper(), 0.0)),
+        anime_shine_angle=_opt(ev, node, 'Hair Shine Angle', VALUE, 0.0),
+        anime_shine_follow=np.clip(
+            _opt(ev, node, 'Hair Shine Follow', VALUE, 0.0), 0.0, 1.0),
+        anime_shine_color2=_opt(ev, node, 'Hair Shine Second Color',
+                                RGBA, (1, 1, 1))[:, :3],
+    )
+    kw.update(_cel_keys(ev, node, p))
+    cl.add('HALCYON', _w(ev), **kw)
+    return {'Surface': cl, 'BSDF': cl}
+
+
+def _cel_keys(ev, node, p):
+    """R238: the cel's light keys shared by the two cel masters -- the
+    material's key (menu + azimuth / elevation, read once per material:
+    a linked azimuth reads its socket default, the key is a direction
+    for the whole material), the screen shadow, the depth rim's mode,
+    width and side, the smoothing shape. Every socket optional."""
+    from .celfield import (LIGHT_CODE, RIM_MODE_CODE, RIM_SIDE_CODE,
+                           SHAPE_CODE, key_vector)
+    n = ev.n
+    mode = float(LIGHT_CODE.get(str(p.get('light_source', 'SCENE')).upper(),
+                                0.0))
+    az = float(np.asarray(_opt(ev, node, 'Light Azimuth', VALUE, 35.0),
+                          np.float32).reshape(-1)[0])
+    el = float(np.asarray(_opt(ev, node, 'Light Elevation', VALUE, 30.0),
+                          np.float32).reshape(-1)[0])
+    return dict(
+        cel_light=np.full(n, mode, np.float32),
+        cel_dir=tuple(float(v) for v in key_vector(mode, az, el)),
+        cel_ss=np.clip(_opt(ev, node, 'Screen Shadow', VALUE, 0.0), 0.0, 1.0),
+        cel_ss_len=np.maximum(
+            _opt(ev, node, 'Screen Shadow Length', VALUE, 24.0), 1.0),
+        cel_rim_mode=float(RIM_MODE_CODE.get(
+            str(p.get('rim_mode', 'FRESNEL')).upper(), 0.0)),
+        cel_rim_width=np.maximum(_opt(ev, node, 'Rim Width', VALUE, 4.0),
+                                 0.5),
+        cel_rim_side=float(RIM_SIDE_CODE.get(
+            str(p.get('rim_side', 'LIT')).upper(), 0.0)),
+        cel_shape=float(SHAPE_CODE.get(
+            str(p.get('smooth_shape', 'SPHERE')).upper(), 0.0)),
+    )
 
 
 def n_bi_material(ev, node):
@@ -3528,9 +5057,21 @@ def n_pat_agate(ev, node):
 
 
 def n_pat_leopard(ev, node):
+    # R216: rosettes. Three colours -- ground, then the warm interior
+    # patch, then the dark broken ring laid over both -- so the print
+    # reads as rosettes rather than as the polka-dot lattice the old
+    # summed-sines body gave. Fac carries the ring mask (the classic
+    # bump/opacity driver).
     p = _pat_vec(ev, node)
-    f = PT.leopard(p, ev.input(node, 'Spot', VALUE).mean())
-    return _pat_out(ev, node, f)
+    ring, inner = PT.leopard(p, ev.input(node, 'Spot', VALUE).mean(),
+                             ev.input(node, 'Jitter', VALUE).mean(),
+                             ev.input(node, 'Break', VALUE).mean())
+    c1 = ev.input(node, 'Color 1', RGBA)
+    c2 = ev.input(node, 'Color 2', RGBA)
+    ci = ev.input(node, 'Interior', RGBA)
+    col = c1 + (ci - c1) * inner[:, None]
+    col = col + (c2 - col) * ring[:, None]
+    return {'Color': col.astype(np.float32), 'Fac': ring}
 
 
 def n_pat_onion(ev, node):
@@ -3677,6 +5218,227 @@ def n_pat_static(ev, node):
     p = _pat_vec(ev, node)
     frame = int(ev.ctx.frame) if _prop(node, 'animate', True) else 0
     f = PT.tv_static(p, frame)
+    return _pat_out(ev, node, f)
+
+
+def n_pat_fur_tufts(ev, node):
+    """R209: round, tapering tuft cross-sections -- the real shell-fur
+    texture. Height is the radial cone field (peak at each tuft's centre,
+    zero at its rim); alpha-testing it against the shell height keeps a
+    disc that shrinks per layer into a strand tip. Random is the winning
+    tuft's hash, for per-strand colour variation."""
+    p = _pat_vec(ev, node)
+    f, rnd = PT.fur_tufts(p,
+                          ev.input(node, 'Coverage', VALUE).mean(),
+                          ev.input(node, 'Taper', VALUE).mean(),
+                          ev.input(node, 'Variation', VALUE).mean())
+    out = _pat_out(ev, node, f)
+    return {'Color': out['Color'], 'Height': f, 'Random': rnd}
+
+
+# ------------------------------------------------------- the 2D media (R232)
+#
+# Hatching, Scribble, Stipple, Charcoal, Paint Strokes, Wash and Paper --
+# core/media.py through the pattern-node conventions, plus three things the
+# rest of the shelf does not have: a per-pixel TONE input (the converter
+# road: a Shader to RGB luminance, a Facing, a dot with a light direction),
+# a SCREEN space that puts the marks on the camera's own paper, and a BOIL
+# that redraws the marks every N frames through the salt.
+
+
+def _md_param(ev, node, name, default):
+    """One media dial as a float32.
+
+    The socket DEFAULT when unlinked -- exactly the number the GPU twin
+    reads, so a dial that reaches a floor (the charcoal's streak stretch)
+    lands the same cell on both devices; the batch mean when linked, a
+    CPU-only road (the emitter refuses linked media scalars by name).
+    """
+    if ev.has_link(node, name):
+        return np.float32(ev.input(node, name, VALUE).mean())
+    for s in node.get('inputs', []):
+        if s.get('name') == name or s.get('identifier') == name:
+            d = s.get('default')
+            try:
+                return np.float32(d[0] if hasattr(d, '__len__') else d)
+            except (TypeError, ValueError, IndexError):
+                return np.float32(default)
+    return np.float32(default)
+
+
+def _md_xy(ev, node):
+    """The medium's 2D coordinate.
+
+    VECTOR space: the Vector input (generated when unlinked) times Scale,
+    x and y. SCREEN space: the camera's paper in units of the frame
+    height, (px + .5) / H and (py + .5) / H times Scale -- so Scale is
+    the number of pattern cells across the frame's height whatever the
+    resolution -- and zeros off the pixel grid (a ray hit), exactly as
+    the Window coordinate answers there. VIEW space (R233): the camera's
+    sphere, the eye-to-point direction octahedrally unfolded (media.
+    view_coords) times Scale -- the marks stay fixed on the scene as the
+    camera turns, Obra Dinn's cure for the shower door.
+    """
+    c = ev.ctx
+    space = str(_prop(node, 'space', 'VECTOR'))
+    if space == 'SCREEN':
+        xy = np.zeros((c.n, 2), np.float32)
+        if c.px is not None and c.width:
+            h = np.float32(c.height)
+            xy[:, 0] = (np.asarray(c.px, np.float32) + np.float32(0.5)) / h
+            xy[:, 1] = (np.asarray(c.py, np.float32) + np.float32(0.5)) / h
+        xy = xy * ev.input(node, 'Scale', VALUE)[:, None]
+    elif space == 'VIEW':
+        # R233: the camera's sphere -- the eye-to-point direction, in the
+        # SAME float32 ops as the GPU (hal_P - hal_eye, L1, fold)
+        P = np.asarray(c.P, np.float32)
+        eye = np.asarray(c.camera_pos, np.float32)
+        dx = P[:, 0] - eye[0]
+        dy = P[:, 1] - eye[1]
+        dz = P[:, 2] - eye[2]
+        u, v = MD.view_coords(dx, dy, dz)
+        xy = np.stack([u, v], 1) * ev.input(node, 'Scale', VALUE)[:, None]
+    else:
+        xy = _pat_vec(ev, node)[:, :2]
+    return (np.ascontiguousarray(xy[:, 0], np.float32),
+            np.ascontiguousarray(xy[:, 1], np.float32))
+
+
+def _md_salt(ev, node):
+    return MD.salt_for(int(_prop(node, 'seed', 0)), int(ev.ctx.frame or 0),
+                       int(_prop(node, 'boil', 0)))
+
+
+def _md_rots(ev, node, fan=180.0):
+    L = max(min(int(_prop(node, 'layers', 2)), 4), 1)
+    ang = float(_md_param(ev, node, 'Angle', 45.0))
+    return [MD.rotation(ang, k, L, fan) for k in range(L)]
+
+
+def _md_has_socket(node, name):
+    return any(s.get('name') == name or s.get('identifier') == name
+               for s in node.get('inputs', ()))
+
+
+def _md_tone(ev, node):
+    """The medium's per-pixel tone, indicated (R235): Indication 1 draws
+    the medium everywhere, 0 leaves the paper bare -- tone' = 1 - (1 -
+    tone) * indication, the same expression as the GPU twin. A node
+    saved before the socket existed reads Indication 1."""
+    tone = ev.input(node, 'Tone', VALUE).astype(np.float32)
+    if not _md_has_socket(node, 'Indication'):
+        return tone
+    ind = ev.input(node, 'Indication', VALUE).astype(np.float32)
+    return (np.float32(1.0) - (np.float32(1.0) - tone) * ind).astype(np.float32)
+
+
+def _md_direction(ev, node):
+    """R235: the per-pixel bin coordinate of a FORM / SLOPE hatch (None
+    for ANGLE): the tangent from the same N and V the matcap frame reads
+    (`n_halcyon_matcap_uv`), in the medium's domain, binned."""
+    mode = str(_prop(node, 'direction', 'ANGLE')).upper()
+    if mode not in ('FORM', 'SLOPE'):
+        return None
+    c = ev.ctx
+    N = M.normalize(c.N)
+    V = -M.normalize(c.I)
+    screen = str(_prop(node, 'space', 'VECTOR')) == 'SCREEN'
+    tx, ty = MD.tangent_2d(N, V, mode, screen)
+    return MD.direction_bins(tx, ty)
+
+
+def _md_directed(ev, node, fn, x, y, tone, fan, *args):
+    """Evaluate a lane medium with its Direction: one coherent field at
+    the Angle, or the twelve-bin cross-fade of FORM / SLOPE."""
+    b = _md_direction(ev, node)
+    if b is None:
+        return fn(x, y, tone, _md_rots(ev, node, fan), *args)
+    L = max(min(int(_prop(node, 'layers', 2)), 4), 1)
+    table = MD.bin_rotations(float(_md_param(ev, node, 'Angle', 45.0)),
+                             L, fan)
+    return MD.blend_bins(fn, x, y, tone, b, table, *args)
+
+
+def n_md_hatching(ev, node):
+    x, y = _md_xy(ev, node)
+    f = _md_directed(ev, node, MD.hatching, x, y, _md_tone(ev, node), 180.0,
+                     _md_param(ev, node, 'Width', 0.35),
+                     _md_param(ev, node, 'Length', 6.0),
+                     _md_param(ev, node, 'Wobble', 0.5),
+                     _md_param(ev, node, 'Breaks', 0.2), _md_salt(ev, node))
+    return _pat_out(ev, node, f)
+
+
+def n_md_scribble(ev, node):
+    x, y = _md_xy(ev, node)
+    f = _md_directed(ev, node, MD.scribble, x, y, _md_tone(ev, node),
+                     MD.SCRIBBLE_FAN,
+                     _md_param(ev, node, 'Width', 0.3),
+                     _md_param(ev, node, 'Curl', 0.5),
+                     _md_param(ev, node, 'Pressure', 0.7),
+                     _md_param(ev, node, 'Grain', 0.6), _md_salt(ev, node),
+                     _md_param(ev, node, 'Blend', 0.0))
+    return _pat_out(ev, node, f)
+
+
+def n_md_stipple(ev, node):
+    x, y = _md_xy(ev, node)
+    f = MD.stipple(x, y, _md_tone(ev, node),
+                   _md_param(ev, node, 'Size', 0.6),
+                   _md_param(ev, node, 'Jitter', 0.8),
+                   _md_param(ev, node, 'Fine', 1.0), _md_salt(ev, node),
+                   str(_prop(node, 'placement', 'SIZE')))
+    return _pat_out(ev, node, f)
+
+
+def n_md_charcoal(ev, node):
+    x, y = _md_xy(ev, node)
+    f = MD.charcoal(x, y, _md_tone(ev, node),
+                    MD.rotation(float(_md_param(ev, node, 'Angle', 20.0))),
+                    _md_param(ev, node, 'Grain', 0.6),
+                    _md_param(ev, node, 'Streak', 0.5),
+                    _md_param(ev, node, 'Smudge', 0.4), _md_salt(ev, node),
+                    _md_param(ev, node, 'Blend', 0.0))
+    return _pat_out(ev, node, f)
+
+
+def n_md_paint(ev, node):
+    """Colour: the canvas under the paint, each dab's value modulating
+    the paint colour (Color 2, per-pixel -- link a lit colour there and
+    the strokes carry it). Fac: the composite paint value, 0 on bare
+    canvas. Stroke ID: the winning dab's hash."""
+    x, y = _md_xy(ev, node)
+    val, alpha, sid = MD.paint_strokes(
+        x, y, MD.rotation(float(_md_param(ev, node, 'Angle', 25.0))),
+        _md_param(ev, node, 'Length', 2.6),
+        _md_param(ev, node, 'Width', 0.85),
+        MD.paint_slope(_md_param(ev, node, 'Spread', 0.5)),
+        _md_param(ev, node, 'Bristles', 0.6),
+        _md_param(ev, node, 'Variation', 0.3), _md_salt(ev, node))
+    canvas = ev.input(node, 'Color 1', RGBA)
+    paint = ev.input(node, 'Color 2', RGBA)
+    # `val` is the PREMULTIPLIED paint value of the two-deep composite
+    # and `alpha` its total coverage, so this is one over-composite
+    col = canvas * (1.0 - alpha)[:, None] + paint * val[:, None]
+    col[:, 3] = 1.0
+    return {'Color': col.astype(np.float32), 'Fac': val, 'Stroke ID': sid}
+
+
+def n_md_wash(ev, node):
+    x, y = _md_xy(ev, node)
+    f = MD.wash(x, y, _md_tone(ev, node),
+                int(_prop(node, 'levels', 3)),
+                _md_param(ev, node, 'Pooling', 0.6),
+                _md_param(ev, node, 'Granulation', 0.4),
+                _md_param(ev, node, 'Bleed', 0.4), _md_salt(ev, node))
+    return _pat_out(ev, node, f)
+
+
+def n_md_paper(ev, node):
+    x, y = _md_xy(ev, node)
+    f = MD.paper(x, y, _md_param(ev, node, 'Tooth', 0.6),
+                 _md_param(ev, node, 'Fibres', 0.3),
+                 _md_param(ev, node, 'Mottle', 0.4), _md_salt(ev, node))
     return _pat_out(ev, node, f)
 
 
@@ -3892,6 +5654,631 @@ def n_bi_texture(ev, node):
             'Alpha': alpha.astype(np.float32)}
 
 
+# ------------------------------------------- the R216 families' evaluators
+
+_TWO_PI = np.float32(2.0 * np.pi)
+
+
+def _vec_uv(ev, node):
+    return np.array(_tex_vector(ev, node, 'uv'), np.float32, copy=True)
+
+
+def _rot2(v, cx, cy, ang):
+    ca, sa = np.cos(ang), np.sin(ang)
+    x = v[:, 0] - cx
+    y = v[:, 1] - cy
+    out = np.array(v, np.float32, copy=True)
+    out[:, 0] = x * ca - y * sa + cx
+    out[:, 1] = x * sa + y * ca + cy
+    return out
+
+
+def n_u16_light_meter(ev, node):
+    """R216: how much lamp light lands here -- Lambert against the real
+    lamp list, simplified falloffs (a lit/unlit driver, not radiometry:
+    sun constant, points 1/(1+r^2), spot cone, optional occlusion ray).
+    Invert Fac into Self-Illumination and a material glows in the dark."""
+    c = ev.ctx
+    from . import lights as LI
+    n = c.n
+    N = M.normalize(c.N)
+    total = np.zeros((n, 3), np.float32)
+    lamps = []
+    try:
+        lamps = LI.select_lights(getattr(c.scene, 'lights', []) or [],
+                                 c.settings)
+    except Exception:                                           # noqa: BLE001
+        lamps = list(getattr(c.scene, 'lights', []) or [])
+    want_shadow = bool(_prop(node, 'shadows', False)) and \
+        getattr(c, 'bvh', None) is not None
+    for l in lamps:
+        lt = str(getattr(l, 'type', 'POINT'))
+        col = np.asarray(getattr(l, 'color', (1, 1, 1)), np.float32)
+        en = float(getattr(l, 'energy', 1.0))
+        if lt == 'AMBIENT':
+            total += col[None, :] * en
+            continue
+        if lt == 'SUN':
+            L = -np.asarray(getattr(l, 'direction', (0, 0, -1)),
+                            np.float32)
+            L = L / max(float(np.linalg.norm(L)), 1e-9)
+            Lv = np.broadcast_to(L[None, :], (n, 3))
+            dist = np.full(n, 1e6, np.float32)
+            att = np.ones(n, np.float32)
+        else:
+            pos = np.asarray(getattr(l, 'position', (0, 0, 0)),
+                             np.float32)
+            dv = pos[None, :] - c.P
+            dist = np.sqrt((dv * dv).sum(1)).astype(np.float32)
+            Lv = dv / np.maximum(dist, 1e-9)[:, None]
+            att = (1.0 / (1.0 + dist * dist)).astype(np.float32)
+            if lt == 'SPOT':
+                ax = np.asarray(getattr(l, 'direction', (0, 0, -1)),
+                                np.float32)
+                ax = ax / max(float(np.linalg.norm(ax)), 1e-9)
+                cd = (-Lv * ax[None, :]).sum(1)
+                co = np.cos(float(getattr(l, 'spot_size', 1.2)) * 0.5)
+                blend = max(float(getattr(l, 'spot_blend', 0.15)), 1e-4)
+                ci = np.cos(float(getattr(l, 'spot_size', 1.2)) * 0.5
+                            * (1.0 - blend))
+                t = np.clip((cd - co) / max(ci - co, 1e-6), 0.0, 1.0)
+                att = att * t * t
+        ndl = np.maximum((N * Lv).sum(1), 0.0).astype(np.float32)
+        vis = np.ones(n, np.float32)
+        if want_shadow:
+            try:
+                org = c.P + N * np.float32(1e-3)
+                occ = c.bvh.occluded(org, Lv,
+                                     np.maximum(dist - 2e-3, 1e-4))
+                vis = np.where(occ, 0.0, 1.0).astype(np.float32)
+            except Exception:                                   # noqa: BLE001
+                pass
+        total += col[None, :] * (en * ndl * att * vis)[:, None]
+    total *= ev.input(node, 'Exposure', VALUE)[:, None]
+    luma = (total * np.array([0.2126, 0.7152, 0.0722],
+                             np.float32)[None, :]).sum(1)
+    return {'Color': np.concatenate(
+        [total, np.ones((n, 1), np.float32)], 1).astype(np.float32),
+        'Fac': np.clip(luma, 0.0, 1.0).astype(np.float32)}
+
+
+def n_u16_timer(ev, node):
+    c = ev.ctx
+    frame = np.full(c.n, float(c.frame), np.float32)
+    sec = np.full(c.n, float(c.time), np.float32)
+    lf = np.maximum(ev.input(node, 'Loop Frames', VALUE), 1.0)
+    loop = (frame / lf) % 1.0
+    return {'Frame': frame, 'Seconds': sec,
+            'Loop': loop.astype(np.float32)}
+
+
+def n_u16_oscillator(ev, node):
+    c = ev.ctx
+    t = np.float32(c.time) * ev.input(node, 'Speed', VALUE) \
+        + ev.input(node, 'Phase', VALUE)
+    wave = str(_prop(node, 'wave', 'SINE'))
+    f = t % 1.0
+    if wave == 'SQUARE':
+        w = (f < 0.5).astype(np.float32)
+    elif wave == 'TRIANGLE':
+        w = (1.0 - np.abs(2.0 * f - 1.0)).astype(np.float32)
+    elif wave == 'SAW':
+        w = f.astype(np.float32)
+    else:
+        w = (np.sin(t * _TWO_PI) * 0.5 + 0.5).astype(np.float32)
+    lo = ev.input(node, 'Min', VALUE)
+    hi = ev.input(node, 'Max', VALUE)
+    return {'Value': (lo + (hi - lo) * w).astype(np.float32)}
+
+
+def n_u16_counter(ev, node):
+    c = ev.ctx
+    step = np.maximum(ev.input(node, 'Frames Per Step', VALUE), 1.0)
+    mod = np.maximum(ev.input(node, 'Modulo', VALUE), 1.0)
+    off = ev.input(node, 'Offset', VALUE)
+    v = (np.floor(np.float32(c.frame) / step) + off) % mod
+    return {'Value': v.astype(np.float32)}
+
+
+def n_u16_pulse(ev, node):
+    c = ev.ctx
+    per = np.maximum(ev.input(node, 'Period', VALUE), 1.0)
+    wid = ev.input(node, 'Width', VALUE)
+    ph = ev.input(node, 'Phase', VALUE)
+    m = (np.float32(c.frame) - ph) % per
+    return {'Fac': (m < wid).astype(np.float32)}
+
+
+def n_u16_gate(ev, node):
+    v = ev.input(node, 'Value', VALUE)
+    th = ev.input(node, 'Threshold', VALUE)
+    so = np.maximum(ev.input(node, 'Softness', VALUE), 0.0)
+    hard = (v >= th).astype(np.float32)
+    t = np.clip((v - (th - so)) / np.maximum(2.0 * so, 1e-9), 0.0, 1.0)
+    smooth = (t * t * (3.0 - 2.0 * t)).astype(np.float32)
+    out = np.where(so > 0.0, smooth, hard).astype(np.float32)
+    if _prop(node, 'invert', False):
+        out = (1.0 - out).astype(np.float32)
+    return {'Fac': out}
+
+
+def n_u16_selector(ev, node):
+    idx = ev.input(node, 'Index', VALUE)
+    cols = [ev.input(node, f'Color {k}', RGBA) for k in (1, 2, 3, 4)]
+    i = np.floor(idx)
+    i = (i % 4.0) if _prop(node, 'wrap', True) else np.clip(i, 0.0, 3.0)
+    i = i.astype(np.int64)
+    stack = np.stack(cols, 0)
+    return {'Color': stack[i, np.arange(idx.shape[0])].astype(np.float32)}
+
+
+def n_u16_color_key(ev, node):
+    col = ev.input(node, 'Color', RGBA)[:, :3]
+    key = ev.input(node, 'Key', RGBA)[:, :3]
+    tol = np.maximum(ev.input(node, 'Tolerance', VALUE), 0.0)
+    so = np.maximum(ev.input(node, 'Softness', VALUE), 1e-6)
+    d = np.sqrt(((col - key) ** 2).sum(1)).astype(np.float32)
+    t = np.clip((d - tol) / so, 0.0, 1.0)
+    fac = (1.0 - t * t * (3.0 - 2.0 * t)).astype(np.float32)
+    return {'Fac': fac, 'Matte': (1.0 - fac).astype(np.float32)}
+
+
+def n_u16_measure(ev, node):
+    c = ev.ctx
+    mode = str(_prop(node, 'mode', 'ORIGIN'))
+    sc = np.maximum(ev.input(node, 'Scale', VALUE), 1e-9)
+    if mode == 'POINT':
+        ref = ev.input(node, 'Point', VECTOR)
+        d = np.sqrt(((c.P - ref) ** 2).sum(1))
+    elif mode == 'CAMERA':
+        d = np.sqrt(((c.P - c.camera_pos[None, :]) ** 2).sum(1))
+    elif mode == 'AXIS_X':
+        d = c.P[:, 0]
+    elif mode == 'AXIS_Y':
+        d = c.P[:, 1]
+    elif mode == 'AXIS_Z':
+        d = c.P[:, 2]
+    else:
+        org = c.object_loc if getattr(c, 'object_loc', None) is not None \
+            else np.zeros((c.n, 3), np.float32)
+        d = np.sqrt(((c.P - org) ** 2).sum(1))
+    return {'Fac': (d / sc).astype(np.float32)}
+
+
+def n_u16_step_ramp(ev, node):
+    f = np.clip(ev.input(node, 'Fac', VALUE), 0.0, 1.0)
+    steps = np.maximum(ev.input(node, 'Steps', VALUE), 1.0)
+    band = np.minimum(np.floor(f * steps), steps - 1.0)
+    q = band / np.maximum(steps - 1.0, 1.0)
+    a = ev.input(node, 'Color 1', RGBA)
+    b = ev.input(node, 'Color 2', RGBA)
+    return {'Color': (a + (b - a) * q[:, None]).astype(np.float32),
+            'Band': band.astype(np.float32)}
+
+
+def n_u16_wobble(ev, node):
+    c = ev.ctx
+    v = ev.input(node, 'Value', VALUE)
+    amt = ev.input(node, 'Amount', VALUE)
+    sp = ev.input(node, 'Speed', VALUE)
+    seed = int(_prop(node, 'seed', 0))
+    t = np.float32(c.time) * sp + np.float32(seed * 13.7)
+    p = np.stack([t, np.full_like(t, 0.37), np.full_like(t, 0.61)], 1)
+    w = PT.value_noise(np.ascontiguousarray(p, np.float32))
+    return {'Value': (v + (w * 2.0 - 1.0) * amt).astype(np.float32)}
+
+
+def n_u16_frame_blend(ev, node):
+    c = ev.ctx
+    a = ev.input(node, 'A', RGBA)
+    b = ev.input(node, 'B', RGBA)
+    s = ev.input(node, 'Start Frame', VALUE)
+    e = ev.input(node, 'End Frame', VALUE)
+    t = np.clip((np.float32(c.frame) - s) / np.maximum(e - s, 1e-6),
+                0.0, 1.0).astype(np.float32)
+    return {'Color': (a + (b - a) * t[:, None]).astype(np.float32),
+            'Fac': t}
+
+
+def n_u16_blackbody(ev, node):
+    """Planckian locus, the era's polynomial fit -- pure arithmetic, so
+    both devices agree to float rounding."""
+    k = np.clip(ev.input(node, 'Kelvin', VALUE), 1000.0, 12000.0)
+    t = k / 100.0
+    r = np.where(t <= 66.0, 1.0,
+                 np.clip(1.292936 * (np.maximum(t - 60.0, 1e-3)
+                                     ** -0.1332047), 0.0, 1.0))
+    g = np.where(
+        t <= 66.0,
+        np.clip((0.3900816 * np.log(np.maximum(t, 1e-3)) - 0.6318414),
+                0.0, 1.0),
+        np.clip(1.129891 * (np.maximum(t - 60.0, 1e-3)
+                             ** -0.0755148), 0.0, 1.0))
+    b = np.where(t >= 66.0, 1.0,
+                 np.where(t <= 19.0, 0.0,
+                          np.clip(0.5432068 * np.log(np.maximum(
+                              t - 10.0, 1e-3)) - 1.19625, 0.0, 1.0)))
+    n = k.shape[0]
+    return {'Color': np.stack([r, g, b, np.ones(n)], 1).astype(np.float32)}
+
+
+def n_u16_compare(ev, node):
+    a = ev.input(node, 'A', VALUE)
+    b = ev.input(node, 'B', VALUE)
+    eps = np.maximum(ev.input(node, 'Epsilon', VALUE), 0.0)
+    eq = (np.abs(a - b) <= eps).astype(np.float32)
+    return {'Equal': eq,
+            'Greater': ((a > b) & (eq < 0.5)).astype(np.float32),
+            'Less': ((a < b) & (eq < 0.5)).astype(np.float32)}
+
+
+def n_u16_on_frame(ev, node):
+    c = ev.ctx
+    s = ev.input(node, 'Start Frame', VALUE)
+    e = ev.input(node, 'End Frame', VALUE)
+    f = np.float32(c.frame)
+    return {'Fac': ((f >= s) & (f <= e)).astype(np.float32)}
+
+
+# --- the vector family ---------------------------------------------------
+
+
+def n_v16_array(ev, node):
+    """R216: decal placement. The nearest copy's LOCAL frame comes back
+    0..1-centred at .5, so an Image Texture on CLIP extension lands the
+    decal once per copy; Index and Random tell the copies apart."""
+    v = _vec_uv(ev, node)
+    ctr = ev.input(node, 'Center', VECTOR)
+    size = np.maximum(ev.input(node, 'Size', VALUE), 1e-6)
+    rot = ev.input(node, 'Rotation', VALUE)
+    jit = ev.input(node, 'Jitter', VALUE)
+    mode = str(_prop(node, 'mode', 'CIRCLE'))
+    count = max(int(_prop(node, 'count', 8)), 1)
+    sides = max(int(_prop(node, 'sides', 5)), 2)
+    orient = bool(_prop(node, 'orient', True))
+    x = v[:, 0] - ctr[:, 0]
+    y = v[:, 1] - ctr[:, 1]
+    n = v.shape[0]
+    if mode == 'LINE':
+        sp = np.maximum(ev.input(node, 'Spacing', VALUE), 1e-6)
+        ca, sa = np.cos(rot), np.sin(rot)
+        tl = x * ca + y * sa
+        pp = -x * sa + y * ca
+        i = np.clip(np.floor(tl / sp + 0.5), 0.0, count - 1.0)
+        px = i * sp
+        lx = tl - px
+        ly = pp
+        ang = np.zeros(n, np.float32)
+        idx = i
+    elif mode == 'GRID':
+        sp = np.maximum(ev.input(node, 'Spacing', VALUE), 1e-6)
+        i = np.clip(np.floor(x / sp + 0.5), 0.0, count - 1.0)
+        j = np.clip(np.floor(y / sp + 0.5), 0.0, sides - 1.0)
+        lx = x - i * sp
+        ly = y - j * sp
+        ang = np.zeros(n, np.float32)
+        idx = j * count + i
+    else:
+        rad = np.maximum(ev.input(node, 'Radius', VALUE), 1e-6)
+        theta = np.arctan2(y, x)
+        if mode == 'CIRCLE':
+            step = _TWO_PI / count
+            i = np.floor(theta / step + 0.5) % count
+            a = i * step
+            cx = np.cos(a) * rad
+            cy = np.sin(a) * rad
+            ang = a + np.float32(np.pi / 2.0)
+            idx = i
+        elif mode == 'SQUARE':
+            per = np.clip((theta / _TWO_PI + 0.5) % 1.0, 0.0, 1.0)
+            i = np.floor(per * count + 0.5) % count
+            tpar = (i / count) * 4.0
+            side = np.floor(tpar)
+            ft = tpar - side
+            e = 2.0 * ft - 1.0
+            cx = np.where(side == 0, 1.0, np.where(side == 1, -e,
+                          np.where(side == 2, -1.0, e))) * rad
+            cy = np.where(side == 0, e, np.where(side == 1, 1.0,
+                          np.where(side == 2, -e, -1.0))) * rad
+            ang = np.arctan2(cy, cx) + np.float32(np.pi / 2.0)
+            idx = i
+        else:                                   # POLYGON / STAR corners
+            pts = sides if mode == 'POLYGON' else sides * 2
+            step = _TWO_PI / pts
+            i = np.floor(theta / step + 0.5) % pts
+            a = i * step
+            rr = np.full(n, rad, np.float32)
+            if mode == 'STAR':
+                inner = np.clip(ev.input(node, 'Inner', VALUE),
+                                0.05, 1.0)
+                rr = np.where(i % 2.0 == 1.0, rad * inner, rad)
+            cx = np.cos(a) * rr
+            cy = np.sin(a) * rr
+            ang = a + np.float32(np.pi / 2.0)
+            idx = i
+        if jit is not None:
+            jx = (PT.hash3(idx.astype(np.int64), np.int64(3),
+                           np.int64(11)) - 0.5) * jit * rad
+            jy = (PT.hash3(idx.astype(np.int64), np.int64(7),
+                           np.int64(23)) - 0.5) * jit * rad
+            cx = cx + jx
+            cy = cy + jy
+        lx = x - cx
+        ly = y - cy
+        if not orient:
+            ang = np.zeros(n, np.float32)
+        ang = ang + rot
+    if mode in ('LINE', 'GRID') and jit is not None:
+        lx = lx + (PT.hash3(idx.astype(np.int64), np.int64(3),
+                            np.int64(11)) - 0.5) * jit
+        ly = ly + (PT.hash3(idx.astype(np.int64), np.int64(7),
+                            np.int64(23)) - 0.5) * jit
+    ca, sa = np.cos(-ang), np.sin(-ang)
+    ox = (lx * ca - ly * sa) / size + 0.5
+    oy = (lx * sa + ly * ca) / size + 0.5
+    out = np.stack([ox, oy, np.zeros(n, np.float32)],
+                   1).astype(np.float32)
+    rnd = PT.hash3(idx.astype(np.int64), np.int64(0), np.int64(97))
+    return {'Vector': out, 'Index': idx.astype(np.float32),
+            'Random': rnd.astype(np.float32)}
+
+
+def n_v16_mirror_tile(ev, node):
+    v = _vec_uv(ev, node)
+    sc = np.maximum(ev.input(node, 'Scale', VALUE), 1e-9)
+    out = np.array(v, np.float32, copy=True)
+    for axis, on in ((0, _prop(node, 'axis_x', True)),
+                     (1, _prop(node, 'axis_y', True))):
+        q = v[:, axis] * sc
+        if on:
+            h = (q * 0.5 - np.floor(q * 0.5)) * 2.0
+            out[:, axis] = 1.0 - np.abs(h - 1.0)
+        else:
+            out[:, axis] = q - np.floor(q)
+    return {'Vector': out.astype(np.float32)}
+
+
+def n_v16_kaleidoscope(ev, node):
+    v = _vec_uv(ev, node)
+    ctr = ev.input(node, 'Center', VECTOR)
+    sec = np.maximum(ev.input(node, 'Sectors', VALUE), 1.0)
+    base = ev.input(node, 'Angle', VALUE)
+    x = v[:, 0] - ctr[:, 0]
+    y = v[:, 1] - ctr[:, 1]
+    r = np.sqrt(x * x + y * y)
+    a = np.arctan2(y, x) - base
+    step = _TWO_PI / sec
+    k = a % (2.0 * step)
+    folded = np.where(k > step, 2.0 * step - k, k) + base
+    out = np.array(v, np.float32, copy=True)
+    out[:, 0] = np.cos(folded) * r + ctr[:, 0]
+    out[:, 1] = np.sin(folded) * r + ctr[:, 1]
+    return {'Vector': out.astype(np.float32)}
+
+
+def n_v16_polar(ev, node):
+    v = _vec_uv(ev, node)
+    ctr = ev.input(node, 'Center', VECTOR)
+    out = np.array(v, np.float32, copy=True)
+    if str(_prop(node, 'direction', 'TO_POLAR')) == 'FROM_POLAR':
+        a = v[:, 0] * _TWO_PI
+        r = v[:, 1]
+        out[:, 0] = np.cos(a) * r + ctr[:, 0]
+        out[:, 1] = np.sin(a) * r + ctr[:, 1]
+        rr = r
+        aa = v[:, 0]
+    else:
+        x = v[:, 0] - ctr[:, 0]
+        y = v[:, 1] - ctr[:, 1]
+        rr = np.sqrt(x * x + y * y)
+        aa = (np.arctan2(y, x) / _TWO_PI) % 1.0
+        out[:, 0] = aa
+        out[:, 1] = rr
+    return {'Vector': out.astype(np.float32),
+            'Radius': rr.astype(np.float32),
+            'Angle': aa.astype(np.float32)}
+
+
+def n_v16_twirl(ev, node):
+    v = _vec_uv(ev, node)
+    ctr = ev.input(node, 'Center', VECTOR)
+    ang = ev.input(node, 'Angle', VALUE)
+    rad = np.maximum(ev.input(node, 'Radius', VALUE), 1e-6)
+    x = v[:, 0] - ctr[:, 0]
+    y = v[:, 1] - ctr[:, 1]
+    r = np.sqrt(x * x + y * y)
+    fall = np.clip(1.0 - r / rad, 0.0, 1.0)
+    a = ang * fall * fall
+    ca, sa = np.cos(a), np.sin(a)
+    out = np.array(v, np.float32, copy=True)
+    out[:, 0] = x * ca - y * sa + ctr[:, 0]
+    out[:, 1] = x * sa + y * ca + ctr[:, 1]
+    return {'Vector': out.astype(np.float32)}
+
+
+def n_v16_lens(ev, node):
+    v = _vec_uv(ev, node)
+    ctr = ev.input(node, 'Center', VECTOR)
+    amt = ev.input(node, 'Amount', VALUE)
+    x = v[:, 0] - ctr[:, 0]
+    y = v[:, 1] - ctr[:, 1]
+    r2 = x * x + y * y
+    f = 1.0 + amt * r2
+    out = np.array(v, np.float32, copy=True)
+    out[:, 0] = x * f + ctr[:, 0]
+    out[:, 1] = y * f + ctr[:, 1]
+    return {'Vector': out.astype(np.float32)}
+
+
+def n_v16_ripple_warp(ev, node):
+    c = ev.ctx
+    v = _vec_uv(ev, node)
+    ctr = ev.input(node, 'Center', VECTOR)
+    amp = ev.input(node, 'Amplitude', VALUE)
+    freq = ev.input(node, 'Frequency', VALUE)
+    sp = ev.input(node, 'Speed', VALUE)
+    t = np.float32(c.time) if _prop(node, 'animate', True) else \
+        np.float32(0.0)
+    x = v[:, 0] - ctr[:, 0]
+    y = v[:, 1] - ctr[:, 1]
+    r = np.sqrt(x * x + y * y)
+    w = np.sin((r * freq - t * sp) * _TWO_PI) * amp
+    safe = np.maximum(r, 1e-9)
+    out = np.array(v, np.float32, copy=True)
+    out[:, 0] = v[:, 0] + (x / safe) * w
+    out[:, 1] = v[:, 1] + (y / safe) * w
+    return {'Vector': out.astype(np.float32)}
+
+
+def n_v16_wave_warp(ev, node):
+    c = ev.ctx
+    v = _vec_uv(ev, node)
+    amp = ev.input(node, 'Amplitude', VALUE)
+    wl = np.maximum(ev.input(node, 'Wavelength', VALUE), 1e-6)
+    sp = ev.input(node, 'Speed', VALUE)
+    t = np.float32(c.time) if _prop(node, 'animate', True) else \
+        np.float32(0.0)
+    out = np.array(v, np.float32, copy=True)
+    if str(_prop(node, 'axis', 'X')) == 'Y':
+        out[:, 0] = v[:, 0] + np.sin((v[:, 1] / wl + t * sp)
+                                     * _TWO_PI) * amp
+    else:
+        out[:, 1] = v[:, 1] + np.sin((v[:, 0] / wl + t * sp)
+                                     * _TWO_PI) * amp
+    return {'Vector': out.astype(np.float32)}
+
+
+def n_v16_tile_random(ev, node):
+    v = _vec_uv(ev, node)
+    sc = np.maximum(ev.input(node, 'Scale', VALUE), 1e-9)
+    q = v[:, :2] * sc[:, None]
+    cell = np.floor(q)
+    f = q - cell
+    cx = cell[:, 0].astype(np.int64)
+    cy = cell[:, 1].astype(np.int64)
+    tid = PT.hash3(cx, cy, np.int64(53))
+    fx = np.array(f[:, 0], np.float32, copy=True)
+    fy = np.array(f[:, 1], np.float32, copy=True)
+    if _prop(node, 'rotate', True):
+        rsel = np.floor(PT.hash3(cx, cy, np.int64(11)) * 4.0) % 4
+        ox, oy = fx - 0.5, fy - 0.5
+        fx = np.where(rsel == 1, -oy, np.where(rsel == 2, -ox,
+                      np.where(rsel == 3, oy, ox))) + 0.5
+        fy = np.where(rsel == 1, ox, np.where(rsel == 2, -oy,
+                      np.where(rsel == 3, -ox, oy))) + 0.5
+    if _prop(node, 'flip', True):
+        fsel = PT.hash3(cx, cy, np.int64(29)) < 0.5
+        fx = np.where(fsel, 1.0 - fx, fx)
+    out = np.array(v, np.float32, copy=True)
+    out[:, 0] = fx
+    out[:, 1] = fy
+    return {'Vector': out.astype(np.float32),
+            'Tile ID': tid.astype(np.float32)}
+
+
+def n_v16_vector_snap(ev, node):
+    v = _vec_uv(ev, node)
+    st = np.maximum(ev.input(node, 'Step', VALUE), 1e-9)
+    q = v[:, :2] / st[:, None]
+    q = np.round(q) if str(_prop(node, 'mode', 'FLOOR')) == 'ROUND' \
+        else np.floor(q)
+    out = np.array(v, np.float32, copy=True)
+    out[:, :2] = q * st[:, None]
+    return {'Vector': out.astype(np.float32)}
+
+
+def n_v16_shear(ev, node):
+    v = _vec_uv(ev, node)
+    xy = ev.input(node, 'X By Y', VALUE)
+    yx = ev.input(node, 'Y By X', VALUE)
+    out = np.array(v, np.float32, copy=True)
+    out[:, 0] = v[:, 0] + v[:, 1] * xy
+    out[:, 1] = v[:, 1] + v[:, 0] * yx
+    return {'Vector': out.astype(np.float32)}
+
+
+def n_v16_orbit(ev, node):
+    c = ev.ctx
+    v = _vec_uv(ev, node)
+    rad = ev.input(node, 'Radius', VALUE)
+    sp = ev.input(node, 'Speed', VALUE)
+    ph = ev.input(node, 'Phase', VALUE)
+    t = (np.float32(c.time) if _prop(node, 'animate', True)
+         else np.float32(0.0)) * sp + ph
+    out = np.array(v, np.float32, copy=True)
+    out[:, 0] = v[:, 0] + np.cos(t * _TWO_PI) * rad
+    out[:, 1] = v[:, 1] + np.sin(t * _TWO_PI) * rad
+    return {'Vector': out.astype(np.float32)}
+
+
+def n_v16_region(ev, node):
+    v = _vec_uv(ev, node)
+    lo = ev.input(node, 'Min', VECTOR)
+    hi = ev.input(node, 'Max', VECTOR)
+    span = np.maximum(hi - lo, 1e-9)
+    q = (v - lo) / span
+    inside = ((q[:, 0] >= 0.0) & (q[:, 0] <= 1.0)
+              & (q[:, 1] >= 0.0) & (q[:, 1] <= 1.0)).astype(np.float32)
+    mode = str(_prop(node, 'outside', 'CLIP'))
+    if mode == 'WRAP':
+        q = q - np.floor(q)
+    elif mode == 'MIRROR':
+        h = (q * 0.5 - np.floor(q * 0.5)) * 2.0
+        q = 1.0 - np.abs(h - 1.0)
+    else:                                   # CLIP and EXTEND clamp
+        q = np.clip(q, 0.0, 1.0)
+    out = (lo + q * span).astype(np.float32)
+    out[:, 2] = v[:, 2]
+    return {'Vector': out, 'Inside': inside}
+
+
+def n_v16_projector(ev, node):
+    v = np.array(_tex_vector(ev, node, 'generated'), np.float32,
+                 copy=True)
+    sc = np.maximum(ev.input(node, 'Scale', VALUE), 1e-9)
+    axis = str(_prop(node, 'axis', 'Z'))
+    order = {'X': (1, 2, 0), 'Y': (0, 2, 1), 'Z': (0, 1, 2)}[axis]
+    u = v[:, order[0]]
+    w = v[:, order[1]]
+    h = v[:, order[2]]
+    mode = str(_prop(node, 'mode', 'PLANAR'))
+    n = v.shape[0]
+    if mode == 'CYLINDER':
+        a = (np.arctan2(w, u) / _TWO_PI) % 1.0
+        out = np.stack([a, h, np.zeros(n, np.float32)], 1)
+    elif mode == 'SPHERE':
+        r = np.sqrt(u * u + w * w + h * h)
+        a = (np.arctan2(w, u) / _TWO_PI) % 1.0
+        el = np.arccos(np.clip(h / np.maximum(r, 1e-9), -1.0, 1.0)) \
+            / np.float32(np.pi)
+        out = np.stack([a, 1.0 - el, np.zeros(n, np.float32)], 1)
+    elif mode == 'BOX':
+        ax_ = np.abs(v)
+        pick_u = np.where(ax_[:, 0] >= np.maximum(ax_[:, 1], ax_[:, 2]),
+                          v[:, 1], np.where(ax_[:, 1] >= ax_[:, 2],
+                                            v[:, 0], v[:, 0]))
+        pick_w = np.where(ax_[:, 0] >= np.maximum(ax_[:, 1], ax_[:, 2]),
+                          v[:, 2], np.where(ax_[:, 1] >= ax_[:, 2],
+                                            v[:, 2], v[:, 1]))
+        out = np.stack([pick_u, pick_w, np.zeros(n, np.float32)], 1)
+    else:
+        out = np.stack([u, w, np.zeros(n, np.float32)], 1)
+    out[:, :2] = out[:, :2] / sc[:, None]
+    return {'Vector': out.astype(np.float32)}
+
+
+def n_v16_spin(ev, node):
+    c = ev.ctx
+    v = _vec_uv(ev, node)
+    ctr = ev.input(node, 'Center', VECTOR)
+    sp = ev.input(node, 'Speed', VALUE)
+    base = ev.input(node, 'Angle', VALUE)
+    t = (np.float32(c.time) if _prop(node, 'animate', True)
+         else np.float32(0.0))
+    return {'Vector': _rot2(v, ctr[:, 0], ctr[:, 1],
+                            base + t * sp * _TWO_PI).astype(np.float32)}
+
+
 DISPATCH = {
     # input
     'ShaderNodeTexCoord': n_tex_coord,
@@ -3909,6 +6296,8 @@ DISPATCH = {
     'ShaderNodeVolumeAbsorption': _n_named(_NO_VOLUME, _n_empty_volume),
     'ShaderNodeVolumeScatter': _n_named(_NO_VOLUME, _n_empty_volume),
     'ShaderNodeVolumePrincipled': _n_named(_NO_VOLUME, _n_empty_volume),
+    'HALCYON_VolumeNode': _n_named(_NO_VOLUME, _n_empty_volume),
+    'HALCYON_CartoonNode': n_cartoon_shader,
     'ShaderNodeVolumeCoefficients': _n_named(_NO_VOLUME, _n_empty_volume),
     'ShaderNodeVolumeInfo': _n_named(_NO_VOLUME),
     'ShaderNodeTexPointDensity': _n_named(_NO_VOLUME),
@@ -3916,8 +6305,7 @@ DISPATCH = {
         'particles are not exported; instance them as real geometry'),
     'ShaderNodePointInfo': _n_named(
         'point clouds are not exported; instance them as real geometry'),
-    'ShaderNodeHairInfo': _n_named(
-        'curves are not exported; convert them to a mesh'),
+    'ShaderNodeHairInfo': n_hair_info,
     'ShaderNodeBsdfRayPortal': _n_named(
         'a Cycles portal, with nothing here to portal to',
         lambda ev, node: {'BSDF': Closure()}),
@@ -4020,6 +6408,7 @@ DISPATCH = {
     'NodeGroupOutput': n_group_output,
     # Halcyon
     'HALCYON_ShaderNode': n_halcyon_shader,
+    'HALCYON_AnimeShaderNode': n_anime_shader,
     'HALCYON_BIMaterialNode': n_bi_material,
     'HALCYON_BITextureNode': n_bi_texture,
     'HALCYON_BIInfluenceNode': n_bi_influence,
@@ -4066,6 +6455,45 @@ DISPATCH = {
     'HALCYON_GradientNode': n_pat_gradient_shaped,
     'HALCYON_CellsNode': n_pat_cells_tex,
     'HALCYON_StaticNode': n_pat_static,
+    'HALCYON_FurTuftsNode': n_pat_fur_tufts,
+    # R232: the 2D media
+    'HALCYON_HatchingNode': n_md_hatching,
+    'HALCYON_ScribbleNode': n_md_scribble,
+    'HALCYON_StippleNode': n_md_stipple,
+    'HALCYON_CharcoalNode': n_md_charcoal,
+    'HALCYON_PaintStrokesNode': n_md_paint,
+    'HALCYON_WashNode': n_md_wash,
+    'HALCYON_PaperNode': n_md_paper,
+    'HALCYON_LightMeterNode': n_u16_light_meter,
+    'HALCYON_TimerNode': n_u16_timer,
+    'HALCYON_OscillatorNode': n_u16_oscillator,
+    'HALCYON_CounterNode': n_u16_counter,
+    'HALCYON_PulseNode': n_u16_pulse,
+    'HALCYON_GateNode': n_u16_gate,
+    'HALCYON_SelectorNode': n_u16_selector,
+    'HALCYON_ColorKeyNode': n_u16_color_key,
+    'HALCYON_MeasureNode': n_u16_measure,
+    'HALCYON_StepRampNode': n_u16_step_ramp,
+    'HALCYON_WobbleNode': n_u16_wobble,
+    'HALCYON_FrameBlendNode': n_u16_frame_blend,
+    'HALCYON_BlackbodyNode': n_u16_blackbody,
+    'HALCYON_CompareNode': n_u16_compare,
+    'HALCYON_OnFrameNode': n_u16_on_frame,
+    'HALCYON_ArrayVecNode': n_v16_array,
+    'HALCYON_MirrorTileNode': n_v16_mirror_tile,
+    'HALCYON_KaleidoscopeNode': n_v16_kaleidoscope,
+    'HALCYON_PolarNode': n_v16_polar,
+    'HALCYON_TwirlNode': n_v16_twirl,
+    'HALCYON_LensNode': n_v16_lens,
+    'HALCYON_RippleWarpNode': n_v16_ripple_warp,
+    'HALCYON_WaveWarpNode': n_v16_wave_warp,
+    'HALCYON_TileRandomNode': n_v16_tile_random,
+    'HALCYON_VectorSnapNode': n_v16_vector_snap,
+    'HALCYON_ShearNode': n_v16_shear,
+    'HALCYON_OrbitNode': n_v16_orbit,
+    'HALCYON_RegionNode': n_v16_region,
+    'HALCYON_ProjectorNode': n_v16_projector,
+    'HALCYON_SpinNode': n_v16_spin,
     'HALCYON_MatcapUVNode': n_halcyon_matcap_uv,
     'HALCYON_RampNode': n_halcyon_ramp,
     'HALCYON_BlurNode': n_halcyon_blur,
@@ -4083,4 +6511,6 @@ DISPATCH = {
     'HALCYON_DistanceMaskNode': n_halcyon_distance_mask,
     'HALCYON_StepTimeNode': n_halcyon_step_time,
     'HALCYON_WaveNode': n_halcyon_wave,
+    # R242: the Max study
+    **MAX_FUNCS,
 }

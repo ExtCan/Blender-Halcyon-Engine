@@ -87,6 +87,74 @@ def sphere(centre=(0, 0, 0), radius=1.0, segs=24, rings=16, mat=0, obj=0, smooth
             np.array(UV, np.float32), np.array(T, np.int32), mat, obj)
 
 
+def torus(centre=(0, 0, 0), major=1.0, minor=0.4, segs=48, rings=24, mat=0,
+          obj=0, upright=True):
+    """R234: a torus (standing on its rim when `upright`, the hole facing
+    -y): interior contours, a terminator that bends, a form with a
+    saddle."""
+    c = np.asarray(centre, np.float32)
+    V, N, UV, T = [], [], [], []
+    for i in range(rings + 1):
+        v = i / rings * 2 * np.pi
+        for j in range(segs + 1):
+            u = j / segs * 2 * np.pi
+            cu, su, cv, sv = np.cos(u), np.sin(u), np.cos(v), np.sin(v)
+            if upright:
+                p = ((major + minor * cv) * cu, minor * sv,
+                     (major + minor * cv) * su)
+                n = (cv * cu, sv, cv * su)
+            else:
+                p = ((major + minor * cv) * cu, (major + minor * cv) * su,
+                     minor * sv)
+                n = (cv * cu, cv * su, sv)
+            V.append(c + np.asarray(p, np.float32))
+            N.append(n)
+            UV.append((j / segs, i / rings))
+    for i in range(rings):
+        for j in range(segs):
+            a = i * (segs + 1) + j
+            b = a + segs + 1
+            T.append([a, b, a + 1])
+            T.append([a + 1, b, b + 1])
+    return (np.array(V, np.float32), np.array(N, np.float32),
+            np.array(UV, np.float32), np.array(T, np.int32), mat, obj)
+
+
+def bumpy(centre=(0, 0, 0), radius=1.0, segs=48, rings=32, mat=0, obj=0,
+          amount=0.12):
+    """R234: a sphere with low-frequency folds -- the valleys of its
+    facing are form lines to find. Smooth normals from the displaced
+    mesh itself."""
+    c = np.asarray(centre, np.float32)
+    V, UV, T = [], [], []
+    for i in range(rings + 1):
+        v = i / rings
+        phi = v * np.pi
+        for j in range(segs + 1):
+            u = j / segs
+            th = u * 2 * np.pi
+            d = np.array([np.sin(phi) * np.cos(th), np.sin(phi) * np.sin(th),
+                          np.cos(phi)], np.float32)
+            rr = radius * (1.0 + amount * np.sin(3 * th) * np.sin(2 * phi)
+                           + amount * 0.67 * np.cos(5 * phi))
+            V.append(c + d * rr)
+            UV.append((u, 1 - v))
+    V = np.array(V, np.float32)
+    for i in range(rings):
+        for j in range(segs):
+            a = i * (segs + 1) + j
+            b = a + segs + 1
+            T.append([a, b, a + 1])
+            T.append([a + 1, b, b + 1])
+    T = np.array(T, np.int32)
+    N = np.zeros_like(V)
+    fn = np.cross(V[T[:, 1]] - V[T[:, 0]], V[T[:, 2]] - V[T[:, 0]])
+    for k in range(3):
+        np.add.at(N, T[:, k], fn)
+    N /= np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-9)
+    return (V, N.astype(np.float32), np.array(UV, np.float32), T, mat, obj)
+
+
 def plane(z=0.0, size=10.0, mat=0, obj=0):
     h = size * 0.5
     V = np.array([[-h, -h, z], [h, -h, z], [h, h, z], [-h, h, z]], np.float32)

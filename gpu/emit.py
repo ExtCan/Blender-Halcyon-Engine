@@ -655,8 +655,11 @@ def e_hue_sat(em, node, _i):
 def e_tex_coord(em, node, index):
     # Generated / Normal / UV / Object / Camera / Window / Reflection --
     # each the CPU's own n_tex_coord answer:
-    #   Object: the evaluator has no per-object inverse matrices, so it
-    #           answers world P -- hal_P matches it exactly.
+    #   Object: the object's own frame -- R243: hal_object, the world
+    #           position through the per-object inverse matrix the
+    #           material bakes as a lookup by object index (exactly
+    #           n_tex_coord's einsum); before R243 the GPU answered
+    #           world P here, a silent split on any moved object.
     #   Camera: c.P - camera_pos, NOT hal_P (the old emitter's silent
     #           wrong answer).
     #   Window: (px+0.5)/size -- the fullscreen pass's own vUV is that
@@ -682,7 +685,7 @@ def e_tex_coord(em, node, index):
             return em.tmp(VEC3, 'vec3(0.0)')
         return em.tmp(VEC3, 'vec3(vUV, 0.0)')
     table = {'generated': 'hal_generated', 'normal': 'hal_N',
-             'uv': 'vec3(hal_uv, 0.0)', 'object': 'hal_P',
+             'uv': 'vec3(hal_uv, 0.0)', 'object': 'hal_object',
              'reflection': 'reflect(-hal_V, hal_N)'}
     return em.tmp(VEC3, table.get(name, 'hal_generated'))
 
@@ -1287,6 +1290,31 @@ def e_halcyon_shader(em, node, _i):
             else 'hal_vcol'
         base, _t = em.tmp(VEC4, f'{base} + ({vcol} - {base}) * {vmix}')
     return base, VEC4
+
+
+def e_anime_shader(em, node, _i):
+    """The anime master (R218), as the deferred pass needs it: its
+    colour -- base times the Line Art chain, times the ILM's drawn
+    line channel in the ArcSys-family modes. Every other socket is a
+    surface parameter the probe harvests (baked when constant, granted
+    per pixel by the tables, refused by name otherwise)."""
+    base, _t = em.tmp(VEC4, em.input(node, 'Diffuse Color', VEC4))
+    line, _t = em.tmp(VEC4, em.input(node, 'Line Art', VEC4))
+    mode = str(prop(node, 'compat', 'GENERIC'))
+    out, _t = em.tmp(VEC4, f'vec4({base}.rgb * {line}.rgb, {base}.a)')
+    if mode in ('ARCSYS', 'DBFZ', 'KAKAROT', 'SPARKING'):
+        game, _t = em.tmp(VEC4, em.input(node, 'Game Texture', VEC4))
+        out, _t = em.tmp(VEC4, f'vec4({out}.rgb * {game}.a, {out}.a)')
+    return out, VEC4
+
+
+def e_cartoon_shader(em, node, _i):
+    """The cartoon/paint master (R228), as the deferred pass needs it:
+    the Paint Color chain. Every other socket is a surface parameter
+    the probe harvests (baked when constant, granted per pixel by the
+    tables, refused by name otherwise); the paint composition itself
+    lives in the lamp lines and the assembly tail."""
+    return em.tmp(VEC4, em.input(node, 'Paint Color', VEC4))
 
 
 def e_bi_material(em, node, _i):
@@ -2026,10 +2054,24 @@ def e_pat_agate(em, node, index):
 
 
 def e_pat_leopard(em, node, index):
+    # R216 rosettes: the pattern hands back (ring, interior) and the
+    # colour output lays ground -> Interior -> ring, exactly as the
+    # evaluator does; Fac is the ring mask
     _need_pattern(em, 'leopard')
     p = _pat_vec(em, node)
-    return _pat_output(em, node, index, (
-        f'hal_pat_leopard({p}, {_pat_scalar(em, node, "Spot", 1.0)})'))
+    ri, _t = em.tmp('vec2', (
+        f'hal_pat_leopard({p}, {_pat_scalar(em, node, "Spot", 1.0)}, '
+        f'{_pat_scalar(em, node, "Jitter", 0.85)}, '
+        f'{_pat_scalar(em, node, "Break", 0.55)})'))
+    outs = node.get('outputs') or []
+    o = outs[index] if index < len(outs) else {}
+    if o.get('name') == 'Fac':
+        return em.tmp(FLOAT, f'{ri}.x')
+    a, _t = em.tmp(VEC4, em.input(node, 'Color 1', VEC4))
+    b, _t = em.tmp(VEC4, em.input(node, 'Color 2', VEC4))
+    ci, _t = em.tmp(VEC4, em.input(node, 'Interior', VEC4))
+    col, _t = em.tmp(VEC4, f'{a} + ({ci} - {a}) * {ri}.y')
+    return em.tmp(VEC4, f'{col} + ({b} - {col}) * {ri}.x')
 
 
 def e_pat_onion(em, node, index):
@@ -2216,6 +2258,296 @@ def e_pat_static(em, node, index):
         frame = '0.0'
     return _pat_output(em, node, index,
                        f'hal_pat_static({p}, {frame})')
+
+
+def e_pat_fur_tufts(em, node, index):
+    """R209: the shell-fur field -- same lattice hashes as the CPU, so the
+    tuft discs land identically and taper identically on both devices."""
+    _need_pattern(em, 'furtufts')
+    p = _pat_vec(em, node)
+    res, _t = em.tmp('vec2', (
+        f'hal_pat_fur_tufts({p}, '
+        f'{_pat_scalar(em, node, "Coverage", 1.0)}, '
+        f'{_pat_scalar(em, node, "Taper", 1.0)}, '
+        f'{_pat_scalar(em, node, "Variation", 0.35)})'))
+    outs = node.get('outputs') or []
+    o = outs[index] if index < len(outs) else {}
+    if o.get('name') == 'Random':
+        return em.tmp(FLOAT, f'{res}.y')
+    if o.get('name') == 'Height':
+        return em.tmp(FLOAT, f'{res}.x')
+    return _pat_output(em, node, index, f'{res}.x')
+
+
+# --- the 2D media (R232) ---------------------------------------------------
+#
+# core/media.py's twins, through the pattern conventions plus three new
+# seams. TONE is per-pixel (a Shader to RGB luminance cannot travel, but a
+# Facing, a Layer Weight or a dot with a light direction can), so it emits
+# through em.input like a colour. SCREEN space reads the frame pass's own
+# vUV back to the integer pixel and divides by the frame HEIGHT -- the
+# CPU's (px + .5) / H in the same float32 ops -- and answers zeros off the
+# pixel grid, exactly as the Window coordinate and Screen Info do. The
+# BOIL rides hal_frame: an animation never recompiles a drawing, the salt
+# is integer arithmetic on the uniform. Angles that reach a floor (the
+# lanes, the brush direction, the charcoal streak axis) are baked to
+# float32 cos/sin literals from the SAME float32 socket value the CPU
+# read, so no driver's cos decides a lane; the scribble's fan and the
+# brush's turn slope bake the same way.
+
+
+def _lit32(v):
+    """A float32 literal that round-trips: the repr of the float32's exact
+    value parses back to that float32 on any front-end."""
+    import numpy as np
+    return repr(float(np.float32(v)))
+
+
+def _md_default(node, name, fallback):
+    """The socket default AS THE CPU READS IT: rounded to float32 first, so
+    a baked cos/sin starts from the same number on both devices."""
+    import numpy as np
+    return float(np.float32(_socket_default(node, name, fallback)))
+
+
+def _md_xy(em, node):
+    space = str(prop(node, 'space', 'VECTOR'))
+    if space == 'VIEW':
+        # R233: the camera's sphere from the SAME two float32 vectors the
+        # CPU subtracts (hal_P is the CPU's own P; hal_eye its eye)
+        _need_pattern(em, 'md_prims')
+        scale = em.input(node, 'Scale', FLOAT)
+        p, _t = em.tmp('vec2', f'hal_md_view(hal_P - hal_eye) * {scale}')
+        return p
+    if space == 'SCREEN':
+        on_grid = (em.frame_mode and not em.secondary
+                   and getattr(em, 'resolution', None) is not None)
+        if on_grid:
+            w, h = float(em.resolution[0]), float(em.resolution[1])
+            base = (f'vec2((floor(vUV.x * {_c(w)}) + 0.5) / {_c(h)}, '
+                    f'(floor(vUV.y * {_c(h)}) + 0.5) / {_c(h)})')
+        else:
+            base = 'vec2(0.0, 0.0)'
+        scale = em.input(node, 'Scale', FLOAT)
+        p, _t = em.tmp('vec2', f'{base} * {scale}')
+        return p
+    p3 = _pat_vec(em, node)
+    p, _t = em.tmp('vec2', f'{p3}.xy')
+    return p
+
+
+def _md_salt(em, node):
+    boil = int(prop(node, 'boil', 0))
+    if boil > 0:
+        em.frame_uniforms.add('hal_frame')
+        frame = 'hal_frame'
+    else:
+        frame = '0.0'
+    seed = em.const(float(int(prop(node, 'seed', 0))), FLOAT)
+    s, _t = em.tmp('int', f'hal_md_salt(int({seed}), {frame}, {boil})')
+    return s
+
+
+def _md_has_socket(node, name):
+    return any(s.get('name') == name or s.get('identifier') == name
+               for s in node.get('inputs', ()))
+
+
+def _md_tone(em, node):
+    tone = em.input(node, 'Tone', FLOAT)
+    if _md_has_socket(node, 'Indication'):
+        # R235: tone' = 1 - (1 - tone) * indication, exactly nodeeval
+        ind = em.input(node, 'Indication', FLOAT)
+        tone, _t = em.tmp(FLOAT, f'1.0 - (1.0 - ({tone})) * ({ind})')
+    d, _t = em.tmp(FLOAT, f'clamp(1.0 - ({tone}), 0.0, 1.0)')
+    return d
+
+
+def _md_directed(em, node, fan, call):
+    """R235: a lane medium's Direction. ANGLE emits the one call `call(rl)`
+    with the baked layer rotations; FORM / SLOPE emit the tangent from
+    hal_N and hal_V (the matcap frame on the camera's paper), the bin
+    coordinate, and two calls with the bin's literal rotation tables
+    cross-faded as f0 * (1 - w) + f1 * w -- media.blend_bins line for
+    line."""
+    from ..core import media as MD
+    mode = str(prop(node, 'direction', 'ANGLE')).upper()
+    if mode not in ('FORM', 'SLOPE'):
+        _L, rl = _md_rots(em, node, fan)
+        f, _t = em.tmp(FLOAT, call(rl))
+        return f
+    L = max(min(int(prop(node, 'layers', 2)), 4), 1)
+    _pat_scalar(em, node, 'Angle')          # linked: refuse by name
+    ang = _md_default(node, 'Angle', 45.0)
+    table = MD.bin_rotations(ang, L, fan)
+    screen = '1' if str(prop(node, 'space', 'VECTOR')) == 'SCREEN' else '0'
+    n, _t = em.tmp(VEC3, 'normalize(hal_N)')
+    t2, _t = em.tmp('vec2', f'hal_md_tangent({n}, hal_V, '
+                            f'{0 if mode == "FORM" else 1}, {screen})')
+    b, _t = em.tmp(FLOAT, f'hal_md_bins({t2}.x, {t2}.y)')
+    bf, _t = em.tmp(FLOAT, f'floor({b})')
+    i0, _t = em.tmp('int', f'min(int({bf}), {MD.DIRECTION_BINS - 1})')
+    i1, _t = em.tmp('int', f'({i0} == {MD.DIRECTION_BINS - 1}) ? 0 : {i0} + 1')
+    w, _t = em.tmp(FLOAT, f'smoothstep(0.35, 0.65, {b} - {bf})')
+
+    def rots_for(idx):
+        lits = []
+        for k in range(4):
+            if k < L:
+                chain = f'vec2({_lit32(table[MD.DIRECTION_BINS - 1][k][0])}, ' \
+                        f'{_lit32(table[MD.DIRECTION_BINS - 1][k][1])})'
+                for i in range(MD.DIRECTION_BINS - 2, -1, -1):
+                    c, sn = table[i][k]
+                    chain = f'({idx} == {i}) ? vec2({_lit32(c)}, ' \
+                            f'{_lit32(sn)}) : ({chain})'
+                r, _t = em.tmp('vec2', chain)
+                lits.append(r)
+            else:
+                lits.append('vec2(1.0, 0.0)')
+        return ', '.join(lits)
+
+    f0, _t = em.tmp(FLOAT, call(rots_for(i0)))
+    f1, _t = em.tmp(FLOAT, call(rots_for(i1)))
+    f, _t = em.tmp(FLOAT, f'{f0} * (1.0 - {w}) + {f1} * {w}')
+    return f
+
+
+def _md_rots(em, node, fan=180.0):
+    from ..core import media as MD
+    L = max(min(int(prop(node, 'layers', 2)), 4), 1)
+    _pat_scalar(em, node, 'Angle')          # linked: refuse by name
+    ang = _md_default(node, 'Angle', 45.0)
+    lits = [f'vec2({_lit32(c)}, {_lit32(s)})'
+            for c, s in (MD.rotation(ang, k, L, fan) for k in range(L))]
+    while len(lits) < 4:
+        lits.append('vec2(1.0, 0.0)')
+    return L, ', '.join(lits)
+
+
+def _md_rot1(em, node, fallback):
+    from ..core import media as MD
+    _pat_scalar(em, node, 'Angle')
+    c, s = MD.rotation(_md_default(node, 'Angle', fallback))
+    return f'vec2({_lit32(c)}, {_lit32(s)})'
+
+
+def e_md_hatching(em, node, index):
+    _need_pattern(em, 'md_prims')
+    _need_pattern(em, 'md_hatching')
+    p = _md_xy(em, node)
+    d = _md_tone(em, node)
+    L = max(min(int(prop(node, 'layers', 2)), 4), 1)
+    width = _pat_scalar(em, node, "Width", 0.35)
+    length = _pat_scalar(em, node, "Length", 6.0)
+    wobble = _pat_scalar(em, node, "Wobble", 0.5)
+    breaks = _pat_scalar(em, node, "Breaks", 0.2)
+    salt = _md_salt(em, node)
+    f = _md_directed(em, node, 180.0, lambda rl: (
+        f'hal_md_hatching({p}, {d}, {L}, {rl}, {width}, {length}, '
+        f'{wobble}, {breaks}, {salt})'))
+    return _pat_output(em, node, index, f)
+
+
+def e_md_scribble(em, node, index):
+    from ..core import media as MD
+    _need_pattern(em, 'md_prims')
+    _need_pattern(em, 'md_scribble')
+    p = _md_xy(em, node)
+    d = _md_tone(em, node)
+    L = max(min(int(prop(node, 'layers', 2)), 4), 1)
+    width = _pat_scalar(em, node, "Width", 0.3)
+    curl = _pat_scalar(em, node, "Curl", 0.5)
+    pressure = _pat_scalar(em, node, "Pressure", 0.7)
+    grain = _pat_scalar(em, node, "Grain", 0.6)
+    salt = _md_salt(em, node)
+    blend = _pat_scalar(em, node, "Blend", 0.0)
+    f = _md_directed(em, node, MD.SCRIBBLE_FAN, lambda rl: (
+        f'hal_md_scribble({p}, {d}, {L}, {rl}, {width}, {curl}, '
+        f'{pressure}, {grain}, {salt}, {blend})'))
+    return _pat_output(em, node, index, f)
+
+
+def e_md_stipple(em, node, index):
+    _need_pattern(em, 'md_prims')
+    _need_pattern(em, 'md_stipple')
+    p = _md_xy(em, node)
+    d = _md_tone(em, node)
+    placement = 1 if str(prop(node, 'placement', 'SIZE')).upper() == 'COUNT' \
+        else 0
+    f, _t = em.tmp(FLOAT, (
+        f'hal_md_stipple({p}, {d}, '
+        f'{_pat_scalar(em, node, "Size", 0.6)}, '
+        f'{_pat_scalar(em, node, "Jitter", 0.8)}, '
+        f'{_pat_scalar(em, node, "Fine", 1.0)}, {_md_salt(em, node)}, '
+        f'{placement})'))
+    return _pat_output(em, node, index, f)
+
+
+def e_md_charcoal(em, node, index):
+    _need_pattern(em, 'md_prims')
+    _need_pattern(em, 'md_charcoal')
+    p = _md_xy(em, node)
+    d = _md_tone(em, node)
+    rot = _md_rot1(em, node, 20.0)
+    f, _t = em.tmp(FLOAT, (
+        f'hal_md_charcoal({p}, {d}, {rot}, '
+        f'{_pat_scalar(em, node, "Grain", 0.6)}, '
+        f'{_pat_scalar(em, node, "Streak", 0.5)}, '
+        f'{_pat_scalar(em, node, "Smudge", 0.4)}, {_md_salt(em, node)}, '
+        f'{_pat_scalar(em, node, "Blend", 0.0)})'))
+    return _pat_output(em, node, index, f)
+
+
+def e_md_paint(em, node, index):
+    from ..core import media as MD
+    _need_pattern(em, 'md_prims')
+    _need_pattern(em, 'md_paint')
+    p = _md_xy(em, node)
+    rot = _md_rot1(em, node, 25.0)
+    _pat_scalar(em, node, 'Spread')
+    slope = _lit32(MD.paint_slope(_md_default(node, 'Spread', 0.5)))
+    res, _t = em.tmp(VEC3, (
+        f'hal_md_paint({p}, {rot}, '
+        f'{_pat_scalar(em, node, "Length", 2.6)}, '
+        f'{_pat_scalar(em, node, "Width", 0.85)}, {slope}, '
+        f'{_pat_scalar(em, node, "Bristles", 0.6)}, '
+        f'{_pat_scalar(em, node, "Variation", 0.3)}, {_md_salt(em, node)})'))
+    outs = node.get('outputs') or []
+    o = outs[index] if index < len(outs) else {}
+    if o.get('name') == 'Stroke ID':
+        return em.tmp(FLOAT, f'{res}.z')
+    if o.get('name') == 'Fac':
+        return em.tmp(FLOAT, f'{res}.x')
+    canvas, _t = em.tmp(VEC4, em.input(node, 'Color 1', VEC4))
+    paint, _t = em.tmp(VEC4, em.input(node, 'Color 2', VEC4))
+    col, _t = em.tmp(VEC4, f'{canvas} * (1.0 - {res}.y) + {paint} * {res}.x')
+    return em.tmp(VEC4, f'vec4({col}.rgb, 1.0)')
+
+
+def e_md_wash(em, node, index):
+    _need_pattern(em, 'md_prims')
+    _need_pattern(em, 'md_wash')
+    p = _md_xy(em, node)
+    d = _md_tone(em, node)
+    n = max(min(int(prop(node, 'levels', 3)), 6), 1)
+    f, _t = em.tmp(FLOAT, (
+        f'hal_md_wash({p}, {d}, {n}, '
+        f'{_pat_scalar(em, node, "Pooling", 0.6)}, '
+        f'{_pat_scalar(em, node, "Granulation", 0.4)}, '
+        f'{_pat_scalar(em, node, "Bleed", 0.4)}, {_md_salt(em, node)})'))
+    return _pat_output(em, node, index, f)
+
+
+def e_md_paper(em, node, index):
+    _need_pattern(em, 'md_prims')
+    _need_pattern(em, 'md_paper')
+    p = _md_xy(em, node)
+    f, _t = em.tmp(FLOAT, (
+        f'hal_md_paper({p}, '
+        f'{_pat_scalar(em, node, "Tooth", 0.6)}, '
+        f'{_pat_scalar(em, node, "Fibres", 0.3)}, '
+        f'{_pat_scalar(em, node, "Mottle", 0.4)}, {_md_salt(em, node)})'))
+    return _pat_output(em, node, index, f)
 
 
 # --- the retro utilities --------------------------------------------------
@@ -3070,6 +3402,10 @@ def e_bump(em, node, _i):
 #: same thing as "nobody wrote one yet": these are refused for a reason worth
 #: naming, so the fallback message says it instead of just the node's name.
 REFUSED = {
+    'HALCYON_LightMeterNode': 'it reads the lamp list at shading time; '
+                              'the deferred pass would need the whole '
+                              'light loop inside a node -- shades on '
+                              'the CPU',
     # the Blender-noise family rides fract(sin(x)*43758.5453), evaluated in
     # float64 on the CPU. A driver's float32 sin decorrelates completely
     # after that amplification, so the GPU would render a DIFFERENT pattern
@@ -3089,9 +3425,17 @@ REFUSED = {
     'ShaderNodeAmbientOcclusion': 'in-graph occlusion rays are CPU-only',
     'ShaderNodeBevel': 'in-graph geometry queries are CPU-only',
     'ShaderNodeLightFalloff': 'falloff lives on the lamps in this renderer',
-    'ShaderNodeVolumeAbsorption': 'no volumetrics in this renderer',
-    'ShaderNodeVolumeScatter': 'no volumetrics in this renderer',
-    'ShaderNodeVolumePrincipled': 'no volumetrics in this renderer',
+    'ShaderNodeVolumeAbsorption': 'a volume node in a SURFACE chain; '
+                                  'volumes march via Material Output > '
+                                  'Volume (R222)',
+    'ShaderNodeVolumeScatter': 'a volume node in a SURFACE chain; '
+                               'volumes march via Material Output > '
+                               'Volume (R222)',
+    'ShaderNodeVolumePrincipled': 'a volume node in a SURFACE chain; '
+                                  'volumes march via Material Output > '
+                                  'Volume (R222)',
+    'HALCYON_VolumeNode': 'a volume node in a SURFACE chain; volumes '
+                          'march via Material Output > Volume (R222)',
     'ShaderNodeTexPointDensity': 'no volumetrics in this renderer',
     'ShaderNodeScript': 'OSL is not in this renderer; the Coded Shader '
                         'node is the native equivalent',
@@ -3211,6 +3555,27 @@ def _lut_sample(em, lut, k, t, kind):
                         f'{x} - float({i0}))')
 
 
+def e_hair_info(em, node, index):
+    """R208: the strand data rides the colour interpolant (hal_vcol)
+    under the engine's one hair convention -- r intercept, g random,
+    b length, a thickness -- and the graph root's 'strand' flag says
+    whether this material IS hair. Both facts are batch constants, so
+    the emitter reads them at plan time and the GLSL is just swizzles."""
+    outs = node.get('outputs') or []
+    o = (outs[index] if index < len(outs) else {}).get('name', '')
+    strand = bool((em.graph or {}).get('strand'))
+    if o == 'Tangent Normal':
+        return em.tmp(VEC3, 'hal_N')
+    if not strand:
+        return em.tmp(FLOAT, '0.0')
+    sw = {'Is Strand': None, 'Intercept': 'hal_vcol.r',
+          'Length': 'hal_vcol.b', 'Thickness': 'hal_vcol.a',
+          'Random': 'hal_vcol.g'}
+    if o == 'Is Strand':
+        return em.tmp(FLOAT, '1.0')
+    return em.tmp(FLOAT, sw.get(o) or 'hal_vcol.r')
+
+
 def e_val_to_rgb(em, node, index):
     """ShaderNodeValToRGB (the ColorRamp), from its baked 256-row LUT."""
     fac = em.input(node, 'Fac', FLOAT)
@@ -3268,8 +3633,1377 @@ def e_rgb_curve(em, node, index):
     return em.tmp(VEC4, f'{col} + ({out} - {col}) * ({fac})')
 
 
+# ------------------------------------------- the R216 families' GLSL twins
+
+def _o_name(node, index):
+    outs = node.get('outputs') or []
+    return (outs[index] if index < len(outs) else {}).get('name', '')
+
+
+def _time_of(em, node, gate='animate', default=True):
+    if prop(node, gate, default):
+        em.frame_uniforms.add('hal_time')
+        return 'hal_time'
+    return '0.0'
+
+
+def e_u16_timer(em, node, index):
+    em.frame_uniforms.add('hal_frame')
+    nm = _o_name(node, index)
+    if nm == 'Seconds':
+        em.frame_uniforms.add('hal_time')
+        return em.tmp(FLOAT, 'hal_time')
+    if nm == 'Loop':
+        lf = em.input(node, 'Loop Frames', FLOAT)
+        return em.tmp(FLOAT, f'fract(hal_frame / max({lf}, 1.0))')
+    return em.tmp(FLOAT, 'hal_frame')
+
+
+def e_u16_oscillator(em, node, index):
+    em.frame_uniforms.add('hal_time')
+    t, _t = em.tmp(FLOAT, f'hal_time * {em.input(node, "Speed", FLOAT)}'
+                          f' + {em.input(node, "Phase", FLOAT)}')
+    wave = str(prop(node, 'wave', 'SINE'))
+    if wave == 'SQUARE':
+        w, _t = em.tmp(FLOAT, f'(fract({t}) < 0.5) ? 1.0 : 0.0')
+    elif wave == 'TRIANGLE':
+        w, _t = em.tmp(FLOAT, f'1.0 - abs(2.0 * fract({t}) - 1.0)')
+    elif wave == 'SAW':
+        w, _t = em.tmp(FLOAT, f'fract({t})')
+    else:
+        w, _t = em.tmp(FLOAT, f'sin({t} * 6.28318530717959) * 0.5 + 0.5')
+    lo = em.input(node, 'Min', FLOAT)
+    hi = em.input(node, 'Max', FLOAT)
+    return em.tmp(FLOAT, f'{lo} + ({hi} - {lo}) * {w}')
+
+
+def e_u16_counter(em, node, index):
+    em.frame_uniforms.add('hal_frame')
+    st = em.input(node, 'Frames Per Step', FLOAT)
+    md = em.input(node, 'Modulo', FLOAT)
+    off = em.input(node, 'Offset', FLOAT)
+    return em.tmp(FLOAT, f'mod(floor(hal_frame / max({st}, 1.0)) '
+                         f'+ {off}, max({md}, 1.0))')
+
+
+def e_u16_pulse(em, node, index):
+    em.frame_uniforms.add('hal_frame')
+    per = em.input(node, 'Period', FLOAT)
+    wid = em.input(node, 'Width', FLOAT)
+    ph = em.input(node, 'Phase', FLOAT)
+    return em.tmp(FLOAT, f'(mod(hal_frame - {ph}, max({per}, 1.0)) '
+                         f'< {wid}) ? 1.0 : 0.0')
+
+
+def e_u16_gate(em, node, index):
+    v = em.input(node, 'Value', FLOAT)
+    th = em.input(node, 'Threshold', FLOAT)
+    so, _t = em.tmp(FLOAT, f'max({em.input(node, "Softness", FLOAT)}, '
+                           '0.0)')
+    tt, _t = em.tmp(FLOAT, f'clamp(({v} - ({th} - {so})) / '
+                           f'max(2.0 * {so}, 1e-9), 0.0, 1.0)')
+    out, _t = em.tmp(FLOAT, f'({so} > 0.0) ? ({tt} * {tt} * '
+                            f'(3.0 - 2.0 * {tt})) '
+                            f': (({v} >= {th}) ? 1.0 : 0.0)')
+    if prop(node, 'invert', False):
+        return em.tmp(FLOAT, f'1.0 - {out}')
+    return out, FLOAT
+
+
+def e_u16_selector(em, node, index):
+    idx, _t = em.tmp(FLOAT, f'floor({em.input(node, "Index", FLOAT)})')
+    if prop(node, 'wrap', True):
+        i, _t = em.tmp(FLOAT, f'mod(mod({idx}, 4.0) + 4.0, 4.0)')
+    else:
+        i, _t = em.tmp(FLOAT, f'clamp({idx}, 0.0, 3.0)')
+    c1 = em.input(node, 'Color 1', VEC4)
+    c2 = em.input(node, 'Color 2', VEC4)
+    c3 = em.input(node, 'Color 3', VEC4)
+    c4 = em.input(node, 'Color 4', VEC4)
+    return em.tmp(VEC4, f'({i} < 0.5) ? {c1} : (({i} < 1.5) ? {c2} : '
+                        f'(({i} < 2.5) ? {c3} : {c4}))')
+
+
+def e_u16_color_key(em, node, index):
+    col, _t = em.tmp(VEC4, em.input(node, 'Color', VEC4))
+    key, _t = em.tmp(VEC4, em.input(node, 'Key', VEC4))
+    tol = em.input(node, 'Tolerance', FLOAT)
+    so, _t = em.tmp(FLOAT, f'max({em.input(node, "Softness", FLOAT)}, '
+                           '1e-6)')
+    d, _t = em.tmp(FLOAT, f'distance({col}.rgb, {key}.rgb)')
+    tt, _t = em.tmp(FLOAT, f'clamp(({d} - max({tol}, 0.0)) / {so}, '
+                           '0.0, 1.0)')
+    fac, _t = em.tmp(FLOAT, f'1.0 - {tt} * {tt} * (3.0 - 2.0 * {tt})')
+    if _o_name(node, index) == 'Matte':
+        return em.tmp(FLOAT, f'1.0 - {fac}')
+    return fac, FLOAT
+
+
+def e_u16_measure(em, node, index):
+    mode = str(prop(node, 'mode', 'ORIGIN'))
+    sc, _t = em.tmp(FLOAT, f'max({em.input(node, "Scale", FLOAT)}, '
+                           '1e-9)')
+    if mode == 'POINT':
+        ref = em.input(node, 'Point', VEC3)
+        d, _t = em.tmp(FLOAT, f'distance(hal_P, {ref})')
+    elif mode == 'CAMERA':
+        d, _t = em.tmp(FLOAT, 'distance(hal_P, hal_eye)')
+    elif mode in ('AXIS_X', 'AXIS_Y', 'AXIS_Z'):
+        d, _t = em.tmp(FLOAT, 'hal_P.' + mode[-1].lower())
+    else:
+        d, _t = em.tmp(FLOAT, 'distance(hal_P, hal_object_loc)')
+    return em.tmp(FLOAT, f'{d} / {sc}')
+
+
+def e_u16_step_ramp(em, node, index):
+    f, _t = em.tmp(FLOAT, f'clamp({em.input(node, "Fac", FLOAT)}, '
+                          '0.0, 1.0)')
+    st, _t = em.tmp(FLOAT, f'max({em.input(node, "Steps", FLOAT)}, 1.0)')
+    band, _t = em.tmp(FLOAT, f'min(floor({f} * {st}), {st} - 1.0)')
+    if _o_name(node, index) == 'Band':
+        return band, FLOAT
+    q, _t = em.tmp(FLOAT, f'{band} / max({st} - 1.0, 1.0)')
+    a = em.input(node, 'Color 1', VEC4)
+    b = em.input(node, 'Color 2', VEC4)
+    return em.tmp(VEC4, f'mix({a}, {b}, {q})')
+
+
+def e_u16_wobble(em, node, index):
+    _need_prims(em)
+    em.frame_uniforms.add('hal_time')
+    v = em.input(node, 'Value', FLOAT)
+    amt = em.input(node, 'Amount', FLOAT)
+    sp = em.input(node, 'Speed', FLOAT)
+    seed = float(int(prop(node, 'seed', 0)) * 13.7)
+    t, _t = em.tmp(FLOAT, f'hal_time * {sp} + {seed!r}')
+    w, _t = em.tmp(FLOAT,
+                   f'hal_pt_vnoise(vec3({t}, 0.37, 0.61))')
+    return em.tmp(FLOAT, f'{v} + ({w} * 2.0 - 1.0) * {amt}')
+
+
+def e_u16_frame_blend(em, node, index):
+    em.frame_uniforms.add('hal_frame')
+    s0 = em.input(node, 'Start Frame', FLOAT)
+    e0 = em.input(node, 'End Frame', FLOAT)
+    t, _t = em.tmp(FLOAT, f'clamp((hal_frame - {s0}) / '
+                          f'max({e0} - {s0}, 1e-6), 0.0, 1.0)')
+    if _o_name(node, index) == 'Fac':
+        return t, FLOAT
+    a = em.input(node, 'A', VEC4)
+    b = em.input(node, 'B', VEC4)
+    return em.tmp(VEC4, f'mix({a}, {b}, {t})')
+
+
+def e_u16_blackbody(em, node, index):
+    k, _t = em.tmp(FLOAT, f'clamp({em.input(node, "Kelvin", FLOAT)}, '
+                          '1000.0, 12000.0)')
+    t, _t = em.tmp(FLOAT, f'{k} / 100.0')
+    r, _t = em.tmp(FLOAT, f'({t} <= 66.0) ? 1.0 : clamp(1.292936 * '
+                          f'pow(max({t} - 60.0, 1e-3), -0.1332047), 0.0, 1.0)')
+    g, _t = em.tmp(FLOAT, f'({t} <= 66.0) ? clamp(0.3900816 * '
+                          f'log(max({t}, 1e-3)) - 0.6318414, 0.0, 1.0) '
+                          f': clamp(1.129891 * pow(max({t} - 60.0, 1e-3), '
+                          '-0.0755148), 0.0, 1.0)')
+    b, _t = em.tmp(FLOAT, f'({t} >= 66.0) ? 1.0 : (({t} <= 19.0) ? 0.0 '
+                          f': clamp(0.5432068 * log(max({t} - 10.0, '
+                          '1e-3)) - 1.19625, 0.0, 1.0))')
+    return em.tmp(VEC4, f'vec4({r}, {g}, {b}, 1.0)')
+
+
+def e_u16_compare(em, node, index):
+    a = em.input(node, 'A', FLOAT)
+    b = em.input(node, 'B', FLOAT)
+    eps, _t = em.tmp(FLOAT, f'max({em.input(node, "Epsilon", FLOAT)}, '
+                            '0.0)')
+    eq, _t = em.tmp(FLOAT, f'(abs({a} - {b}) <= {eps}) ? 1.0 : 0.0')
+    nm = _o_name(node, index)
+    if nm == 'Greater':
+        return em.tmp(FLOAT, f'(({a} > {b}) && ({eq} < 0.5)) '
+                             '? 1.0 : 0.0')
+    if nm == 'Less':
+        return em.tmp(FLOAT, f'(({a} < {b}) && ({eq} < 0.5)) '
+                             '? 1.0 : 0.0')
+    return eq, FLOAT
+
+
+def e_u16_on_frame(em, node, index):
+    em.frame_uniforms.add('hal_frame')
+    s0 = em.input(node, 'Start Frame', FLOAT)
+    e0 = em.input(node, 'End Frame', FLOAT)
+    return em.tmp(FLOAT, f'((hal_frame >= {s0}) && (hal_frame <= {e0}))'
+                         ' ? 1.0 : 0.0')
+
+
+# --- the vector family ----------------------------------------------------
+
+
+def _v16_uv(em, node):
+    v = tex_vector(em, node, 'uv')
+    out, _t = em.tmp(VEC3, v)
+    return out
+
+
+def e_v16_array(em, node, index):
+    _need_prims(em)
+    v = _v16_uv(em, node)
+    ctr = em.input(node, 'Center', VEC3)
+    size, _t = em.tmp(FLOAT, f'max({em.input(node, "Size", FLOAT)}, '
+                             '1e-6)')
+    rot = em.input(node, 'Rotation', FLOAT)
+    jit = em.input(node, 'Jitter', FLOAT)
+    mode = str(prop(node, 'mode', 'CIRCLE'))
+    count = float(max(int(prop(node, 'count', 8)), 1))
+    sides = float(max(int(prop(node, 'sides', 5)), 2))
+    orient = bool(prop(node, 'orient', True))
+    x, _t = em.tmp(FLOAT, f'{v}.x - {ctr}.x')
+    y, _t = em.tmp(FLOAT, f'{v}.y - {ctr}.y')
+    if mode == 'LINE':
+        sp, _t = em.tmp(FLOAT, f'max({em.input(node, "Spacing", FLOAT)}'
+                               ', 1e-6)')
+        ca, _t = em.tmp(FLOAT, f'cos({rot})')
+        sa, _t = em.tmp(FLOAT, f'sin({rot})')
+        tl, _t = em.tmp(FLOAT, f'{x} * {ca} + {y} * {sa}')
+        pp, _t = em.tmp(FLOAT, f'-{x} * {sa} + {y} * {ca}')
+        idx, _t = em.tmp(FLOAT, f'clamp(floor({tl} / {sp} + 0.5), 0.0, '
+                                f'{count - 1.0!r})')
+        lx, _t = em.tmp(FLOAT, f'{tl} - {idx} * {sp}')
+        ly, _t = em.tmp(FLOAT, pp)
+        ang, _t = em.tmp(FLOAT, '0.0')
+    elif mode == 'GRID':
+        sp, _t = em.tmp(FLOAT, f'max({em.input(node, "Spacing", FLOAT)}'
+                               ', 1e-6)')
+        gi, _t = em.tmp(FLOAT, f'clamp(floor({x} / {sp} + 0.5), 0.0, '
+                               f'{count - 1.0!r})')
+        gj, _t = em.tmp(FLOAT, f'clamp(floor({y} / {sp} + 0.5), 0.0, '
+                               f'{sides - 1.0!r})')
+        lx, _t = em.tmp(FLOAT, f'{x} - {gi} * {sp}')
+        ly, _t = em.tmp(FLOAT, f'{y} - {gj} * {sp}')
+        idx, _t = em.tmp(FLOAT, f'{gj} * {count!r} + {gi}')
+        ang, _t = em.tmp(FLOAT, '0.0')
+    else:
+        rad, _t = em.tmp(FLOAT, f'max({em.input(node, "Radius", FLOAT)}'
+                                ', 1e-6)')
+        th, _t = em.tmp(FLOAT, f'atan({y}, {x})')
+        if mode == 'CIRCLE':
+            step = 6.28318530717959 / count
+            idx, _t = em.tmp(FLOAT, f'mod(floor({th} / {step!r} + 0.5) '
+                                    f'+ {count!r}, {count!r})')
+            aa, _t = em.tmp(FLOAT, f'{idx} * {step!r}')
+            cx, _t = em.tmp(FLOAT, f'cos({aa}) * {rad}')
+            cy, _t = em.tmp(FLOAT, f'sin({aa}) * {rad}')
+            ang0, _t = em.tmp(FLOAT, f'{aa} + 1.5707963267949')
+        elif mode == 'SQUARE':
+            per, _t = em.tmp(FLOAT, f'fract({th} / 6.28318530717959 '
+                                    '+ 0.5)')
+            idx, _t = em.tmp(FLOAT, f'mod(floor({per} * {count!r} '
+                                    f'+ 0.5), {count!r})')
+            tp, _t = em.tmp(FLOAT, f'({idx} / {count!r}) * 4.0')
+            side, _t = em.tmp(FLOAT, f'floor({tp})')
+            ft, _t = em.tmp(FLOAT, f'{tp} - {side}')
+            e0, _t = em.tmp(FLOAT, f'2.0 * {ft} - 1.0')
+            cx, _t = em.tmp(FLOAT, f'(({side} < 0.5) ? 1.0 : '
+                                   f'(({side} < 1.5) ? -{e0} : '
+                                   f'(({side} < 2.5) ? -1.0 : {e0}))) '
+                                   f'* {rad}')
+            cy, _t = em.tmp(FLOAT, f'(({side} < 0.5) ? {e0} : '
+                                   f'(({side} < 1.5) ? 1.0 : '
+                                   f'(({side} < 2.5) ? -{e0} : -1.0))) '
+                                   f'* {rad}')
+            ang0, _t = em.tmp(FLOAT, f'atan({cy}, {cx}) '
+                                     '+ 1.5707963267949')
+        else:
+            pts = sides if mode == 'POLYGON' else sides * 2.0
+            step = 6.28318530717959 / pts
+            idx, _t = em.tmp(FLOAT, f'mod(floor({th} / {step!r} + 0.5) '
+                                    f'+ {pts!r}, {pts!r})')
+            aa, _t = em.tmp(FLOAT, f'{idx} * {step!r}')
+            if mode == 'STAR':
+                inner = em.input(node, 'Inner', FLOAT)
+                rr, _t = em.tmp(FLOAT, f'(mod({idx}, 2.0) > 0.5) ? '
+                                       f'({rad} * clamp({inner}, 0.05, '
+                                       f'1.0)) : {rad}')
+            else:
+                rr = rad
+            cx, _t = em.tmp(FLOAT, f'cos({aa}) * {rr}')
+            cy, _t = em.tmp(FLOAT, f'sin({aa}) * {rr}')
+            ang0, _t = em.tmp(FLOAT, f'{aa} + 1.5707963267949')
+        jx, _t = em.tmp(FLOAT, f'(hal_pt_hash3(int({idx}), 3, 11) '
+                               f'- 0.5) * {jit} * {rad}')
+        jy, _t = em.tmp(FLOAT, f'(hal_pt_hash3(int({idx}), 7, 23) '
+                               f'- 0.5) * {jit} * {rad}')
+        cx2, _t = em.tmp(FLOAT, f'{cx} + {jx}')
+        cy2, _t = em.tmp(FLOAT, f'{cy} + {jy}')
+        lx, _t = em.tmp(FLOAT, f'{x} - {cx2}')
+        ly, _t = em.tmp(FLOAT, f'{y} - {cy2}')
+        ang, _t = em.tmp(FLOAT, (ang0 if orient else '0.0'))
+    if mode in ('LINE', 'GRID'):
+        jlx, _t = em.tmp(FLOAT, f'(hal_pt_hash3(int({idx}), 3, 11) '
+                                f'- 0.5) * {jit}')
+        jly, _t = em.tmp(FLOAT, f'(hal_pt_hash3(int({idx}), 7, 23) '
+                                f'- 0.5) * {jit}')
+        lx, _t = em.tmp(FLOAT, f'{lx} + {jlx}')
+        ly, _t = em.tmp(FLOAT, f'{ly} + {jly}')
+    nm = _o_name(node, index)
+    if nm == 'Index':
+        return idx, FLOAT
+    if nm == 'Random':
+        return em.tmp(FLOAT, f'hal_pt_hash3(int({idx}), 0, 97)')
+    aa2, _t = em.tmp(FLOAT, f'{ang} + {rot}' if mode not in
+                     ('LINE', 'GRID') else f'{ang}')
+    ca2, _t = em.tmp(FLOAT, f'cos(-{aa2})')
+    sa2, _t = em.tmp(FLOAT, f'sin(-{aa2})')
+    ox, _t = em.tmp(FLOAT, f'({lx} * {ca2} - {ly} * {sa2}) / {size} '
+                           '+ 0.5')
+    oy, _t = em.tmp(FLOAT, f'({lx} * {sa2} + {ly} * {ca2}) / {size} '
+                           '+ 0.5')
+    return em.tmp(VEC3, f'vec3({ox}, {oy}, 0.0)')
+
+
+def e_v16_mirror_tile(em, node, index):
+    v = _v16_uv(em, node)
+    sc, _t = em.tmp(FLOAT, f'max({em.input(node, "Scale", FLOAT)}, '
+                           '1e-9)')
+    parts = []
+    for comp, on in (('x', prop(node, 'axis_x', True)),
+                     ('y', prop(node, 'axis_y', True))):
+        q, _t = em.tmp(FLOAT, f'{v}.{comp} * {sc}')
+        if on:
+            h, _t = em.tmp(FLOAT, f'fract({q} * 0.5) * 2.0')
+            r, _t = em.tmp(FLOAT, f'1.0 - abs({h} - 1.0)')
+        else:
+            r, _t = em.tmp(FLOAT, f'fract({q})')
+        parts.append(r)
+    return em.tmp(VEC3, f'vec3({parts[0]}, {parts[1]}, {v}.z)')
+
+
+def e_v16_kaleidoscope(em, node, index):
+    v = _v16_uv(em, node)
+    ctr = em.input(node, 'Center', VEC3)
+    sec, _t = em.tmp(FLOAT, f'max({em.input(node, "Sectors", FLOAT)}, '
+                            '1.0)')
+    base = em.input(node, 'Angle', FLOAT)
+    x, _t = em.tmp(FLOAT, f'{v}.x - {ctr}.x')
+    y, _t = em.tmp(FLOAT, f'{v}.y - {ctr}.y')
+    r, _t = em.tmp(FLOAT, f'sqrt({x} * {x} + {y} * {y})')
+    a, _t = em.tmp(FLOAT, f'atan({y}, {x}) - {base}')
+    st, _t = em.tmp(FLOAT, f'6.28318530717959 / {sec}')
+    k, _t = em.tmp(FLOAT, f'mod(mod({a}, 2.0 * {st}) + 2.0 * {st}, '
+                          f'2.0 * {st})')
+    fold, _t = em.tmp(FLOAT, f'(({k} > {st}) ? (2.0 * {st} - {k}) '
+                             f': {k}) + {base}')
+    return em.tmp(VEC3, f'vec3(cos({fold}) * {r} + {ctr}.x, '
+                        f'sin({fold}) * {r} + {ctr}.y, {v}.z)')
+
+
+def e_v16_polar(em, node, index):
+    v = _v16_uv(em, node)
+    ctr = em.input(node, 'Center', VEC3)
+    nm = _o_name(node, index)
+    if str(prop(node, 'direction', 'TO_POLAR')) == 'FROM_POLAR':
+        a, _t = em.tmp(FLOAT, f'{v}.x * 6.28318530717959')
+        r, _t = em.tmp(FLOAT, f'{v}.y')
+        if nm == 'Radius':
+            return r, FLOAT
+        if nm == 'Angle':
+            return em.tmp(FLOAT, f'{v}.x')
+        return em.tmp(VEC3, f'vec3(cos({a}) * {r} + {ctr}.x, '
+                            f'sin({a}) * {r} + {ctr}.y, {v}.z)')
+    x, _t = em.tmp(FLOAT, f'{v}.x - {ctr}.x')
+    y, _t = em.tmp(FLOAT, f'{v}.y - {ctr}.y')
+    r, _t = em.tmp(FLOAT, f'sqrt({x} * {x} + {y} * {y})')
+    a, _t = em.tmp(FLOAT, f'fract(atan({y}, {x}) / 6.28318530717959 '
+                          '+ 1.0)')
+    if nm == 'Radius':
+        return r, FLOAT
+    if nm == 'Angle':
+        return a, FLOAT
+    return em.tmp(VEC3, f'vec3({a}, {r}, {v}.z)')
+
+
+def e_v16_twirl(em, node, index):
+    v = _v16_uv(em, node)
+    ctr = em.input(node, 'Center', VEC3)
+    ang = em.input(node, 'Angle', FLOAT)
+    rad, _t = em.tmp(FLOAT, f'max({em.input(node, "Radius", FLOAT)}, '
+                            '1e-6)')
+    x, _t = em.tmp(FLOAT, f'{v}.x - {ctr}.x')
+    y, _t = em.tmp(FLOAT, f'{v}.y - {ctr}.y')
+    r, _t = em.tmp(FLOAT, f'sqrt({x} * {x} + {y} * {y})')
+    fall, _t = em.tmp(FLOAT, f'clamp(1.0 - {r} / {rad}, 0.0, 1.0)')
+    a, _t = em.tmp(FLOAT, f'{ang} * {fall} * {fall}')
+    ca, _t = em.tmp(FLOAT, f'cos({a})')
+    sa, _t = em.tmp(FLOAT, f'sin({a})')
+    return em.tmp(VEC3, f'vec3({x} * {ca} - {y} * {sa} + {ctr}.x, '
+                        f'{x} * {sa} + {y} * {ca} + {ctr}.y, {v}.z)')
+
+
+def e_v16_lens(em, node, index):
+    v = _v16_uv(em, node)
+    ctr = em.input(node, 'Center', VEC3)
+    amt = em.input(node, 'Amount', FLOAT)
+    x, _t = em.tmp(FLOAT, f'{v}.x - {ctr}.x')
+    y, _t = em.tmp(FLOAT, f'{v}.y - {ctr}.y')
+    f, _t = em.tmp(FLOAT, f'1.0 + {amt} * ({x} * {x} + {y} * {y})')
+    return em.tmp(VEC3, f'vec3({x} * {f} + {ctr}.x, '
+                        f'{y} * {f} + {ctr}.y, {v}.z)')
+
+
+def e_v16_ripple_warp(em, node, index):
+    v = _v16_uv(em, node)
+    ctr = em.input(node, 'Center', VEC3)
+    amp = em.input(node, 'Amplitude', FLOAT)
+    fr = em.input(node, 'Frequency', FLOAT)
+    sp = em.input(node, 'Speed', FLOAT)
+    t = _time_of(em, node)
+    x, _t = em.tmp(FLOAT, f'{v}.x - {ctr}.x')
+    y, _t = em.tmp(FLOAT, f'{v}.y - {ctr}.y')
+    r, _t = em.tmp(FLOAT, f'sqrt({x} * {x} + {y} * {y})')
+    w, _t = em.tmp(FLOAT, f'sin(({r} * {fr} - {t} * {sp}) '
+                          f'* 6.28318530717959) * {amp}')
+    sf, _t = em.tmp(FLOAT, f'max({r}, 1e-9)')
+    return em.tmp(VEC3, f'vec3({v}.x + ({x} / {sf}) * {w}, '
+                        f'{v}.y + ({y} / {sf}) * {w}, {v}.z)')
+
+
+def e_v16_wave_warp(em, node, index):
+    v = _v16_uv(em, node)
+    amp = em.input(node, 'Amplitude', FLOAT)
+    wl, _t = em.tmp(FLOAT, f'max({em.input(node, "Wavelength", FLOAT)}'
+                           ', 1e-6)')
+    sp = em.input(node, 'Speed', FLOAT)
+    t = _time_of(em, node)
+    if str(prop(node, 'axis', 'X')) == 'Y':
+        return em.tmp(VEC3, f'vec3({v}.x + sin(({v}.y / {wl} + {t} * '
+                            f'{sp}) * 6.28318530717959) * {amp}, '
+                            f'{v}.y, {v}.z)')
+    return em.tmp(VEC3, f'vec3({v}.x, {v}.y + sin(({v}.x / {wl} '
+                        f'+ {t} * {sp}) * 6.28318530717959) * {amp}, '
+                        f'{v}.z)')
+
+
+def e_v16_tile_random(em, node, index):
+    _need_prims(em)
+    v = _v16_uv(em, node)
+    sc, _t = em.tmp(FLOAT, f'max({em.input(node, "Scale", FLOAT)}, '
+                           '1e-9)')
+    qx, _t = em.tmp(FLOAT, f'{v}.x * {sc}')
+    qy, _t = em.tmp(FLOAT, f'{v}.y * {sc}')
+    cx, _t = em.tmp(FLOAT, f'floor({qx})')
+    cy, _t = em.tmp(FLOAT, f'floor({qy})')
+    tid, _t = em.tmp(FLOAT, f'hal_pt_hash3(int({cx}), int({cy}), 53)')
+    if _o_name(node, index) == 'Tile ID':
+        return tid, FLOAT
+    fx, _t = em.tmp(FLOAT, f'{qx} - {cx}')
+    fy, _t = em.tmp(FLOAT, f'{qy} - {cy}')
+    if prop(node, 'rotate', True):
+        rs, _t = em.tmp(FLOAT, f'mod(floor(hal_pt_hash3(int({cx}), '
+                               f'int({cy}), 11) * 4.0), 4.0)')
+        ox, _t = em.tmp(FLOAT, f'{fx} - 0.5')
+        oy, _t = em.tmp(FLOAT, f'{fy} - 0.5')
+        fx, _t = em.tmp(FLOAT, f'(({rs} < 0.5) ? {ox} : (({rs} < 1.5) '
+                               f'? -{oy} : (({rs} < 2.5) ? -{ox} : '
+                               f'{oy}))) + 0.5')
+        fy, _t = em.tmp(FLOAT, f'(({rs} < 0.5) ? {oy} : (({rs} < 1.5) '
+                               f'? {ox} : (({rs} < 2.5) ? -{oy} : '
+                               f'-{ox}))) + 0.5')
+    if prop(node, 'flip', True):
+        fs, _t = em.tmp(FLOAT, f'hal_pt_hash3(int({cx}), int({cy}), '
+                               '29)')
+        fx, _t = em.tmp(FLOAT, f'({fs} < 0.5) ? (1.0 - {fx}) : {fx}')
+    return em.tmp(VEC3, f'vec3({fx}, {fy}, {v}.z)')
+
+
+def e_v16_vector_snap(em, node, index):
+    v = _v16_uv(em, node)
+    st, _t = em.tmp(FLOAT, f'max({em.input(node, "Step", FLOAT)}, '
+                           '1e-9)')
+    fn = 'floor' if str(prop(node, 'mode', 'FLOOR')) == 'FLOOR' \
+        else 'floor'
+    if str(prop(node, 'mode', 'FLOOR')) == 'ROUND':
+        return em.tmp(VEC3, f'vec3(floor({v}.x / {st} + 0.5) * {st}, '
+                            f'floor({v}.y / {st} + 0.5) * {st}, {v}.z)')
+    return em.tmp(VEC3, f'vec3({fn}({v}.x / {st}) * {st}, '
+                        f'{fn}({v}.y / {st}) * {st}, {v}.z)')
+
+
+def e_v16_shear(em, node, index):
+    v = _v16_uv(em, node)
+    xy = em.input(node, 'X By Y', FLOAT)
+    yx = em.input(node, 'Y By X', FLOAT)
+    return em.tmp(VEC3, f'vec3({v}.x + {v}.y * {xy}, '
+                        f'{v}.y + {v}.x * {yx}, {v}.z)')
+
+
+def e_v16_orbit(em, node, index):
+    v = _v16_uv(em, node)
+    rad = em.input(node, 'Radius', FLOAT)
+    sp = em.input(node, 'Speed', FLOAT)
+    ph = em.input(node, 'Phase', FLOAT)
+    t = _time_of(em, node)
+    a, _t = em.tmp(FLOAT, f'({t} * {sp} + {ph}) * 6.28318530717959')
+    return em.tmp(VEC3, f'vec3({v}.x + cos({a}) * {rad}, '
+                        f'{v}.y + sin({a}) * {rad}, {v}.z)')
+
+
+def e_v16_region(em, node, index):
+    v = _v16_uv(em, node)
+    lo, _t = em.tmp(VEC3, em.input(node, 'Min', VEC3))
+    hi, _t = em.tmp(VEC3, em.input(node, 'Max', VEC3))
+    spx, _t = em.tmp(FLOAT, f'max({hi}.x - {lo}.x, 1e-9)')
+    spy, _t = em.tmp(FLOAT, f'max({hi}.y - {lo}.y, 1e-9)')
+    qx, _t = em.tmp(FLOAT, f'({v}.x - {lo}.x) / {spx}')
+    qy, _t = em.tmp(FLOAT, f'({v}.y - {lo}.y) / {spy}')
+    if _o_name(node, index) == 'Inside':
+        return em.tmp(FLOAT, f'(({qx} >= 0.0) && ({qx} <= 1.0) && '
+                             f'({qy} >= 0.0) && ({qy} <= 1.0)) '
+                             '? 1.0 : 0.0')
+    mode = str(prop(node, 'outside', 'CLIP'))
+    if mode == 'WRAP':
+        qx, _t = em.tmp(FLOAT, f'fract({qx})')
+        qy, _t = em.tmp(FLOAT, f'fract({qy})')
+    elif mode == 'MIRROR':
+        hx, _t = em.tmp(FLOAT, f'fract({qx} * 0.5) * 2.0')
+        hy, _t = em.tmp(FLOAT, f'fract({qy} * 0.5) * 2.0')
+        qx, _t = em.tmp(FLOAT, f'1.0 - abs({hx} - 1.0)')
+        qy, _t = em.tmp(FLOAT, f'1.0 - abs({hy} - 1.0)')
+    else:
+        qx, _t = em.tmp(FLOAT, f'clamp({qx}, 0.0, 1.0)')
+        qy, _t = em.tmp(FLOAT, f'clamp({qy}, 0.0, 1.0)')
+    return em.tmp(VEC3, f'vec3({lo}.x + {qx} * {spx}, '
+                        f'{lo}.y + {qy} * {spy}, {v}.z)')
+
+
+def e_v16_projector(em, node, index):
+    v0 = tex_vector(em, node, 'generated')
+    v, _t = em.tmp(VEC3, v0)
+    sc, _t = em.tmp(FLOAT, f'max({em.input(node, "Scale", FLOAT)}, '
+                           '1e-9)')
+    axis = str(prop(node, 'axis', 'Z'))
+    comp = {'X': ('y', 'z', 'x'), 'Y': ('x', 'z', 'y'),
+            'Z': ('x', 'y', 'z')}[axis]
+    u, _t = em.tmp(FLOAT, f'{v}.{comp[0]}')
+    w, _t = em.tmp(FLOAT, f'{v}.{comp[1]}')
+    h, _t = em.tmp(FLOAT, f'{v}.{comp[2]}')
+    mode = str(prop(node, 'mode', 'PLANAR'))
+    if mode == 'CYLINDER':
+        a, _t = em.tmp(FLOAT, f'fract(atan({w}, {u}) '
+                              '/ 6.28318530717959 + 1.0)')
+        return em.tmp(VEC3, f'vec3({a} / {sc}, {h} / {sc}, 0.0)')
+    if mode == 'SPHERE':
+        r, _t = em.tmp(FLOAT, f'length(vec3({u}, {w}, {h}))')
+        a, _t = em.tmp(FLOAT, f'fract(atan({w}, {u}) '
+                              '/ 6.28318530717959 + 1.0)')
+        el, _t = em.tmp(FLOAT, f'acos(clamp({h} / max({r}, 1e-9), '
+                               '-1.0, 1.0)) / 3.14159265358979')
+        return em.tmp(VEC3, f'vec3({a} / {sc}, (1.0 - {el}) / {sc}, '
+                            '0.0)')
+    if mode == 'BOX':
+        ax_, _t = em.tmp(VEC3, f'abs({v})')
+        pu, _t = em.tmp(FLOAT, f'({ax_}.x >= max({ax_}.y, {ax_}.z)) '
+                               f'? {v}.y : (({ax_}.y >= {ax_}.z) '
+                               f'? {v}.x : {v}.x)')
+        pw, _t = em.tmp(FLOAT, f'({ax_}.x >= max({ax_}.y, {ax_}.z)) '
+                               f'? {v}.z : (({ax_}.y >= {ax_}.z) '
+                               f'? {v}.z : {v}.y)')
+        return em.tmp(VEC3, f'vec3({pu} / {sc}, {pw} / {sc}, 0.0)')
+    return em.tmp(VEC3, f'vec3({u} / {sc}, {w} / {sc}, 0.0)')
+
+
+def e_v16_spin(em, node, index):
+    v = _v16_uv(em, node)
+    ctr = em.input(node, 'Center', VEC3)
+    sp = em.input(node, 'Speed', FLOAT)
+    base = em.input(node, 'Angle', FLOAT)
+    t = _time_of(em, node)
+    a, _t = em.tmp(FLOAT, f'{base} + {t} * {sp} * 6.28318530717959')
+    ca, _t = em.tmp(FLOAT, f'cos({a})')
+    sa, _t = em.tmp(FLOAT, f'sin({a})')
+    x, _t = em.tmp(FLOAT, f'{v}.x - {ctr}.x')
+    y, _t = em.tmp(FLOAT, f'{v}.y - {ctr}.y')
+    return em.tmp(VEC3, f'vec3({x} * {ca} - {y} * {sa} + {ctr}.x, '
+                        f'{x} * {sa} + {y} * {ca} + {ctr}.y, {v}.z)')
+
+
+
+# ===================================================== R242: the Max study
+# The GPU twins of nodeeval's n_mx_* handlers: each map calls its
+# MAX_GLSL function with the same literal controls the CPU collapsed
+# (a linked control refuses by name through _pat_scalar), the utilities
+# are plain arithmetic, and the compound materials mix the sub-materials'
+# colour chains per pixel exactly as e_mix_shader / e_add_shader do.
+
+def _need_max(em, name):
+    _need_pattern(em, 'mx_prims')
+    _need_pattern(em, name)
+
+
+def _mx_bool(node, name, default=False):
+    return 1 if bool(prop(node, name, default)) else 0
+
+
+def _mx_size_vec(em, node, name='Size'):
+    """Max's 3D map coordinate exactly as `_mx_size_vec`: the vector over
+    Size, Size a batch constant (0 -> 0.0001)."""
+    size = float((next((s for s in node.get('inputs', ())
+                        if s.get('name') == name), {}) or {}).get('default', 1.0))
+    _pat_scalar(em, node, name, 1.0)              # refuses a linked Size
+    if size == 0.0:
+        size = 0.0001
+    v = tex_vector(em, node, 'generated')
+    p, _t = em.tmp(VEC3, f'{v} / {em.const(size, FLOAT)}')
+    return p
+
+
+def _mx_tile_vec(em, node):
+    v = tex_vector(em, node, 'uv')
+    p, _t = em.tmp(VEC3, f'{v} * {_pat_scalar(em, node, "Tiling", 1.0)}')
+    return p
+
+
+def _mx_out_name(node, index):
+    outs = node.get('outputs') or []
+    o = outs[index] if index < len(outs) else {}
+    return o.get('name')
+
+
+def e_mx_noise(em, node, index):
+    _need_max(em, 'mx_noise')
+    p = _mx_size_vec(em, node)
+    kind = {'REGULAR': 0, 'FRACTAL': 1, 'TURBULENCE': 2}.get(
+        str(prop(node, 'kind', 'REGULAR')), 0)
+    return _pat_output(em, node, index, (
+        f'hal_mx_noise({p}, {kind}, {_pat_scalar(em, node, "Levels", 3.0)}, '
+        f'{_pat_scalar(em, node, "Low", 0.0)}, '
+        f'{_pat_scalar(em, node, "High", 1.0)}, '
+        f'{_pat_scalar(em, node, "Phase", 0.0)})'))
+
+
+def e_mx_cellular(em, node, index):
+    _need_max(em, 'mx_cellular')
+    p = _mx_size_vec(em, node)
+    chips = 1 if str(prop(node, 'chips', 'CIRCULAR')) == 'CHIPS' else 0
+    uf, _t = em.tmp(VEC2, (
+        f'hal_mx_cellular({p}, {chips}, '
+        f'{_pat_scalar(em, node, "Spread", 0.5)}, '
+        f'{_mx_bool(node, "fractal", False)}, '
+        f'{em.const(float(prop(node, "iterations", 3)), FLOAT)}, '
+        f'{_pat_scalar(em, node, "Roughness", 0.0)})'))
+    name = _mx_out_name(node, index)
+    if name == 'Fac':
+        return em.tmp(FLOAT, f'clamp({uf}.x, 0.0, 1.0)')
+    if name == 'Cell ID':
+        return em.tmp(FLOAT, f'{uf}.y')
+    return em.tmp(VEC4, (
+        f'hal_mx_cellular_colors({uf}, {em.input(node, "Cell Color", VEC4)}, '
+        f'{em.input(node, "Division Color 1", VEC4)}, '
+        f'{em.input(node, "Division Color 2", VEC4)}, '
+        f'{_pat_scalar(em, node, "Low", 0.0)}, '
+        f'{_pat_scalar(em, node, "Mid", 0.5)}, '
+        f'{_pat_scalar(em, node, "High", 1.0)}, '
+        f'{_pat_scalar(em, node, "Variation", 0.0)})'))
+
+
+def e_mx_smoke(em, node, index):
+    _need_max(em, 'mx_smoke')
+    p = _mx_size_vec(em, node)
+    return _pat_output(em, node, index, (
+        f'hal_mx_smoke({p}, {int(prop(node, "iterations", 5))}, '
+        f'{_pat_scalar(em, node, "Phase", 0.0)}, '
+        f'{_pat_scalar(em, node, "Exponent", 1.5)})'))
+
+
+def e_mx_speckle(em, node, index):
+    _need_max(em, 'mx_speckle')
+    p = _mx_size_vec(em, node)
+    return _pat_output(em, node, index, f'hal_mx_speckle({p})')
+
+
+def e_mx_splat(em, node, index):
+    _need_max(em, 'mx_splat')
+    p = _mx_size_vec(em, node)
+    return _pat_output(em, node, index, (
+        f'hal_mx_splat({p}, {int(prop(node, "iterations", 4))}, '
+        f'{_pat_scalar(em, node, "Threshold", 0.2)})'))
+
+
+def e_mx_stucco(em, node, index):
+    _need_max(em, 'mx_stucco')
+    p = _mx_size_vec(em, node)
+    return _pat_output(em, node, index, (
+        f'hal_mx_stucco({p}, {_pat_scalar(em, node, "Thickness", 0.15)}, '
+        f'{_pat_scalar(em, node, "Threshold", 0.57)})'))
+
+
+def e_mx_marble(em, node, index):
+    _need_max(em, 'mx_marble')
+    p = _mx_size_vec(em, node)
+    return _pat_output(em, node, index, (
+        f'hal_mx_marble({p}, {_pat_scalar(em, node, "Vein Width", 0.025)})'))
+
+
+def e_mx_perlin_marble(em, node, index):
+    _need_max(em, 'mx_perlin_marble')
+    p = _mx_size_vec(em, node)
+    levels = int(round(float((next((s for s in node.get('inputs', ())
+                                    if s.get('name') == 'Levels'), {}) or {}).get('default', 8.0))))
+    _pat_scalar(em, node, 'Levels', 8.0)
+    csp, _t = em.tmp(FLOAT, f'hal_mx_perlin_marble({p}, {levels})')
+    if _mx_out_name(node, index) == 'Fac':
+        return csp, FLOAT
+    return em.tmp(VEC4, (
+        f'hal_mx_perlin_marble_colors({csp}, {em.input(node, "Color 1", VEC4)}, '
+        f'{em.input(node, "Color 2", VEC4)}, '
+        f'{_pat_scalar(em, node, "Saturation 1", 85.0)} / 100.0, '
+        f'{_pat_scalar(em, node, "Saturation 2", 70.0)} / 100.0)'))
+
+
+def e_mx_wood(em, node, index):
+    _need_max(em, 'mx_dentnoise')
+    _need_pattern(em, 'mx_wood')
+    p = _mx_size_vec(em, node, 'Grain Thickness')
+    return _pat_output(em, node, index, (
+        f'hal_mx_wood({p}, {_pat_scalar(em, node, "Radial Noise", 1.0)}, '
+        f'{_pat_scalar(em, node, "Axial Noise", 1.0)})'))
+
+
+def e_mx_dent(em, node, index):
+    _need_max(em, 'mx_dentnoise')
+    _need_pattern(em, 'mx_dent')
+    p = _mx_size_vec(em, node)
+    return _pat_output(em, node, index, (
+        f'hal_mx_dent({p}, {_pat_scalar(em, node, "Strength", 20.0)}, '
+        f'{int(prop(node, "iterations", 2))})'))
+
+
+def e_mx_swirl(em, node, index):
+    _need_max(em, 'mx_swirl')
+    p = _mx_tile_vec(em, node)
+    detail = int(round(float((next((s for s in node.get('inputs', ())
+                                    if s.get('name') == 'Constant Detail'), {}) or {}).get('default', 4.0))))
+    _pat_scalar(em, node, 'Constant Detail', 4.0)
+    v, _t = em.tmp(FLOAT, (
+        f'hal_mx_swirl({p}, {_pat_scalar(em, node, "Center X", -0.5)}, '
+        f'{_pat_scalar(em, node, "Center Y", -0.5)}, '
+        f'{_pat_scalar(em, node, "Twist", 1.0)}, '
+        f'{_pat_scalar(em, node, "Swirl Intensity", 2.0)}, '
+        f'{_pat_scalar(em, node, "Swirl Amount", 1.0)}, {detail}, '
+        f'{_pat_scalar(em, node, "Color Contrast", 0.4)}, '
+        f'{em.const(float(prop(node, "seed", 0)), FLOAT)})'))
+    if _mx_out_name(node, index) == 'Fac':
+        return em.tmp(FLOAT, f'clamp({v}, 0.0, 1.0)')
+    base, _t = em.tmp(VEC4, em.input(node, 'Base Color', VEC4))
+    sw, _t = em.tmp(VEC4, em.input(node, 'Swirl Color', VEC4))
+    col, _t = em.tmp(VEC4, f'clamp({sw} * {v} + {base} * (1.0 - {v}), 0.0, 1.0)')
+    return em.tmp(VEC4, f'vec4({col}.rgb, 1.0)')
+
+
+_PLANET_COLS = ('Water 1', 'Water 2', 'Water 3', 'Land 1', 'Land 2',
+                'Land 3', 'Land 4', 'Land 5')
+
+
+def e_mx_planet(em, node, index):
+    _need_max(em, 'mx_dentnoise')
+    _need_pattern(em, 'mx_planet')
+    p = _mx_size_vec(em, node, 'Continent Size')
+    e, _t = em.tmp(FLOAT, (
+        f'hal_mx_planet({p}, {_pat_scalar(em, node, "Island Factor", 0.5)})'))
+    if _mx_out_name(node, index) == 'Elevation':
+        return e, FLOAT
+    cols = ', '.join(em.input(node, nm, VEC4) for nm in _PLANET_COLS)
+    return em.tmp(VEC4, (
+        f'hal_mx_planet_colors({e}, {cols}, '
+        f'{_pat_scalar(em, node, "Ocean %", 60.0)}, '
+        f'{_mx_bool(node, "blend", False)})'))
+
+
+def e_mx_waves(em, node, index):
+    _need_max(em, 'mx_waves')
+    p = tex_vector(em, node, 'generated')
+    return _pat_output(em, node, index, (
+        f'hal_mx_waves({p}, {int(max(1, min(int(prop(node, "sets", 3)), 50)))}, '
+        f'{_pat_scalar(em, node, "Wave Radius", 10.0)}, '
+        f'{_pat_scalar(em, node, "Wave Len Min", 0.5)}, '
+        f'{_pat_scalar(em, node, "Wave Len Max", 0.5)}, '
+        f'{_pat_scalar(em, node, "Amplitude", 1.0)}, '
+        f'{_pat_scalar(em, node, "Phase", 0.0)}, '
+        f'{_mx_bool(node, "dist3d", True)}, {int(prop(node, "seed", 30159))})'))
+
+
+def e_mx_checker(em, node, index):
+    _need_max(em, 'mx_checker')
+    p = _mx_tile_vec(em, node)
+    return _pat_output(em, node, index, (
+        f'hal_mx_checker({p}, {_pat_scalar(em, node, "Soften", 0.0)})'))
+
+
+_TILE_PATTERNS = ('STACK', 'RUNNING', 'ENGLISH', 'FLEMISH')
+
+
+def e_mx_tiles(em, node, index):
+    _need_max(em, 'mx_tiles')
+    p = _mx_tile_vec(em, node)
+    pat = str(prop(node, 'pattern', 'RUNNING'))
+    pat = _TILE_PATTERNS.index(pat) if pat in _TILE_PATTERNS else 1
+    t3, _t = em.tmp(VEC3, (
+        f'hal_mx_tiles({p}, {pat}, '
+        f'{_pat_scalar(em, node, "Horizontal Count", 4.0)}, '
+        f'{_pat_scalar(em, node, "Vertical Count", 4.0)}, '
+        f'{_pat_scalar(em, node, "Horizontal Gap", 0.5)}, '
+        f'{_pat_scalar(em, node, "Vertical Gap", 0.5)}, '
+        f'{_pat_scalar(em, node, "Line Shift", 0.5)}, '
+        f'{_pat_scalar(em, node, "Random Shift", 0.0)}, '
+        f'{_pat_scalar(em, node, "Holes", 0.0)}, '
+        f'{_pat_scalar(em, node, "Fade Variance", 0.05)}, '
+        f'{_pat_scalar(em, node, "Color Variance", 0.0)}, '
+        f'{int(prop(node, "seed", 33862))})'))
+    name = _mx_out_name(node, index)
+    if name == 'Fac':
+        return em.tmp(FLOAT, f'{t3}.x')
+    if name == 'Tile ID':
+        return em.tmp(FLOAT, f'{t3}.y')
+    tile, _t = em.tmp(VEC4, em.input(node, 'Tile Color', VEC4))
+    grout, _t = em.tmp(VEC4, em.input(node, 'Grout Color', VEC4))
+    tf, _t = em.tmp(VEC4, f'vec4({tile}.rgb * {t3}.z, {tile}.a)')
+    return em.tmp(VEC4, f'clamp({grout} + ({tf} - {grout}) * {t3}.x, 0.0, 1.0)')
+
+
+_GRAD_TYPES = ('FOUR_CORNER', 'BOX', 'DIAGONAL', 'LINEAR', 'NORMAL', 'PONG',
+               'RADIAL', 'SPIRAL', 'SWEEP', 'TARTAN', 'MAPPED')
+
+
+def e_mx_gradient_ramp(em, node, index):
+    _need_max(em, 'mx_gradient_ramp')
+    p = _mx_tile_vec(em, node)
+    kind = str(prop(node, 'gradient_type', 'LINEAR'))
+    k = _GRAD_TYPES.index(kind) if kind in _GRAD_TYPES else 3
+    ndv, _t = em.tmp(FLOAT, 'dot(normalize(hal_N), normalize(hal_V))')
+    u, _t = em.tmp(FLOAT, f'mod({p}.x, 1.0)')
+    v, _t = em.tmp(FLOAT, f'mod({p}.y, 1.0)')
+    a, _t = em.tmp(FLOAT, (
+        f'hal_mx_gradient_ramp({u}, {v}, {k}, {ndv}, '
+        f'{em.input(node, "Mapped", FLOAT)})'))
+    if _mx_out_name(node, index) == 'Fac':
+        return a, FLOAT
+    pos = float((next((s for s in node.get('inputs', ())
+                       if s.get('name') == 'Color 2 Position'), {}) or {}).get('default', 0.5))
+    _pat_scalar(em, node, 'Color 2 Position', 0.5)
+    pos = min(max(pos, 1e-4), 1.0 - 1e-4)
+    posc = em.const(pos, FLOAT)
+    c1, _t = em.tmp(VEC4, em.input(node, 'Color 1', VEC4))
+    c2, _t = em.tmp(VEC4, em.input(node, 'Color 2', VEC4))
+    c3, _t = em.tmp(VEC4, em.input(node, 'Color 3', VEC4))
+    t1, _t = em.tmp(FLOAT, f'clamp({a} / {posc}, 0.0, 1.0)')
+    t2, _t = em.tmp(FLOAT, f'clamp(({a} - {posc}) / (1.0 - {posc}), 0.0, 1.0)')
+    return em.tmp(VEC4, f'({a} < {posc}) ? ({c1} + ({c2} - {c1}) * {t1}) '
+                        f': ({c2} + ({c3} - {c2}) * {t2})')
+
+
+def e_mx_falloff(em, node, index):
+    _need_pattern(em, 'mx_prims')
+    n, _t = em.tmp(VEC3, 'normalize(hal_N)')
+    view, _t = em.tmp(VEC3, 'normalize(hal_V)')
+    d = str(prop(node, 'direction', 'VIEW'))
+    dv = {'WORLD_X': 'vec3(1.0, 0.0, 0.0)', 'WORLD_Y': 'vec3(0.0, 1.0, 0.0)',
+          'WORLD_Z': 'vec3(0.0, 0.0, 1.0)'}.get(d, view)
+    ndd, _t = em.tmp(FLOAT, f'dot({n}, {dv})')
+    kind = str(prop(node, 'falloff_type', 'PERP_PARALLEL'))
+    extrapolate = bool(prop(node, 'extrapolate', False))
+    if kind == 'TOWARDS_AWAY':
+        t, _t = em.tmp(FLOAT, f'1.0 - 0.5 * ({ndd} + 1.0)')
+    elif kind == 'FRESNEL':
+        _need_pattern(em, 'mx_fresnel')
+        ior, _t = em.tmp(FLOAT, f'max({em.input(node, "IOR", FLOAT)}, 1.0)')
+        t, _t = em.tmp(FLOAT, f'hal_mx_fresnel(dot({n}, {view}), {ior})')
+    elif kind == 'SHADOW_LIGHT':
+        raise Unsupported("Falloff's Shadow / Light reads the lamp list at "
+                          'shading time, the Light Meter\'s road -- shades '
+                          'on the CPU')
+    elif kind == 'DISTANCE':
+        near, _t = em.tmp(FLOAT, em.input(node, 'Near Distance', FLOAT))
+        far, _t = em.tmp(FLOAT, em.input(node, 'Far Distance', FLOAT))
+        dist, _t = em.tmp(FLOAT, 'length(hal_P - hal_eye)')
+        span, _t = em.tmp(FLOAT, f'{far} - {near}')
+        t, _t = em.tmp(FLOAT, f'({span} != 0.0) ? ({far} - {dist}) / '
+                              f'(({span} != 0.0) ? {span} : 1.0) : 10000.0')
+        if not extrapolate:
+            t, _t = em.tmp(FLOAT, f'({dist} <= {near}) ? 1.0 : '
+                                  f'(({dist} > {far}) ? 0.0 : {t})')
+    else:
+        t, _t = em.tmp(FLOAT, f'1.0 - abs({ndd})')
+    if not (kind == 'DISTANCE' and extrapolate):
+        t, _t = em.tmp(FLOAT, f'clamp({t}, 0.0, 1.0)')
+    if _mx_out_name(node, index) == 'Fac':
+        return t, FLOAT
+    a, _t = em.tmp(VEC4, em.input(node, 'Front', VEC4))
+    b, _t = em.tmp(VEC4, em.input(node, 'Side', VEC4))
+    return em.tmp(VEC4, f'{a} + ({b} - {a}) * {t}')
+
+
+def e_mx_mix(em, node, index):
+    fac, _t = em.tmp(FLOAT, f'clamp({em.input(node, "Mix Amount", FLOAT)}, 0.0, 1.0)')
+    if prop(node, 'use_curve', False):
+        _need_pattern(em, 'mx_prims')
+        fac, _t = em.tmp(FLOAT, (
+            f'hal_mx_mixcurve({_pat_scalar(em, node, "Lower", 0.3)}, '
+            f'{_pat_scalar(em, node, "Upper", 0.7)}, {fac})'))
+    outs = node.get('outputs') or []
+    o = outs[index] if index < len(outs) else {}
+    if o.get('name') == 'Fac':
+        return fac, FLOAT
+    a, _t = em.tmp(VEC4, em.input(node, 'Color 1', VEC4))
+    b, _t = em.tmp(VEC4, em.input(node, 'Color 2', VEC4))
+    return em.tmp(VEC4, f'{a} + ({b} - {a}) * {fac}')
+
+
+def e_mx_rgbtint(em, node, _i):
+    c, _t = em.tmp(VEC4, em.input(node, 'Color', VEC4))
+    r, _t = em.tmp(VEC4, em.input(node, 'R Tint', VEC4))
+    g, _t = em.tmp(VEC4, em.input(node, 'G Tint', VEC4))
+    b, _t = em.tmp(VEC4, em.input(node, 'B Tint', VEC4))
+    return em.tmp(VEC4, f'vec4({r}.rgb * {c}.r + {g}.rgb * {c}.g '
+                        f'+ {b}.rgb * {c}.b, {c}.a)')
+
+
+def e_mx_output(em, node, index):
+    c, _t = em.tmp(VEC4, em.input(node, 'Color', VEC4))
+    level = em.input(node, 'RGB Level', FLOAT)
+    offset = em.input(node, 'RGB Offset', FLOAT)
+    amount = em.input(node, 'Output Amount', FLOAT)
+    rgb, _t = em.tmp(VEC3, f'({c}.rgb * {level} + {offset} * {c}.a) * {amount}')
+    alpha, _t = em.tmp(FLOAT, f'{c}.a * {amount}')
+    if prop(node, 'invert', False):
+        rgb, _t = em.tmp(VEC3, f'1.0 - {rgb}')
+    if prop(node, 'clamp', False):
+        rgb, _t = em.tmp(VEC3, f'clamp({rgb}, 0.0, 1.0)')
+        alpha, _t = em.tmp(FLOAT, f'clamp({alpha}, 0.0, 1.0)')
+    if prop(node, 'alpha_from_rgb', False):
+        alpha, _t = em.tmp(FLOAT, f'({rgb}.r + {rgb}.g + {rgb}.b) / 3.0')
+    if _mx_out_name(node, index) == 'Fac':
+        return em.tmp(FLOAT, f'{rgb}.r * 0.2126 + {rgb}.g * 0.7152 '
+                             f'+ {rgb}.b * 0.0722')
+    return em.tmp(VEC4, f'vec4({rgb}, {alpha})')
+
+
+def e_mx_mask(em, node, index):
+    m, _t = em.tmp(FLOAT, f'clamp({em.input(node, "Mask", FLOAT)}, 0.0, 1.0)')
+    if prop(node, 'invert_mask', False):
+        m, _t = em.tmp(FLOAT, f'1.0 - {m}')
+    if _mx_out_name(node, index) == 'Alpha':
+        return m, FLOAT
+    c, _t = em.tmp(VEC4, em.input(node, 'Map', VEC4))
+    return em.tmp(VEC4, f'{c} * {m}')
+
+
+def e_mx_rgbmultiply(em, node, index):
+    a, _t = em.tmp(VEC4, em.input(node, 'Color 1', VEC4))
+    b, _t = em.tmp(VEC4, em.input(node, 'Color 2', VEC4))
+    mode = str(prop(node, 'alpha_from', 'MULTIPLY'))
+    alpha = f'{a}.a' if mode == 'MAP1' else (f'{b}.a' if mode == 'MAP2'
+                                             else f'{a}.a * {b}.a')
+    outs = node.get('outputs') or []
+    o = outs[index] if index < len(outs) else {}
+    if o.get('name') == 'Alpha':
+        return em.tmp(FLOAT, alpha)
+    return em.tmp(VEC4, f'vec4({a}.rgb * {b}.rgb, {alpha})')
+
+
+def e_mx_coords(em, node, _i):
+    import numpy as _np
+    src = str(prop(node, 'source', 'MAP_CHANNEL'))
+    linked = any(s.get('name') == 'Vector' and s.get('link')
+                 for s in node.get('inputs', ()))
+    if linked:
+        v = tex_vector(em, node, 'uv')
+    elif src == 'OBJECT_XYZ':
+        v = 'hal_generated'
+    elif src == 'WORLD_XYZ':
+        v = 'hal_P'
+    elif src == 'SCREEN':
+        if em.secondary:
+            v = 'vec3(0.0)'
+        else:
+            v = 'vec3(vUV, 0.0)'
+    else:
+        v = 'vec3(hal_uv, 0.0)'
+    v, _t = em.tmp(VEC3, v)
+    u, _t = em.tmp(FLOAT, f'({v}.x + {_pat_scalar(em, node, "Offset U", 0.0)} '
+                          f'- 0.5) * {_pat_scalar(em, node, "Tiling U", 1.0)} + 0.5')
+    w, _t = em.tmp(FLOAT, f'({v}.y + {_pat_scalar(em, node, "Offset V", 0.0)} '
+                          f'- 0.5) * {_pat_scalar(em, node, "Tiling V", 1.0)} + 0.5')
+    # the angle's trig is baked here with NumPy's float32, as e_mapping does
+    ang = 0.0
+    for sk in node.get('inputs', ()):
+        if sk.get('name') == 'Angle W':
+            if sk.get('link'):
+                raise Unsupported('the Coordinates node bakes its W angle; '
+                                  'a per-pixel angle shades on the CPU')
+            ang = float(sk.get('default', 0.0) or 0.0)
+    a32 = _np.float32(ang) * _np.float32(0.0174532924)
+    ca = em.const(float(_np.float32(_np.cos(a32))), FLOAT)
+    sa = em.const(float(_np.float32(_np.sin(a32))), FLOAT)
+    du, _t = em.tmp(FLOAT, f'{u} - 0.5')
+    dw, _t = em.tmp(FLOAT, f'{w} - 0.5')
+    u, _t = em.tmp(FLOAT, f'{du} * {ca} - {dw} * {sa} + 0.5')
+    w, _t = em.tmp(FLOAT, f'{du} * {sa} + {dw} * {ca} + 0.5')
+    if prop(node, 'mirror_u', False):
+        t, _t = em.tmp(FLOAT, f'mod({u}, 2.0)')
+        u, _t = em.tmp(FLOAT, f'({t} < 1.0) ? {t} : 2.0 - {t}')
+    if prop(node, 'mirror_v', False):
+        t, _t = em.tmp(FLOAT, f'mod({w}, 2.0)')
+        w, _t = em.tmp(FLOAT, f'({t} < 1.0) ? {t} : 2.0 - {t}')
+    return em.tmp(VEC3, f'vec3({u}, {w}, {v}.z)')
+
+
+def _mx_default(node, name, fallback):
+    return float((next((s for s in node.get('inputs', ())
+                        if s.get('name') == name), {}) or {}).get('default', fallback))
+
+
+def _mx_linked(node, name):
+    return any(s.get('name') == name and s.get('link')
+               for s in node.get('inputs', ()))
+
+
+def e_mx_gradient(em, node, index):
+    import numpy as _np
+    _need_max(em, 'mx_gradient')
+    p = _mx_tile_vec(em, node)
+    u, _t = em.tmp(FLOAT, f'mod({p}.x, 1.0)')
+    v, _t = em.tmp(FLOAT, f'mod({p}.y, 1.0)')
+    amount = _mx_default(node, 'Noise Amount', 0.0)
+    _pat_scalar(em, node, 'Noise Amount', 0.0)
+    if amount > 0.0:
+        size = _mx_default(node, 'Noise Size', 1.0)
+        for nm, d in (('Noise Size', 1.0), ('Noise Phase', 0.0), ('Noise Levels', 4.0),
+                      ('Threshold Low', 0.0), ('Threshold High', 1.0),
+                      ('Threshold Smooth', 0.0)):
+            _pat_scalar(em, node, nm, d)
+        size1 = em.const(0.0 if size == 0.0 else float(_np.float32(20.0 / size)), FLOAT)
+        q, _t = em.tmp(VEC3, (
+            f'vec3({u} * {size1} + 1.0, {v} * {size1} + 1.0, '
+            f'{em.const(_mx_default(node, "Noise Phase", 0.0), FLOAT)})'))
+        kind = {'REGULAR': 0, 'FRACTAL': 1, 'TURBULENCE': 2}.get(
+            str(prop(node, 'kind', 'REGULAR')), 0)
+        levels = min(max(_mx_default(node, 'Noise Levels', 4.0), 1.0), 10.0)
+        noise, _t = em.tmp(FLOAT, (
+            f'hal_mx_gradient_noise({q}, {kind}, {em.const(levels, FLOAT)}, '
+            f'{em.const(_mx_default(node, "Threshold Low", 0.0), FLOAT)}, '
+            f'{em.const(_mx_default(node, "Threshold High", 1.0), FLOAT)}, '
+            f'{em.const(_mx_default(node, "Threshold Smooth", 0.0), FLOAT)})'))
+    else:
+        amount = 0.0
+        noise = '0.0'
+    shape = 1 if str(prop(node, 'shape', 'LINEAR')) == 'RADIAL' else 0
+    a, _t = em.tmp(FLOAT, f'hal_mx_gradient({u}, {v}, {shape}, '
+                          f'{em.const(amount, FLOAT)}, {noise})')
+    if _mx_out_name(node, index) == 'Fac':
+        return a, FLOAT
+    pos = min(max(_mx_default(node, 'Color 2 Position', 0.5), 0.0), 1.0)
+    _pat_scalar(em, node, 'Color 2 Position', 0.5)
+    c1, _t = em.tmp(VEC4, em.input(node, 'Color 1', VEC4))
+    c2, _t = em.tmp(VEC4, em.input(node, 'Color 2', VEC4))
+    c3, _t = em.tmp(VEC4, em.input(node, 'Color 3', VEC4))
+    return em.tmp(VEC4, f'hal_mx_gradient_colors({a}, {em.const(pos, FLOAT)}, '
+                        f'{c1}, {c2}, {c3})')
+
+
+_BLEND_MODES = ('NORMAL', 'AVERAGE', 'ADDITION', 'SUBTRACT', 'DARKEN',
+                'MULTIPLY', 'COLOR_BURN', 'LINEAR_BURN', 'LIGHTEN', 'SCREEN',
+                'COLOR_DODGE', 'LINEAR_DODGE', 'SPOTLIGHT', 'SPOTLIGHT_BLEND',
+                'OVERLAY', 'SOFT_LIGHT', 'HARD_LIGHT', 'PIN_LIGHT', 'HARD_MIX',
+                'DIFFERENCE', 'EXCLUSION', 'HUE', 'SATURATION', 'COLOR', 'VALUE')
+
+
+def e_mx_composite_map(em, node, index):
+    _need_pattern(em, 'mx_prims')
+    _need_pattern(em, 'mx_hsl')
+    _need_pattern(em, 'mx_composite')
+    res, _t = em.tmp(VEC4, 'vec4(0.0)')
+    for k in range(1, 6):
+        name = f'Layer {k}'
+        if k > 1 and not _mx_linked(node, name):
+            continue
+        opacity = _mx_default(node, f'Opacity {k}', 100.0)
+        _pat_scalar(em, node, f'Opacity {k}', 100.0)
+        if opacity == 0.0:
+            continue
+        fg, _t = em.tmp(VEC4, em.input(node, name, VEC4))
+        mask, _t = em.tmp(FLOAT, f'clamp({em.input(node, f"Mask {k}", FLOAT)}, 0.0, 1.0)')
+        mode = str(prop(node, f'blend{k}', 'NORMAL')) if k > 1 else 'NORMAL'
+        m = _BLEND_MODES.index(mode) if mode in _BLEND_MODES else 0
+        res, _t = em.tmp(VEC4, f'hal_mx_comp_layer({res}, {fg}, '
+                               f'{em.const(opacity, FLOAT)}, {mask}, {m})')
+    res, _t = em.tmp(VEC4, f'hal_mx_comp_finish({res})')
+    if _mx_out_name(node, index) == 'Alpha':
+        return em.tmp(FLOAT, f'{res}.a')
+    return res, VEC4
+
+
+_REWIRE = ('RED', 'GREEN', 'BLUE', 'ALPHA', 'RED_INV', 'GREEN_INV',
+           'BLUE_INV', 'ALPHA_INV', 'MONO', 'ONE', 'ZERO')
+_CC_PRESETS = {'NORMAL': (0, 1, 2, 3), 'MONO': (8, 8, 8, 3),
+               'INVERT': (4, 5, 6, 3)}
+
+
+def e_mx_color_correction(em, node, index):
+    _need_pattern(em, 'mx_prims')
+    _need_pattern(em, 'mx_hsl')
+    _need_pattern(em, 'mx_colorcorr')
+    preset = str(prop(node, 'channels', 'NORMAL'))
+    if preset in _CC_PRESETS:
+        rw = _CC_PRESETS[preset]
+    else:
+        rw = []
+        for key, dflt in (('rewire_r', 'RED'), ('rewire_g', 'GREEN'),
+                          ('rewire_b', 'BLUE'), ('rewire_a', 'ALPHA')):
+            v = str(prop(node, key, dflt))
+            rw.append(_REWIRE.index(v) if v in _REWIRE else _REWIRE.index(dflt))
+    adv = 1 if str(prop(node, 'lightness', 'STANDARD')) == 'ADVANCED' else 0
+    c, _t = em.tmp(VEC4, em.input(node, 'Color', VEC4))
+    tint, _t = em.tmp(VEC4, em.input(node, 'Hue Tint', VEC4))
+    args = ', '.join(em.input(node, nm, FLOAT) for nm in ('Hue Shift', 'Saturation'))
+    rest = ', '.join(em.input(node, nm, FLOAT) for nm in (
+        'Strength',))
+    light = ', '.join(em.input(node, nm, FLOAT) for nm in (
+        'Brightness', 'Contrast', 'Gain', 'Gamma', 'Pivot', 'Lift'))
+    out, _t = em.tmp(VEC4, (
+        f'hal_mx_color_correction({c}, {rw[0]}, {rw[1]}, {rw[2]}, {rw[3]}, '
+        f'{args}, {tint}.rgb, {rest}, {adv}, {light})'))
+    if _mx_out_name(node, index) == 'Fac':
+        return em.tmp(FLOAT, f'({out}.r + {out}.g + {out}.b) / 3.0')
+    return out, VEC4
+
+
+def e_mx_vertex_color(em, node, index):
+    if prop(node, 'layer_name', ''):
+        raise Unsupported('named colour layers are not in the G-buffer; '
+                          'the active layer is')
+    if str(prop(node, 'channel', 'VERTEX_COLOR')) == 'VERTEX_ALPHA':
+        rgb, _t = em.tmp(VEC3, 'vec3(hal_vcol.a)')
+    else:
+        rgb, _t = em.tmp(VEC3, 'hal_vcol.rgb')
+    sub = str(prop(node, 'sub_channel', 'ALL'))
+    sw = {'RED': 'r', 'GREEN': 'g', 'BLUE': 'b'}.get(sub)
+    if sw:
+        rgb, _t = em.tmp(VEC3, f'vec3({rgb}.{sw})')
+    if _mx_out_name(node, index) == 'Fac':
+        return em.tmp(FLOAT, f'({rgb}.r + {rgb}.g + {rgb}.b) / 3.0')
+    return em.tmp(VEC4, f'vec4({rgb}, 1.0)')
+
+
+def e_mx_xyz_coords(em, node, _i):
+    import numpy as _np
+    src = str(prop(node, 'xyz_source', 'OBJECT_XYZ'))
+    if _mx_linked(node, 'Vector'):
+        v = tex_vector(em, node, 'generated')
+    elif src == 'WORLD_XYZ':
+        v = 'hal_P'
+    elif src == 'MAP_CHANNEL':
+        v = 'vec3(hal_uv, 0.0)'
+    elif src == 'VERTEX_COLOR':
+        v = 'hal_vcol.rgb'
+    elif src == 'GENERATED':
+        v = 'hal_generated'
+    else:
+        v = 'hal_object'
+    v, _t = em.tmp(VEC3, v)
+    offs, _t = em.tmp(VEC3, 'vec3({}, {}, {})'.format(
+        *(_pat_scalar(em, node, f'Offset {ax}', 0.0) for ax in 'XYZ')))
+    tile, _t = em.tmp(VEC3, 'vec3({}, {}, {})'.format(
+        *(_pat_scalar(em, node, f'Tiling {ax}', 1.0) for ax in 'XYZ')))
+    trig = []
+    for ax in 'XYZ':
+        _pat_scalar(em, node, f'Angle {ax}', 0.0)
+        ang = _np.float32(_mx_default(node, f'Angle {ax}', 0.0)) * _np.float32(0.0174532924)
+        trig.append((em.const(float(_np.float32(_np.cos(ang))), FLOAT),
+                     em.const(float(_np.float32(_np.sin(ang))), FLOAT)))
+    (cx, sx), (cy, sy), (cz, sz) = trig
+
+    def turn(q):
+        rx, _t = em.tmp(VEC3, f'vec3({q}.x, {q}.y * {cx} - {q}.z * {sx}, '
+                              f'{q}.y * {sx} + {q}.z * {cx})')
+        ry, _t = em.tmp(VEC3, f'vec3({rx}.z * {sy} + {rx}.x * {cy}, {rx}.y, '
+                              f'{rx}.z * {cy} - {rx}.x * {sy})')
+        rz, _t = em.tmp(VEC3, f'vec3({ry}.x * {cz} - {ry}.y * {sz}, '
+                              f'{ry}.x * {sz} + {ry}.y * {cz}, {ry}.z)')
+        return rz
+    tv = turn(v)
+    to = turn(offs)
+    return em.tmp(VEC3, f'{tv} * {tile} + {to}')
+
+
+def _mx_shader_chain(em, node, name):
+    """A sub-material's colour chain, or None when the socket is bare."""
+    for sk in node.get('inputs', ()):
+        if sk.get('name') == name and sk.get('link'):
+            return em.input(node, name, VEC4)
+    return None
+
+
+def _mx_mix_chains(em, a, b, fac):
+    """mix(a, b, fac) with a bare side dropping out -- the CPU's closure
+    normalises a lone material to full strength."""
+    if a is None and b is None:
+        return em.tmp(VEC4, 'vec4(0.0, 0.0, 0.0, 1.0)')
+    if a is None:
+        return em.tmp(VEC4, b)
+    if b is None:
+        return em.tmp(VEC4, a)
+    return em.tmp(VEC4, f'mix({a}, {b}, {fac})')
+
+
+def e_mx_blend(em, node, _i):
+    fac, _t = em.tmp(FLOAT, f'clamp({em.input(node, "Mix Amount", FLOAT)}, 0.0, 1.0)')
+    if prop(node, 'use_curve', False):
+        _need_pattern(em, 'mx_prims')
+        fac, _t = em.tmp(FLOAT, (
+            f'hal_mx_mixcurve({_pat_scalar(em, node, "Lower", 0.25)}, '
+            f'{_pat_scalar(em, node, "Upper", 0.75)}, {fac})'))
+    return _mx_mix_chains(em, _mx_shader_chain(em, node, 'Material 1'),
+                          _mx_shader_chain(em, node, 'Material 2'), fac)
+
+
+def e_mx_doublesided(em, node, _i):
+    t, _t = em.tmp(FLOAT, f'clamp({em.input(node, "Translucency", FLOAT)}, 0.0, 1.0)')
+    # the stored face normal against the view -- the CPU's own test
+    tn, _t = e_new_geometry(em, {'outputs': [{'name': 'True Normal'}]}, 0)
+    facing, _t = em.tmp(FLOAT, f'(dot(normalize({tn}), normalize(hal_V)) > 0.0) '
+                               f'? 1.0 : 0.0')
+    # facing weight: 1 - t on a face toward the camera, t on one away
+    wf, _t = em.tmp(FLOAT, f'({facing} > 0.5) ? (1.0 - {t}) : {t}')
+    return _mx_mix_chains(em, _mx_shader_chain(em, node, 'Facing'),
+                          _mx_shader_chain(em, node, 'Back'), f'(1.0 - {wf})')
+
+
+def e_mx_topbottom(em, node, _i):
+    _need_pattern(em, 'mx_prims')
+    up, _t = em.tmp(FLOAT, '0.5 + 0.5 * normalize(hal_N).z')
+    pos = _pat_scalar(em, node, 'Position', 0.5)
+    blend = _pat_scalar(em, node, 'Blend', 0.0)
+    tt, _t = em.tmp(FLOAT, f'hal_mx_mixcurve({pos} - max({blend}, 0.0) * 0.5, '
+                           f'{pos} + max({blend}, 0.0) * 0.5, {up})')
+    # Top carries weight tt: mix(bottom, top, tt)
+    return _mx_mix_chains(em, _mx_shader_chain(em, node, 'Bottom'),
+                          _mx_shader_chain(em, node, 'Top'), tt)
+
+
+def e_mx_shellac(em, node, _i):
+    k, _t = em.tmp(FLOAT, f'max({em.input(node, "Color Blend", FLOAT)}, 0.0)')
+    base = _mx_shader_chain(em, node, 'Base')
+    top = _mx_shader_chain(em, node, 'Shellac')
+    if base is None and top is None:
+        return em.tmp(VEC4, 'vec4(0.0, 0.0, 0.0, 1.0)')
+    if top is None:
+        return em.tmp(VEC4, base)
+    if base is None:
+        return em.tmp(VEC4, top)
+    return em.tmp(VEC4, f'{base} + {top} * {k}')
+
+
+def e_mx_composite(em, node, _i):
+    result = _mx_shader_chain(em, node, 'Base')
+    for i in (1, 2, 3, 4):
+        layer = _mx_shader_chain(em, node, f'Material {i}')
+        if layer is None:
+            continue
+        amt, _t = em.tmp(FLOAT, f'max({em.input(node, f"Amount {i}", FLOAT)}, 0.0)')
+        if str(prop(node, f'mode{i}', 'MIX')) == 'ADD':
+            if result is None:
+                result, _t = em.tmp(VEC4, f'{layer} * min({amt}, 2.0)')
+            else:
+                result, _t = em.tmp(VEC4, f'{result} + {layer} * min({amt}, 2.0)')
+        else:
+            a, _t = em.tmp(FLOAT, f'min({amt}, 1.0)')
+            result, _t = _mx_mix_chains(em, result, layer, a)
+    if result is None:
+        return em.tmp(VEC4, 'vec4(0.0, 0.0, 0.0, 1.0)')
+    return em.tmp(VEC4, result)
+
+
+
+def e_max_standard(em, node, _i):
+    """Max's Standard material node, as the deferred pass needs it: its
+    colour chain -- the Diffuse map lerped over the swatch by its Amount
+    and, under a percentage Self-Illumination, dimmed by 1 - si exactly
+    as n_max_standard dims the closure's colour (the glow itself is the
+    probed emission constant). Every other socket is a surface field the
+    probe harvests through closure_to_surface."""
+    p = node.get('props', {})
+    base = em.input(node, 'Diffuse Color', VEC4)
+    linked = any((s.get('identifier') == 'Diffuse Color' or s.get('name') == 'Diffuse')
+                 and s.get('link') for s in node.get('inputs', ()))
+    amt = min(max(float(p.get('diffuse_map_amount', 100)), 0.0), 100.0) / 100.0
+    if linked and amt < 1.0:
+        sw = next((s.get('default') for s in node.get('inputs', ())
+                   if s.get('identifier') == 'Diffuse Color'), None) or (0.588, 0.588, 0.588, 1.0)
+        swc = em.const(tuple(float(v) for v in sw)[:4], VEC4)
+        base, _t = em.tmp(VEC4, f'{swc} + {em.const(amt, FLOAT)} * ({base} - {swc})')
+    if not p.get('self_illum_color'):
+        si_sock = next((s for s in node.get('inputs', ())
+                        if s.get('identifier') == 'Max Self-Illum'), None)
+        if si_sock is not None and si_sock.get('link'):
+            raise Unsupported("a map on Max's Self-Illumination percentage "
+                              'dims the shading per pixel; the material '
+                              'shades on the CPU')
+        si = min(max(float((si_sock or {}).get('default') or 0.0), 0.0), 100.0) / 100.0
+        if si > 0.0:
+            base, _t = em.tmp(VEC4, f'vec4({base}.rgb * {em.const(1.0 - si, FLOAT)}, {base}.a)')
+    fo = next((s for s in node.get('inputs', ())
+               if s.get('identifier') == 'Max Falloff Amount'), None)
+    if fo is not None and (fo.get('link') or float(fo.get('default') or 0.0) > 0.0):
+        raise Unsupported("Max's Opacity Falloff varies the opacity by the "
+                          'view angle per pixel; the material shades on the CPU')
+    return em.tmp(VEC4, base)
+
+
+def e_max_raytrace(em, node, _i):
+    """Max's Raytrace material node: its Diffuse chain; the reflection,
+    luminosity and transparency colours are probed surface constants."""
+    return em.tmp(VEC4, em.input(node, 'Diffuse Color', VEC4))
+
+
+MAX_EMITTERS = {
+    'HALCYON_MaxNoiseNode': e_mx_noise,
+    'HALCYON_MaxCellularNode': e_mx_cellular,
+    'HALCYON_MaxSmokeNode': e_mx_smoke,
+    'HALCYON_MaxSpeckleNode': e_mx_speckle,
+    'HALCYON_MaxSplatNode': e_mx_splat,
+    'HALCYON_MaxStuccoNode': e_mx_stucco,
+    'HALCYON_MaxMarbleNode': e_mx_marble,
+    'HALCYON_MaxPerlinMarbleNode': e_mx_perlin_marble,
+    'HALCYON_MaxWoodNode': e_mx_wood,
+    'HALCYON_MaxDentNode': e_mx_dent,
+    'HALCYON_MaxGradientRampNode': e_mx_gradient_ramp,
+    'HALCYON_MaxSwirlNode': e_mx_swirl,
+    'HALCYON_MaxPlanetNode': e_mx_planet,
+    'HALCYON_MaxWavesNode': e_mx_waves,
+    'HALCYON_MaxCheckerNode': e_mx_checker,
+    'HALCYON_MaxTilesNode': e_mx_tiles,
+    'HALCYON_MaxFalloffNode': e_mx_falloff,
+    'HALCYON_MaxMixNode': e_mx_mix,
+    'HALCYON_MaxRGBTintNode': e_mx_rgbtint,
+    'HALCYON_MaxOutputNode': e_mx_output,
+    'HALCYON_MaxMaskNode': e_mx_mask,
+    'HALCYON_MaxRGBMultiplyNode': e_mx_rgbmultiply,
+    'HALCYON_MaxCoordsNode': e_mx_coords,
+    'HALCYON_MaxGradientNode': e_mx_gradient,
+    'HALCYON_MaxCompositeMapNode': e_mx_composite_map,
+    'HALCYON_MaxColorCorrectionNode': e_mx_color_correction,
+    'HALCYON_MaxVertexColorNode': e_mx_vertex_color,
+    'HALCYON_MaxXYZCoordsNode': e_mx_xyz_coords,
+    'HALCYON_MaxBlendNode': e_mx_blend,
+    'HALCYON_MaxDoubleSidedNode': e_mx_doublesided,
+    'HALCYON_MaxTopBottomNode': e_mx_topbottom,
+    'HALCYON_MaxShellacNode': e_mx_shellac,
+    'HALCYON_MaxCompositeNode': e_mx_composite,
+    'HALCYON_MaxStandardNode': e_max_standard,
+    'HALCYON_MaxRaytraceNode': e_max_raytrace,
+}
+
 EMITTERS = {
     'HALCYON_ShaderNode': e_halcyon_shader,
+    'HALCYON_AnimeShaderNode': e_anime_shader,
+    'HALCYON_CartoonNode': e_cartoon_shader,
     'HALCYON_BIMaterialNode': e_bi_material,
     'HALCYON_CodeNode': e_code_node,
 
@@ -3339,6 +5073,44 @@ EMITTERS = {
     'HALCYON_GradientNode': e_pat_gradient_shaped,
     'HALCYON_CellsNode': e_pat_cells_tex,
     'HALCYON_StaticNode': e_pat_static,
+    'HALCYON_FurTuftsNode': e_pat_fur_tufts,
+    # R232: the 2D media
+    'HALCYON_HatchingNode': e_md_hatching,
+    'HALCYON_ScribbleNode': e_md_scribble,
+    'HALCYON_StippleNode': e_md_stipple,
+    'HALCYON_CharcoalNode': e_md_charcoal,
+    'HALCYON_PaintStrokesNode': e_md_paint,
+    'HALCYON_WashNode': e_md_wash,
+    'HALCYON_PaperNode': e_md_paper,
+    'HALCYON_TimerNode': e_u16_timer,
+    'HALCYON_OscillatorNode': e_u16_oscillator,
+    'HALCYON_CounterNode': e_u16_counter,
+    'HALCYON_PulseNode': e_u16_pulse,
+    'HALCYON_GateNode': e_u16_gate,
+    'HALCYON_SelectorNode': e_u16_selector,
+    'HALCYON_ColorKeyNode': e_u16_color_key,
+    'HALCYON_MeasureNode': e_u16_measure,
+    'HALCYON_StepRampNode': e_u16_step_ramp,
+    'HALCYON_WobbleNode': e_u16_wobble,
+    'HALCYON_FrameBlendNode': e_u16_frame_blend,
+    'HALCYON_BlackbodyNode': e_u16_blackbody,
+    'HALCYON_CompareNode': e_u16_compare,
+    'HALCYON_OnFrameNode': e_u16_on_frame,
+    'HALCYON_ArrayVecNode': e_v16_array,
+    'HALCYON_MirrorTileNode': e_v16_mirror_tile,
+    'HALCYON_KaleidoscopeNode': e_v16_kaleidoscope,
+    'HALCYON_PolarNode': e_v16_polar,
+    'HALCYON_TwirlNode': e_v16_twirl,
+    'HALCYON_LensNode': e_v16_lens,
+    'HALCYON_RippleWarpNode': e_v16_ripple_warp,
+    'HALCYON_WaveWarpNode': e_v16_wave_warp,
+    'HALCYON_TileRandomNode': e_v16_tile_random,
+    'HALCYON_VectorSnapNode': e_v16_vector_snap,
+    'HALCYON_ShearNode': e_v16_shear,
+    'HALCYON_OrbitNode': e_v16_orbit,
+    'HALCYON_RegionNode': e_v16_region,
+    'HALCYON_ProjectorNode': e_v16_projector,
+    'HALCYON_SpinNode': e_v16_spin,
     'HALCYON_PosterizeNode': e_halcyon_posterize,
     'HALCYON_NormalMapNode': e_halcyon_normal_map,
     'HALCYON_NormalMixNode': e_halcyon_normal_mix,
@@ -3375,6 +5147,10 @@ EMITTERS = {
     'ShaderNodeValToRGB': e_val_to_rgb,
     'ShaderNodeFloatCurve': e_float_curve,
     'ShaderNodeRGBCurve': e_rgb_curve,
+    # R208: hair -- the strand convention rides the colour interpolant
+    'ShaderNodeHairInfo': e_hair_info,
+    # R242: the Max study
+    **MAX_EMITTERS,
 }
 
 

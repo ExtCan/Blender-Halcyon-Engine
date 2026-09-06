@@ -103,6 +103,8 @@ class Texture:
             return self._sample_nearest(self.pixels, u, v, wrap)
         if filt == 'N64_3POINT':
             return self._sample_3point(self.pixels, u, v, wrap)
+        if filt == 'CUBIC':
+            return self._sample_bicubic(self.pixels, u, v, wrap)
         return self._sample_bilinear(self.pixels, u, v, wrap)
 
     # -------------------------------------------------------------- internals
@@ -158,6 +160,52 @@ class Texture:
             out = out.copy()
             out[oob] = 0.0
         return out
+
+    def _sample_bicubic(self, img, u, v, wrap):
+        """R219: bicubic B-spline, the smooth 4x4 lookup.
+
+        Uniform cubic B-spline weights -- every weight is non-negative
+        and the four sum to one exactly, so the result never overshoots
+        the texel range (a Catmull-Rom would, and a light's projected
+        factor must never ring negative). Texel centres and wrap
+        arithmetic are _sample_bilinear's own; the GLSL mirror in
+        gpu/material writes out the same sixteen fetches and the same
+        weight polynomials so both devices filter with the same float
+        math.
+        """
+        h, w = img.shape[:2]
+        fx = u * w - 0.5
+        fy = v * h - 0.5
+        x0 = np.floor(fx).astype(np.int64)
+        y0 = np.floor(fy).astype(np.int64)
+        tx = (fx - x0).astype(np.float32)
+        ty = (fy - y0).astype(np.float32)
+        oob = self._oob(u, v, wrap)
+
+        def _wts(t):
+            t2 = t * t
+            t3 = t2 * t
+            return ((1.0 - 3.0 * t + 3.0 * t2 - t3) * np.float32(1 / 6),
+                    (4.0 - 6.0 * t2 + 3.0 * t3) * np.float32(1 / 6),
+                    (1.0 + 3.0 * t + 3.0 * t2 - 3.0 * t3)
+                    * np.float32(1 / 6),
+                    t3 * np.float32(1 / 6))
+
+        wx = _wts(tx)
+        wy = _wts(ty)
+        xi = [self._wrap_index(x0 + k - 1, w, wrap) for k in range(4)]
+        out = None
+        for j in range(4):
+            yj = self._wrap_index(y0 + j - 1, h, wrap)
+            row = None
+            for i in range(4):
+                c = img[yj, xi[i]] * wx[i][:, None]
+                row = c if row is None else row + c
+            row = row * wy[j][:, None]
+            out = row if out is None else out + row
+        if oob is not None:
+            out[oob] = 0.0
+        return out.astype(np.float32)
 
     def _sample_3point(self, img, u, v, wrap):
         """Nintendo 64 3-point (triangular) filter: cheaper, visibly different."""

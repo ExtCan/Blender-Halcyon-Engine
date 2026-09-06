@@ -57,6 +57,40 @@ class Material:
     shadeless: bool = False
     receive_shadow: bool = True
     cast_shadow: bool = True
+    # R208: this material dresses HAIR geometry (ribbon strands or fur
+    # shells): the colour layer carries strand data (r intercept,
+    # g random, b length, a thickness) and Hair Info reads it. The
+    # graph root carries the same flag for both shading devices.
+    strand: bool = False
+    # R211: how the material's alpha reaches the frame. BLEND is the
+    # layer road (A-buffer fragments, sorted and composited -- glass).
+    # CLIP is punch-through, the era's cut-out alpha: the alpha chain is
+    # tested against `alpha_clip` and the surface is either fully there
+    # or fully absent, so its fragments live in the depth-buffered pass
+    # and shade ONCE -- no layers, no sorting, no per-layer passes. The
+    # shading law forces alpha to exactly 0 or 1 under CLIP on every
+    # road (camera, layers, rays), whichever road drew it.
+    alpha_mode: str = 'BLEND'
+    alpha_clip: float = 0.5
+    # R220: per-material ink. The cartoon outline pass was one global
+    # render setting; these let a material opt out of it, force it on
+    # (even with the global switch off), and carry its own ink colour
+    # and width. Defaults are exact inheritance -- bitwise the global
+    # behaviour.
+    ink_mode: str = 'INHERIT'         # INHERIT | ON | OFF
+    ink_use_color: bool = False       # False = the global Ink Colour
+    ink_color: tuple = (0.0, 0.0, 0.0)
+    ink_width: int = 0                # 0 = the global Ink Width
+    # R239: the Guilty Gear line control -- the mesh's vertex colours
+    # steer this material's line (ASW's own convention: ALPHA times the
+    # width, 0.5 as set / 0 erased / 1 doubled; BLUE holds interior and
+    # marked lines back until the surface nears its silhouette)
+    ink_vc: str = 'OFF'               # OFF | ARCSYS
+    # R233: the cel or the painting. CEL is everything that shipped
+    # before; BACKGROUND takes the painted background road (brush strokes
+    # over its lit colour, the ink suppressed unless ink_mode says ON)
+    # and the setback's softness
+    paint_mode: str = 'CEL'           # CEL | BACKGROUND
     wire: bool = False
     wire_size: float = 1.0
     face_texture: bool = False
@@ -88,6 +122,10 @@ class MeshData:
     obj_index: np.ndarray = None      # (T,) int32 -> index into Scene.objects
     face_normals: np.ndarray = None   # (T,3) float32
     smooth: np.ndarray = None         # (T,) bool
+    # R220: the artist's marked edges (Sharp / crease / Freestyle mark)
+    # for the ink pass, folded per triangle: uint8 (T,), bit k set = the
+    # edge opposite corner k is marked. None = no marks anywhere.
+    ink_tri_mask: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -106,6 +144,11 @@ class ObjectInfo:
     cast_shadow: bool = True
     receive_shadow: bool = True
     holdout: bool = False
+    # R223: a fluid-sim smoke domain's voxels, when this object carries
+    # one and the cache is readable: {'res': (rx, ry, rz), 'density':
+    # flat float32 (Mantaflow layout, x fastest), 'flame': same or
+    # None}. The volume marcher multiplies its density field by it.
+    smoke_grid: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -178,11 +221,23 @@ class Light:
     # Projected texture (gobo / cookie): sixth-generation projective
     # texturing -- a SPOT projects its image through the cone like a slide
     # projector, a SUN tiles it across the world perpendicular to its rays
-    # (cloud shadows). `cookie` is an (H,W,3|4) float32 array (or anything
-    # with a .pixels attribute holding one); POINT and AREA lights ignore it.
+    # (cloud shadows), a POINT wraps it around itself like a pierced
+    # lantern (lat-long), an AREA carries it on its face like a printed
+    # gel (R219: every lamp kind projects). `cookie` is an (H,W,3|4)
+    # float32 array (or anything with a .pixels attribute holding one).
     cookie: Any = None
     cookie_strength: float = 1.0
     cookie_scale: float = 10.0        # SUN only: world size of one tile
+    # R219: how the image continues past its edges. AUTO is the era
+    # default each projection always had -- SUN/HEMI tile (REPEAT),
+    # SPOT and AREA clamp (EXTEND), POINT wraps around (REPEAT).
+    # CLIP is the projector's gate: outside the slide, no light.
+    cookie_extend: str = 'AUTO'       # AUTO | REPEAT | EXTEND | CLIP
+    # R219: the lookup filter, same texel arithmetic on both devices.
+    # The projection's focus blur needs no field of its own: it reads
+    # the lamp's existing `radius` (SUN/HEMI: the Angle slider in
+    # radians; others: Radius in scene units). 0 = razor sharp.
+    cookie_filter: str = 'BILINEAR'   # BILINEAR | CLOSEST | CUBIC
     # the light's own X/Y axes, for oriented projection. Export fills them
     # from the object matrix; hand-built scenes may leave them None and get
     # a stable basis derived from the direction.
@@ -353,6 +408,33 @@ class World:
     # banded gradient
     band_count: int = 8
     band_softness: float = 0.0
+    # ------------------------------------------- R233: the painted sky
+    # A background painting on a flat panel in front of the camera, the
+    # way the animation stand's background sat behind the cel: the
+    # gradient's colours brushed in gouache (streaks and, optionally,
+    # dabs), painted clouds lit on top and shadowed beneath, the board's
+    # tooth and a watercolour granulation. Everything reads the panel's
+    # tangent coordinates, so a pan crosses the painting and a tilt
+    # climbs it; directions behind the panel fade to the plain gradient
+    # (the back of the stage). Evaluated per direction on the CPU on
+    # both device roads, like every rich sky -- exact by construction.
+    paint_look: str = 'CUSTOM'          # CUSTOM | GOUACHE_DAY | WATERCOLOUR_DUSK | FLEISCHER_NIGHT | STORYBOARD
+    paint_angle: float = 90.0           # the panel's direction, degrees from +X (+Y default)
+    paint_seed: int = 0
+    paint_streaks: float = 0.35         # the brush's streaks on the gradient
+    paint_streak_scale: float = 12.0    # streaks across 45 degrees of view
+    paint_streak_angle: float = 0.0     # degrees off horizontal
+    paint_dabs: float = 0.0             # impasto dabs over the streaks (costly)
+    paint_dab_scale: float = 10.0
+    paint_clouds: float = 0.35          # cloud coverage
+    paint_cloud_scale: float = 2.2
+    paint_cloud_softness: float = 0.3   # 0 dry-brush, 1 airbrushed
+    paint_cloud_color: tuple = (0.97, 0.96, 0.93)
+    paint_cloud_shadow: tuple = (0.58, 0.60, 0.70)
+    paint_cloud_height: float = 0.05    # where the deck sits above the horizon
+    paint_paper: float = 0.3            # the board's tooth
+    paint_paper_scale: float = 8.0
+    paint_wash: float = 0.25            # watercolour granulation (pigment density)
     # physical
     turbidity: float = 2.5
     ground_albedo: float = 0.3
@@ -459,3 +541,112 @@ class Scene:
 
     def tri_count(self):
         return 0 if self.mesh is None or self.mesh.tris is None else len(self.mesh.tris)
+
+
+def clip_socket(mat):
+    """How a CLIP material's alpha chain can be evaluated on its own.
+
+    The punch-through road (R211) resolves visibility BEFORE shading:
+    each clip fragment evaluates only the material's alpha and the
+    survivors join the depth-buffered pass. That is only honest when
+    the alpha genuinely IS one evaluable chain. Returns
+    ('node', surface_node, socket_name) for a graph whose surface node
+    exposes a plain Opacity/Alpha input, ('const', None, opacity) for a
+    graph-less material, or (None, None, reason) naming exactly why the
+    material's alpha cannot be lifted out -- those keep the blend road,
+    where the shading law still forces CLIP alpha to hard 0/1.
+    """
+    g = getattr(mat, 'graph', None)
+    if not g:
+        return 'const', None, float(getattr(mat, 'opacity', 1.0))
+    nodes = g.get('nodes', {}) or {}
+    out = nodes.get(g.get('output'))
+    if out is None:
+        return 'const', None, float(getattr(mat, 'opacity', 1.0))
+    link = None
+    for s in out.get('inputs', ()):
+        if s.get('name') == 'Surface':
+            link = s.get('link')
+            break
+    if not link:
+        return 'const', None, float(getattr(mat, 'opacity', 1.0))
+    nd = nodes.get(link[0])
+    if nd is None:
+        return None, None, 'the surface link points at no node'
+    bid = nd.get('bl_idname', '')
+    sock = {'HALCYON_ShaderNode': 'Opacity',
+            'ShaderNodeBsdfPrincipled': 'Alpha'}.get(bid)
+    if sock is None:
+        return None, None, (f'its surface is {bid or "unknown"}, whose '
+                            'alpha is not one plain socket')
+    if bid == 'HALCYON_ShaderNode':
+        for s in nd.get('inputs', ()):
+            if s.get('name') != 'Edge Opacity':
+                continue
+            d = s.get('default')
+            if s.get('link') or (d is not None
+                                 and abs(float(d) - 1.0) > 1e-4):
+                return None, None, ('Edge Opacity shapes its '
+                                    'silhouette after the alpha socket')
+    return 'node', nd, sock
+
+
+#: Math operations whose output is exactly 0.0 or 1.0 by construction
+_BINARY_MATH = frozenset({'GREATER_THAN', 'LESS_THAN', 'COMPARE'})
+
+
+def alpha_chain_is_binary(mat, nd, sockname):
+    """True when the alpha chain PROVABLY yields only 0 or 1.
+
+    The proof is structural and conservative: the node feeding the
+    surface's alpha socket is a Math comparison (Greater Than, Less
+    Than, Compare), whose output is exactly 0.0 or 1.0 whatever its
+    inputs do. Every shell-fur material ever built by the Fur Shells
+    operator ends in exactly that node.
+    """
+    g = getattr(mat, 'graph', None)
+    if not g or nd is None:
+        return False
+    for sk in nd.get('inputs', ()):
+        if sk.get('name') != sockname:
+            continue
+        link = sk.get('link')
+        if not link:
+            return False
+        src = (g.get('nodes', {}) or {}).get(link[0])
+        if src is None or src.get('bl_idname') != 'ShaderNodeMath':
+            return False
+        op = str((src.get('props') or {}).get('operation', 'ADD'))
+        # the Math node's clamp flag cannot change a 0/1 output
+        return op in _BINARY_MATH
+    return False
+
+
+def clip_road(mat):
+    """The one predicate for the punch-through road (R213).
+
+    Returns (threshold, kind, node, sock_or_const, note) when the
+    material's alpha resolves in the z-pass, else (None, None, None,
+    None, why). Two ways on:
+
+    - Alpha Mode CLIP, with a liftable chain (R211) -- the user asked.
+    - Alpha Mode BLEND whose chain is PROVABLY binary (R213: the field
+      frame spent 77 of 81 seconds blend-compositing a Greater Than
+      that only ever says 0 or 1). For binary alpha the blend road and
+      the z-buffer produce the identical picture -- except the blend
+      road also sorts, caps layers, and refuses the GPU -- so the
+      engine takes the fast road automatically. Old scenes' fur
+      materials, built before Alpha Mode existed, are exactly this.
+    """
+    kind, nd, extra = clip_socket(mat)
+    mode = str(getattr(mat, 'alpha_mode', 'BLEND'))
+    if mode == 'CLIP':
+        if kind is None:
+            return None, None, None, None, str(extra)
+        return (float(getattr(mat, 'alpha_clip', 0.5)), kind, nd, extra,
+                'Alpha Mode Clip')
+    if kind == 'node' and alpha_chain_is_binary(mat, nd, str(extra)):
+        # any threshold strictly inside (0, 1) tests a 0/1 chain
+        # identically; 0.5 is the canonical one
+        return 0.5, kind, nd, extra, 'binary alpha, detected'
+    return None, None, None, None, 'Alpha Mode Blend'

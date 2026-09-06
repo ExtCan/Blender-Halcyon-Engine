@@ -162,6 +162,28 @@ def value_noise2(p):
     return (x0 + (x1 - x0) * fy).astype(np.float32)
 
 
+def value_noise2s(p, salt=0):
+    """value_noise2 on the z = `salt` plane of the 3D lattice.
+
+    2D noise with an INTEGER salt (R232, the 2D media): the salt rides the
+    third lattice constant, so each salt is a different plane of the same
+    hash and no float coordinate has to carry it. Four corners, bilinear.
+    """
+    fl = np.floor(p)
+    f = p - fl
+    f = f * f * (3.0 - 2.0 * f)
+    i = fl.astype(np.int64)
+    base = i[:, 0] * _HX + i[:, 1] * _HY + np.int64(int(salt)) * _HZ
+    c00 = _hash_mix(base)
+    c10 = _hash_mix(base + _HX)
+    c01 = _hash_mix(base + _HY)
+    c11 = _hash_mix(base + _HX + _HY)
+    fx, fy = f[:, 0], f[:, 1]
+    x0 = c00 + (c10 - c00) * fx
+    x1 = c01 + (c11 - c01) * fx
+    return (x0 + (x1 - x0) * fy).astype(np.float32)
+
+
 def value_noise4(p):
     """Quadrilinearly interpolated value noise over a 4D lattice, in 0..1.
 
@@ -488,6 +510,56 @@ def tv_static(p, frame=0):
                  c[:, 2].astype(np.int64) + int(frame) * 7919)
 
 
+def fur_tufts(p, coverage=1.0, taper=1.0, variation=0.35):
+    """Round tuft cross-sections whose height falls radially -- shell fur.
+
+    The texture shell fur actually reads (R209): each 2D cell grows at
+    most one tuft, a ROUND dot whose value is the tuft's height at that
+    point of its cross-section -- peak at the centre, zero at the rim,
+    falling as 1-(d/r)^2 raised to `taper`. Alpha-testing the field
+    against a shell's height then keeps a disc that SHRINKS as the
+    shells climb and vanishes at the tuft's own peak, so the stack reads
+    as strands tapering to tips instead of square columns (which is what
+    thresholding square per-cell noise gave, and what the field rightly
+    rejected). Worked in the XY plane because tufts live in UV space;
+    hashes ride the same integer lattice as worley, so the GLSL twin is
+    bit-exact. Returns (height 0..1, winning tuft's id).
+    """
+    cx0 = np.floor(p[:, 0]).astype(np.int64)
+    cy0 = np.floor(p[:, 1]).astype(np.int64)
+    best = np.zeros(p.shape[0], np.float32)
+    rnd = np.zeros(p.shape[0], np.float32)
+    cov = np.float32(coverage)
+    var = np.float32(np.clip(variation, 0.0, 1.0))
+    tap = float(max(taper, 1e-3))
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            cx = cx0 + dx
+            cy = cy0 + dy
+            jx = hash3(cx, cy, np.int64(0))
+            jy = hash3(cx, cy, np.int64(31))
+            hv = hash3(cx, cy, np.int64(71))
+            tid = hash3(cx, cy, np.int64(137))
+            # centre jittered inside the cell; radius 0.62 cells, so the
+            # base coat nearly closes and nothing escapes the 3x3 search
+            ddx = (p[:, 0] - (cx.astype(np.float32) + np.float32(0.5)
+                              + (jx - np.float32(0.5)) * np.float32(0.75))) \
+                / np.float32(0.62)
+            ddy = (p[:, 1] - (cy.astype(np.float32) + np.float32(0.5)
+                              + (jy - np.float32(0.5)) * np.float32(0.75))) \
+                / np.float32(0.62)
+            q = np.maximum(np.float32(1.0) - (ddx * ddx + ddy * ddy),
+                           np.float32(0.0)).astype(np.float32)
+            prof = q if tap == 1.0 else np.power(q, np.float32(tap))
+            h = np.where(tid < cov,
+                         (np.float32(1.0) - var + var * hv) * prof,
+                         np.float32(0.0)).astype(np.float32)
+            win = h > best
+            rnd = np.where(win, tid, rnd)
+            best = np.where(win, h, best)
+    return best.astype(np.float32), rnd.astype(np.float32)
+
+
 def marble(p, turb=1.0, octaves=5, veins=1.0, sharpness=1.0, axis=0):
     """Sine banding displaced by turbulence -- the POV-Ray marble."""
     t = turbulence(p, octaves=octaves) * turb
@@ -696,16 +768,94 @@ def agate(p, turb=1.0, octaves=6, bands=1.1, sharpness=0.77, axis=2):
                     max(sharpness, 0.01)).astype(np.float32)
 
 
-def leopard(p, spot=1.0):
-    """POV-Ray's `leopard`: ((sin x + sin y + sin z) / 3) squared.
+def leopard(p, spot=1.0, jitter=0.85, breakup=0.55):
+    """Leopard rosettes: curved dark arcs around warm patches (R216).
 
-    Three interfering sines squared, which lands a rounded spot in the middle
-    of every unit cell. It is the pattern every 1990s "animal print" material
-    was actually made of.
+    The old body was POV-Ray's leopard -- three sines summed and squared,
+    a polka-dot lattice -- and the field said so: "doesn't look remotely
+    like real leopard print". A real rosette is a handful of thick dark
+    arcs hugging a circle around a patch warmer than the ground, with the
+    odd small solid spot between rosettes and nothing periodic anywhere.
+
+    So, per jittered 2D cell (a print lives in UV, so this works the XY
+    plane like fur_tufts): five arc SLOTS around a hashed radius, each an
+    ellipse in (radial, arc-length) coordinates so it curves with the
+    circle, each slot hashed for length, angular slip, and whether it
+    appears at all -- Break raises the drop chance and widens the gaps.
+    About a fifth of the cells trade their rosette for a small solid
+    spot. A gentle value-noise domain warp bends every circle organic.
+    Returns (ring, interior) masks so the node lays THREE colours:
+    ground, the interior patch, then the arcs over both. Hashes ride the
+    same integer lattice as worley and the warp is the integer-hash
+    value noise, so the GLSL twin lands on identical cells and bends.
     """
-    s = (np.sin(p[:, 0]) + np.sin(p[:, 1]) + np.sin(p[:, 2])) / 3.0
-    v = s * s
-    return np.power(np.clip(v, 0.0, 1.0), max(spot, 0.01)).astype(np.float32)
+    size = np.float32(min(max(spot, 0.05), 1.6))
+    jit = np.float32(min(max(jitter, 0.0), 1.0))
+    brk = np.float32(min(max(breakup, 0.0), 1.0))
+    two_pi = np.float32(6.2831853)
+    pi = np.float32(3.14159265)
+
+    def sstep(e0, e1, v):
+        t = np.clip((v - e0) / (e1 - e0), 0.0, 1.0)
+        return t * t * (3.0 - 2.0 * t)
+
+    wx = value_noise(p * np.float32(2.3)) - 0.5
+    wy = value_noise(p * np.float32(2.3) + np.float32(37.0)) - 0.5
+    x = (p[:, 0] + wx * np.float32(0.30)).astype(np.float32)
+    y = (p[:, 1] + wy * np.float32(0.30)).astype(np.float32)
+    cx0 = np.floor(x)
+    cy0 = np.floor(y)
+    ring = np.zeros(x.shape, np.float32)
+    inner = np.zeros(x.shape, np.float32)
+    skip = np.float32(0.10) + np.float32(0.45) * brk
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            cxf = cx0 + np.float32(dx)
+            cyf = cy0 + np.float32(dy)
+            cxi = cxf.astype(np.int64)
+            cyi = cyf.astype(np.int64)
+            zi = np.zeros_like(cxi)
+            jx = hash3(cxi, cyi, zi)
+            jy = hash3(cxi, cyi, zi + 31)
+            sz = hash3(cxi, cyi, zi + 71)
+            rot = hash3(cxi, cyi, zi + 137)
+            so = hash3(cxi, cyi, zi + 197)
+            ox = cxf + 0.5 + (jx - 0.5) * (0.8 * jit)
+            oy = cyf + 0.5 + (jy - 0.5) * (0.8 * jit)
+            # capped so no arc outreaches the 3x3 neighbourhood
+            r0 = np.minimum(size * (0.30 + 0.13 * sz), np.float32(0.58))
+            ddx = x - ox
+            ddy = y - oy
+            d = np.sqrt(ddx * ddx + ddy * ddy)
+            # the +1e-12 keeps atan2(0,0) off the table on BOTH devices;
+            # the seam at +-pi is harmless: arc-length distance wraps
+            theta = np.arctan2(ddy, ddx + np.float32(1e-12))
+            is_solid = np.where(so < 0.22, np.float32(1.0),
+                                np.float32(0.0))
+            blobs = np.zeros(x.shape, np.float32)
+            for k in range(5):
+                hk = hash3(cxi, cyi, zi + (211 + 13 * k))
+                h2 = hash3(cxi, cyi, zi + (311 + 13 * k))
+                keep = np.where(hk >= skip, np.float32(1.0),
+                                np.float32(0.0))
+                ang = two_pi * (np.float32(k) / np.float32(5.0)) \
+                    + rot * two_pi + (hk - 0.5) * np.float32(0.5)
+                dr = (d - r0) / (r0 * np.float32(0.30))
+                # GLSL mod, written out: np.mod can differ by an ulp
+                tw = theta - ang + pi
+                tw = tw - two_pi * np.floor(tw / two_pi)
+                sarc = (tw - pi) / (0.55 + 0.35 * h2)
+                e = np.sqrt(dr * dr + sarc * sarc)
+                blob = (1.0 - sstep(np.float32(0.72), np.float32(1.0),
+                                    e)) * keep
+                blobs = np.maximum(blobs, blob)
+            disc = 1.0 - sstep(r0 * 0.34, r0 * 0.42, d)
+            cell_ring = blobs + (disc - blobs) * is_solid
+            cell_int = (1.0 - sstep(r0 * 0.68, r0 * 0.84, d)) \
+                * (1.0 - is_solid)
+            ring = np.maximum(ring, cell_ring)
+            inner = np.maximum(inner, cell_int)
+    return ring.astype(np.float32), inner.astype(np.float32)
 
 
 def onion(p, thickness=1.0, sharpness=1.0):

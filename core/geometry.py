@@ -679,3 +679,188 @@ def terrain(size=24.0, divisions=96, height=6.0, feature_scale=10.0,
             a = row + c
             faces.append((a, a + 1, a + n1 + 1, a + n1))
     return verts, faces
+
+
+# ------------------------------------------------------------ hair (R208)
+#
+# Two generators behind "Hair/Particle compatibility":
+#
+# `hair_ribbons` turns strand polylines into camera-facing triangle
+# ribbons -- the exact primitive Blender Internal rendered strands as: a
+# flat band that always shows the camera its face, tapering root to tip.
+# The strand's shading data rides the mesh's own colour layer, one
+# convention shared by everything hairlike in the engine:
+#
+#     colour.r = intercept (0 at the root, 1 at the tip)
+#     colour.g = per-strand random (deterministic hash of the seed)
+#     colour.b = strand length, world units
+#     colour.a = local thickness, world units
+#
+# The Hair Info node reads those channels; the Vertex Color node reads
+# them too, which is a feature -- a graph can grade a strand any way it
+# likes without a special attribute system. UVs carry the EMITTER'S
+# root UV, constant along the strand, so image textures paint hair the
+# way 2.79 painted it.
+#
+# `fur_shells` builds the other period hair: shell texturing -- N
+# inflated copies of a mesh, each carrying its height in the SAME
+# colour convention (intercept = shell height), so one Hair Info node
+# serves strands and shells alike. Alpha-tested tufts against the
+# height give the classic Dreamcast/GameCube fur; that material is
+# wired by the Add-menu operator, but any graph works.
+
+
+def _strand_hash(i, seed):
+    """Deterministic per-strand random in [0,1) -- no RNG state."""
+    import numpy as np
+    h = np.sin(np.float64(i) * 127.1 + np.float64(seed) * 311.7) \
+        * 43758.5453123
+    return np.float32(h - np.floor(h))
+
+
+def hair_ribbons(strands, eye, root_width=0.02, tip_width=0.004,
+                 uv_roots=None, seed=0):
+    """Strand polylines -> camera-facing ribbon mesh.
+
+    `strands`: sequence of (K,3) arrays (K >= 2), world space.
+    `eye`: (3,) camera position the ribbons face.
+    Returns (verts, tris, normals, uvs, colors) as float32/int32 arrays,
+    colours in the strand convention above. Degenerate strands (under
+    two distinct points) are skipped. Everything is a pure function of
+    the inputs -- same strands, same picture.
+    """
+    import numpy as np
+    eye = np.asarray(eye, np.float32)
+    all_v = []
+    all_t = []
+    all_n = []
+    all_uv = []
+    all_c = []
+    base = 0
+    for si, pts in enumerate(strands):
+        P = np.asarray(pts, np.float32)
+        if P.ndim != 2 or P.shape[0] < 2:
+            continue
+        K = P.shape[0]
+        seg = np.diff(P, axis=0)
+        seglen = np.sqrt((seg * seg).sum(1))
+        total = float(seglen.sum())
+        if total <= 1e-9:
+            continue
+        # arclength intercept, 0 at root, 1 at tip
+        t = np.concatenate([[0.0], np.cumsum(seglen)]).astype(np.float32)
+        t /= np.float32(total)
+        # tangent at each point: central difference, one-sided at ends
+        tan = np.empty_like(P)
+        tan[0] = seg[0]
+        tan[-1] = seg[-1]
+        if K > 2:
+            tan[1:-1] = P[2:] - P[:-2]
+        tl = np.sqrt((tan * tan).sum(1, keepdims=True))
+        tan = tan / np.maximum(tl, 1e-12)
+        view = P - eye[None, :]
+        vl = np.sqrt((view * view).sum(1, keepdims=True))
+        view = view / np.maximum(vl, 1e-12)
+        side = np.cross(tan, view)
+        sl = np.sqrt((side * side).sum(1, keepdims=True))
+        # a strand aimed straight at the camera has no cross product;
+        # borrow any perpendicular so the ribbon keeps its width
+        bad = (sl[:, 0] < 1e-6)
+        if bad.any():
+            alt = np.cross(tan[bad], np.array([0.0, 0.0, 1.0],
+                                              np.float32)[None, :])
+            al = np.sqrt((alt * alt).sum(1, keepdims=True))
+            flat = (al[:, 0] < 1e-6)
+            if flat.any():
+                alt[flat] = np.array([1.0, 0.0, 0.0], np.float32)
+                al[flat] = 1.0
+            side[bad] = alt / np.maximum(al, 1e-12)
+            sl[bad] = 1.0
+        side = side / np.maximum(sl, 1e-12)
+        w = (np.float32(root_width)
+             + (np.float32(tip_width) - np.float32(root_width)) * t)
+        half = (side * (w * 0.5)[:, None]).astype(np.float32)
+        v = np.empty((K * 2, 3), np.float32)
+        v[0::2] = P - half
+        v[1::2] = P + half
+        # the ribbon shows the camera its face
+        n = np.repeat(-view, 2, axis=0).astype(np.float32)
+        rnd = _strand_hash(si, seed)
+        c = np.empty((K * 2, 4), np.float32)
+        c[:, 0] = np.repeat(t, 2)
+        c[:, 1] = rnd
+        c[:, 2] = np.float32(total)
+        c[:, 3] = np.repeat(w, 2)
+        if uv_roots is not None and si < len(uv_roots):
+            uv = np.tile(np.asarray(uv_roots[si], np.float32)[None, :],
+                         (K * 2, 1))
+        else:
+            uv = np.tile(np.array([rnd, 0.0], np.float32)[None, :],
+                         (K * 2, 1))
+        idx = np.arange(K - 1, dtype=np.int32) * 2 + base
+        tri = np.empty(((K - 1) * 2, 3), np.int32)
+        tri[0::2, 0] = idx
+        tri[0::2, 1] = idx + 1
+        tri[0::2, 2] = idx + 2
+        tri[1::2, 0] = idx + 1
+        tri[1::2, 1] = idx + 3
+        tri[1::2, 2] = idx + 2
+        all_v.append(v)
+        all_t.append(tri)
+        all_n.append(n)
+        all_uv.append(uv)
+        all_c.append(c)
+        base += K * 2
+    if not all_v:
+        z3 = np.zeros((0, 3), np.float32)
+        return (z3, np.zeros((0, 3), np.int32), z3.copy(),
+                np.zeros((0, 2), np.float32), np.zeros((0, 4), np.float32))
+    return (np.concatenate(all_v), np.concatenate(all_t),
+            np.concatenate(all_n), np.concatenate(all_uv),
+            np.concatenate(all_c))
+
+
+def fur_shells(verts, normals, tris, count=12, length=0.25, curve=1.0,
+               comb=(0.0, 0.0, 0.0), uvs=None):
+    """A mesh -> its shell stack, in the strand colour convention.
+
+    `count` shells from the surface (height 0) to `length` along the
+    vertex normals; `curve` biases the spacing (above 1 packs shells
+    near the root, where fur is densest); `comb` is a world-space
+    offset the shells lean into quadratically -- gravity, or a parting.
+    Colour.r carries the shell height, so a Hair Info node's Intercept
+    grades the stack exactly as it grades a strand. Returns
+    (verts, tris, normals, uvs, colors).
+    """
+    import numpy as np
+    V = np.asarray(verts, np.float32)
+    N = np.asarray(normals, np.float32)
+    T = np.asarray(tris, np.int32)
+    comb = np.asarray(comb, np.float32)
+    count = max(int(count), 2)
+    nv = V.shape[0]
+    out_v = []
+    out_t = []
+    out_n = []
+    out_c = []
+    out_uv = []
+    uv_in = np.asarray(uvs, np.float32) if uvs is not None else None
+    for i in range(count):
+        h = np.float32((i / (count - 1)) ** max(float(curve), 1e-3))
+        out_v.append(V + N * (h * np.float32(length))
+                     + comb[None, :] * (h * h))
+        out_t.append(T + i * nv)
+        out_n.append(N)
+        c = np.empty((nv, 4), np.float32)
+        c[:, 0] = h
+        c[:, 1] = 0.5
+        c[:, 2] = np.float32(length)
+        c[:, 3] = 1.0
+        out_c.append(c)
+        out_uv.append(uv_in if uv_in is not None
+                      else np.zeros((nv, 2), np.float32))
+    return (np.concatenate(out_v).astype(np.float32),
+            np.concatenate(out_t).astype(np.int32),
+            np.concatenate(out_n).astype(np.float32),
+            np.concatenate(out_uv).astype(np.float32),
+            np.concatenate(out_c).astype(np.float32))

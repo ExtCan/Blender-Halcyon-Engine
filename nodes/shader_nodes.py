@@ -14,6 +14,14 @@ from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
 from bpy.types import Node, NodeSocket, PropertyGroup
 
 from ..core.shading import MODEL_ITEMS
+from ..core.volume import VOLUME_MODEL_ITEMS, VOLUME_SHAPE_ITEMS
+from ..core.celfield import (CEL_LIGHT_ITEMS, CEL_RIM_MODE_ITEMS,
+                             CEL_RIM_SIDE_ITEMS, CEL_SHAPE_ITEMS)
+from ..core.nodeeval import FACE_AXIS_ITEMS
+from ..core.shading import (CARTOON_SHADOW_MODE_ITEMS,
+                            CARTOON_ERA_ITEMS, CARTOON_ERA_PRESETS,
+                            ANIME_STYLE_ITEMS, ANIME_STYLE_PRESETS,
+                            HAIR_SHINE_SHAPE_ITEMS)
 from ..shaders.compiler import DEFAULT_GLSL, DEFAULT_HLSL, try_compile
 
 ENGINE = 'HALCYON_RENDER'
@@ -28,6 +36,326 @@ class HalcyonNodeBase:
 
 
 # =========================================================== classic shader
+
+
+# R241: every socket of the cel masters and the volume master carries a
+# tooltip too. The blocks the two cel masters share are written once.
+_CEL_LIGHT_SOCKET_DOCS = {
+    'Light Azimuth':
+        "Where the fixed key sits, in degrees. Under Camera Key it is "
+        "measured about the screen (0 from the viewer, positive from "
+        "the screen's left, the drawing's classic key at 35); under "
+        "World Key, from the world +X axis counter-clockwise. Ignored "
+        "under Scene Lamps",
+    'Light Elevation':
+        "How high the fixed key sits, in degrees above the screen's "
+        "centre (Camera Key) or the horizon (World Key). The classic "
+        "drawing key sits around 30. Ignored under Scene Lamps",
+    'Screen Shadow':
+        "The drawn contact shadow's strength: the hair's shadow across "
+        "the brow, the chin's on the neck, marched from the frame's own "
+        "depth toward the key. 0 is off; 1 pushes the shadowed pixels "
+        "fully into the shadow tone. Under Scene Lamps it rides the "
+        "first non-ambient lamp",
+    'Screen Shadow Length':
+        "How far the contact-shadow march reaches, in pixels at 1080 "
+        "lines (it scales with the frame's height). Short lengths keep "
+        "the shadows tight and drawn-looking; long ones let a body "
+        "shadow the ground",
+    'Rim Width':
+        "The depth rim's band width in pixels at 1080 lines (it scales "
+        "with the frame's height) -- how far inside the silhouette the "
+        "line of light reaches when Rim Mode is Depth Rim",
+}
+
+_CEL_HAIR_SOCKET_DOCS = {
+    'Hair Shine':
+        "The painted hair band's strength -- the 80s 'angel ring': a "
+        "band of the shine colour painted across the object, "
+        "light-independent (it was painted on the cel at a position, "
+        "not lit). 0 is off, 1 paints the band at full",
+    'Hair Shine Color':
+        "The band's paint. Classic rings are white or a pale tint of "
+        "the hair's own colour; a linked texture varies it per pixel",
+    'Hair Shine Height':
+        "Where the band sits, as a fraction of the object's own height "
+        "(0 the bottom, 1 the top). The classic ring sits just above "
+        "three quarters",
+    'Hair Shine Width':
+        "The band's thickness, as a fraction of the object's height. "
+        "Television rings ran thin; the OVA glamour pass wore them "
+        "wider",
+    'Hair Shine Wave':
+        "How far the band's edge swings up and down as it travels "
+        "around the head, as a fraction of the object's height. 0 is a "
+        "dead-level band",
+    'Hair Shine Waves':
+        "How many swings the edge makes in one full turn around the "
+        "head. The 80s ring waved five or six times; the 90s made "
+        "three bolder ones",
+    'Hair Shine Softness':
+        "The band edge's blur, as a fraction of the object's height. "
+        "Keep it tiny for the crisp cel look; raise it for an "
+        "airbrushed sheen",
+    'Hair Shine Second':
+        "Puts a thinner echo band this far BELOW the main one (a "
+        "fraction of the object's height; 0 is off) -- the double ring "
+        "of the richer productions",
+    'Hair Shine Angle':
+        "Turns the wave pattern around the head, in degrees -- where "
+        "the teeth and notches sit. Use it to put the pattern's notch "
+        "at the front of the hair, or to animate a slow shimmer",
+    'Hair Shine Follow':
+        "How much the band rides the key light's height: 0 leaves it "
+        "painted where it is (the classic per-cut drawing); 1 lifts "
+        "and lowers it with the key, as if redrawn for every lighting "
+        "change. Follows a directional key (a Sun or Hemi scene key, "
+        "or the material's Camera / World key); a point-family key "
+        "leaves the band painted",
+    'Hair Shine Second Color':
+        "The echo band's own tint, multiplied over the Hair Shine "
+        "Color where the second band owns the pixel. White keeps both "
+        "bands the same paint",
+}
+
+_CEL_AIR_SOCKET_DOCS = {
+    'Airbrush':
+        "The cel painter's soft gradation against the shadow edge: the "
+        "lit tone tinted toward the airbrush colour just above the "
+        "edge, or the shadow tone blended toward it below (the side is "
+        "the Airbrush Side menu). 0 is off",
+    'Airbrush Color':
+        "The gradation's tint. Warm rose against a cool shadow is the "
+        "classic feature-cel choice; a linked texture varies it per "
+        "pixel",
+    'Airbrush Width':
+        "How far the gradation reaches from the shadow edge, as a "
+        "share of the light term's range -- wider washes further into "
+        "the lit or shadow side",
+}
+
+ANIME_SOCKET_DOCS = dict({
+    'Diffuse Color':
+        "The material's own paint under the lit bands. Plug the "
+        "character's base (diffuse) texture in here; the shadow "
+        "colours below multiply it, the games' own arrangement",
+    'Line Art':
+        "A drawn-line texture multiplied over the base -- the inner "
+        "lines drawn in the texture itself (an ILM alpha, a hand-drawn "
+        "line map). White is no line",
+    'Shadow 1 Color':
+        "The first shadow band's tint, multiplied over the paint -- "
+        "the cel painter's kage colour, picked a step darker and "
+        "usually cooler than the local colour. A shadow is a colour "
+        "here, never a darkness",
+    'Shadow 1 Threshold':
+        "Where the first band's edge falls on the wrapped light term "
+        "(0.5 is the terminator; higher pushes the shadow onto the lit "
+        "side)",
+    'Shadow 1 Softness':
+        "The first band edge's blur. The cel tradition cuts hard "
+        "(0.01 and under); features and the modern digital look "
+        "soften a little",
+    'Shadow 2 Color':
+        "The second, deeper shadow band's tint (Tones: Three) -- the "
+        "core shadow inside the first",
+    'Shadow 2 Threshold':
+        "Where the second band's edge falls on the light term, deeper "
+        "than the first (a smaller number)",
+    'Shadow 2 Softness':
+        "The second band edge's blur, usually matched to the first",
+    'Shadow Ramp':
+        "Link a texture -- the game's own ramp, a ColorRamp, any chain "
+        "-- and the tone bands come from the RAMP instead: shadow "
+        "side, transition and lit side all painted, sampled by the "
+        "light term. The tone sliders above stand down while linked",
+    'Ramp Row':
+        "Which row of a multi-row ramp texture to sample (0 the "
+        "bottom). Under GENSHIN with a Game Texture linked, the "
+        "texture's alpha (the material id) picks the row by itself",
+    'Shadow Bias':
+        "Shifts the whole light term before the bands read it: "
+        "positive pushes pixels toward the lit side, negative into "
+        "shadow. The game modes add their own texture-driven bias on "
+        "top",
+    'Game Texture':
+        "The game's own packed control map, decoded by the "
+        "Compatibility mode: the ArcSys lineage's ILM (specular "
+        "intensity / shadow bias / highlight size / drawn lines), the "
+        "HoYo lightmap, the ZZZ map. Leave unlinked outside the game "
+        "modes",
+    'Detail Texture':
+        "The companion map the mode expects: the ArcSys lineage's SSS "
+        "map (its colour multiplies the first shadow tint); ZZZ reads "
+        "its blue as extra specular mask",
+    'Specular Color':
+        "The stepped cel highlight's paint. Keep it near white for "
+        "hair and metal glints",
+    'Specular Level':
+        "The stepped highlight's strength. Cel paint itself is matte "
+        "-- keep it 0 except on hair, metal and eyes",
+    'Specular Size':
+        "The highlight's angular size on the wrapped half-vector: "
+        "bigger paints a larger glint",
+    'Specular Sharpness':
+        "The highlight edge's blur -- tiny for the hard cel glint, "
+        "larger for a soft sheen",
+    'Rim Color':
+        "The rim light's paint -- the painted edge-light of the OVA "
+        "look, or the modern depth rim's line of light",
+    'Rim Amount':
+        "The rim's strength. 0 is off; with Rim Mode Depth Rim it "
+        "scales the constant-width band inside the silhouette",
+    'Rim Power':
+        "The Fresnel rim's falloff exponent: higher keeps the rim "
+        "tighter to the silhouette (Depth Rim ignores it -- its width "
+        "is Rim Width, in pixels)",
+    'Matcap':
+        "A material-capture image applied by the view normal (the "
+        "sphere convention). Use for painterly sheens the lamps "
+        "cannot give; blended in by Matcap Blend",
+    'Matcap Blend':
+        "How much of the matcap lands on the surface, by the Matcap "
+        "Mode menu's blend",
+    'Self-Illumination':
+        "Light the surface emits on its own, added after the bands -- "
+        "glowing eyes, runes, screens. Scaled by Emission Strength",
+    'Emission Strength':
+        "Multiplies Self-Illumination (and, with Alpha Is Emission "
+        "on, the base texture's alpha-masked glow -- the HoYo "
+        "convention)",
+    'Light Response':
+        "Per-material gain on every lamp's contribution: the anime "
+        "compositor's per-character light dial. 1 is physical; below "
+        "flattens the character against the scene's lighting",
+    'Ambient':
+        "How much of the world's ambient light reaches the material. "
+        "The cel look usually keeps a healthy floor so shadows stay "
+        "coloured, never black",
+    'Opacity':
+        "The material's coverage: 1 solid, toward 0 see-through "
+        "(needs a transparency mode in the render settings)",
+    'Normal':
+        "A replacement shading normal (a Bump or Normal Map chain). "
+        "Unlinked, the mesh's own -- including any custom split "
+        "normals you authored",
+    'Bump Strength':
+        "How far the linked Normal chain may bend the surface's "
+        "shading normal (0 ignores it, 1 takes it fully)",
+    'Shadow Smoothing':
+        "The inker's simplification: bends the shading normal toward "
+        "the Smoothing Shape (sphere, cylinder or the camera) so the "
+        "terminator sweeps as one clean drawn shape instead of "
+        "following every bump",
+    'Line Color':
+        "This material's own ink colour, used when the Line Colour "
+        "menu says Line Color Socket (read per material, not per "
+        "pixel)",
+    'Line Darken':
+        "Under Iro-Trace, how far the surface's own colour is darkened "
+        "to make its line -- the 80s coloured trace: hair lines in the "
+        "hair's tone, skin lines in the skin's",
+    'Face Shadow (SDF)':
+        "Link the face's shadow-sweep map (the game's own, or any "
+        "gradient chain) and it REPLACES the light term on this "
+        "material: lit where the map's field outweighs the key's "
+        "horizontal angle about the head's frame, mirrored across the "
+        "face's centre line -- the anime face's drawn terminator. "
+        "Unlinked, nothing changes",
+}, **_CEL_LIGHT_SOCKET_DOCS, **_CEL_HAIR_SOCKET_DOCS,
+   **_CEL_AIR_SOCKET_DOCS)
+
+CARTOON_SOCKET_DOCS = dict({
+    'Paint Color':
+        "The cel's flat paint -- the same under every lamp, whatever "
+        "its energy. Colour is PAINT here, not light; plug the "
+        "painted texture in for patterned surfaces",
+    'Shadow Color':
+        "The one shadow tone's colour. Under the Transparent mode it "
+        "multiplies the paint (the shadow cel's double exposure); "
+        "under Painted it REPLACES the paint outright (a second flat "
+        "paint, the UPA way)",
+    'Shadow Amount':
+        "How fully the shadow tone lands: 1 the full cel, less a "
+        "lighter exposure of it (Transparent mode mixes part-way)",
+    'Shadow Threshold':
+        "Where the shadow's edge falls on the wrapped light term (0.5 "
+        "the terminator; higher pushes the shadow well onto the lit "
+        "side -- the dramatic 40s and 90s look)",
+    'Shadow Softness':
+        "The shadow edge's blur. 0 is the hard inked edge; a little "
+        "softness reads as the feature cel's airbrushed edge",
+    'Highlight Color':
+        "The painted highlight dot's colour (the brightest cel, "
+        "usually just off-white)",
+    'Highlight Size':
+        "The painted highlight dot's size on the lit side. 0 is none "
+        "-- most television eras painted none",
+    'Highlight Softness':
+        "The highlight dot edge's blur -- keep it tiny for a painted "
+        "dot, larger for a sheen",
+    'Lamp Influence':
+        "How much the lamps' actual energy and colour reach the paint. "
+        "0 is pure paint (the classic cel); 1 lets a red lamp redden "
+        "the paint like a surface",
+}, **{k: v for k, v in ANIME_SOCKET_DOCS.items()
+      if k in ('Rim Color', 'Rim Amount', 'Rim Power',
+               'Self-Illumination', 'Emission Strength', 'Opacity',
+               'Normal', 'Shadow Smoothing')},
+   **_CEL_LIGHT_SOCKET_DOCS, **_CEL_HAIR_SOCKET_DOCS,
+   **_CEL_AIR_SOCKET_DOCS)
+
+VOLUME_SOCKET_DOCS = {
+    'Density':
+        "How much stuff fills the container per unit of distance. "
+        "Whatever chain feeds it is evaluated INSIDE the volume at "
+        "every march step -- textures make smoke",
+    'Color':
+        "The scattering tint: the colour the fog throws back at the "
+        "lamps that reach it",
+    'Absorption':
+        "How strongly the volume eats the light passing through, on "
+        "top of what it scatters -- higher reads darker and smokier",
+    'Anisotropy':
+        "The scatter direction: 0 even in all directions, positive "
+        "forward (halos around backlights, the anime god-ray look), "
+        "negative back toward the lamp",
+    'Emission Color':
+        "Light the volume gives off on its own -- fire, ember glow, "
+        "the neon interior. Scaled by Emission Strength",
+    'Emission Strength':
+        "Multiplies the Emission Color: 0 is an unlit volume, higher "
+        "glows through the fog around it",
+    'Edge Threshold':
+        "The stylized volume models' cut: where the accumulated "
+        "density starts to count as a drawn edge (the cel-fog and "
+        "banded looks read it)",
+    'Edge Softness':
+        "The blur of that stylized cut -- 0 the hard drawn edge, "
+        "larger an airbrushed one",
+    'Bands':
+        "How many flat tone bands the banded volume models quantize "
+        "into -- the drawn-smoke look's steps",
+    'Shadow Tint':
+        "The colour the volume's shadowed side leans toward (a cel "
+        "shadow for fog: a colour, not a darkness)",
+    'Tint Amount':
+        "How strongly the Shadow Tint takes hold in the volume's "
+        "unlit parts. 0 leaves the plain scattering colour",
+}
+
+
+def _apply_socket_tips(node, docs):
+    """R241: put the table's tooltip on every input that has one --
+    run at creation AND at the load-post migration, so a node saved
+    before the tips grows them the moment its file opens."""
+    for sock in node.inputs:
+        tip = docs.get(getattr(sock, 'name', None))
+        if tip:
+            try:
+                sock.description = tip
+            except (AttributeError, TypeError):
+                pass
 
 
 # What each input does. The list of models that use it is derived from RELEVANT
@@ -132,6 +460,21 @@ SOCKET_DOCS = {
                         "which is what the flat-shaded era used them for",
     'Backface Mix': "How strongly Backface Color replaces the normal shading on "
                     "back faces. Useful on single-sided leaves, cloth and cards",
+    'Specular Color 2': "Multi-Layer (3ds Max)'s second highlight colour -- the "
+                        "wider, softer lobe that shows through what the first "
+                        "leaves. Max's Second Specular Layer",
+    'Specular Level 2': "Strength of the second highlight, Max's percent over "
+                        "100 (0 turns the layer off, as Max's default does)",
+    'Glossiness 2': "Sharpness of the second highlight, Max's percent -- "
+                    "lower than the first for the classic hot-dot-in-a-glow",
+    'Anisotropy 2': "How far the second highlight stretches, 0 round to 1 a "
+                    "streak -- Max's Anisotropy on the second layer",
+    'Anisotropic Rotation 2': "Turns the second highlight's stretch about the "
+                              "normal, in turns -- Max's Orientation on the "
+                              "second layer",
+    'Translucent Color': "Translucent (3ds Max)'s colour: light from either "
+                         "side of the surface scatters through as this tint, "
+                         "strongest where the diffuse is unlit. Black is opaque",
 }
 
 
@@ -149,20 +492,37 @@ SOCKET_MODELS = {
     # rather than reading this socket; Toon does read it.
     'Specular Color': ('GOURAUD', 'FLAT', 'PHONG', 'BLINN_PHONG', 'BLINN',
                        'COOK_TORRANCE', 'WARD', 'ANISOTROPIC', 'MULTI_LAYER',
-                       'TOON', 'BI_COOKTORR', 'BI_PHONG', 'BI_BLINN'),
+                       'TOON', 'BI_COOKTORR', 'BI_PHONG', 'BI_BLINN',
+                       'OREN_NAYAR_BLINN',
+                       # R243: Max's own shaders (Metal and Strauss colour
+                       # their highlight from the diffuse)
+                       'MAX_PHONG', 'MAX_BLINN', 'MAX_ANISOTROPIC',
+                       'MAX_MULTI_LAYER', 'MAX_OREN_NAYAR_BLINN',
+                       'MAX_TRANSLUCENT'),
     'Specular Level': ALL,
     'Glossiness': ('GOURAUD', 'FLAT', 'PHONG', 'BLINN_PHONG', 'BLINN',
                    'ANISOTROPIC', 'METAL', 'STRAUSS', 'MULTI_LAYER',
-                   'BI_COOKTORR', 'BI_PHONG', 'BI_BLINN'),
-    'Roughness': ('COOK_TORRANCE', 'OREN_NAYAR', 'MINNAERT', 'WARD'),
+                   'BI_COOKTORR', 'BI_PHONG', 'BI_BLINN', 'OREN_NAYAR_BLINN',
+                   'MAX_PHONG', 'MAX_BLINN', 'MAX_METAL', 'MAX_ANISOTROPIC',
+                   'MAX_MULTI_LAYER', 'MAX_OREN_NAYAR_BLINN', 'MAX_STRAUSS',
+                   'MAX_TRANSLUCENT'),
+    'Roughness': ('COOK_TORRANCE', 'OREN_NAYAR', 'MINNAERT', 'WARD',
+                  'OREN_NAYAR_BLINN', 'MAX_MULTI_LAYER', 'MAX_OREN_NAYAR_BLINN'),
     'Metalness': ALL,
-    'Anisotropy': ('WARD', 'ANISOTROPIC'),
-    'Anisotropic Rotation': ('WARD', 'ANISOTROPIC'),
+    'Anisotropy': ('WARD', 'ANISOTROPIC', 'MAX_ANISOTROPIC', 'MAX_MULTI_LAYER'),
+    'Anisotropic Rotation': ('WARD', 'ANISOTROPIC', 'MAX_ANISOTROPIC',
+                             'MAX_MULTI_LAYER'),
+    'Specular Color 2': ('MAX_MULTI_LAYER',),
+    'Specular Level 2': ('MAX_MULTI_LAYER',),
+    'Glossiness 2': ('MAX_MULTI_LAYER',),
+    'Anisotropy 2': ('MAX_MULTI_LAYER',),
+    'Anisotropic Rotation 2': ('MAX_MULTI_LAYER',),
+    'Translucent Color': ('MAX_TRANSLUCENT',),
     'Soften': ALL,
     'Ambient': ALL,
     'Self-Illumination': ALL,
     'Opacity': ALL,
-    'IOR': ('BLINN', 'COOK_TORRANCE', 'BI_BLINN'),
+    'IOR': ('BLINN', 'COOK_TORRANCE', 'BI_BLINN', 'OREN_NAYAR_BLINN'),
     'Reflection': ALL,
     'Translucency': ('TRANSLUCENT',),
     'Toon Size': ('TOON',),
@@ -278,6 +638,13 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
     matcap_mode: EnumProperty(
         name="Matcap Blend", items=_MATCAP_BLENDS, default='MIX',
         description="How the matcap combines with the shaded surface")
+    faceted: BoolProperty(
+        name="Faceted", default=False,
+        description="3ds Max's Faceted: shade every face flat by its own "
+                    "face normal, whatever the model -- the un-smoothed "
+                    "look of early hardware on a mesh that keeps its "
+                    "smooth normals for everything else. Ignores the "
+                    "Normal input while on")
     wire_size: FloatProperty(
         name="Wire Size", default=1.0, min=0.05, max=16.0,
         description="Width of the drawn edge, in rendered pixels. A material "
@@ -304,6 +671,19 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
                      'Bump Strength', 'Bump Height'},
         'WARD': None, 'ANISOTROPIC': None, 'METAL': None, 'STRAUSS': None,
         'MULTI_LAYER': None,
+        # R243: Max's own shaders derive their panels from the measured
+        # table, like the models they mirror
+        'MAX_PHONG': None, 'MAX_BLINN': None, 'MAX_METAL': None,
+        'MAX_ANISOTROPIC': None, 'MAX_MULTI_LAYER': None,
+        'MAX_OREN_NAYAR_BLINN': None, 'MAX_STRAUSS': None,
+        'MAX_TRANSLUCENT': None,
+        # R242: Max's matte shader -- the rough diffuse with the Blinn
+        # highlight's dials
+        'OREN_NAYAR_BLINN': {'Diffuse Color', 'Diffuse Level', 'Roughness',
+                             'Specular Color', 'Specular Level',
+                             'Glossiness', 'Soften', 'IOR', 'Ambient',
+                             'Opacity', 'Self-Illumination', 'Normal',
+                             'Bump Strength', 'Bump Height'},
         'TOON': {'Diffuse Color', 'Diffuse Level', 'Specular Color',
                  'Specular Level', 'Toon Size', 'Toon Smooth', 'Ambient',
                  'Opacity', 'Self-Illumination', 'Normal', 'Bump Strength', 'Bump Height'},
@@ -312,6 +692,12 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
                         'Bump Strength', 'Bump Height'},
         'CONSTANT': {'Diffuse Color', 'Opacity', 'Self-Illumination'},
         'WIREFRAME': {'Diffuse Color', 'Opacity'},
+        # R228: the paint model on the master runs the Cartoon Shader
+        # at its defaults -- the base colour IS the paint; ambient,
+        # specular and the reflectance dials have no say
+        'CARTOON': {'Diffuse Color', 'Diffuse Level', 'Opacity',
+                    'Self-Illumination', 'Normal', 'Bump Strength',
+                    'Bump Height'},
     }
 
     # R202: the order is the panel. Reflection's inputs sit together
@@ -360,6 +746,14 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
         ('NodeSocketFloat', 'Sheen', 0.0),
         ('NodeSocketColor', 'Sheen Color', (1.0, 1.0, 1.0, 1.0)),
         ('NodeSocketFloat', 'Sheen Roughness', 0.3),
+        # R243: the Max Multi-Layer's second highlight and the Max
+        # Translucent's colour
+        ('NodeSocketColor', 'Specular Color 2', (0.9, 0.9, 0.9, 1.0)),
+        ('NodeSocketFloat', 'Specular Level 2', 0.0),
+        ('NodeSocketFloat', 'Glossiness 2', 25.0),
+        ('NodeSocketFloat', 'Anisotropy 2', 0.0),
+        ('NodeSocketFloat', 'Anisotropic Rotation 2', 0.0),
+        ('NodeSocketColor', 'Translucent Color', (0.0, 0.0, 0.0, 1.0)),
     )
 
     def init(self, context):
@@ -510,6 +904,8 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
             layout.prop(self, 'toon_steps')
         if self.model == 'WIREFRAME':
             layout.prop(self, 'wire_size')
+        if self.model not in ('FLAT', 'WIREFRAME', 'CONSTANT'):
+            layout.prop(self, 'faceted')
         # R202: each blend menu draws directly under its own amount
         # slider (the HALCYON_BlendValueSocket does it); a socket the
         # load migration could not swap keeps the old top-of-node menu
@@ -1588,6 +1984,686 @@ class HALCYON_OT_bi_ramp_stop(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class HALCYON_AnimeShaderNode(Node, HalcyonNodeBase):
+    """The anime/cel master shader (R218; ramp road R221).
+
+    N.L wrapped to 0..1 and cut into two or three tone bands whose
+    shadow COLOURS multiply the base -- a shadow is a colour, never a
+    darkness -- with a stepped highlight, rim, matcap and line art.
+    Link a texture into Shadow Ramp and the bands come from the RAMP
+    instead: it is baked once into a LUT the lamp loop samples by the
+    light term (shadow side, transition and lit side all painted, the
+    games' own convention; the tone sliders stand down while linked;
+    a clock-driven ramp chain bakes its first frame). Ramp Row picks
+    the row of a multi-row ramp -- and under GENSHIN, the Game
+    Texture's alpha (the material id) picks it automatically.
+    The Compatibility mode decodes the texture conventions of the 3D
+    anime pipelines: the ArcSys ILM/SSS maps (Guilty Gear Xrd lineage,
+    Dragon Ball FighterZ), the HoYo lightmaps (Genshin Impact, ZZZ),
+    and the Dragon Ball action games that descend from the ArcSys
+    look. Plug the game's own textures into Game Texture and Detail
+    Texture and the channels mean what they meant at home.
+
+    R229, the 80s additions: Hair Shine paints the angel ring -- a
+    band of the shine colour across the object at a fraction of its
+    height, its edge waving around it, light-independent, with a
+    thinner second band below on request; Airbrush lays the cel
+    painter's soft gradation against the first shadow edge (lit side,
+    shadow side or both); Shadow Smoothing bends the terminator toward
+    a sphere, shared with the Cartoon Shader; and the Line Colour menu
+    inks this material's lines in its own shaded tone (iro-trace) or a
+    colour of its own."""
+
+    bl_idname = 'HALCYON_AnimeShaderNode'
+    bl_label = "Anime Shader"
+    bl_icon = 'IPO_CONSTANT'
+    bl_width_default = 220
+
+    def _style_changed(self, context):
+        self.apply_style(self.style)
+
+    # R240: the Style menu -- the Cartoon Shader's Era idea for the
+    # anime tradition's own decades
+    style: EnumProperty(
+        name="Style", default='CUSTOM', items=ANIME_STYLE_ITEMS,
+        update=_style_changed,
+        description="Writes the tone sockets and menus below to a "
+                    "named decade's starting point -- the kage tints, "
+                    "the band edges, the hair shine, the airbrush, the "
+                    "rim, the modern pipeline's key and depth rim; "
+                    "edit them freely afterwards (the menu does not "
+                    "follow your edits, and never touches your paints, "
+                    "textures or the key's angle)")
+
+    compat: EnumProperty(
+        name="Compatibility", default='GENERIC',
+        items=(
+            ('GENERIC', "Generic Cel",
+             "No texture decode: the sockets are the controls. The "
+             "clean slate for original anime materials"),
+            ('ARCSYS', "ArcSys (Guilty Gear Xrd / Strive)",
+             "The Xrd-lineage ILM map: R specular intensity, G shadow "
+             "bias, B highlight size, A drawn line art; the Detail "
+             "Texture is the SSS map whose rgb tints the first "
+             "shadow. Channel semantics from the published shader "
+             "recreations of the GDC 2015 pipeline"),
+            ('DBFZ', "Dragon Ball FighterZ",
+             "The same ArcSys ILM decode -- FighterZ ships the Xrd "
+             "pipeline. Pair with hard softness values (0) for the "
+             "flat two-tone the game reads as"),
+            ('KAKAROT', "DBZ: Kakarot",
+             "The ArcSys-lineage decode with the CC2 game's slightly "
+             "lifted, softer tone placement. Kakarot's exact channel "
+             "dumps are not publicly documented; this mode applies "
+             "the lineage its look descends from, and says so"),
+            ('SPARKING', "DB: Sparking! Zero",
+             "The ArcSys-lineage decode tuned toward Sparking Zero's "
+             "heavier shadow line. Its exact channels are not "
+             "publicly documented; the lineage decode applies, and "
+             "this tooltip says so rather than inventing one"),
+            ('GENSHIN', "Genshin Impact",
+             "The HoYo character lightmap: R specular/metal mask "
+             "(0.9+ reads as metal), G occlusion into the shadow "
+             "decision, B inverted highlight threshold, A material "
+             "id. Per-id ramp rows do not travel to a tone node: "
+             "split materials as the game does and set the tone "
+             "colours per part. Decode taken from the PrimoToon "
+             "shader source"),
+            ('ZZZ', "Zenless Zone Zero",
+             "The ZZZ maps per the modding guides: lightmap R is the "
+             "shadow/outline configuration, G metallic, B gloss; the "
+             "Detail Texture is the material map whose B carries "
+             "specular"),
+        ),
+        description="How Game Texture and Detail Texture channels are "
+                    "decoded. Each mode's tooltip names its source")
+    tones: EnumProperty(
+        name="Tones", default='TWO',
+        items=(('TWO', "Two Tone", "Lit and one shadow band"),
+               ('THREE', "Three Tone",
+                "Lit, first shadow, and a deeper second band")),
+        description="How many bands the light is cut into")
+    use_vertex_ao: BoolProperty(
+        name="Vertex Colour AO", default=False,
+        description="ArcSys convention: painted-down vertex RED "
+                    "forces a region into shadow -- baked occlusion "
+                    "the way Xrd artists painted it (an offset on the "
+                    "shadow threshold, per the GDC talk). Works under "
+                    "every Compatibility mode, hand-painted GENERIC "
+                    "models included; white is neutral")
+    emission_alpha: BoolProperty(
+        name="Alpha Is Emission", default=False,
+        description="HoYo convention: the base texture's alpha "
+                    "channel is the emission mask")
+    rim_blend: EnumProperty(
+        name="Rim Blend", default='ADD',
+        items=(('ADD', "Add", "Added on top of the lit result"),
+               ('MIX', "Mix", "Blends toward the rim colour"),
+               ('MULTIPLY', "Multiply", "Darkens by the rim"),
+               ('SCREEN', "Screen", "Brightens without clipping")),
+        description="How the rim light lands on the shaded surface")
+    matcap_mode: EnumProperty(
+        name="Matcap Blend", default='MIX',
+        items=(('MIX', "Mix", "Blends toward the matcap"),
+               ('ADD', "Add", "Added on top"),
+               ('MULTIPLY', "Multiply", "Darkens by the matcap"),
+               ('SCREEN', "Screen", "Brightens without clipping")),
+        description="How the matcap lands -- feed a metal matcap "
+                    "here for the HoYo metal look")
+    # R229: the 80s additions' two menus
+    airbrush_side: EnumProperty(
+        name="Airbrush Side", default='LIT',
+        items=(('LIT', "Lit Side",
+                "The airbrush colour multiplies the lit tone just above "
+                "the first shadow edge, fading out toward full light"),
+               ('SHADOW', "Shadow Side",
+                "The shadow tone blends toward the airbrush colour "
+                "approaching the edge from inside the shadow"),
+               ('BOTH', "Both Sides", "Both gradations at once")),
+        description="Which side of the first shadow edge the airbrush "
+                    "gradation sits on")
+    # R238: the cel's light -- the material's key, the depth rim's
+    # mode and side, the smoothing shape
+    light_source: EnumProperty(
+        name="Shading Light", default='SCENE', items=CEL_LIGHT_ITEMS,
+        description="What lights this cel: the scene's lamps, or one "
+                    "key fixed to the camera or the world (Light "
+                    "Azimuth / Elevation), with the scene's cast "
+                    "shadows folded in")
+    rim_mode: EnumProperty(
+        name="Rim Mode", default='FRESNEL', items=CEL_RIM_MODE_ITEMS,
+        description="The Fresnel rim by view angle, or the anime depth "
+                    "rim: a band Rim Width pixels wide inside the "
+                    "silhouette, read from the frame's depth")
+    rim_side: EnumProperty(
+        name="Rim Side", default='LIT', items=CEL_RIM_SIDE_ITEMS,
+        description="Which side of the key the depth rim sits on")
+    smooth_shape: EnumProperty(
+        name="Smoothing Shape", default='SPHERE', items=CEL_SHAPE_ITEMS,
+        description="The shape Shadow Smoothing bends the normal toward")
+    # R239: the SDF face shadow's frame -- which object axes the face
+    # looks along (the map is read against the key's angle about them)
+    face_forward: EnumProperty(
+        name="Face Forward", default='NEG_Y', items=FACE_AXIS_ITEMS,
+        description="The axis the face looks along, on the object "
+                    "wearing this material (a Blender character built "
+                    "facing the front view looks along -Y). The SDF "
+                    "face shadow reads the key's angle about this "
+                    "frame; the frame follows the FIRST object wearing "
+                    "the material -- give each head its own face "
+                    "material, as the games do")
+    face_up: EnumProperty(
+        name="Face Up", default='POS_Z', items=FACE_AXIS_ITEMS,
+        description="The axis out of the top of the head, on the "
+                    "object wearing this material")
+    # R241: the hair pass -- the shine wave's shape
+    hair_shine_shape: EnumProperty(
+        name="Hair Shine Shape", default='SMOOTH',
+        items=HAIR_SHINE_SHAPE_ITEMS,
+        description="How the hair shine band's edge travels around "
+                    "the head: the classic smooth swing, the ruler-"
+                    "drawn zigzag, the shoujo scallop of little arcs, "
+                    "or the blocky digital step -- each period-"
+                    "matched, so a swap keeps the band's height and "
+                    "reach")
+    line_source: EnumProperty(
+        name="Line Colour", default='INK',
+        items=(('INK', "Ink Settings",
+                "The Cartoon Outlines panel and the material's Ink row "
+                "decide this material's line colour, as before"),
+               ('IRO', "Iro-Trace (Own Colour)",
+                "The 80s coloured trace line: this surface's own shaded "
+                "colour, darkened by Line Darken, per pixel -- hair "
+                "lines in the hair's tone, skin lines in the skin's. "
+                "Runs the line on the distance-field road"),
+               ('CUSTOM', "Line Color Socket",
+                "The Line Color socket's value, per material (a linked "
+                "chain is not read -- lines are inked per material)")),
+        description="Where this material's ink line takes its colour")
+
+    SOCKETS = (
+        ('NodeSocketColor', 'Diffuse Color', (0.8, 0.8, 0.8, 1.0)),
+        ('NodeSocketColor', 'Line Art', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketColor', 'Shadow 1 Color', (0.62, 0.44, 0.48, 1.0)),
+        ('NodeSocketFloat', 'Shadow 1 Threshold', 0.5),
+        ('NodeSocketFloat', 'Shadow 1 Softness', 0.04),
+        ('NodeSocketColor', 'Shadow 2 Color', (0.38, 0.26, 0.38, 1.0)),
+        ('NodeSocketFloat', 'Shadow 2 Threshold', 0.22),
+        ('NodeSocketFloat', 'Shadow 2 Softness', 0.04),
+        # R221: the ramp shading road. Link a texture (the game's own
+        # ramp, a ColorRamp, any chain) into Shadow Ramp and it is
+        # baked to a LUT sampled by the light term inside the lamp
+        # loop -- shadow side, transition and lit side all painted in
+        # the ramp; the tone sliders above stand down while linked.
+        # Ramp Row picks the row (v) of a multi-row ramp; under
+        # GENSHIN with a Game Texture linked and no explicit row, the
+        # texture's alpha (the material id) picks the row instead.
+        ('NodeSocketColor', 'Shadow Ramp', (0.0, 0.0, 0.0, 1.0)),
+        ('NodeSocketFloat', 'Ramp Row', 0.0),
+        ('NodeSocketFloat', 'Shadow Bias', 0.0),
+        ('NodeSocketColor', 'Game Texture', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketColor', 'Detail Texture', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketColor', 'Specular Color', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketFloat', 'Specular Level', 0.55),
+        ('NodeSocketFloat', 'Specular Size', 0.12),
+        ('NodeSocketFloat', 'Specular Sharpness', 0.05),
+        ('NodeSocketColor', 'Rim Color', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketFloat', 'Rim Amount', 0.0),
+        ('NodeSocketFloat', 'Rim Power', 2.5),
+        ('NodeSocketColor', 'Matcap', (0.0, 0.0, 0.0, 1.0)),
+        ('NodeSocketFloat', 'Matcap Blend', 0.0),
+        ('NodeSocketColor', 'Self-Illumination', (0.0, 0.0, 0.0, 1.0)),
+        ('NodeSocketFloat', 'Emission Strength', 1.0),
+        ('NodeSocketFloat', 'Light Response', 1.0),
+        ('NodeSocketFloat', 'Ambient', 0.35),
+        ('NodeSocketFloat', 'Opacity', 1.0),
+        ('NodeSocketVector', 'Normal', None),
+        ('NodeSocketFloat', 'Bump Strength', 1.0),
+        # R229: the 80s additions. Hair Shine is the "angel ring": a
+        # band of the shine colour across the object at Height (a
+        # fraction of its own height), Width wide, its edge waving
+        # around the object (Wave amplitude, Waves per turn), on the
+        # camera-facing surface; Second puts a thinner band that far
+        # below. Airbrush is the soft gradation against the first
+        # shadow edge (side by the menu). Shadow Smoothing is the
+        # inker's simplification shared with the Cartoon Shader. Line
+        # Color / Line Darken feed the Line Colour menu.
+        ('NodeSocketFloat', 'Hair Shine', 0.0),
+        ('NodeSocketColor', 'Hair Shine Color', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketFloat', 'Hair Shine Height', 0.78),
+        ('NodeSocketFloat', 'Hair Shine Width', 0.06),
+        ('NodeSocketFloat', 'Hair Shine Wave', 0.03),
+        ('NodeSocketFloat', 'Hair Shine Waves', 6.0),
+        ('NodeSocketFloat', 'Hair Shine Softness', 0.01),
+        ('NodeSocketFloat', 'Hair Shine Second', 0.0),
+        ('NodeSocketFloat', 'Airbrush', 0.0),
+        ('NodeSocketColor', 'Airbrush Color', (0.82, 0.62, 0.62, 1.0)),
+        ('NodeSocketFloat', 'Airbrush Width', 0.35),
+        ('NodeSocketFloat', 'Shadow Smoothing', 0.0),
+        ('NodeSocketColor', 'Line Color', (0.0, 0.0, 0.0, 1.0)),
+        ('NodeSocketFloat', 'Line Darken', 0.55),
+        # R238: the cel's light. Light Azimuth / Elevation place the
+        # key under Shading Light Camera or World (degrees); Screen
+        # Shadow is the depth-marched cast shadow toward the key
+        # (amount) over Screen Shadow Length pixels at 1080 lines; Rim
+        # Width is the depth rim's band (pixels at 1080 lines)
+        ('NodeSocketFloat', 'Light Azimuth', 35.0),
+        ('NodeSocketFloat', 'Light Elevation', 30.0),
+        ('NodeSocketFloat', 'Screen Shadow', 0.0),
+        ('NodeSocketFloat', 'Screen Shadow Length', 24.0),
+        ('NodeSocketFloat', 'Rim Width', 4.0),
+        # R239: the SDF face shadow. Link the face's shadow map (the
+        # game's own, or any gradient chain) and it replaces the
+        # lambert term on this material: the map's red field against
+        # the key's horizontal angle about the face's frame (Face
+        # Forward / Face Up), mirrored across the face's centre line
+        # for the other side -- the anime face's DRAWN terminator,
+        # sweeping as the light or the head turns. Unlinked, nothing
+        # changes.
+        ('NodeSocketColor', 'Face Shadow (SDF)', (0.0, 0.0, 0.0, 1.0)),
+        # R241: the hair pass -- the wave's phase around the head, the
+        # band riding the key's height, the second band's own tint
+        ('NodeSocketFloat', 'Hair Shine Angle', 0.0),
+        ('NodeSocketFloat', 'Hair Shine Follow', 0.0),
+        ('NodeSocketColor', 'Hair Shine Second Color', (1.0, 1.0, 1.0, 1.0)),
+    )
+
+    def init(self, context):
+        for kind, name, default in self.SOCKETS:
+            sock = self.inputs.new(kind, name)
+            if default is not None:
+                try:
+                    sock.default_value = default
+                except (TypeError, ValueError):
+                    pass
+        _apply_socket_tips(self, ANIME_SOCKET_DOCS)
+        self.outputs.new('NodeSocketShader', 'Surface')
+
+    def ensure_sockets(self):
+        """R229: a node saved before the 80s additions grows their
+        sockets at their neutral defaults (the evaluator reads a
+        missing socket as its neutral value too, so old files shade
+        the same before and after). R238: the cel's light sockets the
+        same way. R241: every socket gains its tooltip here too, so
+        an old file gets them the moment it opens."""
+        have = {s.name for s in self.inputs}
+        for kind, name, default in self.SOCKETS:
+            if name in have:
+                continue
+            try:
+                sock = self.inputs.new(kind, name)
+                if default is not None:
+                    sock.default_value = default
+            except (TypeError, ValueError, RuntimeError):
+                pass
+        _apply_socket_tips(self, ANIME_SOCKET_DOCS)
+
+    def apply_style(self, style):
+        """R240: write one style's starting point into the sockets and
+        the menus it names. CUSTOM (and an unknown key) writes
+        nothing. The paints, textures and the key's angle are the
+        artist's -- a style never touches them."""
+        preset = ANIME_STYLE_PRESETS.get(str(style))
+        if not preset:
+            return
+        for key, value in preset.items():
+            if key == '__props':
+                for pname, pval in value.items():
+                    try:
+                        setattr(self, pname, pval)
+                    except (TypeError, ValueError):
+                        pass
+                continue
+            sock = self.inputs.get(key) if hasattr(self.inputs, 'get') \
+                else None
+            if sock is None:
+                for cand in self.inputs:
+                    if getattr(cand, 'name', None) == key:
+                        sock = cand
+                        break
+            if sock is None:
+                continue
+            try:
+                sock.default_value = value
+            except (TypeError, ValueError):
+                pass
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'style', text="")
+        layout.prop(self, 'compat', text="")
+        row = layout.row()
+        row.prop(self, 'tones', expand=True)
+        layout.prop(self, 'use_vertex_ao')
+        layout.prop(self, 'emission_alpha')
+        layout.prop(self, 'line_source', text="")
+        layout.prop(self, 'light_source', text="")
+
+    def draw_buttons_ext(self, context, layout):
+        self.draw_buttons(context, layout)
+        layout.prop(self, 'rim_blend')
+        layout.prop(self, 'rim_mode')
+        layout.prop(self, 'rim_side')
+        layout.prop(self, 'smooth_shape')
+        layout.prop(self, 'matcap_mode')
+        layout.prop(self, 'airbrush_side')
+        # R239: the SDF face shadow's frame
+        layout.prop(self, 'face_forward')
+        layout.prop(self, 'face_up')
+        # R241: the hair pass
+        layout.prop(self, 'hair_shine_shape')
+
+
+class HALCYON_CartoonNode(Node, HalcyonNodeBase):
+    """The cartoon/paint master (R228) -- the Western cel.
+
+    The colour is PAINT, not light: flat, the same under every lamp,
+    whatever its energy. One painted shadow tone lands where the key
+    lamps do not reach -- as a transparent shadow cel over the paint
+    (the Golden Age double exposure: paint x Shadow Color), as a
+    second flat paint (UPA and the television decades), or not at all
+    (the cheapest limited animation). Shadow Threshold is where the
+    edge falls on the wrapped light term (0.5 = the terminator; higher
+    pushes the shadow onto the lit side); Softness airbrushes it;
+    Shadow Smoothing bends the shading normal toward a sphere around
+    the object so the terminator sweeps as one clean shape the way an
+    inker simplifies a form. The highlight is a painted dot, not a
+    reflection: Highlight Size opens it, Softness feathers it. Lamp
+    Influence lets the lamps' energy and colour modulate the paint,
+    from none (pure paint) to full (a lit surface).
+
+    The Era menu writes the sockets and the shadow mode to a named
+    starting point -- Golden Age, UPA, Xerox, Saturday morning, 90s
+    feature, 90s TV -- and the sockets stay yours afterwards. Anime
+    is the other tradition: use the Anime Shader for tone bands, game
+    texture decodes and ramps."""
+
+    bl_idname = 'HALCYON_CartoonNode'
+    bl_label = "Cartoon Shader"
+    bl_icon = 'IPO_CONSTANT'
+    bl_width_default = 220
+
+    def _era_changed(self, context):
+        self.apply_era(self.era)
+
+    era: EnumProperty(
+        name="Era", default='CUSTOM', items=CARTOON_ERA_ITEMS,
+        update=_era_changed,
+        description="Writes the sockets below and the shadow mode to a "
+                    "named era's starting point; edit them freely "
+                    "afterwards (the menu does not follow your edits)")
+    shadow_mode: EnumProperty(
+        name="Shadow", default='TRANSPARENT',
+        items=CARTOON_SHADOW_MODE_ITEMS,
+        description="How the one shadow tone lands on the paint")
+    rim_blend: EnumProperty(
+        name="Rim Blend", default='ADD',
+        items=(('ADD', "Add", "Added on top of the paint"),
+               ('MIX', "Mix", "Blends toward the rim colour"),
+               ('MULTIPLY', "Multiply", "Darkens by the rim"),
+               ('SCREEN', "Screen", "Brightens without clipping")),
+        description="How the rim light lands on the painted surface")
+    # R238: the cel's light, shared with the Anime Shader
+    light_source: EnumProperty(
+        name="Shading Light", default='SCENE', items=CEL_LIGHT_ITEMS,
+        description="What lights this cel: the scene's lamps, or one "
+                    "key fixed to the camera or the world (Light "
+                    "Azimuth / Elevation), with the scene's cast "
+                    "shadows folded in")
+    rim_mode: EnumProperty(
+        name="Rim Mode", default='FRESNEL', items=CEL_RIM_MODE_ITEMS,
+        description="The Fresnel rim by view angle, or the depth rim: "
+                    "a band Rim Width pixels wide inside the "
+                    "silhouette, read from the frame's depth")
+    rim_side: EnumProperty(
+        name="Rim Side", default='LIT', items=CEL_RIM_SIDE_ITEMS,
+        description="Which side of the key the depth rim sits on")
+    smooth_shape: EnumProperty(
+        name="Smoothing Shape", default='SPHERE', items=CEL_SHAPE_ITEMS,
+        description="The shape Shadow Smoothing bends the normal toward")
+    airbrush_side: EnumProperty(
+        name="Airbrush Side", default='LIT',
+        items=(('LIT', "Lit Side",
+                "The airbrush colour multiplies the lit paint just above "
+                "the shadow edge, fading out toward full light"),
+               ('SHADOW', "Shadow Side",
+                "The shadow tone blends toward the airbrush colour "
+                "approaching the edge from inside the shadow"),
+               ('BOTH', "Both Sides", "Both gradations at once")),
+        description="Which side of the shadow edge the airbrush "
+                    "gradation sits on -- the rounded rendering of the "
+                    "feature cel")
+    # R241: the highlight cel's wave shape (shared with the Anime
+    # Shader's hair pass)
+    hair_shine_shape: EnumProperty(
+        name="Hair Shine Shape", default='SMOOTH',
+        items=HAIR_SHINE_SHAPE_ITEMS,
+        description="How the hair shine band's edge travels around "
+                    "the head: the classic smooth swing, the ruler-"
+                    "drawn zigzag, the shoujo scallop of little arcs, "
+                    "or the blocky digital step -- each period-"
+                    "matched, so a swap keeps the band's height and "
+                    "reach")
+
+    SOCKETS = (
+        ('NodeSocketColor', 'Paint Color', (0.8, 0.8, 0.8, 1.0)),
+        ('NodeSocketColor', 'Shadow Color', (0.55, 0.45, 0.62, 1.0)),
+        ('NodeSocketFloat', 'Shadow Amount', 1.0),
+        ('NodeSocketFloat', 'Shadow Threshold', 0.5),
+        ('NodeSocketFloat', 'Shadow Softness', 0.02),
+        ('NodeSocketFloat', 'Shadow Smoothing', 0.0),
+        ('NodeSocketColor', 'Highlight Color', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketFloat', 'Highlight Size', 0.0),
+        ('NodeSocketFloat', 'Highlight Softness', 0.02),
+        ('NodeSocketFloat', 'Lamp Influence', 0.0),
+        ('NodeSocketColor', 'Rim Color', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketFloat', 'Rim Amount', 0.0),
+        ('NodeSocketFloat', 'Rim Power', 2.5),
+        ('NodeSocketColor', 'Self-Illumination', (0.0, 0.0, 0.0, 1.0)),
+        ('NodeSocketFloat', 'Emission Strength', 1.0),
+        ('NodeSocketFloat', 'Opacity', 1.0),
+        ('NodeSocketVector', 'Normal', None),
+        # R238: the cel's light (as on the Anime Shader) and the
+        # airbrush gradation against the paint's shadow edge
+        ('NodeSocketFloat', 'Light Azimuth', 35.0),
+        ('NodeSocketFloat', 'Light Elevation', 30.0),
+        ('NodeSocketFloat', 'Screen Shadow', 0.0),
+        ('NodeSocketFloat', 'Screen Shadow Length', 24.0),
+        ('NodeSocketFloat', 'Rim Width', 4.0),
+        ('NodeSocketFloat', 'Airbrush', 0.0),
+        ('NodeSocketColor', 'Airbrush Color', (0.82, 0.62, 0.62, 1.0)),
+        ('NodeSocketFloat', 'Airbrush Width', 0.35),
+        # R241: the highlight cel over the paint -- the Anime Shader's
+        # whole hair bag on the paint master, inert at zero
+        ('NodeSocketFloat', 'Hair Shine', 0.0),
+        ('NodeSocketColor', 'Hair Shine Color', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketFloat', 'Hair Shine Height', 0.78),
+        ('NodeSocketFloat', 'Hair Shine Width', 0.06),
+        ('NodeSocketFloat', 'Hair Shine Wave', 0.03),
+        ('NodeSocketFloat', 'Hair Shine Waves', 6.0),
+        ('NodeSocketFloat', 'Hair Shine Softness', 0.01),
+        ('NodeSocketFloat', 'Hair Shine Second', 0.0),
+        ('NodeSocketFloat', 'Hair Shine Angle', 0.0),
+        ('NodeSocketFloat', 'Hair Shine Follow', 0.0),
+        ('NodeSocketColor', 'Hair Shine Second Color', (1.0, 1.0, 1.0, 1.0)),
+    )
+
+    def init(self, context):
+        for kind, name, default in self.SOCKETS:
+            sock = self.inputs.new(kind, name)
+            if default is not None:
+                try:
+                    sock.default_value = default
+                except (TypeError, ValueError):
+                    pass
+        _apply_socket_tips(self, CARTOON_SOCKET_DOCS)
+        self.outputs.new('NodeSocketShader', 'Surface')
+
+    def ensure_sockets(self):
+        """R238: a node saved before the cel's light grows its sockets
+        at their neutral defaults (the evaluator reads a missing socket
+        as its neutral value too, so old files shade the same). R241:
+        every socket gains its tooltip here too, so an old file gets
+        them the moment it opens."""
+        have = {s.name for s in self.inputs}
+        for kind, name, default in self.SOCKETS:
+            if name in have:
+                continue
+            try:
+                sock = self.inputs.new(kind, name)
+                if default is not None:
+                    sock.default_value = default
+            except (TypeError, ValueError, RuntimeError):
+                pass
+        _apply_socket_tips(self, CARTOON_SOCKET_DOCS)
+
+    def apply_era(self, era):
+        """Write one era's starting point into the sockets and the
+        shadow mode. CUSTOM (and an unknown key) writes nothing."""
+        preset = CARTOON_ERA_PRESETS.get(str(era))
+        if not preset:
+            return
+        for key, value in preset.items():
+            if key == 'shadow_mode':
+                try:
+                    self.shadow_mode = value
+                except (TypeError, ValueError):
+                    pass
+                continue
+            sock = self.inputs.get(key) if hasattr(self.inputs, 'get') \
+                else None
+            if sock is None:
+                for cand in self.inputs:
+                    if getattr(cand, 'name', None) == key:
+                        sock = cand
+                        break
+            if sock is None:
+                continue
+            try:
+                sock.default_value = value
+            except (TypeError, ValueError):
+                pass
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'era', text="")
+        layout.prop(self, 'shadow_mode', text="")
+        layout.prop(self, 'light_source', text="")
+
+    def draw_buttons_ext(self, context, layout):
+        self.draw_buttons(context, layout)
+        layout.prop(self, 'rim_blend')
+        layout.prop(self, 'rim_mode')
+        layout.prop(self, 'rim_side')
+        layout.prop(self, 'smooth_shape')
+        layout.prop(self, 'airbrush_side')
+        # R241: the hair pass
+        layout.prop(self, 'hair_shine_shape')
+
+
+class HALCYON_VolumeNode(Node, HalcyonNodeBase):
+    """The volume master (R222) -- real marched volumes, cel dials on.
+
+    Link its Volume output to the Material Output's Volume socket and
+    the mesh becomes a VOLUME CONTAINER: every camera ray marches the
+    container's bounding box (the era's volume gizmos were boxes and
+    spheres), accumulating absorption and single scatter from the
+    scene's own lamps -- falloffs, gobos, light linking and per-lamp
+    shadows all included. Whatever chain feeds Density is evaluated at
+    every march sample with Generated coordinates spanning the box, so
+    a Bozo or Cells chain shapes clouds exactly as POV-Ray's media and
+    3D Studio's Volume Fog did.
+
+    The stylized half: Edge Threshold/Softness cut HARD anime cloud
+    edges out of a soft density field; Bands posterizes the scattered
+    light into cel steps; Shadow Tint applies the anime rule to
+    volumes -- a shadowed region takes a COLOUR, never just darkness.
+    All neutral at their defaults.
+
+    R225: Model picks the scattering law (eight of them, from
+    Henyey-Greenstein through POV-Ray's media types to 3D Studio's
+    unlit Volume Fog and Combustion), Shape decides what the ray
+    marches (the mesh itself by default; box, sphere and cylinder
+    gizmos on request) and Voxels reads the chains on an N^3 lattice
+    for the blocky voxel look.
+
+    Density takes any chain: a 3D pattern (Bozo, Cells, Blender's
+    Noise or Voronoi) shapes the fog in three dimensions; a 2D image
+    extrudes along the box's Z (Flat), averages its three axis
+    projections into a solid (Box), or projects from the camera
+    through the fog when driven by Texture Coordinate > Window -- a
+    drawn cloud, lit and shadowed as a volume (R226)."""
+
+    bl_idname = 'HALCYON_VolumeNode'
+    bl_label = "Halcyon Volume"
+    bl_icon = 'MOD_FLUIDSIM'
+    bl_width_default = 200
+
+    model: EnumProperty(
+        name="Model", default='HG', items=VOLUME_MODEL_ITEMS,
+        description="The scattering law the lamps light this volume "
+                    "by -- or, for the two 3D Studio atmospherics, the "
+                    "self-lit rule that replaces the lamps. Every lit "
+                    "law is normalised to the same total energy, so "
+                    "switching changes the shape of the glow, not its "
+                    "brightness")
+    shape: EnumProperty(
+        name="Shape", default='MESH', items=VOLUME_SHAPE_ITEMS,
+        description="What a camera ray marches: the container's own "
+                    "faces, or a box, sphere or cylinder gizmo fitted "
+                    "to its bound")
+    voxels: IntProperty(
+        name="Voxels", default=0, min=0, max=512,
+        description="0: the density and colour chains are read at each "
+                    "march sample. N: read at the centres of an N x N x "
+                    "N lattice over the bound instead -- the blocky "
+                    "voxel volume of the era's grid volumetrics (a smoke "
+                    "grid snaps to the same lattice). Set Volume Steps "
+                    "above 2N so the march resolves the cells")
+
+    SOCKETS = (
+        ('NodeSocketFloat', 'Density', 1.0),
+        ('NodeSocketColor', 'Color', (0.8, 0.8, 0.8, 1.0)),
+        ('NodeSocketFloat', 'Absorption', 0.0),
+        ('NodeSocketFloat', 'Anisotropy', 0.0),
+        ('NodeSocketColor', 'Emission Color', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketFloat', 'Emission Strength', 0.0),
+        ('NodeSocketFloat', 'Edge Threshold', 0.0),
+        ('NodeSocketFloat', 'Edge Softness', 0.25),
+        ('NodeSocketFloat', 'Bands', 0.0),
+        ('NodeSocketColor', 'Shadow Tint', (0.35, 0.3, 0.5, 1.0)),
+        ('NodeSocketFloat', 'Tint Amount', 0.0),
+    )
+
+    def init(self, context):
+        for kind, name, default in self.SOCKETS:
+            sock = self.inputs.new(kind, name)
+            if default is not None:
+                try:
+                    sock.default_value = default
+                except (TypeError, ValueError):
+                    pass
+        _apply_socket_tips(self, VOLUME_SOCKET_DOCS)
+        self.outputs.new('NodeSocketShader', 'Volume')
+
+    def ensure_sockets(self):
+        """R241: the tooltips land on an old file's node at load (the
+        socket set itself has not changed since the node shipped)."""
+        _apply_socket_tips(self, VOLUME_SOCKET_DOCS)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'model', text="")
+        row = layout.row(align=True)
+        row.prop(self, 'shape', text="")
+        row.prop(self, 'voxels')
+        note = layout.column(align=True)
+        note.scale_y = 0.8
+        if self.model == 'COMBUSTION':
+            note.label(text="Fire: Color = outer, Emission Color = inner")
+            note.label(text="Absorption = how much the flames hide")
+        elif self.model == 'FOG':
+            note.label(text="Unlit: Color composited by Density")
+        note.label(text="Link to Material Output > Volume")
+
+
 class HALCYON_BIMaterialNode(Node, HalcyonNodeBase):
     """Blender Internal's material panel as one node.
 
@@ -2583,8 +3659,338 @@ class HALCYON_WaveNode(Node, HalcyonNodeBase):
         layout.prop(self, 'wave', text="")
 
 
+# --------------------------------------- the R216 families, spec-generated
+#
+# Fifteen utilities and fifteen vector nodes, from one spec table each --
+# the same generation the pattern nodes use, so a socket cannot drift
+# from its evaluator. All are pure functions of their inputs and the
+# frame clock except Light Meter, which reads the LAMPS at shading time
+# (and says so on the GPU, by name).
+
+_GF = 'NodeSocketFloat'
+_GC = 'NodeSocketColor'
+_GV = 'NodeSocketVector'
+
+#: name, label, icon, doc, inputs (kind, name, default), props, outputs
+UTIL_SPECS = [
+    ('LightMeter', "Light Meter", 'LIGHT_SUN',
+     "How much lamp light lands on this point: Color is the summed "
+     "lamp light (Lambert), Fac its brightness clamped 0..1. Invert "
+     "Fac to drive Self-Illumination and a material GLOWS IN THE DARK "
+     "-- charge-by-light, the era's phosphor trick. Reads the lamps at "
+     "shading time; Shadows adds one occlusion ray per lamp",
+     [(_GF, 'Exposure', 1.0)],
+     {'shadows': ('bool', False, "Shadows")},
+     [(_GC, 'Color'), (_GF, 'Fac')]),
+    ('Timer', "Timer", 'TIME',
+     "The scene clock as sockets: Frame, Seconds, and Loop -- the "
+     "frame wrapped 0..1 over Loop Frames, ready for any cyclic "
+     "animation",
+     [(_GF, 'Loop Frames', 48.0)], {},
+     [(_GF, 'Frame'), (_GF, 'Seconds'), (_GF, 'Loop')]),
+    ('Oscillator', "Oscillator", 'IPO_SINE',
+     "A waveform on the clock: sine, square, triangle or saw between "
+     "Min and Max. Pulsing glows, blinking beacons, breathing scale",
+     [(_GF, 'Speed', 1.0), (_GF, 'Phase', 0.0), (_GF, 'Min', 0.0),
+      (_GF, 'Max', 1.0)],
+     {'wave': ('enum', 'SINE',
+               (('SINE', "Sine", ""), ('SQUARE', "Square", ""),
+                ('TRIANGLE', "Triangle", ""), ('SAW', "Saw", "")),
+               "Wave")},
+     [(_GF, 'Value')]),
+    ('Counter', "Counter", 'LINENUMBERS_ON',
+     "An integer that steps up every N frames and wraps at Modulo -- "
+     "the flipbook and palette driver",
+     [(_GF, 'Frames Per Step', 4.0), (_GF, 'Modulo', 8.0),
+      (_GF, 'Offset', 0.0)], {},
+     [(_GF, 'Value')]),
+    ('Pulse', "Pulse", 'PMARKER_ACT',
+     "1 for Width frames out of every Period frames, else 0 -- strobe "
+     "lights, camera flashes, warning beacons",
+     [(_GF, 'Period', 24.0), (_GF, 'Width', 4.0), (_GF, 'Phase', 0.0)],
+     {},
+     [(_GF, 'Fac')]),
+    ('Gate', "Gate", 'CHECKBOX_HLT',
+     "A threshold with an optional soft edge: 0 below, 1 above, "
+     "smooth across Softness. The building block of masks",
+     [(_GF, 'Value', 0.5), (_GF, 'Threshold', 0.5),
+      (_GF, 'Softness', 0.0)],
+     {'invert': ('bool', False, "Invert")},
+     [(_GF, 'Fac')]),
+    ('Selector', "Selector", 'PRESET',
+     "Index picks one of four colours -- palette animation's other "
+     "half, fed from a Counter",
+     [(_GF, 'Index', 0.0),
+      (_GC, 'Color 1', (0.9, 0.2, 0.2, 1.0)),
+      (_GC, 'Color 2', (0.9, 0.8, 0.2, 1.0)),
+      (_GC, 'Color 3', (0.2, 0.8, 0.3, 1.0)),
+      (_GC, 'Color 4', (0.2, 0.4, 0.9, 1.0))],
+     {'wrap': ('bool', True, "Wrap")},
+     [(_GC, 'Color')]),
+    ('ColorKey', "Color Key", 'EYEDROPPER',
+     "Chroma key: Fac is 1 where Color sits within Tolerance of the "
+     "Key, softened over Softness. Multiply a decal's alpha by Matte "
+     "to knock its backing colour out",
+     [(_GC, 'Color', (0.8, 0.8, 0.8, 1.0)),
+      (_GC, 'Key', (0.0, 1.0, 0.0, 1.0)),
+      (_GF, 'Tolerance', 0.15), (_GF, 'Softness', 0.1)], {},
+     [(_GF, 'Fac'), (_GF, 'Matte')]),
+    ('Measure', "Measure", 'DRIVER_DISTANCE',
+     "A distance as a factor: from the object origin, a point, the "
+     "camera, or along an axis, divided by Scale. Gradients that "
+     "follow space instead of UVs",
+     [(_GV, 'Point', None), (_GF, 'Scale', 1.0)],
+     {'mode': ('enum', 'ORIGIN',
+               (('ORIGIN', "From Object Origin", ""),
+                ('POINT', "From Point", ""),
+                ('CAMERA', "From Camera", ""),
+                ('AXIS_X', "Along X", ""), ('AXIS_Y', "Along Y", ""),
+                ('AXIS_Z', "Along Z", "")), "Measure")},
+     [(_GF, 'Fac')]),
+    ('StepRamp', "Step Ramp", 'SEQ_HISTOGRAM',
+     "The ramp quantised to N flat bands -- toon shading's colour "
+     "side, no stops to edit. Band is the integer band index",
+     [(_GF, 'Fac', 0.5), (_GF, 'Steps', 4.0),
+      (_GC, 'Color 1', (0.05, 0.05, 0.08, 1.0)),
+      (_GC, 'Color 2', (0.95, 0.92, 0.85, 1.0))], {},
+     [(_GC, 'Color'), (_GF, 'Band')]),
+    ('Wobble', "Wobble", 'FORCE_TURBULENCE',
+     "A value with smooth animated jitter on it: the idle hover, the "
+     "nervous needle, the unsteady candle. Integer-hash noise, so both "
+     "devices wobble identically",
+     [(_GF, 'Value', 0.0), (_GF, 'Amount', 0.1), (_GF, 'Speed', 1.0)],
+     {'seed': ('int', 0, 0, 9999, "Seed")},
+     [(_GF, 'Value')]),
+    ('FrameBlend', "Frame Blend", 'PREVIEW_RANGE',
+     "Crossfade from A to B between two frames -- reveals, day-to-"
+     "night sweeps, damage states",
+     [(_GC, 'A', (0.8, 0.8, 0.8, 1.0)), (_GC, 'B', (0.1, 0.1, 0.1, 1.0)),
+      (_GF, 'Start Frame', 1.0), (_GF, 'End Frame', 24.0)], {},
+     [(_GC, 'Color'), (_GF, 'Fac')]),
+    ('Blackbody', "Blackbody", 'LIGHT',
+     "Temperature to colour, 1000K to 12000K: candle orange through "
+     "daylight to sky blue -- lava, filaments, star fields",
+     [(_GF, 'Kelvin', 3000.0)], {},
+     [(_GC, 'Color')]),
+    ('Compare', "Compare", 'ARROW_LEFTRIGHT',
+     "A against B: three 0/1 sockets for equal (within Epsilon), "
+     "greater and less. Logic without nests of Math nodes",
+     [(_GF, 'A', 0.0), (_GF, 'B', 0.0), (_GF, 'Epsilon', 0.0001)], {},
+     [(_GF, 'Equal'), (_GF, 'Greater'), (_GF, 'Less')]),
+    ('OnFrame', "On Frame", 'MARKER_HLT',
+     "1 while the frame sits inside Start..End, else 0 -- shot "
+     "switches and timed reveals",
+     [(_GF, 'Start Frame', 1.0), (_GF, 'End Frame', 24.0)], {},
+     [(_GF, 'Fac')]),
+]
+
+VEC_SPECS = [
+    ('ArrayVec', "Array", 'MOD_ARRAY',
+     "Decal placement: copies of a local frame arranged on a line, "
+     "grid, circle, square, polygon or star. Feed the Vector into an "
+     "Image Texture (CLIP extension) and the image lands once per "
+     "copy; Index and Random tell the copies apart. Orient turns "
+     "copies to follow the shape",
+     [(_GV, 'Vector', None), (_GV, 'Center', None),
+      (_GF, 'Size', 0.18), (_GF, 'Spacing', 0.25),
+      (_GF, 'Radius', 0.35), (_GF, 'Rotation', 0.0),
+      (_GF, 'Jitter', 0.0), (_GF, 'Inner', 0.5)],
+     {'mode': ('enum', 'CIRCLE',
+               (('LINE', "Line", "Count copies along a line"),
+                ('GRID', "Grid", "Count x Rows copies"),
+                ('CIRCLE', "Circle", "Count copies on a ring"),
+                ('SQUARE', "Square", "Count copies round a square"),
+                ('POLYGON', "Polygon", "A copy at each of Sides "
+                 "corners"),
+                ('STAR', "Star", "Sides points, Inner sets the "
+                 "notch")), "Arrange"),
+      'count': ('int', 8, 1, 64, "Count"),
+      'sides': ('int', 5, 2, 24, "Sides / Rows"),
+      'orient': ('bool', True, "Orient To Shape")},
+     [(_GV, 'Vector'), (_GF, 'Index'), (_GF, 'Random')]),
+    ('MirrorTile', "Mirror Tile", 'MOD_MIRROR',
+     "Mirror-repeat tiling: every second tile flips, so any image "
+     "becomes seamless -- the era's bathroom-floor trick",
+     [(_GV, 'Vector', None), (_GF, 'Scale', 2.0)],
+     {'axis_x': ('bool', True, "Mirror X"),
+      'axis_y': ('bool', True, "Mirror Y")},
+     [(_GV, 'Vector')]),
+    ('Kaleidoscope', "Kaleidoscope", 'SEQ_CHROMA_SCOPE',
+     "The angle folded into N mirrored sectors about the centre -- "
+     "mandalas from anything",
+     [(_GV, 'Vector', None), (_GV, 'Center', None),
+      (_GF, 'Sectors', 6.0), (_GF, 'Angle', 0.0)], {},
+     [(_GV, 'Vector')]),
+    ('Polar', "Polar Coordinates", 'CURVE_NCIRCLE',
+     "Rectangular to polar and back: Vector out carries (angle 0..1, "
+     "radius, z), with Radius and Angle as their own sockets -- ring "
+     "gradients, radar sweeps, clock faces",
+     [(_GV, 'Vector', None), (_GV, 'Center', None)],
+     {'direction': ('enum', 'TO_POLAR',
+                    (('TO_POLAR', "To Polar", ""),
+                     ('FROM_POLAR', "From Polar", "")), "Direction")},
+     [(_GV, 'Vector'), (_GF, 'Radius'), (_GF, 'Angle')]),
+    ('Twirl', "Twirl", 'FORCE_VORTEX',
+     "A rotation that falls off with distance from the centre -- the "
+     "classic 90s image-editor twirl, in UV space",
+     [(_GV, 'Vector', None), (_GV, 'Center', None),
+      (_GF, 'Angle', 3.14159), (_GF, 'Radius', 0.5)], {},
+     [(_GV, 'Vector')]),
+    ('Lens', "Lens Distort", 'PROP_PROJECTED',
+     "Barrel (positive) or pincushion (negative) distortion about the "
+     "centre -- the CRT bulge, the fisheye lens",
+     [(_GV, 'Vector', None), (_GV, 'Center', None),
+      (_GF, 'Amount', 0.2)], {},
+     [(_GV, 'Vector')]),
+    ('RippleWarp', "Ripple Warp", 'MOD_WAVE',
+     "Concentric sine displacement from the centre, animated -- the "
+     "stone in the pond, warping whatever samples through it",
+     [(_GV, 'Vector', None), (_GV, 'Center', None),
+      (_GF, 'Amplitude', 0.02), (_GF, 'Frequency', 10.0),
+      (_GF, 'Speed', 1.0)],
+     {'animate': ('bool', True, "Animate")},
+     [(_GV, 'Vector')]),
+    ('WaveWarp', "Wave Warp", 'MOD_NOISE',
+     "A directional sine offset, animated -- flags, heat shimmer, "
+     "seaweed sway",
+     [(_GV, 'Vector', None), (_GF, 'Amplitude', 0.03),
+      (_GF, 'Wavelength', 0.25), (_GF, 'Speed', 1.0)],
+     {'axis': ('enum', 'X', (('X', "Along X", ""), ('Y', "Along Y", "")),
+               "Axis"),
+      'animate': ('bool', True, "Animate")},
+     [(_GV, 'Vector')]),
+    ('TileRandom', "Tile Random", 'MESH_GRID',
+     "Tiles whose contents each get a hashed 90-degree turn and flip "
+     "-- one floor texture stops repeating. Tile ID drives per-tile "
+     "variation downstream",
+     [(_GV, 'Vector', None), (_GF, 'Scale', 4.0)],
+     {'rotate': ('bool', True, "Random Turn"),
+      'flip': ('bool', True, "Random Flip")},
+     [(_GV, 'Vector'), (_GF, 'Tile ID')]),
+    ('VectorSnap', "Vector Snap", 'SNAP_GRID',
+     "The vector quantised to a grid step -- chunky UVs, mosaic "
+     "sampling, deliberate pixelation in texture space",
+     [(_GV, 'Vector', None), (_GF, 'Step', 0.1)],
+     {'mode': ('enum', 'FLOOR', (('FLOOR', "Floor", ""),
+                                 ('ROUND', "Round", "")), "Snap")},
+     [(_GV, 'Vector')]),
+    ('Shear', "Shear", 'MOD_SIMPLEDEFORM',
+     "X pushed by Y and Y pushed by X -- italic decals, raked "
+     "checkerboards",
+     [(_GV, 'Vector', None), (_GF, 'X By Y', 0.0),
+      (_GF, 'Y By X', 0.0)], {},
+     [(_GV, 'Vector')]),
+    ('Orbit', "Orbit", 'ORIENTATION_GIMBAL',
+     "The vector translated round a small circle over time -- drifting "
+     "highlights, floating dust decals, restless goo",
+     [(_GV, 'Vector', None), (_GF, 'Radius', 0.05),
+      (_GF, 'Speed', 1.0), (_GF, 'Phase', 0.0)],
+     {'animate': ('bool', True, "Animate")},
+     [(_GV, 'Vector')]),
+    ('Region', "Region", 'SELECT_SET',
+     "A box in texture space with a chosen outside: clip, wrap, "
+     "mirror or extend -- and Inside as a mask. Place ONE decal: clip "
+     "outside, multiply your alpha by Inside",
+     [(_GV, 'Vector', None), (_GV, 'Min', None), (_GV, 'Max', None)],
+     {'outside': ('enum', 'CLIP',
+                  (('CLIP', "Clip", ""), ('WRAP', "Wrap", ""),
+                   ('MIRROR', "Mirror", ""), ('EXTEND', "Extend", "")),
+                  "Outside")},
+     [(_GV, 'Vector'), (_GF, 'Inside')]),
+    ('Projector', "Projector", 'MOD_UVPROJECT',
+     "Planar, cylindrical, spherical or box projection of the input "
+     "vector -- the era's mapping modes as a node, for any coordinate "
+     "you feed it",
+     [(_GV, 'Vector', None), (_GF, 'Scale', 1.0)],
+     {'mode': ('enum', 'PLANAR',
+               (('PLANAR', "Planar", ""), ('CYLINDER', "Cylindrical", ""),
+                ('SPHERE', "Spherical", ""), ('BOX', "Box", "")),
+               "Projection"),
+      'axis': ('enum', 'Z', (('X', "X", ""), ('Y', "Y", ""),
+                             ('Z', "Z", "")), "Axis")},
+     [(_GV, 'Vector')]),
+    ('Spin', "Spin", 'FILE_REFRESH',
+     "A steady rotation about the centre, animated -- fans, wheels, "
+     "record decals, hypno-spirals",
+     [(_GV, 'Vector', None), (_GV, 'Center', None),
+      (_GF, 'Speed', 1.0), (_GF, 'Angle', 0.0)],
+     {'animate': ('bool', True, "Animate")},
+     [(_GV, 'Vector')]),
+]
+
+
+def _gen_family(specs):
+    made = []
+    for name, label, icon, doc, ins, props, outs in specs:
+        ann = {}
+        for key, spec in props.items():
+            if spec[0] == 'int':
+                _k, default, lo, hi, plabel = spec
+                ann[key] = IntProperty(name=plabel, default=default,
+                                       min=lo, max=hi)
+            elif spec[0] == 'bool':
+                _k, default, plabel = spec
+                ann[key] = BoolProperty(name=plabel, default=default)
+            else:
+                _k, default, items, plabel = spec
+                ann[key] = EnumProperty(name=plabel, items=list(items),
+                                       default=default)
+
+        # Blender's RNA validation counts EVERY named parameter --
+        # init must be exactly (self, context) and draw_buttons exactly
+        # (self, context, layout). The default-argument capture idiom
+        # (init(self, context, _ins=ins)) registers fine in a stub and
+        # refuses to register in Blender ("expected ... 2 args, found
+        # 4", the field's paste). Real closures keep the signature.
+        def _make_init(ins_, outs_):
+            def init(self, context):
+                for kind, sock_name, default in ins_:
+                    sock = self.inputs.new(kind, sock_name)
+                    if default is not None:
+                        try:
+                            sock.default_value = default
+                        except (TypeError, ValueError):
+                            pass
+                for kind, out_name in outs_:
+                    self.outputs.new(kind, out_name)
+            return init
+
+        def _make_draw(props_):
+            def draw_buttons(self, context, layout):
+                for key in props_:
+                    layout.prop(self, key, text="")
+            return draw_buttons
+
+        init = _make_init(ins, outs)
+        draw_buttons = _make_draw(props)
+
+        cls = type(f'HALCYON_{name}Node', (Node, HalcyonNodeBase), {
+            '__doc__': doc,
+            'bl_idname': f'HALCYON_{name}Node',
+            'bl_label': label,
+            'bl_icon': icon,
+            'bl_width_default': 160,
+            '__annotations__': ann,
+            'init': init,
+            'draw_buttons': draw_buttons,
+        })
+        made.append(cls)
+    return tuple(made)
+
+
+UTIL_NODES = _gen_family(UTIL_SPECS)
+VEC_NODES = _gen_family(VEC_SPECS)
+
+#: what the exporter copies for the generated families
+FAMILY_NODE_PROPS = {f'HALCYON_{s[0]}Node': tuple(s[5].keys())
+                     for s in UTIL_SPECS + VEC_SPECS}
+
+
 NODES = (HALCYON_RampNode, HALCYON_BlurNode,
-         HALCYON_ShaderNode, HALCYON_BIMaterialNode,
+         HALCYON_ShaderNode, HALCYON_AnimeShaderNode,
+         HALCYON_CartoonNode,
+         HALCYON_VolumeNode,
+         HALCYON_BIMaterialNode,
          HALCYON_BIInfluenceNode, HALCYON_BIRGBBlendNode,
          HALCYON_CodeNode, HALCYON_PosterizeNode,
          HALCYON_DitherNode, HALCYON_DepthCueNode, HALCYON_ScreenInfoNode,
@@ -2597,7 +4003,8 @@ NODES = (HALCYON_RampNode, HALCYON_BlurNode,
          HALCYON_IridescentNode, HALCYON_SwitchNode,
          HALCYON_RandomPerObjectNode, HALCYON_LevelsNode,
          HALCYON_SmoothStepNode, HALCYON_ChannelShuffleNode,
-         HALCYON_DistanceMaskNode, HALCYON_StepTimeNode, HALCYON_WaveNode)
+         HALCYON_DistanceMaskNode, HALCYON_StepTimeNode,
+         HALCYON_WaveNode) + UTIL_NODES + VEC_NODES
 #: HalcyonBIRampStop is a PropertyGroup, not a node: it registers here,
 #: BEFORE the node whose CollectionProperty points at it, and stays out
 #: of the Add menu (which lists NODES only)
@@ -2617,17 +4024,446 @@ def draw_add_menu(self, context):
     if context.engine != ENGINE:
         return
     layout = self.layout
-    layout.separator()
+    # R242: the Halcyon menu is PREPENDED to the Add menu -- first entry,
+    # not last -- so the separator follows it
     layout.menu('NODE_MT_halcyon_add', icon='SHADING_RENDERED')
+    layout.separator()
+
+
+# ---- R216: the Halcyon menu, by family. Every NODES member belongs to
+# exactly one family below; a census test holds the union to NODES, so a
+# new node cannot silently fall out of the menu.
+# =============================================================== R241 tips
+# Every property of every node carries a real tooltip. Most are set at
+# their declarations; the table below back-fills the ones declared
+# before the rule (mutating a property's keywords before registration
+# is the documented road -- the annotation is a deferred declaration
+# until register_class reads it). ITEM_TIPS does the same for enum
+# items the declarations left empty.
+PROP_TIPS = {
+    ('HALCYON_ShaderNode', 'model'):
+        "The reflectance model this material shades with -- each "
+        "implemented from its published formulation. The menu's own "
+        "entries describe every model; the sockets grey out to what "
+        "the chosen model actually reads",
+    ('HALCYON_ShaderNode', 'toon_steps'):
+        "How many flat bands the Toon model quantizes its light into "
+        "(2 is the classic cel two-tone; more approaches a smooth "
+        "ramp in steps)",
+    ('HALCYON_AnimeShaderNode', 'tones'):
+        "How many shadow bands the cel cuts into: Two (lit plus one "
+        "kage -- the TV standard) or Three (a second, deeper kage "
+        "inside the first -- the OVA and feature dressing)",
+    ('HALCYON_BIMaterialNode', 'diff_shader'):
+        "Blender Internal's diffuse shader menu, verbatim: Lambert, "
+        "Oren-Nayar, Toon, Minnaert or Fresnel, each transcribed from "
+        "2.79's own code so appended materials match",
+    ('HALCYON_BIMaterialNode', 'spec_shader'):
+        "Blender Internal's specular shader menu, verbatim: CookTorr, "
+        "Phong, Blinn, Toon or WardIso, transcribed from 2.79",
+    ('HALCYON_BIMaterialNode', 'ramp_dif_input'):
+        "What drives the diffuse colour ramp, as BI had it: the "
+        "shader's own result, its energy, the normal, or the light "
+        "term",
+    ('HALCYON_BIMaterialNode', 'ramp_dif_blend'):
+        "How the diffuse ramp's colour lands on the base -- BI's full "
+        "blend-mode list, transcribed",
+    ('HALCYON_BIMaterialNode', 'dif_stops'):
+        "The diffuse colorband's stops (position, colour, alpha), "
+        "edited through the ramp rows drawn in the panel",
+    ('HALCYON_BIMaterialNode', 'spec_stops'):
+        "The specular colorband's stops (position, colour, alpha), "
+        "edited through the ramp rows drawn in the panel",
+    ('HALCYON_CodeNode', 'source'):
+        "The Text datablock holding the shader source -- edit it in "
+        "the Text Editor and the node recompiles on every edit",
+    ('HALCYON_BIMaterialNode', 'ramp_dif_factor'):
+        "How strongly the diffuse ramp's colour takes over its input "
+        "(BI's Factor slider, 0 off to 1 full)",
+    ('HALCYON_BIMaterialNode', 'ramp_dif_ipo'):
+        "The diffuse ramp's interpolation between stops: linear, "
+        "ease, B-spline, cardinal or constant -- BI's own menu",
+    ('HALCYON_BIMaterialNode', 'dif_ramp_tex'):
+        "Bookkeeping for the gradient widget backing the diffuse "
+        "ramp; the stops themselves serialize -- not a look control",
+    ('HALCYON_BIMaterialNode', 'ramp_spec_input'):
+        "What drives the specular colour ramp, as BI had it",
+    ('HALCYON_BIMaterialNode', 'ramp_spec_blend'):
+        "How the specular ramp's colour lands on the highlight -- "
+        "BI's blend-mode list, transcribed",
+    ('HALCYON_BIMaterialNode', 'ramp_spec_factor'):
+        "How strongly the specular ramp's colour takes over its "
+        "input (BI's Factor slider, 0 off to 1 full)",
+    ('HALCYON_BIMaterialNode', 'ramp_spec_ipo'):
+        "The specular ramp's interpolation between stops -- BI's own "
+        "menu",
+    ('HALCYON_BIMaterialNode', 'spec_ramp_tex'):
+        "Bookkeeping for the gradient widget backing the specular "
+        "ramp; the stops themselves serialize -- not a look control",
+    ('HALCYON_BIMaterialNode', 'shadow_receive'):
+        "Whether other objects' cast shadows land on this material "
+        "(BI's Receive toggle); its own casting is the Cast toggle "
+        "on the material panel",
+    ('HALCYON_BIMaterialNode', 'sss_front'):
+        "BI's subsurface Front weight: how much of the scatter "
+        "gathered in FRONT of the surface reaches the image (Back is "
+        "its through-the-surface partner)",
+    ('HALCYON_BIInfluenceNode', 'blend'):
+        "How this texture channel lands on what it influences -- "
+        "BI's texture blend menu (Mix, Multiply, Add, ...), "
+        "transcribed from 2.79",
+    ('HALCYON_BIRGBBlendNode', 'blend'):
+        "The blend mode this node applies between its two colours -- "
+        "BI's texture blend list, so appended trees keep their look",
+    ('HALCYON_BIRGBBlendNode', 'alphamix'):
+        "Uses the incoming alpha as the blend factor, the way BI's "
+        "texture stack did when a texture carried its own alpha",
+    ('HALCYON_CodeNode', 'language'):
+        "Which shading language the source pane holds: the GLSL "
+        "subset or the HLSL one. Both compile to the same portable "
+        "program and render identically on CPU and GPU",
+    ('HALCYON_CodeNode', 'needs_rebuild'):
+        "Set while the source is newer than the compiled program -- "
+        "compile bookkeeping the Build button clears, not a look "
+        "control",
+    ('HALCYON_CodeNode', 'source_text'):
+        "The name of the Text datablock holding this shader's "
+        "source, when it is edited in the Text Editor instead of the "
+        "node's own pane",
+    ('HALCYON_CodeNode', 'error'):
+        "The compiler's last error for this node, shown in the "
+        "editor -- diagnostics only, cleared by a clean build",
+    ('HALCYON_CodeNode', 'warn'):
+        "The compiler's last warning for this node -- diagnostics "
+        "only; the program still runs",
+    ('HALCYON_CodeNode', 'auto_compile'):
+        "Rebuilds the program automatically whenever the source "
+        "changes; off waits for the Build button (steadier while "
+        "typing long shaders)",
+    ('HALCYON_DitherNode', 'pattern'):
+        "The ordered-dither matrix: Bayer 2x2 (coarsest, boldest "
+        "crosshatch), 4x4 (the VGA-era standard), 8x8 (finest), or a "
+        "45-degree clustered halftone dot",
+    ('HALCYON_DepthCueNode', 'mode'):
+        "The fog's falloff curve between Start and End: linear, "
+        "exponential, exponential squared, or a 16-step hardware "
+        "fog table -- the classic depth-cue voices",
+    ('HALCYON_ScrollNode', 'animate'):
+        "Scrolls with the scene clock (UV units per second) instead "
+        "of holding the Scroll X / Scroll Y offsets still",
+    ('HALCYON_PaletteNode', 'palette'):
+        "The classic hardware palette to snap colours into: EGA 16, "
+        "the VGA 256 default, Game Boy greens, CGA modes, "
+        "greyscale, or a custom count",
+    ('HALCYON_ColorCycleNode', 'animate'):
+        "Cycles the palette with the scene clock -- the demoscene "
+        "waterfall trick -- instead of holding the Phase still",
+    ('HALCYON_FlipbookNode', 'animate'):
+        "Steps through the sprite sheet's frames with the scene "
+        "clock at the given rate; off shows the Frame input's cell",
+    ('HALCYON_UVWaveNode', 'animate'):
+        "Runs the wave's phase with the scene clock, so the warp "
+        "rolls on its own; off holds the Phase input's moment",
+    ('HALCYON_NormalMapNode', 'space'):
+        "Which space the map's vectors live in: Tangent (the "
+        "ordinary baked map, needs UVs), Object, or World",
+    ('HALCYON_NormalMapNode', 'map_type'):
+        "The map's convention: OpenGL (green up, Blender's own) or "
+        "DirectX (green down -- flip for maps baked elsewhere)",
+    ('HALCYON_NormalMixNode', 'mode'):
+        "How the two normal maps combine: a simple lerp, a whiteout "
+        "blend (keeps both sets of detail), or reoriented (the "
+        "detail map ridden on the base's frame -- the correct one)",
+    ('HALCYON_SmoothStepNode', 'interp'):
+        "The step's easing: hard threshold, smoothstep, or the "
+        "flatter smootherstep",
+    ('HALCYON_ChannelShuffleNode', 'out_r'):
+        "Which input channel lands in the output's RED -- rewire "
+        "packed textures without a chain of separates",
+    ('HALCYON_ChannelShuffleNode', 'out_g'):
+        "Which input channel lands in the output's GREEN",
+    ('HALCYON_ChannelShuffleNode', 'out_b'):
+        "Which input channel lands in the output's BLUE",
+    ('HALCYON_ChannelShuffleNode', 'out_a'):
+        "Which input channel lands in the output's ALPHA",
+    ('HALCYON_WaveNode', 'wave'):
+        "The wave's profile: sine, triangle, square or sawtooth -- "
+        "the classic procedural stripes' four voices",
+    ('HALCYON_LightMeterNode', 'shadows'):
+        "Whether the meter reads the lamps' cast shadows into its "
+        "value, or the raw unshadowed light term",
+    ('HALCYON_OscillatorNode', 'wave'):
+        "The oscillator's profile over time: sine, triangle, square "
+        "or sawtooth -- drive anything that should pulse or blink",
+    ('HALCYON_GateNode', 'invert'):
+        "Flips the gate: passes when the control is BELOW the "
+        "threshold instead of above it",
+    ('HALCYON_SelectorNode', 'wrap'):
+        "Wraps the index around the input count instead of clamping "
+        "at the ends -- a counter cycles through the inputs forever",
+    ('HALCYON_MeasureNode', 'mode'):
+        "Which distance the node measures: from the object's "
+        "origin, from the Point input, from the camera, or the "
+        "coordinate along one world axis",
+    ('HALCYON_WobbleNode', 'seed'):
+        "Picks a different random wobble path; the same seed always "
+        "replays the same wander",
+    ('HALCYON_ArrayVecNode', 'mode'):
+        "How the copies are laid out: a line, a grid, a ring, or a "
+        "regular polygon's corners",
+    ('HALCYON_ArrayVecNode', 'count'):
+        "How many copies the layout places along its line, grid row, "
+        "ring or polygon",
+    ('HALCYON_ArrayVecNode', 'sides'):
+        "The polygon layout's corner count (3 a triangle, 6 a "
+        "hexagon ring)",
+    ('HALCYON_ArrayVecNode', 'orient'):
+        "Turns each copy to face along the layout (around the ring, "
+        "along the line) instead of keeping them all upright",
+    ('HALCYON_MirrorTileNode', 'axis_x'):
+        "Mirrors every second tile horizontally, so patterns meet "
+        "their reflections seamlessly across tile edges",
+    ('HALCYON_MirrorTileNode', 'axis_y'):
+        "Mirrors every second tile vertically, so patterns meet "
+        "their reflections seamlessly across tile edges",
+    ('HALCYON_PolarNode', 'direction'):
+        "Which way the node converts: rectangular coordinates to "
+        "polar (rings and sweeps), or polar back to rectangular",
+    ('HALCYON_RippleWarpNode', 'animate'):
+        "Rolls the ripples outward with the scene clock; off holds "
+        "the Phase input's instant",
+    ('HALCYON_WaveWarpNode', 'axis'):
+        "Which direction the warp displaces: along X (shearing the "
+        "rows sideways) or along Y (shearing the columns)",
+    ('HALCYON_WaveWarpNode', 'animate'):
+        "Runs the warp's phase with the scene clock; off holds the "
+        "Phase input's moment",
+    ('HALCYON_TileRandomNode', 'rotate'):
+        "Gives each tile a random quarter-turn, hiding the repeat in "
+        "tiled textures",
+    ('HALCYON_TileRandomNode', 'flip'):
+        "Gives each tile a random mirror flip, hiding the repeat in "
+        "tiled textures",
+    ('HALCYON_VectorSnapNode', 'mode'):
+        "Snap down to the cell's corner (floor) or to the nearest "
+        "grid point (round) -- pixel-grid versus centred quantizing",
+    ('HALCYON_OrbitNode', 'animate'):
+        "Circles the point with the scene clock at the given speed; "
+        "off holds the Angle input's position",
+    ('HALCYON_RegionNode', 'outside'):
+        "What happens beyond the box: clip it away (Inside goes "
+        "0), wrap around, mirror back, or extend the edge",
+    ('HALCYON_ProjectorNode', 'mode'):
+        "The projection that makes the coordinates: flat planar, "
+        "cylinder, sphere, or box (the three planes picked by the "
+        "normal)",
+    ('HALCYON_ProjectorNode', 'axis'):
+        "The projection's axis: which way the plane faces, the "
+        "cylinder stands, or the box's dominant plane is chosen",
+    ('HALCYON_SpinNode', 'animate'):
+        "Spins with the scene clock at the given rate; off holds the "
+        "Angle input's turn",
+}
+
+ITEM_TIPS = {
+    ('HALCYON_AnimeShaderNode', 'rim_blend'): {
+        'ADD': "Added on top of the banded result -- the light "
+               "wrapping past the silhouette"},
+    ('HALCYON_AnimeShaderNode', 'matcap_mode'): {
+        'MIX': "Blends the capture toward the surface by the Matcap "
+               "Blend amount"},
+    ('HALCYON_CartoonNode', 'rim_blend'): {
+        'ADD': "Added on top of the paint -- the light wrapping past "
+               "the silhouette"},
+    ('HALCYON_DitherNode', 'pattern'): {
+        'BAYER2': "The 2x2 ordered matrix: four levels, the boldest "
+                  "crosshatch texture",
+        'BAYER4': "The 4x4 ordered matrix: sixteen levels, the "
+                  "VGA-era standard look",
+        'BAYER8': "The 8x8 ordered matrix: the finest ordered grain",
+        'HALFTONE': "A clustered dot at the classic 45 degrees -- "
+                    "the newspaper's screen rather than a matrix"},
+    ('HALCYON_DepthCueNode', 'mode'): {
+        'LINEAR': "Fog thickens evenly from Start to End -- the "
+                  "SGI-era hardware default",
+        'EXP': "Exponential falloff: fast at first, easing with "
+               "distance -- natural atmospheric haze",
+        'EXP2': "Exponential squared: clear near the camera, then "
+                "closing in hard -- the heaviest classic curve",
+        'TABLE16': "The blend quantised to 16 hardware fog bands "
+                   "-- visible stepping, as console fog tables did"},
+    ('HALCYON_PaletteNode', 'palette'): {
+        'CUSTOM': "Quantize each channel into the given number of "
+                  "levels instead of a named palette",
+        'GREY4': "Four greys -- the original Game Boy class of "
+                 "display, without the green cast"},
+    ('HALCYON_SmoothStepNode', 'interp'): {
+        'HARD': "A hard threshold at the edge -- no blend at all"},
+    ('HALCYON_ChannelShuffleNode', 'out_r'): {
+        'R': "Take the input's red channel", 'G': "Take the input's "
+        "green channel", 'B': "Take the input's blue channel",
+        'A': "Take the input's alpha channel", 'ONE': "A constant "
+        "1.0 in this channel", 'ZERO': "A constant 0.0 in this "
+        "channel"},
+    ('HALCYON_WaveNode', 'wave'): {
+        'SAW': "The sawtooth: a linear ramp that snaps back -- "
+               "conveyor stripes and scan ramps"},
+    ('HALCYON_OscillatorNode', 'wave'): {
+        'SINE': "The smooth sine pulse -- breathing glows",
+        'TRIANGLE': "A linear rise and fall -- even ramps both ways",
+        'SQUARE': "On-off switching at the rate -- blinkers and "
+                  "beacons",
+        'SAW': "A linear ramp that snaps back each cycle -- "
+               "counters and sweeps"},
+    ('HALCYON_MeasureNode', 'mode'): {
+        'ORIGIN': "Distance from the object's origin, over Scale "
+                  "-- radial gradients growing from the pivot",
+        'POINT': "Distance from the Point input, over Scale -- "
+                 "blast rings and glow falloffs placed anywhere",
+        'CAMERA': "Distance from the camera, over Scale -- fades "
+                  "and cue masks that follow the view",
+        'AXIS_X': "The world X coordinate over Scale -- a flat "
+                  "gradient along X",
+        'AXIS_Y': "The world Y coordinate over Scale -- a flat "
+                  "gradient along Y",
+        'AXIS_Z': "The world height over Scale -- altitude bands "
+                  "and waterlines"},
+    ('HALCYON_ArrayVecNode', 'mode'): {
+        'LINE': "Copies along a straight line at even steps"},
+    ('HALCYON_PolarNode', 'direction'): {
+        'TO_POLAR': "UV becomes (angle around the centre, distance "
+                    "from it) -- rings, sweeps, radar",
+        'FROM_POLAR': "(angle, distance) becomes UV again -- "
+                      "unwrap a ring back to a strip"},
+    ('HALCYON_WaveWarpNode', 'axis'): {
+        'X': "Displace along X, shearing the rows sideways",
+        'Y': "Displace along Y, shearing the columns up and down"},
+    ('HALCYON_VectorSnapNode', 'mode'): {
+        'FLOOR': "Snap down to the cell's corner -- the pixel-grid "
+                 "convention",
+        'ROUND': "Round to the nearest step -- cells centre on the "
+                 "grid lines rather than between them"},
+    ('HALCYON_RegionNode', 'outside'): {
+        'CLIP': "Outside the box the Inside mask reads 0 -- "
+                "multiply your alpha by it to place a decal once",
+        'WRAP': "Repeat the region endlessly beyond its edges",
+        'MIRROR': "Reflect the region back and forth seamlessly",
+        'EXTEND': "Hold the edge value beyond the box -- the "
+                  "border pixels stretch outward"},
+    ('HALCYON_ProjectorNode', 'mode'): {
+        'PLANAR': "Project flat from one direction -- decals and "
+                  "screens",
+        'CYLINDER': "Wrap around the axis -- cans, columns, tree "
+                    "trunks",
+        'SPHERE': "Wrap around a sphere -- planets and domes",
+        'BOX': "Three planar projections picked by the surface "
+               "normal -- quick clean mapping without UVs"},
+    ('HALCYON_ProjectorNode', 'axis'): {
+        'X': "The projection faces / stands along X",
+        'Y': "The projection faces / stands along Y",
+        'Z': "The projection faces / stands along Z"},
+}
+
+# The shuffle's four channels share one item set; so do their docs.
+for _ch in ('out_g', 'out_b', 'out_a'):
+    ITEM_TIPS[('HALCYON_ChannelShuffleNode', _ch)] = \
+        ITEM_TIPS[('HALCYON_ChannelShuffleNode', 'out_r')]
+del _ch
+
+
+def _apply_prop_tips():
+    """R241: back-fill the tables above into the deferred property
+    declarations, before registration reads them. A property whose
+    declaration already carries a real description (40 characters or
+    more) keeps its own words; empty or stub descriptions take the
+    table's. Enum items with thin docs take ITEM_TIPS' by
+    identifier."""
+    for cls in NODES:
+        idn = getattr(cls, 'bl_idname', '')
+        for pname, prop in getattr(cls, '__annotations__', {}).items():
+            kw = getattr(prop, 'keywords', None)
+            if not isinstance(kw, dict):
+                kw = getattr(prop, 'kw', None)
+            if not isinstance(kw, dict):
+                continue
+            tip = PROP_TIPS.get((idn, pname))
+            if tip and len(str(kw.get('description') or '')) < 40:
+                kw['description'] = tip
+            fills = ITEM_TIPS.get((idn, pname))
+            items = kw.get('items')
+            if fills and items and not callable(items):
+                kw['items'] = tuple(
+                    (i[0], i[1],
+                     (i[2] if len(i) > 2 and len(str(i[2])) >= 20
+                      else fills.get(i[0], str(i[2]) if len(i) > 2
+                                     else '')))
+                    for i in items)
+
+
+_apply_prop_tips()
+
+
+MENU_FAMILIES = (
+    ('Shading', 'MATERIAL',
+     (HALCYON_ShaderNode, HALCYON_AnimeShaderNode, HALCYON_CartoonNode,
+      HALCYON_VolumeNode,
+      HALCYON_RampNode,
+      HALCYON_CodeNode, HALCYON_FacingNode, HALCYON_IridescentNode)),
+    ('Blender Internal', 'NODE_MATERIAL',
+     (HALCYON_BIMaterialNode, HALCYON_BIInfluenceNode,
+      HALCYON_BIRGBBlendNode,
+      # R242: the BI texture lives with the BI shading nodes
+      ('HALCYON_BITextureNode', "BI Texture", 'TEXTURE'))),
+    ('Utilities', 'TOOL_SETTINGS',
+     (HALCYON_SwitchNode, HALCYON_RandomPerObjectNode,
+      HALCYON_LevelsNode, HALCYON_SmoothStepNode,
+      HALCYON_ChannelShuffleNode, HALCYON_DistanceMaskNode,
+      HALCYON_StepTimeNode, HALCYON_WaveNode, HALCYON_ThresholdNode,
+      HALCYON_FlipbookNode, HALCYON_AltitudeSlopeNode,
+      HALCYON_BlurNode) + UTIL_NODES),
+    ('Vector', 'ORIENTATION_NORMAL',
+     (HALCYON_NormalMapNode, HALCYON_NormalMixNode,
+      HALCYON_UVWaveNode, HALCYON_ScrollNode) + VEC_NODES
+     # R242: the matcap coordinates are a vector, not a texture
+     + (('HALCYON_MatcapUVNode', "Matcap Coordinates", 'MATSPHERE'),)),
+    ('Retro Screen', 'RENDER_STILL',
+     (HALCYON_PosterizeNode, HALCYON_DitherNode, HALCYON_DepthCueNode,
+      HALCYON_ScreenInfoNode, HALCYON_PixelateNode,
+      HALCYON_ScanlinesNode, HALCYON_PaletteNode,
+      HALCYON_ColorCycleNode, HALCYON_HalftoneNode,
+      HALCYON_QuantizeNode)),
+)
+
+
+#: R242: a family may list a node another module owns, by
+#: (bl_idname, label, icon) -- the census test resolves each reference
+CROSS_FAMILY = {'HALCYON_MatcapUVNode': 'Vector',
+                'HALCYON_BITextureNode': 'Blender Internal'}
+
+
+def _family_menu(title, members):
+    def draw(self, context):
+        layout = self.layout
+        for cls in members:
+            if isinstance(cls, tuple):
+                idname, label, icon = cls
+            else:
+                idname, label = cls.bl_idname, cls.bl_label
+                icon = getattr(cls, 'bl_icon', 'NONE')
+            op = layout.operator('node.add_node', text=label, icon=icon)
+            op.type = idname
+            op.use_transform = True
+    ident = 'NODE_MT_halcyon_' + title.lower().replace(' ', '_')
+    return type(ident, (bpy.types.Menu,), {
+        'bl_idname': ident, 'bl_label': title, 'draw': draw})
+
+
+MENU_SUBMENUS = tuple(_family_menu(t, m) for t, _i, m in MENU_FAMILIES)
 
 
 class NODE_MT_halcyon_add(bpy.types.Menu):
     bl_idname = 'NODE_MT_halcyon_add'
     bl_label = "Halcyon"
-
-    #: nodes that OPEN a group get a separator drawn above them
-    GROUP_STARTS = ('HALCYON_PosterizeNode', 'HALCYON_PixelateNode',
-                    'HALCYON_NormalMapNode', 'HALCYON_AltitudeSlopeNode')
 
     def draw(self, context):
         layout = self.layout
@@ -2638,13 +4474,13 @@ class NODE_MT_halcyon_add(bpy.types.Menu):
             layout.separator()
         except Exception:                                       # noqa: BLE001
             pass
-        for cls in NODES:
-            if cls.bl_idname in self.GROUP_STARTS:
-                layout.separator()
-            op = layout.operator('node.add_node', text=cls.bl_label,
-                                 icon=getattr(cls, 'bl_icon', 'NONE'))
-            op.type = cls.bl_idname
-            op.use_transform = True
+        for (title, icon, _members), sub in zip(MENU_FAMILIES,
+                                                MENU_SUBMENUS):
+            layout.menu(sub.bl_idname, icon=icon)
+        layout.separator()
+        # R242: the 3DS Max shelf -- its materials, textures, utilities
+        # and vectors under one entry
+        layout.menu('NODE_MT_halcyon_max', icon='MESH_CUBE')
         layout.separator()
         layout.menu('NODE_MT_halcyon_textures', icon='TEXTURE')
 
@@ -2671,7 +4507,12 @@ def _migrate_master_sockets(_arg=None):
             for node in getattr(tree, 'nodes', []):
                 idn = getattr(node, 'bl_idname', '')
                 if idn in ('HALCYON_ShaderNode', 'HALCYON_BIMaterialNode',
-                           'HALCYON_AltitudeSlopeNode'):
+                           # R229: the anime master grew sockets
+                           'HALCYON_AnimeShaderNode',
+                           'HALCYON_AltitudeSlopeNode') or (
+                        # R235: the media nodes grew Indication / Blend
+                        idn.startswith('HALCYON_')
+                        and callable(getattr(node, 'ensure_sockets', None))):
                     try:
                         node.ensure_sockets()
                     except Exception:                           # noqa: BLE001
@@ -2693,6 +4534,8 @@ def register():
     global _menu_owner
     from . import pattern_nodes
     pattern_nodes.register()
+    from . import max_nodes
+    max_nodes.register()
     for sock_cls in (NodeSocket,):
         if not hasattr(sock_cls, 'halcyon_uniform'):
             sock_cls.halcyon_uniform = StringProperty(default='')
@@ -2701,6 +4544,8 @@ def register():
             sock_cls.halcyon_is_image = BoolProperty(default=False)
     for cls in OPERATORS + NODES:
         bpy.utils.register_class(cls)
+    for _sub in MENU_SUBMENUS:
+        bpy.utils.register_class(_sub)
     bpy.utils.register_class(NODE_MT_halcyon_add)
     from .. import compat
     _menu_owner = compat.register_node_menu(draw_add_menu)
@@ -2720,11 +4565,14 @@ def unregister():
             hs.remove(_migrate_master_sockets)
     except Exception:                                           # noqa: BLE001
         pass
+    from . import max_nodes
+    max_nodes.unregister()
     from . import pattern_nodes
     pattern_nodes.unregister()
     from .. import compat
     compat.unregister_node_menu(draw_add_menu, _menu_owner)
-    for cls in (NODE_MT_halcyon_add,) + tuple(reversed(NODES + OPERATORS)):
+    for cls in (NODE_MT_halcyon_add,) + tuple(MENU_SUBMENUS) \
+            + tuple(reversed(NODES + OPERATORS)):
         try:
             bpy.utils.unregister_class(cls)
         except Exception:                                       # noqa: BLE001

@@ -88,6 +88,17 @@ def splat(x, k):
     return np.repeat(a[:, None], k, axis=1)
 
 
+def _f32_only(out):
+    """A float vector is float32, whatever its components were: a Python
+    literal component (vec3(h, 0.0, 0.0)) used to promote the whole
+    vector to float64, and everything downstream of it ran at a
+    precision no GPU has -- R243 caught it when a Max noise twin drifted
+    by 1e-3 from a zero-weighted velocity term."""
+    if out.dtype.kind == 'f' and out.dtype != F32:
+        return out.astype(F32)
+    return out
+
+
 def vec(k, *parts):
     """GLSL vector constructor: flattens components, splats a lone scalar."""
     cols = []
@@ -101,15 +112,15 @@ def vec(k, *parts):
         n = max(n, a.shape[0])
         cols.append(a)
     if len(cols) == 1 and cols[0].shape[1] == 1:
-        return np.repeat(bc(cols[0], n), k, axis=1).astype(cols[0].dtype)
+        return _f32_only(np.repeat(bc(cols[0], n), k, axis=1).astype(cols[0].dtype))
     if len(cols) == 1 and cols[0].shape[1] >= k:
-        return cols[0][:, :k]
+        return _f32_only(cols[0][:, :k])
     cols = [bc(c, n) for c in cols]
     out = np.concatenate(cols, axis=1)
     if out.shape[1] < k:                       # pad like GLSL never does, but be kind
         out = np.concatenate([out, np.zeros((out.shape[0], k - out.shape[1]),
                                             out.dtype)], axis=1)
-    return out[:, :k]
+    return _f32_only(out[:, :k])
 
 
 def mat(c, r, *parts):

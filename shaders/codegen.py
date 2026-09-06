@@ -689,6 +689,13 @@ class Generator:
         fdef = self.funcs[name]
         params = fdef[3]
         ret_t = fdef[1]
+        # R235: a driver refuses a call with the wrong number of
+        # arguments; this front-end used to zero-fill the missing ones,
+        # a forgiveness that let a stale twin call compile here and fail
+        # on the hardware (the compiler's-forgiveness lesson)
+        if len(args) != len(params):
+            raise ShaderError(f'{name}() takes {len(params)} arguments, '
+                              f'got {len(args)}')
         codes = []
         outs = []
         for i, (qual, ptype, pname, parr) in enumerate(params):

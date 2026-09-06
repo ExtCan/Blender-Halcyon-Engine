@@ -102,6 +102,24 @@ float hal_pt_vnoise2(vec2 p)
     return x0 + (x1 - x0) * f.y;
 }
 
+// patterns.value_noise2s: value_noise2 on the z = salt plane (R232, the
+// 2D media): the salt rides the third lattice constant
+float hal_pt_vnoise2s(vec2 p, int salt)
+{
+    vec2 fl = floor(p);
+    vec2 f = p - fl;
+    f = f * f * (3.0 - 2.0 * f);
+    uint b = uint(int(fl.x)) * 374761393u + uint(int(fl.y)) * 668265263u
+             + uint(salt) * 1274126177u;
+    float c00 = hal_pt_mix16(b);
+    float c10 = hal_pt_mix16(b + 374761393u);
+    float c01 = hal_pt_mix16(b + 668265263u);
+    float c11 = hal_pt_mix16(b + 374761393u + 668265263u);
+    float x0 = c00 + (c10 - c00) * f.x;
+    float x1 = c01 + (c11 - c01) * f.x;
+    return x0 + (x1 - x0) * f.y;
+}
+
 // patterns.value_noise4: quadrilinear value noise on a 4D lattice --
 // the seamless-loop axis pair lives in (z, w)
 float hal_pt_vn4_plane(uint b, vec2 f)
@@ -440,12 +458,65 @@ float hal_pat_agate(vec3 p, float turb, int octaves, float bands,
     return pow(clamp(v, 0.0, 1.0), max(sharpness, 0.01));
 }
 """,
-    # patterns.leopard: three interfering sines squared
+    # patterns.leopard: jittered rosette cells -- dark broken rings with a
+    # warm interior and the odd solid spot; returns (ring, interior)
     'leopard': """
-float hal_pat_leopard(vec3 p, float spot)
+vec2 hal_pat_leopard(vec3 p, float spot, float jitter, float breakup)
 {
-    float s = (sin(p.x) + sin(p.y) + sin(p.z)) / 3.0;
-    return pow(clamp(s * s, 0.0, 1.0), max(spot, 0.01));
+    float size = clamp(spot, 0.05, 1.6);
+    float jit = clamp(jitter, 0.0, 1.0);
+    float brk = clamp(breakup, 0.0, 1.0);
+    float wx = hal_pt_vnoise(p * 2.3) - 0.5;
+    float wy = hal_pt_vnoise(p * 2.3 + vec3(37.0)) - 0.5;
+    float x = p.x + wx * 0.30;
+    float y = p.y + wy * 0.30;
+    float cx0 = floor(x);
+    float cy0 = floor(y);
+    float ring = 0.0;
+    float inner = 0.0;
+    float skip = 0.10 + 0.45 * brk;
+    for (int dx = -1; dx <= 1; dx++) {
+        for (int dy = -1; dy <= 1; dy++) {
+            float cxf = cx0 + float(dx);
+            float cyf = cy0 + float(dy);
+            int cx = int(cxf);
+            int cy = int(cyf);
+            float jx = hal_pt_hash3(cx, cy, 0);
+            float jy = hal_pt_hash3(cx, cy, 31);
+            float sz = hal_pt_hash3(cx, cy, 71);
+            float rot = hal_pt_hash3(cx, cy, 137);
+            float so = hal_pt_hash3(cx, cy, 197);
+            float ox = cxf + 0.5 + (jx - 0.5) * (0.8 * jit);
+            float oy = cyf + 0.5 + (jy - 0.5) * (0.8 * jit);
+            float r0 = min(size * (0.30 + 0.13 * sz), 0.58);
+            float ddx = x - ox;
+            float ddy = y - oy;
+            float d = sqrt(ddx * ddx + ddy * ddy);
+            float theta = atan(ddy, ddx + 1e-12);
+            float is_solid = 1.0 - step(0.22, so);
+            float blobs = 0.0;
+            for (int k = 0; k < 5; k++) {
+                float hk = hal_pt_hash3(cx, cy, 211 + 13 * k);
+                float h2 = hal_pt_hash3(cx, cy, 311 + 13 * k);
+                float keep = step(skip, hk);
+                float ang = 6.2831853 * (float(k) / 5.0)
+                            + rot * 6.2831853 + (hk - 0.5) * 0.5;
+                float dr = (d - r0) / (r0 * 0.30);
+                float sarc = (mod(theta - ang + 3.14159265, 6.2831853)
+                              - 3.14159265) / (0.55 + 0.35 * h2);
+                float e = sqrt(dr * dr + sarc * sarc);
+                float blob = (1.0 - smoothstep(0.72, 1.0, e)) * keep;
+                blobs = max(blobs, blob);
+            }
+            float disc = 1.0 - smoothstep(r0 * 0.34, r0 * 0.42, d);
+            float cell_ring = blobs + (disc - blobs) * is_solid;
+            float cell_int = (1.0 - smoothstep(r0 * 0.68, r0 * 0.84, d))
+                             * (1.0 - is_solid);
+            ring = max(ring, cell_ring);
+            inner = max(inner, cell_int);
+        }
+    }
+    return vec2(ring, inner);
 }
 """,
     # patterns.onion: concentric spherical shells
@@ -592,6 +663,38 @@ float hal_pat_static(vec3 p, float frame)
     return hal_pt_hash3(int(c.x), int(c.y), int(c.z) + int(frame) * 7919);
 }
 """,
+    # patterns.fur_tufts: round tapering cross-sections; (height, tuft id)
+    'furtufts': """
+vec2 hal_pat_fur_tufts(vec3 p, float coverage, float taper, float variation)
+{
+    float cx0 = floor(p.x);
+    float cy0 = floor(p.y);
+    float best = 0.0;
+    float rnd = 0.0;
+    float var = clamp(variation, 0.0, 1.0);
+    float tap = max(taper, 1e-3);
+    for (int dx = -1; dx <= 1; dx++) {
+        for (int dy = -1; dy <= 1; dy++) {
+            float cxf = cx0 + float(dx);
+            float cyf = cy0 + float(dy);
+            int cx = int(cxf);
+            int cy = int(cyf);
+            float jx = hal_pt_hash3(cx, cy, 0);
+            float jy = hal_pt_hash3(cx, cy, 31);
+            float hv = hal_pt_hash3(cx, cy, 71);
+            float id = hal_pt_hash3(cx, cy, 137);
+            float ddx = (p.x - (cxf + 0.5 + (jx - 0.5) * 0.75)) / 0.62;
+            float ddy = (p.y - (cyf + 0.5 + (jy - 0.5) * 0.75)) / 0.62;
+            float q = max(1.0 - (ddx * ddx + ddy * ddy), 0.0);
+            float prof = (tap == 1.0) ? q : pow(q, tap);
+            float h = (id < coverage)
+                      ? (1.0 - var + var * hv) * prof : 0.0;
+            if (h > best) { best = h; rnd = id; }
+        }
+    }
+    return vec2(best, rnd);
+}
+""",
     # patterns.brick: running bond; (bevel ramp, brick id, inside)
     'brick': """
 vec3 hal_pat_brick(vec3 p, float width, float height, float mortar,
@@ -620,6 +723,412 @@ vec3 hal_pat_brick(vec3 p, float width, float height, float mortar,
 
 #: which patterns need the worley primitive (the others skip its loops)
 NEEDS_WORLEY = frozenset({'dents', 'crackle'})
+
+
+# --------------------------------------------------------- the 2D media (R232)
+#
+# core/media.py moved, not reinvented: hatching, scribble, stipple, charcoal,
+# brush strokes, wash and paper, each the same operation order as its NumPy
+# original. The per-node salt and the hash channel share the lattice's z
+# axis in blocks of 64 (media.SALT_STRIDE); the baked rotations arrive as
+# vec2 (cos, sin) literals from the emitter, exactly the float32 pairs the
+# CPU multiplied with.
+
+MEDIA_GLSL = {
+    'md_prims': """
+// media._n2 / media._h: value noise and a cell hash on the (salt, channel)
+// plane
+float hal_md_n2(vec2 p, int salt, int k)
+{
+    return hal_pt_vnoise2s(p, salt * 64 + k);
+}
+
+float hal_md_h(int ix, int iy, int salt, int k)
+{
+    return hal_pt_hash3(ix, iy, salt * 64 + k);
+}
+
+// media.view_coords: the eye-to-point direction unfolded octahedrally,
+// L1-normalised (abs, add, divide: no sqrt), lower hemisphere folded
+// into the corners -- the View space of the media
+vec2 hal_md_view(vec3 d)
+{
+    float ax = abs(d.x);
+    float ay = abs(d.y);
+    float az = abs(d.z);
+    float s = max(ax + ay + az, 1e-12);
+    float u = d.x / s;
+    float v = d.y / s;
+    float au = abs(u);
+    float av = abs(v);
+    float fu = (1.0 - av) * sign(u);
+    float fv = (1.0 - au) * sign(v);
+    bool lower = d.z < 0.0;
+    return vec2(lower ? fu : u, lower ? fv : v);
+}
+
+// media.tangent_2d (R235): the stroke direction of a FORM (mode 0, N x V,
+// silhouette-parallel) or SLOPE (mode 1, V on the tangent plane) hatch,
+// unit length or zero, in the matcap frame on the camera's paper (screen)
+// or as world x, y
+vec2 hal_md_tangent(vec3 n, vec3 v, int mode, int screen)
+{
+    vec3 t3 = (mode == 0) ? cross(n, v) : (v - n * dot(n, v));
+    float tl = sqrt(dot(t3, t3));
+    bool ok = tl > 1e-6;
+    t3 = ok ? t3 / tl : vec3(0.0, 0.0, 0.0);
+    if (screen == 1) {
+        vec3 r0 = cross(vec3(0.0, 0.0, 1.0), v);
+        float rl = dot(r0, r0);
+        bool deg = rl < 1e-8;
+        vec3 right = deg ? vec3(1.0, 0.0, 0.0) : r0 / sqrt(rl);
+        vec3 upv = cross(v, right);
+        return vec2(dot(t3, right), dot(t3, upv));
+    }
+    return vec2(t3.x, t3.y);
+}
+
+// media.direction_bins: the angle folded onto 180 degrees in units of 15,
+// [0, 12); a zero direction reads bin 0
+float hal_md_bins(float tx, float ty)
+{
+    float th = atan(ty, tx);
+    float b = th * 3.8197186;
+    b = b - floor(b / 12.0) * 12.0;
+    b = min(max(b, 0.0), 11.999);
+    return ((tx * tx + ty * ty) < 1e-8) ? 0.0 : b;
+}
+
+// media.salt_for: seed folded with the boil key, 16 bits. frame // boil
+// is taken as floor((frame + 0.5) / boil): the half keeps the quotient at
+// least 0.5/boil clear of every whole number, so a driver's 2.5-ulp float
+// division (the GLSL spec's allowance) cannot land a key frame on the
+// wrong side, and no integer division is asked of any front-end
+int hal_md_salt(int seed, float frame, int boil)
+{
+    int key = (boil > 0)
+              ? int(floor((float(max(int(frame), 0)) + 0.5) / float(boil)))
+              : 0;
+    return (seed * 7919 + key * 104729) & 0xffff;
+}
+""",
+    # media.hatching: L layers of lanes, per-lane hashes, tonal fill
+    'md_hatching': """
+float hal_md_hatching(vec2 p, float d, int L, vec2 r0, vec2 r1, vec2 r2,
+                      vec2 r3, float width, float length, float wobble,
+                      float breaks, int salt)
+{
+    float remain = 1.0;
+    float wid = clamp(width, 0.0, 1.0);
+    float ln = max(length, 1e-3);
+    float wob_amt = wobble * 0.6;
+    float brk = breaks * 0.6;
+    float fill = clamp((d - 0.8) / 0.2, 0.0, 1.0);
+    for (int k = 0; k < L; k++) {
+        vec2 r = (k == 0) ? r0 : ((k == 1) ? r1 : ((k == 2) ? r2 : r3));
+        float c = r.x;
+        float s = r.y;
+        float u = p.x * c + p.y * s;
+        float v = -p.x * s + p.y * c;
+        float lane = floor(v);
+        int li = int(lane);
+        float h0 = hal_md_h(li, 0, salt, k * 4 + 0);
+        float h1 = hal_md_h(li, 0, salt, k * 4 + 1);
+        float h2 = hal_md_h(li, 0, salt, k * 4 + 2);
+        float off = h0 * 512.0;
+        float wob = (hal_md_n2(vec2(u * 0.35 + off, 0.5), salt, k) - 0.5)
+                    * wob_amt;
+        float a = (v - lane) - 0.5 + wob;
+        float wk = clamp((d - float(k) / float(L)) * float(L), 0.0, 1.0);
+        float hw = 0.5 * (wid * (0.35 + 0.65 * wk) * (0.8 + 0.4 * h1)
+                          + (1.0 - wid) * fill);
+        float t = u / ln + h2;
+        float tl = t - floor(t);
+        float ends = clamp(min(tl, 1.0 - tl) / 0.12, 0.0, 1.0);
+        ends = ends + (1.0 - ends) * fill;
+        float press = 0.75 + 0.25 * hal_md_n2(vec2(u * 1.7 + off, 2.5),
+                                              salt, k);
+        float gap = smoothstep(brk - 0.06, brk + 0.06,
+                               hal_md_n2(vec2(u * 1.1 + off, 4.5), salt, k));
+        gap = gap + (1.0 - gap) * fill;
+        float line = clamp((hw * ends - abs(a)) / 0.08 + 0.5, 0.0, 1.0)
+                     * press * gap * smoothstep(0.0, 0.15, wk);
+        remain = remain * (1.0 - line);
+    }
+    return 1.0 - remain;
+}
+""",
+    # media.scribble: warped lanes, graphite on the tooth
+    'md_scribble': """
+float hal_md_scribble(vec2 p, float d, int L, vec2 r0, vec2 r1, vec2 r2,
+                      vec2 r3, float width, float curl, float pressure,
+                      float grain, int salt, float blend)
+{
+    float bl = clamp(blend, 0.0, 1.0);
+    float amp = curl * 2.5;
+    float xw = p.x + ((hal_md_n2(vec2(p.x * 0.4, p.y * 0.4), salt, 40) - 0.5)
+                      + (hal_md_n2(vec2(p.x * 0.9, p.y * 0.9), salt, 43)
+                         - 0.5) * 0.4) * amp;
+    float yw = p.y + ((hal_md_n2(vec2(p.x * 0.4, p.y * 0.4), salt, 41) - 0.5)
+                      + (hal_md_n2(vec2(p.x * 0.9, p.y * 0.9), salt, 47)
+                         - 0.5) * 0.4) * amp;
+    float tooth = hal_md_n2(vec2(p.x * 18.0, p.y * 18.0), salt, 42);
+    float fill = clamp((d - 0.8) / 0.2, 0.0, 1.0);
+    float g = 0.12 + 0.5 * (1.0 - clamp(grain, 0.0, 1.0));
+    float pd_base = pressure;
+    float wid = width;
+    float remain = 1.0;
+    for (int k = 0; k < L; k++) {
+        vec2 r = (k == 0) ? r0 : ((k == 1) ? r1 : ((k == 2) ? r2 : r3));
+        float c = r.x;
+        float s = r.y;
+        float u = xw * c + yw * s;
+        float v = -xw * s + yw * c;
+        float wob = (hal_md_n2(vec2(u * 0.6, v * 0.6 + 7.3 * float(k)),
+                               salt, 44 + k) - 0.5) * 0.5;
+        float vv = v + wob;
+        float a = (vv - floor(vv)) - 0.5;
+        float wk = clamp((d - float(k) / float(L)) * float(L), 0.0, 1.0);
+        float hw = 0.5 * (wid * (0.4 + 0.6 * wk) + (1.0 - wid) * fill);
+        float press = (0.75 + 0.25 * hal_md_n2(vec2(u * 4.0, v * 0.9),
+                                               salt, 48 + k)) * pd_base;
+        float line = clamp((hw - abs(a)) / 0.1 + 0.5, 0.0, 1.0);
+        float pd = press * (0.6 + 0.6 * d);
+        float dep = line * clamp((tooth - (1.0 - pd)) / g + 0.5 + fill,
+                                 0.0, 1.0);
+        if (bl > 0.0) {
+            float hw2 = max(hw * 2.5, 1e-4);
+            float halo = clamp((hw2 - abs(a)) / hw2, 0.0, 1.0) * pd * 0.5;
+            float smear = max(line * pd * 0.5, halo);
+            dep = dep * (1.0 - bl) + smear * bl;
+        }
+        dep = dep * smoothstep(0.0, 0.15, wk);
+        remain = remain * (1.0 - dep);
+    }
+    return 1.0 - remain;
+}
+""",
+    # media.stipple: two jittered lattices of dots, present by darkness
+    'md_stipple': """
+float hal_md_stipple(vec2 p, float d, float size, float jitter, float fine,
+                     int salt, int placement)
+{
+    float fill = clamp((d - 0.8) / 0.2, 0.0, 1.0);
+    float best = 0.0;
+    float jit = jitter * 0.9;
+    float fn = clamp(fine, 0.0, 1.0);
+    if (placement == 1) {
+        // COUNT: three nested lattices, one dot size, ranks in fixed
+        // ranges (media._COUNT_LEVELS)
+        for (int level = 0; level < 3; level++) {
+            float sc = (level == 0) ? 0.25 : ((level == 1) ? 0.5 : 1.0);
+            float lo = (level == 0) ? 0.0 : ((level == 1) ? 0.04761905
+                                                          : 0.23809524);
+            float hi = (level == 0) ? 0.04761905 : ((level == 1) ? 0.23809524
+                                                                 : 1.0);
+            float px = p.x * sc;
+            float py = p.y * sc;
+            int cx0 = int(floor(px));
+            int cy0 = int(floor(py));
+            float rad = size * 0.5 * (1.0 + 1.5 * fill) * sc;
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    int cx = cx0 + dx;
+                    int cy = cy0 + dy;
+                    float jx = hal_md_h(cx, cy, salt, 30 + level * 4);
+                    float jy = hal_md_h(cx, cy, salt, 31 + level * 4);
+                    float pres = hal_md_h(cx, cy, salt, 32 + level * 4);
+                    float rs = hal_md_h(cx, cy, salt, 33 + level * 4);
+                    float rank = lo + pres * (hi - lo);
+                    float ddx = px - (float(cx) + 0.5 + (jx - 0.5) * jit);
+                    float ddy = py - (float(cy) + 0.5 + (jy - 0.5) * jit);
+                    float dist = sqrt(ddx * ddx + ddy * ddy);
+                    float r = rad * (0.85 + 0.3 * rs);
+                    float dot_ = clamp((r - dist) / 0.06 + 0.5, 0.0, 1.0);
+                    dot_ = (rank < d) ? dot_ : 0.0;
+                    best = max(best, dot_);
+                }
+            }
+        }
+        return best;
+    }
+    for (int level = 0; level < 2; level++) {
+        if (level == 1 && fn <= 0.0) { break; }
+        float sc = (level == 0) ? 1.0 : 2.0;
+        float lv = (level == 0) ? 1.0 : 0.7;
+        float px = p.x * sc;
+        float py = p.y * sc;
+        int cx0 = int(floor(px));
+        int cy0 = int(floor(py));
+        float dens = (level == 0) ? d : clamp((d - 0.5) * 2.0, 0.0, 1.0) * fn;
+        float rad = size * 0.5 * (0.6 + 0.7 * d + 1.5 * fill) * lv;
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                int cx = cx0 + dx;
+                int cy = cy0 + dy;
+                float jx = hal_md_h(cx, cy, salt, 20 + level * 4);
+                float jy = hal_md_h(cx, cy, salt, 21 + level * 4);
+                float pres = hal_md_h(cx, cy, salt, 22 + level * 4);
+                float rs = hal_md_h(cx, cy, salt, 23 + level * 4);
+                float ddx = px - (float(cx) + 0.5 + (jx - 0.5) * jit);
+                float ddy = py - (float(cy) + 0.5 + (jy - 0.5) * jit);
+                float dist = sqrt(ddx * ddx + ddy * ddy);
+                float r = rad * (0.75 + 0.5 * rs);
+                float dot_ = clamp((r - dist) / 0.06 + 0.5, 0.0, 1.0);
+                dot_ = (pres < dens) ? dot_ : 0.0;
+                best = max(best, dot_);
+            }
+        }
+    }
+    return best;
+}
+""",
+    # media.charcoal: the stick on the tooth, streaked, smudged, banded
+    'md_charcoal': """
+float hal_md_charcoal(vec2 p, float d, vec2 rot, float grain, float streak,
+                      float smudge, int salt, float blend)
+{
+    float bl = clamp(blend, 0.0, 1.0);
+    float c = rot.x;
+    float s = rot.y;
+    float u = p.x * c + p.y * s;
+    float v = -p.x * s + p.y * c;
+    float ex = 1.0 / (1.0 + streak * 4.0);
+    float t1 = hal_md_n2(vec2(u * 6.0 * ex, v * 6.0), salt, 60);
+    float t2 = hal_md_n2(vec2(u * 14.0 * ex, v * 14.0), salt, 61);
+    float t3 = hal_md_n2(vec2(u * 30.0 * ex, v * 30.0), salt, 63);
+    float t4 = hal_md_h(int(floor(u * 30.0 * ex)), int(floor(v * 30.0)),
+                        salt, 65);
+    float tooth = clamp((t1 * 0.3 + t2 * 0.3 + t3 * 0.2 + t4 * 0.2 - 0.5)
+                        * 2.5 + 0.5, 0.0, 1.0);
+    float sm = ((hal_md_n2(vec2(p.x * 0.6, p.y * 0.6), salt, 62) - 0.5) * smudge
+                + (hal_md_n2(vec2(u * 0.25, v * 1.6), salt, 64) - 0.5) * 0.45)
+               * clamp(4.0 * d * (1.0 - d), 0.0, 1.0);
+    float g = 0.04 + 0.25 * (1.0 - clamp(grain, 0.0, 1.0));
+    if (bl > 0.0) {
+        tooth = tooth + (0.5 - tooth) * (bl * 0.6);
+        g = g + bl * 0.4;
+    }
+    float P = d * (1.0 + 2.0 * g) - g + sm;
+    float cov = smoothstep(1.0 - P - g, 1.0 - P + g, tooth);
+    return clamp(cov, 0.0, 1.0);
+}
+""",
+    # media.paint_strokes: dabs over a 5x5 search, two-deep painter's order;
+    # returns (value, alpha, id)
+    'md_paint': """
+vec3 hal_md_paint(vec2 p, vec2 rot, float length, float width, float slope,
+                  float bristles, float variation, int salt)
+{
+    float c0 = rot.x;
+    float s0 = rot.y;
+    float hl0 = max(length, 1e-3) * 0.5;
+    float hw0 = max(width, 1e-3) * 0.5;
+    int cx0 = int(floor(p.x));
+    int cy0 = int(floor(p.y));
+    float o1 = -1.0;
+    float v1 = 0.0;
+    float a1 = 0.0;
+    float i1 = 0.0;
+    float o2 = -1.0;
+    float v2 = 0.0;
+    float a2 = 0.0;
+    float br = bristles;
+    float var_ = variation;
+    for (int dx = -2; dx <= 2; dx++) {
+        for (int dy = -2; dy <= 2; dy++) {
+            int cx = cx0 + dx;
+            int cy = cy0 + dy;
+            float jx = hal_md_h(cx, cy, salt, 0);
+            float jy = hal_md_h(cx, cy, salt, 1);
+            float hj = hal_md_h(cx, cy, salt, 2);
+            float order = hal_md_h(cx, cy, salt, 3);
+            float val = hal_md_h(cx, cy, salt, 4);
+            float bid = hal_md_h(cx, cy, salt, 5);
+            float ex = p.x - (float(cx) + 0.5 + (jx - 0.5) * 0.9);
+            float ey = p.y - (float(cy) + 0.5 + (jy - 0.5) * 0.9);
+            float t = (hj - 0.5) * (2.0 * slope);
+            float inv = 1.0 / sqrt(1.0 + t * t);
+            float dxr = (c0 - s0 * t) * inv;
+            float dyr = (s0 + c0 * t) * inv;
+            float al = ex * dxr + ey * dyr;
+            float ac = -ex * dyr + ey * dxr;
+            float hl = hl0 * (0.7 + 0.6 * bid);
+            float hw = hw0 * (0.8 + 0.4 * hj)
+                       * (1.0 - 0.3 * clamp(al / hl, 0.0, 1.0));
+            float qa = al / hl;
+            float qc = ac / hw;
+            float q = (qa * qa) * (qa * qa) + (qc * qc) * (qc * qc);
+            float alpha = clamp((1.0 - q) / 0.12, 0.0, 1.0);
+            bool cover = alpha > 0.0;
+            float b1 = hal_md_n2(vec2(ac * 9.0 + bid * 64.0,
+                                      al * 0.5 + val * 64.0), salt, 6);
+            float b2 = hal_md_n2(vec2(ac * 21.0 + val * 64.0,
+                                      al * 1.1 + bid * 64.0), salt, 7);
+            float bri = b1 * 0.6 + b2 * 0.4;
+            float value = (1.0 + var_ * (val - 0.5)) * (1.0 + br * (bri - 0.5));
+            bool win = cover && (order > o1);
+            bool second = cover && !win && (order > o2);
+            o2 = win ? o1 : (second ? order : o2);
+            v2 = win ? v1 : (second ? value : v2);
+            a2 = win ? a1 : (second ? alpha : a2);
+            o1 = win ? order : o1;
+            v1 = win ? value : v1;
+            a1 = win ? alpha : a1;
+            i1 = win ? bid : i1;
+        }
+    }
+    float under_v = v2 * a2;
+    float under_a = a2;
+    float value = under_v + (v1 - under_v) * a1;
+    float alpha = under_a + (1.0 - under_a) * a1;
+    return vec3(value, alpha, i1);
+}
+""",
+    # media.wash: n flat washes, pooled edges, granulation
+    'md_wash': """
+float hal_md_wash(vec2 p, float d, int n, float pooling, float granulation,
+                  float bleed, int salt)
+{
+    float dn = d + (hal_md_n2(vec2(p.x * 0.9, p.y * 0.9), salt, 70) - 0.5)
+                   * (0.5 * bleed);
+    float cov = 0.0;
+    float pool = pooling;
+    float share = 1.0 / float(n);
+    for (int k = 1; k <= n; k++) {
+        float e = dn - float(k) / float(n + 1);
+        float ak = smoothstep(0.0, 0.03, e);
+        float r = clamp(1.0 - e / 0.06, 0.0, 1.0);
+        float rim = pool * (r * r) * ak;
+        cov = cov + share * ak * (1.0 + rim);
+    }
+    float g1 = hal_md_n2(vec2(p.x * 9.0, p.y * 9.0), salt, 71);
+    float g2 = hal_md_n2(vec2(p.x * 21.0, p.y * 21.0), salt, 72);
+    float gr = 1.0 + granulation * ((g1 * 0.6 + g2 * 0.4) - 0.5);
+    return clamp(cov * gr, 0.0, 1.0);
+}
+""",
+    # media.paper: tooth, fibres, mottle
+    'md_paper': """
+float hal_md_paper(vec2 p, float tooth, float fibres, float mottle, int salt)
+{
+    float t1 = hal_md_n2(vec2(p.x * 9.0, p.y * 9.0), salt, 80);
+    float t2 = hal_md_n2(vec2(p.x * 23.0, p.y * 23.0), salt, 81);
+    float tv = t1 * 0.6 + t2 * 0.4;
+    float f1 = hal_md_n2(vec2(p.x * 1.3, p.y * 16.0), salt, 82);
+    float f2 = hal_md_n2(vec2(p.x * 16.0, p.y * 1.3), salt, 83);
+    float fb = (f1 + f2) * 0.5;
+    float m1 = hal_md_n2(vec2(p.x * 0.8, p.y * 0.8), salt, 84);
+    float m2 = hal_md_n2(vec2(p.x * 1.6, p.y * 1.6), salt, 85);
+    float mv = m1 * 0.65 + m2 * 0.35;
+    float h = 0.5 + tooth * (tv - 0.5) + fibres * (fb - 0.5)
+              + mottle * (mv - 0.5);
+    return clamp(h, 0.0, 1.0);
+}
+""",
+}
+
+PATTERN_GLSL.update(MEDIA_GLSL)
 
 
 #: the colour-space ramp's conversion helpers: OKLab (Ottosson 2020),
@@ -1250,3 +1759,1068 @@ vec3 bi_classic_texvec(vec3 v, vec3 ofs, vec3 size, int classic)
 
 
 PATTERN_GLSL['bitex'] = _bitex_glsl()
+
+
+# ===================================================== R242/R243: 3ds Max
+# maxmaps.py line for line, on Max's own algorithms (R243): the tables
+# the CPU materialised are computed here inline from the same hash
+# (hal_pt_hash3), so a lattice corner has one value on both devices; the
+# arithmetic keeps maxmaps' operation order so the two sides split every
+# band at the same bit. Every control is a batch constant, so the loops
+# take literal counts.
+MAX_GLSL = {
+    # ------------------------------------------------------------ the core
+    # maxmaps' tables and noise: the permutation, gradient and random
+    # tables as the SAME hash the CPU materialised, Perlin's 512-lattice
+    # noise3 in Max's op order, noise3DS / NOISE, and the small helpers.
+    'mx_prims': """
+int hal_mx_perm(int i)
+{
+    return int(hal_pt_hash3(i, 7, 13) * 511.99);
+}
+
+vec3 hal_mx_g3(int i)
+{
+    vec3 g = vec3(hal_pt_hash3(i, 31, 71), hal_pt_hash3(i, 32, 71),
+                  hal_pt_hash3(i, 33, 71)) * 2.0 - 1.0;
+    return g / sqrt(g.x * g.x + g.y * g.y + g.z * g.z);
+}
+
+vec4 hal_mx_g4(int i)
+{
+    vec4 g = vec4(hal_pt_hash3(i, 31, 73), hal_pt_hash3(i, 32, 73),
+                  hal_pt_hash3(i, 33, 73), hal_pt_hash3(i, 34, 73)) * 2.0 - 1.0;
+    return g / sqrt(g.x * g.x + g.y * g.y + g.z * g.z + g.w * g.w);
+}
+
+float hal_mx_rand01(int i) { return hal_pt_hash3(i, 3, 5); }
+float hal_mx_rand02(int i) { return hal_pt_hash3(i, 11, 17); }
+
+int hal_mx_b0(float v) { return int(v + 10000.0) & 511; }
+float hal_mx_r0(float v) { float t = v + 10000.0; return t - float(int(t)); }
+float hal_mx_scurve(float t) { return t * t * (3.0 - 2.0 * t); }
+float hal_mx_lerp(float t, float a, float b) { return a + t * (b - a); }
+
+float hal_mx_noise3(vec3 p)
+{
+    int bx0 = hal_mx_b0(p.x); int bx1 = (bx0 + 1) & 511;
+    float rx0 = hal_mx_r0(p.x); float rx1 = rx0 - 1.0;
+    int by0 = hal_mx_b0(p.y); int by1 = (by0 + 1) & 511;
+    float ry0 = hal_mx_r0(p.y); float ry1 = ry0 - 1.0;
+    int bz0 = hal_mx_b0(p.z); int bz1 = (bz0 + 1) & 511;
+    float rz0 = hal_mx_r0(p.z); float rz1 = rz0 - 1.0;
+    int i = hal_mx_perm(bx0);
+    int j = hal_mx_perm(bx1);
+    int b00 = hal_mx_perm(i + by0);
+    int b10 = hal_mx_perm(j + by0);
+    int b01 = hal_mx_perm(i + by1);
+    int b11 = hal_mx_perm(j + by1);
+    float sx = hal_mx_scurve(rx0);
+    float sy = hal_mx_scurve(ry0);
+    float sz = hal_mx_scurve(rz0);
+    vec3 g;
+    g = hal_mx_g3(b00 + bz0); float u = rx0 * g.x + ry0 * g.y + rz0 * g.z;
+    g = hal_mx_g3(b10 + bz0); float v = rx1 * g.x + ry0 * g.y + rz0 * g.z;
+    float a = hal_mx_lerp(sx, u, v);
+    g = hal_mx_g3(b01 + bz0); u = rx0 * g.x + ry1 * g.y + rz0 * g.z;
+    g = hal_mx_g3(b11 + bz0); v = rx1 * g.x + ry1 * g.y + rz0 * g.z;
+    float b = hal_mx_lerp(sx, u, v);
+    float c = hal_mx_lerp(sy, a, b);
+    g = hal_mx_g3(b00 + bz1); u = rx0 * g.x + ry0 * g.y + rz1 * g.z;
+    g = hal_mx_g3(b10 + bz1); v = rx1 * g.x + ry0 * g.y + rz1 * g.z;
+    a = hal_mx_lerp(sx, u, v);
+    g = hal_mx_g3(b01 + bz1); u = rx0 * g.x + ry1 * g.y + rz1 * g.z;
+    g = hal_mx_g3(b11 + bz1); v = rx1 * g.x + ry1 * g.y + rz1 * g.z;
+    b = hal_mx_lerp(sx, u, v);
+    float d = hal_mx_lerp(sy, a, b);
+    return hal_mx_lerp(sz, c, d);
+}
+
+float hal_mx_noise3ds(vec3 p)
+{
+    return clamp(1.65 * hal_mx_noise3(p), -1.0, 1.0);
+}
+
+float hal_mx_NOISE(vec3 p)
+{
+    return (1.0 + hal_mx_noise3ds(p)) * 0.5;
+}
+
+float hal_mx_threshold(float x, float a, float b)
+{
+    if (a == b) return clamp(x, 0.0, 1.0);
+    return clamp((x - a) / (b - a), 0.0, 1.0);
+}
+
+float hal_mx_smoothstep(float a, float b, float x)
+{
+    b = max(b, a + 1e-6);
+    float t = clamp((x - a) / (b - a), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+float hal_mx_mixcurve(float lo, float hi, float x)
+{
+    if (hi <= lo) return (x >= hi) ? 1.0 : 0.0;
+    float t = clamp((x - lo) / (hi - lo), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+""",
+    # maxmaps.noise4 + mx_noise: the 4D lattice noise with Phase as time;
+    # Regular / Fractal / Turbulence with fractional Levels
+    'mx_noise': """
+float hal_mx_noise4(vec3 p, float w)
+{
+    int bx0 = hal_mx_b0(p.x); int bx1 = (bx0 + 1) & 511;
+    float rx0 = hal_mx_r0(p.x); float rx1 = rx0 - 1.0;
+    int by0 = hal_mx_b0(p.y); int by1 = (by0 + 1) & 511;
+    float ry0 = hal_mx_r0(p.y); float ry1 = ry0 - 1.0;
+    int bz0 = hal_mx_b0(p.z); int bz1 = (bz0 + 1) & 511;
+    float rz0 = hal_mx_r0(p.z); float rz1 = rz0 - 1.0;
+    int bw0 = hal_mx_b0(w); int bw1 = (bw0 + 1) & 511;
+    float rw0 = hal_mx_r0(w); float rw1 = rw0 - 1.0;
+    int i = hal_mx_perm(bx0);
+    int j = hal_mx_perm(bx1);
+    int b00 = hal_mx_perm(i + by0);
+    int b10 = hal_mx_perm(j + by0);
+    int b01 = hal_mx_perm(i + by1);
+    int b11 = hal_mx_perm(j + by1);
+    int c00 = hal_mx_perm(b00 + bz0);
+    int c10 = hal_mx_perm(b10 + bz0);
+    int c01 = hal_mx_perm(b01 + bz0);
+    int c11 = hal_mx_perm(b11 + bz0);
+    int d00 = hal_mx_perm(b00 + bz1);
+    int d10 = hal_mx_perm(b10 + bz1);
+    int d01 = hal_mx_perm(b01 + bz1);
+    int d11 = hal_mx_perm(b11 + bz1);
+    float sx = hal_mx_scurve(rx0);
+    float sy = hal_mx_scurve(ry0);
+    float sz = hal_mx_scurve(rz0);
+    float sw = hal_mx_scurve(rw0);
+    vec4 g;
+    float u; float v; float a; float b; float c; float d;
+    float e; float f;
+    // the w0 octant
+    g = hal_mx_g4(c00 + bw0); u = rx0 * g.x + ry0 * g.y + rz0 * g.z + rw0 * g.w;
+    g = hal_mx_g4(c10 + bw0); v = rx1 * g.x + ry0 * g.y + rz0 * g.z + rw0 * g.w;
+    a = hal_mx_lerp(sx, u, v);
+    g = hal_mx_g4(c01 + bw0); u = rx0 * g.x + ry1 * g.y + rz0 * g.z + rw0 * g.w;
+    g = hal_mx_g4(c11 + bw0); v = rx1 * g.x + ry1 * g.y + rz0 * g.z + rw0 * g.w;
+    b = hal_mx_lerp(sx, u, v);
+    c = hal_mx_lerp(sy, a, b);
+    g = hal_mx_g4(d00 + bw0); u = rx0 * g.x + ry0 * g.y + rz1 * g.z + rw0 * g.w;
+    g = hal_mx_g4(d10 + bw0); v = rx1 * g.x + ry0 * g.y + rz1 * g.z + rw0 * g.w;
+    a = hal_mx_lerp(sx, u, v);
+    g = hal_mx_g4(d01 + bw0); u = rx0 * g.x + ry1 * g.y + rz1 * g.z + rw0 * g.w;
+    g = hal_mx_g4(d11 + bw0); v = rx1 * g.x + ry1 * g.y + rz1 * g.z + rw0 * g.w;
+    b = hal_mx_lerp(sx, u, v);
+    d = hal_mx_lerp(sy, a, b);
+    e = hal_mx_lerp(sz, c, d);
+    // the w1 octant
+    g = hal_mx_g4(c00 + bw1); u = rx0 * g.x + ry0 * g.y + rz0 * g.z + rw1 * g.w;
+    g = hal_mx_g4(c10 + bw1); v = rx1 * g.x + ry0 * g.y + rz0 * g.z + rw1 * g.w;
+    a = hal_mx_lerp(sx, u, v);
+    g = hal_mx_g4(c01 + bw1); u = rx0 * g.x + ry1 * g.y + rz0 * g.z + rw1 * g.w;
+    g = hal_mx_g4(c11 + bw1); v = rx1 * g.x + ry1 * g.y + rz0 * g.z + rw1 * g.w;
+    b = hal_mx_lerp(sx, u, v);
+    c = hal_mx_lerp(sy, a, b);
+    g = hal_mx_g4(d00 + bw1); u = rx0 * g.x + ry0 * g.y + rz1 * g.z + rw1 * g.w;
+    g = hal_mx_g4(d10 + bw1); v = rx1 * g.x + ry0 * g.y + rz1 * g.z + rw1 * g.w;
+    a = hal_mx_lerp(sx, u, v);
+    g = hal_mx_g4(d01 + bw1); u = rx0 * g.x + ry1 * g.y + rz1 * g.z + rw1 * g.w;
+    g = hal_mx_g4(d11 + bw1); v = rx1 * g.x + ry1 * g.y + rz1 * g.z + rw1 * g.w;
+    b = hal_mx_lerp(sx, u, v);
+    d = hal_mx_lerp(sy, a, b);
+    f = hal_mx_lerp(sz, c, d);
+    return hal_mx_lerp(sw, e, f);
+}
+
+float hal_mx_noise(vec3 p, int kind, float levels, float low, float high,
+                   float phase)
+{
+    float lev = clamp(levels, 1.0, 10.0);
+    float res;
+    if (kind == 0) {
+        res = (1.0 + hal_mx_noise4(p, phase)) * 0.5;
+    } else {
+        int count = int(ceil(lev));
+        float rest = lev - floor(lev);
+        float total = 0.0;
+        float f = 1.0;
+        for (int i = 0; i < 10; i++) {
+            if (i >= count) break;
+            float factor = (i == count - 1 && rest > 0.0) ? rest : 1.0;
+            float nz = hal_mx_noise4(p * f, phase);
+            if (kind == 2) nz = abs(nz);
+            total = total + factor * nz / f;
+            f = f * 2.0;
+        }
+        res = (kind == 1) ? 0.5 * (total + 1.0) : total;
+    }
+    if (low < high) res = hal_mx_threshold(res, low, high);
+    return clamp(res, 0.0, 1.0);
+}
+""",
+    # maxmaps.cell_function / fractal_cell_function / mx_cellular /
+    # cellular_colors: Max's 27-cell Poisson Worley, squared distances,
+    # the fractal sum by lacunarity, the colour rule with Variation
+    'mx_cellular': """
+int hal_mx_cell_count(float u)
+{
+    if (u < 0.049787) return 0;
+    if (u < 0.199148) return 1;
+    if (u < 0.423190) return 2;
+    if (u < 0.647232) return 3;
+    if (u < 0.815263) return 4;
+    if (u < 0.916082) return 5;
+    if (u < 0.966492) return 6;
+    if (u < 0.988096) return 7;
+    return 8;
+}
+
+// (f1, f2, the nearest point's id mod 10000)
+vec3 hal_mx_cell_function(vec3 p, int want2)
+{
+    vec3 fp = floor(p);
+    int ipx = int(fp.x); int ipy = int(fp.y); int ipz = int(fp.z);
+    vec3 fip0 = fp - p;
+    float f1 = 1e30;
+    float f2 = 1e30;
+    int fid = 0;
+    for (int dx = -1; dx <= 1; dx++) {
+        int px = hal_mx_perm((ipx + dx) & 511);
+        for (int dy = -1; dy <= 1; dy++) {
+            int py = hal_mx_perm((ipy + dy) & 511) * 512;
+            for (int dz = -1; dz <= 1; dz++) {
+                int pz = hal_mx_perm((ipz + dz) & 511) * 262144;
+                int cid = px + py + pz;
+                int y = cid % 10000;
+                int ct = hal_mx_cell_count(hal_mx_rand01(y));
+                float fipx = fip0.x + float(dx);
+                float fipy = fip0.y + float(dy);
+                float fipz = fip0.z + float(dz);
+                int cntr = 1;
+                for (int k = 0; k < 9; k++) {
+                    if (k >= ct) break;
+                    float qz = hal_mx_rand02(y + cntr) + fipz;
+                    float qy = hal_mx_rand02(y + cntr + 1) + fipy;
+                    float qx = hal_mx_rand02(y + cntr + 2) + fipx;
+                    cntr = cntr + 3;
+                    float d = qx * qx + qy * qy + qz * qz;
+                    if (want2 == 1) f2 = min(f2, max(f1, d));
+                    if (d < f1) { fid = cid + k; }
+                    f1 = min(f1, d);
+                }
+            }
+        }
+    }
+    return vec3(f1, f2, float(fid % 10000));
+}
+
+vec3 hal_mx_fractal_cell(vec3 p, float iterations, float lacunarity, int want2)
+{
+    int it = int(min(iterations, 25.0));
+    float rem = iterations - float(it);
+    vec3 r = hal_mx_cell_function(p, want2);
+    float u = lacunarity;
+    for (int i = 1; i < 25; i++) {
+        if (i >= it) break;
+        vec3 d = hal_mx_cell_function(p * u, want2);
+        r.x = r.x + d.x / u;
+        r.y = r.y + d.y / u;
+        r.z = d.z;
+        u = u * lacunarity;
+    }
+    if (rem > 0.0) {
+        vec3 d = hal_mx_cell_function(p * u, want2);
+        r.x = r.x + rem * d.x / u;
+        r.y = r.y + rem * d.y / u;
+        r.z = d.z;
+    }
+    return r;
+}
+
+// (u, the cell id mod 10000)
+vec2 hal_mx_cellular(vec3 p, int chips, float spread, int fractal,
+                     float iterations, float roughness)
+{
+    vec3 q = p + 1000.0;
+    float lac = 2.0 - roughness;
+    vec3 r;
+    if (fractal == 1) r = hal_mx_fractal_cell(q, iterations, lac, chips);
+    else r = hal_mx_cell_function(q, chips);
+    float u;
+    if (chips == 1) u = 1.0 - (r.y - r.x) / max(spread * 0.5, 1e-6);
+    else u = r.x / max(spread, 1e-6);
+    return vec2(u, r.z);
+}
+
+vec4 hal_mx_cellular_colors(vec2 uf, vec4 cell, vec4 div1, vec4 div2,
+                            float low, float mid, float high, float variation)
+{
+    float u = uf.x;
+    float var = variation / 50.0;
+    if (var > 0.0) {
+        float vr = hal_mx_rand01(int(uf.y)) * var + (1.0 - var * 0.5);
+        cell.rgb = clamp(cell.rgb * vr, 0.0, 1.0);
+    }
+    float ml = max(mid - low, 1e-6);
+    float hm = max(high - mid, 1e-6);
+    vec4 outc;
+    if (u < low) outc = cell;
+    else if (u > high) outc = div2;
+    else if (u < mid) { float t = (u - low) / ml; outc = div1 * t + (1.0 - t) * cell; }
+    else { float t = (u - mid) / hm; outc = div2 * t + (1.0 - t) * div1; }
+    outc.a = 1.0;
+    return outc;
+}
+""",
+    # maxmaps.mx_smoke: |noise3| octaves drifted by their velocities
+    'mx_smoke': """
+vec3 hal_mx_smoke_vel(int i)
+{
+    return vec3(hal_pt_hash3(i, 41, 43) * 2.0 - 1.0,
+                hal_pt_hash3(i, 47, 53) * 2.0 - 1.0,
+                hal_pt_hash3(i, 59, 61) * 2.0 - 1.0);
+}
+
+float hal_mx_smoke(vec3 p, int iterations, float phase, float exponent)
+{
+    vec3 x = p;
+    float mag = 0.0;
+    float s = 1.0;
+    float ft = 1.0;
+    for (int i = 0; i < 20; i++) {
+        if (i >= iterations) break;
+        float k = ft * phase;
+        vec3 r = x + hal_mx_smoke_vel(i) * k;
+        mag = mag + abs(hal_mx_noise3(r)) / s;
+        x = x * 2.0;
+        s = s * 2.0;
+        ft = ft * 2.4;
+    }
+    float d = min(mag, 1.0);
+    return pow(d, max(exponent, 1e-4));
+}
+""",
+    # maxmaps.mx_speckle: the point x10, six octaves of NOISE, capped
+    'mx_speckle': """
+float hal_mx_speckle(vec3 p)
+{
+    vec3 q = p * 10.0;
+    float total = 0.0;
+    float s = 1.0;
+    for (int i = 0; i < 6; i++) {
+        total = total + hal_mx_NOISE(q) / s;
+        s = s * 2.0;
+        q = q * 2.0;
+    }
+    return min(total, 1.0);
+}
+""",
+    # maxmaps.mx_splat: one minus the product of smoothsteps of NOISE
+    'mx_splat': """
+float hal_mx_splat(vec3 p, int iterations, float threshold)
+{
+    vec3 q = p;
+    float fact = 1.0;
+    for (int i = 0; i < 5; i++) {
+        if (i >= iterations) break;
+        float t = min(hal_mx_NOISE(q), 1.0);
+        fact = fact * hal_mx_smoothstep(threshold - 0.02, threshold + 0.02, t);
+        q = q * 2.0;
+    }
+    return 1.0 - fact;
+}
+""",
+    # maxmaps.mx_stucco: the knee curve past Threshold over Thickness
+    'mx_stucco': """
+float hal_mx_stucco(vec3 p, float thickness, float threshold)
+{
+    float f = 0.5 * (hal_mx_noise3(p) + 1.0);
+    f = (f - threshold) / max(thickness, 1e-6);
+    if (f <= 0.0) return 0.0;
+    if (f >= 1.0) return 1.0;
+    if (f < 0.2) return 3.125 * f * f;
+    if (f < 1.0 - 0.2) return 0.625 * (2.0 * f - 0.2);
+    return 1.0 - 3.125 * (1.0 - f) * (1.0 - f);
+}
+""",
+    # maxmaps.mx_swirl: the twisted UV, octaves of noise3 at gain Contrast
+    'mx_swirl': """
+float hal_mx_swirl(vec3 p, float cx, float cy, float twist, float intensity,
+                   float amount, int detail, float contrast, float seed)
+{
+    float u = p.x + cx;
+    float v = p.y + cy;
+    float rsq = u * u + v * v;
+    float ang = twist * 6.2831853 * rsq;
+    float sn = sin(ang);
+    float cs = cos(ang);
+    float ppx = v * cs - u * sn;
+    float ppy = v * sn + u * cs;
+    float ppz = seed;
+    float a = 0.0;
+    float l = 1.0;
+    float o = 1.0;
+    for (int i = 0; i < 7; i++) {
+        if (i >= detail) break;
+        a = a + o * hal_mx_noise3(vec3(ppx * l, ppy * l, ppz * l));
+        l = l * 2.0;
+        o = o * contrast;
+    }
+    return amount * intensity * a;
+}
+""",
+    # maxmaps.dent_noise / wood_noise: the 21-cube linear table noise,
+    # periodic every 20 (Dent, Planet, Wood)
+    'mx_dentnoise': """
+float hal_mx_dent_table(int ix, int iy, int iz)
+{
+    return hal_pt_hash3((ix % 20) + 101, (iy % 20) + 203, (iz % 20) + 307);
+}
+
+float hal_mx_dent_noise(vec3 p)
+{
+    vec3 m = mod(p, 20.0);
+    int ix = int(m.x); int iy = int(m.y); int iz = int(m.z);
+    float fx = mod(m.x, 1.0); float fy = mod(m.y, 1.0); float fz = mod(m.z, 1.0);
+    float n = hal_mx_dent_table(ix, iy, iz);
+    float n00 = n + fx * (hal_mx_dent_table(ix + 1, iy, iz) - n);
+    n = hal_mx_dent_table(ix, iy, iz + 1);
+    float n01 = n + fx * (hal_mx_dent_table(ix + 1, iy, iz + 1) - n);
+    n = hal_mx_dent_table(ix, iy + 1, iz);
+    float n10 = n + fx * (hal_mx_dent_table(ix + 1, iy + 1, iz) - n);
+    n = hal_mx_dent_table(ix, iy + 1, iz + 1);
+    float n11 = n + fx * (hal_mx_dent_table(ix + 1, iy + 1, iz + 1) - n);
+    float n0 = n00 + fy * (n10 - n00);
+    float n1 = n01 + fy * (n11 - n01);
+    return n0 + fz * (n1 - n0);
+}
+
+float hal_mx_wood_noise(float x)
+{
+    float m = mod(x, 20.0);
+    int ix = int(m);
+    float fx = mod(m, 1.0);
+    float n0 = hal_mx_dent_table(ix, 0, 0);
+    float n1 = hal_mx_dent_table(ix + 1, 0, 0);
+    return n0 + fx * (n1 - n0);
+}
+""",
+    # maxmaps.mx_planet / planet_colors
+    'mx_planet': """
+float hal_mx_planet(vec3 p, float island)
+{
+    return hal_mx_dent_noise(p) + hal_mx_dent_noise(p * island) / 5.0;
+}
+
+vec4 hal_mx_planet_colors(float d, vec4 c0, vec4 c1, vec4 c2, vec4 c3,
+                          vec4 c4, vec4 c5, vec4 c6, vec4 c7,
+                          float ocean_pct, int blend)
+{
+    float land = clamp(ocean_pct, 0.0, 100.0) / 100.0;
+    land = min(max(land, 1e-4), 1.0 - 1e-4);
+    if (d < land) {
+        float dw = d / land * 3.0;
+        int iw = min(int(dw), 2);
+        float fw = dw - float(iw);
+        float omf = 1.0 - fw;
+        if (iw == 0) return omf * c0 + fw * c1;
+        if (iw == 1) return omf * c1 + fw * c2;
+        if (blend == 1) return omf * c2 + fw * c3;
+        return c2;
+    }
+    float dl = (d - land) / (1.0 - land) * 5.0;
+    int il = min(int(max(dl, 0.0)), 5);
+    float fl = dl - float(il);
+    float omf = 1.0 - fl;
+    if (il == 0) return omf * c3 + fl * c4;
+    if (il == 1) return omf * c4 + fl * c5;
+    if (il == 2) return omf * c5 + fl * c6;
+    if (il == 3) return omf * c6 + fl * c7;
+    return c7;
+}
+""",
+    # maxmaps.mx_waves: the C runtime's rand() walk seeds the wave sets
+    'mx_waves': """
+float hal_mx_waves(vec3 p, int sets, float radius, float len_min, float len_max,
+                   float amplitude, float phase, int dist3d, int seed)
+{
+    int count = max(1, min(sets, 50));
+    uint h = uint(seed);
+    float n = 0.0;
+    float lmax = max(len_max, 1e-6);
+    for (int i = 0; i < 50; i++) {
+        if (i >= count) break;
+        h = h * 214013u + 2531011u;
+        float cx = float(int((h >> 16u) & 0x7fffu)) / 16384.0 - 1.0;
+        float cy = 0.0;
+        if (dist3d == 1) {
+            h = h * 214013u + 2531011u;
+            cy = float(int((h >> 16u) & 0x7fffu)) / 16384.0 - 1.0;
+        }
+        h = h * 214013u + 2531011u;
+        float cz = float(int((h >> 16u) & 0x7fffu)) / 16384.0 - 1.0;
+        float ln = sqrt(cx * cx + cy * cy + cz * cz);
+        float dd = radius / max(ln, 1e-6);
+        h = h * 214013u + 2531011u;
+        float period = float(int((h >> 16u) & 0x7fffu)) / 32768.0 * (len_max - len_min) + len_min;
+        period = max(period, 1e-6);
+        float rate = sqrt(lmax / period);
+        float vx = (p.x - cx * dd) / period;
+        float vy = (p.y - cy * dd) / period;
+        float vz = (p.z - cz * dd) / period;
+        float d = sqrt(vx * vx + vy * vy + vz * vz);
+        float t = 0.5 * (1.0 + sin((d - phase * rate) * 6.2831853));
+        n = n + t * period / lmax;
+    }
+    float v = n * amplitude / float(count);
+    return min(v, 1.0);
+}
+""",
+    # maxmaps.mx_checker: Max's integrated soften, or the parity test
+    'mx_checker': """
+float hal_mx_sintegral(float x)
+{
+    float fl = floor(x);
+    return fl * 0.5 + max(0.0, (x - fl) - 0.5);
+}
+
+float hal_mx_checker(vec3 p, float soften)
+{
+    float u = p.x;
+    float v = p.y;
+    if (soften <= 0.0) {
+        float fu = u - floor(u);
+        float fv = v - floor(v);
+        bool a = fu > 0.5;
+        bool b = fv > 0.5;
+        return ((a || b) && !(a && b)) ? 0.0 : 1.0;
+    }
+    float du = soften;
+    float hdu = du * 0.5;
+    float s = (hal_mx_sintegral(u + hdu) - hal_mx_sintegral(u - hdu)) / du;
+    float t = (hal_mx_sintegral(v + hdu) - hal_mx_sintegral(v - hdu)) / du;
+    return s * t + (1.0 - s) * (1.0 - t);
+}
+""",
+    # maxmaps.mx_tiles -> vec3(mixer, brick random, fade factor)
+    'mx_tiles': """
+float hal_mx_boxstep(float a, float b, float x)
+{
+    return clamp((x - a) / (b - a), 0.0, 1.0);
+}
+
+vec3 hal_mx_tiles(vec3 p, int pattern, float hcount, float vcount,
+                  float hgap, float vgap, float line_shift, float random_shift,
+                  float holes, float fade, float color_var, int seed)
+{
+    float mtx = hgap * 0.01;
+    float mty = vgap * 0.01;
+    float bw = 1.0 / (hcount + mtx);
+    float bh = 1.0 / (vcount + mty);
+    float mwf = mtx / bw;
+    float mhf = mty / bh;
+    float ss = p.x / bw;
+    float tt = p.y / bh;
+    float tbrick = floor(tt);
+    bool odd = mod(tbrick, 2.0) > 0.5;
+    ss = ss + random_shift * (hal_pt_hash3(int(tbrick), seed, 29) - 0.5);
+    float w = 1.0;
+    if (pattern == 1) { if (odd) ss = ss + line_shift; }
+    else if (pattern == 2) { if (odd) { w = 0.5; ss = ss + line_shift * 0.5; } }
+    else if (pattern == 3) { if (odd) ss = ss + line_shift * 1.5; }
+    float sbrick;
+    float fs;
+    if (pattern == 3) {
+        float t = mod(ss, 1.5);
+        bool head = t >= 1.0;
+        sbrick = floor(ss / 1.5) * 2.0 + (head ? 1.0 : 0.0);
+        fs = head ? (t - 1.0) / 0.5 : t;
+        w = head ? 0.5 : 1.0;
+    } else {
+        sbrick = floor(ss / w);
+        fs = (ss - sbrick * w) / w;
+    }
+    float ft = tt - tbrick;
+    float mw = mwf / w;
+    float wx = hal_mx_boxstep(mw, mw + 1e-4, fs) - hal_mx_boxstep(1.0 - mw, 1.0 - mw + 1e-4, fs);
+    float wy = hal_mx_boxstep(mhf, mhf + 1e-4, ft) - hal_mx_boxstep(1.0 - mhf, 1.0 - mhf + 1e-4, ft);
+    float mixer = wx * wy;
+    int sb = int(sbrick);
+    int tb = int(tbrick);
+    float rnd = hal_pt_hash3(sb, tb, seed);
+    if (hal_pt_hash3(sb, tb, seed + 97) < holes / 100.0) mixer = 0.0;
+    float n1 = rnd - 0.5;
+    float fade_v = (1.0 + color_var * n1) * (1.0 + fade * n1);
+    return vec3(mixer, rnd, max(fade_v, 0.0));
+}
+""",
+    # maxmaps.mx_marble: the point x500, the seventeen-band veins
+    'mx_marble': """
+float hal_mx_marble(vec3 p, float width)
+{
+    vec3 q = p * 500.0;
+    float x = q.x; float y = q.y; float z = q.z;
+    vec3 r = vec3(x / 100.0, y / 200.0, z / 200.0);
+    float d = (x + 10000.0) * width + 7.0 * hal_mx_NOISE(r);
+    float idx = mod(d, 17.0);
+    float outv;
+    if (idx < 4.0) {
+        vec3 r2 = vec3(x / 70.0, y / 50.0, z / 50.0);
+        outv = 0.7 + 0.2 * hal_mx_NOISE(r2);
+    } else {
+        vec3 r3 = vec3(x / 100.0, y / 100.0, x / 100.0);
+        float n3 = hal_mx_NOISE(r3);
+        if (idx < 9.0 || idx >= 12.0) {
+            float dd = abs(d - floor(d / 17.0) * 17.0 - 10.5) * 0.1538462;
+            outv = 0.4 + 0.3 * dd + 0.2 * n3;
+        } else {
+            outv = 0.2 * (1.0 + n3);
+        }
+    }
+    return clamp(outv, 0.0, 1.0);
+}
+""",
+    # maxmaps.mx_perlin_marble / perlin_marble_colors: the turbulence
+    # vein coordinate and Perlin's thirteen-knot Catmull-Rom
+    'mx_perlin_marble': """
+float hal_mx_perlin_marble(vec3 p, int levels)
+{
+    float turb = 0.0;
+    float freq = 1.0;
+    for (int i = 0; i < 8; i++) {
+        if (i >= levels) break;
+        turb = turb + abs(hal_mx_NOISE(p * freq)) / freq;
+        freq = freq * 2.0;
+    }
+    return clamp(sin(p.x + (4.0 * turb - 3.0)), 0.0, 1.0);
+}
+
+vec3 hal_mx_pm_knot(int i, vec3 c0, vec3 c1, vec3 lc0, vec3 dc1)
+{
+    if (i <= 1) return lc0;
+    if (i <= 4) return c0;
+    if (i <= 6) return lc0;
+    if (i <= 8) return c1;
+    if (i <= 10) return dc1;
+    if (i == 11) return lc0;
+    return dc1;
+}
+
+vec4 hal_mx_perlin_marble_colors(float csp, vec4 col0, vec4 col1,
+                                 float sat1, float sat2)
+{
+    vec3 c0 = col0.rgb;
+    vec3 c1 = col1.rgb;
+    vec3 lc0 = clamp(c0 * (2.0 * sat1 - 1.0), 0.0, 1.0);
+    vec3 dc1 = clamp(c1 * (2.0 * sat2 - 1.0), 0.0, 1.0);
+    float x = clamp(csp, 0.0, 1.0) * 10.0;
+    int span = min(int(x), 9);
+    x = x - float(span);
+    vec3 k0 = hal_mx_pm_knot(span, c0, c1, lc0, dc1);
+    vec3 k1 = hal_mx_pm_knot(span + 1, c0, c1, lc0, dc1);
+    vec3 k2 = hal_mx_pm_knot(span + 2, c0, c1, lc0, dc1);
+    vec3 k3 = hal_mx_pm_knot(span + 3, c0, c1, lc0, dc1);
+    vec3 c3 = -0.5 * k0 + 1.5 * k1 + -1.5 * k2 + 0.5 * k3;
+    vec3 c2 = 1.0 * k0 + -2.5 * k1 + 2.0 * k2 + -0.5 * k3;
+    vec3 cc1 = -0.5 * k0 + 0.0 * k1 + 0.5 * k2 + 0.0 * k3;
+    vec3 cc0 = 0.0 * k0 + 1.0 * k1 + 0.0 * k2 + 0.0 * k3;
+    vec3 rgb = ((c3 * x + c2) * x + cc1) * x + cc0;
+    return vec4(rgb, 1.0);
+}
+""",
+    # maxmaps.mx_wood: the ring bands on the jittered radius
+    'mx_wood': """
+float hal_mx_wood(vec3 p, float radial, float axial)
+{
+    float px = p.x + hal_mx_wood_noise(p.x) * radial;
+    float py = p.y + hal_mx_wood_noise(p.y) * radial;
+    float pz = p.z + hal_mx_wood_noise(p.z) * radial;
+    float r = sqrt(py * py + pz * pz);
+    px = px / 4.0;
+    r = r + (hal_mx_wood_noise(r) + axial * hal_mx_wood_noise(px));
+    r = mod(r, 1.0);
+    return hal_mx_smoothstep(0.0, 0.8, r) - hal_mx_smoothstep(0.83, 1.0, r);
+}
+""",
+    # maxmaps.mx_dent: the point x50, |0.5 - dent noise| octaves, cubed
+    'mx_dent': """
+float hal_mx_dent(vec3 p, float strength, int iterations)
+{
+    vec3 q = p * 50.0;
+    float s = 1.0;
+    float mag = 0.0;
+    for (int i = 0; i < 10; i++) {
+        if (i >= iterations) break;
+        mag = mag + abs(0.5 - hal_mx_dent_noise(q)) / s;
+        s = s * 2.0;
+        q = q * 2.0;
+    }
+    return clamp(mag * mag * mag * strength, 0.0, 1.0);
+}
+""",
+    # maxmaps.mx_gradient_ramp: the ramp coordinate for each gradient type
+    'mx_gradient_ramp': """
+float hal_mx_gradient_ramp(float u, float v, int kind, float ndv, float mapped)
+{
+    float a;
+    if (kind == 0) {
+        a = (u > 0.0) ? (v * v) / max(u, 1e-6) * u : v;
+    } else if (kind == 1) {
+        float lu = abs(u - 0.5) * 2.0;
+        float lv = abs(v - 0.5) * 2.0;
+        a = min(max(lu, lv), 1.0);
+    } else if (kind == 2) {
+        a = sqrt(2.0 * (v - u) * (v - u));
+    } else if (kind == 4) {
+        a = 1.0 - clamp(abs(ndv), 0.0, 1.0);
+    } else if (kind == 5) {
+        a = (v > 0.0) ? u / max(v, 1e-6) : v;
+        if (a > 1.0) a = (u > 0.0) ? v / max(u, 1e-6) : 0.0;
+        a = min(a, 1.0);
+    } else if (kind == 6) {
+        a = min(sqrt((u - 0.5) * (u - 0.5) + (v - 0.5) * (v - 0.5)) * 2.0, 1.0);
+    } else if (kind == 7) {
+        float ln = sqrt(u * u + v * v);
+        float c = clamp((ln > 0.0) ? u / max(ln, 1e-6) : 1.0, -1.0, 1.0);
+        a = min(acos(c) * 57.29578 / 90.0, 1.0);
+    } else if (kind == 8) {
+        float lu = u - 0.5;
+        float lv = v - 0.5;
+        float ln = sqrt(lu * lu + lv * lv);
+        float c = clamp((ln > 0.0) ? lu / max(ln, 1e-6) : 1.0, -1.0, 1.0);
+        float x = acos(c) * 57.29578;
+        if (lv > 0.0) x = 360.0 - x;
+        a = min(x / 360.0, 1.0);
+    } else if (kind == 9) {
+        float lu = abs(u - 0.5) * 2.0;
+        float lv = abs(v - 0.5) * 2.0;
+        a = 1.0 - min(min(lu, lv), 1.0);
+    } else if (kind == 10) {
+        a = mapped;
+    } else {
+        a = v;
+    }
+    return clamp(a, 0.0, 1.0);
+}
+""",
+    # maxmaps.max_fresnel: the unpolarised dielectric equation on |N.V|
+    # ------------------------------------------ R243: the remaining maps
+    # tex_gradient's noise, sramp and shape; Color Correction's HSL and
+    # its two lightness roads; the Composite map's twenty-five blend
+    # modes and its "over" -- each the CPU function above, op for op.
+    'mx_gradient': """
+float hal_mx_sramp(float x, float a, float b, float d)
+{
+    if (d <= 0.0) return clamp(x, a, b);
+    float p0 = a - d;
+    float p1 = a + d;
+    float p2 = b - d;
+    float p3 = b + d;
+    if (x <= p0) return a;
+    if (x >= p3) return b;
+    if (x >= p1 && x <= p2) return x;
+    if (x > p0 && x < p1) {
+        float q = (x - p0) / (2.0 * d);
+        return a + q * q * d;
+    }
+    float q = (p3 - x) / (2.0 * d);
+    return b - q * q * d;
+}
+
+float hal_mx_gradient_noise(vec3 p, int kind, float levels, float low,
+                            float high, float smth)
+{
+    float res = 0.0;
+    if (kind == 0 || (kind == 1 && levels == 1.0)) {
+        res = hal_mx_noise3(p);
+    } else {
+        float f = 1.0;
+        float lv = levels;
+        for (int i = 0; i < 12; i++) {
+            if (lv < 1.0) break;
+            float n = hal_mx_noise3(p * f);
+            if (kind == 2) n = abs(n);
+            res = res + n / f;
+            f = f * 2.0;
+            lv -= 1.0;
+        }
+        if (lv > 0.0) {
+            float n = hal_mx_noise3(p * f);
+            if (kind == 2) n = abs(n);
+            res = res + lv * n / f;
+        }
+    }
+    if (low < high) {
+        float sd = (high - low) * 0.5 * smth;
+        res = 2.0 * hal_mx_sramp((res + 1.0) / 2.0, low, high, sd) - 1.0;
+    }
+    return res;
+}
+
+float hal_mx_gradient(float u, float v, int kind, float amount, float noise)
+{
+    float a;
+    if (kind == 1) {
+        float lu = u - 0.5;
+        float lv = v - 0.5;
+        a = min(sqrt(lu * lu + lv * lv) * 2.0, 1.0);
+    } else {
+        a = v;
+    }
+    if (amount != 0.0) a = clamp(a + amount * noise, 0.0, 1.0);
+    return a;
+}
+
+vec4 hal_mx_gradient_colors(float a, float pos, vec4 c1, vec4 c2, vec4 c3)
+{
+    float lo = (pos > 0.0) ? pos : 1.0;
+    float hi = (pos < 1.0) ? 1.0 - pos : 1.0;
+    float t1 = a / lo;
+    float t2 = (a - pos) / hi;
+    vec4 below = c3 * (1.0 - t1) + c2 * t1;
+    vec4 above = c2 * (1.0 - t2) + c1 * t2;
+    return (a < pos) ? below : ((a > pos) ? above : c2);
+}
+""",
+    'mx_hsl': """
+float hal_mx_rotate(float a, float b, float c)
+{
+    float delta = c - b;
+    if (a < b) {
+        float f = float(int((c - a) / delta));
+        a = a + delta * f;
+    }
+    if (a > c) {
+        float f = float(int((a - b) / delta));
+        a = a - delta * f;
+    }
+    return a;
+}
+
+float hal_mx_hue(vec3 c)
+{
+    float mn = min(c.r, min(c.g, c.b));
+    float mx = max(c.r, max(c.g, c.b));
+    float delta = mx - mn;
+    if (delta < 0.00001) return 0.0;
+    float h;
+    if (c.r == mx) h = (c.g - c.b) / delta;
+    else if (c.g == mx) h = 2.0 + (c.b - c.r) / delta;
+    else h = 4.0 + (c.r - c.g) / delta;
+    return hal_mx_rotate(h * 60.0, 0.0, 360.0);
+}
+
+float hal_mx_lum(vec3 c)
+{
+    float mn = min(c.r, min(c.g, c.b));
+    float mx = max(c.r, max(c.g, c.b));
+    return clamp((mx + mn) / 2.0, 0.0, 1.0);
+}
+
+float hal_mx_sat(vec3 c)
+{
+    float mn = min(c.r, min(c.g, c.b));
+    float mx = max(c.r, max(c.g, c.b));
+    float lum = hal_mx_lum(c);
+    if (mn == mx || lum == 0.0) return 0.0;
+    if (lum <= 0.5) return clamp((mx - mn) / (2.0 * lum), 0.0, 1.0);
+    float d2 = 2.0 - 2.0 * lum;
+    if (d2 == 0.0) d2 = 1.0;
+    return clamp((mx - mn) / d2, 0.0, 1.0);
+}
+
+float hal_mx_hue2rgb(float v1, float v2, float h)
+{
+    h = hal_mx_rotate(h, 0.0, 1.0);
+    if (6.0 * h < 1.0) return v1 + (v2 - v1) * 6.0 * h;
+    if (2.0 * h < 1.0) return v2;
+    if (3.0 * h < 2.0) return v1 + (v2 - v1) * (0.6666667 - h) * 6.0;
+    return v1;
+}
+
+vec3 hal_mx_hsl2rgb(float h, float s, float lum)
+{
+    float q = (lum < 0.5) ? lum * (1.0 + s) : lum + s - lum * s;
+    float p = 2.0 * lum - q;
+    float hk = h / 360.0;
+    return clamp(vec3(hal_mx_hue2rgb(p, q, hk + 0.33333334),
+                      hal_mx_hue2rgb(p, q, hk),
+                      hal_mx_hue2rgb(p, q, hk - 0.33333334)), 0.0, 1.0);
+}
+""",
+    'mx_colorcorr': """
+float hal_mx_rewire(int k, vec4 c)
+{
+    if (k == 0) return c.r;
+    if (k == 1) return c.g;
+    if (k == 2) return c.b;
+    if (k == 3) return c.a;
+    if (k == 4) return 1.0 - c.r;
+    if (k == 5) return 1.0 - c.g;
+    if (k == 6) return 1.0 - c.b;
+    if (k == 7) return 1.0 - c.a;
+    if (k == 8) return (c.r + c.g + c.b) / 3.0;
+    if (k == 9) return 1.0;
+    return 0.0;
+}
+
+vec4 hal_mx_color_correction(vec4 c, int rr, int rg, int rb, int ra,
+                             float hue_shift, float saturation, vec3 tint,
+                             float strength, int advanced, float brightness,
+                             float contrast, float gain, float gamma,
+                             float pivot, float lift)
+{
+    vec4 t = c;
+    c = vec4(hal_mx_rewire(rr, t), hal_mx_rewire(rg, t), hal_mx_rewire(rb, t),
+             hal_mx_rewire(ra, t));
+    float h = hal_mx_hue(c.rgb);
+    float s = hal_mx_sat(c.rgb);
+    float lum = hal_mx_lum(c.rgb);
+    h = hal_mx_rotate(h + hue_shift, 0.0, 360.0);
+    s = clamp(s + saturation / 100.0, 0.0, 1.0);
+    float ht = hal_mx_hue(tint);
+    h = h + (ht - h) * (strength / 100.0);
+    vec3 rgb = hal_mx_hsl2rgb(h, s, lum);
+    if (advanced == 0) {
+        float b = brightness / 100.0;
+        float k = contrast / 100.0;
+        rgb = (rgb - 0.5) * (1.0 + k) + 0.5 + b;
+    } else {
+        float gm = max(gamma, 1e-6);
+        float pv = (pivot == 0.0) ? 1e-6 : pivot;
+        vec3 base = max(((rgb * gain) / 100.0) / pv, vec3(0.0));
+        float e = 1.0 / gm;
+        rgb = pv * vec3(pow(base.x, e), pow(base.y, e), pow(base.z, e)) + lift;
+    }
+    return vec4(rgb, c.a);
+}
+""",
+    'mx_composite': """
+vec4 hal_mx_hsl_blend(vec3 hsrc, vec3 ssrc, vec3 lsrc, vec4 fg)
+{
+    return vec4(hal_mx_hsl2rgb(hal_mx_hue(hsrc), hal_mx_sat(ssrc), hal_mx_lum(lsrc)), fg.a);
+}
+
+vec4 hal_mx_blend(int m, vec4 fg, vec4 bg)
+{
+    if (m == 0) return fg;
+    if (m == 1) return (fg + bg) / 2.0;
+    if (m == 2) return fg + bg;
+    if (m == 3) return bg - fg;
+    if (m == 4) return min(fg, bg);
+    if (m == 5) return fg * bg;
+    if (m == 6) {
+        vec4 r = vec4(0.0);
+        if (fg.r != 0.0) r.r = max(1.0 - (1.0 - bg.r) / fg.r, 0.0);
+        if (fg.g != 0.0) r.g = max(1.0 - (1.0 - bg.g) / fg.g, 0.0);
+        if (fg.b != 0.0) r.b = max(1.0 - (1.0 - bg.b) / fg.b, 0.0);
+        if (fg.a != 0.0) r.a = max(1.0 - (1.0 - bg.a) / fg.a, 0.0);
+        return r;
+    }
+    if (m == 7) return max(fg + bg - 1.0, vec4(0.0));
+    if (m == 8) return max(fg, bg);
+    if (m == 9) return fg + bg - fg * bg;
+    if (m == 10) {
+        vec4 r = vec4(1.0);
+        if (fg.r != 1.0) r.r = min(bg.r / (1.0 - fg.r), 1.0);
+        if (fg.g != 1.0) r.g = min(bg.g / (1.0 - fg.g), 1.0);
+        if (fg.b != 1.0) r.b = min(bg.b / (1.0 - fg.b), 1.0);
+        if (fg.a != 1.0) r.a = min(bg.a / (1.0 - fg.a), 1.0);
+        return r;
+    }
+    if (m == 11) return min(fg + bg, vec4(1.0));
+    if (m == 12) return min(2.0 * fg * bg, vec4(1.0));
+    if (m == 13) return min(fg * bg + bg, vec4(1.0));
+    if (m == 14) {
+        vec4 r = 2.0 * fg * bg;
+        if (bg.r > 0.5) r.r = 1.0 - 2.0 * (1.0 - fg.r) * (1.0 - bg.r);
+        if (bg.g > 0.5) r.g = 1.0 - 2.0 * (1.0 - fg.g) * (1.0 - bg.g);
+        if (bg.b > 0.5) r.b = 1.0 - 2.0 * (1.0 - fg.b) * (1.0 - bg.b);
+        if (bg.a > 0.5) r.a = 1.0 - 2.0 * (1.0 - fg.a) * (1.0 - bg.a);
+        return clamp(r, 0.0, 1.0);
+    }
+    if (m == 15) {
+        vec4 r = bg * (bg + 2.0 * fg * (1.0 - bg));
+        if (fg.r > 0.5) r.r = bg.r + (2.0 * fg.r - 1.0) * sqrt(max(bg.r, 0.0)) - bg.r;
+        if (fg.g > 0.5) r.g = bg.g + (2.0 * fg.g - 1.0) * sqrt(max(bg.g, 0.0)) - bg.g;
+        if (fg.b > 0.5) r.b = bg.b + (2.0 * fg.b - 1.0) * sqrt(max(bg.b, 0.0)) - bg.b;
+        if (fg.a > 0.5) r.a = bg.a + (2.0 * fg.a - 1.0) * sqrt(max(bg.a, 0.0)) - bg.a;
+        return clamp(r, 0.0, 1.0);
+    }
+    if (m == 16) {
+        vec4 r = 2.0 * fg * bg;
+        if (fg.r > 0.5) r.r = 1.0 - 2.0 * (1.0 - fg.r) * (1.0 - bg.r);
+        if (fg.g > 0.5) r.g = 1.0 - 2.0 * (1.0 - fg.g) * (1.0 - bg.g);
+        if (fg.b > 0.5) r.b = 1.0 - 2.0 * (1.0 - fg.b) * (1.0 - bg.b);
+        if (fg.a > 0.5) r.a = 1.0 - 2.0 * (1.0 - fg.a) * (1.0 - bg.a);
+        return clamp(r, 0.0, 1.0);
+    }
+    if (m == 17) {
+        vec4 r = bg;
+        if ((fg.r > 0.5 && fg.r > bg.r) || (fg.r < 0.5 && fg.r < bg.r)) r.r = fg.r;
+        if ((fg.g > 0.5 && fg.g > bg.g) || (fg.g < 0.5 && fg.g < bg.g)) r.g = fg.g;
+        if ((fg.b > 0.5 && fg.b > bg.b) || (fg.b < 0.5 && fg.b < bg.b)) r.b = fg.b;
+        if ((fg.a > 0.5 && fg.a > bg.a) || (fg.a < 0.5 && fg.a < bg.a)) r.a = fg.a;
+        return r;
+    }
+    if (m == 18) {
+        vec4 r = vec4(1.0);
+        if (fg.r + bg.r <= 1.0) r.r = 0.0;
+        if (fg.g + bg.g <= 1.0) r.g = 0.0;
+        if (fg.b + bg.b <= 1.0) r.b = 0.0;
+        if (fg.a + bg.a <= 1.0) r.a = 0.0;
+        return r;
+    }
+    if (m == 19) return abs(fg - bg);
+    if (m == 20) return fg + bg - 2.0 * fg * bg;
+    if (m == 21) return hal_mx_hsl_blend(fg.rgb, bg.rgb, bg.rgb, fg);
+    if (m == 22) return hal_mx_hsl_blend(bg.rgb, fg.rgb, bg.rgb, fg);
+    if (m == 23) return hal_mx_hsl_blend(fg.rgb, fg.rgb, bg.rgb, fg);
+    if (m == 24) return hal_mx_hsl_blend(bg.rgb, bg.rgb, fg.rgb, fg);
+    return fg;
+}
+
+vec4 hal_mx_comp_layer(vec4 res, vec4 fg, float opacity, float mask, int m)
+{
+    float a = fg.a;
+    if (a != 1.0 && a != 0.0) fg.rgb = fg.rgb / a;
+    float fa = a * mask;
+    fa = fa * (opacity / 100.0);
+    fg.a = fa;
+    float ra = res.a;
+    if (ra == 0.0) return fg;
+    vec4 bl = hal_mx_blend(m, fg, res);
+    float alpha = fa + (1.0 - fa) * ra;
+    float safe = (alpha != 0.0) ? alpha : 1.0;
+    vec3 rgb = (bl.rgb * (fa * ra) + fg.rgb * (fa * (1.0 - ra))
+                + res.rgb * ((1.0 - fa) * ra)) / safe;
+    return vec4(rgb, alpha);
+}
+
+vec4 hal_mx_comp_finish(vec4 res)
+{
+    if (res.a != 1.0) res.rgb = res.rgb * res.a;
+    return res;
+}
+""",
+    'mx_fresnel': """
+float hal_mx_fresnel(float ndv, float ior)
+{
+    float c = clamp(abs(ndv), 0.0, 1.0);
+    float g2 = ior * ior + c * c - 1.0;
+    if (g2 < 0.0) return 1.0;
+    float g = sqrt(max(g2, 0.0));
+    float gc = max(g + c, 1e-6);
+    float t = (c * gc - 1.0) / (c * gc + 1.0);
+    float f = ((g - c) * (g - c)) / (2.0 * gc * gc) * (1.0 + t * t);
+    return clamp(f, 0.0, 1.0);
+}
+""",
+}
+
+for _k, _v in MAX_GLSL.items():
+    PATTERN_GLSL[_k] = _v
+del _k, _v

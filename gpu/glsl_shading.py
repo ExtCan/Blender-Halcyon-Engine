@@ -43,11 +43,80 @@ struct HalcyonSurface {
     float cast_only;
     float shadows_only;
     float opacity;
+    float anime_th1;
+    float anime_soft1;
+    float anime_th2;
+    float anime_soft2;
+    float anime_bias;
+    float anime_tones;
+    float anime_spec_size;
+    float anime_sharp;
+    float anime_mask;
+    float anime_gain;
+    float anime_ramp_row;
+    float cartoon_amount;
+    float cartoon_th;
+    float cartoon_soft;
+    float cartoon_smooth;
+    float cartoon_hl_size;
+    float cartoon_hl_soft;
+    float cartoon_mode;
+    float cartoon_lamp;
+    float anime_shine;
+    float anime_shine_h;
+    float anime_shine_w;
+    float anime_shine_wave;
+    float anime_shine_waves;
+    float anime_shine_soft;
+    float anime_shine_second;
+    float anime_shine_shape;
+    float anime_shine_angle;
+    float anime_shine_follow;
+    float anime_air;
+    float anime_air_width;
+    float anime_air_side;
+    float cel_light;
+    float cel_ss;
+    float cel_ss_len;
+    float cel_rim_mode;
+    float cel_rim_width;
+    float cel_rim_side;
+    float cel_shape;
+    vec3  cel_dir;
+    vec3  anime_shadow1;
+    vec3  anime_shadow2;
+    vec3  cartoon_shadow;
+    vec3  cartoon_hl_color;
+    vec3  anime_shine_color;
+    vec3  anime_shine_color2;
+    vec3  anime_air_color;
     vec3  tangent;
     vec3  bitangent;
+    // R243: the Max Multi-Layer's second highlight, the Max
+    // Translucent's colour
+    vec3  specular2;
+    float specular_level2;
+    float glossiness2;
+    float anisotropy2;
+    float aniso_rot2;
+    vec3  translucent_color;
 };
 
+// R243: a Max shader whose diffuse carries its own colour (the
+// Oren-Nayar pair, Translucent) leaves it here; every other model
+// leaves the diffuse socket, and the light loop multiplies this in
+// place of s.diffuse -- the same values, bit for bit, on every old road
+vec3 hal_dif_rgb = vec3(1.0);
+
 float hal_saturate(float x) { return clamp(x, 0.0, 1.0); }
+
+// R229: smoothstep with running edges, exactly render._anime_smooth
+// (the guarded division, then t*t*(3-2t))
+float hal_sstep(float e0, float e1, float x)
+{
+    float t = clamp((x - e0) / max(e1 - e0, 1e-6), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
 
 vec3 hal_rgb2hsv(vec3 c)
 {
@@ -549,7 +618,240 @@ float hal_spec_toon(float ndl, float rdv, float size, float smoothness)
 }
 """
 
-GLSL = COMMON + DIFFUSE + SPECULAR
+MAX_SHADERS = """
+// ------------------------------------------- R243: 3ds Max's own shaders
+// shading.py's evaluate_max, line for line: Max's Glossiness is the
+// master's percent over 100, Soften folds the cosine BEFORE the power,
+// the frame is world Z projected onto the surface.
+
+float hal_max_soften(float c, float ndl, float soft)
+{
+    float r = ndl / max(soft, 1e-6);
+    float fold = (soft > 0.0 && ndl < soft) ? r * (2.0 - r) : 1.0;
+    return c * fold;
+}
+
+float hal_max_gloss(float gloss) { return clamp(gloss / 100.0, 0.0, 1.0); }
+
+float hal_max_spec_phong(float ndl, float rdv, float gloss, float soft)
+{
+    float e = pow(2.0, hal_max_gloss(gloss) * 10.0);
+    float c = hal_max_soften(max(rdv, 0.0), ndl, soft);
+    return (rdv > 0.0) ? pow(c, e) : 0.0;
+}
+
+float hal_max_spec_blinn(float ndl, float ndh, float gloss, float soft)
+{
+    float e = pow(2.0, hal_max_gloss(gloss) * 10.0) * 4.0;
+    float c = hal_max_soften(max(ndh, 0.0), ndl, soft);
+    return (ndh > 0.0) ? pow(c, e) : 0.0;
+}
+
+vec3 hal_max_oren_nayar(float ndl, float ndv, vec3 l, vec3 v, vec3 n,
+                        float rough, vec3 rho)
+{
+    rough = rough * 1.5707963;
+    float NL = ndl;
+    float a = (NL < 0.9999) ? acos(clamp(NL, -1.0, 1.0)) : 0.0;
+    a = clamp(a, -3.14159265 * 0.49, 3.14159265 * 0.49);
+    float NV = ndv;
+    vec3 vv = (NV < 0.0) ? -v : v;
+    NV = abs(NV);
+    float b = (NV < 0.9999) ? acos(clamp(NV, -1.0, 1.0)) : 0.0;
+    if (b > a) { float tmp = b; b = a; a = tmp; }
+    vec3 tanV = vv - n * NV;
+    vec3 tanL = l - n * NL;
+    float w = length(tanV) * length(tanL);
+    float cosDPhi = (abs(w) >= 0.0004) ? dot(tanV, tanL) / w : 1.0;
+    cosDPhi = clamp(cosDPhi, -1.0, 1.0);
+    float bc = ((cosDPhi >= 0.0) ? -b : b) * 0.63661977;
+    float bCube = bc * bc * bc;
+    float sigma2 = sqrt(rough);
+    float sigma3 = sigma2 / (sigma2 + 0.09);
+    float c1 = 1.0 - 0.5 * (sigma2 / (sigma2 + 0.33));
+    float c2 = 0.45 * sigma3 * (sin(a) - bCube);
+    float c3 = 0.125 * sigma3 * sqrt(max(4.0 * a * b / 6.2831853, 0.0));
+    float tanB = clamp(tan(b), -100.0, 100.0);
+    float tanAB = clamp(tan((a + b) * 0.5), -100.0, 100.0);
+    float l1 = c1 + c2 * cosDPhi * tanB + c3 * (1.0 - abs(cosDPhi)) * tanAB;
+    float l2 = 0.17 * (sigma2 / (sigma2 + 0.13))
+               * (1.0 - cosDPhi * sqrt(max(2.0 * b / 3.14159265, 0.0)));
+    rho = clamp(rho, 0.0, 1.0);
+    return clamp(l1 * rho + l2 * sqrt(rho), 0.0, 1.0);
+}
+
+vec3 hal_max_tangent(vec3 n)
+{
+    vec3 U = vec3(0.0, 0.0, 1.0);
+    float UN = dot(U, n);
+    if (UN > 0.9999) { U = vec3(0.0, 1.0, 0.0); UN = dot(U, n); }
+    return normalize(U - n * UN);
+}
+
+vec3 hal_max_rotate_about(vec3 t, vec3 n, float ang)
+{
+    float ca = cos(ang);
+    float sa = sin(ang);
+    return t * ca + cross(n, t) * sa + n * (dot(n, t) * (1.0 - ca));
+}
+
+float hal_max_gauss_highlight(vec3 n, vec3 l, vec3 v, float ndl, float gloss,
+                              float aniso, float orient, vec3 t)
+{
+    float asz = (1.0 - gloss) * 0.485;
+    float ax = max(0.015 + asz, 0.0);
+    float ay = max(0.015 + asz * (1.0 - aniso), 0.0);
+    vec3 h = normalize(l + v);
+    float NH = dot(n, h);
+    float NV = max(dot(n, v), 0.001);
+    float NL = ndl;
+    float g = min(1.0 / sqrt(max(NL * NV, 1e-12)), 3.0);
+    float ang = orient * 6.2831853;
+    vec3 t1 = (abs(ang) > 1e-9) ? hal_max_rotate_about(t, n, ang) : t;
+    vec3 b = cross(t1, n);
+    float x = dot(h, t1) / max(ax, 1e-6);
+    float y = dot(h, b) / max(ay, 1e-6);
+    float e = exp(-2.0 * (x * x + y * y) / (1.0 + NH));
+    float outv = 2.6525824 * g * e * 0.5;
+    return (NH > 0.0) ? outv : 0.0;
+}
+
+float hal_max_fres_metal(float c, float k)
+{
+    float b = k * k + 1.0;
+    float c2 = c * c;
+    float rpl = (b * c2 - 2.0 * c + 1.0) / (b * c2 + 2.0 * c + 1.0);
+    float rpp = (b - 2.0 * c + c2) / (b + 2.0 * c + c2);
+    return 0.5 * (rpl + rpp);
+}
+
+vec3 hal_max_spec_metal(vec3 n, vec3 l, vec3 v, float ndl, float ndv,
+                        float gloss, vec3 diffuse)
+{
+    float r = clamp(1.0 - gloss, 0.00001, 0.99999);
+    float m2inv = 1.0 / (r * r);
+    vec3 h = normalize(l + v);
+    float LH = dot(l, h);
+    float NH = dot(n, h);
+    float VH = dot(v, h);
+    float NV = ndv;
+    float NL = ndl;
+    float G = ((NV < NL) ? 2.0 * NV * NH : 2.0 * NL * NH) / ((VH != 0.0) ? VH : 1.0);
+    float fav0 = min((diffuse.r + diffuse.g + diffuse.b) * 0.33333334, 0.9999);
+    float kav = 2.0 * sqrt(max(fav0, 0.0)) / sqrt(max(1.0 - fav0, 1e-6));
+    float fav = hal_max_fres_metal(LH, kav);
+    float t = (fav - fav0) / max(1.0 - fav0, 1e-6);
+    vec3 fcol = (1.0 - t) * diffuse + t;
+    float sec2 = 1.0 / max(NH * NH, 1e-12);
+    float D = 0.15915494 * sec2 * sec2 * m2inv * exp((1.0 - sec2) * m2inv);
+    G = min(G, 1.0);
+    float Rs = D * G / (NV + 0.05);
+    bool ok = (NV >= 0.0) && (NH > 0.0) && (G > 0.0);
+    return ok ? fcol * Rs : vec3(0.0);
+}
+
+float hal_max_strauss_F(float x)
+{
+    float xb = clamp(x, 0.0, 1.0);
+    float xkf = 1.0 / ((xb - 1.12) * (xb - 1.12));
+    return (xkf - 0.79719387) / (69.444443 - 0.79719387);
+}
+
+float hal_max_strauss_G(float x)
+{
+    float xb = clamp(x, 0.0, 1.0);
+    float xkg = 1.0 / ((xb - 1.01) * (xb - 1.01));
+    return (10000.0 - xkg) / (10000.0 - 0.98029605);
+}
+
+vec4 hal_max_strauss(vec3 n, vec3 l, vec3 v, float ndl, float ndv, float gloss,
+                     float metal, float opacity, vec3 diffuse)
+{
+    float g3 = gloss * gloss * gloss;
+    float d = 1.0 - metal * gloss;
+    float rd = (1.0 - metal * g3) * opacity;
+    float rn = opacity - (1.0 - g3) * opacity;
+    float h_e = (gloss >= 1.0) ? 600.0 : 3.0 / max(1.0 - gloss, 1e-6);
+    float NL = ndl;
+    float NV = ndv;
+    float dif = max(NL, 0.0) * d * rd;
+    vec3 R = l - n * (2.0 * NL);
+    float RV = dot(normalize(R), v);
+    if (NL < 0.15) { RV = RV * hal_max_soften(1.0, NL, 0.15); }
+    float s = 1.3 * pow(max(-RV, 0.0), h_e);
+    float a = acos(clamp(NL, -1.0, 1.0)) / 1.5707963;
+    float b = acos(clamp(NV, -1.0, 1.0)) / 1.5707963;
+    float fa = hal_max_strauss_F(a);
+    float j = fa * hal_max_strauss_G(a) * hal_max_strauss_G(b);
+    float rj = (rn > 0.0) ? clamp(rn + (rn + 0.1) * j, 0.0, 1.0) : rn;
+    vec3 Cs = vec3(1.0) + (metal * (1.0 - fa)) * (diffuse - vec3(1.0));
+    vec3 spec = (RV < 0.0 && NL >= 0.0) ? (s * rj) * Cs : vec3(0.0);
+    return vec4(dif, spec);
+}
+
+// (diffuse scalar, specular.rgb); a coloured diffuse lands in hal_dif_rgb
+// with the scalar 1.0, exactly the CPU's (N, 3) return
+vec4 hal_evaluate_max(int model, HalcyonSurface s, vec3 n, vec3 l, vec3 v,
+                      float ndl, float ndv, float ndh, float rdv)
+{
+    float g = hal_max_gloss(s.glossiness);
+    float NL = max(ndl, 0.0);
+    bool lit = ndl >= 0.0;
+    hal_dif_rgb = s.diffuse;
+    if (model == 24) {                      // MAX_PHONG
+        float sp = hal_max_spec_phong(ndl, rdv, s.glossiness, s.soften);
+        return vec4(NL, (lit ? sp : 0.0) * s.specular);
+    }
+    if (model == 25) {                      // MAX_BLINN
+        float sp = hal_max_spec_blinn(ndl, ndh, s.glossiness, s.soften);
+        return vec4(NL, (lit ? sp : 0.0) * s.specular);
+    }
+    if (model == 26) {                      // MAX_METAL
+        vec3 spec = hal_max_spec_metal(n, l, v, ndl, ndv, g, s.diffuse);
+        float omabs = max(1.0 - abs(min(s.specular_level, 9.99)), 0.0);
+        return vec4(NL * omabs, lit ? spec : vec3(0.0));
+    }
+    if (model == 27) {                      // MAX_ANISOTROPIC
+        vec3 t = hal_max_tangent(n);
+        float gs = hal_max_gauss_highlight(n, l, v, NL, g, clamp(s.anisotropy, 0.0, 1.0),
+                                           s.aniso_rot, t);
+        return vec4(NL, (lit ? NL * gs : 0.0) * s.specular);
+    }
+    if (model == 28) {                      // MAX_MULTI_LAYER
+        vec3 dif = hal_max_oren_nayar(ndl, ndv, l, v, n, clamp(s.roughness, 0.0, 1.0),
+                                      s.diffuse) * NL;
+        vec3 t = hal_max_tangent(n);
+        float g1 = hal_max_gauss_highlight(n, l, v, NL, g, clamp(s.anisotropy, 0.0, 1.0),
+                                           s.aniso_rot, t);
+        float g2 = hal_max_gauss_highlight(n, l, v, NL, hal_max_gloss(s.glossiness2),
+                                           clamp(s.anisotropy2, 0.0, 1.0), s.aniso_rot2, t);
+        vec3 s1 = clamp((NL * g1 * min(s.specular_level, 9.99)) * s.specular, 0.0, 1.0);
+        vec3 s2 = (NL * g2 * min(s.specular_level2, 9.99)) * s.specular2;
+        vec3 spec = s1 + (1.0 - s1) * s2;
+        hal_dif_rgb = lit ? dif : vec3(0.0);
+        return vec4(1.0, lit ? spec : vec3(0.0));
+    }
+    if (model == 29) {                      // MAX_OREN_NAYAR_BLINN
+        vec3 dif = hal_max_oren_nayar(ndl, ndv, l, v, n, clamp(s.roughness, 0.0, 1.0),
+                                      s.diffuse) * NL;
+        float sp = hal_max_spec_blinn(ndl, ndh, s.glossiness, s.soften);
+        hal_dif_rgb = lit ? dif : vec3(0.0);
+        return vec4(1.0, (lit ? sp : 0.0) * s.specular);
+    }
+    if (model == 30) {                      // MAX_STRAUSS
+        return hal_max_strauss(n, l, v, ndl, ndv, g, clamp(s.metallic, 0.0, 1.0),
+                               clamp(s.opacity, 0.0, 1.0), s.diffuse);
+    }
+    // MAX_TRANSLUCENT (31)
+    float sp = hal_max_spec_blinn(ndl, ndh, s.glossiness, 0.0);
+    float back = (ndl < 0.0) ? 1.0 : 0.0;
+    vec3 trans = s.translucent_color * ((1.0 + back - NL) * (1.0 - NL));
+    hal_dif_rgb = s.diffuse * NL + max(trans, vec3(0.0));
+    return vec4(1.0, (lit ? sp : 0.0) * s.specular);
+}
+"""
+
+GLSL = COMMON + DIFFUSE + SPECULAR + MAX_SHADERS
 
 #: models expressed as a call the generated shader can make. Each returns
 #: vec4(diffuse, specular.rgb).
@@ -607,7 +909,11 @@ vec4 hal_evaluate2(int model, HalcyonSurface s, vec3 n, vec3 l, vec3 v,
     // multiplied by s.specular in the loop afterwards, which double-tinted
     // Metal and Strauss. Invisible while every test used a white specular.
     vec3 tint = s.specular;
+    hal_dif_rgb = s.diffuse;
 
+    if (model >= 24 && model <= 31) {       // R243: 3ds Max's own shaders
+        return hal_evaluate_max(model, s, n, l, v, ndl_d, ndv, ndh, rdv);
+    }
     if (model == 0) {                       // LAMBERT
         d = hal_diffuse_lambert(ndl_d);
     } else if (model == 1 || model == 2) {  // GOURAUD, FLAT
@@ -667,9 +973,19 @@ vec4 hal_evaluate2(int model, HalcyonSurface s, vec3 n, vec3 l, vec3 v,
         sp = hal_spec_blinn_phong(ndl, ndh, s.glossiness)
              + hal_spec_blinn_phong(ndl, ndh, max(s.glossiness * 0.15, 1.0))
                * 0.35;
+    } else if (model == 23) {               // OREN_NAYAR_BLINN (R242)
+        d = hal_diffuse_oren_nayar(ndl_d, ndv, l, v, n, s.roughness,
+                                   ndl);
+        sp = hal_spec_blinn(ndl, ndv, ndh, vdh, s.glossiness, s.ior);
     } else if (model == 14) {               // TOON
         d = hal_diffuse_toon(ndl_d, s.toon_size, s.toon_smooth, s.toon_steps);
         sp = hal_spec_toon(ndl, rdv, s.toon_size * 0.5, s.toon_smooth);
+    } else if (model == 21 || model == 22) { // ANIME (R218), CARTOON (R228)
+        // the cel bands (and the cartoon's lit verdict) live in the
+        // lamp lines where the shadow term exists; evaluate hands back
+        // the wrapped cosine, no specular
+        d = clamp(ndl_d * 0.5 + 0.5, 0.0, 1.0);
+        return vec4(d, vec3(0.0));
     } else if (model == 15) {               // TRANSLUCENT
         d = hal_diffuse_lambert(ndl)
             + max(-ndl, 0.0) * clamp(s.translucency, 0.0, 1.0);

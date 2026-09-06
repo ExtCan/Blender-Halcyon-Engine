@@ -20,6 +20,11 @@ class RenderSettings:
     spot_cone_samples: int = 12
     spot_cone_falloff: float = 2.0
     spot_cone_reach: float = 64.0
+    # R222: real marched volume containers (a material whose output
+    # links a Volume chain). Steps per ray; low counts band, and the
+    # banding is the era's own slicing artefact
+    volume_steps: int = 48
+    volume_shadows: bool = True
     render_device: str = 'CPU'
     # all three act only when render_device is GPU: the top-of-panel switch
     # is the choice, and these default on so choosing GPU means the GPU.
@@ -198,6 +203,9 @@ class RenderSettings:
     fog_end: float = 40.0
     fog_density: float = 0.05
     fog_vertex: bool = False           # per-vertex fog (Voodoo/PS1 style)
+    # R223: banded depth fog -- transmittance quantized to cel steps
+    # (0 = off; 2+ = the anime painted-planes distance look)
+    fog_bands: int = 0
     # height fog: the fog thins with world height above fog_height_top --
     # the layered ground mist the sixth-generation consoles drew
     fog_height: bool = False
@@ -297,6 +305,110 @@ class RenderSettings:
     outline_normals: bool = True
     outline_normal_angle: float = 60.0
     outline_over_sky: bool = True
+    # R220: draw the artist's own marked edges (Freestyle marks, sharp,
+    # creases) as interior ink, hidden-line-removed against the z-buffer
+    outline_marked: bool = False
+    # R227: the ink style pack -- every default is the mask road's own
+    # look, so an untouched scene never enters the distance-field road
+    ink_style: str = 'CLEAN'          # CLEAN | BRUSH | PENCIL
+    ink_reference_height: int = 0     # 0 = widths in internal pixels
+    ink_taper: float = 0.0            # thick near, thin far
+    ink_interior_scale: float = 1.0   # creases / material breaks / marks
+    ink_weight_noise: float = 0.0     # the hand's pressure along the line
+    ink_weight_scale: float = 24.0    # its screen scale, pixels
+    ink_shadow_side: float = 0.0      # thicker on the key lamp's shadow side
+    ink_boil: float = 0.0             # displacement amplitude, pixels
+    ink_boil_fps: int = 12            # the boil clock (12 = on twos at 24)
+    ink_boil_scale: float = 18.0      # displacement noise scale, pixels
+    ink_pencil_strokes: int = 3
+    ink_pencil_spread: float = 1.5
+    ink_grain: float = 0.0
+    ink_color_mode: str = 'FIXED'     # FIXED | FILL | GRADIENT
+    ink_fill_darken: float = 0.45
+    ink_color2: Tuple[float, float, float] = (0.35, 0.1, 0.45)
+    ink_gradient: str = 'DEPTH'       # DEPTH | VERTICAL | LIGHT
+    # R231: the drawn line -- stroke ends, roughness, drift, gaps, texture
+    ink_end_taper: float = 0.0        # the line thins toward stroke ends
+    ink_end_length: float = 12.0      # over this many pixels
+    ink_roughness: float = 0.0        # edge irregularity, in patches
+    ink_roughness_scale: float = 6.0  # its coarsest scale, pixels
+    ink_drift: float = 0.0            # the hand drifts off the contour, px
+    ink_gaps: float = 0.0             # dry-brush skips
+    ink_texture: str = 'SOLID'        # SOLID | STREAKS | CHARCOAL
+    ink_texture_amount: float = 0.6   # how much of the texture
+    # R234: the inker's line (core/lines.py) -- three more line sources
+    # and the Shadow Level they and the isophote weight share
+    outline_form: bool = False        # the valleys of the facing
+    outline_form_threshold: float = 0.3
+    outline_shadow: bool = False      # the terminator, inked
+    outline_shadow_level: float = 0.1  # n.l where the light stops
+    outline_tone: bool = False        # flow-guided DoG of the shaded frame
+    outline_tone_threshold: float = 0.15
+    # ... the isophote weight, the stroke road, the surface anchor
+    ink_isophote: float = 0.0         # Goodwin's thick-and-thin by the light
+    ink_isophote_range: float = 24.0  # the walk that earns the full width, px
+    ink_smooth: float = 0.0           # chain smoothing, pixels (sigma)
+    ink_pressure: float = 0.0         # heavier through curves, a pause at corners
+    ink_overshoot: float = 0.0        # lines run past ends and junctions, px
+    ink_anchor: str = 'SCREEN'        # SCREEN | SURFACE
+    # R230: the era looks -- the cel photographed and printed (core/film.py)
+    film_grade: str = 'NONE'          # NONE | TECHNICOLOR | EASTMAN_70S | TV_80S | VHS | MONO
+    film_grade_amount: float = 1.0    # how much of the stock's response
+    film_softness: float = 0.0        # optical softness, sigma in pixels
+    film_weave: float = 0.0           # gate weave amplitude, pixels
+    film_dust: float = 0.0            # dust and hairs on the print, density
+    film_grain: float = 0.0           # emulsion grain
+    film_flicker: float = 0.0         # projector flicker
+    film_hold: int = 1                # shoot on ones (1), twos (2), threes (3)
+    film_halftone: float = 0.0        # the print's dot screen, amount
+    film_halftone_pitch: float = 6.0  # dot cell, pixels
+    film_misregister: float = 0.0     # the cel laid off its pegs, pixels
+    film_bleed: float = 0.0           # paint soaking under the line, pixels
+    # R236: the colour PROCESS (core/film.colour_process) -- the records,
+    # the curve to dye, the dyes' impurities, the key, the registration
+    film_process: str = 'NONE'        # NONE | THREE_STRIP | TWO_COLOUR
+    film_process_amount: float = 1.0
+    film_exposure: float = 0.0        # the printer light, stops: down is denser
+    film_gamma: float = 1.3           # the print's straight-line slope
+    film_density: float = 2.4         # the dyes' maximum density
+    film_filters: float = 0.3         # the taking filters' sharpness
+    film_dye_purity: float = 0.5      # 0 = the documented impurities, 1 = ideal dyes
+    film_key: float = 0.0             # the silver key image under the dyes
+    film_halation: float = 0.0        # light scattered in the negative's base
+    film_halation_radius: float = 12.0  # its reach, pixels
+    film_register: float = 0.0        # dye-transfer registration error, pixels
+    # R237: the print's wear (sizes at 1080 lines, scaled by the frame's height)
+    film_grain_size: float = 1.0      # the grain's width, pixels
+    film_grain_clump: float = 0.0     # the share of grain in clumps three grains wide
+    film_grain_chroma: float = 0.5    # 0 = one sheet for every record, 1 = each its own
+    film_dust_size: float = 1.5       # the specks' mean radius, pixels
+    film_dust_negative: float = 0.25  # the share of dust that sat on the negative (clear specks)
+    film_dust_cel: float = 0.0        # the share that sat on the cel (held with the cel)
+    film_hairs: float = 0.0           # hairs in the projector gate, about this many at a time
+    film_hair_length: float = 90.0    # pixels
+    film_hair_width: float = 1.5      # pixels
+    film_hair_hold: int = 12          # frames a hair stays, about
+    film_scratches: float = 0.0       # scratches running, about this many at a time
+    film_scratch_width: float = 1.2   # pixels
+    film_scratch_hold: int = 48       # frames a scratch runs, about
+    film_scratch_side: str = 'EMULSION'  # EMULSION | BASE
+    film_reel: float = 0.0            # reel length in minutes; cue marks at its end (0 = none)
+    # R233: the painted background road (core/gouache.py) -- Meier strokes
+    # on materials in Background paint mode, and the Fleischer setback
+    bg_paint: float = 0.0             # stroke coverage; 0 = off
+    bg_stroke_size: float = 22.0      # stroke width, output pixels
+    bg_stroke_length: float = 3.0     # length over width
+    bg_direction: str = 'GRADIENT'    # GRADIENT | NORMAL | ANGLE
+    bg_angle: float = 20.0            # degrees, for ANGLE and the fallbacks
+    bg_spread: float = 0.5            # per-stroke turn, 0..1 of 45 degrees
+    bg_bristles: float = 0.6          # bristle streaks across each stroke
+    bg_variation: float = 0.25        # per-stroke lightening/darkening
+    bg_smooth: float = 2.0            # the abstracted base under the strokes, sigma px
+    bg_paper: float = 0.0             # the board's tooth over the painting
+    setback: float = 0.0              # the lens on the miniature: max sigma, px
+    setback_start: float = 10.0       # eye distance where the softness begins
+    setback_range: float = 20.0       # distance over which it reaches Setback
+    setback_sky: bool = True          # the sky sits at the far end
     show_stats: bool = False
     watermark: str = ''
     # extra outputs written alongside the beauty image, for the compositor
@@ -357,6 +469,18 @@ RESOLUTION_PRESETS = {
     'SXGA':         (1280, 1024, 1.0, 1.0),
     'UXGA':         (1600, 1200, 1.0, 1.0),
     'SUN_WS':       (1152, 900, 1.0, 1.0),
+    'PC98':         (640, 400, 1.0, 1.0),
+    'WXGA':         (1280, 800, 1.0, 1.0),
+    'SXGA_PLUS':    (1400, 1050, 1.0, 1.0),
+    'WSXGA_PLUS':   (1680, 1050, 1.0, 1.0),
+    'WUXGA':        (1920, 1200, 1.0, 1.0),
+    'QXGA':         (2048, 1536, 1.0, 1.0),
+    # R241: the panels between and past those
+    'XGA_PLUS':     (1152, 864, 1.0, 1.0),
+    'HD_1366':      (1366, 768, 1.0, 1.0),
+    'HD_900':       (1600, 900, 1.0, 1.0),
+    'WQXGA':        (2560, 1600, 1.0, 1.0),
+    'QSXGA':        (2560, 2048, 1.0, 1.0),
     'NEXT_MEGAPIXEL': (1120, 832, 1.0, 1.0),
     'MAC_13':       (640, 480, 1.0, 1.0),
     'MAC_16':       (832, 624, 1.0, 1.0),
@@ -372,6 +496,22 @@ RESOLUTION_PRESETS = {
     'AMIGA_NTSC':   (320, 200, 1.0, 1.2),
     'AMIGA_PAL':    (320, 256, 1.0, 1.0),
     'AMIGA_HIRES':  (640, 512, 1.0, 1.0),
+    'AMIGA_LACE':   (640, 400, 1.0, 1.0),
+    'ZX_SPECTRUM':  (256, 192, 1.0, 1.0),
+    'C64':          (320, 200, 1.0, 1.2),
+    'MSX':          (256, 192, 1.0, 1.0),
+    'APPLE_II':     (280, 192, 1.0, 1.0),
+    'ATARI_8BIT':   (320, 192, 1.0, 1.0),
+    'BBC_MICRO':    (640, 256, 1.0, 2.0),
+    # R241: more of the 8- and 16-bit rooms (aspects by the same rule:
+    # whatever fills the machine's own 4:3 tube -- or its own square
+    # monitor where it shipped with one)
+    'CPC':          (320, 200, 1.0, 1.2),
+    'VIC20':        (176, 184, 46.0, 33.0),
+    'ATARI_ST_MED': (640, 200, 5.0, 12.0),
+    'ATARI_ST_HI':  (640, 400, 1.0, 1.0),
+    'X68000':       (512, 512, 4.0, 3.0),
+    'PC88':         (640, 200, 5.0, 12.0),
 
     # --- game consoles
     'SNES':         (256, 224, 8.0, 7.0),
@@ -385,6 +525,20 @@ RESOLUTION_PRESETS = {
     'GAMECUBE':     (640, 480, 1.0, 1.0),
     'PS2':          (640, 448, 14.0, 15.0),
     'XBOX':         (640, 480, 1.0, 1.0),
+    'NES':          (256, 240, 8.0, 7.0),
+    'GAMEBOY':      (160, 144, 1.0, 1.0),
+    'GBA':          (240, 160, 1.0, 1.0),
+    'NDS':          (256, 192, 1.0, 1.0),
+    'PSP':          (480, 272, 1.0, 1.0),
+    'NEOGEO':       (320, 224, 32.0, 35.0),
+    'CPS2':         (384, 224, 8.0, 7.0),
+    'VIRTUAL_BOY':  (384, 224, 1.0, 1.0),
+    # R241: the consoles and handhelds between the ones above
+    'TG16':         (256, 224, 8.0, 7.0),
+    'CD_3DO':       (320, 240, 1.0, 1.0),
+    'GAMEGEAR':     (160, 144, 6.0, 5.0),
+    'LYNX':         (160, 102, 1.0, 1.0),
+    'WONDERSWAN':   (224, 144, 1.0, 1.0),
 
     # --- video formats
     'QCIF':         (176, 144, 12.0, 11.0),
@@ -396,6 +550,10 @@ RESOLUTION_PRESETS = {
     'DV_NTSC':      (720, 480, 10.0, 11.0),
     'DV_PAL':       (720, 576, 59.0, 54.0),
     'QUICKTIME_160': (160, 120, 1.0, 1.0),
+    'DVD_NTSC':     (720, 480, 10.0, 11.0),
+    'DVD_PAL':      (720, 576, 59.0, 54.0),
+    'HDV_1080':     (1440, 1080, 4.0, 3.0),
+    'DVCPRO_HD':    (1280, 1080, 3.0, 2.0),
 
     # --- pictures and textures
     'QUICKTAKE':    (640, 480, 1.0, 1.0),
@@ -406,6 +564,10 @@ RESOLUTION_PRESETS = {
     'TEXTURE_128':  (128, 128, 1.0, 1.0),
     'TEXTURE_256':  (256, 256, 1.0, 1.0),
     'TEXTURE_512':  (512, 512, 1.0, 1.0),
+    'TEXTURE_1024': (1024, 1024, 1.0, 1.0),
+    'TEXTURE_2048': (2048, 2048, 1.0, 1.0),
+    'TEXTURE_4096': (4096, 4096, 1.0, 1.0),
+    'MAVICA':       (640, 480, 1.0, 1.0),
 
     # --- panoramas and 360 (R194): pair the wide ones with the
     # Panoramic camera; the 2:1 sizes are the standard environment-
@@ -419,6 +581,17 @@ RESOLUTION_PRESETS = {
     'ENV_4K':       (4096, 2048, 1.0, 1.0),
     'ENV_8K':       (8192, 4096, 1.0, 1.0),
 
+    # --- film scans (R241): the scanner's frames, for the cel and
+    # film rounds -- full aperture is the whole camera gate, Academy
+    # the sound-era 1.375 inside it, the anamorphic scope frame is
+    # squeezed 2:1 in the pixel (unsqueeze happens in the aspect),
+    # Super 16 the 1.66 single-perf gate
+    'FILM_FULL_2K':    (2048, 1556, 1.0, 1.0),
+    'FILM_FULL_4K':    (4096, 3112, 1.0, 1.0),
+    'FILM_ACADEMY_2K': (1828, 1332, 1.0, 1.0),
+    'FILM_SCOPE_2K':   (1828, 1556, 2.0, 1.0),
+    'FILM_SUPER16_2K': (2048, 1234, 1.0, 1.0),
+
     # --- modern and general (R194)
     'QHD_1440':     (2560, 1440, 1.0, 1.0),
     'UHD_4K':       (3840, 2160, 1.0, 1.0),
@@ -429,6 +602,21 @@ RESOLUTION_PRESETS = {
     'SOCIAL_STORY': (1080, 1920, 1.0, 1.0),
     'A4_150':       (1754, 1240, 1.0, 1.0),
     'A4_300':       (3508, 2480, 1.0, 1.0),
+    'DCI_2K':       (2048, 1080, 1.0, 1.0),
+    'DCI_4K':       (4096, 2160, 1.0, 1.0),
+    'UHD_5K':       (5120, 2880, 1.0, 1.0),
+    'UHD_8K':       (7680, 4320, 1.0, 1.0),
+    'FHD_ULTRAWIDE': (2560, 1080, 1.0, 1.0),
+    'QHD_ULTRAWIDE': (3440, 1440, 1.0, 1.0),
+    'VERTICAL_FHD': (1080, 1920, 1.0, 1.0),
+    'VERTICAL_4K':  (2160, 3840, 1.0, 1.0),
+    'SQUARE_2K':    (2048, 2048, 1.0, 1.0),
+    'A3_300':       (4961, 3508, 1.0, 1.0),
+    'US_LETTER_300': (3300, 2550, 1.0, 1.0),
+    # R241
+    'SOCIAL_PORTRAIT': (1080, 1350, 1.0, 1.0),
+    'DQHD':         (5120, 1440, 1.0, 1.0),
+    'UWQHD_5K2K':   (5120, 2160, 1.0, 1.0),
 }
 
 #: the categories the UI shows, in order. Every RESOLUTION_PRESETS key appears
@@ -438,23 +626,47 @@ RESOLUTION_GROUPS = (
                      'NTSC_D1_WIDE', 'PAL_D1_WIDE', 'NTSC_TOASTER',
                      'HDTV_720', 'HDTV_1080')),
     ("Computer Monitors", ('HERCULES', 'EGA', 'QVGA', 'VGA', 'SVGA', 'XGA',
-                           'SXGA', 'UXGA', 'SUN_WS', 'NEXT_MEGAPIXEL',
+                           'XGA_PLUS', 'HD_1366', 'HD_900',
+                           'SXGA', 'SXGA_PLUS', 'UXGA', 'WXGA',
+                           'WSXGA_PLUS', 'WUXGA', 'WQXGA', 'QXGA',
+                           'QSXGA', 'SUN_WS',
+                           'NEXT_MEGAPIXEL', 'PC98',
                            'MAC_13', 'MAC_16', 'MAC_PORTRAIT',
                            'MAC_TWO_PAGE')),
     ("Home Computers", ('CGA', 'VGA_13H', 'QUAKE', 'MAC_CLASSIC', 'ATARI_ST',
-                        'AMIGA_NTSC', 'AMIGA_PAL', 'AMIGA_HIRES')),
-    ("Game Consoles", ('SNES', 'GENESIS', 'SATURN', 'PSX', 'PSX_HI', 'N64',
-                       'N64_HI', 'DREAMCAST', 'GAMECUBE', 'PS2', 'XBOX')),
+                        'AMIGA_NTSC', 'AMIGA_PAL', 'AMIGA_HIRES',
+                        'AMIGA_LACE', 'ZX_SPECTRUM', 'C64', 'MSX',
+                        'APPLE_II', 'ATARI_8BIT', 'BBC_MICRO',
+                        'CPC', 'VIC20', 'ATARI_ST_MED', 'ATARI_ST_HI',
+                        'X68000', 'PC88')),
+    ("Game Consoles", ('NES', 'SNES', 'GENESIS', 'NEOGEO', 'CPS2',
+                       'TG16', 'SATURN', 'PSX', 'PSX_HI', 'N64', 'N64_HI',
+                       'CD_3DO', 'DREAMCAST', 'GAMECUBE', 'PS2', 'XBOX',
+                       'GAMEBOY', 'GBA', 'NDS', 'PSP', 'VIRTUAL_BOY',
+                       'GAMEGEAR', 'LYNX', 'WONDERSWAN')),
     ("Video Formats", ('QCIF', 'CIF', 'VCD_NTSC', 'VCD_PAL', 'SVCD_NTSC',
-                       'SVCD_PAL', 'DV_NTSC', 'DV_PAL', 'QUICKTIME_160')),
-    ("Pictures & Textures", ('QUICKTAKE', 'DC120', 'PHOTOCD_BASE',
-                             'PHOTOCD_4BASE', 'PHOTOCD_16BASE', 'TEXTURE_128',
-                             'TEXTURE_256', 'TEXTURE_512')),
+                       'SVCD_PAL', 'DV_NTSC', 'DV_PAL', 'DVD_NTSC',
+                       'DVD_PAL', 'HDV_1080', 'DVCPRO_HD',
+                       'QUICKTIME_160')),
+    ("Pictures & Textures", ('QUICKTAKE', 'MAVICA', 'DC120',
+                             'PHOTOCD_BASE', 'PHOTOCD_4BASE',
+                             'PHOTOCD_16BASE', 'TEXTURE_128',
+                             'TEXTURE_256', 'TEXTURE_512',
+                             'TEXTURE_1024', 'TEXTURE_2048',
+                             'TEXTURE_4096')),
     ("Panoramas & 360", ('QTVR_CLASSIC', 'PANO_2K', 'PANO_4K', 'PANO_8K',
                          'ENV_1K', 'ENV_2K', 'ENV_4K', 'ENV_8K')),
-    ("Modern & General", ('QHD_1440', 'UHD_4K', 'CINEMA_FLAT',
-                          'CINEMA_SCOPE', 'SQUARE_1K', 'SOCIAL_SQUARE',
-                          'SOCIAL_STORY', 'A4_150', 'A4_300')),
+    ("Film Scans", ('FILM_FULL_2K', 'FILM_FULL_4K', 'FILM_ACADEMY_2K',
+                    'FILM_SCOPE_2K', 'FILM_SUPER16_2K')),
+    ("Modern & General", ('QHD_1440', 'UHD_4K', 'UHD_5K', 'UHD_8K',
+                          'DCI_2K', 'DCI_4K', 'CINEMA_FLAT',
+                          'CINEMA_SCOPE', 'FHD_ULTRAWIDE',
+                          'QHD_ULTRAWIDE', 'VERTICAL_FHD', 'VERTICAL_4K',
+                          'SQUARE_1K', 'SQUARE_2K', 'SOCIAL_SQUARE',
+                          'SOCIAL_STORY', 'SOCIAL_PORTRAIT',
+                          'DQHD', 'UWQHD_5K2K',
+                          'A4_150', 'A4_300', 'A3_300',
+                          'US_LETTER_300')),
 )
 
 #: display names where Title Case of the key would be wrong or unhelpful
@@ -499,6 +711,44 @@ RESOLUTION_LABELS = {
     'SQUARE_1K': "Square 1024", 'SOCIAL_SQUARE': "Social Square 1080",
     'SOCIAL_STORY': "Social Story 9:16",
     'A4_150': "A4 Print 150dpi", 'A4_300': "A4 Print 300dpi",
+    'NES': "NES / Famicom", 'GAMEBOY': "Game Boy",
+    'GBA': "Game Boy Advance", 'NDS': "Nintendo DS",
+    'PSP': "PlayStation Portable", 'NEOGEO': "Neo Geo",
+    'CPS2': "Capcom CPS-2 Arcade", 'VIRTUAL_BOY': "Virtual Boy",
+    'PC98': "NEC PC-9801", 'WXGA': "WXGA", 'SXGA_PLUS': "SXGA+",
+    'WSXGA_PLUS': "WSXGA+", 'WUXGA': "WUXGA", 'QXGA': "QXGA",
+    'AMIGA_LACE': "Amiga NTSC Hires Lace",
+    'ZX_SPECTRUM': "ZX Spectrum", 'C64': "Commodore 64",
+    'MSX': "MSX", 'APPLE_II': "Apple II Hi-Res",
+    'ATARI_8BIT': "Atari 8-bit", 'BBC_MICRO': "BBC Micro Mode 0",
+    'DVD_NTSC': "DVD NTSC", 'DVD_PAL': "DVD PAL",
+    'HDV_1080': "HDV 1080 (anamorphic)",
+    'DVCPRO_HD': "DVCPRO HD 1080 (anamorphic)",
+    'TEXTURE_1024': "Game Texture 1K", 'TEXTURE_2048': "Game Texture 2K",
+    'TEXTURE_4096': "Game Texture 4K", 'MAVICA': "Sony Mavica FD",
+    'DCI_2K': "DCI 2K Cinema", 'DCI_4K': "DCI 4K Cinema",
+    'UHD_5K': "5K UHD+", 'UHD_8K': "8K UHD",
+    'FHD_ULTRAWIDE': "Ultrawide FHD 21:9",
+    'QHD_ULTRAWIDE': "Ultrawide QHD 21:9",
+    'VERTICAL_FHD': "Vertical FHD 9:16", 'VERTICAL_4K': "Vertical 4K 9:16",
+    'SQUARE_2K': "Square 2048",
+    'A3_300': "A3 Print 300dpi", 'US_LETTER_300': "US Letter 300dpi",
+    # R241
+    'XGA_PLUS': "XGA+", 'HD_1366': "HD Laptop 1366",
+    'HD_900': "HD+ 1600x900", 'WQXGA': "WQXGA", 'QSXGA': "QSXGA",
+    'CPC': "Amstrad CPC", 'VIC20': "VIC-20",
+    'ATARI_ST_MED': "Atari ST Medium", 'ATARI_ST_HI': "Atari ST High Mono",
+    'X68000': "Sharp X68000", 'PC88': "NEC PC-88",
+    'TG16': "TurboGrafx-16 / PC Engine", 'CD_3DO': "3DO",
+    'GAMEGEAR': "Game Gear", 'LYNX': "Atari Lynx",
+    'WONDERSWAN': "WonderSwan",
+    'FILM_FULL_2K': "35mm Full Aperture 2K",
+    'FILM_FULL_4K': "35mm Full Aperture 4K",
+    'FILM_ACADEMY_2K': "35mm Academy 2K",
+    'FILM_SCOPE_2K': "CinemaScope 2K (Anamorphic)",
+    'FILM_SUPER16_2K': "Super 16 2K",
+    'SOCIAL_PORTRAIT': "Social Portrait 4:5",
+    'DQHD': "Super Ultrawide DQHD", 'UWQHD_5K2K': "Ultrawide 5K2K",
 }
 
 
