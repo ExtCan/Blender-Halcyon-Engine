@@ -57,7 +57,11 @@ ORDERED = {'BAYER2': BAYER2, 'BAYER4': BAYER4, 'BAYER8': BAYER8,
            'BAYER16': bayer(16), 'HALFTONE': HALFTONE8}
 
 
-def threshold_map(kind, h, w):
+def threshold_map(kind, h, w, frame=1, seed=0):
+    if kind == 'N64_NOISE':
+        # R251 C015: the RDP's random alpha compare -- a FULL-FRAME
+        # 8-bit hash per (pixel, frame, seed), never a tiled map
+        return noise_threshold_map(h, w, frame, seed)
     m = ORDERED.get(kind)
     if m is None:
         return None
@@ -378,3 +382,170 @@ def apply_dither(img, palette, kind='NONE', strength=1.0, serpentine=True,
         idx = icm.lookup(np.clip(img, 0, 1))
         out = palette[idx]
     return (out, idx) if return_index else out
+
+
+# ---------------------------------------------------------------- R251
+# The transparency pack (1.90.0): Screen Door's column mesh, the numbered
+# stipple patterns, and the framebuffer formats' pack / read-back integer
+# arithmetic (PS2 PSMCT16, GameCube RGBA6, 3dfx Voodoo RGB565). Every
+# integer step is np.int32; `>>` on a negative int32 is NumPy's arithmetic
+# (floor) shift, which is what every one of these chips did.
+
+#: the Mega Drive / SNES pseudo-hires 1x2 column mesh: threshold 0.25 at an
+#: even column, 0.75 at an odd one -- under the keep rule `alpha > thr` an
+#: opacity in (0.25, 0.75] draws every other pixel column, above 0.75 all,
+#: below 0.25 none. Columns are the frame's own pixel columns.
+COLUMNS = np.array([[0.25, 0.75]], np.float32)
+ORDERED['COLUMNS'] = COLUMNS
+
+#: Screen Door's numbered patterns (properties.STIPPLE_PATTERN carries the
+#: same numbers, explicitly, so a saved .blend keeps its pattern): the five
+#: ordered kinds keep the positions the DITHER list gave them, COLUMNS and
+#: N64_NOISE sit past DITHER's fourteen. N64_NOISE (15) is the RDP's random
+#: alpha compare, a per-frame hash and not a threshold map (C015).
+STIPPLE_NUMBERS = {'BAYER2': 1, 'BAYER4': 2, 'BAYER8': 3, 'BAYER16': 4,
+                   'HALFTONE': 5, 'COLUMNS': 14, 'N64_NOISE': 15}
+
+
+def noise_threshold_at(x, y, frame, seed):
+    """R251 C015 (N64 RDP `dither_alpha_en`): the fresh 8-bit random the
+    alpha compare tests against, at pixel (x, y) of frame `frame` under
+    `seed` -- `film._hash_u32_raw`'s low byte (the hash the GRAIN stage
+    already twins), keyed by ONE integer `frame * 0x10001 + seed` so a
+    frame step and a seed step never collide within 65536 frames.
+    Values 0..255 as float32 (exactly representable); the RDP's LFSR is
+    replaced by Halcyon's own hash, disclosed."""
+    from .film import _hash_u32_raw
+    key = (int(frame) * 0x10001 + int(seed)) & 0x7fffffff
+    r8 = _hash_u32_raw(np.asarray(x), np.asarray(y), key) & np.uint32(0xff)
+    return r8.astype(np.float32)
+
+
+def noise_threshold_map(h, w, frame, seed):
+    """The full-frame (h, w) float32 map of `noise_threshold_at` -- the
+    CPU indexes it `tm[py, px]` (row 0 = bottom) and the GPU road uploads
+    THIS array (four columns per RGBA32F texel), so both devices compare
+    the same 8-bit random at every pixel."""
+    ys, xs = np.mgrid[0:int(h), 0:int(w)]
+    return noise_threshold_at(xs, ys, frame, seed)
+
+
+def pattern(kind, x, y, frame=0, seed=0):
+    """The Screen Door threshold at pixel (x, y) for a numbered or named
+    stipple pattern: `kind` is a STIPPLE_NUMBERS name or its number. An
+    ordered kind indexes its threshold map (tiled from row 0, exactly as
+    `threshold_map` tiles it); N64_NOISE returns the RDP's per-(pixel,
+    frame, seed) 8-bit random (0..255, compared against round(a*255));
+    a kind with no map returns None so the caller falls back by name
+    (Bayer 4x4, printed)."""
+    if not isinstance(kind, str):
+        names = {v: k for k, v in STIPPLE_NUMBERS.items()}
+        kind = names.get(int(kind), '')
+    if str(kind) == 'N64_NOISE':
+        return noise_threshold_at(x, y, frame, seed)
+    m = ORDERED.get(str(kind))
+    if m is None:
+        return None
+    xx = np.asarray(x, np.int64) % m.shape[1]
+    yy = np.asarray(y, np.int64) % m.shape[0]
+    return m[yy, xx]
+
+
+# The framebuffer formats' matrices, as the hardware (or its verified
+# emulator) holds them:
+#: the Voodoo's 4x4 (MAME voodoo_render.h s_dither_matrix_4x4)
+FB_M4 = np.array([[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9],
+                  [15, 7, 13, 5]], np.int32)
+#: the Voodoo's '2x2' (MAME s_dither_matrix_2x2 -- the real {8,10;11,9})
+FB_M2 = np.array([[8, 10], [11, 9]], np.int32)
+#: the GS's DIMX as gsKit's default {4,2,5,3, 0,6,1,7, 5,3,4,2, 1,7,0,6}
+#: read as the register's signed 3-bit two's-complement fields
+FB_DIMX = np.array([[-4, 2, -3, 3], [0, -2, 1, -1], [-3, 3, -4, 2],
+                    [1, -1, 0, -2]], np.int32)
+#: Flipper's 2x2 (Dolphin's hardware test, PixelShaderGen.cpp)
+FB_D2GC = np.array([[0, 2], [3, 1]], np.int32)
+
+FB_FORMATS = ('NONE', 'PS2_CT16', 'GC_RGBA6', 'VOODOO_565_4X4',
+              'VOODOO_565_2X2')
+
+
+def fb_dither_value(fmt, xx, yy, dither):
+    """The matrix entry each pixel adds at a write, int32, same shape as
+    `xx`/`yy` (frame coordinates: `yy` is the frame row, so a banded
+    worker indexes exactly as the whole frame does)."""
+    xx = np.asarray(xx, np.int32)
+    yy = np.asarray(yy, np.int32)
+    fmt = str(fmt)
+    if fmt == 'GC_RGBA6':
+        return FB_D2GC[yy & 1, xx & 1]            # RGBA6 always dithers
+    if not dither:
+        return np.zeros(np.broadcast(xx, yy).shape, np.int32)
+    if fmt == 'PS2_CT16':
+        return FB_DIMX[yy & 3, xx & 3]
+    if fmt == 'VOODOO_565_4X4':
+        return FB_M4[yy & 3, xx & 3]
+    if fmt == 'VOODOO_565_2X2':
+        return FB_M2[yy & 1, xx & 1]
+    return np.zeros(np.broadcast(xx, yy).shape, np.int32)
+
+
+def fb_pack8(c8, xx, yy, fmt, dither):
+    """One write into the buffer: 8-bit int32 rgb (..., 3) -> the STORED
+    value as its 8-bit read-back expansion (..., 3) int32. The expansion
+    is injective, so the 5/6-bit integer the buffer holds is recovered
+    exactly by the inverse shift. PS2: (c8 + DIMX) >> 3, zero-fill
+    expand (the GS reads its 5 bits back as-is); GC: Dolphin's prescale
+    `c8 - (c8 >> 6)` plus the 2x2, >> 2, bit-replicated; Voodoo: MAME's
+    hardware-verified 565 pack, bit-replicated."""
+    c8 = np.asarray(c8, np.int32)
+    fmt = str(fmt)
+    d = fb_dither_value(fmt, xx, yy, dither)[..., None]
+    if fmt == 'PS2_CT16':
+        c5 = np.clip((c8 + d) >> 3, 0, 31)
+        return c5 << 3
+    if fmt == 'GC_RGBA6':
+        t = c8 - (c8 >> 6) + d
+        c6 = np.clip(t >> 2, 0, 63)
+        return (c6 << 2) | (c6 >> 4)
+    if fmt in ('VOODOO_565_4X4', 'VOODOO_565_2X2'):
+        r8 = c8[..., 0]
+        g8 = c8[..., 1]
+        b8 = c8[..., 2]
+        dd = d[..., 0]
+        r5 = np.clip(((r8 << 1) - (r8 >> 4) + (r8 >> 7) + dd) >> 4, 0, 31)
+        g6 = np.clip(((g8 << 2) - (g8 >> 4) + (g8 >> 6) + dd) >> 4, 0, 63)
+        b5 = np.clip(((b8 << 1) - (b8 >> 4) + (b8 >> 7) + dd) >> 4, 0, 31)
+        out = np.empty_like(c8)
+        out[..., 0] = (r5 << 3) | (r5 >> 2)
+        out[..., 1] = (g6 << 2) | (g6 >> 4)
+        out[..., 2] = (b5 << 3) | (b5 >> 2)
+        return out
+    return c8
+
+
+def fb_read8(s8, xx, yy, fmt, dither, subtract):
+    """The destination a blend SEES, from the stored expansion (..., 3)
+    int32. The GS and the EFB read back exactly what they hold; the Voodoo
+    with fbzMode bit 19 ('alpha dither subtraction') adds the matrix value
+    back before blending -- and adds nothing when nothing was added at the
+    write (Buffer Dither off)."""
+    s8 = np.asarray(s8, np.int32)
+    fmt = str(fmt)
+    if fmt in ('VOODOO_565_4X4', 'VOODOO_565_2X2') and subtract and dither:
+        d = fb_dither_value(fmt, xx, yy, dither)
+        out = np.empty_like(s8)
+        out[..., 0] = np.minimum(255, s8[..., 0] + ((15 - d) >> 1))
+        out[..., 1] = np.minimum(255, s8[..., 1] + ((15 - d) >> 2))
+        out[..., 2] = np.minimum(255, s8[..., 2] + ((15 - d) >> 1))
+        return out
+    return s8
+
+
+def fb_over8(f8, a8, b8):
+    """The 8-bit integer over every 16-bit-era blend unit ran (C070's
+    rule; the PS2 and the GC blend in 8 bits too): (F*a + B*(255-a) + 128)
+    >> 8, int32 per channel. `a8` is (...,) and broadcasts over rgb."""
+    f8 = np.asarray(f8, np.int32)
+    b8 = np.asarray(b8, np.int32)
+    a8 = np.asarray(a8, np.int32)[..., None]
+    return (f8 * a8 + b8 * (255 - a8) + 128) >> 8

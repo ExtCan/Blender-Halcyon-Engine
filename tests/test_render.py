@@ -112,7 +112,10 @@ def test_shading_rates_differ():
 # multiplied by zero. That is correct behaviour, not a collision to fix.
 # R243: likewise Max's Translucent with a black Translucent Color IS Max's
 # Blinn (its highlight is Blinn's without Soften, and Soften defaults to 0).
-EXPECTED_TWINS = {('LAMBERT', 'TRANSLUCENT'), ('MAX_BLINN', 'MAX_TRANSLUCENT')}
+EXPECTED_TWINS = {('LAMBERT', 'TRANSLUCENT'), ('MAX_BLINN', 'MAX_TRANSLUCENT'),
+                  # R251 (MAT-A C049): the plot refuses at defaults (no
+                  # fixed palette) and shades as FLAT, by name
+                  ('FLAT', 'SUPERFX_PLOT')}
 
 
 def test_models_differ():
@@ -542,7 +545,8 @@ def test_sky_modes():
         full[mode] = SKY.evaluate(w, dirs)
     pairs = [(a, b) for i, a in enumerate(full) for b in list(full)[i + 1:]]
     same = [f'{a}=={b}' for a, b in pairs
-            if float(np.abs(full[a] - full[b]).mean()) < 1e-4]
+            if 'CYLINDER' not in (a, b)      # R251: a backdrop by pixel; its direction road is SOLID's by design
+            and float(np.abs(full[a] - full[b]).mean()) < 1e-4]
     check('the sky modes are all distinct over the whole sphere', not same,
           ', '.join(same))
 
@@ -1635,6 +1639,30 @@ def test_shader_node_tooltips():
             d2, s2 = evaluate(ident, b, N, L, V)
             if float(np.abs(d1 - d2).max()) > 1e-6 or \
                     float(np.abs(s1 - s2).max()) > 1e-6:
+                measured.add(ident)
+            # R251 (LIGHT-B2): DS_FIXED's table highlight reads Specular
+            # Color and Glossiness BESIDE the evaluate call (light_surface
+            # and the GPU per-light block: the shared GLSL dispatch has no
+            # sampler), and SEGA_MODEL2 reads Glossiness through a 1/2/4/8
+            # snap this perturbation (25 -> 6.3) never crosses
+            if ident == 'DS_FIXED' and attr in ('specular', 'glossiness'):
+                measured.add(ident)
+            # R251 (MAT-A C034, post pass 2): DS_TOON / DS_HIGHLIGHT light
+            # with the DS_FIXED lobe (shading.LOBE_ALIAS), so the evaluate
+            # call above cannot see the two sockets for them either (run
+            # without this branch it measures neither model). They are NOT
+            # added by hand: the frame is measured -- the same perturbation
+            # on the master node's socket, the Ball's pixels compared, on an
+            # eight-entry table (measured 2026-10-04, of 339 px: DS_TOON
+            # 10 / 56, DS_HIGHLIGHT 3 / 37 for Specular Color / Glossiness;
+            # the default two-entry table has one edge, which the Specular
+            # Color perturbation does not cross on that Ball: 0 px)
+            if ident in ('DS_TOON', 'DS_HIGHLIGHT') \
+                    and attr in ('specular', 'glossiness'):
+                from . import test_r251_material as _m251
+                if _m251.ds_socket_moved_pixels(ident, attr) > 0:
+                    measured.add(ident)
+            if ident == 'SEGA_MODEL2' and attr == 'glossiness':
                 measured.add(ident)
         claimed = set(SOCKET_MODELS[sock]) if SOCKET_MODELS[sock] != ALL \
             else set(idents)
@@ -4166,14 +4194,6 @@ def test_gpu_shaders_compile_and_agree():
           float(np.abs(got - want).max()) <= tol,
           f'max {float(np.abs(got - want).max()):.5f} vs tolerance {tol}')
 
-    got = run('DITHER', levels=(32., 64., 32.), strength=1.0, matrix_size=4.0,
-              resolution=(w, h))
-    want = DI.ordered_bits(img.copy(), (5, 6, 5), 'BAYER4', 1.0)
-    tol = VALIDATION['DITHER'][1]
-    check('the DITHER shader agrees within its stated tolerance',
-          float(np.abs(got - want).max()) <= tol,
-          f'max {float(np.abs(got - want).max()):.5f} vs tolerance {tol}')
-
     # NTSC now carries the CPU formulation -- I and Q at their own radii, and
     # the triple box run as three real passes, because the CPU re-pads the
     # frame edge before every pass and one composed kernel cannot say that.
@@ -6693,7 +6713,8 @@ def test_material_templates():
     # + the R229 two: the 80s hair and skin
     # + the R232 seven: the 2D media, five converters and two surfaces
     # + the R242 one: Max's Ink 'n Paint
-    check('the shelf holds 113 templates', len(tmpl.TEMPLATES) == 113,
+    # + the R246 one: the Sparking! ZERO base skin
+    check('the shelf holds 114 templates', len(tmpl.TEMPLATES) == 114,
           str(len(tmpl.TEMPLATES)))
     check('the 80s cel recipes landed with the additions armed',
           tmpl.TEMPLATES['CEL_80S_HAIR']['inputs'].get('Hair Shine', 0) > 0
@@ -7270,8 +7291,13 @@ def test_device_capability_table():
     proven = {k for k, (grade, _t) in VALIDATION.items()
               if grade in ('EXACT', 'CLOSE')}
     claimed = {f for f, (sup, _w) in C.FEATURES.items() if sup == C.BOTH}
-    mapping = {'display_transform': 'DISPLAY', 'ordered_dither': 'DITHER',
-               'crt': 'CRT', 'lens': 'LENS', 'composite_ntsc': 'NTSC'}
+    mapping = {'display_transform': 'DISPLAY', 'ordered_dither': 'ORDERED',
+               'crt': 'CRT', 'lens': 'LENS', 'composite_ntsc': 'NTSC',
+               # R251 (post-palette): the VALIDATION grade of each stage
+               'palette_snap': 'PALETTE', 'era_colour_roads': 'CRY16',
+               # R251 (post-palette, wave 2)
+               'super_black': 'SUPERBLACK',
+               'video_color_check': 'LEGALISE'}
     unproven = []
     for f in claimed:
         if f in mapping:
@@ -7466,8 +7492,13 @@ void main() {
 
     wrong = []
     tested = 0
+    from ..core.shading import UNSUPPORTED_MODELS as _NOGLSL
     for ident, _label, _note in MODEL_ITEMS:
         if ident == 'WIREFRAME':          # not a reflectance model
+            continue
+        if ident in _NOGLSL:
+            # R251 (LIGHT-B2): the Sega boards' models ARE their rates
+            # (FACE / VERTEX) and never reach GLSL by design
             continue
         tested += 1
         d_cpu, s_cpu = evaluate(ident, surf(), N, L, V)
@@ -7970,8 +8001,11 @@ def test_assembled_material_shader_matches_cpu():
     idx = {m[0]: i for i, m in enumerate(MODEL_ITEMS)}
     wrong = []
     tested = 0
+    from ..core.shading import UNSUPPORTED_MODELS as _NOGLSL2
     for ident, _l, _no in MODEL_ITEMS:
-        if ident in ('WIREFRAME', 'GOURAUD', 'FLAT'):
+        if ident in ('WIREFRAME', 'GOURAUD', 'FLAT') or ident in _NOGLSL2:
+            # R251 (LIGHT-B2): SEGA_MODEL2 / SEGA_MODEL3 shade on the
+            # corner road only (no GLSL by design)
             continue
         tested += 1
         u = dict(uni)
@@ -11237,6 +11271,48 @@ def test_generated_glsl_is_driver_strict():
             left = surviving(strip_declarations(src))
             check(f"'{name}' hands CreateInfo no declaration text",
                   not left, str(left[:2]))
+
+    # ---- R250 (1.89.0): the sky pass, the ink passes and the resident
+    # post stages are hand-written GLSL that only the simulator reads
+    # headless. The simulator is forgiving where a driver is not: it
+    # accepts `log10` (not GLSL), HLSL's `saturate` / `lerp` / `frac` /
+    # `atan2` / `rsqrt` / `ddx` / `ddy` / `tex2D` / `float2..4`, Python's
+    # `**`, `np.` and `math.`; `int / int` is a float in it and `int(a /
+    # b)` on ints does not truncate (`int(float(a) / float(b))` does).
+    # Every new source is swept for those by name, stripped like a
+    # material pass, and audited for reserved-word identifiers.
+    from ..gpu import ink as GINK
+    from ..gpu import sky as GSKY
+    from ..gpu.stages import body as stage_body
+    swept = dict(GSKY.SOURCES)
+    swept.update({f'ink {k}': v for k, v in GINK.SOURCES.items()})
+    swept.update({f'stage {k}': stage_body(k) for k in STAGES})
+    check('the sweep covers the sky, every ink pass and every stage',
+          'SKY' in swept and len(GINK.SOURCES) >= 4
+          and all(f'stage {k}' in swept for k in ('GRAIN', 'QUANT',
+                                                  'RESOLVE', 'DISPLAY')),
+          str(sorted(swept)))
+    not_glsl = re.compile(
+        r'(?<![\w.])(log10|saturate|lerp|frac|atan2|rsqrt|ddx|ddy|tex2D|'
+        r'float[234]|int[234]|half[234]?|fmod|mul)\s*\(|\*\*|\bnp\.|\bmath\.')
+    for name, src in sorted(swept.items()):
+        code = '\n'.join(ln.split('//', 1)[0] for ln in src.splitlines())
+        hits = sorted(set(m.group(0) for m in not_glsl.finditer(code)))
+        check(f"'{name}' uses no word the simulator accepts and GLSL "
+              'refuses', not hits, str(hits))
+        left = surviving(strip_declarations(src))
+        check(f"'{name}' hands CreateInfo no duplicate declarations",
+              not left, str(left[:2]))
+        rhits = re.findall(reserved, code)
+        check(f"'{name}' declares no reserved-word identifiers", not rhits,
+              str(rhits))
+        # a bare `int(x / y)` is the truncation blind spot unless both
+        # operands are already floats: every one in the new sources says
+        # so with `float(` on the spot
+        trunc = [m for m in re.findall(r'int\(([^()]*?/[^()]*?)\)', code)
+                 if 'float(' not in m and '.' not in m]
+        check(f"'{name}' truncates no int / int inside int()", not trunc,
+              str(trunc))
 
 
 def test_spot_cones_match_a_brute_force_march():
@@ -16827,9 +16903,11 @@ def test_sixth_generation_console_presets():
               p.get('category') == 'CONSOLE', str(p.get('category')))
         extra = sorted(set(p.get('settings', {})) - known)
         check(f'every {key} key is a real setting', not extra, str(extra))
+    # since 1.90.0 the PS2's dither is the GS's DIMX inside the framebuffer
     check('the PS2 look is field-rendered and dithered',
           PRESETS['PS2']['settings'].get('interlace') == 'FIELDS'
-          and PRESETS['PS2']['settings'].get('dither') != 'NONE')
+          and (PRESETS['PS2']['settings'].get('dither') != 'NONE'
+               or PRESETS['PS2']['settings'].get('framebuffer') == 'PS2_CT16'))
     check('the GameCube look mips trilinearly into layered table fog',
           PRESETS['GAMECUBE']['settings'].get('tex_filter') == 'TRILINEAR'
           and PRESETS['GAMECUBE']['settings'].get('fog_mode') == 'TABLE16'
@@ -17620,8 +17698,12 @@ def _matrix_run(sc, st):
     return post.process(img, st, frame=1, seed=st.seed,
                         target_size=(st.resolution_x, st.resolution_y),
                         allow_resize=False,
+                        # R251 (C092): the plane passed like depth=
+                        coverage=getattr(sc, 'last_coverage', None),
                         depth=getattr(sc, 'last_depth', None),
-                        shaft_sources=getattr(sc, 'last_shafts', None))
+                        shaft_sources=getattr(sc, 'last_shafts', None),
+                        cvg=getattr(sc, 'last_cvg', None),   # R251 C001
+                        gel=getattr(sc, 'last_gel', None))
 
 
 def test_every_feature_survives_the_device_switch():
@@ -17662,17 +17744,21 @@ def test_the_device_switch_gates_every_gpu_entry():
     render with the default gpu_post=True ran its post chain on any
     driver present -- the switch said CPU while dither drew on the GPU
     (up to 0.032 from the CPU chain, per the stage table's own claims).
-    These counters make the contract structural for all four doors:
-    probe, rasteriser, shading, post.
+    These counters make the contract structural for all six doors:
+    probe, rasteriser, shading, post -- and R250's two, the resolve
+    (gpu/frame.resolve) and the sky pass (gpu/sky.prepare).
     """
     from ..gpu import chain as CH
     from ..gpu import craster as CRA
     from ..gpu import device as DEV
+    from ..gpu import frame as FR
     from ..gpu import shade as GSH
+    from ..gpu import sky as GSKY
 
-    calls = {'probe': 0, 'raster': 0, 'shade': 0, 'post': 0}
+    calls = {'probe': 0, 'raster': 0, 'shade': 0, 'post': 0, 'resolve': 0,
+             'sky_prepare': 0}
     saved = (DEV.probe, CRA.raster_into_gbuffer, GSH.shade_frame,
-             CH.try_stage)
+             CH.try_stage, FR.resolve, GSKY.prepare)
 
     def _probe(*a, **k):
         calls['probe'] += 1
@@ -17690,8 +17776,17 @@ def test_the_device_switch_gates_every_gpu_entry():
         calls['post'] += 1
         return saved[3](*a, **k)
 
+    def _resolve(*a, **k):
+        calls['resolve'] += 1
+        return saved[4](*a, **k)
+
+    def _sky(*a, **k):
+        calls['sky_prepare'] += 1
+        return saved[5](*a, **k)
+
     DEV.probe, CRA.raster_into_gbuffer = _probe, _raster
     GSH.shade_frame, CH.try_stage = _shade, _stage
+    FR.resolve, GSKY.prepare = _resolve, _sky
     try:
         st = base_settings(96, 72)
         st.shadows = False
@@ -17731,6 +17826,14 @@ def test_the_device_switch_gates_every_gpu_entry():
         # test_gpu_post_requires_gpu_shading with a fake chain.
         check('post stays un-knocked when shading fell back to the CPU',
               gpu_calls['post'] == 0, str(gpu_calls))
+        # R250: the resolve is never reached without a resident frame,
+        # and the sky pass sits behind the shading's probe -- a
+        # driverless device knocks on neither
+        check('the GPU resolve and the sky pass stay un-knocked when the '
+              'probe fails (the shading returns before the sky, nothing '
+              'is resident for the resolve)',
+              gpu_calls['resolve'] == 0 and gpu_calls['sky_prepare'] == 0,
+              str(gpu_calls))
 
         # the per-stage toggles gate their own doors under the GPU device
         for k in calls:
@@ -17747,12 +17850,15 @@ def test_the_device_switch_gates_every_gpu_entry():
         _matrix_run(sc3, st3)
         off_calls = dict(calls)
         check('with all three stage toggles off, the GPU device attempts '
-              'nothing', off_calls['raster'] == 0
-              and off_calls['shade'] == 0 and off_calls['post'] == 0,
+              'nothing (the resolve and the sky pass included)',
+              off_calls['raster'] == 0
+              and off_calls['shade'] == 0 and off_calls['post'] == 0
+              and off_calls['resolve'] == 0
+              and off_calls['sky_prepare'] == 0,
               str(off_calls))
     finally:
         (DEV.probe, CRA.raster_into_gbuffer, GSH.shade_frame,
-         CH.try_stage) = saved
+         CH.try_stage, FR.resolve, GSKY.prepare) = saved
 
 
 def test_anisotropic_rotation_reaches_the_gpu_frame():
@@ -20448,7 +20554,9 @@ def test_every_setting_does_what_it_says():
         img = R.render(sc, st)
         rgb = post.process(img[:, :, :3], st, frame=1, seed=st.seed,
                            depth=getattr(sc, 'last_depth', None),
-                           shaft_sources=getattr(sc, 'last_shafts', None))
+                           shaft_sources=getattr(sc, 'last_shafts', None),
+                           cvg=getattr(sc, 'last_cvg', None),  # R251 C001
+                           gel=getattr(sc, 'last_gel', None))
         # alpha rides along at render resolution: the Screen Door lives
         # ENTIRELY in the alpha plane, and a harness that drops it calls
         # stipple_pattern dead when it is not
@@ -20844,6 +20952,12 @@ def test_every_setting_does_what_it_says():
         ('color_management',   'SRGB',            'demo',         {}),
         ('input_gamma_naive',  False,             'textured',
          {'color_management': 'SRGB'}),
+        # R251 texture pack (TEX-1)
+        ('tex_format',         'RGB332',          'textured',     {}),
+        ('tex_tmem_format',    'CI4',             'textured',     {}),
+        ('tex_compress',       'DXT1',            'textured_blocks', {}),
+        ('tex_frac_bits',      'BITS_4',          'textured_mag',
+         {'tex_filter': 'BILINEAR'}),
         ('crt_mask_strength',  0.9,               'demo',         CRT),
         ('crt_bloom',          0.8,               'demo',         CRT),
         ('composite_ringing',  0.9,               'demo',         NTSC),
@@ -20860,11 +20974,98 @@ def test_every_setting_does_what_it_says():
          {'render_wire': True}),
         ('wire_width',         3.0,               'demo',
          {'render_wire': True}),
+        # R251 post-signal (SIG-1): the machine's scan-out stages
+        ('vi_dither_filter',   True,              'demo',
+         {'color_depth': '15', 'dither': 'BAYER4'}),
+        ('vi_gamma',           'GAMMA_DITHER',    'demo',
+         {'color_depth': '15'}),
+        ('copy_filter',        'DEFLICKER',       'demo',         {}),
+        ('crtc_blend',         'BG_COLOR',        'demo',
+         {'crtc_alpha': 128}),
+        ('crtc_alpha',         64,                'demo',
+         {'crtc_blend': 'BG_COLOR'}),
+        ('crtc_bg_color',      (0.8, 0.1, 0.1),   'demo',
+         {'crtc_blend': 'BG_COLOR', 'crtc_alpha': 128}),
+        ('video_filter',       'VOODOO1',         'demo',
+         {'color_depth': '16', 'dither': 'BAYER4'}),
+        ('video_filter',       'VOODOO2',         'demo',
+         {'color_depth': '16', 'dither': 'BAYER4'}),
+        ('video_filter_threshold', 0,             'demo',
+         {'color_depth': '16', 'dither': 'BAYER4',
+          'video_filter': 'VOODOO1'}),
+        # R251 texture pack (TEX-2, wave 2): the sample-time roads
+        ('tex_clamp_mode',     'GL_CLAMP',        'textured_extend',
+         {'tex_filter': 'BILINEAR'}),
+        ('tex_colorkey',       True,              'textured_keyed_alpha',
+         {'tex_filter': 'BILINEAR'}),
+        ('tex_colorkey_range', 64,                'textured_keyed_alpha',
+         {'tex_filter': 'BILINEAR', 'tex_colorkey': True}),
+        ('tex_mip_select',     'DITHER_VOODOO',   'textured',
+         {'tex_filter': 'BILINEAR', 'tex_mipmap': True}),
+        ('tex_lod_source',     'GS_Q',            'textured',
+         {'tex_filter': 'TRILINEAR', 'tex_mipmap': True, 'tex_lod_k': -2.0}),
+        ('tex_lod_k',          -3.0,              'textured',
+         {'tex_filter': 'TRILINEAR', 'tex_mipmap': True, 'tex_lod_source': 'GS_Q'}),
+        ('tex_lod_l',          1,                 'textured',
+         {'tex_filter': 'TRILINEAR', 'tex_mipmap': True, 'tex_lod_source': 'GS_Q',
+          'tex_lod_k': -2.0}),
+        ('tex_lod_source',     'TRIANGLE',        'textured',
+         {'tex_filter': 'BILINEAR', 'tex_mipmap': True, 'tex_mip_select': 'NEAREST_LEVEL'}),
+        ('tex_lod_sharpen',    True,              'textured_mag',
+         {'tex_filter': 'N64_3POINT', 'tex_mipmap': True}),
+        # R251 post-signal (SIG-2): chroma siting, cable, PAL, tape
+        ('chroma_format',      'Y411',            'demo',         {}),
+        ('chroma_upsample',    'LINEAR',          'demo',
+         {'chroma_format': 'Y420_MPEG1'}),
+        ('signal',             'SVIDEO',          'demo',         {}),
+        ('rf_bandwidth',       2.0,               'demo',
+         {'signal': 'RF'}),
+        ('rf_beat',            1.0,               'demo',
+         {'signal': 'RF'}),
+        ('rf_snow',            0.2,               'demo',
+         {'signal': 'RF'}),
+        ('rf_ghost',           0.5,               'demo',
+         {'signal': 'RF'}),
+        ('rf_ghost_delay',     3.0,               'demo',
+         {'signal': 'RF', 'rf_ghost': 0.5}),
+        ('pal_decoder',        'DELAY_LINE',      'demo',         {}),
+        ('pal_phase_error',    25.0,              'demo',
+         {'pal_decoder': 'SIMPLE'}),
+        ('pal_crawl',          1.0,               'demo',
+         {'pal_decoder': 'DELAY_LINE'}),
+        ('tape',               'VHS',             'demo',         {}),
+        ('tape_generations',   4,                 'demo',
+         {'tape': 'VHS'}),
+        ('tape_noise',         0.2,               'demo',
+         {'tape': 'VHS'}),
+        ('tape_head_switch',   False,             'demo',
+         {'tape': 'VHS'}),
+        ('tape_dropouts',      40.0,              'demo',
+         {'tape': 'VHS'}),
+        # R251 post-signal (SIG-3): the codecs and the optical printer
+        ('mpeg1',              True,              'demo',         {}),
+        ('mpeg1_qscale',       31,                'demo',
+         {'mpeg1': True, 'mpeg1_gop': 0}),
+        ('mpeg1_gop',          0,                 'demo',
+         {'mpeg1': True, 'mpeg1_qscale': 8}),
+        ('smacker',            True,              'demo',         {}),
+        ('smacker_quality',    0.0,               'demo',
+         {'smacker': True}),
+        ('matte_glow',         True,              'matte_glow',   {}),
+        ('matte_glow_radius',  24.0,              'matte_glow',
+         {'matte_glow': True}),
+        ('matte_glow_passes',  1,                 'matte_glow',
+         {'matte_glow': True}),
+        ('matte_glow_exposure', 2.0,              'matte_glow',
+         {'matte_glow': True}),
     ]
     SHAPES = [
         ('resolution_x',   128,  'demo', {}, None, '', 'SHAPE'),
         ('resolution_y',   96,   'demo', {}, None, '', 'SHAPE'),
         ('output_scale',   '2X', 'demo', {}, None, '', 'SHAPE'),
+        # R251 post-signal: the two machine resamplers move the shape
+        ('output_scale',   'THREEDO_2X', 'demo', {}, None, '', 'SHAPE'),
+        ('output_scale',   'GBA_MODE5', 'demo', {}, None, '', 'SHAPE'),
         ('pixel_aspect_x', 2.0,  'demo', {}, None, '', 'ANY'),
         ('pixel_aspect_y', 2.0,  'demo', {}, None, '', 'ANY'),
     ]
@@ -21023,6 +21224,9 @@ def test_every_setting_does_what_it_says():
                    'pass_material_index', 'tex_wrap_default',
                    'clip_near_epsilon', 'motion_blur', 'motion_shutter',
                    'motion_steps', 'palette_lock', 'use_processes',
+                   # R251: proven by test_r251_sky_camera.test_motion_blur_modes
+                   'motion_blur_mode', 'motion_samples', 'motion_dither',
+                   'motion_dither_tile',
                    # R162: proven by test_bi_subsurface_scattering's
                    # master-switch check (off == plain shading exactly)
                    'sss',
@@ -21061,6 +21265,9 @@ def test_every_setting_does_what_it_says():
         # test_legacy.test_append_watch (gates, receipts, values)
         'auto_fix_appended_lamps': 'append watch toggle; proven by '
                                    'test_legacy.test_append_watch',
+        # R251 pass 2: the eight wave-2 texture dials have their matrix
+        # rows and A/B rows (TEX-2)
+        # R251 LIGHT-A2: fog_face now has its matrix row (per-polygon fog)
     }
     homes = (rows_covered | ab_fields | BEHAVIOURAL
              | set(INFRA) | UI_ONLY)
@@ -22224,6 +22431,8 @@ def test_bi_lamp_loop_tail():
 
 
 def main():
+    from . import utf8_console
+    utf8_console()
     order = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     for fn in order:
         print(fn.__name__)
@@ -26730,10 +26939,12 @@ def test_anime_shader():
     highlight steps, and the compat modes decode the researched channel
     conventions: the ArcSys ILM lineage (channels per the published
     Xrd/DBFZ shader recreations), the HoYo lightmap (per PrimoToon's
-    source), ZZZ (per its modding guides). Kakarot and Sparking Zero
-    ride the ArcSys-lineage decode their looks descend from -- their
-    dumps are not public, and their tooltips say so. Every mode runs
-    the identical banding model: the decode happens in the node.
+    source), ZZZ (per its modding guides). Kakarot rides the
+    ArcSys-lineage decode its look descends from -- its dumps are not
+    public, and its tooltip says so. R246: Sparking! ZERO has its own
+    decode from the game's material export (test_sparking_zero_decode).
+    Every mode runs the identical banding model: the decode happens in
+    the node.
     """
     from ..core.scene import Light, Material
 
@@ -26827,7 +27038,9 @@ def test_anime_shader_gpu_parity():
             ('arcsys+ilm', {'compat': 'ARCSYS'}, True),
             ('dbfz+ilm', {'compat': 'DBFZ'}, True),
             ('kakarot+ilm', {'compat': 'KAKAROT'}, True),
-            ('sparking+ilm', {'compat': 'SPARKING', 'tones': 'THREE'},
+            # R246: under SPARKING the linked Game Texture is Mask1, a
+            # colour multiply folded into the base by the emitter
+            ('sparking+mask', {'compat': 'SPARKING', 'tones': 'THREE'},
              True),
             ('genshin+lm', {'compat': 'GENSHIN', 'emission_alpha': True},
              True),
@@ -26908,8 +27121,8 @@ def test_resolution_preset_expansion():
     PPU grid, BBC Micro Mode 0's double-tall pixels)."""
     from ..core.settings import RESOLUTION_GROUPS, RESOLUTION_PRESETS
 
-    check('the preset shelf holds 140 formats',
-          len(RESOLUTION_PRESETS) == 140, str(len(RESOLUTION_PRESETS)))
+    check('the preset shelf holds 143 formats',
+          len(RESOLUTION_PRESETS) == 143, str(len(RESOLUTION_PRESETS)))
     for key in ('NES', 'GAMEBOY', 'GBA', 'PSP', 'NEOGEO', 'CPS2',
                 'ZX_SPECTRUM', 'C64', 'MSX', 'APPLE_II', 'BBC_MICRO',
                 'PC98', 'WUXGA', 'QXGA', 'DVD_NTSC', 'HDV_1080',
@@ -31935,14 +32148,15 @@ def test_era_looks():
     check('fourteen Cel & Film presets in their own category (R236 '
           'added the prints, R240 the silent, the anime decades and '
           'the modern flat)',
-          len(cel) == 14 and ('CEL', "Cel & Film") in CATEGORIES
+          len(cel) == 15 and 'TRON_1982' in cel   # R251: the Tron printer
+          and ('CEL', "Cel & Film") in CATEGORIES
           and {'CEL_MONO_30S', 'CEL_TECHNICOLOR_40S', 'CEL_TV_70S',
                'CEL_OVA_80S', 'CEL_VHS_80S', 'COMIC_PRINT',
                'CEL_FLEISCHER_41', 'CEL_CINECOLOR_40S',
                'CEL_TWO_STRIP_30S',
                'CEL_SILENT_20S', 'CEL_ANIME_MOVIE_80S',
                'CEL_DIGITAL_00S', 'CEL_ANIME_MODERN',
-               'CEL_FLAT_10S'} == set(cel))
+               'CEL_FLAT_10S', 'TRON_1982'} == set(cel))
     st_p = base_settings(W, H)
     apply_preset(st_p, 'CEL_TECHNICOLOR_40S')
     check('the 40s preset shoots the three-strip process on twos with a '
@@ -31959,8 +32173,8 @@ def test_era_looks():
     # ---- the post chain wiring and neutrality
     psrc = __import__('inspect').getsource(post.process)
     check('the film stages sit before the display encode, the print after',
-          psrc.index('FILM.process_linear') < psrc.index("_gpu_stage('display'")
-          < psrc.index('FILM.halftone') < psrc.index('reduce_depth'))
+          psrc.index('FILM.process_linear') < psrc.index("_gpu('display'")
+          < psrc.index("'halftone'") < psrc.index('reduce_depth'))
     check('the defaults switch nothing on', not FILM.film_on(base_settings(W, H))
           and FILM.paint_reach(base_settings(W, H)) == 0)
     RP = _prev_engine('halcyon-1.72.0.zip')
@@ -32139,8 +32353,16 @@ def test_drawn_line():
         st.ink_taper = 0.4
         now = np.asarray(R.render(demo_scene(st, with_texture=True), st))
         prev = np.asarray(RP.render(demo_scene(st, with_texture=True), st))
-        check('the 1.70 brush line without the new dials is bitwise too',
-              np.array_equal(now, prev))
+        # R249: the nearest-seed tie rule is order-free now, so a pixel
+        # at an exact chamfer tie between two seeds may take the other
+        # seed's depth for its taper -- a handful of pixels, a few
+        # thousandths; the line is otherwise the 1.70 line
+        d_old = np.abs(now - prev).max(axis=2)
+        check('the 1.70 brush line without the new dials is the same line '
+              '(only exact-tie pixels move, by thousandths)',
+              float(d_old.max()) < 0.01
+              and int((d_old > 1e-6).sum()) < 0.002 * d_old.size,
+              f'{float(d_old.max()):.4f}, {int((d_old > 1e-6).sum())} px')
 
     # ---- the presets and the panel
     from ..presets.library import PRESETS, apply_preset
@@ -32616,11 +32838,36 @@ def test_inkers_line():
         st.ink_taper = 0.4
         st.ink_end_taper = 0.5
         st.ink_roughness = 0.4
-        st.ink_texture = 'STREAKS'
         now = np.asarray(R.render(demo_scene(st, with_texture=True), st))
         prev = np.asarray(RP.render(demo_scene(st, with_texture=True), st))
-        check('the 1.74 drawn line without the new dials is bitwise too',
-              np.array_equal(now, prev))
+        # R249: exact-tie pixels may move by thousandths (the order-free
+        # nearest seed); the drawn line is otherwise the 1.74 line
+        d_old = np.abs(now - prev).max(axis=2)
+        check('the 1.74 drawn line without the new dials is the same line '
+              '(only exact-tie pixels move, by thousandths)',
+              float(d_old.max()) < 0.01
+              and int((d_old > 1e-6).sum()) < 0.005 * d_old.size,
+              f'{float(d_old.max()):.4f}, {int((d_old > 1e-6).sum())} px')
+        # R249: the streak texture on a crease line runs along the crease
+        # now; 1.74 ran it on the nearest silhouette however far it lay.
+        # So the two engines differ on crease lines by design -- and
+        # agree without creases (exact ties aside)
+        st.ink_texture = 'STREAKS'
+        st.outline_normals = False
+        now = np.asarray(R.render(demo_scene(st, with_texture=True), st))
+        prev = np.asarray(RP.render(demo_scene(st, with_texture=True), st))
+        d_old = np.abs(now - prev).max(axis=2)
+        check('the 1.74 streaks without crease lines are the same streaks '
+              '(exact-tie pixels aside)',
+              int((d_old > 0.05).sum()) < 0.001 * d_old.size
+              and int((d_old > 1e-6).sum()) < 0.01 * d_old.size,
+              f'{float(d_old.max()):.4f}, {int((d_old > 1e-6).sum())} px')
+        st.outline_normals = True
+        now = np.asarray(R.render(demo_scene(st, with_texture=True), st))
+        prev = np.asarray(RP.render(demo_scene(st, with_texture=True), st))
+        check('...and on crease lines the streaks now run along the crease '
+              '(the frame differs from 1.74 there, by design)',
+              not np.array_equal(now, prev))
 
     # ---- the presets, the panel, the road's trigger
     from ..presets.library import apply_preset
@@ -33578,7 +33825,7 @@ void main() {{ Color = vec4({body}, 1.0); }}'''
           in links
           and ('ShaderNodeInvert', 'Color', 'Indication',
                'HALCYON_HatchingNode') in links, str(links))
-    check('the shelf holds 113 templates', len(tmpl.TEMPLATES) == 113)
+    check('the shelf holds 114 templates', len(tmpl.TEMPLATES) == 114)
 
 
 def test_view_space():
@@ -35184,7 +35431,7 @@ void main() {{ Color = {expr}; }}'''
     # ---- the eight Max shaders: on the master, on both devices
     names = [mi[0] for mi in MODEL_ITEMS]
     check('the eight Max shaders are models 24..31, appended so no code moves',
-          len(names) == 32 and names[24:] == ['MAX_PHONG', 'MAX_BLINN', 'MAX_METAL',
+          len(names) == 32 + 4 + 13 and names[24:32] == ['MAX_PHONG', 'MAX_BLINN', 'MAX_METAL',
                                               'MAX_ANISOTROPIC', 'MAX_MULTI_LAYER',
                                               'MAX_OREN_NAYAR_BLINN', 'MAX_STRAUSS',
                                               'MAX_TRANSLUCENT']
@@ -35721,7 +35968,7 @@ void main() {{ Color = {expr}; }}'''
     both(tex_graph('HALCYON_MaxVertexColorNode', {'sub_channel': 'GREEN'}, {}, out_index=1),
          'Vertex Color (Max), green as Fac', vcol=True)
     both(tex_graph('HALCYON_MaxVertexColorNode', {'layer_name': 'Paint'}, {}),
-         'a named colour layer', vcol=True, expect_refusal='named colour layers')
+         'a named colour layer', vcol=True, expect_refusal="colour layer 'Paint'")
     x = _max_spec_node('x', 'HALCYON_MaxXYZCoordsNode', {},
                        {'Offset X': 0.3, 'Offset Y': -0.2, 'Offset Z': 0.5, 'Tiling X': 2.0,
                         'Tiling Y': 1.5, 'Tiling Z': 0.7, 'Angle X': 30.0, 'Angle Y': -20.0,
@@ -35762,7 +36009,7 @@ void main() {{ Color = {expr}; }}'''
 
     # ----------------------------------------------------- the 2012 preset
     p = PRESETS.get('MAX_2012')
-    check('the 3ds Max 2012 preset exists among 90 presets', p is not None and len(PRESETS) == 90)
+    check('the 3ds Max 2012 preset exists among 112 presets', p is not None and len(PRESETS) == 112)
     if p is not None:
         st = RenderSettings()
         apply_preset(st, 'MAX_2012')
@@ -35860,3 +36107,1980 @@ void main() {{ Color = {expr}; }}'''
           not _re.search(r'np\.array\(\[[^\]]{400,}', src)
           and 'open(' not in src.replace('# open(', '') and '.dds' not in src
           and 'mentalimages' not in src)
+
+
+def test_sparking_zero_decode():
+    """R246: Sparking! ZERO decoded from the game's own material export.
+
+    The field brought the FModel export of a character -- the material
+    instances' parameter sets, the 16x256 T_Tone strips, the greyscale
+    line-art sheets -- and a reconstruction of the master material, and
+    the SPARKING compatibility mode was rebuilt on what they say instead
+    of the ArcSys-lineage guess: the band input stays the half-Lambert
+    cosine (the reconstruction's own), the Shadow Ramp strip is read
+    DOWN its height with white at the top, the Game Texture is the Mask1
+    sheet multiplied over the flat colour, and the Detail Texture is not
+    read. The laws are pinned on the CPU; the GPU twins are held to the
+    CPU picture with the strip and the sheet linked; the Separate/
+    Combine Color nodes the importer emits (the only separate node
+    Blender 5 offers) gained their GPU twins.
+    """
+    from ..core import raster as CR
+    from ..core.scene import ImageBuffer, Light, Material
+    from ..gpu import shade as GSH
+    from ..gpu.emit import EMITTERS
+    from ..nodes.shader_nodes import HALCYON_AnimeShaderNode as AN
+
+    def strip():
+        # a tone strip as the game ships them, in Blender's own layout
+        # (bottom row first): the TOP quarter white, a mid band, a dark
+        # floor -- every column identical
+        px = np.zeros((256, 16, 4), np.float32)
+        px[..., 3] = 1.0
+        px[:, :, :3] = 0.3
+        px[112:208, :, :3] = 0.6
+        px[208:, :, :3] = 1.0
+        return ImageBuffer(name='tone', pixels=px, colorspace='Non-Color')
+
+    def graph(props, ramp=False, game=False, det=False, over=None):
+        over = over or {}
+        nodes = {}
+        ins = []
+        for nm, t, d in _anime_rows():
+            link = None
+            if nm == 'Game Texture' and game:
+                link = ['mar', 0]
+            if nm == 'Detail Texture' and det:
+                link = ['mar', 0]
+            ins.append(_sk(nm, t, over.get(nm, d), link))
+        # (_anime_rows predates the R221 ramp sockets)
+        ins.append(_sk('Shadow Ramp', 'RGBA', [0, 0, 0, 1],
+                       ['tone', 0] if ramp else None))
+        ins.append(_sk('Ramp Row', 'VALUE', over.get('Ramp Row', 0.0)))
+        if ramp:
+            nodes['tone'] = _wnode(
+                'tone', 'ShaderNodeTexImage',
+                {'image': 'tone', 'interpolation': 'Linear',
+                 'extension': 'EXTEND', 'projection': 'FLAT'},
+                [_sk('Vector', 'VECTOR', [0, 0, 0])],
+                [{'name': 'Color', 'type': 'RGBA'},
+                 {'name': 'Alpha', 'type': 'VALUE'}])
+        if game or det:
+            nodes['mar'] = _wnode(
+                'mar', 'HALCYON_MarbleNode', {'octaves': 4, 'axis': 'X'},
+                [_sk('Vector', 'VECTOR', [0, 0, 0]),
+                 _sk('Scale', 'VALUE', 3.0), _sk('Turbulence', 'VALUE', 1.0),
+                 _sk('Veins', 'VALUE', 1.0), _sk('Sharpness', 'VALUE', 1.0),
+                 _sk('Color 1', 'RGBA', [1, .7, 1, 1]),
+                 _sk('Color 2', 'RGBA', [.4, .3, .9, 1])],
+                [{'name': 'Color', 'type': 'RGBA'},
+                 {'name': 'Fac', 'type': 'VALUE'}])
+        nodes['a'] = _wnode('a', 'HALCYON_AnimeShaderNode', dict(props),
+                            ins, [{'name': 'Surface', 'type': 'SHADER'}])
+        nodes['out'] = _wnode('out', 'ShaderNodeOutputMaterial', {},
+                              [_sk('Surface', 'SHADER', None, ['a', 0])], [])
+        return {'output': 'out', 'nodes': nodes}
+
+    w, h = 128, 96
+
+    def scene(props, over=None, **kw):
+        st = base_settings(w, h)
+        st.transparency = 'NONE'
+        sc = demo_scene(st, with_texture=False)
+        sc.lights = [Light(type='SUN', name='K',
+                           direction=(-0.55, 0.35, -0.75),
+                           color=(1.0, 0.98, 0.95), energy=2.4,
+                           shadow='NONE')]
+        sc.materials[1] = Material(name='Anime', index=1,
+                                   graph=graph(props, over=over, **kw))
+        sc.images = {'tone': strip()}
+        return sc, st
+
+    def shot(props, over=None, **kw):
+        sc, st = scene(props, over, **kw)
+        return np.asarray(R.render(sc, st))[..., :3]
+
+    # the ball's pixels, interior only (the silhouette blends with the
+    # sky under the anti-aliasing)
+    sc0, st0 = scene({})
+    view, _p, vp, eye = R.camera_matrices(sc0.camera, w, h)
+    g0 = CR.GBuffer(w, h)
+    CR.rasterize(sc0.mesh.verts, sc0.mesh.tris, vp, w, h, gbuf=g0)
+    mid = np.where(g0.tri >= 0, sc0.mesh.mat_index[np.maximum(g0.tri, 0)],
+                   -1) == 1
+    inner = mid.copy()
+    inner[1:] &= mid[:-1]
+    inner[:-1] &= mid[1:]
+    inner[:, 1:] &= mid[:, :-1]
+    inner[:, :-1] &= mid[:, 1:]
+    inner[2:] &= mid[:-2]
+    inner[:-2] &= mid[2:]
+    inner[:, 2:] &= mid[:, :-2]
+    inner[:, :-2] &= mid[:, 2:]
+    check('the ball covers pixels to test on', int(inner.sum()) > 300)
+
+    flat = {'Specular Level': 0.0, 'Shadow 1 Softness': 0.0,
+            'Shadow 2 Softness': 0.0, 'Rim Amount': 0.0,
+            'Emission Strength': 0.0}
+
+    # (1) the band input is the half-Lambert cosine, as every mode's:
+    # with no texture linked SPARKING is GENERIC bit for bit (the
+    # reconstruction indexes the strip by 1 - N.L/2 - 0.5; no plain-
+    # cosine road, no lineage nudge)
+    a = shot({'compat': 'SPARKING'},
+             dict(flat, **{'Shadow Bias': 0.1, 'Shadow 1 Threshold': 0.55}))
+    b = shot({'compat': 'GENERIC'},
+             dict(flat, **{'Shadow Bias': 0.1, 'Shadow 1 Threshold': 0.55}))
+    check('SPARKING bands on the half-Lambert cosine: with nothing linked '
+          'it is GENERIC bit for bit', np.array_equal(a, b))
+
+    # (2) the Game Texture is Mask1: a multiply over the flat colour
+    g1 = shot({'compat': 'SPARKING'},
+              dict(flat, **{'Shadow Bias': 0.4,
+                            'Game Texture': [0.5, 0.5, 0.5, 1.0]}))
+    g_w = shot({'compat': 'SPARKING'}, dict(flat, **{'Shadow Bias': 0.4}))
+    g_k = shot({'compat': 'SPARKING'},
+               dict(flat, **{'Shadow Bias': 0.4,
+                             'Diffuse Color': [0, 0, 0, 1]}))
+    # what stays with a black base (the base-independent terms) is
+    # subtracted before the ratio is read
+    lit = (g_w - g_k)[inner]
+    got = (g1 - g_k)[inner]
+    check('SPARKING: a grey Game Texture halves the lit colour (Mask1 '
+          'multiplies; no ILM decode)',
+          float(np.abs(got - 0.5 * lit).max()) < 0.02,
+          f'max {float(np.abs(got - 0.5 * lit).max()):.4f}')
+    arc = shot({'compat': 'ARCSYS'},
+               dict(flat, **{'Shadow Bias': 0.4,
+                             'Game Texture': [0.5, 0.5, 0.5, 1.0]}))
+    check('...where ARCSYS still reads the same texture as its ILM',
+          float(np.abs(arc - g1)[inner].max()) > 0.05)
+
+    # (3) the Detail Texture is not read under SPARKING
+    d0 = shot({'compat': 'SPARKING'}, dict(flat, **{'Shadow Bias': 0.4}))
+    d1 = shot({'compat': 'SPARKING'}, dict(flat, **{'Shadow Bias': 0.4}),
+              det=True)
+    check('SPARKING ignores a linked Detail Texture (no SSS map exists)',
+          np.array_equal(d0, d1))
+    # (the key sits behind the camera: a threshold of 0.8 brings the
+    # half-Lambert road's shadow tone into view)
+    neutral_ilm = {'Shadow Bias': 0.0, 'Shadow 1 Threshold': 0.8,
+                   'Game Texture': [1.0, 0.5, 1.0, 1.0]}
+    a0 = shot({'compat': 'ARCSYS'}, dict(flat, **neutral_ilm))
+    a1 = shot({'compat': 'ARCSYS'}, dict(flat, **neutral_ilm), det=True)
+    check('...while ARCSYS still tints its first shadow by it',
+          not np.array_equal(a0, a1))
+
+    # (4) the strip is read DOWN its height under SPARKING: the ball
+    # shows the strip's three levels; the GENERIC read (along u, every
+    # column identical) sees one flat row of it
+    # (bias 0 here so the deep band sits in view; under the game's 0.4
+    # it starts past the terminator, on the side the camera cannot see)
+    r_s = shot({'compat': 'SPARKING'}, dict(flat, **{'Shadow Bias': 0.0}),
+               ramp=True)
+    r_g = shot({'compat': 'GENERIC'}, dict(flat, **{'Shadow Bias': 0.0}),
+               ramp=True)
+    g_k0 = shot({'compat': 'SPARKING'},
+                dict(flat, **{'Shadow Bias': 0.0,
+                              'Diffuse Color': [0, 0, 0, 1]}))
+    lv_s = np.unique(np.round((r_s - g_k0)[inner].max(1) * 10))
+    lv_g = np.unique(np.round((r_g - g_k0)[inner].max(1) * 10))
+    check('SPARKING reads the Shadow Ramp strip down its height: the '
+          'ball carries the three painted bands',
+          len(lv_s) >= 3 and len(lv_g) <= 2,
+          f'sparking {lv_s.tolist()} generic {lv_g.tolist()}')
+    from ..core.nodeeval import bake_anime_ramp
+    sc_r, st_r = scene({'compat': 'SPARKING'}, ramp=True)
+    spec = bake_anime_ramp(sc_r.materials[1].graph,
+                           R.prepare_textures(sc_r, st_r), st_r)
+    lut = spec['lut']
+    check('the baked LUT runs the light term along its width: dark at '
+          'u=0, white at u=1, the top row of the strip at the lit end',
+          lut.shape == (16, 256, 3) and float(lut[0, 0, 0]) < 0.35
+          and float(lut[0, -1, 0]) > 0.95 and float(lut[8, 128, 0]) > 0.5,
+          f'{float(lut[0, 0, 0]):.3f} {float(lut[0, -1, 0]):.3f}')
+
+    # (5) the vertex occlusion still works under SPARKING (the general
+    # road); the old lineage nudge is gone
+    src = open(os.path.join(os.path.dirname(R.__file__), 'nodeeval.py'),
+               encoding='utf-8').read()
+    check('the -0.04 lineage nudge is gone from the SPARKING road',
+          "bias - 0.04" not in src and "'SPARKING'" in src)
+    gsrc = open(os.path.join(os.path.dirname(GSH.__file__), 'material.py'),
+                encoding='utf-8').read()
+    check("...and from the GPU's per-pixel table, where SPARKING left the "
+          'ILM family',
+          "'SPARKING': ' - 0.04'" not in gsrc
+          and "('ARCSYS', 'DBFZ', 'KAKAROT',\n                                    'SPARKING')" not in gsrc)
+
+    # (6) GPU parity with the strip and the sheet linked, three tones
+    for label, kw in (('sparking+mask', dict(game=True)),
+                      ('sparking+strip', dict(ramp=True)),
+                      ('sparking+strip+mask', dict(ramp=True, game=True))):
+        sc, st = scene({'compat': 'SPARKING', 'tones': 'THREE'},
+                       {'Shadow Bias': 0.4}, **kw)
+        cpu = np.asarray(R.render(sc, st))[..., :3]
+        view, _p, vp, eye = R.camera_matrices(sc.camera, w, h)
+        gb = CR.GBuffer(w, h)
+        CR.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=gb)
+        job = R.ShadeJob(sc, st, sc.images, None, view, eye, w, h)
+        GSH._PLAN_CACHE.clear()
+        passes, why, atl = GSH.plan_frame(job, gb)
+        check(f'{label} qualifies for the GPU', passes is not None, str(why))
+        if passes is None:
+            continue
+        sim, _hit = GSH.simulate(job, gb, passes, atl)
+        cov = gb.tri >= 0
+        err = float(np.abs(np.asarray(sim)[cov][:, :3] - cpu[cov]).max())
+        check(f'{label} GPU twin is the CPU picture', err < 6e-3,
+              f'max {err:.6f}')
+
+    # (7) Separate Color / Combine Color on the GPU -- the importer's
+    # eye decode uses them, and Blender 5 offers no other separate node
+    check('Separate Color and Combine Color emit on the GPU',
+          'ShaderNodeSeparateColor' in EMITTERS
+          and 'ShaderNodeCombineColor' in EMITTERS)
+    from ..gpu.emit import Emitter
+    sep_graph = {'output': 'out', 'nodes': {
+        'img': _wnode('img', 'ShaderNodeTexImage',
+                      {'image': 'tone', 'interpolation': 'Linear',
+                       'extension': 'REPEAT', 'projection': 'FLAT'},
+                      [_sk('Vector', 'VECTOR', [0, 0, 0])],
+                      [{'name': 'Color', 'type': 'RGBA'},
+                       {'name': 'Alpha', 'type': 'VALUE'}]),
+        'sep': _wnode('sep', 'ShaderNodeSeparateColor', {'mode': 'RGB'},
+                      [_sk('Color', 'RGBA', [0, 0, 0, 1], ['img', 0])],
+                      [{'name': 'Red', 'type': 'VALUE'},
+                       {'name': 'Green', 'type': 'VALUE'},
+                       {'name': 'Blue', 'type': 'VALUE'}]),
+        'comb': _wnode('comb', 'ShaderNodeCombineColor', {'mode': 'RGB'},
+                       [_sk('Red', 'VALUE', 0.0, ['sep', 2]),
+                        _sk('Green', 'VALUE', 0.0, ['sep', 0]),
+                        _sk('Blue', 'VALUE', 0.25)],
+                       [{'name': 'Color', 'type': 'RGBA'}]),
+        'sh': _wnode('sh', 'HALCYON_ShaderNode', {'model': 'LAMBERT'},
+                     [_sk('Diffuse Color', 'RGBA', [1, 1, 1, 1],
+                          ['comb', 0])],
+                     [{'name': 'Surface', 'type': 'SHADER'}]),
+        'out': _wnode('out', 'ShaderNodeOutputMaterial', {},
+                      [_sk('Surface', 'SHADER', None, ['sh', 0])], [])}}
+    em = Emitter(sep_graph)
+    var, vt = em.output('comb', 0)
+    body = em.body()
+    check('the twins read the channels the CPU reads (.b into Red, .r '
+          'into Green, the constant Blue)',
+          '.b' in body and '.r' in body and '0.25' in body, body[-200:])
+    em2 = Emitter(sep_graph)
+    sep_graph['nodes']['sep']['props']['mode'] = 'HSV'
+    em2.output('comb', 0)
+    check('...and the HSV mode runs hal_rgb2hsv, the Hue/Sat node\'s own twin',
+          'hal_rgb2hsv' in em2.body())
+
+    # (8) the colour layer by NAME on both devices: the importer's
+    # Color Attribute node names the game's 'COL0'; the mesh now carries
+    # its layer's name, so that node shades on the GPU -- another name
+    # still refuses, by name
+    vc_graph = {'output': 'out', 'nodes': {
+        'vc': _wnode('vc', 'ShaderNodeVertexColor', {'layer_name': 'COL0'}, [],
+                     [{'name': 'Color', 'type': 'RGBA'},
+                      {'name': 'Alpha', 'type': 'VALUE'}]),
+        'sh': _wnode('sh', 'HALCYON_ShaderNode', {'model': 'LAMBERT'},
+                     [_sk('Diffuse Color', 'RGBA', [1, 1, 1, 1], ['vc', 0])],
+                     [{'name': 'Surface', 'type': 'SHADER'}]),
+        'out': _wnode('out', 'ShaderNodeOutputMaterial', {},
+                      [_sk('Surface', 'SHADER', None, ['sh', 0])], [])}}
+    for cname, want_gpu in (('COL0', True), ('Paint', False)):
+        st = base_settings(w, h)
+        st.transparency = 'NONE'
+        sc = demo_scene(st, with_texture=False)
+        sc.mesh.colors = np.tile(np.array([[0.2, 0.9, 0.4, 1.0]], np.float32),
+                                 (sc.mesh.verts.shape[0], 1))
+        sc.mesh.color_name = cname
+        sc.lights = [Light(type='SUN', name='K', direction=(-0.55, 0.35, -0.75),
+                           energy=2.4, shadow='NONE')]
+        sc.materials[1] = Material(name='VC', index=1, graph=vc_graph)
+        cpu = np.asarray(R.render(sc, st))[..., :3]
+        view, _p, vp, eye = R.camera_matrices(sc.camera, w, h)
+        gb = CR.GBuffer(w, h)
+        CR.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=gb)
+        job = R.ShadeJob(sc, st, {}, None, view, eye, w, h)
+        GSH._PLAN_CACHE.clear()
+        passes, why, atl = GSH.plan_frame(job, gb)
+        if want_gpu:
+            check("a Color Attribute node naming the mesh's own layer ('COL0') "
+                  'shades on the GPU', passes is not None, str(why))
+            if passes is not None:
+                sim, _hit = GSH.simulate(job, gb, passes, atl)
+                cov = gb.tri >= 0
+                err = float(np.abs(np.asarray(sim)[cov][:, :3] - cpu[cov]).max())
+                check('...and the twin is the CPU picture', err < 6e-3,
+                      f'max {err:.6f}')
+        else:
+            check("...while a layer the mesh does not carry ('COL0' on a "
+                  "'Paint' mesh) refuses by name, naming both",
+                  passes is None and "colour layer 'COL0'" in str(why)
+                  and "'Paint'" in str(why), str(why))
+
+    # (9) the shelf and the node's own words
+    from .. import templates as TPL
+    tp = TPL.TEMPLATES.get('CEL_SPARKING')
+    check("the Pre-Made shelf carries 'Cel Sparking! ZERO Skin' on the "
+          "SPARKING mode with the strip's bands, the skin AS EXPORTED "
+          '(R247: the swatch #FCC79E, no gamma on top of a linear value), '
+          'no scene ambient',
+          tp is not None and tp['anime']['compat'] == 'SPARKING'
+          and tp['inputs']['Shadow Bias'] == 0.0
+          and abs(tp['inputs']['Shadow 1 Threshold'] - 0.7305) < 1e-3
+          and abs(tp['inputs']['Diffuse Color'][0] - 0.969) < 1e-3
+          and abs(tp['inputs']['Diffuse Color'][1] - 0.570) < 1e-3
+          and abs(tp['inputs']['Shadow 1 Color'][0] - 0.453) < 1e-3
+          and tp['inputs']['Ambient'] == 0.0
+          and tp['family'] == 'CEL')
+    items = {i[0]: i for i in AN.__annotations__['compat'].kw['items']}
+    check("the SPARKING tooltip names the export it was decoded from, "
+          'not a lineage guess -- and reads the colours as exported',
+          'FModel' in items['SPARKING'][2] and 'half-' in items['SPARKING'][2]
+          and 'not publicly documented' not in items['SPARKING'][2]
+          and 'gamma' not in items['SPARKING'][2]
+          and 'as exported' in items['SPARKING'][2])
+
+
+def test_gpu_plan_covers_every_material():
+    """R248: the field's unshaded-black material, reproduced and closed.
+
+    A plan holds one pass per material and is cached on a signature that
+    holds no camera (an orbit re-plans nothing -- by design). It used to
+    hold passes only for the materials on screen when it was built, so
+    the first frame that brought another material into view hit the
+    cached plan, found no pass for it, and left its pixels at the
+    cleared target's zero: pure black, unshaded, unreported -- and
+    'in refined but not in orbit, or vice versa', because the two are
+    different sizes with different plans. A plan now carries a pass for
+    EVERY material the mesh has (on-screen ones probed on their own
+    fragments as before, off-screen ones over their own triangles), a
+    cache hit that lacks a material on screen re-plans, only the passes
+    on screen compile and draw, and a material on screen with no pass
+    -- or a covered pixel no pass wrote -- refuses the frame by name.
+    """
+    from ..core import raster as CR
+    from ..gpu import shade as GSH
+    from .scenebuild import demo_scene, look_at_matrix
+    from ..core.scene import Camera, Light
+
+    w, h = 96, 72
+    st = base_settings(w, h)
+    st.transparency = 'NONE'
+    st.shadows = False
+    sc = demo_scene(st, with_texture=False)
+    sc.lights = [Light(type='SUN', name='K', direction=(-0.5, 0.3, -0.8),
+                       energy=2.5, shadow='NONE')]
+    ball_only = Camera(matrix_world=look_at_matrix((-1.3, -4.2, 1.6),
+                                                   (-1.3, 0.2, 1.0)),
+                       lens=70.0, sensor=36.0, clip_start=0.1, clip_end=200.0)
+    both = sc.camera
+
+    def frame(cam, passes_override=None):
+        sc.camera = cam
+        cpu = np.asarray(R.render(sc, st))[..., :3]
+        view, _p, vp, eye = R.camera_matrices(sc.camera, w, h)
+        g = CR.GBuffer(w, h)
+        CR.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+        job = R.ShadeJob(sc, st, R.prepare_textures(sc, st), None, view,
+                         eye, w, h)
+        passes, why, atl = GSH.plan_frame(job, g)
+        present = GSH._present_materials(sc.mesh, g)
+        if passes is None:
+            return cpu, g, job, None, why, atl, present
+        use = passes if passes_override is None else passes_override(passes)
+        sim, hit = GSH.simulate(job, g, use, atl)
+        return cpu, g, job, passes, (sim, hit), atl, present
+
+    GSH._PLAN_CACHE.clear()
+    cpu1, g1, job1, p1, r1, a1, pres1 = frame(ball_only)
+    check('the Ball-only view shows the floor and the ball, not the box',
+          pres1 == {0, 1}, str(pres1))
+    check('the plan built from it carries a pass for EVERY material the '
+          'mesh has -- the off-screen box probed over its own triangles',
+          p1 is not None and sorted(int(p[0]) for p in p1) == [0, 1, 2]
+          and '__unplanned' not in a1,
+          str(None if p1 is None else [p[0] for p in p1])
+          + (f' {r1}' if not isinstance(r1, tuple) else ''))
+    sim1, hit1 = r1
+    cov1 = g1.tri >= 0
+    check('...and its twin matches the CPU with only the on-screen passes run',
+          sim1 is not None
+          and float(np.abs(np.asarray(sim1)[cov1] - cpu1[cov1]).max()) < 6e-3
+          and bool(hit1[cov1].all()))
+    n_cache = len(GSH._PLAN_CACHE)
+    cpu2, g2, job2, p2, r2, a2, pres2 = frame(both)
+    sim2, hit2 = r2
+    cov2 = g2.tri >= 0
+    box = cov2 & (np.where(cov2, sc.mesh.mat_index[np.maximum(g2.tri, 0)], -1) == 2)
+    check('the next frame brings the box on screen: the cached plan serves '
+          'it (no re-plan) and the box shades -- not one black pixel',
+          pres2 == {0, 1, 2} and p2 is p1 and len(GSH._PLAN_CACHE) == n_cache
+          and sim2 is not None and bool(box.any())
+          and float(np.asarray(sim2)[box].max(-1).min()) > 1e-3
+          and float(np.abs(np.asarray(sim2)[cov2] - cpu2[cov2]).max()) < 6e-3
+          and bool(hit2[cov2].all()),
+          f'present {pres2} same plan {p2 is p1} box px {int(box.sum())}')
+    # the refusal by name: a pass list that lacks a material on screen
+    # (the old plan's shape) never draws black -- the simulator, like the
+    # driver, refuses the frame and names the material
+    _cpu3, _g3, _job3, _p3, r3, _a3, _pres3 = frame(
+        both, passes_override=lambda ps: [p for p in ps if int(p[0]) != 2])
+    sim3, why3 = r3
+    check("a material on screen with no pass refuses the frame by name "
+          "('Box', no pass in the plan) instead of shading it black",
+          sim3 is None and "'Box'" in str(why3) and 'no pass' in str(why3),
+          str(why3))
+    # a cache hit that lacks a material on screen re-plans: seed the cache
+    # with the old shape and watch the next frame refuse it
+    sig = next(iter(GSH._PLAN_CACHE))
+    old_shape = ([p for p in p1 if int(p[0]) != 2], None, dict(a1))
+    GSH._PLAN_CACHE[sig] = old_shape
+    _cpu4, _g4, _job4, p4, r4, _a4, _pres4 = frame(both)
+    check('a cached plan that lacks a material now on screen is re-planned, '
+          'not served (the plan that comes back covers the box again)',
+          p4 is not None and p4 is not old_shape[0]
+          and sorted(int(p[0]) for p in p4) == [0, 1, 2]
+          and r4[0] is not None and bool(r4[1][_g4.tri >= 0].all()))
+    # an off-screen material that cannot take the GPU is left unplanned,
+    # named, and costs the frame nothing; on screen it refuses by name
+    # exactly as before
+    GSH._PLAN_CACHE.clear()
+    sc.materials[2].shadeless = True
+    _cpu5, _g5, _job5, p5, r5, a5, _pres5 = frame(ball_only)
+    check('an off-screen material that would refuse (shadeless) is left '
+          "unplanned by name and the frame keeps its GPU",
+          p5 is not None and sorted(int(p[0]) for p in p5) == [0, 1]
+          and 'shadeless' in str((a5 or {}).get('__unplanned', {}).get(2, ''))
+          and r5[0] is not None,
+          str((a5 or {}).get('__unplanned')))
+    _cpu6, _g6, _job6, p6, why6, _a6, _pres6 = frame(both)
+    check('...and the frame that shows it refuses by name, as before',
+          p6 is None and 'Box' in str(why6) and 'shadeless' in str(why6),
+          str(why6))
+    sc.materials[2].shadeless = False
+    GSH._PLAN_CACHE.clear()
+
+
+def test_gpu_ink_pass():
+    """R249 (1.88.0): the ink pass on the GPU -- "the remaining CPU
+    passes to GPU", and the ink was the one that mattered: 514 ms of a
+    720p GPU frame's CPU time, 237 in the chamfer, 193 in the crease
+    test, against milliseconds of shading.
+
+    Bars. The CPU chamfer's feature is now the order-free lexicographic
+    (distance, seed) minimum, exactly what an iterated relaxation
+    converges to (a NumPy relaxation is the reference here, on bounded
+    frames of every size, ties included). The crease test's rewrite is
+    bitwise. The simulator twin of the GPU road draws the mask roads
+    (plain, classed, marked, Custom colour) BITWISE the CPU's and the
+    style road within float tolerance across every dial the GPU takes
+    (most bitwise). The driver road's plumbing runs through the fake
+    device with the driver's own rules and agrees with the simulator;
+    apply_outline's GPU gate takes it, a refusal names its dial and the
+    CPU road answers unchanged. The relaxation count is load-bearing
+    (one pass short changes the line). The near-silhouette rule: an
+    interior line beyond any silhouette's reach takes its own colour
+    and carries no silhouette haze -- on both roads. The params texture
+    carries every dial exactly; the front-end reads true / false.
+    """
+    from ..core import ink as INK
+    from ..core import raster as CR
+    from ..core.scene import Light, Material
+    from ..gpu import ink as GINK
+    from ..shaders.compiler import try_compile
+    from . import fakedevice
+
+    # --- the order-free feature against a converged relaxation
+    INF = 1 << 28
+    offs = [(-1, 0, 5), (1, 0, 5), (0, -1, 5), (0, 1, 5), (-1, -1, 7),
+            (1, -1, 7), (-1, 1, 7), (1, 1, 7), (-2, -1, 11), (2, -1, 11),
+            (-2, 1, 11), (2, 1, 11), (-1, -2, 11), (1, -2, 11), (-1, 2, 11),
+            (1, 2, 11)]
+
+    def relax(seed):
+        H, W = seed.shape
+        yy, xx = np.mgrid[0:H, 0:W]
+        K = np.where(seed, (yy * W + xx).astype(np.int64),
+                     np.int64(INF) * (1 << 32) + (1 << 31) - 1)
+        for _ in range(4096):
+            best = K.copy()
+            for dx, dy, c in offs:
+                cand = K.copy()
+                py = slice(max(-dy, 0), H - max(dy, 0))
+                px = slice(max(-dx, 0), W - max(dx, 0))
+                qy = slice(max(dy, 0), H - max(-dy, 0))
+                qx = slice(max(dx, 0), W - max(-dx, 0))
+                cand[py, px] = K[qy, qx] + c * (1 << 32)
+                best = np.minimum(best, cand)
+            if np.array_equal(best, K):
+                break
+            K = best
+        d = K >> 32
+        return (d.astype(np.float32) * np.float32(0.2),
+                np.where(d < INF, K & 0xffffffff, -1).astype(np.int32))
+
+    import re
+    rng = np.random.default_rng(249)
+    agree = True
+    for trial in range(60):
+        H = int(rng.integers(3, 30))
+        W = int(rng.integers(3, 30))
+        seed = rng.random((H, W)) < rng.choice([0.02, 0.08, 0.25])
+        if trial % 9 == 0:
+            seed[:] = False
+            seed[int(rng.integers(0, H)), int(rng.integers(0, W))] = True
+        if not seed.any():
+            continue
+        D, F = INK.chamfer(seed, feature=True)
+        Dr, Fr = relax(seed)
+        agree &= np.array_equal(D, Dr) and np.array_equal(F, Fr)
+        agree &= np.array_equal(INK.chamfer(seed), D)
+    check('the CPU chamfer is the relaxation\'s exact (distance, seed) '
+          'minimum on 60 bounded frames, the plain road its distances',
+          agree)
+    check('the empty seed still reads far with no feature',
+          bool((INK.chamfer(np.zeros((6, 9), bool), feature=True)[1]
+                == -1).all()))
+
+    # --- the front-end reads bool literals (the ink passes use them)
+    prog, err = try_compile("""
+uniform float x;
+out vec4 Color;
+void main() { bool a = false; bool b = true; if (x > 0.5) a = true;
+              Color = vec4(a ? 1.0 : 0.0, b ? 1.0 : 0.0, 0.0, 1.0); }
+""", 'GLSL')
+    check('the GLSL front-end reads true / false literals', prog is not None
+          and bool(np.array_equal(
+              prog.run({'x': np.array([0.0, 1.0], np.float32)}, {}, 2)[0]
+              ['Color'][:, 0], [0.0, 1.0])), str(err))
+
+    # --- the params texture carries every dial
+    vals = {name: (float(i) + 0.25 if kind == 'f' else i
+                   if kind == 'i' else (1.0, 2.0) if kind == 'v2'
+                   else (0.5, 0.25, 0.125))
+            for i, (name, kind) in enumerate(GINK.PARAMS)}
+    vals['hal_ink_nm'] = 16777215
+    packed = GINK.pack_params(vals)
+    ok_p = packed.shape == (1, len(GINK.PARAMS), 4)
+    for i, (name, kind) in enumerate(GINK.PARAMS):
+        v = vals[name]
+        if kind in ('v2', 'v3'):
+            ok_p &= bool(np.array_equal(packed[0, i, :len(v)],
+                                        np.asarray(v, np.float32)))
+        else:
+            ok_p &= float(packed[0, i, 0]) == float(v)
+    check('the params texture holds every dial exactly (ints to 2**24)',
+          ok_p)
+    for name in GINK.SOURCES:
+        spec = GINK.interface(GINK.SOURCES[name])
+        declared = set(re.findall(r'^\s*uniform\s+\w+\s+(\w+)\s*;',
+                                  GINK.SOURCES[name], re.M))
+        check(f'{name}: every declared uniform is in its CreateInfo spec '
+              'and only the hash ints are push constants',
+              declared == set(sum(spec.values(), []))
+              and set(spec['ints']) <= {'hal_ink_phase', 'hal_ink_salt',
+                                        'hal_ink_side', 'hal_ink_from_field'}
+              and not spec['floats'] and not spec['vec2'] and not spec['vec3'],
+              str(spec))
+
+    # --- the twins
+    def rig(w=112, h=84, **kw):
+        st = base_settings(w, h)
+        st.transparency = 'NONE'
+        st.shadows = False
+        st.outline = True
+        st.outline_width = 3
+        for k, v in kw.items():
+            setattr(st, k, v)
+        sc = demo_scene(st, with_texture=False)
+        sc.lights = [Light(type='SUN', direction=(-0.4, 0.35, -0.85),
+                           energy=3.0, shadow='NONE')]
+        return sc, st
+
+    def buffers(sc, st):
+        w, h = st.resolution_x, st.resolution_y
+        _view, proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+        g = CR.GBuffer(w, h)
+        CR.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+        rn = np.random.default_rng(1)
+        img = np.zeros((h, w, 4), np.float32)
+        img[..., :3] = rn.random((h, w, 3)).astype(np.float32) * 0.8 + 0.1
+        img[..., 3] = (g.tri >= 0).astype(np.float32)
+        return g, img, vp, proj, eye
+
+    def twin(sc, st):
+        g, img, vp, proj, eye = buffers(sc, st)
+        cpu = R.apply_outline(sc, g, img.copy(), st, vp, proj=proj, eye=eye)
+        tables = R.ink_tables(sc, st)
+        md = None
+        if getattr(st, 'outline_marked', False) and \
+                getattr(sc.mesh, 'ink_tri_mask', None) is not None:
+            md = R.marked_edge_distance(g, sc.mesh, vp, snap=R.snap_grid(st))
+        got, why = GINK.simulate(sc, g, img.copy(), st, tables, md=md,
+                                 vp=vp, proj=proj, eye=eye)
+        if got is None:
+            return None, why, cpu, img
+        return float(np.abs(got - cpu).max()), None, cpu, img
+
+    mask_cases = [('plain w3', {}), ('plain w1', {'outline_width': 1}),
+                  ('plain w8 not over sky', {'outline_width': 8,
+                                             'outline_over_sky': False}),
+                  ('plain + material breaks', {'outline_materials': True}),
+                  ('plain opacity', {'outline_opacity': 0.4}),
+                  ('nothing to ink', {'outline_normals': False,
+                                      'outline_objects': False,
+                                      'outline_depth': False})]
+    for label, kw in mask_cases:
+        sc, st = rig(**kw)
+        d, why, cpu, img = twin(sc, st)
+        check(f'mask road, {label}: the GPU line is bitwise the CPU line',
+              d == 0.0, str(why if d is None else d))
+    sc, st = rig(outline_width=2)
+    sc.materials[0].ink_use_color = True
+    sc.materials[0].ink_color = (1.0, 0.2, 0.1)
+    sc.materials[1].ink_width = 5
+    sc.materials[2].ink_mode = 'OFF'
+    d, why, cpu, img = twin(sc, st)
+    check('the classed road (a colour, a width, a Never): bitwise', d == 0.0,
+          str(why if d is None else d))
+    sc, st = rig(outline_width=2, outline=False)
+    sc.materials[1].ink_mode = 'ON'
+    sc.materials[1].ink_width = 4
+    d, why, cpu, img = twin(sc, st)
+    check('the classed road, a forced line under a global off: bitwise',
+          d == 0.0 and bool((np.abs(cpu - img).max(axis=2) > 0).any()),
+          str(why if d is None else d))
+    sc, st = rig(outline_width=2)
+    sc.mesh.ink_tri_mask = np.full(sc.mesh.tris.shape[0], 7, np.uint8)
+    st.outline_marked = True
+    d, why, cpu, img = twin(sc, st)
+    check('marked edges on the mask road: bitwise', d == 0.0,
+          str(why if d is None else d))
+    g_c = _anime80_graph({'line_source': 'CUSTOM'},
+                         {'Line Color': [1.0, 0.0, 0.0, 1.0]})
+    sc, st = rig(outline_width=2)
+    sc.materials[1] = Material(name='Anime', index=1, graph=g_c)
+    d, why, cpu, img = twin(sc, st)
+    check('the Anime Shader\'s Custom line colour on the mask road: bitwise',
+          d == 0.0, str(why if d is None else d))
+
+    style_cases = [
+        ('clean', {'ink_interior_scale': 0.999}, 0.0),
+        ('taper', {'ink_taper': 1.0}, 0.0),
+        ('interior scale', {'ink_interior_scale': 0.5}, 0.0),
+        ('weight noise', {'ink_weight_noise': 0.6, 'ink_weight_scale': 10.0},
+         0.0),
+        ('shadow side', {'ink_shadow_side': 1.0}, 1e-5),
+        ('brush', {'ink_style': 'BRUSH'}, 0.0),
+        ('pencil', {'ink_style': 'PENCIL', 'ink_pencil_strokes': 4}, 1e-5),
+        ('grain', {'ink_grain': 0.5}, 0.0),
+        ('from fill', {'ink_color_mode': 'FILL'}, 0.0),
+        ('gradient by depth', {'ink_color_mode': 'GRADIENT',
+                               'ink_gradient': 'DEPTH'}, 0.0),
+        ('gradient vertical', {'ink_color_mode': 'GRADIENT',
+                               'ink_gradient': 'VERTICAL'}, 0.0),
+        ('gradient by light', {'ink_color_mode': 'GRADIENT',
+                               'ink_gradient': 'LIGHT'}, 1e-5),
+        ('true to height', {'ink_reference_height': 168}, 0.0),
+        ('end taper', {'ink_end_taper': 0.7, 'ink_end_length': 8.0}, 0.0),
+        ('roughness', {'ink_roughness': 0.6, 'ink_roughness_scale': 4.0},
+         1e-5),
+        ('drift', {'ink_drift': 1.0}, 1e-5),
+        ('gaps', {'ink_gaps': 0.3}, 0.0),
+        ('streaks', {'ink_texture': 'STREAKS', 'ink_texture_amount': 0.8,
+                     'ink_style': 'BRUSH'}, 1e-5),
+        ('charcoal', {'ink_texture': 'CHARCOAL', 'ink_texture_amount': 0.8},
+         0.0),
+        ('not over sky', {'ink_taper': 0.4, 'outline_over_sky': False}, 0.0),
+        ('opacity', {'ink_taper': 0.4, 'outline_opacity': 0.5}, 0.0),
+        ('creases only', {'ink_taper': 0.5, 'outline_objects': False,
+                          'outline_depth': False}, 0.0),
+        ('the works', {'ink_style': 'BRUSH', 'ink_taper': 0.5,
+                       'ink_weight_noise': 0.3, 'ink_end_taper': 0.5,
+                       'ink_roughness': 0.4, 'ink_drift': 0.5,
+                       'ink_gaps': 0.1, 'ink_texture': 'STREAKS',
+                       'ink_boil': 1.0, 'outline_width': 4,
+                       'ink_shadow_side': 0.5, 'ink_grain': 0.2}, 1e-4),
+    ]
+    for label, kw, tol in style_cases:
+        sc, st = rig(**kw)
+        d, why, cpu, img = twin(sc, st)
+        inked = bool((np.abs(cpu - img).max(axis=2) > 0).any())
+        check(f'style road, {label}: the GPU line matches the CPU line'
+              + (' bitwise' if tol == 0.0 else f' within {tol:g}'),
+              d is not None and d <= tol and inked,
+              str(why if d is None else d))
+    sc, st = rig(ink_boil=2.0, ink_boil_fps=12)
+    sc.time = 2 / 24.0
+    d, why, cpu, img = twin(sc, st)
+    check('boil on its clock (phase 1): within 1e-5', d is not None
+          and d <= 1e-5, str(why if d is None else d))
+    sc, st = rig(ink_taper=0.3, seed=7)
+    sc.materials[0].ink_use_color = True
+    sc.materials[0].ink_color = (0.9, 0.1, 0.1)
+    sc.materials[1].ink_width = 5
+    sc.materials[2].ink_mode = 'OFF'
+    d, why, cpu, img = twin(sc, st)
+    check('the style road per material (colour, width, Never, a seed): '
+          'bitwise', d == 0.0, str(why if d is None else d))
+    sc, st = rig(ink_style='PENCIL')
+    sc.mesh.ink_tri_mask = np.full(sc.mesh.tris.shape[0], 7, np.uint8)
+    st.outline_marked = True
+    d, why, cpu, img = twin(sc, st)
+    check('marked edges on the style road (pencil): within 1e-5 (the CPU '
+          'keeps the pencil offsets in float64)', d is not None and d <= 1e-5,
+          str(why if d is None else d))
+    g_i = _anime80_graph({'line_source': 'IRO'}, {'Line Darken': 0.7})
+    sc, st = rig(outline_width=2)
+    sc.materials[1] = Material(name='Anime', index=1, graph=g_i)
+    d, why, cpu, img = twin(sc, st)
+    check('Iro-Trace (the surface\'s own colour per pixel): bitwise',
+          d == 0.0, str(why if d is None else d))
+    sc, st = rig(outline_width=8, ink_reference_height=30, ink_taper=1.0,
+                 ink_style='BRUSH')
+    d, why, cpu, img = twin(sc, st)
+    check('a very wide line (a long relaxation): bitwise', d == 0.0,
+          str(why if d is None else d))
+
+    # --- the refusals, by name
+    for kw, word in ((dict(ink_isophote=0.4), 'Isophote'),
+                     (dict(ink_smooth=1.0), 'stroke road'),
+                     (dict(ink_pressure=0.3), 'stroke road'),
+                     (dict(ink_anchor='SURFACE', ink_taper=0.2), 'Surface'),
+                     (dict(outline_form=True), 'Form'),
+                     (dict(outline_tone=True), 'Tone')):
+        sc, st = rig(**kw)
+        d, why, cpu, img = twin(sc, st)
+        check(f'{word} refuses the GPU by name', d is None and word in str(why),
+              str(why))
+    sc, st = rig(ink_taper=0.2)
+    sc.materials[1].ink_vc = 'ARCSYS'
+    d, why, cpu, img = twin(sc, st)
+    check('the vertex-colour line control refuses the GPU by name',
+          d is None and 'vertex-colour' in str(why), str(why))
+
+    # --- the driver road through the fake device, and apply_outline's gate
+    sc, st = rig(ink_style='BRUSH', ink_taper=0.5, ink_end_taper=0.5,
+                 ink_texture='STREAKS', ink_shadow_side=0.4, ink_boil=1.0,
+                 ink_grain=0.1)
+    g, img, vp, proj, eye = buffers(sc, st)
+    tables = R.ink_tables(sc, st)
+    sim, _why = GINK.simulate(sc, g, img.copy(), st, tables, vp=vp,
+                              proj=proj, eye=eye)
+    cpu = R.apply_outline(sc, g, img.copy(), st, vp, proj=proj, eye=eye)
+    with fakedevice.installed() as dev:
+        got, why = GINK.apply(sc, g, img.copy(), st, tables, vp=vp,
+                              proj=proj, eye=eye)
+        check('the driver road runs through the device with the driver\'s '
+              'rules (specs, kinds, bindings, no self-sampling) and draws '
+              'the simulator\'s pixels', got is not None
+              and np.array_equal(got, sim), str(why))
+        check('...seven targets serve every pass (the thinning passes '
+              'borrow two), all freed after the burst',
+              dev.calls['targets'] == 7 and all(t.freed for t in dev.targets)
+              and GINK.LAST_TIMINGS.get('passes', 0) > 20,
+              str(dev.calls))
+        st.render_device = 'GPU'
+        st._frame_gpu_shaded = True
+        via = R.apply_outline(sc, g, img.copy(), st, vp, proj=proj, eye=eye)
+        check('apply_outline takes the GPU road for a GPU-shaded frame',
+              np.array_equal(via, got))
+        st._frame_gpu_shaded = False
+        via_cpu = R.apply_outline(sc, g, img.copy(), st, vp, proj=proj,
+                                  eye=eye)
+        check('...and the CPU road for a CPU-shaded frame, bitwise the CPU '
+              'line', np.array_equal(via_cpu, cpu))
+        st._frame_gpu_shaded = True
+        st.ink_isophote = 0.3
+        cpu_iso = R.apply_outline(sc, g, img.copy(), st, vp, proj=proj,
+                                  eye=eye)
+        st.render_device = 'CPU'
+        cpu_iso2 = R.apply_outline(sc, g, img.copy(), st, vp, proj=proj,
+                                   eye=eye)
+        check('a refused dial inks the GPU frame on the CPU, bitwise the CPU '
+              'device\'s line', np.array_equal(cpu_iso, cpu_iso2))
+        # the ids texture the shading uploaded is reused, never re-packed
+        st.ink_isophote = 0.0
+        n_up = dev.calls['upload']
+        g.gpu_ids_texture = dev.upload(__import__(
+            'halcyon.gpu.gbuffer', fromlist=['pack_ids']).pack_ids(g))
+        n_up = dev.calls['upload']
+        got2, _w = GINK.apply(sc, g, img.copy(), st, tables, vp=vp,
+                              proj=proj, eye=eye)
+        check('the shading\'s ids texture is reused by the ink pass (one '
+              'upload fewer) and the line is the same',
+              got2 is not None and np.array_equal(got2, got)
+              and dev.calls['upload'] - n_up == 4, str(dev.calls))
+        g.gpu_ids_texture = None
+
+    # --- the relaxation count is load-bearing: one pass short moves pixels
+    sc, st = rig(ink_taper=0.6, ink_style='BRUSH', outline_width=5)
+    g, img, vp, proj, eye = buffers(sc, st)
+    tables = R.ink_tables(sc, st)
+    full, _ = GINK.simulate(sc, g, img.copy(), st, tables, vp=vp, proj=proj,
+                            eye=eye)
+    saved_plan = GINK.plan
+
+    def short_plan(*a, **k):
+        p, why = saved_plan(*a, **k)
+        if p is not None:
+            p['K'] = max(p['K'] - 2, 1)
+        return p, why
+    GINK.plan = short_plan
+    try:
+        short, _ = GINK.simulate(sc, g, img.copy(), st, tables, vp=vp,
+                                 proj=proj, eye=eye)
+    finally:
+        GINK.plan = saved_plan
+    check('the relaxation count is the reach (two passes short changes the '
+          'line)', not np.array_equal(full, short))
+
+    # --- the near-silhouette rule, on both roads: interior lines beyond a
+    # silhouette's reach take their own colour, and a soft profile draws
+    # no haze where there is no silhouette at all
+    sc, st = rig(ink_style='BRUSH', outline_objects=False,
+                 outline_depth=False, outline_width=2)
+    g, img, vp, proj, eye = buffers(sc, st)
+    cpu = R.apply_outline(sc, g, img.copy(), st, vp, proj=proj, eye=eye)
+    tables = R.ink_tables(sc, st)
+    got, _ = GINK.simulate(sc, g, img.copy(), st, tables, vp=vp, proj=proj,
+                           eye=eye)
+    changed = np.abs(cpu - img).max(axis=2) > 0
+    # the seeds: the creases alone; a haze would touch pixels well past
+    # any crease's half-width plus its soft edge
+    d_int = INK.chamfer(_crease_seed_for_test(sc, g, st))
+    check('a brush line of creases alone leaves the band clean beyond the '
+          'line (no silhouette haze) -- CPU', not bool(changed[d_int > 3.5].any()),
+          str(int(changed[d_int > 3.5].sum())))
+    check('...and the GPU draws the same line', np.array_equal(cpu, got))
+    sc, st = rig(ink_taper=0.3, outline_width=2)
+    sc.materials[0].ink_use_color = True
+    sc.materials[0].ink_color = (0.0, 1.0, 0.0)     # the floor's own colour
+    g, img, vp, proj, eye = buffers(sc, st)
+    cpu = R.apply_outline(sc, g, img.copy(), st, vp, proj=proj, eye=eye)
+    tables = R.ink_tables(sc, st)
+    got, _ = GINK.simulate(sc, g, img.copy(), st, tables, vp=vp, proj=proj,
+                           eye=eye)
+    check('per-material colours with the near rule: bitwise',
+          np.array_equal(cpu, got))
+
+
+def _crease_seed_for_test(sc, g, st):
+    """The crease seed exactly as apply_outline extracts it (the test's
+    own copy, so a haze check can measure distance from the creases)."""
+    mesh = sc.mesh
+    tri = g.tri
+    cov = tri >= 0
+    safe = np.where(cov, tri, 0)
+    fn = mesh.face_normals[safe]
+    fn = np.where(cov[:, :, None], fn, 0.0).astype(np.float32)
+    cos_lim = np.float32(np.cos(np.radians(
+        float(getattr(st, 'outline_normal_angle', 60.0)))))
+    fx, fy, fz = fn[:, :, 0], fn[:, :, 1], fn[:, :, 2]
+    nz = (np.abs(fx) + np.abs(fy) + np.abs(fz)) > 0
+    e = np.zeros(tri.shape, bool)
+
+    def cp(a, b):
+        d = (fx[a] * fx[b] + fy[a] * fy[b]) + fz[a] * fz[b]
+        return (d < cos_lim) & nz[a] & nz[b]
+    e[:, 1:] |= cp((slice(None), slice(1, None)), (slice(None), slice(None, -1)))
+    e[:, :-1] |= cp((slice(None), slice(None, -1)), (slice(None), slice(1, None)))
+    e[1:, :] |= cp((slice(1, None), slice(None)), (slice(None, -1), slice(None)))
+    e[:-1, :] |= cp((slice(None, -1), slice(None)), (slice(1, None), slice(None)))
+    return e & cov
+
+
+def test_gpu_sky_pass():
+    """R250 (1.89.0): the sky / background pass on the GPU -- "Tomorrow,
+    we will do the remaining CPU passes to GPU." The frame's uncovered
+    pixels were the CPU's (109 ms of a 720p GPU frame for a FLAT colour,
+    179 at the field's supersample); gpu/sky.py now draws them as the
+    LAST draw of the shading burst, transcribed op for op from
+    core/sky.py and render.world_color, and the readback IS the frame.
+
+    Bars. Every mode the pass takes is BITWISE the CPU sky in the
+    simulator at every uncovered pixel of the suite's frame -- the rays
+    included, the fast_background block road included; the covered
+    pixels are exact zeros and the alpha is the film's. Every refusal
+    names itself, and a WIREFRAME material is not the plan's business
+    (the render road releases residency instead). The params texture
+    carries every dial exactly and the interface has one push-constant
+    int. The front-end truncates the block division the ray road relies
+    on. shade.simulate mirrors the sky onto the G-buffer for the suite.
+    And the CPU road is untouched: every mode renders bitwise the
+    previous release on the CPU device.
+    """
+    import re
+    from ..core import raster as CR
+    from ..core.scene import ImageBuffer
+    from ..core.texture import Texture
+    from ..gpu import shade as GSH
+    from ..gpu import sky as GSKY
+    from ..shaders.compiler import try_compile
+
+    W, H = 96, 72
+    rng = np.random.default_rng(250)
+    env_px = rng.random((16, 32, 4)).astype(np.float32)
+    env_px[..., 3] = 1.0
+    env_buf = ImageBuffer(name='envtest', pixels=env_px, colorspace='Linear')
+    env_tex = Texture(env_px, name='envtest', colorspace='Linear')
+
+    def bg_graph(linked=False):
+        nodes = {
+            'bg': _wnode('bg', 'ShaderNodeBackground', {},
+                         [_sk('Color', 'RGBA', [0.3, 0.5, 0.7, 1.0],
+                              ['rgb', 0] if linked else None),
+                          _sk('Strength', 'VALUE', 1.3)],
+                         [{'name': 'Background', 'type': 'SHADER'}]),
+            'out': _wnode('out', 'ShaderNodeOutputWorld', {},
+                          [_sk('Surface', 'SHADER', None, ['bg', 0])], []),
+        }
+        if linked:
+            nodes['rgb'] = _wnode('rgb', 'ShaderNodeRGB', {}, [],
+                                  [{'name': 'Color', 'type': 'RGBA'}])
+        return {'output': 'out', 'nodes': nodes}
+
+    def rig(world=None, ss=1, image=False, **kw):
+        st = base_settings(W, H)
+        st.shadows = False
+        st.transparency = 'NONE'
+        if ss > 1:
+            st.aa_mode = 'SUPERSAMPLE'
+            st.aa_samples = ss * ss
+        for k, v in kw.items():
+            setattr(st, k, v)
+        sc = demo_scene(st, with_texture=False)
+        for k, v in (world or {}).items():
+            setattr(sc.world, k, v)
+        if image:
+            sc.images['envtest'] = env_buf
+        return sc, st
+
+    def twin(sc, st, textures, ss):
+        rw, rh = W * ss, H * ss
+        _view, _proj, vp, eye = R.camera_matrices(sc.camera, rw, rh)
+        g = CR.GBuffer(rw, rh)
+        CR.rasterize(sc.mesh.verts, sc.mesh.tris, vp, rw, rh, gbuf=g)
+        dbg = {}
+        sim, why = GSKY.simulate(sc, g, st, vp, eye, textures, ss=ss,
+                                 debug=dbg)
+        if sim is None:
+            return None, why, None, None, g
+        cpu = R._background_image(sc, st, rw, rh, vp, eye, ~g.mask(),
+                                  textures, ss=ss)
+        return sim, None, cpu, dbg.get('plan'), g
+
+    # (label, world overrides, settings overrides, ss, the env texture
+    # bound, the mode the plan must choose)
+    modes = [
+        ('NODES sky_blend (the demo world)', {}, {}, 1, False,
+         GSKY.MODE_BLEND),
+        ('NODES sky_blend at ss 2 under fast_background (the block road)',
+         {}, {}, 2, False, GSKY.MODE_BLEND),
+        ('a transparent film (exact zeros, alpha 0)', {},
+         {'film_transparent': True}, 1, False, GSKY.MODE_NONE),
+        ('NODES flat colour', {'sky_blend': False, 'color': (0.2, 0.3, 0.4)},
+         {}, 1, False, GSKY.MODE_FLAT),
+        ('SOLID times strength', {'mode': 'SOLID', 'color': (0.4, 0.3, 0.2),
+                                  'strength': 1.7}, {}, 1, False,
+         GSKY.MODE_FLAT),
+        ('GRADIENT at falloff 1', {'mode': 'GRADIENT'}, {}, 1, False,
+         GSKY.MODE_GRADIENT),
+        ('GRADIENT pow 0.7, SMOOTH, the ground shown, horizon 0.15',
+         {'mode': 'GRADIENT', 'gradient_falloff': 0.7, 'blend_mode': 'SMOOTH',
+          'show_ground': True, 'horizon_height': 0.15}, {}, 1, False,
+         GSKY.MODE_GRADIENT),
+        ('GRADIENT rotated 0.6', {'mode': 'GRADIENT', 'rotation': 0.6,
+                                  'show_ground': True}, {}, 1, False,
+         GSKY.MODE_GRADIENT),
+        ('GRADIENT with the EASE blend', {'mode': 'GRADIENT',
+                                          'blend_mode': 'EASE',
+                                          'gradient_falloff': 1.5}, {}, 1,
+         False, GSKY.MODE_GRADIENT),
+        ('BANDS (6 steps, softness 0.3)', {'mode': 'BANDS', 'band_count': 6,
+                                           'band_softness': 0.3}, {}, 1,
+         False, GSKY.MODE_BANDS),
+        ('HDRI equirect, bilinear, tinted', {'mode': 'HDRI',
+                                             'env_image': env_buf,
+                                             'env_tint': (0.9, 0.7, 1.2),
+                                             'strength': 1.2}, {}, 1, True,
+         GSKY.MODE_HDRI),
+        ('HDRI nearest', {'mode': 'HDRI', 'env_image': env_buf,
+                          'env_filter': 'NEAREST'}, {}, 1, True,
+         GSKY.MODE_HDRI),
+        ('HDRI mirror ball', {'mode': 'HDRI', 'env_image': env_buf,
+                              'env_mapping': 'MIRRORBALL'}, {}, 1, True,
+         GSKY.MODE_HDRI),
+        ('HDRI with its texture missing (the solid colour)',
+         {'mode': 'HDRI', 'env_image': env_buf, 'color': (0.3, 0.2, 0.1),
+          'strength': 1.5}, {}, 1, False, GSKY.MODE_FLAT),
+        ('NODES with an env_image', {'sky_blend': False,
+                                     'env_image': env_buf}, {}, 1, True,
+         GSKY.MODE_ENV),
+        ("a plain Background node graph (Blender's default world)",
+         {'graph': bg_graph()}, {}, 1, False, GSKY.MODE_FLAT),
+    ]
+    for label, world, over, ss, bind, expect in modes:
+        sc, st = rig(world, ss=ss, **over)
+        textures = {'envtest': env_tex} if bind else {}
+        sim, why, cpu, plan, g = twin(sc, st, textures, ss)
+        if sim is None:
+            check(f'sky {label}: the pass draws (mode {expect})', False,
+                  str(why))
+            continue
+        unc = ~g.mask()
+        n_diff = int((sim[unc] != cpu[unc]).any(axis=1).sum())
+        cov_zero = bool((sim[~unc] == 0.0).all())
+        a_exp = 0.0 if over.get('film_transparent') else 1.0
+        alpha_ok = bool((sim[unc][:, 3] == a_exp).all())
+        check(f'sky {label}: the GPU pass is bitwise the CPU sky at every '
+              f'uncovered pixel (mode {expect}), covered pixels exact zeros, '
+              f'alpha {a_exp:g}',
+              n_diff == 0 and int(plan['mode']) == expect and cov_zero
+              and alpha_ok,
+              f'{n_diff} px differ; mode {plan["mode"]}; covered zeros '
+              f'{cov_zero}; alpha {alpha_ok}')
+
+    # --- the refusals, by name
+    for label, world, word in (
+            ('the ground plane', {'ground_plane': True}, 'ground plane'),
+            ('the Bryce Sky Lab', {'mode': 'BRYCE'}, 'Bryce'),
+            ('the painted sky', {'mode': 'PAINTED'}, 'painted sky'),
+            ('the starfield', {'mode': 'STARFIELD'}, 'starfield'),
+            ('the physical sky', {'mode': 'PHYSICAL'}, 'physical sky'),
+            ('a Background whose Color is linked',
+             {'graph': bg_graph(linked=True)}, 'world node graph')):
+        sc, st = rig(world)
+        why = GSKY.refusal(sc, st)
+        sim, why2, _c, _p, _g = twin(sc, st, {}, 1)
+        check(f'{label} refuses the GPU sky by name (the plan and the twin '
+              'agree)', why is not None and word in why and sim is None
+              and why2 == why, str(why))
+    sc, st = rig()
+    sc.materials[1].model = 'WIREFRAME'
+    _view, _proj, vp, eye = R.camera_matrices(sc.camera, W, H)
+    g = CR.GBuffer(W, H)
+    CR.rasterize(sc.mesh.verts, sc.mesh.tris, vp, W, H, gbuf=g)
+    p_w, why_w = GSKY.plan(sc, st, W, H, vp, eye, {}, ss=1)
+    check('a WIREFRAME material is NOT refused by the sky plan (the render '
+          'road releases the residency instead: _wire_active says so)',
+          GSKY.refusal(sc, st) is None and p_w is not None and why_w is None
+          and R._wire_active(sc, st, g))
+    sc, st = rig({'mode': 'BRYCE'}, film_transparent=True)
+    p_t, _w = GSKY.plan(sc, st, W, H, vp, eye, {}, ss=1)
+    check('a transparent film plans MODE_NONE before any refusal (nothing '
+          'to draw, whatever the world)', p_t is not None
+          and p_t['mode'] == GSKY.MODE_NONE)
+
+    # --- the params texture carries every dial exactly
+    vals = {}
+    for i, (name, kind) in enumerate(GSKY.PARAMS):
+        vals[name] = (float(i) + 0.25 if kind == 'f' else i if kind == 'i'
+                      else (1.0, 2.0) if kind == 'v2'
+                      else (0.5, 0.25, 0.125) if kind == 'v3'
+                      else (0.5, 0.25, 0.125, 0.0625))
+    vals['hal_sky_steps'] = 16777215
+    packed = GSKY.pack_params(vals)
+    ok_p = packed.shape == (1, len(GSKY.PARAMS), 4)
+    for i, (name, kind) in enumerate(GSKY.PARAMS):
+        v = vals[name]
+        if kind in ('v2', 'v3', 'v4'):
+            ok_p &= bool(np.array_equal(packed[0, i, :len(v)],
+                                        np.asarray(v, np.float32)))
+        else:
+            ok_p &= float(packed[0, i, 0]) == float(v)
+    check('the sky params texture holds every dial exactly (floats, vectors '
+          'and ints to 2**24 round-trip)', ok_p)
+    spec = GSKY.interface(GSKY.SOURCE)
+    declared = set(re.findall(r'^\s*uniform\s+\w+\s+(\w+)\s*;', GSKY.SOURCE,
+                              re.M))
+    check('SKY: every declared uniform is in its CreateInfo spec, the mode is '
+          'the one push-constant int, and no float / vec2 / vec3 rides a '
+          'push constant', declared == set(sum(spec.values(), []))
+          and spec['ints'] == ['hal_sky_mode'] and not spec['floats']
+          and not spec['vec2'] and not spec['vec3']
+          and set(spec['samplers']) == {'hal_gb_ids', 'hal_sky_env',
+                                        'hal_sky_params', 'hal_sky_tab',
+                                        'hal_sky_m7rows',
+                                        'hal_sky_m7map'}, str(spec))
+
+    # --- the front-end truncates the block road's division
+    prog, err = try_compile("""
+uniform float x;
+out vec4 Color;
+void main() { int a = int(float(7) / float(2)); int b = int(x / float(2));
+              Color = vec4(float(a), float(b), 0.0, 1.0); }
+""", 'GLSL')
+    got = None
+    if prog is not None:
+        got = prog.run({'x': np.array([7.0, 9.0], np.float32)}, {}, 2)[0]
+        got = np.asarray(got['Color'], np.float32)
+    check('the GLSL front-end truncates int(float(7) / float(2)) to 3 (the '
+          'fast_background block index)', got is not None
+          and got[0, 0] == 3.0 and got[0, 1] == 3.0 and got[1, 1] == 4.0,
+          str(err if prog is None else got[:, :2].tolist()))
+
+    # --- shade.simulate mirrors the sky onto the G-buffer
+    sc, st = rig()
+    view, proj, vp, eye = R.camera_matrices(sc.camera, W, H)
+    g = CR.GBuffer(W, H)
+    CR.rasterize(sc.mesh.verts, sc.mesh.tris, vp, W, H, gbuf=g)
+    R._build_shadows(sc, st, sc.mesh)
+    textures = R.prepare_textures(sc, st)
+    job = R.ShadeJob(sc, st, textures, None, view, eye, W, H)
+    job.vp = vp
+    job.ss = 1
+    GSH._PLAN_CACHE.clear()
+    passes, why, atl = GSH.plan_frame(job, g)
+    img = None
+    if passes is not None:
+        img, _hit = GSH.simulate(job, g, passes, atl)
+    unc = ~g.mask()
+    cpu = R._background_image(sc, st, W, H, vp, eye, unc, textures)
+    check("shade.simulate with the job's view-projection mirrors the sky: "
+          'gpu_sky set, sim_sky carried on the G-buffer, and the uncovered '
+          'pixels of the shaded frame ARE the CPU sky', img is not None
+          and bool(getattr(g, 'gpu_sky', False)) and g.sim_sky is not None
+          and np.array_equal(img[unc], g.sim_sky[unc][:, :3])
+          and np.array_equal(img[unc], cpu[unc][:, :3]), str(why))
+    g2 = CR.GBuffer(W, H)
+    CR.rasterize(sc.mesh.verts, sc.mesh.tris, vp, W, H, gbuf=g2)
+    job2 = R.ShadeJob(sc, st, textures, None, view, eye, W, H)
+    img2 = None
+    if passes is not None:
+        img2, _hit2 = GSH.simulate(job2, g2, passes, atl)
+    check('a job without a view-projection leaves the sky verdict false and '
+          'the uncovered pixels untouched', img2 is not None
+          and not bool(getattr(g2, 'gpu_sky', False))
+          and bool((img2[~g2.mask()] == 0.0).all()))
+
+    # --- the CPU road is untouched: bitwise the previous release
+    RP = _prev_engine('halcyon-1.88.0.zip')
+    if RP is not None:
+        for label, world, over, ss, bind, _expect in modes:
+            sc, st = rig(world, ss=ss, image=bind, **over)
+            now = np.asarray(R.render(sc, st))
+            sc2, st2 = rig(world, ss=ss, image=bind, **over)
+            prev = np.asarray(RP.render(sc2, st2))
+            check(f'the CPU device renders {label} bitwise the previous '
+                  "release's engine", now.shape == prev.shape
+                  and bool(np.array_equal(now, prev)),
+                  f'max {float(np.abs(now - prev).max()) if now.shape == prev.shape else "shape"}')
+
+
+def test_gpu_frame_resident():
+    """R250 (1.89.0): the frame kept on the GPU between stages --
+    "Tomorrow, we will do the remaining CPU passes to GPU." Until 1.88.0
+    every GPU stage uploaded the frame and read it back; gpu/frame.py's
+    Resident keeps the shading's own target for the ink, the resolve and
+    the post chain, under one LAW: a resident target equals the CPU img
+    byte for byte, and any CPU stage that edits img releases it by name.
+
+    Bars. The whole GPU road runs headless through the fake device and
+    lands within the shading twin's rounding of the CPU frame (alpha
+    bitwise), no target left live; the sky draws in the burst and the
+    frame stays resident through the ink and the resolve; fog, the
+    Screen Door and the wireframe give it back by name. The
+    GPU-shaded flag resets before the geometry-less return and
+    propagates false through stitched frames. The ink reads the resident
+    frame in place bitwise the uploaded road, hands its output over live.
+    Release is idempotent; edited() with nothing resident never reaches
+    the device; a forgotten handle buries its offscreen, never frees it.
+    """
+    import gc
+    import sys
+    from ..core import raster as CR
+    from ..core.scene import Light, MeshData
+    from ..gpu import device as DEV
+    from ..gpu import frame as FR
+    from ..gpu import ink as GINK
+    from ..gpu import shade as GSH
+    from . import fakedevice
+
+    W, H = 96, 72
+
+    def settings(device='CPU', **kw):
+        st = base_settings(W, H)
+        st.shadows = False
+        st.transparency = 'NONE'
+        st.render_device = device
+        for k, v in kw.items():
+            setattr(st, k, v)
+        return st
+
+    def road(**kw):
+        st_c = settings('CPU', **kw)
+        sc_c = demo_scene(st_c, with_texture=False)
+        cpu = R.render(sc_c, st_c)
+        st_g = settings('GPU', **kw)
+        sc_g = demo_scene(st_g, with_texture=False)
+        R._GBUF_CACHE.clear()
+        GSH._PLAN_CACHE.clear()
+        GINK.LAST_TIMINGS.clear()
+        with fakedevice.installed() as dev:
+            gpu = R.render(sc_g, st_g)
+            live = [t for t in dev.targets if not t.freed]
+        return (cpu, gpu, live, dict(GSH.LAST_TIMINGS), dict(FR.LAST),
+                dict(GINK.LAST_TIMINGS), st_g)
+
+    def close(cpu, gpu):
+        d = float(np.abs(gpu[..., :3] - cpu[..., :3]).max())
+        return d <= 6e-6 and bool(np.array_equal(gpu[..., 3], cpu[..., 3])), d
+
+    cpu, gpu, live, LT, LF, LI, st_g = road()
+    ok, d = close(cpu, gpu)
+    check('the whole GPU road headless: the frame matches the CPU render '
+          'within 6e-6 (the shading twin\'s rounding), alpha bitwise',
+          ok, f'max {d}')
+    check('the sky drew in the shading burst (sky_blend, mode 2) and the '
+          'frame stayed resident through the shading',
+          LT.get('sky') == 2 and LT.get('resident') is True
+          and LF.get('kept') == ['shade'] and not LF.get('left_gpu'),
+          f"sky {LT.get('sky')} resident {LT.get('resident')} {LF}")
+    check('no target is left live after render() (no _keep_gpu_frame: the '
+          'frame is released in its finally)', live == []
+          and FR.current(st_g) is None, f'{len(live)} live')
+
+    cpu, gpu, live, LT, LF, LI, st_g = road(outline=True, outline_width=3)
+    ok, d = close(cpu, gpu)
+    check('with the outline: the ink reads the resident frame in place '
+          '(frame_reused) and hands its target over -- kept through shade '
+          'and ink, the frame within 6e-6 of the CPU, alpha bitwise',
+          ok and LI.get('frame_reused') is True
+          and LF.get('kept') == ['shade', 'ink'] and live == [],
+          f'max {d}; {LF}; reused {LI.get("frame_reused")}')
+
+    cpu, gpu, live, LT, LF, LI, st_g = road(outline=True, aa_samples=4)
+    ok, d = close(cpu, gpu)
+    check('at aa_samples 4 the resolve draws on the GPU over the resident '
+          'frame: kept through shade, ink and resolve at ss 2, the output '
+          'within 6e-6 of the CPU, alpha bitwise, nothing left live',
+          ok and LF.get('kept') == ['shade', 'ink', 'resolve']
+          and (LF.get('resolve') or {}).get('ss') == 2 and live == [],
+          f'max {d}; {LF}')
+
+    cpu, gpu, live, LT, LF, LI, st_g = road(fog=True)
+    ok, d = close(cpu, gpu)
+    check('with fog the frame STAYS resident (R251: fog runs inside the '
+          'material pass, nothing on the CPU edits the readback), still '
+          'within 6e-6 of the CPU', ok and LT.get('resident') is True
+          and (LF.get('kept') or [None])[0] == 'shade' and live == [],
+          f'max {d}; {LT.get("resident")} {LF}')
+
+    cpu, gpu, live, LT, LF, LI, st_g = road(transparency='STIPPLE')
+    ok, d = close(cpu, gpu)
+    check("with the Screen Door the frame's alpha is decoded on the CPU: "
+          'resident False, the alpha plane bitwise the CPU\'s',
+          ok and LT.get('resident') is False and live == [],
+          f'max {d}; resident {LT.get("resident")}')
+
+    cpu, gpu, live, LT, LF, LI, st_g = road(render_wire=True)
+    ok, d = close(cpu, gpu)
+    check('the wireframe overlay takes the frame back to the CPU by name '
+          "(left_gpu 'wireframe'), within 6e-6 of the CPU",
+          ok and LF.get('left_gpu') == 'wireframe' and live == [],
+          f'max {d}; {LF}')
+
+    cpu, gpu, live, LT, LF, LI, st_g = road(film_transparent=True)
+    ok, d = close(cpu, gpu)
+    check('a transparent film draws sky mode 0 (exact zeros at uncovered '
+          'pixels): the frame bitwise the CPU\'s alpha, within 6e-6',
+          ok and LT.get('sky') == 0 and live == [],
+          f'max {d}; sky {LT.get("sky")}')
+
+    # --- the flag resets before the geometry-less return
+    for device in ('CPU', 'GPU'):
+        st = settings(device)
+        sc = demo_scene(st, with_texture=False)
+        sc.lights = []
+        sc.mesh = MeshData(verts=np.zeros((0, 3), np.float32),
+                           tris=np.zeros((0, 3), np.int32))
+        st._frame_gpu_shaded = True
+        img = R.render(sc, st)
+        check(f'a geometry-less frame on the {device} device resets the '
+              'GPU-shaded flag before its early return (a reused settings '
+              "object never carries the previous frame's verdict)",
+              st._frame_gpu_shaded is False and img.shape == (H, W, 4)
+              and FR.current(st) is None)
+
+    # --- stitched frames propagate the flag
+    def pano(sc, st):
+        sc.camera.type = 'PANO'
+
+    def stereo(sc, st):
+        st.stereo_mode = 'ANAGLYPH'
+        st.stereo_eye_distance = 0.12
+
+    def accum(sc, st):
+        st.aa_mode = 'ACCUMULATE'
+        st.aa_samples = 2
+
+    for label, prep, device in (('a panorama', pano, 'CPU'),
+                                ('a stereo pair', stereo, 'CPU'),
+                                ('an accumulation buffer', accum, 'CPU'),
+                                ('a stereo pair', stereo, 'GPU')):
+        st = settings(device)
+        sc = demo_scene(st, with_texture=False)
+        prep(sc, st)
+        st._frame_gpu_shaded = True
+        err = None
+        try:
+            img = R.render(sc, st)
+        except Exception as exc:                                # noqa: BLE001
+            img, err = None, exc
+        check(f'{label} stitched on the {device} device propagates the '
+              'GPU-shaded flag false (every sub-frame shaded on the CPU '
+              'here), without an exception', err is None and img is not None
+              and st._frame_gpu_shaded is False and FR.current(st) is None,
+              f'{type(err).__name__}: {err}' if err else '')
+
+    # --- the ink's frame= road against the uploaded road (the style road:
+    # seven targets serve its passes, as test_gpu_ink_pass counts them)
+    st = settings('CPU', outline=True, outline_width=3, ink_style='BRUSH',
+                  ink_taper=0.5, ink_end_taper=0.5, ink_texture='STREAKS',
+                  ink_shadow_side=0.4, ink_boil=1.0, ink_grain=0.1)
+    sc = demo_scene(st, with_texture=False)
+    sc.lights = [Light(type='SUN', direction=(-0.4, 0.35, -0.85), energy=3.0,
+                       shadow='NONE')]
+    _view, proj, vp, eye = R.camera_matrices(sc.camera, W, H)
+    g = CR.GBuffer(W, H)
+    CR.rasterize(sc.mesh.verts, sc.mesh.tris, vp, W, H, gbuf=g)
+    rn = np.random.default_rng(1)
+    img = np.zeros((H, W, 4), np.float32)
+    img[..., :3] = rn.random((H, W, 3)).astype(np.float32) * 0.8 + 0.1
+    img[..., 3] = (g.tri >= 0).astype(np.float32)
+    tables = R.ink_tables(sc, st)
+    with fakedevice.installed() as dev:
+        n0 = dev.calls['upload']
+        got_up, why_up = GINK.apply(sc, g, img.copy(), st, tables, vp=vp,
+                                    proj=proj, eye=eye)
+        ups_up = dev.calls['upload'] - n0
+        t = fakedevice.Target(W, H)
+        t.pixels = np.ascontiguousarray(img, np.float32)
+        res = FR.Resident(t, W, H, 'test')
+        keep = {}
+        n1 = dev.calls['upload']
+        got_fr, why_fr = GINK.apply(sc, g, img.copy(), st, tables, vp=vp,
+                                    proj=proj, eye=eye, frame=res, keep=keep)
+        ups_fr = dev.calls['upload'] - n1
+        live = [x for x in dev.targets if not x.freed]
+        check("the ink's frame= road (the resident target sampled in place) "
+              'draws bitwise the uploaded road, one upload fewer, and the '
+              'pass reports the reuse', got_up is not None
+              and got_fr is not None and np.array_equal(got_up, got_fr)
+              and ups_fr == ups_up - 1
+              and GINK.LAST_TIMINGS.get('frame_reused') is True,
+              f'{why_up} / {why_fr}; uploads {ups_up} -> {ups_fr}')
+        check("with keep={} the ink's 'out' target is handed over live and "
+              'unfreed while the other six are freed (the pool hands the '
+              'same seven back)', keep.get('out') is not None
+              and not keep['out'].freed and live == [keep['out']]
+              and len(dev.targets) == 7,
+              f'{len(live)} live of {len(dev.targets)}')
+        check('the resident handle the ink read is left untouched (still '
+              'live)', res.live and res.texture() is not None)
+        out_res = FR.Resident(keep['out'], W, H, 'ink')
+        was_live = out_res.live
+        out_res.release()
+        out_res.release()
+        check('Resident.release() is idempotent: the target goes back to the '
+              'pool once, the handle reads live False and texture None after',
+              was_live and not out_res.live and out_res.texture() is None
+              and out_res.target is None and keep['out'].freed)
+        res.release()
+
+    # --- edited() with nothing resident never reaches the device
+    st_e = settings('CPU')
+    FR.LAST.clear()
+    saved_target = DEV.Target
+
+    def _boom(*_a, **_k):
+        raise AssertionError('the device was touched')
+
+    DEV.Target = _boom
+    err = ''
+    try:
+        FR.edited(st_e, 'x')
+        FR.edited(st_e, 'x', 'why')
+        FR.release(st_e)
+    except Exception as exc:                                    # noqa: BLE001
+        err = f'{type(exc).__name__}: {exc}'
+    finally:
+        DEV.Target = saved_target
+    check('frame.edited() / release() on a settings object with nothing '
+          'resident are pure no-ops: no device call, no left_gpu record',
+          err == '' and 'left_gpu' not in FR.LAST
+          and FR.current(st_e) is None, err)
+    st_e._gpu_frame = FR.Resident(None, 1, 1, 'dead')
+    check('current() nulls a dead handle (a released target reads None) '
+          'instead of handing it to a stage', FR.current(st_e) is None
+          and getattr(st_e, '_gpu_frame', None) is None)
+    FR.install(st_e, FR.Resident(fakedevice.Target(4, 4), 4, 4, 'a'), 'a')
+    first = st_e._gpu_frame
+    FR.install(st_e, FR.Resident(fakedevice.Target(4, 4), 4, 4, 'b'), 'b')
+    check('install() releases the previous handle and records the stages '
+          'kept in order', not first.live and st_e._gpu_frame.live
+          and FR.LAST.get('kept') == ['a', 'b'])
+    FR.edited(st_e, 'halos', 'a CPU splat')
+    check("edited() releases the resident frame and names the stage once "
+          "('halos (a CPU splat)')", FR.current(st_e) is None
+          and FR.LAST.get('left_gpu') == 'halos (a CPU splat)')
+    FR.begin_frame(st_e)
+    check('begin_frame() clears the record for the next frame',
+          FR.LAST == {} and FR.current(st_e) is None)
+
+    # --- a forgotten handle buries the real Target's offscreen
+    from . import fakebpy
+    fakebpy.install()
+
+    class _Off:
+        def __init__(self, *_a, **_k):
+            self.freed = False
+
+        def free(self):
+            self.freed = True
+
+    gpu_mod = sys.modules.get('gpu')
+    had_types = getattr(gpu_mod, 'types', None) if gpu_mod else None
+    had_off = getattr(had_types, 'GPUOffScreen', None) if had_types else None
+    orig_main = DEV._main
+    DEV._main = lambda _what, fn: fn()
+    try:
+        if had_types is not None:
+            had_types.GPUOffScreen = _Off
+        else:
+            import types as _t
+            gpu_mod.types = _t.SimpleNamespace(GPUOffScreen=_Off)
+        DEV._STATE.setdefault('target_pool', {}).clear()
+        DEV._GRAVEYARD.clear()
+        t = DEV.Target(8, 8)
+        off = t.offscreen
+        r = FR.Resident(t, 8, 8, 'x')
+        was_live = r.live
+        del r
+        del t
+        gc.collect()
+        buried = [o for _e, _d, o in DEV._GRAVEYARD]
+        check("a Resident forgotten and garbage-collected buries the real "
+              "device.Target's offscreen in the graveyard -- never .free()d "
+              'directly, never pooled', was_live and off in buried
+              and not off.freed
+              and not DEV._STATE['target_pool'].get((8, 8, 'RGBA32F')),
+              f'buried {len(buried)}, freed {off.freed}')
+        DEV._GRAVEYARD.clear()
+    finally:
+        DEV._main = orig_main
+        if had_types is not None:
+            if had_off is not None:
+                had_types.GPUOffScreen = had_off
+            else:
+                try:
+                    del had_types.GPUOffScreen
+                except AttributeError:
+                    pass
+
+    # --- R251 (RAST-A1): the depth-key plane's road through the device
+    # switch -- a GPU-device frame under a depth ENCODING knocks on the
+    # raster door WITH the encoding (and no flat depth), and without a
+    # driver lands bitwise on the CPU device's frame
+    from ..gpu import craster as _CRA
+    from ..core.render import _GBUF_CACHE as _gbc
+    _seen = {}
+    _orig_rig = _CRA.raster_into_gbuffer
+
+    def _rig(*a, **k):
+        _seen['opts'] = k.get('opts')
+        _seen['flat'] = k.get('flat_depth')
+        _seen['n'] = _seen.get('n', 0) + 1
+        return _orig_rig(*a, **k)
+    _CRA.raster_into_gbuffer = _rig
+    try:
+        _gbc.clear()
+        st_a = base_settings(96, 72)
+        st_a.shadows = False
+        st_a.depth_encoding = 'N64_FLOAT18'
+        cpu_a = np.asarray(R.render(demo_scene(st_a, with_texture=False),
+                                    st_a))
+        _gbc.clear()
+        st_b = base_settings(96, 72)
+        st_b.shadows = False
+        st_b.depth_encoding = 'N64_FLOAT18'
+        st_b.render_device = 'GPU'
+        st_b.gpu_raster = True
+        gpu_b = np.asarray(R.render(demo_scene(st_b, with_texture=False),
+                                    st_b))
+    finally:
+        _CRA.raster_into_gbuffer = _orig_rig
+    check('R251 depth-key plane: the GPU device knocks on the raster door '
+          'with the N64 encoding and no flat depth, and without a driver '
+          'renders bitwise the CPU device',
+          _seen.get('n', 0) >= 1
+          and str(getattr(_seen.get('opts'), 'enc', '')) == 'N64_FLOAT18'
+          and _seen.get('flat') is None
+          and cpu_a.shape == gpu_b.shape
+          and bool(np.array_equal(cpu_a, gpu_b)),
+          f"knocked {_seen.get('n', 0)}, enc "
+          f"{getattr(_seen.get('opts'), 'enc', None)}")
+
+    # --- R251 (RAST-A2, C001): the N64 coverage plane through the device
+    # switch -- a GPU-device frame with n64_coverage_aa knocks on the
+    # raster door WITH opts.cvg, leaves scene.last_cvg for the post
+    # chain, and without a driver renders AND post-processes bitwise the
+    # CPU device (the VI stage refuses by name and runs on the CPU)
+    from ..core import post as _PO
+    _seen_c = {}
+
+    def _rig_c(*a, **k):
+        _seen_c['cvg'] = getattr(k.get('opts'), 'cvg', None)
+        _seen_c['n'] = _seen_c.get('n', 0) + 1
+        return _orig_rig(*a, **k)
+    _CRA.raster_into_gbuffer = _rig_c
+    try:
+        _gbc.clear()
+        st_a = base_settings(96, 72)
+        st_a.shadows = False
+        st_a.n64_coverage_aa = True
+        sc_a = demo_scene(st_a, with_texture=False)
+        cpu_a = np.asarray(R.render(sc_a, st_a))
+        post_a = np.asarray(_PO.process(cpu_a, st_a, frame=1, seed=0,
+                                        target_size=(96, 72),
+                                        allow_resize=False,
+                                        cvg=getattr(sc_a, 'last_cvg', None)))
+        _gbc.clear()
+        st_b = base_settings(96, 72)
+        st_b.shadows = False
+        st_b.n64_coverage_aa = True
+        st_b.render_device = 'GPU'
+        st_b.gpu_raster = True
+        sc_b = demo_scene(st_b, with_texture=False)
+        gpu_b = np.asarray(R.render(sc_b, st_b))
+        post_b = np.asarray(_PO.process(gpu_b, st_b, frame=1, seed=0,
+                                        target_size=(96, 72),
+                                        allow_resize=False,
+                                        cvg=getattr(sc_b, 'last_cvg', None)))
+    finally:
+        _CRA.raster_into_gbuffer = _orig_rig
+    check('R251 N64 coverage plane: the GPU device knocks on the raster '
+          'door with opts.cvg, both devices leave a coverage plane, and '
+          'without a driver render and post are bitwise the CPU device',
+          _seen_c.get('n', 0) >= 1 and _seen_c.get('cvg') is True
+          and getattr(sc_a, 'last_cvg', None) is not None
+          and getattr(sc_b, 'last_cvg', None) is not None
+          and bool(np.array_equal(cpu_a, gpu_b))
+          and bool(np.array_equal(post_a, post_b)),
+          f"knocked {_seen_c.get('n', 0)}, cvg {_seen_c.get('cvg')}")
+
+
+def test_gpu_post_resident():
+    """R250 (1.89.0): the post chain resident on the GPU -- "Tomorrow, we
+    will do the remaining CPU passes to GPU." The chain used to upload
+    the frame and read it back per stage (NTSC four times over); now it
+    inherits the render's own resident target, draws stage to stage in
+    ping-pong targets, reads back once -- or at the first ACTIVE CPU-only
+    stage, by name. Two new stages: GRAIN (the film's white sheets and
+    the flicker) and QUANT (the bit depth without a dither, fetching the
+    CPU's own level table); the RESOLVE stage lives in gpu/frame.py.
+
+    Bars. Render + post through the fake device equals the CPU chain over
+    the same frame BITWISE for the defaults, the modern cel preset, a
+    gamma with grain, a 15-bit depth, and the readback roads (a dither, a
+    glow with weave, a halftone) -- each readback and upload counted by
+    name; the CRT and NTSC stages within their own CLOSE grades. Every
+    CPU-device post result is bitwise the previous release's. The three
+    stage twins run through the simulator against the CPU functions:
+    GRAIN within 2e-7 (bitwise for one sheet), QUANT bitwise at every
+    depth and at exact half ties, RESOLVE bitwise for every filter. The
+    refusals name every CPU film stage and every dither / palette road.
+    The chain's Frame ping-pongs, retires, reads back and frees exactly;
+    the fake refuses a draw over a freed target. _gpu_stage passes the
+    frame number and seed through.
+    """
+    import importlib
+    import sys
+    import types as _t
+    from ..core import film as FILM
+    from ..core import palette as PA
+    from ..core.texture import Texture
+    from ..gpu import chain
+    from ..gpu import device as DEV
+    from ..gpu import frame as FR
+    from ..gpu import shade as GSH
+    from ..gpu import stages
+    from ..shaders.compiler import try_compile
+    from . import fakedevice
+    PO = post
+
+    W, H = 96, 72
+
+    def settings(**kw):
+        st = base_settings(W, H)
+        st.shadows = False
+        st.transparency = 'NONE'
+        for k, v in kw.items():
+            setattr(st, k, v)
+        return st
+
+    def preset_settings():
+        st = base_settings(W, H)
+        apply_preset(st, 'CEL_ANIME_MODERN')
+        st.resolution_x, st.resolution_y = W, H
+        st.aa_samples = 1
+        return st
+
+    def post_kw(sc, st):
+        return dict(frame=7, seed=st.seed, target_size=(W, H),
+                    allow_resize=False,
+                    depth=getattr(sc, 'last_depth', None),
+                    shaft_sources=getattr(sc, 'last_shafts', None),
+                    flare_sources=getattr(sc, 'last_flares', None))
+
+    def gpu_road(st):
+        st.render_device = 'GPU'
+        sc = demo_scene(st, with_texture=False)
+        R._GBUF_CACHE.clear()
+        GSH._PLAN_CACHE.clear()
+        with fakedevice.installed() as dev:
+            st._keep_gpu_frame = True
+            try:
+                img = R.render(sc, st)
+                out = PO.process(img, st, **post_kw(sc, st))
+                rec = dict(PO.LAST_CHAIN)
+            finally:
+                FR.release(st)
+            live = [t for t in dev.targets if not t.freed]
+        # the CPU chain over the SAME frame: only the device switch differs
+        st_c = st.copy()
+        st_c.render_device = 'CPU'
+        out_c = PO.process(img, st_c, **post_kw(sc, st_c))
+        return out, out_c, rec, live
+
+    cases = [
+        ('the defaults', {}, 0.0,
+         dict(resident=True, stages=['DISPLAY', 'QUANT'], readbacks=0,
+              uploads=0)),
+        ('the CEL_ANIME_MODERN preset (grain, gamma 2.2, the ink)', 'preset',
+         0.0, dict(resident=True, stages=['GRAIN', 'DISPLAY', 'QUANT'],
+                   readbacks=0, uploads=0)),
+        ('gamma 2.2 with film grain 0.3 at size 1.0',
+         {'gamma': 2.2, 'film_grain': 0.3, 'film_grain_size': 1.0}, 0.0,
+         dict(stages=['GRAIN', 'DISPLAY', 'QUANT'], readbacks=0)),
+        ("colour depth '15'", {'color_depth': '15'}, 0.0,
+         dict(stages=['DISPLAY', 'QUANT'], readbacks=0)),
+        ('a BAYER4 dither at 24 bits (the ORDERED stage)',
+         {'dither': 'BAYER4'}, 0.0,
+         dict(stages=['DISPLAY', 'ORDERED'], readbacks=0)),
+        ('a glow with film grain 0.2 and gate weave 0.5 (the glow reads '
+         'back once, the film runs down, one upload after)',
+         {'glow': True, 'film_grain': 0.2, 'film_weave': 0.5}, 0.0,
+         dict(readback_names=['glow'], uploads=1)),
+        ('a halftone 0.5 (the print reads back after the display encode)',
+         {'film_halftone': 0.5}, 0.0,
+         dict(readback_names=['halftone'], uploads=1)),
+        ('CRT scanlines 0.4 with the composite cable (the CLOSE stages)',
+         {'crt': True, 'crt_scanlines': 0.4, 'composite': True}, 5e-4,
+         dict(stages_has=['NTSC', 'CRT'])),
+    ]
+    for label, kw, tol, want in cases:
+        st = preset_settings() if kw == 'preset' else settings(**kw)
+        out_g, out_c, rec, live = gpu_road(st)
+        d = float(np.abs(out_g - out_c).max()) if out_g.shape == out_c.shape \
+            else float('inf')
+        ok = d <= tol and live == []
+        why = [f'max {d}', f'{len(live)} live', str(rec)]
+        if 'resident' in want:
+            ok &= rec.get('resident') is want['resident']
+        if 'stages' in want:
+            ok &= rec.get('stages') == want['stages']
+        if 'stages_has' in want:
+            ok &= all(s in (rec.get('stages') or []) for s in want['stages_has'])
+        if 'readbacks' in want:
+            ok &= len(rec.get('readbacks') or []) == want['readbacks']
+        if 'readback_names' in want:
+            rb = rec.get('readbacks') or []
+            ok &= len(rb) == len(want['readback_names']) and all(
+                nm in r[0] for nm, r in zip(want['readback_names'], rb))
+        if 'uploads' in want:
+            ok &= rec.get('uploads') == want['uploads']
+        check(f'post on the resident frame, {label}: the GPU chain equals '
+              'the CPU chain over the same frame '
+              + ('bitwise' if tol == 0.0 else f'within {tol:g}')
+              + ', its record as named, nothing left live', ok, '; '.join(why))
+
+    # --- every CPU-device post result is bitwise the previous release's
+    RP = _prev_engine('halcyon-1.88.0.zip')
+    if RP is not None:
+        prev_post = importlib.import_module(
+            RP.__name__.rsplit('.', 1)[0] + '.post')
+        for label, kw, _tol, _want in cases:
+            st = preset_settings() if kw == 'preset' else settings(**kw)
+            sc = demo_scene(st, with_texture=False)
+            now = PO.process(R.render(sc, st), st, **post_kw(sc, st))
+            st2 = preset_settings() if kw == 'preset' else settings(**kw)
+            sc2 = demo_scene(st2, with_texture=False)
+            prev = prev_post.process(RP.render(sc2, st2), st2,
+                                     **post_kw(sc2, st2))
+            check(f'the CPU device, {label}: render + post bitwise the '
+                  "previous release's", now.shape == prev.shape
+                  and bool(np.array_equal(now, prev)),
+                  f'max {float(np.abs(now - prev).max()) if now.shape == prev.shape else "shape"}')
+
+    # --- the stage twins through the simulator
+    def run_stage(name, h, w, uniforms, samplers):
+        src = stages.STAGES[name].replace('in vec2 vUV;', 'uniform vec2 vUV;')
+        prog, err = try_compile(src, 'GLSL')
+        if prog is None:
+            return None, err
+        n = h * w
+        yy, xx = np.mgrid[0:h, 0:w]
+        u = {'vUV': np.stack([(xx.ravel() + 0.5) / w, (yy.ravel() + 0.5) / h],
+                             1).astype(np.float32)}
+        for k, v in samplers.items():
+            u[k] = Texture(v, colorspace='Non-Color', filt='NEAREST',
+                           wrap='EXTEND')
+        for k, v in uniforms.items():
+            if isinstance(v, int):
+                u[k] = np.full(n, int(v), np.int32)
+            elif isinstance(v, (tuple, list)):
+                u[k] = np.tile(np.asarray(v, np.float32)[None, :], (n, 1))
+            else:
+                u[k] = np.full(n, float(v), np.float32)
+        outs, _d = prog.run(u, {}, n)
+        return np.asarray(outs['Color'], np.float32).reshape(h, w, 4), None
+
+    rng = np.random.default_rng(250)
+    h, w = 48, 64
+    rgb = (rng.random((h, w, 3)).astype(np.float32) * 0.9 + 0.05)
+    # the GRAIN twin is one float32 ulp from the CPU at every amplitude
+    # (measured 5.96e-8 at the finest grain, 1.19e-7 at a coarse one):
+    # the shader's log10 rides log2 times a constant, and the two differ
+    # by an ulp on more than half of all inputs -- the stage's one
+    # library call, and the reason its grade is CLOSE, not EXACT
+    for label, kw in (('chroma 0 (one sheet for every record)',
+                       {'film_grain_chroma': 0.0}),
+                      ('chroma 0.5 (the sheets mixed)',
+                       {'film_grain_chroma': 0.5}),
+                      ('chroma 1 with flicker 0.4',
+                       {'film_grain_chroma': 1.0, 'film_flicker': 0.4})):
+        st = settings(film_grain=0.4, film_grain_size=12.0, **kw)
+        frame_no, seed = 7, 3
+        uni = chain.grain_uniforms(st, h, w, frame_no, seed)
+        got, err = run_stage('GRAIN', h, w, uni, {'source': rgb})
+        ref = FILM.process_linear(rgb, st, frame_no, seed, key_frame=frame_no,
+                                  fps=24.0)
+        d = float(np.abs(got[..., :3] - ref).max()) if got is not None else -1
+        moved = float(np.abs(ref - rgb).max())
+        check(f'GRAIN {label}: the GPU sheets match film.process_linear '
+              'within one float32 ulp (2e-7: log10 rides log2, the stage\'s '
+              'one library call) and the grain is not vacuous',
+              got is not None and d <= 2e-7 and moved > 1e-3
+              and chain.film_refusal(st, h) is None
+              and bool((got[..., 3] == 1.0).all()),
+              f'max {d}; moved {moved:.4f}; {err or ""}')
+
+    for depth in ('24', '16', '15', '12', '9', '8'):
+        bits = PO.DEPTH_BITS[depth]
+        levels = tuple(float((1 << b) - 1) for b in bits)
+        got, err = run_stage('QUANT', h, w,
+                             {'resolution': (float(w), float(h)),
+                              'levels': levels},
+                             {'source': rgb, 'lut': chain.quant_lut(bits)})
+        ref = PA.snap_bits(rgb, *bits)
+        check(f"QUANT at colour depth '{depth}' {bits}: bitwise "
+              'palette.snap_bits', got is not None
+              and np.array_equal(got[..., :3], ref)
+              and bool((got[..., 3] == 1.0).all()),
+              str(err) if got is None
+              else f'max {float(np.abs(got[..., :3] - ref).max())}')
+    for depth in ('24', '16', '15', '8'):
+        bits = PO.DEPTH_BITS[depth]
+        cols = []
+        for b in bits:
+            lv = np.float32((1 << b) - 1)
+            k = np.arange((1 << b) - 1, dtype=np.float32)
+            v = ((k + np.float32(0.5)) / lv).astype(np.float32)
+            exact = (v * lv).astype(np.float32) == (k + np.float32(0.5))
+            cols.append(v[exact])
+        n_t = min(len(c) for c in cols)
+        ties = np.stack([c[:n_t] for c in cols], 1)[None].astype(np.float32)
+        levels = tuple(float((1 << b) - 1) for b in bits)
+        got, err = run_stage('QUANT', 1, n_t,
+                             {'resolution': (float(n_t), 1.0),
+                              'levels': levels},
+                             {'source': ties, 'lut': chain.quant_lut(bits)})
+        ref = PA.snap_bits(ties, *bits)
+        even = all(bool((np.rint(ref[..., ch] * np.float32(levels[ch])) % 2
+                         == 0).all()) for ch in range(3))
+        check(f"QUANT at depth '{depth}': {n_t} exact half ties per channel "
+              'round half to even, bitwise the CPU (roundEven is np.round)',
+              got is not None and n_t > 0 and even
+              and np.array_equal(got[..., :3], ref), str(err or n_t))
+
+    Wo, Ho = 24, 18
+    for ss, filt in ((2, 'BOX'), (2, 'TRIANGLE'), (3, 'GAUSS'), (2, 'CATROM'),
+                     (4, 'MITCHELL'), (8, 'BOX')):
+        st = settings(aa_filter=filt)
+        big = rng.random((Ho * ss, Wo * ss, 4)).astype(np.float32)
+        ktex = np.zeros((ss, ss, 4), np.float32)
+        ktex[..., 0] = FR.resolve_kernel(ss, st)
+        got, err = run_stage('RESOLVE', Ho, Wo,
+                             {'resolution': (float(Wo), float(Ho)),
+                              'ss': int(ss)},
+                             {'source': big, 'kernel': ktex})
+        ref = R._resolve(big, Wo, Ho, ss, st)
+        check(f'RESOLVE at ss {ss} with the {filt} filter: bitwise '
+              'render._resolve (the kernel from resolve_kernel, the taps '
+              "summed in the einsum's order)", got is not None
+              and np.array_equal(got, ref),
+              str(err) if got is None
+              else f'max {float(np.abs(got - ref).max())}')
+
+    # --- the refusals, by name
+    for label, kw, word in (
+            ('the colour process', {'film_process': 'THREE_STRIP'},
+             'colour process'),
+            ('the stock grade', {'film_grade': 'TECHNICOLOR'}, 'stock grade'),
+            ('the rostrum softness', {'film_softness': 0.5}, 'softness'),
+            ('the gate weave', {'film_weave': 0.5}, 'weave'),
+            ('the dust', {'film_dust': 0.5}, 'dust'),
+            ('the gate hairs', {'film_hairs': 1.0}, 'hairs'),
+            ('the scratches', {'film_scratches': 1.0}, 'scratches'),
+            ('the cue marks', {'film_reel': 10.0}, 'cue marks'),
+            ('a grain over 1.2 px', {'film_grain': 0.3,
+                                     'film_grain_size': 2.0}, 'Grain Size'),
+            ('the grain clumps', {'film_grain': 0.3,
+                                  'film_grain_clump': 0.5}, 'Grain Clump')):
+        why = chain.film_refusal(settings(**kw), 1080)
+        check(f'film_refusal names {label} as a CPU stage',
+              why is not None and word in why, str(why))
+    check('film_refusal: no film stage on says so; grain to 1.2 px alone '
+          'is the GPU stage (None)',
+          'no film stage' in str(chain.film_refusal(settings(), 1080))
+          and chain.film_refusal(settings(film_grain=0.3,
+                                          film_grain_size=1.2), 1080) is None)
+    for label, kw, word in (
+            ('HAM6', {'color_depth': 'HAM6'}, 'HAM'),
+            ('HAM8', {'color_depth': 'HAM8'}, 'HAM'),
+            ('1-bit', {'color_depth': '1'}, '1-bit'),
+            # R251: the palette snap and the ordered dither are GPU stages;
+            # diffusion, Blue Noise and an unlocked adaptive palette refuse
+            ('an 8-bit palette under Floyd-Steinberg',
+             {'color_depth': '8', 'dither': 'FLOYD'}, 'FLOYD dither'),
+            ('a 4-bit palette under Blue Noise',
+             {'color_depth': '4', 'dither': 'NOISE'}, 'NOISE'),
+            ('an adaptive palette with Lock Palette off',
+             {'color_depth': '8', 'palette_lock': False}, 'Lock Palette'),
+            ('a Blue Noise dither', {'dither': 'NOISE'}, 'NOISE dither'),
+            ('Floyd-Steinberg', {'dither': 'FLOYD'}, 'FLOYD dither')):
+        why = chain.quant_refusal(settings(**kw))
+        check(f'quant_refusal names {label} as a CPU road',
+              why is not None and word in why, str(why))
+    check('quant_refusal: every plain bit depth without a dither is the GPU '
+          'stage (None)', all(chain.quant_refusal(settings(color_depth=d))
+                              is None for d in ('32', '24', '16', '15',
+                                                '12', '9'))
+          # R251: a fixed palette and an ordered dither are GPU stages too
+          and chain.quant_refusal(settings(color_depth='8',
+                                           palette_mode='VGA256')) is None
+          and chain.quant_refusal(settings(color_depth='16',
+                                           dither='BAYER4')) is None)
+
+    # --- the chain's Frame under the fake device
+    h2, w2 = 12, 16
+    rgb2 = rng.random((h2, w2, 3)).astype(np.float32)
+    uni_id = {'exposure': 1.0, 'brightness': 0.0, 'contrast': 0.0,
+              'saturation': 1.0, 'gamma': 1.0, 'cm_mode': 0}
+    uni_half = dict(uni_id, exposure=0.5)
+    with fakedevice.installed() as dev:
+        sh, err = DEV.compile_stage('DISPLAY', stages.STAGES['DISPLAY'])
+        fr = chain.Frame(rgb=rgb2)
+        fr.draw('A', sh, uni_half, {'source': 'source'})
+        t1 = fr.target
+        fr.draw('B', sh, uni_half, {'source': 'source'})
+        t2 = fr.target
+        binds_b = fr.pending[1][2]
+        check("two Frame draws ping-pong: the second samples the first's "
+              'target, which is retired (not freed) until the burst runs, '
+              'and nothing has crossed yet', sh is not None and t1 is not t2
+              and fr.retired == [t1] and not t1.freed
+              and isinstance(binds_b['source'], fakedevice.TargetTexture)
+              and binds_b['source'].target is t1 and dev.calls['draws'] == 0
+              and fr.uploads == 1 and fr.stages == ['A', 'B'], str(err))
+        got = fr.down('cpu stage', 'runs on the CPU')
+        exp = np.clip(rgb2 * 0.25, 0.0, 1.0)
+        check('down() flushes the burst in one crossing (two draws, one '
+              'read), frees the retired target and the current one, and '
+              'hands the CPU the picture by name', dev.calls['draws'] == 2
+              and dev.calls['reads'] == 1 and t1.freed and t2.freed
+              and fr.target is None and fr.retired == []
+              and got.shape == (h2, w2, 3)
+              and float(np.abs(got - exp).max()) <= 1e-6
+              and fr.readbacks == [('cpu stage', 'runs on the CPU')],
+              str(dev.calls))
+        fr.draw('C', sh, uni_id, {'source': 'source'})
+        t3 = fr.target
+        fin = fr.finish()
+        check('finish() uploads the CPU-edited picture once more, reads the '
+              'frame back and frees the target', fr.uploads == 2 and t3.freed
+              and fr.target is None and dev.calls['reads'] == 2
+              and float(np.abs(fin - got).max()) <= 1e-6, str(dev.calls))
+        fr.draw('D', sh, uni_id, {'source': 'source'})
+        t4 = fr.target
+        fr.release()
+        fr.release()
+        check('release() is idempotent: the pending draw is dropped, the '
+              'target freed, nothing crosses', t4.freed and fr.target is None
+              and fr.pending == [] and dev.calls['draws'] == 3,
+              str(dev.calls))
+        tgt = DEV.Target(w2, h2)
+        tf = DEV.Target(w2, h2)
+        tf.free()
+        refused = ''
+        try:
+            DEV.draw_many([(sh, uni_id, {'source': DEV.target_texture(tf)},
+                            tgt, 'NONE', False, None)])
+        except AssertionError as exc:
+            refused = str(exc)
+        check("the fake refuses a draw that samples a freed target by name "
+              "('samples a freed target')", 'samples a freed target' in refused,
+              refused)
+        tgt.free()
+
+    # --- _gpu_stage passes frame_no / seed through
+    import halcyon.gpu as _G
+    seen = {}
+    fake = _t.ModuleType('halcyon.gpu.chain')
+
+    def _display(rgb_in, st_in, **extra):
+        seen.update(extra)
+        return rgb_in
+
+    fake.display = _display
+    old_mod = sys.modules.get('halcyon.gpu.chain')
+    old_attr = getattr(_G, 'chain', None)
+    sys.modules['halcyon.gpu.chain'] = fake
+    _G.chain = fake
+    try:
+        st_k = RenderSettings()
+        st_k.render_device = 'GPU'
+        st_k.gpu_post = True
+        st_k._frame_gpu_shaded = True
+        out_k = PO._gpu_stage('display', rgb2, st_k, frame_no=7, seed=3)
+    finally:
+        if old_mod is None:
+            sys.modules.pop('halcyon.gpu.chain', None)
+        else:
+            sys.modules['halcyon.gpu.chain'] = old_mod
+        if old_attr is None:
+            try:
+                del _G.chain
+            except AttributeError:
+                pass
+        else:
+            _G.chain = old_attr
+    check('_gpu_stage passes frame_no and seed through to the chain stage '
+          '(**extra) and returns its picture', out_k is rgb2
+          and seen == {'frame_no': 7, 'seed': 3}, str(seen))

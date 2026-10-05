@@ -39,6 +39,7 @@ FORMAT_VERSION = 1
 WATER_FIELDS = (
     'ground_plane', 'ground_mode', 'ground_height', 'ground_scale',
     'ground_color2', 'ground_fade',
+    'mode7_texel_size', 'mode7_over',          # R251 C048: the Mode 7 floor's dials
     'ocean_choppiness', 'ocean_speed', 'ocean_wind_angle', 'ocean_spread',
     'ocean_wave_scale', 'ocean_detail', 'ocean_sparkle',
     'ocean_horizon_smooth', 'ocean_deep', 'ocean_shallow', 'ocean_glitter',

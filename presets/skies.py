@@ -33,6 +33,7 @@ FORMAT_VERSION = 1
 EXCLUDED = frozenset({
     'graph', 'env_image', 'mist', 'mist_start', 'mist_depth', 'mist_color',
     'mist_falloff', 'mist_intensity', 'mode', 'strength',
+    'ground_image',       # R251 C048: the Mode 7 map, an image datablock
 })
 
 

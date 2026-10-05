@@ -39,13 +39,19 @@ works from DISTANCE FIELDS instead of masks:
 
 Every noise here is an integer hash of (pixel, phase, seed): a pure
 function of its inputs, so bands, workers, refine passes and both
-devices draw the same line. The pass stays on the CPU on both device
-roads (the outline doctrine), so no GLSL twin is needed.
+devices draw the same line. R249 (1.88.0): a frame the GPU shaded draws
+this same road as fragment passes (gpu/ink.py -- the chamfer as an
+iterated relaxation, the hashes in uint arithmetic, every dial
+transcribed); this module is the CPU road and the reference the GPU
+twin is held to. The stroke road, the isophote weight and the SURFACE
+anchor stay here and refuse the GPU by name.
 """
 
 import numpy as np
 
 INF = np.int32(1 << 28)
+# R249: no coverage at all -- far below any soft profile's transition
+NO_COVER = np.float32(-1e9)
 
 INK_STYLE_ITEMS = (
     ('CLEAN', "Clean",
@@ -105,18 +111,15 @@ def chamfer(seed, feature=False):
     """
     seed = np.asarray(seed, bool)
     H, W = seed.shape
-    d = np.where(seed, np.int32(0), INF).astype(np.int32)
     if not seed.any():
         if feature:
             return (np.full((H, W), np.float32(INF / 5.0), np.float32),
                     np.full((H, W), -1, np.int32))
         return np.full((H, W), np.float32(INF / 5.0), np.float32)
-    f = None
     if feature:
-        flat = np.arange(H * W, dtype=np.int32).reshape(H, W)
-        f = np.where(seed, flat, np.int32(-1)).astype(np.int32)
+        return _chamfer_feature(seed)
+    d = np.where(seed, np.int32(0), INF).astype(np.int32)
     idx = np.arange(W, dtype=np.int32) * 5
-    ar = np.arange(W, dtype=np.int32)
 
     def shifted(r, off, add, fill):
         out = np.full(W, fill, np.int32)
@@ -132,55 +135,97 @@ def chamfer(seed, feature=False):
         for y in order:
             row = d[y]
             cands = [row]
-            fcands = [f[y]] if feature else None
             y1 = y - sgn
             if 0 <= y1 < H:
                 r1 = d[y1]
                 for off, add in ((0, 5), (-1, 7), (1, 7), (-2, 11), (2, 11)):
                     cands.append(shifted(r1, off, add, INF))
-                    if feature:
-                        fcands.append(shifted(f[y1], off, 0, -1))
             y2 = y - 2 * sgn
             if 0 <= y2 < H:
                 r2 = d[y2]
                 for off, add in ((-1, 11), (1, 11)):
                     cands.append(shifted(r2, off, add, INF))
-                    if feature:
-                        fcands.append(shifted(f[y2], off, 0, -1))
             if len(cands) > 1:
-                C = np.stack(cands)
-                if feature:
-                    k = np.argmin(C, axis=0)
-                    row = C[k, ar]
-                    frow = np.stack(fcands)[k, ar]
-                else:
-                    row = C.min(axis=0)
-            elif feature:
-                frow = fcands[0]
+                row = np.stack(cands).min(axis=0)
             if sgn > 0:
                 v = row - idx
                 acc = np.minimum.accumulate(v)
                 row = acc + idx
-                if feature:
-                    src = np.maximum.accumulate(np.where(v == acc, ar, -1))
-                    frow = frow[src]
             else:
                 v = row[::-1] - idx
                 acc = np.minimum.accumulate(v)
                 row = (acc + idx)[::-1]
-                if feature:
-                    src = np.maximum.accumulate(np.where(v == acc, ar, -1))
-                    frow = frow[::-1][src][::-1]
             d[y] = row
-            if feature:
-                f[y] = frow
 
     do_pass(range(H), 1)
     do_pass(range(H - 1, -1, -1), -1)
+    return d.astype(np.float32) * np.float32(0.2)
+
+
+_KEY_SHIFT = np.int64(1) << np.int64(32)
+_NO_SEED = np.int64((1 << 31) - 1)
+
+
+def _chamfer_feature(seed):
+    """The feature-tracking chamfer on ONE int64 key per pixel,
+    distance * 2**32 + nearest-seed flat index, so the nearest seed of
+    a pixel is the lexicographic minimum (distance, seed index) over
+    every path -- an ORDER-FREE tie rule. R249: the GPU draws the same
+    transform as an iterated relaxation, whose result is exactly that
+    minimum; the previous rule (the first candidate in the mask's
+    order, the last position the in-row prefix minimum was set at) was
+    an artefact of the scan and no relaxation could reproduce it. Pixels
+    change only at exact ties between two different seeds, where either
+    seed was a correct answer."""
+    H, W = seed.shape
+    far = INF * _KEY_SHIFT + _NO_SEED
+    flat = np.arange(H * W, dtype=np.int64).reshape(H, W)
+    K = np.where(seed, flat, far).astype(np.int64)
+    idx = np.arange(W, dtype=np.int64) * (np.int64(5) * _KEY_SHIFT)
+
+    def shifted(r, off, add):
+        out = np.full(W, far, np.int64)
+        if off > 0:
+            out[:-off] = r[off:] + add
+        elif off < 0:
+            out[-off:] = r[:off] + add
+        else:
+            out[:] = r + add
+        return out
+
+    def do_pass(order, sgn):
+        for y in order:
+            row = K[y]
+            cands = [row]
+            y1 = y - sgn
+            if 0 <= y1 < H:
+                r1 = K[y1]
+                for off, add in ((0, 5), (-1, 7), (1, 7), (-2, 11), (2, 11)):
+                    cands.append(shifted(r1, off, add * _KEY_SHIFT))
+            y2 = y - 2 * sgn
+            if 0 <= y2 < H:
+                r2 = K[y2]
+                for off, add in ((-1, 11), (1, 11)):
+                    cands.append(shifted(r2, off, add * _KEY_SHIFT))
+            if len(cands) > 1:
+                row = np.stack(cands).min(axis=0)
+            if sgn > 0:
+                v = row - idx
+                acc = np.minimum.accumulate(v)
+                row = acc + idx
+            else:
+                v = row[::-1] - idx
+                acc = np.minimum.accumulate(v)
+                row = (acc + idx)[::-1]
+            K[y] = row
+
+    do_pass(range(H), 1)
+    do_pass(range(H - 1, -1, -1), -1)
+    d = K >> np.int64(32)
+    near = d < INF
+    f = np.where(near, K & np.int64(0xffffffff), -1).astype(np.int32)
     dist = d.astype(np.float32) * np.float32(0.2)
-    if feature:
-        return dist, f
-    return dist
+    return dist, f
 
 
 # --------------------------------------------------------------- strokes
@@ -627,7 +672,8 @@ def apply(scene, gbuf, img, st, seeds, plane, vp=None, proj=None, eye=None):
         ends = stroke_ends(sil)
         dend = chamfer(ends) if ends.any() else None
     margin = boil + spread + 1.5
-    band = has_sil & (dsil < h_max + margin)
+    reach_sil = h_max + margin
+    band = has_sil & (dsil < reach_sil)
     if dint is not None:
         band |= dint < h_max * inner + margin
     if md is not None:
@@ -641,7 +687,19 @@ def apply(scene, gbuf, img, st, seeds, plane, vp=None, proj=None, eye=None):
     n = by.size
     bflat = (by * W + bx).astype(np.int64)
     feat_b = feat[by, bx].astype(np.int64)
-    has_b = feat_b >= 0
+    # R249: a pixel is NEAR a silhouette when it lies within the
+    # silhouette line's own reach (the sil band). Farther pixels -- in
+    # the band through an interior or marked line -- are their own
+    # source: they take their own material's colour, count as inside,
+    # and carry no silhouette coverage at all. The previous rule read
+    # the nearest silhouette seed however far it lay, so an interior
+    # line's fringe could take its colour from an unrelated object
+    # across the frame, and where no silhouette existed at all the
+    # missing coverage read as -1, which a soft (Brush / Charcoal)
+    # profile painted as a faint haze along every interior line. The
+    # GPU road's distance transform is exact within the reach and only
+    # there, which is what made the rule explicit
+    has_b = (feat_b >= 0) & (dsil[by, bx] < reach_sil)
     feat_b = np.where(has_b, feat_b, bflat)
     # the ORIGIN: the surface pixel every lookup reads -- the seed
     # itself off the stroke road, the pixel the redrawn seed came from
@@ -719,7 +777,7 @@ def apply(scene, gbuf, img, st, seeds, plane, vp=None, proj=None, eye=None):
                                        phase * 3 + 23 + seed_salt) - 1.0)
         d_b = np.where(inside_b, d_b + dn, d_b - dn)
     db_sil = np.where(inside_b, d_b + 0.5, d_b - 0.5)
-    cov_sil = np.where(has_b, half_sil + 0.5 - db_sil, -1.0)
+    cov_sil = np.where(has_b, half_sil + 0.5 - db_sil, NO_COVER)
     half_self = half_at(bflat)
     if w_int is not None and fint is not None:
         fi = fint[by, bx].astype(np.int64)
@@ -753,7 +811,7 @@ def apply(scene, gbuf, img, st, seeds, plane, vp=None, proj=None, eye=None):
         half_sil = half_sil * wf
         half_self = half_self * wf
         half_int = half_int * wf
-        cov_sil = np.where(has_b, half_sil + 0.5 - db_sil, -1.0)
+        cov_sil = np.where(has_b, half_sil + 0.5 - db_sil, NO_COVER)
     cov_int = None
     if dint is not None:
         if road:
@@ -803,7 +861,35 @@ def apply(scene, gbuf, img, st, seeds, plane, vp=None, proj=None, eye=None):
         # R231: the brush's hairs -- streaks along the stroke: noise
         # stretched along the local tangent (20 px) and pinched across
         # it (1.3 px), lightening the body of the line
+        # R249: the tangent of the line that put the pixel in the band
+        # -- the silhouette field within its reach, else the interior
+        # field, else the marked-edge field. (The silhouette's tangent
+        # used to serve every pixel, however far the silhouette lay.)
         tx, ty = tangent_at(dsil, by, bx)
+        fx = (feat_b % W).astype(np.float32)
+        fy = (feat_b // W).astype(np.float32)
+        v_d = np.where(inside_b, d_b, -d_b)
+        if dint is not None:
+            on_int = ~has_b & (dint[by, bx] < h_max * inner + margin)
+            if np.any(on_int):
+                tx2, ty2 = tangent_at(dint, by, bx)
+                tx = np.where(on_int, tx2, tx)
+                ty = np.where(on_int, ty2, ty)
+                fx = np.where(on_int, bx.astype(np.float32), fx)
+                fy = np.where(on_int, by.astype(np.float32), fy)
+                v_d = np.where(on_int, dint[by, bx], v_d)
+                rest = ~has_b & ~on_int
+            else:
+                rest = ~has_b
+        else:
+            rest = ~has_b
+        if md is not None and np.any(rest):
+            tx3, ty3 = tangent_at(md, by, bx)
+            tx = np.where(rest, tx3, tx)
+            ty = np.where(rest, ty3, ty)
+            fx = np.where(rest, bx.astype(np.float32), fx)
+            fy = np.where(rest, by.astype(np.float32), fy)
+            v_d = np.where(rest, md[by, bx], v_d)
         # a canonical tangent (the gradient flips sign across the seed,
         # the tangent must not), the ALONG coordinate from the source
         # pixel (every pixel of one cross-section shares it) and the
@@ -812,11 +898,9 @@ def apply(scene, gbuf, img, st, seeds, plane, vp=None, proj=None, eye=None):
         flip = (tx < 0.0) | ((tx == 0.0) & (ty < 0.0))
         tx = np.where(flip, -tx, tx)
         ty = np.where(flip, -ty, ty)
-        fx = (feat_b % W).astype(np.float32)
-        fy = (feat_b // W).astype(np.float32)
         across = np.maximum(np.float32(1.0), half_sil * np.float32(0.4))
         u = (fx * tx + fy * ty) / (26.0 * rs)
-        v = np.where(inside_b, d_b, -d_b) / across
+        v = v_d / across
         sn = value_noise(u + 2.1, v + 6.3, phase * 3 + 61 + seed_salt)
         streak = np.clip((sn - 0.55) / 0.3, 0.0, 1.0)
         streak = streak * streak * (3.0 - 2.0 * streak)

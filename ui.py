@@ -390,18 +390,47 @@ class HALCYON_PT_sampling(HalcyonPanel, Panel):
         else:
             sub.prop(hs, 'aa_filter')
             sub.prop(hs, 'aa_filter_width')
+        sub = col.column()                              # R251 C127
+        sub.active = hs.aa_mode in ('NONE', 'SUPERSAMPLE')
+        sub.prop(hs, 'aa_sample_pattern')
+        col.separator()                                 # R251 C001
+        col.prop(hs, 'n64_coverage_aa')
+        sub = col.column()
+        sub.active = hs.n64_coverage_aa
+        sub.prop(hs, 'n64_divot')
+        # R251 (RAST-B): the two resolve-side period dials -- the
+        # LightWave clamp works at one sample too, the Blender 2.41
+        # gamma blend only with samples to blend
+        col.prop(hs, 'aa_clamp_samples')
+        sub = col.column()
+        sub.active = hs.aa_mode not in ('NONE', 'EDGE', 'ADAPTIVE') and hs.aa_samples > 1
+        sub.prop(hs, 'aa_gamma_blend')
         col.separator()
         col.prop(hs, 'stereo_mode')
         sub = col.column()
         sub.active = hs.stereo_mode != 'NONE'
         sub.prop(hs, 'stereo_eye_distance')
         sub.prop(hs, 'stereo_convergence')
+        sub.prop(hs, 'stereo_parallax_layers')
+        sub2 = sub.column()
+        sub2.active = hs.stereo_parallax_layers
+        sub2.prop(hs, 'stereo_parallax_max')
+        col.separator()
+        col.prop(hs, 'camera_yshear')
+        col.prop(hs, 'pano_parts')
         col.separator()
         col.prop(hs, 'motion_blur')
         sub = col.column()
         sub.active = hs.motion_blur
         sub.prop(hs, 'motion_shutter')
         sub.prop(hs, 'motion_steps')
+        sub.prop(hs, 'motion_blur_mode')
+        if hs.motion_blur_mode == 'MAX_SLICES':
+            sub.prop(hs, 'motion_samples')
+            sub.prop(hs, 'motion_dither')
+            sub2 = sub.column()
+            sub2.active = hs.motion_dither > 0.0
+            sub2.prop(hs, 'motion_dither_tile')
         col.separator()
         col.prop(hs, 'seed')
 
@@ -423,12 +452,27 @@ class HALCYON_PT_geometry(HalcyonPanel, Panel):
         sub = col.column()
         sub.active = hs.vertex_snap
         sub.prop(hs, 'vertex_snap_grid')
+        col.prop(hs, 'vertex_quantize')                # R251 C012
+        sub = col.column()
+        sub.active = hs.vertex_quantize != 'NONE'
+        sub.prop(hs, 'vertex_units')
+        col.prop(hs, 'pixel_center')                   # R251 C084
         col.separator()
         col.prop(hs, 'depth_sort')
         sub = col.column()
         sub.active = hs.depth_sort == 'PAINTERS'
         sub.prop(hs, 'painters_key')
-        col.prop(hs, 'depth_precision')
+        if hs.painters_key == 'ORDERING_TABLE':        # R251 C004
+            sub.prop(hs, 'ot_length')
+            sub.prop(hs, 'ot_far')
+        sub = col.column()                              # R251 C007/C026/C075
+        sub.active = hs.depth_sort != 'PAINTERS'
+        sub.prop(hs, 'depth_encoding')
+        sub = col.column()
+        sub.active = hs.depth_sort == 'PAINTERS' or \
+            hs.depth_encoding in ('LINEAR', 'W_FIXED')
+        sub.prop(hs, 'depth_precision')
+        col.prop(hs, 'near_clip_mode')                 # R251 C027
 
 
 class HALCYON_PT_shading(HalcyonPanel, Panel):
@@ -447,11 +491,18 @@ class HALCYON_PT_shading(HalcyonPanel, Panel):
         if str(getattr(hs, 'material_override', 'NONE')) != 'NONE':
             col.prop(hs, 'override_color')
         col.prop(hs, 'normal_source')
+        # R251 C119 (MAT-B): the REYES grid is a per-pixel rate's dial;
+        # drawn greyed at VERTEX / FACE, never hidden
+        sub = col.column()
+        sub.active = hs.shading_rate == 'PIXEL'
+        sub.prop(hs, 'shading_rate_area')
         col.prop(hs, 'displacement_scale')
         col.separator()
         col.prop(hs, 'specular_in_gamma')
+        col.prop(hs, 'specular_viewer')
         col.prop(hs, 'clamp_specular')
         col.prop(hs, 'light_clamp')
+        col.prop(hs, 'crand_per_frame')
 
 
 class HALCYON_PT_lighting(HalcyonPanel, Panel):
@@ -537,10 +588,14 @@ class HALCYON_PT_shadows(HalcyonPanel, Panel):
         col = layout.column()
         col.active = hs.shadows
         col.prop(hs, 'shadow_default')
+        if hs.shadow_default == 'PLANAR':
+            col.prop(hs, 'planar_plane_z')          # R251 C052
         col.prop(hs, 'shadow_map_size')
+        col.prop(hs, 'shadow_map_depth')            # R251 C117
         col.prop(hs, 'shadow_bias')
         col.prop(hs, 'shadow_softness')
         col.prop(hs, 'shadow_samples')
+        col.prop(hs, 'modvol_scale')                # R251 C020
         col.operator('halcyon.adopt_shadow_settings',
                      text="All Lights Use These Settings",
                      icon='FILE_REFRESH').scope = 'SCENE'
@@ -631,16 +686,42 @@ class HALCYON_PT_textures(HalcyonPanel, Panel):
         hs = context.scene.halcyon
         col = layout.column()
         col.prop(hs, 'tex_filter')
-        col.prop(hs, 'tex_mipmap')
+        # R251 texture pack: the rows in the machine's order; greying
+        # follows sample_opts (core/texture.py) so a greyed dial is inert
         sub = col.column()
-        sub.active = hs.tex_mipmap
-        sub.prop(hs, 'tex_mip_bias')
+        sub.active = hs.tex_filter in {'BILINEAR', 'TRILINEAR'}
+        sub.prop(hs, 'tex_frac_bits')                                # C080
+        col.prop(hs, 'tex_mipmap')
+        sub_bias = col.column()
+        sub_bias.active = (hs.tex_mipmap and hs.tex_lod_source != 'GS_Q') \
+            or hs.tex_filter == 'SUMMED_AREA'                        # C088 (live without mips), C022 (inert under GS_Q)
+        sub_bias.prop(hs, 'tex_mip_bias')
+        # R251 TEX-2: the level roads, sample_opts rules (1) and (2)
+        sub = col.column()
+        sub.active = hs.tex_mipmap and hs.tex_filter in {'NEAREST', 'BILINEAR', 'N64_3POINT', 'TRILINEAR'}
+        sub.prop(hs, 'tex_mip_select')                               # C072
+        sub.prop(hs, 'tex_lod_source')                               # C022 / C079
+        sub2 = sub.column()
+        sub2.active = hs.tex_lod_source == 'GS_Q'
+        sub2.prop(hs, 'tex_lod_k')
+        sub2.prop(hs, 'tex_lod_l')
+        sub.prop(hs, 'tex_lod_sharpen')                              # C008
         col.separator()
         col.prop(hs, 'tex_perspective')
         col.separator()
         col.prop(hs, 'tex_max_size')
         col.prop(hs, 'tex_quantize')
+        sub_fmt = col.column()
+        sub_fmt.active = hs.tex_tmem_format == 'OFF'
+        sub_fmt.prop(hs, 'tex_format')                               # C074 (greyed under TMEM, A2.1)
+        col.prop(hs, 'tex_tmem_format')                              # C013
+        col.prop(hs, 'tex_compress')                                 # C024
         col.prop(hs, 'tex_wrap_default')
+        col.prop(hs, 'tex_clamp_mode')                               # C077
+        col.prop(hs, 'tex_colorkey')                                 # C083
+        sub = col.column()
+        sub.active = hs.tex_colorkey
+        sub.prop(hs, 'tex_colorkey_range')
 
 
 class HALCYON_PT_transparency(HalcyonPanel, Panel):
@@ -656,9 +737,23 @@ class HALCYON_PT_transparency(HalcyonPanel, Panel):
         col.prop(hs, 'transparency')
         if hs.transparency == 'STIPPLE':
             col.prop(hs, 'stipple_pattern')
+        if hs.transparency in ('SORTED', 'ABUFFER'):
+            # R251: the blend unit and the composite order (DS)
+            col.prop(hs, 'blend_equation')
+            col.prop(hs, 'translucent_order')
+            col.prop(hs, 'translucent_depth_write')
         col.prop(hs, 'max_transparent_layers')
         col.prop(hs, 'alpha_bits')
         col.prop(hs, 'alpha_threshold')
+        # R251: the framebuffer format is read in EVERY mode (the frame
+        # itself is what it truncates); RGBA6 always dithers, so its
+        # knob is dead there and is not drawn
+        col.prop(hs, 'framebuffer')
+        if hs.framebuffer != 'NONE' and not hs.framebuffer.startswith('GC'):
+            row = col.row(align=True)
+            row.prop(hs, 'fb_dither')
+            if hs.framebuffer.startswith('VOODOO'):
+                row.prop(hs, 'fb_dither_subtract')
 
 
 class HALCYON_PT_fog(HalcyonPanel, Panel):
@@ -676,18 +771,54 @@ class HALCYON_PT_fog(HalcyonPanel, Panel):
         col = layout.column()
         col.active = hs.fog
         col.prop(hs, 'fog_mode')
+        col.prop(hs, 'fog_depth')
         col.prop(hs, 'fog_color')
-        if hs.fog_mode in ('LINEAR', 'TABLE16'):
+        col.prop(hs, 'fog_color_source')      # R251 F008 (LIGHT-A2)
+        _ranged = hs.fog_mode in ('LINEAR', 'TABLE16', 'GTE_1Z')
+        if _ranged:
             col.prop(hs, 'fog_start')
             col.prop(hs, 'fog_end')
+        elif hs.fog_mode == 'GROUND':
+            # R251 F009: POV's fog_type 2 reads Distance and the layer
+            col.prop(hs, 'fog_density')
+            col.prop(hs, 'fog_ground_offset')
+            col.prop(hs, 'fog_ground_alt')
         else:
             col.prop(hs, 'fog_density')
+        # R251: the hardware tables (F002 / F003 / F022); inert under
+        # Ground Fog (a ray integral has no depth curve to fill them)
+        sub = col.column()
+        sub.active = hs.fog_mode != 'GROUND'
+        sub.prop(hs, 'fog_table')
+        if hs.fog_table == 'PVR128' and not _ranged:
+            col.prop(hs, 'fog_end', text="Fog End (density register)")
+        if hs.fog_table == 'DS32' and not _ranged:
+            col.prop(hs, 'fog_start', text="Fog Start (table entry 0)")
+            col.prop(hs, 'fog_end', text="Fog End (last table entry)")
+        sub = col.column()
+        sub.active = hs.fog_table == 'VOODOO64'
+        sub.prop(hs, 'fog_dither')
         col.prop(hs, 'fog_vertex')
+        col.prop(hs, 'fog_face')      # R251 F005 (LIGHT-A2)
+        col.prop(hs, 'fog_range_adjust')    # R251 F004 (LIGHT-A2)
         col.prop(hs, 'fog_bands')
+        # R251 F015: the Model 3 spotlight's share of the fog colour
+        col.prop(hs, 'fog_spot')
+        # R251 F006: Model 3's fogAmbient and System 22's second cz bank
+        col.prop(hs, 'fog_ambient')
+        sub = col.column()
+        sub.active = hs.fog and hs.fog_mode in ('LINEAR', 'TABLE16', 'GTE_1Z')
+        sub.prop(hs, 'fog_bank1_start')
+        sub.prop(hs, 'fog_bank1_end')
+        # R251 F010: POV's turbulent fog
+        col.prop(hs, 'fog_turbulence')
+        sub = col.column()
+        sub.active = hs.fog_turbulence > 0.0
+        sub.prop(hs, 'fog_turb_depth')
         col.separator()
         col.prop(hs, 'fog_height')
         sub = col.column()
-        sub.active = hs.fog_height
+        sub.active = hs.fog_height and hs.fog_mode != 'GROUND'
         sub.prop(hs, 'fog_height_top')
         sub.prop(hs, 'fog_height_falloff')
 
@@ -730,14 +861,34 @@ class HALCYON_PT_effects(HalcyonPanel, Panel):
         row = col.row()
         row.active = False
         row.label(text="Set Volumetric on a light to cast them", icon='LIGHT')
+        # R251 C134: the optical printer's backlit mattes
+        col = layout.column(heading="Matte Glow")
+        col.prop(hs, 'matte_glow', text="Enable")
+        mg = col.column()
+        mg.active = hs.matte_glow
+        mg.prop(hs, 'matte_glow_radius')
+        mg.prop(hs, 'matte_glow_passes')
+        mg.prop(hs, 'matte_glow_exposure')
+        row = col.row()
+        row.active = False
+        row.label(text="Set a Glow Gel on a material to expose it",
+                  icon='MATERIAL')
         col = layout.column(heading="Depth of Field")
         col.prop(hs, 'dof', text="Enable")
         sub = col.column()
         sub.active = hs.dof
         sub.prop(hs, 'dof_focus')
-        sub.prop(hs, 'dof_amount')
-        sub.prop(hs, 'dof_layers')
-        sub.prop(hs, 'dof_max_radius')
+        sub.prop(hs, 'dof_method')
+        if hs.dof_method == 'LENS_ACCUMULATE':
+            sub.prop(hs, 'dof_lens_pattern')
+            sub.prop(hs, 'dof_lens_samples')
+            row = sub.row()
+            row.active = False
+            row.label(text="f-number: the camera's Depth of Field > F-Stop")
+        else:
+            sub.prop(hs, 'dof_amount')
+            sub.prop(hs, 'dof_layers')
+            sub.prop(hs, 'dof_max_radius')
         col = layout.column(heading="Lens Flare")
         col.prop(hs, 'lens_flare', text="Enable")
         sub = col.column()
@@ -756,12 +907,20 @@ class HALCYON_PT_colour(HalcyonPanel, Panel):
         layout.use_property_split = True
         hs = context.scene.halcyon
         col = layout.column()
-        col.prop(hs, 'color_depth')
+        # R251 (C050 / C060): the era roads that OWN the colour stage --
+        # while one is on, Colour Depth and the palette controls idle
+        col.prop(hs, 'attribute_cells')
+        col.prop(hs, 'scanline_palette')
+        _era_free = hs.attribute_cells == 'NONE' and \
+            hs.scanline_palette == 'NONE'
+        cd = col.row()
+        cd.active = _era_free
+        cd.prop(hs, 'color_depth')
         indexed = hs.color_depth in ('8', '4', 'HAM8', 'HAM6')
         sub = col.column()
         # R202: a non-adaptive palette (Custom included) forces itself
         # at ANY depth, so the controls only dim while they truly idle
-        sub.active = indexed or hs.palette_mode != 'ADAPTIVE'
+        sub.active = (indexed or hs.palette_mode != 'ADAPTIVE') and _era_free
         sub.prop(hs, 'palette_mode')
         if hs.palette_mode == 'CUSTOM':
             sub.template_ID(hs, 'palette_image', open='image.open')
@@ -781,15 +940,29 @@ class HALCYON_PT_colour(HalcyonPanel, Panel):
         s2a.active = hs.palette_mode in ('ADAPTIVE', 'CUSTOM')
         s2a.prop(hs, 'palette_size')
         s2 = sub.column()
-        s2.active = hs.palette_mode == 'ADAPTIVE'
+        s2.active = hs.palette_mode in ('ADAPTIVE', 'EHB')
         s2.prop(hs, 'palette_method')
         s2.prop(hs, 'palette_lock')
         if hs.palette_lock:
             s2.operator('halcyon.clear_palette_cache', icon='FILE_REFRESH')
+        # R251 (C061): the register / DAC lattice; applies to fixed modes
+        # too, so it draws with the palette controls, lock or not
+        sub.prop(hs, 'palette_bits')
         col.separator()
         col.prop(hs, 'dither')
         s3 = col.column()
-        s3.active = hs.dither != 'NONE'
+        # R251 (C050 / C060): the cell and scanline fits take an ordered
+        # dither only; diffusion and noise are inert there
+        _era_inert = (not _era_free) and hs.dither not in (
+            'NONE', 'BAYER2', 'BAYER4', 'BAYER8', 'BAYER16', 'HALFTONE',
+            'COLUMNS')
+        s3.active = hs.dither != 'NONE' and not _era_inert and \
+            (not _era_free or hs.color_depth not in ('CRY16', 'YJK'))
+        if _era_inert:
+            note = col.row()
+            note.active = False
+            note.label(text="Attribute cells and scanline palettes take "
+                            "an ordered dither only", icon='INFO')
         s3.prop(hs, 'dither_strength')
         s3.prop(hs, 'dither_serpentine')
         if hs.dither_serpentine and hs.dither in _DIFFUSION_KERNELS:
@@ -797,6 +970,27 @@ class HALCYON_PT_colour(HalcyonPanel, Panel):
             note.active = False
             note.label(text="Off is ~2x faster (diagonal processing)",
                        icon='SORTTIME')
+        # R251 post-signal: the machine's scan-out, on the frame it wrote
+        col.separator()
+        vi = col.column()
+        vi.active = hs.color_depth in ('15', '16')
+        vi.prop(hs, 'vi_dither_filter')
+        vi.prop(hs, 'vi_gamma')
+        col.prop(hs, 'copy_filter')
+        col.prop(hs, 'crtc_blend')
+        sub2 = col.column()
+        sub2.active = hs.crtc_blend != 'NONE'
+        sub2.prop(hs, 'crtc_alpha')
+        sub2.prop(hs, 'crtc_bg_color')
+        col.prop(hs, 'video_filter')
+        sub3 = col.column()
+        sub3.active = hs.video_filter != 'NONE' and hs.color_depth == '16'
+        sub3.prop(hs, 'video_filter_threshold')
+        if hs.color_depth in ('CRY16', 'YJK'):
+            # R251 (C011 / C059): the integer encodes have no dither seat
+            note = col.row()
+            note.active = False
+            note.label(text="This encode takes no dither", icon='INFO')
 
 
 class HALCYON_PT_display(HalcyonPanel, Panel):
@@ -832,6 +1026,18 @@ class HALCYON_PT_display(HalcyonPanel, Panel):
         col.prop(hs, 'brightness')
         col.prop(hs, 'contrast')
         col.prop(hs, 'saturation')
+        # R251 (C092 / C093): the 3D Studio / Max video-out pair
+        col.separator()
+        col.prop(hs, 'super_black')
+        sb = col.column()
+        sb.active = hs.super_black
+        sb.prop(hs, 'super_black_threshold')
+        col.separator()
+        col.prop(hs, 'video_color_check')
+        vc = col.column()
+        vc.active = hs.video_color_check != 'NONE'
+        vc.prop(hs, 'video_system')
+        vc.prop(hs, 'video_ire_limit')
         col.separator()
         col.prop(hs, 'output_scale')
         col.prop(hs, 'pixel_grid')
@@ -888,12 +1094,47 @@ class HALCYON_PT_composite(HalcyonPanel, Panel):
         layout.use_property_split = True
         hs = context.scene.halcyon
         col = layout.column()
-        col.active = hs.composite
+        # R251 SIG-2: the cable is one or the other -- the composite rows
+        # grey under the S-Video items
+        col.active = hs.composite and hs.signal not in ('SVIDEO', 'SVIDEO_PAL')
         col.prop(hs, 'composite_bleed')
         col.prop(hs, 'composite_ringing')
-        col.prop(hs, 'composite_dot_crawl')
+        dc = col.column()
+        dc.active = hs.pal_crawl <= 0.0      # one crawl: the PAL one wins
+        dc.prop(hs, 'composite_dot_crawl')
         col.separator()
         col.prop(hs, 'interlace')
+        # R251 SIG-2: the cable, the tape, the PAL receiver and the digital
+        # formats' chroma -- a fresh column, never gated by Composite Video
+        c2 = layout.column()
+        c2.separator()
+        c2.prop(hs, 'signal')
+        rf = c2.column()
+        rf.active = hs.signal == 'RF'
+        rf.prop(hs, 'rf_bandwidth')
+        rf.prop(hs, 'rf_beat')
+        rf.prop(hs, 'rf_snow')
+        rf.prop(hs, 'rf_ghost')
+        rf.prop(hs, 'rf_ghost_delay')
+        c2.separator()
+        c2.prop(hs, 'tape')
+        tp = c2.column()
+        tp.active = hs.tape != 'NONE'
+        tp.prop(hs, 'tape_generations')
+        tp.prop(hs, 'tape_noise')
+        tp.prop(hs, 'tape_head_switch')
+        tp.prop(hs, 'tape_dropouts')
+        c2.separator()
+        c2.prop(hs, 'pal_decoder')
+        pl = c2.column()
+        pl.active = hs.pal_decoder == 'SIMPLE'
+        pl.prop(hs, 'pal_phase_error')
+        c2.prop(hs, 'pal_crawl')
+        c2.separator()
+        c2.prop(hs, 'chroma_format')
+        cu = c2.column()
+        cu.active = hs.chroma_format != 'NONE'
+        cu.prop(hs, 'chroma_upsample')
 
 
 class HALCYON_PT_film(HalcyonPanel, Panel):
@@ -1052,10 +1293,22 @@ class HALCYON_PT_jpeg(HalcyonPanel, Panel):
         layout.use_property_split = True
         hs = context.scene.halcyon
         col = layout.column()
-        col.active = hs.jpeg_artifacts
+        col.active = hs.jpeg_artifacts and not hs.mpeg1   # one codec at a time
         col.prop(hs, 'jpeg_quality')
         col.prop(hs, 'jpeg_passes')
         col.prop(hs, 'block_size')
+        # R251 SIG-3: the era's other codecs, each under its own switch
+        cd = layout.column(heading="MPEG-1")
+        cd.prop(hs, 'mpeg1', text="Enable")
+        mp = cd.column()
+        mp.active = hs.mpeg1
+        mp.prop(hs, 'mpeg1_qscale')
+        mp.prop(hs, 'mpeg1_gop')
+        cd = layout.column(heading="Smacker")
+        cd.prop(hs, 'smacker', text="Enable")
+        sm = cd.column()
+        sm.active = hs.smacker
+        sm.prop(hs, 'smacker_quality')
 
 
 class HALCYON_PT_performance(HalcyonPanel, Panel):
@@ -1103,7 +1356,7 @@ class HALCYON_PT_world_ground(HalcyonPanel, Panel):
         col.active = hs.ground_plane
         col.prop(hs, 'ground_mode')
         col.prop(hs, 'ground_height')
-        if hs.ground_mode != 'MATERIAL':
+        if hs.ground_mode not in ('MATERIAL', 'MODE7'):
             col.prop(hs, 'ground_color')
         # R203 field find: every two-colour mode owns the second
         # colour, and every mode's dials draw -- Tiles and Lava were
@@ -1111,7 +1364,7 @@ class HALCYON_PT_world_ground(HalcyonPanel, Panel):
         if hs.ground_mode in ('CHECKER', 'NOISE', 'TILES', 'DESERT',
                               'SNOW', 'LAVA'):
             col.prop(hs, 'ground_color2')
-        if hs.ground_mode != 'SOLID':
+        if hs.ground_mode not in ('SOLID', 'MODE7'):
             col.prop(hs, 'ground_scale')
         if hs.ground_mode == 'TILES':
             col.prop(hs, 'ground_grout')
@@ -1142,13 +1395,20 @@ class HALCYON_PT_world_ground(HalcyonPanel, Panel):
         elif hs.ground_mode == 'OCEAN':
             col.prop(hs, 'ocean_choppiness')
             col.prop(hs, 'ocean_speed')
+        elif hs.ground_mode == 'MODE7':
+            # R251 C048: the map, its texel size and the M7SEL over-map
+            # rule; the floor is unlit and unfaded, so those dials stay off
+            col.template_ID(hs, 'ground_image', open='image.open')
+            col.prop(hs, 'mode7_texel_size')
+            col.prop(hs, 'mode7_over')
         col.separator()
         # R204 field find: the floors ignored every lamp in the scene.
         # This dial hands them to the lighting; OCEAN keeps its own
         # sun-and-sky model and doesn't need it
-        if hs.ground_mode != 'OCEAN':
+        if hs.ground_mode not in ('OCEAN', 'MODE7'):
             col.prop(hs, 'ground_lighting')
-        col.prop(hs, 'ground_fade')
+        if hs.ground_mode != 'MODE7':
+            col.prop(hs, 'ground_fade')
         if not hs.ground_plane:
             note = layout.column(align=True)
             note.active = False
@@ -1798,14 +2058,36 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
         layout.prop(hs, 'strand')
         row = layout.row(align=True)
         row.prop(hs, 'alpha_mode', text="Alpha")
-        if hs.alpha_mode == 'CLIP':
+        if hs.alpha_mode in ('CLIP', 'CLIP_BLEND'):
             row.prop(hs, 'alpha_clip', text="")
+        # R251: the per-material blend equation (PS1 glow beside glass)
+        row = layout.row(align=True)
+        row.prop(hs, 'blend_mode', text="Blend")
+        if hs.blend_mode == 'THIN_WALL':
+            # R251 C095: Max's Thickness Offset rides the Blend row
+            row.prop(hs, 'thin_wall_offset', text="")
+        if hs.blend_mode == 'IMAGINE_FOG':
+            # R251 C101: Imagine's Fog Length rides the Blend row
+            row.prop(hs, 'fog_length', text="")
+        # R251 C126: Blender 2.4x's Zoffs / ZInvert
+        row = layout.row(align=True)
+        row.prop(hs, 'z_offset')
+        row.prop(hs, 'z_invert')
         # R219: shadow flags apply to EVERY material, node-shaded or
         # overridden -- they sat in the override column below, greyed
         # out for the node materials that needed them most (fur shells)
         row = layout.row(align=True)
         row.prop(hs, 'cast_shadow')
         row.prop(hs, 'receive_shadow')
+        # R251 C134: the gel of the Tron printer's matte -- a flag for
+        # every material, node-shaded or overridden
+        layout.prop(hs, 'glow_gel')
+        # R251 C020/C036: the material as an authored shadow volume
+        layout.prop(hs, 'volume_role')
+        row = layout.row(align=True)
+        row.prop(hs, 'polygon_id')
+        if hs.volume_role == 'DS_SHADOW':
+            row.prop(hs, 'shadow_alpha')
         # R220: this material's say over the cartoon outline pass
         # R233: the cel or the painting
         row = layout.row(align=True)
@@ -2000,14 +2282,33 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
             if hs.decay == 'CUSTOM':
                 col.prop(hs, 'decay_start')
                 col.prop(hs, 'decay_end')
+            # R251 F013: the POV fade distance / GX ref_dist is Falloff
+            # End; GL's kl/kq are the Lin/Quad sliders (BI_SLIDERS reads
+            # them too and drew them nowhere)
+            if hs.decay in ('POV_FADE_LINEAR', 'POV_FADE_SQUARE') or \
+                    hs.decay.startswith('GX_'):
+                col.prop(hs, 'decay_end')
+            if hs.decay in ('GL_3TERM', 'BI_SLIDERS'):
+                col.prop(hs, 'decay_ld1')
+                col.prop(hs, 'decay_ld2')
+            if hs.decay.startswith('GX_'):
+                col.prop(hs, 'gx_ref_brite')
         if light.type == 'SPOT':
             col.prop(hs, 'hotspot')
+            # R251 F012: the cone law; the exponent only where a law
+            # reads it
+            col.prop(hs, 'spot_law')
+            if hs.spot_law in ('GL11', 'POV'):
+                col.prop(hs, 'spot_exponent')
+            # R251 F015: the Model 3 screen spotlight
+            col.prop(hs, 'screen_spot')
         col.separator()
         col.prop(hs, 'shadow')
         sub = col.column()
         sub.active = hs.shadow != 'NONE'
         sub.prop(hs, 'shadow_map_size')
         sub.prop(hs, 'shadow_bias')
+        sub.prop(hs, 'shadow_map_depth')            # R251 C117
         if hs.shadow_map_size > 0 or hs.shadow_bias > 0.0:
             note = sub.row()
             note.active = False
@@ -2041,6 +2342,7 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
         row.prop(hs, 'diffuse_only')
         row.prop(hs, 'specular_only')
         col.prop(hs, 'negative')
+        col.prop(hs, 'only_shadow')
         col.prop(hs, 'ambient_only')
         if light.type == 'SUN':
             col.prop(hs, 'hemi')
@@ -2132,8 +2434,16 @@ class HALCYON_PT_wireframe(HalcyonPanel, Panel):
         col = layout.column()
         col.prop(hs, 'wire_mode')
         sub = col.column()
-        sub.active = hs.wire_mode == 'CREASE'
+        sub.active = hs.wire_mode in ('CREASE', 'BEAM')
         sub.prop(hs, 'wire_angle')
+        # R251 (RAST-B): C063 Elite's dot distance, C055 the vector beam
+        sub = col.column()
+        sub.active = hs.wire_mode == 'ELITE'
+        sub.prop(hs, 'wire_dot_distance')
+        sub = col.column()
+        sub.active = hs.wire_mode == 'BEAM'
+        sub.prop(hs, 'beam_machine')
+        sub.prop(hs, 'beam_sigma')
         col.separator()
         col.prop(hs, 'render_wire')
         sub = col.column()
@@ -2813,8 +3123,23 @@ class HALCYON_PT_world(HalcyonPanel, Panel):
         elif m == 'PHYSICAL':
             col.prop(hs, 'turbidity')
             col.prop(hs, 'ground_albedo')
+        elif m == 'CYLINDER':
+            # R251 C056: Doom's cylinder sky rides the world's image slot
+            col.template_ID(hs, 'env_image', open='image.open')
+            col.prop(hs, 'sky_cylinder_repeats')
+            col.prop(hs, 'sky_cylinder_mid')
+        elif m == 'LW_GRADIENT':
+            # R251 C100: LightWave's Backdrop panel, top to bottom
+            col.prop(hs, 'lw_zenith')
+            col.prop(hs, 'lw_sky')
+            col.prop(hs, 'lw_sky_squeeze')
+            col.separator()
+            col.prop(hs, 'lw_ground')
+            col.prop(hs, 'lw_nadir')
+            col.prop(hs, 'lw_ground_squeeze')
 
-        if m in ('GRADIENT', 'BANDS', 'BRYCE', 'PHYSICAL', 'PAINTED'):
+        if m in ('GRADIENT', 'BANDS', 'BRYCE', 'PHYSICAL', 'PAINTED',
+                 'CYLINDER'):
             col.separator()
             col.prop(hs, 'show_ground')
             sub = col.column()
@@ -2830,6 +3155,16 @@ class HALCYON_PT_world(HalcyonPanel, Panel):
         row = col.row(align=True)
         row.prop(hs, 'exposure')
         row.prop(hs, 'exposure_range', text="Range")
+        # R251 C038: the DS rear-plane depth bitmap (a Z pass the
+        # z-buffer honours, tiled 1:1 with the DS's offset)
+        col.separator()
+        col.label(text="Backdrop Depth (Nintendo DS)")
+        col.template_ID(hs, 'backdrop_depth_image', open='image.open')
+        sub = col.column()
+        sub.active = hs.backdrop_depth_image is not None
+        row = sub.row(align=True)
+        row.prop(hs, 'backdrop_offset_x')
+        row.prop(hs, 'backdrop_offset_y')
 
 
 class HALCYON_PT_world_clouds(HalcyonPanel, Panel):

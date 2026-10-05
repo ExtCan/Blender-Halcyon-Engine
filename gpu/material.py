@@ -15,6 +15,7 @@ the correct outcome and the caller renders it on the CPU.
 """
 
 from . import glsl_shading as GS
+from . import combine as GCB         # R251 material pack (MAT-A)
 from .emit import Emitter, Unsupported
 
 MAX_LIGHTS = 8
@@ -385,19 +386,37 @@ def _v3(t):
 #: refine and 30-second cold F12 were exactly that recompile storm).
 #: STRUCTURE -- light count, types, decay modes, shadow modes, which
 #: sliders are nonzero -- still bakes, still re-plans when it changes.
-LIGHT_TEXEL_STRIDE = 4
+#: R251 LIGHT-B1: 8 texels per light -- 4 = (spot_exponent, cr, a0, a1)
+#: and 5.x = a2 (F012), 5.yz = the GX (k1, k2) (F013), 6 = (cx, cy, w,
+#: h) and 7 = (start, aext, 0, 0) the Model 3 screen spotlight (F015)
+LIGHT_TEXEL_STRIDE = 8
 
 
-def pack_light_texels(lights):
+def pack_light_texels(lights, job=None):
     """The per-light value texture, (1, n*STRIDE, 4) float32.
 
     Every value is np.float32 of the SAME python expression the old
     literal bake evaluated, so the arithmetic downstream sees the same
     numbers to within the literal's own %.9g decimal rounding -- and
     the CPU's exact float32 values, which is what parity is against.
+
+    R251 (STRIDE 8): texel 4 = (spot_exponent, cr, a0, a1) and 5.x = a2,
+    the cone law's values (F012); 5.yz = the GX distance coefficients
+    (k1, k2) (F013); 6 = (cx, cy, w, h) and 7 = (start, aext, 0, 0), the
+    Model 3 screen spotlight's ellipse in INTERNAL pixels (F015) --
+    camera-dependent, so `job` (its settings, camera, width, height) is
+    passed by every caller and the plan-cache HIT repack runs per frame.
     """
     import numpy as np
+    from ..core import lights as LI
     n = max(len(lights), 1)
+    st_job = getattr(job, 'settings', None)
+    vp_job = None
+    if job is not None and any(getattr(l, 'screen_spot', False)
+                               for l in lights):
+        from ..core import render as _R
+        vp_job = _R.camera_matrices(job.scene.camera, job.width,
+                                    job.height)[2]
     out = np.zeros((1, n * LIGHT_TEXEL_STRIDE, 4), np.float32)
     for i, light in enumerate(lights):
         b = i * LIGHT_TEXEL_STRIDE
@@ -452,7 +471,148 @@ def pack_light_texels(lights):
             float(getattr(light, 'decay_ld1', 0.0) or 0.0))
         out[0, b + 3, 3] = np.float32(
             float(getattr(light, 'decay_ld2', 0.0) or 0.0))
+        if kind == 'SPOT':
+            # R251 F012: the cone law's values -- the SAME expressions
+            # spot_law_factor evaluates (spot_law_coeffs is the one
+            # place the coefficients are computed)
+            cr, a0, a1, a2 = LI.spot_law_coeffs(light)
+            out[0, b + 4, 0] = np.float32(
+                float(getattr(light, 'spot_exponent', 0.0) or 0.0))
+            out[0, b + 4, 1] = cr
+            out[0, b + 4, 2] = a0
+            out[0, b + 4, 3] = a1
+            out[0, b + 5, 0] = a2
+            if getattr(light, 'screen_spot', False) and vp_job is not None:
+                # R251 F015: the screen ellipse, per frame
+                cx, cy, w_e, h_e, s0, aext = LI.screen_spot_params(
+                    light, vp_job, job.width, job.height,
+                    getattr(job.scene, 'camera', None))
+                out[0, b + 6, 0] = cx
+                out[0, b + 6, 1] = cy
+                out[0, b + 6, 2] = w_e
+                out[0, b + 6, 3] = h_e
+                out[0, b + 7, 0] = s0
+                out[0, b + 7, 1] = aext
+        dmode = str(mode)
+        if dmode == 'DEFAULT' and st_job is not None:
+            dmode = str(getattr(st_job, 'light_falloff_default', 'DEFAULT'))
+        if dmode.startswith('GX_') and kind not in ('SUN', 'HEMI'):
+            # R251 F013: libogc's (k1, k2) for the lamp's ref_brite
+            k1, k2 = LI.gx_dist_coeffs(light, dmode)
+            out[0, b + 5, 1] = k1
+            out[0, b + 5, 2] = k2
     return out
+
+
+def spot_law_glsl(law, exp_on, r):
+    """R251 F012: the GLSL of one cone law, defining `float spot_f` from
+    `cosang` -- statement for statement lights.spot_law_factor. `r` maps
+    'si' (the cutoff cosine), 'exp', 'cr', 'a0', 'a1', 'a2' to their
+    expressions (hal_lights texel reads, or literals). Whether the
+    exponent is nonzero is structure (`exp_on`); its value is a texel.
+    The test module compiles exactly these lines standalone."""
+    if law == 'GL11':
+        if exp_on:
+            return [f'    float spot_f = (cosang < {r["si"]}) ? 0.0 : '
+                    f'pow(max(cosang, 0.0), {r["exp"]});']
+        return [f'    float spot_f = (cosang < {r["si"]}) ? 0.0 : 1.0;']
+    if law == 'POV':
+        lines = [(f'    float pa = pow(max(cosang, 0.0), {r["exp"]});'
+                  if exp_on else '    float pa = 1.0;'),
+                 f'    float pd = {r["cr"]} - {r["si"]};',
+                 f'    float pt0 = cosang - {r["si"]};',
+                 # the division by a tiny pd lives in the DISCARDED
+                 # operand of the select below
+                 '    pt0 = pt0 / pd;',
+                 '    pt0 = clamp(pt0, 0.0, 1.0);',
+                 f'    float pt1 = (cosang < {r["cr"]}) ? 0.0 : 1.0;',
+                 '    float pt = (pd < 1e-6) ? pt1 : pt0;',
+                 '    float pt2 = pt * pt;',
+                 '    float ps = 3.0 - 2.0 * pt;',
+                 '    ps = ps * pt2;',
+                 '    float pb = pa * ps;',
+                 f'    pa = (cosang < {r["cr"]}) ? pb : pa;',
+                 '    float spot_f = (cosang <= 0.0) ? 0.0 : pa;']
+        return lines
+    # the six GX angular functions: a quadratic in the cosine, saturated
+    return [f'    float ga = {r["a1"]} * cosang;',
+            f'    ga = {r["a0"]} + ga;',
+            '    float gc = cosang * cosang;',
+            f'    gc = {r["a2"]} * gc;',
+            '    ga = ga + gc;',
+            '    float spot_f = clamp(ga, 0.0, 1.0);']
+
+
+def screen_spot_glsl(r):
+    """R251 F015: the GLSL of the Model 3 screen-spot lobe, defining
+    `ss_en`, `ss_el`, `ss_lobe` from `ss_px`, `ss_py`, `ss_depth` --
+    statement for statement lights.screen_spot_lobe. `r` maps 'cx',
+    'cy', 'w', 'h', 'start', 'aext' to expressions."""
+    return ['    float ss_ex = ss_px + 0.5;',
+            f'    ss_ex = ss_ex - {r["cx"]};',
+            f'    ss_ex = ss_ex / {r["w"]};',
+            '    float ss_ey = ss_py + 0.5;',
+            f'    ss_ey = ss_ey - {r["cy"]};',
+            f'    ss_ey = ss_ey / {r["h"]};',
+            '    ss_ex = ss_ex * ss_ex;',
+            '    ss_ey = ss_ey * ss_ey;',
+            '    float ss_el = 1.0 - ss_ex;',
+            '    ss_el = ss_el - ss_ey;',
+            '    ss_el = max(ss_el, 0.0);',
+            f'    float ss_en = (ss_depth >= {r["start"]}) ? 1.0 : 0.0;',
+            '    float ss_z = -ss_depth;',
+            f'    float ss_dd = {r["start"]} + {r["aext"]};',
+            '    ss_dd = ss_dd + ss_z;',
+            '    ss_dd = min(ss_dd, 0.0);',
+            f'    float ss_qa = 1.0 + {r["aext"]};',
+            '    float ss_q = ss_dd / ss_qa;',
+            '    ss_q = ss_q - 1.0;',
+            '    ss_q = ss_q * ss_q;',
+            '    float ss_rng = ss_en / ss_q;',
+            '    float ss_lobe = ss_rng * ss_el;']
+
+
+def decay_law_glsl(mode, r):
+    """R251 F013: the GLSL of one decay law, defining `float att` from
+    `dist` -- statement for statement lights.decay_law. `r` maps 'D',
+    'ld1', 'ld2', 'k1', 'k2' to expressions (texel reads or literals)."""
+    lines = ['    float dm = max(dist, 0.0);']
+    if mode in ('POV_FADE_LINEAR', 'POV_FADE_SQUARE'):
+        lines.append(f'    float at_q = dm / {r["D"]};')
+        if mode == 'POV_FADE_SQUARE':
+            lines.append('    at_q = at_q * at_q;')
+        lines += ['    float at_s = 1.0 + at_q;',
+                  '    float att = 2.0 / at_s;']
+        return lines
+    ka, kb = (r['ld1'], r['ld2']) if mode == 'GL_3TERM' else (r['k1'],
+                                                              r['k2'])
+    lines += [f'    float at_t = {ka} * dm;',
+              '    float at_u = dm * dm;',
+              f'    at_u = {kb} * at_u;',
+              '    float at_s = 1.0 + at_t;',
+              '    at_s = at_s + at_u;',
+              '    float att = 1.0 / at_s;']
+    return lines
+
+
+#: R251 F011: the fixed camera-axis viewer rides hal_fogtab texel 227
+#: (the lighting pack's section-0 texel map: (vs.x, vs.y, vs.z, 0), the
+#: normalised +Z row of the CPU's own view matrix, packed per frame by
+#: pack_fog_texels). A constant vector read from a texture: bitwise.
+AXIS_VIEWER_TEXEL = 227
+
+
+def viewer_expr(consts, bake=None):
+    """The GLSL viewer the reflectance models take: `V` (the true eye
+    vector, PIXEL) or the frame's camera axis (AXIS, or a model that
+    forces the axis -- F016/F018 mark `bake['__axis_viewer']`)."""
+    if str((consts or {}).get('specular_viewer', 'PIXEL')) == 'AXIS' \
+            or bool((bake or {}).get('__axis_viewer')) \
+            or int((bake or {}).get('__model_i', -1)) in (32, 35):
+        # (32 GX_LIGHT / 35 DS_FIXED force the axis: LIGHT-B2 F016/F018)
+        return (f'texelFetch(hal_fogtab, ivec2({AXIS_VIEWER_TEXEL}, 0), 0)'
+                '.xyz')
+    return 'V'
 
 
 def _lref(i, texel, comp):
@@ -1166,9 +1326,15 @@ def _shadow_function(i, meta, consts):
                  f'max(pdist, {_f(near)}) / {_f(size)};')
     else:
         L.append(f'    float texel = {_f(2.0 * meta["extent"] / size)};')
-    L += [f'    float off_amt = texel * (1.5 + 2.5 * '
-          f'sqrt(max(1.0 - ndl * ndl, 0.0))) * {_f(max(1.0, soft))};',
-          '    vec4 ph = vec4(P + N * off_amt, 1.0);']
+    if meta.get('midpoint'):
+        # R251 C117: the MIDPOINT map's compare has no normal offset (and
+        # `slope` above folds to 0.0 * (...) = 0.0 from the zero bias):
+        # `P + N * 0.0 == P` bitwise, the CPU's own zeroed inputs
+        L.append('    float off_amt = 0.0;')
+    else:
+        L.append(f'    float off_amt = texel * (1.5 + 2.5 * '
+                 f'sqrt(max(1.0 - ndl * ndl, 0.0))) * {_f(max(1.0, soft))};')
+    L.append('    vec4 ph = vec4(P + N * off_amt, 1.0);')
 
     if len(faces) > 1:
         # cube: the face is the major axis of the vector from the light
@@ -1320,7 +1486,122 @@ def _sky_env_lines(env_spec):
 #: mip atlas, which the FRAME and vertex-rate passes carry (hal_uvgrad);
 #: secondary passes mirror the CPU's ray hits, which have no footprint
 #: and sample the top level. N64 3-point needs no footprint at all.
-SUPPORTED_TEX_FILTERS = ('NEAREST', 'BILINEAR', 'TRILINEAR', 'N64_3POINT')
+SUPPORTED_TEX_FILTERS = ('NEAREST', 'BILINEAR', 'TRILINEAR', 'N64_3POINT',
+                         'POV_NORMDIST', 'SUMMED_AREA')
+
+# R251 texture pack: one definition of the pyramid / footprint filter sets
+# (core/texture.py) and ONE `sample_opts` for both devices, so the three
+# rules of `sample_opts` cannot drift between the CPU and the GPU
+from ..core import texture as _TX                                   # noqa: E402
+import numpy as np                                                  # noqa: E402
+PYRAMID_FILTERS = _TX.PYRAMID_FILTERS
+FOOTPRINT_TEX_FILTERS = _TX.FOOTPRINT_TEX_FILTERS
+#: what a footprint filter samples where no footprint exists (secondary
+#: passes, coded images, linked Vector chains): the CPU's lod=None road
+NOFOOTPRINT_FILTER = {'TRILINEAR': 'BILINEAR', 'SUMMED_AREA': 'NEAREST'}
+_OPT_KEYS = ('tex_filter', 'tex_mipmap', 'tex_aniso', 'tex_frac_bits',
+             'tex_clamp_mode', 'tex_colorkey', 'tex_colorkey_range',
+             'tex_mip_select', 'tex_lod_sharpen', 'tex_lod_source',
+             'tex_lod_k', 'tex_lod_l')
+
+
+def _tex_opts(consts):
+    """The sample-time dials of R251 from the plan's consts: the SAME
+    `sample_opts` the CPU reads, on the same twelve keys."""
+    import types
+    ns = types.SimpleNamespace(**{k: consts[k] for k in _OPT_KEYS if k in consts})
+    return _TX.sample_opts(ns)
+
+
+def _frac_lines(frac_bits):
+    """C080: the Voodoo's coarse texel fraction, exactly _sample_bilinear's
+    four float32 operations (floor of an exact power-of-two product)."""
+    n = float(2 ** int(frac_bits))
+    inv = float(1.0 / 2 ** int(frac_bits))
+    return [f'    float txq = floor(tx * {_f(n)});',
+            f'    tx = txq * {_f(inv)};',
+            f'    float tyq = floor(ty * {_f(n)});',
+            f'    ty = tyq * {_f(inv)};']
+
+
+def _border_wrap(wrap, opts):
+    """C077: `Texture.sample`'s own mapping -- an Extend wrap under
+    GL_CLAMP is the internal BORDER wrap (the GL 1.1 coordinate clamp with
+    transparent-black border taps)."""
+    if opts is not None and wrap == 'EXTEND' and opts.get('clamp_mode') == 'GL_CLAMP':
+        return 'BORDER'
+    return wrap
+
+
+def _colorkey_lines(tex, opts):
+    """C083: the chroma key's tail, after the filter and after CLIP: a
+    sample below the threshold on every channel is discarded (alpha 0), a
+    survivor keeps its own alpha. The literal is `colorkey_threshold` on
+    the texture's OWN colourspace, `_f` round-trips the float32."""
+    if opts is None or not opts.get('colorkey'):
+        return []
+    thr = _TX.colorkey_threshold(int(opts.get('colorkey_range', 0)),
+                                 getattr(tex, 'colorspace', 'sRGB') == 'Linear')
+    t = _f(thr)
+    return [f'    if (c.r < {t} && c.g < {t} && c.b < {t}) {{ c.a = 0.0; }}']
+
+
+def _clip_lines(wrap):
+    if wrap == 'CLIP':
+        return ['    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || '
+                'uv.y > 1.0) { c = vec4(0.0); }']
+    return []
+
+
+def _border_select(wrap, v00, v10, v01, v11, wdim, hdim, x0='x0', y0='y0',
+                   x1='x1', y1='y1'):
+    """C077: the four validity selects of the BORDER taps against the
+    dims `wdim`/`hdim` (literals or runtime names): the low side can only
+    fail for x0/y0 and the high side for x1/y1 once s, t are clamped --
+    the CPU's `_border_taps` mask, tap by tap."""
+    if wrap != 'BORDER':
+        return []
+    return [f'    {v00} = ({x0} >= 0.0 && {y0} >= 0.0) ? {v00} : vec4(0.0);',
+            f'    {v10} = ({x1} <= {wdim} - 1.0 && {y0} >= 0.0) ? {v10} : vec4(0.0);',
+            f'    {v01} = ({x0} >= 0.0 && {y1} <= {hdim} - 1.0) ? {v01} : vec4(0.0);',
+            f'    {v11} = ({x1} <= {wdim} - 1.0 && {y1} <= {hdim} - 1.0) ? {v11} : vec4(0.0);']
+
+
+def _uv_clamp_lines(wrap, sx='s', sy='t'):
+    """C077: GL_CLAMP clamps the coordinate; `sx`, `sy` replace uv.x, uv.y
+    (the 3-point branch names its own s / t, so it passes cs / ct)."""
+    if wrap == 'BORDER':
+        return [f'    float {sx} = clamp(uv.x, 0.0, 1.0);',
+                f'    float {sy} = clamp(uv.y, 0.0, 1.0);']
+    return []
+
+
+def _uvx(wrap, sx='s'):
+    return sx if wrap == 'BORDER' else 'uv.x'
+
+
+def _uvy(wrap, sy='t'):
+    return sy if wrap == 'BORDER' else 'uv.y'
+
+
+def _lod_field_key(opts, tex):
+    """Which CPU-decided LOD field a footprint sampler reads: None (the
+    driver's own log2(rho) + bias, as today), (0, 0) under the GS's Q rule
+    (one size-independent field) or (w, h) under a per-texture-size level
+    road. Wave 1 emits none of the field roads; the emission site refuses
+    them by name until TEX-2 lands the samplers."""
+    if opts is None:
+        return None
+    if opts.get('lod_source') == 'GS_Q':
+        return (0, 0)
+    if opts.get('lod_source') == 'TRIANGLE' or opts.get('mip_select') != 'FILTER' \
+            or opts.get('lod_sharpen'):
+        return (int(tex.width), int(tex.height))
+    return None
+
+
+def _lod_uniform(key):
+    return 'hal_lodq' if key == (0, 0) else f'hal_lod_{key[0]}x{key[1]}'
 
 
 def mip_atlas(tex):
@@ -1356,19 +1637,12 @@ def _wrap_dyn(var, dim, wrap):
     return f'clamp({var}, 0.0, {dim} - 1.0)'          # EXTEND and CLIP
 
 
-def _mip_sampler(name, tex, wrap, levels, aniso, bias):
-    """GLSL for one TRILINEAR (optionally anisotropic) footprint sampler.
-
-    Mirrors Texture._sample_trilinear and _sample_aniso line for line:
-    compute_lod from the hal_uvgrad field (the CPU's OWN derivatives,
-    uploaded), a per-level manual bilinear inside the atlas stack, the
-    a + (b - a) * frac level blend, and -- under anisotropy -- the mip
-    level of the MINOR footprint axis with uniform trilinear taps along
-    the major. The level table is a select ladder: no arrays, nothing
-    the front-end cannot run.
-    """
-    w0, h0 = float(tex.width), float(tex.height)
-    n = len(levels)
+def _atlas_head(name, tex, levels):
+    """The atlas fetch and the level table shared by every pyramid
+    sampler: `hal_afetch` reads a texel centre of the vertical mip stack,
+    `hal_mipof(l)` is the select ladder (y0, w, h) of level l -- no
+    arrays, nothing the front-end cannot run."""
+    w0 = float(tex.width)
     L = [f'uniform sampler2D {name};',
          f'vec4 hal_afetch_{name}(float x, float y)',
          '{',
@@ -1382,16 +1656,40 @@ def _mip_sampler(name, tex, wrap, levels, aniso, bias):
                  f'{{ return vec3({_f(y0)}, {_f(lw)}, {_f(lh)}); }}')
     y0, lw, lh = levels[-1]
     L += [f'    return vec3({_f(y0)}, {_f(lw)}, {_f(lh)});',
-          '}',
-          f'vec4 hal_lvl_{name}(vec2 uv, float y0, float lw, float lh)',
-          '{',
-          '    float fx = uv.x * lw - 0.5;',
-          '    float fy = uv.y * lh - 0.5;',
+          '}']
+    return L
+
+
+def _lvl_function(name, filt, wrap, frac_bits):
+    """`hal_lvl_NAME(uv, y0, lw, lh)`: the FILTER's own tap set against the
+    runtime level dims (mip levels vary) -- exactly Texture._sample_nearest
+    / _sample_bilinear(frac_bits) / _sample_3point on one level, with the
+    C077 BORDER coordinate clamp and validity selects and the C080 fraction
+    bits. BILINEAR is TRILINEAR's level sampler (1.89.0's text under
+    neutral opts)."""
+    L = [f'vec4 hal_lvl_{name}(vec2 uv, float y0, float lw, float lh)',
+         '{']
+    if filt == 'NEAREST':
+        # _sample_nearest: the coordinate is NOT clamped under BORDER
+        # (GL 1.1 special-cases s = 1 for NEAREST: no seam), the index is
+        L += ['    float x = floor(uv.x * lw);',
+              '    float y = floor(uv.y * lh);',
+              f'    x = {_wrap_dyn("x", "lw", wrap)};',
+              f'    y = {_wrap_dyn("y", "lh", wrap)};',
+              f'    return hal_afetch_{name}(x, y0 + y);',
+              '}']
+        return L
+    sx, sy = ('cs', 'ct') if filt == 'N64_3POINT' else ('s', 't')
+    L += _uv_clamp_lines(wrap, sx, sy)
+    L += [f'    float fx = {_uvx(wrap, sx)} * lw - 0.5;',
+          f'    float fy = {_uvy(wrap, sy)} * lh - 0.5;',
           '    float x0 = floor(fx);',
           '    float y0i = floor(fy);',
           '    float tx = fx - x0;',
-          '    float ty = fy - y0i;',
-          '    float x1 = x0 + 1.0;',
+          '    float ty = fy - y0i;']
+    if filt != 'N64_3POINT' and int(frac_bits):
+        L += _frac_lines(frac_bits)                      # C080, per level
+    L += ['    float x1 = x0 + 1.0;',
           '    float y1 = y0i + 1.0;',
           f'    float wx0 = {_wrap_dyn("x0", "lw", wrap)};',
           f'    float wx1 = {_wrap_dyn("x1", "lw", wrap)};',
@@ -1400,28 +1698,69 @@ def _mip_sampler(name, tex, wrap, levels, aniso, bias):
           f'    vec4 c00 = hal_afetch_{name}(wx0, y0 + wy0);',
           f'    vec4 c10 = hal_afetch_{name}(wx1, y0 + wy0);',
           f'    vec4 c01 = hal_afetch_{name}(wx0, y0 + wy1);',
-          f'    vec4 c11 = hal_afetch_{name}(wx1, y0 + wy1);',
-          '    vec4 top = c00 + (c10 - c00) * tx;',
-          '    vec4 bot = c01 + (c11 - c01) * tx;',
-          '    return top + (bot - top) * ty;',
-          '}',
-          f'vec4 hal_trilerp_{name}(vec2 uv, float lod)',
-          '{',
-          f'    float l = clamp(lod, 0.0, {_f(n - 1.0)});',
-          '    float l0 = floor(l);',
-          '    float f = l - l0;',
-          f'    vec3 A = hal_mipof_{name}(l0);',
-          f'    vec3 B = hal_mipof_{name}(min(l0 + 1.0, {_f(n - 1.0)}));',
-          f'    vec4 a = hal_lvl_{name}(uv, A.x, A.y, A.z);',
-          f'    vec4 b = hal_lvl_{name}(uv, B.x, B.y, B.z);',
-          '    return a + (b - a) * f;',
-          '}',
-          f'vec4 hal_sample_{name}(vec2 uv)',
-          '{',
-          '    ivec2 hal_gsz = textureSize(hal_uvgrad, 0);',
-          '    vec4 g = texelFetch(hal_uvgrad, '
-          'ivec2(clamp(vUV * vec2(hal_gsz), vec2(0.0), '
-          'vec2(hal_gsz) - vec2(1.0))), 0);']
+          f'    vec4 c11 = hal_afetch_{name}(wx1, y0 + wy1);']
+    L += _border_select(wrap, 'c00', 'c10', 'c01', 'c11', 'lw', 'lh', y0='y0i')
+    if filt == 'N64_3POINT':
+        L += ['    float up = ((tx + ty) > 1.0) ? 1.0 : 0.0;',
+              '    vec4 a = (up > 0.5) ? c11 : c00;',
+              '    float s = (up > 0.5) ? (1.0 - ty) : tx;',
+              '    float t = (up > 0.5) ? (1.0 - tx) : ty;',
+              '    vec4 b = (up > 0.5) ? c01 : c10;',
+              '    vec4 cc = (up > 0.5) ? c10 : c01;',
+              '    return a + (b - a) * s + (cc - a) * t;',
+              '}']
+    else:
+        L += ['    vec4 top = c00 + (c10 - c00) * tx;',
+              '    vec4 bot = c01 + (c11 - c01) * tx;',
+              '    return top + (bot - top) * ty;',
+              '}']
+    return L
+
+
+def _trilerp_function(name, n):
+    return [f'vec4 hal_trilerp_{name}(vec2 uv, float lod)',
+            '{',
+            f'    float l = clamp(lod, 0.0, {_f(n - 1.0)});',
+            '    float l0 = floor(l);',
+            '    float f = l - l0;',
+            f'    vec3 A = hal_mipof_{name}(l0);',
+            f'    vec3 B = hal_mipof_{name}(min(l0 + 1.0, {_f(n - 1.0)}));',
+            f'    vec4 a = hal_lvl_{name}(uv, A.x, A.y, A.z);',
+            f'    vec4 b = hal_lvl_{name}(uv, B.x, B.y, B.z);',
+            '    return a + (b - a) * f;',
+            '}']
+
+
+_UVGRAD_FETCH = [
+    '    ivec2 hal_gsz = textureSize(hal_uvgrad, 0);',
+    '    vec4 g = texelFetch(hal_uvgrad, '
+    'ivec2(clamp(vUV * vec2(hal_gsz), vec2(0.0), '
+    'vec2(hal_gsz) - vec2(1.0))), 0);']
+
+
+def _mip_sampler(name, tex, wrap, levels, aniso, bias, frac_bits=0, opts=None):
+    """GLSL for one TRILINEAR (optionally anisotropic) footprint sampler on
+    the DERIVATIVE road (1.89.0's: the level is the driver's log2(rho) +
+    bias).
+
+    Mirrors Texture._sample_trilinear and _sample_aniso line for line:
+    compute_lod from the hal_uvgrad field (the CPU's OWN derivatives,
+    uploaded), a per-level manual bilinear inside the atlas stack, the
+    a + (b - a) * frac level blend, and -- under anisotropy -- the mip
+    level of the MINOR footprint axis with uniform trilinear taps along
+    the major. The level table is a select ladder: no arrays, nothing
+    the front-end cannot run. R251: `wrap` may be BORDER (C077), `opts`
+    carries the chroma key (C083); the CPU-decided level roads are
+    `_level_sampler`'s.
+    """
+    w0, h0 = float(tex.width), float(tex.height)
+    n = len(levels)
+    L = _atlas_head(name, tex, levels)
+    L += _lvl_function(name, 'BILINEAR', wrap, frac_bits)
+    L += _trilerp_function(name, n)
+    L += [f'vec4 hal_sample_{name}(vec2 uv)',
+          '{']
+    L += _UVGRAD_FETCH
     if int(aniso) > 1:
         A = float(int(aniso))
         L += [
@@ -1454,9 +1793,246 @@ def _mip_sampler(name, tex, wrap, levels, aniso, bias):
             '    float rho = max(max(dx, dy), 1e-6);',
             f'    vec4 c = hal_trilerp_{name}(uv, log2(rho) '
             f'+ {_f(bias)});']
-    if wrap == 'CLIP':
-        L.append('    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || '
-                 'uv.y > 1.0) { c = vec4(0.0); }')
+    L += _clip_lines(wrap)
+    L += _colorkey_lines(tex, opts)
+    L += ['    return c;', '}']
+    return '\n'.join(L) + '\n'
+
+
+_DITHER_LINES = [
+    # the same pixel the uvgrad fetch reads (gbpx's expression; uploads are
+    # bottom-row-first, the CPU's row 0 is the bottom, so gp.y == py) and
+    # the 4x4 Bayer matrix as bit arithmetic: 0 8 2 10 / 12 4 14 6 /
+    # 3 11 1 9 / 15 7 13 5 == DI.BAYER4 * 16 indexed [py & 3, px & 3]
+    '    int bx = gp.x & 3;',
+    '    int by = gp.y & 3;',
+    '    int xy = bx ^ by;',
+    '    int d0 = (xy & 1) << 3;',
+    '    int d1 = (by & 1) << 2;',
+    '    int d2 = ((xy >> 1) & 1) << 1;',
+    '    int d3 = (by >> 1) & 1;',
+    '    float d16 = float(d0 + d1 + d2 + d3);']
+
+
+def _level_sampler(name, tex, filt, wrap, opts, bias, lod_key):
+    """R251 (C072 / C022 / C079 / C008): a pyramid filter on a CPU-decided
+    level road. The LOD is NEVER computed on the driver here -- it is read
+    per pixel from the uploaded field (`hal_lod_WxH`: compute_lod or the
+    per-triangle table; `hal_lodq`: the GS rule), so no sqrt / log2 ULP
+    can become a whole level. `hal_pick` selects or blends levels with
+    the filter's own `hal_lvl` taps (BLEND = the lod_frac lerp,
+    NEAREST_LEVEL = GL 1.1's ceil(l + 1/2) - 1 written with floor,
+    DITHER_VOODOO = MAME's 8.8 fixed lod + (bayer << 4) >> 8); FILTER
+    (TRILINEAR under the GS rule, or a Sharpen alone) is the trilerp for
+    TRILINEAR and level 0 for the others. Sharpen (C008) extrapolates
+    level 0 away from level 1 under magnification with roundEven and the
+    9-bit clamp, one shared float32 constant. Bitwise the CPU."""
+    _atlas_px, levels = mip_atlas(tex)
+    n = len(levels)
+    w0, h0 = float(tex.width), float(tex.height)
+    sel = str(opts.get('mip_select', 'FILTER'))
+    sharpen = bool(opts.get('lod_sharpen')) and n >= 2
+    lod_uniform = _lod_uniform(lod_key)
+    L = _atlas_head(name, tex, levels)
+    L += _lvl_function(name, filt, wrap, int(opts.get('frac_bits', 0)))
+    L += [f'vec4 hal_pick_{name}(vec2 uv, float lod, float d16)',
+          '{',
+          f'    float l = clamp(lod, 0.0, {_f(n - 1.0)});']
+    if sel == 'BLEND' or (sel == 'FILTER' and filt == 'TRILINEAR'):
+        L += ['    float l0 = floor(l);',
+              '    float f = l - l0;',
+              f'    vec3 A = hal_mipof_{name}(l0);',
+              f'    vec3 B = hal_mipof_{name}(min(l0 + 1.0, {_f(n - 1.0)}));',
+              f'    vec4 a = hal_lvl_{name}(uv, A.x, A.y, A.z);',
+              f'    vec4 b = hal_lvl_{name}(uv, B.x, B.y, B.z);',
+              '    return a + (b - a) * f;',
+              '}']
+    elif sel == 'NEAREST_LEVEL':
+        L += ['    float lq = l + 0.5;',
+              '    float ln = 0.0 - lq;',
+              '    float lf = floor(ln);',
+              '    float lc2 = 0.0 - lf;',
+              '    float lc = lc2 - 1.0;',
+              f'    lc = clamp(lc, 0.0, {_f(n - 1.0)});',
+              f'    vec3 A = hal_mipof_{name}(lc);',
+              f'    return hal_lvl_{name}(uv, A.x, A.y, A.z);',
+              '}']
+    elif sel == 'DITHER_VOODOO':
+        L += ['    float lod8 = floor(l * 256.0);',
+              '    float dd = d16 * 16.0;',
+              '    float ls = lod8 + dd;',
+              '    float lq = ls * 0.00390625;',
+              '    float lc = floor(lq);',
+              f'    lc = clamp(lc, 0.0, {_f(n - 1.0)});',
+              f'    vec3 A = hal_mipof_{name}(lc);',
+              f'    return hal_lvl_{name}(uv, A.x, A.y, A.z);',
+              '}']
+    else:
+        # FILTER for NEAREST / BILINEAR / N64_3POINT: level 0, as the CPU's
+        # plain filter (a Sharpen alone reaches this road)
+        L += [f'    vec3 A = hal_mipof_{name}(0.0);',
+              f'    return hal_lvl_{name}(uv, A.x, A.y, A.z);',
+              '}']
+    if sharpen:
+        L += [f'float hal_clamp9_{name}(float v8)',
+              '{',
+              '    int i = int(v8);',
+              '    int w9 = i & 511;',
+              '    int b8 = w9 & 256;',
+              '    int b7 = w9 & 128;',
+              '    float o = float(w9);',
+              '    if (b8 != 0) { o = (b7 != 0) ? 0.0 : 255.0; }',
+              f'    return o * {_f(np.float32(1.0 / 255.0))};',
+              '}']
+    L += [f'vec4 hal_sample_{name}(vec2 uv)',
+          '{']
+    L += _UVGRAD_FETCH
+    L += ['    ivec2 gp = ivec2(clamp(vUV * vec2(hal_gsz), vec2(0.0), '
+          'vec2(hal_gsz) - vec2(1.0)));']
+    if sel == 'DITHER_VOODOO':
+        L += _DITHER_LINES
+    else:
+        L += ['    float d16 = 0.0;']
+    L += [f'    float lodf = texelFetch({lod_uniform}, gp, 0).r;',
+          f'    vec4 c = hal_pick_{name}(uv, lodf, d16);']
+    if sharpen:
+        L += [f'    float ax = abs(g.x) * {_f(w0)};',
+              f'    float ay = abs(g.y) * {_f(w0)};',
+              f'    float bx = abs(g.z) * {_f(h0)};',
+              f'    float by = abs(g.w) * {_f(h0)};',
+              '    float mx = max(ax, ay);',
+              '    float my = max(bx, by);',
+              '    float m = max(mx, my);',
+              '    if (m < 1.0) {',
+              f'        vec3 L0 = hal_mipof_{name}(0.0);',
+              f'        vec3 L1 = hal_mipof_{name}(1.0);',
+              f'        vec4 t0 = hal_lvl_{name}(uv, L0.x, L0.y, L0.z);',
+              f'        vec4 t1 = hal_lvl_{name}(uv, L1.x, L1.y, L1.z);',
+              '        float f = m - 1.0;',
+              '        vec4 d = t1 - t0;',
+              '        vec4 df = d * f;',
+              '        vec4 v = t0 + df;',
+              '        vec4 v255 = v * 255.0;',
+              '        vec4 v8 = roundEven(v255);',
+              f'        c = vec4(hal_clamp9_{name}(v8.r), hal_clamp9_{name}(v8.g), '
+              f'hal_clamp9_{name}(v8.b), hal_clamp9_{name}(v8.a));',
+              '    }']
+    L += _clip_lines(wrap)
+    L += _colorkey_lines(tex, opts)
+    L += ['    return c;', '}']
+    return '\n'.join(L) + '\n'
+
+
+def sat_atlas(tex):
+    """C088: the summed-area table as one (H, 2W, 4) float32 image --
+    the hi plane in the left half, the lo plane in the right (integer
+    DATA: read with texelFetch). Built from the texture's OWN table."""
+    hi, lo = tex.build_sat()
+    h, w = hi.shape[:2]
+    atlas = np.zeros((h, 2 * w, 4), np.float32)
+    atlas[:, :w] = hi
+    atlas[:, w:] = lo
+    return atlas
+
+
+def _sat_sampler(name, tex, wrap, opts, bias):
+    """C088: Crow's summed-area box over the footprint rectangle, exactly
+    Texture._sample_sat -- half-extents from the uploaded derivatives
+    (at least half a texel, at most 127), the continuous coordinate
+    wrapped (REPEAT; the continuous MIRROR with no "- 1"), ceil - 1
+    written with floor, the box clamped at the edge, four texelFetch
+    pairs, a uint wrap-around difference, two RECIP256 reads and one
+    multiply by 1/65535. `hal_recip256` is declared ONCE per pass by the
+    emission site (the hal_uvgrad idiom, A12.1). No division, no
+    transcendental: bitwise."""
+    w, h = float(tex.width), float(tex.height)
+    W, H = _f(w), _f(h)
+    scale = _f(np.float32(2.0 ** float(bias)))
+    L = [f'uniform sampler2D {name};',
+         f'vec4 hal_satfetch_{name}(float x, float y)',
+         '{',
+         f'    return texelFetch({name}, ivec2(int(x), int(y)), 0);',
+         '}',
+         f'float hal_box_{name}(float Ah, float Al, float Bh, float Bl, '
+         'float Ch, float Cl, float Dh, float Dl, float rx, float ry)',
+         '{',
+         '    uint A = uint(Ah) * 65536u + uint(Al);',
+         '    uint B = uint(Bh) * 65536u + uint(Bl);',
+         '    uint C = uint(Ch) * 65536u + uint(Cl);',
+         '    uint D = uint(Dh) * 65536u + uint(Dl);',
+         '    uint AB = A - B;',
+         '    uint ABC = AB - C;',
+         '    uint box = ABC + D;',
+         '    uint qh = box >> 16u;',
+         '    uint ql = box & 65535u;',
+         '    float fh = float(qh) * 65536.0;',
+         '    float f = fh + float(ql);',
+         '    float m1 = f * rx;',
+         '    float m2 = m1 * ry;',
+         f'    return m2 * {_f(np.float32(1.0 / 65535.0))};',
+         '}',
+         f'vec4 hal_sample_{name}(vec2 uv)',
+         '{']
+    L += _UVGRAD_FETCH
+    L += ['    float ax = abs(g.x);',
+          '    float ay = abs(g.y);',
+          '    float sx = ax + ay;',
+          '    float hx = sx * 0.5;',
+          f'    float hw = hx * {W};',
+          f'    float hs = hw * {scale};',
+          '    float hu = max(hs, 0.5);',
+          '    hu = min(hu, 127.0);',
+          '    float bx = abs(g.z);',
+          '    float by = abs(g.w);',
+          '    float sy = bx + by;',
+          '    float hy = sy * 0.5;',
+          f'    float hh = hy * {H};',
+          f'    float ht = hh * {scale};',
+          '    float hv = max(ht, 0.5);',
+          '    hv = min(hv, 127.0);',
+          f'    float uc = uv.x * {W};',
+          f'    float vc = uv.y * {H};']
+    if wrap == 'REPEAT':
+        L += [f'    uc = uc - floor(uc / {W}) * {W};',
+              f'    vc = vc - floor(vc / {H}) * {H};']
+    elif wrap == 'MIRROR':
+        W2, H2 = _f(2.0 * w), _f(2.0 * h)
+        L += [f'    float mu = uc - floor(uc / {W2}) * {W2};',
+              f'    uc = (mu < {W}) ? mu : {W2} - mu;',
+              f'    float mv = vc - floor(vc / {H2}) * {H2};',
+              f'    vc = (mv < {H}) ? mv : {H2} - mv;']
+    L += ['    float x0 = floor(uc - hu);',
+          '    float nx1 = 0.0 - (uc + hu);',
+          '    float fx1 = floor(nx1);',
+          '    float x1 = (0.0 - fx1) - 1.0;',
+          '    float y0 = floor(vc - hv);',
+          '    float ny1 = 0.0 - (vc + hv);',
+          '    float fy1 = floor(ny1);',
+          '    float y1 = (0.0 - fy1) - 1.0;',
+          f'    x0 = clamp(x0, 0.0, {W} - 1.0);',
+          f'    x1 = clamp(x1, 0.0, {W} - 1.0);',
+          f'    y0 = clamp(y0, 0.0, {H} - 1.0);',
+          f'    y1 = clamp(y1, 0.0, {H} - 1.0);',
+          '    float xm = x0 - 1.0;',
+          '    float ym = y0 - 1.0;',
+          f'    vec4 Ah = hal_satfetch_{name}(x1, y1);',
+          f'    vec4 Al = hal_satfetch_{name}(x1 + {W}, y1);',
+          f'    vec4 Bh = (xm < 0.0) ? vec4(0.0) : hal_satfetch_{name}(xm, y1);',
+          f'    vec4 Bl = (xm < 0.0) ? vec4(0.0) : hal_satfetch_{name}(xm + {W}, y1);',
+          f'    vec4 Ch = (ym < 0.0) ? vec4(0.0) : hal_satfetch_{name}(x1, ym);',
+          f'    vec4 Cl = (ym < 0.0) ? vec4(0.0) : hal_satfetch_{name}(x1 + {W}, ym);',
+          f'    vec4 Dh = (xm < 0.0 || ym < 0.0) ? vec4(0.0) : hal_satfetch_{name}(xm, ym);',
+          f'    vec4 Dl = (xm < 0.0 || ym < 0.0) ? vec4(0.0) : hal_satfetch_{name}(xm + {W}, ym);',
+          '    float nx = x1 - x0;',
+          '    float ny = y1 - y0;',
+          '    float rx = texelFetch(hal_recip256, ivec2(int(nx), 0), 0).r;',
+          '    float ry = texelFetch(hal_recip256, ivec2(int(ny), 0), 0).r;',
+          f'    vec4 c = vec4(hal_box_{name}(Ah.r, Al.r, Bh.r, Bl.r, Ch.r, Cl.r, Dh.r, Dl.r, rx, ry),',
+          f'                  hal_box_{name}(Ah.g, Al.g, Bh.g, Bl.g, Ch.g, Cl.g, Dh.g, Dl.g, rx, ry),',
+          f'                  hal_box_{name}(Ah.b, Al.b, Bh.b, Bl.b, Ch.b, Cl.b, Dh.b, Dl.b, rx, ry),',
+          f'                  hal_box_{name}(Ah.a, Al.a, Bh.a, Bl.a, Ch.a, Cl.a, Dh.a, Dl.a, rx, ry));']
+    L += _clip_lines(wrap)
+    L += _colorkey_lines(tex, opts)
     L += ['    return c;', '}']
     return '\n'.join(L) + '\n'
 
@@ -1492,14 +2068,43 @@ def _wrap_expr(var, n, mode):
     return f'clamp({var}, 0.0, {_f(n - 1)})'     # EXTEND, and CLIP's indices
 
 
-def _texture_sampler(name, tex, filt, wrap):
+def _footprint_sampler(name, tex, filt, wrap, opts, bias, lod_key):
+    """The footprint road's sampler (the seven roads of R251):
+    `_sat_sampler` for SUMMED_AREA (C088); `_mip_sampler` for TRILINEAR
+    on the derivative road with no level select (1.89.0's driver log2,
+    untouched); `_level_sampler` for every CPU-decided level road -- a Mip
+    Level Select (C072), the GS rule (C022), the per-polygon level (C079)
+    or Sharpen (C008) -- reading the uploaded `hal_lod_WxH` / `hal_lodq`
+    field. GL_CLAMP maps Extend to BORDER here as `Texture.sample` does
+    (C077); every sampler carries the chroma-key tail (C083)."""
+    wrap = _border_wrap(wrap, opts)
+    if filt == 'SUMMED_AREA':
+        return _sat_sampler(name, tex, wrap, opts, float(bias))
+    if filt == 'TRILINEAR' and lod_key is None:
+        _atlas_px, levels = mip_atlas(tex)
+        return _mip_sampler(name, tex, wrap, levels, int(opts['aniso']),
+                            float(bias), int(opts['frac_bits']), opts=opts)
+    if filt not in PYRAMID_FILTERS or lod_key is None:
+        raise ValueError(f'no GLSL footprint sampler for {filt} on the '
+                         f'{lod_key} level road')
+    return _level_sampler(name, tex, filt, wrap, opts, float(bias), lod_key)
+
+
+def _texture_sampler(name, tex, filt, wrap, opts=None):
     """A manual sampler matching Texture.sample, driver-independent.
 
     `texture()` with driver filtering would put the sampling arithmetic in
     the driver's hands; fetching texel centres and doing the filter in the
     shader keeps it in ours, which is what makes the GPU pixel the CPU pixel.
+
+    R251: `opts` (from `_tex_opts`) carries the sample-time dials;
+    `opts=None` is 1.89.0's text byte for byte. The filter ladder is
+    explicit -- an unlisted filter raises instead of falling through to
+    bilinear.
     """
     w, h = float(tex.width), float(tex.height)
+    frac_bits = int(opts['frac_bits']) if opts is not None else 0
+    wrap = _border_wrap(wrap, opts)                       # C077: EXTEND + GL_CLAMP
     L = [f'uniform sampler2D {name};',
          f'vec4 hal_fetch_{name}(float x, float y)',
          '{',
@@ -1517,9 +2122,11 @@ def _texture_sampler(name, tex, filt, wrap):
     elif filt == 'N64_3POINT':
         # exactly Texture._sample_3point: the triangular filter picks the
         # dominant corner and blends along the two edges -- three taps,
-        # the N64's own arithmetic, no footprint needed
-        L += [f'    float fx = uv.x * {_f(w)} - 0.5;',
-              f'    float fy = uv.y * {_f(h)} - 0.5;',
+        # the N64's own arithmetic, no footprint needed (C077: under
+        # BORDER the coordinate is clamped and the taps select the border)
+        L += _uv_clamp_lines(wrap, 'cs', 'ct')
+        L += [f'    float fx = {_uvx(wrap, "cs")} * {_f(w)} - 0.5;',
+              f'    float fy = {_uvy(wrap, "ct")} * {_f(h)} - 0.5;',
               '    float x0 = floor(fx);',
               '    float y0 = floor(fy);',
               '    float tx = fx - x0;',
@@ -1533,22 +2140,72 @@ def _texture_sampler(name, tex, filt, wrap):
               f'    vec4 c00 = hal_fetch_{name}(wx0, wy0);',
               f'    vec4 c10 = hal_fetch_{name}(wx1, wy0);',
               f'    vec4 c01 = hal_fetch_{name}(wx0, wy1);',
-              f'    vec4 c11 = hal_fetch_{name}(wx1, wy1);',
-              '    float up = ((tx + ty) > 1.0) ? 1.0 : 0.0;',
+              f'    vec4 c11 = hal_fetch_{name}(wx1, wy1);']
+        L += _border_select(wrap, 'c00', 'c10', 'c01', 'c11', _f(w), _f(h))
+        L += ['    float up = ((tx + ty) > 1.0) ? 1.0 : 0.0;',
               '    vec4 a = (up > 0.5) ? c11 : c00;',
               '    float s = (up > 0.5) ? (1.0 - ty) : tx;',
               '    float t = (up > 0.5) ? (1.0 - tx) : ty;',
               '    vec4 b = (up > 0.5) ? c01 : c10;',
               '    vec4 cc = (up > 0.5) ? c10 : c01;',
               '    vec4 c = a + (b - a) * s + (cc - a) * t;']
-    else:
-        L += [f'    float fx = uv.x * {_f(w)} - 0.5;',
-              f'    float fy = uv.y * {_f(h)} - 0.5;',
+    elif filt == 'POV_NORMDIST':
+        # C111: exactly Texture._sample_normdist -- POV-Ray's interpolate
+        # 4, inverse-square weights to the four texel centres, normalised;
+        # one operation per statement (the driver's fma contraction and
+        # its `/` ULPs are the stated bar; the simulator is bitwise)
+        L += [f'    float xp = uv.x * {_f(w)} + 0.5;',
+              f'    float yp = uv.y * {_f(h)} + 0.5;',
+              '    float ix = floor(xp);',
+              '    float iy = floor(yp);',
+              '    float p = xp - ix;',
+              '    float q = yp - iy;',
+              '    float ixm = ix - 1.0;',
+              '    float iym = iy - 1.0;',
+              f'    float wx0 = {_wrap_expr("ix", w, wrap)};',
+              f'    float wx1 = {_wrap_expr("ixm", w, wrap)};',
+              f'    float wy0 = {_wrap_expr("iy", h, wrap)};',
+              f'    float wy1 = {_wrap_expr("iym", h, wrap)};',
+              f'    vec4 c0 = hal_fetch_{name}(wx0, wy0);',
+              f'    vec4 c1 = hal_fetch_{name}(wx1, wy0);',
+              f'    vec4 c2 = hal_fetch_{name}(wx0, wy1);',
+              f'    vec4 c3 = hal_fetch_{name}(wx1, wy1);',
+              '    float pm = 1.0 - p;',
+              '    float qm = 1.0 - q;',
+              '    float pm2 = pm * pm;',
+              '    float qm2 = qm * qm;',
+              '    float p2 = p * p;',
+              '    float q2 = q * q;',
+              '    float d0 = pm2 + qm2;',
+              '    float d1 = p2 + qm2;',
+              '    float d2 = pm2 + q2;',
+              '    float d3 = p2 + q2;',
+              '    float w0 = 1.0 / max(d0, 1e-12);',
+              '    float w1 = 1.0 / max(d1, 1e-12);',
+              '    float w2 = 1.0 / max(d2, 1e-12);',
+              '    float w3 = 1.0 / max(d3, 1e-12);',
+              '    float s01 = w0 + w1;',
+              '    float s012 = s01 + w2;',
+              '    float s = s012 + w3;',
+              '    vec4 a0 = c0 * w0;',
+              '    vec4 a1 = c1 * w1;',
+              '    vec4 a2 = c2 * w2;',
+              '    vec4 a3 = c3 * w3;',
+              '    vec4 t01 = a0 + a1;',
+              '    vec4 t012 = t01 + a2;',
+              '    vec4 t = t012 + a3;',
+              '    vec4 c = t / s;']
+    elif filt == 'BILINEAR':
+        L += _uv_clamp_lines(wrap)                        # C077
+        L += [f'    float fx = {_uvx(wrap)} * {_f(w)} - 0.5;',
+              f'    float fy = {_uvy(wrap)} * {_f(h)} - 0.5;',
               '    float x0 = floor(fx);',
               '    float y0 = floor(fy);',
               '    float tx = fx - x0;',
-              '    float ty = fy - y0;',
-              '    float x1 = x0 + 1.0;',
+              '    float ty = fy - y0;']
+        if frac_bits:
+            L += _frac_lines(frac_bits)                  # C080
+        L += ['    float x1 = x0 + 1.0;',
               '    float y1 = y0 + 1.0;',
               f'    float wx0 = {_wrap_expr("x0", w, wrap)};',
               f'    float wx1 = {_wrap_expr("x1", w, wrap)};',
@@ -1557,11 +2214,21 @@ def _texture_sampler(name, tex, filt, wrap):
               f'    vec4 c00 = hal_fetch_{name}(wx0, wy0);',
               f'    vec4 c10 = hal_fetch_{name}(wx1, wy0);',
               f'    vec4 c01 = hal_fetch_{name}(wx0, wy1);',
-              f'    vec4 c11 = hal_fetch_{name}(wx1, wy1);',
-              '    vec4 c = mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);']
+              f'    vec4 c11 = hal_fetch_{name}(wx1, wy1);']
+        L += _border_select(wrap, 'c00', 'c10', 'c01', 'c11', _f(w), _f(h))
+        if frac_bits or wrap == 'BORDER':
+            # the CPU's own lerp order: bitwise, unlike mix() (C080, C077)
+            L += ['    vec4 top = c00 + (c10 - c00) * tx;',
+                  '    vec4 bot = c01 + (c11 - c01) * tx;',
+                  '    vec4 c = top + (bot - top) * ty;']
+        else:
+            L += ['    vec4 c = mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);']
+    else:
+        raise ValueError(f'no GLSL sampler for {filt}')
     if wrap == 'CLIP':
         L.append('    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || '
                  'uv.y > 1.0) { c = vec4(0.0); }')
+    L += _colorkey_lines(tex, opts)                        # C083
     L += ['    return c;', '}']
     return '\n'.join(L) + '\n'
 
@@ -1829,7 +2496,8 @@ def _cel_key_source(consts, bake):
     if bake.get('__cel_field') and float(bake.get('cel_ss', 0.0) or 0.0) > 1e-6:
         lines.append('    hal_sv = hal_sv * (1.0 - hal_cel.r '
                      '* clamp(s.cel_ss, 0.0, 1.0));')
-    lines += ['    vec4 ds = hal_evaluate(hal_model_i, s, N, L, V);',
+    lines += ['    vec3 hal_vs = ' + viewer_expr(consts, bake) + ';',
+              '    vec4 ds = hal_evaluate(hal_model_i, s, N, L, hal_vs);',
               '    vec3 hal_dcon = vec3(0.0);',
               '    vec3 hal_scon = vec3(0.0);']
     closed = _cel_composition(lines, bake, consts, True, True)
@@ -1867,7 +2535,57 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
     col = _lref(i, 2, 'rgb') if use_tx else \
         _v3(getattr(light, 'color', (1, 1, 1)))
     energy = float(getattr(light, 'energy', 1.0))
-    lines = ['    {']
+    lines = ['    {',
+             # R251 F011: the viewer the reflectance models take -- the
+             # true eye vector, or the frame's camera axis (one texel)
+             f'    vec3 hal_vs = {viewer_expr(consts, bake)};']
+    if kind == 'SPOT' and getattr(light, 'screen_spot', False):
+        # R251 F015: the Model 3 screen spotlight, exactly light_surface's
+        # early branch. The lamp lives on the SCREEN: no block at all on
+        # a secondary (hit) or layer pass (the CPU's px is None there,
+        # A10) and none under a fixed cel key (it casts no shadow, A53).
+        # Values ride hal_lights texels 6-7 (per frame); depth is the
+        # F000 expression on the view row (hal_fogtab texel 3, so the
+        # frame's consts['fogtab'] rule must cover a screen-spot lamp).
+        if bake.get('__cel_key') or not consts.get('__screen_pass', True):
+            return []
+        w_px, h_px = consts['resolution']
+        r = {'cx': _lref(i, 6, 'x'), 'cy': _lref(i, 6, 'y'),
+             'w': _lref(i, 6, 'z'), 'h': _lref(i, 6, 'w'),
+             'start': _lref(i, 7, 'x'), 'aext': _lref(i, 7, 'y')}
+        lines += [
+            f'    int ss_ix = int(vUV.x * {_f(float(w_px))});',
+            f'    int ss_iy = int(vUV.y * {_f(float(h_px))});',
+            '    float ss_px = float(ss_ix);',
+            '    float ss_py = float(ss_iy);',
+            '    vec3 ss_dp = P - hal_eye;',
+            '    vec3 ss_r = texelFetch(hal_fogtab, ivec2(3, 0), 0).xyz;',
+            '    float ss_dz = ss_dp.x * ss_r.x;',
+            '    ss_dz += ss_dp.y * ss_r.y;',
+            '    ss_dz += ss_dp.z * ss_r.z;',
+            '    float ss_depth = abs(ss_dz);']
+        lines += screen_spot_glsl(r)
+        lines += [
+            f'    vec3 ss_col = {col} * {_lref(i, 0, "w")};',
+            '    vec3 hal_sst = (s.diffuse * s.diffuse_level) * ss_col;',
+            '    hal_sst = hal_sst * ss_lobe;',
+            '    hal_sst = hal_sst * 0.318309886;',
+            '    vec3 ss_fog = ss_col * (ss_en * ss_el);']
+        link_ss = (consts.get('light_links') or {}).get(i)
+        if link_ss:
+            tests = ' + '.join(f'((abs(td.y - {_f(float(o))}) < 0.5) '
+                               '? 1.0 : 0.0)'
+                               for o in link_ss['objects'])
+            lines.append(f'    float hal_lk{i} = min({tests}, 1.0);')
+            mask = f'hal_lk{i}' \
+                if str(link_ss.get('mode', 'EXCLUDE')).upper() == 'ONLY' \
+                else f'(1.0 - hal_lk{i})'
+            lines += [f'    hal_sst = hal_sst * {mask};',
+                      f'    ss_fog = ss_fog * {mask};']
+        lines += ['    total += hal_sst;',
+                  '    hal_spotfog += ss_fog;',
+                  '    }']
+        return lines
     ck = (consts.get('cookies') or {}).get(i)
     if kind in ('SUN', 'HEMI'):
         d = np.asarray(light.direction, np.float32)
@@ -1900,11 +2618,41 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
         lines += [f'    vec3 delta = {pos} - P;',
                   '    float dist = max(length(delta), 1e-6);',
                   '    vec3 L = delta / dist;']
+        dmode = str(getattr(light, 'decay', 'DEFAULT') or 'DEFAULT')
+        if dmode == 'DEFAULT':
+            dmode = str(consts['falloff_default'])
         if kind == 'AREA':
             # lamp_get_visibility skips its falloff switch for LA_AREA:
             # visifac stays 1.0 and distance speaks only through the
             # form factor -- exactly the CPU sample()'s area branch
             lines.append('    float att = 1.0;')
+        elif dmode in ('GL_3TERM', 'POV_FADE_LINEAR', 'POV_FADE_SQUARE',
+                       'GX_GENTLE', 'GX_MEDIUM', 'GX_STEEP'):
+            # R251 F013: the GL / POV / GX decay laws, one op per
+            # statement, exactly lights.decay_law (the mode is already
+            # _light_sig structure; D, the sliders and the GX
+            # coefficients are texels)
+            from ..core import lights as _LI
+            if use_tx:
+                drefs = {'D': _lref(i, 3, 'y'), 'ld1': _lref(i, 3, 'z'),
+                         'ld2': _lref(i, 3, 'w'), 'k1': _lref(i, 5, 'y'),
+                         'k2': _lref(i, 5, 'z')}
+            else:
+                _k1, _k2 = _LI.gx_dist_coeffs(light, dmode)
+                drefs = {'D': _f(max(float(getattr(light, 'decay_end',
+                                                   25.0)), 1e-6)),
+                         'ld1': _f(float(getattr(light, 'decay_ld1', 0.0)
+                                         or 0.0)),
+                         'ld2': _f(float(getattr(light, 'decay_ld2', 0.0)
+                                         or 0.0)),
+                         'k1': _f(_k1), 'k2': _f(_k2)}
+            lines += decay_law_glsl(dmode, drefs)
+            if getattr(light, 'bi_sphere', False):
+                # LA_SPHERE outside the falloff switch, exactly
+                # _attenuation's wrap
+                _D = drefs['D']
+                lines.append(f'    att = (max(dist, 0.0) < {_D}) ? (att '
+                             f'* (({_D} - max(dist, 0.0)) / {_D})) : 0.0;')
         else:
             lines.append(
                 f'    float att = '
@@ -1924,24 +2672,45 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
             sd_r = _lref(i, 1, 'xyz') if use_tx else _v3(sd)
             si_r = _lref(i, 1, 'w') if use_tx else _f(spotsi)
             bl_r = _lref(i, 2, 'w') if use_tx else _f(spotbl)
-            lines += [
-                f'    float cosang = -dot(L, {sd_r});',
-                f'    float spot_t = cosang - {si_r};',
-                '    float spot_f = 0.0;',
-                '    if (spot_t > 0.0) {']
-            if spotbl != 0.0:
-                # whether a blend EXISTS is structure; its width is a
-                # texel (crossing zero re-plans, dragging it does not)
-                lines += [
-                    f'        float spot_i = clamp(spot_t / '
-                    f'{bl_r}, 0.0, 1.0);',
-                    f'        float spot_s = (spot_t < {bl_r}) ? '
-                    '(3.0 * spot_i * spot_i - 2.0 * spot_i * spot_i '
-                    '* spot_i) : 1.0;',
-                    '        spot_f = spot_s * cosang;']
+            law = str(getattr(light, 'spot_law', 'BLENDER') or 'BLENDER')
+            lines.append(f'    float cosang = -dot(L, {sd_r});')
+            if law in ('GL11', 'POV', 'GX_FLAT', 'GX_COS', 'GX_COS2',
+                       'GX_SHARP', 'GX_RING1', 'GX_RING2'):
+                # R251 F012: the OpenGL 1.1 / POV-Ray / GX cone laws,
+                # exactly lights.spot_law_factor; the law and whether
+                # the exponent is nonzero are _light_sig structure, the
+                # exponent, POV's radius and the GX coefficients texels
+                exp_v = float(getattr(light, 'spot_exponent', 0.0) or 0.0)
+                if use_tx:
+                    srefs = {'si': si_r, 'exp': _lref(i, 4, 'x'),
+                             'cr': _lref(i, 4, 'y'), 'a0': _lref(i, 4, 'z'),
+                             'a1': _lref(i, 4, 'w'), 'a2': _lref(i, 5, 'x')}
+                else:
+                    from ..core import lights as _LI
+                    _cr, _a0, _a1, _a2 = _LI.spot_law_coeffs(light)
+                    srefs = {'si': si_r, 'exp': _f(np.float32(exp_v)),
+                             'cr': _f(_cr), 'a0': _f(_a0), 'a1': _f(_a1),
+                             'a2': _f(_a2)}
+                lines += spot_law_glsl(law, exp_v != 0.0, srefs)
             else:
-                lines += ['        spot_f = cosang;']
-            lines += ['    }']
+                lines += [
+                    f'    float spot_t = cosang - {si_r};',
+                    '    float spot_f = 0.0;',
+                    '    if (spot_t > 0.0) {']
+                if spotbl != 0.0:
+                    # whether a blend EXISTS is structure; its width is
+                    # a texel (crossing zero re-plans, dragging it does
+                    # not)
+                    lines += [
+                        f'        float spot_i = clamp(spot_t / '
+                        f'{bl_r}, 0.0, 1.0);',
+                        f'        float spot_s = (spot_t < {bl_r}) ? '
+                        '(3.0 * spot_i * spot_i - 2.0 * spot_i * spot_i '
+                        '* spot_i) : 1.0;',
+                        '        spot_f = spot_s * cosang;']
+                else:
+                    lines += ['        spot_f = cosang;']
+                lines += ['    }']
             if mode_bi:
                 # the combined visifac (att * spot) snaps at 0.001,
                 # exactly the CPU's sample()
@@ -2000,6 +2769,16 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
     bi = bi or {}
     rd = bi.get('ramp_dif')
     rs_ = bi.get('ramp_spec')
+    # R251 (LIGHT-B1 F011 / LIGHT-B2 F016-F018): the view vector the
+    # models take -- V, or ONE camera axis for the whole frame (hal_fogtab
+    # texel 227: OpenGL 1.1's infinite viewer, the Sega boards' R.z, the
+    # DS's line of sight) under Specular Viewer AXIS or for the console
+    # light units (models 32 / 35), exactly light_surface's Vs. The Hemi
+    # override keeps V, as the CPU's does.
+    _model_i = int(bake.get('__model_i', -1))
+    # (integrator) hal_vs is declared ONCE at the block's head -- LIGHT-B1's
+    # viewer_expr, which also selects the axis for the console models
+    _vs = 'hal_vs'
     if kind == 'HEMI':
         # BI's Hemi replaces the shaders on BOTH lobes, exactly
         # light_surface's override: the 0.5+0.5*N.L wrap and a wrapped
@@ -2021,12 +2800,16 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
         # .y is the flipped-normal twin, consumed by BI translucency
         lines += [
             f'    vec2 hal_ainp = hal_area_inp{i}(P, N);',
-            '    vec4 ds = hal_evaluate2(hal_model_i, s, N, L, V, '
-            'hal_ainp.x, hal_ainp.y, 1.0);',
-            '    ds.yzw *= hal_ainp.x;']
+            f'    vec4 ds = hal_evaluate2(hal_model_i, s, N, L, {_vs}, '
+            'hal_ainp.x, hal_ainp.y, 1.0);']
+        # R251: the console and POV finish terms sit BEFORE the area
+        # correction, exactly light_surface's order (spec * area_nd last)
+        lines += _console_finish_lines(kind, bake, consts, _model_i, i)
+        lines.append('    ds.yzw *= hal_ainp.x;')
     else:
         lines.append(
-            '    vec4 ds = hal_evaluate(hal_model_i, s, N, L, V);')
+            f'    vec4 ds = hal_evaluate(hal_model_i, s, N, L, {_vs});')
+        lines += _console_finish_lines(kind, bake, consts, _model_i, i)
     # the shadow term -- evaluated AFTER the shaders, exactly the CPU's
     # R167 order (SH.evaluate before visibility), and R177 adds the
     # CPU's own skip to the twin: the traversal runs ONLY where this
@@ -2091,6 +2874,43 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
         # receive fold, exactly light_surface's order
         lines.append('    hal_sv = hal_sv * (1.0 - hal_cel.r '
                      '* clamp(s.cel_ss, 0.0, 1.0));')
+    if getattr(light, 'only_shadow', False):
+        # R251 F014: Blender Internal's LA_ONLYSHADOW, exactly
+        # light_surface's hook -- the plain diffuse the lamp would have
+        # given, times (1 - vis)*(1 - shadow colour), subtracted; no
+        # specular, no ramp, no clamp; nothing when the lobe flags give
+        # no diffuse. Same association as the CPU:
+        # (((dif*col*level)*rad)*inv_pi)*dark. The block closes here:
+        # an only-shadow lamp never reaches the contribution tail.
+        if getattr(light, 'affect_diffuse', True) and \
+                not getattr(light, 'specular_only', False):
+            _oshc = tuple(getattr(light, 'shadow_color', (0.0, 0.0, 0.0))
+                          or (0.0, 0.0, 0.0))
+            lines += [
+                '    vec3 hal_osh = (ds.x * hal_dif_rgb * s.diffuse_level)'
+                ' * rad;',
+                '    hal_osh = hal_osh * 0.318309886;',
+                '    vec3 hal_osd = vec3(1.0 - hal_sv);']
+            if max(_oshc) > 0.0:
+                lines.append(f'    hal_osd = hal_osd * (vec3(1.0) - '
+                             f'{_v3(_oshc)});')
+            lines.append('    hal_osh = hal_osh * hal_osd;')
+            link_os = (consts.get('light_links') or {}).get(i)
+            if link_os:
+                tests = ' + '.join(f'((abs(td.y - {_f(float(o))}) < 0.5) '
+                                   '? 1.0 : 0.0)'
+                                   for o in link_os['objects'])
+                lines.append(f'    float hal_lk{i} = min({tests}, 1.0);')
+                mask = f'hal_lk{i}' \
+                    if str(link_os.get('mode', 'EXCLUDE')).upper() == 'ONLY' \
+                    else f'(1.0 - hal_lk{i})'
+                lines.append(f'    hal_osh = hal_osh * {mask};')
+            if (bi or {}).get('result_mode'):
+                lines.append('    hal_dacc -= hal_osh;')
+            else:
+                lines.append('    total = total - hal_osh;')
+        lines.append('    }')
+        return lines
     lines.append('    vec3 hal_dcon = vec3(0.0);')
     lines.append('    vec3 hal_scon = vec3(0.0);')
     anime = bool(bake.get('__anime'))
@@ -2265,6 +3085,498 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
     return lines
 
 
+def fog_material_dials(bake):
+    """R251 LIGHT-A2 (F006): True when this material's bake carries a
+    non-default fog dial (Fog Burn-Through, Fog Bias, or Fog Bank 1) --
+    the per-material STRUCTURE decision core/fog.material_dials makes
+    per point on the CPU. A material with a dial calls the five-argument
+    hal_fog; every other material keeps the two-argument call."""
+    if not bake:
+        return False
+    burn = float(bake.get('fog_burn', 0.0) or 0.0)
+    bias = float(bake.get('fog_bias', 0.0) or 0.0)
+    bank = float(bake.get('fog_bank', 0.0) or 0.0)
+    import numpy as np
+    return burn != 0.0 or bias != 0.0 or float(np.rint(bank)) >= 1.0
+
+
+def FOG_BACKDROP_SAMPLER(consts):
+    """R251 LIGHT-A2 (F008): whether the pass declares and binds the
+    hal_backdrop texture -- exactly when it carries the hal_fog
+    definition under a BACKDROP fog target (assemble_frame emits the
+    definition on every pass of a fogged plan)."""
+    return bool(consts.get('fogtab')) and bool(consts.get('fog')) \
+        and str((consts.get('fog') or {}).get('source', 'FIXED')) == 'BACKDROP'
+
+
+def FOG_CALL(consts, bake):
+    """R251 LIGHT-A2 (F006): the hal_fog CALL the tail emits. A material
+    with a fog dial hands its three values (hal_mats texels through
+    _mv: a slider drag re-uploads a row, never recompiles); every other
+    material emits the wave-1 call verbatim."""
+    args = ['total', 'P']
+    if fog_material_dials(bake):
+        args += [_mv(consts, float(bake.get('fog_burn', 0.0) or 0.0)),
+                 _mv(consts, float(bake.get('fog_bias', 0.0) or 0.0)),
+                 _mv(consts, float(bake.get('fog_bank', 0.0) or 0.0))]
+    if (consts.get('fog') or {}).get('spot'):
+        # F015's fog half: the screen spotlights' lobe accumulator the
+        # lamp loop declares on a lit primary pass (LIGHT-B1's
+        # hal_spotfog); a shadeless pass has no loop and hands zeros
+        args.append('vec3(0.0)' if bake.get('__shadeless') else 'hal_spotfog')
+    if len(args) == 2:
+        return '    total = hal_fog(total, P);'
+    return '    total = hal_fog(' + ', '.join(args) + ');'
+
+
+def FOG_GLSL(consts, bake=None, em=None):
+    """R251: `hal_fog(rgb, P)` -- the GLSL twin of core/fog.py's `factor`
+    + `blend`, one op per statement in the CPU's float32 order.
+
+    STRUCTURE (which bracketed lines are emitted) comes from
+    `consts['fog']` (core/fog.structure: mode, vertex, bands, height,
+    table, dither, depth, ortho; wave 2: range_adjust, face, source,
+    bank1, turb) and is in the plan signature; VALUES ride the
+    `hal_fogtab` data texture (core/fog.pack_fog_texels, texelFetch
+    only; the sampler is declared by assemble_frame under
+    `consts['fogtab']`, never here), the backdrop target rides
+    `hal_backdrop` (F008) and a material's fog dials arrive as the
+    call's three extra arguments (F006, `FOG_CALL`; the definition is
+    then `vec3 hal_fog(vec3 rgb, vec3 P, float fburn, float fbias,
+    float fbank)`, otherwise the wave-1 `vec3 hal_fog(vec3 rgb, vec3 P)`).
+    `em` is the pass's Emitter: F010's turbulence needs the pattern
+    library (PRIM_GLSL) inlined exactly once per pass -- the once-guard
+    is `'__pt_prims' in em.once` (gpu/emit._need_prims's key, A36).
+    Accepted subset only: no `int/int`, no `%` (`& 3`), `roundEven` for
+    np.round, `precise` where a driver could contract a sum of products.
+    Bitwise the CPU in the simulator; on the driver `exp`, `atan`,
+    `sqrt` and `/` are its own roundings (the EXP fog's and the LINEAR
+    fog's existing class) and the blend is 1 ULP unless `precise` is
+    honoured."""
+    fog = consts.get('fog') or {}
+    mode = str(fog.get('mode', 'LINEAR'))
+    table = str(fog.get('table', 'NONE'))
+    import numpy as np
+    w, h = consts['resolution']
+    f32 = np.float32
+    dials = fog_material_dials(bake)
+    bank1 = bool(fog.get('bank1')) and dials
+    radj = bool(fog.get('range_adjust')) and not bool(fog.get('ortho'))
+    backdrop = str(fog.get('source', 'FIXED')) == 'BACKDROP'
+    turb = bool(fog.get('turb'))
+    need_px = table == 'VOODOO64' or radj or backdrop
+    # F006: the curve reads the point's bank (texel 5 / 6) or texel 0
+    B = 'fpb' if bank1 else 'fp0'
+    G = 'fgb' if bank1 else 'fpg'
+    prefix = ''
+    if turb:
+        # F010: the pattern library once per pass (A36)
+        from .procedural import PRIM_GLSL
+        if em is None:
+            prefix = PRIM_GLSL + '\n'
+        elif '__pt_prims' not in em.once:
+            em.once.add('__pt_prims')
+            prefix = PRIM_GLSL + '\n'
+    spot = bool(fog.get('spot'))
+    params = 'vec3 rgb, vec3 P'
+    if dials:
+        params += ', float fburn, float fbias, float fbank'
+    if spot:
+        params += ', vec3 fspot'
+    sig = 'vec3 hal_fog(' + params + ')'
+    # (the wave-1 form, for the MARKER and the reader: vec3 hal_fog(vec3 rgb, vec3 P))
+    L = [sig,
+         '{',
+         '    vec4 fp0 = texelFetch(hal_fogtab, ivec2(0, 0), 0);'
+         '   // start, end, span, density',
+         '    vec4 fp1 = texelFetch(hal_fogtab, ivec2(1, 0), 0);'
+         '   // col.rgb * ambient, bands',
+         '    vec4 fp2 = texelFetch(hal_fogtab, ivec2(2, 0), 0);'
+         '   // top, falloff, near, k',
+         '    vec4 fp3 = texelFetch(hal_fogtab, ivec2(3, 0), 0);'
+         '   // job.view[2, :3], 0',
+         '    vec4 fp4 = texelFetch(hal_fogtab, ivec2(4, 0), 0);'
+         '   // ambient, cx, k, spot',
+         '    vec3 dP = P - hal_eye;',
+         '    precise float dz = dP.x * fp3.x;',
+         '    dz = dz + dP.y * fp3.y;',
+         '    dz = dz + dP.z * fp3.z;',
+         '    precise float d = abs(dz);']
+    if need_px:
+        # the screen pixel (the F002 dither, the F004 column, the F008
+        # backdrop texel): int(vUV * size), the fragment's own pixel
+        L += [f'    int sx = int(vUV.x * {_f(float(w))});',
+              f'    int sy = int(vUV.y * {_f(float(h))});']
+    if fog.get('face'):
+        # [fog_face, F005]: the polygon's mean corner depth replaces the
+        # pixel's (the G-buffer's own corners, slot 0 = world position;
+        # the fixed corner order 0, 1, 2; the mean as ONE multiply)
+        L += ['    HalcyonFragment ff = hal_read_gbuffer(vUV);']
+        for c in range(3):
+            L += [f'    vec3 c{c} = hal_fetch_attr(ff.tri, {c}, 0).xyz;',
+                  f'    vec3 e{c} = c{c} - hal_eye;',
+                  f'    precise float z{c} = e{c}.x * fp3.x;',
+                  f'    z{c} = z{c} + e{c}.y * fp3.y;',
+                  f'    z{c} = z{c} + e{c}.z * fp3.z;',
+                  f'    z{c} = abs(z{c});']
+        L += ['    float ds = z0 + z1;',
+              '    ds = ds + z2;',
+              f'    d = ds * {_f(f32(1.0 / 3.0))};']
+    if radj:
+        # [range_adjust, F004]: GX_InitFogAdjTable's secant of the
+        # column, interpolated between the ten knots (texels 8..17;
+        # K[-1] = 1 at the centre), scales the planar depth
+        L += ['    float dxp = float(sx) + 0.5;',
+              '    dxp = dxp - fp4.y;',
+              '    dxp = abs(dxp);',
+              '    float tt = dxp * fp4.z;',
+              '    float jj = floor(tt);',
+              '    jj = min(jj, 9.0);',
+              '    int ji = int(jj);',
+              '    float kb = texelFetch(hal_fogtab, ivec2(8 + ji, 0), 0).x;',
+              '    float ka = (ji == 0) ? 1.0 : texelFetch(hal_fogtab, '
+              'ivec2(7 + ji, 0), 0).x;',
+              '    float fr = tt - jj;',
+              '    float kd = kb - ka;',
+              '    kd = kd * fr;',
+              '    precise float k = ka + kd;',
+              '    d = d * k;']
+    if fog.get('vertex'):
+        # [fog_vertex, structure; skipped by GTE_1Z / tables / fog_face]
+        L += ['    float d8 = d * 8.0;',
+              '    d8 = roundEven(d8);',
+              '    d = d8 / 8.0;']
+    L.append('    d = max(d, 0.0);')
+    if str(fog.get('depth', 'W')) == 'Z':
+        # [fog_depth Z, F007]: D3D's z' = f/(f-n) * (1 - n/z), or the
+        # linear ortho z-buffer
+        if fog.get('ortho'):
+            L += ['    float tz = d - fp2.z;',
+                  '    d = tz * fp2.w;']
+        else:
+            L += [f'    float ddz = max(d, {_f(f32(1e-6))});',
+                  '    float qz = fp2.z / ddz;',
+                  '    float tz = 1.0 - qz;',
+                  '    d = fp2.w * tz;']
+
+    def turb_lines(var):
+        # [turbulence, F010]: POV's one read at the segment's middle,
+        # faded by exp(-distance * density), scales the distance `var`
+        return ['    vec4 fpt = texelFetch(hal_fogtab, ivec2(226, 0), 0);',
+                '    vec3 pm = hal_eye + P;',
+                '    pm = pm * 0.5;',
+                '    pm = pm * fpt.x;',
+                '    float tu = hal_pt_turb(pm, 6, 2.0, 0.5);',
+                f'    float te = -{var};',
+                '    te = te * fp0.w;',
+                '    float tk = exp(te);',
+                '    float tuq = tu * fpt.y;',
+                '    tuq = min(tuq, 1.0);',
+                '    float tkk = tk * tuq;',
+                '    float tsc = 1.0 - tkk;',
+                f'    {var} = {var} * tsc;']
+    if turb and mode != 'GROUND':
+        L += turb_lines('d')
+    L.append('    precise float f = 1.0;')
+    if bank1:
+        # [bank, F006]: the material's bank index (half-to-even, 0..1)
+        # selects texel 5's Start / End / span when bank 1 is live
+        L += ['    float bkf = roundEven(fbank);',
+              '    bkf = clamp(bkf, 0.0, 1.0);',
+              '    int bk = int(bkf);',
+              '    vec4 fp5 = texelFetch(hal_fogtab, ivec2(5, 0), 0);',
+              '    float ub = (bk == 1) ? fp5.w : 0.0;',
+              '    vec4 fpb = (ub > 0.5) ? fp5 : fp0;']
+    if mode == 'GROUND':
+        # [GROUND, F009]: POV's ComputeGroundFogDepth on the eye -> P
+        # segment; every candidate computed, the select picks (A32)
+        L += ['    vec4 fpo = texelFetch(hal_fogtab, ivec2(225, 0), 0);',
+              '    float gy1 = fpo.z;',
+              '    float gy2 = P.z - fpo.x;',
+              '    gy2 = gy2 * fpo.y;',
+              '    float gsx = dP.x * dP.x;',
+              '    gsx = gsx + dP.y * dP.y;',
+              '    gsx = gsx + dP.z * dP.z;',
+              '    float gdd = sqrt(gsx);']
+        if turb:
+            L += turb_lines('gdd')
+        L += ['    float ga1 = atan(gy1);',
+              '    float ga2 = atan(gy2);',
+              '    float gmB = (ga2 - gy1) / (gy2 - gy1);',
+              '    float gmC = (ga1 - gy2) / (gy1 - gy2);',
+              '    float gmD = (ga1 - ga2) / (gy1 - gy2);',
+              '    float gq = gy1 * gy1;',
+              '    gq = gq + 1.0;',
+              '    float gmE = 1.0 / gq;',
+              '    float gm = ((gy1 <= 0.0) && (gy2 <= 0.0)) ? 1.0 : '
+              '((gy1 <= 0.0) ? gmB : ((gy2 <= 0.0) ? gmC : '
+              f'((abs(gy1 - gy2) > {_f(f32(1e-6))}) ? gmD : gmE)));',
+              '    float ge = gdd * gm;',
+              '    ge = ge * fp0.w;',
+              '    ge = -ge;',
+              '    f = exp(ge);']
+    elif table == 'VOODOO64':
+        # [VOODOO64, F002]: Glide's 64-entry w-table, MAME's shift chain
+        L += ['    float wv = max(d, 1.0);',
+              '    wv = min(wv, 65535.0);',
+              '    int e = 0;']
+        for k in range(1, 16):
+            L.append(f'    e = e + ((wv >= {_f(f32(2.0 ** k))}) ? 1 : 0);')
+        L.append('    float p = 1.0;')
+        for k in range(1, 16):
+            L.append(f'    p = (e >= {k}) ? p * 2.0 : p;')
+        L += ['    float r = p / wv;',
+              '    float m = 1.0 - r;',
+              '    m = m * 8.0;',
+              '    float fi = floor(m);',
+              '    int i = 4 * e + int(fi);',
+              '    float frac = m - fi;',
+              '    float fr8 = frac * 256.0;',
+              '    fr8 = floor(fr8);',
+              '    int frac8 = int(fr8);',
+              '    vec4 te = texelFetch(hal_fogtab, ivec2(32 + i, 0), 0);',
+              '    int ti = int(te.x);',
+              '    int dl = int(te.y);',
+              '    int dv = (dl * frac8) >> 6;']
+        if fog.get('dither'):
+            # [dither]: Voodoo2 fogMode bit 6, the 4x4 matrix at the pixel
+            L += ['    int dm = int(texelFetch(hal_fogtab, ivec2(240 + '
+                  '((sy & 3) * 4 + (sx & 3)), 0), 0).x);',
+                  '    dv = dv + dm;']
+        L += ['    dv = dv >> 4;',
+              '    int fbv = ti + dv + 1;',
+              '    float fop = float(fbv) * 0.00390625;',
+              '    f = 1.0 - fop;']
+    elif table == 'PVR128':
+        # [PVR128, F003]: the CLX2's log table on density / w
+        L += ['    vec4 fpg = texelFetch(hal_fogtab, ivec2(224, 0), 0);',
+              f'    float dd = max(d, {_f(f32(1e-6))});',
+              '    float invw = 1.0 / dd;',
+              '    float x = fpg.z * invw;',
+              f'    x = clamp(x, 1.0, {_f(f32(255.999985))});',
+              '    int e = 0;']
+        for k in range(1, 8):
+            L.append(f'    e = e + ((x >= {_f(f32(2.0 ** k))}) ? 1 : 0);')
+        L.append('    float p = 1.0;')
+        for k in range(1, 8):
+            L.append(f'    p = (e >= {k}) ? p * 2.0 : p;')
+        L += ['    float m = x / p;',
+              '    float mm = m - 1.0;',
+              '    float m4f = mm * 16.0;',
+              '    m4f = floor(m4f);',
+              '    int m4 = int(m4f);',
+              '    int idx = 16 * e + m4;',
+              '    float f8f = mm * 4096.0;',
+              '    f8f = floor(f8f);',
+              '    int f8 = int(f8f) - m4 * 256;',
+              '    vec4 te = texelFetch(hal_fogtab, ivec2(96 + idx, 0), 0);',
+              '    int hi = int(te.x);',
+              '    int lo = int(te.y);',
+              '    int a = (lo * f8 + hi * (255 - f8)) >> 8;',
+              '    f = float(255 - a) / 255.0;']
+    elif table == 'DS32':
+        # [DS32, F022]: melonDS's CalculateFogDensity on eye depth
+        L += ['    vec4 fpg = texelFetch(hal_fogtab, ivec2(224, 0), 0);',
+              '    float dt = d - fp0.x;',
+              '    dt = dt / fpg.w;',
+              '    dt = clamp(dt, 0.0, 32.0);',
+              '    float dfi = floor(dt);',
+              '    float dfr = dt - dfi;',
+              '    float d17 = dfr * 131072.0;',
+              '    d17 = floor(d17);',
+              '    int di = int(dfi);',
+              '    int dq = int(d17);',
+              '    int t0 = int(texelFetch(hal_fogtab, ivec2(256 + di, 0), '
+              '0).x);',
+              '    int t1 = int(texelFetch(hal_fogtab, ivec2(257 + di, 0), '
+              '0).x);',
+              '    int dsum = t0 * (131072 - dq);',
+              '    dsum = dsum + t1 * dq;',
+              '    int dD = dsum >> 17;',
+              '    dD = (dD >= 127) ? 128 : dD;',
+              '    float fop = float(dD) * 0.0078125;',
+              '    f = 1.0 - fop;']
+    elif mode == 'GTE_1Z':
+        # [GTE_1Z, F001]: affine in 1/z, floored to 4.12 (IR0); bank 1
+        # reads its own (A, B) from texel 6 (F006)
+        L += ['    vec4 fpg = texelFetch(hal_fogtab, ivec2(224, 0), 0);']
+        if bank1:
+            L += ['    vec4 fp6 = texelFetch(hal_fogtab, ivec2(6, 0), 0);',
+                  '    vec2 fgb = (ub > 0.5) ? fp6.xy : fpg.xy;']
+        L += [f'    float dd = max(d, {_f(f32(1e-6))});',
+              f'    float q = {G}.x / dd;',
+              f'    float t = q + {G}.y;',
+              '    t = clamp(t, 0.0, 1.0);',
+              '    float ir = t * 4096.0;',
+              '    ir = floor(ir);',
+              '    t = ir * 0.000244140625;',
+              '    f = 1.0 - t;']
+    elif mode == 'EXP':
+        L += ['    float e = -fp0.w;',
+              '    e = e * d;',
+              '    f = exp(e);']
+    elif mode == 'EXP2':
+        L += ['    float t = fp0.w * d;',
+              '    float t2 = t * t;',
+              '    float e = -t2;',
+              '    f = exp(e);']
+    elif mode == 'TABLE16':
+        L += [f'    float t = d - {B}.x;',
+              f'    t = t / {B}.z;',
+              '    t = clamp(t, 0.0, 1.0);',
+              '    float ft = t * 16.0;',
+              '    ft = floor(ft);',
+              '    ft = ft / 16.0;',
+              '    f = 1.0 - ft;']
+    else:
+        # LINEAR (and any mode without a branch)
+        L += [f'    f = {B}.y - d;',
+              f'    f = f / {B}.z;']
+    L.append('    f = clamp(f, 0.0, 1.0);')
+    if dials:
+        # [material fog, F006]: System 22's cz delta on the opacity, then
+        # Model 3's light modifier (the share that burns through)
+        L += ['    float op = 1.0 - f;',
+              '    op = op + fbias;',
+              '    op = clamp(op, 0.0, 1.0);',
+              '    float bt = 1.0 - fburn;',
+              '    op = op * bt;',
+              '    f = 1.0 - op;']
+    if fog.get('bands'):
+        # [bands >= 2, structure]: round-to-band
+        L += ['    float fb = f * fp1.w;',
+              '    fb = fb + 0.5;',
+              '    fb = floor(fb);',
+              '    f = fb / fp1.w;']
+    if fog.get('height'):
+        # [fog_height, structure]: the fog AMOUNT scales by the height
+        # falloff; h == 1 passes f through UNTOUCHED (an inert control
+        # must be inert), exactly apply_fog's np.where
+        L += ['    float above = P.z - fp2.x;',
+              '    above = max(above, 0.0);',
+              '    float hx = -above;',
+              '    hx = hx * fp2.y;',
+              '    float hh = exp(hx);',
+              '    float omf = 1.0 - f;',
+              '    omf = omf * hh;',
+              '    float f2 = 1.0 - omf;',
+              '    f = (hh >= 1.0) ? f : f2;']
+    if backdrop:
+        # [backdrop, F008]: the CPU's own backdrop at this pixel is the
+        # target (LightWave's Use Backdrop Color); not scaled by ambient
+        L += ['    vec3 col = texelFetch(hal_backdrop, ivec2(sx, sy), 0).rgb;']
+    else:
+        L += ['    vec3 col = fp1.xyz;']
+    if spot:
+        # [spot fog, F015]: Spotlight Fog x the screen spotlights' lobe
+        # (Supermodel's spotFogColor x fogAttenuation) joins the target
+        L += ['    vec3 sp = fp4.w * fspot;',
+              '    col = col + sp;']
+    L += ['    vec3 o = rgb * f;',
+          '    float g = 1.0 - f;',
+          '    o = o + col * g;',
+          '    return o;',
+          '}']
+    return prefix + '\n'.join(L) + '\n'
+
+
+def _console_finish_lines(kind, bake, consts, model_i, light_i=0):
+    """R251 (LIGHT-B2): the lines that follow the evaluate call in ONE
+    light's block, exactly light_surface's order after SH.evaluate --
+    the GX Sun-only gate (F016), the DS table highlight (F018), then the
+    POV-Ray finish dials on the scalar diffuse and the coloured
+    highlight (F019 brilliance, F020 crand, F021 metallic). Emitted for
+    the lamps that run the evaluate call (the Hemi override replaces
+    both lobes afterwards on both roads, so it takes none of these).
+    `light_i` is the lamp's index in the frame's light list (crand's
+    salt, light_surface's own `li`). Every statement is one operation in
+    the CPU's order."""
+    lines = []
+    if kind == 'HEMI':
+        return lines
+    if model_i == 32 and kind not in ('SUN', 'HEMI'):
+        # GX_AF_SPEC lit from directional lights only (GX_InitSpecularDir):
+        # a point or spot lamp adds no highlight on the GameCube
+        lines.append('    ds.yzw = vec3(0.0);')
+    if model_i == 35:
+        # GBATEK: HalfVector = (LightVector + LineOfSight) / 2, NOT
+        # normalised; ShininessLevel = max(0, -H.N)^2; then the 128-entry
+        # 8-bit shininess table (this material's row of hal_dstab, one
+        # `_f`-baked row per material), truncation as the hardware's
+        # index, the entry as a 0.8 fixed value (1/256). hal_vs is the
+        # fixed line of sight (texel 227). core/shading.ds_spec, line
+        # for line.
+        row = int(bake.get('__mat_id', 0))
+        lines += [
+            '    vec3 hal_dsh = L + hal_vs;',
+            '    hal_dsh = hal_dsh * 0.5;',
+            '    float hal_dsv = dot(N, hal_dsh);',
+            '    hal_dsv = max(hal_dsv, 0.0);',
+            '    hal_dsv = hal_dsv * hal_dsv;',
+            '    float hal_dsi = hal_dsv * 128.0;',
+            '    int hal_dsx = int(hal_dsi);',
+            '    hal_dsx = min(hal_dsx, 127);',
+            f'    float hal_dst = texelFetch(hal_dstab, ivec2(hal_dsx, '
+            f'{int(row)}), 0).r;',
+            '    ds.yzw = s.specular * (hal_dst * 0.00390625);']
+    if 24 <= model_i <= 31:
+        # the 3ds Max shaders keep their own laws (their diffuse carries
+        # its colour): the POV finish is inert there on both roads
+        return lines
+    if float(bake.get('brilliance', 1.0)) != 1.0:
+        # F019: POV's `if (Brilliance != 1.0) intensity = pow(fabs(cos),
+        # Brilliance)` on the model's diffuse scalar (SH.apply_brilliance);
+        # a per-material texel, the same np.power in the simulator
+        lines.append('    ds.x = (s.brilliance == 1.0) ? ds.x : '
+                     'pow(max(ds.x, 0.0), s.brilliance);')
+    if float(bake.get('crand', 0.0)) > 0.0:
+        # F020: POV's `intensity -= rand * Crand` per lamp, from the
+        # integer hash of the pixel and a salt (977 + 131 lamp + 7919
+        # seed, + 1013 frame under Crand Flickers per Frame), the salt
+        # wrapped to 31 bits exactly as light_surface wraps it -- the
+        # hash reads only the low 31 bits, so both roads hash ONE number
+        # whatever the seed. The pixel identity is the soft-shadow
+        # sampler's own (int(vUV * resolution)).
+        w, h = consts['resolution']
+        z0 = (977 + 131 * int(light_i) + 7919 * int(consts.get('seed', 0))) \
+            & 0x7fffffff
+        lines += [f'    int hal_csx = int(vUV.x * {_f(float(w))});',
+                  f'    int hal_csy = int(vUV.y * {_f(float(h))});',
+                  f'    int hal_cz = {int(z0)};']
+        if consts.get('crand_per_frame'):
+            lines += ['    hal_cz = hal_cz + int(hal_frame) * 1013;',
+                      '    hal_cz = hal_cz & 0x7fffffff;']
+        lines += ['    float hal_ch = hal_smp_hash3(hal_csx, hal_csy, '
+                  'hal_cz);',
+                  '    hal_ch = s.crand * hal_ch;',
+                  '    ds.x = ds.x - hal_ch;',
+                  '    ds.x = max(ds.x, 0.0);']
+    if float(bake.get('pov_metallic', 0.0)) > 0.0:
+        # F021: POV's ComputeMetallic -- x = acos(N.L)/(pi/2), F =
+        # 0.014567225/(x - 1.12)^2 - 0.011612903 clamped, colour *=
+        # 1 + M (1 - F)(pigment - 1) on the highlight. Every literal is
+        # the float32 of the CPU's own constant through _f (never
+        # hand-copied float64 digits); SH.pov_metallic_fresnel line for
+        # line.
+        import numpy as _np
+        lines += [
+            '    float hal_hx = clamp(dot(N, L), 0.0, 1.0);',
+            '    hal_hx = acos(hal_hx);',
+            f'    hal_hx = hal_hx * {_f(_np.float32(2.0 / _np.pi))};',
+            f'    float hal_hxm = hal_hx - {_f(_np.float32(1.12))};',
+            '    hal_hxm = hal_hxm * hal_hxm;',
+            f'    float hal_hF = {_f(_np.float32(0.014567225))} / hal_hxm;',
+            f'    hal_hF = hal_hF - {_f(_np.float32(0.011612903))};',
+            '    hal_hF = clamp(hal_hF, 0.0, 1.0);',
+            '    float hal_hm = 1.0 - hal_hF;',
+            '    hal_hm = hal_hm * s.pov_metallic;',
+            '    vec3 hal_ht = s.diffuse - vec3(1.0);',
+            '    hal_ht = hal_ht * hal_hm;',
+            '    hal_ht = hal_ht + vec3(1.0);',
+            '    ds.yzw = ds.yzw * hal_ht;']
+    return lines
+
+
 def perpix_names(bake):
     """R229: the per-pixel field names the assembler recorded on the
     bake (so the lamp lines can gate their structure on 'this field
@@ -2381,6 +3693,9 @@ BAKE_FIELDS = ('diffuse_level', 'specular_level', 'glossiness', 'roughness',
                'bi_slope', 'bi_transp_fresnel', 'bi_transp_blend',
                'bi_spectra', 'bi_cubic', 'bi_tangent', 'shadow_receive',
                'cast_only', 'shadows_only', 'opacity',
+               # R251 lighting: the period finish dials (F006, F019-F021)
+               'fog_burn', 'fog_bias', 'fog_bank', 'brilliance', 'crand',
+               'pov_metallic',
                # the anime/cel drivers (R218)
                'anime_th1', 'anime_soft1', 'anime_th2', 'anime_soft2',
                'anime_bias', 'anime_tones', 'anime_spec_size',
@@ -2604,8 +3919,10 @@ def per_pixel_fields(graph):
                 det_linked = True
             if nm == 'Diffuse Color' and sock.get('link'):
                 base_alpha = True
-        if game_linked and mode in ('ARCSYS', 'DBFZ', 'KAKAROT',
-                                    'SPARKING'):
+        if game_linked and mode in ('ARCSYS', 'DBFZ', 'KAKAROT'):
+            # (R246: SPARKING left this family -- its Game Texture is
+            # the Mask1 detail sheet, a colour multiply the emitter
+            # folds into the base; no field decodes from it)
             out['anime_mask'] = ('Game Texture', 'anime_arcsys_mask')
             out['anime_bias'] = ('Game Texture', 'anime_arcsys_bias')
             out['anime_spec_size'] = ('Game Texture',
@@ -2631,8 +3948,7 @@ def per_pixel_fields(graph):
             out['anime_mask'] = ('Game Texture', 'anime_zzz_mask')
             out['anime_bias'] = ('Game Texture', 'anime_zzz_bias')
             out['anime_spec_size'] = ('Game Texture', 'anime_zzz_size')
-        if det_linked and mode in ('ARCSYS', 'DBFZ', 'KAKAROT',
-                                   'SPARKING'):
+        if det_linked and mode in ('ARCSYS', 'DBFZ', 'KAKAROT'):
             out['anime_shadow1'] = ('Detail Texture', 'anime_sss')
         if bool(p.get('emission_alpha')) and base_alpha:
             out['emission'] = ('Diffuse Color', 'anime_emit')
@@ -2673,7 +3989,9 @@ def _assemble_height_pass(graph, mat_id, bump_node, consts, textures,
     em.resolution = consts.get('resolution')
     em.camera = consts.get('camera')
     em.uv_names = tuple(consts.get('uv_names') or ())
+    em.color_name = str(consts.get('color_name') or '')
     em.has_vcol = bool(consts.get('has_vcol'))
+    em.seed = int(consts.get('seed', 0) or 0)          # R251 C099 (MAT-B)
     em.programs = programs if programs is not None else {}
     try:
         expr = em.input(bump_node, 'Height', 'float')
@@ -2736,20 +4054,24 @@ def _assemble_height_pass(graph, mat_id, bump_node, consts, textures,
             wrap = {'REPEAT': 'REPEAT', 'EXTEND': 'EXTEND', 'CLIP': 'CLIP',
                     'MIRROR': 'MIRROR'}.get(meta.get('extension', 'REPEAT'),
                                             'REPEAT')
+        opts = _tex_opts(consts)                                   # R251
         if filt not in SUPPORTED_TEX_FILTERS:
             return None, (f'the {filt} texture filter is not in the '
                           f'deferred pass yet')
-        if filt == 'TRILINEAR':
-            # the height pre-pass has no footprint field; the CPU height
-            # image is exact by construction, so exotic-filtered heights
-            # take that path instead of a wrong mip
+        if filt in FOOTPRINT_TEX_FILTERS or (
+                filt in PYRAMID_FILTERS
+                and (opts['lod_sharpen'] or opts['mip_select'] != 'FILTER')):
+            # the height pre-pass has no footprint field, and the CPU's
+            # height chain runs through job.context (R:5289) WITH the
+            # footprint: every footprint filter and level road takes the
+            # proven CPU height-image pre-pass, as TRILINEAR did
             return '__CPU__', {'cpu': True, 'node': bump_node.get('id'),
-                               'why': 'a TRILINEAR-filtered height chain '
-                                      'evaluates on the CPU into the '
-                                      'height pre-pass',
+                               'why': f'a {filt} footprint in a height chain '
+                                      'evaluates on the CPU into the height '
+                                      'pre-pass',
                                'samplers': [], 'textures': {},
                                'frame_uniforms': [], 'uses_screen': False}
-        tex_fns.append(_texture_sampler(sname, tex, filt, wrap))
+        tex_fns.append(_texture_sampler(sname, tex, filt, wrap, opts))
         tex_binds[sname] = key
         replacements.append((f'texture({sname},', f'hal_sample_{sname}('))
     for old, new in replacements:
@@ -2933,6 +4255,10 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     _cartoon_idx = next((k for k, m in enumerate(_MI)
                          if m[0] == 'CARTOON'), -1)
     bake['__cartoon'] = int(model_index) == _cartoon_idx
+    # R251 (LIGHT-B2): the model index and the material id, for the
+    # per-light block's console branches (GX gate, DS table row)
+    bake['__model_i'] = int(model_index)
+    bake['__mat_id'] = int(mat_id)
     # R243: the Max shaders the light loop must not scale by Specular
     # Level (shading.LEVEL_FREE_MODELS), by index
     from ..core.shading import LEVEL_FREE_MODELS as _LF
@@ -2969,7 +4295,9 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     em.secondary = secondary
     em.camera = consts.get('camera')
     em.uv_names = tuple(consts.get('uv_names') or ())
+    em.color_name = str(consts.get('color_name') or '')
     em.has_vcol = bool(consts.get('has_vcol'))
+    em.seed = int(consts.get('seed', 0) or 0)          # R251 C099 (MAT-B)
     # {} is authoritative "nothing compiled" (code nodes read as zeros, the
     # CPU's own answer); the frame path always knows, so it never passes None
     em.programs = programs if programs is not None else {}
@@ -2994,8 +4322,7 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
                 if gtype.startswith('anime_'):
                     p = mnode.get('props', {})
                     mode = str(p.get('compat', 'GENERIC'))
-                    kk = {'KAKAROT': ' + 0.06', 'SPARKING': ' - 0.04'} \
-                        .get(mode, '')
+                    kk = {'KAKAROT': ' + 0.06'}.get(mode, '')
                     vao = ''
                     if bool(p.get('use_vertex_ao')) and em.has_vcol:
                         vao = ' + (hal_vcol.r - 1.0) * 2.0'
@@ -3104,6 +4431,8 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     tex_fns = []
     tex_binds = {}
     tex_binds_mip = {}
+    tex_binds_sat = {}            # R251 C088 (TEX-2): summed-area atlases
+    needs_lod = {}                # R251: sampler -> CPU-decided LOD field key (TEX-2)
     needs_uvgrad = []
     src = body + ('\n' if body else '')
     replacements = []
@@ -3139,37 +4468,42 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
             wrap = {'REPEAT': 'REPEAT', 'EXTEND': 'EXTEND', 'CLIP': 'CLIP',
                     'MIRROR': 'MIRROR'}.get(meta.get('extension', 'REPEAT'),
                                             'REPEAT')
+        opts = _tex_opts(consts)                           # R251 texture pack (coded shaders too: B0.4)
         if filt not in SUPPORTED_TEX_FILTERS:
             return None, (f'the {filt} texture filter is not in the '
                           f'deferred pass yet')
-        if filt == 'TRILINEAR':
-            # the footprint rules, exactly the CPU's: a raw flat UV
-            # lookup on a SCREEN point filters with the mip footprint; a
-            # linked Vector chain, a coded-shader image, or a ray hit
-            # (secondary pass -- no pixel footprint) samples the top
-            # level, which is what lod=None does on the CPU
-            fp = bool(meta.get('footprint')) and not meta.get('code') \
-                and not secondary
-            if fp and layer:
-                return None, ('the TRILINEAR footprint is not in the '
-                              'layer passes yet (the opaque frame has '
-                              'it); this glass shades on the CPU')
-            if fp:
-                if not needs_uvgrad:
-                    tex_fns.append('uniform sampler2D hal_uvgrad;\n')
-                _atlas_px, levels = mip_atlas(tex)
-                tex_fns.append(_mip_sampler(
-                    sname, tex, wrap, levels,
-                    int(consts.get('tex_aniso', 1) or 1),
-                    float(consts.get('tex_mip_bias', 0.0) or 0.0)))
-                tex_binds_mip[sname] = key
-                needs_uvgrad.append(sname)
-            else:
-                tex_fns.append(_texture_sampler(sname, tex, 'BILINEAR',
-                                                wrap))
-                tex_binds[sname] = key
+        # the footprint rules, exactly the CPU's: a raw flat UV lookup on
+        # a SCREEN point filters with the mip footprint; a linked Vector
+        # chain, a coded-shader image, or a ray hit (secondary pass -- no
+        # pixel footprint) samples the top level, which is what lod=None
+        # does on the CPU. The predicate is sample_opts' (0.1 A / E)
+        wants_fp = filt in FOOTPRINT_TEX_FILTERS or (
+            filt in PYRAMID_FILTERS
+            and (opts['lod_sharpen'] or opts['mip_select'] != 'FILTER'))
+        fp = wants_fp and bool(meta.get('footprint')) and not meta.get('code') \
+            and not secondary
+        if fp and layer:
+            return None, (f'the {filt} footprint is not in the layer '
+                          'passes yet (the opaque frame has it); this '
+                          'glass shades on the CPU')
+        if fp:
+            lod_key = _lod_field_key(opts, tex)     # R251 TEX-2: the level roads emit below
+            if not needs_uvgrad:
+                tex_fns.append('uniform sampler2D hal_uvgrad;\n')
+            if filt == 'SUMMED_AREA' and not tex_binds_sat:
+                tex_fns.append('uniform sampler2D hal_recip256;\n')      # declared ONCE per pass, as hal_uvgrad is (A12.1)
+            if lod_key is not None and lod_key not in needs_lod.values():
+                tex_fns.append(f'uniform sampler2D {_lod_uniform(lod_key)};\n')
+            tex_fns.append(_footprint_sampler(
+                sname, tex, filt, wrap, opts,
+                float(consts.get('tex_mip_bias', 0.0) or 0.0), lod_key))
+            (tex_binds_sat if filt == 'SUMMED_AREA' else tex_binds_mip)[sname] = key
+            needs_uvgrad.append(sname)
+            if lod_key is not None:
+                needs_lod[sname] = lod_key
         else:
-            tex_fns.append(_texture_sampler(sname, tex, filt, wrap))
+            tex_fns.append(_texture_sampler(
+                sname, tex, NOFOOTPRINT_FILTER.get(filt, filt), wrap, opts))
             tex_binds[sname] = key
         # the emitter sampled with texture(); the frame pass samples with
         # the arithmetic above, so the same pixel comes back on any driver
@@ -3309,6 +4643,9 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
             f'    return texelFetch(hal_vlight, ivec2(vi % {vside}, '
             f'vi / {vside}), 0).rgb;\n'
             '}\n')
+        # R251 (MAT-A): hal_vlight_fetch4 + the period combine's function
+        # ('' for every pre-1.90 model: the text above is unchanged)
+        vlight_fns += GCB.combine_fns(bake.get('__model'), consts, vside)
         vlight_spec = {'rate': str(vertex_rate), 'side': int(vside),
                        'mat': int(mat_id)}
         env_lines = []                     # the corners carry the env term
@@ -3413,7 +4750,11 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
             trav = trav.replace(cname, _f(float(sides[cname])))
         shadow_fns.append(trav)
         samplers += ['hal_bvh', 'hal_btris']
-    if soft_any or ao_spec or rad_gather:
+    # R251 (LIGHT-B2 F020, B13): a crand material reads hal_smp_hash3 --
+    # the primitives (and the hal_circle sampler they declare) are
+    # appended exactly once, here, whatever else the frame needs
+    crand_on = float(bake.get('crand', 0.0)) > 0.0
+    if soft_any or ao_spec or rad_gather or crand_on:
         # the deterministic-sampling primitives: the pattern hash under a
         # sampling name (a material may inline the pattern library too),
         # and the shared unit-circle table
@@ -3567,9 +4908,42 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
             '    return texelFetch(hal_lights, ivec2(t, 0), 0);\n'
             '}\n')
         samplers.append('hal_lights')
+    if int(model_index) == 35 and lights and not (vertex_rate or shadeless):
+        # R251 (LIGHT-B2 F018): the DS shininess table rides a data
+        # texture declared ONLY in a DS pass (the shared GLSL dispatch
+        # carries no sampler; a PHONG pass in the same frame declares
+        # it not). The table is per material: a per-pixel Glossiness
+        # chain has no row and refuses by name.
+        if 'glossiness' in perpix_exprs:
+            return None, ("the DS shininess table is one row per "
+                          "material; a per-pixel Glossiness chain "
+                          "shades on the CPU")
+        triaux_fns += 'uniform sampler2D hal_dstab;\n'
+        samplers.append('hal_dstab')
     if consts.get('stipple') and not secondary:
         # the Screen Door threshold map (see the composite below)
         samplers.append('hal_stipple')
+    if consts.get('fogtab'):
+        # R251: hal_fogtab rides every pass while the rule holds (+1
+        # sampler against the driver's limit, named in capability.py)
+        samplers.append('hal_fogtab')
+    # R251 C119 (MAT-B): the REYES snap -- the camera G-buffer's passes
+    # only (hit / layer passes refused by name in the planner); a Bump
+    # pre-pass samples its heights at the pixel, the CPU at the cell
+    # corner, so a Bump material refuses by name
+    reyes_fns = ''
+    reyes_splice = ''
+    if consts.get('reyes') and not secondary and not layer:
+        if prepasses:
+            from ..core import reyes as _REYES
+            return None, _REYES.REFUSE_BUMP
+        from ..core import reyes as _REYES
+        reyes_fns = _REYES.snap_glsl(int(consts['reyes']['side']))
+        reyes_splice = '    f = hal_reyes_snap(f);\n'
+        samplers.append('hal_reyes')
+    if FOG_BACKDROP_SAMPLER(consts):
+        # R251 LIGHT-A2 (F008): the backdrop target (+1 sampler more)
+        samplers.append('hal_backdrop')
     # the per-corner screen positions for the Wireframe node's Pixel
     # Size: (sx, sy, w) per triangle corner, the CPU's own sgrad-cache
     # projection baked -- same packed-square fetch as every data
@@ -3591,6 +4965,12 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
             f'wi / {wside}), 0);\n'
             '}\n')
         samplers.append('hal_vscreen')
+    if consts.get('crand_per_frame') and \
+            float(bake.get('crand', 0.0)) > 0.0:
+        # R251 (LIGHT-B2 F020): crand folds the frame number into its
+        # salt; the pass declares the per-frame scalar (already fed by
+        # the driver and the simulator)
+        em.frame_uniforms.add('hal_frame')
     frame_unis = sorted(em.frame_uniforms)
     extra_unis = ''.join(f'uniform float {u};\n' for u in frame_unis)
     # the interface declarations come FIRST: the sampling helpers and the
@@ -3614,14 +4994,25 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
              + ('uniform sampler2D hal_gb_idslin;\n' if affine_uv else '')
              + ('uniform sampler2D hal_stipple;\n'
                 if (consts.get('stipple') and not secondary) else '')
+             # R251: the fog VALUE texture, on every pass of a plan
+             # that needs it (lighting.md section 0's one rule)
+             + ('uniform sampler2D hal_fogtab;\n'
+                if consts.get('fogtab') else '')
+             # R251 LIGHT-A2 (F008): the backdrop fog target, on every
+             # pass that carries the hal_fog definition
+             + ('uniform sampler2D hal_backdrop;\n'
+                if FOG_BACKDROP_SAMPLER(consts) else '')
              + extra_unis)
     parts = [GS.GLSL, GS.DISPATCH, GB.GLSL, decls, gen_fns,
              _block(inline_parts), _block(tex_fns), _block(shadow_fns),
-             vlight_fns, triaux_fns, wirescreen_fns, f"""
+             # R251: hal_fog (FOG_GLSL), reading hal_fogtab and hal_eye
+             (FOG_GLSL(consts, bake, em) if (consts.get('fogtab')
+                                             and consts.get('fog')) else ''),
+             vlight_fns, triaux_fns, wirescreen_fns, reyes_fns, f"""
 void main()
 {{
     HalcyonFragment f = hal_read_gbuffer(vUV);
-    vec4 td = hal_tri_data(max(f.tri, 0.0));
+{reyes_splice}    vec4 td = hal_tri_data(max(f.tri, 0.0));
     float keep = (f.covered && abs(td.x - {_mv(consts, mat_id)}) < 0.5) ? 1.0 : 0.0;
     // EARLY OUT on the ownership mask. Every material pass draws the
     // full screen; this shader used to shade EVERY pixel and multiply
@@ -3837,8 +5228,7 @@ void main()
             '    vec3 hal_vl = hal_vlight_fetch(hal_vt) * f.bary.x',
             '        + hal_vlight_fetch(hal_vt + 1.0) * f.bary.y',
             '        + hal_vlight_fetch(hal_vt + 2.0) * f.bary.z;',
-            '    vec3 total = s.diffuse * hal_vl;',
-        ]
+        ] + GCB.recombine_lines(bake.get('__model'), consts, bake)
     elif shadeless:
         # light_surface's early return, verbatim: diffuse x level (+
         # emission, added by the shared block below). No ambient term,
@@ -3922,6 +5312,14 @@ void main()
     bi_group = frozenset(bi_props.get('light_group_lights') or ()) \
         if bi_props else frozenset()
     excl_names = frozenset(consts.get('exclusive_lights') or ())
+    # R251 F015 (LIGHT-B1): a screen-spot lamp lives on the SCREEN --
+    # its block is emitted on primary passes only (hits and layers have
+    # no pixel on the CPU either); the fog lobe accumulator LIGHT-A1's
+    # hal_fog reads (SPOT32 * hal_spotfog)
+    consts_l = dict(consts, __screen_pass=not (secondary or layer))
+    if not (secondary or layer or vertex_rate or shadeless) and \
+            any(getattr(l, 'screen_spot', False) for l in lights):
+        lines.append('    vec3 hal_spotfog = vec3(0.0);')
     for i, light in enumerate(() if (vertex_rate or shadeless)
                                else lights):
         lname = getattr(light, 'name', None)
@@ -3930,7 +5328,7 @@ void main()
                 continue
         elif excl_names and lname in excl_names:
             continue
-        lines += _one_light_source(i, light, consts,
+        lines += _one_light_source(i, light, consts_l,
                                    shadowed=shadows[i], bake=bake,
                                    bi=bi_meta)
     if cel_key_on:
@@ -4127,6 +5525,19 @@ void main()
             '+ hal_hcol * hal_hk;',
             '    }',
         ]
+    if not vertex_rate and not shadeless and int(model_index) in (32, 35):
+        # R251 (LIGHT-B2): the vertex unit's saturated integer output --
+        # the GX's 8-bit lit colour (F016) or the DS's 5-bit one (F018)
+        # -- before the clamp and the emission, exactly light_surface's
+        # SH.quantize_lit: a DIVISION by the level count so full white
+        # is exactly 1.0, the half-up tie, one operation per statement
+        # (the driver may contract `* lv + 0.5`: one level at a tie)
+        _lv = '255.0' if int(model_index) == 32 else '31.0'
+        lines += ['    total = clamp(total, 0.0, 1.0);',
+                  f'    total = total * {_lv};',
+                  '    total = total + 0.5;',
+                  '    total = floor(total);',
+                  f'    total = total / {_lv};']
     if not vertex_rate and not shadeless \
             and consts.get('clamp_specular', True):
         lines.append('    total = min(total, vec3(64.0));')
@@ -4234,6 +5645,15 @@ void main()
             ' + vec3(1.0 - hal_obhit);',
             '    total = total * hal_obc;']
     lines += env_lines
+    if consts.get('fog') and not vertex_rate and not secondary \
+            and not layer and float(bake.get('use_mist', 1.0)) >= 0.5 \
+            and not consts.get('fog_cpu'):
+        # R251: fog INSIDE the pass (FOG_GLSL's hal_fog) -- the CPU's
+        # own order: light_surface -> apply_fog -> alpha. Vertex-rate
+        # passes carry fog in their CPU-lit corners; hits and layers
+        # fog on the CPU where their composites are; fog_cpu materials
+        # keep the readback road (named by the planner)
+        lines.append(FOG_CALL(consts, bake))
     if layer:
         # a TRANSPARENT LAYER writes its real alpha -- the same chain
         # shade_batch runs for SORTED/ABUFFER fragments: opacity clamped,
@@ -4281,9 +5701,12 @@ void main()
         ac = float(bake.get('alpha_clip', -1.0))
         if ac >= 0.0:
             # R211 punch-through law, exactly the CPU's: a CLIP material
-            # is fully there or fully absent, after the whole chain
+            # is fully there or fully absent, after the whole chain.
+            # R251 C031: a Clip+Blend layer keeps the sub-threshold alpha
+            # (its blend half); the probe bakes the mode as structure
+            cb_else = 'hal_alpha' if bake.get('__clip_blend') else '0.0'
             lines.append(f'    hal_alpha = (hal_alpha >= '
-                         f'{_f(max(ac, 1e-6))}) ? 1.0 : 0.0;')
+                         f'{_f(max(ac, 1e-6))}) ? 1.0 : {cb_else};')
         lines.append('    Color = vec4(total * keep, hal_alpha * keep);')
     elif consts.get('stipple') and not secondary:
         # Screen Door: shade_batch's own chain -- clamp, the hard
@@ -4310,16 +5733,42 @@ void main()
             lines.append(f'    hal_alpha = (hal_alpha >= '
                          f'{_f(max(ac, 1e-6))}) ? 1.0 : 0.0;')
         rw, rh = consts.get('resolution', (1.0, 1.0))
-        lines += [
-            f'    float hal_spx = mod(floor(vUV.x * {_f(float(rw))}), '
-            '64.0);',
-            f'    float hal_spy = mod(floor(vUV.y * {_f(float(rh))}), '
-            '64.0);',
-            '    float hal_sthr = texelFetch(hal_stipple, '
-            'ivec2(int(hal_spx), int(hal_spy)), 0).r;',
-            '    hal_alpha = (hal_alpha > hal_sthr) ? 1.0 : 0.0;',
-            '    Color = vec4(total, 0.6 + 0.3 * hal_alpha) * keep;',
-        ]
+        if str((consts.get('stipple') or {}).get('pattern')) == 'N64_NOISE':
+            # R251 C015 (N64 RDP dither_alpha_en): hal_stipple is the
+            # CPU's FULL-FRAME 8-bit random map, four pixel columns per
+            # RGBA32F texel (pixel x in texel x >> 2, channel x & 3 --
+            # selected by three compares, never an integer divide: the
+            # simulator's int/int is a float). round(alpha * 255) is
+            # roundEven <-> np.round; 255.0 and the texel values 0..255
+            # are exact, so `>` is the CPU's a8 > r8 bit for bit. One op
+            # per statement where the rounding matters.
+            lines += [
+                f'    float hal_spx = floor(vUV.x * {_f(float(rw))});',
+                f'    float hal_spy = floor(vUV.y * {_f(float(rh))});',
+                '    float hal_sq = floor(hal_spx * 0.25);',
+                '    float hal_sc = hal_spx - hal_sq * 4.0;',
+                '    vec4 hal_st4 = texelFetch(hal_stipple, '
+                'ivec2(int(hal_sq), int(hal_spy)), 0);',
+                '    float hal_sthr = hal_st4.r;',
+                '    hal_sthr = (hal_sc > 0.5) ? hal_st4.g : hal_sthr;',
+                '    hal_sthr = (hal_sc > 1.5) ? hal_st4.b : hal_sthr;',
+                '    hal_sthr = (hal_sc > 2.5) ? hal_st4.a : hal_sthr;',
+                '    float hal_a8 = hal_alpha * 255.0;',
+                '    hal_a8 = roundEven(hal_a8);',
+                '    hal_alpha = (hal_a8 > hal_sthr) ? 1.0 : 0.0;',
+                '    Color = vec4(total, 0.6 + 0.3 * hal_alpha) * keep;',
+            ]
+        else:
+            lines += [
+                f'    float hal_spx = mod(floor(vUV.x * {_f(float(rw))}), '
+                '64.0);',
+                f'    float hal_spy = mod(floor(vUV.y * {_f(float(rh))}), '
+                '64.0);',
+                '    float hal_sthr = texelFetch(hal_stipple, '
+                'ivec2(int(hal_spx), int(hal_spy)), 0).r;',
+                '    hal_alpha = (hal_alpha > hal_sthr) ? 1.0 : 0.0;',
+                '    Color = vec4(total, 0.6 + 0.3 * hal_alpha) * keep;',
+            ]
     else:
         lines.append('    Color = vec4(total, 1.0) * keep;')
     lines.append('}')
@@ -4327,7 +5776,10 @@ void main()
     all_samplers = (samplers
                     + (['hal_vlight'] if vlight_spec is not None else [])
                     + sorted(tex_binds) + sorted(tex_binds_mip)
+                    + sorted(tex_binds_sat)                                   # R251: SAT atlases (TEX-2)
+                    + (['hal_recip256'] if tex_binds_sat else [])             # R251: the reciprocal atlas (bound as hal_circle is)
                     + (['hal_uvgrad'] if needs_uvgrad else [])
+                    + sorted({_lod_uniform(k) for k in needs_lod.values()})   # R251: the CPU-decided LOD fields (TEX-2)
                     + [p[0] for p in prepasses])
     _slim = int(consts.get('max_samplers', 16))
     if len(all_samplers) + 3 > _slim:
@@ -4341,8 +5793,14 @@ void main()
         return None, (f'needs {len(all_samplers) + 3} texture samplers; '
                       f'this driver provides {_slim}')
     info = {'samplers': all_samplers,
+            # R251 (LIGHT-B2 F018): (material index, Glossiness) -- the
+            # hal_dstab row this pass reads, packed by the plan
+            'dstab': ((int(mat_id), float(bake.get('glossiness', 25.0)))
+                      if 'hal_dstab' in samplers else None),
             'textures': tex_binds,
             'textures_mip': tex_binds_mip,
+            'textures_sat': tex_binds_sat,                                     # R251 (TEX-2 fills it)
+            'textures_lod': {_lod_uniform(k): k for k in needs_lod.values()},  # R251 (TEX-2 fills it)
             'needs_uvgrad': bool(needs_uvgrad),
             'needs_wirescreen': bool(getattr(em, 'needs_wirescreen',
                                              False)),
@@ -4350,6 +5808,13 @@ void main()
             'prepasses': prepasses,
             'uses_screen': em.used_screen
             or any(p[2].get('uses_screen') for p in prepasses)}
+    if consts.get('fog_cpu'):
+        # R251: the planner's reason this material fogs on the CPU
+        info['fog_cpu'] = str(consts['fog_cpu'])
+        # R251 LIGHT-A2 (F006): its fog dials for the refusal road
+        info['fog_mat'] = (float(bake.get('fog_burn', 0.0) or 0.0),
+                           float(bake.get('fog_bias', 0.0) or 0.0),
+                           float(bake.get('fog_bank', 0.0) or 0.0))
     if vlight_spec is not None:
         info['vlight'] = vlight_spec
     if raybias_stub:

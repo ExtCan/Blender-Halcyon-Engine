@@ -101,6 +101,9 @@ class ShadeContext:
         self.attributes = {}
         self.duv = None
         self.dvv = None
+        self.tri_lod = None          # R251 C079: the lazy per-triangle LOD table (TEX-2)
+        self.spx = None              # R251: the screen pixel (ShadeJob.context sets it; None elsewhere)
+        self.spy = None
         self._object_matrix_inv = None
         self._obj_mats = None
         self._obj_idx = None
@@ -898,29 +901,44 @@ def n_tex_image(ev, node):
             # would leave two of the three axes reading one row
             if not ev.has_link(node, 'Vector') and c.generated is not None:
                 vec = c.generated
-            cols = [tex.sample(vec[:, a], vec[:, b], filt=filt, wrap=wrap)
+            # R251: a volume's solid texture takes the same dials (A12.6)
+            from .texture import sample_opts as _sample_opts
+            _opts = _sample_opts(st) if st is not None else None
+            cols = [tex.sample(vec[:, a], vec[:, b], filt=filt, wrap=wrap,
+                               opts=_opts)
                     for a, b in ((1, 2), (0, 2), (0, 1))]
             col = ((cols[0] + cols[1] + cols[2])
                    * np.float32(1.0 / 3.0)).astype(np.float32)
             return {'Color': col, 'Alpha': col[:, 3]}
         u, v = _box_project(vec, c.N)
+    # R251 texture pack (0.1 C): the sample-time dials travel as one
+    # `opts`; every level road rides the footprint gate `fp` -- the
+    # derivatives describe the RAW UV attribute: a linked Vector chain or
+    # a non-flat projection resamples through a transform the chain rule
+    # was never applied to, so those (and ray hits: no c.duv) keep the top
+    # level rather than filtering with the wrong footprint, exactly as the
+    # GPU's `secondary` / `footprint` flags make them. With opts=None and
+    # the old inputs the dispatch is 1.89.0's.
+    from .texture import sample_opts
     lod = None
-    if filt == 'TRILINEAR' and c.duv is not None \
-            and not ev.has_link(node, 'Vector') and proj == 'FLAT':
-        # the derivatives describe the RAW UV attribute: a linked Vector
-        # chain or a non-flat projection resamples through a transform
-        # the chain rule was never applied to, so those keep the top
-        # level rather than filtering with the wrong footprint
+    opts = sample_opts(st) if st is not None else None
+    fp = c.duv is not None and not ev.has_link(node, 'Vector') and proj == 'FLAT'
+    bias = float(getattr(st, 'tex_mip_bias', 0.0) or 0.0) if st is not None else 0.0
+    an = opts['aniso'] if opts is not None else 1      # rule (3) of sample_opts decides anisotropy
+    if filt == 'TRILINEAR' and fp and an > 1:
+        col = tex.sample(u, v, filt=filt, wrap=wrap, aniso=an, duv=c.duv,
+                         dvv=c.dvv, bias=bias, opts=opts)
+        return {'Color': col, 'Alpha': col[:, 3]}
+    if fp and opts is not None and opts['lod_source'] == 'TRIANGLE' \
+            and getattr(c, 'tri_lod', None) is not None:
+        lod = c.tri_lod(tex.width, tex.height, bias)[c.tri]     # C079: one level per polygon (TEX-2)
+    elif fp and filt == 'TRILINEAR':
         from .texture import compute_lod
-        an = int(getattr(st, 'tex_aniso', 1) or 1) if st is not None else 1
-        bias = float(getattr(st, 'tex_mip_bias', 0.0) or 0.0) \
-            if st is not None else 0.0
-        if an > 1:
-            col = tex.sample(u, v, filt=filt, wrap=wrap, aniso=an,
-                             duv=c.duv, dvv=c.dvv, bias=bias)
-            return {'Color': col, 'Alpha': col[:, 3]}
         lod = compute_lod(c.duv, c.dvv, tex.width, tex.height, bias)
-    col = tex.sample(u, v, filt=filt, wrap=wrap, lod=lod)
+    col = tex.sample(u, v, filt=filt, wrap=wrap, lod=lod, bias=bias, opts=opts,
+                     duv=c.duv if fp else None, dvv=c.dvv if fp else None,
+                     depth=getattr(c, 'depth', None) if fp else None,
+                     px=getattr(c, 'spx', None), py=getattr(c, 'spy', None))
     return {'Color': col, 'Alpha': col[:, 3]}
 
 
@@ -3487,6 +3505,13 @@ def n_halcyon_shader(ev, node):
         sheen=_opt(ev, node, 'Sheen', VALUE, 0.0),
         sheen_color=_opt(ev, node, 'Sheen Color', RGBA, (1, 1, 1)),
         sheen_roughness=_opt(ev, node, 'Sheen Roughness', VALUE, 0.3),
+        # R251 lighting: the period finish dials (F006, F019-F021)
+        fog_burn=_opt(ev, node, 'Fog Burn-Through', VALUE, 0.0),
+        fog_bias=_opt(ev, node, 'Fog Bias', VALUE, 0.0),
+        fog_bank=_opt(ev, node, 'Fog Bank', VALUE, 0.0),
+        brilliance=_opt(ev, node, 'Brilliance', VALUE, 1.0),
+        crand=_opt(ev, node, 'Crand', VALUE, 0.0),
+        pov_metallic=_opt(ev, node, 'Metallic (POV)', VALUE, 0.0),
         bump_strength=_opt(ev, node, 'Bump Strength', VALUE, 1.0),
         refraction=_opt(ev, node, 'Refraction Amount', VALUE, 1.0),
         toon_size=ev.input(node, 'Toon Size', VALUE),
@@ -3736,6 +3761,15 @@ def bake_anime_ramp(graph, images, settings=None):
                  ANIME_RAMP_H)
     vv = np.repeat(((np.arange(ANIME_RAMP_H, dtype=np.float32) + 0.5)
                     / ANIME_RAMP_H), ANIME_RAMP_W)
+    if str(target.get('props', {}).get('compat', 'GENERIC')) == 'SPARKING':
+        # R246: Sparking! ZERO's GradientTexture is a 16x256 strip read
+        # DOWN its V by the half-Lambert cosine -- white at the top
+        # (lit), the tone bands below (the exported T_Tone* textures,
+        # every column identical; the reconstruction samples it at
+        # (0.5, 1 - N.L/2 - 0.5)). Blender loads it with the top row at
+        # v=1, so the light term sweeps v here and the row (the 16
+        # columns) sweeps u: the game's own texture drops in unrotated.
+        uu, vv = vv, uu
     ctx.uv[:, 0] = uu
     ctx.uv[:, 1] = vv
     ctx.uv2 = ctx.uv.copy()
@@ -3761,10 +3795,12 @@ def n_anime_shader(ev, node):
     The channel semantics were taken from the shader recreations and
     modding documentation of those games (ArcSys ILM and SSS maps from
     the Xrd lineage; the HoYo lightmap conventions from PrimoToon's
-    source; ZZZ from its modding guides). Kakarot and Sparking Zero
-    are served by the ArcSys-lineage decode they descend from -- their
-    exact channel dumps are not publicly documented, and the mode says
-    so in its tooltip rather than inventing one.
+    source; ZZZ from its modding guides). Kakarot is served by the
+    ArcSys-lineage decode it descends from -- its exact channel dumps
+    are not publicly documented, and the mode says so in its tooltip
+    rather than inventing one. R246: Sparking! ZERO is decoded from
+    the game's own material export (the MI parameter set, the T_Tone*
+    strips, the character sheets): see the SPARKING branch below.
 
     Every decoded driver lands in the closure as an anime_* key, so
     the shading model itself is mode-blind -- and the master's whole
@@ -3788,7 +3824,18 @@ def n_anime_shader(ev, node):
     mask = np.ones(n, np.float32)
     base_rgb = base[:, :3] * line[:, :3]
 
-    if mode in ('ARCSYS', 'DBFZ', 'KAKAROT', 'SPARKING'):
+    if mode == 'SPARKING':
+        # R246: the decode from the game's own material export (FModel:
+        # the MI parameter set, the 16x256 T_Tone* strips, the character
+        # sheets) read against the field's reconstruction of the master
+        # material. No ILM map exists in this pipeline: the Game Texture
+        # is Mask1, the greyscale line-art/detail sheet that MULTIPLIES
+        # the flat Color1 (white neutral); the tone comes from
+        # GradientTexture in Shadow Ramp, read down its height by the
+        # half-Lambert cosine (see bake_anime_ramp). The Detail Texture
+        # is not read in this mode.
+        base_rgb = base_rgb * game[:, :3]
+    elif mode in ('ARCSYS', 'DBFZ', 'KAKAROT'):
         # the Xrd lineage, from the recreations: ILM.r = specular
         # intensity, ILM.g = shadow bias (0.5 neutral), ILM.b =
         # highlight size, ILM.a = the drawn line art; the SSS map's
@@ -3812,8 +3859,6 @@ def n_anime_shader(ev, node):
             # the CC2 look sits a touch lighter and softer than the
             # fighters; a lineage tuning, stated in the tooltip
             bias = bias + 0.06
-        if mode == 'SPARKING':
-            bias = bias - 0.04
     elif mode == 'GENSHIN':
         # PrimoToon's decode: lightmap.r is the specular/metal mask
         # (0.9+ reads metal), .g the occlusion fed into the shadow
@@ -3845,7 +3890,7 @@ def n_anime_shader(ev, node):
     # The ArcSys branch above keeps its own copy in its 1.62 float
     # order, so no old file's pixels move.)
     if bool(p.get('use_vertex_ao', False)) and \
-            mode not in ('ARCSYS', 'DBFZ', 'KAKAROT', 'SPARKING'):
+            mode not in ('ARCSYS', 'DBFZ', 'KAKAROT'):
         vc = getattr(ev.ctx, 'vcol', None)
         if vc is not None:
             vr = coerce(vc, RGBA, n)[:, 0]
@@ -4302,9 +4347,12 @@ def n_halcyon_code(ev, node):
             uniforms[gl] = np.asarray(val, np.float32)
     inputs = _shader_inputs(c)
     from ..shaders.builtins import Ctx as SCtx
+    from .texture import sample_opts as _sample_opts
     sctx = SCtx(n=c.n, px=c.px, py=c.py, width=c.width, height=c.height,
                 tri=c.tri, filt=getattr(c.settings, 'tex_filter', 'NEAREST'),
-                wrap='REPEAT')
+                wrap='REPEAT',
+                # R251 (B0.4): a coded shader's image sees the same dials
+                opts=_sample_opts(c.settings) if c.settings is not None else None)
     res, discard = prog.run(uniforms, inputs, c.n, ctx=sctx)
     for o in node.get('outputs', []):
         key_ = o.get('key') or o.get('name')
@@ -6514,3 +6562,342 @@ DISPATCH = {
     # R242: the Max study
     **MAX_FUNCS,
 }
+
+
+# ---- R251 material pack, wave 2 (MAT-B): period node evaluators ----
+# Integer arithmetic in float32 (every quantity < 2^24, exact), one op per
+# statement where a rounding follows, `np.rint` half to even (the GLSL
+# twins use roundEven); the reciprocal multiply `R255` on both roads.
+R255 = np.float32(1.0 / 255.0)          # GLSL literal 0.00392156886
+
+
+def _cb_q8(x):
+    """8-bit: rint(clip(x, 0, 1) * 255), exact integers in float32."""
+    return np.rint(np.clip(np.asarray(x, np.float32), np.float32(0.0),
+                           np.float32(1.0)) * np.float32(255.0)).astype(np.float32)
+
+
+def _cb_tev(a, b, c, d, op, bias, scale, clamp):
+    a8 = _cb_q8(a)
+    b8 = _cb_q8(b)
+    c8 = _cb_q8(c)
+    d10 = np.clip(np.rint(np.asarray(d, np.float32) * np.float32(255.0)),
+                  np.float32(-1024.0), np.float32(1023.0)).astype(np.float32)
+    zero = np.zeros_like(c8)
+    if op in ('ADD', 'SUB'):
+        c9 = c8 + np.floor(c8 / np.float32(128.0))          # c8 >> 7: 255 -> 256
+        q1 = np.float32(256.0) - c9
+        p = a8 * q1
+        q = b8 * c9
+        s = p + q
+        lp = np.floor(s / np.float32(256.0))                 # (a8*(256-c9) + b8*c9) >> 8
+        out = d10 + lp if op == 'ADD' else d10 - lp
+        if bias == 'ADD_HALF':
+            out = out + np.float32(128.0)
+        elif bias == 'SUB_HALF':
+            out = out - np.float32(128.0)
+        if scale == 'X2':
+            out = out * np.float32(2.0)
+        elif scale == 'X4':
+            out = out * np.float32(4.0)
+        elif scale == 'HALF':
+            out = np.floor(out / np.float32(2.0))
+    else:
+        gt = op.endswith('_GT')
+        if op.startswith('COMP_R8'):
+            pa = a8[:, 0:1]
+            pb = b8[:, 0:1]
+        elif op.startswith('COMP_GR16'):
+            pa = (a8[:, 1:2] * np.float32(256.0)) + a8[:, 0:1]
+            pb = (b8[:, 1:2] * np.float32(256.0)) + b8[:, 0:1]
+        elif op.startswith('COMP_BGR24'):
+            pa = (a8[:, 2:3] * np.float32(65536.0)) + (a8[:, 1:2] * np.float32(256.0))
+            pa = pa + a8[:, 0:1]
+            pb = (b8[:, 2:3] * np.float32(65536.0)) + (b8[:, 1:2] * np.float32(256.0))
+            pb = pb + b8[:, 0:1]
+        else:                                                   # COMP_RGB8: per channel
+            pa = a8
+            pb = b8
+        sel = (pa > pb) if gt else (pa == pb)
+        out = d10 + np.where(sel, c8, zero)
+    hi = np.float32(255.0) if clamp else np.float32(1023.0)
+    lo = np.float32(0.0) if clamp else np.float32(-1024.0)
+    return np.clip(out, lo, hi).astype(np.float32)
+
+
+def _cb_nv_map(e, mapping):
+    e = np.asarray(e, np.float32)
+    z = np.float32(0.0)
+    if mapping == 'UNSIGNED_INVERT':
+        return (np.float32(1.0) - np.clip(e, z, np.float32(1.0))).astype(np.float32)
+    if mapping == 'EXPAND_NORMAL':
+        return (np.float32(2.0) * np.maximum(e, z) - np.float32(1.0)).astype(np.float32)
+    if mapping == 'EXPAND_NEGATE':
+        return (-(np.float32(2.0) * np.maximum(e, z) - np.float32(1.0))).astype(np.float32)
+    if mapping == 'HALF_BIAS_NORMAL':
+        return (np.maximum(e, z) - np.float32(0.5)).astype(np.float32)
+    if mapping == 'HALF_BIAS_NEGATE':
+        return (-(np.maximum(e, z) - np.float32(0.5))).astype(np.float32)
+    if mapping == 'SIGNED_IDENTITY':
+        return e
+    if mapping == 'SIGNED_NEGATE':
+        return (-e).astype(np.float32)
+    return np.maximum(e, z).astype(np.float32)                  # UNSIGNED_IDENTITY
+
+
+def _cb_q9(v):
+    """9-bit signed: clip(rint(v * 255), -256, 255)."""
+    return np.clip(np.rint(np.asarray(v, np.float32) * np.float32(255.0)),
+                   np.float32(-256.0), np.float32(255.0)).astype(np.float32)
+
+
+def _cb_nv2a(a, b, c, d, maps, scale, bias):
+    qa = _cb_q9(_cb_nv_map(a, maps[0]))
+    qb = _cb_q9(_cb_nv_map(b, maps[1]))
+    qc = _cb_q9(_cb_nv_map(c, maps[2]))
+    qd = _cb_q9(_cb_nv_map(d, maps[3]))
+    pab_i = qa * qb
+    pab = np.rint(pab_i / np.float32(255.0))     # an integer numerator: the fraction is never within 1/510 of .5
+    pcd_i = qc * qd
+    pcd = np.rint(pcd_i / np.float32(255.0))
+    s = pab + pcd
+    if scale == 'X2':
+        s = s * np.float32(2.0)
+    elif scale == 'X4':
+        s = s * np.float32(4.0)
+    elif scale == 'HALF':
+        s = np.floor(s / np.float32(2.0))
+    if bias == 'MINUS_HALF':
+        s = s - np.float32(128.0)
+    return np.clip(s, np.float32(-256.0), np.float32(255.0)).astype(np.float32)
+
+
+def n_halcyon_combiner_stage(ev, node):
+    """C028: one TEV / NV2A combiner stage (see the node's docstring)."""
+    a4 = ev.input(node, 'A', RGBA)
+    b4 = ev.input(node, 'B', RGBA)
+    c4 = ev.input(node, 'C', RGBA)
+    d4 = ev.input(node, 'D', RGBA)
+    a, b, c, d = (np.asarray(x[:, :3], np.float32) for x in (a4, b4, c4, d4))
+    if _prop(node, 'hardware', 'TEV') == 'NV2A':
+        maps = tuple(_prop(node, k, 'UNSIGNED_IDENTITY')
+                     for k in ('map_a', 'map_b', 'map_c', 'map_d'))
+        out = _cb_nv2a(a, b, c, d, maps, _prop(node, 'nv_scale', 'X1'),
+                       _prop(node, 'nv_bias', 'NONE'))
+    else:
+        out = _cb_tev(a, b, c, d, _prop(node, 'op', 'ADD'),
+                      _prop(node, 'bias', 'ZERO'), _prop(node, 'scale', 'X1'),
+                      bool(_prop(node, 'clamp', True)))
+    rgb = (out * R255).astype(np.float32)
+    return {'Color': np.concatenate([rgb, np.asarray(a4[:, 3:4], np.float32)],
+                                    axis=1).astype(np.float32)}
+
+
+DISPATCH.update({
+    'HALCYON_CombinerStageNode': n_halcyon_combiner_stage,
+})
+
+
+# ---- MAT-B C023: SR Bump (PowerVR2) ----
+def n_halcyon_sr_bump(ev, node):
+    """C023: the PVR2 (S,R) bump intensity through the angle tables; a
+    LINKED Light is evaluated per pixel (float64 atan2, then the same Q
+    quantisation) -- the GPU refuses that case by name."""
+    from . import srbump_tables as SRT
+    col = ev.input(node, 'Color', RGBA)
+    base = ev.input(node, 'Base', RGBA)
+    n8 = np.rint(np.clip(np.asarray(col[:, :3], np.float32), np.float32(0.0),
+                         np.float32(1.0)) * np.float32(255.0)).astype(np.int64)
+    strength = np.asarray(ev.input(node, 'Strength', VALUE), np.float32)
+    light_linked = ev.has_link(node, 'Light')
+    strength_linked = ev.has_link(node, 'Strength')
+    if not light_linked and not strength_linked:
+        light = np.asarray(ev.input(node, 'Light', VECTOR), np.float32)[0]
+        K1, K2, K3, Q = SRT.light_constants(light, float(strength[0]))
+        I = SRT.intensity(n8[:, 0], n8[:, 1], n8[:, 2], K1, K2, K3, Q)
+    else:
+        L = np.asarray(ev.input(node, 'Light', VECTOR), np.float32)
+        L = M.normalize(L).astype(np.float32)
+        sinT = np.clip(L[:, 2], np.float32(0.0), np.float32(1.0)).astype(np.float32)
+        cosT = np.sqrt(np.maximum(np.float32(1.0) - sinT * sinT, np.float32(0.0))).astype(np.float32)
+        Q = (np.round((np.arctan2(L[:, 1].astype(np.float64), L[:, 0].astype(np.float64)) + np.pi)
+                      / (2.0 * np.pi) * 255.0).astype(np.int64) & 255)
+        H = np.clip(strength, np.float32(0.0), np.float32(1.0)).astype(np.float32)
+        K1 = (np.float32(1.0) - H).astype(np.float32)
+        K2 = (sinT * H).astype(np.float32)
+        K3 = (cosT * H).astype(np.float32)
+        I = SRT.intensity(n8[:, 0], n8[:, 1], n8[:, 2], K1, K2, K3, Q)
+    b3 = np.asarray(base[:, :3], np.float32)
+    if _prop(node, 'blend', 'MULTIPLY') == 'ADD':
+        rgb = np.minimum(b3 + I[:, None], np.float32(1.0)).astype(np.float32)
+    else:
+        rgb = (b3 * I[:, None]).astype(np.float32)
+    return {'Intensity': I,
+            'Color': np.concatenate([rgb, np.asarray(base[:, 3:4], np.float32)], axis=1).astype(np.float32)}
+
+
+DISPATCH.update({'HALCYON_SRBumpNode': n_halcyon_sr_bump})
+
+
+# ---- MAT-B C135: Emboss Bump (DirectX 6), two stages ----
+def n_halcyon_emboss_shift(ev, node):
+    """C135 stage one: the second texture stage's UV, shifted toward the
+    light by Offset texels of a Texture Size-wide map. `inv = 1/size` is
+    computed ONCE from the constant socket (a linked Texture Size is per
+    pixel here and refuses on the GPU); p, d two statements."""
+    c = ev.ctx
+    uv = np.asarray(_tex_vector(ev, node, 'uv'), np.float32)
+    light = np.asarray(ev.input(node, 'Light', VECTOR), np.float32)
+    offset = np.asarray(ev.input(node, 'Offset', VALUE), np.float32)
+    if ev.has_link(node, 'Texture Size'):
+        size = np.asarray(ev.input(node, 'Texture Size', VALUE), np.float32)
+        inv = (np.float32(1.0) / np.maximum(size, np.float32(1.0))).astype(np.float32)[:, None]
+    else:
+        size = np.float32(max(float(np.asarray(ev.input(node, 'Texture Size', VALUE), np.float32)[0]), 1.0))
+        inv = np.float32(np.float32(1.0) / size)
+    p = (offset[:, None] * light[:, :2]).astype(np.float32)
+    d = (p * inv).astype(np.float32)
+    out = np.array(uv, np.float32, copy=True)
+    out[:, 0] = (uv[:, 0] + d[:, 0]).astype(np.float32)
+    out[:, 1] = (uv[:, 1] + d[:, 1]).astype(np.float32)
+    return {'Shifted UV': out}
+
+
+def n_halcyon_emboss_bump(ev, node):
+    """C135 stage two: hd = h - hs; b = clip(0.5 + hd, 0, 1) (ADDSIGNED);
+    m = min(2b, 1); Color = Base * m (MODULATE2X); Factor = b. Both
+    heights at 0.5 give Color == Base bitwise."""
+    h = np.asarray(ev.input(node, 'Height', VALUE), np.float32)
+    hs = np.asarray(ev.input(node, 'Height Shifted', VALUE), np.float32)
+    base = np.asarray(ev.input(node, 'Base', RGBA), np.float32)
+    hd = (h - hs).astype(np.float32)
+    b = (np.float32(0.5) + hd).astype(np.float32)
+    b = np.clip(b, np.float32(0.0), np.float32(1.0)).astype(np.float32)
+    m = np.minimum(np.float32(2.0) * b, np.float32(1.0)).astype(np.float32)
+    rgb = (base[:, :3] * m[:, None]).astype(np.float32)
+    return {'Factor': b,
+            'Color': np.concatenate([rgb, base[:, 3:4]], axis=1).astype(np.float32)}
+
+
+DISPATCH.update({'HALCYON_EmbossShiftNode': n_halcyon_emboss_shift,
+                 'HALCYON_EmbossBumpNode': n_halcyon_emboss_bump})
+
+
+# ---- MAT-B C099: Roughness (Imagine) ----
+_IMR_LANES = (np.uint32(1757225451), np.uint32(48610963), np.uint32(2524743835))
+
+
+def n_halcyon_imagine_roughness(ev, node):
+    """C099: a per-pixel random turn of the normal from the house Wang hash
+    of (px, py, seed[, frame]); Roughness 0 returns the input normal
+    bitwise; a hit (no pixel grid) turns nothing -- the GPU refuses the
+    same case by name."""
+    c = ev.ctx
+    n = c.n
+    if ev.has_link(node, 'Normal'):
+        N = np.asarray(ev.input(node, 'Normal', VECTOR), np.float32)
+    else:
+        N = np.asarray(c.N, np.float32)
+    r = np.clip(np.asarray(ev.input(node, 'Roughness', VALUE), np.float32),
+                np.float32(0.0), np.float32(255.0)).astype(np.float32)
+    Nn = M.normalize(N).astype(np.float32)
+    if c.px is None:
+        return {'Normal': N}
+    seed = int(getattr(c.settings, 'seed', 0) or 0) if c.settings is not None else 0
+    frame = int(getattr(c, 'frame', 1) or 0)
+    shimmer = bool(_prop(node, 'animate', False))
+    salt = np.uint32((seed * 7919 + (frame * 104729 if shimmer else 0)) & 0xFFFFFFFF)
+    with np.errstate(over='ignore'):
+        u = (np.asarray(c.px, np.uint32) + np.asarray(c.py, np.uint32) * np.uint32(65536)
+             + salt).astype(np.uint32)
+        u = _wang32(u)
+        x = np.float32(2.0) * _wang01(u ^ _IMR_LANES[0]) - np.float32(1.0)
+        y = np.float32(2.0) * _wang01(u ^ _IMR_LANES[1]) - np.float32(1.0)
+        z = np.float32(2.0) * _wang01(u ^ _IMR_LANES[2]) - np.float32(1.0)
+    j = np.stack([x, y, z], axis=1).astype(np.float32)
+    k0 = (r * np.float32(0.00392156886)).astype(np.float32)
+    k = (k0 * np.float32(0.5)).astype(np.float32)
+    N2 = (Nn + k[:, None] * j).astype(np.float32)
+    out = np.where((r > 0)[:, None], M.normalize(N2).astype(np.float32), N).astype(np.float32)
+    return {'Normal': out}
+
+
+DISPATCH.update({'HALCYON_ImagineRoughnessNode': n_halcyon_imagine_roughness})
+
+
+# ---- MAT-B C123: Env Chrome (Alias / Maya) ----
+_EC_DEFAULTS = {'light_width': 0.5, 'light_depth': 0.1, 'light_width_gain': 1.0,
+                'light_width_offset': 0.0, 'light_depth_gain': 1.0,
+                'light_depth_offset': 0.0, 'grid_width': 0.1, 'grid_depth': 0.1,
+                'grid_width_gain': 1.0, 'grid_width_offset': 0.0,
+                'grid_depth_gain': 1.0, 'grid_depth_offset': 0.0,
+                'floor_altitude': -1.0}
+
+
+def _ec_f(node, name):
+    return np.float32(float(_prop(node, name, _EC_DEFAULTS[name])))
+
+
+def env_chrome(I, N, P, cols, pr, real_floor):
+    """The showroom along R = reflect(I, N), float32, the statement order
+    the GLSL twin keeps: `cols` are the six (n, 3) colours (sky, zenith,
+    light, floor, horizon, grid), `pr` the 13 float32 parameters."""
+    f = np.float32
+    dn = (N * I).sum(axis=1).astype(np.float32)
+    s2 = (f(2.0) * dn).astype(np.float32)
+    R = (I - s2[:, None] * N).astype(np.float32)
+    sky_c, zen_c, light_c, floor_c, hor_c, grid_c = cols
+    # sky side
+    rz = np.maximum(R[:, 2], f(1e-6)).astype(np.float32)
+    t = np.clip(R[:, 2], f(0.0), f(1.0)).astype(np.float32)
+    sky = (sky_c + (zen_c - sky_c) * t[:, None]).astype(np.float32)
+    px = (R[:, 0] / rz).astype(np.float32)
+    pz = (R[:, 1] / rz).astype(np.float32)
+    fx = (px * pr['light_width_gain'] + pr['light_width_offset']).astype(np.float32)
+    fx = (fx - np.floor(fx)).astype(np.float32)
+    fz = (pz * pr['light_depth_gain'] + pr['light_depth_offset']).astype(np.float32)
+    fz = (fz - np.floor(fz)).astype(np.float32)
+    in_light = (fx < pr['light_width']) & (fz < pr['light_depth'])
+    up = np.where(in_light[:, None], light_c, sky).astype(np.float32)
+    # floor side
+    rzn = np.minimum(R[:, 2], f(-1e-6)).astype(np.float32)
+    pxn = (R[:, 0] * pr['floor_altitude'] / rzn).astype(np.float32)
+    pzn = (R[:, 1] * pr['floor_altitude'] / rzn).astype(np.float32)
+    if real_floor:
+        tt = ((pr['floor_altitude'] - P[:, 2]) / rzn).astype(np.float32)
+        pxr = (P[:, 0] + tt * R[:, 0]).astype(np.float32)
+        pzr = (P[:, 1] + tt * R[:, 1]).astype(np.float32)
+        hit = tt >= f(0.0)
+        px2 = np.where(hit, pxr, pxn).astype(np.float32)
+        pz2 = np.where(hit, pzr, pzn).astype(np.float32)
+    else:
+        px2, pz2 = pxn, pzn
+    base = (hor_c + (floor_c - hor_c) * (-R[:, 2])[:, None]).astype(np.float32)
+    gx = (px2 * pr['grid_width_gain'] + pr['grid_width_offset']).astype(np.float32)
+    gx = (gx - np.floor(gx)).astype(np.float32)
+    gz = (pz2 * pr['grid_depth_gain'] + pr['grid_depth_offset']).astype(np.float32)
+    gz = (gz - np.floor(gz)).astype(np.float32)
+    on_grid = (gx < pr['grid_width']) | (gz < pr['grid_depth'])
+    down = np.where(on_grid[:, None], grid_c, base).astype(np.float32)
+    return np.where((R[:, 2] >= f(0.0))[:, None], up, down).astype(np.float32)
+
+
+def n_halcyon_env_chrome(ev, node):
+    """C123: the environment seen along the reflection of the view ray."""
+    c = ev.ctx
+    I = M.normalize(np.asarray(c.I, np.float32)).astype(np.float32)
+    if ev.has_link(node, 'Normal'):
+        N = M.normalize(np.asarray(ev.input(node, 'Normal', VECTOR), np.float32)).astype(np.float32)
+    else:
+        N = M.normalize(np.asarray(c.N, np.float32)).astype(np.float32)
+    P = np.asarray(c.P, np.float32)
+    cols = tuple(np.asarray(ev.input(node, name, RGBA), np.float32)[:, :3]
+                 for name in ('Sky Color', 'Zenith Color', 'Light Color',
+                              'Floor Color', 'Horizon Color', 'Grid Color'))
+    pr = {k: _ec_f(node, k) for k in _EC_DEFAULTS}
+    rgb = env_chrome(I, N, P, cols, pr, bool(_prop(node, 'real_floor', True)))
+    a = np.ones((c.n, 1), np.float32)
+    return {'Color': np.concatenate([rgb, a], axis=1).astype(np.float32)}
+
+
+DISPATCH.update({'HALCYON_EnvChromeNode': n_halcyon_env_chrome})

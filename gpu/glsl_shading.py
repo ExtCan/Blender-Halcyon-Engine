@@ -100,6 +100,13 @@ struct HalcyonSurface {
     float anisotropy2;
     float aniso_rot2;
     vec3  translucent_color;
+    // R251 lighting: the period finish dials (F006, F019-F021)
+    float fog_burn;
+    float fog_bias;
+    float fog_bank;
+    float brilliance;
+    float crand;
+    float pov_metallic;
 };
 
 // R243: a Max shader whose diffuse carries its own colour (the
@@ -616,6 +623,29 @@ float hal_spec_toon(float ndl, float rdv, float size, float smoothness)
     float sm = max(smoothness, 1e-4);
     return clamp((lim + sm - ang) / sm, 0.0, 1.0);
 }
+
+// R251 (LIGHT-B2 F016): the GameCube GX's rational 'shininess' highlight
+// -- GX_InitLightShininess reuses the attenuation unit with a = (0,0,1),
+// k = (s/2, 0, 1 - s/2) on N.H: (N.H)^2 / (s/2 + (1 - s/2)(N.H)^2), "only
+// a ratio of quadratics, a true exponential function is not possible"
+// (libogc gx.h). `v` is the frame's camera axis (hal_fogtab texel 227).
+// One operation per statement, in core/shading.gx_spec's exact order.
+float hal_gx_spec(float ndl, vec3 n, vec3 l, vec3 v, float gloss)
+{
+    vec3 hs = l + v;
+    hs = normalize(hs);
+    float h = dot(n, hs);
+    h = max(h, 0.0);
+    float h2 = h * h;
+    float sh = gloss * 0.5;
+    float om = 1.0 - sh;
+    float den = om * h2;
+    den = sh + den;
+    // den = sh (1 - h2) + h2 > 0 for any Glossiness > 0; the guard is
+    // Glossiness 0 at h = 0 (0/0), the CPU's own 0
+    float sp = (den > 0.0) ? (h2 / den) : 0.0;
+    return sp;
+}
 """
 
 MAX_SHADERS = """
@@ -892,6 +922,11 @@ float hal_bi_matrix_diffuse(int di, HalcyonSurface s, vec3 n, vec3 l,
 vec4 hal_evaluate2(int model, HalcyonSurface s, vec3 n, vec3 l, vec3 v,
                    float ndl_d, float back_d, float area_on)
 {
+    // R251 material pack (MAT-A C034): the DS toon pair lights with the
+    // DS_FIXED lobe (core/shading.LOBE_ALIAS; the pack's test parses
+    // these two lines back against _model_index)
+    if (model == 45) model = 35;
+    if (model == 46) model = 35;
     float ndl = dot(n, l);
     float ndv = dot(n, v);
     vec3 h = normalize(l + v);
@@ -1042,6 +1077,22 @@ vec4 hal_evaluate2(int model, HalcyonSurface s, vec3 n, vec3 l, vec3 v,
         } else {
             sp = hal_spec_bi_cooktorr(ndl, ndv, ndh, s.glossiness);
         }
+    } else if (model == 32) {               // R251 GX_LIGHT (LIGHT-B2)
+        // the GameCube's light unit: Lambert plus the rational
+        // highlight against the camera axis (`v` is hal_vs, texel 227)
+        d = hal_diffuse_lambert(ndl_d);
+        sp = hal_gx_spec(ndl, n, l, v, s.glossiness);
+    } else if (model == 35) {               // R251 DS_FIXED (LIGHT-B2)
+        // the DS's light unit: the diffuse ONLY here -- the table
+        // highlight reads the hal_dstab sampler in the per-light block
+        // (a DS pass declares it; this shared text never does)
+        d = hal_diffuse_lambert(ndl_d);
+    } else if (model >= 36) {               // R251 material pack (MAT-A)
+        // the period combiners (items 36..48) name no lobe of their own:
+        // the CPU's evaluate() fallback, Lambert + Blinn-Phong, written
+        // down (their picture is the corner road's combine, never this)
+        d = hal_diffuse_lambert(ndl_d);
+        sp = hal_spec_blinn_phong(ndl, ndh, s.glossiness);
     } else {
         d = hal_diffuse_lambert(ndl_d);
     }

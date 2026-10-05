@@ -11,14 +11,19 @@ Everything here is bpy-free so the whole thing can be exercised headlessly.
 """
 
 import os
+import copy
+import math
 
 import numpy as np
 
 from . import lights as LI
+from . import shadowmask as SM
 from . import stats as ST
 from . import mathx as M
 from . import raster
+from . import reyes as REYES            # R251 C119 (MAT-B)
 from . import shading as SH
+from . import combine as CB          # R251 material pack (MAT-A)
 from .bvh import BVH
 from .nodeeval import Closure, GraphEvaluator, ShadeContext, to_color, to_value
 from .texture import Texture
@@ -29,19 +34,113 @@ EMPTY = -1
 # ------------------------------------------------------------------ camera
 
 
-def camera_matrices(camera, width, height):
-    """(view, proj, viewproj, eye) from a Camera."""
+#: R251 C058: the Y-shear caps, ZDoom's (32 degrees up, 56 down); the
+#: engines' own constants, never a dial
+YSHEAR_UP_DEG, YSHEAR_DOWN_DEG = 32.0, 56.0
+
+
+def camera_basis(camera):
+    """The camera's rigid float32 world matrix (R:34-44's own two
+    branches, moved here so the cylinder sky and `camera_matrices` read
+    ONE basis): the identity at z = 8 for no camera, else the matrix
+    with object scale stripped."""
     if camera is None or camera.matrix_world is None:
         mw = np.eye(4, dtype=np.float32)
         mw[2, 3] = 8.0
-    else:
-        # R205: strip object scale from the camera basis. A camera under
-        # a scaled parent (the .3DS/FBX $$$DUMMY rigs) composes the same
-        # picture but multiplies every camera-space DEPTH by 1/S -- fog,
-        # clip and DoF all read wrong distances. Blender ignores camera
-        # scale; so does Halcyon now. Rigid matrices pass through
-        # bitwise untouched.
-        mw = M.rigid_camera_matrix(camera.matrix_world)
+        return mw
+    # R205: strip object scale from the camera basis. A camera under
+    # a scaled parent (the .3DS/FBX $$$DUMMY rigs) composes the same
+    # picture but multiplies every camera-space DEPTH by 1/S -- fog,
+    # clip and DoF all read wrong distances. Blender ignores camera
+    # scale; so does Halcyon now. Rigid matrices pass through
+    # bitwise untouched.
+    return M.rigid_camera_matrix(camera.matrix_world)
+
+
+def camera_yaw(mw):
+    """The heading of a camera basis (radians about world Z); the level
+    camera and the cylinder sky read ONE function. Blender: -Z looks,
+    +X right, +Y up. Straight up or down, the right axis carries the
+    heading."""
+    f = -mw[:3, 2]
+    r = mw[:3, 0]
+    if math.hypot(float(f[0]), float(f[1])) > 1e-6:
+        return math.atan2(float(f[1]), float(f[0]))
+    return math.atan2(float(r[0]), -float(r[1]))
+
+
+def clip_jitter(st, proj, rw, rh):
+    """The clip-space translation of a pass: the float32 4x4 J the
+    accumulation jitter and the stereo eye ride, or None when the pass
+    carries neither (the J block's own lines, R251: moved here so the
+    cylinder sky reads the same J).
+
+    The accumulation pass's subpixel offset, as a clip-space
+    translation: J @ vp shifts the whole projection by a fraction of
+    a pixel, exactly what the OpenGL accumulation buffer's
+    glTranslate jitter did. A stereo eye rides the same matrix:
+    its off-axis frustum IS a clip-space x translation, sized so
+    the convergence plane lands at zero parallax.
+    """
+    jit = getattr(st, '_accum_jitter', None)
+    ster = getattr(st, '_stereo', None)
+    if jit is None and ster is None:
+        return None
+    J = np.eye(4, dtype=np.float32)
+    if jit is not None:
+        J[0, 3] = 2.0 * float(jit[0]) / rw
+        J[1, 3] = 2.0 * float(jit[1]) / rh
+    if ster is not None:
+        s_off, conv = ster
+        J[0, 3] += float(proj[0, 0]) * float(s_off) / max(float(conv),
+                                                          1e-4)
+    return J
+
+
+def yshear_active(camera, st):
+    """R251 C058: does this frame render its pitch as a Y-shear?
+    Perspective cameras only; never inside a panorama strip."""
+    return bool(getattr(st, 'camera_yshear', False)) and camera is not None \
+        and str(getattr(camera, 'type', 'PERSP')) == 'PERSP' \
+        and not getattr(st, '_pano_strip', False)
+
+
+def level_camera(mw):
+    """R251 C058: the camera basis made LEVEL and unrolled, and the
+    pitch it had (radians, + looking up). A basis already level and
+    unrolled (|f_z| < 1e-7 and |r_z| < 1e-7) passes through bitwise --
+    that branch decides whether an existing scene's pixels can move
+    under the flag. Position untouched."""
+    f = -mw[:3, 2]
+    r = mw[:3, 0]
+    if abs(float(f[2])) < 1e-7 and abs(float(r[2])) < 1e-7:
+        return mw, 0.0
+    fz = min(max(float(f[2]), -1.0), 1.0)
+    theta = math.asin(fz)
+    yaw = camera_yaw(mw)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    out = mw.copy()
+    out[:3, 0] = np.array([sy, -cy, 0.0], np.float32)   # right' = f' x Z
+    out[:3, 1] = np.array([0.0, 0.0, 1.0], np.float32)  # up' = world Z
+    out[:3, 2] = np.array([-cy, -sy, 0.0], np.float32)  # -forward'
+    return out, theta
+
+
+def camera_matrices(camera, width, height):
+    """(view, proj, viewproj, eye) from a Camera.
+
+    R251: a camera flagged `_yshear` (set by render() from
+    `camera_yshear`) renders LEVEL and slides the projection centre by
+    focal x tan(pitch) -- Heretic / Hexen / Build's Y-shear (C058); a
+    camera carrying `_lens = (lx, ly, d_f)` (the lens-pass road, C098)
+    has its window sheared so the focus plane at d_f stays put while
+    the eye moves by (lx, ly) across the aperture. Level first, then the
+    slide, then the lens shear; `eye` stays the centre eye.
+    """
+    mw = camera_basis(camera)
+    theta = 0.0
+    if getattr(camera, '_yshear', False):
+        mw, theta = level_camera(mw)
     view = np.linalg.inv(mw).astype(np.float32)
     eye = mw[:3, 3].astype(np.float32)
     if camera is not None and camera.projection is not None:
@@ -61,6 +160,29 @@ def camera_matrices(camera, width, height):
             fov_x = 2.0 * np.arctan(sensor * 0.5 / max(lens, 1e-3))
             fov_y = 2.0 * np.arctan(np.tan(fov_x * 0.5) / max(aspect, 1e-6))
             proj = LI._persp(fov_y, aspect, near, far)
+    if theta != 0.0:
+        # C058: the NDC slide, rounded once. clip_y' = clip_y + s*z_v;
+        # with clip_w = -z_v (row 3 is (0,0,-1,0)): ndc_y' = ndc_y - s.
+        # proj.copy() is load-bearing: np.asarray returns the camera's
+        # OWN float32 array, and the slide must never accumulate on it
+        tc = min(max(theta, -math.radians(YSHEAR_DOWN_DEG)),
+                 math.radians(YSHEAR_UP_DEG))
+        s = np.float32(float(proj[1, 1]) * math.tan(tc))
+        proj = proj.copy()
+        proj[1, 2] = np.float32(proj[1, 2] + s)
+    lens_pt = getattr(camera, '_lens', None)
+    if lens_pt is not None:
+        # C098: the accumulation buffer's lens shear (Haeberli & Akeley
+        # 1990, Appendix B): a view-space point at depth d moves to
+        # x' = x + lx*(d/d_f - 1), so a vertex ON the focus plane d_f
+        # does not move; the eye returned stays the CENTRE eye
+        lx, ly, d_f = lens_pt
+        S = np.eye(4, dtype=np.float32)
+        S[0, 2] = np.float32(-lx / d_f)
+        S[0, 3] = np.float32(-lx)
+        S[1, 2] = np.float32(-ly / d_f)
+        S[1, 3] = np.float32(-ly)
+        proj = (proj @ S).astype(np.float32)
     return view, proj, (proj @ view).astype(np.float32), eye
 
 
@@ -103,6 +225,9 @@ LAST_GPU_VERDICT = {'wanted': False, 'engaged': False, 'why': ''}
 
 _GBUF_CACHE = {}
 _GBUF_STATS = {'hits': 0, 'misses': 0, 'bytes': 0}
+#: R251 C001: the supersample factors the N64 coverage skip was named for
+#: (once each, so a viewport redraw never spams the console)
+_N64_SKIP_SAID = set()
 #: R172: the raster cache is bounded by BYTES, not by a slot count. The
 #: field's draft storm inserted a new key per jittered draft and the old
 #: 4-slot LRU evicted the refine and F12 entries between uses
@@ -144,7 +269,12 @@ def prepare_textures(scene, settings):
     out = {}
     sig = (settings.tex_filter, settings.tex_wrap_default, settings.tex_max_size,
            settings.tex_quantize, settings.tex_mipmap, settings.color_management,
-           settings.input_gamma_naive)
+           settings.input_gamma_naive,
+           # R251 texture pack: prep-time storage laws (content changes)
+           str(getattr(settings, 'tex_format', 'NONE')),
+           str(getattr(settings, 'tex_tmem_format', 'OFF')),
+           str(getattr(settings, 'tex_compress', 'NONE')),
+           bool(getattr(settings, 'tex_colorkey', False)))
     images = getattr(scene, 'images', None) or {}
     for key, buf in images.items():
         if buf is None:
@@ -160,14 +290,40 @@ def prepare_textures(scene, settings):
         tex = Texture(px, name=getattr(buf, 'name', ''),
                       colorspace=getattr(buf, 'colorspace', 'sRGB'),
                       wrap=settings.tex_wrap_default, filt=settings.tex_filter)
-        if settings.color_management != 'NONE' and not settings.input_gamma_naive:
+        # R251: "encoded" is the one fact the storage laws need -- True
+        # when the pixels ARE the file's bytes (no decode ran); a storage
+        # law on a decoded image re-encodes, quantises and decodes with
+        # the pipeline's own converters (core/texture.py)
+        encoded = not (settings.color_management != 'NONE'
+                       and not settings.input_gamma_naive)
+        if not encoded:
             tex.to_linear()
         if settings.tex_max_size:
             tex.clamp_size(settings.tex_max_size)
         if settings.tex_quantize:
             tex.quantize(settings.tex_quantize)
+        # R251 prep-time laws, in this fixed order: a TMEM format OWNS
+        # the texel format (C013 over C074), block compression composes
+        # after either (C024: the Xbox stored DXT1 of a 565 source), the
+        # chroma-key prep and the summed-area table are wave 2's. A
+        # texel format with no alpha plane converts its cut-outs to the
+        # key INSIDE the law (keyed=): the prep after it would find none
+        if sig[8] != 'OFF':
+            tex.fit_tmem(sig[8], bool(settings.tex_mipmap), encoded)
+        elif sig[7] != 'NONE':
+            tex.store_format(sig[7], encoded, keyed=bool(sig[10]))
+        if sig[9] != 'NONE':
+            tex.block_compress(sig[9], encoded)
+        if sig[10] and hasattr(tex, 'colorkey_prepare'):
+            tex.colorkey_prepare()
+        if settings.tex_filter == 'SUMMED_AREA' and hasattr(tex, 'build_sat'):
+            tex.build_sat()
         if settings.tex_mipmap:
             tex.build_mips()
+        # the CONTENT laws (everything but filter and wrap) as one tag:
+        # the driver's upload keys carry it, so a texture prepared under
+        # another law is another upload by construction (A12.13)
+        tex.prep = sig[2:]
         if len(_TEX_CACHE) > 32:
             _TEX_CACHE.clear()
         _TEX_CACHE[ckey] = tex
@@ -188,6 +344,26 @@ def prepare_textures(scene, settings):
                       filt='NEAREST')
         _TEX_CACHE['__bitex_tables__'] = tab
     out['__bitex_tables__'] = tab
+    # R251 C023 (MAT-B): the PowerVR2 (S,R) angle tables, the SR Bump
+    # node's two raw data textures (hal_sr_tab: SIDX / SINS / COSS /
+    # COS256 in one row; hal_sr_atan: the 256x256 azimuth table), built
+    # once, cached forever, bound like the BI tables
+    srt = _TEX_CACHE.get('__sr_tables__')
+    if srt is None:
+        from .srbump_tables import table_pixels as _sr_table_pixels
+        srt = Texture(_sr_table_pixels(), name='__sr_tables__',
+                      colorspace='Non-Color', wrap='EXTEND',
+                      filt='NEAREST')
+        _TEX_CACHE['__sr_tables__'] = srt
+    out['__sr_tables__'] = srt
+    sra = _TEX_CACHE.get('__sr_atan__')
+    if sra is None:
+        from .srbump_tables import atan_pixels as _sr_atan_pixels
+        sra = Texture(_sr_atan_pixels(), name='__sr_atan__',
+                      colorspace='Non-Color', wrap='EXTEND',
+                      filt='NEAREST')
+        _TEX_CACHE['__sr_atan__'] = sra
+    out['__sr_atan__'] = sra
     return out
 
 
@@ -217,17 +393,20 @@ def closure_to_surface(cl, ctx, settings, material=None):
         surf.opacity[:] = material.opacity
         _thr_pt = None
         if getattr(material, 'has_alpha', False) or \
-                str(getattr(material, 'alpha_mode', 'BLEND')) == 'CLIP':
+                str(getattr(material, 'alpha_mode', 'BLEND')) in ('CLIP', 'CLIP_BLEND'):
             from .scene import clip_road as _clip_road
             _thr_pt = _clip_road(material)[0]
         if _thr_pt is not None or \
-                str(getattr(material, 'alpha_mode', 'BLEND')) == 'CLIP':
+                str(getattr(material, 'alpha_mode', 'BLEND')) in ('CLIP', 'CLIP_BLEND'):
             # R211/R213 punch-through: the law below forces hard 0/1
             # alpha -- an identity on the provably-binary chains the
             # auto road promotes, the requested semantics under CLIP
             surf.alpha_clip[:] = float(
                 _thr_pt if _thr_pt is not None
                 else getattr(material, 'alpha_clip', 0.5))
+        # R251 C031 (PS2 AFAIL): the two-pass mode reaches the alpha law
+        # PER FRAGMENT (the vertex/face roads batch across materials)
+        surf.alpha_soft[:] = 1.0 if str(getattr(material, 'alpha_mode', 'BLEND')) == 'CLIP_BLEND' else 0.0
         surf.ior[:] = material.ior
         surf.ray_ior[:] = material.ior   # one slider, both meanings here
         surf.roughness[:] = material.roughness
@@ -393,6 +572,13 @@ def closure_to_surface(cl, ctx, settings, material=None):
                 ('sheen', 'sheen', 'v', 0.0),
                 ('sheen_color', 'sheen_color', 'c', (1, 1, 1)),
                 ('sheen_roughness', 'sheen_roughness', 'v', 0.3),
+                # R251 lighting: the period finish dials (F006, F019-F021)
+                ('fog_burn', 'fog_burn', 'v', 0.0),
+                ('fog_bias', 'fog_bias', 'v', 0.0),
+                ('fog_bank', 'fog_bank', 'v', 0.0),
+                ('brilliance', 'brilliance', 'v', 1.0),
+                ('crand', 'crand', 'v', 0.0),
+                ('pov_metallic', 'pov_metallic', 'v', 0.0),
                 ('refraction', 'refraction', 'v', 1.0),
                 ('toon_size2', 'toon_size2', 'v', 0.5),
                 ('toon_smooth2', 'toon_smooth2', 'v', 0.1),
@@ -925,12 +1111,38 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
     ({'sampled': (n,3), 'texfac': f}), REPLACES the accumulated
     diffuse with the scatter-tree sample shaped by the material colour
     -- the shade_lamp_loop block, verbatim."""
+    # R251 (MAT-A C034): the DS toon pair IS the DS light unit
+    model = SH.LOBE_ALIAS.get(model, model)
     n = ctx.n
     N = M.normalize(ctx.N)
     V = -M.normalize(ctx.I)
     if settings.two_sided_lighting:
         flip = M.dot(N, V) < 0.0
         N = np.where(flip[:, None], -N, N)
+    # R251 F011: the reflectance models' viewer -- the true eye vector,
+    # or ONE camera axis for the whole frame (OpenGL 1.1's infinite
+    # viewer, the Sega Model boards' R.z, the DS's line of sight): the
+    # camera's +Z row of the CPU's own view matrix (inv(mw), R:44), the
+    # world-space direction toward a viewer at infinity. Only
+    # SH.evaluate reads Vs; the flip, the Hemi override, the cheats,
+    # sheen and the cel loops keep the true V.
+    if settings.two_sided_lighting:
+        flip = M.dot(N, V) < 0.0
+        N = np.where(flip[:, None], -N, N)
+    # R251 (LIGHT-B1 F011 / LIGHT-B2 F016-F018): the view vector the
+    # reflectance models take -- the true eye, or ONE camera axis for the
+    # whole frame (OpenGL 1.1's infinite viewer, the Sega boards' R.z,
+    # the DS's (0,0,-1) line of sight). The console light units force
+    # the axis inside themselves; the flip above, the Hemi override, the
+    # silhouette cheats and sheen keep the true eye.
+    Vs = V
+    if str(getattr(settings, 'specular_viewer', 'PIXEL')) == 'AXIS' \
+            or model in getattr(SH, 'AXIS_MODELS', ()):
+        _vm = getattr(ctx, 'view_matrix', None)
+        if _vm is not None:
+            Vs = np.broadcast_to(
+                M.normalize(np.asarray(_vm, np.float32)[2:3, :3])[0][None, :],
+                V.shape).astype(np.float32)
 
     if model in ('CONSTANT', 'WIREFRAME'):
         return surf.diffuse * surf.diffuse_level[:, None] + surf.emission
@@ -1106,7 +1318,9 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
     track_result = (
         (ramp_dif is not None and ramp_dif.get('input') == 'RESULT')
         or (ramp_spec is not None and ramp_spec.get('input') == 'RESULT')
-        or (sss is not None) or exposure_on)
+        or (sss is not None) or exposure_on
+        # R251 (MAT-A): the period combiners' specular carry
+        or (extras is not None and bool(extras.get('want_spec'))))
     diff_acc = np.zeros((n, 3), np.float32) if track_result else None
     spec_acc = np.zeros((n, 3), np.float32) \
         if (track_result or want_spec_acc) else None
@@ -1156,6 +1370,12 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
                         num / np.where(np.abs(den) > 1e-20, den, 1.0),
                         0.0).astype(np.float32)
 
+    # R251 (MAT-A C057): the house key lamp (lines.key_light: the first
+    # non-ambient lamp in scene order), compared by identity in the loop
+    sh_key = None
+    if extras is not None and extras.get('want_key_lit'):
+        from . import lines as _LN
+        sh_key = _LN.key_light(scene)
     for li, light in enumerate(lights):
         lname = getattr(light, 'name', None)
         if group is not None:
@@ -1176,8 +1396,10 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         if cel_mode > 0:
             # R238: under a fixed key the scene's lamps only CAST their
             # shadows: the strongest visibility among the casters that
-            # reach this object is the key's own (no caster: lit)
-            if not LI.casts_shadow(light, settings):
+            # reach this object is the key's own (no caster: lit).
+            # R251 F015: a screen spot casts no shadow -- skipped
+            if not LI.casts_shadow(light, settings) or \
+                    getattr(light, 'screen_spot', False):
                 continue
             L_c, _rad_c, dist_c = LI.sample(light, ctx.P, settings)
             vis_c = LI.visibility(light, ctx.P, N, L_c, dist_c, settings,
@@ -1188,6 +1410,44 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
             if lit_mask is not None:
                 vis_c = np.where(lit_mask, vis_c, -1.0).astype(np.float32)
             vis_acc = np.maximum(vis_acc, vis_c)
+            continue
+        if getattr(light, 'screen_spot', False) and \
+                getattr(light, 'type', '') == 'SPOT':
+            # R251 F015: Sega Model 3's viewport spotlight -- an ellipse
+            # pinned to the SCREEN at the lamp's projected position, a
+            # depth window from the near clip over |Falloff End|, its
+            # lobe added to the diffuse at the lamp's Energy/4pi (the
+            # same radiance scale every Halcyon lamp uses) -- no cone,
+            # no N.L, no shadow. The lamp lives on the screen: a point
+            # with no pixel (ray hits, transparent layers, vertex
+            # corners) gets nothing (lighting.md section 0, A10). ONE
+            # association on both roads (A50): ((diffuse*level)*colE)
+            # *lobe*inv_pi. The fog lobe colE*(en*el) accumulates in
+            # ctx.spot_fog for core/fog.py (LIGHT-A1's fog_spot).
+            px_ = getattr(ctx, 'px', None)
+            py_ = getattr(ctx, 'py', None)
+            dep_ = getattr(ctx, 'depth', None)
+            if px_ is None or py_ is None or dep_ is None:
+                continue
+            _ss_vp = camera_matrices(scene.camera, ctx.width, ctx.height)[2]
+            _ss = LI.screen_spot_params(light, _ss_vp, ctx.width, ctx.height,
+                                        scene.camera)
+            ss_en, ss_el, ss_lobe = LI.screen_spot_lobe(px_, py_, dep_, *_ss)
+            _ss_sign = -1.0 if light.negative else 1.0
+            ss_col = np.asarray(light.color, np.float32) * np.float32(
+                _ss_sign * float(light.energy) / (4.0 * np.pi))
+            ss_t = (surf.diffuse * surf.diffuse_level[:, None]) * ss_col[None, :]
+            ss_t = ss_t * ss_lobe[:, None]
+            ss_t = ss_t * inv_pi
+            if lit_mask is not None:
+                ss_t = ss_t * lit_mask[:, None]
+            out += ss_t
+            ss_fog = ss_col[None, :] * (ss_en * ss_el)[:, None]
+            if lit_mask is not None:
+                ss_fog = ss_fog * lit_mask[:, None]
+            _sf = getattr(ctx, 'spot_fog', None)
+            ctx.spot_fog = ss_fog.astype(np.float32) if _sf is None \
+                else (_sf + ss_fog).astype(np.float32)
             continue
         L, rad, dist = LI.sample(light, ctx.P, settings)
         ndl = M.dot(N, L)
@@ -1222,17 +1482,59 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
                                                     want_back=True)
             else:
                 area_nd = LI.area_inp(light, ctx.P, N)
-        dif, spec = SH.evaluate(model, surf, N, L, V,
+        # R251 (LIGHT-B2): every model's own view term takes Vs -- the
+        # true eye, or the frame's camera axis for the console light
+        # units (SH.AXIS_MODELS) and under Specular Viewer AXIS
+        dif, spec = SH.evaluate(model, surf, N, L, Vs,
                                 area_ndl=area_nd,
                                 area_ndl_back=area_nd_back)
         # R243: a Max shader whose diffuse carries its own colour (the
         # Oren-Nayar pair, Translucent) returns it as (N, 3); the scalar
         # every other road reads is its mean, and the contribution
         # takes the colour as given instead of the diffuse socket
+        if model == 'GX_LIGHT' and \
+                getattr(light, 'type', '') not in ('SUN', 'HEMI'):
+            # R251 (LIGHT-B2): GX_AF_SPEC lit from directional lights
+            # only (GX_InitSpecularDir) -- a point or spot lamp adds no
+            # highlight on the GameCube
+            spec = np.zeros_like(spec)
+        elif model == 'DS_FIXED':
+            # R251 (LIGHT-B2): the DS's table highlight, evaluated HERE
+            # on both roads (the GPU's per-light block reads hal_dstab
+            # right after its evaluate call): the unnormalised half
+            # vector of the light and the fixed line of sight, squared,
+            # through the material's 128-entry shininess table
+            spec = (SH.ds_spec(N, L, Vs, surf.glossiness)[:, None]
+                    * surf.specular).astype(np.float32)
         dif_rgb = None
         if np.ndim(dif) == 2:
             dif_rgb = dif
             dif = dif.mean(axis=1).astype(np.float32)
+        if model not in SH.MAX_MODELS:
+            # R251 (LIGHT-B2): POV-Ray's finish dials, in trace.cpp's
+            # order -- brilliance on the diffuse cosine (skipped at 1.0),
+            # crand's per-lamp, per-pixel grain off the direct diffuse,
+            # metallic's rational Fresnel tint on the highlight. The Max
+            # shaders return a coloured diffuse and keep their own laws
+            # (inert there, on both roads); the Hemi override below
+            # replaces both lobes afterwards, so a Hemi lamp is inert too
+            dif = SH.apply_brilliance(dif, surf.brilliance)
+            if have_id and np.any(surf.crand > 0.0):
+                z = 977 + 131 * li + \
+                    7919 * int(getattr(settings, 'seed', 0) or 0)
+                if getattr(settings, 'crand_per_frame', False):
+                    z += 1013 * int(getattr(ctx, 'frame', 0) or 0)
+                # the hash reads only the low 31 bits of its salt, so
+                # the masked salt IS the int32-wrapped salt's hash (the
+                # GLSL carries the same masked literal)
+                z = int(np.int64(z) & 0x7fffffff)
+                from . import patterns as PT
+                h_cr = PT.sample_u(spx, spy, z)
+                dif = np.maximum(dif - surf.crand * h_cr,
+                                 np.float32(0.0)).astype(np.float32)
+            if np.any(surf.pov_metallic > 0.0):
+                spec = SH.apply_pov_metallic(spec, ndl, surf.pov_metallic,
+                                             surf.diffuse)
         if area_nd is not None:
             # shade_one_light's area lamp correction: specfac *= inp
             spec = spec * area_nd[:, None]
@@ -1262,6 +1564,46 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         if cel_ss_term is not None and light is cel_key:
             # R238: the screen shadow rides the key lamp's visibility
             vis = (vis * cel_ss_term).astype(np.float32)
+        if getattr(light, 'only_shadow', False):
+            # R251 F014: Blender Internal's LA_ONLYSHADOW (2.79
+            # shadeoutput.c `shr->shad -= ...`): the lamp adds nothing
+            # and subtracts the plain diffuse it would have given where
+            # its shadow falls -- unshadowed minus shadowed under the
+            # shadow-colour rule `vis + shcol*(1 - vis)`, so the dark
+            # term is (1 - vis)*(1 - shcol) per channel. No specular,
+            # no ramp, no terminator bias, no per-light clamp (the
+            # subtraction is negative; Negative lamps have no floor
+            # either). Nothing at all when the lobe flags give no
+            # diffuse. The GPU block associates identically:
+            # (((dif*col*level)*rad)*inv_pi)*dark.
+            if light.affect_diffuse and not light.specular_only:
+                lamp_os_rad = -rad if light.negative else rad
+                if dif_rgb is not None:
+                    lamp_os = (dif_rgb * surf.diffuse_level[:, None]) \
+                        * lamp_os_rad
+                else:
+                    lamp_os = (dif[:, None] * surf.diffuse
+                               * surf.diffuse_level[:, None]) * lamp_os_rad
+                lamp_os = lamp_os * inv_pi
+                lamp_dark = (np.float32(1.0) - vis)[:, None]
+                _oshc = np.asarray(getattr(light, 'shadow_color',
+                                           (0.0, 0.0, 0.0)), np.float32)
+                if float(_oshc.max()) > 0.0:
+                    lamp_dark = lamp_dark * (np.float32(1.0)
+                                             - _oshc[None, :])
+                lamp_os = lamp_os * lamp_dark
+                if lit_mask is not None:
+                    lamp_os = lamp_os * lit_mask[:, None]
+                if track_result:
+                    diff_acc -= lamp_os
+                else:
+                    out -= lamp_os
+            continue
+        if sh_key is not None and light is sh_key:
+            # R251 (MAT-A C057): the key lamp's lit fraction, captured
+            # after `vis` is final (absent when the key never gets here)
+            extras['key_lit'] = (vis * np.maximum(ndl, 0.0)).astype(
+                np.float32)
         if not np.any(vis > 0.0):
             continue
         if getattr(light, 'type', '') == 'HEMI':
@@ -1526,7 +1868,11 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
             spec_acc = (linfac
                         * (1.0 - np.exp(spec_acc * logfac))).astype(
                             np.float32)
-        light_part = diff_acc + spec_acc
+        # R251 (MAT-A): a carrying model's corner EXCLUDES the specular
+        # (it rides the corner alpha and is added after the texel)
+        light_part = diff_acc \
+            if (extras is not None and extras.get('want_spec')) \
+            else diff_acc + spec_acc
         if clamp > 0.0:
             light_part = np.minimum(light_part, clamp)
         out += light_part
@@ -1590,6 +1936,14 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         # R229: the hair shine band, painted OVER the banded result
         # (before emission and the silhouette cheats, like the paint)
         out = _anime_hair_shine(out, surf, ctx, N, V, hair_key_z)
+    if model == 'GX_LIGHT':
+        # R251 (LIGHT-B2): the GX vertex unit's saturated 8-bit lit
+        # colour (per corner at the Gouraud rate the model is meant for)
+        out = SH.quantize_lit(out, 255)
+    elif model == 'DS_FIXED':
+        # R251 (LIGHT-B2): the DS light unit's 5-bit saturation, once
+        # (GBATEK: the vertex colour saturates at 31)
+        out = SH.quantize_lit(out, 31)
     if settings.clamp_specular:
         out = np.minimum(out, 64.0)
     out = out + surf.emission
@@ -2081,7 +2435,8 @@ def world_color(scene, settings, dirs, textures, n=None, eye=None):
 # ------------------------------------------------------------------- fog
 
 
-def apply_fog(rgb, depth, settings, scene, vertex_rate=False, P=None):
+def apply_fog(rgb, depth, settings, scene, vertex_rate=False, P=None,
+              ctx=None, surf=None):
     """Distance fog. `fog_vertex` evaluates it per vertex and interpolates,
     which is how fixed-function hardware did it -- and it shows, because the
     fog band follows the tessellation rather than the surface.
@@ -2090,48 +2445,25 @@ def apply_fog(rgb, depth, settings, scene, vertex_rate=False, P=None):
     thinning exponentially above it -- the layered ground mist the
     sixth-generation consoles drew (fog volumes on the GameCube, VU-computed
     height fog on the PS2). Needs `P`; without it the fog stays pure
-    distance fog."""
+    distance fog.
+
+    R251: the arithmetic lives in core/fog.py. A frame with no new dial
+    (every 1.89.0 field set) runs `fog.legacy`, the 1.89.0 body moved
+    verbatim -- bitwise by construction; a period dial (the GTE cue, a
+    hardware table, z-buffer depth) takes `fog.apply`, whose GLSL twin
+    `hal_fog` mirrors it statement for statement. `vertex_rate` is kept
+    in the signature for callers and read by nothing (it was dead in
+    1.89.0 too: called nowhere)."""
     if not settings.fog:
         return rgb
-    if settings.fog_vertex and not vertex_rate:
-        # quantise the depth so the blend steps rather than sweeps, which is
-        # what interpolating a per-vertex factor looks like on coarse geometry
-        depth = np.round(depth * 8.0) / 8.0
-    mode = settings.fog_mode
-    d = np.maximum(depth, 0.0)
-    if mode == 'LINEAR':
-        f = (settings.fog_end - d) / max(settings.fog_end - settings.fog_start, 1e-5)
-    elif mode == 'EXP':
-        f = np.exp(-settings.fog_density * d)
-    elif mode == 'EXP2':
-        f = np.exp(-((settings.fog_density * d) ** 2))
-    else:                                   # TABLE16 -- the fixed-function LUT
-        t = np.clip((d - settings.fog_start) /
-                    max(settings.fog_end - settings.fog_start, 1e-5), 0.0, 1.0)
-        f = 1.0 - np.floor(t * 16.0) / 16.0
-    f = np.clip(f, 0.0, 1.0)
-    fb = int(getattr(settings, 'fog_bands', 0) or 0)
-    if fb >= 2:
-        # R223: banded depth fog -- the transmittance quantized to cel
-        # steps, so distance reads as flat painted planes (the anime
-        # background trick, and the PS1's own coarse fog tables).
-        # Round-to-band, so near surfaces stay clear and the far end
-        # saturates instead of everything sliding one band down
-        f = np.floor(f * fb + 0.5) / fb
-    if getattr(settings, 'fog_height', False) and P is not None:
-        # h = 1 below the top (full fog), exp falloff above; the fog AMOUNT
-        # (1 - f) scales by h, so high surfaces come out of the mist. Where
-        # h is exactly 1 the transmittance passes through UNTOUCHED --
-        # 1-(1-f) re-rounds f by an ulp, and an inert control must be inert
-        above = np.maximum(P[:, 2] - float(settings.fog_height_top), 0.0)
-        h = np.exp(-above * max(float(settings.fog_height_falloff), 0.0))
-        f = np.where(h >= 1.0, f, 1.0 - (1.0 - f) * h)
-    f = f[:, None]
-    col = np.asarray(settings.fog_color, np.float32)[None, :]
-    return (rgb * f + col * (1.0 - f)).astype(np.float32)
+    from . import fog as _FOG
+    if _FOG.extended(settings, surf):
+        return _FOG.apply(rgb, depth, settings, scene, P, ctx, surf)
+    return _FOG.legacy(rgb, depth, settings, scene, P)
 
 
-def fog_for_points(job, tri_idx, bary, rgb):
+def fog_for_points(job, tri_idx, bary, rgb, px=None, py=None, surf=None,
+                   spot_fog=None):
     """apply_fog for externally-shaded points, exactly as shade_batch fogs.
 
     Fog is SEPARABLE: a lerp toward the fog colour by a factor of geometry
@@ -2140,6 +2472,17 @@ def fog_for_points(job, tri_idx, bary, rgb):
     on the readback with the same P and the same ctx.depth formula --
     the two devices agree by construction instead of by a GLSL twin of
     four fog modes, a quantised vertex emulation and a height layer.
+
+    R251: most fogged materials now fog INSIDE the deferred pass
+    (`hal_fog`, gpu/material.FOG_GLSL); this road serves the materials
+    the planner named `fog_cpu` (traced / env composites that land after
+    the readback), the reflection hits and the transparent layers.
+    `px, py` are the screen pixels where the points ARE pixels (None for
+    hits and corners: the Voodoo dither then adds 0, the GC range adjust
+    takes k = 1, a backdrop target takes the world along the ray);
+    `surf` the per-material fog dials (F006: burn-through, bias, bank --
+    `_fog_readback` builds them from `binds['fog_mat']`); `spot_fog` the
+    screen-spot lobe (F015).
 
     The caller decides WHICH points: pixel-rate surfaces fog here;
     vertex-rate materials must NOT (their fog is already inside the
@@ -2150,10 +2493,35 @@ def fog_for_points(job, tri_idx, bary, rgb):
     if not getattr(st, 'fog', False) or tri_idx.size == 0:
         return rgb
     P = job.attributes(tri_idx, bary, None)[0]
-    view_p = (P - job.eye[None, :]) @ job.view[:3, :3].T
-    depth = np.abs(view_p[:, 2]).astype(np.float32)
+    # the sequential float32 chain shade_batch's ctx.depth carries (R251
+    # A1: the GLSL twin computes exactly these three products and two sums)
+    dP = np.asarray(P, np.float32) - np.asarray(job.eye, np.float32)[None, :]
+    r = np.asarray(job.view, np.float32)[2, :3]
+    dz = dP[:, 0] * r[0]
+    dz += dP[:, 1] * r[1]
+    dz += dP[:, 2] * r[2]
+    depth = np.abs(dz).astype(np.float32)
+    from types import SimpleNamespace
+    eye = np.asarray(job.eye, np.float32)
+    if spot_fog is None and px is not None and \
+            float(getattr(st, 'fog_spot', 0.0) or 0.0) > 0.0:
+        # R251 LIGHT-A2 (F015's fog half, A52): the refusal road's points
+        # ARE pixels -- the screen spotlights' lobe is recomputed here,
+        # exactly light_surface's per-batch sum
+        from . import fog as _FOGS
+        spot_fog = _FOGS.spot_fog_of(job, px, py, depth)
+    ctx = SimpleNamespace(
+        tri=tri_idx, bary=bary, px=px, py=py, spx=px, spy=py,
+        scene=job.scene, camera_pos=eye, view_matrix=job.view,
+        settings=st, P=P, depth=depth,
+        I=M.normalize(np.asarray(P, np.float32) - eye[None, :]),
+        is_camera_ray=(px is not None), width=job.width, height=job.height,
+        backdrop=getattr(job, 'backdrop', None), spot_fog=spot_fog,
+        # R251 LIGHT-A2 (F008): the world's textures for the direction
+        # form, and the job itself so a missing backdrop is built once
+        textures=getattr(job, 'textures', None), job=job)
     return apply_fog(np.asarray(rgb, np.float32), depth, st, job.scene,
-                     P=P)
+                     P=P, ctx=ctx, surf=surf)
 
 
 # --------------------------------------------------------- fragment shading
@@ -2301,6 +2669,58 @@ class ShadeJob:
                 else np.ones((tri_idx.size, 4), np.float32)
         return P, Ns, Ng, uv, uv2, col
 
+    def _screen_projection(self):
+        """(sx, sy, ws) per VERTEX: the projected screen positions and the
+        clip w, cached per job (the accumulation jitter is a pure
+        translation, which gradients cannot see). `uv_screen_gradients`
+        and C079's `tri_lod` read the same projection."""
+        cache = getattr(self, '_sgrad_cache', None)
+        if cache is None:
+            mesh = self.scene.mesh
+            _v, _p, vp, _e = camera_matrices(self.scene.camera, self.width,
+                                             self.height)
+            verts = np.asarray(mesh.verts, np.float32)
+            clip = np.concatenate(
+                [verts, np.ones((verts.shape[0], 1), np.float32)],
+                axis=1) @ vp.T
+            w = clip[:, 3]
+            ws = np.where(np.abs(w) < 1e-9, np.float32(1e-9), w)
+            sx = (clip[:, 0] / ws * 0.5 + 0.5) * self.width
+            sy = (clip[:, 1] / ws * 0.5 + 0.5) * self.height
+            cache = (sx.astype(np.float32), sy.astype(np.float32),
+                     ws.astype(np.float32))
+            self._sgrad_cache = cache
+        return cache
+
+    def tri_lod(self, w, h, bias=0.0):
+        """One mip level per TRIANGLE for a (w, h) texture: 0.5 * log2(texel
+        area / screen area) + bias, float64 once per frame -> float32,
+        cached per (w, h, bias). Both devices read this table (R251 C079:
+        the Riva 128 / Verite per-polygon level, the Voodoo's lodbase)."""
+        key = (int(w), int(h), float(bias))
+        cache = getattr(self, '_tri_lod_cache', None)
+        if cache is None:
+            cache = self._tri_lod_cache = {}
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        mesh = self.scene.mesh
+        sx, sy, _ws = self._screen_projection()
+        tris = mesh.tris
+        px_ = sx[tris].astype(np.float64)
+        py_ = sy[tris].astype(np.float64)                                      # (N,3)
+        a_pix = 0.5 * np.abs((px_[:, 1] - px_[:, 0]) * (py_[:, 2] - py_[:, 0])
+                             - (py_[:, 1] - py_[:, 0]) * (px_[:, 2] - px_[:, 0]))
+        uvt = (mesh.uvs[tris] if mesh.uvs is not None
+               else np.zeros(tris.shape + (2,), np.float32)).astype(np.float64)   # (N,3,2)
+        a_tex = 0.5 * np.abs((uvt[:, 1, 0] - uvt[:, 0, 0]) * (uvt[:, 2, 1] - uvt[:, 0, 1])
+                             - (uvt[:, 1, 1] - uvt[:, 0, 1]) * (uvt[:, 2, 0] - uvt[:, 0, 0])) \
+            * float(w) * float(h)
+        lod = 0.5 * np.log2(np.maximum(a_tex, 1e-12) / np.maximum(a_pix, 1e-6)) + float(bias)
+        out = lod.astype(np.float32)
+        cache[key] = out
+        return out
+
     def uv_screen_gradients(self, tri_idx, bary, uv):
         """Analytic per-pixel screen derivatives of the interpolated UV.
 
@@ -2321,22 +2741,7 @@ class ShadeJob:
         pure translation, which gradients cannot see.
         """
         mesh = self.scene.mesh
-        cache = getattr(self, '_sgrad_cache', None)
-        if cache is None:
-            _v, _p, vp, _e = camera_matrices(self.scene.camera, self.width,
-                                             self.height)
-            verts = np.asarray(mesh.verts, np.float32)
-            clip = np.concatenate(
-                [verts, np.ones((verts.shape[0], 1), np.float32)],
-                axis=1) @ vp.T
-            w = clip[:, 3]
-            ws = np.where(np.abs(w) < 1e-9, np.float32(1e-9), w)
-            sx = (clip[:, 0] / ws * 0.5 + 0.5) * self.width
-            sy = (clip[:, 1] / ws * 0.5 + 0.5) * self.height
-            cache = (sx.astype(np.float32), sy.astype(np.float32),
-                     ws.astype(np.float32))
-            self._sgrad_cache = cache
-        sx, sy, w = cache
+        sx, sy, w = self._screen_projection()
         tris = mesh.tris[tri_idx]                              # (N,3)
         p = np.stack([np.stack([sx[tris[:, i]], sy[tris[:, i]]], 1)
                       for i in range(3)], axis=1)              # (N,3,2)
@@ -2412,6 +2817,20 @@ class ShadeJob:
                      + np.sqrt((dPdy * dPdy).sum(1)))
         return dmin.astype(np.float32), wpp.astype(np.float32)
 
+    def view_depth(self, P):
+        """|view z| of the points P (= 1/|Q|, the GS's Q): the sequential
+        float32 chain the GLSL fog twin computes -- three products, two
+        sums, no matmul kernel -- bitwise the matmul on this NumPy, a
+        construction on any. R251 A1 (fog) and C022 (TEX-2: the
+        PlayStation 2 LOD field reads it on the same attributes() output
+        the CPU's context hands the sampler)."""
+        _dP = np.asarray(P, np.float32) - self.eye[None, :]
+        _r = np.asarray(self.view, np.float32)[2, :3]
+        _dz = _dP[:, 0] * _r[0]
+        _dz += _dP[:, 1] * _r[1]
+        _dz += _dP[:, 2] * _r[2]
+        return np.abs(_dz).astype(np.float32)
+
     def context(self, tri_idx, bary, px=None, py=None, front=None, bary_lin=None,
                 ray_depth=0, is_camera=True, need=None):
         mesh = self.scene.mesh
@@ -2443,6 +2862,11 @@ class ShadeJob:
             ctx.attributes['uv:' + names[0]] = uv
         if len(names) > 1 and names[1] and uv2 is not None:
             ctx.attributes['uv:' + names[1]] = uv2
+        # R246: the colour layer by its name too (the Color Attribute
+        # node reads 'col:<name>'; the GPU answers the same name)
+        cname = getattr(mesh, 'color_name', None)
+        if cname and col is not None:
+            ctx.attributes['col:' + cname] = col
         ctx.I = M.normalize(P - self.eye[None, :]) \
             if P is not None else None
         ctx.px = px
@@ -2461,12 +2885,14 @@ class ShadeJob:
         if front is not None:
             ctx.backfacing = (~front).astype(np.float32)
         if P is not None:
-            view_p = (P - self.eye[None, :]) @ self.view[:3, :3].T
-            ctx.depth = np.abs(view_p[:, 2]).astype(np.float32)
+            # R251 (A1): the sequential float32 chain the GLSL fog twin
+            # computes; C022 (TEX-2): ONE function, read by the GPU's
+            # hal_lodq field builder too
+            ctx.depth = self.view_depth(P)
         else:
             ctx.depth = None
-        if px is not None and uv is not None and \
-                str(getattr(self.settings, 'tex_filter', '')) == 'TRILINEAR':
+        from .texture import footprint_wanted
+        if px is not None and uv is not None and footprint_wanted(self.settings):
             # the mip footprint: screen points only (a ray hit has no
             # pixel footprint and samples the top level, as the era did)
             ctx.duv, ctx.dvv = self.uv_screen_gradients(tri_idx, bary, uv)
@@ -2496,11 +2922,24 @@ class ShadeJob:
         ctx.spx = np.asarray(px, np.int64) if px is not None else None
         ctx.spy = np.asarray(py, np.int64) if py is not None else None
         ctx.view_matrix = self.view
+        # R251 F015: the Model 3 screen spotlights' fog lobe, colE*(en*el)
+        # summed by light_surface (None = no screen spot reached this
+        # batch); core/fog.py adds fog_spot * spot_fog to its blend colour
+        ctx.spot_fog = None
+        # R251 LIGHT-A2 (F008): the backdrop fog target and the world's
+        # textures for the direction form (core/fog.py reads them)
+        ctx.backdrop = getattr(self, 'backdrop', None)
+        ctx.textures = self.textures
+        ctx.job = self
         # the Wireframe node's inputs, supplied lazily: nothing is computed
         # unless a graph actually asks (the duv/dvv lesson of 1.25.80 --
         # give the reference its inputs, and give them only when read)
         _job, _tri, _bary = self, tri_idx, bary
         ctx.wire_fields = lambda: _job.wire_fields(_tri, _bary)
+        # R251 C079 (TEX-2): the per-triangle mip table, lazily too --
+        # n_tex_image reads it under the footprint gate with lod_source
+        # TRIANGLE; the GPU's hal_lod_WxH field is the same table
+        ctx.tri_lod = lambda w, h, bias=0.0: _job.tri_lod(w, h, bias)
         return ctx
 
     def _fill_object(self, ctx, obj_idx):
@@ -2621,6 +3060,15 @@ class ShadeJob:
             surf.backfacing = np.asarray(ctx.backfacing, np.float32)
         extras = {} if (np.any(surf.bi_spectra > 0.0)
                         or np.any(surf.shadows_only > 0.5)) else None
+        if rate_mode == 'LIGHT':
+            # R251 (MAT-A): a refused period item shades as its fallback
+            # (DS_FIXED / FLAT) from here on; the carriers ask for the
+            # specular (and the key lamp's cosine) apart
+            model = CB.effective_model(model, mat, st)
+            ex = CB.light_extras(model)
+            if ex:
+                extras = dict(extras or {})
+                extras.update(ex)
         # the SSS main-pass sample: shi->co was CAMERA space, so the
         # tree is queried there; nothing samples during the pre-pass
         # (2.79's sample_sss returns 0 before the tree exists)
@@ -2637,6 +3085,17 @@ class ShadeJob:
                             rng if rng is not None else self.rng, self.lights,
                             extras=extras, suppress_spec=self.sss_prepass,
                             sss=sss_arg)
+        light_alpha = None
+        if rate_mode == 'LIGHT' and CB.wants_spec(model):
+            # R251 (MAT-A): the carried channel, read BEFORE fog (the DS
+            # index and the D3D carry are unfogged; the PS2 carry takes
+            # the corner's fog transmittance from core/fog.factor)
+            _fog_f = None
+            if st.fog and CB.fogs_carry(model):
+                from . import fog as _FOGM
+                _fog_f = _FOGM.factor(ctx.depth, st, self.scene, ctx.P,
+                                      ctx, surf)
+            light_alpha = CB.light_alpha(model, rgb, extras, fog=_fog_f)
 
         if np.any(surf.bi_mir_fresnel != 0.0):
             # Mirror > Fresnel: 2.79 scales ray_mirror by fresnel_fac
@@ -2662,10 +3121,11 @@ class ShadeJob:
         if np.any(surf.use_mist < 0.5):
             # Options > Use Mist off: the material ignores the fog
             fogged = apply_fog(rgb.copy(), ctx.depth, st, self.scene,
-                               P=ctx.P)
+                               P=ctx.P, ctx=ctx, surf=surf)
             rgb = np.where((surf.use_mist > 0.5)[:, None], fogged, rgb)
         else:
-            rgb = apply_fog(rgb, ctx.depth, st, self.scene, P=ctx.P)
+            rgb = apply_fog(rgb, ctx.depth, st, self.scene, P=ctx.P,
+                            ctx=ctx, surf=surf)
         alpha = np.clip(surf.opacity, 0.0, 1.0)
         if np.any(surf.bi_transp_fresnel != 0.0):
             # Transparency > Fresnel REPLACES the alpha slider outright,
@@ -2697,22 +3157,73 @@ class ShadeJob:
             # SAME hard law on every road (camera pass, blend layers,
             # ray hits), so whichever road drew the surface agrees on
             # where its holes are
+            # R251 C031 (PS2 GS AFAIL / GX alpha compare): a Clip+Blend
+            # material keeps its SUB-threshold alpha (the blend half,
+            # drawn a second time as a layer with no depth write) and
+            # forces 1.0 above it (the opaque half, promoted in the
+            # z-pass exactly as CLIP); `surf.alpha_soft` carries the mode
+            # PER FRAGMENT because the vertex/face roads batch across
+            # materials. CLIP keeps its hard 0/1.
             cm = surf.alpha_clip >= 0.0
             alpha = np.where(
                 cm,
                 np.where(alpha >= np.maximum(surf.alpha_clip, 1e-6),
-                         1.0, 0.0),
+                         1.0, np.where(surf.alpha_soft > 0.5, alpha, 0.0)),
                 alpha).astype(np.float32)
         if st.transparency == 'STIPPLE' and ctx.px is not None:
             # keep or drop each pixel outright against an ordered threshold --
             # no blending, exactly as hardware without an alpha unit managed it
-            from .dither import threshold_map
-            tm = threshold_map(st.stipple_pattern
-                               if st.stipple_pattern != 'NONE' else 'BAYER4',
-                               64, 64)
-            thr = tm[np.asarray(ctx.py) % tm.shape[0],
-                     np.asarray(ctx.px) % tm.shape[1]]
-            alpha = np.where(alpha > np.asarray(thr, np.float32), 1.0, 0.0)
+            from .dither import ORDERED, threshold_map
+            kind = str(getattr(st, 'stipple_pattern', 'BAYER4') or '')
+            if kind == 'N64_NOISE':
+                # R251 C015 (N64 RDP dither_alpha_en): the compare is
+                # the RDP's integer one -- round(alpha * 255) against a
+                # FRESH 8-bit random per (pixel, frame, seed), a FULL-
+                # FRAME map (never tiled) built once per (H, W, frame,
+                # seed) and shared by every shading chunk (a double
+                # build in two threads is bitwise the same map, never a
+                # lock). a8 > r8 exactly as angrylion's alpha_compare;
+                # a tie DROPS. The GPU uploads this very array
+                frame_n = int(getattr(self.scene, 'frame', 1) or 1)
+                seed_n = int(getattr(st, 'seed', 0) or 0)
+                nkey = (int(self.height), int(self.width), frame_n,
+                        seed_n)
+                ncache = getattr(self, '_r251_noise_maps', None)
+                if ncache is None:
+                    ncache = self._r251_noise_maps = {}
+                tm = ncache.get(nkey)
+                if tm is None:
+                    tm = threshold_map('N64_NOISE', nkey[0], nkey[1],
+                                       frame=frame_n, seed=seed_n)
+                    ncache.clear()
+                    ncache[nkey] = tm
+                thr = tm[np.asarray(ctx.py), np.asarray(ctx.px)]
+                a8 = np.round(np.asarray(alpha, np.float32)
+                              * np.float32(255))
+                alpha = np.where(a8 > thr, 1.0, 0.0)
+                kind = None
+            elif ORDERED.get(kind) is None:
+                # R251: `stipple_pattern` is a free string, so a preset
+                # dict or a script can carry an error-diffusion kind past
+                # the enum, and Blender hands the exporter '' for a
+                # stored number no item carries (a scene saved before
+                # 1.90.0 with Screen Door at None). Bayer 4x4, by name,
+                # once per job (the GPU's `_build_stipple` takes the
+                # same fallback so both devices bake the same map)
+                if not getattr(self, '_r251_stipple_said', False):
+                    print(f'[Halcyon] transparency: stipple pattern '
+                          f'{kind!r} is not an ordered map; Bayer 4x4 '
+                          'used (an error-diffusion kind, or a scene '
+                          'saved before 1.90.0 with Screen Door at None, '
+                          'reads back as this)')
+                    self._r251_stipple_said = True
+                kind = 'BAYER4'
+            if kind is not None:
+                tm = threshold_map(kind, 64, 64)
+                thr = tm[np.asarray(ctx.py) % tm.shape[0],
+                         np.asarray(ctx.px) % tm.shape[1]]
+                alpha = np.where(alpha > np.asarray(thr, np.float32),
+                                 1.0, 0.0)
         elif st.transparency == 'NONE':
             alpha = np.ones_like(alpha)
         if extras is not None and 'only_shadow' in extras and \
@@ -2764,6 +3275,47 @@ class ShadeJob:
                         if nd.get('bl_idname')
                         == 'HALCYON_BIMaterialNode'):
                     alpha = alpha * oc[:, 3]
+        if rate_mode == 'LIGHT':
+            # R251 (MAT-A): the corner quantiser (the lit colour saturated
+            # and quantised to the machine's depth, AFTER fog, shadows-only
+            # and object colour) and the carried channel in the alpha
+            rgb_q = CB.corner_rgb(model, rgb)
+            if rgb_q is not None:
+                rgb = rgb_q
+            if light_alpha is not None:
+                alpha = light_alpha
+        # R251 C126 (Blender 2.4x Env): an Env-hole material shows the
+        # WORLD along the view ray (the same evaluator the background
+        # uses, ground plane included) at alpha 0 -- opaque for the
+        # z-test, nothing behind it composited; after every alpha law
+        # so it holds in every transparency mode, and at ray hits too
+        # (a mirror sees the sky through the hole, as 2.4x's Env did).
+        # Per FRAGMENT through the material index (the vertex/face
+        # roads batch across materials)
+        _hole_mats = getattr(self, '_r251_env_hole_mats', None)
+        if _hole_mats is None:
+            _hole_mats = self._r251_env_hole_mats = np.array(
+                [str(getattr(m, 'blend_mode', 'INHERIT')) == 'ENV_HOLE'
+                 for m in (self.scene.materials or [])] or [False], bool)
+        if bool(_hole_mats.any()):
+            _tri_h = getattr(ctx, 'tri', None)
+            _mi_h = getattr(self.scene.mesh, 'mat_index', None)
+            if _tri_h is not None and _mi_h is not None:
+                hole = _hole_mats[np.clip(_mi_h[np.asarray(_tri_h)], 0,
+                                          _hole_mats.size - 1)]
+            elif mat is not None:
+                hole = np.full(alpha.shape[0], str(getattr(
+                    mat, 'blend_mode', 'INHERIT')) == 'ENV_HOLE', bool)
+            else:
+                hole = None
+            if hole is not None and bool(hole.any()):
+                wc = world_color(self.scene, st,
+                                 M.normalize(np.asarray(ctx.I)[hole]),
+                                 self.textures, int(hole.sum()),
+                                 eye=self.eye)
+                rgb = np.asarray(rgb, np.float32).copy()
+                rgb[hole] = np.asarray(wc, np.float32)
+                alpha = np.where(hole, 0.0, alpha)
         return np.concatenate([rgb, alpha[:, None]], axis=1).astype(np.float32)
 
     def _add_raytraced(self, rgb, surf, ctx, ray_depth):
@@ -3025,7 +3577,7 @@ def shade_vertex_rate(job, tri_subset, rate, st=None):
     mesh = job.scene.mesh
     tris = mesh.tris[tri_subset]
     if rate == 'FACE':
-        bary = np.full((tris.shape[0], 3), 1.0 / 3.0, np.float32)
+        bary = CB.face_bary(job, tri_subset, st)
         idx = tri_subset.astype(np.int32)
         col = (_shade_chunked(job, idx, bary, None, None, None, None, st)
                if st is not None else job.shade(idx, bary))
@@ -3522,6 +4074,14 @@ def render(scene, settings=None, progress=None, band=None):
     row 0 as the top and must flip first.
     """
     st = settings or scene.settings
+    st._period_refusals = set()      # R251 (MAT-A): CB.refuse prints once
+    # R251 C012: the console vertex formats, on the persistent scene
+    # (idempotent: quantize_mesh returns the same object for the same
+    # dial and the original for NONE)
+    scene.mesh = raster.quantize_mesh(
+        scene.mesh, str(getattr(st, 'vertex_quantize', 'NONE')),
+        float(getattr(st, 'vertex_units', 64.0)))
+    scene.last_gel = None       # R251 C134: rebuilt below, beside last_depth
     scene = _apply_material_override(scene, st)
     collect_exclusive_lights(scene)
     mesh = scene.mesh
@@ -3543,6 +4103,15 @@ def render(scene, settings=None, progress=None, band=None):
             not getattr(st, '_pano_strip', False) and band is None and \
             not getattr(st, '_viewport', False):
         return _render_panorama(scene, st, progress)
+    # R251 C125: Blender 2.4's Pano + Xparts -- N yawed planar strips
+    # butted together; a PANO camera (the true cylinder) wins above,
+    # stereo / Y-shear stay off inside the strips, the AA roads and the
+    # lens passes run inside each strip
+    if int(getattr(st, 'pano_parts', 1)) > 1 and scene.camera is not None \
+            and str(getattr(scene.camera, 'type', 'PERSP')) == 'PERSP' \
+            and not getattr(st, '_pano_strip', False) and band is None \
+            and not getattr(st, '_viewport', False):
+        return _render_pano_parts(scene, st, progress)
     if str(getattr(st, 'stereo_mode', 'NONE')) != 'NONE' and \
             getattr(st, '_stereo', None) is None and band is None and \
             not getattr(st, '_pano_strip', False) and \
@@ -3551,30 +4120,47 @@ def render(scene, settings=None, progress=None, band=None):
     if str(st.aa_mode) == 'ACCUMULATE' and int(st.aa_samples) > 1 \
             and getattr(st, '_accum_jitter', None) is None:
         return _render_accumulated(scene, st, progress, band)
+    # R251 C098: lens passes are an F12 road: the viewport shows NO depth
+    # of field under Lens Passes (K full frames per draft and refine
+    # would be the lag the rules forbid; the post blur belongs to the
+    # POST method). No _pano_strip term: the shear is a per-strip camera
+    # matrix and composes inside each Pano Parts strip as ACCUMULATE does
+    if bool(st.dof) and str(getattr(st, 'dof_method', 'POST')) == 'LENS_ACCUMULATE' \
+            and not getattr(st, '_lens_pass', False) and scene.camera is not None \
+            and str(getattr(scene.camera, 'type', 'PERSP')) == 'PERSP' \
+            and not getattr(st, '_viewport', False):
+        return _render_lens_accumulated(scene, st, progress, band)
     LAST_GPU_VERDICT.update(wanted=False, engaged=False, why='')
+    # R250: the frame's residency record; a reused settings object
+    # (motion blur re-renders on the same one) may still carry the last
+    # frame's handle -- released here, never leaked
+    from ..gpu import frame as _FR
+    _FR.begin_frame(st)
+    # R249/R250: the flag every later GPU gate reads (post, ink) starts
+    # each frame false -- and BEFORE the geometry-less early return
+    # below, which used to leave a reused settings object with the
+    # previous frame's verdict
+    st._frame_gpu_shaded = False
+    # R251 (C092): the coverage plane starts every frame absent, before
+    # the geometry-less early return (a reused settings object must not
+    # carry the previous frame's plane)
+    scene.last_coverage = None
+    st._last_coverage = None
     ss = 1
     if st.aa_mode == 'SUPERSAMPLE':
         ss = max(int(np.round(np.sqrt(max(st.aa_samples, 1)))), 1)
     rw, rh = W * ss, H * ss
 
+    # R251 C058: the Y-shear flag lives on the bpy-free Camera, rewritten
+    # every frame (a stereo eye or an AA pass re-derives it from the
+    # settings itself; st.copy() drops private flags, the camera keeps it)
+    if scene.camera is not None:
+        scene.camera._yshear = yshear_active(scene.camera, st)
     view, proj, vp, eye = camera_matrices(scene.camera, rw, rh)
-    jit = getattr(st, '_accum_jitter', None)
-    ster = getattr(st, '_stereo', None)
-    if jit is not None or ster is not None:
-        # the accumulation pass's subpixel offset, as a clip-space
-        # translation: J @ vp shifts the whole projection by a fraction of
-        # a pixel, exactly what the OpenGL accumulation buffer's
-        # glTranslate jitter did. A stereo eye rides the same matrix:
-        # its off-axis frustum IS a clip-space x translation, sized so
-        # the convergence plane lands at zero parallax
-        J = np.eye(4, dtype=np.float32)
-        if jit is not None:
-            J[0, 3] = 2.0 * float(jit[0]) / rw
-            J[1, 3] = 2.0 * float(jit[1]) / rh
-        if ster is not None:
-            s_off, conv = ster
-            J[0, 3] += float(proj[0, 0]) * float(s_off) / max(float(conv),
-                                                              1e-4)
+    # the accumulation jitter and the stereo eye's window shift, as ONE
+    # clip-space translation (clip_jitter: the J block's own lines)
+    J = clip_jitter(st, proj, rw, rh)
+    if J is not None:
         proj = (J @ proj).astype(np.float32)
         vp = (J @ vp).astype(np.float32)
     # the water needs to know how big a pixel is before it can decide which
@@ -3620,6 +4206,9 @@ def render(scene, settings=None, progress=None, band=None):
     # body. Refreshed every frame; None when everything casts.
     st._shadow_cast_tri = _caster_keep_tri(
         scene, mesh) if st.shadows and st.ray_shadows else None
+    # R251 shadow pack: the mask pack (planar polygons, DC modifier
+    # volumes, DS shadow polygons) is baked after the G-buffer is final
+    st._mask_pack = st._mask_params = None
     # R204: the infinite floor answers the scene's lamps now -- built
     # after the BVH and the shadow maps so its cast shadows can use
     # whichever of the two each lamp uses
@@ -3638,11 +4227,94 @@ def render(scene, settings=None, progress=None, band=None):
     # by NOTHING -- the rasterisers ran their 1e-5 default regardless)
     near_eps = max(float(getattr(st, 'clip_near_epsilon', 1e-5) or 1e-5),
                    1e-6)
+    # ---- R251 raster options (RAST-A1): every new rasteriser dial in
+    # ONE object, built once, carried through the camera-space raster
+    # call sites and the kernel road, keyed into the G-buffer cache.
+    # The W encodings read the camera's own depth mapping z = A + B / w
+    # (near and far DERIVED from the projection matrix -- Blender's
+    # calc_matrix_camera and Halcyon's _persp alike -- so the clip
+    # planes, the matrix and the encoding are one truth)
+    _A = float(-proj[2, 2])
+    _B = float(proj[2, 3])
+    _is_ortho = str(getattr(scene.camera, 'type', 'PERSP')) == 'ORTHO'
+    _wnear = -_B / (1.0 + _A) if (1.0 + _A) != 0.0 else 0.0
+    _wfar = _B / (1.0 - _A) if (1.0 - _A) != 0.0 else 0.0
+    _enc = str(getattr(st, 'depth_encoding', 'LINEAR') or 'LINEAR')
+    if _enc not in raster.DEPTH_ENCODINGS:
+        _enc = 'LINEAR'
+    if _enc in raster.W_ENCODINGS and _is_ortho:
+        # an orthographic camera has w = 1 everywhere: the fallback by
+        # name, BEFORE either road, so the raster never sees the case
+        print(f'[Halcyon] depth encoding {_enc} needs a perspective '
+              'camera: LINEAR depth this frame')
+        _enc = 'LINEAR'
+    _painters = str(getattr(st, 'depth_sort', 'ZBUFFER')) == 'PAINTERS'
+    if _painters and _enc != 'LINEAR':
+        # a painter's key is a distance in units or a bucket, not NDC
+        # z: an encoding would clamp every polygon to the top code
+        print(f"[Halcyon] depth encoding {_enc} is a z-buffer rule; "
+              "Painter's sort keeps LINEAR this frame")
+        _enc = 'LINEAR'
+    _ot_on = _painters and \
+        str(getattr(st, 'painters_key', 'CENTROID')) == 'ORDERING_TABLE'
+    # R251 C127: REYES jitter -- fresh per (frame, seed); inert where
+    # EDGE / ADAPTIVE / ACCUMULATE run their own sample logic (their
+    # sub-passes render at aa_mode NONE with _accum_jitter set)
+    _jit = None
+    if str(getattr(st, 'aa_sample_pattern', 'GRID')) == 'JITTER' and \
+            str(st.aa_mode) in ('NONE', 'SUPERSAMPLE') and \
+            getattr(st, '_accum_jitter', None) is None:
+        _jit = (int(getattr(scene, 'frame', 1) or 1),
+                int(getattr(st, 'seed', 0) or 0))
+    # R251 C001: the RDP's coverage plane, at 1 sample per pixel only
+    # (the VI filter reads the coverage at output size): a named no-op
+    _cvg_on = bool(getattr(st, 'n64_coverage_aa', False))
+    if _cvg_on and ss > 1:
+        if int(ss) not in _N64_SKIP_SAID:
+            _N64_SKIP_SAID.add(int(ss))
+            print('[Halcyon] N64 coverage AA needs 1 sample per pixel (the '
+                  'VI filter reads the coverage at output size): skipped '
+                  'this frame')
+        _cvg_on = False
+    opts = raster.RasterOpts(
+        pixel_shift=raster.pixel_shift_of(st),
+        reject=str(getattr(st, 'near_clip_mode', 'CLIP')) == 'REJECT',
+        size_limit=(1023 * ss, 511 * ss) if _ot_on else None,
+        jitter=_jit,
+        cvg=_cvg_on,
+        enc=_enc,
+        wparams=raster.WParams(near=np.float32(_wnear),
+                               far=np.float32(_wfar),
+                               A=np.float32(_A), B=np.float32(_B),
+                               is_ortho=_is_ortho))
+    st._raster_opts = opts          # the punch-through raster reads it
+    # R251 C038: the DS rear-plane depth bitmap -- the World's Z pass as
+    # the frame's own z-buffer clear, in the frame's encoding and bits
+    _wd = getattr(scene.world, 'backdrop_depth', None) \
+        if scene.world is not None else None
+    if _wd is not None:
+        opts.clear = raster.backdrop_clear(
+            _wd, getattr(scene.world, 'backdrop_offset', (0, 0)), rw, rh,
+            opts, int(st.depth_precision), ss=ss)
+        gbuf.clear_depth(opts.clear[0], opts.clear[1], opts.enc)
     if not st.tex_perspective:
         gbuf.alloc_linear()
     frags = raster.FragmentList() if st.transparency in ('SORTED', 'ABUFFER') else None
 
     job = ShadeJob(scene, st, textures, bvh, view, eye, rw, rh)
+    # R250: the sky pass draws the camera rays the background pass draws:
+    # the same (jittered, stereo-shifted) view-projection and the same
+    # supersample factor ride on the job for gpu/shade and gpu/sky
+    job.vp = vp
+    job.ss = ss
+    if bool(getattr(st, 'fog', False)) and \
+            str(getattr(st, 'fog_color_source', 'FIXED')) == 'BACKDROP':
+        # R251 LIGHT-A2 (F008, A30): the backdrop at EVERY pixel, built
+        # once before either road shades, so both read one array
+        from . import sky as _SKYB
+        with ST.track('backdrop (fog target)'):
+            job.backdrop = _SKYB.backdrop_rgb(scene, st, rw, rh, vp, eye,
+                                              textures, ss=ss)
 
     if mesh is None or mesh.tris is None or mesh.tris.size == 0:
         img = _background_image(scene, st, rw, rh, vp, eye, None, textures)
@@ -3750,7 +4422,10 @@ def render(scene, settings=None, progress=None, band=None):
 
     flat_depth = None
     if st.depth_sort == 'PAINTERS':
-        flat_depth = polygon_depths(mesh, view, eye, st.painters_key)
+        flat_depth = polygon_depths(
+            mesh, view, eye, st.painters_key,
+            ot=(int(st.ot_length), float(st.ot_far))
+            if str(st.painters_key) == 'ORDERING_TABLE' else None)
 
     want_overdraw = st.debug_pass == 'OVERDRAW'
     # ---- the G-buffer cache (R170): a redraw with an unchanged camera,
@@ -3784,7 +4459,8 @@ def render(scene, settings=None, progress=None, band=None):
             gbuf_ckey = (_gk(mesh), np.asarray(vp, np.float32).tobytes(),
                          rw, rh, cull, float(snap),
                          int(st.depth_precision), int(subdiv_px),
-                         float(near_eps), gbuf.bary_lin is not None, _sub)
+                         float(near_eps), gbuf.bary_lin is not None, _sub,
+                         opts.key())
         except Exception:                                       # noqa: BLE001
             gbuf_ckey = None
             _GBUF_STATS['last'] = 'off(keyfail)'
@@ -3798,6 +4474,12 @@ def render(scene, settings=None, progress=None, band=None):
             gbuf.depth[:] = _gb_hit['depth']
             gbuf.zndc[:] = _gb_hit['zndc']
             gbuf.front[:] = _gb_hit['front']
+            if _gb_hit.get('zkey') is not None:
+                gbuf.alloc_zkey()[:] = _gb_hit['zkey']
+            if _gb_hit.get('cvg') is not None:
+                # R251 C001: without this a HIT (the second F12, every
+                # viewport redraw) would hand the VI an all-full plane
+                gbuf.alloc_cvg()[:] = _gb_hit['cvg']
             if _gb_hit.get('bary_lin') is not None and \
                     gbuf.bary_lin is not None:
                 gbuf.bary_lin[:] = _gb_hit['bary_lin']
@@ -3813,10 +4495,21 @@ def render(scene, settings=None, progress=None, band=None):
     # qualified -- anything it does not reproduce rasterises on the CPU
     # exactly as before, with the reason printed. Whole-frame only.
     rastered_on_gpu = False
+    _gate_why = None
     if not rastered_from_cache and \
             str(getattr(st, 'render_device', 'CPU')).upper() == 'GPU' and \
-            getattr(st, 'gpu_raster', False) and band is None and \
-            flat_depth is None and not want_overdraw:
+            getattr(st, 'gpu_raster', False):
+        # R251: the two refusals left are printed by name (Painter's
+        # now rides the kernel through the flat depth, C004)
+        _gate_why = 'a banded frame (workers own their rows)' \
+            if band is not None else \
+            ('the OVERDRAW census is a sequential count'
+             if want_overdraw else None)
+        if _gate_why is not None:
+            print(f'[Halcyon GPU] rasterising on the CPU: {_gate_why}')
+    if not rastered_from_cache and \
+            str(getattr(st, 'render_device', 'CPU')).upper() == 'GPU' and \
+            getattr(st, 'gpu_raster', False) and _gate_why is None:
         # affine frames run the kernel's lin variant (a third image
         # carries the screen-linear barycentrics, fill()'s bary_lin);
         # quantised-depth and snapped frames run with the RASTER TIE
@@ -3834,11 +4527,21 @@ def render(scene, settings=None, progress=None, band=None):
             # (gpu/device.py _main): the CPU halves of this call
             # never block the interface, the driver halves cross
             # as millisecond bursts
+            if bool(getattr(opts, 'cvg', False)) and gbuf.cvg is None:
+                # C001: the kernel writes the coverage plane only into a
+                # plane that EXISTS (craster.raster_into_gbuffer's
+                # want_cvg); the CPU fill allocates its own. For want of
+                # this line a GPU-rastered N64 frame had no coverage on
+                # the driver: the VI filter was skipped on the GPU device
+                # (5512 of 6912 px wrong), and the plane-less G-buffer
+                # was cached for the next CPU frame of the same key
+                gbuf.alloc_cvg()
             try:
                 ok_r, why_r = _craster.raster_into_gbuffer(
                     mesh, vp, rw, rh, gbuf, cull=cull, snap=snap,
                     depth_bits=st.depth_precision, subset=opaque,
-                    subdiv_px=subdiv_px, near_eps=near_eps)
+                    subdiv_px=subdiv_px, near_eps=near_eps,
+                    flat_depth=flat_depth, opts=opts)
             except Exception as exc:                            # noqa: BLE001
                 ok_r, why_r = False, str(exc)
         if ok_r:
@@ -3853,7 +4556,8 @@ def render(scene, settings=None, progress=None, band=None):
                              count_overdraw=want_overdraw,
                              flat_depth=flat_depth, scissor=scissor,
                              batched=False if want_overdraw else None,
-                             subdiv_px=subdiv_px, near_eps=near_eps)
+                             subdiv_px=subdiv_px, near_eps=near_eps,
+                             opts=opts)
     if gbuf_ckey is not None and not rastered_from_cache:
         # store copies -- the live gbuf is written by later stages
         # (gpu_alpha, wireframe) and must never alias the cache
@@ -3865,7 +4569,7 @@ def render(scene, settings=None, progress=None, band=None):
             _GBUF_STATS['last'] = 'MISS(first)'
         else:
             _names = ('mesh', 'vp', 'rw', 'rh', 'cull', 'snap', 'depth',
-                      'subdiv', 'eps', 'lin', 'subset')
+                      'subdiv', 'eps', 'lin', 'subset', 'opts')
             _diff = [n for n, a, b in zip(_names, _prev, gbuf_ckey)
                      if a != b]
             if 'vp' in _diff:
@@ -3907,6 +4611,8 @@ def render(scene, settings=None, progress=None, band=None):
             'tri': gbuf.tri.copy(), 'bary': gbuf.bary.copy(),
             'depth': gbuf.depth.copy(), 'zndc': gbuf.zndc.copy(),
             'front': gbuf.front.copy(),
+            'zkey': None if gbuf.zkey is None else gbuf.zkey.copy(),
+            'cvg': None if gbuf.cvg is None else gbuf.cvg.copy(),
             'bary_lin': None if gbuf.bary_lin is None
             else gbuf.bary_lin.copy()}
         _nb = _gbuf_entry_bytes(_ent)
@@ -3934,6 +4640,23 @@ def render(scene, settings=None, progress=None, band=None):
                 _promote_clip(job, gbuf, vp, st, clip_sub, _clip_plans,
                               snap, flat_depth, scissor, subdiv_px,
                               near_eps, ckey=gbuf_ckey)
+
+    # R251 shadow pack: the shadow-mask bake -- AFTER the R211 promotion
+    # (it rewrites gbuf.tri/zndc at every promoted CLIP pixel) and never
+    # after the _GBUF_CACHE store alone. One caster raster per PLANAR
+    # lamp, one fragment capture per authored volume, on BOTH roads
+    # (the beauty G-buffer is bitwise the CPU's on the GPU road too);
+    # (None, None) when no planar lamp and no volume exists
+    from .shadowmask import build as _mask_build
+    _pl = st.shadows and (st.shadow_default == 'PLANAR' or (
+        st.shadow_default == 'PER_LIGHT' and any(
+            getattr(l, 'shadow', 'MAP') == 'PLANAR' for l in scene.lights)))
+    _kt = _caster_keep_tri(scene, mesh) if _pl else None
+    with ST.track('shadow mask bake'):
+        st._mask_pack, st._mask_params = _mask_build(
+            scene, st, gbuf, vp, snap, near_eps,
+            None if _kt is None else np.nonzero(_kt)[0],
+            scissor=scissor, view=view, eye=eye)
 
     if band is None and not getattr(st, '_viewport', False):
         # the two numbers behind "the depth is screwed up": what the
@@ -4045,15 +4768,28 @@ def render(scene, settings=None, progress=None, band=None):
         # this took the field's sky bucket from a full evaluation per
         # pass to a sliver
         _bg_un = _bg_un & _rm
-    with ST.track('background / sky'):
-        img = _background_image(scene, st, rw, rh, vp, eye, _bg_un,
-                                textures, ss=ss)
+    _gpu_road = str(getattr(st, 'render_device', 'CPU')).upper() == 'GPU' \
+        and bool(st.gpu_shading) and band is None
+
+    def _cpu_sky():
+        with ST.track('background / sky'):
+            return _background_image(scene, st, rw, rh, vp, eye, _bg_un,
+                                     textures, ss=ss)
+
+    # R250: on the GPU road the sky is drawn in the shading burst (the
+    # readback is then the whole frame) and the CPU evaluates it only
+    # when that pass refused, AFTER shading -- order-free, because the
+    # shading never writes an uncovered pixel and the sky never a covered
+    # one. The CPU road evaluates it here, exactly as before
+    img = None if _gpu_road else _cpu_sky()
     # (volumetric light beams composite AFTER shading now -- they are in
     # front of geometry, and drawing them here had the shading loop's
     # img[py, px] assignment overwrite every beam pixel that crossed a
     # surface: the field's beams only ever showed against the sky)
 
     py, px = np.nonzero(covered)
+    # (R250: st._frame_gpu_shaded is reset at the top of the frame now,
+    # before the geometry-less early return)
     if py.size:
         # Deferred GPU shading: the G-buffer just rasterised is shaded in a
         # full-screen pass per material, on the same mechanism the post
@@ -4154,16 +4890,61 @@ def render(scene, settings=None, progress=None, band=None):
                 except Exception:                               # noqa: BLE001
                     pass
             else:
-                img[py, px, :3] = got[py, px]
                 ga = getattr(gbuf, 'gpu_alpha', None)
-                if st.transparency == 'STIPPLE' and ga is not None:
-                    # the Screen Door: rgb is the full shaded colour and
-                    # the ordered 0/1 pattern rides the alpha -- exactly
-                    # the (rgb shaded, alpha stippled) split _shade
-                    # writes on the CPU
-                    img[py, px, 3] = ga[py, px].astype(np.float32)
+                _stip = st.transparency == 'STIPPLE' and ga is not None
+                _res = getattr(gbuf, 'gpu_frame', None)
+                if getattr(gbuf, 'gpu_sky', False):
+                    # R250: the sky drew in the burst -- the readback IS
+                    # the frame. rgb whole (the sky in every uncovered
+                    # pixel, the materials in every covered one); the
+                    # alpha plane is the frame's own law: covered 1.0 --
+                    # or the Screen Door's decoded 0/1 bit -- uncovered
+                    # the film's (0 under a transparent film). No
+                    # per-pixel copy: that copy was a bucket of its own
+                    _cov_all = gbuf.mask()
+                    _bg_a = np.float32(0.0 if getattr(st, 'film_transparent',
+                                                       False) else 1.0)
+                    _rgba = getattr(gbuf, 'gpu_frame_rgba', None)
+                    if _rgba is not None and _rgba.shape[0] == rh and \
+                            _rgba.shape[1] == rw and _rgba.shape[2] == 4:
+                        img = _rgba
+                    else:
+                        img = np.empty((rh, rw, 4), np.float32)
+                        img[:, :, :3] = got
+                    if _stip:
+                        img[:, :, 3] = np.where(_cov_all,
+                                                ga.astype(np.float32), _bg_a)
+                    else:
+                        img[:, :, 3] = np.where(_cov_all, np.float32(1.0),
+                                                _bg_a)
+                    if _res is not None:
+                        if img is _rgba and not _stip:
+                            # the target on the GPU equals img byte for
+                            # byte: it stays there for the ink, the
+                            # resolve and the post chain
+                            _FR.install(st, _res, 'shade')
+                        else:
+                            _res.release()
                 else:
-                    img[py, px, 3] = 1.0
+                    # the sky pass refused by name: the CPU draws the sky
+                    # now (after the shading; the pixels are the same)
+                    if _res is not None:
+                        _res.release()
+                    if img is None:
+                        img = _cpu_sky()
+                    img[py, px, :3] = got[py, px]
+                    if _stip:
+                        # the Screen Door: rgb is the full shaded colour
+                        # and the ordered 0/1 pattern rides the alpha --
+                        # exactly the (rgb shaded, alpha stippled) split
+                        # _shade writes on the CPU
+                        img[py, px, 3] = ga[py, px].astype(np.float32)
+                    else:
+                        img[py, px, 3] = 1.0
+                    _why_sky = str(getattr(gbuf, 'gpu_sky_why', '') or '')
+                    if _why_sky:
+                        from ..gpu import sky as _GSKY
+                        _GSKY._warn(_why_sky)
                 shaded_on_gpu = True
                 LAST_GPU_VERDICT['engaged'] = True
                 try:
@@ -4237,6 +5018,24 @@ def render(scene, settings=None, progress=None, band=None):
                         print(f'[Halcyon GPU] shade split: {parts}; '
                               f"{int(_LT.get('passes', 0))} material "
                               f'pass(es)')
+                        # R250: the sky's verdict and the frame's
+                        # residency, on the same line the field reads
+                        _sky_m = int(_LT.get('sky', -1))
+                        _sky_names = {0: 'transparent film (zeros)',
+                                      1: 'flat colour', 2: 'sky blend',
+                                      3: 'environment image',
+                                      4: 'gradient', 5: 'bands', 6: 'HDRI'}
+                        if _sky_m >= 0:
+                            print('[Halcyon GPU] sky: '
+                                  f"{_sky_names.get(_sky_m, _sky_m)} drawn "
+                                  'in the shading burst; frame '
+                                  + ('kept on the GPU'
+                                     if _LT.get('resident') else
+                                     'read back (' + (
+                                         'Screen Door alpha'
+                                         if st.transparency == 'STIPPLE'
+                                         else 'a CPU composite edits it')
+                                     + ')'))
                         if _LT.get('reflect_ms'):
                             print(
                                 '[Halcyon GPU] reflect split: trace '
@@ -4257,6 +5056,8 @@ def render(scene, settings=None, progress=None, band=None):
         # loss right after the frame parked
         st._frame_gpu_shaded = shaded_on_gpu
         if not shaded_on_gpu:
+            if img is None:
+                img = _cpu_sky()
             if getattr(st, 'radiosity', False) and bvh is not None and \
                     band is None and not getattr(st, '_viewport', False):
                 # the cost, named before it is paid: the field's first
@@ -4297,10 +5098,22 @@ def render(scene, settings=None, progress=None, band=None):
             img[py, px, :3] = col[:, :3]
             img[py, px, 3] = np.maximum(img[py, px, 3], col[:, 3])
 
+    if img is None:
+        # nothing was covered: the whole frame is sky, drawn on the CPU
+        img = _cpu_sky()
+
+    # R251 shadow pack: the mask applied over the finished opaque frame,
+    # the same float32 numpy rule on both roads (the frame leaves the GPU
+    # for it, as under fog)
+    img = SM.apply_after_readback(img, job, st)
+
+    if _wire_active(scene, st, gbuf):
+        _FR.edited(st, 'wireframe')
     with ST.track('wireframe'):
         img = apply_wireframe(job, gbuf, img, st, vp, eye, textures)
 
     if _gou_on:
+        _FR.edited(st, 'painted backgrounds')
         # R233: the painted background road -- strokes over the
         # Background materials and the setback's softness, before the
         # ink so the cels' lines land crisp over the painting. One CPU
@@ -4326,6 +5139,7 @@ def render(scene, settings=None, progress=None, band=None):
         # Never on a band: a band's buffer starts at its own y and the
         # frame-coordinate splats would land shifted (the pool skips
         # halo scenes; this guard keeps a direct banded call honest)
+        _FR.edited(st, 'halos')
         with ST.track('halos'):
             img = _draw_halos(img, scene, st, gbuf, view, proj, rw, rh,
                               sel_mask=_rm)
@@ -4333,19 +5147,51 @@ def render(scene, settings=None, progress=None, band=None):
     if transparent is not None and transparent.size and frags is not None:
         if progress:
             progress(0.65, 'Transparency')
-        raster.rasterize(mesh.verts, mesh.tris, vp, rw, rh, cull='NONE', snap=snap,
-                         depth_bits=st.depth_precision, subset=transparent,
-                         gbuf=gbuf, frags=frags, depth_write=False,
-                         flat_depth=flat_depth, scissor=scissor,
-                         subdiv_px=subdiv_px, near_eps=near_eps)
+        # R251 C126 (Blender 2.4x Zoffs): one raster call per distinct Z
+        # Offset among the see-through materials, nearer = smaller depth,
+        # applied at COLLECTION (the keep test against the opaque depth
+        # runs on the offset z, so a decal a little behind its surface
+        # is captured); every offset zero is ONE call with z_offset 0.0
+        _zo = np.array([np.float32(getattr(m, 'z_offset', 0.0))
+                        for m in (scene.materials or [None])], np.float32)
+        zo_all = (_zo[np.clip(mesh.mat_index[transparent], 0, _zo.size - 1)]
+                  if mesh.mat_index is not None
+                  else np.zeros(transparent.size, np.float32))
+        # the raster's depth is the buffer's own (ndc z), so the slider
+        # converts through the camera's clip range exactly as 2.4x's
+        # zbuf did (polygon_offset = zoffs * INT_MAX / (clipend - clipsta))
+        _zo_scale = zoffs_scale(scene.camera)
+        for zo in np.unique(zo_all):
+            raster.rasterize(mesh.verts, mesh.tris, vp, rw, rh, cull='NONE', snap=snap,
+                             depth_bits=st.depth_precision,
+                             subset=transparent[zo_all == zo],
+                             gbuf=gbuf, frags=frags, depth_write=False,
+                             flat_depth=flat_depth, scissor=scissor,
+                             subdiv_px=subdiv_px, near_eps=near_eps,
+                             opts=opts,
+                             z_offset=(-float(np.float32(zo) * _zo_scale)
+                                       if zo != 0.0 else 0.0))
+        _FR.edited(st, 'transparency')
         with ST.track('transparency'):
-            img = _composite_abuffer(job, frags, gbuf, img, st, band=band)
+            img = _composite_abuffer(job, frags, gbuf, img, st, band=band,
+                                     vp=vp, snap=snap, rows=scissor)
     elif transparent is not None and transparent.size:
         raster.rasterize(mesh.verts, mesh.tris, vp, rw, rh, cull=cull, snap=snap,
                          depth_bits=st.depth_precision, subset=transparent,
                          gbuf=gbuf, flat_depth=flat_depth, scissor=scissor,
-                         subdiv_px=subdiv_px, near_eps=near_eps)
+                         subdiv_px=subdiv_px, near_eps=near_eps,
+                         opts=opts)
 
+    if str(getattr(st, 'framebuffer', 'NONE')) != 'NONE' and not (
+            transparent is not None and transparent.size and frags is not None):
+        # R251: a 16-bit buffer truncates the opaque frame too -- with
+        # nothing see-through the composite never ran, so pack it here
+        _FR.edited(st, 'framebuffer format')
+        with ST.track('transparency'):
+            img = framebuffer_pack_frame(img, st, rows=scissor)
+
+    if _beams_active(scene, st):
+        _FR.edited(st, 'volumetric lights')
     with ST.track('volumetric lights'):
         img = _light_volumes(img, scene, st, gbuf, vp, eye, rw, rh, bvh,
                              sel_mask=_rm)
@@ -4359,6 +5205,8 @@ def render(scene, settings=None, progress=None, band=None):
         # (volume, step, lamp)), so the band's values are the whole
         # frame's, and N workers no longer march the frame N times
         from . import volume as VOL
+        if VOL.scene_volumes(scene):
+            _FR.edited(st, 'volume containers')
         _vol_sel = _rm
         if band is not None:
             _bm = np.zeros((rh, rw), bool)
@@ -4394,6 +5242,7 @@ def render(scene, settings=None, progress=None, band=None):
         if wd_w is not None and \
                 str(getattr(wd_w, 'weather', 'NONE') or 'NONE') != 'NONE':
             from . import sky as SKY
+            _FR.edited(st, 'weather')
             with ST.track('weather'):
                 img = SKY.weather_overlay(
                     img, wd_w, rw, rh,
@@ -4401,6 +5250,7 @@ def render(scene, settings=None, progress=None, band=None):
                     out_wh=(W, H), sel_mask=_rm)
 
     if st.debug_pass != 'BEAUTY':
+        _FR.edited(st, 'debug pass')
         img = _debug_pass(job, gbuf, img, st)
 
     if progress:
@@ -4421,12 +5271,39 @@ def render(scene, settings=None, progress=None, band=None):
         scene.last_passes = {k: v[::ss, ::ss]
                              for k, v in scene.last_passes.items()}
 
+    # R251 C001: the coverage plane for the post chain's VI stage (1
+    # sample per pixel, else None -- the skip was named above)
+    scene.last_cvg = gbuf.cvg if (getattr(opts, 'cvg', False) and ss == 1
+                                  and gbuf.cvg is not None) else None
     scene.last_depth = None
     if st.dof and depth_m is not None:
         # metres, so Focus Distance in the UI is the distance it says it is.
         # It was normalised device depth, which put every focus value the
         # slider allows far behind the whole scene and blurred the lot.
         scene.last_depth = depth_m[::ss, ::ss] if ss > 1 else depth_m
+    # R251 (C092): the coverage plane Super Black floors by -- the
+    # G-buffer's own triangle mask, ANY sample of a supersampled pixel
+    # counting as covered. Built only when the stage is on (the
+    # reduction is a pass over every sample)
+    scene.last_coverage = None
+    if bool(getattr(st, 'super_black', False)):
+        try:
+            _cm = gbuf.mask()
+            if ss > 1:
+                _cm = _cm.reshape(_cm.shape[0] // ss, ss,
+                                  _cm.shape[1] // ss, ss).any(axis=(1, 3))
+            scene.last_coverage = np.ascontiguousarray(_cm)
+        except Exception:                                   # noqa: BLE001
+            scene.last_coverage = None
+    st._last_coverage = scene.last_coverage
+    # R251 C134: the material plane the optical printer's mattes are cut
+    # from (an F12 stage: no plane for a pooled band or the viewport)
+    scene.last_gel = None
+    if getattr(st, 'matte_glow', False) and band is None \
+            and not getattr(st, '_viewport', False):
+        from . import signal_codec as _SC
+        scene.last_gel = _SC.gel_plane(gbuf, job.scene.mesh,
+                                       scene.materials, ss)
     scene.last_shafts = shaft_sources(scene, st, vp)
     scene.last_flares = _flare_sources(scene, st, gbuf, vp)
 
@@ -4436,6 +5313,7 @@ def render(scene, settings=None, progress=None, band=None):
         # pixels with a separable 1-2-1 tent -- the Dreamcast/PS2-era
         # "edge antialias" that smoothed silhouettes without paying for a
         # supersampled frame
+        _FR.edited(st, 'edge smooth')
         with ST.track('edge smooth'):
             img = _edge_smooth(img, gbuf, st, depth_m)
 
@@ -4449,6 +5327,7 @@ def render(scene, settings=None, progress=None, band=None):
         # already someone's sub-sample (_accum_jitter), a pooled band
         # cannot see across its seam (band -- the engine skips the pool
         # for this mode), and the viewport forces aa NONE anyway
+        _FR.edited(st, 'adaptive AA')
         with ST.track('adaptive AA'):
             img = _adaptive_refine(scene, st, img, gbuf, mesh, depth_m,
                                    progress)
@@ -4458,7 +5337,30 @@ def render(scene, settings=None, progress=None, band=None):
             y0 = max(band[0], 0)
             y1 = min(band[1], H)
             return _resolve(img[y0 * ss:y1 * ss], W, y1 - y0, ss, st)
-        return _resolve(img, W, H, ss, st)
+        out = None
+        if ss > 1 and _FR.current(st) is not None:
+            # R250: the supersample filter drawn on the GPU over the
+            # resident frame; the readback is the OUTPUT frame, a quarter
+            # of the bytes at ss 2, and the output target stays resident
+            # for the post chain
+            with ST.track('resolve (GPU)'):
+                got_r, why_r = _FR.resolve(st, W, H, ss)
+            if got_r is not None:
+                out = got_r
+            else:
+                _FR.edited(st, 'resolve', str(why_r))
+        if out is None:
+            if ss <= 1 and getattr(st, 'aa_clamp_samples', False):
+                # R251 C094: the single pass clips too, on the CPU --
+                # the resident frame would feed the post chain unclipped
+                _FR.edited(st, 'sample clamp at 1 sample')
+            out = _resolve(img, W, H, ss, st)
+    if not getattr(st, '_keep_gpu_frame', False):
+        # a caller that wants the frame kept on the GPU for its post
+        # chain says so and releases it itself, in a finally; every
+        # other caller (the suite, a script) can never leak a target
+        _FR.release(st)
+    return out
 
 
 def bake_lightmap(scene, st, obj_index=None, size=512, mode='COMBINED',
@@ -4653,6 +5555,7 @@ def _render_panorama(scene, st, progress):
     out = np.zeros((H, W, 4), np.float32)
     jj = (np.arange(H, dtype=np.float32) + 0.5) / H * 2.0 - 1.0
     tanel = jj * tan_vh
+    _gpu_flags = []
     for k in range(n_strips):
         if progress:
             progress(0.05 + 0.9 * (k / n_strips),
@@ -4671,6 +5574,7 @@ def _render_panorama(scene, st, progress):
         st2.resolution_y = hs
         st2._pano_strip = True
         frame = render(sc2, st2, None, band=None)
+        _gpu_flags.append(bool(getattr(st2, '_frame_gpu_shaded', False)))
         fh, fw = frame.shape[:2]
 
         i0 = int(np.floor(k * cols_per))
@@ -4698,9 +5602,12 @@ def _render_panorama(scene, st, progress):
     # planar screen-space extras cannot be stitched honestly
     scene.last_passes = None
     scene.last_depth = None
+    scene.last_coverage = None      # R251 (C092): no honest stitched plane
+    st._last_coverage = None
     scene.last_shafts = []
     scene.last_flares = []
     out = out.astype(np.float32)
+    _propagate_gpu_flag(st, _gpu_flags, 'panorama strips')
     # R200: weather falls ONCE across the finished panorama -- each
     # strip skipped it (st2._pano_strip), or sixteen copies of the
     # same storm would tile the sweep
@@ -4733,6 +5640,8 @@ def _render_stereo(scene, st, progress):
     conv = max(float(getattr(st, 'stereo_convergence', 8.0)), 1e-3)
     mw = np.asarray(scene.camera.matrix_world, np.float32)
     right = mw[:3, 0] / max(float(np.linalg.norm(mw[:3, 0])), 1e-9)
+    _stereo_flags = []
+    _stereo_cov = []                # R251 (C092): each eye's coverage plane
 
     def eye_frame(sign, prog):
         cam2 = _copy.copy(scene.camera)
@@ -4743,10 +5652,15 @@ def _render_stereo(scene, st, progress):
         sc2.camera = cam2
         st2 = st.copy()
         # the eye moved +s along right, so straight-ahead points slide
-        # -x in its view; the frustum shifts to put Convergence back at
-        # ndc x = 0 (derivation in the J block above)
-        st2._stereo = (-sign * d * 0.5, conv)
+        # -x in its view; the window shifts by +p00*s/conv to put
+        # Convergence back at ndc x = 0 (clip_jitter's own term). R251:
+        # the sign was inverted since R190 -- the eyes DIVERGED (a
+        # convergence-plane point landed at +/-p00*d/(2*conv) instead
+        # of 0); fixed, and every pair with a non-zero eye distance moves
+        st2._stereo = (sign * d * 0.5, conv)
         frame = render(sc2, st2, prog, band=None)
+        _stereo_flags.append(bool(getattr(st2, '_frame_gpu_shaded', False)))
+        _stereo_cov.append(getattr(st2, '_last_coverage', None))
         # aux passes land on the shallow copy's shared attributes; the
         # LEFT eye (rendered first) is the reference, so its values are
         # captured before the right eye overwrites them
@@ -4755,12 +5669,177 @@ def _render_stereo(scene, st, progress):
                        getattr(sc2, 'last_shafts', None),
                        getattr(sc2, 'last_flares', None))
 
+    if getattr(st, 'stereo_parallax_layers', False):
+        # R251 C016: the Virtual Boy's VIP never projected two cameras --
+        # every world (layer) carried ONE integer parallax and was drawn
+        # at x - P into the left buffer and x + P into the right. One
+        # centre render (IndexOB + Depth forced at OUTPUT resolution),
+        # then each object is a flat card shifted by the whole-pixel
+        # disparity the two-camera road would give its centroid depth;
+        # the sky is the farthest layer, at the cap. Every op after the
+        # render is integer indexing: both devices produce the same
+        # bytes by construction.
+        st2 = st.copy()
+        st2.pass_object_index = True
+        st2.pass_depth = True
+        # st.copy() drops the private flags and stereo_mode is still
+        # set: without this the stereo gate would re-enter this road
+        # forever. J[0, 3] += p00 * 0.0 / conv == 0.0, so J is the exact
+        # identity and (J @ proj) reproduces proj bitwise
+        st2._stereo = (0.0, conv)
+        sc2 = _copy.copy(scene)
+        centre = render(sc2, st2, progress, band=None)
+        _stereo_flags.append(bool(getattr(st2, '_frame_gpu_shaded', False)))
+        passes = getattr(sc2, 'last_passes', None) or {}
+        H, W = centre.shape[:2]
+        Pmax = int(np.clip(int(getattr(st, 'stereo_parallax_max', 16)), 1, 64))
+        mesh = scene.mesh
+        if 'IndexOB' in passes and 'Depth' in passes and mesh is not None \
+                and mesh.verts is not None and mesh.tris is not None \
+                and mesh.tris.size and passes['IndexOB'].shape[:2] == (H, W):
+            ids = passes['IndexOB'][:, :, 0].astype(np.int64)
+            # build_aux_passes' convention for no geometry
+            uncovered = passes['Depth'][:, :, 0] >= 1e10
+            # per-object centroid view depth through the same flagged
+            # camera (the Y-shear composes)
+            view, proj, _vp, _eye = camera_matrices(scene.camera, W, H)
+            verts = np.asarray(mesh.verts, np.float32)
+            ones = np.ones((verts.shape[0], 1), np.float32)
+            verts_v = (np.concatenate([verts, ones], 1) @ view.T)[:, :3]
+            zv = -verts_v[:, 2].astype(np.float64)
+            oi_tri = (np.asarray(mesh.obj_index, np.int64)
+                      if getattr(mesh, 'obj_index', None) is not None
+                      else np.zeros(len(mesh.tris), np.int64))
+            n_obj = int(oi_tri.max()) + 1
+            # one pass, no Python loop over objects: every triangle
+            # corner counted, so a shared vertex weighs once per triangle
+            # it sits on (the rule, stated)
+            oi = np.repeat(oi_tri, 3)
+            zc = zv[np.asarray(mesh.tris).ravel()]
+            cnt = np.bincount(oi, minlength=n_obj)
+            z_o = np.where(cnt > 0,
+                           np.bincount(oi, weights=zc, minlength=n_obj)
+                           / np.maximum(cnt, 1), conv)
+            # the two-camera road's disparity at that depth, in OUTPUT
+            # pixels, whole: D(z) = (W/2) * p00 * d * (1/conv - 1/z);
+            # P = round_half_even(D/2) (np.round: the tie rule); nearer
+            # than Convergence -> negative (the VB's sign)
+            D = 0.5 * W * float(proj[0, 0]) * d * \
+                (1.0 / conv - 1.0 / np.maximum(z_o, 1e-6))
+            P_o = np.clip(np.round(D * 0.5), -Pmax, Pmax).astype(np.int64)
+            # the sky is the farthest layer, at the cap
+            Pmap = np.where(uncovered, Pmax, P_o[np.clip(ids, 0, n_obj - 1)])
+        else:
+            # no geometry: one layer, the sky, at the cap
+            Pmap = np.full((H, W), Pmax, np.int64)
+        left = parallax_shift(centre, Pmap, -1)
+        right_f = parallax_shift(centre, Pmap, +1)
+        # the centre's aux, minus the two passes forced here unless the
+        # user asked for them
+        want = wanted_passes(st)
+        kept = {k: v for k, v in passes.items() if k in want}
+        (scene.last_passes, scene.last_depth, scene.last_shafts,
+         scene.last_flares) = (kept if kept else None,
+                               getattr(sc2, 'last_depth', None),
+                               getattr(sc2, 'last_shafts', None),
+                               getattr(sc2, 'last_flares', None))
+        _propagate_gpu_flag(st, _stereo_flags, 'parallax layers')
+        # R251 (C092): each eye's plane is the centre's, shifted by the
+        # very gather that shifted the picture, then packed as it is
+        _cc = getattr(st2, '_last_coverage', None)
+        if _cc is not None and _cc.shape == Pmap.shape:
+            _stereo_cov = [parallax_shift(_cc, Pmap, -1),
+                           parallax_shift(_cc, Pmap, +1)]
+        else:
+            _stereo_cov = [None, None]
+        scene.last_coverage = _pack_stereo_coverage(
+            _stereo_cov, str(getattr(st, 'stereo_mode', 'NONE')), W)
+        st._last_coverage = scene.last_coverage
+        return _pack_stereo(left, right_f, str(getattr(st, 'stereo_mode', 'NONE')))
+
     left, aux = eye_frame(-1.0, progress)
     right_f, _aux_r = eye_frame(+1.0, None)
     (scene.last_passes, scene.last_depth, scene.last_shafts,
      scene.last_flares) = aux
+    _propagate_gpu_flag(st, _stereo_flags, 'stereo eyes')
+    # R251 (C092): the coverage plane packed exactly as the picture is
+    scene.last_coverage = _pack_stereo_coverage(
+        _stereo_cov, str(getattr(st, 'stereo_mode', 'NONE')), left.shape[1])
+    st._last_coverage = scene.last_coverage
+    return _pack_stereo(left, right_f, str(getattr(st, 'stereo_mode', 'NONE')))
 
-    mode = str(getattr(st, 'stereo_mode', 'NONE'))
+
+def parallax_shift(centre, Pmap, sign):
+    """R251 C016: one eye of the Virtual Boy pair -- every pixel of the
+    centre frame moved horizontally by its layer's whole-pixel parallax
+    (`Pmap`, int64 (H, W)); sign -1 is the left buffer (x - P), +1 the
+    right (x + P). Layers are gathered nearest first (ascending P) and
+    the first claim wins; a pixel no layer claims (the far plane hidden
+    behind a shifted near card -- the VIP drew its background world
+    there, Halcyon has no picture behind an object) keeps the centre
+    frame's own pixel, never a zero. Rows are independent, so the
+    gather is order-free per row. `sign` is an INTEGER: a float sign
+    would make the source index float64."""
+    sign = int(sign)
+    H, W = centre.shape[:2]
+    out = centre.copy()
+    claimed = np.zeros((H, W), bool)
+    X = np.arange(W)[None, :]
+    rows = np.arange(H)[:, None]
+    for P in np.unique(Pmap):                  # ascending = nearest first
+        P = int(P)
+        # left: the pixel X shows the centre's X + P (a near card, P < 0,
+        # moves RIGHT in the left eye)
+        src = X - sign * P
+        ok = (src >= 0) & (src < W)
+        srcc = np.clip(src, 0, W - 1)
+        take = ok & (Pmap[rows, srcc] == P) & ~claimed
+        out[take] = centre[rows, srcc][take]
+        claimed |= take
+    return out
+
+
+def _or_coverage(planes):
+    """R251 (C092): the coverage of an accumulated frame -- a pixel any
+    pass covered is covered (the any-sample law). None when a pass has
+    no plane or the shapes disagree."""
+    cov = None
+    for c in planes:
+        if c is None or (cov is not None and c.shape != cov.shape):
+            return None
+        cov = c.copy() if cov is None else (cov | c)
+    return cov
+
+
+def _pack_stereo_coverage(planes, mode, width):
+    """R251 (C092): the two eyes' coverage planes packed exactly as
+    _pack_stereo packs the picture: ANAGLYPH is covL | covR (a pixel
+    covered in either eye shows geometry in some channel); SBS / CROSS
+    take every other column of each eye, the seam padded `edge`. None
+    when either eye has no plane."""
+    if len(planes) != 2 or planes[0] is None or planes[1] is None \
+            or planes[0].shape != planes[1].shape:
+        return None
+    covL, covR = planes
+    if mode == 'ANAGLYPH':
+        return covL | covR
+    lh_c = covL[:, ::2]
+    rh_c = covR[:, ::2]
+    w_half = min(lh_c.shape[1], rh_c.shape[1])
+    lh_c, rh_c = lh_c[:, :w_half], rh_c[:, :w_half]
+    cov = np.concatenate((rh_c, lh_c) if mode == 'CROSS' else (lh_c, rh_c),
+                         axis=1)
+    if cov.shape[1] < width:                    # odd width: pad the seam
+        cov = np.pad(cov, ((0, 0), (0, width - cov.shape[1])), mode='edge')
+    return np.ascontiguousarray(cov[:, :width])
+
+
+def _pack_stereo(left, right_f, mode):
+    """The stereo pair packed for viewing: the 1.89.0 tail of
+    _render_stereo, factored so the two-camera road and the parallax
+    layers (C016) share it byte for byte. ANAGLYPH combines the classic
+    way (left eye's red, right eye's green and blue); SBS packs squeezed
+    left|right half-frames; CROSS swaps them for the cross-eyed viewer."""
     if mode == 'ANAGLYPH':
         out = right_f.copy()
         out[:, :, 0] = left[:, :, 0]
@@ -4778,6 +5857,256 @@ def _render_stereo(scene, st, progress):
         out = np.pad(out, ((0, 0), (0, left.shape[1] - out.shape[1]),
                            (0, 0)), mode='edge')
     return out[:, :left.shape[1]].astype(np.float32)
+
+
+def _render_pano_parts(scene, st, progress):
+    """R251 C125: Blender 2.4's Pano + Xparts -- N planar strips, the
+    camera yawed by one strip's horizontal field between them, butted
+    together unblended (straight lines kink at every seam: the tell of
+    the era's QuickTime VR cylinders; `initrender.c`: "pano is fake
+    parts"). The strip angle is the camera's own horizontal field fitted
+    across the STRIP width (the `LI._persp` fallback at aspect ws/H,
+    `cam2.projection = None`), which is what makes the strips abut on a
+    shared clip plane by construction; the last strip is cropped when N
+    does not divide the width. Each strip is a whole render() on
+    whichever device; the concatenation is integer slicing, so both
+    roads produce the same bytes by construction.
+    """
+    n = int(np.clip(int(st.pano_parts), 1, 16))
+    W = max(int(st.resolution_x), 1)
+    H = max(int(st.resolution_y), 1)
+    ws = int(math.ceil(W / n))       # 2.4: SizeX per part; n*ws >= W, cropped
+    cam = scene.camera
+    mw = M.rigid_camera_matrix(np.asarray(cam.matrix_world, np.float32))
+    up = mw[:3, 1] / max(float(np.linalg.norm(mw[:3, 1])), 1e-9)
+    lens = float(getattr(cam, 'lens', 50.0) or 50.0)
+    sensor = float(getattr(cam, 'sensor', 36.0) or 36.0)
+    # camera_matrices' own fov_x, across the STRIP width (2.4's
+    # 2*atan(16/lens) with a 32 mm sensor)
+    phi = 2.0 * math.atan(sensor * 0.5 / max(lens, 1e-3))
+    out = np.zeros((H, W, 4), np.float32)
+    flags = []
+    for i in range(n):
+        if progress:
+            progress(0.05 + 0.9 * (i / n), f'Pano part {i + 1}/{n}')
+        a_i = (i - (n - 1) * 0.5) * phi          # azimuth of strip i, leftmost first
+        cam2 = copy.copy(cam)
+        m2 = mw.copy()
+        # _render_panorama's sign: azimuth to the right = negative
+        # rotation about up
+        m2[:3, :3] = _rot_axis3(up, -a_i) @ mw[:3, :3]
+        cam2.matrix_world = m2
+        cam2.projection = None
+        cam2.type = 'PERSP'
+        sc2 = copy.copy(scene)
+        sc2.camera = cam2
+        st2 = st.copy()
+        st2.resolution_x = ws
+        st2.resolution_y = H
+        # the flag every strip-hostile gate already reads (stereo,
+        # weather, Y-shear)
+        st2._pano_strip = True
+        # a dataclass FIELD, so it survives every st.copy() below this
+        # road: a strip's AA passes can never re-enter this gate (without
+        # it ACCUMULATE inside a strip would split the strip into strips
+        # of strips down to width 1, forever)
+        st2.pano_parts = 1
+        frame = render(sc2, st2, progress if i == 0 else None, band=None)
+        flags.append(bool(getattr(st2, '_frame_gpu_shaded', False)))
+        x0 = i * ws
+        x1 = min((i + 1) * ws, W)
+        out[:, x0:x1] = frame[:, :x1 - x0]
+    # planar extras cannot be stitched honestly (the PANO rule)
+    scene.last_passes = None
+    scene.last_depth = None
+    scene.last_coverage = None      # R251 (C092): the PANO rule
+    st._last_coverage = None
+    scene.last_shafts = []
+    scene.last_flares = []
+    _propagate_gpu_flag(st, flags, 'pano parts')
+    # weather falls ONCE across the finished frame -- each strip skipped
+    # it (st2._pano_strip), exactly as the true panorama does
+    wd_w = getattr(scene, 'world', None)
+    if wd_w is not None and \
+            str(getattr(wd_w, 'weather', 'NONE') or 'NONE') != 'NONE':
+        from . import sky as SKY
+        with ST.track('weather'):
+            out = SKY.weather_overlay(
+                out, wd_w, W, H,
+                time=float(getattr(scene, 'time', 0.0)), out_wh=(W, H))
+    return out
+
+
+def _lens_points(st, R_l):
+    """R251 C098: the lens points of one lens-sampled DOF frame, in
+    scene units across the aperture of radius R_l, rounded once to
+    float32. HALTON_DISC: the accumulation-buffer AA's own Halton
+    sequence mapped to the unit disc (Shirley-Chiu concentric map; the
+    1990 paper's 23-point table was never published, this stands in).
+    MAX_SPIRAL: pass 0 at the lens centre (3ds Max's Use Original
+    Location), then Halcyon's golden-angle spiral over Max's documented
+    multi-pass dials (Sample Radius 1.0, Sample Bias 0.5) -- Autodesk
+    documents the dials, not its point pattern."""
+    K = int(np.clip(int(getattr(st, 'dof_lens_samples', 23)), 2, 64))
+    pts = []
+    if str(getattr(st, 'dof_lens_pattern', 'HALTON_DISC')) == 'MAX_SPIRAL':
+        for k in range(K):
+            if k == 0:
+                pts.append((0.0, 0.0))
+                continue
+            # Sample Radius 1.0, Sample Bias 0.5 (Max's defaults, constants)
+            rho = R_l * ((k + 0.5) / K) ** (0.5 + 0.5)
+            a = k * 2.399963229728653                      # the golden angle
+            pts.append((rho * math.cos(a), rho * math.sin(a)))
+    else:
+        for k in range(1, K + 1):
+            a = 2.0 * _halton(k, 2) - 1.0                  # the AA road's sequence
+            b = 2.0 * _halton(k, 3) - 1.0
+            if a == 0.0 and b == 0.0:
+                r, ph = 0.0, 0.0
+            elif a * a > b * b:
+                r, ph = a, (math.pi / 4.0) * (b / a)
+            else:
+                r, ph = b, (math.pi / 2.0) - (math.pi / 4.0) * (a / b)
+            pts.append((R_l * r * math.cos(ph), R_l * r * math.sin(ph)))
+    return [(float(np.float32(x)), float(np.float32(y))) for x, y in pts]
+
+
+def _render_lens_accumulated(scene, st, progress, band):
+    """R251 C098: depth of field by sampling the LENS -- REYES lens
+    sampling by the SGI accumulation buffer's method (Haeberli & Akeley
+    1990, Appendix B) and 3ds Max's multi-pass DOF: the frame rendered
+    once per lens point with the eye moved across the aperture and the
+    window sheared so the focus plane stays put (camera_matrices reads
+    the per-pass camera's `_lens`), then averaged in float64 in pass
+    order as the accumulation AA does. Exact occlusion, the lens pattern
+    as the bokeh, K full renders. The lens diameter is the camera's
+    focal length over its f-number (RiDepthOfField's lensdiameter), the
+    focus is `dof_focus`. Each pass is a whole render() on whichever
+    device; the mean is the CPU's: both roads produce the same bytes by
+    construction. An F12 road: the gate excludes the viewport."""
+    cam = scene.camera
+    # RiDepthOfField: lensdiameter = focallength / fstop (the CAMERA's
+    # f-number), scene units = metres; the radius is half of it
+    R_l = (float(getattr(cam, 'lens', 50.0) or 50.0) / 1000.0) / \
+        (2.0 * max(float(getattr(cam, 'fstop', 2.8) or 2.8), 1e-3))
+    d_f = max(float(st.dof_focus), 1e-3)
+    acc = None
+    flags = []
+    aux = None
+    _lens_cov = []                  # R251 (C092): every pass's coverage plane
+    pts = _lens_points(st, R_l)
+    for k, (lx, ly) in enumerate(pts):
+        if progress:
+            progress(0.05 + 0.9 * (k / len(pts)), f'Lens pass {k + 1}/{len(pts)}')
+        # no _yshear copy: render()'s flag line rewrites scene.camera's
+        # _yshear inside every pass before camera_matrices reads it
+        cam2 = copy.copy(cam)
+        cam2._lens = (lx, ly, d_f)
+        sc2 = copy.copy(scene)
+        sc2.camera = cam2
+        st2 = st.copy()
+        st2._lens_pass = True
+        # st.copy() drops the private flags; the outer roads' state (an
+        # AA pass's jitter, a stereo eye, a pano strip) must ride along
+        for flag in ('_accum_jitter', '_stereo', '_viewport', '_refine_mask',
+                     '_pano_strip'):
+            if hasattr(st, flag):
+                setattr(st2, flag, getattr(st, flag))
+        frame = render(sc2, st2, progress if k == 0 else None, band=band)
+        flags.append(bool(getattr(st2, '_frame_gpu_shaded', False)))
+        _lens_cov.append(getattr(st2, '_last_coverage', None))
+        if k == 0:
+            # pass 0's extras (the centre point under MAX_SPIRAL)
+            aux = (getattr(sc2, 'last_passes', None),
+                   getattr(sc2, 'last_depth', None),
+                   getattr(sc2, 'last_shafts', None),
+                   getattr(sc2, 'last_flares', None))
+            _gel0 = getattr(sc2, 'last_gel', None)      # R251 C134
+        # the accumulation road's own sum, in pass order
+        acc = frame.astype(np.float64) if acc is None else acc + frame
+    (scene.last_passes, scene.last_depth, scene.last_shafts,
+     scene.last_flares) = aux
+    scene.last_gel = _gel0                              # R251 C134
+    _propagate_gpu_flag(st, flags, 'lens passes')
+    scene.last_coverage = _or_coverage(_lens_cov)     # R251 (C092)
+    st._last_coverage = scene.last_coverage
+    return (acc / float(len(flags))).astype(np.float32)
+
+
+def shutter_steps(st):
+    """R251 C090: how many sub-frames the engine's motion blur renders --
+    Blur Steps, clamped to 32 under Max Object Motion Blur (Max's own
+    Samples cap, printed), doubled under LightWave's Dithered blur (the
+    row-parity split needs a slice per parity)."""
+    n = max(int(st.motion_steps), 2)
+    mode = str(getattr(st, 'motion_blur_mode', 'MEAN'))
+    if mode == 'MAX_SLICES' and n > 32:
+        print(f"[Halcyon] motion blur: Blur Steps {n} clamped to 32 under "
+              "Max Object Motion Blur (Max's own Samples cap)")
+        n = 32
+    return 2 * n if mode == 'LW_FIELD' else n
+
+
+def shutter_weight(st, k, S, H, W, frame_no=0, seed=0):
+    """R251 C090: the (H, W) float64 weight of slice k of S -- a pure
+    function of (x, y, k, S, frame, seed), so the engine streams the
+    combine with ONE slice resident. MEAN: every weight 1.0. LW_FIELD:
+    even rows take the even slices, odd rows the odd (row 0 = bottom;
+    LightWave 5.6-7's Dithered Motion Blur, the field-rendering split).
+    MAX_SLICES: each pixel averages only Samples (M) of the S slices,
+    the first pick o = floor(h01 * S) from the GRAIN hash family and the
+    rest (o + floor(j*S/M)) mod S, j < M -- tested per slice by the
+    arithmetic rule "a multiple of S lies in [r*M, r*M + M)" with
+    r = (k - o) mod S; Max 3+'s multi-pass Dither Strength then weights
+    each picked slice 1 +/- d by an 8x8 ordered pattern phased per slice,
+    thresholds at the Bayer cell CENTRES (k + 0.5)/64, so every weight is
+    at least 1 - d*63/64 >= 1/64 and no pixel can lose every slice."""
+    # R:7883's own form: core/render.py binds neither at module level
+    from . import film as FILM
+    from .dither import BAYER8       # bayer(8) is ALREADY k/64 as float32
+    mode = str(getattr(st, 'motion_blur_mode', 'MEAN'))
+    if mode == 'MEAN':
+        return np.ones((H, W), np.float64)
+    yy, xx = np.mgrid[0:H, 0:W]
+    if mode == 'LW_FIELD':
+        return ((yy & 1) == (k & 1)).astype(np.float64)
+    M_ = int(np.clip(int(getattr(st, 'motion_samples', 10)), 1, S))
+    h = FILM._hash_u32_raw(xx.astype(np.uint32), yy.astype(np.uint32),
+                           int(frame_no) * 1000003 + int(seed))
+    o = (h.astype(np.int64) * S) >> 24          # floor(h01 * S): the first slice
+    r = (k - o) % S                             # k's offset from the first pick
+    sel = ((-(r * M_)) % S) < M_                # k is one of the M picks
+    d = float(np.clip(float(getattr(st, 'motion_dither', 0.0)), 0.0, 1.0))
+    if d > 0.0:
+        cell = max(int(getattr(st, 'motion_dither_tile', 32)) // 8, 1)
+        B = BAYER8[((xx // cell) + k) % 8, (yy // cell) % 8].astype(np.float64) \
+            + (0.5 / 64.0)
+        return sel * (1.0 + d * (2.0 * B - 1.0))
+    return sel.astype(np.float64)
+
+
+def shutter_combine(frames, st, frame_no=0, seed=0):
+    """R251 C090: `frames` are the S sub-frame renders in time order
+    ((H, W, 4) float32). Returns the (H, W, 4) float32 frame -- the batch
+    form of the engine's streamed loop (for the tests): the same
+    k-ordered float64 sums, bitwise. MEAN is the 1.89.0 expression
+    verbatim; MAX_SLICES with Samples == S and Dither 0 reproduces it
+    bitwise (every weight 1.0, wsum == S exactly)."""
+    S = len(frames)
+    H, W = frames[0].shape[:2]
+    if str(getattr(st, 'motion_blur_mode', 'MEAN')) == 'MEAN':
+        acc = frames[0].astype(np.float64)
+        for k in range(1, S):
+            acc = acc + frames[k]
+        return (acc / float(S)).astype(np.float32)
+    acc = np.zeros((H, W, 4), np.float64)
+    wsum = np.zeros((H, W), np.float64)
+    for k in range(S):
+        w = shutter_weight(st, k, S, H, W, frame_no, seed)
+        acc = acc + frames[k] * w[:, :, None]
+        wsum = wsum + w
+    return (acc / wsum[:, :, None]).astype(np.float32)
 
 
 def _halton(i, b):
@@ -4802,13 +6131,26 @@ def _render_accumulated(scene, st, progress, band):
     """
     n = int(np.clip(int(st.aa_samples), 2, 64))
     acc = None
+    _accum_flags = []
+    _accum_cov = []                 # R251 (C092): every pass's coverage plane
     for k in range(n):
         st2 = st.copy()
         st2.aa_mode = 'NONE'
         st2._accum_jitter = (_halton(k + 1, 2) - 0.5,
                              _halton(k + 1, 3) - 0.5)
+        # R251: st.copy() drops the private flags; a stereo eye's or a
+        # pano strip's pass must keep reading them (a pair per pass
+        # since R190 otherwise; at defaults both read None / False)
+        st2._stereo = getattr(st, '_stereo', None)
+        st2._pano_strip = getattr(st, '_pano_strip', False)
         frame = render(scene, st2, progress if k == 0 else None, band=band)
+        _accum_flags.append(bool(getattr(st2, '_frame_gpu_shaded', False)))
+        _accum_cov.append(getattr(st2, '_last_coverage', None))
         acc = frame.astype(np.float64) if acc is None else acc + frame
+    _propagate_gpu_flag(st, _accum_flags, 'accumulation passes')
+    # R251 (C092): any sample counts as covered -- the passes' planes OR-ed
+    scene.last_coverage = _or_coverage(_accum_cov)
+    st._last_coverage = scene.last_coverage
     return (acc / float(n)).astype(np.float32)
 
 
@@ -4934,6 +6276,9 @@ def _adaptive_refine(scene, st, img, gbuf, mesh, depth_m, progress):
               getattr(scene, 'last_shafts', None),
               getattr(scene, 'last_flares', None))
     _verdict = dict(LAST_GPU_VERDICT)
+    # R251 (C092): the BASE frame's coverage plane, put back like the rest
+    _saved_cov = getattr(scene, 'last_coverage', None)
+    _saved_gel = getattr(scene, 'last_gel', None)       # R251 C134
     acc = img[mask].astype(np.float64)
     try:
         for k in range(1, n):
@@ -4946,12 +6291,17 @@ def _adaptive_refine(scene, st, img, gbuf, mesh, depth_m, progress):
             st2._accum_jitter = (_halton(k, 2) - 0.5,
                                  _halton(k, 3) - 0.5)
             st2._refine_mask = mask
+            st2._stereo = getattr(st, '_stereo', None)      # R251: carried
+            st2._pano_strip = getattr(st, '_pano_strip', False)
             acc += render(scene, st2, None, band=None)[mask]
     finally:
         (scene.last_passes, scene.last_depth, scene.last_shafts,
          scene.last_flares) = _saved
         LAST_GPU_VERDICT.clear()
         LAST_GPU_VERDICT.update(_verdict)
+        scene.last_coverage = _saved_cov
+        st._last_coverage = _saved_cov
+        scene.last_gel = _saved_gel                     # R251 C134
     out = img.copy()
     out[mask] = (acc / float(n)).astype(np.float32)
     return out
@@ -5066,7 +6416,10 @@ def material_wire_size(mat, default=1.0):
     return max(float(getattr(mat, 'wire_size', default) or default), 0.05)
 
 
-RATE_FOR_MODEL = {'GOURAUD': 'VERTEX', 'FLAT': 'FACE', 'WIREFRAME': 'PIXEL'}
+RATE_FOR_MODEL = {'GOURAUD': 'VERTEX', 'FLAT': 'FACE', 'WIREFRAME': 'PIXEL',
+                  # R251 (LIGHT-B2): the Sega boards' own rates --
+                  # Model 2 one luma per polygon, Model 3 per vertex
+                  **SH.RATE_FOR_MODEL}
 
 
 #: BVH trees by mesh CONTENT, surviving across exports. Every F12
@@ -5180,7 +6533,8 @@ def _shade_all(job, tri_idx, bary, px, py, front, blin, st, progress=None):
     rates = {}
     for i, mat in enumerate(scene.materials):
         model = material_model(mat, st)
-        rates[i] = RATE_FOR_MODEL.get(model, st.shading_rate) if model \
+        rates[i] = (CB.rate_for_model(model, st)
+                    or RATE_FOR_MODEL.get(model, st.shading_rate)) if model \
             else st.shading_rate
     per_frag = np.array([rates.get(int(m), st.shading_rate) for m in
                          range(max(len(scene.materials), 1))], dtype=object)
@@ -5209,9 +6563,17 @@ def _shade_all(job, tri_idx, bary, px, py, front, blin, st, progress=None):
             done = 0
             total = int(sel.size)
             workers = resolve_threads(st)
+            # R251 C119 (MAT-B): the REYES micropolygon grid, once per
+            # frame (None at rate 0: the snap is never called); the
+            # snapped barycentrics feed BOTH the bump pre-pass and the
+            # shade, so a Bump material samples its heights where it
+            # shades
+            reyes_grid = REYES.grid_for(job)
             for m in np.unique(sel_mats):
                 sm = sel[sel_mats == m]
                 nm = int(sm.size)
+                bary_s = REYES.snap(bary[sm], tri_idx[sm], reyes_grid) \
+                    if reyes_grid is not None else bary[sm]
                 # a material too covered for ONE batch would have its
                 # n_bump gradients cut at every chunk boundary -- so its
                 # height chains render to whole-material gradient fields
@@ -5239,7 +6601,9 @@ def _shade_all(job, tri_idx, bary, px, py, front, blin, st, progress=None):
                             int(np.ceil(fs.size / max(workers * 4, 1))),
                             MIN_CHUNK), MAX_CHUNK))
                         job.bump_fields.update(_bump_height_fields(
-                            job, mat, int(m), ftri[fs], fbary[fs],
+                            job, mat, int(m), ftri[fs],
+                            REYES.snap(fbary[fs], ftri[fs], reyes_grid)
+                            if reyes_grid is not None else fbary[fs],
                             fpx[fs], fpy[fs],
                             ffront[fs] if ffront is not None else None,
                             fblin[fs] if fblin is not None else None,
@@ -5247,7 +6611,7 @@ def _shade_all(job, tri_idx, bary, px, py, front, blin, st, progress=None):
                 elif mchunk < nm and mat is not None \
                         and getattr(mat, 'graph', None):
                     job.bump_fields.update(_bump_height_fields(
-                        job, mat, int(m), tri_idx[sm], bary[sm], px[sm],
+                        job, mat, int(m), tri_idx[sm], bary_s, px[sm],
                         py[sm], front[sm] if front is not None else None,
                         blin[sm] if blin is not None else None, mchunk))
                 if progress is not None:
@@ -5260,7 +6624,7 @@ def _shade_all(job, tri_idx, bary, px, py, front, blin, st, progress=None):
                                                 / max(total, 1)), msg)
                 else:
                     _prog = None
-                out[sm] = _shade_chunked(job, tri_idx[sm], bary[sm],
+                out[sm] = _shade_chunked(job, tri_idx[sm], bary_s,
                                          px[sm], py[sm], front[sm],
                                          blin[sm] if blin is not None
                                          else None,
@@ -5393,6 +6757,7 @@ def _shade_interpolated(job, tri_idx, bary, rate, st=None,
     if rate == 'FACE':
         order = np.searchsorted(uniq, tri_idx)
         light = col[order]
+        c0 = c1 = c2 = None
     else:
         tris = mesh.tris[tri_idx]
         c0 = col[lookup[tris[:, 0]]]
@@ -5408,7 +6773,11 @@ def _shade_interpolated(job, tri_idx, bary, rate, st=None,
     finally:
         job.rate_mode = saved
     out = np.empty_like(light)
-    out[:, :3] = light[:, :3] * alb[:, :3]
+    # R251 (MAT-A): the period combiners' hook -- None unless a period
+    # model is present, and then the plain product on every other pixel
+    period = CB.recombine(job, tri_idx, light, c0, c1, c2, bary, alb, px,
+                          py, st)
+    out[:, :3] = light[:, :3] * alb[:, :3] if period is None else period
     # alpha comes from the PIXEL pass: a cut-out texture's edge is the
     # one thing that must never be interpolated between vertices
     out[:, 3] = alb[:, 3]
@@ -5445,8 +6814,7 @@ def vertex_light_corners(job, mi, rate, st):
     finally:
         job.rate_mode = saved
     if rate == 'FACE':
-        for c in range(3):
-            out[sel * 3 + c] = col
+        CB.pack_face_corners(out, sel, col, job, st, mi)
     else:
         tris = mesh.tris[sel]
         for c in range(3):
@@ -5454,7 +6822,7 @@ def vertex_light_corners(job, mi, rate, st):
     return out
 
 
-def polygon_depths(mesh, view, eye, mode='CENTROID'):
+def polygon_depths(mesh, view, eye, mode='CENTROID', ot=None):
     """One depth per triangle, for Painter's algorithm.
 
     Painter's does not compare fragments, it compares whole polygons: the one
@@ -5474,6 +6842,22 @@ def polygon_depths(mesh, view, eye, mode='CENTROID'):
         depth = per_vertex.min(axis=1)
     elif mode == 'FARTHEST':
         depth = per_vertex.max(axis=1)
+    elif mode == 'ORDERING_TABLE' and ot is not None:
+        # R251 C004: the PS1's AVSZ3 average floored into one of L
+        # integer buckets to `far`; +inf is "not drawn" (a polygon past
+        # the table never writes: the fill's test fails against inf and
+        # its tie branch against EMPTY). The bucket IS the flat depth,
+        # so equal buckets resolve to the lowest id -- the PS1's
+        # first-added-on-top, since Halcyon's ids are submission order.
+        # float32, one op per statement
+        L = max(int(ot[0]), 2)
+        far = max(float(ot[1]), 1e-6)
+        z_avg = per_vertex.mean(axis=1).astype(np.float32)
+        bucket = z_avg * np.float32(L)
+        bucket = bucket / np.float32(far)
+        bucket = np.floor(bucket)
+        depth = np.where((bucket <= 0.0) | (bucket >= np.float32(L)),
+                         np.float32(np.inf), bucket).astype(np.float32)
     else:
         depth = per_vertex.mean(axis=1)
     # matches the z-buffer's convention: smaller is nearer
@@ -5500,13 +6884,26 @@ def _split_by_alpha(scene, mesh, st=None):
     LAST_SPLIT.clear()
     if mesh.mat_index is None:
         return None, np.zeros(0, np.int32)
+    from .scene import material_is_absent as _absent
+    from .scene import material_see_through as _see
+    from .volume import material_is_volume as _miv
     if st is not None and st.transparency in ('NONE', 'STIPPLE'):
         # R222: even with transparency off, a volume container's
         # triangles stay out of the raster -- they are the marcher's
-        # bound, never a surface
-        from .volume import material_is_volume as _miv
-        vmask = np.array([_miv(m) for m in scene.materials] or [False],
-                         bool)
+        # bound, never a surface. R247: so does a CLIP material whose
+        # constant alpha is below its threshold -- no fragment of it
+        # exists in any mode (an outline shell left flat on the body
+        # z-fought it into black speckles under these two modes)
+        vmask = np.array([_miv(m) or _absent(m) for m in scene.materials]
+                         or [False], bool)
+        gone = {str(getattr(m, 'name', None) or f'material {i}'):
+                'constant alpha below the threshold'
+                for i, m in enumerate(scene.materials)
+                if _absent(m) and not _miv(m)}
+        if gone:
+            LAST_CLIP.clear()
+            LAST_CLIP.update(absent=gone, refused={}, materials=0, auto=[],
+                             fragments=0, evaluated=0, kept=0, promoted=0)
         if vmask.any():
             mi0 = np.clip(mesh.mat_index, 0, vmask.size - 1)
             keep = ~vmask[mi0]
@@ -5517,27 +6914,38 @@ def _split_by_alpha(scene, mesh, st=None):
     see_through = np.zeros(max(len(scene.materials), 1), bool)
     is_vol = np.zeros(max(len(scene.materials), 1), bool)
     reasons = {}
+    absent = {}
     for i, m in enumerate(scene.materials):
-        why = None
-        if m.opacity < 0.999:
-            why = f'Opacity {float(m.opacity):.3f}'
-        elif getattr(m, 'has_alpha', False):
-            # export.py's _alpha_reason names the specific evidence --
-            # a transparent node, or which Alpha socket. A vague reason
-            # is what let a whole mis-flagged character hide for three
-            # rounds behind "flagged on export".
-            why = str(getattr(m, 'alpha_why', None)
-                      or 'flagged see-through on export')
+        # R251: ONE predicate (core/scene.py `material_see_through`),
+        # shared with the GPU layer loop, so the layer plan and this
+        # split can never disagree on which material holds fragments:
+        # a constant opacity below 1, export.py's `_alpha_reason`
+        # evidence (a transparent node, or which Alpha socket -- a vague
+        # reason is what let a whole mis-flagged character hide for
+        # three rounds behind "flagged on export"), a per-material Blend
+        # Mode (a PS1 additive glow at opacity 1.0 must reach the
+        # transparent pass), the PS2 two-pass Clip+Blend; an Env hole is
+        # opaque here
+        why = _see(m)
         see_through[i] = why is not None
         if why is not None:
             reasons[str(getattr(m, 'name', None) or f'material {i}')] = why
         # R222: a volume container draws NO surface -- its triangles are
         # only the marcher's bound, in neither raster pass
-        from .volume import material_is_volume
-        if material_is_volume(m):
+        if _miv(m):
             is_vol[i] = True
             reasons[str(getattr(m, 'name', None) or f'material {i}')] = \
                 'volume container (marched, no surface)'
+        elif _absent(m):
+            # R247: a punch-through with a constant alpha below its
+            # threshold has no fragment: in neither pass, the same as
+            # the clip stage would have resolved it -- without the
+            # stage's evaluation
+            is_vol[i] = True
+            reasons[str(getattr(m, 'name', None) or f'material {i}')] = \
+                'Alpha Mode Clip at a constant alpha below the threshold (no surface)'
+            absent[str(getattr(m, 'name', None) or f'material {i}')] = \
+                'constant alpha below the threshold'
     mi = np.clip(mesh.mat_index, 0, see_through.size - 1)
     t = see_through[mi]
     vol_t = is_vol[mi]
@@ -5546,6 +6954,12 @@ def _split_by_alpha(scene, mesh, st=None):
                       tris=int(mesh.mat_index.size),
                       tris_see_through=int(t.sum()),
                       tris_volume=int(vol_t.sum()))
+    if absent:
+        # the clip instrument tells the truth for this frame even when
+        # the stage never runs: nothing kept, these resolved by absence
+        LAST_CLIP.clear()
+        LAST_CLIP.update(absent=absent, refused={}, materials=0, auto=[],
+                         fragments=0, evaluated=0, kept=0, promoted=0)
     return (np.nonzero(~t & ~vol_t)[0].astype(np.int32),
             np.nonzero(t & ~vol_t)[0].astype(np.int32))
 
@@ -5568,7 +6982,11 @@ def _clip_partition(scene, mesh, st, transparent, affine=False):
     (clip_tris_or_None, blend_tris, plans).
     """
     from .scene import clip_road
+    absent = LAST_CLIP.get('absent')
     LAST_CLIP.clear()
+    if absent:
+        # R247: the materials the split resolved by absence stay named
+        LAST_CLIP['absent'] = absent
     if transparent is None or transparent.size == 0:
         return None, transparent, {}
     plans, refused, auto = {}, {}, []
@@ -5599,8 +7017,15 @@ def _clip_partition(scene, mesh, st, transparent, affine=False):
     mi = np.clip(mesh.mat_index[transparent], 0,
                  max(len(scene.materials), 1) - 1)
     is_clip = np.isin(mi, np.array(sorted(plans), np.int64))
+    # R251 C031 (PS2 AFAIL): a Clip+Blend material's triangles resolve
+    # their opaque half in the z-pass AND stay on the blend road for
+    # the sub-threshold remainder (drawn a second time, no depth write)
+    is_cb = np.isin(mi, np.array(
+        [i for i in plans
+         if str(getattr(scene.materials[i], 'alpha_mode', 'BLEND'))
+         == 'CLIP_BLEND'], np.int64))
     clip_sub = transparent[is_clip]
-    blend_sub = transparent[~is_clip]
+    blend_sub = transparent[~is_clip | is_cb]
     return (clip_sub if clip_sub.size else None), blend_sub, plans
 
 
@@ -5773,6 +7198,10 @@ def _promote_clip(job, gbuf, vp, st, clip_tris, plans, snap, flat_depth,
     # of the opaque depth so coplanar shell-meets-skin contacts promote
     # exactly as a blend layer would have composited
     cg = raster.GBuffer(gbuf.width, gbuf.height)
+    _ro = getattr(st, '_raster_opts', None)
+    if _ro is not None and getattr(_ro, 'clear', None) is not None:
+        # R251 C038: CLIP fragments z-test against the backdrop too
+        cg.clear_depth(_ro.clear[0], _ro.clear[1], _ro.enc)
     cg.depth[:] = raster.abuf_depth_limit(gbuf.depth)
     cg.zndc[:] = cg.depth
 
@@ -5868,7 +7297,8 @@ def _promote_clip(job, gbuf, vp, st, clip_tris, plans, snap, flat_depth,
                          subset=clip_tris[ch], gbuf=cg,
                          depth_write=True, flat_depth=flat_depth,
                          scissor=scissor, subdiv_px=subdiv_px,
-                         near_eps=near_eps, frag_test=frag_test)
+                         near_eps=near_eps, frag_test=frag_test,
+                         opts=getattr(st, '_raster_opts', None))
 
     win = cg.mask()
     n_win = int(win.sum())
@@ -6005,11 +7435,24 @@ def fog_coverage_note(proj, gbuf, settings):
     Returns the line, or None when there is nothing to warn about.
     """
     mode = str(getattr(settings, 'fog_mode', 'LINEAR'))
-    if mode not in ('LINEAR', 'TABLE16'):
+    if mode not in ('LINEAR', 'TABLE16', 'GTE_1Z'):
         return None
     cov = gbuf.tri >= 0
     if proj is None or not cov.any():
         return None
+    from . import fog as _FOG
+    if _FOG.depth_of(settings) == 'Z':
+        # F007: under Fog Depth Z, Start and End are post-projection
+        # depths in 0..1. Compared in scene units this cried PURE fog
+        # at any End <= 1, and said nothing while a scene-unit Start
+        # fogged nothing at all -- ask in the domain the fog reads.
+        # Direct3D's z' IS the raster's NDC z remapped, (z + 1) / 2,
+        # under a perspective and an orthographic camera alike
+        zf = gbuf.zndc[cov].astype(np.float64)
+        zf = zf[np.isfinite(zf)]
+        if zf.size == 0:
+            return None
+        return _fog_coverage_note_z((zf + 1.0) * 0.5, settings)
     p = np.asarray(proj, np.float64)
     a, b = float(p[2, 2]), float(p[2, 3])
     if abs(a - 1.0) < 1e-12 or abs(a + 1.0) < 1e-12:
@@ -6041,6 +7484,32 @@ def fog_coverage_note(proj, gbuf, settings):
             'numbers above look several times too large, check the '
             'camera for scaled parents (now stripped automatically) or '
             'move Fog Start/End out to the scene\'s real distances')
+
+
+def _fog_coverage_note_z(zd, settings):
+    """`fog_coverage_note` under Fog Depth Z (F007): Direct3D's
+    post-projection depth of every covered pixel (`zd`, 0..1)
+    against Fog Start and End, which are 0..1 depths there. Two
+    lines: nothing reaches Fog Start (a switched-on fog that fogs
+    nothing -- what scene-unit Start/End do under Z), or the frame
+    sits past Fog End. Returns the line or None."""
+    lo, hi = float(zd.min()), float(zd.max())
+    start = float(getattr(settings, 'fog_start', 0.0))
+    end = float(getattr(settings, 'fog_end', 0.0))
+    span = ('Fog Depth is Z, so Fog Start and End are post-projection '
+            "depths in 0..1, and this frame's surfaces span "
+            f'{lo:.4f}..{hi:.4f}')
+    fix = ('put Fog Start/End inside that span, or set Fog Depth to W to '
+           'give them in scene units')
+    if start >= hi:
+        return (f'[Halcyon] fog: NOTHING is fogged -- {span}: Fog Start '
+                f'({start:.4g}) lies past every one of them; {fix}')
+    frac = float((zd >= end).mean()) if end > 0.0 else 0.0
+    if frac >= 0.9:
+        return (f'[Halcyon] fog: {100.0 * frac:.0f}% of the covered frame '
+                f'sits at or past Fog End ({end:.4g}) and renders as PURE '
+                f'fog colour -- {span}; {fix}')
+    return None
 
 
 #: the volumetric marchers by lamp type. SUN and HEMI are deliberately
@@ -7063,10 +8532,33 @@ def _background_image(scene, st, w, h, vp, eye, uncovered=None,
     world = pts @ inv.T
     world = world[:, :3] / np.where(np.abs(world[:, 3:4]) < 1e-9, 1e-9, world[:, 3:4])
     dirs = M.normalize(world - eye[None, :])
+    # R251 (sky-camera C056): Doom's cylinder sky is a function of the
+    # OUTPUT pixel, not of the ray: the per-column angle table and the
+    # 1:1 rows are built ONCE at the output size from the frame's own
+    # projection and J (jitter, stereo window), the same bytes
+    # gpu/sky.py uploads. Reflections never come here (they evaluate
+    # world_color along a direction and see the flat colour)
+    from . import sky as SKY
+    wd = getattr(scene, 'world', None)
+    total = dirs.shape[0]
+    if wd is not None and str(getattr(wd, 'mode', 'NODES')) == 'CYLINDER':
+        tex = SKY.env_texture(wd, textures or {})
+        Wo, Ho = max(w // ss, 1), max(h // ss, 1)
+        proj_c, jx, jy, yaw = SKY.cylinder_inputs(scene, st, Wo, Ho)
+        if tex is not None:
+            cols = SKY.cylinder_pixels(wd, yaw, proj_c, w, h, ss, xx, yy,
+                                       tex, jx, jy)
+        else:
+            # no image: the solid colour then strength, hdri()'s own rule
+            cols = (SKY.solid(wd, dirs)
+                    * float(getattr(wd, 'strength', 1.0))).astype(np.float32)
+        if getattr(wd, 'ground_plane', False):
+            cols = SKY.ground_plane(wd, dirs, cols, eye,
+                                    getattr(scene, 'time', 0.0), textures)
+        img[yy, xx, :3] = cols
     # the background is a large independent job and was the third biggest
     # stage on a real frame, so it is chunked like the shading
-    total = dirs.shape[0]
-    if total > 4 * MIN_CHUNK:
+    elif total > 4 * MIN_CHUNK:
         # chunked to bound memory on a large frame, not for parallelism
         cols = np.empty((total, 3), np.float32)
         step = MAX_CHUNK
@@ -7078,6 +8570,21 @@ def _background_image(scene, st, w, h, vp, eye, uncovered=None,
     else:
         img[yy, xx, :3] = world_color(scene, st, dirs, textures or {}, total,
                                       eye=eye)
+    # R251 (sky-camera C048): the Mode 7 floor, drawn by OUTPUT pixel over
+    # whichever sky ran (the analytic ground_plane() leaves a MODE7 world
+    # untouched), from per-row integer registers gpu/sky.py uploads
+    if wd is not None and getattr(wd, 'ground_plane', False) and \
+            str(getattr(wd, 'ground_mode', 'SOLID')) == 'MODE7':
+        img[yy, xx, :3] = SKY.mode7_floor(wd, inv, eye, w, h, ss, xx, yy,
+                                          img[yy, xx, :3])
+    if getattr(st, 'fog', False) and \
+            str(getattr(st, 'fog_mode', 'LINEAR')) == 'GROUND':
+        # R251 LIGHT-A2 (F009): POV's fog_type 2 fogs a ray that hits
+        # nothing by its elevation (the closed form); gpu/sky.py's
+        # hal_ground_fog_sky is the twin, on the same ray
+        from . import fog as _FOG
+        img[yy, xx, :3] = _FOG.ground_fog_sky(img[yy, xx, :3], dirs, st,
+                                              eye)
     return img
 
 
@@ -7198,6 +8705,436 @@ def _shade_fragments_cpu(job, tri, bary, px, py, front, rank, st):
     return col
 
 
+# ---------------------------------------------------------------- R251
+# The transparency pack (1.90.0): the blend unit's fixed equations, the
+# framebuffer format at the blend, the DS composite rules and the Doom
+# fuzz, all in ONE composite skeleton that runs on the CPU on both roads
+# (CAP 'abuffer' NEVER). Every rule that quantises a layer colour refuses
+# the GPU LAYER passes by name inside the routing block, so its twin is
+# CPU vs CPU by construction; the ALPHA road under framebuffer NONE keeps
+# 1.89.0's float over byte for byte.
+
+#: the composite's one table of equation ids -- properties.BLEND_EQUATION
+#: carries the SAME numbers explicitly (Blender stores the integer in the
+#: .blend, so a positional list would renumber every saved scene)
+MODE_INDEX = {'ALPHA': 0, 'PS1_AVG': 1, 'PS1_ADD': 2, 'PS1_SUB': 3,
+              'PS1_QUARTER': 4, 'SATURN_HALF': 5, 'SATURN_SHADOW': 6,
+              'SATURN_HALF_LUM': 7, 'THREEDO_SUB': 8, 'THREEDO_XOR': 9,
+              'SNES_ADD': 10, 'SNES_SUB': 11, 'SNES_ADD_HALF': 12,
+              'SNES_SUB_HALF': 13, 'GBA': 14, 'DS': 15, 'FUZZ': 16,
+              'THIN_WALL': 17, 'IMAGINE_FOG': 18}
+#: every equation that reads F's rgb: `to8(F) >> 3` turns a one-ulp
+#: simulator/driver difference at a to8 boundary into a whole lattice
+#: level, so these refuse the GPU layers by name. ALPHA keeps today's
+#: layer twin; SATURN_SHADOW and FUZZ read only `a > 0` (a baked constant)
+MODES_READ_F = frozenset(MODE_INDEX.values()) - {0, 6, 16}
+#: the one-sub-screen chips: only the layer composited LAST at a pixel
+#: blends, every layer beneath it is drawn opaque (SNES colour math has
+#: one sub screen; the GBA blends the top two layers)
+MODES_ONE_SUB = frozenset({10, 11, 12, 13, 14})
+#: id's r_draw.c fuzzoffset, in rows (+1 = one row up, -1 = one row down)
+FUZZ_T = np.array([+1, -1, +1, -1, +1, +1, -1, +1, +1, -1, +1, +1, +1, -1,
+                   +1, +1, +1, -1, -1, -1, -1, +1, -1, -1, +1, +1, +1, +1,
+                   -1, +1, -1, +1, +1, -1, -1, +1, +1, -1, -1, -1, -1, +1,
+                   +1, +1, +1, -1, +1, +1, -1, +1], np.int32)
+
+
+def _to8(c):
+    """float rgb/alpha -> 8-bit int32, np.round half-to-even (the named
+    tie rule of every integer equation below)."""
+    return np.round(np.clip(c, 0.0, 1.0) * np.float32(255)).astype(np.int32)
+
+
+def _from8(k):
+    """8-bit int32 -> float32, one float32 division."""
+    return k.astype(np.float32) / np.float32(255)
+
+
+def _mode_table(scene, st):
+    """(mode_of_mat (M,) int32, the global mode): each material's equation
+    id -- its own Blend Mode, or the render's Blend Equation at INHERIT;
+    an unknown name reads as ALPHA."""
+    g = str(getattr(st, 'blend_equation', 'ALPHA') or 'ALPHA')
+    g_id = MODE_INDEX.get(g, 0)
+    mats = scene.materials or []
+    ids = []
+    for m in mats:
+        mm = str(getattr(m, 'blend_mode', 'INHERIT') or 'INHERIT')
+        ids.append(MODE_INDEX.get(mm, 0) if mm != 'INHERIT' else g_id)
+    return np.array(ids or [g_id], np.int32), g
+
+
+def zoffs_scale(camera):
+    """R251 C126 (Blender 2.4x Zoffs): the factor that turns a material's
+    Z Offset (scene units) into the depth buffer's own units. The raster
+    tests and stores ndc z, so a constant offset must live there -- as
+    2.4x's zbuf.c did, `polygon_offset = zoffs * 0x7FFFFFFF /
+    (clipend - clipsta)`: the offset divided by the camera's clip range.
+    Exact scene units under an orthographic camera (ndc z is linear
+    there); under perspective the world-space effect grows with
+    distance, exactly 2.4x's behaviour, disclosed. One float32."""
+    near = float(getattr(camera, 'clip_start', 0.1) or 0.1)
+    far = float(getattr(camera, 'clip_end', 1000.0) or 1000.0)
+    return np.float32(1.0 / max(far - near, 1e-6))
+
+
+def composite_reads_neighbours(scene, st):
+    """True when the transparent composite reads a NEIGHBOURING pixel of
+    the finished frame (Fuzz: the row above/below; Thin Wall: the jogged
+    background) -- which a pooled row band never holds at its seam, so
+    the engine's worker-pool gate skips the pool by name for it."""
+    if str(getattr(st, 'transparency', 'NONE')) not in ('SORTED', 'ABUFFER'):
+        return False
+    if str(getattr(st, 'blend_equation', 'ALPHA')) in ('FUZZ', 'THIN_WALL'):
+        return True
+    return any(str(getattr(m, 'blend_mode', 'INHERIT')) in ('FUZZ', 'THIN_WALL')
+               for m in (scene.materials or ()))
+
+
+class _Framebuffer:
+    """The framebuffer format the frame is written INTO (C018 + C070):
+    PS2 PSMCT16, GameCube RGBA6, 3dfx Voodoo RGB565 -- every write
+    truncates, every blend reads the truncated value back. NONE is the
+    identity (the SAME array back, no copy). `rows` = the internal row
+    range a banded worker owns; the dither is indexed by the FRAME row,
+    so a banded frame packs each pixel exactly once and bitwise the
+    whole frame. The frame is kept as the format's EXPANDED read-back
+    value at all times (every expansion is injective)."""
+
+    def __init__(self, st, width, height, rows=None):
+        from . import dither as DI
+        fmt = str(getattr(st, 'framebuffer', 'NONE') or 'NONE')
+        if fmt not in DI.FB_FORMATS:
+            print(f'[Halcyon] transparency: framebuffer format {fmt!r} is '
+                  'not one of the formats; the frame stays 24-bit float '
+                  '(NONE), by name')
+            fmt = 'NONE'
+        self.fmt = fmt
+        self.on = fmt != 'NONE'
+        self.dither = bool(getattr(st, 'fb_dither', True))
+        self.subtract = bool(getattr(st, 'fb_dither_subtract', True))
+        self.width = int(width)
+        self.height = int(height)
+        self.rows = rows
+        self._DI = DI
+
+    def enter(self, img):
+        if not self.on:
+            return img
+        r0, r1 = (0, img.shape[0]) if self.rows is None else \
+            (max(int(self.rows[0]), 0), min(int(self.rows[1]), img.shape[0]))
+        if r1 <= r0:
+            return img
+        ys, xs = np.mgrid[r0:r1, 0:img.shape[1]]
+        c8 = _to8(img[r0:r1, :, :3])
+        img[r0:r1, :, :3] = _from8(
+            self._DI.fb_pack8(c8, xs, ys, self.fmt, self.dither))
+        return img
+
+    def leave(self, img):
+        return img
+
+    def read(self, rgb, xx, yy):
+        """The destination a blend SEES at (xx, yy): identity under NONE,
+        the format's read-back (the Voodoo's dither subtraction) else."""
+        if not self.on:
+            return rgb
+        return _from8(self._DI.fb_read8(_to8(rgb), xx, yy, self.fmt,
+                                        self.dither, self.subtract))
+
+    def over(self, F, a, B):
+        """ALPHA: 1.89.0's float over exactly (R:7606) under NONE; the
+        8-bit integer over of every 16-bit-era blend unit else."""
+        if not self.on:
+            aa = a[:, None]
+            return F * aa + B * (1.0 - aa)
+        a8 = _to8(a)
+        return _from8(self._DI.fb_over8(_to8(F), a8, _to8(B)))
+
+    def write(self, out, xx, yy):
+        if not self.on:
+            return out
+        return _from8(self._DI.fb_pack8(_to8(out), xx, yy, self.fmt,
+                                        self.dither))
+
+
+def framebuffer_pack_frame(img, st, rows=None):
+    """The whole-frame pack for a frame the composite never ran on (no
+    see-through fragments): the same truncation the composite's entry
+    applies, so a 16-bit buffer's opaque frame is on its lattice too."""
+    fb = _Framebuffer(st, img.shape[1], img.shape[0], rows=rows)
+    return fb.leave(fb.enter(img))
+
+
+def _layer_order(rank_s, st):
+    """The layers in composite order: DEPTH draws the farthest kept layer
+    first (R:7599, unchanged); the DS orders (Y_SORT / SUBMISSION) draw
+    the first-sorted layer first."""
+    top = int(rank_s[-1])
+    if str(getattr(st, 'translucent_order', 'DEPTH')) == 'DEPTH':
+        return range(top, -1, -1)
+    return range(0, top + 1)
+
+
+def _thin_wall_jog(frag, job, st, width, height):
+    """R251 C095 (3ds Max Thin Wall Refraction): the screen-space jog of
+    each fragment -- (qx, qy) int64, the frame pixel the pane shows. The
+    shading normal is rebuilt from the mesh exactly as shading used it
+    (corner normals under smooth, the face normal under flat, the
+    normal_source override, the two-sided flip toward the eye), taken
+    into view space by three explicit float32 sums in a fixed order
+    (never a BLAS kernel's), scaled by Thickness Offset x (IOR - 1) x
+    16 px at 480 lines (Halcyon's own calibration of Max's unpublished
+    constant, disclosed) and rounded half-to-even (np.round: a jog of
+    exactly n + 0.5 px lands on the even pixel, named), edge-clamped."""
+    mesh = job.scene.mesh
+    t = frag['tri']
+    bary = np.asarray(frag['bary'], np.float32)
+    w0, w1, w2 = bary[:, 0], bary[:, 1], bary[:, 2]
+    n_c = np.asarray(mesh.normals, np.float32)[mesh.tris[t]]
+    n = w0[:, None] * n_c[:, 0] + w1[:, None] * n_c[:, 1] \
+        + w2[:, None] * n_c[:, 2]
+    sm = np.ones(t.size, bool) if mesh.smooth is None \
+        else np.asarray(mesh.smooth, bool)[t].copy()
+    ns = str(getattr(st, 'normal_source', 'AUTO'))
+    if ns == 'FACE':
+        sm[:] = False
+    elif ns == 'SMOOTH':
+        sm[:] = True
+    n = np.where(sm[:, None], n,
+                 np.asarray(mesh.face_normals, np.float32)[t])
+    n = n / np.maximum(np.sqrt((n * n).sum(1, keepdims=True)),
+                       np.float32(1e-20))
+    front = frag.get('front')
+    if front is not None:
+        n = np.where(np.asarray(front, bool)[:, None], n, -n)
+    n = n.astype(np.float32)
+    V = np.asarray(job.view, np.float32)[:3, :3]
+    n_vx = (n[:, 0] * V[0, 0] + n[:, 1] * V[0, 1]) + n[:, 2] * V[0, 2]
+    n_vy = (n[:, 0] * V[1, 0] + n[:, 1] * V[1, 1]) + n[:, 2] * V[1, 2]
+    mats = job.scene.materials or []
+    thick_of = np.array([np.float32(getattr(m, 'thin_wall_offset', 0.5))
+                         for m in mats] or [0.5], np.float32)
+    ior_of = np.array([np.float32(getattr(m, 'ior', 1.45))
+                       for m in mats] or [1.45], np.float32)
+    mf = np.clip(np.asarray(frag['mat_f']), 0, thick_of.size - 1)
+    k = ((thick_of[mf] * (ior_of[mf] - np.float32(1.0)))
+         * np.float32(16.0)) * np.float32(height / 480.0)
+    ox = k * n_vx
+    oy = k * n_vy
+    xx = np.asarray(frag['xx'], np.float32)
+    yy = np.asarray(frag['yy'], np.float32)
+    qx = np.clip(np.round(xx + ox), 0, width - 1).astype(np.int64)
+    qy = np.clip(np.round(yy + oy), 0, height - 1).astype(np.int64)
+    return qx, qy
+
+
+def _view_depth(job, P):
+    """|z| of world points P along the view axis, scene units -- the
+    sequential float32 chain shade_batch's ctx.depth carries (three
+    products, two sums, no matmul kernel)."""
+    dP = np.asarray(P, np.float32) - np.asarray(job.eye, np.float32)[None, :]
+    r = np.asarray(job.view, np.float32)[2, :3]
+    dz = dP[:, 0] * r[0]
+    dz += dP[:, 1] * r[1]
+    dz += dP[:, 2] * r[2]
+    return np.abs(dz).astype(np.float32)
+
+
+def _imagine_fog_spans(mode, pix, mat_f, tri, bary, px, py, front, gbuf,
+                       job):
+    """R251 C101 (Imagine Fog Length): per fog fragment, the opacity of
+    its (pixel, material) group and whether it is the group's NEAREST
+    fragment (the one that carries the fog). Returns (a_fog (N,)
+    float32, first_fog (N,) bool) in the composite's fragment order.
+
+    The thickness is measured along the VIEW AXIS in scene units from
+    the fragments' own surface points (the raster's depth is the
+    buffer's ndc z, so both the fragments and the opaque surface behind
+    them are taken to view depth through the same float32 chain
+    ctx.depth uses); the successor of a fog fragment is found among the
+    FOG MATERIAL'S OWN fragments at the pixel (a pane or the Box
+    between a front and its back would otherwise orphan the back), a
+    winding count per (pixel, material) in depth order makes nested or
+    interpenetrating shells of one material count their union ONCE and
+    shells one behind the other sum; an unmatched back face (open mesh)
+    adds nothing, an unmatched front spans to the opaque surface (the
+    camera's clip end where nothing is behind). Enter / leave is the
+    face normal against the eye ray (geometric, never the winding flag);
+    a shared-edge pixel two coplanar triangles both rasterise counts
+    once. One float32 divide by Fog Length, one min: opacity = min(1,
+    D / L); L <= 0 saturates."""
+    n = pix.size
+    a_fog = np.zeros(n, np.float32)
+    first_fog = np.zeros(n, bool)
+    fi = np.nonzero(mode == 18)[0]
+    if fi.size == 0:
+        return a_fog, first_fog
+    P_f = job.attributes(tri[fi], bary[fi], None, need={'P'})[0]
+    dz_all = _view_depth(job, P_f)
+    far = np.float32(getattr(job.scene.camera, 'clip_end', 1000.0) or 1000.0)
+    oz_all = np.full(fi.size, far, np.float32)
+    otri = gbuf.tri[py[fi], px[fi]]
+    cov = otri >= 0
+    if bool(cov.any()):
+        P_o = job.attributes(otri[cov], gbuf.bary[py[fi][cov], px[fi][cov]],
+                             None, need={'P'})[0]
+        oz_all[cov] = _view_depth(job, P_o)
+    # enter / leave by the GEOMETRIC facing (the face normal against the
+    # eye ray), never the raster's winding flag: a mesh wound inward
+    # would otherwise leave through its front face
+    mesh = job.scene.mesh
+    fn = np.asarray(mesh.face_normals, np.float32)[tri[fi]]
+    to_eye = np.asarray(job.eye, np.float32)[None, :] - np.asarray(P_f, np.float32)
+    enter_all = (fn[:, 0] * to_eye[:, 0] + fn[:, 1] * to_eye[:, 1]
+                 + fn[:, 2] * to_eye[:, 2]) > 0.0
+    o2 = np.lexsort((dz_all, mat_f[fi], pix[fi]))
+    fi, dz, oz, frz = fi[o2], dz_all[o2], oz_all[o2], enter_all[o2]
+    pz, mz = pix[fi], mat_f[fi]
+    same = (pz[1:] == pz[:-1]) & (mz[1:] == mz[:-1])
+    # a pixel on an edge two coplanar triangles share is rasterised by
+    # BOTH (the raster's coverage wobble window): the second fragment,
+    # within the A-buffer's own depth tolerance of the first and facing
+    # the same way, is the same surface and counts once, named
+    dup = np.zeros(fi.size, bool)
+    if fi.size > 1:
+        tol = np.abs(dz[:-1]) * raster.ABUF_DEPTH_TOL_REL + raster.ABUF_DEPTH_TOL_ABS
+        dup[1:] = same & (frz[1:] == frz[:-1]) & (np.abs(dz[1:] - dz[:-1]) <= tol)
+    z_next = np.append(np.where(same, dz[1:], oz[:-1]), oz[-1:])
+    start = np.r_[True, ~same]
+    gid = np.cumsum(start) - 1
+    g0 = np.nonzero(start)[0][gid]
+    w = np.where(dup, 0, np.where(frz, 1, -1)).astype(np.int32)
+    cs = np.cumsum(w)
+    w = cs - (cs[g0] - w[g0])
+    inside = w > 0
+    span = np.where(inside, np.maximum(z_next - dz, np.float32(0.0)),
+                    np.float32(0.0)).astype(np.float32)
+    D = np.zeros(int(gid[-1]) + 1, np.float32)
+    np.add.at(D, gid[inside], span[inside])
+    mats = job.scene.materials or []
+    L_of = np.array([np.float32(getattr(m, 'fog_length', 1.0))
+                     for m in mats] or [1.0], np.float32)
+    L = L_of[np.clip(mz, 0, L_of.size - 1)]
+    a_g = np.where(L > 0.0, np.minimum(np.float32(1.0), D[gid] / L),
+                   np.float32(1.0)).astype(np.float32)
+    a_fog[fi] = a_g
+    first_fog[fi[start]] = True
+    return a_fog, first_fog
+
+
+def _fixed_blend(m_id, F, a, B, xx, yy, last, img, fb, job, st, height,
+                 frag=None):
+    """One fixed equation over its fragments: (out rgb float32, cov,
+    alpha_max-or-None). Every integer step int32; `to8` half-to-even;
+    `>>` arithmetic. `drawn = a > 0`: an alpha chain that resolved to
+    exactly 0 draws nothing -- no other alpha weighting exists on these
+    chips (GBA / DS weight by their own fixed-point alpha). `frag` is
+    the per-fragment mesh data the software items read (tri, bary,
+    front, mat_f, xx, yy; the Imagine fog's a_fog / first_fog)."""
+    n = a.size
+    drawn = a > 0.0
+    if m_id == 17:
+        # THIN_WALL (3ds Max Thin Wall Refraction): the frame BENEATH
+        # this layer read at the jogged pixel, then the opacity over it.
+        # The PANE is the jog: at opacity 0 a clear window still bends
+        # the view (Max's invisibility dial is Thickness Offset, not
+        # opacity), so every fragment is drawn. Read before the write
+        # (order-free within the layer)
+        qx, qy = _thin_wall_jog(frag, job, st, img.shape[1], height)
+        behind = fb.read(img[qy, qx, :3], qx, qy)
+        out = fb.over(F, a, behind)
+        return out.astype(np.float32), a.copy(), None
+    if m_id == 18:
+        # IMAGINE_FOG (Imagine Fog Length): the NEAREST fog fragment of
+        # the material at the pixel carries the whole fog -- its shaded
+        # colour (the entry point's colour chain) over B at the span
+        # opacity; every other fragment of the material there is not
+        # drawn. Unlit by construction under the Constant model
+        af = np.asarray(frag['a_fog'], np.float32)
+        first = np.asarray(frag['first_fog'], bool)
+        out = np.where(first[:, None], fb.over(F, af, B), B)
+        cov = np.where(first, af, np.float32(0.0)).astype(np.float32)
+        return out.astype(np.float32), cov, None
+    if m_id == 16:
+        # FUZZ (Doom Spectre): the frame one row up or down, at 26/32,
+        # the surface's own colour never appears; per (x, y, frame, seed)
+        from . import film as _film
+        frame = int(getattr(job.scene, 'frame', 1) or 1)
+        start = (_film._hash_u32_raw(xx, np.full_like(xx, frame),
+                                     int(getattr(st, 'seed', 0)))
+                 % np.uint32(50)).astype(np.int32)
+        k = (yy.astype(np.int32) + start) % 50
+        sy = np.clip(yy + FUZZ_T[k], 1, max(height - 2, 0))
+        src = fb.read(img[sy, xx, :3], xx, sy)
+        out = np.where(drawn[:, None], src * np.float32(0.8125), B)
+        return out.astype(np.float32), \
+            np.where(drawn, np.float32(1.0), np.float32(0.0)), None
+    if m_id == 15:
+        # DS: (F*(A+1) + B*(31-A)) / 32 on 6-bit channels, A = 5-bit
+        # polygon alpha; A 0 draws nothing, A 31 replaces; alpha = max
+        a5 = np.clip(np.round(a * np.float32(31)), 0, 31).astype(np.int32)
+        f6 = _to8(F) >> 2
+        b6 = _to8(B) >> 2
+        a5c = a5[:, None]
+        o = (f6 * (a5c + 1) + b6 * (31 - a5c)) >> 5
+        o = np.where(a5c == 31, f6, o)
+        exp = _from8((o << 2) | (o >> 4))
+        drawn = a5 > 0
+        out = np.where(drawn[:, None], exp, B)
+        amax = a5.astype(np.float32) / np.float32(31)
+        return out.astype(np.float32), np.zeros(n, np.float32), amax
+    if m_id in MODES_ONE_SUB:
+        # SNES colour math / GBA BLDALPHA: one sub screen -- the layer
+        # composited LAST blends, every layer beneath it REPLACES
+        f = _to8(F) >> 3
+        b = _to8(B) >> 3
+        if m_id == 10:
+            o = np.minimum(31, b + f)
+        elif m_id == 11:
+            o = np.maximum(0, b - f)
+        elif m_id == 12:
+            o = (b + f) >> 1
+        elif m_id == 13:
+            o = np.maximum(0, b - f) >> 1
+        else:
+            eva = np.clip(np.round(a * np.float32(16)), 0, 16).astype(np.int32)
+            evb = 16 - eva
+            o = np.minimum(31, (f * eva[:, None] + b * evb[:, None]) >> 4)
+        blended = _from8((o << 3) | (o >> 2))
+        out = np.where(last[:, None], blended, F)
+        out = np.where(drawn[:, None], out, B)
+        return out.astype(np.float32), \
+            np.where(drawn, np.float32(1.0), np.float32(0.0)), None
+    # PS1 / Saturn VDP1 / 3DO PIXC: 5-bit of the 8-bit values, one
+    # integer expression, zero-fill expand (the 15-bit VRAM read)
+    f = _to8(F) >> 3
+    b = _to8(B) >> 3
+    if m_id == 1:
+        o = (b + f) >> 1
+    elif m_id == 2:
+        o = np.minimum(31, b + f)
+    elif m_id == 3:
+        o = np.maximum(0, b - f)
+    elif m_id == 4:
+        o = np.minimum(31, b + (f >> 2))
+    elif m_id == 5:
+        o = (b >> 1) + (f >> 1)
+    elif m_id == 6:
+        o = b >> 1
+    elif m_id == 7:
+        o = f >> 1
+    elif m_id == 8:
+        o = np.clip(f - b, 0, 31)
+    elif m_id == 9:
+        o = f ^ b
+    else:
+        return fb.over(F, a, B), a.copy(), None
+    out = np.where(drawn[:, None], _from8(o << 3), B)
+    return out.astype(np.float32), \
+        np.where(drawn, np.float32(1.0), np.float32(0.0)), None
+
+
 #: how the last GPU-gated A-buffer frame routed its depth layers --
 #: per-layer fragment counts, the threshold, and who shaded what. The
 #: printed routing line reads from it; the tests assert on it so a
@@ -7215,7 +9152,8 @@ def _fmt_frags(n):
     return str(n)
 
 
-def _composite_abuffer(job, frags, gbuf, img, st, band=None):
+def _composite_abuffer(job, frags, gbuf, img, st, band=None, vp=None,
+                       snap=0.0, rows=None):
     """True A-buffer: shade every fragment, sort per pixel, composite.
 
     Two things used to make this the slowest stage in the renderer by a wide
@@ -7230,40 +9168,107 @@ def _composite_abuffer(job, frags, gbuf, img, st, band=None):
     pixel a hundred deep in glass therefore cost a hundred passes over millions
     of fragments. Sorting by layer first makes each layer a contiguous slice, so
     the whole composite is one pass in total.
+
+    R251 (the transparency pack): the framebuffer format wraps every exit
+    (the format is the frame's, not the fragment count's); the sort takes
+    the DS orders; each fragment blends by its material's equation (the
+    render's Blend Equation at INHERIT); a fixed equation refuses the GPU
+    layers by name in the routing block; the alpha plane takes the DS's
+    max and the DS depth write / same-ID-once rules run per layer.
     """
+    W, H = gbuf.width, gbuf.height
+    fb = _Framebuffer(st, W, H, rows=rows)
+    img = fb.enter(img)
     px, py, tri, depth, bary, front = frags.finish()
     if px.size == 0:
-        return img
+        return fb.leave(img)
     opaque_z = gbuf.depth[py, px]
     # the SAME tolerant limit the collection used (raster.abuf_depth_limit):
     # a coplanar contact must not flip on which rasteriser rounded the
     # opaque depth's last ULP
     keep = depth <= raster.abuf_depth_limit(opaque_z)
     if not np.any(keep):
-        return img
-    px, py, tri, depth, bary, front = (a[keep] for a in
-                                       (px, py, tri, depth, bary, front))
+        return fb.leave(img)
+    px, py, tri, depth, bary, front, opaque_z = (
+        a[keep] for a in (px, py, tri, depth, bary, front, opaque_z))
 
-    # Sorted Blend orders whole polygons by their centroid, which is what a
-    # renderer without per-fragment lists could manage -- and it shows the
-    # classic sorting errors where surfaces interpenetrate. A-Buffer sorts every
-    # fragment on its own depth and is correct through any arrangement.
-    if st.transparency == 'SORTED':
-        mesh = job.scene.mesh
-        cent = mesh.verts[mesh.tris].mean(axis=1)
-        view_z = np.abs((cent - job.eye[None, :]) @ job.view[:3, :3].T)[:, 2]
-        key = view_z[tri].astype(np.float32)
+    mesh = job.scene.mesh
+    # R251 C126 (Blender 2.4x Zoffs / ZInvert): per material, the Z
+    # Offset the raster ALREADY applied at collection (the ABUFFER
+    # `depth` carries it; Sorted Blend's centroid key takes it here)
+    # and the Invert Z flag (the material's fragments sort far-first,
+    # in front of every ordinary fragment -- Depth order only)
+    _mats0 = job.scene.materials or []
+    zo_of_mat = np.array([np.float32(getattr(m, 'z_offset', 0.0))
+                          for m in _mats0] or [0.0], np.float32)
+    zi_of_mat = np.array([bool(getattr(m, 'z_invert', False))
+                          for m in _mats0] or [False], bool)
+    if mesh.mat_index is not None:
+        mat_f0 = np.clip(mesh.mat_index[tri], 0, zo_of_mat.size - 1)
     else:
-        key = depth
-
-    pix = py.astype(np.int64) * gbuf.width + px
-    order = np.lexsort((key, pix))
+        mat_f0 = np.zeros(tri.size, np.int32)
+    order_mode = str(getattr(st, 'translucent_order', 'DEPTH') or 'DEPTH')
+    if order_mode == 'Y_SORT' and vp is None:
+        print('[Halcyon] transparency: Y-sort needs the projection (vp '
+              'missing); composited by depth')
+        order_mode = 'DEPTH'
+    pix = py.astype(np.int64) * W + px
+    if order_mode == 'Y_SORT':
+        # the DS auto-sort: polygons with the lower bottom screen row
+        # first, then the lower top row, then submission -- never depth.
+        # The rows are the raster's own projection (the snapped rows an
+        # INTEGER preset rasterised with); a corner behind the eye has a
+        # meaningless row and is clamped to the frame (the DS clipped
+        # such a polygon and sorted the clipped rows: the named stand-in)
+        _c, screen, _iw, _z = raster.project(mesh.verts, vp, W, H, snap=snap)
+        row = np.clip(np.floor(screen[:, 1]), 0, H - 1).astype(np.int64)
+        rows3 = row[mesh.tris]
+        ytop = (H - 1) - rows3.max(axis=1)
+        ybot = (H - 1) - rows3.min(axis=1)
+        order = np.lexsort((tri, ytop[tri], ybot[tri], pix))
+    elif order_mode == 'SUBMISSION':
+        order = np.lexsort((tri, pix))
+    else:
+        # Sorted Blend orders whole polygons by their centroid, which is
+        # what a renderer without per-fragment lists could manage -- and
+        # it shows the classic sorting errors where surfaces
+        # interpenetrate. A-Buffer sorts every fragment on its own depth
+        # and is correct through any arrangement.
+        if st.transparency == 'SORTED':
+            cent = mesh.verts[mesh.tris].mean(axis=1)
+            view_z = np.abs((cent - job.eye[None, :])
+                            @ job.view[:3, :3].T)[:, 2]
+            key = view_z[tri].astype(np.float32)
+            if bool(np.any(zo_of_mat != 0.0)):
+                # Zoffs on the centroid key: one float32 subtract
+                key = key - zo_of_mat[mat_f0]
+        else:
+            key = depth
+        if bool(np.any(zi_of_mat)):
+            # ZInvert: the material's fragments take a negated key, so
+            # they sort in front of every ordinary fragment at the
+            # pixel, far-first among themselves -- the far wall is
+            # composited LAST (on top). The opaque z-test kept the
+            # TRUE ordering (`keep` read `depth`, not this key)
+            key = np.where(zi_of_mat[mat_f0], -key, key).astype(np.float32)
+        if np.unique(zo_of_mat[mat_f0]).size > 1:
+            # several offsets = several raster calls concatenated, so the
+            # list order among equal-depth fragments would be CALL order:
+            # the lower triangle id takes the lower rank (composited
+            # later, on top), the raster's own tie rule, named. With ONE
+            # offset value the stable sort over the raster's own append
+            # order stays (the identity pin needs it)
+            order = np.lexsort((tri, key, pix))
+        else:
+            order = np.lexsort((key, pix))
     pix = pix[order]
     px = px[order]
     py = py[order]
     tri = tri[order]
     bary = bary[order]
     front = front[order]
+    depth = depth[order]
+    opaque_z = opaque_z[order]
 
     grp_start = np.zeros(pix.size, np.int64)
     new_group = np.nonzero(pix[1:] != pix[:-1])[0] + 1
@@ -7287,10 +9292,52 @@ def _composite_abuffer(job, frags, gbuf, img, st, band=None):
               'not drawn, and where nothing opaque sits behind them '
               'the background shows through. Raise Max Transparent '
               'Layers to draw them')
-        px, py, tri, bary, front, rank = (a[within] for a in
-                                          (px, py, tri, bary, front, rank))
+        px, py, tri, bary, front, rank, pix, depth, opaque_z = (
+            a[within] for a in (px, py, tri, bary, front, rank, pix,
+                                depth, opaque_z))
         if px.size == 0:
-            return img
+            return fb.leave(img)
+
+    # R251: the per-fragment equation and the GPU-layer refusal by name
+    mode_of_mat, _g = _mode_table(job.scene, st)
+    if mesh.mat_index is not None:
+        mat_f = np.clip(mesh.mat_index[tri], 0, mode_of_mat.size - 1)
+    else:
+        mat_f = np.zeros(tri.size, np.int32)
+    mode = mode_of_mat[mat_f]
+    # R251 C101 (Imagine Fog Length): the fog spans need the A-buffer's
+    # per-fragment depths -- under Sorted Blend the key is the centroid
+    # and front/back pairing is meaningless, so the fog material blends
+    # as Alpha Over, said once per frame per material
+    a_fog = first_fog = None
+    if bool(np.any(mode == 18)):
+        if str(getattr(st, 'transparency', 'NONE')) == 'SORTED':
+            _mats_f = job.scene.materials or []
+            for _mi in sorted(set(int(v) for v in np.unique(mat_f[mode == 18]))):
+                _nm = str(getattr(_mats_f[_mi], 'name', None) or f'material {_mi}') \
+                    if 0 <= _mi < len(_mats_f) else f'material {_mi}'
+                print('[Halcyon] transparency: Imagine Fog Length needs '
+                      'A-Buffer (Sorted Blend orders whole polygons by '
+                      f"centroid): '{_nm}' blends as Alpha Over")
+            mode = np.where(mode == 18, 0, mode).astype(np.int32)
+        else:
+            a_fog, first_fog = _imagine_fog_spans(
+                mode, pix, mat_f, tri, bary, px, py, front, gbuf, job)
+    why_cpu = None
+    if fb.on:
+        why_cpu = (f'the {fb.fmt} framebuffer quantises every layer '
+                   'colour to 5/6 bits and the layer shading holds 6e-3 '
+                   'across devices (TR:19224-19228); the layers shade on '
+                   'the CPU, by name')
+    else:
+        used = sorted(k for k, v in MODE_INDEX.items()
+                      if v in MODES_READ_F and bool(np.any(mode == v)))
+        if used:
+            why_cpu = (f"the {', '.join(used)} blend equation quantises "
+                       'the layer colour to 5/6 bits and the layer '
+                       'shading holds 6e-3 across devices '
+                       '(TR:19224-19228); the layers shade on the CPU, '
+                       'by name')
 
     # Deferred GPU shading of the layers themselves: each depth layer's
     # fragments become an ids texture and every transparent material's
@@ -7330,7 +9377,14 @@ def _composite_abuffer(job, frags, gbuf, img, st, band=None):
             gpu_ranks=n_gpu_r, cpu_ranks=n_cpu_r,
             gpu_frags=int(gsel.sum()),
             cpu_frags=int(rank.size - int(gsel.sum())))
-        if not gsel.any():
+        if why_cpu is not None:
+            # R251: a fixed equation or a framebuffer format reads F's
+            # rgb through a 5/6-bit lattice -- a refusal BY NAME, the
+            # layer counts kept in the record; `col` stays None
+            LAST_ROUTING['refused'] = why_cpu
+            print('[Halcyon GPU] transparent layers on the CPU: '
+                  f'{why_cpu}')
+        elif not gsel.any():
             # every layer sits below the break-even: nothing for the
             # driver. That is a ROUTE, not a refusal -- say so calmly,
             # and only when a driver was actually there to be skipped
@@ -7412,25 +9466,121 @@ def _composite_abuffer(job, frags, gbuf, img, st, band=None):
         with ST.track('transparency shading'):
             col = _shade_fragments_cpu(job, tri, bary, px, py, front,
                                        rank, st)
+    # R251 C031 (PS2 AFAIL): a Clip+Blend fragment at or above its Clip
+    # Threshold is the OPAQUE half seen again through the transparent
+    # pass (same triangle, same depth, kept by the tolerant limit): it
+    # was promoted into the z-buffer and shaded there, so it draws
+    # nothing here. Decided on the PRE-quantised alpha (alpha_bits 1
+    # would round a sub-threshold 0.6 to 1.0 and drop the blend half)
+    # A material the clip stage REFUSED by name (affine texturing, an
+    # unliftable chain) was never promoted: it stays whole on this road,
+    # where the law already forces 1.0 above the threshold as CLIP does
+    _cb_refused = LAST_CLIP.get('refused') or {}
+    _cb_thr = np.full(mode_of_mat.size, -1.0, np.float32)
+    for _i, _m in enumerate(job.scene.materials or []):
+        if str(getattr(_m, 'alpha_mode', 'BLEND')) == 'CLIP_BLEND' and \
+                str(getattr(_m, 'name', None) or f'material {_i}') \
+                not in _cb_refused:
+            _cb_thr[_i] = max(float(getattr(_m, 'alpha_clip', 0.5)), 1e-6)
+    _cb_f = _cb_thr[mat_f]
+    is_opaque_half = (_cb_f >= 0.0) & (col[:, 3] >= _cb_f)
     if st.alpha_bits < 8:
         levels = float(2 ** max(st.alpha_bits, 1) - 1)
         col[:, 3] = np.round(col[:, 3] * levels) / levels
 
     # group by layer so each one is a contiguous run, then composite the
-    # farthest kept layer first
+    # farthest kept layer first (DEPTH) or the first-sorted first (the
+    # DS orders)
     layer_order = np.argsort(rank, kind='stable')
     rank_s = rank[layer_order]
     bounds = np.searchsorted(rank_s, np.arange(int(rank_s[-1]) + 2))
-    for r in range(int(rank_s[-1]), -1, -1):
+    n_at = np.bincount(pix, minlength=W * H)        # kept per pixel, after the cap
+    by_depth = order_mode == 'DEPTH'
+    depth_write = bool(getattr(st, 'translucent_depth_write', False))
+    zw = np.full(W * H, np.inf, np.float32) if depth_write else None
+    any_ds = bool(np.any(mode == 15))
+    last_id = np.full(W * H, -1, np.int32) if any_ds else None
+    if any_ds:
+        oid = (mesh.obj_index[tri].astype(np.int32)
+               if getattr(mesh, 'obj_index', None) is not None
+               else np.zeros(tri.size, np.int32))
+    for r in _layer_order(rank_s, st):
         lo, hi = bounds[r], bounds[r + 1]
         if hi <= lo:
             continue
         sel = layer_order[lo:hi]
         yy, xx = py[sel], px[sel]
-        a = np.clip(col[sel, 3], 0.0, 1.0)[:, None]
-        img[yy, xx, :3] = col[sel, :3] * a + img[yy, xx, :3] * (1.0 - a)
-        img[yy, xx, 3] = np.clip(img[yy, xx, 3] + a[:, 0], 0.0, 1.0)
-    return img
+        pp = pix[sel]
+        msel = mode[sel]
+        a = np.clip(col[sel, 3], 0.0, 1.0).astype(np.float32)
+        if bool(np.any(is_opaque_half[sel])):
+            a = np.where(is_opaque_half[sel], np.float32(0.0), a)
+        if zw is not None:
+            # DS POLYGON_ATTR bit 11: a drawn translucent fragment writes
+            # depth; a later one behind it at that pixel is dropped
+            # (strict LESS: a tie loses, named). A fragment whose alpha
+            # chain resolved to 0 draws nothing and writes nothing.
+            ok = depth[sel] < zw[pp]
+            a = np.where(ok, a, np.float32(0.0)).astype(np.float32)
+            wr = ok & (a > 0.0)
+            zw[pp[wr]] = depth[sel][wr]
+        if last_id is not None:
+            # DS same-ID once: a pixel already holding this translucent
+            # polygon ID (Halcyon's object index) is never blended twice
+            ds = msel == 15
+            skip = ds & (oid[sel] == last_id[pp])
+            a = np.where(skip, np.float32(0.0), a).astype(np.float32)
+        if msel.max() == 0 and msel.min() == 0:
+            # the ALPHA road: 1.89.0's over byte for byte under NONE
+            aa = a[:, None]
+            if fb.on:
+                B = fb.read(img[yy, xx, :3], xx, yy)
+                img[yy, xx, :3] = fb.write(fb.over(col[sel, :3], a, B), xx, yy)
+            else:
+                img[yy, xx, :3] = col[sel, :3] * aa + img[yy, xx, :3] * (1.0 - aa)
+            img[yy, xx, 3] = np.clip(img[yy, xx, 3] + aa[:, 0], 0.0, 1.0)
+            continue
+        last = (rank[sel] == 0) if by_depth else (rank[sel] == n_at[pp] - 1)
+        F = col[sel, :3]
+        B = fb.read(img[yy, xx, :3], xx, yy)
+        out = np.empty_like(F)
+        cov = a.copy()
+        amax = None
+        for m_id in np.unique(msel):
+            k = msel == m_id
+            if m_id == 0:
+                out[k] = fb.over(F[k], a[k], B[k])
+            else:
+                frag_k = None
+                if int(m_id) in (17, 18):
+                    # the software items read the fragment's mesh data
+                    sk = sel[k]
+                    frag_k = dict(tri=tri[sk], bary=bary[sk],
+                                  front=front[sk], mat_f=mat_f[sk],
+                                  xx=xx[k], yy=yy[k])
+                    if a_fog is not None:
+                        frag_k['a_fog'] = a_fog[sk]
+                        frag_k['first_fog'] = first_fog[sk]
+                o, c, am = _fixed_blend(int(m_id), F[k], a[k], B[k], xx[k],
+                                        yy[k], last[k], img, fb, job, st, H,
+                                        frag=frag_k)
+                out[k] = o
+                cov[k] = c
+                if am is not None:
+                    if amax is None:
+                        amax = np.full(a.size, -1.0, np.float32)
+                    amax[k] = am
+        img[yy, xx, :3] = fb.write(out, xx, yy)
+        new_a = np.clip(img[yy, xx, 3] + cov, 0.0, 1.0)
+        if amax is not None:
+            # DS destination alpha = max(Ap, Af)
+            kd = amax >= 0.0
+            new_a[kd] = np.maximum(img[yy, xx, 3][kd], amax[kd])
+        img[yy, xx, 3] = new_a
+        if last_id is not None:
+            drew = ds & (a > 0.0)
+            last_id[pp[drew]] = oid[sel][drew]
+    return fb.leave(img)
 
 
 def edge_factor(gbuf, width=1.0):
@@ -7495,7 +9645,7 @@ def edge_factor(gbuf, width=1.0):
     return np.where(measurable, dist, 0.0)
 
 
-def edge_distance_exact(gbuf, mesh, vp, snap=0.0):
+def edge_distance_exact(gbuf, mesh, vp, snap=0.0, pixel_shift=0.0):
     """Distance in pixels from each covered pixel to its triangle's nearest edge.
 
     Computed from the triangle's own projected vertices rather than from a
@@ -7517,7 +9667,7 @@ def edge_distance_exact(gbuf, mesh, vp, snap=0.0):
     try:
         _clip, screen, _invw, _z = _raster.project(
             np.asarray(mesh.verts, np.float32), vp, gbuf.width, gbuf.height,
-            snap=snap)
+            snap=snap, pixel_shift=pixel_shift)
     except Exception:                                           # noqa: BLE001
         return None
 
@@ -7558,7 +9708,7 @@ def edge_distance_exact(gbuf, mesh, vp, snap=0.0):
     return out
 
 
-def marked_edge_distance(gbuf, mesh, vp, snap=0.0):
+def marked_edge_distance(gbuf, mesh, vp, snap=0.0, pixel_shift=0.0):
     """R220: distance in pixels from each covered pixel to the nearest
     MARKED edge of its own triangle -- Freestyle marks, Sharp, creases,
     carried per triangle as `MeshData.ink_tri_mask` (bit k = the edge
@@ -7574,7 +9724,7 @@ def marked_edge_distance(gbuf, mesh, vp, snap=0.0):
     try:
         _clip, screen, _invw, _z = _raster.project(
             np.asarray(mesh.verts, np.float32), vp, gbuf.width, gbuf.height,
-            snap=snap)
+            snap=snap, pixel_shift=pixel_shift)
     except Exception:                                           # noqa: BLE001
         return None
     cov = gbuf.mask()
@@ -7777,6 +9927,58 @@ def _ink_reach_rows(scene, st):
         + _paint_reach_rows(st)
 
 
+def ink_tables(scene, st):
+    """R249: the per-material ink tables every road reads, read once.
+
+    Per material: ink on (Always, or Inherit under a global line) and
+    Never, the width (its own or the global), the colour (its own, the
+    Anime Shader's Custom line colour, or the global) and the Iro-Trace
+    darken; plus the sky class, which inherits the globals. R233: an
+    inheriting Background painting reads as Never. The arrays carry the
+    sky class as their last entry; 'iro' is None when no material inks
+    in its own colour.
+    """
+    from . import ink as INK
+    mats = getattr(scene, 'materials', None) or []
+    opacity = float(np.clip(getattr(st, 'outline_opacity', 1.0), 0.0, 1.0))
+    g_width = int(np.clip(getattr(st, 'outline_width', 1), 1, 8))
+    g_col = np.asarray(getattr(st, 'outline_color', (0.0, 0.0, 0.0)),
+                       np.float32)
+    over_sky = bool(getattr(st, 'outline_over_sky', True))
+    g_on = bool(getattr(st, 'outline', False))
+    modes = [str(getattr(m, 'ink_mode', 'INHERIT') or 'INHERIT').upper()
+             for m in mats]
+    modes = ['OFF' if (md == 'INHERIT' and str(getattr(
+        m, 'paint_mode', 'CEL')).upper() == 'BACKGROUND') else md
+        for md, m in zip(modes, mats)]
+    m_on = [True if md == 'ON' else False if md == 'OFF' else g_on
+            for md in modes]
+    m_w = [int(np.clip(int(getattr(m, 'ink_width', 0) or 0) or g_width,
+                       1, 8)) for m in mats]
+    m_col = [tuple(np.asarray(getattr(m, 'ink_color', (0, 0, 0)),
+                              np.float32))
+             if getattr(m, 'ink_use_color', False) else tuple(g_col)
+             for m in mats]
+    # R229: the Anime Shader's Line Colour menu -- CUSTOM is a per-
+    # material constant (both roads), IRO the surface's own colour per
+    # pixel (the style road; styled_on(st, scene) routes there)
+    iro_rows = INK.scene_iro(scene)
+    for i_m, (imode, icol, _idk) in enumerate(iro_rows):
+        if imode == 'CUSTOM' and icol is not None:
+            m_col[i_m] = tuple(np.asarray(icol, np.float32))
+    iro_lut = np.array([idk if imode == 'IRO' else -1.0
+                        for imode, _c, idk in iro_rows] + [-1.0], np.float32)
+    return {'mats': mats, 'opacity': opacity, 'g_width': g_width,
+            'g_color': g_col, 'over_sky': over_sky, 'g_on': g_on,
+            'modes': modes, 'm_on': m_on, 'm_w': m_w, 'm_col': m_col,
+            'iro_rows': iro_rows,
+            'on': np.array(m_on + [g_on], bool),
+            'off': np.array([md_ == 'OFF' for md_ in modes] + [False], bool),
+            'width': np.array(m_w + [g_width], np.float32),
+            'color': np.array(m_col + [tuple(g_col)], np.float32),
+            'iro': iro_lut if np.any(iro_lut >= 0.0) else None}
+
+
 def apply_outline(scene, gbuf, img, st, vp=None, proj=None, eye=None):
     """Ink cartoon outlines from the G-buffer, before the post chain.
 
@@ -7797,7 +9999,11 @@ def apply_outline(scene, gbuf, img, st, vp=None, proj=None, eye=None):
     bitwise.
 
     Computed on the CPU from the same G-buffer on either device, so the
-    picture cannot differ between them by construction.
+    picture cannot differ between them by construction. R249: a frame
+    the GPU shaded draws its line on the GPU too (gpu/ink.py -- the
+    same seeds, the same distance transform, the same style maths, as
+    fragment passes); the dials that stay on the CPU refuse by name and
+    the CPU road below runs exactly as before.
     """
     mesh = scene.mesh
     tri = gbuf.tri
@@ -7810,12 +10016,68 @@ def apply_outline(scene, gbuf, img, st, vp=None, proj=None, eye=None):
     # the drawing put them. Internal-resolution amplitudes scale by the
     # supersample factor so the dials mean output pixels.
     from . import film as FILM
+    from ..gpu import frame as _FR
     if float(getattr(st, 'film_misregister', 0.0)) > 0.0 or \
             float(getattr(st, 'film_bleed', 0.0)) > 1e-3:
+        _FR.edited(st, 'painted line', 'misregister / bleed')
         _ss = float(tri.shape[0]) / float(max(int(st.resolution_y), 1))
         img = FILM.misregister_and_bleed(
             img, st, frame=int(getattr(scene, 'frame', 0) or 0),
             seed=int(getattr(st, 'seed', 0) or 0), ss=_ss)
+    # the per-material tables (on / Never, width, colour, Iro-Trace)
+    # and the globals, read once for every road
+    tables = ink_tables(scene, st)
+    opacity = tables['opacity']
+    g_width = tables['g_width']
+    g_col = tables['g_color']
+    over_sky = tables['over_sky']
+    mats = tables['mats']
+    g_on = tables['g_on']
+    modes = tables['modes']
+    m_on = tables['m_on']
+    m_w = tables['m_w']
+    m_col = tables['m_col']
+    iro_rows = tables['iro_rows']
+    from . import ink as INK
+
+    md = None
+    if getattr(st, 'outline_marked', False) and vp is not None and \
+            getattr(mesh, 'ink_tri_mask', None) is not None:
+        md = marked_edge_distance(gbuf, mesh, vp, snap=snap_grid(st),
+                                  pixel_shift=raster.pixel_shift_of(st))
+
+    if str(getattr(st, 'render_device', 'CPU')).upper() == 'GPU' and \
+            getattr(st, '_frame_gpu_shaded', False):
+        # R249: the GPU road -- the frame was shaded on the GPU, so the
+        # device is live and the G-buffer is already up there; the line
+        # is drawn by fragment passes and the CPU never extracts a seed.
+        # Every refusal is a reason, printed once, and the CPU road runs
+        from ..gpu import ink as GINK
+        _keep = {}
+        with ST.track('outline (GPU)'):
+            try:
+                # R250: the frame the shading left on the GPU is read in
+                # place (no upload); the ink's output target becomes the
+                # frame that stays there for the resolve and the post
+                got, why = GINK.apply(scene, gbuf, img, st, tables, md=md,
+                                      vp=vp, proj=proj, eye=eye,
+                                      frame=_FR.current(st), keep=_keep)
+            except Exception as exc:                            # noqa: BLE001
+                got, why = None, f'{type(exc).__name__}: {exc}'
+        if got is not None:
+            _out_t = _keep.get('out')
+            if _out_t is not None:
+                _FR.install(st, _FR.Resident(_out_t, gbuf.width, gbuf.height,
+                                             'ink'), 'ink')
+            return got
+        GINK._warn(str(why))
+        _FR.edited(st, 'outline', 'the line drew on the CPU')
+        try:
+            from .. import fault_note
+            fault_note(f'GPU ink refused: {why}'[:220], key='ink-no', limit=3)
+        except Exception:                                       # noqa: BLE001
+            pass
+
     # R227: the seeds keep their KIND -- silhouette (object, depth and
     # sky boundaries) apart from interior (material breaks, creases) --
     # for the style road's thick-outer / thin-inner line; the mask roads
@@ -7856,13 +10118,30 @@ def apply_outline(scene, gbuf, img, st, vp=None, proj=None, eye=None):
         fn = np.where(cov[:, :, None], fn, 0.0).astype(np.float32)
         cos_lim = np.float32(np.cos(np.radians(
             float(getattr(st, 'outline_normal_angle', 60.0)))))
+        # R249: the same test, four times cheaper -- the dot as three
+        # channel products summed in NumPy's own order ((x + y) + z, the
+        # order .sum(-1) reduces three elements in), the non-zero test
+        # computed once per pixel instead of once per neighbour pair.
+        # 193 ms of a 720p frame's 514 ms outline bucket were this
+        # reduction over a three-wide last axis
+        fx, fy, fz = fn[:, :, 0], fn[:, :, 1], fn[:, :, 2]
+        nz = (np.abs(fx) + np.abs(fy) + np.abs(fz)) > 0
 
-        def crease(a, b):
-            d = (a * b).sum(axis=-1)
-            return (d < cos_lim) & (np.abs(a).sum(-1) > 0) & \
-                (np.abs(b).sum(-1) > 0)
+        def crease_planes(sl_a, sl_b):
+            d = (fx[sl_a] * fx[sl_b] + fy[sl_a] * fy[sl_b]) \
+                + fz[sl_a] * fz[sl_b]
+            return (d < cos_lim) & nz[sl_a] & nz[sl_b]
 
-        edge_int |= neigh_diff(fn, crease)
+        e_n = np.zeros(tri.shape, bool)
+        e_n[:, 1:] |= crease_planes((slice(None), slice(1, None)),
+                                    (slice(None), slice(None, -1)))
+        e_n[:, :-1] |= crease_planes((slice(None), slice(None, -1)),
+                                     (slice(None), slice(1, None)))
+        e_n[1:, :] |= crease_planes((slice(1, None), slice(None)),
+                                    (slice(None, -1), slice(None)))
+        e_n[:-1, :] |= crease_planes((slice(None, -1), slice(None)),
+                                     (slice(1, None), slice(None)))
+        edge_int |= e_n
     # R234: three more interior sources (core/lines.py) -- form lines
     # (the valleys of the facing), shadow lines (the terminator at the
     # Shadow Level) and tone lines (flow-guided DoG of the shaded
@@ -7909,12 +10188,6 @@ def apply_outline(scene, gbuf, img, st, vp=None, proj=None, eye=None):
     if not getattr(st, 'outline_over_sky', True):
         edge &= cov
 
-    opacity = float(np.clip(getattr(st, 'outline_opacity', 1.0), 0.0, 1.0))
-    g_width = int(np.clip(getattr(st, 'outline_width', 1), 1, 8))
-    g_col = np.asarray(getattr(st, 'outline_color', (0.0, 0.0, 0.0)),
-                       np.float32)
-    over_sky = getattr(st, 'outline_over_sky', True)
-
     def _dilate(mask, steps):
         for _ in range(steps):
             grown = mask.copy()
@@ -7924,37 +10197,6 @@ def apply_outline(scene, gbuf, img, st, vp=None, proj=None, eye=None):
             grown[:-1, :] |= mask[1:, :]
             mask = grown
         return mask
-
-    mats = getattr(scene, 'materials', None) or []
-    g_on = bool(getattr(st, 'outline', False))
-    modes = [str(getattr(m, 'ink_mode', 'INHERIT') or 'INHERIT').upper()
-             for m in mats]
-    # R233: a Background painting has no ink line unless the material
-    # says Always -- an inheriting Background material reads as OFF
-    modes = ['OFF' if (md == 'INHERIT' and str(getattr(
-        m, 'paint_mode', 'CEL')).upper() == 'BACKGROUND') else md
-        for md, m in zip(modes, mats)]
-    m_on = [True if md == 'ON' else False if md == 'OFF' else g_on
-            for md in modes]
-    m_w = [int(np.clip(int(getattr(m, 'ink_width', 0) or 0) or g_width,
-                       1, 8)) for m in mats]
-    m_col = [tuple(np.asarray(getattr(m, 'ink_color', (0, 0, 0)),
-                              np.float32))
-             if getattr(m, 'ink_use_color', False) else tuple(g_col)
-             for m in mats]
-    # R229: the Anime Shader's Line Colour menu -- CUSTOM is a per-
-    # material constant (both roads), IRO the surface's own colour per
-    # pixel (the style road; styled_on(st, scene) routes there)
-    from . import ink as INK
-    iro_rows = INK.scene_iro(scene)
-    for i_m, (imode, icol, _idk) in enumerate(iro_rows):
-        if imode == 'CUSTOM' and icol is not None:
-            m_col[i_m] = tuple(np.asarray(icol, np.float32))
-
-    md = None
-    if getattr(st, 'outline_marked', False) and vp is not None and \
-            getattr(mesh, 'ink_tri_mask', None) is not None:
-        md = marked_edge_distance(gbuf, mesh, vp, snap=snap_grid(st))
 
     if INK.styled_on(st, scene):
         # R227: the style road -- distance fields, planes of width and
@@ -8137,6 +10379,50 @@ def apply_outline(scene, gbuf, img, st, vp=None, proj=None, eye=None):
     return img
 
 
+def _wire_active(scene, st, gbuf):
+    """Whether apply_wireframe will edit the frame (its own early exits)."""
+    try:
+        if not gbuf.mask().any():
+            return False
+        if getattr(st, 'render_wire', False):
+            return True
+        return any(material_model(m, st) == 'WIREFRAME'
+                   for m in scene.materials)
+    except Exception:                                           # noqa: BLE001
+        return True
+
+
+def _beams_active(scene, st):
+    """Whether _light_volumes will edit the frame (its own early exits)."""
+    if not getattr(st, 'spot_cones', False):
+        return False
+    return any(str(getattr(l, 'type', '')).upper() in _VOLUME_KINDS
+               and float(getattr(l, 'volumetric', 0.0)) > 0.0
+               for l in (getattr(scene, 'lights', None) or ()))
+
+
+def _propagate_gpu_flag(st, flags, what):
+    """R250: a frame stitched from sub-frames (panorama strips, stereo
+    eyes, accumulation passes) carries the post chain's device truth
+    only if EVERY sub-frame shaded on the GPU; a frame that did not says
+    so once instead of running its post on the CPU in silence."""
+    ok = bool(flags) and all(bool(f) for f in flags)
+    st._frame_gpu_shaded = ok
+    if not ok and str(getattr(st, 'render_device', 'CPU')).upper() == 'GPU':
+        n_cpu = sum(1 for f in flags if not f)
+        _gpu_flag_warn(f'post on the CPU: {n_cpu} of {len(flags)} {what} '
+                       'shaded on the CPU')
+
+
+_GPU_FLAG_WARNED = set()
+
+
+def _gpu_flag_warn(msg):
+    if msg not in _GPU_FLAG_WARNED:
+        _GPU_FLAG_WARNED.add(msg)
+        print(f'[Halcyon GPU] {msg}')
+
+
 def apply_wireframe(job, gbuf, img, st, vp, eye, textures):
     """Draw the Wireframe shading model, and the global wire overlay."""
     scene = job.scene
@@ -8153,17 +10439,35 @@ def apply_wireframe(job, gbuf, img, st, vp, eye, textures):
         scene.wireframe_note = None
         return img
     scene.wireframe_note = sorted(wire_mats)
+    overlay = bool(st.render_wire)
+    # R251 (RAST-B): the two wire roads that replace the depth-tested
+    # overlay -- C063 Elite's rule (either face front, no depth test, a
+    # dot past wire_dot_distance) and C055 the vector monitor beam (a
+    # phosphor stroke per feature edge, additive, no depth test). Both
+    # draw on the CPU on either device: the wire road released the
+    # resident frame by name ('wireframe') before this call. A material
+    # shading as WIREFRAME still carves below, without the overlay.
+    if st.render_wire and str(getattr(st, 'wire_mode', 'ALL')) == 'ELITE':
+        img = raster.draw_elite_wire(img, mesh, vp, eye, st, snap=snap_grid(st))
+        overlay = False
+    if st.render_wire and str(getattr(st, 'wire_mode', 'ALL')) == 'BEAM':
+        img = raster.draw_beam_wire(img, mesh, job.view, vp, eye, st,
+                                    rh=gbuf.height, snap=snap_grid(st))
+        overlay = False
+    if not wire_mats and not overlay:
+        return img
     crease = None
     if str(getattr(st, 'wire_mode', 'ALL')) == 'CREASE':
         crease = crease_edges(gbuf, mesh, float(getattr(st, 'wire_angle', 25.0)))
         dist = None
     else:
-        dist = edge_distance_exact(gbuf, mesh, vp, snap=snap_grid(st))
+        dist = edge_distance_exact(gbuf, mesh, vp, snap=snap_grid(st),
+                                   pixel_shift=raster.pixel_shift_of(st))
         if dist is None:
             dist = edge_factor(gbuf)
     py, px = np.nonzero(cov)
     d = dist[py, px] if dist is not None else None
-    if st.render_wire:
+    if overlay:
         w = max(float(st.wire_width), 0.1)
         on = (d < w) if d is not None else \
             _thicken(crease, w)[py, px]
@@ -8393,7 +10697,16 @@ def _mitchell(x, b=1 / 3, c=1 / 3):
 
 
 def _resolve(img, W, H, ss, st):
+    # R251 (RAST-B): C094 LightWave's Limit Dynamic Range clips every
+    # sample at 1.0 before the filter (the single pass too: LightWave
+    # clipped it); C122 Blender 2.41's gamma-2 OSA blend squares the
+    # samples through the table and square-roots the sum, inert at one
+    # sample as Blender's do_gamma required OSA. Both twins live in
+    # gpu/stages.resolve_source and are drawn by gpu/frame.resolve.
+    clamp = bool(getattr(st, 'aa_clamp_samples', False))
     if ss <= 1:
+        if clamp:
+            return raster.clamp_samples(img)
         return img
     fn = FILTERS.get(st.aa_filter, FILTERS['BOX'])
     off = (np.arange(ss, dtype=np.float32) + 0.5) / ss - 0.5
@@ -8403,4 +10716,8 @@ def _resolve(img, W, H, ss, st):
     s = kern.sum()
     kern = kern / (s if abs(s) > 1e-8 else 1.0)
     tile = img[:H * ss, :W * ss].reshape(H, ss, W, ss, 4)
+    if clamp:
+        tile = raster.clamp_samples(tile)
+    if getattr(st, 'aa_gamma_blend', False):
+        return raster.gamma2_blend(tile, kern)
     return np.einsum('hiwjc,ij->hwc', tile, kern).astype(np.float32)

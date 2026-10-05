@@ -48,12 +48,59 @@ STEREO_MODE = _items(
     ('CROSS', "Cross-Eyed",
      "Right|left half-frames, for free-viewing by crossing your eyes"),
 )
+# R251 C098: depth of field by lens sampling (REYES / SGI accumulation
+# buffer / 3ds Max multi-pass) beside the layered post blur
+DOF_METHOD = _items(
+    ('POST', "Layered Post Blur",
+     "The existing depth-of-field: the finished frame blurred in depth "
+     "slabs (dof_layers, dof_max_radius)"),
+    ('LENS_ACCUMULATE', "Lens Passes (Accumulation Buffer)",
+     "Render the frame once per lens point with the eye moved across the "
+     "aperture and the window sheared so the focus plane stays put, then "
+     "average -- REYES lens sampling by the SGI accumulation buffer's "
+     "method (Haeberli & Akeley 1990) and 3ds Max's multi-pass DOF. Exact "
+     "occlusion, the lens pattern as the bokeh, N full renders. An F12 "
+     "road: the viewport shows no depth of field under Lens Passes"),
+)
+DOF_LENS_PATTERN = _items(
+    ('HALTON_DISC', "Halton disc (SGI 1990)",
+     "Lens points from the same Halton sequence the Accumulation Buffer AA "
+     "uses, mapped to the unit disc (Shirley-Chiu concentric map); the "
+     "paper's own point table was never published, this stands in"),
+    ('MAX_SPIRAL', "Max multi-pass spiral (3ds Max 3+)",
+     "Pass 0 at the lens centre (Use Original Location), then Halcyon's "
+     "golden-angle spiral over 3ds Max's multi-pass dials (Sample Radius "
+     "1.0, Sample Bias 0.5); Max documents the dials, not its point "
+     "pattern"),
+)
+# R251 C090: the era's time-slice motion blur beyond the plain average
+MOTION_BLUR_MODE = _items(
+    ('MEAN', "Average every step",
+     "Every time step averaged into the frame -- the accumulation-buffer "
+     "trails Halcyon has always drawn"),
+    ('MAX_SLICES', "Max Object Motion Blur (random slices)",
+     "Each pixel averages only Samples of the Blur Steps slices, the subset "
+     "picked per pixel by hash -- 3D Studio / 3ds Max Object Motion Blur's "
+     "grainy blur when Samples < Duration Subdivisions"),
+    ('LW_FIELD', "LightWave Dithered (row parity)",
+     "Twice the steps, even scanlines averaging the even-numbered slices "
+     "and odd scanlines the odd -- LightWave 5.6-7's Dithered Motion Blur, "
+     "the field-rendering split"),
+)
 AA_FILTER = _items(
     ('BOX', "Box", "Flat average -- what most 1990s renderers used"),
     ('TRIANGLE', "Triangle", "Linear falloff"),
     ('GAUSS', "Gaussian", "Soft"),
     ('CATROM', "Catmull-Rom", "Sharpening"),
     ('MITCHELL', "Mitchell-Netravali", "Balanced"),
+)
+# R251 raster pack (RAST-A2, C127): where the supersampler tests inside
+# each subpixel
+AA_PATTERN = _items(
+    ('GRID', "Regular grid", "Every sample at its subpixel centre"),
+    ('JITTER', "Jittered (REYES / PRMan)",
+     "Each subpixel's sample moves to a hashed position inside its cell, "
+     "fresh per pixel and per frame"),
 )
 SUBPIXEL = _items(
     ('FLOAT', "Floating Point", "Modern sub-pixel accuracy"),
@@ -63,6 +110,47 @@ SUBPIXEL = _items(
      "Integer raster coordinates -- vertices land on the whole-pixel grid, "
      "the PS1 wobble at its coarsest. Snapping rounds rather than "
      "truncates, so this shares Fixed 1's grid"),
+)
+# R251 raster pack (RAST-A1): the pixel centre, the near-plane rule and
+# the z-buffer encoding family -- each item names its machine
+PIXEL_CENTER = _items(
+    ('HALF', "Centre +0.5 (OpenGL / Direct3D 10)",
+     "The sample sits in the middle of the pixel"),
+    ('INTEGER_D3D', "Integer corner (Direct3D 3-9)",
+     "Direct3D 3 to 9 sampled at the integer coordinate"),
+)
+VERTEX_QUANTIZE = _items(
+    ('NONE', "Float (software renderers)", "Vertices as exported"),
+    ('PS1', "PlayStation (16-bit, 1.3.12 normals, integer-texel UVs)",
+     "16-bit positions on the world grid, 1.3.12 normals, UVs on the "
+     "1/256 texel page, 8-bit colours"),
+    ('N64', "Nintendo 64 (16-bit, 8-bit normals)",
+     "16-bit positions on the world grid, signed 8-bit normals, 8-bit "
+     "colours; UVs untouched"),
+)
+NEAR_CLIP = _items(
+    ('CLIP', "Clip (software renderers)",
+     "Triangles are cut at the near plane"),
+    ('REJECT', "Reject whole triangle (PS2 VU1 / PS1)",
+     "A triangle with any vertex past the near plane, the far plane or "
+     "the 6.4-half-screen guard band is dropped whole"),
+)
+DEPTH_ENCODING = _items(
+    ('LINEAR', "Fixed point (Z-Buffer Bits)",
+     "Uniform steps in normalised device z"),
+    ('N64_FLOAT18', "N64 18-bit floating (RDP)",
+     "64-unit steps near, 1-unit steps far: the RDP's piecewise-floating z"),
+    ('GC_14E2', "GameCube 16-bit 14e2 (near ratio)",
+     "Reverse-float compressed z: 15 bits near, 17 far"),
+    ('GC_13E3', "GameCube 16-bit 13e3 (mid ratio)",
+     "Reverse-float compressed z: 14 bits near, 20 far"),
+    ('GC_12E4', "GameCube 16-bit 12e4 (far ratio)",
+     "Reverse-float compressed z: 13 bits near, the full 24 far"),
+    ('W_FIXED', "Fixed-point W (Xbox NV2A, Direct3D W-buffer)",
+     "Eye depth w in Z-Buffer Bits, uniform steps in distance"),
+    ('VOODOO_W16', "16-bit floating W (3dfx Voodoo / Glide)",
+     "1/w as a 4-bit octave and 12 inverted mantissa bits: constant "
+     "relative precision per octave"),
 )
 DEPTH_SORT = _items(
     ('ZBUFFER', "Z-Buffer", "Per-pixel depth test. Always correct"),
@@ -78,6 +166,11 @@ PAINTERS_KEY = _items(
      "Sort on the closest corner. Fewer errors on surfaces that face the "
      "camera, more on long polygons running away from it"),
     ('FARTHEST', "Farthest Vertex", "Sort on the furthest corner"),
+    ('ORDERING_TABLE', "Ordering Table (PlayStation)",
+     "The PS1's integer depth buckets: mean depth into L entries, far "
+     "buckets first, first-added on top; polygons past the far wall or "
+     "1023x511 px (a near-clipped polygon measured after the cut) are "
+     "dropped whole"),
 )
 SHADING_RATE = _items(
     ('PIXEL', "Per Pixel (Phong)", "Shade every fragment"),
@@ -101,21 +194,177 @@ FALLOFF = _items(
      "Blender Internal's slider falloff: D/(D+lin*d) times "
      "D^2/(D^2+quad*d^2), each factor only while its slider is "
      "above zero -- the 2.4x Quad lamp's att1/att2 pair"),
+    # R251 F013 (LIGHT-B1): appended at the END -- _items numbers
+    # positionally and saved files hold the numbers
+    ('GL_3TERM', "OpenGL 1.1 (1 + lin d + quad d^2)",
+     "1/(1 + Linear Slider x d + Quad Slider x d^2): OpenGL's three-term "
+     "attenuation, both sliders 0 = no falloff, GL's default"),
+    ('POV_FADE_LINEAR', "POV-Ray fade_power 1",
+     "2/(1 + d/D): twice the strength at the lamp, exactly 1 at Falloff "
+     "End, POV-Ray's linear fade"),
+    ('POV_FADE_SQUARE', "POV-Ray fade_power 2",
+     "2/(1 + (d/D)^2): POV-Ray's inverse-square fade, 1 at Falloff End; "
+     "other fade powers are not modelled"),
+    ('GX_GENTLE', "GX Gentle (GameCube)",
+     "GX_DA_GENTLE: Ref Brightness at Falloff End, linear term only"),
+    ('GX_MEDIUM', "GX Medium (GameCube)",
+     "GX_DA_MEDIUM: half linear, half quadratic"),
+    ('GX_STEEP', "GX Steep (GameCube)",
+     "GX_DA_STEEP: quadratic term only"),
+)
+# R251 F012 (LIGHT-B1): the spot lamp's cone law
+SPOT_LAW = _items(
+    ('BLENDER', "Blender Internal",
+     "BI's smoothstep blend band times the raw cosine, the Spot Blend "
+     "slider's own law"),
+    ('GL11', "OpenGL 1.1",
+     "A hard cutoff at the cone edge, the cosine to the Cone Exponent "
+     "inside"),
+    ('POV', "POV-Ray",
+     "Flat inside the Hotspot, a Hermite step down to the cone edge, "
+     "times the cosine to the Cone Exponent"),
+    ('GX_FLAT', "GX Flat (GameCube)",
+     "GX_SP_FLAT: full inside the cutoff, a saturating step at the edge"),
+    ('GX_COS', "GX Cosine (GameCube)",
+     "GX_SP_COS: linear in the cosine from the edge to the axis"),
+    ('GX_COS2', "GX Cosine Squared (GameCube)",
+     "GX_SP_COS2: the cosine squared from the edge, a softer centre"),
+    ('GX_SHARP', "GX Sharp (GameCube)",
+     "GX_SP_SHARP: a peaked lobe, brightest on the axis and falling fast"),
+    ('GX_RING1', "GX Ring 1 (GameCube)",
+     "GX_SP_RING1: a ring around the axis, dark on the axis, peaking "
+     "about two thirds of the way out"),
+    ('GX_RING2', "GX Ring 2 (GameCube)",
+     "GX_SP_RING2: a narrower ring, dark on the axis, brightest at the "
+     "cone edge and fading outside it"),
 )
 SHADOW_MODE = _items(
     ('NONE', "None", "No shadows"),
     ('MAP', "Shadow Maps", "Depth maps rendered from each light"),
     ('RAY', "Ray Traced", "Hard or area-sampled shadow rays"),
     ('PER_LIGHT', "Per Light", "Use each light's own setting"),
+    # R251 C052: appended LAST (item order is menu order; positional numbering)
+    ('PLANAR', "Planar Polygons (Model 1 / Blinn)",
+     "Casters projected onto the floor plane and drawn as flat polygons, "
+     "Blinn 1988 / Sega Model 1"),
+)
+# R251 C117: what a shadow-map texel stores
+SHADOW_MAP_DEPTH = _items(
+    ('CLASSIC', "Classic (nearest + bias)",
+     "The nearest caster depth with the bias and normal offset, as every "
+     "map until now"),
+    ('MIDPOINT', "Midpoint (Maya Use Mid Dist / Blender Classic-Halfway)",
+     "Woo's midpoint between the two nearest casters; bias and offset "
+     "become zero"),
+)
+LIGHT_MAP_DEPTH = _items(
+    ('INHERIT', "Use Render Setting",
+     "This lamp's map stores what the render's Map Depth says"),
+    ('CLASSIC', "Classic (nearest + bias)",
+     "The nearest caster depth with the bias and normal offset, as every "
+     "map until now"),
+    ('MIDPOINT', "Midpoint (Maya Use Mid Dist / Blender Classic-Halfway)",
+     "Woo's midpoint between the two nearest casters; bias and offset "
+     "become zero"),
+)
+# R251 C020/C036: a material's triangles as an authored shadow volume
+VOLUME_ROLE = _items(
+    ('NONE', "Surface", "Drawn as geometry, as every material until now"),
+    ('DC_INCLUDE', "Dreamcast Modifier (inside)",
+     "A closed modifier volume: pixels INSIDE it by crossing parity take "
+     "the Dreamcast shadow scale"),
+    ('DC_EXCLUDE', "Dreamcast Modifier (outside)",
+     "A closed modifier volume: EVERYTHING in the frame outside it takes "
+     "the Dreamcast shadow scale -- the whole picture darkens except the "
+     "inside, not only a rim around it (PowerVR EXCLUDE_LAST_POLY)"),
+    ('DS_SHADOW', "DS Shadow Polygon",
+     "A closed volume drawn as a Nintendo DS mode-3 shadow polygon: "
+     "depth-fail mask, then a 5-bit blend of this material's colour"),
 )
 TEX_FILTER = _items(
     ('NEAREST', "Nearest", "Point sampling -- chunky texels"),
     ('BILINEAR', "Bilinear", "Smooth"),
     ('TRILINEAR', "Trilinear", "Bilinear plus mip blending"),
     ('N64_3POINT', "3-Point (N64)", "The Reality Coprocessor's triangular filter"),
+    # R251 (TEX-1 C111; TEX-2 appends SUMMED_AREA after it, at the END)
+    ('POV_NORMDIST', "Normalised Distance (POV-Ray 4)",
+     "POV-Ray image_map interpolate 4: inverse-square weights, cusps at texel centres"),
+    # R251 (TEX-2 C088), at the END
+    ('SUMMED_AREA', "Summed Area (3D Studio / Max)",
+     "Crow's summed-area table: an exact box average over the footprint's rectangle, no pyramid"),
 )
 WRAP = _items(('REPEAT', "Repeat", ""), ('EXTEND', "Extend", ""),
               ('CLIP', "Clip", ""), ('MIRROR', "Mirror", ""))
+# R251 texture pack (TEX-1): the once-per-upload texel formats (C074)
+TEX_FORMAT = _items(
+    ('NONE', "Off", "The image's own precision"),
+    ('RGB565', "RGB 5:6:5", "3dfx Glide GR_TEXFMT_RGB_565 / Direct3D 5-7"),
+    ('ARGB1555', "ARGB 1:5:5:5", "Glide / D3D: 1-bit alpha cut-outs"),
+    ('ARGB4444', "ARGB 4:4:4:4", "Glide / D3D / PowerVR PCX fallback, 16 levels per channel"),
+    ('RGB332', "RGB 3:3:2", "Glide GR_TEXFMT_RGB_332 / PCX 8-bit"),
+    ('RGB5550', "RGB 5:5:5", "PowerVR PCX1/PCX2, green at five bits"),
+    ('I8', "Intensity 8", "Glide INTENSITY_8: grey that also feeds alpha"),
+    ('A8', "Alpha 8", "Glide ALPHA_8: white with the image's alpha"),
+    ('AI44', "Alpha 4 + Intensity 4", "Glide ALPHA_INTENSITY_44 fonts and lightmaps"),
+    ('AI88', "Alpha 8 + Intensity 8", "Glide ALPHA_INTENSITY_88"),
+    ('I4', "Luma 4-bit", "Sega Model 2 / Model 3 luminance texture RAM"),
+    ('I4_MODEL2', "Luma 4-bit, 0xF transparent", "Sega Model 2: level 15 is the hole marker"),
+    ('A3I5', "Alpha 3 + Intensity 5 (DS)", "Nintendo DS translucent texture: 5-bit grey, 8 alpha levels"),
+    ('A5I3', "Alpha 5 + Intensity 3 (DS)", "Nintendo DS translucent texture: 3-bit grey, 32 alpha levels"),
+    ('YIQ422', "NCC YIQ 4:2:2", "3dfx TexUS narrow-channel compression, 8 bits per texel"),
+    ('AYIQ8422', "NCC AYIQ 8:4:2:2", "3dfx NCC with an 8-bit alpha byte"),
+)
+# the Nintendo 64's 4 KB TMEM budget by format (C013)
+TEX_TMEM = _items(
+    ('OFF', "Off", "No texture-memory budget"),
+    ('RGBA16', "RGBA16 (N64 TMEM)", "5551 texels, 2048 of them fit"),
+    ('RGBA32', "RGBA32 (N64 TMEM)", "8888 split across both halves, 1024 texels"),
+    ('CI8', "CI8 (N64 TMEM)", "256-colour index in the lower 2 KB, 15-bit entries"),
+    ('CI4', "CI4 (N64 TMEM)", "16-colour index, 4096 texels (64x64)"),
+    ('IA16', "IA16 (N64 TMEM)", "8-bit intensity + 8-bit alpha"),
+    ('IA8', "IA8 (N64 TMEM)", "4-bit intensity + 4-bit alpha"),
+    ('IA4', "IA4 (N64 TMEM)", "3-bit intensity + 1-bit alpha, 8192 texels"),
+    ('I8', "I8 (N64 TMEM)", "8-bit intensity, alpha = intensity"),
+    ('I4', "I4 (N64 TMEM)", "4-bit intensity, alpha = intensity, 8192 texels"),
+)
+# baked block compression (C024)
+TEX_COMPRESS = _items(
+    ('NONE', "Off", "Uncompressed texels"),
+    ('DXT1', "DXT1 (S3TC, PC 1998+)", "4x4 blocks, two 5:6:5 endpoints, reference 8-bit decode"),
+    ('DXT1_NV2A', "DXT1, 16-bit decode (Xbox)", "NV2A decodes the interpolants at 5:6:5, banding gradients"),
+    ('CMPR_GC', "CMPR (GameCube / Wii)", "DXT1 blocks with the TEV's 3/8-5/8 interpolants"),
+    ('VQ_DC', "VQ codebook (Dreamcast / Naomi)", "256 entries of 2x2 texels, 2 bits per texel"),
+)
+# the Voodoo's coarse bilinear fraction (C080)
+TEX_FRAC_BITS = _items(
+    ('FLOAT', "Float", "Full-precision blend weights"),
+    ('BITS_4', "4-bit (Voodoo1, Verite V1000)", "Sixteen blend steps between texels"),
+    ('BITS_8', "8-bit (Voodoo2)", "256 blend steps between texels"),
+)
+# R251 texture pack (TEX-2, wave 2): how Extend nodes clamp (C077)
+TEX_CLAMP_MODE = _items(
+    ('EDGE', "Clamp to Edge (OpenGL 1.2+, consoles)", "Extend repeats the last texel"),
+    ('GL_CLAMP', "GL_CLAMP border (OpenGL 1.0/1.1, 3dfx MiniGL)",
+     "Linear taps past the last texel read the (0,0,0,0) border: the half-texel seam"),
+)
+# how a mip level is picked (C072)
+TEX_MIP_SELECT = _items(
+    ('FILTER', "As the filter", "Trilinear blends two levels; the other filters read level 0"),
+    ('BLEND', "Blend two levels (N64 RDP)",
+     "3-Point, Bilinear or Nearest taps at each level, lerped by the LOD fraction; Bilinear + Blend is Trilinear"),
+    ('NEAREST_LEVEL', "One level, nearest (OpenGL 1.1, Direct3D point mip)",
+     "level = ceil(lod + 1/2) - 1, no blend: the popping of 1996 cards"),
+    ('DITHER_VOODOO', "One level, 4x4 dithered (3dfx Voodoo1)",
+     "level = floor(lod + bayer/16) on 8.8 fixed LOD: stippled mip seams"),
+)
+# where the mip LOD comes from (C022 / C079)
+TEX_LOD_SOURCE = _items(
+    ('DERIVATIVE', "Screen derivatives (PC cards, N64)", "Per-pixel texture footprint, as today"),
+    ('GS_Q', "log2 of Q, 7.4 fixed (PlayStation 2 GS)",
+     "LOD from depth alone: (log2(1/|Q|) << L) + K with four fractional bits"),
+    ('TRIANGLE', "One level per polygon (Riva 128, Verite V1000)",
+     "The triangle's texel-area / screen-area ratio picks its ONE nearest level, no blend: mip seams at polygon edges"),
+)
 TRANSPARENCY = _items(
     ('NONE', "Opaque", "Ignore alpha"),
     ('STIPPLE', "Screen Door", "Dithered stipple, as hardware without blending did"),
@@ -126,6 +375,49 @@ FOG_MODE = _items(
     ('LINEAR', "Linear", ""), ('EXP', "Exponential", ""),
     ('EXP2', "Exponential Squared", ""),
     ('TABLE16', "16-Step Table", "Banded fixed-function fog table"),
+    # R251 F001 (PlayStation GTE); F009's GROUND item lands in wave 2
+    ('GTE_1Z', "Hyperbolic 1/z (PlayStation GTE)",
+     "The GTE's depth cue: a factor affine in 1/z that is 0 at Fog "
+     "Start and 1 at Fog End, floored to 4.12 fixed point (IR0) before "
+     "the far colour blends in -- the PlayStation's and Namco System "
+     "11/12's fog. At the Gouraud (vertex) rate this is the GTE's own "
+     "per-vertex cue interpolated across the polygon; per pixel the "
+     "same curve is evaluated everywhere, which no console did. "
+     "Per-Vertex Fog's 1/8 rounding is skipped: the mode has its own "
+     "12-bit floor"),
+    # R251 F009 (LIGHT-A2): POV-Ray's fog_type 2
+    ('GROUND', "Ground Fog, atan integral (POV-Ray)",
+     "POV-Ray's fog_type 2: density 1/(1+Y^2) above Fog Ground Offset, "
+     "integrated along the eye ray, exp(-distance x mean density x Fog "
+     "Density); the sky is fogged by elevation, as POV fogs a ray that "
+     "hits nothing. The hardware fog tables and Height Fog are inert "
+     "here: the integral is its own height law"),
+)
+# R251 F008 (LIGHT-A2): what the fog fades toward
+FOG_SOURCE = _items(
+    ('FIXED', "Fog Colour", "The Fog Colour swatch"),
+    ('BACKDROP', "Backdrop (LightWave)",
+     "The sky or backdrop behind each pixel"),
+)
+# R251 F002 / F003 / F022: the accelerators' own fog tables
+FOG_TABLE = _items(
+    ('NONE', "None", "The fog curve as computed, no hardware table"),
+    ('VOODOO64', "64 Entries on 1/w (3dfx Voodoo)",
+     "Glide's 64-entry table at 2^(3+i/4)/(8-i%4) scene units, "
+     "interpolated by the w mantissa's next 8 bits"),
+    ('PVR128', "128 Log Entries (PowerVR2 / Dreamcast)",
+     "The CLX2's 128 entries over 8 octaves of 1/w below Fog End, two "
+     "8-bit densities blended per entry"),
+    ('DS32', "32 Entries (Nintendo DS)",
+     "The DS's 32-entry table of 7-bit densities at equal steps from "
+     "Fog Start to Fog End, blended in 1/128 units"),
+)
+# R251 F007: where the fog reads its distance
+FOG_DEPTH = _items(
+    ('W', "Eye Depth (w)", "Eye-space distance, as W-fog and every console did"),
+    ('Z', "Z-Buffer Depth (Direct3D z-fog)",
+     "Post-projection z in 0..1 -- hyperbolic, so the fog piles into the "
+     "far stretch"),
 )
 COLOR_DEPTH = _items(
     ('32', "32-bit (8:8:8:8)", "True colour with alpha"),
@@ -138,6 +430,13 @@ COLOR_DEPTH = _items(
     ('1', "1-bit", "Monochrome"),
     ('HAM8', "Amiga HAM8", "Hold-and-modify, 6 bits per channel"),
     ('HAM6', "Amiga HAM6", "Hold-and-modify, 4 bits per channel"),
+    # R251 (post-palette): appended at the END -- _items numbers positionally
+    ('CRY16', "16-bit CRY (Atari Jaguar)",
+     "8-bit intensity and 256 chroma cells: smooth luminance, stepped hue "
+     "and saturation"),
+    ('YJK', "YJK 19,268 colours (MSX2+ Screen 12)",
+     "5-bit luma per pixel, chroma shared by aligned groups of four output "
+     "pixels (before Pixel Scale)"),
 )
 PALETTE_MODE = _items(
     ('ADAPTIVE', "Adaptive", "Built from this image's own colours"),
@@ -150,12 +449,87 @@ PALETTE_MODE = _items(
     ('CGA4', "CGA 4", "Cyan/magenta/white"),
     ('GRAY', "Greyscale", ""),
     ('CUSTOM', "Custom", "From a palette image"),
+    # R251 (post-palette): appended at the END -- _items numbers positionally
+    ('EHB', "Extra Half-Brite (Amiga OCS/ECS)",
+     "32 adaptive 12-bit registers plus their exact halves: 64 colours; Lock "
+     "Palette shares its cache with a 32-colour adaptive palette"),
 )
 PALETTE_METHOD = _items(
     ('MEDIAN_CUT', "Median Cut", "Heckbert's algorithm, the period standard"),
     ('OCTREE', "Octree", "Gervautz-Purgathofer"),
     ('POPULARITY', "Popularity", "Most frequent colours"),
     ('KMEANS', "K-Means", "Slowest, best quality"),
+)
+# R251 (post-palette C061): the palette RAM / DAC precision the registers
+# are snapped to before the per-pixel search; the level count is the item
+PALETTE_BITS = _items(
+    ('NONE', "Full (AGA / Mac / VGA at 8 bits)",
+     "Registers keep their fitted 8-bit values"),
+    ('BITS_1', "1-bit -- PC-88 digital RGB (8)",
+     "Each channel on or off (the ZX Spectrum's fifteen are an attribute "
+     "set: Attribute Cells)"),
+    ('BITS_2', "2-bit -- EGA (64)", "Four levels per channel"),
+    ('CPC_27', "3 levels -- Amstrad CPC (27)",
+     "Three voltages per channel, not a bit depth"),
+    ('BITS_3', "3-bit -- Atari ST / MSX2 (512)",
+     "Eight levels per channel (the Mega Drive's 9-bit CRAM lattice too, "
+     "but its DAC ramp is non-linear and not modelled here)"),
+    ('BITS_4', "4-bit -- Amiga OCS-ECS / STE / PC-98 (4096)",
+     "Sixteen levels per channel"),
+    ('BITS_5', "5-bit -- SNES CGRAM / Sega 32X / Neo Geo (32768)",
+     "Thirty-two levels per channel (the Neo Geo's one shared dark bit is "
+     "not modelled; the PS1 has no frame palette registers -- its 15-bit "
+     "framebuffer is Colour Depth 15)"),
+    ('BITS_6', "6-bit -- VGA DAC (262144)", "Sixty-four levels per channel"),
+)
+# R251 (post-palette C050): colour stored per character cell; the cell
+# size, the colour set and the shared-bright rule are the item's
+ATTRIBUTE_CELLS = _items(
+    ('NONE', "Off", "Colour per pixel"),
+    ('ZX_SPECTRUM', "ZX Spectrum (8x8: ink + paper, shared BRIGHT)",
+     "Two of fifteen per cell, one brightness bit for both"),
+    ('MSX1', "MSX1 Screen 2 (8x1: two of fifteen)",
+     "The TMS9918's two colours per eight-pixel run"),
+    ('C64_HIRES', "C64 hires bitmap (8x8: two of sixteen)",
+     "Two VIC-II colours per cell"),
+    ('C64_MULTI', "C64 multicolour (4x8: three + shared background)",
+     "Three cell colours plus the most common colour of the frame"),
+)
+# R251 (post-palette C060): the registers rewritten every scanline; the
+# cost is in the item, so it is read before the render
+SCANLINE_PALETTE = _items(
+    ('NONE', "Off", "One palette for the frame"),
+    ('SPECTRUM_512', "Spectrum 512 (Atari ST): 3 x 16 per line from 512",
+     "The 68000 reloads the ST's registers three times a line (slow: a "
+     "median cut per third of a line, on the CPU)"),
+    ('DYNAMIC_HIRES', "Dynamic HiRes (Amiga): 16 per line from 4096",
+     "Sixteen Copper MOVEs in every horizontal blank (slow: a median cut "
+     "per line, on the CPU)"),
+    ('SHAM', "Sliced HAM (Amiga): HAM6 with 16 base colours per line",
+     "Hold-and-modify with the fringes reset every line (slowest: a "
+     "median cut and a HAM encode per line, on the CPU)"),
+)
+# R251 (post-palette C093): 3D Studio's / 3ds Max's Video Color Check
+VIDEO_COLOR_CHECK = _items(
+    ('NONE', "Off", "No legality test"),
+    ('FLAG_BLACK', "Flag with Black (3D Studio / Max)",
+     "Illegal pixels turn black for inspection"),
+    ('SCALE_LUMA', "Scale Luma (Max)",
+     "Darken the pixel into range, hue and saturation kept"),
+    ('SCALE_SAT', "Scale Saturation (Max)",
+     "Desaturate toward its own luma, brightness kept"),
+)
+VIDEO_SYSTEM = _items(
+    ('NTSC', "NTSC-M (7.5 IRE setup, gain 92.5)",
+     "Black at 7.5 IRE, the American envelope"),
+    ('PAL', "PAL (0 IRE setup, gain 100)",
+     "Black at 0 IRE, the European envelope"),
+)
+VIDEO_IRE_LIMIT = _items(
+    ('IRE_120', "120 IRE (the NTSC envelope, Max's test)",
+     "The composite maximum"),
+    ('IRE_110', "110 IRE (broadcast house rule, After Effects)",
+     "The conservative limit stations asked for"),
 )
 DITHER = _items(
     ('NONE', "None", ""),
@@ -167,6 +541,133 @@ DITHER = _items(
     ('BURKES', "Burkes", ""), ('SIERRA', "Sierra", ""),
     ('SIERRA_LITE', "Sierra Lite", ""), ('NOISE', "Blue Noise", ""),
 )
+# R251 (transparency pack): the blend unit's fixed equations. FIVE-tuples
+# with EXPLICIT numbers: `_items` builds three-tuples that Blender numbers
+# by POSITION and stores as integers in the .blend, so a separator or a
+# machine group inserted later would renumber every saved scene. The
+# numbers are core/render.py's MODE_INDEX (the composite's one table of
+# ids); separators take 900+ (never stored); INHERIT 100 / ENV_HOLE 101
+# exist only in the Material list. Grouped by machine with the empty-
+# identifier separator idiom `res_preset` already uses.
+BLEND_EQUATION = [
+    ('ALPHA', "Alpha Over (Halcyon)",
+     "Halcyon's float blend: F*a + B*(1-a) per layer, in depth order", '', 0),
+    ('', "PlayStation", '', '', 900),
+    ('PS1_AVG', "(B+F)/2 (PlayStation average)",
+     "The PS1 GPU's 0.5B+0.5F on 5-bit channels: a fixed 50% glass whatever "
+     "the opacity; MascotCapsule PATTR_BLEND_HALF", '', 1),
+    ('PS1_ADD', "B+F (PlayStation add)",
+     "The PS1 GPU's 1.0B+1.0F on 5-bit channels, saturating at 31: additive "
+     "glows white out; MascotCapsule PATTR_BLEND_ADD", '', 2),
+    ('PS1_SUB', "B-F (PlayStation subtract)",
+     "The PS1 GPU's 1.0B-1.0F on 5-bit channels, clamped at 0: subtractive "
+     "shadows and smoke; MascotCapsule PATTR_BLEND_SUB", '', 3),
+    ('PS1_QUARTER', "B+F/4 (PlayStation quarter-add)",
+     "The PS1 GPU's 1.0B+0.25F on 5-bit channels, saturating at 31: the "
+     "faint additive for particles and lens glints", '', 4),
+    ('', "Sega Saturn", '', '', 901),
+    ('SATURN_HALF', "B/2+F/2 (Saturn VDP1 half-transparency)",
+     "VDP1's colour-calculation half-transparency: each 5-bit operand halved "
+     "before the add; also the 3DO PIXC's default P/2+S/2", '', 5),
+    ('SATURN_SHADOW', "B/2 (Saturn VDP1 shadow)",
+     "VDP1's shadow calculation: the frame pixel halved, the source colour "
+     "ignored (a drop shadow sprite)", '', 6),
+    ('SATURN_HALF_LUM', "F/2 (Saturn VDP1 half-luminance)",
+     "VDP1's half-luminance replace: the source at half brightness, the "
+     "frame pixel ignored -- a per-sprite bit, so a Material Blend Mode "
+     "only", '', 7),
+    ('', "3DO", '', '', 902),
+    ('THREEDO_SUB', "F-B (3DO PIXC subtract)",
+     "The PIXC's cel minus the frame pixel on 5-bit channels, clamped at 0 "
+     "(S = the frame pixel; the CCB constant source is not offered)", '', 8),
+    ('THREEDO_XOR', "F xor B (3DO PIXC)",
+     "The PIXC's xor of the cel against the frame pixel (S = the frame "
+     "pixel; the CCB constant source is not offered)", '', 9),
+    ('', "SNES", '', '', 903),
+    ('SNES_ADD', "B+F clamp 31 (SNES colour math add)",
+     "The PPU's colour-math add of the main screen and ONE sub screen, "
+     "clamped at 31 -- the PS1's arithmetic with bit-replicated read-back "
+     "and one sub screen", '', 10),
+    ('SNES_SUB', "B-F clamp 0 (SNES colour math subtract)",
+     "The PPU's colour-math subtract of one sub screen, clamped at 0 -- the "
+     "PS1's arithmetic with bit-replicated read-back and one sub screen",
+     '', 11),
+    ('SNES_ADD_HALF', "(B+F)/2 (SNES colour math add-half)",
+     "The PPU's colour-math add with the halve bit: the average of the main "
+     "screen and one sub screen -- the PS1's arithmetic with bit-replicated "
+     "read-back and one sub screen", '', 12),
+    ('SNES_SUB_HALF', "max(0,B-F)/2 (SNES colour math subtract-half)",
+     "The PPU's colour-math subtract with the halve bit, clamped at 0 then "
+     "halved -- the PS1's arithmetic with bit-replicated read-back and one "
+     "sub screen", '', 13),
+    ('', "Game Boy Advance", '', '', 904),
+    ('GBA', "(F*EVA+B*EVB)/16 (GBA BLDALPHA)",
+     "The LCD's BLDALPHA blend of the top two layers: EVA = the alpha in "
+     "sixteenths, EVB = 16-EVA, clamped at 31 on 5-bit channels, bit-"
+     "replicated read-back", '', 14),
+    ('', "Nintendo DS", '', '', 905),
+    ('DS', "(F*(A+1)+B*(31-A))/32, alpha max, same-ID once (Nintendo DS)",
+     "The DS 3D engine's blend on 6-bit channels with a 5-bit polygon alpha: "
+     "destination alpha = max, and a pixel already holding the same "
+     "translucent polygon ID (Halcyon's object index) is never blended "
+     "twice", '', 15),
+    ('', "Software", '', '', 906),
+    ('FUZZ', "Fuzz (Doom Spectre)",
+     "The background one row up or down, at 26/32 brightness: id's "
+     "r_draw.c fuzz columns", '', 16),
+    ('THIN_WALL', "Thin Wall (3ds Max refraction)",
+     "The background jogged along the projected normal by Thickness Offset "
+     "x (IOR - 1), the 3ds Max Thin Wall Refraction map; no rays", '', 17),
+    ('IMAGINE_FOG', "Imagine Fog (Impulse Imagine)",
+     "Opacity = the object's thickness along the view / Fog Length, capped "
+     "at 1, unlit -- Imagine's fog object; needs A-Buffer", '', 18),
+]
+#: the global menu: every equation but the VDP1's per-sprite half-luminance
+#: replace (a frame-wide F/2 makes every see-through surface an opaque
+#: half-bright replace, which no Saturn frame was)
+BLEND_EQUATION_GLOBAL = [i for i in BLEND_EQUATION if i[0] != 'SATURN_HALF_LUM']
+BLEND_MODE_MAT = [('INHERIT', "Inherit",
+                   "The render setting's Blend Equation", '', 100)] \
+    + BLEND_EQUATION \
+    + [('ENV_HOLE', "Env Hole (Blender 2.4x)",
+        "The world along the view ray, alpha 0, nothing behind it", '',
+        101)]
+# R251: Screen Door's own pattern list -- the ORDERED kinds only (an
+# error-diffusion kind has no threshold map, and R:2717 used to index the
+# None), as five-tuples carrying the numbers DITHER gave the five ordered
+# kinds (BAYER2 1 .. HALFTONE 5) so a scene saved with Screen Door at
+# Bayer 4x4 (stored 2) reloads as Bayer 4x4; COLUMNS 14 and N64_NOISE 15
+# sit past DITHER's fourteen so a later `dither` item never collides. A
+# stored number no item carries (the old NONE = 0, an error-diffusion kind
+# 6..13) reads back from Blender as '' and the renderer falls back to
+# Bayer 4x4 by name.
+STIPPLE_PATTERN = [
+    ('BAYER2', "Bayer 2x2", "", '', 1), ('BAYER4', "Bayer 4x4", "", '', 2),
+    ('BAYER8', "Bayer 8x8", "", '', 3), ('BAYER16', "Bayer 16x16", "", '', 4),
+    ('HALFTONE', "Halftone", "Clustered dot", '', 5),
+    ('COLUMNS', "Columns 1x2 (Mega Drive / SNES 512)",
+     "Alternate pixel columns: the stripe mesh a composite TV blended", '',
+     14),
+    ('N64_NOISE', "Random compare (N64 RDP)",
+     "A fresh 8-bit hash per pixel and frame against the alpha, "
+     "dither_alpha_en", '', 15),
+]
+TRANSLUCENT_ORDER = _items(
+    ('DEPTH', "Depth (Halcyon)", "Per-fragment or per-polygon depth"),
+    ('Y_SORT', "Bottom Row (DS auto-sort)",
+     "Bottom screen row, then top row, then submission -- the DS's order, "
+     "never depth"),
+    ('SUBMISSION', "Submission (DS manual / GL)", "Draw order as exported"))
+FRAMEBUFFER = _items(
+    ('NONE', "24-bit float (Halcyon)", "No in-pipeline truncation"),
+    ('PS2_CT16', "PSMCT16 (PlayStation 2)",
+     "5-5-5 per write with the GS's DIMX dither, read back per blend"),
+    ('GC_RGBA6', "RGBA6 (GameCube EFB)",
+     "6 bits per channel, Flipper's 2x2 dither at every write"),
+    ('VOODOO_565_4X4', "RGB565 4x4 (3dfx Voodoo)",
+     "MAME's hardware-verified pack, dithered read-back"),
+    ('VOODOO_565_2X2', "RGB565 '2x2' (3dfx Voodoo)",
+     "grDitherMode 2x2: the real {8,10;11,9} matrix"))
 COLOR_MGMT = _items(
     ('NONE', "None (Period Correct)", "No transform -- 1990s renderers had none"),
     ('SRGB', "sRGB", "Modern display transform"),
@@ -185,7 +686,124 @@ INTERLACE = _items(
     ('BLEND', "Blended", "Darken alternate lines"),
 )
 OUTPUT_SCALE = _items(('NONE', "1x", ""), ('2X', "2x", ""), ('3X', "3x", ""),
-                      ('4X', "4x", ""))
+                      ('4X', "4x", ""),
+                      # R251 post-signal: the two machine resamplers (appended at
+                      # the END: the enum is numbered positionally)
+                      ('THREEDO_2X', "2x interpolated (3DO, fixed cornerweight)",
+                       "The Opera display generator's 320x240 to 640x480 "
+                       "interpolation with every sample at the same subpixel "
+                       "(plain 2x bilinear on the cornerweight lattice) and blue "
+                       "at 4 bits; the projector's per-cel subpixel bits wait on "
+                       "the coverage road"),
+                      ('GBA_MODE5', "Mode 5 affine stretch (GBA)",
+                       "The 160x128 bitmap stretched to the 240x160 LCD through "
+                       "BG2's 8.8 registers PA = 0xAB, PD = 0xCD: uneven columns, "
+                       "no filtering"))
+# R251 post-signal: the machine's scan-out stages (core/signal_era.py)
+VI_GAMMA = _items(
+    ('NONE', "Off", "No VI gamma: the framebuffer reaches the DAC as it is"),
+    ('GAMMA', "Gamma (N64 GAMMA_ENABLE)",
+     "2 * isqrt(64 * v): the Video Interface's integer square-root curve"),
+    ('GAMMA_DITHER', "Gamma + dither (N64 GAMMA_DITHER_ENABLE)",
+     "Six hashed bits folded under the root: the N64's fine gradient noise"),
+    ('DITHER_ONLY', "Dither only (N64, no gamma)",
+     "One hashed bit added to each channel's LSB"),
+)
+COPY_FILTER = _items(
+    ('NONE', "Off",
+     "The EFB copies unfiltered (the progressive set {0,0,21,22,21,0,0}, "
+     "an identity)"),
+    ('DEFLICKER', "Deflicker (GameCube / Wii default)",
+     "libogc's {8,8,10,12,10,8,8}: lines above and below at 16/64, the "
+     "line at 32/64"),
+    ('DEFLICKER_AA', "Deflicker, AA modes (GameCube / Wii)",
+     "The *Aa render modes' {4,8,12,16,12,8,4}: 12/64, 40/64, 12/64"),
+)
+CRTC_BLEND = _items(
+    ('NONE', "Off", "One read circuit: the framebuffer as it is"),
+    ('PREVIOUS_FRAME', "Previous frame (PS2 RC2)",
+     "RC2 scans the previous frame's CRTC output: a recursive trail"),
+    ('BG_COLOR', "Background colour (PS2 SLBG)",
+     "RC1 mixed with the BGCOLOR register: the CRTC fade"),
+)
+VIDEO_FILTER = _items(
+    ('NONE', "Off", "The 16-bit framebuffer reaches the DAC as it is"),
+    ('VOODOO1', "4x1 scan-out filter (Voodoo Graphics)",
+     "86Box's reconstruction of the '22-bit' filter: four 2-tap passes "
+     "along the line, each halving a capped difference"),
+    ('VOODOO2', "Look-ahead scan-out filter (Voodoo2)",
+     "86Box's Voodoo2 rule: each pixel lifted toward its brighter "
+     "neighbours three back and one ahead by three fifths of the "
+     "difference, at most 32 levels, never past the threshold"),
+)
+# R251 SIG-2: the digital formats' chroma, the cable, the PAL receiver, the tape
+CHROMA_FORMAT = _items(
+    ('NONE', "Off", "RGB straight through: no chroma sampling"),
+    ('Y422', "4:2:2 co-sited (D1 / Digital Betacam, 1986)",
+     "One Cb/Cr per two luma samples, sited on the even one"),
+    ('Y411', "4:1:1 co-sited (NTSC DV, 1995)",
+     "One Cb/Cr per four luma samples: colour edges in four-pixel steps"),
+    ('Y420_MPEG1', "4:2:0 centred (MPEG-1 / Video CD / PS1 MDEC)",
+     "One Cb/Cr per 2x2 block, sited at its centre"),
+    ('Y420_MPEG2', "4:2:0 MPEG-2 (DVD)",
+     "One per 2x2 block, co-sited horizontally, centred vertically"),
+    ('Y420_DVPAL', "4:2:0 alternate lines (PAL DV)",
+     "Cb on even lines, Cr on odd lines, each two pixels wide"),
+    ('XFB_422', "XFB 4:2:2 (GameCube / Wii, 2001)",
+     "The pair averaged in RGB, then the BT.601 integers Dolphin measured "
+     "on the hardware and the legal clamps; runs after the copy filter, "
+     "in the EFB-to-XFB copy's order"),
+)
+CHROMA_UPSAMPLE = _items(
+    ('HOLD', "Sample and hold",
+     "Each pixel takes its site's chroma: the blocky DV / VCD colour"),
+    ('LINEAR', "Linear",
+     "Chroma interpolated between the two nearest sites along the "
+     "subsampled axis"),
+)
+SIGNAL = _items(
+    ('RGB', "RGB / SCART / component",
+     "No cable artefact: the frame as the machine made it"),
+    ('SVIDEO', "S-Video, NTSC (1987)",
+     "Luma whole; the encoder's I at 1.3 MHz and Q at 0.5 MHz as a "
+     "wideband decoder passes them: chroma blur, no dot crawl (Composite "
+     "Video is greyed: the cable is one or the other)"),
+    ('SVIDEO_PAL', "S-Video, PAL",
+     "Luma whole; U and V at 1.3 MHz over a 52 us line"),
+    ('RF', "RF modulator (channel 3/4)",
+     "The composite chain through a modulator: luma low-pass, the 920 kHz "
+     "beat, snow and a ghost (turn Composite Video on for the full chain)"),
+)
+PAL_DECODER = _items(
+    ('NONE', "Off", "No PAL decoder stage"),
+    ('DELAY_LINE', "PAL-D delay line (1967)",
+     "Each line's chroma averaged with the line above in the same field: "
+     "vertical colour resolution halved, no hue error"),
+    ('SIMPLE', "Simple PAL, no delay line",
+     "The cheap decoder: a phase error shows as Hanover bars, alternating "
+     "hue two lines tall"),
+)
+TAPE = _items(
+    ('NONE', "Off", "No tape: the frame goes straight down the cable"),
+    ('VHS', "VHS (1976)",
+     "240 TVL luma, 40 TVL colour-under chroma, 0.6 us Y/C delay"),
+    ('SVHS', "S-VHS (1987)",
+     "400 TVL luma on the raised carrier, colour-under chroma as VHS"),
+    ('BETAMAX', "Betamax (1975)",
+     "250 TVL luma, 40 TVL colour-under chroma"),
+    ('UMATIC', "U-matic (1971)",
+     "260 TVL luma, 45 TVL chroma on the 688 kHz carrier, 0.5 us delay"),
+    ('VIDEO8', "Video8 (1985)",
+     "240 TVL luma, 40 TVL chroma on the 743 kHz carrier"),
+    ('HI8', "Hi8 (1989)",
+     "400 TVL luma, colour-under chroma as Video8"),
+    ('BETACAM', "Betacam (1982)",
+     "Component CTDM: 300 TVL luma, 120 TVL chroma, no Y/C delay"),
+    ('BETACAM_SP', "Betacam SP (1986)",
+     "Component: 340 TVL luma, 120 TVL chroma"),
+    ('TYPE_C', "1-inch Type C (1978)",
+     "The broadcast master: 400 TVL luma, 120 TVL chroma, no delay"),
+)
 DEBUG_PASS = _items(
     ('BEAUTY', "Beauty", ""), ('DEPTH', "Depth", ""), ('NORMAL', "Normal", ""),
     ('UV', "UV", ""), ('MATID', "Material ID", ""), ('OVERDRAW', "Overdraw", ""),
@@ -199,11 +817,25 @@ WIRE_MODE = _items(
     ('CREASE', "Creases & Silhouette",
      "Only the outline and the edges where the surface turns by more than the "
      "angle below. Stays a wireframe however many triangles are behind it"),
+    # R251 (RAST-B): the two period wire roads, both without a depth test
+    ('ELITE', "Elite rule (BBC Micro 1984)",
+     "An edge draws when either of its faces faces the camera; no depth "
+     "test, so concave hulls show through-lines and nothing hides behind "
+     "anything"),
+    ('BEAM', "Vector beam (Atari DVG / AVG, Vectrex)",
+     "Each feature edge is a phosphor stroke: Gaussian spot, quantised "
+     "intensity, end-dwell dots, additive where strokes cross; no depth "
+     "test"),
 )
 LIGHT_LIMIT = _items(
     ('BRIGHTEST', "Brightest", "Keep the strongest lights"),
     ('NEAREST', "Nearest", "Keep the closest lights"),
     ('FIRST', "First", "Keep them in scene order"),
+)
+SPEC_VIEWER = _items(
+    ('PIXEL', "Per Pixel", "The true eye direction at every shaded point"),
+    ('AXIS', "Camera Axis (OpenGL 1.1 / Sega Model / DS)",
+     "One view vector for the whole frame: the camera's own axis"),
 )
 NORMAL_SOURCE = _items(
     ('AUTO', "Auto", "Use the mesh's own smooth/flat flags"),
@@ -216,6 +848,17 @@ RENDER_DEVICE = _items(
     ('CPU', "CPU", "Everything on the CPU. Every feature works"),
     ('GPU', "GPU", "Move the proven post stages to the GPU. Features that "
                    "cannot run there fall back to the CPU automatically"),
+)
+
+# R251 C055: which vector generator quantises the beam's strokes
+BEAM_MACHINE = _items(
+    ('DVG', "DVG: Asteroids / Battlezone (4-bit)",
+     "16 intensity levels and a long end dwell; monochrome behind the "
+     "overlay colour"),
+    ('AVG', "AVG: Tempest / Major Havoc (3-bit doubled, colour RAM)",
+     "Intensities 4..14 of 15, 1 bit per colour channel, a short dwell"),
+    ('STARWARS', "AVG + STATZ: Star Wars 1983 (8-bit)",
+     "256 intensity levels, 3 direct RGB bits, a short dwell"),
 )
 
 ENUMS = {
@@ -233,21 +876,53 @@ ENUMS = {
     'ink_gradient': _items(*INK_GRADIENT_ITEMS),
     'render_device': RENDER_DEVICE,
     'stereo_mode': STEREO_MODE,
+    'dof_method': DOF_METHOD, 'dof_lens_pattern': DOF_LENS_PATTERN,
+    'motion_blur_mode': MOTION_BLUR_MODE,
     'aa_mode': AA_MODE, 'aa_filter': AA_FILTER, 'subpixel_precision': SUBPIXEL,
+    'aa_sample_pattern': AA_PATTERN,
     'depth_sort': DEPTH_SORT, 'painters_key': PAINTERS_KEY, 'shading_rate': SHADING_RATE,
+    'pixel_center': PIXEL_CENTER, 'near_clip_mode': NEAR_CLIP,
+    'depth_encoding': DEPTH_ENCODING,
+    'vertex_quantize': VERTEX_QUANTIZE,
     'default_model': [(a, b, c) for a, b, c in MODEL_ITEMS],
     'force_model': FORCE_MODEL, 'normal_source': NORMAL_SOURCE,
+    'specular_viewer': SPEC_VIEWER,
     'light_falloff_default': FALLOFF, 'shadow_default': SHADOW_MODE,
+    'shadow_map_depth': SHADOW_MAP_DEPTH,
     'light_limit_mode': LIGHT_LIMIT, 'tex_filter': TEX_FILTER,
     'tex_wrap_default': WRAP, 'transparency': TRANSPARENCY,
-    'stipple_pattern': DITHER, 'fog_mode': FOG_MODE, 'glow_quality':
+    # R251 texture pack (TEX-1 + TEX-2)
+    'tex_format': TEX_FORMAT, 'tex_tmem_format': TEX_TMEM,
+    'tex_compress': TEX_COMPRESS, 'tex_frac_bits': TEX_FRAC_BITS,
+    'tex_clamp_mode': TEX_CLAMP_MODE, 'tex_mip_select': TEX_MIP_SELECT,
+    'tex_lod_source': TEX_LOD_SOURCE,
+    'stipple_pattern': STIPPLE_PATTERN, 'fog_mode': FOG_MODE,
+    'fog_table': FOG_TABLE, 'fog_depth': FOG_DEPTH,
+    'fog_color_source': FOG_SOURCE, 'glow_quality':
     _items(('BOX', "Box", ""), ('GAUSS', "Gaussian", "")),
     'color_depth': COLOR_DEPTH, 'palette_mode': PALETTE_MODE,
     'palette_method': PALETTE_METHOD, 'dither': DITHER,
+    'palette_bits': PALETTE_BITS,
+    # R251 (post-palette, wave 2)
+    'attribute_cells': ATTRIBUTE_CELLS,
+    'scanline_palette': SCANLINE_PALETTE,
+    'video_color_check': VIDEO_COLOR_CHECK,
+    'video_system': VIDEO_SYSTEM, 'video_ire_limit': VIDEO_IRE_LIMIT,
     'color_management': COLOR_MGMT, 'crt_mask': CRT_MASK,
     'interlace': INTERLACE, 'output_scale': OUTPUT_SCALE,
+    # R251 post-signal
+    'vi_gamma': VI_GAMMA, 'copy_filter': COPY_FILTER,
+    'crtc_blend': CRTC_BLEND, 'video_filter': VIDEO_FILTER,
+    'chroma_format': CHROMA_FORMAT, 'chroma_upsample': CHROMA_UPSAMPLE,
+    'signal': SIGNAL, 'pal_decoder': PAL_DECODER, 'tape': TAPE,
     'debug_pass': DEBUG_PASS,
     'wire_mode': WIRE_MODE,
+    # R251 (transparency pack): the blend unit, the composite order,
+    # the framebuffer format
+    'blend_equation': BLEND_EQUATION_GLOBAL,
+    'translucent_order': TRANSLUCENT_ORDER,
+    'framebuffer': FRAMEBUFFER,
+    'beam_machine': BEAM_MACHINE,     # R251 C055
     'material_override': _items(
         ('NONE', "Off", "Materials render as authored"),
         ('CLAY', "Clay", "Every material becomes one plain matte "
@@ -312,13 +987,23 @@ RANGES = {
     'setback_start': (0.0, 10000.0), 'setback_range': (0.01, 10000.0),
     'volume_steps': (4, 256),
     'fog_bands': (0, 16),
+    # R251 F015 (LIGHT-B1)
+    'fog_spot': (0.0, 4.0),
+    # R251 LIGHT-A2 (F006 / F009 / F010)
+    'fog_ambient': (0.0, 4.0),
+    'fog_bank1_start': (0.0, 100000.0), 'fog_bank1_end': (0.0, 100000.0),
+    'fog_ground_offset': (-100000.0, 100000.0),
+    'fog_ground_alt': (0.001, 100000.0),
+    'fog_turbulence': (0.0, 10.0), 'fog_turb_depth': (0.0, 1.0),
     'outline_opacity': (0.0, 1.0),
     'outline_depth_threshold': (0.0005, 1.0),
     'outline_normal_angle': (5.0, 179.0),
     'stereo_eye_distance': (0.001, 2.0), 'stereo_convergence': (0.05, 500.0),
+    'stereo_parallax_max': (1, 64),
     'aa_samples': (1, 64), 'aa_filter_width': (0.1, 4.0),
     'aa_edge_threshold': (0.0, 100.0), 'vertex_snap_grid': (0.05, 16.0),
-    'depth_precision': (4, 32), 
+    'depth_precision': (4, 32), 'ot_length': (16, 65536), 'ot_far': (0.1, 100000.0), 
+    'vertex_units': (1.0, 4096.0),
     'light_clamp': (0.0, 1000.0), 'ao_distance': (0.001, 1000.0),
     'ao_samples': (1, 256), 'ao_intensity': (0.0, 1.0),
     'radiosity_samples': (1, 64), 'radiosity_distance': (0.01, 1000.0),
@@ -327,21 +1012,29 @@ RANGES = {
     'global_ambient_level': (0.0, 10.0), 'max_lights': (0, 64),
     'process_count': (0, 64), 'shadow_map_size': (32, 4096), 'shadow_bias': (0.0, 10.0),
     'shadow_softness': (0.0, 32.0), 'shadow_samples': (1, 64),
+    'planar_plane_z': (-10000.0, 10000.0), 'modvol_scale': (0, 255),
     'ray_depth': (0, 16), 'ray_bias': (0.0, 1.0),
     'reflection_blur_samples': (1, 64), 'tex_mip_bias': (-4.0, 4.0),
     'tex_aniso': (1, 16), 'tex_max_size': (0, 4096), 'tex_quantize': (0, 256),
+    # R251 texture pack (wave-2 fields, TEX-2: the register's own ranges)
+    'tex_colorkey_range': (0, 255), 'tex_lod_k': (-64.0, 63.9375), 'tex_lod_l': (0, 3),
     'tex_affine_subdiv': (0, 64), 'alpha_bits': (1, 8),
     'alpha_threshold': (0.0, 1.0), 'fog_start': (0.0, 100000.0),
     'fog_end': (0.0, 100000.0), 'fog_density': (0.0, 10.0),
     'fog_height_top': (-100000.0, 100000.0),
     'fog_height_falloff': (0.0, 100.0),
     'motion_shutter': (0.0, 4.0), 'motion_steps': (2, 64),
+    'motion_samples': (1, 32), 'motion_dither': (0.0, 1.0),
+    'motion_dither_tile': (8, 64),
+    'pano_parts': (1, 16),
     'lens_distortion': (-1.0, 1.0), 'chromatic_aberration': (0.0, 8.0),
     'shaft_threshold': (0.0, 4.0), 'shaft_length': (0.0, 1.0),
     'shaft_decay': (0.5, 1.0), 'shaft_samples': (2, 128),
     'dof_focus': (0.01, 10000.0), 'dof_amount': (0.0, 8.0),
     'dof_layers': (2, 16), 'dof_max_radius': (1.0, 128.0),
+    'dof_lens_samples': (2, 64),
     'displacement_scale': (0.0, 8.0),
+    'shading_rate_area': (0.0, 64.0),          # R251 C119 (MAT-B)
     'glow_threshold': (0.0, 4.0), 'glow_radius': (1.0, 128.0),
     'glow_intensity': (0.0, 4.0), 'star_points': (2, 12),
     'star_length': (1.0, 256.0), 'star_rotation': (0.0, 6.2832),
@@ -350,39 +1043,84 @@ RANGES = {
     'palette_size': (2, 256), 'dither_strength': (0.0, 2.0),
     'exposure': (0.0, 64.0), 'gamma': (0.1, 5.0), 'contrast': (-1.0, 4.0),
     'saturation': (0.0, 4.0), 'brightness': (-1.0, 1.0),
+    'super_black_threshold': (0, 255),      # R251 C092: an 8-bit value
     'crt_scanlines': (0.0, 1.0), 'crt_mask_strength': (0.0, 1.0),
     'crt_bloom': (0.0, 2.0), 'crt_curvature': (0.0, 2.0),
     'crt_vignette': (0.0, 2.0), 'composite_bleed': (0.0, 2.0),
     'composite_ringing': (0.0, 2.0), 'composite_dot_crawl': (0.0, 2.0),
     'jpeg_quality': (1, 100), 'jpeg_passes': (1, 8), 'block_size': (4, 16),
+    # R251 post-signal
+    'crtc_alpha': (0, 255), 'video_filter_threshold': (0, 255),
+    'rf_bandwidth': (2.0, 4.2), 'rf_beat': (0.0, 2.0), 'rf_snow': (0.0, 0.5),
+    'rf_ghost': (0.0, 1.0), 'rf_ghost_delay': (0.1, 5.0),
+    'pal_phase_error': (0.0, 45.0), 'pal_crawl': (0.0, 2.0),
+    'tape_generations': (1, 8), 'tape_noise': (0.0, 0.5),
+    'tape_dropouts': (0.0, 50.0),
+    # R251 SIG-3: the codecs and the optical printer
+    'mpeg1_qscale': (1, 31), 'mpeg1_gop': (0, 30),
+    'smacker_quality': (0.0, 1.0),
+    'matte_glow_radius': (1.0, 64.0), 'matte_glow_passes': (1, 5),
+    'matte_glow_exposure': (0.0, 4.0),
     'threads': (0, 64), 'preview_scale': (1, 16), 'orbit_scale': (0, 16),
     'seed': (0, 2 ** 30),
     'wire_width': (0.1, 8.0), 'wire_angle': (0.0, 180.0), 'resolution_x': (1, 16384),
     'resolution_y': (1, 16384), 'pixel_aspect_x': (0.01, 100.0),
     'pixel_aspect_y': (0.01, 100.0), 
     'clip_near_epsilon': (1e-6, 1.0), 'decay_start': (0.0, 10000.0),
+    # R251 (RAST-B): Elite's dot distance, the beam's spot sigma
+    'wire_dot_distance': (0.0, 100000.0), 'beam_sigma': (0.2, 4.0),
 }
 
 LABELS = {
+    # R251 (transparency pack)
+    'blend_equation': "Blend Equation", 'translucent_order': "Composite Order",
+    'translucent_depth_write': "Translucent Depth Write",
+    'framebuffer': "Framebuffer Format", 'fb_dither': "Buffer Dither",
+    'fb_dither_subtract': "Dither Subtraction",
     'stereo_mode': "Stereo", 'stereo_eye_distance': "Eye Distance",
     'stereo_convergence': "Convergence",
+    'stereo_parallax_layers': "Parallax Layers (Virtual Boy)",
+    'stereo_parallax_max': "Parallax Cap (px)",
+    'camera_yshear': "Y-Shear Pitch",
+    'pano_parts': "Pano Parts (2.4)",
     'aa_mode': "Anti-Aliasing", 'aa_samples': "Samples",
     'aa_filter': "Filter", 'aa_filter_width': "Filter Width",
     'aa_edge_threshold': "Edge Depth Threshold",
     'motion_blur': "Motion Blur", 'motion_shutter': "Shutter (frames)",
     'motion_steps': "Blur Steps",
+    'motion_blur_mode': "Blur Mode", 'motion_samples': "Samples (Max)",
+    'motion_dither': "Pass Dither", 'motion_dither_tile': "Dither Tile (px)",
+    'dof_method': "DOF Method", 'dof_lens_pattern': "Lens Pattern",
+    'dof_lens_samples': "Lens Passes",
     'fog_height': "Height Fog", 'fog_height_top': "Fog Top",
     'fog_height_falloff': "Height Falloff",
     'vertex_snap': "Vertex Snapping",
     'vertex_snap_grid': "Snap Grid (px)",
     'depth_precision': "Z-Buffer Bits", 'depth_sort': "Depth Method",
+    'pixel_center': "Pixel Centre", 'near_clip_mode': "Near Plane",
+    'depth_encoding': "Z-Buffer Encoding",
+    'ot_length': "Table Entries", 'ot_far': "Table Far Distance",
+    'vertex_quantize': "Vertex Format", 'vertex_units': "Vertex Units",
+    'aa_sample_pattern': "Sample Pattern",
+    'n64_coverage_aa': "N64 Coverage AA", 'n64_divot': "N64 Divot Filter",
     'shading_rate': "Shading Rate", 'default_model': "Default Shader",
     'force_model': "Override Shader",
     'specular_in_gamma': "Specular in Gamma Space",
+    'crand_per_frame': "Crand Flickers per Frame",
+    'specular_viewer': "Specular Viewer",
     'max_lights': "Light Limit", 'shadow_default': "Shadow Method",
+    'shadow_map_depth': "Map Depth", 'planar_plane_z': "Floor Plane Z",
+    'modvol_scale': "DC Shadow Scale",
     'tex_filter': "Texture Filter",
     'tex_perspective': "Perspective Correction",
     'tex_max_size': "Texture Size Limit", 'tex_quantize': "Texture Colours",
+    # R251 texture pack
+    'tex_format': "Texel Format", 'tex_tmem_format': "TMEM Budget (N64)",
+    'tex_compress': "Block Compression", 'tex_frac_bits': "Bilinear Fraction Bits",
+    'tex_clamp_mode': "Extend Clamp Mode", 'tex_colorkey': "Chroma Key (after filter)",
+    'tex_colorkey_range': "Chroma Key Range", 'tex_mip_select': "Mip Level Select",
+    'tex_lod_source': "Mip LOD Source", 'tex_lod_k': "GS LOD K", 'tex_lod_l': "GS LOD L",
+    'tex_lod_sharpen': "Sharpen (N64)",
     'threads': "Threads", 'film_transparent': "Transparent Film",
     'cache_shadows': "Cache Shadow Maps", 'show_stats': "Timing Breakdown",
     'fast_background': "Fast Background",
@@ -405,11 +1143,43 @@ LABELS = {
     'reflection_blur_samples': "Blur Samples",
     'watermark': "Burn-In Text",
     'palette_lock': "Lock Palette", 'displacement_scale': "Displacement",
+    'shading_rate_area': "Shading Rate Area (REYES)",     # R251 C119 (MAT-B)
     'color_depth': "Colour Depth", 'palette_mode': "Palette",
     'palette_method': "Quantiser", 'dither': "Dither",
+    'palette_bits': "Register Depth",
+    # R251 (post-palette, wave 2)
+    'attribute_cells': "Attribute Cells",
+    'scanline_palette': "Scanline Palette",
+    'super_black': "Super Black",
+    'super_black_threshold': "Super Black Threshold",
+    'video_color_check': "Video Color Check",
+    'video_system': "Video System", 'video_ire_limit': "IRE Limit",
     'color_management': "View Transform", 'crt': "CRT Simulation",
     'composite': "Composite Video", 'jpeg_artifacts': "JPEG Artefacts",
     'output_scale': "Pixel Scale", 'debug_pass': "Render Pass",
+    # R251 post-signal
+    'vi_dither_filter': "VI De-dither (N64)", 'vi_gamma': "VI Gamma (N64)",
+    'copy_filter': "Copy Filter (GameCube)",
+    'crtc_blend': "CRTC Blend (PS2)", 'crtc_alpha': "CRTC Alpha",
+    'crtc_bg_color': "CRTC Background",
+    'video_filter': "Scan-out Filter (3dfx)",
+    'video_filter_threshold': "Filter Threshold",
+    'chroma_format': "Chroma Sampling", 'chroma_upsample': "Chroma Upsample",
+    'signal': "Cable", 'rf_bandwidth': "RF Bandwidth (MHz)",
+    'rf_beat': "RF 920 kHz Beat", 'rf_snow': "RF Snow",
+    'rf_ghost': "RF Ghost", 'rf_ghost_delay': "Ghost Delay (us)",
+    'pal_decoder': "PAL Decoder", 'pal_phase_error': "PAL Phase Error",
+    'pal_crawl': "PAL Crawl",
+    'tape': "Tape Format", 'tape_generations': "Generations",
+    'tape_noise': "Tape Noise", 'tape_head_switch': "Head Switch",
+    'tape_dropouts': "Dropouts / Frame",
+    # R251 SIG-3: the codecs and the optical printer
+    'mpeg1': "MPEG-1 (Video CD)", 'mpeg1_qscale': "MPEG-1 Scale",
+    'mpeg1_gop': "MPEG-1 GOP",
+    'smacker': "Smacker Blocks", 'smacker_quality': "Smacker Quality",
+    'matte_glow': "Matte Glow (Tron)", 'matte_glow_radius': "Matte Radius",
+    'matte_glow_passes': "Matte Passes",
+    'matte_glow_exposure': "Matte Exposure",
     'render_wire': "Wireframe Overlay", 'wire_width': "Wire Width",
     'outline': "Cartoon Outlines", 'outline_color': "Ink Colour",
     'outline_width': "Ink Width", 'outline_opacity': "Ink Opacity",
@@ -471,8 +1241,26 @@ LABELS = {
     'volume_steps': "Volume Steps",
     'volume_shadows': "Volume Shadows",
     'fog_bands': "Fog Bands",
+    'fog_spot': "Spotlight Fog (Model 3)",
+    'fog_table': "Hardware Fog Table", 'fog_dither': "Fog Dither (Voodoo2)",
+    'fog_face': "Per-Polygon Fog (Namco System 21)",
+    'fog_depth': "Fog Depth",
+    # R251 LIGHT-A2
+    'fog_range_adjust': "Fog Range Adjust (GameCube)",
+    'fog_ambient': "Fog Ambient (Model 3)",
+    'fog_bank1_start': "Bank 1 Start", 'fog_bank1_end': "Bank 1 End",
+    'fog_color_source': "Fog Target",
+    'fog_ground_offset': "Fog Ground Offset",
+    'fog_ground_alt': "Fog Ground Altitude",
+    'fog_turbulence': "Fog Turbulence",
+    'fog_turb_depth': "Fog Turbulence Depth",
     'wire_color': "Wire Colour", 'wire_mode': "Edges",
     'wire_angle': "Crease Angle",
+    # R251 (RAST-B)
+    'aa_clamp_samples': "Limit Dynamic Range",
+    'aa_gamma_blend': "Gamma-2 Sample Blend",
+    'wire_dot_distance': "Dot Distance",
+    'beam_machine': "Vector Generator", 'beam_sigma': "Beam Spot",
     'pass_depth': "Depth", 'pass_normal': "Normal",
     'pass_position': "Position", 'pass_uv': "UV",
     'pass_object_index': "Object Index", 'pass_material_index': "Material Index",
@@ -515,6 +1303,35 @@ DESCRIPTIONS = {
     'stereo_convergence': "Distance at which the two views line up "
                           "exactly (zero parallax). Nearer objects pop "
                           "out of the screen, farther ones sink in",
+    'stereo_parallax_layers': "Virtual Boy stereo: render ONCE and shift every "
+                              "object as a flat card by one whole-pixel parallax "
+                              "per object (its centroid depth through Eye "
+                              "Distance and Convergence), the sky by the cap -- "
+                              "the VIP's per-world parallax, not two cameras. "
+                              "Pack the pair with the Stereo mode chosen above",
+    'stereo_parallax_max': "Largest whole-pixel shift a layer may take either "
+                           "way; the sky always takes it. Virtual Boy games "
+                           "kept their parallax within a few pixels of the "
+                           "384-wide frame for comfort",
+    'camera_yshear': "Render the camera LEVEL and slide the projection centre by "
+                     "focal x tan(pitch) instead of tilting it -- the Y-shear of "
+                     "Heretic, Hexen, Marathon and the Build engine (Duke Nukem "
+                     "3D). Verticals stay vertical, the horizon slides; the shear "
+                     "is capped at 32 degrees up and 56 down, ZDoom's limits, and "
+                     "roll is dropped as those engines had none. Perspective "
+                     "cameras only",
+    'pano_parts': "Blender 2.4's Pano + Xparts: the frame width is divided "
+                  "into N planar strips (the last one cropped when N does not "
+                  "divide it), the camera yawed by one strip's horizontal "
+                  "field between them and the strips butted together "
+                  "unblended -- straight lines kink at every seam, the tell "
+                  "of the era's QuickTime VR cylinders. With a 32 mm sensor "
+                  "four 16 mm parts close the circle. Stereo and Y-shear are "
+                  "off inside the strips, as under the Panoramic camera; "
+                  "accumulation AA, adaptive AA and lens-pass depth of field "
+                  "run inside each strip; the worker pool stands aside (the "
+                  "strips render in-process). 1 = off; the PANO camera type "
+                  "is the true cylinder",
     'motion_blur': "Blur moving objects across the shutter interval by "
                    "averaging time-offset frames, as the era's renderers "
                    "faked it -- expect the cost of Steps extra renders",
@@ -523,6 +1340,21 @@ DESCRIPTIONS = {
     'motion_steps': "Time samples across the shutter. Few steps show the "
                     "classic stepped ghosting; many approach smooth blur "
                     "at a render each",
+    'motion_blur_mode': "How the time slices combine: every step averaged "
+                        "(the accumulation buffer), 3ds Max Object Motion "
+                        "Blur's per-pixel random subset of the slices, or "
+                        "LightWave's Dithered blur splitting the slices by "
+                        "scanline parity",
+    'motion_samples': "Max's Samples: how many of the Blur Steps slices each "
+                      "pixel averages. Equal to Blur Steps the blur is smooth "
+                      "(the plain average); fewer is grainier. 3ds Max's "
+                      "default 10 of 10, cap 32",
+    'motion_dither': "3ds Max 3+ multi-pass Dither Strength: each slice's "
+                     "weight is 1 +/- this by an 8x8 ordered pattern phased "
+                     "per slice, weights normalised -- 0 is the plain "
+                     "average, Max's default 0.4",
+    'motion_dither_tile': "3ds Max multi-pass Tile Size: how many pixels the "
+                          "8x8 dither pattern spans (Max's default 32)",
     # ------------------------------------------------------- rasteriser
     'backface_cull': "Skip triangles facing away from the camera at the "
                      "raster, as period hardware did. Closed meshes look "
@@ -543,6 +1375,61 @@ DESCRIPTIONS = {
     'depth_precision': "Bits of depth buffer. 32 is exact for any scene; "
                        "24 is the period standard; 16 brings the z-fighting "
                        "and poke-through of budget hardware, faithfully",
+    'pixel_center': "Where the rasteriser samples each pixel. Direct3D 3 "
+                    "to 9 sampled at the integer corner while texels sat "
+                    "at +0.5, so 1:1 textures blurred by half a texel and "
+                    "the whole frame sat half a pixel up-left; OpenGL and "
+                    "Direct3D 10 sample at +0.5",
+    'near_clip_mode': "What happens to a triangle that crosses the near "
+                      "plane. Clip cuts it as software renderers did; "
+                      "Reject drops it whole, as the PS2's VU1 fast path "
+                      "and the PS1 did, so geometry pops instead of being "
+                      "cut",
+    'depth_encoding': "How the z-buffer stores depth. Fixed point rounds "
+                      "normalised z to Z-Buffer Bits; the N64 RDP kept "
+                      "18-bit z in a piecewise-floating code (coarse near, "
+                      "fine far), the GameCube compressed 24-bit z by "
+                      "octave, Xbox and Voodoo buffered w instead of z -- "
+                      "each moves the z-fighting bands to where that "
+                      "machine had them",
+    'ot_length': "Entries in the PlayStation ordering table. Every "
+                 "polygon's mean depth is floored into one of these "
+                 "buckets; fewer buckets merge more polygons into one draw "
+                 "order and mis-sort more",
+    'ot_far': "Scene distance that lands in the last ordering-table "
+              "bucket. Polygons past it fall outside the table and are "
+              "not drawn at all, the PS1's far pop-in",
+    'vertex_quantize': "Round mesh data to the console's vertex format "
+                       "before projection: 16-bit integer positions on a "
+                       "world grid of Vertex Units per unit, PS1 1.3.12 "
+                       "or N64 8-bit normals, PS1 integer-texel UVs and "
+                       "8-bit vertex colours -- the crunch and texture "
+                       "jitter of integer geometry. A world grid, "
+                       "disclosed: the consoles quantised in model space",
+    'vertex_units': "Integer vertex units per world unit for the "
+                    "vertex-format quantisation. 64 puts vertices on a "
+                    "1/64-unit lattice; fewer units crunch harder",
+    'aa_sample_pattern': "Where the supersampler tests inside each subpixel. "
+                         "Grid samples the centre (moire and stair-steps); "
+                         "Jitter hashes a position inside every subpixel per "
+                         "pixel and frame, as REYES did, so aliasing turns "
+                         "into fine noise. At 1 sample it is a per-pixel "
+                         "offset",
+    'n64_coverage_aa': "The N64's anti-aliasing: the rasteriser stores 3 "
+                       "bits of coverage per pixel from 16 subsamples of "
+                       "the winning polygon, and the Video Interface pulls "
+                       "every partially covered pixel toward the "
+                       "penultimate extremes of its six fully covered "
+                       "neighbours by (7 - coverage)/8, softening every "
+                       "polygon edge, interior seams included. Needs 1 "
+                       "sample per pixel; reads the frame as the RDP's "
+                       "16-bit (5551) framebuffer, so smooth shading "
+                       "bands at 5 bits per channel across the whole "
+                       "frame, whatever Colour Depth is set to",
+    'n64_divot': "The VI's divot filter after the coverage blend: any "
+                 "pixel whose horizontal triple holds a partial-coverage "
+                 "pixel becomes the per-channel median of the three. The "
+                 "N64's default with anti-aliasing on",
     'clip_near_epsilon': "Safety margin for the near-plane clip, in NDC "
                          "units. Raise it only if geometry grazing the "
                          "camera shows cracks; lowering it buys nothing",
@@ -620,6 +1507,35 @@ DESCRIPTIONS = {
     'shadow_samples': "Taps per pixel for soft mapped shadows, or rays per "
                       "pixel for soft traced shadows from area-sized "
                       "lights. More is smoother and slower",
+    # R251 C117
+    'shadow_map_depth': "What each shadow-map texel stores. CLASSIC keeps "
+                        "the nearest caster and fights acne with Bias and "
+                        "a normal offset. MIDPOINT stores the halfway "
+                        "point between the two nearest casters along the "
+                        "texel (Woo 1992, Maya's Use Mid Dist, Blender's "
+                        "Classic-Halfway): the compare lands inside the "
+                        "caster's thickness, so Bias and the offset are "
+                        "zero and thin closed objects cast without a gap. "
+                        "A texel that sees a lone surface stores the far "
+                        "plane: a single open face casts nothing (mental "
+                        "ray's rule). A MIDPOINT map costs two rasters of "
+                        "the casters instead of one",
+    # R251 C052
+    'planar_plane_z': "World height of the receiver plane (normal +Z) that "
+                      "planar shadows are drawn on: casters are projected "
+                      "along each lamp onto Z = this value, the way Model 1 "
+                      "flattened fighters onto the ring floor. Only lamps "
+                      "within the Light Limit cast; every frame (viewport "
+                      "drafts included) pays one extra raster of the "
+                      "casters per casting lamp",
+    # R251 C020
+    'modvol_scale': "The Dreamcast's FPU_SHAD_SCALE register: inside a "
+                    "modifier volume the 8-bit colour becomes colour x "
+                    "scale / 256, integer -- 128 is the half-brightness "
+                    "shadow Sonic Adventure used, 0 is black, 255 barely "
+                    "darkens. Read only while a Dreamcast Modifier volume "
+                    "exists in the scene; each such volume costs one "
+                    "fragment capture per frame",
     # ------------------------------------------------------ ray tracing
     'raytrace': "Master switch for traced reflections and refractions -- "
                 "the checkbox that separated the raytracers from the "
@@ -643,16 +1559,23 @@ DESCRIPTIONS = {
     # --------------------------------------------------------- textures
     'tex_filter': "How textures are sampled: Nearest is the chunky texel "
                   "look, Bilinear smooths, Trilinear adds mip blending, "
-                  "EWA is the quality path. The single most visible "
-                  "texture-era switch",
+                  "3-Point is the N64's, Normalised Distance is POV-Ray's "
+                  "interpolate 4, Summed Area is 3D Studio's box integral. "
+                  "The single most visible texture-era switch",
     'tex_mipmap': "Build and use mip pyramids so distant textures calm "
                   "down instead of sparkling. Off reproduces the shimmer "
                   "of software that never mipped",
     'tex_mip_bias': "Shift mip selection sharper (negative) or blurrier "
                     "(positive), in levels. Period hardware often biased "
-                    "sharp and lived with the noise",
-    'tex_aniso': "Maximum anisotropy for EWA filtering. Higher keeps "
-                 "floors readable at grazing angles; 1 is isotropic",
+                    "sharp and lived with the noise; under Summed Area it "
+                    "scales the footprint rectangle by 2^bias, with or "
+                    "without Mipmaps; inert under the PlayStation 2 LOD (K "
+                    "replaces it)",
+    'tex_aniso': "Maximum anisotropy for Trilinear: up to this many trilinear "
+                 "taps along the footprint's long axis, the N-tap box of "
+                 "late-90s cards (not EWA). Higher keeps floors readable at "
+                 "grazing angles; 1 is isotropic. Off under the PlayStation 2 "
+                 "LOD, a Mip Level Select or Sharpen",
     'tex_max_size': "Downsample any texture larger than this before use, "
                     "as period VRAM budgets forced. 0 keeps full size",
     'tex_quantize': "Reduce every texture to this many colours before "
@@ -664,14 +1587,146 @@ DESCRIPTIONS = {
     'tex_wrap_default': "What textures do past their edges when the node "
                         "does not say: repeat, mirror, clamp, or clip to "
                         "nothing",
+    # ------------------------------------------ R251 texture pack (TEX-1)
+    'tex_format': "Store every texture at the card's texel format before "
+                  "sampling: rounded once like the Glide and Direct3D drivers "
+                  "did, expanded by bit replication on fetch. 4:4:4:4 bands "
+                  "skies, 1:5:5:5 cuts alpha hard, Model 2's 4-bit luma tints "
+                  "through the material colour, the DS's A3I5 keeps 8 alpha "
+                  "levels, 3dfx NCC keeps 16 luma steps and a 4x4 chroma table. "
+                  "Ignored while a TMEM Budget is set: the N64 format owns the "
+                  "texel",
+    'tex_tmem_format': "Fit every texture into the Nintendo 64's 4 KB TMEM by "
+                       "the chosen format: rows padded to 64-bit words, "
+                       "colour-index formats confined to the lower 2 KB, mip "
+                       "levels counted when Mipmaps is on, then the largest "
+                       "halving that fits and the format's own texel depth "
+                       "(RGBA16 = 5551, CI4 = 16 colours, I4 = 16 greys feeding "
+                       "alpha). A TMEM format owns the texel format: Texel "
+                       "Format is ignored while this is set",
+    'tex_compress': "Bake the era's block compression into every texture "
+                    "before sampling: DXT1's two 5:6:5 endpoints and four "
+                    "colours per 4x4 block (S3TC), the Xbox NV2A's 16-bit decode "
+                    "banding, the GameCube's CMPR 3/8-5/8 interpolants, or the "
+                    "Dreamcast's 256-entry 2x2 vector-quantised codebook. Mip "
+                    "levels are box-halved from the compressed level",
+    'tex_frac_bits': "Keep only the top bits of the texel fraction before "
+                     "blending, as the Voodoo1's bilinear unit did (4 bits: "
+                     "sixteen steps between texels, faint terraces on magnified "
+                     "textures) or the Voodoo2's (8 bits). Applies to Bilinear "
+                     "and to each Trilinear level; 3-Point keeps the RDP's own "
+                     "arithmetic",
+    # ------------------------------------------ R251 texture pack (TEX-2, wave 2)
+    'tex_clamp_mode': "How Extend-mode textures clamp: Clamp to Edge repeats the "
+                      "last texel; GL_CLAMP clamps the coordinate but lets the "
+                      "bilinear taps past the last texel read OpenGL 1.1's "
+                      "transparent-black border, the half-texel dark seam of "
+                      "GLQuake-era sky boxes on conformant drivers",
+    'tex_colorkey': "Test the texture's colour against black AFTER filtering, as "
+                    "the Voodoo's chroma key and Direct3D's colour key did; alpha "
+                    "cut-outs are stored as opaque black first, so the filter "
+                    "bleeds a dark fringe into every keyed edge that then "
+                    "survives the test. A texture's own alpha above one half is "
+                    "kept",
+    'tex_colorkey_range': "Voodoo2 chromaRange: a texel within this many 8-bit "
+                          "levels of black on every channel is keyed out; 0 is "
+                          "the Voodoo1 and Direct3D exact match",
+    'tex_mip_select': "How a mip level is picked when Mipmaps is on: as the "
+                      "filter does today (Trilinear blends, the rest read level "
+                      "0), Blend two levels with the filter's own taps (the N64 "
+                      "RDP's 3-point mip blend; Bilinear + Blend is exactly "
+                      "Trilinear), one Nearest level as OpenGL 1.1's "
+                      "LINEAR_MIPMAP_NEAREST and Direct3D's point mip did, or the "
+                      "Voodoo1's 4x4-dithered level pick that stipples every mip "
+                      "seam. Anisotropy is off under a level select: no card had "
+                      "both",
+    'tex_lod_source': "Where the mip level comes from: the screen-space texture "
+                      "derivatives every PC card used, the PlayStation 2 GS's "
+                      "rule -- log2 of the interpolated Q (1/w) alone, shifted by "
+                      "L and offset by K in 7.4 fixed point -- so mip bands sit "
+                      "at fixed distances whatever the surface angle, or one "
+                      "level per polygon from the triangle's texel-to-pixel area "
+                      "ratio (Riva 128, Verite) -- one NEAREST level, no blend: "
+                      "under it As the Filter and Blend read as Nearest Level, "
+                      "the Voodoo dither still applies. Needs Mipmaps (the GS "
+                      "rule also needs Trilinear or a Mip Level Select); "
+                      "anisotropy and Mip Bias are off under the GS rule (K "
+                      "replaces the bias)",
+    'tex_lod_k': "The GS TEX1 K offset in levels, signed 7.4 fixed point "
+                 "(quantised to 1/16): negative sharpens, positive blurs, tuned "
+                 "per game on the real machine",
+    'tex_lod_l': "The GS TEX1 L shift: the LOD from Q is multiplied by 2^L "
+                 "before K is added",
+    'tex_lod_sharpen': "Nintendo 64 sharpen mode (gDPSetTextureDetail "
+                       "G_TD_SHARPEN): under magnification the RDP extrapolates "
+                       "level 0 away from level 1 with a negative LOD fraction -- "
+                       "most at full magnification, none at 1:1 -- and its 9-bit "
+                       "clamp saturates the overshoot into crisp, ringing texel "
+                       "edges. Needs Mipmaps on; anisotropy is off under it",
     # ----------------------------------------------------- transparency
     'transparency': "How see-through surfaces composite: sorted alpha "
                     "blending, the A-buffer's exact per-pixel lists, or "
                     "Screen Door's dither-pattern holes (no sorting, no "
                     "blending, pure period)",
     'stipple_pattern': "The hole pattern Screen Door transparency punches, "
-                       "per opacity level. Each entry is a real pattern "
-                       "family from shipped hardware",
+                       "per opacity level: the Bayer and clustered-dot "
+                       "ordered maps, the Mega Drive / SNES pseudo-hires "
+                       "1x2 column mesh, or the N64 RDP's per-pixel random "
+                       "alpha compare. Each is a real pattern family from "
+                       "shipped hardware",
+    # R251 (transparency pack)
+    'blend_equation': "The blend unit's equation for every see-through "
+                      "surface under Sorted Blend or A-Buffer. Alpha Over "
+                      "is Halcyon's float blend; the PlayStation, Saturn "
+                      "VDP1, 3DO PIXC, SNES, GBA and DS items are those "
+                      "chips' fixed integer formulas on 5- or 6-bit "
+                      "channels (saturating adds and subtracts, halves, "
+                      "sixteenths), applied per layer in Halcyon's own "
+                      "depth order. Fuzz, Thin Wall and Imagine Fog are "
+                      "the software looks of the same stage. A "
+                      "material's Blend Mode overrides this for that "
+                      "material",
+    'translucent_order': "The order see-through layers composite in under "
+                         "Sorted Blend or A-Buffer. Depth is Halcyon's "
+                         "per-fragment (A-Buffer) or per-polygon (Sorted) "
+                         "order; the Nintendo DS auto-sort ordered "
+                         "translucent polygons by their bottom screen "
+                         "row, then top row, then submission, never by "
+                         "depth -- the source of its mis-sorted water and "
+                         "glass -- and its manual sort drew them in "
+                         "submission order",
+    'translucent_depth_write': "Translucent fragments write the depth "
+                               "buffer as they composite, so a later "
+                               "fragment in the composite order that lies "
+                               "behind one already drawn at that pixel is "
+                               "dropped -- the DS POLYGON_ATTR bit 11 "
+                               "behaviour (and fixed-function GL with depth "
+                               "writes left on). Off, layers never occlude "
+                               "each other",
+    'framebuffer': "The framebuffer format the frame is written INTO, not "
+                   "the output depth: the PlayStation 2's 16-bit buffer, "
+                   "the GameCube EFB's 6-bit channels and the 3dfx "
+                   "Voodoo's RGB565 truncate at every write and read the "
+                   "truncated value back for every blend, so stacked "
+                   "see-through layers, particles and fog volumes "
+                   "accumulate their dither into grain where they "
+                   "overlap. Colour Depth at post quantises the finished "
+                   "frame once; this quantises inside the pipeline. "
+                   "Under supersampling the resolve averages the dither "
+                   "away: the presets that ship it use no or edge AA",
+    'fb_dither': "The buffer's hardware dither at each write: the GS "
+                 "DTHE/DIMX matrix (PlayStation 2), the Voodoo's "
+                 "grDitherMode matrix. Off is the GS with DTHE clear or "
+                 "Glide's GR_DITHER_DISABLE -- plain truncation. The "
+                 "GameCube RGBA6 format always dithers and ignores this",
+    'fb_dither_subtract': "Voodoo 'alpha dither subtraction' (fbzMode bit "
+                          "19): a blend reads the dithered 565 destination "
+                          "back with the matrix value added back before "
+                          "blending, undoing the dither for that read. Off "
+                          "leaves the read raw, so the grain compounds "
+                          "harder. With Buffer Dither off nothing was "
+                          "added at the write, so nothing is subtracted "
+                          "at the read. Only the Voodoo formats read this",
     'alpha_bits': "Bits of opacity resolution for the alpha channel. "
                   "Fewer bits step smooth fades into visible bands",
     'alpha_threshold': "Hard opacity cutoff: below this a pixel is "
@@ -693,15 +1748,99 @@ DESCRIPTIONS = {
                "everything is fog colour",
     'fog_density': "Steepness of the exponential fog modes. Small numbers "
                    "haze the horizon; large ones swallow the middle ground",
+    'fog_table': "Quantise the fog through the accelerator's own fog "
+                 "table: 3dfx Voodoo's 64 entries indexed by the pixel's "
+                 "1/w and interpolated by its next 8 mantissa bits "
+                 "(Glide), the PowerVR2's 128 log-spaced entries below "
+                 "Fog End (Dreamcast), or the Nintendo DS's 32 equal "
+                 "steps between Fog Start and Fog End. The Fog Mode "
+                 "curve fills the table at each entry's own depth; a "
+                 "16-Step Table mode is read as Linear here. For the "
+                 "Voodoo table w is eye depth in scene units (one scene "
+                 "unit is one Glide w unit, so a metre-scale scene uses "
+                 "the near octaves) and Fog Start does not move the "
+                 "table; every table replaces Per-Vertex Fog's rounding "
+                 "with its own steps",
+    'fog_dither': "Voodoo2's fog dither: the 4x4 ordered matrix is added "
+                  "to the fog interpolation fraction before its final "
+                  "shift (fogMode bit 6), the fine checker inside the "
+                  "Voodoo2's fog bands. Only the 64-entry table reads it",
+    'fog_face': "One fog step per polygon: the fog curve is evaluated once at "
+                "the mean depth of the triangle's three corners and every pixel "
+                "of the polygon takes that value, so whole polygons pop between "
+                "haze bands as on Namco's System 21 (the board averaged its "
+                "quads' four corners; a triangle pair straddling a bank pops as "
+                "two halves). Fog Bands sets the bank count (16 or 32 on the "
+                "hardware); it replaces Per-Vertex Fog's rounding with the "
+                "polygon's own step",
+    # R251 LIGHT-A2: F004 / F006 / F008 / F009 / F010
+    'fog_range_adjust': "GameCube's horizontal fog range adjustment: the "
+                        "planar fog depth is scaled by the secant of each "
+                        "pixel column's view angle through a 10-knot table "
+                        "at 32-pixel steps of the output frame "
+                        "(GX_InitFogAdjTable), so the fog stops breathing "
+                        "at the frame edges when the camera turns. Off in "
+                        "GXInit; inert under an orthographic camera",
+    'fog_ambient': "Model 3's fogAmbient: scales the fog colour every "
+                   "material blends toward, the 8-bit viewport register "
+                   "that dimmed the whole haze. A Backdrop fog target is "
+                   "not scaled (LightWave had no such register)",
+    'fog_bank1_start': "Fog Start for materials on Fog Bank 1 -- System "
+                       "22's second cz table; inert while Bank 1 End <= "
+                       "Bank 1 Start. The board had four banks; Halcyon "
+                       "ships this one beside the scene's",
+    'fog_bank1_end': "Fog End for materials on Fog Bank 1 -- System 22's "
+                     "second cz table; inert while Bank 1 End <= Bank 1 "
+                     "Start. The board had four banks; Halcyon ships this "
+                     "one beside the scene's",
+    'fog_color_source': "What the fog fades toward: the Fog Colour swatch, "
+                        "or LightWave's Use Backdrop Color -- the world "
+                        "colour the same pixel would show if nothing were "
+                        "drawn there (gradient, bands, HDRI, painted "
+                        "backdrop), so distant objects dissolve into the "
+                        "sky behind them while the backdrop itself "
+                        "receives no fog. Reflections and vertex-lit "
+                        "corners take the world colour along their own "
+                        "direction instead",
+    'fog_ground_offset': "World height of POV-Ray's constant-density "
+                         "layer: below it the ground fog is full density, "
+                         "above it thins as 1/(1+Y^2) over Fog Ground "
+                         "Altitude",
+    'fog_ground_alt': "POV-Ray's fog_alt: the height above the offset at "
+                      "which the ground fog's density has halved (the "
+                      "shipped code's law, not the manual's quarter)",
+    'fog_turbulence': "POV-Ray's fog turbulence: one value-noise "
+                      "turbulence read at the middle of each pixel's "
+                      "fogged path scales the fog distance, faded by "
+                      "exp(-distance x Fog Density) so near fog goes wispy "
+                      "and far fog stays smooth. Six octaves, lambda 2, "
+                      "omega 0.5 (POV's defaults); 0 leaves the fog "
+                      "untouched",
+    'fog_turb_depth': "POV-Ray's turb_depth: how much of the fog distance "
+                      "the turbulence may remove (min(1, turbulence x "
+                      "depth)); 0.5 is POV's default",
+    'fog_depth': "Where the fog reads its distance: eye depth (w), or "
+                 "Direct3D's post-projection z in 0..1 as pixel fog did "
+                 "on devices without W-fog -- Fog Start and End are then "
+                 "0..1 depths and almost the whole scene sits above "
+                 "0.99, so the fog arrives as a wall. Applies to the "
+                 "Linear/Exp/Exp2/16-Step curves; the console modes and "
+                 "hardware tables keep eye depth",
     'fog_vertex': "Compute fog per vertex and interpolate, as fixed-"
                   "function pipelines did -- visible banding on long "
                   "triangles, which is the point",
+    'fog_spot': "How much a Model 3 screen spotlight brightens the fog "
+                "inside its ellipse (Supermodel's spotFogColor x "
+                "fogAttenuation): the lobe's colour is added to the fog "
+                "target where the lamp shines. 0 leaves the fog untouched",
     'fog_bands': "Quantize the fog into this many hard depth steps -- "
                  "distance reads as flat painted planes, the anime "
                  "background trick (and the PS1's own coarse fog "
                  "tables). 0 keeps the fog smooth",
     'fog_height': "Limit fog to below a world height, thinning with "
-                  "altitude -- valley mist instead of uniform soup",
+                  "altitude -- valley mist instead of uniform soup. "
+                  "Ignored under Ground Fog, which integrates its own "
+                  "height law",
     'fog_height_top': "World height where height fog has fully thinned "
                       "to nothing",
     'fog_height_falloff': "How sharply height fog thins between its base "
@@ -737,7 +1876,9 @@ DESCRIPTIONS = {
     'color_depth': "Bits per pixel of the delivered frame. 24 is "
                    "truecolor; 16 and below quantise with the exact "
                    "banding of the era's framebuffers; HAM modes "
-                   "reproduce the Amiga's tricks precisely",
+                   "reproduce the Amiga's tricks precisely; CRY16 is the "
+                   "Jaguar's intensity-plus-chroma-cell pixel, YJK the "
+                   "MSX2+'s shared-chroma pixel",
     'palette_mode': "For palettised depths: use a fixed period palette, "
                     "or fit one to this frame the way the era's "
                     "converters did",
@@ -745,6 +1886,35 @@ DESCRIPTIONS = {
                     "16 is EGA territory",
     'palette_method': "How the fitted palette is chosen -- median cut is "
                       "the classic, octree the smoother",
+    'palette_bits': "Precision of the palette registers or DAC the chosen "
+                    "colours are snapped to before display: an Atari ST held "
+                    "16 colours from 512 (3 bits per channel), an Amiga 32 "
+                    "from 4096, the VGA DAC 6 bits. Applies to every palette "
+                    "mode -- fixed, adaptive or custom -- so the per-pixel "
+                    "search lands on colours the machine could hold; ignored "
+                    "under Extra Half-Brite (12-bit by definition) and "
+                    "attribute cells (fixed hardware colours)",
+    'attribute_cells': "Store colour per character cell, not per pixel, "
+                       "the way tile-based displays did: each cell may "
+                       "hold only its machine's two colours (ZX "
+                       "Spectrum, MSX1, C64 hires) or three plus one "
+                       "screen-wide background (C64 multicolour), chosen "
+                       "by least squared error over the cell's pixels "
+                       "-- where two colours meet inside a cell the "
+                       "attribute clash shows. Owns the colour stage: "
+                       "Colour Depth and Palette are not consulted; an "
+                       "ordered Dither perturbs the pixels before the "
+                       "fit, error diffusion and Blue Noise are ignored "
+                       "(printed once)",
+    'scanline_palette': "Rewrite the palette registers every scanline "
+                        "the way raster-timed software did: Spectrum 512 "
+                        "reloads the Atari ST's 16 registers three times "
+                        "per line (48 colours a line, 3 bits per "
+                        "channel), Dynamic HiRes loads 16 Amiga colours "
+                        "per line, Sliced HAM gives HAM6 a fresh "
+                        "16-colour base each line. A median cut per "
+                        "line, so it runs on the CPU and refuses the GPU "
+                        "road by name",
     'dither': "The error-spreading pattern that sells low colour depths: "
               "ordered Bayer matrices in period sizes, or Floyd-"
               "Steinberg diffusion",
@@ -764,6 +1934,37 @@ DESCRIPTIONS = {
                          "naive period software did, instead of "
                          "converting from sRGB. Changes every texture's "
                          "midtones; authentic, not correct",
+    # R251 (post-palette C092 / C093): the 3D Studio / Max video-out pair
+    'super_black': "Keep every pixel covered by geometry at or above the "
+                   "threshold while uncovered background pixels stay at "
+                   "0, so a luminance keyer can tell them apart -- 3D "
+                   "Studio's and 3ds Max's Super Black for video keying. "
+                   "Applied per pixel after the blend, so a high "
+                   "threshold lifts anti-aliased edges (Max's own "
+                   "caveat); not under the process pool this round (the "
+                   "workers return pixels only)",
+    'super_black_threshold': "The lowest 8-bit value (0-255) a "
+                             "geometry-covered pixel may show under "
+                             "Super Black; Max's default is 15, 0 "
+                             "changes nothing",
+    'video_color_check': "Test every display-referred pixel against the "
+                         "composite video envelope in IRE (luma plus the "
+                         "chroma subcarrier) and correct the illegal ones "
+                         "the way 3D Studio and 3ds Max did: flag them "
+                         "black, scale their luminance into range, or "
+                         "scale their saturation toward grey. Runs after "
+                         "the display transform, before any dither or "
+                         "palette",
+    'video_system': "Which composite envelope the legaliser tests "
+                    "against: NTSC-M with its 7.5 IRE black setup and "
+                    "92.5 IRE of picture, or PAL with black at 0 IRE and "
+                    "100 of picture (100 IRE = 700 mV: PAL is specified "
+                    "in millivolts, the IRE figure is a borrowing)",
+    'video_ire_limit': "The peak the composite envelope may reach: 120 "
+                       "IRE is the NTSC maximum 3ds Max tested against, "
+                       "110 IRE the broadcast house rule After Effects "
+                       "defaults to; the trough limit is -20 IRE either "
+                       "way",
     # ---------------------------------------------------------- CRT & TV
     'crt': "Draw the frame as a CRT would show it: scanlines, phosphor "
            "mask, bloom and curvature, each with its own control",
@@ -814,6 +2015,30 @@ DESCRIPTIONS = {
     'wire_color': "Colour the wireframe's edges are inked in, drawn over "
                   "whatever the surface renders beneath them",
     'wire_width': "Width of the inked edges, in output pixels",
+    # R251 (RAST-B): C094, C122, C063, C055
+    'aa_clamp_samples': "LightWave's Limit Dynamic Range: clip every "
+                        "sample's colour at 1.0 before the anti-aliasing "
+                        "filter, so an overbright edge blends between "
+                        "displayable values instead of bleeding a halo. "
+                        "Glow and flare then see a clipped frame",
+    'aa_gamma_blend': "Blender 2.2x-2.41's OSA gamma: each anti-aliasing "
+                      "sample is squared through the 400-entry table "
+                      "before the filter and the sum square-rooted after, "
+                      "so bright thin lines stay wide and dark ones pinch. "
+                      "Only the sample blend changes; flat areas keep "
+                      "their value to a table step",
+    'wire_dot_distance': "Beyond this camera distance an object under the "
+                         "Elite rule collapses to a single dot at its "
+                         "centre, as Elite's ships did. 0 never",
+    'beam_machine': "Which vector generator quantises the strokes: the "
+                    "DVG's 4-bit intensity with bright end dots, the AVG's "
+                    "3-bit doubled levels, or Star Wars' 8-bit STATZ. AVG "
+                    "and Star Wars colour is 1 bit per channel, so a wire "
+                    "colour below 0.5 on every channel draws nothing and "
+                    "says so",
+    'beam_sigma': "The phosphor spot's Gaussian sigma in pixels at 480 "
+                  "lines (scaled with the frame); larger is a fatter, "
+                  "softer beam",
     'outline': "Ink cartoon outlines over the frame, drawn from the "
                "renderer's own buffers -- silhouettes, material borders, "
                "depth breaks and creases, each its own toggle below. At "
@@ -1260,17 +2485,32 @@ DESCRIPTIONS = {
                "dispatch between small ones. Defaults to 1 for that reason. "
                "Worker Processes is the route that actually parallelises",
     'render_device': "Where the frame is computed. GPU rasterises the frame, "
-                     "shades it and runs the post stages on your driver -- "
-                     "each measured against the CPU frame on real hardware, "
-                     "and each falling back per frame with the reason on the "
-                     "console when a scene uses something still CPU-only "
-                     "(ray tracing, for now). Flipping to GPU turns the "
-                     "proven stages on; the Debug panel can switch them off "
-                     "individually",
-    'gpu_post': "Run the parallel post stages on the GPU through Blender's own "
-                "gpu module, the layer EEVEE is built on. Measured against "
-                "the CPU stages on real hardware. Falls back to the CPU stage by "
-                "stage, and says why on the console",
+                     "shades it, draws the sky in the same burst for the "
+                     "simple and HDRI worlds, keeps the frame on the GPU "
+                     "for the ink, the supersample resolve and the post "
+                     "chain, and runs that chain resident -- each stage "
+                     "measured against the CPU frame on real hardware, and "
+                     "each falling back per frame with the reason on the "
+                     "console when a scene uses something still CPU-only: "
+                     "a caster mask on ray shadows, the Bryce and painted "
+                     "skies, world node graphs beyond a plain Background "
+                     "node, the ground plane, the film beyond grain, the "
+                     "dithers and palettes. Flipping to GPU turns the "
+                     "proven stages on; the Debug panel can switch the "
+                     "rasteriser and the shading off individually (GPU "
+                     "Post follows the device switch)",
+    'gpu_post': "Run the post chain on the GPU through Blender's own gpu "
+                "module, the layer EEVEE is built on -- resident since 1.89: "
+                "the frame the render left on the GPU is inherited (no "
+                "upload; otherwise one, plus one after each CPU-only stage "
+                "that hands it back), the film grain and flicker, the display "
+                "transform, the bit depth, NTSC and CRT draw stage to stage "
+                "in place, and the picture reads back once at the end. Each "
+                "stage is measured against the CPU stage on real hardware; "
+                "a CPU-only stage that is on (a dither or palette, halftone, "
+                "interlace, lens, JPEG, the optical stages, the film beyond "
+                "grain) reads the frame back by name and says so on the "
+                "console",
     'gpu_hold_context': "Give the render thread the GPU context for the "
                         "whole frame, as before 1.25.53. Bursts start "
                         "instantly but Blender's interface cannot redraw "
@@ -1290,20 +2530,30 @@ DESCRIPTIONS = {
                    "textures, converted master-shader materials, normal-map "
                    "chains, coded shader nodes, the period pattern "
                    "textures, matcap, backface and environment reflections "
-                   "all included, with sun, point, spot and area lights. "
+                   "all included, with sun, point, spot and area lights -- "
+                   "and the sky or background for the simple and HDRI "
+                   "worlds is drawn in the same burst, so the readback is "
+                   "the whole frame, which then stays on the GPU for the "
+                   "ink, the supersample resolve and the post chain. "
                    "Measured against the CPU frame at 0.00002 max "
                    "difference on real hardware. Frames using what the GLSL "
-                   "does not reproduce yet -- ray-traced shadows, fog, ray "
-                   "tracing, the N64 texture filter, the Bump node -- "
-                   "shade on the CPU with the reason on the console. "
-                   "Shader compiles, plans and unchanged uploads are all "
-                   "cached across frames",
+                   "does not reproduce yet -- a caster mask on ray shadows, "
+                   "a Bump node inside a transparency layer, per-pixel "
+                   "opacity under Screen Door, the refusals the console "
+                   "names -- shade on the CPU with the reason on the "
+                   "console; a fog frame shades on the GPU and takes the "
+                   "CPU's own fog over the readback; a Bryce or painted "
+                   "sky, a starfield or physical sky, a world node graph "
+                   "beyond a plain Background node, or the ground plane "
+                   "keeps the sky on the CPU and says so. Shader compiles, "
+                   "plans and "
+                   "unchanged uploads are all cached across frames",
     'gpu_raster': "Rasterise the frame on the GPU too: a compute-shader "
                   "port of the CPU rasteriser's own fill rules, one thread "
                   "per pixel, measured at ZERO differing pixels against the "
                   "CPU on real hardware and several times faster at "
                   "working sizes. Frames it cannot reproduce yet -- "
-                  "Painter's depth sort, affine texture mode, overdraw "
+                  "affine texture mode, overdraw "
                   "debugging, banded worker renders -- rasterise on the "
                   "CPU with the reason on the console",
     'lens_distortion': "Barrel distortion below zero, pincushion above. What a "
@@ -1316,10 +2566,31 @@ DESCRIPTIONS = {
            "What compositors of the era did, at a handful of blurs rather than "
            "hundreds of samples",
     'dof_focus': "Distance from the camera that stays sharp",
+    'dof_method': "How depth of field is made: the finished frame blurred "
+                  "in depth slabs (Layered Post Blur), or the frame rendered "
+                  "once per lens point and averaged (Lens Passes -- REYES / "
+                  "the SGI accumulation buffer / 3ds Max multi-pass DOF)",
+    'dof_lens_pattern': "Where the lens points sit across the aperture: a "
+                        "Halton disc (the accumulation buffer paper's "
+                        "sequence) or 3ds Max's multi-pass spiral with pass 0 "
+                        "at the lens centre",
+    'dof_lens_samples': "Lens points, one full render each: the accumulation "
+                        "buffer paper's example used 23, 3ds Max's Total Passes "
+                        "default is 12. Few passes show as rings, which is the "
+                        "era's own look",
     'dof_amount': "How quickly things go soft either side of the focus distance",
     'dof_layers': "Number of depth slabs. More is smoother and slower",
     'shaft_threshold': "How bright a pixel must be to throw a shaft",
     'shaft_length': "How far the streaks reach toward the light",
+    # R251 C119 (MAT-B)
+    'shading_rate_area': "REYES ShadingRate: shade on a surface-aligned grid "
+                         "whose cells cover about this many pixels of the "
+                         "OUTPUT frame's area, one shade per cell (constant "
+                         "interpolation) -- the micropolygon facet of Pixar's "
+                         "renderer, PRMan and BMRT. 0 shades every pixel; 1 is "
+                         "PRMan's default; 4-16 give the preview-render look. "
+                         "Inert at the VERTEX / FACE rates (they shade coarser "
+                         "than any grid); both roads snap the same cells",
     'displacement_scale': "Strength of the bump derived from a material's "
                           "Displacement output. Geometry is not tessellated -- "
                           "the height becomes a normal perturbation, which is "
@@ -1382,14 +2653,173 @@ DESCRIPTIONS = {
     'override_color': "The matte colour Material Override renders with",
     'output_scale': "Render at 1/N of the output resolution and scale back up "
                     "with nearest-neighbour. The output stays the size you set, "
-                    "and the render costs N squared times less",
+                    "and the render costs N squared times less, or resample "
+                    "the way the 3DO's display generator and the GBA's affine "
+                    "background did (the 3DO and GBA items)",
+    # R251 post-signal: the machine's scan-out stages
+    'vi_dither_filter': "The N64 Video Interface's DITHER_FILTER_ENABLE: at "
+                        "scan-out each 5-bit channel steps toward each of its "
+                        "eight neighbours by one 8-bit level, so the RDP's "
+                        "ordered dither melts into 8-bit tone. Reads the N64's "
+                        "15-bit (5551) frame; on a 5:6:5 frame the 6-bit green "
+                        "steps on its own 8-bit expansion, an extension of the "
+                        "VI's rule",
+    'vi_gamma': "The N64 Video Interface's gamma stage: an integer square-root "
+                "curve (2*isqrt(64*v)) with or without six random bits under "
+                "the root (GAMMA_DITHER_ENABLE), or the single-bit dither "
+                "alone. Replaces the display Gamma dial for an N64 look",
+    'copy_filter': "The GameCube and Wii EFB-to-XFB copy filter: a three-line "
+                   "vertical blur in 1/64 units run on every frame before the "
+                   "video encoder, the SDK's deflicker set or the antialiased "
+                   "modes' set; the 1/64 divide floors, a choice (Dolphin "
+                   "computes in float and lets the store round; the hardware's "
+                   "rounding is undocumented)",
+    'crtc_blend': "The PlayStation 2 CRTC's PMODE mix: the frame blended per "
+                  "pixel with the previous frame's output (a persistence "
+                  "trail) or with the BGCOLOR register, as "
+                  "(cur*A + other*(255-A))/255 in integers",
+    'crtc_alpha': "The PMODE ALP register, 0..255: how much of the current "
+                  "frame reaches the screen; 255 shows only the current frame, "
+                  "0 only RC2",
+    'crtc_bg_color': "The GS BGCOLOR register: what RC2 shows in Background "
+                     "mode, and what a frame with no rendered predecessor "
+                     "blends against",
+    'video_filter': "The 3dfx Voodoo's filter between the 5:6:5 framebuffer "
+                    "and the RAMDAC that dissolved its ordered dither into "
+                    "gradients (the '22-bit colour' of 1997); 86Box's "
+                    "reconstructions of the Voodoo Graphics four-pass line and "
+                    "the Voodoo2 look-ahead. At the frame's border columns a "
+                    "missing neighbour counts as the pixel itself (the pack's "
+                    "rule; the emulator leaves its edge columns partly "
+                    "filtered). Reads a 16-bit frame",
+    'video_filter_threshold': "The driver's SST_VIDEO_FILTER_THRESHOLD (86Box "
+                              "scrfilterThreshold), one cap for all three "
+                              "channels (86Box carries a byte per channel out "
+                              "of one 24-bit value): on the Voodoo Graphics a "
+                              "difference is halved as if it were at most the "
+                              "threshold, so an edge moves by at most half the "
+                              "threshold per pass; on the Voodoo2 a difference "
+                              "beyond the threshold moves nothing. 0 disables "
+                              "the passes. Calibrate against a capture",
+    # R251 SIG-2
+    'chroma_format': "How the digital tape, disc or console output stored "
+                     "colour: Y'CbCr at 8-bit legal levels with chroma "
+                     "sampled at the format's rate and SITE, the way D1, DV, "
+                     "Video CD, DVD and the GameCube XFB did. The file "
+                     "formats run before the display's own quantiser; the "
+                     "XFB runs after the copy filter",
+    'chroma_upsample': "How the decoder rebuilt full-resolution chroma from "
+                       "the sites: held (cheap decoders, visible chroma "
+                       "blocking) or linearly interpolated (better ones)",
+    'signal': "The cable between the machine and the television: S-Video "
+              "band-limits the encoded chroma only (no crawl; the NTSC item "
+              "models a wideband I/Q decoder on the encoder's own bands); "
+              "RF adds the modulator's luma low-pass, the 920 kHz "
+              "sound-chroma beat, snow and a multipath ghost after the "
+              "composite cable. Composite itself is the Composite Video "
+              "switch; RGB and component carry nothing per pixel",
+    'rf_bandwidth': "The RF modulator's video bandwidth in MHz, a horizontal "
+                    "luma low-pass; cheap modulators sat near 3 MHz, the NTSC "
+                    "limit is 4.2",
+    'rf_beat': "The 920 kHz herringbone: the 4.5 MHz sound carrier beating "
+               "with the 3.58 MHz colour subcarrier, added to luma in "
+               "proportion to chroma amplitude",
+    'rf_snow': "Thermal noise on the whole RF signal as a fraction of white: "
+               "luma grain and colour speckle, hashed per pixel and frame",
+    'rf_ghost': "A multipath ghost: the picture added back at this strength, "
+                "displaced to the right by the ghost delay",
+    'rf_ghost_delay': "The ghost's delay in microseconds along the 52.66 us "
+                      "NTSC active line (1 us is about 12 pixels at 640)",
+    'pal_decoder': "The PAL television's chroma decoder: the delay-line set "
+                   "that averages two lines of colour, or the simple set that "
+                   "shows phase error as Hanover bars. The NTSC composite "
+                   "stage stays the cable; this is the receiver",
+    'pal_phase_error': "Differential phase error in degrees; a simple PAL "
+                       "decoder turns it into Hanover bars (+phi on even "
+                       "lines, -phi on odd), a delay-line decoder cancels it. "
+                       "Read under the Simple decoder only",
+    'pal_crawl': "PAL dot crawl: the 4.43 MHz subcarrier left in luma, "
+                 "advancing three quarters of a cycle per line and repeating "
+                 "over eight fields, in proportion to chroma amplitude",
+    'tape': "The analogue tape format the frame was recorded on: its luma "
+            "FM bandwidth (TVL) as a horizontal low-pass, colour-under "
+            "chroma band-limited and delayed to the right, the head-switch "
+            "tear, dropouts, and every dub compounding all of it. Runs "
+            "before the cable",
+    'tape_generations': "How many dubs deep: the tape's low-pass is applied "
+                        "once per generation (sigma times the square root of "
+                        "N) and its noise grows with the square root of N; 1 "
+                        "is a first-generation recording",
+    'tape_noise': "The FM demodulation noise on the luma as a fraction of "
+                  "white (chroma at half), hashed per pixel and frame; grows "
+                  "with the square root of the generation count",
+    'tape_head_switch': "The head-switch tear: the bottom seven lines (at "
+                        "480) of the overscanned picture torn sideways by a "
+                        "few pixels, re-hashed per frame, with four times the "
+                        "luma noise",
+    'tape_dropouts': "Expected tape dropouts per frame: bright horizontal "
+                     "dashes 8 to 48 pixels long at hashed rows and columns, "
+                     "the oxide the heads could not read",
+    # R251 SIG-3: the codecs and the optical printer
+    'mpeg1': "The JPEG stage's cousin with MPEG-1's own rules: recode the "
+             "frame as Video CD intra blocks -- 8x8 DCT in 4:2:0 with the "
+             "standard's intra matrix times a linear quantiser scale, an "
+             "8-bit DC in steps of 8, the mismatch-control oddification "
+             "and the GOP pumping the scale per frame. One codec at a "
+             "time: JPEG Artefacts are greyed while this is on",
+    'mpeg1_qscale': "quantizer_scale for I frames, 1..31: the linear "
+                    "multiplier on MPEG-1's intra matrix; Video CD "
+                    "encoders sat around 8-12 at 1.15 Mbit/s",
+    'mpeg1_gop': "Frames per group of pictures (Video CD: 15, with every "
+                 "third a P frame); B frames take 1.4 times the I scale "
+                 "(MPEG Test Model 5), so quality pumps through the "
+                 "group. 0 codes every frame as an I frame",
+    'smacker': "Recode the frame as Smacker blocks (RAD Game Tools, 1994): "
+               "a 256-colour palette fitted to the frame, then every 4x4 "
+               "block filled with one colour, split into two (the mono "
+               "block with its bit mask) or kept at sixteen, by the "
+               "encoder's error budget",
+    'smacker_quality': "The Smacker encoder's budget: low values fill and "
+                       "mono-code more blocks (the chunky cutscene), 1 "
+                       "keeps nearly every block at full sixteen colours. "
+                       "Halcyon's own thresholds, the codec's block grammar",
+    'matte_glow': "The optical printer's backlit matte (Tron, 1982): every "
+                  "material with a Glow Gel colour is a clear-or-opaque "
+                  "Kodalith matte exposed in its gel's colour, once crisp "
+                  "and once per diffusion pass at doubling radius, summed "
+                  "on the negative before the film stages. An F12 stage: "
+                  "the viewport draws the frame without it",
+    'matte_glow_radius': "The first diffusion pass's blur in pixels at 1080 "
+                         "lines of the Tron printer stage; each further "
+                         "pass doubles it and halves its exposure",
+    'matte_glow_passes': "How many diffusion passes each Kodalith matte is "
+                         "exposed through, at radius x1, x2, x4... and "
+                         "exposure 1/2, 1/4, 1/8...",
+    'matte_glow_exposure': "The gel's exposure in the Tron printer stage: "
+                           "what one crisp pass adds; the diffusion "
+                           "passes add half, a quarter... of it",
     'vertex_snap': "Round transformed vertices to a pixel grid, as the "
                    "PlayStation's integer GTE did",
     'tex_perspective': "Turn off for the affine texture warp of hardware with "
                        "no perspective divide per texel",
+    'specular_viewer': "The view vector the reflectance models use: the true "
+                       "per-pixel eye direction, or one fixed camera axis for "
+                       "the whole frame -- OpenGL 1.1's default infinite "
+                       "viewer, the Sega Model boards' R.z and the DS's "
+                       "(0,0,-1) line of sight -- so highlights sit still "
+                       "under perspective. Every model's own view term takes "
+                       "the axis (a Cook-Torrance or Strauss Fresnel "
+                       "included: that is the infinite viewer); the Master "
+                       "shader's rim, Fresnel and sheen cheats and the "
+                       "two-sided flip keep the true eye",
     'specular_in_gamma': "Compute highlights in display space. 1990s renderers "
                          "had no linear workflow, and the blown-out speculars "
                          "are a large part of the look",
+    'crand_per_frame': "Fold the frame number into the crand hash so the grain "
+                       "re-rolls every frame, reproducing POV-Ray's "
+                       "sequential-random flicker on purpose; off, the same "
+                       "frame always renders the same grain (the Master "
+                       "shader's Crand socket draws the grain)",
     'color_management': "Leave at None for period-correct output. Blender's own "
                         "view transform is bypassed by this engine",
     'depth_sort': "Painter's algorithm reproduces the sorting errors of "
@@ -1583,13 +3013,68 @@ class HalcyonMaterialSettings(PropertyGroup):
                 "sorting, no per-layer GPU passes -- which is why "
                 "fur, foliage, fences and cut-out sprites were cheap "
                 "on 1990s hardware. Fur Shells materials use this "
-                "automatically")],
+                "automatically"),
+               # R251 C031 (transparency pack)
+               ('CLIP_BLEND', "Clip + Blend (PS2 two-pass)",
+                "The PlayStation 2's two-pass cut-out: alpha at or above "
+                "the Clip Threshold resolves in the z-buffer and shades "
+                "once, like Clip; everything below it is drawn a second "
+                "time as a blended layer with no depth write (GS AFAIL "
+                "'framebuffer only'), so hair and foliage keep a soft "
+                "edge without sorting")],
         default='BLEND',
         description="How this material's alpha reaches the frame")
     alpha_clip: FloatProperty(
         name="Clip Threshold", default=0.5, min=0.0, max=1.0,
         description="Alpha at or above this renders solid; below it, "
                     "nothing renders at all")
+    # R251 (transparency pack): the per-material blend equation
+    blend_mode: EnumProperty(
+        name="Blend Mode", items=BLEND_MODE_MAT, default='INHERIT',
+        description="How this material's fragments blend into the frame: "
+                    "the render setting's Blend Equation, or one chip's "
+                    "fixed formula for this material alone -- a "
+                    "PlayStation scene mixes additive glows and averaged "
+                    "glass per primitive, and this is that switch. Env "
+                    "Hole shows the world through the surface and writes "
+                    "alpha 0 (Blender 2.4x 'Env')")
+    # R251 (transparency pack, TRANS-2): Blender 2.4x's Zoffs / ZInvert
+    # (C126), Max's Thin Wall Refraction Thickness Offset (C095), Imagine's
+    # Fog Length (C101) -- the per-material dials of the blend items
+    z_offset: FloatProperty(
+        name="Z Offset", default=0.0, min=-1000.0, max=1000.0,
+        description="Blender 2.4x Z Offset: this material's see-through "
+                    "fragments sort and depth-test as if this much nearer "
+                    "the camera, so a decal or label laid on a surface "
+                    "never fights it. Shading and fog use the true depth. "
+                    "The raster tests and collects this material's "
+                    "see-through fragments at the offset depth, so a decal "
+                    "a little behind its surface is captured and drawn; an "
+                    "opaque material ignores it")
+    z_invert: BoolProperty(
+        name="Invert Z Depth", default=False,
+        description="Blender 2.4x Invert Z Depth: this material's own "
+                    "see-through fragments sort far-first, so a closed "
+                    "shell shows its far inner wall in front of its near "
+                    "wall -- the hollow-object trick. Read under Depth "
+                    "order only")
+    thin_wall_offset: FloatProperty(
+        name="Thickness Offset", default=0.5, min=0.0, max=10.0,
+        description="3ds Max Thin Wall Refraction's Thickness Offset: how "
+                    "far the picture behind this material is jogged along "
+                    "its projected normal, scaled by the material's IOR (0 "
+                    "= an invisible pane, 10 = the largest jog). No ray "
+                    "leaves the surface; the object's own thickness never "
+                    "distorts anything, exactly the map")
+    fog_length: FloatProperty(
+        name="Fog Length", default=1.0, min=0.0, max=100000.0,
+        description="Imagine's Fog Length: the path length through this "
+                    "closed object at which its fog becomes fully opaque "
+                    "-- opacity is the ray's thickness through the object "
+                    "divided by this, capped at 1, with no lamps, shadows "
+                    "or scattering (Imagine 3.0 'Fog Attribute'); nested "
+                    "shells of one fog material count once. Use a "
+                    "Constant (shadeless) model for Imagine's unlit colour")
     model: EnumProperty(name="Model", items=[(a, b, c) for a, b, c in MODEL_ITEMS],
                         default='PHONG')
     diffuse: FloatVectorProperty(name="Diffuse", subtype='COLOR', size=3,
@@ -1618,6 +3103,42 @@ class HalcyonMaterialSettings(PropertyGroup):
     shadeless: BoolProperty(name="Shadeless", default=False)
     cast_shadow: BoolProperty(name="Cast Shadows", default=True)
     receive_shadow: BoolProperty(name="Receive Shadows", default=True)
+    # R251 C134: the gel of the Tron printer's backlit matte
+    glow_gel: FloatVectorProperty(
+        name="Glow Gel", subtype='COLOR', size=3, min=0.0, max=1.0,
+        default=(0.0, 0.0, 0.0),
+        description="The gel this material's Kodalith matte is backlit "
+                    "through in the Tron printer stage; black means no "
+                    "matte for this material (Optical Effects > Matte "
+                    "Glow must be on)")
+    # R251 C020/C036: the material's triangles as an authored volume
+    volume_role: EnumProperty(
+        name="Volume Role", default='NONE', items=VOLUME_ROLE,
+        description="What this material's triangles are: a drawn surface, "
+                    "or a closed authored volume that is never drawn as "
+                    "geometry and instead darkens the pixels it encloses "
+                    "-- the Dreamcast's modifier volumes (stencil parity "
+                    "times the shadow scale; the outside kind darkens the "
+                    "whole frame except the inside) or the Nintendo DS's "
+                    "shadow polygons (depth-fail mask, then a 5-bit alpha "
+                    "blend of this colour). Every frame, viewport drafts "
+                    "included, pays one fragment capture per volume while "
+                    "the render's Shadows are on (off draws no volume)")
+    polygon_id: IntProperty(
+        name="Polygon ID", default=0, min=0, max=63,
+        description="The Nintendo DS polygon ID (0-63) written to the "
+                    "attribute buffer with this material's pixels; a DS "
+                    "shadow polygon darkens only pixels whose ID differs "
+                    "from its own, which is how a character is kept out "
+                    "of its own shadow -- give the caster and its shadow "
+                    "volume the same ID")
+    shadow_alpha: IntProperty(
+        name="DS Shadow Alpha", default=16, min=1, max=30,
+        description="Alpha of this material as a DS shadow polygon, in "
+                    "the DS's 5-bit units 1-30: the pixel becomes "
+                    "(colour x (alpha+1) + pixel x (31-alpha)) / 32 on "
+                    "6-bit channels -- 16 is the half-dark shadow most "
+                    "games used, 30 nearly solid")
     # R233: the cel or the painting
     paint_mode: EnumProperty(
         name="Paint Mode", default='CEL', items=_items(
@@ -1972,9 +3493,44 @@ class HalcyonLightSettings(PropertyGroup):
         description="BI's Sphere clamp: the light fades linearly to "
                     "zero at its Falloff End and never reaches past "
                     "it, whatever the falloff curve")
+    gx_ref_brite: FloatProperty(
+        name="Ref Brightness (GX)", default=0.5, min=0.05, max=0.95,
+        description="GX_InitLightDistAttn's ref_brite: the fraction of the "
+                    "lamp's energy left at Falloff End (its ref_dist) under "
+                    "the three GameCube distance laws")
+    spot_law: EnumProperty(
+        name="Cone Law", items=SPOT_LAW, default='BLENDER',
+        description="How the spot's cone fades: Blender Internal's smoothstep "
+                    "band times the cosine, OpenGL 1.1's hard cutoff with a "
+                    "cosine power, POV-Ray's flat hotspot with a Hermite "
+                    "edge, or the GameCube's six GX angular functions built "
+                    "from the cone angle (the ring functions light a ring "
+                    "and leave the axis dark). Spot Blend is Blender "
+                    "Internal's only: the other laws never read it")
+    spot_exponent: FloatProperty(
+        name="Cone Exponent", default=0.0, min=0.0, max=128.0,
+        description="OpenGL's GL_SPOT_EXPONENT / POV-Ray's tightness: the "
+                    "cosine of the angle to the axis raised to this power "
+                    "inside the cone; 0 (both defaults) is flat")
+    screen_spot: BoolProperty(
+        name="Screen Spotlight (Model 3)", default=False,
+        description="Sega Model 3's viewport spotlight: an ellipse pinned to "
+                    "the screen at this lamp's projected position, half the "
+                    "Spot Size wide as a fraction of the frame height, adding "
+                    "the lamp's colour at its Energy over 4 pi (the same "
+                    "radiance scale every Halcyon lamp uses) to the diffuse "
+                    "inside a depth window from the near clip over the lamp's "
+                    "Falloff End -- the headlight pool that slides with the "
+                    "camera. No shadows, no cone; it still counts as one of "
+                    "Max Lights")
     shadow: EnumProperty(name="Shadows", items=_items(
         ('NONE', "None", ""), ('MAP', "Shadow Map", ""),
-        ('RAY', "Ray Traced", "")), default='MAP')
+        ('RAY', "Ray Traced", ""),
+        # R251 C052: appended last
+        ('PLANAR', "Planar Polygons (Model 1 / Blinn)",
+         "This lamp projects the casters onto the Floor Plane Z and "
+         "draws them as flat polygons, Blinn 1988 / Sega Model 1")),
+        default='MAP')
     shadow_map_size: IntProperty(
         name="Map Size", default=0, min=0, max=4096,
         description="Shadow map resolution for this light. 0 uses the "
@@ -1983,6 +3539,15 @@ class HalcyonLightSettings(PropertyGroup):
         name="Bias", default=0.0, min=0.0, max=10.0,
         description="Depth offset that stops a surface shadowing itself. "
                     "0 uses the render setting's Shadow Bias")
+    # R251 C117: the per-lamp map depth (Maya's Use Mid Dist and
+    # Blender's buffer type were per lamp)
+    shadow_map_depth: EnumProperty(
+        name="Map Depth", default='INHERIT', items=LIGHT_MAP_DEPTH,
+        description="This lamp's own map depth: Inherit follows the "
+                    "render's Map Depth; Classic and Midpoint override it "
+                    "for this lamp alone -- Maya's Use Mid Dist and "
+                    "Blender's buffer type were per lamp, and a scene can "
+                    "mix a tight midpoint spot with a classic sun")
     shadow_softness: FloatProperty(name="Softness", default=1.0, min=0.0, max=32.0)
     shadow_samples: IntProperty(name="Samples", default=4, min=1, max=64)
     shadow_density: FloatProperty(name="Density", default=1.0, min=0.0, max=1.0)
@@ -1991,6 +3556,15 @@ class HalcyonLightSettings(PropertyGroup):
     negative: BoolProperty(name="Negative", default=False,
                            description="Subtract light instead of adding it, as "
                                        "3D Studio and LightWave allowed")
+    only_shadow: BoolProperty(
+        name="Only Shadow", default=False,
+        description="Blender Internal's Only Shadow lamp: the lamp lights "
+                    "nothing and only darkens the diffuse where its shadow "
+                    "falls, by the plain diffuse it would have given (a "
+                    "Blender Internal material's diffuse ramp and "
+                    "terminator bias are not part of the subtraction) -- "
+                    "a shadow without a light. With shadows off, or on a "
+                    "lamp that affects no diffuse, it does nothing")
     hemi: BoolProperty(
         name="Hemisphere (BI Hemi)", default=False,
         description="Shade this Sun as Blender Internal's Hemi lamp: "
@@ -2002,7 +3576,9 @@ class HalcyonLightSettings(PropertyGroup):
     ambient_only: BoolProperty(name="Ambient Only", default=False)
     hotspot: FloatProperty(name="Hotspot", default=0.0, min=0.0, max=3.1416,
                            description="Inner cone angle, the 3D Studio "
-                                       "hotspot/falloff pair")
+                                       "hotspot/falloff pair; POV-Ray's "
+                                       "radius under the POV cone law, "
+                                       "never wider than the Spot Size")
     area_gamma: FloatProperty(
         name="Gamma", default=1.0, min=0.01, max=2.0,
         description="Blender Internal's area lamp Gamma (la->k): shapes "
@@ -2305,7 +3881,60 @@ class HalcyonWorldSettings(PropertyGroup):
          "A background painting on a flat panel in front of the camera: "
          "the gradient brushed in gouache, painted clouds, the board's "
          "tooth, a watercolour granulation -- a pan crosses it, a tilt "
-         "climbs it, the way the animation stand's background did")))
+         "climbs it, the way the animation stand's background did"),
+        # R251 sky-camera: appended at the END (positional numbering)
+        ('CYLINDER', "Cylinder Sky (Doom)",
+         "Doom's angle-mapped sky: the image wrapped as a cylinder by "
+         "camera yaw alone, rows 1:1 with a 200-line screen, unlit, never "
+         "tilting with pitch. The image runs right-to-left around the "
+         "turn as Doom's own did, and reflections see the flat World "
+         "colour -- a backdrop, not an environment. In a stereo pair the "
+         "sky sits at infinity (each eye's window shift moves it), and "
+         "accumulation AA jitters it with the rest of the frame"),
+        ('LW_GRADIENT', "Gradient Backdrop (LightWave)",
+         "LightWave's four-colour backdrop: Sky to Zenith above the "
+         "horizon, Ground to Nadir below, a hard horizon step, each blend "
+         "squeezed toward the horizon by a whole-number power. The "
+         "defaults are the LightWave 5-7 manual's example values, to be "
+         "calibrated against a real render; Rotation does not turn it (a "
+         "backdrop symmetric about the vertical)")))
+    # ---- R251 C056 Cylinder Sky (Doom): the image rides env_image
+    sky_cylinder_repeats: IntProperty(
+        name="Repeats", default=4, min=1, max=16,
+        description="How many times the sky image goes round a full turn. "
+                    "Doom's 256-wide sky repeated four times (1024 columns "
+                    "per turn, ANGLETOSKYSHIFT 22); Build skies use their "
+                    "own count")
+    sky_cylinder_mid: FloatProperty(
+        name="Centre Row", default=0.78125, min=0.0, max=1.0,
+        description="Fraction of the image's height drawn ABOVE the "
+                    "screen's centre line; the rest hangs below. Doom put "
+                    "texture row 100 of 128 on the centre line "
+                    "(skytexturemid), 0.78125")
+    # ---- R251 C100 LightWave Gradient Backdrop: four colours, two squeezes
+    lw_zenith: _col("Zenith Color", (0.0, 0.156862745, 0.31372549),
+                    "Zenith Color: the colour straight up; LightWave's "
+                    "Backdrop blends Sky Color into it above the horizon")
+    lw_sky: _col("Sky Color", (0.470588235, 0.705882353, 0.941176471),
+                 "Sky Color: the colour all around the horizon's upper edge "
+                 "(LightWave Backdrop)")
+    lw_ground: _col("Ground Color", (0.196078431, 0.156862745, 0.117647059),
+                    "Ground Color: the colour all around the horizon's lower "
+                    "edge; there is no blend between it and Sky Color "
+                    "(LightWave)")
+    lw_nadir: _col("Nadir Color", (0.392156863, 0.31372549, 0.235294118),
+                   "Nadir Color: the colour straight down; Ground Color "
+                   "blends into it (LightWave Backdrop)")
+    lw_sky_squeeze: IntProperty(
+        name="Sky Squeeze", default=2, min=1, max=20,
+        description="Sky Squeeze: compresses the Sky-to-Zenith blend toward "
+                    "the horizon as a whole-number power (LightWave's "
+                    "default 2; 20 leaves a thin band at the horizon)")
+    lw_ground_squeeze: IntProperty(
+        name="Ground Squeeze", default=2, min=1, max=20,
+        description="Ground Squeeze: compresses the Ground-to-Nadir blend "
+                    "toward the horizon as a whole-number power "
+                    "(LightWave's default 2)")
     strength: FloatProperty(name="Strength", default=1.0, min=0.0, max=64.0)
     rotation: FloatProperty(name="Rotation", default=0.0, min=-6.2832, max=6.2832,
                             subtype='ANGLE',
@@ -2687,7 +4316,44 @@ class HalcyonWorldSettings(PropertyGroup):
                            "term so it mirrors at glancing angles"),
         ('MATERIAL', "Material", "The plane wears a material you pick: its "
                                  "node graph is evaluated across the "
-                                 "infinite ground, tiled by Scale")))
+                                 "infinite ground, tiled by Scale"),
+        # R251 C048, appended at the END (positional numbering)
+        ('MODE7', "Mode 7 (SNES / GBA)",
+         "A 1024x1024 map of 256 fifteen-bit colours read through per-row "
+         "8.8 fixed-point steps from a whole-texel origin, point-sampled, "
+         "unlit -- the SNES PPU's BG mode 7 driven per scanline as F-Zero, "
+         "Pilotwings and Mario Kart did. Not the Material floor "
+         "(perspective-correct per pixel, filtered, lit): per-row fixed "
+         "point, 256 colours, unlit, and mirrors do not see it. Needs a "
+         "Map image")))
+    # ---- R251 C048 Mode 7 floor
+    ground_image: PointerProperty(
+        name="Mode 7 Map", type=bpy.types.Image,
+        description="The map the Mode 7 floor reads: resampled to 1024x1024 "
+                    "texels by nearest sampling and cut to 256 colours of "
+                    "15-bit RGB once at load, as the SNES's tile map and "
+                    "palette held it")
+    mode7_texel_size: FloatProperty(
+        name="Texel Size", default=1.0, min=0.001, max=1000.0,
+        description="Scene units per map texel: how far along the floor one "
+                    "Mode 7 texel reaches (the whole 1024-texel map spans "
+                    "1024 x this)")
+    mode7_over: EnumProperty(
+        name="Outside the Map", default='WRAP',
+        description="What the SNES PPU drew past the edge of the 1024x1024 "
+                    "Mode 7 map (the M7SEL register): the map wrapped, "
+                    "nothing (the sky shows), or tile 0 repeated",
+        items=_items(
+        ('WRAP', "Wrap (M7SEL 0, GBA wrap)",
+         "Outside the map the map repeats: the address is taken modulo "
+         "1024 in both axes"),
+        ('TRANSPARENT', "Transparent (M7SEL 2)",
+         "Outside the 1024x1024 map nothing is drawn and the sky shows; "
+         "the origin is sign-clipped to the SNES's 13 bits (the GBA's "
+         "28-bit origin differs only past 4096 texels, not modelled)"),
+        ('TILE0', "Tile 0 (M7SEL 3)",
+         "Outside the map the SNES fills with tile 0: the map's top-left "
+         "8x8 texels, repeated")))
     ground_material: PointerProperty(
         name="Ground Material", type=bpy.types.Material,
         description="R203: the material the infinite plane wears in "
@@ -2809,6 +4475,23 @@ class HalcyonWorldSettings(PropertyGroup):
         ('BILINEAR', "Bilinear", ""), ('NEAREST', "Nearest", "")),
         default='BILINEAR')
     env_tint: _col("Tint", (1.0, 1.0, 1.0))
+    # R251 C038: the DS rear-plane depth bitmap
+    backdrop_depth_image: PointerProperty(
+        name="Backdrop Depth", type=bpy.types.Image,
+        description="An image whose red channel is eye-space depth in scene "
+                    "units -- the Z pass of a pre-rendered background -- that "
+                    "the z-buffer honours: geometry passes behind the parts of "
+                    "the background that are nearer, the DS's rear-plane depth "
+                    "bitmap and the pre-rendered-background trick. Tiled 1:1. "
+                    "Must be a float image (a Z pass) in Non-Color space")
+    backdrop_offset_x: IntProperty(
+        name="Offset X", default=0, min=-4096, max=4096,
+        description="Pixel offset of the tiled backdrop depth bitmap (the DS's "
+                    "CLRIMAGE_OFFSET), horizontal")
+    backdrop_offset_y: IntProperty(
+        name="Offset Y", default=0, min=-4096, max=4096,
+        description="Pixel offset of the tiled backdrop depth bitmap (the DS's "
+                    "CLRIMAGE_OFFSET), vertical")
     sky_blend: BoolProperty(name="Sky Gradient", default=False,
                             options={'HIDDEN'})
     # ------------------------------------------------ R200: Weather

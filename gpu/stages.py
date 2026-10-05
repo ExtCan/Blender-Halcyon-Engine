@@ -143,44 +143,6 @@ void main()
 }
 """
 
-# Ordered dither plus bit-depth quantisation: the framebuffer, in one pass.
-DITHER = """
-uniform sampler2D source;
-uniform vec3 levels;
-uniform float strength;
-uniform float matrix_size;
-uniform vec2 resolution;
-in vec2 vUV;
-out vec4 Color;
-
-float bayer(vec2 p, float size)
-{
-    // recursive Bayer, unrolled to four levels
-    float v = 0.0;
-    float scale = 1.0;
-    for (int i = 0; i < 4; i++) {
-        if (scale >= size) { break; }
-        vec2 q = mod(floor(p / scale), 2.0);
-        v = v + (q.x + 2.0 * q.y * (1.0 - q.x) + q.x * (1.0 - q.y) * 2.0) * 0.0;
-        v = v * 4.0 + (2.0 * q.y + q.x);
-        scale = scale * 2.0;
-    }
-    float total = size * size;
-    return (v + 0.5) / total;
-}
-
-void main()
-{
-    vec4 texel = texture(source, vUV);
-    vec2 px = floor(vUV * resolution);
-    float t = bayer(px, matrix_size) - 0.5;
-    vec3 steps = max(levels - vec3(1.0), vec3(1.0));
-    vec3 c = texel.rgb + vec3(t * strength) / steps;
-    c = floor(clamp(c, 0.0, 1.0) * steps + vec3(0.5)) / steps;
-    Color = vec4(clamp(c, 0.0, 1.0), texel.a);
-}
-"""
-
 # Composite chroma bleed: separable, so the horizontal blur is a fixed tap set.
 # The composite cable, structured as the CPU structures it: the chroma is
 # blurred by a box blur RUN THREE TIMES (a triple box is the CPU's fast
@@ -270,6 +232,257 @@ void main()
 }
 """
 
+# R250: the film's grain on the GPU -- wear.grain_plain for grains at or
+# under 1.2 px (the white sheets: two hashes per pixel sliced into one
+# triangular and three uniform unit-variance sheets, no blur), the
+# frame's transmittance read as a print's density, the density noise
+# strongest where half the grains developed, each channel its own sheet
+# by Chroma; the projector's flicker factor last, as film.process_linear
+# orders them. Larger grains and clumps blur the sheets on the CPU and
+# refuse by name. The hash is the ink's uint hash, masked to 24 bits as
+# film._hash_u32_raw masks it; log10 is the one library call (CLOSE).
+GRAIN = """
+uniform sampler2D source;
+uniform vec2 resolution;
+uniform int key_a;
+uniform int key_b;
+uniform int chroma_mode;
+uniform float mix_a;
+uniform float mix_b;
+uniform float amp;
+uniform float tri_scale;
+uniform float tri_off;
+uniform float u_scale;
+uniform float u_off;
+uniform float a_coef;
+uniform float ln10;
+uniform float flicker;
+in vec2 vUV;
+out vec4 Color;
+
+uint hal_grain_hash(uint x, uint y, int k)
+{
+    uint h = x * 0x9E3779B1u ^ (y + 0x85EBCA77u) ^ (uint(k) * 0xC2B2AE3Du);
+    h ^= h >> 15u;
+    h *= 0x2C1B3C6Du;
+    h ^= h >> 12u;
+    h *= 0x297A2D39u;
+    h ^= h >> 15u;
+    return h & 0xffffffu;
+}
+
+// wear.grain_plain, one channel: the transmittance's density, the noise
+// on it, mean-preserving
+float hal_grain_ch(float x, float sh)
+{
+    float t = max(x, 1e-4);
+    float a = log2(t) * 0.30102999566398120;
+    a = a * a_coef;
+    a = clamp(a, 0.0, 1.0);
+    float sig = sqrt(clamp(a * (1.0 - a), 0.0, 1.0)) * amp;
+    sig = sig * sh;
+    sig = sig * ln10;
+    sig = sig + 1.0;
+    return x * sig;
+}
+
+void main()
+{
+    ivec2 px = ivec2(clamp(vUV * resolution, vec2(0.0), resolution - vec2(1.0)));
+    vec4 texel = texelFetch(source, px, 0);
+    uint ha = hal_grain_hash(uint(px.x), uint(px.y), key_a);
+    uint hb = hal_grain_hash(uint(px.x), uint(px.y), key_b);
+    // the triangular sheet: two 12-bit uniforms summed, scaled to unit variance
+    float tri = float(ha & 0xfffu);
+    tri += float((ha >> 12u) & 0xfffu);
+    tri *= tri_scale;
+    tri -= tri_off;
+    // three uniform sheets, 8 bits each
+    float u0 = float(hb & 0xffu);
+    u0 *= u_scale;
+    u0 -= u_off;
+    float u1 = float((hb >> 8u) & 0xffu);
+    u1 *= u_scale;
+    u1 -= u_off;
+    float u2 = float((hb >> 16u) & 0xffu);
+    u2 *= u_scale;
+    u2 -= u_off;
+    vec3 sheet = vec3(tri);
+    if (chroma_mode == 1) {
+        sheet = vec3(u0, u1, u2);
+    } else if (chroma_mode == 2) {
+        sheet = vec3(u0 * mix_b + tri * mix_a, u1 * mix_b + tri * mix_a,
+                     u2 * mix_b + tri * mix_a);
+    }
+    vec3 outc = vec3(hal_grain_ch(texel.r, sheet.x),
+                     hal_grain_ch(texel.g, sheet.y),
+                     hal_grain_ch(texel.b, sheet.z));
+    outc = max(outc, vec3(0.0));
+    Color = vec4(outc * flicker, texel.a);
+}
+"""
+
+# R250: the framebuffer's bit depth without a dither -- palette.snap_bits:
+# clip, scale to the channel's levels, round half to even (NumPy's
+# round), back. roundEven is the CPU's tie rule exactly.
+QUANT = """
+uniform sampler2D source;
+uniform sampler2D lut;
+uniform vec2 resolution;
+uniform vec3 levels;
+in vec2 vUV;
+out vec4 Color;
+void main()
+{
+    ivec2 px = ivec2(clamp(vUV * resolution, vec2(0.0), resolution - vec2(1.0)));
+    vec4 texel = texelFetch(source, px, 0);
+    // the level index is one multiply and one round-half-even (both
+    // exact everywhere); the level's VALUE is fetched from the CPU's own
+    // k / levels table, so the driver's division never enters
+    vec3 idx = roundEven(clamp(texel.rgb, 0.0, 1.0) * levels);
+    float r = texelFetch(lut, ivec2(int(idx.r), 0), 0).r;
+    float g = texelFetch(lut, ivec2(int(idx.g), 0), 0).g;
+    float b = texelFetch(lut, ivec2(int(idx.b), 0), 0).b;
+    Color = vec4(r, g, b, texel.a);
+}
+"""
+
+# R250: the supersample resolve -- render._resolve's filter over each
+# output pixel's ss x ss block, the taps summed row by row in the order
+# the CPU's einsum sums them (row i outer, column j inner; measured
+# bitwise for every filter and factor). The kernel rides a texture.
+RESOLVE = """
+uniform sampler2D source;
+uniform sampler2D kernel;
+uniform vec2 resolution;
+uniform int ss;
+in vec2 vUV;
+out vec4 Color;
+void main()
+{
+    ivec2 px = ivec2(clamp(vUV * resolution, vec2(0.0), resolution - vec2(1.0)));
+    vec4 acc = vec4(0.0);
+    for (int i = 0; i < 8; i++) {
+        if (i >= ss) { break; }
+        for (int j = 0; j < 8; j++) {
+            if (j >= ss) { break; }
+            vec4 t = texelFetch(source, ivec2(px.x * ss + j, px.y * ss + i), 0);
+            float k = texelFetch(kernel, ivec2(j, i), 0).x;
+            acc = acc + t * k;
+        }
+    }
+    Color = acc;
+}
+"""
+
+
+# R251 (RAST-B, 1.90.0): the two resolve variants -- C094 LightWave's
+# Limit Dynamic Range (a per-tap `min` before the same fixed-order sum)
+# and C122 Blender 2.41's gamma-2 OSA blend (each tap squared through the
+# CPU's own 400-entry table, the sum square-rooted through the inverse
+# table). NOT an edit to the pinned RESOLVE stage: `resolve_source` with
+# both flags off returns RESOLVE byte-identical, and the variants are
+# compiled through `device.compile_dynamic` from gpu/frame.resolve with
+# `resolve_spec`'s interface, so STAGES / INTERFACE / VALIDATION and the
+# self test's stage table never see them. `vec3(float(ii.r), ...) * 0.0025`
+# is the same float32 multiply as raster.gamma2_tables' `dom` (the
+# per-component float() matters: the simulator's vec3(ivec3) keeps the
+# integers and a later float op promotes to float64 -- a front-end blind
+# spot this pack's twin test found), the fetches return the
+# CPU's table bits and the accumulation order is RESOLVE's, so both
+# variants are EXACT in the simulator (tests/test_r251_raster_wire.py).
+RESOLVE_CLAMP = """
+            if (clamp_samples > 0.5) { t.rgb = min(t.rgb, vec3(1.0)); }
+"""
+
+RESOLVE_GAMMA2 = """
+            if (gamma_blend > 0.5) {
+                vec3 c = clamp(t.rgb, 0.0, 1.0);
+                ivec3 ii = ivec3(floor(c * 400.0));
+                vec3 dom = vec3(float(ii.r), float(ii.g), float(ii.b)) * 0.0025;
+                vec4 tr = texelFetch(gtab, ivec2(ii.r, 0), 0);
+                vec4 tg = texelFetch(gtab, ivec2(ii.g, 0), 0);
+                vec4 tb = texelFetch(gtab, ivec2(ii.b, 0), 0);
+                vec3 d = c - dom;
+                d = d * vec3(tr.y, tg.y, tb.y);
+                t.rgb = vec3(tr.x, tg.x, tb.x) + d;
+            }
+"""
+
+RESOLVE_GAMMA2_INVERSE = """
+    if (gamma_blend > 0.5) {
+        vec3 a = clamp(acc.rgb, 0.0, 1.0);
+        ivec3 ii = ivec3(floor(a * 400.0));
+        vec3 dom = vec3(float(ii.r), float(ii.g), float(ii.b)) * 0.0025;
+        vec4 tr = texelFetch(gtab, ivec2(ii.r, 0), 0);
+        vec4 tg = texelFetch(gtab, ivec2(ii.g, 0), 0);
+        vec4 tb = texelFetch(gtab, ivec2(ii.b, 0), 0);
+        vec3 d = a - dom;
+        d = d * vec3(tr.w, tg.w, tb.w);
+        acc.rgb = vec3(tr.z, tg.z, tb.z) + d;
+    }
+"""
+
+_RESOLVE_DECL = 'uniform int ss;\n'
+_RESOLVE_TAP = ('            vec4 t = texelFetch(source, ivec2(px.x * ss + j, '
+                'px.y * ss + i), 0);\n')
+_RESOLVE_OUT = '    Color = acc;\n'
+
+
+def resolve_flags(st):
+    """(clamp, gamma): the two resolve dials as read from the settings."""
+    return (bool(getattr(st, 'aa_clamp_samples', False)),
+            bool(getattr(st, 'aa_gamma_blend', False)))
+
+
+def resolve_variant_name(clamp=False, gamma=False):
+    """'RESOLVE' when both are off, else RESOLVE_C / RESOLVE_G / RESOLVE_CG."""
+    if not clamp and not gamma:
+        return 'RESOLVE'
+    return 'RESOLVE_' + ('C' if clamp else '') + ('G' if gamma else '')
+
+
+def resolve_source(clamp=False, gamma=False):
+    """The RESOLVE stage's source with the C094 clamp and/or the C122
+    gamma blend spliced in: with both flags off, RESOLVE byte-identical."""
+    src = RESOLVE
+    if not clamp and not gamma:
+        return src
+    decl = ''
+    if clamp:
+        decl += 'uniform float clamp_samples;\n'
+    if gamma:
+        decl += 'uniform float gamma_blend;\nuniform sampler2D gtab;\n'
+    assert src.count(_RESOLVE_DECL) == 1
+    src = src.replace(_RESOLVE_DECL, _RESOLVE_DECL + decl, 1)
+    ins = ''
+    if clamp:
+        ins += RESOLVE_CLAMP
+    if gamma:
+        ins += RESOLVE_GAMMA2
+    assert src.count(_RESOLVE_TAP) == 1
+    src = src.replace(_RESOLVE_TAP, _RESOLVE_TAP + ins, 1)
+    if gamma:
+        assert src.count(_RESOLVE_OUT) == 1
+        src = src.replace(_RESOLVE_OUT, RESOLVE_GAMMA2_INVERSE + _RESOLVE_OUT, 1)
+    return src
+
+
+def resolve_spec(clamp=False, gamma=False):
+    """INTERFACE['RESOLVE'] plus the variant's uniforms: `clamp_samples`
+    under clamp, `gamma_blend` and the `gtab` sampler under gamma -- a
+    declared sampler must be bound on every draw, so the table exists
+    only in the _G / _CG variants."""
+    spec = {'samplers': [], 'floats': [], 'ints': [], 'vec2': [], 'vec3': []}
+    spec.update({k: list(v) for k, v in INTERFACE['RESOLVE'].items()})
+    if clamp:
+        spec['floats'].append('clamp_samples')
+    if gamma:
+        spec['floats'].append('gamma_blend')
+        spec['samplers'].append('gtab')
+    return spec
+
+
 # Vulkan has no legacy GPUShader(vertex, fragment) constructor: shaders are
 # built from a GPUShaderCreateInfo, which carries the interface itself and
 # wants the GLSL *without* its declarations. One spec per stage, so the
@@ -285,14 +498,20 @@ INTERFACE = {
     'CRT': {'samplers': ['source'],
             'floats': ['scanlines', 'mask_strength', 'vignette'],
             'ints': ['mask_kind'], 'vec2': ['resolution']},
-    'DITHER': {'samplers': ['source'],
-               'floats': ['strength', 'matrix_size'],
-               'vec2': ['resolution'], 'vec3': ['levels']},
     'NTSC_BLUR': {'samplers': ['source'],
                   'floats': ['ri', 'rq', 'ry', 'to_yiq'],
                   'vec2': ['resolution']},
     'NTSC': {'samplers': ['source', 'blurred'],
              'floats': ['ringing']},
+    'GRAIN': {'samplers': ['source'],
+              'floats': ['mix_a', 'mix_b', 'amp', 'tri_scale', 'tri_off',
+                         'u_scale', 'u_off', 'a_coef', 'ln10', 'flicker'],
+              'ints': ['key_a', 'key_b', 'chroma_mode'],
+              'vec2': ['resolution']},
+    'QUANT': {'samplers': ['source', 'lut'], 'vec2': ['resolution'],
+              'vec3': ['levels']},
+    'RESOLVE': {'samplers': ['source', 'kernel'], 'ints': ['ss'],
+                'vec2': ['resolution']},
 }
 
 
@@ -312,9 +531,11 @@ STAGES = {
     'DISPLAY': DISPLAY,
     'LENS': LENS,
     'CRT': CRT,
-    'DITHER': DITHER,
     'NTSC_BLUR': NTSC_BLUR,
     'NTSC': NTSC,
+    'GRAIN': GRAIN,
+    'QUANT': QUANT,
+    'RESOLVE': RESOLVE,
 }
 
 # How far each stage has been shown to agree with the CPU function it replaces,
@@ -331,7 +552,6 @@ STAGES = {
 VALIDATION = {
     'DISPLAY': ('EXACT', 0.0001),    # 0.00001 measured on hardware at 32F
     'CRT': ('CLOSE', 0.03),          # 0.0113 measured
-    'DITHER': ('CLOSE', 0.04),       # 0.0327 measured
     'LENS': ('CLOSE', 0.01),         # 0.00426 measured after the half-texel fix
     'NTSC': ('CLOSE', 0.001),        # 0.00037 measured on an RTX 5060 Ti
                                      # under Vulkan, run as its real shape:
@@ -340,7 +560,39 @@ VALIDATION = {
                                      # self test bought this line
     'NTSC_BLUR': ('CLOSE', 0.001),   # measured as part of the NTSC pipeline;
                                      # never drawn on its own
+    # R250: QUANT and RESOLVE are bitwise the CPU in the simulator
+    # (roundEven on the CPU's own level LUT; the resolve's summation
+    # order). GRAIN is one float32 ulp off in the simulator (1.2e-7):
+    # `log2(t) * 0.30102999566398120` is not `np.log10(t)` at 5133 of
+    # 9216 float32 inputs, the one library call the stage makes. The
+    # tolerance is the driver's (FMA contraction, its log2 / division);
+    # the field test measured 0.00000 on an RTX 5060 Ti under Vulkan
+    'GRAIN': ('CLOSE', 0.0005),      # log10 through log2: the one library call
+    'QUANT': ('EXACT', 0.00001),
+    'RESOLVE': ('EXACT', 0.00001),
 }
+
+# R251: the post-palette pack's era colour stages (PALETTE, ORDERED, EHB,
+# CRY16, YJK), merged before ENABLED is derived
+from . import stages_palette as _SP  # noqa: E402
+STAGES.update(_SP.STAGES)
+INTERFACE.update(_SP.INTERFACE)
+VALIDATION.update(_SP.VALIDATION)
+
+# R251: the post-signal pack's stages (gpu/stages_signal.py)
+from .stages_signal import STAGES_SIGNAL, INTERFACE_SIGNAL, VALIDATION_SIGNAL  # noqa: E402
+STAGES.update(STAGES_SIGNAL); INTERFACE.update(INTERFACE_SIGNAL); VALIDATION.update(VALIDATION_SIGNAL)
+# R251 SIG-2: the tape / cable / PAL / chroma-siting stages (gpu/stages_tape.py)
+from .stages_tape import STAGES_TAPE, INTERFACE_TAPE, VALIDATION_TAPE  # noqa: E402
+STAGES.update(STAGES_TAPE); INTERFACE.update(INTERFACE_TAPE); VALIDATION.update(VALIDATION_TAPE)
+
+# R251 SIG-3: the codec / optical-printer stages (gpu/stages_codec.py)
+from .stages_codec import STAGES_CODEC, INTERFACE_CODEC, VALIDATION_CODEC  # noqa: E402
+STAGES.update(STAGES_CODEC); INTERFACE.update(INTERFACE_CODEC); VALIDATION.update(VALIDATION_CODEC)
+
+# R251 C001 (raster pack): the N64 VI's coverage blend and divot (gpu/stages_vi.py)
+from .stages_vi import STAGES_VI, INTERFACE_VI, VALIDATION_VI  # noqa: E402
+STAGES.update(STAGES_VI); INTERFACE.update(INTERFACE_VI); VALIDATION.update(VALIDATION_VI)
 
 #: stages the engine is allowed to run. Widening this needs evidence, not hope.
 ENABLED = tuple(k for k, (grade, _tol) in VALIDATION.items()

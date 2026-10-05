@@ -494,6 +494,7 @@ class Viewport:
             except Exception:                                   # noqa: BLE001
                 pass
             marshal.acct_reset()      # per-frame crossing/wait accounting
+            settings._keep_gpu_frame = True     # R250: for the post chain
             img = core_render.render(scene, settings, progress=tick)
             try:
                 from . import fault_note
@@ -508,6 +509,8 @@ class Viewport:
                 pass
             img = post.process(img, settings,
                                frame=getattr(scene, 'frame', 0),
+                               cvg=getattr(scene, 'last_cvg', None),  # R251 C001
+                               coverage=None,
                                seed=getattr(settings, 'seed', 0),
                                target_size=(settings.resolution_x,
                                             settings.resolution_y),
@@ -518,18 +521,20 @@ class Viewport:
                                # the sources the render had computed
                                flare_sources=getattr(scene, 'last_flares',
                                                      None))
-            # THE BLACK-FRAME GUARD (a field instrument): the field reports
-            # materials randomly turning pure black / flashing, VIEWPORT
-            # only, GPU device -- and the headless cadence stress runs
-            # clean, so whatever it is lives in live driver state this
-            # code cannot reproduce. So the viewport measures instead: a
-            # GPU frame whose black fraction JUMPS against the previous
-            # parked frame is re-shaded on the CPU (kept, so the flash
-            # never reaches the screen) and counted, with one console
-            # line naming the event. The line is the next instrument:
-            # paste it. A legitimately dark scene converges (the guard
-            # compares against what was last PARKED) and costs at most
-            # one spurious CPU frame at a hard cut.
+            # THE BLACK-FRAME GUARD (a field instrument). The field's
+            # "materials randomly turning pure black" was found at its
+            # root in R248: the GPU plan cached passes only for the
+            # materials on screen at its first frame, and a material
+            # that came into view later had no pass and stayed at the
+            # target's cleared zero (gpu/shade.py: a plan now covers
+            # every material, a hit lacking one re-plans, and a pixel
+            # no pass wrote refuses the frame by name). The guard stays
+            # as the instrument it was: a GPU frame whose black fraction
+            # JUMPS against the previous parked frame of the same view
+            # is re-shaded on the CPU (kept, so a flash never reaches
+            # the screen) and counted, with one console line naming the
+            # event -- paste it. A legitimately dark scene converges and
+            # costs at most one spurious CPU frame at a hard cut.
             if self.last_engaged == 'GPU':
                 blk, tiles = _black_measure(img)
                 prev = self._black_prev
@@ -578,6 +583,8 @@ class Viewport:
                     img = core_render.render(scene, retry, progress=tick)
                     img = post.process(img, retry,
                                        frame=getattr(scene, 'frame', 0),
+                                       cvg=getattr(scene, 'last_cvg', None),  # R251 C001
+                               coverage=None,
                                        seed=getattr(retry, 'seed', 0),
                                        target_size=(retry.resolution_x,
                                                     retry.resolution_y),
@@ -702,6 +709,11 @@ class Viewport:
             self.complain('the viewport render failed',
                           traceback.format_exc())
         finally:
+            try:
+                from .gpu import frame as _FR
+                _FR.release(settings)     # R250: nothing stays resident
+            except Exception:                                   # noqa: BLE001
+                pass
             if holding:
                 marshal.disable()
                 marshal.PIPELINE.release()

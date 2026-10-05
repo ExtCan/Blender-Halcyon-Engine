@@ -44,6 +44,9 @@ INERT_FIELDS = (('edge_opacity', 1.0), ('opacity', 1.0))
 #: nearly every converted material, so refusing them refused real scenes.
 EXTRA_SCALARS = ('fresnel', 'fresnel_power', 'rim', 'rim_power',
                  'sheen', 'sheen_roughness', 'matcap_blend', 'backface_mix',
+                 # R251 lighting: the period finish dials (F006, F019-F021)
+                 'fog_burn', 'fog_bias', 'fog_bank', 'brilliance', 'crand',
+                 'pov_metallic',
                  'fresnel_blend', 'rim_blend', 'matcap_mode',
                  'reflect', 'refraction', 'edge_opacity',
                  # the BI panel round's CPU-consumed ray constants
@@ -72,8 +75,18 @@ EXTRA_COLORS = ('anime_shine_color2',
 #: CONSTANT are shadeless -- light_surface returns early, so the pass
 #: emits diffuse x level + emission and no lighting support at all
 #: (apply_wireframe carves the wires on the readback either way).
-UNSUPPORTED_MODELS = frozenset({'GOURAUD', 'FLAT'})
+from ..core import shading as _SHM
+from ..core import reyes as REYES        # R251 C119 (MAT-B)
+# R251 (LIGHT-B2): SEGA_MODEL2 / SEGA_MODEL3 are their rates (FACE /
+# VERTEX, render.RATE_FOR_MODEL): the corner road is the machine on
+# both devices and a PIXEL-rate request refuses here by name
+UNSUPPORTED_MODELS = frozenset({'GOURAUD', 'FLAT'}) | _SHM.UNSUPPORTED_MODELS
 SHADELESS_MODELS = frozenset({'WIREFRAME', 'CONSTANT'})
+
+
+def _plot_ss(st):
+    from ..core import combine as _CBS
+    return int(_CBS.plot_ss(st))
 
 
 def _model_index(model):
@@ -269,7 +282,9 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
         if not master_normal_linked(_g) and not master_faceted(_g):
             return None, None, ('the graph bends the shading normal outside '
                                 "the master shader's Normal socket")
-    rate = str(RATE_FOR_MODEL.get(model, st.shading_rate))
+    from ..core import combine as _CBR
+    rate = str(_CBR.rate_for_model(model, st)
+               or RATE_FOR_MODEL.get(model, st.shading_rate))
     if rate not in ('PIXEL', 'VERTEX', 'FACE'):
         return None, None, f'unknown shading rate {rate}'
     if rate != 'PIXEL' and (layer or secondary):
@@ -277,6 +292,10 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
         return None, None, (f'{model or "the material"} shades at {rate} '
                             f'rate, and a {which} pass lights per pixel '
                             f'-- the light loop has no {model} formula')
+    if (layer or secondary) and REYES.rate_of(st) > 0.0:
+        # R251 C119 (MAT-B): only the camera G-buffer carries the
+        # barycentrics the snap reads
+        return None, None, REYES.REFUSE_PASS
     if rate == 'PIXEL':
         if model in SHADELESS_MODELS:
             idx = 0            # never dispatched: the pass emits no lights
@@ -294,6 +313,17 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
         # model needs no GLSL dispatch entry at all
         idx = 0
 
+    if mat is not None and \
+            str(getattr(mat, 'blend_mode', 'INHERIT')) == 'ENV_HOLE':
+        # R251 C126 (Blender 2.4x Env): the hole needs the world
+        # evaluator per COVERED pixel, which only the CPU sky road
+        # provides today (gpu/sky.py draws uncovered pixels only; the
+        # env-reflection road applies the world on the CPU over the
+        # readback). cpu_only, by name -- lifted the day the sky pass
+        # draws through holes (a coverage-mask edit in gpu/sky.py)
+        return None, None, (f"material '{getattr(mat, 'name', mi)}' is "
+                            'an Env hole (the world along the view ray, '
+                            'alpha 0); the frame shades on the CPU')
     stipple_mode = str(getattr(st, 'transparency', 'SORTED')) == 'STIPPLE'
     for name, inert in INERT_FIELDS:
         if layer or secondary:
@@ -335,9 +365,24 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
     # opacity varying WITHOUT a granted chain still refuses through the
     # BAKE_FIELDS constancy rule below)
 
-    bake = {'__rate': rate}
+    bake = {'__rate': rate, '__model': model}
+    if rate != 'PIXEL':
+        # R251 (MAT-A): the period items' CPU gates (a linked DS Toon
+        # Size, the Super FX palette / gamma gates) refuse the pass by
+        # name with the CPU's own text; the DS table rides the bake
+        from ..core import combine as _CB
+        try:
+            _tab = _CB.probe_gate(model, mat, st)
+        except _CB.Refusal as _r:
+            return None, None, f'{model}: {_r}'
+        if _tab is not None:
+            bake['__ds_table'] = tuple(float(v) for v in _tab)
     if rate == 'PIXEL' and model in SHADELESS_MODELS:
         bake['__shadeless'] = True
+    if mat is not None and \
+            str(getattr(mat, 'alpha_mode', 'BLEND')) == 'CLIP_BLEND':
+        # R251 C031: the layer emit keeps the sub-threshold alpha
+        bake['__clip_blend'] = True
     from .material import BAKE_FIELDS, per_pixel_fields
     # fields a linked master-node socket will compute per pixel are exempt
     # from the constancy rule -- varying is their whole point, and the
@@ -574,7 +619,9 @@ def _shadow_meta(light, st, bvh=None):
         return None, None, None
     mode = light.shadow if st.shadow_default == 'PER_LIGHT' else \
         st.shadow_default
-    if mode == 'NONE':
+    # R251 C052: PLANAR before the ray fallback, the CPU's `visibility`
+    # gate exactly (the polygon is a readback edit, not a lighting term)
+    if mode in ('NONE', 'PLANAR'):
         return None, None, None
     sm = getattr(light, 'shadow_map', None)
     # the CPU's gate exactly: ray_shadows is the master switch for traced
@@ -645,11 +692,16 @@ def _shadow_meta(light, st, bvh=None):
         return None, None, f'unknown shadow map type {type(sm).__name__}'
     first = faces_sm[0]
     size = int(first.size)
+    # R251 C117: Woo's MIDPOINT map -- the texels are the halfway point
+    # between the two nearest casters, and the compare carries no bias
+    # and no normal offset (the CPU's `visibility` rule, one resolve)
+    from ..core.lights import midpoint_map as _midpoint_map
+    mid = bool(_midpoint_map(light, st))
 
     # packed lazily, behind a content fingerprint: the CPU caches these maps
     # across frames, and re-packing + re-uploading an unchanged 33 MB cube
     # atlas every frame was most of the warm frame's cost
-    key = ('shadow', size, grid,
+    key = ('shadow', size, grid, 'MID' if mid else 'CLS',
            tuple(round(float(f.depth[::23].sum()), 3) for f in faces_sm))
 
     def build(_faces=faces_sm, _size=size, _grid=grid):
@@ -660,6 +712,8 @@ def _shadow_meta(light, st, bvh=None):
         return atlas
 
     bias = float(getattr(light, 'shadow_bias', 0.0) or st.shadow_bias)
+    if mid:
+        bias = 0.0
     soft = max(float(getattr(light, 'shadow_softness', 1.0))
                * float(st.shadow_softness), 0.0) \
         + float(getattr(sm, 'soft_extra', 0.0) or 0.0)
@@ -670,6 +724,7 @@ def _shadow_meta(light, st, bvh=None):
         'origin': tuple(float(v) for v in origin), 'grid': grid,
         'bias': bias, 'softness': soft,
         'density': float(getattr(light, 'shadow_density', 1.0)),
+        'midpoint': mid,
     }
     return meta, (key, build), None
 
@@ -711,6 +766,13 @@ def _light_sig(l):
            bool(getattr(l, 'affect_specular', True)),
            bool(getattr(l, 'specular_only', False)),
            bool(getattr(l, 'diffuse_only', False)),
+           # R251 LIGHT-B1: the only-shadow block (F014), the cone law
+           # and whether its exponent is nonzero (F012), the screen
+           # spot (F015) each emit a different block -- structure
+           bool(getattr(l, 'only_shadow', False)),
+           str(getattr(l, 'spot_law', 'BLENDER') or 'BLENDER'),
+           float(getattr(l, 'spot_exponent', 0.0) or 0.0) != 0.0,
+           bool(getattr(l, 'screen_spot', False)),
            # light linking bakes a per-light object ladder into the
            # pass source (R78: a bake the plan reads MUST be in the
            # signature)
@@ -740,7 +802,10 @@ def _light_sig(l):
                 round(float(getattr(l, 'spot_size', 0.0)), 6),
                 round(float(getattr(l, 'shadow_bias', 0.0)), 6),
                 round(float(getattr(l, 'shadow_softness', 1.0)), 6),
-                round(float(getattr(l, 'shadow_density', 1.0)), 6))
+                round(float(getattr(l, 'shadow_density', 1.0)), 6),
+                # R251 C117: the per-lamp Map Depth override changes
+                # the emitted offset line
+                str(getattr(l, 'shadow_map_depth', 'INHERIT')))
     if cookie is not None:
         # a projected texture bakes its frame, strength and size into
         # the pass, and its pixels ride the upload cache: swap or edit
@@ -783,6 +848,10 @@ def _mat_sig(m):
             round(float(getattr(m, 'reflect_level', 0.0)), 6),
             round(float(getattr(m, 'emission_level', 0.0)), 6),
             round(float(getattr(m, 'ior', 1.45)), 6),
+            # R251 (transparency pack): the per-material blend equation
+            # and the alpha road are plan gates (Env hole, Clip+Blend)
+            str(getattr(m, 'blend_mode', 'INHERIT')),
+            str(getattr(m, 'alpha_mode', 'BLEND')),
             hash(repr(graph)) if graph else None)
 
 
@@ -805,7 +874,10 @@ _TIME_NODES_ANIMATE = frozenset({
     'HALCYON_StaticNode', 'HALCYON_WaterNode', 'HALCYON_CausticsNode',
     'HALCYON_PlasmaNode', 'HALCYON_RipplesNode', 'HALCYON_UVWaveNode',
     'HALCYON_RippleWarpNode', 'HALCYON_WaveWarpNode',
-    'HALCYON_OrbitNode', 'HALCYON_SpinNode'})
+    'HALCYON_OrbitNode', 'HALCYON_SpinNode',
+    # R251 C099 (MAT-B): Shimmer re-randomises per frame (its prop is
+    # named `animate` so this check reads it as it stands)
+    'HALCYON_ImagineRoughnessNode'})
 
 
 def _scene_time_dependent(scene):
@@ -843,6 +915,22 @@ def _plan_sig(job, mkey):
         # the filter trio bakes into the mip samplers (R78's lesson: a
         # gate or bake the plan reads MUST be in this signature)
         'tex_aniso', 'tex_mip_bias', 'tex_mipmap',
+        # R251 texture pack: the prep-time CONTENT laws (belt and braces
+        # beside tex_sig's strided sum) and every sample-time dial that
+        # sample_opts reads (gates of the emission site and of the aniso
+        # rule on both roads)
+        'tex_format', 'tex_tmem_format', 'tex_compress', 'tex_frac_bits',
+        'tex_clamp_mode', 'tex_colorkey', 'tex_colorkey_range',
+        'tex_mip_select', 'tex_lod_sharpen', 'tex_lod_source', 'tex_lod_k',
+        'tex_lod_l',
+        # R251 material pack (MAT-B): the REYES snap is a gate AND a
+        # bake (C119), and the keys the pack found missing -- the AA
+        # pair (the internal size the grid is sized for), the palette
+        # trio the Palette node bakes and the display pair the
+        # specular-in-gamma road reads
+        'shading_rate_area', 'aa_mode', 'aa_samples',
+        'palette_mode', 'palette_size', 'palette_colors', 'gamma',
+        'color_management',
         'transparency', 'env_reflection',
         # the Screen Door threshold map bakes from the pattern (R78: a
         # bake the plan reads MUST be in this signature)
@@ -862,7 +950,36 @@ def _plan_sig(job, mkey):
         'radiosity_intensity', 'radiosity_spacing', 'reflection_blur',
         'reflection_blur_samples',
         # the transparent-layer alpha chain bakes this cutoff
-        'alpha_threshold'))
+        'alpha_threshold',
+        # R251 C117: the map depth changes the emitted offset line (a
+        # bake the plan reads MUST be in this signature)
+        'shadow_map_depth',
+        # R251 (lighting): the fog block's STRUCTURE -- which hal_fog
+        # branches a pass emits -- and the hal_fogtab sampler gate
+        # (specular_viewer AXIS reads the same texture, F011)
+        'fog_mode', 'fog_vertex', 'fog_height', 'fog_table', 'fog_dither',
+        'fog_depth', 'specular_viewer',
+        # R251 (LIGHT-B2 F020): crand's hash folds the frame in
+        # (structure: the hal_frame uniform)
+        'crand_per_frame',
+        # R251 (MAT-A C049): the Super FX plot's supersample bake and
+        # its palette / gamma GATES (a gate the plan reads MUST be here)
+        'aa_mode', 'aa_samples', 'palette_mode', 'palette_size',
+        'palette_colors', 'gamma', 'color_management')) + (
+        int(getattr(st, 'fog_bands', 0) or 0) >= 2,
+        # the module switch IS a gate the plan reads (B2)
+        bool(FOG_ON_GPU))
+    # R251 LIGHT-B1 (F015): whether the fog reads the screen-spot lobe
+    st_sig = st_sig + (float(getattr(st, 'fog_spot', 0.0) or 0.0) > 0.0,)
+    # R251 LIGHT-A2 (F004 / F005 / F008 / F006 / F010): the wave-2 fog
+    # STRUCTURE -- which hal_fog branches a pass emits (core/fog.structure)
+    st_sig = st_sig + (
+        bool(getattr(st, 'fog_range_adjust', False)),
+        bool(getattr(st, 'fog_face', False)),
+        str(getattr(st, 'fog_color_source', 'FIXED')),
+        float(getattr(st, 'fog_bank1_end', 0.0) or 0.0)
+        > float(getattr(st, 'fog_bank1_start', 0.0) or 0.0),
+        float(getattr(st, 'fog_turbulence', 0.0) or 0.0) > 0.0)
     world = getattr(scene, 'world', None)
     world_sig = None
     if world is not None:
@@ -994,6 +1111,17 @@ def _pool_tag(tag, src, spec):
 _PLAN_CACHE = {}
 
 
+def _pack_dstab(job, rows):
+    """R251 (LIGHT-B2 F018): the DS shininess tables as a data texture
+    -- row = material index, 128 texels of T[i] in .r (float32 integers
+    0..255), the CPU's own SH.ds_shininess_table per Glossiness."""
+    n = max([len(job.scene.materials)] + [int(mi) + 1 for mi, _g in rows])
+    arr = np.zeros((n, 128, 4), np.float32)
+    for mi, gloss in rows:
+        arr[int(mi), :, 0] = _SHM.ds_shininess_table(float(gloss))
+    return arr
+
+
 def plan_frame(job, gbuf, use_cache=True):
     """Decide whether this frame can shade on the GPU, and build its passes.
 
@@ -1016,12 +1144,29 @@ def plan_frame(job, gbuf, use_cache=True):
     from .material import assemble_frame
 
     sig = None
+    present_now = _present_materials(job.scene.mesh, gbuf)
     if use_cache:
         try:
             sig = _plan_sig(job, _mesh_key(job.scene.mesh))
         except Exception:                                       # noqa: BLE001
             sig = None
         hit = _PLAN_CACHE.get(sig) if sig is not None else None
+        if hit is not None and hit[0] is not None and \
+                not present_now.issubset({int(p[0]) for p in hit[0]}):
+            # R248: THE UNSHADED-BLACK MATERIAL. A plan holds one pass
+            # per material, and it used to hold passes only for the
+            # materials on screen when it was built -- while its
+            # signature, by design, holds no camera. An orbit that
+            # brought a material into view for the first time hit the
+            # cached plan, found no pass for it, and the pass loop left
+            # its pixels at the cleared target's zero: pure black, no
+            # shading, no refusal -- "in refined but not in orbit, or
+            # vice versa" because drafts and refines are different
+            # sizes with different plans, each built from whatever was
+            # visible at ITS first frame. A plan now covers every
+            # material the mesh carries (below), and a hit that still
+            # lacks one on screen re-plans instead of serving it
+            hit = None
         if hit is not None:
             h_passes, h_why, h_atlases = hit
             if h_atlases and 'hal_lights' in h_atlases:
@@ -1034,12 +1179,44 @@ def plan_frame(job, gbuf, use_cache=True):
                 from ..core import lights as _LI2
                 from .material import pack_light_texels as _plt
                 _arr = _plt(_LI2.select_lights(job.scene.lights,
-                                               job.settings))
+                                               job.settings), job)
                 h_atlases = dict(h_atlases)
                 h_atlases['hal_lights'] = (('lights', _arr.tobytes()),
                                            lambda a=_arr: a)
                 hit = (h_passes, h_why, h_atlases)
                 _PLAN_CACHE[sig] = hit
+            if h_atlases and 'hal_fogtab' in h_atlases:
+                # R251: the fog values are per-frame data too (the view
+                # row rides them): a hit repacks from THIS frame
+                from ..core.fog import pack_fog_texels as _pft2
+                _fa = _pft2(job)
+                h_atlases = dict(h_atlases)
+                h_atlases['hal_fogtab'] = (('fogtab', _fa.tobytes()),
+                                           lambda a=_fa: a)
+                hit = (h_passes, h_why, h_atlases)
+                _PLAN_CACHE[sig] = hit
+            if h_atlases and 'hal_backdrop' in h_atlases:
+                # R251 LIGHT-A2 (F008): the backdrop follows the camera
+                from ..core.fog import backdrop_atlas as _bda2
+                h_atlases = dict(h_atlases)
+                h_atlases['hal_backdrop'] = _bda2(job)
+                hit = (h_passes, h_why, h_atlases)
+                _PLAN_CACHE[sig] = hit
+            if h_atlases and 'hal_stipple' in h_atlases and \
+                    len(h_atlases['hal_stipple']) == 3:
+                # R251 C015: the N64 noise map is per-frame data (the
+                # frame and seed are its stamp, never in the plan
+                # signature -- a re-plan per frame is the cost this
+                # idiom avoids): a hit repacks it for THIS frame and
+                # the stamped upload replaces the one resident texture
+                _fs = (int(getattr(job.scene, 'frame', 1) or 1),
+                       int(getattr(job.settings, 'seed', 0) or 0))
+                if h_atlases['hal_stipple'][2] != _fs:
+                    h_atlases = dict(h_atlases)
+                    h_atlases['hal_stipple'] = _stipple_atlas_entry(
+                        'N64_NOISE', job)
+                    hit = (h_passes, h_why, h_atlases)
+                    _PLAN_CACHE[sig] = hit
             if h_atlases and 'hal_celfield' in h_atlases:
                 # R238: the cel field is per-frame data too (the camera
                 # and the frame's own G-buffer shape it): a hit
@@ -1096,6 +1273,10 @@ def plan_frame(job, gbuf, use_cache=True):
     # RASTER of an affine frame still runs on the CPU (craster does
     # not carry bary_lin yet), which render.py prints by name.
     affine = not getattr(st, 'tex_perspective', True)
+    # R251 C119 (MAT-B): under affine mapping the uv rides a second
+    # grid (hal_gb_idslin) the snap does not cover -- refuse by name
+    if affine and REYES.rate_of(st) > 0.0:
+        return None, REYES.REFUSE_AFFINE, {}
     # WIREFRAME and CONSTANT left the refusal list with the shadeless
     # emit: the pass writes diffuse x level (+ emission) and
     # apply_wireframe carves the wires on the readback, the CPU's own
@@ -1392,6 +1573,18 @@ def plan_frame(job, gbuf, use_cache=True):
         'tex_filter': str(getattr(st, 'tex_filter', 'NEAREST')),
         'tex_aniso': int(getattr(st, 'tex_aniso', 1) or 1),
         'tex_mip_bias': float(getattr(st, 'tex_mip_bias', 0.0) or 0.0),
+        # R251 texture pack: the sample-time dials material._tex_opts
+        # hands to core.texture.sample_opts (one function, both devices)
+        'tex_mipmap': bool(getattr(st, 'tex_mipmap', False)),
+        'tex_frac_bits': str(getattr(st, 'tex_frac_bits', 'FLOAT')),
+        'tex_clamp_mode': str(getattr(st, 'tex_clamp_mode', 'EDGE')),
+        'tex_colorkey': bool(getattr(st, 'tex_colorkey', False)),
+        'tex_colorkey_range': int(getattr(st, 'tex_colorkey_range', 0)),
+        'tex_mip_select': str(getattr(st, 'tex_mip_select', 'FILTER')),
+        'tex_lod_sharpen': bool(getattr(st, 'tex_lod_sharpen', False)),
+        'tex_lod_source': str(getattr(st, 'tex_lod_source', 'DERIVATIVE')),
+        'tex_lod_k': float(getattr(st, 'tex_lod_k', 0.0)),
+        'tex_lod_l': int(getattr(st, 'tex_lod_l', 0)),
         # per-object bounds for Generated coordinates: derived from the mesh,
         # which the plan signature already fingerprints
         'obj_bounds': job.object_bounds(),
@@ -1457,6 +1650,7 @@ def plan_frame(job, gbuf, use_cache=True):
         if getattr(scene.mesh, 'tris', None) is not None else 0,
         # the mesh's named UV layers, for the UV Map node's resolution
         'uv_names': tuple(getattr(scene.mesh, 'uv_names', None) or ()),
+        'color_name': str(getattr(scene.mesh, 'color_name', None) or ''),
         'has_vcol': getattr(scene.mesh, 'colors', None) is not None,
         # the BVH texture sides, baked into the traversal source when any
         # light shadows by ray; None otherwise
@@ -1464,8 +1658,26 @@ def plan_frame(job, gbuf, use_cache=True):
         # deterministic sampling: the seed every hash stream mixes in, and
         # the AO spec when the frame occludes ambient light
         'seed': int(getattr(st, 'seed', 0) or 0),
+        # R251 LIGHT-B1 (F011): PIXEL | AXIS -- the fixed camera-axis
+        # viewer reads hal_fogtab texel 227 (section 0's map)
+        'specular_viewer': str(getattr(st, 'specular_viewer', 'PIXEL')),
+        # R251 (LIGHT-B2 F020): crand folds the frame number into its
+        # hash (structure: the pass declares hal_frame; in st_sig)
+        'crand_per_frame': bool(getattr(st, 'crand_per_frame', False)),
+        # R251 (MAT-A C049): the output-pixel pitch of the Super FX plot
+        'plot_ss': _plot_ss(st),
+        # R251 (MAT-A C049): the output-pixel pitch of the Super FX plot
+        'plot_ss': _plot_ss(st),
+        # R251 C119 (MAT-B): the REYES snap's padded-square side, None
+        # at rate 0 (the snap function is emitted only when set)
+        'reyes': REYES.consts_for(st, scene),
         # the transparent-layer alpha chain's hard cutoff
         'alpha_threshold': float(getattr(st, 'alpha_threshold', 0.0)),
+        # R251 (lighting): fog STRUCTURE for hal_fog (core/fog.structure,
+        # plus the camera type for the z-fog branch) and the ONE rule
+        # for the hal_fogtab sampler (lighting.md section 0, A9)
+        'fog': _fog_structure(st, scene),
+        'fogtab': _fogtab_needed(st, scene),
         # R174: material VALUES ride the hal_mats texture (assemble_frame
         # marks them, lifts them, and hands the row back in
         # info['mat_values']). Same-structure materials share one
@@ -1549,6 +1761,10 @@ def plan_frame(job, gbuf, use_cache=True):
             return None, (f"'{_mat_name(mi)}' shades at {vrate} rate, "
                           f'and a {which} pass lights per pixel -- the '
                           'light loop has no formula for it')
+        if (secondary or layer) and consts.get('reyes'):
+            # R251 C119 (MAT-B): the on-screen loop reuses the primary
+            # probe's bake, so the probe's refusal never ran -- gate here
+            return None, f"'{_mat_name(mi)}': {REYES.REFUSE_PASS}"
         # under ray tracing the CPU never takes the env branch at depth 0
         # (the traced bounce replaces it); the depth-exhausted SECONDARY
         # shade is exactly where the env branch lives -- so only the
@@ -1581,8 +1797,37 @@ def plan_frame(job, gbuf, use_cache=True):
                 cpu_env['hit' if secondary else 'primary'][mi] = \
                     tuple(float(x) for x in sc_env)
                 env_spec = None
+        # R251 (lighting, B17): fog stays on the CPU, BY NAME, for the
+        # materials whose composites land AFTER the readback -- traced
+        # reflections / refractions and a CPU-evaluated env term (the
+        # CPU fogs base + r*hit; in-shader fog would give fog(base) +
+        # r*hit) -- and while the module switch is off. Decided HERE,
+        # before the source exists; the tail reads consts['fog_cpu'],
+        # assemble_frame echoes it as info['fog_cpu'], _fog_readback
+        # fogs exactly those ids. Printed once per plan (a cache hit
+        # never re-enters this function). A material with Use Mist off
+        # is fogged by neither road and carries no reason.
+        fog_cpu = None
+        if bool(getattr(st, 'fog', False)) and vrate == 'PIXEL' \
+                and not secondary and not layer \
+                and float(bake.get('use_mist', 1.0)) >= 0.5:
+            if not FOG_ON_GPU:
+                fog_cpu = 'the module switch is off'
+            elif ((ray_on and job.bvh is not None
+                   and ((getattr(st, 'ray_reflection', True)
+                         and float(bake.get('reflect', 0.0)) > 1e-4)
+                        or (getattr(st, 'ray_refraction', True)
+                            and float(bake.get('opacity', 1.0))
+                            < 0.999)))
+                  or mi in cpu_env['primary']):
+                fog_cpu = ('traced/env composites land after the '
+                           'readback; fog stays on the CPU')
+            if fog_cpu:
+                print(f"[Halcyon GPU] fog on the CPU for "
+                      f"'{_mat_name(mi)}': {fog_cpu}")
         c = dict(consts)
         c['env'] = env_spec
+        c['fog_cpu'] = fog_cpu
         src, info = assemble_frame(graph, mi, model_idx, bake, lights,
                                    c, shadows, textures=job.textures,
                                    programs=getattr(mat, 'programs', None)
@@ -1678,64 +1923,105 @@ def plan_frame(job, gbuf, use_cache=True):
     any_screen = False
     rng = np.random.default_rng(19)
     py, px = np.nonzero(covered)
-    for mi in mat_ids:
+    # R248: a pass for EVERY material the mesh carries, not only those
+    # on screen this frame -- the plan's signature holds no camera, so
+    # a plan must serve any view. A material on screen is probed on its
+    # own fragments exactly as before (a refusal there refuses the
+    # frame, by name, as before); a material off screen is probed over
+    # its own triangles -- the road the ray plan already walks for
+    # materials 'visible only in reflections' -- and one that cannot be
+    # probed there is left UNPLANNED, named: it never costs the frame
+    # its GPU, and the first frame that shows it re-plans with it on
+    # screen (the cache-hit rule above). The draw side compiles and
+    # draws only the passes on screen, so an off-screen pass costs the
+    # plan a probe and a source, never a driver compile.
+    m_of = scene.mesh.mat_index[gbuf.tri[py, px]] \
+        if scene.mesh.mat_index is not None else np.zeros(py.size, np.int32)
+    all_ids = np.unique(scene.mesh.mat_index) \
+        if scene.mesh.mat_index is not None else np.zeros(1, np.int32)
+    unplanned = {}
+    for mi in all_ids:
         mi = int(mi)
-        m = scene.mesh.mat_index[gbuf.tri[py, px]] \
-            if scene.mesh.mat_index is not None else np.zeros(py.size, np.int32)
-        mine = np.nonzero(m == mi)[0]
-        if mine.size == 0:
+        on_screen = mi in present_now
+        mine = np.nonzero(m_of == mi)[0] if on_screen else np.zeros(0, np.int64)
+        if on_screen and mine.size == 0:
             continue
-        pick = mine if mine.size <= PROBE_FRAGMENTS else \
-            mine[rng.choice(mine.size, PROBE_FRAGMENTS, replace=False)]
-        bake, model_idx, why = _probe_material(job, gbuf, mi,
-                                               py[pick], px[pick])
+        if on_screen:
+            pick = mine if mine.size <= PROBE_FRAGMENTS else \
+                mine[rng.choice(mine.size, PROBE_FRAGMENTS, replace=False)]
+            bake, model_idx, why = _probe_material(job, gbuf, mi,
+                                                   py[pick], px[pick])
+        else:
+            tri_pool = np.nonzero(scene.mesh.mat_index == mi)[0]
+            if tri_pool.size == 0:
+                continue
+            pick_t = tri_pool if tri_pool.size <= PROBE_FRAGMENTS else \
+                tri_pool[rng.choice(tri_pool.size, PROBE_FRAGMENTS,
+                                    replace=False)]
+            frag_bary = np.full((pick_t.size, 3), 1.0 / 3.0, np.float32)
+            try:
+                bake, model_idx, why = _probe_material(
+                    job, gbuf, mi, None, None,
+                    frags=(pick_t.astype(np.int32), frag_bary))
+            except Exception as exc:                            # noqa: BLE001
+                bake, model_idx = None, None
+                why = f'probing it off-screen failed ({exc})'
+        refuse = None
         if bake is None:
-            return None, f"'{_mat_name(mi)}': {why}", {}
+            refuse = f"'{_mat_name(mi)}': {why}"
         # the BI panel round's honest CPU-only flags
-        if float(bake.get('cast_only', 0.0)) > 0.5:
-            return None, f"'{_mat_name(mi)}' is Cast Only: peeling the " \
-                         'camera surface shades on the CPU', {}
-        if float(bake.get('shadows_only', 0.0)) > 0.5:
-            return None, f"'{_mat_name(mi)}' is Shadows Only: the " \
-                         'shadow catcher shades on the CPU', {}
-        if float(bake.get('use_mist', 1.0)) < 0.5 and \
-                bool(getattr(st, 'fog', False)):
-            return None, f"'{_mat_name(mi)}' opts out of mist; fogged " \
-                         'frames shade it on the CPU', {}
-        if float(bake.get('backface_mix', 0.0)) > 1e-4 and \
+        elif float(bake.get('cast_only', 0.0)) > 0.5:
+            refuse = f"'{_mat_name(mi)}' is Cast Only: peeling the " \
+                     'camera surface shades on the CPU'
+        elif float(bake.get('shadows_only', 0.0)) > 0.5:
+            refuse = f"'{_mat_name(mi)}' is Shadows Only: the " \
+                     'shadow catcher shades on the CPU'
+        # R251: 'opts out of mist' no longer refuses -- the fog block
+        # honours the bake (a Use-Mist-off pass emits no hal_fog call)
+        elif float(bake.get('backface_mix', 0.0)) > 1e-4 and \
                 str(getattr(scene.camera, 'type', 'PERSP')).upper() != \
                 'PERSP':
             # the shader decides backfacing with a plane-side test against
             # the eye, which is the rasteriser's answer only in perspective
-            return None, f"'{_mat_name(mi)}': the backface override " \
-                         'under an orthographic camera is not in the ' \
-                         'deferred pass yet', {}
+            refuse = f"'{_mat_name(mi)}': the backface override " \
+                     'under an orthographic camera is not in the ' \
+                     'deferred pass yet'
         mat = scene.materials[mi] if mi < len(scene.materials) else None
         graph = getattr(mat, 'graph', None) if mat is not None else None
-        if ray_on:
-            gate = _ray_gate(mi, bake, graph)
-            if gate is not None:
-                return None, gate, {}
-        entry, why = _one_material(mi, bake, model_idx)
-        if entry is None:
-            return None, why, {}
+        if refuse is None and ray_on:
+            refuse = _ray_gate(mi, bake, graph)
+        entry = entry2 = entry3 = None
+        if refuse is None:
+            entry, why = _one_material(mi, bake, model_idx)
+            if entry is None:
+                refuse = why
+        if refuse is None and ray_on:
+            entry2, why2 = _one_material(mi, bake, model_idx,
+                                         secondary=True)
+            if entry2 is None:
+                refuse = why2
+            elif ray_depth >= 2:
+                entry3, why3 = _one_material(mi, bake, model_idx,
+                                             secondary=True, mid=True)
+                if entry3 is None:
+                    refuse = why3
+        if refuse is not None:
+            if on_screen:
+                return None, refuse, {}
+            # off screen: the frame keeps its GPU; the material is
+            # named, and re-probed on its own fragments the first
+            # frame it appears
+            unplanned[mi] = str(refuse)
+            continue
         passes.append(entry)
         any_screen = any_screen or bool(entry[3].get('uses_screen'))
         # exactly _add_raytraced's k and tint, per material: the gate
         # above already held every constant this needs
         _collect_ray_terms(mi, bake)
         if ray_on:
-            entry2, why2 = _one_material(mi, bake, model_idx,
-                                         secondary=True)
-            if entry2 is None:
-                return None, why2, {}
             secondary.append(entry2)
             any_screen = any_screen or bool(entry2[3].get('uses_screen'))
             if ray_depth >= 2:
-                entry3, why3 = _one_material(mi, bake, model_idx,
-                                             secondary=True, mid=True)
-                if entry3 is None:
-                    return None, why3, {}
                 secondary_mid.append(entry3)
 
     # transparent LAYERS: under SORTED/ABUFFER the A-buffer's fragments
@@ -1772,10 +2058,35 @@ def plan_frame(job, gbuf, use_cache=True):
             # opaque material whose layer variant would refuse (a Bump
             # pre-pass, say) cannot cost the frame its GPU layers
             m_l = mats_l[mi] if 0 <= mi < len(mats_l) else None
-            if m_l is not None and not (
-                    float(getattr(m_l, 'opacity', 1.0)) < 0.999
-                    or getattr(m_l, 'has_alpha', False)):
-                continue
+            if m_l is not None:
+                # R251: the ONE predicate `_split_by_alpha` uses
+                # (core/scene.py `material_see_through`: opacity, the
+                # export's alpha evidence, a per-material Blend Mode, the
+                # PS2 Clip+Blend; an Env hole is opaque), so the layer
+                # plan and the split can never disagree
+                from ..core.scene import material_see_through
+                if material_see_through(m_l) is None:
+                    continue
+            if m_l is not None and \
+                    str(getattr(m_l, 'alpha_mode', 'BLEND')) == 'CLIP_BLEND':
+                # R251 C031 (PS2 AFAIL): the opaque half is decided on
+                # the CPU by _promote_clip, and the composite drops a
+                # layer fragment whose alpha passes the threshold. A
+                # layer pass would decide `hal_alpha >= threshold` per
+                # fragment in the driver's own chain arithmetic (held to
+                # 6e-3, not 0): within an ulp of the threshold one device
+                # promotes where the other still blends -- the keep/drop
+                # cliff class. A baked CONSTANT passes the threshold
+                # identically on both devices and keeps its layer pass.
+                from .material import per_pixel_fields as _ppf
+                if getattr(m_l, 'has_alpha', False) or \
+                        'opacity' in _ppf(getattr(m_l, 'graph', None)):
+                    lwhy = (f"'{_mat_name(mi)}' is Clip+Blend with a "
+                            'per-pixel alpha: the blend half\'s '
+                            'keep/drop against the Clip Threshold is '
+                            'a cliff between devices; the layers '
+                            'shade on the CPU, by name')
+                    break
             if m_l is not None:
                 # R211/R213 punch-through: a material on the clip road
                 # (Alpha Mode Clip, or a Blend chain that provably
@@ -1786,7 +2097,10 @@ def plan_frame(job, gbuf, use_cache=True):
                 # (refused, by name, in the render log) still blends:
                 # keep its layer pass.
                 from ..core.scene import clip_road
-                if clip_road(m_l)[0] is not None:
+                if clip_road(m_l)[0] is not None and \
+                        str(getattr(m_l, 'alpha_mode', 'BLEND')) != 'CLIP_BLEND':
+                    # (R251 C031: a Clip+Blend material's layer pass IS
+                    # its blend half -- never skipped)
                     continue
             mine_l = np.nonzero(m_all == mi)[0]
             try:
@@ -2001,9 +2315,24 @@ def plan_frame(job, gbuf, use_cache=True):
         # -- and nothing else: the pass sources no longer contain the
         # values, so the plan above was a cache HIT.
         from .material import pack_light_texels
-        _lt_arr = pack_light_texels(lights)
+        _lt_arr = pack_light_texels(lights, job)
         atlases['hal_lights'] = (('lights', _lt_arr.tobytes()),
                                  lambda a=_lt_arr: a)
+    if consts.get('fogtab'):
+        # R251: the fog VALUE texture (core/fog.pack_fog_texels): like
+        # hal_lights, per-frame data keyed by its bytes and repacked on
+        # a plan-cache hit (a slider drag re-uploads 8 KB, never recompiles)
+        from ..core.fog import pack_fog_texels as _pft
+        _ft_arr = _pft(job)
+        atlases['hal_fogtab'] = (('fogtab', _ft_arr.tobytes()),
+                                 lambda a=_ft_arr: a)
+    if consts.get('fogtab') and \
+            (consts.get('fog') or {}).get('source') == 'BACKDROP':
+        # R251 LIGHT-A2 (F008): the CPU's own backdrop at every pixel,
+        # uploaded as the fog target (keyed by a crc of its bytes, not
+        # the bytes themselves); repacked on a plan-cache hit below
+        from ..core.fog import backdrop_atlas as _bda
+        atlases['hal_backdrop'] = _bda(job, announce=True)
 
     # R174: the per-MATERIAL value texture. Every pass that lifted values
     # gets a row (hal_mrow rides its binds as 'mat_row'); the walk order
@@ -2025,26 +2354,125 @@ def plan_frame(job, gbuf, use_cache=True):
         atlases['hal_mats'] = (('mats', _ma.tobytes()),
                                lambda a=_ma: a)
 
+    _ds_rows = sorted({tuple(b['dstab']) for b in _pass_binds()
+                       if b.get('dstab')})
+    if _ds_rows:
+        # R251 (LIGHT-B2 F018): the DS materials' shininess tables --
+        # the key carries the (material, Glossiness) pairs; Glossiness
+        # is in _mat_sig, so a change re-plans and repacks
+        _da = _pack_dstab(job, _ds_rows)
+        atlases['hal_dstab'] = (('dstab', _da.tobytes()), lambda a=_da: a)
+    if any('hal_circle' in (b.get('samplers') or ())
+           for b in _pass_binds()) and 'hal_circle' not in atlases:
+        # R251 (LIGHT-B2 F020, B13): a crand material appends the
+        # sampling primitives (SAMPLING_GLSL declares hal_circle) with
+        # no soft shadow, AO or radiosity in the frame -- the table is
+        # registered here, after the bakes exist
+        from ..core.patterns import CIRCLE256 as _C256
+
+        def _build_circle_r251():
+            img = np.zeros((1, 256, 4), np.float32)
+            img[0, :, 0] = _C256[:, 0]
+            img[0, :, 1] = _C256[:, 1]
+            return img
+        atlases['hal_circle'] = (('circle256', 1), _build_circle_r251)
+    if any('hal_recip256' in (b.get('samplers') or ())
+           for b in _pass_binds()) and 'hal_recip256' not in atlases:
+        # R251 C088 (TEX-2): the CPU's own float32 reciprocals 1/1..1/256
+        # as a 1-row texture -- both roads multiply by the SAME table,
+        # never divide (the summed-area box)
+        from ..core.texture import RECIP256 as _R256
+
+        def _build_recip():
+            img = np.zeros((1, 256, 4), np.float32)
+            img[0, :, 0] = _R256
+            return img
+        atlases['hal_recip256'] = (('recip256', 1), _build_recip)
     if any('hal_stipple' in (b.get('samplers') or ())
            for b in _pass_binds()):
         # the CPU's own 64x64 threshold map, uploaded verbatim: both
         # devices compare the SAME baked opacity against the SAME
         # threshold values, so the keep-or-drop decision is identical
         pat = (consts.get('stipple') or {}).get('pattern', 'BAYER4')
+        atlases['hal_stipple'] = _stipple_atlas_entry(pat, job)
 
-        def _build_stipple(p=pat):
-            from ..core.dither import threshold_map
-            tm = threshold_map(p, 64, 64)
-            out = np.zeros((64, 64, 4), np.float32)
-            out[:, :, 0] = np.asarray(tm, np.float32)
-            return out
-        atlases['hal_stipple'] = (('stipple', pat), _build_stipple)
-
+    if unplanned:
+        atlases['__unplanned'] = unplanned
     if sig is not None:
         if len(_PLAN_CACHE) > 4:
             _PLAN_CACHE.clear()
         _PLAN_CACHE[sig] = (passes, None, atlases)
     return passes, None, atlases
+
+
+def _stipple_atlas_entry(pat, job):
+    """The hal_stipple atlas entry for pattern `pat`: the CPU's own
+    threshold map, uploaded verbatim so both devices compare the SAME
+    baked opacity against the SAME threshold values.
+
+    R251 C015 (N64 RDP dither_alpha_en): for N64_NOISE the map is the
+    CPU's FULL-FRAME 8-bit random (core/dither.noise_threshold_map),
+    packed FOUR pixel columns per RGBA32F texel (pixel x in texel
+    x >> 2, channel x & 3: 3.7 MB at 720p, the CPU array's own size)
+    under a key STABLE across frames, ('stipple', 'N64_NOISE', H, W),
+    with the frame and seed carried as the upload STAMP (a 3-tuple
+    entry): one noise texture lives at a time, replaced through the
+    graveyard when the stamp moves, and a re-plan of the same frame
+    uploads nothing. The ordered kinds keep the 64x64 tile in .r and
+    the 2-tuple entry; a kind with no map (an error-diffusion kind,
+    '' for a stored number no item carries) bakes Bayer 4x4 by name,
+    exactly shade_batch's fallback."""
+    p = str(pat)
+    if p == 'N64_NOISE':
+        H, W = int(job.height), int(job.width)
+        frame = int(getattr(job.scene, 'frame', 1) or 1)
+        seed = int(getattr(job.settings, 'seed', 0) or 0)
+
+        def _build_noise(h=H, w=W, f=frame, s=seed):
+            from ..core.dither import threshold_map
+            tm = np.asarray(threshold_map('N64_NOISE', h, w, frame=f,
+                                          seed=s), np.float32)
+            pad = (-w) % 4
+            if pad:
+                tm = np.pad(tm, ((0, 0), (0, pad)), mode='edge')
+            return np.ascontiguousarray(tm.reshape(h, -1, 4))
+        return (('stipple', 'N64_NOISE', H, W), _build_noise,
+                (frame, seed))
+
+    def _build_stipple(p=p):
+        from ..core.dither import ORDERED, threshold_map
+        if ORDERED.get(str(p)) is None:
+            # R251: the CPU's own by-name fallback (shade_batch):
+            # an error-diffusion kind, or '' for a stored number
+            # no item carries, bakes Bayer 4x4 on both devices
+            print(f'[Halcyon] transparency: stipple pattern '
+                  f'{p!r} is not an ordered map; Bayer 4x4 '
+                  'used (an error-diffusion kind, or a scene '
+                  'saved before 1.90.0 with Screen Door at None, '
+                  'reads back as this)')
+            p = 'BAYER4'
+        tm = threshold_map(p, 64, 64)
+        out = np.zeros((64, 64, 4), np.float32)
+        out[:, :, 0] = np.asarray(tm, np.float32)
+        return out
+    return (('stipple', p), _build_stipple)
+
+
+def _material_name(job, mi):
+    mats = getattr(job.scene, 'materials', None) or []
+    return getattr(mats[mi], 'name', None) or f'material {mi}' \
+        if 0 <= int(mi) < len(mats) else f'material {mi}'
+
+
+def _present_materials(mesh, gbuf):
+    """The material ids with at least one pixel in this frame's G-buffer."""
+    try:
+        covered = gbuf.tri >= 0
+        if not covered.any() or getattr(mesh, 'mat_index', None) is None:
+            return set()
+        return set(int(m) for m in np.unique(mesh.mat_index[gbuf.tri[covered]]))
+    except Exception:                                           # noqa: BLE001
+        return set()
 
 
 def _textures(job, gbuf):
@@ -2106,7 +2534,8 @@ def _gather_pass_textures(bind_dicts, job_textures, up):
                 continue
             tx = job_textures[key]
             ik = ('img', key, tx.width, tx.height,
-                  round(float(tx.pixels[::13].sum()), 3))
+                  round(float(tx.pixels[::13].sum()), 3),
+                  getattr(tx, 'prep', None))              # R251 A12.13
             out[(id(binds), sname)] = up(ik, lambda _t=tx: _t.pixels)
         # mip atlases: the CPU's OWN build_mips output, packed as a
         # vertical stack -- the driver filters the very texels the CPU
@@ -2116,9 +2545,20 @@ def _gather_pass_textures(bind_dicts, job_textures, up):
                 continue
             tx = job_textures[key]
             mk = ('mipatlas', key, tx.width, tx.height,
-                  round(float(tx.pixels[::13].sum()), 3))
+                  round(float(tx.pixels[::13].sum()), 3),
+                  getattr(tx, 'prep', None))              # R251 A12.13
             from .material import mip_atlas as _mip_atlas
             out[(id(binds), sname)] = up(mk, lambda _t=tx: _mip_atlas(_t)[0])
+        # R251 C088 (TEX-2): the summed-area atlases, keyed like the mips
+        for sname, key in (binds.get('textures_sat') or {}).items():
+            if (id(binds), sname) in out:
+                continue
+            tx = job_textures[key]
+            sk = ('satatlas', key, tx.width, tx.height,
+                  round(float(tx.pixels[::13].sum()), 3),
+                  getattr(tx, 'prep', None))
+            from .material import sat_atlas as _sat_atlas
+            out[(id(binds), sname)] = up(sk, lambda _t=tx: _sat_atlas(_t))
     return out
 
 
@@ -2158,6 +2598,9 @@ def _mesh_key(mesh):
     mats = getattr(mesh, 'mat_index', None)
     if mats is not None:
         parts.append(int(np.asarray(mats)[::stride].sum()))
+    # R251 C012: the vertex-format tag (a fine lattice can move the
+    # strided sums by less than the 3-decimal rounding)
+    parts.append(getattr(mesh, '_quant_tag', None))
     return tuple(parts)
 
 
@@ -2529,7 +2972,8 @@ def _no_layer_plan_why(job, atlases, tri):
         return (f"the layer plan is empty, yet fragments arrived from "
                 f"'{name}' (opacity "
                 f"{float(getattr(m, 'opacity', 1.0)):.3f}, has_alpha "
-                f'{bool(getattr(m, "has_alpha", False))} read as opaque '
+                f'{bool(getattr(m, "has_alpha", False))}, blend_mode '
+                f"{getattr(m, 'blend_mode', 'INHERIT')} read as opaque "
                 'to the layer predicate)')
     return 'the layer plan is empty and no fragment names a material'
 
@@ -2660,7 +3104,8 @@ def shade_fragments_frame(job, gbuf, tri, bary, px, py, rank):
     try:
         tex_attrs = device.upload_cached(('gb_attrs',) + mkey, build_attrs)
         tex_tris = device.upload_cached(('gb_tris',) + mkey, build_tris)
-        tex_shadows = {sname: device.upload_cached(entry[0], entry[1])
+        tex_shadows = {sname: device.upload_cached(entry[0], entry[1],
+                                                   *entry[2:])
                        for sname, entry in atlases.items()
                        if not sname.startswith('__')}
         srcs_all = []
@@ -3533,6 +3978,25 @@ def _child_refract(job, rplan, img, py, px, dirs, child_hit, child_img,
     img[py, px] = img[py, px] * (1.0 - k) + add * k * dif
 
 
+def _field_uv(job, gbuf, st, cov):
+    """R251 (TEX-2, A12.5): (tri, bary, uv) of the covered pixels with uv
+    fetched by the CPU's OWN affine rule -- attributes() R:2286 reads uv
+    from the screen-linear barycentrics exactly when tex_perspective is
+    off, and context() hands THAT uv to uv_screen_gradients with the
+    true barycentrics. The GPU's sampler already reads the affine uv
+    (hal_gb_idslin); the fields were the odd ones out."""
+    from ..core import raster as _raster
+    mesh = job.scene.mesh
+    tri = gbuf.tri[cov]
+    bary = gbuf.bary[cov]
+    ub = gbuf.bary_lin[cov] if (gbuf.bary_lin is not None
+                                and not getattr(st, 'tex_perspective', True)) else bary
+    uv = _raster.fetch(mesh.uvs, mesh.tris, tri, ub) \
+        if mesh.uvs is not None \
+        else np.zeros((tri.size, 2), np.float32)
+    return tri, bary, uv
+
+
 def _uvgrad_field(job, gbuf):
     """(H, W, 4) float32: the CPU's analytic UV screen derivatives.
 
@@ -3540,58 +4004,172 @@ def _uvgrad_field(job, gbuf):
     -- computed by ShadeJob.uv_screen_gradients, the very function the
     CPU's own trilinear reads through the context. Same numbers, one
     upload, shared by every footprint-filtered sampler in the frame.
+    R251 (TEX-2): built ONCE per job and G-buffer (fill_base runs per
+    pass, A12.8) and fetching uv by the CPU's affine rule (A12.5).
     """
-    from ..core import raster as _raster
+    cache = getattr(job, '_uvgrad_fields', None)
+    if cache is None:
+        cache = job._uvgrad_fields = {}
+    hit = cache.get(id(gbuf))
+    if hit is not None and hit[0] is gbuf:
+        return hit[1]
     h, w = gbuf.tri.shape
     field = np.zeros((h, w, 4), np.float32)
     cov = gbuf.tri >= 0
     if cov.any():
-        mesh = job.scene.mesh
-        tri = gbuf.tri[cov]
-        bary = gbuf.bary[cov]
-        uv = _raster.fetch(mesh.uvs, mesh.tris, tri, bary) \
-            if mesh.uvs is not None \
-            else np.zeros((tri.size, 2), np.float32)
+        tri, bary, uv = _field_uv(job, gbuf, job.settings, cov)
         du, dv = job.uv_screen_gradients(tri, bary, uv)
         field[cov, 0] = du[:, 0]
         field[cov, 1] = du[:, 1]
         field[cov, 2] = dv[:, 0]
         field[cov, 3] = dv[:, 1]
+    cache[id(gbuf)] = (gbuf, field)        # the G-buffer rides along: its id cannot be reused while cached
     return field
 
 
+def _lod_field(job, gbuf, st, key):
+    """(H, W, 4) float32, channel 0 = the CPU's own mip LOD at every covered
+    pixel, zeros elsewhere: gs_lod16 over the view depth (key (0, 0), the
+    PlayStation 2 road, C022), the per-triangle table (TRIANGLE, C079),
+    or compute_lod on the analytic derivatives for a (w, h) texture (a
+    Mip Level Select on the derivative road, C072). The same functions
+    on the same attributes() output the CPU's sampler reads; one upload
+    per distinct key per frame, like hal_uvgrad, and one BUILD per key
+    per job (A12.8: fill_base runs per pass)."""
+    from ..core import texture as TX
+    cache = getattr(job, '_lod_fields', None)
+    if cache is None:
+        cache = job._lod_fields = {}
+    hit = cache.get((id(gbuf), key))
+    if hit is not None and hit[0] is gbuf:
+        return hit[1]
+    h, w = gbuf.tri.shape
+    field = np.zeros((h, w, 4), np.float32)
+    cov = gbuf.tri >= 0
+    if cov.any():
+        tri = gbuf.tri[cov]
+        bary = gbuf.bary[cov]
+        opts = TX.sample_opts(st)
+        bias = float(getattr(st, 'tex_mip_bias', 0.0) or 0.0)
+        if opts['lod_source'] == 'GS_Q':
+            P = job.attributes(tri, bary, need={'P'})[0]                  # A0.5: P alone
+            field[cov, 0] = TX.gs_lod16(job.view_depth(P), opts['lod_k16'], opts['lod_l'])
+        elif opts['lod_source'] == 'TRIANGLE':
+            field[cov, 0] = job.tri_lod(key[0], key[1], bias)[tri]         # C079
+        else:
+            tri, bary, uv = _field_uv(job, gbuf, st, cov)
+            du, dv = job.uv_screen_gradients(tri, bary, uv)
+            field[cov, 0] = TX.compute_lod(du, dv, key[0], key[1], bias)    # C072 on the derivative road
+    cache[(id(gbuf), key)] = (gbuf, field)
+    return field
+
+
+#: R251: fog runs INSIDE the deferred material pass (`hal_fog`,
+#: gpu/material.FOG_GLSL) -- bitwise the CPU's apply_fog in the simulator.
+#: The module switch exists for the A/B in the test suite (the
+#: MATERIAL_TEXELS precedent) and, unlike that precedent, it is IN the plan
+#: signature: a gate the plan reads must be, or a cache hit walks straight
+#: past the refusal. Off, every primary pass carries `fog_cpu` and the
+#: 1.89.0 readback fog runs below.
+FOG_ON_GPU = True
+
+
+def _fog_structure(st, scene):
+    """`consts['fog']`: the branches hal_fog emits (core/fog.structure)
+    plus the camera type, which decides the z-fog form (F007)."""
+    from ..core import fog as _FOG
+    fs = _FOG.structure(st)
+    if fs:
+        fs['ortho'] = str(getattr(getattr(scene, 'camera', None), 'type',
+                                  'PERSP')) == 'ORTHO'
+        # R251 LIGHT-A2: the plan's fog notes, once per plan (the
+        # ORTHO fallback of the GC range adjust, a table inert under
+        # Ground Fog); the CPU road prints the same lines once
+        for _note in _FOG.plan_notes(st, fs['ortho']):
+            print(_note)
+        # F015's fog half (LIGHT-A2): the lobe joins the target only when
+        # a screen-spot lamp exists AND Spotlight Fog > 0 (both in the
+        # signature: _light_sig's screen_spot, st_sig's fog_spot gate)
+        fs['spot'] = _FOG.spot_on(st) and any(
+            getattr(l, 'screen_spot', False)
+            for l in (getattr(scene, 'lights', ()) or ()))
+    return fs
+
+
+def _fogtab_needed(st, scene):
+    """`consts['fogtab']`, lighting.md section 0's ONE rule: iff true,
+    every pass declares, appends and binds the hal_fogtab sampler."""
+    if bool(getattr(st, 'fog', False)):
+        return True
+    if str(getattr(st, 'specular_viewer', 'PIXEL')) == 'AXIS':
+        return True
+    # R251 LIGHT-B1 (F015): a screen-spot lamp reads the view row from
+    # hal_fogtab texel 3 (integrator: LIGHT-B1's clause of the one rule)
+    if any(getattr(l, 'screen_spot', False)
+           for l in (getattr(scene, 'lights', ()) or ())):
+        return True
+    from ..core import shading as _SH
+    axis = getattr(_SH, 'AXIS_MODELS', None)
+    if axis:
+        from ..core.render import material_model
+        return any(material_model(m, st) in axis
+                   for m in (getattr(scene, 'materials', ()) or ()))
+    return False
+
+
 def _fog_readback(job, gbuf, passes, out, hit):
-    """The CPU's own fog over the deferred readback, pixel-rate only.
+    """The CPU's own fog over the deferred readback, for the materials the
+    planner named `fog_cpu` -- and only those.
 
-    Fog is separable -- a lerp toward the fog colour by geometry alone --
-    so instead of a GLSL twin of four fog modes, the vertex quantisation
-    and the height layer, the readback takes core.render.apply_fog with
-    the same P and view depth ctx.depth carries. Order matches the CPU
-    exactly: lighting, traced composites and the env term are already in
-    `out`; fog is the CPU's LAST rgb operation, and it is the last here.
+    R251: fog is in the material pass for every primary pixel-rate pass
+    (`hal_fog`); this road remains for the materials whose composites land
+    AFTER the readback (traced reflections and refractions, a CPU-evaluated
+    environment term: the CPU fogs `base + r*hit`, so in-shader fog would
+    give `fog(base) + r*hit`) and for the module switch. `_one_material`
+    decides `binds['fog_cpu']` before the source exists and prints the
+    reason once per plan; here the selection is by material id, exactly
+    the 1.89.0 body over those ids, now handing the screen pixels to
+    `fog_for_points` (the Voodoo dither reads them).
 
-    Vertex-rate materials SKIP: shade_batch lit their corners with
-    rate_mode LIGHT, which runs apply_fog at the corner -- per-vertex
-    fog, the era's own -- and the interpolated product already carries
-    it. Fogging again would double-attenuate exactly those materials.
+    Returns `out` by IDENTITY when nothing was fogged on the CPU (the
+    tests assert structure, never wall-clock). Vertex-rate materials SKIP
+    as before: shade_batch lit their corners with rate_mode LIGHT, which
+    runs apply_fog at the corner, and the interpolated product already
+    carries it.
     """
     st = job.settings
     if not getattr(st, 'fog', False) or not hit.any():
         return out
+    cpu_ids = sorted({int(mat_id) for mat_id, _n, _s, binds in passes
+                      if (binds or {}).get('fog_cpu')
+                      and not (binds or {}).get('vlight')})
+    if not cpu_ids:
+        return out
     from ..core.render import fog_for_points
-    vrate = sorted(mat_id for mat_id, _n, _s, binds in passes
-                   if (binds or {}).get('vlight'))
     py, px = np.nonzero(hit)
     tri = gbuf.tri[py, px]
     mesh = job.scene.mesh
     mi = mesh.mat_index[tri] if mesh.mat_index is not None \
         else np.zeros(tri.size, np.int32)
-    sel = ~np.isin(mi, np.asarray(vrate, np.int64)) if vrate \
-        else np.ones(tri.size, bool)
+    sel = np.isin(mi, np.asarray(cpu_ids, np.int64))
     if not sel.any():
         return out
-    out[py[sel], px[sel]] = fog_for_points(
-        job, tri[sel], gbuf.bary[py, px][sel], out[py[sel], px[sel]])
+    pys, pxs = py[sel], px[sel]
+    # R251 C119 (MAT-B): the CPU fogs at the cell corner's depth (its
+    # ctx.depth derives from the snapped P), so the readback snaps with
+    # the same grid object before fogging
+    _fb = gbuf.bary[py, px][sel]
+    _rg = REYES.grid_for(job)
+    if _rg is not None:
+        _fb = REYES.snap(_fb, tri[sel], _rg)
+    # R251 LIGHT-A2 (F006): the fog_cpu materials' own dials, per
+    # pixel from binds['fog_mat'] (burn, bias, bank), so the refusal
+    # road honours them exactly as shade_batch's surf does
+    from ..core.fog import readback_surf as _rbs
+    surf_rb = _rbs(passes, mi[sel])
+    out[pys, pxs] = fog_for_points(
+        job, tri[sel], _fb, out[pys, pxs],
+        px=pxs, py=pys, surf=surf_rb)
     return out
 
 
@@ -3889,6 +4467,20 @@ def simulate(job, gbuf, passes=None, atlases=None):
         if passes is None:
             return None, why
     h, w = gbuf.tri.shape
+    # R248: the driver's own rule, mirrored -- a material on screen
+    # without a pass refuses by name, and only the passes on screen run
+    present = _present_materials(job.scene.mesh, gbuf)
+    planned_ids = {int(p[0]) for p in passes}
+    missing = sorted(present - planned_ids)
+    if missing:
+        unp = (atlases or {}).get('__unplanned') or {}
+        return None, (f'{len(missing)} material(s) on screen have no GPU '
+                      'pass: ' + '; '.join(
+                          f"'{_material_name(job, mi)}'"
+                          + (f' ({unp[mi]})' if mi in unp else
+                             ' (no pass in the plan)')
+                          for mi in missing[:4]))
+    passes = [p for p in passes if int(p[0]) in present]
     ids, attrs, side, tris, tside = _textures(job, gbuf)
     yy, xx = np.mgrid[0:h, 0:w]
     uv = np.stack([(xx.ravel() + 0.5) / w, (yy.ravel() + 0.5) / h],
@@ -3905,7 +4497,7 @@ def simulate(job, gbuf, passes=None, atlases=None):
     for sname, entry in (atlases or {}).items():
         if sname.startswith('__'):
             continue               # plans and specs, not atlases
-        _key, build = entry
+        _key, build = entry[0], entry[1]    # R251 C015: a stamped 3-tuple
         tex[sname] = Texture(build(), colorspace='Non-Color', filt='NEAREST',
                              wrap='EXTEND')
 
@@ -3945,6 +4537,17 @@ def simulate(job, gbuf, passes=None, atlases=None):
             uni[sname] = Texture(_mip_atlas(job.textures[key])[0],
                                  colorspace='Non-Color', filt='NEAREST',
                                  wrap='EXTEND')
+        # R251 (TEX-2): the summed-area atlases (C088) and the CPU-decided
+        # LOD fields (C022 / C079 / C072), by name as the driver binds them
+        for sname, key in (binds.get('textures_sat') or {}).items():
+            from .material import sat_atlas as _sat_atlas
+            uni[sname] = Texture(_sat_atlas(job.textures[key]),
+                                 colorspace='Non-Color', filt='NEAREST',
+                                 wrap='EXTEND')
+        for uniform, key in (binds.get('textures_lod') or {}).items():
+            uni[uniform] = Texture(_lod_field(job, gbuf, job.settings, key),
+                                   colorspace='Non-Color', filt='NEAREST',
+                                   wrap='EXTEND')
         if binds.get('needs_uvgrad'):
             uni['hal_uvgrad'] = Texture(_uvgrad_field(job, gbuf),
                                         colorspace='Non-Color',
@@ -3953,6 +4556,12 @@ def simulate(job, gbuf, passes=None, atlases=None):
             uni['hal_vscreen'] = Texture(_pack_vscreen(job),
                                          colorspace='Non-Color',
                                          filt='NEAREST', wrap='EXTEND')
+        if 'hal_reyes' in (binds.get('samplers') or ()):
+            # R251 C119 (MAT-B): the per-triangle (n, inv_n) pair, the
+            # CPU's own numbers, beside hal_vlight
+            uni['hal_reyes'] = Texture(REYES.image(job),
+                                       colorspace='Non-Color',
+                                       filt='NEAREST', wrap='EXTEND')
         uni['hal_attr_side'] = np.full(n, float(side), np.float32)
         uni['hal_slot_count'] = np.full(n, 4.0, np.float32)
         uni['hal_tri_side'] = np.full(n, float(tside), np.float32)
@@ -4015,6 +4624,23 @@ def simulate(job, gbuf, passes=None, atlases=None):
         return None, why
     out = out.reshape(h, w, 3)
     hit = hit.reshape(h, w)
+    # R248: the coverage law, mirrored from shade_frame
+    _cov = gbuf.tri >= 0
+    _mesh = job.scene.mesh
+    if _mesh.mat_index is not None:
+        _mpx = np.where(_cov, _mesh.mat_index[np.maximum(gbuf.tri, 0)], -1)
+        _owed = _cov & np.isin(_mpx, list(planned_ids)) & ~hit
+    else:
+        _mpx = None
+        _owed = _cov & ~hit
+    if _owed.any():
+        _names = [] if _mpx is None else [
+            f"'{_material_name(job, int(mi))}'"
+            for mi in np.unique(_mpx[_owed])[:4]]
+        return None, (f'{int(_owed.sum())} covered pixel(s) came back '
+                      'unshaded from the material passes '
+                      f'({", ".join(_names) or "?"}); the frame shades on '
+                      'the CPU')
     if str(getattr(job.settings, 'transparency', 'NONE')) == 'STIPPLE':
         # the encoded Screen Door bit, decoded exactly as the driver
         # path decodes its readback and carried the same way
@@ -4048,6 +4674,33 @@ def simulate(job, gbuf, passes=None, atlases=None):
         except _SweepFail as sf:
             return None, str(sf)
     out = _fog_readback(job, gbuf, passes, out, hit)
+    # R250: the sky pass, mirrored -- the same source over the same ids,
+    # its colour at the uncovered pixels (covered ones discard); the
+    # verdict rides the G-buffer as the driver road's does
+    _vp = getattr(job, 'vp', None)
+    try:
+        gbuf.gpu_sky = False
+        gbuf.gpu_sky_why = ''
+    except AttributeError:
+        pass
+    if _vp is not None:
+        from . import sky as GSKY
+        sky4, sky_why = GSKY.simulate(job.scene, gbuf, job.settings, _vp,
+                                      job.eye, job.textures,
+                                      ss=int(getattr(job, 'ss', 1) or 1))
+        if sky4 is not None:
+            unc = gbuf.tri < 0
+            out[unc] = sky4[unc][:, :3]
+            try:
+                gbuf.gpu_sky = True
+                gbuf.sim_sky = sky4
+            except AttributeError:
+                pass
+        else:
+            try:
+                gbuf.gpu_sky_why = str(sky_why)
+            except AttributeError:
+                pass
     return out, hit
 
 
@@ -4080,6 +4733,25 @@ def shade_frame(job, gbuf):
     t0 = _time.perf_counter()
     mesh = job.scene.mesh
     mkey = _mesh_key(mesh)
+    # R248: only the passes ON SCREEN compile and draw -- a plan carries
+    # a pass for every material the mesh has, and a pass with no pixel
+    # writes nothing, so skipping it is bit-identical and saves a
+    # driver compile per hidden material. A material on screen with NO
+    # pass is the field's unshaded-black defect: it never draws black
+    # again -- the frame refuses, by name, and shades on the CPU
+    present = _present_materials(mesh, gbuf)
+    planned_ids = {int(p[0]) for p in passes}
+    missing = sorted(present - planned_ids)
+    if missing:
+        unp = atlases.get('__unplanned') or {}
+        why = '; '.join(
+            f"'{_material_name(job, mi)}'"
+            + (f' ({unp[mi]})' if mi in unp else ' (no pass in the plan)')
+            for mi in missing[:4])
+        return None, (f'{len(missing)} material(s) on screen have no GPU '
+                      f'pass: {why}')
+    all_passes = passes
+    passes = [p for p in passes if int(p[0]) in present]
     ids = GB.pack_ids(gbuf)                    # camera-dependent: every frame
     side_holder = {}
 
@@ -4097,9 +4769,17 @@ def shade_frame(job, gbuf):
     prepass_tex = {}               # (mat_id, sampler name) -> height texture
     try:
         tex_ids = device.upload(ids)
+        # R249: the ink pass reads this frame's ids texture too (the
+        # G-buffer holds it; a later drop is safe -- every draw that
+        # reads it is followed by a readback that proves it executed)
+        try:
+            gbuf.gpu_ids_texture = tex_ids
+        except AttributeError:
+            pass
         tex_attrs = device.upload_cached(('gb_attrs',) + mkey, build_attrs)
         tex_tris = device.upload_cached(('gb_tris',) + mkey, build_tris)
-        tex_shadows = {sname: device.upload_cached(entry[0], entry[1])
+        tex_shadows = {sname: device.upload_cached(entry[0], entry[1],
+                                                   *entry[2:])
                        for sname, entry in atlases.items()
                        if not sname.startswith('__')}
         if not getattr(job.settings, 'tex_perspective', True):
@@ -4117,6 +4797,11 @@ def shade_frame(job, gbuf):
             # Pixel Size: camera-dependent, packed per frame like the
             # footprint field, bound by name through tex_shadows
             tex_shadows['hal_vscreen'] = device.upload(_pack_vscreen(job))
+        if any('hal_reyes' in (b.get('samplers') or ()) for b in all_binds):
+            # R251 C119 (MAT-B): a VALUE (it depends on the camera, which
+            # the plan signature excludes): uploaded per frame beside
+            # hal_vlight, bound by name to every pass that declares it
+            tex_shadows['hal_reyes'] = device.upload(REYES.image(job))
         tex_images = _gather_pass_textures(all_binds, job.textures,
                                            device.upload_cached)
         # the footprint field: the CPU's analytic UV derivatives for every
@@ -4125,6 +4810,14 @@ def shade_frame(job, gbuf):
         tex_uvgrad = None
         if any((b or {}).get('needs_uvgrad') for b in all_binds):
             tex_uvgrad = device.upload(_uvgrad_field(job, gbuf))
+        # R251 (TEX-2): the CPU-decided LOD fields (hal_lodq /
+        # hal_lod_WxH), one upload per distinct key per frame
+        tex_lod = {}
+        for b in all_binds:
+            for _un, _lk in ((b or {}).get('textures_lod') or {}).items():
+                if _un not in tex_lod:
+                    tex_lod[_un] = device.upload(
+                        _lod_field(job, gbuf, job.settings, _lk))
         # vertex-rate passes: the CPU lights the corners (worker side --
         # cheap, that is the point of the rate) and the values cross as
         # one small texture per material. Fresh each frame: the corners
@@ -4136,6 +4829,11 @@ def shade_frame(job, gbuf):
                 vlight_tex[int(_vmi)] = device.upload(
                     _vlight_image(job, spec))
     except Exception as exc:                                    # noqa: BLE001
+        # R250: an unexpected exception here is a reason AND a traceback
+        # (the field's 'object() takes no arguments' named nothing)
+        import traceback as _tb
+        print('[Halcyon GPU] the G-buffer upload raised: '
+              + _tb.format_exc())
         return None, f'uploading the G-buffer failed: {exc}'
     # the packers only ran on a cache miss; on a hit the sides come from the
     # texture itself (attribute textures are square)
@@ -4165,6 +4863,8 @@ def shade_frame(job, gbuf):
                     bind[sname] = vlight_tex[int(mat_id)]
                 elif sname == 'hal_uvgrad' and tex_uvgrad is not None:
                     bind[sname] = tex_uvgrad
+                elif sname in tex_lod:
+                    bind[sname] = tex_lod[sname]              # R251 TEX-2
                 elif sname in tex_shadows:
                     bind[sname] = tex_shadows[sname]
                 elif (id(binds), sname) in tex_images:
@@ -4317,6 +5017,29 @@ def shade_frame(job, gbuf):
             t.free()
         return None, err
 
+    # R250: the sky / background, drawn LAST in the same burst -- blend
+    # NONE, covered pixels discard, so the material passes' texels stand
+    # and every uncovered texel is the world's colour whatever a pass
+    # left there. The readback is then the whole frame. Refusals name
+    # themselves and the CPU draws the sky as it did before
+    from . import sky as GSKY
+    _sky_draw, _sky_plan, _sky_why = None, None, None
+    _job_vp = getattr(job, 'vp', None)
+    if _job_vp is not None:
+        try:
+            _sky_draw, _sky_plan = GSKY.prepare(
+                job.scene, gbuf, job.settings, _job_vp, job.eye,
+                job.textures, int(getattr(job, 'ss', 1) or 1), tex_ids)
+            if _sky_draw is None:
+                _sky_why = _sky_plan
+                _sky_plan = None
+        except Exception as exc:                                # noqa: BLE001
+            _sky_draw, _sky_plan = None, None
+            _sky_why = f'the sky pass failed to prepare: {exc}'
+    else:
+        _sky_why = 'the frame carries no view-projection for the sky pass'
+    _sky_drawn = False
+
     t_draw = 0.0
     _burst_snap = {}
     _c_own = _c_env = 0.0
@@ -4332,12 +5055,16 @@ def shade_frame(job, gbuf):
             # R175: every pass and the readback in ONE marshal crossing
             # -- the same commands in the same order, none of the
             # per-pass queue sleeps (was ~14 ms of latency per pass)
-            got = device.draw_many(
-                [(shader, {**uni, **extra} if extra else uni, bind,
-                  target, 'ALPHA_PREMULT', i == 0, None)
-                 for i, (name, shader, bind, extra)
-                 in enumerate(plan_draw)],
-                read=target)
+            _draws = [(shader, {**uni, **extra} if extra else uni, bind,
+                       target, 'ALPHA_PREMULT', i == 0, None)
+                      for i, (name, shader, bind, extra)
+                      in enumerate(plan_draw)]
+            if _sky_draw is not None:
+                _sk_sh, _sk_uni, _sk_bind = _sky_draw
+                _draws.append((_sk_sh, _sk_uni, _sk_bind, target, 'NONE',
+                               False, None))
+            got = device.draw_many(_draws, read=target)
+            _sky_drawn = _sky_draw is not None
             # snapshot NOW: the sweeps and layer ranks run their own
             # bursts before LAST_TIMINGS is written, and this pair must
             # describe the OPAQUE frame's burst
@@ -4353,21 +5080,30 @@ def shade_frame(job, gbuf):
         if got is not None:
             t_draw = _time.perf_counter() - t1
             _tc0 = _time.perf_counter()
-            hit = got[:, :, 3] > 0.5
-            # no masking needed: the target was cleared to zero and the
-            # blend leaves untouched pixels at zero, so the colour planes
-            # are already exactly what a mask would have produced. The
-            # where() this replaces was most of the composite slice
+            # R250: `hit` means 'a material pass wrote this covered
+            # pixel'. The sky draw writes alpha 1 at UNCOVERED pixels,
+            # so the mask is taken over the G-buffer's coverage -- the
+            # fog readback indexes triangles through it, and a sky pixel
+            # (tri -1) must never reach that road
+            _covered_px = gbuf.tri >= 0
+            hit = (got[:, :, 3] > 0.5) & _covered_px
+            # the colour planes are exactly what a mask would have
+            # produced at covered pixels (the target was cleared to zero
+            # and the blend leaves untouched pixels at zero); at
+            # uncovered pixels they are the sky when it drew
             out = np.ascontiguousarray(got[:, :, :3], np.float32)
             if stip:
                 # the encoded Screen Door bit (see the pass composite):
                 # 0.9 = kept, 0.6 = dropped; decoded here and carried
                 # out of band on the G-buffer for the frame's alpha
-                gbuf.gpu_alpha = got[:, :, 3] > 0.75
+                gbuf.gpu_alpha = (got[:, :, 3] > 0.75) & _covered_px
             _c_own = (_time.perf_counter() - _tc0) * 1000.0
         else:
             out = np.zeros((h, w, 3), np.float32)
             hit = np.zeros((h, w), bool)
+            _sky_drawn = False
+            _sky_why = 'the blended burst fell back to per-pass readbacks'
+            _covered_px = gbuf.tri >= 0
             if stip:
                 gbuf.gpu_alpha = np.zeros((h, w), bool)
             for name, shader, bind, extra in plan_draw:
@@ -4379,7 +5115,7 @@ def shade_frame(job, gbuf):
                 except Exception as exc:                        # noqa: BLE001
                     return None, f"drawing '{name}' failed: {exc}"
                 t_draw += _time.perf_counter() - t1
-                keep = frame[:, :, 3] > 0.5
+                keep = (frame[:, :, 3] > 0.5) & _covered_px
                 # masked copy instead of boolean fancy indexing: the same
                 # pixels move, but no index lists are materialised -- at a
                 # supersampled frame this was most of the composite bucket
@@ -4389,9 +5125,55 @@ def shade_frame(job, gbuf):
                 if stip:
                     gbuf.gpu_alpha |= frame[:, :, 3] > 0.75
     finally:
-        target.free()
         for t in prepass_targets:
             t.free()
+        # R250: the frame stays on the GPU when nothing on the CPU will
+        # touch its readback -- the sky drew (every pixel is the frame's),
+        # no Screen Door (its alpha codes differ from the frame's alpha),
+        # no fog, no CPU environment composite, no reflection sweep. The
+        # target is then kept for the ink, the resolve and the post chain
+        # (gpu/frame.py owns its lifetime); otherwise it is pooled as before
+        _keep_target = bool(
+            got is not None and _sky_drawn and not stip
+            # R251: fog runs in the pass; only a fog_cpu material
+            # (traced / env composite, or the module switch) edits it
+            and not any((b or {}).get('fog_cpu')
+                        for _fm, _fn, _fs, b in passes)
+            and not (atlases.get('__env') or {}).get('primary')
+            and atlases.get('__reflect') is None)
+        if not _keep_target:
+            target.free()
+
+    def _fail(why):
+        if _keep_target:
+            target.free()
+        return None, why
+
+    # R248: every covered pixel whose material has a pass must have been
+    # written (alpha one, or the Screen Door's encoded bit). A pixel
+    # left at the cleared zero is the unshaded-black defect on the
+    # driver's side -- a pass that compiled and wrote nothing -- and
+    # the frame refuses by name rather than show it
+    try:
+        covered = gbuf.tri >= 0
+        if mesh.mat_index is not None:
+            mat_px = np.where(covered, mesh.mat_index[np.maximum(gbuf.tri, 0)], -1)
+            owed = covered & np.isin(mat_px, list(planned_ids)) & ~hit
+        else:
+            owed = covered & ~hit
+        n_owed = int(owed.sum())
+    except Exception:                                           # noqa: BLE001
+        n_owed, owed, mat_px = 0, None, None
+    if n_owed:
+        names = []
+        try:
+            for mi in np.unique(mat_px[owed])[:4]:
+                names.append(f"'{_material_name(job, int(mi))}'")
+        except Exception:                                       # noqa: BLE001
+            pass
+        return _fail(f'{n_owed} covered pixel(s) came back unshaded from '
+                     f'the material passes ({", ".join(names) or "?"}); '
+                     'the frame shades on the CPU')
 
     # the CPU-composite environment term: for worlds richer than the
     # baked GLSL paths, the renderer's own world_color along the
@@ -4402,7 +5184,7 @@ def shade_frame(job, gbuf):
         out = _apply_cpu_env_primary(job, gbuf,
                                      (env_plan or {}).get('primary'), out)
     except Exception as exc:                                    # noqa: BLE001
-        return None, f'the environment composite failed: {exc}'
+        return _fail(f'the environment composite failed: {exc}')
     _c_env = (_time.perf_counter() - _tc1) * 1000.0
 
     # the traced bounces: rays off the reflective then refractive pixels,
@@ -4469,14 +5251,14 @@ def shade_frame(job, gbuf):
             out = _run_sweeps(job, gbuf, rplan, out, draw_secondary, isect,
                               env=env_plan)
         except _SweepFail as sf:
-            return None, str(sf)
+            return _fail(str(sf))
         except Exception as exc:                                # noqa: BLE001
             # shade_frame's contract is that EVERY failure is a reason
             # and the caller shades on the CPU -- the field's depth-2
             # section died whole because a ValueError escaped this loop
             # instead of becoming one
-            return None, (f'the ray sweeps failed: '
-                          f'{type(exc).__name__}: {exc}')
+            return _fail(f'the ray sweeps failed: '
+                         f'{type(exc).__name__}: {exc}')
         t_reflect = _time.perf_counter() - t1
 
     total = _time.perf_counter() - t_all
@@ -4532,4 +5314,27 @@ def shade_frame(job, gbuf):
     _tcf = _time.perf_counter()
     out = _fog_readback(job, gbuf, passes, out, hit)
     LAST_TIMINGS['c_fog_ms'] = (_time.perf_counter() - _tcf) * 1000.0
+    # R250: the sky's verdict and the frame's residency, for render()
+    # and the field test. gpu_frame_rgba is the readback itself when it
+    # IS the frame (nothing on the CPU touched it): rgb whole, the sky
+    # in the uncovered pixels; render() writes only the alpha plane
+    if _sky_drawn and _sky_plan is not None:
+        LAST_TIMINGS['sky'] = int(_sky_plan['mode'])
+    else:
+        LAST_TIMINGS['sky'] = -1
+    LAST_TIMINGS['sky_why'] = '' if _sky_drawn else str(_sky_why or '')
+    LAST_TIMINGS['resident'] = bool(_keep_target)
+    try:
+        gbuf.gpu_sky = bool(_sky_drawn)
+        gbuf.gpu_sky_why = '' if _sky_drawn else str(_sky_why or '')
+        if _keep_target:
+            from .frame import Resident as _Resident
+            gbuf.gpu_frame = _Resident(target, w, h, 'shade')
+            gbuf.gpu_frame_rgba = got
+        else:
+            gbuf.gpu_frame = None
+            gbuf.gpu_frame_rgba = None
+    except AttributeError:
+        if _keep_target:
+            target.free()
     return out, hit

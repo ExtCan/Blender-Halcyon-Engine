@@ -79,6 +79,9 @@ class RenderSettings:
     dof_amount: float = 1.0
     dof_layers: int = 5
     dof_max_radius: float = 24.0
+    dof_method: str = 'POST'         # POST | LENS_ACCUMULATE (R251 C098: REYES / accumulation-buffer lens passes, one full render per point)
+    dof_lens_pattern: str = 'HALTON_DISC'   # HALTON_DISC | MAX_SPIRAL
+    dof_lens_samples: int = 23       # one full render per point
     palette_lock: bool = True
     film_transparent: bool = False
     res_preset: str = 'CUSTOM'
@@ -91,40 +94,67 @@ class RenderSettings:
     aa_samples: int = 1               # supersample factor (1..8)
     aa_filter: str = 'BOX'            # BOX | TRIANGLE | GAUSS | CATROM | MITCHELL
     aa_filter_width: float = 1.0
+    aa_sample_pattern: str = 'GRID'   # R251 C127: GRID | JITTER -- REYES per-subpixel jitter from the integer hash
+    aa_clamp_samples: bool = False     # R251 C094: LightWave Limit Dynamic Range -- min(sample, 1) before the AA filter
+    aa_gamma_blend: bool = False       # R251 C122: Blender 2.41's gamma-2 OSA sample blend (400-entry tables)
     aa_edge_threshold: float = 0.1
+    n64_coverage_aa: bool = False      # R251 C001: RDP 3-bit coverage + VI scan-out blend (needs aa_samples 1)
+    n64_divot: bool = True             # R251 C001: the VI divot median after the blend
     # accumulation motion blur: the frame renders motion_steps times across
     # the shutter (re-exported at each subframe) and averages -- the
     # accumulation-buffer trails of the era, paid for honestly at N frames
     motion_blur: bool = False
     motion_shutter: float = 0.5        # shutter open time, in frames
     motion_steps: int = 5
+    motion_blur_mode: str = 'MEAN'    # MEAN | MAX_SLICES | LW_FIELD (R251 C090)
+    motion_samples: int = 10          # Max's Samples (MAX_SLICES): slices each pixel averages
+    motion_dither: float = 0.0        # Max 3+ multi-pass Dither Strength
+    motion_dither_tile: int = 32      # Max 3+ multi-pass Tile Size (px)
     # ------------------------------------------------------------- stereo
     # parallel cameras with an off-axis (asymmetric-frustum) shift, so
     # the convergence plane sits at zero parallax with no vertical error
     stereo_mode: str = 'NONE'          # NONE | ANAGLYPH | SBS | CROSS
     stereo_eye_distance: float = 0.065
     stereo_convergence: float = 8.0
+    stereo_parallax_layers: bool = False   # C016 Virtual Boy: one render, whole-pixel shift per object
+    stereo_parallax_max: int = 16          # C016 the largest whole-pixel parallax; the sky takes it
+    # ------------------------------------------------------------- camera (R251)
+    camera_yshear: bool = False       # C058 Heretic/Build Y-shear: level view + projection slide by f*tan(pitch)
+    pano_parts: int = 1               # C125 Blender 2.4 Pano + Xparts: N planar strips, butted; 1 = off
     # ------------------------------------------------------------- geometry
     backface_cull: bool = False
     two_sided_lighting: bool = True
     subpixel_precision: str = 'FLOAT'  # FLOAT | FIXED_4 | FIXED_1 | INTEGER
+    pixel_center: str = 'HALF'        # R251 C084: HALF | INTEGER_D3D -- Direct3D 3-9 sampled at the integer corner
     vertex_snap: bool = False          # PlayStation-style vertex jitter
     vertex_snap_grid: float = 1.0      # in pixels of the *output* image
+    vertex_quantize: str = 'NONE'     # R251 C012: NONE | PS1 | N64 -- integer vertex formats on a world lattice
+    vertex_units: float = 64.0        # R251 C012: lattice units per world unit
     depth_precision: int = 24          # z-buffer bits (8..32); low = fighting
+    depth_encoding: str = 'LINEAR'    # R251 C007/C026/C075: LINEAR | N64_FLOAT18 | GC_14E2 | GC_13E3 | GC_12E4 | W_FIXED | VOODOO_W16
     depth_sort: str = 'ZBUFFER'        # ZBUFFER | PAINTERS
-    painters_key: str = 'CENTROID'     # CENTROID | NEAREST | FARTHEST
+    painters_key: str = 'CENTROID'     # CENTROID | NEAREST | FARTHEST | ORDERING_TABLE (R251 C004)
+    ot_length: int = 4096            # R251 C004: PS1 ordering-table entries (painters_key ORDERING_TABLE)
+    ot_far: float = 40.0              # R251 C004: scene distance of the last bucket
     # the camera raster's near-plane epsilon. 1e-5 IS the value
     # the rasterisers have always run; the setting used to claim
     # 1e-4 and drive nothing (found by the settings audit)
     clip_near_epsilon: float = 1e-5
+    near_clip_mode: str = 'CLIP'      # R251 C027: CLIP | REJECT -- whole-triangle rejection at near/far/guard 6.4 (PS2 VU1, PS1)
     # ------------------------------------------------------------- shading
     default_model: str = 'PHONG'
     force_model: str = 'NONE'          # override every material's model
     shading_rate: str = 'PIXEL'        # PIXEL | VERTEX (global Gouraud) | FACE
     normal_source: str = 'AUTO'        # AUTO | SPLIT | FACE | VERTEX
+    shading_rate_area: float = 0.0   # R251: REYES ShadingRate as an AREA in pixels; 0 = off (per-pixel), PRMan's 1.0 = one shade per pixel-area micropolygon
     specular_in_gamma: bool = True     # 90s renderers lit in display space
+    # PIXEL | AXIS -- the true eye vector, or one camera axis for the
+    # frame (GL 1.1 infinite viewer, Sega Model, DS) (R251)
+    specular_viewer: str = 'PIXEL'
     clamp_specular: bool = True
     light_clamp: float = 0.0           # 0 = off
+    # fold the frame number into crand's hash: POV's flicker on purpose (R251)
+    crand_per_frame: bool = False
     ambient_occlusion: bool = False
     sss: bool = True                   # BI's R_SSS master switch
     # workflow, not shading: the append watch (classic lamps fixed the
@@ -158,8 +188,11 @@ class RenderSettings:
     shadow_default: str = 'MAP'
     shadow_map_size: int = 512
     shadow_bias: float = 0.02
+    shadow_map_depth: str = 'CLASSIC'    # R251 C117: CLASSIC | MIDPOINT -- Woo's halfway map (Maya Use Mid Dist, Blender Classic-Halfway)
     shadow_softness: float = 1.0
     shadow_samples: int = 4
+    planar_plane_z: float = 0.0     # R251 C052: the receiver plane Z of PLANAR shadows (Blinn / Model 1)
+    modvol_scale: int = 128     # R251 C020: the Dreamcast FPU_SHAD_SCALE register for modifier volumes (colour * scale / 256)
     # ------------------------------------------------------------ raytracing
     raytrace: bool = False
     ray_depth: int = 2
@@ -185,6 +218,20 @@ class RenderSettings:
     tex_perspective: bool = True       # False = affine mapping (PS1 warp)
     tex_affine_subdiv: int = 0         # affine correction subdivision, 0 = none
     tex_wrap_default: str = 'REPEAT'
+    # R251 texture pack (TEX-1, wave 1)
+    tex_format: str = 'NONE'          # R251: once-per-upload texel format (Glide/D3D/PCX/Model 2/NCC/DS); NONE = the image's own precision
+    tex_tmem_format: str = 'OFF'      # R251: N64 4 KB TMEM budget by format (size, palette, depth from one byte rule); OFF = none; owns the texel format
+    tex_compress: str = 'NONE'        # R251: baked block compression (DXT1 / Xbox NV2A decode / GameCube CMPR / Dreamcast VQ); NONE = uncompressed
+    tex_frac_bits: str = 'FLOAT'      # R251: bilinear weight precision (FLOAT | BITS_4 Voodoo1/Verite | BITS_8 Voodoo2)
+    # R251 texture pack (wave 2, TEX-2): plumbed through sample_opts on both roads, inert until pass 2
+    tex_clamp_mode: str = 'EDGE'      # R251: how Extend nodes clamp (EDGE = CLAMP_TO_EDGE; GL_CLAMP = OpenGL 1.1 border, the half-texel seam)
+    tex_colorkey: bool = False        # R251: Glide/D3D chroma key tested AFTER filtering; alpha cut-outs stored as opaque black at prep
+    tex_colorkey_range: int = 0       # R251: Voodoo2 chromaRange in 8-bit levels per channel (0 = Voodoo1/D3D exact match)
+    tex_mip_select: str = 'FILTER'    # R251: how a mip level is chosen (FILTER = as today | BLEND | NEAREST_LEVEL GL/D3D | DITHER_VOODOO)
+    tex_lod_source: str = 'DERIVATIVE'  # R251: where the mip LOD comes from (DERIVATIVE = screen derivatives | GS_Q = PS2 log2(1/|Q|) << L + K | TRIANGLE = one level per polygon)
+    tex_lod_k: float = 0.0            # R251: GS TEX1 K, signed 7.4 fixed in levels (quantised to 1/16)
+    tex_lod_l: int = 0                # R251: GS TEX1 L shift (0..3)
+    tex_lod_sharpen: bool = False     # R251: N64 G_TD_SHARPEN: extrapolate level 0 away from level 1 under magnification, 9-bit clamp
     # ---------------------------------------------------------- transparency
     transparency: str = 'SORTED'       # NONE | STIPPLE | SORTED | ABUFFER
     stipple_pattern: str = 'BAYER4'
@@ -195,17 +242,53 @@ class RenderSettings:
     # blended transparency should blend. Raise it for classic cut-out
     # alpha (foliage cards, chain-link fences).
     alpha_threshold: float = 0.0
+    blend_equation: str = 'ALPHA'      # R251: the blend unit's per-layer formula -- ALPHA | PS1_AVG | PS1_ADD | PS1_SUB | PS1_QUARTER | SATURN_HALF | SATURN_SHADOW | SATURN_HALF_LUM | THREEDO_SUB | THREEDO_XOR | SNES_ADD | SNES_SUB | SNES_ADD_HALF | SNES_SUB_HALF | GBA | DS | FUZZ | THIN_WALL | IMAGINE_FOG (integer, no alpha weighting except GBA/DS)
+    translucent_order: str = 'DEPTH'   # R251: DEPTH | Y_SORT (DS auto-sort: bottom row, top row, submission) | SUBMISSION
+    translucent_depth_write: bool = False  # R251: DS POLYGON_ATTR bit 11 -- composited fragments occlude later ones
+    framebuffer: str = 'NONE'          # R251: NONE | PS2_CT16 | GC_RGBA6 | VOODOO_565_4X4 | VOODOO_565_2X2 -- the buffer every write truncates into, read back per blend
+    fb_dither: bool = True             # R251: the buffer's write dither (GS DTHE, Voodoo grDitherMode); GC always dithers
+    fb_dither_subtract: bool = True    # R251: Voodoo fbzMode bit 19, the dithered read-back
     # --------------------------------------------------------------- depth cue
     fog: bool = False
-    fog_mode: str = 'LINEAR'           # LINEAR | EXP | EXP2 | TABLE16
+    fog_mode: str = 'LINEAR'           # LINEAR | EXP | EXP2 | TABLE16 | GTE_1Z (R251)
+    # R251: the accelerator's own fog table, filled by the fog_mode curve
+    fog_table: str = 'NONE'            # NONE | VOODOO64 | PVR128 | DS32
+    # R251: W = eye depth; Z = Direct3D's post-projection z in 0..1
+    fog_depth: str = 'W'               # W | Z
     fog_color: Tuple[float, float, float] = (0.5, 0.55, 0.65)
     fog_start: float = 5.0
     fog_end: float = 40.0
     fog_density: float = 0.05
     fog_vertex: bool = False           # per-vertex fog (Voodoo/PS1 style)
+    # R251: Voodoo2 fogMode bit 6, the 4x4 matrix added to the blend fraction
+    fog_dither: bool = False
+    # R251 F005 (LIGHT-A2): one fog value per polygon from its mean vertex
+    # depth (Namco System 21)
+    fog_face: bool = False
+    # R251 F004: GX_InitFogAdjTable -- the planar fog depth scaled by the
+    # pixel column's secant (GameCube)
+    fog_range_adjust: bool = False
+    # R251 F006: Model 3 fogAmbient (scales the fog colour), and System
+    # 22's cz bank 1 -- a second Start/End pair, inert while end <= start
+    fog_ambient: float = 1.0
+    fog_bank1_start: float = 0.0
+    fog_bank1_end: float = 0.0
+    # R251 F008: FIXED | BACKDROP -- LightWave's Use Backdrop Color
+    fog_color_source: str = 'FIXED'
+    # R251 F009: POV-Ray fog_type 2 (ground fog: density 1/(1+Y^2) above
+    # the offset, Y in units of the altitude, the atan integral)
+    fog_ground_offset: float = 0.0
+    fog_ground_alt: float = 1.0
+    # R251 F010: POV-Ray fog turbulence <t> as one scalar (0 = off) and
+    # turb_depth (the share of the fog distance the noise may remove)
+    fog_turbulence: float = 0.0
+    fog_turb_depth: float = 0.5
     # R223: banded depth fog -- transmittance quantized to cel steps
     # (0 = off; 2+ = the anime painted-planes distance look)
     fog_bands: int = 0
+    # Model 3 spotlight fog attenuation: the lobe's share added to the
+    # fog colour (R251)
+    fog_spot: float = 0.0
     # height fog: the fog thins with world height above fog_height_top --
     # the layered ground mist the sixth-generation consoles drew
     fog_height: bool = False
@@ -237,6 +320,18 @@ class RenderSettings:
     #: deterministic). Empty = no image picked; CUSTOM then behaves as
     #: it always did (adaptive), so nothing existing changes.
     palette_colors: tuple = ()
+    palette_bits: str = 'NONE'         # NONE | BITS_1 | BITS_2 | CPC_27 | BITS_3 | \
+                                       # BITS_4 | BITS_5 | BITS_6 -- R251: the palette
+                                       # RAM / DAC precision every register is snapped
+                                       # to before the per-pixel search (C061)
+    attribute_cells: str = 'NONE'      # NONE | ZX_SPECTRUM | MSX1 | C64_HIRES | C64_MULTI
+                                       # -- R251: colour per character cell from the
+                                       # machine's fixed set, least squared error per
+                                       # cell (C050); owns the colour stage
+    scanline_palette: str = 'NONE'     # NONE | SPECTRUM_512 | DYNAMIC_HIRES | SHAM --
+                                       # R251: the registers rewritten every scanline, a
+                                       # median cut per line (C060); CPU only, refused
+                                       # by name on the GPU road
     dither: str = 'NONE'               # NONE | BAYER2 | BAYER4 | BAYER8 | FLOYD | \
                                        # JJN | STUCKI | ATKINSON | BURKES | SIERRA | \
                                        # SIERRA_LITE | NOISE | HALFTONE
@@ -250,6 +345,15 @@ class RenderSettings:
     brightness: float = 0.0
     color_management: str = 'NONE'     # NONE (naive 90s) | SRGB | FILMIC_OFF
     input_gamma_naive: bool = True     # skip sRGB->linear on textures
+    super_black: bool = False          # R251: 3D Studio / Max Super Black -- covered
+                                       # pixels floored at the threshold for luminance
+                                       # keying (C092)
+    super_black_threshold: int = 15    # 0..255, Max's default
+    video_color_check: str = 'NONE'    # NONE | FLAG_BLACK | SCALE_LUMA | SCALE_SAT --
+                                       # R251: 3D Studio / Max Video Color Check on the
+                                       # composite envelope (C093)
+    video_system: str = 'NTSC'         # NTSC | PAL
+    video_ire_limit: str = 'IRE_120'   # IRE_120 | IRE_110
     crt: bool = False
     crt_scanlines: float = 0.0
     crt_mask: str = 'NONE'             # NONE | APERTURE | SLOT | SHADOW
@@ -267,6 +371,46 @@ class RenderSettings:
     jpeg_quality: int = 60
     jpeg_passes: int = 1
     block_size: int = 8
+    # ------------------------------------------------ post: signal (R251)
+    # the machine's scan-out stages, between the framebuffer and the glass
+    # (core/signal_era.py; every default leaves every pixel untouched)
+    vi_dither_filter: bool = False   # R251: N64 VI DITHER_FILTER_ENABLE
+    vi_gamma: str = 'NONE'              # NONE | GAMMA | GAMMA_DITHER | DITHER_ONLY (N64 VI GAMMA_ENABLE bits)
+    copy_filter: str = 'NONE'        # NONE | DEFLICKER | DEFLICKER_AA (GameCube/Wii EFB copy, R251)
+    crtc_blend: str = 'NONE'        # NONE | PREVIOUS_FRAME | BG_COLOR (PS2 GS PMODE, R251)
+    crtc_alpha: int = 128           # PMODE ALP
+    crtc_bg_color: tuple = (0.0, 0.0, 0.0)   # GS BGCOLOR
+    video_filter: str = 'NONE'      # NONE | VOODOO1 | VOODOO2 (3dfx scan-out '22-bit' filter, R251)
+    video_filter_threshold: int = 64   # SST_VIDEO_FILTER_THRESHOLD
+    # R251 SIG-2: the digital formats' chroma, the tape, the cable, the
+    # receiver (core/signal_tape.py; every default leaves every pixel untouched)
+    chroma_format: str = 'NONE'     # NONE | Y422 | Y411 | Y420_MPEG1 | Y420_MPEG2 | Y420_DVPAL | XFB_422 (R251)
+    chroma_upsample: str = 'HOLD'   # HOLD | LINEAR: how the decoder rebuilt chroma between the sites
+    signal: str = 'RGB'              # RGB | SVIDEO | SVIDEO_PAL | RF (the cable, R251)
+    rf_bandwidth: float = 3.2       # MHz: the RF modulator's luma low-pass
+    rf_beat: float = 0.0            # the 920 kHz sound-chroma herringbone, in proportion to chroma
+    rf_snow: float = 0.0            # thermal noise as a fraction of white, hashed per pixel and frame
+    rf_ghost: float = 0.0           # the multipath ghost's strength
+    rf_ghost_delay: float = 1.0     # us along the 52.66 us NTSC active line
+    pal_decoder: str = 'NONE'       # NONE | DELAY_LINE | SIMPLE (PAL receiver, R251)
+    pal_phase_error: float = 0.0    # degrees, SIMPLE only: Hanover bars
+    pal_crawl: float = 0.0          # the 4.43 MHz subcarrier left in luma, eight-field sequence
+    tape: str = 'NONE'              # NONE | VHS | SVHS | BETAMAX | UMATIC | VIDEO8 | HI8 | BETACAM | BETACAM_SP | TYPE_C (R251)
+    tape_generations: int = 1       # dubs deep: the low-pass at sigma * sqrt(N), the noise * sqrt(N)
+    tape_noise: float = 0.02        # FM demodulation noise on luma as a fraction of white (chroma at half)
+    tape_head_switch: bool = True   # the head-switch tear: the bottom 7 lines (at 480) torn sideways, x4 noise
+    tape_dropouts: float = 0.0      # expected dropouts per frame: white dashes 8..48 px at hashed rows
+    # R251 SIG-3: the codecs the display showed and the optical printer
+    # (core/signal_codec.py; every default leaves every pixel untouched)
+    mpeg1: bool = False              # MPEG-1 intra recode (Video CD, R251 C132)
+    mpeg1_qscale: int = 8            # quantizer_scale for I pictures, 1..31
+    mpeg1_gop: int = 15              # frames per group of pictures; 0 = every frame an I picture
+    smacker: bool = False            # Smacker 4x4 block recode over the frame palette (R251 C133)
+    smacker_quality: float = 0.5     # the encoder's budget, 0..1
+    matte_glow: bool = False         # the Tron printer's backlit Kodalith mattes (R251 C134)
+    matte_glow_radius: float = 8.0   # the first diffusion pass's sigma, px at 1080 lines
+    matte_glow_passes: int = 3       # diffusion passes at radius x1, x2, x4... (1..5)
+    matte_glow_exposure: float = 1.0   # what one crisp pass adds; the passes add 1/2, 1/4...
     # ------------------------------------------------------------ post: scale
     output_scale: str = 'NONE'         # NONE | NEAREST_2X | NEAREST_3X | NEAREST_4X
     pixel_grid: bool = False
@@ -286,10 +430,13 @@ class RenderSettings:
     # what fills a dense mesh solid; CREASE draws only silhouettes and edges
     # where the surface actually turns, which stays a wireframe however many
     # triangles are behind it
-    wire_mode: str = 'ALL'            # ALL | CREASE
+    wire_mode: str = 'ALL'            # ALL | CREASE | ELITE | BEAM
     wire_angle: float = 25.0
     wire_color: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     wire_width: float = 1.0
+    wire_dot_distance: float = 0.0     # R251 C063: Elite rule -- the object collapses to a dot past this distance (0 = never)
+    beam_machine: str = 'AVG'          # R251 C055: DVG | AVG | STARWARS -- the vector generator's intensity, colour and dwell
+    beam_sigma: float = 0.7            # R251 C055: phosphor spot sigma in pixels at 480 lines
     # ------------------------------------------------- cartoon outlines
     # ink drawn from the G-buffer's own boundaries -- object ids, material
     # ids, depth breaks, normal creases -- at the internal resolution, so
@@ -515,6 +662,10 @@ RESOLUTION_PRESETS = {
 
     # --- game consoles
     'SNES':         (256, 224, 8.0, 7.0),
+    # R251 (MAT-A C049): the Super FX screen heights (SCMR), the SNES's 8:7
+    'SUPERFX_192':  (256, 192, 8.0, 7.0),
+    'SUPERFX_160':  (256, 160, 8.0, 7.0),
+    'SUPERFX_128':  (256, 128, 8.0, 7.0),
     'GENESIS':      (320, 224, 32.0, 35.0),
     'SATURN':       (352, 240, 10.0, 11.0),
     'PSX':          (320, 240, 1.0, 1.0),
@@ -639,7 +790,8 @@ RESOLUTION_GROUPS = (
                         'APPLE_II', 'ATARI_8BIT', 'BBC_MICRO',
                         'CPC', 'VIC20', 'ATARI_ST_MED', 'ATARI_ST_HI',
                         'X68000', 'PC88')),
-    ("Game Consoles", ('NES', 'SNES', 'GENESIS', 'NEOGEO', 'CPS2',
+    ("Game Consoles", ('NES', 'SNES', 'SUPERFX_192', 'SUPERFX_160',
+                       'SUPERFX_128', 'GENESIS', 'NEOGEO', 'CPS2',
                        'TG16', 'SATURN', 'PSX', 'PSX_HI', 'N64', 'N64_HI',
                        'CD_3DO', 'DREAMCAST', 'GAMECUBE', 'PS2', 'XBOX',
                        'GAMEBOY', 'GBA', 'NDS', 'PSP', 'VIRTUAL_BOY',
@@ -687,6 +839,8 @@ RESOLUTION_LABELS = {
     'AMIGA_NTSC': "Amiga NTSC Lores", 'AMIGA_PAL': "Amiga PAL Lores",
     'AMIGA_HIRES': "Amiga PAL Hires",
     'SNES': "Super NES", 'GENESIS': "Genesis / Mega Drive",
+    'SUPERFX_192': "Super FX 256x192 (Star Fox)",
+    'SUPERFX_160': "Super FX 256x160", 'SUPERFX_128': "Super FX 256x128",
     'SATURN': "Saturn", 'PSX': "PlayStation", 'PSX_HI': "PlayStation Hi-Res",
     'N64': "Nintendo 64", 'N64_HI': "Nintendo 64 Hi-Res",
     'DREAMCAST': "Dreamcast", 'GAMECUBE': "GameCube",

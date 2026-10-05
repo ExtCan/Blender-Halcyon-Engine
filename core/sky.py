@@ -9,13 +9,17 @@ Blender node graph, which remains available as its own mode.
 bpy-free, like everything else under core/.
 """
 
+import math
+import zlib
+
 import numpy as np
 
 from . import mathx as M
+from . import palette as PA
 from .patterns import fbm, hash3 as _hash3, turbulence, value_noise as _value_noise
 
 MODES = ('NODES', 'SOLID', 'GRADIENT', 'BANDS', 'STARFIELD', 'BRYCE',
-         'PHYSICAL', 'HDRI', 'PAINTED')
+         'PHYSICAL', 'HDRI', 'PAINTED', 'CYLINDER', 'LW_GRADIENT')
 
 
 def _rotate_z(d, angle):
@@ -133,6 +137,37 @@ def bands(world, dirs):
 #: the painted sky's era looks: World field values the Look menu writes
 #: (CUSTOM writes nothing). Named after the background departments they
 #: imitate, not after any studio's own colour keys.
+def lw_gradient(world, dirs):
+    """R251 (C100): LightWave 3D's Gradient Backdrop. Sky Color at the
+    horizon blending to Zenith above, Ground Color blending to Nadir
+    below, a HARD step at the horizon, each blend compressed toward the
+    horizon by a whole-number Squeeze: t = 1 - (1 - u)^s as repeated
+    multiplication (no pow: the GPU twin is bitwise). float32
+    throughout, the fixed a + (b - a) * t order, never a mix."""
+    u = np.clip(dirs[:, 2], -1.0, 1.0).astype(np.float32)
+    above = u >= np.float32(0.0)               # tie: u == 0 is the sky half
+    s_sky = int(np.clip(int(getattr(world, 'lw_sky_squeeze', 2)), 1, 20))
+    s_gnd = int(np.clip(int(getattr(world, 'lw_ground_squeeze', 2)), 1, 20))
+    p_s = (np.float32(1.0) - u).astype(np.float32)
+    p_g = (np.float32(1.0) + u).astype(np.float32)
+    q_s = p_s.copy()
+    for _ in range(s_sky - 1):
+        q_s = (q_s * p_s).astype(np.float32)     # repeated multiply, left to right
+    q_g = p_g.copy()
+    for _ in range(s_gnd - 1):
+        q_g = (q_g * p_g).astype(np.float32)
+    t_s = (np.float32(1.0) - q_s)[:, None]
+    t_g = (np.float32(1.0) - q_g)[:, None]
+    # float32 BEFORE the subtraction, so (b - a) rounds as the GPU's
+    # vec3 subtraction does
+    zen, skyc, gndc, nad = (np.asarray(getattr(world, n_), np.float32)[None, :]
+                            for n_ in ('lw_zenith', 'lw_sky', 'lw_ground',
+                                       'lw_nadir'))
+    sky = skyc + (zen - skyc) * t_s
+    gnd = gndc + (nad - gndc) * t_g
+    return np.where(above[:, None], sky, gnd).astype(np.float32)
+
+
 PAINTED_LOOKS = {
     'GOUACHE_DAY': {
         'horizon': (0.60, 0.74, 0.80), 'zenith': (0.20, 0.40, 0.74),
@@ -1061,16 +1096,29 @@ def physical(world, dirs):
     return np.nan_to_num(col, nan=0.0, posinf=1.0, neginf=0.0)
 
 
+def env_texture(world, textures):
+    """The texture the CPU samples for the world's env image: the
+    image's own name in `textures`, else the exporter's `world_env`
+    key, else None. R251: ONE lookup for `hdri()`, the cylinder sky
+    hook and `gpu/sky.py` (three copies of a two-line lookup is how
+    the affine incident started)."""
+    if world is None:
+        return None
+    img = getattr(world, 'env_image', None)
+    key = getattr(img, 'name', None) if img is not None else None
+    tex = None
+    if key:
+        tex = (textures or {}).get(key)
+    if tex is None:
+        tex = (textures or {}).get('world_env')
+    return tex
+
+
 def hdri(world, dirs, textures):
     """An image wrapped around the scene, equirectangular or mirror ball."""
     from .texture import env_equirect_uv, env_sphere_uv
     n = dirs.shape[0]
-    tex = None
-    key = getattr(world.env_image, 'name', None) if world.env_image else None
-    if key:
-        tex = textures.get(key)
-    if tex is None:
-        tex = textures.get('world_env')
+    tex = env_texture(world, textures)
     if tex is None:
         return solid(world, dirs)
     if world.env_mapping == 'MIRRORBALL':
@@ -1318,6 +1366,11 @@ def ground_plane(world, dirs, sky_col, eye, time=0.0, textures=None):
     Distance haze does the rest: the plane fades into the horizon colour, and
     without that it reads as a flat sheet rather than as ground going away.
     """
+    if str(getattr(world, 'ground_mode', 'SOLID')) == 'MODE7':
+        # R251 (C048): the Mode 7 floor is drawn by OUTPUT pixel from
+        # `_background_image` (mode7_floor); the analytic road never
+        # touches a MODE7 world, and a reflected ray sees the sky alone
+        return sky_col
     dz = dirs[:, 2]
     # every ray that dips below the plane hits it. The old -1e-5 threshold
     # left a sliver of rays -- a band a few pixels tall at the horizon --
@@ -1660,6 +1713,13 @@ def evaluate(world, dirs, textures=None, strength=True, eye=None,
         col = hdri(world, dirs, textures or {})
     elif mode == 'PAINTED':
         col = painted(world, dirs)
+    elif mode == 'CYLINDER':
+        # R251 (C056): a backdrop, not an environment -- the camera rays
+        # are drawn by output pixel in `_background_image`; reflections
+        # and ray misses (direction-only callers) see the flat colour
+        col = solid(world, dirs)
+    elif mode == 'LW_GRADIENT':
+        col = lw_gradient(world, dirs)
     else:
         return None                      # caller falls back to the node graph
     if strength:
@@ -1865,3 +1925,293 @@ def _wthr_splat(field, x, y, wgt, radius):
         return
     field.idx.append(yi[ok].astype(np.int64) * w + xi[ok])
     field.wgt.append(kw[ok].astype(np.float64))
+
+
+# ---------------------------------------- R251: pixel-addressed backdrops
+#
+# The Doom cylinder sky (C056) and the Mode 7 floor (C048) are functions of
+# the OUTPUT pixel (xo, yo), not of the ray direction, so they cannot ride
+# `evaluate(world, dirs)`: `render._background_image` calls them with the
+# pixel lists, and `gpu/sky.py` draws them from the SAME CPU-built integer
+# tables (texelFetch, ints < 2**24), so the two roads are bitwise by
+# construction. Row 0 is the BOTTOM of the frame and of every image buffer.
+
+DOOM_REF_LINES = 200.0       # Doom's screen: rows advance 200/H_out texture rows per output row
+
+
+def _camera_basis(camera):
+    """The camera's rigid world matrix, exactly `render.camera_matrices`'s
+    own two branches (the R205 scale strip; a rigid matrix passes through
+    bitwise). Local to this module until C058's `render.camera_basis`
+    lands; `cylinder_inputs` prefers the render module's when present."""
+    if camera is None or getattr(camera, 'matrix_world', None) is None:
+        mw = np.eye(4, dtype=np.float32)
+        mw[2, 3] = 8.0
+        return mw
+    return M.rigid_camera_matrix(camera.matrix_world)
+
+
+def _camera_yaw(mw):
+    """The heading of a camera basis (Blender: -Z looks, +X right, +Y up);
+    straight up or down, the right axis carries the heading."""
+    mw = np.asarray(mw, np.float32)
+    f = -mw[:3, 2]
+    r = mw[:3, 0]
+    if math.hypot(float(f[0]), float(f[1])) > 1e-6:
+        return math.atan2(float(f[1]), float(f[0]))
+    return math.atan2(float(r[0]), -float(r[1]))
+
+
+def _clip_jitter(st, proj, rw, rh):
+    """The J block's translation (render.py, the clip-space plug point),
+    verbatim: the float32 4x4 J of an accumulation pass's jitter and / or a
+    stereo eye's window shift, or None when the pass carries neither."""
+    jit = getattr(st, '_accum_jitter', None)
+    ster = getattr(st, '_stereo', None)
+    if jit is None and ster is None:
+        return None
+    J = np.eye(4, dtype=np.float32)
+    if jit is not None:
+        J[0, 3] = 2.0 * float(jit[0]) / rw
+        J[1, 3] = 2.0 * float(jit[1]) / rh
+    if ster is not None:
+        s_off, conv = ster
+        J[0, 3] += float(proj[0, 0]) * float(s_off) / max(float(conv), 1e-4)
+    return J
+
+
+def cylinder_inputs(scene, st, Wo, Ho):
+    """(proj, jx, jy, yaw) for the cylinder tables at the OUTPUT size --
+    ONE function for the CPU hook and `gpu/sky.py`'s plan, so both roads
+    build the tables from the same projection, the same J (the pass's
+    jitter and stereo window: a stereo eye sees the sky at infinity, an
+    accumulation pass moves it by its jitter) and the same yaw. The
+    projection is taken at (Wo, Ho) on EVERY road (fast_background's
+    recursion, the plain CPU road and the GPU plan all pass the output
+    size): a size ss does not divide would otherwise part them by an ulp
+    of the aspect. The render module's C058 helpers (`camera_basis`,
+    `camera_yaw`, `clip_jitter`) are used when the tree has them, this
+    module's bitwise copies otherwise."""
+    from . import render as _R
+    camera = getattr(scene, 'camera', None)
+    proj = _R.camera_matrices(camera, Wo, Ho)[1]
+    cj = getattr(_R, 'clip_jitter', None) or _clip_jitter
+    J = cj(st, proj, Wo, Ho)
+    jx, jy = (float(J[0, 3]), float(J[1, 3])) if J is not None else (0.0, 0.0)
+    cb = getattr(_R, 'camera_basis', None) or _camera_basis
+    cy = getattr(_R, 'camera_yaw', None) or _camera_yaw
+    yaw = float(cy(cb(camera)))
+    return proj, jx, jy, yaw
+
+
+def cylinder_tables(world, yaw, proj, Wo, Ho, tex_w, tex_h, jx=0.0, jy=0.0):
+    """(col_of_x int32 (Wo,), row_of_y int32 (Ho,)) -- Doom's per-column
+    angle table and 1:1 rows. yaw: the camera heading (cylinder_inputs);
+    proj: the projection at the OUTPUT size; jx, jy: the pass's own NDC
+    translation (0.0 when the pass carries no jitter and no eye). Built
+    once per frame in float64 and floored once; per pixel only integer
+    indexing remains."""
+    repeats = int(np.clip(int(getattr(world, 'sky_cylinder_repeats', 4)), 1, 16))
+    mid = float(np.clip(float(getattr(world, 'sky_cylinder_mid', 0.78125)), 0.0, 1.0))
+    yaw = float(yaw) - float(getattr(world, 'rotation', 0.0))
+    p00 = float(proj[0, 0])
+    p02 = float(proj[0, 2])
+    p12 = float(proj[1, 2])
+    focal_px = p00 * Wo * 0.5                        # pixels per unit tan
+    # the straight-ahead column: ndc_x = -p02 + J[0,3] for the forward
+    # direction (row 3 = (0,0,-1,0) and J leaves clip_w alone); Blender's
+    # shift_x rides p02, a stereo eye's window shift and the AA jitter jx
+    cx = (0.5 - 0.5 * (p02 - jx)) * Wo
+    # the centre row: ndc_y = -p12 + J[1,3]. The Y-shear's slide s > 0
+    # (looking up) moves it DOWN the frame, so rows above the mid line
+    # show -- Heretic's sky scrolls down as you look up
+    cy = (0.5 - 0.5 * (p12 - jy)) * Ho
+    xo = np.arange(Wo, dtype=np.float64)
+    # left of centre = larger angle = counter-clockwise (Doom's xtoviewangle)
+    ang = yaw + np.arctan((cx - (xo + 0.5)) / focal_px)
+    frac = np.mod(ang / (2.0 * math.pi), 1.0)        # a BAM angle as a fraction of a turn
+    col = (np.floor(frac * tex_w * repeats).astype(np.int64) % tex_w).astype(np.int32)
+    yo = np.arange(Ho, dtype=np.float64)
+    # texture row counted from the TOP of the image: Doom's
+    # dc_texturemid + (y - centery) at 200 lines per screen
+    r_top = np.floor(mid * tex_h + (cy - (yo + 0.5)) * (DOOM_REF_LINES / Ho))
+    r_top = np.clip(r_top, 0, tex_h - 1).astype(np.int32)
+    row = ((tex_h - 1) - r_top).astype(np.int32)     # stored bottom-up (ImageBuffer / GPU texel row)
+    return col, row
+
+
+def cylinder_pixels(world, yaw, proj, w, h, ss, xx, yy, tex, jx=0.0, jy=0.0):
+    """The cylinder sky at the internal pixels (xx, yy) of a (w, h) frame
+    supersampled ss times: nearest, unlit, then strength (SK.evaluate's own
+    `col * float(strength)`)."""
+    Wo, Ho = max(w // ss, 1), max(h // ss, 1)
+    col, row = cylinder_tables(world, yaw, proj, Wo, Ho, tex.width, tex.height,
+                               jx, jy)
+    xo = np.minimum(xx // ss, Wo - 1)
+    yo = np.minimum(yy // ss, Ho - 1)
+    # the float32 view env_pixels() uploads, so a non-float32 ImageBuffer
+    # cannot part the roads
+    out = np.asarray(tex.pixels, np.float32)[row[yo], col[xo], :3]
+    return (out * float(getattr(world, 'strength', 1.0))).astype(np.float32)
+
+
+# ---- Mode 7 (C048): the SNES PPU's BG mode 7 driven per scanline
+
+_MODE7_CACHE = {}
+
+
+def mode7_key(world):
+    """The content key of the world's Mode 7 map, or None without one."""
+    img = getattr(world, 'ground_image', None)
+    px = getattr(img, 'pixels', None) if img is not None else None
+    if px is None:
+        return None
+    px = np.asarray(px)
+    return (str(getattr(img, 'name', '')), tuple(int(v) for v in px.shape),
+            int(zlib.adler32(np.ascontiguousarray(px[::7]).tobytes())),
+            int(zlib.adler32(np.ascontiguousarray(px[3::11]).tobytes())))
+
+
+def mode7_map(world):
+    """(rgb (1024, 1024, 3) float32) -- the map palettised once per image
+    content, cached (4 entries). The cut runs on the RESAMPLED 1024x1024
+    map on purpose: the SNES quantised what its tile map held, so a small
+    source image's texels weigh as the copies the map holds of them (a
+    weighted cut on the source would need a new palette API for the same
+    answer); `median_cut` histograms at 5 bits, so 1M pixels cost 32768
+    bins, about a second, once per content."""
+    key = mode7_key(world)
+    if key is None:
+        return None
+    hit = _MODE7_CACHE.get(key)
+    if hit is not None:
+        return hit
+    src = np.asarray(world.ground_image.pixels, np.float32)[:, :, :3]
+    H, W = src.shape[:2]
+    sy = (np.arange(1024, dtype=np.int64) * H) // 1024
+    sx = (np.arange(1024, dtype=np.int64) * W) // 1024
+    big = src[sy][:, sx]                                     # nearest resample to the SNES map size
+    pal = PA.median_cut(big.reshape(-1, 3), 256, bits=5)     # Heckbert at 5 bits per channel: the 15-bit palette
+    pal = (np.floor(pal * 31.0 + 0.5) / 31.0).astype(np.float32)   # every entry on the 15-bit grid
+    # nearest by the engine's own inverse colormap; ties = lowest index
+    idx = PA.InverseColormap(pal, bits=6).lookup(big.reshape(-1, 3)).reshape(1024, 1024)
+    rgb = pal[idx].astype(np.float32)
+    while len(_MODE7_CACHE) >= 4:
+        _MODE7_CACHE.pop(next(iter(_MODE7_CACHE)))
+    _MODE7_CACHE[key] = rgb
+    return rgb
+
+
+def mode7_rows(world, inv, eye, Wo, Ho):
+    """(hit bool (Ho,), A, C, X0, Y0 int32 (Ho,)) -- one HDMA register set
+    per OUTPUT row: the 8.8 fixed-point texel steps along the row (A, C)
+    and the whole-texel row origin (X0, Y0, already << 8), from the row's
+    first and last pixel-centre rays through `inv` (the frame's own
+    inverse view-projection, float32) exactly as `_background_image`
+    unprojects them. `np.round` (half to even) is the tie rule."""
+    ts = max(float(getattr(world, 'mode7_texel_size', 1.0)), 1e-6)
+    gh = float(getattr(world, 'ground_height', 0.0))
+    inv = np.asarray(inv, np.float32)
+    yo = np.arange(Ho, dtype=np.float32)
+    ny = (yo + np.float32(0.5)) / np.float32(Ho) * np.float32(2.0) - np.float32(1.0)
+    nx0 = np.full(Ho, (0.5 / Wo) * 2.0 - 1.0, np.float32)
+    nx1 = np.full(Ho, ((Wo - 0.5) / Wo) * 2.0 - 1.0, np.float32)
+    eye32 = np.asarray(eye, np.float32)
+
+    def ray(nx):                                              # _background_image's unproject, float32
+        pts = np.stack([nx, ny, np.ones(Ho, np.float32), np.ones(Ho, np.float32)], 1)
+        wv = pts @ inv.T
+        wv = wv[:, :3] / np.where(np.abs(wv[:, 3:4]) < 1e-9, 1e-9, wv[:, 3:4])
+        return M.normalize(wv - eye32[None, :])
+
+    d0 = ray(nx0).astype(np.float64)
+    d1 = ray(nx1).astype(np.float64)
+    e = np.asarray(eye, np.float64)
+
+    def hit_uv(d):
+        ok = d[:, 2] < -1e-12
+        t = np.where(ok, (gh - e[2]) / np.where(ok, d[:, 2], -1.0), -1.0)
+        ok &= t > 0.0
+        p = e[None, :] + d * t[:, None]
+        return ok, p[:, 0] / ts, p[:, 1] / ts
+
+    ok0, u0, v0 = hit_uv(d0)
+    ok1, u1, v1 = hit_uv(d1)
+    hit = ok0 & ok1
+    den = float(max(Wo - 1, 1))
+    A = np.clip(np.round((u1 - u0) / den * 256.0), -32768, 32767).astype(np.int32)   # int16 8.8
+    C = np.clip(np.round((v1 - v0) / den * 256.0), -32768, 32767).astype(np.int32)
+    CX = np.round(np.where(hit, u0, 0.0)).astype(np.int64)     # whole-texel row origins
+    CY = np.round(np.where(hit, v0, 0.0)).astype(np.int64)
+    CX = ((CX + 4096) & 8191) - 4096                          # the SNES's 13-bit sign clip
+    CY = ((CY + 4096) & 8191) - 4096
+    A = np.where(hit, A, 0).astype(np.int32)
+    C = np.where(hit, C, 0).astype(np.int32)
+    return hit, A, C, (CX << 8).astype(np.int32), (CY << 8).astype(np.int32)
+
+
+def mode7_floor(world, inv, eye, w, h, ss, xx, yy, cols):
+    """The Mode 7 floor over the sky colours `cols` of the internal pixels
+    (xx, yy): per output row the PPU's X = X0 + A * x, Y = Y0 + C * x in
+    8.8, the texel (X >> 8, Y >> 8) through the M7SEL over-map rule, the
+    palettised map's colour, unlit and never scaled by strength. Without
+    a map nothing is drawn (the panel says so), identical on both roads."""
+    rgb = mode7_map(world)
+    if rgb is None:
+        return cols
+    Wo, Ho = max(w // ss, 1), max(h // ss, 1)
+    hit, A, C, X0, Y0 = mode7_rows(world, inv, eye, Wo, Ho)
+    xo = np.minimum(xx // ss, Wo - 1).astype(np.int32)
+    yo = np.minimum(yy // ss, Ho - 1)
+    X = (X0[yo] + A[yo] * xo).astype(np.int32)    # |A*xo| <= 32767*4095 < 2**27
+    Y = (Y0[yo] + C[yo] * xo).astype(np.int32)
+    u = X >> 8                                     # arithmetic shift, as the PPU's
+    v = Y >> 8
+    over = str(getattr(world, 'mode7_over', 'WRAP'))
+    if over == 'WRAP':
+        inside = np.ones(u.shape, bool)
+        uu = u & 1023
+        vv = v & 1023
+    else:
+        inside = (u >= 0) & (u < 1024) & (v >= 0) & (v < 1024)
+        if over == 'TILE0':
+            uu = np.where(inside, u, u & 7)
+            vv = np.where(inside, v, v & 7)
+            inside = np.ones(u.shape, bool)
+        else:
+            uu = np.clip(u, 0, 1023)
+            vv = np.clip(v, 0, 1023)
+    draw = hit[yo] & inside
+    out = np.array(cols, np.float32, copy=True)
+    out[draw] = rgb[vv[draw], uu[draw]]
+    return out
+
+
+mode7_overlay = mode7_floor        # the spec's name for the same function
+
+
+# ---- the backdrop at every pixel (R251, exported for LIGHT-A2's F008)
+
+def backdrop_rgb(scene, st, w, h, vp=None, eye=None, textures=None, ss=1):
+    """(h, w, 3) float32 -- the backdrop of a (w, h) internal frame at
+    EVERY pixel: `render._background_image` over `uncovered=None`, the
+    SAME call that fills the frame's sky pixels (fast_background, the
+    cylinder sky, the Mode 7 floor included), so a pixel fogged fully
+    toward it is bitwise the sky beside it (LightWave's Use Backdrop
+    Color, F008). `vp` / `eye` are the frame's own; when a caller has
+    none they are `camera_matrices` at (w, h) with the pass's J
+    (jitter, stereo window) applied, as the frame's clip-space plug
+    point does. A transparent film gives zeros, the call's own rule."""
+    from . import render as _R
+    if vp is None or eye is None:
+        camera = getattr(scene, 'camera', None)
+        _view, proj, vp0, eye0 = _R.camera_matrices(camera, w, h)
+        cj = getattr(_R, 'clip_jitter', None) or _clip_jitter
+        J = cj(st, proj, w, h)
+        if J is not None:
+            vp0 = (J @ vp0).astype(np.float32)
+        vp = vp0 if vp is None else vp
+        eye = eye0 if eye is None else eye
+    img = _R._background_image(scene, st, w, h, vp, eye, None,
+                               textures or {}, ss=ss)
+    return np.ascontiguousarray(img[..., :3])

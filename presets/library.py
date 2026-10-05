@@ -14,6 +14,7 @@ CATEGORIES = (
     ('BROADCAST', "Video & Broadcast"),
     ('WEB', "Early Web"),
     ('CEL', "Cel & Film"),
+    ('ARCADE', "Arcade Boards"),
 )
 
 PRESETS = {
@@ -43,7 +44,8 @@ PRESETS = {
                 "for the closest match to the original render. BI "
                 "defaulted to 8 AA samples; 4 here renders 4x the "
                 "pixels instead of 9x -- raise it if the edges matter "
-                "more than the wait.",
+                "more than the wait. Zoffs / ZInvert / Env are material "
+                "options.",
         'settings': {
             'default_model': 'BI_COOKTORR', 'shading_rate': 'PIXEL',
             'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
@@ -54,6 +56,10 @@ PRESETS = {
             # shadowed AND built a BVH into every viewport update --
             # the field's 'preset cripples rendering time'.
             'shadows': True, 'shadow_default': 'PER_LIGHT',
+            # R251 C117: 2.5+'s BKE_lamp_init set la->buftype =
+            # LA_SHADBUF_HALFWAY, so a spot's buffer shadow was a
+            # midpoint map (Classic-Halfway)
+            'shadow_map_depth': 'MIDPOINT',
             'raytrace': True, 'ray_depth': 2,
             'ray_reflection': True, 'ray_refraction': True,
             'transparency': 'SORTED',
@@ -129,7 +135,10 @@ PRESETS = {
         'label': "3D Studio MAX R2 (1997)",
         'category': 'SOFTWARE',
         'note': "Blinn default with the Soften parameter, shadow maps, and the "
-                "characteristic slightly grey ambient.",
+                "characteristic slightly grey ambient. Summed Area is the "
+                "other filter the Mapping / Filtering rollout offered. "
+                "Super Black and "
+                "Video Color Check are off, as Max shipped them.",
         'settings': {
             'resolution_x': 640, 'resolution_y': 480,
             'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
@@ -138,6 +147,7 @@ PRESETS = {
             'shadow_samples': 8, 'global_ambient': (0.12, 0.12, 0.12),
             'specular_in_gamma': True, 'color_depth': '24',
             'tex_filter': 'BILINEAR', 'gamma': 2.2,
+            'motion_blur_mode': 'MAX_SLICES', 'motion_samples': 10,
         },
     },
     'MAX_2012': {
@@ -154,9 +164,11 @@ PRESETS = {
                 "with its Sample Range of 4, no ambient light (Max 2012's "
                 "environment ambient is black), the raytracer's global "
                 "depth of 9 for Raytrace materials, and NO gamma/LUT "
-                "correction -- Max 2012 shipped with it off, so the frame "
+                "correction -- Max 2012 shipped with it off (Super Black "
+                "and Video Color Check off too, as shipped), so the frame "
                 "is the linear light itself on a 24-bit output with no "
-                "dither. No light limit, no fog, no glow.",
+                "dither. No light limit, no fog, no glow; Thin Wall "
+                "Refraction is a material Blend Mode.",
         'settings': {
             'resolution_x': 640, 'resolution_y': 480,
             'pixel_aspect_x': 1.0, 'pixel_aspect_y': 1.0,
@@ -174,13 +186,20 @@ PRESETS = {
             'color_depth': '24', 'dither': 'NONE',
             'gamma': 1.0, 'color_management': 'NONE', 'input_gamma_naive': True,
             'fog': False, 'glow': False,
+            'dof_method': 'LENS_ACCUMULATE', 'dof_lens_pattern': 'MAX_SPIRAL',
+            'dof_lens_samples': 12,
+            'motion_blur_mode': 'MAX_SLICES', 'motion_dither': 0.4,
+            'motion_dither_tile': 32,
         },
     },
     'STUDIO_R4': {
         'label': "3D Studio R4, DOS (1994)",
         'category': 'SOFTWARE',
         'note': "The 320x200 VGA workhorse. Phong, 8 lights maximum, "
-                "256 colours with an adaptive palette.",
+                "256 colours with an adaptive palette. Summed Area is the "
+                "other filter the Mapping / Filtering rollout offered. "
+                "Super Black and "
+                "Video Color Check off, as R4 shipped them.",
         'settings': {
             'resolution_x': 320, 'resolution_y': 200,
             'pixel_aspect_x': 1.0, 'pixel_aspect_y': 1.2,
@@ -191,6 +210,8 @@ PRESETS = {
             'palette_mode': 'ADAPTIVE', 'palette_size': 256,
             'palette_method': 'MEDIAN_CUT', 'dither': 'FLOYD',
             'gamma': 2.2, 'output_scale': '2X',
+            'motion_blur_mode': 'MAX_SLICES', 'motion_samples': 5,
+            'motion_steps': 10,
         },
     },
     'TRUESPACE_2': {
@@ -206,11 +227,40 @@ PRESETS = {
             'gamma': 2.2,
         },
     },
+    # R251 C122: the 2.4-era Internal renderer's gamma-2 OSA blend
+    'BLENDER_241': {
+        'label': "Blender 2.41 (2006)",
+        'category': 'SOFTWARE',
+        'note': "The 2.4-era Internal renderer before the 2.42 rewrite: "
+                "shaded in display space, OSA 8 with the Gauss filter and "
+                "the gamma-2 sample blend that kept bright lines wide, "
+                "Lambert/CookTorr, ray shadows to depth 2, soft dither. "
+                "The 2.79 preset is the linear-light successor.",
+        'settings': {
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 9, 'aa_filter': 'GAUSS',
+            'aa_gamma_blend': True,
+            'default_model': 'BI_COOKTORR', 'shading_rate': 'PIXEL',
+            'color_management': 'NONE', 'input_gamma_naive': True,
+            'gamma': 1.0, 'specular_in_gamma': True,
+            'shadows': True, 'shadow_default': 'PER_LIGHT',
+            'raytrace': True, 'ray_depth': 2,
+            'ray_reflection': True, 'ray_refraction': True,
+            'transparency': 'SORTED',
+            'tex_filter': 'TRILINEAR', 'tex_perspective': True,
+            'color_depth': '24', 'dither': 'NOISE',
+            'global_ambient': (0.0, 0.0, 0.0),
+            'fog': False, 'glow': False,
+        },
+    },
     'LIGHTWAVE_56': {
         'label': "LightWave 5.6 (1998)",
         'category': 'SOFTWARE',
         'note': "Broadcast-quality scanline: sharp AA, ray-traced shadows, "
-                "the classic Toaster-era specular.",
+                "the classic Toaster-era specular. Limit Dynamic Range clips "
+                "each sample at 1.0 before the AA filter, as the manual "
+                "advised for bright scenes. Video Color Check stays off: "
+                "LightWave's Video Legalize filter is later than 5.6's "
+                "shelf.",
         'settings': {
             'resolution_x': 752, 'resolution_y': 480,
             'pixel_aspect_x': 10.0, 'pixel_aspect_y': 11.0,
@@ -219,13 +269,21 @@ PRESETS = {
             'shadows': True, 'shadow_default': 'RAY',
             'color_depth': '24', 'gamma': 2.2, 'glow': True,
             'glow_intensity': 0.25, 'glow_threshold': 0.92,
+            # R251 C094: the manual's own recommendation for bright scenes
+            'aa_clamp_samples': True,
+            'motion_blur_mode': 'LW_FIELD',
+            # R251 LIGHT-A2 F008: LightWave's Use Backdrop Color is the
+            # fog's target once fog is switched on (fog itself stays off)
+            'fog_color_source': 'BACKDROP',
         },
     },
     'IMAGINE_3': {
         'label': "Imagine 3.0, Amiga (1994)",
         'category': 'SOFTWARE',
         'note': "HAM8 framebuffer, Phong shading, the fringing on colour "
-                "transitions that hold-and-modify always produced.",
+                "transitions that hold-and-modify always produced; Fog "
+                "Length is a material Blend Mode. The Roughness (Imagine) "
+                "node is its per-pixel random normal turn.",
         'settings': {
             'resolution_x': 320, 'resolution_y': 256,
             'pixel_aspect_x': 1.0, 'pixel_aspect_y': 1.0,
@@ -240,7 +298,10 @@ PRESETS = {
         'label': "POV-Ray 3.1 (1998)",
         'category': 'SOFTWARE',
         'note': "Pure ray tracer: hard shadows, mirror reflections, "
-                "no ambient occlusion and a flat ambient term.",
+                "no ambient occlusion and a flat ambient term. Normalised "
+                "Distance is POV's interpolate 4 if your image_maps used it. "
+                "Fog is per scene in POV: Ground Fog (fog_type 2) and Fog "
+                "Turbulence in the Fog panel are its two fog laws.",
         'settings': {
             'resolution_x': 640, 'resolution_y': 480,
             'aa_mode': 'SUPERSAMPLE', 'aa_samples': 9, 'aa_filter': 'BOX',
@@ -249,6 +310,8 @@ PRESETS = {
             'shadows': True, 'shadow_default': 'RAY', 'shadow_samples': 1,
             'global_ambient': (0.1, 0.1, 0.1), 'color_depth': '24',
             'gamma': 1.0, 'color_management': 'NONE',
+            # R251 F013: fade_power 0 -- POV lamps do not fall off
+            'light_falloff_default': 'NONE',
         },
     },
     'BRYCE_2': {
@@ -312,7 +375,8 @@ PRESETS = {
         'label': "Softimage|3D (1994)",
         'category': 'SOFTWARE',
         'note': "Film-house scanline: heavy anti-aliasing, ray-traced shadows, "
-                "restrained specular. The look of mid-90s effects work.",
+                "restrained specular. The look of mid-90s effects work. The "
+                "Env Chrome node is the showroom reflection environment.",
         'settings': {
             'resolution_x': 720, 'resolution_y': 486,
             'pixel_aspect_x': 10.0, 'pixel_aspect_y': 11.0,
@@ -326,7 +390,8 @@ PRESETS = {
         'label': "Alias PowerAnimator (1993)",
         'category': 'SOFTWARE',
         'note': "SGI workstation output: Blinn surfaces, clean ray tracing, "
-                "and the slightly cool cast of an Indigo monitor.",
+                "and the slightly cool cast of an Indigo monitor. The Env "
+                "Chrome node is the showroom reflection environment.",
         'settings': {
             'resolution_x': 646, 'resolution_y': 485,
             'aa_mode': 'SUPERSAMPLE', 'aa_samples': 9, 'aa_filter': 'CATROM',
@@ -410,7 +475,8 @@ PRESETS = {
         'label': "POV-Ray 2.2 (1993)",
         'category': 'SOFTWARE',
         'note': "The earlier ray tracer: no area lights, hard shadows, and a "
-                "completely flat ambient term.",
+                "completely flat ambient term. Normalised Distance is POV's "
+                "interpolate 4 if your image_maps used it.",
         'settings': {
             'resolution_x': 320, 'resolution_y': 240,
             'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4, 'aa_filter': 'BOX',
@@ -418,6 +484,8 @@ PRESETS = {
             'ray_reflection': True, 'shadows': True, 'shadow_default': 'RAY',
             'shadow_samples': 1, 'global_ambient': (0.15, 0.15, 0.15),
             'color_depth': '24', 'gamma': 1.0, 'color_management': 'NONE',
+            # R251 F013: fade_power 0 -- POV-Ray 2.2 lamps do not fall off either
+            'light_falloff_default': 'NONE',
             'output_scale': '2X',
         },
     },
@@ -451,8 +519,27 @@ PRESETS = {
             'default_model': 'GOURAUD', 'shading_rate': 'VERTEX',
             'tex_filter': 'NEAREST', 'color_depth': '4',
             'palette_mode': 'ADAPTIVE', 'palette_size': 16,
+            'palette_bits': 'BITS_3',
             'palette_method': 'MEDIAN_CUT', 'dither': 'FLOYD',
             'shadows': False, 'max_lights': 2, 'gamma': 2.2,
+            'output_scale': '3X',
+        },
+    },
+    # R251 C060: the ST's registers reloaded three times a scanline
+    'SPECTRUM_512': {
+        'label': "Atari ST Spectrum 512 (1987)",
+        'category': 'PLATFORM',
+        'note': "320x200 with the ST's 16 registers reloaded three times "
+                "a scanline: 48 colours a line, 512 across the screen. "
+                "CAD-3D 2.0 rendered straight into it.",
+        'settings': {
+            'resolution_x': 320, 'resolution_y': 200,
+            'pixel_aspect_x': 1.0, 'pixel_aspect_y': 1.2,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'GOURAUD', 'shading_rate': 'VERTEX',
+            'tex_filter': 'NEAREST', 'color_depth': '8',
+            'scanline_palette': 'SPECTRUM_512', 'dither': 'BAYER4',
+            'shadows': False, 'max_lights': 3, 'gamma': 2.2,
             'output_scale': '3X',
         },
     },
@@ -486,6 +573,8 @@ PRESETS = {
             'dither': 'BAYER4', 'shadows': False, 'max_lights': 1,
             'crt': True, 'crt_scanlines': 0.0, 'crt_bloom': 0.4,
             'output_scale': '2X',
+            'stereo_mode': 'SBS', 'stereo_parallax_layers': True,
+            'stereo_parallax_max': 16,
         },
     },
     'GAME_GEAR': {
@@ -505,6 +594,45 @@ PRESETS = {
             'output_scale': '4X',
         },
     },
+    'NDS': {
+        'label': "Nintendo DS (2004)",
+        'category': 'CONSOLE',
+        'note': "256x192 per-vertex lighting with the DS's squared "
+                "half-vector highlight through a shininess table, integer "
+                "vertex positions with perspective-correct textures (the DS "
+                "never warped like the PS1), no filtering, 5-bit lit "
+                "colours, the DS's 32-entry fog table. Materials with their "
+                "own model keep it; set Force Model to make every material "
+                "the machine's. Translucency at (A+1)/32, blended once per "
+                "polygon ID in bottom-row order, not depth; 24-bit depth, "
+                "back-face culling and the DS's 1-pixel edge marking. "
+                "Texel x vertex colour with GBATEK's +1 modulate.",
+        'settings': {
+            'resolution_x': 256, 'resolution_y': 192,
+            'aa_mode': 'NONE', 'default_model': 'DS_FIXED',
+            'shading_rate': 'VERTEX', 'vertex_snap': True,
+            'vertex_snap_grid': 1.0, 'subpixel_precision': 'INTEGER',
+            'tex_filter': 'NEAREST', 'tex_perspective': True,
+            'tex_max_size': 1024, 'color_depth': '24', 'dither': 'NONE',
+            'fog': True, 'fog_mode': 'LINEAR', 'fog_start': 8.0,
+            'fog_end': 40.0,
+            'fog_table': 'DS32',
+            'fog_color': (0.5, 0.55, 0.65),
+            'shadows': False, 'max_lights': 4,
+            # R251 C042 (design 2.5 #35): translucency at (A+1)/32, blended once
+            # per polygon ID in bottom-row order, not depth
+            'transparency': 'ABUFFER', 'blend_equation': 'DS',
+            'translucent_order': 'Y_SORT', 'translucent_depth_write': False,
+            # R251 raster (design 2.5 #35): the DS's 24-bit depth, its culling and
+            # edge marking (vertex_quantize / vertex_units land in pass 2)
+            'depth_precision': 24, 'backface_cull': True,
+            'vertex_quantize': 'N64', 'vertex_units': 64.0,   # R251 C012 (design 2.5 #35): the DS's 16-bit positions, 10-bit normals nearest the N64 item
+            'outline': True, 'outline_objects': True, 'outline_materials': False,
+            'outline_depth': False, 'outline_normals': False, 'outline_width': 1,
+            'outline_over_sky': True, 'outline_color': (0.0, 0.0, 0.0),
+            'gamma': 2.2, 'output_scale': '3X',
+        },
+    },
     'SNES': {
         'label': "Super Nintendo (1990)",
         'category': 'CONSOLE',
@@ -515,11 +643,14 @@ PRESETS = {
             'pixel_aspect_x': 1.0, 'pixel_aspect_y': 1.14,
             'aa_mode': 'NONE', 'aa_samples': 1,
             'default_model': 'FLAT', 'shading_rate': 'FACE',
-            'tex_filter': 'NEAREST', 'color_depth': '5',
+            'tex_filter': 'NEAREST', 'color_depth': '8',
             'palette_mode': 'ADAPTIVE', 'palette_size': 256,
+            'palette_bits': 'BITS_5',
             'palette_method': 'MEDIAN_CUT', 'dither': 'NONE',
             'depth_sort': 'PAINTERS', 'shadows': False, 'max_lights': 1,
             'output_scale': '3X',
+            # R251: the PPU's colour math, add-half of one sub screen
+            'transparency': 'SORTED', 'blend_equation': 'SNES_ADD_HALF',
         },
     },
     'NEO_GEO': {
@@ -531,8 +662,9 @@ PRESETS = {
             'resolution_x': 320, 'resolution_y': 224,
             'aa_mode': 'SUPERSAMPLE', 'aa_samples': 2,
             'default_model': 'GOURAUD', 'shading_rate': 'VERTEX',
-            'tex_filter': 'NEAREST', 'color_depth': '5',
+            'tex_filter': 'NEAREST', 'color_depth': '8',
             'palette_mode': 'ADAPTIVE', 'palette_size': 256,
+            'palette_bits': 'BITS_5',
             'palette_method': 'OCTREE', 'dither': 'NONE',
             'shadows': True, 'max_lights': 3, 'output_scale': '3X',
         },
@@ -546,8 +678,9 @@ PRESETS = {
             'resolution_x': 320, 'resolution_y': 224,
             'aa_mode': 'NONE', 'aa_samples': 1,
             'default_model': 'FLAT', 'shading_rate': 'FACE',
-            'tex_filter': 'NEAREST', 'color_depth': '5',
+            'tex_filter': 'NEAREST', 'color_depth': '8',
             'palette_mode': 'ADAPTIVE', 'palette_size': 256,
+            'palette_bits': 'BITS_5',
             'palette_method': 'MEDIAN_CUT', 'dither': 'BAYER4',
             'depth_sort': 'PAINTERS', 'shadows': False, 'max_lights': 2,
             'composite': True, 'output_scale': '2X',
@@ -563,6 +696,8 @@ PRESETS = {
         'settings': {
             'resolution_x': 160, 'resolution_y': 200,
             'pixel_aspect_x': 2.0, 'pixel_aspect_y': 1.0,
+            # R251 C050: 160x200 at 2:1 IS the multicolour bitmap
+            'attribute_cells': 'C64_MULTI',
             'aa_mode': 'NONE', 'aa_samples': 1,
             'default_model': 'FLAT', 'shading_rate': 'FACE',
             'tex_filter': 'NEAREST', 'color_depth': '4',
@@ -574,14 +709,16 @@ PRESETS = {
     'ZX_SPECTRUM': {
         'label': "ZX Spectrum (1982)",
         'category': 'PLATFORM',
-        'note': "256x192 from fifteen colours. The real machine allowed two "
-                "per character cell, which is why everything on it looked "
-                "like it had been coloured in afterwards.",
+        'note': "256x192 with two colours per 8x8 character cell from "
+                "fifteen, one BRIGHT bit shared by both -- the attribute "
+                "clash IS the look.",
         'settings': {
             'resolution_x': 256, 'resolution_y': 192,
             'aa_mode': 'NONE', 'aa_samples': 1,
             'default_model': 'FLAT', 'shading_rate': 'FACE',
-            'tex_filter': 'NEAREST', 'color_depth': '3',
+            'tex_filter': 'NEAREST', 'color_depth': '8',
+            # R251 C050: the attribute cells own the colour stage
+            'attribute_cells': 'ZX_SPECTRUM',
             'palette_mode': 'ADAPTIVE', 'palette_size': 15,
             'palette_method': 'MEDIAN_CUT', 'dither': 'BAYER8',
             'shadows': False, 'max_lights': 1, 'output_scale': '3X',
@@ -614,8 +751,40 @@ PRESETS = {
             'default_model': 'GOURAUD', 'shading_rate': 'VERTEX',
             'tex_filter': 'NEAREST', 'color_depth': '8',
             'palette_mode': 'ADAPTIVE', 'palette_size': 256,
+            'palette_bits': 'BITS_3',
             'palette_method': 'MEDIAN_CUT', 'dither': 'FLOYD',
             'shadows': False, 'max_lights': 2, 'output_scale': '3X',
+        },
+    },
+    'MSX2_PLUS': {
+        'label': "MSX2+ Screen 12 (1988)",
+        'category': 'PLATFORM',
+        'note': "256x212 in 19,268 YJK colours: luma per pixel, chroma "
+                "shared by every four pixels -- the V9958's road to "
+                "photographic backdrops. Konami and Compile lived here.",
+        'settings': {
+            'resolution_x': 256, 'resolution_y': 212,
+            'aa_mode': 'NONE', 'aa_samples': 1,
+            'default_model': 'GOURAUD', 'shading_rate': 'VERTEX',
+            'tex_filter': 'NEAREST', 'color_depth': 'YJK',
+            'dither': 'NONE', 'shadows': False, 'max_lights': 2,
+            'output_scale': '3X',
+        },
+    },
+    # R251 C050: the TMS9918's Graphics II -- two colours per 8x1 run
+    'MSX1': {
+        'label': "MSX1 Screen 2 (1983)",
+        'category': 'PLATFORM',
+        'note': "256x192 from the TMS9918's fifteen colours, two per "
+                "eight-pixel run -- the horizontal colour stripes of "
+                "every MSX1 picture.",
+        'settings': {
+            'resolution_x': 256, 'resolution_y': 192,
+            'aa_mode': 'NONE', 'aa_samples': 1,
+            'default_model': 'FLAT', 'shading_rate': 'FACE',
+            'tex_filter': 'NEAREST', 'color_depth': '8',
+            'attribute_cells': 'MSX1', 'dither': 'BAYER4',
+            'shadows': False, 'max_lights': 1, 'output_scale': '3X',
         },
     },
     'NEXTSTEP': {
@@ -644,6 +813,10 @@ PRESETS = {
             'tex_filter': 'TRILINEAR', 'color_depth': '8',
             'palette_mode': 'ADAPTIVE', 'palette_size': 256,
             'dither': 'NONE', 'shadows': True, 'max_lights': 8,
+            # R251 F011/F013: IRIS GL / OpenGL's infinite viewer and
+            # glLight's (1, 0, 0) default attenuation
+            'specular_viewer': 'AXIS', 'light_falloff_default': 'NONE',
+            'dof_method': 'LENS_ACCUMULATE', 'dof_lens_samples': 23,
         },
     },
 
@@ -652,7 +825,10 @@ PRESETS = {
         'label': "Doom software (1993)",
         'category': 'PLATFORM',
         'note': "320x200 in 256 colours with light levels quantised into "
-                "bands. The bands are the shading model, not an artefact.",
+                "bands. The bands are the shading model, not an artefact. "
+                "Heretic, Hexen and the Build engine (Duke Nukem 3D, 1996) "
+                "share the view: looking up and down slides the picture "
+                "(Y-shear) and verticals stay vertical.",
         'settings': {
             'resolution_x': 320, 'resolution_y': 200,
             'pixel_aspect_x': 1.0, 'pixel_aspect_y': 1.2,
@@ -663,6 +839,31 @@ PRESETS = {
             'palette_method': 'MEDIAN_CUT', 'dither': 'NONE',
             'depth_sort': 'PAINTERS', 'shadows': False, 'max_lights': 2,
             'fog': True, 'output_scale': '3X',
+            # R251: vanilla Doom's only see-through is the Spectre fuzz
+            'transparency': 'SORTED', 'blend_equation': 'FUZZ',
+            'camera_yshear': True,
+        },
+    },
+    'MAYA_4': {
+        'label': "Alias|Wavefront Maya 4 (2001)",
+        'category': 'SOFTWARE',
+        'note': "Maya's software renderer as stand-ins: Blinn surfaces, "
+                "512 depth-map shadows with Use Mid Dist on (the halfway "
+                "map, no bias -- Maya's documented default) and a 4-tap "
+                "blur standing in for dmap filter size 1, 2x2 "
+                "supersampling standing in for Maya's exact-area "
+                "visibility sampling (not modelled), 24-bit output. The "
+                "remaining values follow the SGI-era presets.",
+        'settings': {
+            'resolution_x': 640, 'resolution_y': 480,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'aa_filter': 'TRIANGLE',
+            'default_model': 'BLINN', 'shading_rate': 'PIXEL',
+            'shadows': True, 'shadow_default': 'MAP',
+            'shadow_map_size': 512, 'shadow_map_depth': 'MIDPOINT',
+            'shadow_softness': 1.0, 'shadow_samples': 4,
+            'raytrace': False, 'color_depth': '24', 'dither': 'NONE',
+            'gamma': 2.2,
         },
     },
     'RENDERMAN': {
@@ -673,25 +874,34 @@ PRESETS = {
         'settings': {
             'resolution_x': 1024, 'resolution_y': 778,
             'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'aa_sample_pattern': 'JITTER',   # R251 C127: PRMan's PixelSamples jitter, on by default
             'default_model': 'BLINN', 'shading_rate': 'PIXEL',
             'tex_filter': 'TRILINEAR', 'color_depth': '8',
             'palette_mode': 'ADAPTIVE', 'palette_size': 256,
             'dither': 'NONE', 'shadows': True, 'max_lights': 8,
             'raytrace': True, 'ambient_occlusion': True,
+            'dof_method': 'LENS_ACCUMULATE', 'dof_lens_pattern': 'HALTON_DISC',
+            'dof_lens_samples': 16,
+            # R251 C119 (MAT-B): PRMan's ShadingRate 1 -- one shade per
+            # pixel-area micropolygon, constant interpolation
+            'shading_rate_area': 1.0,
         },
     },
     'TURBO_SILVER': {
         'label': "Turbo Silver (1987)",
         'category': 'SOFTWARE',
         'note': "The Amiga raytracer that became Imagine. Hard shadows, hard "
-                "reflections, and a HAM palette doing its best underneath.",
+                "reflections, and a HAM palette doing its best underneath. "
+                "The Roughness (Imagine) node is its per-pixel random "
+                "normal turn.",
         'settings': {
             'resolution_x': 320, 'resolution_y': 256,
             'pixel_aspect_x': 1.0, 'pixel_aspect_y': 1.1,
             'aa_mode': 'SUPERSAMPLE', 'aa_samples': 2,
             'default_model': 'PHONG', 'shading_rate': 'PIXEL',
-            'tex_filter': 'NEAREST', 'color_depth': '6',
+            'tex_filter': 'NEAREST', 'color_depth': '8',
             'palette_mode': 'ADAPTIVE', 'palette_size': 64,
+            'palette_bits': 'BITS_4',
             'palette_method': 'MEDIAN_CUT', 'dither': 'FLOYD',
             'shadows': True, 'shadow_softness': 0.0, 'max_lights': 3,
             'raytrace': True, 'output_scale': '2X',
@@ -796,6 +1006,7 @@ PRESETS = {
             'default_model': 'GOURAUD', 'shading_rate': 'VERTEX',
             'tex_filter': 'NEAREST', 'color_depth': '4',
             'palette_mode': 'ADAPTIVE', 'palette_size': 16,
+            'palette_bits': 'BITS_4',
             'dither': 'BAYER4', 'shadows': False, 'gamma': 2.2,
         },
     },
@@ -842,14 +1053,22 @@ PRESETS = {
         'label': "Sega Dreamcast (1998)",
         'category': 'CONSOLE',
         'note': "640x480 with proper perspective correction, bilinear filtering "
-                "and per-pixel fog. The end of the era.",
+                "and per-pixel fog. The end of the era. Give a closed mesh "
+                "a material with Volume Role = Dreamcast Modifier for the "
+                "PowerVR's parity shadows at the DC Shadow Scale. "
+                "Offset colour: specular added after the texel. The SR "
+                "Bump node is the PowerVR2's (S,R) angle-table bump mapping.",
         'settings': {
             'resolution_x': 640, 'resolution_y': 480,
             'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4, 'aa_filter': 'TRIANGLE',
-            'default_model': 'GOURAUD', 'shading_rate': 'VERTEX',
+            'default_model': 'D3D_SEPARATE_SPEC', 'shading_rate': 'VERTEX',   # R251 MAT-A C076
             'tex_filter': 'BILINEAR', 'tex_mipmap': True, 'tex_max_size': 256,
+            'tex_compress': 'VQ_DC',            # R251 TEX-1 C024: the PVR2's 256-entry 2x2 VQ codebook
             'tex_perspective': True, 'color_depth': '16', 'dither': 'BAYER2',
+            # R251 F003: the CLX2's 128-entry table on 1/w below the
+            # density register (Fog End); EXP 0.02 stays as the fill
             'fog': True, 'fog_mode': 'EXP', 'fog_density': 0.02,
+            'fog_table': 'PVR128', 'fog_end': 64.0,
             'fog_color': (0.4, 0.45, 0.55), 'shadows': False,
             'max_lights': 8, 'transparency': 'SORTED', 'gamma': 2.2,
         },
@@ -857,22 +1076,37 @@ PRESETS = {
     'PS2': {
         'label': "PlayStation 2 (2000)",
         'category': 'CONSOLE',
-        'note': "640x448 field-rendered with the GS's famous ordered dither, "
+        'note': "640x448 field-rendered with the GS's DIMX dither inside its "
+                "16-bit framebuffer, "
                 "bilinear mipmaps that pop, edge antialias (the flicker "
-                "filter), accumulation trails available, and bloom bleeding "
-                "off the brights. The machine that made 'PS2 haze' a look.",
+                "filter), the CRTC's frame-persistence blend available "
+                "(Colour Depth > CRTC Blend), and bloom bleeding "
+                "off the brights. The machine that made 'PS2 haze' a look; "
+                "hair and foliage take the two-pass Clip+Blend alpha mode. "
+                "GS HIGHLIGHT: white specular added after the texel, "
+                "0x80 = 1.0.",
         'settings': {
             'resolution_x': 640, 'resolution_y': 448,
             'aa_mode': 'EDGE', 'aa_edge_threshold': 0.08,
-            'default_model': 'PHONG', 'shading_rate': 'PIXEL',
-            'tex_filter': 'BILINEAR', 'tex_mipmap': True, 'tex_mip_bias': 0.5,
+            'default_model': 'PS2_HIGHLIGHT', 'shading_rate': 'VERTEX',   # R251 MAT-A C017
+            'tex_filter': 'BILINEAR', 'tex_mipmap': True,
             'tex_max_size': 256, 'tex_perspective': True,
-            'color_depth': '16', 'dither': 'BAYER4', 'dither_strength': 0.8,
+            # R251 TEX-2 C022 / C072: the GS's LOD from Q alone, 7.4 fixed
+            # (K = -2 is Halcyon's scene-unit tuning; the derivative
+            # road's tex_mip_bias is inert under it and dropped), one
+            # nearest level -- bilinear mipmaps that pop
+            'tex_lod_source': 'GS_Q', 'tex_lod_k': -2.0, 'tex_lod_l': 0,
+            'tex_mip_select': 'NEAREST_LEVEL',
+            # R251: the GS's PSMCT16 buffer with DTHE on -- the dither is
+            # inside the pipeline now, not at post
+            'color_depth': '24', 'dither': 'NONE',
+            'framebuffer': 'PS2_CT16', 'fb_dither': True,
             'interlace': 'FIELDS',
             'glow': True, 'glow_threshold': 0.8, 'glow_radius': 10.0,
             'glow_intensity': 0.5, 'glow_quality': 'BOX',
             'fog': True, 'fog_mode': 'LINEAR', 'fog_start': 18.0,
             'fog_end': 90.0, 'fog_color': (0.45, 0.5, 0.58),
+            'near_clip_mode': 'REJECT',        # R251 C027: VU1 whole-triangle drop
             'shadows': True, 'shadow_default': 'MAP', 'shadow_map_size': 512,
             'max_lights': 8, 'transparency': 'SORTED', 'gamma': 2.2,
         },
@@ -882,22 +1116,36 @@ PRESETS = {
         'category': 'CONSOLE',
         'note': "640x480 with clean trilinear mipmaps, per-pixel table fog "
                 "with a height layer (the Flipper's fog unit), soft shadow "
-                "maps and a gentle deflicker. The tidy one of the three.",
+                "maps and the EFB copy's deflicker filter. The tidy one of "
+                "the three. "
+                "Lighting is GX's fixed-function unit per vertex; materials "
+                "with their own model keep it; set Force Model to make "
+                "every material the board's. The Combiner Stage node is "
+                "the TEV / register-combiner stage for period multitexture.",
         'settings': {
             'resolution_x': 640, 'resolution_y': 480,
-            'aa_mode': 'EDGE', 'aa_edge_threshold': 0.1,
-            'default_model': 'PHONG', 'shading_rate': 'PIXEL',
+            # R251: the Flipper's real AA was rarely used (it halves the
+            # EFB); the softness is the copy filter's, not an edge filter's
+            'aa_mode': 'NONE', 'copy_filter': 'DEFLICKER',
+            'chroma_format': 'XFB_422',         # R251 C131: every frame passed through the XFB's 4:2:2
+            # R251 (LIGHT-B2 F016): the Flipper lit per vertex with GX's
+            # fixed-function unit; the per-pixel Phong was a stand-in
+            'default_model': 'GX_LIGHT', 'shading_rate': 'VERTEX',
             'tex_filter': 'TRILINEAR', 'tex_mipmap': True, 'tex_aniso': 2,
             'tex_max_size': 512, 'tex_perspective': True,
+            'tex_compress': 'CMPR_GC',          # R251 TEX-1 C024: the TEV's 3/8-5/8 CMPR blocks
             'color_depth': '24', 'dither': 'NONE',
             'fog': True, 'fog_mode': 'TABLE16', 'fog_start': 12.0,
             'fog_end': 80.0, 'fog_color': (0.5, 0.55, 0.62),
             'fog_height': True, 'fog_height_top': 3.0,
             'fog_height_falloff': 0.4,
+            'depth_encoding': 'GC_14E2',       # R251 C026: the 16-bit compressed Z
             'shadows': True, 'shadow_default': 'MAP',
             'shadow_map_size': 1024, 'shadow_softness': 2.0,
             'shadow_samples': 8,
             'max_lights': 8, 'transparency': 'SORTED', 'gamma': 2.2,
+            # R251: the EFB's RGBA6_Z24 format, Flipper's 2x2 dither
+            'framebuffer': 'GC_RGBA6',
         },
     },
     'XBOX': {
@@ -906,19 +1154,25 @@ PRESETS = {
         'note': "640x480 with trilinear plus anisotropy, per-pixel specular "
                 "everywhere, big soft shadow maps, projected light textures "
                 "on the spots (set an image on a lamp) and a hot bloom. The "
-                "pixel-shader flex of the generation.",
+                "pixel-shader flex of the generation. The Combiner Stage "
+                "node is the TEV / register-combiner stage for period "
+                "multitexture.",
         'settings': {
             'resolution_x': 640, 'resolution_y': 480,
             'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4, 'aa_filter': 'BOX',
             'default_model': 'BLINN', 'shading_rate': 'PIXEL',
             'tex_filter': 'TRILINEAR', 'tex_mipmap': True, 'tex_aniso': 4,
             'tex_max_size': 1024, 'tex_perspective': True,
+            'tex_compress': 'DXT1_NV2A',        # R251 TEX-1 C024: the NV2A's 16-bit DXT1 decode
             'color_depth': '24', 'dither': 'NONE',
             'glow': True, 'glow_threshold': 0.9, 'glow_radius': 14.0,
             'glow_intensity': 0.6, 'glow_quality': 'GAUSS',
             'specular_in_gamma': True, 'clamp_specular': False,
             'shadows': True, 'shadow_default': 'MAP',
             'shadow_map_size': 1024, 'shadow_softness': 1.5,
+            # R251 C084 / C026: Direct3D 8 on the NV2A -- integer pixel
+            # centres and the fixed-point W-buffer
+            'pixel_center': 'INTEGER_D3D', 'depth_encoding': 'W_FIXED',
             'shadow_samples': 8,
             'max_lights': 8, 'transparency': 'SORTED', 'gamma': 2.2,
         },
@@ -927,7 +1181,8 @@ PRESETS = {
         'label': "3DO Interactive (1993)",
         'category': 'CONSOLE',
         'note': "Cel-based hardware: warped textures, no z-buffer, 320x240 "
-                "with visible seams between quads.",
+                "with visible seams between quads, doubled to 640x480 by "
+                "the display generator's cornerweight interpolation.",
         'settings': {
             'resolution_x': 320, 'resolution_y': 240,
             'aa_mode': 'NONE', 'default_model': 'FLAT', 'shading_rate': 'FACE',
@@ -935,39 +1190,98 @@ PRESETS = {
             'tex_filter': 'NEAREST', 'tex_perspective': False,
             'depth_sort': 'PAINTERS', 'color_depth': '15', 'dither': 'BAYER2',
             'shadows': False, 'max_lights': 2, 'backface_cull': True,
-            'gamma': 2.2, 'output_scale': '3X',
+            # R251: the Opera display generator's own doubled raster
+            'gamma': 2.2, 'output_scale': 'THREEDO_2X',
+            # R251: the PIXC's default P/2+S/2
+            'transparency': 'SORTED', 'blend_equation': 'SATURN_HALF',
         },
     },
     'JAGUAR': {
         'label': "Atari Jaguar (1993)",
         'category': 'CONSOLE',
-        'note': "Gouraud-shaded flat-lit polygons at 320x240, 16-bit, no "
-                "texture filtering.",
+        'note': "Flat-lit polygons at 320x240 in the Jaguar's own CRY "
+                "pixel: smooth intensity, 256 chroma cells, no texture "
+                "filtering. Halcyon's Gouraud interpolates RGB and encodes "
+                "CRY per pixel; the Blitter's intensity-only Gouraud is "
+                "not modelled.",
         'settings': {
             'resolution_x': 320, 'resolution_y': 240,
             'aa_mode': 'NONE', 'default_model': 'GOURAUD',
             'shading_rate': 'VERTEX', 'tex_filter': 'NEAREST',
-            'tex_perspective': False, 'color_depth': '16', 'dither': 'NONE',
+            'tex_perspective': False, 'color_depth': 'CRY16', 'dither': 'NONE',
             'shadows': False, 'max_lights': 2, 'backface_cull': True,
             'gamma': 2.2, 'output_scale': '3X',
+        },
+    },
+    # R251 post-signal (C047): software 3D into Mode 5's bitmap, stretched
+    # to the LCD by BG2's affine registers (design 2.5 #36 merges
+    # transparency's GBA keys into this dict)
+    'GBA_MODE5': {
+        'label': "Game Boy Advance, Mode 5 (2001)",
+        'category': 'CONSOLE',
+        'note': "Software 3D drawn into the 160x128 Mode 5 bitmap and "
+                "stretched to the LCD by BG2's affine registers: 15-bit, "
+                "flat, no filtering, no z-buffer, BLDALPHA's sixteenths for "
+                "anything see-through.",
+        'settings': {
+            'resolution_x': 240, 'resolution_y': 160,
+            'aa_mode': 'NONE', 'default_model': 'FLAT', 'shading_rate': 'FACE',
+            'vertex_snap': True, 'vertex_snap_grid': 1.0,
+            'tex_filter': 'NEAREST', 'tex_perspective': False,
+            'depth_sort': 'PAINTERS', 'painters_key': 'CENTROID',
+            'color_depth': '15', 'dither': 'NONE',
+            'shadows': False, 'max_lights': 1, 'backface_cull': True,
+            # R251 C053 (design 2.5 #36): BLDALPHA's sixteenths for anything see-through
+            'aa_samples': 1, 'transparency': 'SORTED', 'blend_equation': 'GBA',
+            'output_scale': 'GBA_MODE5',
+        },
+    },
+    'NAMCO_S21': {
+        'label': "Namco System 21 (1988)",
+        'category': 'ARCADE',
+        'note': "Flat untextured polygons in 16 palette banks: every polygon "
+                "steps toward the haze by its mean depth (Winning Run, Starblade, "
+                "Solvalou). No z-buffer, no textures. The painter's sort fills by "
+                "one depth per polygon, on the CPU or the GPU rasteriser. Materials "
+                "with their own model keep it; set Force Model to make every "
+                "material the board's.",
+        'settings': {
+            'resolution_x': 496, 'resolution_y': 480,
+            'aa_mode': 'NONE', 'default_model': 'FLAT',
+            'shading_rate': 'FACE', 'tex_filter': 'NEAREST',
+            'depth_sort': 'PAINTERS', 'color_depth': '15',
+            'dither': 'NONE', 'fog': True, 'fog_mode': 'LINEAR',
+            'fog_start': 6.0, 'fog_end': 40.0,
+            'fog_face': True, 'fog_bands': 16,
+            'fog_color': (0.55, 0.6, 0.7), 'shadows': False,
+            'max_lights': 1, 'backface_cull': True, 'gamma': 2.2,
         },
     },
     'PSX_HIRES': {
         'label': "PlayStation high-res (1994)",
         'category': 'CONSOLE',
         'note': "512x240 mode: the same warping and snapping, twice the "
-                "horizontal detail. Used for menus and FMV overlays.",
+                "horizontal detail. Used for menus and FMV overlays; "
+                "texel x vertex colour / 128.",
         'settings': {
             'resolution_x': 512, 'resolution_y': 240,
             'pixel_aspect_x': 1.0, 'pixel_aspect_y': 2.0,
-            'aa_mode': 'NONE', 'default_model': 'GOURAUD',
+            'aa_mode': 'NONE', 'default_model': 'PS1_MODULATE',   # R251 MAT-A C006
             'shading_rate': 'VERTEX', 'vertex_snap': True,
             'vertex_snap_grid': 1.0, 'subpixel_precision': 'INTEGER',
             'tex_filter': 'NEAREST', 'tex_perspective': False,
-            'depth_sort': 'PAINTERS', 'painters_key': 'CENTROID',
+            'depth_sort': 'PAINTERS', 'painters_key': 'ORDERING_TABLE',
+            'ot_length': 4096, 'ot_far': 40.0,   # R251 C004: the ordering table
+            'near_clip_mode': 'REJECT',          # R251 C027: the GTE's whole-polygon drop
+            'vertex_quantize': 'PS1', 'vertex_units': 64.0,   # R251 C012: 16-bit vertices, 1.3.12 normals, 8-bit UVs
             'transparency': 'SORTED',
             'color_depth': '15', 'dither': 'BAYER4', 'shadows': False,
             'max_lights': 4, 'backface_cull': True, 'gamma': 2.2,
+            # R251: the GPU's 0.5B+0.5F semi-transparency
+            'blend_equation': 'PS1_AVG',
+            # R251 F001: the GTE's depth cue at the preset's vertex rate
+            'fog': True, 'fog_mode': 'GTE_1Z', 'fog_start': 6.0,
+            'fog_end': 24.0, 'fog_color': (0.32, 0.32, 0.36),
         },
     },
 
@@ -975,14 +1289,20 @@ PRESETS = {
     'VHS': {
         'label': "VHS tape (1976)",
         'category': 'BROADCAST',
-        'note': "Third-generation dub: chroma smeared into next week, ringing, "
-                "dot crawl and interlace.",
+        'note': "A VHS recording down a composite cable: the tape's 240-line "
+                "luma, colour-under chroma smeared and landing late, the "
+                "head-switch tear at the bottom, then ringing, dot crawl and "
+                "interlace. Raise Generations for a dub of a dub.",
         'settings': {
             'resolution_x': 640, 'resolution_y': 480,
             'pixel_aspect_x': 10.0, 'pixel_aspect_y': 11.0,
             'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
             'default_model': 'PHONG', 'shadows': True,
-            'color_depth': '24', 'composite': True, 'composite_bleed': 2.0,
+            # R251 C128: the tape's own path carries the chroma smear
+            # (240 TVL luma, 40 TVL colour-under chroma, the Y/C delay,
+            # the head switch); the cable keeps its own, smaller, bleed
+            'tape': 'VHS', 'tape_generations': 1, 'tape_noise': 0.03,
+            'color_depth': '24', 'composite': True, 'composite_bleed': 0.5,
             'composite_ringing': 1.0, 'composite_dot_crawl': 1.2,
             'interlace': 'BLEND', 'crt': True, 'crt_scanlines': 0.2,
             'crt_vignette': 0.4, 'crt_bloom': 0.3,
@@ -1000,10 +1320,31 @@ PRESETS = {
             'pixel_aspect_x': 10.0, 'pixel_aspect_y': 11.0,
             'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4, 'aa_filter': 'MITCHELL',
             'default_model': 'PHONG', 'shadows': True, 'shadow_default': 'MAP',
-            'color_depth': '24', 'composite': True, 'composite_bleed': 0.4,
-            'composite_ringing': 0.15, 'composite_dot_crawl': 0.0,
+            # R251 C129: the cable itself -- luma whole, the encoded chroma
+            # band-limited (I 1.3 / Q 0.5 MHz), no composite stage at all
+            'color_depth': '24', 'composite': False, 'signal': 'SVIDEO',
             'interlace': 'BLEND', 'crt': True, 'crt_scanlines': 0.1,
             'crt_mask': 'APERTURE', 'crt_mask_strength': 0.15, 'gamma': 2.2,
+        },
+    },
+    # R251 C129: the console on the aerial socket
+    'RF_MODULATOR': {
+        'label': "RF modulator, channel 3 (1977)",
+        'category': 'BROADCAST',
+        'note': "The console on the aerial socket: composite through a cheap "
+                "modulator -- soft luma, the 920 kHz herringbone on colour, a "
+                "little snow and a ghost to the right.",
+        'settings': {
+            'resolution_x': 640, 'resolution_y': 480,
+            'pixel_aspect_x': 10.0, 'pixel_aspect_y': 11.0,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'PHONG', 'shadows': True,
+            'color_depth': '24', 'composite': True, 'composite_bleed': 1.0,
+            'composite_ringing': 0.5, 'composite_dot_crawl': 0.6,
+            'signal': 'RF', 'rf_bandwidth': 3.0, 'rf_beat': 0.4,
+            'rf_snow': 0.03, 'rf_ghost': 0.15, 'rf_ghost_delay': 1.5,
+            'interlace': 'BLEND', 'crt': True, 'crt_scanlines': 0.2,
+            'crt_vignette': 0.3, 'gamma': 2.2,
         },
     },
 
@@ -1022,6 +1363,45 @@ PRESETS = {
             'jpeg_artifacts': True, 'jpeg_quality': 30, 'jpeg_passes': 2,
             'block_size': 4, 'shadows': True, 'gamma': 2.2,
             'output_scale': '2X', 'saturation': 0.9,
+            'chroma_format': 'Y420_MPEG1',      # R251 C131: Cinepak's 2x2-cell chroma
+        },
+    },
+    # R251 C132: the white-book disc
+    'VIDEO_CD': {
+        'label': "Video CD, MPEG-1 (1993)",
+        'category': 'BROADCAST',
+        'note': "The white-book disc: 352x240 MPEG-1 intra blocks at scale "
+                "10 with the GOP's quality pumping, chroma held per 2x2, "
+                "doubled up for the television.",
+        'settings': {
+            'resolution_x': 352, 'resolution_y': 240,
+            'pixel_aspect_x': 10.0, 'pixel_aspect_y': 11.0,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'PHONG', 'shadows': True,
+            'color_depth': '24',
+            'mpeg1': True, 'mpeg1_qscale': 10, 'mpeg1_gop': 15,
+            'composite': True, 'composite_bleed': 0.6,
+            'composite_ringing': 0.2, 'interlace': 'NONE',
+            'crt': True, 'crt_scanlines': 0.15, 'gamma': 2.2,
+            'output_scale': '2X',
+        },
+    },
+    # R251 C133: the RAD Game Tools cutscene
+    'SMACKER_FMV': {
+        'label': "Smacker game video (1994)",
+        'category': 'WEB',
+        'note': "The RAD Game Tools cutscene: a 256-colour frame palette "
+                "and 4x4 blocks filled, split in two with a bit mask, or "
+                "kept whole, doubled up in the game window.",
+        'settings': {
+            'resolution_x': 320, 'resolution_y': 240,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'PHONG', 'shadows': True,
+            'color_depth': '8', 'palette_mode': 'ADAPTIVE',
+            'palette_size': 256, 'palette_method': 'MEDIAN_CUT',
+            'dither': 'NONE',
+            'smacker': True, 'smacker_quality': 0.4,
+            'gamma': 2.2, 'output_scale': '2X',
         },
     },
     'WEB_PNG8': {
@@ -1098,6 +1478,27 @@ PRESETS = {
             'output_scale': '3X',
         },
     },
+    # R251 C063: Elite's wireframe rule
+    'ELITE_BBC': {
+        'label': "Elite (BBC Micro, 1984)",
+        'category': 'PLATFORM',
+        'note': "Wireframe ships by Elite's own rule: an edge draws when "
+                "either face faces you, no depth test, so far edges show "
+                "through concave hulls. Set the world black; surfaces "
+                "render black under the override so only the lines "
+                "remain. 1-bit output as the BBC's Mode 4.",
+        'settings': {
+            'resolution_x': 320, 'resolution_y': 256,
+            'aa_mode': 'NONE',
+            'render_wire': True, 'wire_mode': 'ELITE', 'wire_width': 1.0,
+            'wire_color': (1.0, 1.0, 1.0), 'wire_dot_distance': 0.0,
+            'material_override': 'CLAY', 'override_color': (0.0, 0.0, 0.0),
+            'global_ambient': (0.0, 0.0, 0.0),
+            'shadows': False, 'fog': False, 'glow': False,
+            'color_depth': '1', 'dither': 'NONE', 'gamma': 1.0,
+            'output_scale': '3X',
+        },
+    },
     'AMIGA_OCS': {
         'label': "Amiga OCS 32 colour (1985)",
         'category': 'PLATFORM',
@@ -1108,8 +1509,26 @@ PRESETS = {
             'default_model': 'GOURAUD', 'shading_rate': 'VERTEX',
             'tex_filter': 'NEAREST', 'color_depth': '8',
             'palette_mode': 'ADAPTIVE', 'palette_size': 32,
+            'palette_bits': 'BITS_4',
             'palette_method': 'MEDIAN_CUT', 'dither': 'FLOYD',
             'shadows': False, 'gamma': 2.2, 'output_scale': '3X',
+        },
+    },
+    'AMIGA_EHB': {
+        'label': "Amiga Extra Half-Brite (1985)",
+        'category': 'PLATFORM',
+        'note': "320x256 PAL in 64 colours: 32 registers from 4096 and "
+                "their exact halves, the free shadow step shaded 3D used "
+                "before AGA. No dither: the half-brite step is the "
+                "shading.",
+        'settings': {
+            'resolution_x': 320, 'resolution_y': 256,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'default_model': 'GOURAUD', 'shading_rate': 'VERTEX',
+            'tex_filter': 'NEAREST', 'color_depth': '8',
+            'palette_mode': 'EHB', 'palette_method': 'MEDIAN_CUT',
+            'dither': 'NONE', 'shadows': False, 'max_lights': 3,
+            'gamma': 2.2, 'output_scale': '3X',
         },
     },
     'QUAKE_SW': {
@@ -1136,67 +1555,277 @@ PRESETS = {
         'label': "PlayStation (1994)",
         'category': 'CONSOLE',
         'note': "Integer vertex snapping, affine texture warp, no z-buffer "
-                "sorting, 15-bit colour with ordered dither.",
+                "sorting, 15-bit colour with ordered dither; texel x "
+                "vertex colour / 128 (the GPU's texture blend).",
         'settings': {
             'resolution_x': 320, 'resolution_y': 240,
-            'aa_mode': 'NONE', 'default_model': 'GOURAUD',
+            'aa_mode': 'NONE', 'default_model': 'PS1_MODULATE',   # R251 MAT-A C006
             'shading_rate': 'VERTEX', 'vertex_snap': True,
             'vertex_snap_grid': 1.0, 'subpixel_precision': 'INTEGER',
             'tex_filter': 'NEAREST', 'tex_perspective': False,
-            'depth_sort': 'PAINTERS', 'painters_key': 'CENTROID',
+            'depth_sort': 'PAINTERS', 'painters_key': 'ORDERING_TABLE',
+            'ot_length': 4096, 'ot_far': 40.0,   # R251 C004: the ordering table
+            'near_clip_mode': 'REJECT',          # R251 C027: the GTE's whole-polygon drop
+            'vertex_quantize': 'PS1', 'vertex_units': 64.0,   # R251 C012: 16-bit vertices, 1.3.12 normals, 8-bit UVs
             'transparency': 'SORTED',
             'color_depth': '15', 'dither': 'BAYER4', 'dither_strength': 1.0,
             'shadows': False, 'max_lights': 4, 'backface_cull': True,
             'gamma': 2.2, 'output_scale': '3X',
+            # R251: the GPU's 0.5B+0.5F semi-transparency
+            'blend_equation': 'PS1_AVG',
+            # R251 F001: the GTE's depth cue at the preset's vertex rate
+            'fog': True, 'fog_mode': 'GTE_1Z', 'fog_start': 6.0,
+            'fog_end': 24.0, 'fog_color': (0.32, 0.32, 0.36),
+        },
+    },
+    'MODEL1': {
+        'label': "Sega Model 1 (1992)",
+        'category': 'ARCADE',
+        'note': "Virtua Racing / Virtua Fighter: flat-lit untextured "
+                "polygons at 496x384, the first light as the one "
+                "directional lamp, and the fighters' shadows projected "
+                "flat onto the floor as solid black polygons (Blinn's "
+                "fake shadow). Textures stay if a material has them; "
+                "Model 1 had none. 24-bit output and gamma 2.2 follow "
+                "the neighbouring arcade presets.",
+        'settings': {
+            'resolution_x': 496, 'resolution_y': 384,
+            'aa_mode': 'NONE', 'default_model': 'FLAT',
+            'shading_rate': 'FACE', 'tex_filter': 'NEAREST',
+            'backface_cull': True,
+            'shadows': True, 'shadow_default': 'PLANAR',
+            'max_lights': 1, 'light_limit_mode': 'FIRST',
+            'fog': False, 'color_depth': '24', 'dither': 'NONE',
+            'gamma': 2.2,
         },
     },
     'SATURN': {
         'label': "Sega Saturn (1994)",
         'category': 'CONSOLE',
         'note': "Quad-based renderer: flat-ish shading, no perspective "
-                "correction, 15-bit output, visible seams.",
+                "correction, 15-bit output, visible seams; the VDP1's "
+                "5-bit Gouraud add.",
         'settings': {
             'resolution_x': 352, 'resolution_y': 240,
-            'aa_mode': 'NONE', 'default_model': 'FLAT', 'shading_rate': 'FACE',
+            'aa_mode': 'NONE', 'default_model': 'SATURN_ADD', 'shading_rate': 'FACE',   # R251 MAT-A C006
             'vertex_snap': True, 'vertex_snap_grid': 1.0,
             'tex_filter': 'NEAREST', 'tex_perspective': False,
             'depth_sort': 'PAINTERS', 'color_depth': '15', 'dither': 'NONE',
             'shadows': False, 'max_lights': 2, 'backface_cull': True,
             'gamma': 2.2, 'output_scale': '3X',
+            # R251: VDP1's half-transparency colour calculation
+            'transparency': 'SORTED', 'blend_equation': 'SATURN_HALF',
+        },
+    },
+    'SEGA_MODEL2': {
+        'label': "Sega Model 2 (1993)",
+        'category': 'ARCADE',   # R251 (design 2.5 #38)
+        'note': "Daytona USA's board: one luma per polygon, a fixed-viewer "
+                "highlight squared into it, bilinear textures at 496x384, "
+                "the 50% checker for translucency (the board had one fixed "
+                "checker and discarded texels below half; Halcyon's Screen "
+                "Door thresholds any alpha), no z-fighting, one sun. Camera "
+                "Axis is on for every material's model; materials with "
+                "their own model keep it -- set Force Model to make every "
+                "material the board's. 4-bit luminance textures tinted "
+                "through the material colour (the board had no per-vertex "
+                "colour). The lit term then takes the 64-step luma ramp per "
+                "5-bit channel, MAME's colour translate.",
+        'settings': {
+            'resolution_x': 496, 'resolution_y': 384,
+            'aa_mode': 'NONE', 'default_model': 'SEGA_MODEL2',
+            'shading_rate': 'FACE', 'tex_filter': 'BILINEAR',
+            'tex_perspective': True, 'tex_max_size': 256,
+            'tex_format': 'I4_MODEL2',       # R251 TEX-1 C074 (design 2.5 #34)
+            'color_depth': '15', 'dither': 'NONE',
+            'transparency': 'STIPPLE', 'stipple_pattern': 'BAYER2',
+            'shadows': False, 'max_lights': 1,
+            'specular_viewer': 'AXIS',
+            'backface_cull': True, 'gamma': 2.2,
+        },
+    },
+    'SEGA_MODEL3': {
+        'label': "Sega Model 3 (1996)",
+        'category': 'ARCADE',   # R251 (design 2.5 #38)
+        'note': "Scud Race's board: Gouraud per vertex with the N.L "
+                "highlight snapped to 8/16/32/64, trilinear mipmaps at "
+                "496x384, per-pixel linear fog, a screen-pinned headlight "
+                "spot (see Screen Spotlight on a lamp), one sun. The viewport "
+                "spotlight is the lamp's Screen Spotlight flag (Light panel, "
+                "Spot lamps): an ellipse pinned to the screen, its lobe added "
+                "to the diffuse and, through Spotlight Fog, to the fog. A material's "
+                "Fog Burn-Through socket is the polygon light modifier (neon "
+                "through the haze); Fog Bank 1 is a nearer second curve. Camera "
+                "Axis is on for every material's model; materials with "
+                "their own model keep it -- set Force Model to make every "
+                "material the board's. The lit term then takes the 64-step "
+                "luma ramp per 5-bit channel, MAME's colour translate.",
+        'settings': {
+            'resolution_x': 496, 'resolution_y': 384,
+            'aa_mode': 'NONE', 'default_model': 'SEGA_MODEL3',
+            'shading_rate': 'VERTEX', 'tex_filter': 'TRILINEAR',
+            'tex_mipmap': True, 'tex_perspective': True,
+            'color_depth': '24', 'dither': 'NONE',
+            'fog': True, 'fog_mode': 'LINEAR', 'fog_start': 15.0,
+            'fog_end': 90.0, 'fog_color': (0.6, 0.65, 0.75),
+            # R251 LIGHT-A2 F006: a second fog bank ready for a material's
+            # Fog Bank 1 socket (the board's near haze; inert until used)
+            'fog_bank1_start': 6.0, 'fog_bank1_end': 45.0,
+            'shadows': False, 'max_lights': 1,
+            'specular_viewer': 'AXIS',
+            'backface_cull': True, 'gamma': 2.2,
         },
     },
     'N64': {
         'label': "Nintendo 64 (1996)",
         'category': 'CONSOLE',
         'note': "Three-point filtered textures at 64x64, aggressive fog, "
-                "16-bit framebuffer with the RDP's dither.",
+                "15-bit (5551) framebuffer with the RDP's dither, the VI's "
+                "de-dither and gamma-dither at scan-out; the RDP "
+                "combiner's rounding; Screen Door "
+                "offers the RDP's random alpha compare (N64_NOISE). Sharpen "
+                "(G_TD_SHARPEN) is the RDP's magnification mode if your "
+                "textures used it.",
         'settings': {
             'resolution_x': 320, 'resolution_y': 240,
-            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4, 'aa_filter': 'TRIANGLE',
-            'default_model': 'GOURAUD', 'shading_rate': 'VERTEX',
+            # R251 C001: the N64 had no supersampler -- its AA IS the RDP's
+            # coverage blended by the VI (the filter line was a dead key)
+            'aa_mode': 'NONE', 'n64_coverage_aa': True, 'n64_divot': True,
+            'default_model': 'N64_COMBINE', 'shading_rate': 'VERTEX',   # R251 MAT-A C006
             'tex_filter': 'N64_3POINT', 'tex_max_size': 64,
             'tex_perspective': True, 'tex_mipmap': True,
-            'color_depth': '16', 'dither': 'BAYER2',
+            'tex_tmem_format': 'CI4',           # R251 TEX-1 C013: 16 colours at 5551, 64x64 in 2 KB
+            'tex_mip_select': 'BLEND',          # R251 TEX-2 C072: the RDP's lod_frac lerp over its 3-point taps
+            'color_depth': '15', 'dither': 'BAYER2',
             'fog': True, 'fog_mode': 'LINEAR', 'fog_start': 6.0,
             'fog_end': 26.0, 'fog_color': (0.35, 0.42, 0.55),
-            'shadows': False, 'max_lights': 4, 'gamma': 2.2,
+            'depth_encoding': 'N64_FLOAT18',   # R251 C007: the RDP's 14-bit float z
+            'vertex_quantize': 'N64', 'vertex_units': 64.0,   # R251 C012: Vtx_t short ob[3], signed char n[3]
+            'shadows': False, 'max_lights': 4, 'gamma': 1.0,
+            # R251: the VI's own de-dither and gamma-dither at scan-out
+            # (gamma 1.0: the VI's root replaces the display dial)
+            'vi_dither_filter': True, 'vi_gamma': 'GAMMA_DITHER',
             'output_scale': '3X',
         },
     },
     'VOODOO': {
         'label': "3dfx Voodoo Graphics (1996)",
         'category': 'CONSOLE',
-        'note': "Bilinear filtering, 16-bit colour with the 22-bit "
-                "post-filter, table fog. The 1997 accelerated look.",
+        'note': "Bilinear filtering, RGB565 truncated at every write with "
+                "the hardware's own dither (the 22-bit post-filter is the "
+                "signal pack's), table fog. The 1997 accelerated look. "
+                "Set Extend Clamp Mode to GL_CLAMP for GLQuake-style "
+                "sky-box seams (the MiniGL was conformant). A texture's "
+                "alpha cut-outs are chroma-keyed as Glide did (stored "
+                "black, cut after the filter): wire the image's Alpha to "
+                "see through them, or the holes show black.",
         'settings': {
             'resolution_x': 640, 'resolution_y': 480,
             'aa_mode': 'NONE', 'default_model': 'GOURAUD',
             'shading_rate': 'VERTEX', 'tex_filter': 'BILINEAR',
             'tex_mipmap': True, 'tex_max_size': 256,
-            'color_depth': '16', 'dither': 'BAYER4', 'dither_strength': 0.6,
-            'fog': True, 'fog_mode': 'TABLE16', 'fog_start': 8.0,
-            'fog_end': 40.0, 'shadows': False, 'max_lights': 8,
+            # R251 TEX-1: Glide's default upload format and the Voodoo1's
+            # four-bit bilinear fraction (C074, C080)
+            'tex_format': 'RGB565', 'tex_frac_bits': 'BITS_4',
+            # R251 TEX-2: one TMU -- no level blend, a 4x4-dithered pick
+            # of the polygon's lodbase level (C072, C079); the Glide
+            # chroma key tested after the filter (C083)
+            'tex_mip_select': 'DITHER_VOODOO', 'tex_lod_source': 'TRIANGLE',
+            'tex_colorkey': True,
+            # R251: the 16-bit step moves to where the hardware had it --
+            # the 565 buffer with the Voodoo's own write dither; the post
+            # snap to '16' without dither is a no-op on that lattice
+            'color_depth': '16', 'dither': 'NONE',
+            'framebuffer': 'VOODOO_565_4X4', 'fb_dither': True,
+            # R251 F002: Glide's 64-entry table on 1/w, filled by
+            # guFogGenerateExp's curve (TABLE16 was a stand-in)
+            'fog': True, 'fog_mode': 'EXP', 'fog_density': 0.035,
+            'fog_table': 'VOODOO64', 'shadows': False, 'max_lights': 8,
+            'depth_encoding': 'VOODOO_W16',    # R251 C075: the 16-bit floating W
             'transparency': 'SORTED', 'gamma': 2.2,
+            # R251: the '22-bit' scan-out filter 86Box reconstructed
+            'video_filter': 'VOODOO1',
+        },
+    },
+    # R251 F002: the integrator rebuilds this dict from the FINAL merged
+    # VOODOO settings (design 2.5 #33: + video_filter, tex_frac_bits)
+    'VOODOO2': {
+        'label': "3dfx Voodoo2 (1998)",
+        'category': 'CONSOLE',
+        'note': "Two texture units and 800x600: bilinear mipmaps, 16-bit "
+                "colour with ordered dither, Glide's table fog with the "
+                "Voodoo2's fog dither. A texture's alpha cut-outs are "
+                "chroma-keyed (stored black, cut after the filter): wire "
+                "the image's Alpha to see through them, or the holes "
+                "show black.",
+        'settings': {
+            'resolution_x': 800, 'resolution_y': 600,
+            'aa_mode': 'NONE', 'default_model': 'GOURAUD',
+            'shading_rate': 'VERTEX', 'tex_filter': 'BILINEAR',
+            'tex_mipmap': True, 'tex_max_size': 256,
+            'color_depth': '16', 'dither': 'BAYER4', 'dither_strength': 0.6,
+            'fog': True, 'fog_mode': 'EXP', 'fog_density': 0.035,
+            'fog_table': 'VOODOO64', 'fog_dither': True,
+            'shadows': False, 'max_lights': 8,
+            'transparency': 'SORTED', 'gamma': 2.2,
+        },
+    },
+    # R251 material pack (MAT-A): the fixed-function combiners' machines
+    'D3D_RETAIL_1997': {
+        'label': "Direct3D 5 retail (1997)",
+        'category': 'CONSOLE',
+        'note': "Direct3D's fixed-function pipe: flat shading takes the "
+                "first vertex, 8-bit vertex colours, specular added after "
+                "the texture (give a material the Gouraud, separate "
+                "specular model). The Emboss Bump node is DX6 texture "
+                "embossing. For the cards' z-based pixel fog set Fog "
+                "Depth to Z and give Fog Start and End as 0..1 depths.",
+        'settings': {
+            'default_model': 'FLAT_D3D_FIRST', 'shading_rate': 'FACE',
+            'tex_filter': 'BILINEAR', 'color_depth': '16', 'dither': 'NONE',
+            # R251 C084 (the raster pack's key for this preset): the
+            # integer pixel centre of Direct3D 3-9. The lighting pack's
+            # `fog_depth 'Z'` stays OUT: under it the Fog switch fogs
+            # nothing at scene-unit Start/End (measured), and a preset
+            # that never turns fog on should not change what that switch
+            # means -- the note names the dial instead
+            'pixel_center': 'INTEGER_D3D',
+            'shadows': False, 'max_lights': 8, 'gamma': 2.2,
+        },
+    },
+    'POWERVR_PCX2': {
+        'label': "PowerVR PCX2, Matrox m3D (1997)",
+        'category': 'CONSOLE',
+        'note': "One base colour per polygon and a single interpolated "
+                "intensity: coloured lighting falls back to monochrome. "
+                "Bilinear, 16-bit, no specular.",
+        'settings': {
+            'default_model': 'PCX_INTENSITY', 'shading_rate': 'VERTEX',
+            # R251: the texture pack's `tex_format 'RGB5550'` stays OUT --
+            # the card stored 5:5:5 for opaque textures and 4:4:4:4 for
+            # those with alpha, and ONE global alpha-less format turns
+            # every cut-out opaque (measured), with nothing printed
+            'tex_filter': 'BILINEAR', 'color_depth': '16',
+            'dither': 'BAYER4', 'dither_strength': 0.6, 'shadows': False,
+            'max_lights': 8, 'gamma': 2.2,
+            'resolution_x': 640, 'resolution_y': 480,
+        },
+    },
+    'MEGA_DRIVE': {
+        'label': "Sega Mega Drive / Genesis (1988)",
+        'category': 'CONSOLE',
+        'note': "320x224, 3 bits per channel through the VDP's non-linear "
+                "DAC in shadow/highlight mode: three intensity classes "
+                "from tables, flat polygons, no blending (column mesh).",
+        'settings': {
+            'resolution_x': 320, 'resolution_y': 224,
+            'pixel_aspect_x': 32.0, 'pixel_aspect_y': 35.0,
+            'aa_mode': 'NONE', 'aa_samples': 1,
+            'default_model': 'MEGA_DRIVE_SH', 'shading_rate': 'FACE',
+            'tex_filter': 'NEAREST', 'color_depth': '24', 'dither': 'NONE',
+            'transparency': 'STIPPLE', 'stipple_pattern': 'COLUMNS',
+            'depth_sort': 'PAINTERS', 'shadows': False, 'max_lights': 1,
+            'gamma': 1.0, 'color_management': 'NONE', 'output_scale': '3X',
         },
     },
 
@@ -1211,6 +1840,7 @@ PRESETS = {
             'pixel_aspect_x': 10.0, 'pixel_aspect_y': 11.0,
             'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4, 'aa_filter': 'MITCHELL',
             'default_model': 'PHONG', 'shadows': True, 'shadow_default': 'MAP',
+            'chroma_format': 'Y422',            # R251 C131: D1's co-sited 4:2:2
             'color_depth': '24', 'composite': True, 'composite_bleed': 1.0,
             'composite_ringing': 0.45, 'composite_dot_crawl': 0.4,
             'interlace': 'BLEND', 'crt': True, 'crt_scanlines': 0.15,
@@ -1227,6 +1857,9 @@ PRESETS = {
                 "shadows, broadcast-legal colour and a light interlace "
                 "blend. ReBoot on your engine.",
         'settings': {
+            # R251 C093: the note's promise kept -- Scale Saturation on
+            # the NTSC envelope at 120 IRE (the defaults)
+            'video_color_check': 'SCALE_SAT',
             'resolution_x': 720, 'resolution_y': 486,
             'pixel_aspect_x': 10.0, 'pixel_aspect_y': 11.0,
             'aa_mode': 'SUPERSAMPLE', 'aa_samples': 9,
@@ -1236,6 +1869,7 @@ PRESETS = {
             'shadow_map_size': 1024, 'shadow_softness': 1.0,
             'shadow_samples': 4,
             'global_ambient': (0.10, 0.10, 0.12),
+            'chroma_format': 'Y422',            # R251 C131: the D1 master's co-sited 4:2:2
             'color_depth': '24', 'interlace': 'BLEND',
             'gamma': 2.2, 'saturation': 0.9, 'dither': 'NONE',
         },
@@ -1243,7 +1877,9 @@ PRESETS = {
     'PAL_TV': {
         'label': "PAL broadcast (1967)",
         'category': 'BROADCAST',
-        'note': "720x576 with PAL pixel aspect and a softer composite.",
+        'note': "720x576 with PAL pixel aspect, a softer composite, the "
+                "delay-line decoder's two-line chroma and the eight-field "
+                "crawl.",
         'settings': {
             'resolution_x': 720, 'resolution_y': 576,
             'pixel_aspect_x': 59.0, 'pixel_aspect_y': 54.0,
@@ -1251,6 +1887,9 @@ PRESETS = {
             'default_model': 'PHONG', 'shadows': True,
             'color_depth': '24', 'composite': True, 'composite_bleed': 0.7,
             'composite_ringing': 0.3, 'interlace': 'BLEND',
+            # R251 C130: the PAL-D receiver; one crawl, the PAL one
+            'pal_decoder': 'DELAY_LINE', 'pal_crawl': 0.4,
+            'composite_dot_crawl': 0.0,
             'crt': True, 'crt_scanlines': 0.12, 'crt_vignette': 0.2,
             'gamma': 2.2,
         },
@@ -1590,7 +2229,9 @@ PRESETS = {
             'film_scratches': 0.1, 'film_scratch_width': 1.1,
             'film_scratch_hold': 48, 'film_scratch_side': 'EMULSION',
             'film_misregister': 0.4, 'film_bleed': 0.2,
-            'composite': True, 'composite_bleed': 2.0,
+            # R251 C128: taped off air -- the tape path under the cable
+            'tape': 'VHS', 'tape_generations': 1,
+            'composite': True, 'composite_bleed': 0.5,
             'composite_ringing': 0.8, 'composite_dot_crawl': 0.8,
             'interlace': 'BLEND', 'crt': True, 'crt_scanlines': 0.2,
             'crt_vignette': 0.35, 'color_depth': '24', 'gamma': 2.2,
@@ -1748,7 +2389,54 @@ PRESETS = {
             'film_hold': 1, 'color_depth': '24', 'gamma': 2.2,
         },
     },
+    # R251 C134: the optical printer
+    'TRON_1982': {
+        'label': "Tron backlit mattes (1982)",
+        'category': 'CEL',
+        'note': "MAGI and Triple-I frames finished through backlit "
+                "Kodalith mattes: give the circuit materials a Glow Gel "
+                "colour and each glows as a sum of exposures at doubling "
+                "diffusion, the line crisp underneath.",
+        'settings': {
+            'resolution_x': 1920, 'resolution_y': 1080,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4,
+            'aa_filter': 'GAUSS', 'default_model': 'PHONG',
+            'shadows': True, 'shadow_default': 'RAY',
+            'matte_glow': True, 'matte_glow_radius': 8.0,
+            'matte_glow_passes': 3, 'matte_glow_exposure': 1.0,
+            'film_grain': 0.12, 'film_grain_size': 1.0,
+            'color_depth': '24', 'gamma': 2.2,
+        },
+    },
+
+    # ---------------------------------------------------------- arcade
+    # R251 C055: the vector monitor beam
+    'ATARI_VECTOR': {
+        'label': "Atari vector arcade (1979)",
+        'category': 'ARCADE',
+        'note': "The DVG beam of Asteroids and Battlezone: feature edges "
+                "as phosphor strokes with 16 intensity levels, bright "
+                "dwell dots at the vertices, additive crossings. Surfaces "
+                "black under the override; set the world black.",
+        'settings': {
+            'resolution_x': 640, 'resolution_y': 480,
+            'aa_mode': 'NONE',
+            'render_wire': True, 'wire_mode': 'BEAM',
+            'beam_machine': 'DVG', 'beam_sigma': 0.7,
+            'wire_angle': 25.0, 'wire_color': (0.85, 1.0, 0.9),
+            'material_override': 'CLAY', 'override_color': (0.0, 0.0, 0.0),
+            'global_ambient': (0.0, 0.0, 0.0),
+            'shadows': False, 'fog': False, 'glow': False,
+            'color_depth': '24', 'dither': 'NONE', 'gamma': 1.0,
+        },
+    },
 }
+
+# R251 (design 2.5 #33): VOODOO2 is the FINAL merged VOODOO plus the Voodoo2's own
+# keys (fog dither, the scan-out filter, 8-bit texel fractions, 800x600)
+PRESETS['VOODOO2']['settings'] = dict(
+    PRESETS['VOODOO']['settings'], resolution_x=800, resolution_y=600,
+    fog_dither=True, video_filter='VOODOO2', tex_frac_bits='BITS_8')
 
 
 # The device family: where the frame computes is a property of the person's

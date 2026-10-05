@@ -317,6 +317,13 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                 scene.last_depth = _held.get('depth')
                 scene.last_shafts = _held.get('shafts')
                 scene.last_flares = _held.get('flares')
+                # R251 (C092): Super Black on a held frame floors by its
+                # key frame's plane (off on held frames otherwise: the
+                # alternating-roads bug class)
+                scene.last_coverage = _held.get('coverage')
+                settings._last_coverage = scene.last_coverage
+                scene.last_cvg = _held.get('cvg')          # R251 C001
+                scene.last_gel = _held.get('gel')        # R251 C134
                 print(f"[Halcyon] shoot on {_hold}s: frame {int(scene.frame)}"
                       f" holds frame {_hold_key} (not rendered again)")
             elif _hold_key != int(scene.frame):
@@ -337,7 +344,8 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             # complete render; a pool inside a pass would nest pools).
             print(f"[Halcyon] motion blur: {mb_steps} steps across a "
                   f"{float(settings.motion_shutter):.2f}-frame shutter "
-                  f"({mb_steps} full renders, averaged)")
+                  f"({mb_steps} full renders, "
+                  f"{str(getattr(settings, 'motion_blur_mode', 'MEAN'))})")
             try:
                 image, scene = self._render_motion_accumulated(
                     depsgraph, bscene, settings, warnings, on_progress)
@@ -390,6 +398,15 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             print("[Halcyon] worker pool skipped: the panorama camera "
                   "renders rotated strips in-process and stitches them")
         elif settings.use_processes and not preview and \
+                int(getattr(settings, 'pano_parts', 1)) > 1 and \
+                getattr(scene, 'camera', None) is not None and \
+                str(getattr(scene.camera, 'type', 'PERSP')) == 'PERSP':
+            # R251 C125: the strips are whole renders; a pooled band
+            # would be the unstitched planar frame (the gate reads
+            # band is None). The camera guard mirrors the render gate's
+            print("[Halcyon] worker pool skipped: Pano Parts renders N "
+                  "yawed strips in-process and butts them")
+        elif settings.use_processes and not preview and \
                 str(getattr(settings, 'stereo_mode', 'NONE')) != 'NONE':
             # each eye is its own whole frame; a pooled band would render
             # one mono slice
@@ -419,6 +436,22 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             print("[Halcyon] worker pool skipped: the weather overlay "
                   "splats in whole-frame coordinates, so the frame "
                   "renders in-process")
+        elif settings.use_processes and not preview and \
+                core_render.composite_reads_neighbours(scene, settings):
+            # R251: the Fuzz / Thin Wall blend equations read the row
+            # above or beside a pixel of the FINISHED frame, which a
+            # pooled band never holds at its seam
+            print("[Halcyon] worker pool skipped: the "
+                  "Fuzz / Thin Wall blend reads neighbouring pixels "
+                  "of the finished frame, so the frame renders in-process")
+        elif settings.use_processes and not preview and \
+                bool(getattr(settings, 'matte_glow', False)):
+            # R251 C134: the optical printer's mattes are cut from the
+            # WHOLE frame's material plane, which a pooled band never
+            # holds (the pool sends back pixels, not buffers)
+            print("[Halcyon] worker pool skipped: Matte Glow cuts its "
+                  "mattes from the whole frame's material plane, so the "
+                  "frame renders in-process")
         elif settings.use_processes and not preview:
             from .core import parallel as _par
             n = int(settings.process_count) or _resolve_cpus()
@@ -436,14 +469,19 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                 print(f"[Halcyon] process pool unavailable ({why}); "
                       f"rendering in this process")
 
+        # R250: the frame the render leaves on the GPU is kept for the
+        # post chain; this method releases it in its own finally below
+        settings._keep_gpu_frame = True
         try:
             if image is None:
                 image = core_render.render(scene, settings, progress=on_progress)
         except _Cancelled:
+            _release_gpu_frame(settings)
             return
         except Exception as exc:                                # noqa: BLE001
             import traceback
             traceback.print_exc()
+            _release_gpu_frame(settings)
             if not preview:
                 self.report({'ERROR'}, f"Halcyon render failed: {exc}")
             return
@@ -455,7 +493,24 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                        (tw, th), settings, image,
                        getattr(scene, 'last_depth', None),
                        getattr(scene, 'last_shafts', None),
-                       getattr(scene, 'last_flares', None))
+                       getattr(scene, 'last_flares', None),
+                       gpu=bool(getattr(settings, '_frame_gpu_shaded',
+                                        False)),
+                       cvg=getattr(scene, 'last_cvg', None),   # R251 C001
+                       coverage=getattr(scene, 'last_coverage', None))
+            # R251 C134: the key frame's gel plane rides with its cel
+            _HOLD_CACHE['last']['gel'] = getattr(scene, 'last_gel', None)
+        elif _held is not None:
+            # R250: a held frame photographs its key frame's cel again,
+            # and its post chain takes the road that cel's shading took
+            # -- the flag used to stay unset here, so every held frame
+            # ran its post on the CPU in silence, alternating roads
+            # frame by frame under the field's own 'shoot on twos'
+            settings._frame_gpu_shaded = bool(_held.get('gpu', False))
+            if settings._frame_gpu_shaded:
+                _once(f"[Halcyon GPU] post on a held frame: the key frame's "
+                      f"cel uploaded once (frame {int(scene.frame)} holds "
+                      f"frame {_hold_key})")
 
         # R180: the GPU verdict, in the interface. A frame that fell to
         # the CPU used to say so in one console line; at a supersampled
@@ -491,6 +546,9 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             stamp_info = {'render_time': time.time() - export_started,
                           'blender': _host,
                           'scroll': _RENDER_SERIAL['n']}
+            # R251: the scene token the CRTC state (signal_era.CRTC_STATE)
+            # keys on, as hold_lookup keys on the scene name
+            settings._scene_name = str(getattr(bscene, 'name', ''))
             with ST.track('post processing'):
                 final = post.process(image, settings, frame=scene.frame,
                                      seed=settings.seed, target_size=(tw, th),
@@ -504,13 +562,18 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                                      flare_sources=getattr(scene,
                                                            'last_flares',
                                                            None),
-                                     stamp_info=stamp_info)
+                                     stamp_info=stamp_info,
+                                     cvg=getattr(scene, 'last_cvg', None),  # R251 C001
+                                     coverage=getattr(scene, 'last_coverage', None),
+                                     gel=getattr(scene, 'last_gel', None))
         except Exception as exc:                                # noqa: BLE001
             import traceback
             traceback.print_exc()
             if not preview:
                 self.report({'WARNING'}, f"Post chain failed: {exc}")
             final = post.fit_to(np.clip(image, 0.0, 1.0), (tw, th))
+        finally:
+            _release_gpu_frame(settings)
 
         with ST.track('deliver to Blender'):
             self._deliver(final, bscene,
@@ -566,7 +629,11 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
         the middle of the shutter.
         """
         frame0 = int(bscene.frame_current)
-        n = max(int(settings.motion_steps), 2)
+        # R251 C090: the mode's slice count (Max's 32 cap, LW's 2x) and the
+        # per-slice weights; the combine streams with ONE slice resident
+        n = core_render.shutter_steps(settings)
+        mode = str(getattr(settings, 'motion_blur_mode', 'MEAN'))
+        wsum = None
         shutter = max(float(settings.motion_shutter), 0.0)
         offs = np.linspace(-shutter * 0.5, shutter * 0.5, n)
         center_k = int(np.argmin(np.abs(offs)))
@@ -581,7 +648,15 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                 img = core_render.render(
                     scene_k, settings,
                     progress=on_progress if k == center_k else None)
-                acc = img.astype(np.float64) if acc is None else acc + img
+                if mode == 'MEAN':
+                    acc = img.astype(np.float64) if acc is None else acc + img
+                else:
+                    w = core_render.shutter_weight(settings, k, n, img.shape[0],
+                                                   img.shape[1], frame_no=frame0,
+                                                   seed=int(settings.seed))
+                    acc = img * w[:, :, None] if acc is None \
+                        else acc + img * w[:, :, None]
+                    wsum = w if wsum is None else wsum + w
                 if k == center_k:
                     center_scene = scene_k
                 self.update_stats("Halcyon",
@@ -593,7 +668,8 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                 self.frame_set(frame0, 0.0)
             except Exception:                                   # noqa: BLE001
                 pass
-        return (acc / float(n)).astype(np.float32), center_scene
+        return ((acc / float(n)) if mode == 'MEAN'
+                else (acc / wsum[:, :, None])).astype(np.float32), center_scene
 
     # ------------------------------------------------------------------ passes
     def update_render_passes(self, scene=None, renderlayer=None):
@@ -1003,13 +1079,37 @@ def hold_lookup(scene_name, frame, start, hold, size, settings):
 
 
 def hold_store(scene_name, frame, size, settings, image, depth, shafts,
-               flares):
+               flares, gpu=False, cvg=None, coverage=None):
     """Remember a key frame's cel (and the data the post chain reads)
-    for the held frames that follow it."""
+    for the held frames that follow it. `gpu`: whether that cel's
+    shading engaged the GPU (the held frames' post takes the same road)."""
     _HOLD_CACHE['last'] = {
         'scene': scene_name, 'frame': int(frame), 'size': tuple(size),
         'fp': _hold_fingerprint(settings), 'image': image, 'depth': depth,
-        'shafts': shafts, 'flares': flares}
+        'shafts': shafts, 'flares': flares, 'gpu': bool(gpu),
+        'cvg': cvg,                                     # R251 C001
+        # R251 (C092): the key frame's coverage plane -- a held frame is
+        # posted with a fresh settings object and no render
+        'coverage': coverage}
+
+
+_ONCE = set()
+
+
+def _once(msg):
+    if msg not in _ONCE:
+        _ONCE.add(msg)
+        print(msg)
+
+
+def _release_gpu_frame(settings):
+    """R250: whatever the render left resident on the GPU goes back to
+    the pool; idempotent, and never an error."""
+    try:
+        from .gpu import frame as _FR
+        _FR.release(settings)
+    except Exception:                                           # noqa: BLE001
+        pass
 
 
 class _Cancelled(Exception):
@@ -1034,7 +1134,8 @@ def _resolve_cpus():
         return os.cpu_count() or 1
 
 
-SCALE_FACTOR = {'NONE': 1, '2X': 2, '3X': 3, '4X': 4}
+SCALE_FACTOR = {'NONE': 1, '2X': 2, '3X': 3, '4X': 4,
+                'THREEDO_2X': 2, 'GBA_MODE5': 0}   # R251: 0 = ask signal_era
 
 
 def _settings_from_scene(bscene, target_w, target_h, preview=False):
@@ -1058,8 +1159,13 @@ def _settings_from_scene(bscene, target_w, target_h, preview=False):
     if getattr(bscene.render, 'film_transparent', False):
         st.film_transparent = True
     n = SCALE_FACTOR.get(str(st.output_scale), 1)
-    st.resolution_x = max(int(target_w) // n, 1)
-    st.resolution_y = max(int(target_h) // n, 1)
+    if str(st.output_scale) == 'GBA_MODE5':
+        # R251: the Mode 5 bitmap the LCD reads through PA / PD
+        from .core import signal_era as _SIG
+        st.resolution_x, st.resolution_y = _SIG.gba_source_size(int(target_w), int(target_h))
+    else:
+        st.resolution_x = max(int(target_w) // n, 1)
+        st.resolution_y = max(int(target_h) // n, 1)
     # Blender applies its own pixel aspect at display time; applying it here too
     # would double the stretch and change the buffer size
     st.pixel_aspect_x = st.pixel_aspect_y = 1.0

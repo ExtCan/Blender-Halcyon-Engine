@@ -363,6 +363,23 @@ class Target:
             bury(self.offscreen)
         self.offscreen = None
 
+    def __del__(self):
+        # R250: a target kept past its burst (the resident frame) that a
+        # caller forgets is dropped by refcount -- which would DESTROY
+        # the GPUOffScreen, the one operation with no safe moment. It
+        # parks in the graveyard instead, released once a readback has
+        # proven every draw that touched it
+        try:
+            off = self.offscreen
+        except AttributeError:
+            return
+        if off is not None:
+            try:
+                bury(off)
+            except Exception:                                   # noqa: BLE001
+                pass
+            self.offscreen = None
+
 
 def target_texture(target):
     """A target's colour texture handle, fetched where the context lives."""
@@ -510,8 +527,17 @@ def draw_tick():
     _SCREEN_GRAVE[:] = keep
 
 
-def upload_cached(key, build):
+def upload_cached(key, build, stamp=None):
     """A GPUTexture cached across frames, keyed on the data's fingerprint.
+
+    R251 C015: `stamp` (optional) names the DATA generation under a key
+    that stays stable -- the N64 noise map is keyed by its size and
+    stamped by (frame, seed), so an animation holds ONE resident noise
+    texture instead of one new cache entry per frame (96 of them before
+    the first eviction, ~1.4 GB of VRAM). A hit whose stamp differs
+    buries the old texture (the graveyard keeps it alive until its
+    recorded draws executed) and uploads `build()` under the same key;
+    `stamp=None` is the old behaviour byte for byte.
 
     `build` is called only on a miss and must return the (H,W,3|4) float32
     array to upload -- lazily, so a cache hit skips the *packing* as well as
@@ -521,13 +547,20 @@ def upload_cached(key, build):
     of the deferred pass's warm cost.
     """
     cache = _STATE.setdefault('textures', {})
+    stamps = _STATE.setdefault('stamps', {})
     hit = cache.get(key)
     if hit is not None:
-        # move-to-end: eviction drops the least recently USED, so a
-        # working set that fits never loses a member
-        cache[key] = cache.pop(key)
-        return hit
+        if stamp is None or stamps.get(key) == stamp:
+            # move-to-end: eviction drops the least recently USED, so a
+            # working set that fits never loses a member
+            cache[key] = cache.pop(key)
+            return hit
+        # R251 C015: the same key, a new data generation -- replace
+        # through the graveyard, never drop a live texture
+        bury(cache.pop(key))
     tex = upload(build())
+    if stamp is not None:
+        stamps[key] = stamp
     if len(cache) >= 96:
         # drop the oldest third INTO THE GRAVEYARD -- an evicted texture
         # can still be referenced by passes recorded THIS frame (the

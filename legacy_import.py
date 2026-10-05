@@ -482,6 +482,9 @@ def _apply_lamp_bi(light, lm, warnings=None):
     try:
         if lm.get('negative'):
             hs.negative = True
+        if lm.get('only_shadow'):
+            # R251 F014: LA_ONLYSHADOW, the shadow without a light
+            hs.only_shadow = True
         if lm.get('no_diffuse'):
             hs.specular_only = True
         if lm.get('no_specular'):

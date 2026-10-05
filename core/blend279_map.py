@@ -840,11 +840,8 @@ def lamp_map(la, version=279):
         out['warnings'].append(
             f"{out['name']}: falloff type {la.get('falloff_type')} "
             'approximated as Inverse Linear')
-    if mode & LA_ONLYSHADOW:
-        out['warnings'].append(
-            f"{out['name']}: Only Shadow lamps (shadow subtraction "
-            'without light) are not imported yet; the lamp lights '
-            'normally')
+    # R251 F014: LA_ONLYSHADOW imports as the lamp's Only Shadow flag
+    out['only_shadow'] = bool(mode & LA_ONLYSHADOW)
     if mode & LA_LAYER:
         out['warnings'].append(
             f"{out['name']}: the This Layer Only restriction is not "

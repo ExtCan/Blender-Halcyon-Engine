@@ -172,7 +172,181 @@ MODEL_ITEMS = (
      "Translucent Color lit by every lamp's light from either side, "
      "darkening where the diffuse is already lit -- Max's leaf and "
      "lampshade shader (the hemisphere sums are taken per lamp here)"),
+    # R251 (LIGHT-B2): the console light units, items 32..35 -- appended
+    # so no saved model index moves (gpu/shade._model_index is positional)
+    ('GX_LIGHT', "GameCube GX (2001)",
+     "The GameCube's fixed-function light unit exactly: Lambert diffuse "
+     "plus GX's rational 'shininess' highlight (N.H)^2 / (s/2 + (1 - s/2)"
+     "(N.H)^2) with s = Glossiness, the half vector against the camera "
+     "axis, specular from Sun lamps only, and the lit colour saturated "
+     "and written as 8 bits per channel as the vertex unit did. Meant "
+     "for the Gouraud rate: GX never lit per pixel"),
+    ('SEGA_MODEL2', "Sega Model 2 (1993)",
+     "Sega's Model 2 board exactly: Lambert diffuse and a highlight on "
+     "the reflection's component along the camera axis (2(N.L)N.z - L.z, "
+     "no per-pixel eye vector), raised to 1, 2, 4 or 8 by repeated "
+     "squaring -- Glossiness snaps to the nearest of the four. Shaded "
+     "once per polygon, as the board did, then the 64-step luma ramp: "
+     "the lit term collapses to one luminance quantised to 64 steps "
+     "BEFORE it meets colour, and each 5-bit channel of the polygon "
+     "colour is looked up through a linear 64-entry ramp (the games "
+     "wrote their own; disclosed) -- so Daytona's polygons band at the "
+     "same 64 rungs whatever their hue"),
+    ('SEGA_MODEL3', "Sega Model 3 (1996)",
+     "Sega's Model 3 board's smooth polygons exactly: Lambert diffuse "
+     "and a highlight keyed to N.L raised to 8, 16, 32 or 64 by "
+     "squaring, times the board's 1.6/1.6/2.4/3.2 gain for each step -- "
+     "Glossiness snaps to the nearest exponent. Lit per vertex, one "
+     "sun, no per-pixel eye vector, then the 64-step luma ramp: the "
+     "lit term collapses to one luminance quantised to 64 steps BEFORE "
+     "it meets colour, and each 5-bit channel of the polygon colour is "
+     "looked up through a linear 64-entry ramp (the games wrote their "
+     "own; disclosed), the 64 rungs interpolated across the polygon"),
+    ('DS_FIXED', "Nintendo DS (2004)",
+     "The DS light unit exactly: Lambert diffuse and a highlight from "
+     "the unnormalised half vector of the light and the fixed line of "
+     "sight (0,0,-1), squared, then read through a 128-entry 8-bit "
+     "shininess table shaped by Glossiness (the games authored theirs; "
+     "the entry curve here is (i/128)^(Glossiness/8), so Glossiness 8 "
+     "is a linear table and 64 a tight pin), the lit colour saturated "
+     "to 5 bits per channel. Lit per vertex, four directional lights; "
+     "at the Vertex and Face shading rates the lit colour then meets "
+     "the texel through the DS's +1 modulate on 6-bit channels, "
+     "GBATEK's texture blend (a per-pixel scene shades the light unit "
+     "alone)"),
+    # ---- R251 material pack: period combiners (each a shading RATE plus
+    # the machine's combine arithmetic), items 36..48 -- appended after the
+    # lighting pack's four so no saved model index moves (MAT-A)
+    ('FLAT_GL_LAST', "Flat, last vertex (OpenGL 1.x / PSP)",
+     "A shading RATE like Flat, but the machine's: the whole triangle takes "
+     "the LAST corner's Gouraud lighting with that corner's smooth normal "
+     "-- OpenGL 1.0-1.5 GL_FLAT and the PSP's GU_FLAT. A quad splits along "
+     "its diagonal and a lit grid shows the diamond pattern; the centroid "
+     "Flat above cannot"),
+    ('FLAT_D3D_FIRST', "Flat, first vertex (Direct3D 3-9)",
+     "A shading RATE like Flat, but Direct3D's D3DSHADE_FLAT: the whole "
+     "triangle takes the FIRST corner's Gouraud lighting with that corner's "
+     "smooth normal, so the two halves of a quad take different corners and "
+     "a lit surface shows the 1996-2005 PC diagonal split"),
+    ('PS1_MODULATE', "Gouraud x/128 (PlayStation / PS2 GS / PSP, 1994)",
+     "A shading RATE plus the PlayStation GPU's texture blend: the lit "
+     "colour becomes an 8-bit vertex colour with 80h meaning 1.0, the texel "
+     "is multiplied by it and shifted right 7, saturating at FFh -- so a "
+     "lit vertex up to 2.0 brightens the texture twofold and clips flat. "
+     "The PS2 GS (>>7, 0x80 = 1.0) and the PSP's TFX modulate are the same "
+     "arithmetic"),
+    ('PS2_HIGHLIGHT', "Highlight (PlayStation 2 GS, 2000)",
+     "A shading RATE plus the Graphics Synthesizer's HIGHLIGHT texture "
+     "function: the diffuse light becomes an 8-bit vertex colour with 0x80 "
+     "= 1.0, multiplied into the texel and shifted right 7, then the vertex "
+     "ALPHA -- the specular sum, always white on a PS2 -- is added to all "
+     "three channels and truncated at 0xFF, so highlights float white over "
+     "any texture"),
+    ('SATURN_ADD', "Gouraud add (Sega Saturn VDP1, 1994)",
+     "A shading RATE plus the VDP1's Gouraud table: the lit colour becomes "
+     "a 5-bit value with 10h neutral, and (value - 16) is ADDED to each "
+     "5-bit channel of the texel, clamped 0..31 -- 00h darkens by 16 steps, "
+     "1Fh brightens by 15, so shading pushes a texture past its own "
+     "brightness instead of scaling it"),
+    ('N64_COMBINE', "Colour combiner (Nintendo 64 RDP, 1996)",
+     "A shading RATE plus the RDP colour combiner's first cycle (TEXEL0 - "
+     "0) * SHADE + 0 on 8-bit values: ((t * s) + 0x80) >> 8, no headroom "
+     "above 1.0 and a rounding term the PS1 lacks, so full light leaves "
+     "bright texels one step short of themselves -- the N64's own quiet "
+     "darkening"),
+    ('S22_MODULATE', "Gouraud x/64 (Namco System 22, 1993)",
+     "A shading RATE plus the System 22's vertex brightness with unity at "
+     "0x40: the texel is multiplied by an 8-bit shade and shifted right 6, "
+     "saturating -- near-4x headroom, so Ridge Racer's lit polygons burn to "
+     "white long before a PlayStation's would (read from MAME's arithmetic, "
+     "not a Namco document)"),
+    ('D3D_SEPARATE_SPEC',
+     "Gouraud, separate specular (Direct3D 5-7 / OpenGL 1.2 / Dreamcast, 1996)",
+     "A shading RATE plus the fixed-function OFFSET colour: the texture "
+     "modulates the interpolated diffuse light only, and the interpolated "
+     "specular sum is added AFTER the texture, clamped at 1 -- so highlights "
+     "float white over dark textures the way every 1996-2001 consumer card "
+     "and the Dreamcast's offset colour drew them. Halcyon's plain Gouraud "
+     "multiplies the highlight into the texel instead"),
+    ('PCX_INTENSITY', "Intensity Gouraud (PowerVR PCX1 / PCX2, 1996)",
+     "A shading RATE plus the PCX's monochrome interpolation: each triangle "
+     "takes one base colour (the mean of its three lit corners) and "
+     "interpolates only a scalar intensity -- corner luminance over the "
+     "base's luminance -- so two coloured lamps meeting on one polygon "
+     "become a grey ramp over an average tint. Textures multiply as usual. "
+     "Rectified in PowerVR Series 2"),
+    ('DS_TOON', "Toon table (Nintendo DS, 2004)",
+     "A shading RATE plus the DS's mode-2 toon: the lit colour's RED "
+     "channel (ambient, specular and emission included) becomes a 5-bit "
+     "index into a 32-entry table that REPLACES the vertex colour before "
+     "the texel modulates it; green and blue of the lighting are "
+     "discarded. The table is this material's Toon Size and Toon Steps "
+     "sampled at 32 stops with hard edges (the DS had no smooth band) and "
+     "quantised to 15 bits"),
+    ('DS_HIGHLIGHT', "Highlight table (Nintendo DS, 2004)",
+     "A shading RATE plus the DS's mode-2 highlight: the same 32-entry "
+     "table indexed by the lit RED channel, but the entry is modulated with "
+     "the texel AND added again, truncated at 63 -- GBATEK's highlight "
+     "mode, the glossy toon of DS racers. With the default two-step toon "
+     "table every lit entry is 63 and the add saturates: lit surfaces go "
+     "pure white whatever the texture. The texel shows only at table "
+     "entries strictly between 0 and 63 (entry 0 is black), which takes "
+     "more Toon Steps together with lamps dimmed off the top entry -- "
+     "dimmed too far, the surface falls to entry 0"),
+    ('MEGA_DRIVE_SH', "Shadow/Highlight (Sega Mega Drive VDP, 1988)",
+     "A shading RATE (one class per polygon) plus the VDP's shadow/highlight "
+     "mode: the albedo is crushed to 3 bits per channel and read through "
+     "one of three measured DAC ramps -- NORMAL, SHADOW (the key lamp's lit "
+     "fraction below 1/2; the key is the scene's first lamp, Halcyon's own "
+     "rule, and a light limit that drops the first lamp shadows everything) "
+     "or HIGHLIGHT (a specular sum of 1/2 or more) -- so darkening is a "
+     "table, not a multiply, the way the Genesis 3D racers and Vectorman "
+     "shaded"),
+    ('SUPERFX_PLOT', "Dither plot (Super FX / Star Fox, 1993)",
+     "A shading RATE (one colour per polygon) plus the Super FX PLOT "
+     "dither: the face's lit colour is matched by the closest PAIR of "
+     "entries of the frame's fixed palette (16 colours or fewer, the chip's "
+     "4-bpp mode) and the face is filled with a 50% checkerboard of the two "
+     "at output-pixel pitch, before any post. Needs a fixed palette of at "
+     "most 16 entries, gamma 1 and no display transform, or it shades flat "
+     "and says so"),
 )
+
+#: R251 material pack (MAT-A C034): the DS toon / highlight items light
+#: with the DS_FIXED lobe (the mode-2 polygon's light unit is the DS's
+#: one light unit) -- consulted as the first line of `evaluate` and by
+#: light_surface, so the fixed viewer, the table highlight and the 5-bit
+#: step all apply under the alias
+LOBE_ALIAS = {'DS_TOON': 'DS_FIXED', 'DS_HIGHLIGHT': 'DS_FIXED'}
+
+#: R251 (LIGHT-B2): models that force the camera-axis viewer inside
+#: themselves (GL 1.1's infinite viewer, the Sega boards' R.z, the DS's
+#: (0,0,-1) line of sight) -- light_surface hands them the axis whatever
+#: `specular_viewer` says, and the plan registers the axis texel for them
+AXIS_MODELS = frozenset({'GX_LIGHT', 'SEGA_MODEL2', 'SEGA_MODEL3',
+                         'DS_FIXED'})
+# (R251 material pack, MAT-A C034: DS_TOON / DS_HIGHLIGHT reach this set
+# through LOBE_ALIAS -- light_surface and evaluate alias them to DS_FIXED
+# before reading it -- so the set itself stays the lighting pack's four)
+#: R251 (LIGHT-B2): models that ARE their shading rate, as GOURAUD / FLAT
+#: are (render.RATE_FOR_MODEL merges this table): Model 2 shaded one luma
+#: per polygon, Model 3 per vertex. Neither reaches GLSL: the corner road
+#: (the CPU lights the corners, the pass interpolates) is the machine on
+#: both devices, so a PIXEL-rate request refuses by name through
+#: gpu/shade.UNSUPPORTED_MODELS, which merges the set below.
+RATE_FOR_MODEL = {'SEGA_MODEL2': 'FACE', 'SEGA_MODEL3': 'VERTEX'}
+UNSUPPORTED_MODELS = frozenset({'SEGA_MODEL2', 'SEGA_MODEL3'})
+
+
+def axis_viewer(view):
+    """R251 (LIGHT-B2): the fixed viewer of the console light units --
+    the camera's own +Z row of the CPU's view matrix (`view = inv(mw)`),
+    normalised: the world-space direction toward a viewer at infinity.
+    OpenGL 1.1's infinite viewer, the Sega boards' R.z, the DS's (0,0,-1)
+    line of sight. One float32 (3,) vector per frame; the GPU road reads
+    the SAME bits from a texel, so both roads shade the same highlight."""
+    row = np.asarray(view, np.float32)[2:3, :3]
+    return M.normalize(row)[0].astype(np.float32)
 
 #: models whose highlight the light loop must NOT scale by Specular
 #: Level: Strauss has no such dial in Max, and Multi-Layer applies its two
@@ -504,7 +678,12 @@ class Surface:
                  'rim', 'rim_power', 'rim_color', 'rim_blend',
                  'matcap', 'matcap_blend', 'matcap_mode', 'reflect_color',
                  'edge_opacity', 'backface_color', 'backface_mix', 'alpha_clip',
+                 # R251 C031: 1.0 under Alpha Mode Clip+Blend (PS2 two-pass)
+                 'alpha_soft',
                  'sheen', 'sheen_color', 'sheen_roughness', 'refraction',
+                 # R251 lighting: the period finish dials (F006, F019-F021)
+                 'fog_burn', 'fog_bias', 'fog_bank', 'brilliance', 'crand',
+                 'pov_metallic',
                  # the anime/cel master (R218): tone bands, their
                  # colours, the decoded game-texture drivers
                  'anime_shadow1', 'anime_shadow2', 'anime_th1',
@@ -687,6 +866,8 @@ class Surface:
         # R211 punch-through: >= 0 is the material's CLIP threshold; the
         # shading law then forces alpha to exactly 0 or 1. -1 = BLEND
         self.alpha_clip = np.full(n, -1.0, np.float32)
+        # R251 C031: > 0.5 keeps the sub-threshold alpha (the blend half)
+        self.alpha_soft = np.zeros(n, np.float32)
         self.backface_color = np.zeros((n, 3), np.float32)
         self.backface_mix = np.zeros(n, np.float32)
         # a velvet lobe, added in the light loop rather than inside a model:
@@ -695,6 +876,13 @@ class Surface:
         self.sheen = np.zeros(n, np.float32)
         self.sheen_color = np.ones((n, 3), np.float32)
         self.sheen_roughness = np.full(n, 0.3, np.float32)
+        # R251 lighting: the period finish dials (F006, F019-F021)
+        self.fog_burn = np.zeros(n, np.float32)
+        self.fog_bias = np.zeros(n, np.float32)
+        self.fog_bank = np.zeros(n, np.float32)
+        self.brilliance = np.ones(n, np.float32)
+        self.crand = np.zeros(n, np.float32)
+        self.pov_metallic = np.zeros(n, np.float32)
         # how much of the ray traced through a transparent surface is kept
         self.refraction = np.ones(n, np.float32)
         # R243: the Max Multi-Layer's second highlight, Max's defaults
@@ -1561,6 +1749,8 @@ def evaluate(model, surf, n, l, v, ndl_raw=None, area_ndl=None,
     is the flipped-normal twin, consumed by BI translucency's
     negated-normal rerun.
     """
+    # R251 (MAT-A C034): the DS toon pair takes the DS_FIXED lobe
+    model = LOBE_ALIAS.get(model, model)
     ndl = M.dot(n, l) if ndl_raw is None else ndl_raw
     ndv = M.dot(n, v)
     h = M.normalize(l + v)
@@ -1627,6 +1817,10 @@ def evaluate(model, surf, n, l, v, ndl_raw=None, area_ndl=None,
     # ---- diffuse term (an AREA lamp's form factor stands in for the
     # cosine, exactly as shade_one_light's `inp` reassignment did)
     ndl_d = ndl if area_ndl is None else area_ndl
+    if model in AXIS_MODELS:
+        # R251 (LIGHT-B2): the console light units -- their own diffuse
+        # and highlight, `v` being the camera axis (light_surface's Vs)
+        return evaluate_console(model, surf, n, l, v, ndl, ndl_d, rdv)
     if model in ('OREN_NAYAR', 'OREN_NAYAR_BLINN'):
         dif = diffuse_oren_nayar(
             ndl_d, ndv, l, v, n, surf.roughness,
@@ -1736,3 +1930,199 @@ def ambient_term(surf, model):
     if model in ('CONSTANT', 'WIREFRAME'):
         return np.ones((surf.n, 3), np.float32)
     return surf.ambient[:, None] * np.ones((1, 3), np.float32)
+
+
+# ------------------------------------------------ R251 (LIGHT-B2): the
+# console light units (GX_LIGHT, SEGA_MODEL2, SEGA_MODEL3, DS_FIXED) and
+# the POV-Ray finish dials (brilliance, crand, metallic). Every line is
+# float32, one operation per statement, in the order the GLSL twin
+# (gpu/glsl_shading.py hal_gx_spec, gpu/material.py's DS lines) runs it.
+
+def gx_spec(ndl, n, l, v, gloss):
+    """GX_InitLightShininess's rational highlight: (N.H)^2 / (s/2 +
+    (1 - s/2)(N.H)^2), the attenuation unit fed a = (0,0,1), k = (s/2, 0,
+    1 - s/2) on N.H -- "only a ratio of quadratics, a true exponential
+    function is not possible" (libogc gx.h). `v` is the camera axis."""
+    hs = l + v
+    hs = M.normalize(hs)
+    h = M.dot(n, hs)
+    h = np.maximum(h, np.float32(0.0))
+    h2 = h * h
+    sh = gloss * np.float32(0.5)
+    om = np.float32(1.0) - sh
+    den = om * h2
+    den = sh + den
+    # den = sh (1 - h2) + h2 > 0 for any Glossiness > 0; the guard is for
+    # Glossiness 0 at h = 0 (0/0), where the GLSL twin takes the same 0
+    sp = np.where(den > 0.0, h2 / np.where(den > 0.0, den, 1.0), 0.0)
+    return sp.astype(np.float32)
+
+
+_DS_TABLES = {}
+
+
+def ds_shininess_table(gloss):
+    """The DS's 128-entry 8-bit shininess table for one Glossiness value:
+    T[i] = round(255 * ((i + 0.5)/128) ^ (Glossiness/8)), float64 fill
+    (the games authored theirs; GBATEK documents no default), cached per
+    value. Returned as float32 integers 0..255 (the texture's texels)."""
+    g = float(gloss)
+    t = _DS_TABLES.get(g)
+    if t is None:
+        p = g / 8.0
+        i = np.arange(128, dtype=np.float64)
+        vals = 255.0 * ((i + 0.5) / 128.0) ** p
+        t = np.array([int(round(float(x))) for x in vals],
+                     np.float32)
+        _DS_TABLES[g] = t
+    return t
+
+
+def ds_spec(n, l, v, gloss):
+    """GBATEK's ShininessLevel = max(0, -H.N)^2 with H the UNNORMALISED
+    (LightVector + LineOfSight)/2 -- `v` the fixed line of sight -- then
+    the 128-entry table indexed by truncation, the 8-bit entry as a 0.8
+    fixed value (1/256)."""
+    hs = l + v
+    hs = hs * np.float32(0.5)
+    s = M.dot(n, hs)
+    s = np.maximum(s, np.float32(0.0))
+    s = s * s
+    si = s * np.float32(128.0)
+    idx = np.minimum(si.astype(np.int32), 127)
+    gloss = np.asarray(gloss, np.float32)
+    if gloss.ndim == 0 or gloss.size == 1:
+        t = ds_shininess_table(float(gloss.reshape(-1)[0]))
+        val = t[idx]
+    else:
+        val = np.zeros(idx.shape, np.float32)
+        for g in np.unique(gloss):
+            m = gloss == g
+            val[m] = ds_shininess_table(float(g))[idx[m]]
+    sp = val * np.float32(0.00390625)
+    return sp.astype(np.float32)
+
+
+_MODEL3_MULT = np.array([1.6, 1.6, 2.4, 3.2], np.float32)
+
+
+def sega_model2_spec(rdv, gloss):
+    """Model 2's geometry engine: spec = 2(N.L)N.z - L.z (the reflection's
+    component along the camera axis -- `rdv` with v the axis), clamped at
+    0 and squared 0-3 times per the specular_control bits (MAME
+    model2_v.cpp); Glossiness snaps to the nearest of 1, 2, 4, 8."""
+    c = np.maximum(rdv, np.float32(0.0)).astype(np.float32)
+    k = np.where(gloss < 1.5, 0, np.where(gloss < 3.0, 1,
+                                          np.where(gloss < 6.0, 2, 3)))
+    c2 = c * c
+    c4 = c2 * c2
+    c8 = c4 * c4
+    sp = np.choose(k, [c, c2, c4, c8])
+    return sp.astype(np.float32)
+
+
+def sega_model3_spec(ndl, gloss):
+    """Model 3's smooth polygons: pow(max(0, N.L), {8,16,32,64}[k]) *
+    {1.6,1.6,2.4,3.2}[k] (Supermodel R3DShaderTriangles.h), the power by
+    repeated squaring; Glossiness snaps to the nearest exponent."""
+    c = np.maximum(ndl, np.float32(0.0)).astype(np.float32)
+    k = np.where(gloss < 12.0, 0, np.where(gloss < 24.0, 1,
+                                           np.where(gloss < 48.0, 2, 3)))
+    c2 = c * c
+    c4 = c2 * c2
+    c8 = c4 * c4
+    c16 = c8 * c8
+    c32 = c16 * c16
+    c64 = c32 * c32
+    e = np.choose(k, [c8, c16, c32, c64])
+    mult = _MODEL3_MULT[k]
+    sp = e * mult
+    return sp.astype(np.float32)
+
+
+def evaluate_console(model, surf, n, l, v, ndl, ndl_d, rdv):
+    """`evaluate`'s branch for the AXIS_MODELS: (diffuse (N,), specular
+    (N,3)). `v` is the camera axis light_surface selected. GX_LIGHT's
+    highlight passes through Soften exactly as the GLSL dispatch's
+    hal_soften does. DS_FIXED returns the Lambert diffuse ONLY here --
+    its table highlight (`ds_spec`) is added by light_surface after this
+    call, exactly where the GPU's per-light block reads the `hal_dstab`
+    texture (the shared GLSL dispatch carries no sampler), so the two
+    dispatches agree term for term. The Sega models take no Soften (the
+    boards had none) and never reach GLSL (RATE_FOR_MODEL)."""
+    dif = np.maximum(ndl_d, np.float32(0.0)).astype(np.float32)
+    gloss = surf.glossiness
+    if model == 'GX_LIGHT':
+        sp = gx_spec(ndl, n, l, v, gloss)
+        sp = _soften(sp, ndl, surf.soften)
+    elif model == 'DS_FIXED':
+        sp = np.zeros_like(dif)
+    elif model == 'SEGA_MODEL2':
+        sp = sega_model2_spec(rdv, gloss)
+    else:                                   # SEGA_MODEL3
+        sp = sega_model3_spec(ndl, gloss)
+    spec = sp[:, None] * surf.specular
+    return dif, spec.astype(np.float32)
+
+
+def quantize_lit(out, levels):
+    """The vertex unit's saturation and integer output: clip to 0..1,
+    floor(x * levels + 0.5) / levels, a DIVISION by `levels` so full
+    white is exactly 1.0 (255/255, 31/31) -- the GX's 8-bit vertex colour
+    (levels 255) and the DS's 5-bit one (31). Half-up tie, the same
+    expression on both roads."""
+    lv = np.float32(levels)
+    o = np.clip(out, np.float32(0.0), np.float32(1.0))
+    o = o * lv
+    o = o + np.float32(0.5)
+    o = np.floor(o)
+    o = o / lv
+    return o.astype(np.float32)
+
+
+def apply_brilliance(dif, brilliance):
+    """POV-Ray's finish brilliance (trace.cpp ComputeDiffuseColour):
+    `if (Brilliance != 1.0) intensity = pow(fabs(cos), Brilliance)` --
+    the diffuse cosine raised to the power, skipped exactly at 1.0."""
+    b = np.asarray(brilliance, np.float32)
+    if not np.any(b != 1.0):
+        return dif
+    d = np.asarray(dif, np.float32)
+    p = np.power(np.maximum(d, np.float32(0.0)), b)
+    return np.where(b == 1.0, d, p).astype(np.float32)
+
+
+_POV_TWO_OVER_PI = np.float32(2.0 / np.pi)
+_POV_MET_A = np.float32(0.014567225)
+_POV_MET_B = np.float32(0.011612903)
+_POV_MET_X0 = np.float32(1.12)
+
+
+def pov_metallic_fresnel(ndl):
+    """POV-Ray's ComputeMetallic Fresnel: x = acos(cos)/(pi/2), F =
+    0.014567225/(x - 1.12)^2 - 0.011612903 clamped to 0..1. float32, one
+    operation per statement (the GLSL twin carries the same float32
+    literals through _f)."""
+    c = np.clip(np.asarray(ndl, np.float32), np.float32(0.0),
+                np.float32(1.0)).astype(np.float32)
+    x = np.arccos(c)
+    x = x * _POV_TWO_OVER_PI
+    xm = x - _POV_MET_X0
+    xm = xm * xm
+    f = _POV_MET_A / xm
+    f = f - _POV_MET_B
+    f = np.clip(f, np.float32(0.0), np.float32(1.0))
+    return f.astype(np.float32)
+
+
+def apply_pov_metallic(spec, ndl, metallic, diffuse):
+    """`colour *= 1 + M (1 - F)(pigment - 1)` on the highlight colour:
+    pigment-coloured facing the light, the light's own colour at
+    grazing. `spec` is the model's (N,3) specular (its colour folded in)."""
+    f = pov_metallic_fresnel(ndl)
+    m = np.float32(1.0) - f
+    m = m * np.asarray(metallic, np.float32)
+    tint = np.asarray(diffuse, np.float32) - np.float32(1.0)
+    tint = tint * m[:, None]
+    tint = tint + np.float32(1.0)
+    return (np.asarray(spec, np.float32) * tint).astype(np.float32)

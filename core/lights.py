@@ -77,7 +77,30 @@ class ShadowMap:
         self.persp = bool(persp)
         self.size = int(size)
         self.origin = np.asarray(origin, np.float32)
-        self.depth = self._linearise(zndc)
+        if isinstance(zndc, tuple):
+            # R251 C117: the MIDPOINT map (Woo 1992, Maya 'Use Mid Dist',
+            # Blender Classic-Halfway). `_render_depth` hands (z1, z2,
+            # has2): the nearest and the second-nearest caster per texel
+            # and where a second one exists. The texel stores the halfway
+            # point of the two LINEAR light-space distances (Blender
+            # averaged its integer z; the compare domain here is linear,
+            # LI:1-7), so a receiver compares against a value inside the
+            # caster's thickness -- no bias, no acne, no Peter-Panning.
+            # A texel that sees a lone surface stores CLASSIC's own empty
+            # texel (`linearise(1.0)`, the far plane: mental ray's rule)
+            # -- computed through the array path, never `float32(far)`,
+            # which differs from it by two roundings on an ortho map and
+            # by 2nf/((f+n)-(f-n)) != f on every perspective map
+            z1, z2, has2 = zndc
+            d1 = self._linearise(z1)
+            d2 = self._linearise(z2)
+            h1 = d1 * np.float32(0.5)
+            h2 = d2 * np.float32(0.5)
+            mid = h1 + h2
+            empty = self._linearise(np.ones(1, np.float32))[0]
+            self.depth = np.where(has2, mid, empty).astype(np.float32)
+        else:
+            self.depth = self._linearise(zndc)
         # extra PCF blur, in texels, derived from the LAMP'S OWN SIZE at
         # build time (see soft_size_texels) -- 0 keeps the classic blur
         self.soft_extra = 0.0
@@ -186,7 +209,34 @@ def scene_bounds(verts):
     return centre.astype(np.float32), radius
 
 
-def _render_depth(verts, tris, vp, size, cull='NONE'):
+class _DepthFrags(raster.FragmentList):
+    """R251 C117: a fragment collector that keeps only (px, py, depth).
+
+    The midpoint map's second raster wants every fragment's depth and
+    nothing else; the full FragmentList would hold bary/front/tri for
+    ~1.4 GB per cube face on a 4096-texel map at depth complexity 3."""
+
+    def add(self, px, py, tri, depth, bary, front, bary_lin=None):
+        if px.size == 0:
+            return
+        self.px.append(px.astype(np.int32))
+        self.py.append(py.astype(np.int32))
+        self.depth.append(depth.astype(np.float32))
+
+    def finish(self):
+        if not self.px:
+            z = np.zeros(0, np.int32)
+            return z, z, np.zeros(0, np.float32)
+        return (np.concatenate(self.px), np.concatenate(self.py),
+                np.concatenate(self.depth))
+
+
+#: triangles per run of the midpoint map's second raster (memory is
+#: bounded by one run's fragments; the result is run-size independent)
+MIDPOINT_RUN = 20000
+
+
+def _render_depth(verts, tris, vp, size, cull='NONE', midpoint=False):
     # A per-map frustum cull was tried here (R87) and REVERTED on the
     # measurement: a concentrated high-poly object sits inside most map
     # frustums, so the cull kept ~100% of triangles and its own gather
@@ -196,7 +246,42 @@ def _render_depth(verts, tris, vp, size, cull='NONE'):
     gb = raster.GBuffer(size, size)
     raster.rasterize(verts, tris, vp, size, size, cull=cull, gbuf=gb,
                      depth_bits=32)
-    return gb.zndc
+    if not midpoint:
+        return gb.zndc
+    # R251 C117: the MIDPOINT map's second surface. Raster 1 above is
+    # CLASSIC's own call (z1 is bitwise the CLASSIC texel). Raster 2 is a
+    # chunked fragment sweep: every fragment of the casters, and per texel
+    # the nearest one BEYOND the A-buffer tolerance of z1 -- THE NAMED TIE
+    # RULE: a fragment within `abuf_depth_limit` of the nearest is the
+    # SAME surface (the two triangles at a shared caster edge both include
+    # the boundary texel by the wobble window and would otherwise register
+    # the front surface twice: midpoint = front, self-shadow speckle along
+    # every caster's wireframe). Corollary: a closed shell thinner than the
+    # tolerance is one surface and casts nothing. Order-free by
+    # construction: z1 is a min; z2 is the min over a SET whose membership
+    # depends only on z1; a min is associative, commutative and exact in
+    # float32, so the run size cannot move a texel -- and the fill path is
+    # coverage-identical between `fill` and `fill_batched` (a run under
+    # BATCH_MIN_TRIS or a big triangle takes `fill` inside either).
+    z1 = gb.zndc
+    z2 = np.full((size, size), 1.0, np.float32)
+    has2 = np.zeros((size, size), bool)
+    n = int(tris.shape[0])
+    for start in range(0, n, MIDPOINT_RUN):
+        run = tris[start:start + MIDPOINT_RUN]
+        gb2 = raster.GBuffer(size, size)      # depth inf: every fragment kept
+        fl = _DepthFrags()
+        raster.rasterize(verts, run, vp, size, size, cull=cull, gbuf=gb2,
+                         frags=fl, depth_write=False, depth_bits=32)
+        px, py, zz = fl.finish()
+        if px.size == 0:
+            continue
+        sel = zz > raster.abuf_depth_limit(z1[py, px])
+        if not sel.any():
+            continue
+        np.minimum.at(z2, (py[sel], px[sel]), zz[sel])
+        has2[py[sel], px[sel]] = True
+    return z1, z2, has2
 
 
 _SHADOW_CACHE = {}
@@ -204,6 +289,18 @@ _SHADOW_CACHE = {}
 
 def clear_shadow_cache():
     _SHADOW_CACHE.clear()
+
+
+def midpoint_map(light, settings):
+    """R251 C117: does this lamp's map store Woo's midpoint? The lamp's
+    own Map Depth (INHERIT / CLASSIC / MIDPOINT) overrides the render's
+    (CLASSIC / MIDPOINT) -- Maya's Use Mid Dist and Blender's buffer
+    type were per lamp. One resolve for the bake, the CPU lookup and
+    the GPU's `_shadow_meta`."""
+    own = str(getattr(light, 'shadow_map_depth', 'INHERIT') or 'INHERIT')
+    mode = own if own != 'INHERIT' else \
+        str(getattr(settings, 'shadow_map_depth', 'CLASSIC') or 'CLASSIC')
+    return mode == 'MIDPOINT'
 
 
 def _shadow_base_signature(scene, settings, caster_tris):
@@ -221,7 +318,9 @@ def _shadow_base_signature(scene, settings, caster_tris):
             # same-sized materials toggling Shadow > Cast) must not
             # collide in the cache
             None if caster_tris is None else
-            (int(caster_tris.size), int(caster_tris.sum())))
+            (int(caster_tris.size), int(caster_tris.sum())),
+            # R251 C117: the map depth rule changes every texel
+            str(getattr(settings, 'shadow_map_depth', 'CLASSIC')))
 
 
 def _light_shadow_signature(light):
@@ -239,7 +338,9 @@ def _light_shadow_signature(light):
             round(float(light.spot_size), 5), light.shadow,
             int(light.shadow_map_size),
             round(float(getattr(light, 'radius', 0.0)), 6),
-            round(float(asz[0]), 6), round(float(asz[1]), 6))
+            round(float(asz[0]), 6), round(float(asz[1]), 6),
+            # R251 C117: the per-lamp Map Depth override
+            str(getattr(light, 'shadow_map_depth', 'INHERIT')))
 
 
 def build_shadow_maps(scene, settings, caster_tris=None):
@@ -342,7 +443,7 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
     # rasteriser is big-array NumPy that releases the interpreter lock,
     # which is the one shape of work threads genuinely scale on this
     # renderer (the shading loop is not -- see the Threads tooltip).
-    jobs = []                      # (assign, vp, size) -- assign(depth)
+    jobs = []                      # (assign, vp, size, mid) -- assign(depth)
     for li, light in enumerate(scene.lights):
         if only is not None and li not in only:
             continue
@@ -355,6 +456,8 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
             continue
         size = int(light.shadow_map_size or settings.shadow_map_size)
         size = max(32, min(4096, size))
+        # R251 C117: CLASSIC (nearest + bias) or Woo's MIDPOINT map
+        mid = midpoint_map(light, settings)
         pos = np.asarray(light.position, np.float32)
         if light.type == 'SUN':
             d = M.normalize(np.asarray(light.direction, np.float32))
@@ -371,7 +474,7 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
                                              size, eye, half)
                 _stamp_soft(light.shadow_map, light,
                             float(np.linalg.norm(centre - eye)))
-            jobs.append((assign, vp, size))
+            jobs.append((assign, vp, size, mid))
         elif light.type == 'SPOT':
             d = M.normalize(np.asarray(light.direction, np.float32))
             view = _look_at_lh(pos, pos + d, np.array([0, 0, 1.0], np.float32))
@@ -387,7 +490,7 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
                                              float(np.tan(fov * 0.5)))
                 _stamp_soft(light.shadow_map, light,
                             float(np.linalg.norm(centre - pos)))
-            jobs.append((assign, vp, size))
+            jobs.append((assign, vp, size, mid))
         else:
             near = max(radius * 0.005, 1e-3)
             far = max(float(np.linalg.norm(centre - pos)) + radius * 1.5, near * 10)
@@ -408,7 +511,7 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
                         light.shadow_map = CubeShadow(list(slots), pos)
                         _stamp_soft(light.shadow_map, light,
                                     float(np.linalg.norm(centre - pos)))
-                jobs.append((assign, vp, size))
+                jobs.append((assign, vp, size, mid))
 
     if not jobs:
         return
@@ -419,12 +522,12 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
         workers = min(len(jobs), max((_os.cpu_count() or 2) - 1, 2))
         with _fut.ThreadPoolExecutor(max_workers=workers) as pool:
             depths = list(pool.map(
-                lambda j: _render_depth(mesh.verts, tris, j[1], j[2]), jobs))
-        for (assign, _vp, _s), depth in zip(jobs, depths):
+                lambda j: _render_depth(mesh.verts, tris, j[1], j[2], midpoint=j[3]), jobs))
+        for (assign, _vp, _s, _m), depth in zip(jobs, depths):
             assign(depth)
     else:
-        for assign, vp, size in jobs:
-            assign(_render_depth(mesh.verts, tris, vp, size))
+        for assign, vp, size, mid in jobs:
+            assign(_render_depth(mesh.verts, tris, vp, size, midpoint=mid))
 
 
 # ------------------------------------------------------------- light sampling
@@ -478,6 +581,11 @@ def attenuate(light, dist, settings=None):
         if ld2 > 0.0:
             att = att * ((D * D) / (D * D + ld2
                                     * np.maximum(dist, 0.0) ** 2))
+    elif mode in DECAY_LAWS_R251:
+        # R251 F013: OpenGL's three-term attenuation, POV-Ray's fade
+        # laws and the GameCube's GX distance tables -- float32, one op
+        # per statement, exactly the GLSL `decay_law_glsl` emits
+        att = decay_law(light, mode, dist)
     else:
         att = 1.0 / (d * d)
     if getattr(light, 'bi_sphere', False):
@@ -502,6 +610,11 @@ def spot_falloff(light, L):
     cosine roll-off -- the field's spot rigs read wrong both ways."""
     d = M.normalize(np.asarray(light.direction, np.float32))
     inpr = -M.dot(L, np.broadcast_to(d[None, :], L.shape))
+    return spot_law_factor(light, inpr)
+
+
+def _spot_blender(light, inpr):
+    """Blender Internal's cone, verbatim (the 1.89.0 spot_falloff body)."""
     spotsi = np.float32(np.cos(float(light.spot_size) * 0.5))
     spotbl = np.float32((1.0 - spotsi) * float(light.spot_blend))
     t = inpr - spotsi
@@ -1025,7 +1138,9 @@ def casts_shadow(light, settings):
         return False
     mode = light.shadow if settings.shadow_default == 'PER_LIGHT' else \
         settings.shadow_default
-    return mode != 'NONE'
+    # R251 C052: a PLANAR lamp's lighting term is untouched by its own
+    # polygon (no self-shadow, the era's rule): it is no caster here
+    return mode not in ('NONE', 'PLANAR')
 
 
 def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
@@ -1054,7 +1169,10 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
         return np.ones(n, np.float32)
     mode = light.shadow if settings.shadow_default == 'PER_LIGHT' else \
         settings.shadow_default
-    if mode == 'NONE':
+    # R251 C052: PLANAR returns BEFORE the ray fallback below -- a map-less
+    # lamp with a BVH present would otherwise TRACE on top of its polygon
+    # (the polygon is drawn by core/shadowmask.py over the finished frame)
+    if mode in ('NONE', 'PLANAR'):
         return np.ones(n, np.float32)
 
     # ray_shadows is the master switch for TRACED shadows: RAY-mode lights
@@ -1164,7 +1282,12 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
     sm = light.shadow_map
     if sm is None:
         return np.ones(n, np.float32)
-    bias = float(light.shadow_bias or settings.shadow_bias)
+    # R251 C117: under a MIDPOINT map the compare lands inside the
+    # caster's thickness, so the bias and the normal offset are ZERO --
+    # `P + N * 0.0 == P` bitwise and slope 0.0: the same lookup, two
+    # zeroed inputs (Woo's rule, Maya's Use Mid Dist)
+    mid = midpoint_map(light, settings)
+    bias = 0.0 if mid else float(light.shadow_bias or settings.shadow_bias)
     ndl = np.clip(M.dot(N, L), 0.0, 1.0)
     slope = bias * (1.0 + 2.0 * (1.0 - ndl))
     soft = max(float(light.shadow_softness) * settings.shadow_softness, 0.0) \
@@ -1173,8 +1296,11 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
     # obliquely the light hits. Removes acne without the detached shadows a
     # large constant depth bias produces.
     texel = sm.texel_size(np.linalg.norm(P - sm.origin[None, :], axis=1))
-    offset = texel * (1.5 + 2.5 * np.sqrt(np.maximum(1.0 - ndl * ndl, 0.0))) * \
-        max(1.0, soft)
+    if mid:
+        offset = np.zeros(n, np.float32)
+    else:
+        offset = texel * (1.5 + 2.5 * np.sqrt(np.maximum(1.0 - ndl * ndl, 0.0))) * \
+            max(1.0, soft)
     lit = sm.lookup(P + N * offset[:, None], slope, soft, settings.shadow_samples)
     dens = float(light.shadow_density)
     return (1.0 - (1.0 - lit) * dens).astype(np.float32)
@@ -1224,3 +1350,270 @@ def ambient_light_split(scene, settings):
 def ambient_light(scene, settings):
     eng, wrld = ambient_light_split(scene, settings)
     return (eng + wrld).astype(np.float32)
+
+
+# ------------------------------------------------- R251 LIGHT-B1: lamp laws
+#
+# F012 spot cone laws, F013 decay laws, F015 the Model 3 screen spotlight.
+# Every function here is float32, one op per statement, and is the CPU
+# half of a GLSL twin (gpu/material.py spot_law_glsl / decay_law_glsl /
+# the screen-spot block) that runs the same statements in the same
+# order, so the simulator reproduces it bit for bit. The coefficient
+# helpers are the ONE place the numbers are computed: the GPU packer
+# (pack_light_texels) uploads exactly what these return.
+
+#: R251 F012: the cone laws a spot lamp may take (Light.spot_law).
+#: BLENDER is the 1.89.0 behaviour (Blender Internal's smoothstep band
+#: times the raw cosine); GL11 is glLight's cutoff + GL_SPOT_EXPONENT;
+#: POV is lightsource.cpp's flat hotspot with a cubic_spline edge and
+#: tightness; the GX_* six are libogc GX_InitLightSpot's angular
+#: functions (FLAT, COS, COS2, SHARP, RING1, RING2).
+SPOT_LAWS = ('BLENDER', 'GL11', 'POV', 'GX_FLAT', 'GX_COS', 'GX_COS2',
+             'GX_SHARP', 'GX_RING1', 'GX_RING2')
+
+#: R251 F013: the decay laws added to the shared FALLOFF enum.
+DECAY_LAWS_R251 = ('GL_3TERM', 'POV_FADE_LINEAR', 'POV_FADE_SQUARE',
+                   'GX_GENTLE', 'GX_MEDIUM', 'GX_STEEP')
+
+_GX_DEGENERATE_SAID = set()
+
+
+def spot_law_coeffs(light):
+    """(cr, a0, a1, a2), four float32, for the lamp's cone law.
+
+    `cr` is the cosine the law compares against: POV-Ray's radius,
+    cos(min(hotspot, spot_size)/2) (the clamp keeps cr >= the cone's
+    cutoff cosine on both roads, so a hotspot dragged past the cone
+    gives the hard edge at the cone); for the GX functions the cutoff
+    cosine itself. (a0, a1, a2) are libogc GX_InitLightSpot's
+    coefficients for the GX laws, computed in float64 and rounded to
+    float32 ONCE -- SHARP's a0 divided by (1 - cr)^2 as its other two
+    terms are (the libogc transcription slip, disclosed in the
+    CHANGELOG). Zeros for the other laws. The GPU packer uploads these
+    very values (hal_lights texels 4.yzw and 5.x).
+    """
+    law = str(getattr(light, 'spot_law', 'BLENDER') or 'BLENDER')
+    size = float(light.spot_size)
+    cf = float(np.cos(size * 0.5))
+    if law == 'POV':
+        hot = float(getattr(light, 'hotspot', 0.0) or 0.0)
+        cr = float(np.cos(min(hot, size) * 0.5))
+    else:
+        cr = cf
+    a0 = a1 = a2 = 0.0
+    if law.startswith('GX_'):
+        c = cr
+        if 1.0 - c < 1e-6:
+            # a cone too narrow for the rational functions (cr -> 1
+            # divides by zero): the law degenerates to FLAT, said once
+            key = (getattr(light, 'name', ''), law)
+            if key not in _GX_DEGENERATE_SAID:
+                _GX_DEGENERATE_SAID.add(key)
+                print(f"[Halcyon] spot '{key[0]}': Spot Size below 0.003 "
+                      f"rad degenerates the {law} cone law to GX_FLAT")
+            law = 'GX_FLAT'
+            c = min(c, 1.0 - 1e-6)
+        D = (1.0 - c) * (1.0 - c)
+        if law == 'GX_FLAT':
+            a0, a1, a2 = -1000.0 * c, 1000.0, 0.0
+        elif law == 'GX_COS':
+            a0, a1, a2 = -c / (1.0 - c), 1.0 / (1.0 - c), 0.0
+        elif law == 'GX_COS2':
+            a0, a1, a2 = 0.0, -c / (1.0 - c), 1.0 / (1.0 - c)
+        elif law == 'GX_SHARP':
+            a0, a1, a2 = c * (c - 2.0) / D, 2.0 / D, -1.0 / D
+        elif law == 'GX_RING1':
+            a0, a1, a2 = -4.0 * c / D, 4.0 * (1.0 + c) / D, -4.0 / D
+        elif law == 'GX_RING2':
+            a0, a1, a2 = 1.0 - 2.0 * c * c / D, 4.0 * c / D, -2.0 / D
+    return (np.float32(cr), np.float32(a0), np.float32(a1), np.float32(a2))
+
+
+def spot_law_factor(light, inpr):
+    """The cone factor for cos(angle to the axis) `inpr`, per `spot_law`.
+
+    BLENDER: the 1.89.0 body untouched. GL11: 0 outside the cutoff, the
+    cosine to Cone Exponent inside (exponent 0: exactly 1). POV: flat 1
+    inside the hotspot, the Hermite (3 - 2t) t^2 down to the cone edge,
+    times cos^exponent; the Hermite rides the VALUES road (both forms
+    computed, selected by `pd < 1e-6` -- dragging the hotspot onto the
+    cone edge changes a texel, never the plan). GX_*: libogc's
+    quadratic in the cosine, saturated to [0, 1] (GX's lighting terms
+    saturate before the colour multiply; FLAT's 1000x slope IS a
+    saturating step). Float32, one op per statement; the GLSL twin is
+    gpu/material.py spot_law_glsl.
+    """
+    law = str(getattr(light, 'spot_law', 'BLENDER') or 'BLENDER')
+    inpr = np.asarray(inpr, np.float32)
+    if law == 'BLENDER' or law not in SPOT_LAWS:
+        return _spot_blender(light, inpr)
+    cf = np.float32(np.cos(float(light.spot_size) * 0.5))
+    exp32 = np.float32(getattr(light, 'spot_exponent', 0.0) or 0.0)
+    if law == 'GL11':
+        if exp32 > 0.0:
+            p = M.safe_pow(np.maximum(inpr, np.float32(0.0)), exp32)
+            fac = np.where(inpr < cf, np.float32(0.0), p)
+        else:
+            fac = np.where(inpr < cf, np.float32(0.0), np.float32(1.0))
+        return fac.astype(np.float32)
+    cr, a0, a1, a2 = spot_law_coeffs(light)
+    if law == 'POV':
+        if exp32 > 0.0:
+            att = M.safe_pow(np.maximum(inpr, np.float32(0.0)), exp32)
+        else:
+            att = np.ones_like(inpr)
+        pd = np.float32(cr - cf)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            t0 = inpr - cf
+            t0 = t0 / pd
+        t0 = np.clip(t0, np.float32(0.0), np.float32(1.0))
+        t1 = np.where(inpr < cr, np.float32(0.0), np.float32(1.0))
+        t = np.where(pd < 1e-6, t1, t0).astype(np.float32)
+        t2 = t * t
+        s = np.float32(3.0) - np.float32(2.0) * t
+        s = s * t2
+        att = np.where(inpr < cr, att * s, att)
+        fac = np.where(inpr <= 0.0, np.float32(0.0), att)
+        return fac.astype(np.float32)
+    # GX_*
+    c = inpr
+    ang = a1 * c
+    ang = a0 + ang
+    cc = c * c
+    cc = a2 * cc
+    ang = ang + cc
+    fac = np.clip(ang, np.float32(0.0), np.float32(1.0))
+    return fac.astype(np.float32)
+
+
+def gx_dist_coeffs(light, mode):
+    """(k1, k2) float32 of libogc GX_InitLightDistAttn for a GX decay
+    mode: ref_dist = Falloff End, ref_brite = the lamp's gx_ref_brite,
+    computed in float64 and rounded once. The lamp is exactly ref_brite
+    bright at ref_dist. Zeros for any other mode."""
+    rb = float(getattr(light, 'gx_ref_brite', 0.5) or 0.5)
+    rb = min(max(rb, 1e-3), 1.0 - 1e-3)
+    rd = max(float(light.decay_end), EPS)
+    k1 = k2 = 0.0
+    if mode == 'GX_GENTLE':
+        k1 = (1.0 - rb) / (rb * rd)
+    elif mode == 'GX_MEDIUM':
+        k1 = 0.5 * (1.0 - rb) / (rb * rd)
+        k2 = 0.5 * (1.0 - rb) / (rb * rd * rd)
+    elif mode == 'GX_STEEP':
+        k2 = (1.0 - rb) / (rb * rd * rd)
+    return np.float32(k1), np.float32(k2)
+
+
+def decay_law(light, mode, dist):
+    """R251 F013: the six decay laws on `dm = max(dist, 0)`, float32, one
+    op per statement -- the CPU half of gpu/material.py decay_law_glsl.
+
+    GL_3TERM: 1/(1 + ld1 d + ld2 d^2) (glLight's kc, kl, kq with kc = 1;
+    both sliders 0 = GL's default, no falloff). POV_FADE_LINEAR /
+    POV_FADE_SQUARE: 2/(1 + (d/D)^P), P = 1, 2 -- bounded at 2, exactly
+    1 at D = Falloff End (POV's fade_distance-0 form and other powers
+    are not modelled). GX_*: 1/(1 + k1 d + k2 d^2) with (k1, k2) from
+    gx_dist_coeffs.
+    """
+    dm = np.maximum(np.asarray(dist, np.float32), np.float32(0.0))
+    one = np.float32(1.0)
+    if mode == 'GL_3TERM':
+        ld1 = np.float32(getattr(light, 'decay_ld1', 0.0) or 0.0)
+        ld2 = np.float32(getattr(light, 'decay_ld2', 0.0) or 0.0)
+        t = ld1 * dm
+        u = dm * dm
+        u = ld2 * u
+        s = one + t
+        s = s + u
+        att = one / s
+    elif mode in ('POV_FADE_LINEAR', 'POV_FADE_SQUARE'):
+        D = np.float32(max(float(light.decay_end), EPS))
+        q = dm / D
+        if mode == 'POV_FADE_SQUARE':
+            q = q * q
+        s = one + q
+        att = np.float32(2.0) / s
+    else:
+        k1, k2 = gx_dist_coeffs(light, mode)
+        t = k1 * dm
+        u = dm * dm
+        u = k2 * u
+        s = one + t
+        s = s + u
+        att = one / s
+    return att.astype(np.float32)
+
+
+def screen_spot_params(light, vp, w, h, camera=None):
+    """R251 F015: the Model 3 viewport spotlight's ellipse for one frame,
+    six float32 -- (cx, cy, w, h, start, aext) in INTERNAL pixels.
+
+    (cx, cy) is the lamp position projected by `vp` exactly as the
+    rasteriser projects a vertex (`clip = (pos, 1) @ vp.T`, then
+    `(ndc*0.5 + 0.5) * size`; row 0 = the bottom of the frame, pixel
+    centres sit at +0.5); the half axes are half the Spot Size as a
+    fraction of the frame HEIGHT (Halcyon's own mapping of the board's
+    pixel size, stated in the tooltip); `start` is the camera's near
+    clip (the board's 1/float depth start) and `aext` = |Falloff End|
+    (the extent). The GPU packer uploads these very values (hal_lights
+    texels 6 and 7); the CPU loop reads them per batch.
+    """
+    pos = np.asarray(light.position, np.float32)
+    clip = np.append(pos, 1.0).astype(np.float32) @ \
+        np.asarray(vp, np.float32).T
+    cw = float(clip[3])
+    if abs(cw) < 1e-9:
+        cw = 1e-9
+    ndc_x = float(clip[0]) / cw
+    ndc_y = float(clip[1]) / cw
+    cx = np.float32((ndc_x * 0.5 + 0.5) * float(w))
+    cy = np.float32((ndc_y * 0.5 + 0.5) * float(h))
+    half = np.float32(0.5 * float(light.spot_size) * float(h))
+    start = np.float32(float(getattr(camera, 'clip_start', 0.1) or 0.1)
+                       if camera is not None else 0.1)
+    aext = np.float32(abs(float(light.decay_end)))
+    return cx, cy, half, half, start, aext
+
+
+def screen_spot_lobe(px, py, depth, cx, cy, w, h, start, aext):
+    """R251 F015: Supermodel's ComputeSpotlight, float32, one op per
+    statement -- (en, el, lobe), three (N,) arrays.
+
+    el = max(0, 1 - ((x - cx)/w)^2 - ((y - cy)/h)^2) is the screen
+    ellipse at the pixel centre; en gates on depth >= start; the depth
+    window is 1/((d/(1 + |extent|) - 1)^2) with d = min(start + aext -
+    depth, 0) (full from `start` to start + aext, then fading; q >= 1
+    always, so the division never sees zero); lobe = window * ellipse.
+    The GLSL twin (gpu/material.py screen_spot_glsl) runs the same
+    statements in the same order.
+    """
+    px = np.asarray(px, np.float32)
+    py = np.asarray(py, np.float32)
+    depth = np.asarray(depth, np.float32)
+    half = np.float32(0.5)
+    ex = px + half
+    ex = ex - cx
+    ex = ex / w
+    ey = py + half
+    ey = ey - cy
+    ey = ey / h
+    ex = ex * ex
+    ey = ey * ey
+    el = np.float32(1.0) - ex
+    el = el - ey
+    el = np.maximum(el, np.float32(0.0))
+    en = np.where(depth >= start, np.float32(1.0),
+                  np.float32(0.0)).astype(np.float32)
+    z = -depth
+    dd = np.float32(start + aext)
+    dd = dd + z
+    dd = np.minimum(dd, np.float32(0.0))
+    qa = np.float32(np.float32(1.0) + aext)
+    q = dd / qa
+    q = q - np.float32(1.0)
+    q = q * q
+    rng = en / q
+    lobe = rng * el
+    return (en.astype(np.float32), el.astype(np.float32),
+            lobe.astype(np.float32))

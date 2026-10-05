@@ -20,8 +20,9 @@ class Ctx:
     """Per-invocation state that some builtins need (derivatives, samplers)."""
 
     def __init__(self, n=1, px=None, py=None, width=0, height=0, tri=None,
-                 samplers=None, filt='NEAREST', wrap='REPEAT'):
+                 samplers=None, filt='NEAREST', wrap='REPEAT', opts=None):
         self.n = n
+        self.opts = opts             # R251: the texture pack's sample-time dials
         self.px = px
         self.py = py
         self.width = width
@@ -216,6 +217,14 @@ def to_float(x):
 
 def to_int(x):
     a = np.asarray(x)
+    if a.dtype.kind == 'f':
+        # R249: lanes outside the current mask carry don't-care values
+        # (a function called under a partial mask returns zero on the
+        # lanes it did not run for), and a later int() of the garbage
+        # they produce must not raise NumPy's invalid-cast warning --
+        # the lanes are never stored
+        with np.errstate(invalid='ignore'):
+            return a.astype(np.int32)
     return a.astype(np.int32)
 
 
@@ -538,7 +547,8 @@ def texture(samp, uv, bias=None):
     u = np.asarray(uv, F32)
     if u.ndim == 1:
         u = u[:, None]
-    return samp.sample(u[:, 0], u[:, 1], filt=c.filt, wrap=c.wrap).astype(F32)
+    return samp.sample(u[:, 0], u[:, 1], filt=c.filt, wrap=c.wrap,
+                       opts=getattr(c, 'opts', None)).astype(F32)
 
 
 def texture2D(samp, uv, bias=None):

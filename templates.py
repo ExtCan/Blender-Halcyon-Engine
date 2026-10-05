@@ -133,6 +133,40 @@ TEMPLATES = {
                    # whole surface -- raise it once the maps are in
                    'Emission Strength': 0.0},
     },
+    # R246: Sparking! ZERO, from the game's own material export read
+    # against the field's reconstruction of its master material -- the
+    # base skin instance (MI_SKN000): Color1 (1.0, 0.655, 0.498) gamma
+    # decoded, its T_ToneSKN00 strip decoded into the sliders (white
+    # above 0.73 on the half-Lambert cosine; the strip's warm band
+    # (150, 111, 109) read as a colour texture lifts GradientAdjust1's
+    # floor (0.2 ^ 2.2) toward white), no highlight at rest, the
+    # character lighting itself (Ambient 0)
+    'CEL_SPARKING': {
+        'label': "Cel Sparking! ZERO Skin",
+        'category': 'SIMPLE',
+        'family': 'CEL',
+        'note': "SPARKING mode armed with the game's own base skin "
+                "material as its export states it: the flat colour as "
+                "exported (the swatch #FCC79E), the T_ToneSKN00 strip's "
+                "two bands as the sliders on the half-Lambert cosine "
+                "(white above 0.73, the tone below lifted from "
+                "GradientAdjust1's floor), no highlight at rest, no scene "
+                "ambient. Link the character's GradientTexture into "
+                "Shadow Ramp and Mask1 into Game Texture -- or File > "
+                "Import > Sparking! ZERO Material builds every part from "
+                "its FModel .json",
+        'anime': {'compat': 'SPARKING', 'tones': 'TWO',
+                  'line_source': 'CUSTOM'},
+        'inputs': {'Diffuse Color': (0.969, 0.570, 0.339, 1.0),
+                   'Shadow Bias': 0.0,
+                   'Shadow 1 Threshold': 0.7305,
+                   'Shadow 1 Softness': 0.0,
+                   'Shadow 1 Color': (0.453, 0.428, 0.424, 1.0),
+                   'Specular Level': 0.0, 'Specular Size': 0.25,
+                   'Rim Amount': 0.0,
+                   'Line Color': (0.0, 0.0, 0.0, 1.0),
+                   'Ambient': 0.0},
+    },
     # ---------------------------------------------- R229: the 80s anime
     'CEL_80S_HAIR': {
         'label': "Cel 80s Hair",

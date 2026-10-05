@@ -11,6 +11,8 @@ with one flat pointer map decodes the wrong struct without ever noticing.
 """
 
 import gzip
+import os
+import tempfile
 import types
 
 import numpy as np
@@ -20,6 +22,17 @@ from ..core import blend279_map as M
 from . import legacy_fixture as FX
 
 FAILS = []
+
+#: R250: the scratch files these tests write. They used to name /tmp
+#: outright, which exists on the Linux container that ran R1-R249 and
+#: not on the user's Windows machine -- the legacy section aborted at
+#: its first test there (FileNotFoundError), and run_all's count came
+#: up ~450 short of the suite
+_TMP = tempfile.gettempdir()
+
+
+def _tmp(name):
+    return os.path.join(_TMP, name)
 
 
 def check(name, cond, extra=''):
@@ -1410,8 +1423,18 @@ _NODE_TABLE_TAIL = {
     'ShaderNodeTexMagic': ([('Vector', 'VECTOR'), ('Scale', 'VALUE'),
                             ('Distortion', 'VALUE')],
                            [('Color', 'RGBA'), ('Fac', 'VALUE')]),
+    # R246: the Sparking! ZERO importer's nodes
+    'ShaderNodeVertexColor': ([], [('Color', 'RGBA'), ('Alpha', 'VALUE')]),
+    'ShaderNodeSeparateColor': ([('Color', 'RGBA')],
+                                [('Red', 'VALUE'), ('Green', 'VALUE'),
+                                 ('Blue', 'VALUE')]),
 }
 _NODE_TABLE.update(_NODE_TABLE_TAIL)
+_NODE_ATTRS['ShaderNodeVertexColor'] = (('layer_name', ''),)
+_NODE_ATTRS['ShaderNodeSeparateColor'] = (('mode', 'RGB'),)
+_NODE_ATTRS['ShaderNodeTexImage'] = (('image', None), ('interpolation', 'Linear'),
+                                     ('extension', 'REPEAT'),
+                                     ('projection', 'FLAT'))
 
 
 class _FNode:
@@ -1433,6 +1456,24 @@ class _FNode:
                 self.inputs.append(s)
             self.outputs.append(_FSock(self, 'Surface', 'SHADER'))
             self.model = 'PHONG'
+            self.refresh_sockets = lambda: None
+        elif idname == 'HALCYON_AnimeShaderNode':
+            # R246: the anime master, from the real class's socket table
+            from ..nodes.shader_nodes import HALCYON_AnimeShaderNode
+            for kind, name, default in HALCYON_AnimeShaderNode.SOCKETS:
+                s = _FSock(self, name, {'NodeSocketColor': 'RGBA',
+                                        'NodeSocketVector':
+                                        'VECTOR'}.get(kind, 'VALUE'))
+                if default is not None:
+                    if isinstance(s.default_value, list) and \
+                            hasattr(default, '__len__'):
+                        s.default_value = list(default)
+                    elif not isinstance(s.default_value, list):
+                        s.default_value = default
+                self.inputs.append(s)
+            self.outputs.append(_FSock(self, 'Surface', 'SHADER'))
+            for k in ('compat', 'tones', 'line_source', 'use_vertex_ao'):
+                setattr(self, k, None)
             self.refresh_sockets = lambda: None
         elif idname == 'HALCYON_BIMaterialNode':
             # the BI node: BI display names over master identifiers,
@@ -2382,7 +2423,7 @@ def test_appended_route_end_to_end():
     bpy = fakebpy.install()
     from .. import legacy_import as LI
 
-    path = '/tmp/halcyon_fix279_e2e.blend'
+    path = _tmp('halcyon_fix279_e2e.blend')
     data, truth = FX.build_279()
     with open(path, 'wb') as fh:
         fh.write(data)
@@ -2563,7 +2604,7 @@ def test_appended_route_end_to_end():
     coll2 = _t2.SimpleNamespace(objects=_LinkList())
     warns2 = []
     imported2, _nm, _ni = LI._fallback_import(
-        ctx, path, {'Spot': lamp_parsed}, {}, 279, '/tmp', coll2,
+        ctx, path, {'Spot': lamp_parsed}, {}, 279, _TMP, coll2,
         warns2, hidden={'Spot'})
     check('a hidden-layer object imports HIDDEN from viewport and '
           'render, as 2.79 kept it',
@@ -2632,7 +2673,7 @@ def test_fix_appended_lamps():
           == (None, None, None))
 
     # ---- the operator, headless, against the real fixture file
-    path = '/tmp/halcyon_fix_lamps.blend'
+    path = _tmp('halcyon_fix_lamps.blend')
     data, _truth = FX.build_279()
     with open(path, 'wb') as fh:
         fh.write(data)
@@ -2787,7 +2828,7 @@ def test_append_watch():
     from .. import append_watch as AW
     from .. import legacy_import as LI
 
-    path = '/tmp/halcyon_watch_279.blend'
+    path = _tmp('halcyon_watch_279.blend')
     data, _truth = FX.build_279()
     with open(path, 'wb') as fh:
         fh.write(data)
@@ -2795,23 +2836,23 @@ def test_append_watch():
     # ---- the header sniff: classic in, everything else out
     check('a classic header reads its version',
           AW.blend_header_version(path) == 279)
-    gzpath = '/tmp/halcyon_watch_279.blend.gz.blend'
+    gzpath = _tmp('halcyon_watch_279.blend.gz.blend')
     with open(gzpath, 'wb') as fh:
         fh.write(_gz.compress(data))
     check('...through gzip, as 2.4x-era saves are wrapped',
           AW.blend_header_version(gzpath) == 279)
-    modpath = '/tmp/halcyon_watch_modern.blend'
+    modpath = _tmp('halcyon_watch_modern.blend')
     with open(modpath, 'wb') as fh:
         fh.write(b'BLENDER-v502' + b'\x00' * 64)
     check('a modern header is NOT classic',
           AW.blend_header_version(modpath) == 502)
-    zstpath = '/tmp/halcyon_watch_zstd.blend'
+    zstpath = _tmp('halcyon_watch_zstd.blend')
     with open(zstpath, 'wb') as fh:
         fh.write(b'\x28\xb5\x2f\xfd' + b'\x00' * 64)
     check('Zstandard files are modern by definition -> None',
           AW.blend_header_version(zstpath) is None)
     check('garbage and missing files are None, never a raise',
-          AW.blend_header_version('/tmp/halcyon_watch_missing.blend')
+          AW.blend_header_version(_tmp('halcyon_watch_missing.blend'))
           is None)
 
     # ---- collect_light_jobs: exactly the appended lights, by file
@@ -3137,6 +3178,8 @@ def test_lamp_loop_tail_import():
 
 
 def main():
+    from . import utf8_console
+    utf8_console()
     tests = [(k, v) for k, v in sorted(globals().items())
              if k.startswith('test_') and callable(v)]
     for name, fn in tests:
@@ -3243,3 +3286,645 @@ def test_halo_points_need_no_faces():
         halo=False))
     check('a surface material collects nothing',
           EX._collect_halo_points(me, mw, [plain]) is None)
+
+
+def test_sparking_zero_material_import():
+    """R246/R247: the Sparking! ZERO material importer.
+
+    The field's FModel export -- material instances as .json with the
+    Textures map and the Parameters block (Colors, Scalars, Switches,
+    Properties), the textures as PNGs in the same content tree -- is
+    read into the Anime Shader's SPARKING decode: the flat Color1 AS
+    EXPORTED (R247: Unreal's linear colour, the Hex beside it the
+    artist's swatch -- the remake's 2.2 on top of it made the SS4 fur
+    black in the field), the Mask1 line-art sheet, the GradientTexture
+    strip plus GradientAdjust1, the specular carried with its level at
+    0 (the pow(N.H) gate covered the shoulder pads in white), the mouth
+    palette where Color1 is black, the eye decal on Separate Color, the
+    outline shell (MI_LNE000) as an invisible punch-through and found
+    under Common for the slot the pick did not cover. The tone strip's
+    bands are decoded into the sliders too, so the material still reads
+    right with the ramp unlinked. Everything here is synthetic --
+    nothing from the game is in the tree -- and shaped like the export.
+    """
+    import json
+    import os
+    import tempfile
+    import numpy as np
+    from . import fakebpy
+    bpy = fakebpy.install()
+    from .. import sparking as SP
+
+    def color(r, g, b, a=1.0):
+        return {'R': r, 'G': g, 'B': b, 'A': a, 'Hex': 'FFFFFF'}
+
+    def mi(**kw):
+        d = {'Textures': {
+                 'Mask1': '/Game/SS/Characters/0001/1p/Textures/T_0001_SKN_00.T_0001_SKN_00',
+                 'GradientTexture': '/Game/SS/Characters/Common/Textures/T_ToneX.T_ToneX',
+                 'ColorTexture1': '/Game/SS/Characters/Common/Textures/Mouth_00.Mouth_00',
+                 'EyeTexture': '/Game/SS/Characters/Common/Textures/T_MaskDefault.T_MaskDefault',
+                 'ReflectionTexture': '/Game/SS/Characters/Common/Textures/T_Ref00.T_Ref00',
+                 'FaceLightMask2': '/Game/SS/Characters/Common/Textures/T_MaskDefault.T_MaskDefault',
+                 'HeatmapGradient': '/Engine/EngineDebugMaterials/HeatmapGradient.HeatmapGradient'},
+             'Parameters': {
+                 'BlendMode': 1, 'ShadingModel': 0,
+                 'Colors': {'Color1': color(0.513, 0.641, 0.197),
+                            'Color2': color(1.0, 1.0, 1.0),
+                            'GradientAdjust1': color(0.14, 0.2, 0.12),
+                            'SpecularColor': color(0.082, 0.15, 0.092, 0.896),
+                            'RimLightColor': color(1, 1, 1),
+                            'RimlightColorMult_1': color(0.5, 1.0, 0.5),
+                            'LineColor': color(0, 0, 0),
+                            'EyeColor': color(0.8, 0.3, 0.6)},
+                 'Scalars': {'ShadowStep': 0.4, 'M_Gloss': 1.2,
+                             'SpecularShininess': 1.0, 'SpecularSmooth': 0.05,
+                             'Rimlight_Intensity': 0.0, 'RimlightSize': 0.65,
+                             'UseReflection': 0.0, 'ChrToplight_Intensity': 0.0},
+                 'Switches': {}, 'Properties': {}}}
+        for k, v in kw.items():
+            sect, key = k.split('__')
+            if sect == 'T':
+                d['Textures'][key] = v
+            elif sect == 'C':
+                d['Parameters']['Colors'][key] = v
+            else:
+                d['Parameters']['Scalars'][key] = v
+        return d
+
+    # ---- the reader and the texture resolver, on a tree shaped like
+    # FModel's: <root>/Content/SS/... beside the JSON's own folder
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp, 'export', 'Content')
+        mdir = os.path.join(root, 'SS', 'Characters', '0001', '1p', 'Materials')
+        tdir = os.path.join(root, 'SS', 'Characters', '0001', '1p', 'Textures')
+        cdir = os.path.join(root, 'SS', 'Characters', 'Common', 'Textures')
+        for d in (mdir, tdir, cdir):
+            os.makedirs(d)
+        for f in (os.path.join(tdir, 'T_0001_SKN_00.png'),
+                  os.path.join(cdir, 'T_ToneX.png'),
+                  os.path.join(cdir, 'Mouth_00.tga')):
+            open(f, 'wb').close()
+        jpath = os.path.join(mdir, 'MI_0001_SKN000.json')
+        json.dump(mi(), open(jpath, 'w'))
+        d = SP.read_mi(jpath)
+        check('the reader takes the FModel instance shape',
+              d['Parameters']['Scalars']['ShadowStep'] == 0.4)
+        bad = os.path.join(mdir, 'notmat.json')
+        json.dump({'foo': 1}, open(bad, 'w'))
+        try:
+            SP.read_mi(bad)
+            ok = False
+        except ValueError as exc:
+            ok = 'Parameters' in str(exc)
+        check('a JSON that is not a material instance is refused by name', ok)
+        check("texture_name strips the '/Game/.../T_X.T_X' reference",
+              SP.texture_name(d['Textures']['Mask1']) == 'T_0001_SKN_00'
+              and SP.texture_name('') == '')
+        got = SP.resolve_texture(d['Textures']['Mask1'], jpath)
+        check('the Mask1 sheet resolves beside the JSON, under Content',
+              got == os.path.join(tdir, 'T_0001_SKN_00.png'), str(got))
+        check('a Common texture resolves through the same root',
+              SP.resolve_texture(d['Textures']['GradientTexture'], jpath)
+              == os.path.join(cdir, 'T_ToneX.png'))
+        check('FModel\'s other formats are tried in order (.tga)',
+              SP.resolve_texture(d['Textures']['ColorTexture1'], jpath)
+              == os.path.join(cdir, 'Mouth_00.tga'))
+        check('an Engine reference and a missing file resolve to None',
+              SP.resolve_texture(d['Textures']['HeatmapGradient'], jpath) is None
+              and SP.resolve_texture(d['Textures']['ReflectionTexture'], jpath) is None)
+
+        # ---- the decode
+        dec = SP.decode(d, 'SKN000')
+        ins = dec['inputs']
+        check('the decode: Color1 into Diffuse Color AS EXPORTED (the '
+              'linear value whose Hex is the swatch), the half-Lambert bands '
+              '(Shadow Bias 0), hard edges, the character lighting itself',
+              tuple(round(v, 3) for v in ins['Diffuse Color'][:3])
+              == (0.513, 0.641, 0.197)
+              and ins['Shadow Bias'] == 0.0 and ins['Shadow 1 Softness'] == 0.0
+              and ins['Ambient'] == 0.0
+              and dec['props']['compat'] == 'SPARKING'
+              and dec['props']['line_source'] == 'CUSTOM',
+              str(ins['Diffuse Color']))
+        check('the specular: carried with Specular Level 0 (the reconstruction '
+              'has no highlight term), the colour as exported, the alpha '
+              'threshold onto the wrapped gate ((1 - 0.896) / 2), the '
+              'smoothness halved -- and the note names the numbers',
+              ins['Specular Level'] == 0.0
+              and abs(ins['Specular Size'] - 0.052) < 1e-6
+              and abs(ins['Specular Sharpness'] - 0.025) < 1e-9
+              and abs(ins['Specular Color'][1] - 0.15) < 1e-6
+              and any('SpecularColor (0.08, 0.15, 0.09) alpha 0.90, M_Gloss 1.2'
+                      in n and 'Specular Level 0' in n for n in dec['notes']),
+              str(dec['notes']))
+        check('the export\'s Hex is the sRGB encoding of the linear value: '
+              'srgb_hex writes it back (the SS4 fur #752A31)',
+              all(abs(int(SP.srgb_hex((0.1771, 0.0240, 0.0313))[i:i + 2], 16) - w) <= 1
+                  for i, w in ((1, 0x75), (3, 0x2A), (5, 0x31)))
+              and SP.srgb_hex((1.0, 1.0, 1.0)) == '#FFFFFF'
+              and SP.srgb_hex((0.129, 0.128, 0.13)) == '#656465')
+        check('ShadowStep is reported as not read',
+              any('ShadowStep 0.4: not read' in n for n in dec['notes']))
+        check('a shininess above 1 tightens the gate: pow(N.H, s) > a is '
+              'N.H > a^(1/s)',
+              abs(SP.specular_size(0.5, 10.0)
+                  - (1.0 - 0.5 ** 0.1) * 0.5) < 1e-9
+              and SP.specular_size(1.0, 1.0) == 0.0)
+        check('the rim: carried with the amount at 0 (the remake soft-lights '
+              'a lit-side Fresnel edge), the colour times its multiplier, '
+              'as exported, the size as the power',
+              ins['Rim Amount'] == 0.0
+              and tuple(round(v, 3) for v in ins['Rim Color'][:3])
+              == (0.5, 1.0, 0.5)
+              and abs(ins['Rim Power'] - 0.65) < 1e-9)
+        dr = SP.decode(mi(S__Rimlight_Intensity=3.0, S__RimlightSize=4.46))
+        check('...an instance with the rim armed stays off and says so by '
+              'name',
+              dr['inputs']['Rim Amount'] == 0.0
+              and any('Rimlight_Intensity 3' in n and 'Rim Amount 0' in n
+                      for n in dr['notes']))
+        dh = SP.decode(mi(C__SpecularColor=color(2.0, 2.0, 2.0, 0.87),
+                          S__SpecularShininess=0.5,
+                          C__Color1=color(2.0, 1.893, 0.771, 0.6)))
+        check('HDR values: a 2.0 specular becomes white on the socket with '
+              'the level still 0 (the SS4 shoulder pads: no white blob); a '
+              '2.0 Color1 is a glow, its overflow the emission',
+              tuple(round(v, 3) for v in dh['inputs']['Specular Color'][:3]) == (1.0, 1.0, 1.0)
+              and dh['inputs']['Specular Level'] == 0.0
+              and abs(dh['inputs']['Specular Size'] - (1 - 0.87 ** 2) / 2) < 1e-9
+              and max(dh['inputs']['Diffuse Color'][:3]) == 1.0
+              and abs(dh['inputs']['Emission Strength'] - 1.0) < 1e-6
+              and any('SpecularColor (2.00, 2.00, 2.00) alpha 0.87' in n
+                      for n in dh['notes'])
+              and any('read as a glow' in n for n in dh['notes']),
+              str(dh['inputs']))
+        check('the field\'s SS4 fur and vest: Color1 (0.177, 0.024, 0.031) '
+              'and (0.129, 0.128, 0.130) reach the socket as they are -- '
+              'the 2.2 that put them at 2% and 1% is gone',
+              tuple(round(v, 3) for v in SP.decode(mi(C__Color1=color(0.1771, 0.0240, 0.0313)))['inputs']['Diffuse Color'][:3])
+              == (0.177, 0.024, 0.031)
+              and abs(SP.decode(mi(C__Color1=color(0.1295, 0.128, 0.13)))['inputs']['Diffuse Color'][0] - 0.1295) < 1e-6)
+        check('the texture roles: Mask1 the game sheet, GradientTexture the '
+              "ramp; the slot's common Mouth_00 and a T_MaskDefault are "
+              "nothing under a flat colour; GradientAdjust1 is the shadow's "
+              'floor as exported, held at white when it exceeds it',
+              set(dec['textures']) == {'game', 'ramp'}
+              and tuple(round(v, 4) for v in dec['floor']) == (0.14, 0.2, 0.12)
+              and SP.decode(mi(C__GradientAdjust1=color(2.0, 1.9, 1.1)))['floor'] == (1.0, 1.0, 1.0))
+        check('a black SpecularColor carries no note; the level is 0 either way',
+              SP.decode(mi(C__SpecularColor=color(0, 0, 0, 0.5)))['inputs']['Specular Level'] == 0.0
+              and not any('SpecularColor' in n for n in SP.decode(mi(C__SpecularColor=color(0, 0, 0, 0.5)))['notes']))
+        d2 = SP.decode(mi(S__UseReflection=1.5, S__ChrToplight_Intensity=0.3,
+                          T__FaceLightMask2='/Game/SS/Characters/0001/1p/Textures/T_0001_FLT_02.T_0001_FLT_02'))
+        check('what is not decoded is reported by name: the reflection '
+              'map, the top light, the face light mask',
+              any('UseReflection 1.5' in n and 'T_Ref00' in n for n in d2['notes'])
+              and any('ChrToplight' in n for n in d2['notes'])
+              and any('FaceLightMask2 T_0001_FLT_02' in n for n in d2['notes']))
+        d3 = SP.decode(mi(T__EyeTexture='/Game/SS/Characters/0001/1p/Textures/T_0001_EYE_00.T_0001_EYE_00'))
+        check('an eye sheet makes an eye material: the role lands, the flat '
+              'colour steps aside for the decal, EyeColor as exported',
+              'eye' in d3['textures'] and d3['inputs']['Diffuse Color'] == (1.0, 1.0, 1.0, 1.0)
+              and tuple(round(v, 3) for v in d3['eye_color']) == (0.8, 0.3, 0.6))
+        d4 = SP.decode({'Textures': {}, 'Parameters': {'Colors': {}, 'Scalars': {}}})
+        check('an empty instance still decodes (the missing strip noted)',
+              d4['inputs']['Shadow Bias'] == 0.0
+              and any('no GradientTexture' in n for n in d4['notes']))
+
+        # ---- the strip decoded into the sliders (bottom-left origin,
+        # the top rows lit), with the 3-row compression transitions
+        # the exported strips carry
+        px = np.zeros((256, 16, 4), np.float32)
+        px[..., 3] = 1.0
+        px[:, :, :3] = 0.34                    # rows 0..111 from the bottom
+        px[112:207, :, :3] = 0.525             # the mid band
+        px[204:207, :, :3] = 0.51              # a transition
+        px[207:, :, :3] = 1.0                  # the top 49 rows: lit
+        from ..core.mathx import srgb_to_linear
+        fl = (0.14, 0.2, 0.12)
+        t1 = float(srgb_to_linear(np.full((1, 1, 4), 0.525, np.float32))[0, 0, 0])
+        t2 = float(srgb_to_linear(np.full((1, 1, 4), 0.34, np.float32))[0, 0, 0])
+        want1 = tuple(round(f + (1 - f) * t1, 3) for f in fl)
+        want2 = tuple(round(f + (1 - f) * t2, 3) for f in fl)
+        bands = SP.decode_tone_strip(px, fl)
+        check('the strip decodes to three bands: lit above 1 - 49/256, '
+              'the mid tone to 1 - 144/256, each band read as a colour '
+              "texture and lifting the floor toward white (the remake's "
+              'lerp)',
+              bands is not None and bands['tones'] == 'THREE'
+              and abs(bands['Shadow 1 Threshold'] - (1 - 49 / 256)) < 1e-6
+              and abs(bands['Shadow 2 Threshold'] - (1 - 144 / 256)) < 1e-6
+              and tuple(round(v, 3) for v in bands['Shadow 1 Color'][:3]) == want1
+              and tuple(round(v, 3) for v in bands['Shadow 2 Color'][:3]) == want2
+              and t1 < 0.3,
+              f'{bands} want {want1} {want2}')
+        two = px.copy()
+        two[:207, :, :3] = 0.5
+        b2 = SP.decode_tone_strip(two)
+        check('a two-band strip decodes to Two Tone; a flat one to nothing',
+              b2 is not None and b2['tones'] == 'TWO'
+              and 'Shadow 2 Threshold' not in b2
+              and SP.decode_tone_strip(np.ones((256, 16, 4), np.float32)) is None)
+
+        # ---- the graph, in nodeeval's own shape
+        dmouth = SP.decode(mi(T__ColorTexture1='/Game/SS/Characters/0001/1p/Textures/T_0001_MTH_00.T_0001_MTH_00',
+                              C__Color1=color(0, 0, 0), C__Color2=color(1.15, 1.15, 1.15)))
+        dcommon = SP.decode(mi(C__Color1=color(0, 0, 0), C__Color2=color(1.15, 1.15, 1.15)))
+        check("a mouth instance's colour texture is its base (the palette) "
+              '-- its own, or the common Mouth_00 under a black Color1 (R247: '
+              "the shared MI_MTH000); a flat colour's Mouth_00 never is",
+              'color' in dmouth['textures'] and 'color' in dcommon['textures']
+              and any('Color1 is black: ColorTexture1 Mouth_00 is the base' in n
+                      for n in dcommon['notes'])
+              and 'color' not in dec['textures'])
+        # ---- the outline shell (R247): the field's white lines
+        lne = {'Textures': {'DitherTexture': '/Game/SS/Effects/Common/Textures/T_EF.T_EF'},
+               'Parameters': {'Colors': {'ChrColorMult': color(1, 1, 1),
+                                         'ChrToonlineColor2': color(0, 0, 0),
+                                         'ColorAdd': color(0, 0, 0, 0)},
+                              'Scalars': {'M_FaceLine_Visibility': 1.0, 'RimlightSize': 0.5},
+                              'Switches': {}, 'Properties': {'BasePropertyOverrides': {'BlendMode': 'EBlendMode::BLEND_Masked'}}}}
+        dl = SP.decode(lne, 'MI_LNE000')
+        check("the outline shell's instance (ChrToonlineColor2, no Color1) "
+              'decodes to its own kind: a Lambert Halcyon Shader in the line '
+              'colour at Opacity 0, Alpha Mode Clip, casting no shadow',
+              SP.is_outline(lne) and not SP.is_outline(mi())
+              and dl['kind'] == 'outline' and dl['props'] == {'model': 'LAMBERT'}
+              and dl['inputs']['Opacity'] == 0.0
+              and dl['inputs']['Diffuse Color'] == (0.0, 0.0, 0.0, 1.0)
+              and dl['flags'] == {'alpha_mode': 'CLIP', 'alpha_clip': 0.5, 'cast_shadow': False}
+              and dl['textures'] == {}
+              and any('inverted hull' in n and 'Opacity 0' in n for n in dl['notes']),
+              str(dl))
+        gl = SP.build_graph(dl, {})
+        ln = gl['nodes']
+        check("...its graph is the Halcyon Shader with every socket of the "
+              'class, Opacity 0, into the output',
+              set(ln) == {'shader', 'out'}
+              and ln['shader']['bl_idname'] == 'HALCYON_ShaderNode'
+              and len(ln['shader']['inputs']) == len(
+                  __import__('halcyon.nodes.shader_nodes', fromlist=['x'])
+                  .HALCYON_ShaderNode.SOCKETS)
+              and [s for s in ln['shader']['inputs'] if s['name'] == 'Opacity'][0]['default'] == 0.0
+              and ln['out']['inputs'][0]['link'] == ['shader', 0])
+        check('the shell carries the flags onto a material (the dataclass '
+              'here, mat.halcyon in Blender); a surface decode carries none',
+              (lambda m: (SP.apply_flags(m, dl), m.alpha_mode == 'CLIP'
+                          and m.alpha_clip == 0.5 and m.cast_shadow is False)[1])(
+                  __import__('halcyon.core.scene', fromlist=['x']).Material(name='MI_LNE000'))
+              and dec['flags'] == {} and dec['kind'] == 'surface')
+        g = SP.build_graph(dmouth, {'game': 'sheet', 'ramp': 'strip', 'color': 'mouth'})
+        nodes = g['nodes']
+        anime = nodes['anime']
+        links = {s['name']: s['link'] for s in anime['inputs'] if s.get('link')}
+        check('the graph: the strip x (1 - floor) + floor into Shadow Ramp, '
+              'the sheet into Game Texture (linear), the colour texture x '
+              'Color2 into Diffuse, the strip a colour texture',
+              links['Shadow Ramp'] == ['floor', 0]
+              and nodes['floor']['props']['blend_type'] == 'ADD'
+              and nodes['floor']['inputs'][1]['link'] == ['span', 0]
+              and nodes['span']['props']['blend_type'] == 'MULTIPLY'
+              and nodes['span']['inputs'][1]['link'] == ['tone', 0]
+              and abs(nodes['span']['inputs'][2]['default'][1]
+                      - (1 - 0.2)) < 1e-6
+              and links['Game Texture'] == ['mask', 0]
+              and links['Diffuse Color'] == ['c2', 0]
+              and nodes['c2']['inputs'][1]['link'] == ['ctex', 0]
+              and abs(nodes['c2']['inputs'][2]['default'][0] - 1.15) < 1e-6
+              and nodes['tone']['props']['image'] == 'strip'
+              and nodes['tone']['props']['colorspace'] == 'sRGB'
+              and nodes['mask']['props']['colorspace'] == 'Non-Color'
+              and 'vcol' not in nodes,
+              str(links))
+        gplain = SP.build_graph(dec, {'game': 'sheet', 'ramp': 'strip'})
+        check('a flat instance carries Color1 x Color2 in the socket itself',
+              not any(s.get('link') for s in gplain['nodes']['anime']['inputs']
+                      if s['name'] == 'Diffuse Color')
+              and abs(gplain['nodes']['anime']['inputs'][0]['default'][1]
+                      - 0.641) < 2e-3)
+        check("the node carries the mode and every socket of the class",
+              anime['props']['compat'] == 'SPARKING'
+              and len(anime['inputs']) == len(
+                  __import__('halcyon.nodes.shader_nodes', fromlist=['x'])
+                  .HALCYON_AnimeShaderNode.SOCKETS))
+        g0 = SP.build_graph(SP.decode(mi(C__GradientAdjust1=color(0, 0, 0))),
+                            {'ramp': 'strip'})
+        check('a zero floor links the strip straight in; a missing image '
+              'leaves the socket unlinked',
+              {s['name']: s['link'] for s in g0['nodes']['anime']['inputs']
+               if s.get('link')} == {'Shadow Ramp': ['tone', 0]})
+        ge = SP.build_graph(d3, {'eye': 'eyesheet'})
+        en = ge['nodes']
+        elinks = {s['name']: s['link'] for s in en['anime']['inputs'] if s.get('link')}
+        check('the eye graph: Separate Color on the sheet, EyeColor by its '
+              'red, white by its blue, the sclera (EyeColor2) outside the '
+              "disc the alpha marks -- and the eye stays opaque",
+              en['eyech']['bl_idname'] == 'ShaderNodeSeparateColor'
+              and en['iris']['inputs'][0]['link'] == ['eyech', 0]
+              and en['eyehl']['inputs'][0]['link'] == ['eyech', 2]
+              and en['eyemix']['inputs'][0]['link'] == ['eye', 1]
+              and en['eyemix']['inputs'][1]['default'] == [1.0, 1.0, 1.0, 1.0]
+              and en['eyemix']['inputs'][2]['link'] == ['eyehl', 0]
+              and elinks['Diffuse Color'] == ['eyemix', 0]
+              and 'Opacity' not in elinks, str(elinks))
+
+        # ---- the graph renders headless as it is
+        from ..core import render as R
+        from ..core.scene import ImageBuffer, Light, Material
+        from .scenebuild import demo_scene
+        from .test_render import base_settings
+        st = base_settings(64, 48)
+        st.transparency = 'NONE'
+        sc = demo_scene(st, with_texture=False)
+        sc.lights = [Light(type='SUN', name='K', direction=(-0.5, 0.3, -0.8),
+                           energy=2.5, shadow='NONE')]
+        sheet = np.ones((8, 8, 4), np.float32)
+        sheet[2:4, :, :3] = 0.5
+        mouth = np.ones((8, 8, 4), np.float32) * 0.5
+        mouth[..., 3] = 1.0
+        sc.images = {'sheet': ImageBuffer(name='sheet', pixels=sheet),
+                     'strip': ImageBuffer(name='strip', pixels=px, colorspace='Non-Color'),
+                     'mouth': ImageBuffer(name='mouth', pixels=mouth)}
+        sc.materials[1] = Material(name='SKN000', index=1, graph=g)
+        img = np.asarray(R.render(sc, st))
+        check('the imported graph renders headless, finite and shaded',
+              np.isfinite(img).all() and float(img[..., :3].std()) > 0.02)
+
+        # ---- the Blender side: the same graph rebuilt node for node
+        socks, specs = _shader_socket_table()
+        fm = _fake_material(socks, specs)
+
+        class _Img:
+            def __init__(self, name):
+                self.name = name
+                self.name_full = name
+                self.colorspace_settings = types.SimpleNamespace(name='sRGB')
+                self.source = 'FILE'
+                self.has_data = True
+                self.size = (16, 256)
+                self.pixels = types.SimpleNamespace(
+                    foreach_get=lambda buf: buf.__setitem__(
+                        slice(None), px.ravel()))
+
+        imgs = {'sheet': _Img('sheet'), 'strip': _Img('strip'),
+                'mouth': _Img('mouth')}
+        shader = SP.graph_to_tree(fm, g, imgs)
+        made = {n.bl_idname: n for n in fm.node_tree.nodes}
+        wired = [(a.node.name, a.name, b.node.name, b.name)
+                 for a, b in fm.node_tree.links]
+        check('graph_to_tree makes every node of the graph, named as the '
+              'graph names them',
+              shader is not None and shader.bl_idname == 'HALCYON_AnimeShaderNode'
+              and {n.name for n in fm.node_tree.nodes} == set(nodes),
+              str(sorted(n.name for n in fm.node_tree.nodes)))
+        check('...sets the images, the sheet as Non-Color data and the strip '
+              'as colour, the mode and the socket values',
+              made['ShaderNodeTexImage'] is not None
+              and imgs['strip'].colorspace_settings.name == 'sRGB'
+              and imgs['sheet'].colorspace_settings.name == 'Non-Color'
+              and shader.compat == 'SPARKING'
+              and shader.inputs['Shadow Bias'].default_value == 0.0
+              and made['ShaderNodeMixRGB'] is not None)
+        check('...and wires the links: strip -> span -> floor -> Shadow Ramp, '
+              'sheet -> Game Texture, ctex -> c2 -> Diffuse Color, out',
+              ('tone', 'Color', 'span', 'Color1') in wired
+              and ('span', 'Color', 'floor', 'Color1') in wired
+              and ('floor', 'Color', 'anime', 'Shadow Ramp') in wired
+              and ('mask', 'Color', 'anime', 'Game Texture') in wired
+              and ('ctex', 'Color', 'c2', 'Color1') in wired
+              and ('c2', 'Color', 'anime', 'Diffuse Color') in wired
+              and ('anime', 'Surface', 'out', 'Surface') in wired,
+              str(wired))
+
+        # ---- import_material end to end, on the fake data
+        class _Mats(dict):
+            def new(self, name):
+                m = _fake_material(socks, specs)
+                m.name = name
+                self[name] = m
+                return m
+
+        mats = _Mats()
+        loaded = []
+
+        def loader(path, colorspace):
+            loaded.append((os.path.basename(path), colorspace))
+            im = _Img(os.path.basename(path))
+            im.colorspace_settings.name = colorspace
+            return im
+
+        mat, dec_i, notes = SP.import_material(jpath, True, loader, mats)
+        check('import_material builds the material named after the JSON, '
+              'loads the sheet as data and the strip as colour, and '
+              'decodes the strip into the sliders',
+              mat.name == 'MI_0001_SKN000' and mat in mats.values()
+              and ('T_0001_SKN_00.png', 'Non-Color') in loaded
+              and ('T_ToneX.png', 'sRGB') in loaded
+              and not any(n[0].startswith('Mouth_00') for n in loaded)
+              and dec_i['props']['tones'] == 'THREE'
+              and abs(dec_i['inputs']['Shadow 1 Threshold'] - (1 - 49 / 256)) < 1e-6,
+              f'{mat.name} {loaded} {dec_i["props"]}')
+        jmiss = os.path.join(mdir, 'MI_0001_MISSING.json')
+        json.dump(mi(T__Mask1='/Game/SS/Characters/0001/1p/Textures/T_NOPE.T_NOPE'),
+                  open(jmiss, 'w'))
+        _m, _d, notes_m = SP.import_material(jmiss, True, loader, mats)
+        check('a texture the export lacks is reported by name, the flat '
+              'value standing in',
+              any('T_NOPE not found beside the JSON' in n for n in notes_m)
+              and not any('not found' in n for n in notes), str(notes_m))
+        pre = _Mats()
+        pre.new('MI_0001_SKN000')
+        existing = pre['MI_0001_SKN000']
+        mat2, _d, _n = SP.import_material(jpath, True, loader, pre)
+        check('Fill Existing rebuilds the slot the UEFormat importer named, '
+              'in place', mat2 is existing and len(pre) == 1)
+        mat3, _d, _n = SP.import_material(jpath, False, loader, pre)
+        check('...and off makes a fresh material', mat3 is not existing)
+
+        # ---- R247: the shared instances under Common, for the slots the
+        # pick did not cover (the field: MI_LNE000 left as the UEFormat
+        # importer made it -- a bare grey material -- drew the shell white)
+        common = os.path.join(root, 'SS', 'Characters', 'Common', 'Materials', 'BaseMI')
+        os.makedirs(common)
+        jlne = os.path.join(common, 'MI_LNE000.json')
+        json.dump(lne, open(jlne, 'w'))
+        check('find_instance_json walks up to the Characters tree and finds '
+              'the shared instance under Common/Materials; a name the '
+              'export lacks is None',
+              SP.find_instance_json('MI_LNE000', jpath) == jlne
+              and SP.find_instance_json('MI_NOPE', jpath) is None
+              and SP.find_instance_json('MI_LNE000', None) is None)
+        slots = _Mats()
+        for n in ('MI_0001_SKN000', 'MI_LNE000', 'MI_SWT000', 'Body', 'MI_0001_EYE000'):
+            slots.new(n)
+        owed = SP.shared_slots(slots.values(), {'MI_0001_SKN000'}, jpath)
+        check('shared_slots names every MI_ slot without a Halcyon tree that '
+              'the pick left: the shell with its Common .json, an outline '
+              'by name even without one; a slot with no .json anywhere and '
+              'a non-MI material are left alone',
+              sorted(owed) == [('MI_LNE000', jlne)]
+              or sorted(owed) == sorted([('MI_LNE000', jlne)]),
+              str(owed))
+        os.remove(jlne)
+        owed2 = SP.shared_slots(slots.values(), {'MI_0001_SKN000'}, jpath)
+        check('...an export without MI_LNE000.json still owes the shell, '
+              'from its name',
+              owed2 == [('MI_LNE000', None)], str(owed2))
+        ml, dl2, nl = SP.import_material(None, True, loader, slots, name='MI_LNE000')
+        check('import_material builds the shell from the name alone and '
+              'says the .json was not in the export; the flags land on '
+              'mat.halcyon',
+              ml is slots['MI_LNE000'] and dl2['kind'] == 'outline'
+              and any('not in the export' in n for n in nl)
+              and getattr(ml.halcyon, 'alpha_mode', None) == 'CLIP'
+              and getattr(ml.halcyon, 'cast_shadow', None) is False
+              and getattr(ml.halcyon, 'use_override', None) is False
+              and {n.bl_idname for n in ml.node_tree.nodes}
+              == {'HALCYON_ShaderNode', 'ShaderNodeOutputMaterial'},
+              str(nl))
+        check('...and a filled slot has a Halcyon tree, an empty one has not; '
+              "a pick that left the character's own slot owes it too (its "
+              '.json is under the same tree); the built shell is owed AGAIN '
+              '(a shared instance is always rebuilt -- the field kept an '
+              "older reading's grey shell through a re-import)",
+              SP.has_halcyon_tree(ml) and not SP.has_halcyon_tree(slots['MI_SWT000'])
+              and sorted(SP.shared_slots(slots.values(), set(), jpath))
+              == [('MI_0001_SKN000', jpath), ('MI_LNE000', None)],
+              str(SP.shared_slots(slots.values(), set(), jpath)))
+        # the stamp: this importer's builds carry the version; a slot an
+        # older version built is owed, one this version built is not,
+        # and a tree the user made (no stamp) is left alone
+        from ..version import VERSION as _V
+        here = '.'.join(str(v) for v in _V)
+        check('every import stamps the material with the version that '
+              'built it',
+              SP.built_by(ml) == here and SP.built_by(mat) == here
+              and SP.built_by(slots['MI_SWT000']) == '')
+        mine = slots.new('MI_0001_EYE000')          # the user's own tree
+        mine.node_tree.nodes.new('HALCYON_AnimeShaderNode')
+        stale = slots.new('MI_0001_BTS000')
+        stale.node_tree.nodes.new('HALCYON_AnimeShaderNode')
+        SP.stamp_built(stale, '1.87.0')
+        json.dump(mi(), open(os.path.join(mdir, 'MI_0001_EYE000.json'), 'w'))
+        json.dump(mi(), open(os.path.join(mdir, 'MI_0001_BTS000.json'), 'w'))
+        owed3 = sorted(n for n, _p in SP.shared_slots(slots.values(), {'MI_0001_SKN000'}, jpath, here))
+        check("slot_is_owed: a stale build (another version's stamp) and the "
+              'shared instance are rebuilt; a tree the user built and a '
+              "slot this version built are left alone",
+              owed3 == ['MI_0001_BTS000', 'MI_LNE000']
+              and not SP.slot_is_owed(mine, here) and SP.slot_is_owed(stale, here)
+              and SP.slot_is_owed(ml, here) and not SP.slot_is_owed(mat, here),
+              str(owed3))
+        try:
+            SP.import_material(None, True, loader, slots, name='MI_SWT000')
+            ok = False
+        except ValueError as exc:
+            ok = 'no .json' in str(exc)
+        check('a non-outline name without a .json is refused by name', ok)
+
+        # ---- the shell in a frame: coincident with the body, wound the
+        # other way, it draws nothing on either device (the punch-through
+        # keeps no fragment), the body's own shading untouched
+        from ..core import raster as CR
+        from ..gpu import shade as GSH
+        st2 = base_settings(64, 48)
+        st2.transparency = 'SORTED'
+        st2.shadows = False
+        sc2 = demo_scene(st2, with_texture=False)
+        sc2.lights = [Light(type='SUN', name='K', direction=(-0.5, 0.3, -0.8),
+                            energy=2.5, shadow='NONE')]
+        sc2.images = dict(sc.images)
+        sc2.materials[1] = Material(name='SKN000', index=1, graph=g)
+        ref = np.asarray(R.render(sc2, st2))[..., :3].copy()
+        # the hull: every triangle of material 1 again, wound the other way
+        m1 = np.nonzero(sc2.mesh.mat_index == 1)[0]
+        hull = sc2.mesh.tris[m1][:, ::-1]
+        mesh = sc2.mesh
+        mesh.tris = np.concatenate([mesh.tris, hull]).astype(np.int32)
+        mesh.mat_index = np.concatenate([mesh.mat_index, np.full(len(hull), len(sc2.materials), np.int32)])
+        mesh.obj_index = np.concatenate([mesh.obj_index, mesh.obj_index[m1]])
+        mesh.face_normals = np.concatenate([mesh.face_normals, -mesh.face_normals[m1]])
+        mesh.smooth = np.concatenate([mesh.smooth, mesh.smooth[m1]])
+        if getattr(mesh, 'ink_tri_mask', None) is not None:
+            mesh.ink_tri_mask = np.concatenate([mesh.ink_tri_mask, mesh.ink_tri_mask[m1]])
+        shell = Material(name='MI_LNE000', index=len(sc2.materials), graph=gl)
+        SP.apply_flags(shell, dl)
+        shell.has_alpha = True
+        shell.alpha_why = 'Opacity 0.000'
+        sc2.materials.append(shell)
+        got = np.asarray(R.render(sc2, st2))[..., :3]
+        from ..core.scene import material_is_absent
+        check('the shell draws nothing: the frame with the coincident hull '
+              'is the frame without it, bit for bit -- the material is '
+              'ABSENT (Clip at a constant alpha below the threshold), in '
+              'neither raster pass',
+              np.array_equal(got, ref) and material_is_absent(shell)
+              and R.LAST_SPLIT.get('tris_volume') == len(hull)
+              and 'no surface' in str(R.LAST_SPLIT.get('reasons', {}).get('MI_LNE000')),
+              f'diff {float(np.abs(got - ref).max())} split {R.LAST_SPLIT}')
+        # ...and under every transparency mode: with None or Screen Door
+        # the clip stage never runs, and a coincident shell z-fought the
+        # body into black speckles there before the absence law
+        same = {}
+        for mode in ('NONE', 'STIPPLE', 'ABUFFER'):
+            st2.transparency = mode
+            sc2.materials.pop()
+            mesh.tris = mesh.tris[:-len(hull)]
+            mesh.mat_index = mesh.mat_index[:-len(hull)]
+            mesh.obj_index = mesh.obj_index[:-len(hull)]
+            mesh.face_normals = mesh.face_normals[:-len(hull)]
+            mesh.smooth = mesh.smooth[:-len(hull)]
+            if getattr(mesh, 'ink_tri_mask', None) is not None:
+                mesh.ink_tri_mask = mesh.ink_tri_mask[:-len(hull)]
+            ref_m = np.asarray(R.render(sc2, st2))[..., :3].copy()
+            mesh.tris = np.concatenate([mesh.tris, hull]).astype(np.int32)
+            mesh.mat_index = np.concatenate([mesh.mat_index, np.full(len(hull), len(sc2.materials), np.int32)])
+            mesh.obj_index = np.concatenate([mesh.obj_index, mesh.obj_index[m1]])
+            mesh.face_normals = np.concatenate([mesh.face_normals, -mesh.face_normals[m1]])
+            mesh.smooth = np.concatenate([mesh.smooth, mesh.smooth[m1]])
+            if getattr(mesh, 'ink_tri_mask', None) is not None:
+                mesh.ink_tri_mask = np.concatenate([mesh.ink_tri_mask, mesh.ink_tri_mask[m1]])
+            sc2.materials.append(shell)
+            got_m = np.asarray(R.render(sc2, st2))[..., :3]
+            same[mode] = bool(np.array_equal(got_m, ref_m))
+        st2.transparency = 'SORTED'
+        check('...and the same under Transparency None, Screen Door and '
+              'A-Buffer: absent everywhere, bit for bit',
+              all(same.values()), str(same))
+        check('a Clip material whose alpha is linked, or above the threshold, '
+              'or a Blend material, is not absent',
+              not material_is_absent(Material(name='b', graph=gl))
+              and not material_is_absent(Material(name='c', graph=None, alpha_mode='CLIP', opacity=0.7))
+              and material_is_absent(Material(name='d', graph=None, alpha_mode='CLIP', opacity=0.2))
+              and not material_is_absent(sc2.materials[1]))
+        w2, h2 = 64, 48
+        view, _p, vp, eye = R.camera_matrices(sc2.camera, w2, h2)
+        opaque, _t = R._split_by_alpha(sc2, mesh, st2)
+        gb = CR.GBuffer(w2, h2)
+        CR.rasterize(mesh.verts, mesh.tris, vp, w2, h2, gbuf=gb, subset=opaque)
+        job = R.ShadeJob(sc2, st2, R.prepare_textures(sc2, st2), None, view, eye, w2, h2)
+        GSH._PLAN_CACHE.clear()
+        passes, why, atl = GSH.plan_frame(job, gb)
+        cov = gb.tri >= 0
+        if passes is not None:
+            sim, _hit = GSH.simulate(job, gb, passes, atl)
+            perr = float(np.abs(np.asarray(sim)[cov][:, :3] - got[cov]).max())
+        else:
+            perr = 1.0
+        check('...and the GPU plans the frame with the shell material in '
+              'the scene, its twin matching the CPU',
+              passes is not None and perr < 6e-3, f'{why} {perr}')
+
+    # ---- the operator and the menu
+    check('the importer registers as an operator with the file browser '
+          'and lives in the module list',
+          SP.HALCYON_OT_import_sparking.bl_idname == 'halcyon.import_sparking'
+          and 'Sparking' in SP.HALCYON_OT_import_sparking.bl_label)
+    import halcyon as H
+    mods = H._import_modules()
+    check('halcyon registers the sparking module',
+          any(getattr(m, '__name__', '') == 'halcyon.sparking' for m in mods))
+    ann = SP.HALCYON_OT_import_sparking.__annotations__
+    check('the operator\'s option carries a real tooltip',
+          len(ann['fill_existing'].kw.get('description', '')) > 40)

@@ -20,6 +20,7 @@ import numpy as np
 from . import dither as DI
 from . import mathx as M
 from . import palette as PA
+from . import palette_era as PE
 
 DEPTH_BITS = {
     '32': (8, 8, 8), '24': (8, 8, 8), '16': (5, 6, 5), '15': (5, 5, 5),
@@ -295,7 +296,7 @@ def display_transform(rgb, st):
 # ------------------------------------------------------------ colour depth
 
 
-def _palette_for(st, size, rgb, seed, mode=None):
+def _palette_for_raw(st, size, rgb, seed, mode=None):
     """The palette for this frame, reused across frames when locked.
 
     An adaptive palette recomputed every frame does not merely cost time: median
@@ -319,11 +320,21 @@ def _palette_for(st, size, rgb, seed, mode=None):
                                     st.palette_method, seed))
 
 
+def _palette_for(st, size, rgb, seed, mode=None):
+    """R251: every palette road sees the registers snapped to the machine's DAC (palette_era.snap_registers)."""
+    return PE.snap_registers(_palette_for_raw(st, size, rgb, seed, mode), st)
+
+
 def reduce_depth(rgb, st, seed=0):
     """Framebuffer quantisation: bit depth, palette and dither together."""
     depth = str(st.color_depth)
     kind = st.dither
     strength = float(st.dither_strength)
+
+    # R251: the era colour roads own the stage when selected (palette_era)
+    era = PE.reduce_depth_era(rgb, st, seed)
+    if era is not None:
+        return era
 
     if depth in ('HAM6', 'HAM8'):
         bits = 8 if depth == 'HAM8' else 6
@@ -357,7 +368,7 @@ def reduce_depth(rgb, st, seed=0):
                 size = min(size, 256)
             pal = _palette_for(st, size, rgb, seed)
             if kind == 'NONE':
-                icm = PA.InverseColormap(pal)
+                icm = PA.get_inverse_colormap(pal)   # R251: cached, bitwise the fresh one
                 idx = icm.lookup(rgb.reshape(-1, 3))
                 return pal[idx].reshape(rgb.shape).astype(np.float32)
             return DI.apply_dither(rgb, pal, kind, strength, st.dither_serpentine,
@@ -681,7 +692,17 @@ def apply_pixel_aspect(rgb, st):
 
 
 def upscale(rgb, st):
-    n = {'NONE': 1, '2X': 2, '3X': 3, '4X': 4}.get(str(st.output_scale), 1)
+    # R251 post-signal: the two machine resamplers, after the final
+    # readback on both roads. The 3DO lattice quantises to the frame's
+    # depth, so a data pass (DEPTH, NORMAL...) takes nearest 2x instead;
+    # the GBA stretch is pure indexing and runs on any pass
+    if str(st.output_scale) == 'THREEDO_2X' and str(getattr(st, 'debug_pass', 'BEAUTY')) == 'BEAUTY':
+        from . import signal_era as SIG
+        return SIG.threedo_2x(rgb, st)
+    if str(st.output_scale) == 'GBA_MODE5':
+        from . import signal_era as SIG
+        return SIG.gba_stretch(rgb, st)
+    n = {'NONE': 1, '2X': 2, '3X': 3, '4X': 4, 'THREEDO_2X': 2}.get(str(st.output_scale), 1)   # a debug pass takes nearest 2x (review 2-2)
     if n <= 1:
         return rgb
     out = np.repeat(np.repeat(rgb, n, axis=0), n, axis=1)
@@ -694,8 +715,13 @@ def upscale(rgb, st):
 # ------------------------------------------------------------------ the chain
 
 
-def _gpu_stage(name, rgb, st):
+def _gpu_stage(name, rgb, st, **extra):
     """Ask the GPU chain for a stage. None means the CPU one runs.
+
+    R250: `rgb` is a gpu/chain.Frame on the resident road (the picture
+    on the GPU, drawn stage to stage without a readback); the chain's
+    functions take either. `extra` carries the frame number and seed
+    the film stages read.
 
     The gate is DEVICE first: the CPU/GPU switch must mean what it says.
     The original condition was `device != GPU AND not gpu_post` -- with
@@ -728,10 +754,67 @@ def _gpu_stage(name, rgb, st):
         # the GPU crossings live at the device boundary (gpu/device.py):
         # the stage's own arithmetic stays here, its driver calls cross
         # as millisecond bursts
-        return fn(rgb, st)
+        return fn(rgb, st, **extra)
     except Exception as exc:                                    # noqa: BLE001
         print(f'[Halcyon GPU] {name} on the CPU: {exc}')
         return None
+
+
+def _gpu_road(st):
+    """The post chain's device truth: the GPU device, GPU post on, and
+    a frame whose shading engaged the GPU."""
+    return str(getattr(st, 'render_device', 'CPU')).upper() == 'GPU' and \
+        bool(getattr(st, 'gpu_post', False)) and \
+        bool(getattr(st, '_frame_gpu_shaded', False))
+
+
+_POST_WARNED = set()
+
+
+def _post_warn(msg):
+    if msg not in _POST_WARNED:
+        _POST_WARNED.add(msg)
+        print(f'[Halcyon GPU] {msg}')
+
+
+#: R250: what the last post chain did on the GPU road, for the console
+#: and the field test
+LAST_CHAIN = {}
+
+
+def _open_frame(st, rgb):
+    """The chain's Frame on the GPU road: the render's own resident
+    target when it is still up at this size (no upload), else a Frame
+    that uploads once when the first GPU stage asks. None on the CPU
+    road."""
+    if not _gpu_road(st):
+        return None
+    try:
+        from ..gpu import chain, frame as FR
+    except Exception:                                           # noqa: BLE001
+        return None
+    fr = chain.Frame(rgb=rgb)
+    res = FR.current(st)
+    if res is not None:
+        if (res.width, res.height) == (rgb.shape[1], rgb.shape[0]):
+            # ownership of the target moves to the chain
+            fr.target = res.target
+            fr.resident = True
+            res.target = None
+            try:
+                st._gpu_frame = None
+            except Exception:                                   # noqa: BLE001
+                pass
+        else:
+            _post_warn(f'post: the resident frame is {res.width}x'
+                       f'{res.height}, the post chain runs at '
+                       f'{rgb.shape[1]}x{rgb.shape[0]}; uploaded once')
+            FR.release(st)
+    else:
+        _post_warn('post: the frame was not kept on the GPU ('
+                   + (str(FR.LAST.get('left_gpu')) if FR.LAST.get('left_gpu')
+                      else 'a held or stitched frame') + '); uploaded once')
+    return fr
 
 
 def fit_to(rgb, size):
@@ -748,7 +831,8 @@ def fit_to(rgb, size):
 
 def process(image, st, frame=0, seed=0, target_size=None, allow_resize=True,
             depth=None, shaft_sources=None, flare_sources=None,
-            stamp_info=None, key_frame=None, fps=24.0):
+            stamp_info=None, key_frame=None, fps=24.0,
+            cvg=None, coverage=None, gel=None):
     """Linear RGBA framebuffer -> final display-referred RGBA.
 
     Row order is preserved; row 0 stays the bottom of the picture.
@@ -780,30 +864,227 @@ def process(image, st, frame=0, seed=0, target_size=None, allow_resize=True,
         return rgb.astype(np.float32)
 
     _WM_TEXT = str(getattr(st, 'watermark', '') or '')
-
-    rgb = depth_of_field(rgb, depth, st)
-    rgb = light_shafts(rgb, st, shaft_sources)
-    rgb = glow(rgb, st)
-    rgb = star_filter(rgb, st)
-    rgb = lens_flare(rgb, st)
-    rgb = lamp_flares(rgb, st, flare_sources)
-    # R230: the cel photographed -- stock, optics, gate, dust, grain,
-    # flicker -- on the linear frame, before the display encode
     from . import film as FILM
-    rgb = FILM.process_linear(rgb, st, frame, seed, key_frame=key_frame,
-                              fps=fps)
-    gpu_out = _gpu_stage('display', rgb, st)
-    rgb = gpu_out if gpu_out is not None else display_transform(rgb, st)
+    from . import signal_era as SIG      # R251: the post-signal pack's stages
+    from . import n64vi as N64VI         # R251 C001: the N64 VI coverage filter (raster pack)
+    # R251 C001: the coverage plane the VI stage reads (a shape that is
+    # not the frame's means a resize upstream: skipped by name)
+    st._n64_cvg = N64VI.plane_for_frame(cvg, rgb.shape[:2], st, _post_warn)
+    from . import signal_tape as SIGT    # R251 SIG-2: chroma siting, tape, cable, PAL receiver
+    from . import signal_codec as SC     # R251: the codecs and the optical printer
+
+    # R250: on the GPU road the picture rides a gpu/chain.Frame -- the
+    # render's own resident target when it is still up, else one upload
+    # -- and is drawn stage to stage; a CPU-only stage that is ACTIVE
+    # reads it back by name (the stage runs on the array, the next GPU
+    # stage uploads again), an inactive one costs nothing. One final
+    # readback. The CPU road is this function exactly as it was
+    fr = _open_frame(st, rgb)
+    stages_gpu = []
+    # R251 (C092): the coverage plane Super Black floors by -- the
+    # explicit kwarg first, the render's private second (one of them
+    # wins, never a blend); a plane of another size is no plane. The
+    # fallbacks are named: a transparent film's alpha IS the coverage
+    # law; an opaque film with no plane skips the stage, in words
+    cov = None
+    if bool(getattr(st, 'super_black', False)) and \
+            int(getattr(st, 'super_black_threshold', 15)) > 0:
+        cov = coverage if coverage is not None \
+            else getattr(st, '_last_coverage', None)
+        if cov is not None and tuple(np.shape(cov)) != tuple(rgb.shape[:2]):
+            cov = None
+        if cov is None:
+            if bool(getattr(st, 'film_transparent', False)) \
+                    and alpha is not None:
+                cov = alpha[..., 0] > 0.0
+            elif bool(getattr(st, 'use_processes', False)):
+                _post_warn('super black: skipped -- the process pool '
+                           'returns pixels only (no coverage plane); '
+                           'render in-process or use Film Transparent')
+            else:
+                _post_warn('super black: skipped -- this caller passed no '
+                           'coverage plane and the film is opaque')
+        if fr is not None:
+            fr.coverage = cov
+
+    def _cpu(stage, active, fn, *a, **k):
+        nonlocal rgb
+        if not active:
+            return
+        if fr is not None and fr.on_gpu:
+            rgb = fr.down(stage, 'runs on the CPU')
+        rgb = fn(rgb, *a, **k)
+        if fr is not None:
+            fr.rgb = rgb
+
+    def _gpu(name, cpu_fn, *a, **k):
+        nonlocal rgb
+        if fr is not None:
+            got = _gpu_stage(name, fr, st, frame_no=frame, seed=seed, **k)
+            if got is not None:
+                stages_gpu.append(name)
+                if not fr.on_gpu:
+                    # R251: the stage read the frame back itself (the
+                    # CRTC keeps its output for the next frame); the
+                    # array the next CPU stage reads is the chain's
+                    rgb = fr.rgb
+                return
+            if fr.on_gpu:
+                rgb = fr.down(name, 'refused by name (the console says why)')
+            else:
+                rgb = fr.rgb   # R251: a chain function may have read the frame back for its own tables; fr.rgb is current whenever the target is None
+        rgb = cpu_fn(rgb, *a, **k)
+        if fr is not None:
+            fr.rgb = rgb
+
+    _cpu('depth of field', bool(st.dof) and depth is not None
+         and str(getattr(st, 'dof_method', 'POST')) == 'POST',
+         depth_of_field, depth, st)
+    _cpu('light shafts', bool(shaft_sources), light_shafts, st, shaft_sources)
+    _cpu('glow', bool(st.glow) and float(st.glow_intensity) > 0, glow, st)
+    _cpu('star filter', bool(st.star_filter) and float(st.star_intensity) > 0,
+         star_filter, st)
+    _cpu('lens flare', bool(st.lens_flare) and float(st.flare_intensity) > 0,
+         lens_flare, st)
+    _cpu('lamp flares', bool(flare_sources), lamp_flares, st, flare_sources)
+    # R251 C134: the optical printer's backlit mattes, summed on the
+    # linear negative before the film stages. `gel` rides as a KEYWORD
+    # so the closure hands it to chain.matte_glow too; with no gel
+    # plane the stage is a named no-op and the frame stays where it is
+    if SC.matte_glow_on(st) and SC.matte_glow_ready(st, gel, rgb.shape):
+        _gpu('matte_glow', SC.matte_glow, st, gel=gel)
+    # R230: the cel photographed -- stock, optics, gate, dust, grain,
+    # flicker -- on the linear frame, before the display encode.
+    # R250: the grain and the flicker draw on the GPU when they are all
+    # the CPU would run; any other film stage keeps the whole film on
+    # the CPU by name
+    if FILM.film_on(st):
+        _film_why = None
+        if fr is not None:
+            from ..gpu import chain as _chain
+            _film_why = _chain.film_refusal(st, rgb.shape[0])
+        if fr is not None and _film_why is None:
+            _gpu('film', FILM.process_linear, st, frame, seed,
+                 key_frame=key_frame, fps=fps)
+        else:
+            _cpu('film' if _film_why is None else f'film ({_film_why})',
+                 True, FILM.process_linear, st, frame, seed,
+                 key_frame=key_frame, fps=fps)
+    # R251 (field v4, C061 ATARI_ST / AMIGA_OCS): an error-diffusion
+    # dither is SEQUENTIAL -- every pixel's quantisation error is carried
+    # into the pixels after it (core/dither.py KERNELS: FLOYD, JJN,
+    # STUCKI, ATKINSON, BURKES, SIERRA, SIERRA_LITE) -- and the driver's
+    # DISPLAY is exact only to 1e-5 (its pow), so the last bits of the
+    # gamma decided whole palette entries over 42% of a 720p frame. When
+    # the colour depth stage is going to read back for such a kernel, the
+    # display transform runs on the CPU BY NAME. That removes ONE source
+    # and is NOT a cure: with this routing active the driver runs of
+    # 2026-10-05 still measured 351,922 / 67,372 / 354,017 differing
+    # pixels of 921,600 on three FLOYD presets (289,708 / 364,620 / 312,123
+    # over the CPU's raster), and 0 to 5 on the same presets without the
+    # dither -- the diffusion amplifies the GPU shading's and the GPU
+    # rasteriser's last bits too. Whether such a frame should render on the
+    # CPU by
+    # name is an open decision; until then the line below says what is
+    # true. The ordered kinds and NOISE quantise per pixel (no carry)
+    # and keep DISPLAY on the GPU; with no dither nothing here engages
+    _ed_kind = str(getattr(st, 'dither', 'NONE'))
+    _ed_why = None
+    if fr is not None and _ed_kind in DI.KERNELS:
+        from ..gpu import chain as _chain
+        if _chain.quant_refusal(st) is not None:
+            _ed_why = (f'display (the {_ed_kind} error-diffusion dither '
+                       "follows: the driver's gamma ulps would cascade)")
+    if _ed_why is not None:
+        _post_warn(f'post: {_ed_why}: the display transform runs on the '
+                   'CPU. The dither pattern still differs from the CPU '
+                   "device's (it amplifies the GPU shading's last-bit "
+                   'differences; measured on the driver at 7 to 38 percent '
+                   "of a 720p frame): render on the CPU device for the CPU's "
+                   'exact pattern')
+        _cpu(_ed_why, True, display_transform, st)
+    else:
+        _gpu('display', display_transform, st)
+    # R251: the two video-out stages of the 3D Studio / Max shelf, on the
+    # display-referred frame before any dot screen, dither or palette
+    if str(getattr(st, 'video_color_check', 'NONE')) != 'NONE':
+        _gpu('legalise', PE.video_color_check, st)
+    if cov is not None:
+        _gpu('superblack', PE.super_black, cov, st)
     # R230: the print's dot screen, on the display-referred frame
-    rgb = FILM.halftone(rgb, st)
-    rgb = reduce_depth(rgb, st, seed)
-    gpu_out = _gpu_stage('ntsc', rgb, st)
-    rgb = gpu_out if gpu_out is not None else composite_ntsc(rgb, st, frame)
-    rgb = interlace(rgb, st, frame)
-    gpu_out = _gpu_stage('crt', rgb, st)
-    rgb = gpu_out if gpu_out is not None else crt(rgb, st)
-    rgb = lens_distortion(rgb, st)
-    rgb = jpeg_artifacts(rgb, st)
+    _cpu('halftone', float(getattr(st, 'film_halftone', 0.0)) > 0.0,
+         FILM.halftone, st)
+    # R251 block A: the digital video the display showed -- its chroma
+    # sampled at the format's rate and site (core/signal_tape.py)
+    if SIGT.chroma_site_on(st):
+        _gpu('chroma_site', SIGT.chroma_site, st)
+    # R251 block A: the digital video the display showed -- a file is
+    # decoded BEFORE the display quantises it (core/signal_codec.py)
+    if SC.mpeg1_on(st):
+        _gpu('mpeg1', SC.mpeg1_intra, st, frame)
+    if SC.smacker_on(st):
+        _gpu('smacker', SC.smacker, st, seed)
+    # R250: the bit depth without a dither is a GPU stage (the CPU's own
+    # level table); every dither and palette road reads back by name
+    if fr is not None:
+        from ..gpu import chain as _chain
+        _q_why = _chain.quant_refusal(st)
+    else:
+        _q_why = None
+    if fr is not None and _q_why is None:
+        _gpu('quant', reduce_depth, st, seed)
+    else:
+        _cpu('colour depth' + (f' ({_q_why})' if _q_why else ''), True,
+             reduce_depth, st, seed)
+    # R251 block B: the machine's scan-out, the tape, the cable
+    # (core/signal_era.py; the wave-2 lines land between these)
+    # R251 C001 (raster pack): the N64 VI's coverage blend and divot on
+    # the quantised framebuffer, before the VI's de-dither / gamma
+    if N64VI.vi_on(st):
+        _gpu('n64vi', N64VI.n64_vi, st)
+    if SIG.vi_filter_on(st):
+        _gpu('vi_filter', SIG.vi_filter, st, frame, seed)
+    if SIG.copy_filter_on(st):
+        _gpu('copy_filter', SIG.copy_filter, st)
+    if SIGT.xfb_on(st):                  # the EFB-to-XFB copy: filter first, then the 4:2:2 store
+        _gpu('chroma_site', SIGT.chroma_site, st)
+    if SIG.crtc_blend_on(st):
+        _gpu('crtc_blend', SIG.crtc_blend, st, frame)
+    if SIG.video_filter_on(st):
+        _gpu('video_filter', SIG.video_filter, st)
+    if SIGT.tape_on(st):                 # the analogue tape, before the cable
+        _gpu('tape', SIGT.tape_path, st, frame, seed)
+    if SIGT.cable_chroma_on(st):         # S-Video: the chroma-only cable
+        _gpu('cable_chroma', SIGT.svideo, st)
+    if bool(st.composite):
+        _gpu('ntsc', composite_ntsc, st, frame)
+    if SIGT.pal_decode_on(st):           # the PAL receiver, after the cable
+        _gpu('pal_decode', SIGT.pal_decode, st, frame)
+    if SIGT.cable_rf_on(st):             # the RF modulator over the composite signal
+        _gpu('cable_rf', SIGT.rf_modulate, st, frame, seed)
+    _cpu('interlace', str(st.interlace) != 'NONE', interlace, st, frame)
+    if bool(st.crt):
+        _gpu('crt', crt, st)
+    _cpu('lens distortion', abs(float(st.lens_distortion)) >= 1e-5
+         or abs(float(st.chromatic_aberration)) >= 1e-5, lens_distortion, st)
+    _cpu('jpeg', bool(st.jpeg_artifacts), jpeg_artifacts, st)
+    if fr is not None:
+        rgb = fr.finish()
+        LAST_CHAIN.clear()
+        LAST_CHAIN.update(resident=bool(fr.resident), stages=list(fr.stages),
+                          readbacks=list(fr.readbacks), uploads=int(fr.uploads),
+                          gpu_stages=list(stages_gpu))
+        fr.release()
+        if not getattr(st, '_viewport', False):
+            _rb = '; '.join(f'{s} ({w})' for s, w in fr.readbacks)
+            print('[Halcyon GPU] post: '
+                  + (f"resident chain {', '.join(fr.stages)}"
+                     if fr.stages else 'no GPU stage engaged')
+                  + (f'; frame {"inherited from the render" if fr.resident else "uploaded"}'
+                     if fr.stages or fr.uploads else '')
+                  + (f'; {len(fr.readbacks)} CPU readback(s): {_rb}'
+                     if fr.readbacks else '')
+                  + '; 1 final readback')
     if allow_resize:
         rgb = apply_pixel_aspect(rgb, st)
     rgb = upscale(rgb, st)

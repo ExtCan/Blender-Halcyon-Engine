@@ -298,6 +298,8 @@ def test_error_reporting():
 
 
 def main():
+    from . import utf8_console
+    utf8_console()
     for fn in list(globals().values()):
         if callable(fn) and getattr(fn, '__name__', '').startswith('test_'):
             try:

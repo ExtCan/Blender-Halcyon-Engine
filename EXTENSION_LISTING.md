@@ -19,11 +19,11 @@ the reflectance models the old packages actually shipped, real framebuffer
 quantisation, a genuine GLSL/HLSL compiler for coded-shader nodes, and a
 complete GPU port held to the CPU picture pixel for pixel. Python and NumPy
 only — nothing compiled — and the whole engine runs headless without Blender
-for its 5,000-check test suite.
+for its 9503-check test suite.
 
 **Three roads, one engine.**
 
-**The eras.** Ninety render presets, each what its target actually did:
+**The eras.** 112 render presets, each what its target actually did:
 Infini-D, Ray Dream, 3D Studio R4 and MAX, trueSpace, LightWave, Imagine,
 POV-Ray, Bryce, Softimage, Alias, RenderMan; VGA, EGA, CGA, the Mac 1-bit and
 8-bit palettes, Amiga OCS/AGA/HAM, Atari ST, PC-98, X68000; PlayStation,
@@ -55,7 +55,9 @@ rollouts, a shelf of thirty-five nodes — runs on Max's own algorithms, reimple
 UPA, Xerox-line, Saturday-morning, 90s feature, wartime noir and modern flat
 eras on a menu — and an Anime Shader with kage tones, the hair shine, the
 airbrush, a six-decade Style menu, and compatibility modes that decode real
-game texture conventions (ArcSys, Genshin, ZZZ). An ink pass drawn from the
+game texture conventions (ArcSys, Genshin, ZZZ, and Sparking! ZERO from the
+game's own material export, with an importer that builds a character's
+materials from its FModel .json). An ink pass drawn from the
 shared G-buffer: clean, brush and pencil lines that taper, roughen, drift,
 skip and boil, the inker's weight by the light, Arc System Works' vertex-colour
 line control. 2D media converters that turn the lit cel into hatching, pencil
@@ -69,15 +71,17 @@ frames held on twos and threes.
 
 ## What you get
 
-**32 shading models**, each implemented from its published formulation —
+**49 shading models**, each implemented from its published formulation —
 Lambert, Gouraud, Flat, Phong, Blinn-Phong, Blinn, Cook-Torrance, Oren-Nayar,
 Minnaert, Ward, Anisotropic, Metal, Strauss, Multi-Layer, Toon, Translucent,
 Constant, Wireframe, Anime, Cartoon, Oren-Nayar-Blinn, the whole Blender
-Internal diffuse/specular matrix, and 3ds Max's own eight.
+Internal diffuse/specular matrix, 3ds Max's own eight, and seventeen period
+light units and combiners (GameCube, Sega Model 2 and 3, Nintendo DS,
+PlayStation, Saturn, N64, PS2, Direct3D, PowerVR, Mega Drive, Super FX).
 
-**243 node types** are evaluated — every shader node Blender 5.x offers (the
+**249 node types** are evaluated — every shader node Blender 5.x offers (the
 full Principled BSDF, recursive node groups, every Math and Vector Math
-operation) plus Halcyon's own 137: the master shader with the era's whole bag
+operation) plus Halcyon's own 143: the master shader with the era's whole bag
 of tricks on one node, 34 procedural textures, the 2D media, thirty utilities
 and vector warps, the BI Texture and BI Material nodes, the 3DS Max shelf.
 Nodes the engine does not recognise pass through and report a warning rather
@@ -89,7 +93,7 @@ execution masks, so different pixels genuinely take different branches.
 Declare `uniform float rimPower = 2.5;` and a Rim Power socket appears on the
 node. Coded shaders compile natively into the GPU's deferred pass too.
 
-**113 material templates** on the Pre-Made shelf in fourteen families — the
+**114 material templates** on the Pre-Made shelf in fourteen families — the
 engine's own recipes, the 46 decoded Bryce presets, the cel, cartoon, media
 and volume shelves. Picking one adds its nodes beside your graph.
 
@@ -98,29 +102,36 @@ container: per-channel Beer-Lambert, single scatter from the scene's own
 lamps and shadows (god rays included), eight scattering models, mesh-shaped
 containers, voxels, smoke grids, and the cel dials for stylized fog.
 
-**Nine sky modes** — node tree, solid, gradient, banded, starfield, Preetham,
-HDRI, a full Bryce Sky Lab, and the painted backdrop — with **303 sky
-presets** in a thumbnail gallery, **48 water presets**, and **nine infinite
-grounds that answer the scene's lighting**. Weather, a seven-landform terrain
+**Eleven sky modes** — node tree, solid, gradient, banded, starfield, Preetham,
+HDRI, a full Bryce Sky Lab, the painted backdrop, Doom's Cylinder Sky and
+LightWave's Gradient Backdrop — with **303 sky
+presets** in a thumbnail gallery, **48 water presets**, and **ten infinite
+grounds**: nine that answer the scene's lighting, and the SNES's Mode 7
+floor, which is unlit. Weather, a seven-landform terrain
 generator, halo materials and lens flares against the frame's own depth.
 
 **Output that lands in the right decade.** Colour depth from 32-bit down to
 1-bit, real VGA, Macintosh, EGA, CGA and web-safe palettes, four adaptive
 quantisers, seven error-diffusion kernels plus ordered dither, any image as a
 palette, composite NTSC encoding with chroma bleed and dot crawl, CRT masks,
-interlacing, and a genuine 8×8 DCT round-trip for JPEG artefacts. **140
+interlacing, and a genuine 8×8 DCT round-trip for JPEG artefacts. **143
 resolution presets** from the NES's 8:7 pixel to 8K and the 35 mm scan
 formats.
 
-**291 settings, all proven.** One test holds every setting to evidence that
+**396 settings, all proven.** One test holds every setting to evidence that
 it changes what it claims to change; another fails the build if any property
 ships without a real tooltip.
 
 ## GPU support
 
 **The GPU port is complete** — rasterisation, deferred shading and post all
-run through Blender's own `gpu` module. Set Device: GPU in Render Properties.
-A 116-row feature matrix in the built-in Self Test compares the GPU picture
+run through Blender's own `gpu` module, and since 1.89.0 the frame stays
+there between the stages: the sky is drawn in the shading's own burst, the
+ink and the supersample resolve read the frame in place, and the post chain
+runs resident — one upload at most, one readback at the end — with the film
+grain and the bit depth as stages of their own. Set Device: GPU in Render
+Properties.
+A 299-row feature matrix in the built-in Self Test compares the GPU picture
 against the CPU's on your own driver; anything that cannot run on the GPU is
 routed to the CPU **by name**, with the reason printed, and the picture stays
 right. Same frame, same numbers, on either device, in any band, on any worker.
@@ -165,8 +176,8 @@ Blender already ships. Developed and tested against Blender 5.2.
   shade on the CPU by name; Halcyon's own pattern nodes are the portable,
   bit-exact replacements
 - The Sky Texture node is Preetham, not Nishita
-- The film stages run on the CPU on both device roads, once per frame, so
-  the two roads see the same numbers
+- Most film stages run on the CPU on both device roads; the grain (to
+  1.2 px) and the flicker draw on the GPU, within a measured tolerance
 - The 3ds Max shelf reproduces Max's algorithms and controls, not a Max
   scene's exact random tables — the character, not the pattern
 
@@ -174,7 +185,7 @@ Blender already ships. Developed and tested against Blender 5.2.
 
 Turn on **Developer Options**, then **Run Self Test** in the Debug panel: it
 copies a report covering your GPU, the shaders compiled on your driver, the
-116-row CPU/GPU feature comparison and per-stage timings. Nearly every bug in
+299-row CPU/GPU feature comparison and per-stage timings. Nearly every bug in
 this engine's history was diagnosed from that output.
 
 ## Credits

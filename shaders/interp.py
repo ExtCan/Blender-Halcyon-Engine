@@ -284,6 +284,11 @@ class Interpreter:
         k = node[0]
         if k == 'num':
             return self.number(node, n)
+        if k == 'bool':
+            # R249: the true / false literals (the parser always made
+            # them; the generator handled them; the interpreter had no
+            # case, so `bool x = false;` was an unsupported expression)
+            return np.full(n, bool(node[1]), bool), BOOL
         if k == 'var':
             slot = scope.get(node[1])
             if slot is None:

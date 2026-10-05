@@ -57,6 +57,17 @@ class Material:
     shadeless: bool = False
     receive_shadow: bool = True
     cast_shadow: bool = True
+    # R251 C134: the gel this material's Kodalith matte is backlit
+    # through in the Tron printer stage (black = no matte)
+    glow_gel: tuple = (0.0, 0.0, 0.0)
+    # R251 C020/C036: this material's triangles are an AUTHORED VOLUME
+    # (never drawn as geometry): a Dreamcast modifier volume (stencil
+    # parity x FPU_SHAD_SCALE, INCLUDE or EXCLUDE) or a Nintendo DS
+    # shadow polygon (depth-fail mask, then a 5-bit blend of `diffuse`
+    # at `shadow_alpha`, skipping pixels of its own `polygon_id`)
+    volume_role: str = 'NONE'   # NONE | DC_INCLUDE | DC_EXCLUDE | DS_SHADOW
+    polygon_id: int = 0         # the DS attribute-buffer polygon ID, 0..63
+    shadow_alpha: int = 16      # the DS shadow polygon's 5-bit alpha, 1..30
     # R208: this material dresses HAIR geometry (ribbon strands or fur
     # shells): the colour layer carries strand data (r intercept,
     # g random, b length, a thickness) and Hair Info reads it. The
@@ -72,6 +83,11 @@ class Material:
     # road (camera, layers, rays), whichever road drew it.
     alpha_mode: str = 'BLEND'
     alpha_clip: float = 0.5
+    blend_mode: str = 'INHERIT'        # R251: INHERIT | the blend_equation items | ENV_HOLE
+    z_offset: float = 0.0              # R251: Blender 2.4x Zoffs, see-through fragments sort/test this much nearer
+    z_invert: bool = False             # R251: Blender 2.4x ZInvert, the material's fragments sort far-first
+    thin_wall_offset: float = 0.5      # R251: Max Thin Wall Refraction 'Thickness Offset', read under blend_mode THIN_WALL
+    fog_length: float = 1.0            # R251: Imagine 'Fog Length', read under blend_mode IMAGINE_FOG
     # R220: per-material ink. The cartoon outline pass was one global
     # render setting; these let a material opt out of it, force it on
     # (even with the global switch off), and carry its own ink colour
@@ -117,6 +133,9 @@ class MeshData:
     uvs2: Optional[np.ndarray] = None  # (V,2) secondary UV
     uv_names: Optional[list] = None    # layer names, [active, secondary]
     colors: np.ndarray = None         # (V,4) float32
+    # R246: the colour layer's NAME (the one `colors` carries), so a
+    # Color Attribute node naming it resolves on both devices
+    color_name: Optional[str] = None
     tris: np.ndarray = None           # (T,3) int32 indices into verts
     mat_index: np.ndarray = None      # (T,) int32 -> index into Scene.materials
     obj_index: np.ndarray = None      # (T,) int32 -> index into Scene.objects
@@ -164,6 +183,14 @@ class Light:
     spot_size: float = 1.2            # full cone angle, radians
     spot_blend: float = 0.15
     hotspot: float = 0.0              # derived falloff/hotspot pair (radians)
+    # R251 F012: the cone law -- BLENDER | GL11 | POV | GX_FLAT | GX_COS |
+    # GX_COS2 | GX_SHARP | GX_RING1 | GX_RING2 -- and GL's
+    # GL_SPOT_EXPONENT / POV's tightness (0 = flat, both defaults)
+    spot_law: str = 'BLENDER'
+    spot_exponent: float = 0.0
+    # R251 F015: Sega Model 3's viewport spotlight -- an ellipse pinned
+    # to the screen at the lamp's projected position; no cone, no shadow
+    screen_spot: bool = False
     # Area
     area_size: tuple = (1.0, 1.0)
     area_shape: str = 'SQUARE'
@@ -178,19 +205,26 @@ class Light:
     decay_ld1: float = 0.0     # BI Lin/Quad sliders (att1/att2)
     decay_ld2: float = 0.0
     bi_sphere: bool = False    # BI's Sphere clamp at decay_end
+    # R251 F013: GX_InitLightDistAttn's ref_brite -- the fraction of
+    # the energy left at decay_end under the three GX_* decay laws
+    gx_ref_brite: float = 0.5
     # Shadowing
-    shadow: str = 'MAP'               # NONE | MAP | RAY
+    shadow: str = 'MAP'               # NONE | MAP | RAY | PLANAR
     # 0 = inherit the render setting. The old defaults (512 / 0.02) sat in
     # front of the global sliders and made them unreachable: `light.x or
     # settings.x` never fell through (found by the settings audit)
     shadow_map_size: int = 0
     shadow_bias: float = 0.0
+    shadow_map_depth: str = 'INHERIT'   # INHERIT | CLASSIC | MIDPOINT (R251 C117)
     shadow_softness: float = 1.0      # shadow-map blur radius in texels
     shadow_samples: int = 4
     shadow_color: tuple = (0.0, 0.0, 0.0)
     shadow_density: float = 1.0
     # Period features
     negative: bool = False
+    # R251 F014: Blender Internal's LA_ONLYSHADOW -- the lamp lights
+    # nothing and subtracts its plain diffuse where its shadow falls
+    only_shadow: bool = False
     diffuse_only: bool = False
     specular_only: bool = False
     affect_diffuse: bool = True
@@ -287,6 +321,21 @@ class World:
     horizon_height: float = 0.0
     gradient_falloff: float = 1.0
     blend_mode: str = 'LINEAR'        # LINEAR|SMOOTH|SHARP|EASE
+    # R251 C038: the DS rear-plane depth bitmap (eye-space distance, row 0 = bottom)
+    backdrop_depth: Optional[Any] = None
+    backdrop_offset: tuple = (0, 0)
+    # ------------------------------------------------ R251 sky-camera
+    # C056 Cylinder Sky (Doom): the image rides env_image; Doom's numbers
+    sky_cylinder_repeats: int = 4      # Doom: 1024 columns per turn over a 256-wide texture
+    sky_cylinder_mid: float = 0.78125  # Doom: texture row 100 of 128 on the centre line
+    # LightWave Backdrop (R251): four colours, hard horizon, whole-number squeezes
+    # (C100; the LW 5-7 manual's example values as 8-bit/255, float32 literals)
+    lw_zenith: tuple = (0.0, 0.156862745, 0.31372549)
+    lw_sky: tuple = (0.470588235, 0.705882353, 0.941176471)
+    lw_ground: tuple = (0.196078431, 0.156862745, 0.117647059)
+    lw_nadir: tuple = (0.392156863, 0.31372549, 0.235294118)
+    lw_sky_squeeze: int = 2
+    lw_ground_squeeze: int = 2
     # ------------------------------------------------ Bryce's Sky Lab
     # Bryce's Sky & Fog palette offered a Sky Mode: Soft Sky drove the dome
     # from the sun's own colour, Custom Sky exposed the three stops directly.
@@ -470,6 +519,10 @@ class World:
     ground_lighting: float = 1.0
     ground_graph: Optional[Dict[str, Any]] = None
     ground_programs: Optional[Dict[str, Any]] = None
+    # R251 C048 Mode 7 (SNES / GBA) floor: the ground group
+    ground_image: Optional[ImageBuffer] = None   # R251 Mode 7 map (an image datablock: never in a preset)
+    mode7_texel_size: float = 1.0
+    mode7_over: str = 'WRAP'                # WRAP | TRANSPARENT | TILE0 (M7SEL)
     ocean_choppiness: float = 0.35
     ocean_speed: float = 1.0
     # the water, the other half of a Bryce picture
@@ -538,6 +591,13 @@ class Scene:
     #: for facing-scaled sizes)}. Built by the exporter from every
     #: mesh/particle/point-cloud object wearing a halo material.
     halos: Optional[List[Dict[str, Any]]] = None
+    #: R251 C020/C036: the authored shadow volumes the exporter split off
+    #: the surface mesh (one per (object, volume-role material) pair, in
+    #: object order then material order): {'name', 'verts' (V,3) float32,
+    #: 'tris' (T,3) int32, 'role' DC_INCLUDE|DC_EXCLUDE|DS_SHADOW,
+    #: 'polygon_id', 'alpha', 'color'}. Never rasterised, never a caster,
+    #: never inked, never in the BVH -- core/shadowmask.py reads them.
+    shadow_volumes: list = field(default_factory=list)
 
     def tri_count(self):
         return 0 if self.mesh is None or self.mesh.tris is None else len(self.mesh.tris)
@@ -622,6 +682,71 @@ def alpha_chain_is_binary(mat, nd, sockname):
     return False
 
 
+def material_see_through(mat):
+    """R251 (transparency pack): the ONE see-through predicate of the
+    transparent split (`_split_by_alpha`) and the GPU layer loop --
+    the reason string a material rasterises into the A-buffer for, or
+    None when it stays in the opaque pass. Order: an Env hole is opaque
+    for the split (the sky is drawn through it, C126); a constant
+    opacity below 1; the exporter's alpha evidence; a per-material
+    Blend Mode that is neither Inherit nor Alpha (a PS1 additive glow at
+    opacity 1.0 must reach the transparent pass -- the mode is NOT
+    alpha evidence, `_alpha_reason` never reads it); the PS2 two-pass
+    Clip+Blend (C031). Both roads call this, so the layer plan and the
+    split can never disagree on which material holds fragments."""
+    mode = str(getattr(mat, 'blend_mode', 'INHERIT') or 'INHERIT')
+    if mode == 'ENV_HOLE':
+        return None
+    opacity = float(getattr(mat, 'opacity', 1.0))
+    if opacity < 0.999:
+        return f'Opacity {opacity:.3f}'
+    if getattr(mat, 'has_alpha', False):
+        return str(getattr(mat, 'alpha_why', None)
+                   or 'flagged see-through on export')
+    if mode not in ('INHERIT', 'ALPHA'):
+        return f'Blend Mode {mode}'
+    if str(getattr(mat, 'alpha_mode', 'BLEND')) == 'CLIP_BLEND':
+        return 'Alpha Mode Clip+Blend (PS2 two-pass)'
+    return None
+
+
+def material_is_absent(mat):
+    """R247: a CLIP material whose alpha is a CONSTANT below its
+    threshold has no fragment anywhere -- it draws no surface in ANY
+    transparency mode, the way a volume container draws none.
+
+    The punch-through law says a CLIP material is fully there or fully
+    absent, the same on every road; with Transparency None or Screen
+    Door the clip stage does not run and such a material rendered
+    SOLID -- a coincident outline shell (the Sparking! ZERO import's
+    MI_LNE000, the game's inverted hull left flat on the body) then
+    z-fought the body into black speckles under those two modes and
+    was clean under the other two. A constant alpha needs no stage to
+    resolve: the surface is not there. Structural and conservative:
+    the surface node's plain alpha socket, unlinked, at a default
+    below the threshold; or a graph-less material's own opacity.
+    """
+    if str(getattr(mat, 'alpha_mode', 'BLEND')) != 'CLIP':
+        return False
+    kind, nd, extra = clip_socket(mat)
+    thr = max(float(getattr(mat, 'alpha_clip', 0.5)), 1e-6)
+    if kind == 'const':
+        return float(extra) < thr
+    if kind != 'node' or nd is None:
+        return False
+    for sk in nd.get('inputs', ()):
+        if sk.get('name') != extra:
+            continue
+        if sk.get('link'):
+            return False
+        d = sk.get('default')
+        try:
+            return d is not None and float(d) < thr
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
 def clip_road(mat):
     """The one predicate for the punch-through road (R213).
 
@@ -640,7 +765,9 @@ def clip_road(mat):
     """
     kind, nd, extra = clip_socket(mat)
     mode = str(getattr(mat, 'alpha_mode', 'BLEND'))
-    if mode == 'CLIP':
+    if mode in ('CLIP', 'CLIP_BLEND'):
+        # (R251 C031: Clip+Blend's opaque half rides the same road;
+        # the note string stays 'Alpha Mode Clip')
         if kind is None:
             return None, None, None, None, str(extra)
         return (float(getattr(mat, 'alpha_clip', 0.5)), kind, nd, extra,

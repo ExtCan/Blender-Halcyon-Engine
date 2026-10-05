@@ -4,6 +4,2633 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
 
 ---
 
+## [1.90.0] — 2026-09-26
+
+### Period machines on both roads: fog in the pass, Painter's on the GPU raster, and nine packs of 3D software / console features (R251)
+
+- **What was asked.** "Add some more 3D software/console period features,
+  as many as possible that works with both GPU and CPU modes." The round's
+  answer is nine packs — shadow, lighting, material, raster, texture,
+  transparency, sky and camera, palette, signal — every feature written for
+  both device roads with one of three stated outcomes: a bitwise twin in the
+  simulator; a stated tolerance, with the transcendental or the division
+  that sets it; or CPU-only BY NAME with the printed reason. Every new
+  setting is bitwise-neutral at its default (each pack's module pins render
+  and post against `halcyon-1.89.0.zip`).
+- **How to read the evidence in this entry.** "In the simulator" and "on the
+  fake device" figures are each pack's own measurements as its hand-over
+  reports them (`docs-dev/r251_handover/<SLOT>_handover.md`, the slot named
+  at the head of each block); they were not re-measured for this entry.
+  "On the driver" figures are read from `docs-dev/r251_field4_report.txt`
+  (one line per variant in `docs-dev/r251_field4_verdicts.txt`): run 4,
+  the run of record, 2026-10-05 02:01 to 02:31, on the tree after fix
+  pass 4 — RTX 5060 Ti, Vulkan, Blender 5.2.0 LTS, 1280x720 (921,600
+  pixels), the GPU device's frame against the CPU device's with the post
+  chain included. 212 variants ran in seventeen fresh Blender processes,
+  sixteen of thirteen and one of four (206 from the two waves' lists,
+  four error-diffusion controls as 207–210, the two field frames of the
+  user's own export as 211 and 212), and every process finished its
+  report. In all 212 the GPU device's first run rasterised on the GPU.
+  Run 3 (2026-10-04, `docs-dev/r251_field3_report.txt`), whose numbers
+  an earlier draft of this entry quoted, did not measure that: the
+  G-buffer cache key carries no device, so in 188 of its 208 variants
+  the GPU runs were served the CPU run's raster and the row compared
+  shading, sky and post over one raster. The field script now clears
+  that cache before the GPU runs and prints the raster's device on every
+  GPU line. The per-row pixel figures below are run 4's
+  (`docs-dev/r251_field4_vs_field3.txt` lists the 108 rows that moved;
+  104 did not); the driver's millisecond figures in the bullets before
+  the driver section are still run 3's unless a bullet names run 4 (the
+  warm frames are the same configuration in both runs). The verdict
+  table's classes over the 212 rows, run 3's count in brackets: 43 (52)
+  with 0 pixels above 1e-6, 34 (41) at most one 8-bit level apart, 13
+  (13) at most two, 56 (56) whose maximum is the parked pixel (76, 688) —
+  the one shadow-map compare of the demo scene parked in an earlier
+  release — with nothing else above 1e-2, 60 (44) other, and 6 (6)
+  diverged (more than 1000 pixels above 1e-3). New in run 4, with the
+  GPU rasteriser engaged: a few pixels of a 720p frame differ between
+  the devices by large amounts at isolated places that recur across rows
+  ((37, 789), (431, 572), (414, 573)), read as the GPU rasteriser, which
+  predates this round, deciding an edge differently from the CPU's; not
+  diagnosed, OPEN (the driver section near the end of this entry). Three
+  of the six diverged rows are presets whose dither is FLOYD error
+  diffusion: there the devices differ at 67,372 to 354,017 of the
+  921,600 pixels, each above 1e-2, and that is OPEN too (the same
+  section). The figures stand in each feature's own bullet and in that
+  section. A
+  driver figure says how far apart the two devices' frames are; it does
+  not say the feature moved a pixel. Where the field's list has no row
+  for a feature the bullet says so; a "96x72 matrix" figure is the same
+  report's feature matrix on the same driver (its maximum to six
+  decimals and its count of pixels above 1e-2). The counts below were
+  computed by a probe against `halcyon-1.89.0.zip` on 2026-10-04.
+- **Measured first.** `docs-dev/r251_baseline_presets.txt` (the 1.89.0 tree,
+  CPU device, demo scene 480x360, render + post) lists the sixteen shipped
+  machine presets and what each meant on the GPU road. **7 of 16 set fog**
+  (N64, DREAMCAST, PS2, GAMECUBE, DOOM, QUAKE_SW, VOODOO): the GPU frame
+  paid the CPU's fog over the readback — about 550 ms at 720p, 1.88.0's
+  code, as 1.89.0 disclosed — and the resident frame came down for it.
+  **6 of 16 use Painter's sort** (PSX, PSX_HIRES, SATURN, THREEDO, SNES,
+  DOOM): the GPU rasteriser refused, silently, and the raster ran on the
+  CPU. Two more dither with Floyd-Steinberg (AMIGA_OCS, AMIGA_AGA), CPU-only
+  by name. Twelve of the sixteen therefore lost the resident frame or the
+  GPU raster before any new feature was written, fourteen counting the two
+  diffusion presets; only JAGUAR and XBOX set none of the three. So the
+  round's first two items are not features: the fog twin (F000, next) and
+  Painter's on the GPU rasteriser (C004, the raster block).
+- **Counts, computed.** Presets 90 → 112: 22 new, 39 shipped presets with
+  changed settings, 3 with a changed note only (every one listed under *The
+  presets* below). Shading models 32 → 49. Feature-matrix rows 116 → 299.
+  `RenderSettings` fields 291 → 396 (105 new), `Material` 40 → 49, `World`
+  187 → 200, `Light` 54 → 60. Six new shader nodes (Combiner Stage, SR
+  Bump, Emboss Shift, Emboss Bump, Roughness (Imagine), Env Chrome). 37 new
+  `.py` files: 10 in `core/` (`combine`, `fog`, `n64vi`, `palette_era`,
+  `reyes`, `shadowmask`, `signal_codec`, `signal_era`, `signal_tape`,
+  `srbump_tables`), 11 in `gpu/` (`combine`, `chain_` and `stages_` ×
+  `palette`, `signal`, `tape`, `codec`, `vi`), 16 in `tests/` (fifteen
+  `test_r251_*` modules and `r251_common`). The zip as last built: 430 →
+  467 entries. The suite: 9503 checks, 0 failures
+  (`docs-dev/suite_1.90.0_final.log`: 9503 lines starting `  ok`, 0 starting
+  `  FAIL`, "everything passed", 1737.6 s; run on the final code, after fix
+  pass 4 and one console-line correction,
+  the simulator and the fake device, no driver).
+- **Fog in the deferred pass (F000; wave 1, LIGHT_A1).** Fog now runs
+  inside the deferred material pass on the GPU road (`hal_fog`,
+  `gpu/material.FOG_GLSL`); `core/fog.py` holds the CPU functions and the
+  1.89.0 body verbatim. Twinned: the four curves (LINEAR, EXP, EXP2,
+  TABLE16), the 1/8-unit per-vertex quantisation, the cel bands, the height
+  layer. In the simulator the fog ARITHMETIC is bitwise on the shader's own
+  depth for every mode, and the fog STAGE, applied over the same simulated
+  shading, is bitwise on every quantised row (TABLE16, bands, per-vertex,
+  the GTE cue and the three hardware tables of the lighting block) and
+  2.4e-7 on the four smooth curves, 4e-6 pinned. The whole fogged FRAME
+  against the CPU frame is NOT bitwise on any row, quantised rows included:
+  2.0e-6 to 5.0e-6 measured against a pinned 1e-3, the deferred pass's bar
+  (read in `docs-dev/suite_1.90.0_fix2.log:12823-12878`: TABLE16 prints
+  `equals the CPU fog over the same simulated shading bitwise  0.0` at
+  :12841 and `matches the CPU frame within 1e-3  2.62e-06` at :12842; the
+  smooth curves print 2.38e-07 for the stage and 2.0e-06 to 5.0e-06 for the
+  frame). An earlier draft of this entry said the quantised FRAME was
+  bitwise; the log does not say that. The cause of the smooth curves'
+  2.4e-7 is measured and is not the fog:
+  the G-buffer packs the third barycentric as `1 - x - y` (`pack_ids`, and
+  the compute raster's kernel to match it) while the CPU shades with the
+  rasteriser's own, so the fragment position differs by one ulp at 3333 of
+  4263 demo pixels on BOTH device roads. Closing it is one line in each of
+  two raster files that must move together; it was handed to the raster
+  pack and is not done (open, below). Kept on the CPU, by name: a material
+  with traced reflections, refractions or a CPU-evaluated environment term
+  keeps the CPU's fog over the readback because its composites land after
+  it (`[Halcyon GPU] fog on the CPU for '<material>': traced/env composites
+  land after the readback`); vertex-rate materials keep their fog in the
+  CPU-lit corners. A Use-Mist-off material no longer refuses the GPU. The
+  frame now STAYS resident under fog (the keep rule reads the per-material
+  `fog_cpu`, not `st.fog`; `test_gpu_frame_resident`'s "with fog the frame
+  is not kept" was re-read on purpose). Cost: one more sampler on a fogged
+  pass (`hal_fogtab`, 8 KB, re-uploaded on a slider drag, never
+  recompiled). Pixels that move against 1.89.0: every fogged material on
+  the GPU road (in-shader now; within the bar above on the smooth curves)
+  and Blender Internal materials with Use Mist off under fog (from
+  CPU-exact by refusal to the deferred bar). The CPU road is 1.89.0's. On
+  the driver: six F000 rows, variants 6–11 (LINEAR, EXP, EXP2, TABLE16,
+  per-vertex + bands, height); each has its maximum (6.3e-2 to 7.8e-2) at
+  the parked pixel (76, 688) — the ONE pixel above 1e-2 — and 16 to 23
+  pixels above 1e-3, of which the post chain alone accounts for 5 to 20 at
+  one 8-bit level. The fog LINEAR row at 720p: 91–95 ms warm, render and
+  post, against 1160 ms on the CPU device; the frame kept through the
+  shading, the post resident, no readback and no upload before the final
+  one.
+
+#### Shadow (wave 1; SHADOW_handover.md)
+
+The shared road, said once: a planar lamp or a shadow volume is a CPU edit
+of the finished frame on BOTH device roads (`shadowmask.apply_after_readback`,
+one call in `render()`), so the frame leaves the GPU for the mask by name
+(`shadow mask`), as it did under fog in 1.89.0; the mask lands AFTER fog on
+both roads (the spec wanted it before — a stated deviation, the same on
+both devices). The bake runs on every frame that has a planar lamp or a
+volume, viewport drafts included (whether drafts should skip it by name is
+an open question to the viewport, not decided). With the render's Shadows
+switch off no planar polygon and no volume is drawn.
+
+- **Midpoint shadow map (C117).** Woo's halfway map (Graphics Gems III) as
+  Maya 1–4 shipped it ("Use Mid Dist", on by default) and Blender 2.43–2.79
+  called Classic-Halfway. Dial: `Map Depth` on the Shadows panel and per
+  lamp (Inherit / Classic / Midpoint). Nearest and second-nearest caster
+  per texel, averaged in Halcyon's linear light-space distance (Blender
+  averaged integer z), the far plane where a texel sees one surface, bias
+  and normal offset zero. A shell thinner than the A-buffer tolerance casts
+  nothing. Cost: two caster rasters per map. Road: the same atlas and
+  compare as CLASSIC on both roads; the hand-over reports the simulator twin
+  as "bitwise (0.000006 on the demo, the lighting chain's own noise)" and
+  states the map's 6e-3 bar for a driver. On the driver the two C117 rows
+  exceed that bar (the map compare): max 4.98e-1 at (52, 756), 17 pixels
+  above 1e-3 and 2 above 1e-2; under the MAYA_4 preset 9.80e-2 at (28,
+  813), 22 and 5 (variants 1, 2). Evidence: Maya's shadow attributes; the
+  mental ray manual; Blender 2.79b `zbuf.c`.
+- **Planar projected shadows (C052).** Blinn's 1988 "Me and My (Fake)
+  Shadow" as Sega Model 1 used it. Dials: `Shadow Method = Planar
+  Polygons` (scene and per lamp), `Floor Plane Z`. The projection is drawn
+  with the frame's own rasteriser, the lamp's Shadow Colour and Density as
+  the polygon's colour and opacity, union where polygons overlap, no
+  self-shadow, 24 lamps per frame (named). Departures named: a surface
+  lying on the plane takes a contact hairline; a shadeless floor takes the
+  polygon too; a lamp below the plane prints that it casts no floor shadow.
+  The Model 1 / Virtua Fighter / Tekken attribution is the catalogue's
+  platform line, not a primary source. Road: a NumPy edit over the readback,
+  the same code on both devices.
+- **Dreamcast modifier-volume shadows (C020).** PowerVR2 CLX2 (reicast
+  `refsw_pixel.cpp`, KallistiOS `pvr.h`, flycast). Dials: per material
+  `Volume Role = Dreamcast Modifier (inside / outside)`, `DC Shadow Scale`
+  (128 = the half shadow). Crossing parity of the volume's faces nearer
+  than the pixel, all volumes XOR into one bit, then `floor(rint(c*255) *
+  scale / 256) / 255`. Departures named: the scale hits the shaded LINEAR
+  colour, not the gamma-encoded vertex colours before texturing; the
+  two-volume colour/UV swap is not built; a volume face within the A-buffer
+  depth band of the surface counts as AT the surface (measured: one grid
+  alone left 1 of ~600 contact pixels speckled). Inside a volume the two
+  devices may differ by one 8-bit level at a rounding tie (stated, under
+  the 6e-3 bar). No 720p driver row: the field's variant list carries
+  settings only and a volume is scene data. The 96x72 matrix prints the
+  inside and the outside rows at 0.000000 with 0 pixels above 1e-2
+  (stages RSP).
+- **DS shadow polygons (C036).** GBATEK "DS 3D Shadow Polygons" and melonDS
+  `GPU3D_Soft.cpp`. Dials: `Volume Role = DS Shadow Polygon`, `Polygon ID`
+  (0–63), `DS Shadow Alpha` (1–30). A depth-fail mask per failing back-face
+  fragment, a draw where a front face passes, the polygon-ID
+  self-exclusion, the DS's `(Cs*(a+1) + Cd*(31-a)) >> 5` on 6-bit channels,
+  24 volumes per frame (named). Departures named: the fog-flag AND is not
+  modelled; the 6-bit rounding applies inside the shadow only; two culled
+  captures per volume (the raster's `front` flag is the winding sign and
+  was the wrong one to read). Inside a shadow the devices may differ by one
+  6-bit level at a tie, so the matrix row runs under the CONSTANT model
+  (d == 0.0 there) and the lit case is held at a stated bar. No 720p driver
+  row, for C020's reason; the 96x72 matrix row prints 0.000000 with 0
+  pixels above 1e-2 (stages RSP).
+
+#### Lighting (wave 1: LIGHT_A1, LIGHT_B1, LIGHT_B2; wave 2: LIGHT_A2)
+
+**The machines' fog (wave 1).** At the VERTEX rate every table below is read
+at the CPU-lit corners, where there is no pixel; the Voodoo, the PowerVR
+and the DS fogged per pixel after interpolation. The VOODOO, VOODOO2 and
+DREAMCAST presets shade at the VERTEX rate, so their table fog is per
+corner today and the Voodoo2 dither adds 0 there. A per-pixel fog road for
+vertex-rate passes is the named next cut.
+
+- **PS1 GTE depth cue (F001).** psx-spx GTE (RTPS MAC0/IR0, DPCS). Dial:
+  `fog_mode GTE_1Z`: affine in 1/z between Fog Start and End, floored
+  to 12 bits at the vertices under the Gouraud rate; per pixel the same
+  curve is evaluated everywhere, which no console did (the tooltip says
+  so). The UNR reciprocal's error is not modelled (it vanishes under the
+  12-bit floor). Simulator: the fog over the same simulated shading is
+  bitwise; the deferred frame is 8.3e-7 from the CPU frame, inside the
+  deferred bar (`suite_1.90.0_fix2.log:12969-12970`).
+- **Voodoo 64-entry fog table and the Voodoo2 fog dither (F002).** Glide
+  2.2 `guFogTableIndexToW`, MAME `voodoo_render.cpp apply_fogging`. Dials:
+  `fog_table VOODOO64`, `fog_dither`. The table on 1/w, filled by
+  `guFogGenerateExp`'s curve, interpolated by the w mantissa's next 8 bits
+  through Glide's 6.2 delta; the Voodoo2 adds MAME's 4x4 matrix to the
+  fraction. Disclosed: w is eye depth in scene units; "affine in m" holds
+  only up to one 1/256 unit of the shift chain. `fog_dither` without the
+  table renders bitwise 1.89.0.
+- **PowerVR2 128-entry fog table (F003).** powervr-reg.txt, reicast
+  `LookupFogTable`, KallistiOS `pvr_fog.c`. Dial: `fog_table PVR128`; Fog
+  End is the density register. Disclosed: the `>> 8` blend at fraction 0 gives an entry minus one (reicast's own arithmetic).
+- **DS 32-entry fog table (F022).** GBATEK FOG_TABLE / FOG_OFFSET, melonDS.
+  Dial: `fog_table DS32`: 7-bit densities, the 17-bit fraction, 1/128
+  blend with 127 read as full fog, on eye depth between Fog Start and End.
+  Disclosed: the DS indexed its z- or w-buffer instead; its alpha-only mode
+  is not here.
+- **Direct3D z-fog (F007).** Microsoft's pixel-fog documentation. Dial:
+  `fog_depth Z`: the curve reads the raster's own projected z, far-stretch
+  pile-up included; linear under an orthographic camera. Applies to the
+  four curves; the console modes and tables keep eye depth. Fog Start and
+  End are then 0..1 depths, and scene-unit values fog NOTHING (measured on
+  the demo at 160x120: Start 5, End 40 moved 0 of 19200 pixels). **Fixed
+  before release (fix pass 3): the Fog End advisory was blind to the z
+  domain.** It compared scene-unit distance with the 0..1 End, so it
+  printed "PURE fog colour" at any End of 1 or less while the fog was
+  partial, advised moving Start/End out to scene distances, and printed
+  nothing at all while such values fogged nothing. It now asks both
+  questions in z: "NOTHING is fogged" with the frame's own z span when Fog
+  Start lies past every surface, and the PURE-fog line in z when the frame
+  sits past Fog End, under a perspective or an orthographic camera (the
+  raster's own z, remapped to 0..1, IS Direct3D's). Eye-depth fog keeps
+  its wording; a console line only, no pixel moves. Still silent, by the
+  renderer's standing rule: viewport frames print no advisory at all.
+
+**The lamps (wave 1, LIGHT_B1).** None moves a pixel at any default (six
+scenes pinned bitwise against 1.89.0, render and post).
+
+- **Specular Viewer: Camera Axis (F011).** OpenGL 1.1's infinite viewer
+  (`GL_LIGHT_MODEL_LOCAL_VIEWER` false), the Sega Model boards' fixed R.z,
+  the DS's LineOfSight. One vector per frame read by every model's view
+  term; in the simulator the one-colour facing quad is bitwise and the demo
+  frame within 1.1e-5 of the CPU's, the deferred bar (a constant fetched from
+  `hal_fogtab`). The Master shader's rim, Fresnel and sheen cheats and the
+  two-sided flip keep the true eye (tooltip).
+- **Only Shadow lamps (F014).** Blender Internal's LA_ONLYSHADOW (2.79
+  `shadeoutput.c`): the plain diffuse the lamp would have given, subtracted
+  where its shadow falls; ramps and terminator bias excluded, no floor on
+  the subtraction. Imported .blend files that used it now import it.
+  Simulator: the inert cases are bitwise, the only-shadow row's frame
+  within 6e-6 of the CPU's; a driver's products at 1 ulp (expected, not
+  measured: no field row).
+- **Cone Law (F012).** OpenGL 1.1 (`GL_SPOT_CUTOFF` / `GL_SPOT_EXPONENT`),
+  POV-Ray (`lightsource.cpp`, cubic spline), GX (libogc `GX_InitLightSpot`,
+  its transcription slip in SHARP disclosed and corrected). GX_RING2 peaks
+  AT the cone edge (measured; the first tooltip draft was wrong). In the
+  simulator every law's GLSL at exponent 0 is bitwise the CPU's and the
+  three checked rows' frames sit 9e-6 to 9.0e-5 from the CPU's (the GX ring
+  the largest); on a driver the `pow` class for a nonzero
+  GL exponent and one division for POV's Hermite parameter (expected; no
+  field row). The lamp's Hotspot is POV's radius.
+- **Decay laws (F013).** POV-Ray's fade (2/(1 + (d/D)^P), P = 1 and 2;
+  free fade_power and the fade_distance-0 form not modelled), OpenGL's
+  three-term law, GX's gentle / medium / steep tables (libogc
+  `GX_InitLightDistAttn`). In the simulator each law's GLSL is bitwise the
+  CPU's and the rows' frames sit 6e-6 to 8e-6 from it; one driver division
+  (two under POV).
+- **Screen Spotlight (F015), the diffuse half.** Supermodel's reconstruction
+  of the Model 3 viewport spotlight (`R3DShaderCommon.h`): an ellipse
+  pinned to the screen with a depth window, its lobe added to the diffuse.
+  The size mapping from Spot Size is Halcyon's own convention and says so.
+  The lobe lives on the screen: ray hits, transparent layers and vertex
+  corners get nothing. In the simulator the lobe's GLSL is bitwise the CPU's
+  and the row's frame within 6e-6; three driver divisions at
+  2.5 ulp (expected). The 720p field row (variant 24) has no screen spot
+  in its scene and proves nothing about the lobe: its figures are the
+  plain LINEAR fog row's (max 7.06e-2 at the parked pixel (76, 688), 17
+  pixels above 1e-3, 1 above 1e-2). The 96x72 matrix, whose scene has a
+  screen-spot lamp, prints `Model 3 screen-space spotlight` at 0.000000
+  with 0 pixels above 1e-2 (stages RSP).
+
+**The console light units and the POV-Ray finish (wave 1, LIGHT_B2).**
+
+- **GX_LIGHT (F016).** GameCube / Wii fixed-function light unit: Lambert
+  plus `GX_InitLightShininess`'s rational highlight (libogc `gx.h`: "a true
+  exponential function is not possible"), the half vector against the
+  camera axis, specular from Sun lamps only, the lit colour saturated and
+  written as 8 bits per channel. Meant for the Gouraud rate. Simulator:
+  d == 0.0 at pixel rate, 1.2e-7 to 7.2e-7 on the corner road. On a driver
+  one normalize, one division and the 8-bit tie can move one level at
+  isolated pixels (expected).
+- **SEGA_MODEL2 / SEGA_MODEL3 (F017).** Model 2's R.z highlight squared 0–3
+  times (MAME `model2_v.cpp`; Glossiness snaps to 1/2/4/8), Model 3's N.L
+  to {8, 16, 32, 64} with Supermodel's multipliers. The two models HAVE NO
+  GLSL: they are computed on the CPU's corner road on both devices because
+  the boards lit per polygon and per vertex, and a pixel-rate request
+  refuses by name. Not built: Model 3's flat-polygon path. The Model 2
+  checker is exact at 50% opacity only.
+- **DS_FIXED (F018).** The DS light unit (GBATEK): LineOfSight (0,0,-1),
+  the unnormalised half vector, the 128-entry shininess table, 5-bit vertex
+  colours. The table's SHAPE is `(i/128)^(Glossiness/8)`, Halcyon's:
+  games authored their own and GBATEK documents no default. The highlight
+  is evaluated beside the `evaluate` call on both roads (the shared GLSL
+  dispatch carries no sampler); a per-pixel Glossiness chain refuses by
+  name. Simulator d == 0.0 at pixel rate; fake-device mixed frame within
+  7.2e-7.
+- **Brilliance (F019).** POV-Ray's finish `brilliance`: `pow` on the
+  diffuse cosine (`trace.cpp`), skipped exactly at 1.0. Applied to
+  Halcyon's non-Lambert diffuse laws too, which POV never had, and inert on
+  the 3ds Max shaders — both disclosed. In the simulator the brilliance
+  statement is bitwise the CPU's and the frame within 6.0e-6 (the deferred
+  bar); a driver `pow` within the deferred bar (expected; no field row); a
+  per-pixel chain refuses by name.
+- **Crand (F020).** POV-Ray's finish `crand`, drawn from Halcyon's integer
+  hash per pixel and lamp instead of POV's sequential generator — the one
+  stated deviation, and what makes a frame render the same bits twice.
+  `Crand Flickers per Frame` brings POV's flicker back on purpose. A
+  reflection shares its parent pixel's number; vertex corners get no grain.
+  In the simulator the frame is within 6.2e-6 of the CPU's (the deferred
+  bar); the fake device draws bitwise the simulator and lands within 1e-5
+  of the CPU.
+- **Metallic (POV) (F021).** POV-Ray's `ComputeMetallic` curve on
+  `acos(N.L)/(pi/2)` applied to the highlight's colour. In the simulator
+  the Fresnel curve is bitwise the CPU's and the frame within 6.2e-6; on a
+  driver `acos` sets the bar, 2e-5 on the highlight
+  (stated; no field row). The 3.5 reflection variant is not in this round.
+
+**More fog (wave 2, LIGHT_A2).** No preset default moves a pixel through
+these seven. The simulator figures in the seven bullets are read from
+`docs-dev/suite_1.90.0_fix2.log:13194-13500`: the first is the fog stage
+over the same simulated shading, the second the whole deferred frame
+against the CPU frame, which is never bitwise. The driver figures in the
+first six bullets are the full run's 720p rows (variants 138–151): the two
+devices' frames after the post chain. In each of those rows every
+differing pixel is above 1e-3 (the counts above 1e-6 and above 1e-3 are
+equal), so a row shows agreement to an 8-bit level, not to an ulp or to a
+2e-5 bar. The seventh bullet (F015) has no 720p row with a screen spot
+and cites the 96x72 matrix.
+
+- **Fog Range Adjust (F004).** GameCube `GX_InitFogAdjTable`: ten 4.8
+  secants at 32-pixel steps from the viewport centre scale the planar fog
+  depth per column. The GAMECUBE preset does NOT
+  set it: at the preset's VERTEX rate the corners have no pixel column and
+  the key would do nothing (measured 0 px; the design's line was dropped).
+  Inert under an orthographic camera, by name. Simulator: the stage is
+  bitwise, the frame 2.3e-6 from the CPU frame (log :13194-13195). Expected
+  on a driver: the knot lerp at 1 ulp, one 8-bit level at a TABLE16 step
+  edge.
+  On the driver (variants 138, 139): TABLE16 3..12 with the adjust, max
+  7.84e-2 at the parked pixel (76, 688), 19 pixels above 1e-3, 1 above
+  1e-2 (the F000 TABLE16 row, variant 9, has the same maximum and 17
+  pixels). The GAMECUBE look at the PIXEL rate with the adjust: 4 pixels
+  above 1e-3, 2 above 1e-2, max 1.96e-2 at (139, 572), the post chain
+  alone 0 (0 pixels in run 3, over the CPU's raster), the frame leaving
+  the GPU at `framebuffer format`; 136–140 ms warm against 1717 on the
+  CPU device.
+- **Per-Polygon Fog (F005).** Namco System 21 (MAME `namcos21_3d.cpp`): one
+  fog bank per polygon from the mean of its corners' depths. Halcyon means
+  a TRIANGLE's three corners where the board meant a quad's four, so a
+  split quad can pop as two halves (disclosed). On the NAMCO_S21 preset's
+  own FACE rate the flag changes no pixel (measured 0.0: one shade per
+  polygon already fogs at the centroid); it matters at the PIXEL and VERTEX
+  rates. Simulator: the stage is bitwise, the frame 2.3e-6 from the CPU
+  frame (log :13235-13236). On the driver (variants 140–142): 16 banks, max
+  8.24e-2 at the parked pixel (76, 688), 14 pixels above 1e-3, 1 above
+  1e-2; the NAMCO_S21 preset, 0 pixels above 1e-6 (97–109 ms warm against
+  703 on the CPU device); the NAMCO_S21 look at the PIXEL rate, 3 pixels,
+  all above 1e-2, max 3.23e-2 at (443, 534), not the parked pixel — the
+  post chain compared alone on the same frame differs at 2 pixels by the
+  same 3.23e-2.
+- **Material fog control (F006).** Model 3's polygon light modifier
+  (`Fog Burn-Through`), System 22's cz delta and type (`Fog Bias`, `Fog
+  Bank`), Model 3's `Fog Ambient`. Three Master-shader sockets and one
+  extra bank (System 22 had four; Halcyon ships two). A socket driven per
+  pixel refuses by name. Reflection hits fog with the scene curve, not the
+  material's dials (stated deviation). Simulator: NOT bitwise — the stage
+  is 1.8e-7 (burn-through / bias) and 1.5e-7 (bank 1) inside its 4e-6 pin,
+  the frame 6.0e-6 from the CPU frame (log :13344-13354).
+  On the driver (variants 143–145) the three rows have the same maximum,
+  7.06e-2 at the parked pixel (76, 688), the one pixel above 1e-2; above
+  1e-3: burn-through and bias 25 pixels, bank 1 19, fog ambient 0.5 25.
+- **Fog Target: Backdrop (F008).** LightWave's Use Backdrop Color (LW 7
+  manual ch. 15): fog blends toward the world colour at the same pixel.
+  On the GPU road the CPU's backdrop is uploaded once per plan
+  (`hal_backdrop`, 14.7 MB at 720p, one more sampler on every pass of the
+  plan, printed with its size). Fogged vertex corners, reflected rays and
+  transparent layers take the world along their own direction, so a fogged
+  corner is not bitwise the sky beside it. On the driver (variants 146,
+  147): under the gradient sky max 3.92e-3 (one 8-bit level) at (270,
+  499), 10 pixels above 1e-3, 0 above 1e-2, 177–186 ms warm against 388
+  on the CPU device; under the HDRI world max 3.14e-2 at the parked pixel
+  (76, 688), 440 pixels above 1e-3, 1 above 1e-2, where the sky compared
+  alone differs at 431 pixels by one 8-bit level. The report does not
+  print the upload's ms.
+- **Ground Fog (F009).** POV-Ray `fog_type 2` as `trace.cpp` integrates it
+  (the atan mean of 1/(1+Y²) along the eye ray); the sky is fogged by POV's
+  closed form on both roads. On the demo camera every sky ray falls, so
+  the whole visible sky IS the fog colour — checked after the collage
+  showed it (29,449 sky rays, fog factor 1.0 top and bottom; the fix
+  agent's measurement). Reflections integrate eye → hit, not per segment.
+  Simulator: NOT bitwise — the stage is 2.4e-7 on the geometry and 1.4e-6
+  with the sky fogged by elevation (pin 4e-6), the frame 4.5e-6 and 1.1e-5
+  from the CPU frame; the sky drawn in the burst is bitwise the CPU's
+  fogged sky (log :13402-13426). On a driver `atan` and `exp` set the bar,
+  stated at 2e-5. On the driver (variants 148, 149; the rows do not
+  resolve 2e-5): the geometry row, max 9.02e-2 at the parked pixel (76,
+  688), 23 pixels above 1e-3, 1 above 1e-2; with the sky fogged by
+  elevation, max 3.92e-3 (one 8-bit level) at (7, 891), 28 pixels above
+  1e-3, 0 above 1e-2.
+- **Fog Turbulence (F010).** POV-Ray's fog `turbulence` / `turb_depth`: one
+  turbulence read at the segment's midpoint scales the fog distance. The
+  noise is Halcyon's integer-hash value turbulence, one scalar, not POV's
+  Perlin vector (disclosed). Simulator: NOT bitwise — the stage 2.4e-7
+  (EXP is smooth; pin 4e-6), the frame 2.6e-6 to 2.7e-6 from the CPU frame
+  (log :13454-13463). Two driver `exp` calls, the stated bar 2e-5.
+  On the driver (variants 150, 151; the rows do not resolve 2e-5): depth
+  0.5 max 7.06e-2, depth 1.0 max 7.45e-2, both at the parked pixel (76,
+  688), the one pixel above 1e-2; 25 and 18 pixels above 1e-3.
+- **Spotlight Fog (F015, the fog half).** The Model 3 screen spotlight's
+  lobe times `Spotlight Fog` is added to the fog target on both roads.
+  Pass 1 measured its collage row at 0 px (the half was not in the tree);
+  it now moves 7,539 px (the verify agent's collage run). Light-linking
+  masks are not applied on the refusal road's lobe. Simulator: the stage
+  1.9e-6 inside its 4e-6 pin, the frame 2.4e-6 from the CPU frame (log
+  :13499-13500). Not measured at 720p: the one F015 field row
+  (variant 24, `fog_spot` 1.0) has no screen spot in its scene. The 96x72
+  matrix, whose scene has a screen-spot lamp, prints `Model 3 spotlight
+  fog lobe` at 0.000000 with 0 pixels above 1e-2 (stages RSP).
+
+#### Material (wave 2: MAT_A, MAT_B)
+
+**The period combiners (MAT_A).** Thirteen shading models, each a shading
+RATE (the scene's Gouraud / flat rate; Gouraud when the scene shades per
+pixel) plus one machine's integer combine: the CPU lights and quantises the
+triangle corners, the GPU pass interpolates them and applies the same rule
+in floats with `floor` / `roundEven`. Every lit vertex colour is saturated
+and quantised to the machine's depth BEFORE interpolation (PS1 / PS2 8-bit
+at 0x80, N64 / Direct3D 8-bit, Saturn 5-bit table, DS 5-bit expanded to 6);
+the interpolation itself is float32, not the machine's fixed point
+(disclosed). The 8-bit texel enters every blend (the PS1's own CLUT entries
+were 15-bit — disclosed). What the hand-over measured: the function twins
+are d == 0.0 on 4096 pairs each in the simulator; the frame seams on the
+textured demo are 0.0 for PS1 / Saturn / DS_FIXED / S22 / PS2 / DS_TOON /
+DS_HIGHLIGHT / MEGA_DRIVE / SEGA_MODEL2 / SEGA_MODEL3, 2.4e-7 for the two
+provoking-vertex flats and D3D, 1.8e-7 for PCX, and for N64_COMBINE at the
+VERTEX rate ONE pixel at one 8-bit level (the G-buffer's packed
+barycentrics move the corner lerp by an ulp at a .5 boundary), 0.0 at
+FACE. A hit pass refuses these models by name (it lights per pixel).
+On the driver (variants 119–135) the field's frame is the demo scene
+WITHOUT its texture (`with_texture=False`, `field/halcyon_field_r251.py`),
+so no texel enters these blends at 720p. 0 pixels above 1e-6:
+PS1_MODULATE (PSX), SATURN_ADD (SATURN), the plain SUPERFX_PLOT row. Not
+0 in run 4, where run 3 read 0 over the CPU's raster: FLAT_D3D_FIRST (on
+the D3D_RETAIL_1997 preset) 1 pixel, max 1.90e-1 at (414, 573), and
+SUPERFX_PLOT under 2x2 supersampling 3 pixels, max 3.33e-1 at (37, 789),
+all above 1e-2, the sky and the post chain alone 0 in both rows. One
+8-bit level (3.92e-3), none above 1e-2: FLAT_GL_LAST, S22_MODULATE and
+MEGA_DRIVE_SH (MEGA_DRIVE) at 3 pixels each, DS_TOON and DS_HIGHLIGHT
+(NDS) at 7 each. Two levels (7.84e-3) at 4 pixels, none above 1e-2:
+N64_COMBINE (N64) and PS2_HIGHLIGHT (PS2). Every differing pixel above
+1e-2: PCX_INTENSITY (POWERVR_PCX2) at 3 pixels, max 1.59e-2, where the
+post chain compared alone gives the same maximum at the same pixel;
+D3D_SEPARATE_SPEC (DREAMCAST) at 4 pixels, max 6.45e-2 at (37, 789),
+where the post chain alone gives 1.59e-2 at 4 pixels. The keyed rows:
+the DS modulate on DS_FIXED (NDS) one level at 7 pixels, the SEGA_MODEL2
+preset 0 pixels above 1e-6, the SEGA_MODEL3 preset one level at 7. With
+the texture, the models ran on the driver only in the 96x72 matrix:
+D3D_SEPARATE_SPEC and PCX_INTENSITY print 0.003922, the other eleven
+0.000000, all thirteen with 0 pixels above 1e-2 (stages RSP; the two
+flats and SUPERFX_PLOT are untextured there too). Every preset row
+forces its model (`force_model`, `field/r251_variants_MAT_A.py`), so
+none shows a preset's Default Model reaching a material, and no row runs
+PSX_HIRES.
+
+- **FLAT_GL_LAST / FLAT_D3D_FIRST (C043).** OpenGL 1.0–1.5 `GL_FLAT` and
+  PSP `GU_FLAT` copy the LAST corner over the triangle, Direct3D 3–9
+  `D3DSHADE_FLAT` the FIRST (the ARB_provoking_vertex spec; the D3D9
+  reference). A quad splits along its diagonal. Not quantised (a
+  provoking-vertex claim, not a depth claim).
+- **PS1_MODULATE, SATURN_ADD, N64_COMBINE, S22_MODULATE, and the DS
+  modulate (C006).** psx-spx (texel × vertex colour / 128, 808080h
+  neutral, saturating); the VDP1 User's Manual Table 5.3 (the 5-bit
+  Gouraud add); angrylion's `color_combiner_equation`
+  (`((t * s) + 0x80) >> 8`); MAME `namcos22` (unity read as 0x40 — INFERRED
+  from MAME, not a Namco document). The DS modulate
+  `((t + 1)(v + 1) - 1) >> 6` (GBATEK) is keyed on DS_FIXED and is a
+  VERTEX / FACE-rate feature: a per-pixel scene shades DS_FIXED per pixel
+  WITHOUT the blend. Not reproduced: the N64's second cycle, the Saturn's
+  per-corner table.
+- **PS2_HIGHLIGHT (C017).** ps2tek TEX0 HIGHLIGHT, `Rv = ((Rf * Rt) >> 7)
+  + Af`: the specular sum rides the corner's alpha as its Rec.601 luminance
+  and is added white after the texel, truncated at 0xFF, multiplied by the
+  corner's fog transmittance. A carrying material routes through the
+  RESULT bookkeeping, so `light_clamp` applies once to the summed diffuse
+  instead of per light (disclosed).
+- **D3D_SEPARATE_SPEC (C076).** D3D9 "Specular Lighting", GL 1.2
+  `GL_SEPARATE_SPECULAR_COLOR`, KallistiOS `oargb`: the texel modulates the
+  diffuse only; the specular is added after as its luminance (the Specular
+  Color tint folds to luminance — disclosed), clamped at 1, UNFOGGED.
+- **PCX_INTENSITY (C078).** PowerVR PCX1/PCX2 (a PowerVR engineer's
+  description; vintage3d's reviews): one base colour per triangle times one
+  interpolated intensity. The base colour is the MEAN of the three lit
+  corners — the driver's choice is undocumented, the MEAN is Halcyon's
+  (disclosed). One division, a driver 2.5-ulp divide (expected).
+- **DS_TOON / DS_HIGHLIGHT (C034).** GBATEK TOON_TABLE; melonDS
+  `RenderToonTable`. The lit RED (saturated to 5 bits) indexes a 32-entry
+  table that replaces (Toon) or modulates-and-adds (Highlight) before the
+  texel. The table's CONTENT was game data on the DS; Halcyon fills ONE
+  table per material from Toon Size and Toon Steps with HARD edges — a
+  reconstruction (disclosed). A linked Toon Size refuses by name and the
+  material shades as DS_FIXED. The DS index reads a 5-bit-stepped diffuse
+  red plus the unstepped specular red (one extra rounding against the DS,
+  disclosed). **OPEN DEFECT — DS_HIGHLIGHT whitens every lit surface at the
+  default table.** On the textured demo at 320x240 (Toon Size 0.5, Toon
+  Steps 2) 46,602 pixels, 60.68% of the frame, are pure white: floor, ball
+  and cube. The table always tops out at 63, the demo lamps put most of the
+  frame on the top entry, and highlight mode adds the entry after
+  modulating by it, so the add saturates. A narrow band does not help
+  (Toon Size 0.9: 59.85% white); half-energy lamps with 8 steps give 1.70%
+  white (the fix agent's measurements; the collage carries both rows and
+  the default row is labelled as saturating). **The hardware rule is
+  undecided between two cited sources:** GBATEK gives the form as built
+  (`((Rt+1)*(Rs+1)-1)/64 + Rs`, Rs the table entry, truncated at 63);
+  melonDS's `GPU3D_Soft.cpp` modulates the texel by the VERTEX red as grey
+  and adds the entry. The arithmetic was NOT changed. The fix agent's
+  reasoning — not a render — is that the default table whitens under
+  either rule. The model's tooltip says since fix pass 3 that the default
+  table saturates and that the texel shows only at entries strictly
+  between 0 and 63 (more steps, and lamps dimmed off the top entry but
+  not down to entry 0, which is black); the catalogue's C034 line cites
+  melonDS for a rule it does not support.
+- **The 64-step luma ramp (C066).** MAME `model1_v.cpp` / `model2rd.ipp`.
+  Keyed on SEGA_MODEL2 (one luma per polygon) and SEGA_MODEL3 (per vertex):
+  the lit term collapses to one luminance on 64 rungs before it meets
+  colour. The ramps and gamma table were game-written RAM; the LINEAR
+  64-entry ramp is a stand-in (disclosed).
+- **MEGA_DRIVE_SH (C057).** The Mega Drive VDP's shadow / highlight mode
+  (plutiedev's colour ramp; spritesmind's measured 15 DAC levels): the
+  albedo crushed to 3 bits and read through the NORMAL / SHADOW / HIGHLIGHT
+  ramps. The VDP had no lighting: "key lamp lit fraction < 1/2 = SHADOW,
+  specular >= 1/2 = HIGHLIGHT" is Halcyon's mapping onto an operator the
+  games drove by sprite priority (disclosed); a light limit that culls the
+  first lamp shadows everything.
+- **SUPERFX_PLOT (C049).** Super FX (bsnes `plot()`: the dither nibble by
+  `(x ^ y) & 1`). One PAIR of fixed-palette entries per face, filled as a
+  50% checkerboard at output-pixel pitch before any post; the pair rule
+  (nearest doubled mean) is Halcyon's — the games chose pairs by hand
+  (disclosed). Needs a fixed palette of at most 16 entries, gamma 1 and no
+  display transform, or it shades FLAT and prints why on both roads (the
+  refusal print and the bitwise FLAT twin at defaults were measured by the
+  fix agent). Bitwise in the simulator and on the fake device (the pass
+  selects CPU-chosen entries). Resolution shelf: Super FX 256x192, 256x160,
+  256x128 at the SNES's 8:7.
+
+**REYES and the period nodes (MAT_B).**
+
+- **REYES shading rate (C119).** Pixar REYES 1987 / PRMan `RiShadingRate`
+  with "constant" interpolation (RISpec 3.2 s4.2.7–8). Dial:
+  `shading_rate_area`, the area in OUTPUT pixels one shade covers. Halcyon
+  dices each TRIANGLE's barycentric plane into n × n cells where the paper
+  dices the primitive's own (u, v) — a reconstruction (disclosed). Road:
+  the snap is d == 0.0 on 4096 lanes in the simulator; the frame 3.3e-6 at
+  rate 4 and 1.3e-6 at rate 16 under LINEAR fog (bar 6e-3). Refuses the GPU
+  by name: affine texturing, hit and layer passes, a material with a Bump
+  height pre-pass. The CPU's uv gradients are taken at the cell corner, the
+  GPU's at the pixel — a difference only under TRILINEAR / anisotropic
+  filtering (disclosed). On the driver (variants 136, 137, 158): rate
+  4 on the demo, max 3.92e-3 (one 8-bit level, under the 6e-3 bar) at
+  (21, 517), 17 pixels above 1e-3, 0 above 1e-2; 81–82 ms warm against
+  1128 on the CPU device. Rate 16 ran on the RENDERMAN preset only, on
+  the refusal road, and differs at 1 pixel, max 2.26e-1 at (300, 574) (0
+  pixels in run 3, over the CPU's raster): the block prints
+  `sky: on the CPU; frame kept through nothing` and `post: on the CPU`,
+  the GPU device takes 6184–6244 ms warm against 6483, and the console
+  names the refusal (`'Floor': REYES shading rate snaps the camera
+  G-buffer's barycentrics; a hit/layer pass has none -- shades on the
+  CPU`, `docs-dev/r251_field4_console_part_131.txt`). The RENDERMAN
+  preset as shipped, on the same road: 4 pixels, all above 1e-2, max
+  1.67e-1 at (60, 731) (0 in run 3); 29126–29204 ms warm against 30595.
+- **Combiner Stage node (C028).** GameCube / Wii TEV and the Xbox NV2A
+  register combiner (bmdview and amnoid's TEV notes; NV_register_combiners;
+  xboxdevwiki). One fixed-point stage. Not built: the NV2A mux, dot-product
+  modes and final combiner; TEV's konst selection. Simulator: d == 0.0 on
+  4096 lanes for all 27 op / mapping / bias / scale cases; frame 7.15e-7.
+  **Weak evidence, said plainly:** the matrix row "node combiner TEV" and
+  the collage row use op ADD, bias +0.5, scale ×2, which clamps to white
+  on every channel — real hardware would do the same with those registers,
+  but that row compares white with white and shows nothing; the
+  non-saturating cases are the module's function twin. On the driver: no
+  720p row (the field's list carries settings; a node lives in the
+  material graph). The 96x72 matrix prints `node combiner TEV` and `node
+  combiner NV2A` at 0.000000 with 0 pixels above 1e-2 (stages RSP). The
+  TEV row is the saturating one named above; the NV2A row is the same
+  graph with EXPAND_NORMAL on A, and whether it saturates was not
+  checked. A non-saturating TEV stage has no driver row.
+- **SR Bump node (C023).** PowerVR2 CLX2 (flycast `pp_BumpMap`; KallistiOS
+  `pvr_pack_bump`): two 8-bit angles per texel, the polygon's K1/K2/K3/Q.
+  Halcyon quantises a tangent-space normal map to those angles through
+  baked tables. The azimuth ORIGIN is Halcyon's stated one; a mirrored
+  azimuth against KallistiOS would move pixels and has NOT been checked
+  against a KOS checkout (open). A linked Light shades on the CPU, by name.
+  Simulator: bitwise on 4096 texel lanes × 4 lights; frame 7.15e-7 under
+  NEAREST. On the driver: no 720p row (a node). The 96x72 matrix row is
+  MULTIPLY under NEAREST and prints 0.000000 with 0 pixels above 1e-2
+  (stages RSP). ADD has no driver row.
+- **Emboss Shift + Emboss Bump nodes (C135).** DirectX 6 texture embossing
+  (Game Developer, "Ups and Downs of Bump Mapping with DirectX 6"): the
+  height map sampled twice, the shifted sample subtracted, the base applied
+  modulate-2x. TWO nodes, not the spec's one: a single node feeding its own
+  input is a cycle Blender refuses. A linked Texture Size refuses by name.
+  Simulator: both stages bitwise; frame 7.15e-7. The collage tile (a
+  mostly white ball with dark crack lines) could not be judged at 320x240
+  and was not investigated. On the driver: no 720p row (a node). The 96x72
+  matrix row samples Closest and prints 0.000000 with 0 pixels above 1e-2
+  (stages RSP). Linear has no driver row.
+- **Roughness (Imagine) node (C099).** Impulse Imagine / Turbo Silver
+  (Imagine 3.0 Reference Manual ch. 5): a per-pixel random turn of the
+  shading normal. `0.5 × r/255` is Halcyon's calibration of an attribute
+  the manual never quantified (255 turns the normal about 22° mean);
+  `Shimmer` re-randomises per frame, Imagine's own behaviour, off by
+  default. Simulator: bitwise on 4096 pixels; frame 1.81e-5 (the deferred
+  bar). On a driver `normalize` is a 2-ulp inversesqrt (expected). Refuses
+  a hit pass by name (no pixel position). On the driver: no 720p row (a
+  node). The 96x72 matrix has one row, at its own Roughness value, and
+  prints 0.000000 with 0 pixels above 1e-2 (stages RSP). 128 and 255
+  have no driver row.
+- **Env Chrome node (C123).** Alias PowerAnimator / Maya 1–4 `envChrome`:
+  the procedural showroom seen only in reflections. Maya's PARAMETERS at
+  Maya's defaults; the plane distance, the blend curves and the six colours
+  are Halcyon's — "a showroom of the same description, not a pixel match"
+  (Maya's are unpublished). Simulator: bitwise on 4096 rays; frame 6.2e-6.
+  The collage tile (a pink-white ball with a speckled lower half) could not
+  be judged and was not investigated. On the driver: no 720p row (a node).
+  The 96x72 matrix row is Env Chrome into Matcap Add on the PHONG ball
+  and prints 0.000000 with 0 pixels above 1e-2 (stages RSP).
+
+#### Raster (wave 1: RAST_A1, RAST_B; wave 2: RAST_A2)
+
+- **Painter's sort on the GPU rasteriser (C004, part one; wave 1).** The
+  six Painter's presets no longer lose the GPU raster: the named tie rule
+  made the sort order-free, the kernel reads the polygon's one depth, and
+  the two gate refusals left (bands, overdraw) are now PRINTED by name.
+  Pre-existing and unchanged, disclosed: `quantize_depth` runs on the
+  painter's key (a distance treated as NDC z). The driver row (variant 33)
+  is NOT zero: max 2.47e-1 at (31, 909), 20 pixels above 1e-3, 3 above
+  1e-2; 136–142 ms warm against 1773 on the CPU device.
+- **Ordering-table buckets (C004, part two; wave 1).** PlayStation (Psy-Q
+  "Ordering Table Tutorial"; psx-spx AVSZ3 / OTZ). Dials: `painters_key
+  ORDERING_TABLE`, `ot_length`, `ot_far`: the AVSZ3 average bucketed, far
+  buckets first, first-added on top, a polygon past the table or past
+  1023x511 pixels dropped whole. In the simulator (160x120, 4096 entries to
+  40 units) the kernel picks the CPU fill's winner at every pixel (0 of
+  19200 ids differ) and the bucket depth round-trips bitwise; the
+  barycentrics agree to 1.19e-7 (bar 1e-5), the raster's standing figure.
+  The far wall and the size drop are pinned on the CPU fill only, and the
+  suite's one frame check for this key ran without a driver, so both of
+  its frames came from the CPU.
+- **Integer pixel centres (C084; wave 1).** Direct3D 3–9 (Microsoft,
+  "Directly Mapping Texels to Pixels"). Dial: `pixel_center
+  INTEGER_D3D`: the raster's sample grid moves half a pixel, on both roads before
+  either fill. The shift is the RASTER's and the wire lines': the sky,
+  halos, flares, shafts, cel field and SSS stay on the +0.5 grid, as a D3D9
+  title's screen-space effects did.
+- **Near-plane whole-triangle rejection (C027; wave 1).** PS2 VU1 and the
+  PS1 GTE (Hughes, GDC 2002; psx-spx FLAG bits). Dial: `near_clip_mode
+  REJECT`: a polygon with any vertex failing the near test or the fixed
+  ±6.4-half-screen guard is dropped whole, before the clipper, on both
+  roads.
+- **The depth encodings (C007 N64 18-bit floating z; C026 GameCube 14e2 /
+  13e3 / 12e4 and the Xbox fixed-point W; C075 Voodoo 16-bit floating W;
+  wave 1).** angrylion `z_build_com_table`; the GX manual and Dolphin
+  `BPMemory.h` (the three GameCube layouts are RECONSTRUCTED from the
+  manual's stated resolutions — disclosed); xemu and `D3DZB_USEW`; MAME
+  `compute_wfloat` (pinned against an integer transcription). Dial:
+  `depth_encoding`. Road: bitwise in the simulator (keys, decoded depths,
+  winners); on a driver the winner at a MARKED pixel is the CPU's own
+  replay, and a lone candidate within an ulp of a boundary may store a code
+  one step off. A frame that is one coincident sheet over the floor marks
+  37–56% of its pixels, exceeds the 10% referral budget and rasterises on
+  the CPU whole, with the count printed. The W items refuse an orthographic
+  camera by name; an encoding under Painter's falls back to LINEAR by name.
+  Not carried: the N64's decal / transparent / interpenetrating compare
+  modes. On the demo scene at 96x72 the encodings do not move the PICTURE
+  (0–1 pixels: the scene sits in every encoding's far segment); the tests
+  pin the depth plane and a fighting-sheet scene instead.
+- **LightWave Limit Dynamic Range (C094; wave 1).** LightWave 5.6–7.5 (LW 7
+  manual ch. 14). Dial: `aa_clamp_samples`: each sample clipped at 1.0
+  before the AA filter. Bitwise twin (the RESOLVE_C variant); at ONE sample
+  the GPU road reads back by name (`sample clamp at 1 sample`). Halcyon's
+  resolve is a per-pixel tile, so the "halo" is the edge pixel saturating.
+- **Blender 2.41 gamma-2 OSA blend (C122; wave 1).** Blender 2.2x–2.41
+  (`initrender.c`, `gammaCorrectionTables.c`). Dial: `aa_gamma_blend`: the
+  samples blended through 400-entry gamma-2 tables. The RESOLVE stage is
+  bitwise `render._resolve` on the same samples in the simulator (0.0:
+  BOX at ss 2 and 3, TRIANGLE and CATROM at ss 2, GAUSS and MITCHELL at
+  ss 3; the other pairs are not checked); the whole GPU-road frame at ss 2
+  through the fake device measured 1.37e-6 from the CPU frame (1.07e-6
+  with the sample clamp on; bar 6e-6), alpha bitwise.
+  Halcyon clamps where Blender called `pow` outside the table; the
+  alpha-Key exclusion is not modelled.
+- **Elite wireframe rule (C063; wave 1) — CPU-only by name.** BBC Micro
+  Elite (Mark Moxon, bbcelite.com): an edge draws when either face faces
+  the viewer, no depth test. Dials: `wire_mode ELITE`,
+  `wire_dot_distance`. Vertices are welded by position and a flat quad's
+  diagonal never draws. Drawn on the CPU on both devices through the wire
+  road's readback (`wireframe`).
+- **Vector monitor beam (C055; wave 1) — CPU-only by name.** Atari DVG /
+  AVG / Star Wars (Margolin, "The Secret Life of Vector Generators"; MAME
+  `avgdvg.c`). Dials: `wire_mode BEAM`, `beam_machine`, `beam_sigma`: a
+  Gaussian spot along each stroke at quantised intensity, dwell dots at the
+  ends, additive crossings, from a pinned integer table. The per-machine
+  dwell constants are CHOSEN, not measured; the DVG's length dimming is not
+  modelled. The same CPU road as Elite.
+- **Vertex format quantisation (C012; wave 2).** PS1 GTE and N64 RSP 16-bit
+  vertices (psx-spx; libultra `gbi.h` `Vtx_t`). Dials: `vertex_quantize`,
+  `vertex_units`: the mesh rounded once before either rasteriser, the BVH,
+  the shadows or the shading read it — shared data, so the two roads see
+  the same mesh. The lattice is a WORLD grid where the consoles quantised
+  in model space (an animated object crunches against a fixed world grid —
+  disclosed); the N64's S10.5 UV grid is not modelled. On the driver
+  (variants 152–155) the two 8-unit rows have their maximum, one 8-bit
+  level (3.92e-3), at (12, 896) and nothing above 1e-2: PS1 17 pixels,
+  N64 20. PS1 at 64 units: 20 pixels above 1e-3, 1 above 1e-2, max
+  4.04e-1 at (64, 723) (in run 3, over the CPU's raster, 19 pixels at
+  one level). The PSX preset row: 1 pixel, max 3.23e-2 at (523, 542).
+- **Jittered sample positions (C127; wave 2).** REYES / PRMan (Cook,
+  Carpenter, Catmull 1987; `RiPixelSamples`). Dial: `aa_sample_pattern
+  JITTER`: every sample moved by Halcyon's integer hash. Ids bitwise in the
+  simulator, the barycentrics within the raster's standing bar. Inert
+  under EDGE / ADAPTIVE / ACCUMULATE. Texture footprints still use the
+  regular spacing (mip selection off by up to a subpixel, both roads
+  alike). On the driver (variants 156, 157) neither row is 0 and
+  neither maximum is the parked pixel: at 4 samples max 1.41e-1 at (359,
+  573), 21 pixels above 1e-3, 5 above 1e-2; at 1 sample max 2.43e-1 at
+  (300, 574), 22 pixels above 1e-3, 3 above 1e-2. Not diagnosed. The
+  RENDERMAN preset row (variant 158), on the refusal road, differs at 4
+  pixels, max 1.67e-1 at (60, 731) (the REYES bullet, C119).
+- **Rear-plane depth bitmap (C038; wave 2).** Nintendo DS (GBATEK
+  CLEAR_DEPTH / CLRIMAGE_OFFSET; melonDS). Dials on the World: a float Z
+  pass as the bitmap, its offset: both rasterisers start their z-buffer
+  from it. The distance goes through the frame's own encoding where the DS
+  expanded a 15-bit bitmap; an 8-bit or colour-managed image is refused by
+  name. On the driver (variants 159, 160): a slanted wall the sphere
+  passes behind. Alone: max 5.45e-1 at (233, 323), 18 pixels above 1e-3,
+  2 above 1e-2 (in run 3, over the CPU's raster, the max was the parked
+  pixel, the one above 1e-2). Under N64_FLOAT18: max 1.33e-1 at the
+  parked pixel (76, 688), the one pixel above 1e-2, with 17 pixels above
+  1e-3.
+- **N64 coverage AA and the divot (C001; wave 2).** The RDP's 3-bit
+  coverage blended at scan-out by the Video Interface (angrylion-rdp-plus
+  `video_filter16` / `video_max_optimized`, `divot.c`, read from the source
+  this round: the spec's form overshot — 70 pixels outside their own 3x3
+  range on the demo — and was corrected). Dials: `n64_coverage_aa`,
+  `n64_divot`. Two integer passes, bitwise in the simulator; on a driver a
+  pixel with a subsample inside the edge wobble window is marked and its
+  coverage is the CPU's replay. NOT modelled: the RDP's coverage
+  accumulate (coverage is the winning polygon's alone, so interior seams
+  soften too); the VI's 2x bilinear scale (half of the "N64 blur" stays
+  open); coverage under supersampling. **The stage reads the frame as 5
+  bits per channel whatever `color_depth` says**, so with the flag alone
+  shading gradients band over the whole frame: the collage rows move about
+  66,000 of 76,800 pixels and show contour rings inside flat faces, not
+  only softened edges (seen in the sheet and read from the row's label;
+  `core/n64vi.py` was not re-read to confirm). On the driver at 720p
+  (variants 161–165) the post line lists N64VI_AA, and N64VI_DIVOT where
+  the divot is on, as GPU stages with no readback. With the divot and
+  without it: max 1.61e-1 at the parked pixel (76, 688), 3 pixels, all
+  above 1e-2; the post chain compared alone differs at 2 pixels by
+  3.14e-2. On the coverage-edge rig: 1 pixel, the same 1.61e-1 at the
+  same (76, 688). The N64 preset, and the same under the HDRI world: max
+  7.84e-3 (two 8-bit levels) at (7, 534), 4 pixels and 2, none above
+  1e-2 (the N64 preset: 232–283 ms warm against 2432 on the CPU device).
+  The report does not print the mark count. **A defect found by run 3's
+  own 96x72 matrix, fixed (fix pass 4) and rerun.** That matrix FAILED
+  `N64 coverage AA + VI filter` and the coverage-edge rig row (max
+  0.819608 on both; 5512 and 5452 of 6912 pixels above 1e-2) and its
+  console printed `N64 VI filter skipped: no coverage plane for this
+  frame` on the GPU device.
+  Cause: the GPU rasteriser writes the coverage plane only into a plane
+  that exists, the CPU fill allocates its own, and the renderer never
+  allocated one before the GPU raster call. A GPU-rastered frame so had
+  no coverage and the filter was skipped; the plane-less G-buffer was
+  then cached and served to the next CPU frame of the same key (the
+  no-divot row's 0.000000 was BOTH devices skipping the filter). The GPU
+  rasteriser is on by default, so the N64 preset rendered without its
+  anti-aliasing on the GPU device. Run 3's 720p rows did not show it:
+  their GPU runs were served the CPU run's cached G-buffer (the driver
+  section says what that meant for that run's 720p rows). Fixed by
+  allocating the plane; in run 4, on the driver on 2026-10-05, the three
+  matrix rows read 0.000000 at 0 pixels with rasteriser, shading and
+  post all on the GPU, the skip line is gone, and the five 720p rows,
+  now rasterised on the GPU, read 3, 3, 1, 4 and 2 pixels (3, 3, 1, 4
+  and 4 in run 3). The headless suite could not see it (the fake device
+  cannot build the compute raster); a spy test now stands at that door.
+
+#### Texture (wave 1: TEX_1; wave 2: TEX_2)
+
+The storage laws (formats, TMEM, block compression) are applied once, at
+texture preparation, and both devices sample the ONE prepared array, so
+they need no GLSL. The deferred frame itself stays at the lighting-ulp bar
+(NEAREST 5.96e-6 measured by the pack). Predating this round and open: the
+prepared-texture cache is keyed by `id()` of the pixel array (see *Still
+open*).
+
+On the driver (run 4, 2026-10-05, RTX 5060 Ti, 1280x720): the
+field script renders the demo scene WITHOUT its checker
+(`demo_scene(st, with_texture=False)`: three plain materials, no image),
+so the 720p rows named after this block's features sample no texel. They
+show the two devices agree on that frame with the dial set, not the dial
+at work. The dials met a texture on the driver only in the run's 96x72
+feature matrix (max |diff| over the frame, six decimals; then the pixels
+above 1e-2). Its wave-1 rows: the five texel formats, the two TMEM
+budgets and the 4-bit fraction max 0.000000; DXT1, the NV2A decode,
+CMPR, VQ and the POV filter max 0.003922 (one 8-bit level); no pixel
+above 1e-2 in the thirteen. The wave-2 rows are quoted per bullet below,
+beside the 720p row.
+
+- **Texel Format (C074; wave 1).** The once-per-upload conversion of
+  1996–2001 accelerators (Glide 3.0 Programming Guide; OpenGlide). Dial:
+  `tex_format`, 16 items: 5:6:5, 4:4:4:4, 1:5:5:5, 3:3:2, the Glide
+  intensity formats, the NCC YIQ items, Model 2's 4-bit luma (MAME
+  `model2rd.ipp`), the DS's A3I5 / A5I3 (GBATEK). The NCC FIT is Halcyon's
+  own deterministic one (TexUS's fitter was never published); DS palette
+  keying and TEX4X4 stay out.
+- **N64 TMEM Budget (C013; wave 1).** The N64 Programming Manual's layout:
+  4 KB, CI formats in the lower 2 KB. Dial: `tex_tmem_format`, 10 items.
+  CI palettes are Halcyon's median cut (the SDK converter was per artist).
+- **Block Compression (C024; wave 1).** DXT1 (Khronos S3TC, S3's min/max
+  luminance endpoints), the NV2A's 16-bit interpolation (its rounding is
+  undocumented: floor in 5/6/5 is the reading), GameCube CMPR (Dolphin's
+  `DXTBlend`), Dreamcast VQ. Dial: `tex_compress`. The VQ codebook is
+  Halcyon's own seeded LBG (the SDK quantiser is unpublished): identical
+  between the two DEVICES by construction, but a float64 fit NOT pinned
+  across NumPy versions. Each pool worker re-encodes once (about 1 s for a
+  1024² VQ).
+- **Bilinear Fraction Bits (C080; wave 1).** MAME's `bilinear_mask` (4 bits
+  Voodoo Graphics, 8 bits Voodoo2). Dial: `tex_frac_bits`. The GLSL twin
+  emits the CPU's `a + (b - a) * t` under the dial: the sampler 0.0 in the
+  simulator on the frame's own inputs, the deferred frame 5.96e-6 from the
+  CPU frame (the lighting's bar, not the sampler's). Under TRILINEAR the level blend carries 1.89.0's
+  pre-existing 1 ulp (5.96e-8: the CPU rounds once in float64, GLSL twice).
+- **Normalised Distance filter (C111; wave 1).** POV-Ray `imageutil.cpp`
+  `Interp()` (interpolate 4). Dial: `tex_filter POV_NORMDIST`.
+  The sampler is bitwise `Texture.sample` in the simulator (0.0 on all four
+  wraps and on the frame's own uv); the deferred frame measured 5.44e-5
+  from the CPU frame (bar 6e-3; nine times the 5.96e-6 the NEAREST frames
+  print, cause not looked for). On a driver the division is within 2.5 ulp
+  (stated). The 1e-12 guard at an exact centre is Halcyon's; a texel of
+  exactly 0 reads about 1e-12.
+- **GL_CLAMP border seams (C077; wave 2).** OpenGL 1.0/1.1's own clamp
+  (the half-texel dark seam of GLQuake-era sky boxes on conformant
+  drivers). Dial: `tex_clamp_mode`. Sampler 0.0 in the simulator. No preset
+  sets it. Driver: the matrix row (BILINEAR on the extend scene) max
+  0.000000. The 720p row (the dial on the VOODOO preset, no texel): 0 of
+  921,600 pixels; CPU 1659 ms, GPU 208 / 215 ms warm (variant 166).
+- **Chroma key after filtering (C083; wave 2).** MAME's `chroma_key_test`;
+  Glide `grChromakeyMode`; Direct3D DDCKEY_SRCBLT. Dials: `tex_colorkey`,
+  `tex_colorkey_range` (the Voodoo2's chromaRange). Alpha holes are stored
+  as OPAQUE black at preparation and the filter bleeds a dark fringe that
+  survives the test. Halcyon blends LINEAR texels where the card blended
+  bytes, so a slightly wider fringe survives (disclosed); plain BILINEAR's
+  `mix()` (2e-5) can flip a verdict at the threshold. Sampler 0.0 in the
+  simulator on the bitwise samplers. **Fixed before release (fix pass 3): under a texel format with no
+  alpha plane the key keyed nothing.** `store_format` RGB565 wrote alpha 1
+  BEFORE `colorkey_prepare` looked for alpha below one half, so no hole was
+  found and the VOODOO and VOODOO2 presets' key moved 0 pixels (measured on
+  the pre-fix tree: 0 of 19200 on the keyed-alpha scene at 160x120 under
+  RGB565, RGB332 and RGB5550; 791 with the format off or at ARGB1555). The
+  pack's spec prescribed that order; the method's own description (the
+  driver converts cut-outs to the key colour BECAUSE a keyed format carried
+  no alpha) decided it was a defect. The storage law now converts the
+  cut-outs itself when the key is on and the format has no alpha plane
+  (RGB565, RGB332, RGB5550, YIQ422, I4): every hole texel is stored as
+  exact opaque black (52 of 52 on the test image), every other texel is
+  bitwise the unkeyed law (with block compression off: see below), a
+  format with an alpha plane of its own is bitwise untouched, and with
+  the key off the code path is the old one (the review hashed the
+  prepared texture over 1216 configurations in both trees: only an
+  alpha-less format with the key on and a cut-out image differs).
+  Measured after: 1545 of 19200 pixels move under each of the three
+  formats, 1518 / 1545 under the VOODOO / VOODOO2 presets' texture laws
+  (more than the 791 without a format, because there the image's alpha
+  already cut the hole and the key only changes the fringe; under 5:6:5
+  the key is the only thing that cuts it). Simulator: the emitted sampler
+  0.0 on the frame's own inputs, the deferred frame 5.96e-6 from the CPU
+  frame (at the presets' full laws: mips, the dithered per-polygon level).
+  **What the working key now does under the two presets:** a texture with
+  alpha below one half whose Alpha is NOT wired shows those texels black
+  (the key's prep half; reported by the review at 160x120: 0 pixels before,
+  1505 / 1516 after under VOODOO / VOODOO2). A texture that carries a mask
+  in its alpha gets black areas; the presets' notes say so. Left as is,
+  disclosed, none of it a preset's combination: under the formats whose
+  alpha is not the source's (I8 and the N64's I4 read it from intensity;
+  Model 2's I4 from its white marker) the key's prep never sees the
+  source's cut-outs; with block compression after an alpha-less format
+  the conversion runs BEFORE the compression, so black becomes a block
+  endpoint and neighbours move (reported: RGB565 + DXT1 104 of 3472
+  non-hole texels, up to 31/255; + VQ 340, and 16 holes lost); under NCC
+  the table is fitted to the image before the key, and the stored black
+  is not one of its colours. Driver: the matrix row (the keyed scene,
+  BILINEAR at 4 fraction bits, no texel format) max 0.000000. Under the
+  VOODOO / VOODOO2 presets no keyed texture met the driver: their 720p
+  rows hold no texel, 0 of 921,600 pixels each (variants 167, 168; GPU
+  206 / 204 and 213 / 211 ms warm, CPU 1319 and 1532 ms).
+- **Mip Level Select (C072; wave 2).** `tex_mip_select`: Blend (the N64's
+  lod_frac lerp), Nearest Level (GL 1.1's tie rule), Dither (Voodoo) —
+  MAME's `fetch_texel` on 8.8 LOD with the plain 4x4 Bayer. The level is
+  decided on the CPU and uploaded per pixel, so no driver sqrt or log2 can
+  become a level. The Voodoo matrix is applied vertically flipped against
+  the card (Halcyon's row 0 is the bottom — disclosed). Simulator: the
+  level picks 0.0, the two-level blends 1.2e-7 (1.89.0's ulp).
+  Driver, matrix rows on the textured demo: Blend, Nearest Level and
+  Dither each max 0.003922 (one 8-bit level), no pixel above 1e-2. 720p
+  rows (no texel): Blend on the N64 preset 4 pixels, max 7.84e-3 at (7,
+  534), as the plain N64 row; Nearest Level and Dither on the VOODOO
+  preset 0 pixels each (variants 169-171).
+- **Mip LOD Source: Triangle (C079; wave 2).** One level per polygon from
+  its texel-area / screen-area ratio (vintage3d's Riva 128 and Verite
+  reviews; MAME's `lodbase`). The Voodoo added log2(1/w) per pixel, which
+  this does not (disclosed). Driver: the matrix row (the textured demo,
+  Nearest Level) max 0.003922, no pixel above 1e-2; the 720p row (the
+  VOODOO preset, no texel) 0 of 921,600 pixels (variant 172).
+- **Mip LOD Source: GS Q, with K and L (C022; wave 2).** ps2tek's TEX1
+  formula `LOD = (log2(1/|Q|) << L) + K`, the four fractional bits taken
+  from the float's mantissa. One field upload more than DERIVATIVE per
+  frame (measured on the fake device). Driver, matrix rows on the textured
+  demo: NEAREST_LEVEL and TRILINEAR each max 0.003922, no pixel above
+  1e-2. The 720p row (the PS2 preset, no texel): 0 of 921,600 pixels,
+  its interlace on the CPU by name (variant 173).
+- **Sharpen (N64) (C008; wave 2).** angrylion `tcoord.c` and the Manual
+  13.7. Dial: `tex_lod_sharpen`. Halcyon lerps float texels then rounds to
+  8 bits where the RDP lerped 8-bit texels in 9-bit integers, and the 9-bit
+  wrap is evaluated on LINEAR texels (both disclosed). No preset sets it.
+  Sampler 0.0 in the simulator. Driver: the matrix row (3-point on the
+  magnified scene) max 0.000000; the 720p row (the N64 preset, no texel)
+  4 pixels, max 7.84e-3 at (7, 534), as the plain N64 row (variant 174).
+- **Summed Area filter (C088; wave 2).** Crow 1984 as 3D Studio R2–R4 and
+  MAX offered it. Dial: `tex_filter SUMMED_AREA`. The table holds 16-bit
+  values modulo 2^32, so the footprint is capped at 255 texels a side and
+  the box clamps at the texture edge (Crow's wrapped quadrants are not
+  reproduced). Sampler 0.0 in the simulator; on the deferred frame at 1:1
+  ONE pixel of 4263 differs by a whole texel (a box edge within a uv ulp of
+  a texel boundary — stated, allowed by the test). No preset switches it
+  on. **On the driver the matrix row at bias 0 FAILED:** max 0.278431,
+  1 pixel above 1e-2 (its bar 0.05), on the textured demo. One pixel is
+  what the frame twin allows headless; that this is the same box-edge
+  pixel was not checked. At bias 2 (footprint x4): max 0.000000. The
+  720p rows hold no texel. MAX_R2 with the filter set: 23 pixels of
+  921,600, 2 above 1e-2, max 1.18e-2 at (186, 535) (variant 175).
+  STUDIO_R4 with footprint x4: 354,017 pixels above 1e-2, max 0.484
+  (variant 176); that is the preset's FLOYD dither, not the filter: with
+  the dither off the frame differs at 4 pixels, max 3.23e-2 at (34,
+  1134); the post chain alone prints the same count, max and position
+  (control 210). See *Palette register depth* below.
+
+#### Transparency (wave 1: TRANS_1; wave 2: TRANS_2)
+
+The rule for the whole block: every fixed-point blend item REFUSES the GPU
+LAYER passes by name — on a 5- or 6-bit lattice a one-ulp device difference
+would become a whole level — and composites on the CPU on both devices; the
+opaque frame beneath stays on the GPU. So the composite is CPU against CPU
+by construction, and the whole frame sits at the deferred frame's own bar
+(measured by the pack on the fake device: 3.0e-7 to 4.8e-6), NOT bitwise.
+
+On the driver (run 4, 2026-10-05): the field script's 720p
+scene is the demo with three opaque materials, and its verdict compares
+rgb only, so no 720p row of this block blends or stipples a surface (the
+framebuffer-format rows do show the frame leaving the GPU at
+`framebuffer format`). The translucent scenes ran on the driver only in
+the run's 96x72 feature matrix (max |diff|, six decimals; then the
+pixels above 1e-2). Its wave-1 rows: the nine blend rows (PS1_ADD,
+SATURN_HALF, THREEDO_XOR, SNES_ADD_HALF, GBA, three DS rows, FUZZ) and
+the six framebuffer rows max 0.000000, COLUMNS max 0.003922; no pixel
+above 1e-2 in the sixteen. The wave-2 rows are quoted per bullet below.
+
+- **Blend equations (C002; wave 1).** PlayStation (psx-spx "Semi
+  Transparency"), Saturn VDP1, 3DO PIXC. Dials: `blend_equation` on the
+  render, `Blend Mode` per material. 5-bit integer equations in Halcyon's
+  own depth order: the PS1's ordering-table order and the 3DO's cel order
+  are not modelled.
+- **Framebuffer format (C018 + C070; wave 1).** The Voodoo's 565 pack with
+  dither subtraction (MAME), the PS2 GS's 16-bit buffer with DIMX (gsKit),
+  the GameCube's RGBA6 (Dolphin). Dials: `framebuffer`, `fb_dither`,
+  `fb_dither_subtract`. The truncation happens inside the pipeline, at
+  every write, instead of once at post; the frame leaves the GPU for it by
+  name (`framebuffer format`). Bitwise on the fake device (the pack
+  quantises the frame pass's ulps away). Under supersampling the resolve
+  averages the dither away. MAME's 565 re-pack is not a fixed point at the
+  ends of the matrix range (one level; disclosed). The alpha plane is
+  untouched; the Dreamcast's tile-write dither is unpublished and not
+  imitated.
+- **SNES / GBA colour math and the column mesh (C053; wave 1).** SNES
+  colour math (snes.nesdev.org), GBA BLDALPHA (GBATEK), the Mega Drive's
+  1x2 column stipple. The SNES's sprite-never-blends-sprite rule and
+  fixed-colour sub source are not modelled. **The COLUMNS collage row moves
+  0 rgb pixels:** a Screen Door hole is alpha 0 with the full rgb, so the
+  mesh is pinned in the alpha plane and the sheet shows nothing.
+- **DS translucency (C042; wave 1).** GBATEK and melonDS: (A+1)/32 on
+  6-bit channels, alpha max, one blend per polygon ID (Halcyon's object
+  index stands in), bottom-row-then-submission order. Dials:
+  `blend_equation DS`, `translucent_order`, `translucent_depth_write`.
+- **Doom fuzz (C062; wave 1).** `r_draw.c`'s 50-entry row table and the
+  6/32 darkening. The global fuzz counter is replaced by a per-column hash
+  (order-free); the darkening is a multiply, not the colormap lookup. The
+  worker pool is skipped by name (the composite reads neighbours).
+- **N64 random alpha compare (C015; wave 2).** angrylion `alpha_compare`
+  with `dither_alpha_en`. Dial: Screen Door pattern `N64_NOISE`: Halcyon's
+  hash in place of the RDP's LFSR, re-rolled every frame by design. The
+  GPU compares the CPU's own map, uploaded under one stable key. Alpha
+  plane d == 0.0 in the simulator. A per-pixel Opacity refuses by name.
+  **Its collage row moves 0 rgb pixels**, for COLUMNS's reason.
+  Driver: the matrix row (the glass scene) max 0.003922, no pixel above
+  1e-2. The 720p rows hold no stippled surface: 18 pixels of 921,600, 1
+  above 1e-2, max 1.33e-1 at the parked pixel (76, 688) (variant 177);
+  on the N64 preset 4 pixels, max 7.84e-3 at (7, 534) (variant 178). The
+  report prints no alpha-plane verdict and no second frame.
+- **PS2 two-pass alpha (C031; wave 2).** GS TEST / AFAIL (ps2tek). Dial:
+  material `alpha_mode CLIP_BLEND`: the solid part resolves in the
+  z-buffer, the soft remainder blends without depth. Under affine texturing
+  it refuses by name; a per-pixel alpha's LAYER pass refuses by name; a
+  constant alpha keeps it (alpha plane bitwise, rgb 4.77e-7 on the fake
+  device). Driver: no 720p row. The matrix row (the `clip_blend` scene):
+  max 0.000000; the promoted and the constant road were not measured
+  apart.
+- **Blender 2.4x Zoffs / ZInvert / Env (C126; wave 2).** Dials: material
+  `Z Offset`, `Invert Z Depth`, Blend Mode `ENV_HOLE`. The offset is
+  converted through the camera clip range as 2.4x's zbuf did (exact scene
+  units only under an orthographic camera). Zoffs / ZInvert composite on
+  the CPU on both roads; an Env material shades the frame on the CPU, by
+  name. A coplanar decal at Z Offset 0 still z-fights as in 1.89.0 (177 of
+  328 fragments, pinned). Driver: no 720p row. Matrix rows: the Z Offset
+  decal and the ZInvert shell each max 0.000000; the Env hole max
+  0.000000 with its shading and post on the CPU (stages `R--`).
+- **3ds Max Thin Wall Refraction (C095; wave 2).** Autodesk's map
+  reference. Blend Mode `THIN_WALL`, `Thickness Offset`: the frame beneath
+  the pane read at a pixel jogged along the projected normal. The
+  16-px-at-480-lines scale is Halcyon's calibration of an unpublished
+  constant. Refuses the GPU layers by name; the worker pool is skipped by
+  name. Driver: no 720p row. The matrix row (the tilted pane, IOR 1.5): max
+  0.000000.
+- **Imagine fog object (C101; wave 2).** Imagine 3.0 Reference Manual
+  ch. 5. Blend Mode `IMAGINE_FOG`, `Fog Length`: opacity = axial thickness
+  through the closed object / Fog Length. An object of another material
+  inside the fog is attenuated by the fog's WHOLE thickness at that pixel,
+  not the partial path (disclosed). Refuses the GPU layers by name; Sorted
+  Blend falls back to Alpha Over by name. Driver: no 720p row. The matrix
+  row (the Box as a fog object, Fog Length 4.0): max 0.000000.
+
+#### Sky and camera (wave 1: SKY, CAM)
+
+- **Cylinder Sky (C056).** Doom's sky columns (linuxdoom-1.10 `r_plane.c`:
+  `angle >> 22`, four repeats of a 256-column texture, centre row 100).
+  World > Sky > Cylinder Sky. The image reads right-to-left around the
+  turn, as Doom's did — a user will see it mirrored (disclosed).
+  Reflections see the flat colour (a backdrop, not an environment). The GPU
+  pass fetches the CPU's own integer tables: bitwise by construction.
+- **Gradient Backdrop (C100).** LightWave 3.5–7.5 (LW 7 manual ch. 14).
+  Four colours, a hard horizon, Sky / Ground Squeeze. LightWave never
+  published the squeeze curve; `1 - (1-u)^s` with whole-number s is
+  Halcyon's and **must be calibrated against a real LightWave render
+  before it is called exact** (open). Bitwise twin (repeated
+  multiplication, no `pow`). On the driver the sky alone is NOT bitwise
+  in its two 720p rows: one 8-bit level at 5 and at 3 of 921,600 pixels.
+- **Mode 7 floor (C048).** SNES PPU mode 7 / GBA affine backgrounds
+  (Anomie's register document; TONC; GBATEK). World > Infinite Ground >
+  Mode 7, from a map image; without one nothing is drawn. The 256-colour
+  palette is Halcyon's median cut on the resampled map, not a game's CLUT.
+  Mirrors and ray misses see no floor (a backdrop). Integer registers and
+  a palettised map as textures: bitwise by construction. A reflective
+  material under it still shades on the CPU.
+- **Y-shear pitch (C058).** Heretic / Hexen / Build / Marathon (ZDoom
+  wiki; Sanglard's Build internals). Dial: `camera_yshear`. The cap (32°
+  up, 56° down) is ZDoom's, not Build's (unpublished). No GLSL: both roads
+  read one matrix.
+- **Sliced panorama (C125).** Blender 1.x–2.4x Pano + Xparts
+  (`initrender.c`). Dial: `pano_parts`. Each strip is a whole render;
+  2.4's own sensor fit for parts taller than wide differed (disclosed).
+- **Layer parallax stereo (C016).** Nintendo Virtual Boy (Sacred Tech
+  Scroll): one whole-pixel parallax per object, an integer gather on the
+  CPU over one centre render. Where a shifted near card uncovers
+  background, the centre frame shows (the VIP drew its background world
+  there — disclosed).
+- **Stereo convergence sign (a fix).** The convergence shift had its sign
+  inverted since R190: the eyes diverged. Fixed; **every stereo pair with
+  a non-zero eye distance changes.** Also fixed: stereo with accumulation
+  or adaptive AA rendered a pair per AA pass.
+- **Lens-sampled depth of field (C098).** REYES / PRMan `RiDepthOfField`,
+  the SGI accumulation buffer (Haeberli & Akeley 1990), 3ds Max multi-pass
+  DOF. Dials: `dof_method LENS_ACCUMULATE`, `dof_lens_pattern`,
+  `dof_lens_samples`. The Halton disc stands in for the paper's
+  unpublished 23-point table; the Max spiral is a parametrisation of
+  documented dials, not a transcription. An F12 road: the viewport shows
+  NO depth of field under Lens Passes. The resident frame is read back per
+  pass.
+- **Dithered time-slice motion blur (C090).** 3D Studio R3–R4 / 3ds Max
+  Object Motion Blur, LightWave's Dithered blur. Dials: `motion_blur_mode`,
+  `motion_samples`, `motion_dither`, `motion_dither_tile`. The per-pixel
+  choice is Halcyon's integer hash standing in for Max's RNG; LightWave's
+  exact shutter phase and Max's dither kernel are unpublished (disclosed).
+  The combine runs where 1.89.0's mean ran, on both roads. No field row.
+
+#### Palette (wave 1: PAL_1; wave 2: PAL_2)
+
+- **The palette snap on the GPU (P0; wave 1).** The CPU's own inverse
+  colormap drawn as a texture (Heckbert 1982). Bitwise on the undithered
+  road in the simulator. Refused by name: the diffusion kinds, Blue Noise,
+  an unlocked adaptive palette, an imageless Custom palette. On a driver
+  the once-built adaptive palette is median-cut from the GPU's DISPLAY
+  output, so the two roads' FIRST frame may build tables that differ where
+  a pixel sits within 1e-5 of a 5-bit bin edge (disclosed).
+- **Ordered dither to bits on the GPU (P1; wave 1).** The CPU's own Bayer
+  matrix and level table as the ORDERED stage; the never-called DITHER
+  stage is retired. Bitwise in the simulator; on a driver a multiply-add
+  before a half-even round. The machines' per-primitive write-time matrices
+  are the framebuffer formats of the transparency block, not this.
+- **Palette register depth (C061; wave 1).** Dial: `palette_bits`: the
+  registers snapped to the machine's DAC lattice (an ST's 3 bits, the
+  Amiga's 4, VGA's 6) before the per-pixel search. The SNES, Neo Geo and
+  32X presets' `'5'` and Turbo Silver's `'6'` were not colour-depth items
+  and quantised NOTHING in 1.89.0; they now hold 256 adaptive colours.
+  Measured by the pack: on the demo frame the BITS_5 snap itself moves 0
+  pixels under SNES and SEGA_32X (the median cut already returns 5-bit
+  bins); those two move by the depth item, NEO_GEO (octree) by the snap.
+  **Display before error diffusion — wired, active on the driver, and not
+  the cure.** `core/post.py` runs the display transform on the CPU, by
+  name, when an error-diffusion dither follows. In the full driver run
+  (run 4, 2026-10-05, RTX 5060 Ti) both FLOYD presets of this feature print
+  that routing (`display (the FLOYD error-diffusion dither follows: the
+  driver's gamma ulps would cascade)` runs on the CPU, GPU stages `[]`)
+  and still differ between the devices: ATARI_ST at 351,922 of 921,600
+  pixels above 1e-2 (max 1.00), AMIGA_OCS at 67,372 (max 0.533). The
+  counts depend on the raster the diffusion starts from: run 3, over the
+  CPU's raster, read 289,708 and 364,620. Controls on the driver
+  (variants 207–209): ATARI_ST with the dither off 0 pixels, with BAYER4
+  in its place 0 pixels; AMIGA_OCS with the dither off 1 pixel, max
+  2.00e-1 at (37, 789), a place that recurs across run 4's rows, the
+  post chain alone 0 (0 pixels in run 3). So the registers, their snap
+  and the palette search agree, and moving the display transform did not
+  make the frames agree. The run's 96x72 matrix row `error diffusion FLOYD`
+  FAILED as well: max 0.032258, 724 pixels above 1e-2 (bar 0.006), its
+  post on the CPU. The reading: the driver's shading is close to the
+  CPU's, not bitwise (the same report's deferred frame: max 0.000023),
+  and error diffusion carries a last-bit difference forward into a
+  different dither pattern. Under an error-diffusion dither the two
+  devices give different, equally dithered pictures. That breaks the
+  rule of identical pixels across devices. It was measured on three
+  presets (STUDIO_R4 is the third, under *Summed Area* above); the
+  reading extends it to every error-diffusion dither, and it predates
+  this round: it had never been measured. Whether such frames render on
+  the CPU by name or keep the GPU's speed with the difference printed is
+  the user's decision and is OPEN; since fix pass 4 the routing's console
+  line says the pattern still differs. As run in run 4: ATARI_ST CPU 4583
+  ms, GPU 1792 / 1782 ms warm; AMIGA_OCS 3792 ms, 1785 / 1801 ms.
+- **Extra Half-Brite (C054; wave 1).** Amiga Hardware Reference Manual:
+  32 twelve-bit registers and their component-wise halves. The fit is
+  Halcyon's median cut, not DeluxePaint's or a demo's hand palette. The
+  EHB stage is bitwise in the simulator.
+- **CRY colour (C011; wave 1).** Atari Jaguar (Technical Reference Manual
+  rev. 8): 8-bit intensity × a 256-cell chroma table. The 16x16 chroma
+  square is Halcyon's OWN derivation, not the manual's published tables:
+  **how many of the 256 cells differ from the manual's is UNMEASURED.**
+  The Blitter's intensity-only Gouraud is not modelled. A dither is
+  ignored with a printed note.
+- **YJK colour (C059; wave 1).** MSX2+ Screen 12 (Grauw, "YJK colour"):
+  5-bit luma per pixel, chroma per four. Screen 12 only; the preset does
+  not dither inside the encoder as the photo converters did.
+- **Super Black (C092; wave 2).** 3D Studio / 3ds Max. Dials:
+  `super_black`, `super_black_threshold` (15): geometry-covered pixels are
+  floored, the background left at 0. The coverage is the OPAQUE G-buffer's
+  (a pixel covered only by blended geometry is not floored); the process
+  pool, panoramas and Pano Parts carry no plane (skipped by name).
+  SUPERBLACK d == 0.0 in the simulator and on the fake device.
+  Driver: the self test's SUPERBLACK row prints max diff 0.00000, EXACT.
+  At 720p the stage draws on the GPU (`DISPLAY`, `SUPERBLACK`, `QUANT`;
+  no readback). Threshold 15: 5 pixels of 921,600, 1 above 1e-2, max
+  1.57e-2 at the parked pixel (76, 688); the post chain alone 4 pixels
+  at one 8-bit level (variant 179). Threshold 64 at 4 samples: 0 pixels,
+  the post chain alone 0 (variant 180; 1 pixel at one level in run 3).
+  GPU 79 / 77 and 301 / 299 ms warm; CPU 915 and 4559 ms.
+- **Video Color Check (C093; wave 2).** 3ds Max's Flag with Black / Scale
+  Luma / Scale Saturation on the NTSC or PAL composite envelope (Poynton).
+  Dials: `video_color_check`, `video_system`, `video_ire_limit`. The
+  simulator is d == 0.0; the stage is graded CLOSE at 1e-5 for a driver —
+  a square root and a division set it — and Flag with Black can differ by
+  whole pixels where a pixel sits on the envelope itself. On the driver the
+  self test's LEGALISE row prints max diff 0.00000 (grade CLOSE). The
+  720p frames are 8-bit after `QUANT`, so 1e-5 is not resolved there.
+  With `LEGALISE` on the GPU the post chain alone differs at 13 pixels
+  of 921,600 (Flag with Black), 13 (the same, PAL at 110 IRE), 13 (Scale
+  Luma) and 15 (Scale Saturation). Three rows are at one 8-bit level
+  with none above 1e-2; the PAL row has ONE pixel above 1e-2, max 1.00
+  at (104, 939), which is what a pixel blacked on one device only would
+  show (none in run 3; not diagnosed). The whole frames do not carry it:
+  26, 24, 26 and 28 pixels, 1 above 1e-2 in each, max 1.37e-1 at the
+  parked pixel (76, 688) (variants 181-184). No flagged-pixel count is
+  printed. The SGI_BROADCAST preset at its own AA: 22 pixels, 1 above
+  1e-2, max 1.18e-2 at (512, 720), the same pixel in the post chain
+  alone (variant 185).
+- **Attribute cells (C050; wave 2).** ZX Spectrum (two colours per 8x8
+  cell from fifteen, one BRIGHT bit), MSX1 / TMS9918 (two per 8x1 run),
+  C64 hires and multicolour (Pepto's VIC-II colours). Dial:
+  `attribute_cells`. Each cell's colours are fitted by least squared error
+  — a converter's fit. CELLS d == 0.0 in the simulator and on the fake
+  device. Refused by name: C64 multicolour with Lock Palette off; a
+  non-square ordered matrix. Error diffusion, NOISE and Blue Noise are
+  inert under it (printed once). Driver cost stated by the pack, not
+  measured: about 236 M texel fetches for the Spectrum at 720p.
+  Driver: the self test's CELLS line prints EXACT, 0 of 6144 pixels
+  differing, 0 readback (ZX Spectrum 8x8 + BAYER4, fit + snap). At 720p,
+  `DISPLAY` and `CELLS` on the GPU, no readback in any run: ZX_SPECTRUM
+  0 of 921,600 pixels, post 99 / 104 ms warm against the CPU's 1303;
+  MSX1 0 pixels, post 128 / 91 ms against 1048; the C64 preset
+  (multicolour) 0 pixels, post 95 / 112 ms against 8619; C64 hires 1
+  pixel, the parked pixel (76, 688), max 5.61e-1, the post chain alone 0
+  (variants 186-189).
+- **Per-scanline palette (C060; wave 2) — CPU-only by name.** Spectrum 512
+  (Atari ST), Dynamic HiRes and Sliced HAM (Amiga). Dial:
+  `scanline_palette`. A median cut per line; three fixed thirds of a line
+  stand in for Spectrum 512's staggered register reloads (the counts are
+  the machine's, the timing is not). Always refuses the GPU road, by name;
+  the fake-device row equals the CPU chain through the named readback.
+  Driver (the SPECTRUM_512 preset at 720p, variant 190): the post line
+  names the readback, `colour depth (the SPECTRUM_512 per-scanline
+  palette is fitted row by row on the CPU (a median cut per line))`,
+  after `DISPLAY` on the GPU; 6 of 921,600 pixels differ, all above
+  1e-2, max 1.43e-1 at (37, 788), the post chain alone 0 (0 pixels in
+  run 3, over the CPU's raster). Post costs 793 / 770 ms warm on the GPU
+  device, 823 ms on the CPU device; the readback alone is not timed.
+
+#### Signal (wave 1: SIG_1; wave 2: SIG_2, SIG_3)
+
+- **N64 VI dither filter and gamma (C005; wave 1).** angrylion-rdp-plus
+  `restore_filter16` and the `gamma_table` / `gamma_dither_table`. Dials:
+  `vi_dither_filter`, `vi_gamma`. Integer gather and table fetches:
+  d == 0.0 in the simulator over 12 combinations. A depth other than 15 or
+  16 bits refuses by name on both roads.
+- **GameCube / Wii copy filter (C019; wave 1).** libogc's default
+  EFB-to-XFB vertical filter {8,8,10,12,10,8,8}; Dolphin. Dial:
+  `copy_filter`. The 1/64 divide floors — a choice (the hardware's rounding
+  is undocumented). Bitwise in the simulator.
+- **PS2 CRTC two-circuit blend (C033; wave 1).** ps2sdk `GS_PMODE`. Dials:
+  `crtc_blend`, `crtc_alpha`, `crtc_bg_color`: the previous frame's output
+  (a recursive trail) or BGCOLOR. A frame without a rendered predecessor
+  blends against BGCOLOR and prints that it did. PREVIOUS_FRAME reads its
+  output back by name. Bitwise in the simulator. No preset switches it on.
+- **3dfx "22-bit" scan-out filter (C069; wave 1).** 86Box's reconstruction
+  from captures (`vid_voodoo_display.c`); the Voodoo2's look-ahead rule.
+  Dials: `video_filter`, `video_filter_threshold`. The taps are a
+  RECONSTRUCTION (3dfx never published them); the emulator's odd-line tint
+  is not modelled. Bitwise in the simulator.
+- **3DO 2x interpolation (C014; wave 1).** The Opera display generator's
+  cornerweight doubling with blue at four bits (3DO Portfolio). Output
+  scale `THREEDO_2X`. Runs after the final readback on both roads, at the
+  FIXED subpixel: the projector's per-cel bits need a coverage centroid
+  and are open.
+- **GBA Mode 5 affine stretch (C047; wave 1).** GBATEK / Tonc: the 160x128
+  bitmap stretched by PA = 0xAB, PD = 0xCD, the texel truncated per pixel.
+  Output scale `GBA_MODE5`; after the final readback on both roads.
+- **Chroma siting (C131; wave 2).** D1's co-sited 4:2:2, DV 4:1:1, MPEG-1's
+  centred 4:2:0, the GameCube XFB's integer pair (Microsoft, "Recommended
+  8-Bit YUV Formats"; Dolphin). Dials: `chroma_format`, `chroma_upsample`.
+  CHROMA_SITE d == 0.0 in the simulator for six formats. On the driver the
+  self test's CHROMA_SITE row prints max diff 0.00000, EXACT. Four of
+  the six formats ran at 720p, the stage on the GPU in each. DV 4:1:1:
+  28 pixels of 921,600, 2 above 1e-2, max 1.29e-1 at the parked pixel
+  (76, 688); the post chain alone 18 pixels, max 7.84e-3 (variant 191).
+  MPEG-1 4:2:0: 20 pixels, 1 above 1e-2, max 1.33e-1 at the parked
+  pixel; the post chain alone 14, max 7.84e-3 (variant 192). The XFB
+  pair under the GAMECUBE preset: 3 pixels, max 7.84e-3 at (378, 391);
+  the post chain alone 0 (variant 193). D1 4:2:2 only inside the
+  SGI_BROADCAST row (variant 185, under *Video Color Check*). The two
+  other 4:2:0 formats have no row.
+- **Cables: S-Video and RF (C129; wave 2).** Dials: `signal`,
+  `rf_bandwidth`, `rf_beat`, `rf_snow`, `rf_ghost`, `rf_ghost_delay`.
+  S-Video band-limits only the encoded chroma (Extron's NTSC bands); RF
+  adds a luma low-pass, the 920 kHz intercarrier beat, snow and a ghost.
+  The modulator bandwidth, the beat amplitude and the snow are dials
+  calibrated BY EYE. Bitwise in the simulator with Composite Video off;
+  over the composite stage RF is within 4/255 at 141 of 6912 pixels
+  (stated bar: that stage's own CLOSE grade re-quantised). A FIR radius
+  over 96 px runs on the CPU by name (S-Video NTSC above 1685 px of
+  width). On the driver the self test's CABLE_CHROMA and CABLE_RF rows
+  print max diff 0.00000, EXACT. **RF over the composite stage exceeds
+  the 4/255 bar at 720p** (`NTSC` and `CABLE_RF` on the GPU; beat 0.4,
+  snow 0.03, ghost 0.15): the post chain alone differs at 23,507 of
+  921,600 pixels, 787 above 1e-2, max 1.96e-2 against the bar's 1.57e-2;
+  the whole frame at 23,542, 795 above 1e-2, max 3.53e-2 at (76, 724)
+  (variant 195). The run's 96x72 matrix row sits on the bar: max
+  0.015686, 4 pixels above 1e-2. The SVIDEO preset (`CABLE_CHROMA` and
+  `CRT` on the GPU, interlace on the CPU by name): 42 pixels, 5 above
+  1e-2, max 3.88e-2 at (228, 575); the post chain alone 8 pixels, max
+  7.06e-3 (variant 194).
+- **PAL receiver (C130; wave 2).** A PAL-D delay-line decoder, the
+  8-field subcarrier crawl, the Simple decoder's Hanover bars. Dials:
+  `pal_decoder`, `pal_phase_error`, `pal_crawl`. The composite bleed under
+  it is still the NTSC-shaped I/Q chain (the next PAL step). Bitwise in
+  the simulator without the composite stage; over it 3/255 measured at 100
+  of 6912 pixels, bar 4/255. On the driver the self test's PAL_DECODE row
+  prints max diff 0.00000, EXACT. The run has no PAL_TV row and no PAL
+  row over the composite stage: the 4/255 bar was not measured at 720p.
+  Without composite, `PAL_DECODE` on the GPU: the delay line with crawl
+  18 pixels of 921,600, 2 above 1e-2, max 1.25e-1 at the parked pixel
+  (76, 688), the post chain alone 8 pixels, max 7.84e-3 (variant 196);
+  Simple PAL at 20 degrees 11 pixels, 1 above 1e-2, max 1.33e-1 at the
+  parked pixel, the post chain alone 8, max 7.84e-3 (variant 197).
+- **Tape (C128; wave 2).** Nine formats (VHS 240/40 TVL to Type C 400/120;
+  Wikipedia "VHS", "Betacam"; US Patent 5,386,296). Dials: `tape`,
+  `tape_generations`, `tape_noise`, `tape_head_switch`, `tape_dropouts`.
+  The TVL figures are the published ones; the Y/C delay is nominal; the
+  noise, the head-switch band and the dropout statistics are modelled BY
+  EYE. TAPE bitwise in the simulator; a low-pass wider than 96 px (VHS at 8
+  generations above 1206 px) runs on the CPU by name. On the driver the
+  self test's TAPE row prints max diff 0.00000, EXACT. At 720p, `TAPE`
+  on the GPU: VHS at 3 generations 28 pixels of 921,600, 8 above 1e-2,
+  max 1.96e-2 at the parked pixel (76, 688); the post chain alone 10
+  pixels, max 7.84e-3 (variant 198; post 21 / 21 ms warm against the
+  CPU's 1302). Betacam SP: 25 pixels, 6 above 1e-2, max 3.53e-2 at the
+  parked pixel; the post chain alone 9, max 7.84e-3 (variant 199). VHS
+  at one generation ran only as the VHS preset (its `tape_generations`
+  is 1) at its own AA, under the composite cable: 128 pixels above 1e-6,
+  120 above 1e-3, 42 above 1e-2, max 2.13e-2 at (226, 571), the post
+  chain alone 0 (0 pixels in run 3, over the CPU's raster), its tape on
+  the GPU, its composite stage refused by name (`ntsc`) and run on the
+  CPU (variant 200). The tape alone at one generation has no row.
+- **Backlit matte glow (C134; wave 2).** Tron's optical printer (American
+  Cinematographer, "The Making of Tron"). Dials: `matte_glow`, its radius,
+  passes and exposure, and a material `Glow Gel` colour. The radius ladder
+  and its halving are Halcyon's model of "some passes through diffusion".
+  The matte is cut from the OPAQUE G-buffer. An F12 stage; a stereo pair,
+  a panorama and Pano Parts are a named no-op; the worker pool is skipped
+  by name. d == 0.0 in the simulator and on the fake device; graded CLOSE
+  5e-4 for a driver until the self test prints its number; a blur past 160
+  taps refuses by name (four passes at radius 8 and 1080 lines).
+  Driver: the self test's MATTE_GLOW row prints max diff 0.00000 (grade
+  CLOSE), inside 5e-4. At 720p on the gelled ball, radius 12, three
+  passes, the stage on the GPU: 9 pixels of 921,600, 1 above 1e-2, max
+  1.33e-1 at the parked pixel (76, 688); the post chain alone 5 pixels
+  at one 8-bit level; post 35 / 33 ms warm against the CPU's 3523
+  (variant 201). The TRON_1982 preset: 24 pixels, 4 above 1e-2, max
+  8.63e-2 at (37, 789), the post chain alone 20 at one 8-bit level (in
+  run 3, over the CPU's raster, 22 at one level in both); post 31 / 30
+  ms against 2452 (variant 202). Not measured at 1080 lines: the run is
+  720 lines.
+- **MPEG-1 intra blocks (C132; wave 2).** Video CD (FFmpeg's default intra
+  matrix and `dct_unquantize_mpeg1_intra_c`; ISO/IEC 11172-2). Dials:
+  `mpeg1`, `mpeg1_qscale`, `mpeg1_gop`. NOT simulated: the inter-frame road
+  — every picture is intra-coded and only the quantiser pumps. The DCT is
+  Halcyon's float32 table. Five draws; d == 0.0 in the simulator and on the
+  fake device; graded CLOSE 1/255 for a driver until the self test prints
+  its number. On the driver the self test's MPEG1 row prints max diff
+  0.00000 (grade CLOSE). **At 720p the 1/255 bar (3.92e-3) is
+  exceeded.** Intra blocks at scale 12 (`DISPLAY`, `MPEG1`, `QUANT` on
+  the GPU): the post chain alone differs at 4,712 of 921,600 pixels, 3
+  above 1e-2, max 1.18e-2; the whole frame at 4,774, 63 above 1e-2, max
+  1.41e-1 at the parked pixel (76, 688) (variant 203). The VIDEO_CD
+  preset (a B picture at scale 14, then `NTSC` and `CRT`, whose own
+  self-test row prints max diff 0.01152): 921,589 pixels above 1e-6,
+  9,266 above 1e-3, none above 1e-2, max 8.32e-3 at (591, 559), the post
+  chain alone the same with 9,202 above 1e-3 (variant 204). The cause
+  was not looked for.
+- **Smacker blocks (C133; wave 2).** RAD Game Tools (MultimediaWiki
+  "Smacker"): a 256-colour palette and 4x4 blocks Filled, Mono or Full.
+  The fill / mono / full thresholds are Halcyon's own (RAD's encoder is
+  unpublished); Skip blocks are not simulated. One draw, d == 0.0; the
+  palette is fitted on the CPU from one named readback per palette lock
+  (every frame with Lock Palette off). On the driver the self test's SMACKER
+  row prints max diff 0.00000, EXACT. At 720p neither row prints a
+  readback in any of its three GPU runs, so the cold lock's readback was
+  neither seen nor timed. Blocks at quality 0.5 (`SMACKER` on the GPU):
+  the post chain alone 0 pixels; the whole frame 6 pixels of 921,600,
+  all above 1e-2, max 3.53e-2 at the parked pixel (76, 688) (variant
+  205). The SMACKER_FMV preset: 1 pixel, max 9.68e-2 at (37, 789), the
+  post chain alone 0 (0 pixels in run 3, over the CPU's raster) (variant
+  206).
+
+#### The presets, one line each
+
+Read from the tree: every preset's settings diffed against the 1.89.0 zip
+by probe. "Moves" means the rendered picture differs from 1.89.0's under
+that preset; "inert" means the key does nothing until the user's own
+switch is on. The source for each number is the feature's line above.
+The split into "moves" and "no pixel moves" below was written from what
+each feature does, before any edited preset had been rendered against its
+1.89.0 self. That render exists now and is in the next block, *The shipped
+presets against 1.89.0*: on the demo scene SATURN, POVRAY_31 and POVRAY_2,
+filed here under "the picture moves", move no pixel either.
+
+**New (22).**
+
+- **MAYA_4** (3D Software) — Alias|Wavefront Maya 4 (2001): Blinn, 512
+  depth-map shadows with Use Mid Dist (Maya's documented default), 4 taps
+  standing in for dmap filter size 1, 2x2 supersampling standing in for
+  Maya's exact-area visibility sampling (not modelled). Every number says
+  what it stands in for.
+- **BLENDER_241** (3D Software) — the 2.4-era Internal renderer before the
+  2.42 rewrite: OSA 9 with the Gauss filter and the gamma-2 blend, shaded
+  in display space, Lambert / CookTorr, ray shadows to depth 2.
+- **MODEL1** (Arcade Boards, a new shelf) — Sega Model 1 (1992): flat-lit
+  untextured polygons at 496x384, the first light only, planar shadows as
+  solid black polygons. 24-bit and gamma 2.2 are the neighbouring arcade
+  presets' values, said so in the note.
+- **NAMCO_S21** (Arcade) — Namco System 21 (1988): 496x480, FLAT at the
+  FACE rate, Painter's sort, LINEAR fog 6..40 in 16 banks per polygon,
+  15-bit. Its `fog_face` flag states the machine and changes no pixel at
+  the preset's own rate (measured).
+- **SEGA_MODEL2** (Arcade) — Model 2 (1993): 496x384, one luma per polygon
+  with the board's highlight and the 64-step ramp, 4-bit luminance
+  textures (`I4_MODEL2`), the 2x2 checker for translucency, 15-bit.
+- **SEGA_MODEL3** (Arcade) — Model 3 (1996): per-vertex N.L to 8..64, the
+  luma ramp, LINEAR fog 15..90 with a second bank 6..45 that no material
+  reads by default, trilinear.
+- **NDS** (Game Consoles) — Nintendo DS (2004): 256x192, DS_FIXED at the
+  VERTEX rate with the DS modulate, the 32-entry fog table over 8..40,
+  integer vertex positions, the N64 vertex item at 64 units (the nearest to
+  the DS's formats; its 1/16-texel UVs not modelled), A-buffer + DS blend +
+  Y-sort without depth write, a 1-pixel black object outline from the
+  existing outline settings, 3X. The DS's 18-bit output is not in the
+  preset (`color_depth '24'`).
+- **VOODOO2** (Consoles) — 3dfx Voodoo2 (1998): built from the merged
+  VOODOO plus 800x600, mipmaps, the fog dither, 8-bit bilinear fractions
+  and the look-ahead scan-out filter. It inherits VOODOO's chroma key
+  (a texture's unwired alpha holes show black, as there).
+- **D3D_RETAIL_1997** (Consoles) — Direct3D 5 retail: FLAT_D3D_FIRST at
+  the FACE rate, bilinear, 16-bit, no dither, the integer pixel centre
+  (`pixel_center INTEGER_D3D`: the raster hand-over's key for it, dropped
+  by the merge, added in fix pass 3). The lighting hand-over's `fog_depth
+  Z` stays OUT on purpose: under it the Fog switch at scene-unit Start
+  and End fogs nothing (measured), a viewport prints no advisory, and the
+  preset never turns fog on itself. The preset's note names the dial;
+  whether the preset should carry it is the user's decision.
+- **POWERVR_PCX2** (Consoles) — PowerVR PCX2 / Matrox m3D (1997):
+  PCX_INTENSITY at the VERTEX rate, bilinear, 16-bit with BAYER4 0.6,
+  640x480. The texture hand-over's `tex_format RGB5550` stays OUT on
+  purpose: the card stored 5:5:5 for opaque textures and 4:4:4:4 for
+  those with alpha, and one global alpha-less format turns every cut-out
+  opaque with nothing printed (measured at 96x72: 556 pixels cut as
+  shipped, 0 under RGB5550; fix pass 3 added the key, its review caught
+  this, and it was taken out again).
+- **MEGA_DRIVE** (Consoles) — 320x224 at 32:35, MEGA_DRIVE_SH at the FACE
+  rate, the column mesh for translucency, Painter's; `color_depth '24'`
+  and gamma 1 so the DAC levels reach the file untouched (the ramp IS the
+  quantiser).
+- **GBA_MODE5** (Consoles) — Game Boy Advance Mode 5 (2001): software 3D,
+  FLAT, Painter's, affine textures, 15-bit, BLDALPHA sixteenths, the
+  160x128 bitmap stretched to the LCD. No gamma key (no source gives one).
+- **ELITE_BBC** (Home Computers) — Elite (1984): 320x256, 1-bit white
+  lines on black clay by Elite's edge rule, 3X. Set the world black.
+- **ATARI_VECTOR** (Arcade) — Asteroids / Battlezone (1979): the DVG beam,
+  sigma 0.7, the Asteroids gel (0.85, 1.0, 0.9) over black clay.
+- **MSX2_PLUS** (Home Computers) — Screen 12 (1988): 256x212 in YJK, no
+  dither (the naked 5-bit luma ramp), 3X.
+- **AMIGA_EHB** (Home Computers) — Extra Half-Brite (1985): 320x256, 32
+  registers and their halves, no dither (the half-brite step is the
+  shading), 3X.
+- **MSX1** (Home Computers) — Screen 2 (1983): 256x192, the TMS9918's
+  fifteen colours, two per 8x1 run, BAYER4.
+- **SPECTRUM_512** (Home Computers) — Atari ST Spectrum 512 (1987):
+  320x200, 48 colours a line from 512; CPU-only by name.
+- **RF_MODULATOR** (Video & Broadcast) — channel 3 (1977): composite
+  through the modulator, beat 0.4, snow 0.03, ghost 0.15 at 1.5 (dials set
+  by eye).
+- **VIDEO_CD** (Video & Broadcast) — 352x240 at 10:11, MPEG-1 intra at
+  scale 10 in a 15-picture group, composite + CRT, doubled. The bitrate is
+  not modelled.
+- **SMACKER_FMV** (Early Web) — 320x240, a 256-colour median-cut palette,
+  Smacker at quality 0.4, doubled.
+- **TRON_1982** (Cel & Film) — 1080 lines, the matte glow at radius 8 with
+  three passes, grain 0.12. The scene's circuit materials need a Glow Gel
+  colour: a preset cannot set material fields.
+
+**Changed, and meant to move the picture (36 by their settings; measured
+on the demo scene, 33 of the 39 edited presets move and 6 do not: see "The
+shipped presets against 1.89.0" below).**
+
+- **PSX, PSX_HIRES** — PS1_MODULATE (was GOURAUD); the GTE depth cue 6..24
+  toward (0.32, 0.32, 0.36) where they had no fog; the ordering table at
+  4096 entries to 40 units; whole-triangle near rejection; the PS1 vertex
+  format at 64 units; PS1_AVG blending. Their BAYER4-at-15-bit dither is
+  the same pixels, now drawn by the ORDERED stage.
+- **SATURN** — SATURN_ADD (was FLAT, the rate stays FACE); Sorted Blend
+  with SATURN_HALF.
+- **N64** — N64_COMBINE; the 4x supersample and its triangle filter
+  REPLACED by coverage AA and the divot; Colour Depth 16 → 15 and Gamma
+  2.2 → 1.0 with the VI's de-dither and gamma-dither (the RDP's frame is
+  5551; the VI's root replaces the display dial); the 18-bit floating z;
+  the CI4 TMEM budget; Blend between mip levels; the N64 vertex format at
+  64 units. Whether a title enabled the VI gamma was per game; the preset
+  takes libultra's antialiased default.
+- **THREEDO** — Sorted Blend with the PIXC default P/2 + S/2; the output
+  is the Opera's own 2x doubling (was 3X nearest).
+- **JAGUAR** — Colour Depth 16 → CRY16.
+- **DREAMCAST** — D3D_SEPARATE_SPEC (was GOURAUD); the CLX2 fog table with
+  Fog End 64 as the density register; VQ textures.
+- **PS2** — PS2_HIGHLIGHT at the VERTEX rate (was per-pixel PHONG); the
+  GS's 16-bit buffer with DIMX inside the pipeline and the post dither off
+  (Colour Depth 16 → 24); near rejection; mip level from Q with K = -2,
+  L = 0, nearest level, the mip bias dropped. K = -2 is Halcyon's tuning
+  for scene-unit depths; on the machine K was per texture.
+- **GAMECUBE** — GX_LIGHT at the VERTEX rate (was per-pixel PHONG); EDGE AA
+  removed, the copy filter's deflicker in its place; the XFB's 4:2:2; the
+  14e2 compressed z; the RGBA6 framebuffer; CMPR textures. Two choices are
+  contestable and are stated: the raster spec had left the 14e2 encoding
+  off because it was not the machine's default (the design switched it
+  on), and the transparency pack's own homework says RGB8_Z24 was the
+  common framebuffer while the preset carries RGBA6.
+- **XBOX** — integer pixel centres; the fixed-point W-buffer at 24 bits;
+  DXT1 with the NV2A's 16-bit decode.
+- **SNES, NEO_GEO, SEGA_32X** — Colour Depth '5' → '8' with 5-bit
+  registers: 256 adaptive colours where 1.89.0 quantised nothing. SNES
+  also takes Sorted Blend with add-half colour math.
+- **TURBO_SILVER** — Colour Depth '6' → '8' with 4-bit registers: 64
+  adaptive 12-bit registers. Still an approximation of a HAM picture; the
+  label says so.
+- **ATARI_ST, MSX2** (3-bit registers); **AMIGA_OCS, PC98** (4-bit).
+  ATARI_ST and AMIGA_OCS dither with FLOYD error diffusion and differ
+  between the devices at 351,922 and 67,372 of 921,600 pixels (*On the
+  RTX 5060 Ti: the full run*, the error-diffusion bullet). MSX2 dithers
+  with FLOYD too; it and PC98 have no driver row.
+- **ZX_SPECTRUM** — Colour Depth '3' → '8' with the Spectrum's attribute
+  cells: the note's attribute clash is now true (1.83.0 disclosed its
+  absence). **C64** — multicolour cells.
+- **DOOM** — Sorted Blend with the fuzz; Y-shear (a pitched camera shears
+  where 1.89.0 tilted: the preset now changes the projection, 31,022 px on
+  the demo scene, next block; that a level shot is bitwise 1.89.0 is the
+  camera pack's statement and was not measured for this entry).
+- **VOODOO** — the 64-entry fog table (was TABLE16 8..40); the 16-bit
+  floating W; the 565 framebuffer with the card's own write dither and the
+  post dither off; 5:6:5 textures, 4-bit bilinear fractions, the dithered
+  per-polygon mip level; the "22-bit" scan-out filter. It also sets
+  `tex_colorkey`: cut-outs in its 5:6:5 textures are stored as the key
+  colour and keyed after the filter (it keyed nothing until fix pass 3;
+  texture block). With the image's Alpha wired the holes are see-through;
+  unwired they show black, which is new for any scene whose textures
+  carry alpha below one half.
+- **VIRTUAL_BOY** — a side-by-side pair of parallax layers at cap 16. The
+  pair is packed at half width as a viewing convenience; the console held
+  two full buffers. The preset renders grey, as it did in 1.89.0, not red
+  (next block).
+- **POVRAY_31, POVRAY_2** — lamps no longer fall off by default (POV's
+  fade_power 0). **SGI_INDY** — the same, plus the camera-axis viewer.
+- **LIGHTWAVE_56** — clips its nine samples before the filter (every hot
+  highlight edge moves). Its backdrop fog target and Dithered motion blur
+  are inert until fog / motion blur are on.
+- **RENDERMAN** — jittered samples and a shading rate of 1 pixel of area
+  (PRMan's defaults). The shading-rate change is one no test pins.
+- **BLENDER_INTERNAL** — Classic-Halfway shadow buffers (2.5+'s default):
+  moves where a spot lamp casts a buffer shadow.
+- **VHS, CEL_VHS_80S** — the tape path at ONE generation, composite bleed
+  2.0 → 0.5 (the tape carries the smear). The spec said three generations
+  and the old note "third-generation dub"; the design chose one and the
+  note was rewritten.
+- **SVIDEO** — now the cable (chroma band-limited, luma and crawl
+  untouched), no longer a soft composite. **PAL_TV** — the delay-line
+  decoder and the PAL crawl; the NTSC dot crawl set to 0.
+- **TOASTER, SGI_BROADCAST** — D1's 4:2:2; SGI_BROADCAST also legalises
+  with Scale Saturation. **CD_ROM_FMV** — MPEG-1's 4:2:0, standing for
+  Cinepak's 2x2-cell chroma (Cinepak's codebooks are not simulated).
+
+**Changed, no rendered pixel moves (3 by their settings; SATURN, POVRAY_2
+and POVRAY_31 also move nothing on the demo scene, measured below):**
+MAX_R2, STUDIO_R4, MAX_2012 — the
+Object Motion Blur and multi-pass depth-of-field dials are set, and are
+inert until the user switches motion blur or depth of field on.
+**Note only (3):** ALIAS_POWER, SOFTIMAGE_3D (the Env Chrome node),
+IMAGINE_3 (the Roughness node, Fog Length).
+
+#### The shipped presets against 1.89.0
+
+Written after the list above, from `docs-dev/r251_presets.log` and
+`docs-dev/r251_handover/POST_PASS2_TODO.md` item 10. The log is the output
+of `tools/r251_preset_sheet.py`: each edited preset on the 1.89.0 engine
+with 1.89.0's own preset, beside the current tree with the current preset,
+on the demo scene at 320x240, on the CPU road, each frame from empty
+palette locks (the tool's header, read). It is a look, not a test, and not
+a driver measurement. Below, "the log" and "reported" mean that file or
+the TODO says it; "read" means the cited line was read for this entry;
+"probed" means a command was run on the tree for this entry.
+
+- **What the suite holds, and what it does not.** 39 of the 90 shipped
+  presets have edited settings, 22 presets are new, 51 are unchanged (the
+  log, line 1). The suite's identity pin covers only presets "whose dict
+  the round left alone" (read: `tests/test_r251_sky_camera.py:1034`,
+  `tests/test_r251_raster_wire.py:91`) — the 51. An edited preset is
+  compared with its 1.89.0 self by nothing in the suite. The sheet is the
+  only such comparison, and it is one scene at one size.
+- **Six edited presets move no pixel on the demo scene:** MAX_2012,
+  MAX_R2, STUDIO_R4, POVRAY_2, POVRAY_31 and SATURN (the log, lines 15,
+  16, 38, 23, 24, 32); the other 33 move. That can be because the new
+  settings need something the demo scene lacks. The three Max presets set
+  motion-blur and depth-of-field dials that do nothing until motion blur
+  or depth of field is switched on. The POV pair set `light_falloff_default
+  NONE`, which only a lamp whose own Decay is Default reads (read:
+  `core/lights.py:536-539`), and the demo scene's point lamp names
+  INVERSE_SQUARE itself (read: `tests/scenebuild.py:394-396`; its sun
+  leaves Decay at Default, and whether a sun is ever attenuated was not
+  read). SATURN
+  changes `default_model`, which the demo scene's materials override (next
+  bullet), and sets Sorted Blend with SATURN_HALF; whether the demo scene
+  holds a translucent surface for that blend to act on was not read. None
+  of the six has been rendered on a scene where its edit could show,
+  except SATURN with the materials' models removed (next bullet).
+- **A preset's Default Model reaches only materials without a model of
+  their own.** Read: `core/render.py:6337-6371`, `material_model`:
+  `force_model` first (:6343-6344); then the material's own model when its
+  override is set (:6351-6352); then the model a Halcyon node in its graph
+  names (:6353-6370); `default_model` is returned only for no material
+  (:6345-6346), a Halcyon Shader node that names none (:6356), or a
+  graph-less material with no model (:6371). Measured (reported, TODO item
+  10, "PRESET FOLLOW-UPS"): SATURN with `default_model` FLAT against
+  SATURN_ADD moves 0 px on the demo scene and on the feature matrix's
+  'textured' scene, whose materials all name a model. Seven presets
+  changed `default_model` this round: DREAMCAST, GAMECUBE, N64, PS2, PSX,
+  PSX_HIRES, SATURN. With the materials' own models removed (the log's
+  ` *` lines) they move, of 76,800 px: SATURN 12,136 (0 with the models
+  in place), DREAMCAST 31,456 (15,751), GAMECUBE 70,272 (70,004), N64
+  76,798 (76,798), PS2 73,130 (73,130), PSX and PSX_HIRES 47,280 (46,697).
+  NOT read: the shading path beyond that function, and how the exporter
+  gives Blender materials a model in a real scene. So on which real scenes
+  the new models of these seven presets are what shades is not established
+  here; the material block's "pictures move" for them is untested on any
+  scene where a material lacks its own model. Force Model applies the
+  board's model to every material (:6343).
+- **Two presets now change more than a look, stated as changes.** DOOM
+  sets `camera_yshear` (with Sorted Blend and FUZZ): choosing the preset
+  changes the PROJECTION of a pitched camera — 31,022 px against 1.89.0,
+  max 239/255 (the log, line 8). VIRTUAL_BOY sets side-by-side stereo with
+  parallax layers at cap 16: the frame is now a pair — 48,393 px against
+  1.89.0, max 208/255 (the log, line 44). It renders GREY in both
+  versions: r == g == b on every pixel, 140 greys in 1.89.0 and 132 now
+  (reported, TODO item 10, "PRESET PROBE"; the log's colour counts are the
+  same two numbers). A collage label written this round says "4 reds";
+  that is not what the preset delivers, and the grey predates this round.
+  Both edits are choices made inside the packs; they are flagged here for
+  the user to keep or revert.
+- **Colour depths that were no-ops in 1.89.0 quantise now.** 1.89.0's
+  `color_depth` '5' (SNES, SEGA_32X, NEO_GEO), '6' (TURBO_SILVER) and '3'
+  (ZX_SPECTRUM) quantised nothing (reported, TODO item 10). The presets
+  now carry '8' with register bits or attribute cells, and the picture
+  changes everywhere. Distinct colours on the demo frame, 1.89.0 → 1.90.0
+  (the log, lines 37, 34, 20, 42, 47): SNES 92 → 16 (76,800 px moved, max
+  8/255); SEGA_32X 6,607 → 5,114 (61,815 px, max 15/255); NEO_GEO 1,935 →
+  102 (73,055 px, max 7/255); TURBO_SILVER 614 → 54 (76,800 px, max
+  197/255); ZX_SPECTRUM 201 → 5 (76,800 px, max 183/255).
+- **The register-depth road builds the palette and THEN snaps it.** Read:
+  `core/post.py:323-325`, `_palette_for` returns
+  `snap_registers(_palette_for_raw(...))`. Entries that land on one
+  register value collide, so the frame shows fewer colours than the
+  palette size: AMIGA_OCS 32 → 24 distinct colours, ATARI_ST 16 → 11,
+  PC98 16 → 14 (the log, lines 2, 3, 22). A machine's artist had N
+  distinct registers. Building the palette in register space, or
+  deduplicating and refilling, is a design point for C061; not decided.
+  Open.
+- **As-built gaps against the plan: one closed in fix pass 3, three left
+  out on purpose.** The lighting, raster and texture hand-overs each
+  listed a key for a preset another pack owned, and the merge dropped
+  them (`docs-dev/R251_DESIGN.md:319`, `:325`, `:329`). Each was checked
+  by rendering it. IN: D3D_RETAIL_1997 `pixel_center 'INTEGER_D3D'` (1671
+  of 6912 pixels move against the half-pixel centre). OUT, with the
+  reason pinned by a test: D3D_RETAIL_1997 `fog_depth 'Z'` (the Fog
+  switch then fogs nothing at scene-unit Start/End); POWERVR_PCX2
+  `tex_format 'RGB5550'` (every alpha cut-out goes opaque); GAMECUBE
+  `fog_range_adjust` (the lighting pack dropped it itself: GXInit leaves
+  it off, and at the preset's VERTEX rate a lit corner has no pixel
+  column, so it is inert: that frame is pinned bitwise the plain one).
+  Earlier drafts of this entry called all of them undecided gaps, then
+  added two that the review of the pass showed to be harmful: the plan's
+  lines had not been rendered before they were written.
+- **Cost on the CPU road.** Reported by TODO item 10 ("COST PROBE" and
+  "PRESET FOLLOW-UPS"): three consecutive frames in one process at
+  320x240 on the CPU road, measured on a busy machine, so noisy.
+  First-frame costs that did not repeat on the next two frames (what is
+  built in that first frame was presumed by the orchestrator and not read,
+  so no cause is named here; whether the cost returns when a cache is
+  evicted or a scene changes was not measured):
+  CRY16, the JAGUAR preset's depth, about 0.67 s in post (670 / 12 / 13
+  ms); VGA256 with BAYER4 about 0.5 s (523 / 34 / 34); the Dreamcast VQ
+  rows about 0.9 s in the render (1042 / 157 / 157 against 301 / 155 /
+  165 without); SNES, NEO_GEO and SEGA_32X about 0.3 s in post (287 / 7 /
+  7, 329 / 8 / 8, 290 / 12 / 11). Per-frame costs, paid on every frame:
+  C64 multicolour attribute cells about 570 ms (583 / 563 / 569); MSX2
+  about 127; TURBO_SILVER about 124; ZX_SPECTRUM about 95; MSX1 cells
+  about 190 (193 / 202 / 206); VGA256 with BAYER4 about 30 against 3 to 4
+  without. An earlier run of the C64 row read 618 / 844 / 938; the later
+  run was flat, and the orchestrator reads the rise as machine load. NOT
+  measured by that probe: larger frames, the presets' own sizes, the GPU
+  road. The full driver run (next section) times one CPU frame and three
+  GPU frames of each variant at 1280x720: in run 3 the C64 preset takes
+  9241 ms on the CPU device (8619 of it post) against 157 and 172 ms warm
+  on the GPU device; ZX_SPECTRUM 1985 (post 1303) against 166 and 169;
+  MSX1 1657 (post 1048) against 259 and 164. The presets' own sizes are
+  still unmeasured, and against the performance rule the CPU road stays
+  open until they are.
+- **The adaptive palette lock is keyed without the picture.** Read:
+  `core/post.py:317`, the key is `('ADAPTIVE', size, palette_method,
+  seed)` and nothing else; `core/palette.py:353-366`, `cached_adaptive`
+  returns whatever was first built under that key. That is by design for
+  animations (the docstring at `post.py:300-305`: a palette rebuilt per
+  frame crawls). `core/palette.py:369-372`, `clear_caches()` clears
+  `_ICM_CACHE`, `_ICM_ORDER` and `_PALETTE_CACHE`. `core/render.py:257-259`,
+  `clear_caches()` clears the texture cache and the shadow cache and does
+  not touch the palette's: read for this entry, where the TODO had it as
+  an inference from an A/B in the collage tool. Reported as older than
+  this round. Measured headless (reported): in the one-process collage
+  tool a tile inherited an earlier row's palette, and six rows changed
+  after the tool was fixed. NOT read: whether a second scene rendered in
+  one Blender session inherits the first scene's palette. Open (below).
+
+#### On the RTX 5060 Ti: the full run
+
+`docs-dev/r251_field4_report.txt`; the per-variant table is
+`docs-dev/r251_field4_verdicts.txt`, and
+`docs-dev/r251_field4_vs_field3.txt` sets this run against the one before
+it, row by row. Run 4 of the whole R251 field script, on the tree after fix
+pass 4 (headless suite, `docs-dev/suite_1.90.0_fix4.log`: 9503 ok, 0 FAIL):
+Vulkan (NVIDIA 617.14), Blender 5.2.0 LTS, 1280x720. Each variant is the GPU
+device's frame against the CPU device's, post included, over 921,600 pixels,
+with one CPU frame and three GPU frames timed. 212 variants: 1–118 are wave
+1, 119–206 wave 2, 207–210 four controls, 211 and 212 two frames of the
+user's own export. They ran on 2026-10-05 from 02:01 to 02:31 in seventeen
+fresh Blender processes (sixteen of thirteen variants, one of four); every
+process finished its report and none died.
+
+**Why there are two runs.** Run 3 (2026-10-04 23:29 to 2026-10-05 00:03,
+after fix pass 3; `docs-dev/r251_field3_report.txt`, read row by row in
+`docs-dev/FIELD_R251_full.md`) had a defect in its harness: the renderer's
+G-buffer cache key carries no device, so in 188 of its 208 variants the
+GPU-device runs were served the G-buffer the CPU run had rasterised; only
+the 20 rows under a Painter's preset rasterised on the GPU. Its 720p rows
+therefore measured shading, sky and post over the CPU's raster, not the GPU
+rasteriser. The field script now clears that cache before the GPU runs and
+prints the raster's device on every GPU line. In run 4 the GPU device's run
+1 rasterised on the GPU in all 212 variants; runs 2 and 3 are served run 1's
+G-buffer, as a second render of the same frame is, except in 20 rows, which
+rasterise on the GPU again on every run. Variants 1 to 206 are the same rows
+in both runs; run 3 numbered the field frames 207 and 208 and the controls
+209 to 212. Row for row, 104 verdict lines are identical in the two runs, 67
+moved by at most 2 pixels above 1e-3 and 1 above 1e-2 inside their class,
+and 41 moved by more. The wave-1-only run of 2026-09-27 is superseded and
+not quoted here.
+
+Four things first. **With the GPU rasteriser engaged, a few pixels of a 720p
+frame differ between the devices by large amounts**, at places that recur
+from row to row. **Under a FLOYD error-diffusion dither the two devices
+render different pictures**: 67,372 to 354,017 pixels in three presets, with
+this round's display routing active. **The feature matrix on the driver
+prints 2 FAILED rows of 299.** **A row's number says how far the two devices
+agree; it does not say the labelled feature was active in the frame**: 32
+labels say "bitwise" and 30 of those rows are not 0 pixels.
+
+The 212 rows by class, as the verdict table sorts them: 43, 34, 13, 56, 60
+and 6 (run 3: 52, 41, 13, 56, 44 and 6).
+
+| class                          | wave 1 | wave 2 | control | field |
+|--------------------------------|--------|--------|---------|-------|
+| 0 pixels                       | 25     | 16     | 2       | 0     |
+| one 8-bit level at most        | 21     | 12     | 0       | 1     |
+| two 8-bit levels at most       | 5      | 8      | 0       | 0     |
+| parked pixel alone above 1e-2  | 35     | 21     | 0       | 0     |
+| other                          | 30     | 27     | 2       | 1     |
+| diverged                       | 2      | 4      | 0       | 0     |
+
+- **0 pixels: 41 rows and two controls.** What a zero shows depends on where
+  the frame was compared. 17 rows stayed on the GPU to the final readback
+  (frame kept, post chain resident, no readback named): 73, 85, 86, 90, 105,
+  106, 108, 117, 118, 121, 122, 134, 141, 180, 186, 187 and 189. 21 rows
+  `left the GPU at framebuffer format`: the seventeen VOODOO and VOODOO2
+  preset rows, GAMECUBE (25) and PS2 (78, 114, 173). There the GPU device's
+  frame comes down for the CPU's framebuffer pack before post and the
+  devices agree to 0 pixels; no line of the block shows the texture setting
+  or the chroma key of the label at work (167 and 168 are fix pass 3's key
+  on VOODOO and VOODOO2). The other three: SEGA_MODEL2 (27, 131: `frame kept
+  through nothing`) and ELITE_BBC (53: left the GPU at `wireframe`).
+- **One 8-bit level at most (3.92e-03), nothing above 1e-2: 34 rows, 1 to 28
+  pixels each.** In 33 the post chain compared alone is one level too, at 2
+  to 22 pixels: the class 1.89.0 attributed to DISPLAY's `pow` on the driver
+  (0.00001 in the stage table), not re-proved here. In 211 (the field frame
+  at ss 1) the chain alone is 0 and one pixel differs.
+- **Two 8-bit levels at most (7.84e-03), nothing above 1e-2: 13 rows, 2 to 4
+  pixels each.** Seven N64 preset rows print one line (42, 61, 111, 164,
+  169, 174, 178: 4 pixels, the max at (7, 534); the post chain alone differs
+  at 2) and the eighth, under the HDRI world (165), 2 pixels; N64_COMBINE
+  (123) and PS2_HIGHLIGHT (126) 4 pixels; the GAMECUBE preset 3 pixels in
+  64, 113 and 193.
+- **The parked pixel (76, 688) is the max and the only pixel above 1e-2: 56
+  rows.** From 1.57e-02 (179) to 5.61e-01 (188) at that pixel, with 0 to 27
+  more pixels above 1e-3; the two HDRI rows 45 and 147 have 446 and 440
+  above 1e-3, and their sky alone is one level at 431 pixels. Eleven of the
+  56 print one identical line (1.33e-01, 18 pixels; the post chain alone one
+  level at 10): the five depth encodings (37 to 41), the Elite rule (52) and
+  five transparency rows (79, 81, 82, 84, 177). The report cannot tell a
+  setting that is identical on both devices from one that reached no pixel
+  of the demo frame. Counting class "other" and variant 203, the parked
+  pixel is the max in 73 of the 212 rows.
+- **The GPU rasteriser's edges: a few pixels, large differences.** Ten rows
+  that were exactly 0 in run 3 are not 0 in run 4: AMIGA_EHB (107: 2 pixels,
+  max 2.67e-01), D3D_RETAIL_1997 (119: 1, 1.90e-01), SUPERFX_PLOT at ss 2
+  (135: 3, 3.33e-01), the two RENDERMAN rows (137: 1, 2.26e-01; 158: 4,
+  1.67e-01), the GAMECUBE look (139: 4, 2 of them above 1e-2, 1.96e-02),
+  SPECTRUM_512 (190: 6, 1.43e-01), the VHS preset (200: 120 above 1e-3, 42
+  above 1e-2, 2.13e-02), SMACKER_FMV (206: 1, 9.68e-02) and the AMIGA_OCS
+  control (209: 1, 2.00e-01). Where the block prints them (all ten but 137
+  and 158) the sky alone and the post chain alone read 0. Seven more rows
+  left the one-level or the parked class for "other" (46, 48, 92, 96, 152,
+  202, 159), and five already there went from 1 pixel above 1e-2 to 5 or 6
+  (18, 49, 87, 156, 194). The field frame at its own AA (212; 208 in run 3)
+  went from 3 pixels, 2 above 1e-2, max 7.06e-02, to 39, 38 above 1e-2, max
+  9.80e-01 at (359, 11); its sky alone and resolve alone read 0. The same
+  places recur: (37, 789) is the max of eight rows (18, 46, 49, 127, 135,
+  202, 206, 209), (431, 572) of three (87, 92, 107), (414, 573) of two (31,
+  119), (300, 574) of two (137, 157). The console prints the raster tie
+  referral replaying hundreds of pixels with the CPU fill's arithmetic (417
+  of 603,821 covered, `r251_field4_console_part_105.txt:355`), and these
+  pixels are not among them. The orchestrator's reading, not a measurement:
+  the GPU rasteriser's edge decisions differ from the CPU rasteriser's at a
+  few pixels of a 720p frame; the rasteriser and its referral predate this
+  round (1.88 / 1.89) and are not one of its features; no earlier field run
+  measured this at 720p, because the same cache served the CPU's raster; it
+  breaks the rule of identical pixels at those pixels. The cause is not
+  diagnosed and it is **open**. The GPU rasteriser is on by default on the
+  GPU device.
+- **Error diffusion: three presets, a different picture on each device.**
+  ATARI_ST (103): max 1.00e+00, 351,922 of 921,600 pixels differ, every one
+  above 1e-2. AMIGA_OCS (104): 5.33e-01, 67,372. Summed Area x4 on STUDIO_R4
+  (176): 4.84e-01, 354,017. All three dither with FLOYD. Run 3, over the
+  CPU's raster, printed 289,708, 364,620 and 312,123: the diffusion is
+  chaotic, so the counts depend on the raster under it. The routing this
+  round added is active on the driver: on every run of the three the post
+  line reads `GPU stages []` and names the `display` readback, `runs on the
+  CPU`. It does not make the frames agree: with the whole post chain on the
+  CPU on both devices, what differs is the frame that enters it (the sky
+  alone reads 0 in all three). Controls, the presets without their
+  error-diffusion dither: ATARI_ST with the dither off (207) 0 pixels;
+  ATARI_ST with BAYER4 (208) 0 pixels; AMIGA_OCS with the dither off (209) 1
+  pixel, 2.00e-01 at (37, 789), one of the rasteriser's places, its post
+  chain alone 0; STUDIO_R4 with the dither off and Summed Area x4 kept (210)
+  4 pixels, max 3.23e-02, the post chain alone printing the same line;
+  DISPLAY and PALETTE draw on the GPU in all four. So neither the palette
+  nor the summed-area footprint is the cause. Error diffusion carries each
+  pixel's error into the pixels after it, so a last-bit difference in the
+  GPU's frame (the report's deferred-shading test reads max 0.000023 against
+  the CPU: close, not bitwise) flips a palette choice and the pattern after
+  it. The orchestrator's reading, not a measurement: under an
+  error-diffusion dither the two devices give different, equally dithered
+  pictures; that breaks the rule of identical pixels across devices; it
+  holds for any preset with such a dither and predates this round. Whether
+  such frames render on the CPU by name or keep the GPU's speed with the
+  difference printed is the user's decision and is **open**. What the choice
+  costs here: 4583, 3792 and 2678 ms on the CPU device against 1792 and
+  1782, 1785 and 1801, 1583 and 1583 ms warm on the GPU device. Since fix
+  pass 4 the line the routing prints on the console says that the pattern
+  still differs and that the CPU device gives the CPU's exact pattern.
+  Presets with an error-diffusion dither, read from `presets/library.py`:
+  STUDIO_R4, IMAGINE_3, ATARI_ST, APPLE_IIGS, MSX2, TURBO_SILVER, AMIGA_AGA,
+  VGA_13H and AMIGA_OCS (FLOYD), NEXTSTEP and MAC_1BIT (ATKINSON), EGA
+  (STUCKI). Only three ran, STUDIO_R4 only with Summed Area x4 on it.
+- **The other three diverged rows are signal and codec rows, over their
+  label's bar.** They are a different thing from the dither: one picture,
+  off by a few levels. RF modulator over composite (195; DISPLAY, QUANT,
+  NTSC and CABLE_RF drew): max 3.53e-02 at (76, 724), 23,542 pixels above
+  1e-3 and 795 above 1e-2; the post chain alone 1.96e-02, 23,507 and 787.
+  Its label states a 4/255 bar. MPEG-1 intra blocks at scale 12 (203;
+  DISPLAY, MPEG1, QUANT): max 1.41e-01 on the parked pixel, 4,774 above 1e-3
+  and 63 above 1e-2; the post chain alone 1.18e-02 at (312, 383), 4,712 and
+  3 pixels. Its label states 1/255. The VIDEO_CD preset (204; DISPLAY,
+  MPEG1, QUANT, NTSC, CRT): max 8.32e-03 at (591, 559), 921,589 pixels above
+  1e-6, 9,266 above 1e-3, none above 1e-2; the post chain alone has the same
+  max and 9,202 above 1e-3. Its label states 1/255 through NTSC and CRT. How
+  many pixels are over each bar is not printed. The stage table reads MPEG1
+  and CABLE_RF 0.00000 on its own input, NTSC 0.00037, CRT 0.01152.
+- **Other: 57 rows, controls 209 and 210, and the field frame 212.**
+  Thirteen have one pixel above 1e-2: the PSX preset in five rows (13, 36,
+  72, 101, 155: 3.23e-02 at (523, 542) and no other pixel; its sixth row,
+  121, is 0), the LIGHTWAVE_56 preset (48), Pano Parts (94: 1.33e-01),
+  D3D_RETAIL_1997 (119), REYES rate 16 (137), the PS1 vertex format at 64
+  units (152: 4.04e-01), SGI_BROADCAST (185), SMACKER_FMV (206) and the
+  AMIGA_OCS control (209). The other 47 have more than one. In 16 of them
+  the max is the parked pixel; as max, then pixels above 1e-3 / above 1e-2
+  of 921,600: 22 (1.61e-01, 2 / 2), 30 (1.29e-01, 5 / 2), 50 (3.92e-02, 23 /
+  2), 74 (1.25e-01, 2 / 2), 75 (1.41e-01, 5 / 5), 76 (1.29e-01, 5 / 5), 97
+  (3.53e-02, 21 / 3), 98 (3.33e-01, 3 / 3), 100 (2.26e-01, 2 / 2), 161 and
+  162 (1.61e-01, 3 / 3), 191 (1.29e-01, 28 / 2), 196 (1.25e-01, 18 / 2), 198
+  (1.96e-02, 28 / 8), 199 (3.53e-02, 25 / 6) and 205 (3.53e-02, 6 / 6). The
+  31 whose max is elsewhere are in the table, px counted the same way.
+
+| #   | variant                       | max      | at          | px       |
+|-----|-------------------------------|----------|-------------|----------|
+| 1   | MIDPOINT shadow map, bias 0   | 4.98e-01 | (52, 756)   | 17 / 2   |
+| 2   | MIDPOINT under MAYA_4         | 9.80e-02 | (28, 813)   | 22 / 5   |
+| 18  | DREAMCAST preset, table fog   | 6.45e-02 | (37, 789)   | 6 / 6    |
+| 31  | integer pixel centres         | 2.63e-01 | (414, 573)  | 20 / 2   |
+| 33  | Painter's on the GPU raster   | 2.47e-01 | (31, 909)   | 20 / 3   |
+| 46  | LW limit dynamic range, ss 2  | 3.92e-02 | (37, 789)   | 8 / 4    |
+| 49  | gamma-2 blend at BOX, ss 2    | 1.02e-01 | (37, 789)   | 24 / 5   |
+| 65  | VQ on the DREAMCAST preset    | 3.23e-02 | (149, 1259) | 2 / 2    |
+| 87  | Cylinder Sky at ss 2          | 1.49e-01 | (431, 572)  | 13 / 6   |
+| 92  | Mode 7 floor, TILE0, ss 2     | 1.49e-01 | (431, 572)  | 8 / 4    |
+| 95  | Virtual Boy layers, SBS pair  | 1.33e-01 | (76, 340)   | 16 / 2   |
+| 96  | lens DOF, Halton disc         | 1.33e-01 | (57, 739)   | 23 / 2   |
+| 107 | AMIGA_EHB preset              | 2.67e-01 | (431, 572)  | 2 / 2    |
+| 109 | JAGUAR preset (CRY)           | 1.06e-01 | (49, 973)   | 10 / 5   |
+| 110 | MSX2_PLUS preset (YJK)        | 3.14e-02 | (382, 224)  | 4 / 4    |
+| 127 | D3D_SEPARATE_SPEC (DREAMCAST) | 6.45e-02 | (37, 789)   | 4 / 4    |
+| 128 | PCX_INTENSITY (POWERVR_PCX2)  | 1.59e-02 | (361, 442)  | 3 / 3    |
+| 135 | SUPERFX_PLOT at ss 2          | 3.33e-01 | (37, 789)   | 3 / 3    |
+| 139 | GAMECUBE look, PIXEL rate     | 1.96e-02 | (139, 572)  | 4 / 2    |
+| 142 | NAMCO_S21 look, PIXEL rate    | 3.23e-02 | (443, 534)  | 3 / 3    |
+| 156 | jitter at 4 samples           | 1.41e-01 | (359, 573)  | 21 / 5   |
+| 157 | jitter at 1 sample            | 2.43e-01 | (300, 574)  | 22 / 3   |
+| 158 | RENDERMAN preset              | 1.67e-01 | (60, 731)   | 4 / 4    |
+| 159 | DS rear-plane depth bitmap    | 5.45e-01 | (233, 323)  | 18 / 2   |
+| 175 | Summed Area on MAX_R2         | 1.18e-02 | (186, 535)  | 23 / 2   |
+| 190 | SPECTRUM_512 preset           | 1.43e-01 | (37, 788)   | 6 / 6    |
+| 194 | SVIDEO preset                 | 3.88e-02 | (228, 575)  | 42 / 5   |
+| 200 | VHS preset                    | 2.13e-02 | (226, 571)  | 120 / 42 |
+| 202 | TRON_1982 preset              | 8.63e-02 | (37, 789)   | 24 / 4   |
+| 210 | control: STUDIO_R4, no dither | 3.23e-02 | (34, 1134)  | 4 / 4    |
+| 212 | the field frame at ss 2       | 9.80e-01 | (359, 11)   | 39 / 38  |
+
+- **Where those 47 differ.** In twelve the post chain compared alone is
+  above 1e-2, at 1 to 4 pixels (18, 22, 65, 98, 100, 109, 127, 128, 142,
+  161, 162 and control 210), as it is in 185: DISPLAY is followed by a stage
+  that snaps (ORDERED, PALETTE, CRY16, QUANT, the VI's AA). The stage table
+  reads those stages 0.00000 on its own input; behind DISPLAY at 0.00001
+  they are not exact on a frame. In eleven the max is the parked pixel and
+  the chain alone is two levels at most (30, 50, 74, 75, 76, 97, 191, 196,
+  198, 199, 205). For ten of them the round's reading is that a resolve, an
+  accumulation, a framebuffer pack or a spatial stage carries the parked
+  difference to 2 to 8 pixels; 30 (DS_FIXED per pixel) has none of those in
+  its block, and the report does not place its second pixel. The other 24
+  have their max elsewhere and nothing above 1e-2 in the chain alone (158
+  prints no chain compare), and their blocks do not say why. Eighteen of
+  them moved from run 3 and are named in the rasteriser bullet; six stand as
+  in run 3 or within 2 pixels of it (1, 2, 33, 95, 110, 175), and 1 and 2
+  state a 6e-3 bar for the map compare and are over it.
+- **The feature matrix on the driver: 299 rows, 2 FAILED.** The matrix
+  renders every feature at 96x72 on both devices and clears the G-buffer
+  cache itself, so its rows used the GPU rasteriser in run 3 as well. Its
+  line reads `293 raster+shade on the driver and matched, 4 partially routed
+  to the CPU by name and matched, 2 FAILED`. The two: `texture Summed Area
+  (3DS/Max)` 0.278431 at 1 pixel above 1e-2 (bar 0.05), and `error diffusion
+  FLOYD` 0.032258 at 724 pixels, its post on the CPU (bar 0.006). The FLOYD
+  row is the finding above at 96x72. The Summed Area row is one pixel a
+  whole texel apart (the texel-edge class its headless test allows); not
+  diagnosed further. `Summed Area footprint x4` reads 0.000000. Run 3
+  printed 4 FAILED (291 matched on the driver): the other two were `N64
+  coverage AA + VI filter` and the coverage-edge rig row, a defect (the
+  coverage plane was lost under the GPU rasteriser), FIXED in fix pass 4
+  (the raster block's coverage bullet). All three N64 coverage rows read
+  0.000000 now; at 720p the coverage rows 161 and 162 differ at 3 pixels and
+  163 at 1. The merged report holds the first process's matrix; the other
+  sixteen processes print the same two rows. The headless suite does not see
+  either.
+- **Timings.** One CPU frame and the GPU's warm runs 2 and 3, in ms, render
+  and post, in the table; raster is the GPU rasteriser's own ms on run 1 (3
+  to 375 over the 212 variants, median 32). Run 1 also holds the shader
+  compiles; the PSX preset is one of the 20 that rasterise again on runs 2
+  and 3 (37 and 34 ms). No variant's warm GPU run is slower than its CPU
+  frame. Where post stays on the CPU the GPU device pays for it: ATARI_ST's
+  post is 1547 and 1543 ms of its warm runs (the display and the FLOYD
+  dither), the VHS preset's 1664 and 1673 (`ntsc` refused by name under dot
+  crawl). The RENDERMAN preset's GPU-device frame is nearly all CPU work
+  (the last bullet). The PS2 preset's line does not show where its time goes
+  (shade 50 and 57, post 113 and 112).
+
+| #   | variant                 | CPU   | GPU run 2 | GPU run 3 | raster |
+|-----|-------------------------|-------|-----------|-----------|--------|
+| 6   | fog LINEAR in the pass  | 1755  | 119       | 112       | 32     |
+| 36  | PSX preset              | 485   | 185       | 187       | 34     |
+| 48  | LIGHTWAVE_56 preset     | 36121 | 1225      | 1218      | 375    |
+| 78  | PS2 preset              | 1725  | 828       | 831       | 30     |
+| 103 | ATARI_ST preset         | 4583  | 1792      | 1782      | 99     |
+| 158 | RENDERMAN preset        | 28210 | 26831     | 26979     | 101    |
+| 164 | N64 preset              | 1362  | 133       | 126       | 39     |
+| 189 | C64 preset              | 7145  | 147       | 149       | 20     |
+| 200 | VHS preset              | 6714  | 1905      | 1907      | 98     |
+| 202 | TRON_1982 preset        | 10914 | 288       | 299       | 102    |
+| 211 | the field frame at ss 1 | 1652  | 105       | 100       | 84     |
+| 212 | the field frame at ss 2 | 6036  | 306       | 302       | 149    |
+
+- **Labels and the stage table.** 41 labels are not met in run 4. Of the 32
+  that say "bitwise", two rows are 0 pixels (86, 90) and 30 are not. One of
+  the 30 claims only to equal the plain fog row (24: it prints 6's line,
+  7.06e-02 on the parked pixel, 17 pixels). The other 29: eleven at one
+  8-bit level, 7 to 27 pixels (3, 4, 5, 32, 34, 35, 88, 89, 91, 153, 154);
+  two on the parked pixel (179, 188); sixteen in class "other" (31, 33, 36,
+  87, 92, 98, 152, 155, 156, 157, 158, 159, 161, 190, 205, 206), three of
+  which were 0 pixels in run 3 (158, 190, 206). Twelve more labels state a
+  bar or an expected count and are over it: 6e-3 (1, 2), 4/255 (195), 1/255
+  (203, 204), 5e-4 (201, and 202 with "the grain's" added), "within 1e-5"
+  (183, 184, 185) and "whole pixels, expected 0" (181, 182: 26 and 24 pixels
+  above 1e-3, the parked pixel the only one above 1e-2; in 182 the post
+  chain alone has one pixel at 1.00e+00, at (104, 939)). Three labels
+  promise a cold readback (100, 189, 205) and every GPU run of each prints
+  `readbacks none`. Run Self Test's stage table, in the same report, reads
+  0.00000 for the thirteen wave-2 stages as for the wave-1 stages. That is
+  each stage on the self test's own input: the rows above show the MPEG1
+  chain (203), the NTSC + CABLE_RF chain (195) and DISPLAY ahead of ORDERED,
+  PALETTE or CRY16 differing on frames.
+- **Not covered.** Whether a labelled feature was active: no block prints
+  it, and no block prints a mark count, so the twelve labels that cite a
+  marked-pixel bar cannot be checked. The 720p field scene has no texture
+  and no translucent material, so the 720p texture and transparency rows
+  show the devices agreeing on a frame that does not exercise the feature;
+  their driver evidence is the 96x72 matrix. Rows that shaded on the CPU say
+  little about the devices' shading: the two RENDERMAN rows (137, 158) print
+  `sky: on the CPU` and `post: on the CPU`, the console names one material,
+  'Floor', as shaded on the CPU under the REYES shading rate
+  (`r251_field4_console_part_131.txt:365`), and the GPU device takes 5696 to
+  5776 and 26831 to 26979 ms against the CPU's 6024 and 28210. C020 and C036
+  are scene data and are not field variants; they appear only as matrix rows
+  at 96x72 (`Dreamcast modifier volume`, inside and outside, and `DS shadow
+  polygon`: 0.000000). No variant is labelled F012, F014, F019, F020, F021
+  or C090. F015 ran without a screen-spot lamp again (24 prints 6's line).
+  No variant drew the LENS stage or ran a BRYCE, PAINTED, STARFIELD or
+  PHYSICAL sky. The other nine error-diffusion presets. The presets' own
+  sizes, the viewport, an animation. A process longer than thirteen
+  variants: the two silent deaths of the 2026-09-27 run were not retested
+  and their cause is unknown. Nothing was rerun after this reading.
+
+Still open, disclosed. **Under an error-diffusion dither the two devices
+render different pictures** (three presets measured; the decision is the
+user's; below). **With the GPU rasteriser engaged, a few pixels of a
+720p frame differ between the devices by large amounts** (run 4: ten
+rows that were exactly 0 in run 3 carry 1 to 120 pixels above 1e-3, and
+the field frame at ss 2 has 39, max 9.80e-01; the same places recur from
+row to row). The reading, not a measurement, is that the GPU
+rasteriser's edge decisions differ from the CPU's there; the rasteriser
+predates this round and is on by default on the GPU device, the cause is
+not diagnosed, and it is open. **Two feature-matrix rows FAIL on the
+driver**: FLOYD, and Summed Area at one pixel, not diagnosed (run 3's
+two N64 coverage AA rows were a defect, fixed in fix pass 4).
+**Three signal and codec rows are over their
+label's bar on the driver** (RF over composite, MPEG-1 intra blocks, the
+VIDEO_CD preset), and 30 rows labelled bitwise are not 0 pixels there.
+**No edited preset is compared with its 1.89.0 self by
+the suite** (39 of them; the sheet in *The shipped presets against 1.89.0*
+is a look at one scene). **Seven presets' new Default Model shades nothing
+on a scene whose materials name their own model**, and how Blender
+materials reach that rule in a real scene was not read. **The register-depth
+palettes lose entries to collisions** (AMIGA_OCS 32 → 24, ATARI_ST 16 →
+11). **CPU cost is unmeasured at the presets' own sizes:** at 320x240 the
+attribute-cell and register roads cost every frame (C64 multicolour about
+570 ms, MSX1 about 190, MSX2 about 127, TURBO_SILVER about 124,
+ZX_SPECTRUM about 95) and several roads pay 0.3 to 0.9 s once on the first
+frame. **The adaptive palette lock is keyed without the picture** (older
+than this round): in one process a later frame can inherit an earlier
+scene's palette — measured headless in the collage tool, fixed there only;
+whether a second scene rendered in one Blender session inherits the first
+scene's palette was not read. **DOOM's Y-shear and VIRTUAL_BOY's
+side-by-side pair** are preset changes awaiting the user's decision.
+**Stale text in code, corrected in fix pass 3:** the NAMCO_S21 preset's
+note and the capability table's raster row said Painter's sort keeps the
+raster on the CPU; both now say it reads one depth per polygon on either
+device (C004). **The field script printed `sky: on
+the CPU` for the Cylinder Sky and Gradient Backdrop rows** because its
+name table stopped at mode 6; the GPU drew those skies (the names are in
+`field/halcyon_field_r251.py:193-206` now; closed: the full run prints
+`cylinder sky` on variants 86 and 87 and `LightWave gradient` on 88 and
+89).
+**DS_HIGHLIGHT whitens lit surfaces at the default table** (60.68% of the
+textured demo pure white), and the hardware rule is undecided between
+GBATEK (as built) and melonDS; the arithmetic was not changed, and the
+model's tooltip now says that the default table whitens lit surfaces.
+**Display before error diffusion is active on the driver and is not
+enough:** with the display transform on the CPU by name, ATARI_ST,
+AMIGA_OCS and STUDIO_R4 (under Summed Area x4) still differ between the
+devices at 351,922, 67,372 and 354,017 of 921,600 pixels; with the dither
+off or ordered the same presets agree to 0, 0, 1 and 4 pixels (the full
+run, above). **The cascade is not a class of stages to route:** an
+error-diffusion dither amplifies any last-bit difference ahead of it, the
+GPU shading's own included. The matte glow, the film grain, Video Color
+Check, Super Black, chroma siting, MPEG-1 and Smacker ahead of such a
+dither are exposed in the same way, as is every preset with an
+error-diffusion dither; none of those combinations was measured. Whether
+such frames render on the CPU by name or keep the GPU's speed with the
+difference printed is the user's decision and is open. The routing's
+printed line says since fix pass 4 that the pattern still differs and
+that the CPU device gives the CPU's exact pattern (it used to claim that
+both devices diffuse the same picture). **Two
+collage rows move no rgb pixel** (the Mega Drive COLUMNS mesh and the
+N64_NOISE alpha compare: both live in the alpha plane, so the sheet shows
+nothing for them). **The prepared-texture cache is keyed by `id()` of the
+pixel array** (`core/render.py`, the same line as in the 1.89.0 zip, so it
+predates this round): measured once, headless, the collage process was
+served a stale texture (one row 30,744 pixels instead of 3,438); it is
+worked around only in the collage tool, whether it can occur inside
+Blender is not known, and although a stale texture would be stale on both
+devices, a textured field variant may not have tested what its label
+says. **Blender dies after a few dozen 720p variants in one process**
+(twice, on 2026-09-27; the full run kept to thirteen variants a process
+and did not retest it; cause unknown — VRAM growth in the pools or cached
+uploads is a guess, not a finding). Also open: the parked pixel at row
+76, col 688 (the max in 73 of the full run's 212 rows); the
+G-buffer's third barycentric (`1 - x - y`), one ulp off the rasteriser's
+own, which keeps the fog stage on the smooth curves at 2.4e-7 instead of
+bitwise (the whole fogged frame is 8.3e-7 to 1.1e-5 from the CPU frame
+across the fog rows the suite checks, quantised and smooth alike);
+per-pixel fog for vertex-rate passes (the Voodoo2 fog dither and the
+GameCube range adjust do nothing at the VERTEX rate their presets use);
+material fog dials on reflection hits; the 14.7 MB backdrop upload under
+Fog Target Backdrop; the SR Bump azimuth origin unchecked against a
+KallistiOS checkout; the LightWave squeeze curve uncalibrated against a
+real render; the CRY chroma table unmeasured against the manual's; the TEV
+matrix and collage row comparing white with white; the Emboss Bump and Env
+Chrome collage tiles not judged; N64 coverage AA banding the whole frame
+to 5 bits, its coverage accumulate and the VI's 2x bilinear scale not
+modelled; three preset keys of the design left out on purpose (GAMECUBE's
+fog range adjust, D3D_RETAIL_1997's z-fog, POWERVR_PCX2's 5:5:5 texels);
+the chroma key under the texel formats whose alpha is not the source's,
+under block compression and under NCC; no fog advisory in the viewport;
+the GAMECUBE preset's 14e2 z and
+RGBA6 buffer as contestable defaults; VHS at one generation where the
+spec said three; the mask bake running on viewport drafts; Super Black,
+Depth of Field and the matte glow without a plane from the process pool;
+the MPEG-1 inter-frame road, Smacker's Skip blocks and Cinepak; NES /
+Mega Drive / SNES / GBC sub-palette fitting; a GPU line pass for the Elite
+rule and the beam; a headless `dither='COLUMNS'` reaching the palette
+stages with a wrong tile mask (unreachable from the panel); DS_FIXED's
+socket test exemption still by hand; and, carried from 1.89.0, the BRYCE
+and PAINTED skies, STARFIELD and PHYSICAL, the film stages beyond grain
+and flicker, the cel field, the ink's depth upload and the viewport's blit
+from a resident texture.
+
+---
+
+## [1.89.0] — 2026-09-16
+
+### The frame stays on the GPU: the sky, the resolve and the post chain
+
+- **The sky is drawn in the shading burst.** "Continue work on Halcyon.
+  Read the Dev kit zip file to know what to do and what to look at, then
+  all continued work will be put in the continued folder." — and the
+  standing "Tomorrow, we will do the remaining CPU passes to GPU."
+  Measured first, at the field's own F12 shape (1280x720 under
+  CEL_ANIME_MODERN: aa 4, so a 2560x1440 frame inside; gamma 2.2; grain
+  0.06; hold 2; a CLEAN line) on the SS4 character, CPU device, warm:
+  shade 1993 ms, outline 770, background / sky 179, resolve / downsample
+  107, 112 unaccounted; the post: film.process_linear 68 (the plain
+  grain), display_transform 27, reduce_depth 15. At ss 1 the sky bucket
+  was 109 ms for a FLAT colour world — 61 ms of camera rays and three
+  normalisations, 59 of world_color — before any mode added its own
+  (per 921,600 directions: SOLID 27, GRADIENT 48, BANDS 53, HDRI 44,
+  STARFIELD 167, PHYSICAL 218, PAINTED 1918, BRYCE 2778 ms). The sky /
+  background is now the LAST draw of the deferred shading's own burst
+  (`gpu/sky.py`): blend NONE, and every covered pixel `discard`s, so
+  the material passes' texels stand bit for bit and every uncovered
+  texel is the world's colour whatever a pass left there; under a
+  transparent film it writes exact zeros. Drawn: SOLID; a NODES world's
+  flat colour, its sky_blend gradient, its env_image (bilinear,
+  extended); a NODES world whose graph is a plain Background node
+  (constant Color and Strength — Blender's default world); GRADIENT;
+  BANDS; HDRI (nearest or bilinear, extended, tinted; a missing texture
+  falls to the solid colour as the CPU does). The supersampled
+  `fast_background` road is reproduced exactly: the low-resolution
+  block centre's ray for every pixel of a block, the edge blocks folded.
+  Refused by name, printed once, the CPU drawing the sky as before —
+  now AFTER the shading on the GPU road, order-free because the shading
+  never writes an uncovered pixel and the sky never a covered one:
+  BRYCE, PAINTED, STARFIELD, PHYSICAL, any other world node graph, the
+  ground plane. The readback IS the frame: rgb whole; the alpha plane
+  written on the CPU by the frame's own law (covered 1.0, or the Screen
+  Door's decoded bit; uncovered the film's) — the per-pixel copy of the
+  readback over the CPU sky, part of the 112 ms unaccounted, is gone.
+  `hit`, the coverage law's mask, is masked by the G-buffer's coverage,
+  so the sky's alpha never reaches the fog readback. The plan is per
+  frame (no cache); every dial rides a params texture; the mode is the
+  one push-constant int. Twins: the simulator is **bitwise** the CPU
+  sky for every ported mode — the CPU's (N,4)x(4,4) matmul sums in the
+  shader's order, and `_rotate_z`'s float64 rounding lands on the same
+  float32. On the RTX 5060 Ti (field test v3, the reading in
+  `docs-dev/FIELD_R250.md`): the sky alone (the GPU sky against the same frame with the CPU sky, both after the post chain's gamma and 8-bit depth) is bitwise for the flat colour, the GRADIENT (pow 0.7 SMOOTH, rotated) and the transparent film; one 8-bit level (3.92e-3) at 2 of 921,600 pixels for the sky blend, at 1 pixel for a 6-band BANDS sky, at 427 pixels (0.05%) for a bilinear HDRI of random texels — the driver contracts the interpolation's multiply-add where the CPU rounds twice, and a map whose neighbours differ by up to 2.0 is the worst case; nothing anywhere above one level; BRYCE refused by name and the CPU drew it in 367 ms. The 720p GPU frame
+  with the field preset (sky blend, CLEAN ink, grain, gamma 2.2) took 124–158 ms to render in R249's field test plus 67 ms of CPU post; now 83–85 ms render AND post together (the CPU device: 1202 ms) — the sky 42 → 0 CPU ms, the post 67 → 14 ms, zero uploads and zero readbacks between the shading burst and the delivered frame; at the preset's own AA (ss 2) 475–563 ms against 6830 on the CPU, the resolve 201 → 6 ms; the SS4 field frame from the export 112–129 ms (CPU 2869), and at ss 2 411–435 ms (CPU 9784).
+- **The frame stays on the GPU.** `gpu/frame.py` — `Resident`, the
+  frame kept on the GPU between stages. The shading's target is kept,
+  not pooled, when its readback needed no CPU edit (the sky drew; no
+  Screen Door; no fog; no CPU environment composite; no reflection
+  sweep). The ink reads it in place instead of uploading the frame
+  (`gpu/ink.apply(frame=, keep=)`) and its output target becomes the
+  resident frame; the new RESOLVE stage — the supersample filter at
+  output size, the taps summed in the CPU einsum's own order, bitwise
+  for every filter and factor in the simulator — reads it and its
+  output target becomes the resident (the readback is the OUTPUT frame,
+  a quarter of the bytes at ss 2); the post chain inherits it. Every
+  CPU stage that edits the frame releases it by name — the wireframe,
+  painted backgrounds, misregister / bleed, the CPU ink, halos,
+  transparency, volumetric lights, volume containers, weather, the
+  debug pass, edge smooth, adaptive AA, a refused resolve — recorded in
+  `gpu.frame.LAST['left_gpu']` and printed. Lifetime, as a law:
+  `render()` releases a stale handle on entry (motion blur re-renders on
+  one settings object) and releases at its end unless the caller set
+  `st._keep_gpu_frame` — the engine, the viewport and the self test do,
+  and release in a `finally` after `post.process`; a forgotten target is
+  buried by `device.Target.__del__`, never destroyed by refcount;
+  `release()` is idempotent. On the driver: the RESOLVE stage is bitwise — 0.00e+00 over 921,600 pixels — on the field preset at ss 2 and on the SS4 field frame at ss 2; the frame kept through shade, ink and resolve, the ink reading it in place (9 passes, 88 ms at 2560×1440), the resolve 6–7 ms warm (5 on the SS4 frame).
+- **The post chain, resident.** `gpu/chain.py` rewritten: texture in,
+  texture out (`chain.Frame`); no upload when the render's frame is inherited, otherwise one — plus one more after each active CPU-only stage that hands the frame back; the stages draw in ping-pong pooled
+  targets; a CPU-only stage that is ACTIVE reads back by name, runs on
+  the array, and the next GPU stage uploads again; one final readback.
+  The console says exactly what happened: `[Halcyon GPU] post: resident
+  chain GRAIN, DISPLAY, QUANT; frame inherited from the render; 1 CPU
+  readback(s): glow (runs on the CPU); 1 final readback`. Two new
+  stages. **GRAIN** — `wear.grain_plain` for grains at or under 1.2 px
+  with no clumps: the white sheets from the ink's uint hash, the density
+  noise on the transmittance, each channel its own sheet by Chroma, then
+  the projector's flicker scalar — within 1.2e-7 of the CPU in the
+  simulator at every chroma (log10 through log2: one float32 ulp, the
+  stage's one library call), 0.00000 on the driver; larger grains,
+  clumps and every other film stage (dust, soften, grade, the colour
+  process, weave, hairs, scratches, cue marks, halftone) keep the whole
+  film on the CPU by name. **QUANT** — `palette.snap_bits`: clip, scale,
+  `roundEven` (the CPU's half-to-even), and the level VALUE fetched from
+  the CPU's own k/levels table, so the driver's division never enters —
+  bitwise at every depth in the simulator. NTSC ping-pongs on the GPU
+  with no readback between its blurs; DISPLAY and CRT as before. Read
+  back by name: the dither kinds, the palettes, HAM, 1-bit, halftone,
+  interlace, lens, jpeg, and the optical stages (depth of field,
+  shafts, glow, star, flares). LENS stays validated but unwired (wiring
+  it would change the CPU's CRT-then-lens order); DITHER stays unwired
+  (its half-up tie rule and CLOSE 0.0327 grade would regress a road
+  that is bitwise on the CPU today). This retracts the ROADMAP's filing
+  of "the film stages on the GPU" under *impossible by construction*:
+  1.73.0 disclosed them as open, not impossible — "the film stages run
+  on the CPU on both device roads (a GPU twin would need a post stage of
+  its own)" — and that stage now exists for the grain and the flicker;
+  the rest are named refusals. On the driver: GRAIN 0.00000 and QUANT 0.00000 in the self test's stage table; the resident chain (GRAIN, DISPLAY, QUANT) against the CPU chain over the same frame lands one 8-bit level (3.92e-3) off at 23 of 921,600 pixels on the field preset and at none on the SS4 field frame — DISPLAY's `pow` on the driver, an ulp the 8-bit depth snaps across a level boundary, the class 1.73.0 graded; CRT + NTSC + 15-bit within the CRT stage's own grade (9.12e-3 max, 3 pixels above 1e-3).
+- **Found by the round's reading.** `st._frame_gpu_shaded` is reset
+  BEFORE the geometry-less early return (a reused settings object kept
+  the previous frame's verdict). Panorama strips, stereo eyes and
+  accumulation passes hand their device truth to the caller's settings
+  — the AND of the sub-frames — and print once when the post therefore
+  runs on the CPU; it used to run there silently. A held frame (Shoot
+  On 2 or 3) carries its key frame's device truth: its post used to run
+  on the CPU silently, alternating roads frame by frame under the
+  field's own preset (a held frame's post costs one upload of the key
+  cel, disclosed). `selftest.feature_matrix` clears the G-buffer cache
+  before the GPU row — the CPU row's cache served the GPU row, so the
+  compute raster was never asked and every row of every field report
+  read `-SP` with no reason printed. `tools/build_zip.py` had its
+  NEW_FILES depth off by one. And the suite on Windows: the legacy tests
+  wrote to `/tmp`, and a cp1252 console crashed a passing check on a
+  '▸' — both false failures on the field machine, fixed in the harness
+  (`tests/__init__.py` utf8_console, `test_legacy._TMP`).
+- **The suite.** The fake device (`tests/fakedevice.py`) now models the
+  driver's per-draw state: clear, blend NONE / ALPHA_PREMULT, discard,
+  scissor regions, a target pool that hands the SAME object back, a
+  draw that samples a freed target refused by name, and
+  `compile_stage` / `draw_fullscreen` / `read_target` — so `render()`
+  and `post.process` run headless through it: the whole GPU road
+  (shading + sky + ink + resolve + resident post) lands within 6e-6 of
+  the CPU render on the demo scene — the shading twin's rounding, one
+  8-bit level at 1–3 pixels of 76,800 after the depth, none at 15-bit —
+  with the alpha plane bitwise; the resident post chain is **bitwise**
+  the CPU chain over the same frame for the defaults, the field preset,
+  grain and 15-bit, and within the CRT / NTSC stages' own grades when
+  those are on; the CPU road is bitwise the 1.88.0 zip at
+  every default and dial pinned. Three new tests: `test_gpu_sky_pass`,
+  `test_gpu_frame_resident`, `test_gpu_post_resident` (45, 25 and 61 checks);
+  the driver-strictness sweep now reads the sky, every ink pass and
+  every stage for the words the simulator accepts and GLSL refuses.
+  5692 checks.
+
+Still open, disclosed: the BRYCE and PAINTED skies (2.8 s and 1.9 s per
+720p frame on the CPU — a round of their own); STARFIELD and PHYSICAL
+(the CPU's chains are float64-rounded-once; next round, with a stated
+bar); world node graphs beyond a plain Background; the film stages
+beyond grain and flicker; the cel field (a GPU march; nothing on the
+field frame pays for it); the ink's depth upload; the viewport's blit
+from a resident texture; and the one device difference left on the R249
+field frame — a shading pixel at row 76, col 688 (0.133, equal in all
+channels: a shadow-map compare flipping at a texel boundary), which
+field test v2 isolated after the GPU ink itself proved exact (9.5e-7
+over 7,975 inked pixels) — parked by name.
+
+---
+
+## [1.88.0] — 2026-09-16
+
+### The ink pass on the GPU
+
+- **The line is drawn on the GPU.** "Tomorrow, we will do the remaining
+  CPU passes to GPU." Measured first: at 1280x720 on the SS4 character
+  under CEL_ANIME_MODERN, a GPU frame's CPU time was dominated by the
+  outline bucket — 514 ms, of which 237 ms was the chamfer distance
+  transform and 193 ms the crease test that extracts the seeds — while
+  shading, sky and post together were under 150 ms. That pass now runs
+  as full-screen fragment passes (`gpu/ink.py`) on the G-buffer the
+  shading already uploaded, drawing the same line: the seed pass is
+  `apply_outline`'s four-neighbour compares (object ids, the depth
+  break, the crease on the CPU's own raw face normals, the material
+  break); the mask roads (plain and classed) are one pass — a
+  Manhattan-diamond search of radius width−1, exactly the CPU's
+  4-connected dilation, with the classed road's owner rule and its
+  paint order; the style road runs the (5,7,11) chamfer as an
+  **iterated relaxation** (sixteen fetches a pass, ping-pong targets,
+  one pass per pixel of reach — exact within the band by construction),
+  then the per-pixel style maths transcribed dial for dial (taper,
+  shadow side, weight noise, end taper with its thinning passes and a
+  second distance chain, roughness, drift, gaps, streaks, charcoal, the
+  profiles, From Fill, the gradients, Iro-Trace, marked edges), then
+  boil and pencil as manual bilinear taps, grain, opacity, the
+  composite. The noises are the CPU's own integer hashes in uint
+  arithmetic. Every dial rides a small params texture rather than push
+  constants (a Vulkan driver guarantees only 128 bytes of those).
+  Result on the field frame: the GPU line is **bitwise** the CPU line
+  at 720p, and the pass costs an upload, eight passes and a readback
+  where it cost half a second of NumPy. Frames a GPU shaded take this
+  road on F12 and in the viewport; the dials that stay on the CPU —
+  the stroke road (Smooth, Pressure, Overshoot), the isophote weight,
+  the Surface anchor, Form / Shadow / Tone lines, the vertex-colour
+  line control — refuse by name, printed once, and the CPU road runs
+  exactly as before.
+- **The CPU road, twice as fast.** The crease test reduced a
+  three-wide axis with NumPy's slowest reduction, four times a frame;
+  it is now three channel products summed in the same order — bitwise
+  the same seeds, 193 ms → ~40 ms at 720p. The feature-tracking chamfer
+  runs on one 64-bit key per pixel (distance in the high word, nearest
+  seed in the low): 190 ms → 75 ms.
+- **The nearest seed is order-free.** The chamfer's feature used to be
+  whichever candidate the scan met first — an artefact of the raster
+  order no relaxation could reproduce. Both roads now take the
+  lexicographic (distance, seed) minimum, held against a converged
+  reference on bounded frames of every size. Pixels move only at exact
+  ties between two seeds, where either was a correct answer.
+- **The near-silhouette rule.** A band pixel beyond any silhouette's
+  reach (in the band through an interior or marked line) is now its
+  own source: its own material's colour, its own side, no silhouette
+  coverage. It used to read the nearest silhouette seed however far it
+  lay — so an interior line's fringe could take its colour from an
+  unrelated object across the frame, and where no silhouette existed
+  at all the missing coverage read as −1, which a Brush or Charcoal
+  profile painted as a faint haze along every interior line. The
+  streak texture on such pixels runs along the line that put them in
+  the band (interior, then marked), not along a distant silhouette.
+- **The suite.** `test_gpu_ink_pass`: the chamfer against the
+  relaxation, the mask roads bitwise, twenty-odd style dials bitwise or
+  within 1e-5 (the CPU keeps a few float64 intermediates), the
+  refusals by name, the driver road run through a **fake device** that
+  applies the driver's own rules (every declared uniform in the
+  CreateInfo spec, every sampler bound, ints as ints, no pass sampling
+  its own target) and agrees with the simulator, `apply_outline`'s gate
+  both ways, the relaxation count load-bearing, the near rule on both
+  roads, the params texture exact. The GLSL front-end reads `true` /
+  `false` literals (it never had the case) and no longer warns on the
+  don't-care lanes of a masked call. 5,530 checks.
+
+---
+
+## [1.87.2] — 2026-09-06
+
+### The unshaded-black material, found at its root — and the shell lines, closed on re-import
+
+- **The unshaded-black material.** The field's most irritating bug — a
+  material, or several, turning pure unshaded black in the rendered
+  viewport, sometimes in the refine and not the orbit, sometimes the
+  other way, never on demand — is reproduced headless and closed at its
+  cause. The GPU plan holds one full-screen pass per material and is
+  cached on a signature that deliberately holds no camera (an orbit
+  re-plans nothing). It used to hold passes only for the materials on
+  screen when it was first built. The first frame that brought another
+  material into view hit the cached plan, found no pass for it, and the
+  pass loop left its pixels at the cleared target's zero — black, with
+  no shading and no refusal, because the frame front-end copied the
+  GPU's picture over every covered pixel and discarded the coverage
+  mask the passes returned. Drafts and refines are different sizes with
+  different plans, each built from whatever happened to be visible at
+  its own first frame — hence "in refined but not in orbit, or vice
+  versa", and hence unreproducible by hand: it depended on which parts
+  of the character were in view the first time each resolution was
+  planned. (A head shot, then a full-body shot: the pants and boots came
+  back black, 7,404 pixels, in the headless twin.) Now: **a plan
+  carries a pass for every material the mesh has** — on-screen ones
+  probed on their own fragments exactly as before, off-screen ones over
+  their own triangles (the road the ray plan already walked for
+  materials visible only in reflections); an off-screen material that
+  would refuse is left unplanned, named, and costs the frame nothing
+  until it appears; **a cache hit that lacks a material on screen
+  re-plans** instead of serving; **only the passes on screen compile
+  and draw** (bit-identical, and a hidden material never costs a driver
+  compile); and two laws stand behind it — a material on screen with no
+  pass, or a covered pixel no pass wrote, **refuses the frame by name**
+  and shades on the CPU, never black. The simulator mirrors all of it,
+  so the suite pins the exact sequence: the plan built from a partial
+  view covers everything, the next view shades whole on the cached
+  plan, a pass list lacking a material refuses naming it, a stale cache
+  entry is re-planned, an off-screen shadeless material stays
+  unplanned until it appears.
+- **The shell lines, on re-import.** 1.87.1's shared-slot discovery
+  skipped any `MI_*` slot that already carried a Halcyon tree — which
+  kept a shell built by 1.87.0 (an Anime Shader in grey) through a
+  re-import, and the field's lines stayed white. The game's shared
+  instances (`MI_LNE*`, `MI_MTH*`, `MI_SWT*`) are now **rebuilt on every
+  import** — they are the game's, never the user's — every material the
+  importer builds is stamped with the version that built it, a slot an
+  older version built is rebuilt, and a tree the user made is left
+  alone. The log says which slots were rebuilt and why.
+
+---
+
+## [1.87.1] — 2026-09-06
+
+### The Sparking! ZERO import against the field's render — three defects, each at its root
+
+The user rendered the imported Super Saiyan 4 Gogeta in Blender and
+named three things: *the white lines, the horrid highlight on the
+shoulder pads, the PURE BLACK FUR.* Each is traced here to its cause in
+1.87.0's reading and fixed where it lives; nothing is patched over.
+
+- **The white lines** were the game's outline shell. Every part carries
+  an `MI_LNE000` section — the body's own triangles again, wound the
+  other way, coincident with the surface (distance 0 on every part
+  measured): an inverted hull the game's vertex shader pushes out along
+  the normal by the `COL0` width. The export carries it flat, the
+  UEFormat importer gives it a bare material, and a coarse hull lying on
+  a finer body pokes through at every crease — white lines exactly along
+  the abs, the pecs, the neck. The importer now recognises the instance
+  (`ChrToonlineColor2` and no `Color1`, or the `MI_LNE` name when the
+  export lacks the .json) and builds it as what it is in Halcyon: a
+  Halcyon Shader in its line colour at **Opacity 0, Alpha Mode Clip,
+  casting no shadow** — and the engine now holds the punch-through law
+  to its word in every mode: a Clip material whose alpha is a CONSTANT
+  below its threshold is **absent**, in neither raster pass, the way a
+  volume container draws no surface (under Transparency None and Screen
+  Door the clip stage never ran, and such a shell rendered solid — black
+  speckles where it z-fought the body). A frame with the coincident hull
+  is the frame without it, bit for bit, under all four transparency
+  modes and on both devices; Halcyon inks the outline from the G-buffer
+  as it always has. And because that instance's .json lives
+  under `Characters/Common/Materials`, never beside the character's own,
+  the operator now **finds the slots a pick left** — every `MI_*`
+  material without a Halcyon tree — and imports them from the export
+  tree (the outline shell, the mouth, the sweat, or a part the pick
+  skipped), each named in the log with where it was found.
+- **The horrid highlight** was the specular reading. The shoulder pads
+  carry `SpecularColor (2, 2, 2)` alpha 0.87, `M_Gloss 1.2`,
+  `SpecularShininess 0.5`; 1.87.0 read the gate as pow(N·H, shininess)
+  over the alpha (a 41° cone) and folded the HDR peak into the level
+  (1.2 × 2^2.2 = 5.5) — a white blob over most of each pad. The
+  reconstruction carries no highlight term at all, and the gate those
+  parameters drive is not established. The colour (its peak
+  normalised), size and sharpness are still carried onto the node, with
+  **Specular Level 0**, and the log states the four numbers on any part
+  whose specular colour is not black.
+- **The pure black fur** was a gamma applied twice. The FModel export's
+  `R,G,B` are Unreal's linear colour, and the `Hex` beside them is that
+  value's sRGB encoding — the swatch the artist chose (the SS4 fur
+  `#752A31`, the vest `#656465`, the base skin `#FCC79E` — a classic cel
+  skin tone as picked). The reconstruction raises `Color1` and
+  `GradientAdjust1` to 2.2 before use, and 1.87.0 applied that to values
+  already linear: the fur went to 2 %, the vest to 1 %, every shadow
+  floor with them. **Every colour parameter is now read as exported**
+  — Diffuse Color shows the artist's swatch 1:1 under a sun of strength
+  π (Halcyon's lamps are Blender's) — and the shadow floor is held at
+  white where an accessory's `GradientAdjust1` exceeds it (the halo's
+  2.0 means no shading). The Cel Sparking! ZERO Skin template carries
+  the corrected numbers (`#FCC79E`, the T_ToneSKN00 tone from a 0.21 /
+  0.32 floor).
+- **The mouth palette, on the shared instance too.** 1.87.0 read a mouth
+  instance's *own* `ColorTexture1` and treated the common `Mouth_00` as
+  the slot's default everywhere — which left Gogeta's mouth (the shared
+  `MI_MTH000`, whose palette IS `Mouth_00`) black. The rule is now the
+  export's own: an instance whose `Color1` is black hands its base to
+  the palette in the slot (the closed line dark brown, the teeth, the
+  tongue; `Color2` 1.15 multiplied in the graph); a flat colour's
+  `Mouth_00` is still not read — the body's UVs land on it.
+- **Validated the field's way:** SS4 Gogeta with every section the
+  UEFormat importer creates, the shells included, under a plain white
+  sun — no white lines, the pads solid, the fur `#752A31` in the lit
+  band, the mouth line dark brown; the whole character plans onto the
+  GPU with the shell material in the scene (CPU twin to 4e-6). The
+  suite pins the shell (coincident hull, bitwise-absent under every
+  transparency mode, both devices; `scene.material_is_absent`), the
+  shared-slot discovery, the as-exported colours (the fur and the vest
+  by their numbers), the specular carried at 0, the palette rule.
+
+### The reading, corrected
+
+The reconstruction's `Power 2.2` on `Color1` and `GradientAdjust1` is
+not carried: the export's colours are linear as Unreal stores them, and
+their Hex is what the artist saw. The highlight parameters are carried
+but not lit. `COL0` is the outline width (1 on the body, 0 inside the
+mouth, the hull's own push), not a colour term. What the field's picture
+next contradicts lands here.
+
+---
+
+## [1.87.0] — 2026-09-06
+
+### Sparking! ZERO decoded from the game's own export — the SPARKING mode rebuilt, a material importer, the Cel Sparking! ZERO Skin template
+
+The field brought a character's FModel export — every material instance
+as a .json (its Textures map and Parameters block), the 16×256 tone
+strips, the greyscale line-art sheets, the UEFormat model — then a second
+character in three forms, and a reconstruction of the master material
+(an Unreal remake of `M_ChrToon`, whose expression graph this round
+walked node by node). Until now the SPARKING compatibility mode was the
+ArcSys-lineage guess with a tone nudge, and its tooltip said so. It is
+now the game's own convention as the export and the reconstruction
+state it; where a term is still open it is named in the code and in the
+notes the importer writes, never invented silently.
+
+- **The SPARKING compatibility mode, rebuilt.** The tone strip in
+  **Shadow Ramp** is read DOWN its height with white at the top, the way
+  the exported `T_Tone*` textures are painted (every column identical;
+  the reconstruction samples it at (0.5, 1 − N·L/2 − 0.5), so the band
+  input stays the half-Lambert cosine every mode uses) — the ramp bake
+  swaps its sweep axes under SPARKING and the game's own texture drops
+  in unrotated; the **Game Texture** is `Mask1`, the greyscale line-art
+  and detail sheet that MULTIPLIES the flat `Color1` (no ILM map exists
+  in this pipeline); the Detail Texture is not read. The −0.04 lineage
+  nudge is gone; with nothing linked SPARKING is GENERIC bit for bit.
+  Every other mode renders as before; KAKAROT keeps its lineage reading
+  and its honest tooltip.
+- **File ▸ Import ▸ Sparking! ZERO Material (FModel .json)** — a new
+  importer (`halcyon/sparking.py`). Pick one or many instance JSONs and
+  each becomes an Anime Shader material on the SPARKING mode, read the
+  reconstruction's way: the MI colours are display colours, so `Color1`
+  (times `Color2`) lands in Diffuse Color gamma-decoded (^2.2) and
+  every other colour parameter likewise; `Mask1` into Game Texture as
+  linear data; `GradientTexture` into Shadow Ramp as a colour texture
+  (its 134 grey reads 0.235 of the light — the bold shadow the game
+  shows) with the tone lifted from `GradientAdjust1`'s floor toward
+  white by the strip (tone = floor + (1 − floor) × strip, a MixRGB
+  Multiply and Add, per channel); `SpecularColor`, `M_Gloss`,
+  `SpecularShininess` and `SpecularSmooth` onto the stepped highlight
+  (size = (1 − alpha^(1/shininess)) / 2 on the wrapped gate, sharpness
+  = smooth / 2); `LineColor` as the material's own line colour;
+  `DynamicLightAmbient` as Ambient — the character lights itself, the
+  strip already carrying the shadow's colour; a mouth instance's own
+  `ColorTexture1` (its palette) as the base — the slot's common
+  `Mouth_00` is a default and is not read (read as a texture it painted
+  the lips grey: the field's "the mouth lip areas are incorrectly
+  colored"); an `EyeTexture` as the
+  eye on a Separate Color — the sheet is channel data, not a picture:
+  `EyeColor` where its red is (the iris), black where it is not (the
+  pupil), white where its blue is (the highlight), and the sclera —
+  `EyeColor2`, white in every shipped instance — outside the disc its
+  alpha marks, the eye opaque (the field caught the first cut, which
+  cut the whites out to the socket). The rim's colour and size travel
+  with Rim Amount 0 (the reconstruction gates a white Fresnel edge on
+  the lit side and soft-lights it in; the note names the numbers so
+  raising Rim Amount shows it). An HDR `Color1` (the halo's 2.0 with an
+  `Emissive2_Mult`) is read as a glow, the paint normalised and the
+  overflow into Self-Illumination; an HDR specular folds into the
+  level. Textures resolve beside the JSON — every ancestor folder tried
+  as the content root, with and without `Content`, .png then
+  .tga/.jpg/.dds — and a missing one is named in the log with the flat
+  value standing in. **Fill Existing Materials** rebuilds the empty
+  slots the UEFormat importer named, in place, so the character picks
+  the result up without reassigning. The strip's bands are decoded into
+  the tone sliders too (thresholds from the rows, the tints from the
+  floor and the strip), so the material reads right with the ramp
+  unlinked. What is not decoded is reported by name, never guessed:
+  `ShadowStep`, ReflectionTexture, the Toplight, the FaceLighting masks,
+  the damage layers; the reconstruction's soft light over the whole
+  base (black where the rim is off, which squares the colour) is not
+  applied — the shipped colours read right without it. Nothing from the
+  game ships — the importer reads the user's own export.
+- **Cel Sparking! ZERO Skin** on the Pre-Made shelf (114 templates): the
+  game's own base skin instance (`MI_SKN000`) as its export states it —
+  the flat colour gamma-decoded, the `T_ToneSKN00` strip's two bands as
+  the sliders on the half-Lambert cosine (white above 0.73, the warm
+  tone below lifted from GradientAdjust1's floor), no highlight at rest,
+  no scene ambient.
+- **Separate Color and Combine Color on the GPU.** Blender 4/5 offer no
+  other separate node, and the GPU had only the legacy Separate RGB: the
+  new twins read the channels the CPU reads (HSV/HSL through
+  `hal_rgb2hsv`, the Hue/Saturation node's own twin).
+- **The colour layer by name, on both devices.** The mesh now carries
+  the name of the colour layer it exports (`MeshData.color_name`, the
+  way `uv_names` travel), the CPU registers it as `col:<name>`, and a
+  Color Attribute node — or the Max Vertex Color node — naming THAT
+  layer shades on the GPU instead of refusing as "named"; a layer the
+  mesh does not carry still refuses, naming both. Cell, Gogeta and Super
+  Saiyan 4 Gogeta each plan for the GPU whole (every material, the
+  strips, the sheets, the Separate Color eyes) and match the CPU picture
+  to 6e-4.
+- **Validated on a second export.** The field's Gogeta set — base and
+  Super Saiyan 4, 40 instances across 20 .uemodel parts, the hair on
+  `T_ToneHIR00` with its own line sheet, the SS4 fur on its detail
+  sheet, the halo, the blue-green SS4 eyes — decodes with every texture
+  resolved and renders on both devices; `docs/r246_sparking_cell.png`
+  shows Cell, Gogeta and SS4 Gogeta through the same road.
+- **Docs:** the SPARKING tooltip names the export and the reconstruction;
+  the Shadow Ramp, Game Texture and Detail Texture socket tips say what
+  they mean under SPARKING.
+- **Suite:** `test_sparking_zero_decode` (SPARKING is GENERIC bit for
+  bit with nothing linked, the Mask1 multiply, the ignored Detail
+  Texture, the strip read down its height on the ball and in the baked
+  LUT, GPU parity with the strip and the sheet linked, the colour layer
+  by name on both devices, the new colour twins, the template, the
+  tooltip) and `test_sparking_zero_material_import` (the reader, the
+  resolver on an FModel-shaped tree, the decode's every mapping, the
+  gamma, the HDR folds, the strip-to-sliders decode with its compression
+  transitions, the graph, the Blender rebuild on the fake tree, import
+  end to end, Fill Existing, the operator's registration and tooltips).
+
+### The reading, stated
+
+Two readings the export cannot settle and the reconstruction does not
+carry: the eye sheet's alpha is the iris disc over an `EyeColor2` sclera
+(the whites are not in the sheet); an HDR `Color1` is a glow. The vertex
+colours (black on the mouth sections, a gradient at the lips) are not
+read — their term is not established. If the game's own master graph
+ever comes out, these are where a correction lands.
+
+---
+
 ## [1.86.2] — 2026-09-06
 
 ### The GitHub round — the documentation rewritten against live counts, four preview sheets

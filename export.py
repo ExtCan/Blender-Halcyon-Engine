@@ -492,8 +492,24 @@ def export_material(mat, images, warnings):
         # override toggle was never meant to gate them.
         m.cast_shadow = hs.cast_shadow
         m.receive_shadow = hs.receive_shadow
+        # R251 C134: the gel of the Tron printer's backlit matte
+        m.glow_gel = tuple(float(c) for c in
+                           getattr(hs, 'glow_gel', (0.0, 0.0, 0.0)))
+        # R251 C020/C036: the material's triangles as an authored volume
+        m.volume_role = str(getattr(hs, 'volume_role', 'NONE'))
+        m.polygon_id = int(getattr(hs, 'polygon_id', 0))
+        m.shadow_alpha = int(getattr(hs, 'shadow_alpha', 16))
         m.alpha_mode = str(getattr(hs, 'alpha_mode', 'BLEND'))
         m.alpha_clip = float(getattr(hs, 'alpha_clip', 0.5))
+        # R251: the per-material blend equation rides the same road
+        m.blend_mode = str(getattr(hs, 'blend_mode', 'INHERIT') or 'INHERIT')
+        # R251 C126: Blender 2.4x's Zoffs / ZInvert
+        m.z_offset = float(getattr(hs, 'z_offset', 0.0))
+        m.z_invert = bool(getattr(hs, 'z_invert', False))
+        # R251 C095: Max's Thin Wall Refraction Thickness Offset
+        m.thin_wall_offset = float(getattr(hs, 'thin_wall_offset', 0.5))
+        # R251 C101: Imagine's Fog Length
+        m.fog_length = float(getattr(hs, 'fog_length', 1.0))
         # R220: per-material ink rides the same unconditional road
         m.ink_mode = str(getattr(hs, 'ink_mode', 'INHERIT') or 'INHERIT')
         m.ink_use_color = bool(getattr(hs, 'ink_use_color', False))
@@ -893,10 +909,12 @@ def _mesh_arrays(me, matrix, mat_offset, obj_index):
             uv_names.append(str(getattr(order[1], 'name', '') or ''))
 
     cols = np.ones((n_loops, 4), np.float32)
+    color_name = ''
     clayers = compat.color_layers(me)
     if len(clayers):
         try:
             lay = clayers[0]
+            color_name = str(getattr(lay, 'name', '') or '')
             domain = getattr(lay, 'domain', 'CORNER')
             n_items = n_loops if domain == 'CORNER' else n_verts
             buf = np.empty(n_items * 4, np.float32)
@@ -981,7 +999,7 @@ def _mesh_arrays(me, matrix, mat_offset, obj_index):
     return dict(verts=pos.astype(np.float32), normals=nn.astype(np.float32),
                 uvs=uvs.astype(np.float32),
                 uvs2=uvs2.astype(np.float32) if uvs2 is not None else None,
-                uv_names=uv_names,
+                uv_names=uv_names, color_name=color_name,
                 colors=cols.astype(np.float32), tris=lt.astype(np.int32),
                 mat_index=(mat_idx + mat_offset).astype(np.int32),
                 obj_index=np.full(n_tris, obj_index, np.int32),
@@ -1032,18 +1050,24 @@ def export_light(ob, matrix, unit_scale=1.0):
         lt.decay_ld1 = getattr(hs, 'decay_ld1', 0.0)
         lt.decay_ld2 = getattr(hs, 'decay_ld2', 0.0)
         lt.bi_sphere = getattr(hs, 'bi_sphere', False)
+        lt.gx_ref_brite = float(getattr(hs, 'gx_ref_brite', 0.5) or 0.5)
         lt.shadow = hs.shadow
         lt.shadow_map_size = hs.shadow_map_size
         lt.shadow_bias = hs.shadow_bias
+        lt.shadow_map_depth = str(getattr(hs, 'shadow_map_depth', 'INHERIT'))
         lt.shadow_softness = hs.shadow_softness
         lt.shadow_samples = hs.shadow_samples
         lt.shadow_density = hs.shadow_density
         lt.shadow_color = tuple(hs.shadow_color)
         lt.negative = hs.negative
+        lt.only_shadow = bool(getattr(hs, 'only_shadow', False))
         lt.diffuse_only = hs.diffuse_only
         lt.specular_only = hs.specular_only
         lt.ambient_only = hs.ambient_only
         lt.hotspot = hs.hotspot
+        lt.spot_law = str(getattr(hs, 'spot_law', 'BLENDER') or 'BLENDER')
+        lt.spot_exponent = float(getattr(hs, 'spot_exponent', 0.0) or 0.0)
+        lt.screen_spot = bool(getattr(hs, 'screen_spot', False))
         lt.volumetric = hs.volumetric
         lt.volumetric_occlusion = getattr(hs, 'volumetric_occlusion', False)
         lt.flare = float(getattr(hs, 'flare', 0.0))
@@ -2225,6 +2249,12 @@ def export_scene(depsgraph, settings, warnings=None):
     mesh = _concat([p for p in parts if p is not None])
     _sp['concat_ms'] = (_time.perf_counter() - _t0) * 1000.0
 
+    # R251 C020/C036: the authored shadow volumes leave the surface mesh
+    # HERE, once, on the merged mesh with its FINAL global mat_index (the
+    # per-object cache stores data without mat_index and remaps at every
+    # export, so a split at the _mesh_arrays sites would freeze the role)
+    shadow_volumes = _split_volumes(mesh, materials, objects)
+
     # R191: a halo material draws NO faces -- 2.79 turned the mesh into
     # halos and never converted its geometry. Drop the soup triangles
     # wearing a halo material (vertices stay; unreferenced is harmless)
@@ -2275,6 +2305,9 @@ def export_scene(depsgraph, settings, warnings=None):
         camera.shift_x = float(cam.shift_x)
         camera.shift_y = float(cam.shift_y)
         camera.dof = bool(getattr(cam.dof, 'use_dof', False))
+        # R251 C098: the lens-pass road reads the camera's own f-number
+        camera.fstop = float(getattr(cam.dof, 'aperture_fstop', 2.8))
+        camera.focus_distance = float(getattr(cam.dof, 'focus_distance', 5.0))
         camera.projection = _projection_from_camera(cam_ob, depsgraph, settings)
 
     world = World()
@@ -2290,7 +2323,7 @@ def export_scene(depsgraph, settings, warnings=None):
             for f in _dc.fields(World):
                 if f.name in ('graph', 'env_image', 'mist', 'mist_start',
                               'mist_depth', 'mist_color', 'mist_falloff',
-                              'mist_intensity'):
+                              'mist_intensity', 'ground_image'):
                     continue
                 if hasattr(hs, f.name):
                     v = getattr(hs, f.name)
@@ -2305,6 +2338,36 @@ def export_scene(depsgraph, settings, warnings=None):
                         images[key] = ImageBuffer(name=key, pixels=px,
                                                   colorspace='Linear')
                 world.env_image = images.get(key)
+            # R251 C048: the Mode 7 map, an image datablock like env_image
+            img7 = getattr(hs, 'ground_image', None)
+            if img7 is not None:
+                key = img7.name_full
+                if key not in images:
+                    px = compat.image_pixels(img7)
+                    if px is not None:
+                        images[key] = ImageBuffer(name=key, pixels=px,
+                                                  colorspace='Linear')
+                world.ground_image = images.get(key)
+            # R251 C038: the rear-plane depth bitmap -- the red channel of
+            # a float Z pass in Non-Color space (an 8-bit or colour-managed
+            # image is not a distance)
+            imgd = getattr(hs, 'backdrop_depth_image', None)
+            if imgd is not None:
+                _cs = getattr(getattr(imgd, 'colorspace_settings', None),
+                              'name', '')
+                if not bool(getattr(imgd, 'is_float', False)) or \
+                        str(_cs) != 'Non-Color':
+                    print('[Halcyon] Backdrop Depth ignored: the image must '
+                          'be a float Z pass in Non-Color space (an 8-bit '
+                          'or colour-managed image is not a distance)')
+                else:
+                    pxd = compat.image_pixels(imgd)
+                    if pxd is not None:
+                        world.backdrop_depth = np.ascontiguousarray(
+                            np.asarray(pxd, np.float32)[:, :, 0])
+                        world.backdrop_offset = (
+                            int(getattr(hs, 'backdrop_offset_x', 0)),
+                            int(getattr(hs, 'backdrop_offset_y', 0)))
             # R203: the material-ground road -- the picked material's
             # tree serialized onto the world, programs beside it, so
             # the bpy-free plane can wear it
@@ -2353,6 +2416,7 @@ def export_scene(depsgraph, settings, warnings=None):
         pass
 
     sc = Scene(mesh=mesh, materials=materials or [Material()], objects=objects,
+               shadow_volumes=shadow_volumes,
                lights=lights, camera=camera, world=world, settings=settings,
                frame=bscene.frame_current, fps=bscene.render.fps,
                time=bscene.frame_current / max(bscene.render.fps, 1))
@@ -2392,6 +2456,65 @@ def _projection_from_camera(cam_ob, depsgraph, settings):
         return np.asarray(m, np.float32)
     except Exception:                                           # noqa: BLE001
         return None
+
+
+def _split_volumes(mesh, materials, objects):
+    """R251 C020/C036: pull every volume-role material's triangles OUT of
+    the merged mesh into Scene.shadow_volumes entries (one per (object,
+    material) pair, object order then material order) and compact the
+    corner arrays to the corners the kept triangles reference -- so a
+    volume never touches the surface mesh, not even its bounds (an
+    unreferenced far corner would coarsen every shadow map's texel).
+    Returns the list; the mesh is edited in place."""
+    vols = []
+    if mesh is None or getattr(mesh, 'tris', None) is None or \
+            not len(mesh.tris) or not materials or \
+            getattr(mesh, 'mat_index', None) is None:
+        return vols
+    roles = np.array([str(getattr(m, 'volume_role', 'NONE') or 'NONE')
+                      for m in materials])
+    mi_all = np.clip(mesh.mat_index, 0, len(materials) - 1)
+    vol = roles[mi_all] != 'NONE'
+    if not vol.any():
+        return vols
+    oi_all = mesh.obj_index if getattr(mesh, 'obj_index', None) is not None \
+        else np.zeros(len(mesh.tris), np.int32)
+    pairs = sorted({(int(o), int(m))
+                    for o, m in zip(oi_all[vol], mi_all[vol])})
+    for oi, mi in pairs:
+        sel = vol & (oi_all == oi) & (mi_all == mi)
+        t = mesh.tris[sel]
+        used, inv = np.unique(t.ravel(), return_inverse=True)
+        mat = materials[mi]
+        name = objects[oi].name if objects and 0 <= oi < len(objects) \
+            else f'object {oi}'
+        vols.append({
+            'name': str(name),
+            'verts': np.ascontiguousarray(mesh.verts[used], np.float32),
+            'tris': inv.reshape(t.shape).astype(np.int32),
+            'role': str(mat.volume_role),
+            'polygon_id': int(getattr(mat, 'polygon_id', 0)),
+            'alpha': int(getattr(mat, 'shadow_alpha', 16)),
+            'color': tuple(float(v) for v in
+                           (getattr(mat, 'diffuse', None) or (0.8, 0.8, 0.8))[:3]),
+        })
+    keep = ~vol
+    for name in ('tris', 'mat_index', 'obj_index', 'face_normals', 'smooth',
+                 'ink_tri_mask'):
+        a = getattr(mesh, name, None)
+        if a is not None and len(a) == keep.size:
+            setattr(mesh, name, a[keep])
+    keep_v = np.zeros(mesh.verts.shape[0], bool)
+    if len(mesh.tris):
+        keep_v[mesh.tris.ravel()] = True
+    idx = np.cumsum(keep_v) - 1
+    if len(mesh.tris):
+        mesh.tris = idx[mesh.tris].astype(np.int32)
+    for name in ('verts', 'normals', 'uvs', 'uvs2', 'colors'):
+        a = getattr(mesh, name, None)
+        if a is not None and len(a) == keep_v.size:
+            setattr(mesh, name, a[keep_v])
+    return vols
 
 
 def _concat(parts):
@@ -2436,6 +2559,9 @@ def _concat(parts):
                           if p.get('uv_names')), [])
     mesh.uv_name_pairs = [tuple(p['uv_names']) for p in parts
                           if p.get('uv_names')]
+    # R246: the colour layer's name, first-seen, the same way
+    mesh.color_name = next((p['color_name'] for p in parts
+                            if p.get('color_name')), None)
     mesh.colors = np.concatenate(C)
     mesh.tris = np.concatenate(T)
     mesh.mat_index = np.concatenate(MI)

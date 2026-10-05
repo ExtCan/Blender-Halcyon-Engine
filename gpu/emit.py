@@ -46,6 +46,8 @@ class Emitter:
         #                            guessing them right
 
         self.uv_names = ()         # the mesh's named UV maps, layer order
+        self.color_name = ''       # R246: the colour layer the G-buffer
+        #                            carries, by name
         self.has_vcol = False      # the mesh HAS a colour layer: BI
         #                            stripped vertex-colour modes when
         #                            none existed (convertblender.c),
@@ -527,6 +529,33 @@ def e_combine_rgb(em, node, _i):
     r = _input_indexed(em, node, 'R', 0, FLOAT)
     g = _input_indexed(em, node, 'G', 0, FLOAT)
     b = _input_indexed(em, node, 'B', 0, FLOAT)
+    return em.tmp(VEC4, f'vec4({r}, {g}, {b}, 1.0)')
+
+
+def e_separate_color(em, node, index):
+    """R246: Blender 4/5's Separate Color -- the only separate node
+    those versions offer -- exactly n_separate_color: the RGB channels,
+    or hal_rgb2hsv's HSV for the HSV/HSL modes (the CPU reads both as
+    HSV), the alpha as a fourth output where a tree asks for it."""
+    c, _t = em.tmp(VEC4, em.input(node, 'Color', VEC4))
+    if index >= 3:
+        return em.tmp(FLOAT, f'{c}.a')
+    mode = str(prop(node, 'mode', 'RGB'))
+    if mode in ('HSV', 'HSL'):
+        h, _t = em.tmp(VEC3, f'hal_rgb2hsv({c}.rgb)')
+        return em.tmp(FLOAT, f'{h}.{"xyz"[index]}')
+    return em.tmp(FLOAT, f'{c}.{"rgb"[index]}')
+
+
+def e_combine_color(em, node, _i):
+    """R246: the Combine Color twin of n_combine_color."""
+    r = em.input(node, 'Red', FLOAT)
+    g = em.input(node, 'Green', FLOAT)
+    b = em.input(node, 'Blue', FLOAT)
+    mode = str(prop(node, 'mode', 'RGB'))
+    if mode in ('HSV', 'HSL'):
+        rgb, _t = em.tmp(VEC3, f'hal_hsv2rgb(vec3({r}, {g}, {b}))')
+        return em.tmp(VEC4, f'vec4({rgb}, 1.0)')
     return em.tmp(VEC4, f'vec4({r}, {g}, {b}, 1.0)')
 
 
@@ -1302,9 +1331,14 @@ def e_anime_shader(em, node, _i):
     line, _t = em.tmp(VEC4, em.input(node, 'Line Art', VEC4))
     mode = str(prop(node, 'compat', 'GENERIC'))
     out, _t = em.tmp(VEC4, f'vec4({base}.rgb * {line}.rgb, {base}.a)')
-    if mode in ('ARCSYS', 'DBFZ', 'KAKAROT', 'SPARKING'):
+    if mode in ('ARCSYS', 'DBFZ', 'KAKAROT'):
         game, _t = em.tmp(VEC4, em.input(node, 'Game Texture', VEC4))
         out, _t = em.tmp(VEC4, f'vec4({out}.rgb * {game}.a, {out}.a)')
+    elif mode == 'SPARKING':
+        # R246: Sparking! ZERO's Mask1 -- the greyscale detail sheet
+        # multiplies the flat colour, exactly n_anime_shader
+        game, _t = em.tmp(VEC4, em.input(node, 'Game Texture', VEC4))
+        out, _t = em.tmp(VEC4, f'vec4({out}.rgb * {game}.rgb, {out}.a)')
     return out, VEC4
 
 
@@ -1347,12 +1381,15 @@ def e_bi_material(em, node, _i):
 def e_vertex_color(em, node, _i):
     """The mesh's painted colour, straight from the G-buffer.
 
-    The G-buffer carries the active colour layer; a node naming some other
-    layer refuses rather than quietly reading the wrong paint.
+    The G-buffer carries the active colour layer; a node naming THAT
+    layer reads it (R246: the mesh carries the layer's name, so an
+    imported character's 'COL0' resolves on both devices); a node naming
+    some other layer refuses rather than quietly reading the wrong paint.
     """
-    if prop(node, 'layer_name', ''):
-        raise Unsupported('named colour layers are not in the G-buffer; '
-                          'the active layer is')
+    name = prop(node, 'layer_name', '')
+    if name and name != getattr(em, 'color_name', ''):
+        raise Unsupported(f"colour layer '{name}' is not in the G-buffer; "
+                          f"the active layer '{em.color_name}' is")
     return em.tmp(VEC4, 'hal_vcol')
 
 
@@ -4775,9 +4812,10 @@ def e_mx_color_correction(em, node, index):
 
 
 def e_mx_vertex_color(em, node, index):
-    if prop(node, 'layer_name', ''):
-        raise Unsupported('named colour layers are not in the G-buffer; '
-                          'the active layer is')
+    name = prop(node, 'layer_name', '')
+    if name and name != getattr(em, 'color_name', ''):
+        raise Unsupported(f"colour layer '{name}' is not in the G-buffer; "
+                          f"the active layer '{em.color_name}' is")
     if str(prop(node, 'channel', 'VERTEX_COLOR')) == 'VERTEX_ALPHA':
         rgb, _t = em.tmp(VEC3, 'vec3(hal_vcol.a)')
     else:
@@ -5041,6 +5079,8 @@ EMITTERS = {
     'ShaderNodeCombineXYZ': e_combine_xyz,
     'ShaderNodeSeparateRGB': e_separate_rgb,
     'ShaderNodeCombineRGB': e_combine_rgb,
+    'ShaderNodeSeparateColor': e_separate_color,
+    'ShaderNodeCombineColor': e_combine_color,
     'ShaderNodeTexChecker': e_checker,
     'ShaderNodeTexGradient': e_tex_gradient,
     'ShaderNodeTexMagic': e_tex_magic,
@@ -5173,3 +5213,414 @@ def can_emit(graph):
             except Unsupported:
                 pass
     return (not em.unsupported), em.unsupported
+
+
+# ---- R251 material pack, wave 2 (MAT-B): period node emitters ----
+# The GLSL twins of core/nodeeval.py's period evaluators: the same
+# statements on vec3 with roundEven / floor / clamp, one op per em.tmp
+# line where a rounding follows (no FMA across a quantisation), power-of-
+# two divides only except the NV2A's proven /255, values through em._m.
+
+
+def _mb_value(em, v):
+    """A liftable VALUE written with NINE significant digits: `em._m` formats
+    with %.8g, which does not round-trip every float32 (float32(1) -
+    float32(0.9) = 0.1000000238 -> "0.10000002" -> 0.1000000164, one ULP
+    off), and the MAT-B twins are claimed bitwise. The lifter parses the
+    literal text, so the hal_mats texel carries the exact float32 too."""
+    import numpy as _np
+    try:
+        f = float(_np.float32(v))
+    except (TypeError, ValueError):
+        f = 0.0
+    s = f'{f:.9g}'
+    if '.' not in s and 'e' not in s and 'inf' not in s and 'nan' not in s:
+        s += '.0'
+    if em.mark_values and f == f and abs(f) != float('inf'):
+        return f'hal_MV({s})'
+    return s
+
+_R255_GLSL = '0.00392156886'
+
+
+def _cb_q8_glsl(em, expr):
+    return em.tmp(VEC3, f'roundEven(clamp({expr}, 0.0, 1.0) * 255.0)')[0]
+
+
+def e_halcyon_combiner_stage(em, node, _i):
+    """C028: the TEV / NV2A stage, integer arithmetic in floats."""
+    A, _t = em.tmp(VEC4, em.input(node, 'A', VEC4))
+    B, _t = em.tmp(VEC4, em.input(node, 'B', VEC4))
+    C, _t = em.tmp(VEC4, em.input(node, 'C', VEC4))
+    D, _t = em.tmp(VEC4, em.input(node, 'D', VEC4))
+    if str(prop(node, 'hardware', 'TEV')) == 'NV2A':
+        def nvmap(v, mapping):
+            if mapping == 'UNSIGNED_INVERT':
+                return em.tmp(VEC3, f'1.0 - clamp({v}.rgb, 0.0, 1.0)')[0]
+            if mapping == 'EXPAND_NORMAL':
+                m0 = em.tmp(VEC3, f'max({v}.rgb, 0.0)')[0]
+                m1 = em.tmp(VEC3, f'2.0 * {m0}')[0]
+                return em.tmp(VEC3, f'{m1} - 1.0')[0]
+            if mapping == 'EXPAND_NEGATE':
+                m0 = em.tmp(VEC3, f'max({v}.rgb, 0.0)')[0]
+                m1 = em.tmp(VEC3, f'2.0 * {m0}')[0]
+                m2 = em.tmp(VEC3, f'{m1} - 1.0')[0]
+                return em.tmp(VEC3, f'-{m2}')[0]
+            if mapping == 'HALF_BIAS_NORMAL':
+                m0 = em.tmp(VEC3, f'max({v}.rgb, 0.0)')[0]
+                return em.tmp(VEC3, f'{m0} - 0.5')[0]
+            if mapping == 'HALF_BIAS_NEGATE':
+                m0 = em.tmp(VEC3, f'max({v}.rgb, 0.0)')[0]
+                m1 = em.tmp(VEC3, f'{m0} - 0.5')[0]
+                return em.tmp(VEC3, f'-{m1}')[0]
+            if mapping == 'SIGNED_IDENTITY':
+                return em.tmp(VEC3, f'{v}.rgb')[0]
+            if mapping == 'SIGNED_NEGATE':
+                return em.tmp(VEC3, f'-{v}.rgb')[0]
+            return em.tmp(VEC3, f'max({v}.rgb, 0.0)')[0]
+
+        def q9(v):
+            r = em.tmp(VEC3, f'roundEven({v} * 255.0)')[0]
+            return em.tmp(VEC3, f'clamp({r}, -256.0, 255.0)')[0]
+        qa = q9(nvmap(A, str(prop(node, 'map_a', 'UNSIGNED_IDENTITY'))))
+        qb = q9(nvmap(B, str(prop(node, 'map_b', 'UNSIGNED_IDENTITY'))))
+        qc = q9(nvmap(C, str(prop(node, 'map_c', 'UNSIGNED_IDENTITY'))))
+        qd = q9(nvmap(D, str(prop(node, 'map_d', 'UNSIGNED_IDENTITY'))))
+        pab_i = em.tmp(VEC3, f'{qa} * {qb}')[0]
+        pab = em.tmp(VEC3, f'roundEven({pab_i} / 255.0)')[0]
+        pcd_i = em.tmp(VEC3, f'{qc} * {qd}')[0]
+        pcd = em.tmp(VEC3, f'roundEven({pcd_i} / 255.0)')[0]
+        s = em.tmp(VEC3, f'{pab} + {pcd}')[0]
+        sc = str(prop(node, 'nv_scale', 'X1'))
+        if sc == 'X2':
+            s = em.tmp(VEC3, f'{s} * 2.0')[0]
+        elif sc == 'X4':
+            s = em.tmp(VEC3, f'{s} * 4.0')[0]
+        elif sc == 'HALF':
+            s = em.tmp(VEC3, f'floor({s} / 2.0)')[0]
+        if str(prop(node, 'nv_bias', 'NONE')) == 'MINUS_HALF':
+            s = em.tmp(VEC3, f'{s} - 128.0')[0]
+        o = em.tmp(VEC3, f'clamp({s}, -256.0, 255.0)')[0]
+    else:
+        a8 = _cb_q8_glsl(em, f'{A}.rgb')
+        b8 = _cb_q8_glsl(em, f'{B}.rgb')
+        c8 = _cb_q8_glsl(em, f'{C}.rgb')
+        d0 = em.tmp(VEC3, f'roundEven({D}.rgb * 255.0)')[0]
+        d10 = em.tmp(VEC3, f'clamp({d0}, -1024.0, 1023.0)')[0]
+        op = str(prop(node, 'op', 'ADD'))
+        if op in ('ADD', 'SUB'):
+            c9a = em.tmp(VEC3, f'floor({c8} / 128.0)')[0]
+            c9 = em.tmp(VEC3, f'{c8} + {c9a}')[0]
+            q1 = em.tmp(VEC3, f'256.0 - {c9}')[0]
+            p = em.tmp(VEC3, f'{a8} * {q1}')[0]
+            q = em.tmp(VEC3, f'{b8} * {c9}')[0]
+            s = em.tmp(VEC3, f'{p} + {q}')[0]
+            lp = em.tmp(VEC3, f'floor({s} / 256.0)')[0]
+            o = em.tmp(VEC3, f'{d10} + {lp}' if op == 'ADD' else f'{d10} - {lp}')[0]
+            bias = str(prop(node, 'bias', 'ZERO'))
+            if bias == 'ADD_HALF':
+                o = em.tmp(VEC3, f'{o} + 128.0')[0]
+            elif bias == 'SUB_HALF':
+                o = em.tmp(VEC3, f'{o} - 128.0')[0]
+            sc = str(prop(node, 'scale', 'X1'))
+            if sc == 'X2':
+                o = em.tmp(VEC3, f'{o} * 2.0')[0]
+            elif sc == 'X4':
+                o = em.tmp(VEC3, f'{o} * 4.0')[0]
+            elif sc == 'HALF':
+                o = em.tmp(VEC3, f'floor({o} / 2.0)')[0]
+        else:
+            gt = op.endswith('_GT')
+            cmp = '>' if gt else '=='
+            if op.startswith('COMP_R8'):
+                sel = em.tmp(VEC3, f'({a8}.r {cmp} {b8}.r) ? {c8} : vec3(0.0)')[0]
+            elif op.startswith('COMP_GR16'):
+                pa0 = em.tmp(FLOAT, f'{a8}.g * 256.0')[0]
+                pa = em.tmp(FLOAT, f'{pa0} + {a8}.r')[0]
+                pb0 = em.tmp(FLOAT, f'{b8}.g * 256.0')[0]
+                pb = em.tmp(FLOAT, f'{pb0} + {b8}.r')[0]
+                sel = em.tmp(VEC3, f'({pa} {cmp} {pb}) ? {c8} : vec3(0.0)')[0]
+            elif op.startswith('COMP_BGR24'):
+                pa0 = em.tmp(FLOAT, f'{a8}.b * 65536.0')[0]
+                pa1 = em.tmp(FLOAT, f'{a8}.g * 256.0')[0]
+                pa2 = em.tmp(FLOAT, f'{pa0} + {pa1}')[0]
+                pa = em.tmp(FLOAT, f'{pa2} + {a8}.r')[0]
+                pb0 = em.tmp(FLOAT, f'{b8}.b * 65536.0')[0]
+                pb1 = em.tmp(FLOAT, f'{b8}.g * 256.0')[0]
+                pb2 = em.tmp(FLOAT, f'{pb0} + {pb1}')[0]
+                pb = em.tmp(FLOAT, f'{pb2} + {b8}.r')[0]
+                sel = em.tmp(VEC3, f'({pa} {cmp} {pb}) ? {c8} : vec3(0.0)')[0]
+            else:                                               # COMP_RGB8
+                sel = em.tmp(VEC3, f'vec3(({a8}.r {cmp} {b8}.r) ? {c8}.r : 0.0, '
+                                   f'({a8}.g {cmp} {b8}.g) ? {c8}.g : 0.0, '
+                                   f'({a8}.b {cmp} {b8}.b) ? {c8}.b : 0.0)')[0]
+            o = em.tmp(VEC3, f'{d10} + {sel}')[0]
+        if bool(prop(node, 'clamp', True)):
+            o = em.tmp(VEC3, f'clamp({o}, 0.0, 255.0)')[0]
+        else:
+            o = em.tmp(VEC3, f'clamp({o}, -1024.0, 1023.0)')[0]
+    return em.tmp(VEC4, f'vec4({o} * {_R255_GLSL}, {A}.a)')
+
+
+EMITTERS.update({
+    'HALCYON_CombinerStageNode': e_halcyon_combiner_stage,
+})
+
+
+# ---- MAT-B C023: SR Bump (PowerVR2) ----
+def _sr_linked(node, name):
+    sock = next((s for s in node.get('inputs', ()) if s.get('name') == name), None)
+    return bool(sock and sock.get('link'))
+
+
+def e_halcyon_sr_bump(em, node, index):
+    """C023: the (S,R) intensity through the two raw table textures; K1,
+    K2, K3, Q baked from the constant Light socket by the CPU's own
+    `light_constants`; a linked Light refuses by name."""
+    from ..core import srbump_tables as SRT
+    light_linked = _sr_linked(node, 'Light')
+    strength_linked = _sr_linked(node, 'Strength')
+    if light_linked and strength_linked:
+        raise Unsupported('SR Bump: Strength linked with a linked Light -- '
+                          'per-pixel sqrt; shades on the CPU')
+    if light_linked:
+        raise Unsupported("SR Bump: Light linked -- the PVR2's light azimuth "
+                          'is one per polygon (a per-pixel atan2); shades on '
+                          'the CPU')
+    key = ('__sr_tables',)
+    if key not in em.once:
+        em.once.add(key)
+        em.samplers.append({'uniform': 'hal_sr_tab', 'image': '__sr_tables__',
+                            'raw': True})
+        em.samplers.append({'uniform': 'hal_sr_atan', 'image': '__sr_atan__',
+                            'raw': True})
+    if '__sr_decl' not in em.once:
+        em.once.add('__sr_decl')
+        em.inline.append('uniform sampler2D hal_sr_tab;\n'
+                         'uniform sampler2D hal_sr_atan;\n')
+    col, _t = em.tmp(VEC4, em.input(node, 'Color', VEC4))
+    base, _t = em.tmp(VEC4, em.input(node, 'Base', VEC4))
+    lsock = next((s for s in node.get('inputs', ()) if s.get('name') == 'Light'), None)
+    lvec = list((lsock or {}).get('default') or (0.0, 0.0, 1.0))[:3]
+    ssock = next((s for s in node.get('inputs', ()) if s.get('name') == 'Strength'), None)
+    if strength_linked:
+        # a linked Strength with an unlinked Light: sinT / cosT baked once,
+        # K1 / K2 / K3 per pixel (no transcendental)
+        K1c, K2c, K3c, Q = SRT.light_constants(lvec, 1.0)     # H = 1: K2 = sinT, K3 = cosT
+        Hraw = em.input(node, 'Strength', FLOAT)
+        Hv, _t = em.tmp(FLOAT, f'clamp({Hraw}, 0.0, 1.0)')
+        K1, _t = em.tmp(FLOAT, f'1.0 - {Hv}')
+        K2, _t = em.tmp(FLOAT, f'{_mb_value(em, K2c)} * {Hv}')
+        K3, _t = em.tmp(FLOAT, f'{_mb_value(em, K3c)} * {Hv}')
+    else:
+        H = float((ssock or {}).get('default') or 0.0)
+        K1c, K2c, K3c, Q = SRT.light_constants(lvec, H)
+        K1, _t = em.tmp(FLOAT, _mb_value(em, K1c))
+        K2, _t = em.tmp(FLOAT, _mb_value(em, K2c))
+        K3, _t = em.tmp(FLOAT, _mb_value(em, K3c))
+    Qv, _t = em.tmp(FLOAT, _mb_value(em, float(Q)))
+    n8, _t = em.tmp(VEC3, f'roundEven(clamp({col}.rgb, 0.0, 1.0) * 255.0)')
+    S, _t = em.tmp(FLOAT, f'texelFetch(hal_sr_tab, ivec2(int({n8}.b), 0), 0).r')
+    R, _t = em.tmp(FLOAT, f'texelFetch(hal_sr_atan, ivec2(int({n8}.r), int({n8}.g)), 0).r')
+    sinS, _t = em.tmp(FLOAT, f'texelFetch(hal_sr_tab, ivec2(int({S}) + 256, 0), 0).r')
+    cosS, _t = em.tmp(FLOAT, f'texelFetch(hal_sr_tab, ivec2(int({S}) + 512, 0), 0).r')
+    m0, _t = em.tmp(FLOAT, f'{R} - {Qv}')
+    mf, _t = em.tmp(FLOAT, f'floor({m0} / 256.0)')
+    m1, _t = em.tmp(FLOAT, f'256.0 * {mf}')
+    m, _t = em.tmp(FLOAT, f'{m0} - {m1}')
+    c256, _t = em.tmp(FLOAT, f'texelFetch(hal_sr_tab, ivec2(int({m}) + 768, 0), 0).r')
+    p1, _t = em.tmp(FLOAT, f'{K2} * {sinS}')
+    a, _t = em.tmp(FLOAT, f'{K1} + {p1}')
+    c1, _t = em.tmp(FLOAT, f'{cosS} * {c256}')
+    p2, _t = em.tmp(FLOAT, f'{K3} * {c1}')
+    I0, _t = em.tmp(FLOAT, f'{a} + {p2}')
+    I, _t = em.tmp(FLOAT, f'clamp({I0}, 0.0, 1.0)')
+    if index == 0:
+        return I, FLOAT
+    if str(prop(node, 'blend', 'MULTIPLY')) == 'ADD':
+        rgb, _t = em.tmp(VEC3, f'min({base}.rgb + vec3({I}), 1.0)')
+    else:
+        rgb, _t = em.tmp(VEC3, f'{base}.rgb * {I}')
+    return em.tmp(VEC4, f'vec4({rgb}, {base}.a)')
+
+
+EMITTERS.update({'HALCYON_SRBumpNode': e_halcyon_sr_bump})
+
+
+# ---- MAT-B C135: Emboss Bump (DirectX 6), two stages ----
+def e_halcyon_emboss_shift(em, node, _i):
+    """C135 stage one: `inv` is a value baked on the CPU (1/size in float32,
+    so the GPU never divides); a linked Texture Size refuses by name."""
+    if _sr_linked(node, 'Texture Size'):
+        raise Unsupported("Emboss Bump: Texture Size linked -- the shift's "
+                          'reciprocal is baked once per material; shades on '
+                          'the CPU')
+    import numpy as _np
+    ssock = next((s for s in node.get('inputs', ()) if s.get('name') == 'Texture Size'), None)
+    size = max(float((ssock or {}).get('default') or 256.0), 1.0)
+    inv = float(_np.float32(_np.float32(1.0) / _np.float32(size)))
+    uv, _t = em.tmp(VEC3, tex_vector(em, node, 'uv'))
+    L, _t = em.tmp(VEC3, em.input(node, 'Light', VEC3))
+    off, _t = em.tmp(FLOAT, em.input(node, 'Offset', FLOAT))
+    p, _t = em.tmp('vec2', f'{off} * {L}.xy')
+    d, _t = em.tmp('vec2', f'{p} * {_mb_value(em, inv)}')
+    return em.tmp(VEC3, f'vec3({uv}.xy + {d}, {uv}.z)')
+
+
+def e_halcyon_emboss_bump(em, node, index):
+    """C135 stage two: hd, b, clamp, m, the modulate-2x -- five statements."""
+    h, _t = em.tmp(FLOAT, em.input(node, 'Height', FLOAT))
+    hs, _t = em.tmp(FLOAT, em.input(node, 'Height Shifted', FLOAT))
+    base, _t = em.tmp(VEC4, em.input(node, 'Base', VEC4))
+    hd, _t = em.tmp(FLOAT, f'{h} - {hs}')
+    b0, _t = em.tmp(FLOAT, f'0.5 + {hd}')
+    b, _t = em.tmp(FLOAT, f'clamp({b0}, 0.0, 1.0)')
+    if index == 0:
+        return b, FLOAT
+    m0, _t = em.tmp(FLOAT, f'2.0 * {b}')
+    m, _t = em.tmp(FLOAT, f'min({m0}, 1.0)')
+    rgb, _t = em.tmp(VEC3, f'{base}.rgb * {m}')
+    return em.tmp(VEC4, f'vec4({rgb}, {base}.a)')
+
+
+EMITTERS.update({'HALCYON_EmbossShiftNode': e_halcyon_emboss_shift,
+                 'HALCYON_EmbossBumpNode': e_halcyon_emboss_bump})
+
+
+# ---- MAT-B C099: Roughness (Imagine) ----
+#: the Wang mix WITHOUT the 0..1 fold (the CPU hashes the pixel word once,
+#: then folds the three lanes off the mixed word through hal_wang01)
+_IMR_WANG_GLSL = """
+uint hal_imr_wang(uint u)
+{
+    u = (u ^ 61u) ^ (u >> 16u);
+    u = u * 9u;
+    u = u ^ (u >> 4u);
+    u = u * 668265261u;
+    u = u ^ (u >> 15u);
+    return u;
+}
+"""
+
+
+def e_halcyon_imagine_roughness(em, node, _i):
+    """C099: the same Wang hash of (pixel, seed[, frame]) on the driver; the
+    Screen Info rule (the pixel exists only in the deferred frame); the
+    seed is a plan-signature key, baked as a literal (`em.seed`)."""
+    if not (em.frame_mode and not em.secondary
+            and getattr(em, 'resolution', None) is not None):
+        raise Unsupported('Roughness (Imagine) reads the pixel position, which '
+                          'hit shading does not carry; shades on the CPU')
+    if '__wang' not in em.once:
+        em.once.add('__wang')
+        em.inline.append(_WANG_GLSL)
+    if '__imr_wang' not in em.once:
+        em.once.add('__imr_wang')
+        em.inline.append(_IMR_WANG_GLSL)
+    nrm = em.input(node, 'Normal', VEC3) if _sr_linked(node, 'Normal') else 'hal_N'
+    N, _t = em.tmp(VEC3, nrm)
+    r0 = em.input(node, 'Roughness', FLOAT)
+    r, _t = em.tmp(FLOAT, f'clamp({r0}, 0.0, 255.0)')
+    w, h = float(em.resolution[0]), float(em.resolution[1])
+    seed = int(getattr(em, 'seed', 0) or 0)
+    shimmer = bool(prop(node, 'animate', False))
+    base_salt = (seed * 7919) & 0xFFFFFFFF
+    if shimmer:
+        em.frame_uniforms.add('hal_frame')
+        salt_expr = f'({base_salt}u + uint(hal_frame) * 104729u)'
+    else:
+        salt_expr = f'{base_salt}u'
+    px, _t = em.tmp('uint', f'uint(floor(vUV.x * {_c(w)}))')
+    py, _t = em.tmp('uint', f'uint(floor(vUV.y * {_c(h)}))')
+    u, _t = em.tmp('uint', f'hal_imr_wang({px} + {py} * 65536u + {salt_expr})')
+    x, _t = em.tmp(FLOAT, f'2.0 * hal_wang01({u} ^ 1757225451u) - 1.0')
+    y, _t = em.tmp(FLOAT, f'2.0 * hal_wang01({u} ^ 48610963u) - 1.0')
+    z, _t = em.tmp(FLOAT, f'2.0 * hal_wang01({u} ^ 2524743835u) - 1.0')
+    nn, _t = em.tmp(VEC3, f'normalize({N})')
+    k0, _t = em.tmp(FLOAT, f'{r} * 0.00392156886')
+    k, _t = em.tmp(FLOAT, f'{k0} * 0.5')
+    n2, _t = em.tmp(VEC3, f'{nn} + {k} * vec3({x}, {y}, {z})')
+    return em.tmp(VEC3, f'({r} > 0.0) ? normalize({n2}) : {N}')
+
+
+EMITTERS.update({'HALCYON_ImagineRoughnessNode': e_halcyon_imagine_roughness})
+
+
+# ---- MAT-B C123: Env Chrome (Alias / Maya) ----
+_EC_DEFAULTS_E = {'light_width': 0.5, 'light_depth': 0.1, 'light_width_gain': 1.0,
+                  'light_width_offset': 0.0, 'light_depth_gain': 1.0,
+                  'light_depth_offset': 0.0, 'grid_width': 0.1, 'grid_depth': 0.1,
+                  'grid_width_gain': 1.0, 'grid_width_offset': 0.0,
+                  'grid_depth_gain': 1.0, 'grid_depth_offset': 0.0,
+                  'floor_altitude': -1.0}
+
+
+def e_halcyon_env_chrome(em, node, _i):
+    """C123: the showroom along reflect(I, N) -- every multiply-add split
+    into two statements (numpy rounds them apart; no FMA may cross a
+    floor or a compare), the two lerps as a + (b - a) * t, `?:` selects;
+    the 13 parameters and the six colours are values."""
+    def pv(name):
+        v, _t = em.tmp(FLOAT, _mb_value(em, float(prop(node, name, _EC_DEFAULTS_E[name]))))
+        return v
+    pr = {k: pv(k) for k in _EC_DEFAULTS_E}
+    cols = {}
+    for name, key in (('Sky Color', 'sky'), ('Zenith Color', 'zen'), ('Light Color', 'light'),
+                      ('Floor Color', 'floor'), ('Horizon Color', 'hor'), ('Grid Color', 'grid')):
+        c4, _t = em.tmp(VEC4, em.input(node, name, VEC4))
+        cols[key], _t = em.tmp(VEC3, f'{c4}.rgb')
+    I, _t = em.tmp(VEC3, '-normalize(hal_V)')
+    nrm = em.input(node, 'Normal', VEC3) if _sr_linked(node, 'Normal') else 'hal_N'
+    N, _t = em.tmp(VEC3, f'normalize({nrm})')
+    dn, _t = em.tmp(FLOAT, f'dot({N}, {I})')
+    s2, _t = em.tmp(FLOAT, f'2.0 * {dn}')
+    sn, _t = em.tmp(VEC3, f'{s2} * {N}')
+    R, _t = em.tmp(VEC3, f'{I} - {sn}')
+    # sky side
+    rz, _t = em.tmp(FLOAT, f'max({R}.z, 1e-6)')
+    t, _t = em.tmp(FLOAT, f'clamp({R}.z, 0.0, 1.0)')
+    dz, _t = em.tmp(VEC3, f'{cols["zen"]} - {cols["sky"]}')
+    dzt, _t = em.tmp(VEC3, f'{dz} * {t}')
+    sky, _t = em.tmp(VEC3, f'{cols["sky"]} + {dzt}')
+    px, _t = em.tmp(FLOAT, f'{R}.x / {rz}')
+    pz, _t = em.tmp(FLOAT, f'{R}.y / {rz}')
+    fx0, _t = em.tmp(FLOAT, f'{px} * {pr["light_width_gain"]}')
+    fx1, _t = em.tmp(FLOAT, f'{fx0} + {pr["light_width_offset"]}')
+    fx, _t = em.tmp(FLOAT, f'{fx1} - floor({fx1})')
+    fz0, _t = em.tmp(FLOAT, f'{pz} * {pr["light_depth_gain"]}')
+    fz1, _t = em.tmp(FLOAT, f'{fz0} + {pr["light_depth_offset"]}')
+    fz, _t = em.tmp(FLOAT, f'{fz1} - floor({fz1})')
+    up, _t = em.tmp(VEC3, f'(({fx} < {pr["light_width"]}) && ({fz} < {pr["light_depth"]})) ? {cols["light"]} : {sky}')
+    # floor side
+    rzn, _t = em.tmp(FLOAT, f'min({R}.z, -1e-6)')
+    ax, _t = em.tmp(FLOAT, f'{R}.x * {pr["floor_altitude"]}')
+    pxn, _t = em.tmp(FLOAT, f'{ax} / {rzn}')
+    az, _t = em.tmp(FLOAT, f'{R}.y * {pr["floor_altitude"]}')
+    pzn, _t = em.tmp(FLOAT, f'{az} / {rzn}')
+    if bool(prop(node, 'real_floor', True)):
+        dh, _t = em.tmp(FLOAT, f'{pr["floor_altitude"]} - hal_P.z')
+        tt, _t = em.tmp(FLOAT, f'{dh} / {rzn}')
+        mx, _t = em.tmp(FLOAT, f'{tt} * {R}.x')
+        pxr, _t = em.tmp(FLOAT, f'hal_P.x + {mx}')
+        mz, _t = em.tmp(FLOAT, f'{tt} * {R}.y')
+        pzr, _t = em.tmp(FLOAT, f'hal_P.y + {mz}')
+        px2, _t = em.tmp(FLOAT, f'({tt} >= 0.0) ? {pxr} : {pxn}')
+        pz2, _t = em.tmp(FLOAT, f'({tt} >= 0.0) ? {pzr} : {pzn}')
+    else:
+        px2, pz2 = pxn, pzn
+    nz, _t = em.tmp(FLOAT, f'-{R}.z')
+    dfh, _t = em.tmp(VEC3, f'{cols["floor"]} - {cols["hor"]}')
+    dft, _t = em.tmp(VEC3, f'{dfh} * {nz}')
+    base, _t = em.tmp(VEC3, f'{cols["hor"]} + {dft}')
+    gx0, _t = em.tmp(FLOAT, f'{px2} * {pr["grid_width_gain"]}')
+    gx1, _t = em.tmp(FLOAT, f'{gx0} + {pr["grid_width_offset"]}')
+    gx, _t = em.tmp(FLOAT, f'{gx1} - floor({gx1})')
+    gz0, _t = em.tmp(FLOAT, f'{pz2} * {pr["grid_depth_gain"]}')
+    gz1, _t = em.tmp(FLOAT, f'{gz0} + {pr["grid_depth_offset"]}')
+    gz, _t = em.tmp(FLOAT, f'{gz1} - floor({gz1})')
+    down, _t = em.tmp(VEC3, f'(({gx} < {pr["grid_width"]}) || ({gz} < {pr["grid_depth"]})) ? {cols["grid"]} : {base}')
+    out, _t = em.tmp(VEC3, f'({R}.z >= 0.0) ? {up} : {down}')
+    return em.tmp(VEC4, f'vec4({out}, 1.0)')
+
+
+EMITTERS.update({'HALCYON_EnvChromeNode': e_halcyon_env_chrome})

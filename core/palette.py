@@ -137,11 +137,6 @@ def mac256():
     return pal
 
 
-def amiga_ocs(n=32):
-    """Amiga OCS/ECS 12-bit colour register set (adaptive, but 4 bits/channel)."""
-    return None  # generated adaptively then snapped; see snap_bits
-
-
 FIXED_PALETTES = {
     'EGA16': lambda size: EGA16,
     'CGA4': lambda size: CGA4,
@@ -435,6 +430,29 @@ def snap_bits(img, rbits, gbits, bbits):
     return out
 
 
+def snap_levels(pal, levels):
+    """R251 (C061): a palette snapped to a register lattice of `levels`
+    values per channel -- snap_bits's own arithmetic with a general level
+    count (the Amstrad CPC's 27 colours are three levels, not a bit
+    depth), half to even. Float32 in, float32 out."""
+    lv = float(int(levels) - 1)
+    p = np.asarray(pal, np.float32)
+    return (np.round(np.clip(p, 0.0, 1.0) * lv) / lv).astype(np.float32)
+
+
+def icm_index_image(icm):
+    """R251 (P0): an InverseColormap's 64^3 index table as a (512, 512, 4)
+    float32 image the GPU palette stage fetches: .r[y, x] = lut[y * 512 + x]
+    (the CPU's packed code (r << 12) | (g << 6) | b split as y = code >> 9,
+    x = code & 511), alpha 1. Every index is exact below 2^24."""
+    lut = np.asarray(icm.lut, np.int32)
+    assert lut.shape[0] == 512 * 512, lut.shape
+    img = np.zeros((512, 512, 4), np.float32)
+    img[:, :, 0] = lut.reshape(512, 512).astype(np.float32)
+    img[:, :, 3] = 1.0
+    return img
+
+
 def quantize_image(rgb, n_colors, method='MEDIAN_CUT', dither='NONE',
                    strength=1.0, palette=None, serpentine=True, seed=0):
     """Map an image to an N-colour palette. Returns (rgb_out, palette)."""
@@ -447,6 +465,35 @@ def quantize_image(rgb, n_colors, method='MEDIAN_CUT', dither='NONE',
 
 
 # ------------------------------------------------------------------- Amiga
+
+
+def sham_row(row_q, base):
+    """R251 (C060): one scanline of the hold-and-modify encode -- the
+    row loop of ham_encode, factored out so Sliced HAM can restart it on
+    every line with that line's own base colours. `row_q` (W, 3) is the
+    row already on the channel lattice, `base` (N, 3) the base palette.
+    The held colour starts at black; per pixel the best base entry
+    (np.argmin: lowest index on ties), then each single-channel modify
+    of the held colour in channel order replaces it only when STRICTLY
+    better; the chosen colour is held for the next pixel."""
+    out = np.empty_like(row_q)
+    cur = np.array([0.0, 0.0, 0.0], np.float32)
+    for x in range(row_q.shape[0]):
+        tgt = row_q[x]
+        d_base = ((base - tgt) ** 2).sum(axis=1)
+        i_base = int(np.argmin(d_base))
+        best = float(d_base[i_base])
+        cand = base[i_base]
+        for ch in range(3):
+            c = cur.copy()
+            c[ch] = tgt[ch]
+            e = float(((c - tgt) ** 2).sum())
+            if e < best:
+                best = e
+                cand = c
+        cur = np.asarray(cand, np.float32).copy()
+        out[x] = cur
+    return out
 
 
 def ham_encode(rgb, bits=8):
@@ -462,23 +509,7 @@ def ham_encode(rgb, bits=8):
     out = np.empty_like(q)
     base_scaled = base
     for y in range(h):
-        cur = np.array([0.0, 0.0, 0.0], np.float32)
-        row = q[y]
-        for x in range(w):
-            tgt = row[x]
-            d_base = ((base_scaled - tgt) ** 2).sum(axis=1)
-            i_base = int(np.argmin(d_base))
-            best = float(d_base[i_base])
-            cand = base_scaled[i_base]
-            for ch in range(3):
-                c = cur.copy()
-                c[ch] = tgt[ch]
-                e = float(((c - tgt) ** 2).sum())
-                if e < best:
-                    best = e
-                    cand = c
-            cur = np.asarray(cand, np.float32).copy()
-            out[y, x] = cur
+        out[y] = sham_row(q[y], base_scaled)
     return out, base
 
 

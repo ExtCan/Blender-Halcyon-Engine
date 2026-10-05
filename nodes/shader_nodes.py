@@ -168,7 +168,10 @@ ANIME_SOCKET_DOCS = dict({
         "Link a texture -- the game's own ramp, a ColorRamp, any chain "
         "-- and the tone bands come from the RAMP instead: shadow "
         "side, transition and lit side all painted, sampled by the "
-        "light term. The tone sliders above stand down while linked",
+        "light term. The tone sliders above stand down while linked. "
+        "Under SPARKING the strip is read DOWN its height (white at "
+        "the top = lit) by the half-Lambert cosine, Sparking! ZERO's "
+        "GradientTexture as exported",
     'Ramp Row':
         "Which row of a multi-row ramp texture to sample (0 the "
         "bottom). Under GENSHIN with a Game Texture linked, the "
@@ -182,12 +185,14 @@ ANIME_SOCKET_DOCS = dict({
         "The game's own packed control map, decoded by the "
         "Compatibility mode: the ArcSys lineage's ILM (specular "
         "intensity / shadow bias / highlight size / drawn lines), the "
-        "HoYo lightmap, the ZZZ map. Leave unlinked outside the game "
-        "modes",
+        "HoYo lightmap, the ZZZ map, Sparking! ZERO's Mask1 (the "
+        "greyscale line-art sheet that multiplies the flat colour). "
+        "Leave unlinked outside the game modes",
     'Detail Texture':
         "The companion map the mode expects: the ArcSys lineage's SSS "
         "map (its colour multiplies the first shadow tint); ZZZ reads "
-        "its blue as extra specular mask",
+        "its blue as extra specular mask. SPARKING has no companion "
+        "map and does not read this socket",
     'Specular Color':
         "The stepped cel highlight's paint. Keep it near white for "
         "hair and metal glints",
@@ -403,7 +408,9 @@ SOCKET_DOCS = {
     'Translucency': "How much light passes through from behind. Paper, leaves "
                     "and lampshades",
     'Toon Size': "Where the light-to-dark step falls, as a fraction of the "
-                 "diffuse range",
+                 "diffuse range; under the DS Toon / DS Highlight models it "
+                 "and Toon Steps also shape the material's 32-entry DS table "
+                 "(hard-edged: the DS had no smooth band)",
     'Toon Smooth': "How soft that step is. 0 is a hard cel edge",
     'Normal': "Replaces the shading normal, for normal and bump mapping",
     'Fresnel': "Brightens the highlight toward the silhouette, the way a real "
@@ -443,6 +450,40 @@ SOCKET_DOCS = {
                    "white however deeply the pile is dyed",
     'Sheen Roughness': "Width of the sheen band. 0 confines it to the "
                        "silhouette; 1 spreads it across the whole surface",
+    # R251 lighting F006: Model 3 / System 22 per-material fog control
+    'Fog Burn-Through': "Model 3's polygon light modifier: the share of the "
+                        "fog this material shines through (0 = fogged like "
+                        "everything, 1 = never fogged -- the same as the "
+                        "Blender Internal node's Mist toggle off), the 5-bit "
+                        "header field Daytona 2's neon used",
+    'Fog Bias': "System 22's per-polygon cz delta: added to the fog amount "
+                "before the clamp, so this material fogs earlier (positive) "
+                "or later (negative) than the scene's curve; -1..1",
+    'Fog Bank': "System 22's cz bank: 0 reads the scene's Fog Start/End, 1 "
+                "reads the Fog Bank 1 Start/End pair in Render Properties > "
+                "Fog (inert while that End is not past its Start). System 22 "
+                "had four banks; Halcyon ships two. Exponential fog reads "
+                "density only and ignores the bank",
+    # R251 lighting F019 / F020 / F021: POV-Ray finish
+    'Brilliance': "POV-Ray's brilliance: the diffuse cosine raised to this "
+                  "power before the model's own diffuse law -- above 1 the lit "
+                  "region hugs the light and darkens on the flanks (POV's "
+                  "metallic diffuse), below 1 it flattens toward a wrapped "
+                  "look. 1.0 is exact Lambert and costs nothing. Inert on the "
+                  "3ds Max shaders, whose diffuse laws carry their own colour",
+    'Crand': "POV-Ray's crand: a random darkening of the direct diffuse term "
+             "per lamp and per pixel -- sandpaper on the lit side only, "
+             "highlights and shadows untouched. Halcyon draws it from its "
+             "integer hash so a frame renders the same bits every time; a "
+             "reflection grains with its parent pixel's number; 0 is off",
+    'Metallic (POV)': "POV-Ray's finish metallic: the highlight's colour slides "
+                      "from the light's colour toward the diffuse pigment by "
+                      "POV's rational Fresnel of N.L -- pigment-coloured facing "
+                      "the light, the light's own colour at grazing. 0 is off; "
+                      "POV's Metal model and Reflection Tint tint uniformly, "
+                      "this does not. Inert on the Anime and Cartoon models and "
+                      "the Hemi lamp, which paint their highlights in the lamp "
+                      "loop",
     'Bump Strength': "Scales how far the Normal input is allowed to bend the "
                      "shading normal away from the surface. 0 ignores the bump "
                      "entirely, 1 uses it as given, above 1 exaggerates it",
@@ -498,14 +539,36 @@ SOCKET_MODELS = {
                        # their highlight from the diffuse)
                        'MAX_PHONG', 'MAX_BLINN', 'MAX_ANISOTROPIC',
                        'MAX_MULTI_LAYER', 'MAX_OREN_NAYAR_BLINN',
-                       'MAX_TRANSLUCENT'),
+                       'MAX_TRANSLUCENT',
+                       # R251 (LIGHT-B2): the console light units (the DS
+                       # lobe reads it beside the evaluate call)
+                       'GX_LIGHT', 'SEGA_MODEL2', 'SEGA_MODEL3',
+                       'DS_FIXED',
+                       # R251 material pack (MAT-A): the period combiners
+                       # light their corners with Blinn-Phong (the CPU's
+                       # own fallback); the DS pair under the DS_FIXED lobe
+                       'FLAT_GL_LAST', 'FLAT_D3D_FIRST', 'PS1_MODULATE',
+                       'PS2_HIGHLIGHT', 'SATURN_ADD', 'N64_COMBINE',
+                       'S22_MODULATE', 'D3D_SEPARATE_SPEC', 'PCX_INTENSITY',
+                       'DS_TOON', 'DS_HIGHLIGHT', 'MEGA_DRIVE_SH',
+                       'SUPERFX_PLOT'),
     'Specular Level': ALL,
     'Glossiness': ('GOURAUD', 'FLAT', 'PHONG', 'BLINN_PHONG', 'BLINN',
                    'ANISOTROPIC', 'METAL', 'STRAUSS', 'MULTI_LAYER',
                    'BI_COOKTORR', 'BI_PHONG', 'BI_BLINN', 'OREN_NAYAR_BLINN',
                    'MAX_PHONG', 'MAX_BLINN', 'MAX_METAL', 'MAX_ANISOTROPIC',
                    'MAX_MULTI_LAYER', 'MAX_OREN_NAYAR_BLINN', 'MAX_STRAUSS',
-                   'MAX_TRANSLUCENT'),
+                   'MAX_TRANSLUCENT',
+                   # R251 (LIGHT-B2): GX's s/2 shape, Model 2's 1/2/4/8
+                   # snap, Model 3's 8..64 snap, the DS table's exponent
+                   'GX_LIGHT', 'SEGA_MODEL2', 'SEGA_MODEL3', 'DS_FIXED',
+                   # R251 material pack (MAT-A): Blinn-Phong's exponent at
+                   # the corners; the DS pair's table exponent
+                   'FLAT_GL_LAST', 'FLAT_D3D_FIRST', 'PS1_MODULATE',
+                   'PS2_HIGHLIGHT', 'SATURN_ADD', 'N64_COMBINE',
+                   'S22_MODULATE', 'D3D_SEPARATE_SPEC', 'PCX_INTENSITY',
+                   'DS_TOON', 'DS_HIGHLIGHT', 'MEGA_DRIVE_SH',
+                   'SUPERFX_PLOT'),
     'Roughness': ('COOK_TORRANCE', 'OREN_NAYAR', 'MINNAERT', 'WARD',
                   'OREN_NAYAR_BLINN', 'MAX_MULTI_LAYER', 'MAX_OREN_NAYAR_BLINN'),
     'Metalness': ALL,
@@ -534,6 +597,8 @@ SOCKET_MODELS = {
     'Edge Opacity': ALL, 'Backface Color': ALL, 'Backface Mix': ALL,
     'Vertex Color': ALL, 'Vertex Color Mix': ALL,
     'Sheen': ALL, 'Sheen Color': ALL, 'Sheen Roughness': ALL,
+    'Fog Burn-Through': ALL, 'Fog Bias': ALL, 'Fog Bank': ALL,
+    'Brilliance': ALL, 'Crand': ALL, 'Metallic (POV)': ALL,
     'Bump Strength': ALL, 'Bump Height': ALL, 'Refraction Amount': ALL,
 }
 
@@ -698,6 +763,29 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
         'CARTOON': {'Diffuse Color', 'Diffuse Level', 'Opacity',
                     'Self-Illumination', 'Normal', 'Bump Strength',
                     'Bump Height'},
+        # R251 material pack (MAT-A): the period combiners -- the plain
+        # ones take the full socket set like FLAT; the DS toon pair reads
+        # Toon Size (and Toon Steps) for its table but never Toon Smooth
+        # (the DS had no smooth band); the Mega Drive class reads only
+        # the lamp's cosine and the specular sum; the Super FX plot has
+        # no highlight (the chip's polygons were flat colours)
+        'FLAT_GL_LAST': None, 'FLAT_D3D_FIRST': None,
+        'PS1_MODULATE': None, 'PS2_HIGHLIGHT': None, 'SATURN_ADD': None,
+        'N64_COMBINE': None, 'S22_MODULATE': None,
+        'D3D_SEPARATE_SPEC': None, 'PCX_INTENSITY': None,
+        'DS_TOON': {'Diffuse Color', 'Diffuse Level', 'Specular Color',
+                    'Specular Level', 'Glossiness', 'Toon Size', 'Ambient',
+                    'Opacity', 'Self-Illumination', 'Normal',
+                    'Bump Strength', 'Bump Height'},
+        'DS_HIGHLIGHT': {'Diffuse Color', 'Diffuse Level', 'Specular Color',
+                         'Specular Level', 'Glossiness', 'Toon Size',
+                         'Ambient', 'Opacity', 'Self-Illumination', 'Normal',
+                         'Bump Strength', 'Bump Height'},
+        'MEGA_DRIVE_SH': {'Diffuse Color', 'Specular Color',
+                          'Specular Level', 'Glossiness', 'Opacity',
+                          'Normal', 'Bump Strength', 'Bump Height'},
+        'SUPERFX_PLOT': {'Diffuse Color', 'Diffuse Level', 'Ambient',
+                         'Opacity', 'Self-Illumination', 'Normal'},
     }
 
     # R202: the order is the panel. Reflection's inputs sit together
@@ -746,6 +834,14 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
         ('NodeSocketFloat', 'Sheen', 0.0),
         ('NodeSocketColor', 'Sheen Color', (1.0, 1.0, 1.0, 1.0)),
         ('NodeSocketFloat', 'Sheen Roughness', 0.3),
+        # R251 lighting: the period finish dials (F006 Model 3 / System
+        # 22 fog control; F019 / F020 / F021 POV-Ray finish)
+        ('NodeSocketFloat', 'Fog Burn-Through', 0.0),
+        ('NodeSocketFloat', 'Fog Bias', 0.0),
+        ('NodeSocketFloat', 'Fog Bank', 0.0),
+        ('NodeSocketFloat', 'Brilliance', 1.0),
+        ('NodeSocketFloat', 'Crand', 0.0),
+        ('NodeSocketFloat', 'Metallic (POV)', 0.0),
         # R243: the Max Multi-Layer's second highlight and the Max
         # Translucent's colour
         ('NodeSocketColor', 'Specular Color 2', (0.9, 0.9, 0.9, 1.0)),
@@ -900,7 +996,7 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
 
     def draw_buttons(self, context, layout):
         layout.prop(self, 'model', text="")
-        if self.model == 'TOON':
+        if self.model in ('TOON', 'DS_TOON', 'DS_HIGHLIGHT'):
             layout.prop(self, 'toon_steps')
         if self.model == 'WIREFRAME':
             layout.prop(self, 'wire_size')
@@ -2000,9 +2096,12 @@ class HALCYON_AnimeShaderNode(Node, HalcyonNodeBase):
     The Compatibility mode decodes the texture conventions of the 3D
     anime pipelines: the ArcSys ILM/SSS maps (Guilty Gear Xrd lineage,
     Dragon Ball FighterZ), the HoYo lightmaps (Genshin Impact, ZZZ),
-    and the Dragon Ball action games that descend from the ArcSys
-    look. Plug the game's own textures into Game Texture and Detail
-    Texture and the channels mean what they meant at home.
+    Kakarot on the ArcSys lineage it descends from, and Sparking! ZERO
+    from the game's own material export (R246: the flat Color1, the
+    Mask1 line-art multiply, the T_Tone strip read down its height by
+    the half-Lambert cosine). Plug the game's own textures into
+    Game Texture and Detail Texture and the channels mean what they
+    meant at home.
 
     R229, the 80s additions: Hair Shine paints the angel ring -- a
     band of the shine colour across the object at a fraction of its
@@ -2057,10 +2156,18 @@ class HALCYON_AnimeShaderNode(Node, HalcyonNodeBase):
              "dumps are not publicly documented; this mode applies "
              "the lineage its look descends from, and says so"),
             ('SPARKING', "DB: Sparking! Zero",
-             "The ArcSys-lineage decode tuned toward Sparking Zero's "
-             "heavier shadow line. Its exact channels are not "
-             "publicly documented; the lineage decode applies, and "
-             "this tooltip says so rather than inventing one"),
+             "Decoded from the game's own material export (the FModel "
+             "MI parameter set, the 16x256 T_Tone strips, the "
+             "character sheets) against the field's reconstruction of "
+             "its master material: Diffuse Color is Color1 as exported "
+             "(Unreal's linear colour, the swatch the artist chose), "
+             "the Game Texture is Mask1 (greyscale line art, a linear "
+             "multiply), the Shadow Ramp is GradientTexture read down "
+             "its height with white at the top by the half-Lambert "
+             "cosine, the tone lifted from GradientAdjust1's floor to "
+             "white by the strip; the outline shell the export carries "
+             "is made invisible (Halcyon inks). File > Import > "
+             "Sparking! ZERO Material builds all of it from the .json"),
             ('GENSHIN', "Genshin Impact",
              "The HoYo character lightmap: R specular/metal mask "
              "(0.9+ reads as metal), G occlusion into the shadow "
@@ -4577,3 +4684,575 @@ def unregister():
             bpy.utils.unregister_class(cls)
         except Exception:                                       # noqa: BLE001
             pass
+
+
+# ---- R251 material pack, wave 2 (MAT-B): period nodes ----
+# Five nodes of the period-combiner pack: the GameCube / Xbox fixed-point
+# combiner stage (C028), the PowerVR2 (S,R) bump (C023), the DirectX 6
+# emboss (C135), Imagine's Roughness (C099) and Alias / Maya's Env Chrome
+# (C123). Each is one class + a socket-doc table; the section's tail
+# registers them in NODES, MENU_FAMILIES (rebuilt, MENU_SUBMENUS with it)
+# and PERIOD_NODE_PROPS -> FAMILY_NODE_PROPS (the exporter's road).
+
+_CB_HARDWARE = [
+    ('TEV', "TEV (GameCube / Wii, 2001)",
+     "8-bit inputs, S10 intermediates, GX's bias / scale / clamp"),
+    ('NV2A', "Register combiner (Xbox NV2A, 2001)",
+     "9-bit signed A*B + C*D with the NV input mappings"),
+]
+_CB_TEV_OPS = [
+    ('ADD', "Add", "GX_TEV_ADD: d + lerp(a, b, c) + bias, then scale"),
+    ('SUB', "Subtract", "GX_TEV_SUB: d - lerp(a, b, c) + bias, then scale"),
+    ('COMP_R8_GT', "Compare R8 >", "GX_TEV_COMP_R8_GT: d + (a.r > b.r ? c : 0)"),
+    ('COMP_R8_EQ', "Compare R8 =", "GX_TEV_COMP_R8_EQ: d + (a.r == b.r ? c : 0)"),
+    ('COMP_GR16_GT', "Compare GR16 >",
+     "GX_TEV_COMP_GR16_GT: d + (a.gr > b.gr ? c : 0) on the 16-bit packed pair"),
+    ('COMP_GR16_EQ', "Compare GR16 =",
+     "GX_TEV_COMP_GR16_EQ: d + (a.gr == b.gr ? c : 0) on the 16-bit packed pair"),
+    ('COMP_BGR24_GT', "Compare BGR24 >",
+     "GX_TEV_COMP_BGR24_GT: d + (a.bgr > b.bgr ? c : 0) on the 24-bit packed triple"),
+    ('COMP_BGR24_EQ', "Compare BGR24 =",
+     "GX_TEV_COMP_BGR24_EQ: d + (a.bgr == b.bgr ? c : 0) on the 24-bit packed triple"),
+    ('COMP_RGB8_GT', "Compare RGB8 >",
+     "GX_TEV_COMP_RGB8_GT: per channel a > b ? c : 0, plus d"),
+    ('COMP_RGB8_EQ', "Compare RGB8 =",
+     "GX_TEV_COMP_RGB8_EQ: per channel a == b ? c : 0, plus d"),
+]
+_CB_TEV_BIAS = [
+    ('ZERO', "Zero", "GX_TB_ZERO: no bias on the register"),
+    ('ADD_HALF', "+0.5", "GX_TB_ADDHALF: +128 on the S10 register"),
+    ('SUB_HALF', "-0.5", "GX_TB_SUBHALF: -128 on the S10 register"),
+]
+_CB_TEV_SCALE = [
+    ('X1', "x1", "GX_CS_SCALE_1: the register as it is"),
+    ('X2', "x2", "GX_CS_SCALE_2: the register doubled"),
+    ('X4', "x4", "GX_CS_SCALE_4: the register times four"),
+    ('HALF', "/2", "GX_CS_DIVIDE_2: an arithmetic shift right (floor on the signed S10)"),
+]
+_CB_NV_MAPS = [
+    ('UNSIGNED_IDENTITY', "Unsigned identity", "max(0, e): the input as it is, negatives clamped"),
+    ('UNSIGNED_INVERT', "Unsigned invert", "1 - min(max(e, 0), 1): the input inverted"),
+    ('EXPAND_NORMAL', "Expand normal", "2 * max(0, e) - 1: 0..1 stretched to -1..1"),
+    ('EXPAND_NEGATE', "Expand negate", "-(2 * max(0, e) - 1): the expansion negated"),
+    ('HALF_BIAS_NORMAL', "Half-bias normal", "max(0, e) - 0.5: the input biased down"),
+    ('HALF_BIAS_NEGATE', "Half-bias negate", "-(max(0, e) - 0.5): the biased input negated"),
+    ('SIGNED_IDENTITY', "Signed identity", "e: the signed input as it is"),
+    ('SIGNED_NEGATE', "Signed negate", "-e: the signed input negated"),
+]
+_CB_NV_SCALE = [
+    ('X1', "x1", "NV_NONE: the sum as it is"),
+    ('X2', "x2", "NV_SCALE_BY_TWO_NV: the sum doubled"),
+    ('X4', "x4", "NV_SCALE_BY_FOUR_NV: the sum times four"),
+    ('HALF', "/2", "NV_SCALE_BY_ONE_HALF_NV: floor on the 9-bit signed sum"),
+]
+_CB_NV_BIAS = [
+    ('NONE', "None", "NV_NONE: no bias on the sum"),
+    ('MINUS_HALF', "-0.5", "NV_BIAS_BY_NEGATIVE_ONE_HALF_NV: -128 on the 9-bit sum"),
+]
+
+COMBINER_SOCKET_DOCS = {
+    'A': "First input: 8-bit (TEV) or 9-bit signed (NV2A) fixed point; a "
+         "texture, the rasterised colour, a register or a constant",
+    'B': "Second input on the same fixed-point grid; TEV's lerp end, the "
+         "NV2A's right factor of the first product A*B",
+    'C': "The lerp weight in TEV: 255 maps to 256 exactly, the hardware's "
+         "c9 = c8 + (c8 >> 7); the NV2A's left factor of C*D",
+    'D': "TEV: the signed 10-bit register the lerp adds to; NV2A: the second "
+         "product's right factor. Its signed range (-4.02..4.01 unclamped) "
+         "is reachable only through a LINK from a previous stage: a colour "
+         "socket's own default is clamped to 0..1",
+}
+
+
+class HALCYON_CombinerStageNode(Node, HalcyonNodeBase):
+    """R251 C028: one fixed-point combiner stage -- the GameCube / Wii
+    TEV (8-bit inputs, signed 10-bit register, bias / scale / clamp and
+    the compare ops) or the Xbox NV2A register combiner (9-bit signed
+    A*B + C*D with the eight input mappings). Integer arithmetic on both
+    devices, so the posterisation and sign-clamping of 2001 multitexture
+    appear by construction. Chain stages by linking Color into D."""
+
+    bl_idname = 'HALCYON_CombinerStageNode'
+    bl_label = "Combiner Stage"
+    bl_icon = 'NODE_COMPOSITING'
+
+    hardware: EnumProperty(
+        name="Hardware", items=_CB_HARDWARE, default='TEV',
+        description="Which machine's combiner arithmetic this stage runs: "
+                    "GX's TEV (8-bit, S10 register) or the NV2A register "
+                    "combiner (9-bit signed products)")
+    op: EnumProperty(
+        name="Op", items=_CB_TEV_OPS, default='ADD',
+        description="TEV: the stage operation -- add or subtract the lerp, "
+                    "or one of GX's compare ops on packed 8 / 16 / 24-bit "
+                    "values selecting C or zero")
+    bias: EnumProperty(
+        name="Bias", items=_CB_TEV_BIAS, default='ZERO',
+        description="TEV: GX's bias on the S10 register for ADD / SUB "
+                    "(the compare ops ignore bias and scale, as GX requires)")
+    scale: EnumProperty(
+        name="Scale", items=_CB_TEV_SCALE, default='X1',
+        description="TEV: GX's output scale on the S10 register -- x1, x2, "
+                    "x4 or an arithmetic shift right (floor division by 2)")
+    clamp: BoolProperty(
+        name="Clamp", default=True,
+        description="GX_TRUE: clamp the register to 0..255; off keeps the "
+                    "signed 10-bit range (-1024..1023) for the next stage")
+    map_a: EnumProperty(
+        name="Map A", items=_CB_NV_MAPS, default='UNSIGNED_IDENTITY',
+        description="NV2A: the NV_register_combiners input mapping applied "
+                    "to A before the 9-bit quantisation")
+    map_b: EnumProperty(
+        name="Map B", items=_CB_NV_MAPS, default='UNSIGNED_IDENTITY',
+        description="NV2A: the NV_register_combiners input mapping applied "
+                    "to B before the 9-bit quantisation")
+    map_c: EnumProperty(
+        name="Map C", items=_CB_NV_MAPS, default='UNSIGNED_IDENTITY',
+        description="NV2A: the NV_register_combiners input mapping applied "
+                    "to C before the 9-bit quantisation")
+    map_d: EnumProperty(
+        name="Map D", items=_CB_NV_MAPS, default='UNSIGNED_IDENTITY',
+        description="NV2A: the NV_register_combiners input mapping applied "
+                    "to D before the 9-bit quantisation")
+    nv_scale: EnumProperty(
+        name="NV Scale", items=_CB_NV_SCALE, default='X1',
+        description="NV2A: the combiner output scale on the 9-bit signed "
+                    "sum A*B + C*D (x1, x2, x4, or floor /2)")
+    nv_bias: EnumProperty(
+        name="NV Bias", items=_CB_NV_BIAS, default='NONE',
+        description="NV2A: the combiner output bias on the 9-bit signed "
+                    "sum -- none, or -0.5 (-128) before the clamp")
+
+    SOCKETS = (('NodeSocketColor', 'A', (0.0, 0.0, 0.0, 1.0)),
+               ('NodeSocketColor', 'B', (1.0, 1.0, 1.0, 1.0)),
+               ('NodeSocketColor', 'C', (0.0, 0.0, 0.0, 1.0)),
+               ('NodeSocketColor', 'D', (0.0, 0.0, 0.0, 1.0)))
+
+    def init(self, context):
+        for kind, name, default in self.SOCKETS:
+            s = self.inputs.new(kind, name)
+            try:
+                s.default_value = default
+            except (TypeError, ValueError):
+                pass
+        _apply_socket_tips(self, COMBINER_SOCKET_DOCS)
+        self.outputs.new('NodeSocketColor', 'Color')
+
+    def ensure_sockets(self):
+        _apply_socket_tips(self, COMBINER_SOCKET_DOCS)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'hardware', text="")
+        if self.hardware == 'NV2A':
+            col = layout.column(align=True)
+            col.prop(self, 'map_a')
+            col.prop(self, 'map_b')
+            col.prop(self, 'map_c')
+            col.prop(self, 'map_d')
+            row = layout.row(align=True)
+            row.prop(self, 'nv_scale', text="")
+            row.prop(self, 'nv_bias', text="")
+        else:
+            layout.prop(self, 'op', text="")
+            row = layout.row(align=True)
+            row.prop(self, 'bias', text="")
+            row.prop(self, 'scale', text="")
+            layout.prop(self, 'clamp')
+
+
+_SR_BLEND = [
+    ('MULTIPLY', "Multiply (DECAL x intensity)",
+     "The DC's second pass: the base texture times the bump intensity"),
+    ('ADD', "Add",
+     "The intensity added over the base -- the era's other second pass"),
+]
+
+SRBUMP_SOCKET_DOCS = {
+    'Color': "The (S,R) source: a tangent-space normal map texel, quantised "
+             "to the PVR2's two 8-bit angles (elevation S, azimuth R) through "
+             "baked tables",
+    'Light': "The lamp's direction in the texture's tangent frame (t, b, n); "
+             "one direction per polygon on the PVR2, so keep it unlinked for "
+             "the GPU",
+    'Strength': "H, the bump strength: K1 = 1 - H is the ambient floor, K2 = "
+                "sin T * H and K3 = cos T * H the light's split by elevation T",
+    'Base': "The DECAL texture the intensity multiplies or adds over",
+}
+
+
+class HALCYON_SRBumpNode(Node, HalcyonNodeBase):
+    """R251 C023: PowerVR2 (S,R) bump mapping (Dreamcast CLX2, Naomi). A
+    bump texel is two 8-bit angles; one directional light per polygon,
+    no view vector, 256 azimuth steps: `I = clamp(K1 + K2 sin S + K3 cos
+    S cos(R - Q), 0, 1)`, then a multiply or add pass over the base
+    texture. Bitwise on both devices under NEAREST (baked tables)."""
+
+    bl_idname = 'HALCYON_SRBumpNode'
+    bl_label = "SR Bump (Dreamcast)"
+    bl_icon = 'MOD_DISPLACE'
+
+    blend: EnumProperty(
+        name="Blend", items=_SR_BLEND, default='MULTIPLY',
+        description="The PVR2's second pass over the base texture: the "
+                    "intensity multiplies the DECAL, or is added over it")
+
+    SOCKETS = (('NodeSocketColor', 'Color', (0.5, 0.5, 1.0, 1.0)),
+               ('NodeSocketVector', 'Light', (0.0, 0.0, 1.0)),
+               ('NodeSocketFloat', 'Strength', 0.0),
+               ('NodeSocketColor', 'Base', (0.8, 0.8, 0.8, 1.0)))
+
+    def init(self, context):
+        for kind, name, default in self.SOCKETS:
+            s = self.inputs.new(kind, name)
+            try:
+                s.default_value = default
+            except (TypeError, ValueError):
+                pass
+            if name == 'Strength':
+                try:
+                    s.min_value, s.max_value = 0.0, 1.0
+                except (AttributeError, TypeError):
+                    pass
+        _apply_socket_tips(self, SRBUMP_SOCKET_DOCS)
+        self.outputs.new('NodeSocketFloat', 'Intensity')
+        self.outputs.new('NodeSocketColor', 'Color')
+
+    def ensure_sockets(self):
+        _apply_socket_tips(self, SRBUMP_SOCKET_DOCS)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'blend', text="")
+
+
+EMBOSS_SHIFT_SOCKET_DOCS = {
+    'Vector': "The height map's UV (unlinked: the UV map); the second stage "
+              "samples the SAME map at this UV shifted toward the light",
+    'Light': "The lamp direction in the tangent frame; only its (t, b) part "
+             "shifts the second sample -- unnormalised, as the DX6 pipe "
+             "interpolated it",
+    'Offset': "The shift toward the light in texels (about one texel; larger "
+              "shifts invert the relief, the era's over-shift artefact)",
+    'Texture Size': "The height map's width in texels: the shift is Offset / "
+                    "Texture Size in UV, so this must match the image",
+}
+
+EMBOSS_SOCKET_DOCS = {
+    'Height': "The height map sampled at the UV (scale the map into 0..0.5 "
+              "as the era did, or accept the clamp)",
+    'Height Shifted': "The SAME height map sampled at the Shifted UV of the "
+                      "Emboss Shift node -- the second texture stage",
+    'Base': "The base texture, applied modulate-2x over the emboss",
+}
+
+
+class HALCYON_EmbossShiftNode(Node, HalcyonNodeBase):
+    """R251 C135, stage one of DirectX 6 texture embossing: the second
+    texture stage's coordinate set -- the UV shifted toward the light by
+    about one texel in the tangent plane (`uv + Offset * Light.xy /
+    Texture Size`). Wire it into a second Image Texture of the SAME
+    height map and hand both samples to the Emboss Bump node; a node
+    cannot feed its own input (a cycle), which is why the two stages
+    are two nodes, exactly the DX6 multitexture setup."""
+
+    bl_idname = 'HALCYON_EmbossShiftNode'
+    bl_label = "Emboss Shift (DirectX 6)"
+    bl_icon = 'SHADING_TEXTURE'
+
+    SOCKETS = (('NodeSocketVector', 'Vector', (0.0, 0.0, 0.0)),
+               ('NodeSocketVector', 'Light', (0.7071, 0.7071, 0.0)),
+               ('NodeSocketFloat', 'Offset', 1.0),
+               ('NodeSocketFloat', 'Texture Size', 256.0))
+
+    def init(self, context):
+        for kind, name, default in self.SOCKETS:
+            s = self.inputs.new(kind, name)
+            try:
+                s.default_value = default
+            except (TypeError, ValueError):
+                pass
+            if name == 'Vector':
+                try:
+                    s.hide_value = True
+                except (AttributeError, TypeError):
+                    pass
+        _apply_socket_tips(self, EMBOSS_SHIFT_SOCKET_DOCS)
+        self.outputs.new('NodeSocketVector', 'Shifted UV')
+
+    def ensure_sockets(self):
+        _apply_socket_tips(self, EMBOSS_SHIFT_SOCKET_DOCS)
+
+    def draw_buttons(self, context, layout):
+        pass
+
+
+class HALCYON_EmbossBumpNode(Node, HalcyonNodeBase):
+    """R251 C135, stage two of DirectX 6 texture embossing (RIVA TNT /
+    TNT2, GeForce 256, Voodoo3, 1998-2001): no per-pixel normal -- the
+    inverted second sample (0.5 - h') is added to the first
+    (D3DTOP_ADDSIGNED), 0.5 on flat ground and a signed bias on slopes,
+    and the base texture is applied modulate-2x (D3DTOP_MODULATE2X), so
+    relief reads as a one-directional emboss that slides and inverts
+    as the light moves. Bitwise on both devices at NEAREST."""
+
+    bl_idname = 'HALCYON_EmbossBumpNode'
+    bl_label = "Emboss Bump (DirectX 6)"
+    bl_icon = 'SHADING_TEXTURE'
+
+    SOCKETS = (('NodeSocketFloat', 'Height', 0.5),
+               ('NodeSocketFloat', 'Height Shifted', 0.5),
+               ('NodeSocketColor', 'Base', (0.8, 0.8, 0.8, 1.0)))
+
+    def init(self, context):
+        for kind, name, default in self.SOCKETS:
+            s = self.inputs.new(kind, name)
+            try:
+                s.default_value = default
+            except (TypeError, ValueError):
+                pass
+        _apply_socket_tips(self, EMBOSS_SOCKET_DOCS)
+        self.outputs.new('NodeSocketFloat', 'Factor')
+        self.outputs.new('NodeSocketColor', 'Color')
+
+    def ensure_sockets(self):
+        _apply_socket_tips(self, EMBOSS_SOCKET_DOCS)
+
+    def draw_buttons(self, context, layout):
+        pass
+
+
+ROUGHNESS_SOCKET_DOCS = {
+    'Normal': "The normal to roughen; unlinked takes the surface's shading "
+              "normal (the master shader's own)",
+    'Roughness': "Imagine's 0..255 attribute: 255 turns the normal by about "
+                 "25 degrees rms, per PIXEL, from a stable hash of the pixel "
+                 "position and the render seed",
+}
+
+
+class HALCYON_ImagineRoughnessNode(Node, HalcyonNodeBase):
+    """R251 C099: Imagine's Roughness (Impulse Imagine 1.1-4.0, Turbo
+    Silver): a per-pixel random turn of the shading normal before the
+    lighting -- the sandpaper of Amiga ray-traced pottery. A stable hash
+    of (pixel, seed) on both devices; Shimmer re-randomises per frame,
+    Imagine's own behaviour, off by default (the manual warned against
+    it in animation)."""
+
+    bl_idname = 'HALCYON_ImagineRoughnessNode'
+    bl_label = "Roughness (Imagine)"
+    bl_icon = 'MOD_NOISE'
+
+    animate: BoolProperty(
+        name="Shimmer", default=False,
+        description="Re-randomise every frame, Imagine's own behaviour -- the "
+                    "manual warned against it in animation, so it is off; on, "
+                    "the material becomes time-dependent")
+
+    SOCKETS = (('NodeSocketVector', 'Normal', (0.0, 0.0, 0.0)),
+               ('NodeSocketFloat', 'Roughness', 0.0))
+
+    def init(self, context):
+        for kind, name, default in self.SOCKETS:
+            s = self.inputs.new(kind, name)
+            try:
+                s.default_value = default
+            except (TypeError, ValueError):
+                pass
+            if name == 'Normal':
+                try:
+                    s.hide_value = True
+                except (AttributeError, TypeError):
+                    pass
+            if name == 'Roughness':
+                try:
+                    s.min_value, s.max_value = 0.0, 255.0
+                except (AttributeError, TypeError):
+                    pass
+        _apply_socket_tips(self, ROUGHNESS_SOCKET_DOCS)
+        self.outputs.new('NodeSocketVector', 'Normal')
+
+    def ensure_sockets(self):
+        _apply_socket_tips(self, ROUGHNESS_SOCKET_DOCS)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'animate')
+
+
+ENVCHROME_SOCKET_DOCS = {
+    'Normal': "The normal the view ray reflects about; unlinked takes the "
+              "surface's shading normal",
+    'Sky Color': "Maya's envChrome skyColor: the sky plane at the horizon, "
+                 "blending to the Zenith Color straight up",
+    'Zenith Color': "Maya's envChrome zenithColor: the sky straight up "
+                    "(reflection z = 1)",
+    'Light Color': "Maya's envChrome lightColor: the rectangular fluorescent "
+                   "tubes laid out on the sky plane; they never illuminate",
+    'Floor Color': "Maya's envChrome floorColor: the floor plane straight "
+                   "down, blending to the Horizon Color at grazing",
+    'Horizon Color': "Maya's envChrome horizonColor: the floor at the horizon "
+                     "(reflection z -> 0 from below)",
+    'Grid Color': "Maya's envChrome gridColor: the ruled lines on the floor "
+                  "plane",
+}
+
+#: (prop, Maya attribute, default, description)
+_EC_PROPS = (
+    ('light_width', 'lightWidth', 0.5,
+     "Maya's envChrome lightWidth: the fraction of each lattice cell a "
+     "fluorescent tube covers across the sky plane"),
+    ('light_depth', 'lightDepth', 0.1,
+     "Maya's envChrome lightDepth: the fraction of each lattice cell a "
+     "tube covers along the sky plane's depth"),
+    ('light_width_gain', 'lightWidthGain', 1.0,
+     "Maya's envChrome lightWidthGain: tubes per unit of the sky plane "
+     "across -- doubling it doubles the tube count"),
+    ('light_width_offset', 'lightWidthOffset', 0.0,
+     "Maya's envChrome lightWidthOffset: slides the tube lattice across "
+     "the sky plane (in cells)"),
+    ('light_depth_gain', 'lightDepthGain', 1.0,
+     "Maya's envChrome lightDepthGain: tubes per unit of the sky plane "
+     "along its depth"),
+    ('light_depth_offset', 'lightDepthOffset', 0.0,
+     "Maya's envChrome lightDepthOffset: slides the tube lattice along "
+     "the sky plane's depth (in cells)"),
+    ('grid_width', 'gridWidth', 0.1,
+     "Maya's envChrome gridWidth: the fraction of each floor cell a grid "
+     "line covers across the floor"),
+    ('grid_depth', 'gridDepth', 0.1,
+     "Maya's envChrome gridDepth: the fraction of each floor cell a grid "
+     "line covers along the floor's depth"),
+    ('grid_width_gain', 'gridWidthGain', 1.0,
+     "Maya's envChrome gridWidthGain: grid lines per unit of the floor "
+     "across"),
+    ('grid_width_offset', 'gridWidthOffset', 0.0,
+     "Maya's envChrome gridWidthOffset: slides the grid across the floor "
+     "(in cells)"),
+    ('grid_depth_gain', 'gridDepthGain', 1.0,
+     "Maya's envChrome gridDepthGain: grid lines per unit of the floor "
+     "along its depth"),
+    ('grid_depth_offset', 'gridDepthOffset', 0.0,
+     "Maya's envChrome gridDepthOffset: slides the grid along the floor's "
+     "depth (in cells)"),
+    ('floor_altitude', 'floorAltitude', -1.0,
+     "Maya's envChrome floorAltitude: the height (Blender Z) of the floor "
+     "plane the downward reflections hit"),
+)
+
+
+class HALCYON_EnvChromeNode(Node, HalcyonNodeBase):
+    """R251 C123: Alias PowerAnimator / Maya 1-4 envChrome -- a procedural
+    showroom seen only in reflections: a sky plane with rectangular
+    fluorescent tubes laid out by width / depth gains and offsets, a
+    floor at an altitude carrying a ruled grid; the chrome of every
+    1990s Alias logo. Maya's PARAMETERS at Maya's defaults; the plane
+    at unit height and the linear sky / floor blends are Halcyon's
+    (Maya's are unpublished). Plug Color into the master shader's
+    Matcap (Add) -- Maya's Reflected Color slot. Maya's Y-up is
+    Blender's Z-up here. The tubes never illuminate (per Maya)."""
+
+    bl_idname = 'HALCYON_EnvChromeNode'
+    bl_label = "Env Chrome (Alias / Maya)"
+    bl_icon = 'MATSPHERE'
+
+    light_width: FloatProperty(name="Light Width", default=_EC_PROPS[0][2], min=0.0, max=1.0,
+                               description=_EC_PROPS[0][3])
+    light_depth: FloatProperty(name="Light Depth", default=_EC_PROPS[1][2], min=0.0, max=1.0,
+                               description=_EC_PROPS[1][3])
+    light_width_gain: FloatProperty(name="Light Width Gain", default=_EC_PROPS[2][2], min=0.0, soft_max=16.0,
+                                    description=_EC_PROPS[2][3])
+    light_width_offset: FloatProperty(name="Light Width Offset", default=_EC_PROPS[3][2], soft_min=-4.0, soft_max=4.0,
+                                      description=_EC_PROPS[3][3])
+    light_depth_gain: FloatProperty(name="Light Depth Gain", default=_EC_PROPS[4][2], min=0.0, soft_max=16.0,
+                                    description=_EC_PROPS[4][3])
+    light_depth_offset: FloatProperty(name="Light Depth Offset", default=_EC_PROPS[5][2], soft_min=-4.0, soft_max=4.0,
+                                      description=_EC_PROPS[5][3])
+    grid_width: FloatProperty(name="Grid Width", default=_EC_PROPS[6][2], min=0.0, max=1.0,
+                              description=_EC_PROPS[6][3])
+    grid_depth: FloatProperty(name="Grid Depth", default=_EC_PROPS[7][2], min=0.0, max=1.0,
+                              description=_EC_PROPS[7][3])
+    grid_width_gain: FloatProperty(name="Grid Width Gain", default=_EC_PROPS[8][2], min=0.0, soft_max=16.0,
+                                   description=_EC_PROPS[8][3])
+    grid_width_offset: FloatProperty(name="Grid Width Offset", default=_EC_PROPS[9][2], soft_min=-4.0, soft_max=4.0,
+                                     description=_EC_PROPS[9][3])
+    grid_depth_gain: FloatProperty(name="Grid Depth Gain", default=_EC_PROPS[10][2], min=0.0, soft_max=16.0,
+                                   description=_EC_PROPS[10][3])
+    grid_depth_offset: FloatProperty(name="Grid Depth Offset", default=_EC_PROPS[11][2], soft_min=-4.0, soft_max=4.0,
+                                     description=_EC_PROPS[11][3])
+    floor_altitude: FloatProperty(name="Floor Altitude", default=_EC_PROPS[12][2], soft_min=-20.0, soft_max=20.0,
+                                  description=_EC_PROPS[12][3])
+    real_floor: BoolProperty(
+        name="Real Floor", default=True,
+        description="Maya's envChrome realFloor: the floor is a true plane at "
+                    "Floor Altitude the reflected ray intersects from the "
+                    "surface point (parallax); off, the grid depends on the "
+                    "reflection direction alone")
+
+    SOCKETS = (('NodeSocketVector', 'Normal', (0.0, 0.0, 0.0)),
+               ('NodeSocketColor', 'Sky Color', (0.55, 0.62, 0.78, 1.0)),
+               ('NodeSocketColor', 'Zenith Color', (0.15, 0.22, 0.48, 1.0)),
+               ('NodeSocketColor', 'Light Color', (1.0, 1.0, 1.0, 1.0)),
+               ('NodeSocketColor', 'Floor Color', (0.18, 0.18, 0.18, 1.0)),
+               ('NodeSocketColor', 'Horizon Color', (0.5, 0.5, 0.5, 1.0)),
+               ('NodeSocketColor', 'Grid Color', (0.04, 0.04, 0.04, 1.0)))
+
+    def init(self, context):
+        for kind, name, default in self.SOCKETS:
+            s = self.inputs.new(kind, name)
+            try:
+                s.default_value = default
+            except (TypeError, ValueError):
+                pass
+            if name == 'Normal':
+                try:
+                    s.hide_value = True
+                except (AttributeError, TypeError):
+                    pass
+        _apply_socket_tips(self, ENVCHROME_SOCKET_DOCS)
+        self.outputs.new('NodeSocketColor', 'Color')
+
+    def ensure_sockets(self):
+        _apply_socket_tips(self, ENVCHROME_SOCKET_DOCS)
+
+    def draw_buttons(self, context, layout):
+        col = layout.column(align=True)
+        col.label(text="Lights (sky plane)")
+        col.prop(self, 'light_width')
+        col.prop(self, 'light_depth')
+        col.prop(self, 'light_width_gain')
+        col.prop(self, 'light_width_offset')
+        col.prop(self, 'light_depth_gain')
+        col.prop(self, 'light_depth_offset')
+        col = layout.column(align=True)
+        col.label(text="Floor grid")
+        col.prop(self, 'grid_width')
+        col.prop(self, 'grid_depth')
+        col.prop(self, 'grid_width_gain')
+        col.prop(self, 'grid_width_offset')
+        col.prop(self, 'grid_depth_gain')
+        col.prop(self, 'grid_depth_offset')
+        col.prop(self, 'floor_altitude')
+        col.prop(self, 'real_floor')
+
+
+# ---- MAT-B: period node registration ----
+PERIOD_NODES = (HALCYON_CombinerStageNode, HALCYON_SRBumpNode, HALCYON_EmbossShiftNode, HALCYON_EmbossBumpNode, HALCYON_ImagineRoughnessNode, HALCYON_EnvChromeNode,)
+#: what the exporter copies for the period nodes (export.py folds
+#: FAMILY_NODE_PROPS into NODE_PROPS; the Emboss node has no props)
+PERIOD_NODE_PROPS = {
+    'HALCYON_CombinerStageNode': ('hardware', 'op', 'bias', 'scale', 'clamp',
+                                  'map_a', 'map_b', 'map_c', 'map_d',
+                                  'nv_scale', 'nv_bias'),
+    'HALCYON_SRBumpNode': ('blend',),
+    'HALCYON_ImagineRoughnessNode': ('animate',),
+    'HALCYON_EnvChromeNode': ('light_width', 'light_depth', 'light_width_gain', 'light_width_offset', 'light_depth_gain', 'light_depth_offset', 'grid_width', 'grid_depth', 'grid_width_gain', 'grid_width_offset', 'grid_depth_gain', 'grid_depth_offset', 'floor_altitude', 'real_floor',),
+}
+FAMILY_NODE_PROPS.update(PERIOD_NODE_PROPS)
+NODES = NODES + PERIOD_NODES
+_PERIOD_SHADING = tuple(c for c in PERIOD_NODES
+                        if c.bl_idname != 'HALCYON_ImagineRoughnessNode')
+_PERIOD_VECTOR = tuple(c for c in PERIOD_NODES
+                       if c.bl_idname == 'HALCYON_ImagineRoughnessNode')
+MENU_FAMILIES = tuple(
+    (t, i, (m + _PERIOD_SHADING if t == 'Shading'
+            else (m + _PERIOD_VECTOR if t == 'Vector' else m)))
+    for t, i, m in MENU_FAMILIES)
+MENU_SUBMENUS = tuple(_family_menu(t, m) for t, _i, m in MENU_FAMILIES)

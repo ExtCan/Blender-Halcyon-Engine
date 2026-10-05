@@ -66,6 +66,8 @@ def gpu_stages(out):
     from .core.settings import RenderSettings
     from .gpu import device
     from .gpu.stages import MASK_KINDS, STAGES, VALIDATION
+    from .gpu import stages_signal as _stages_signal     # R251 post-signal
+    from .core import signal_era as SE
 
     _p(out)
     _p(out, LINE)
@@ -93,27 +95,216 @@ def gpu_stages(out):
     st.composite, st.composite_bleed = True, 1.0
     st.composite_ringing, st.composite_dot_crawl = 0.5, 0.0
 
+    # R250: the film's grain, the bit depth and the supersample resolve
+    from .core import film as FILM
+    from .core import palette as PA
+    from .gpu import chain as _CH
+    # R251 (post-palette): the era colour stages' tables and references
+    from .core import palette_era as PE
+    from .gpu import chain_palette as CP
+    st_g = RenderSettings()
+    st_g.film_grain, st_g.film_grain_size = 0.5, 1.0
+    st_g.film_grain_chroma, st_g.film_flicker = 0.5, 0.3
+    grain_u = _CH.grain_uniforms(st_g, h, w, 7, 3)
+    quant_lut = _CH.quant_lut((5, 6, 5))
+    ss_r = 2
+    img_big = rng.random((h * ss_r, w * ss_r, 3)).astype(np.float32)
+    rgba_big = np.concatenate([img_big, np.ones((h * ss_r, w * ss_r, 1),
+                                                np.float32)], axis=2)
+    st_r = RenderSettings()
+    st_r.aa_filter = 'MITCHELL'
+    from .gpu import frame as _FRM
+    kern = _FRM.resolve_kernel(ss_r, st_r)
+    kern_img = np.zeros((ss_r, ss_r, 4), np.float32)
+    kern_img[..., 0] = kern
+    from .core import render as _R
+    extra_tex = {'QUANT': {'lut': quant_lut},
+                 'RESOLVE': {'kernel': kern_img}}
+    # R251 (post-palette): the palette snap on the VGA table with a
+    # BAYER4 dither at strength 1 (the ordered road's multiply-add
+    # hazard, measured here), the ORDERED stage on the 5:6:5 table (the
+    # row the retired DITHER stage measured, now against the wired
+    # stage), CRY16 and YJK from their constant tables
+    _vga = PA.vga256()
+    extra_tex['PALETTE'] = {
+        'icm': PA.icm_index_image(PA.get_inverse_colormap(_vga)),
+        'pal': CP.pal_image(_vga), 'tile': CP.tile_image(DI.BAYER4)}
+    extra_tex['ORDERED'] = {'lut': quant_lut,
+                            'tile': CP.tile_image(DI.BAYER4)}
+    extra_tex['CRY16'] = dict(PE.cry_images(),
+                              lut255=_CH.quant_lut((8, 8, 8)))
+    extra_tex['YJK'] = {'lut255': _CH.quant_lut((8, 8, 8))}
+    # R251 (post-palette, wave 2): Super Black at Max's 15 over a fixed
+    # checker plane on a dark frame; Video Color Check (Scale
+    # Saturation, NTSC at 120 IRE) over the frame with its saturation
+    # pushed so illegal pixels exist
+    st_sb = RenderSettings()
+    st_sb.super_black = True
+    _cy, _cx = np.mgrid[0:h, 0:w]
+    cov_t = ((_cx // 8 + _cy // 8) % 2) == 0
+    img_dark = (img * np.float32(0.1)).astype(np.float32)
+    extra_tex['SUPERBLACK'] = {'coverage': PE.pack_coverage(cov_t)}
+    st_vc = RenderSettings()
+    st_vc.video_color_check = 'SCALE_SAT'
+    _yl = (img[..., 0] * np.float32(0.299) + img[..., 1] * np.float32(0.587)
+           + img[..., 2] * np.float32(0.114))[..., None]
+    img_sat = np.clip(_yl + np.float32(2.5) * (img - _yl), 0.0,
+                      1.0).astype(np.float32)
+    _vc_hi, _vc_lo = PE.legal_limits(st_vc)
+    # R251 post-signal: the scan-out stages over a 5:6:5 frame
+    src565 = PA.snap_bits(img.copy(), 5, 6, 5)
+    rgba565 = np.concatenate([src565, np.ones((h, w, 1), np.float32)], axis=2)
+    st_vi = RenderSettings()
+    st_vi.color_depth, st_vi.vi_dither_filter, st_vi.vi_gamma = '16', True, 'GAMMA_DITHER'
+    st_cf = RenderSettings()
+    st_cf.copy_filter = 'DEFLICKER'
+    st_cb = RenderSettings()
+    st_cb.crtc_blend, st_cb.crtc_alpha, st_cb.crtc_bg_color = 'BG_COLOR', 160, (0.1, 0.0, 0.2)
+    st_v2 = RenderSettings()
+    st_v2.color_depth, st_v2.video_filter = '16', 'VOODOO2'
+    from .core import wear as _WEAR
+    extra_tex.update({
+                 'VI': {'u8lut': SE.u8_image(), 'glut': SE.vi_gdither_image()},
+                 'COPY_FILTER': {'u8lut': SE.u8_image()},
+                 'CRTC_BLEND': {'u8lut': SE.u8_image(), 'prev': SE.u8_image()},
+                 'VOODOO_LOOK': {'u8lut': SE.u8_image()}})
+    # R251 C001 (raster pack): the N64 VI's coverage blend and divot over
+    # a synthetic coverage plane (a third of the pixels partial)
+    from .core import n64vi as N64VI
+    cvg_syn = np.random.default_rng(64).integers(0, 8, (h, w)).astype(np.int32)
+    cvg_syn[::3, ::2] = 7
+    extra_tex['N64VI_AA'] = {'cvg': N64VI.cvg_image(cvg_syn)}
+    extra_tex['N64VI_DIVOT'] = {'cvg': N64VI.cvg_image(cvg_syn)}
+    # R251 SIG-2: chroma siting, the S-Video cable, the RF modulator, the
+    # PAL receiver (single draws; the tape's two draws are measured below)
+    from .core import signal_tape as ST2
+    st_cs = RenderSettings()
+    st_cs.chroma_format, st_cs.chroma_upsample = 'Y420_MPEG1', 'LINEAR'
+    st_sv = RenderSettings()
+    st_sv.signal = 'SVIDEO'
+    _sv = ST2.cable_params(st_sv, w)
+    st_rf = RenderSettings()
+    st_rf.signal, st_rf.rf_beat, st_rf.rf_snow, st_rf.rf_ghost = 'RF', 0.5, 0.05, 0.3
+    _rf = ST2.rf_params(st_rf, w, 7, 3)
+    st_pal = RenderSettings()
+    st_pal.pal_decoder, st_pal.pal_crawl = 'DELAY_LINE', 0.5
+    _pal = ST2.pal_params(st_pal, w, 7)
+    extra_tex.update({
+        'CHROMA_SITE': {'u8lut': SE.u8_image()},
+        'CABLE_CHROMA': {'taps': ST2.taps_image(_sv['taps1'], _sv['taps2']),
+                         'u8lut': SE.u8_image()},
+        'CABLE_RF': {'taps': ST2.taps_image(_rf['taps']),
+                     'sin16': SE.sin16_image(), 'u8lut': SE.u8_image()},
+        'PAL_DECODE': {'sin16': SE.sin16_image(), 'u8lut': SE.u8_image()}})
+    # R251 SIG-3: Smacker over the test frame's own median-cut palette
+    # (built here, never through the palette lock: a self test must not
+    # leave a lock behind for the next render)
+    from .core import signal_codec as SCD
+    from .gpu import chain_codec as _CC
+    st_sm = RenderSettings()
+    st_sm.smacker, st_sm.smacker_quality = True, 0.5
+    _smk_pal, _smk_lut = SCD.smacker_tables(PA.get_palette(
+        'ADAPTIVE', 256, img.reshape(-1, 3), st_sm.palette_method, 0))
+    extra_tex['SMACKER'] = {
+        'pal': CP.pal_image(_smk_pal),
+        'icm': PA.icm_index_image(PA.get_inverse_colormap(_smk_pal))}
+    sources = {'RESOLVE': rgba_big, 'VI': rgba565, 'VOODOO_LOOK': rgba565}
+
     cases = {
         'DISPLAY': (dict(exposure=1.3, brightness=0.05, contrast=0.15,
                          saturation=1.25, gamma=2.2),
                     lambda: PO.display_transform(img.copy(), st)),
+        'GRAIN': (grain_u,
+                  lambda: FILM.process_linear(img.copy(), st_g, 7, 3,
+                                              key_frame=7, fps=24.0)),
+        'QUANT': (dict(resolution=(float(w), float(h)),
+                       levels=(31.0, 63.0, 31.0)),
+                  lambda: PA.snap_bits(img.copy(), 5, 6, 5)),
+        'RESOLVE': (dict(resolution=(float(w), float(h)), ss=int(ss_r)),
+                    lambda: _R._resolve(rgba_big.copy(), w, h, ss_r,
+                                        st_r)[:, :, :3]),
         'CRT': (dict(scanlines=0.4, mask_strength=0.35,
                      mask_kind=MASK_KINDS['APERTURE'], vignette=0.5,
                      resolution=(float(w), float(h))),
                 lambda: PO.crt(img.copy(), st)),
-        'DITHER': (dict(levels=(32.0, 64.0, 32.0), strength=1.0,
-                        matrix_size=4.0, resolution=(float(w), float(h))),
-                   lambda: DI.ordered_bits(img.copy(), (5, 6, 5), 'BAYER4', 1.0)),
+        # R251: ORDERED replaces the retired DITHER case (same reference)
+        'ORDERED': (dict(resolution=(float(w), float(h)),
+                         levels=(31.0, 63.0, 31.0), strength=1.0,
+                         tile_mask=3),
+                    lambda: DI.ordered_bits(img.copy(), (5, 6, 5), 'BAYER4',
+                                            1.0)),
+        'PALETTE': (dict(resolution=(float(w), float(h)), strength=1.0,
+                         spacing=float(np.float32(
+                             DI._palette_spacing(PA.vga256()))),
+                         tile_mask=3, dither_on=1),
+                    lambda: DI.ordered_palette(img.copy(), PA.vga256(),
+                                               'BAYER4', 1.0)[0]),
+        'CRY16': (dict(resolution=(float(w), float(h))),
+                  lambda: PE.cry16(img.copy())),
+        'YJK': (dict(resolution=(float(w), float(h))),
+                lambda: PE.yjk(img.copy())),
+        # R251 (post-palette, wave 2)
+        'SUPERBLACK': (dict(resolution=(float(w), float(h)),
+                            threshold=float(PE.super_black_threshold(st_sb))),
+                       lambda: PE.super_black(img_dark.copy(), cov_t, st_sb)),
+        'LEGALISE': (dict(resolution=(float(w), float(h)), mode=3,
+                          hi=float(_vc_hi), lo=float(_vc_lo)),
+                     lambda: PE.video_color_check(img_sat.copy(), st_vc)),
         'LENS': (dict(distortion=0.25, aberration=3.0, edges=0.0,
                       resolution=(float(w), float(h))),
                  lambda: PO.lens_distortion(img.copy(), st)),
+        # R251 post-signal (SIG-1)
+        'VI': (dict(resolution=(float(w), float(h)), levels=(31.0, 63.0, 31.0),
+                    shift_r=3, shift_g=2, shift_b=3, dedither=1, gamma_mode=2,
+                    key=int(_WEAR._sheet_key(7, 3, 41))),
+               lambda: SE.vi_filter(src565.copy(), st_vi, 7, 3)),
+        'COPY_FILTER': (dict(resolution=(float(w), float(h)), tap_u=16, tap_m=32,
+                             tap_l=16),
+                        lambda: SE.copy_filter(img.copy(), st_cf)),
+        'CRTC_BLEND': (dict(resolution=(float(w), float(h)), bg=(0.1, 0.0, 0.2),
+                            alpha=160, mode=1, inv255=float(np.float32(1 / 255))),
+                       lambda: SE.crtc_blend(img.copy(), st_cb, 1)),
+        'VOODOO_LOOK': (dict(resolution=(float(w), float(h)), cap=64, cap32=32,
+                             inv5=float(np.float32(0.2))),
+                        lambda: SE.video_filter(src565.copy(), st_v2)),
+        # R251 C001 (raster pack): integer passes over the CPU's own plane
+        'N64VI_AA': (dict(resolution=(float(w), float(h))),
+                     lambda: N64VI.vi_aa(N64VI.quant5(img.copy()),
+                                         cvg_syn).astype(np.float32)
+                     / np.float32(255.0)),
+        'N64VI_DIVOT': (dict(resolution=(float(w), float(h))),
+                        lambda: N64VI.vi_divot(N64VI.to8(img.copy()),
+                                               cvg_syn).astype(np.float32)
+                        / np.float32(255.0)),
+        # R251 post-signal (SIG-2)
+        'CHROMA_SITE': (dict(resolution=(float(w), float(h)), fmt=2, interp=1),
+                        lambda: ST2.chroma_site(img.copy(), st_cs)),
+        'CABLE_CHROMA': (dict(resolution=(float(w), float(h)), space=0,
+                              r1=int(_sv['r1']), r2=int(_sv['r2'])),
+                         lambda: ST2.svideo(img.copy(), st_sv)),
+        'CABLE_RF': (dict({k: int(_rf[k]) for k in ST2.RF_INTS},
+                          resolution=(float(w), float(h))),
+                     lambda: ST2.rf_modulate(img.copy(), st_rf, 7, 3)),
+        'PAL_DECODE': (dict({k: int(_pal[k]) for k in ST2.PAL_INTS},
+                            resolution=(float(w), float(h))),
+                       lambda: ST2.pal_decode(img.copy(), st_pal, 7)),
+        'SMACKER': (_CC.smacker_uniforms(st_sm, w, h),
+                    lambda: SCD.smacker_with(img.copy(), _smk_pal,
+                                             _smk_lut, 0.5)),
     }
 
+    # R251 (post-palette, wave 2): the two stages' own source frames
+    sources['SUPERBLACK'] = np.concatenate(
+        [img_dark, np.ones((h, w, 1), np.float32)], axis=2)
+    sources['LEGALISE'] = np.concatenate(
+        [img_sat, np.ones((h, w, 1), np.float32)], axis=2)
     _p(out, f'  {"stage":9s} {"compile":9s} {"run":7s} {"max diff":>9s} '
             f'{"mean":>9s}  claimed')
     for name, src in STAGES.items():
-        if name in ('NTSC', 'NTSC_BLUR'):
+        if name in ('NTSC', 'NTSC_BLUR', 'EHB', 'CELLS_FIT', 'CELLS_SNAP') + _stages_signal.SIGNAL_MULTI:
             continue                    # multi-pass: measured below as one
+                                        # (R251: EHB needs its 32 fitted
+                                        # first -- measured below too)
         claimed = VALIDATION.get(name, ('?', None))[0]
         shader, err = device.compile_stage(name, src)
         if shader is None:
@@ -122,11 +313,14 @@ def gpu_stages(out):
             continue
         uniforms, reference = cases.get(name, ({}, None))
         try:
-            tex = device.upload(rgba)
+            tex = device.upload(sources.get(name, rgba))
+            binds = {'source': tex}
+            for _bn, _bimg in extra_tex.get(name, {}).items():
+                binds[_bn] = device.upload(_bimg)
             target = device.Target(w, h)
             try:
                 got = device.draw_fullscreen(shader, uniforms,
-                                             {'source': tex}, target)[:, :, :3]
+                                             binds, target)[:, :, :3]
             finally:
                 target.free()
         except Exception as exc:                                # noqa: BLE001
@@ -162,7 +356,11 @@ def gpu_stages(out):
         _saved_dev = st.render_device
         st.render_device = 'GPU'
         try:
-            got = chain.ntsc(img, st)
+            _fr = chain.Frame(rgb=img.copy())
+            got = chain.ntsc(_fr, st)
+            if got is not None:
+                got = _fr.finish()
+            _fr.release()
         finally:
             _stages.ENABLED = saved
             chain.ENABLED = saved
@@ -178,6 +376,188 @@ def gpu_stages(out):
                     f'{claimed} (3 blur draws + combine)')
     except Exception as exc:                                    # noqa: BLE001
         _p(out, f'  {"NTSC":9s} FAILED    {type(exc).__name__}: {exc}')
+
+    # R251 post-signal: the Voodoo Graphics line runs as four VOODOO_LINE
+    # draws orchestrated by chain.video_filter; measured through the
+    # orchestrator in the NTSC shape, with the ENABLED gate lifted
+    try:
+        from .gpu import chain, stages as _stages
+        claimed = VALIDATION.get('VOODOO_LINE', ('?', None))[0]
+        st_vf = RenderSettings()
+        st_vf.color_depth, st_vf.video_filter = '16', 'VOODOO1'
+        saved = _stages.ENABLED
+        _stages.ENABLED = tuple(set(saved) | {'VOODOO_LINE'})
+        chain.ENABLED = _stages.ENABLED
+        st_vf.gpu_post = True
+        st_vf.render_device = 'GPU'
+        try:
+            _fr = chain.Frame(rgb=src565.copy())
+            got = chain.video_filter(_fr, st_vf)
+            if got is not None:
+                got = _fr.finish()
+            _fr.release()
+        finally:
+            _stages.ENABLED = saved
+            chain.ENABLED = saved
+        if got is None:
+            _p(out, f'  {"VIDEO_FILTER":9s} ok        SKIPPED (see console)')
+        else:
+            want = SE.video_filter(src565.copy(), st_vf)
+            mx = float(np.abs(got - want).max())
+            mn = float(np.abs(got - want).mean())
+            _p(out, f'  {"VIDEO_FILTER":9s} ok        ok      {mx:9.5f} {mn:9.5f}  '
+                    f'{claimed} (4 line draws)')
+    except Exception as exc:                                    # noqa: BLE001
+        _p(out, f'  {"VIDEO_FILTER":9s} FAILED    {type(exc).__name__}: {exc}')
+
+    # R251 SIG-2: the tape path runs as TAPE_FIR + TAPE_OUT orchestrated by
+    # chain.tape; measured through the orchestrator in the NTSC shape
+    try:
+        from .gpu import chain, stages as _stages
+        claimed = VALIDATION.get('TAPE_OUT', ('?', None))[0]
+        st_t = RenderSettings()
+        st_t.tape, st_t.tape_generations, st_t.tape_dropouts = 'VHS', 3, 20.0
+        saved = _stages.ENABLED
+        _stages.ENABLED = tuple(set(saved) | {'TAPE_FIR', 'TAPE_OUT'})
+        chain.ENABLED = _stages.ENABLED
+        st_t.gpu_post = True
+        st_t.render_device = 'GPU'
+        try:
+            _fr = chain.Frame(rgb=img.copy())
+            got = chain.tape(_fr, st_t, frame_no=7, seed=3)
+            if got is not None:
+                got = _fr.finish()
+            _fr.release()
+        finally:
+            _stages.ENABLED = saved
+            chain.ENABLED = saved
+        if got is None:
+            _p(out, f'  {"TAPE":9s} ok        SKIPPED (see console)')
+        else:
+            want = ST2.tape_path(img.copy(), st_t, 7, 3)
+            mx = float(np.abs(got - want).max())
+            mn = float(np.abs(got - want).mean())
+            _p(out, f'  {"TAPE":9s} ok        ok      {mx:9.5f} {mn:9.5f}  '
+                    f'{claimed} (FIR + out draws)')
+    except Exception as exc:                                    # noqa: BLE001
+        _p(out, f'  {"TAPE":9s} FAILED    {type(exc).__name__}: {exc}')
+
+    # R251 SIG-3: MPEG-1 runs as five block draws (four at the padded
+    # size) orchestrated by chain.mpeg1, and the matte glow as
+    # 2 * passes + 1 draws by chain.matte_glow; measured through their
+    # orchestrators in the NTSC shape. This is where the driver's FMA
+    # number for the two CLOSE grades (1/255 and 5e-4) is read
+    for _nm, _first, _note in (('MPEG1', 'MPEG_ENC', '5 block draws'),
+                               ('MATTE_GLOW', 'MATTE_BLUR',
+                                '2 x 3 blur draws + the sum')):
+        try:
+            from .gpu import chain, stages as _stages
+            claimed = VALIDATION.get(_first, ('?', None))[0]
+            st_o = RenderSettings()
+            st_o.gpu_post = True
+            st_o.render_device = 'GPU'
+            chain.ENABLED = _stages.ENABLED
+            _fr = chain.Frame(rgb=img.copy())
+            if _nm == 'MPEG1':
+                st_o.mpeg1, st_o.mpeg1_qscale, st_o.mpeg1_gop = True, 12, 0
+                got = chain.mpeg1(_fr, st_o, frame_no=1)
+                _want = lambda: SCD.mpeg1_intra(img.copy(), st_o, 1)  # noqa: E731
+            else:
+                st_o.matte_glow, st_o.matte_glow_radius = True, 24.0
+                st_o.matte_glow_passes = 3
+                gel_img = np.zeros((h, w, 3), np.float32)
+                gel_img[h // 2 - 6:h // 2 + 6, w // 2 - 10:w // 2 + 10] = \
+                    (0.2, 0.9, 1.0)
+                got = chain.matte_glow(_fr, st_o, gel=gel_img)
+                _want = lambda: SCD.matte_glow(img.copy(), st_o, gel=gel_img)  # noqa: E731
+            if got is not None:
+                got = _fr.finish()
+            _fr.release()
+            if got is None:
+                _p(out, f'  {_nm:9s} ok        SKIPPED (see console)')
+            else:
+                want = _want()
+                mx = float(np.abs(got - want).max())
+                mn = float(np.abs(got - want).mean())
+                _p(out, f'  {_nm:9s} ok        ok      {mx:9.5f} {mn:9.5f}  '
+                        f'{claimed} ({_note})')
+        except Exception as exc:                                # noqa: BLE001
+            _p(out, f'  {_nm:9s} FAILED    {type(exc).__name__}: {exc}')
+
+    # R251 (post-palette C054): Extra Half-Brite through the orchestrator,
+    # the 32 pre-fitted into the lock cache from `img` so no readback is
+    # spent -- the driver's own number for the EHB stage's lattice round
+    # (the single-draw table skips it: its tables come from the frame)
+    try:
+        from .gpu import chain, stages as _stages
+        claimed = VALIDATION.get('EHB', ('?', None))[0]
+        st_ehb = RenderSettings()
+        st_ehb.palette_mode, st_ehb.dither = 'EHB', 'BAYER4'
+        st_ehb.dither_strength = 0.8
+        st_ehb.gpu_post, st_ehb.render_device = True, 'GPU'
+        PE.ehb_fit(img, st_ehb, 0)           # the 32, cached under lock
+        saved = _stages.ENABLED
+        _stages.ENABLED = tuple(set(saved) | {'EHB'})
+        chain.ENABLED = _stages.ENABLED
+        try:
+            _fr = chain.Frame(rgb=img.copy())
+            got = CP.ehb(_fr, st_ehb)
+            if got is not None:
+                got = _fr.finish()
+            _rb = list(_fr.readbacks)
+            _fr.release()
+        finally:
+            _stages.ENABLED = saved
+            chain.ENABLED = saved
+        if got is None:
+            _p(out, f'  {"EHB":9s} ok        SKIPPED (see console)')
+        else:
+            want = PE.ehb_reduce(img.copy(), st_ehb, 0)
+            mx = float(np.abs(got - want).max())
+            mn = float(np.abs(got - want).mean())
+            _p(out, f'  {"EHB":9s} ok        ok      {mx:9.5f} {mn:9.5f}  '
+                    f'{claimed} (32 registers + halves, BAYER4 0.8; '
+                    f'{len(_rb)} readback)')
+    except Exception as exc:                                    # noqa: BLE001
+        _p(out, f'  {"EHB":9s} FAILED    {type(exc).__name__}: {exc}')
+
+    # R251 (post-palette C050): attribute cells through the orchestrator
+    # -- two passes, the least-squares set per cell then the nearest of
+    # its colours per pixel -- ZX Spectrum with BAYER4 (a fixed-set mode:
+    # no frame table, no readback). The driver's own number for the
+    # ordered perturbation's multiply-add: whole pixels, 0 expected
+    try:
+        from .gpu import chain, stages as _stages
+        claimed = VALIDATION.get('CELLS_SNAP', ('?', None))[0]
+        st_cells = RenderSettings()
+        st_cells.attribute_cells, st_cells.dither = 'ZX_SPECTRUM', 'BAYER4'
+        st_cells.gpu_post, st_cells.render_device = True, 'GPU'
+        saved = _stages.ENABLED
+        _stages.ENABLED = tuple(set(saved) | {'CELLS_FIT', 'CELLS_SNAP'})
+        chain.ENABLED = _stages.ENABLED
+        try:
+            _fr = chain.Frame(rgb=img.copy())
+            got = CP.cells(_fr, st_cells)
+            if got is not None:
+                got = _fr.finish()
+            _rb = list(_fr.readbacks)
+            _fr.release()
+        finally:
+            _stages.ENABLED = saved
+            chain.ENABLED = saved
+        if got is None:
+            _p(out, f'  {"CELLS":9s} ok        SKIPPED (see console)')
+        else:
+            want = PE.attribute_cells(img.copy(), st_cells, 0)
+            mx = float(np.abs(got - want).max())
+            mn = float(np.abs(got - want).mean())
+            _whole = int((got != want).any(axis=2).sum())
+            _p(out, f'  {"CELLS":9s} ok        ok      {mx:9.5f} {mn:9.5f}  '
+                    f'{claimed} (ZX Spectrum 8x8 + BAYER4, fit + snap; '
+                    f'{_whole} of {h * w} pixels differ; '
+                    f'{len(_rb)} readback)')
+    except Exception as exc:                                    # noqa: BLE001
+        _p(out, f'  {"CELLS":9s} FAILED    {type(exc).__name__}: {exc}')
 
 
 def _bisect_deferred(out, passes):
@@ -612,14 +992,24 @@ def feature_matrix(out):
     _p(out)
 
     def _run(sc, st):
-        img = R.render(sc, st)
-        return _post.process(img, st, frame=1, seed=st.seed,
-                             target_size=(st.resolution_x,
-                                          st.resolution_y),
-                             allow_resize=False,
-                             depth=getattr(sc, 'last_depth', None),
-                             shaft_sources=getattr(sc, 'last_shafts',
-                                                   None))
+        # R250: exactly F12's road -- the frame kept on the GPU for the
+        # post chain, released after it
+        st._keep_gpu_frame = True
+        try:
+            img = R.render(sc, st)
+            return _post.process(img, st, frame=1, seed=st.seed,
+                                 target_size=(st.resolution_x,
+                                              st.resolution_y),
+                                 allow_resize=False,
+                                 cvg=getattr(sc, 'last_cvg', None),  # R251 C001
+                                 coverage=getattr(sc, 'last_coverage', None),
+                                 gel=getattr(sc, 'last_gel', None),
+                                 depth=getattr(sc, 'last_depth', None),
+                                 shaft_sources=getattr(sc, 'last_shafts',
+                                                       None))
+        finally:
+            from .gpu import frame as _FR
+            _FR.release(st)
 
     t_all = _time.perf_counter()
     n_gpu = n_routed = n_fail = 0
@@ -631,6 +1021,18 @@ def feature_matrix(out):
             cpu = _run(scC, stC)
             scG, stG = build(key)
             stG.render_device = 'GPU'
+            # R250: the CPU row just stored this frame's G-buffer in the
+            # render cache under a key that carries no device (the raster
+            # is device-independent by construction), so the GPU row was
+            # served from it, the compute raster was never asked, and
+            # every row of every field report read '-SP' with no reason
+            # printed. The headless twin of this matrix clears the cache
+            # for the same reason (test_the_device_switch_gates_every_gpu_entry)
+            try:
+                from .core.render import _GBUF_CACHE as _gbc
+                _gbc.clear()
+            except Exception:                               # noqa: BLE001
+                pass
             hit = {'R': False, 'S': False, 'P': False}
 
             def _w(fn, flag):

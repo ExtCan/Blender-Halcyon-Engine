@@ -11,7 +11,7 @@ tested without Blender at all:
 bl_info = {
     "name": "Halcyon Render Engine",
     "author": "Built by Claude with help from Mr. Emotiman",
-    "version": (1, 86, 2),
+    "version": (1, 90, 0),
     "blender": (5, 1, 0),
     "location": "Render Properties > Render Engine > Halcyon",
     "description": "Scanline/raytrace hybrid engine reproducing mid-to-late "
@@ -86,10 +86,10 @@ def fault_note(msg, key=None, limit=6):
 def _import_modules():
     from . import (append_watch, compat, convert, engine, export,
                    legacy_import, objects, properties, selftest,
-                   templates, ui)
+                   sparking, templates, ui)
     from .nodes import shader_nodes
     return (properties, shader_nodes, convert, templates, legacy_import,
-            append_watch, export, objects, engine, selftest, ui)
+            sparking, append_watch, export, objects, engine, selftest, ui)
 
 
 def register():

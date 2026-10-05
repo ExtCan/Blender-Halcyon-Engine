@@ -310,9 +310,12 @@ def _view_points(proj, px, py, z, W, H):
     xn = (px + np.float32(0.5)) * np.float32(2.0 / W) - np.float32(1.0)
     yn = (py + np.float32(0.5)) * np.float32(2.0 / H) - np.float32(1.0)
     if abs(float(pm[3, 2])) > 1e-9:
-        # clip.w = -z_v = z: x_ndc = (p00 x_v + p02 z_v) / z
-        xv = (xn + pm[0, 2]) * z / pm[0, 0]
-        yv = (yn + pm[1, 2]) * z / pm[1, 1]
+        # clip.w = -z_v = z: x_ndc = (p00 x_v + p02 z_v + p03) / z.
+        # R251 C098: the lens shear puts a clip translation in
+        # pm[., 3]; subtracting an exact 0.0 is bitwise the old form,
+        # and _screen_of already carries the same term
+        xv = ((xn + pm[0, 2]) * z - pm[0, 3]) / pm[0, 0]
+        yv = ((yn + pm[1, 2]) * z - pm[1, 3]) / pm[1, 1]
     else:
         xv = (xn - pm[0, 3]) / pm[0, 0]
         yv = (yn - pm[1, 3]) / pm[1, 1]
