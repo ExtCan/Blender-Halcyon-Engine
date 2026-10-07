@@ -232,6 +232,7 @@ class RenderSettings:
     tex_lod_k: float = 0.0            # R251: GS TEX1 K, signed 7.4 fixed in levels (quantised to 1/16)
     tex_lod_l: int = 0                # R251: GS TEX1 L shift (0..3)
     tex_lod_sharpen: bool = False     # R251: N64 G_TD_SHARPEN: extrapolate level 0 away from level 1 under magnification, 9-bit clamp
+    generated_space: str = 'OBJECT'   # R253: where Generated coordinates are measured (OBJECT = the mesh's own box, as Blender | WORLD = the pre-1.92 world-space box that scrolled under motion)
     # ---------------------------------------------------------- transparency
     transparency: str = 'SORTED'       # NONE | STIPPLE | SORTED | ABUFFER
     stipple_pattern: str = 'BAYER4'

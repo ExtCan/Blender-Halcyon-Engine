@@ -366,6 +366,16 @@ TEX_LOD_SOURCE = _items(
     ('TRIANGLE', "One level per polygon (Riva 128, Verite V1000)",
      "The triangle's texel-area / screen-area ratio picks its ONE nearest level, no blend: mip seams at polygon edges"),
 )
+# R253: where Generated texture coordinates are measured. Blender's
+# Generated output is the mesh's texture space (the object-space box),
+# so a moving object carries its procedural textures; the pre-1.92
+# world box scrolled them, and a file that relied on that opts back.
+GENERATED_SPACE = _items(
+    ('OBJECT', "Object box (Blender)",
+     "Generated coordinates span the mesh's own bounding box, so moving, turning or scaling the object carries its procedural textures with it"),
+    ('WORLD', "World box (legacy, pre-1.92)",
+     "The pre-1.92 behaviour: the box is measured in world space, so an animated object scrolls through its procedural textures"),
+)
 TRANSPARENCY = _items(
     ('NONE', "Opaque", "Ignore alpha"),
     ('STIPPLE', "Screen Door", "Dithered stipple, as hardware without blending did"),
@@ -897,6 +907,7 @@ ENUMS = {
     'tex_compress': TEX_COMPRESS, 'tex_frac_bits': TEX_FRAC_BITS,
     'tex_clamp_mode': TEX_CLAMP_MODE, 'tex_mip_select': TEX_MIP_SELECT,
     'tex_lod_source': TEX_LOD_SOURCE,
+    'generated_space': GENERATED_SPACE,                         # R253
     'stipple_pattern': STIPPLE_PATTERN, 'fog_mode': FOG_MODE,
     'fog_table': FOG_TABLE, 'fog_depth': FOG_DEPTH,
     'fog_color_source': FOG_SOURCE, 'glow_quality':
@@ -1122,6 +1133,7 @@ LABELS = {
     'tex_colorkey_range': "Chroma Key Range", 'tex_mip_select': "Mip Level Select",
     'tex_lod_source': "Mip LOD Source", 'tex_lod_k': "GS LOD K", 'tex_lod_l': "GS LOD L",
     'tex_lod_sharpen': "Sharpen (N64)",
+    'generated_space': "Generated Space",                       # R253
     'threads': "Threads", 'film_transparent': "Transparent Film",
     'cache_shadows': "Cache Shadow Maps", 'show_stats': "Timing Breakdown",
     'fast_background': "Fast Background",
@@ -1658,6 +1670,14 @@ DESCRIPTIONS = {
                  "per game on the real machine",
     'tex_lod_l': "The GS TEX1 L shift: the LOD from Q is multiplied by 2^L "
                  "before K is added",
+    # R253
+    'generated_space': "Which box the Generated texture coordinates are "
+                       "measured in: the object's own bounding box (Blender's "
+                       "rule -- procedural textures stay glued to a moving, "
+                       "turning or scaling object; the mesh's manual Texture "
+                       "Space is honoured) or the pre-1.92 world-space box, "
+                       "which scrolled an animated object through its "
+                       "procedural textures -- for a file that relied on it",
     'tex_lod_sharpen': "Nintendo 64 sharpen mode (gDPSetTextureDetail "
                        "G_TD_SHARPEN): under magnification the RDP extrapolates "
                        "level 0 away from level 1 with a negative LOD fraction -- "

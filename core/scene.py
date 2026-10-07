@@ -168,6 +168,14 @@ class ObjectInfo:
     # flat float32 (Mantaflow layout, x fastest), 'flame': same or
     # None}. The volume marcher multiplies its density field by it.
     smoke_grid: Optional[Dict[str, Any]] = None
+    # R253: the mesh's texture space -- (lo, hi), two float32 (3,)
+    # arrays in OBJECT space -- the box Generated coordinates span
+    # (Blender's BKE_mesh_texspace: the object-space bounding box, or
+    # the mesh's manual Texture Space as loc - size .. loc + size).
+    # export.py fills it from the untransformed vertex array so the box
+    # never moves with the object; None = derive it from the mesh
+    # (hand-built scenes, hair parts).
+    gen_bounds: Optional[tuple] = None
 
 
 @dataclass

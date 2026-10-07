@@ -129,6 +129,36 @@ def transform_normals(m_inv, n):
     return n @ m_inv[:3, :3]
 
 
+def object_space_points(P, inv):
+    """R253: world points back into their object's own frame, one
+    inverse matrix per point: (n,3) float32 from P (n,3) and inv
+    (n,4,4) (or a single (4,4), broadcast).
+
+    Written as the SEQUENTIAL float32 chain per row r --
+    `t = inv[r,0]*x; t += inv[r,1]*y; t += inv[r,2]*z; t += inv[r,3]` --
+    because that is the order the GLSL simulator's `dot` (np.sum of
+    four float32 products, shaders/builtins.dot_) evaluates
+    `dot(hal_obj_rN(td.y), vec4(P, 1.0))`, so the CPU's Generated and
+    Object coordinates and the GPU's hal_generated / hal_object are the
+    same bits in the simulator (the view_depth precedent in
+    core/render.py). Measured on this NumPy: bitwise the np.sum chain
+    and bitwise the einsum n_tex_coord used before (200k points, 0
+    ULP); a construction on any. At identity it returns P exactly
+    (1*x + 0 + 0 + 0)."""
+    P = np.asarray(P, np.float32)
+    inv = np.asarray(inv, np.float32)
+    if inv.ndim == 2:
+        inv = np.broadcast_to(inv, (P.shape[0], 4, 4))
+    out = np.empty((P.shape[0], 3), np.float32)
+    for r in range(3):
+        t = inv[:, r, 0] * P[:, 0]
+        t += inv[:, r, 1] * P[:, 1]
+        t += inv[:, r, 2] * P[:, 2]
+        t += inv[:, r, 3]
+        out[:, r] = t
+    return out
+
+
 def transform_h(m, p):
     """Homogeneous transform. p: (N,3) -> (N,4)."""
     m = np.asarray(m, dtype=np.float32)

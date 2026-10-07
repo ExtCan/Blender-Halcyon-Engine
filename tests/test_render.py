@@ -20636,6 +20636,21 @@ def test_every_setting_does_what_it_says():
         for m in sc.materials:
             m.graph = _DISP_GRAPH
 
+    def _moved_generated_marble(sc):
+        # R253: a Generated-driven marble on a ball whose matrix is a
+        # rotation + translation -- the object box and the legacy world
+        # box only differ on a MOVED object (identity scenes are
+        # bitwise on both roads by design, test_r253_generated_coords)
+        from ..core.scene import Material
+        from .test_r253_generated_coords import marble_graph, move_ball
+        sc.materials[1] = Material(name='GenMarble', index=1,
+                                   graph=marble_graph())
+        c, s = np.cos(0.7), np.sin(0.7)
+        mw = np.eye(4, dtype=np.float32)
+        mw[0, 0], mw[0, 1], mw[1, 0], mw[1, 1] = c, -s, s, c
+        mw[:3, 3] = (0.3, -0.2, 0.4)
+        move_ball(sc, mw)
+
     CONES = {'spot_cones': True}
     AO = {'ambient_occlusion': True, 'ao_samples': 4}
     RAD = {'radiosity': True, 'radiosity_samples': 4,
@@ -21020,6 +21035,10 @@ def test_every_setting_does_what_it_says():
          {'tex_filter': 'BILINEAR', 'tex_mipmap': True, 'tex_mip_select': 'NEAREST_LEVEL'}),
         ('tex_lod_sharpen',    True,              'textured_mag',
          {'tex_filter': 'N64_3POINT', 'tex_mipmap': True}),
+        # R253: Generated coordinates in the object's own box; the flip
+        # to the legacy world box is a DIFF on a moved marble ball
+        ('generated_space',    'WORLD',           'demo',         {},
+         _moved_generated_marble),
         # R251 post-signal (SIG-2): chroma siting, cable, PAL, tape
         ('chroma_format',      'Y411',            'demo',         {}),
         ('chroma_upsample',    'LINEAR',          'demo',

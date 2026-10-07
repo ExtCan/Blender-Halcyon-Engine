@@ -26,6 +26,8 @@ def run_tests():
     from . import test_r252_console
     # R253 (1.92.0): the Convert to Anime / Cartoon / Game buttons
     from . import test_r253_convert_buttons
+    # R253 (1.92.0): Generated coordinates in the object's own box
+    from . import test_r253_generated_coords
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -127,6 +129,9 @@ def run_tests():
     print('R253 CONVERT TO ANIME / CARTOON / GAME')
     print('=' * 66)
     rc |= test_r253_convert_buttons.main()
+    print('R253 GENERATED COORDINATES (OBJECT BOX)')
+    print('=' * 66)
+    rc |= test_r253_generated_coords.main()
     return rc
 
 

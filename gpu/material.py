@@ -334,14 +334,21 @@ def _lift_marked_values(src):
     return _MV_RE.sub(_sub, src), vals
 
 
-def _object_frame(src, consts):
+def _object_frame(src, consts, need_rows=False):
     """R243: the object's own frame on the GPU. `hal_object` reads the
     world position through the per-object inverse matrix, baked as
     three row-lookup functions by object index -- exactly the CPU's
-    n_tex_coord einsum (inv[:3, :3] . P + inv[:3, 3]). Returns the
-    functions and the line, or ('', '') when no chain reads it, or
-    (None, why) when the caller supplied no matrices."""
-    if 'hal_object' not in src:
+    n_tex_coord chain (core/mathx.object_space_points: inv[:3, :3] . P
+    + inv[:3, 3], the sequential float32 sum the simulator's dot runs).
+    Returns the functions and the line, or ('', '') when no chain reads
+    it, or (None, why) when the caller supplied no matrices. R253:
+    `need_rows` asks for the three row functions without the hal_object
+    line -- the object-space Generated line reads the same rows, and a
+    pass must define them exactly ONCE (gpu/device.duplicate_definitions
+    refuses otherwise), so every row emission goes through this one
+    call per assembler."""
+    wants_line = 'hal_object' in src
+    if not wants_line and not need_rows:
         return '', ''
     mats = consts.get('obj_inv')
     if mats is None:
@@ -363,13 +370,73 @@ def _object_frame(src, consts):
     fns = '\n'.join(_sel(f'hal_obj_r{r}', rows[r]) for r in range(3)) + '\n'
     line = ('    vec3 hal_object = vec3(dot(hal_obj_r0(td.y), vec4(P, 1.0)), '
             'dot(hal_obj_r1(td.y), vec4(P, 1.0)), '
-            'dot(hal_obj_r2(td.y), vec4(P, 1.0)));\n')
+            'dot(hal_obj_r2(td.y), vec4(P, 1.0)));\n') if wants_line else ''
     return fns, line
 
 
 def _v3(t):
     t = tuple(float(v) for v in t)[:3]
     return 'vec3({}, {}, {})'.format(*(_f(v) for v in t))
+
+
+def _bounds_fns(lo, span, lo_name, span_name):
+    """A per-object (lo, span) table as two vec3 lookup functions keyed
+    by the object index the tri_data texture carries -- the bake both
+    assemblers used for hal_gen_lo / hal_gen_span since the per-object
+    bounds shipped, lifted out verbatim (R253) so the object-space table
+    hal_lgen_lo / hal_lgen_span is the same text under another name."""
+    def _sel(name, rows):
+        lines = [f'vec3 {name}(float obj)', '{']
+        for i in range(len(rows) - 1):
+            lines.append(f'    if (obj < {_f(i + 0.5)}) '
+                         f'return {_v3(rows[i])};')
+        lines.append(f'    return {_v3(rows[len(rows) - 1])};')
+        lines.append('}')
+        return '\n'.join(lines)
+    return _sel(lo_name, list(lo)) + '\n' + _sel(span_name, list(span)) + '\n'
+
+
+def _generated_frame(src, consts, force_line=False, world_table=False):
+    """R253: the Generated-coordinate line of a pass and the table it
+    reads: (fns, line, None), ('', '', None) when nothing reads it, or
+    (None, None, why) when the caller supplied no frame.
+
+    OBJECT (the default, Blender's rule): the world position is taken
+    back into the object's own frame through the three hal_obj_rN rows
+    (the caller emits them ONCE through _object_frame(need_rows=True))
+    and measured over the mesh's OWN box, baked from consts['obj_gen']
+    (ShadeJob.object_generated_frame) as hal_lgen_lo / hal_lgen_span.
+    The three dots are the simulator's np.sum chain, bitwise the CPU's
+    core/mathx.object_space_points; the subtraction and the division
+    are the same elementwise float32 ops the CPU runs. WORLD (legacy,
+    pre-1.92): today's text verbatim -- the world table hal_gen_lo /
+    hal_gen_span and `(P - lo) / span`; `world_table` says the caller
+    already baked that table (the cartoon centre / hair shine read it),
+    so it is not defined twice. `force_line` asks for the line when no
+    chain names hal_generated but a block reads it (the hair shine)."""
+    if 'hal_generated' not in src and not force_line:
+        return '', '', None
+    if str(consts.get('generated_space', 'OBJECT')) == 'WORLD':
+        fns = ''
+        if not world_table:
+            bounds = consts.get('obj_bounds')
+            if bounds is None:
+                return None, None, 'generated coordinates need the ' \
+                    'per-object bounds the caller did not supply'
+            fns = _bounds_fns(bounds[0], bounds[1], 'hal_gen_lo', 'hal_gen_span')
+        line = ('    vec3 hal_generated = (P - hal_gen_lo(td.y)) '
+                '/ hal_gen_span(td.y);\n')
+        return fns, line, None
+    gen = consts.get('obj_gen')
+    if gen is None:
+        return None, None, 'generated coordinates need the per-object ' \
+                           'frame the caller did not supply'
+    fns = _bounds_fns(gen[0], gen[1], 'hal_lgen_lo', 'hal_lgen_span')
+    line = ('    vec3 hal_generated = (vec3(dot(hal_obj_r0(td.y), vec4(P, 1.0)), '
+            'dot(hal_obj_r1(td.y), vec4(P, 1.0)), '
+            'dot(hal_obj_r2(td.y), vec4(P, 1.0))) - hal_lgen_lo(td.y)) '
+            '/ hal_lgen_span(td.y);\n')
+    return fns, line, None
 
 
 #: texels per light in the hal_lights texture (R169). Layout:
@@ -4094,33 +4161,21 @@ def _assemble_height_pass(graph, mat_id, bump_node, consts, textures,
     if 'hal_T' in src:
         return None, 'tangent texture coordinates are not in the ' \
                      'G-buffer yet (UV and generated coordinates are)'
+    # R253: the Generated line (object-space by default, the legacy
+    # world line under generated_space WORLD) and the hal_obj_rN rows
+    # it and hal_object share -- emitted exactly once per pass
     gen_fns = ''
     gen_line = ''
-    if 'hal_generated' in src:
-        bounds = consts.get('obj_bounds')
-        if bounds is None:
-            return None, 'generated coordinates need the per-object ' \
-                         'bounds the caller did not supply'
-        lo, span = bounds
-
-        def _sel(name, rows):
-            lines = [f'vec3 {name}(float obj)', '{']
-            for i in range(len(rows) - 1):
-                lines.append(f'    if (obj < {_f(i + 0.5)}) '
-                             f'return {_v3(rows[i])};')
-            lines.append(f'    return {_v3(rows[len(rows) - 1])};')
-            lines.append('}')
-            return '\n'.join(lines)
-
-        gen_fns = _sel('hal_gen_lo', list(lo)) + '\n' \
-            + _sel('hal_gen_span', list(span)) + '\n'
-        gen_line = ('    vec3 hal_generated = (P - hal_gen_lo(td.y)) '
-                    '/ hal_gen_span(td.y);\n')
-    obj_fns, obj_line = _object_frame(src, consts)
+    g_fns, g_line, g_err = _generated_frame(src, consts)
+    if g_fns is None:
+        return None, g_err
+    _legacy = str(consts.get('generated_space', 'OBJECT')) == 'WORLD'
+    obj_fns, obj_line = _object_frame(src, consts,
+                                      need_rows=bool(g_line) and not _legacy)
     if obj_fns is None:
         return None, obj_line
-    gen_fns += obj_fns
-    gen_line += obj_line
+    gen_fns = (g_fns + obj_fns) if _legacy else (obj_fns + g_fns)
+    gen_line = g_line + obj_line
 
     frame_unis = sorted(em.frame_uniforms)
     extra_unis = ''.join(f'uniform float {u};\n' for u in frame_unis)
@@ -4537,7 +4592,9 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     # generated coordinates: Blender normalises them over each object's own
     # bounding box, and those bounds are per-scene constants -- so they bake
     # as a pair of lookup functions keyed by the object index the tri_data
-    # texture already carries. Exactly ctx.generated = (P - lo[obj])/span
+    # texture already carries. Exactly ctx.generated = (Po - lo[obj])/span
+    # with Po the point in the object's own frame (R253; P itself on the
+    # legacy world road)
     gen_fns = ''
     gen_line = ''
     # R228: the cartoon's shape smoothing reads the same per-object
@@ -4553,32 +4610,33 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
                   or bool(bake.get('__cartoon'))) and (
         'anime_shine' in perpix_exprs
         or float(bake.get('anime_shine', 0.0) or 0.0) > 1e-6)
-    if 'hal_generated' in src or _cartoon_gen or _shine_gen:
+    # R253: the WORLD table stays, under its names, for the cartoon
+    # centre (hal_ccen) and the hair-shine azimuth (hal_hcen) -- they
+    # measure a direction from the world point to the world centre,
+    # exactly as the CPU keeps ctx.obj_bounds world. The Generated LINE
+    # itself is object-space by default (_generated_frame: the point
+    # through the hal_obj_rN rows, over the mesh's own box
+    # hal_lgen_lo / hal_lgen_span) and the legacy world line under
+    # generated_space WORLD; the rows are emitted exactly once per
+    # pass, shared with hal_object through one _object_frame call
+    world_fns = ''
+    if _cartoon_gen or _shine_gen:
         bounds = consts.get('obj_bounds')
         if bounds is None:
             return None, 'generated coordinates need the per-object bounds ' \
                          'the caller did not supply'
-        lo, span = bounds
-
-        def _sel(name, rows):
-            lines = [f'vec3 {name}(float obj)', '{']
-            for i in range(len(rows) - 1):
-                lines.append(f'    if (obj < {_f(i + 0.5)}) '
-                             f'return {_v3(rows[i])};')
-            lines.append(f'    return {_v3(rows[len(rows) - 1])};')
-            lines.append('}')
-            return '\n'.join(lines)
-
-        gen_fns = _sel('hal_gen_lo', list(lo)) + '\n' \
-            + _sel('hal_gen_span', list(span)) + '\n'
-        if 'hal_generated' in src or _shine_gen:
-            gen_line = ('    vec3 hal_generated = (P - hal_gen_lo(td.y)) '
-                        '/ hal_gen_span(td.y);\n')
-    obj_fns, obj_line = _object_frame(src, consts)
+        world_fns = _bounds_fns(bounds[0], bounds[1], 'hal_gen_lo', 'hal_gen_span')
+    g_fns, g_line, g_err = _generated_frame(src, consts, force_line=_shine_gen,
+                                            world_table=bool(world_fns))
+    if g_fns is None:
+        return None, g_err
+    _legacy = str(consts.get('generated_space', 'OBJECT')) == 'WORLD'
+    obj_fns, obj_line = _object_frame(src, consts,
+                                      need_rows=bool(g_line) and not _legacy)
     if obj_fns is None:
         return None, obj_line
-    gen_fns += obj_fns
-    gen_line += obj_line
+    gen_fns = world_fns + ((g_fns + obj_fns) if _legacy else (obj_fns + g_fns))
+    gen_line = g_line + obj_line
 
     # Bump nodes recorded height pre-passes during the walk: each height
     # chain becomes its own full-screen pass whose target the main pass
