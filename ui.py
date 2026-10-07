@@ -2770,6 +2770,64 @@ class HALCYON_OT_sky_save(Operator):
         return {'FINISHED'}
 
 
+class HALCYON_OT_cube_load_six(Operator):
+    """Fill the six cube-map slots from any one file of a skybox set"""
+
+    # R253: pick ONE face file (unit1_rt.tga, posx.png, sky_right.jpg ...)
+    # and the other five are found by their suffix; the convention is
+    # set from the suffix family (core/sky.cube_set_from_path, bpy-free)
+    bl_idname = 'halcyon.cube_load_six'
+    bl_label = "Load Six Faces"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filepath: StringProperty(subtype='FILE_PATH')
+    filter_glob: StringProperty(
+        default="*.tga;*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff;*.exr;*.hdr;"
+                "*.pcx;*.dds",
+        options={'HIDDEN'})
+
+    @classmethod
+    def poll(cls, context):
+        return context.world is not None
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        import os
+
+        from .core import sky as SKY
+        if not self.filepath:
+            self.report({'ERROR'}, "No file")
+            return {'CANCELLED'}
+        conv, paths = SKY.cube_set_from_path(self.filepath)
+        if conv is None:
+            self.report({'ERROR'}, str(paths))
+            return {'CANCELLED'}
+        hs = context.world.halcyon
+        missing = []
+        for slot, path in paths.items():
+            if not os.path.isfile(path):
+                missing.append(os.path.basename(path))
+                continue
+            try:
+                img = bpy.data.images.load(path, check_existing=True)
+            except RuntimeError as exc:
+                missing.append(f'{os.path.basename(path)} ({exc})')
+                continue
+            setattr(hs, f'cube_image_{slot}', img)
+        hs.cube_source = 'SIX'
+        hs.cube_convention = conv
+        if missing:
+            self.report({'WARNING'},
+                        f"{6 - len(missing)} of 6 faces loaded ({conv}); "
+                        'not found: ' + ', '.join(missing))
+        else:
+            self.report({'INFO'}, f"Six faces loaded ({conv})")
+        return {'FINISHED'}
+
+
 class HALCYON_OT_sky_load(Operator):
     """Add a .halsky file to the preset list, without changing this sky"""
 
@@ -3204,6 +3262,31 @@ class HALCYON_PT_world(HalcyonPanel, Panel):
             col.template_ID(hs, 'env_image', open='image.open')
             col.prop(hs, 'sky_cylinder_repeats')
             col.prop(hs, 'sky_cylinder_mid')
+        elif m == 'CUBEMAP':
+            # R253: the skybox -- one packed image (riding env_image) or
+            # six slots labelled in the convention's own words
+            from .core.sky import CUBE_SLOT_LABELS
+            col.prop(hs, 'cube_source')
+            labels = CUBE_SLOT_LABELS.get(hs.cube_convention,
+                                          CUBE_SLOT_LABELS['OPENGL'])
+            if hs.cube_source == 'SIX':
+                col.operator('halcyon.cube_load_six',
+                             text="Load Six Faces...", icon='FILE_FOLDER')
+                for i, slot in enumerate(('px', 'nx', 'py', 'ny', 'pz', 'nz')):
+                    col.template_ID(hs, f'cube_image_{slot}',
+                                    open='image.open', text=labels[i])
+            else:
+                col.template_ID(hs, 'env_image', open='image.open')
+                col.prop(hs, 'cube_layout')
+            col.prop(hs, 'cube_convention')
+            col.prop(hs, 'cube_filter')
+            col.prop(hs, 'env_tint')
+            box = layout.box()
+            box.label(text="Face Orientation")
+            for i in range(6):
+                row = box.row(align=True)
+                row.prop(hs, 'cube_face_rot', index=i, text=labels[i])
+                row.prop(hs, 'cube_face_flip', index=i, text="Mirror")
         elif m == 'LW_GRADIENT':
             # R251 C100: LightWave's Backdrop panel, top to bottom
             col.prop(hs, 'lw_zenith')
@@ -3368,6 +3451,7 @@ CLASSES = (
     HALCYON_MT_resolutions, HALCYON_PT_output,
     HALCYON_OT_fix_view_transform,
     HALCYON_OT_sky_preset, HALCYON_OT_sky_save, HALCYON_OT_sky_load,
+    HALCYON_OT_cube_load_six,            # R253
     HALCYON_OT_water_preset, HALCYON_OT_water_save, HALCYON_OT_water_load,
     HALCYON_UL_materials,
     HalcyonPreferences,

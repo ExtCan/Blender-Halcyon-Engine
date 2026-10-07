@@ -228,7 +228,14 @@ def _compile_dynamic_miss(key, name, fragment, spec):
             _STATE['shaders'][key] = shader
             return shader, None
         except Exception as exc:                                # noqa: BLE001
-            create_err = f'{name}: CreateInfo failed: {exc}'
+            # R253 (the post-field re-read): a single hand-over. The
+            # legacy constructor below compiles the SAME text; the
+            # 1.91.0 log reads 'CreateInfo failed: Shader Compile Error
+            # ...; legacy constructor also failed' and the application
+            # went down right after -- a second GPU object asked of a
+            # source the driver just refused is the double hand-over
+            # R193's rule forbids. The refusal is cached by the caller
+            return None, f'{name}: CreateInfo failed: {exc}'
 
     try:
         shader = gpu.types.GPUShader(VERTEX, fragment)
@@ -312,7 +319,8 @@ def _build(name, fragment, vertex=None):
             info.fragment_source(body(name))
             return gpu.shader.create_from_info(info), None
         except Exception as exc:                                # noqa: BLE001
-            create_err = f'{name}: CreateInfo failed: {exc}'
+            # R253: a single hand-over (see _compile_dynamic_miss)
+            return None, f'{name}: CreateInfo failed: {exc}'
 
     try:
         return gpu.types.GPUShader(vertex or VERTEX, fragment), None

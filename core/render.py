@@ -5190,7 +5190,11 @@ def render(scene, settings=None, progress=None, band=None):
                         _sky_names = {0: 'transparent film (zeros)',
                                       1: 'flat colour', 2: 'sky blend',
                                       3: 'environment image',
-                                      4: 'gradient', 5: 'bands', 6: 'HDRI'}
+                                      4: 'gradient', 5: 'bands', 6: 'HDRI',
+                                      # R251 / R253: named, not numbered
+                                      7: 'cylinder sky',
+                                      8: 'gradient backdrop',
+                                      9: 'cube map'}
                         if _sky_m >= 0:
                             print('[Halcyon GPU] sky: '
                                   f"{_sky_names.get(_sky_m, _sky_m)} drawn "

@@ -517,9 +517,11 @@ def test_sky_modes():
     seen = {}
     # driven by the mode list rather than a copy of it, so a mode added to the
     # engine and forgotten here fails this test instead of going untested
-    modes = [m for m in SKY.MODES if m not in ('NODES', 'HDRI')]
-    check('every sky mode but NODES and HDRI is covered here',
-          len(modes) == len(SKY.MODES) - 2, str(modes))
+    # R253: CUBEMAP joins HDRI here -- without an image it is the solid
+    # colour by hdri's own rule (its frames are tests/test_r253_cubemap's)
+    modes = [m for m in SKY.MODES if m not in ('NODES', 'HDRI', 'CUBEMAP')]
+    check('every sky mode but NODES, HDRI and CUBEMAP is covered here',
+          len(modes) == len(SKY.MODES) - 3, str(modes))
     for mode in modes:
         sc = demo_scene(st)
         sc.world = World()

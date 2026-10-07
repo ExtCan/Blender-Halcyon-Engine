@@ -9,6 +9,8 @@ import bpy
 from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
                        FloatVectorProperty, IntProperty, PointerProperty,
                        StringProperty)
+# R253: the cube map's per-face turn / mirror vectors (size 6)
+from bpy.props import BoolVectorProperty, IntVectorProperty
 from bpy.types import PropertyGroup
 
 from .core.settings import (RESOLUTION_GROUPS, RenderSettings,
@@ -3957,7 +3959,16 @@ class HalcyonWorldSettings(PropertyGroup):
          "squeezed toward the horizon by a whole-number power. The "
          "defaults are the LightWave 5-7 manual's example values, to be "
          "calibrated against a real render; Rotation does not turn it (a "
-         "backdrop symmetric about the vertical)")))
+         "backdrop symmetric about the vertical)"),
+        # R253 cube map: appended at the END (positional numbering)
+        ('CUBEMAP', "Cube Map (Skybox)",
+         "Six square faces around the camera, the 1990s skybox: one "
+         "packed cross or strip image in the Image slot, or six files "
+         "named the OpenGL (+X -X +Y -Y +Z -Z) or the Quake / Half-Life "
+         "(rt lf up dn bk ft) way; point-sampled or bilinear inside each "
+         "face, never blended across a seam. An environment like the "
+         "HDRI: reflections and ray misses see it, Rotation turns it, "
+         "Tint and Strength scale it")))
     # ---- R251 C056 Cylinder Sky (Doom): the image rides env_image
     sky_cylinder_repeats: IntProperty(
         name="Repeats", default=4, min=1, max=16,
@@ -3971,6 +3982,99 @@ class HalcyonWorldSettings(PropertyGroup):
                     "screen's centre line; the rest hangs below. Doom put "
                     "texture row 100 of 128 on the centre line "
                     "(skytexturemid), 0.78125")
+    # ---- R253 Cube Map (Skybox): the single image rides env_image; the six
+    # slots are positional (slot i is named by the convention: OpenGL +X -X
+    # +Y -Y +Z -Z, or Quake rt lf up dn bk ft) -- a size-6 vector property
+    # is a file-format promise: the sizes never change
+    cube_source: EnumProperty(
+        name="Source", default='SINGLE', items=_items(
+            ('SINGLE', "Single Image",
+             "One packed image in the Image slot: a horizontal or vertical "
+             "cross, or a 6:1 / 1:6 strip of square faces"),
+            ('SIX', "Six Images",
+             "One image per face in the six slots below, named and turned "
+             "by the convention")),
+        description="Where the six faces come from: one packed cross or "
+                    "strip image, or six separate face images (the way "
+                    "Quake 2 and Half-Life shipped a sky)")
+    cube_layout: EnumProperty(
+        name="Layout", default='AUTO', items=_items(
+            ('AUTO', "Auto by Aspect",
+             "4:3 is a horizontal cross, 3:4 a vertical cross, 6:1 and 1:6 "
+             "are strips; anything else is refused by name in the console"),
+            ('HCROSS', "Horizontal Cross",
+             "Four cells wide, three high: +Y on top, -X +Z +X -Z across the "
+             "middle row, -Y below (the common 4:3 cross)"),
+            ('VCROSS', "Vertical Cross",
+             "Three cells wide, four high: +Y on top, -X +Z +X across, -Y "
+             "below, -Z at the bottom turned 180 degrees (HDRShop's cross)"),
+            ('HSTRIP', "Horizontal Strip 6:1",
+             "Six square cells left to right in the face order +X -X +Y -Y "
+             "+Z -Z"),
+            ('VSTRIP', "Vertical Strip 1:6",
+             "Six square cells top to bottom in the face order +X -X +Y -Y "
+             "+Z -Z")),
+        description="How the single image packs the six faces. Auto reads "
+                    "the aspect ratio; an image that is none of the four "
+                    "shapes draws the flat World colour and says so once "
+                    "in the system console")
+    cube_convention: EnumProperty(
+        name="Convention", default='OPENGL', items=_items(
+            ('OPENGL', "OpenGL (+X -X +Y -Y +Z -Z)",
+             "The GL_TEXTURE_CUBE_MAP face order and orientation, Y up: "
+             "the slots are Blender +X -X +Z -Z -Y +Y"),
+            ('QUAKE2', "Quake / Half-Life (rt lf up dn bk ft)",
+             "id Software's skybox suffixes and their orientation, Z up: "
+             "rt +X, lf +Y, up +Z, dn -Z, bk -X, ft -Y in Blender axes")),
+        description="Which way the six faces are named and turned: the "
+                    "OpenGL cube-map convention, or id Software's "
+                    "rt/lf/up/dn/bk/ft sky files (Quake 2, Half-Life)")
+    cube_filter: EnumProperty(
+        name="Filter", default='NEAREST', items=_items(
+            ('NEAREST', "Nearest",
+             "One texel per pixel and the hard seam of the era at every "
+             "face edge"),
+            ('BILINEAR', "Bilinear",
+             "Blended between texels inside each face and clamped at its "
+             "edge; never blended across a seam")),
+        description="How a face is sampled: point-sampled (the hard-edged "
+                    "1990s look) or bilinear inside the face; a tap never "
+                    "crosses into the neighbouring face either way")
+    cube_face_rot: IntVectorProperty(
+        name="Face Turns", size=6, min=0, max=3, default=(0, 0, 0, 0, 0, 0),
+        description="Quarter turns applied to each face image before it "
+                    "is placed (0 to 3, one per slot in the convention's "
+                    "order), for a face that loads sideways or upside down")
+    cube_face_flip: BoolVectorProperty(
+        name="Face Mirror", size=6,
+        default=(False, False, False, False, False, False),
+        description="Mirror each face image left to right after its turns "
+                    "(one per slot in the convention's order), for a face "
+                    "that loads the wrong way round")
+    cube_image_px: PointerProperty(
+        name="+X / rt", type=bpy.types.Image,
+        description="First face slot: OpenGL +X (Blender +X) or Quake's rt "
+                    "file (Blender +X)")
+    cube_image_nx: PointerProperty(
+        name="-X / lf", type=bpy.types.Image,
+        description="Second face slot: OpenGL -X (Blender -X) or Quake's lf "
+                    "file (Blender +Y)")
+    cube_image_py: PointerProperty(
+        name="+Y / up", type=bpy.types.Image,
+        description="Third face slot: OpenGL +Y (Blender +Z, straight up) "
+                    "or Quake's up file (Blender +Z)")
+    cube_image_ny: PointerProperty(
+        name="-Y / dn", type=bpy.types.Image,
+        description="Fourth face slot: OpenGL -Y (Blender -Z, straight "
+                    "down) or Quake's dn file (Blender -Z)")
+    cube_image_pz: PointerProperty(
+        name="+Z / bk", type=bpy.types.Image,
+        description="Fifth face slot: OpenGL +Z (Blender -Y) or Quake's bk "
+                    "file (Blender -X)")
+    cube_image_nz: PointerProperty(
+        name="-Z / ft", type=bpy.types.Image,
+        description="Sixth face slot: OpenGL -Z (Blender +Y) or Quake's ft "
+                    "file (Blender -Y)")
     # ---- R251 C100 LightWave Gradient Backdrop: four colours, two squeezes
     lw_zenith: _col("Zenith Color", (0.0, 0.156862745, 0.31372549),
                     "Zenith Color: the colour straight up; LightWave's "
@@ -4715,7 +4819,9 @@ GROUP_DOCS = {
     'HalcyonWorldSettings': {
         'mode': "What the sky IS: the material node tree, a flat colour, "
                 "a gradient, banded steps, a starfield, the Bryce sky "
-                "lab, a physical atmosphere, or an HDRI image",
+                "lab, a physical atmosphere, an HDRI image, a painted "
+                "backdrop, Doom's cylinder sky, LightWave's backdrop or "
+                "a cube-map skybox (R253)",
         'strength': "Multiplier on everything the sky contributes -- "
                     "background, ambient and reflections together",
         'ambient': "Colour of the light the world adds from every "

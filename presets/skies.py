@@ -34,6 +34,12 @@ EXCLUDED = frozenset({
     'graph', 'env_image', 'mist', 'mist_start', 'mist_depth', 'mist_color',
     'mist_falloff', 'mist_intensity', 'mode', 'strength',
     'ground_image',       # R251 C048: the Mode 7 map, an image datablock
+    # R253: a skybox belongs to its images, not to the Bryce library --
+    # the six slots foremost (an ImageBuffer is not JSON), and the dials
+    # that only mean something next to them
+    'cube_image_px', 'cube_image_nx', 'cube_image_py', 'cube_image_ny',
+    'cube_image_pz', 'cube_image_nz', 'cube_source', 'cube_layout',
+    'cube_convention', 'cube_filter', 'cube_face_rot', 'cube_face_flip',
 })
 
 
