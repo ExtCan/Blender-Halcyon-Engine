@@ -19,7 +19,8 @@ from . import palette as PA
 from .patterns import fbm, hash3 as _hash3, turbulence, value_noise as _value_noise
 
 MODES = ('NODES', 'SOLID', 'GRADIENT', 'BANDS', 'STARFIELD', 'BRYCE',
-         'PHYSICAL', 'HDRI', 'PAINTED', 'CYLINDER', 'LW_GRADIENT')
+         'PHYSICAL', 'HDRI', 'PAINTED', 'CYLINDER', 'LW_GRADIENT',
+         'CUBEMAP')                      # R253: appended at the END (positional)
 
 
 def _rotate_z(d, angle):
@@ -1096,6 +1097,367 @@ def physical(world, dirs):
     return np.nan_to_num(col, nan=0.0, posinf=1.0, neginf=0.0)
 
 
+# ---------------------------------------------------------- R253 cube map
+#
+# The 1990s skybox: six square faces around the eye, the OpenGL cube-map
+# face rule picking the face and its (s, t) from the direction (OpenGL 4.6
+# core profile, section 8.13 "Cube Map Texture Selection", table 8.19),
+# the texel point- or bilinear-sampled INSIDE that face only. A tap never
+# leaves its face: NEAREST shows the era's hard seam at every edge and
+# BILINEAR clamps at the face's own border -- never a blend across faces
+# (GL_CLAMP_TO_EDGE on a 1998 card, no seamless-cube-map extension). That
+# is a law here, not an option.
+#
+# The six faces come from ONE packed image (a horizontal or vertical cross,
+# a 6:1 or 1:6 strip, cut by aspect) riding the world's `env_image` slot
+# exactly as CYLINDER's does, or from six image slots. The slots are
+# positional; a CONVENTION names and turns them: OpenGL (+X -X +Y -Y +Z -Z
+# in GL axes, Y up -- the texel GL_TEXTURE_CUBE_MAP would return for the
+# direction, no more: from inside the cube a GL face reads mirrored, the
+# convention is defined from outside, and that is what a cube map built
+# FOR GL expects) or Quake 2 / Half-Life (rt lf up dn bk ft, id's suffix
+# files, Z up, derived from ref_gl/gl_warp.c's st_to_vec table and
+# MakeSkyVec's `t = 1 - t`).
+#
+# Both roads sample ONE atlas: the six faces stacked in GL face order
+# (face f at rows [f*S, (f+1)*S) of a (6S, S, 4) float32 texture), each
+# already moved into the canonical GL orientation on the CPU by np.rot90
+# / np.fliplr -- exact texel permutations, no arithmetic -- so `cube_sample`
+# here and `hal_sky_sample_cube` in gpu/sky.py are one rule on the same
+# bytes. Axes: Blender is Z up with -Y the front view; GL's faces are Y up.
+# The swap gl = (x, z, -y) lands Blender +X -X +Y -Y +Z -Z on GL faces
+# 0 1 5 4 2 3.
+
+CUBE_FACES = ('PX', 'NX', 'PY', 'NY', 'PZ', 'NZ')     # GL order: the atlas's face index
+
+#: the single-image layouts: (columns, rows, {face: (col, row_from_top[, quarter
+#: turns])}); every cell holds its face in the GL image orientation (top row
+#: up) except where a turn is given -- the Debevec / HDRShop vertical cross
+#: draws -Z at the bottom upside down
+CUBE_LAYOUTS = {
+    'HCROSS': (4, 3, {'PY': (1, 0), 'NX': (0, 1), 'PZ': (1, 1), 'PX': (2, 1),
+                      'NZ': (3, 1), 'NY': (1, 2)}),
+    'VCROSS': (3, 4, {'PY': (1, 0), 'NX': (0, 1), 'PZ': (1, 1), 'PX': (2, 1),
+                      'NY': (1, 2), 'NZ': (1, 3, 2)}),
+    'HSTRIP': (6, 1, {f: (i, 0) for i, f in enumerate(CUBE_FACES)}),
+    'VSTRIP': (1, 6, {f: (0, i) for i, f in enumerate(CUBE_FACES)}),
+}
+
+#: the six positional slots by convention, in slot order (World.cube_image_px
+#: .. _nz hold slot 0 .. 5 whatever the convention)
+CUBE_SLOTS = {'OPENGL': ('px', 'nx', 'py', 'ny', 'pz', 'nz'),
+              'QUAKE2': ('rt', 'lf', 'up', 'dn', 'bk', 'ft')}
+CUBE_SLOT_LABELS = {'OPENGL': ('+X', '-X', '+Y', '-Y', '+Z', '-Z'),
+                    'QUAKE2': ('rt', 'lf', 'up', 'dn', 'bk', 'ft')}
+
+#: slot i -> (GL face, quarter turns, mirror): the texel permutation
+#: (np.rot90 by `turns`, THEN np.fliplr when `mirror`) that moves the slot's
+#: picture (row 0 at the bottom, Blender's image order) onto the canonical GL
+#: face. Quake 2 (gl_warp.c, suffix order {rt, bk, lf, ft, up, dn} with
+#: st_to_vec = {{3,-1,2},{-3,1,2},{1,3,2},{-1,-3,2},{-2,-1,3},{2,-1,-3}} and
+#: MakeSkyVec's t = 1 - t): rt sits at +X with s toward -Y and the picture's
+#: top toward +Z; bk at -X (s toward +Y); lf at +Y (s toward +X); ft at -Y (s
+#: toward -X); up at +Z (s toward -Y, top toward -X); dn at -Z (s toward -Y,
+#: top toward +X) -- Quake and Blender share the Z-up right-handed frame.
+#: Every Quake face is mirrored against GL's (GL's faces are defined from
+#: outside the cube, Quake's are painted for the inside), and up / dn turn.
+CUBE_CONVENTIONS = {
+    'OPENGL': (('PX', 0, False), ('NX', 0, False), ('PY', 0, False),
+               ('NY', 0, False), ('PZ', 0, False), ('NZ', 0, False)),
+    'QUAKE2': (('PX', 0, True),      # rt: +X
+               ('NZ', 0, True),      # lf: +Y (GL -Z)
+               ('PY', 1, True),      # up: +Z (GL +Y)
+               ('NY', 3, True),      # dn: -Z (GL -Y)
+               ('NX', 0, True),      # bk: -X
+               ('PZ', 0, True)),     # ft: -Y (GL +Z)
+}
+
+#: the file-name families `cube_set_from_path` recognises, in slot order
+#: (tried in this order: the explicit forms before the bare two-letter
+#: Quake suffixes, so `sky_right.png` is never read as a Quake `ht`)
+CUBE_SUFFIX_FAMILIES = (
+    ('QUAKE2', ('_rt', '_lf', '_up', '_dn', '_bk', '_ft')),
+    ('OPENGL', ('_px', '_nx', '_py', '_ny', '_pz', '_nz')),
+    ('OPENGL', ('posx', 'negx', 'posy', 'negy', 'posz', 'negz')),
+    ('OPENGL', ('_right', '_left', '_top', '_bottom', '_front', '_back')),
+    ('QUAKE2', ('rt', 'lf', 'up', 'dn', 'bk', 'ft')),
+)
+
+_CUBE_PRINTED = set()
+_CUBE_CACHE = {}
+CUBE_CACHE_MAX = 4
+
+
+def _cube_print_once(msg):
+    """The `[Halcyon] cube map: ...` line, once per message per session
+    (gpu/sky._warn's pattern): a malformed image is not a refusal -- the
+    frame draws the flat colour -- but the console must say why."""
+    if msg not in _CUBE_PRINTED:
+        _CUBE_PRINTED.add(msg)
+        print(f'[Halcyon] cube map: {msg}')
+
+
+def cube_layout_auto(w, h):
+    """The single-image layout an image's aspect names, or None."""
+    w, h = int(w), int(h)
+    if w <= 0 or h <= 0:
+        return None
+    if w * 3 == h * 4:
+        return 'HCROSS'
+    if w * 4 == h * 3:
+        return 'VCROSS'
+    if w == 6 * h:
+        return 'HSTRIP'
+    if h == 6 * w:
+        return 'VSTRIP'
+    return None
+
+
+def _cube_world_dials(world):
+    """(convention, rot, flip) read defensively: a World from an older
+    file carries none of them."""
+    conv = str(getattr(world, 'cube_convention', 'OPENGL') or 'OPENGL').upper()
+    if conv not in CUBE_CONVENTIONS:
+        conv = 'OPENGL'
+    rot = list(getattr(world, 'cube_face_rot', None) or ())
+    rot = [int(v) % 4 for v in rot[:6]] + [0] * (6 - min(len(rot), 6))
+    flip = list(getattr(world, 'cube_face_flip', None) or ())
+    flip = [bool(v) for v in flip[:6]] + [False] * (6 - min(len(flip), 6))
+    return conv, tuple(rot), tuple(flip)
+
+
+def _cube_slots_single(world, textures):
+    """The six slot pictures cut from the packed image, or (None, why)."""
+    tex = env_texture(world, textures)
+    if tex is None:
+        return None, None, None            # no image: hdri's silent rule
+    w, h = int(tex.width), int(tex.height)
+    layout = str(getattr(world, 'cube_layout', 'AUTO') or 'AUTO').upper()
+    if layout not in CUBE_LAYOUTS:
+        lay = cube_layout_auto(w, h)
+        if lay is None:
+            return None, None, (
+                f'the image is {w}x{h}, which is not a horizontal cross '
+                '(4:3), a vertical cross (3:4) or a strip (6:1 / 1:6); '
+                'choose the layout or fix the image -- drawing the flat '
+                'World colour')
+    else:
+        lay = layout
+    cols, rows, cells = CUBE_LAYOUTS[lay]
+    S = w // cols
+    if S <= 0 or w != S * cols or h != S * rows:
+        want = f'{cols}x{rows} square cells'
+        guess = max(w // cols, h // rows, 1)
+        return None, None, (
+            f'a {lay} layout needs an image of {want} ({guess * cols}x'
+            f'{guess * rows} for {guess} px faces); the image is {w}x{h} '
+            '-- drawing the flat World colour')
+    px = np.asarray(tex.pixels, np.float32)
+    slots = []
+    for face in CUBE_FACES:
+        cell = cells[face]
+        c, r = int(cell[0]), int(cell[1])
+        turns = int(cell[2]) if len(cell) > 2 else 0
+        # ImageBuffer rows run bottom-up (compat.image_pixels): cell row r
+        # from the TOP occupies buffer rows [h - (r+1)*S, h - r*S)
+        sub = px[h - (r + 1) * S:h - r * S, c * S:(c + 1) * S]
+        if turns:
+            sub = np.rot90(sub, turns)
+        slots.append(sub)
+    return slots, (tex,), lay
+
+
+def _cube_slots_six(world, textures):
+    """The six slot pictures from the six image slots, or (None, why)."""
+    conv, _rot, _flip = _cube_world_dials(world)
+    labels = CUBE_SLOT_LABELS[conv]
+    texs, missing = [], []
+    for i, slot in enumerate(CUBE_SLOTS['OPENGL']):
+        img = getattr(world, f'cube_image_{slot}', None)
+        key = getattr(img, 'name', None) if img is not None else None
+        tex = (textures or {}).get(key) if key else None
+        if tex is None:
+            missing.append(labels[i])
+        texs.append(tex)
+    if missing:
+        return None, None, ('the six-image mode needs every slot filled; '
+                            f'empty: {", ".join(missing)} -- drawing the '
+                            'flat World colour')
+    sizes = sorted({(int(t.width), int(t.height)) for t in texs})
+    if len(sizes) != 1 or sizes[0][0] != sizes[0][1]:
+        return None, None, ('the six faces must be square and all of one '
+                            'size; found ' + ', '.join(f'{a}x{b}' for a, b in sizes)
+                            + ' -- drawing the flat World colour')
+    return [np.asarray(t.pixels, np.float32) for t in texs], tuple(texs), 'SIX'
+
+
+def cube_atlas(world, textures):
+    """The world's six faces as ONE sampling-ready Texture of shape
+    (6*S, S, 4): face f (GL order) at rows [f*S, (f+1)*S), every face in the
+    canonical GL orientation. None without an image (the caller draws the
+    flat colour, hdri's rule) or with a malformed one (printed once, by
+    size). Cached by source identity, shape, prep tag and every dial
+    (CUBE_CACHE_MAX entries; a hit re-checks the source arrays by
+    identity, so a recycled id can never serve a stale atlas)."""
+    src = str(getattr(world, 'cube_source', 'SINGLE') or 'SINGLE').upper()
+    conv, rot, flip = _cube_world_dials(world)
+    if src == 'SIX':
+        slots, sources, lay = _cube_slots_six(world, textures)
+    else:
+        slots, sources, lay = _cube_slots_single(world, textures)
+    if slots is None:
+        if lay:
+            _cube_print_once(lay)
+        return None
+    key = (src, conv, lay, rot, flip,
+           tuple((str(getattr(t, 'name', '')), id(t.pixels),
+                  tuple(int(v) for v in np.shape(t.pixels)),
+                  getattr(t, 'prep', None)) for t in sources))
+    hit = _CUBE_CACHE.get(key)
+    if hit is not None:
+        held, atlas = hit
+        if len(held) == len(sources) and \
+                all(a.pixels is b.pixels for a, b in zip(held, sources)):
+            return atlas
+    S = int(slots[0].shape[0])
+    atlas = np.zeros((6 * S, S, 4), np.float32)
+    atlas[:, :, 3] = 1.0
+    for i, pic in enumerate(slots):
+        gl_face, turns, mirror = CUBE_CONVENTIONS[conv][i]
+        # the convention's permutation, then the user's: rot90 then fliplr,
+        # exact texel moves (no arithmetic, so the twin stays bitwise)
+        if turns:
+            pic = np.rot90(pic, turns)
+        if mirror:
+            pic = np.fliplr(pic)
+        if rot[i]:
+            pic = np.rot90(pic, rot[i])
+        if flip[i]:
+            pic = np.fliplr(pic)
+        f = CUBE_FACES.index(gl_face)
+        atlas[f * S:(f + 1) * S, :, :pic.shape[2]] = pic
+    from .texture import Texture
+    names = '+'.join(str(getattr(t, 'name', '')) for t in sources)
+    rots = ''.join(str(v) for v in rot)
+    flips = ''.join('1' if v else '0' for v in flip)
+    tex = Texture(atlas, name=f'cube:{conv}:{lay}:{names}:{rots}:{flips}',
+                  colorspace='Non-Color', wrap='EXTEND', filt='NEAREST')
+    tex.prep = tuple(getattr(t, 'prep', None) for t in sources)
+    while len(_CUBE_CACHE) >= CUBE_CACHE_MAX:
+        _CUBE_CACHE.pop(next(iter(_CUBE_CACHE)))
+    _CUBE_CACHE[key] = (sources, tex)
+    return tex
+
+
+def cube_face_uv(dirs):
+    """(face int64, u float32, v float32) for unit directions (N, 3) in
+    Blender axes: the OpenGL 4.6 table 8.19 rule on gl = (x, z, -y), ties
+    X over Y over Z (gpu/sky.hal_sky_sample_cube's order, op for op in
+    float32), u along GL's s and v = 1 - t (GL's t runs down the image;
+    the atlas rows run up)."""
+    d = np.asarray(dirs, np.float32)
+    gx, gy, gz = d[:, 0], d[:, 2], -d[:, 1]
+    ax, ay, az = np.abs(gx), np.abs(gy), np.abs(gz)
+    isx = (ax >= ay) & (ax >= az)
+    isy = ~isx & (ay >= az)
+    face = np.where(isx, np.where(gx >= 0.0, 0, 1),
+                    np.where(isy, np.where(gy >= 0.0, 2, 3),
+                             np.where(gz >= 0.0, 4, 5))).astype(np.int64)
+    ma = np.where(isx, ax, np.where(isy, ay, az)).astype(np.float32)
+    sel = [face == k for k in range(6)]
+    sc = np.select(sel, [-gz, gz, gx, gx, gx, -gx]).astype(np.float32)
+    tc = np.select(sel, [-gy, -gy, gz, -gz, -gy, -gy]).astype(np.float32)
+    half = np.float32(0.5)
+    u = ((sc / ma) * half + half).astype(np.float32)
+    v = (half - (tc / ma) * half).astype(np.float32)
+    return face, u, v
+
+
+def cube_sample(atlas_px, face, u, v, filt='NEAREST'):
+    """Texture._sample_nearest / _sample_bilinear (core/texture.py) on the
+    (6S, S, 4) atlas with every tap clamped to [0, S-1] inside the face
+    and offset by face * S -- the seam law. Returns (N, 4) float32."""
+    px = np.asarray(atlas_px, np.float32)
+    S = int(px.shape[1])
+    S32 = np.float32(S)
+    y0f = np.asarray(face, np.int64) * S
+    u = np.asarray(u, np.float32)
+    v = np.asarray(v, np.float32)
+    if filt == 'NEAREST':
+        x = np.clip(np.floor(u * S32), 0, S - 1).astype(np.int64)
+        y = np.clip(np.floor(v * S32), 0, S - 1).astype(np.int64)
+        return px[y0f + y, x]
+    half = np.float32(0.5)
+    fx = (u * S32 - half).astype(np.float32)
+    fy = (v * S32 - half).astype(np.float32)
+    x0 = np.floor(fx)
+    y0 = np.floor(fy)
+    tx = (fx - x0).astype(np.float32)[:, None]
+    ty = (fy - y0).astype(np.float32)[:, None]
+    ix0 = np.clip(x0, 0, S - 1).astype(np.int64)
+    ix1 = np.clip(x0 + 1, 0, S - 1).astype(np.int64)
+    iy0 = np.clip(y0, 0, S - 1).astype(np.int64)
+    iy1 = np.clip(y0 + 1, 0, S - 1).astype(np.int64)
+    c00 = px[y0f + iy0, ix0]
+    c10 = px[y0f + iy0, ix1]
+    c01 = px[y0f + iy1, ix0]
+    c11 = px[y0f + iy1, ix1]
+    top = c00 + (c10 - c00) * tx
+    bot = c01 + (c11 - c01) * tx
+    return (top + (bot - top) * ty).astype(np.float32)
+
+
+def cubemap(world, dirs, textures):
+    """The skybox along `dirs`: the atlas texel times env_tint, exactly as
+    `hdri()` tints; the solid colour without an atlas (hdri's rule)."""
+    atlas = cube_atlas(world, textures)
+    if atlas is None:
+        return solid(world, dirs)
+    face, u, v = cube_face_uv(dirs)
+    filt = 'NEAREST' if str(getattr(world, 'cube_filter', 'NEAREST')) == \
+        'NEAREST' else 'BILINEAR'
+    col = cube_sample(atlas.pixels, face, u, v, filt)[:, :3]
+    tint = np.asarray(getattr(world, 'env_tint', (1.0, 1.0, 1.0)),
+                      np.float32)[None, :]
+    return (col * tint).astype(np.float32)
+
+
+def cube_set_from_path(path):
+    """One face file of a skybox set -> (convention, {slot: path}) for the
+    six positional slots, or (None, reason). Pure string work (bpy-free):
+    the operator checks which of the six exist. Recognised: Quake 2 /
+    Half-Life `<name>rt` .. `ft` with or without an underscore, `_px` ..
+    `_nz`, `posx` .. `negz`, `_right/_left/_top/_bottom/_front/_back`."""
+    import os
+    path = str(path or '')
+    folder, name = os.path.split(path)
+    stem, ext = os.path.splitext(name)
+    if not stem:
+        return None, 'no file name'
+    low = stem.lower()
+    for conv, suffixes in CUBE_SUFFIX_FAMILIES:
+        for k, suf in enumerate(suffixes):
+            if not low.endswith(suf):
+                continue
+            prefix = stem[:len(stem) - len(suf)]
+            orig = stem[len(stem) - len(suf):]
+            out = {}
+            for slot, s in zip(CUBE_SLOTS['OPENGL'], suffixes):
+                # the set keeps the file's own case: RT, Right, rt
+                letters = s.lstrip('_')
+                lead = s[:len(s) - len(letters)]
+                if orig.isupper():
+                    s2 = s.upper()
+                elif orig.lstrip('_')[:1].isupper():
+                    s2 = lead + letters.capitalize()
+                else:
+                    s2 = s
+                out[slot] = os.path.join(folder, prefix + s2 + ext)
+            return conv, out
+    return None, (f"'{name}' carries no skybox face suffix (rt/lf/up/dn/bk/ft, "
+                  "_px.._nz, posx..negz or _right.._back)")
+
+
 def env_texture(world, textures):
     """The texture the CPU samples for the world's env image: the
     image's own name in `textures`, else the exporter's `world_env`
@@ -1720,6 +2082,10 @@ def evaluate(world, dirs, textures=None, strength=True, eye=None,
         col = solid(world, dirs)
     elif mode == 'LW_GRADIENT':
         col = lw_gradient(world, dirs)
+    elif mode == 'CUBEMAP':
+        # R253: an environment like HDRI -- reflections and ray misses
+        # see the cube texel along any direction (unlike CYLINDER)
+        col = cubemap(world, dirs, textures or {})
     else:
         return None                      # caller falls back to the node graph
     if strength:

@@ -586,7 +586,8 @@ def _env_world(job):
             spec['soft'] = float(np.clip(getattr(world, 'band_softness',
                                                  0.0), 0.0, 1.0))
         return ('SKY_BANDS' if mode == 'BANDS' else 'SKY_GRAD', spec), None
-    if mode in ('STARFIELD', 'BRYCE', 'PHYSICAL', 'HDRI', 'PAINTED'):
+    if mode in ('STARFIELD', 'BRYCE', 'PHYSICAL', 'HDRI', 'PAINTED',
+                'CUBEMAP'):          # R253: the skybox is an environment
         # rich skies take the CPU-composite path: the env term is the
         # LAST rgb term the CPU adds (fog frames refuse), and every
         # pixel it applies to is CPU-known -- so the renderer evaluates

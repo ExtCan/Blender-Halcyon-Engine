@@ -52,6 +52,22 @@ sky colour: per-row 8.8 registers (`hal_sky_m7rows`, per frame) over
 the palettised 1024x1024 map (`hal_sky_m7map`, cached by content),
 integer multiply / add / shift / mask only. All three are bitwise
 the CPU by construction: tables and map are CPU bytes.
+
+R253 (cubemap-world): CUBEMAP, the 1990s skybox, is one more direction
+mode (MODE_CUBE = 9) on the HDRI pattern: `core/sky.cube_atlas` builds
+the six faces as ONE (6S x S) atlas in GL face order, already turned
+into the canonical GL orientation on the CPU, and it rides the existing
+`hal_sky_env` sampler (no new sampler, no new push constant; one PARAMS
+texel `hal_sky_cube` = (S, filter, 0)). `hal_sky_sample_cube` is the
+op-for-op transcription of `sky.cube_face_uv` + `sky.cube_sample`: the
+OpenGL 4.6 table 8.19 face rule on the Z-up direction swapped to GL
+axes, then exactly `hal_sky_sample_env`'s nearest / bilinear arithmetic
+with every tap clamped to the face's own texels (the seam law: a tap
+never leaves its face). Bitwise in the simulator; on the driver a ray
+an ulp off can flip a nearest-texel cliff whole (HDRI's stance). The
+plan refuses by name when 6 * S would exceed the driver's texture
+height; a missing or malformed image folds to the flat colour x
+strength exactly as HDRI's plan does.
 """
 
 import re
@@ -69,8 +85,15 @@ MODE_BANDS = 5         # sky.bands (then strength)
 MODE_HDRI = 6          # sky.hdri (tint, then strength)
 MODE_CYL = 7           # R251 C056: sky.cylinder_pixels (the tables, then strength)
 MODE_LWGRAD = 8        # R251 C100: sky.lw_gradient (then strength)
+MODE_CUBE = 9          # R253: sky.cubemap (the atlas, tint, then strength)
 
 M7_OVER = {'WRAP': 0, 'TRANSPARENT': 1, 'TILE0': 2}   # World.mode7_over (M7SEL)
+
+#: R253: the tallest atlas the plan will hand the driver (6 * S rows). The
+#: GL_MAX_TEXTURE_SIZE floor of every card the field runs is 16384; a
+#: taller atlas is refused BY NAME at plan time (the CPU draws the sky),
+#: never left to a failed upload
+CUBE_ATLAS_MAX_HEIGHT = 16384
 
 BLEND_CODES = {'LINEAR': 0, 'SMOOTH': 1, 'SHARP': 2, 'EASE': 3}
 
@@ -118,6 +141,8 @@ PARAMS = [
     # ---- R251 LIGHT-A2 (F009): POV ground fog on a miss ray
     ('hal_sky_gfog', 'v3'),      # (alt*(pi/2 - atan(y1)) float32, density, on)
     ('hal_sky_gfcol', 'v3'),     # the fog colour x fog ambient
+    # ---- R253 cube map (appended at the END: PARAM_INDEX is positional)
+    ('hal_sky_cube', 'v3'),      # (S, filt 0 NEAREST / 1 BILINEAR, 0); read under mode 9 only
 ]
 PARAM_INDEX = {name: i for i, (name, _k) in enumerate(PARAMS)}
 
@@ -315,6 +340,62 @@ vec3 hal_sky_sample_env(vec3 d, int filt)
     return top + (bot - top) * ty;
 }
 
+// R253: sky.cube_face_uv + sky.cube_sample -- the OpenGL 4.6 table 8.19
+// face rule on the Z-up direction swapped to GL axes (gx, gy, gz) =
+// (d.x, d.z, -d.y), the same tie order (X over Y over Z), then exactly
+// hal_sky_sample_env's nearest / bilinear arithmetic with every tap
+// clamped to the face's own S texels at atlas rows [face*S, face*S+S):
+// a tap never leaves its face (the seam law on both roads)
+vec3 hal_sky_sample_cube(vec3 d, int filt)
+{
+    float S = hal_sky_cube().x;
+    float gx = d.x;
+    float gy = d.z;
+    float gz = -d.y;
+    float ax = abs(gx);
+    float ay = abs(gy);
+    float az = abs(gz);
+    int face;
+    float ma;
+    float sc;
+    float tc;
+    if (ax >= ay && ax >= az) {
+        ma = ax;
+        if (gx >= 0.0) { face = 0; sc = -gz; tc = -gy; } else { face = 1; sc = gz; tc = -gy; }
+    } else if (ay >= az) {
+        ma = ay;
+        if (gy >= 0.0) { face = 2; sc = gx; tc = gz; } else { face = 3; sc = gx; tc = -gz; }
+    } else {
+        ma = az;
+        if (gz >= 0.0) { face = 4; sc = gx; tc = -gy; } else { face = 5; sc = -gx; tc = -gy; }
+    }
+    float u = (sc / ma) * 0.5 + 0.5;
+    float v = 0.5 - (tc / ma) * 0.5;      // GL's t runs down; the atlas rows run up
+    int y0f = face * int(S);
+    if (filt == 0) {
+        int x = int(clamp(floor(u * S), 0.0, S - 1.0));
+        int y = int(clamp(floor(v * S), 0.0, S - 1.0));
+        return hal_sky_fetch(x, y0f + y).rgb;
+    }
+    float fx = u * S - 0.5;
+    float fy = v * S - 0.5;
+    float x0 = floor(fx);
+    float y0 = floor(fy);
+    float tx = fx - x0;
+    float ty = fy - y0;
+    int ix0 = int(clamp(x0, 0.0, S - 1.0));
+    int ix1 = int(clamp(x0 + 1.0, 0.0, S - 1.0));
+    int iy0 = int(clamp(y0, 0.0, S - 1.0));
+    int iy1 = int(clamp(y0 + 1.0, 0.0, S - 1.0));
+    vec3 c00 = hal_sky_fetch(ix0, y0f + iy0).rgb;
+    vec3 c10 = hal_sky_fetch(ix1, y0f + iy0).rgb;
+    vec3 c01 = hal_sky_fetch(ix0, y0f + iy1).rgb;
+    vec3 c11 = hal_sky_fetch(ix1, y0f + iy1).rgb;
+    vec3 top = c00 + (c10 - c00) * tx;
+    vec3 bot = c01 + (c11 - c01) * tx;
+    return top + (bot - top) * ty;
+}
+
 void main()
 {
     vec2 size = hal_sky_size();
@@ -387,6 +468,9 @@ void main()
                 float t = 1.0 - q;
                 col = hal_sky_lw_gnd() + (hal_sky_lw_nad() - hal_sky_lw_gnd()) * t;
             }
+        } else if (hal_sky_mode == 9) {
+            // R253: sky.cubemap -- the atlas texel, then the tint as hdri()
+            col = hal_sky_sample_cube(d, int(hal_sky_cube().y)) * hal_sky_tint();
         }
         col = col * hal_sky_strength();
     }
@@ -514,7 +598,7 @@ def refusal(scene, st):
                  'STARFIELD': 'the starfield', 'PHYSICAL': 'the physical sky'}
         return f'{names[mode]} is evaluated on the CPU'
     if mode not in ('NODES', 'SOLID', 'GRADIENT', 'BANDS', 'HDRI',
-                    'CYLINDER', 'LW_GRADIENT'):
+                    'CYLINDER', 'LW_GRADIENT', 'CUBEMAP'):   # R253: CUBEMAP
         return f"sky mode '{mode}' has no GPU pass"
     if getattr(world, 'ground_plane', False) and \
             str(getattr(world, 'ground_mode', 'SOLID')) != 'MODE7':
@@ -602,7 +686,14 @@ def plan(scene, st, width, height, vp, eye, textures=None, ss=1):
         else:
             rot = float(getattr(world, 'rotation', 0.0))
             if abs(rot) > 1e-6:
-                vals['hal_sky_rot'] = (_f32(np.cos(rot)), _f32(np.sin(rot)), 1.0)
+                # R253 (pre-existing, found by the cube map's twin): the
+                # texel must carry sky._rotate_z's OWN (c, s) for the angle
+                # -rotation -- the shader's `x*c - y*s, x*s + y*c` is that
+                # function's text, and with (cos(rot), sin(rot)) it spun the
+                # sky the other way: every GPU HDRI pixel under a non-zero
+                # Rotation had differed from the CPU's since 1.89.0 (no
+                # direction mode had been twinned with a rotation)
+                vals['hal_sky_rot'] = (_f32(np.cos(-rot)), _f32(np.sin(-rot)), 1.0)
             else:
                 vals['hal_sky_rot'] = (1.0, 0.0, 0.0)
             vals['hal_sky_strength'] = strength
@@ -686,6 +777,33 @@ def plan(scene, st, width, height, vp, eye, textures=None, ss=1):
                     world, 'lw_sky_squeeze', 2)), 1, 20))
                 vals['hal_sky_lw_sqg'] = int(np.clip(int(getattr(
                     world, 'lw_ground_squeeze', 2)), 1, 20))
+            elif wmode == 'CUBEMAP':
+                # R253: the six faces as ONE atlas on the env sampler (the
+                # CPU's own bytes: sky.cube_atlas builds and caches it for
+                # both roads); no image, or a malformed one, folds to the
+                # solid colour then strength -- hdri's rule, bitwise
+                from ..core import sky as SKY
+                atlas = SKY.cube_atlas(world, textures)
+                if atlas is None:
+                    c = np.asarray(world.color, np.float32) * np.float32(strength)
+                    vals['hal_sky_color'] = tuple(float(v) for v in c)
+                    vals['hal_sky_strength'] = 1.0
+                else:
+                    S = int(atlas.width)
+                    if 6 * S > CUBE_ATLAS_MAX_HEIGHT:
+                        # a refusal by name: render._warn prints it once and
+                        # the CPU draws the sky as before
+                        return None, (f'the cube map faces are {S} px; the '
+                                      'six-face atlas would exceed the '
+                                      "driver's texture height")
+                    mode = MODE_CUBE
+                    env = atlas
+                    filt = 0.0 if str(getattr(world, 'cube_filter',
+                                              'NEAREST')) == 'NEAREST' else 1.0
+                    vals['hal_sky_cube'] = (float(S), filt, 0.0)
+                    vals['hal_sky_tint'] = tuple(float(np.float32(v)) for v in
+                                                 getattr(world, 'env_tint',
+                                                         (1.0, 1.0, 1.0)))
     # R251 C048: the Mode 7 floor, a second stage of the same draw over
     # any sky mode drawn here; without a map the CPU draws nothing either
     vals['hal_sky_m7'] = 0

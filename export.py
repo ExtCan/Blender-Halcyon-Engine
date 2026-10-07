@@ -1941,6 +1941,23 @@ def _collect_extra_halos(depsgraph, mat_lookup, materials, images,
                 continue
 
 
+def _world_image(hs, attr, images):
+    """R253: one world-side image slot as the exporter carries
+    env_image: the datablock's pixels into `images[name_full]` once
+    (Linear) and the ImageBuffer back, or None without a datablock or
+    its pixels."""
+    img = getattr(hs, attr, None)
+    if img is None:
+        return None
+    key = img.name_full
+    if key not in images:
+        px = compat.image_pixels(img)
+        if px is not None:
+            images[key] = ImageBuffer(name=key, pixels=px,
+                                      colorspace='Linear')
+    return images.get(key)
+
+
 def export_scene(depsgraph, settings, warnings=None):
     """Evaluated depsgraph -> Scene."""
     import time as _time
@@ -2337,7 +2354,11 @@ def export_scene(depsgraph, settings, warnings=None):
             for f in _dc.fields(World):
                 if f.name in ('graph', 'env_image', 'mist', 'mist_start',
                               'mist_depth', 'mist_color', 'mist_falloff',
-                              'mist_intensity', 'ground_image'):
+                              'mist_intensity', 'ground_image',
+                              # R253: the six cube-map slots (loaded below)
+                              'cube_image_px', 'cube_image_nx',
+                              'cube_image_py', 'cube_image_ny',
+                              'cube_image_pz', 'cube_image_nz'):
                     continue
                 if hasattr(hs, f.name):
                     v = getattr(hs, f.name)
@@ -2362,6 +2383,12 @@ def export_scene(depsgraph, settings, warnings=None):
                         images[key] = ImageBuffer(name=key, pixels=px,
                                                   colorspace='Linear')
                 world.ground_image = images.get(key)
+            # R253: the six cube-map face slots -- the env_image road six
+            # times (Linear, like env_image: the sky is not a colour-managed
+            # albedo), each on the World by the slot's own name
+            for _slot in ('px', 'nx', 'py', 'ny', 'pz', 'nz'):
+                setattr(world, f'cube_image_{_slot}',
+                        _world_image(hs, f'cube_image_{_slot}', images))
             # R251 C038: the rear-plane depth bitmap -- the red channel of
             # a float Z pass in Non-Color space (an 8-bit or colour-managed
             # image is not a distance)

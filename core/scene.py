@@ -336,6 +336,23 @@ class World:
     lw_nadir: tuple = (0.392156863, 0.31372549, 0.235294118)
     lw_sky_squeeze: int = 2
     lw_ground_squeeze: int = 2
+    # ------------------------------------------------ R253 cube map
+    # The 1990s skybox (CUBEMAP): six square faces from one packed cross /
+    # strip image (which rides env_image, as CYLINDER's does) or from six
+    # image slots named the OpenGL or the Quake 2 / Half-Life way. Every
+    # default is neutral: no mode reads these unless mode == 'CUBEMAP'.
+    cube_source: str = 'SINGLE'          # SINGLE | SIX
+    cube_layout: str = 'AUTO'            # AUTO | HCROSS | VCROSS | HSTRIP | VSTRIP
+    cube_convention: str = 'OPENGL'      # OPENGL | QUAKE2 (sky.CUBE_CONVENTIONS)
+    cube_filter: str = 'NEAREST'         # NEAREST | BILINEAR, never across a seam
+    cube_face_rot: tuple = (0, 0, 0, 0, 0, 0)       # quarter turns per slot, 0..3
+    cube_face_flip: tuple = (False, False, False, False, False, False)
+    cube_image_px: Optional[ImageBuffer] = None     # the six slots, positional:
+    cube_image_nx: Optional[ImageBuffer] = None     # OpenGL +X -X +Y -Y +Z -Z or
+    cube_image_py: Optional[ImageBuffer] = None     # Quake rt lf up dn bk ft
+    cube_image_ny: Optional[ImageBuffer] = None
+    cube_image_pz: Optional[ImageBuffer] = None
+    cube_image_nz: Optional[ImageBuffer] = None
     # ------------------------------------------------ Bryce's Sky Lab
     # Bryce's Sky & Fog palette offered a Sky Mode: Soft Sky drove the dome
     # from the sun's own colour, Custom Sky exposed the three stops directly.
