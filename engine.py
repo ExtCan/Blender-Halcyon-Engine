@@ -188,9 +188,14 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
         # used to print wire=ALL on every render, engaged or not, while
         # the field hunted a faint wireframe the overlay itself was drawing
         wire = settings.wire_mode if settings.render_wire else 'OFF'
+        # R253: Blender's render border (Ctrl+B / Output > Format > Render
+        # Region), in OUTPUT pixels -- None for a whole frame
+        _rb = _border_rect(bscene, tw, th) if not preview else None
         print(f"[Halcyon] {version_string()} rendering "
               f"{tw}x{th}  pass={settings.debug_pass}"
-              f"  wire={wire}")
+              f"  wire={wire}"
+              + (f"  region x{_rb[0]}..{_rb[2]} y{_rb[1]}..{_rb[3]} "
+                 f"of {tw}x{th}" if _rb is not None else ""))
         # the display truth, every render: if Blender is still regrading
         # (the pin refused, or something re-set it between the pin and
         # now), the console says so INSTEAD of the picture silently
@@ -575,9 +580,38 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
         finally:
             _release_gpu_frame(settings)
 
+        _extra = getattr(scene, 'last_passes', None)
+        _size = None
+        if _rb is not None:
+            # R253: the crop happens LAST -- the post chain ran over the
+            # full-frame canvas (zeros outside the rect) so every pattern
+            # stage kept the frame's origin; Blender's result under
+            # use_border is border-sized, and begin_result(0, 0, bw, bh)
+            # is its contract (render_result_uncrop places it in the
+            # full frame when Crop to Render Region is off)
+            x0, y0, x1, y1 = _rb
+            try:
+                final = np.asarray(final, np.float32)
+                if final.shape[0] != th or final.shape[1] != tw:
+                    final = post.fit_to(final, (tw, th))
+                final = np.ascontiguousarray(final[y0:y1, x0:x1])
+                if _extra:
+                    _cut = {}
+                    for _nm, _buf in _extra.items():
+                        _a = np.asarray(_buf, np.float32)
+                        if _a.ndim == 3 and (_a.shape[0] != th
+                                             or _a.shape[1] != tw):
+                            _a = post.fit_to(_a, (tw, th))
+                        _cut[_nm] = np.ascontiguousarray(_a[y0:y1, x0:x1]) \
+                            if _a.ndim == 3 else _a
+                    _extra = _cut
+                _size = (x1 - x0, y1 - y0)
+            except Exception:                                   # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                _size = None
         with ST.track('deliver to Blender'):
-            self._deliver(final, bscene,
-                          getattr(scene, 'last_passes', None))
+            self._deliver(final, bscene, _extra, size=_size)
 
         # reporting during a preview render pushes UI work onto the preview
         # thread for a thumbnail nobody is reading
@@ -735,15 +769,23 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
         pct = max(r.resolution_percentage, 1) / 100.0
         return max(int(r.resolution_x * pct), 1), max(int(r.resolution_y * pct), 1)
 
-    def _deliver(self, final, bscene, extra=None):
+    def _deliver(self, final, bscene, extra=None, size=None):
         """Hand the finished image back through the render result.
 
         The buffer size is dictated by Blender, never by the image: writing more
         floats than `rect` holds overruns a C buffer and takes the process down
         with it. Post can legitimately resize (Pixel Scale, pixel aspect), so the
         result is fitted to the allocated size before a single value is written.
+
+        R253: `size=(bw, bh)` is the render border's size -- the result
+        Blender allocates under scene.render.use_border is border-sized
+        (RE_InitState keeps winx, rectx = the border), and begin_result's
+        own clamp plus the len(rect) guard below keep a wrong guess from
+        ever overrunning it.
         """
         w, h = self._target_size(bscene)
+        if size is not None:
+            w, h = max(int(size[0]), 1), max(int(size[1]), 1)
         final = np.asarray(final, np.float32)
         if final.ndim != 3 or final.shape[2] not in (3, 4):
             return
@@ -760,9 +802,27 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
 
         result = self.begin_result(0, 0, w, h)
         try:
+            layer = result.layers[0].passes["Combined"]
+            if size is not None:
+                # R253: the guard -- Blender's rect is the truth; if it
+                # disagrees with the border size, say both and fit to
+                # what it holds rather than scramble a resize
+                try:
+                    _have = int(len(layer.rect))
+                except Exception:                               # noqa: BLE001
+                    _have = -1
+                if _have > 0 and _have != w * h * 4 and _have != w * h:
+                    _px = _have // 4 if _have % 4 == 0 else _have
+                    print(f'[Halcyon] render region: Blender allocated '
+                          f'{_px} pixels for the result, the border is '
+                          f'{w}x{h}={w * h}; the picture is fitted to the '
+                          'allocation')
+                    _tw, _th = self._target_size(bscene)
+                    if _px == _tw * _th:
+                        w, h = _tw, _th
+                        final = post.fit_to(final, (w, h))
             if extra:
                 self._deliver_passes(result, extra, w, h)
-            layer = result.layers[0].passes["Combined"]
             # Both buffers are bottom-row-first: the rasteriser maps NDC y = -1
             # to row 0, and Blender's rect expects the bottom row first.
             # ONE flat float32 buffer: foreach_set's single-memcpy fast
@@ -880,7 +940,17 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             vp.draw_placeholder(depsgraph)
             return
 
-        vp.want(_view_camera(context), w, h)
+        # R253: the render rect (camera frame / Blender's border) joins
+        # the wanted view; a failure here is a whole-region frame, never
+        # a blank viewport
+        try:
+            _rect = _view_rect(context, depsgraph.scene, vp.settings)
+        except Exception:                                       # noqa: BLE001
+            import traceback
+            vp.complain('the viewport render rect failed',
+                        traceback.format_exc())
+            _rect = None
+        vp.want(_view_camera(context), w, h, rect=_rect)
         vp.kick(self)
 
         if vp.frame is None:
@@ -888,8 +958,22 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             return
         try:
             tex = vp.texture(gpu)
+            with vp.lock:
+                _frect = vp.frame_rect
+            if _frect is not None:
+                # camera-frame mode: the parked frame is the rect's own
+                # size -- clear the region to the placeholder colour
+                # first, then blit at the rect's place
+                vp.clear_region(depsgraph)
+                _bx = int(round(float(_frect[0]) * w))
+                _by = int(round(float(_frect[1]) * h))
+                _bw = max(int(round(float(_frect[2]) * w)) - _bx, 1)
+                _bh = max(int(round(float(_frect[3]) * h)) - _by, 1)
+            else:
+                _bx = _by = 0
+                _bw, _bh = w, h
             self.bind_display_space_shader(depsgraph.scene)
-            _draw_texture(tex, w, h)
+            _draw_texture(tex, _bw, _bh, _bx, _by)
             self.unbind_display_space_shader()
             # the redraw completed: advance the screen grave's clock --
             # the ONLY thing that retires replaced blit textures and
@@ -1158,6 +1242,20 @@ def _settings_from_scene(bscene, target_w, target_h, preview=False):
     # wins when it is on; the Halcyon toggle can also enable it independently.
     if getattr(bscene.render, 'film_transparent', False):
         st.film_transparent = True
+    # R253: Blender's render border (Ctrl+B in camera view / Output >
+    # Format > Render Region) rides the same derived road: the five
+    # fields are scene.render's own, never a Halcyon property. Preview
+    # thumbnails ignore it (a material ball has no border)
+    st.use_border = False
+    if not preview and bool(getattr(bscene.render, 'use_border', False)):
+        try:
+            st.border_min_x = float(bscene.render.border_min_x)
+            st.border_min_y = float(bscene.render.border_min_y)
+            st.border_max_x = float(bscene.render.border_max_x)
+            st.border_max_y = float(bscene.render.border_max_y)
+            st.use_border = True
+        except (AttributeError, TypeError, ValueError):
+            st.use_border = False
     n = SCALE_FACTOR.get(str(st.output_scale), 1)
     if str(st.output_scale) == 'GBA_MODE5':
         # R251: the Mode 5 bitmap the LCD reads through PA / PD
@@ -1190,6 +1288,100 @@ def _settings_from_scene(bscene, target_w, target_h, preview=False):
         st.resolution_x = min(max(int(target_w), 1), 256)
         st.resolution_y = min(max(int(target_h), 1), 256)
     return st
+
+
+def _border_rect(bscene, tw, th):
+    """R253: Blender's render border at OUTPUT size, (x0, y0, x1, y1), or
+    None when scene.render.use_border is off or the rect is the whole
+    frame. Takes the scene or its `render` struct. The rounding is the
+    pipeline's own (render_init_from_main: disprect = border * winx,
+    truncated) on both edges -- the region the engine CROPS to; the
+    render rect core/render.region_pixels builds from the same fractions
+    ceils its max edge, so the render is always a superset of this."""
+    r = getattr(bscene, 'render', bscene)
+    if not bool(getattr(r, 'use_border', False)):
+        return None
+    tw, th = max(int(tw), 1), max(int(th), 1)
+    try:
+        x0 = int(float(r.border_min_x) * tw)
+        y0 = int(float(r.border_min_y) * th)
+        x1 = int(float(r.border_max_x) * tw)
+        y1 = int(float(r.border_max_y) * th)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    x0, y0 = min(max(x0, 0), tw - 1), min(max(y0, 0), th - 1)
+    x1, y1 = min(max(x1, x0 + 1), tw), min(max(y1, y0 + 1), th)
+    if (x0, y0, x1, y1) == (0, 0, tw, th):
+        return None
+    return (x0, y0, x1, y1)
+
+
+def _view_rect(context, bscene, settings):
+    """R253: the viewport's render rect as FRACTIONS of the region, or
+    None -- `preview.region_rect(w, h, frame, border)` over:
+
+    * the CAMERA FRAME, in camera view, when the Performance panel's
+      Camera Frame Only is on: the camera's view_frame corners projected
+      through view3d_utils onto the region (min / max of the four);
+    * the BORDER: in camera view Blender's scene border (Ctrl+B writes
+      scene.render.border_* there) mapped INTO the frame rect, the
+      Cycles rule (BlenderSync::get_buffer_params); in a free view the
+      space's own render border (space_data.use_render_border).
+    """
+    rv3d = getattr(context, 'region_data', None)
+    region = getattr(context, 'region', None)
+    if rv3d is None or region is None:
+        return None
+    w = max(int(getattr(region, 'width', 0) or 0), 4)
+    h = max(int(getattr(region, 'height', 0) or 0), 4)
+    in_camera = str(getattr(rv3d, 'view_perspective', '')) == 'CAMERA'
+    frame = None
+    border = None
+    cam = getattr(bscene, 'camera', None)
+    if in_camera and cam is not None:
+        frame_rect = None
+        try:
+            from bpy_extras import view3d_utils as _v3u
+            corners = cam.data.view_frame(scene=bscene)
+            mw = cam.matrix_world
+            pts = []
+            for p in corners:
+                q = _v3u.location_3d_to_region_2d(region, rv3d, mw @ p)
+                if q is None:
+                    pts = []
+                    break
+                pts.append((float(q[0]), float(q[1])))
+            if pts:
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                frame_rect = (min(xs) / w, min(ys) / h,
+                              max(xs) / w, max(ys) / h)
+        except Exception:                                       # noqa: BLE001
+            frame_rect = None
+        if bool(getattr(settings, 'viewport_camera_frame', False)):
+            frame = frame_rect
+        r = getattr(bscene, 'render', None)
+        if r is not None and bool(getattr(r, 'use_border', False)):
+            try:
+                from .preview import border_in_frame
+                border = border_in_frame(
+                    frame_rect, (float(r.border_min_x), float(r.border_min_y),
+                                 float(r.border_max_x), float(r.border_max_y)))
+            except (AttributeError, TypeError, ValueError):
+                border = None
+    else:
+        space = getattr(context, 'space_data', None)
+        if space is not None and bool(getattr(space, 'use_render_border',
+                                              False)):
+            try:
+                border = (float(space.render_border_min_x),
+                          float(space.render_border_min_y),
+                          float(space.render_border_max_x),
+                          float(space.render_border_max_y))
+            except (AttributeError, TypeError, ValueError):
+                border = None
+    from .preview import region_rect
+    return region_rect(w, h, frame, border)
 
 
 def _viewport_settings(bscene, w, h):
@@ -1237,8 +1429,10 @@ def _view_camera(context):
 _BLIT = {'batches': {}}
 
 
-def _draw_texture(tex, w, h):
-    """Blit a texture over the region.
+def _draw_texture(tex, w, h, x=0, y=0):
+    """Blit a texture over the region (R253: or at (x, y) with size
+    (w, h) inside it -- the camera-frame rect; batches key on all four,
+    the same session-long doctrine).
 
     The template idiom, with two amendments: TRI_STRIP instead of the
     deprecated TRI_FAN `draw_texture_2d` still carries (the fan leaves in
@@ -1250,11 +1444,13 @@ def _draw_texture(tex, w, h):
     from gpu_extras.batch import batch_for_shader
     shader = gpu.shader.from_builtin('IMAGE')
     batches = _BLIT['batches']
-    batch = batches.get((w, h))
+    x, y = int(x), int(y)
+    key = (w, h) if (x == 0 and y == 0) else (x, y, w, h)
+    batch = batches.get(key)
     if batch is None:
         batch = batch_for_shader(
             shader, 'TRI_STRIP',
-            {'pos': ((0, 0), (w, 0), (0, h), (w, h)),
+            {'pos': ((x, y), (x + w, y), (x, y + h), (x + w, y + h)),
              'texCoord': ((0, 0), (1, 0), (0, 1), (1, 1))})
         if len(batches) >= 16:
             # a continuously resized viewport: the eldest sizes park in
@@ -1263,7 +1459,7 @@ def _draw_texture(tex, w, h):
             from .gpu import device as _dev
             for k in list(batches)[:8]:
                 _dev.bury_screen(batches.pop(k))
-        batches[(w, h)] = batch
+        batches[key] = batch
     gpu.state.blend_set('ALPHA_PREMULT')
     try:
         shader.uniform_sampler('image', tex)

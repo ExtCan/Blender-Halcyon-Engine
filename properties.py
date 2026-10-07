@@ -1134,6 +1134,7 @@ LABELS = {
     'gpu_hold_context': "Hold GPU Context (freezes UI)",
     'gpu_scissor': "Scissor Layer Passes",
     'viewport_gpu': "Viewport GPU",
+    'viewport_camera_frame': "Camera Frame Only",      # R253
     'radiosity': "Radiosity",
     'radiosity_samples': "Gather Samples",
     'radiosity_distance': "Gather Distance",
@@ -2453,6 +2454,17 @@ DESCRIPTIONS = {
                     "bisect switch for viewport-only driver problems: if a "
                     "glitch follows this toggle, it lives in the viewport's "
                     "GPU path; if it stays, it never did",
+    # R253: the viewport's camera-frame option (the F12 border is
+    # Blender's own Render Region, Ctrl+B, in Output > Format)
+    'viewport_camera_frame': "In camera view the rendered viewport shades "
+                             "only the pixels inside the camera frame; the "
+                             "rest of the region keeps the viewport "
+                             "background (Blender's passepartout darkens it "
+                             "as usual). Fewer pixels per draft and refine, "
+                             "and the picture you see is the picture F12 "
+                             "frames. Blender's own render border (Ctrl+B "
+                             "in a free view, or the scene's Render Region "
+                             "in camera view) is honoured on top of it",
 
     'spot_cones': "Draw the visible beam of every spot light whose Volumetric "
                   "value is above zero. The view ray is intersected with the "
@@ -2836,7 +2848,15 @@ COLOR_FIELDS = {'global_ambient', 'fog_color', 'wire_color',
 #: properties -- each one's UI lives elsewhere (palette_colors is read
 #: out of the picked Palette Image; a generated FloatVector of size 0
 #: would not even register)
-_DERIVED_FIELDS = {'palette_colors'}
+_DERIVED_FIELDS = {'palette_colors',
+                   # R253: the render region is Blender's own
+                   # (scene.render.use_border / border_min_x..max_y,
+                   # Output > Format > Render Region, Ctrl+B); the engine
+                   # derives the five fields from scene.render at F12
+                   # (engine._settings_from_scene) and the viewport worker
+                   # sets them from the drawn rect -- no second UI
+                   'use_border', 'border_min_x', 'border_min_y',
+                   'border_max_x', 'border_max_y'}
 
 
 def _build():

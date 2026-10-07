@@ -3349,19 +3349,38 @@ def shade_fragments_frame(job, gbuf, tri, bary, px, py, rank):
     # disagrees about the newer region-read path.
     region_on = REGION_DRAWS and \
         bool(getattr(getattr(job, 'settings', None), 'gpu_scissor', True))
+    # R253: the render region's box (core/render puts it on the job):
+    # a rank's fragments OUTSIDE it never draw (their colour stays the
+    # zero `out` starts at, and the composite's pixels outside the rect
+    # are cut at the frame's exit), and the rank's scissor is its own
+    # bbox AND the rect -- regardless of the Debug toggle, which keeps
+    # governing the per-rank bbox alone
+    _rr = getattr(job, 'region', None)
+    if _rr is not None:
+        _rr = tuple(int(v) for v in _rr)
     for r in range(top + 1):
         sel = rorder[rbounds[r]:rbounds[r + 1]]
         if sel.size == 0:
             continue
+        if _rr is not None:
+            _in = ((px[sel] >= _rr[0]) & (px[sel] < _rr[0] + _rr[2])
+                   & (py[sel] >= _rr[1]) & (py[sel] < _rr[1] + _rr[3]))
+            sel = sel[_in]
+            if sel.size == 0:
+                continue
         tm['ranks'] += 1
         spy, spx = py[sel], px[sel]
         ids[spy, spx, :3] = bary[sel]
         ids[spy, spx, 3] = tri[sel].astype(np.float32)
-        if region_on:
+        if region_on or _rr is not None:
             x0 = int(spx.min())
             y0 = int(spy.min())
             region = (x0, y0, int(spx.max()) + 1 - x0,
                       int(spy.max()) + 1 - y0)
+            if not region_on:
+                # the Debug toggle is off: the rect itself is the box
+                x0, y0 = _rr[0], _rr[1]
+                region = _rr
             tm['scissor_px'] += float(region[2]) * float(region[3])
         else:
             x0 = y0 = 0
@@ -4470,13 +4489,19 @@ def _sim_radfield(radfield, job, ids_arr, tex_by_name, side, tside):
                    wrap='EXTEND'), None
 
 
-def simulate(job, gbuf, passes=None, atlases=None):
+def simulate(job, gbuf, passes=None, atlases=None, region=None):
     """Run the frame passes through Halcyon's own GLSL front-end.
 
     This is the proof that does not need a GPU: the same sources the driver
     would compile, executed by the NumPy backend against the same packed
     textures -- shadow atlases included. Returns (image (H,W,3), covered
     mask) or (None, why).
+
+    R253: `region=(x, y, w, h)` is the headless twin of shade_frame's
+    scissor -- the uv grid covers only the box's pixels, every lane
+    scatters into a zero frame, the sky lands inside the box only. The
+    box's pixels equal the full simulation's bitwise (the same lanes
+    see the same uniforms); outside is zero and `hit` False.
     """
     from ..core.texture import Texture
     from ..shaders.compiler import try_compile
@@ -4486,6 +4511,15 @@ def simulate(job, gbuf, passes=None, atlases=None):
         if passes is None:
             return None, why
     h, w = gbuf.tri.shape
+    _rmask = None
+    if region is not None:
+        region = tuple(int(v) for v in region)
+        if region[2] > 0 and region[3] > 0:
+            _rmask = np.zeros((h, w), bool)
+            _rmask[region[1]:region[1] + region[3],
+                   region[0]:region[0] + region[2]] = True
+        else:
+            region = None
     # R248: the driver's own rule, mirrored -- a material on screen
     # without a pass refuses by name, and only the passes on screen run
     present = _present_materials(job.scene.mesh, gbuf)
@@ -4501,10 +4535,27 @@ def simulate(job, gbuf, passes=None, atlases=None):
                           for mi in missing[:4]))
     passes = [p for p in passes if int(p[0]) in present]
     ids, attrs, side, tris, tside = _textures(job, gbuf)
-    yy, xx = np.mgrid[0:h, 0:w]
+    if region is not None:
+        yy, xx = np.mgrid[region[1]:region[1] + region[3],
+                          region[0]:region[0] + region[2]]
+    else:
+        yy, xx = np.mgrid[0:h, 0:w]
     uv = np.stack([(xx.ravel() + 0.5) / w, (yy.ravel() + 0.5) / h],
                   1).astype(np.float32)
-    n = h * w
+    n = int(uv.shape[0])
+    # the lanes' frame addresses: every per-lane result scatters through
+    # these into a (h*w) array, so the rest of the road (the reshape to
+    # the frame, the sweeps, the fog readback) sees the full frame
+    _lane_ix = (yy.ravel().astype(np.int64) * w + xx.ravel()) \
+        if region is not None else None
+
+    def _spread(arr):
+        """(n, ...) per-lane -> (h*w, ...) frame-ordered, zeros outside."""
+        if _lane_ix is None:
+            return arr
+        full = np.zeros((h * w,) + tuple(arr.shape[1:]), arr.dtype)
+        full[_lane_ix] = arr
+        return full
     tex = {
         'hal_gb_ids': Texture(ids, colorspace='Non-Color', filt='NEAREST',
                               wrap='EXTEND'),
@@ -4600,9 +4651,9 @@ def simulate(job, gbuf, passes=None, atlases=None):
         return uni
 
     def run_passes(pass_list, ids_texture):
-        got_out = np.zeros((n, 3), np.float32)
-        got_hit = np.zeros(n, bool)
-        got_stip = np.zeros(n, bool)
+        got_out = np.zeros((h * w, 3), np.float32)
+        got_hit = np.zeros(h * w, bool)
+        got_stip = np.zeros(h * w, bool)
         for mat_id, name, src, binds in pass_list:
             sim_src = src.replace('in vec2 vUV;', 'uniform vec2 vUV;')
             prog, err = try_compile(sim_src, 'GLSL')
@@ -4627,11 +4678,11 @@ def simulate(job, gbuf, passes=None, atlases=None):
                     return None, None, None, \
                         f"'{name}' height pass would not compile: {perr}"
                 puni = fill_base(dict(tex), ids_texture, pbinds)
-                pgot = pprog.run(puni, {}, n)[0]['Color']
+                pgot = _spread(pprog.run(puni, {}, n)[0]['Color'])
                 uni[uname] = Texture(pgot.reshape(h, w, 4),
                                      colorspace='Non-Color', filt='NEAREST',
                                      wrap='EXTEND')
-            got = prog.run(uni, {}, n)[0]['Color']
+            got = _spread(prog.run(uni, {}, n)[0]['Color'])
             keep = got[:, 3] > 0.5
             np.copyto(got_out, got[:, :3], where=keep[:, None])
             got_hit |= keep
@@ -4643,8 +4694,11 @@ def simulate(job, gbuf, passes=None, atlases=None):
         return None, why
     out = out.reshape(h, w, 3)
     hit = hit.reshape(h, w)
-    # R248: the coverage law, mirrored from shade_frame
+    # R248: the coverage law, mirrored from shade_frame (R253: inside the
+    # box only, as the driver's own check looks)
     _cov = gbuf.tri >= 0
+    if _rmask is not None:
+        _cov = _cov & _rmask
     _mesh = job.scene.mesh
     if _mesh.mat_index is not None:
         _mpx = np.where(_cov, _mesh.mat_index[np.maximum(gbuf.tri, 0)], -1)
@@ -4709,6 +4763,8 @@ def simulate(job, gbuf, passes=None, atlases=None):
                                       ss=int(getattr(job, 'ss', 1) or 1))
         if sky4 is not None:
             unc = gbuf.tri < 0
+            if _rmask is not None:
+                unc = unc & _rmask       # R253: the sky draws inside the box
             out[unc] = sky4[unc][:, :3]
             try:
                 gbuf.gpu_sky = True
@@ -4720,15 +4776,32 @@ def simulate(job, gbuf, passes=None, atlases=None):
                 gbuf.gpu_sky_why = str(sky_why)
             except AttributeError:
                 pass
+    if _rmask is not None:
+        # R253: the sweeps and the environment composite work the full
+        # frame (a reflective pixel anywhere spawns its ray, as the
+        # driver road's do); the box is the contract, so the rest is cut
+        # here exactly as the driver's readback leaves it
+        out = np.where(_rmask[:, :, None], out, np.float32(0.0)).astype(
+            np.float32)
+        hit = hit & _rmask
     return out, hit
 
 
-def shade_frame(job, gbuf):
+def shade_frame(job, gbuf, region=None):
     """The driver path: upload the G-buffer, draw each material's pass.
 
     Returns (image (H,W,3), covered mask) or (None, why). Every failure --
     no gpu module, a driver that rejects a shader, anything -- is a reason,
     and the caller shades on the CPU as it always has.
+
+    R253: `region=(x, y, w, h)` (the render region's box in G-buffer
+    pixels) scissors every material pass and the sky pass to that box
+    and reads back only the box, scattered into a zero frame -- the
+    per-rank scissor transport (gpu_scissor, 'pure transport: the same
+    pixels shade either way') applied to the opaque frame. The pixels
+    inside the box are bitwise the full frame's; outside, the frame
+    holds the cleared target's zeros, `hit` is False and the unshaded-
+    pixel refusal below looks only inside the box.
     """
     from . import device
 
@@ -4736,6 +4809,10 @@ def shade_frame(job, gbuf):
     ok, why = device.probe()
     if not ok:
         return None, why
+    if region is not None:
+        region = tuple(int(v) for v in region)
+        if region[2] <= 0 or region[3] <= 0:
+            region = None
     t_p = _time.perf_counter()
     passes, why, atlases = plan_frame(job, gbuf)
     t_plan = _time.perf_counter() - t_p
@@ -5075,14 +5152,22 @@ def shade_frame(job, gbuf):
             # -- the same commands in the same order, none of the
             # per-pass queue sleeps (was ~14 ms of latency per pass)
             _draws = [(shader, {**uni, **extra} if extra else uni, bind,
-                       target, 'ALPHA_PREMULT', i == 0, None)
+                       target, 'ALPHA_PREMULT', i == 0, region)
                       for i, (name, shader, bind, extra)
                       in enumerate(plan_draw)]
             if _sky_draw is not None:
                 _sk_sh, _sk_uni, _sk_bind = _sky_draw
                 _draws.append((_sk_sh, _sk_uni, _sk_bind, target, 'NONE',
-                               False, None))
-            got = device.draw_many(_draws, read=target)
+                               False, region))
+            got = device.draw_many(_draws, read=target, read_region=region)
+            if region is not None and got is not None:
+                # R253: the box crossed the bus; the rest of the frame
+                # is the cleared target's zeros, exactly as the sparse
+                # ray sweep scatters its hit box
+                _rx, _ry, _rw2, _rh2 = region
+                _full = np.zeros((h, w, 4), np.float32)
+                _full[_ry:_ry + _rh2, _rx:_rx + _rw2] = got
+                got = _full
             _sky_drawn = _sky_draw is not None
             # snapshot NOW: the sweeps and layer ranks run their own
             # bursts before LAST_TIMINGS is written, and this pair must
@@ -5125,12 +5210,17 @@ def shade_frame(job, gbuf):
             _covered_px = gbuf.tri >= 0
             if stip:
                 gbuf.gpu_alpha = np.zeros((h, w), bool)
+            if region is not None:
+                _rx, _ry, _rw2, _rh2 = region
+                _rmask = np.zeros((h, w), bool)
+                _rmask[_ry:_ry + _rh2, _rx:_rx + _rw2] = True
+                _covered_px = _covered_px & _rmask
             for name, shader, bind, extra in plan_draw:
                 t1 = _time.perf_counter()
                 try:
                     frame = device.draw_fullscreen(shader, {**uni, **extra}
                                                    if extra else uni, bind,
-                                                   target)
+                                                   target, region=region)
                 except Exception as exc:                        # noqa: BLE001
                     return None, f"drawing '{name}' failed: {exc}"
                 t_draw += _time.perf_counter() - t1
@@ -5175,6 +5265,13 @@ def shade_frame(job, gbuf):
     # the frame refuses by name rather than show it
     try:
         covered = gbuf.tri >= 0
+        if region is not None:
+            # R253: only the box was drawn; a pixel outside it is owed
+            # nothing (the frame's exit cuts it)
+            _rx, _ry, _rw2, _rh2 = region
+            _rmask = np.zeros((h, w), bool)
+            _rmask[_ry:_ry + _rh2, _rx:_rx + _rw2] = True
+            covered = covered & _rmask
         if mesh.mat_index is not None:
             mat_px = np.where(covered, mesh.mat_index[np.maximum(gbuf.tri, 0)], -1)
             owed = covered & np.isin(mat_px, list(planned_ids)) & ~hit

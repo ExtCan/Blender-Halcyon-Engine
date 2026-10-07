@@ -2457,6 +2457,10 @@ PRESERVED = frozenset({
     'threads', 'preview_scale', 'progressive',
     'show_stats', 'debug_pass', 'seed',
     'film_transparent', 'use_processes', 'process_count',
+    # R253: the render region and the viewport's camera-frame toggle are
+    # output plumbing (Blender's own border, the drawn rect), never a look
+    'viewport_camera_frame', 'use_border', 'border_min_x', 'border_min_y',
+    'border_max_x', 'border_max_y',
 }) | DEVICE_KEYS
 
 

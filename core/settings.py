@@ -89,6 +89,23 @@ class RenderSettings:
     resolution_y: int = 240
     pixel_aspect_x: float = 1.0
     pixel_aspect_y: float = 1.0
+    # R253: the render region (Blender's Ctrl+B border) -- fractions of
+    # the frame, bottom-left origin, exactly scene.render.border_min_x..
+    # max_y (row 0 is the bottom here too). The engine derives them from
+    # scene.render at F12 (properties._DERIVED_FIELDS: Blender's own
+    # Output > Format panel is their UI) and the viewport worker sets
+    # them from the drawn rect. Off / the full frame is the identity:
+    # render.region_pixels() returns None and every old scene renders
+    # through exactly the pre-R253 code paths
+    use_border: bool = False
+    border_min_x: float = 0.0
+    border_min_y: float = 0.0
+    border_max_x: float = 1.0
+    border_max_y: float = 1.0
+    # R253: viewport-only -- in camera view the rendered viewport shades
+    # only the camera frame's pixels (engine._view_rect reads it; F12
+    # never does)
+    viewport_camera_frame: bool = False
     # ------------------------------------------------------------- sampling
     aa_mode: str = 'SUPERSAMPLE'      # NONE | SUPERSAMPLE | EDGE | ADAPTIVE | ACCUMULATE
     aa_samples: int = 1               # supersample factor (1..8)

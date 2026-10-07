@@ -842,6 +842,23 @@ def process(image, st, frame=0, seed=0, target_size=None, allow_resize=True,
     multiplies it -- and a caller writing into a fixed-size buffer must not be
     handed something bigger. Blender's render result is exactly such a buffer,
     and overrunning it corrupts the heap rather than raising.
+
+    R253 -- the render region contract: under Blender's render border the
+    input is the FULL frame with RGBA zeros outside the rect (core/render
+    `_apply_region`), never a cropped array. The chain runs over that
+    canvas unchanged, so every stage that addresses the pixel grid from
+    the origin (the dither tiles, the CRT mask and scanlines, interlace
+    rows, the N64 / noise hash maps, film halftone lattices, codec
+    blocks, every GPU twin's `resolution` uniform) keeps the whole
+    frame's anchoring by construction and the rect's pixels equal the
+    full render's bitwise; the non-local stages (glow, star, flares,
+    DOF, shafts, the NTSC / tape filters, the codec blocks) read those
+    zeros past the rect edge and are therefore region-local within their
+    own kernel radius of the edge -- the documented tolerance. The crop
+    happens AFTER this chain (engine.py for F12, preview.py for the
+    viewport's camera-frame mode crops before it, on purpose: the frame's
+    own corner is the pattern origin there, as it is for an F12 of the
+    camera frame).
     """
     rgb = np.asarray(image, np.float32)
     alpha = rgb[:, :, 3:4].copy() if rgb.shape[2] == 4 else None

@@ -4117,6 +4117,143 @@ def _apply_material_override(scene, st):
     return out
 
 
+# ---------------------------------------------------------------- R253:
+# the render region (Blender's Ctrl+B border, Output > Format > Render
+# Region). One mechanism for F12 and the viewport: a RECT carried on the
+# settings as Blender's own fractions, applied here as "full-frame
+# G-buffer, shading masked to the rect plus a context ring, zeros
+# outside, full-frame return shape". The post chain then runs over the
+# full-frame canvas, so every pattern stage (CRT mask, Bayer tiles,
+# interlace rows, N64 / noise hashes, codec blocks) keeps its full-frame
+# anchoring with no per-stage change, and the crop happens LAST (the
+# engine for F12, the viewport worker for the rendered view).
+
+def region_pixels(st, W, H):
+    """The render region in OUTPUT pixels, (x0, y0, x1, y1), or None.
+
+    Blender's own rounding (render/intern/pipeline.cc: disprect.xmin =
+    border_min_x * winx, truncated) on the min edge; the max edge is
+    CEILED so a Pixel Scale render rect (computed at render resolution)
+    is always a superset of the output crop (computed at output
+    resolution). At least one pixel each way, clamped to the frame.
+    None when the border is off, empty, or covers the whole frame -- so
+    an old scene never enters the region code at all."""
+    if not bool(getattr(st, 'use_border', False)):
+        return None
+    W = max(int(W), 1)
+    H = max(int(H), 1)
+    try:
+        mnx = float(getattr(st, 'border_min_x', 0.0))
+        mny = float(getattr(st, 'border_min_y', 0.0))
+        mxx = float(getattr(st, 'border_max_x', 1.0))
+        mxy = float(getattr(st, 'border_max_y', 1.0))
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in (mnx, mny, mxx, mxy)):
+        return None
+    mnx, mny = min(max(mnx, 0.0), 1.0), min(max(mny, 0.0), 1.0)
+    mxx, mxy = min(max(mxx, 0.0), 1.0), min(max(mxy, 0.0), 1.0)
+    if mxx <= mnx or mxy <= mny:
+        return None
+    x0 = min(int(mnx * W), W - 1)
+    y0 = min(int(mny * H), H - 1)
+    x1 = min(max(int(math.ceil(mxx * W)), x0 + 1), W)
+    y1 = min(max(int(math.ceil(mxy * H)), y0 + 1), H)
+    if x0 == 0 and y0 == 0 and x1 == W and y1 == H:
+        return None
+    return (x0, y0, x1, y1)
+
+
+def _region_keep(rect, rw, rh, ss, reach):
+    """The 2-D twin of the band `keep` row mask: a (rh, rw) bool mask of
+    the rect at INTERNAL resolution (rect * ss), grown by `reach` pixels
+    on every side -- the context ring the neighbour-reading stages (ink,
+    bump pre-passes, the interpolated radiosity grid, the edge tent, the
+    adaptive contrast window, the Fuzz / Thin Wall blends) read past the
+    rect, exactly as the band scissor keeps its context rows."""
+    x0, y0, x1, y1 = rect
+    s = max(int(ss), 1)
+    r = max(int(reach), 0)
+    keep = np.zeros((int(rh), int(rw)), bool)
+    keep[max(y0 * s - r, 0):min(y1 * s + r, int(rh)),
+         max(x0 * s - r, 0):min(x1 * s + r, int(rw))] = True
+    return keep
+
+
+def _region_box(keep):
+    """(x, y, w, h) of a keep mask's true pixels -- the GPU scissor box
+    (device.draw_many's read_region takes this shape)."""
+    ys = np.nonzero(keep.any(axis=1))[0]
+    xs = np.nonzero(keep.any(axis=0))[0]
+    if ys.size == 0 or xs.size == 0:
+        return (0, 0, 0, 0)
+    return (int(xs[0]), int(ys[0]), int(xs[-1]) + 1 - int(xs[0]),
+            int(ys[-1]) + 1 - int(ys[0]))
+
+
+def _apply_region(out, rect, y_off=0):
+    """Zero (RGBA 0,0,0,0) every output pixel outside the rect. `y_off`
+    is the row the array starts at (a band's first output row), so a
+    pooled band of a region frame zeroes the same pixels the whole frame
+    would. The array is edited in place when it is writable."""
+    if rect is None or out is None:
+        return out
+    x0, y0, x1, y1 = rect
+    h, w = out.shape[:2]
+    ya = min(max(y0 - int(y_off), 0), h)
+    yb = min(max(y1 - int(y_off), 0), h)
+    xa = min(max(x0, 0), w)
+    xb = min(max(x1, 0), w)
+    try:
+        out = np.ascontiguousarray(out, np.float32)
+        if not out.flags.writeable:
+            out = out.copy()
+    except Exception:                                           # noqa: BLE001
+        out = np.array(out, np.float32)
+    if ya > 0:
+        out[:ya] = 0.0
+    if yb < h:
+        out[yb:] = 0.0
+    if xa > 0:
+        out[ya:yb, :xa] = 0.0
+    if xb < w:
+        out[ya:yb, xb:] = 0.0
+    return out
+
+
+def _region_reach(scene, st, ink_reach, has_bump):
+    """How far past the rect the frame's stages read, in internal pixels:
+    the band scissor's own context rules (ink, bump, the interpolated
+    radiosity grid) plus one ring for the edge tent (_edge_smooth), two
+    for the adaptive contrast window (_adaptive_mask: 'within two
+    pixels of a geometric flag'). The Fuzz / Thin Wall blends have no
+    finite ring (render() renders them whole and crops, by name)."""
+    reach = int(ink_reach or 0)
+    if has_bump:
+        reach += 1
+    rad_n = int(getattr(st, 'radiosity_spacing', 1) or 1)
+    if getattr(st, 'radiosity', False) and rad_n > 1:
+        reach += 2 * rad_n
+    mode = str(getattr(st, 'aa_mode', 'NONE'))
+    if mode == 'EDGE':
+        reach += 1
+    elif mode == 'ADAPTIVE':
+        reach += 2
+    return reach
+
+
+def _region_refuse(st, why):
+    """The region's refusals, printed once per reason (the period
+    refusal doctrine: by name, never silent)."""
+    key = str(why)
+    said = getattr(st, '_period_refusals', None)
+    if isinstance(said, set):
+        if key in said:
+            return
+        said.add(key)
+    print(f'[Halcyon] render region: {why}')
+
+
 def render(scene, settings=None, progress=None, band=None):
     """Render `scene`. Returns a linear (H,W,4) float32 image.
 
@@ -4152,12 +4289,57 @@ def render(scene, settings=None, progress=None, band=None):
     if getattr(scene, 'world', None) is not None:
         desugar_master_bump(getattr(scene.world, 'graph', None))
     _synth_caustic_cookies(scene)
+    # R253: the render region in output pixels, or None (the identity --
+    # every old scene takes exactly the pre-R253 paths below)
+    rect = region_pixels(st, W, H)
+    if rect is not None and composite_reads_neighbours(scene, st):
+        # the Fuzz / Thin Wall blends read the FINISHED frame's
+        # neighbouring rows, layer upon layer (a Spectre behind a Spectre
+        # reads a row that itself read a row), so no finite context ring
+        # holds -- the worker-pool gate refuses them for the same reason.
+        # The frame renders whole and the rect is cut after, by name
+        _region_refuse(st, 'the Fuzz / Thin Wall blend reads neighbouring '
+                           'pixels of the finished frame; the frame renders '
+                           'whole and is cropped')
+        st_w = st.copy()
+        st_w.use_border = False
+        st_w._period_refusals = st._period_refusals
+        for _k in ('_viewport', '_viewport_stats', '_keep_gpu_frame',
+                   '_stereo', '_pano_strip', '_accum_jitter', '_lens_pass',
+                   '_refine_mask'):
+            if hasattr(st, _k):
+                setattr(st_w, _k, getattr(st, _k))
+        out_w = render(scene, st_w, progress, band)
+        try:
+            st._frame_gpu_shaded = bool(getattr(st_w, '_frame_gpu_shaded',
+                                                False))
+            st._last_coverage = getattr(st_w, '_last_coverage', None)
+        except Exception:                                       # noqa: BLE001
+            pass
+        # the crop below is a CPU edit of the whole frame: a resident GPU
+        # frame of the whole picture is released by name, never kept
+        from ..gpu import frame as _FRw
+        _FRw.edited(st_w, 'render region', 'rendered whole and cropped')
+        _FRw.release(st_w)
+        return _apply_region(out_w, rect,
+                             y_off=max(band[0], 0) if band is not None else 0)
     # PANO outranks stereo: QTVR panoramas were mono deliverables, and an
     # off-axis frustum shift has no honest meaning on a stitched cylinder
     if scene.camera is not None and \
             str(getattr(scene.camera, 'type', 'PERSP')) == 'PANO' and \
             not getattr(st, '_pano_strip', False) and band is None and \
             not getattr(st, '_viewport', False):
+        if rect is not None:
+            # R253: a strip of the drum has no rect meaning (the region
+            # is a planar window); the panorama renders whole and the
+            # rect is cut after the stitch, by name
+            _region_refuse(st, 'the panorama camera renders whole and '
+                               'is cropped after the stitch')
+            st_w = st.copy()
+            st_w.use_border = False
+            st_w._period_refusals = st._period_refusals
+            return _apply_region(_render_panorama(scene, st_w, progress),
+                                 rect)
         return _render_panorama(scene, st, progress)
     # R251 C125: Blender 2.4's Pano + Xparts -- N yawed planar strips
     # butted together; a PANO camera (the true cylinder) wins above,
@@ -4167,6 +4349,14 @@ def render(scene, settings=None, progress=None, band=None):
             and str(getattr(scene.camera, 'type', 'PERSP')) == 'PERSP' \
             and not getattr(st, '_pano_strip', False) and band is None \
             and not getattr(st, '_viewport', False):
+        if rect is not None:
+            _region_refuse(st, 'the panorama camera renders whole and '
+                               'is cropped after the stitch')
+            st_w = st.copy()
+            st_w.use_border = False
+            st_w._period_refusals = st._period_refusals
+            return _apply_region(_render_pano_parts(scene, st_w, progress),
+                                 rect)
         return _render_pano_parts(scene, st, progress)
     if str(getattr(st, 'stereo_mode', 'NONE')) != 'NONE' and \
             getattr(st, '_stereo', None) is None and band is None and \
@@ -4373,7 +4563,12 @@ def render(scene, settings=None, progress=None, band=None):
                                               textures, ss=ss)
 
     if mesh is None or mesh.tris is None or mesh.tris.size == 0:
-        img = _background_image(scene, st, rw, rh, vp, eye, None, textures)
+        # R253: a region frame evaluates the sky inside the rect only
+        # (per-pixel, so the rect's values are the whole frame's); the
+        # halos / weather below draw whole and the resolve zeroes outside
+        img = _background_image(scene, st, rw, rh, vp, eye,
+                                _region_keep(rect, rw, rh, ss, 0)
+                                if rect is not None else None, textures)
         if band is None:
             # R194/R195 field finds: this early path returned before
             # ANY of the whole-frame extras were computed. A scene of
@@ -4408,8 +4603,10 @@ def render(scene, settings=None, progress=None, band=None):
             scene.last_flares = _flare_sources(scene, st, g_empty, vp)
         if band is not None:
             y0, y1 = max(band[0], 0), min(band[1], H)
-            return _resolve(img[y0 * ss:y1 * ss], W, y1 - y0, ss, st)
-        return _resolve(img, W, H, ss, st)
+            return _apply_region(
+                _resolve(img[y0 * ss:y1 * ss], W, y1 - y0, ss, st),
+                rect, y_off=y0)
+        return _apply_region(_resolve(img, W, H, ss, st), rect)
 
     opaque, transparent = _split_by_alpha(scene, mesh, st)
     snap = snap_grid(st)
@@ -4475,6 +4672,27 @@ def render(scene, settings=None, progress=None, band=None):
             # and are never shaded (band masking below is untouched).
             scissor = (max(scissor[0] - 2 * rad_n, 0),
                        min(scissor[1] + 2 * rad_n, rh))
+    # R253: the region's 2-D keep mask -- the rect at internal
+    # resolution plus the context ring the band scissor's own rules
+    # state (core/render._region_reach). The OPAQUE raster stays
+    # whole-frame on both devices (the G-buffer cache is keyed on the
+    # raster's inputs, never the rect, so a cached full frame serves a
+    # region frame and a region frame can never poison a full one); the
+    # see-through raster and composite take the rect's rows as a band
+    # takes its own (`t_scissor`), the proven per-row context road
+    _keep2 = None
+    _region_box_px = None
+    t_scissor = scissor
+    if rect is not None:
+        _keep2 = _region_keep(rect, rw, rh, ss,
+                              _region_reach(scene, st, ink_reach, has_bump))
+        _region_box_px = _region_box(_keep2)
+        if band is None:
+            t_scissor = (_region_box_px[1],
+                         _region_box_px[1] + _region_box_px[3])
+    # the GPU layer passes (gpu/shade.shade_fragments_frame) read the
+    # box off the job: each depth rank's scissor becomes bbox AND rect
+    job.region = _region_box_px
 
     flat_depth = None
     if st.depth_sort == 'PAINTERS':
@@ -4815,7 +5033,15 @@ def render(scene, settings=None, progress=None, band=None):
         # accumulation in _adaptive_refine, so restricting `covered`
         # here changes no masked pixel's value
         covered &= _rm
+    if _keep2 is not None:
+        # R253: the region -- shade the rect and its context ring only;
+        # every pixel inside is a pure function of the same G-buffer and
+        # lamps the whole frame shades from, so the rect's values are
+        # the whole frame's (test_r253_region pins it bitwise)
+        covered &= _keep2
     _bg_un = (~covered) & (keep[:, None] if band is not None else True)
+    if _keep2 is not None:
+        _bg_un = _bg_un & _keep2
     if _rm is not None:
         # a refine pass keeps only its flagged pixels; sky computed
         # anywhere else is discarded by the accumulation, so it is not
@@ -4930,7 +5156,12 @@ def render(scene, settings=None, progress=None, band=None):
             from ..gpu import shade as _gpu_shade
             with ST.track('shade (GPU)'):
                 try:
-                    got, why = _gpu_shade.shade_frame(job, gbuf)
+                    # R253: a region frame scissors the material passes
+                    # and the readback to the rect's box (pure transport,
+                    # the per-rank scissor road); the readback comes back
+                    # zero-padded to the frame
+                    got, why = _gpu_shade.shade_frame(
+                        job, gbuf, region=_region_box_px)
                 except Exception as exc:                        # noqa: BLE001
                     got, why = None, str(exc)
             if got is None:
@@ -5163,6 +5394,15 @@ def render(scene, settings=None, progress=None, band=None):
     # for it, as under fog)
     img = SM.apply_after_readback(img, job, st)
 
+    if rect is not None:
+        # R253: the scissored target holds the rect AND its context ring
+        # shaded; the ring is cut on the CPU side only (_apply_region at
+        # the exit), so a resident frame would feed the GPU ink, resolve
+        # and post chain pixels the CPU road zeroes -- a device-parity
+        # hole in every non-local stage. Released by name: the post chain
+        # uploads the zero-padded frame once and _post_warn says why
+        _FR.edited(st, 'render region', 'the context ring is cut on the CPU')
+
     if _wire_active(scene, st, gbuf):
         _FR.edited(st, 'wireframe')
     with ST.track('wireframe'):
@@ -5222,7 +5462,7 @@ def render(scene, settings=None, progress=None, band=None):
                              depth_bits=st.depth_precision,
                              subset=transparent[zo_all == zo],
                              gbuf=gbuf, frags=frags, depth_write=False,
-                             flat_depth=flat_depth, scissor=scissor,
+                             flat_depth=flat_depth, scissor=t_scissor,
                              subdiv_px=subdiv_px, near_eps=near_eps,
                              opts=opts,
                              z_offset=(-float(np.float32(zo) * _zo_scale)
@@ -5230,11 +5470,11 @@ def render(scene, settings=None, progress=None, band=None):
         _FR.edited(st, 'transparency')
         with ST.track('transparency'):
             img = _composite_abuffer(job, frags, gbuf, img, st, band=band,
-                                     vp=vp, snap=snap, rows=scissor)
+                                     vp=vp, snap=snap, rows=t_scissor)
     elif transparent is not None and transparent.size:
         raster.rasterize(mesh.verts, mesh.tris, vp, rw, rh, cull=cull, snap=snap,
                          depth_bits=st.depth_precision, subset=transparent,
-                         gbuf=gbuf, flat_depth=flat_depth, scissor=scissor,
+                         gbuf=gbuf, flat_depth=flat_depth, scissor=t_scissor,
                          subdiv_px=subdiv_px, near_eps=near_eps,
                          opts=opts)
 
@@ -5244,7 +5484,7 @@ def render(scene, settings=None, progress=None, band=None):
         # nothing see-through the composite never ran, so pack it here
         _FR.edited(st, 'framebuffer format')
         with ST.track('transparency'):
-            img = framebuffer_pack_frame(img, st, rows=scissor)
+            img = framebuffer_pack_frame(img, st, rows=t_scissor)
 
     if _beams_active(scene, st):
         _FR.edited(st, 'volumetric lights')
@@ -5268,6 +5508,10 @@ def render(scene, settings=None, progress=None, band=None):
             _bm = np.zeros((rh, rw), bool)
             _bm[keep] = True
             _vol_sel = _bm if _rm is None else (_bm & _rm)
+        if _keep2 is not None:
+            # R253: the region marches its rect (and ring) only, the
+            # band's own per-pixel rule
+            _vol_sel = _keep2 if _vol_sel is None else (_vol_sel & _keep2)
         img = VOL.march(img, scene, st, gbuf, vp, eye, rw, rh, bvh,
                         sel_mask=_vol_sel, textures=textures, view=view)
 
@@ -5392,7 +5636,9 @@ def render(scene, settings=None, progress=None, band=None):
         if band is not None:
             y0 = max(band[0], 0)
             y1 = min(band[1], H)
-            return _resolve(img[y0 * ss:y1 * ss], W, y1 - y0, ss, st)
+            return _apply_region(
+                _resolve(img[y0 * ss:y1 * ss], W, y1 - y0, ss, st),
+                rect, y_off=y0)
         out = None
         if ss > 1 and _FR.current(st) is not None:
             # R250: the supersample filter drawn on the GPU over the
@@ -5411,6 +5657,13 @@ def render(scene, settings=None, progress=None, band=None):
                 # the resident frame would feed the post chain unclipped
                 _FR.edited(st, 'sample clamp at 1 sample')
             out = _resolve(img, W, H, ss, st)
+    if rect is not None:
+        # R253: the region's contract at the frame's exit -- zeros (RGBA
+        # 0,0,0,0) outside the rect, the full-frame shape kept so the
+        # post chain's patterns stay anchored to the frame's origin; the
+        # context ring shaded above is cut here (the GPU target that held
+        # it was released by name after the readback)
+        out = _apply_region(out, rect)
     if not getattr(st, '_keep_gpu_frame', False):
         # a caller that wants the frame kept on the GPU for its post
         # chain says so and releases it itself, in a finally; every
