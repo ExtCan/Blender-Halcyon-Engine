@@ -22,6 +22,7 @@ from .core.wear import FILM_SCRATCH_SIDE_ITEMS
 from .core.sky import PAINTED_LOOK_ITEMS, PAINTED_LOOKS
 from .core.gouache import BG_DIRECTION_ITEMS
 from .core.shading import MODEL_ITEMS
+from .core import console as _console
 from .presets.library import preset_items
 
 
@@ -2941,6 +2942,41 @@ class HalcyonSettings(PropertyGroup):
         items=_shading.master_model_items(),
         description="The model every conversion gets when Shader "
                     "Detection is Set Shader")
+    # R253: the scene's choices for the Convert to Anime / Cartoon / Game
+    # buttons -- UI state like convert_detection, never a render setting
+    # (to_settings iterates RenderSettings' fields, so these are ignored
+    # by the renderer and a saved scene renders exactly as before). All
+    # four are STATIC tuples with a default, the rule fakebpy enforces;
+    # each tuple is the one the target node's own menu reads, so the
+    # identifiers a .blend carries keep their meaning on the node.
+    convert_anime_style: EnumProperty(
+        name="Anime Style", default='CUSTOM',
+        items=_shading.ANIME_STYLE_ITEMS,
+        description="The Style the Anime Shader starts from when Convert "
+                    "to Anime builds it -- a named decade's tone bands, "
+                    "hair shine and rim; Custom leaves the node at its "
+                    "defaults")
+    convert_anime_compat: EnumProperty(
+        name="Anime Compatibility", default='GENERIC',
+        items=_shading.ANIME_COMPAT_ITEMS,
+        description="How Convert to Anime sets the new node's texture "
+                    "decode: Generic Cel, or one of the game pipelines "
+                    "whose maps you will plug into Game Texture / Detail "
+                    "Texture")
+    convert_cartoon_era: EnumProperty(
+        name="Cartoon Era", default='CUSTOM',
+        items=_shading.CARTOON_ERA_ITEMS,
+        description="The Era the Cartoon Shader starts from when Convert "
+                    "to Cartoon builds it -- shadow mode, tone and "
+                    "highlight written to the node; Custom leaves the "
+                    "defaults")
+    convert_console: EnumProperty(
+        name="Console", default='PS1',
+        items=_console.CONSOLE_ITEMS,
+        description="The machine Convert to Game builds the Console "
+                    "Emulation Shader for; its shader type and options "
+                    "stay at that machine's defaults and are editable on "
+                    "the node")
     ui_tab: EnumProperty(
         name="Tab", items=_items(
             ('SAMPLING', "Sampling", ""), ('SHADING', "Shading", ""),

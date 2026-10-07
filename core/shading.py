@@ -672,6 +672,59 @@ ANIME_STYLE_ITEMS = (
      "camera -- the character lit the same way in every shot"),
 )
 
+#: R253: the Anime Shader's Compatibility menu, hoisted here so the
+#: scene-level Convert to Anime choice (properties.convert_anime_compat)
+#: and the node's own enum read ONE tuple -- same identifiers, same
+#: order, texts verbatim, so a saved file's compat value keeps its
+#: meaning and the tooltip audit reads the same entries. Each entry's
+#: text names the source its decode was taken from.
+ANIME_COMPAT_ITEMS = (
+    ('GENERIC', "Generic Cel",
+     "No texture decode: the sockets are the controls. The "
+     "clean slate for original anime materials"),
+    ('ARCSYS', "ArcSys (Guilty Gear Xrd / Strive)",
+     "The Xrd-lineage ILM map: R specular intensity, G shadow "
+     "bias, B highlight size, A drawn line art; the Detail "
+     "Texture is the SSS map whose rgb tints the first "
+     "shadow. Channel semantics from the published shader "
+     "recreations of the GDC 2015 pipeline"),
+    ('DBFZ', "Dragon Ball FighterZ",
+     "The same ArcSys ILM decode -- FighterZ ships the Xrd "
+     "pipeline. Pair with hard softness values (0) for the "
+     "flat two-tone the game reads as"),
+    ('KAKAROT', "DBZ: Kakarot",
+     "The ArcSys-lineage decode with the CC2 game's slightly "
+     "lifted, softer tone placement. Kakarot's exact channel "
+     "dumps are not publicly documented; this mode applies "
+     "the lineage its look descends from, and says so"),
+    ('SPARKING', "DB: Sparking! Zero",
+     "Decoded from the game's own material export (the FModel "
+     "MI parameter set, the 16x256 T_Tone strips, the "
+     "character sheets) against the field's reconstruction of "
+     "its master material: Diffuse Color is Color1 as exported "
+     "(Unreal's linear colour, the swatch the artist chose), "
+     "the Game Texture is Mask1 (greyscale line art, a linear "
+     "multiply), the Shadow Ramp is GradientTexture read down "
+     "its height with white at the top by the half-Lambert "
+     "cosine, the tone lifted from GradientAdjust1's floor to "
+     "white by the strip; the outline shell the export carries "
+     "is made invisible (Halcyon inks). File > Import > "
+     "Sparking! ZERO Material builds all of it from the .json"),
+    ('GENSHIN', "Genshin Impact",
+     "The HoYo character lightmap: R specular/metal mask "
+     "(0.9+ reads as metal), G occlusion into the shadow "
+     "decision, B inverted highlight threshold, A material "
+     "id. Per-id ramp rows do not travel to a tone node: "
+     "split materials as the game does and set the tone "
+     "colours per part. Decode taken from the PrimoToon "
+     "shader source"),
+    ('ZZZ', "Zenless Zone Zero",
+     "The ZZZ maps per the modding guides: lightmap R is the "
+     "shadow/outline configuration, G metallic, B gloss; the "
+     "Detail Texture is the material map whose B carries "
+     "specular"),
+)
+
 ANIME_STYLE_PRESETS = {
     'MOVIE_80S': {
         '__props': {'tones': 'TWO', 'airbrush_side': 'SHADOW',
