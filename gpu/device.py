@@ -175,10 +175,33 @@ def compile_dynamic(name, fragment, spec):
     return out
 
 
+def duplicate_definitions(fragment):
+    """R252 (post-field): the names defined more than once in a fragment
+    source -- `<type> name(...)` at line start, every function the
+    assembler writes. A driver's compiler rejects a redefinition ('Shader
+    Compile Error') where the simulator shrugs, and the 1.91.0 field log
+    shows the application going down right after such a refusal; so the
+    wrappers below refuse BY NAME before the driver ever sees the text."""
+    import re
+    names = re.findall(r'^\s*(?:float|vec2|vec3|vec4|ivec2|int|bool|void)'
+                       r'\s+(hal_\w+)\s*\(', str(fragment or ''), re.M)
+    seen, dup = set(), []
+    for n in names:
+        if n in seen and n not in dup:
+            dup.append(n)
+        seen.add(n)
+    return dup
+
+
 def _compile_dynamic_miss(key, name, fragment, spec):
     ok, why = probe()
     if not ok:
         return None, why
+    dup = duplicate_definitions(fragment)
+    if dup:
+        return None, (f'{name}: the pass defines {", ".join(dup)} more than '
+                      'once; refused before the driver (a redefinition is a '
+                      'Shader Compile Error on every driver)')
 
     import gpu
 
@@ -263,6 +286,10 @@ def _build(name, fragment, vertex=None):
 
     from .stages import INTERFACE, body
 
+    dup = duplicate_definitions(fragment)
+    if dup:
+        return None, (f'{name}: the pass defines {", ".join(dup)} more than '
+                      'once; refused before the driver')
     spec = INTERFACE.get(name)
     create_err = f'{name}: no CreateInfo path'
     if spec is not None and hasattr(gpu.types, 'GPUShaderCreateInfo'):

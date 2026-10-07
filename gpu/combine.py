@@ -223,7 +223,7 @@ FN_S8 = (
     '    return roundEven(clamp(A, 0.0, 1.0) * 255.0);\n'
     '}\n')
 
-FN_TEV = FN_S8 + (
+FN_TEV_BODY = (
     'vec3 hal_cb_tev(vec3 L, vec3 A)\n'
     '{\n'
     '    vec3 t8 = hal_t8(A);\n'
@@ -236,7 +236,7 @@ FN_TEV = FN_S8 + (
     f'    return o * {R255};\n'
     '}\n')
 
-FN_MOD8 = FN_S8 + (
+FN_MOD8_BODY = (
     'vec3 hal_cb_mod8(vec3 L, vec3 A)\n'
     '{\n'
     '    vec3 t8 = hal_t8(A);\n'
@@ -248,7 +248,7 @@ FN_MOD8 = FN_S8 + (
     f'    return o * {R255};\n'
     '}\n')
 
-FN_MOD8K = FN_S8 + (
+FN_MOD8K_BODY = (
     'vec3 hal_cb_mod8k(vec3 L, vec3 A, float k)\n'
     '{\n'
     '    vec3 t8 = hal_t8(A);\n'
@@ -261,7 +261,7 @@ FN_MOD8K = FN_S8 + (
     f'    return o * {R255};\n'
     '}\n')
 
-FN_ADD8 = FN_S8 + (
+FN_ADD8_BODY = (
     'vec3 hal_cb_add8(vec3 L, vec3 A)\n'
     '{\n'
     '    vec3 t8 = hal_t8(A);\n'
@@ -271,7 +271,7 @@ FN_ADD8 = FN_S8 + (
     f'    return o * {R255};\n'
     '}\n')
 
-FN_ADDSIGNED8 = FN_S8 + (
+FN_ADDSIGNED8_BODY = (
     'vec3 hal_cb_addsigned8(vec3 L, vec3 A)\n'
     '{\n'
     '    vec3 t8 = hal_t8(A);\n'
@@ -282,7 +282,7 @@ FN_ADDSIGNED8 = FN_S8 + (
     f'    return o * {R255};\n'
     '}\n')
 
-FN_DECAL8 = FN_S8 + (
+FN_DECAL8_BODY = (
     'vec3 hal_cb_decal8(vec3 L, vec3 A, float alpha)\n'
     '{\n'
     '    vec3 t8 = hal_t8(A);\n'
@@ -318,7 +318,7 @@ FN_DSDECAL = (
     f'    return c6 * {R63};\n'
     '}\n')
 
-FN_N64BLEND = FN_S8 + (
+FN_N64BLEND_BODY = (
     'vec3 hal_cb_n64blend(vec3 L, vec3 A, float alpha)\n'
     '{\n'
     '    vec3 t8 = hal_t8(A);\n'
@@ -333,7 +333,7 @@ FN_N64BLEND = FN_S8 + (
     f'    return o * {R255};\n'
     '}\n')
 
-FN_JAGUAR = FN_LUM + FN_S8 + (
+FN_JAGUAR_BODY = (
     'vec3 hal_cb_jaguar(vec3 L, vec3 A)\n'
     '{\n'
     '    float lum = hal_lum(L);\n'
@@ -358,7 +358,49 @@ FN_THREEDO = FN_LUM + (
     f'    return o * {R255};\n'
     '}\n')
 
-FN_D3DSPEC_OP = FN_MOD8K + FN_ADD8 + FN_ADDSIGNED8
+# the composed texts -- every helper (hal_s8 / hal_t8, hal_lum) exactly
+# ONCE per text, so a pass never carries two definitions of one function
+# (the GLSL simulator tolerates a redefinition; a driver's compiler does
+# not: the 1.91.0 field crash on a PC fixed-function MODULATE4X material
+# was this text with hal_s8 three times over)
+FN_TEV = FN_S8 + FN_TEV_BODY
+FN_MOD8 = FN_S8 + FN_MOD8_BODY
+FN_MOD8K = FN_S8 + FN_MOD8K_BODY
+FN_ADD8 = FN_S8 + FN_ADD8_BODY
+FN_ADDSIGNED8 = FN_S8 + FN_ADDSIGNED8_BODY
+FN_DECAL8 = FN_S8 + FN_DECAL8_BODY
+FN_N64BLEND = FN_S8 + FN_N64BLEND_BODY
+FN_JAGUAR = FN_LUM + FN_S8 + FN_JAGUAR_BODY
+FN_D3DSPEC_OP = FN_S8 + FN_MOD8K_BODY + FN_ADD8_BODY + FN_ADDSIGNED8_BODY
+
+
+def dedupe_functions(text):
+    """R252 (post-field): keep the FIRST definition of every GLSL function
+    in `text` and drop the rest, by signature line -- the belt to the
+    composition's braces above. A pass that reached the driver with two
+    `vec3 hal_s8(vec3 L)` blocks was refused ('Shader Compile Error') and
+    the app went down after the refusal; a text through here cannot carry
+    one twice. Blocks are `<type> <name>(<args>)\n{ ... }\n` as every
+    function in this module is written."""
+    import re
+    out = []
+    seen = set()
+    pos = 0
+    pat = re.compile(r'^(float|vec2|vec3|vec4|int|bool|void)\s+(hal_\w+)\s*\('
+                     r'[^)]*\)\s*\n\{\n', re.M)
+    for m in pat.finditer(text):
+        if m.start() < pos:
+            continue
+        end = text.find('\n}\n', m.end())
+        end = len(text) if end < 0 else end + 3
+        out.append(text[pos:m.start()])
+        if m.group(2) not in seen:
+            seen.add(m.group(2))
+            out.append(text[m.start():end])
+        pos = end
+    out.append(text[pos:])
+    return ''.join(out)
+
 
 FN_DSTOON = (
     'vec3 hal_cb_dstoon(float cs, vec3 A, float hl)\n'
@@ -445,7 +487,9 @@ def combine_fns(model, consts, vside, bake=None):
         return fns + FN_PCX_FIRST
     if model == 'D3D_SEPARATE_SPEC' and \
             str(opts.get('texop', 'MOD')) != 'MOD':
-        return fns + FN_D3DSPEC_OP
+        return dedupe_functions(fns + FN_D3DSPEC_OP)
+    if model in CB.PERIOD_MODELS_R252:
+        return dedupe_functions(fns + _FNS.get(model, ''))
     return fns + _FNS.get(model, '')
 
 

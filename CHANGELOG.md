@@ -8,6 +8,21 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
 
 ### The Console Emulation Shader, the master menu's classics, RenderWare (R252)
 
+- **Post-field fix (same version, from the first field log).** A PC
+  fixed-function material set to Modulate 4x reached the driver with
+  `hal_s8` / `hal_t8` defined three times -- the D3D texture-op text was
+  three function texts concatenated, each carrying the shared 8-bit
+  helpers; the simulator tolerates a redefinition, a driver's compiler
+  does not ('Shader Compile Error'), and the log shows the application
+  going down right after that refusal. The helpers are now composed ONCE
+  per text (`gpu/combine.FN_*_BODY` + `FN_S8`), `dedupe_functions` guards
+  every console text, and `gpu/device.duplicate_definitions` refuses any
+  pass that defines a function twice BY NAME before the driver sees it
+  (`test_glsl_texts_define_each_function_once`: 60 model / option texts
+  and the assembled Modulate 4x pass). The same log carries an access
+  violation inside the preview thread's sky background (`render.py`
+  `_background_image`, the `world_color` write) after a Super FX refusal
+  -- a pre-1.91 path, not reproduced headless, OPEN.
 - **What was asked.** "Add Renderware options and shaders. Move the Game
   system shaders (Gamecube, Model 3, DS, etc) out of the Halcyon master
   shading node and into their own node called Console Emulation Shader,

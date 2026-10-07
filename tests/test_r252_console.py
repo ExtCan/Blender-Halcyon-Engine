@@ -539,6 +539,66 @@ def test_options_change_the_picture():
         check('the Super FX gates accept the fixed-palette settings', False, str(exc))
 
 
+def test_glsl_texts_define_each_function_once():
+    """Post-field (the 1.91.0 crash log): a PC fixed-function MODULATE4X
+    material reached the driver with hal_s8 / hal_t8 defined three times
+    (three function texts each carrying the helpers), the driver refused
+    the pass ('Shader Compile Error') and the application went down after
+    the refusal. The simulator tolerates a redefinition; a driver does not.
+    Every combine text the console road can emit now defines each function
+    ONCE, dedupe_functions drops a repeat, the device wrapper refuses a
+    redefinition BY NAME before the driver sees it, and the assembled
+    MODULATE4X pass carries no duplicate."""
+    import re
+    from ..gpu import device as DEV
+
+    def defs(t):
+        return re.findall(r'^(?:float|vec2|vec3|vec4|int|bool)\s+(hal_\w+)\s*\(',
+                          t, re.M)
+    bad = []
+    models = list(CB.PERIOD_MODELS) + list(CB.PERIOD_MODELS_R252) + \
+        list(CB.LIGHTING_COMBINE)
+    variants = ({}, {'texop': 'MOD2X'}, {'texop': 'MOD4X'}, {'texop': 'ADD'},
+                {'texop': 'ADDSIGNED'}, {'saturn_half': True},
+                {'pcx_first': True}, {'luma_gamma': 0.5}, {'sfx_dither': False})
+    for model in models:
+        for opts in variants:
+            t = GCB.combine_fns(model, {}, 64, {'__console': dict(opts)})
+            d = defs(t)
+            if len(d) != len(set(d)):
+                bad.append(f'{model}/{opts}: {d}')
+    check(f'every combine text ({len(models)} models x {len(variants)} option '
+          'sets) defines each function once', not bad, '; '.join(bad[:3]))
+    twice = GCB.FN_S8 + GCB.FN_S8 + GCB.FN_ADD8_BODY
+    once = GCB.dedupe_functions(twice)
+    check('dedupe_functions keeps the first definition and drops the repeat',
+          defs(once) == ['hal_s8', 'hal_t8', 'hal_cb_add8']
+          and once.count('vec3 hal_s8(') == 1)
+    check('a text with no repeat passes through dedupe_functions unchanged',
+          GCB.dedupe_functions(GCB.FN_D3DSPEC_OP) == GCB.FN_D3DSPEC_OP
+          and GCB.dedupe_functions(GCB.FN_LUMA64) == GCB.FN_LUMA64)
+    dup = DEV.duplicate_definitions(twice)
+    check('the device wrapper names a redefinition before the driver sees it',
+          dup == ['hal_s8', 'hal_t8'] and DEV.duplicate_definitions(once) == [],
+          str(dup))
+    # the assembled pass, end to end
+    sc, st = _scene({'console': 'PC_FIXED', 'pc_texture_op': 'MODULATE4X'},
+                    w=32, h=24, shading_rate='PIXEL')
+    st.render_device = 'GPU'
+    d, nbad, img, cpu, passes, why = _sim_vs_cpu(sc, st)
+    srcs = []
+    for ps in (passes or ()):
+        for item in (ps if isinstance(ps, (tuple, list)) else (ps,)):
+            if isinstance(item, str) and 'void main' in item:
+                srcs.append(item)
+    check('the MODULATE4X material plans on the GPU and its pass sources '
+          'define each function once',
+          passes is not None and srcs and all(
+              len(defs(t)) == len(set(defs(t))) for t in srcs),
+          str(why) if passes is None else f'{len(srcs)} sources')
+    check('...and the pass is the CPU frame', d is not None and d < 6e-3 and nbad == 0)
+
+
 def test_rate_override():
     """The node's Rate menu decides per material (Machine / Scene / Vertex /
     Face) for the models the hardware tables do not pin; the Sega boards
