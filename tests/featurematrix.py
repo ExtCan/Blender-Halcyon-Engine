@@ -1746,7 +1746,47 @@ def _sc_fog_materials(st):
     return sc
 
 
+def region_bump_scene(st, strength=0.8):
+    """R253: the demo with the Ball under a ShaderNodeBump chain (the
+    height pre-pass road, test_render's bump recipe) -- the render
+    region's bump context ring has to prove itself on a frame that
+    reads neighbour heights."""
+    from .scenebuild import add_normal_mapped_ball
+    sc = demo_scene(st, with_texture=False)
+    add_normal_mapped_ball(sc)
+    g = sc.materials[1].graph
+    rng = np.random.default_rng(3)
+    him = np.zeros((16, 16, 4), np.float32)
+    him[:, :, 0] = rng.random((16, 16))
+    him[:, :, 1] = him[:, :, 2] = him[:, :, 0]
+    him[:, :, 3] = 1.0
+    sc.images['hmap'] = ImageBuffer(name='hmap', pixels=him)
+    g['nodes']['htex'] = {
+        'id': 'htex', 'bl_idname': 'ShaderNodeTexImage',
+        'props': {'image': 'hmap', 'interpolation': 'Closest'},
+        'inputs': [_sk('Vector', 'VECTOR', [0, 0, 0])],
+        'outputs': [{'name': 'Color', 'type': 'RGBA'},
+                    {'name': 'Alpha', 'type': 'VALUE'}]}
+    g['nodes']['bump'] = {
+        'id': 'bump', 'bl_idname': 'ShaderNodeBump',
+        'props': {'invert': False},
+        'inputs': [_sk('Strength', 'VALUE', strength),
+                   _sk('Distance', 'VALUE', 0.6),
+                   _sk('Height', 'VALUE', 0.5, ['htex', 0]),
+                   _sk('Normal', 'VECTOR', [0, 0, 0])],
+        'outputs': [{'name': 'Normal', 'type': 'VECTOR'}]}
+    for s in g['nodes']['hal']['inputs']:
+        if s['name'] == 'Normal':
+            s['link'] = ['bump', 0]
+        if s['name'] == 'Diffuse Color':
+            s['link'] = None
+            s['default'] = [0.8, 0.3, 0.2, 1.0]
+    return sc
+
+
 SCENES = {
+    # R253: the render region's bump-context scene
+    'region_bump': region_bump_scene,
     # R251 material pack, wave 2 (MAT-B): the period node scenes
     'combiner_node': _sc_combiner_node,
     'combiner_nv2a_node': _sc_combiner_nv2a_node,
@@ -2446,6 +2486,17 @@ ROWS = [
     ('debug pass DEPTH', {'debug_pass': 'DEPTH'}, 'demo'),
     ('aux passes (depth + normal)', {'pass_depth': True,
                                      'pass_normal': True}, 'demo'),
+    # R253: the render region (Blender's Ctrl+B border) -- the five
+    # border fields' matrix home; both devices must agree on the rect
+    # and the zeros outside it, plain and with the context rings (a
+    # thick ink line, a bump chain) engaged
+    ('render region quarter',
+     {'use_border': True, 'border_min_x': 0.25, 'border_min_y': 0.2,
+      'border_max_x': 0.8, 'border_max_y': 0.9}, 'demo'),
+    ('render region + ink + bump',
+     {'use_border': True, 'border_min_x': 0.25, 'border_min_y': 0.2,
+      'border_max_x': 0.8, 'border_max_y': 0.9,
+      'outline': True, 'outline_width': 3}, 'region_bump'),
 ]
 
 

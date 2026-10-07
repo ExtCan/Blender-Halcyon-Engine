@@ -21279,6 +21279,10 @@ def test_every_setting_does_what_it_says():
         'layer_gpu_min_frac': 'LAYER-pass scheduling threshold',
         'gpu_scissor':        'device-side scissor; parity rows run it on',
         'viewport_gpu':       'viewport drawing, outside the F12 contract',
+        # R253: the viewport's Camera Frame Only toggle -- read by
+        # engine._view_rect; proven by test_r253_region
+        'viewport_camera_frame': 'viewport drawing, outside the F12 '
+                                 'contract; proven by test_r253_region',
         'preview_scale':      'viewport pacing, outside the F12 contract',
         'progressive':        'viewport pacing, outside the F12 contract',
         'orbit_scale':        'viewport pacing; proven by '

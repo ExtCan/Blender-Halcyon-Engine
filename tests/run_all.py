@@ -30,6 +30,8 @@ def run_tests():
     from . import test_r253_generated_coords
     # R253 (1.92.0): the cube map world
     from . import test_r253_cubemap
+    # R253: the render region (camera box / Ctrl+B border)
+    from . import test_r253_region
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -141,6 +143,11 @@ def run_tests():
     print('R253 CUBE MAP WORLD')
     print('=' * 66)
     rc |= test_r253_cubemap.main()
+    print()
+    print('=' * 66)
+    print('R253 RENDER REGION (CAMERA BOX / CTRL+B BORDER)')
+    print('=' * 66)
+    rc |= test_r253_region.main()
     return rc
 
 

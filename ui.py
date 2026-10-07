@@ -367,6 +367,29 @@ class HALCYON_PT_output(HalcyonPanel, Panel):
             note.active = False
             note.label(text="Panoramic camera: pair with a Panoramas "
                             "& 360 preset", icon='INFO')
+        if bool(getattr(r, 'use_border', False)):
+            # R253: a passive status row -- Blender's own Render Region /
+            # Crop to Render Region checkboxes (RENDER_PT_format, adopted
+            # through enable_compatible_panels) are the controls; this
+            # names the rect Halcyon will shade, in output pixels
+            try:
+                from .engine import _border_rect
+                pct = max(int(getattr(r, 'resolution_percentage', 100)),
+                          1) / 100.0
+                tw = max(int(int(r.resolution_x) * pct), 1)
+                th = max(int(int(r.resolution_y) * pct), 1)
+                rect = _border_rect(r, tw, th)
+            except Exception:                                   # noqa: BLE001
+                rect = None
+            if rect is not None:
+                srow = layout.row()
+                srow.active = False
+                srow.label(text=f"Render Region: {rect[0]}..{rect[2]} x "
+                                f"{rect[1]}..{rect[3]}"
+                                + ("  (cropped)"
+                                   if getattr(r, 'use_crop_to_border', False)
+                                   else "  (placed in the full frame)"),
+                           icon='INFO')
 
 
 class HALCYON_PT_sampling(HalcyonPanel, Panel):
@@ -1330,6 +1353,7 @@ class HALCYON_PT_performance(HalcyonPanel, Panel):
         col.separator()
         col.prop(hs, 'preview_scale')
         col.prop(hs, 'orbit_scale')
+        col.prop(hs, 'viewport_camera_frame')        # R253
 
 
 

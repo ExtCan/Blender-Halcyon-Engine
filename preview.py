@@ -37,6 +37,7 @@ Rules the class keeps:
   see the difference on must never stall a final frame.
 """
 
+import math
 import threading
 import time
 
@@ -176,7 +177,78 @@ def shape_settings(settings, w, h):
     settings._viewport_stats = bool(getattr(settings, 'show_stats', False))
     settings.show_stats = False
     settings._viewport = True         # quiets the per-frame depth report
+    # R253: the viewport's rect comes from the DRAW side (engine._view_rect
+    # -> want(rect=...)), never from the scene's F12 border: a free view
+    # has no scene border, and the settings signature would otherwise
+    # re-render every view each time Blender's Render Region toggles
+    settings.use_border = False
+    settings.border_min_x = settings.border_min_y = 0.0
+    settings.border_max_x = settings.border_max_y = 1.0
     return settings
+
+
+def border_in_frame(frame, border):
+    """R253: Blender's camera-view rule (Cycles BlenderSync::get_buffer_
+    params): the scene's render border is RELATIVE to the camera frame,
+    so a border (fractions 0..1 of the frame) maps into the frame's
+    region-fraction rect. `frame` None means the whole region."""
+    if border is None:
+        return None
+    fr = (0.0, 0.0, 1.0, 1.0) if frame is None else tuple(
+        float(v) for v in frame)
+    fw, fh = fr[2] - fr[0], fr[3] - fr[1]
+    b = tuple(float(v) for v in border)
+    return (fr[0] + b[0] * fw, fr[1] + b[1] * fh,
+            fr[0] + b[2] * fw, fr[1] + b[3] * fh)
+
+
+def region_rect(w, h, frame=None, border=None):
+    """R253: the viewport's render rect as region fractions, or None.
+
+    `frame` is the camera frame's rect (region fractions, bottom-left
+    origin) when Camera Frame Only applies, `border` the render border
+    as region fractions (already mapped into the frame in camera view:
+    border_in_frame). The two intersect; the result is quantised to
+    whole region pixels with Blender's own truncation on every edge
+    (pipeline.cc: border * size, int) so the key is stable across the
+    sub-pixel jitter of a zooming camera view; None when nothing
+    applies, the rect is empty, or it is the whole region. The fifth
+    element says whether the CAMERA FRAME shaped the rect: the worker
+    then crops BEFORE the post chain (the frame's own corner is the
+    pattern origin, as it is for F12) and the draw side blits at the
+    rect; a border-only rect keeps the post over the whole region and
+    the frame carries alpha 0 outside."""
+    if frame is None and border is None:
+        return None
+    w, h = max(int(w), 1), max(int(h), 1)
+
+    def _clamp(r):
+        r = tuple(float(v) for v in r)
+        if not all(math.isfinite(v) for v in r):
+            return None
+        return (min(max(r[0], 0.0), 1.0), min(max(r[1], 0.0), 1.0),
+                min(max(r[2], 0.0), 1.0), min(max(r[3], 0.0), 1.0))
+    r = (0.0, 0.0, 1.0, 1.0)
+    frame_only = False
+    if frame is not None:
+        fr = _clamp(frame)
+        if fr is not None:
+            r = fr
+            frame_only = True
+    if border is not None:
+        br = _clamp(border)
+        if br is not None:
+            r = (max(r[0], br[0]), max(r[1], br[1]),
+                 min(r[2], br[2]), min(r[3], br[3]))
+    if r[2] <= r[0] or r[3] <= r[1]:
+        return None
+    x0, y0 = int(r[0] * w), int(r[1] * h)
+    x1, y1 = int(r[2] * w), int(r[3] * h)
+    x0, y0 = min(max(x0, 0), w - 1), min(max(y0, 0), h - 1)
+    x1, y1 = min(max(x1, x0 + 1), w), min(max(y1, y0 + 1), h)
+    if (x0, y0, x1, y1) == (0, 0, w, h):
+        return None
+    return (x0 / w, y0 / h, x1 / w, y1 / h, bool(frame_only))
 
 
 class Viewport:
@@ -191,6 +263,9 @@ class Viewport:
         self.wanted = None        # (key, camera, w, h) most recently drawn-for
         self.done_key = None      # (key, version, draft) the parked frame is of
         self.frame = None         # (H,W,4) float32, ready to blit
+        # R253: where the parked frame goes on the region (fractions
+        # x0, y0, x1, y1) in camera-frame mode, else None (whole region)
+        self.frame_rect = None
         self.abort = False
         self.busy = False
         self._inflight_draft = False
@@ -304,7 +379,7 @@ class Viewport:
                 self.abort = True
             self._last_change = self.clock()
 
-    def want(self, camera, w, h):
+    def want(self, camera, w, h, rect=None):
         """Record the view the draw side asked for.
 
         Animation-frame and data changes arrive as `set_scene` exports
@@ -315,11 +390,15 @@ class Viewport:
         draft instead of finishing a full frame of a view nobody is at.
         A draft in flight always runs to completion -- killing those is
         the exact bug that made the preview update only at rest.
+
+        R253: `rect` is the render rect (region_rect's tuple) or None;
+        it joins the key, so a changed border or camera frame re-kicks
+        and an unchanged one costs nothing.
         """
-        key = self._key(camera, w, h)
+        key = self._key(camera, w, h, rect)
         with self.lock:
             changed = self.wanted is not None and self.wanted[0] != key
-            self.wanted = (key, camera, w, h)
+            self.wanted = (key, camera, w, h, rect)
             if changed:
                 self._last_change = self.clock()
                 if self.busy and not self._inflight_draft:
@@ -366,7 +445,7 @@ class Viewport:
         return True
 
     @staticmethod
-    def _key(camera, w, h):
+    def _key(camera, w, h, rect=None):
         cam = None
         if camera is not None:
             cam = (tuple(np.round(np.asarray(camera.matrix_world,
@@ -374,7 +453,16 @@ class Viewport:
                    tuple(np.round(np.asarray(camera.projection,
                                              np.float64).reshape(-1), 5)),
                    camera.type)
-        return (cam, int(w), int(h))
+        if rect is None:
+            # the pre-R253 key, byte for byte: a whole-region view keys
+            # exactly as it always did
+            return (cam, int(w), int(h))
+        # R253: the rect, rounded like the matrices (region_rect already
+        # quantised it to whole pixels, so a jittering camera-view zoom
+        # does not re-kick drafts)
+        return (cam, int(w), int(h),
+                tuple(float(np.round(float(v), 6)) for v in rect[:4])
+                + (bool(rect[4]) if len(rect) > 4 else False,))
 
     def kick(self, engine=None):
         """Start a worker for the newest wanted view, if one is due.
@@ -388,7 +476,8 @@ class Viewport:
         with self.lock:
             if self.busy or self.scene is None or self.wanted is None:
                 return False
-            key, camera, w, h = self.wanted
+            key, camera, w, h = self.wanted[:4]
+            rect = self.wanted[4] if len(self.wanted) > 4 else None
             moving = (self.clock() - self._last_change) < DRAFT_WINDOW
             done = self.done_key
             if done is not None and done[0] == key and done[1] == self.version:
@@ -414,15 +503,24 @@ class Viewport:
             scene, settings, version = self.scene, self.settings, self.version
         worker = threading.Thread(
             target=self._render, name='halcyon-viewport',
-            args=(engine, scene, settings, camera, w, h, key, version, draft),
+            args=(engine, scene, settings, camera, w, h, key, version, draft,
+                  rect),
             daemon=True)
         worker.start()
         return True
 
     # ---------------------------------------------------------- worker thread
     def _render(self, engine, scene, settings, camera, w, h, key, version,
-                draft=False):
+                draft=False, rect=None):
         holding = False
+        # R253: the render rect (region fractions + the camera-frame
+        # flag) -- the per-frame settings copy carries it as Blender's
+        # own border fields, render() shades the rect only, and in
+        # camera-frame mode the worker crops BEFORE the post chain and
+        # parks where the frame goes
+        frame_only = bool(rect[4]) if (rect is not None and len(rect) > 4) \
+            else False
+        frame_rect = None
         try:
             # a fresh copy per frame: the stored settings object must not
             # accumulate this frame's resolution or device decisions
@@ -453,9 +551,76 @@ class Viewport:
                         scale += 1
             settings.resolution_x = max(int(w) // scale, 4)
             settings.resolution_y = max(int(h) // scale, 4)
+            if rect is not None:
+                settings.use_border = True
+                settings.border_min_x = float(rect[0])
+                settings.border_min_y = float(rect[1])
+                settings.border_max_x = float(rect[2])
+                settings.border_max_y = float(rect[3])
+            else:
+                settings.use_border = False
             if camera is not None:
                 scene.camera = camera
             scene.settings = settings
+
+            def _post(img_in, stx):
+                """The post chain for this frame: whole-region (border
+                mode: the rect is a window onto the region's render, the
+                patterns stay anchored to the region) or, in camera-frame
+                mode, over the CROPPED frame so the frame's own corner is
+                the pattern origin exactly as an F12 of the frame"""
+                flares = getattr(scene, 'last_flares', None)
+                cvg = getattr(scene, 'last_cvg', None)   # R251 C001
+                tsize = (stx.resolution_x, stx.resolution_y)
+                rp = core_render.region_pixels(stx, stx.resolution_x,
+                                               stx.resolution_y) \
+                    if frame_only else None
+                if rp is not None:
+                    x0, y0, x1, y1 = rp
+                    W0, H0 = int(stx.resolution_x), int(stx.resolution_y)
+                    img_in = np.ascontiguousarray(img_in[y0:y1, x0:x1])
+                    if cvg is not None and getattr(cvg, 'shape', (0, 0))[:2] \
+                            == (H0, W0):
+                        cvg = np.ascontiguousarray(cvg[y0:y1, x0:x1])
+                    elif cvg is not None:
+                        cvg = None
+                    if flares:
+                        # ndc sources through the crop (post maps ndc
+                        # onto (size - 1), the sources' own convention)
+                        bw, bh = x1 - x0, y1 - y0
+                        moved = []
+                        for src in flares:
+                            try:
+                                s2 = dict(src)
+                                sx = (float(s2['x']) * 0.5 + 0.5) * (W0 - 1) - x0
+                                sy = (float(s2['y']) * 0.5 + 0.5) * (H0 - 1) - y0
+                                s2['x'] = (sx / max(bw - 1, 1)) * 2.0 - 1.0
+                                s2['y'] = (sy / max(bh - 1, 1)) * 2.0 - 1.0
+                                moved.append(s2)
+                            except Exception:                   # noqa: BLE001
+                                moved.append(src)
+                        flares = moved
+                    tsize = (x1 - x0, y1 - y0)
+                    try:
+                        from .gpu import frame as _FRc
+                        # the resident frame is region-sized; the crop is
+                        # a CPU edit, named
+                        _FRc.edited(stx, 'camera frame crop')
+                    except Exception:                           # noqa: BLE001
+                        pass
+                out = post.process(img_in, stx,
+                                   frame=getattr(scene, 'frame', 0),
+                                   cvg=cvg,
+                                   coverage=None,
+                                   seed=getattr(stx, 'seed', 0),
+                                   target_size=tsize,
+                                   # R195: the per-lamp flares draw in the
+                                   # rendered viewport too -- the field set
+                                   # the dial, looked exactly here, and saw
+                                   # nothing because this call never passed
+                                   # the sources the render had computed
+                                   flare_sources=flares)
+                return out, rp
 
             wants_gpu = str(getattr(settings, 'render_device',
                                     'CPU')).upper() == 'GPU'
@@ -507,20 +672,24 @@ class Viewport:
                            limit=3)
             except Exception:                                   # noqa: BLE001
                 pass
-            img = post.process(img, settings,
-                               frame=getattr(scene, 'frame', 0),
-                               cvg=getattr(scene, 'last_cvg', None),  # R251 C001
-                               coverage=None,
-                               seed=getattr(settings, 'seed', 0),
-                               target_size=(settings.resolution_x,
-                                            settings.resolution_y),
-                               # R195: the per-lamp flares draw in the
-                               # rendered viewport too -- the field set
-                               # the dial, looked exactly here, and saw
-                               # nothing because this call never passed
-                               # the sources the render had computed
-                               flare_sources=getattr(scene, 'last_flares',
-                                                     None))
+            img, _rp = _post(img, settings)
+            if _rp is not None:
+                frame_rect = (_rp[0] / float(settings.resolution_x),
+                              _rp[1] / float(settings.resolution_y),
+                              _rp[2] / float(settings.resolution_x),
+                              _rp[3] / float(settings.resolution_y))
+
+            def _measure(img_m, stx):
+                """R253: the black guard measures the RECT only -- a
+                border frame is zero outside by contract, and a border
+                change must never read as a blackout"""
+                if rect is None or frame_only:
+                    return _black_measure(img_m)
+                rp2 = core_render.region_pixels(stx, img_m.shape[1],
+                                                img_m.shape[0])
+                if rp2 is None:
+                    return _black_measure(img_m)
+                return _black_measure(img_m[rp2[1]:rp2[3], rp2[0]:rp2[2]])
             # THE BLACK-FRAME GUARD (a field instrument). The field's
             # "materials randomly turning pure black" was found at its
             # root in R248: the GPU plan cached passes only for the
@@ -536,7 +705,7 @@ class Viewport:
             # event -- paste it. A legitimately dark scene converges and
             # costs at most one spurious CPU frame at a hard cut.
             if self.last_engaged == 'GPU':
-                blk, tiles = _black_measure(img)
+                blk, tiles = _measure(img, settings)
                 prev = self._black_prev
                 ptiles = self._black_tiles_prev
                 flips = 0
@@ -581,23 +750,15 @@ class Viewport:
                     retry.render_device = 'CPU'
                     scene.settings = retry
                     img = core_render.render(scene, retry, progress=tick)
-                    img = post.process(img, retry,
-                                       frame=getattr(scene, 'frame', 0),
-                                       cvg=getattr(scene, 'last_cvg', None),  # R251 C001
-                               coverage=None,
-                                       seed=getattr(retry, 'seed', 0),
-                                       target_size=(retry.resolution_x,
-                                                    retry.resolution_y),
-                                       flare_sources=getattr(
-                                           scene, 'last_flares', None))
+                    img, _rp = _post(img, retry)
                     self.last_engaged = 'CPU (guard)'
-                    blk, tiles = _black_measure(img)
+                    blk, tiles = _measure(img, retry)
                 self._black_prev = blk
                 self._black_tiles_prev = tiles
                 self._black_key = key
             else:
                 self._black_prev, self._black_tiles_prev = \
-                    _black_measure(img)
+                    _measure(img, settings)
                 self._black_key = key
             stats_on = getattr(settings, '_viewport_stats', False)
             if not draft and (stats_on or not self._split_said):
@@ -686,6 +847,7 @@ class Viewport:
             img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
             with self.lock:
                 self.frame = np.ascontiguousarray(img)
+                self.frame_rect = frame_rect
                 self.done_key = (key, version, draft)
                 self.busy = False
             try:
@@ -773,22 +935,34 @@ class Viewport:
         _dev.bury_screen((flat, buf))
         return self._tex
 
+    @staticmethod
+    def placeholder_color(depsgraph):
+        """The flat fill's colour: the world's, else near-black."""
+        col = (0.02, 0.02, 0.025, 1.0)
+        sc = getattr(depsgraph, 'scene', None)
+        world = getattr(sc, 'world', None)
+        if world is not None:
+            try:
+                c = world.color
+                col = (float(c[0]), float(c[1]), float(c[2]), 1.0)
+            except Exception:                                   # noqa: BLE001
+                pass
+        return col
+
+    def clear_region(self, depsgraph):
+        """R253: fill the whole region with the placeholder colour -- the
+        camera-frame blit lands on top of it, so the pixels outside the
+        frame show the viewport's own background (Blender's passepartout
+        darkens them as usual) instead of last redraw's leftovers."""
+        import gpu
+        fb = gpu.state.active_framebuffer_get()
+        fb.clear(color=self.placeholder_color(depsgraph))
+
     def draw_placeholder(self, depsgraph):
         """First frame not ready (or nothing to render): flat dark fill, so
         entering rendered mode visibly DID something while the worker runs."""
         try:
-            import gpu
-            col = (0.02, 0.02, 0.025, 1.0)
-            sc = getattr(depsgraph, 'scene', None)
-            world = getattr(sc, 'world', None)
-            if world is not None:
-                try:
-                    c = world.color
-                    col = (float(c[0]), float(c[1]), float(c[2]), 1.0)
-                except Exception:                               # noqa: BLE001
-                    pass
-            fb = gpu.state.active_framebuffer_get()
-            fb.clear(color=col)
+            self.clear_region(depsgraph)
         except Exception:                                       # noqa: BLE001
             import traceback
             self.complain('the placeholder draw failed',

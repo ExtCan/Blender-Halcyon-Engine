@@ -2772,6 +2772,139 @@ def _refracted_diagnosis(out, scB, stB, cpuA, gpuA, w2, h2):
         _p(out, f'      diagnosis itself failed: {_exc}')
 
 
+def render_region(out):
+    """R253: the render region on the REAL driver.
+
+    The headless suite proves the region machinery on the CPU road and
+    through the GLSL simulator; what only a driver can prove is the
+    scissored burst itself: `shade_frame(job, gbuf, region=box)` draws
+    every material pass and the sky pass inside the box and reads back
+    the box alone (the per-rank scissor transport, gpu_scissor's own
+    road). This section A/Bs that against the full frame's box -- the
+    bar is bitwise, the same bar the layer scissor holds -- and then
+    runs the whole render + post chain under the border, CPU device
+    against GPU device (the scissored target is released by name after
+    the readback -- its context ring is cut on the CPU -- so the resolve
+    and the post chain take the zero-padded frame on both devices).
+    """
+    from .core import post as _post
+    from .core import render as _R
+    from .core.settings import RenderSettings
+    from .gpu import device
+    from .gpu import shade as _GSH
+    from .tests.scenebuild import demo_scene
+
+    _p(out)
+    _p(out, LINE)
+    _p(out, 'RENDER REGION  (the Ctrl+B border on the driver)')
+    _p(out, LINE)
+    ok, why = device.probe()
+    if not ok:
+        _p(out, f'  skipped: {why}')
+        return
+
+    w, h = 320, 240
+    st = RenderSettings()
+    st.render_device = 'GPU'
+    st.aa_samples = 1
+    st.resolution_x, st.resolution_y = w, h
+    st.threads = 1
+    sc = demo_scene(st, with_texture=True)
+    view, _proj, vp, eye = _R.camera_matrices(sc.camera, w, h)
+    from .core import raster as _raster
+    g = _raster.GBuffer(w, h)
+    _raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g,
+                      depth_bits=st.depth_precision)
+    _R._build_shadows(sc, st, sc.mesh)
+    job = _R.ShadeJob(sc, st, _R.prepare_textures(sc, st), None, view, eye,
+                      w, h)
+    job.vp = vp
+    job.ss = 1
+    stb = st.copy()
+    stb.use_border = True
+    stb.border_min_x, stb.border_min_y = 0.25, 0.2
+    stb.border_max_x, stb.border_max_y = 0.8, 0.9
+    rect = _R.region_pixels(stb, w, h)
+    box = _R._region_box(_R._region_keep(rect, w, h, 1, 0))
+    _GSH._PLAN_CACHE.clear()
+    full, hit_f = _GSH.shade_frame(job, g)
+    if full is None:
+        _p(out, f'  skipped: the demo refused the GPU plan ({hit_f})')
+        return
+    _release = getattr(g, 'gpu_frame', None)
+    if _release is not None:
+        _release.release()
+    part, hit_p = _GSH.shade_frame(job, g, region=box)
+    if part is None:
+        _p(out, f'  FAILED: the scissored burst refused ({hit_p}) -- '
+                'paste this section')
+        return
+    _release = getattr(g, 'gpu_frame', None)
+    if _release is not None:
+        _release.release()
+    bx, by, bw, bh = box
+    a = np.abs(np.asarray(part[by:by + bh, bx:bx + bw], np.float64)
+               - full[by:by + bh, bx:bx + bw])
+    m = np.ones((h, w), bool)
+    m[by:by + bh, bx:bx + bw] = False
+    outside = float(np.abs(part[m]).max()) if m.any() else 0.0
+    fl = int((a.max(axis=2) > 0.0).sum())
+    _p(out, f'  scissored burst vs the full frame\'s box {box} '
+            f'({bw}x{bh} of {w}x{h}):')
+    _p(out, f'    max difference : {a.max():.6f}   px differing: {fl} '
+            f'of {bw * bh}   outside the box: {outside:.6f}')
+    if fl == 0 and outside == 0.0:
+        _p(out, '    bitwise: the region readback is the full frame\'s '
+                'box (pure transport)')
+    else:
+        _p(out, '    NOT bitwise -- the Debug toggle Scissor Layer Passes '
+                'does not govern this path; paste this section')
+
+    def _run(st_run):
+        sc_run = demo_scene(st_run, with_texture=True)
+        img = _R.render(sc_run, st_run)
+        return _post.process(img, st_run, frame=1, seed=st_run.seed,
+                             target_size=(w, h), allow_resize=False,
+                             depth=getattr(sc_run, 'last_depth', None),
+                             shaft_sources=getattr(sc_run, 'last_shafts',
+                                                   None),
+                             flare_sources=getattr(sc_run, 'last_flares',
+                                                   None),
+                             cvg=getattr(sc_run, 'last_cvg', None),
+                             coverage=getattr(sc_run, 'last_coverage',
+                                              None),
+                             gel=getattr(sc_run, 'last_gel', None))
+
+    stages = []
+    for label, ov in (('plain', {}),
+                      ('supersampled 2x2', {'aa_mode': 'SUPERSAMPLE',
+                                            'aa_samples': 4}),
+                      ('CRT + 16-bit Bayer', {'crt': True,
+                                              'crt_mask': 'APERTURE',
+                                              'crt_scanlines': 0.4,
+                                              'color_depth': '16',
+                                              'dither': 'BAYER4'})):
+        stc = stb.copy()
+        stc.render_device = 'CPU'
+        stg = stb.copy()
+        for k, v in ov.items():
+            setattr(stc, k, v)
+            setattr(stg, k, v)
+        cpu = _run(stc).astype(np.float64)
+        gpu = _run(stg).astype(np.float64)
+        d = np.abs(cpu - gpu)
+        x0, y0, x1, y1 = rect
+        inside = float(d[y0:y1, x0:x1].max())
+        outside = float(max(np.abs(cpu[m]).max() if m.any() else 0.0,
+                            np.abs(gpu[m]).max() if m.any() else 0.0))
+        stages.append(label)
+        _p(out, f'  {label:20s}: CPU vs GPU inside the rect max '
+                f'{inside:.6f}, outside {outside:.6f} (zeros by contract)')
+    _p(out, f'    stages engaged: {", ".join(stages)}; the rect is the '
+            f'full frame\'s rect on both devices, the post chain ran over '
+            f'the full-frame canvas (patterns anchored at the frame)')
+
+
 def _gpu_compute_probe_retired(out):
     """The round-19 API probe, kept for reference; superseded above."""
     _p(out)
@@ -2892,6 +3025,7 @@ class HALCYON_OT_selftest(Operator):
                     ('gpu compute capability', lambda: gpu_compute(out)),
                     ('viewport', lambda: viewport_device(out)),
                     ('feature matrix', lambda: feature_matrix(out)),
+                    ('render region', lambda: render_region(out)),   # R253
                     ('frame breakdown', lambda: frame_breakdown(out))]
         if self.include_scaling:
             sections.append(('cpu scaling', lambda: cpu_scaling(out, self.heavy)))

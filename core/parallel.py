@@ -431,9 +431,17 @@ def render_parallel(scene, settings, workers, scene_key=None, progress=None):
     count = max(1, min(int(workers), 64))
     if count < 2:
         return None, 'only one worker requested'
-    if H < 4 * count:
+    # R253: a render region bands only the rect's rows (the workers'
+    # render() applies the rect's columns itself and zeroes the rest);
+    # the size gates then judge the rect's pixel count, not the frame's
+    from .render import region_pixels
+    rect = region_pixels(settings, W, H)
+    ry0, ry1 = (0, H) if rect is None else (rect[1], rect[3])
+    H_eff = ry1 - ry0
+    W_eff = W if rect is None else (rect[2] - rect[0])
+    if H_eff < 4 * count:
         return None, 'frame too short to split usefully'
-    if W * H < 64 * 1024:
+    if W_eff * H_eff < 64 * 1024:
         # below this the pickling and pipe traffic cost more than the split saves
         return None, 'frame too small to be worth splitting'
 
@@ -446,8 +454,8 @@ def render_parallel(scene, settings, workers, scene_key=None, progress=None):
     # and with a scissor keeping the rasterisation proportional there is little
     # left to load-balance. Three bands each made the pool slower than not
     # using it at all.
-    n_bands = min(count, H)
-    edges = [round(i * H / n_bands) for i in range(n_bands + 1)]
+    n_bands = min(count, H_eff)
+    edges = [ry0 + round(i * H_eff / n_bands) for i in range(n_bands + 1)]
     bands = [(edges[i], edges[i + 1]) for i in range(n_bands)
              if edges[i + 1] > edges[i]]
 
@@ -461,4 +469,12 @@ def render_parallel(scene, settings, workers, scene_key=None, progress=None):
         return None, f'{type(exc).__name__}: {exc}'
     if parts is None:
         return None, pool.error
-    return np.concatenate(parts, axis=0), None
+    joined = np.concatenate(parts, axis=0)
+    if rect is None:
+        return joined, None
+    # R253: the rect's rows land in a zero full-frame canvas at y0 -- the
+    # in-process region frame's own shape and zeros, so the pool's pixels
+    # stay the in-process pixels
+    canvas = np.zeros((H, W) + tuple(joined.shape[2:]), np.float32)
+    canvas[ry0:ry0 + joined.shape[0]] = joined
+    return canvas, None
