@@ -262,6 +262,12 @@ def test_combine_laws():
           np.array_equal(CB.cb_luma64(L, A), CB.cb_luma64(L, A, 1.0))
           and CB.luma_remap_table(1.0) is None)
     tab = CB.luma_remap_table(0.5)
+    check('a Sega pass without a ramp keeps the 1.90 luma64 text (no remap '
+          'call) and a ramped one takes the table function',
+          'hal_luma_remap' not in GCB.combine_fns('SEGA_MODEL2', {}, 64, {})
+          and GCB.combine_fns('SEGA_MODEL2', {}, 64, {}) == GCB.FN_LUMA64
+          and 'float hal_luma_remap' in GCB.combine_fns(
+              'SEGA_MODEL2', {}, 64, {'__console': {'luma_gamma': 0.5}}))
     check('the luma remap table is monotone, 64 integers, ends pinned',
           tab.shape == (64,) and tab[0] == 0 and tab[63] == 63
           and np.all(np.diff(tab) >= 0) and np.array_equal(tab, np.floor(tab)))
@@ -329,9 +335,9 @@ def test_combine_gpu_twins():
         ('N64 blend', GCB.FN_N64BLEND, 'hal_cb_n64blend(L, A, a)', CB.cb_n64_blend(L, A, a)),
         ('Jaguar', GCB.FN_JAGUAR, 'hal_cb_jaguar(L, A)', CB.cb_jaguar(L, A)),
         ('3DO', GCB.FN_THREEDO, 'hal_cb_threedo(L, A)', CB.cb_threedo(L, A)),
-        ('luma64 gamma 0.5', GCB.fn_luma_remap(0.5) + GCB.FN_LUMA64,
+        ('luma64 gamma 0.5', GCB.fn_luma_remap(0.5) + GCB.FN_LUMA64_GAMMA,
          'hal_cb_luma64(L, A)', CB.cb_luma64(L, A, 0.5)),
-        ('luma64 gamma 1 (identity remap)', GCB.fn_luma_remap(1.0) + GCB.FN_LUMA64,
+        ('luma64 gamma 1 (the 1.90 text, no remap)', GCB.FN_LUMA64,
          'hal_cb_luma64(L, A)', CB.cb_luma64(L, A)),
         ('Saturn half', GCB.FN_SATURN_HALF, 'hal_cb_saturn_half(L, A)',
          CB.cb_saturn(L, A, half=True)),

@@ -148,7 +148,6 @@ FN_LUMA64 = FN_LUM + (
     '    float lum = hal_lum(L);\n'
     '    float l8 = floor(clamp(lum, 0.0, 1.0) * 255.0);\n'
     '    float lum6 = min(floor(l8 / 4.0), 63.0);\n'
-    '    lum6 = hal_luma_remap(lum6);\n'
     '    vec3 ca = clamp(A, 0.0, 1.0) * 31.0;\n'
     '    vec3 c5 = floor(ca + 0.5);\n'
     '    vec3 num = c5 * lum6;\n'
@@ -158,17 +157,23 @@ FN_LUMA64 = FN_LUM + (
     f'    return o8 * {R255};\n'
     '}\n')
 
+#: R252: the luma64 text WITH the ramp lookup -- FN_LUMA64 above is the
+#: 1.90 text to the byte (a Sega pass without a ramp keeps it); a pass with
+#: a Luma Ramp Gamma takes this one, after fn_luma_remap's table
+FN_LUMA64_GAMMA = FN_LUMA64.replace(
+    '    float lum6 = min(floor(l8 / 4.0), 63.0);\n',
+    '    float lum6 = min(floor(l8 / 4.0), 63.0);\n'
+    '    lum6 = hal_luma_remap(lum6);\n')
+
+
 def fn_luma_remap(gamma):
     """R252: the 64-entry luma ramp (core/combine.luma_remap_table) as a
-    GLSL function -- the identity at gamma 1 (the pre-R252 text plus one
-    call), else 64 compares against baked integers: no pow() in the
-    shader, the SAME table the CPU read."""
+    GLSL function -- 64 compares against baked integers: no pow() in the
+    shader, the SAME table the CPU read. Returns '' at gamma 1 (no ramp:
+    the pass takes FN_LUMA64 unchanged)."""
     tab = CB.luma_remap_table(gamma)
     if tab is None:
-        return ('float hal_luma_remap(float i)\n'
-                '{\n'
-                '    return i;\n'
-                '}\n')
+        return ''
     terms = ' + '.join(f'((abs(i - {_f(k)}) < 0.5) ? {_f(v)} : 0.0)'
                        for k, v in enumerate(tab))
     return ('float hal_luma_remap(float i)\n'
@@ -427,7 +432,8 @@ def combine_fns(model, consts, vside, bake=None):
     opts = (bake or {}).get('__console') or {}
     kind = CB.LIGHTING_COMBINE.get(model)
     if kind == 'luma64':
-        return fn_luma_remap(float(opts.get('luma_gamma', 1.0))) + FN_LUMA64
+        remap = fn_luma_remap(float(opts.get('luma_gamma', 1.0)))
+        return (remap + FN_LUMA64_GAMMA) if remap else FN_LUMA64
     if kind == 'ds':
         return FN_DS
     fns = ''

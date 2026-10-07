@@ -115,7 +115,14 @@ def test_shading_rates_differ():
 EXPECTED_TWINS = {('LAMBERT', 'TRANSLUCENT'), ('MAX_BLINN', 'MAX_TRANSLUCENT'),
                   # R251 (MAT-A C049): the plot refuses at defaults (no
                   # fixed palette) and shades as FLAT, by name
-                  ('FLAT', 'SUPERFX_PLOT')}
+                  ('FLAT', 'SUPERFX_PLOT'),
+                  # R252: forced on a bare material, RenderWare's PS2
+                  # pipeline IS the GS's x/128 arithmetic (the prelight
+                  # and the surface coefficients live on the Console
+                  # node), and G_CC_SHADE differs from the modulate only
+                  # under a linked texture (none on the demo materials)
+                  ('PS1_MODULATE', 'RENDERWARE_PS2'),
+                  ('N64_COMBINE', 'N64_SHADE')}
 
 
 def test_models_differ():
@@ -35442,7 +35449,8 @@ void main() {{ Color = {expr}; }}'''
     # ---- the eight Max shaders: on the master, on both devices
     names = [mi[0] for mi in MODEL_ITEMS]
     check('the eight Max shaders are models 24..31, appended so no code moves',
-          len(names) == 32 + 4 + 13 and names[24:32] == ['MAX_PHONG', 'MAX_BLINN', 'MAX_METAL',
+          # (R251 appended 4 + 13, R252 the Console Emulation Shader's 10)
+          len(names) == 32 + 4 + 13 + 10 and names[24:32] == ['MAX_PHONG', 'MAX_BLINN', 'MAX_METAL',
                                               'MAX_ANISOTROPIC', 'MAX_MULTI_LAYER',
                                               'MAX_OREN_NAYAR_BLINN', 'MAX_STRAUSS',
                                               'MAX_TRANSLUCENT']

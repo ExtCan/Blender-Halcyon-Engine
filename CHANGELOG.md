@@ -197,7 +197,7 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   22 remaining items keep their indices; the R251 pins
   (`test_r251_lighting_models`, `test_r251_material.test_b_tables_and_items`
   with the new items appended) hold.
-- **Tests.** `tests/test_r252_console.py` (139 checks: the tables, the
+- **Tests.** `tests/test_r252_console.py` (140 checks: the tables, the
   combine laws, the GPU twins, the frames, the options, the rate override,
   the GPU parity and refusals, the node and the load migration on a fake
   tree), registered in `run_all`; `test_enum_callback_default_rule` and the
