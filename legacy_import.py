@@ -185,6 +185,16 @@ def _convert_material(bmat, mdict, version, blend_dir, warnings,
             bmat.diffuse_color = tuple(h['color']) + (1.0,)
         except (AttributeError, TypeError, ValueError):
             pass
+        # R253: the panel props were the staging format; the material
+        # arrives as a Halo node straight away (an operator context,
+        # where node creation is legal)
+        try:
+            from .nodes import shader_nodes as _SN
+            _SN.migrate_halo_material(bmat)
+        except Exception as exc:                            # noqa: BLE001
+            warnings.append(f"{spec['name']}: the halo panel did not "
+                            f'convert to a Halo node ({exc}); the '
+                            'deprecated panel kit renders it')
         return bmat, 0
     n_images = 0
     for entry in spec['textures']:

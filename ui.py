@@ -336,6 +336,50 @@ class HALCYON_OT_halo_ramp(Operator):
         return {'FINISHED'}
 
 
+class HALCYON_OT_halo_node(Operator):
+    """R253: give a material its Halo node.
+
+    A material still carrying the deprecated panel kit (hs.halo) is
+    converted value for value (shader_nodes.migrate_halo_material);
+    any other material gets a bare Halo node linked to an unlinked
+    Surface. Node creation is legal here (an operator), never in a
+    draw or update callback."""
+
+    bl_idname = 'halcyon.halo_node'
+    bl_label = "Add Halo Node"
+    bl_description = ("Add a Halo node to this material -- its vertices "
+                      "then glow as billboard halos and its faces do not "
+                      "draw; legacy panel halo settings convert to the "
+                      "node value for value")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.material is not None
+
+    def execute(self, context):
+        from .nodes import shader_nodes as SN
+        mat = context.material
+        if not mat.use_nodes:
+            mat.use_nodes = True
+        hs = getattr(mat, 'halcyon', None)
+        node = None
+        if hs is not None and getattr(hs, 'halo', False):
+            node = SN.migrate_halo_material(mat)
+        tree = mat.node_tree
+        if node is None and tree is not None and \
+                SN.halo_node_of(tree) is None:
+            node = tree.nodes.new('HALCYON_HaloNode')
+            node.label = "Halo"
+            node.location = (-300, 300)
+            out = SN._active_output_node(tree)
+            if out is not None:
+                surf = out.inputs.get('Surface')
+                if surf is not None and not surf.is_linked:
+                    tree.links.new(node.outputs[0], surf)
+        return {'FINISHED'}
+
+
 class HALCYON_MT_resolutions(bpy.types.Menu):
     bl_idname = 'HALCYON_MT_resolutions'
     bl_label = "Resolution Presets"
@@ -2153,11 +2197,33 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
         if hs.wire or hs.model == 'WIREFRAME':
             col.prop(hs, 'wire_size')
 
-        # ---- Halo: BI's other material type, never gated by Override
+        # ---- Halo: BI's other material type, never gated by Override.
+        # R253: the kit lives on the Halo node now. The panel shows the
+        # node when there is one; the DEPRECATED legacy kit with a
+        # convert button when a file still carries hs.halo without a
+        # node; else the Add Halo Node button. The `halo` checkbox is
+        # no longer drawn -- the panel path is creation-locked
         layout.separator()
         hcol = layout.column()
-        hcol.prop(hs, 'halo')
-        if hs.halo:
+        from .export import halo_node_of as _halo_node_of
+        _hnode = _halo_node_of(mat) if mat is not None else None
+        if _hnode is not None:
+            box = hcol.box()
+            box.label(text=f"Halo node: {_hnode.name}", icon='PARTICLES')
+            note = box.row()
+            note.active = False
+            note.label(text="Edit it in the Shader Editor; the mesh's "
+                            "vertices glow, faces do not draw",
+                       icon='INFO')
+        elif not hs.halo:
+            hcol.operator('halcyon.halo_node', text="Add Halo Node",
+                          icon='PARTICLES')
+        if _hnode is None and hs.halo:
+            warn = hcol.box()
+            warn.label(text="Legacy halo settings (deprecated) -- "
+                            "convert to a Halo node", icon='ERROR')
+            warn.operator('halcyon.halo_node', text="Convert to Halo Node",
+                          icon='PARTICLES')
             sub = hcol.column()
             sub.prop(hs, 'halo_shape')
             if hs.halo_shape == 'IMAGE':
@@ -3302,6 +3368,7 @@ def _wrap(text, width):
 CLASSES = (
     HALCYON_OT_apply_preset, HALCYON_OT_set_resolution,
     HALCYON_OT_halo_ramp,
+    HALCYON_OT_halo_node,                 # R253
     HALCYON_OT_adopt_shadow_settings,
 ) + RESOLUTION_MENUS + (
     HALCYON_MT_resolutions, HALCYON_PT_output,

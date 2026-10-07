@@ -3210,10 +3210,11 @@ class HalcyonMaterialSettings(PropertyGroup):
     # ---- Halo material (R191): Blender Internal's MA_TYPE_HALO ----
     halo: BoolProperty(
         name="Halo", default=False,
-        description="Render this material as Blender Internal halos: "
-                    "the mesh's vertices become depth-tested billboard "
-                    "glows instead of surfaces -- the 90s way to do "
-                    "sparks, fairy dust, star fields and energy effects")
+        description="DEPRECATED (pre-1.92 panel path): render this "
+                    "material as Blender Internal halos -- the mesh's "
+                    "vertices become depth-tested billboard glows. A "
+                    "file carrying it grows a Halo node at load (R253) "
+                    "and the toggle clears; the node is the one kit now")
     halo_size: FloatProperty(
         name="Halo Size", default=0.5, min=0.0, max=100.0,
         description="World-space radius of each glow (2.79's HaloSize)")

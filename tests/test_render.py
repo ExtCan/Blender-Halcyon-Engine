@@ -23942,7 +23942,15 @@ def test_halo_materials():
                         ray_color=None, bolt_color=None, hue_shift=0.0,
                         sat_shift=1.0, val_shift=1.0, pulse_speed=1.0,
                         flicker_speed=1.0, noise_speed=1.0,
-                        bolt_speed=1.0, grad_noise_speed=1.0)
+                        bolt_speed=1.0, grad_noise_speed=1.0,
+                        # R253: the Halo node's new keys at their
+                        # defaults -- the old road bit for bit
+                        falloff='BI', ring_inner=0.6,
+                        blend='ADD_SLIDER', depth_mode='ZBUFFER',
+                        fade_near=0.0, fade_far=0.0, stretch=1.0,
+                        stretch_angle=0.0, glow_size=0.0,
+                        glow_strength=1.0, glow_color=None,
+                        animate_seed=False)
     check('the expansion kit at defaults is bitwise-neutral',
           bool(np.array_equal(neutral, rich)))
     # the same promise with rays and bolts LIVE: the split
@@ -25229,6 +25237,8 @@ def test_every_node_prop_reaches_the_renderer():
         ('HALCYON_AnimeShaderNode', 'style'):
             'a preset applicator: writes the sockets and the tone '
             'menus, which serialize by themselves (R240)',
+        ('HALCYON_HaloNode', 'ui_page'):
+            'node-panel paging; draws nothing (R253)',
     }
     dead = []
     for cls in SN.NODES:
@@ -34590,7 +34600,9 @@ def test_tooltips_everywhere():
     for cls, docs, label in (
             (SN.HALCYON_AnimeShaderNode, SN.ANIME_SOCKET_DOCS, 'Anime'),
             (SN.HALCYON_CartoonNode, SN.CARTOON_SOCKET_DOCS, 'Cartoon'),
-            (SN.HALCYON_VolumeNode, SN.VOLUME_SOCKET_DOCS, 'Volume')):
+            (SN.HALCYON_VolumeNode, SN.VOLUME_SOCKET_DOCS, 'Volume'),
+            # R253: the Halo node's table
+            (SN.HALCYON_HaloNode, SN.HALO_SOCKET_DOCS, 'Halo')):
         names = [s[1] for s in cls.SOCKETS]
         miss = [n for n in names if len(docs.get(n, '')) < 40]
         check(f'the {label} master documents every one of its '
@@ -34615,7 +34627,7 @@ def test_tooltips_everywhere():
           and n.inputs[2].description == 'stays')
     src = open(SN.__file__, encoding='utf-8').read()
     for idn in ('ANIME_SOCKET_DOCS', 'CARTOON_SOCKET_DOCS',
-                'VOLUME_SOCKET_DOCS'):
+                'VOLUME_SOCKET_DOCS', 'HALO_SOCKET_DOCS'):
         check(f'ensure_sockets re-applies {idn} at load',
               src.count(f'_apply_socket_tips(self, {idn})') >= 2)
 

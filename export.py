@@ -100,6 +100,19 @@ NODE_PROPS = {
                                 'hair_shine_shape'),
     # R225: the volume master's law, container shape and voxel lattice
     'HALCYON_VolumeNode': ('model', 'shape', 'voxels'),
+    # R253: the Halo node (ui_page is panel paging; image is a Pointer)
+    'HALCYON_HaloNode': (
+        'hardness', 'seed', 'animate_seed', 'rings', 'ring_count',
+        'rings_even', 'ring_width', 'lines', 'line_count', 'line_width',
+        'star', 'star_tips', 'shape', 'noise', 'noise_scale', 'bolts',
+        'bolt_width', 'bolt_own_color', 'rays', 'ray_sharp',
+        'ray_own_color', 'gradient', 'gradient_type', 'gradient_noise',
+        'aspect', 'rotation', 'rand_hue', 'rand_sat', 'rand_val',
+        'hue_shift', 'sat_shift', 'val_shift', 'pulse', 'flicker',
+        'spin', 'anim_speed', 'pulse_speed', 'flicker_speed',
+        'noise_speed', 'bolt_speed', 'grad_noise_speed', 'xalpha',
+        'soft', 'shaded', 'puno', 'falloff', 'ring_inner', 'blend',
+        'depth_mode', 'glow_own_color'),
     # R228: the cartoon master's shadow mode (the Era menu is a preset
     # applicator: it writes the sockets, which serialize by themselves)
     'HALCYON_CartoonNode': ('shadow_mode', 'rim_blend',
@@ -533,112 +546,14 @@ def export_material(mat, images, warnings):
         m.ink_vc = str(getattr(hs, 'ink_vc', 'OFF') or 'OFF')
         # R233: the cel or the painting
         m.paint_mode = str(getattr(hs, 'paint_mode', 'CEL') or 'CEL')
-        if getattr(hs, 'halo', False):
-            # R191: BI's halo material -- the whole panel in one spec.
-            # Counts are 0 when their toggle is off, exactly the 2.79
-            # mode-bit-gates-count arrangement
-            m.halo = {
-                'size': float(hs.halo_size),
-                'hardness': int(hs.halo_hardness),
-                'add': float(hs.halo_add),
-                'alpha': float(hs.halo_alpha),
-                'color': tuple(hs.halo_color),
-                'seed': int(hs.halo_seed),
-                'rings': int(hs.halo_ring_count) if hs.halo_rings else 0,
-                'lines': int(hs.halo_line_count) if hs.halo_lines else 0,
-                'star_points': int(hs.halo_star_tips) if hs.halo_star
-                               else 0,
-                'ring_color': tuple(hs.halo_ring_color),
-                'line_color': tuple(hs.halo_line_color),
-                'xalpha': bool(hs.halo_xalpha),
-                'soft': bool(hs.halo_soft),
-                'shaded': bool(hs.halo_shaded),
-                'puno': bool(hs.halo_puno),
-                # R194: the expansion kit -- all neutral at defaults
-                'shape': str(getattr(hs, 'halo_shape', 'DISC')),
-                'line_width': float(getattr(hs, 'halo_line_width', 1.0)),
-                'ring_width': float(getattr(hs, 'halo_ring_width', 1.0)),
-                'gradient': bool(getattr(hs, 'halo_gradient', False)),
-                'color2': tuple(getattr(hs, 'halo_color2',
-                                        (0.0, 0.0, 0.0))),
-                'rand_hue': float(getattr(hs, 'halo_rand_hue', 0.0)),
-                'rand_sat': float(getattr(hs, 'halo_rand_sat', 0.0)),
-                'rand_val': float(getattr(hs, 'halo_rand_val', 0.0)),
-                'pulse': float(getattr(hs, 'halo_pulse', 0.0)),
-                'flicker': float(getattr(hs, 'halo_flicker', 0.0)),
-                'spin': float(getattr(hs, 'halo_spin', 0.0)),
-                'anim_speed': float(getattr(hs, 'halo_anim_speed', 1.0)),
-                'aspect': float(getattr(hs, 'halo_aspect', 1.0)),
-                'rotation': float(getattr(hs, 'halo_rotation', 0.0)),
-                # R198: the energy kit
-                'noise': float(getattr(hs, 'halo_noise', 0.0)),
-                'noise_scale': float(getattr(hs, 'halo_noise_scale',
-                                             4.0)),
-                'bolts': int(getattr(hs, 'halo_bolts', 0)),
-                'bolt_width': float(getattr(hs, 'halo_bolt_width', 1.0)),
-                'rays': int(getattr(hs, 'halo_rays', 0)),
-                'ray_sharp': float(getattr(hs, 'halo_ray_sharp', 8.0)),
-                'rings_even': bool(getattr(hs, 'halo_rings_even',
-                                           False)),
-                'gradient_type': str(getattr(hs, 'halo_gradient_type',
-                                             'RADIAL')),
-                'gradient_noise': float(getattr(hs,
-                                                'halo_gradient_noise',
-                                                0.0)),
-                # R200: master HSV shift and the per-effect clocks --
-                # all exactly neutral at 0 / 1 / 1 and x1.0
-                'hue_shift': float(getattr(hs, 'halo_hue_shift', 0.0)),
-                'sat_shift': float(getattr(hs, 'halo_sat_shift', 1.0)),
-                'val_shift': float(getattr(hs, 'halo_val_shift', 1.0)),
-                'pulse_speed': float(getattr(hs, 'halo_pulse_speed',
-                                             1.0)),
-                'flicker_speed': float(getattr(hs,
-                                               'halo_flicker_speed',
-                                               1.0)),
-                'noise_speed': float(getattr(hs, 'halo_noise_speed',
-                                             1.0)),
-                'bolt_speed': float(getattr(hs, 'halo_bolt_speed',
-                                            1.0)),
-                'grad_noise_speed': float(getattr(
-                    hs, 'halo_grad_noise_speed', 1.0)),
-            }
-            # R200: Ray/Bolt Colour ship only once the artist has SET
-            # them -- untouched, the key stays absent and the core
-            # keeps riding the Line Colour, so every existing scene
-            # renders exactly as before the dials existed
-            for pk, sk in (('ray_color', 'halo_ray_color'),
-                           ('bolt_color', 'halo_bolt_color')):
-                try:
-                    if hs.is_property_set(sk):
-                        m.halo[pk] = tuple(getattr(hs, sk))
-                except Exception:                               # noqa: BLE001
-                    pass
-            # the image halo: the picture rides the scene's image pool
-            himg = getattr(hs, 'halo_image', None)
-            if himg is not None and \
-                    str(getattr(hs, 'halo_shape', '')) == 'IMAGE':
-                try:
-                    key = himg.name_full
-                    if key not in images:
-                        px = compat.image_pixels(himg)
-                        if px is not None:
-                            images[key] = ImageBuffer(name=key,
-                                                      pixels=px)
-                    m.halo['image'] = images.get(key)
-                except Exception:                               # noqa: BLE001
-                    pass
-            # the colour ramp, sampled into a small LUT (the widget
-            # lives on the hidden '__halo_ramp' node)
-            try:
-                if getattr(hs, 'halo_gradient', False) and \
-                        compat.uses_nodes(mat) and mat.node_tree:
-                    rn = mat.node_tree.nodes.get('__halo_ramp')
-                    if rn is not None:
-                        cr = rn.color_ramp
-                        m.halo['ramp'] = [tuple(cr.evaluate(i / 31.0))
-                                          for i in range(32)]
-            except Exception:                                   # noqa: BLE001
-                pass
+    # R253: the Halo node wins; the panel kit is the DEPRECATED fallback
+    # for a material that still carries hs.halo without a node (a legacy
+    # import or a failed migration), so old files render bit for bit
+    _hn = halo_node_of(mat)
+    if _hn is not None:
+        m.halo = _halo_spec_from_node(_hn, mat, images, warnings)
+    elif hs is not None and getattr(hs, 'halo', False):
+        m.halo = _halo_spec_from_panel(hs, mat, images)
     if compat.uses_nodes(mat) and mat.node_tree and \
             not (hs is not None and hs.use_override):
         # a material with Override on shades from the panel's own fields --
@@ -1608,7 +1523,479 @@ def export_lights_into(parked, depsgraph):
     return scene
 
 
-def _collect_halo_points(me, matrix, slots):
+def _halo_spec_from_panel(hs, mat, images):
+    """R191: BI's halo material -- the whole panel in one spec.
+
+    R253: the DEPRECATED road. A material that still carries `hs.halo`
+    without a Halo node (a legacy import that could not convert, a
+    file whose load-time migration failed) exports through this
+    function UNCHANGED, so every pre-1.92 file renders bit for bit;
+    a material with a node never reaches it (_halo_spec_from_node).
+    """
+    # Counts are 0 when their toggle is off, exactly the 2.79
+    # mode-bit-gates-count arrangement
+    halo = {
+        'size': float(hs.halo_size),
+        'hardness': int(hs.halo_hardness),
+        'add': float(hs.halo_add),
+        'alpha': float(hs.halo_alpha),
+        'color': tuple(hs.halo_color),
+        'seed': int(hs.halo_seed),
+        'rings': int(hs.halo_ring_count) if hs.halo_rings else 0,
+        'lines': int(hs.halo_line_count) if hs.halo_lines else 0,
+        'star_points': int(hs.halo_star_tips) if hs.halo_star
+                       else 0,
+        'ring_color': tuple(hs.halo_ring_color),
+        'line_color': tuple(hs.halo_line_color),
+        'xalpha': bool(hs.halo_xalpha),
+        'soft': bool(hs.halo_soft),
+        'shaded': bool(hs.halo_shaded),
+        'puno': bool(hs.halo_puno),
+        # R194: the expansion kit -- all neutral at defaults
+        'shape': str(getattr(hs, 'halo_shape', 'DISC')),
+        'line_width': float(getattr(hs, 'halo_line_width', 1.0)),
+        'ring_width': float(getattr(hs, 'halo_ring_width', 1.0)),
+        'gradient': bool(getattr(hs, 'halo_gradient', False)),
+        'color2': tuple(getattr(hs, 'halo_color2',
+                                (0.0, 0.0, 0.0))),
+        'rand_hue': float(getattr(hs, 'halo_rand_hue', 0.0)),
+        'rand_sat': float(getattr(hs, 'halo_rand_sat', 0.0)),
+        'rand_val': float(getattr(hs, 'halo_rand_val', 0.0)),
+        'pulse': float(getattr(hs, 'halo_pulse', 0.0)),
+        'flicker': float(getattr(hs, 'halo_flicker', 0.0)),
+        'spin': float(getattr(hs, 'halo_spin', 0.0)),
+        'anim_speed': float(getattr(hs, 'halo_anim_speed', 1.0)),
+        'aspect': float(getattr(hs, 'halo_aspect', 1.0)),
+        'rotation': float(getattr(hs, 'halo_rotation', 0.0)),
+        # R198: the energy kit
+        'noise': float(getattr(hs, 'halo_noise', 0.0)),
+        'noise_scale': float(getattr(hs, 'halo_noise_scale',
+                                     4.0)),
+        'bolts': int(getattr(hs, 'halo_bolts', 0)),
+        'bolt_width': float(getattr(hs, 'halo_bolt_width', 1.0)),
+        'rays': int(getattr(hs, 'halo_rays', 0)),
+        'ray_sharp': float(getattr(hs, 'halo_ray_sharp', 8.0)),
+        'rings_even': bool(getattr(hs, 'halo_rings_even',
+                                   False)),
+        'gradient_type': str(getattr(hs, 'halo_gradient_type',
+                                     'RADIAL')),
+        'gradient_noise': float(getattr(hs,
+                                        'halo_gradient_noise',
+                                        0.0)),
+        # R200: master HSV shift and the per-effect clocks --
+        # all exactly neutral at 0 / 1 / 1 and x1.0
+        'hue_shift': float(getattr(hs, 'halo_hue_shift', 0.0)),
+        'sat_shift': float(getattr(hs, 'halo_sat_shift', 1.0)),
+        'val_shift': float(getattr(hs, 'halo_val_shift', 1.0)),
+        'pulse_speed': float(getattr(hs, 'halo_pulse_speed',
+                                     1.0)),
+        'flicker_speed': float(getattr(hs,
+                                       'halo_flicker_speed',
+                                       1.0)),
+        'noise_speed': float(getattr(hs, 'halo_noise_speed',
+                                     1.0)),
+        'bolt_speed': float(getattr(hs, 'halo_bolt_speed',
+                                    1.0)),
+        'grad_noise_speed': float(getattr(
+            hs, 'halo_grad_noise_speed', 1.0)),
+    }
+    # R200: Ray/Bolt Colour ship only once the artist has SET
+    # them -- untouched, the key stays absent and the core
+    # keeps riding the Line Colour, so every existing scene
+    # renders exactly as before the dials existed
+    for pk, sk in (('ray_color', 'halo_ray_color'),
+                   ('bolt_color', 'halo_bolt_color')):
+        try:
+            if hs.is_property_set(sk):
+                halo[pk] = tuple(getattr(hs, sk))
+        except Exception:                               # noqa: BLE001
+            pass
+    # the image halo: the picture rides the scene's image pool
+    himg = getattr(hs, 'halo_image', None)
+    if himg is not None and \
+            str(getattr(hs, 'halo_shape', '')) == 'IMAGE':
+        try:
+            key = himg.name_full
+            if key not in images:
+                px = compat.image_pixels(himg)
+                if px is not None:
+                    images[key] = ImageBuffer(name=key,
+                                              pixels=px)
+            halo['image'] = images.get(key)
+        except Exception:                               # noqa: BLE001
+            pass
+    # the colour ramp, sampled into a small LUT (the widget
+    # lives on the hidden '__halo_ramp' node)
+    try:
+        if getattr(hs, 'halo_gradient', False) and \
+                compat.uses_nodes(mat) and mat.node_tree:
+            rn = mat.node_tree.nodes.get('__halo_ramp')
+            if rn is not None:
+                cr = rn.color_ramp
+                halo['ramp'] = [tuple(cr.evaluate(i / 31.0))
+                                  for i in range(32)]
+    except Exception:                                   # noqa: BLE001
+        pass
+    return halo
+
+
+# ------------------------------------------------- R253: the Halo node road
+
+
+def halo_node_of(mat):
+    """R253: the Halo node a material shades by, or None.
+
+    Every touch is getattr-guarded: the stub materials of the suite
+    are SimpleNamespaces with node_tree=None, and a material whose
+    `use_nodes` is off keeps its tree out of the picture."""
+    if mat is None:
+        return None
+    try:
+        if not compat.uses_nodes(mat):
+            return None
+    except Exception:                                           # noqa: BLE001
+        return None
+    tree = getattr(mat, 'node_tree', None)
+    if tree is None:
+        return None
+    try:
+        from .nodes.shader_nodes import halo_node_of as _in_tree
+        return _in_tree(tree)
+    except Exception:                                           # noqa: BLE001
+        return None
+
+
+def material_is_halo(obj):
+    """R253: does this material (or a slot stub carrying `.halcyon`)
+    glow? A Halo node in its tree, or the deprecated panel toggle."""
+    if obj is None:
+        return False
+    mat = getattr(obj, 'material', None)
+    if mat is None and not hasattr(obj, 'material'):
+        mat = obj                      # a material (or a stub) itself
+    hs = getattr(obj, 'halcyon', None)
+    if hs is None and mat is not None:
+        hs = getattr(mat, 'halcyon', None)
+    if mat is not None and halo_node_of(mat) is not None:
+        return True
+    return bool(getattr(hs, 'halo', False))
+
+
+def _halo_puno_of(obj, hs):
+    """Vertex Normal scaling: the node's flag, else the panel's."""
+    mat = getattr(obj, 'material', None)
+    if mat is None and not hasattr(obj, 'material'):
+        mat = obj
+    node = halo_node_of(mat)
+    if node is not None:
+        return bool(getattr(node, 'puno', False))
+    return bool(getattr(hs, 'halo_puno', False))
+
+
+def _halo_sock(node, name):
+    ins = getattr(node, 'inputs', None)
+    if ins is None:
+        return None
+    get = getattr(ins, 'get', None)
+    if callable(get):
+        try:
+            s = get(name)
+            if s is not None:
+                return s
+        except Exception:                                       # noqa: BLE001
+            pass
+    for s in ins:
+        if getattr(s, 'name', None) == name:
+            return s
+    return None
+
+
+def _halo_link_source(sock):
+    """(from_node, from_socket) of a linked socket, else None."""
+    if sock is None or not getattr(sock, 'is_linked', False):
+        return None
+    links = getattr(sock, 'links', None) or ()
+    if not links:
+        return None
+    lk = links[0]
+    return getattr(lk, 'from_node', None), getattr(lk, 'from_socket', None)
+
+
+def _halo_plain(v):
+    """A socket value as the spec carries it: a float, or an (r, g, b)."""
+    if v is None:
+        return None
+    if hasattr(v, '__len__') and not isinstance(v, str):
+        vals = [float(x) for x in v]
+        return tuple(vals[:3]) if len(vals) >= 3 else tuple(vals)
+    return float(v)
+
+
+def _halo_socket_value(node, name, warnings, mat=None):
+    """A Halo socket's value at export: its own, or the constant an RGB /
+    Value node feeds it. A shader chain cannot be evaluated per halo at
+    export, so any other link warns BY NAME and the socket value is
+    used."""
+    sock = _halo_sock(node, name)
+    if sock is None:
+        return None
+    src = _halo_link_source(sock)
+    if src is not None:
+        fnode, _fs = src
+        idn = getattr(fnode, 'bl_idname', '')
+        if idn in ('ShaderNodeRGB', 'ShaderNodeValue'):
+            try:
+                return _halo_plain(fnode.outputs[0].default_value)
+            except Exception:                                   # noqa: BLE001
+                pass
+        if warnings is not None:
+            warnings.append(
+                f"Halo {name} on '{getattr(mat, 'name', '?')}': only an "
+                f"RGB/Value node can drive this socket at export "
+                f"({idn or 'unknown node'} is linked); the socket value "
+                f"is used")
+    return _halo_plain(getattr(sock, 'default_value', None))
+
+
+#: the Size socket's three per-halo sources (an attribute per vertex, a
+#: colour attribute's red channel, the particle's own size)
+_HALO_SIZE_SOURCES = ('ShaderNodeAttribute', 'ShaderNodeVertexColor',
+                      'ShaderNodeParticleInfo')
+
+
+def _halo_size_source_of_node(node, warnings=None, mat=None):
+    """('ATTR', name) / ('VCOL', layer) / ('PARTICLE',) when the Size
+    socket is linked from one of the three per-halo sources, else None
+    (an RGB/Value or stranger link is the constant road, which
+    _halo_socket_value resolves and names)."""
+    src = _halo_link_source(_halo_sock(node, 'Size'))
+    if src is None:
+        return None
+    fnode, fsock = src
+    idn = getattr(fnode, 'bl_idname', '')
+    if idn == 'ShaderNodeAttribute':
+        return ('ATTR', str(getattr(fnode, 'attribute_name', '') or ''))
+    if idn == 'ShaderNodeVertexColor':
+        return ('VCOL', str(getattr(fnode, 'layer_name', '') or ''))
+    if idn == 'ShaderNodeParticleInfo':
+        if getattr(fsock, 'name', 'Size') == 'Size':
+            return ('PARTICLE',)
+        if warnings is not None:
+            warnings.append(
+                f"Halo Size on '{getattr(mat, 'name', '?')}': only "
+                f"Particle Info > Size can size the halos per particle "
+                f"({getattr(fsock, 'name', '?')} is linked); the socket "
+                f"value is used")
+        return None
+    return None
+
+
+def _halo_size_source(mat):
+    """The per-halo size source of a material's Halo node, or None."""
+    node = halo_node_of(mat)
+    if node is None:
+        return None
+    try:
+        return _halo_size_source_of_node(node)
+    except Exception:                                           # noqa: BLE001
+        return None
+
+
+def _halo_sizes_from(data, src, n, warnings):
+    """R253: the per-halo 'sizes' array from a mesh's / point cloud's
+    POINT-domain attribute, or None (with a warning by name) when the
+    attribute is missing or of another domain / type -- CORNER colour
+    layers are refused rather than averaged."""
+    label = getattr(data, 'name', '?')
+    try:
+        if src[0] == 'ATTR':
+            attrs = getattr(data, 'attributes', None)
+            attr = attrs.get(src[1]) if attrs is not None else None
+            if attr is None:
+                if warnings is not None:
+                    warnings.append(
+                        f"Halo Size: point attribute '{src[1]}' not found "
+                        f"on '{label}'; the socket value sizes every halo")
+                return None
+            dom = str(getattr(attr, 'domain', 'POINT'))
+            typ = str(getattr(attr, 'data_type', 'FLOAT'))
+            if dom != 'POINT' or typ != 'FLOAT':
+                if warnings is not None:
+                    warnings.append(
+                        f"Halo Size: attribute '{src[1]}' on '{label}' is "
+                        f"{dom}/{typ}, not a POINT float; the socket value "
+                        f"sizes every halo")
+                return None
+            if len(attr.data) != n:
+                return None
+            buf = np.empty(n, np.float32)
+            attr.data.foreach_get('value', buf)
+            return buf
+        if src[0] == 'VCOL':
+            cols = getattr(data, 'color_attributes', None)
+            layer = cols.get(src[1]) if cols is not None else None
+            if layer is None:
+                if warnings is not None:
+                    warnings.append(
+                        f"Halo Size: colour attribute '{src[1]}' not found "
+                        f"on '{label}'; the socket value sizes every halo")
+                return None
+            dom = str(getattr(layer, 'domain', 'POINT'))
+            if dom != 'POINT':
+                if warnings is not None:
+                    warnings.append(
+                        f"Halo Size: colour attribute '{src[1]}' on "
+                        f"'{label}' is on the {dom} domain; only a POINT "
+                        f"layer can size halos -- the socket value is used")
+                return None
+            if len(layer.data) != n:
+                return None
+            buf = np.empty(n * 4, np.float32)
+            layer.data.foreach_get('color', buf)
+            return np.ascontiguousarray(buf.reshape(-1, 4)[:, 0])
+    except Exception as exc:                                    # noqa: BLE001
+        if warnings is not None:
+            warnings.append(f"Halo Size on '{label}': the attribute could "
+                            f"not be read ({type(exc).__name__}: {exc})")
+    return None
+
+
+def _halo_spec_from_node(node, mat, images, warnings):
+    """R253: the Halo node as the spec dict _draw_halos reads -- the
+    panel road's exact keys and arithmetic (counts gated by their
+    toggles, Ray/Bolt Colour only once their Own Colour flag is set,
+    the image through the scene's pool, the ramp as a 32-entry LUT),
+    plus the node-only keys, every one neutral at its default."""
+    def P(name, default):
+        v = getattr(node, name, default)
+        return default if v is None else v
+
+    def S(name):
+        return _halo_socket_value(node, name, warnings, mat)
+
+    size_source = _halo_size_source_of_node(node, warnings, mat)
+    if size_source is not None:
+        size = _halo_plain(getattr(_halo_sock(node, 'Size'),
+                                   'default_value', 0.5))
+    else:
+        size = S('Size')
+    _alpha = S('Alpha')
+    _stretch = S('Stretch')
+    _gstr = S('Glow Strength')
+    halo = {
+        'size': float(size if size is not None else 0.5),
+        'hardness': int(P('hardness', 50)),
+        'add': float(S('Add') or 0.0),
+        'alpha': float(_alpha if _alpha is not None else 1.0),
+        'color': tuple(S('Color') or (0.8, 0.8, 0.8)),
+        'seed': int(P('seed', 0)),
+        'rings': int(P('ring_count', 4)) if P('rings', False) else 0,
+        'lines': int(P('line_count', 12)) if P('lines', False) else 0,
+        'star_points': int(P('star_tips', 4)) if P('star', False) else 0,
+        'ring_color': tuple(S('Ring Color') or (1.0, 1.0, 1.0)),
+        'line_color': tuple(S('Line Color') or (1.0, 1.0, 1.0)),
+        'xalpha': bool(P('xalpha', False)),
+        'soft': bool(P('soft', False)),
+        'shaded': bool(P('shaded', False)),
+        'puno': bool(P('puno', False)),
+        'shape': str(P('shape', 'DISC')),
+        'line_width': float(P('line_width', 1.0)),
+        'ring_width': float(P('ring_width', 1.0)),
+        'gradient': bool(P('gradient', False)),
+        'color2': tuple(S('Edge Color') or (0.0, 0.0, 0.0)),
+        'rand_hue': float(P('rand_hue', 0.0)),
+        'rand_sat': float(P('rand_sat', 0.0)),
+        'rand_val': float(P('rand_val', 0.0)),
+        'pulse': float(P('pulse', 0.0)),
+        'flicker': float(P('flicker', 0.0)),
+        'spin': float(P('spin', 0.0)),
+        'anim_speed': float(P('anim_speed', 1.0)),
+        'aspect': float(P('aspect', 1.0)),
+        'rotation': float(P('rotation', 0.0)),
+        'noise': float(P('noise', 0.0)),
+        'noise_scale': float(P('noise_scale', 4.0)),
+        'bolts': int(P('bolts', 0)),
+        'bolt_width': float(P('bolt_width', 1.0)),
+        'rays': int(P('rays', 0)),
+        'ray_sharp': float(P('ray_sharp', 8.0)),
+        'rings_even': bool(P('rings_even', False)),
+        'gradient_type': str(P('gradient_type', 'RADIAL')),
+        'gradient_noise': float(P('gradient_noise', 0.0)),
+        'hue_shift': float(P('hue_shift', 0.0)),
+        'sat_shift': float(P('sat_shift', 1.0)),
+        'val_shift': float(P('val_shift', 1.0)),
+        'pulse_speed': float(P('pulse_speed', 1.0)),
+        'flicker_speed': float(P('flicker_speed', 1.0)),
+        'noise_speed': float(P('noise_speed', 1.0)),
+        'bolt_speed': float(P('bolt_speed', 1.0)),
+        'grad_noise_speed': float(P('grad_noise_speed', 1.0)),
+        # ---- the node-only keys (R253), neutral at these defaults
+        'falloff': str(P('falloff', 'BI')),
+        'ring_inner': float(P('ring_inner', 0.6)),
+        'blend': str(P('blend', 'ADD_SLIDER')),
+        'depth_mode': str(P('depth_mode', 'ZBUFFER')),
+        'fade_near': float(S('Fade Near') or 0.0),
+        'fade_far': float(S('Fade Far') or 0.0),
+        'stretch': float(_stretch if _stretch is not None else 1.0),
+        'stretch_angle': float(S('Stretch Angle') or 0.0),
+        'glow_size': float(S('Glow Size') or 0.0),
+        'glow_strength': float(_gstr if _gstr is not None else 1.0),
+        'animate_seed': bool(P('animate_seed', False)),
+        'size_source': size_source,
+    }
+    # R200's contract as toggles: the colour ships only when its Own
+    # Colour flag is on -- off, the key stays absent and the element
+    # rides the Line Colour
+    if bool(P('ray_own_color', False)):
+        halo['ray_color'] = tuple(S('Ray Color') or (1.0, 1.0, 1.0))
+    if bool(P('bolt_own_color', False)):
+        halo['bolt_color'] = tuple(S('Bolt Color') or (1.0, 1.0, 1.0))
+    if bool(P('glow_own_color', False)):
+        halo['glow_color'] = tuple(S('Glow Color') or (1.0, 1.0, 1.0))
+    # the image halo: the picture rides the scene's image pool
+    himg = getattr(node, 'image', None)
+    if himg is not None and halo['shape'] == 'IMAGE':
+        try:
+            key = himg.name_full
+            if key not in images:
+                px = compat.image_pixels(himg)
+                if px is not None:
+                    images[key] = ImageBuffer(name=key, pixels=px)
+            halo['image'] = images.get(key)
+        except Exception:                                       # noqa: BLE001
+            pass
+    # the colour ramp: a ColorRamp linked into the Ramp socket (else a
+    # surviving '__halo_ramp' widget), sampled into a small LUT
+    if halo['gradient']:
+        rn = None
+        src = _halo_link_source(_halo_sock(node, 'Ramp'))
+        if src is not None and \
+                getattr(src[0], 'bl_idname', '') == 'ShaderNodeValToRGB':
+            rn = src[0]
+        elif src is not None and warnings is not None:
+            warnings.append(
+                f"Halo Ramp on '{getattr(mat, 'name', '?')}': only a Color "
+                f"Ramp node can drive this socket at export "
+                f"({getattr(src[0], 'bl_idname', '?')} is linked); the two "
+                f"colours are used")
+        if rn is None:
+            try:
+                tree = getattr(mat, 'node_tree', None)
+                rn = tree.nodes.get('__halo_ramp') if tree is not None \
+                    else None
+            except Exception:                                   # noqa: BLE001
+                rn = None
+        if rn is not None:
+            try:
+                cr = rn.color_ramp
+                halo['ramp'] = [tuple(cr.evaluate(i / 31.0))
+                                for i in range(32)]
+            except Exception:                                   # noqa: BLE001
+                pass
+    return halo
+
+
+def _collect_halo_points(me, matrix, slots, warnings=None):
     """R191: the raw VERTICES of a mesh wearing halo materials.
 
     make_render_halos reads mvert directly -- every vertex, loose ones
@@ -1617,9 +2004,9 @@ def _collect_halo_points(me, matrix, slots):
     slots glows twice, exactly as 2.79 did. Returns None when no slot
     is a halo, else per-slot dicts of world positions (and world
     normals when the material's Vertex Normal scaling asks)."""
+    # R253: a Halo node OR the deprecated panel toggle makes a slot glow
     halo_slots = [si for si, s in enumerate(slots)
-                  if s is not None
-                  and getattr(getattr(s, 'halcyon', None), 'halo', False)]
+                  if s is not None and material_is_halo(s)]
     if not halo_slots:
         return None
     try:
@@ -1636,7 +2023,13 @@ def _collect_halo_points(me, matrix, slots):
     for si in halo_slots:
         hs = getattr(slots[si], 'halcyon', None)
         entry = {'slot': si, 'pos': pos}
-        if getattr(hs, 'halo_puno', False):
+        # R253: per-halo sizes from the node's Size link
+        _src = _halo_size_source(slots[si])
+        if _src is not None:
+            _sz = _halo_sizes_from(me, _src, n, warnings)
+            if _sz is not None:
+                entry['sizes'] = _sz
+        if _halo_puno_of(slots[si], hs):
             no = np.empty(n * 3, np.float32)
             try:
                 me.vertices.foreach_get('normal', no)
@@ -1666,6 +2059,9 @@ def _halo_groups_from(points, remap, materials):
                        # seed1 + running vertex index, mod 256 at use
                        # exactly as RE_inithalo stores seed % 256
                        'seeds': (base + np.arange(n, dtype=np.int64)) % 256,
+                       # R253: per-halo sizes ride along (None = the
+                       # material's Size)
+                       'sizes': entry.get('sizes'),
                        'normals': entry.get('normals')})
     return groups
 
@@ -1886,11 +2282,11 @@ def _collect_extra_halos(depsgraph, mat_lookup, materials, images,
                 slots = list(getattr(ob, 'material_slots', ()) or ())
                 mat = slots[mslot].material if 0 <= mslot < len(slots) \
                     else None
-                hs = getattr(mat, 'halcyon', None) if mat else None
-                if not getattr(hs, 'halo', False):
+                if not material_is_halo(mat):
                     continue
-                locs = [tuple(p.location) for p in ps.particles
-                        if getattr(p, 'alive_state', 'ALIVE') == 'ALIVE']
+                alive = [p for p in ps.particles
+                         if getattr(p, 'alive_state', 'ALIVE') == 'ALIVE']
+                locs = [tuple(p.location) for p in alive]
                 if not locs:
                     continue
                 key = mat.name_full
@@ -1903,10 +2299,19 @@ def _collect_extra_halos(depsgraph, mat_lookup, materials, images,
                 pos = _np.asarray(locs, _np.float32)
                 n = pos.shape[0]
                 base = int(spec.get('seed', 0))
+                # R253: Particle Info > Size on the node's Size socket
+                _sz = None
+                if _halo_size_source(mat) == ('PARTICLE',):
+                    try:
+                        _sz = _np.asarray([float(p.size) for p in alive],
+                                          _np.float32)
+                    except Exception:                       # noqa: BLE001
+                        _sz = None
                 halo_groups.append({
                     'mat': mi, 'pos': pos,
                     'seeds': (base + _np.arange(n, dtype=_np.int64))
                              % 256,
+                    'sizes': _sz,
                     'normals': None})
             except Exception:                                   # noqa: BLE001
                 continue
@@ -1915,8 +2320,7 @@ def _collect_extra_halos(depsgraph, mat_lookup, materials, images,
             try:
                 slots = list(getattr(ob, 'material_slots', ()) or ())
                 mat = slots[0].material if slots else None
-                hs = getattr(mat, 'halcyon', None) if mat else None
-                if not getattr(hs, 'halo', False):
+                if not material_is_halo(mat):
                     continue
                 attr = ob.data.attributes.get('position')
                 n = len(attr.data)
@@ -1932,10 +2336,16 @@ def _collect_extra_halos(depsgraph, mat_lookup, materials, images,
                 mi = mat_lookup[key]
                 spec = materials[mi].halo or {}
                 base = int(spec.get('seed', 0))
+                # R253: a point attribute on the cloud sizes each glow
+                _sz = None
+                _src = _halo_size_source(mat)
+                if _src is not None:
+                    _sz = _halo_sizes_from(ob.data, _src, n, warnings)
                 halo_groups.append({
                     'mat': mi, 'pos': pos,
                     'seeds': (base + _np.arange(n, dtype=_np.int64))
                              % 256,
+                    'sizes': _sz,
                     'normals': None})
             except Exception:                                   # noqa: BLE001
                 continue
@@ -2082,7 +2492,7 @@ def export_scene(depsgraph, settings, warnings=None):
             _t0 = _time.perf_counter()
             data = _mesh_arrays(me, matrix, 0, obj_index)
             _check_fur_strand_health(ob, me, data, warnings)
-            halo_pts = _collect_halo_points(me, matrix, slots)
+            halo_pts = _collect_halo_points(me, matrix, slots, warnings)
             _sp['mesh_ms'] += (_time.perf_counter() - _t0) * 1000.0
             _sp['meshes'] += 1
         except Exception as exc:                                # noqa: BLE001
@@ -2166,7 +2576,8 @@ def export_scene(depsgraph, settings, warnings=None):
                      for s in slots], np.int32)
                 _t0 = _time.perf_counter()
                 data = _mesh_arrays(me, r_matrix, 0, obj_index)
-                r_halo_pts = _collect_halo_points(me, r_matrix, slots)
+                r_halo_pts = _collect_halo_points(me, r_matrix, slots,
+                                                  warnings)
                 if r_halo_pts:
                     halo_groups += _halo_groups_from(r_halo_pts, remap,
                                                      materials)

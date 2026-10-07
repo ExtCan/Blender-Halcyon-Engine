@@ -24,6 +24,8 @@ def run_tests():
                    test_r251_post_codec)
     # R252 (1.91.0): the Console Emulation Shader
     from . import test_r252_console
+    # R253: the Halo node
+    from . import test_r253_halo_node
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -120,6 +122,11 @@ def run_tests():
     print('R252 CONSOLE EMULATION SHADER')
     print('=' * 66)
     rc |= test_r252_console.main()
+    print()
+    print('=' * 66)
+    print('R253 HALO NODE')
+    print('=' * 66)
+    rc |= test_r253_halo_node.main()
     return rc
 
 
