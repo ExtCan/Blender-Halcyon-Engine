@@ -786,6 +786,23 @@ def _alpha_reason(mat, m):
                     return f'its {s["name"]} socket is linked'
                 if s['default'] is not None and float(s['default']) < 0.999:
                     return f'{s["name"]} {float(s["default"]):.3f}'
+        if idn in ('HALCYON_AnimeShaderNode', 'HALCYON_CartoonNode',
+                   'HALCYON_ConsoleShaderNode'):
+            # R253: the cel masters and the console carry their alpha on
+            # the same Opacity socket (the console its Edge Opacity too)
+            # and were classified opaque whatever it said -- a converted
+            # semi-transparent Principled is the first thing that reaches
+            # here. Neutral at the nodes' default Opacity 1.0 unlinked.
+            names = ('Opacity', 'Edge Opacity') \
+                if idn == 'HALCYON_ConsoleShaderNode' else ('Opacity',)
+            for s in node['inputs']:
+                sname = s.get('identifier') or s['name']
+                if sname not in names and s['name'] not in names:
+                    continue
+                if s['link'] is not None:
+                    return f'its {s["name"]} socket is linked'
+                if s['default'] is not None and float(s['default']) < 0.999:
+                    return f'{s["name"]} {float(s["default"]):.3f}'
     return None
 
 

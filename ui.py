@@ -1699,6 +1699,16 @@ def material_state(mat):
             if node.bl_idname in ('HALCYON_MaxStandardNode',
                                   'HALCYON_MaxRaytraceNode'):
                 return f'3ds Max {node.shader_type}', True
+            # R253: the cel masters are converted materials too -- the
+            # slot list used to label them 'not converted'
+            if node.bl_idname == 'HALCYON_AnimeShaderNode':
+                style = str(getattr(node, 'style', 'CUSTOM') or 'CUSTOM')
+                return (f'Anime {style}' if style != 'CUSTOM'
+                        else 'Anime'), True
+            if node.bl_idname == 'HALCYON_CartoonNode':
+                era = str(getattr(node, 'era', 'CUSTOM') or 'CUSTOM')
+                return (f'Cartoon {era}' if era != 'CUSTOM'
+                        else 'Cartoon'), True
         for node in mat.node_tree.nodes:
             if node.bl_idname == 'HALCYON_CodeNode':
                 return 'CODED', True
@@ -1942,6 +1952,42 @@ class HALCYON_PT_debug(HalcyonPanel, Panel):
             row.label(text="Strict node evaluation is on", icon='CHECKMARK')
 
 
+#: R253: the scene menu(s) each Convert to Anime / Cartoon / Game block
+#: draws above its scope buttons (HalcyonSettings props)
+_CONVERT_CHOICE_PROPS = {
+    'ANIME': ('convert_anime_style', 'convert_anime_compat'),
+    'CARTOON': ('convert_cartoon_era',),
+    'CONSOLE': ('convert_console',),
+}
+
+
+def _draw_convert_target(box, hal, target, label, icon, kinds):
+    """R253: one Convert to <target> block -- the label, the scene's
+    choice row and the three scope buttons on 'halcyon.convert_to_node'.
+    The scene choices ride on the operator's string properties the way
+    `model` rides on the master conversion; This Material reconverts
+    (force) when the tree already holds the target node, as the master's
+    own button does."""
+    from .core.convert import TARGET_NODES
+    col = box.column(align=True)
+    col.label(text=label, icon=icon)
+    row = col.row(align=True)
+    for prop in _CONVERT_CHOICE_PROPS[target]:
+        row.prop(hal, prop, text="")
+    row = col.row(align=True)
+    for scope, text, sicon in (('ACTIVE', "This Material", 'MATERIAL'),
+                               ('SELECTED', "Selected", 'RESTRICT_SELECT_OFF'),
+                               ('SCENE', "Scene", 'SCENE_DATA')):
+        op = row.operator('halcyon.convert_to_node', text=text, icon=sicon)
+        op.target = target
+        op.scope = scope
+        op.style = hal.convert_anime_style
+        op.compat = hal.convert_anime_compat
+        op.era = hal.convert_cartoon_era
+        op.console = hal.convert_console
+        op.force = bool(scope == 'ACTIVE' and TARGET_NODES[target] in kinds)
+
+
 class HALCYON_PT_material(HalcyonPanel, Panel):
     bl_label = "Halcyon Material"
     bl_context = "material"
@@ -2004,10 +2050,15 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
             return
         hs = mat.halcyon
 
+        # R253: the node kinds in the tree, read once -- the header and
+        # the nine Convert to Anime / Cartoon / Game buttons consult it
+        kinds = {n.bl_idname for n in mat.node_tree.nodes} \
+            if (_uses_nodes(mat) and mat.node_tree) else set()
         has_master = bool(_uses_nodes(mat) and mat.node_tree and any(
             n.bl_idname in ('HALCYON_ShaderNode', 'HALCYON_BIMaterialNode',
                             'HALCYON_MaxStandardNode', 'HALCYON_MaxRaytraceNode',
-                            'HALCYON_ConsoleShaderNode')
+                            'HALCYON_ConsoleShaderNode',
+                            'HALCYON_AnimeShaderNode', 'HALCYON_CartoonNode')
             for n in mat.node_tree.nodes))
         box = layout.box()
         row = box.row()
@@ -2047,6 +2098,15 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
         op = col.operator('halcyon.convert_to_bi', text="Whole Scene",
                           icon='SCENE_DATA')
         op.scope = 'SCENE'
+
+        # R253: the three other masters, each with the scene's choice
+        # above its three scope buttons (one operator, a target enum)
+        _draw_convert_target(box, hal, 'ANIME', "To Anime Shader:",
+                             'IPO_CONSTANT', kinds)
+        _draw_convert_target(box, hal, 'CARTOON', "To Cartoon Shader:",
+                             'IPO_CONSTANT', kinds)
+        _draw_convert_target(box, hal, 'CONSOLE', "To Game (Console):",
+                             'SYSTEM', kinds)
 
         # R202: the template shelf moved to the Shader Editor's Add
         # menu (Add > Pre-Made > Bryce / Halcyon) -- a note points the

@@ -192,7 +192,12 @@ def plan(idname, values=None, links=None, model='AUTO'):
     """
     values = values or {}
     links = set(links or ())
-    table = SOURCES.get(idname)
+    # R253: the engine's own nodes are sources too -- 'Convert This
+    # Material' on an Anime / Cartoon / BI / Console material carries
+    # its sockets by name instead of the generic colour-and-normal
+    # table. SOURCES itself is left alone: the plan test iterates it
+    # as the list of BLENDER shaders.
+    table = SOURCES.get(idname) or HALCYON_SOURCES.get(idname)
     notes = []
     if table is None:
         notes.append(f"{idname} has no direct equivalent; "
@@ -209,9 +214,12 @@ def plan(idname, values=None, links=None, model='AUTO'):
 
     extras = dict(EXTRAS.get(idname, {}))
     # a roughness constant also sets the specular exponent, which is the
-    # parameter the period models actually shade with
+    # parameter the period models actually shade with -- unless the
+    # source names a Glossiness of its own (R253: the engine's nodes as
+    # sources carry both sockets, and the explicit exponent wins)
+    has_gloss = any(t == 'Glossiness' for t, _a in pairs)
     for _t, alias in pairs:
-        if alias == 'Roughness' and 'Roughness' not in links:
+        if alias == 'Roughness' and 'Roughness' not in links and not has_gloss:
             try:
                 r = values.get('Roughness', 0.5)
                 r = float(r[0]) if hasattr(r, '__len__') else float(r)
@@ -232,7 +240,11 @@ def plan(idname, values=None, links=None, model='AUTO'):
         except (TypeError, ValueError):
             pass
 
-    if idname in ('ShaderNodeBsdfPrincipled', 'ShaderNodeEmission'):
+    # R253: the fold runs for every source that names an emission
+    # colour (_EMIT_COLOR) -- Principled and the Emission shader as
+    # before, and now the cel nodes, whose Emission Strength must
+    # fold the same way when they are converted onward
+    if idname in _EMIT_COLOR:
         # Emission Strength actually FOLDS now. The old code noted "strength
         # folded into the colour" and then copied Emission Color alone --
         # and since 4.0 Principled defaults to a WHITE emission colour at
@@ -260,9 +272,14 @@ def plan(idname, values=None, links=None, model='AUTO'):
 
 #: which socket carries the emission colour / strength, per source node
 _EMIT_COLOR = {'ShaderNodeBsdfPrincipled': ('Emission Color', 'Emission'),
-               'ShaderNodeEmission': ('Color',)}
+               'ShaderNodeEmission': ('Color',),
+               # R253: the cel masters carry a colour AND a strength
+               'HALCYON_AnimeShaderNode': ('Self-Illumination',),
+               'HALCYON_CartoonNode': ('Self-Illumination',)}
 _EMIT_STRENGTH = {'ShaderNodeBsdfPrincipled': ('Emission Strength',),
-                  'ShaderNodeEmission': ('Strength',)}
+                  'ShaderNodeEmission': ('Strength',),
+                  'HALCYON_AnimeShaderNode': ('Emission Strength',),
+                  'HALCYON_CartoonNode': ('Emission Strength',)}
 
 
 def _fold_emission(idname, values, links, pairs):
@@ -510,3 +527,351 @@ def bi_plan(idname, values=None, links=None):
         out_links.append(('Normal', 'Normal'))
     return {'props': props, 'sockets': sockets, 'links': out_links,
             'notes': notes}
+
+
+# -------------------------------- R253: conversion TO the other masters
+#
+# The Material panel's third family of buttons: Convert to Anime /
+# Cartoon / Game rebuilds a material around the Anime Shader, the
+# Cartoon Shader or the Console Emulation Shader with the SAME
+# relink-not-reset contract as the master conversion. The decision is
+# made here, in the master shader's socket vocabulary: plan() turns any
+# source into master-named pairs and extras, and TARGET_MAP turns those
+# into the target node's own sockets. Nothing new is rendered by a
+# conversion; what the converted material shades through is the target
+# node's existing two-road implementation.
+
+ANIME_NODE = 'HALCYON_AnimeShaderNode'
+CARTOON_NODE = 'HALCYON_CartoonNode'
+CONSOLE_NODE = 'HALCYON_ConsoleShaderNode'
+
+#: the operator's target enum id -> the node it builds
+TARGET_NODES = {'ANIME': ANIME_NODE, 'CARTOON': CARTOON_NODE,
+                'CONSOLE': CONSOLE_NODE}
+
+#: the master socket names that any target can take, identity-mapped:
+#: the vocabulary every HALCYON_SOURCES table and TARGET_MAP speaks
+_MASTER_CARRY = (
+    'Diffuse Color', 'Diffuse Level', 'Specular Color', 'Specular Level',
+    'Glossiness', 'Soften', 'Ambient', 'Self-Illumination', 'Opacity',
+    'Toon Size', 'Toon Smooth', 'Normal', 'Bump Strength', 'Bump Height',
+    'Vertex Color', 'Vertex Color Mix', 'Reflection', 'Reflection Color',
+    'Edge Opacity', 'Fog Burn-Through', 'Fog Bias', 'Fog Bank',
+    'Rim Light', 'Rim Amount', 'Rim Power', 'Matcap', 'Matcap Blend',
+    'Metalness', 'Roughness')
+
+#: the 21 master names the Console Emulation Shader shares (its SOCKETS
+#: are the master's own names, so the carry is the identity)
+_CONSOLE_CARRY = (
+    'Diffuse Color', 'Diffuse Level', 'Specular Color', 'Specular Level',
+    'Glossiness', 'Soften', 'Ambient', 'Self-Illumination', 'Opacity',
+    'Toon Size', 'Normal', 'Bump Strength', 'Bump Height', 'Vertex Color',
+    'Vertex Color Mix', 'Reflection', 'Reflection Color', 'Edge Opacity',
+    'Fog Burn-Through', 'Fog Bias', 'Fog Bank')
+
+#: the engine's own nodes as SOURCES, in the master vocabulary:
+#: (master socket, [that node's socket aliases]). plan() falls back to
+#: this table, so a cel / BI / console material converted onward (or
+#: back to the master) carries by name the way migrate_master_node
+#: travels links master -> console.
+HALCYON_SOURCES = {
+    MASTER_NODE: [(n, [n]) for n in _MASTER_CARRY],
+    CONSOLE_NODE: [(n, [n]) for n in _CONSOLE_CARRY],
+    ANIME_NODE: [
+        ('Diffuse Color', ['Diffuse Color']),
+        ('Self-Illumination', ['Self-Illumination']),
+        ('Opacity', ['Opacity']),
+        ('Normal', ['Normal']),
+        ('Bump Strength', ['Bump Strength']),
+        ('Specular Color', ['Specular Color']),
+        ('Specular Level', ['Specular Level']),
+        ('Ambient', ['Ambient']),
+        ('Rim Light', ['Rim Color']),
+        ('Rim Amount', ['Rim Amount']),
+        ('Rim Power', ['Rim Power']),
+        ('Matcap', ['Matcap']),
+        ('Matcap Blend', ['Matcap Blend']),
+        ('Toon Size', ['Shadow 1 Threshold']),
+        ('Toon Smooth', ['Shadow 1 Softness']),
+    ],
+    CARTOON_NODE: [
+        ('Diffuse Color', ['Paint Color']),
+        ('Self-Illumination', ['Self-Illumination']),
+        ('Opacity', ['Opacity']),
+        ('Normal', ['Normal']),
+        ('Rim Light', ['Rim Color']),
+        ('Rim Amount', ['Rim Amount']),
+        ('Rim Power', ['Rim Power']),
+        ('Toon Size', ['Shadow Threshold']),
+        ('Toon Smooth', ['Shadow Softness']),
+    ],
+    # Blender 2.79's material, by its panel names (Specular Hardness 1..511
+    # is the exponent the period models shade with -- a Glossiness)
+    BI_NODE: [
+        ('Diffuse Color', ['Color']),
+        ('Specular Color', ['Specular Color']),
+        ('Specular Level', ['Specular Intensity']),
+        ('Glossiness', ['Hardness']),
+        ('Opacity', ['Alpha']),
+        ('Translucency', ['Translucency']),
+        ('Normal', ['Normal']),
+        ('Bump Strength', ['Bump Strength']),
+        ('Bump Height', ['Bump Height']),
+    ],
+}
+
+#: master vocabulary -> each target's sockets. What a target lacks is
+#: dropped (and the first drops are reported by name). The cel targets
+#: take the Toon BSDF's Size / Smooth as their first shadow band's
+#: threshold / softness; the master's Rim Light colour is their Rim
+#: Color; the console is the identity over the names it shares.
+TARGET_MAP = {
+    'ANIME': {
+        'Diffuse Color': 'Diffuse Color',
+        'Self-Illumination': 'Self-Illumination',
+        'Opacity': 'Opacity',
+        'Normal': 'Normal',
+        'Bump Strength': 'Bump Strength',
+        'Specular Color': 'Specular Color',
+        'Specular Level': 'Specular Level',
+        'Ambient': 'Ambient',
+        'Rim Light': 'Rim Color',
+        'Rim Amount': 'Rim Amount',
+        'Rim Power': 'Rim Power',
+        'Matcap': 'Matcap',
+        'Matcap Blend': 'Matcap Blend',
+        'Toon Size': 'Shadow 1 Threshold',
+        'Toon Smooth': 'Shadow 1 Softness',
+    },
+    'CARTOON': {
+        'Diffuse Color': 'Paint Color',
+        'Self-Illumination': 'Self-Illumination',
+        'Opacity': 'Opacity',
+        'Normal': 'Normal',
+        'Rim Light': 'Rim Color',
+        'Rim Amount': 'Rim Amount',
+        'Rim Power': 'Rim Power',
+        'Toon Size': 'Shadow Threshold',
+        'Toon Smooth': 'Shadow Softness',
+    },
+    'CONSOLE': {n: n for n in _CONSOLE_CARRY},
+}
+
+#: the target sockets a chosen Style / Era writes (derived at import from
+#: the presets, so a preset edit can never fight the converter): a
+#: constant the conversion would put there is dropped when the chosen
+#: preset owns the socket -- the preset is what the user asked for; a
+#: LINKED chain always carries, it is the artist's own network
+from .shading import ANIME_STYLE_PRESETS as _ASP  # noqa: E402
+from .shading import CARTOON_ERA_PRESETS as _CEP  # noqa: E402
+
+STYLE_OWNED = {k: {n for n in v if n != '__props'} for k, v in _ASP.items()}
+ERA_OWNED = {k: {n for n in v if n != 'shadow_mode'} for k, v in _CEP.items()}
+
+#: the Glossiness ceiling a console material keeps: the DS shininess
+#: table and the GX / PSP / Model 3 exponents all top out around 128
+#: (GBATEK's 128-entry table, GX_InitLightShininess' useful range), and
+#: the period combines quantise anything sharper to the same pixel
+CONSOLE_GLOSS_MAX = 128.0
+
+#: the strength sockets a cel target carries STRAIGHT (its own Emission
+#: Strength socket multiplies Self-Illumination in the evaluator, so no
+#: fold and no multiply node is needed)
+_EMIT_STRENGTH_ALIASES = ('Emission Strength', 'Strength')
+
+
+def anime_specular_size(gloss):
+    """A stand-in curve from a Phong exponent to the Anime Shader's
+    Specular Size (the stepped highlight's angular width, 0..1):
+    0.9 / sqrt(gloss), clamped to 0.02..0.5 -- gloss 30 gives 0.16, 128
+    gives 0.08, 8192 gives the smallest dot. A stand-in: the cel
+    highlight is a painted shape, not a lobe, so no closed form maps
+    one onto the other; this one keeps 'rougher' = 'wider'."""
+    try:
+        g = max(float(gloss), 1.0)
+    except (TypeError, ValueError):
+        g = 30.0
+    return max(0.02, min(0.5, 0.9 / (g ** 0.5)))
+
+
+def _val(values, name, default=None):
+    if name not in values:
+        return default
+    v = values[name]
+    try:
+        return float(v[0]) if hasattr(v, '__len__') else float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def plan_for(target, idname, values=None, links=None, choice=None,
+             sources=None):
+    """How a source shader lands on the Anime / Cartoon / Console node.
+
+    bpy-free. `target` is a TARGET_NODES key; `idname`, `values`, `links`
+    are the source as plan() takes them; `choice` is the scene's menu
+    ({'style', 'compat', 'era', 'console'}); `sources` maps a linked
+    source socket to the bl_idname of the node feeding it (the vertex
+    colour detection reads it). Returns {'target': node idname, 'props':
+    {node prop: value} in the order they must be set, 'pairs': [(target
+    socket, source alias)], 'extras': {target socket: value},
+    'scale_links': {...}, 'notes': [...], 'source': idname, 'label': str}.
+
+    The emission is the one place the targets differ: the cel nodes own
+    an Emission Strength socket that multiplies Self-Illumination in
+    the evaluator, so colour and strength travel STRAIGHT (a white
+    colour at strength 0 lands as colour x 0 = black -- no multiply node,
+    no burn); the console has no strength socket, so plan()'s fold and
+    its multiply-node markers apply as they do for the master.
+    """
+    if target not in TARGET_NODES:
+        raise ValueError(f"unknown conversion target {target!r}")
+    values = dict(values or {})
+    links = set(links or ())
+    choice = dict(choice or {})
+    sources = dict(sources or {})
+    tmap = TARGET_MAP[target]
+    notes = []
+
+    if target in ('ANIME', 'CARTOON'):
+        v2 = {k: v for k, v in values.items()
+              if k not in _EMIT_STRENGTH_ALIASES}
+        l2 = {k for k in links if k not in _EMIT_STRENGTH_ALIASES}
+        base = plan(idname, v2, l2, 'AUTO')
+        s_alias = next((a for a in _EMIT_STRENGTH_ALIASES
+                        if a in links or a in values), None)
+    else:
+        base = plan(idname, values, links, 'AUTO')
+        s_alias = None
+    notes.extend(base['notes'])
+
+    # ---- translate the master vocabulary into the target's sockets.
+    # Metalness, Roughness and Glossiness are CONSUMED below (the
+    # highlight derivations), not lost, so they are never reported
+    consumed = ('Metalness', 'Roughness', 'Glossiness', 'Self-Illumination')
+    pairs, extras, scale_links, dropped = [], {}, {}, []
+    for t, alias in base['pairs']:
+        if t in tmap:
+            pairs.append((tmap[t], alias))
+        elif t not in dropped and t not in consumed:
+            dropped.append(t)
+    for t, v in base['extras'].items():
+        if t in tmap:
+            extras[tmap[t]] = v
+        elif t not in dropped and t not in consumed:
+            dropped.append(t)
+    for t, spec in (base.get('scale_links') or {}).items():
+        if t in tmap:
+            scale_links[tmap[t]] = spec
+    if s_alias is not None:
+        # the cel node's own strength socket, straight from the source
+        pairs.append(('Emission Strength', s_alias))
+
+    def master_pair(name):
+        """(alias, linked, constant) of a master-vocabulary pair."""
+        for t, a in base['pairs']:
+            if t == name:
+                return a, a in links, _val(values, a)
+        return None, False, None
+
+    m_alias, m_linked, m_val = master_pair('Metalness')
+    metal = m_linked or (m_val is not None and m_val > 0.5)
+    g_alias, g_linked, g_val = master_pair('Glossiness')
+    gloss = base['extras'].get('Glossiness')
+    if gloss is None and not g_linked and g_val is not None:
+        gloss = g_val
+    tlabel = {'ANIME': 'anime', 'CARTOON': 'cartoon',
+              'CONSOLE': 'console'}[target]
+    props = {}
+
+    if target == 'ANIME':
+        style = str(choice.get('style') or 'CUSTOM')
+        compat = str(choice.get('compat') or 'GENERIC')
+        props['compat'] = compat
+        props['style'] = style
+        owned = STYLE_OWNED.get(style, set())
+        if gloss is not None and 'Specular Size' not in owned:
+            extras['Specular Size'] = anime_specular_size(gloss)
+        if metal:
+            if 'Specular Level' not in owned:
+                extras['Specular Level'] = 1.0
+            notes.append("metal: feed a metal matcap for the HoYo look")
+        from .shading import ANIME_STYLE_ITEMS
+        slabel = next((b for a, b, _c in ANIME_STYLE_ITEMS if a == style),
+                      style)
+        label = f"Anime Shader ({slabel})"
+    elif target == 'CARTOON':
+        era = str(choice.get('era') or 'CUSTOM')
+        props['era'] = era
+        owned = ERA_OWNED.get(era, set())
+        if idname == 'ShaderNodeEmission':
+            # an unlit colour is flat paint: no shadow tone, no lamp
+            extras['Shadow Amount'] = 0.0
+            extras['Lamp Influence'] = 0.0
+            notes.append("emission became flat paint")
+        from .shading import CARTOON_ERA_ITEMS
+        elabel = next((b for a, b, _c in CARTOON_ERA_ITEMS if a == era), era)
+        label = f"Cartoon Shader ({elabel})"
+    else:
+        owned = set()
+        con = str(choice.get('console') or 'PS1')
+        props['console'] = con
+        # the exponent ceiling of the period light units
+        if gloss is not None and gloss > CONSOLE_GLOSS_MAX:
+            extras['Glossiness'] = CONSOLE_GLOSS_MAX
+            if g_alias is not None and not g_linked:
+                pairs = [(t, a) for (t, a) in pairs if t != 'Glossiness']
+            notes.append(f"glossiness clamped to the console's "
+                         f"{CONSOLE_GLOSS_MAX:g}")
+        if metal:
+            # the bi_plan move: no metalness on a fixed-function light
+            # unit, so the highlight is tinted with the base colour
+            base_c = _c3(values, 'Base Color', 'Color', 'Diffuse Color',
+                         default=(0.8, 0.8, 0.8))
+            spec = _f1(values, 'Specular IOR Level', 'Specular',
+                       'Specular Level', default=0.5)
+            extras['Specular Color'] = tuple(base_c) + (1.0,)
+            extras['Specular Level'] = max(spec, 0.8)
+            notes.append("no metalness on a console light unit; the "
+                         "highlight is tinted with the base colour")
+        # a vertex colour feeding the base colour is the machine's own
+        # material source: GX_SRC_VTX, D3DRS_COLORVERTEX, the N64's
+        # lighting-off shade -- not a texture chain
+        d_alias = next((a for (t, a) in pairs if t == 'Diffuse Color'), None)
+        if d_alias is not None and d_alias in links and sources.get(d_alias) \
+                in ('ShaderNodeVertexColor', 'ShaderNodeAttribute'):
+            pairs = [(t, a) for (t, a) in pairs if t != 'Diffuse Color']
+            pairs.append(('Vertex Color', d_alias))
+            extras['Vertex Color Mix'] = 1.0
+            if con == 'GAMECUBE':
+                props['gc_material_src'] = 'VTX'
+            elif con == 'PC_FIXED':
+                props['pc_color_vertex'] = True
+            elif con == 'N64':
+                props['n64_type'] = 'VERTEX'
+            notes.append("vertex colour is the material colour")
+        from . import console as _console
+        label = _console.label_of(props)
+
+    # ---- the chosen preset owns its sockets: a constant the conversion
+    # would write there is dropped (the preset wins); a link carries
+    if owned:
+        kept = []
+        for t, a in pairs:
+            if t in owned and a not in links:
+                note = f"{t} left to the chosen preset"
+                if note not in notes:
+                    notes.append(note)
+                continue
+            kept.append((t, a))
+        pairs = kept
+        for t in list(extras):
+            if t in owned:
+                del extras[t]
+
+    for t in dropped[:2]:
+        notes.append(f"{t} has no {tlabel} equivalent")
+
+    return {'target': TARGET_NODES[target], 'props': props, 'pairs': pairs,
+            'extras': extras, 'scale_links': scale_links, 'notes': notes,
+            'source': idname, 'label': label}
