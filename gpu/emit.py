@@ -182,6 +182,8 @@ def tex_vector(em, node, default='generated'):
     An unlinked Vector on a texture node does not mean "use the socket value";
     it means generated coordinates. Reading the default instead silently
     produces a constant, which looks like a working texture that never varies.
+    R253: hal_generated is measured in the object's OWN box (the mesh's
+    texture space, as Blender), so a moving object carries the pattern.
     """
     for sock in node.get('inputs', ()):
         if sock.get('name') == 'Vector' and sock.get('link'):
@@ -966,7 +968,7 @@ CODE_VARYINGS = {
     'time': ('hal_time', 1),
     'frame': ('hal_frame', 1),
     'tangent': (None, 3),               # built from hal_N at the call site
-    'object': ('hal_generated', 3),     # per-object bounds bake per scene
+    'object': ('hal_generated', 3),     # per-object OBJECT-space box bake per scene (R253)
     'screenuv': (None, 2),              # gl_FragCoord.xy / width, baked
     'resolution': (None, 3),            # (w, h, 1), baked per plan
 }

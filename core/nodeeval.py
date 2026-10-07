@@ -566,9 +566,10 @@ def n_tex_coord(ev, node):
     if c.P is not None:
         obj = c.P
         if c.object_matrix_inv is not None:
-            obj = np.einsum('nij,nj->ni',
-                            c.object_matrix_inv[:, :3, :3], c.P) + \
-                c.object_matrix_inv[:, :3, 3]
+            # R253: the one sequential chain Generated coordinates use
+            # (bitwise the einsum this read before, and bitwise the
+            # GPU's hal_obj_rN dots in the simulator)
+            obj = M.object_space_points(c.P, c.object_matrix_inv)
         out['Object'] = obj
         out['Camera'] = c.P - c.camera_pos[None, :]
     win = np.zeros((c.n, 3), np.float32)

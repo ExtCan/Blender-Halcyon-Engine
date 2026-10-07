@@ -942,6 +942,10 @@ def _plan_sig(job, mkey):
         'tex_clamp_mode', 'tex_colorkey', 'tex_colorkey_range',
         'tex_mip_select', 'tex_lod_sharpen', 'tex_lod_source', 'tex_lod_k',
         'tex_lod_l',
+        # R253: the Generated-coordinate road is a BAKE the plan reads
+        # (the object-space line or the legacy world line); a moved
+        # object re-plans through _mesh_key already
+        'generated_space',
         # R251 material pack (MAT-B): the REYES snap is a gate AND a
         # bake (C119), and the keys the pack found missing -- the AA
         # pair (the internal size the grid is sized for), the palette
@@ -1610,6 +1614,11 @@ def plan_frame(job, gbuf, use_cache=True):
         # R243: the per-object inverse matrices, for Object coordinates
         # (the Texture Coordinate node's Object output, Max's Object XYZ)
         'obj_inv': job.object_matrices(),
+        # R253: the OBJECT-space box Generated coordinates span (the
+        # mesh's texture space) and which road the bake takes; the
+        # setting is in _plan_sig (a bake the plan reads MUST be)
+        'obj_gen': job.object_generated_frame(),
+        'generated_space': str(getattr(st, 'generated_space', 'OBJECT')),
         # the frame size, for coded shaders reading vScreenUV/iResolution
         'resolution': (float(job.width), float(job.height)),
         # R238: the cel field rides this frame; the scene's key lamp

@@ -2595,6 +2595,10 @@ class ShadeJob:
         self._obj_matrices = None
         self._bounds = None
         self._obj_bounds = None
+        #: R253: the per-object OBJECT-space texture space (lo, span)
+        #: Generated coordinates span; see object_generated_frame()
+        self._obj_gen = None
+        self._obj_gen_identity = True
         #: (mat_index, bump-node id) -> (gx, gy) full-frame gradient grids,
         #: filled by _shade_all for materials whose chunking would otherwise
         #: cut n_bump's screen gradients mid-material
@@ -2637,6 +2641,95 @@ class ShadeJob:
         self._obj_bounds = (lo, np.maximum(hi - lo, 1e-6))
         return self._obj_bounds
 
+    def object_generated_frame(self):
+        """R253: the box Generated coordinates are measured in, per
+        object, in the object's OWN space: (lo, span) float32 (n_obj, 3).
+
+        Blender's Generated output is the mesh's texture space -- the
+        object-space bounding box (auto texspace) or the manual Texture
+        Space -- so it never changes with the object transform.
+        object_bounds() above measures the WORLD box, which rotation,
+        scale and any animated motion re-shape: that is the scroll the
+        user saw on a moving object. Per object: the exported
+        ObjectInfo.gen_bounds when the export supplied one; else, at an
+        identity matrix, the world rows of object_bounds() (local ==
+        world there, so old scenes are bitwise); else that object's
+        world vertices taken back through its inverse matrix (the same
+        chain the fragments use) and boxed. The span keeps Halcyon's
+        max(hi - lo, 1e-6) clamp, NOT Blender's size-1 rule for a flat
+        axis, so a flat ground plane with a 3-D Noise renders as before.
+        Cached, and prewarm() builds it before any worker starts.
+        """
+        if self._obj_gen is not None:
+            return self._obj_gen
+        lo_w, span_w = self.object_bounds()
+        n_obj = lo_w.shape[0]
+        # the world rows verbatim (the same bits, not lo + span - lo)
+        # for every object that keeps them: identity, no mesh, no verts
+        lo = lo_w.copy()
+        span = span_w.copy()
+        objs = self.scene.objects or []
+        mesh = self.scene.mesh
+        inv = self.object_matrices()
+        vert_obj = None
+        eye = np.eye(4, dtype=np.float32)
+        for i in range(min(n_obj, len(objs))):
+            o = objs[i]
+            gb = getattr(o, 'gen_bounds', None)
+            if gb is not None:
+                g_lo = np.asarray(gb[0], np.float32).reshape(3)
+                g_hi = np.asarray(gb[1], np.float32).reshape(3)
+                lo[i] = g_lo
+                span[i] = np.maximum(g_hi - g_lo, 1e-6)
+                continue
+            mw = getattr(o, 'matrix_world', None)
+            if mw is None or np.array_equal(np.asarray(mw, np.float32), eye):
+                continue                     # identity: local == world
+            if mesh is None or mesh.verts is None or not mesh.verts.size:
+                continue
+            if vert_obj is None:
+                vert_obj = np.zeros(mesh.verts.shape[0], np.int32)
+                if mesh.obj_index is not None and mesh.tris is not None:
+                    # a vertex belongs to whichever object owns its
+                    # triangles (object_bounds' rule)
+                    vert_obj[mesh.tris.reshape(-1)] = np.repeat(mesh.obj_index, 3)
+            sel = vert_obj == i
+            if not sel.any():
+                continue
+            local = M.object_space_points(mesh.verts[sel],
+                                          inv[min(i, inv.shape[0] - 1)])
+            g_lo = local.min(0).astype(np.float32)
+            g_hi = local.max(0).astype(np.float32)
+            lo[i] = g_lo
+            span[i] = np.maximum(g_hi - g_lo, 1e-6)
+        self._obj_gen = (lo.astype(np.float32), span.astype(np.float32))
+        # every inverse the identity (an untransformed scene, every
+        # hand-built one): the chain would return P bit for bit, so the
+        # fragments skip it
+        self._obj_gen_identity = bool(np.all(inv == eye[None]))
+        return self._obj_gen
+
+    def _object_space(self, P, obj_idx):
+        """R253: the world points P (n,3) back into their own objects'
+        frames, one object at a time through its single (4,4) inverse --
+        the same elementwise float32 chain as a per-fragment gather
+        (bitwise) with no (n,4,4) temporary (a 262144-fragment chunk's
+        would be 16 MB per worker). P itself, untouched, when every
+        matrix is the identity."""
+        self.object_generated_frame()
+        if self._obj_gen_identity:
+            return P
+        inv = self.object_matrices()
+        oi = np.clip(np.asarray(obj_idx, np.int64), 0, inv.shape[0] - 1)
+        ids = np.unique(oi)
+        if ids.size == 1:
+            return M.object_space_points(P, inv[int(ids[0])])
+        Po = np.empty((P.shape[0], 3), np.float32)
+        for i in ids:
+            sel = oi == i
+            Po[sel] = M.object_space_points(P[sel], inv[int(i)])
+        return Po
+
     def object_matrices(self):
         """Per-object inverse world matrices (n_obj, 4, 4), for object-space
         texture coordinates -- built once, shared by the CPU contexts and
@@ -2673,6 +2766,8 @@ class ShadeJob:
                 mats.append(np.linalg.inv(np.asarray(m, np.float32))
                             if m is not None else np.eye(4, dtype=np.float32))
             self._obj_matrices = np.stack(mats)
+        # R253: the object-space Generated frame (reads the matrices)
+        self.object_generated_frame()
 
     # ..................................................... attribute fetch
     def attributes(self, tri_idx, bary, bary_lin=None, need=None):
@@ -2953,8 +3048,23 @@ class ShadeJob:
         if P is not None:
             lo, span = self.object_bounds()
             oi_c = np.clip(obj_idx, 0, lo.shape[0] - 1)
-            ctx.generated = ((P - lo[oi_c]) / span[oi_c]).astype(np.float32)
+            if str(getattr(self.settings, 'generated_space', 'OBJECT')) == 'WORLD':
+                # the pre-1.92 road, verbatim: the WORLD box, which
+                # scrolls under a turning or scaling object
+                ctx.generated = ((P - lo[oi_c]) / span[oi_c]).astype(np.float32)
+            else:
+                # R253: Blender's rule -- the point taken back into the
+                # object's own frame (the chain the GPU's hal_obj_rN
+                # dots run, bitwise in the simulator) and measured over
+                # the mesh's OWN box, so a moving object carries its
+                # procedural textures with it. At identity Po is P and
+                # the frame is the world rows: the same bits as before.
+                glo, gspan = self.object_generated_frame()
+                Po = self._object_space(P, obj_idx)
+                ctx.generated = ((Po - glo[oi_c]) / gspan[oi_c]).astype(np.float32)
             # R228: the cartoon's shape smoothing reads the same bounds
+            # (the WORLD box: it measures a direction from the world
+            # point to the world centre, correct as-is -- R253)
             ctx.obj_bounds = (lo, span)
         else:
             ctx.generated = None

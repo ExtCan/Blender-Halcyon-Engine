@@ -890,6 +890,25 @@ def _mesh_arrays(me, matrix, mat_offset, obj_index):
     co = np.empty(n_verts * 3, np.float32)
     me.vertices.foreach_get('co', co)
     co = co.reshape(-1, 3)
+    # R253: the mesh's texture space, measured on the UNTRANSFORMED
+    # vertices so Generated coordinates never scroll when the object
+    # moves, turns or scales (Blender's BKE_mesh_texspace_calc: the
+    # object-space bounding box; Cycles' mesh_texture_space reads the
+    # manual Texture Space as loc - size .. loc + size). The getattr
+    # guards fall back to the vertex box on an evaluated mesh that does
+    # not expose the texspace RNA.
+    g_lo = co.min(0).astype(np.float32)
+    g_hi = co.max(0).astype(np.float32)
+    try:
+        if not getattr(me, 'use_auto_texspace', True):
+            _tloc = np.asarray(tuple(me.texspace_location), np.float32)
+            _tsize = np.asarray(tuple(me.texspace_size), np.float32)
+            if _tloc.shape == (3,) and _tsize.shape == (3,):
+                g_lo = (_tloc - _tsize).astype(np.float32)
+                g_hi = (_tloc + _tsize).astype(np.float32)
+    except Exception:                                           # noqa: BLE001
+        pass
+    gen_bounds = (g_lo, g_hi)
 
     lv = np.empty(n_loops, np.int32)
     me.loops.foreach_get('vertex_index', lv)
@@ -1018,7 +1037,10 @@ def _mesh_arrays(me, matrix, mat_offset, obj_index):
                 mat_index=(mat_idx + mat_offset).astype(np.int32),
                 obj_index=np.full(n_tris, obj_index, np.int32),
                 face_normals=fn.astype(np.float32), smooth=smooth,
-                ink_tri_mask=ink_mask)
+                ink_tri_mask=ink_mask,
+                # R253: the object-space texture space (rides the mesh
+                # cache's 'data' untouched; _concat ignores it)
+                gen_bounds=gen_bounds)
 
 
 # ------------------------------------------------------------------- lights
@@ -1506,7 +1528,10 @@ def _info_snapshot(ob):
         smoke_grid=_smoke_grid(ob))
 
 
-def _info_object(info, matrix):
+def _info_object(info, matrix, gen_bounds=None):
+    # R253: `gen_bounds` is the mesh's object-space texture space from
+    # _mesh_arrays (None = the renderer derives it); an optional third
+    # argument so every older two-argument caller still works
     mw = np.asarray(matrix, np.float32)
     return ObjectInfo(
         name=info['name'], location=tuple(mw[:3, 3]), matrix_world=mw,
@@ -1514,7 +1539,8 @@ def _info_object(info, matrix):
         visible_camera=info['visible_camera'],
         cast_shadow=info['cast_shadow'], holdout=info['holdout'],
         smoothresh=info['smoothresh'],
-        smoke_grid=info.get('smoke_grid'))
+        smoke_grid=info.get('smoke_grid'),
+        gen_bounds=gen_bounds)
 
 
 def register():
@@ -2056,7 +2082,9 @@ def export_scene(depsgraph, settings, warnings=None):
                 info = _info_snapshot(_ev)
             except Exception:                                   # noqa: BLE001
                 pass
-            objects.append(_info_object(info, matrix))
+            # R253: the texture space rides the cached 'data'
+            objects.append(_info_object(info, matrix,
+                                        data.get('gen_bounds')))
             _sp['cached_ms'] += (_time.perf_counter() - _t0) * 1000.0
             _sp['cached'] += 1
             if k in _touched:
@@ -2132,7 +2160,7 @@ def export_scene(depsgraph, settings, warnings=None):
         idx = np.clip(data['mat_index'], 0, len(remap) - 1)
         data['mat_index'] = remap[idx]
         parts.append(data)
-        objects.append(_info_object(info, matrix))
+        objects.append(_info_object(info, matrix, data.get('gen_bounds')))
 
     # the RETRY pass: cached entries whose stored slot names went
     # unresolvable (a material rename). One live re-export each, one at a
@@ -2206,7 +2234,8 @@ def export_scene(depsgraph, settings, warnings=None):
         if info is None:
             info = _info_snapshot(r_ob)
         parts[i_part] = data if data is not None else _empty_part()
-        objects[obj_index] = _info_object(info, r_matrix)
+        objects[obj_index] = _info_object(info, r_matrix,
+                                          (data or {}).get('gen_bounds'))
 
     # R172: the stale sweep. Keys nobody visits again -- an instancer
     # empty dragged through fifty matrices, a scene emptied out -- used

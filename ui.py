@@ -708,6 +708,7 @@ class HALCYON_PT_textures(HalcyonPanel, Panel):
         sub.prop(hs, 'tex_lod_sharpen')                              # C008
         col.separator()
         col.prop(hs, 'tex_perspective')
+        col.prop(hs, 'generated_space')                              # R253
         col.separator()
         col.prop(hs, 'tex_max_size')
         col.prop(hs, 'tex_quantize')
