@@ -8052,6 +8052,74 @@ def _halo_speed(spec, key):
     return 1.0 if v is None else float(v)
 
 
+def _halo_falloff(kind, d, inner):
+    """R253: the Falloff menu's curves, brightness in [0,1] from the
+    squared shape metric d in [0,1] (1 at the rim). 'BI' never reaches
+    here (the hardness ladder stays verbatim in _draw_halos).
+
+    GAUSSIAN is Reeves' additive puff normalised to reach zero at the
+    rim; LINEAR and QUADRATIC the point-sprite era's fades; HARD the
+    flat sprite dot; RING_ONLY dark inside `inner`, then a linear fade
+    out -- a hollow shockwave."""
+    d = np.minimum(np.asarray(d, np.float32), 1.0)
+    r = np.sqrt(d)
+    if kind == 'GAUSSIAN':
+        k = float(np.exp(-4.5))
+        out = (np.exp(-4.5 * d) - k) / (1.0 - k)
+    elif kind == 'LINEAR':
+        out = 1.0 - r
+    elif kind == 'QUADRATIC':
+        out = (1.0 - r) * (1.0 - r)
+    elif kind == 'HARD':
+        out = np.where(d < 1.0, 1.0, 0.0)
+    elif kind == 'RING_ONLY':
+        inner = min(max(float(inner), 0.0), 0.99)
+        out = np.where(r >= inner,
+                       1.0 - (r - inner) / max(1.0 - inner, 1e-6), 0.0)
+    else:
+        out = np.where(d < 1.0, 1.0 - d, 0.0)
+    # exactly zero at and past the rim, whatever float32 made of the
+    # curve's last step (the window corners past the circle keep the
+    # caller's `inside` mask besides)
+    out = np.where(d < 1.0, out, 0.0)
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
+def _halo_stretch(fx, fy, stretch, ang):
+    """R253: the anamorphic streak -- shrink the halo's frame along a
+    screen angle so the glow reads `stretch` times longer along it.
+    Independent of Rotation/Spin (applied after them), so a turning
+    star keeps a fixed horizontal smear."""
+    c, s = float(np.cos(ang)), float(np.sin(ang))
+    u = c * fx + s * fy
+    v = -s * fx + c * fy
+    u = u / np.float32(stretch)
+    return c * u - s * v, s * u + c * v
+
+
+def _halo_blend(sub_rgb, sub_a, crgb, ca, lv, mode, addfac):
+    """R253: one glow's composite over the frame window, in place.
+
+    ADD_SLIDER is addalphaAddfacFloat verbatim -- the destination
+    weight slides with Add from alpha-over (0) to pure addition (1);
+    ALPHA and ADDITIVE are its two ends (the same two statements, so
+    Add 0 / Add 1 match them bit for bit); SCREEN is the separable
+    1 - (1 - a)(1 - b) of the PDF blend modes, which never exceeds
+    white (the colour clamps to [0,1] here and only here)."""
+    if mode == 'SCREEN':
+        c = np.clip(crgb, 0.0, 1.0)
+        sub_rgb[lv] = sub_rgb[lv] + c[lv] - sub_rgb[lv] * c[lv]
+        sub_a[lv] = sub_a[lv] + ca[lv] - sub_a[lv] * ca[lv]
+        return
+    if mode == 'ALPHA':
+        addfac = 0.0
+    elif mode == 'ADDITIVE':
+        addfac = 1.0
+    mfac = (1.0 - ca * (1.0 - addfac)).astype(np.float32)
+    sub_rgb[lv] = (mfac[lv, None] * sub_rgb[lv] + crgb[lv])
+    sub_a[lv] = mfac[lv] * sub_a[lv] + ca[lv]
+
+
 def _draw_halos(img, scene, st, gbuf, view, proj, w, h, sel_mask=None):
     """BI's halo materials: every vertex a depth-tested billboard glow.
 
@@ -8121,6 +8189,10 @@ def _draw_halos(img, scene, st, gbuf, view, proj, w, h, sel_mask=None):
         seeds = (np.asarray(seeds, np.int64).reshape(-1)
                  if seeds is not None
                  else int(spec.get('seed', 0)) + np.arange(n, dtype=np.int64))
+        if bool(spec.get('animate_seed')):
+            # R253: the seed walks with the frame -- rings, lines,
+            # jitter and pulse phases all re-roll per frame
+            seeds = (seeds + int(getattr(scene, 'frame', 0))) % 256
         if bool(spec.get('puno')) and grp.get('normals') is not None:
             # MA_HALOPUNO: only rear-facing verts glow, scaled by the
             # facing cosine to the fourth
@@ -8169,11 +8241,16 @@ def _draw_halos(img, scene, st, gbuf, view, proj, w, h, sel_mask=None):
         w3 = v3 @ pm[3, :3].T + pm[3, 3]
         zd = np.abs(zs - h3[:, 2] / np.where(np.abs(w3) > 1e-6, w3, 1.0))
         ok &= rad > 1e-6
+        # R253: the camera distance the Fade Near/Far sockets read --
+        # view-space depth forward of the lens (the radial distance
+        # under an orthographic camera, whose z is the sort key only)
+        dcam = -vco[:, 2] if persp else np.linalg.norm(vco, axis=1)
         idx = np.nonzero(ok)[0]
         for i in idx:
             drawn.append((float(zs[i]), mi, float(xs[i]), float(ys[i]),
                           float(rad[i]), float(zd[i]), int(seeds[i]),
-                          float(sizes[i]), np.asarray(pos[i])))
+                          float(sizes[i]), np.asarray(pos[i]),
+                          float(dcam[i])))
     if not drawn:
         return img
     # verghalo: descending zs -- far halos first, near composite over
@@ -8191,7 +8268,8 @@ def _draw_halos(img, scene, st, gbuf, view, proj, w, h, sel_mask=None):
     # is bit-for-bit the old picture. Floored so tiny previews keep
     # their lines
     wscale = max(float(h) / 480.0, 0.5)
-    for zs, mi, xs, ys, rad, zd, seed, hasize, wpos in drawn:
+    _gauss_k = float(np.exp(-4.5))
+    for zs, mi, xs, ys, rad, zd, seed, hasize, wpos, dcam in drawn:
         spec = mats[mi].halo
         alpha0 = float(np.clip(spec.get('alpha', 1.0), 0.0, 1.0))
         flick = float(spec.get('flicker', 0.0) or 0.0)
@@ -8207,6 +8285,12 @@ def _draw_halos(img, scene, st, gbuf, view, proj, w, h, sel_mask=None):
             h01 = float(_halo_hash01(np.array([seed * 1013 + fr_i],
                                               np.int64), 0xA511E9B3)[0])
             alpha0 *= max(1.0 - flick * h01, 0.0)
+        # R253: the camera-distance fade (Far above Near turns it on;
+        # the 0/0 default is a no-op by construction)
+        fn_ = float(spec.get('fade_near', 0.0) or 0.0)
+        ff_ = float(spec.get('fade_far', 0.0) or 0.0)
+        if ff_ > fn_:
+            alpha0 *= float(np.clip((ff_ - dcam) / (ff_ - fn_), 0.0, 1.0))
         if alpha0 == 0.0:
             continue
         # R197: the halo's own frame -- static Rotation plus Spin share
@@ -8218,15 +8302,17 @@ def _draw_halos(img, scene, st, gbuf, view, proj, w, h, sel_mask=None):
         spin = float(spec.get('spin', 0.0) or 0.0)
         aspect = min(max(float(spec.get('aspect', 1.0) or 1.0), 0.05),
                      20.0)
+        # R253: the anamorphic Stretch (a screen-angle streak that is
+        # independent of Rotation/Spin) and the outer Glow both need a
+        # wider pixel window than the core; the window and the halo's
+        # own frame are closures so the core at the defaults computes
+        # EXACTLY the pre-R253 arrays (same operations, same order)
+        stretch = min(max(float(spec.get('stretch', 1.0) or 1.0), 0.05),
+                      20.0)
+        over = str(spec.get('depth_mode', 'ZBUFFER') or 'ZBUFFER') == 'OVER'
         ext = rad * max(aspect, 1.0)
-        x0 = max(int(np.floor(xs - ext)), 0)
-        x1 = min(int(np.ceil(xs + ext)) + 1, w)
-        y0 = max(int(np.floor(ys - ext)), 0)
-        y1 = min(int(np.ceil(ys + ext)) + 1, h)
-        if x0 >= x1 or y0 >= y1:
-            continue
-        xn = np.arange(x0, x1, dtype=np.float32)[None, :] - np.float32(xs)
-        yn = np.arange(y0, y1, dtype=np.float32)[:, None] - np.float32(ys)
+        if stretch != 1.0:
+            ext = ext * max(stretch, 1.0)
         if spin != 0.0 or rot_b != 0.0:
             ang_s = rot_b
             if spin != 0.0:
@@ -8235,12 +8321,39 @@ def _draw_halos(img, scene, st, gbuf, view, proj, w, h, sel_mask=None):
                                           0x7F4A7C15)[0])
                 ang_s = ang_s + spin * t_s + ph_s * 2.0 * np.pi
             ca_s, sa_s = float(np.cos(ang_s)), float(np.sin(ang_s))
-            xn_r = ca_s * xn + sa_s * yn
-            yn_r = -sa_s * xn + ca_s * yn
         else:
-            xn_r, yn_r = xn, yn
-        xa = xn_r / np.float32(aspect) if aspect != 1.0 else xn_r
-        ya = yn_r
+            ca_s = sa_s = None
+
+        def _window(extent):
+            wx0 = max(int(np.floor(xs - extent)), 0)
+            wx1 = min(int(np.ceil(xs + extent)) + 1, w)
+            wy0 = max(int(np.floor(ys - extent)), 0)
+            wy1 = min(int(np.ceil(ys + extent)) + 1, h)
+            if wx0 >= wx1 or wy0 >= wy1:
+                return None
+            wxn = np.arange(wx0, wx1, dtype=np.float32)[None, :] \
+                - np.float32(xs)
+            wyn = np.arange(wy0, wy1, dtype=np.float32)[:, None] \
+                - np.float32(ys)
+            return wx0, wx1, wy0, wy1, wxn, wyn
+
+        def _frame(wxn, wyn):
+            if ca_s is not None:
+                fx = ca_s * wxn + sa_s * wyn
+                fy = -sa_s * wxn + ca_s * wyn
+            else:
+                fx, fy = wxn, wyn
+            if stretch != 1.0:
+                fx, fy = _halo_stretch(fx, fy, stretch, float(
+                    spec.get('stretch_angle', 0.0) or 0.0))
+            fx = fx / np.float32(aspect) if aspect != 1.0 else fx
+            return fx, fy
+
+        win = _window(ext)
+        if win is None:
+            continue
+        x0, x1, y0, y1, xn, yn = win
+        xa, ya = _frame(xn, yn)
         distsq = xa * xa + ya * ya
         radsq = rad * rad
         shape = str(spec.get('shape', 'DISC') or 'DISC')
@@ -8281,7 +8394,7 @@ def _draw_halos(img, scene, st, gbuf, view, proj, w, h, sel_mask=None):
             continue
         zz = zbuf[y0:y1, x0:x1]
         soft = bool(spec.get('soft'))
-        if not soft:
+        if not soft and not over:
             inside &= zz > zs
             if not inside.any():
                 continue
@@ -8298,8 +8411,9 @@ def _draw_halos(img, scene, st, gbuf, view, proj, w, h, sel_mask=None):
             alpha *= np.clip(soften, 0.0, 1.0)
             inside &= depth2 > 1e-12
             inside &= alpha > 0.0
-        else:
+        elif not over:
             # the old softening: geometry within zd behind the centre
+            # (R253: Over Everything skips it with the z-test)
             zde = max(zd, 1e-12)
             t_soft = (zz - zs) / zde
             near_geo = zs > (zz - zd)
@@ -8384,17 +8498,24 @@ def _draw_halos(img, scene, st, gbuf, view, proj, w, h, sel_mask=None):
             dist = np.where(f_h < 0.0,
                             np.minimum((radist / max(rad, 1e-12)) ** 2
                                        * 0.8, 1.0), 1.0)
-        _hd = spec.get('hardness', 50)
-        hard = int(_hd) if _hd is not None else 50
-        if hard >= 30:
-            dist = np.sqrt(dist)
-            if hard >= 40:
-                dist = np.sin(dist * (np.pi * 0.5))
-                if hard >= 50:
-                    dist = np.sqrt(dist)
-        elif hard < 20:
-            dist = dist * dist
-        dist = np.where(dist < 1.0, 1.0 - dist, 0.0)
+        # R253: the Falloff menu -- 'BI' is the ladder verbatim; the
+        # other curves read the same shape metric
+        fo_ = str(spec.get('falloff', 'BI') or 'BI')
+        if fo_ == 'BI':
+            _hd = spec.get('hardness', 50)
+            hard = int(_hd) if _hd is not None else 50
+            if hard >= 30:
+                dist = np.sqrt(dist)
+                if hard >= 40:
+                    dist = np.sin(dist * (np.pi * 0.5))
+                    if hard >= 50:
+                        dist = np.sqrt(dist)
+            elif hard < 20:
+                dist = dist * dist
+            dist = np.where(dist < 1.0, 1.0 - dist, 0.0)
+        else:
+            dist = _halo_falloff(fo_, dist,
+                                 float(spec.get('ring_inner', 0.6)))
         if img_a is not None:
             # image authority: its alpha replaces the shaped falloff
             # (the hardness ladder is the disc's law, not the image's)
@@ -8548,6 +8669,7 @@ def _draw_halos(img, scene, st, gbuf, view, proj, w, h, sel_mask=None):
             return np.asarray(_cs.hsv_to_rgb(hh, ss, vv), np.float32)
         col_r = _adj(col_r)
         col2_r = _adj(col2_r)
+        lit_v = None
         xalpha = bool(spec.get('xalpha'))
         ca = dist * dist if xalpha else dist
         ramp = spec.get('ramp')
@@ -8641,6 +8763,7 @@ def _draw_halos(img, scene, st, gbuf, view, proj, w, h, sel_mask=None):
                 lit = np.maximum(acc, 0.0)
                 shaded_cache[key] = lit
             crgb = crgb * lit[None, None, :]
+            lit_v = lit
         # R200: each element's colour add is its own (rays and bolts
         # no longer ride the line colour once theirs is set; unset
         # keys fall back to it, keeping old scenes). The alpha add
@@ -8672,15 +8795,56 @@ def _draw_halos(img, scene, st, gbuf, view, proj, w, h, sel_mask=None):
             ca = ca + (ringf * ringf if xalpha else ringf)
         ca = np.minimum(ca, 1.0).astype(np.float32)
         crgb = crgb.astype(np.float32)
-        # addalphaAddfacFloat: dest weight slides with Add
+        # addalphaAddfacFloat: dest weight slides with Add (R253: or
+        # one of the fixed Blend modes -- the helper is the old two
+        # statements verbatim under ADD_SLIDER)
         addfac = float(np.clip(spec.get('add', 0.0), 0.0, 1.0))
-        mfac = (1.0 - ca * (1.0 - addfac)).astype(np.float32)
+        bmode = str(spec.get('blend', 'ADD_SLIDER') or 'ADD_SLIDER')
+        gs_ = min(max(float(spec.get('glow_size', 0.0) or 0.0), 0.0), 8.0)
+        if gs_ > 0.0:
+            # R253: the outer glow -- a second, wider Gaussian layer
+            # under the core, the sprite engines' bloom. Its own
+            # window, the same frame, the same depth rule (z-tested
+            # against its own pixels unless Over Everything), the
+            # same blend; composited BEFORE the core so the core
+            # sits on top of it
+            gwin = _window(ext * gs_)
+            if gwin is not None:
+                gx0, gx1, gy0, gy1, gxn, gyn = gwin
+                gxa, gya = _frame(gxn, gyn)
+                dg = (gxa * gxa + gya * gya) \
+                    / max((rad * gs_) * (rad * gs_), 1e-12)
+                g_in = dg < 1.0
+                if sel_mask is not None:
+                    g_in &= sel_mask[gy0:gy1, gx0:gx1]
+                if not over:
+                    g_in &= zbuf[gy0:gy1, gx0:gx1] > zs
+                if g_in.any():
+                    _gs = spec.get('glow_strength')
+                    gstr = 1.0 if _gs is None else max(float(_gs), 0.0)
+                    ag = (alpha0 * gstr
+                          * np.clip((np.exp(-4.5 * np.minimum(dg, 1.0))
+                                     - _gauss_k) / (1.0 - _gauss_k),
+                                    0.0, 1.0)).astype(np.float32)
+                    gcv = spec.get('glow_color')
+                    gcol = col_r if gcv is None \
+                        else _adj(np.asarray(gcv, np.float32))
+                    if lit_v is not None:
+                        gcol = gcol * lit_v
+                    g_live = g_in & (ag > 0.00001)
+                    if g_live.any():
+                        ag = np.minimum(ag * ag if xalpha else ag, 1.0)
+                        g_rgb = (ag[:, :, None]
+                                 * gcol[None, None, :]).astype(np.float32)
+                        gsub = out[gy0:gy1, gx0:gx1]
+                        _halo_blend(gsub[:, :, :3], gsub[:, :, 3], g_rgb,
+                                    ag.astype(np.float32), g_live, bmode,
+                                    addfac)
         lv = live
         sub = out[y0:y1, x0:x1]
         sub_rgb = sub[:, :, :3]
         sub_a = sub[:, :, 3]
-        sub_rgb[lv] = (mfac[lv, None] * sub_rgb[lv] + crgb[lv])
-        sub_a[lv] = mfac[lv] * sub_a[lv] + ca[lv]
+        _halo_blend(sub_rgb, sub_a, crgb, ca, lv, bmode, addfac)
     return out
 
 

@@ -3178,6 +3178,749 @@ class HALCYON_VolumeNode(Node, HalcyonNodeBase):
         note.label(text="Link to Material Output > Volume")
 
 
+# =========================================================== the halo node
+
+# R253: the Material tab's halo kit (R191/R194/R198/R200) becomes a node,
+# so the glow's colour, size and ramp can be driven by sockets and the
+# kit can keep growing without lengthening a panel. Every socket carries
+# its tooltip, applied at creation and again at load (_apply_socket_tips).
+HALO_SOCKET_DOCS = {
+    'Color':
+        "The glow's own colour -- 2.79 read the material's base colour "
+        "for this. An RGB node may drive it; any other link warns and "
+        "the socket value is used",
+    'Size':
+        "World-space radius of each glow (2.79's HaloSize). A Value "
+        "node sets it for every vertex; an Attribute node (a float "
+        "point attribute), a Color Attribute (its red channel) or "
+        "Particle Info > Size gives every halo its OWN size -- any other "
+        "link warns and the socket value is used",
+    'Alpha':
+        "The halo's own opacity (2.79's material Alpha); Extreme Alpha "
+        "squares it for a hotter core",
+    'Add':
+        "Slides the blend from alpha-over (0) to pure additive glow (1) "
+        "-- 2.79's Add slider; read only under the Add Slider blend mode",
+    'Edge Color':
+        "The rim end of the gradient; the halo Color holds the centre "
+        "(Gradient must be on, and a linked Ramp takes precedence)",
+    'Ramp':
+        "Link a Color Ramp's Color output here and the gradient follows "
+        "the ramp instead of the two colours, sampled into a 32-entry "
+        "table at export. Unlinked, the socket value is ignored",
+    'Ring Color':
+        "The concentric rings' colour -- 2.79 took this from the "
+        "material's Mirror colour",
+    'Line Color':
+        "The hashed radial streaks' colour -- 2.79 took this from the "
+        "material's Specular colour; rays and bolts follow it until "
+        "their Own Colour toggles are set",
+    'Ray Color':
+        "The even rays' own colour, read only when Ray Own Colour is on "
+        "-- otherwise the rays follow the Line Color as they always did",
+    'Bolt Color':
+        "The electric arcs' own colour, read only when Bolt Own Colour "
+        "is on -- otherwise the bolts follow the Line Color",
+    'Fade Near':
+        "Camera distance at which the halo is fully bright; between "
+        "Fade Near and Fade Far the alpha falls to nothing. Both 0 (or "
+        "Far at or below Near) disables the fade",
+    'Fade Far':
+        "Camera distance at which the halo has faded away completely; "
+        "set it above Fade Near to turn the distance fade on",
+    'Stretch':
+        "Elongates the glow along Stretch Angle in screen space -- the "
+        "anamorphic streak of a lens flare or a motion smear. 1 is the "
+        "round halo; up to 20 (every shape, line and ring stretches)",
+    'Stretch Angle':
+        "The screen-space angle, in radians, that Stretch pulls along "
+        "-- independent of Rotation and Spin, so a turning star can "
+        "keep a horizontal streak",
+    'Glow Size':
+        "A second, softer Gaussian glow drawn under the core, this many "
+        "times the halo radius wide -- the lens bloom of the era's "
+        "sprite engines. 0 is off; kept at or below 8 for speed",
+    'Glow Strength':
+        "How bright the outer glow layer is relative to the halo's "
+        "alpha; 1 matches the core's own opacity",
+    'Glow Color':
+        "The outer glow layer's colour, read only when Glow Own Colour "
+        "is on -- otherwise the glow takes the halo Color",
+}
+
+#: R253: the falloff menu -- 'BI' keeps 2.79's hardness ladder bit for
+#: bit; the others are the sprite engines' own curves (Reeves 1983's
+#: Gaussian puffs, the point-sprite era's linear and quadratic fades)
+HALO_FALLOFF_ITEMS = [
+    ('BI', "Blender Internal (Hardness)",
+     "2.79's exact hardness ladder: the Hardness value picks the rung"),
+    ('GAUSSIAN', "Gaussian",
+     "A normalised Gaussian puff, zero at the rim -- the Reeves particle "
+     "glow"),
+    ('LINEAR', "Linear",
+     "Brightness falls straight from the centre to the rim"),
+    ('QUADRATIC', "Quadratic",
+     "A squared linear fade: a tight bright core, a soft wide skirt"),
+    ('HARD', "Hard Disc",
+     "Full brightness to the rim, then nothing -- the flat sprite dot"),
+    ('RING_ONLY', "Ring Only",
+     "Nothing inside Ring Inner, then a fade out to the rim -- a hollow "
+     "shockwave"),
+]
+
+#: R253: the blend menu -- ADD_SLIDER is addalphaAddfacFloat with the Add
+#: socket (the 2.79 road); the fixed modes are its two ends and Screen
+HALO_BLEND_ITEMS = [
+    ('ADD_SLIDER', "Add Slider (BI)",
+     "The Add socket slides between alpha-over and additive, exactly 2.79"),
+    ('ALPHA', "Alpha Over",
+     "Porter-Duff over: the halo covers what is beneath by its alpha"),
+    ('ADDITIVE', "Additive",
+     "Pure addition: overlapping glows brighten, the sprite-engine way"),
+    ('SCREEN', "Screen",
+     "1 - (1 - a)(1 - b): brightens without ever exceeding white"),
+]
+
+#: R253: the depth menu -- ZBUFFER is the 2.79 road (a halo behind a
+#: surface is hidden by it); OVER is the sprite overlay that ignores depth
+HALO_DEPTH_ITEMS = [
+    ('ZBUFFER', "Z-Buffer",
+     "Halos are depth-tested against the frame, exactly as 2.79 drew them"),
+    ('OVER', "Over Everything",
+     "Halos ignore the depth buffer and draw over every surface -- the "
+     "point-sprite overlay"),
+]
+
+#: R253: the node's own panel paging (UI only; it never serializes)
+HALO_PAGE_ITEMS = [
+    ('CORE', "Core", "Shape, falloff, blend, depth and the seed"),
+    ('TRIM', "Trim", "Rings, lines and the star pinch"),
+    ('ENERGY', "Energy", "Noise, bolts, rays and the outer glow"),
+    ('COLOR', "Colour", "Gradient, per-halo scatter and the HSV shift"),
+    ('MOTION', "Motion", "Pulse, flicker, spin and the per-effect clocks"),
+    ('ADVANCED', "Advanced",
+     "Aspect, rotation and the 2.79 mode bits"),
+]
+
+#: the 12 silhouettes, verbatim from the panel's halo_shape (properties.py)
+HALO_SHAPE_ITEMS = [
+    ('DISC', "Disc", "The classic round glow, 2.79's own core"),
+    ('RING', "Ring", "A hollow ring -- the centre pushed to the "
+                     "rim by 2.79's own flare-circle formula"),
+    ('HEX', "Hexagon", "A soft six-sided glow, the lens-iris "
+                       "look of the era's flare kits"),
+    ('DIAMOND', "Diamond", "A four-pointed soft diamond sparkle"),
+    ('TRIANGLE', "Triangle", "A soft three-sided glow, vertex "
+                             "up under zero rotation"),
+    ('PENTAGON', "Pentagon", "A soft five-sided iris glow"),
+    ('OCTAGON', "Octagon", "A soft eight-sided iris glow"),
+    ('CROSS', "Cross", "A plus-sign glow, bright along both "
+                       "axes and tapering at the rim"),
+    ('SQUARE', "Square", "A soft axis-aligned square glow"),
+    ('STAR', "Star", "A solid five-point star, points on the "
+                     "halo circle"),
+    ('HEART', "Heart", "The classic heart, radial glow inside"),
+    ('IMAGE', "Image", "An image IS the halo: its alpha the "
+                       "shape, its colours the glow -- the "
+                       "HaloTex idea, native"),
+]
+
+#: the gradient sweeps, verbatim from the panel's halo_gradient_type
+HALO_GRADIENT_ITEMS = [
+    ('RADIAL', "Centre Out (Radial)",
+     "Centre to rim along the radius"),
+    ('ANGULAR', "Angular", "A full turn around the centre -- "
+                           "the conic sweep"),
+    ('HORIZONTAL', "Horizontal",
+     "Left to right across the halo"),
+    ('VERTICAL', "Vertical", "Bottom to top across the halo"),
+    ('DIAGONAL', "Diagonal", "Corner to corner at 45 degrees"),
+]
+
+
+class HALCYON_HaloNode(Node, HalcyonNodeBase):
+    """The Halo node (R253): Blender Internal's MA_TYPE_HALO as a node.
+
+    A material carrying this node draws NO faces: every vertex of the
+    mesh wearing it (and every particle or point-cloud point) becomes a
+    depth-tested billboard glow splatted over the finished frame, on
+    both devices -- the transcription of 2.79's shadeHaloFloat lives
+    in core/render._draw_halos. Before 1.92 the same kit was ~60
+    properties on the Material tab; a file saved that way grows this
+    node at load (migrate_halo_material) and the panel block stays
+    only as a deprecated fallback.
+
+    New with the node: a Falloff menu beside the hardness ladder, a
+    Blend menu (alpha / additive / screen), Over Everything depth,
+    camera-distance fade, an anamorphic Stretch, a second Gaussian
+    glow layer, a per-frame re-rolled seed, and per-halo Size from an
+    Attribute / Color Attribute / Particle Info link. Every one is
+    neutral at its default: an old scene renders bit for bit.
+    """
+
+    bl_idname = 'HALCYON_HaloNode'
+    bl_label = "Halo"
+    bl_icon = 'PARTICLES'
+    bl_width_default = 220
+
+    # ---- the 2.79 core
+    hardness: IntProperty(
+        name="Hardness", default=50, min=0, max=127,
+        description="Falloff shape under the Blender Internal falloff, "
+                    "2.79's exact ladder: below 20 squares the falloff, "
+                    "30/40/50 each soften it a step further")
+    seed: IntProperty(
+        name="Seed", default=0, min=0, max=255,
+        description="Starting seed for the rings and lines hash -- each "
+                    "vertex walks on from it, exactly 2.79")
+    animate_seed: BoolProperty(
+        name="Animate Seed", default=False,
+        description="Re-roll the seed every frame (seed + frame, mod "
+                    "256): rings, lines, jitter and pulse phases all "
+                    "change from frame to frame -- the flickering "
+                    "sparkle of the era's effects")
+    rings: BoolProperty(
+        name="Rings", default=False,
+        description="Concentric circles around each halo, placed by the "
+                    "seed hash -- BI's Rings flag")
+    ring_count: IntProperty(
+        name="Ring Count", default=4, min=1, max=24,
+        description="How many concentric circles each halo draws, placed "
+                    "by the seed hash")
+    rings_even: BoolProperty(
+        name="Even Rings", default=False,
+        description="Space the rings evenly out from the centre -- "
+                    "shockwaves -- instead of hashing their radii the "
+                    "2.79 way")
+    ring_width: FloatProperty(
+        name="Ring Width", default=1.0, min=0.05, max=8.0,
+        description="Thickness of the concentric rings; 1.0 is the "
+                    "classic thin circle")
+    lines: BoolProperty(
+        name="Lines", default=False,
+        description="Random radial streaks through each halo, directions "
+                    "drawn from the seed hash -- BI's Lines flag")
+    line_count: IntProperty(
+        name="Line Count", default=12, min=1, max=250,
+        description="How many radial streaks cross each halo, directions "
+                    "drawn from the seed hash")
+    line_width: FloatProperty(
+        name="Line Width", default=1.0, min=0.05, max=8.0,
+        description="Thickness of the radial streaks; 1.0 is the classic "
+                    "hairline")
+    star: BoolProperty(
+        name="Star", default=False,
+        description="Pinch each halo into a star with the Star Tips "
+                    "point count -- BI's Star flag")
+    star_tips: IntProperty(
+        name="Star Tips", default=4, min=3, max=50,
+        description="Points on the star the halo is pinched into (4 was "
+                    "the classic lens sparkle)")
+    shape: EnumProperty(
+        name="Shape", default='DISC', items=HALO_SHAPE_ITEMS,
+        description="The glow's core silhouette; every shape still runs "
+                    "the falloff and the effects")
+    image: PointerProperty(
+        name="Halo Image", type=bpy.types.Image,
+        description="The picture drawn as the halo when Shape is Image; "
+                    "alpha carves the silhouette")
+    # ---- the energy kit (R198)
+    noise: FloatProperty(
+        name="Noise", default=0.0, min=0.0, max=1.0,
+        description="Animated value noise carving and boosting the core "
+                    "-- the energy-blast writhe; composes with every "
+                    "shape and the image")
+    noise_scale: FloatProperty(
+        name="Noise Scale", default=4.0, min=0.2, max=32.0,
+        description="Cells of noise across the halo; higher is finer "
+                    "boiling")
+    bolts: IntProperty(
+        name="Bolts", default=0, min=0, max=24,
+        description="Electric arcs radiating from the centre, each "
+                    "wiggling with radius and re-striking eight times "
+                    "per animation second")
+    bolt_width: FloatProperty(
+        name="Bolt Width", default=1.0, min=0.05, max=8.0,
+        description="Thickness of the electric arcs, in the same "
+                    "resolution-true units as Line Width")
+    bolt_own_color: BoolProperty(
+        name="Bolt Own Colour", default=False,
+        description="Read the Bolt Color socket; off, the bolts follow "
+                    "the Line Color as they always did (R200)")
+    rays: IntProperty(
+        name="Rays", default=0, min=0, max=64,
+        description="EVENLY spaced rays -- the symmetric starburst the "
+                    "hashed Lines cannot make; they turn with Rotation "
+                    "and Spin")
+    ray_sharp: FloatProperty(
+        name="Ray Sharpness", default=8.0, min=0.5, max=64.0,
+        description="How needle-thin the even rays are; higher is "
+                    "sharper spikes")
+    ray_own_color: BoolProperty(
+        name="Ray Own Colour", default=False,
+        description="Read the Ray Color socket; off, the rays follow "
+                    "the Line Color as they always did (R200)")
+    # ---- colour
+    gradient: BoolProperty(
+        name="Gradient", default=False,
+        description="Blend from the halo Color at the centre to the Edge "
+                    "Color at the rim (or along a linked Ramp)")
+    gradient_type: EnumProperty(
+        name="Gradient Type", default='RADIAL', items=HALO_GRADIENT_ITEMS,
+        description="How the gradient (or colour ramp) sweeps the halo; "
+                    "linear sweeps turn with Rotation and Spin")
+    gradient_noise: FloatProperty(
+        name="Gradient Noise", default=0.0, min=0.0, max=1.0,
+        description="Wobbles the gradient coordinate with animated noise "
+                    "-- turbulent colour bands; Noise Scale sets the "
+                    "cell size, Anim Speed drives it, and the angular "
+                    "sweep wraps seamlessly")
+    aspect: FloatProperty(
+        name="Aspect", default=1.0, min=0.05, max=20.0,
+        description="Stretches the halo horizontally (above 1) or "
+                    "vertically (below 1) -- with Rotation, a turned "
+                    "anamorphic streak; applies to every shape, the "
+                    "lines and the star")
+    rotation: FloatProperty(
+        name="Rotation", default=0.0, min=-6.2832, max=6.2832,
+        subtype='ANGLE',
+        description="Static turn of the shape, lines and star about the "
+                    "centre; Spin animates on top of it")
+    rand_hue: FloatProperty(
+        name="Random Hue", default=0.0, min=0.0, max=1.0,
+        description="Per-halo hue scatter off the seed -- confetti clouds "
+                    "from one material, deterministic per vertex; it "
+                    "scatters every coloured option, trim included")
+    rand_sat: FloatProperty(
+        name="Random Saturation", default=0.0, min=0.0, max=1.0,
+        description="Per-halo saturation scatter off the seed, over every "
+                    "coloured option")
+    rand_val: FloatProperty(
+        name="Random Value", default=0.0, min=0.0, max=1.0,
+        description="Per-halo brightness scatter off the seed, over every "
+                    "coloured option")
+    hue_shift: FloatProperty(
+        name="Hue Shift", default=0.0, min=-1.0, max=1.0,
+        description="Turns the hue of EVERY coloured option together -- "
+                    "body, gradient end, ramp, image, rings, lines, rays "
+                    "and bolts; a full turn is 1.0, and keyframing it "
+                    "cycles the whole halo through the wheel")
+    sat_shift: FloatProperty(
+        name="Saturation Shift", default=1.0, min=0.0, max=2.0,
+        description="Scales the saturation of every coloured option "
+                    "together; 0 drains the halo to grey, above 1 "
+                    "over-saturates")
+    val_shift: FloatProperty(
+        name="Value Shift", default=1.0, min=0.0, max=4.0,
+        description="Scales the brightness of every coloured option "
+                    "together; keyframable for fades that keep the "
+                    "alpha shape")
+    # ---- motion
+    pulse: FloatProperty(
+        name="Pulse", default=0.0, min=0.0, max=1.0,
+        description="Each halo's size breathes over time on its own "
+                    "hashed phase, so a cloud shimmers instead of "
+                    "throbbing in sync")
+    flicker: FloatProperty(
+        name="Flicker", default=0.0, min=0.0, max=1.0,
+        description="Per-frame per-halo brightness jitter -- the 90s "
+                    "sparkle; deterministic in (seed, frame)")
+    spin: FloatProperty(
+        name="Spin", default=0.0, min=-16.0, max=16.0,
+        description="Turns the lines, star and shaped cores about the "
+                    "centre, in radians per second of scene time")
+    anim_speed: FloatProperty(
+        name="Anim Speed", default=1.0, min=0.0, max=8.0,
+        description="The master clock every animated halo effect rides "
+                    "-- Pulse, Noise, Bolts and Gradient Noise all scale "
+                    "by it; 0 freezes them all in place")
+    pulse_speed: FloatProperty(
+        name="Pulse Speed", default=1.0, min=0.0, max=20.0,
+        description="Scales the Pulse breathing alone, on top of the "
+                    "master Anim Speed; 0 freezes just the pulse")
+    flicker_speed: FloatProperty(
+        name="Flicker Speed", default=1.0, min=0.0, max=20.0,
+        description="How often the Flicker re-rolls: 1 is every frame "
+                    "(the classic sparkle), 0.5 every other frame, 0 "
+                    "holds one roll forever")
+    noise_speed: FloatProperty(
+        name="Noise Speed", default=1.0, min=0.0, max=20.0,
+        description="Scales the core Noise writhe alone, on top of the "
+                    "master Anim Speed; 0 freezes the boil")
+    bolt_speed: FloatProperty(
+        name="Bolt Speed", default=1.0, min=0.0, max=20.0,
+        description="Scales the electric arcs alone -- strike rate and "
+                    "writhe together -- on top of the master Anim "
+                    "Speed; 0 freezes the strike")
+    grad_noise_speed: FloatProperty(
+        name="Gradient Noise Speed", default=1.0, min=0.0, max=20.0,
+        description="Scales the Gradient Noise wobble alone, on top of "
+                    "the master Anim Speed; 0 freezes the bands")
+    # ---- the 2.79 mode bits
+    xalpha: BoolProperty(
+        name="Extreme Alpha", default=False,
+        description="Square the alpha for a hotter core -- 2.79's "
+                    "MA_HALO_XALPHA mode bit")
+    soft: BoolProperty(
+        name="Soft", default=False,
+        description="Soften halos where they intersect geometry by how "
+                    "much of their depth is visible (MA_HALO_SOFT)")
+    shaded: BoolProperty(
+        name="Shaded", default=False,
+        description="Tint each halo by the scene's lamps at its centre "
+                    "-- 2.79's MA_HALO_SHADE mode bit")
+    puno: BoolProperty(
+        name="Vertex Normal", default=False,
+        description="Scale each halo by its vertex normal's facing -- "
+                    "rear-facing verts glow, camera-facing ones vanish "
+                    "(MA_HALOPUNO)")
+    # ---- R253: the new options
+    falloff: EnumProperty(
+        name="Falloff", default='BI', items=HALO_FALLOFF_ITEMS,
+        description="The core's brightness curve from centre to rim: "
+                    "2.79's hardness ladder, or one of the sprite "
+                    "engines' own curves. The image shape keeps its "
+                    "alpha whatever this says")
+    ring_inner: FloatProperty(
+        name="Ring Inner", default=0.6, min=0.0, max=0.99,
+        description="Under the Ring Only falloff: the fraction of the "
+                    "radius that stays dark before the ring begins")
+    blend: EnumProperty(
+        name="Blend", default='ADD_SLIDER', items=HALO_BLEND_ITEMS,
+        description="How each glow composites over the frame: 2.79's "
+                    "Add slider, a fixed alpha-over, pure addition, or "
+                    "the screen formula that never clips to white")
+    depth_mode: EnumProperty(
+        name="Depth", default='ZBUFFER', items=HALO_DEPTH_ITEMS,
+        description="Z-Buffer hides a halo behind a surface exactly as "
+                    "2.79 did; Over Everything skips the depth test for "
+                    "the point-sprite overlay")
+    glow_own_color: BoolProperty(
+        name="Glow Own Colour", default=False,
+        description="Read the Glow Color socket for the outer glow "
+                    "layer; off, the glow takes the halo Color")
+    ui_page: EnumProperty(
+        name="Page", default='CORE', items=HALO_PAGE_ITEMS,
+        description="Which page of the node's options is shown -- the "
+                    "node's panel paging only, it changes no pixel")
+
+    SOCKETS = (
+        ('NodeSocketColor', 'Color', (0.8, 0.8, 0.8, 1.0)),
+        ('NodeSocketFloat', 'Size', 0.5),
+        ('NodeSocketFloat', 'Alpha', 1.0),
+        ('NodeSocketFloat', 'Add', 0.0),
+        ('NodeSocketColor', 'Edge Color', (0.0, 0.0, 0.0, 1.0)),
+        ('NodeSocketColor', 'Ramp', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketColor', 'Ring Color', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketColor', 'Line Color', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketColor', 'Ray Color', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketColor', 'Bolt Color', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketFloat', 'Fade Near', 0.0),
+        ('NodeSocketFloat', 'Fade Far', 0.0),
+        ('NodeSocketFloat', 'Stretch', 1.0),
+        ('NodeSocketFloat', 'Stretch Angle', 0.0),
+        ('NodeSocketFloat', 'Glow Size', 0.0),
+        ('NodeSocketFloat', 'Glow Strength', 1.0),
+        ('NodeSocketColor', 'Glow Color', (1.0, 1.0, 1.0, 1.0)),
+    )
+
+    def init(self, context):
+        for kind, name, default in self.SOCKETS:
+            sock = self.inputs.new(kind, name)
+            if default is not None:
+                try:
+                    sock.default_value = default
+                except (TypeError, ValueError):
+                    pass
+        _apply_socket_tips(self, HALO_SOCKET_DOCS)
+        self.outputs.new('NodeSocketShader', 'Halo')
+
+    def ensure_sockets(self):
+        """load_post: a saved node gains any socket a later round
+        added (by name, at the end) and the tooltips land again."""
+        have = {getattr(s, 'name', None) for s in self.inputs}
+        for kind, name, default in self.SOCKETS:
+            if name in have:
+                continue
+            try:
+                sock = self.inputs.new(kind, name)
+                if default is not None:
+                    sock.default_value = default
+            except Exception:                                   # noqa: BLE001
+                pass
+        _apply_socket_tips(self, HALO_SOCKET_DOCS)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'ui_page', expand=True)
+        page = self.ui_page
+        col = layout.column(align=True)
+        if page == 'CORE':
+            col.prop(self, 'shape', text="")
+            if self.shape == 'IMAGE':
+                col.template_ID(self, 'image', open='image.open')
+            col.prop(self, 'falloff', text="")
+            if self.falloff == 'RING_ONLY':
+                col.prop(self, 'ring_inner')
+            hrow = col.row()
+            hrow.active = self.falloff == 'BI'
+            hrow.prop(self, 'hardness')
+            col.prop(self, 'blend', text="")
+            col.prop(self, 'depth_mode', text="")
+            row = col.row(align=True)
+            row.prop(self, 'seed')
+            row.prop(self, 'animate_seed', text="", icon='TIME')
+            note = layout.column(align=True)
+            note.active = False
+            note.scale_y = 0.8
+            note.label(text="Vertices glow; faces do not draw")
+        elif page == 'TRIM':
+            row = col.row(align=True)
+            row.prop(self, 'rings')
+            rsub = row.row()
+            rsub.active = self.rings
+            rsub.prop(self, 'ring_count', text="")
+            if self.rings:
+                col.prop(self, 'ring_width')
+                col.prop(self, 'rings_even')
+            row = col.row(align=True)
+            row.prop(self, 'lines')
+            lsub = row.row()
+            lsub.active = self.lines
+            lsub.prop(self, 'line_count', text="")
+            if self.lines:
+                col.prop(self, 'line_width')
+            row = col.row(align=True)
+            row.prop(self, 'star')
+            ssub = row.row()
+            ssub.active = self.star
+            ssub.prop(self, 'star_tips', text="")
+        elif page == 'ENERGY':
+            row = col.row(align=True)
+            row.prop(self, 'noise')
+            row.prop(self, 'noise_scale')
+            row = col.row(align=True)
+            row.prop(self, 'bolts')
+            row.prop(self, 'bolt_width')
+            if self.bolts:
+                col.prop(self, 'bolt_own_color')
+            row = col.row(align=True)
+            row.prop(self, 'rays')
+            row.prop(self, 'ray_sharp')
+            if self.rays:
+                col.prop(self, 'ray_own_color')
+            col.prop(self, 'glow_own_color')
+        elif page == 'COLOR':
+            col.prop(self, 'gradient')
+            if self.gradient:
+                row = col.row(align=True)
+                row.prop(self, 'gradient_type', text="")
+                row.prop(self, 'gradient_noise')
+            row = col.row(align=True)
+            row.prop(self, 'rand_hue', text="Hue")
+            row.prop(self, 'rand_sat', text="Sat")
+            row.prop(self, 'rand_val', text="Val")
+            row = col.row(align=True)
+            row.prop(self, 'hue_shift', text="Hue Shift")
+            row.prop(self, 'sat_shift', text="Sat")
+            row.prop(self, 'val_shift', text="Val")
+        elif page == 'MOTION':
+            row = col.row(align=True)
+            row.prop(self, 'pulse')
+            row.prop(self, 'flicker')
+            row = col.row(align=True)
+            row.prop(self, 'spin')
+            row.prop(self, 'anim_speed')
+            row = col.row(align=True)
+            row.prop(self, 'pulse_speed', text="Pulse")
+            row.prop(self, 'flicker_speed', text="Flicker")
+            row = col.row(align=True)
+            row.prop(self, 'noise_speed', text="Noise")
+            row.prop(self, 'bolt_speed', text="Bolt")
+            col.prop(self, 'grad_noise_speed')
+        else:                                   # ADVANCED
+            row = col.row(align=True)
+            row.prop(self, 'aspect')
+            row.prop(self, 'rotation')
+            row = col.row(align=True)
+            row.prop(self, 'xalpha')
+            row.prop(self, 'soft')
+            row = col.row(align=True)
+            row.prop(self, 'shaded')
+            row.prop(self, 'puno')
+
+
+#: R253: the panel-prop -> node map the load-time migration copies.
+#: (panel prop, 'sock' | 'prop', node socket name | node property)
+HALO_PANEL_MAP = (
+    ('halo_color', 'sock', 'Color'),
+    ('halo_size', 'sock', 'Size'),
+    ('halo_alpha', 'sock', 'Alpha'),
+    ('halo_add', 'sock', 'Add'),
+    ('halo_color2', 'sock', 'Edge Color'),
+    ('halo_ring_color', 'sock', 'Ring Color'),
+    ('halo_line_color', 'sock', 'Line Color'),
+    ('halo_ray_color', 'sock', 'Ray Color'),
+    ('halo_bolt_color', 'sock', 'Bolt Color'),
+    ('halo_hardness', 'prop', 'hardness'),
+    ('halo_seed', 'prop', 'seed'),
+    ('halo_rings', 'prop', 'rings'),
+    ('halo_ring_count', 'prop', 'ring_count'),
+    ('halo_rings_even', 'prop', 'rings_even'),
+    ('halo_ring_width', 'prop', 'ring_width'),
+    ('halo_lines', 'prop', 'lines'),
+    ('halo_line_count', 'prop', 'line_count'),
+    ('halo_line_width', 'prop', 'line_width'),
+    ('halo_star', 'prop', 'star'),
+    ('halo_star_tips', 'prop', 'star_tips'),
+    ('halo_shape', 'prop', 'shape'),
+    ('halo_image', 'prop', 'image'),
+    ('halo_noise', 'prop', 'noise'),
+    ('halo_noise_scale', 'prop', 'noise_scale'),
+    ('halo_bolts', 'prop', 'bolts'),
+    ('halo_bolt_width', 'prop', 'bolt_width'),
+    ('halo_rays', 'prop', 'rays'),
+    ('halo_ray_sharp', 'prop', 'ray_sharp'),
+    ('halo_gradient', 'prop', 'gradient'),
+    ('halo_gradient_type', 'prop', 'gradient_type'),
+    ('halo_gradient_noise', 'prop', 'gradient_noise'),
+    ('halo_aspect', 'prop', 'aspect'),
+    ('halo_rotation', 'prop', 'rotation'),
+    ('halo_rand_hue', 'prop', 'rand_hue'),
+    ('halo_rand_sat', 'prop', 'rand_sat'),
+    ('halo_rand_val', 'prop', 'rand_val'),
+    ('halo_hue_shift', 'prop', 'hue_shift'),
+    ('halo_sat_shift', 'prop', 'sat_shift'),
+    ('halo_val_shift', 'prop', 'val_shift'),
+    ('halo_pulse', 'prop', 'pulse'),
+    ('halo_flicker', 'prop', 'flicker'),
+    ('halo_spin', 'prop', 'spin'),
+    ('halo_anim_speed', 'prop', 'anim_speed'),
+    ('halo_pulse_speed', 'prop', 'pulse_speed'),
+    ('halo_flicker_speed', 'prop', 'flicker_speed'),
+    ('halo_noise_speed', 'prop', 'noise_speed'),
+    ('halo_bolt_speed', 'prop', 'bolt_speed'),
+    ('halo_grad_noise_speed', 'prop', 'grad_noise_speed'),
+    ('halo_xalpha', 'prop', 'xalpha'),
+    ('halo_soft', 'prop', 'soft'),
+    ('halo_shaded', 'prop', 'shaded'),
+    ('halo_puno', 'prop', 'puno'),
+)
+
+
+def _active_output_node(tree):
+    """The tree's active Material Output (else its first), or None."""
+    first = None
+    for node in getattr(tree, 'nodes', None) or ():
+        if getattr(node, 'bl_idname', '') != 'ShaderNodeOutputMaterial':
+            continue
+        if getattr(node, 'is_active_output', False):
+            return node
+        if first is None:
+            first = node
+    return first
+
+
+def halo_node_of(tree):
+    """R253: the Halo node a tree shades by, or None.
+
+    The first non-muted HALCYON_HaloNode; with several, the one whose
+    output feeds the active Material Output's Surface, else the lowest
+    node name -- so the pick is deterministic across exports."""
+    nodes = getattr(tree, 'nodes', None)
+    if not nodes:
+        return None
+    cands = [n for n in nodes
+             if getattr(n, 'bl_idname', '') == 'HALCYON_HaloNode'
+             and not getattr(n, 'mute', False)]
+    if not cands:
+        return None
+    if len(cands) == 1:
+        return cands[0]
+    for n in cands:
+        for o in getattr(n, 'outputs', None) or ():
+            for ln in getattr(o, 'links', None) or ():
+                to = getattr(ln, 'to_node', None)
+                if getattr(to, 'bl_idname', '') == 'ShaderNodeOutputMaterial' \
+                        and getattr(getattr(ln, 'to_socket', None),
+                                    'name', '') == 'Surface':
+                    return n
+    return min(cands, key=lambda n: str(getattr(n, 'name', '')))
+
+
+def migrate_halo_material(mat):
+    """R253: a material carrying the pre-1.92 panel kit (`hs.halo` on)
+    and no Halo node grows one, value for value, and the panel toggle
+    clears so the node is the ONE source of truth. Returns the node,
+    or None when nothing was migrated (no panel halo, or a node already
+    present). Load-time only, like migrate_master_node -- node creation
+    is legal there and in an operator, never in an update callback."""
+    hs = getattr(mat, 'halcyon', None)
+    if hs is None or not getattr(hs, 'halo', False):
+        return None
+    try:
+        if not getattr(mat, 'use_nodes', True):
+            mat.use_nodes = True
+    except Exception:                                           # noqa: BLE001
+        pass
+    tree = getattr(mat, 'node_tree', None)
+    if tree is None:
+        return None
+    if halo_node_of(tree) is not None:
+        return None
+    node = tree.nodes.new('HALCYON_HaloNode')
+    try:
+        node.label = "Halo"
+        node.location = (-300, 300)
+    except Exception:                                           # noqa: BLE001
+        pass
+    for pname, kind, target in HALO_PANEL_MAP:
+        if not hasattr(hs, pname):
+            continue
+        try:
+            val = getattr(hs, pname)
+            if kind == 'sock':
+                sock = node.inputs.get(target)
+                if sock is None:
+                    continue
+                if hasattr(val, '__len__') and not isinstance(val, str):
+                    val = tuple(float(x) for x in val)
+                    if len(val) == 3:
+                        val = val + (1.0,)
+                sock.default_value = val
+            else:
+                setattr(node, target, val)
+        except Exception:                                       # noqa: BLE001
+            pass
+    # R200's 'unset follows the Line Colour' contract becomes a toggle
+    for sk, flag in (('halo_ray_color', 'ray_own_color'),
+                     ('halo_bolt_color', 'bolt_own_color')):
+        try:
+            setattr(node, flag, bool(hs.is_property_set(sk)))
+        except Exception:                                       # noqa: BLE001
+            pass
+    # the hidden ramp widget becomes a real link
+    try:
+        ramp = tree.nodes.get('__halo_ramp')
+        if ramp is not None:
+            tree.links.new(ramp.outputs[0], node.inputs.get('Ramp'))
+    except Exception:                                           # noqa: BLE001
+        pass
+    # the output: only onto an UNLINKED Surface (never steal a chain)
+    try:
+        out = _active_output_node(tree)
+        if out is not None:
+            surf = out.inputs.get('Surface')
+            if surf is not None and not getattr(surf, 'is_linked', False):
+                tree.links.new(node.outputs[0], surf)
+    except Exception:                                           # noqa: BLE001
+        pass
+    try:
+        hs.halo = False
+    except Exception:                                           # noqa: BLE001
+        pass
+    return node
+
+
 class HALCYON_BIMaterialNode(Node, HalcyonNodeBase):
     """Blender Internal's material panel as one node.
 
@@ -4504,6 +5247,7 @@ NODES = (HALCYON_RampNode, HALCYON_BlurNode,
          HALCYON_ShaderNode, HALCYON_AnimeShaderNode,
          HALCYON_CartoonNode, HALCYON_ConsoleShaderNode,
          HALCYON_VolumeNode,
+         HALCYON_HaloNode,              # R253
          HALCYON_BIMaterialNode,
          HALCYON_BIInfluenceNode, HALCYON_BIRGBBlendNode,
          HALCYON_CodeNode, HALCYON_PosterizeNode,
@@ -4925,6 +5669,7 @@ MENU_FAMILIES = (
      (HALCYON_ShaderNode, HALCYON_AnimeShaderNode, HALCYON_CartoonNode,
       HALCYON_ConsoleShaderNode,
       HALCYON_VolumeNode,
+      HALCYON_HaloNode,              # R253: the halo kit as a node
       HALCYON_RampNode,
       HALCYON_CodeNode, HALCYON_FacingNode, HALCYON_IridescentNode)),
     ('Blender Internal', 'NODE_MATERIAL',
@@ -5121,6 +5866,16 @@ def _migrate_master_sockets(_arg=None):
     model the master no longer offers is rebuilt here as the node that
     carries it (migrate_master_node), before the socket pass.
     """
+    # R253: the Material tab's halo kit becomes a Halo node at load
+    # (the panel toggle clears, so the two can never disagree)
+    try:
+        for mat in bpy.data.materials:
+            try:
+                migrate_halo_material(mat)
+            except Exception:                           # noqa: BLE001
+                pass
+    except Exception:                                       # noqa: BLE001
+        pass
     try:
         trees = []
         for mat in bpy.data.materials:

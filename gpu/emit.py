@@ -3552,6 +3552,10 @@ REFUSED = {
                                   'Volume (R222)',
     'HALCYON_VolumeNode': 'a volume node in a SURFACE chain; volumes '
                           'march via Material Output > Volume (R222)',
+    # R253: the Halo node never rasterises on either device
+    'HALCYON_HaloNode': 'a halo material draws no faces; its vertices '
+                        'splat on the CPU over the readback on both '
+                        'devices (R191)',
     'ShaderNodeTexPointDensity': 'no volumetrics in this renderer',
     'ShaderNodeScript': 'OSL is not in this renderer; the Coded Shader '
                         'node is the native equivalent',

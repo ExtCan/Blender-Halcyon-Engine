@@ -3408,6 +3408,18 @@ def _n_empty_volume(ev, node):
     return {'Volume': Closure()}
 
 
+#: R253: the Halo node is not a surface either -- its material's
+#: vertices splat as billboard glows over the finished frame
+#: (core/render._draw_halos, R191), on both devices
+_NO_HALO = ('a halo material draws no faces: its vertices splat as '
+            'billboard glows over the finished frame (R191/R253); the '
+            'Halo output is an empty surface')
+
+
+def _n_empty_halo(ev, node):
+    return {'Halo': Closure()}
+
+
 def _n_bevel_out(ev, node):
     nrm = ev.input(node, 'Normal', VECTOR) if ev.has_link(node, 'Normal') \
         else ev.ctx.N
@@ -6499,6 +6511,8 @@ DISPATCH = {
     'ShaderNodeVolumeScatter': _n_named(_NO_VOLUME, _n_empty_volume),
     'ShaderNodeVolumePrincipled': _n_named(_NO_VOLUME, _n_empty_volume),
     'HALCYON_VolumeNode': _n_named(_NO_VOLUME, _n_empty_volume),
+    # R253: the Halo node names itself -- its material draws no faces
+    'HALCYON_HaloNode': _n_named(_NO_HALO, _n_empty_halo),
     'HALCYON_CartoonNode': n_cartoon_shader,
     'ShaderNodeVolumeCoefficients': _n_named(_NO_VOLUME, _n_empty_volume),
     'ShaderNodeVolumeInfo': _n_named(_NO_VOLUME),

@@ -320,6 +320,13 @@ FEATURES = {
                               "GPU refuses by name what it cannot carry (affine or "
                               "hit / layer passes under REYES, a linked SR Bump Light, "
                               "a linked Emboss Texture Size, Roughness off the grid)"),
+    # R253: the Halo node -- the same CPU splat on both roads, named
+    'halo_splat': (NOT_YET,
+                   "BI halo materials (the Halo node): painter's-order "
+                   "billboard glows splatted against the whole frame's "
+                   "depth; a CPU pass over the readback on both roads -- "
+                   "the frame leaves the GPU at 'halos' (gpu/frame.edited) "
+                   "and core/post says so once"),
 }
 
 #: features that force the whole frame onto the CPU when a scene uses them.
