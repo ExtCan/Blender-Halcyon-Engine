@@ -110,6 +110,21 @@ python -m halcyon.tests.run_all
 
 That is what CI runs, on Linux, Windows and macOS.
 
+**Strict GLSL (optional, needs glslang).** The GLSL simulator that proves
+every GPU twin bitwise accepts a text a driver rejects (a function defined
+twice, the 1.91.0 Modulate 4x crash). `tests/glsl_strict.py` compiles every
+material pass the deferred road plans (every engine model at every rate,
+every Console Emulation Shader type and option, the cel masters), the post
+stages, the sky pass and the rasteriser's fragment road with the Khronos
+front-end as desktop GLSL 4.30:
+
+    HALCYON_GLSLANG=/path/to/glslang python3 -m halcyon.tests.glsl_strict
+
+Build glslang from github.com/KhronosGroup/glslang (`cmake -G Ninja
+-DENABLE_OPT=OFF -DENABLE_HLSL=OFF .. && ninja glslang-standalone`; the
+binary is `StandAlone/glslang`). Without the variable the tool says it did
+not run and exits 0 -- it is a release gate, not a suite member.
+
 ### Reporting a problem
 
 Turn on **Developer Options** in Preferences ▸ Add-ons ▸ Halcyon, then use
