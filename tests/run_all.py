@@ -129,6 +129,8 @@ def run_tests():
     print('R253 CONVERT TO ANIME / CARTOON / GAME')
     print('=' * 66)
     rc |= test_r253_convert_buttons.main()
+    print()
+    print('=' * 66)
     print('R253 GENERATED COORDINATES (OBJECT BOX)')
     print('=' * 66)
     rc |= test_r253_generated_coords.main()
