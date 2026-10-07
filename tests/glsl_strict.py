@@ -131,10 +131,14 @@ def check_masters():
     graphs = {
         'anime': _one_bsdf_graph('HALCYON_AnimeShaderNode',
                                  [_sk('Diffuse Color', 'RGBA', [0.8, 0.3, 0.3, 1]),
-                                  _sk('Line Art', 'RGBA', [1, 1, 1, 1])],
+                                  _sk('Line Art', 'RGBA', [1, 1, 1, 1]),
+                                  _sk('Opacity', 'VALUE', 1.0),
+                                  _sk('Emission Strength', 'VALUE', 0.0)],
                                  {'compat': 'GENERIC', 'tones': 'TWO'}),
         'cartoon': _one_bsdf_graph('HALCYON_CartoonNode',
-                                   [_sk('Paint Color', 'RGBA', [0.8, 0.3, 0.3, 1])],
+                                   [_sk('Paint Color', 'RGBA', [0.8, 0.3, 0.3, 1]),
+                                    _sk('Opacity', 'VALUE', 1.0),
+                                    _sk('Emission Strength', 'VALUE', 0.0)],
                                    {'shadow_mode': 'PAINTED'}),
     }
     for name, graph in graphs.items():
