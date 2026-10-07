@@ -2994,14 +2994,31 @@ class HALCYON_PT_passes(HalcyonPanel, Panel):
         col.separator()
         col.prop(hs, 'pass_object_index')
         col.prop(hs, 'pass_material_index')
+        col.prop(hs, 'pass_mist')
+        # R253: the frame passes and the BI light split
+        col = layout.column(heading="Frame")
+        col.prop(hs, 'pass_environment')
+        col.prop(hs, 'pass_beauty')
+        col = layout.column(heading="Light")
+        col.prop(hs, 'pass_diffuse')
+        col.prop(hs, 'pass_specular')
+        col.prop(hs, 'pass_ambient')
+        col.prop(hs, 'pass_emission')
+        col.prop(hs, 'pass_shadow')
+        col.prop(hs, 'pass_ao')
+        col.prop(hs, 'pass_color')
+        col.separator()
+        col.prop(hs, 'pass_lights')
         note = layout.column(align=True)
         note.active = False
         note.scale_y = 0.8
-        for line in _wrap("These are data, not pictures: they skip the display "
-                          "chain, the palette and the dither entirely. Blender's "
-                          "own Passes panel is not shown because most of what it "
-                          "lists -- mist, vectors, light components -- is not "
-                          "something this engine produces.", 46):
+        for line in _wrap("Data passes (Depth to Mist) skip the display chain, "
+                          "the palette and the dither; Env and Beauty are "
+                          "linear colour. The Light passes shade the frame on "
+                          "the CPU by name and sum to the Beauty (Diffuse + "
+                          "Specular + Ambient + Emission). Blender's own "
+                          "Passes panel stays hidden because Vector and "
+                          "Denoising Data are not produced.", 46):
             note.label(text=line)
         if hs.use_processes:
             box = layout.box()

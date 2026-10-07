@@ -2446,6 +2446,17 @@ ROWS = [
     ('debug pass DEPTH', {'debug_pass': 'DEPTH'}, 'demo'),
     ('aux passes (depth + normal)', {'pass_depth': True,
                                      'pass_normal': True}, 'demo'),
+    # R253: the frame passes (bitwise twins by construction) and the BI
+    # light split (the GPU plan refuses by name; both roads land on the
+    # same CPU shade) -- the device-switch test proves the picture, and
+    # rows_covered homes every new pass_* field
+    ('aux passes (frame: mist + env + beauty)',
+     {'pass_mist': True, 'pass_environment': True, 'pass_beauty': True},
+     'demo'),
+    ('aux passes (light split)',
+     {'pass_diffuse': True, 'pass_specular': True, 'pass_ambient': True,
+      'pass_emission': True, 'pass_shadow': True, 'pass_ao': True,
+      'pass_color': True, 'pass_lights': True}, 'demo'),
 ]
 
 

@@ -565,9 +565,28 @@ class RenderSettings:
     pass_uv: bool = False
     pass_object_index: bool = False
     pass_material_index: bool = False
+    # R253: the compositing passes -- Blender Internal 2.79's RenderResult
+    # names (Mist, Env, Diffuse, Spec, Ambient, Emit, Shadow, AO, Color)
+    # so a comp built for BI drops in, plus Beauty (the linear frame
+    # before the post chain) and the per-lamp split (Light00..Light07).
+    # Every one defaults off: an old scene asks for nothing new, and the
+    # frame's arithmetic never moves (the split reads side accumulators)
+    pass_mist: bool = False
+    pass_environment: bool = False
+    pass_beauty: bool = False
+    pass_diffuse: bool = False
+    pass_specular: bool = False
+    pass_ambient: bool = False
+    pass_emission: bool = False
+    pass_shadow: bool = False
+    pass_ao: bool = False
+    pass_color: bool = False
+    pass_lights: bool = False
     debug_pass: str = 'BEAUTY'         # BEAUTY | DEPTH | NORMAL | UV | MATID | \
-                                       # DIFFUSE | SPECULAR | AMBIENT | SHADOW | \
-                                       # OVERDRAW | WIREFRAME
+                                       # OVERDRAW | WIREFRAME (properties.py
+                                       # DEBUG_PASS: the light components
+                                       # are real passes since R253, not
+                                       # debug views)
 
     # ------------------------------------------------------------------ utils
     def copy(self):

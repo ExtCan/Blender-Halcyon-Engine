@@ -24,6 +24,8 @@ def run_tests():
                    test_r251_post_codec)
     # R252 (1.91.0): the Console Emulation Shader
     from . import test_r252_console
+    # R253 (1.92.0): the compositing passes
+    from . import test_r253_compositing
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -120,6 +122,11 @@ def run_tests():
     print('R252 CONSOLE EMULATION SHADER')
     print('=' * 66)
     rc |= test_r252_console.main()
+    print()
+    print('=' * 66)
+    print('R253 COMPOSITING PASSES')
+    print('=' * 66)
+    rc |= test_r253_compositing.main()
     return rc
 
 
