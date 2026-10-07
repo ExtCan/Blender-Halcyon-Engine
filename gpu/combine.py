@@ -348,7 +348,13 @@ FN_THREEDO = FN_LUM + (
     'vec3 hal_cb_threedo(vec3 L, vec3 A)\n'
     '{\n'
     '    float lum = hal_lum(L);\n'
-    '    float n8 = floor(clamp(lum, 0.0, 1.0) * 8.0 + 0.5);\n'
+    # R253 (the console re-read): one op per statement before the floor
+    # -- `x * 8.0 + 0.5` in one expression is an FMA on a contracting
+    # driver, and the rounded product can land on the other side of
+    # the .5 the CPU's two-step float32 arithmetic sees
+    '    float m8 = clamp(lum, 0.0, 1.0) * 8.0;\n'
+    '    m8 = m8 + 0.5;\n'
+    '    float n8 = floor(m8);\n'
     '    n8 = clamp(n8, 1.0, 8.0);\n'
     '    vec3 c5 = roundEven(clamp(A, 0.0, 1.0) * 31.0);\n'
     '    vec3 c8 = c5 * 255.0;\n'

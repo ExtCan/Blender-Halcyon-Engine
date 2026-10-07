@@ -23,7 +23,7 @@ from . import utf8_console
 from .test_render import base_settings, _sk
 from .scenebuild import demo_scene
 from .featurematrix import _one_bsdf_graph
-from .test_r251_material import _sim_vs_cpu, glsl_twin
+from .test_r251_material import _job_for, _sim_vs_cpu, glsl_twin
 from ..core import combine as CB
 from ..core import console as CON
 from ..core import render as R
@@ -581,6 +581,52 @@ def test_glsl_texts_define_each_function_once():
     check('the device wrapper names a redefinition before the driver sees it',
           dup == ['hal_s8', 'hal_t8'] and DEV.duplicate_definitions(once) == [],
           str(dup))
+    # R253 (the console re-read): a PROTOTYPE is not a definition. The
+    # assembler writes `vec4 hal_ltex(int t);` ahead of the area-lamp
+    # functions and the body later; the first guard counted both and
+    # refused every material pass of a scene with an AREA lamp on the
+    # driver (the whole frame shaded on the CPU). The guard reads bodies
+    proto = ('vec4 hal_ltex(int t);\n' + GCB.FN_S8
+             + 'vec4 hal_ltex(int t)\n{\n    return vec4(0.0);\n}\n')
+    check('a prototype followed by its definition is not a duplicate',
+          DEV.duplicate_definitions(proto) == [],
+          str(DEV.duplicate_definitions(proto)))
+    check('a real redefinition behind a prototype is still named',
+          DEV.duplicate_definitions(proto + GCB.FN_S8) == ['hal_s8', 'hal_t8'])
+    from .featurematrix import SCENES as _SCENES
+    st_a = base_settings(48, 36)
+    st_a.render_device = 'GPU'
+    sc_a = _SCENES['area'](st_a)
+    g_a, job_a = _job_for(sc_a, st_a)
+    GSH._PLAN_CACHE.clear()
+    passes_a, why_a, _atl_a = GSH.plan_frame(job_a, g_a)
+    check('an AREA-lamp scene\'s material passes (the hal_ltex prototype) '
+          'carry no duplicate for the guard', passes_a is not None and all(
+              DEV.duplicate_definitions(src) == []
+              for _mi, _nm, src, _b in passes_a)
+          and any('vec4 hal_ltex(int t);' in src
+                  for _mi, _nm, src, _b in passes_a), str(why_a))
+    # R253 (the console re-read): the front-end pre-flight -- a text the
+    # simulator's grammar will not compile never reaches the driver (the
+    # crash class: a driver compile error, then the app down), and every
+    # real pass passes it
+    check('the pre-flight passes every AREA-lamp material pass',
+          passes_a is not None and all(
+              DEV.preflight(nm, src) is None for _mi, nm, src, _b in passes_a))
+    check('the pre-flight names a redefinition',
+          'more than once' in str(DEV.preflight('HAL_MAT_X', twice)))
+    broken = GCB.FN_S8 + 'in vec2 vUV;\nout vec4 Color;\nvoid main()\n{\n' \
+        '    Color = vec4(hal_s8(vec3(0.5)) * , 1.0);\n}\n'
+    why_b = DEV.preflight('HAL_MAT_X', broken)
+    check('the pre-flight refuses a syntax slip by name, before the driver',
+          why_b is not None and 'front-end' in why_b, str(why_b))
+    saved_pf = DEV.PREFLIGHT
+    DEV.PREFLIGHT = False
+    try:
+        check('the pre-flight switch turns it off for a bisect',
+              DEV.preflight('HAL_MAT_X', broken) is None)
+    finally:
+        DEV.PREFLIGHT = saved_pf
     # the assembled pass, end to end
     sc, st = _scene({'console': 'PC_FIXED', 'pc_texture_op': 'MODULATE4X'},
                     w=32, h=24, shading_rate='PIXEL')
@@ -597,6 +643,12 @@ def test_glsl_texts_define_each_function_once():
               len(defs(t)) == len(set(defs(t))) for t in srcs),
           str(why) if passes is None else f'{len(srcs)} sources')
     check('...and the pass is the CPU frame', d is not None and d < 6e-3 and nbad == 0)
+    # R253 (the console re-read): the assembled MODULATE4X pass clears the
+    # front-end pre-flight -- the text that crashed 1.91.0 never reaches
+    # a driver again, and the good text is not refused
+    check('the assembled MODULATE4X pass passes the pre-flight',
+          passes is not None and all(
+              DEV.preflight(nm, src) is None for _mi, nm, src, _b in passes))
 
 
 def test_rate_override():

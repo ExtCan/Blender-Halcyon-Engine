@@ -154,6 +154,38 @@ their house voice.
   presets, the version stamps, stereo, the panorama, pano parts, the whole
   feature matrix fallback, the R252 console module (146 checks).
 
+- **The console shader re-read (asked for with the field log, done after
+  the feature).** Every GLSL text the Console Emulation Shader can emit --
+  2940 machine x type x option x rate configurations, 8766 pass sources
+  (opaque, height pre-pass, secondary), plus the 301 matrix rows' 839
+  sources and the 51 stage / ink / sky / resolve texts -- was run through
+  the redefinition guard and Halcyon's own GLSL front-end. Three things
+  came out. (1) A REGRESSION from the 1.91.0 crash fix: the guard
+  `gpu/device.duplicate_definitions` counted the `vec4 hal_ltex(int t);`
+  PROTOTYPE the assembler writes ahead of the area-lamp functions as a
+  second definition, so on a driver every material pass of every scene
+  with an AREA lamp refused by name ("defines hal_ltex more than once")
+  and the whole frame shaded on the CPU -- invisible headless (no driver,
+  no compile). The guard now reads bodies only (`)...{`); pinned in
+  `test_glsl_texts_define_each_function_once` (a prototype + its body is
+  not a duplicate, a real repeat behind a prototype still is, the area
+  scene's passes carry none). (2) The 3DO PIXC twin's `floor(lum * 8.0 +
+  0.5)` was one expression -- an FMA on a contracting driver, the house
+  rule's one-op-per-statement slip; split (`gpu/combine.FN_THREEDO`), the
+  simulator twin stays d == 0.0. (3) A front-end PRE-FLIGHT
+  (`gpu/device.preflight`, switch `PREFLIGHT`): every dynamic pass (the
+  materials, the ink, the sky, the resolve variants, the radiosity grid)
+  is parsed by `shaders/compiler.try_compile` on the render worker before
+  the main-thread crossing; a text the twin grammar rejects is refused BY
+  NAME with the front-end's error and the frame shades on the CPU, instead
+  of a driver 'Shader Compile Error' -- the class the 1.91.0 log shows the
+  application dying right after. ~45 ms once per distinct text, nothing
+  on a repeat. The other field fatal in the same log (an access violation
+  inside the preview thread's `_background_image` after a Super FX plan
+  refusal, a pure-NumPy path over owned arrays) is not reproduced headless
+  and stays OPEN: a Python-side plan refusal makes no driver call, so the
+  corruption is upstream of that frame.
+
 ## README
 
 **Render Region (Ctrl+B).** Blender's own render border works in Halcyon

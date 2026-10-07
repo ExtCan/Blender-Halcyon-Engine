@@ -163,6 +163,12 @@ def compile_dynamic(name, fragment, spec):
         # refuse from memory: re-handing a known-bad source to the
         # driver is how the field session died (R193)
         return None, failed
+    pre = preflight(name, fragment)
+    if pre is not None:
+        if len(_STATE['failed']) >= _FAILED_CAP:
+            _STATE['failed'].pop(next(iter(_STATE['failed'])))
+        _STATE['failed'][key] = pre
+        return None, pre
     import time as _t
     t0 = _t.perf_counter()
     out = _main(f'compiling {name}', lambda: _compile_dynamic_miss(
@@ -175,16 +181,70 @@ def compile_dynamic(name, fragment, spec):
     return out
 
 
+#: R253 (the console re-read): the front-end pre-flight's switch -- off
+#: only for a bisect (every refusal it makes is printed by name)
+PREFLIGHT = True
+
+
+def preflight(name, fragment):
+    """R253 (the console re-read): the reason a dynamic pass must NOT reach
+    the driver, or None. Two walls, both on the CALLING thread (the render
+    worker), before the main-thread crossing:
+
+    * a redefinition (`duplicate_definitions`) -- the 1.91.0 field crash:
+      the driver refused the text ('Shader Compile Error') and the
+      application went down right after the refusal;
+    * a text Halcyon's own GLSL front-end (shaders/compiler.try_compile,
+      the grammar every twin is proven in) will not compile -- the same
+      class of refusal one step earlier, named with the front-end's
+      error, so a syntax slip in an emitter is a printed reason and a
+      CPU frame instead of a driver compile error. Every source the
+      assembler, the ink, the sky and the resolve emit today parses
+      (the scan over 8766 console sources and 839 matrix sources); the
+      parse costs ~45 ms once per distinct text and nothing on a repeat
+      (the front-end caches), the driver's own compile costs more.
+    """
+    if not PREFLIGHT:
+        return None
+    dup = duplicate_definitions(fragment)
+    if dup:
+        return (f'{name}: the pass defines {", ".join(dup)} more than '
+                'once; refused before the driver (a redefinition is a '
+                'Shader Compile Error on every driver)')
+    try:
+        from ..shaders.compiler import try_compile
+        src = str(fragment or '').replace('in vec2 vUV;', 'uniform vec2 vUV;')
+        prog, err = try_compile(src, 'GLSL')
+    except Exception as exc:                                    # noqa: BLE001
+        # the front-end itself failing is not the pass's fault: the
+        # driver decides, as before this guard
+        prog, err = True, str(exc)
+    if prog is None:
+        return (f"{name}: Halcyon's GLSL front-end would not compile the "
+                f'pass ({str(err)[:160]}); refused before the driver')
+    return None
+
+
 def duplicate_definitions(fragment):
-    """R252 (post-field): the names defined more than once in a fragment
-    source -- `<type> name(...)` at line start, every function the
-    assembler writes. A driver's compiler rejects a redefinition ('Shader
-    Compile Error') where the simulator shrugs, and the 1.91.0 field log
-    shows the application going down right after such a refusal; so the
-    wrappers below refuse BY NAME before the driver ever sees the text."""
+    """R252 (post-field): the names DEFINED more than once in a fragment
+    source -- `<type> name(...)` at line start followed by a body, every
+    function the assembler writes. A driver's compiler rejects a
+    redefinition ('Shader Compile Error') where the simulator shrugs, and
+    the 1.91.0 field log shows the application going down right after
+    such a refusal; so the wrappers below refuse BY NAME before the
+    driver ever sees the text.
+
+    R253 (the console re-read): a PROTOTYPE is not a definition. The
+    assembler writes `vec4 hal_ltex(int t);` ahead of the area-lamp
+    functions (declaration before use, the R193 strict-driver rule) and
+    the body after the shadow functions; the first form of this guard
+    counted both and refused every material pass of every scene with an
+    AREA lamp on the driver -- the whole frame shaded on the CPU with a
+    reason nobody could act on. The signature must be followed by `{`."""
     import re
     names = re.findall(r'^\s*(?:float|vec2|vec3|vec4|ivec2|int|bool|void)'
-                       r'\s+(hal_\w+)\s*\(', str(fragment or ''), re.M)
+                       r'\s+(hal_\w+)\s*\([^;{)]*\)\s*\{',
+                       str(fragment or ''), re.M)
     seen, dup = set(), []
     for n in names:
         if n in seen and n not in dup:
@@ -199,6 +259,8 @@ def _compile_dynamic_miss(key, name, fragment, spec):
         return None, why
     dup = duplicate_definitions(fragment)
     if dup:
+        # (the pre-flight above already refused this on the worker; the
+        # belt stays for a caller that reaches the miss directly)
         return None, (f'{name}: the pass defines {", ".join(dup)} more than '
                       'once; refused before the driver (a redefinition is a '
                       'Shader Compile Error on every driver)')
