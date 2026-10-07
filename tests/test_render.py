@@ -27197,9 +27197,15 @@ def test_enum_callback_default_rule():
     items = cm.kw.get('items')
     check('convert_model carries STATIC items with its default',
           not callable(items) and cm.kw.get('default') == 'PHONG')
-    from ..core.shading import MODEL_ITEMS
-    check('the static list is the model table, whole',
-          [i[0] for i in items] == [m[0] for m in MODEL_ITEMS])
+    from ..core.shading import MASTER_MODELS, MODEL_ITEMS
+    # R252: the picker offers the MASTER node's menu (the anime / cartoon
+    # / Max / console models have their own nodes), each item numbered by
+    # its engine index so a saved value keeps its meaning
+    check('the static list is the master menu, whole, numbered by the '
+          'engine table',
+          [i[0] for i in items] == list(MASTER_MODELS)
+          and all(len(i) == 5 and MODEL_ITEMS[i[4]][0] == i[0]
+                  for i in items))
     # the add-on must never import itself by its source name: an
     # installed extension is called bl_ext.<repo>.<name>, not halcyon
     root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
@@ -30017,11 +30023,16 @@ def test_cartoon_shader():
     node.apply_era('CUSTOM')
     check('CUSTOM writes nothing',
           node.inputs.get('Shadow Color').default_value == before)
-    check('the master hides what the paint ignores',
-          SN.HALCYON_ShaderNode.RELEVANT.get('CARTOON')
-          and 'Specular Level' not in
-          SN.HALCYON_ShaderNode.RELEVANT['CARTOON']
-          and 'Diffuse Color' in SN.HALCYON_ShaderNode.RELEVANT['CARTOON'])
+    # R252: the master no longer offers CARTOON -- the Cartoon Shader
+    # carries the paint model; the engine table keeps the model (and its
+    # GLSL index) and the master's menu is numbered by that table
+    from ..core.shading import MASTER_MODELS
+    check('the master no longer offers the paint model (the Cartoon '
+          'Shader carries it) and its menu keeps the engine indices',
+          'CARTOON' not in MASTER_MODELS
+          and 'CARTOON' not in SN.HALCYON_ShaderNode.RELEVANT
+          and all(it[0] in MASTER_MODELS for it in
+                  SN.HALCYON_ShaderNode.__annotations__['model'].kw['items']))
 
 
 def test_cartoon_shader_gpu_parity():

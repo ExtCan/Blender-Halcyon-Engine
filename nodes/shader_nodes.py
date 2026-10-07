@@ -13,7 +13,9 @@ from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
                        PointerProperty, StringProperty)
 from bpy.types import Node, NodeSocket, PropertyGroup
 
-from ..core.shading import MODEL_ITEMS
+from ..core.shading import (MODEL_ITEMS, MASTER_MODELS, MOVED_MODELS,
+                            master_model_items)
+from ..core import console as CON
 from ..core.volume import VOLUME_MODEL_ITEMS, VOLUME_SHAPE_ITEMS
 from ..core.celfield import (CEL_LIGHT_ITEMS, CEL_RIM_MODE_ITEMS,
                              CEL_RIM_SIDE_ITEMS, CEL_SHAPE_ITEMS)
@@ -551,7 +553,13 @@ SOCKET_MODELS = {
                        'PS2_HIGHLIGHT', 'SATURN_ADD', 'N64_COMBINE',
                        'S22_MODULATE', 'D3D_SEPARATE_SPEC', 'PCX_INTENSITY',
                        'DS_TOON', 'DS_HIGHLIGHT', 'MEGA_DRIVE_SH',
-                       'SUPERFX_PLOT'),
+                       'SUPERFX_PLOT',
+                       # R252: the Console Emulation Shader's items light
+                       # their corners with the same Blinn-Phong fallback
+                       'RENDERWARE_PS2', 'RENDERWARE_GC', 'RENDERWARE_PC',
+                       'DS_DECAL', 'DECAL_ALPHA', 'ADD8_COMBINE',
+                       'N64_SHADE', 'N64_BLENDRGBA', 'JAGUAR_CRY',
+                       'THREEDO_PIXC'),
     'Specular Level': ALL,
     'Glossiness': ('GOURAUD', 'FLAT', 'PHONG', 'BLINN_PHONG', 'BLINN',
                    'ANISOTROPIC', 'METAL', 'STRAUSS', 'MULTI_LAYER',
@@ -568,7 +576,12 @@ SOCKET_MODELS = {
                    'PS2_HIGHLIGHT', 'SATURN_ADD', 'N64_COMBINE',
                    'S22_MODULATE', 'D3D_SEPARATE_SPEC', 'PCX_INTENSITY',
                    'DS_TOON', 'DS_HIGHLIGHT', 'MEGA_DRIVE_SH',
-                   'SUPERFX_PLOT'),
+                   'SUPERFX_PLOT',
+                   # R252: the Console Emulation Shader's items
+                   'RENDERWARE_PS2', 'RENDERWARE_GC', 'RENDERWARE_PC',
+                   'DS_DECAL', 'DECAL_ALPHA', 'ADD8_COMBINE',
+                   'N64_SHADE', 'N64_BLENDRGBA', 'JAGUAR_CRY',
+                   'THREEDO_PIXC'),
     'Roughness': ('COOK_TORRANCE', 'OREN_NAYAR', 'MINNAERT', 'WARD',
                   'OREN_NAYAR_BLINN', 'MAX_MULTI_LAYER', 'MAX_OREN_NAYAR_BLINN'),
     'Metalness': ALL,
@@ -675,7 +688,13 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
     def _update(self, context):
         self.refresh_sockets()
 
-    model: EnumProperty(name="Model", items=[(a, b, c) for a, b, c in MODEL_ITEMS],
+    # R252: the menu is the master's own list (core/shading.MASTER_MODELS)
+    # -- the anime / cartoon masters, the eight 3ds Max shaders and the
+    # period machines each have their own node now. Each item carries its
+    # MODEL_ITEMS index as its number, so a file saved with Phong at 3
+    # still reads Phong; a file saved with a moved model is rebuilt as the
+    # right node at load (_migrate_master_sockets)
+    model: EnumProperty(name="Model", items=master_model_items(),
                         default='PHONG', update=_update)
     toon_steps: IntProperty(name="Toon Steps", default=2, min=1, max=16)
 
@@ -719,7 +738,7 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
 
     # which sockets each model actually uses -- the rest are hidden, not removed,
     # so switching models never loses a connection
-    MODEL_ORDER = tuple(m[0] for m in MODEL_ITEMS)
+    MODEL_ORDER = tuple(MASTER_MODELS)
 
     RELEVANT = {
         'LAMBERT': {'Diffuse Color', 'Diffuse Level', 'Ambient', 'Opacity',
@@ -757,35 +776,10 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
                         'Bump Strength', 'Bump Height'},
         'CONSTANT': {'Diffuse Color', 'Opacity', 'Self-Illumination'},
         'WIREFRAME': {'Diffuse Color', 'Opacity'},
-        # R228: the paint model on the master runs the Cartoon Shader
-        # at its defaults -- the base colour IS the paint; ambient,
-        # specular and the reflectance dials have no say
-        'CARTOON': {'Diffuse Color', 'Diffuse Level', 'Opacity',
-                    'Self-Illumination', 'Normal', 'Bump Strength',
-                    'Bump Height'},
-        # R251 material pack (MAT-A): the period combiners -- the plain
-        # ones take the full socket set like FLAT; the DS toon pair reads
-        # Toon Size (and Toon Steps) for its table but never Toon Smooth
-        # (the DS had no smooth band); the Mega Drive class reads only
-        # the lamp's cosine and the specular sum; the Super FX plot has
-        # no highlight (the chip's polygons were flat colours)
-        'FLAT_GL_LAST': None, 'FLAT_D3D_FIRST': None,
-        'PS1_MODULATE': None, 'PS2_HIGHLIGHT': None, 'SATURN_ADD': None,
-        'N64_COMBINE': None, 'S22_MODULATE': None,
-        'D3D_SEPARATE_SPEC': None, 'PCX_INTENSITY': None,
-        'DS_TOON': {'Diffuse Color', 'Diffuse Level', 'Specular Color',
-                    'Specular Level', 'Glossiness', 'Toon Size', 'Ambient',
-                    'Opacity', 'Self-Illumination', 'Normal',
-                    'Bump Strength', 'Bump Height'},
-        'DS_HIGHLIGHT': {'Diffuse Color', 'Diffuse Level', 'Specular Color',
-                         'Specular Level', 'Glossiness', 'Toon Size',
-                         'Ambient', 'Opacity', 'Self-Illumination', 'Normal',
-                         'Bump Strength', 'Bump Height'},
-        'MEGA_DRIVE_SH': {'Diffuse Color', 'Specular Color',
-                          'Specular Level', 'Glossiness', 'Opacity',
-                          'Normal', 'Bump Strength', 'Bump Height'},
-        'SUPERFX_PLOT': {'Diffuse Color', 'Diffuse Level', 'Ambient',
-                         'Opacity', 'Self-Illumination', 'Normal'},
+        # (R252: the CARTOON row and the period machines' rows left with
+        # their models -- the Cartoon Shader and the Console Emulation
+        # Shader carry them; the Max rows above stay for the measured
+        # SOCKET_MODELS table, which still names every engine model)
     }
 
     # R202: the order is the panel. Reflection's inputs sit together
@@ -996,7 +990,7 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
 
     def draw_buttons(self, context, layout):
         layout.prop(self, 'model', text="")
-        if self.model in ('TOON', 'DS_TOON', 'DS_HIGHLIGHT'):
+        if self.model == 'TOON':
             layout.prop(self, 'toon_steps')
         if self.model == 'WIREFRAME':
             layout.prop(self, 'wire_size')
@@ -1053,6 +1047,460 @@ class HALCYON_ShaderNode(Node, HalcyonNodeBase):
             if ident == self.model:
                 return label
         return self.bl_label
+
+
+# =========================================== R252: the console emulation node
+
+#: the sockets every machine shares (the master's names, so the roads
+#: downstream read one vocabulary); each machine's own extras come from
+#: core/console.MACHINE_SOCKETS
+_CONSOLE_SHARED = ('Diffuse Color', 'Diffuse Level', 'Ambient',
+                   'Self-Illumination', 'Opacity', 'Normal',
+                   'Bump Strength', 'Bump Height', 'Vertex Color',
+                   'Vertex Color Mix', 'Reflection', 'Reflection Color',
+                   'Edge Opacity')
+
+CONSOLE_SOCKET_DOCS = {
+    'Diffuse Color': "The polygon's colour (RenderWare's material colour, "
+                     "GX's material register, the GTE's material RGB): a "
+                     "linked texture is the texel the machine's combine "
+                     "multiplies per pixel",
+    'Diffuse Level': "Scales the lit diffuse term; for RenderWare it is "
+                     "RwSurfaceProperties.diffuse, the coefficient every "
+                     "light's cosine is multiplied by",
+    'Specular Color': "The highlight's tint (every machine's highlight was "
+                      "the light's colour, so leave it white for the real "
+                      "look)",
+    'Specular Level': "The highlight's strength; a shader type that pins "
+                      "or disables the specular (Model 2 / 3 Off, "
+                      "RenderWare's default pipelines) ignores it",
+    'Glossiness': "The highlight's exponent where the machine took one: "
+                  "GX's shininess, the DS's custom table, the GTA-style "
+                  "specular power; Model 2 / 3 and the DS presets pin "
+                  "their own",
+    'Soften': "GX only: softens the highlight at grazing light, the master "
+              "shader's own Soften",
+    'Ambient': "Scales the scene ambient on this material; for RenderWare "
+               "it is RwSurfaceProperties.ambient",
+    'Self-Illumination': "Added after the lighting, untouched by the lamps "
+                         "-- the emissive colour",
+    'Opacity': "The polygon's alpha (Model 3 steps it to its 32 levels "
+               "when Alpha Steps is on; the Saturn's mesh type pins 0.5)",
+    'Toon Size': "The DS toon / highlight table's step position, sampled "
+                 "at 32 stops with hard edges (Toon Steps sets how many)",
+    'Normal': "A bent shading normal; unlinked takes the mesh's own",
+    'Bump Strength': "How far the Bump Height map bends the normal (for "
+                     "RenderWare's RpMatFX bump it is the bumpiness "
+                     "coefficient, rpMatFXMaterialSetBumpMapCoefficient)",
+    'Bump Height': "A greyscale height map bumped into the shading normal "
+                   "(RenderWare's rpMATFXEFFECTBUMPMAP map goes here)",
+    'Vertex Color': "The mesh's painted colour; unlinked reads the mesh's "
+                    "own colour attribute. The types that make the vertex "
+                    "colour the material (GX_SRC_VTX, Model 3 fixed "
+                    "shading, the N64 with lighting off, D3D's colour "
+                    "vertex) read it whole",
+    'Vertex Color Mix': "How far the vertex colour replaces the Diffuse "
+                        "Color (0 none, 1 whole); the vertex-colour types "
+                        "force 1",
+    'Reflection': "Ray-traced reflection strength -- none of these "
+                  "machines traced rays, so 0 is the period look",
+    'Reflection Color': "The ray-traced reflection's tint, white for the "
+                        "mirror's own colour (period machines had none)",
+    'Edge Opacity': "Opacity at the silhouette, 1 for the period look",
+    'Fog Burn-Through': "Model 3 / System 22's polygon light modifier: the "
+                        "share of this material that burns through the "
+                        "scene fog",
+    'Fog Bias': "A per-material offset on the fog's start (the Model 3's "
+                "polygon fog bias)",
+    'Fog Bank': "A per-material fog density scale (the Model 3's fog "
+                "bank)",
+    'Prelit Color': "RenderWare's prelight (rpGEOMETRYPRELIT): the baked "
+                    "vertex colour ADDED to the computed light before the "
+                    "clamp; unlinked reads the mesh's own colour attribute",
+    'Night Color': "GTA San Andreas's extra vertex colours: the night "
+                   "prelight the Prelit Color blends toward by Night Blend",
+    'Night Blend': "How far the prelight is blended toward the Night "
+                   "Color (0 day, 1 night) -- the game's time-of-day lerp",
+    'Env Map': "RenderWare's rpMATFXEFFECTENVMAP texture, sphere-mapped "
+               "(link an Image Texture through Matcap Coordinates), ADDED "
+               "over the material by the coefficient",
+    'Env Map Coefficient': "rpMatFXMaterialSetEnvMapCoefficient: how much "
+                           "of the environment map is added (the PS2 and "
+                           "D3D passes blend ONE / ONE)",
+    'Dual Texture': "RenderWare's rpMATFXEFFECTDUAL second texture, "
+                    "blended over the base texture by the Dual Blend mode",
+}
+
+
+class HALCYON_ConsoleShaderNode(Node, HalcyonNodeBase):
+    """R252: the Console Emulation Shader -- a period machine's light
+    unit and combiner, with the SHADER TYPES its polygon attribute word
+    could select (GX's channel control, the Model 2 specular bits, the
+    Model 3 header's fixed shading and sun clamp, the DS's four polygon
+    modes, the PS1's raw-texture bit, the GS's four texture functions,
+    the PSP's GU_TFX set, VDP1's colour calculations, the N64's G_CC
+    presets, the Dreamcast's vertex formats, Direct3D's texture ops and
+    render states, the Mega Drive's S/H classes, the Super FX plot, the
+    Jaguar's CRY Gouraud, the 3DO's PIXC, RenderWare's pipelines) and
+    the options each carried. The sockets are the master shader's own
+    names, so every road downstream -- the corner road, the combines,
+    the GPU bake -- reads one vocabulary."""
+
+    bl_idname = 'HALCYON_ConsoleShaderNode'
+    bl_label = "Console Emulation Shader"
+    bl_icon = 'SYSTEM'
+    bl_width_default = 230
+
+    def _update(self, context):
+        self.refresh_sockets()
+
+    console: EnumProperty(
+        name="Console", items=CON.CONSOLE_ITEMS, default='PS1',
+        update=_update,
+        description="The machine whose light unit and combiner this "
+                    "material shades with; the panel below shows that "
+                    "machine's shader types and the options its polygon "
+                    "attribute word carried")
+    gc_type: EnumProperty(
+        name="Shader Type", items=CON.GC_TYPE_ITEMS, default='LIT',
+        update=_update,
+        description="The GameCube channel's shader type: the lit light "
+                    "unit or the vertex colour with the lights off")
+    gc_diffuse_fn: EnumProperty(
+        name="Diffuse Function", items=CON.GC_DIFFUSE_FN_ITEMS, default='CLAMP',
+        description="GX_SetChanCtrl's diffuse function: the cosine clamped "
+                    "(GX_DF_CLAMP), signed (GX_DF_SIGN) or none "
+                    "(GX_DF_NONE, the light added flat)")
+    gc_attn_fn: EnumProperty(
+        name="Attenuation Function", items=CON.GC_ATTN_FN_ITEMS, default='SPEC',
+        description="GX_SetChanCtrl's attenuation function: the rational "
+                    "highlight (GX_AF_SPEC), the spot cone (GX_AF_SPOT) or "
+                    "none (GX_AF_NONE) -- only SPEC adds a highlight")
+    gc_material_src: EnumProperty(
+        name="Material Source", items=CON.GC_MATERIAL_SRC_ITEMS, default='REG',
+        update=_update,
+        description="GX_SetChanCtrl's material source: the material "
+                    "register (this node's Diffuse Color) or the vertex "
+                    "colour attribute")
+    m2_type: EnumProperty(
+        name="Shader Type", items=CON.M2_TYPE_ITEMS, default='LIT',
+        update=_update,
+        description="Model 2's polygon shading: lit through the luma ramp, "
+                    "or the fixed-luma unlit polygon")
+    m2_specular: EnumProperty(
+        name="Specular Control", items=CON.M2_SPECULAR_ITEMS, default='P4',
+        update=_update,
+        description="Model 2's specular-control bits: off, or the "
+                    "reflection term raised to 1, 2, 4 or 8 by repeated "
+                    "squaring (MAME model2_v.cpp)")
+    m3_type: EnumProperty(
+        name="Shader Type", items=CON.M3_TYPE_ITEMS, default='SMOOTH',
+        update=_update,
+        description="Model 3's polygon header: smooth per-vertex lighting "
+                    "or the fixed-shading bit (the vertex colours shown as "
+                    "they are)")
+    m3_specular: EnumProperty(
+        name="Specular", items=CON.M3_SPECULAR_ITEMS, default='P16',
+        update=_update,
+        description="Model 3's polygon-header specular: off, or the four "
+                    "exponent / gain pairs 8 x 1.6, 16 x 1.6, 32 x 2.4, "
+                    "64 x 3.2 (Supermodel R3DShaderTriangles)")
+    m3_sun_clamp: BoolProperty(
+        name="Sun Clamp", default=True,
+        description="The polygon header's sun-clamp bit (Supermodel's "
+                    "sunClamp): on, the sun's cosine is clamped at 0; off, "
+                    "a face turned away goes darker than ambient -- the "
+                    "Model 3's negative lighting")
+    m3_alpha_steps: BoolProperty(
+        name="Alpha Steps (32)", default=False,
+        description="Quantise this material's Opacity to Model 3's 32 "
+                    "polygon translucency levels (the header's 5-bit alpha)")
+    luma_gamma: FloatProperty(
+        name="Luma Ramp Gamma", default=1.0, min=0.1, max=4.0,
+        description="The 64-entry luma ramp the game wrote, as a gamma on "
+                    "the 64-step index (1 is the linear ramp; below 1 "
+                    "lifts the mid-tones the way Daytona's and Virtua "
+                    "Fighter's ramps did; the ramps themselves are "
+                    "unpublished -- a stand-in)")
+    ds_type: EnumProperty(
+        name="Polygon Mode", items=CON.DS_TYPE_ITEMS, default='MODULATE',
+        update=_update,
+        description="The DS polygon attribute's mode: modulation (0), "
+                    "decal (1), toon or highlight (2) -- GBATEK's texture "
+                    "blend modes")
+    ds_table: EnumProperty(
+        name="Shininess Table", items=CON.DS_TABLE_ITEMS, default='PIN',
+        update=_update,
+        description="The DS's 128-entry shininess table: left linear "
+                    "(disabled), soft, pinned, or shaped by the Glossiness "
+                    "socket")
+    ps1_type: EnumProperty(
+        name="Primitive", items=CON.PS1_TYPE_ITEMS, default='GOURAUD',
+        update=_update,
+        description="The PlayStation GPU primitive: Gouraud textured, flat "
+                    "textured, or the raw (unlit) texture bit")
+    ps2_type: EnumProperty(
+        name="Texture Function", items=CON.PS2_TYPE_ITEMS, default='MODULATE',
+        update=_update,
+        description="The Graphics Synthesizer's TEX0 TFX: modulate, decal, "
+                    "highlight or highlight 2")
+    psp_type: EnumProperty(
+        name="Texture Function", items=CON.PSP_TYPE_ITEMS, default='MODULATE',
+        update=_update,
+        description="The PSP GU's texture function (sceGuTexFunc): "
+                    "modulate, decal, replace or add -- or the GU_FLAT "
+                    "shading model")
+    sat_type: EnumProperty(
+        name="Colour Calculation", items=CON.SAT_TYPE_ITEMS, default='GOURAUD',
+        update=_update,
+        description="VDP1's CMDPMOD colour calculation: the Gouraud table, "
+                    "replace, Gouraud with half luminance, or the mesh "
+                    "(checkerboard transparency) bit")
+    n64_type: EnumProperty(
+        name="Combiner Preset", items=CON.N64_TYPE_ITEMS, default='MODULATE',
+        update=_update,
+        description="The RDP colour combiner's gbi.h preset: modulate, "
+                    "decal, shade only, blend by texel alpha -- or the "
+                    "vertex colours with G_LIGHTING off")
+    s22_type: EnumProperty(
+        name="Shader Type", items=CON.S22_TYPE_ITEMS, default='LIT',
+        update=_update,
+        description="System 22's polygon: lit through the x/64 brightness, "
+                    "or fixed (unlit)")
+    dc_type: EnumProperty(
+        name="Vertex Format", items=CON.DC_TYPE_ITEMS, default='PACKED',
+        update=_update,
+        description="The CLX2's vertex / shading instruction: packed "
+                    "colour with the offset colour, the intensity formats, "
+                    "decal, or flat")
+    pc_type: EnumProperty(
+        name="Shading", items=CON.PC_TYPE_ITEMS, default='GOURAUD_SEP',
+        update=_update,
+        description="The fixed-function shading model: Gouraud with the "
+                    "separate specular, the early modulated specular, or "
+                    "the two provoking-vertex flats")
+    pc_texture_op: EnumProperty(
+        name="Texture Op", items=CON.PC_TEXTURE_OP_ITEMS, default='MODULATE',
+        description="The texture stage's colour op (D3DTOP_*): modulate, "
+                    "modulate 2x / 4x, add, add signed -- applied under "
+                    "the separate specular")
+    pc_local_viewer: BoolProperty(
+        name="Local Viewer", default=True,
+        description="D3DRS_LOCALVIEWER / GL_LIGHT_MODEL_LOCAL_VIEWER: on, "
+                    "the highlight takes the true eye vector per pixel; "
+                    "off, one camera axis for the whole frame (OpenGL's "
+                    "default)")
+    pc_color_vertex: BoolProperty(
+        name="Colour Vertex", default=False,
+        description="D3DRS_COLORVERTEX with D3DMCS_COLOR1: the vertex "
+                    "colour is the material's diffuse (GL_COLOR_MATERIAL)")
+    pcx_base: EnumProperty(
+        name="Base Colour", items=CON.PCX_BASE_ITEMS, default='MEAN',
+        description="Which lit colour the PCX's one base colour per "
+                    "triangle comes from: the mean of the corners or the "
+                    "first corner")
+    md_type: EnumProperty(
+        name="S/H Mode", items=CON.MD_TYPE_ITEMS, default='AUTO',
+        update=_update,
+        description="The VDP's shadow / highlight mode: the class per "
+                    "polygon by the lighting, or every polygon forced "
+                    "NORMAL, SHADOW or HIGHLIGHT")
+    sfx_type: EnumProperty(
+        name="Fill", items=CON.SFX_TYPE_ITEMS, default='DITHER',
+        update=_update,
+        description="The Super FX PLOT fill: the dithered pair of palette "
+                    "entries, or the nearest single entry")
+    jag_type: EnumProperty(
+        name="Blitter Mode", items=CON.JAG_TYPE_ITEMS, default='GOURAUD',
+        update=_update,
+        description="The Jaguar blitter's fill: CRY intensity Gouraud or "
+                    "a flat fill")
+    tdo_type: EnumProperty(
+        name="Cel Shading", items=CON.TDO_TYPE_ITEMS, default='PIXC',
+        description="The 3DO cel engine's shading: the PIXC multiplier, "
+                    "one eighth-step per cel")
+    rw_type: EnumProperty(
+        name="Geometry Flags", items=CON.RW_TYPE_ITEMS, default='PRELIT',
+        update=_update,
+        description="RenderWare's RpGeometry flags: lit, prelit and lit, "
+                    "or prelit only (rpGEOMETRYLIGHT / rpGEOMETRYPRELIT)")
+    rw_platform: EnumProperty(
+        name="Platform", items=CON.RW_PLATFORM_ITEMS, default='PS2',
+        update=_update,
+        description="The RenderWare platform pipeline: the PS2's GS grid "
+                    "with its overbright headroom, the GameCube's TEV "
+                    "modulate, or the Xbox / Direct3D 8 8-bit modulate")
+    rw_specular: EnumProperty(
+        name="Specular", items=CON.RW_SPECULAR_ITEMS, default='NONE',
+        update=_update,
+        description="None (the default pipelines do not use the specular "
+                    "coefficient) or the GTA San Andreas specular plugin's "
+                    "highlight")
+    rw_matfx: EnumProperty(
+        name="Material Effect", items=CON.RW_MATFX_ITEMS, default='NONE',
+        update=_update,
+        description="RpMatFX's effect on this material: none, environment "
+                    "map, bump map, both, or the dual-texture pass")
+    rw_dual_blend: EnumProperty(
+        name="Dual Blend", items=CON.RW_DUAL_BLEND_ITEMS, default='MODULATE',
+        description="The dual-texture pass's blend pair "
+                    "(rpMatFXMaterialSetDualBlendModes): modulate, add or "
+                    "alpha blend")
+    rate: EnumProperty(
+        name="Rate", items=CON.RATE_ITEMS, default='MACHINE',
+        description="The shading rate this material lights at: the "
+                    "machine's own, the scene's, per vertex or per face "
+                    "(the hardware-fixed items keep theirs)")
+    light_limit: BoolProperty(
+        name="Machine's Light Limit", default=False,
+        description="Light this material with the machine's own lamp "
+                    "count only (GX 8, DS 4, PS1 3, PS2 3, PSP 4, N64 7, "
+                    "System 22 1), the first lamps in scene order -- the "
+                    "games' register order")
+    toon_steps: IntProperty(
+        name="Toon Steps", default=2, min=1, max=16,
+        description="How many flat bands the DS toon / highlight table "
+                    "cuts the light into (2 is the classic two-tone)")
+
+    SOCKETS = (
+        ('NodeSocketColor', 'Diffuse Color', (0.8, 0.8, 0.8, 1.0)),
+        ('NodeSocketFloat', 'Diffuse Level', 1.0),
+        ('NodeSocketColor', 'Specular Color', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketFloat', 'Specular Level', 0.5),
+        ('NodeSocketFloat', 'Glossiness', 25.0),
+        ('NodeSocketFloat', 'Soften', 0.0),
+        ('NodeSocketFloat', 'Ambient', 1.0),
+        ('NodeSocketColor', 'Self-Illumination', (0.0, 0.0, 0.0, 1.0)),
+        ('NodeSocketFloat', 'Opacity', 1.0),
+        ('NodeSocketFloat', 'Toon Size', 0.5),
+        ('NodeSocketVector', 'Normal', None),
+        ('NodeSocketFloat', 'Bump Strength', 1.0),
+        ('NodeSocketFloat', 'Bump Height', 0.5),
+        ('NodeSocketColor', 'Vertex Color', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketFloat', 'Vertex Color Mix', 0.0),
+        ('NodeSocketFloat', 'Reflection', 0.0),
+        ('NodeSocketColor', 'Reflection Color', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketFloat', 'Edge Opacity', 1.0),
+        ('NodeSocketFloat', 'Fog Burn-Through', 0.0),
+        ('NodeSocketFloat', 'Fog Bias', 0.0),
+        ('NodeSocketFloat', 'Fog Bank', 0.0),
+        ('NodeSocketColor', 'Prelit Color', (1.0, 1.0, 1.0, 1.0)),
+        ('NodeSocketColor', 'Night Color', (0.2, 0.2, 0.3, 1.0)),
+        ('NodeSocketFloat', 'Night Blend', 0.0),
+        ('NodeSocketColor', 'Env Map', (0.0, 0.0, 0.0, 1.0)),
+        ('NodeSocketFloat', 'Env Map Coefficient', 0.0),
+        ('NodeSocketColor', 'Dual Texture', (1.0, 1.0, 1.0, 1.0)),
+    )
+
+    def init(self, context):
+        for kind, name, default in self.SOCKETS:
+            sock = self.inputs.new(kind, name)
+            if default is not None:
+                try:
+                    sock.default_value = default
+                except (TypeError, ValueError):
+                    pass
+            if name == 'Normal':
+                try:
+                    sock.hide_value = True
+                except (AttributeError, TypeError):
+                    pass
+        _apply_socket_tips(self, CONSOLE_SOCKET_DOCS)
+        self.outputs.new('NodeSocketShader', 'Surface')
+        self.outputs[0].description = (
+            "Connect to Material Output. Shades as the chosen machine's "
+            "light unit and combiner when Halcyon renders it")
+        self.refresh_sockets()
+
+    def ensure_sockets(self):
+        have = {s.name for s in self.inputs}
+        for kind, name, default in self.SOCKETS:
+            if name in have:
+                continue
+            try:
+                sock = self.inputs.new(kind, name)
+                if default is not None:
+                    sock.default_value = default
+            except Exception:                                   # noqa: BLE001
+                pass
+        _apply_socket_tips(self, CONSOLE_SOCKET_DOCS)
+
+    def _props(self):
+        out = {}
+        for name, _items, _d in CON.ENUM_PROPS:
+            out[name] = getattr(self, name, _d)
+        for name, _kind, _d in CON.SCALAR_PROPS:
+            out[name] = getattr(self, name, _d)
+        return out
+
+    def refresh_sockets(self):
+        con = str(self.console)
+        keep = set(_CONSOLE_SHARED) | set(CON.MACHINE_SOCKETS.get(con, ()))
+        res = CON.resolve(self._props())
+        if res['gloss'] is not None:
+            keep.discard('Glossiness')
+        if res['spec_level'] is not None and res['spec_level'] == 0.0:
+            keep.discard('Specular Color')
+            keep.discard('Specular Level')
+            keep.discard('Glossiness')
+        if res['opacity'] is not None:
+            keep.discard('Opacity')
+        if res['vmix'] is not None:
+            keep.discard('Vertex Color Mix')
+        if con == 'RENDERWARE':
+            fx = str(self.rw_matfx)
+            if fx not in ('ENVMAP', 'BUMPENVMAP'):
+                keep.discard('Env Map')
+                keep.discard('Env Map Coefficient')
+            if fx not in ('BUMPMAP', 'BUMPENVMAP'):
+                keep.discard('Bump Strength')
+                keep.discard('Bump Height')
+            if fx != 'DUAL':
+                keep.discard('Dual Texture')
+            if res['prelit'] is None:
+                keep.discard('Prelit Color')
+                keep.discard('Night Color')
+                keep.discard('Night Blend')
+        if con == 'DS' and str(self.ds_type) not in ('TOON', 'HIGHLIGHT'):
+            keep.discard('Toon Size')
+        if res['fixed_shade'] > 0.5:
+            for nm in ('Specular Color', 'Specular Level', 'Glossiness',
+                       'Soften', 'Ambient', 'Diffuse Level'):
+                keep.discard(nm)
+        for sock in self.inputs:
+            sock.hide = bool(sock.name not in keep and not sock.is_linked)
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'console', text="")
+        con = str(self.console)
+        col = layout.column(align=True)
+        for name in CON.PANEL.get(con, ()):
+            if name == 'toon_steps' and \
+                    str(self.ds_type) not in ('TOON', 'HIGHLIGHT'):
+                continue
+            col.prop(self, name)
+        row = layout.row(align=True)
+        row.prop(self, 'rate', text="")
+        if CON.LIGHT_LIMIT.get(con, 0) > 0:
+            layout.prop(self, 'light_limit')
+
+    def draw_buttons_ext(self, context, layout):
+        self.draw_buttons(context, layout)
+        box = layout.box()
+        col = box.column(align=True)
+        col.scale_y = 0.8
+        desc = next((c for a, _b, c in CON.CONSOLE_ITEMS
+                     if a == str(self.console)), '')
+        for line in _wrap_text(desc, 40):
+            col.label(text=line)
+        res = CON.resolve(self._props())
+        layout.label(text=f"Engine model: {res['model']}", icon='INFO')
+
+    def draw_label(self):
+        try:
+            return CON.label_of(self._props())
+        except Exception:                                       # noqa: BLE001
+            return self.bl_label
 
 
 # ======================================================== coded shader node
@@ -4095,7 +4543,7 @@ FAMILY_NODE_PROPS = {f'HALCYON_{s[0]}Node': tuple(s[5].keys())
 
 NODES = (HALCYON_RampNode, HALCYON_BlurNode,
          HALCYON_ShaderNode, HALCYON_AnimeShaderNode,
-         HALCYON_CartoonNode,
+         HALCYON_CartoonNode, HALCYON_ConsoleShaderNode,
          HALCYON_VolumeNode,
          HALCYON_BIMaterialNode,
          HALCYON_BIInfluenceNode, HALCYON_BIRGBBlendNode,
@@ -4152,7 +4600,10 @@ PROP_TIPS = {
         "The reflectance model this material shades with -- each "
         "implemented from its published formulation. The menu's own "
         "entries describe every model; the sockets grey out to what "
-        "the chosen model actually reads",
+        "the chosen model actually reads. The anime and cartoon "
+        "masters, the 3ds Max shaders and the period machines live on "
+        "their own nodes (Anime Shader, Cartoon Shader, the 3DS Max "
+        "shelf, Console Emulation Shader)",
     ('HALCYON_ShaderNode', 'toon_steps'):
         "How many flat bands the Toon model quantizes its light into "
         "(2 is the classic cel two-tone; more approaches a smooth "
@@ -4513,6 +4964,7 @@ _apply_prop_tips()
 MENU_FAMILIES = (
     ('Shading', 'MATERIAL',
      (HALCYON_ShaderNode, HALCYON_AnimeShaderNode, HALCYON_CartoonNode,
+      HALCYON_ConsoleShaderNode,
       HALCYON_VolumeNode,
       HALCYON_RampNode,
       HALCYON_CodeNode, HALCYON_FacingNode, HALCYON_IridescentNode)),
@@ -4595,13 +5047,120 @@ class NODE_MT_halcyon_add(bpy.types.Menu):
 _menu_owner = None
 
 
+#: R252: the Max shader type the Max Standard node takes for each moved
+#: Max model (nodes/max_nodes.MAX_MODEL_FOR, inverted)
+_MAX_TYPE_FOR = {'MAX_ANISOTROPIC': 'ANISOTROPIC', 'MAX_BLINN': 'BLINN',
+                 'MAX_METAL': 'METAL', 'MAX_MULTI_LAYER': 'MULTI_LAYER',
+                 'MAX_OREN_NAYAR_BLINN': 'OREN_NAYAR_BLINN',
+                 'MAX_PHONG': 'PHONG', 'MAX_STRAUSS': 'STRAUSS',
+                 'MAX_TRANSLUCENT': 'TRANSLUCENT'}
+
+
+def saved_master_model(node):
+    """R252: the model a saved master node carries, by name -- the live
+    property when its value is still on the menu, else the raw enum
+    integer read back through the engine table (an EnumProperty without
+    explicit numbers stored the item's INDEX, and MODEL_ITEMS is that
+    order, never reordered). None when nothing is stored."""
+    try:
+        live = str(getattr(node, 'model', '') or '')
+    except Exception:                                           # noqa: BLE001
+        live = ''
+    if live and live in MASTER_MODELS:
+        return live
+    if live and live in MOVED_MODELS:
+        return live
+    raw = None
+    try:
+        raw = node.get('model')
+    except Exception:                                           # noqa: BLE001
+        raw = None
+    if isinstance(raw, int) and 0 <= raw < len(MODEL_ITEMS):
+        return MODEL_ITEMS[raw][0]
+    if isinstance(raw, str) and raw:
+        return raw
+    return None
+
+
+def migrate_master_node(tree, node):
+    """R252: rebuild one master node saved with a model the master no
+    longer offers as the node that carries it now -- the Anime Shader,
+    the Cartoon Shader, the Max Standard material (its shader type set)
+    or the Console Emulation Shader (its machine, type and options set
+    from core/console.MIGRATE). Links and socket values travel by socket
+    name; the output relinks to whatever the old Surface fed. Returns
+    the new node, or None when the node needs no migration. Best-effort
+    and load-time only, like every other topology change."""
+    model = saved_master_model(node)
+    if model is None or model in MASTER_MODELS:
+        return None
+    target = MOVED_MODELS.get(model)
+    if target is None:
+        return None
+    new = tree.nodes.new(target)
+    try:
+        new.location = node.location
+        new.label = node.label
+        new.hide = node.hide
+    except Exception:                                           # noqa: BLE001
+        pass
+    if target == 'HALCYON_MaxStandardNode':
+        try:
+            new.shader_type = _MAX_TYPE_FOR.get(model, 'BLINN')
+        except Exception:                                       # noqa: BLE001
+            pass
+    elif target == 'HALCYON_ConsoleShaderNode':
+        for k, v in CON.MIGRATE.get(model, {}).items():
+            try:
+                setattr(new, k, v)
+            except Exception:                                   # noqa: BLE001
+                pass
+        try:
+            new.toon_steps = int(getattr(node, 'toon_steps', 2) or 2)
+        except Exception:                                       # noqa: BLE001
+            pass
+    # the sockets: values and links by name
+    for old_s in list(node.inputs):
+        ns = new.inputs.get(old_s.name)
+        if ns is None:
+            continue
+        try:
+            if not old_s.is_linked and hasattr(old_s, 'default_value'):
+                ns.default_value = old_s.default_value
+        except Exception:                                       # noqa: BLE001
+            pass
+        for ln in list(getattr(old_s, 'links', ())):
+            try:
+                tree.links.new(ln.from_socket, ns)
+            except Exception:                                   # noqa: BLE001
+                pass
+    for old_o in list(node.outputs):
+        for ln in list(getattr(old_o, 'links', ())):
+            try:
+                tree.links.new(new.outputs[0], ln.to_socket)
+            except Exception:                                   # noqa: BLE001
+                pass
+    try:
+        if callable(getattr(new, 'refresh_sockets', None)):
+            new.refresh_sockets()
+    except Exception:                                           # noqa: BLE001
+        pass
+    try:
+        tree.nodes.remove(node)
+    except Exception:                                           # noqa: BLE001
+        pass
+    return new
+
+
 def _migrate_master_sockets(_arg=None):
     """load_post: saved master nodes gain any socket their file predates.
 
     Socket creation is forbidden inside update callbacks (the guard test
     holds refresh_sockets to toggles only); file load is the one place
     topology change is safe, so it happens here -- Bump Height appears on
-    old files the moment they open.
+    old files the moment they open. R252: a master node saved with a
+    model the master no longer offers is rebuilt here as the node that
+    carries it (migrate_master_node), before the socket pass.
     """
     try:
         trees = []
@@ -4611,6 +5170,12 @@ def _migrate_master_sockets(_arg=None):
         for grp in getattr(bpy.data, 'node_groups', []):
             trees.append(grp)
         for tree in trees:
+            for node in list(getattr(tree, 'nodes', [])):
+                if getattr(node, 'bl_idname', '') == 'HALCYON_ShaderNode':
+                    try:
+                        migrate_master_node(tree, node)
+                    except Exception:                           # noqa: BLE001
+                        pass
             for node in getattr(tree, 'nodes', []):
                 idn = getattr(node, 'bl_idname', '')
                 if idn in ('HALCYON_ShaderNode', 'HALCYON_BIMaterialNode',

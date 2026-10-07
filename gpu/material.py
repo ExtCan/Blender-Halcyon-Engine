@@ -608,7 +608,9 @@ def viewer_expr(consts, bake=None):
     forces the axis -- F016/F018 mark `bake['__axis_viewer']`)."""
     if str((consts or {}).get('specular_viewer', 'PIXEL')) == 'AXIS' \
             or bool((bake or {}).get('__axis_viewer')) \
+            or float((bake or {}).get('axis_viewer', 0.0) or 0.0) > 0.5 \
             or int((bake or {}).get('__model_i', -1)) in (32, 35):
+        # (R252: a Console node's Local Viewer off bakes axis_viewer 1)
         # (32 GX_LIGHT / 35 DS_FIXED force the axis: LIGHT-B2 F016/F018)
         return (f'texelFetch(hal_fogtab, ivec2({AXIS_VIEWER_TEXEL}, 0), 0)'
                 '.xyz')
@@ -3494,9 +3496,12 @@ def _console_finish_lines(kind, bake, consts, model_i, light_i=0):
     lines = []
     if kind == 'HEMI':
         return lines
-    if model_i == 32 and kind not in ('SUN', 'HEMI'):
+    if model_i == 32 and (kind not in ('SUN', 'HEMI')
+                          or float(bake.get('gx_attn_fn', 0.0) or 0.0) > 0.5):
         # GX_AF_SPEC lit from directional lights only (GX_InitSpecularDir):
-        # a point or spot lamp adds no highlight on the GameCube
+        # a point or spot lamp adds no highlight on the GameCube. R252:
+        # nor a channel under GX_AF_SPOT / GX_AF_NONE (light_surface's
+        # own gate, a baked per-material constant)
         lines.append('    ds.yzw = vec3(0.0);')
     if model_i == 35:
         # GBATEK: HalfVector = (LightVector + LineOfSight) / 2, NOT
@@ -3720,7 +3725,11 @@ BAKE_FIELDS = ('diffuse_level', 'specular_level', 'glossiness', 'roughness',
                'cel_light', 'cel_ss', 'cel_ss_len', 'cel_rim_mode',
                'cel_rim_width', 'cel_rim_side', 'cel_shape',
                # R243: the Max Multi-Layer's second highlight
-               'specular_level2', 'glossiness2', 'anisotropy2', 'aniso_rot2')
+               'specular_level2', 'glossiness2', 'anisotropy2', 'aniso_rot2',
+               # R252: the console fields the pixel road reads (the
+               # per-material viewer axis, GX's channel functions); the
+               # rest are corner-road fields the CPU consumes
+               'axis_viewer', 'gx_diff_fn', 'gx_attn_fn')
 
 #: master-node sockets that may vary per pixel: when LINKED, the chain is
 #: emitted and assigned to the surface field; unlinked, the probed constant
@@ -3803,7 +3812,9 @@ def master_node(graph):
             'HALCYON_ShaderNode', 'HALCYON_AnimeShaderNode',
             'HALCYON_CartoonNode', 'HALCYON_BIMaterialNode',
             # R243: Max's Standard and Raytrace materials, the BI idiom
-            'HALCYON_MaxStandardNode', 'HALCYON_MaxRaytraceNode'):
+            'HALCYON_MaxStandardNode', 'HALCYON_MaxRaytraceNode',
+            # R252: the Console Emulation Shader (the master's vocabulary)
+            'HALCYON_ConsoleShaderNode'):
         return node
     return None
 
@@ -4302,6 +4313,7 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     # CPU's own answer); the frame path always knows, so it never passes None
     em.programs = programs if programs is not None else {}
     base = None
+    base_alpha = '1.0'
     body = ''
     perpix = {}
     perpix_exprs = {}
@@ -4312,6 +4324,9 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
         try:
             var, vt = em.output(link[0], link[1])
             base = em.cast(var, vt, 'vec3')
+            # R252: the texel's alpha for the decal combines (the albedo
+            # pass's fourth channel on the CPU)
+            base_alpha = f'({var}).a' if vt == 'vec4' else '1.0'
             # linked surface-parameter sockets on the master node: their
             # chains are emitted here, through the same emitter -- shared
             # subexpressions and all -- and assigned per pixel below
@@ -4645,7 +4660,8 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
             '}\n')
         # R251 (MAT-A): hal_vlight_fetch4 + the period combine's function
         # ('' for every pre-1.90 model: the text above is unchanged)
-        vlight_fns += GCB.combine_fns(bake.get('__model'), consts, vside)
+        vlight_fns += GCB.combine_fns(bake.get('__model'), consts, vside,
+                                      bake)
         vlight_spec = {'rate': str(vertex_rate), 'side': int(vside),
                        'mat': int(mat_id)}
         env_lines = []                     # the corners carry the env term
@@ -5228,7 +5244,8 @@ void main()
             '    vec3 hal_vl = hal_vlight_fetch(hal_vt) * f.bary.x',
             '        + hal_vlight_fetch(hal_vt + 1.0) * f.bary.y',
             '        + hal_vlight_fetch(hal_vt + 2.0) * f.bary.z;',
-        ] + GCB.recombine_lines(bake.get('__model'), consts, bake)
+        ] + GCB.recombine_lines(bake.get('__model'), consts, bake,
+                                alpha=base_alpha)
     elif shadeless:
         # light_surface's early return, verbatim: diffuse x level (+
         # emission, added by the shared block below). No ambient term,

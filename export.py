@@ -111,6 +111,20 @@ NODE_PROPS = {
     'HALCYON_ShaderNode': ('model', 'toon_steps', 'wire_size',
                            'fresnel_blend', 'rim_blend', 'matcap_mode',
                            'faceted'),
+    # R252: the Console Emulation Shader -- every machine's type and
+    # option menus, the shared rate / light-limit / toon-steps props
+    # (core/console.ENUM_PROPS + SCALAR_PROPS, named here verbatim so the
+    # audit test reads a literal)
+    'HALCYON_ConsoleShaderNode': (
+        'console', 'gc_type', 'gc_diffuse_fn', 'gc_attn_fn',
+        'gc_material_src', 'm2_type', 'm2_specular', 'm3_type',
+        'm3_specular', 'ds_type', 'ds_table', 'ps1_type', 'ps2_type',
+        'psp_type', 'sat_type', 'n64_type', 's22_type', 'dc_type',
+        'pc_type', 'pc_texture_op', 'pcx_base', 'md_type', 'sfx_type',
+        'jag_type', 'tdo_type', 'rw_type', 'rw_platform', 'rw_specular',
+        'rw_matfx', 'rw_dual_blend', 'rate', 'light_limit', 'm3_sun_clamp',
+        'm3_alpha_steps', 'pc_local_viewer', 'pc_color_vertex',
+        'luma_gamma', 'toon_steps'),
     'HALCYON_BIMaterialNode': (
         'diff_shader', 'spec_shader', 'shadeless',
         # the BI panel round: sorted by panel

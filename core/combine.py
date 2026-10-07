@@ -60,7 +60,12 @@ R63_LIT = '0.0158730168'
 #: corners are equal and the item collapses to the plain product)
 RATE_FIXED = {'FLAT_GL_LAST': 'FACE', 'FLAT_D3D_FIRST': 'FACE',
               'SUPERFX_PLOT': 'FACE', 'PCX_INTENSITY': 'VERTEX',
-              'MEGA_DRIVE_SH': 'FACE'}
+              'MEGA_DRIVE_SH': 'FACE',
+              # R252: RenderWare lit per vertex on every platform; the
+              # Jaguar blitter interpolates intensity per vertex; a 3DO
+              # cel is lit as a whole
+              'RENDERWARE_PS2': 'VERTEX', 'RENDERWARE_GC': 'VERTEX',
+              'RENDERWARE_PC': 'VERTEX', 'THREEDO_PIXC': 'FACE'}
 #: the combines: the scene's VERTEX or FACE rate, VERTEX when the scene
 #: shades per pixel (a combiner needs the light / albedo split to exist).
 #: DS_FIXED is the LIGHTING pack's item (F018) and stays PIXEL-capable
@@ -70,7 +75,13 @@ RATE_FIXED = {'FLAT_GL_LAST': 'FACE', 'FLAT_D3D_FIRST': 'FACE',
 #: blend (material.md coordination item (4), the alternative; CHANGELOG)
 COMBINE_MODELS = frozenset({'PS1_MODULATE', 'PS2_HIGHLIGHT', 'SATURN_ADD',
                             'N64_COMBINE', 'S22_MODULATE',
-                            'D3D_SEPARATE_SPEC', 'DS_TOON', 'DS_HIGHLIGHT'})
+                            'D3D_SEPARATE_SPEC', 'DS_TOON', 'DS_HIGHLIGHT',
+                            # R252: the Console Emulation Shader's combines
+                            'DS_DECAL', 'DECAL_ALPHA', 'ADD8_COMBINE',
+                            'N64_SHADE', 'N64_BLENDRGBA',
+                            # (the blitter filled per vertex or flat: the
+                            # node's Blitter Mode picks)
+                            'JAGUAR_CRY'})
 #: the lighting pack's names this pack's combines key on (review item 50):
 #: the Sega boards take their rate from lighting's RATE_FOR_MODEL rows
 LIGHTING_COMBINE = {'SEGA_MODEL2': 'luma64', 'SEGA_MODEL3': 'luma64',
@@ -81,20 +92,61 @@ PERIOD_MODELS = ('FLAT_GL_LAST', 'FLAT_D3D_FIRST', 'PS1_MODULATE',
                  'PS2_HIGHLIGHT', 'SATURN_ADD', 'N64_COMBINE', 'S22_MODULATE',
                  'D3D_SEPARATE_SPEC', 'PCX_INTENSITY', 'DS_TOON',
                  'DS_HIGHLIGHT', 'MEGA_DRIVE_SH', 'SUPERFX_PLOT')
+#: R252: the Console Emulation Shader's ten items (core/shading.py appends
+#: them after this pack's thirteen), the three RenderWare platforms first
+PERIOD_MODELS_R252 = ('RENDERWARE_PS2', 'RENDERWARE_GC', 'RENDERWARE_PC',
+                      'DS_DECAL', 'DECAL_ALPHA', 'ADD8_COMBINE', 'N64_SHADE',
+                      'N64_BLENDRGBA', 'JAGUAR_CRY', 'THREEDO_PIXC')
 #: the models `recombine` dispatches (a period combine, or a lighting name
 #: with a combine keyed on it)
 RECOMBINE_MODELS = frozenset({'PS1_MODULATE', 'PS2_HIGHLIGHT', 'SATURN_ADD',
                               'N64_COMBINE', 'S22_MODULATE',
                               'D3D_SEPARATE_SPEC', 'PCX_INTENSITY',
                               'DS_TOON', 'DS_HIGHLIGHT', 'MEGA_DRIVE_SH',
-                              'SUPERFX_PLOT'}) | frozenset(LIGHTING_COMBINE)
+                              'SUPERFX_PLOT'}) | frozenset(LIGHTING_COMBINE) \
+    | frozenset(PERIOD_MODELS_R252)
+#: R252: the models whose combine reads the texel's ALPHA (the albedo
+#: pass's fourth channel) -- the decals and the N64 blend
+ALPHA_COMBINES = frozenset({'DS_DECAL', 'DECAL_ALPHA', 'N64_BLENDRGBA'})
 
 
-def rate_for_model(model, st):
-    """The period rate, or None when the existing rows decide."""
+def console_opts(mat):
+    """R252: the combine-stage options of a material's Console Emulation
+    Shader node (core/console.combine_opts), {} for any other material.
+    The CPU hook and the GPU pass's bake read the same dict."""
+    from . import console as CON
+    graph = getattr(mat, 'graph', None) if mat is not None else None
+    node = CON.console_node(graph)
+    if node is None:
+        return {}
+    return CON.combine_opts(node.get('props', {}))
+
+
+def console_rate(mat):
+    """R252: the per-material rate the Console node asks for ('VERTEX' /
+    'FACE'), or None."""
+    from . import console as CON
+    graph = getattr(mat, 'graph', None) if mat is not None else None
+    node = CON.console_node(graph)
+    if node is None:
+        return None
+    return CON.rate_of(node.get('props', {}))
+
+
+def rate_for_model(model, st, mat=None):
+    """The period rate, or None when the existing rows decide.
+
+    R252: with `mat` given, a Console Emulation Shader's own Rate menu
+    (Machine / Vertex / Face) decides for every model the hardware tables
+    do not pin -- the rate-fixed items (RATE_FIXED, shading.RATE_FOR_MODEL)
+    keep theirs, a flat Model 2 polygon is a flat Model 2 polygon."""
     r = RATE_FIXED.get(model)
     if r is not None:
         return r
+    if mat is not None and model not in SH.RATE_FOR_MODEL:
+        ov = console_rate(mat)
+        if ov in ('VERTEX', 'FACE'):
+            return ov
     if model in COMBINE_MODELS:
         return st.shading_rate if st.shading_rate in ('VERTEX', 'FACE') \
             else 'VERTEX'
@@ -178,14 +230,19 @@ _SPEC_LUM = frozenset({'PS2_HIGHLIGHT', 'D3D_SEPARATE_SPEC'})
 _SPEC_RED = frozenset({'DS_TOON', 'DS_HIGHLIGHT'})
 
 
-def light_extras(model):
+def light_extras(model, mat=None):
     """What the LIGHT pass must keep apart for `model`: the specular sum
     for the four carriers (PS2 / D3D carry its luminance, the DS pair its
-    RED), plus the key lamp's lit fraction for the Mega Drive class."""
+    RED), plus the key lamp's lit fraction for the Mega Drive class.
+    R252: a Console node's forced Mega Drive class rides along as
+    'md_class' (-1 = by class, the pre-R252 rule)."""
     if model in _SPEC_LUM or model in _SPEC_RED:
         return {'want_spec': True}
     if model == 'MEGA_DRIVE_SH':
-        return {'want_spec': True, 'want_key_lit': True}
+        ex = {'want_spec': True, 'want_key_lit': True}
+        if mat is not None:
+            ex['md_class'] = float(console_opts(mat).get('md_class', -1.0))
+        return ex
     return None
 
 
@@ -242,6 +299,10 @@ def light_alpha(model, rgb, extras, fog=None):
         v5 = np.floor(m + f32(0.5)).astype(f32)
         return (_expand5(v5) * R63).astype(f32)
     if model == 'MEGA_DRIVE_SH':
+        forced = float(extras.get('md_class', -1.0))
+        if forced >= 0.0:
+            # R252: the Console node's S/H mode forced to one class
+            return np.full(n, f32(min(max(forced, 0.0), 2.0)), f32)
         key_lit = extras.get('key_lit')
         key_lit = np.zeros(n, f32) if key_lit is None \
             else np.asarray(key_lit, f32).reshape(-1)
@@ -274,6 +335,20 @@ def corner_rgb(model, rgb):
     if model == 'S22_MODULATE':
         c8 = np.clip(np.rint(rgb * f32(64.0)), 0.0, 255.0).astype(f32)
         return (c8 / f32(64.0)).astype(f32)
+    # R252: RenderWare's lit vertex on its platform's grid -- the GS's
+    # 0x80 = 1.0 with the overbright headroom to 0xFF, or the 8-bit
+    # saturated grid of the GameCube, the Xbox and Direct3D 8
+    if model == 'RENDERWARE_PS2':
+        c8 = np.clip(np.rint(rgb * f32(128.0)), 0.0, 255.0).astype(f32)
+        return (c8 / f32(128.0)).astype(f32)
+    if model in ('RENDERWARE_GC', 'RENDERWARE_PC', 'DECAL_ALPHA',
+                 'ADD8_COMBINE', 'N64_SHADE', 'N64_BLENDRGBA'):
+        c8 = np.rint(np.clip(rgb, 0.0, 1.0) * f32(255.0)).astype(f32)
+        return (c8 * R255).astype(f32)
+    if model == 'DS_DECAL':
+        m = np.clip(rgb, 0.0, 1.0).astype(f32) * f32(31.0)
+        v5 = np.floor(m + f32(0.5)).astype(f32)
+        return (_expand5(v5) * R63).astype(f32)
     return None
 
 
@@ -294,10 +369,13 @@ def cb_ps1(L, A):
     return (o * R255).astype(f32)
 
 
-def cb_saturn(L, A):
+def cb_saturn(L, A, half=False):
     """VDP1 Gouraud add: 5-bit texel + (5-bit table value - 16), clamped
-    0..31."""
+    0..31. R252: `half` is colour calculation 6, the texel halved (floor on
+    the 5-bit grid) before the table adds."""
     t5 = np.rint(np.clip(np.asarray(A, f32), 0.0, 1.0) * f32(31.0)).astype(f32)
+    if half:
+        t5 = np.floor(t5 / f32(2.0)).astype(f32)
     g5 = np.clip(np.rint(np.asarray(L, f32) * f32(16.0)), 0.0, 31.0).astype(f32)
     o = t5 + g5
     o = o - f32(16.0)
@@ -372,17 +450,22 @@ def _lum(c):
     return l.astype(f32)
 
 
-def cb_pcx(c0, c1, c2, bary, A):
+def cb_pcx(c0, c1, c2, bary, A, first=False):
     """PowerVR PCX: one base colour per polygon (the mean of the three lit
     corners) times ONE interpolated scalar intensity (corner luminance
     over the base's luminance)."""
     c0 = np.asarray(c0, f32)[:, :3]
     c1 = np.asarray(c1, f32)[:, :3]
     c2 = np.asarray(c2, f32)[:, :3]
-    s = c0 + c1
-    s = s + c2
-    base = s * f32(0.333333343)
-    base = np.clip(base, 0.0, 1.0).astype(f32)
+    if first:
+        # R252: the first corner's lit colour is the base (the other
+        # corners contribute intensity only)
+        base = np.clip(c0, 0.0, 1.0).astype(f32)
+    else:
+        s = c0 + c1
+        s = s + c2
+        base = s * f32(0.333333343)
+        base = np.clip(base, 0.0, 1.0).astype(f32)
     lb = np.maximum(_lum(base), f32(1e-4)).astype(f32)
     i0 = np.clip(_lum(c0) / lb, 0.0, 1.0).astype(f32)
     i1 = np.clip(_lum(c1) / lb, 0.0, 1.0).astype(f32)
@@ -395,14 +478,20 @@ def cb_pcx(c0, c1, c2, bary, A):
     return (p * I[:, None]).astype(f32)
 
 
-def cb_luma64(L, A):
+def cb_luma64(L, A, gamma=1.0):
     """Sega Model 1/2/3 colour translate: the lit term collapses to one
     luminance quantised to 64 steps BEFORE it meets colour; each 5-bit
     channel through a linear 64-entry ramp (the margin rule on the one
-    non-power-of-two divide: floor((num + 0.5) / 1953) == num // 1953)."""
+    non-power-of-two divide: floor((num + 0.5) / 1953) == num // 1953).
+    R252: `gamma` shapes the ramp the games wrote -- the 64-step index is
+    read through (i/63)^gamma and re-quantised to 64 steps (half up)
+    before the lookup; 1.0 is the linear ramp, bitwise the pre-R252 path."""
     lum = np.asarray(MX.luminance_601(np.asarray(L, f32)[:, :3]), f32)
     l8 = np.floor(np.clip(lum, 0.0, 1.0) * f32(255.0)).astype(f32)
     lum6 = np.minimum(np.floor(l8 / f32(4.0)), f32(63.0)).astype(f32)
+    tab = luma_remap_table(gamma)
+    if tab is not None:
+        lum6 = tab[lum6.astype(np.int32)]
     ca = np.clip(np.asarray(A, f32)[:, :3], 0.0, 1.0).astype(f32) * f32(31.0)
     c5 = np.floor(ca + f32(0.5)).astype(f32)
     num = c5 * lum6[:, None]
@@ -412,6 +501,199 @@ def cb_luma64(L, A):
     return (o8 * R255).astype(f32)
 
 
+_LUMA_TABLES = {}
+
+
+def luma_remap_table(gamma):
+    """R252: the 64-entry luma ramp a Model 2 / Model 3 game wrote, as a
+    remap of the 64-step index: round(63 * (i/63)^gamma), float64 fill,
+    cached per value; None at gamma 1 (the linear ramp, the pre-R252
+    path bitwise). Both roads read the SAME 64 integers -- the GPU bakes
+    them as constants (gpu/combine), never a pow() in the shader."""
+    g = float(gamma)
+    if g == 1.0 or g <= 0.0:
+        return None
+    t = _LUMA_TABLES.get(g)
+    if t is None:
+        i = np.arange(64, dtype=np.float64)
+        vals = 63.0 * (i / 63.0) ** g
+        t = np.array([min(int(np.floor(v + 0.5)), 63) for v in vals], f32)
+        _LUMA_TABLES[g] = t
+    return t
+
+
+# ---------------------------------------------- R252: the console combines
+
+def _s8(L, scale=255.0):
+    """The lit colour on an 8-bit grid: rint(L * scale), clamped 0..255."""
+    return np.clip(np.rint(np.asarray(L, f32)[:, :3] * f32(scale)), 0.0,
+                   255.0).astype(f32)
+
+
+def cb_tev(L, A):
+    """GX's TEV modulate (GX_TEV_ADD, a = 0, b = texel, c = colour): the
+    8-bit colour widened to 9 bits as c + (c >> 7) so 255 means 256
+    exactly, (texel x c9 + 128) >> 8, clamped 255 -- a full-lit texel is
+    itself (libogc gx.h, the TEV's lerp rule)."""
+    t8 = _t8(A)
+    c8 = _s8(L)
+    c9 = c8 + np.floor(c8 / f32(128.0))
+    v = t8 * c9
+    v = v + f32(128.0)
+    o = np.floor(v / f32(256.0))
+    o = np.minimum(o, f32(255.0)).astype(f32)
+    return (o * R255).astype(f32)
+
+
+def cb_mod8(L, A):
+    """The exact 8-bit modulate of the Xbox register combiner and the
+    Direct3D reference rasteriser: round(texel x colour / 255), half to
+    even (the margin rule: (v + 127) // 255 differs from this at ties
+    only, and the GLSL twin is roundEven on the same division)."""
+    t8 = _t8(A)
+    c8 = _s8(L)
+    v = t8 * c8
+    v = v / f32(255.0)
+    o = np.rint(v)
+    o = np.minimum(o, f32(255.0)).astype(f32)
+    return (o * R255).astype(f32)
+
+
+def cb_mod8_k(L, A, k):
+    """Direct3D's MODULATE2X / MODULATE4X: the 8-bit product shifted left
+    once or twice (k = 2, 4), saturating at 255."""
+    t8 = _t8(A)
+    c8 = _s8(L)
+    v = t8 * c8
+    v = v / f32(255.0)
+    o = np.rint(v)
+    o = o * f32(k)
+    o = np.minimum(o, f32(255.0)).astype(f32)
+    return (o * R255).astype(f32)
+
+
+def cb_add8(L, A):
+    """GU_TFX_ADD / D3DTOP_ADD: texel + colour on the 8-bit grid,
+    saturating at 255."""
+    t8 = _t8(A)
+    c8 = _s8(L)
+    o = t8 + c8
+    o = np.minimum(o, f32(255.0)).astype(f32)
+    return (o * R255).astype(f32)
+
+
+def cb_addsigned8(L, A):
+    """D3DTOP_ADDSIGNED: texel + colour - 128 on the 8-bit grid, clamped
+    0..255 (the detail-texture stage)."""
+    t8 = _t8(A)
+    c8 = _s8(L)
+    o = t8 + c8
+    o = o - f32(128.0)
+    o = np.clip(o, 0.0, 255.0).astype(f32)
+    return (o * R255).astype(f32)
+
+
+def cb_decal8(L, A, alpha):
+    """GU_TFX_DECAL / the CLX2 decal-alpha: texel x a + colour x (255 - a)
+    over 255, rounded half to even, on 8-bit values."""
+    t8 = _t8(A)
+    c8 = _s8(L)
+    a8 = np.clip(np.rint(np.asarray(alpha, f32).reshape(-1) * f32(255.0)),
+                 0.0, 255.0).astype(f32)
+    ia = f32(255.0) - a8
+    v = t8 * a8[:, None]
+    w = c8 * ia[:, None]
+    v = v + w
+    v = v / f32(255.0)
+    o = np.rint(v)
+    o = np.minimum(o, f32(255.0)).astype(f32)
+    return (o * R255).astype(f32)
+
+
+def cb_ds_decal(L, A, alpha):
+    """GBATEK's polygon mode 1: (texel x a + lit x (63 - a)) / 64 on
+    6-bit channels, the texel alpha on the 5-bit grid expanded to 6."""
+    ta = np.clip(np.asarray(A, f32)[:, :3], 0.0, 1.0).astype(f32) * f32(63.0)
+    ta = ta + f32(0.5)
+    t6 = np.floor(ta).astype(f32)
+    la = np.clip(np.asarray(L, f32)[:, :3], 0.0, 1.0).astype(f32) * f32(63.0)
+    la = la + f32(0.5)
+    l6 = np.floor(la).astype(f32)
+    m = np.clip(np.asarray(alpha, f32).reshape(-1), 0.0, 1.0) * f32(31.0)
+    a5 = np.floor(m + f32(0.5)).astype(f32)
+    a6 = _expand5(a5)
+    ia = f32(63.0) - a6
+    v = t6 * a6[:, None]
+    w = l6 * ia[:, None]
+    v = v + w
+    c6 = np.floor(v / f32(64.0)).astype(f32)
+    return (c6 * R63).astype(f32)
+
+
+def cb_n64_blend(L, A, alpha):
+    """G_CC_BLENDRGBA: (TEXEL0 - SHADE) * TEXEL0_ALPHA + SHADE on 8-bit
+    values with the combiner's rounding term: ((t - s) * a + 128) >> 8 +
+    s, clamped 0..255 (the signed 9-bit difference the RDP carries)."""
+    t8 = _t8(A)
+    s8 = _s8(L)
+    a8 = np.clip(np.rint(np.asarray(alpha, f32).reshape(-1) * f32(255.0)),
+                 0.0, 255.0).astype(f32)
+    d = t8 - s8
+    v = d * a8[:, None]
+    v = v + f32(128.0)
+    v = np.floor(v / f32(256.0))
+    o = v + s8
+    o = np.clip(o, 0.0, 255.0).astype(f32)
+    return (o * R255).astype(f32)
+
+
+def cb_jaguar(L, A):
+    """The Jaguar blitter's GOURD: the lit term collapses to one 8-bit
+    intensity byte (the CRY Y), floor on the 0..255 grid, and scales the
+    colour -- the chroma never moves."""
+    lum = np.asarray(MX.luminance_601(np.asarray(L, f32)[:, :3]), f32)
+    y8 = np.floor(np.clip(lum, 0.0, 1.0) * f32(255.0)).astype(f32)
+    t8 = _t8(A)
+    v = t8 * y8[:, None]
+    o = np.floor(v / f32(255.0))
+    return (o * R255).astype(f32)
+
+
+def cb_threedo(L, A):
+    """The 3DO cel engine's PIXC multiplier: the cel's lit luminance to
+    the nearest eighth, never below 1/8 (the register's 1..8), times the
+    cel's 5-bit colour (the 3DO's 15-bit cels), on the 8-bit grid."""
+    lum = np.asarray(MX.luminance_601(np.asarray(L, f32)[:, :3]), f32)
+    n8 = np.floor(np.clip(lum, 0.0, 1.0) * f32(8.0) + f32(0.5))
+    n8 = np.clip(n8, 1.0, 8.0).astype(f32)
+    c5 = np.rint(np.clip(np.asarray(A, f32)[:, :3], 0.0, 1.0) * f32(31.0))
+    c8 = c5 * f32(255.0)
+    c8 = np.floor(c8 / f32(31.0))
+    v = c8 * n8[:, None]
+    o = np.floor(v / f32(8.0))
+    return (o * R255).astype(f32)
+
+
+def cb_d3dspec_op(Lrgb, S, A, texop):
+    """R252: the fixed-function texture-stage op under the separate
+    specular: MOD is cb_d3dspec verbatim; MOD2X / MOD4X double or
+    quadruple the 8-bit modulate (saturating) before the specular add;
+    ADD and ADDSIGNED replace the product with the additive stages."""
+    S = np.asarray(S, f32).reshape(-1)
+    if texop == 'MOD2X':
+        p = cb_mod8_k(Lrgb, A, 2.0)
+    elif texop == 'MOD4X':
+        p = cb_mod8_k(Lrgb, A, 4.0)
+    elif texop == 'ADD':
+        p = cb_add8(Lrgb, A)
+    elif texop == 'ADDSIGNED':
+        p = cb_addsigned8(Lrgb, A)
+    else:
+        return cb_d3dspec(Lrgb, S, A)
+    o = p + S[:, None]
+    return np.minimum(o, f32(1.0)).astype(f32)
+
+
 # --------------------------------------------------- C034: the DS toon table
 
 def _master_node(mat):
@@ -419,7 +701,10 @@ def _master_node(mat):
     if not graph:
         return None
     for node in graph.get('nodes', {}).values():
-        if node.get('bl_idname') == 'HALCYON_ShaderNode':
+        if node.get('bl_idname') in ('HALCYON_ShaderNode',
+                                     # R252: the Console Emulation Shader
+                                     # carries Toon Size and Toon Steps too
+                                     'HALCYON_ConsoleShaderNode'):
             return node
     return None
 
@@ -612,6 +897,11 @@ def pack_face_corners(out, sel, col, job, st, mi):
         refuse(st, 'SUPERFX_PLOT', str(r))
         return
     Pi, Pj = plot_pairs_for_faces(job, sel, col[:, :3], st, P)
+    mats = getattr(job.scene, 'materials', None) or []
+    if not bool(console_opts(mats[mi] if mi < len(mats) else None)
+                .get('sfx_dither', True)):
+        # R252: the Console node's solid fill -- the nearest entry alone
+        Pj = Pi
     out[sel * 3 + 0, :3] = Pi
     out[sel * 3 + 1, :3] = Pj
 
@@ -666,21 +956,29 @@ def recombine(job, tri_idx, light, c0, c1, c2, bary, alb, px, py, st):
     out = (light[:, :3] * alb[:, :3]).astype(f32)
     L = light[:, :3]
     A = alb[:, :3]
+    # the texel's alpha, for the combines that read it (R252: the decals
+    # and the N64 blend; the albedo pass carries it as its fourth channel)
+    alb_a = alb[:, 3] if alb.ndim == 2 and alb.shape[1] >= 4 \
+        else np.ones(alb.shape[0], f32)
     for mi, model in enumerate(eff):
         if model not in RECOMBINE_MODELS:
             continue
         sel = np.nonzero(mat_idx == mi)[0]
         if sel.size == 0:
             continue
+        # R252: the Console node's combine-stage options ({} elsewhere)
+        opts = console_opts(mats[mi] if mi < len(mats) else None)
         kind = LIGHTING_COMBINE.get(model, model)
         if kind == 'luma64':
-            out[sel] = cb_luma64(L[sel], A[sel])
+            out[sel] = cb_luma64(L[sel], A[sel],
+                                 gamma=float(opts.get('luma_gamma', 1.0)))
         elif kind == 'ds':
             out[sel] = cb_ds(L[sel], A[sel])
         elif model == 'PS1_MODULATE':
             out[sel] = cb_ps1(L[sel], A[sel])
         elif model == 'SATURN_ADD':
-            out[sel] = cb_saturn(L[sel], A[sel])
+            out[sel] = cb_saturn(L[sel], A[sel],
+                                 half=bool(opts.get('saturn_half', False)))
         elif model == 'N64_COMBINE':
             out[sel] = cb_n64(L[sel], A[sel])
         elif model == 'S22_MODULATE':
@@ -688,13 +986,38 @@ def recombine(job, tri_idx, light, c0, c1, c2, bary, alb, px, py, st):
         elif model == 'PS2_HIGHLIGHT':
             out[sel] = cb_ps2hl(L[sel], light[sel, 3], A[sel])
         elif model == 'D3D_SEPARATE_SPEC':
-            out[sel] = cb_d3dspec(L[sel], light[sel, 3], A[sel])
+            out[sel] = cb_d3dspec_op(L[sel], light[sel, 3], A[sel],
+                                     str(opts.get('texop', 'MOD')))
         elif model == 'PCX_INTENSITY':
             if c0 is None:
                 # FACE rate: the three corners are equal, the item is the
                 # plain product (RATE_FIXED keeps PCX at VERTEX)
                 continue
-            out[sel] = cb_pcx(c0[sel], c1[sel], c2[sel], bary[sel], A[sel])
+            out[sel] = cb_pcx(c0[sel], c1[sel], c2[sel], bary[sel], A[sel],
+                              first=bool(opts.get('pcx_first', False)))
+        # ---- R252: the Console Emulation Shader's own combines
+        elif model == 'RENDERWARE_PS2':
+            out[sel] = cb_ps1(L[sel], A[sel])
+        elif model == 'RENDERWARE_GC':
+            out[sel] = cb_tev(L[sel], A[sel])
+        elif model == 'RENDERWARE_PC':
+            out[sel] = cb_mod8(L[sel], A[sel])
+        elif model == 'DS_DECAL':
+            out[sel] = cb_ds_decal(L[sel], A[sel], alb_a[sel])
+        elif model == 'DECAL_ALPHA':
+            out[sel] = cb_decal8(L[sel], A[sel], alb_a[sel])
+        elif model == 'ADD8_COMBINE':
+            out[sel] = cb_add8(L[sel], A[sel])
+        elif model == 'N64_SHADE':
+            # the texel is gone already (the evaluator read the flat
+            # colour): the RDP's modulate on the shade and that colour
+            out[sel] = cb_n64(L[sel], A[sel])
+        elif model == 'N64_BLENDRGBA':
+            out[sel] = cb_n64_blend(L[sel], A[sel], alb_a[sel])
+        elif model == 'JAGUAR_CRY':
+            out[sel] = cb_jaguar(L[sel], A[sel])
+        elif model == 'THREEDO_PIXC':
+            out[sel] = cb_threedo(L[sel], A[sel])
         elif model in _SPEC_RED:
             tab = ds_toon_table(mats[mi] if mi < len(mats) else None)
             out[sel] = cb_ds_toon(light[sel, 3], A[sel], tab,
@@ -706,6 +1029,9 @@ def recombine(job, tri_idx, light, c0, c1, c2, bary, alb, px, py, st):
             faces, first, inv = np.unique(tri_idx[sel], return_index=True,
                                           return_inverse=True)
             Pi, Pj = plot_pairs_for_faces(job, faces, L[sel][first], st, P)
+            if not bool(opts.get('sfx_dither', True)):
+                # R252: the solid fill -- the nearest single entry
+                Pj = Pi
             if px is None or py is None:
                 out[sel] = Pi[inv]
             else:

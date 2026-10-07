@@ -1679,6 +1679,20 @@ def material_state(mat):
         for node in mat.node_tree.nodes:
             if node.bl_idname == 'HALCYON_ShaderNode':
                 return node.model, True
+            if node.bl_idname == 'HALCYON_ConsoleShaderNode':
+                # R252: the Console Emulation Shader names its machine
+                from .core.console import label_of
+                try:
+                    props = {k: getattr(node, k) for k in
+                             ('console', 'gc_type', 'm2_type', 'm3_type',
+                              'ds_type', 'ps1_type', 'ps2_type', 'psp_type',
+                              'sat_type', 'n64_type', 's22_type', 'dc_type',
+                              'pc_type', 'pcx_base', 'md_type', 'sfx_type',
+                              'jag_type', 'tdo_type', 'rw_type')
+                             if hasattr(node, k)}
+                    return label_of(props), True
+                except Exception:                               # noqa: BLE001
+                    return 'Console', True
             if node.bl_idname == 'HALCYON_BIMaterialNode':
                 return ('CONSTANT' if node.shadeless else
                         f'BI {node.diff_shader}/{node.spec_shader}'), True
@@ -1992,7 +2006,8 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
 
         has_master = bool(_uses_nodes(mat) and mat.node_tree and any(
             n.bl_idname in ('HALCYON_ShaderNode', 'HALCYON_BIMaterialNode',
-                            'HALCYON_MaxStandardNode', 'HALCYON_MaxRaytraceNode')
+                            'HALCYON_MaxStandardNode', 'HALCYON_MaxRaytraceNode',
+                            'HALCYON_ConsoleShaderNode')
             for n in mat.node_tree.nodes))
         box = layout.box()
         row = box.row()

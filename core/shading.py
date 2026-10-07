@@ -310,7 +310,131 @@ MODEL_ITEMS = (
      "at output-pixel pitch, before any post. Needs a fixed palette of at "
      "most 16 entries, gamma 1 and no display transform, or it shades flat "
      "and says so"),
+    # ---- R252: the Console Emulation Shader's own items, 49..58 --
+    # appended after the material pack's thirteen so no saved model index
+    # moves. Each is a shading RATE plus a machine's rule, like the pack
+    # above; the RenderWare three share one light law and differ in the
+    # platform's grid and modulate (core/console.py names them)
+    ('RENDERWARE_PS2', "RenderWare on PlayStation 2 (Criterion, 2000)",
+     "Criterion's RpMaterial on the PS2 default pipeline: ambient times the "
+     "surface's ambient coefficient, each light's cosine times its diffuse "
+     "coefficient, the prelight vertex colour ADDED before the clamp, per "
+     "vertex (RenderWare lit per vertex on every platform), the lit colour "
+     "on the GS's 8-bit grid with 0x80 as 1.0 -- a vertex may reach 0xFF, "
+     "twice the texture's brightness -- and the GS modulate, texel x colour "
+     ">> 7 saturating. Specular is not used by the default pipelines (the "
+     "SDK says so); the GTA-era specular plugin adds a Blinn-Phong"),
+    ('RENDERWARE_GC', "RenderWare on GameCube (Criterion, 2001)",
+     "The same RpMaterial light law on the GameCube pipeline: the lit colour "
+     "saturated to 8 bits per channel (no overbright headroom) and the "
+     "TEV's modulate with its 255 -> 256 trick, (texel x (c + c >> 7) + "
+     "128) >> 8 -- so full light leaves a texel exactly itself where the "
+     "N64's rounding left it one step short"),
+    ('RENDERWARE_PC', "RenderWare on Xbox / PC Direct3D 8 (Criterion, 2001)",
+     "The same RpMaterial light law on the Xbox and Direct3D 8 pipelines: "
+     "the lit colour saturated to 8 bits and an exact 8-bit modulate, "
+     "texel x colour / 255 rounded half to even -- the register combiner's "
+     "and the reference rasteriser's product (a driver's own rounding is a "
+     "stand-in)"),
+    ('DS_DECAL', "Decal (Nintendo DS polygon mode 1, 2004)",
+     "A shading RATE plus GBATEK's mode-1 decal: the texel REPLACES the lit "
+     "vertex colour by its own alpha on 6-bit channels, (texel x alpha + "
+     "lit x (63 - alpha)) / 64, so an opaque texel ignores the light and a "
+     "transparent one shows it -- the DS's decal sprite over a lit polygon"),
+    ('DECAL_ALPHA', "Decal by texel alpha (PSP GU_TFX_DECAL / PowerVR2, 2004)",
+     "A shading RATE plus the 8-bit decal: texel x alpha + lit colour x "
+     "(255 - alpha), over 255, rounded -- the PSP's GU_TFX_DECAL and the "
+     "CLX2's decal-alpha instruction, the texel fading over the light by "
+     "its own alpha"),
+    ('ADD8_COMBINE', "Texel add (PSP GU_TFX_ADD / D3DTOP_ADD, 1996)",
+     "A shading RATE plus the additive texture function: the 8-bit texel "
+     "and the 8-bit lit colour ADD and saturate at 255 -- the PSP's "
+     "GU_TFX_ADD and Direct3D's D3DTOP_ADD, the glow and lightmap stage "
+     "where light brightens a texture past itself instead of scaling it"),
+    ('N64_SHADE', "Shade only (Nintendo 64 G_CC_SHADE, 1996)",
+     "A shading RATE plus the RDP combiner preset (0 - 0) * 0 + SHADE: the "
+     "lit vertex colour alone, the TEXTURE ignored -- the untextured "
+     "polygons of every early N64 title, banded by the RSP's per-vertex "
+     "lighting. The material's flat colour stands in for the per-material "
+     "light colours those titles set (Mario 64's gdSPDefLights1 per "
+     "material), through the combiner's own 8-bit modulate and rounding"),
+    ('N64_BLENDRGBA', "Blend by texel alpha (Nintendo 64 G_CC_BLENDRGBA, 1996)",
+     "A shading RATE plus the RDP preset (TEXEL0 - SHADE) * TEXEL0_ALPHA + "
+     "SHADE on 8-bit values with the combiner's rounding: the texel fades "
+     "over the lit colour by its own alpha -- the decal-over-shade look "
+     "of N64 road markings and logos"),
+    ('JAGUAR_CRY', "CRY intensity Gouraud (Atari Jaguar blitter, 1993)",
+     "A shading RATE plus the blitter's Gouraud in the CRY colour space: a "
+     "polygon keeps ONE chroma and only its 8-bit intensity byte is "
+     "interpolated -- the lit term collapses to a luminance on the 0..255 "
+     "grid and scales the colour, so a lit Jaguar polygon never shifts hue, "
+     "only brightness, the machine's own shaded look (Atari's Jaguar "
+     "Technical Reference, GOURD mode)"),
+    ('THREEDO_PIXC', "Cel shading (3DO cel engine PIXC, 1993)",
+     "A shading RATE (one value per polygon) plus the cel engine's pixel "
+     "processor: the cel's colour is multiplied by n/8 for n in 1..8, the "
+     "PIXC register's 3-bit multiplier, chosen once per cel from its lit "
+     "luminance (rounded to the nearest eighth, never below 1/8) -- the only "
+     "shading the 3DO's sprites-as-polygons could take"),
 )
+
+#: R252: the models the Halcyon Shader (the master node) offers. The
+#: engine table above keeps every model -- its order is the GLSL dispatch
+#: index and a saved file's enum value -- but the master's menu stopped
+#: carrying the anime / cartoon masters (they have their own nodes), the
+#: eight 3ds Max shaders (the 3DS Max shelf's Standard material carries
+#: them) and the period machines (the Console Emulation Shader carries
+#: them). The master's EnumProperty gives each item its MODEL_ITEMS index
+#: as its number, so a file saved with Phong at 3 still reads Phong.
+MASTER_MODELS = ('LAMBERT', 'GOURAUD', 'FLAT', 'PHONG', 'BLINN_PHONG',
+                 'BLINN', 'COOK_TORRANCE', 'OREN_NAYAR', 'MINNAERT', 'WARD',
+                 'ANISOTROPIC', 'METAL', 'STRAUSS', 'MULTI_LAYER', 'TOON',
+                 'TRANSLUCENT', 'CONSTANT', 'WIREFRAME', 'BI_COOKTORR',
+                 'BI_PHONG', 'BI_BLINN', 'OREN_NAYAR_BLINN')
+
+
+def master_model_items():
+    """The master node's enum items: (identifier, name, description,
+    icon, number) with the MODEL_ITEMS index as the number."""
+    out = []
+    for i, (ident, label, desc) in enumerate(MODEL_ITEMS):
+        if ident in MASTER_MODELS:
+            out.append((ident, label, desc, 'NONE', i))
+    return tuple(out)
+
+
+#: R252: where a model the master no longer offers went -- the node that
+#: carries it now (the load-time migration in nodes/shader_nodes.py reads
+#: this to rebuild a saved master node as the right node)
+MOVED_MODELS = {
+    'ANIME': 'HALCYON_AnimeShaderNode',
+    'CARTOON': 'HALCYON_CartoonNode',
+    'MAX_PHONG': 'HALCYON_MaxStandardNode',
+    'MAX_BLINN': 'HALCYON_MaxStandardNode',
+    'MAX_METAL': 'HALCYON_MaxStandardNode',
+    'MAX_ANISOTROPIC': 'HALCYON_MaxStandardNode',
+    'MAX_MULTI_LAYER': 'HALCYON_MaxStandardNode',
+    'MAX_OREN_NAYAR_BLINN': 'HALCYON_MaxStandardNode',
+    'MAX_STRAUSS': 'HALCYON_MaxStandardNode',
+    'MAX_TRANSLUCENT': 'HALCYON_MaxStandardNode',
+    'GX_LIGHT': 'HALCYON_ConsoleShaderNode',
+    'SEGA_MODEL2': 'HALCYON_ConsoleShaderNode',
+    'SEGA_MODEL3': 'HALCYON_ConsoleShaderNode',
+    'DS_FIXED': 'HALCYON_ConsoleShaderNode',
+    'FLAT_GL_LAST': 'HALCYON_ConsoleShaderNode',
+    'FLAT_D3D_FIRST': 'HALCYON_ConsoleShaderNode',
+    'PS1_MODULATE': 'HALCYON_ConsoleShaderNode',
+    'PS2_HIGHLIGHT': 'HALCYON_ConsoleShaderNode',
+    'SATURN_ADD': 'HALCYON_ConsoleShaderNode',
+    'N64_COMBINE': 'HALCYON_ConsoleShaderNode',
+    'S22_MODULATE': 'HALCYON_ConsoleShaderNode',
+    'D3D_SEPARATE_SPEC': 'HALCYON_ConsoleShaderNode',
+    'PCX_INTENSITY': 'HALCYON_ConsoleShaderNode',
+    'DS_TOON': 'HALCYON_ConsoleShaderNode',
+    'DS_HIGHLIGHT': 'HALCYON_ConsoleShaderNode',
+    'MEGA_DRIVE_SH': 'HALCYON_ConsoleShaderNode',
+    'SUPERFX_PLOT': 'HALCYON_ConsoleShaderNode',
+}
 
 #: R251 material pack (MAT-A C034): the DS toon / highlight items light
 #: with the DS_FIXED lobe (the mode-2 polygon's light unit is the DS's
@@ -740,7 +864,16 @@ class Surface:
                  # R243: Multi-Layer's second highlight and the
                  # Translucent shader's colour
                  'specular2', 'specular_level2', 'glossiness2',
-                 'anisotropy2', 'aniso_rot2', 'translucent_color')
+                 'anisotropy2', 'aniso_rot2', 'translucent_color',
+                 # R252: the Console Emulation Shader's light-loop fields
+                 # -- fixed shading (no light evaluated), the machine's
+                 # light limit, the per-material camera-axis viewer, the
+                 # RenderWare prelight (added, or the whole light), GX's
+                 # channel functions, Model 3's sun clamp, the polygon
+                 # alpha step count
+                 'fixed_shade', 'light_limit', 'axis_viewer', 'prelit',
+                 'prelit_mode', 'gx_diff_fn', 'gx_attn_fn', 'sun_clamp',
+                 'alpha_steps')
 
     def __init__(self, n):
         self.n = n
@@ -894,6 +1027,18 @@ class Surface:
         self.anisotropy2 = np.zeros(n, np.float32)
         self.aniso_rot2 = np.zeros(n, np.float32)
         self.translucent_color = np.zeros((n, 3), np.float32)
+        # R252: the console fields, every default the pre-R252 behaviour
+        # (lights evaluated, no limit, the scene's viewer, no prelight,
+        # GX_DF_CLAMP / GX_AF_SPEC, the sun clamped, continuous alpha)
+        self.fixed_shade = np.zeros(n, np.float32)
+        self.light_limit = np.zeros(n, np.float32)
+        self.axis_viewer = np.zeros(n, np.float32)
+        self.prelit = np.ones((n, 3), np.float32)
+        self.prelit_mode = np.zeros(n, np.float32)
+        self.gx_diff_fn = np.zeros(n, np.float32)
+        self.gx_attn_fn = np.zeros(n, np.float32)
+        self.sun_clamp = np.ones(n, np.float32)
+        self.alpha_steps = np.zeros(n, np.float32)
         self.model = 'PHONG'
 
 
@@ -2053,6 +2198,15 @@ def evaluate_console(model, surf, n, l, v, ndl, ndl_d, rdv):
     dif = np.maximum(ndl_d, np.float32(0.0)).astype(np.float32)
     gloss = surf.glossiness
     if model == 'GX_LIGHT':
+        # R252: the channel control's diffuse function -- GX_DF_CLAMP
+        # (0, the cosine clamped), GX_DF_SIGN (1, the cosine with its
+        # sign: a light behind the surface subtracts, the channel
+        # saturating at 0 afterwards) or GX_DF_NONE (2, no cosine: the
+        # light adds flat). Inert at the default 0 (every old frame)
+        fn = np.asarray(surf.gx_diff_fn, np.float32)
+        if np.any(fn > 0.5):
+            dif = np.where(fn > 1.5, np.float32(1.0),
+                           np.where(fn > 0.5, ndl_d, dif)).astype(np.float32)
         sp = gx_spec(ndl, n, l, v, gloss)
         sp = _soften(sp, ndl, surf.soften)
     elif model == 'DS_FIXED':
@@ -2060,6 +2214,13 @@ def evaluate_console(model, surf, n, l, v, ndl, ndl_d, rdv):
     elif model == 'SEGA_MODEL2':
         sp = sega_model2_spec(rdv, gloss)
     else:                                   # SEGA_MODEL3
+        # R252: the polygon header's sun-clamp bit (Supermodel's
+        # sunClamp): clear, the sun's cosine keeps its sign and a face
+        # turned away goes DARKER than ambient before the luma ramp
+        # clips it -- the Model 3's own negative lighting
+        sc = np.asarray(surf.sun_clamp, np.float32)
+        if np.any(sc < 0.5):
+            dif = np.where(sc < 0.5, ndl_d, dif).astype(np.float32)
         sp = sega_model3_spec(ndl, gloss)
     spec = sp[:, None] * surf.specular
     return dif, spec.astype(np.float32)

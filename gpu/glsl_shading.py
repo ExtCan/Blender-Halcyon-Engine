@@ -107,6 +107,12 @@ struct HalcyonSurface {
     float brilliance;
     float crand;
     float pov_metallic;
+    // R252: the Console Emulation Shader's pixel-road fields -- the
+    // per-material viewer axis (read by the assembler), GX's channel
+    // diffuse and attenuation functions
+    float axis_viewer;
+    float gx_diff_fn;
+    float gx_attn_fn;
 };
 
 // R243: a Max shader whose diffuse carries its own colour (the
@@ -1079,8 +1085,12 @@ vec4 hal_evaluate2(int model, HalcyonSurface s, vec3 n, vec3 l, vec3 v,
         }
     } else if (model == 32) {               // R251 GX_LIGHT (LIGHT-B2)
         // the GameCube's light unit: Lambert plus the rational
-        // highlight against the camera axis (`v` is hal_vs, texel 227)
+        // highlight against the camera axis (`v` is hal_vs, texel 227).
+        // R252: the channel's diffuse function -- GX_DF_CLAMP (0),
+        // GX_DF_SIGN (1, the signed cosine) or GX_DF_NONE (2, flat),
+        // exactly core/shading.evaluate_console's where()
         d = hal_diffuse_lambert(ndl_d);
+        d = (s.gx_diff_fn > 1.5) ? 1.0 : ((s.gx_diff_fn > 0.5) ? ndl_d : d);
         sp = hal_gx_spec(ndl, n, l, v, s.glossiness);
     } else if (model == 35) {               // R251 DS_FIXED (LIGHT-B2)
         // the DS's light unit: the diffuse ONLY here -- the table

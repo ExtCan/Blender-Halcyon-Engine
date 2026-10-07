@@ -283,8 +283,15 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
             return None, None, ('the graph bends the shading normal outside '
                                 "the master shader's Normal socket")
     from ..core import combine as _CBR
-    rate = str(_CBR.rate_for_model(model, st)
+    rate = str(_CBR.rate_for_model(model, st, mat)
                or RATE_FOR_MODEL.get(model, st.shading_rate))
+    if rate == 'PIXEL' and np.any(surf.light_limit > 0.5):
+        # R252: the machine's light limit is the corner road's rule (the
+        # CPU lights the first N lamps); a pixel-rate pass emits every
+        # lamp, so it refuses by name
+        return None, None, ("the material's console light limit is a "
+                            'per-vertex rule; at the pixel rate the frame '
+                            'shades on the CPU, by name')
     if rate not in ('PIXEL', 'VERTEX', 'FACE'):
         return None, None, f'unknown shading rate {rate}'
     if rate != 'PIXEL' and (layer or secondary):
@@ -379,6 +386,18 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
             bake['__ds_table'] = tuple(float(v) for v in _tab)
     if rate == 'PIXEL' and model in SHADELESS_MODELS:
         bake['__shadeless'] = True
+    if rate == 'PIXEL' and np.any(surf.fixed_shade > 0.5):
+        # R252: fixed shading at the pixel rate IS the shadeless pass
+        # (diffuse x level + emission, light_surface's early return);
+        # the RenderWare prelight never reaches here (rate-fixed VERTEX)
+        if not np.all(surf.fixed_shade > 0.5):
+            return None, None, ('fixed shading varies across the frame; '
+                                'the frame shades on the CPU')
+        bake['__shadeless'] = True
+    # R252: the Console node's combine-stage options (the texture op,
+    # the Saturn half, the luma ramp, the PCX base, the plot's dither)
+    # ride the bake for gpu/combine.recombine_lines
+    bake['__console'] = _CBR.console_opts(mat) if mat is not None else {}
     if mat is not None and \
             str(getattr(mat, 'alpha_mode', 'BLEND')) == 'CLIP_BLEND':
         # R251 C031: the layer emit keeps the sub-threshold alpha

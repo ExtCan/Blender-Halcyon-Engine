@@ -1768,7 +1768,10 @@ def desugar_master_bump(graph):
         nd = nodes[nid]
         idn = nd.get('bl_idname')
         if idn not in ('HALCYON_ShaderNode', 'HALCYON_BIMaterialNode',
-                       'HALCYON_MaxStandardNode', 'HALCYON_MaxRaytraceNode'):
+                       'HALCYON_MaxStandardNode', 'HALCYON_MaxRaytraceNode',
+                       # R252: the Console node's Bump Map / Bumpiness
+                       # (RenderWare's RpMatFX bump) ride the same desugar
+                       'HALCYON_ConsoleShaderNode'):
             continue
         ins = nd.get('inputs') or []
 
@@ -3536,6 +3539,156 @@ def n_halcyon_shader(ev, node):
         # normal for this material (closure_to_surface reads it)
         faceted=bool(p.get('faceted', False)),
     )
+    cl.add('HALCYON', _w(ev), **kw)
+    return {'Surface': cl, 'BSDF': cl}
+
+
+def console_albedo(ev, node, base):
+    """R252: the Console node's per-pixel colour -- the vertex colour as
+    the material where the type says so, RenderWare's dual-texture pass
+    over the base (modulate / add / alpha, the rpMATFXEFFECTDUAL blend
+    pairs). Shared by the CPU evaluator and the GPU emitter's twin
+    (gpu/emit.e_console_shader writes the same arithmetic)."""
+    from .console import resolve
+    p = node.get('props', {})
+    res = resolve(p)
+    n = ev.n
+
+    def _vcol():
+        # the mesh's own colour attribute when it has one; else the
+        # socket's value (a flat vertex colour for an unpainted mesh --
+        # the GPU emitter reads the same socket when the G-buffer
+        # carries no colour layer)
+        if ev.has_link(node, 'Vertex Color'):
+            return ev.input(node, 'Vertex Color', RGBA)
+        mesh_col = getattr(ev.ctx, 'vcol', None)
+        if mesh_col is not None and getattr(ev.ctx, 'has_vcol', True):
+            return coerce(mesh_col, RGBA, n)
+        return _opt(ev, node, 'Vertex Color', RGBA, (1.0, 1.0, 1.0))
+
+    if res['vmix'] is not None:
+        base = base + (_vcol() - base) * np.float32(res['vmix'])
+    else:
+        vmix = np.clip(_opt(ev, node, 'Vertex Color Mix', VALUE, 0.0), 0.0, 1.0)
+        if np.any(vmix > 0.0):
+            base = base + (_vcol() - base) * vmix[:, None]
+    cmb = res['combine']
+    if cmb.get('rw_matfx') == 'DUAL' and ev.has_link(node, 'Dual Texture'):
+        dual = ev.input(node, 'Dual Texture', RGBA)
+        mode = str(cmb.get('rw_dual', 'MODULATE'))
+        rgb = base[:, :3]
+        if mode == 'ADD':
+            rgb = np.minimum(rgb + dual[:, :3], 1.0)
+        elif mode == 'ALPHA':
+            a = np.clip(dual[:, 3:4], 0.0, 1.0)
+            rgb = rgb * (1.0 - a) + dual[:, :3] * a
+        else:
+            rgb = rgb * dual[:, :3]
+        base = np.concatenate([rgb.astype(np.float32), base[:, 3:4]], axis=1)
+    return base.astype(np.float32)
+
+
+def n_console_shader(ev, node):
+    """R252: the Console Emulation Shader -- a machine, one of its shader
+    types and the options its polygon attribute word carried, resolved
+    (core/console.resolve) to an engine model plus the light-loop fields
+    the master shader never had: fixed shading, the machine's light
+    limit, the per-material viewer axis, GX's channel functions, Model
+    3's sun clamp, the polygon alpha steps, RenderWare's prelight. The
+    sockets it shares with the master shader land on the same closure
+    keys, so every road downstream (the corner road, the combines, the
+    GPU bake) reads one vocabulary."""
+    from .console import resolve
+    p = node.get('props', {})
+    res = resolve(p)
+    cl = Closure()
+    n = ev.n
+    if res['untextured']:
+        # G_CC_SHADE: the texture chain dropped, the socket's own flat
+        # colour read instead
+        sock = next((sk for sk in node.get('inputs', ())
+                     if sk.get('name') == 'Diffuse Color'), None)
+        dv = (sock or {}).get('default') if sock else None
+        base0 = coerce(dv if dv is not None else (0.8, 0.8, 0.8, 1.0),
+                       RGBA, n)
+    else:
+        base0 = ev.input(node, 'Diffuse Color', RGBA)
+    base = console_albedo(ev, node, base0)
+    gloss = ev.input(node, 'Glossiness', VALUE)
+    if res['gloss'] is not None:
+        gloss = np.full(n, float(res['gloss']), np.float32)
+    spec_level = ev.input(node, 'Specular Level', VALUE)
+    if res['spec_level'] is not None:
+        spec_level = np.full(n, float(res['spec_level']), np.float32)
+    opacity = ev.input(node, 'Opacity', VALUE)
+    if res['opacity'] is not None:
+        opacity = np.full(n, float(res['opacity']), np.float32)
+    # RenderWare's prelight: the vertex colour (or the Prelit Color
+    # chain), blended toward the night colour by Night Blend (GTA San
+    # Andreas's extra vertex colours plugin)
+    prelit = None
+    if res['prelit'] is not None:
+        if ev.has_link(node, 'Prelit Color'):
+            prelit = ev.input(node, 'Prelit Color', RGBA)[:, :3]
+        else:
+            # the mesh's colour attribute is the prelight (RenderWare's
+            # own storage); an unpainted mesh takes the socket's value
+            mesh_col = getattr(ev.ctx, 'vcol', None)
+            if not getattr(ev.ctx, 'has_vcol', True):
+                mesh_col = None
+            prelit = (coerce(mesh_col, RGBA, n)[:, :3] if mesh_col is not None
+                      else _opt(ev, node, 'Prelit Color', RGBA,
+                                (1.0, 1.0, 1.0))[:, :3])
+        nb = np.clip(_opt(ev, node, 'Night Blend', VALUE, 0.0), 0.0, 1.0)
+        if np.any(nb > 0.0):
+            night = _opt(ev, node, 'Night Color', RGBA, (0.2, 0.2, 0.3))[:, :3]
+            prelit = prelit + (night - prelit) * nb[:, None]
+    cmb = res['combine']
+    fx = str(cmb.get('rw_matfx', 'NONE'))
+    env_on = fx in ('ENVMAP', 'BUMPENVMAP')
+    kw = dict(
+        color=base,
+        diffuse_level=ev.input(node, 'Diffuse Level', VALUE),
+        spec_color=ev.input(node, 'Specular Color', RGBA),
+        spec_level=spec_level,
+        glossiness=gloss,
+        ambient=ev.input(node, 'Ambient', VALUE),
+        emission=ev.input(node, 'Self-Illumination', RGBA),
+        opacity=opacity,
+        soften=_opt(ev, node, 'Soften', VALUE, 0.0),
+        reflect=_opt(ev, node, 'Reflection', VALUE, 0.0),
+        reflect_color=_opt(ev, node, 'Reflection Color', RGBA, (1, 1, 1)),
+        # RenderWare's env map rides the matcap road, ADDED by its
+        # coefficient (rpMatFXMaterialSetEnvMapCoefficient; the PS2 and
+        # D3D env passes blend ONE / ONE)
+        matcap=(_opt(ev, node, 'Env Map', RGBA, (0, 0, 0)) if env_on
+                else coerce((0.0, 0.0, 0.0, 1.0), RGBA, n)),
+        matcap_blend=(np.clip(_opt(ev, node, 'Env Map Coefficient', VALUE,
+                                   0.0), 0.0, 1.0)
+                      if env_on else np.zeros(n, np.float32)),
+        matcap_mode=float(_MATCAP_BLEND_CODE['ADD']),
+        fog_burn=_opt(ev, node, 'Fog Burn-Through', VALUE, 0.0),
+        fog_bias=_opt(ev, node, 'Fog Bias', VALUE, 0.0),
+        fog_bank=_opt(ev, node, 'Fog Bank', VALUE, 0.0),
+        bump_strength=_opt(ev, node, 'Bump Strength', VALUE, 1.0),
+        toon_size=_opt(ev, node, 'Toon Size', VALUE, 0.5),
+        toon_smooth=np.zeros(n, np.float32),
+        toon_steps=float(p.get('toon_steps', 2) or 2),
+        edge_opacity=_opt(ev, node, 'Edge Opacity', VALUE, 1.0),
+        normal=ev.input(node, 'Normal', VECTOR) if ev.has_link(node, 'Normal') else None,
+        model=res['model'],
+        fixed_shade=float(res['fixed_shade']),
+        light_limit=float(res['light_limit']),
+        axis_viewer=float(res['axis_viewer']),
+        gx_diff_fn=float(res['gx_diff_fn']),
+        gx_attn_fn=float(res['gx_attn_fn']),
+        sun_clamp=float(res['sun_clamp']),
+        alpha_steps=float(res['alpha_steps']),
+        prelit_mode=(0.0 if res['prelit'] is None else
+                     (2.0 if res['prelit'] == 'ONLY' else 1.0)),
+    )
+    if prelit is not None:
+        kw['prelit'] = prelit.astype(np.float32)
     cl.add('HALCYON', _w(ev), **kw)
     return {'Surface': cl, 'BSDF': cl}
 
@@ -6456,6 +6609,7 @@ DISPATCH = {
     'NodeGroupOutput': n_group_output,
     # Halcyon
     'HALCYON_ShaderNode': n_halcyon_shader,
+    'HALCYON_ConsoleShaderNode': n_console_shader,     # R252
     'HALCYON_AnimeShaderNode': n_anime_shader,
     'HALCYON_BIMaterialNode': n_bi_material,
     'HALCYON_BITextureNode': n_bi_texture,

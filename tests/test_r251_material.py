@@ -292,18 +292,20 @@ def test_b_tables_and_items():
     i0 = GSH._model_index('FLAT_GL_LAST')
     check('FLAT_GL_LAST follows DS_FIXED and sits at or above 32',
           i0 == GSH._model_index('DS_FIXED') + 1 and i0 >= 32, str(i0))
-    check('the 13 items are contiguous in the spec order, SUPERFX_PLOT last',
+    check('the 13 items are contiguous in the spec order, SUPERFX_PLOT last '
+          "of them (R252's ten follow, appended)",
           names[i0:i0 + 13] == list(CB.PERIOD_MODELS)
           and GSH._model_index('SUPERFX_PLOT') == i0 + 12
-          and len(names) == i0 + 13)
+          and names[i0 + 13:] == list(CB.PERIOD_MODELS_R252)
+          and len(names) == i0 + 13 + len(CB.PERIOD_MODELS_R252))
     check('every item description exceeds 60 characters',
           all(len(m[2]) > 60 for m in SH.MODEL_ITEMS[i0:]))
     check('RATE_FIXED and COMBINE_MODELS are disjoint and cover exactly the '
-          "13 names (DS_FIXED keeps lighting's PIXEL-capable rate; its "
-          'modulate applies at the VERTEX / FACE scene rates)',
+          "13 names plus R252's ten (DS_FIXED keeps lighting's PIXEL-capable "
+          'rate; its modulate applies at the VERTEX / FACE scene rates)',
           not (set(CB.RATE_FIXED) & CB.COMBINE_MODELS)
           and (set(CB.RATE_FIXED) | CB.COMBINE_MODELS)
-          == set(CB.PERIOD_MODELS)
+          == set(CB.PERIOD_MODELS) | set(CB.PERIOD_MODELS_R252)
           and CB.rate_for_model('DS_FIXED', _settings(shading_rate='PIXEL'))
           is None)
     check('the lighting names the combines key on exist in MODEL_ITEMS',

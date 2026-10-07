@@ -2932,9 +2932,13 @@ class HalcyonSettings(PropertyGroup):
     # 'halcyon' would have broken anyway under an extension's mangled
     # package name. Static items have neither problem, and the enum
     # identifiers are stable strings safe to save in a .blend.
+    # R252: the list is the MASTER node's menu (core/shading.MASTER_MODELS
+    # with each item's engine index as its number): a conversion builds a
+    # Halcyon Shader, which no longer offers the anime / cartoon / Max /
+    # console models -- those have their own nodes
     convert_model: EnumProperty(
         name="Model", default='PHONG',
-        items=tuple((a, b, c) for a, b, c in _shading.MODEL_ITEMS),
+        items=_shading.master_model_items(),
         description="The model every conversion gets when Shader "
                     "Detection is Set Shader")
     ui_tab: EnumProperty(

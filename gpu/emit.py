@@ -1321,6 +1321,83 @@ def e_halcyon_shader(em, node, _i):
     return base, VEC4
 
 
+def _console_lit(x):
+    """R252: a float literal a strict GLSL front-end reads as a float
+    (%.9g, the float32 round-trip, with a '.0' where it has none)."""
+    t = f'{float(x):.9g}'
+    if 'e' not in t and 'E' not in t and '.' not in t and 'inf' not in t \
+            and 'nan' not in t:
+        t += '.0'
+    return t
+
+
+def e_console_shader(em, node, _i):
+    """R252: the Console Emulation Shader, as the deferred pass needs it:
+    its colour -- the Diffuse Color chain, the vertex colour blended
+    over it (as the master does it) or REPLACING it where the type makes
+    the vertex colour the material (GX_SRC_VTX, Model 3 fixed shading,
+    the N64 with lighting off, D3D's colour vertex), and RenderWare's
+    dual-texture pass over the base: core/nodeeval.console_albedo's
+    arithmetic, written out. Every other socket is a surface parameter
+    the probe harvests (baked when constant, granted per pixel by the
+    tables, refused by name otherwise)."""
+    from ..core.console import resolve
+    res = resolve(node.get('props', {}))
+    vmix_on = res['vmix'] is not None
+    vcol_linked = False
+    dual_linked = False
+    vmix_default = 0.0
+    for sock in node.get('inputs', ()):
+        name = sock.get('name')
+        if name == 'Vertex Color Mix':
+            try:
+                vmix_default = float(sock.get('default') or 0.0)
+            except (TypeError, ValueError):
+                vmix_default = 0.0
+            if bool(sock.get('link')) or vmix_default > 1e-6:
+                vmix_on = True
+        if name == 'Vertex Color':
+            vcol_linked = bool(sock.get('link'))
+        if name == 'Dual Texture':
+            dual_linked = bool(sock.get('link'))
+    if res['untextured']:
+        # G_CC_SHADE: the socket's flat colour, the chain dropped
+        # (console_albedo's own read)
+        sock = next((sk for sk in node.get('inputs', ())
+                     if sk.get('name') == 'Diffuse Color'), None)
+        dv = list((sock or {}).get('default') or (0.8, 0.8, 0.8, 1.0))
+        dv = (dv + [1.0, 1.0, 1.0, 1.0])[:4]
+        base, _t = em.tmp(VEC4, 'vec4(' + ', '.join(_console_lit(v)
+                                                     for v in dv) + ')')
+    else:
+        base, _t = em.tmp(VEC4, em.input(node, 'Diffuse Color', VEC4))
+    if vmix_on:
+        if res['vmix'] is not None:
+            vmix = _console_lit(res['vmix'])
+        else:
+            vmix, _t = em.tmp(FLOAT,
+                              f'clamp({em.input(node, "Vertex Color Mix", FLOAT)}'
+                              f', 0.0, 1.0)')
+        # the G-buffer's colour layer, or the socket (linked, or the
+        # mesh unpainted -- console_albedo's own fallback)
+        vcol = em.input(node, 'Vertex Color', VEC4) \
+            if (vcol_linked or not em.has_vcol) else 'hal_vcol'
+        base, _t = em.tmp(VEC4, f'{base} + ({vcol} - {base}) * {vmix}')
+    cmb = res['combine']
+    if cmb.get('rw_matfx') == 'DUAL' and dual_linked:
+        dual, _t = em.tmp(VEC4, em.input(node, 'Dual Texture', VEC4))
+        mode = str(cmb.get('rw_dual', 'MODULATE'))
+        if mode == 'ADD':
+            rgb = f'min({base}.rgb + {dual}.rgb, vec3(1.0))'
+        elif mode == 'ALPHA':
+            rgb = (f'{base}.rgb * (1.0 - clamp({dual}.a, 0.0, 1.0)) '
+                   f'+ {dual}.rgb * clamp({dual}.a, 0.0, 1.0)')
+        else:
+            rgb = f'{base}.rgb * {dual}.rgb'
+        base, _t = em.tmp(VEC4, f'vec4({rgb}, {base}.a)')
+    return base, VEC4
+
+
 def e_anime_shader(em, node, _i):
     """The anime master (R218), as the deferred pass needs it: its
     colour -- base times the Line Art chain, times the ILM's drawn
@@ -5040,6 +5117,7 @@ MAX_EMITTERS = {
 
 EMITTERS = {
     'HALCYON_ShaderNode': e_halcyon_shader,
+    'HALCYON_ConsoleShaderNode': e_console_shader,     # R252
     'HALCYON_AnimeShaderNode': e_anime_shader,
     'HALCYON_CartoonNode': e_cartoon_shader,
     'HALCYON_BIMaterialNode': e_bi_material,

@@ -71,7 +71,7 @@ frames held on twos and threes.
 
 ## What you get
 
-**49 shading models**, each implemented from its published formulation —
+**59 shading models**, each implemented from its published formulation —
 Lambert, Gouraud, Flat, Phong, Blinn-Phong, Blinn, Cook-Torrance, Oren-Nayar,
 Minnaert, Ward, Anisotropic, Metal, Strauss, Multi-Layer, Toon, Translucent,
 Constant, Wireframe, Anime, Cartoon, Oren-Nayar-Blinn, the whole Blender
@@ -79,7 +79,7 @@ Internal diffuse/specular matrix, 3ds Max's own eight, and seventeen period
 light units and combiners (GameCube, Sega Model 2 and 3, Nintendo DS,
 PlayStation, Saturn, N64, PS2, Direct3D, PowerVR, Mega Drive, Super FX).
 
-**249 node types** are evaluated — every shader node Blender 5.x offers (the
+**250 node types** are evaluated — every shader node Blender 5.x offers (the
 full Principled BSDF, recursive node groups, every Math and Vector Math
 operation) plus Halcyon's own 143: the master shader with the era's whole bag
 of tricks on one node, 34 procedural textures, the 2D media, thirty utilities

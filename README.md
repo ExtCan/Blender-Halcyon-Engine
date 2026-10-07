@@ -67,7 +67,7 @@ without Blender for its 9503-check test suite.
 
 ![the libraries](docs/halcyon_libraries.png)
 
-**At a glance:** 49 shading models · 249 node types evaluated (every shader
+**At a glance:** 59 shading models · 250 node types evaluated (every shader
 node Blender 5.x offers, plus Halcyon's own 143) · 112 render presets in
 eight categories · 143 resolution presets · 114 Pre-Made material templates
 in fourteen families · eleven sky modes, 303 skies, 48 waters, ten infinite
@@ -200,7 +200,7 @@ selecting Flat evaluates once per face. That is where the banding and the
 faceting genuinely come from, and it is why they look right instead of merely
 blurry.
 
-**249 node types** are evaluated — 102 of Blender's own, audited against its
+**250 node types** are evaluated — 102 of Blender's own, audited against its
 full surface-node registry, and the audit came back clean: every shader node Blender 5.x offers
 has an evaluator except Freestyle's stroke UV, which has no meaning outside
 Freestyle. That includes the full Principled BSDF, node groups (recursively),
@@ -220,6 +220,72 @@ Bump node between the texture and the Normal chain, so it renders identically
 on both devices by construction. The Material Properties tab drives the same
 material with plain sliders when **Override** is on — override withholds the
 node tree at export, so what the panel shows is exactly what renders.
+
+**The master shader's menu is the classics' alone (1.91).** Lambert to
+Multi-Layer, Toon, Translucent, Constant, Wireframe, Blender Internal's
+three and Oren-Nayar-Blinn: 22 models. The anime and cartoon masters, the
+eight 3ds Max shaders and the period machines each have their own node now
+(the Anime Shader, the Cartoon Shader, the 3DS Max shelf's Standard
+material, the Console Emulation Shader below), and the menu's items are
+numbered by the engine's own table, so a file saved with Phong still reads
+Phong and a file saved with a moved model — a GameCube master, a Cartoon
+master, a Max Metal master — is rebuilt at load as the node that carries
+it, links and socket values intact.
+
+**The Console Emulation Shader (1.91)** is the period machines' own master
+node: a **Console** menu — GameCube / Wii, Sega Model 2 and Model 3,
+Nintendo DS, PlayStation, PlayStation 2, PSP, Saturn, Nintendo 64, Namco
+System 22, Dreamcast / Naomi, PC fixed function (Direct3D 3–9 / OpenGL
+1.x), PowerVR PCX1 / PCX2, Mega Drive, Super FX, Atari Jaguar, 3DO,
+RenderWare — and, per machine, the **shader types its polygon attribute
+word could select** and the options that word carried. GX's channel
+control: the diffuse function (clamp, signed, none), the attenuation
+function (specular, spot, none), the material source (register or vertex
+colour). Model 2's specular-control bits as the four powers they were
+(off, 1, 2, 4, 8) and its fixed-luma unlit polygon; Model 3's header: the
+four exponent / gain pairs, fixed shading, the sun-clamp bit (off, a face
+turned away goes darker than ambient), the 32 alpha levels; both boards'
+64-entry luma ramp as a gamma on the 64-step index. The DS's four polygon
+modes — modulation, **decal** (new: GBATEK's texel-over-lit by alpha on
+6-bit channels), toon, highlight — and the shininess table's shape. The
+PS1's Gouraud, flat and raw-texture primitives and the GTE's three-light
+limit; the GS's four texture functions; the PSP's modulate / decal /
+replace / add and GU_FLAT; VDP1's colour calculations (Gouraud, replace,
+half luminance, mesh); the N64's combiner presets (modulate, decal, shade
+only, blend by texel alpha, vertex colours with lighting off) and its
+seven-light limit; Direct3D's texture-stage ops (modulate, 2x, 4x, add,
+add signed), the local-viewer and colour-vertex render states, the two
+provoking-vertex flats; the Dreamcast's packed, intensity, decal and flat
+vertex formats; the PCX's base-colour choice; the Mega Drive's S/H classes
+forced or by class; the Super FX plot's dither pair or nearest entry; the
+**Jaguar's CRY intensity Gouraud** (new: one chroma per polygon, the 8-bit
+intensity interpolated); the **3DO's PIXC multiplier** (new: a cel lit as a
+whole in eighths). A **Rate** menu lights each material at its machine's
+own rate, the scene's, per vertex or per face — a PS1 flat primitive sits
+beside a Gouraud one in one scene — and a **Machine's Light Limit** toggle
+keeps the first N lamps in scene order (the games' register order). Every
+type and option shades on both devices: the corner road carries the
+machine's lighting, the combine's GLSL twin is bitwise the CPU's in the
+simulator; a light limit or a fixed-shading mix at the pixel rate refuses
+the GPU by name.
+
+**RenderWare (1.91)** is the Console menu's last entry: Criterion's
+RpMaterial on the PS2, GameCube and Xbox / Direct3D 8 default pipelines.
+RwSurfaceProperties' ambient and diffuse coefficients (the Ambient and
+Diffuse Level sockets), the geometry flags — lit, **prelit + lit** (the
+prelight vertex colour ADDED to the computed light before the clamp, the
+baked-lighting road of every RW world mesh), prelit only — per vertex on
+every platform, the lit colour on each platform's grid: the GS's 0x80 = 1.0
+with its overbright headroom to 0xFF, or the 8-bit saturated grid of the
+GameCube and the Xbox, then the platform's modulate (the GS's x/128, the
+TEV's 255→256 trick, the exact 8-bit product). The default pipelines do
+not use the specular coefficient (the SDK says so); the **GTA San Andreas
+specular plugin** adds its Blinn-Phong. RpMatFX's effects ride the master's
+own roads: the **environment map** added by its coefficient (the matcap
+road, ONE / ONE), the **bump map** through Bump Height / Bump Strength
+(the bumpiness coefficient), **dual texture** over the base by the
+rwBLEND pair (modulate, add, alpha). GTA's **night vertex colours** blend
+the prelight toward a Night Color by Night Blend.
 
 New materials created while Halcyon is the active engine are **born as master
 shader materials** — the panel's New button builds one directly, and a
@@ -1089,14 +1155,15 @@ Feature, 90s TV (Dark Deco) — and the sockets stay yours afterwards.
 Shades identically on CPU and GPU, per-pixel chains into Shadow Color,
 Shadow Amount, Shadow Threshold, Shadow Smoothing, Highlight Color,
 Highlight Size and Lamp Influence included; a chain into a softness
-socket refuses the driver by name. The master shader's model menu
-carries **Cartoon (Paint)** too, running the node at its defaults.
+socket refuses the driver by name. (Until 1.91 the master shader's model
+menu carried **Cartoon (Paint)** too; the Cartoon Shader alone carries it
+now, and a file saved with the master set to it opens as a Cartoon Shader.)
 
 **Convert to Halcyon chooses its shader your way (1.62).** The Material
 panel's converter grew a Detection switch: **Automatic** keeps reading
 the source shader (Principled roughness becomes Glossiness, Glass
 becomes Blinn, Toon becomes Toon), **Set Shader** forces one chosen
-model — any of the 19, the Anime/Cel bands included — onto everything it
+model — any of the master's 22 classics — onto everything it
 converts.
 
 **143 resolution presets in nine categories (1.62, 1.84, 1.90)** — the
@@ -2243,10 +2310,14 @@ halcyon/
     texture.py     sampling, mips, N64 three-point filter; the period
                    texel formats, compression, level roads and the
                    summed-area table (1.90.0)
-    shading.py     the 49 models (Max's eight and the period light units
-                   included)
+    shading.py     the 59 models (Max's eight, the period light units and
+                   the Console Emulation Shader's ten included); the master
+                   menu's own 22 (1.91.0)
+    console.py     the Console Emulation Shader's machines, shader types,
+                   options and resolver (1.91.0)
     combine.py     the period combiners: the corner quantiser and each
-                   machine's integer rule (1.90.0)
+                   machine's integer rule (1.90.0); the console combines
+                   and the per-material options (1.91.0)
     fog.py         the fog curves, tables and cues both devices share
                    (1.90.0)
     shadowmask.py  planar shadows, Dreamcast modifier volumes, DS shadow
@@ -2254,7 +2325,7 @@ halcyon/
     reyes.py       the REYES micropolygon grid and its snap (1.90.0)
     srbump_tables.py  the PowerVR2 bump angle tables (1.90.0)
     lights.py      attenuation, shadow maps, PCF, ray shadows, gobos
-    nodeeval.py    249 node types, the bump desugar, the space ramps
+    nodeeval.py    250 node types, the bump desugar, the space ramps
     patterns.py    the integer-hash pattern library, 1D–4D noise
     maxmaps.py     3ds Max's map algorithms on Halcyon's own tables
     bitex.py       the ported Blender Internal texture engine (+ tables)
@@ -2294,7 +2365,7 @@ halcyon/
     craster.py     the compute rasteriser and its NumPy twin
     shade.py       frame planning, deferred passes, the ray sweeps
     material.py    GLSL assembly per material
-    emit.py        186 node emitters
+    emit.py        187 node emitters
     procedural.py  the pattern, media and Max map libraries as GLSL,
                    twin by twin
     glsl_shading.py  the reflectance models in GLSL

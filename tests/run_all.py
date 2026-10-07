@@ -22,6 +22,8 @@ def run_tests():
                    test_r251_sky_camera, test_r251_post_palette, test_r251_post_signal)
     from . import (test_r251_material, test_r251_material_nodes, test_r251_post_tape,
                    test_r251_post_codec)
+    # R252 (1.91.0): the Console Emulation Shader
+    from . import test_r252_console
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -113,6 +115,11 @@ def run_tests():
     print('R251 POST-CODEC (SIG-3)')
     print('=' * 66)
     rc |= test_r251_post_codec.main()
+    print()
+    print('=' * 66)
+    print('R252 CONSOLE EMULATION SHADER')
+    print('=' * 66)
+    rc |= test_r252_console.main()
     return rc
 
 

@@ -4,6 +4,206 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
 
 ---
 
+## [1.91.0] — 2026-10-07
+
+### The Console Emulation Shader, the master menu's classics, RenderWare (R252)
+
+- **What was asked.** "Add Renderware options and shaders. Move the Game
+  system shaders (Gamecube, Model 3, DS, etc) out of the Halcyon master
+  shading node and into their own node called Console Emulation Shader,
+  with many unique options per shader type. Include specified shader types
+  per console and modify the pre-existing ones to be more accurate. Also,
+  remove the Cartoon/Anime/3DS Max shaders from the Halcyon Master Shader
+  node as they already have their own nodes."
+- **The master shader's menu is the classics' alone.** The Halcyon Shader
+  offers 22 models now (`core/shading.MASTER_MODELS`): Lambert, Gouraud,
+  Flat, Phong, Blinn-Phong, Blinn, Cook-Torrance, Oren-Nayar, Minnaert,
+  Ward, Anisotropic, Metal, Strauss, Multi-Layer, Toon, Translucent,
+  Constant, Wireframe, the three Blender Internal shaders and
+  Oren-Nayar-Blinn. Gone from the menu: Anime / Cel and Cartoon (Paint)
+  (the Anime Shader and the Cartoon Shader carry them), the eight "(3ds
+  Max)" shaders (the 3DS Max shelf's Standard material carries them by
+  shader type) and the seventeen period machines (the new node below).
+  The engine's table (`MODEL_ITEMS`) keeps every model in its place -- its
+  order is the GLSL dispatch index and a saved file's enum value -- and the
+  master's EnumProperty gives each item its table index as its explicit
+  number (`master_model_items`), so a file saved with Phong at 3 still
+  reads Phong. **A file saved with a moved model is rebuilt at load**
+  (`nodes/shader_nodes.migrate_master_node`, from the load_post migration
+  that already grew sockets): the raw enum integer is read back through the
+  table (`saved_master_model`), the right node is made -- the Anime
+  Shader, the Cartoon Shader, the Max Standard node with its shader type
+  set, or the Console Emulation Shader with its machine, type and options
+  set from `core/console.MIGRATE` and its Toon Steps carried -- the socket
+  values and links travel by socket name, the output relinks to whatever
+  the old Surface fed, and the old node goes. The converter's Set Shader
+  list is the master's menu (`properties.convert_model`), numbered the
+  same way. The material panel's Override menu (the plain-slider road) is
+  untouched: it names engine models directly.
+- **The Console Emulation Shader** (`HALCYON_ConsoleShaderNode`, the
+  Shading family). A Console menu of eighteen machines, and per machine the
+  SHADER TYPES its polygon attribute word could select plus the options it
+  carried, every one a real register bit or render state with its source
+  named in the tooltip (`core/console.py` holds the tables and the
+  resolver; the node imports them, like the master imports `MODEL_ITEMS`).
+  The sockets are the master's own names, so every road downstream -- the
+  corner road, the combines, the GPU bake and its per-pixel grants -- reads
+  one vocabulary. The resolver turns one node into an engine model plus
+  Surface fields the light loop never had: `fixed_shade` (no light
+  evaluated: the colour shown as is -- Model 3's fixed-shading bit, the
+  PS1's raw-texture bit, a GS / N64 decal, the PSP's replace, RenderWare's
+  unlit prelit), `light_limit` (the first N lamps in scene order: GX 8, DS
+  4, PS1 3, PS2 3, PSP 4, N64 7, System 22 1), `axis_viewer` (the
+  per-material camera-axis viewer, OpenGL's default and Direct3D's
+  LOCALVIEWER FALSE), `prelit` / `prelit_mode` (RenderWare's prelight),
+  `gx_diff_fn` / `gx_attn_fn` (GX's channel functions), `sun_clamp` (Model
+  3's header bit), `alpha_steps` (Model 3's 32 translucency levels), and
+  the combine-stage options `core/combine.recombine` reads per material
+  (`console_opts`) and the GPU pass bakes (`__console`). A Rate menu
+  (Machine / Scene / Vertex / Face) decides per material for every model the
+  hardware tables do not pin (`combine.rate_for_model` takes the material
+  now; the Sega boards, the flats, the Mega Drive, the Super FX, the 3DO
+  and RenderWare keep theirs). Per machine:
+  - *GameCube / Wii.* Lit (GX light unit) or vertex colour with lights off.
+    Diffuse function GX_DF_CLAMP / GX_DF_SIGN (the signed cosine: a light
+    behind the surface subtracts, the channel saturating at 0) / GX_DF_NONE
+    (the light added flat) -- `evaluate_console` reads `surf.gx_diff_fn`,
+    the GLSL dispatch's model 32 branch the same field. Attenuation
+    function GX_AF_SPEC / GX_AF_SPOT / GX_AF_NONE -- only SPEC adds the
+    rational highlight (the Sun-only gate of F016 grew the second
+    condition on both roads). Material source register / vertex colour.
+  - *Sega Model 2.* Lit through the luma ramp, or fixed luma. The
+    specular-control bits as off / power 1 / 2 / 4 / 8 (the node pins
+    Glossiness to the exponent the lobe snaps to). *Model 3.* Smooth or
+    fixed shading (the vertex colours shown as they are), specular off or
+    the four exponent / gain pairs 8x1.6, 16x1.6, 32x2.4, 64x3.2, the
+    sun-clamp bit (off: the sun's cosine keeps its sign, Supermodel's
+    sunClamp), Alpha Steps (Opacity to 1/32). Both: a Luma Ramp Gamma on
+    the 64-step index -- `combine.luma_remap_table`, 64 integers both roads
+    read (the GLSL bakes them as compares, never a pow()); 1.0 is the
+    pre-1.91 linear ramp bitwise. The ramps the games wrote are
+    unpublished: a stand-in, the tooltip says so.
+  - *Nintendo DS.* The four polygon modes: modulation, **decal** (new,
+    `DS_DECAL`: GBATEK's (texel x alpha + lit x (63 - alpha)) / 64 on 6-bit
+    channels, the texel alpha on the 5-bit grid expanded to 6; the /64
+    leaves each side one step short of itself, the mode's own arithmetic),
+    toon, highlight; the shininess table linear (the table disabled is the
+    identity line, Glossiness 8) / soft / pin / the Glossiness socket; the
+    toon table's steps on the node.
+  - *PlayStation.* Gouraud textured, flat textured (the Face rate, pinned
+    whatever the Rate menu says), raw texture; the GTE's three-light limit.
+    *PlayStation 2.* The GS's MODULATE, DECAL, HIGHLIGHT and HIGHLIGHT2
+    (the same colour arithmetic as HIGHLIGHT; the difference lives in the
+    output alpha, which is the texel's on both here -- said in the
+    tooltip); the VU1 microcode's three lights. *PSP.* GU_TFX_MODULATE,
+    **DECAL** (new, `DECAL_ALPHA`: texel x a + colour x (255 - a) over 255,
+    rounded), REPLACE, **ADD** (new, `ADD8_COMBINE`: texel + colour
+    saturating), GU_FLAT; four lights.
+  - *Saturn.* VDP1's colour calculation: the Gouraud table, replace, Gouraud
+    + half luminance (the texel halved on the 5-bit grid before the add),
+    Gouraud + mesh (Opacity pinned 0.5: under the scene's Screen Door it is
+    the checkerboard, under Sorted it blends).
+  - *Nintendo 64.* G_CC_MODULATERGB, G_CC_DECALRGB, **G_CC_SHADE** (new,
+    `N64_SHADE`: the texture ignored -- the Diffuse Color's flat value
+    read with its link dropped, the material colour standing in for the
+    per-material light colours Mario 64's gdSPDefLights1 set -- through
+    the combiner's own modulate and rounding), **G_CC_BLENDRGBA** (new,
+    `N64_BLENDRGBA`: (TEXEL0 - SHADE) * TEXEL0_ALPHA + SHADE with the
+    rounding term, the signed 9-bit difference), vertex colours with
+    G_LIGHTING off; seven lights.
+  - *Namco System 22.* Lit (x/64) or fixed; one light.
+  - *Dreamcast / Naomi.* Packed colour with the offset colour, the intensity
+    vertex formats (PCX's monochrome Gouraud carried over), decal, flat
+    (the last vertex: the OpenGL rule stands in for the CLX2's own corner
+    choice, disclosed).
+  - *PC fixed function.* Gouraud with the separate specular, Gouraud with
+    the modulated specular (D3D3 / GL 1.0), flat last vertex, flat first
+    vertex. Texture Op D3DTOP_MODULATE / MODULATE2X / MODULATE4X / ADD /
+    ADDSIGNED under the separate specular (`cb_d3dspec_op`; the 2x / 4x
+    double or quadruple the exact 8-bit product, saturating; ADDSIGNED at
+    half light is the texel itself). Local Viewer (off: the camera axis per
+    material, `axis_viewer`, `viewer_expr` reads the baked field). Colour
+    Vertex (the vertex colour is the material).
+  - *PowerVR PCX.* The base colour from the mean of the corners (the 1.90
+    stand-in) or the first corner (`cb_pcx(first=True)`, its own GLSL
+    text).
+  - *Mega Drive.* The S/H class by the lighting, or NORMAL / SHADOW /
+    HIGHLIGHT forced (`light_extras` takes the material; the class rides
+    `extras['md_class']` into `light_alpha`).
+  - *Super FX.* The dither pair or the nearest single entry (`Pj = Pi` on
+    both roads: the hook and `pack_face_corners`).
+  - *Atari Jaguar* (new, `JAGUAR_CRY`). The blitter's GOURD in CRY: the lit
+    term collapses to one 8-bit intensity byte (floor on the 0..255 grid)
+    and scales the colour -- the chroma never moves. Per vertex, or the
+    flat fill (Face).
+  - *3DO* (new, `THREEDO_PIXC`). The cel engine's PIXC multiplier: the
+    cel's lit luminance to the nearest eighth, never below 1/8 (the
+    register's 1..8), times the cel's 5-bit colour. One value per polygon
+    (Face, pinned).
+- **RenderWare** (`RENDERWARE_PS2`, `RENDERWARE_GC`, `RENDERWARE_PC`, items
+  49..51). Criterion's RpMaterial on the default pipelines. The light law:
+  ambient x RwSurfaceProperties.ambient (the Ambient socket) plus each
+  light's cosine x .diffuse (Diffuse Level), the prelight vertex colour
+  ADDED before the clamp under rpGEOMETRYPRELIT (`light_surface` adds
+  `surf.prelit` after the ambient term; prelit only = the prelight as the
+  whole light under fixed shading), per vertex on every platform
+  (RATE_FIXED VERTEX), the lit corner on the platform's grid
+  (`corner_rgb`: the GS's 0x80 = 1.0 with headroom to 0xFF -- a vertex may
+  reach twice the texture's brightness, the PS2's overbright; the GameCube
+  and the Xbox saturate at 8 bits), then the platform's modulate: the GS's
+  x/128 (`cb_ps1`, the same arithmetic), the TEV's (texel x (c + c >> 7)
+  + 128) >> 8 (`cb_tev`, new: a full-lit texel is exactly itself where the
+  N64's rounding left it one step short), the exact 8-bit product rounded
+  half to even (`cb_mod8`, new; a driver's own rounding is a stand-in). The
+  default pipelines do not use the specular coefficient (the SDK says so):
+  Specular NONE pins the level to 0; the GTA San Andreas specular plugin is
+  the Blinn-Phong from Specular Level and Glossiness. RpMatFX: ENVMAP (the
+  Env Map socket through the matcap road, ADDED by Env Map Coefficient --
+  the PS2 and D3D passes blend ONE / ONE), BUMPMAP (Bump Height through the
+  bump desugar, Bump Strength as the bumpiness coefficient), BUMPENVMAP,
+  DUAL (the Dual Texture socket over the base by the rwBLEND pair:
+  modulate, add, alpha -- `nodeeval.console_albedo` and the emitter's twin
+  compose the same arithmetic). GTA's extra vertex colours: Night Color and
+  Night Blend lerp the prelight. On an unpainted mesh the Vertex Color and
+  Prelit Color sockets stand in for the colour attribute (`ctx.has_vcol`;
+  the emitter reads the socket when the G-buffer carries no colour layer).
+- **Both roads.** Every type and option is on both devices: the corner road
+  carries the machine's lighting (the CPU lights the corners, the pass
+  interpolates), and each new combine has its GLSL twin in `gpu/combine.py`
+  -- the TEV, the 8-bit modulate and its 2x / 4x, add, add signed, the two
+  decals and the N64 blend (the texel alpha reaches the pass as the colour
+  chain's `.a`), the Jaguar byte, the 3DO eighths, the luma ramp table, the
+  Saturn half, the PCX first corner -- each bitwise the CPU in the simulator
+  on 2048 random lanes (`tests/test_r252_console.test_combine_gpu_twins`,
+  d == 0.0; the PCX corner within 1 ulp on its one non-power-of-two
+  divide). At the pixel rate GX's diffuse function and the per-material
+  viewer are in the GLSL (`s.gx_diff_fn`, `s.axis_viewer`, `s.gx_attn_fn`
+  in the struct and BAKE_FIELDS); fixed shading at the pixel rate is the
+  shadeless pass (`bake['__shadeless']`); a light limit at the pixel rate
+  and a fixed-shading mix refuse by name. Twenty-one console materials
+  through the simulator against the CPU frame at the corner road's bar
+  (max < 6e-3, no pixel > 1e-2): `test_gpu_parity`.
+- **Measured on the demo scene** (`test_types_render_distinct`,
+  `test_options_change_the_picture`): all 55 machine / type pairs render
+  finite; the 49 distinct resolutions render pairwise distinct pictures
+  (fixed-shading types and decals at texel alpha 1 are the albedo, as they
+  should be, and are grouped); every option moves the frame it claims to.
+  The lamps are dimmed to 45% in those checks: at the test card's full
+  energy the 8-bit units saturate the whole Ball and a highlight has nowhere
+  to show -- the machines' own ceiling, not a defect.
+- **Bitwise-neutral for every existing material.** Every new Surface field
+  defaults to the pre-1.91 behaviour; `cb_luma64` at gamma 1 is the 1.90
+  path; `rate_for_model` without a material is the 1.90 answer; the master's
+  22 remaining items keep their indices; the R251 pins
+  (`test_r251_lighting_models`, `test_r251_material.test_b_tables_and_items`
+  with the new items appended) hold.
+- **Tests.** `tests/test_r252_console.py` (139 checks: the tables, the
+  combine laws, the GPU twins, the frames, the options, the rate override,
+  the GPU parity and refusals, the node and the load migration on a fake
+  tree), registered in `run_all`; `test_enum_callback_default_rule` and the
+  Cartoon test's master check updated for the trimmed menu;
+  `SOCKET_MODELS` names the ten new items (the measured table holds).
+
 ## [1.90.0] — 2026-09-26
 
 ### Period machines on both roads: fog in the pass, Painter's on the GPU raster, and nine packs of 3D software / console features (R251)

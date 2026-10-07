@@ -662,7 +662,17 @@ def closure_to_surface(cl, ctx, settings, material=None):
                 ('shadow_receive', 'shadow_receive', 'v', 1.0),
                 ('cast_only', 'cast_only', 'v', 0.0),
                 ('shadows_only', 'shadows_only', 'v', 0.0),
-                ('use_mist', 'use_mist', 'v', 1.0)):
+                ('use_mist', 'use_mist', 'v', 1.0),
+                # R252: the Console Emulation Shader's light-loop fields
+                ('fixed_shade', 'fixed_shade', 'v', 0.0),
+                ('light_limit', 'light_limit', 'v', 0.0),
+                ('axis_viewer', 'axis_viewer', 'v', 0.0),
+                ('prelit', 'prelit', 'c', (1.0, 1.0, 1.0)),
+                ('prelit_mode', 'prelit_mode', 'v', 0.0),
+                ('gx_diff_fn', 'gx_diff_fn', 'v', 0.0),
+                ('gx_attn_fn', 'gx_attn_fn', 'v', 0.0),
+                ('sun_clamp', 'sun_clamp', 'v', 1.0),
+                ('alpha_steps', 'alpha_steps', 'v', 0.0)):
             if any(hp.get(key) is not None for _w, hp in halcyon):
                 setattr(surf, attr, hmix(key, dflt, knd == 'c'))
         # a master shader's refraction bends through its one IOR slider;
@@ -1137,7 +1147,10 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
     # silhouette cheats and sheen keep the true eye.
     Vs = V
     if str(getattr(settings, 'specular_viewer', 'PIXEL')) == 'AXIS' \
-            or model in getattr(SH, 'AXIS_MODELS', ()):
+            or model in getattr(SH, 'AXIS_MODELS', ()) \
+            or np.any(surf.axis_viewer > 0.5):
+        # (R252: a Console node's Local Viewer off asks for the axis per
+        # material -- OpenGL's default, Direct3D's D3DRS_LOCALVIEWER FALSE)
         _vm = getattr(ctx, 'view_matrix', None)
         if _vm is not None:
             Vs = np.broadcast_to(
@@ -1146,6 +1159,22 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
 
     if model in ('CONSTANT', 'WIREFRAME'):
         return surf.diffuse * surf.diffuse_level[:, None] + surf.emission
+    if np.any(surf.fixed_shade > 0.5):
+        # R252: fixed shading -- no light evaluated (Model 3's fixed
+        # shading bit, the PS1's raw-texture bit, a GS / N64 decal, the
+        # PSP's replace, RenderWare's unlit prelit geometry): the colour
+        # shown as it is, times the prelight where the mode says so, plus
+        # emission. At the corner road the LIGHT half is white, so the
+        # combine sees unity (the texel exactly itself through every
+        # machine's modulate) or the prelight alone
+        base = surf.diffuse * surf.diffuse_level[:, None]
+        pre = np.where((surf.prelit_mode > 0.5)[:, None], surf.prelit, 1.0)
+        fixed = base * pre + surf.emission
+        if np.all(surf.fixed_shade > 0.5):
+            return fixed.astype(np.float32)
+        fixed_mask = surf.fixed_shade > 0.5
+    else:
+        fixed_mask = None
     # R238: the cel's light -- the material's key (0 the scene's lamps,
     # 1 a key fixed to the camera, 2 a key fixed to the world), the
     # screen shadow and the depth rim read from the frame's cel field
@@ -1285,6 +1314,20 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
 
     lights = active_lights if active_lights is not None else \
         LI.select_lights(scene.lights, settings)
+    # R252: the machine's light limit, per material (the GTE's three
+    # rows, the DS's four lights, the RSP's seven): the first N of the
+    # scene's selection, in scene order -- the games' own register order
+    _ll = int(np.max(np.asarray(surf.light_limit, np.float32))) \
+        if surf.n else 0
+    if _ll > 0 and len(lights) > _ll:
+        lights = list(lights)[:_ll]
+    if np.any(surf.prelit_mode > 0.5):
+        # R252: RenderWare's rpGEOMETRYPRELIT -- the prelight vertex
+        # colour ADDED to the computed light before the clamp (never
+        # multiplied by the material: the material colour and the texel
+        # come after, at the combine)
+        out = out + np.where((surf.prelit_mode > 0.5)[:, None],
+                             surf.prelit, 0.0).astype(np.float32)
     clamp = float(settings.light_clamp)
 
     # ---- the BI panel round's per-material machinery
@@ -1493,10 +1536,13 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         # every other road reads is its mean, and the contribution
         # takes the colour as given instead of the diffuse socket
         if model == 'GX_LIGHT' and \
-                getattr(light, 'type', '') not in ('SUN', 'HEMI'):
+                (getattr(light, 'type', '') not in ('SUN', 'HEMI')
+                 or np.any(surf.gx_attn_fn > 0.5)):
             # R251 (LIGHT-B2): GX_AF_SPEC lit from directional lights
             # only (GX_InitSpecularDir) -- a point or spot lamp adds no
-            # highlight on the GameCube
+            # highlight on the GameCube. R252: nor does a channel whose
+            # attenuation function is GX_AF_SPOT or GX_AF_NONE (the
+            # attenuation unit is busy with the cone, or off)
             spec = np.zeros_like(spec)
         elif model == 'DS_FIXED':
             # R251 (LIGHT-B2): the DS's table highlight, evaluated HERE
@@ -1936,6 +1982,10 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         # R229: the hair shine band, painted OVER the banded result
         # (before emission and the silhouette cheats, like the paint)
         out = _anime_hair_shine(out, surf, ctx, N, V, hair_key_z)
+    if fixed_mask is not None:
+        # R252: a batch mixing fixed-shaded and lit fragments (a Mix
+        # Shader between two console materials) keeps each its own
+        out = np.where(fixed_mask[:, None], fixed, out).astype(np.float32)
     if model == 'GX_LIGHT':
         # R251 (LIGHT-B2): the GX vertex unit's saturated 8-bit lit
         # colour (per corner at the Gouraud rate the model is meant for)
@@ -3036,9 +3086,15 @@ class ShadeJob:
         rate_mode = getattr(self, 'rate_mode', None)
         if rate_mode == 'ALBEDO':
             alb = np.asarray(surf.diffuse, np.float32)
+            _op = np.clip(surf.opacity, 0.0, 1.0)
+            if np.any(surf.alpha_steps > 0.5):
+                # R252: the polygon alpha on the machine's step count
+                # (Model 3's 32 translucency levels), half up
+                _as = np.maximum(surf.alpha_steps, 1.0)
+                _op = np.where(surf.alpha_steps > 0.5,
+                               np.floor(_op * _as + 0.5) / _as, _op)
             return np.concatenate(
-                [alb, np.clip(surf.opacity, 0.0, 1.0)[:, None]],
-                axis=1).astype(np.float32)
+                [alb, _op[:, None]], axis=1).astype(np.float32)
         if rate_mode == 'LIGHT':
             surf.diffuse = np.ones_like(np.asarray(surf.diffuse, np.float32))
         if nrm is not None:
@@ -3065,7 +3121,7 @@ class ShadeJob:
             # (DS_FIXED / FLAT) from here on; the carriers ask for the
             # specular (and the key lamp's cosine) apart
             model = CB.effective_model(model, mat, st)
-            ex = CB.light_extras(model)
+            ex = CB.light_extras(model, mat)
             if ex:
                 extras = dict(extras or {})
                 extras.update(ex)
@@ -6365,6 +6421,11 @@ def material_model(mat, settings):
         for node in mat.graph.get('nodes', {}).values():
             if node.get('bl_idname') == 'HALCYON_ShaderNode':
                 return node.get('props', {}).get('model', settings.default_model)
+            if node.get('bl_idname') == 'HALCYON_ConsoleShaderNode':
+                # R252: the Console Emulation Shader resolves its machine
+                # and shader type to an engine model
+                from .console import model_of
+                return model_of(node.get('props', {}))
             if node.get('bl_idname') == 'HALCYON_BIMaterialNode':
                 return bi_matrix_model(node.get('props', {}))
             if node.get('bl_idname') in ('HALCYON_MaxStandardNode',
@@ -6533,7 +6594,7 @@ def _shade_all(job, tri_idx, bary, px, py, front, blin, st, progress=None):
     rates = {}
     for i, mat in enumerate(scene.materials):
         model = material_model(mat, st)
-        rates[i] = (CB.rate_for_model(model, st)
+        rates[i] = (CB.rate_for_model(model, st, mat)
                     or RATE_FOR_MODEL.get(model, st.shading_rate)) if model \
             else st.shading_rate
     per_frag = np.array([rates.get(int(m), st.shading_rate) for m in

@@ -148,6 +148,7 @@ FN_LUMA64 = FN_LUM + (
     '    float lum = hal_lum(L);\n'
     '    float l8 = floor(clamp(lum, 0.0, 1.0) * 255.0);\n'
     '    float lum6 = min(floor(l8 / 4.0), 63.0);\n'
+    '    lum6 = hal_luma_remap(lum6);\n'
     '    vec3 ca = clamp(A, 0.0, 1.0) * 31.0;\n'
     '    vec3 c5 = floor(ca + 0.5);\n'
     '    vec3 num = c5 * lum6;\n'
@@ -156,6 +157,203 @@ FN_LUMA64 = FN_LUM + (
     '    vec3 o8 = floor(q / 1953.0);\n'
     f'    return o8 * {R255};\n'
     '}\n')
+
+def fn_luma_remap(gamma):
+    """R252: the 64-entry luma ramp (core/combine.luma_remap_table) as a
+    GLSL function -- the identity at gamma 1 (the pre-R252 text plus one
+    call), else 64 compares against baked integers: no pow() in the
+    shader, the SAME table the CPU read."""
+    tab = CB.luma_remap_table(gamma)
+    if tab is None:
+        return ('float hal_luma_remap(float i)\n'
+                '{\n'
+                '    return i;\n'
+                '}\n')
+    terms = ' + '.join(f'((abs(i - {_f(k)}) < 0.5) ? {_f(v)} : 0.0)'
+                       for k, v in enumerate(tab))
+    return ('float hal_luma_remap(float i)\n'
+            '{\n'
+            f'    return {terms};\n'
+            '}\n')
+
+
+FN_SATURN_HALF = (
+    'vec3 hal_cb_saturn_half(vec3 L, vec3 A)\n'
+    '{\n'
+    '    vec3 t5 = roundEven(clamp(A, 0.0, 1.0) * 31.0);\n'
+    '    t5 = floor(t5 / 2.0);\n'
+    '    vec3 g5 = clamp(roundEven(L * 16.0), 0.0, 31.0);\n'
+    '    vec3 o = t5 + g5;\n'
+    '    o = o - 16.0;\n'
+    '    o = clamp(o, 0.0, 31.0);\n'
+    f'    return o * {R31};\n'
+    '}\n')
+
+FN_PCX_FIRST = FN_LUM + (
+    'vec3 hal_cb_pcx1(vec3 c0, vec3 c1, vec3 c2, vec3 b, vec3 A)\n'
+    '{\n'
+    '    vec3 base = clamp(c0, 0.0, 1.0);\n'
+    '    float lb = max(hal_lum(base), 1e-4);\n'
+    '    float i0 = clamp(hal_lum(c0) / lb, 0.0, 1.0);\n'
+    '    float i1 = clamp(hal_lum(c1) / lb, 0.0, 1.0);\n'
+    '    float i2 = clamp(hal_lum(c2) / lb, 0.0, 1.0);\n'
+    '    float I = i0 * b.x;\n'
+    '    I = I + i1 * b.y;\n'
+    '    I = I + i2 * b.z;\n'
+    '    vec3 p = A * base;\n'
+    '    return p * I;\n'
+    '}\n')
+
+# ---- R252: the Console Emulation Shader's combines (core/combine.cb_*
+# written in the subset: roundEven for rint, floor for the integer
+# steps, one op per statement where a rounding follows)
+
+FN_S8 = (
+    'vec3 hal_s8(vec3 L)\n'
+    '{\n'
+    '    return clamp(roundEven(L * 255.0), 0.0, 255.0);\n'
+    '}\n'
+    'vec3 hal_t8(vec3 A)\n'
+    '{\n'
+    '    return roundEven(clamp(A, 0.0, 1.0) * 255.0);\n'
+    '}\n')
+
+FN_TEV = FN_S8 + (
+    'vec3 hal_cb_tev(vec3 L, vec3 A)\n'
+    '{\n'
+    '    vec3 t8 = hal_t8(A);\n'
+    '    vec3 c8 = hal_s8(L);\n'
+    '    vec3 c9 = c8 + floor(c8 / 128.0);\n'
+    '    vec3 v = t8 * c9;\n'
+    '    v = v + 128.0;\n'
+    '    vec3 o = floor(v / 256.0);\n'
+    '    o = min(o, vec3(255.0));\n'
+    f'    return o * {R255};\n'
+    '}\n')
+
+FN_MOD8 = FN_S8 + (
+    'vec3 hal_cb_mod8(vec3 L, vec3 A)\n'
+    '{\n'
+    '    vec3 t8 = hal_t8(A);\n'
+    '    vec3 c8 = hal_s8(L);\n'
+    '    vec3 v = t8 * c8;\n'
+    '    v = v / 255.0;\n'
+    '    vec3 o = roundEven(v);\n'
+    '    o = min(o, vec3(255.0));\n'
+    f'    return o * {R255};\n'
+    '}\n')
+
+FN_MOD8K = FN_S8 + (
+    'vec3 hal_cb_mod8k(vec3 L, vec3 A, float k)\n'
+    '{\n'
+    '    vec3 t8 = hal_t8(A);\n'
+    '    vec3 c8 = hal_s8(L);\n'
+    '    vec3 v = t8 * c8;\n'
+    '    v = v / 255.0;\n'
+    '    vec3 o = roundEven(v);\n'
+    '    o = o * k;\n'
+    '    o = min(o, vec3(255.0));\n'
+    f'    return o * {R255};\n'
+    '}\n')
+
+FN_ADD8 = FN_S8 + (
+    'vec3 hal_cb_add8(vec3 L, vec3 A)\n'
+    '{\n'
+    '    vec3 t8 = hal_t8(A);\n'
+    '    vec3 c8 = hal_s8(L);\n'
+    '    vec3 o = t8 + c8;\n'
+    '    o = min(o, vec3(255.0));\n'
+    f'    return o * {R255};\n'
+    '}\n')
+
+FN_ADDSIGNED8 = FN_S8 + (
+    'vec3 hal_cb_addsigned8(vec3 L, vec3 A)\n'
+    '{\n'
+    '    vec3 t8 = hal_t8(A);\n'
+    '    vec3 c8 = hal_s8(L);\n'
+    '    vec3 o = t8 + c8;\n'
+    '    o = o - 128.0;\n'
+    '    o = clamp(o, 0.0, 255.0);\n'
+    f'    return o * {R255};\n'
+    '}\n')
+
+FN_DECAL8 = FN_S8 + (
+    'vec3 hal_cb_decal8(vec3 L, vec3 A, float alpha)\n'
+    '{\n'
+    '    vec3 t8 = hal_t8(A);\n'
+    '    vec3 c8 = hal_s8(L);\n'
+    '    float a8 = clamp(roundEven(alpha * 255.0), 0.0, 255.0);\n'
+    '    float ia = 255.0 - a8;\n'
+    '    vec3 v = t8 * a8;\n'
+    '    vec3 w = c8 * ia;\n'
+    '    v = v + w;\n'
+    '    v = v / 255.0;\n'
+    '    vec3 o = roundEven(v);\n'
+    '    o = min(o, vec3(255.0));\n'
+    f'    return o * {R255};\n'
+    '}\n')
+
+FN_DSDECAL = (
+    'vec3 hal_cb_dsdecal(vec3 L, vec3 A, float alpha)\n'
+    '{\n'
+    '    vec3 ta = clamp(A, 0.0, 1.0) * 63.0;\n'
+    '    ta = ta + 0.5;\n'
+    '    vec3 t6 = floor(ta);\n'
+    '    vec3 la = clamp(L, 0.0, 1.0) * 63.0;\n'
+    '    la = la + 0.5;\n'
+    '    vec3 l6 = floor(la);\n'
+    '    float m = clamp(alpha, 0.0, 1.0) * 31.0;\n'
+    '    float a5 = floor(m + 0.5);\n'
+    '    float a6 = (a5 > 0.0) ? (2.0 * a5 + 1.0) : 0.0;\n'
+    '    float ia = 63.0 - a6;\n'
+    '    vec3 v = t6 * a6;\n'
+    '    vec3 w = l6 * ia;\n'
+    '    v = v + w;\n'
+    '    vec3 c6 = floor(v / 64.0);\n'
+    f'    return c6 * {R63};\n'
+    '}\n')
+
+FN_N64BLEND = FN_S8 + (
+    'vec3 hal_cb_n64blend(vec3 L, vec3 A, float alpha)\n'
+    '{\n'
+    '    vec3 t8 = hal_t8(A);\n'
+    '    vec3 s8 = hal_s8(L);\n'
+    '    float a8 = clamp(roundEven(alpha * 255.0), 0.0, 255.0);\n'
+    '    vec3 d = t8 - s8;\n'
+    '    vec3 v = d * a8;\n'
+    '    v = v + 128.0;\n'
+    '    v = floor(v / 256.0);\n'
+    '    vec3 o = v + s8;\n'
+    '    o = clamp(o, 0.0, 255.0);\n'
+    f'    return o * {R255};\n'
+    '}\n')
+
+FN_JAGUAR = FN_LUM + FN_S8 + (
+    'vec3 hal_cb_jaguar(vec3 L, vec3 A)\n'
+    '{\n'
+    '    float lum = hal_lum(L);\n'
+    '    float y8 = floor(clamp(lum, 0.0, 1.0) * 255.0);\n'
+    '    vec3 t8 = hal_t8(A);\n'
+    '    vec3 v = t8 * y8;\n'
+    '    vec3 o = floor(v / 255.0);\n'
+    f'    return o * {R255};\n'
+    '}\n')
+
+FN_THREEDO = FN_LUM + (
+    'vec3 hal_cb_threedo(vec3 L, vec3 A)\n'
+    '{\n'
+    '    float lum = hal_lum(L);\n'
+    '    float n8 = floor(clamp(lum, 0.0, 1.0) * 8.0 + 0.5);\n'
+    '    n8 = clamp(n8, 1.0, 8.0);\n'
+    '    vec3 c5 = roundEven(clamp(A, 0.0, 1.0) * 31.0);\n'
+    '    vec3 c8 = c5 * 255.0;\n'
+    '    c8 = floor(c8 / 31.0);\n'
+    '    vec3 v = c8 * n8;\n'
+    '    vec3 o = floor(v / 8.0);\n'
+    f'    return o * {R255};\n'
+    '}\n')
+
+FN_D3DSPEC_OP = FN_MOD8K + FN_ADD8 + FN_ADDSIGNED8
 
 FN_DSTOON = (
     'vec3 hal_cb_dstoon(float cs, vec3 A, float hl)\n'
@@ -204,7 +402,13 @@ _FNS = {'PS1_MODULATE': FN_PS1, 'SATURN_ADD': FN_SATURN,
         'PS2_HIGHLIGHT': FN_PS2HL, 'D3D_SEPARATE_SPEC': FN_D3DSPEC,
         'PCX_INTENSITY': FN_PCX, 'DS_TOON': FN_DSTOON,
         'DS_HIGHLIGHT': FN_DSTOON, 'MEGA_DRIVE_SH': FN_SHRAMP,
-        'SUPERFX_PLOT': ''}
+        'SUPERFX_PLOT': '',
+        # R252: the Console Emulation Shader's combines
+        'RENDERWARE_PS2': FN_PS1, 'RENDERWARE_GC': FN_TEV,
+        'RENDERWARE_PC': FN_MOD8, 'DS_DECAL': FN_DSDECAL,
+        'DECAL_ALPHA': FN_DECAL8, 'ADD8_COMBINE': FN_ADD8,
+        'N64_SHADE': FN_N64, 'N64_BLENDRGBA': FN_N64BLEND,
+        'JAGUAR_CRY': FN_JAGUAR, 'THREEDO_PIXC': FN_THREEDO}
 
 
 #: the models whose lines read the corner's ALPHA (the carried channel)
@@ -214,18 +418,28 @@ NEEDS_FETCH4 = frozenset({'PS2_HIGHLIGHT', 'D3D_SEPARATE_SPEC', 'DS_TOON',
                           'DS_HIGHLIGHT', 'MEGA_DRIVE_SH'})
 
 
-def combine_fns(model, consts, vside):
+def combine_fns(model, consts, vside, bake=None):
     """The global GLSL a vertex-rate pass for `model` needs ('' for every
     pre-1.90 model): hal_vlight_fetch4 for the carrying models, then the
-    combine's function."""
+    combine's function. R252: `bake['__console']` carries the Console
+    node's options -- the luma ramp table, the Saturn half, the PCX base,
+    the texture op -- each a different function text."""
+    opts = (bake or {}).get('__console') or {}
     kind = CB.LIGHTING_COMBINE.get(model)
     if kind == 'luma64':
-        return FN_LUMA64
+        return fn_luma_remap(float(opts.get('luma_gamma', 1.0))) + FN_LUMA64
     if kind == 'ds':
         return FN_DS
     fns = ''
     if model in NEEDS_FETCH4:
         fns += FN_VL4_TMPL.replace('{vside}', str(int(vside)))
+    if model == 'SATURN_ADD' and bool(opts.get('saturn_half', False)):
+        return fns + FN_SATURN_HALF
+    if model == 'PCX_INTENSITY' and bool(opts.get('pcx_first', False)):
+        return fns + FN_PCX_FIRST
+    if model == 'D3D_SEPARATE_SPEC' and \
+            str(opts.get('texop', 'MOD')) != 'MOD':
+        return fns + FN_D3DSPEC_OP
     return fns + _FNS.get(model, '')
 
 
@@ -240,21 +454,26 @@ _CORNERS = ['    vec3 hal_c0 = hal_vlight_fetch(hal_vt);',
             '    vec3 hal_c2 = hal_vlight_fetch(hal_vt + 2.0);']
 
 
-def recombine_lines(model, consts, bake):
+def recombine_lines(model, consts, bake, alpha='1.0'):
     """The statements that produce `vec3 total` in a vertex-rate pass:
     `_PLAIN` verbatim for every pre-1.90 model, the machine's combine for
     a period model. Raises core.combine.Refusal for a DS toon table or a
     Super FX plot that cannot run (the probe already gated: this is the
-    belt to its braces)."""
+    belt to its braces). R252: `alpha` is the per-pixel texel alpha
+    expression the decal combines read; `bake['__console']` the Console
+    node's options."""
     from .material import _mv
+    opts = (bake or {}).get('__console') or {}
     kind = CB.LIGHTING_COMBINE.get(model)
     if kind == 'luma64':
         return ['    vec3 total = hal_cb_luma64(hal_vl, s.diffuse);']
     if kind == 'ds':
         return ['    vec3 total = hal_cb_ds(hal_vl, s.diffuse);']
-    if model == 'PS1_MODULATE':
+    if model in ('PS1_MODULATE', 'RENDERWARE_PS2'):
         return ['    vec3 total = hal_cb_ps1(hal_vl, s.diffuse);']
     if model == 'SATURN_ADD':
+        if bool(opts.get('saturn_half', False)):
+            return ['    vec3 total = hal_cb_saturn_half(hal_vl, s.diffuse);']
         return ['    vec3 total = hal_cb_saturn(hal_vl, s.diffuse);']
     if model == 'N64_COMBINE':
         return ['    vec3 total = hal_cb_n64(hal_vl, s.diffuse);']
@@ -263,10 +482,44 @@ def recombine_lines(model, consts, bake):
     if model == 'PS2_HIGHLIGHT':
         return _VL4 + ['    vec3 total = hal_cb_ps2hl(hal_vl4, s.diffuse);']
     if model == 'D3D_SEPARATE_SPEC':
-        return _VL4 + ['    vec3 total = hal_cb_d3dspec(hal_vl4, s.diffuse);']
+        op = str(opts.get('texop', 'MOD'))
+        if op == 'MOD':
+            return _VL4 + ['    vec3 total = hal_cb_d3dspec(hal_vl4, s.diffuse);']
+        if op == 'MOD2X':
+            prod = 'hal_cb_mod8k(hal_vl4.rgb, s.diffuse, 2.0)'
+        elif op == 'MOD4X':
+            prod = 'hal_cb_mod8k(hal_vl4.rgb, s.diffuse, 4.0)'
+        elif op == 'ADD':
+            prod = 'hal_cb_add8(hal_vl4.rgb, s.diffuse)'
+        else:
+            prod = 'hal_cb_addsigned8(hal_vl4.rgb, s.diffuse)'
+        return _VL4 + [f'    vec3 hal_tp = {prod};',
+                       '    vec3 total = hal_tp + vec3(hal_vl4.a);',
+                       '    total = min(total, vec3(1.0));']
     if model == 'PCX_INTENSITY':
-        return _CORNERS + ['    vec3 total = hal_cb_pcx(hal_c0, hal_c1, '
+        fn = 'hal_cb_pcx1' if bool(opts.get('pcx_first', False)) \
+            else 'hal_cb_pcx'
+        return _CORNERS + [f'    vec3 total = {fn}(hal_c0, hal_c1, '
                            'hal_c2, f.bary, s.diffuse);']
+    # ---- R252: the Console Emulation Shader's combines
+    if model == 'RENDERWARE_GC':
+        return ['    vec3 total = hal_cb_tev(hal_vl, s.diffuse);']
+    if model == 'RENDERWARE_PC':
+        return ['    vec3 total = hal_cb_mod8(hal_vl, s.diffuse);']
+    if model == 'DS_DECAL':
+        return [f'    vec3 total = hal_cb_dsdecal(hal_vl, s.diffuse, {alpha});']
+    if model == 'DECAL_ALPHA':
+        return [f'    vec3 total = hal_cb_decal8(hal_vl, s.diffuse, {alpha});']
+    if model == 'ADD8_COMBINE':
+        return ['    vec3 total = hal_cb_add8(hal_vl, s.diffuse);']
+    if model == 'N64_SHADE':
+        return ['    vec3 total = hal_cb_n64(hal_vl, s.diffuse);']
+    if model == 'N64_BLENDRGBA':
+        return [f'    vec3 total = hal_cb_n64blend(hal_vl, s.diffuse, {alpha});']
+    if model == 'JAGUAR_CRY':
+        return ['    vec3 total = hal_cb_jaguar(hal_vl, s.diffuse);']
+    if model == 'THREEDO_PIXC':
+        return ['    vec3 total = hal_cb_threedo(hal_vl, s.diffuse);']
     if model in ('DS_TOON', 'DS_HIGHLIGHT'):
         tab = bake.get('__ds_table') if bake else None
         if tab is None:
