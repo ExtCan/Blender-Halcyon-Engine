@@ -2486,21 +2486,31 @@ def test_render_passes_reach_blender():
     from ..core import render as CR
     from ..core.settings import RenderSettings
 
+    import dataclasses
+
     st = RenderSettings()
     st.resolution_x, st.resolution_y = 120, 90
     st.output_scale = 'NONE'
-    for attr in ('pass_depth', 'pass_normal', 'pass_position', 'pass_uv',
-                 'pass_object_index', 'pass_material_index'):
+    # R253: every pass_* field by introspection (the six data passes, the
+    # three frame passes, the seven light components and the per-lamp
+    # toggle that opens LIGHT_PASS_SLOTS names)
+    pass_fields = sorted(f.name for f in dataclasses.fields(RenderSettings)
+                         if f.name.startswith('pass_'))
+    for attr in pass_fields:
         setattr(st, attr, True)
     wanted = CR.wanted_passes(st)
-    check('all six passes are offered', len(wanted) == 6, str(wanted))
+    check('every pass is offered',
+          len(wanted) == len(pass_fields) - 1 + CR.LIGHT_PASS_SLOTS
+          and len(pass_fields) == 17, f'{len(wanted)} from {pass_fields}')
 
     for aa in (1, 4):
         st.aa_samples = aa
         sc = demo_scene(st)
         R.render(sc, st)
         got = getattr(sc, 'last_passes', None) or {}
-        missing = [n for n in wanted if n not in got]
+        # R253: Beauty is the engine's (the frame it hands to post), not
+        # the renderer's -- test_beauty_pass_is_the_linear_frame covers it
+        missing = [n for n in wanted if n not in got and n != 'Beauty']
         check(f'every requested pass is produced at aa={aa}', not missing,
               ', '.join(missing))
         wrong = [f'{n}{got[n].shape}' for n in got
@@ -2775,10 +2785,13 @@ def test_the_engine_actually_runs():
           ', '.join(same) + ' came out as the beauty render')
 
     # and the extra passes arrive as separate buffers
+    # (R253: the Beauty, Mist and Diffuse passes ride the same road)
     _img, extra, _cap = FB.run_render(
         props, engine, pass_depth=True, pass_normal=True,
-        pass_object_index=True)
-    missing = [n for n in ('Depth', 'Normal', 'IndexOB') if n not in extra]
+        pass_object_index=True, pass_beauty=True, pass_mist=True,
+        pass_diffuse=True)
+    missing = [n for n in ('Depth', 'Normal', 'IndexOB', 'Beauty', 'Mist',
+                           'Diffuse') if n not in extra]
     check('the extra passes are registered and written', not missing,
           ', '.join(missing))
     if 'Depth' in extra:

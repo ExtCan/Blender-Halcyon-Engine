@@ -1004,6 +1004,13 @@ def _plan_sig(job, mkey):
         float(getattr(st, 'fog_bank1_end', 0.0) or 0.0)
         > float(getattr(st, 'fog_bank1_start', 0.0) or 0.0),
         float(getattr(st, 'fog_turbulence', 0.0) or 0.0) > 0.0)
+    # R253: the light-component passes GATE the plan (the refusal below
+    # reads them): a gate the plan reads MUST be in this signature, or a
+    # plan cached with them off walks past the refusal once they flip
+    st_sig = st_sig + tuple(bool(getattr(st, n, False)) for n in (
+        'pass_diffuse', 'pass_specular', 'pass_ambient', 'pass_emission',
+        'pass_shadow', 'pass_ao', 'pass_color', 'pass_lights',
+        'pass_mist', 'pass_environment', 'pass_beauty'))
     world = getattr(scene, 'world', None)
     world_sig = None
     if world is not None:
@@ -1309,6 +1316,18 @@ def plan_frame(job, gbuf, use_cache=True):
     if str(getattr(st, 'shading_rate', 'PIXEL')) not in ('PIXEL', 'VERTEX',
                                                          'FACE'):
         return None, f'the scene shading rate is {st.shading_rate}', {}
+    # R253: the BI light split (Diffuse, Spec, Ambient, Emit, Shadow, AO,
+    # Color, LightNN) reads light_surface's own per-lobe accumulators;
+    # the GLSL loop sums every lamp into one colour and keeps no per-lobe
+    # sums, so a frame asking for any of them shades on the CPU BY NAME
+    # (both devices then draw the same bits). A GLSL twin is MRT, one
+    # target per lobe -- capability.FEATURES['light_passes'] names it
+    from ..core.render import light_pass_names as _lpn
+    _lp = _lpn(st)
+    if _lp:
+        return None, (f"light-component passes ({', '.join(_lp)}) "
+                      'accumulate on the CPU: the GLSL loop keeps no '
+                      'per-lobe sums'), {}
     if str(getattr(st, 'normal_source', 'AUTO')) == 'FACE' and \
             getattr(scene.mesh, 'face_normals', None) is None:
         # FACE left the refusal list with the hal_triaux texture: the

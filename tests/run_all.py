@@ -34,6 +34,8 @@ def run_tests():
     from . import test_r253_region
     # R253: the Halo node
     from . import test_r253_halo_node
+    # R253 (1.92.0): the compositing passes
+    from . import test_r253_compositing
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -155,6 +157,11 @@ def run_tests():
     print('R253 HALO NODE')
     print('=' * 66)
     rc |= test_r253_halo_node.main()
+    print()
+    print('=' * 66)
+    print('R253 COMPOSITING PASSES')
+    print('=' * 66)
+    rc |= test_r253_compositing.main()
     return rc
 
 

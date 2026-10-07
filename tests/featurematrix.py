@@ -2497,6 +2497,17 @@ ROWS = [
      {'use_border': True, 'border_min_x': 0.25, 'border_min_y': 0.2,
       'border_max_x': 0.8, 'border_max_y': 0.9,
       'outline': True, 'outline_width': 3}, 'region_bump'),
+    # R253: the frame passes (bitwise twins by construction) and the BI
+    # light split (the GPU plan refuses by name; both roads land on the
+    # same CPU shade) -- the device-switch test proves the picture, and
+    # rows_covered homes every new pass_* field
+    ('aux passes (frame: mist + env + beauty)',
+     {'pass_mist': True, 'pass_environment': True, 'pass_beauty': True},
+     'demo'),
+    ('aux passes (light split)',
+     {'pass_diffuse': True, 'pass_specular': True, 'pass_ambient': True,
+      'pass_emission': True, 'pass_shadow': True, 'pass_ao': True,
+      'pass_color': True, 'pass_lights': True}, 'demo'),
 ]
 
 

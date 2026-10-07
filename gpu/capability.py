@@ -308,6 +308,21 @@ FEATURES = {
                 "an unbounded per-pixel fragment list needs depth peeling or "
                 "linked lists, which is a different algorithm rather than a "
                 "port of this one"),
+    # R253: the compositing passes
+    'render_passes': (BOTH,
+                      "Depth, Normal, Position, UV, IndexOB, IndexMA, Mist, "
+                      "Env and Beauty come off the CPU-reconstructed G-buffer "
+                      "and the frame itself on both roads (the GPU rasteriser "
+                      "reconstructs the GBuffer, the shading burst only writes "
+                      "the frame) -- measured 0.0 (bitwise) by construction in "
+                      "the fake-device matrix rows"),
+    'light_passes': (NOT_YET,
+                     "the BI light split (Diffuse, Spec, Ambient, Emit, Shadow, "
+                     "AO, Color, per-lamp Light00..07) reads light_surface's "
+                     "own accumulators; a frame asking for any of them shades "
+                     "on the CPU by name (plan_frame refuses), so both devices "
+                     "draw the same bits; a GLSL twin is MRT, one target per "
+                     "lobe -- feasible, not written"),
     # R251 material pack, wave 2 (MAT-B)
     'period_material_nodes': (BOTH,
                               "measured: the REYES micropolygon snap, the TEV / NV2A "
@@ -332,7 +347,11 @@ FEATURES = {
 #: features that force the whole frame onto the CPU when a scene uses them.
 #: code_node left this list when the deferred pass learned to inline it --
 #: a coded-shader scene is no longer forced anywhere
-BLOCKING = ('node_graph', 'rasterise', 'shading_models')
+BLOCKING = ('node_graph', 'rasterise', 'shading_models',
+            # R253: any light-component pass puts the frame's shading on
+            # the CPU (plan_frame refuses by name); the device panel and
+            # plan()'s notes say 'Light Passes -- CPU for now'
+            'light_passes')
 
 
 def supports(feature, device):
@@ -400,6 +419,12 @@ def scene_features(scene, settings):
         used.add('crt')
     if getattr(settings, 'composite', False):
         used.add('composite_ntsc')
+    # R253: the passes a frame asks for
+    from ..core.render import light_pass_names, wanted_passes
+    if wanted_passes(settings):
+        used.add('render_passes')
+    if light_pass_names(settings):
+        used.add('light_passes')
     return used
 
 

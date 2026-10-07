@@ -1280,6 +1280,13 @@ LABELS = {
     'pass_depth': "Depth", 'pass_normal': "Normal",
     'pass_position': "Position", 'pass_uv': "UV",
     'pass_object_index': "Object Index", 'pass_material_index': "Material Index",
+    # R253: the compositing passes
+    'pass_mist': "Mist", 'pass_environment': "Environment",
+    'pass_beauty': "Beauty (Linear)",
+    'pass_diffuse': "Diffuse", 'pass_specular': "Specular",
+    'pass_ambient': "Ambient", 'pass_emission': "Emission",
+    'pass_shadow': "Shadow", 'pass_ao': "Ambient Occlusion",
+    'pass_color': "Color", 'pass_lights': "Per-Lamp Passes",
 }
 
 DESCRIPTIONS = {
@@ -2426,6 +2433,52 @@ DESCRIPTIONS = {
                          "per-object masks downstream",
     'pass_material_index': "Also deliver each pixel's material index, "
                            "for per-material masks downstream",
+    # R253: the compositing passes (Blender Internal's names, so a comp
+    # built for BI drops in)
+    'pass_mist': "Also deliver a Mist pass: the scene Fog curve (Start, End, "
+                 "Mode) on each pixel's camera distance whether or not Fog "
+                 "is on -- 0 near, 1 at the sky; data, like Depth",
+    'pass_environment': "Also deliver an Env pass: the world where the "
+                        "camera saw it -- the sky at uncovered pixels, "
+                        "black under geometry -- before the wires, ink and "
+                        "halos draw over it; the same on both devices",
+    'pass_beauty': "Also deliver a Beauty pass: the linear frame before the "
+                   "post chain -- palette, dither, CRT and signal stages "
+                   "untouched -- next to the finished Combined",
+    'pass_diffuse': "Also deliver a Diffuse pass: every lamp's diffuse sum "
+                    "(after shadow and shadow colour, before the per-lamp "
+                    "clamp). Diffuse + Specular + Ambient + Emission equals "
+                    "the linear beauty for the classic models with Light "
+                    "Clamp 0, Fog off and no traced reflections; any light "
+                    "pass shades the frame on the CPU by name. Cel paint and "
+                    "vertex- or face-rate materials report their whole lit "
+                    "colour here",
+    'pass_specular': "Also deliver a Specular pass (Blender's 'Spec'): "
+                     "every lamp's specular sum, the sheen included -- "
+                     "shades the frame on the CPU by name",
+    'pass_ambient': "Also deliver an Ambient pass: everything before the "
+                    "first lamp -- the ambient term, radiosity, ambient "
+                    "occlusion and the prelight -- shades on the CPU by name",
+    'pass_emission': "Also deliver an Emission pass (Blender's 'Emit'): "
+                     "the material's self-illumination as it joins the "
+                     "beauty -- shades the frame on the CPU by name",
+    'pass_shadow': "Also deliver a Shadow pass: 1 lit, 0 in shadow, averaged "
+                   "over the lamps that cast shadows (1 where a lamp would "
+                   "not light the point at all, so no extra rays are traced); "
+                   "all 1 with Shadows off -- shades on the CPU by name",
+    'pass_ao': "Also deliver an AO pass: the ambient occlusion factor itself, "
+               "following the Ambient Occlusion checkbox and its sliders; "
+               "white when AO is off -- shades the frame on the CPU by name",
+    'pass_color': "Also deliver a Color pass (Blender's 'Color'): the "
+                  "material's diffuse colour times its level before any "
+                  "light, i.e. the texture as the surface shows it -- shades "
+                  "on the CPU by name",
+    'pass_lights': "Also deliver one pass per lamp, Light00..Light07 in lamp "
+                   "order for the first eight selected lamps (diffuse + "
+                   "specular, before the per-lamp clamp; the rest stay "
+                   "black). Eight full-frame colour buffers at the render "
+                   "resolution: costly at high AA -- shades on the CPU by "
+                   "name",
     'debug_pass': "Replace the delivered image with one internal buffer "
                   "-- depth, normals, UVs, overdraw, wireframe -- to see "
                   "what the renderer sees",

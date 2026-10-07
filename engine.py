@@ -581,6 +581,13 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             _release_gpu_frame(settings)
 
         _extra = getattr(scene, 'last_passes', None)
+        # R253: the Beauty pass IS the linear frame post was handed --
+        # palette, dither, CRT and signal stages untouched (the render
+        # resolution's frame; _deliver_passes fits it to Blender's buffer,
+        # and the region crop below cuts it like every other pass)
+        if getattr(settings, 'pass_beauty', False) and image is not None:
+            _extra = dict(_extra or {})
+            _extra['Beauty'] = np.asarray(image, np.float32)
         _size = None
         if _rb is not None:
             # R253: the crop happens LAST -- the post chain ran over the
@@ -1477,7 +1484,23 @@ PASS_SPEC = (
     ("UV", 3, "UVA", 'VECTOR'),
     ("IndexOB", 1, "X", 'VALUE'),
     ("IndexMA", 1, "X", 'VALUE'),
-)
+    # R253: the compositing passes -- Blender Internal 2.79's own names
+    # (render_result.c: Mist, Env, Diffuse, Spec, Shadow, AO, Emit, Color)
+    # so a comp built for BI drops in; Beauty is the linear frame before
+    # the post chain; Light00..Light07 the per-lamp split (a fixed slot
+    # count, so registration needs no scene knowledge)
+    ("Mist", 1, "Z", 'VALUE'),
+    ("Env", 3, "RGB", 'COLOR'),
+    ("Beauty", 4, "RGBA", 'COLOR'),
+    ("Diffuse", 3, "RGB", 'COLOR'),
+    ("Spec", 3, "RGB", 'COLOR'),
+    ("Ambient", 3, "RGB", 'COLOR'),
+    ("Emit", 3, "RGB", 'COLOR'),
+    ("Shadow", 3, "RGB", 'COLOR'),
+    ("AO", 3, "RGB", 'COLOR'),
+    ("Color", 3, "RGB", 'COLOR'),
+) + tuple((f"Light{i:02d}", 3, "RGB", 'COLOR')
+          for i in range(core_render.LIGHT_PASS_SLOTS))
 
 
 # ---------------------------------------------------------------- UI plumbing
@@ -1511,10 +1534,11 @@ FORCED_PANELS = {
     'WORLD_PT_context_world', 'WORLD_PT_viewport_display',
     'RENDER_PT_color_management', 'RENDER_PT_color_management_curves',
 }
-# VIEWLAYER_PT_layer_passes is deliberately *not* forced: it lists Mist,
-# Vector, Denoising Data and the light-component passes, none of which this
-# engine produces. Halcyon has its own Passes panel offering the six it can
-# actually fill, which is the same rule EXCLUDED_PANELS exists for.
+# VIEWLAYER_PT_layer_passes is deliberately *not* forced: it lists Vector
+# and Denoising Data, which this engine does not produce (R253: Mist, Env
+# and the light components ARE produced now, under Blender Internal's own
+# names). Halcyon has its own Passes panel offering exactly the passes it
+# fills, which is the same rule EXCLUDED_PANELS exists for.
 
 _patched = []
 

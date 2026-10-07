@@ -1124,6 +1124,16 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
     # R251 (MAT-A C034): the DS toon pair IS the DS light unit
     model = SH.LOBE_ALIAS.get(model, model)
     n = ctx.n
+    # R253: the light split -- shade_batch asks for it (extras
+    # ['want_split'] = the wanted pass names, or True for all) at the
+    # opaque frame's camera fragments. Every split array is a SEPARATE
+    # accumulator fed the same arrays `out` receives; no arithmetic on
+    # `out` moves, so the beauty stays bitwise with the split off or on
+    _wsn = extras.get('want_split') if extras is not None else None
+    want_split = bool(_wsn)
+    sp_names = set(_wsn) if isinstance(_wsn, (tuple, list, set, frozenset)) \
+        else None
+    sp_ao = None
     N = M.normalize(ctx.N)
     V = -M.normalize(ctx.I)
     if settings.two_sided_lighting:
@@ -1158,6 +1168,12 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
                 V.shape).astype(np.float32)
 
     if model in ('CONSTANT', 'WIREFRAME'):
+        if want_split:
+            # R253: no light evaluated -- the colour is the diffuse, the
+            # shadow and AO read open
+            extras['split'] = _split_unlit(
+                surf, surf.diffuse * surf.diffuse_level[:, None], n,
+                sp_names)
         return surf.diffuse * surf.diffuse_level[:, None] + surf.emission
     if np.any(surf.fixed_shade > 0.5):
         # R252: fixed shading -- no light evaluated (Model 3's fixed
@@ -1171,6 +1187,11 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         pre = np.where((surf.prelit_mode > 0.5)[:, None], surf.prelit, 1.0)
         fixed = base * pre + surf.emission
         if np.all(surf.fixed_shade > 0.5):
+            if want_split:
+                # R253: fixed shading reports its shown colour (texel x
+                # prelight) as Diffuse, so the identity holds
+                extras['split'] = _split_unlit(surf, base * pre, n,
+                                               sp_names, color=base)
             return fixed.astype(np.float32)
         fixed_mask = surf.fixed_shade > 0.5
     else:
@@ -1301,9 +1322,13 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
             amb_col = LI.ambient_light(scene, settings)
             out = surf.diffuse * surf.ambient[:, None] * amb_col[None, :]
         if settings.ambient_occlusion and bvh is not None:
-            out *= ambient_occlusion(ctx.P, N, bvh, settings, rng,
+            # R253: the factor is kept for the AO pass (ONE call, the
+            # same product `out` always took)
+            _aof = ambient_occlusion(ctx.P, N, bvh, settings, rng,
                                      sample_xy=(spx, spy) if have_id
-                                     else None)[:, None]
+                                     else None)
+            out *= _aof[:, None]
+            sp_ao = _aof
 
     # the sheen lobe's falloff, computed once rather than per light
     sheen_exp = None
@@ -1329,6 +1354,40 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         out = out + np.where((surf.prelit_mode > 0.5)[:, None],
                              surf.prelit, 0.0).astype(np.float32)
     clamp = float(settings.light_clamp)
+    # R253: everything before the first lamp IS the Ambient pass (the
+    # ambient term, radiosity, AO, the prelight); the lamp sums and the
+    # Shadow pass's own accum / ir (2.79 shade_only_shadow's shape: the
+    # dark fraction averaged over the lamps that shadow, 1.0 where the
+    # lamp would not light the point -- zero extra rays) live in `sp`
+    _spl = None
+    if want_split:
+        _spl = {'amb': out.copy(), 'diff': np.zeros((n, 3), np.float32),
+                'spec': np.zeros((n, 3), np.float32), 'light': {},
+                'sh_acc': np.zeros(n, np.float32), 'sh_ir': 0.0,
+                'lamps': sp_names is None
+                or any(k.startswith('Light') for k in sp_names)}
+
+    def _sp_add(li_, d_, s_):
+        # one lamp's (diffuse, specular) as `out` receives them (after
+        # vis, shadow colour, lit_mask; BEFORE the per-lamp clamp)
+        _spl['diff'] += d_
+        if s_ is not None:
+            _spl['spec'] += s_
+        if _spl['lamps'] and li_ is not None and li_ < LIGHT_PASS_SLOTS:
+            slot = _spl['light'].get(li_)
+            if slot is None:
+                slot = _spl['light'][li_] = np.zeros((n, 3), np.float32)
+            slot += d_
+            if s_ is not None:
+                slot += s_
+
+    def _sp_shadows(light_):
+        smode_ = light_.shadow if settings.shadow_default == 'PER_LIGHT' \
+            else settings.shadow_default
+        return bool(settings.shadows) and light_.shadow != 'NONE' \
+            and smode_ != 'NONE' \
+            and getattr(light_, 'type', '') != 'HEMI' \
+            and not getattr(light_, 'screen_spot', False)
 
     # ---- the BI panel round's per-material machinery
     bi_ex = surf.bi
@@ -1429,6 +1488,10 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
             # a lamp claimed by some material's EXCLUSIVE group lights
             # nothing else
             continue
+        if want_split and cel_mode == 0 and _sp_shadows(light):
+            # R253: this lamp counts in the Shadow pass's average (its
+            # dark fraction joins below wherever `vis` is read)
+            _spl['sh_ir'] += 1.0
         lit_mask = None
         excl = getattr(light, 'exclude_objects', None)
         if excl and obj_idx is not None:
@@ -1485,6 +1548,8 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
             if lit_mask is not None:
                 ss_t = ss_t * lit_mask[:, None]
             out += ss_t
+            if want_split:
+                _sp_add(li, ss_t, None)                        # R253
             ss_fog = ss_col[None, :] * (ss_en * ss_el)[:, None]
             if lit_mask is not None:
                 ss_fog = ss_fog * lit_mask[:, None]
@@ -1594,6 +1659,16 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         vis = LI.visibility(light, ctx.P, N, L, dist, settings, bvh, rng,
                             sample_xy=(spx, spy, li) if have_id else None,
                             mask=need)
+        if want_split and _sp_shadows(light):
+            # R253: the Shadow pass reads the vis this lamp already
+            # traced -- 1.0 (no darkening) where `need` was False, so the
+            # existing skip logic and the beauty are untouched
+            _dk = (np.float32(1.0) - vis).astype(np.float32)
+            if need is not None:
+                _dk = np.where(need, _dk, np.float32(0.0))
+            if lit_mask is not None:
+                _dk = _dk * lit_mask
+            _spl['sh_acc'] += _dk
         if only_accum is not None:
             smode = light.shadow if settings.shadow_default == 'PER_LIGHT' \
                 else settings.shadow_default
@@ -1644,6 +1719,8 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
                     diff_acc -= lamp_os
                 else:
                     out -= lamp_os
+                if want_split:
+                    _sp_add(li, -lamp_os, None)                # R253
             continue
         if sh_key is not None and light is sh_key:
             # R251 (MAT-A C057): the key lamp's lit fraction, captured
@@ -1716,6 +1793,8 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
             if lit_mask is not None:
                 dcontrib *= lit_mask[:, None]
                 scontrib *= lit_mask[:, None]
+            if want_split:
+                _sp_add(li, dcontrib, scontrib)                # R253
             if track_result:
                 diff_acc += dcontrib
                 spec_acc += scontrib
@@ -1847,6 +1926,8 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         if lit_mask is not None:
             dcontrib *= lit_mask[:, None]
             scontrib *= lit_mask[:, None]
+        if want_split:
+            _sp_add(li, dcontrib, scontrib)                    # R253
         if track_result:
             diff_acc += dcontrib
             spec_acc += scontrib
@@ -1919,6 +2000,11 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         light_part = diff_acc \
             if (extras is not None and extras.get('want_spec')) \
             else diff_acc + spec_acc
+        if want_split:
+            # R253: RESULT ramps, SSS and the world exposure rewrote the
+            # sums -- the split reports what `out` receives
+            _spl['diff'] = np.asarray(diff_acc, np.float32)
+            _spl['spec'] = np.asarray(spec_acc, np.float32)
         if clamp > 0.0:
             light_part = np.minimum(light_part, clamp)
         out += light_part
@@ -1944,6 +2030,8 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
             dcontrib, scontrib = _anime_lamp(surf, wrap_k, vis_key, rad_k,
                                              N, cel_L, V, True,
                                              not suppress_spec)
+            if want_split:
+                _sp_add(None, dcontrib, scontrib)              # R253
             if track_result:
                 diff_acc += dcontrib
                 spec_acc += scontrib
@@ -1996,8 +2084,87 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         out = SH.quantize_lit(out, 31)
     if settings.clamp_specular:
         out = np.minimum(out, 64.0)
+    if want_split:
+        # R253: the non-separable tails -- the cartoon paint and the cel
+        # bands (and their hair shine), a fixed-shade mix, the GX / DS
+        # saturation -- REPLACE the sum: Diffuse then carries whatever is
+        # neither ambient nor specular (cel paint reports as diffuse),
+        # so Diffuse + Spec + Ambient + Emit still equals the beauty
+        if model in ('CARTOON', 'ANIME', 'GX_LIGHT', 'DS_FIXED') \
+                or fixed_mask is not None:
+            _spl['diff'] = (out - _spl['amb'] - _spl['spec']).astype(np.float32)
+        extras['split'] = _split_pack(surf, _spl, sp_ao, n, sp_names)
     out = out + surf.emission
     return apply_surface_effects(out, surf, N, V, rim_field=cel_rim)
+
+
+def _split_pack(surf, sp, sp_ao, n, names):
+    """R253: the light split as pass name -> (n, 3) float32, for the
+    names asked (None = all): the ambient snapshot, the lamp sums, the
+    emission, the Shadow average (1 lit, 0 dark; 1.0 when no lamp
+    shadows), the AO factor (white when AO is off), the material colour
+    and the per-lamp slots (Light00.. zeros where no lamp landed)."""
+    def want(k):
+        return names is None or k in names
+    ones3 = None
+    out = {}
+    if want('Diffuse'):
+        out['Diffuse'] = sp['diff']
+    if want('Spec'):
+        out['Spec'] = sp['spec']
+    if want('Ambient'):
+        out['Ambient'] = sp['amb']
+    if want('Emit'):
+        out['Emit'] = np.broadcast_to(
+            np.asarray(surf.emission, np.float32), (n, 3))
+    if want('Shadow'):
+        ir = float(sp['sh_ir'])
+        if ir > 0.0:
+            sh = (np.float32(1.0) - sp['sh_acc'] / np.float32(ir))
+            sh = np.clip(sh, 0.0, 1.0).astype(np.float32)
+            out['Shadow'] = np.broadcast_to(sh[:, None], (n, 3))
+        else:
+            ones3 = np.ones((n, 3), np.float32)
+            out['Shadow'] = ones3
+    if want('AO'):
+        if sp_ao is not None:
+            out['AO'] = np.broadcast_to(
+                np.asarray(sp_ao, np.float32)[:, None], (n, 3))
+        else:
+            ones3 = np.ones((n, 3), np.float32) if ones3 is None else ones3
+            out['AO'] = ones3
+    if want('Color'):
+        out['Color'] = (surf.diffuse
+                        * surf.diffuse_level[:, None]).astype(np.float32)
+    if sp['lamps']:
+        zeros3 = None
+        for i in range(LIGHT_PASS_SLOTS):
+            k = f'Light{i:02d}'
+            if not want(k):
+                continue
+            slot = sp['light'].get(i)
+            if slot is None:
+                zeros3 = np.zeros((n, 3), np.float32) \
+                    if zeros3 is None else zeros3
+                slot = zeros3
+            out[k] = slot
+    return out
+
+
+def _split_unlit(surf, base, n, names, color=None):
+    """R253: the split of a surface no lamp touched (CONSTANT /
+    WIREFRAME, fixed shading): the shown colour as Diffuse, nothing
+    specular or ambient, the emission as Emit, shadow and AO open."""
+    sp = {'amb': np.zeros((n, 3), np.float32),
+          'diff': np.asarray(base, np.float32),
+          'spec': np.zeros((n, 3), np.float32), 'light': {},
+          'sh_acc': np.zeros(n, np.float32), 'sh_ir': 0.0,
+          'lamps': names is None or any(k.startswith('Light')
+                                        for k in names)}
+    out = _split_pack(surf, sp, None, n, names)
+    if color is not None and 'Color' in out:
+        out['Color'] = np.asarray(color, np.float32)
+    return out
 
 
 def _blend_layer(out, color, f, mode):
@@ -2609,6 +2776,14 @@ class ShadeJob:
         #: in 2.79's preprocess too)
         self.sss_trees = {}
         self.sss_prepass = False
+        #: R253: the light-split sink -- pass name -> float32 (height,
+        #: width, 3) at render resolution, allocated by render() for
+        #: exactly the wanted light passes (None otherwise), written by
+        #: shade_batch at camera fragments while `pass_sink_armed` is set
+        #: (the opaque frame pass only: a transparent layer over a pixel
+        #: must not overwrite the surface the pixel's Combined shows)
+        self.pass_sink = None
+        self.pass_sink_armed = False
 
     def object_bounds(self):
         """Per-object bounding boxes, for Generated texture coordinates.
@@ -3226,6 +3401,20 @@ class ShadeJob:
             surf.backfacing = np.asarray(ctx.backfacing, np.float32)
         extras = {} if (np.any(surf.bi_spectra > 0.0)
                         or np.any(surf.shadows_only > 0.5)) else None
+        # R253: the light split is asked for at the opaque frame's own
+        # camera fragments only -- never a ray hit (px None), a layer, a
+        # vertex corner or the SSS point pass. A non-None extras dict is
+        # neutral by itself: every reader keys off a surf flag or a key
+        # only written when its own flag asked (want_only, want_spec_acc,
+        # want_spec, want_key_lit, spec_acc / only_shadow below)
+        want_split = (self.pass_sink is not None
+                      and getattr(self, 'pass_sink_armed', False)
+                      and ray_depth == 0
+                      and bool(getattr(ctx, 'is_camera_ray', True))
+                      and ctx.px is not None and not self.sss_prepass)
+        if want_split:
+            extras = dict(extras or {})
+            extras['want_split'] = True
         if rate_mode == 'LIGHT':
             # R251 (MAT-A): a refused period item shades as its fallback
             # (DS_FIXED / FLAT) from here on; the carriers ask for the
@@ -3251,6 +3440,15 @@ class ShadeJob:
                             rng if rng is not None else self.rng, self.lights,
                             extras=extras, suppress_spec=self.sss_prepass,
                             sss=sss_arg)
+        if want_split and extras is not None and 'split' in extras:
+            # R253: the split lands in the sink at this batch's pixels
+            # (the sink holds exactly the wanted names; the rest is
+            # dropped here, never computed twice)
+            _sp = extras['split']
+            for _name, _buf in self.pass_sink.items():
+                _v = _sp.get(_name)
+                if _v is not None:
+                    _buf[ctx.py, ctx.px] = np.asarray(_v, np.float32)
         light_alpha = None
         if rate_mode == 'LIGHT' and CB.wants_spec(model):
             # R251 (MAT-A): the carried channel, read BEFORE fog (the DS
@@ -4663,6 +4861,20 @@ def render(scene, settings=None, progress=None, band=None):
     # supersample factor ride on the job for gpu/shade and gpu/sky
     job.vp = vp
     job.ss = ss
+    # R253: the light-split sink -- one (rh, rw, 3) float32 plane per
+    # wanted light pass at RENDER resolution (the cost the Per-Lamp
+    # tooltip names), Shadow and AO starting white (an uncovered or
+    # unlit pixel reads 'lit / open'). Whole-frame roads only: a band
+    # (the pool skips pass frames anyway) and the viewport allocate none
+    _env_rgb = None
+    _lpn = light_pass_names(st) if (band is None and not getattr(
+        st, '_viewport', False)) else ()
+    if _lpn:
+        job.pass_sink = {
+            _pn: np.full((rh, rw, 3),
+                         np.float32(1.0 if _pn in ('Shadow', 'AO') else 0.0),
+                         np.float32)
+            for _pn in _lpn}
     if bool(getattr(st, 'fog', False)) and \
             str(getattr(st, 'fog_color_source', 'FIXED')) == 'BACKDROP':
         # R251 LIGHT-A2 (F008, A30): the backdrop at EVERY pixel, built
@@ -5493,9 +5705,11 @@ def render(scene, settings=None, progress=None, band=None):
                     gbuf.front[fpy, fpx],
                     gbuf.bary_lin[fpy, fpx]
                     if gbuf.bary_lin is not None else None)
+            job.pass_sink_armed = True       # R253: the opaque frame pass
             with ST.track('shade'):
                 col = _shade_all(job, tri_idx, bary, px, py, front, blin, st,
                                  progress=progress)
+            job.pass_sink_armed = False
             img[py, px, :3] = col[:, :3]
             img[py, px, 3] = np.maximum(img[py, px, 3], col[:, 3])
 
@@ -5516,6 +5730,13 @@ def render(scene, settings=None, progress=None, band=None):
         # hole in every non-local stage. Released by name: the post chain
         # uploads the zero-padded frame once and _post_warn says why
         _FR.edited(st, 'render region', 'the context ring is cut on the CPU')
+
+    if 'Env' in wanted_passes(st):
+        # R253: the Env pass -- the sky where the camera saw it (on the
+        # GPU road the readback's sky pixels, the measured twin), taken
+        # BEFORE the wires, the ink, the halos and the lights draw over it
+        _env_rgb = np.where(gbuf.mask()[:, :, None], np.float32(0.0),
+                            img[:, :, :3]).astype(np.float32)
 
     if _wire_active(scene, st, gbuf):
         _FR.edited(st, 'wireframe')
@@ -5673,16 +5894,23 @@ def render(scene, settings=None, progress=None, band=None):
     # Extra passes come off the same G-buffer the beauty image did, before
     # anything downsamples or quantises it.
     depth_m = None
-    if st.dof or 'Depth' in wanted_passes(st) or \
+    _wp = wanted_passes(st)
+    if st.dof or 'Depth' in _wp or 'Mist' in _wp or \
             str(st.aa_mode) in ('EDGE', 'ADAPTIVE'):
         with ST.track('linear depth'):
             depth_m = linear_depth(job, gbuf, eye)
-    scene.last_passes = build_aux_passes(job, gbuf, st, depth_m)
+    scene.last_passes = build_aux_passes(job, gbuf, st, depth_m,
+                                         env_rgb=_env_rgb,
+                                         sink=job.pass_sink, ss=ss,
+                                         out_wh=(W, H))
     if scene.last_passes and ss > 1:
         # data, not colour: averaging a normal or an object index across
         # samples produces a value that was never on any surface, so the
         # top-left sample of each output pixel is taken instead
-        scene.last_passes = {k: v[::ss, ::ss]
+        # (R253: the COLOUR passes -- Env and the light split -- were
+        # resolved through the beauty's own filter in build_aux_passes
+        # and are at output size already; DATA_PASSES keep this rule)
+        scene.last_passes = {k: (v[::ss, ::ss] if k in DATA_PASSES else v)
                              for k, v in scene.last_passes.items()}
 
     # R251 C001: the coverage plane for the post chain's VI stage (1
@@ -6703,6 +6931,13 @@ def _adaptive_refine(scene, st, img, gbuf, mesh, depth_m, progress):
     _saved_cov = getattr(scene, 'last_coverage', None)
     _saved_gel = getattr(scene, 'last_gel', None)       # R251 C134
     acc = img[mask].astype(np.float64)
+    # R253: the COLOUR passes (Env, the light split) average over the
+    # same samples the flagged pixels do, so Diffuse + Spec + Ambient +
+    # Emit keeps summing to the refined beauty; the data passes keep
+    # the base frame's values (a refined normal is no normal)
+    _base_p = _saved[0] or {}
+    _acc_p = {k: v[mask].astype(np.float64) for k, v in _base_p.items()
+              if k not in DATA_PASSES and v.shape[:2] == mask.shape}
     try:
         for k in range(1, n):
             if progress:
@@ -6717,6 +6952,12 @@ def _adaptive_refine(scene, st, img, gbuf, mesh, depth_m, progress):
             st2._stereo = getattr(st, '_stereo', None)      # R251: carried
             st2._pano_strip = getattr(st, '_pano_strip', False)
             acc += render(scene, st2, None, band=None)[mask]
+            _rp = getattr(scene, 'last_passes', None) or {}
+            for _k in list(_acc_p.keys()):
+                if _k in _rp and _rp[_k].shape == _base_p[_k].shape:
+                    _acc_p[_k] += _rp[_k][mask]
+                else:
+                    del _acc_p[_k]          # a refine without it: base kept
     finally:
         (scene.last_passes, scene.last_depth, scene.last_shafts,
          scene.last_flares) = _saved
@@ -6727,6 +6968,13 @@ def _adaptive_refine(scene, st, img, gbuf, mesh, depth_m, progress):
         scene.last_gel = _saved_gel                     # R251 C134
     out = img.copy()
     out[mask] = (acc / float(n)).astype(np.float32)
+    if _acc_p:
+        refined = dict(_base_p)
+        for _k, _v in _acc_p.items():
+            buf = _base_p[_k].copy()
+            buf[mask] = (_v / float(n)).astype(np.float32)
+            refined[_k] = buf
+        scene.last_passes = refined
     return out
 
 
@@ -7209,6 +7457,22 @@ def _shade_interpolated(job, tri_idx, bary, rate, st=None,
     # alpha comes from the PIXEL pass: a cut-out texture's edge is the
     # one thing that must never be interpolated between vertices
     out[:, 3] = alb[:, 3]
+    if job.pass_sink is not None and getattr(job, 'pass_sink_armed', False) \
+            and px is not None:
+        # R253: the corners shaded with no pixel of their own (px None in
+        # shade_vertex_rate), so the split cannot be interpolated per
+        # lobe: a vertex- or face-rate material reports its WHOLE lit
+        # colour as Diffuse (and as Light00), its albedo as Color,
+        # nothing specular / ambient / emissive, shadow and AO open
+        for _name, _buf in job.pass_sink.items():
+            if _name in ('Diffuse', 'Light00'):
+                _buf[py, px] = out[:, :3]
+            elif _name == 'Color':
+                _buf[py, px] = alb[:, :3]
+            elif _name in ('Shadow', 'AO'):
+                _buf[py, px] = np.float32(1.0)
+            else:
+                _buf[py, px] = np.float32(0.0)
     return out
 
 
@@ -11189,10 +11453,61 @@ def wanted_passes(st):
         names.append('IndexOB')
     if getattr(st, 'pass_material_index', False):
         names.append('IndexMA')
+    # R253: the frame passes (G-buffer / frame by-products, both roads
+    # bitwise by construction) and the BI light split (light_surface's
+    # own side accumulators; the GPU plan refuses them by name)
+    if getattr(st, 'pass_mist', False):
+        names.append('Mist')
+    if getattr(st, 'pass_environment', False):
+        names.append('Env')
+    if getattr(st, 'pass_beauty', False):
+        names.append('Beauty')
+    if getattr(st, 'pass_diffuse', False):
+        names.append('Diffuse')
+    if getattr(st, 'pass_specular', False):
+        names.append('Spec')
+    if getattr(st, 'pass_ambient', False):
+        names.append('Ambient')
+    if getattr(st, 'pass_emission', False):
+        names.append('Emit')
+    if getattr(st, 'pass_shadow', False):
+        names.append('Shadow')
+    if getattr(st, 'pass_ao', False):
+        names.append('AO')
+    if getattr(st, 'pass_color', False):
+        names.append('Color')
+    if getattr(st, 'pass_lights', False):
+        names.extend(f'Light{i:02d}' for i in range(LIGHT_PASS_SLOTS))
     return tuple(names)
 
 
-def build_aux_passes(job, gbuf, st, depth_m=None):
+# R253: the BI light split -- Blender Internal 2.79's RenderResult names
+# (render_result.c RE_PASSNAME_DIFFUSE 'Diffuse', _SPEC 'Spec', _SHADOW,
+# _AO, _EMIT, _RGBA 'Color'; Ambient is Halcyon's own, BI folded it into
+# Combined) -- every one read off light_surface's own accumulators, never
+# the frame's arithmetic
+LIGHT_SPLIT_PASSES = ('Diffuse', 'Spec', 'Ambient', 'Emit', 'Shadow', 'AO',
+                      'Color')
+#: fixed so update_render_passes needs no scene knowledge: Light00..Light07
+#: in lamp order, the first eight selected lamps
+LIGHT_PASS_SLOTS = 8
+#: passes that are DATA (top-left sample under supersampling, never
+#: filtered); everything else wanted is COLOUR and resolves through the
+#: CPU's own AA kernel exactly as the beauty does
+DATA_PASSES = ('Depth', 'Normal', 'Position', 'UV', 'IndexOB', 'IndexMA',
+               'Mist')
+
+
+def light_pass_names(st):
+    """The wanted light-component passes (split names + LightNN), in
+    wanted order -- the ONE predicate render(), the GPU plan's refusal,
+    the capability table and the engine share. Empty when none is on."""
+    return tuple(n for n in wanted_passes(st)
+                 if n in LIGHT_SPLIT_PASSES or n.startswith('Light'))
+
+
+def build_aux_passes(job, gbuf, st, depth_m=None, env_rgb=None, sink=None,
+                     ss=1, out_wh=None):
     """Raw data buffers for the compositor, straight off the G-buffer.
 
     These are *data*, so nothing here is display-transformed, dithered or
@@ -11200,6 +11515,17 @@ def build_aux_passes(job, gbuf, st, depth_m=None):
     stays an integer. Uncovered pixels get the conventions Blender's own
     engines use -- 1e10 for depth, zero for everything else -- so a Z pass
     composites the same way a Cycles one does.
+
+    R253: `env_rgb` is the frame's rgb at uncovered pixels (the Env pass,
+    snapshotted by render() before any composite edits the frame), `sink`
+    the ShadeJob's light-split sink (pass name -> (rh, rw, 3) at RENDER
+    resolution), `ss` / `out_wh` the supersample factor and the output
+    size. The COLOUR passes (Env and the split) are resolved here through
+    _resolve -- the CPU's own AA kernel, the same one the beauty takes --
+    so Diffuse + Spec + Ambient + Emit keeps summing to the beauty after
+    the filter; the DATA passes are returned at render resolution and
+    render() takes their top-left sample. 'Beauty' is the engine's (the
+    frame it hands to post), never built here.
     """
     names = wanted_passes(st)
     if not names:
@@ -11212,12 +11538,63 @@ def build_aux_passes(job, gbuf, st, depth_m=None):
     ctx = None
     if py.size and ({'Normal', 'Position', 'UV'} & set(names)):
         ctx = job.context(gbuf.tri[py, px], gbuf.bary[py, px], px, py)
+    ss = max(int(ss or 1), 1)
+    if out_wh is None:
+        out_wh = (w // ss, h // ss)
+    W_o, H_o = int(out_wh[0]), int(out_wh[1])
+
+    def _colour(buf3):
+        # a colour pass takes the beauty's own filter (a 4-channel
+        # shape is what _resolve reads; the alpha lane is discarded)
+        buf4 = np.concatenate(
+            [np.asarray(buf3, np.float32),
+             np.ones((buf3.shape[0], buf3.shape[1], 1), np.float32)],
+            axis=2)
+        return np.ascontiguousarray(
+            _resolve(buf4, W_o, H_o, ss, st)[:, :, :3]).astype(np.float32)
+
     for name in names:
+        if name == 'Beauty':
+            continue                      # the engine's: the frame itself
         if name == 'Depth':
             d = depth_m if depth_m is not None else linear_depth(
                 job, gbuf, getattr(job, 'eye', (0.0, 0.0, 0.0)))
             d = np.where(np.isfinite(d), d, 1e10)
             out[name] = d[:, :, None].astype(np.float32)
+            continue
+        if name == 'Mist':
+            # R253: BI's mist pass (shadeoutput.c mistfactor) on the scene
+            # Fog curve -- core/fog.legacy_curve, the same LINEAR / EXP /
+            # EXP2 / TABLE16 curves the fog reads, on the camera DISTANCE
+            # (legacy_import maps BI mist onto exactly these dials). It
+            # reads the curve, not the Fog toggle: 0 at the near edge,
+            # 1 at the sky, whether or not fog is drawn
+            from . import fog as _FOGP
+            d = depth_m if depth_m is not None else linear_depth(
+                job, gbuf, getattr(job, 'eye', (0.0, 0.0, 0.0)))
+            fin = np.isfinite(d)
+            d32 = np.where(fin, d, 0.0).astype(np.float32)
+            with np.errstate(all='ignore'):
+                curve = np.asarray(_FOGP.legacy_curve(d32, st), np.float32)
+            mist = np.clip(np.float32(1.0) - curve, 0.0, 1.0)
+            mist = np.where(fin, mist, np.float32(1.0)).astype(np.float32)
+            out[name] = mist[:, :, None]
+            continue
+        if name == 'Env':
+            # R253: the world where the camera saw it -- the frame at
+            # uncovered pixels (the sky pass's own pixels on either road),
+            # black under geometry. A COLOUR pass: filtered like the beauty
+            if env_rgb is None:
+                env_rgb = np.zeros((h, w, 3), np.float32)
+            out[name] = _colour(np.where(cov[:, :, None], np.float32(0.0),
+                                         np.asarray(env_rgb, np.float32)))
+            continue
+        if name in LIGHT_SPLIT_PASSES or name.startswith('Light'):
+            # R253: the light split, read from the ShadeJob's sink (filled
+            # by shade_batch at every camera fragment; absent on a road
+            # that allocated none -- a band, the viewport)
+            if sink is not None and name in sink:
+                out[name] = _colour(sink[name])
             continue
         chans = 1 if name in ('IndexOB', 'IndexMA') else 3
         buf = np.zeros((h, w, chans), np.float32)
