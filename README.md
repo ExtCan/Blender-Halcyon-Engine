@@ -67,12 +67,12 @@ without Blender for its 9503-check test suite.
 
 ![the libraries](docs/halcyon_libraries.png)
 
-**At a glance:** 59 shading models · 250 node types evaluated (every shader
-node Blender 5.x offers, plus Halcyon's own 143) · 121 render presets in
+**At a glance:** 59 shading models · 256 node types evaluated (every shader
+node Blender 5.x offers, plus Halcyon's own 149) · 121 render presets in
 eight categories · 143 resolution presets · 114 Pre-Made material templates
 in fourteen families · twelve sky modes, 303 skies, 48 waters, ten infinite
 grounds · real volumes (eight scattering models, mesh containers, voxels) ·
-396 render settings, every one proven to change what it claims · a
+414 render settings, every one proven to change what it claims · a
 9503-check suite that runs without Blender · about 128,000 lines
 of Python and NumPy (201,000 with the tests), no compiled dependencies.
 
@@ -215,7 +215,7 @@ selecting Flat evaluates once per face. That is where the banding and the
 faceting genuinely come from, and it is why they look right instead of merely
 blurry.
 
-**250 node types** are evaluated — 102 of Blender's own, audited against its
+**256 node types** are evaluated — 102 of Blender's own, audited against its
 full surface-node registry, and the audit came back clean: every shader node Blender 5.x offers
 has an evaluator except Freestyle's stroke UV, which has no meaning outside
 Freestyle. That includes the full Principled BSDF, node groups (recursively),
@@ -1628,7 +1628,7 @@ evaluated box. A file that relied on the old world-space box can set
 **Generated Space** (Render ▸ Textures) to *World box (legacy, pre-1.92)*;
 untransformed objects render identically either way.
 
-**396 settings, all exposed, all proven, all explained.** Two tests stand
+**414 settings, all exposed, all proven, all explained.** Two tests stand
 behind that sentence: one holds every setting to a proof that it changes what
 it claims to change (a matrix row, an A/B render, a behavioural check, or a
 declared reason — nothing silently exempt), and one fails the build the moment
@@ -1772,7 +1772,7 @@ texture warp, vertex snapping, A-buffer transparency, ray-traced reflection to
 any depth, node-graph evaluation including group recursion and unknown-node
 fallback, palette colour counts, the full post chain, the generated period
 objects, all 114 templates rendering, all 303 skies applying and differing,
-all 112 presets, every setting's proof, and every tooltip's existence).
+all 121 presets, every setting's proof, and every tooltip's existence).
 Fifteen further modules (`tests/test_r251_*.py`, 1.90) hold the period
 features: each pins its pack's defaults bitwise against the 1.89.0 zip,
 then its laws, its GLSL twins and its refusals by name.
@@ -2546,7 +2546,7 @@ halcyon/
   core/          bpy-free renderer
     mathx.py       vector maths on (N,3) arrays
     scene.py       dataclasses the renderer consumes
-    settings.py    RenderSettings — the 396 knobs
+    settings.py    RenderSettings — the 414 knobs
     raster.py      clipping, z-buffer, watertight edge rules, A-buffer
     bvh.py         binned-SAH BVH, wave traversal, order-free ties
     texture.py     sampling, mips, N64 three-point filter; the period
@@ -2567,7 +2567,7 @@ halcyon/
     reyes.py       the REYES micropolygon grid and its snap (1.90.0)
     srbump_tables.py  the PowerVR2 bump angle tables (1.90.0)
     lights.py      attenuation, shadow maps, PCF, ray shadows, gobos
-    nodeeval.py    250 node types, the bump desugar, the space ramps
+    nodeeval.py    256 node types, the bump desugar, the space ramps
     patterns.py    the integer-hash pattern library, 1D–4D noise
     maxmaps.py     3ds Max's map algorithms on Halcyon's own tables
     bitex.py       the ported Blender Internal texture engine (+ tables)

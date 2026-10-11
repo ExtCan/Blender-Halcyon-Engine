@@ -23,7 +23,7 @@ for its 9503-check test suite.
 
 **Three roads, one engine.**
 
-**The eras.** 112 render presets, each what its target actually did:
+**The eras.** 121 render presets, each what its target actually did:
 Infini-D, Ray Dream, 3D Studio R4 and MAX, trueSpace, LightWave, Imagine,
 POV-Ray, Bryce, Softimage, Alias, RenderMan; VGA, EGA, CGA, the Mac 1-bit and
 8-bit palettes, Amiga OCS/AGA/HAM, Atari ST, PC-98, X68000; PlayStation,
@@ -79,7 +79,7 @@ Internal diffuse/specular matrix, 3ds Max's own eight, and seventeen period
 light units and combiners (GameCube, Sega Model 2 and 3, Nintendo DS,
 PlayStation, Saturn, N64, PS2, Direct3D, PowerVR, Mega Drive, Super FX).
 
-**250 node types** are evaluated — every shader node Blender 5.x offers (the
+**256 node types** are evaluated — every shader node Blender 5.x offers (the
 full Principled BSDF, recursive node groups, every Math and Vector Math
 operation) plus Halcyon's own 143: the master shader with the era's whole bag
 of tricks on one node, 34 procedural textures, the 2D media, thirty utilities
