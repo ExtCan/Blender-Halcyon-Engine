@@ -4,6 +4,903 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
 
 ---
 
+## [1.92.0] — 2026-10-11
+
+### The feature round: render region, cube map world, generated coordinates, converters, passes, the Halo node, mapping, lights, terrain, console presets (R253)
+
+- **What was asked.** "When in camera view, Render ONLY inside of camera of box (option) - Box rendering (Ctrl+B functionality in Halcyon) - Cubemap world type (single image/multi-image) - Generated Coordinate fix (so they don't change as the mesh moves causing a scrolling issue) - Convert to Cartoon/Anime/Game buttons - More Compositing Features and Types - Change the Halo options in the Material tab into a Halo node (with new options) for deeper customization - More Mapping types (Tri-Planar, etc) - More Light options - Expanded Terrain creation tool with map support - Render Presets for the consoles that were given shaders." And, with the 1.91.0 field log: "Add a deep re-read through the new game emulation shader code too after everything, there was a crash when changing the texture option to Modulate 4x in the Game Emulation node's PC fixed function mode."
+- **How the round was built.** Each feature was designed against the real code, implemented on its own branch with its own test module (`tests/test_r253_*.py`, registered in `run_all`) and its own docs-dev fragment (`docs-dev/r253/<feature>.md`: the CHANGELOG, README and Blender-only texts below), merged one at a time with the constraining tests re-run on the merged tree, then reviewed adversarially (three lenses per feature, three refuters per finding) before the version moved. The console-shader re-read the field log asked for is folded into the render-region and cube-map entries (the redefinition guard, the front-end pre-flight, the single CreateInfo hand-over, the GPU HDRI rotation sign) and closed by the final re-read entry at the end.
+
+#### The render region: Ctrl+B for F12 and the viewport, Camera Frame Only
+
+- **What was asked.** "Box rendering (Ctrl+B functionality in Halcyon)"
+  and "when in camera view, render ONLY inside of camera box (option)".
+  Blender already owns the user-facing half -- Ctrl+B (`view3d.render_border`)
+  writes `space_data.use_render_border` / `render_border_*` in a free view
+  and `scene.render.use_border` / `border_min_x..max_y` in camera view,
+  Ctrl+Alt+B clears them, Output > Format shows Render Region and Crop to
+  Render Region (RENDER_PT_format is marked BLENDER_RENDER, so
+  `enable_compatible_panels` already adopts it) -- and Halcyon neither read
+  nor honoured any of it: an F12 with Render Region on handed Blender's
+  border-sized result a full-frame buffer through `np.resize` (the latent
+  scramble is gone with this round). No second operator: Halcyon obeys
+  those exact properties.
+- **One mechanism for both.** `core/render.region_pixels(st, W, H)` turns
+  Blender's fractions (five new `RenderSettings` fields `use_border`,
+  `border_min_x/y`, `border_max_x/y`, derived from `scene.render` at F12 by
+  `engine._settings_from_scene`, never a Halcyon property --
+  `properties._DERIVED_FIELDS`, the `palette_colors` precedent) into an
+  output rect with the pipeline's own truncation on the min edge and a ceil
+  on the max edge (a Pixel Scale render rect is a superset of the output
+  crop); `render()` rasterises the FULL frame on both devices (the G-buffer
+  cache stays keyed without the rect: a cached full frame serves a region
+  frame, a region frame can never poison a full one), masks the shading to
+  the rect plus a context ring (`_region_keep` / `_region_reach`: the band
+  scissor's own rules -- the ink reach, one row for a bump chain, 2N for an
+  interpolated radiosity grid -- plus one ring for the edge tent and two for
+  the adaptive contrast window), marches the volume containers over the
+  same mask, takes the rect's rows as a band takes its own for the
+  see-through raster and composite, and zeroes RGBA outside the rect at the
+  frame's exit (`_apply_region`), returning the FULL-FRAME shape. The post
+  chain therefore runs over a full-frame canvas and every stage that
+  addresses the pixel grid from the origin -- the dither tiles, the CRT
+  mask and scanlines, interlace rows, the N64 / noise hashes, film halftone
+  lattices, codec blocks, every GPU twin's `resolution` uniform -- keeps
+  the whole frame's anchoring by construction, with zero per-stage changes;
+  the crop happens LAST. Bands and the region compose: a pooled band of a
+  region frame is the full frame's rows x rect, `core/parallel.render_parallel`
+  bands only the rect's rows (the size gates judge the rect's pixel count)
+  and places them in a zero canvas, so the pool's pixels stay the
+  in-process pixels.
+- **The GPU road is pure transport, no new GLSL.** `gpu/shade.shade_frame
+  (job, gbuf, region=box)` scissors every material pass and the sky pass to
+  the rect's box (the per-rank scissor road `gpu_scissor` already proved on
+  the driver) and reads back the box alone, scattered into zeros exactly as
+  the sparse ray sweep scatters its hit box; the unshaded-pixel refusal
+  looks inside the box only; the transparent layer passes
+  (`shade_fragments_frame`) take each depth rank's bbox AND the box from
+  `job.region`. The scissored target is released BY NAME right after the
+  readback (`frame.edited(st, 'render region', 'the context ring is cut on
+  the CPU')`): it holds the rect and its shaded context ring, the ring is
+  cut on the CPU side only, and a resident frame would have fed the GPU
+  ink, resolve and post chain pixels the CPU road zeroes -- a device-parity
+  hole in every non-local stage. The post chain uploads the zero-padded
+  frame once and says why. `gpu/shade.simulate(job, gbuf, region=box)` is
+  the headless twin -- the uv
+  grid covers the box's lanes, every lane scatters into a zero frame -- and
+  the self-test's new RENDER REGION section A/Bs the scissored burst
+  against the full frame's box on the driver (bar: bitwise) and the whole
+  render + post chain under the border, CPU device against GPU device.
+- **Two viewport modes, one key.** `preview.region_rect(w, h, frame,
+  border)` (pure, pixel-quantised with Blender's truncation so a zooming
+  camera view does not re-kick drafts) joins `Viewport.want(camera, w, h,
+  rect=)` and the worker's key; the per-frame settings copy carries the
+  rect as the five border fields (`shape_settings` forces the scene's own
+  F12 border OFF for the viewport: the rect comes from the draw side).
+  Border mode (Ctrl+B in a free view: `space_data.render_border_*`; in
+  camera view the scene border mapped INTO the camera frame, Cycles'
+  `get_buffer_params` rule, `preview.border_in_frame`) keeps the post chain
+  over the whole region and parks a region-sized frame with alpha 0
+  outside, so the existing ALPHA_PREMULT blit leaves Blender's background
+  showing through. Camera Frame Only (`viewport_camera_frame`, Performance
+  panel, default off) projects the camera's `view_frame` corners through
+  `view3d_utils.location_3d_to_region_2d` (`engine._view_rect`), crops
+  BEFORE the post chain so the frame's own corner is the pattern origin
+  exactly as an F12 of the frame, parks `Viewport.frame_rect`, and the
+  draw side clears the region to the placeholder colour and blits at the
+  rect (`_draw_texture(tex, w, h, x, y)`, batches keyed on all four). The
+  black-frame guard measures the rect only, so a border change never
+  reads as a blackout.
+- **F12 delivery.** `engine._border_rect` (both edges truncated, the
+  pipeline's own `disprect`) names the region in the header line, the
+  finished picture and every extra pass are cropped after `post.process`,
+  and `_deliver(..., size=(bw, bh))` calls `begin_result(0, 0, bw, bh)` --
+  Blender's own contract for an external engine under `use_border`
+  (`render_result_uncrop` places it in the full frame when Crop to Render
+  Region is off, so no `crop_to_border` field exists in Halcyon) -- with a
+  `len(layer.rect)` guard that prints both sizes and fits to Blender's
+  allocation rather than scramble. The Output tab shows a passive
+  "Render Region: x0..x1 x y0..y1 (cropped | placed in the full frame)"
+  row beside Blender's own checkboxes; the hold cache's fingerprint carries
+  the border automatically; `presets.PRESERVED` keeps the six keys (output
+  plumbing, never a look).
+- **Refuses by name.** A PANO camera and Pano Parts render whole and are
+  cropped after the stitch (`[Halcyon] render region: the panorama camera
+  renders whole and is cropped after the stitch`, once per frame): a strip
+  of the drum has no rect meaning. The Fuzz / Thin Wall blends read the
+  finished frame's neighbouring rows layer upon layer, so no finite ring
+  holds: the frame renders whole and is cropped, printed once (`the Fuzz /
+  Thin Wall blend reads neighbouring pixels of the finished frame`), the
+  worker-pool gate's own precedent.
+- **Stated tolerance.** Every per-pixel stage is bitwise the full frame's
+  rect on both devices. The non-local post stages (glow, star, lens / lamp
+  flares, DOF, shafts, the NTSC / tape filters, the codec blocks) see zeros
+  past the rect edge and are region-local within their own kernel radius
+  of the edge -- exactly as Cycles' compositor sees only the border -- and
+  deeper inside agree to within the running-sum box blur's float rounding
+  (at most one 1/255 step after the 8-bit quantisation; pinned at 1/255 for
+  glow radius 4 beyond 14 px, 1e-4 for the NTSC chroma blur beyond 12 px).
+  The GPU reflection sweeps and the environment composite still spawn
+  rays for every reflective pixel of the frame (cost, not pixels: the box
+  is cut after).
+- **Tests.** `tests/test_r253_region.py` (15 headings, 127 checks):
+  `region_pixels` rounding / clamps / None cases and the keep mask + box;
+  the bitwise pin on the demo at 160x120 for plain, 2x2 supersampled (box
+  and triangle filters), ink width 3, a ShaderNodeBump chain, EDGE and
+  ADAPTIVE AA, radiosity spacing 2, Thin Wall, Fuzz (whole-then-crop, the
+  line counted), A-buffer and Sorted see-through, transparent film, a
+  corner rect, the full-frame border identity and the six defaults;
+  `last_depth` / `last_passes` / `last_coverage` / `last_cvg` /
+  `last_shafts` / `last_flares` full-frame; bands and the pool (640x480,
+  bitwise; a too-short rect declines with a reason); the post chain over
+  the zero-padded canvas (CRT aperture / slot / shadow, 16-bit Bayer, noise
+  and N64 noise dither, interlace, the display transform, Super Black, an
+  8-bit palette) bitwise over the rect and the glow / NTSC tolerance both
+  held and shown real; the GLSL simulator region twin (plain and bump)
+  bitwise inside the box, zero outside; the GPU device's headless fallback
+  equal with the verdict naming the driver; PANO and Pano Parts by name;
+  SBS stereo (zero and parted eyes, the squeezed rect) and ACCUMULATE 4;
+  `region_rect` / `border_in_frame`; the viewport's border mode (draft and
+  refine sizes, the parked frame = render()+post of the bordered settings,
+  alpha 0 outside, re-kick on a changed rect only, rect None = the pre-R253
+  frames and key byte for byte) and camera-frame mode (rect-sized frame,
+  `frame_rect`, post over the cropped render, the guard over the rect
+  only); the engine's F12 delivery through fakeblender (header line,
+  `begin_result` at the border size, the buffer and the Depth pass = the
+  full delivery's rect, `_settings_from_scene`, preview thumbnails ignore
+  the border, Pixel Scale superset, the `len(rect)` guard); the settings
+  plumbing (derived fields, no generated property, the tooltip, PRESERVED,
+  `apply_preset`, the hold fingerprint, the panels, copy / as_dict /
+  apply). `tests/featurematrix.py` gains two rows (`render region quarter`,
+  `render region + ink + bump` on the new `region_bump` scene) so both
+  devices prove fallback equality and the five fields have a matrix home;
+  `INFRA` names `viewport_camera_frame`. Constraining tests re-run green:
+  bands rejoin, the worker pool, the headless viewport, the performance
+  shape, the black guard and the device switch, the caches, every setting
+  does what it says (235 checks), the tooltips, no setting lies, the
+  presets, the version stamps, stereo, the panorama, pano parts, the whole
+  feature matrix fallback, the R252 console module (146 checks).
+
+- **The console shader re-read (asked for with the field log, done after
+  the feature).** Every GLSL text the Console Emulation Shader can emit --
+  2940 machine x type x option x rate configurations, 8766 pass sources
+  (opaque, height pre-pass, secondary), plus the 301 matrix rows' 839
+  sources and the 51 stage / ink / sky / resolve texts -- was run through
+  the redefinition guard and Halcyon's own GLSL front-end. Three things
+  came out. (1) A REGRESSION from the 1.91.0 crash fix: the guard
+  `gpu/device.duplicate_definitions` counted the `vec4 hal_ltex(int t);`
+  PROTOTYPE the assembler writes ahead of the area-lamp functions as a
+  second definition, so on a driver every material pass of every scene
+  with an AREA lamp refused by name ("defines hal_ltex more than once")
+  and the whole frame shaded on the CPU -- invisible headless (no driver,
+  no compile). The guard now reads bodies only (`)...{`); pinned in
+  `test_glsl_texts_define_each_function_once` (a prototype + its body is
+  not a duplicate, a real repeat behind a prototype still is, the area
+  scene's passes carry none). (2) The 3DO PIXC twin's `floor(lum * 8.0 +
+  0.5)` was one expression -- an FMA on a contracting driver, the house
+  rule's one-op-per-statement slip; split (`gpu/combine.FN_THREEDO`), the
+  simulator twin stays d == 0.0. (3) A front-end PRE-FLIGHT
+  (`gpu/device.preflight`, switch `PREFLIGHT`): every dynamic pass (the
+  materials, the ink, the sky, the resolve variants, the radiosity grid)
+  is parsed by `shaders/compiler.try_compile` on the render worker before
+  the main-thread crossing; a text the twin grammar rejects is refused BY
+  NAME with the front-end's error and the frame shades on the CPU, instead
+  of a driver 'Shader Compile Error' -- the class the 1.91.0 log shows the
+  application dying right after. ~45 ms once per distinct text, nothing
+  on a repeat. The other field fatal in the same log (an access violation
+  inside the preview thread's `_background_image` after a Super FX plan
+  refusal, a pure-NumPy path over owned arrays) is not reproduced headless
+  and stays OPEN: a Python-side plan refusal makes no driver call, so the
+  corruption is upstream of that frame.
+
+#### The Cube Map world
+
+- **What was asked.** A cube map world: the 1990s skybox, six square faces
+  around the camera, loaded from one packed image (a cross or a strip) or
+  from six files named the OpenGL or the Quake / Half-Life way, with the
+  Blender Z-up mapping, a per-face turn / mirror, nearest or bilinear
+  sampling INSIDE a face and never across a seam, the world's Rotation,
+  Tint and Strength -- on both devices.
+- **The mode.** `CUBEMAP` is appended at the END of `core/sky.MODES` and of
+  `HalcyonWorldSettings.mode` (positional numbering: every saved file keeps
+  its mode). `core/sky.py` carries the whole law in one `# R253 cube map`
+  section: `CUBE_LAYOUTS` (horizontal cross 4x3 with +Y on top, -X +Z +X -Z
+  across, -Y below; the HDRShop vertical cross 3x4 with -Z at the bottom
+  turned 180 degrees; the 6:1 and 1:6 strips in GL face order),
+  `cube_layout_auto` (4:3 / 3:4 / 6:1 / 1:6 by aspect), `CUBE_CONVENTIONS`
+  (slot -> GL face, quarter turns, mirror: OpenGL is the identity; Quake 2
+  is derived from ref_gl/gl_warp.c's suffix order {rt, bk, lf, ft, up, dn},
+  its `st_to_vec` table and MakeSkyVec's `t = 1 - t` -- rt at +X, lf at +Y,
+  up at +Z, dn at -Z, bk at -X, ft at -Y in Blender's Z-up frame, every
+  Quake face mirrored against GL's because GL's faces are defined from
+  outside the cube and Quake's are painted for the inside, up and dn turned),
+  `cube_atlas` (the six faces as ONE (6S, S) float32 texture in GL face
+  order, each moved into the canonical GL orientation by `np.rot90` /
+  `np.fliplr` -- exact texel permutations, no arithmetic -- cached four deep
+  by source identity, shape, prep tag and every dial; a hit re-checks the
+  source arrays by identity so a recycled id never serves a stale atlas),
+  `cube_face_uv` (OpenGL 4.6 core profile section 8.13, table 8.19, on the
+  direction swapped to GL axes as gl = (x, z, -y): Blender +X -X +Y -Y +Z -Z
+  land on GL faces 0 1 5 4 2 3; ties X over Y over Z), `cube_sample`
+  (`Texture._sample_nearest` / `_sample_bilinear` with every tap clamped to
+  the face's own [0, S-1] texels and offset by face * S -- the seam law:
+  NEAREST shows the era's hard edge, BILINEAR a half-texel gutter, never a
+  blend of two faces), `cubemap` (the texel times `env_tint`, exactly as
+  `hdri()` tints; the solid colour without an atlas, hdri's rule) and
+  `cube_set_from_path` (one face file -> the six paths and the convention:
+  `rt..ft` with or without an underscore, `_px.._nz`, `posx..negz`,
+  `_right.._back`, the file's own case kept). The single image rides the
+  shared `env_image` slot exactly as the Cylinder Sky's does; the six-image
+  mode uses six new `World.cube_image_*` slots, exported on the `env_image`
+  road (Linear) through one `export._world_image` helper. `evaluate()`
+  dispatches `elif mode == 'CUBEMAP'` after LW_GRADIENT: an environment
+  like HDRI -- reflections and ray misses see the cube texel along any
+  direction (unlike the Cylinder backdrop). The world's existing Rotation
+  spins it (no second dial), Strength multiplies after the tint.
+- **The GPU road** (`gpu/sky.py`): `MODE_CUBE = 9`, one PARAMS texel
+  `hal_sky_cube = (S, filter, 0)` appended LAST, the atlas uploaded through
+  the existing `hal_sky_env` sampler by `plan()`'s own env block (no new
+  sampler, no new push constant -- the pinned interface holds). The GLSL
+  `hal_sky_sample_cube` is the op-for-op transcription of `cube_face_uv` +
+  `cube_sample`, dispatched in `main()` after the mode-8 branch and before
+  the strength multiply; the ground-fog tail is untouched. Bitwise in the
+  simulator at the function level (4006 directions, both filters) and on
+  the frame for NEAREST under every rig and rotation; BILINEAR on the frame
+  is within 4e-6 (the ray build's own ulps under the suite's NumPy, which
+  the shipped HDRI / GRADIENT twins of `test_gpu_sky_pass` show at the
+  same 10-13 pixels on the pristine tree; a wrong face or a crossed seam
+  would be a whole texel). The fake device draws the SINGLE and the SIX
+  frames' sky pixels bitwise the CPU device's. Refused by name, printed
+  once through `gpu/sky._warn` at the console line, when 6 * S would
+  exceed the driver's texture height (`CUBE_ATLAS_MAX_HEIGHT` 16384, the
+  field's GL_MAX_TEXTURE_SIZE floor: faces above 2730 px stay on the CPU);
+  a missing image folds both roads to the flat colour x strength (MODE_FLAT,
+  bitwise) and a malformed one (a 5x3-cell cross, six faces of two sizes,
+  a non-square face, an empty slot) prints ONE `[Halcyon] cube map: ...`
+  line naming the size or the slot and draws the flat colour -- not a
+  refusal, the frame still draws. `gpu/shade._env_world` names CUBEMAP
+  among the rich modes: a reflective material under a skybox takes the
+  exact CPU-composite road (`('CPU',)`). The console line names the mode
+  (`_sky_names` 7 cylinder sky, 8 gradient backdrop, 9 cube map).
+- **Pre-existing, fixed on the way (gpu/sky.py `plan`).** The GPU HDRI sky
+  spun the OTHER way under a non-zero World Rotation since 1.89.0: the
+  shader's `x*c - y*s, x*s + y*c` is `sky._rotate_z`'s text for the angle
+  -rotation, but the params texel carried (cos(rot), sin(rot)); every
+  uncovered GPU pixel of a rotated HDRI differed from the CPU's (GRADIENT /
+  BANDS / LW_GRADIENT read only d.z, so the sign never showed; no direction
+  mode had been twinned with a rotation). The texel now carries
+  (cos(-rot), sin(-rot)) and the HDRI NEAREST twin under rotation 0.3 is
+  bitwise (`test_cube_gpu_twin` pins it; it was 0.71 at every pixel).
+- **The panel** (`ui.HALCYON_PT_world.draw`): Source (Single Image / Six
+  Images); under Single the Image slot and the Layout (Auto by Aspect, the
+  two crosses, the two strips); under Six a `Load Six Faces...` button
+  (`HALCYON_OT_cube_load_six`, the sky-file browser pattern: pick ONE face
+  file and the other five are found by suffix, the convention set from the
+  family, the missing ones reported by name) and six Image slots labelled
+  in the convention's own words (+X .. -Z or rt .. ft); then Convention,
+  Filter, Tint, and a Face Orientation box with a quarter-turn and a
+  Mirror per slot (`cube_face_rot` IntVectorProperty(6), `cube_face_flip`
+  BoolVectorProperty(6) -- sizes that are now a file-format promise). Not
+  in the show_ground list: an environment, like HDRI. Every new property
+  carries a >= 40-char tooltip, every enum item a >= 12-char line.
+- **Presets.** `presets/skies.EXCLUDED` gains every `cube_*` field (the six
+  image slots foremost): a skybox belongs to its images, a sky file never
+  carries an ImageBuffer, and applying a Bryce preset never clears a loaded
+  skybox.
+- **Nodes.** No node is added; `export.NODE_PROPS` is untouched (the node
+  rules are vacuous for this feature).
+- **Neutrality.** Every new World field defaults inert (`cube_source`
+  SINGLE, `cube_layout` AUTO, `cube_convention` OPENGL, `cube_filter`
+  NEAREST, zero turns, no mirrors, six empty slots); `hal_sky_cube` is the
+  last PARAMS texel and no pre-existing mode sets it; an HDRI frame is
+  bitwise `hdri()`'s own evaluation along `_background_image`'s rays; a
+  GRADIENT / HDRI / SOLID frame with every cube dial changed and six slots
+  filled is bitwise the default frame (`test_cube_neutrality`).
+- **Stand-ins and open items.** The Quake 2 / Half-Life orientation table
+  is derived from gl_warp.c and pinned by gradient corners headless; only a
+  real `*rt/lf/up/dn/bk/ft` set in Blender proves it is not mirrored or
+  turned on one face. An 8-bit TGA skybox decodes through `prepare_textures`
+  as env_image does (Linear ImageBuffer), the same brightness HDRI mode gives
+  such a file. A 2048-px face set is a 403 MB float32 atlas beside its
+  sources. The field's nearest-texel cliffs: a ray an ulp off on the driver
+  flips a whole texel, HDRI's stance -- counted by name, not a seam bug.
+  Adjacent and out of scope: `_env_world` still sends a CYLINDER /
+  LW_GRADIENT world with an env_image down the NODES fall-through (the
+  image reflected as EQUIRECT where the CPU reflects the flat colour).
+- **Tests.** `tests/test_r253_cubemap.py` (registered after the R252 block
+  in `tests/run_all.py`): eleven tests, 140 checks -- the face rule and the
+  function-level GLSL twin, the four layouts and AUTO, the six-image road
+  under both conventions with the gl_warp.c corners, the per-face
+  orientation and the cache, the seams (a 401-sample sweep across a seam
+  reads only the two edge texels; BILINEAR clamps), rotation / tint /
+  strength, the GPU twin (three rigs x two filters bitwise at rotation 0,
+  three rotations, the SIX road, MODE_FLAT without an image, the height
+  refusal sentence, the fake device on both roads, the content key), the
+  reflections, the wiring under fakebpy, the neutrality of every
+  default, and the console-shader driver-strictness sweep of the deep
+  re-read below (151 combos). `tests/test_render.py::test_sky_modes` excludes CUBEMAP beside
+  HDRI (no image -> the solid colour by design; `- 3`).
+
+#### Generated coordinates follow the object
+
+- **Generated coordinates follow the object (R253).** What was asked: a
+  procedural texture (Marble, Noise, Bozo, any pattern node with an
+  unlinked Vector, Texture Coordinate ▸ Generated) slid across a mesh
+  whenever the object was moved, turned, scaled or animated. Blender's
+  Generated output is the mesh's *texture space* — the object-space
+  bounding box (`BKE_mesh_texspace_calc`, auto texspace) or the mesh's
+  manual Texture Space (Cycles `mesh_texture_space`: `loc - size ..
+  loc + size`; 2.79 Internal's TEXCO_ORCO) — so it never changes with the
+  object transform. Halcyon measured it over the WORLD box of the exported
+  (already transformed) vertices: a translation kept the box glued, but a
+  rotation or a scale reshaped the world AABB, and that was the scroll.
+  Now the exporter measures the box on the UNTRANSFORMED vertex array
+  (`export._mesh_arrays` → `gen_bounds`, honouring `use_auto_texspace` /
+  `texspace_location` / `texspace_size` behind a getattr guard, carried on
+  `ObjectInfo.gen_bounds` through `_info_object`'s new optional third
+  argument and the mesh cache's `data`), and the renderer takes every
+  surface point back into its object's frame through the per-object
+  inverse matrix R243 already ships to both devices before normalising:
+  `core/mathx.object_space_points` is the ONE chain (the sequential float32
+  sum the GLSL simulator's `dot` evaluates — bitwise the simulator and
+  bitwise the einsum the Texture Coordinate Object output ran before, 200k
+  points, 0 ULP — so the Object output shares it and no picture moves),
+  `ShadeJob.object_generated_frame` the per-object (lo, span) table (the
+  exported box; at an identity matrix the world rows verbatim; else the
+  object's vertices taken back through its inverse and boxed — hand-built
+  scenes), `ShadeJob._object_space` the per-object transform without an
+  (n,4,4) temporary, and `context()` the switch. On the GPU
+  `gpu/material._generated_frame` bakes the object box as `hal_lgen_lo` /
+  `hal_lgen_span` (the same `_bounds_fns` if-chain the world table uses)
+  and emits `hal_generated = (vec3(dot(hal_obj_r0(td.y), vec4(P, 1.0)),
+  …) - hal_lgen_lo(td.y)) / hal_lgen_span(td.y)` in both `assemble_frame`
+  and the bump height pre-pass; `_object_frame(need_rows=True)` emits the
+  three `hal_obj_rN` rows exactly ONCE per pass whether Generated, the
+  Object output or both read them (`gpu/device.duplicate_definitions`
+  stays silent). The twin is BITWISE in the simulator at the function level
+  (the generated line compiled standalone on the context's own P and
+  object ids: 0.0 over every triangle) and 1.8e-5 at the frame level on a
+  moved + turned + non-uniformly scaled ball (the R243 bar of 6e-3 stands
+  for a driver's FMA fusion of the three dots). The WORLD table
+  `hal_gen_lo` / `hal_gen_span` stays for the cartoon centre (`hal_ccen`)
+  and the hair-shine azimuth (`hal_hcen`): they measure a direction from
+  the world point to the world centre and are right as they are, exactly
+  as the CPU keeps `ctx.obj_bounds` world; only the shine's height term
+  (Generated.z) follows the object now, on both devices. **Default
+  neutrality:** untransformed objects are bitwise the 1.91 numbers (the
+  identity inverse returns P bit for bit, the local box IS the world rows)
+  — proved on contexts and on whole frames (a Generated marble, the
+  textured demo card, a bump pre-pass); transformed objects change BY
+  DESIGN. `generated_space` (Render ▸ Textures, "Generated Space") is the
+  escape hatch: OBJECT (default, Blender's rule) or WORLD, the pre-1.92
+  text verbatim on both devices, in `_plan_sig` because the bake reads it.
+  Stand-ins / divergences kept on purpose: Halcyon keeps its `max(hi - lo,
+  1e-6)` clamp for a flat axis (Blender's texspace gives such an axis size
+  1, so a plane's Generated.z would be 0.5) so a flat ground plane with a
+  3-D Noise renders as before; the auto path measures the EVALUATED mesh,
+  so an armature or shape-key deformation still breathes the box slightly
+  where Blender keeps the undeformed texspace; volumes (`core/volume.py`)
+  still measure Generated over the container's world AABB; the Blur node's
+  `_shifted_ctx` still adds a world-space delta (CPU-only node). Refuses by
+  name: `'generated coordinates need the per-object frame the caller did
+  not supply'` (no `obj_gen`), the legacy road's bounds refusal and
+  `_object_frame`'s matrices refusal unchanged.
+- **Tests.** `tests/test_r253_generated_coords.py` (88 checks: the one
+  chain bitwise the simulator dot and the einsum; Generated follows a
+  moved + turned + scaled ball within 2.4e-7, the exported box road, a
+  pure translation, the legacy formula bitwise and its 0.448 scroll;
+  identity contexts and frames bitwise under OBJECT and WORLD; the GPU twin
+  on moved objects — the pass, Object + Generated in one pass with the rows
+  once, the standalone generated line bitwise, the legacy text verbatim,
+  the plan-signature flip; the bump pre-pass twin 4.5e-4; the manual
+  texture space 0.25..0.75 and its literals; the cartoon centre bitwise
+  unchanged with `hal_ccen` from `hal_gen_lo(`; the export road on
+  bpy-free fakes — `_mesh_arrays`, texspace on/off, `_info_object`
+  two- and three-argument, `export_scene` of a moved cube; the setting's
+  surface, the refusals by name, prewarm and an object-less scene),
+  registered in `run_all` after the R252 block; `test_render.py` gains the
+  `generated_space` A/B row (a DIFF on a moved marble ball, since identity
+  scenes are EQUAL by design) in `test_every_setting_does_what_it_says`.
+  The constraining tests hold: `test_generated_coords_are_per_object`,
+  `test_period_patterns_shade_on_the_gpu` (the 26 pattern twins),
+  `test_cartoon_shader_gpu_parity` / `test_anime_80s_gpu_parity` (the
+  pinned names), `test_max_shelf_completion` (the R243 Object-output twin
+  on moved objects), `test_bump_glass_layers_shade_on_the_gpu`,
+  `test_blender5_socket_names_and_volume_chains`,
+  `test_light_edit_fast_paths`, `test_glsl_node_emitters_match_cpu`,
+  `test_generated_glsl_is_driver_strict`, `test_no_duplicate_definitions`,
+  the two tooltip sweeps, `test_r252_console` (146).
+
+#### Convert to Anime / Cartoon / Game
+
+- **What was asked.** "Add Convert to Anime, Convert to Cartoon and
+  Convert to Game buttons next to the Halcyon Shader and Blender Internal
+  ones, with the same relink-not-reset behaviour, and a way to choose the
+  anime style, the cartoon era and the console; converting an existing
+  Halcyon Shader material should work too." 'Game' is the Console
+  Emulation Shader, the only game-hardware node; the menu says "Game
+  (Console Emulation)" and the enum id is `CONSOLE`.
+- **Nine buttons, one operator.** The Material panel's converter box
+  (`ui.HALCYON_PT_material.draw`) grows three blocks after the BI one,
+  drawn by `ui._draw_convert_target`: *To Anime Shader* (with the scene's
+  Style and Compatibility menus), *To Cartoon Shader* (its Era) and *To
+  Game (Console)* (its machine), each with This Material / Selected /
+  Scene on `halcyon.convert_to_node` (`convert.HALCYON_OT_convert_to_node`,
+  a `target` enum and the three scopes; the scene choices ride on its
+  string properties the way `model` rides on the master conversion, so
+  no enum is duplicated). This Material reconverts (force) when the tree
+  already holds the target node, as the master's own button does. The two
+  existing operators are untouched; the three master buttons and the
+  three BI buttons keep their pinned counts.
+- **The scene's choices** are four new `HalcyonSettings` properties
+  (`convert_anime_style`, `convert_anime_compat`, `convert_cartoon_era`,
+  `convert_console`) -- UI state beside `convert_detection`, never a
+  render setting (`to_settings` iterates `RenderSettings`' fields, so a
+  saved scene renders byte-identically; `test_old_scenes_render_identically`
+  proves it through the engine stub). Each is a static tuple with a
+  default, reading the node's own menu: `ANIME_STYLE_ITEMS`,
+  `CARTOON_ERA_ITEMS`, `core/console.CONSOLE_ITEMS` and the Anime
+  Shader's compat menu, which is **hoisted** to
+  `core/shading.ANIME_COMPAT_ITEMS` (seven entries, same identifiers,
+  same order, texts verbatim) so the node and the setting read one tuple
+  and a saved file's compat value keeps its meaning.
+- **The decision is bpy-free** (`core/convert.plan_for`), in the master
+  shader's socket vocabulary: `plan()` turns any source into master-named
+  pairs and extras, `TARGET_MAP` turns those into the target's sockets
+  (the Toon BSDF's Size / Smooth become the first shadow band's threshold
+  / softness, the master's Rim Light colour the Rim Color, the console the
+  identity over the 21 names it shares), and what a target lacks is
+  dropped and the first drops reported by name ("IOR has no anime
+  equivalent"). **The emission is the one place the targets differ**: the
+  cel nodes own an Emission Strength socket that multiplies
+  Self-Illumination in the evaluator (`core/nodeeval.py`), so colour AND
+  strength travel straight -- Blender 4's white emission at strength 0
+  lands as colour x 0 = black, no multiply node, no burn; the console has
+  no strength socket, so the master's fold and its multiply-node markers
+  apply (`convert._carry` is the master's pairs / extras / scale_links
+  surgery parameterised on the node). Per target: **Anime** -- Style and
+  Compatibility set (compat first, then style, whose preset is applied
+  explicitly), a Principled roughness under *Custom* becomes a Specular
+  Size through `anime_specular_size` (a STAND-IN curve, 0.9 / sqrt(gloss)
+  clamped 0.02..0.5: the cel highlight is a painted shape, not a lobe),
+  metal lifts the Specular Level and says "feed a metal matcap for the
+  HoYo look"; **Cartoon** -- the Era set, an Emission shader becomes flat
+  paint (Shadow Amount 0, Lamp Influence 0); **Game** -- the machine set
+  (its type and options at the machine's defaults, editable on the node),
+  Glossiness clamped to `CONSOLE_GLOSS_MAX` 128 (the DS shininess table
+  and the GX / Model 3 exponents top out there -- GBATEK, the GX API
+  reference), the `bi_plan` metal move (highlight tinted with the base
+  colour, level >= 0.8), and a Vertex Color / Attribute node feeding Base
+  Color becomes the machine's OWN material source instead of a texture
+  chain: `Vertex Color` linked at Mix 1.0 with GX_SRC_VTX on the GameCube
+  (`gc_material_src 'VTX'`, Nintendo GX API reference GX_SetChanCtrl),
+  D3DRS_COLORVERTEX / GL_COLOR_MATERIAL on PC fixed-function
+  (`pc_color_vertex`, Direct3D 7-9 docs), G_LIGHTING off on the N64
+  (`n64_type 'VERTEX'`, gbi.h). **A chosen Style / Era owns its sockets**
+  (`STYLE_OWNED` / `ERA_OWNED`, derived at import from the presets): a
+  CONSTANT the conversion would write there yields to the preset (noted
+  by name), a LINKED chain always carries -- it is the artist's network.
+- **The engine's own nodes are sources** (`core/convert.HALCYON_SOURCES`:
+  the master, the Console, Anime, Cartoon and BI nodes in the master
+  vocabulary, modelled on `migrate_master_node`'s travel by socket name;
+  BI's Specular Hardness 1..511 is a Glossiness, per the 2.79 manual).
+  `plan()` falls back to that table, so *Convert This Material* on an
+  Anime / Cartoon / BI / Console material -- to any target, the master
+  included -- now carries by name where it used to carry only the generic
+  colour-and-normal pair; a cel node's Emission Strength folds on the way
+  back to the master (the fold now runs for every source in
+  `_EMIT_COLOR`, which gained the two cel nodes). A behaviour change for
+  that one button, called out here; nothing pinned it. A source naming
+  its own Glossiness no longer has its Roughness socket re-derive one.
+- **The slot list and the header** count a converted cel material: the
+  UIList used to label an Anime / Cartoon material "not converted"
+  (`ui.material_state` now returns "Anime <style>" / "Cartoon <era>"; the
+  panel header's `has_master` tuple names both nodes).
+- **The alpha predicate sees the cel nodes.** `export._alpha_reason`
+  reads Opacity on the Anime, Cartoon and Console nodes (and the
+  console's Edge Opacity) exactly as it reads the master's -- linked, or
+  below 1.0, is see-through by name. Neutral at the nodes' default 1.0
+  unlinked; a converted semi-transparent Principled is the first thing
+  that reaches it. A user file that already set a cel Opacity below 1 was
+  classified opaque before and takes the see-through layer plan now
+  (correctly), on both devices; a per-pixel alpha there may now be named
+  by the GPU layer refusals as a master material's would.
+- **GPU story.** Nothing in `gpu/` changes and no renderer code is added:
+  a conversion edits a node tree, and the converted material renders
+  through the target node's existing two-road implementation (the Anime
+  twin at < 6e-3, the Cartoon twin with its refusals by name, the Console
+  twin per machine / type) -- `test_anime_shader_gpu_parity`,
+  `test_cartoon_shader_gpu_parity` and `test_r252_console.test_gpu_parity`
+  re-run unchanged.
+- **Tests.** `tests/test_r253_convert_buttons.py` (123 checks): the
+  tables against the real SOCKETS tuples, the three plans, the engine
+  nodes as sources, the surgery and the operator on a fake tree built
+  from the real socket tables with the real `apply_style` / `apply_era`
+  bound in, the scene props and the panel (its drawing recorded on a fake
+  layout), the alpha predicate for the three nodes, and default
+  neutrality (a byte-identical frame before and after, the default
+  `RenderSettings` unchanged, the master converter's pinned fold cases
+  through the new lookup). Constraining tests re-run green:
+  `test_material_conversion_plan`,
+  `test_the_converter_stops_burning_materials_white`,
+  `test_convert_to_blender_internal`,
+  `test_convert_shader_detection_option`,
+  `test_enum_callback_default_rule`,
+  `test_every_setting_has_a_detailed_tooltip`, `test_tooltips_everywhere`,
+  `test_material_panel_visibility`,
+  `test_a_blend_mode_alone_does_not_make_a_material_see_through`,
+  `test_every_version_stamp_agrees`, `test_max_shelf_completion`, the two
+  cel parity tests and `test_r252_console.test_node_and_migration` /
+  `test_gpu_parity`.
+
+#### Compositing: Mist, Env, Beauty, the light split, per-lamp passes
+
+- **What was asked.** "More Compositing Features and Types": more of the
+  buffers Blender's compositor can read beside Combined. 'Compositing' in
+  Halcyon is the Passes panel (`ui.HALCYON_PT_passes`), the engine's
+  `update_render_passes` / `PASS_SPEC` and `core/render.build_aux_passes`;
+  the Composite Video chain (`HALCYON_PT_composite`, `core/signal_*`) is
+  the NTSC/PAL scan-out stage and is untouched.
+- **Eighteen new passes, Blender Internal 2.79's own names** (`render_
+  result.c`: `Mist`, `Env`, `Diffuse`, `Spec`, `Ambient`, `Emit`,
+  `Shadow`, `AO`, `Color`), so a comp built for BI drops in exactly as
+  the six existing data passes follow Blender's (`Depth`, `Normal`,
+  `Position`, `UV`, `IndexOB`, `IndexMA`). Eleven new settings, all
+  `False` by default (`core/settings.py` `pass_mist`, `pass_environment`,
+  `pass_beauty`, `pass_diffuse`, `pass_specular`, `pass_ambient`,
+  `pass_emission`, `pass_shadow`, `pass_ao`, `pass_color`,
+  `pass_lights`); `pass_lights` opens eight fixed slots
+  `Light00..Light07` (`core/render.LIGHT_PASS_SLOTS`), the first eight
+  selected lamps in lamp order. `core/render.wanted_passes` reads each
+  field by name; `light_pass_names` is the one predicate `render()`, the
+  GPU plan, the capability table and the engine share; `engine.PASS_SPEC`
+  declares every name (Mist 1ch `Z` VALUE, Beauty 4ch `RGBA` COLOR, the
+  rest 3ch `RGB` COLOR); `properties.LABELS` / `DESCRIPTIONS` carry a
+  label and a tooltip of 40+ characters each; the Passes panel gains
+  Frame and Light columns and a corrected note.
+- **Three frame passes, bitwise twins by construction.** `Mist` is BI's
+  mist (`shadeoutput.c mistfactor`) as the scene Fog curve
+  (`core/fog.legacy_curve`: LINEAR / EXP / EXP2 / TABLE16 on Fog Start /
+  End / Density, the dials `legacy_import` maps BI mist onto) on the
+  camera distance -- 0 near, 1 at the sky, read from the curve whether or
+  not Fog is drawn (`build_aux_passes`). `Env` is the world where the
+  camera saw it: the frame at uncovered pixels, black under geometry,
+  snapshotted in `render()` right after the shadow mask and BEFORE the
+  wires, ink, halos and volumetric lights draw over the sky. `Beauty` is
+  the linear frame `engine.render` hands to `post.process`, delivered
+  beside the finished Combined (palette, dither, CRT and signal stages
+  untouched). All three come off the CPU-reconstructed G-buffer and the
+  frame itself on both roads (`gpu/craster.raster_into_gbuffer`
+  reconstructs the GBuffer; the GPU shading burst only writes the frame),
+  recorded as `capability.FEATURES['render_passes']` = BOTH, measured 0.0
+  by construction in the fake-device matrix row `aux passes (frame: mist
+  + env + beauty)`.
+- **The BI light split, read from `light_surface`'s own accumulators.**
+  `ShadeJob.pass_sink` (one `(rh, rw, 3)` float32 plane per wanted name,
+  allocated by `render()` for whole-frame roads) is written by
+  `shade_batch` at the opaque frame's camera fragments only
+  (`pass_sink_armed` around `_shade_all`: never a ray hit, a transparent
+  layer, a vertex corner or the SSS point pass). `light_surface` fills
+  `extras['split']` from SEPARATE arrays fed the very `dcontrib` /
+  `scontrib` `out` receives (after vis, shadow colour and lit_mask,
+  before the per-lamp clamp) at the ANIME, generic, cel-key, screen-spot
+  and Only-Shadow sites; `Ambient` is `out` before the first lamp (the
+  ambient term, radiosity, AO, the prelight); `AO` the
+  `ambient_occlusion()` factor captured from the ONE existing call (white
+  when AO is off); `Emit` the emission as it joins; `Color` the diffuse
+  times its level; `Shadow` 1 lit / 0 dark averaged over the lamps that
+  shadow (2.79 `shade_only_shadow`'s accum / ir shape), reading the `vis`
+  each lamp already traced and 1.0 where `need` was False -- zero extra
+  rays, the existing skip logic untouched. The tracked road (RESULT
+  ramps, SSS, world exposure) reports the rewritten `diff_acc` /
+  `spec_acc`; the non-separable tails (cartoon paint, cel bands and hair
+  shine, fixed-shade mixes, the GX / DS saturation) report
+  `out - Ambient - Spec` as Diffuse so the identity holds; vertex- and
+  face-rate materials (`_shade_interpolated`) report their WHOLE lit
+  colour as Diffuse (and Light00), their albedo as Color. Colour passes
+  (Env and the split) resolve through `_resolve`, the CPU's own AA
+  kernel, so **Diffuse + Spec + Ambient + Emit + Env == the linear beauty
+  at every pixel through the supersample filter** (measured 2.4e-7); the
+  data passes keep the top-left-sample rule (`DATA_PASSES`). Adaptive AA
+  refine passes average the colour passes with the frame
+  (`_adaptive_refine`), so the identity holds at `aa_mode ADAPTIVE` too.
+- **Device story.** Any light-component pass puts the frame's shading on
+  the CPU BY NAME: `gpu/shade.plan_frame` returns `light-component
+  passes (<names>) accumulate on the CPU: the GLSL loop keeps no per-lobe
+  sums`, printed per frame by `render()` as `[Halcyon GPU] shading on
+  the CPU: ...` and recorded in `LAST_GPU_VERDICT`; the eleven flags join
+  `_plan_sig` so a cached valid plan cannot walk past the refusal (the
+  R78 lesson, pinned through a warm cache). `capability.FEATURES
+  ['light_passes']` = NOT_YET names the GLSL twin (MRT, one target per
+  lobe); `scene_features` adds `light_passes` and `BLOCKING` lists it, so
+  `capability.plan`'s notes and the device panel say "Light Passes -- CPU
+  for now". Both devices draw the same bits (matrix row `aux passes
+  (light split)`).
+- **Bitwise-neutral at the defaults, proven.** Every pass on vs every
+  pass off is `np.array_equal` on the demo scene, on a variant with
+  traced soft shadows + ambient occlusion + raytracing, and on BI
+  materials that already share the extras dict (a RESULT ramp,
+  Transparency > Specular, a Shadows Only catcher). A non-None extras
+  dict is neutral by itself: every reader keys off a surf flag or a key
+  only written when its own flag asked.
+- **Out of scope, by name.** Vector / motion (no previous-frame
+  transforms are exported), Cryptomatte (the manifest contract; IndexOB /
+  IndexMA + ID Mask cover masks), Ink and Halo passes (the composites
+  return only the edited frame), DiffInd / GlossInd (radiosity replaces
+  the ambient term and is reported inside Ambient), Reflect (traced
+  reflections join the beauty only). The identity holds for the classic
+  models with Light Clamp 0, Fog off, no traced reflections and no
+  Gamma-2 sample blend; Shadow reads 1.0 where a lamp would not light
+  the point (BI's `shade_only_shadow` traced every point); IndexOB stays
+  the export order (unchanged, two R251 tests depend on it); the
+  per-lamp sink costs eight full-frame planes at render resolution.
+- **Stale claims corrected.** The `debug_pass` comment in
+  `core/settings.py` (DIFFUSE | SPECULAR | AMBIENT | SHADOW were never
+  DEBUG_PASS items), the engine's `VIEWLAYER_PT_layer_passes` note and
+  the Passes panel note (Mist and the light components ARE produced now;
+  Vector and Denoising Data are the remaining reasons the panel stays
+  hidden).
+- **Tests.** `tests/test_r253_compositing.py` (11 tests, 107 checks):
+  `test_light_passes_sum_to_the_beauty` (aa 1 and 4), `test_light_passes_
+  are_bitwise_neutral` (5 scene variants + the defaults),
+  `test_shadow_pass_content`, `test_mist_pass_content` (LINEAR exact, EXP,
+  Fog on == off), `test_ao_and_color_passes`, `test_per_light_passes_sum_
+  to_the_lamps`, `test_rate_shaded_and_adaptive_frames_keep_the_identity`,
+  `test_light_passes_refuse_the_gpu_by_name` (warm cache, the GPU device
+  bit for bit with every pass buffer), `test_pass_panel_and_table_text`,
+  `test_beauty_pass_is_the_linear_frame` (fake engine, EGA),
+  `test_passes_survive_the_sub_render_roads` (panorama, parallax stereo,
+  accumulate). Updated: `test_render_passes_reach_blender` (every
+  `pass_*` field by introspection, 17 fields / 24 names), `test_the_
+  engine_actually_runs` (Beauty, Mist, Diffuse through fakeblender); two
+  new `featurematrix.ROWS`.
+
+#### The Halo node
+
+- **What was asked.** Move the Material tab's halo kit into a proper
+  shader node, so the glow's colour, size and ramp can be driven by
+  sockets and the kit can keep growing; add a halo shape (falloff)
+  menu, blend modes, a depth-sorting choice and per-halo size.
+- **What was built.** `nodes/shader_nodes.HALCYON_HaloNode` (Shading
+  family, icon PARTICLES): 17 input sockets (Color, Size, Alpha, Add,
+  Edge Color, Ramp, Ring/Line/Ray/Bolt Color, Fade Near/Far, Stretch,
+  Stretch Angle, Glow Size/Strength/Color) with `HALO_SOCKET_DOCS`
+  tooltips applied at creation and at load (`ensure_sockets` also grows
+  any socket a saved node lacks), and the ~50 kit properties the panel
+  carried -- hardness, seed, rings/lines/star and their counts and
+  widths, the 12 silhouettes, the image, noise, bolts, rays, gradient,
+  aspect/rotation, the random HSV scatter and the HSV shift, pulse /
+  flicker / spin and the per-effect clocks, the four 2.79 mode bits --
+  every default equal to the panel's so a migrated material is value
+  identical. `draw_buttons` pages them (`ui_page`: Core / Trim / Energy
+  / Colour / Motion / Advanced). New with the node: `falloff` (BI
+  hardness ladder, Gaussian, Linear, Quadratic, Hard disc, Ring Only
+  with `ring_inner`), `blend` (Add Slider, Alpha Over, Additive,
+  Screen), `depth_mode` (Z-Buffer, Over Everything), `animate_seed`,
+  camera-distance Fade Near/Far, an anamorphic Stretch along a screen
+  angle, a second Gaussian Glow layer, and per-halo Size from exactly
+  three link sources (Attribute = a POINT float attribute, Color
+  Attribute = a POINT layer's red channel, Particle Info > Size); any
+  other link on Size, or on a colour/value socket other than an
+  RGB/Value node, warns by name and the socket value is used.
+  `export.py`: `halo_node_of`, `material_is_halo`, `_halo_socket_value`,
+  `_halo_size_source_of_node`, `_halo_sizes_from`, `_halo_spec_from_node`
+  (the panel road's exact dict keys and arithmetic plus the new keys)
+  and `_halo_spec_from_panel` (the old block, factored unchanged);
+  `export_material` reads the node first and the panel only as the
+  deprecated fallback; `_collect_halo_points` / `_collect_extra_halos`
+  gate on `material_is_halo` and fill the group's `'sizes'` array
+  (CORNER-domain attributes refused by name). `core/render._draw_halos`:
+  the seed walks with the frame, the camera distance rides each halo
+  for the fade, the pixel window and the halo frame became closures
+  (`_window` / `_frame`) so Stretch and the Glow can widen the rect,
+  `_halo_falloff`, `_halo_stretch` and `_halo_blend` are the new
+  module helpers, Over Everything skips the z-test and the old
+  near-geometry softening, and the glow composites before the core
+  with the same blend and depth rule. Every new key is read with
+  `spec.get(key, default)` and gated at its default, so an old spec
+  dict takes the pre-R253 path bit for bit. Migration:
+  `shader_nodes.migrate_halo_material` runs at load_post (before the
+  socket pass) and from `legacy_import` and the new
+  `HALCYON_OT_halo_node` operator: it copies `HALO_PANEL_MAP` value for
+  value, turns the R200 'unset follows Line Colour' contract into the
+  Ray/Bolt Own Colour toggles via `is_property_set`, relinks a
+  `__halo_ramp` widget into Ramp, lands the output on an unlinked
+  Surface only, and clears `hs.halo` so the node is the one source of
+  truth. The Material tab shows the node by name, or the deprecated
+  legacy kit with a Convert button, or the Add Halo Node button; the
+  `halo` checkbox is no longer drawn (the panel path is
+  creation-locked; the 52 `halo_*` properties stay registered as the
+  deprecated carrier so old files load).
+- **Sources.** Blender 2.79 `convertblender.c make_render_halos`,
+  `renderdatabase.c RE_inithalo`, `shadeoutput.c shadeHaloFloat`,
+  `rendercore.c addalphaAddfacFloat`; the 2.79 and 2.4x manuals' Halo
+  pages; Reeves 1983 (additive Gaussian sprites); Porter & Duff 1984
+  and the PDF Reference 1.7 section 11.3.5 (Screen); GL_ARB_point_sprite
+  / D3D point sprites (per-point size, the depth-test-off overlay).
+- **Stand-ins / refusals by name.** Halos remain a CPU splat over the
+  finished frame on BOTH devices (no halo code in `gpu/`): the frame
+  leaves the GPU at `'halos'` as before, `gpu/capability.FEATURES`
+  gains the non-blocking `halo_splat` (NOT_YET) row that says so,
+  `gpu/emit.REFUSED['HALCYON_HaloNode']` refuses the node by name if it
+  is ever wired as a surface, and `core/nodeeval.DISPATCH` names it the
+  same way (`_n_named`, an empty `Halo` closure). Socket links resolve
+  to constants only (RGB / Value nodes) -- a texture chain cannot be
+  evaluated per halo at export and says so. The glow layer under a Soft
+  halo is z-tested, not soft-faded. Glow Size clamps at 8, Stretch at
+  20 (window cost).
+- **Tests.** `tests/test_r253_halo_node.py` (8 tests, 128 checks):
+  registration / family / icon / tooltips / NODE_PROPS / panel-map
+  defaults; the node spec equals the panel spec on all 46 shared keys,
+  Own Colour gating, the 32x4 ramp LUT, RGB/Value constants, named
+  warnings, `size_source` from Attribute / Particle Info; node wins
+  over panel and the panel dict is the pre-R253 dict key for key;
+  migration on a fake tree (52 values, toggles, ramp, Surface,
+  idempotence, linked Surface kept, muted-node pick); headless splat:
+  new keys at defaults `array_equal` with the old road (also around
+  live soft/aspect/rotation/trim), every option speaks, Add 0 / Add 1
+  bitwise ALPHA / ADDITIVE, OVER draws the buried point, SCREEN never
+  passes white where ADDITIVE does, Stretch widens along its angle,
+  per-halo sizes, determinism; attribute sizes from a stub mesh (POINT
+  float, POINT colour red channel, CORNER refused, missing warned);
+  refusal by name on both roads; the Material tab / operator sources
+  and the operator on fake materials. `tests/test_render.py`:
+  NOT_SHADING gains `ui_page`, the socket-doc table and the
+  `ensure_sockets` count gain `HALO_SOCKET_DOCS`, and
+  `test_halo_materials`' neutral kit pins the twelve new keys at their
+  defaults bitwise on the old road.
+
+#### Only Blender can show
+
+What headless cannot prove, per feature (the fakebpy / fakeblender stubs validate arities, icons, shapes and the pure arithmetic; the items below need a running Blender and, where named, a real driver):
+
+*The render region: Ctrl+B for F12 and the viewport, Camera Frame Only.*
+
+- `begin_result(0, 0, bw, bh)` under `scene.render.use_border` with and
+  without `use_crop_to_border`: the picture landing in the right place, no
+  scramble, the extra passes aligned, and the `len(RenderPass.rect)`
+  semantics (floats vs pixels) of the delivery guard.
+- The camera-frame rectangle from `view_frame` corners through
+  `view3d_utils.location_3d_to_region_2d` matching Blender's drawn
+  passepartout at every `view_camera_zoom` / `view_camera_offset` / Lock
+  Camera to View state (a 1-px halo at the frame edge is possible until
+  tuned), and the clear + offset blit leaving the viewport background
+  outside the frame.
+- Ctrl+B / Ctrl+Alt+B in a free view (`space_data.use_render_border`) and
+  in camera view (`scene.render.use_border` relative to the frame)
+  re-kicking the worker and drawing only the box, with Blender's own
+  background showing through the alpha-0 outside; Blender's own dashed
+  border overlay over the blit; Film > Transparent against the alpha-0
+  outside.
+- The scissored GPU readback on a real driver: the self-test's RENDER
+  REGION section (shade_frame(region) bitwise against the full frame's
+  box, the scissor + `read_color` region path on Vulkan and OpenGL
+  backends, the named release of the scissored target and the post
+  chain's one upload under the border).
+- The Output tab showing Blender's Render Region / Crop to Render Region
+  checkboxes next to the new status row, and the Performance panel's
+  Camera Frame Only toggle.
+- Pixel Scale (2X..4X / GBA Mode 5 / 3DO 2X) with a border: the render
+  rect is computed at render resolution and the crop at output resolution
+  (ceil on the max edge keeps the render a superset; a 1-px drift at the
+  right / top edge is possible).
+
+*The Cube Map world.*
+
+- The six template_ID slots, their convention labels and the Face
+  Orientation rows drawing in the World panel (fakebpy has no layout).
+- `HALCYON_OT_cube_load_six`'s file browser, `bpy.data.images.load(path,
+  check_existing=True)` of the six files, and that the loaded images reach
+  the exporter with pixels (compat.image_pixels).
+- A real Quake 2 / Half-Life skybox set rendering the right way round (the
+  gl_warp.c-derived orientation table: every face mirrored, up / dn turned).
+- The brightness of an 8-bit skybox under Blender's colour management
+  (ImageBuffer colorspace 'Linear' like env_image).
+- The real driver's division / floor roundings at nearest-texel cliffs, the
+  upload of a 6S-tall atlas near GL_MAX_TEXTURE_SIZE on the field's cards,
+  and the VRAM of a 2048-face skybox.
+- The console lines `[Halcyon GPU] sky: cube map drawn in the shading burst`,
+  the once-printed `[Halcyon] cube map: ...` layout / slot messages and the
+  height-limit refusal appearing in Blender's system console.
+- The GPU HDRI sky under a non-zero Rotation now matching the CPU's on a
+  real driver (the pre-existing sign fix).
+
+*Generated coordinates follow the object.*
+
+- That `Mesh.use_auto_texspace` / `texspace_location` / `texspace_size`
+  are readable on the evaluated mesh `compat.evaluated_meshes` hands out in
+  Blender 4.x / 5.x (the getattr guard falls back to the vertex box if not).
+- That the mesh cache (`export._cache_key`, keyed on the object token and
+  the matrix) serves a fresh `gen_bounds` after a manual Texture Space
+  edit with no geometry change (if the data token does not bump on that
+  edit, fold the texspace triple into the token).
+- That a procedural texture stays glued while dragging / animating an
+  object in the live viewport preview, and how visible the breathing of
+  the evaluated box is under an armature or shape-key deformation.
+- The real-driver tolerance of the three `dot()` products (FMA fusion)
+  versus the simulator's bitwise chain on NVIDIA / AMD / Intel; the
+  integer-hash patterns can amplify a 1-ULP seam at a cell boundary
+  (the same exposure R243's `hal_object` already has).
+- Loading a pre-1.92 .blend: `generated_space` is absent from the
+  PropertyGroup and resolves to the OBJECT default (enum items only added,
+  no migration needed).
+- The Textures panel row renders and the tooltip reads in the UI.
+
+*Convert to Anime / Cartoon / Game.*
+
+- EnumProperty update callbacks firing on setattr inside the operator
+  (`style` -> `apply_style`, `era` -> `apply_era`, `console` ->
+  `refresh_sockets`) and the socket hide flags they set; headless, the
+  explicit `apply_*` calls and a stubbed `refresh_sockets` stand in.
+- `tree.links.new` between real socket types (an Image Texture RGBA into
+  NodeSocketColor, a Normal Map VECTOR into NodeSocketVector, a Vertex
+  Color RGBA into 'Vertex Color') and Blender's refusal of invalid pairs;
+  the real `ShaderNodeMix` multiply node's socket identifiers.
+- The panel layout: three aligned buttons per row at the default
+  properties-editor width (labels kept to This Material / Selected /
+  Scene), the choice rows' dropdown widths, the UIList's new
+  "Anime <style>" / "Cartoon <era>" labels and the header switching to
+  "Halcyon Shader" with the CHECKMARK icon for a cel material.
+- Undo of a conversion (REGISTER / UNDO) restoring the muted source and
+  the removed links.
+- The `depsgraph_update_post` pristine-material watcher
+  (`convert._halcyon_default_material`) not re-firing on a freshly
+  converted cel material.
+- A converted semi-transparent Anime / Cartoon / Console material taking
+  the see-through layer plan on a real render, CPU and GPU, including
+  the GPU layer refusal text when its alpha is per-pixel.
+- Viewport preview redraw after the conversion.
+
+*Compositing: Mist, Env, Beauty, the light split, per-lamp passes.*
+
+- `RenderEngine.register_pass` accepting the new names and channel ids
+  (Mist 1ch 'Z', Beauty 4ch 'RGBA', Env / the split 3ch 'RGB', the eight
+  LightNN) and the Render Layers node showing one socket per registered
+  pass.
+- `rect.foreach_set` sizes for 1-, 3- and 4-channel passes on a real
+  RenderResult (fakeblender's FakePass only mimics the shape).
+- The Image Editor's pass dropdown showing Beauty as untouched linear
+  colour next to a palette-quantised Combined under an EGA preset.
+- The `[Halcyon GPU] shading on the CPU: light-component passes (...)`
+  line in the real console on a GPU-device F12 with a driver present
+  (headless, the device probe refuses first and the verdict carries the
+  probe's reason; the plan's refusal is pinned through `plan_frame`
+  directly), and the device panel row "Light Passes -- CPU for now".
+- Per-lamp pass memory at production resolution and AA (eight
+  `(rh, rw, 3)` float32 planes) on a real machine.
+- Material preview renders (`is_preview`) with passes enabled on the
+  scene -- `update_render_passes` is called with the preview scene and
+  must not throw.
+- Animation renders: passes delivered every frame with the plan cache
+  warm across frames; the Beauty buffer's `post.fit_to` under a border
+  or a resized output.
+
+*The Halo node.*
+
+- The node's draw_buttons paging, the template_ID image picker on a
+  node, and the socket tooltips as Blender renders them (fakebpy
+  validates arities and icons only).
+- `migrate_halo_material` inside a real load_post: the use_nodes flip,
+  node creation, `__halo_ramp` relinking, output Surface linking, and
+  the file's dirty state afterwards; a PointerProperty image assigned
+  on a node at load.
+- `HALCYON_OT_halo_node` from the Material tab (operator context, undo)
+  and the panel's three states (node / legacy kit / button).
+- Live re-render on node edits through the depsgraph (engine.py covers
+  ShaderNodeTree ids; an image swap on the node is the untested case).
+- Per-halo Size from a real mesh float attribute, a POINT-domain colour
+  attribute, and Particle Info > Size on a Blender 5.x particle system
+  (the legacy particle API may be absent).
+- The exported ramp LUT from a real ColorRamp linked into Ramp
+  (`cr.evaluate` on a live node).
+- The GPU road in the field: the deferred frame leaving the GPU at
+  'halos' and the post warning line once per frame (headless uses the
+  fake device).
+- Blender's own validation of a Node class with ~52 annotated
+  properties and a 12-item EnumProperty at register_class.
+
+---
+
 ## [1.91.0] — 2026-10-07
 
 ### The Console Emulation Shader, the master menu's classics, RenderWare (R252)

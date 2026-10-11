@@ -102,13 +102,17 @@ container: per-channel Beer-Lambert, single scatter from the scene's own
 lamps and shadows (god rays included), eight scattering models, mesh-shaped
 containers, voxels, smoke grids, and the cel dials for stylized fog.
 
-**Eleven sky modes** — node tree, solid, gradient, banded, starfield, Preetham,
-HDRI, a full Bryce Sky Lab, the painted backdrop, Doom's Cylinder Sky and
-LightWave's Gradient Backdrop — with **303 sky
+**Twelve sky modes** — node tree, solid, gradient, banded, starfield, Preetham,
+HDRI, a full Bryce Sky Lab, the painted backdrop, Doom's Cylinder Sky,
+LightWave's Gradient Backdrop and the 1990s Cube Map skybox (one cross or
+strip image, or six files named the OpenGL or Quake way) — with **303 sky
 presets** in a thumbnail gallery, **48 water presets**, and **ten infinite
 grounds**: nine that answer the scene's lighting, and the SNES's Mode 7
 floor, which is unlit. Weather, a seven-landform terrain
-generator, halo materials and lens flares against the frame's own depth.
+generator, the Halo node's glow sprites and lens flares against the frame's
+own depth. Blender's Ctrl+B render region works for F12 and the viewport, and
+the compositor gets Blender Internal's pass set: Mist, Env, Beauty, Diffuse,
+Spec, Ambient, Emit, Shadow, AO, Color and per-lamp passes.
 
 **Output that lands in the right decade.** Colour depth from 32-bit down to
 1-bit, real VGA, Macintosh, EGA, CGA and web-safe palettes, four adaptive
