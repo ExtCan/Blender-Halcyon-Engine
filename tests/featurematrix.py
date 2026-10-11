@@ -679,6 +679,94 @@ def _sc_screen_spot(st):
     return sc
 
 
+# ---- R253 light options: the seven lamp scenes, every one the demo scene
+# plus (or with) one lamp carrying ONE of the new dials
+
+def _sc_square_spot(st):
+    """R253 (A): the R251 cone-law spot (a BLENDER cone) with the Square
+    flag -- the beam lights a square patch of the floor."""
+    sc = _sc_spot_law(st, 'BLENDER')
+    sc.lights[-1].spot_square = True
+    return sc
+
+
+def _sc_spec_tint(st):
+    """R253 (B): the demo scene with the Fill lamp's highlight tinted red
+    (GL_SPECULAR / dcvSpecular); the diffuse keeps the lamp colour."""
+    sc = demo_scene(st, with_texture=False)
+    for l in sc.lights:
+        if l.type == 'POINT':
+            l.specular_color = (1.0, 0.15, 0.1)
+    return sc
+
+
+def _sc_hemi_ground(st):
+    """R253 (C): one HEMI with a warm sky colour and a cool ground colour
+    (Rost 9.1's two-tone hemisphere), nothing else lighting."""
+    sc = demo_scene(st, with_texture=False)
+    hemi = Light(type='HEMI', name='sky', direction=(0.2, -0.3, -0.93),
+                 color=(1.0, 0.95, 0.8), energy=1.5, shadow='NONE')
+    hemi.hemi_ground = (0.15, 0.3, 0.55)
+    sc.lights = [hemi]
+    return sc
+
+
+def _sc_nominal_decay(st):
+    """R253 (D): the demo POINT lamp on the Scene Default falloff with a
+    nominal distance of 4 (the ROW sets the law as the scene default, so
+    the reference under INVERSE_SQUARE is the same lamp)."""
+    return _sc_decay_law(st, 4.0)
+
+
+def _sc_near_atten(st):
+    """R253 (E): the demo POINT lamp fading IN between 3 and 6 units
+    (3ds Max's Near Attenuation): the nearest surfaces go dark."""
+    sc = demo_scene(st, with_texture=False)
+    for l in sc.lights:
+        if l.type == 'POINT':
+            l.decay_near_start = 3.0
+            l.decay_near_end = 6.0
+    return sc
+
+
+def _sc_clip_map(st):
+    """R253 (F): a map-shadowed POINT lamp over the Ball whose buffer's
+    far plane (ClipEnd) stops short of the floor -- the floor is beyond
+    the map and keeps its light."""
+    sc = demo_scene(st, with_texture=False)
+    lamp = Light(type='POINT', name='clipped', position=(-1.3, 0.2, 3.6),
+                 color=(1.0, 1.0, 1.0), energy=300.0, shadow='MAP',
+                 decay='INVERSE_SQUARE')
+    lamp.shadow_clip_end = 2.2
+    sc.lights = list(sc.lights) + [lamp]
+    return sc
+
+
+def _sc_cookie_xform(st):
+    """R253 (G): the gobo spot with its slide turned 30 degrees, tiled
+    twice across and slid a quarter -- the projector-map Coordinates."""
+    sc = _sc_cookie_spot(st)
+    spot = sc.lights[-1]
+    spot.cookie_extend = 'REPEAT'
+    spot.cookie_rotation = 0.5236
+    spot.cookie_tile = (2.0, 1.0)
+    spot.cookie_offset = (0.25, 0.0)
+    return sc
+
+
+def _sc_light_style(st):
+    """R253 (H): the demo Fill lamp on Quake's SLOW_STRONG_PULSE at scene
+    time 1.3 (character 13 = 'n', gain 13/12): a touch brighter."""
+    sc = demo_scene(st, with_texture=False)
+    for l in sc.lights:
+        if l.type == 'POINT':
+            l.light_style = 'SLOW_STRONG_PULSE'
+    sc.frame = 32
+    sc.fps = 24.0
+    sc.time = 1.3
+    return sc
+
+
 def _sc_facing_quad(st):
     """R251 F011: one quad squarely facing the camera (its normal IS
     the camera axis view[2, :3]) under one SUN 30 degrees off the
@@ -1824,6 +1912,11 @@ SCENES = {
     'demo_plain': _sc_demo,
     'cookie_sun': _sc_cookie_sun, 'area': _sc_area,
     'negative': _sc_negative, 'soft': _sc_soft, 'bryce': _sc_bryce,
+    # R253 light options
+    'square_spot': _sc_square_spot, 'spec_tint': _sc_spec_tint,
+    'hemi_ground': _sc_hemi_ground, 'nominal_decay': _sc_nominal_decay,
+    'near_atten': _sc_near_atten, 'clip_map': _sc_clip_map,
+    'cookie_xform': _sc_cookie_xform, 'light_style': _sc_light_style,
     'metallic_node': _sc_metallic_node, 'specular_node': _sc_specular_node,
     'wireframe_node': _sc_wireframe_node,
     'noise_node': _sc_noise_node,
@@ -1987,6 +2080,18 @@ ROWS = [
     ('Model 3 spotlight fog lobe',
      {'fog': True, 'fog_mode': 'LINEAR', 'fog_start': 3.0, 'fog_end': 12.0,
       'fog_spot': 1.0}, 'screen_spot'),
+    # ------------------------------------------------ R253 light options
+    ('square spot cone (Blender Internal LA_SQUARE)', {}, 'square_spot'),
+    ('lamp specular colour (GL_SPECULAR / dcvSpecular)', {}, 'spec_tint'),
+    ('hemi ground colour (two-tone hemisphere)', {}, 'hemi_ground'),
+    ('inverse from nominal distance (3ds Max / LightWave)',
+     {'light_falloff_default': 'NOMINAL_INVERSE'}, 'nominal_decay'),
+    ('inverse square from nominal distance (3ds Max / LightWave)',
+     {'light_falloff_default': 'NOMINAL_INV_SQUARE'}, 'nominal_decay'),
+    ('near attenuation fade-in (3ds Max)', {}, 'near_atten'),
+    ('shadow buffer clip end (BI ClipEnd)', {}, 'clip_map'),
+    ('cookie offset / tiling / angle (projector map)', {}, 'cookie_xform'),
+    ('Quake light style (slow strong pulse)', {}, 'light_style'),
     # ------------------------------------------------------------ shadows
     ('shadows off', {'shadows': False}, 'demo'),
     ('ray shadows', {'shadow_default': 'RAY'}, 'demo'),

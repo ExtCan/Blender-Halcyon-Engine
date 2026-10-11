@@ -886,6 +886,8 @@ def read_legacy_scene(path_or_bytes, geometry=True):
             'type': 'h', 'r': 'f', 'g': 'f', 'b': 'f', 'energy': 'f',
             'dist': 'f', 'spotsize': 'f', 'spotblend': 'f', 'mode': 'i',
             'area_size': 'f', 'area_sizey': 'f', 'clipsta': 'f',
+            # R253 (F): the buffer's far plane beside its near one
+            'clipend': 'f',
             'falloff_type': 'h', 'att1': 'f', 'att2': 'f',
             # R164: the lamp's SHADOW COLOUR -- lashdw in
             # shade_one_light tints the shadowed part of the light

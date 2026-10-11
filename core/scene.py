@@ -280,6 +280,42 @@ class Light:
     # the lamp's existing `radius` (SUN/HEMI: the Angle slider in
     # radians; others: Radius in scene units). 0 = razor sharp.
     cookie_filter: str = 'BILINEAR'   # BILINEAR | CLOSEST | CUBIC
+    # R253 light options: eight period dials, every one bitwise-neutral
+    # at its default (old scenes render identically; the R253 lamps
+    # test pins it against the 1.91.0 tree).
+    # (A) Blender Internal's LA_SQUARE: the cone becomes a pyramid --
+    # the angle to the axis is measured along the wider of the lamp's
+    # two sides (2.79 shadeoutput.c lamp_get_visibility: x = max(|x/z|,
+    # |y/z|), inpr = 1/sqrt(1+x^2)); every cone law reads that cosine
+    spot_square: bool = False
+    # (B) the lamp's second colour for the highlight only -- OpenGL 1.1
+    # glLight GL_SPECULAR, Direct3D 7 D3DLIGHT7.dcvSpecular; a
+    # MULTIPLIER on the lamp colour, white = the classic lobes
+    specular_color: tuple = (1.0, 1.0, 1.0)
+    # (C) the two-tone hemisphere's ground colour (Rost, OpenGL Shading
+    # Language 2004, 9.1: mix(ground, sky, 0.5 + 0.5 N.L)); black = the
+    # one-colour BI hemi of 1.89
+    hemi_ground: tuple = (0.0, 0.0, 0.0)
+    # (E) 3ds Max's Near Attenuation Start/End: the light FADES IN
+    # between the two distances (active only while end > start; the
+    # far pair is the CUSTOM falloff); never on SUN/HEMI/AREA
+    decay_near_start: float = 0.0
+    decay_near_end: float = 0.0
+    # (F) Blender Internal's ClipSta / ClipEnd: the shadow buffer's
+    # near and far planes in scene units; 0 = the automatic planes
+    shadow_clip_start: float = 0.0
+    shadow_clip_end: float = 0.0
+    # (G) the projector map's Coordinates rollout (3ds Max) / the 2.4x
+    # lamp texture's ofs/size: a UV transform on the cookie lookup,
+    # about the slide's centre -- offset, tiling, rotation (radians)
+    cookie_offset: tuple = (0.0, 0.0)
+    cookie_tile: tuple = (1.0, 1.0)
+    cookie_rotation: float = 0.0
+    # (H) Quake's lightstyle flicker: one of the twelve world.qc
+    # strings (core/lights.LIGHT_STYLES), stepped `light_style_rate`
+    # characters per second of scene.time; NORMAL ('m') is exactly 1.0
+    light_style: str = 'NORMAL'
+    light_style_rate: float = 10.0
     # the light's own X/Y axes, for oriented projection. Export fills them
     # from the object matrix; hand-built scenes may leave them None and get
     # a stable basis derived from the direction.
@@ -287,6 +323,9 @@ class Light:
     frame_y: Any = None
     # Runtime
     shadow_map: Any = None
+    # R253: the light style's gain for THIS frame (lights.apply_light_styles
+    # writes it from scene.time before the maps build; never exported)
+    style_gain: float = 1.0
 
 
 @dataclass

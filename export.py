@@ -1050,6 +1050,25 @@ def export_light(ob, matrix, unit_scale=1.0):
         coll = getattr(hs, 'exclude_collection', None)
         if coll is not None:
             lt.exclude_names = {o.name for o in coll.all_objects}
+        # R253 light options: every new dial through getattr with the
+        # dataclass default -- an older panel (or a test's fake hs
+        # without the fields) exports the inert lamp
+        lt.spot_square = bool(getattr(hs, 'spot_square', False))
+        lt.specular_color = tuple(float(v) for v in getattr(
+            hs, 'specular_color', (1.0, 1.0, 1.0)))[:3]
+        lt.hemi_ground = tuple(float(v) for v in getattr(
+            hs, 'hemi_ground', (0.0, 0.0, 0.0)))[:3]
+        lt.decay_near_start = float(getattr(hs, 'decay_near_start', 0.0)
+                                    or 0.0)
+        lt.decay_near_end = float(getattr(hs, 'decay_near_end', 0.0) or 0.0)
+        lt.shadow_clip_start = float(getattr(hs, 'shadow_clip_start', 0.0)
+                                     or 0.0)
+        lt.shadow_clip_end = float(getattr(hs, 'shadow_clip_end', 0.0)
+                                   or 0.0)
+        lt.light_style = str(getattr(hs, 'light_style', 'NORMAL')
+                             or 'NORMAL')
+        lt.light_style_rate = float(getattr(hs, 'light_style_rate', 10.0)
+                                    or 10.0)
         ck = getattr(hs, 'cookie', None)
         if ck is not None:
             # R219: every lamp kind projects (the old gate let only
@@ -1065,6 +1084,13 @@ def export_light(ob, matrix, unit_scale=1.0):
                                                'AUTO') or 'AUTO')
                 lt.cookie_filter = str(getattr(hs, 'cookie_filter',
                                                'BILINEAR') or 'BILINEAR')
+                # R253 (G): the slide's Offset / Tiling / Angle
+                lt.cookie_offset = tuple(float(v) for v in getattr(
+                    hs, 'cookie_offset', (0.0, 0.0)))[:2]
+                lt.cookie_tile = tuple(float(v) for v in getattr(
+                    hs, 'cookie_tile', (1.0, 1.0)))[:2]
+                lt.cookie_rotation = float(getattr(hs, 'cookie_rotation',
+                                                   0.0) or 0.0)
     else:
         lt.shadow = 'MAP' if getattr(la, 'use_shadow', True) else 'NONE'
     if not getattr(la, 'use_shadow', True):

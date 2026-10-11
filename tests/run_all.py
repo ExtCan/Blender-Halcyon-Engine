@@ -36,6 +36,8 @@ def run_tests():
     from . import test_r253_halo_node
     # R253 (1.92.0): the compositing passes
     from . import test_r253_compositing
+    # R253 (1.92.0): the eight period lamp options
+    from . import test_r253_light_options
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -162,6 +164,13 @@ def run_tests():
     print('R253 COMPOSITING PASSES')
     print('=' * 66)
     rc |= test_r253_compositing.main()
+    print()
+    print('=' * 66)
+    print('R253 LIGHT OPTIONS (SQUARE SPOT, SPECULAR COLOUR, HEMI GROUND, '
+          'NOMINAL DECAY, NEAR ATTENUATION, SHADOW CLIP, COOKIE TRANSFORM, '
+          'LIGHT STYLES)')
+    print('=' * 66)
+    rc |= test_r253_light_options.main()
     return rc
 
 

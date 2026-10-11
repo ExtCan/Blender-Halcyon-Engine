@@ -2434,6 +2434,13 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
         col = layout.column()
         col.prop(light, 'color')
         col.prop(light, 'energy')
+        # R253 light options: the lamp's second colour (GL_SPECULAR /
+        # dcvSpecular) and Quake's lightstyle flicker
+        col.prop(hs, 'specular_color')
+        col.prop(hs, 'light_style')
+        sub = col.column()
+        sub.active = hs.light_style != 'NORMAL'
+        sub.prop(hs, 'light_style_rate')
         col.separator()
         if light.type == 'AREA':
             # no decay menu for an area lamp: 2.79's lamp_get_visibility
@@ -2454,13 +2461,23 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
             if hs.decay in ('POV_FADE_LINEAR', 'POV_FADE_SQUARE') or \
                     hs.decay.startswith('GX_'):
                 col.prop(hs, 'decay_end')
+            if hs.decay in ('NOMINAL_INVERSE', 'NOMINAL_INV_SQUARE'):
+                # R253 (D): Max's R0 / LightWave's Range IS Falloff End
+                col.prop(hs, 'decay_end', text="Nominal Distance")
             if hs.decay in ('GL_3TERM', 'BI_SLIDERS'):
                 col.prop(hs, 'decay_ld1')
                 col.prop(hs, 'decay_ld2')
             if hs.decay.startswith('GX_'):
                 col.prop(hs, 'gx_ref_brite')
+            if not getattr(hs, 'hemi', False):
+                # R253 (E): 3ds Max's Near Attenuation fade-in (the far
+                # pair is the Custom Range falloff); never on a hemi
+                col.prop(hs, 'decay_near_start')
+                col.prop(hs, 'decay_near_end')
         if light.type == 'SPOT':
             col.prop(hs, 'hotspot')
+            # R253 (A): Blender Internal's Square cone
+            col.prop(hs, 'spot_square')
             # R251 F012: the cone law; the exponent only where a law
             # reads it
             col.prop(hs, 'spot_law')
@@ -2475,6 +2492,17 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
         sub.prop(hs, 'shadow_map_size')
         sub.prop(hs, 'shadow_bias')
         sub.prop(hs, 'shadow_map_depth')            # R251 C117
+        if light.type in ('SPOT', 'POINT'):
+            # R253 (F): BI's ClipSta / ClipEnd -- the map's planes
+            clip = sub.column()
+            clip.active = hs.shadow == 'MAP'
+            clip.prop(hs, 'shadow_clip_start')
+            clip.prop(hs, 'shadow_clip_end')
+            if hs.shadow_clip_start > 0.0 or hs.shadow_clip_end > 0.0:
+                note = clip.row()
+                note.active = False
+                note.label(text="The map's near and far planes; "
+                                "0 = automatic", icon='INFO')
         if hs.shadow_map_size > 0 or hs.shadow_bias > 0.0:
             note = sub.row()
             note.active = False
@@ -2498,6 +2526,11 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
             sub.prop(hs, 'cookie_scale')
         sub.prop(hs, 'cookie_extend')
         sub.prop(hs, 'cookie_filter')
+        # R253 (G): the slide's Offset / Tiling / Angle (3ds Max's
+        # projector-map Coordinates rollout)
+        sub.prop(hs, 'cookie_offset')
+        sub.prop(hs, 'cookie_tile')
+        sub.prop(hs, 'cookie_rotation')
         if hs.cookie is not None:
             note = sub.row()
             note.active = False
@@ -2512,6 +2545,10 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
         col.prop(hs, 'ambient_only')
         if light.type == 'SUN':
             col.prop(hs, 'hemi')
+            # R253 (C): the two-tone hemisphere's ground colour
+            sub = col.column()
+            sub.active = bool(hs.hemi)
+            sub.prop(hs, 'hemi_ground')
         col.prop(hs, 'volumetric')
         if light.type in ('SPOT', 'POINT', 'AREA'):
             # the in-air beam kinds; a SUN's volumetric drives the

@@ -452,6 +452,19 @@ def _apply_lamp_bi(light, lm, warnings=None):
     hs = getattr(light, 'halcyon', None)
     if hs is None:
         return want
+    if lm['type'] == 'SPOT':
+        # R253 (A) / (F): the Square cone and the buffer's ClipSta /
+        # ClipEnd (lamp_map carries the clip pair only for a
+        # buffer-shadowed spot; an older fake namespace may lack the
+        # attributes, hence the try)
+        try:
+            hs.spot_square = bool(lm.get('square'))
+            if lm.get('shadow') == 'MAP':
+                hs.shadow_clip_start = float(lm.get('clip_start', 0.0)
+                                             or 0.0)
+                hs.shadow_clip_end = float(lm.get('clip_end', 0.0) or 0.0)
+        except (AttributeError, TypeError, ValueError):
+            pass
     if hemi:
         hs.hemi = True
         hs.shadow = 'NONE'         # BI never shadowed hemi lamps
