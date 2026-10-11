@@ -43,6 +43,9 @@ def run_tests():
     from . import test_r253_light_options
     # R253 (1.92.0): the review fixes
     from . import test_r253_review
+    # R253 (1.92.0): the expanded Terrain tool (pictures, erosion, live
+    # dials, Export Heightmap)
+    from . import test_r253_terrain_tool
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -186,6 +189,11 @@ def run_tests():
     print('R253 REVIEW FIXES')
     print('=' * 66)
     rc |= test_r253_review.main()
+    print()
+    print('=' * 66)
+    print('R253 TERRAIN (MAPS, EROSION, LIVE DIALS)')
+    print('=' * 66)
+    rc |= test_r253_terrain_tool.main()
     return rc
 
 
