@@ -493,51 +493,15 @@ def is_manifoldish(verts, faces):
 # ------------------------------------------------------------ the terrain
 
 
-def terrain(size=24.0, divisions=96, height=6.0, feature_scale=10.0,
-            octaves=6, roughness=0.5, ridge=0.5, island=0.4,
-            terraces=0, sea_level=0.0, seed=0, kind='MOUNTAIN',
-            direction=0.0):
-    """R201: the Bryce mountain -- a fractal heightfield as a grid mesh.
-
-    The Altitude & Slope node shipped with nothing to stand on: this is
-    the terrain that node was built to paint. A (divisions+1)^2 vertex
-    grid, displaced by a blend of smooth fBm (rolling hills) and RIDGED
-    fractal (the knife-edged crests Bryce terrains are remembered for),
-    with the shaping dials the Terrain Editor had:
-
-    - `feature_scale`: metres per large noise feature -- bigger numbers
-      mean broader mountains.
-    - `octaves` / `roughness`: detail levels and how much each level
-      contributes (fBm gain).
-    - `ridge`: 0 is all rolling fBm, 1 is all ridged crest.
-    - `island`: fades the height to zero toward the grid's edge with a
-      smoothstep ring -- a mountain that ENDS inside the grid instead
-      of slicing off at the boundary. 0 disables.
-    - `terraces`: N > 0 quantises the height into N shelves with a
-      smoothed riser between them -- Bryce's terracing.
-    - `sea_level`: fraction of the height range flattened into a floor
-      -- the water table the ocean plane sits on.
-    - `seed`: re-deals the mountain; the same seed is the same mountain
-      on every machine (hash-lattice noise, no RNG state anywhere).
-    - `kind` (R202): the terrain TYPE. MOUNTAIN is the R201 fractal
-      exactly; HILLS is soft pasture; CANYON a cut mesa; DUNES
-      directional sand waves (turned by `direction`, radians); CRATER
-      one great ringed impact; VOLCANO a cone with its caldera bitten
-      out; PLATEAU hard-shouldered table-land. Island, terracing and
-      sea level compose with every kind.
-
-    Returns (verts, faces) as plain lists: quads, counter-clockwise
-    seen from above, ready for `validate` and `from_pydata`.
-    """
+def _terrain_grid(size, divisions):
+    """R253: the (divisions+1)^2 lattice -- the R201 statements, lifted
+    out of `terrain()` unchanged so the picture, erosion and export
+    roads share one grid with the fractal road."""
     import numpy as np
-
-    from . import patterns as PT
 
     divisions = max(int(divisions), 2)
     n1 = divisions + 1
     size = float(size)
-    height = float(height)
-    fs = max(float(feature_scale), 1e-3)
     step = size / divisions
     half = size * 0.5
 
@@ -545,7 +509,14 @@ def terrain(size=24.0, divisions=96, height=6.0, feature_scale=10.0,
     gx, gy = np.meshgrid(cc, cc, indexing='xy')
     xs = gx.ravel()
     ys = gy.ravel()
+    return xs, ys, n1, half, step
 
+
+def _terrain_domain(xs, ys, feature_scale, seed):
+    """R253: the seeded noise domain (R201 statements, verbatim)."""
+    import numpy as np
+
+    fs = max(float(feature_scale), 1e-3)
     # the seed walks the noise DOMAIN: two Wang-hashed offsets plus a
     # third-axis shelf, so seeds are uncorrelated, not slid copies
     from .patterns import _wang01p
@@ -557,15 +528,33 @@ def terrain(size=24.0, divisions=96, height=6.0, feature_scale=10.0,
     oz = float(int(seed) % 97) * 7.13
     p = np.stack([xs / fs + ox, ys / fs + oy,
                   np.full_like(xs, oz)], axis=1).astype(np.float32)
+    return p, fs
 
-    octs = max(int(octaves), 1)
-    gain = min(max(float(roughness), 0.05), 0.95)
-    rg = min(max(float(ridge), 0.0), 1.0)
-    kind = str(kind or 'MOUNTAIN').upper()
 
-    def _smooth(t):
-        t = np.clip(t, 0.0, 1.0)
-        return t * t * (3.0 - 2.0 * t)
+def _smooth01(t):
+    """The smoothstep the landforms shape with (clipped, float-preserving)."""
+    import numpy as np
+    t = np.clip(t, 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _terrain_base(kind, p, xs, ys, half, fs, octs, gain, rg, direction,
+                  heightmap=None, heightmap_scale=1.0,
+                  heightmap_offset=0.0, heightmap_channel='LUMA',
+                  heightmap_sampling='BILINEAR', heightmap_tile=False):
+    """R253: the landform field BEFORE the shaping stages.
+
+    The seven R201/R202 branches are the original statements in the
+    original order (the pinned hashes prove it); the four R253 kinds
+    are appended after them and never touch the chain above. Returns
+    the flat (n1*n1,) float32 field, already clipped to >= 0.
+    """
+    import numpy as np
+
+    from . import patterns as PT
+
+    _smooth = _smooth01
+    n = xs.shape[0]
 
     if kind == 'HILLS':
         # R202: pure rolling fBm, softened once more -- pastureland
@@ -641,20 +630,542 @@ def terrain(size=24.0, divisions=96, height=6.0, feature_scale=10.0,
         f = PT.fbm(p, octaves=octs, gain=gain)
         top = _smooth((f - 0.45) / 0.12)
         h = top * 0.72 + f * 0.18
+    elif kind == 'PICTURE':
+        # R253: the Bryce 'Picture' terrain -- the heights ARE an
+        # image. A (n1,n1) field is taken as it is; raw (H,W[,4])
+        # pixels are sampled onto the grid first (bottom row first =
+        # the grid's -Y row 0, so the picture lies on the ground as
+        # seen from above). No image at all is a flat zero plane --
+        # the operator reports the missing picture by name, the
+        # geometry never raises
+        n1 = int(round(n ** 0.5))
+        if heightmap is None:
+            h = np.zeros(n, np.float32)
+        else:
+            hm = np.asarray(heightmap, np.float32)
+            if hm.shape != (n1, n1) and hm.size != n:
+                hm = sample_heightmap(hm, n1 - 1, heightmap_channel,
+                                      heightmap_sampling, heightmap_tile)
+            h = hm.reshape(-1).astype(np.float32)
+            h = np.float32(heightmap_scale) * h \
+                + np.float32(heightmap_offset)
+    elif kind == 'ARCHIPELAGO':
+        # R253: many islands from a flat sea -- fBm pushed through a
+        # soft threshold at 0.55 (the sea is exactly 0.0 where the
+        # noise sits below it), each island crowned by a secondary
+        # ridged crest that only grows where land stands
+        f = PT.fbm(p * 0.8 + 5.3, octaves=octs, gain=gain)
+        land = _smooth((f - 0.55) / 0.12)
+        crest = PT.ridged(p * 1.7 + 23.1, octaves=octs, gain=gain)
+        h = land * (0.45 + 0.55 * crest * land)
+    elif kind == 'BADLANDS':
+        # R253: eroded strata -- a ridged fractal under a low-frequency
+        # fBm envelope, pre-terraced into nine shelves with a smoothed
+        # riser, then three talus passes so the risers crumble the way
+        # the Bryce 'Erode' button crumbled a terraced mesa
+        r = PT.ridged(p * 1.1 + 41.7, octaves=octs, gain=gain)
+        env = 0.4 + 0.6 * _smooth(PT.fbm(p * 0.4 + 13.1,
+                                         octaves=max(octs - 2, 1),
+                                         gain=gain))
+        h = np.clip(r * env * 1.6, 0.0, 1.0)
+        tq = h * 9.0
+        fl = np.floor(tq)
+        fr = tq - fl
+        h = (fl + fr * fr * fr * (fr * (fr * 6.0 - 15.0) + 10.0)) / 9.0
+        n1 = int(round(n ** 0.5))
+        h = thermal_erosion(h.reshape(n1, n1), 3, 0.02, 0.5).reshape(-1)
+    elif kind == 'VALLEY':
+        # R253: a river valley -- rolling fBm with ONE channel carved
+        # along `direction`: a smoothstep trough whose centre line
+        # wanders with a low-frequency noise of the along-valley
+        # coordinate only, its floor flattened to a constant shelf
+        ca, sa = float(np.cos(direction)), float(np.sin(direction))
+        along = (xs * ca + ys * sa) / fs
+        across = (ys * ca - xs * sa) / max(half, 1e-6)
+        q = np.stack([along * 0.45 + 61.3, np.full_like(along, 7.7),
+                      p[:, 2]], axis=1).astype(np.float32)
+        centre = (PT.fbm(q, octaves=max(octs - 3, 1), gain=gain)
+                  - 0.5) * 0.9
+        dist = np.abs(across - centre)
+        trough = _smooth((dist - 0.10) / 0.22)
+        base = 0.25 + 0.75 * _smooth(PT.fbm(p * 0.9 + 3.3, octaves=octs,
+                                            gain=gain))
+        h = 0.08 + np.clip(base - 0.08, 0.0, None) * trough
     else:                                       # MOUNTAIN, the R201 road
         h = PT.fbm(p, octaves=octs, gain=gain)
         if rg > 0.0:
             h = h * (1.0 - rg) \
                 + PT.ridged(p, octaves=octs, gain=gain) * rg
     h = np.clip(h, 0.0, None)
+    return h
+
+
+# ---------------------------------------------- R253: the terrain stages
+#
+# Every helper below is a pure NumPy function on a (n1, n1) float32
+# field, bpy-free, and each is guarded in `terrain_heights` by its own
+# default so a 1.91 terrain executes exactly the 1.91 statements. The
+# dial names follow the Bryce Terrain Editor (Picture, Erode, Smoothing,
+# Raise / Zero Edges, Spikes, Symmetric); the erosion models follow
+# Musgrave, Kolb & Mace, 'The Synthesis and Rendering of Eroded Fractal
+# Terrains' (SIGGRAPH 1989), on a 4-neighbour grid.
+
+
+def _as2d(h):
+    """(n1*n1,) -> (n1, n1) view; a reshape, so bitwise."""
+    n1 = int(round(h.shape[0] ** 0.5))
+    return h.reshape(n1, n1)
+
+
+def _luma(px):
+    """Rec.709 luma of (..., 3+) float32 pixels, float32 throughout."""
+    import numpy as np
+    return (px[..., 0] * np.float32(0.2126)
+            + px[..., 1] * np.float32(0.7152)) \
+        + px[..., 2] * np.float32(0.0722)
+
+
+def sample_heightmap(pixels, divisions, channel='LUMA',
+                     sampling='BILINEAR', tile=False):
+    """R253: an (H,W,4) or (H,W) image -> the (n1,n1) float32 height
+    field the grid wants.
+
+    `channel` LUMA takes the Rec.709 weights (0.2126 / 0.7152 /
+    0.0722); 'R' / 'G' / 'B' / 'A' take one plane (an image without an
+    alpha plane reads A as 1). BILINEAR samples at u = i / divisions
+    over [0, W-1] x [0, H-1] with edge clamp -- so a (n1,n1) picture at
+    `divisions` = n1-1 lands on the grid bitwise; NEAREST rounds to the
+    pixel. `tile` samples over [0, W) x [0, H) with modulo instead, so
+    the grid's last row and column wrap to the first (a seamless
+    picture makes a seamless terrain). Rows follow Blender's pixel
+    buffer: row 0 is the BOTTOM of the picture and the grid's -Y edge.
+    """
+    import numpy as np
+
+    px = np.asarray(pixels, np.float32)
+    if px.ndim == 2:
+        field = px
+    else:
+        ch = str(channel or 'LUMA').upper()
+        if ch == 'LUMA':
+            field = _luma(px)
+        else:
+            idx = {'R': 0, 'G': 1, 'B': 2, 'A': 3}.get(ch, 0)
+            if idx < px.shape[-1]:
+                field = px[..., idx]
+            else:
+                field = np.ones(px.shape[:2], np.float32)
+    field = np.ascontiguousarray(field, np.float32)
+    H, W = field.shape
+    divisions = max(int(divisions), 2)
+    n1 = divisions + 1
+    i = np.arange(n1, dtype=np.float64)
+    nearest = str(sampling or 'BILINEAR').upper() == 'NEAREST'
+    if tile:
+        u = i / divisions * W
+        v = i / divisions * H
+        if nearest:
+            ix = np.rint(u).astype(np.int64) % W
+            iy = np.rint(v).astype(np.int64) % H
+            return field[iy[:, None], ix[None, :]]
+        x0 = np.floor(u)
+        y0 = np.floor(v)
+        fx = (u - x0).astype(np.float32)
+        fy = (v - y0).astype(np.float32)
+        x0 = x0.astype(np.int64) % W
+        y0 = y0.astype(np.int64) % H
+        x1 = (x0 + 1) % W
+        y1 = (y0 + 1) % H
+    else:
+        u = i / divisions * (W - 1)
+        v = i / divisions * (H - 1)
+        if nearest:
+            ix = np.clip(np.rint(u), 0, W - 1).astype(np.int64)
+            iy = np.clip(np.rint(v), 0, H - 1).astype(np.int64)
+            return field[iy[:, None], ix[None, :]]
+        x0 = np.floor(u)
+        y0 = np.floor(v)
+        fx = (u - x0).astype(np.float32)
+        fy = (v - y0).astype(np.float32)
+        x0 = np.clip(x0, 0, W - 1).astype(np.int64)
+        y0 = np.clip(y0, 0, H - 1).astype(np.int64)
+        x1 = np.minimum(x0 + 1, W - 1)
+        y1 = np.minimum(y0 + 1, H - 1)
+    # lerp as a + (b - a) * f: at f == 0 the result IS a, bitwise, so
+    # a picture the size of the grid comes through untouched
+    c00 = field[y0[:, None], x0[None, :]]
+    c10 = field[y0[:, None], x1[None, :]]
+    c01 = field[y1[:, None], x0[None, :]]
+    c11 = field[y1[:, None], x1[None, :]]
+    fxr = fx[None, :]
+    fyr = fy[:, None]
+    top = c00 + (c10 - c00) * fxr
+    bot = c01 + (c11 - c01) * fxr
+    return (top + (bot - top) * fyr).astype(np.float32)
+
+
+def heights_to_pixels(h01):
+    """R253: the export road -- a (n1,n1) field as (n1,n1,4) float32
+    pixels, bottom row first, RGB = height, A = 1. The inverse of
+    `sample_heightmap(..., 'R', 'NEAREST')` at the grid's own size,
+    bitwise, so Export Heightmap -> Picture round-trips."""
+    import numpy as np
+    h = np.asarray(h01, np.float32)
+    out = np.empty(h.shape + (4,), np.float32)
+    out[..., 0] = h
+    out[..., 1] = h
+    out[..., 2] = h
+    out[..., 3] = 1.0
+    return out
+
+
+def fractal_detail(h, p, octaves, amount, gain=0.5):
+    """R253: fine fBm octaves on ANY base -- a picture gets procedural
+    detail, a landform gets grit. Adds amount * (fbm(8p) - 0.5), then
+    keeps the field at or above zero."""
+    import numpy as np
+    from . import patterns as PT
+    octs = max(int(octaves), 1)
+    d = (PT.fbm(p * 8.0, octaves=octs, gain=gain) - 0.5) * np.float32(amount)
+    return np.clip(h + d, 0.0, None).astype(np.float32)
+
+
+def symmetrize_heights(h, mode):
+    """R253: Bryce's 'Symmetric' brush as a whole-field stage.
+
+    'X' mirrors the -X half onto the +X half (column i onto n1-1-i),
+    'Y' rows, 'XY' both, 'RADIAL' averages the four 90-degree
+    rotations -- summed as (h + r180) + (r90 + r270), which is its OWN
+    90-degree rotation bitwise because IEEE addition commutes."""
+    import numpy as np
+    mode = str(mode or 'NONE').upper()
+    if mode == 'NONE':
+        return h
+    h = np.array(h, np.float32, copy=True)
+    n1 = h.shape[1]
+    if mode in ('X', 'XY'):
+        half = n1 // 2
+        h[:, n1 - half:] = h[:, :half][:, ::-1]
+    if mode in ('Y', 'XY'):
+        half = h.shape[0] // 2
+        h[h.shape[0] - half:, :] = h[:half, :][::-1, :]
+    if mode == 'RADIAL':
+        if h.shape[0] != h.shape[1]:
+            return h
+        r90 = np.rot90(h, 1)
+        r180 = np.rot90(h, 2)
+        r270 = np.rot90(h, 3)
+        h = ((h + r180) + (r90 + r270)) * np.float32(0.25)
+    return h.astype(np.float32)
+
+
+def _shift_into(dst, src, drow, dcol):
+    """Add `src` into `dst` shifted by (drow, dcol); what would leave
+    the grid stays put (the caller never budgets it)."""
+    R, C = dst.shape
+    rs = slice(max(drow, 0), R + min(drow, 0))
+    rd = slice(max(-drow, 0), R + min(-drow, 0))
+    cs = slice(max(dcol, 0), C + min(dcol, 0))
+    cd = slice(max(-dcol, 0), C + min(-dcol, 0))
+    dst[rs, cs] += src[rd, cd]
+
+
+#: the four grid neighbours as (row shift, column shift)
+_NB4 = ((-1, 0), (1, 0), (0, -1), (0, 1))
+
+
+def thermal_erosion(h, iterations, talus=0.02, rate=0.5):
+    """R253: talus slide (Musgrave 1989's thermal weathering).
+
+    Per iteration, every cell looks at its four neighbours; where it
+    stands more than `talus` above one, that excess is a drop. Each
+    drop moves rate/4 of itself to that neighbour. The quarter is the
+    bound at which a cell fed by all four neighbours can never overshoot
+    them and a cell feeding all four can never undershoot them, so for
+    any rate in [0, 1]: mass is conserved (what leaves a cell lands in
+    a neighbour -- edges never spill), the field's maximum never rises
+    and its minimum never falls. Material that would leave the grid is
+    simply not budgeted. float32 in and out, float64 inside; no
+    reductions over the field, so the same seed slides the same way on
+    every machine."""
+    import numpy as np
+    iters = int(iterations)
+    if iters <= 0:
+        return h
+    hh = np.asarray(h, np.float64).copy()
+    c = min(max(float(rate), 0.0), 1.0) * 0.25
+    t = float(talus)
+    for _ in range(iters):
+        moved = np.zeros_like(hh)
+        gain = np.zeros_like(hh)
+        for drow, dcol in _NB4:
+            nb = np.full_like(hh, np.inf)
+            # the neighbour at (row+drow, col+dcol), seen from each cell
+            R, C = hh.shape
+            rs = slice(max(drow, 0), R + min(drow, 0))
+            rd = slice(max(-drow, 0), R + min(-drow, 0))
+            cs = slice(max(dcol, 0), C + min(dcol, 0))
+            cd = slice(max(-dcol, 0), C + min(-dcol, 0))
+            nb[rd, cd] = hh[rs, cs]
+            drop = hh - nb - t
+            drop = np.where(np.isfinite(drop) & (drop > 0.0), drop, 0.0)
+            flow = drop * c
+            moved += flow
+            _shift_into(gain, flow, drow, dcol)
+        hh = hh - moved + gain
+    return hh.astype(np.float32)
+
+
+def hydraulic_erosion(h, iterations, rain=0.01, solubility=0.1,
+                      evaporation=0.5, capacity=0.05):
+    """R253: the water-table approximation of Musgrave 1989's hydraulic
+    erosion. Each pass: rain falls on every cell; the water dissolves
+    `solubility` of itself from the rock (capped at the rock there)
+    into sediment; water and its sediment flow to lower neighbours by
+    the drop in water-table height (rock + water), the quarter rule
+    of the thermal pass again; `evaporation` of the water leaves, and
+    sediment above `capacity` of the remaining water is deposited back
+    as rock. When the passes end the sediment still in suspension
+    settles, so rock + sediment is conserved throughout (to rounding)
+    and the heights come back as float32 with no water on them."""
+    import numpy as np
+    iters = int(iterations)
+    if iters <= 0:
+        return h
+    rock = np.asarray(h, np.float64).copy()
+    water = np.zeros_like(rock)
+    sed = np.zeros_like(rock)
+    rain = max(float(rain), 0.0)
+    sol = min(max(float(solubility), 0.0), 1.0)
+    evap = min(max(float(evaporation), 0.0), 1.0)
+    cap = max(float(capacity), 0.0)
+    R, C = rock.shape
+    for _ in range(iters):
+        water = water + rain
+        dissolve = np.minimum(sol * water, rock)
+        rock = rock - dissolve
+        sed = sed + dissolve
+        table = rock + water
+        w_out = np.zeros_like(rock)
+        s_out = np.zeros_like(rock)
+        w_in = np.zeros_like(rock)
+        s_in = np.zeros_like(rock)
+        frac = np.where(water > 0.0, sed / np.where(water > 0.0, water, 1.0),
+                        0.0)
+        for drow, dcol in _NB4:
+            nb = np.full_like(table, np.inf)
+            rs = slice(max(drow, 0), R + min(drow, 0))
+            rd = slice(max(-drow, 0), R + min(-drow, 0))
+            cs = slice(max(dcol, 0), C + min(dcol, 0))
+            cd = slice(max(-dcol, 0), C + min(-dcol, 0))
+            nb[rd, cd] = table[rs, cs]
+            drop = table - nb
+            drop = np.where(np.isfinite(drop) & (drop > 0.0), drop, 0.0)
+            wf = np.minimum(drop * 0.25, water * 0.25)
+            sf = wf * frac
+            w_out += wf
+            s_out += sf
+            _shift_into(w_in, wf, drow, dcol)
+            _shift_into(s_in, sf, drow, dcol)
+        water = water - w_out + w_in
+        sed = sed - s_out + s_in
+        water = water * (1.0 - evap)
+        excess = np.maximum(sed - cap * water, 0.0)
+        rock = rock + excess
+        sed = sed - excess
+    rock = rock + sed
+    return rock.astype(np.float32)
+
+
+def smooth_heights(h, passes):
+    """R253: Bryce's Smoothing -- the 3x3 cross kernel (4,1,1,1,1)/8
+    with edge padding, `passes` times. A convex blend, so the result is
+    clipped into the input's own [min, max] (rounding can never push a
+    shelf above the peak it averages)."""
+    import numpy as np
+    n = int(passes)
+    if n <= 0:
+        return h
+    hh = np.asarray(h, np.float64)
+    lo, hi = float(hh.min()), float(hh.max())
+    for _ in range(n):
+        pad = np.pad(hh, 1, mode='edge')
+        hh = (pad[1:-1, 1:-1] * 4.0 + pad[:-2, 1:-1] + pad[2:, 1:-1]
+              + pad[1:-1, :-2] + pad[1:-1, 2:]) * 0.125
+    return np.clip(hh, lo, hi).astype(np.float32)
+
+
+def spike_heights(h, p, amount, scale=4.0, slope_only=False):
+    """R253: Bryce's Spikes / 'slope noise' -- a thresholded value
+    noise (only its top 40 percent) adds needles of `amount`; with
+    `slope_only` the needles grow on the steep faces (the local
+    gradient magnitude, clipped to 1) and leave flats alone."""
+    import numpy as np
+    from . import patterns as PT
+    a = float(amount)
+    if a == 0.0:
+        return h
+    n1 = h.shape[0]
+    vn = PT.value_noise((p * np.float32(scale)).astype(np.float32))
+    spk = np.clip(vn - np.float32(0.6), 0.0, None) * np.float32(2.5)
+    spk = spk.reshape(n1, n1)
+    if slope_only:
+        gy, gx = np.gradient(np.asarray(h, np.float32))
+        slope = np.clip(np.sqrt(gx * gx + gy * gy) * n1, 0.0, 1.0)
+        spk = spk * slope
+    return (h + spk * np.float32(a)).astype(np.float32)
+
+
+def island_mask(xs, ys, half, falloff, shape='RADIAL'):
+    """R253: the island ring as a field. RADIAL is the R201 expression
+    exactly (the terrain multiplies by it the way it always did, so
+    the default is bitwise); SQUARE uses the Chebyshev distance, so
+    all four edges reach zero at the same falloff."""
+    import numpy as np
+    isl = max(float(falloff), 1e-6)
+    if str(shape or 'RADIAL').upper() == 'SQUARE':
+        r = np.maximum(np.abs(xs), np.abs(ys)) / half
+    else:
+        r = np.sqrt(xs * xs + ys * ys) / half
+    t = np.clip((1.0 - r) / isl, 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def edge_shape(h, mode, edge_height=0.0):
+    """R253: Bryce's Zero Edges / Raise Edges. 'FALLOFF' leaves the
+    field to the island ring; 'ZERO' forces the outermost ring to
+    exactly 0.0; 'RAISE' lifts the outer eighth of the grid toward
+    `edge_height` with a smoothstep -- the bowl, the crater wall, the
+    valley that ends in a ridge."""
+    import numpy as np
+    mode = str(mode or 'FALLOFF').upper()
+    if mode == 'ZERO':
+        h = np.array(h, np.float32, copy=True)
+        h[0, :] = 0.0
+        h[-1, :] = 0.0
+        h[:, 0] = 0.0
+        h[:, -1] = 0.0
+        return h
+    if mode == 'RAISE':
+        n1 = h.shape[0]
+        band = max(n1 // 8, 1)
+        i = np.arange(n1)
+        d = np.minimum(i, n1 - 1 - i)
+        d2 = np.minimum(d[:, None], d[None, :]).astype(np.float32)
+        t = _smooth01(1.0 - d2 / np.float32(band))
+        eh = np.float32(edge_height)
+        return (h + (eh - h) * t).astype(np.float32)
+    return h
+
+
+def seamless_heights(h):
+    """R253: a tileable field. The core (divisions x divisions) part is
+    cross-faded with its own half-period roll along each axis -- the
+    weight is 1 at the wrap and 0 at the centre, so the wrap sees ONE
+    continuous surface -- and the grid's last row / column are then
+    copies of the first, bitwise, so tiles meet exactly."""
+    import numpy as np
+    h = np.array(h, np.float32, copy=True)
+    n1 = h.shape[0]
+    n = n1 - 1
+    if n < 2:
+        return h
+    core = h[:n, :n]
+    i = np.arange(n, dtype=np.float32)
+    c = n * 0.5
+    w = _smooth01(np.abs(i - c) / c)
+    rolled = np.roll(core, n // 2, axis=1)
+    core = core + (rolled - core) * w[None, :]
+    rolled = np.roll(core, n // 2, axis=0)
+    core = core + (rolled - core) * w[:, None]
+    h[:n, :n] = core
+    h[n, :n] = core[0, :]
+    h[:n, n] = core[:, 0]
+    h[n, n] = core[0, 0]
+    return h
+
+
+def water_quad(size, z):
+    """R253: the water plane -- one CCW quad of `size` at height `z`,
+    in the terrain's own frame (centred, Z up)."""
+    half = float(size) * 0.5
+    z = float(z)
+    verts = [(-half, -half, z), (half, -half, z),
+             (half, half, z), (-half, half, z)]
+    return verts, [(0, 1, 2, 3)]
+
+
+def terrain_heights(size=24.0, divisions=96, height=6.0, feature_scale=10.0,
+                    octaves=6, roughness=0.5, ridge=0.5, island=0.4,
+                    terraces=0, sea_level=0.0, seed=0, kind='MOUNTAIN',
+                    direction=0.0,
+                    heightmap=None, heightmap_scale=1.0,
+                    heightmap_offset=0.0, heightmap_channel='LUMA',
+                    heightmap_sampling='BILINEAR', heightmap_tile=False,
+                    detail_octaves=0, detail_amount=0.0, symmetry='NONE',
+                    thermal_iterations=0, thermal_talus=0.02,
+                    thermal_rate=0.5, hydraulic_iterations=0,
+                    hydraulic_rain=0.01, hydraulic_solubility=0.1,
+                    hydraulic_evaporation=0.5, hydraulic_capacity=0.05,
+                    smooth_passes=0, spikes=0.0, spike_scale=4.0,
+                    island_shape='RADIAL', edge_mode='FALLOFF',
+                    edge_height=0.0, seamless=False):
+    """R253: the terrain's NORMALISED heights -- (xs, ys, h01) with h01
+    a (n1, n1) float32 field before the height multiply.
+
+    The stage pipeline, in order: base landform -> clip >= 0 ->
+    fractal detail -> symmetry -> thermal erosion -> hydraulic erosion
+    -> smoothing -> spikes -> island ring / edge shape -> terraces ->
+    sea floor -> seamless. Erosion runs BEFORE the island ring so the
+    ring's law (the rim is zero) holds after erosion. Every stage is
+    skipped at its default, so the default pipeline is the 1.91
+    `terrain()` statement for statement. `height` is accepted (the
+    operator hands one dict to both this and `heights_to_mesh`) and
+    not used here.
+    """
+    import numpy as np
+
+    xs, ys, n1, half, _step = _terrain_grid(size, divisions)
+    p, fs = _terrain_domain(xs, ys, feature_scale, seed)
+
+    octs = max(int(octaves), 1)
+    gain = min(max(float(roughness), 0.05), 0.95)
+    rg = min(max(float(ridge), 0.0), 1.0)
+    kind = str(kind or 'MOUNTAIN').upper()
+
+    h = _terrain_base(kind, p, xs, ys, half, fs, octs, gain, rg, direction,
+                      heightmap=heightmap, heightmap_scale=heightmap_scale,
+                      heightmap_offset=heightmap_offset,
+                      heightmap_channel=heightmap_channel,
+                      heightmap_sampling=heightmap_sampling,
+                      heightmap_tile=heightmap_tile)
+
+    if int(detail_octaves) > 0 and float(detail_amount) != 0.0:
+        h = fractal_detail(h, p, detail_octaves, detail_amount, gain)
+    sym = str(symmetry or 'NONE').upper()
+    if sym != 'NONE':
+        h = symmetrize_heights(_as2d(h), sym).reshape(-1)
+    if int(thermal_iterations) > 0:
+        h = thermal_erosion(_as2d(h), thermal_iterations, thermal_talus,
+                            thermal_rate).reshape(-1)
+    if int(hydraulic_iterations) > 0:
+        h = hydraulic_erosion(_as2d(h), hydraulic_iterations,
+                              hydraulic_rain, hydraulic_solubility,
+                              hydraulic_evaporation,
+                              hydraulic_capacity).reshape(-1)
+    if int(smooth_passes) > 0:
+        h = smooth_heights(_as2d(h), smooth_passes).reshape(-1)
+    if float(spikes) != 0.0:
+        h = spike_heights(_as2d(h), p, spikes, spike_scale).reshape(-1)
 
     isl = min(max(float(island), 0.0), 1.0)
     if isl > 0.0:
         # radial smoothstep ring: full height inside (1-island) of the
         # half-size, zero at the corner-safe edge radius
-        r = np.sqrt(xs * xs + ys * ys) / half
-        t = np.clip((1.0 - r) / max(isl, 1e-6), 0.0, 1.0)
-        h = h * (t * t * (3.0 - 2.0 * t))
+        h = h * island_mask(xs, ys, half, isl, island_shape)
+    em = str(edge_mode or 'FALLOFF').upper()
+    if em != 'FALLOFF':
+        h = edge_shape(_as2d(h), em, edge_height).reshape(-1)
 
     steps = int(terraces)
     if steps > 0:
@@ -669,6 +1180,21 @@ def terrain(size=24.0, divisions=96, height=6.0, feature_scale=10.0,
     if sea > 0.0:
         h = np.maximum(h, sea)
 
+    if seamless:
+        h = seamless_heights(_as2d(h)).reshape(-1)
+
+    return xs, ys, _as2d(np.asarray(h, np.float32))
+
+
+def heights_to_mesh(xs, ys, h01, height, divisions=None):
+    """R253: the R201 mesh emit -- (verts, faces) from a height field,
+    the vertex tuple and quad loops unchanged."""
+    import numpy as np
+
+    h = np.asarray(h01).reshape(-1)
+    n1 = int(round(h.shape[0] ** 0.5))
+    divisions = n1 - 1 if divisions is None else int(divisions)
+    height = float(height)
     zs = (h * height).astype(np.float32)
     verts = [(float(xs[i]), float(ys[i]), float(zs[i]))
              for i in range(n1 * n1)]
@@ -679,6 +1205,55 @@ def terrain(size=24.0, divisions=96, height=6.0, feature_scale=10.0,
             a = row + c
             faces.append((a, a + 1, a + n1 + 1, a + n1))
     return verts, faces
+
+
+def terrain(size=24.0, divisions=96, height=6.0, feature_scale=10.0,
+            octaves=6, roughness=0.5, ridge=0.5, island=0.4,
+            terraces=0, sea_level=0.0, seed=0, kind='MOUNTAIN',
+            direction=0.0, **stages):
+    """R201: the Bryce mountain -- a fractal heightfield as a grid mesh.
+
+    The Altitude & Slope node shipped with nothing to stand on: this is
+    the terrain that node was built to paint. A (divisions+1)^2 vertex
+    grid, displaced by a blend of smooth fBm (rolling hills) and RIDGED
+    fractal (the knife-edged crests Bryce terrains are remembered for),
+    with the shaping dials the Terrain Editor had:
+
+    - `feature_scale`: metres per large noise feature -- bigger numbers
+      mean broader mountains.
+    - `octaves` / `roughness`: detail levels and how much each level
+      contributes (fBm gain).
+    - `ridge`: 0 is all rolling fBm, 1 is all ridged crest.
+    - `island`: fades the height to zero toward the grid's edge with a
+      smoothstep ring -- a mountain that ENDS inside the grid instead
+      of slicing off at the boundary. 0 disables.
+    - `terraces`: N > 0 quantises the height into N shelves with a
+      smoothed riser between them -- Bryce's terracing.
+    - `sea_level`: fraction of the height range flattened into a floor
+      -- the water table the ocean plane sits on.
+    - `seed`: re-deals the mountain; the same seed is the same mountain
+      on every machine (hash-lattice noise, no RNG state anywhere).
+    - `kind` (R202): the terrain TYPE. MOUNTAIN is the R201 fractal
+      exactly; HILLS is soft pasture; CANYON a cut mesa; DUNES
+      directional sand waves (turned by `direction`, radians); CRATER
+      one great ringed impact; VOLCANO a cone with its caldera bitten
+      out; PLATEAU hard-shouldered table-land. Island, terracing and
+      sea level compose with every kind.
+    - R253: four more kinds -- PICTURE (the heights are an image, see
+      `heightmap`), ARCHIPELAGO, BADLANDS, VALLEY -- and the stage
+      dials of `terrain_heights` (heightmap_*, detail_*, symmetry,
+      thermal_*, hydraulic_*, smooth_passes, spikes, spike_scale,
+      island_shape, edge_mode, edge_height, seamless), every one
+      defaulted to 'off' so a 1.91 call builds the 1.91 mesh bitwise.
+
+    Returns (verts, faces) as plain lists: quads, counter-clockwise
+    seen from above, ready for `validate` and `from_pydata`.
+    """
+    xs, ys, h01 = terrain_heights(
+        size, divisions, height, feature_scale, octaves, roughness,
+        ridge, island, terraces, sea_level, seed, kind, direction,
+        **stages)
+    return heights_to_mesh(xs, ys, h01, height)
 
 
 # ------------------------------------------------------------ hair (R208)

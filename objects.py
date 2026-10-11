@@ -12,7 +12,8 @@ that cannot be -- meshes, materials, operators and the menu.
 
 import bpy
 from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
-                       FloatVectorProperty, IntProperty, PointerProperty)
+                       FloatVectorProperty, IntProperty, PointerProperty,
+                       StringProperty)
 from bpy.types import Menu, Operator, Panel, PropertyGroup
 
 from . import templates
@@ -398,9 +399,604 @@ def _terrain_material(name, height):
     return mat
 
 
+#: R253: the landform menu -- the seven R201/R202 kinds in their saved
+#: order, the four R253 kinds APPENDED after them (a saved file's enum
+#: index keeps its meaning; never reorder). One tuple serves the Add
+#: operator and the per-object settings group.
+TERRAIN_KIND_ITEMS = (
+    ('MOUNTAIN', "Mountain",
+     "The fractal peak -- rolling fBm blended toward ridged "
+     "crests by the Ridged dial"),
+    ('HILLS', "Rolling Hills",
+     "Soft pastureland, no crests at all"),
+    ('CANYON', "Canyon",
+     "A high mesa with winding channels carved out of it"),
+    ('DUNES', "Dunes",
+     "Directional sand waves; the Direction dial turns the "
+     "wind that laid them"),
+    ('CRATER', "Crater",
+     "One great ringed impact: raised rim, sunken floor"),
+    ('VOLCANO', "Volcano",
+     "The cone with its caldera bitten out of the top"),
+    ('PLATEAU', "Plateau",
+     "Hard-shouldered table-land, flat on top"),
+    ('PICTURE', "Picture (Heightmap)",
+     "The heights ARE an image (Bryce's Picture terrain): brightness "
+     "is altitude, the picture's bottom row lies along the grid's -Y "
+     "edge, so it reads as seen from above. Set the image to "
+     "Non-Color so its values arrive untouched"),
+    ('ARCHIPELAGO', "Archipelago",
+     "Many islands rising from a flat sea, each crowned with a "
+     "ridged crest"),
+    ('BADLANDS', "Badlands",
+     "Eroded strata: nine terraced shelves whose risers a talus pass "
+     "has already crumbled"),
+    ('VALLEY', "River Valley",
+     "Rolling hills with one wandering river channel carved along "
+     "the Direction, its floor flat"),
+)
+
+#: R253: every dial `core/geometry.terrain_heights` takes, by the SAME
+#: name on the operator, on the per-object group and in the geometry
+#: call -- `_terrain_params` reads this list from either source
+TERRAIN_FIELDS = (
+    'kind', 'direction', 'size', 'divisions', 'height', 'feature_scale',
+    'octaves', 'roughness', 'ridge', 'island', 'terraces', 'sea_level',
+    'seed',
+    'heightmap_channel', 'heightmap_sampling', 'heightmap_tile',
+    'heightmap_scale', 'heightmap_offset', 'detail_octaves',
+    'detail_amount', 'symmetry', 'thermal_iterations', 'thermal_talus',
+    'thermal_rate', 'hydraulic_iterations', 'hydraulic_rain',
+    'hydraulic_solubility', 'hydraulic_evaporation', 'hydraulic_capacity',
+    'smooth_passes', 'spikes', 'spike_scale', 'island_shape', 'edge_mode',
+    'edge_height', 'seamless')
+
+#: R253: the dials that shape the OBJECT rather than the heights
+TERRAIN_EXTRAS = ('water_plane', 'water_color', 'smooth')
+
+#: divisions above this are applied by the Rebuild button only -- a
+#: slider drag must never trigger a million-vertex from_pydata per tick
+TERRAIN_LIVE_DIVISIONS = 512
+
+
+def _terrain_dials(update=None):
+    """R253: the terrain's height dials, ONE table for the Add operator
+    (no update callback) and the per-object HalcyonTerrainSettings
+    group (every dial re-dials the mesh live). Same names, defaults,
+    ranges and menus on both, so an F9 redo and the Object panel are
+    the same editor, and every default equals the geometry default --
+    an old redo-recorded call builds the 1.91 mesh."""
+    u = {'update': update} if update is not None else {}
+    return dict(
+        kind=EnumProperty(
+            name="Type", default='MOUNTAIN', items=TERRAIN_KIND_ITEMS,
+            description="The landform this terrain grows into; every type "
+                        "still takes the island, terrace and sea dials",
+            **u),
+        direction=FloatProperty(
+            name="Direction", default=0.0, min=-6.2832, max=6.2832,
+            subtype='ANGLE',
+            description="Turns the Dunes' wind and the River Valley's "
+                        "channel (free for any kind that wants a bearing)",
+            **u),
+        size=FloatProperty(
+            name="Size", default=24.0, min=0.1, max=10000.0,
+            description="Width of the terrain grid in scene units, the "
+                        "water plane included",
+            **u),
+        divisions=IntProperty(
+            name="Divisions", default=96, min=2, max=1024,
+            description="Grid squares along each side: 96 is a Bryce-era "
+                        "mountain (9,409 vertices), 256 a modern one "
+                        "(66,049), 1024 the ceiling (1,050,625 -- Blender "
+                        "pauses while it builds; above 512 the live panel "
+                        "waits for Rebuild)",
+            **u),
+        height=FloatProperty(
+            name="Height", default=6.0, min=0.0, max=1000.0,
+            description="Peak altitude of the fractal at full strength",
+            **u),
+        feature_scale=FloatProperty(
+            name="Feature Scale", default=10.0, min=0.1, max=1000.0,
+            description="Metres per large noise feature -- bigger numbers "
+                        "mean broader, calmer mountains",
+            **u),
+        octaves=IntProperty(
+            name="Detail", default=6, min=1, max=12,
+            description="Fractal detail levels; each adds finer bumps at "
+                        "half the strength set by Roughness",
+            **u),
+        roughness=FloatProperty(
+            name="Roughness", default=0.5, min=0.05, max=0.95,
+            description="How much each finer detail level contributes -- "
+                        "low is rolling hills, high is crumpled rock",
+            **u),
+        ridge=FloatProperty(
+            name="Ridged", default=0.5, min=0.0, max=1.0,
+            description="Blend from smooth rolling fBm (0) to the "
+                        "knife-edged ridged crests Bryce is remembered "
+                        "for (1)",
+            **u),
+        island=FloatProperty(
+            name="Island Falloff", default=0.4, min=0.0, max=1.0,
+            description="Fades the height to zero toward the grid edge so "
+                        "the mountain ends inside the grid instead of "
+                        "slicing off at the boundary; 0 disables",
+            **u),
+        terraces=IntProperty(
+            name="Terraces", default=0, min=0, max=64,
+            description="Above zero, quantises the height into this many "
+                        "shelves with smoothed risers -- Bryce's "
+                        "terracing; 0 is off",
+            **u),
+        sea_level=FloatProperty(
+            name="Sea Level", default=0.0, min=0.0, max=0.95,
+            description="Flattens everything below this fraction of the "
+                        "height into a floor -- the water table an ocean "
+                        "plane sits on; 0 is off",
+            **u),
+        seed=IntProperty(
+            name="Seed", default=0, min=0, max=100000,
+            description="Re-deals the mountain; the same seed builds the "
+                        "same mountain on every machine",
+            **u),
+        heightmap_channel=EnumProperty(
+            name="Channel", default='LUMA',
+            items=(('LUMA', "Luminance",
+                    "Rec.709 luma of the picture (0.2126 R + 0.7152 G "
+                    "+ 0.0722 B) drives the height"),
+                   ('R', "Red", "The red plane alone drives the height"),
+                   ('G', "Green",
+                    "The green plane alone drives the height"),
+                   ('B', "Blue", "The blue plane alone drives the height"),
+                   ('A', "Alpha",
+                    "The alpha plane drives the height (1 everywhere "
+                    "for a picture without one)")),
+            description="Which plane of the picture becomes the height "
+                        "for the Picture landform",
+            **u),
+        heightmap_sampling=EnumProperty(
+            name="Sampling", default='BILINEAR',
+            items=(('BILINEAR', "Bilinear",
+                    "Blend the four nearest pixels -- smooth slopes from "
+                    "a picture smaller than the grid"),
+                   ('NEAREST', "Nearest",
+                    "Take the nearest pixel -- hard steps, exact at the "
+                    "picture's own size")),
+            description="How the picture is read between its pixels when "
+                        "the grid is finer or coarser than the image",
+            **u),
+        heightmap_tile=BoolProperty(
+            name="Tile Picture", default=False,
+            description="Sample the picture as a repeating tile so the "
+                        "grid's last row and column wrap to its first -- "
+                        "a seamless picture makes a seamless terrain",
+            **u),
+        heightmap_scale=FloatProperty(
+            name="Picture Scale", default=1.0, min=-10.0, max=10.0,
+            description="Multiplies the picture's values before they "
+                        "become heights; a negative scale inverts the "
+                        "picture (with an Offset of 1 to keep it positive)",
+            **u),
+        heightmap_offset=FloatProperty(
+            name="Picture Offset", default=0.0, min=-10.0, max=10.0,
+            description="Added to the picture's values after Picture "
+                        "Scale; the result is clipped at zero like every "
+                        "landform",
+            **u),
+        detail_octaves=IntProperty(
+            name="Detail Octaves", default=0, min=0, max=8,
+            description="Fine fractal octaves layered on top of any "
+                        "landform or picture (Bryce's fractal detail on a "
+                        "picture terrain); 0 is off",
+            **u),
+        detail_amount=FloatProperty(
+            name="Detail Amount", default=0.0, min=0.0, max=1.0,
+            description="How far the fine octaves move the height, as a "
+                        "fraction of the normalised range; 0 is off",
+            **u),
+        symmetry=EnumProperty(
+            name="Symmetry", default='NONE',
+            items=(('NONE', "None",
+                    "No mirroring: the landform as the noise dealt it"),
+                   ('X', "Mirror X",
+                    "The -X half is mirrored onto the +X half"),
+                   ('Y', "Mirror Y",
+                    "The -Y half is mirrored onto the +Y half"),
+                   ('XY', "Mirror Both",
+                    "Mirrored across both axes -- four identical "
+                    "quarters"),
+                   ('RADIAL', "Radial",
+                    "The average of the four 90-degree rotations -- the "
+                    "same from every side")),
+            description="Bryce's Symmetric brush as a whole-terrain stage, "
+                        "applied before the erosion passes",
+            **u),
+        thermal_iterations=IntProperty(
+            name="Thermal Passes", default=0, min=0, max=200,
+            description="Talus-slide erosion passes (Musgrave 1989): "
+                        "material standing above the talus angle slides "
+                        "down to its lower neighbours; 0 is off",
+            **u),
+        thermal_talus=FloatProperty(
+            name="Talus", default=0.02, min=0.0, max=0.5,
+            description="The height difference between neighbours (of the "
+                        "normalised range) a slope may hold before it "
+                        "slides",
+            **u),
+        thermal_rate=FloatProperty(
+            name="Slide Rate", default=0.5, min=0.0, max=1.0,
+            description="How much of each excess drop slides per pass; 1 "
+                        "is the fastest rate that can never overshoot",
+            **u),
+        hydraulic_iterations=IntProperty(
+            name="Hydraulic Passes", default=0, min=0, max=200,
+            description="Rain-and-sediment erosion passes (Musgrave 1989): "
+                        "water dissolves rock, carries it downhill and "
+                        "drops it as it evaporates; 0 is off",
+            **u),
+        hydraulic_rain=FloatProperty(
+            name="Rain", default=0.01, min=0.0, max=0.2,
+            description="Water added to every cell per pass, as a fraction "
+                        "of the normalised height range",
+            **u),
+        hydraulic_solubility=FloatProperty(
+            name="Solubility", default=0.1, min=0.0, max=1.0,
+            description="The fraction of the standing water's depth "
+                        "dissolved out of the rock each pass",
+            **u),
+        hydraulic_evaporation=FloatProperty(
+            name="Evaporation", default=0.5, min=0.0, max=1.0,
+            description="The fraction of the water that leaves each pass, "
+                        "dropping the sediment it can no longer carry",
+            **u),
+        hydraulic_capacity=FloatProperty(
+            name="Sediment Capacity", default=0.05, min=0.0, max=1.0,
+            description="How much sediment a unit of water keeps in "
+                        "suspension; the rest is deposited back as rock "
+                        "each pass",
+            **u),
+        smooth_passes=IntProperty(
+            name="Smoothing", default=0, min=0, max=32,
+            description="Bryce's Smoothing: 3x3 blur passes over the "
+                        "heights after the erosion; 0 is off",
+            **u),
+        spikes=FloatProperty(
+            name="Spikes", default=0.0, min=0.0, max=1.0,
+            description="Bryce's Spikes: needles of thresholded noise "
+                        "added to the heights, as a fraction of the "
+                        "normalised range; 0 is off",
+            **u),
+        spike_scale=FloatProperty(
+            name="Spike Scale", default=4.0, min=0.5, max=64.0,
+            description="Noise frequency of the spikes relative to the "
+                        "Feature Scale -- higher is finer, denser needles",
+            **u),
+        island_shape=EnumProperty(
+            name="Island Shape", default='RADIAL',
+            items=(('RADIAL', "Round",
+                    "The classic radial ring: zero at the edge radius, "
+                    "the corners always clear"),
+                   ('SQUARE', "Square",
+                    "A square ring (Chebyshev distance) so all four edges "
+                    "fade at the same falloff")),
+            description="The shape of the Island Falloff ring around the "
+                        "terrain",
+            **u),
+        edge_mode=EnumProperty(
+            name="Edges", default='FALLOFF',
+            items=(('FALLOFF', "Falloff Only",
+                    "The edges are shaped by Island Falloff alone"),
+                   ('ZERO', "Zero Edges",
+                    "The outermost ring of vertices is forced to exactly "
+                    "zero"),
+                   ('RAISE', "Raise Edges",
+                    "The outer eighth of the grid rises toward Edge "
+                    "Height -- a bowl or a crater wall")),
+            description="Bryce's Zero Edges / Raise Edges, applied after "
+                        "the island ring and before the terraces",
+            **u),
+        edge_height=FloatProperty(
+            name="Edge Height", default=0.0, min=0.0, max=2.0,
+            description="The normalised height Raise Edges lifts the rim "
+                        "toward (1 is the full Height)",
+            **u),
+        seamless=BoolProperty(
+            name="Seamless", default=False,
+            description="Cross-fade the heights with their half-period "
+                        "roll so the terrain tiles: the last row and "
+                        "column equal the first exactly. Set Island "
+                        "Falloff to 0 for a tile without a zero rim",
+            **u),
+    )
+
+
+def _terrain_extras(update=None):
+    """R253: the object-side dials (the water plane, shading)."""
+    u = {'update': update} if update is not None else {}
+    return dict(
+        water_plane=BoolProperty(
+            name="Water Plane", default=False,
+            description="Add a flat water quad at the Sea Level height as "
+                        "a child object, with a reflective Halcyon "
+                        "material; off removes it again",
+            **u),
+        water_color=FloatVectorProperty(
+            name="Water Colour", subtype='COLOR', size=3, min=0.0, max=1.0,
+            default=(0.10, 0.22, 0.30),
+            description="Diffuse colour of the water plane's material "
+                        "(reflection and highlight sit on top of it)",
+            **u),
+        smooth=BoolProperty(
+            name="Smooth Shading", default=True,
+            description="Smooth-shade the grid so slopes grade instead of "
+                        "facet; turn off for the flat-shaded early look",
+            **u),
+    )
+
+
+def _draw_terrain_dials(layout, src, picker):
+    """R253: the grouped dial boxes -- the F9 redo panel (src is the
+    operator) and the Object Properties panel (src is the group) draw
+    the same editor; `picker` draws the picture chooser each one has."""
+    layout.use_property_split = True
+    box = layout.box()
+    box.label(text="Landform", icon='RNDCURVE')
+    col = box.column(align=True)
+    col.prop(src, 'kind')
+    col.prop(src, 'direction')
+    col.prop(src, 'size')
+    col.prop(src, 'divisions')
+    if int(src.divisions) > TERRAIN_LIVE_DIVISIONS:
+        n1 = int(src.divisions) + 1
+        box.label(text=f"{n1 * n1:,} vertices -- Blender pauses while "
+                       f"it builds", icon='ERROR')
+    col.prop(src, 'height')
+    col.prop(src, 'seed')
+    if str(src.kind) == 'PICTURE':
+        box = layout.box()
+        box.label(text="Picture", icon='IMAGE_DATA')
+        picker(box)
+        col = box.column(align=True)
+        col.prop(src, 'heightmap_channel')
+        col.prop(src, 'heightmap_sampling')
+        col.prop(src, 'heightmap_tile')
+        col.prop(src, 'heightmap_scale')
+        col.prop(src, 'heightmap_offset')
+    box = layout.box()
+    box.label(text="Fractal")
+    col = box.column(align=True)
+    col.prop(src, 'feature_scale')
+    col.prop(src, 'octaves')
+    col.prop(src, 'roughness')
+    col.prop(src, 'ridge')
+    col.prop(src, 'detail_octaves')
+    col.prop(src, 'detail_amount')
+    box = layout.box()
+    box.label(text="Erosion")
+    col = box.column(align=True)
+    col.prop(src, 'thermal_iterations')
+    col.prop(src, 'thermal_talus')
+    col.prop(src, 'thermal_rate')
+    col = box.column(align=True)
+    col.prop(src, 'hydraulic_iterations')
+    col.prop(src, 'hydraulic_rain')
+    col.prop(src, 'hydraulic_solubility')
+    col.prop(src, 'hydraulic_evaporation')
+    col.prop(src, 'hydraulic_capacity')
+    col = box.column(align=True)
+    col.prop(src, 'smooth_passes')
+    col.prop(src, 'spikes')
+    col.prop(src, 'spike_scale')
+    box = layout.box()
+    box.label(text="Shape")
+    col = box.column(align=True)
+    col.prop(src, 'symmetry')
+    col.prop(src, 'island')
+    col.prop(src, 'island_shape')
+    col.prop(src, 'edge_mode')
+    col.prop(src, 'edge_height')
+    col.prop(src, 'seamless')
+    col.prop(src, 'terraces')
+    box = layout.box()
+    box.label(text="Sea", icon='MOD_OCEAN')
+    col = box.column(align=True)
+    col.prop(src, 'sea_level')
+    col.prop(src, 'water_plane')
+    col.prop(src, 'water_color')
+    box = layout.box()
+    box.label(text="Shading")
+    box.prop(src, 'smooth')
+
+
+#: re-entrancy guard (the _FUR_BUSY idiom): the operator filling the
+#: panel's fields, and the rebuild itself, must not re-trigger the
+#: update callbacks -- or every copied field rebuilds the mesh once
+_TERRAIN_BUSY = False
+
+
+def _terrain_params(src):
+    """R253: the kwargs for `GEO.terrain_heights`, read by the one name
+    list from either the operator or the per-object group -> (params,
+    warning-or-None).
+
+    The picture resolves differently on the two sources: an operator
+    cannot carry an ID pointer, so the Add operator holds the image's
+    NAME (`heightmap_name`, looked up in bpy.data.images); the group
+    holds a real `heightmap` pointer. Either way the pixels go in raw
+    (bottom row first, through compat.image_pixels) and the geometry
+    samples them at the grid size. No image, a stale name or an
+    unreadable buffer degrades to a flat Picture with a WARNING --
+    never an exception in execute, redo or a slider drag.
+    """
+    params = {}
+    for nm in TERRAIN_FIELDS:
+        v = getattr(src, nm)
+        params[nm] = str(v) if nm in ('kind', 'heightmap_channel',
+                                      'heightmap_sampling', 'symmetry',
+                                      'island_shape', 'edge_mode') else v
+    warn = None
+    img = None
+    if hasattr(src, 'heightmap_name'):
+        name = str(getattr(src, 'heightmap_name', '') or '')
+        if name:
+            img = bpy.data.images.get(name)
+            if img is None and params['kind'] == 'PICTURE':
+                warn = (f"no image named '{name}' -- the Picture terrain "
+                        f"is a flat plane")
+    else:
+        img = getattr(src, 'heightmap', None)
+    px = None
+    if img is not None:
+        from . import compat
+        px = compat.image_pixels(img)
+        if px is None and params['kind'] == 'PICTURE':
+            warn = (f"image '{getattr(img, 'name', '?')}' has no pixels "
+                    f"-- the Picture terrain is a flat plane")
+    elif params['kind'] == 'PICTURE' and warn is None:
+        warn = ("no Picture chosen -- the terrain is a flat plane; pick "
+                "an image in the Picture box")
+    params['heightmap'] = px
+    return params, warn
+
+
+def _terrain_mesh(name, verts, faces, materials, smooth):
+    """R253: the terrain mesh datablock on the one proven road
+    (from_pydata -- the R214 rule for every Halcyon object)."""
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata(list(verts), [], [list(f) for f in faces])
+    mesh.update()
+    for m in materials:
+        if m is not None:
+            mesh.materials.append(m)
+    if smooth:
+        try:
+            import numpy as _np
+            mesh.polygons.foreach_set(
+                'use_smooth', _np.ones(len(mesh.polygons), bool))
+        except Exception:                                       # noqa: BLE001
+            for poly in mesh.polygons:
+                poly.use_smooth = True
+    return mesh
+
+
+def _terrain_realize(context, params, ob=None, mat=None, smooth=True,
+                     label="Terrain"):
+    """R253: build (ob None) or re-build (ob given) a terrain from its
+    dials -- ONE builder for the Add operator, the live panel and the
+    Rebuild button (the R211 fur shape). Returns (ob, h01): the
+    normalised heights are handed back so Export and the water plane
+    can reuse them."""
+    xs, ys, h01 = GEO.terrain_heights(**params)
+    verts, faces = GEO.heights_to_mesh(xs, ys, h01, params['height'])
+    if ob is None:
+        mats = (mat,) if mat is not None else ()
+        name = label
+    else:
+        mats = tuple(ob.data.materials)
+        name = ob.data.name
+    mesh = _terrain_mesh(name, verts, faces, mats, smooth)
+    if ob is None:
+        ob = bpy.data.objects.new(name, mesh)
+        _present_object(context, ob)
+    else:
+        old = ob.data
+        old_name = old.name
+        ob.data = mesh
+        try:
+            if old.users == 0:
+                bpy.data.meshes.remove(old)
+                mesh.name = old_name
+        except Exception:                                       # noqa: BLE001
+            pass
+    return ob, h01
+
+
+def _terrain_water(context, ob, params, color, enabled):
+    """R253: the water plane -- a child quad of the terrain's size at
+    the sea height (sea_level * height), wearing a reflective Halcyon
+    PHONG. Built or re-fitted when `enabled`; removed when not. The
+    child is remembered by name on the group (`water_child`) so a
+    renamed terrain still finds it; a child the user deleted is simply
+    gone."""
+    ts = getattr(ob, 'halcyon_terrain', None)
+    child = None
+    remembered = str(getattr(ts, 'water_child', '') or '') if ts else ''
+    if remembered:
+        child = bpy.data.objects.get(remembered)
+    if child is None:
+        child = bpy.data.objects.get(f"{ob.name} Water")
+    if not enabled:
+        if child is not None:
+            try:
+                bpy.data.objects.remove(child, do_unlink=True)
+            except Exception:                                   # noqa: BLE001
+                pass
+        if ts is not None:
+            try:
+                ts.water_child = ''
+            except Exception:                                   # noqa: BLE001
+                pass
+        return None
+    sea = min(max(float(params['sea_level']), 0.0), 0.95)
+    z = sea * float(params['height'])
+    verts, faces = GEO.water_quad(params['size'], z)
+    rgb = tuple(float(c) for c in color)[:3]
+    if child is None:
+        mat = _material(f"{ob.name} Water", rgb + (1.0,), model='PHONG',
+                        **{'Reflection': 0.3, 'Specular Level': 0.8,
+                           'Glossiness': 200.0})
+        mesh = _terrain_mesh(f"{ob.name} Water", verts, faces, (mat,),
+                             False)
+        child = bpy.data.objects.new(f"{ob.name} Water", mesh)
+        collection = context.collection or context.scene.collection
+        collection.objects.link(child)
+        try:
+            child.parent = ob
+        except Exception:                                       # noqa: BLE001
+            pass
+    else:
+        old = child.data
+        old_name = old.name
+        mesh = _terrain_mesh(old_name, verts, faces,
+                             tuple(old.materials), False)
+        child.data = mesh
+        try:
+            if old.users == 0:
+                bpy.data.meshes.remove(old)
+                mesh.name = old_name
+        except Exception:                                       # noqa: BLE001
+            pass
+        # the colour is a node edit, not a rebuild
+        for m in list(mesh.materials):
+            tree = getattr(m, 'node_tree', None)
+            if tree is None:
+                continue
+            for nd in tree.nodes:
+                if getattr(nd, 'bl_idname', '') == 'HALCYON_ShaderNode':
+                    try:
+                        sock = nd.inputs['Diffuse Color']
+                        for i in range(3):
+                            sock.default_value[i] = rgb[i]
+                    except Exception:                           # noqa: BLE001
+                        pass
+            try:
+                m.diffuse_color = rgb + (1.0,)
+            except Exception:                                   # noqa: BLE001
+                pass
+    if ts is not None:
+        try:
+            ts.water_child = child.name
+        except Exception:                                       # noqa: BLE001
+            pass
+    return child
+
+
 class HALCYON_OT_add_terrain(_AddBase):
     """A fractal mountain with the Bryce material already on it --
-    altitude bands from shore to snow, steep faces pulled to rock"""
+    altitude bands from shore to snow, steep faces pulled to rock.
+    R253: or a terrain grown from a picture, eroded, mirrored, tiled,
+    and re-dialled later in Object Properties > Halcyon Terrain"""
 
     bl_idname = 'halcyon.add_terrain'
     bl_label = "Terrain"
@@ -409,36 +1005,23 @@ class HALCYON_OT_add_terrain(_AddBase):
         name="Type", default='MOUNTAIN',
         description="The landform this terrain grows into; every type "
                     "still takes the island, terrace and sea dials",
-        items=[
-            ('MOUNTAIN', "Mountain",
-             "The fractal peak -- rolling fBm blended toward ridged "
-             "crests by the Ridged dial"),
-            ('HILLS', "Rolling Hills",
-             "Soft pastureland, no crests at all"),
-            ('CANYON', "Canyon",
-             "A high mesa with winding channels carved out of it"),
-            ('DUNES', "Dunes",
-             "Directional sand waves; the Direction dial turns the "
-             "wind that laid them"),
-            ('CRATER', "Crater",
-             "One great ringed impact: raised rim, sunken floor"),
-            ('VOLCANO', "Volcano",
-             "The cone with its caldera bitten out of the top"),
-            ('PLATEAU', "Plateau",
-             "Hard-shouldered table-land, flat on top"),
-        ])
+        items=TERRAIN_KIND_ITEMS)
     direction: FloatProperty(
         name="Direction", default=0.0, min=-6.2832, max=6.2832,
         subtype='ANGLE',
-        description="Turns the Dunes' wind (and is free for any kind "
-                    "that later wants a bearing)")
+        description="Turns the Dunes' wind and the River Valley's "
+                    "channel (free for any kind that wants a bearing)")
     size: FloatProperty(
         name="Size", default=24.0, min=0.1, max=10000.0,
-        description="Width of the terrain grid in scene units")
+        description="Width of the terrain grid in scene units, the "
+                    "water plane included")
     divisions: IntProperty(
-        name="Divisions", default=96, min=2, max=512,
-        description="Grid squares along each side; 96 is a Bryce-era "
-                    "mountain, 256 a modern one")
+        name="Divisions", default=96, min=2, max=1024,
+        description="Grid squares along each side: 96 is a Bryce-era "
+                    "mountain (9,409 vertices), 256 a modern one "
+                    "(66,049), 1024 the ceiling (1,050,625 -- Blender "
+                    "pauses while it builds; above 512 the live panel "
+                    "waits for Rebuild)")
     height: FloatProperty(
         name="Height", default=6.0, min=0.0, max=1000.0,
         description="Peak altitude of the fractal at full strength")
@@ -482,18 +1065,67 @@ class HALCYON_OT_add_terrain(_AddBase):
         name="Smooth Shading", default=True,
         description="Smooth-shade the grid so slopes grade instead of "
                     "facet; turn off for the flat-shaded early look")
+    # R253: an operator cannot hold an ID pointer (Blender refuses
+    # PointerProperty on operators), so the Picture is chosen by NAME
+    # through prop_search over bpy.data.images; the per-object group
+    # carries the real pointer afterwards
+    heightmap_name: StringProperty(
+        name="Picture", default='',
+        description="The image whose brightness becomes the height for "
+                    "the Picture landform (any size; sampled onto the "
+                    "grid). Set it to Non-Color so sRGB decoding does "
+                    "not bend the heights")
+
+    def draw(self, context):
+        _draw_terrain_dials(
+            self.layout, self,
+            lambda box: box.prop_search(self, 'heightmap_name', bpy.data,
+                                        'images', icon='IMAGE_DATA'))
 
     def execute(self, context):
-        verts, faces = GEO.terrain(
-            self.size, self.divisions, self.height, self.feature_scale,
-            self.octaves, self.roughness, self.ridge, self.island,
-            self.terraces, self.sea_level, self.seed,
-            kind=self.kind, direction=self.direction)
+        global _TERRAIN_BUSY
+        params, warn = _terrain_params(self)
+        if warn:
+            self.report({'WARNING'}, warn)
         label = self.kind.title().replace('_', ' ')
         mat = _terrain_material(label, max(float(self.height), 1e-3))
-        _new_object(context, label, verts, faces, (mat,),
-                    smooth=self.smooth)
+        _TERRAIN_BUSY = True
+        try:
+            ob, _h01 = _terrain_realize(context, params, mat=mat,
+                                        smooth=bool(self.smooth),
+                                        label=label)
+            ts = getattr(ob, 'halcyon_terrain', None)
+            if ts is not None:
+                # the dials move onto the object, so the panel can
+                # re-dial this terrain long after the redo panel is gone
+                for nm in TERRAIN_FIELDS + TERRAIN_EXTRAS:
+                    try:
+                        setattr(ts, nm, getattr(self, nm))
+                    except Exception:                           # noqa: BLE001
+                        pass
+                try:
+                    ts.heightmap = (bpy.data.images.get(self.heightmap_name)
+                                    if self.heightmap_name else None)
+                except Exception:                               # noqa: BLE001
+                    pass
+                ts.is_terrain = True
+            _terrain_water(context, ob, params, tuple(self.water_color),
+                           bool(self.water_plane))
+        finally:
+            _TERRAIN_BUSY = False
         return {'FINISHED'}
+
+
+# R253: the stage dials and the water dials come from the one table,
+# appended to the operator's own annotations (the names above stay
+# where the 1.91 file declared them)
+_ann = dict(HALCYON_OT_add_terrain.__annotations__)
+for _nm, _prop in list(_terrain_dials().items()) \
+        + list(_terrain_extras().items()):
+    if _nm not in _ann:
+        _ann[_nm] = _prop
+HALCYON_OT_add_terrain.__annotations__ = _ann
+del _ann, _nm, _prop
 
 
 # ---------------------------------------------------------------- fur
@@ -1268,6 +1900,245 @@ class HALCYON_PT_fur(Panel):
                         icon='FILE_REFRESH')
 
 
+# ------------------------------------------- the terrain's live dials
+#
+# R253: the R211 fur pattern exactly. The Add operator stores its dials
+# on the object (HalcyonTerrainSettings), a panel in Object Properties
+# re-dials them live, and the ONE builder (_terrain_realize) serves the
+# operator, the live update and the Rebuild button. Nothing in the
+# exporter reads the group: the terrain and its water plane export as
+# ordinary meshes, so both devices rasterise them identically.
+
+
+def _terrain_update(self, context):
+    """A dial moved on the panel: re-dial the mesh in place. Divisions
+    above TERRAIN_LIVE_DIVISIONS are applied by the Rebuild button only
+    (a slider drag must not build a million vertices per tick)."""
+    global _TERRAIN_BUSY
+    if _TERRAIN_BUSY or not self.is_terrain:
+        return
+    ob = self.id_data
+    if getattr(ob, 'type', 'MESH') != 'MESH':
+        return
+    if int(self.divisions) > TERRAIN_LIVE_DIVISIONS:
+        try:
+            have = len(ob.data.vertices)
+        except Exception:                                       # noqa: BLE001
+            have = -1
+        if (int(self.divisions) + 1) ** 2 != have:
+            return
+    _TERRAIN_BUSY = True
+    try:
+        params, warn = _terrain_params(self)
+        if warn:
+            print(f'[Halcyon] terrain: {warn}')
+        _terrain_realize(context, params, ob=ob, smooth=bool(self.smooth))
+        _terrain_water(context, ob, params, tuple(self.water_color),
+                       bool(self.water_plane))
+    except Exception:                                           # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+    finally:
+        _TERRAIN_BUSY = False
+
+
+def _terrain_water_update(self, context):
+    """The water dials re-fit the plane alone; the terrain stays."""
+    global _TERRAIN_BUSY
+    if _TERRAIN_BUSY or not self.is_terrain:
+        return
+    _TERRAIN_BUSY = True
+    try:
+        params, _warn = _terrain_params(self)
+        _terrain_water(context, self.id_data, params,
+                       tuple(self.water_color), bool(self.water_plane))
+    except Exception:                                           # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+    finally:
+        _TERRAIN_BUSY = False
+
+
+class HalcyonTerrainSettings(PropertyGroup):
+    """R253: the terrain's dials, living on the terrain object itself
+    (bpy.types.Object.halcyon_terrain). Every height dial of the Add
+    operator by the same name, each re-dialling the mesh on change,
+    plus the real Image pointer the operator could not carry."""
+
+
+def _terrain_group_annotations():
+    ann = dict(
+        is_terrain=BoolProperty(
+            default=False, options={'HIDDEN'},
+            description="Set by the Terrain operator on the objects it "
+                        "built; the panel and Rebuild poll on it"),
+        heightmap=PointerProperty(
+            type=bpy.types.Image, name="Picture", update=_terrain_update,
+            description="The image whose brightness becomes the height "
+                        "for the Picture landform (any size; sampled onto "
+                        "the grid, bottom row toward -Y). Set it to "
+                        "Non-Color so sRGB decoding does not bend the "
+                        "heights"),
+        water_child=StringProperty(
+            default='', options={'HIDDEN'},
+            description="Name of the water plane object this terrain "
+                        "owns, so toggling Water off can remove it even "
+                        "after the terrain was renamed"),
+    )
+    ann.update(_terrain_dials(update=_terrain_update))
+    extras = _terrain_extras(update=_terrain_water_update)
+    extras['smooth'] = _terrain_extras(update=_terrain_update)['smooth']
+    ann.update(extras)
+    return ann
+
+
+HalcyonTerrainSettings.__annotations__ = _terrain_group_annotations()
+
+
+class HALCYON_OT_terrain_rebuild(Operator):
+    """Rebuild the terrain from the panel's dials as they are NOW --
+    the road for Divisions above 512, and for a picture edited since"""
+
+    bl_idname = 'halcyon.terrain_rebuild'
+    bl_label = "Rebuild Terrain"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        ob = getattr(context, 'object', None)
+        return (ob is not None
+                and getattr(getattr(ob, 'halcyon_terrain', None),
+                            'is_terrain', False))
+
+    def execute(self, context):
+        global _TERRAIN_BUSY
+        ob = context.object
+        ts = ob.halcyon_terrain
+        params, warn = _terrain_params(ts)
+        if warn:
+            self.report({'WARNING'}, warn)
+        _TERRAIN_BUSY = True
+        try:
+            _terrain_realize(context, params, ob=ob, smooth=bool(ts.smooth))
+            _terrain_water(context, ob, params, tuple(ts.water_color),
+                           bool(ts.water_plane))
+        finally:
+            _TERRAIN_BUSY = False
+        return {'FINISHED'}
+
+
+class HALCYON_OT_terrain_export_heightmap(Operator):
+    """Write the terrain's CURRENT heights (sculpts included) into an
+    Image as a float heightmap the Picture landform reads back exactly"""
+
+    bl_idname = 'halcyon.terrain_export_heightmap'
+    bl_label = "Export Heightmap"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    image_name: StringProperty(
+        name="Image", default='',
+        description="Name of the image to write (created if missing, "
+                    "resized if its size differs); empty names it after "
+                    "the terrain")
+    normalize: BoolProperty(
+        name="Normalize", default=False,
+        description="Stretch the heights to fill 0..1 instead of dividing "
+                    "by the terrain's Height dial (a sculpted peak above "
+                    "Height would otherwise exceed 1)")
+
+    @classmethod
+    def poll(cls, context):
+        ob = getattr(context, 'object', None)
+        return (ob is not None
+                and getattr(getattr(ob, 'halcyon_terrain', None),
+                            'is_terrain', False))
+
+    def execute(self, context):
+        import numpy as np
+        ob = context.object
+        ts = ob.halcyon_terrain
+        try:
+            nv = len(ob.data.vertices)
+            buf = np.empty(nv * 3, np.float32)
+            ob.data.vertices.foreach_get('co', buf)
+        except Exception as exc:                                # noqa: BLE001
+            self.report({'ERROR'}, f"could not read the mesh: {exc}")
+            return {'CANCELLED'}
+        n1 = int(round(nv ** 0.5))
+        if n1 * n1 != nv or n1 < 2:
+            self.report({'ERROR'},
+                        f"the mesh has {nv} vertices, not a square grid "
+                        f"-- only a terrain lattice exports")
+            return {'CANCELLED'}
+        z = buf.reshape(nv, 3)[:, 2]
+        if self.normalize:
+            lo, hi = float(z.min()), float(z.max())
+            h01 = (z - lo) / max(hi - lo, 1e-9)
+        else:
+            h01 = z / max(float(ts.height), 1e-6)
+        px = GEO.heights_to_pixels(h01.reshape(n1, n1).astype(np.float32))
+        name = str(self.image_name or '') or f"{ob.name} Heightmap"
+        img = bpy.data.images.get(name)
+        if img is None:
+            img = bpy.data.images.new(name, n1, n1, alpha=False,
+                                      float_buffer=True)
+        elif tuple(img.size) != (n1, n1):
+            img.scale(n1, n1)
+        try:
+            img.colorspace_settings.name = 'Non-Color'
+        except Exception:                                       # noqa: BLE001
+            pass
+        # engine images are bottom-row-first -- Blender's pixel order
+        img.pixels.foreach_set(np.ascontiguousarray(px, np.float32).ravel())
+        img.update()
+        from . import compat
+        compat.clear_image_cache()
+        self.report({'INFO'},
+                    f"Exported '{ob.name}' heights into image '{name}' "
+                    f"({n1}x{n1})")
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+
+class HALCYON_PT_terrain(Panel):
+    """Object Properties > Halcyon Terrain: the terrain's live dials."""
+
+    bl_label = "Halcyon Terrain"
+    bl_idname = 'HALCYON_PT_terrain'
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = 'object'
+
+    @classmethod
+    def poll(cls, context):
+        ob = getattr(context, 'object', None)
+        return (ob is not None
+                and getattr(getattr(ob, 'halcyon_terrain', None),
+                            'is_terrain', False))
+
+    def draw(self, context):
+        layout = self.layout
+        ob = context.object
+        ts = ob.halcyon_terrain
+        row = layout.row(align=True)
+        row.operator(HALCYON_OT_terrain_rebuild.bl_idname,
+                     icon='FILE_REFRESH')
+        row.operator(HALCYON_OT_terrain_export_heightmap.bl_idname,
+                     icon='EXPORT')
+        if int(ts.divisions) > TERRAIN_LIVE_DIVISIONS:
+            try:
+                have = len(ob.data.vertices)
+            except Exception:                                   # noqa: BLE001
+                have = -1
+            if (int(ts.divisions) + 1) ** 2 != have:
+                layout.label(text="Divisions above 512 apply on Rebuild",
+                             icon='INFO')
+        _draw_terrain_dials(layout, ts,
+                            lambda box: box.prop(ts, 'heightmap'))
+
+
 # -------------------------------------------------------------- the menu
 
 
@@ -1286,6 +2157,9 @@ class VIEW3D_MT_halcyon_add(Menu):
         layout.separator()
         layout.operator(HALCYON_OT_add_terrain.bl_idname,
                         icon='RNDCURVE')
+        layout.operator(HALCYON_OT_add_terrain.bl_idname,
+                        text="Terrain From Image",
+                        icon='IMAGE_DATA').kind = 'PICTURE'
         layout.operator(HALCYON_OT_add_fur_shells.bl_idname,
                         icon='STRANDS')
 
@@ -1297,11 +2171,13 @@ def draw_add_menu(self, context):
     self.layout.menu(VIEW3D_MT_halcyon_add.bl_idname, icon='SHADING_RENDERED')
 
 
-CLASSES = (HalcyonFurSettings, HALCYON_OT_add_teapot,
+CLASSES = (HalcyonFurSettings, HalcyonTerrainSettings, HALCYON_OT_add_teapot,
            HALCYON_OT_add_teaset,
            HALCYON_OT_add_cornell_box, HALCYON_OT_add_checker_plane,
            HALCYON_OT_add_terrain, HALCYON_OT_add_fur_shells,
            HALCYON_OT_fur_rebuild, HALCYON_PT_fur,
+           HALCYON_OT_terrain_rebuild, HALCYON_OT_terrain_export_heightmap,
+           HALCYON_PT_terrain,
            VIEW3D_MT_halcyon_add)
 
 
@@ -1310,6 +2186,9 @@ def register():
         bpy.utils.register_class(cls)
     # the pelt's live dials live on the OBJECT (R211)
     bpy.types.Object.halcyon_fur = PointerProperty(type=HalcyonFurSettings)
+    # R253: the terrain's live dials live on the OBJECT too
+    bpy.types.Object.halcyon_terrain = PointerProperty(
+        type=HalcyonTerrainSettings)
     menu = getattr(bpy.types, 'VIEW3D_MT_add', None)
     if menu is not None and hasattr(menu, 'append'):
         menu.append(draw_add_menu)
@@ -1324,6 +2203,10 @@ def unregister():
             pass
     try:
         del bpy.types.Object.halcyon_fur
+    except Exception:                                           # noqa: BLE001
+        pass
+    try:
+        del bpy.types.Object.halcyon_terrain
     except Exception:                                           # noqa: BLE001
         pass
     for cls in reversed(CLASSES):

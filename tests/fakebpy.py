@@ -290,16 +290,91 @@ class _Collection:
         self._items.append(item)
         return item
 
-    def remove(self, item):
+    def remove(self, item, **_kw):
         if item in self._items:
             self._items.remove(item)
+
+    # R253: the terrain tool looks images up by name (`bpy.data.images.get`)
+    # and the suite walks collections; Blender's ID collections do both
+    def get(self, name, default=None):
+        for item in self._items:
+            if getattr(item, 'name', None) == name:
+                return item
+        return default
+
+    def __iter__(self):
+        return iter(list(self._items))
+
+    def __len__(self):
+        return len(self._items)
+
+
+class _FakePixels:
+    """R253: bpy.types.Image.pixels -- foreach_get / foreach_set over a
+    float32 buffer, bottom row first, four floats per pixel (Blender's
+    own layout, the one compat.image_pixels reads)."""
+
+    def __init__(self, image):
+        self._image = image
+
+    def foreach_get(self, buf):
+        import numpy as np
+        src = self._image._buf
+        np.asarray(buf)[:src.size] = src
+
+    def foreach_set(self, seq):
+        import numpy as np
+        arr = np.asarray(seq, np.float32).ravel()
+        if arr.size != self._image._buf.size:
+            raise ValueError(f'foreach_set: expected {self._image._buf.size} '
+                             f'floats, got {arr.size}')
+        self._image._buf[:] = arr
+        self._image.is_dirty = True
+
+    def __len__(self):
+        return int(self._image._buf.size)
+
+
+class _FakeImage:
+    """R253: a bpy.types.Image stand-in with the surface the terrain
+    tool and compat.image_pixels touch: name / size / has_data / source
+    / filepath_raw / is_dirty / colorspace_settings, a pixels buffer,
+    scale() and update()."""
+
+    def __init__(self, name, width=0, height=0, alpha=True,
+                 float_buffer=False, **_kw):
+        import numpy as np
+        self.name = name
+        self.name_full = name
+        self.size = (int(width), int(height))
+        self.has_data = True
+        self.source = 'GENERATED'
+        self.filepath_raw = ''
+        self.is_dirty = False
+        self.is_float = bool(float_buffer)
+        self.alpha_mode = 'STRAIGHT' if alpha else 'NONE'
+        self.colorspace_settings = types.SimpleNamespace(name='Non-Color')
+        self._buf = np.zeros(int(width) * int(height) * 4, np.float32)
+        self._buf[3::4] = 1.0
+        self.pixels = _FakePixels(self)
+        self.users = 0
+
+    def scale(self, width, height):
+        import numpy as np
+        self.size = (int(width), int(height))
+        self._buf = np.zeros(int(width) * int(height) * 4, np.float32)
+        self._buf[3::4] = 1.0
+
+    def update(self):
+        pass
 
 
 data = types.SimpleNamespace(texts=types.SimpleNamespace(new=lambda n: Text()),
                              materials=_Collection(),
                              meshes=_Collection(),
                              objects=_Collection(),
-                             lights=_Collection())
+                             lights=_Collection(),
+                             images=_Collection(_FakeImage))
 context = types.SimpleNamespace(engine='HALCYON_RENDER')
 
 bpy = types.ModuleType('bpy')
