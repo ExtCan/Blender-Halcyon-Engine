@@ -2094,7 +2094,12 @@ def test_add_menu_is_complete():
     panel_ops = [c for c in objects.CLASSES
                  if c.__name__.startswith('HALCYON_OT_')
                  and not c.__name__.startswith('HALCYON_OT_add_')]
-    psrc = inspect.getsource(objects.HALCYON_PT_fur.draw)
+    # R253: the module carries more than one panel now (the fur panel
+    # and the terrain panel) -- a panel operator is reachable from ANY
+    # of the module's panels
+    psrc = ''.join(inspect.getsource(c.draw) for c in objects.CLASSES
+                   if c.__name__.startswith('HALCYON_PT_')
+                   and callable(getattr(c, 'draw', None)))
     dangling = [c.bl_idname for c in panel_ops if c.__name__ not in psrc]
     check('every panel operator is reachable from its panel',
           not dangling, ', '.join(dangling))

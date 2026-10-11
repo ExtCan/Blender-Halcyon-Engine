@@ -1464,6 +1464,31 @@ ready-wired to the **Altitude & Slope** node, which grades a material by
 height and steepness — with an optional noise socket to roughen the band
 edges, and a ColorRamp downstream is the classic snow-line in two nodes.
 
+**Terrain, expanded (1.92).** *Add > Halcyon > Terrain* grows eleven
+landforms now: the seven of before plus **Archipelago**, **Badlands**,
+**River Valley** and **Picture (Heightmap)** -- a terrain whose heights
+are an image (*Add > Halcyon > Terrain From Image* opens it on that
+type). Pick any image in the redo panel; choose the plane it reads
+(luminance, or one channel), bilinear or nearest sampling, tiling for a
+seamless picture, and a scale and offset. The picture lies on the ground
+the way you see it from above (its bottom row toward -Y); set it to
+Non-Color so the heights arrive untouched. Under the Landform box sit the
+Bryce Terrain Editor's dials: fractal **Detail** octaves on any base
+(a picture gets procedural grit), **Thermal** and **Hydraulic** erosion
+passes (the talus slide and the rain-and-sediment model of Musgrave's
+1989 paper), **Smoothing**, **Spikes**, **Symmetry** (mirror or radial),
+a round or **Square** island, **Zero / Raise Edges**, a **Seamless** tile
+and the terraces, with Divisions up to 1024 (a million vertices -- the
+panel warns, and Blender pauses). **Sea Level** can now put a **Water
+Plane** under the mountain: a reflective quad at the sea height, a child
+of the terrain, re-fitted as you dial. Every terrain the operator builds
+carries its dials in **Object Properties > Halcyon Terrain**, so you can
+come back a week later and re-dial it live (above 512 divisions the
+**Rebuild Terrain** button applies the change), and **Export Heightmap**
+writes the current heights -- sculpts included -- into a float image the
+Picture landform reads back exactly. The terrain and its water export as
+ordinary meshes, so both devices draw them the same.
+
 **Halo materials** — the era's glow sprites, splatted against the
 frame's own depth: images, noise breakup, colour ramps over radius,
 rays, star spikes, lightning bolts, shockwave rings, halos along curve
