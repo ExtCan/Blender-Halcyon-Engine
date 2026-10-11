@@ -2469,9 +2469,10 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
                 col.prop(hs, 'decay_ld2')
             if hs.decay.startswith('GX_'):
                 col.prop(hs, 'gx_ref_brite')
-            if not getattr(hs, 'hemi', False):
+            if light.type != 'SUN':
                 # R253 (E): 3ds Max's Near Attenuation fade-in (the far
-                # pair is the Custom Range falloff); never on a hemi
+                # pair is the Custom Range falloff); never on a Sun or
+                # a hemi -- directional lamps carry no attenuation
                 col.prop(hs, 'decay_near_start')
                 col.prop(hs, 'decay_near_end')
         if light.type == 'SPOT':

@@ -1435,8 +1435,9 @@ def test_export_and_ui():
                 check('an AREA panel shows no near pair, no Square, no clip',
                       'decay_near_start' not in rec and 'spot_square' not in rec
                       and 'shadow_clip_start' not in rec)
-            if kind == 'SUN' and hemi:
-                check('a hemi SUN panel shows the ground colour and no near pair',
+            if kind == 'SUN':
+                check(f'a SUN panel (hemi {hemi}) shows the ground colour and '
+                      'no near pair (directional lamps never attenuate)',
                       'hemi_ground' in rec and 'decay_near_start' not in rec)
     check('across the lamp kinds every new dial is drawn',
           all(f in seen_all for f in NEW_FIELDS),
