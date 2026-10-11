@@ -10,6 +10,7 @@ renderer collapses that into one of its period reflectance models -- so a tree
 built for Cycles still renders, translated rather than ignored.
 """
 
+import math
 import os
 
 import numpy as np
@@ -857,6 +858,10 @@ def _tex_vector(ev, node, default='generated'):
         return ev.input(node, 'Vector', VECTOR)
     if default == 'uv':
         return np.concatenate([c.uv, np.zeros((c.n, 1), np.float32)], 1)
+    if default == 'world':
+        # R253: the Object Projection node measures the WORLD position
+        # when nothing is linked (gpu/emit.tex_vector answers hal_P)
+        return c.P
     return c.generated
 
 
@@ -5877,6 +5882,62 @@ def _vec_uv(ev, node):
     return np.array(_tex_vector(ev, node, 'uv'), np.float32, copy=True)
 
 
+# ---- R253: the mapping helpers both tri-planar nodes and the Object
+# Projection share, so the roads cannot drift. Every expression is
+# ordered exactly as its GLSL twin in gpu/emit.py ((a + b) + c, never
+# a + (b + c)) and runs in float32.
+
+_F32_HALF = np.float32(0.5)
+_F32_ONE = np.float32(1.0)
+
+
+def _vec_or_normal(ev, node):
+    """The Normal input when linked, else the shading normal (the GPU
+    reads em.input or hal_N)."""
+    if ev.has_link(node, 'Normal'):
+        return np.asarray(ev.input(node, 'Normal', VECTOR), np.float32)
+    return np.asarray(ev.ctx.N, np.float32)
+
+
+def _tri_planar_frames(v, n, sc, blend):
+    """Tri-planar texturing's three frames and weights (Geiss, GPU Gems 3
+    ch. 1): w_i = max(|n_i| - t, 0) with t = (1 - Blend) * 0.5 (0.5 is
+    below 1/sqrt(3), so a unit normal's dominant axis always survives),
+    normalised over (wx + wy) + wz; the UV pairs are the Image Texture's
+    Box pairs (`_box_project`: X -> (y, z), Y -> (x, z), Z -> (x, y)),
+    so an axis-aligned normal reproduces the Box answer. Returns
+    ((ux, vx), (uy, vy), (uz, vz), (wx, wy, wz)), float32 lanes."""
+    a = np.abs(n)
+    t = (_F32_ONE - np.clip(blend, 0.0, 1.0).astype(np.float32)) * _F32_HALF
+    wx = np.maximum(a[:, 0] - t, np.float32(0.0))
+    wy = np.maximum(a[:, 1] - t, np.float32(0.0))
+    wz = np.maximum(a[:, 2] - t, np.float32(0.0))
+    s = np.maximum((wx + wy) + wz, np.float32(1e-9))
+    wx = wx / s
+    wy = wy / s
+    wz = wz / s
+    ux = v[:, 1] / sc
+    vx = v[:, 2] / sc
+    uy = v[:, 0] / sc
+    vy = v[:, 2] / sc
+    uz = v[:, 0] / sc
+    vz = v[:, 1] / sc
+    return ((ux, vx), (uy, vy), (uz, vz),
+            (wx.astype(np.float32), wy.astype(np.float32),
+             wz.astype(np.float32)))
+
+
+def _lit8(x):
+    """A scalar as the GPU reads it: gpu/emit.Emitter._m prints every
+    baked literal with 8 significant digits (`{:.8g}`), so the CPU
+    rounds through the same decimal before casting to float32 -- both
+    devices then read one number, bit for bit."""
+    try:
+        return np.float32(float(f'{float(x):.8g}'))
+    except (TypeError, ValueError):
+        return np.float32(0.0)
+
+
 def _rot2(v, cx, cy, ang):
     ca, sa = np.cos(ang), np.sin(ang)
     x = v[:, 0] - cx
@@ -6456,6 +6517,10 @@ def n_v16_projector(ev, node):
     w = v[:, order[1]]
     h = v[:, order[2]]
     mode = str(_prop(node, 'mode', 'PLANAR'))
+    if mode in _PROJECTOR_R253_MODES:
+        # R253: the appended modes; the four shipped modes below are
+        # byte-for-byte 1.91 (the frozen-digest test pins them)
+        return _projector_r253(ev, node, mode, v, sc, order, u, w, h)
     n = v.shape[0]
     if mode == 'CYLINDER':
         a = (np.arctan2(w, u) / _TWO_PI) % 1.0
@@ -6491,6 +6556,322 @@ def n_v16_spin(ev, node):
          else np.float32(0.0))
     return {'Vector': _rot2(v, ctr[:, 0], ctr[:, 1],
                             base + t * sp * _TWO_PI).astype(np.float32)}
+
+
+# ---- R253: more mapping types -- the Projector's appended modes and the
+# tri-planar / object-projection / hex-grid nodes. Sources: Blender 2.79
+# Internal's texco_mapping (Object / Refl / Nor / Window texco), the 2.79
+# manual's Mapping panel, 3D Studio R4's Mapping and Camera Map, Imagine
+# 3.0's Screen brush mapping, Debevec's light-probe conventions (SIGGRAPH
+# 98), Geiss (GPU Gems 3 ch. 1) for tri-planar weights, Red Blob Games'
+# hexagonal grids for the axial / cube rounding. Every branch is written
+# in the order its GLSL twin (gpu/emit.py) evaluates, in float32.
+
+_PI_F = np.float32(np.pi)
+_PROJECTOR_R253_MODES = frozenset((
+    'CUBE', 'EQUIRECT', 'MIRROR_BALL', 'ANGULAR', 'CYLINDER_CAP', 'SCREEN',
+    'REFLECTION', 'NORMAL', 'TANGENT'))
+#: the identity's first three rows, the Object Projection fallback
+_IDENT12 = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+
+
+def _equirect_f32(x, y, z):
+    """texture.env_equirect_uv's text on three float32 lanes -- the
+    hal_sky_sample_env GLSL verbatim: no normalize (atan2 is
+    scale-invariant; the zero vector reads the 1e-12 guard on both
+    roads)."""
+    u = np.arctan2(y, -x) / _TWO_PI + _F32_HALF
+    v = np.arctan2(z, np.sqrt(np.maximum(x * x + y * y, np.float32(1e-12)))) \
+        / _PI_F + _F32_HALF
+    return u.astype(np.float32), v.astype(np.float32)
+
+
+def _projector_r253(ev, node, mode, v, sc, order, u, w, h):
+    """The nine appended Projector modes. `v` is the raw input vector,
+    `sc` max(Scale, 1e-9), (u, w, h) the axis-reordered triple exactly as
+    the shipped modes read it."""
+    c = ev.ctx
+    n = v.shape[0]
+    z0 = np.zeros(n, np.float32)
+    one = np.ones(n, np.float32)
+    if mode == 'CUBE':
+        # six faces by the NORMAL's dominant axis (the >= chain is
+        # np.argmax's first-max rule, the _box_project pairs), each into
+        # a 3 x 2 atlas: columns X Y Z, bottom row the negative faces
+        N = np.asarray(c.N, np.float32)
+        a = np.abs(N)
+        dx = a[:, 0] >= np.maximum(a[:, 1], a[:, 2])
+        dy = a[:, 1] >= a[:, 2]
+        axis_i = np.where(dx, np.float32(0.0),
+                          np.where(dy, np.float32(1.0),
+                                   np.float32(2.0))).astype(np.float32)
+        nd = np.where(dx, N[:, 0], np.where(dy, N[:, 1], N[:, 2]))
+        neg = (nd < 0.0).astype(np.float32)
+        fu = np.where(dx, v[:, 1], np.where(dy, v[:, 0], v[:, 0])) / sc
+        fv = np.where(dx, v[:, 2], np.where(dy, v[:, 2], v[:, 1])) / sc
+        ox = (axis_i + (fu - np.floor(fu))) / np.float32(3.0)
+        oy = ((_F32_ONE - neg) + (fv - np.floor(fv))) / np.float32(2.0)
+        oz = axis_i * np.float32(2.0) + neg
+        return {'Vector': np.stack([ox, oy, oz], 1).astype(np.float32)}
+    if mode == 'EQUIRECT':
+        ou, ov = _equirect_f32(u, w, h)
+        return {'Vector': np.stack([ou / sc, ov / sc, z0], 1)
+                .astype(np.float32)}
+    if mode in ('MIRROR_BALL', 'ANGULAR'):
+        # an explicit divide by the same sqrt on both roads (GLSL's
+        # normalize() guards differently)
+        ln = np.maximum(np.sqrt((u * u + w * w) + h * h), np.float32(1e-9))
+        dx = u / ln
+        dy = w / ln
+        dz = h / ln
+        if mode == 'MIRROR_BALL':
+            # texture.env_sphere_uv: the OpenGL GL_SPHERE_MAP formula
+            m = np.float32(2.0) * np.sqrt(np.maximum(
+                (dx * dx + dy * dy) + (dz + _F32_ONE) * (dz + _F32_ONE),
+                np.float32(1e-8)))
+            ox = (dx / m + _F32_HALF) / sc
+            oy = (dy / m + _F32_HALF) / sc
+        else:
+            # Debevec's angular map: radius = angle from the axis / pi
+            r = np.arccos(np.clip(dz, -1.0, 1.0)) / _PI_F \
+                / np.maximum(np.sqrt(dx * dx + dy * dy), np.float32(1e-9))
+            ox = (dx * r * _F32_HALF + _F32_HALF) / sc
+            oy = (dy * r * _F32_HALF + _F32_HALF) / sc
+        return {'Vector': np.stack([ox, oy, z0], 1).astype(np.float32)}
+    if mode == 'CYLINDER_CAP':
+        # the CYLINDER text round the side; a flat lid where the normal
+        # leans past 45 degrees along the axis (z = 1 there)
+        a = (np.arctan2(w, u) / _TWO_PI) % 1.0
+        N = np.asarray(c.N, np.float32)
+        lid = np.abs(N[:, order[2]]) > np.float32(0.70710678)
+        ox = np.where(lid, u / sc, a / sc)
+        oy = np.where(lid, w / sc, h / sc)
+        oz = np.where(lid, one, z0)
+        return {'Vector': np.stack([ox, oy, oz], 1).astype(np.float32)}
+    if mode == 'SCREEN':
+        # the Tex Coord Window rule (n_tex_coord): the pixel's own
+        # window position; a HIT context (px None) reads zeros
+        if c.px is None or not c.width:
+            ox = z0
+            oy = z0
+        else:
+            ox = ((c.px + 0.5) / c.width).astype(np.float32)
+            oy = ((c.py + 0.5) / c.height).astype(np.float32)
+            if _prop(node, 'aspect', False):
+                ox = ox * np.float32(float(c.width) / float(c.height))
+        return {'Vector': np.stack([ox / sc, oy / sc, z0], 1)
+                .astype(np.float32)}
+    if mode == 'REFLECTION':
+        # n_tex_coord's Reflection output into the equirect text; the
+        # axis is ignored, as Reflection on Tex Coord ignores it
+        R = M.reflect(M.normalize(np.asarray(c.I, np.float32)),
+                      M.normalize(np.asarray(c.N, np.float32)))
+        ou, ov = _equirect_f32(R[:, 0], R[:, 1], R[:, 2])
+        return {'Vector': np.stack([ou / sc, ov / sc, z0], 1)
+                .astype(np.float32)}
+    if mode == 'NORMAL':
+        N = np.asarray(c.N, np.float32)
+        ox = (N[:, 0] * _F32_HALF + _F32_HALF) / sc
+        oy = (N[:, 1] * _F32_HALF + _F32_HALF) / sc
+        oz = N[:, 2] * _F32_HALF + _F32_HALF
+        return {'Vector': np.stack([ox, oy, oz], 1).astype(np.float32)}
+    # TANGENT: the raw vector in the Normal Map node's frame
+    # (mathx.orthonormal_basis, gpu/emit.e_normal_map's three lines)
+    nn = M.normalize(np.asarray(c.N, np.float32))
+    t, b = M.orthonormal_basis(nn)
+    ox = M.dot(v, t) / sc
+    oy = M.dot(v, b) / sc
+    oz = M.dot(v, nn)
+    return {'Vector': np.stack([ox, oy, oz], 1).astype(np.float32)}
+
+
+def n_v16_tri_planar(ev, node):
+    """Tri-Planar Coordinates: the three Box frames and the normal's
+    blend weights (`_tri_planar_frames`)."""
+    c = ev.ctx
+    v = np.array(_tex_vector(ev, node, 'generated'), np.float32, copy=True)
+    nrm = _vec_or_normal(ev, node)
+    sc = np.maximum(ev.input(node, 'Scale', VALUE), 1e-9).astype(np.float32)
+    blend = np.asarray(ev.input(node, 'Blend', VALUE), np.float32)
+    (ux, vx), (uy, vy), (uz, vz), (wx, wy, wz) = \
+        _tri_planar_frames(v, nrm, sc, blend)
+    z0 = np.zeros(c.n, np.float32)
+    return {'UV X': np.stack([ux, vx, z0], 1).astype(np.float32),
+            'UV Y': np.stack([uy, vy, z0], 1).astype(np.float32),
+            'UV Z': np.stack([uz, vz, z0], 1).astype(np.float32),
+            'Weight X': wx, 'Weight Y': wy, 'Weight Z': wz}
+
+
+def n_u16_tri_planar_mix(ev, node):
+    """Tri-Planar Mix: (cx*wx + cy*wy) + cz*wz on all four channels."""
+    cx = np.asarray(ev.input(node, 'Color X', RGBA), np.float32)
+    cy = np.asarray(ev.input(node, 'Color Y', RGBA), np.float32)
+    cz = np.asarray(ev.input(node, 'Color Z', RGBA), np.float32)
+    wx = np.asarray(ev.input(node, 'Weight X', VALUE), np.float32)[:, None]
+    wy = np.asarray(ev.input(node, 'Weight Y', VALUE), np.float32)[:, None]
+    wz = np.asarray(ev.input(node, 'Weight Z', VALUE), np.float32)[:, None]
+    col = ((cx * wx + cy * wy) + cz * wz).astype(np.float32)
+    return {'Color': col, 'Alpha': col[:, 3]}
+
+
+def n_halcyon_tri_planar_texture(ev, node):
+    """Tri-Planar Texture: one image sampled through the three Box
+    frames and blended by the normal's weights -- n_tex_image's sampler
+    contract (filter / wrap maps, settings.tex_filter, no image = opaque
+    black), the volume-Box precedent's plain top-level taps (a non-flat
+    projection keeps the top level: no footprint, no lod)."""
+    c = ev.ctx
+    tex = _get_image(ev, node)
+    if tex is None:
+        col = np.zeros((c.n, 4), np.float32)
+        col[:, 3] = 1.0
+        return {'Color': col, 'Alpha': np.ones(c.n, np.float32)}
+    interp = _prop(node, 'interpolation', 'Linear')
+    ext = _prop(node, 'extension', 'REPEAT')
+    st = c.settings
+    filt = {'Closest': 'NEAREST', 'Linear': 'BILINEAR', 'Cubic': 'BILINEAR',
+            'Smart': 'BILINEAR'}.get(interp, 'BILINEAR')
+    if st is not None and getattr(st, 'tex_filter', None):
+        filt = st.tex_filter
+    wrap = {'REPEAT': 'REPEAT', 'EXTEND': 'EXTEND', 'CLIP': 'CLIP',
+            'MIRROR': 'MIRROR'}.get(ext, 'REPEAT')
+    v = np.array(_tex_vector(ev, node, 'generated'), np.float32, copy=True)
+    nrm = _vec_or_normal(ev, node)
+    sc = np.maximum(ev.input(node, 'Scale', VALUE), 1e-9).astype(np.float32)
+    blend = np.asarray(ev.input(node, 'Blend', VALUE), np.float32)
+    (ux, vx), (uy, vy), (uz, vz), (wx, wy, wz) = \
+        _tri_planar_frames(v, nrm, sc, blend)
+    from .texture import sample_opts
+    opts = sample_opts(st) if st is not None else None
+    c0 = tex.sample(ux, vx, filt=filt, wrap=wrap, opts=opts)
+    c1 = tex.sample(uy, vy, filt=filt, wrap=wrap, opts=opts)
+    c2 = tex.sample(uz, vz, filt=filt, wrap=wrap, opts=opts)
+    col = ((c0 * wx[:, None] + c1 * wy[:, None])
+           + c2 * wz[:, None]).astype(np.float32)
+    return {'Color': col, 'Alpha': col[:, 3]}
+
+
+def n_halcyon_object_map(ev, node):
+    """Object Projection: the world point in the picked object's frame
+    (`object_inv`, the twelve floats export.py bakes from the object's
+    inverse matrix_world, scale included -- the object_matrices()
+    convention), then its local XYZ (FRAME), a perspective window
+    through -Z with the lens half-angle's tangent (PERSPECTIVE) or a
+    parallel window Ortho Size wide (ORTHO). The matrix product is the
+    explicit left-to-right ((m0*x + m1*y) + m2*z) + m3 on BOTH roads
+    (not einsum, not GLSL dot(): their summation order is not pinned),
+    every baked scalar rounded through `_lit8` -- the GPU's literal."""
+    c = ev.ctx
+    p = np.asarray(_tex_vector(ev, node, 'world'), np.float32)
+    props = node.get('props', {}) or {}
+    m = props.get('object_inv')
+    if m is None or len(m) != 12:
+        m = _IDENT12
+    m = [_lit8(x) for x in m]
+    px, py, pz = p[:, 0], p[:, 1], p[:, 2]
+    lx = ((m[0] * px + m[1] * py) + m[2] * pz) + m[3]
+    ly = ((m[4] * px + m[5] * py) + m[6] * pz) + m[7]
+    lz = ((m[8] * px + m[9] * py) + m[10] * pz) + m[11]
+    mode = str(props.get('proj_mode') or props.get('mode', 'AUTO'))
+    n = p.shape[0]
+    if mode not in ('PERSPECTIVE', 'ORTHO'):
+        # FRAME, and AUTO the exporter never resolved (a hand-built
+        # graph): the local frame
+        return {'Vector': np.stack([lx, ly, lz], 1).astype(np.float32),
+                'Inside': np.ones(n, np.float32),
+                'Depth': (-lz).astype(np.float32)}
+    zc = -lz
+    if mode == 'PERSPECTIVE':
+        pt = props.get('proj_tan')
+        if pt is not None:
+            tan_half = _lit8(pt)
+        elif ev.has_link(node, 'Angle'):
+            # per-lane tan at shading time: the GPU refuses this by name
+            ang = np.asarray(ev.input(node, 'Angle', VALUE), np.float32)
+            tan_half = np.tan(np.radians(ang) * _F32_HALF).astype(np.float32)
+        else:
+            ang = 45.0
+            for s in node.get('inputs', ()):
+                if s.get('name') == 'Angle':
+                    try:
+                        ang = float(s.get('default') or 0.0)
+                    except (TypeError, ValueError):
+                        ang = 0.0
+            tan_half = _lit8(math.tan(math.radians(ang) * 0.5))
+        den = np.maximum(zc, np.float32(1e-6)) * tan_half
+        uu = lx / den * _F32_HALF + _F32_HALF
+        vv = ly / den * _F32_HALF + _F32_HALF
+        inside = ((zc > 0.0) & (uu >= 0.0) & (uu <= 1.0)
+                  & (vv >= 0.0) & (vv <= 1.0)).astype(np.float32)
+    else:
+        ph = props.get('proj_half')
+        if ph is not None:
+            half = _lit8(ph)
+        else:
+            half = np.asarray(ev.input(node, 'Ortho Size', VALUE),
+                              np.float32) * _F32_HALF
+        den = np.maximum(half * np.float32(2.0), np.float32(1e-9))
+        uu = lx / den + _F32_HALF
+        vv = ly / den + _F32_HALF
+        inside = ((uu >= 0.0) & (uu <= 1.0)
+                  & (vv >= 0.0) & (vv <= 1.0)).astype(np.float32)
+    return {'Vector': np.stack([uu, vv, np.zeros(n, np.float32)], 1)
+            .astype(np.float32),
+            'Inside': inside, 'Depth': zc.astype(np.float32)}
+
+
+#: the hex constants, as float32 literals the GLSL text prints verbatim
+_HEX_K = {k: np.float32(v) for k, v in (
+    ('q_x', 0.57735027), ('q_y', 0.33333334), ('r_y', 0.6666667),
+    ('c_x', 1.7320508), ('c_z', 0.8660254), ('c_y', 1.5),
+    ('half', 0.5), ('two', 2.0), ('inr', 1.1547005))}
+
+
+def n_v16_hex_grid(ev, node):
+    """Hex Grid: pixel-to-hex by axial coordinates and cube rounding (Red
+    Blob Games), rounded with floor(x + 0.5) on both roads (np.round's
+    half-even would split from the GPU: the VectorSnap ROUND seam, not
+    repeated here); Cell ID through the TileRandom integer hash; Edge
+    the pointy-top hex's inradius distance (1 at the centre, 0 on the
+    edge, clamped at 0). FLAT swaps x and y in and back out."""
+    K = _HEX_K
+    v = _vec_uv(ev, node)
+    sc = np.asarray(ev.input(node, 'Scale', VALUE), np.float32)
+    flat = str(_prop(node, 'orient', 'POINTY')) == 'FLAT'
+    px = v[:, 0] * sc
+    py = v[:, 1] * sc
+    if flat:
+        px, py = py, px
+    q = K['q_x'] * px - K['q_y'] * py
+    r = K['r_y'] * py
+    nq = -q - r
+    rx = np.floor(q + K['half'])
+    rz = np.floor(r + K['half'])
+    ry = np.floor(nq + K['half'])
+    dx = np.abs(rx - q)
+    dy = np.abs(ry - nq)
+    dz = np.abs(rz - r)
+    c1 = (dx > dy) & (dx > dz)
+    c2 = dy > dz
+    rx2 = np.where(c1, -ry - rz, rx)
+    ry2 = np.where(c1, ry, np.where(c2, -rx - rz, ry))
+    rz2 = np.where(c1, rz, np.where(c2, rz, -rx - ry))
+    rx, ry, rz = rx2, ry2, rz2
+    cx = K['c_x'] * rx + K['c_z'] * rz
+    cy = K['c_y'] * rz
+    lx = px - cx
+    ly = py - cy
+    cid = PT.hash3(rx.astype(np.int64), rz.astype(np.int64), np.int64(53))
+    e = np.maximum(np.abs(lx), np.abs(lx) * K['half']
+                   + np.abs(ly) * K['c_z']) * K['inr']
+    edge = np.maximum(_F32_ONE - e, np.float32(0.0))
+    ox = lx / K['c_x'] + K['half']
+    oy = ly / K['two'] + K['half']
+    if flat:
+        ox, oy = oy, ox
+    return {'Vector': np.stack([ox, oy, cid], 1).astype(np.float32),
+            'Cell ID': cid.astype(np.float32),
+            'Edge': edge.astype(np.float32)}
 
 
 DISPATCH = {
@@ -6711,6 +7092,12 @@ DISPATCH = {
     'HALCYON_RegionNode': n_v16_region,
     'HALCYON_ProjectorNode': n_v16_projector,
     'HALCYON_SpinNode': n_v16_spin,
+    # R253: more mapping types
+    'HALCYON_TriPlanarNode': n_v16_tri_planar,
+    'HALCYON_TriPlanarMixNode': n_u16_tri_planar_mix,
+    'HALCYON_TriPlanarTextureNode': n_halcyon_tri_planar_texture,
+    'HALCYON_ObjectMapNode': n_halcyon_object_map,
+    'HALCYON_HexGridNode': n_v16_hex_grid,
     'HALCYON_MatcapUVNode': n_halcyon_matcap_uv,
     'HALCYON_RampNode': n_halcyon_ramp,
     'HALCYON_BlurNode': n_halcyon_blur,

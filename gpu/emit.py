@@ -189,7 +189,13 @@ def tex_vector(em, node, default='generated'):
         if sock.get('name') == 'Vector' and sock.get('link'):
             var, vt = em.output(sock['link'][0], sock['link'][1])
             return em.cast(var, vt, VEC3)
-    return 'vec3(hal_uv, 0.0)' if default == 'uv' else 'hal_generated'
+    if default == 'uv':
+        return 'vec3(hal_uv, 0.0)'
+    if default == 'world':
+        # R253: the Object Projection node measures the world position
+        # (nodeeval._tex_vector answers ctx.P)
+        return 'hal_P'
+    return 'hal_generated'
 
 
 def e_mapping(em, node, _i):
@@ -634,6 +640,36 @@ def e_tex_image(em, node, index):
                       and str(prop(node, 'projection', 'FLAT')) == 'FLAT'),
     })
     uv, _t = em.tmp(VEC3, v)
+    # R253: the Sphere / Tube / Box projections, exactly n_tex_image's
+    # (this emitter sampled every projection FLAT before -- a silent
+    # CPU/GPU split, never refused). Sphere: env_equirect_uv's text
+    # without the CPU's normalize (atan2 is scale-invariant; the zero
+    # vector reads the 1e-12 guard on both roads); Tube: atan / 2pi and
+    # z * 0.5 + 0.5; Box: the face by hal_N's dominant axis through
+    # _box_project's pairs (the >= chain is np.argmax's first-max).
+    # projection_blend stays unread on both roads, as it always was.
+    proj = str(prop(node, 'projection', 'FLAT'))
+    if proj == 'SPHERE':
+        su, _t = em.tmp(FLOAT, f'atan({uv}.y, -{uv}.x) / 6.283185307179586 '
+                               '+ 0.5')
+        sv, _t = em.tmp(FLOAT, f'atan({uv}.z, sqrt(max({uv}.x * {uv}.x + '
+                               f'{uv}.y * {uv}.y, 1e-12))) '
+                               '/ 3.141592653589793 + 0.5')
+        uv, _t = em.tmp(VEC3, f'vec3({su}, {sv}, 0.0)')
+    elif proj == 'TUBE':
+        su, _t = em.tmp(FLOAT, f'atan({uv}.y, {uv}.x) / 6.283185307179586 '
+                               '+ 0.5')
+        sv, _t = em.tmp(FLOAT, f'{uv}.z * 0.5 + 0.5')
+        uv, _t = em.tmp(VEC3, f'vec3({su}, {sv}, 0.0)')
+    elif proj == 'BOX':
+        ax_, _t = em.tmp(VEC3, 'abs(hal_N)')
+        pu, _t = em.tmp(FLOAT, f'({ax_}.x >= max({ax_}.y, {ax_}.z)) '
+                               f'? {uv}.y : (({ax_}.y >= {ax_}.z) '
+                               f'? {uv}.x : {uv}.x)')
+        pw, _t = em.tmp(FLOAT, f'({ax_}.x >= max({ax_}.y, {ax_}.z)) '
+                               f'? {uv}.z : (({ax_}.y >= {ax_}.z) '
+                               f'? {uv}.z : {uv}.y)')
+        uv, _t = em.tmp(VEC3, f'vec3({pu}, {pw}, 0.0)')
     texel, _t = em.tmp(VEC4, f'texture({name}, {uv}.xy)')
     if index == 1:
         return em.tmp(FLOAT, f'{texel}.a')
@@ -3963,6 +3999,51 @@ def _v16_uv(em, node):
     return out
 
 
+# ---- R253: the mapping helpers, the twins of nodeeval._vec_or_normal /
+# _tri_planar_frames, placed here so the tri-planar nodes cannot drift
+
+def _v16_normal(em, node):
+    """The Normal input when linked, else hal_N (nodeeval reads ctx.N)."""
+    for sock in node.get('inputs', ()):
+        if sock.get('name') == 'Normal' and sock.get('link'):
+            var, vt = em.output(sock['link'][0], sock['link'][1])
+            out, _t = em.tmp(VEC3, em.cast(var, vt, VEC3))
+            return out
+    out, _t = em.tmp(VEC3, 'hal_N')
+    return out
+
+
+def _tri_planar_frames_glsl(em, v, n, sc, blend):
+    """nodeeval._tri_planar_frames in GLSL: the same max / clamp / abs
+    and the SAME parenthesised sum ((wx + wy) + wz). Returns
+    ((ux, vx), (uy, vy), (uz, vz), (wx, wy, wz)) temp names."""
+    a, _t = em.tmp(VEC3, f'abs({n})')
+    t, _t = em.tmp(FLOAT, f'(1.0 - clamp({blend}, 0.0, 1.0)) * 0.5')
+    wx, _t = em.tmp(FLOAT, f'max({a}.x - {t}, 0.0)')
+    wy, _t = em.tmp(FLOAT, f'max({a}.y - {t}, 0.0)')
+    wz, _t = em.tmp(FLOAT, f'max({a}.z - {t}, 0.0)')
+    s, _t = em.tmp(FLOAT, f'max(({wx} + {wy}) + {wz}, 1e-9)')
+    wx, _t = em.tmp(FLOAT, f'{wx} / {s}')
+    wy, _t = em.tmp(FLOAT, f'{wy} / {s}')
+    wz, _t = em.tmp(FLOAT, f'{wz} / {s}')
+    ux, _t = em.tmp(FLOAT, f'{v}.y / {sc}')
+    vx, _t = em.tmp(FLOAT, f'{v}.z / {sc}')
+    uy, _t = em.tmp(FLOAT, f'{v}.x / {sc}')
+    vy, _t = em.tmp(FLOAT, f'{v}.z / {sc}')
+    uz, _t = em.tmp(FLOAT, f'{v}.x / {sc}')
+    vz, _t = em.tmp(FLOAT, f'{v}.y / {sc}')
+    return (ux, vx), (uy, vy), (uz, vz), (wx, wy, wz)
+
+
+def _f32lit(v):
+    """A float32 round-trip literal (repr of the float32 value), for the
+    frame-structure numbers the CPU computes as np.float32(x): parsed
+    back to float32 it is the CPU's own bits."""
+    import numpy as _np
+    s = repr(float(_np.float32(float(v))))
+    return s if ('.' in s or 'e' in s or 'n' in s) else s + '.0'
+
+
 def e_v16_array(em, node, index):
     _need_prims(em)
     v = _v16_uv(em, node)
@@ -4305,6 +4386,10 @@ def e_v16_projector(em, node, index):
     w, _t = em.tmp(FLOAT, f'{v}.{comp[1]}')
     h, _t = em.tmp(FLOAT, f'{v}.{comp[2]}')
     mode = str(prop(node, 'mode', 'PLANAR'))
+    if mode in _PROJECTOR_R253_MODES:
+        # R253: the appended modes; the four shipped texts below are
+        # byte-for-byte 1.91 (the frozen-text test pins them)
+        return _e_projector_r253(em, node, mode, v, sc, comp, u, w, h)
     if mode == 'CYLINDER':
         a, _t = em.tmp(FLOAT, f'fract(atan({w}, {u}) '
                               '/ 6.28318530717959 + 1.0)')
@@ -5121,6 +5206,306 @@ MAX_EMITTERS = {
     'HALCYON_MaxRaytraceNode': e_max_raytrace,
 }
 
+# ---- R253: more mapping types -- the GLSL twins of nodeeval's
+# _projector_r253 and the five mapping nodes. Every text is the CPU's
+# expression in the same order; the bitwise ones use abs / max / min /
+# clamp / floor / fract / mul / add / div / compare only, the
+# transcendental ones (atan, acos, sqrt, normalize) ride the simulator's
+# float32 at the stated 2e-6 bar.
+
+_PROJECTOR_R253_MODES = frozenset((
+    'CUBE', 'EQUIRECT', 'MIRROR_BALL', 'ANGULAR', 'CYLINDER_CAP', 'SCREEN',
+    'REFLECTION', 'NORMAL', 'TANGENT'))
+
+
+def _refuse(em, text):
+    """A CPU-only answer, BY NAME: the text lands in em.unsupported (the
+    plan prints that set once) and the emitter unwinds."""
+    em.unsupported.add(text)
+    raise Unsupported(text)
+
+
+def _equirect_glsl(em, x, y, z):
+    """nodeeval._equirect_f32 / gpu/sky.hal_sky_sample_env's text."""
+    ou, _t = em.tmp(FLOAT, f'atan({y}, -{x}) / 6.283185307179586 + 0.5')
+    ov, _t = em.tmp(FLOAT, f'atan({z}, sqrt(max({x} * {x} + {y} * {y}, '
+                           '1e-12))) / 3.141592653589793 + 0.5')
+    return ou, ov
+
+
+def _e_projector_r253(em, node, mode, v, sc, comp, u, w, h):
+    if mode == 'CUBE':
+        ax_, _t = em.tmp(VEC3, 'abs(hal_N)')
+        dom = f'({ax_}.x >= max({ax_}.y, {ax_}.z))'
+        dy = f'({ax_}.y >= {ax_}.z)'
+        axi, _t = em.tmp(FLOAT, f'{dom} ? 0.0 : ({dy} ? 1.0 : 2.0)')
+        nd, _t = em.tmp(FLOAT, f'{dom} ? hal_N.x : ({dy} ? hal_N.y '
+                               ': hal_N.z)')
+        neg, _t = em.tmp(FLOAT, f'({nd} < 0.0) ? 1.0 : 0.0')
+        fu, _t = em.tmp(FLOAT, f'({dom} ? {v}.y : ({dy} ? {v}.x : {v}.x)) '
+                               f'/ {sc}')
+        fv, _t = em.tmp(FLOAT, f'({dom} ? {v}.z : ({dy} ? {v}.z : {v}.y)) '
+                               f'/ {sc}')
+        ox, _t = em.tmp(FLOAT, f'({axi} + fract({fu})) / 3.0')
+        oy, _t = em.tmp(FLOAT, f'((1.0 - {neg}) + fract({fv})) / 2.0')
+        oz, _t = em.tmp(FLOAT, f'{axi} * 2.0 + {neg}')
+        return em.tmp(VEC3, f'vec3({ox}, {oy}, {oz})')
+    if mode == 'EQUIRECT':
+        ou, ov = _equirect_glsl(em, u, w, h)
+        return em.tmp(VEC3, f'vec3({ou} / {sc}, {ov} / {sc}, 0.0)')
+    if mode in ('MIRROR_BALL', 'ANGULAR'):
+        ln, _t = em.tmp(FLOAT, f'max(sqrt(({u} * {u} + {w} * {w}) + {h} * {h}), '
+                               '1e-9)')
+        dx, _t = em.tmp(FLOAT, f'{u} / {ln}')
+        dy, _t = em.tmp(FLOAT, f'{w} / {ln}')
+        dz, _t = em.tmp(FLOAT, f'{h} / {ln}')
+        if mode == 'MIRROR_BALL':
+            m, _t = em.tmp(FLOAT, f'2.0 * sqrt(max(({dx} * {dx} + {dy} * {dy}) '
+                                  f'+ ({dz} + 1.0) * ({dz} + 1.0), 1e-8))')
+            ox, _t = em.tmp(FLOAT, f'({dx} / {m} + 0.5) / {sc}')
+            oy, _t = em.tmp(FLOAT, f'({dy} / {m} + 0.5) / {sc}')
+        else:
+            r, _t = em.tmp(FLOAT, f'acos(clamp({dz}, -1.0, 1.0)) '
+                                  '/ 3.141592653589793 '
+                                  f'/ max(sqrt({dx} * {dx} + {dy} * {dy}), 1e-9)')
+            ox, _t = em.tmp(FLOAT, f'({dx} * {r} * 0.5 + 0.5) / {sc}')
+            oy, _t = em.tmp(FLOAT, f'({dy} * {r} * 0.5 + 0.5) / {sc}')
+        return em.tmp(VEC3, f'vec3({ox}, {oy}, 0.0)')
+    if mode == 'CYLINDER_CAP':
+        a, _t = em.tmp(FLOAT, f'fract(atan({w}, {u}) '
+                              '/ 6.28318530717959 + 1.0)')
+        lid, _t = em.tmp(FLOAT, f'(abs(hal_N.{comp[2]}) > 0.70710678) '
+                                '? 1.0 : 0.0')
+        ox, _t = em.tmp(FLOAT, f'({lid} > 0.5) ? {u} / {sc} : {a} / {sc}')
+        oy, _t = em.tmp(FLOAT, f'({lid} > 0.5) ? {w} / {sc} : {h} / {sc}')
+        return em.tmp(VEC3, f'vec3({ox}, {oy}, {lid})')
+    if mode == 'SCREEN':
+        # e_tex_coord's Window rule: the pass's own vUV; a secondary
+        # (ray-hit) pass has no screen pixel and reads zeros, as the
+        # CPU's HIT context (px None) does
+        if em.secondary:
+            return em.tmp(VEC3, 'vec3(0.0)')
+        ox, _t = em.tmp(FLOAT, 'vUV.x')
+        oy, _t = em.tmp(FLOAT, 'vUV.y')
+        if prop(node, 'aspect', False):
+            res = getattr(em, 'resolution', None)
+            if res is None:
+                _refuse(em, 'HALCYON_ProjectorNode (Screen mode with Keep '
+                            'Aspect needs the frame resolution)')
+            wh = float(res[0]) / float(res[1])
+            ox, _t = em.tmp(FLOAT, f'{ox} * {_f32lit(wh)}')
+        return em.tmp(VEC3, f'vec3({ox} / {sc}, {oy} / {sc}, 0.0)')
+    if mode == 'REFLECTION':
+        rv, _t = em.tmp(VEC3, 'reflect(-hal_V, hal_N)')
+        ou, ov = _equirect_glsl(em, f'{rv}.x', f'{rv}.y', f'{rv}.z')
+        return em.tmp(VEC3, f'vec3({ou} / {sc}, {ov} / {sc}, 0.0)')
+    if mode == 'NORMAL':
+        return em.tmp(VEC3, f'vec3((hal_N.x * 0.5 + 0.5) / {sc}, '
+                            f'(hal_N.y * 0.5 + 0.5) / {sc}, '
+                            'hal_N.z * 0.5 + 0.5)')
+    # TANGENT: e_normal_map's three lines (mathx.orthonormal_basis)
+    n, _t = em.tmp(VEC3, 'normalize(hal_N)')
+    up, _t = em.tmp(VEC3, f'(abs({n}.z) < 0.999) '
+                          f'? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0)')
+    t, _t = em.tmp(VEC3, f'normalize(cross({up}, {n}))')
+    b, _t = em.tmp(VEC3, f'cross({n}, {t})')
+    return em.tmp(VEC3, f'vec3(dot({v}, {t}) / {sc}, dot({v}, {b}) / {sc}, '
+                        f'dot({v}, {n}))')
+
+
+def e_v16_tri_planar(em, node, index):
+    """Tri-Planar Coordinates, bitwise n_v16_tri_planar."""
+    v0 = tex_vector(em, node, 'generated')
+    v, _t = em.tmp(VEC3, v0)
+    n = _v16_normal(em, node)
+    sc, _t = em.tmp(FLOAT, f'max({em.input(node, "Scale", FLOAT)}, '
+                           '1e-9)')
+    blend, _t = em.tmp(FLOAT, em.input(node, 'Blend', FLOAT))
+    (ux, vx), (uy, vy), (uz, vz), (wx, wy, wz) = \
+        _tri_planar_frames_glsl(em, v, n, sc, blend)
+    name = _o_name(node, index)
+    if name == 'Weight X':
+        return wx, FLOAT
+    if name == 'Weight Y':
+        return wy, FLOAT
+    if name == 'Weight Z':
+        return wz, FLOAT
+    if name == 'UV Y':
+        return em.tmp(VEC3, f'vec3({uy}, {vy}, 0.0)')
+    if name == 'UV Z':
+        return em.tmp(VEC3, f'vec3({uz}, {vz}, 0.0)')
+    return em.tmp(VEC3, f'vec3({ux}, {vx}, 0.0)')
+
+
+def e_u16_tri_planar_mix(em, node, index):
+    """Tri-Planar Mix, bitwise n_u16_tri_planar_mix: the SAME order
+    (cx*wx + cy*wy) + cz*wz."""
+    cx, _t = em.tmp(VEC4, em.input(node, 'Color X', VEC4))
+    cy, _t = em.tmp(VEC4, em.input(node, 'Color Y', VEC4))
+    cz, _t = em.tmp(VEC4, em.input(node, 'Color Z', VEC4))
+    wx, _t = em.tmp(FLOAT, em.input(node, 'Weight X', FLOAT))
+    wy, _t = em.tmp(FLOAT, em.input(node, 'Weight Y', FLOAT))
+    wz, _t = em.tmp(FLOAT, em.input(node, 'Weight Z', FLOAT))
+    col, _t = em.tmp(VEC4, f'({cx} * {wx} + {cy} * {wy}) + {cz} * {wz}')
+    if _o_name(node, index) == 'Alpha' or index == 1:
+        return em.tmp(FLOAT, f'{col}.a')
+    return col, VEC4
+
+
+def e_halcyon_tri_planar_texture(em, node, index):
+    """Tri-Planar Texture: e_tex_image's sampler contract (no image =
+    the CPU's opaque black and NO sampler; one em.samplers entry,
+    footprint False -- a non-flat projection keeps the top level) and
+    three texture() taps blended in n_halcyon_tri_planar_texture's
+    order."""
+    if not prop(node, 'image'):
+        if index == 1:
+            return em.tmp(FLOAT, '1.0')
+        return em.tmp(VEC4, 'vec4(0.0, 0.0, 0.0, 1.0)')
+    v0 = tex_vector(em, node, 'generated')
+    v, _t = em.tmp(VEC3, v0)
+    n = _v16_normal(em, node)
+    sc, _t = em.tmp(FLOAT, f'max({em.input(node, "Scale", FLOAT)}, '
+                           '1e-9)')
+    blend, _t = em.tmp(FLOAT, em.input(node, 'Blend', FLOAT))
+    (ux, vx), (uy, vy), (uz, vz), (wx, wy, wz) = \
+        _tri_planar_frames_glsl(em, v, n, sc, blend)
+    name = f'hal_tex{len(em.samplers)}'
+    em.samplers.append({
+        'uniform': name,
+        'image': prop(node, 'image'),
+        'interpolation': prop(node, 'interpolation', 'Linear'),
+        'extension': prop(node, 'extension', 'REPEAT'),
+        'footprint': False,
+    })
+    c0, _t = em.tmp(VEC4, f'texture({name}, vec2({ux}, {vx}))')
+    c1, _t = em.tmp(VEC4, f'texture({name}, vec2({uy}, {vy}))')
+    c2, _t = em.tmp(VEC4, f'texture({name}, vec2({uz}, {vz}))')
+    col, _t = em.tmp(VEC4, f'({c0} * {wx} + {c1} * {wy}) + {c2} * {wz}')
+    if index == 1:
+        return em.tmp(FLOAT, f'{col}.a')
+    return col, VEC4
+
+
+def e_halcyon_object_map(em, node, index):
+    """Object Projection, bitwise n_halcyon_object_map: the twelve
+    matrix floats through em.const (liftable into material texels under
+    mark_values, so a moved projector re-uploads and never recompiles --
+    the R174 contract), the explicit ((m0*x + m1*y) + m2*z) + m3, and a
+    baked tan of the lens half-angle; a LINKED Angle needs tan() at
+    shading time and is refused by name."""
+    import math as _math
+    v0 = tex_vector(em, node, 'world')
+    p, _t = em.tmp(VEC3, v0)
+    props = node.get('props', {}) or {}
+    m = props.get('object_inv')
+    if m is None or len(m) != 12:
+        m = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+    lit = [em.const(x, FLOAT) for x in m]
+    lx, _t = em.tmp(FLOAT, f'(({lit[0]} * {p}.x + {lit[1]} * {p}.y) '
+                           f'+ {lit[2]} * {p}.z) + {lit[3]}')
+    ly, _t = em.tmp(FLOAT, f'(({lit[4]} * {p}.x + {lit[5]} * {p}.y) '
+                           f'+ {lit[6]} * {p}.z) + {lit[7]}')
+    lz, _t = em.tmp(FLOAT, f'(({lit[8]} * {p}.x + {lit[9]} * {p}.y) '
+                           f'+ {lit[10]} * {p}.z) + {lit[11]}')
+    mode = str(props.get('proj_mode') or props.get('mode', 'AUTO'))
+    name = _o_name(node, index)
+    if mode not in ('PERSPECTIVE', 'ORTHO'):
+        if name == 'Inside' or index == 1:
+            return em.tmp(FLOAT, '1.0')
+        if name == 'Depth' or index == 2:
+            return em.tmp(FLOAT, f'-{lz}')
+        return em.tmp(VEC3, f'vec3({lx}, {ly}, {lz})')
+    zc, _t = em.tmp(FLOAT, f'-{lz}')
+    if name == 'Depth' or index == 2:
+        return zc, FLOAT
+    if mode == 'PERSPECTIVE':
+        pt = props.get('proj_tan')
+        if pt is not None:
+            tan_half = em.const(float(pt), FLOAT)
+        else:
+            ang = 45.0
+            for s in node.get('inputs', ()):
+                if s.get('name') == 'Angle':
+                    if s.get('link'):
+                        _refuse(em, 'HALCYON_ObjectMapNode (a linked Angle '
+                                    'needs tan() at shading time; set the '
+                                    'Angle on the node)')
+                    try:
+                        ang = float(s.get('default') or 0.0)
+                    except (TypeError, ValueError):
+                        ang = 0.0
+            tan_half = em.const(_math.tan(_math.radians(ang) * 0.5), FLOAT)
+        den, _t = em.tmp(FLOAT, f'max({zc}, 1e-6) * {tan_half}')
+        uu, _t = em.tmp(FLOAT, f'{lx} / {den} * 0.5 + 0.5')
+        vv, _t = em.tmp(FLOAT, f'{ly} / {den} * 0.5 + 0.5')
+        if name == 'Inside' or index == 1:
+            return em.tmp(FLOAT, f'(({zc} > 0.0) && ({uu} >= 0.0) && '
+                                 f'({uu} <= 1.0) && ({vv} >= 0.0) && '
+                                 f'({vv} <= 1.0)) ? 1.0 : 0.0')
+        return em.tmp(VEC3, f'vec3({uu}, {vv}, 0.0)')
+    ph = props.get('proj_half')
+    if ph is not None:
+        half = em.const(float(ph), FLOAT)
+    else:
+        half, _t = em.tmp(FLOAT, f'{em.input(node, "Ortho Size", FLOAT)} '
+                                 '* 0.5')
+    den, _t = em.tmp(FLOAT, f'max({half} * 2.0, 1e-9)')
+    uu, _t = em.tmp(FLOAT, f'{lx} / {den} + 0.5')
+    vv, _t = em.tmp(FLOAT, f'{ly} / {den} + 0.5')
+    if name == 'Inside' or index == 1:
+        return em.tmp(FLOAT, f'(({uu} >= 0.0) && ({uu} <= 1.0) && '
+                             f'({vv} >= 0.0) && ({vv} <= 1.0)) ? 1.0 : 0.0')
+    return em.tmp(VEC3, f'vec3({uu}, {vv}, 0.0)')
+
+
+def e_v16_hex_grid(em, node, index):
+    """Hex Grid, bitwise n_v16_hex_grid: floor(x + 0.5) rounding with the
+    add in its own statement (no FMA across the rounding), the cube
+    round's if-chain as nested ternaries, hal_pt_hash3 through
+    _need_prims for the cell id."""
+    _need_prims(em)
+    v = _v16_uv(em, node)
+    sc, _t = em.tmp(FLOAT, em.input(node, 'Scale', FLOAT))
+    flat = str(prop(node, 'orient', 'POINTY')) == 'FLAT'
+    px, _t = em.tmp(FLOAT, f'{v}.{"y" if flat else "x"} * {sc}')
+    py, _t = em.tmp(FLOAT, f'{v}.{"x" if flat else "y"} * {sc}')
+    q, _t = em.tmp(FLOAT, f'0.57735027 * {px} - 0.33333334 * {py}')
+    r, _t = em.tmp(FLOAT, f'0.6666667 * {py}')
+    nq, _t = em.tmp(FLOAT, f'-{q} - {r}')
+    qh, _t = em.tmp(FLOAT, f'{q} + 0.5')
+    rh, _t = em.tmp(FLOAT, f'{r} + 0.5')
+    nh, _t = em.tmp(FLOAT, f'{nq} + 0.5')
+    rx, _t = em.tmp(FLOAT, f'floor({qh})')
+    rz, _t = em.tmp(FLOAT, f'floor({rh})')
+    ry, _t = em.tmp(FLOAT, f'floor({nh})')
+    dx, _t = em.tmp(FLOAT, f'abs({rx} - {q})')
+    dy, _t = em.tmp(FLOAT, f'abs({ry} - {nq})')
+    dz, _t = em.tmp(FLOAT, f'abs({rz} - {r})')
+    c1 = f'(({dx} > {dy}) && ({dx} > {dz}))'
+    c2 = f'({dy} > {dz})'
+    rx2, _t = em.tmp(FLOAT, f'{c1} ? (-{ry} - {rz}) : {rx}')
+    ry2, _t = em.tmp(FLOAT, f'{c1} ? {ry} : ({c2} ? (-{rx} - {rz}) : {ry})')
+    rz2, _t = em.tmp(FLOAT, f'{c1} ? {rz} : ({c2} ? {rz} : (-{rx} - {ry}))')
+    cx, _t = em.tmp(FLOAT, f'1.7320508 * {rx2} + 0.8660254 * {rz2}')
+    cy, _t = em.tmp(FLOAT, f'1.5 * {rz2}')
+    lx, _t = em.tmp(FLOAT, f'{px} - {cx}')
+    ly, _t = em.tmp(FLOAT, f'{py} - {cy}')
+    cid, _t = em.tmp(FLOAT, f'hal_pt_hash3(int({rx2}), int({rz2}), 53)')
+    name = _o_name(node, index)
+    if name == 'Cell ID' or index == 1:
+        return cid, FLOAT
+    if name == 'Edge' or index == 2:
+        e, _t = em.tmp(FLOAT, f'max(abs({lx}), abs({lx}) * 0.5 '
+                              f'+ abs({ly}) * 0.8660254) * 1.1547005')
+        return em.tmp(FLOAT, f'max(1.0 - {e}, 0.0)')
+    ox, _t = em.tmp(FLOAT, f'{lx} / 1.7320508 + 0.5')
+    oy, _t = em.tmp(FLOAT, f'{ly} / 2.0 + 0.5')
+    if flat:
+        ox, oy = oy, ox
+    return em.tmp(VEC3, f'vec3({ox}, {oy}, {cid})')
+
+
 EMITTERS = {
     'HALCYON_ShaderNode': e_halcyon_shader,
     'HALCYON_ConsoleShaderNode': e_console_shader,     # R252
@@ -5235,6 +5620,12 @@ EMITTERS = {
     'HALCYON_RegionNode': e_v16_region,
     'HALCYON_ProjectorNode': e_v16_projector,
     'HALCYON_SpinNode': e_v16_spin,
+    # R253: more mapping types
+    'HALCYON_TriPlanarNode': e_v16_tri_planar,
+    'HALCYON_TriPlanarMixNode': e_u16_tri_planar_mix,
+    'HALCYON_TriPlanarTextureNode': e_halcyon_tri_planar_texture,
+    'HALCYON_ObjectMapNode': e_halcyon_object_map,
+    'HALCYON_HexGridNode': e_v16_hex_grid,
     'HALCYON_PosterizeNode': e_halcyon_posterize,
     'HALCYON_NormalMapNode': e_halcyon_normal_map,
     'HALCYON_NormalMixNode': e_halcyon_normal_mix,

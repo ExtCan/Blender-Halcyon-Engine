@@ -2143,6 +2143,147 @@ class HALCYON_ScrollNode(Node, HalcyonNodeBase):
         layout.prop(self, 'fps')
 
 
+# R253: the two mapping nodes that need a pointer -- an Image or an
+# Object -- so they are written by hand (the generated families know
+# only int / bool / enum). Their arithmetic lives beside the generated
+# Tri-Planar Coordinates / Projector evaluators so the roads cannot
+# drift: core/nodeeval._tri_planar_frames and n_halcyon_object_map,
+# gpu/emit's twins.
+_TRI_INTERP_ITEMS = (
+    ('Linear', "Linear",
+     "Bilinear filtering across the texels (the renderer's Texture "
+     "Filter setting still overrides it)"),
+    ('Closest', "Closest",
+     "Nearest texel, no filtering -- the chunky period look"),
+)
+_TRI_EXT_ITEMS = (
+    ('REPEAT', "Repeat", "Tile the image endlessly across every face"),
+    ('EXTEND', "Extend", "Hold the edge texels beyond the image"),
+    ('CLIP', "Clip", "Transparent black beyond the image's 0..1 square"),
+    ('MIRROR', "Mirror", "Reflect the image back and forth seamlessly"),
+)
+
+
+class HALCYON_TriPlanarTextureNode(Node, HalcyonNodeBase):
+    """One image projected from X, Y and Z and blended by the normal --
+    the tri-planar rock, bark and terrain trick as a single node"""
+
+    bl_idname = 'HALCYON_TriPlanarTextureNode'
+    bl_label = "Tri-Planar Texture"
+    bl_icon = 'IMAGE_PLANE'
+    bl_width_default = 200
+
+    image: PointerProperty(
+        name="Image", type=bpy.types.Image,
+        description="The picture projected from X, Y and Z and blended "
+                    "by the normal -- rock, bark, terrain, anything "
+                    "without a UV map")
+    interpolation: EnumProperty(
+        name="Interpolation", items=_TRI_INTERP_ITEMS, default='Linear',
+        description="How the three taps read between texels: Linear "
+                    "filters, Closest picks the nearest texel")
+    extension: EnumProperty(
+        name="Extension", items=_TRI_EXT_ITEMS, default='REPEAT',
+        description="What the three projections read beyond the "
+                    "image's 0..1 square: repeat, hold the edge, clip "
+                    "to transparent black or mirror")
+
+    def init(self, context):
+        v = self.inputs.new('NodeSocketVector', 'Vector')
+        v.description = ("The coordinate the three planes project. "
+                         "Unlinked means the Generated coordinates (the "
+                         "object's own box)")
+        nrm = self.inputs.new('NodeSocketVector', 'Normal')
+        nrm.description = ("The direction that picks and weighs the three "
+                           "faces. Unlinked means the shading normal")
+        s = self.inputs.new('NodeSocketFloat', 'Scale')
+        s.default_value = 1.0
+        s.description = "Coordinate units per image repeat on every face"
+        b = self.inputs.new('NodeSocketFloat', 'Blend')
+        b.default_value = 0.5
+        b.description = ("Width of the cross-fade between faces: 0 is a "
+                         "hard pick by the dominant axis, 1 the softest "
+                         "blend")
+        self.outputs.new('NodeSocketColor', 'Color')
+        self.outputs.new('NodeSocketFloat', 'Alpha')
+
+    def draw_buttons(self, context, layout):
+        layout.template_ID(self, 'image', new='image.new', open='image.open')
+        layout.prop(self, 'interpolation', text="")
+        layout.prop(self, 'extension', text="")
+
+
+_OBJMAP_MODE_ITEMS = (
+    ('AUTO', "Auto",
+     "Spot lamps and perspective cameras project through their lens, sun "
+     "lamps and orthographic cameras flat along -Z, anything else gives "
+     "its local frame"),
+    ('FRAME', "Local Frame",
+     "The world position in the object's own XYZ, scale included -- "
+     "Blender Internal's Object coordinates with an object picked"),
+    ('PERSPECTIVE', "Perspective",
+     "A window 0..1 seen through the object's -Z with the lens angle (a "
+     "spot lamp's cone, a camera's field of view): the slide-projector "
+     "decal"),
+    ('ORTHO', "Parallel",
+     "A window 0..1 projected flat along the object's -Z, Ortho Size "
+     "wide -- a sun lamp's stencil, 3D Studio's planar decal"),
+)
+
+
+class HALCYON_ObjectMapNode(Node, HalcyonNodeBase):
+    """Coordinates measured in another object's frame: Blender Internal's
+    Object texco with an object picked, the spot-lamp slide projector,
+    3D Studio's Camera Map -- the picked object's inverse matrix travels
+    with the material, so moving the projector re-uploads, never
+    recompiles"""
+
+    bl_idname = 'HALCYON_ObjectMapNode'
+    bl_label = "Object Projection"
+    bl_icon = 'OBJECT_DATA'
+    bl_width_default = 200
+
+    object: PointerProperty(
+        name="Object", type=bpy.types.Object,
+        description="The object whose frame the coordinates are measured "
+                    "in: an empty for Blender's Object texco, a spot lamp "
+                    "for a slide-projector decal, a camera for camera "
+                    "mapping")
+    mode: EnumProperty(
+        name="Mode", items=_OBJMAP_MODE_ITEMS, default='AUTO',
+        description="How the picked object's frame becomes a coordinate: "
+                    "its local XYZ, a perspective window through its "
+                    "lens, or a parallel window along its -Z; Auto reads "
+                    "the object's type")
+
+    def init(self, context):
+        v = self.inputs.new('NodeSocketVector', 'Vector')
+        v.description = ("The world-space point to measure. Unlinked "
+                         "means the shaded surface's own world position")
+        o = self.inputs.new('NodeSocketFloat', 'Ortho Size')
+        o.default_value = 2.0
+        o.description = ("Parallel mode: the width of the 0..1 window in "
+                         "the object's units (an orthographic camera "
+                         "brings its own)")
+        a = self.inputs.new('NodeSocketFloat', 'Angle')
+        a.default_value = 45.0
+        a.description = ("Perspective mode: the full cone angle in degrees "
+                         "when the picked object is not a spot lamp or a "
+                         "camera (those bring their own); on the GPU set "
+                         "it on the node, a linked Angle shades on the CPU")
+        self.outputs.new('NodeSocketVector', 'Vector')
+        i = self.outputs.new('NodeSocketFloat', 'Inside')
+        i.description = ("1 where the point lies inside the window (and in "
+                         "front of the lens), 0 outside -- the decal mask")
+        d = self.outputs.new('NodeSocketFloat', 'Depth')
+        d.description = ("Distance along the object's -Z axis, for "
+                         "fading a projection with its throw")
+
+    def draw_buttons(self, context, layout):
+        layout.prop(self, 'object')
+        layout.prop(self, 'mode', text="")
+
+
 class HALCYON_ScanlinesNode(Node, HalcyonNodeBase):
     """Darken alternate lines across a surface -- an in-scene CRT screen"""
 
@@ -5039,6 +5180,20 @@ UTIL_SPECS = [
      "switches and timed reveals",
      [(_GF, 'Start Frame', 1.0), (_GF, 'End Frame', 24.0)], {},
      [(_GF, 'Fac')]),
+    # R253: the blend half of the tri-planar pair -- three colours by
+    # three weights, (cx*wx + cy*wy) + cz*wz on every channel
+    ('TriPlanarMix', "Tri-Planar Mix", 'SNAP_FACE',
+     "Blend three colours by three weights -- the Tri-Planar "
+     "Coordinates node's Weight X / Y / Z over three Image Textures "
+     "fed its UV X / Y / Z. Color is (X * Weight X + Y * Weight Y) + "
+     "Z * Weight Z on every channel; Alpha is the blended alpha",
+     [(_GC, 'Color X', (0.8, 0.8, 0.8, 1.0)),
+      (_GC, 'Color Y', (0.8, 0.8, 0.8, 1.0)),
+      (_GC, 'Color Z', (0.8, 0.8, 0.8, 1.0)),
+      (_GF, 'Weight X', 0.333333), (_GF, 'Weight Y', 0.333333),
+      (_GF, 'Weight Z', 0.333333)],
+     {},
+     [(_GC, 'Color'), (_GF, 'Alpha')]),
 ]
 
 VEC_SPECS = [
@@ -5157,15 +5312,95 @@ VEC_SPECS = [
     ('Projector', "Projector", 'MOD_UVPROJECT',
      "Planar, cylindrical, spherical or box projection of the input "
      "vector -- the era's mapping modes as a node, for any coordinate "
-     "you feed it",
+     "you feed it. R253 adds the rest of the period menu: a six-face "
+     "cube atlas, the three sphere conventions (equirectangular, "
+     "mirror ball, angular map), a capped cylinder, screen (window) "
+     "mapping, Blender Internal's Reflection and world Normal texco, "
+     "and the tangent frame. Box picks its face by the COORDINATE "
+     "(as shipped); Cube and the Tri-Planar nodes pick by the normal",
      [(_GV, 'Vector', None), (_GF, 'Scale', 1.0)],
      {'mode': ('enum', 'PLANAR',
                (('PLANAR', "Planar", ""), ('CYLINDER', "Cylindrical", ""),
-                ('SPHERE', "Spherical", ""), ('BOX', "Box", "")),
+                ('SPHERE', "Spherical", ""), ('BOX', "Box", ""),
+                # R253: appended, never reordered -- a 1.91 file's saved
+                # index still names the mode it was saved with
+                ('CUBE', "Cube Atlas",
+                 "Six faces picked by the surface normal's dominant axis "
+                 "and sign, each laid into a 3 x 2 atlas (columns X Y Z, "
+                 "bottom row the negative faces); z carries the face "
+                 "index 0..5"),
+                ('EQUIRECT', "Equirectangular",
+                 "The direction wrapped as a latitude-longitude map, the "
+                 "same convention the World's HDRI uses "
+                 "(texture.env_equirect_uv)"),
+                ('MIRROR_BALL', "Mirror Ball",
+                 "The direction looked up as a photographed chrome "
+                 "sphere -- the 90s light-probe"),
+                ('ANGULAR', "Angular Map",
+                 "The direction as an angular (light-probe) map: radius "
+                 "grows with the angle from the axis, so the pole "
+                 "opposite the axis sits on the rim"),
+                ('CYLINDER_CAP', "Capped Cylinder",
+                 "Cylindrical round the side, flat across the two lids "
+                 "where the normal leans past 45 degrees along the axis; "
+                 "z is 1 on a lid"),
+                ('SCREEN', "Screen",
+                 "The pixel's own window position (0..1 across the "
+                 "frame) -- Imagine's and 3D Studio's screen mapping, "
+                 "locked to the view; the input vector is ignored; ray "
+                 "hits read 0"),
+                ('REFLECTION', "Reflection",
+                 "The mirror direction of the view ray wrapped as an "
+                 "equirectangular map -- Blender Internal's Refl texco; "
+                 "the input vector is ignored"),
+                ('NORMAL', "World Normal",
+                 "The world-space shading normal as a 3D coordinate, "
+                 "0..1 (the view-space normal is the Matcap Coordinates "
+                 "node)"),
+                ('TANGENT', "Tangent Space",
+                 "The input vector expressed in the surface's tangent "
+                 "frame (tangent, bitangent, normal) -- the frame the "
+                 "Normal Map node uses")),
                "Projection"),
       'axis': ('enum', 'Z', (('X', "X", ""), ('Y', "Y", ""),
-                             ('Z', "Z", "")), "Axis")},
+                             ('Z', "Z", "")), "Axis"),
+      # R253: Screen mode only; False is bitwise-neutral for every mode
+      'aspect': ('bool', False, "Keep Aspect")},
      [(_GV, 'Vector')]),
+    # R253: the honest node-graph form of tri-planar texturing (Geiss,
+    # GPU Gems 3 ch. 1): three planar frames and the normal's blend
+    # weights, for three Image Textures and a Tri-Planar Mix
+    ('TriPlanar', "Tri-Planar Coordinates", 'MATCUBE',
+     "Three planar projections (the YZ, XZ and XY planes, the Image "
+     "Texture's Box pairs) and the blend weight of each, picked by the "
+     "surface normal: feed UV X / Y / Z to three Image Textures and "
+     "mix them with Tri-Planar Mix by the weights -- rock, bark and "
+     "terrain without a UV map. Blend 0 is the hardest pick (a face "
+     "fades in only where its normal component passes 0.5), 1 the "
+     "softest cross-fade. Unlinked Vector reads the Generated "
+     "coordinates, unlinked Normal the shading normal",
+     [(_GV, 'Vector', None), (_GV, 'Normal', None),
+      (_GF, 'Scale', 1.0), (_GF, 'Blend', 0.5)],
+     {},
+     [(_GV, 'UV X'), (_GV, 'UV Y'), (_GV, 'UV Z'),
+      (_GF, 'Weight X'), (_GF, 'Weight Y'), (_GF, 'Weight Z')]),
+    # R253: hexagonal cells (Red Blob Games' axial / cube rounding)
+    ('HexGrid', "Hex Grid", 'MESH_ICOSPHERE',
+     "A honeycomb of hexagonal cells over the coordinate: Vector is the "
+     "local 0..1 frame inside the cell (z the cell's id), Cell ID a "
+     "stable random per cell for tinting, Edge 1 at the centre falling "
+     "to 0 on the cell's edge -- hex tiles, chain-link, honeycomb "
+     "armour, the strategy map. Unlinked Vector reads the UV map",
+     [(_GV, 'Vector', None), (_GF, 'Scale', 4.0)],
+     {'orient': ('enum', 'POINTY',
+                 (('POINTY', "Pointy Top",
+                   "Hexagons with a vertex at the top, rows offset "
+                   "sideways"),
+                  ('FLAT', "Flat Top",
+                   "Hexagons with an edge at the top, columns offset "
+                   "vertically")),
+                 "Orientation")},
+     [(_GV, 'Vector'), (_GF, 'Cell ID'), (_GF, 'Edge')]),
     ('Spin', "Spin", 'FILE_REFRESH',
      "A steady rotation about the centre, animated -- fans, wheels, "
      "record decals, hypno-spirals",
@@ -5262,7 +5497,10 @@ NODES = (HALCYON_RampNode, HALCYON_BlurNode,
          HALCYON_RandomPerObjectNode, HALCYON_LevelsNode,
          HALCYON_SmoothStepNode, HALCYON_ChannelShuffleNode,
          HALCYON_DistanceMaskNode, HALCYON_StepTimeNode,
-         HALCYON_WaveNode) + UTIL_NODES + VEC_NODES
+         HALCYON_WaveNode,
+         # R253: the pointer-carrying mapping nodes
+         HALCYON_TriPlanarTextureNode, HALCYON_ObjectMapNode,
+         ) + UTIL_NODES + VEC_NODES
 #: HalcyonBIRampStop is a PropertyGroup, not a node: it registers here,
 #: BEFORE the node whose CollectionProperty points at it, and stays out
 #: of the Add menu (which lists NODES only)
@@ -5516,11 +5754,22 @@ PROP_TIPS = {
         "0), wrap around, mirror back, or extend the edge",
     ('HALCYON_ProjectorNode', 'mode'):
         "The projection that makes the coordinates: flat planar, "
-        "cylinder, sphere, or box (the three planes picked by the "
-        "normal)",
+        "cylinder, sphere, box (the three planes picked by the "
+        "coordinate's largest axis, as shipped), and R253's cube atlas, "
+        "equirectangular / mirror-ball / angular sphere maps, capped "
+        "cylinder, screen, reflection, world normal and tangent space",
     ('HALCYON_ProjectorNode', 'axis'):
         "The projection's axis: which way the plane faces, the "
         "cylinder stands, or the box's dominant plane is chosen",
+    # R253
+    ('HALCYON_ProjectorNode', 'aspect'):
+        "Screen mode only: multiply the horizontal coordinate by the "
+        "frame's width over height so a square image stays square on "
+        "screen",
+    ('HALCYON_HexGridNode', 'orient'):
+        "Which way the hexagons point: a vertex at the top (rows offset "
+        "sideways) or an edge at the top (columns offset vertically) -- "
+        "the two are the x/y swap of each other",
     ('HALCYON_SpinNode', 'animate'):
         "Spins with the scene clock at the given rate; off holds the "
         "Angle input's turn",
@@ -5617,8 +5866,21 @@ ITEM_TIPS = {
         'CYLINDER': "Wrap around the axis -- cans, columns, tree "
                     "trunks",
         'SPHERE': "Wrap around a sphere -- planets and domes",
-        'BOX': "Three planar projections picked by the surface "
-               "normal -- quick clean mapping without UVs"},
+        'BOX': "Three planar projections picked by the coordinate's "
+               "largest axis (as shipped; Cube Atlas and the "
+               "Tri-Planar nodes pick by the normal)",
+        # R253: the appended modes carry their own >= 20-char text in
+        # the spec, so this table and the spec cannot disagree; the
+        # lines here only back-fill a stub
+        'CUBE': "Six faces by the normal into a 3 x 2 atlas",
+        'EQUIRECT': "Latitude-longitude sphere map of the direction",
+        'MIRROR_BALL': "Chrome-sphere (light probe) lookup",
+        'ANGULAR': "Angular light-probe map of the direction",
+        'CYLINDER_CAP': "Cylinder round the side, flat across the lids",
+        'SCREEN': "The pixel's window position, locked to the view",
+        'REFLECTION': "The mirror direction as an equirectangular map",
+        'NORMAL': "The world shading normal as a 0..1 coordinate",
+        'TANGENT': "The vector in the tangent / bitangent / normal frame"},
     ('HALCYON_ProjectorNode', 'axis'): {
         'X': "The projection faces / stands along X",
         'Y': "The projection faces / stands along Y",
@@ -5686,7 +5948,9 @@ MENU_FAMILIES = (
       HALCYON_BlurNode) + UTIL_NODES),
     ('Vector', 'ORIENTATION_NORMAL',
      (HALCYON_NormalMapNode, HALCYON_NormalMixNode,
-      HALCYON_UVWaveNode, HALCYON_ScrollNode) + VEC_NODES
+      HALCYON_UVWaveNode, HALCYON_ScrollNode,
+      # R253: the image-owning tri-planar node and the object projector
+      HALCYON_TriPlanarTextureNode, HALCYON_ObjectMapNode) + VEC_NODES
      # R242: the matcap coordinates are a vector, not a texture
      + (('HALCYON_MatcapUVNode', "Matcap Coordinates", 'MATSPHERE'),)),
     ('Retro Screen', 'RENDER_STILL',

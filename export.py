@@ -5,6 +5,7 @@ renderer testable headlessly, and it is why node trees are flattened into dicts
 here rather than walked live during shading.
 """
 
+import math
 import re
 
 import numpy as np
@@ -193,6 +194,10 @@ NODE_PROPS = {
     'HALCYON_ColorCycleNode': ('animate',),
     'HALCYON_FlipbookNode': ('animate',),
     'HALCYON_UVWaveNode': ('animate',),
+    # R253: the pointer-carrying mapping nodes (the image key rides the
+    # generic `node.image` hook; the object's matrix the hook below)
+    'HALCYON_TriPlanarTextureNode': ('interpolation', 'extension'),
+    'HALCYON_ObjectMapNode': ('mode',),
 }
 
 try:
@@ -344,7 +349,104 @@ def _node_props(node, images, programs, warnings):
             programs[node.name] = prog
         elif err:
             warnings.append(f"{node.name}: {err}")
+
+    if node.bl_idname == 'HALCYON_ObjectMapNode':
+        # R253: the picked object's frame travels with the material
+        props.update(object_map_props(node, warnings))
     return props
+
+
+def _lit8(x):
+    """R253: a baked scalar as BOTH devices read it -- rounded through
+    the 8-significant-digit decimal gpu/emit prints as the GLSL
+    literal (nodeeval._lit8 does the same before its float32 cast)."""
+    return float(f'{float(x):.8g}')
+
+
+def _socket_value(node, name, default):
+    """(default_value, is_linked) of an input socket by name, or
+    (default, False) when the node has no such socket."""
+    for sock in getattr(node, 'inputs', ()) or ():
+        if getattr(sock, 'name', '') != name:
+            continue
+        linked = bool(getattr(sock, 'is_linked', False))
+        try:
+            return float(getattr(sock, 'default_value', default)), linked
+        except (TypeError, ValueError):
+            return float(default), linked
+    return float(default), False
+
+
+def object_map_props(node, warnings):
+    """R253: the Object Projection node's baked frame. `object_inv` is
+    rows 0..2 of the picked object's inverse matrix_world (the
+    object_matrices() convention of core/render.py, scale included),
+    twelve floats; `proj_mode` the AUTO mode resolved from the object's
+    type (spot lamp / perspective camera -> PERSPECTIVE, sun lamp /
+    orthographic camera -> ORTHO, anything else -> FRAME); `proj_tan`
+    the lens half-angle's tangent (a spot's spot_size / 2, a camera's
+    sensor over twice the lens -- sensor_fit VERTICAL reads
+    sensor_height) and `proj_half` the parallel window's half-width (an
+    ortho camera's ortho_scale / 2), each written whenever one number
+    can be resolved -- the object's own lens first, else the node's
+    Angle / Ortho Size socket when it is not linked (a linked socket is
+    read per lane at shading time: the CPU computes it, the GPU refuses
+    the Angle by name). No object picked: the identity, with a
+    warning."""
+    out = {}
+    ob = getattr(node, 'object', None)
+    label = getattr(node, 'name', 'Object Projection')
+    if ob is None:
+        warnings.append(f"{label}: no object picked; world space")
+        inv = np.eye(4, dtype=np.float32)
+        kind, sub = '', ''
+    else:
+        try:
+            mw = np.asarray(ob.matrix_world, np.float32).reshape(4, 4)
+            inv = np.linalg.inv(mw)
+        except Exception:                                       # noqa: BLE001
+            warnings.append(f"{label}: '{getattr(ob, 'name', '?')}' has "
+                            "no usable matrix; world space")
+            inv = np.eye(4, dtype=np.float32)
+        kind = str(getattr(ob, 'type', '') or '')
+        sub = str(getattr(getattr(ob, 'data', None), 'type', '') or '')
+    out['object_inv'] = [_lit8(x) for x in inv[:3, :].reshape(-1)]
+
+    mode = str(getattr(node, 'mode', 'AUTO') or 'AUTO')
+    data = getattr(ob, 'data', None)
+    lens_tan = None
+    lens_half = None
+    if kind == 'LIGHT' and sub == 'SPOT':
+        lens_tan = math.tan(float(getattr(data, 'spot_size', 0.785398)) * 0.5)
+        auto = 'PERSPECTIVE'
+    elif kind == 'LIGHT' and sub == 'SUN':
+        auto = 'ORTHO'
+    elif kind == 'CAMERA':
+        if str(getattr(data, 'type', 'PERSP')) == 'ORTHO':
+            lens_half = float(getattr(data, 'ortho_scale', 6.0)) * 0.5
+            auto = 'ORTHO'
+        else:
+            fit = str(getattr(data, 'sensor_fit', 'AUTO'))
+            sensor = float(getattr(data, 'sensor_height', 24.0)) \
+                if fit == 'VERTICAL' else float(getattr(data, 'sensor_width', 36.0))
+            lens = max(float(getattr(data, 'lens', 50.0)), 1e-6)
+            lens_tan = sensor / (2.0 * lens)
+            auto = 'PERSPECTIVE'
+    else:
+        auto = 'FRAME'
+    out['proj_mode'] = auto if mode == 'AUTO' else mode
+
+    ang, ang_linked = _socket_value(node, 'Angle', 45.0)
+    size, size_linked = _socket_value(node, 'Ortho Size', 2.0)
+    if lens_tan is not None:
+        out['proj_tan'] = _lit8(lens_tan)
+    elif not ang_linked:
+        out['proj_tan'] = _lit8(math.tan(math.radians(ang) * 0.5))
+    if lens_half is not None:
+        out['proj_half'] = _lit8(lens_half)
+    elif not size_linked:
+        out['proj_half'] = _lit8(size * 0.5)
+    return out
 
 
 def _compile_node(node):
