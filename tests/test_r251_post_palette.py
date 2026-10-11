@@ -910,9 +910,13 @@ def test_c054_ehb():
           and p['settings'].get('dither') == 'NONE'
           and (p['settings'].get('resolution_x'),
                p['settings'].get('resolution_y')) == (320, 256))
-    check("the PALETTE_MODE enum carries EHB at the END (positional numbering "
-          'never moves an item)',
-          [i[0] for i in _properties().PALETTE_MODE][-1] == 'EHB')
+    # R253 (console presets): SUPERFX16 is appended AFTER EHB, so EHB keeps
+    # its index (10) and the new item is the last -- the positional rule
+    # holds for both
+    _pm = [i[0] for i in _properties().PALETTE_MODE]
+    check("the PALETTE_MODE enum keeps EHB at its index (10) and SUPERFX16 "
+          'follows it at the END (positional numbering never moves an item)',
+          _pm.index('EHB') == 10 and _pm[-1] == 'SUPERFX16')
 
 
 # ---------------------------------------------------- C011: CRY16 (Jaguar)
@@ -1007,11 +1011,15 @@ def test_c011_cry16():
     # (5) the FM row and the preset
     check("the featurematrix carries the 'CRY16 colour (Jaguar)' row",
           fm_row('CRY16 colour (Jaguar)'))
-    check("the JAGUAR preset renders in CRY16 and its note no longer claims a "
-          'Gouraud the engine does not do',
+    # R253 (console presets): the blitter's intensity-only Gouraud now
+    # exists (core/shading JAGUAR_CRY, R252), so the preset names it and
+    # the note describes it instead of disclaiming it
+    check("the JAGUAR preset renders in CRY16 and its note names the blitter's "
+          'intensity-only Gouraud, which the engine now does (JAGUAR_CRY)',
           PRESETS['JAGUAR']['settings'].get('color_depth') == 'CRY16'
           and 'CRY' in PRESETS['JAGUAR']['note']
-          and 'intensity-only Gouraud is not modelled' in PRESETS['JAGUAR']['note'])
+          and 'intensity-only Gouraud' in PRESETS['JAGUAR']['note']
+          and PRESETS['JAGUAR']['settings']['default_model'] == 'JAGUAR_CRY')
     CD = _properties().COLOR_DEPTH
     check('the COLOR_DEPTH enum carries CRY16 and YJK at the END, after HAM6 '
           '(positional numbering never moves an item)',

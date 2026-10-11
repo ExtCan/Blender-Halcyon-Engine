@@ -36081,7 +36081,8 @@ void main() {{ Color = {expr}; }}'''
 
     # ----------------------------------------------------- the 2012 preset
     p = PRESETS.get('MAX_2012')
-    check('the 3ds Max 2012 preset exists among 112 presets', p is not None and len(PRESETS) == 112)
+    # R253 (console presets): 112 + the nine console / arcade looks
+    check('the 3ds Max 2012 preset exists among 121 presets', p is not None and len(PRESETS) == 121)
     if p is not None:
         st = RenderSettings()
         apply_preset(st, 'MAX_2012')

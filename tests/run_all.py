@@ -39,6 +39,8 @@ def run_tests():
     # R253 (1.92.0): more mapping types (Tri-Planar, cube atlas, object
     # projection, hex grid, the Projector's appended modes)
     from . import test_r253_mapping
+    # R253 (1.92.0): render presets for the consoles that got shaders
+    from . import test_r253_console_presets
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -170,6 +172,11 @@ def run_tests():
     print('R253 MORE MAPPING TYPES')
     print('=' * 66)
     rc |= test_r253_mapping.main()
+    print()
+    print('=' * 66)
+    print('R253 CONSOLE RENDER PRESETS')
+    print('=' * 66)
+    rc |= test_r253_console_presets.main()
     return rc
 
 
@@ -189,7 +196,9 @@ def write_images(outdir='.'):
     from .scenebuild import demo_scene
 
     picks = ['INFINID_4', 'STUDIO_R4', 'PSX', 'N64', 'VOODOO', 'EGA',
-             'IMAGINE_3', 'QUAKE_SW', 'TOASTER']
+             'IMAGINE_3', 'QUAKE_SW', 'TOASTER',
+             # R253 (console presets): the plot, the Trails, the LCD
+             'SUPERFX', 'GTA_PS2', 'PSP']
     os.makedirs(outdir, exist_ok=True)
     tiles = []
     print()
@@ -214,7 +223,9 @@ def write_images(outdir='.'):
         print(f'  {PRESETS[key]["label"]:28s} -> {path}   {time.time() - t0:5.2f}s')
 
     W, H, gap = 240, 180, 4
-    sheet = np.zeros((H * 3 + gap * 2, W * 3 + gap * 2, 3), np.float32)
+    rows = (len(tiles) + 2) // 3      # R253: three per row, as many rows as the picks need
+    sheet = np.zeros((H * rows + gap * (rows - 1), W * 3 + gap * 2, 3),
+                     np.float32)
     for i, t in enumerate(tiles):
         r, c = divmod(i, 3)
         sheet[r * (H + gap):r * (H + gap) + H,

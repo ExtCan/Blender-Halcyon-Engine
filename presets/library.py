@@ -4,6 +4,12 @@ Each entry is a partial RenderSettings override. The values are chosen from what
 each target actually did -- Infini-D's Phong with no ambient occlusion and a
 sharp 24-bit output, the PlayStation's affine texture warp and vertex snapping,
 Imagine's HAM8 framebuffer, and so on. Nothing here is a generic "retro" blur.
+
+R253: a console or arcade preset may also carry 'console_node', the Convert
+to Game hint (the Console Emulation Shader's machine, shader type and
+options that reproduce the preset's default_model on the node). It is the
+only optional top-level key beside the four required ones; apply_preset
+never reads it (`console_hint` below does).
 """
 
 CATEGORIES = (
@@ -619,6 +625,7 @@ PRESETS = {
             'fog_table': 'DS32',
             'fog_color': (0.5, 0.55, 0.65),
             'shadows': False, 'max_lights': 4,
+            'light_limit_mode': 'FIRST',   # R253: the geometry engine's four, in order
             # R251 C042 (design 2.5 #35): translucency at (A+1)/32, blended once
             # per polygon ID in bottom-row order, not depth
             'transparency': 'ABUFFER', 'blend_equation': 'DS',
@@ -632,6 +639,10 @@ PRESETS = {
             'outline_over_sky': True, 'outline_color': (0.0, 0.0, 0.0),
             'gamma': 2.2, 'output_scale': '3X',
         },
+        # R253: the Convert to Game hint (GBATEK's polygon mode 0, the
+        # shininess table pinned at 64, the four-light toggle)
+        'console_node': {'console': 'DS', 'ds_type': 'MODULATE',
+                         'ds_table': 'PIN', 'light_limit': True},
     },
     'SNES': {
         'label': "Super Nintendo (1990)",
@@ -1072,6 +1083,8 @@ PRESETS = {
             'fog_color': (0.4, 0.45, 0.55), 'shadows': False,
             'max_lights': 8, 'transparency': 'SORTED', 'gamma': 2.2,
         },
+        # R253: the Convert to Game hint (the CLX2's packed + offset colour)
+        'console_node': {'console': 'DREAMCAST', 'dc_type': 'PACKED'},
     },
     'PS2': {
         'label': "PlayStation 2 (2000)",
@@ -1108,8 +1121,14 @@ PRESETS = {
             'fog_end': 90.0, 'fog_color': (0.45, 0.5, 0.58),
             'near_clip_mode': 'REJECT',        # R251 C027: VU1 whole-triangle drop
             'shadows': True, 'shadow_default': 'MAP', 'shadow_map_size': 512,
-            'max_lights': 8, 'transparency': 'SORTED', 'gamma': 2.2,
+            # R253: the common VU1 microcode's three directional lights, in
+            # order (core/console.LIGHT_LIMIT; was 8)
+            'max_lights': 3, 'light_limit_mode': 'FIRST',
+            'transparency': 'SORTED', 'gamma': 2.2,
         },
+        # R253: the Convert to Game hint (TFX 2, the three-light toggle)
+        'console_node': {'console': 'PS2', 'ps2_type': 'HIGHLIGHT',
+                         'light_limit': True},
     },
     'GAMECUBE': {
         'label': "Nintendo GameCube (2001)",
@@ -1144,9 +1163,13 @@ PRESETS = {
             'shadow_map_size': 1024, 'shadow_softness': 2.0,
             'shadow_samples': 8,
             'max_lights': 8, 'transparency': 'SORTED', 'gamma': 2.2,
+            'light_limit_mode': 'FIRST',   # R253: GX's eight lights, in order
             # R251: the EFB's RGBA6_Z24 format, Flipper's 2x2 dither
             'framebuffer': 'GC_RGBA6',
         },
+        # R253: the Convert to Game hint (GX_SetChanCtrl with lights on)
+        'console_node': {'console': 'GAMECUBE', 'gc_type': 'LIT',
+                         'light_limit': True},
     },
     'XBOX': {
         'label': "Microsoft Xbox (2001)",
@@ -1176,16 +1199,23 @@ PRESETS = {
             'shadow_samples': 8,
             'max_lights': 8, 'transparency': 'SORTED', 'gamma': 2.2,
         },
+        # R253: the Convert to Game hint -- Direct3D 8's separate specular;
+        # the preset's own BLINN per pixel stays (the generation's flex)
+        'console_node': {'console': 'PC_FIXED', 'pc_type': 'GOURAUD_SEP'},
     },
     'THREEDO': {
         'label': "3DO Interactive (1993)",
         'category': 'CONSOLE',
         'note': "Cel-based hardware: warped textures, no z-buffer, 320x240 "
                 "with visible seams between quads, doubled to 640x480 by "
-                "the display generator's cornerweight interpolation.",
+                "the display generator's cornerweight interpolation. Each "
+                "cel is lit as a whole by the PIXC multiplier (n/8), the "
+                "only shading the machine's sprites-as-polygons took.",
         'settings': {
             'resolution_x': 320, 'resolution_y': 240,
-            'aa_mode': 'NONE', 'default_model': 'FLAT', 'shading_rate': 'FACE',
+            # R253: the cel engine's PIXC (core/shading THREEDO_PIXC, rate
+            # fixed at FACE) replaces the FLAT stand-in
+            'aa_mode': 'NONE', 'default_model': 'THREEDO_PIXC', 'shading_rate': 'FACE',
             'vertex_snap': True, 'vertex_snap_grid': 1.0,
             'tex_filter': 'NEAREST', 'tex_perspective': False,
             'depth_sort': 'PAINTERS', 'color_depth': '15', 'dither': 'BAYER2',
@@ -1195,23 +1225,30 @@ PRESETS = {
             # R251: the PIXC's default P/2+S/2
             'transparency': 'SORTED', 'blend_equation': 'SATURN_HALF',
         },
+        # R253: the Convert to Game hint
+        'console_node': {'console': 'THREEDO', 'tdo_type': 'PIXC'},
     },
     'JAGUAR': {
         'label': "Atari Jaguar (1993)",
         'category': 'CONSOLE',
         'note': "Flat-lit polygons at 320x240 in the Jaguar's own CRY "
                 "pixel: smooth intensity, 256 chroma cells, no texture "
-                "filtering. Halcyon's Gouraud interpolates RGB and encodes "
-                "CRY per pixel; the Blitter's intensity-only Gouraud is "
-                "not modelled.",
+                "filtering. The Blitter's intensity-only Gouraud: one "
+                "chroma per polygon, only the 8-bit intensity byte "
+                "interpolates across it, so a lit polygon never changes "
+                "hue (GOURD mode, Jaguar Technical Reference).",
         'settings': {
             'resolution_x': 320, 'resolution_y': 240,
-            'aa_mode': 'NONE', 'default_model': 'GOURAUD',
+            # R253: the blitter's GOURD (core/shading JAGUAR_CRY) replaces
+            # the RGB Gouraud stand-in
+            'aa_mode': 'NONE', 'default_model': 'JAGUAR_CRY',
             'shading_rate': 'VERTEX', 'tex_filter': 'NEAREST',
             'tex_perspective': False, 'color_depth': 'CRY16', 'dither': 'NONE',
             'shadows': False, 'max_lights': 2, 'backface_cull': True,
             'gamma': 2.2, 'output_scale': '3X',
         },
+        # R253: the Convert to Game hint
+        'console_node': {'console': 'JAGUAR', 'jag_type': 'GOURAUD'},
     },
     # R251 post-signal (C047): software 3D into Mode 5's bitmap, stretched
     # to the LCD by BG2's affine registers (design 2.5 #36 merges
@@ -1276,13 +1313,19 @@ PRESETS = {
             'vertex_quantize': 'PS1', 'vertex_units': 64.0,   # R251 C012: 16-bit vertices, 1.3.12 normals, 8-bit UVs
             'transparency': 'SORTED',
             'color_depth': '15', 'dither': 'BAYER4', 'shadows': False,
-            'max_lights': 4, 'backface_cull': True, 'gamma': 2.2,
+            # R253: the GTE's three-light colour matrix (LLM / LCM, nocash),
+            # in order (core/console.LIGHT_LIMIT; was 4)
+            'max_lights': 3, 'light_limit_mode': 'FIRST',
+            'backface_cull': True, 'gamma': 2.2,
             # R251: the GPU's 0.5B+0.5F semi-transparency
             'blend_equation': 'PS1_AVG',
             # R251 F001: the GTE's depth cue at the preset's vertex rate
             'fog': True, 'fog_mode': 'GTE_1Z', 'fog_start': 6.0,
             'fog_end': 24.0, 'fog_color': (0.32, 0.32, 0.36),
         },
+        # R253: the Convert to Game hint (GTE-lit Gouraud, the three-light toggle)
+        'console_node': {'console': 'PS1', 'ps1_type': 'GOURAUD',
+                         'light_limit': True},
     },
 
     # --------------------------------------------------- more broadcast
@@ -1569,7 +1612,10 @@ PRESETS = {
             'vertex_quantize': 'PS1', 'vertex_units': 64.0,   # R251 C012: 16-bit vertices, 1.3.12 normals, 8-bit UVs
             'transparency': 'SORTED',
             'color_depth': '15', 'dither': 'BAYER4', 'dither_strength': 1.0,
-            'shadows': False, 'max_lights': 4, 'backface_cull': True,
+            # R253: the GTE's three-light colour matrix (LLM / LCM, nocash),
+            # in order (core/console.LIGHT_LIMIT; was 4)
+            'shadows': False, 'max_lights': 3, 'light_limit_mode': 'FIRST',
+            'backface_cull': True,
             'gamma': 2.2, 'output_scale': '3X',
             # R251: the GPU's 0.5B+0.5F semi-transparency
             'blend_equation': 'PS1_AVG',
@@ -1577,6 +1623,9 @@ PRESETS = {
             'fog': True, 'fog_mode': 'GTE_1Z', 'fog_start': 6.0,
             'fog_end': 24.0, 'fog_color': (0.32, 0.32, 0.36),
         },
+        # R253: the Convert to Game hint (GTE-lit Gouraud, the three-light toggle)
+        'console_node': {'console': 'PS1', 'ps1_type': 'GOURAUD',
+                         'light_limit': True},
     },
     'MODEL1': {
         'label': "Sega Model 1 (1992)",
@@ -1616,6 +1665,11 @@ PRESETS = {
             # R251: VDP1's half-transparency colour calculation
             'transparency': 'SORTED', 'blend_equation': 'SATURN_HALF',
         },
+        # R253: the Convert to Game hint (colour calculation 4). The scene
+        # rate stays FACE as shipped; the node's Rate menu at Machine
+        # shades the converted material per vertex (the VDP1's Gouraud
+        # table is per corner) while the scene stays flat -- disclosed
+        'console_node': {'console': 'SATURN', 'sat_type': 'GOURAUD'},
     },
     'SEGA_MODEL2': {
         'label': "Sega Model 2 (1993)",
@@ -1640,9 +1694,12 @@ PRESETS = {
             'color_depth': '15', 'dither': 'NONE',
             'transparency': 'STIPPLE', 'stipple_pattern': 'BAYER2',
             'shadows': False, 'max_lights': 1,
+            'light_limit_mode': 'FIRST',   # R253: the one sun is the first lamp
             'specular_viewer': 'AXIS',
             'backface_cull': True, 'gamma': 2.2,
         },
+        # R253: the Convert to Game hint (the lit polygon through the luma ramp)
+        'console_node': {'console': 'MODEL2', 'm2_type': 'LIT'},
     },
     'SEGA_MODEL3': {
         'label': "Sega Model 3 (1996)",
@@ -1672,9 +1729,12 @@ PRESETS = {
             # Fog Bank 1 socket (the board's near haze; inert until used)
             'fog_bank1_start': 6.0, 'fog_bank1_end': 45.0,
             'shadows': False, 'max_lights': 1,
+            'light_limit_mode': 'FIRST',   # R253: the one sun is the first lamp
             'specular_viewer': 'AXIS',
             'backface_cull': True, 'gamma': 2.2,
         },
+        # R253: the Convert to Game hint (the smooth polygon, per-vertex lit)
+        'console_node': {'console': 'MODEL3', 'm3_type': 'SMOOTH'},
     },
     'N64': {
         'label': "Nintendo 64 (1996)",
@@ -1701,12 +1761,18 @@ PRESETS = {
             'fog_end': 26.0, 'fog_color': (0.35, 0.42, 0.55),
             'depth_encoding': 'N64_FLOAT18',   # R251 C007: the RDP's 14-bit float z
             'vertex_quantize': 'N64', 'vertex_units': 64.0,   # R251 C012: Vtx_t short ob[3], signed char n[3]
-            'shadows': False, 'max_lights': 4, 'gamma': 1.0,
+            # R253: the RSP's seven directional lights plus the ambient
+            # (gbi.h; core/console.LIGHT_LIMIT), in order (was 4)
+            'shadows': False, 'max_lights': 7, 'light_limit_mode': 'FIRST',
+            'gamma': 1.0,
             # R251: the VI's own de-dither and gamma-dither at scan-out
             # (gamma 1.0: the VI's root replaces the display dial)
             'vi_dither_filter': True, 'vi_gamma': 'GAMMA_DITHER',
             'output_scale': '3X',
         },
+        # R253: the Convert to Game hint (G_CC_MODULATERGB, the seven-light toggle)
+        'console_node': {'console': 'N64', 'n64_type': 'MODULATE',
+                         'light_limit': True},
     },
     'VOODOO': {
         'label': "3dfx Voodoo Graphics (1996)",
@@ -1746,6 +1812,10 @@ PRESETS = {
             # R251: the '22-bit' scan-out filter 86Box reconstructed
             'video_filter': 'VOODOO1',
         },
+        # R253: the Convert to Game hint -- the Glide era's CPU-lit Gouraud
+        # with the specular modulated into the texel (Direct3D 3 / Glide)
+        'console_node': {'console': 'PC_FIXED', 'pc_type': 'GOURAUD',
+                         'pc_texture_op': 'MODULATE'},
     },
     # R251 F002: the integrator rebuilds this dict from the FINAL merged
     # VOODOO settings (design 2.5 #33: + video_filter, tex_frac_bits)
@@ -1769,6 +1839,9 @@ PRESETS = {
             'shadows': False, 'max_lights': 8,
             'transparency': 'SORTED', 'gamma': 2.2,
         },
+        # R253: the Convert to Game hint (as VOODOO)
+        'console_node': {'console': 'PC_FIXED', 'pc_type': 'GOURAUD',
+                         'pc_texture_op': 'MODULATE'},
     },
     # R251 material pack (MAT-A): the fixed-function combiners' machines
     'D3D_RETAIL_1997': {
@@ -1791,7 +1864,11 @@ PRESETS = {
             # means -- the note names the dial instead
             'pixel_center': 'INTEGER_D3D',
             'shadows': False, 'max_lights': 8, 'gamma': 2.2,
+            'light_limit_mode': 'FIRST',   # R253: MaxActiveLights 8, in order
         },
+        # R253: the Convert to Game hint (D3DSHADE_FLAT, D3DTOP_MODULATE)
+        'console_node': {'console': 'PC_FIXED', 'pc_type': 'FLAT_D3D',
+                         'pc_texture_op': 'MODULATE'},
     },
     'POWERVR_PCX2': {
         'label': "PowerVR PCX2, Matrox m3D (1997)",
@@ -1810,6 +1887,8 @@ PRESETS = {
             'max_lights': 8, 'gamma': 2.2,
             'resolution_x': 640, 'resolution_y': 480,
         },
+        # R253: the Convert to Game hint (the mean of the three corners)
+        'console_node': {'console': 'PCX', 'pcx_base': 'MEAN'},
     },
     'MEGA_DRIVE': {
         'label': "Sega Mega Drive / Genesis (1988)",
@@ -1825,8 +1904,278 @@ PRESETS = {
             'tex_filter': 'NEAREST', 'color_depth': '24', 'dither': 'NONE',
             'transparency': 'STIPPLE', 'stipple_pattern': 'COLUMNS',
             'depth_sort': 'PAINTERS', 'shadows': False, 'max_lights': 1,
+            'light_limit_mode': 'FIRST',   # R253: the key lamp is the first lamp
             'gamma': 1.0, 'color_management': 'NONE', 'output_scale': '3X',
         },
+        # R253: the Convert to Game hint (shadow / highlight by class)
+        'console_node': {'console': 'MEGADRIVE', 'md_type': 'AUTO'},
+    },
+
+    # R253 (console presets): the machines the Console Emulation Shader
+    # emulates that had no shelf entry, and the two RenderWare-era looks.
+    # Each dict carries 'console_node', the Convert to Game hint (see
+    # console_hint below); apply_preset reads 'settings' alone. Where a
+    # hardware number is a stand-in the note says so.
+    'PSP': {
+        'label': "Sony PSP (2004)",
+        'category': 'CONSOLE',
+        'note': "480x272 on the LCD at 2x, the GU's modulate texture "
+                "function over its four-light unit (sceGuLight x4), "
+                "bilinear mipmaps up to 512, perspective-correct, a "
+                "16-bit 5:6:5 framebuffer (GU_PSM_5650) under the GE's "
+                "4x4 dither matrix -- Bayer 4x4 stands in for "
+                "sceGuSetDither's own table -- and sceGuFog's linear "
+                "near/far fog. Materials with their own model keep it; "
+                "set Force Model to make every material the machine's.",
+        'settings': {
+            'resolution_x': 480, 'resolution_y': 272,
+            'aa_mode': 'NONE', 'default_model': 'PS1_MODULATE',
+            'shading_rate': 'VERTEX',
+            'tex_filter': 'BILINEAR', 'tex_mipmap': True, 'tex_max_size': 512,
+            'tex_perspective': True, 'tex_format': 'RGB565',
+            'color_depth': '16', 'dither': 'BAYER4',
+            'fog': True, 'fog_mode': 'LINEAR', 'fog_start': 10.0,
+            'fog_end': 60.0, 'fog_color': (0.5, 0.55, 0.65),
+            'shadows': False, 'max_lights': 4, 'light_limit_mode': 'FIRST',
+            'transparency': 'SORTED', 'backface_cull': True,
+            'gamma': 2.2, 'output_scale': '2X',
+        },
+        'console_node': {'console': 'PSP', 'psp_type': 'MODULATE',
+                         'light_limit': True},
+    },
+    'NAMCO_S22': {
+        'label': "Namco System 22 (1993)",
+        'category': 'ARCADE',
+        'note': "Ridge Racer's board: 640x480 textured polygons lit per "
+                "vertex by one parallel light with unity at 0x40, "
+                "point-sampled textures (Super System 22 added bilinear), "
+                "24-bit output, no shadows. The depth cue is MAME's czram "
+                "per-polygon-z table; Linear fog is the stand-in curve. "
+                "Materials with their own model keep it; set Force Model "
+                "to make every material the board's.",
+        'settings': {
+            'resolution_x': 640, 'resolution_y': 480,
+            'aa_mode': 'NONE', 'default_model': 'S22_MODULATE',
+            'shading_rate': 'VERTEX', 'tex_filter': 'NEAREST',
+            'tex_perspective': True, 'tex_max_size': 256,
+            'color_depth': '24', 'dither': 'NONE',
+            'fog': True, 'fog_mode': 'LINEAR', 'fog_start': 8.0,
+            'fog_end': 60.0, 'fog_color': (0.6, 0.65, 0.75),
+            'shadows': False, 'max_lights': 1, 'light_limit_mode': 'FIRST',
+            'backface_cull': True, 'gamma': 2.2,
+        },
+        'console_node': {'console': 'SYSTEM22', 's22_type': 'LIT',
+                         'light_limit': True},
+    },
+    'SUPERFX': {
+        'label': "Super FX / Star Fox (1993)",
+        'category': 'CONSOLE',
+        'note': "Star Fox's PLOT into a 4 bpp bitmap at 256x224 (the "
+                "SNES's 8:7 pixel): one colour per polygon, matched by the "
+                "nearest pair of a fixed 16-entry palette and filled as a "
+                "checkerboard of the two. The palette is Star Fox 16, a "
+                "STAND-IN for the cartridge's own CGRAM (no dump is "
+                "cited); gamma 1.0 and no colour management keep the "
+                "plotted entries on the palette (the plot's gates). No "
+                "dither stage: the plot IS the dither.",
+        'settings': {
+            'resolution_x': 256, 'resolution_y': 224,
+            'pixel_aspect_x': 1.0, 'pixel_aspect_y': 1.14,
+            'aa_mode': 'NONE', 'aa_samples': 1,
+            'default_model': 'SUPERFX_PLOT', 'shading_rate': 'FACE',
+            'tex_filter': 'NEAREST', 'depth_sort': 'PAINTERS',
+            'color_depth': '4', 'palette_mode': 'SUPERFX16',
+            'palette_size': 16, 'palette_bits': 'BITS_5', 'dither': 'NONE',
+            'gamma': 1.0, 'color_management': 'NONE',
+            'transparency': 'NONE', 'shadows': False, 'max_lights': 1,
+            'light_limit_mode': 'FIRST', 'backface_cull': True,
+            'output_scale': '3X',
+        },
+        'console_node': {'console': 'SUPERFX', 'sfx_type': 'DITHER'},
+    },
+    'WII': {
+        'label': "Nintendo Wii, 480p 16:9 (2006)",
+        'category': 'CONSOLE',
+        'note': "The GameCube look at the Wii's settings: 640x480 "
+                "progressive with an ANAMORPHIC 16:9 pixel (4:3 pixel "
+                "aspect -- Blender's Format panel shows it), GX's "
+                "fixed-function light unit per vertex with its eight "
+                "lights, trilinear mipmaps up to 1024 at 4x anisotropy "
+                "(GX_ANISO_4, the Hollywood maximum), the EFB copy's "
+                "deflicker filter, the XFB's 4:2:2, table fog with a "
+                "height layer, the RGBA6 EFB and 1024 shadow maps.",
+        'settings': {  # the GAMECUBE dict, then the Wii's own numbers
+            'resolution_x': 640, 'resolution_y': 480,
+            'pixel_aspect_x': 4.0, 'pixel_aspect_y': 3.0,
+            'aa_mode': 'NONE', 'copy_filter': 'DEFLICKER',
+            'chroma_format': 'XFB_422', 'interlace': 'NONE',
+            'default_model': 'GX_LIGHT', 'shading_rate': 'VERTEX',
+            'tex_filter': 'TRILINEAR', 'tex_mipmap': True, 'tex_aniso': 4,
+            'tex_max_size': 1024, 'tex_perspective': True,
+            'tex_compress': 'CMPR_GC',
+            'color_depth': '24', 'dither': 'NONE',
+            'fog': True, 'fog_mode': 'TABLE16', 'fog_start': 12.0,
+            'fog_end': 80.0, 'fog_color': (0.5, 0.55, 0.62),
+            'fog_height': True, 'fog_height_top': 3.0,
+            'fog_height_falloff': 0.4,
+            'depth_encoding': 'GC_14E2',
+            'shadows': True, 'shadow_default': 'MAP',
+            'shadow_map_size': 1024, 'shadow_softness': 2.0,
+            'shadow_samples': 8,
+            'max_lights': 8, 'light_limit_mode': 'FIRST',
+            'transparency': 'SORTED', 'gamma': 2.2,
+            'framebuffer': 'GC_RGBA6',
+        },
+        'console_node': {'console': 'GAMECUBE', 'gc_type': 'LIT',
+                         'light_limit': True},
+    },
+    'NAOMI': {
+        'label': "Sega Naomi (1998)",
+        'category': 'ARCADE',
+        'note': "The Dreamcast's PowerVR2 on the arcade board: 640x480 at "
+                "31 kHz VGA into a 24-bit framebuffer (no dither, no "
+                "supersampler -- the DC preset's 4x stays its own), VQ "
+                "textures up to 1024, bilinear mipmaps, the CLX2's "
+                "128-entry fog table on 1/w, packed vertex colours with "
+                "the offset (specular) colour. No hardware light unit: "
+                "the eight lights are CPU-lit, as the SH-4 did.",
+        'settings': {  # the DREAMCAST dict, then the board's own numbers
+            'resolution_x': 640, 'resolution_y': 480,
+            'aa_mode': 'NONE',
+            'default_model': 'D3D_SEPARATE_SPEC', 'shading_rate': 'VERTEX',
+            'tex_filter': 'BILINEAR', 'tex_mipmap': True, 'tex_max_size': 1024,
+            'tex_compress': 'VQ_DC',
+            'tex_perspective': True, 'color_depth': '24', 'dither': 'NONE',
+            'fog': True, 'fog_mode': 'EXP', 'fog_density': 0.02,
+            'fog_table': 'PVR128', 'fog_end': 64.0,
+            'fog_color': (0.4, 0.45, 0.55), 'shadows': False,
+            'max_lights': 8, 'transparency': 'SORTED', 'gamma': 2.2,
+        },
+        'console_node': {'console': 'DREAMCAST', 'dc_type': 'PACKED'},
+    },
+    'RENDERWARE_PS2': {
+        'label': "RenderWare on PlayStation 2 (2001)",
+        'category': 'CONSOLE',
+        'note': "Criterion's default PS2 pipeline: 512x448 field-rendered "
+                "(the GS's 512-wide mode most RW titles ran; the generic "
+                "width is a stand-in for any one title) into the 16-bit "
+                "PSMCT16 buffer with DTHE on, bilinear mipmaps popping "
+                "from Q, prelit vertex colours added to the lights with "
+                "no hardware light count (RpWorld has none), "
+                "RwCameraSetFogDistance's linear fog, no shadows (blob "
+                "shadows were geometry), VU1's whole-triangle near drop.",
+        'settings': {  # the PS2 dict, then RenderWare's own choices
+            'resolution_x': 512, 'resolution_y': 448,
+            'aa_mode': 'EDGE', 'aa_edge_threshold': 0.08,
+            'default_model': 'RENDERWARE_PS2', 'shading_rate': 'VERTEX',
+            'tex_filter': 'BILINEAR', 'tex_mipmap': True,
+            'tex_max_size': 256, 'tex_perspective': True,
+            'tex_lod_source': 'GS_Q', 'tex_lod_k': -2.0, 'tex_lod_l': 0,
+            'tex_mip_select': 'NEAREST_LEVEL',
+            'color_depth': '24', 'dither': 'NONE',
+            'framebuffer': 'PS2_CT16', 'fb_dither': True,
+            'interlace': 'FIELDS',
+            'glow': False,
+            'fog': True, 'fog_mode': 'LINEAR', 'fog_start': 20.0,
+            'fog_end': 120.0, 'fog_color': (0.45, 0.5, 0.58),
+            'near_clip_mode': 'REJECT',
+            'shadows': False, 'max_lights': 0,
+            'transparency': 'SORTED', 'gamma': 2.2,
+        },
+        'console_node': {'console': 'RENDERWARE', 'rw_platform': 'PS2',
+                         'rw_type': 'PRELIT'},
+    },
+    'RENDERWARE_GC': {
+        'label': "RenderWare on GameCube (2002)",
+        'category': 'CONSOLE',
+        'note': "Criterion's default GameCube pipeline on the Flipper: "
+                "640x480 with the deflicker copy filter and the XFB's "
+                "4:2:2, trilinear CMPR textures, prelit vertex colours "
+                "added to the lights with no hardware light count "
+                "(RpWorld has none), RwCameraSetFogDistance's linear fog "
+                "(no height layer), no shadows, the RGBA6 EFB and the "
+                "16-bit compressed Z.",
+        'settings': {  # the GAMECUBE dict, then RenderWare's own choices
+            'resolution_x': 640, 'resolution_y': 480,
+            'aa_mode': 'NONE', 'copy_filter': 'DEFLICKER',
+            'chroma_format': 'XFB_422',
+            'default_model': 'RENDERWARE_GC', 'shading_rate': 'VERTEX',
+            'tex_filter': 'TRILINEAR', 'tex_mipmap': True, 'tex_aniso': 2,
+            'tex_max_size': 512, 'tex_perspective': True,
+            'tex_compress': 'CMPR_GC',
+            'color_depth': '24', 'dither': 'NONE',
+            'fog': True, 'fog_mode': 'LINEAR', 'fog_start': 12.0,
+            'fog_end': 80.0, 'fog_color': (0.5, 0.55, 0.62),
+            'fog_height': False,
+            'depth_encoding': 'GC_14E2',
+            'shadows': False, 'max_lights': 0,
+            'transparency': 'SORTED', 'gamma': 2.2,
+            'framebuffer': 'GC_RGBA6',
+        },
+        'console_node': {'console': 'RENDERWARE', 'rw_platform': 'GC',
+                         'rw_type': 'PRELIT'},
+    },
+    'RENDERWARE_XBOX': {
+        'label': "RenderWare on Xbox / Direct3D 8 (2002)",
+        'category': 'CONSOLE',
+        'note': "Criterion's Direct3D 8 pipeline on the NV2A: 640x480 "
+                "supersampled, trilinear plus anisotropy, DXT1 textures "
+                "decoded at 16 bits, prelit vertex colours added to the "
+                "lights per vertex with no hardware light count (RpWorld "
+                "has none), RwCameraSetFogDistance's linear fog, no "
+                "bloom, no shadows, integer pixel centres and the "
+                "fixed-point W-buffer.",
+        'settings': {  # the XBOX dict, then RenderWare's own choices
+            'resolution_x': 640, 'resolution_y': 480,
+            'aa_mode': 'SUPERSAMPLE', 'aa_samples': 4, 'aa_filter': 'BOX',
+            'default_model': 'RENDERWARE_PC', 'shading_rate': 'VERTEX',
+            'tex_filter': 'TRILINEAR', 'tex_mipmap': True, 'tex_aniso': 4,
+            'tex_max_size': 1024, 'tex_perspective': True,
+            'tex_compress': 'DXT1_NV2A',
+            'color_depth': '24', 'dither': 'NONE',
+            'glow': False,
+            'specular_in_gamma': True, 'clamp_specular': False,
+            'fog': True, 'fog_mode': 'LINEAR', 'fog_start': 20.0,
+            'fog_end': 120.0, 'fog_color': (0.5, 0.55, 0.62),
+            'shadows': False,
+            'pixel_center': 'INTEGER_D3D', 'depth_encoding': 'W_FIXED',
+            'max_lights': 0, 'transparency': 'SORTED', 'gamma': 2.2,
+        },
+        'console_node': {'console': 'RENDERWARE', 'rw_platform': 'PC',
+                         'rw_type': 'PRELIT'},
+    },
+    'GTA_PS2': {
+        'label': "GTA-era PS2, RenderWare + Trails (2001-04)",
+        'category': 'CONSOLE',
+        'note': "RenderWare on the PS2 as the GTA III / Vice City titles "
+                "ran it: 640x448 field-rendered into the 16-bit DTHE "
+                "buffer, the CRTC's second read circuit blending the "
+                "previous frame at ALP 128 (PMODE RC2 -- the games' "
+                "'Trails' option, visible over an animation), a warm "
+                "linear fog, 256 textures popping from Q, prelit vertex "
+                "colours, no shadows, no hardware light count. San "
+                "Andreas vehicles: set the node's Specular to Plugin.",
+        'settings': {
+            'resolution_x': 640, 'resolution_y': 448,
+            'aa_mode': 'EDGE', 'aa_edge_threshold': 0.08,
+            'default_model': 'RENDERWARE_PS2', 'shading_rate': 'VERTEX',
+            'tex_filter': 'BILINEAR', 'tex_mipmap': True,
+            'tex_max_size': 256, 'tex_perspective': True,
+            'tex_lod_source': 'GS_Q', 'tex_lod_k': -2.0, 'tex_lod_l': 0,
+            'tex_mip_select': 'NEAREST_LEVEL',
+            'color_depth': '24', 'dither': 'NONE',
+            'framebuffer': 'PS2_CT16', 'fb_dither': True,
+            'interlace': 'FIELDS',
+            'crtc_blend': 'PREVIOUS_FRAME', 'crtc_alpha': 128,
+            'glow': False,
+            'fog': True, 'fog_mode': 'LINEAR', 'fog_start': 20.0,
+            'fog_end': 120.0, 'fog_color': (0.62, 0.58, 0.50),
+            'near_clip_mode': 'REJECT',
+            'shadows': False, 'max_lights': 0,
+            'transparency': 'SORTED', 'gamma': 2.2,
+        },
+        'console_node': {'console': 'RENDERWARE', 'rw_platform': 'PS2',
+                         'rw_type': 'PRELIT'},
     },
 
     # ------------------------------------------------------------- broadcast
@@ -2437,6 +2786,31 @@ PRESETS = {
 PRESETS['VOODOO2']['settings'] = dict(
     PRESETS['VOODOO']['settings'], resolution_x=800, resolution_y=600,
     fog_dither=True, video_filter='VOODOO2', tex_frac_bits='BITS_8')
+
+
+# R253 (console presets): the Convert to Game hint. A console or arcade
+# preset may carry a fifth, optional top-level key, 'console_node': the
+# HALCYON_ConsoleShaderNode property values (core/console.ENUM_PROPS and
+# SCALAR_PROPS names only) that reproduce the preset's default_model on
+# the node -- the machine, its shader type, its light-limit toggle. It
+# is a hint for the Game conversion and the scene's Console menu, never
+# a render setting: apply_preset reads entry['settings'] alone, so a
+# preset with the key renders exactly as one without it. The presets
+# whose machine has no console model (System 21, Model 1, the SNES, the
+# handhelds) carry none.
+def console_hint(key):
+    """A COPY of the preset's console_node dict, or None when the preset
+    carries no hint (or does not exist)."""
+    entry = PRESETS.get(key)
+    if not entry:
+        return None
+    hint = entry.get('console_node')
+    return dict(hint) if hint else None
+
+
+#: the preset keys that carry a console_node hint (built AFTER the dict)
+CONSOLE_HINTED = frozenset(k for k, v in PRESETS.items()
+                           if v.get('console_node'))
 
 
 # The device family: where the frame computes is a property of the person's

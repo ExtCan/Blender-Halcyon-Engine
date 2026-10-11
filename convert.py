@@ -463,6 +463,14 @@ class HALCYON_OT_convert_to_node(Operator):
         name="Reconvert", default=False,
         description="Convert again even if the material already uses the "
                     "target node")
+    # R253 (console presets): the Game conversion from the active render
+    # preset's console_node hint (presets/library.console_hint)
+    from_preset: BoolProperty(
+        name="From Active Preset", default=False,
+        description="Start the Console Emulation Shader at the machine, "
+                    "shader type and options the scene's active render "
+                    "preset names (its console_node hint) instead of the "
+                    "Console menu alone")
 
     def execute(self, context):
         mats = _materials_for(context, self.scope)
@@ -471,6 +479,17 @@ class HALCYON_OT_convert_to_node(Operator):
             return {'CANCELLED'}
         choice = {'style': self.style, 'compat': self.compat,
                   'era': self.era, 'console': self.console}
+        # R253: the preset's hint names the machine and its type; a preset
+        # without one leaves the Console menu in charge (getattr: a
+        # headless operator built without the property reads False)
+        if getattr(self, 'from_preset', False) and self.target == 'CONSOLE':
+            from .presets import library as _library
+            hint = _library.console_hint(
+                getattr(getattr(context.scene, 'halcyon', None), 'preset', ''))
+            if hint:
+                self.console = str(hint['console'])
+                choice['console'] = self.console
+                choice['console_props'] = hint
         done, skipped, failed = 0, 0, 0
         for mat in mats:
             try:
