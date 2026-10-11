@@ -70,7 +70,7 @@ without Blender for its 9503-check test suite.
 **At a glance:** 59 shading models · 250 node types evaluated (every shader
 node Blender 5.x offers, plus Halcyon's own 143) · 112 render presets in
 eight categories · 143 resolution presets · 114 Pre-Made material templates
-in fourteen families · eleven sky modes, 303 skies, 48 waters, ten infinite
+in fourteen families · twelve sky modes, 303 skies, 48 waters, ten infinite
 grounds · real volumes (eight scattering models, mesh containers, voxels) ·
 396 render settings, every one proven to change what it claims · a
 9503-check suite that runs without Blender · about 128,000 lines
@@ -1181,6 +1181,32 @@ becomes Blinn, Toon becomes Toon), **Set Shader** forces one chosen
 model — any of the master's 22 classics — onto everything it
 converts.
 
+**Convert to Anime, Cartoon or Game (1.92).** The Material panel's
+converter has three more one-click targets beside the Halcyon Shader
+and Blender Internal ones: **To Anime Shader**, **To Cartoon Shader**
+and **To Game (Console)**, each for this material, the selected objects
+or the whole scene. The same promise holds -- textures are relinked, not
+discarded: whatever fed Base Color arrives in Diffuse Color or Paint
+Color, the normal chain in Normal, the alpha in Opacity, the emission in
+Self-Illumination (with its strength on the cel nodes' own Emission
+Strength socket, so a Blender 4 material's white-at-zero emission stays
+dark). Above each block the scene chooses what the new node starts as: an
+anime **Style** (the decades) and **Compatibility** (Generic Cel or a game
+pipeline's texture decode), a cartoon **Era**, or the **Console** the
+Game conversion builds -- the machine's shader type and options stay
+editable on the node. A chosen style or era writes its sockets and wins
+over the constants a conversion would have put there; a linked chain
+always carries. The source may be any Blender shader or one of Halcyon's
+own nodes -- a Halcyon Shader material converts to Anime by socket name,
+an Anime material to Cartoon, a Blender Internal one to a console (its
+Hardness becoming the Glossiness). On the Game side a Vertex Color node
+feeding Base Color becomes the machine's own vertex-colour material
+source (GX_SRC_VTX, D3DRS_COLORVERTEX, the N64's lighting-off shade)
+rather than a texture chain, and glossiness is clamped to the period
+light units' 128. The slot list now labels converted Anime / Cartoon
+materials by their style / era, and a cel or console material with
+Opacity below 1 takes the see-through pass like a Halcyon Shader one.
+
 **143 resolution presets in nine categories (1.62, 1.84, 1.90)** — the
 Super FX's three heights (256×192 for Star Fox, 256×160, 256×128, at the
 SNES's 8:7) joined in 1.90; the shelf grew from 75: the handhelds and arcade boards (NES at its true 8:7 PPU
@@ -1346,6 +1372,17 @@ tenth and eleventh (1.90) are Doom's **Cylinder Sky** and LightWave's
 **Gradient Backdrop** with its Sky and Ground Squeeze, described with the
 period features.
 
+**Twelve sky modes** -- the eleven of 1.90 and now (1.92) the **Cube Map**,
+the 1990s skybox: six square faces around the camera from one packed image
+(a horizontal or vertical cross, a 6:1 or 1:6 strip, read by aspect) or
+from six files named the OpenGL way (+X -X +Y -Y +Z -Z) or the Quake /
+Half-Life way (rt lf up dn bk ft -- pick one file and the other five load
+by suffix), point-sampled for the hard seam of the era or bilinear inside
+each face and never across one, with a quarter-turn and a mirror per face
+for a set that loads sideways, the world's Rotation, Tint and Strength.
+It is an environment like the HDRI: reflections see it, and it draws in
+the GPU sky pass bitwise the CPU's.
+
 **303 sky presets, every one with a rendered thumbnail.** The original 43 plus
 **260 new skies in 26 authored families** — Golden Hour, Blue Hour, High Noon,
 Storm Front, Ember, Midnight Clear, Vapor Dream, Winter Overcast, Desert Dusk,
@@ -1406,6 +1443,28 @@ rays, star spikes, lightning bolts, shockwave rings, halos along curve
 objects, and lens flares that sample their lamp's visibility off the
 z-buffer. A sky-only scene can flare; a halo behind a wall cannot.
 
+**Halo materials are a node now.** Add *Halcyon > Shading > Halo* to a
+material and its vertices glow as Blender Internal halos -- faces do not
+draw -- with the whole kit on one node: the colour, size, alpha and Add
+slider as sockets (an RGB or Value node can drive them), the rings,
+lines, star, the twelve silhouettes and the image, noise, bolts and
+rays, the gradient and a Color Ramp linked straight into the Ramp
+socket, random HSV scatter, the HSV shift, pulse, flicker, spin and the
+per-effect clocks, and the four 2.79 mode bits. New with the node:
+*Falloff* (the 2.79 hardness ladder, or Gaussian, linear, quadratic, a
+hard disc, or a hollow ring), *Blend* (the Add slider, alpha over,
+additive, screen), *Depth* (z-buffered, or over everything for the
+point-sprite overlay), *Animate Seed*, a camera-distance *Fade
+Near/Far*, an anamorphic *Stretch* along any screen angle, an outer
+*Glow* layer, and a per-halo *Size*: link an Attribute node naming a
+float point attribute, a Color Attribute (its red channel) or Particle
+Info > Size and every vertex, point or particle carries its own radius.
+A file saved before 1.92 grows the node at load with every value
+carried over and the old Material-tab toggle cleared; a material that
+still shows the legacy block has a *Convert to Halo Node* button. Halos
+splat on the CPU over the finished frame on both devices, as they
+always did.
+
 **Animation, told honestly** — sequence renders print per-frame time and
 a completion estimate that knows the first frame pays for the caches the
 rest reuse (shadow maps, BVHs, compiled shaders), so the ETA converges
@@ -1432,9 +1491,67 @@ silent nitrate to the modern digital master, Tron's backlit mattes among
 them. Applying one resets everything first, so presets
 never accumulate.
 
-**Render passes** — Depth, Normal, Position, UV, Object Index and Material
-Index, written under Blender's own names and channel layouts so a Halcyon Z
-pass drops into a comp built for Cycles without rewiring.
+**Render passes.** Beside Combined the engine writes, on request,
+Blender Internal's own pass set for the compositor's Render Layers node:
+the data passes Depth, Normal, Position, UV, IndexOB, IndexMA and Mist
+(the scene Fog curve on the camera distance, 1 at the sky, whether or not
+Fog is drawn), the frame passes Env (the world where the camera saw it)
+and Beauty (the linear frame before the palette, dither, CRT and signal
+stages), and the light split Diffuse, Spec, Ambient, Emit, Shadow, AO and
+Color -- named exactly as BI 2.79 named them, so a comp built for Blender
+Internal drops in. Diffuse + Spec + Ambient + Emit (+ Env at the sky) is
+the linear beauty for the classic models, through the supersample filter
+and the adaptive AA refine; Shadow is 1 lit / 0 dark averaged over the
+lamps that cast; AO is the occlusion factor itself; Per-Lamp Passes adds
+Light00..Light07, one per selected lamp in lamp order. The data and frame
+passes come off the same G-buffer and frame on both devices, bit for bit;
+any light pass shades the frame on the CPU by name (the GLSL loop keeps
+no per-lobe sums -- the console says so, the device panel reads "Light
+Passes -- CPU for now"). Every pass defaults off: an old scene renders
+the same bytes. Vector, Cryptomatte, Ink and Halo passes are not
+produced; the compositor's ID Mask node on IndexOB / IndexMA covers
+masks.
+
+**Render Region (Ctrl+B).** Blender's own render border works in Halcyon
+now, for F12 and for the rendered viewport. Press Ctrl+B in camera view to
+set the scene's Render Region (Output > Format shows it, with Crop to
+Render Region beside it), Ctrl+B in a free view for the viewport's own box,
+Ctrl+Alt+B to clear either. The engine rasterises the whole frame on
+either device, shades only the box and a thin context ring, and runs the
+post chain over the full-frame canvas with zeros outside the box -- so a
+dither tile, a CRT mask, an interlace field or a codec block inside the
+box is exactly the pixel the full render would have put there, and the
+crop happens last. The box is cropped or placed in the full frame as
+Blender's checkbox says. The Output tab names the rect in pixels. Pooled
+bands, stereo pairs, accumulate AA and Pixel Scale all compose with it.
+
+**Camera Frame Only** (Performance panel, off by default). In camera view
+the rendered viewport shades only the pixels inside the camera frame; the
+rest of the region keeps the viewport background (Blender's passepartout
+darkens it as usual). Fewer pixels per draft and refine, and the picture
+you see is the picture F12 frames -- the frame's own corner is the pattern
+origin, as it is for an F12. A Ctrl+B box in camera view is honoured on
+top of it.
+
+**Generated coordinates are measured in the object's own box.** Every
+pattern node with an unlinked Vector, and Texture Coordinate ▸ Generated,
+reads the mesh's *texture space* as Blender defines it: the object-space
+bounding box, or the mesh's manual Texture Space (Object Data ▸ Texture
+Space, with Auto Texture Space off) as `location ± size`. The box is
+measured on the untransformed mesh at export and the shading point is
+taken back into the object's frame on both devices, so a marble ball keeps
+its veins when you move, turn or scale it and an animated object no longer
+scrolls through its procedural textures — on the GPU the same three dot
+products the Object output uses, bit for bit in the simulator. The
+Cartoon Shader's shape smoothing and the Anime Shader's hair-shine
+azimuth still measure from the object's world-space centre, as they should;
+only the shine's height band rides the object's own Z. Two things stay
+Halcyon's: a flat object keeps a thin box on its flat axis (Blender gives
+it a size of 1), so a ground plane with a 3-D Noise renders exactly as it
+did, and a mesh deformed by an armature or shape keys measures its
+evaluated box. A file that relied on the old world-space box can set
+**Generated Space** (Render ▸ Textures) to *World box (legacy, pre-1.92)*;
+untransformed objects render identically either way.
 
 **396 settings, all exposed, all proven, all explained.** Two tests stand
 behind that sentence: one holds every setting to a proof that it changes what
@@ -2255,6 +2372,21 @@ than quietly left out. An object that will not convert is skipped with its name
 reported — one bad object costs you that object, not the frame.
 
 ---
+
+**Under a render border (1.92).** Under a render border the non-local post
+stages -- glow, star, lens / lamp flares, depth of field, light shafts,
+the NTSC / tape filters, the codec blocks -- see nothing outside the box,
+so within their own kernel radius of the box edge they differ from the
+full render (as Cycles' compositor does with a blur over a border);
+deeper inside they agree to within the running-sum blur's float rounding,
+at most one 8-bit step. A PANO camera or Pano Parts renders whole and is
+cropped after the stitch (printed once). The Fuzz / Thin Wall blends
+render whole and are cropped (printed once): they read the finished
+frame's neighbouring rows layer upon layer. The GPU reflection sweeps
+still trace every reflective pixel of the frame under a border (the box is
+cut afterwards): a tiny box on a mirror-heavy frame saves the material
+passes, not the rays. Post over the full-frame canvas costs the full
+frame's post time for any box size.
 
 ## Performance
 

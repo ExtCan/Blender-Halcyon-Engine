@@ -36,6 +36,9 @@ def run_tests():
     from . import test_r253_halo_node
     # R253 (1.92.0): the compositing passes
     from . import test_r253_compositing
+    # R253 (1.92.0): more mapping types (Tri-Planar, cube atlas, object
+    # projection, hex grid, the Projector's appended modes)
+    from . import test_r253_mapping
     # R253 (1.92.0): the eight period lamp options
     from . import test_r253_light_options
     utf8_console()
@@ -164,6 +167,11 @@ def run_tests():
     print('R253 COMPOSITING PASSES')
     print('=' * 66)
     rc |= test_r253_compositing.main()
+    print()
+    print('=' * 66)
+    print('R253 MORE MAPPING TYPES')
+    print('=' * 66)
+    rc |= test_r253_mapping.main()
     print()
     print('=' * 66)
     print('R253 LIGHT OPTIONS (SQUARE SPOT, SPECULAR COLOUR, HEMI GROUND, '

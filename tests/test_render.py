@@ -23633,8 +23633,11 @@ def test_period_lens_flares():
           "lens flares sample" in esrc)
     # R195: the rendered viewport's post call hands the sources over
     psrc = open(os.path.join(root, 'preview.py'), encoding='utf-8').read()
+    # R253: the two post calls (the frame and the retry) became ONE
+    # closure, `_post`, that hands the sources over -- so the pin is the
+    # hand-over itself plus both roads calling the closure
     check('the rendered viewport draws the lamp flares',
-          psrc.count('flare_sources=') >= 2)
+          psrc.count('flare_sources=') >= 1 and psrc.count('_post(') >= 3)
     usrc2 = open(os.path.join(root, 'ui.py'), encoding='utf-8').read()
     check('the lamp panel answers whether the anchor is in frame',
           'world_to_camera_view' in usrc2)
