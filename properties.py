@@ -511,6 +511,10 @@ PALETTE_MODE = _items(
     ('EHB', "Extra Half-Brite (Amiga OCS/ECS)",
      "32 adaptive 12-bit registers plus their exact halves: 64 colours; Lock "
      "Palette shares its cache with a 32-colour adaptive palette"),
+    # R253 (console presets): appended AFTER EHB -- positional numbering
+    ('SUPERFX16', "Star Fox 16 (Super FX)",
+     "Sixteen fixed polygon colours for the Super FX plot, 4 bits per pixel; "
+     "a stand-in for the cartridge's own CGRAM"),
 )
 PALETTE_METHOD = _items(
     ('MEDIAN_CUT', "Median Cut", "Heckbert's algorithm, the period standard"),

@@ -111,6 +111,16 @@ class HALCYON_OT_apply_preset(Operator):
             r.pixel_aspect_y = entry['settings']['pixel_aspect_y']
         if entry['settings'].get('film_transparent') is not None:
             r.film_transparent = bool(entry['settings']['film_transparent'])
+        # R253 (console presets): a preset's console_node hint points the
+        # Game conversion's Console menu at the machine -- UI state only
+        # (convert_console is not a RenderSettings field, so to_settings
+        # and the frame are untouched)
+        hint = entry.get('console_node')
+        if hint:
+            try:
+                hs.convert_console = str(hint['console'])
+            except (TypeError, ValueError, KeyError):
+                pass
         _poke_updated(context, context.scene)
         self.report({'INFO'}, f"Applied {entry['label']}"
                               + (" (settings reset first)" if self.reset else ""))
@@ -270,6 +280,13 @@ class HALCYON_PT_presets(HalcyonPanel, Panel):
             box.scale_y = 0.8
             for line in _wrap(entry['note'], 46):
                 box.label(text=line)
+            # R253 (console presets): the machine / type Convert to Game
+            # builds from this preset's hint
+            if entry.get('console_node'):
+                from .core.console import label_of
+                box.label(text="Game conversion: "
+                          + label_of(entry['console_node']),
+                          icon='NODE_MATERIAL')
         layout.separator()
         draw_disclaimer(layout)
 
@@ -2055,6 +2072,26 @@ def _draw_convert_target(box, hal, target, label, icon, kinds):
         op.era = hal.convert_cartoon_era
         op.console = hal.convert_console
         op.force = bool(scope == 'ACTIVE' and TARGET_NODES[target] in kinds)
+    if target == 'CONSOLE':
+        # R253 (console presets): the active render preset's console_node
+        # hint -- a fourth button converts this material to the machine,
+        # type and options the preset names (the Console menu untouched)
+        from .core.console import label_of
+        from .presets.library import console_hint
+        hint = console_hint(getattr(hal, 'preset', None))
+        if hint:
+            row = col.row(align=True)
+            op = row.operator('halcyon.convert_to_node', text="From Preset",
+                              icon='IMPORT')
+            op.target = target
+            op.scope = 'ACTIVE'
+            op.style = hal.convert_anime_style
+            op.compat = hal.convert_anime_compat
+            op.era = hal.convert_cartoon_era
+            op.console = str(hint['console'])
+            op.from_preset = True
+            op.force = bool(TARGET_NODES[target] in kinds)
+            col.label(text=f"Preset: {label_of(hint)}")
 
 
 class HALCYON_PT_material(HalcyonPanel, Panel):

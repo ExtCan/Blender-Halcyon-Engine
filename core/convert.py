@@ -816,6 +816,20 @@ def plan_for(target, idname, values=None, links=None, choice=None,
         owned = set()
         con = str(choice.get('console') or 'PS1')
         props['console'] = con
+        # R253 (console presets): a render preset's console_node hint --
+        # the machine's shader type and options -- merges after the
+        # machine (which stays the first key, set first on the node) and
+        # before the conversion's own decisions below, so the vertex-
+        # colour switch wins over a hinted type. Only the node's declared
+        # properties pass; 'console' itself is the menu's
+        extra = dict(choice.get('console_props') or {})
+        if extra:
+            from . import console as _console
+            declared = ({n for n, _i, _d in _console.ENUM_PROPS}
+                        | {n for n, _k, _d in _console.SCALAR_PROPS})
+            for k, v in extra.items():
+                if k != 'console' and k in declared:
+                    props[k] = v
         # the exponent ceiling of the period light units
         if gloss is not None and gloss > CONSOLE_GLOSS_MAX:
             extras['Glossiness'] = CONSOLE_GLOSS_MAX

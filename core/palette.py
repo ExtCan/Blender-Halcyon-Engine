@@ -137,6 +137,34 @@ def mac256():
     return pal
 
 
+# R253 (console presets): the Super FX plot's 16 polygon colours. Star
+# Fox plotted into a 4 bpp bitmap whose 16 CGRAM entries the cartridge
+# set per scene; no published dump is cited, so this table is a STAND-IN
+# -- black, two greys, white, two blues, two reds, orange, yellow, two
+# greens, brown, cyan, magenta and navy, each on the SNES's 5-bit-per-
+# channel CGRAM lattice (k / 31, so palette_bits BITS_5 snaps it to
+# itself and the plot's pairs land on the post stage's own entries),
+# ordered by luma (0.299 R + 0.587 G + 0.114 B).
+SUPERFX16 = np.array([
+    ( 0,  0,  0),   # black
+    ( 0,  0, 12),   # navy
+    ( 0,  4, 20),   # dark blue
+    (16,  0,  0),   # dark red
+    ( 0, 12,  4),   # dark green
+    (10, 10, 10),   # dark grey
+    (16, 10,  4),   # brown
+    (28,  4,  4),   # red
+    ( 8, 12, 31),   # blue
+    (24,  6, 24),   # magenta
+    ( 8, 24,  8),   # green
+    (31, 16,  0),   # orange
+    (20, 20, 20),   # light grey
+    ( 8, 26, 28),   # cyan
+    (31, 28,  4),   # yellow
+    (31, 31, 31),   # white
+], np.float32) / np.float32(31.0)
+
+
 FIXED_PALETTES = {
     'EGA16': lambda size: EGA16,
     'CGA4': lambda size: CGA4,
@@ -147,6 +175,8 @@ FIXED_PALETTES = {
     'VGA256': lambda size: vga256(),
     'MAC256': lambda size: mac256(),
     'GRAY': lambda size: grayscale(max(2, int(size))),
+    # R253: the Super FX plot's stand-in CGRAM (16 entries whatever the size)
+    'SUPERFX16': lambda size: SUPERFX16,
 }
 
 
