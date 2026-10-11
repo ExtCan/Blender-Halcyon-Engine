@@ -2350,6 +2350,26 @@ devices read identical texels); extension (Era Default / Repeat / Extend
 / Clip — Clip is the projector's gate) and interpolation (Bilinear /
 Closest / Cubic) are per-lamp choices, mirrored texel-for-texel in GLSL.
 
+**Eight more lamp dials (1.92)**, each from a named period source and each
+silent until you touch it: Blender Internal's **Square** spot (the cone
+becomes a pyramid, every cone law included, the shadow buffer widened to
+the corners; a 2.79 file's square spots now import square); a per-lamp
+**Specular Color** (OpenGL's `GL_SPECULAR`, Direct3D 7's `dcvSpecular`)
+that tints the highlight and nothing else; the hemi's **Ground Color** (the
+two-tone hemisphere of Rost's *OpenGL Shading Language*, 9.1); two more
+falloffs, **Inverse** and **Inverse Square from Nominal Distance** (3ds
+Max's Decay with Start R0, LightWave's Inverse Distance with Range: exactly
+full strength at the Falloff End, brighter inside); 3ds Max's **Near
+Attenuation** Start / End fade-in; Blender Internal's **ClipSta / ClipEnd**
+on the shadow buffer; the projected slide's **Offset / Tiling / Angle**
+(3ds Max's projector-map Coordinates, the 2.4x lamp texture's ofs / size);
+and Quake's twelve **Light Styles** -- the torch flicker, the candles, the
+strobes, the fluorescent tube -- stepped ten characters per second of scene
+time, on the surfaces, the beam, the flare and the fog lobe alike. Every
+dial has a GPU twin (the laws bitwise in the simulator, the frames at the
+deferred bar) and rides the lamp-edit fast path: a value drag re-uploads a
+texel, only a flag re-plans.
+
 **Depth of field is layered, not sampled.** Depth slabs, each blurred by its
 circle of confusion — a handful of blurs instead of hundreds of rays, as
 compositors of the era did.
