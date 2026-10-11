@@ -1309,13 +1309,40 @@ trick behind glow-in-the-dark and light-reactive materials; a Timer,
 Oscillator, Counter, Pulse, Gate, Selector, Color Key, Measure, Step Ramp,
 Wobble, Frame Blend, Blackbody, Compare and On Frame. Light Meter reads the
 lamp list at shading time, so the GPU plan refuses it by name and that
-material shades on the CPU. And fifteen **Vector** nodes — among them
+material shades on the CPU. And nineteen **Vector** nodes — among them
 **Array**, which lays a decal's UVs out along a line, grid, circle, square,
 polygon or star with per-copy jitter and rotation (made for stamping image
 decals; following seams, creases or sharp edges needs mesh edge flags the
 exporter does not carry yet, and is stated on the node rather than faked);
 plus Mirror Tile, Kaleidoscope, Polar, Twirl, Lens, Ripple Warp, Wave Warp,
-Tile Random, Snap, Shear, Orbit, Region, Projector and Spin.
+Tile Random, Snap, Shear, Orbit, Region, Projector and Spin, and (1.92)
+Tri-Planar Coordinates, Tri-Planar Texture, Object Projection and Hex Grid.
+
+**More mapping types.** The Projector node now carries the whole period
+menu: besides Planar, Cylindrical, Spherical and Box it offers a six-face
+**Cube Atlas**, the three sphere conventions (**Equirectangular**, the
+World's HDRI layout; **Mirror Ball**, the photographed chrome sphere;
+**Angular Map**, Debevec's light probe), a **Capped Cylinder**, **Screen**
+mapping locked to the view (Imagine's and 3D Studio's, with *Keep Aspect*
+for a square image on a wide frame), Blender Internal's **Reflection** and
+**World Normal** texco and **Tangent Space**. Box keeps its shipped
+behaviour — it picks the face by the coordinate; Cube Atlas and the
+tri-planar nodes pick by the normal. **Tri-planar texturing** comes two
+ways: *Tri-Planar Texture* owns an image and projects it from X, Y and Z,
+cross-faded by the surface normal (rock, bark, terrain — anything without
+a UV map), while *Tri-Planar Coordinates* + *Tri-Planar Mix* are the
+same thing as a node graph, for three different images or any three
+textures. **Object Projection** measures coordinates in another object's
+frame: an empty for Blender Internal's Object coordinates with an object
+picked, a spot lamp for the slide-projector decal (its cone becomes the
+0..1 window, *Inside* the mask, *Depth* the throw), a camera for 3D
+Studio's Camera Map, or any object flat along its −Z with *Parallel*.
+**Hex Grid** tiles hexagonal cells with a per-cell random, an edge
+falloff and a local frame, pointy- or flat-topped. Every mode and node
+shades on both devices — bitwise in the simulator where the arithmetic
+is plain, within 2e-6 for the trigonometric ones — and the Image
+Texture's own Sphere / Tube / Box projections now reach the GPU too. A
+spiral mapping is Polar plus one Math node (angle + k × radius).
 
 **The Add menu is families now.** Add ▸ Halcyon opens Pre-Made, then
 Shading, Blender Internal, Utilities, Vector, Retro Screen and Textures as
