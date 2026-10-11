@@ -13,6 +13,29 @@ pinned where it bit.
     no punch-through clip, no Screen Door compare, no Transparency None.
     `ShadeJob._alpha_law` is the one law the pixel road already applied,
     now applied there too.
+(4) The PC fixed-function Texture Op was drawn for every shading type
+    and honoured by the separate-specular combine alone; D3DTSS_COLOROP
+    is texture-stage state, so `core/combine.cb_pc_texop` and its GLSL
+    twin run the other three types' product through the same 8-bit ops.
+(5) The vertex-colour material sources (GX_SRC_VTX, the N64's unlit
+    shade, Model 3's fixed shading, D3D's COLORVERTEX) replaced the
+    TEXTURED albedo with the vertex colour; the hardware replaces the
+    material colour and the texture still modulates -- a linked Diffuse
+    Color is now multiplied, an unlinked one replaced, on both roads.
+(6) Super FX and 3DO hide their specular sockets but left the hidden
+    socket's 0.5 in the light loop; resolve() pins the level at 0.
+(7) A 1.90 Model 2 / Model 3 master picked its specular setting by
+    snapping Glossiness; the migrated node took the menu default (P4 /
+    P16) and the highlight changed at file load. The migration snaps
+    the old sockets the same way.
+(8) The Model 2 / Model 3 specular menus had labels under 12 characters.
+(9) The GPU plan signature omitted the baked per-object frame (the
+    inverse rows, the Generated box): a translation keeps the mesh key,
+    so the cache served stale literals. Fingerprinted now.
+(10) A TRANSFORMED flat object divided the inverse chain's float32
+    residual by the 1e-6 span clamp and read +/-0.5 of noise on its flat
+    axis; `_gen_span` gives a flat axis of a transformed object the span
+    1.0 (an identity object keeps the 1.91 bits).
 """
 import io
 import sys
@@ -28,7 +51,9 @@ from .scenebuild import demo_scene
 from ..core import console as CON
 from ..core import render as R
 from ..core.scene import material_see_through
-from .test_r252_console import _scene as console_scene, console_graph
+from .test_r252_console import _scene as console_scene, console_graph, _render as console_render
+from .test_render import _sk
+from .test_r251_material import _sim_vs_cpu
 
 FAILS = []
 f32 = np.float32
@@ -134,6 +159,192 @@ def test_corner_road_alpha_law():
     src = inspect.getsource(R.ShadeJob)
     check('the pixel road and the ALBEDO pass call the same _alpha_law',
           src.count('self._alpha_law(') >= 2 and 'def _alpha_law' in src)
+
+
+def _textured(props, **kw):
+    """A console scene whose Ball and Box carry the checker texture in
+    Diffuse Color (the linked-texture road)."""
+    sc, st = console_scene(props, inputs=[_sk('Diffuse Color', 'RGBA', [0.85, 0.2, 0.15, 1.0], ['tex', 0])], **kw)
+    for m in (sc.materials[1], sc.materials[2]):
+        m.graph['nodes']['tex'] = {'id': 'tex', 'bl_idname': 'ShaderNodeTexImage',
+                                   'props': {'image': 'checker', 'interpolation': 'Closest', 'extension': 'REPEAT'},
+                                   'inputs': [_sk('Vector', 'VECTOR', [0, 0, 0])],
+                                   'outputs': [{'name': 'Color', 'type': 'RGBA'}, {'name': 'Alpha', 'type': 'VALUE'}]}
+    return sc, st
+
+
+def _dmax(a, b):
+    return float(np.abs(np.asarray(a)[:, :, :3] - np.asarray(b)[:, :, :3]).max())
+
+
+def _twin(sc, st):
+    st.render_device = 'GPU'
+    d, nbad, _img, _cpu, _passes, why = _sim_vs_cpu(sc, st)
+    return d, nbad, why
+
+
+def test_pc_texture_op_on_every_type():
+    for t in ('GOURAUD', 'FLAT_GL', 'FLAT_D3D', 'GOURAUD_SEP'):
+        a = console_render({'console': 'PC_FIXED', 'pc_type': t, 'pc_texture_op': 'MODULATE'})
+        for op in ('MODULATE2X', 'MODULATE4X', 'ADD', 'ADDSIGNED'):
+            b = console_render({'console': 'PC_FIXED', 'pc_type': t, 'pc_texture_op': op})
+            check(f'PC {t}: Texture Op {op} changes the picture', _dmax(a, b) > 1e-2)
+        for op in ('MODULATE4X', 'ADDSIGNED'):
+            sc, st = console_scene({'console': 'PC_FIXED', 'pc_type': t, 'pc_texture_op': op}, w=48, h=36, shading_rate='PIXEL')
+            d, nbad, why = _twin(sc, st)
+            check(f'PC {t} {op}: the simulator frame is the CPU frame', d is not None and d < 6e-3 and nbad == 0, str(why if d is None else d))
+    # MODULATE on the three plain types is the plain product (1.90 bits): the recombine hook declines
+    from ..core import combine as CB
+    sc, st = console_scene({'console': 'PC_FIXED', 'pc_type': 'GOURAUD', 'pc_texture_op': 'MODULATE'})
+    check('cb_pc_texop(MOD) is None (the plain product stays)', CB.cb_pc_texop(np.ones((2, 3), f32), np.ones((2, 3), f32), 'MOD') is None)
+    check('PC_TEXOP_MODELS names the three non-combine PC models',
+          CB.PC_TEXOP_MODELS == frozenset({'GOURAUD', 'FLAT_GL_LAST', 'FLAT_D3D_FIRST'}))
+
+
+def test_vertex_colour_keeps_a_linked_texture():
+    cases = (('GX lit, material source VTX', {'console': 'GAMECUBE', 'gc_material_src': 'VTX'}),
+             ('GX vertex', {'console': 'GAMECUBE', 'gc_type': 'VERTEX'}),
+             ('N64 vertex (G_LIGHTING off)', {'console': 'N64', 'n64_type': 'VERTEX'}),
+             ('Model 3 fixed shading', {'console': 'MODEL3', 'm3_type': 'FIXED'}),
+             ('PC colour vertex', {'console': 'PC_FIXED', 'pc_color_vertex': True}))
+    for name, props in cases:
+        sc_t, st_t = _textured(props)
+        sc_u, st_u = console_scene(props)
+        check(f'{name}: the linked texture is visible (modulated by the vertex colour, not replaced)',
+              _dmax(R.render(sc_t, st_t), R.render(sc_u, st_u)) > 0.1)
+        sc_g, st_g = _textured(props, w=48, h=36, shading_rate='PIXEL')
+        d, nbad, why = _twin(sc_g, st_g)
+        check(f'{name}: the simulator frame is the CPU frame with the texture', d is not None and d < 6e-3 and nbad == 0, str(why if d is None else d))
+    # an unlinked Diffuse Color is still REPLACED by the vertex colour (the 1.91 picture)
+    a = console_render({'console': 'GAMECUBE', 'gc_type': 'VERTEX'})
+    b = console_render({'console': 'GAMECUBE', 'gc_type': 'VERTEX'}, inputs=[_sk('Diffuse Color', 'RGBA', [0.1, 0.1, 0.9, 1.0])])
+    check('an unlinked Diffuse Color under a vertex-colour type is replaced (the socket colour does not show)', _dmax(a, b) < 1e-6)
+
+
+def test_hidden_specular_pins():
+    for con in ('SUPERFX', 'THREEDO'):
+        kw = dict(palette_mode='EGA16', gamma=1.0, color_management='NONE')
+        a = console_render({'console': con}, inputs=[_sk('Specular Level', 'VALUE', 0.0)], **kw)
+        b = console_render({'console': con}, inputs=[_sk('Specular Level', 'VALUE', 0.9)], **kw)
+        check(f'{con}: the hidden Specular Level socket cannot add a highlight', _dmax(a, b) < 1e-6)
+        check(f'{con}: resolve pins spec_level 0', CON.resolve({'console': con}).get('spec_level') == 0.0)
+
+
+def test_model23_migration_keeps_the_exponent():
+    from . import fakebpy
+    fakebpy.install()
+    from ..nodes import shader_nodes as SN
+    from ..core import shading as SH
+    N = SN.HALCYON_ConsoleShaderNode
+
+    class _Sock:
+        def __init__(self, name, value=None):
+            self.name, self.default_value, self.is_linked, self.links, self.hide = name, value, False, [], False
+
+    class _Inputs(list):
+        def get(self, name):
+            return next((s for s in self if s.name == name), None)
+
+        def new(self, kind, name):
+            s = _Sock(name); self.append(s); return s
+
+    class _Node:
+        def __init__(self, idn):
+            self.bl_idname, self.inputs, self.outputs, self.location, self.label, self.hide, self._raw = idn, _Inputs(), _Inputs(), (0, 0), '', False, {}
+
+        def get(self, k):
+            return self._raw.get(k)
+
+    class _Links(list):
+        def new(self, a, b):
+            self.append((a, b)); b.is_linked = True; return (a, b)
+
+    class _Nodes(list):
+        def new(self, idn):
+            n = _Node(idn)
+            if idn == 'HALCYON_ConsoleShaderNode':
+                for kind, name, d in N.SOCKETS:
+                    n.inputs.new(kind, name).default_value = d
+                n.outputs.new('NodeSocketShader', 'Surface')
+                for name, _i, d in CON.ENUM_PROPS:
+                    setattr(n, name, d)
+                for name, _k, d in CON.SCALAR_PROPS:
+                    setattr(n, name, d)
+                n.refresh_sockets = lambda: None
+            self.append(n); return n
+
+        def remove(self, n):
+            if n in self:
+                super().remove(n)
+
+    class _Tree:
+        def __init__(self):
+            self.nodes, self.links = _Nodes(), _Links()
+
+    def migrated(model, gloss, level=0.5):
+        tree = _Tree()
+        old = _Node('HALCYON_ShaderNode')
+        for kind, name, d in SN.HALCYON_ShaderNode.SOCKETS:
+            old.inputs.new(kind, name).default_value = d
+        old.inputs.get('Glossiness').default_value = gloss
+        old.inputs.get('Specular Level').default_value = level
+        old.outputs.new('NodeSocketShader', 'Surface')
+        old.model = ''
+        old._raw['model'] = [m[0] for m in SH.MODEL_ITEMS].index(model)
+        tree.nodes.append(old)
+        new = SN.migrate_master_node(tree, old)
+        return new
+
+    for gloss, want in ((1.0, 'P1'), (2.0, 'P2'), (4.0, 'P4'), (25.0, 'P8')):
+        n = migrated('SEGA_MODEL2', gloss)
+        check(f'a 1.90 Model 2 master at Glossiness {gloss} migrates to {want}', getattr(n, 'm2_specular', None) == want, str(getattr(n, 'm2_specular', None)))
+    for gloss, want in ((8.0, 'P8'), (16.0, 'P16'), (25.0, 'P32'), (64.0, 'P64')):
+        n = migrated('SEGA_MODEL3', gloss)
+        check(f'a 1.90 Model 3 master at Glossiness {gloss} migrates to {want}', getattr(n, 'm3_specular', None) == want, str(getattr(n, 'm3_specular', None)))
+    n = migrated('SEGA_MODEL3', 25.0, level=0.0)
+    check('a Specular Level of 0 migrates to OFF', getattr(n, 'm3_specular', None) == 'OFF')
+    check('the Model 2 / Model 3 specular labels are 12 characters or more',
+          all(len(b) >= 12 for _a, b, _c in CON.M2_SPECULAR_ITEMS + CON.M3_SPECULAR_ITEMS))
+    ann = N.__annotations__['pc_color_vertex']
+    check('pc_color_vertex refreshes the sockets (an update callback)', ann.kw.get('update') is not None)
+
+
+def test_generated_frame_signature_and_flat_axis():
+    from .test_r253_generated_coords import move_ball, _job
+    from ..core import mathx as M
+    from ..gpu import shade as GSH
+    st = base_settings(64, 48)
+    sc0 = demo_scene(st, with_texture=False); j0, _ = _job(sc0, st)
+    mw = np.eye(4, dtype=f32); mw[:3, 3] = (0.3, -0.3, 0.0)
+    sc1 = demo_scene(st, with_texture=False); move_ball(sc1, mw); j1, _ = _job(sc1, st)
+    k0, k1 = GSH._mesh_key(sc0.mesh), GSH._mesh_key(sc1.mesh)
+    check('a translation keeps the mesh key (the stale-cache case)', k0 == k1)
+    check('...and changes the plan signature (the baked frame is fingerprinted)', GSH._plan_sig(j0, k0) != GSH._plan_sig(j1, k1))
+    sc2 = demo_scene(st, with_texture=False); move_ball(sc2, mw)
+    sc2.objects[1].gen_bounds = (np.array([-3.3, -3.3, -3.3], f32), np.array([3.3, 3.3, 3.3], f32))
+    j2, _ = _job(sc2, st)
+    check('a Texture Space edit alone changes the plan signature', GSH._plan_sig(j1, k1) != GSH._plan_sig(j2, GSH._mesh_key(sc2.mesh)))
+    # the flat floor, rotated and moved: its flat axis spans 1.0 and reads ~0
+    sc3 = demo_scene(st, with_texture=False)
+    a = 0.5; c, s_ = np.cos(a), np.sin(a)
+    rot = np.eye(4, dtype=f32); rot[1, 1], rot[1, 2], rot[2, 1], rot[2, 2] = c, -s_, s_, c; rot[:3, 3] = (5.0, 5.0, 5.0)
+    mesh = sc3.mesh
+    vert_obj = np.zeros(mesh.verts.shape[0], np.int32); vert_obj[mesh.tris.reshape(-1)] = np.repeat(mesh.obj_index, 3)
+    sel = vert_obj == 0
+    V = mesh.verts.copy(); V[sel] = (V[sel] @ rot[:3, :3].T + rot[:3, 3]).astype(f32); mesh.verts = V
+    sc3.objects[0].matrix_world = rot
+    j3, _ = _job(sc3, st)
+    lo, span = j3.object_generated_frame()
+    check('a transformed flat object spans 1.0 on its flat axis', float(span[0][2]) == 1.0, str(span[0].tolist()))
+    rng = np.random.RandomState(1); P0 = np.zeros((2000, 3), f32); P0[:, :2] = rng.uniform(-5, 5, (2000, 2))
+    P = (P0 @ rot[:3, :3].T + rot[:3, 3]).astype(f32)
+    g = (M.object_space_points(P, j3.object_matrices()[0]) - lo[0]) / span[0]
+    check('and its Generated.z reads within 1e-5 of 0 (no float32 speckle)', float(np.abs(g[:, 2]).max()) < 1e-5, str(float(np.abs(g[:, 2]).max())))
+    sc4 = demo_scene(st, with_texture=False); j4, _ = _job(sc4, st); _lo4, span4 = j4.object_generated_frame()
+    check('an identity object keeps the 1e-6 clamp (the 1.91 bits)', abs(float(span4[0][2]) - 1e-6) < 1e-9)
+    check('_gen_span: identity keeps max(extent, 1e-6), a transform gives a flat axis 1.0',
+          bool(np.array_equal(R._gen_span(np.array([2.0, 0.0, 3.0], f32), True), np.array([2.0, 1e-6, 3.0], f32)))
+          and bool(np.array_equal(R._gen_span(np.array([2.0, 0.0, 3.0], f32), False), np.array([2.0, 1.0, 3.0], f32))))
 
 
 def main():

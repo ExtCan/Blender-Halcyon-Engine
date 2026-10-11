@@ -494,6 +494,10 @@ def combine_fns(model, consts, vside, bake=None):
     if model == 'D3D_SEPARATE_SPEC' and \
             str(opts.get('texop', 'MOD')) != 'MOD':
         return dedupe_functions(fns + FN_D3DSPEC_OP)
+    if model in CB.PC_TEXOP_MODELS and \
+            str(opts.get('texop', 'MOD')) != 'MOD':
+        # R253 (review): the texture-stage op on the other PC types
+        return dedupe_functions(fns + FN_D3DSPEC_OP)
     if model in CB.PERIOD_MODELS_R252:
         return dedupe_functions(fns + _FNS.get(model, ''))
     return fns + _FNS.get(model, '')
@@ -537,6 +541,18 @@ def recombine_lines(model, consts, bake, alpha='1.0'):
         return ['    vec3 total = hal_cb_s22(hal_vl, s.diffuse);']
     if model == 'PS2_HIGHLIGHT':
         return _VL4 + ['    vec3 total = hal_cb_ps2hl(hal_vl4, s.diffuse);']
+    if model in CB.PC_TEXOP_MODELS and \
+            str(opts.get('texop', 'MOD')) != 'MOD':
+        # R253 (review): core/combine.cb_pc_texop's twin -- the op on
+        # the plain vertex light, no separate specular term
+        op = str(opts.get('texop', 'MOD'))
+        if op == 'MOD2X':
+            return ['    vec3 total = hal_cb_mod8k(hal_vl, s.diffuse, 2.0);']
+        if op == 'MOD4X':
+            return ['    vec3 total = hal_cb_mod8k(hal_vl, s.diffuse, 4.0);']
+        if op == 'ADD':
+            return ['    vec3 total = hal_cb_add8(hal_vl, s.diffuse);']
+        return ['    vec3 total = hal_cb_addsigned8(hal_vl, s.diffuse);']
     if model == 'D3D_SEPARATE_SPEC':
         op = str(opts.get('texop', 'MOD'))
         if op == 'MOD':

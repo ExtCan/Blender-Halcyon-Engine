@@ -105,6 +105,13 @@ RECOMBINE_MODELS = frozenset({'PS1_MODULATE', 'PS2_HIGHLIGHT', 'SATURN_ADD',
                               'DS_TOON', 'DS_HIGHLIGHT', 'MEGA_DRIVE_SH',
                               'SUPERFX_PLOT'}) | frozenset(LIGHTING_COMBINE) \
     | frozenset(PERIOD_MODELS_R252)
+#: R253 (review): the PC fixed-function shading types that are NOT the
+#: separate-specular combine -- the D3D texture-stage op applies to them
+#: too (D3DTSS_COLOROP is texture-stage state, orthogonal to the shade
+#: mode), so `recombine` runs their product through the same 8-bit ops
+#: when the Console node's Texture Op is not Modulate (Modulate stays the
+#: plain float product, bitwise 1.90)
+PC_TEXOP_MODELS = frozenset({'GOURAUD', 'FLAT_GL_LAST', 'FLAT_D3D_FIRST'})
 #: R252: the models whose combine reads the texel's ALPHA (the albedo
 #: pass's fourth channel) -- the decals and the N64 blend
 ALPHA_COMBINES = frozenset({'DS_DECAL', 'DECAL_ALPHA', 'N64_BLENDRGBA'})
@@ -694,6 +701,21 @@ def cb_d3dspec_op(Lrgb, S, A, texop):
     return np.minimum(o, f32(1.0)).astype(f32)
 
 
+def cb_pc_texop(Lrgb, A, texop):
+    """R253 (review): the texture-stage op alone (no separate specular)
+    for the other PC fixed-function shading types; None for MOD (the
+    plain product the caller already holds)."""
+    if texop == 'MOD2X':
+        return cb_mod8_k(Lrgb, A, 2.0)
+    if texop == 'MOD4X':
+        return cb_mod8_k(Lrgb, A, 4.0)
+    if texop == 'ADD':
+        return cb_add8(Lrgb, A)
+    if texop == 'ADDSIGNED':
+        return cb_addsigned8(Lrgb, A)
+    return None
+
+
 # --------------------------------------------------- C034: the DS toon table
 
 def _master_node(mat):
@@ -947,7 +969,12 @@ def recombine(job, tri_idx, light, c0, c1, c2, bary, alb, px, py, st):
     models = _models_of(job, st)
     eff = [effective_model(m, mats[i] if i < len(mats) else None, st)
            for i, m in enumerate(models)]
-    if not any(m in RECOMBINE_MODELS for m in eff):
+    def _pc_op(i):
+        return str(console_opts(mats[i] if i < len(mats) else None)
+                   .get('texop', 'MOD')) != 'MOD'
+
+    if not any(m in RECOMBINE_MODELS or (m in PC_TEXOP_MODELS and _pc_op(i))
+               for i, m in enumerate(eff)):
         return None
     tri_idx = np.asarray(tri_idx)
     mat_idx = _mat_of(job, tri_idx)
@@ -961,7 +988,8 @@ def recombine(job, tri_idx, light, c0, c1, c2, bary, alb, px, py, st):
     alb_a = alb[:, 3] if alb.ndim == 2 and alb.shape[1] >= 4 \
         else np.ones(alb.shape[0], f32)
     for mi, model in enumerate(eff):
-        if model not in RECOMBINE_MODELS:
+        if model not in RECOMBINE_MODELS and not (
+                model in PC_TEXOP_MODELS and _pc_op(mi)):
             continue
         sel = np.nonzero(mat_idx == mi)[0]
         if sel.size == 0:
@@ -969,7 +997,11 @@ def recombine(job, tri_idx, light, c0, c1, c2, bary, alb, px, py, st):
         # R252: the Console node's combine-stage options ({} elsewhere)
         opts = console_opts(mats[mi] if mi < len(mats) else None)
         kind = LIGHTING_COMBINE.get(model, model)
-        if kind == 'luma64':
+        if model in PC_TEXOP_MODELS:
+            p = cb_pc_texop(L[sel], A[sel], str(opts.get('texop', 'MOD')))
+            if p is not None:
+                out[sel] = p
+        elif kind == 'luma64':
             out[sel] = cb_luma64(L[sel], A[sel],
                                  gamma=float(opts.get('luma_gamma', 1.0)))
         elif kind == 'ds':

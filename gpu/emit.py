@@ -1383,6 +1383,7 @@ def e_console_shader(em, node, _i):
     res = resolve(node.get('props', {}))
     vmix_on = res['vmix'] is not None
     vcol_linked = False
+    diff_linked = False
     dual_linked = False
     vmix_default = 0.0
     for sock in node.get('inputs', ()):
@@ -1396,6 +1397,8 @@ def e_console_shader(em, node, _i):
                 vmix_on = True
         if name == 'Vertex Color':
             vcol_linked = bool(sock.get('link'))
+        if name == 'Diffuse Color':
+            diff_linked = bool(sock.get('link'))
         if name == 'Dual Texture':
             dual_linked = bool(sock.get('link'))
     if res['untextured']:
@@ -1420,7 +1423,16 @@ def e_console_shader(em, node, _i):
         # mesh unpainted -- console_albedo's own fallback)
         vcol = em.input(node, 'Vertex Color', VEC4) \
             if (vcol_linked or not em.has_vcol) else 'hal_vcol'
-        base, _t = em.tmp(VEC4, f'{base} + ({vcol} - {base}) * {vmix}')
+        if diff_linked and not res['untextured']:
+            # R253 (review): console_albedo's rule -- a linked texture is
+            # modulated by the vertex colour, never replaced (one op per
+            # statement, the CPU's own order)
+            t1, _t = em.tmp(VEC3, f'{vcol}.rgb - vec3(1.0)')
+            t2, _t = em.tmp(VEC3, f'{t1} * {vmix}')
+            t3, _t = em.tmp(VEC3, f'vec3(1.0) + {t2}')
+            base, _t = em.tmp(VEC4, f'vec4({base}.rgb * {t3}, {base}.a)')
+        else:
+            base, _t = em.tmp(VEC4, f'{base} + ({vcol} - {base}) * {vmix}')
     cmb = res['combine']
     if cmb.get('rw_matfx') == 'DUAL' and dual_linked:
         dual, _t = em.tmp(VEC4, em.input(node, 'Dual Texture', VEC4))

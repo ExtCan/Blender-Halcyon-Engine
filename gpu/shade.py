@@ -1070,6 +1070,18 @@ def _plan_sig(job, mkey):
         tuple(np.round(np.asarray(getattr(o, 'color', (1, 1, 1, 1)),
                                   np.float32), 5))
         for o in (getattr(scene, 'objects', ()) or ()))
+    # R253 (review): the per-object inverse rows and the Generated box
+    # are BAKED into the pass as literals (hal_obj_rN, hal_lgen_lo /
+    # span); a transform that keeps the mesh key (a translation, a
+    # Texture Space edit) must re-plan, or the cache serves stale bits
+    try:
+        _g_lo, _g_span = job.object_generated_frame()
+        obgen_sig = (np.asarray(_g_lo, np.float32).tobytes(),
+                     np.asarray(_g_span, np.float32).tobytes(),
+                     np.asarray(job.object_matrices(), np.float32).tobytes())
+    except Exception:                                           # noqa: BLE001
+        obgen_sig = None
+    obcol_sig = obcol_sig + (obgen_sig,)
     # R216: image CONTENT joins the signature (a strided sum per image)
     # -- an image sequence advancing, or a repainted texture, must
     # re-plan so the mip atlases re-upload; a name alone hid both

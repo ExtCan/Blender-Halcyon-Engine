@@ -164,12 +164,12 @@ M2_TYPE_ITEMS = (
      "it is, the board's unlit polygon flag"),
 )
 M2_SPECULAR_ITEMS = (
-    ('OFF', "Off", "No specular term: the specular-control bits cleared"),
-    ('P1', "Power 1", "The reflection's camera-axis component as it is "
+    ('OFF', "Off (bits cleared)", "No specular term: the specular-control bits cleared"),
+    ('P1', "Power 1 (no squaring)", "The reflection's camera-axis component as it is "
                       "(no squaring): the broadest highlight the bits allow"),
-    ('P2', "Power 2", "Squared once: the second of the four specular settings"),
-    ('P4', "Power 4", "Squared twice: the third of the four specular settings"),
-    ('P8', "Power 8", "Squared three times: the tightest highlight the "
+    ('P2', "Power 2 (squared once)", "Squared once: the second of the four specular settings"),
+    ('P4', "Power 4 (squared twice)", "Squared twice: the third of the four specular settings"),
+    ('P8', "Power 8 (squared thrice)", "Squared three times: the tightest highlight the "
                       "specular-control bits can ask for"),
 )
 
@@ -182,7 +182,7 @@ M3_TYPE_ITEMS = (
      "are, no light evaluated -- Supermodel's fixedShading path"),
 )
 M3_SPECULAR_ITEMS = (
-    ('OFF', "Off", "The header's specular-enable bit cleared: no highlight"),
+    ('OFF', "Off (specular bit clear)", "The header's specular-enable bit cleared: no highlight"),
     ('P8', "Exponent 8, gain 1.6",
      "The first of the four polygon-header specular settings"),
     ('P16', "Exponent 16, gain 1.6",
@@ -796,12 +796,17 @@ def resolve(props):
     elif con == 'SUPERFX':
         out['model'] = 'SUPERFX_PLOT'
         cmb['sfx_dither'] = str(_p(p, 'sfx_type')) != 'SOLID'
+        # R253 (review): the plot has no highlight -- the specular
+        # sockets are hidden (MACHINE_SOCKETS) and the level is pinned,
+        # not left to the hidden socket's 0.5
+        out['spec_level'] = 0.0
     elif con == 'JAGUAR':
         out['model'] = 'JAGUAR_CRY'
         if str(_p(p, 'jag_type')) == 'FLAT':
             out['rate'] = 'FACE'
     elif con == 'THREEDO':
         out['model'] = 'THREEDO_PIXC'
+        out['spec_level'] = 0.0          # R253 (review): the cel engine lights no highlight
     elif con == 'RENDERWARE':
         out['model'] = _RW_MODEL.get(str(_p(p, 'rw_platform')), 'RENDERWARE_PS2')
         t = str(_p(p, 'rw_type'))

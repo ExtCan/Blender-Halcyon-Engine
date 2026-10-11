@@ -2783,6 +2783,19 @@ def fog_for_points(job, tri_idx, bary, rgb, px=None, py=None, surf=None,
 _SINGULAR_SAID = set()
 
 
+def _gen_span(extent, identity):
+    """R253 (review): the Generated box's span per axis. An untransformed
+    object keeps Halcyon's max(extent, 1e-6) clamp (the 1.91 bits: a flat
+    plane reads 0 on its flat axis); a TRANSFORMED flat object would have
+    divided the inverse chain's float32 residual (~1e-7 of |P|) by that
+    1e-6 and read +/-0.5 of noise on its flat axis, so there a flat axis
+    spans 1.0 and reads ~0 instead."""
+    extent = np.asarray(extent, np.float32)
+    if identity:
+        return np.maximum(extent, 1e-6).astype(np.float32)
+    return np.where(extent > 1e-6, extent, np.float32(1.0)).astype(np.float32)
+
+
 def object_inverse(m, obj=None):
     """R253 (review): the per-object inverse world matrix for the
     object-space roads (Object coordinates, the R253 Generated frame).
@@ -2924,14 +2937,15 @@ class ShadeJob:
         for i in range(min(n_obj, len(objs))):
             o = objs[i]
             gb = getattr(o, 'gen_bounds', None)
+            mw = getattr(o, 'matrix_world', None)
+            ident = mw is None or np.array_equal(np.asarray(mw, np.float32), eye)
             if gb is not None:
                 g_lo = np.asarray(gb[0], np.float32).reshape(3)
                 g_hi = np.asarray(gb[1], np.float32).reshape(3)
                 lo[i] = g_lo
-                span[i] = np.maximum(g_hi - g_lo, 1e-6)
+                span[i] = _gen_span(g_hi - g_lo, ident)
                 continue
-            mw = getattr(o, 'matrix_world', None)
-            if mw is None or np.array_equal(np.asarray(mw, np.float32), eye):
+            if ident:
                 continue                     # identity: local == world
             if mesh is None or mesh.verts is None or not mesh.verts.size:
                 continue
@@ -2949,7 +2963,7 @@ class ShadeJob:
             g_lo = local.min(0).astype(np.float32)
             g_hi = local.max(0).astype(np.float32)
             lo[i] = g_lo
-            span[i] = np.maximum(g_hi - g_lo, 1e-6)
+            span[i] = _gen_span(g_hi - g_lo, False)
         self._obj_gen = (lo.astype(np.float32), span.astype(np.float32))
         # every inverse the identity (an untransformed scene, every
         # hand-built one): the chain would return P bit for bit, so the

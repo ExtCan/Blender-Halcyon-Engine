@@ -1293,6 +1293,7 @@ class HALCYON_ConsoleShaderNode(Node, HalcyonNodeBase):
                     "default)")
     pc_color_vertex: BoolProperty(
         name="Colour Vertex", default=False,
+        update=_update,
         description="D3DRS_COLORVERTEX with D3DMCS_COLOR1: the vertex "
                     "colour is the material's diffuse (GL_COLOR_MATERIAL)")
     pcx_base: EnumProperty(
@@ -6087,6 +6088,31 @@ def migrate_master_node(tree, node):
             new.toon_steps = int(getattr(node, 'toon_steps', 2) or 2)
         except Exception:                                       # noqa: BLE001
             pass
+        if model in ('SEGA_MODEL2', 'SEGA_MODEL3'):
+            # R253 (review): the 1.90 master picked the board's specular
+            # setting by snapping its Glossiness (core/shading
+            # sega_model2_spec / sega_model3_spec); the node pins it by
+            # menu, so the menu is set from the old sockets or the
+            # highlight changed at file load (P4 / P16 defaults)
+            try:
+                gl = node.inputs.get('Glossiness')
+                sl = node.inputs.get('Specular Level')
+                g = float(gl.default_value) if gl is not None and \
+                    not gl.is_linked else 25.0
+                lvl = float(sl.default_value) if sl is not None and \
+                    not sl.is_linked else 0.5
+                if model == 'SEGA_MODEL2':
+                    pick = 'OFF' if lvl <= 0.0 else (
+                        'P1' if g < 1.5 else 'P2' if g < 3.0 else
+                        'P4' if g < 6.0 else 'P8')
+                    new.m2_specular = pick
+                else:
+                    pick = 'OFF' if lvl <= 0.0 else (
+                        'P8' if g < 12.0 else 'P16' if g < 24.0 else
+                        'P32' if g < 48.0 else 'P64')
+                    new.m3_specular = pick
+            except Exception:                                   # noqa: BLE001
+                pass
     # the sockets: values and links by name
     for old_s in list(node.inputs):
         ns = new.inputs.get(old_s.name)

@@ -3584,12 +3584,31 @@ def console_albedo(ev, node, base):
             return coerce(mesh_col, RGBA, n)
         return _opt(ev, node, 'Vertex Color', RGBA, (1.0, 1.0, 1.0))
 
+    # R253 (review): a linked texture stays. The vertex colour replaces
+    # the MATERIAL colour on every machine that reads it (GX_SRC_VTX, the
+    # N64's shade with G_LIGHTING off, Model 3's fixed shading, D3D's
+    # COLORVERTEX) and the texture still modulates it; replacing the
+    # textured albedo dropped the texture. An unlinked Diffuse Color IS
+    # the material colour, so there the lerp replaces as before.
+    tex_linked = ev.has_link(node, 'Diffuse Color') and not res['untextured']
+
+    def _mix(b, vm):
+        vc = _vcol()
+        if not tex_linked:
+            return b + (vc - b) * vm
+        t1 = vc[:, :3] - np.float32(1.0)
+        t2 = t1 * vm
+        t3 = np.float32(1.0) + t2
+        out = np.array(b, np.float32, copy=True)
+        out[:, :3] = b[:, :3] * t3
+        return out
+
     if res['vmix'] is not None:
-        base = base + (_vcol() - base) * np.float32(res['vmix'])
+        base = _mix(base, np.float32(res['vmix']))
     else:
         vmix = np.clip(_opt(ev, node, 'Vertex Color Mix', VALUE, 0.0), 0.0, 1.0)
         if np.any(vmix > 0.0):
-            base = base + (_vcol() - base) * vmix[:, None]
+            base = _mix(base, vmix[:, None])
     cmb = res['combine']
     if cmb.get('rw_matfx') == 'DUAL' and ev.has_link(node, 'Dual Texture'):
         dual = ev.input(node, 'Dual Texture', RGBA)
