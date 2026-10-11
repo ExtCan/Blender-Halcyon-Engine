@@ -20,7 +20,7 @@ without Blender for its 9503-check test suite.
 
 **Three roads, one engine.**
 
-- **The eras.** 112 render presets, each what its target actually did —
+- **The eras.** 121 render presets, each what its target actually did —
   Infini-D, Ray Dream, 3D Studio R4 and MAX, trueSpace, LightWave, Imagine,
   POV-Ray, Bryce, Softimage, Alias, Maya 4, RenderMan; VGA, EGA, CGA, the
   Mac 1-bit and 8-bit palettes, Amiga OCS/EHB/AGA/HAM, Atari ST, MSX,
@@ -68,7 +68,7 @@ without Blender for its 9503-check test suite.
 ![the libraries](docs/halcyon_libraries.png)
 
 **At a glance:** 59 shading models · 250 node types evaluated (every shader
-node Blender 5.x offers, plus Halcyon's own 143) · 112 render presets in
+node Blender 5.x offers, plus Halcyon's own 143) · 121 render presets in
 eight categories · 143 resolution presets · 114 Pre-Made material templates
 in fourteen families · twelve sky modes, 303 skies, 48 waters, ten infinite
 grounds · real volumes (eight scattering models, mesh containers, voxels) ·
@@ -1529,7 +1529,7 @@ feed it. Both dither roads clamp before they quantise and before they
 diffuse, so an unrepresentable hue becomes the nearest palette colour
 instead of a smear.
 
-**112 render presets** across eight categories — 3D software (Infini-D, Ray
+**121 render presets** across eight categories — 3D software (Infini-D, Ray
 Dream, 3D Studio, MAX R2 and 3ds Max 2012, trueSpace, LightWave, POV-Ray,
 Bryce, Softimage|3D, Maya 4, Blender 2.41 and the rest), home computers
 (VGA Mode 13h through PC-98 and X68000, the Amiga's Extra Half-Brite, MSX1
@@ -1542,6 +1542,29 @@ Toaster, PAL, VHS, the RF modulator, Video CD), handhelds, the early web
 silent nitrate to the modern digital master, Tron's backlit mattes among
 them. Applying one resets everything first, so presets
 never accumulate.
+
+**Render presets for every console that got a shader (1.92).** The
+preset shelf now has a look for each machine the Console Emulation
+Shader emulates: the **PSP** (480x272, the GU's four lights, RGB565 with
+the GE's dither), **Namco System 22** (Ridge Racer's point-sampled
+640x480 and its depth cue), the **Super FX** (Star Fox's 4 bpp plot into
+a fixed sixteen-colour palette -- the new *Star Fox 16* palette mode),
+the **Wii** (the GameCube at 480p with an anamorphic 16:9 pixel, 4x
+anisotropy and 1024 textures), the **Naomi** (the Dreamcast's PowerVR2
+at 24 bits on a VGA monitor), **RenderWare** on the PlayStation 2, the
+GameCube and the Xbox (Criterion's prelit pipelines, linear fog, no
+hardware light count) and a **GTA-era PS2** look with the CRTC's
+previous-frame "Trails" blend. The older console presets now carry
+their machines' real light counts (the PlayStation's three, the PS2's
+three, the N64's seven), the Jaguar preset shades with the blitter's
+intensity-only CRY Gouraud and the 3DO preset with the cel engine's PIXC
+multiplier -- the models the Console Emulation Shader brought. Each of
+these presets also remembers which machine it is: applying one points
+the Material panel's Convert to Game **Console** menu at it, the presets
+panel says "Game conversion: Sony PlayStation / Gouraud, textured", and a
+**From Preset** button next to the three Game buttons converts this
+material to the preset's machine, shader type and light limit in one
+click. 121 render presets.
 
 **Render passes.** Beside Combined the engine writes, on request,
 Blender Internal's own pass set for the compositor's Render Layers node:
@@ -2614,7 +2637,7 @@ halcyon/
                  shaders and the BI Material node (shader_nodes.py), the
                  pattern and media shelf (pattern_nodes.py), the 3DS Max
                  shelf (max_nodes.py), the BI Texture node
-  presets/       112 render presets, 303 skies (+ thumbs/), 48 waters
+  presets/       121 render presets, 303 skies (+ thumbs/), 48 waters
   tests/         headless suite, bpy stub, fake Blender, the fake device
                  (the driver's rules, headless), feature matrix, Blender
                  5.2's icon enum; and 1.90.0's fifteen modules, one or
