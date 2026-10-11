@@ -1540,8 +1540,11 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
                                         scene.camera)
             ss_en, ss_el, ss_lobe = LI.screen_spot_lobe(px_, py_, dep_, *_ss)
             _ss_sign = -1.0 if light.negative else 1.0
+            # R253 (H): the style gain rides the energy (x 1.0 is exact)
             ss_col = np.asarray(light.color, np.float32) * np.float32(
-                _ss_sign * float(light.energy) / (4.0 * np.pi))
+                _ss_sign * (float(light.energy)
+                            * float(getattr(light, 'style_gain', 1.0)))
+                / (4.0 * np.pi))
             ss_t = (surf.diffuse * surf.diffuse_level[:, None]) * ss_col[None, :]
             ss_t = ss_t * ss_lobe[:, None]
             ss_t = ss_t * inv_pi
@@ -1834,7 +1837,40 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
             else:
                 dcontrib = (dif[:, None] * dcol *
                             surf.diffuse_level[:, None]) * rad
+            if getattr(light, 'type', '') == 'HEMI':
+                _hg = getattr(light, 'hemi_ground', None)
+                if _hg is not None and max(_hg) > 0.0:
+                    # R253 (C): the two-tone hemisphere (Rost, OpenGL
+                    # Shading Language 9.1: mix(ground, sky, 0.5 + 0.5
+                    # N.L)) split into the sky term above (today's
+                    # wrap `dif`) plus the GROUND term, weighted 1 -
+                    # dif -- the lamp's own sign, energy and style
+                    # gain (the same scalar sample() gave the sky
+                    # term; texel 0.w on the GPU), NO cookie on the
+                    # ground: the slide is a projector, the ground a
+                    # bounce. It rides the inv_pi / vis (always 1
+                    # for a hemi) / link mask / clamp tail unchanged.
+                    _hsg = -1.0 if light.negative else 1.0
+                    rad_g = np.broadcast_to(
+                        np.asarray(_hg, np.float32) * np.float32(
+                            _hsg * (float(light.energy)
+                                    * float(getattr(light, 'style_gain',
+                                                    1.0)))),
+                        (n, 3))
+                    dcontrib = dcontrib + (
+                        ((np.float32(1.0) - dif)[:, None] * dcol
+                         * surf.diffuse_level[:, None]) * rad_g)
         if light.affect_specular and not light.diffuse_only:
+            # R253 (B): the lamp's Specular Colour tints the classic
+            # lobes only -- OpenGL 1.1's GL_SPECULAR / D3DLIGHT7's
+            # dcvSpecular, a second colour per light. White (the
+            # default) keeps `rad` itself: no new arithmetic at all.
+            # The sheen term, the ramp ENERGY luminance and the cel
+            # roads keep the plain `rad`.
+            _sct = np.asarray(getattr(light, 'specular_color',
+                                      (1.0, 1.0, 1.0)), np.float32)
+            rad_s = rad * _sct[None, :] if bool(np.any(_sct != 1.0)) \
+                else rad
             sp = spec
             if ramp_spec is not None and ramp_spec.get('input') != 'RESULT':
                 # recover the shader scalar from evaluate's coloured
@@ -1869,9 +1905,9 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
             if model in SH.LEVEL_FREE_MODELS:
                 # R243: Strauss has no Specular Level in Max, Multi-Layer
                 # applies its two levels inside -- the loop scales by nothing
-                scontrib = sp * rad
+                scontrib = sp * rad_s
             else:
-                scontrib = sp * surf.specular_level[:, None] * rad
+                scontrib = sp * surf.specular_level[:, None] * rad_s
             if sheen_exp is not None:
                 # velvet: light scattered back at grazing angles, so the lobe
                 # lives at the silhouette and vanishes face-on. It still needs
@@ -2757,6 +2793,9 @@ class ShadeJob:
         self.width = width
         self.height = height
         self.rng = np.random.default_rng(settings.seed)
+        # R253 (H): a job built without render() (the GPU plan rigs)
+        # still packs the frame's style gains; idempotent after render's
+        LI.apply_light_styles(scene)
         self.lights = LI.select_lights(scene.lights, settings)
         self.unsupported = set()
         self._obj_matrices = None
@@ -4159,6 +4198,10 @@ def _caster_keep_tri(scene, mesh):
 
 
 def _build_shadows(scene, st, mesh):
+    # R253 (H): every lamp's style gain for THIS frame, written before
+    # anything reads an energy -- the CPU loop, the beams, the fog
+    # lobe, the ambient pool and the GPU packer all see one number
+    LI.apply_light_styles(scene)
     if not (st.shadows and st.shadow_default in ('MAP', 'PER_LIGHT')):
         return
     keep_tri = _caster_keep_tri(scene, mesh)
@@ -4312,7 +4355,11 @@ def _flare_sources(scene, st, gbuf, vp):
             continue
         out.append({'x': float(ndc[0]), 'y': float(ndc[1]),
                     'color': tuple(float(c) for c in light.color),
-                    'intensity': fi * frac,
+                    # R253 (H): the flare flickers in sync with its lamp
+                    # (the flare dial never read the energy, so the
+                    # style gain lands on the intensity; x 1.0 is exact)
+                    'intensity': fi * frac
+                    * float(getattr(light, 'style_gain', 1.0)),
                     'scale': float(getattr(light, 'flare_scale', 1.0)),
                     'streaks': int(getattr(light, 'flare_streaks', 6)),
                     'rings': int(getattr(light, 'flare_rings', 1)),
@@ -9203,7 +9250,10 @@ def _light_volumes(img, scene, st, gbuf, vp, eye, w, h, bvh=None,
             max_distance=reach_l, occlude=occ)
         if scatter.any():
             col = np.asarray(light.color, np.float32)[None, :]
-            add += scatter[:, None] * col * float(light.energy) / np.pi
+            # R253 (H): the beam flickers with the lamp's style
+            add += scatter[:, None] * col * (
+                float(light.energy)
+                * float(getattr(light, 'style_gain', 1.0))) / np.pi
     if sel is None:
         img[:, :, :3] += add.reshape(h, w, 3)
     else:

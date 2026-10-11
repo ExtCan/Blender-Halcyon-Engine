@@ -340,7 +340,28 @@ def _light_shadow_signature(light):
             round(float(getattr(light, 'radius', 0.0)), 6),
             round(float(asz[0]), 6), round(float(asz[1]), 6),
             # R251 C117: the per-lamp Map Depth override
-            str(getattr(light, 'shadow_map_depth', 'INHERIT')))
+            str(getattr(light, 'shadow_map_depth', 'INHERIT')),
+            # R253: the Square cone widens the buffer's frustum and
+            # ClipSta / ClipEnd move its planes -- every one a depth
+            # texel, so the per-light cache must rebuild on a change
+            bool(getattr(light, 'spot_square', False)),
+            round(float(getattr(light, 'shadow_clip_start', 0.0) or 0.0), 6),
+            round(float(getattr(light, 'shadow_clip_end', 0.0) or 0.0), 6))
+
+
+def shadow_clip_planes(light, near_auto, far_auto):
+    """R253 (F): Blender Internal's la->clipsta / la->clipend as the
+    shadow buffer's near and far planes. 0 keeps the automatic plane
+    (the 1.89 rule, bitwise: the same python expressions the caller
+    evaluated); a Start above 0 replaces the near plane, an End past
+    the near plane replaces the far one. Both roads read the planes
+    off the built map (the GPU shadow meta copies near/far/vp), so
+    the clipped map is one texture on both devices."""
+    cs = float(getattr(light, 'shadow_clip_start', 0.0) or 0.0)
+    ce = float(getattr(light, 'shadow_clip_end', 0.0) or 0.0)
+    near = cs if cs > 0.0 else near_auto
+    far = ce if ce > near else far_auto
+    return near, far
 
 
 def build_shadow_maps(scene, settings, caster_tris=None):
@@ -480,7 +501,19 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
             view = _look_at_lh(pos, pos + d, np.array([0, 0, 1.0], np.float32))
             near = max(radius * 0.005, 1e-3)
             far = max(float(np.linalg.norm(centre - pos)) + radius * 1.5, near * 10)
-            fov = min(max(float(light.spot_size) * 1.15, 0.05), 3.0)
+            # R253 (F): BI's ClipSta / ClipEnd replace the automatic
+            # planes (0 = automatic, the expressions above untouched)
+            near, far = shadow_clip_planes(light, near, far)
+            if getattr(light, 'spot_square', False):
+                # R253 (A): a Square cone lights a square patch whose
+                # corners sit sqrt(2) further out than the round cone's
+                # edge -- widen the buffer to the diagonal so the
+                # corners keep their shadows (the round fov is the old
+                # expression, bitwise, when the flag is off)
+                half_t = float(np.tan(float(light.spot_size) * 0.5)) * np.sqrt(2.0)
+                fov = min(max(2.0 * float(np.arctan(half_t)) * 1.15, 0.05), 3.0)
+            else:
+                fov = min(max(float(light.spot_size) * 1.15, 0.05), 3.0)
             vp = _persp(fov, 1.0, near, far) @ view
 
             def assign(depth, light=light, vp=vp, near=near, far=far,
@@ -494,6 +527,8 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
         else:
             near = max(radius * 0.005, 1e-3)
             far = max(float(np.linalg.norm(centre - pos)) + radius * 1.5, near * 10)
+            # R253 (F): the cube's six faces share BI's clip pair too
+            near, far = shadow_clip_planes(light, near, far)
             proj = _persp(np.pi * 0.5, 1.0, near, far)
             slots = [None] * len(CUBE_DIRS)
             pending = {'n': len(CUBE_DIRS)}
@@ -538,17 +573,15 @@ def attenuate(light, dist, settings=None):
     if mode == 'DEFAULT' and settings is not None:
         mode = settings.light_falloff_default
     start = float(light.decay_start)
-    if mode == 'NONE':
-        att = np.ones_like(dist)
-        if getattr(light, 'bi_sphere', False):
-            # LA_SPHERE applies OUTSIDE the falloff switch in the C --
-            # even a Constant-falloff lamp clips at its Distance
-            D = max(float(light.decay_end), EPS)
-            t = D - np.maximum(dist, 0.0)
-            att = np.where(t <= 0.0, 0.0, att * t / D)
-        return att.astype(np.float32)
     d = np.maximum(dist - start, EPS) if start > 0 else np.maximum(dist, EPS)
-    if mode == 'INVERSE':
+    if mode == 'NONE':
+        # R253: no early return any more -- the Sphere wrap below is
+        # the SAME statements this branch used to run (LA_SPHERE
+        # applies OUTSIDE the falloff switch in the C, so even a
+        # Constant-falloff lamp clips at its Distance), and the Near
+        # Attenuation tail must see every curve
+        att = np.ones_like(dist)
+    elif mode == 'INVERSE':
         att = 1.0 / d
     elif mode == 'CUSTOM':
         end = max(float(light.decay_end), start + EPS)
@@ -581,10 +614,11 @@ def attenuate(light, dist, settings=None):
         if ld2 > 0.0:
             att = att * ((D * D) / (D * D + ld2
                                     * np.maximum(dist, 0.0) ** 2))
-    elif mode in DECAY_LAWS_R251:
+    elif mode in DECAY_LAWS_R251 or mode in DECAY_LAWS_R253:
         # R251 F013: OpenGL's three-term attenuation, POV-Ray's fade
         # laws and the GameCube's GX distance tables -- float32, one op
-        # per statement, exactly the GLSL `decay_law_glsl` emits
+        # per statement, exactly the GLSL `decay_law_glsl` emits.
+        # R253 (D): the two nominal-distance laws ride the same road
         att = decay_law(light, mode, dist)
     else:
         att = 1.0 / (d * d)
@@ -594,7 +628,28 @@ def attenuate(light, dist, settings=None):
         D = max(float(light.decay_end), EPS)
         t = D - np.maximum(dist, 0.0)
         att = np.where(t <= 0.0, 0.0, att * t / D)
+    ns = float(getattr(light, 'decay_near_start', 0.0) or 0.0)
+    ne = float(getattr(light, 'decay_near_end', 0.0) or 0.0)
+    if ne > ns:
+        # R253 (E): 3ds Max's Near Attenuation -- the light fades IN
+        # from nothing at Start to full at End (the Attenuation
+        # Parameters rollout; the manual draws the ramp and names no
+        # curve, so it is linear here). Float32, one op per statement,
+        # exactly the GLSL lines _one_light_source emits after `att`
+        # is final; inert (no statement at all) while End <= Start
+        att = near_attenuation(att, dist, ns, ne)
     return att.astype(np.float32)
+
+
+def near_attenuation(att, dist, ns, ne):
+    """R253 (E): att times the linear fade-in over [ns, ne] of max(dist,
+    0) -- the CPU half of the GLSL `at_nt` statements."""
+    dm = np.maximum(np.asarray(dist, np.float32), np.float32(0.0))
+    span = np.float32(ne - ns)
+    t = dm - np.float32(ns)
+    t = t / span
+    t = np.clip(t, np.float32(0.0), np.float32(1.0))
+    return (np.asarray(att, np.float32) * t).astype(np.float32)
 
 
 def spot_falloff(light, L):
@@ -610,7 +665,36 @@ def spot_falloff(light, L):
     cosine roll-off -- the field's spot rigs read wrong both ways."""
     d = M.normalize(np.asarray(light.direction, np.float32))
     inpr = -M.dot(L, np.broadcast_to(d[None, :], L.shape))
+    if getattr(light, 'spot_square', False):
+        # R253 (A): BI's LA_SQUARE -- the cosine the cone law reads is
+        # measured along the wider of the lamp's two sides, so every
+        # law (BI blend, GL11, POV, GX) gets a square version
+        inpr = square_cos(light, L, inpr)
     return spot_law_factor(light, inpr)
+
+
+def square_cos(light, L, z):
+    """R253 (A): Blender Internal's Square spot, verbatim from 2.79
+    shadeoutput.c lamp_get_visibility's LA_SQUARE block: the view
+    vector in lamp space, x = max(|x/z|, |y/z|), inpr = 1/sqrt(1 + x^2)
+    (cos(atan(x))); zero behind the lamp. `z` is the plain cosine to
+    the axis (-L . direction), the frame is cookie_frame's (side, up),
+    so a projected slide fills the square corner to corner. Float32,
+    one op per statement -- the CPU half of the GLSL `sq_*` lines."""
+    s, u, _f = cookie_frame(light)
+    x = -(L @ s.astype(np.float32))
+    y = -(L @ u.astype(np.float32))
+    zz = np.maximum(np.asarray(z, np.float32), np.float32(1e-20))
+    with np.errstate(over='ignore', invalid='ignore'):
+        # behind the lamp x/zz overflows to inf (and 1/sqrt(inf) to 0);
+        # the select below discards that lane, exactly the GLSL ternary
+        ax = np.abs(x / zz)
+        ay = np.abs(y / zz)
+        m = np.maximum(ax, ay)
+        q = m * m
+        q = np.float32(1.0) + q
+        c = np.float32(1.0) / np.sqrt(q)
+    return np.where(z > 0.0, c, np.float32(0.0)).astype(np.float32)
 
 
 def _spot_blender(light, inpr):
@@ -833,6 +917,61 @@ def _cookie_texture(light):
     return tex
 
 
+def cookie_xform_on(light):
+    """R253 (G): whether the cookie carries a non-identity UV transform
+    (an offset, a tiling other than 1 or a rotation) -- structure on
+    the GPU road (the lookup function opens with the transform or not),
+    and the gate on the CPU's own statements."""
+    try:
+        ox, oy = (float(v) for v in getattr(light, 'cookie_offset',
+                                            (0.0, 0.0))[:2])
+        tx, ty = (float(v) for v in getattr(light, 'cookie_tile',
+                                            (1.0, 1.0))[:2])
+    except Exception:                                           # noqa: BLE001
+        return False
+    rot = float(getattr(light, 'cookie_rotation', 0.0) or 0.0)
+    return ox != 0.0 or oy != 0.0 or tx != 1.0 or ty != 1.0 or rot != 0.0
+
+
+def cookie_xform_consts(light):
+    """R253 (G): (ox, oy, tx, ty, c, s) float32 -- the one place the
+    transform's numbers are computed; the GPU bakes exactly these as
+    literals (the cookie road's convention: side/up/strength are
+    literals too)."""
+    ox, oy = (float(v) for v in getattr(light, 'cookie_offset',
+                                        (0.0, 0.0))[:2])
+    tx, ty = (float(v) for v in getattr(light, 'cookie_tile',
+                                        (1.0, 1.0))[:2])
+    rot = float(getattr(light, 'cookie_rotation', 0.0) or 0.0)
+    return (np.float32(ox), np.float32(oy), np.float32(tx), np.float32(ty),
+            np.float32(np.cos(rot)), np.float32(np.sin(rot)))
+
+
+def cookie_xform(light, cu, cv):
+    """R253 (G): the projector map's Coordinates rollout (3ds Max) and
+    the 2.4x lamp texture's ofs/size on the cookie's uv -- a rotation
+    about the slide's centre, then the tiling, then the offset, float32
+    and one op per statement (the GLSL `ck_*` lines are these
+    statements). The CLIP gate and the focus blur stay in texture space
+    after it, untouched."""
+    ox, oy, tx, ty, c, s = cookie_xform_consts(light)
+    u = np.asarray(cu, np.float32) - np.float32(0.5)
+    v = np.asarray(cv, np.float32) - np.float32(0.5)
+    u2 = u * c
+    t = v * s
+    u2 = u2 - t
+    v2 = u * s
+    t2 = v * c
+    v2 = v2 + t2
+    u2 = u2 * tx
+    v2 = v2 * ty
+    cu = u2 + np.float32(0.5)
+    cu = cu + ox
+    cv = v2 + np.float32(0.5)
+    cv = cv + oy
+    return cu.astype(np.float32), cv.astype(np.float32)
+
+
 def cookie_factor(light, P, L):
     """Per-point rgb multiplier from a light's projected texture.
 
@@ -863,10 +1002,15 @@ def cookie_factor(light, P, L):
     wrap = cookie_extend(light)
     filt = cookie_filter(light)
     strength = float(np.clip(getattr(light, 'cookie_strength', 1.0), 0.0, 1.0))
+    # R253 (G): the uv transform, applied right before every lookup and
+    # ONLY when it is not the identity (no statement at the default)
+    xf = cookie_xform_on(light)
     if kind in ('SUN', 'HEMI'):
         scale = max(float(getattr(light, 'cookie_scale', 10.0)), 1e-6)
         cu = (P @ s.astype(np.float32)) / scale
         cv = (P @ u.astype(np.float32)) / scale
+        if xf:
+            cu, cv = cookie_xform(light, cu, cv)
         rgb = tex.sample(cu.astype(np.float32), cv.astype(np.float32),
                          filt=filt, wrap=wrap)[:, :3]
         return (1.0 + (rgb - 1.0) * strength).astype(np.float32)
@@ -881,6 +1025,8 @@ def cookie_factor(light, P, L):
         cu = np.arctan2(dx, dz) * np.float32(1.0 / (2.0 * np.pi)) + 0.5
         cv = np.arcsin(np.clip(dy, -1.0, 1.0)) * np.float32(1.0 / np.pi) \
             + 0.5
+        if xf:
+            cu, cv = cookie_xform(light, cu, cv)
         rgb = tex.sample(cu.astype(np.float32), cv.astype(np.float32),
                          filt=filt, wrap=wrap)[:, :3]
         return (1.0 + (rgb - 1.0) * strength).astype(np.float32)
@@ -896,6 +1042,8 @@ def cookie_factor(light, P, L):
         dz = rel @ f.astype(np.float32)
         cu = (rel @ s.astype(np.float32)) / max(sx, 1e-6) + 0.5
         cv = (rel @ u.astype(np.float32)) / max(sy, 1e-6) + 0.5
+        if xf:
+            cu, cv = cookie_xform(light, cu, cv)
         rgb = tex.sample(cu.astype(np.float32), cv.astype(np.float32),
                          filt=filt, wrap=wrap)[:, :3]
         out = 1.0 + (rgb - 1.0) * strength
@@ -909,6 +1057,8 @@ def cookie_factor(light, P, L):
     safe = np.maximum(dz, 1e-6) * (2.0 * tanh)
     cu = (d @ s.astype(np.float32)) / safe + 0.5
     cv = (d @ u.astype(np.float32)) / safe + 0.5
+    if xf:
+        cu, cv = cookie_xform(light, cu, cv)
     rgb = tex.sample(cu.astype(np.float32), cv.astype(np.float32),
                      filt=filt, wrap=wrap)[:, :3]
     out = 1.0 + (rgb - 1.0) * strength
@@ -923,7 +1073,10 @@ def sample(light, P, settings, area_sample=None):
     """
     n = P.shape[0]
     col = np.asarray(light.color, np.float32)[None, :]
-    energy = float(light.energy)
+    # R253 (H): the light style's gain for this frame (1.0 exactly for
+    # NORMAL, so x * 1.0 is the old double bitwise); the same python
+    # double the GPU packer scales by
+    energy = float(light.energy) * float(getattr(light, 'style_gain', 1.0))
     if light.type in ('SUN', 'HEMI'):
         # HEMI is directional exactly like SUN -- what changes is the
         # SHADING (the 0.5+0.5*N.L wrap, in light_surface), not the
@@ -1343,7 +1496,9 @@ def ambient_light_split(scene, settings):
             scene.world.ambient_level
     for l in scene.lights:
         if l.type == 'AMBIENT' or l.ambient_only:
-            wrld = wrld + np.asarray(l.color, np.float32) * l.energy
+            # R253 (H): an ambient-only lamp flickers with its style too
+            wrld = wrld + np.asarray(l.color, np.float32) * (
+                l.energy * float(getattr(l, 'style_gain', 1.0)))
     return eng.astype(np.float32), wrld.astype(np.float32)
 
 
@@ -1374,6 +1529,14 @@ SPOT_LAWS = ('BLENDER', 'GL11', 'POV', 'GX_FLAT', 'GX_COS', 'GX_COS2',
 #: R251 F013: the decay laws added to the shared FALLOFF enum.
 DECAY_LAWS_R251 = ('GL_3TERM', 'POV_FADE_LINEAR', 'POV_FADE_SQUARE',
                    'GX_GENTLE', 'GX_MEDIUM', 'GX_STEEP')
+
+#: R253 (D): the nominal-distance laws appended to FALLOFF -- (D/d)^n
+#: with D = Falloff End: 3ds Max's Decay Inverse / Inverse Square with
+#: Start R0 (Lum = (R0/R)^n, the 3ds Max 3 User Reference's Attenuation
+#: Parameters), LightWave 6/7's Intensity Falloff Inverse Distance /
+#: Inverse Distance^2 with its Range (nominal distance). Exactly full
+#: strength at D, brighter inside, the plain law beyond.
+DECAY_LAWS_R253 = ('NOMINAL_INVERSE', 'NOMINAL_INV_SQUARE')
 
 _GX_DEGENERATE_SAID = set()
 
@@ -1534,6 +1697,15 @@ def decay_law(light, mode, dist):
             q = q * q
         s = one + q
         att = np.float32(2.0) / s
+    elif mode in DECAY_LAWS_R253:
+        # R253 (D): (D/d)^n, D = Falloff End (the nominal distance),
+        # d floored at 1e-6 so the lamp's own position is finite --
+        # exactly 1.0 at d = D (float32 D/D), 0.5 / 0.25 at 2D
+        D = np.float32(max(float(light.decay_end), EPS))
+        dq = np.maximum(dm, np.float32(1e-6))
+        att = D / dq
+        if mode == 'NOMINAL_INV_SQUARE':
+            att = att * att
     else:
         k1, k2 = gx_dist_coeffs(light, mode)
         t = k1 * dm
@@ -1543,6 +1715,68 @@ def decay_law(light, mode, dist):
         s = s + u
         att = one / s
     return att.astype(np.float32)
+
+
+# ------------------------------------------------- R253 (H): light styles
+#
+# Quake (id Software, 1996), QuakeC world.qc: the twelve worldspawn
+# lightstyle strings, 'a' = 0, 'm' = normal, 'z' = double, advanced ten
+# steps per second by the client (cl_main.c CL_ParseLightstyle +
+# r_light.c R_AnimateLight: `i = (int)(cl.time*10)`, `k = ...[i %
+# length] - 'a'; k = k*22` -- Quake's own unit is 22/256 per letter,
+# so its 'm' is 264/256 = 1.03; Halcyon normalises 'm' to EXACTLY 1.0
+# so NORMAL is bitwise inert). The gain is a pure function of
+# (style, rate, scene.time): deterministic per frame on both devices.
+
+#: the twelve world.qc strings, in Quake's own order (0 = normal)
+LIGHT_STYLES = {
+    'NORMAL': 'm',
+    'FLICKER_A': 'mmnmmommommnonmmonqnmmo',
+    'SLOW_STRONG_PULSE': 'abcdefghijklmnopqrstuvwxyzyxwvutsrqponmlkjihgfedcba',
+    'CANDLE_A': 'mmmmmaaaaammmmmaaaaaabcdefgabcdefg',
+    'FAST_STROBE': 'mamamamamama',
+    'GENTLE_PULSE': 'jklmnopqrstuvwxyzyxwvutsrqponmlkj',
+    'FLICKER_B': 'nmonqnmomnmomomno',
+    'CANDLE_B': 'mmmaaaabcdefgmmmmaaaammmaamm',
+    'CANDLE_C': 'mmmaaammmaaammmabcdefaaaammmmabcdefmmmaaaa',
+    'SLOW_STROBE': 'aaaaaaaazzzzzzzz',
+    'FLUORESCENT_FLICKER': 'mmamammmmammamamaaamammma',
+    'SLOW_PULSE_NO_BLACK': 'abcdefghijklmnopqrrqponmlkjihgfedcba',
+}
+
+
+def style_char_gain(ch):
+    """One lightstyle letter's gain: (ord - 'a') / 12, so 'a' = 0, 'm' =
+    exactly 1.0 and 'z' = 25/12 (Quake's own step is 22/256 per letter;
+    the normalisation is Halcyon's, so the NORMAL style is inert)."""
+    return (ord(ch) - 97) / 12.0
+
+
+def style_gain(light, time):
+    """R253 (H): the lamp's gain at `time` seconds -- the character of
+    its style string at floor(time * rate), wrapping at the string's
+    length (R_AnimateLight's `i % length`). NORMAL (and an unknown
+    style) is 1.0 exactly."""
+    key = str(getattr(light, 'light_style', 'NORMAL') or 'NORMAL')
+    sstr = LIGHT_STYLES.get(key, 'm')
+    if sstr == 'm':
+        return 1.0
+    rate = float(getattr(light, 'light_style_rate', 10.0) or 10.0)
+    i = int(np.floor(float(time) * rate)) % len(sstr)
+    return style_char_gain(sstr[i])
+
+
+def apply_light_styles(scene):
+    """R253 (H): write every lamp's `style_gain` for THIS frame from
+    scene.time -- called before the shadow maps build (render) and by
+    ShadeJob, so the CPU loop, the beams, the fog lobe, the ambient
+    pool and the GPU packer all read one number. Idempotent."""
+    t = float(getattr(scene, 'time', 0.0) or 0.0)
+    for l in (getattr(scene, 'lights', None) or ()):
+        try:
+            l.style_gain = float(style_gain(l, t))
+        except Exception:                                       # noqa: BLE001
+            pass
 
 
 def screen_spot_params(light, vp, w, h, camera=None):

@@ -801,7 +801,21 @@ def _light_sig(l):
            # the soft-ray shadow function bakes the radius and sample
            # unroll; the shadow colour folds into every light block
            round(float(getattr(l, 'radius', 0.0)), 6),
-           t(getattr(l, 'shadow_color', (0, 0, 0))))
+           t(getattr(l, 'shadow_color', (0, 0, 0))),
+           # R253 light options: the four STRUCTURE bits -- a Square
+           # cone, a non-white specular tint, a non-black hemi ground
+           # and a live Near Attenuation pair each emit a block; their
+           # VALUES (the tint, the ground, the distances, the frame)
+           # are texels 8-11 and never appear here. The light style's
+           # gain is folded into the energy texel (no bit at all)
+           bool(getattr(l, 'spot_square', False)),
+           tuple(float(v) for v in (getattr(l, 'specular_color',
+                                            (1.0, 1.0, 1.0))
+                                    or (1.0, 1.0, 1.0))) != (1.0, 1.0, 1.0),
+           max(tuple(getattr(l, 'hemi_ground', (0.0, 0.0, 0.0))
+                     or (0.0, 0.0, 0.0))) > 0.0,
+           float(getattr(l, 'decay_near_end', 0.0) or 0.0)
+           > float(getattr(l, 'decay_near_start', 0.0) or 0.0))
     if str(getattr(l, 'type', '')).upper() == 'AREA':
         # the AREA soft-ray twin bakes the rectangle -- centre, axes,
         # half-sizes, shape -- as literals (the radius precedent), so
@@ -842,7 +856,12 @@ def _light_sig(l):
                 str(getattr(l, 'cookie_extend', 'AUTO') or 'AUTO'),
                 str(getattr(l, 'cookie_filter', 'BILINEAR')
                     or 'BILINEAR'),
-                _cookie_sig(l))
+                _cookie_sig(l),
+                # R253 (G): the uv transform is baked as literals into
+                # the lookup function (the cookie road's convention)
+                t(getattr(l, 'cookie_offset', (0.0, 0.0)) or (0.0, 0.0)),
+                t(getattr(l, 'cookie_tile', (1.0, 1.0)) or (1.0, 1.0)),
+                round(float(getattr(l, 'cookie_rotation', 0.0) or 0.0), 6))
     return sig
 
 
@@ -1440,6 +1459,10 @@ def plan_frame(job, gbuf, use_cache=True):
             'extend': LI.cookie_extend(l),
             'filter': LI.cookie_filter(l),
             'sx': max(a_sx, 1e-6), 'sy': max(a_sy, 1e-6),
+            # R253 (G): the Offset / Tiling / Angle transform's six
+            # constants, or None at the identity (no statement emitted)
+            'xform': (tuple(float(v) for v in LI.cookie_xform_consts(l))
+                      if LI.cookie_xform_on(l) else None),
         }
 
     # R221: the anime Shadow Ramps -- bake (idempotent, cache-keyed) and

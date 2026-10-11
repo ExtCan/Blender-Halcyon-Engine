@@ -39,6 +39,8 @@ def run_tests():
     # R253 (1.92.0): more mapping types (Tri-Planar, cube atlas, object
     # projection, hex grid, the Projector's appended modes)
     from . import test_r253_mapping
+    # R253 (1.92.0): the eight period lamp options
+    from . import test_r253_light_options
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -170,6 +172,13 @@ def run_tests():
     print('R253 MORE MAPPING TYPES')
     print('=' * 66)
     rc |= test_r253_mapping.main()
+    print()
+    print('=' * 66)
+    print('R253 LIGHT OPTIONS (SQUARE SPOT, SPECULAR COLOUR, HEMI GROUND, '
+          'NOMINAL DECAY, NEAR ATTENUATION, SHADOW CLIP, COOKIE TRANSFORM, '
+          'LIGHT STYLES)')
+    print('=' * 66)
+    rc |= test_r253_light_options.main()
     return rc
 
 

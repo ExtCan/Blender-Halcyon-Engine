@@ -846,10 +846,13 @@ def lamp_map(la, version=279):
         out['warnings'].append(
             f"{out['name']}: the This Layer Only restriction is not "
             'imported; the lamp lights every layer')
-    if kind == 'SPOT' and (mode & LA_SQUARE):
-        out['warnings'].append(
-            f"{out['name']}: square spot cones are not imported; the "
-            'cone imports round')
+    # R253 (A): LA_SQUARE imports as the lamp's Square cone (it used to
+    # warn and import round); (F) la->clipsta / clipend as the shadow
+    # buffer's planes for a buffer-shadowed spot (0 = automatic)
+    out['square'] = bool(kind == 'SPOT' and (mode & LA_SQUARE))
+    if kind == 'SPOT' and (mode & LA_SHAD_BUF):
+        out['clip_start'] = _f(la.get('clipsta'), 0.0)
+        out['clip_end'] = _f(la.get('clipend'), 0.0)
     if kind == 'SPOT':
         size = _f(la.get('spotsize'), 45.0)
         if version < 270:

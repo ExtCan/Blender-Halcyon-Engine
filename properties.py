@@ -214,6 +214,51 @@ FALLOFF = _items(
      "GX_DA_MEDIUM: half linear, half quadratic"),
     ('GX_STEEP', "GX Steep (GameCube)",
      "GX_DA_STEEP: quadratic term only"),
+    # R253 light options (D): appended at the END -- _items numbers
+    # positionally and saved files hold the numbers
+    ('NOMINAL_INVERSE', "Inverse from Nominal Distance (3ds Max / LightWave)",
+     "D/d with D = Falloff End (the Nominal Distance): exactly full "
+     "strength at that distance, brighter inside, 1/d beyond -- 3ds Max's "
+     "Decay Inverse with Start R0, LightWave's Inverse Distance with Range"),
+    ('NOMINAL_INV_SQUARE',
+     "Inverse Square from Nominal Distance (3ds Max / LightWave)",
+     "(D/d)^2 with D = Falloff End (the Nominal Distance): exactly full "
+     "strength at that distance, brighter inside, 1/d^2 beyond -- 3ds "
+     "Max's Decay Inverse Square, LightWave's Inverse Distance^2"),
+)
+# R253 light options (H): Quake's twelve worldspawn lightstyles (world.qc),
+# the strings core/lights.LIGHT_STYLES steps ten per second
+LIGHT_STYLE = _items(
+    ('NORMAL', "Normal (steady)",
+     "Quake's lightstyle 0, the string 'm': a steady lamp at full "
+     "strength -- the default, bitwise the lamp without a style"),
+    ('FLICKER_A', "Flicker A (Quake 1)",
+     "Quake's lightstyle 1, the torch flicker: mmnmmommommnonmmonqnmmo"),
+    ('SLOW_STRONG_PULSE', "Slow Strong Pulse (Quake 2)",
+     "Quake's lightstyle 2: a slow pulse from black to double and back, "
+     "abcdefghijklmnopqrstuvwxyzyxwvutsrqponmlkjihgfedcba"),
+    ('CANDLE_A', "Candle A (Quake 3)",
+     "Quake's lightstyle 3, the candle: mmmmmaaaaammmmmaaaaaabcdefgabcdefg"),
+    ('FAST_STROBE', "Fast Strobe (Quake 4)",
+     "Quake's lightstyle 4: full and black every step, mamamamamama"),
+    ('GENTLE_PULSE', "Gentle Pulse (Quake 5)",
+     "Quake's lightstyle 5: a gentle pulse that never goes dark, "
+     "jklmnopqrstuvwxyzyxwvutsrqponmlkj"),
+    ('FLICKER_B', "Flicker B (Quake 6)",
+     "Quake's lightstyle 6, the second torch flicker: nmonqnmomnmomomno"),
+    ('CANDLE_B', "Candle B (Quake 7)",
+     "Quake's lightstyle 7, the second candle: mmmaaaabcdefgmmmmaaaammmaamm"),
+    ('CANDLE_C', "Candle C (Quake 8)",
+     "Quake's lightstyle 8, the third candle: "
+     "mmmaaammmaaammmabcdefaaaammmmabcdefmmmaaaa"),
+    ('SLOW_STROBE', "Slow Strobe (Quake 9)",
+     "Quake's lightstyle 9: eight steps black, eight steps double, "
+     "aaaaaaaazzzzzzzz"),
+    ('FLUORESCENT_FLICKER', "Fluorescent Flicker (Quake 10)",
+     "Quake's lightstyle 10, the failing tube: mmamammmmammamamaaamammma"),
+    ('SLOW_PULSE_NO_BLACK', "Slow Pulse, No Black (Quake 11)",
+     "Quake's lightstyle 11: the slow pulse that stops short of black, "
+     "abcdefghijklmnopqrrqponmlkjihgfedcba"),
 )
 # R251 F012 (LIGHT-B1): the spot lamp's cone law
 SPOT_LAW = _items(
@@ -3821,6 +3866,102 @@ class HalcyonLightSettings(PropertyGroup):
              "the projection cannot ring")),
         description="How texels of the projected image are blended, "
                     "identically on both devices")
+    # ---- R253 light options: eight period dials, every one inert at
+    # its default (the lamp renders bitwise the 1.91 lamp until a dial
+    # moves); tooltips >= 40 chars, the node audit's own bar
+    spot_square: BoolProperty(
+        name="Square", default=False,
+        description="Blender Internal's Square spot: the cone becomes a "
+                    "pyramid -- the angle to the axis is measured along the "
+                    "wider of the lamp's two sides, so the beam lights a "
+                    "square patch and a projected slide fills it corner to "
+                    "corner. Every cone law reads the square cosine; the "
+                    "shadow buffer widens to the square's diagonal; the "
+                    "volumetric beam itself stays round (as BI's halo did)")
+    specular_color: FloatVectorProperty(
+        name="Specular Color", subtype='COLOR', size=3,
+        default=(1.0, 1.0, 1.0), min=0.0, max=1.0,
+        description="Tints this lamp's highlight only, as OpenGL 1.1's "
+                    "GL_SPECULAR and Direct3D 7's dcvSpecular let a light "
+                    "carry a second colour beside its diffuse one -- a "
+                    "multiplier on the lamp colour for the classic specular "
+                    "lobes; white leaves them untouched. The sheen term, the "
+                    "ramp Energy input and the cel shaders keep the plain "
+                    "lamp colour")
+    hemi_ground: FloatVectorProperty(
+        name="Ground Color", subtype='COLOR', size=3,
+        default=(0.0, 0.0, 0.0), min=0.0, max=1.0,
+        description="The two-tone hemisphere's ground colour (Rost, OpenGL "
+                    "Shading Language, 9.1 Hemisphere Lighting: mix(ground, "
+                    "sky, 0.5 + 0.5 N.L)): faces turned away from the hemi "
+                    "receive this colour at the lamp's energy, faces toward "
+                    "it the lamp colour, in between a blend. Black (the "
+                    "default) is the one-colour Blender Internal hemi; the "
+                    "projected texture tints the sky term only")
+    decay_near_start: FloatProperty(
+        name="Near Attenuation Start", default=0.0, min=0.0,
+        description="3ds Max's Near Attenuation Start: below this distance "
+                    "the lamp gives no light at all; it fades IN between "
+                    "Start and End (a linear ramp) and is at full strength "
+                    "past End. Active only while End is above Start; never "
+                    "on a Sun, Hemi or Area lamp (Max's directional lights "
+                    "carry no attenuation either). Composes with the falloff")
+    decay_near_end: FloatProperty(
+        name="Near Attenuation End", default=0.0, min=0.0,
+        description="3ds Max's Near Attenuation End: the distance at which "
+                    "the fade-in from Start reaches full strength. 0 (and "
+                    "any value at or below Start) switches the fade-in off "
+                    "-- the lamp is then exactly the lamp without it")
+    shadow_clip_start: FloatProperty(
+        name="Shadow Clip Start", default=0.0, min=0.0,
+        description="Blender Internal's ClipSta: the shadow buffer's near "
+                    "plane in scene units -- casters nearer than this fall "
+                    "outside the map and cast nothing. 0 = the automatic "
+                    "plane (half a percent of the scene radius). Map "
+                    "shadows of Spot and Point lamps only; a ray shadow "
+                    "has no buffer to clip")
+    shadow_clip_end: FloatProperty(
+        name="Shadow Clip End", default=0.0, min=0.0,
+        description="Blender Internal's ClipEnd: the shadow buffer's far "
+                    "plane in scene units -- receivers and casters beyond "
+                    "it fall outside the map and are lit as if unshadowed. "
+                    "0 (or a value inside Clip Start) = the automatic plane "
+                    "(the scene's far edge from the lamp). Map shadows of "
+                    "Spot and Point lamps only")
+    cookie_offset: FloatVectorProperty(
+        name="Projection Offset", size=2, default=(0.0, 0.0),
+        description="Slides the projected image across the beam in slide "
+                    "units (1 = one image width / height) -- the Offset of "
+                    "3ds Max's projector-map Coordinates rollout, the ofs of "
+                    "a 2.4x lamp texture. Applied after the rotation and "
+                    "the tiling, about the slide's centre; 0, 0 = untouched")
+    cookie_tile: FloatVectorProperty(
+        name="Projection Tiling", size=2, default=(1.0, 1.0), min=0.01,
+        description="How many copies of the projected image span the beam "
+                    "in each direction (with Repeat extension) or how much "
+                    "smaller the single slide is (Extend / Clip) -- the "
+                    "Tiling of 3ds Max's Coordinates rollout, the size of a "
+                    "2.4x lamp texture; 1, 1 = the plain projection")
+    cookie_rotation: FloatProperty(
+        name="Projection Angle", subtype='ANGLE', default=0.0,
+        description="Turns the projected image about the beam axis (the "
+                    "slide's centre) -- the Angle of 3ds Max's projector-map "
+                    "Coordinates rollout; applied before the tiling and the "
+                    "offset, identically on both devices. 0 = untouched")
+    light_style: EnumProperty(
+        name="Light Style", items=LIGHT_STYLE, default='NORMAL',
+        description="Quake's lightstyle flicker: one of the twelve "
+                    "worldspawn strings of world.qc, stepped Rate characters "
+                    "per second of scene time ('a' = dark, 'm' = the lamp's "
+                    "Energy exactly, 'z' = double), the same for the "
+                    "surfaces, the beam, the flare and the fog lobe. Normal "
+                    "is steady and bitwise the lamp without a style")
+    light_style_rate: FloatProperty(
+        name="Style Rate", default=10.0, min=0.1, max=60.0,
+        description="Characters of the light style string per second of "
+                    "scene time; Quake advanced its styles ten per second "
+                    "(R_AnimateLight's cl.time * 10). Deterministic from the "
+                    "frame and the scene's frame rate on both devices")
 
 
 def _col(name, default, desc=''):

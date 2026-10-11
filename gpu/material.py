@@ -456,7 +456,16 @@ def _generated_frame(src, consts, force_line=False, world_table=False):
 #: R251 LIGHT-B1: 8 texels per light -- 4 = (spot_exponent, cr, a0, a1)
 #: and 5.x = a2 (F012), 5.yz = the GX (k1, k2) (F013), 6 = (cx, cy, w,
 #: h) and 7 = (start, aext, 0, 0) the Model 3 screen spotlight (F015)
-LIGHT_TEXEL_STRIDE = 8
+#: R253 light options: 16 texels per light (texels 0-7 untouched; every
+#: reader goes through _lref / the symbol, so the bump moves no bit) --
+#:   t8  = (specular_color.rgb,     decay_near_start)
+#:   t9  = (hemi_ground.rgb,        near_span = near_end - near_start)
+#:   t10 = (lamp frame side.xyz from LI.cookie_frame, 0)   (SPOT only)
+#:   t11 = (lamp frame up.xyz,                        0)   (SPOT only)
+#:   t12-15 reserved (zeros)
+#: The style gain (H) is folded into texel 0.w: the SAME python double
+#: the CPU's sample() scales by, so the texel is bitwise its scale.
+LIGHT_TEXEL_STRIDE = 16
 
 
 def pack_light_texels(lights, job=None):
@@ -489,7 +498,11 @@ def pack_light_texels(lights, job=None):
         b = i * LIGHT_TEXEL_STRIDE
         kind = getattr(light, 'type', 'POINT')
         sign = -1.0 if getattr(light, 'negative', False) else 1.0
-        energy = float(getattr(light, 'energy', 1.0))
+        # R253 (H): the light style's gain -- BEFORE the np.float32 of
+        # the /4pi scale, so the texel is the CPU's own float32 (x 1.0
+        # is exact: NORMAL moves no bit)
+        energy = float(getattr(light, 'energy', 1.0)) \
+            * float(getattr(light, 'style_gain', 1.0))
         if kind in ('SUN', 'HEMI'):
             d = np.asarray(light.direction, np.float32)
             d = d / max(float(np.linalg.norm(d)), 1e-9)
@@ -568,6 +581,25 @@ def pack_light_texels(lights, job=None):
             k1, k2 = LI.gx_dist_coeffs(light, dmode)
             out[0, b + 5, 1] = k1
             out[0, b + 5, 2] = k2
+        # R253 light options: texels 8-11 for every lamp (the values
+        # are harmless where the structure bit is off -- no block reads
+        # them). The same expressions the CPU evaluates: the specular
+        # tint and the ground colour as float32, the near pair as the
+        # float32 of the python doubles near_attenuation takes
+        out[0, b + 8, :3] = np.asarray(
+            getattr(light, 'specular_color', (1.0, 1.0, 1.0)), np.float32)
+        _ns = float(getattr(light, 'decay_near_start', 0.0) or 0.0)
+        _ne = float(getattr(light, 'decay_near_end', 0.0) or 0.0)
+        out[0, b + 8, 3] = np.float32(_ns)
+        out[0, b + 9, :3] = np.asarray(
+            getattr(light, 'hemi_ground', (0.0, 0.0, 0.0)), np.float32)
+        out[0, b + 9, 3] = np.float32(_ne - _ns)
+        if kind == 'SPOT':
+            # (A) the lamp's side / up axes for the Square cone,
+            # exactly square_cos's frame
+            _sq_s, _sq_u, _sq_f = LI.cookie_frame(light)
+            out[0, b + 10, :3] = np.asarray(_sq_s, np.float32)
+            out[0, b + 11, :3] = np.asarray(_sq_u, np.float32)
     return out
 
 
@@ -650,6 +682,13 @@ def decay_law_glsl(mode, r):
             lines.append('    at_q = at_q * at_q;')
         lines += ['    float at_s = 1.0 + at_q;',
                   '    float att = 2.0 / at_s;']
+        return lines
+    if mode in ('NOMINAL_INVERSE', 'NOMINAL_INV_SQUARE'):
+        # R253 (D): (D/d)^n, statement for statement lights.decay_law
+        lines += ['    float at_dq = max(dm, 1e-6);',
+                  f'    float att = {r["D"]} / at_dq;']
+        if mode == 'NOMINAL_INV_SQUARE':
+            lines.append('    att = att * att;')
         return lines
     ka, kb = (r['ld1'], r['ld2']) if mode == 'GL_3TERM' else (r['k1'],
                                                               r['k2'])
@@ -1062,6 +1101,27 @@ def _cookie_function(i, spec):
     L = [f'uniform sampler2D hal_cookie{i};',
          f'vec3 hal_cookie_rgb{i}(vec2 uv)',
          '{']
+    xf = spec.get('xform')
+    if xf is not None:
+        # R253 (G): the projector map's Coordinates rollout -- the
+        # CPU's cookie_xform statements on `uv` BEFORE the CLIP test
+        # (the gate reads the transformed slide), literals in the
+        # cookie road's own convention (side/up/strength are literals)
+        ox, oy, tx, ty, c, s_ = (_f(v) for v in xf)
+        L += ['    float ck_u = uv.x - 0.5;',
+              '    float ck_v = uv.y - 0.5;',
+              f'    float ck_u2 = ck_u * {c};',
+              f'    float ck_t = ck_v * {s_};',
+              '    ck_u2 = ck_u2 - ck_t;',
+              f'    float ck_v2 = ck_u * {s_};',
+              f'    float ck_t2 = ck_v * {c};',
+              '    ck_v2 = ck_v2 + ck_t2;',
+              f'    ck_u2 = ck_u2 * {tx};',
+              f'    ck_v2 = ck_v2 * {ty};',
+              '    uv.x = ck_u2 + 0.5;',
+              f'    uv.x = uv.x + {ox};',
+              '    uv.y = ck_v2 + 0.5;',
+              f'    uv.y = uv.y + {oy};']
     if ext == 'CLIP':
         # the CPU zeroes every out-of-square lookup after sampling;
         # returning early is the same value for less work
@@ -2696,7 +2756,8 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
             # form factor -- exactly the CPU sample()'s area branch
             lines.append('    float att = 1.0;')
         elif dmode in ('GL_3TERM', 'POV_FADE_LINEAR', 'POV_FADE_SQUARE',
-                       'GX_GENTLE', 'GX_MEDIUM', 'GX_STEEP'):
+                       'GX_GENTLE', 'GX_MEDIUM', 'GX_STEEP',
+                       'NOMINAL_INVERSE', 'NOMINAL_INV_SQUARE'):
             # R251 F013: the GL / POV / GX decay laws, one op per
             # statement, exactly lights.decay_law (the mode is already
             # _light_sig structure; D, the sliders and the GX
@@ -2726,6 +2787,23 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
             lines.append(
                 f'    float att = '
                 f'{_attenuation(light, consts["falloff_default"], refs=refs)};')
+        _ns = float(getattr(light, 'decay_near_start', 0.0) or 0.0)
+        _ne = float(getattr(light, 'decay_near_end', 0.0) or 0.0)
+        if _ne > _ns and kind != 'AREA':
+            # R253 (E): 3ds Max's Near Attenuation after `att` is final
+            # (the decay law and its Sphere wrap) and BEFORE the BI
+            # snap -- statement for statement lights.near_attenuation.
+            # Whether the pair is live is _light_sig structure; the
+            # distances are texels 8.w / 9.w (a drag re-uploads)
+            if use_tx:
+                _nsr, _nspan = _lref(i, 8, 'w'), _lref(i, 9, 'w')
+            else:
+                _nsr, _nspan = _f(np.float32(_ns)), _f(np.float32(_ne - _ns))
+            lines += ['    float at_dm = max(dist, 0.0);',
+                      f'    float at_nt = at_dm - {_nsr};',
+                      f'    at_nt = at_nt / {_nspan};',
+                      '    at_nt = clamp(at_nt, 0.0, 1.0);',
+                      '    att = att * at_nt;']
         if mode_bi and kind not in ('SPOT', 'AREA'):
             # lamp_get_visibility's tail: visifac <= 0.001 snaps to 0
             lines.append('    att = (att <= 0.001) ? 0.0 : att;')
@@ -2743,6 +2821,29 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
             bl_r = _lref(i, 2, 'w') if use_tx else _f(spotbl)
             law = str(getattr(light, 'spot_law', 'BLENDER') or 'BLENDER')
             lines.append(f'    float cosang = -dot(L, {sd_r});')
+            if getattr(light, 'spot_square', False):
+                # R253 (A): BI's LA_SQUARE, statement for statement
+                # lights.square_cos -- the cosine along the wider side
+                # replaces cosang and the cone-law lines below read it
+                # unchanged. The frame rides texels 10 / 11 (the
+                # packer's LI.cookie_frame); the flag is structure
+                if use_tx:
+                    _sq_sr, _sq_ur = _lref(i, 10, 'xyz'), _lref(i, 11, 'xyz')
+                else:
+                    from ..core import lights as _LIsq
+                    _sqs, _squ, _sqf = _LIsq.cookie_frame(light)
+                    _sq_sr, _sq_ur = _v3(_sqs), _v3(_squ)
+                lines += [f'    float sq_x = -dot(L, {_sq_sr});',
+                          f'    float sq_y = -dot(L, {_sq_ur});',
+                          '    float sq_zz = max(cosang, 1e-20);',
+                          '    float sq_ax = abs(sq_x / sq_zz);',
+                          '    float sq_ay = abs(sq_y / sq_zz);',
+                          '    float sq_m = max(sq_ax, sq_ay);',
+                          '    float sq_q = sq_m * sq_m;',
+                          '    sq_q = 1.0 + sq_q;',
+                          '    float sq_r = sqrt(sq_q);',
+                          '    float sq_c = 1.0 / sq_r;',
+                          '    cosang = (cosang > 0.0) ? sq_c : 0.0;']
             if law in ('GL11', 'POV', 'GX_FLAT', 'GX_COS', 'GX_COS2',
                        'GX_SHARP', 'GX_RING1', 'GX_RING2'):
                 # R251 F012: the OpenGL 1.1 / POV-Ray / GX cone laws,
@@ -3016,8 +3117,40 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
             # shaders whose diffuse carries its own colour
             lines.append('    hal_dcon += (ds.x * hal_dif_rgb * '
                          's.diffuse_level) * rad;')
+        _hg = tuple(getattr(light, 'hemi_ground', (0.0, 0.0, 0.0))
+                    or (0.0, 0.0, 0.0))
+        if kind == 'HEMI' and max(_hg) > 0.0:
+            # R253 (C): the two-tone hemisphere's GROUND term, exactly
+            # light_surface's: (1 - wrap) times the diffuse colour and
+            # level times ground x (sign * energy * gain) -- texel 9.rgb
+            # times texel 0.w (the SUN/HEMI energy the packer writes),
+            # no cookie. A black ground emits no line.
+            _hcol = 'hal_dcol' if (rd is not None
+                                   and rd.get('input') != 'RESULT') \
+                else 'hal_dif_rgb'
+            if use_tx:
+                lines.append(f'    vec3 rad_g = {_lref(i, 9, "rgb")} * '
+                             f'{_lref(i, 0, "w")};')
+            else:
+                _hsg = -1.0 if getattr(light, 'negative', False) else 1.0
+                lines.append(f'    vec3 rad_g = {_v3(_hg)} * '
+                             f'{_f(_hsg * energy)};')
+            lines.append(f'    hal_dcon += ((1.0 - ds.x) * {_hcol} * '
+                         's.diffuse_level) * rad_g;')
     if not anime and getattr(light, 'affect_specular', True) and \
             not getattr(light, 'diffuse_only', False):
+        # R253 (B): the lamp's Specular Colour -- texel 8.rgb times rad,
+        # substituted into the two lobe lines ONLY when the tint is not
+        # white (structure: _light_sig); at the default no line is
+        # emitted and the text is the 1.91 text. Sheen keeps `rad`.
+        _sct = tuple(getattr(light, 'specular_color', (1.0, 1.0, 1.0))
+                     or (1.0, 1.0, 1.0))
+        if tuple(float(v) for v in _sct) != (1.0, 1.0, 1.0):
+            _sref = _lref(i, 8, 'rgb') if use_tx else _v3(_sct)
+            lines.append(f'    vec3 rad_s = rad * {_sref};')
+            rs = 'rad_s'
+        else:
+            rs = 'rad'
         spec = 'ds.yzw'
         if rs_ is not None and rs_.get('input') != 'RESULT':
             # recover the shader scalar from the coloured return (spec =
@@ -3049,9 +3182,9 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
         if bake.get('__level_free'):
             # R243: Strauss has no Specular Level in Max, Multi-Layer
             # applies its two levels inside -- the loop scales by nothing
-            lines.append(f'    hal_scon += {spec} * rad;')
+            lines.append(f'    hal_scon += {spec} * {rs};')
         else:
-            lines.append(f'    hal_scon += {spec} * s.specular_level * rad;')
+            lines.append(f'    hal_scon += {spec} * s.specular_level * {rs};')
         if float(bake.get('sheen', 0.0)) > 1e-4:
             # the velvet lobe, exactly as light_surface: scattered back at
             # grazing angles, needing a light, vanishing face-on

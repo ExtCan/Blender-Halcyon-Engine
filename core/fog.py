@@ -674,8 +674,11 @@ def spot_fog_of(job, px, py, depth):
                                    scene.camera)
         en, el, _lobe = LI.screen_spot_lobe(px, py, depth, *pr)
         sign = -1.0 if getattr(light, 'negative', False) else 1.0
+        # R253 (H): the style gain rides the energy (x 1.0 is exact)
         col = np.asarray(light.color, np.float32) * np.float32(
-            sign * float(light.energy) / (4.0 * np.pi))
+            sign * (float(light.energy)
+                    * float(getattr(light, 'style_gain', 1.0)))
+            / (4.0 * np.pi))
         sf = col[None, :] * (en * el)[:, None]
         acc = sf.astype(np.float32) if acc is None \
             else (acc + sf).astype(np.float32)
