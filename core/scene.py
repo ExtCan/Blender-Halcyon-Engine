@@ -764,6 +764,15 @@ def material_see_through(mat):
     opacity = float(getattr(mat, 'opacity', 1.0))
     if opacity < 0.999:
         return f'Opacity {opacity:.3f}'
+    graph = getattr(mat, 'graph', None)
+    if graph:
+        # R253 (review): a console TYPE can pin the opacity below 1 with
+        # its socket hidden at 1.0 (the Saturn mesh) -- the split and the
+        # layer plan must see it on both roads, exported or hand-built
+        from . import console as _console
+        pinned = _console.pinned_alpha_reason(graph)
+        if pinned:
+            return pinned
     if getattr(mat, 'has_alpha', False):
         return str(getattr(mat, 'alpha_why', None)
                    or 'flagged see-through on export')

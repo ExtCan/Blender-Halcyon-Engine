@@ -41,6 +41,8 @@ def run_tests():
     from . import test_r253_mapping
     # R253 (1.92.0): the eight period lamp options
     from . import test_r253_light_options
+    # R253 (1.92.0): the review fixes
+    from . import test_r253_review
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -179,6 +181,11 @@ def run_tests():
           'LIGHT STYLES)')
     print('=' * 66)
     rc |= test_r253_light_options.main()
+    print()
+    print('=' * 66)
+    print('R253 REVIEW FIXES')
+    print('=' * 66)
+    rc |= test_r253_review.main()
     return rc
 
 

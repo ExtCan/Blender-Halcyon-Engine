@@ -2780,6 +2780,40 @@ def fog_for_points(job, tri_idx, bary, rgb, px=None, py=None, surf=None,
 # --------------------------------------------------------- fragment shading
 
 
+_SINGULAR_SAID = set()
+
+
+def object_inverse(m, obj=None):
+    """R253 (review): the per-object inverse world matrix for the
+    object-space roads (Object coordinates, the R253 Generated frame).
+    A zero scale on any axis -- a plane flattened with Scale Z 0, an
+    animated scale passing through 0 -- is SINGULAR and np.linalg.inv
+    raised out of the whole frame on both devices; the pseudo-inverse
+    takes the world point back onto the object's collapsed plane
+    instead, printed once by name, and the frame draws."""
+    if m is None:
+        return np.eye(4, dtype=np.float32)
+    mw = np.asarray(m, np.float32)
+    try:
+        inv = np.linalg.inv(mw)
+        if np.all(np.isfinite(inv)):
+            return inv.astype(np.float32)
+    except np.linalg.LinAlgError:
+        pass
+    name = str(getattr(obj, 'name', None) or '?')
+    if name not in _SINGULAR_SAID:
+        _SINGULAR_SAID.add(name)
+        print(f"[Halcyon] object '{name}': its matrix is singular (a zero "
+              "scale on some axis); object-space coordinates read it "
+              "through the pseudo-inverse")
+    try:
+        inv = np.linalg.pinv(mw.astype(np.float64)).astype(np.float32)
+    except np.linalg.LinAlgError:
+        inv = np.eye(4, dtype=np.float32)
+    inv[~np.isfinite(inv)] = 0.0
+    return inv
+
+
 class ShadeJob:
     """Everything needed to shade an arbitrary set of surface points."""
 
@@ -2954,8 +2988,7 @@ class ShadeJob:
                 mats = []
                 for o in objs:
                     m = o.matrix_world
-                    mats.append(np.linalg.inv(np.asarray(m, np.float32))
-                                if m is not None else np.eye(4, dtype=np.float32))
+                    mats.append(object_inverse(m, o))
                 self._obj_matrices = np.stack(mats)
             else:
                 self._obj_matrices = np.eye(4, dtype=np.float32)[None]
@@ -2977,8 +3010,7 @@ class ShadeJob:
             mats = []
             for o in self.scene.objects:
                 m = o.matrix_world
-                mats.append(np.linalg.inv(np.asarray(m, np.float32))
-                            if m is not None else np.eye(4, dtype=np.float32))
+                mats.append(object_inverse(m, o))
             self._obj_matrices = np.stack(mats)
         # R253: the object-space Generated frame (reads the matrices)
         self.object_generated_frame()
@@ -3334,8 +3366,7 @@ class ShadeJob:
             mats = []
             for o in objs:
                 m = o.matrix_world
-                mats.append(np.linalg.inv(np.asarray(m, np.float32))
-                            if m is not None else np.eye(4, dtype=np.float32))
+                mats.append(object_inverse(m, o))
             self._obj_matrices = np.stack(mats)
         ctx._obj_mats = self._obj_matrices
         ctx._obj_idx = oi
@@ -3374,6 +3405,91 @@ class ShadeJob:
                 sub.spy = np.asarray(spy, np.int64)[sel]
             out[sel] = self.shade_batch(sub, mat, ray_depth, rng)
         return out
+
+    def _alpha_law(self, alpha, surf, ctx, st):
+        """R253 (review): the ONE alpha law of the camera pass -- the
+        punch-through clip, the Screen Door compare, Transparency None
+        -- factored so the corner road's ALBEDO pass applies it too: a
+        vertex- or face-rate material (every console machine) returned
+        its raw fractional opacity before this, so under Screen Door the
+        Saturn mesh never drew its checkerboard and a CLIP cut-out kept
+        a soft edge the pixel road would have punched."""
+        if np.any(surf.alpha_clip >= 0.0):
+            # R211 punch-through: a CLIP material is either fully there
+            # or fully absent -- the era's cut-out alpha test, and the
+            # SAME hard law on every road (camera pass, blend layers,
+            # ray hits), so whichever road drew the surface agrees on
+            # where its holes are
+            # R251 C031 (PS2 GS AFAIL / GX alpha compare): a Clip+Blend
+            # material keeps its SUB-threshold alpha (the blend half,
+            # drawn a second time as a layer with no depth write) and
+            # forces 1.0 above it (the opaque half, promoted in the
+            # z-pass exactly as CLIP); `surf.alpha_soft` carries the mode
+            # PER FRAGMENT because the vertex/face roads batch across
+            # materials. CLIP keeps its hard 0/1.
+            cm = surf.alpha_clip >= 0.0
+            alpha = np.where(
+                cm,
+                np.where(alpha >= np.maximum(surf.alpha_clip, 1e-6),
+                         1.0, np.where(surf.alpha_soft > 0.5, alpha, 0.0)),
+                alpha).astype(np.float32)
+        if st.transparency == 'STIPPLE' and ctx.px is not None:
+            # keep or drop each pixel outright against an ordered threshold --
+            # no blending, exactly as hardware without an alpha unit managed it
+            from .dither import ORDERED, threshold_map
+            kind = str(getattr(st, 'stipple_pattern', 'BAYER4') or '')
+            if kind == 'N64_NOISE':
+                # R251 C015 (N64 RDP dither_alpha_en): the compare is
+                # the RDP's integer one -- round(alpha * 255) against a
+                # FRESH 8-bit random per (pixel, frame, seed), a FULL-
+                # FRAME map (never tiled) built once per (H, W, frame,
+                # seed) and shared by every shading chunk (a double
+                # build in two threads is bitwise the same map, never a
+                # lock). a8 > r8 exactly as angrylion's alpha_compare;
+                # a tie DROPS. The GPU uploads this very array
+                frame_n = int(getattr(self.scene, 'frame', 1) or 1)
+                seed_n = int(getattr(st, 'seed', 0) or 0)
+                nkey = (int(self.height), int(self.width), frame_n,
+                        seed_n)
+                ncache = getattr(self, '_r251_noise_maps', None)
+                if ncache is None:
+                    ncache = self._r251_noise_maps = {}
+                tm = ncache.get(nkey)
+                if tm is None:
+                    tm = threshold_map('N64_NOISE', nkey[0], nkey[1],
+                                       frame=frame_n, seed=seed_n)
+                    ncache.clear()
+                    ncache[nkey] = tm
+                thr = tm[np.asarray(ctx.py), np.asarray(ctx.px)]
+                a8 = np.round(np.asarray(alpha, np.float32)
+                              * np.float32(255))
+                alpha = np.where(a8 > thr, 1.0, 0.0)
+                kind = None
+            elif ORDERED.get(kind) is None:
+                # R251: `stipple_pattern` is a free string, so a preset
+                # dict or a script can carry an error-diffusion kind past
+                # the enum, and Blender hands the exporter '' for a
+                # stored number no item carries (a scene saved before
+                # 1.90.0 with Screen Door at None). Bayer 4x4, by name,
+                # once per job (the GPU's `_build_stipple` takes the
+                # same fallback so both devices bake the same map)
+                if not getattr(self, '_r251_stipple_said', False):
+                    print(f'[Halcyon] transparency: stipple pattern '
+                          f'{kind!r} is not an ordered map; Bayer 4x4 '
+                          'used (an error-diffusion kind, or a scene '
+                          'saved before 1.90.0 with Screen Door at None, '
+                          'reads back as this)')
+                    self._r251_stipple_said = True
+                kind = 'BAYER4'
+            if kind is not None:
+                tm = threshold_map(kind, 64, 64)
+                thr = tm[np.asarray(ctx.py) % tm.shape[0],
+                         np.asarray(ctx.px) % tm.shape[1]]
+                alpha = np.where(alpha > np.asarray(thr, np.float32),
+                                 1.0, 0.0)
+        elif st.transparency == 'NONE':
+            alpha = np.ones_like(alpha)
+        return alpha
 
     def shade_batch(self, ctx, mat, ray_depth=0, rng=None):
         st = self.settings
@@ -3417,6 +3533,7 @@ class ShadeJob:
                 _as = np.maximum(surf.alpha_steps, 1.0)
                 _op = np.where(surf.alpha_steps > 0.5,
                                np.floor(_op * _as + 0.5) / _as, _op)
+            _op = self._alpha_law(np.asarray(_op, np.float32), surf, ctx, st)
             return np.concatenate(
                 [alb, _op[:, None]], axis=1).astype(np.float32)
         if rate_mode == 'LIGHT':
@@ -3554,81 +3671,7 @@ class ShadeJob:
                                           -M.normalize(ctx.I))), 0.0, 1.0)
             t = np.power(1.0 - facing, np.maximum(surf.fresnel_power, 0.01))
             alpha = np.clip(alpha * (1.0 - t) + surf.edge_opacity * t, 0.0, 1.0)
-        if np.any(surf.alpha_clip >= 0.0):
-            # R211 punch-through: a CLIP material is either fully there
-            # or fully absent -- the era's cut-out alpha test, and the
-            # SAME hard law on every road (camera pass, blend layers,
-            # ray hits), so whichever road drew the surface agrees on
-            # where its holes are
-            # R251 C031 (PS2 GS AFAIL / GX alpha compare): a Clip+Blend
-            # material keeps its SUB-threshold alpha (the blend half,
-            # drawn a second time as a layer with no depth write) and
-            # forces 1.0 above it (the opaque half, promoted in the
-            # z-pass exactly as CLIP); `surf.alpha_soft` carries the mode
-            # PER FRAGMENT because the vertex/face roads batch across
-            # materials. CLIP keeps its hard 0/1.
-            cm = surf.alpha_clip >= 0.0
-            alpha = np.where(
-                cm,
-                np.where(alpha >= np.maximum(surf.alpha_clip, 1e-6),
-                         1.0, np.where(surf.alpha_soft > 0.5, alpha, 0.0)),
-                alpha).astype(np.float32)
-        if st.transparency == 'STIPPLE' and ctx.px is not None:
-            # keep or drop each pixel outright against an ordered threshold --
-            # no blending, exactly as hardware without an alpha unit managed it
-            from .dither import ORDERED, threshold_map
-            kind = str(getattr(st, 'stipple_pattern', 'BAYER4') or '')
-            if kind == 'N64_NOISE':
-                # R251 C015 (N64 RDP dither_alpha_en): the compare is
-                # the RDP's integer one -- round(alpha * 255) against a
-                # FRESH 8-bit random per (pixel, frame, seed), a FULL-
-                # FRAME map (never tiled) built once per (H, W, frame,
-                # seed) and shared by every shading chunk (a double
-                # build in two threads is bitwise the same map, never a
-                # lock). a8 > r8 exactly as angrylion's alpha_compare;
-                # a tie DROPS. The GPU uploads this very array
-                frame_n = int(getattr(self.scene, 'frame', 1) or 1)
-                seed_n = int(getattr(st, 'seed', 0) or 0)
-                nkey = (int(self.height), int(self.width), frame_n,
-                        seed_n)
-                ncache = getattr(self, '_r251_noise_maps', None)
-                if ncache is None:
-                    ncache = self._r251_noise_maps = {}
-                tm = ncache.get(nkey)
-                if tm is None:
-                    tm = threshold_map('N64_NOISE', nkey[0], nkey[1],
-                                       frame=frame_n, seed=seed_n)
-                    ncache.clear()
-                    ncache[nkey] = tm
-                thr = tm[np.asarray(ctx.py), np.asarray(ctx.px)]
-                a8 = np.round(np.asarray(alpha, np.float32)
-                              * np.float32(255))
-                alpha = np.where(a8 > thr, 1.0, 0.0)
-                kind = None
-            elif ORDERED.get(kind) is None:
-                # R251: `stipple_pattern` is a free string, so a preset
-                # dict or a script can carry an error-diffusion kind past
-                # the enum, and Blender hands the exporter '' for a
-                # stored number no item carries (a scene saved before
-                # 1.90.0 with Screen Door at None). Bayer 4x4, by name,
-                # once per job (the GPU's `_build_stipple` takes the
-                # same fallback so both devices bake the same map)
-                if not getattr(self, '_r251_stipple_said', False):
-                    print(f'[Halcyon] transparency: stipple pattern '
-                          f'{kind!r} is not an ordered map; Bayer 4x4 '
-                          'used (an error-diffusion kind, or a scene '
-                          'saved before 1.90.0 with Screen Door at None, '
-                          'reads back as this)')
-                    self._r251_stipple_said = True
-                kind = 'BAYER4'
-            if kind is not None:
-                tm = threshold_map(kind, 64, 64)
-                thr = tm[np.asarray(ctx.py) % tm.shape[0],
-                         np.asarray(ctx.px) % tm.shape[1]]
-                alpha = np.where(alpha > np.asarray(thr, np.float32),
-                                 1.0, 0.0)
-        elif st.transparency == 'NONE':
-            alpha = np.ones_like(alpha)
+        alpha = self._alpha_law(alpha, surf, ctx, st)
         if extras is not None and 'only_shadow' in extras and \
                 np.any(surf.shadows_only > 0.5):
             # Shadow > Shadows Only: the classic catcher. The material

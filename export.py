@@ -14,6 +14,7 @@ from . import compat
 from .core.scene import (Camera, ImageBuffer, Light, Material, MeshData,
                          ObjectInfo, Scene, World)
 from .shaders.compiler import try_compile
+from .core import console as _console
 
 SOCKET_KIND = {
     'VALUE': 'VALUE', 'INT': 'VALUE', 'BOOLEAN': 'VALUE',
@@ -812,6 +813,12 @@ def _alpha_reason(mat, m):
             # here. Neutral at the nodes' default Opacity 1.0 unlinked.
             names = ('Opacity', 'Edge Opacity') \
                 if idn == 'HALCYON_ConsoleShaderNode' else ('Opacity',)
+            if idn == 'HALCYON_ConsoleShaderNode':
+                # R253 (review): a TYPE can pin the opacity below 1 with
+                # the socket hidden at 1.0 (the Saturn mesh)
+                pinned = _console.pinned_alpha_reason(m.graph)
+                if pinned:
+                    return pinned
             for s in node['inputs']:
                 sname = s.get('identifier') or s['name']
                 if sname not in names and s['name'] not in names:

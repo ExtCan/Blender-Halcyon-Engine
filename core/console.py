@@ -861,6 +861,29 @@ def console_node(graph):
     return None
 
 
+def pinned_alpha_reason(graph):
+    """R253 (review): the see-through reason a console TYPE pins without
+    any socket saying so -- the Saturn mesh colour calculation draws every
+    other pixel (opacity 0.5 in resolve()) while its hidden Opacity socket
+    reads 1.0, so the alpha classifiers (export._alpha_reason, the split's
+    material_see_through) saw an opaque material and the half-transparent
+    polygon never reached the transparent pass. None when nothing is
+    pinned below 1."""
+    node = console_node(graph)
+    if node is None:
+        return None
+    try:
+        res = resolve(node.get('props') or {})
+    except Exception:                                           # noqa: BLE001
+        return None
+    op = res.get('opacity')
+    if op is None or float(op) >= 0.999:
+        return None
+    props = node.get('props') or {}
+    return (f"{label_of(props)} pins Opacity {float(op):.3f} "
+            "(the colour calculation, not a socket)")
+
+
 def label_of(props):
     """'<machine> / <type>' for the UI's material list."""
     p = props or {}
