@@ -2176,7 +2176,7 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
         if hal.convert_detection == 'SET':
             det.prop(hal, 'convert_model', text="")
         _model = 'AUTO' if hal.convert_detection == 'AUTO' \
-            else hal.convert_model
+            else (hal.convert_model or 'AUTO')
         col = box.column(align=True)
         op = col.operator('halcyon.convert_materials', text="Convert This Material",
                           icon='MATERIAL')

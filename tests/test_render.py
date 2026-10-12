@@ -27150,7 +27150,10 @@ def test_convert_shader_detection_option():
                   'AUTO')
     check('AUTO detection still detects (Toon -> TOON)',
           p_auto['model'] == 'TOON', p_auto['model'])
-    for forced in ('LAMBERT', 'ANIME', 'COOK_TORRANCE'):
+    # R253: the Set list is the master's own menu (ANIME moved to its
+    # node in 1.91); a moved or stale model reads as AUTO (pinned in
+    # tests/test_r253_review), so the forced three are master models
+    for forced in ('LAMBERT', 'MINNAERT', 'COOK_TORRANCE'):
         p = plan('ShaderNodeBsdfToon',
                  {'Color': [1, 0, 0, 1], 'Roughness': 0.3}, set(),
                  forced)

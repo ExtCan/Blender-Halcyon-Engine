@@ -167,8 +167,23 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
         # mid-flight finishes first (they are sub-second), then this
         # render owns the pipeline for its duration -- viewport frames
         # that arrive meanwhile render on the CPU and say so
+        held = False
         if gpu_dev:
-            _marshal.PIPELINE.acquire()
+            # R253 (field): a BLOCKING acquire with no bound could park
+            # this render job forever behind a viewport frame that never
+            # released the lock (a worker that died mid-frame) -- and a
+            # render job that never ends greys every redo panel and
+            # refuses undo / redo for the whole session (Blender refuses
+            # both while a scene job runs). Bounded: past the wait this
+            # frame shades on the CPU and says why
+            held = _marshal.PIPELINE.acquire(timeout=30.0)
+            if not held:
+                print('[Halcyon] render: the GPU pipeline is held by a '
+                      'viewport frame that did not finish in 30 s; this '
+                      'render shades on the CPU')
+                settings.render_device = 'CPU'
+                gpu_dev = False
+                marshalled = False
         if marshalled:
             _marshal.enable()
         try:
@@ -177,7 +192,7 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
         finally:
             if marshalled:
                 _marshal.disable()
-            if gpu_dev:
+            if held:
                 _marshal.PIPELINE.release()
 
     def _render_body(self, depsgraph, bscene, tw, th, preview, settings,

@@ -125,7 +125,12 @@ def convert_material(mat, model='AUTO', keep_original=True, force=False):
     notes.extend(p['notes'])
 
     master = tree.nodes.new(MASTER_NODE)
-    master.model = p['model']
+    try:
+        master.model = p['model']
+    except (TypeError, ValueError):
+        # a model the node's menu no longer carries: the node keeps its
+        # default rather than the whole conversion raising
+        pass
     if source is not None:
         master.location = (source.location.x, source.location.y)
         master.label = f"from {source.bl_label}"
@@ -881,6 +886,11 @@ def _pristine_default(mat):
         return False
 
 
+#: (name, session_uid) of every material the watcher converted this
+#: session -- an undo that restores the pristine tree is the user's call
+_HANDLER_CONVERTED = set()
+
+
 def _halcyon_default_material(scene, depsgraph):
     """depsgraph_update_post: fresh default materials become Halcyon.
 
@@ -898,8 +908,19 @@ def _halcyon_default_material(scene, depsgraph):
             if mid is None or not isinstance(mid, bpy.types.Material):
                 continue
             mat = bpy.data.materials.get(mid.name)
-            if mat is not None and _pristine_default(mat):
-                convert_material(mat, keep_original=False, force=True)
+            if mat is None or not _pristine_default(mat):
+                continue
+            # R253 (field): ONCE per material. The conversion lands
+            # AFTER the operator's undo push (handlers run on the next
+            # depsgraph pass), so Ctrl+Z restored the pristine tree and
+            # this handler converted it straight back -- undo looked
+            # broken. A material this handler already converted is left
+            # as the user put it
+            key = (mid.name, getattr(mid, 'session_uid', None))
+            if key in _HANDLER_CONVERTED:
+                continue
+            _HANDLER_CONVERTED.add(key)
+            convert_material(mat, keep_original=False, force=True)
     except Exception:                                           # noqa: BLE001
         pass
 

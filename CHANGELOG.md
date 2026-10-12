@@ -4,7 +4,7 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
 
 ---
 
-## [1.92.0] — 2026-10-11
+## [1.92.0] — 2026-10-12
 
 ### The feature round: render region, cube map world, generated coordinates, converters, passes, the Halo node, mapping, lights, terrain, console presets (R253)
 
@@ -1422,6 +1422,28 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   Generated.z; `_gen_span` gives a flat axis of a TRANSFORMED object the
   span 1.0 (it reads within 1e-6 of 0) while an identity object keeps the
   1.91 clamp bit for bit.
+- **The field's greyed redo panels and refused undo / redo (hardened).**
+  Blender's own rule (`WM_operator_check_ui_enabled`, `ed_undo_step_pre`):
+  every Adjust Last Operation panel is disabled and undo / redo are
+  refused while a non-background job owned by the scene is running, or
+  while the operator's undo step is gone. Three things in the add-on
+  could feed that and are closed: (1) the F12 render acquired the GPU
+  pipeline lock with NO bound, so a viewport frame that never released
+  it parked the render job for the whole session -- `engine.render`
+  waits 30 s, then shades on the CPU and says so; (2) the
+  pristine-material watcher (`convert._halcyon_default_material`) runs
+  on the depsgraph pass AFTER the operator's undo push, so Ctrl+Z
+  restored the pristine tree and the watcher converted it straight back
+  (undo looked broken) -- it converts each material ONCE per session
+  (`_HANDLER_CONVERTED`); (3) a 1.90 scene saved with Detection=Set and
+  a model that moved off the master menu reads the model back as '',
+  which `core/convert.plan` passed through verbatim and `master.model =
+  ''` raised inside every Convert button, leaving an unlinked master
+  node per click -- anything but a master model is AUTO now, the node's
+  model assignment is guarded, and the panel never pushes an empty
+  model (the review's confirmed finding). The field's diagnostic is the
+  jobs list: `bpy.app.is_job_running` for RENDER / COMPOSITE /
+  OBJECT_BAKE names the job that holds the panel.
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon

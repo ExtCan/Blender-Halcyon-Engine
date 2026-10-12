@@ -38,6 +38,7 @@ pinned where it bit.
     1.0 (an identity object keeps the 1.91 bits).
 """
 import io
+import os
 import sys
 import traceback
 import types
@@ -345,6 +346,33 @@ def test_generated_frame_signature_and_flat_axis():
     check('_gen_span: identity keeps max(extent, 1e-6), a transform gives a flat axis 1.0',
           bool(np.array_equal(R._gen_span(np.array([2.0, 0.0, 3.0], f32), True), np.array([2.0, 1e-6, 3.0], f32)))
           and bool(np.array_equal(R._gen_span(np.array([2.0, 0.0, 3.0], f32), False), np.array([2.0, 1.0, 3.0], f32))))
+
+
+def test_field_hardening_f9_and_undo():
+    """The field report (every redo panel greyed, undo / redo refused):
+    Blender refuses both while a scene-owned job runs or the step is
+    gone. The render job can no longer hang on the pipeline lock, the
+    pristine-material watcher converts a material once, and a stale
+    Set-Shader model no longer makes every Convert button raise."""
+    import inspect
+    from ..core import convert as CC
+    from ..core.shading import MASTER_MODELS
+    p = CC.plan('ShaderNodeBsdfPrincipled', {}, set(), '')
+    check("plan() with the stale '' model chooses a master model (AUTO)", p['model'] in MASTER_MODELS, str(p['model']))
+    p2 = CC.plan('ShaderNodeBsdfPrincipled', {}, set(), 'GX_LIGHT')
+    check('plan() with a moved model (GX_LIGHT) reads as AUTO', p2['model'] in MASTER_MODELS, str(p2['model']))
+    p3 = CC.plan('ShaderNodeBsdfPrincipled', {}, set(), 'PHONG')
+    check('plan() with a master model keeps it', p3['model'] == 'PHONG')
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    esrc = open(os.path.join(root, 'engine.py'), encoding='utf-8').read()
+    check('the F12 render acquires the GPU pipeline with a timeout (a render job that never ends greys every redo panel)',
+          'PIPELINE.acquire(timeout=' in esrc and 'shades on the CPU' in esrc)
+    csrc = open(os.path.join(root, 'convert.py'), encoding='utf-8').read()
+    check('the pristine-material watcher converts each material once (an undone conversion stays undone)',
+          '_HANDLER_CONVERTED' in csrc and csrc.count('_HANDLER_CONVERTED') >= 3)
+    check("convert_material guards the node's model assignment", 'master.model = p[' in csrc and 'except (TypeError, ValueError)' in csrc.split('master.model = p[')[1][:200])
+    usrc = open(os.path.join(root, 'ui.py'), encoding='utf-8').read()
+    check("the panel never pushes an empty model", "(hal.convert_model or 'AUTO')" in usrc)
 
 
 def main():

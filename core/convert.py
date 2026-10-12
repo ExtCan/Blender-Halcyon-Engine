@@ -10,6 +10,8 @@ inputs in 4.0 -- 'Specular' became 'Specular IOR Level', 'Emission' became
 means one code path covers 3.x through 5.x.
 """
 
+from .shading import MASTER_MODELS
+
 MASTER_NODE = 'HALCYON_ShaderNode'
 
 # (halcyon socket, [source socket aliases])
@@ -190,6 +192,14 @@ def plan(idname, values=None, links=None, model='AUTO'):
     Returns a dict with the chosen model, the socket pairs to relink or copy,
     the constants to apply afterwards, and any notes worth reporting.
     """
+    # R253 (review): a scene saved by 1.90 with Detection=Set carries the
+    # raw enum int of a model that moved off the master menu (GX, PS1,
+    # DS, Anime, Max...); Blender reads it back as '' and the panel pushed
+    # that '' here, where it passed through verbatim and `master.model =
+    # ''` raised inside every Convert button, leaving an unlinked master
+    # node per click. Anything but a master model is AUTO.
+    if model != 'AUTO' and model not in MASTER_MODELS:
+        model = 'AUTO'
     values = values or {}
     links = set(links or ())
     # R253: the engine's own nodes are sources too -- 'Convert This
