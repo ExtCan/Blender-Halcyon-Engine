@@ -106,7 +106,13 @@ below was reproduced headless before it was fixed and is pinned in
   `test_break` (Esc, the undo kill, the next render) with
   `WorkerCancelled` -- the one pool outcome that is not an in-process
   retry -- or a deadline (60 s for the handshake, an hour per band) with
-  a named IOError and the in-process road. (2) *The GPU marshal's pickup
+  a named IOError and the in-process road. Reproduced headless before
+  the fix: 900 frames of a scene whose band road prints one note per
+  call (a W encoding under an orthographic camera), two workers -- the
+  1.92.0 pool wedged with the worker in `anon_pipe_write` and the
+  parent's render thread in `anon_pipe_read` once the pipe filled; the
+  fixed pool finished all 900 with 112 KiB of worker output per worker
+  in its log. (2) *The GPU marshal's pickup
   wait.* A burst waiting for the main-thread pump sat out the whole 8 s
   TIMEOUT per burst while Blender's undo or the next render joined the
   job thread ON the main thread (the pump could not fire): an 8 s freeze
