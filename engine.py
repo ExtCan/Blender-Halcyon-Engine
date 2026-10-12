@@ -186,10 +186,19 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                 marshalled = False
         if marshalled:
             _marshal.enable()
+        # R253 (field): this job thread's cancel hook -- a GPU burst
+        # waiting for the main thread gives up the moment Blender asks
+        # the job to stop (Esc, Ctrl+Z killing jobs, the next render)
+        # instead of sitting out the pickup timeout per burst
+        _prev_cancel = _marshal.set_cancel(self.test_break)
         try:
             self._render_body(depsgraph, bscene, tw, th, preview,
                               settings, warnings)
+        except _marshal.Cancelled:
+            _release_gpu_frame(settings)
+            return
         finally:
+            _marshal.set_cancel(_prev_cancel)
             if marshalled:
                 _marshal.disable()
             if held:
@@ -480,8 +489,12 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                 with ST.track('worker pool'):
                     image, why = _par.render_parallel(scene, settings, n,
                                                       scene_key=key,
-                                                      progress=on_progress)
-            except _Cancelled:
+                                                      progress=on_progress,
+                                                      cancel=self.test_break)
+            except (_Cancelled, _par.WorkerCancelled):
+                # R253 (field): the pool's waits answer test_break too --
+                # a stop (Esc, undo's job kill) ends a band wait within a
+                # slice instead of parking this job behind the workers
                 return
             except Exception as exc:                            # noqa: BLE001
                 image, why = None, f'{type(exc).__name__}: {exc}'
@@ -1612,14 +1625,35 @@ except Exception:                                               # noqa: BLE001
         return f
 
 
+#: scene session_uid (or name) -> the engine it was last seen with, so
+#: the depsgraph handler pins on TRANSITIONS only
+_PIN_SEEN = {}
+
+
 @_persistent
 def _pin_display_handler(*_args):
     """Main-thread pin: render()/view_update see EVALUATED scenes,
     where writes may not stick. This runs on depsgraph updates and
-    file loads and pins the ORIGINAL whenever Halcyon is active."""
+    file loads and pins the ORIGINAL whenever Halcyon is active.
+
+    R253 (field): on transitions only -- the moment a scene's engine
+    becomes Halcyon, and on every file load (the table is cleared
+    then). The old every-update write landed AFTER each operator's
+    undo push, so an undone Color Management edit was re-applied by the
+    next depsgraph pass and undo looked broken there; render() and
+    view_update still pin at every frame they draw.
+    """
     try:
+        if not _args or not hasattr(_args[0], 'render'):
+            # load_post (a file path or nothing, never a scene): every
+            # scene starts over
+            _PIN_SEEN.clear()
         for scene in bpy.data.scenes:
-            if getattr(scene.render, 'engine', '') == 'HALCYON_RENDER':
+            engine = getattr(scene.render, 'engine', '')
+            key = getattr(scene, 'session_uid', None) or scene.name
+            before = _PIN_SEEN.get(key)
+            _PIN_SEEN[key] = engine
+            if engine == 'HALCYON_RENDER' and before != engine:
                 _pin_display(scene)
     except Exception:                                           # noqa: BLE001
         pass

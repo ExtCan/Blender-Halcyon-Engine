@@ -60,6 +60,14 @@ _JOBS = queue.Queue()
 _STATE = {'enabled': 0, 'timer': False}
 _STATE_LOCK = threading.Lock()
 
+#: per-thread cancel hooks: thread ident -> callable answering "stop now?"
+#: (Blender's test_break for the F12 / preview job thread). A pickup wait
+#: looks at its own thread's hook every SLICE and gives up at once when it
+#: answers true, instead of sitting out the whole TIMEOUT
+_CANCEL = {}
+#: how long a pickup wait sleeps between looks at the cancel hook
+SLICE = 0.05
+
 #: one render on the GPU at a time. The plan, shader and upload caches are
 #: shared module state written from whichever thread is rendering, and two
 #: renders interleaving driver bursts would thrash them -- so the F12
@@ -92,6 +100,39 @@ LINGER = 0.002
 
 class MarshalTimeout(RuntimeError):
     """The main thread did not pick the burst up in time."""
+
+
+class Cancelled(BaseException):
+    """The waiting thread's cancel hook went up during a pickup wait.
+
+    A BaseException on purpose: every GPU stage catches Exception and
+    takes the CPU road, which is right for a driver failure and wrong
+    for a cancel -- the render was asked to STOP (Esc, Ctrl+Z killing
+    the job, the next F12), and the CPU road would keep it alive. This
+    passes those handlers and reaches the engine's own cancel catch.
+    """
+
+
+def set_cancel(fn):
+    """Register `fn` as the CURRENT thread's cancel hook; returns the
+    previous one (None when there was none) for the caller to restore."""
+    tid = threading.get_ident()
+    prev = _CANCEL.get(tid)
+    if fn is None:
+        _CANCEL.pop(tid, None)
+    else:
+        _CANCEL[tid] = fn
+    return prev
+
+
+def _cancelled():
+    fn = _CANCEL.get(threading.get_ident())
+    if fn is None:
+        return False
+    try:
+        return bool(fn())
+    except Exception:                                           # noqa: BLE001
+        return False
 
 
 #: crossing accounting since the last reset: how many bursts crossed,
@@ -161,7 +202,19 @@ def _pump():
 
 def _ensure_timer():
     if _STATE['timer']:
-        return
+        # R253 (field): the flag alone was trusted, and a file load drops
+        # every non-persistent timer without clearing it -- after that
+        # every burst waited the full TIMEOUT and fell back to the CPU for
+        # the rest of the session. Ask Blender whether the pump is really
+        # registered when it can say
+        try:
+            import bpy
+            is_reg = getattr(bpy.app.timers, 'is_registered', None)
+            if is_reg is None or is_reg(_pump):
+                return
+            _STATE['timer'] = False
+        except Exception:                                       # noqa: BLE001
+            return
     try:
         import bpy
         bpy.app.timers.register(_pump, first_interval=0.0)
@@ -232,7 +285,28 @@ def run_on_main(fn, timeout=None, what='GPU work'):
         raise MarshalTimeout(
             f'{what}: no main-thread pump could be registered; this '
             'work is skipped and the CPU path takes over')
-    if not job.started.wait(TIMEOUT if timeout is None else timeout):
+    # the pickup wait, in slices: the thread's cancel hook ends it at
+    # once. Blender's undo and the next render kill a running job by
+    # joining its thread ON the main thread, so the pump cannot fire
+    # while the join waits -- without this look the join sat out the
+    # whole TIMEOUT per outstanding burst (an 8 s freeze per stage)
+    budget = TIMEOUT if timeout is None else float(timeout)
+    deadline = t0 + budget
+    picked = False
+    while True:
+        if _cancelled():
+            job.abandoned = True
+            if job.started.is_set():
+                break               # the burst is running: let it finish
+            raise Cancelled(f'{what}: the render was cancelled while '
+                            'waiting for the main thread')
+        left = deadline - _time.perf_counter()
+        if left <= 0.0:
+            break
+        if job.started.wait(min(SLICE, left)):
+            picked = True
+            break
+    if not picked and not job.started.is_set():
         job.abandoned = True
         if not job.started.is_set():
             raise MarshalTimeout(

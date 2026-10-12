@@ -87,6 +87,56 @@ below was reproduced headless before it was fixed and is pinned in
   model (the review's confirmed finding). The field's diagnostic is the
   jobs list: `bpy.app.is_job_running` for RENDER / COMPOSITE /
   OBJECT_BAKE names the job that holds the panel.
+- **The render job can no longer be parked (the second pass over the
+  same field pair).** A five-lens hunt over Blender 5.2's own sources
+  (`wm_jobs.cc`, `ed_undo.cc`, `wm_operators.cc`, `render_internal.cc`)
+  and the add-on found the roads that could keep the F12 job alive for
+  the rest of a session, and closed every one. (1) *The worker pool's
+  stderr pipe.* Each worker was started with `stderr=PIPE` and that pipe
+  was read only after a failure -- yet the renderer prints inside every
+  band (the worker routes `print()` to stderr to keep the protocol
+  stream clean), so a persistent worker filled the pipe after enough
+  frames (64 KiB on Linux, a few KiB on Windows), blocked inside its own
+  print, never answered, and the parent's `recv()` -- a bare pipe read --
+  waited for the rest of the session; an F12 job that never ends greys
+  every redo panel and refuses undo / redo, and Ctrl+Z (which kills every
+  job by JOINING its thread) then froze the application. Now the child's
+  stderr is its log file, replies arrive through a reader thread, and
+  `Worker.recv` waits in 0.25 s slices that answer Blender's
+  `test_break` (Esc, the undo kill, the next render) with
+  `WorkerCancelled` -- the one pool outcome that is not an in-process
+  retry -- or a deadline (60 s for the handshake, an hour per band) with
+  a named IOError and the in-process road. (2) *The GPU marshal's pickup
+  wait.* A burst waiting for the main-thread pump sat out the whole 8 s
+  TIMEOUT per burst while Blender's undo or the next render joined the
+  job thread ON the main thread (the pump could not fire): an 8 s freeze
+  per outstanding GPU stage. `render()` installs `test_break` as the job
+  thread's cancel hook (`gpu/marshal.set_cancel`, per thread, restored in
+  `finally`); the wait looks at it every 50 ms and raises
+  `marshal.Cancelled` -- a BaseException on purpose, so the stages'
+  `except Exception` CPU fallbacks do not keep a cancelled render alive
+  -- which the engine catches like its own `_Cancelled`. The pump's
+  registration is now checked against `bpy.app.timers.is_registered`
+  instead of a flag a file load could leave stale (after which every
+  burst timed out and fell back to the CPU for the session). (3) *The
+  display pin fought undo.* `_pin_display_handler` rewrote Color
+  Management on EVERY depsgraph update, which lands after each
+  operator's undo push -- an undone Color Management edit was re-applied
+  by the next pass and undo looked broken there. It pins on transitions
+  only (a scene's engine becoming Halcyon, and every file load);
+  `render()` and `view_update` still pin the frames they draw. (4) *The
+  cause is visible.* The Debug panel names any running Blender job
+  (`bpy.app.is_job_running`) in red with the rule, so a render that
+  never finished is seen as what it is instead of as a broken interface.
+  Reproduced in a real Blender 5.2.2 (UI under Xvfb, `ed.undo_redo.poll`
+  being Blender's exact redo-panel test): with the add-on on, the CPU
+  road, the GPU road, the rendered viewport, the material tab, a
+  Halcyon material and three F12 renders all leave the panel enabled and
+  undo / redo working, as EEVEE does; the parked-job roads above are the
+  ones that differ from that baseline in the field, and each is pinned
+  headless (`test_field_worker_pool_waits_are_bounded`,
+  `test_field_marshal_pickup_wait_is_cancellable`,
+  `test_field_display_pin_on_transitions_only`).
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
@@ -124,3 +174,8 @@ below was reproduced headless before it was fixed and is pinned in
   Vertex Color Mix socket at once.
 - A moved object's procedural texture following it in the live viewport
   without a mesh edit (the plan signature carrying the frame).
+- The field pair itself on the reporter's machine: with 1.92.0 on, the
+  Debug panel's red "Blender job running" line while the F9 panels are
+  grey names the job (RENDER means a render that never ended -- Esc in
+  the render window), and `bpy.app.is_job_running('RENDER')` in the
+  Python console says the same.

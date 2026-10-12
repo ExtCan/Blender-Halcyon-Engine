@@ -1949,6 +1949,27 @@ class HALCYON_OT_diagnostics(Operator):
         return {'FINISHED'}
 
 
+#: the job kinds bpy.app.is_job_running can name
+_JOB_KINDS = ('RENDER', 'RENDER_PREVIEW', 'OBJECT_BAKE', 'COMPOSITE',
+              'SHADER_COMPILATION')
+
+
+def _running_jobs():
+    """Names of the Blender jobs running now (see bpy.app.is_job_running);
+    empty when none, or when this Blender cannot say."""
+    out = []
+    probe = getattr(bpy.app, 'is_job_running', None)
+    if probe is None:
+        return out
+    for kind in _JOB_KINDS:
+        try:
+            if probe(kind):
+                out.append(kind)
+        except Exception:                                       # noqa: BLE001
+            pass
+    return out
+
+
 class HALCYON_PT_debug(HalcyonPanel, Panel):
     bl_label = "Debug"
     bl_context = "render"
@@ -1973,6 +1994,22 @@ class HALCYON_PT_debug(HalcyonPanel, Panel):
             note.active = False
             note.label(text="Breakdown prints to the system console",
                        icon='CONSOLE')
+        # R253 (field): Blender greys every Adjust Last Operation (F9)
+        # panel and refuses undo / redo while a scene job runs -- name
+        # the running ones here, so a render that never ended is seen
+        # as what it is instead of as a broken interface
+        running = _running_jobs()
+        if running:
+            warn = layout.box().column(align=True)
+            warn.alert = True
+            warn.label(text="Blender job running: " + ", ".join(running),
+                       icon='ERROR')
+            warn.scale_y = 0.8
+            for line in _wrap("While a scene job runs, Blender greys the "
+                              "F9 panels and refuses undo and redo. A "
+                              "render that never finished shows here; "
+                              "Esc in the render window stops it.", 46):
+                warn.label(text=line)
         layout.operator('halcyon.diagnostics', icon='CONSOLE')
 
         box = layout.box()

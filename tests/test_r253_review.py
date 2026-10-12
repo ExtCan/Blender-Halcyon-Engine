@@ -375,6 +375,206 @@ def test_field_hardening_f9_and_undo():
     check("the panel never pushes an empty model", "(hal.convert_model or 'AUTO')" in usrc)
 
 
+def test_field_worker_pool_waits_are_bounded():
+    """The field pair again (every F9 panel greyed, undo refused): an F12
+    job parked forever in the worker pool. The child's stderr was a pipe
+    nobody read while it lived, so a chatty worker eventually blocked in
+    its own print and the parent's recv() -- a bare pipe read -- waited
+    for the rest of the session. Now: stderr is the worker's log file,
+    replies come through a reader thread, and recv() waits in slices
+    that answer a cancel (test_break) or a deadline."""
+    import queue
+    import threading
+    import time as _t
+    from ..core import parallel as P
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    src = open(os.path.join(root, 'core', 'parallel.py'), encoding='utf-8').read()
+    check("a worker's stderr is never a pipe the parent does not read",
+          'stderr=subprocess.PIPE' not in src and 'stderr=err' in src)
+    check('replies arrive through a reader thread', '_read_loop' in src and 'self._inbox' in src)
+    check('the handshake and every band have a deadline',
+          'deadline=HANDSHAKE_DEADLINE' in src and src.count('deadline=BAND_DEADLINE') >= 2)
+    check('WorkerCancelled is its own outcome, never an in-process retry',
+          'except WorkerCancelled:\n        shutdown()\n        raise' in src)
+    esrc = open(os.path.join(root, 'engine.py'), encoding='utf-8').read()
+    check('the engine hands the pool its test_break',
+          'cancel=self.test_break)' in esrc and '_par.WorkerCancelled' in esrc)
+
+    # recv() on a worker that never answers: the cancel ends it within a slice
+    w = P.Worker.__new__(P.Worker)
+    w._inbox = queue.Queue()
+    w.proc = type('P', (), {'poll': staticmethod(lambda: None), 'returncode': None})()
+    w.lock = threading.Lock()
+    t0 = _t.monotonic()
+    try:
+        w.recv(cancel=lambda: True)
+        got = 'returned'
+    except P.WorkerCancelled:
+        got = 'cancelled'
+    except Exception as exc:                                    # noqa: BLE001
+        got = f'{type(exc).__name__}'
+    dt = _t.monotonic() - t0
+    check('a cancel ends a silent recv() with WorkerCancelled within a slice',
+          got == 'cancelled' and dt < 5.0 * P.SLICE + 1.0, f'{got} after {dt:.2f}s')
+    t0 = _t.monotonic()
+    try:
+        w.recv(deadline=0.3)
+        got = 'returned'
+    except IOError as exc:
+        got = 'IOError: ' + str(exc)
+    dt = _t.monotonic() - t0
+    check('a deadline ends a silent recv() with IOError naming the wait',
+          got.startswith('IOError') and 'did not answer' in got and dt < 3.0, f'{got} after {dt:.2f}s')
+    import pickle
+    w._inbox.put(('msg', pickle.dumps(('ok',))))
+    check('a queued reply is returned as the message', w.recv(cancel=lambda: True) == ('ok',))
+    w._inbox.put(('eof', 'worker closed the connection'))
+    try:
+        w.recv()
+        got = 'returned'
+    except IOError as exc:
+        got = str(exc)
+    check('a closed connection is an IOError, not a hang', 'closed' in got, got)
+    dead = type('P', (), {'poll': staticmethod(lambda: 1), 'returncode': 1})()
+    w.proc = dead
+    t0 = _t.monotonic()
+    try:
+        w.recv()
+        got = 'returned'
+    except IOError as exc:
+        got = str(exc)
+    check('an exited worker is noticed without a cancel or deadline',
+          'exited' in got and _t.monotonic() - t0 < 3.0, got)
+
+
+def test_field_marshal_pickup_wait_is_cancellable():
+    """A GPU burst waiting for the main thread gives up the moment the
+    job thread's cancel hook answers true -- Blender's undo and the next
+    render JOIN the job thread on the main thread, so the pump could
+    not fire and every outstanding burst sat out the whole TIMEOUT."""
+    import threading
+    import time as _t
+    from . import fakebpy
+    bpy = fakebpy.install()
+    from ..gpu import marshal as M
+    while not M._JOBS.empty():
+        M._JOBS.get_nowait()
+    M._STATE['enabled'] = 0
+    M._STATE['timer'] = False
+    check('Cancelled passes the stages\' Exception handlers (a BaseException)',
+          issubclass(M.Cancelled, BaseException) and not issubclass(M.Cancelled, Exception))
+    res = {}
+
+    def worker():
+        prev = M.set_cancel(lambda: True)
+        try:
+            t0 = _t.monotonic()
+            try:
+                M.run_on_main(lambda: res.setdefault('ran', True), timeout=6.0)
+                res['r'] = 'returned'
+            except M.Cancelled:
+                res['r'] = 'cancelled'
+            except BaseException as exc:                        # noqa: BLE001
+                res['r'] = type(exc).__name__
+            res['dt'] = _t.monotonic() - t0
+        finally:
+            M.set_cancel(prev)
+            res['hook_after'] = M._CANCEL.get(threading.get_ident())
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join(10.0)                     # the main loop never pumps: a join
+    check('a cancelled pickup wait raises Cancelled long before the timeout',
+          res.get('r') == 'cancelled' and res.get('dt', 99) < 2.0, str(res))
+    check('the burst never ran and the hook is restored', 'ran' not in res and res.get('hook_after') is None, str(res))
+    res.clear()
+
+    def worker2():
+        prev = M.set_cancel(lambda: False)
+        try:
+            try:
+                M.run_on_main(lambda: 1, timeout=0.3)
+                res['r'] = 'returned'
+            except M.MarshalTimeout:
+                res['r'] = 'timeout'
+            except BaseException as exc:                        # noqa: BLE001
+                res['r'] = type(exc).__name__
+        finally:
+            M.set_cancel(prev)
+
+    t = threading.Thread(target=worker2)
+    t.start()
+    t.join(10.0)
+    check('a hook answering False leaves the timeout to do its work', res.get('r') == 'timeout', str(res))
+    while not M._JOBS.empty():
+        M._JOBS.get_nowait()
+    # the pump timer flag is checked against Blender, not trusted
+    M._STATE['timer'] = True
+    bpy.app.timers.unregister(M._pump)
+    M._ensure_timer()
+    check('_ensure_timer re-registers a pump a file load dropped',
+          bpy.app.timers.is_registered(M._pump), str(M._STATE))
+    bpy.app.timers.unregister(M._pump)
+    M._STATE['timer'] = False
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    esrc = open(os.path.join(root, 'engine.py'), encoding='utf-8').read()
+    check('render() installs test_break as the job thread\'s cancel hook and restores it',
+          '_marshal.set_cancel(self.test_break)' in esrc and '_marshal.set_cancel(_prev_cancel)' in esrc
+          and 'except _marshal.Cancelled:' in esrc)
+
+
+def test_field_display_pin_on_transitions_only():
+    """The depsgraph handler pins Color Management when a scene's engine
+    BECOMES Halcyon and after a file load, never on every update: the
+    every-update write landed after each operator's undo push and
+    re-applied an undone edit on the next pass."""
+    from . import fakebpy
+    fakebpy.install()
+    import importlib
+    import types
+    ENG = importlib.import_module('halcyon.engine')
+    pinned = []
+    orig = ENG._pin_display
+    ENG._pin_display = lambda sc: pinned.append(sc.name)
+    import sys
+    bpy = sys.modules['bpy']
+    had = getattr(bpy.data, 'scenes', None)
+
+    def scene(name, engine, uid):
+        return types.SimpleNamespace(name=name, session_uid=uid,
+                                     render=types.SimpleNamespace(engine=engine))
+    a = scene('A', 'HALCYON_RENDER', 11)
+    b = scene('B', 'BLENDER_EEVEE', 12)
+    try:
+        bpy.data.scenes = [a, b]
+        ENG._PIN_SEEN.clear()
+        ENG._pin_display_handler(a, None)
+        ENG._pin_display_handler(a, None)
+        ENG._pin_display_handler(a, None)
+        check('three depsgraph updates pin the Halcyon scene once', pinned == ['A'], str(pinned))
+        b.render.engine = 'HALCYON_RENDER'
+        ENG._pin_display_handler(b, None)
+        check('a scene switching to Halcyon is pinned on that update', pinned == ['A', 'B'], str(pinned))
+        ENG._pin_display_handler(b, None)
+        check('and not again on the next', pinned == ['A', 'B'], str(pinned))
+        ENG._pin_display_handler('/tmp/x.blend')
+        check('a file load pins every Halcyon scene again', pinned == ['A', 'B', 'A', 'B'], str(pinned))
+        a.render.engine = 'BLENDER_EEVEE'
+        ENG._pin_display_handler(a, None)
+        a.render.engine = 'HALCYON_RENDER'
+        ENG._pin_display_handler(a, None)
+        check('leaving and coming back to Halcyon pins again', pinned[-1] == 'A' and len(pinned) == 5, str(pinned))
+    finally:
+        ENG._pin_display = orig
+        ENG._PIN_SEEN.clear()
+        if had is not None:
+            bpy.data.scenes = had
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    usrc = open(os.path.join(root, 'ui.py'), encoding='utf-8').read()
+    check('the Debug panel names a running Blender job (the F9 / undo refusal has a visible cause)',
+          'def _running_jobs' in usrc and 'is_job_running' in usrc and 'Blender job running: ' in usrc)
+
+
 def main():
     utf8_console()
     FAILS.clear()
