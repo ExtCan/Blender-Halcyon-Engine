@@ -2648,13 +2648,13 @@ DESCRIPTIONS = {
                 "interlace, lens, JPEG, the optical stages, the film beyond "
                 "grain) reads the frame back by name and says so on the "
                 "console",
-    'gpu_hold_context': "Give the render thread the GPU context for the "
-                        "whole frame, as before 1.25.53. Bursts start "
-                        "instantly but Blender's interface cannot redraw "
-                        "until the frame ends (Not Responding on long "
-                        "renders). Off, the interface stays live and each "
-                        "GPU burst runs on the main thread instead. Takes "
-                        "effect from the next render",
+    'gpu_hold_context': "Reserved. Blender hands a render engine the GPU "
+                        "context only when the engine is registered, so "
+                        "this cannot change a running session: every GPU "
+                        "burst crosses to the main thread between redraws "
+                        "and the interface stays live. Background "
+                        "(command-line) renders hold the context by "
+                        "themselves",
     'gpu_scissor': "Limit each transparent depth layer's GPU passes and "
                    "readbacks to the layer's own bounding box. The same "
                    "pixels shade either way -- the self test proves the "

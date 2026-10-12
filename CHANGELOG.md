@@ -1493,7 +1493,28 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   ones that differ from that baseline in the field, and each is pinned
   headless (`test_field_worker_pool_waits_are_bounded`,
   `test_field_marshal_pickup_wait_is_cancellable`,
-  `test_field_display_pin_on_transitions_only`).
+  `test_field_display_pin_on_transitions_only`). The same hunt's second
+  batch: (5) *the F12 pipeline wait answers test_break* -- the 30 s
+  acquire is taken in 0.25 s slices and gives up the moment Blender
+  stops the job, so a kill no longer holds its join for the bound; (6)
+  *thumbnails never touch the driver* -- a material / world / icon
+  preview renders on the CPU with no pipeline lock, because Blender
+  joins the preview job's thread on the main thread for every
+  node-editor operator, every undo and every F12 start, and a thumbnail
+  parked behind a viewport frame's lock froze those; (7) *every GPU
+  render marshals* -- Blender copies `bl_use_gpu_context` into the
+  engine type once at registration (False) and a later class-attribute
+  write never reaches it, so the old `granted` read of that stale
+  attribute switched the marshal OFF under Hold GPU Context: bursts
+  still queued, the pump retired after each one, and the pickup race
+  cost 8 s timeouts (the Hold toggle keeps its background meaning only;
+  its tooltip says so); (8) *the pump is persistent and retires under
+  the lock it registers under* -- a file load dropped the non-persistent
+  timer, and a burst queued between the pump's unlocked "queue empty"
+  look and its flag clear waited out the whole timeout for a pump that
+  had just left; (9) *view_update pins through the transition table*
+  too, so a rendered viewport no longer re-applies undone Color
+  Management edits on every depsgraph poke.
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon

@@ -521,6 +521,20 @@ def test_field_marshal_pickup_wait_is_cancellable():
     check('render() installs test_break as the job thread\'s cancel hook and restores it',
           '_marshal.set_cancel(self.test_break)' in esrc and '_marshal.set_cancel(_prev_cancel)' in esrc
           and 'except _marshal.Cancelled:' in esrc)
+    msrc = open(os.path.join(root, 'gpu', 'marshal.py'), encoding='utf-8').read()
+    check('the pump is registered persistent (a file load no longer drops it)',
+          'persistent=True' in msrc)
+    check('the pump retires and re-registers under one lock (no orphaned burst)',
+          'with _STATE_LOCK:\n        if not _STATE[\'enabled\'] and _JOBS.empty():' in msrc
+          and 'def _ensure_timer():\n    with _STATE_LOCK:' in msrc)
+    check('the F12 pipeline wait answers test_break in slices',
+          'PIPELINE.acquire(timeout=0.25)' in esrc and 'if self.test_break():\n                    return' in esrc)
+    check('a thumbnail never touches the driver or the pipeline lock',
+          'if preview and gpu_dev:' in esrc and "settings.render_device = 'CPU'\n            gpu_dev = False" in esrc)
+    check('every GPU render marshals (the stale bl_use_gpu_context read is gone)',
+          'marshalled = gpu_dev and not background' in esrc and 'granted = ' not in esrc)
+    check('view_update pins through the transition table, not per update',
+          '_pin_display_handler(depsgraph.scene, depsgraph)' in esrc)
 
 
 def test_field_display_pin_on_transitions_only():

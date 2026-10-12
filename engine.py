@@ -155,14 +155,30 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
         # always hold: there is no interface to keep alive, and a
         # windowless main loop may never run a timer.
         background = bool(getattr(bpy.app, 'background', False))
-        granted = bool(type(self).bl_use_gpu_context)
         hold = bool(getattr(settings, 'gpu_hold_context', False)) or \
             background
         type(self).bl_use_gpu_context = hold
         from .gpu import marshal as _marshal
         gpu_dev = str(getattr(settings, 'render_device',
                               'CPU')).upper() == 'GPU'
-        marshalled = not granted and gpu_dev and not background
+        if preview and gpu_dev:
+            # R253 (field): thumbnails never touch the driver or the
+            # pipeline lock. Blender joins the preview job's thread on
+            # the main thread for every node-editor operator, every
+            # undo and every F12 start -- a thumbnail parked behind a
+            # viewport frame's lock or a marshal pickup froze those.
+            # A thumbnail is small; the CPU road draws it
+            settings.render_device = 'CPU'
+            gpu_dev = False
+        # R253 (field): Blender copies bl_use_gpu_context into the engine
+        # type ONCE at registration (False), and a later class-attribute
+        # write never reaches it -- so a context is never granted to this
+        # render, and the old `not granted` read of that stale attribute
+        # switched the marshal OFF under Hold: bursts still queued, the
+        # pump retired after each one, and the pickup race cost 8 s
+        # timeouts. Every GPU render marshals; the Hold toggle keeps its
+        # background meaning only (no interface to keep alive)
+        marshalled = gpu_dev and not background
         # one render on the driver at a time: a GPU viewport frame
         # mid-flight finishes first (they are sub-second), then this
         # render owns the pipeline for its duration -- viewport frames
@@ -176,7 +192,19 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             # refuses undo / redo for the whole session (Blender refuses
             # both while a scene job runs). Bounded: past the wait this
             # frame shades on the CPU and says why
-            held = _marshal.PIPELINE.acquire(timeout=30.0)
+            # ...and the wait answers test_break: Blender kills a job it
+            # is stopping by JOINING its thread, and a thread parked in
+            # this acquire would hold that join for the whole bound
+            held = False
+            _t_end = time.monotonic() + 30.0
+            while not held:
+                held = _marshal.PIPELINE.acquire(timeout=0.25)
+                if held:
+                    break
+                if self.test_break():
+                    return
+                if time.monotonic() >= _t_end:
+                    break
             if not held:
                 print('[Halcyon] render: the GPU pipeline is held by a '
                       'viewport frame that did not finish in 30 s; this '
@@ -893,7 +921,10 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
     def view_update(self, context, depsgraph):
         vp = self._viewport()
         try:
-            _pin_display(depsgraph.scene)
+            # R253 (field): on transitions only (see the handler) -- a
+            # per-update pin here re-applied undone Color Management
+            # edits on every depsgraph poke while the viewport rendered
+            _pin_display_handler(depsgraph.scene, depsgraph)
         except Exception:                                       # noqa: BLE001
             pass
         try:

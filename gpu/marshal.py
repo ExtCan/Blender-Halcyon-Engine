@@ -194,33 +194,44 @@ def _pump():
                 break
         did = True
         job.run()
-    if not _STATE['enabled'] and _JOBS.empty():
-        _STATE['timer'] = False
-        return None                     # unregister: the render is over
+    # retire under the lock _ensure_timer registers under: a worker that
+    # put() a burst between an unlocked "queue empty" look and the flag
+    # clear saw the flag still True, registered nothing, and waited out
+    # the whole pickup timeout for a pump that had just left
+    with _STATE_LOCK:
+        if not _STATE['enabled'] and _JOBS.empty():
+            _STATE['timer'] = False
+            return None                 # unregister: the render is over
     return TICK
 
 
 def _ensure_timer():
-    if _STATE['timer']:
-        # R253 (field): the flag alone was trusted, and a file load drops
-        # every non-persistent timer without clearing it -- after that
-        # every burst waited the full TIMEOUT and fell back to the CPU for
-        # the rest of the session. Ask Blender whether the pump is really
-        # registered when it can say
+    with _STATE_LOCK:
+        if _STATE['timer']:
+            # R253 (field): the flag alone was trusted, and a file load
+            # drops every non-persistent timer without clearing it --
+            # after that every burst waited the full TIMEOUT and fell
+            # back to the CPU for the rest of the session. The pump is
+            # registered persistent now, and Blender is asked whether it
+            # is really there when it can say
+            try:
+                import bpy
+                is_reg = getattr(bpy.app.timers, 'is_registered', None)
+                if is_reg is None or is_reg(_pump):
+                    return
+                _STATE['timer'] = False
+            except Exception:                                   # noqa: BLE001
+                return
         try:
             import bpy
-            is_reg = getattr(bpy.app.timers, 'is_registered', None)
-            if is_reg is None or is_reg(_pump):
-                return
-            _STATE['timer'] = False
+            try:
+                bpy.app.timers.register(_pump, first_interval=0.0,
+                                        persistent=True)
+            except TypeError:
+                bpy.app.timers.register(_pump, first_interval=0.0)
+            _STATE['timer'] = True
         except Exception:                                       # noqa: BLE001
-            return
-    try:
-        import bpy
-        bpy.app.timers.register(_pump, first_interval=0.0)
-        _STATE['timer'] = True
-    except Exception:                                           # noqa: BLE001
-        _STATE['timer'] = False
+            _STATE['timer'] = False
 
 
 def enable():
