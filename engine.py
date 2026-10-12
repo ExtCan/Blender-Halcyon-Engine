@@ -1650,7 +1650,7 @@ def disable_compatible_panels():
 
 
 try:
-    from bpy.app.handlers import persistent as _persistent
+    _persistent = bpy.app.handlers.persistent
 except Exception:                                               # noqa: BLE001
     def _persistent(f):
         return f

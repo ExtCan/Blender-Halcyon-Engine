@@ -890,7 +890,17 @@ def _pristine_default(mat):
 #: session -- an undo that restores the pristine tree is the user's call
 _HANDLER_CONVERTED = set()
 
+try:
+    _persistent = bpy.app.handlers.persistent
+except Exception:                                               # noqa: BLE001
+    def _persistent(f):
+        return f
 
+
+# R253 (field): persistent -- Blender drops every handler without the
+# attribute on the first File > Open / New, after which fresh default
+# materials silently stopped becoming Halcyon for the rest of the session
+@_persistent
 def _halcyon_default_material(scene, depsgraph):
     """depsgraph_update_post: fresh default materials become Halcyon.
 

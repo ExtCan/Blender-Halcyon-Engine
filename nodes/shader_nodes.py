@@ -6146,6 +6146,16 @@ def migrate_master_node(tree, node):
     return new
 
 
+try:
+    _persistent = bpy.app.handlers.persistent
+except Exception:                                               # noqa: BLE001
+    def _persistent(f):
+        return f
+
+
+# R253 (field): persistent -- a load_post handler without the attribute
+# is dropped by the very file load it was registered for the NEXT of
+@_persistent
 def _migrate_master_sockets(_arg=None):
     """load_post: saved master nodes gain any socket their file predates.
 

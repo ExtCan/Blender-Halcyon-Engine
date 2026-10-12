@@ -278,8 +278,22 @@ class _Timers:
                 self.unregister(fn)
 
 
+def _persistent(fn):
+    """bpy.app.handlers.persistent: Blender marks the function with the
+    _bpy_persistent attribute, which the file-load reset looks for."""
+    fn._bpy_persistent = None
+    return fn
+
+
+_handlers = types.SimpleNamespace(
+    persistent=_persistent,
+    depsgraph_update_post=[], load_post=[], undo_post=[], redo_post=[],
+    frame_change_post=[], blend_import_post=[], render_pre=[],
+    render_post=[], render_cancel=[], render_complete=[], save_pre=[],
+    save_post=[], load_pre=[])
+
 app = types.SimpleNamespace(version=(5, 2, 0), background=True,
-                            timers=_Timers())
+                            timers=_Timers(), handlers=_handlers)
 class _Collection:
     def __init__(self, factory=None):
         self._items = []

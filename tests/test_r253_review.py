@@ -587,6 +587,14 @@ def test_field_display_pin_on_transitions_only():
     usrc = open(os.path.join(root, 'ui.py'), encoding='utf-8').read()
     check('the Debug panel names a running Blender job (the F9 / undo refusal has a visible cause)',
           'def _running_jobs' in usrc and 'is_job_running' in usrc and 'Blender job running: ' in usrc)
+    # every Halcyon handler survives a file load (Blender drops the rest)
+    import importlib as _il
+    for modname, fname in (('halcyon.convert', '_halcyon_default_material'),
+                           ('halcyon.nodes.shader_nodes', '_migrate_master_sockets'),
+                           ('halcyon.engine', '_pin_display_handler')):
+        fn = getattr(_il.import_module(modname), fname)
+        check(f'{fname} is a persistent handler (it survives File > Open)',
+              hasattr(fn, '_bpy_persistent'), str(list(vars(fn).keys())))
 
 
 def main():
