@@ -5310,6 +5310,45 @@ def _apply_group_docs():
 _apply_group_docs()
 
 
+def _settings_written(self, context):
+    """R254: the update callback of every Halcyon setting; it does nothing.
+
+    Having one is the point. Blender runs a property's update -- and tags
+    the datablock that owns it for the depsgraph -- from the interface
+    always, but from Python only when the property HAS an update function.
+    Without one a script's `light.halcyon.shadow_softness = 8`, and the
+    add-on's own 'Use Render Shadow Settings' button, changed the value in
+    the panel and nothing else: no depsgraph update, the evaluated copy the
+    exporter reads still held the old value, and the rendered viewport
+    stood still until some other edit happened to tag the lamp. With a
+    callback the write is what a drag in the panel is. Nothing is written
+    here, so a callback can never start another."""
+    return None
+
+
+def _apply_update_tags():
+    """Give every property of the four groups the callback above, where it
+    has none of its own (the two that write other dials keep theirs).
+
+    The same walk as _apply_group_docs: the real bpy's deferred property
+    carries `.keywords`, the test fake `.kw`. A CollectionProperty takes
+    no update and is left alone."""
+    for cls in (HalcyonSettings, HalcyonMaterialSettings,
+                HalcyonLightSettings, HalcyonWorldSettings):
+        for ann in cls.__annotations__.values():
+            fn = getattr(ann, 'function', None)
+            kind = getattr(fn, '__name__', None) or getattr(ann, 'kind', '')
+            if kind == 'CollectionProperty':
+                continue
+            for attr in ('keywords', 'kw'):
+                kw = getattr(ann, attr, None)
+                if isinstance(kw, dict):
+                    kw.setdefault('update', _settings_written)
+
+
+_apply_update_tags()
+
+
 CLASSES = (HalcyonSettings, HalcyonMaterialSettings, HalcyonLightSettings,
            HalcyonWorldSettings)
 

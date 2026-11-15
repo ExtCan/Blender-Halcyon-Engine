@@ -297,7 +297,12 @@ def _node_props(node, images, programs, warnings, key=None):
         # the engine never sees collections, only the name list
         gname = str(getattr(node, 'light_group', '') or '')
         if gname:
+            # R254: this module has no module-level bpy, so the lookup
+            # below raised NameError, the guard swallowed it, and EVERY
+            # Light Group resolved to no lamps in Blender: the material
+            # lost all direct light and the warning blamed the collection
             try:
+                import bpy
                 coll = bpy.data.collections.get(gname)
             except Exception:                                   # noqa: BLE001
                 coll = None
@@ -441,6 +446,14 @@ def object_map_props(node, warnings):
         kind = str(getattr(ob, 'type', '') or '')
         sub = str(getattr(getattr(ob, 'data', None), 'type', '') or '')
     out['object_inv'] = [_lit8(x) for x in inv[:3, :].reshape(-1)]
+    if kind == 'LIGHT':
+        # R254: this material carries a LAMP's frame (and a spot's cone
+        # below). The viewport's lights-only export shares the parked
+        # materials, so it must stand down for a scene that holds one
+        # (export_lights_into): the projection stayed at the old pose
+        # while the lamp moved. Written for a lamp only -- every other
+        # node's props are what they were
+        out['object_is_light'] = True
 
     mode = str(getattr(node, 'mode', 'AUTO') or 'AUTO')
     data = getattr(ob, 'data', None)
@@ -1351,8 +1364,17 @@ _CACHE_ARMED = False
 #: its OBJECT, whose own update dirties it -- the same dependency
 #: propagation Image and Texture already trust. Everything not named
 #: here still flushes the whole cache -- unknown means dirty.
+#
+# R254: light DATA reports as its concrete subclass (PointLight, never
+# Light), so the name above never matched and every lamp edit flushed
+# the whole pool: the split line read 'dirt ALL(PointLight)' after a
+# Power tick. The four subclasses are named now, and the Freestyle line
+# style beside them (every new depsgraph lists one; it draws lines and
+# cannot reach a mesh).
 _IRRELEVANT_IDS = frozenset({
     'Material', 'Image', 'Texture', 'ImageTexture', 'Light', 'World',
+    'PointLight', 'SunLight', 'SpotLight', 'AreaLight',
+    'FreestyleLineStyle',
     'Camera', 'Scene', 'Collection', 'ViewLayer', 'ShaderNodeTree',
     'CompositorNodeTree', 'TextureNodeTree', 'Brush', 'Palette',
     'Screen', 'WindowManager', 'WorkSpace'})
@@ -1381,8 +1403,15 @@ def _obj_token(ob):
 
 
 @_persistent
-def _watch_updates(scene, depsgraph):
-    """depsgraph_update_post: turn Blender's update report into dirt."""
+def _watch_updates(scene, depsgraph, heard=None):
+    """depsgraph_update_post: turn Blender's update report into dirt.
+
+    `heard` (R254, _on_frame_change only): the tokens of the objects whose
+    every edit the main depsgraph has already reported here. With it the
+    list is a newly built RENDER depsgraph's, which names every ID it
+    holds: an object in `heard` is skipped, any other object is dirtied
+    as always, and the non-object IDs are skipped too (each cached entry
+    belongs to an object, and every object is either heard or dirtied)."""
     global _DIRTY_ALL, _DIRTY_ALL_BY
     if not _CACHE_ARMED:
         return
@@ -1399,13 +1428,14 @@ def _watch_updates(scene, depsgraph):
                 # correct one
                 tok = _obj_token(idb)
                 if tok is not None:
-                    _DIRTY_OBJS.add(tok)
+                    if heard is None or tok not in heard:
+                        _DIRTY_OBJS.add(tok)
                 else:
                     _DIRTY_ALL = True
                     _DIRTY_ALL_BY = t
                     return
                 continue
-            if t in _IRRELEVANT_IDS:
+            if heard is not None or t in _IRRELEVANT_IDS:
                 continue
             uid = getattr(idb, 'session_uid', None)
             if t in _GEOM_DATA_IDS and uid is not None:
@@ -1450,6 +1480,15 @@ def _on_frame_change(scene, depsgraph=None):
     walks through the ordinary targeted dirt. A real frame step (an
     animation render, playback, scrubbing) still flushes whole,
     exactly as before.
+
+    R254: on an F12 that depsgraph is the RENDER depsgraph Blender has
+    just built, and a newly built depsgraph lists every ID it holds --
+    so 'whatever it lists' was every object of the scene, and no F12
+    ever reused a cached mesh ('meshes live 62 cached 0' with nothing
+    edited). Edits do not need that list: they arrive through
+    depsgraph_update_post of the main depsgraph before the render
+    starts. _heard_objects says which objects that is true for; they are
+    skipped, and every other object is dirtied as before.
     """
     global _DIRTY_ALL, _DIRTY_ALL_BY
     if not _CACHE_ARMED:
@@ -1464,12 +1503,104 @@ def _on_frame_change(scene, depsgraph=None):
             _LAST_FRAME.pop(next(iter(_LAST_FRAME)))
         if last == (fr, sub):
             if depsgraph is not None:
-                _watch_updates(scene, depsgraph)
+                _watch_updates(scene, depsgraph,
+                               heard=_heard_objects(depsgraph))
             return
     except Exception:                                           # noqa: BLE001
         pass
     _DIRTY_ALL = True
     _DIRTY_ALL_BY = 'frame'
+
+
+#: the handler lists whose functions run between the main depsgraph's
+#: last report and the export of an F12: an edit made there is seen by
+#: the RENDER depsgraph alone
+_RENDER_HOOKS = ('render_init', 'render_pre', 'frame_change_pre',
+                 'frame_change_post')
+
+
+def _foreign_render_hooks(bpy):
+    """True when a function that is not this add-on's sits in one of
+    _RENDER_HOOKS (another add-on, a script in the file)."""
+    root = __name__.rpartition('.')[0]
+    for name in _RENDER_HOOKS:
+        for fn in getattr(bpy.app.handlers, name, ()) or ():
+            mod = str(getattr(fn, '__module__', '') or '')
+            if not root or not (mod == root or mod.startswith(root + '.')):
+                return True
+    return False
+
+
+def _viewport_enabled(view_layer):
+    """The tokens of the objects the view layer's VIEWPORT depsgraph
+    holds and reports: the bases enabled in viewports. Blender's layer
+    sync, read off the original data: a collection's Disable in Viewports
+    is inherited by everything under it, Exclude is each layer
+    collection's own, and an object's own Disable in Viewports removes
+    its base. (An object reached only through an instanced collection is
+    not here: it stays unheard and is exported live, as before.)"""
+    out = set()
+    stack = [(view_layer.layer_collection, False)]
+    while stack:
+        lc, restricted = stack.pop()
+        coll = lc.collection
+        restricted = restricted or bool(coll.hide_viewport)
+        if not restricted and not lc.exclude:
+            for ob in coll.objects:
+                if not ob.hide_viewport:
+                    tok = _obj_token(ob)
+                    if tok is not None:
+                        out.add(tok)
+        for child in lc.children:
+            stack.append((child, restricted))
+    return out
+
+
+def _heard_objects(depsgraph):
+    """The objects of a still F12 whose edits have all been reported
+    already, or None when nothing may be assumed (the whole update list
+    is then walked, as it always was).
+
+    A set comes back only when every one of these holds:
+    * the depsgraph is a RENDER one (a viewport re-evaluation of the same
+      frame lists real changes and is walked whole);
+    * no foreign function is registered in _RENDER_HOOKS -- a render_pre
+      handler that moves a vertex is seen by the render depsgraph alone
+      (measured: 207 px of stale mesh under a rule without this test);
+    * a window shows this scene and view layer, so its main depsgraph is
+      the one Blender evaluates after every edit and before the render
+      (a scene rendered by name from a script has no such depsgraph);
+    * that main depsgraph holds no tag it has not reported yet
+      (Depsgraph.id_type_updated is set when an ID is tagged and cleared
+      by the evaluation that reports it).
+    The set is _viewport_enabled: an object disabled in viewports but
+    enabled in renders is in the render depsgraph only, nobody reports
+    its edits, and it is exported live every time."""
+    try:
+        if str(getattr(depsgraph, 'mode', '')) != 'RENDER':
+            return None
+        import bpy
+        if _foreign_render_hooks(bpy):
+            return None
+        sc = depsgraph.scene
+        vl = depsgraph.view_layer
+        shown = False
+        for wm in bpy.data.window_managers:
+            for win in wm.windows:
+                if win.scene == sc and win.view_layer == vl:
+                    shown = True
+        if not shown:
+            return None
+        main = vl.depsgraph
+        if str(getattr(main, 'mode', '')) != 'VIEWPORT':
+            return None
+        for item in type(main).bl_rna.functions[
+                'id_type_updated'].parameters['id_type'].enum_items:
+            if main.id_type_updated(item.identifier):
+                return None
+        return _viewport_enabled(vl)
+    except Exception:                                           # noqa: BLE001
+        return None
 
 
 #: the Scene fields that can change EVALUATED MESH GEOMETRY -- the
@@ -1729,7 +1860,34 @@ def _kind(ob):
     return _KINDS.get(getattr(ob, 'type', ''), "Object")
 
 
-def export_lights_into(parked, depsgraph):
+def _lamp_bound(materials):
+    """What the exported materials bake of the scene's LAMPS, for
+    export_lights_into: (projects, grouped).
+
+    `projects`: an Object Projection node picked a lamp, so the material
+    graph carries that lamp's inverse matrix and cone (object_map_props).
+    `grouped`: a material names lamps through a Light Group, resolved to
+    lamp NAMES when the material was exported."""
+    projects = grouped = False
+    for m in materials or ():
+        for node in ((getattr(m, 'graph', None) or {})
+                     .get('nodes', {}) or {}).values():
+            props = node.get('props') or {}
+            if props.get('object_is_light'):
+                projects = True
+            if props.get('light_group_lights'):
+                grouped = True
+    return projects, grouped
+
+
+def _lamp_names(lights):
+    """The exported lamps' names, sorted; the world's own light (made at
+    render entry by core/worldlight.sync, never exported) left out."""
+    return sorted(str(getattr(l, 'name', '')) for l in lights or ()
+                  if not getattr(l, 'world_light', False))
+
+
+def export_lights_into(parked, depsgraph, space=None):
     """A next Scene with FRESH lights and everything else SHARED.
 
     A lamp drag fires view_update every tick, and each tick used to run
@@ -1740,16 +1898,38 @@ def export_lights_into(parked, depsgraph):
     shallow-copies the parked export around them, so the mesh, material,
     image and world objects keep their identities and every downstream
     identity-keyed cache (BVH, prepared textures, shadow signatures)
-    stays warm."""
+    stays warm.
+
+    R254. The clock is read here as export_scene reads it: a keyframed
+    lamp scrubbed or played takes this path, and the parked frame number
+    froze Light Style and Caustics while the lamp's Power and position
+    animated. `space` is the view's SpaceView3D (compat.in_view): a lamp
+    this viewport hides is left out, as export_scene leaves it out.
+
+    Returns None when the parked MATERIALS bake something of a lamp, so
+    that fresh lamps around old materials would be a wrong picture and
+    the caller must export fully: an Object Projection node that projects
+    from a lamp (its matrix and cone sit in the material graph), or a
+    Light Group while the set of lamp names differs from the parked one
+    (the group was resolved to names at material export)."""
     import copy
     bscene = depsgraph.scene
+    projects, grouped = getattr(parked, 'lamp_bound', None) or (False, False)
+    if projects:
+        return None
+    view = space if str(getattr(depsgraph, 'mode', 'VIEWPORT')) \
+        == 'VIEWPORT' else None
     lights = []
     for inst in depsgraph.object_instances:
         ob = inst.object
         if ob is None or ob.type != 'LIGHT' or not inst.show_self:
             continue
+        if not compat.in_view(inst, view):
+            continue
         lights.append(export_light(ob, inst.matrix_world,
                                    bscene.unit_settings.scale_length))
+    if grouped and _lamp_names(lights) != _lamp_names(parked.lights):
+        return None
     name_to_index = {o.name: i
                      for i, o in enumerate(parked.objects or [])}
     for lt in lights:
@@ -1759,6 +1939,15 @@ def export_lights_into(parked, depsgraph):
                 name_to_index[n] for n in names if n in name_to_index))
     scene = copy.copy(parked)
     scene.lights = lights
+    # the three expressions export_scene ends on; a stub depsgraph with
+    # no clock keeps the parked one
+    fr = getattr(bscene, 'frame_current', None)
+    if fr is not None:
+        fps = getattr(getattr(bscene, 'render', None), 'fps',
+                      getattr(parked, 'fps', 24))
+        scene.frame = fr
+        scene.fps = fps
+        scene.time = fr / max(fps, 1)
     return scene
 
 
@@ -2336,7 +2525,7 @@ def _strand_material(mat, mat_lookup, materials, images, warnings):
 
 
 def _collect_hair_parts(depsgraph, bscene, mat_lookup, materials, images,
-                        objects, parts, warnings):
+                        objects, parts, warnings, space=None):
     """R208: hair renders. Particle-system hair and Curves objects both
     become camera-facing ribbon meshes (core.geometry.hair_ribbons --
     the primitive BI rendered strands as), wearing a strand-flagged
@@ -2393,6 +2582,8 @@ def _collect_hair_parts(depsgraph, bscene, mat_lookup, materials, images,
     for inst in depsgraph.object_instances:
         ob = inst.object
         if ob is None or not getattr(inst, 'show_self', True):
+            continue
+        if not compat.in_view(inst, space):
             continue
 
         # ---- legacy particle-system hair ----
@@ -2499,7 +2690,7 @@ def _collect_hair_parts(depsgraph, bscene, mat_lookup, materials, images,
 
 
 def _collect_extra_halos(depsgraph, mat_lookup, materials, images,
-                         halo_groups, warnings):
+                         halo_groups, warnings, space=None):
     """Particles and point clouds as halos, API-guarded.
 
     BI rendered particles through the same halo road when their
@@ -2511,6 +2702,8 @@ def _collect_extra_halos(depsgraph, mat_lookup, materials, images,
     for inst in depsgraph.object_instances:
         ob = inst.object
         if ob is None or not getattr(inst, 'show_self', True):
+            continue
+        if not compat.in_view(inst, space):
             continue
         mw = _np.asarray(inst.matrix_world, _np.float32)
         # ---- legacy particle systems ----
@@ -2607,8 +2800,16 @@ def _world_image(hs, attr, images):
     return images.get(key)
 
 
-def export_scene(depsgraph, settings, warnings=None):
-    """Evaluated depsgraph -> Scene."""
+def export_scene(depsgraph, settings, warnings=None, space=None):
+    """Evaluated depsgraph -> Scene.
+
+    `space` (R254): the SpaceView3D of the rendered viewport this export
+    is for, or None. A VIEWPORT depsgraph keeps an object whose collection
+    was hidden with the outliner's eye, or that Local View left out, with
+    show_self True; what says it is hidden is the per-viewport test
+    Blender's own engines make (compat.in_view), so every instance loop
+    below asks it. F12 passes no space and keeps its own rule (show_self
+    of the RENDER depsgraph: hide_render decides)."""
     import time as _time
     warnings = warnings if warnings is not None else []
     bscene = depsgraph.scene
@@ -2636,6 +2837,7 @@ def export_scene(depsgraph, settings, warnings=None):
     _sp['dirt_all'] = _dirt_all_by or ''
     _sp['dirt_n'] = _dirt_objs + _dirt_data
     _dg_mode = str(getattr(depsgraph, 'mode', 'VIEWPORT'))
+    _view = space if _dg_mode == 'VIEWPORT' else None
     _cache_on = _CACHE_ARMED and not _DIRTY_ALL
     _touched = set()          # keys stored or reused THIS export
     retries = []
@@ -2660,7 +2862,8 @@ def export_scene(depsgraph, settings, warnings=None):
     # the way to the next one, and wrapping it in list() would read every one
     # of them after it had been freed. See compat.evaluated_meshes.
     for ob, me, matrix, temp in compat.evaluated_meshes(depsgraph,
-                                                        skip=_skip):
+                                                        skip=_skip,
+                                                        space=_view):
         if me is None:
             # the skip path: this object was never evaluated -- serve its
             # arrays from the cache. Materials still export FRESH every
@@ -2893,7 +3096,7 @@ def export_scene(depsgraph, settings, warnings=None):
                 if k not in _touched:
                     _cache_pop(k)
 
-    for name, kind in compat.unconvertible(depsgraph):
+    for name, kind in compat.unconvertible(depsgraph, space=_view):
         warnings.append(f"{_KINDS.get(kind, kind.title())} '{name}' is not a "
                         f"surface Halcyon can render. Convert it to a mesh "
                         f"to include it")
@@ -2901,6 +3104,8 @@ def export_scene(depsgraph, settings, warnings=None):
     for inst in depsgraph.object_instances:
         ob = inst.object
         if ob is None or ob.type != 'LIGHT' or not inst.show_self:
+            continue
+        if not compat.in_view(inst, _view):
             continue
         lights.append(export_light(ob, inst.matrix_world,
                                    bscene.unit_settings.scale_length))
@@ -2917,7 +3122,7 @@ def export_scene(depsgraph, settings, warnings=None):
     # R191: particles and point clouds wearing halo materials
     try:
         _collect_extra_halos(depsgraph, mat_lookup, materials, images,
-                             halo_groups, warnings)
+                             halo_groups, warnings, space=_view)
     except Exception:                                           # noqa: BLE001
         pass
 
@@ -2925,7 +3130,7 @@ def export_scene(depsgraph, settings, warnings=None):
     # camera-facing ribbons wearing a strand-flagged material clone
     try:
         _collect_hair_parts(depsgraph, bscene, mat_lookup, materials,
-                            images, objects, parts, warnings)
+                            images, objects, parts, warnings, space=_view)
     except Exception:                                           # noqa: BLE001
         pass
 
@@ -3117,6 +3322,8 @@ def export_scene(depsgraph, settings, warnings=None):
     sc.halos = halo_groups or None
     sc.images = images
     sc.warnings = warnings
+    # R254: what these materials bake of the lamps (export_lights_into)
+    sc.lamp_bound = _lamp_bound(materials)
     # R170: the export split -- at 0.36s of a 0.75s warm F12, "export"
     # is a number and a split is a diagnosis (engine prints it)
     _sp['total_ms'] = (_time.perf_counter() - _t_all) * 1000.0

@@ -209,8 +209,30 @@ def enable_nodes(datablock):
             datablock.use_nodes = True
 
 
-def evaluated_meshes(depsgraph, skip=None):
+def in_view(inst, space):
+    """False when the viewport `space` (a SpaceView3D) does not show this
+    depsgraph instance; True with no space.
+
+    R254: a viewport depsgraph instance's show_self stays True when the
+    object's collection is hidden with the outliner's eye, when Local
+    View leaves the object out, when a local collection or the viewport's
+    object-type filter hides it. What changes is the per-viewport test
+    Blender's own engines make on the instance's object
+    (Object.visible_in_viewport_get; an instanced object carries its
+    instancer's flags, so instances follow their instancer). An object
+    that cannot answer is shown."""
+    if space is None:
+        return True
+    try:
+        return bool(inst.object.visible_in_viewport_get(space))
+    except Exception:                                           # noqa: BLE001
+        return True
+
+
+def evaluated_meshes(depsgraph, skip=None, space=None):
     """Yield (object, evaluated mesh, matrix, is_temporary), one at a time.
+
+    `space`: the rendered viewport's SpaceView3D, or None (in_view).
 
     `skip(original, matrix)` -> True short-circuits an object BEFORE its
     depsgraph evaluation: the caller gets (original, None, matrix,
@@ -260,6 +282,8 @@ def evaluated_meshes(depsgraph, skip=None):
                 continue
             if ob.type not in GEOMETRY_TYPES:
                 continue
+            if not in_view(i, space):
+                continue
             # .original is the bmain-owned datablock: the ONE reference
             # that stays valid after this iteration step ends
             orig = getattr(ob, 'original', None) or ob
@@ -295,7 +319,7 @@ def evaluated_meshes(depsgraph, skip=None):
             free_mesh(live)
 
 
-def unconvertible(depsgraph):
+def unconvertible(depsgraph, space=None):
     """Names and types of visible objects we had to leave out."""
     out = []
     try:
@@ -303,6 +327,8 @@ def unconvertible(depsgraph):
         for i in depsgraph.object_instances:
             ob = i.object
             if ob is None or not i.show_self:
+                continue
+            if not in_view(i, space):
                 continue
             if ob.type in UNCONVERTIBLE_TYPES and ob.name not in seen:
                 seen.add(ob.name)
@@ -332,6 +358,36 @@ def clear_image_cache():
     _PIXEL_ORDER.clear()
 
 
+def _file_stamp(image):
+    """(st_mtime_ns, st_size) of the file an unpacked FILE image reads,
+    or None (packed, generated, a path that is not one file).
+
+    R254: the stamp is what moves when the file is rewritten on disk and
+    Reload is pressed; nothing else on the Image does. Nanoseconds and
+    the size, so a rewrite within the same second is seen."""
+    try:
+        if str(getattr(image, 'source', '')) != 'FILE' or \
+                getattr(image, 'packed_file', None) is not None:
+            return None
+        raw = getattr(image, 'filepath_raw', '') or ''
+        if not raw:
+            return None
+        import os
+        path = bpy.path.abspath(raw, library=getattr(image, 'library', None))
+        st = os.stat(path)
+        return (int(st.st_mtime_ns), int(st.st_size))
+    except Exception:                                           # noqa: BLE001
+        return None
+
+
+def _pixel_forget(name, keep=None):
+    """Drop every cached generation of the image `name` but `keep`."""
+    for k in [k for k in _PIXEL_CACHE if k[0] == name and k != keep]:
+        _PIXEL_CACHE.pop(k, None)
+        if k in _PIXEL_ORDER:
+            _PIXEL_ORDER.remove(k)
+
+
 def image_pixels(image):
     """(H,W,4) float32, bottom row first (Blender's own layout).
 
@@ -340,24 +396,39 @@ def image_pixels(image):
     every image on every frame of an animation is pure waste, since the pixels
     almost never change -- so the result is cached, keyed on everything that
     would alter it.
+
+    R254: 'everything' was the name, size, source, path, the dirty flag and
+    the colour space, and none of those moves when a file is rewritten and
+    reloaded, or when an image that is already dirty is painted again -- a
+    projector's gobo, or any texture, stayed as first read until Blender was
+    restarted. Now a clean image is keyed on its file's stamp as well
+    (_file_stamp), and a DIRTY image is read every time: Blender says
+    nothing when its pixels change (a pixel write fires no depsgraph update),
+    so reading them is the only way to know. When the fresh read equals the
+    cached copy the cached ARRAY is returned, so the caches downstream that
+    key on its identity stay warm; one generation per image is kept.
     """
     import numpy as np
     if image is None:
         return None
     key = None
+    dirty = False
     try:
         src = getattr(image, 'source', 'FILE')
         if src not in ('SEQUENCE', 'MOVIE'):        # these change per frame
+            dirty = bool(getattr(image, 'is_dirty', False))
             key = (image.name_full, tuple(image.size), src,
                    getattr(image, 'filepath_raw', ''),
-                   bool(getattr(image, 'is_dirty', False)),
+                   'dirty' if dirty else _file_stamp(image),
                    getattr(image, 'colorspace_settings', None)
                    and image.colorspace_settings.name)
-            hit = _PIXEL_CACHE.get(key)
-            if hit is not None:
-                return hit
+            if not dirty:
+                hit = _PIXEL_CACHE.get(key)
+                if hit is not None:
+                    return hit
     except Exception:                                           # noqa: BLE001
         key = None
+        dirty = False
     # foreach_get on an image with no pixel buffer reads from a null pointer
     if not getattr(image, 'has_data', True):
         try:
@@ -374,6 +445,12 @@ def image_pixels(image):
         image.pixels.foreach_get(buf)
         out = buf.reshape(h, w, 4)
         if key is not None:
+            if dirty:
+                prev = _PIXEL_CACHE.get(key)
+                if prev is not None and prev.shape == out.shape and \
+                        np.array_equal(prev, out):
+                    return prev
+            _pixel_forget(key[0])
             _PIXEL_CACHE[key] = out
             _PIXEL_ORDER.append(key)
             while len(_PIXEL_ORDER) > _PIXEL_LIMIT:
