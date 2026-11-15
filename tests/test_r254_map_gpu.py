@@ -24,8 +24,6 @@ a number that the tree before this package fails:
        the simulator
     h  the plan cache keeps a draft's and a refine's plan through a drag
        and holds no map alive
-    i  the no-caster table: a fragment with no caster in reach skips the
-       blocker search, and the picture does not move
 
     python -m halcyon.tests.test_r254_map_gpu
 """

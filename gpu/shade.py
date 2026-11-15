@@ -1430,7 +1430,10 @@ def _plan_store(sig, passes, atlases):
         kept['hal_shadowpack'] = (atlases['hal_shadowpack'][0], None, None)
     _PLAN_CACHE.pop(sig, None)
     while len(_PLAN_CACHE) >= PLAN_CACHE_MAX:
-        _PLAN_CACHE.pop(next(iter(_PLAN_CACHE)))
+        try:
+            _PLAN_CACHE.pop(next(iter(_PLAN_CACHE)), None)
+        except (StopIteration, RuntimeError):
+            break                 # another thread emptied or resized it
     _PLAN_CACHE[sig] = (passes, None, kept)
 
 
@@ -1526,45 +1529,50 @@ def plan_frame(job, gbuf, use_cache=True):
             # material the mesh carries (below), and a hit that still
             # lacks one on screen re-plans instead of serving it
             hit = None
+        h_lts = h_metas = h_pack = None
+        if hit is not None and hit[2] and ('hal_lights' in hit[2]
+                                           or 'hal_shadowpack' in hit[2]):
+            # R254: the SHADOW entries of a hit are per-frame data. The
+            # metas are rebuilt from the current lamps and maps (their
+            # structure is the cached plan's, by the signature) and the
+            # pack entry carries the current maps under their content
+            # stamp
+            from ..core import lights as _LI2
+            h_lts = _LI2.frame_lights(job.scene, job.settings)
+            h_metas, _parts = [], []
+            for _i, _l in enumerate(h_lts):
+                _m, _a, _w = _shadow_meta(_l, job.settings,
+                                          getattr(job, 'bvh', None))
+                h_metas.append(_m)
+                if _a is not None:
+                    _parts.append((_i, _a))
+            h_pack = _shadow_pack(h_metas, _parts)
+            if ('hal_shadowpack' in hit[2]) != (h_pack is not None):
+                # the plan and the frame disagree on whether a map
+                # exists (the signature rules it out): plan afresh
+                hit = None
         if hit is not None:
             PLAN_STATS['hit'] += 1
             # least recently USED is what the cap evicts
-            _PLAN_CACHE[sig] = _PLAN_CACHE.pop(sig)
+            _PLAN_CACHE.pop(sig, None)
+            _PLAN_CACHE[sig] = hit
             h_passes, h_why, h_atlases = hit
-            h_pack = None
-            if h_atlases and ('hal_lights' in h_atlases
-                              or 'hal_shadowpack' in h_atlases):
+            if h_lts is not None and 'hal_lights' in h_atlases:
                 # R169: the light VALUES are per-frame data, not part
                 # of the plan -- a cache hit reuses every source and
                 # every other atlas, but the hal_lights texture repacks
                 # from the CURRENT lamps (this is the whole point: a
                 # lamp edit lands here, as a hit plus one tiny upload,
-                # instead of a 25-shader recompile storm).
-                # R254: the SHADOW entries are per-frame data too. The
-                # metas are rebuilt from the current lamps and maps
-                # (their structure is the cached plan's, by the
-                # signature), the pack entry carries the current maps
-                # under their content stamp, and the lamps' shadow
-                # values ride the same hal_lights repack
-                from ..core import lights as _LI2
+                # instead of a 25-shader recompile storm). R254: the
+                # lamps' shadow values ride the same repack
                 from .material import pack_light_texels as _plt
-                _lts = _LI2.frame_lights(job.scene, job.settings)
-                _metas, _parts = [], []
-                for _i, _l in enumerate(_lts):
-                    _m, _a, _w = _shadow_meta(_l, job.settings,
-                                              getattr(job, 'bvh', None))
-                    _metas.append(_m)
-                    if _a is not None:
-                        _parts.append((_i, _a))
-                h_pack = _shadow_pack(_metas, _parts)
-                if 'hal_lights' in h_atlases:
-                    _arr = _plt(_lts, job,
-                                shadows=_metas if SHADOW_TEXELS else None)
-                    h_atlases = dict(h_atlases)
-                    h_atlases['hal_lights'] = (('lights', _arr.tobytes()),
-                                               lambda a=_arr: a)
-                    hit = (h_passes, h_why, h_atlases)
-                    _PLAN_CACHE[sig] = hit
+                _arr = _plt(h_lts, job,
+                            shadows=h_metas if SHADOW_TEXELS else None)
+                h_atlases = dict(h_atlases)
+                h_atlases['hal_lights'] = (('lights', _arr.tobytes()),
+                                           lambda a=_arr: a)
+                hit = (h_passes, h_why, h_atlases)
+                _PLAN_CACHE[sig] = hit
             if h_atlases and 'hal_fogtab' in h_atlases:
                 # R251: the fog values are per-frame data too (the view
                 # row rides them): a hit repacks from THIS frame
