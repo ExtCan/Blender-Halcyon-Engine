@@ -29735,6 +29735,72 @@ def test_ink_style_pack():
 
 _PREV_ENGINE = {}
 
+#: the previous releases' sky ray: the one line of `_background_image`
+#: (every release from 1.32 to 1.92.0) and of `sky.mode7_rows` (1.90 on)
+#: that unprojected a pixel through BLAS, and the line that replaces it
+#: in the extracted copy -- (file, the shipped line, the chained line)
+_PREV_SKY_RAY = (
+    ('core/render.py', '    world = pts @ inv.T\n',
+     '    world = _hal_chain_ray(nx, ny, inv)\n'),
+    ('core/sky.py', '        wv = pts @ inv.T\n',
+     '        wv = _hal_chain_ray(nx, ny, inv)\n'),
+)
+_PREV_SKY_RAY_NOTED = set()
+
+
+def _chain_prev_sky_ray(root, zip_name):
+    """Put the extracted previous engine's sky ray on the float32 chain
+    (R253 field round; `mathx.unproject_far` has the measurement).
+
+    The releases computed the ray as `pts @ inv.T`, which is `sgemm`:
+    on a BLAS that fuses multiply-add (OpenBLAS's Haswell-and-later
+    cores) it lands an ulp off the chain at a dozen sky pixels of a
+    96x72 frame, and since this tree's ray IS the chain, every
+    'bitwise the previous release' pin of a frame with sky in it would
+    then measure the machine's BLAS kernel instead of the release.
+    Each shipped line is replaced, line for line, by a call to
+    `_hal_chain_ray`, and THIS tree's `mathx.unproject_far` is appended
+    to the file under that name -- its own source, so there is one
+    chain, and the copy stays whole for a worker process that imports
+    it afresh. On an unfused kernel that is the shipped arithmetic bit
+    for bit (measured: 685 skies, 659 frames), so the pins there are
+    what they were; on a fused one both engines now state the same ray
+    and the pins compare everything else, as they were written to.
+
+    A line is replaced only where it stands EXACTLY once; anything else
+    leaves the file as shipped and says so once -- except a release cut
+    after this fix, whose ray is the chain already: silently as shipped.
+    Returns the files that were chained."""
+    import inspect
+    from ..core import mathx as _M
+    helper = inspect.getsource(_M.unproject_far).replace(
+        'def unproject_far(', 'def _hal_chain_ray(', 1)
+    done = []
+    for rel, shipped, chained in _PREV_SKY_RAY:
+        path = os.path.join(root, *rel.split('/'))
+        if not os.path.exists(path):
+            continue
+        with open(path, 'r', encoding='utf-8') as fh:
+            text = fh.read()
+        if text.count(shipped) != 1 or 'def _hal_chain_ray(' not in helper:
+            # a release cut after this fix already states the chain: there
+            # is no shipped line in it and nothing to say
+            already = text.count(shipped) == 0 and 'unproject_far(' in text
+            if rel == 'core/render.py' and not already and \
+                    (zip_name, rel) not in _PREV_SKY_RAY_NOTED:
+                _PREV_SKY_RAY_NOTED.add((zip_name, rel))
+                print(f'  note {zip_name}: {rel} does not hold the sky ray '
+                      f'line exactly once ({text.count(shipped)}); the '
+                      'previous engine keeps its own ray, and on a fused '
+                      'BLAS its sky is an ulp off this tree\'s')
+            continue
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(text.replace(shipped, chained)
+                     + '\n\n# appended by tests.test_render._prev_engine\n'
+                     + helper)
+        done.append(rel)
+    return done
+
 
 def _prev_engine(zip_name='halcyon-1.70.0.zip'):
     """R228: the PREVIOUS release's WHOLE engine, imported from the
@@ -29742,7 +29808,11 @@ def _prev_engine(zip_name='halcyon-1.70.0.zip'):
     elsewhere) under its own package name, so a frame can be rendered
     by last round's code and compared bitwise with this round's. The
     strongest neutrality pin there is for a feature that must be
-    invisible until asked for."""
+    invisible until asked for.
+
+    One line of it is not the release's: the sky ray is brought onto
+    the float32 chain this tree states (`_chain_prev_sky_ray`), so the
+    comparison never turns on which `sgemm` kernel the machine has."""
     import atexit
     import importlib
     import shutil
@@ -29762,6 +29832,14 @@ def _prev_engine(zip_name='halcyon-1.70.0.zip'):
             pkg = 'halcyon_prev_' + zip_name.replace('.', '_').replace(
                 '-', '_')
             os.rename(os.path.join(d, 'halcyon'), os.path.join(d, pkg))
+            try:
+                _chain_prev_sky_ray(os.path.join(d, pkg), zip_name)
+            except Exception as exc:                            # noqa: BLE001
+                # never the reason a pin cannot run: the engine imports
+                # as shipped and the line says what that costs
+                print(f'  note {zip_name}: the sky ray stays as shipped '
+                      f'({type(exc).__name__}: {exc}); on a fused BLAS '
+                      "its sky is an ulp off this tree's")
             sys.path.insert(0, d)
             mod = importlib.import_module(pkg + '.core.render')
             atexit.register(shutil.rmtree, d, True)

@@ -2791,6 +2791,164 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   Compile, the warning and error boxes, the export, the evaluator at
   shading time, the GPU port and `device.preflight`). 32 mutations of the
   fix each fail them.
+- **The sky twins hold on any BLAS kernel, and the jitter pair on NumPy
+  2.4 and later (the cloud-container run).** In a cloud container (Linux,
+  Python 3.13, NumPy 2.5.3 on OpenBLAS 0.3.34, an AVX-512 Xeon) `run_all`
+  failed 20 checks that demand `d == 0.0` of a GPU sky twin and raised in
+  one test, beside the 1.89.0 zip pins that fail wherever the zip is
+  absent (ten names, twenty checks in the fifteen R251 modules): eight in
+  `test_gpu_sky_pass` (NODES `sky_blend` 10 px, 40 at ss 2 on the block
+  road; GRADIENT 11; HDRI and the env image 13; `shade.simulate`'s
+  mirror), three under Ground Fog (5.96e-07), eight in
+  `test_r251_sky_camera` (the sheared vp 4.47e-08, LightWave's backdrop
+  2.4e-07 to 8.3e-07, the fake device's LW frame), the Super FX plot
+  through the fake device (5.96e-08), and `test_w2_c127_jitter`
+  (`TypeError: only 0-dimensional arrays can be converted to Python
+  scalars`). (1) *One operation, and it is not in the sky.* All twenty are
+  the ray of `render._background_image`: `world = pts @ inv.T`, an
+  (N,4)x(4,4) float32 matmul that NumPy hands to BLAS `sgemm`, against the
+  four statements of `hal_sky_ray`, `((nx*i.x + ny*i.y) + i.z) + i.w`.
+  Nothing in `core/sky.py` and nothing in the simulator's NumPy backend
+  moved -- no `pow`, no `atan`, no `exp`, no reduction. An unfused `sgemm`
+  sums in the shader's order and rounds after every operation; OpenBLAS's
+  Haswell-and-later cores compute the second product fused into the first,
+  `fma(ny, i.y, nx*i.x)` -- one rounding where the chain has two -- and
+  land an ulp away in about three rows of ten on random input. Emulated in
+  float64, that fused chain is bitwise those kernels on 100,000 rows and
+  gives the container's own counts on the suite's frame (10, 40, 11 and 11
+  px; 7.15e-07 on the (7, 3) squeeze). (2) *The variable is the kernel,
+  not the NumPy version.* Measured on that one CPU with the version and
+  the core varied separately (`OPENBLAS_CORETYPE`), twelve configurations
+  of the unfixed tree: NumPy 1.26.4 passes the twenty there, but only
+  because its OpenBLAS 0.3.23 does not know the CPU and falls back to
+  Prescott -- forced to Haswell the same 1.26.4 fails the same twenty;
+  2.0.2, 2.1.3, 2.2.6, 2.3.5, 2.4.6 and 2.5.3 (OpenBLAS 0.3.27 to 0.3.34,
+  which run it as Cooperlake or SkylakeX) fail them; and 2.3.5 and 2.5.3
+  forced to Nehalem or Sandybridge pass them. The verdict follows fused /
+  unfused on every version. So the twenty pass wherever the float32 matmul
+  is unfused -- those cores, or a NumPy without BLAS (its own loop is the
+  chain: measured through the strided path of 1.26.4 to 2.2.6) -- and fail
+  on the default wheel of any CPU OpenBLAS runs as Haswell or later, 1.26
+  to 2.5 alike. Which one the release machine has could not be measured
+  from the container; the new module prints it, and (5) shows the R253
+  round itself ran on a fused one. (3) *The fix is the discipline, not a
+  tolerance.* `core/mathx.unproject_far(nx, ny, inv)` is the chain, one
+  ufunc call per rounding -- `a = nx*i.x; b = ny*i.y; a = a + b; a = a +
+  i.z; a = a + i.w` -- on NumPy's own float32 multiply and add, which are
+  separate correctly rounded operations on every build and CPU (the
+  `view_depth` / `object_space_points` precedent), and `_background_image`
+  and `sky.mode7_rows` (whose docstring promises the frame's own
+  unprojection) call it. At 720p the chain takes 9 ms where the stack and
+  the four-thread `sgemm` took 6, inside the noise of the 165 ms the whole
+  CPU sky of that frame costs. The twins keep `d == 0.0`: a stated
+  tolerance would have had to cover a ray an ulp off, and that is not
+  bounded at the pixel (it flips a band edge or a nearest texel whole,
+  which is why the bar is 0.0). After the change the twenty pass on ten
+  configurations: NumPy 1.26.4, 2.0.2, 2.3.5, 2.4.6 and 2.5.3 on Prescott,
+  Haswell, Cooperlake, SkylakeX and Nehalem, and 2.5.3 with NumPy's own
+  AVX-512 and AVX2 dispatch switched off (`NPY_DISABLE_CPU_FEATURES`: the
+  `pow`, `atan2` and `exp` both roads share return other bits there -- a
+  fifth of `pow`'s results and two fifths of `atan2`'s move without
+  AVX-512 -- and the roads still agree, each calling the same ufunc on the
+  same operands). Bit-neutral on an unfused kernel: the old tree and the
+  new return the same bytes from all 685 `_background_image` calls, all 48
+  `mode7_rows` calls and all 659 `render()` frames of the sky, fog,
+  cube-map and region modules, so every pin of a CPU frame is what it was
+  there. On a fused kernel the sky pixels move by that ulp ONTO those
+  bytes: the 130 skies of the nine GPU-twinned sky tests, 57 of which
+  differed between SkylakeX and Nehalem, are one set of bytes on SkylakeX,
+  Haswell and Nehalem now. Not claimed: a whole CPU frame identical across
+  kernels -- the vertex transforms, the camera matrices' own products and
+  the CPU-only skies (`dirs @ sun`) are still matmuls, read by both roads
+  alike. Closed on the way: a ONE-row product (a frame with one uncovered
+  pixel) took another BLAS routine and another order, off the chain in
+  nearly four rows of five on fused and unfused cores alike; the chain has
+  no batch in it. Left as they were: the three other `@ inv.T`
+  unprojections (the light cones in `core/render.py`, the volume
+  containers in `core/volume.py`) are CPU-only, with no twin to hold. (4)
+  *`raster.jitter_at` answers in the shape it was asked.* The function
+  takes pixel indices of "any shape", runs its hash on `np.atleast_1d` of
+  them (a wrapping uint32 multiply warns on NumPy scalars and wraps
+  silently on arrays) and never gave the shape back: a pair of scalars
+  came out as two (1,) arrays, and the test's `float(jx1)` is a
+  DeprecationWarning from NumPy 1.25 and a TypeError from 2.4. That is the
+  function's leak, not the test's: the offsets now come back in the
+  indices' broadcast shape -- planes for planes (`jitter_offsets`), a list
+  for a list (the compute raster's replay, which indexes `jx[:, None]`),
+  0-d float32 for a scalar pair -- and the R251 test stands as written.
+  This one IS the NumPy version: 1.26.4 to 2.3.5 warn, 2.4.1 to 2.5.3
+  raise. A scan of the whole suite under `sys.monitoring` (every raise of
+  that TypeError recorded, caught or not) found this one site: nothing the
+  suite reaches in the engine converts a (1,) array to a scalar. (5) *Two
+  kinds of pin hold a CPU frame's bytes, and on a fused kernel both held
+  its ray.* There the fix moves ten sky pixels of a 96x72 frame by one ulp
+  (5.96e-08), onto the chain; a machine with a fused kernel could not hold
+  `d == 0.0` against the shader and the bytes of a matmul sky at once, and
+  never could. (a) *The mapping round's three frame digests.*
+  `test_r253_mapping`'s `OLD_FRAME_DIGESTS` ("the pre-edit bytes",
+  computed on `claude-cloud` b0cbe1c) matched in the container before the
+  fix and not after: they are a fused kernel's frames, with its ray in
+  them. So on the machine that computed them the twenty sky twins were red
+  already, and have been since the mapping round at least. The test now
+  renders each scene twice: with the ray put back as the matmul it renders
+  the pre-edit digests, untouched (the ray is the whole difference, 10
+  px), and as it is `FRAME_DIGESTS`. Both rows are the bytes of ONE
+  machine class, as the pre-edit row always was -- a fused BLAS under
+  NumPy's AVX-512 loops (1.26.4, 2.0.2, 2.3.5 and 2.5.3 agree there on
+  Haswell, Cooperlake and SkylakeX); an unfused kernel renders 1539176161
+  / 928542048 / 2436496908 before and after the fix, and a NumPy without
+  the AVX-512 loops other bytes again, because the vertex transforms are
+  matmuls too and `pow` / `atan2` are SIMD loops. Off that class the pin
+  fails exactly as it did; widening it (a digest per class, or a
+  comparison in place of a checksum) is a decision left open. (b) *The
+  previous releases in their zips.* `test_render._prev_engine` renders
+  "bitwise the 1.89.0 engine", and every release computed the ray as the
+  matmul (the line stands exactly once in all 29 revisions of
+  `core/render.py` in the repository, 1.9.0 to 1.92.0). On a fused kernel
+  with the zip present the fix alone would have turned the identity pins
+  red: measured with a stand-in (the pre-fix tree zipped as
+  `halcyon-1.89.0.zip`), 161 failing lines in 13 of the 16 modules that
+  load it, against 27 before (the twelve sky twins those modules hold and
+  two artefacts of the stand-in). The loader now replaces that ONE line in
+  the extracted copy (`world = pts @ inv.T`, and `sky.mode7_rows`' own
+  from 1.90 on) with a call to this tree's `mathx.unproject_far`, appended
+  to the file as its source so the copy stays whole for a worker that
+  imports it afresh: line for line, exactly once or the file is left as
+  shipped and named in a `note` (a release cut after this fix states the
+  chain already and is left alone silently: the 1.92.0 zip the R254
+  ray-road pin asks for), and a failure there never stops the engine
+  importing. On an unfused kernel that is the shipped arithmetic bit for
+  bit, so the zip pins are what they were; on a fused one both engines
+  state the same ray and the pins compare everything else, as they were
+  written to. With it the stand-in run is 4 failing lines (the two
+  artefacts, twice) and no new one, the same against a second stand-in
+  zipped from the 1.90.0 tag, and on Nehalem, over three of the modules,
+  the fixed tree and the pre-fix tree fail the same one check. Pinned in
+  `tests/test_r253_kernels.py` (6 tests, 33 checks, registered in
+  `run_all`), on every machine whatever its BLAS: the chain against a
+  float64-then-round reference (IEEE's own answer for each single
+  operation, with no float32 arithmetic of NumPy's in it) on the demo
+  frame and on 100,000 random rows; four twins of the report at `d ==
+  0.0`, and the SAME four with the emulated fused ray standing in for the
+  chain, which move by the container's counts -- the failure reproduced
+  wherever the suite runs; a source scan (no matmul in the two functions,
+  multiply and add alone in the chain); `mode7_rows` reading the same ray;
+  the shape law, with `float()` of the scalar pair held silent under
+  warnings-as-errors so it bites on NumPy 1.26 too; the loader's
+  replacement on the two lines as the releases wrote them (the chain's
+  bytes after, the machine's matmul before, the line numbers kept, a line
+  that stands twice left alone and named once, a release already on the
+  chain left alone and not named). Six mutations each fail it on fused and
+  unfused kernels alike (the matmul back in `_background_image`, in
+  `mode7_rows`, inside `unproject_far`; the chain reassociated; the
+  reshape dropped; the loader's replacement dropped). The module prints
+  one `note` line, never asserted: `NumPy 2.5.3: this machine's float32
+  matmul is the fused chain, bitwise (an FMA kernel) -- 32375 of 100000
+  rows off the chain` in the container, `... is the chain, bitwise (an
+  unfused kernel)` where the twins were green. With this the container's
+  `run_all` fails the zip pins and nothing else: on the tree this entry
+  landed on, 12,293 checks pass where 12,217 did, and the failing lines
+  that remain are the baseline's zip lines, byte for byte.
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
@@ -3198,6 +3356,19 @@ What headless cannot prove, per feature (the fakebpy / fakeblender stubs validat
   it by name). A wrong argument count or two vector widths in a coded
   shader of a real file: the red line in the node, and the frame shading
   without that node's program rather than failing halfway.
+- The release machine itself, where the zips are (the cloud-container
+  fix was proven on the container's one Xeon, with the kernel varied by
+  `OPENBLAS_CORETYPE` and the previous engine stood in for by this
+  repository's own trees): the `note` line of
+  `tests/test_r253_kernels.py` there, and under Blender's own Python,
+  naming which matmul each NumPy has; and every real zip from 1.70.0 to
+  1.89.0 loading through `_prev_engine` with its sky ray chained -- no
+  `note` naming a zip whose `core/render.py` does not hold the line
+  exactly once -- with the identity pins as they were. NOT run in this
+  round: the container has no zip. If that machine's line says "an FMA
+  kernel", its sky twins were red before this round and are green now;
+  the three mapping frame digests pass there only if its NumPy also runs
+  the AVX-512 loops.
 
 *World Light: the sky's own sun or moon lights the scene.*
 
