@@ -807,6 +807,17 @@ def test_d_light_links_resolve_every_instance():
     check("'Exclude' with nothing resolved stays unlinked, and a lamp "
           'without a collection is untouched',
           res(set(), 'EXCLUDE') == () and res(None, 'ONLY') == ())
+    stale = _linked({'Gone'})
+    stale.exclude_objects = (4,)
+    kept = _linked(None)
+    kept.exclude_objects = (4,)
+    _resolve([stale, kept], rows)
+    check('the resolver decides every picked link (an index left by an '
+          'earlier pass does not survive an unresolved collection) and '
+          'never touches a lamp without one',
+          tuple(stale.exclude_objects) == ()
+          and tuple(kept.exclude_objects) == (4,),
+          f'{stale.exclude_objects} {kept.exclude_objects}')
     clash = [_row('Rock', link_name='Rock [props.blend]'),
              _row('Rock', link_name='Rock')]
     check('a library object does not answer for a local object of the same '

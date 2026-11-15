@@ -149,14 +149,20 @@ every before-number was measured on.
   appended. Names were bare.
 - **What it does now.** `export._resolve_links(lights, objects)` serves
   both sites: every exported row of a name answers, and every row
-  INSTANCED BY a named object. `compat.evaluated_meshes` yields a fifth
-  element, `compat.instancer_name(inst)` -- the outermost object that
-  generated the instance: the empty of a collection instance, the object
-  carrying a geometry-nodes or particle instancer, the parent of a vertex
-  instance -- which `ObjectInfo.instancer` carries (hair rows too). Names
-  are library-qualified (`compat.link_name`: Blender's `name_full`,
-  `ObjectInfo.link_name`). The resolve runs after the hair rows exist, and
-  a volume container follows its object (section 4).
+  INSTANCED BY a named object. `compat.instancer_name(inst)` is the
+  outermost object that generated an instance -- the empty of a
+  collection instance, the object carrying a geometry-nodes or particle
+  instancer, the parent of a vertex instance -- and `ObjectInfo.instancer`
+  carries it (hair rows too). `compat.evaluated_meshes` leaves it in
+  `compat.LAST_INSTANCER[0]` before each yield and `export_scene` reads it
+  while it stands on the item; the generator's four-element yield and its
+  loop head in `export_scene`, which the viewport package rewrote while
+  this one was written, are untouched (the audit's verifier asked for a
+  fifth tuple element: that is the tidier form once both are in, a
+  three-line change). Names are library-qualified (`compat.link_name`:
+  Blender's `name_full`, `ObjectInfo.link_name`). The resolver decides
+  every picked link, runs after the hair rows exist, and a volume
+  container follows its object (section 5).
 - **On the GPU.** With instances resolved a link can hold hundreds of
   indices, and the plan refused above 64. The ladder is one term per RUN
   of consecutive indices now (`GM.link_ladder`: a lone index is the
@@ -360,11 +366,11 @@ Each on both roads; "twin" is max |CPU - GPU| over covered pixels.
 
 ## Tests
 
-tests/test_r254_flags.py, 136 checks, `python3 -m
-halcyon.tests.test_r254_flags` (about 55 s). On the fork point 125 of them
+tests/test_r254_flags.py, 137 checks, `python3 -m
+halcyon.tests.test_r254_flags` (about 55 s). On the fork point 126 of them
 run and 68 fail, at least one per fix. With HALCYON_GLSLANG set its last
-test compiles 18 planned passes of the ambient tail and the link ladder
-under strict GLSL 4.30. The strict gate (tests/glsl_strict.py) is green on
+test adds one: 18 planned passes of the ambient tail and the link ladder
+compile under strict GLSL 4.30. The strict gate (tests/glsl_strict.py) is green on
 this tree: 174 + 396 + 4 + 38 + 3 + 8 + 8 shaders, 0 bad.
 
 Existing tests run green on this tree: test_r254_falloff (152),
@@ -376,12 +382,8 @@ checks). test_r251_lighting_lamps, _lighting_models, _lighting_fog,
 _material and _shadow fail only on the names of the baseline list (the
 1.89.0 zip pins, the sky ulp pins, the Super FX device pin).
 
-Two pins changed:
+One pin changed:
 
-- tests/test_render.py `test_evaluated_meshes_survives_pointer_
-  invalidation`: `for ob, me, _mw, _tmp in compat.evaluated_meshes(dg)`
-  -> `for ob, me, _mw, _tmp, _by in ...` (the generator yields the
-  instancer's name as a fifth element).
 - tests/test_render.py `test_the_shading_routes_fall`: 'a 70-object
   linking list refuses by name' with `exclude_objects = tuple(range(70))`
   -> 'a linking list of 70 scattered objects refuses by name' with
@@ -409,10 +411,19 @@ Two pins changed:
 
 ## For the integrator
 
-- Merges into claude-cloud at 4e655f6 without a conflict (checked with
-  `git merge-tree`); on the merged tree tests/test_r254_flags.py and the
-  ray-road, spot-beam, map-soft, falloff, world-light and light-options
-  modules pass.
+- Merges into claude-cloud at 3e30799 (the ray-road, spot-beam, map-soft
+  and viewport packages in) without a conflict, checked with
+  `git merge-tree`; on that merged tree tests/test_r254_flags.py and the
+  viewport, spot-beam, falloff, world-light and light-options modules
+  pass (ray-road and map-soft passed on the merge with 4e655f6).
+- `export.export_lights_into` (the viewport package's): this package only
+  ADDS a line, `_resolve_links(lights, parked.objects or [])`, after the
+  single-index statements that function had. They are redundant now (the
+  resolver decides every picked link) and can be deleted: seven lines
+  from `name_to_index = {o.name: i` to the end of its loop.
+- `compat.evaluated_meshes` keeps its four-element yield; the instancer
+  rides `compat.LAST_INSTANCER` (section 3 says why, and what the tidier
+  form is).
 - `core/render.shaft_sources`: the filter sits at the `out.append` (a
   lamp must be one of `_medium_lamps`) so it merges under the spot
   package's rewrite of the loop head; it may move to the loop head later.
@@ -421,7 +432,6 @@ Two pins changed:
   another name, `test_f_the_panel_says_what_the_flags_do` fails on the
   frame-rate-base rows and names the two clocks: point `scene_clock` at
   the helper.
-- `compat.evaluated_meshes` yields five elements (one caller, export.py).
 - tests/run_all.py: add `test_r254_flags`.
 - A scene with an ambient lamp uploads a `hal_lights` row three texels
   longer; texels 12-15 of each light's block are still reserved zeros.
