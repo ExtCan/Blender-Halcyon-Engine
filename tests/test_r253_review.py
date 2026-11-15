@@ -50,6 +50,16 @@ pinned where it bit.
     whatever the sockets say, so "off" could only strand the OLD sockets
     under the NEW program. The Inline Source tooltip called the property
     the NAME of a Text datablock; it is the source itself.
+(13) A Coded Shader with a Text assigned ran TWO shaders: the exporter
+    compiled the Text for the program (the CPU's truth) and copied the
+    raw inline `source_text` -- the starter shader `init` leaves there --
+    into the graph, which is what the GPU emitter inlines. The deferred
+    pass qualified and drew the starter. The editor and the exporter also
+    disagreed about an EMPTY assigned Text. One rule now
+    (`shaders/compiler.node_source` / `compile_node`): the assigned Text,
+    whatever it holds, else the inline source -- compiled by the editor
+    and the exporter through one call, shipped by the exporter as the
+    graph's source, and the only source the emitter reads.
 """
 import io
 import os
@@ -68,7 +78,7 @@ from ..core import render as R
 from ..core.scene import material_see_through
 from .test_r252_console import _scene as console_scene, console_graph, _render as console_render
 from .test_render import _sk
-from .test_r251_material import _sim_vs_cpu
+from .test_r251_material import _sim_vs_cpu, _job_for
 
 FAILS = []
 f32 = np.float32
@@ -642,6 +652,10 @@ class _CodeSock:
     """One node socket: exactly what rebuild_sockets reads and writes."""
     _DEFAULTS = {'NodeSocketFloat': 0.0, 'NodeSocketInt': 0, 'NodeSocketBool': False,
                  'NodeSocketVector': (0.0, 0.0, 0.0), 'NodeSocketColor': (0.0, 0.0, 0.0, 1.0)}
+    #: bl_idname -> NodeSocket.type, the two things export.serialize_tree
+    #: reads off a socket beyond its name and its links
+    _TYPES = {'NodeSocketFloat': 'VALUE', 'NodeSocketInt': 'INT', 'NodeSocketBool': 'BOOLEAN',
+              'NodeSocketVector': 'VECTOR', 'NodeSocketColor': 'RGBA', 'NodeSocketShader': 'SHADER'}
 
     def __init__(self, node, stype, name):
         self.node, self.bl_idname, self.name = node, stype, name
@@ -650,6 +664,14 @@ class _CodeSock:
         self.halcyon_is_image = False
         if stype in self._DEFAULTS:
             self.default_value = self._DEFAULTS[stype]
+
+    @property
+    def type(self):
+        return self._TYPES[self.bl_idname]
+
+    @property
+    def is_linked(self):
+        return bool(self.links)
 
 
 class _CodeSockets(list):
@@ -901,8 +923,8 @@ def test_code_node_props_do_what_their_tooltips_say():
     check('...and every property the node still declares keeps a tooltip at the 40-character bar',
           all(len(str(Node.__annotations__[k].kw.get('description') or '')) >= 40 for k in live),
           str({k: len(str(Node.__annotations__[k].kw.get('description') or '')) for k in live}))
-    check('the exporter ships language, as_surface and source_text for the node, as before',
-          EX.NODE_PROPS['HALCYON_CodeNode'] == ('language', 'as_surface', 'source_text'))
+    check('the exporter copies language and as_surface verbatim (the source ships RESOLVED: finding 13)',
+          EX.NODE_PROPS['HALCYON_CodeNode'] == ('language', 'as_surface'))
     root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
     here, named = os.path.abspath(__file__), []
     for folder, dirs, files in os.walk(root):
@@ -968,7 +990,7 @@ def test_code_node_props_do_what_their_tooltips_say():
         check('the export of a flagged node carries the NEW program (the picture never waited for a build)',
               uniforms(programs.get(n.name)) == ['gain', 'edge', 'stripes'] and stale(n) and not warnings,
               f'{uniforms(programs.get(n.name))} {warnings} {state(n)}')
-        check('...and exactly the three shipped properties', sorted(props) == ['as_surface', 'language', 'source_text'],
+        check('...and exactly the three shipped keys', sorted(props) == ['as_surface', 'language', 'source_text'],
               str(sorted(props)))
         op = SN.HALCYON_OT_compile_shader()
         op.node, op.report = n.name, (lambda *_a: None)
@@ -992,6 +1014,287 @@ def test_code_node_props_do_what_their_tooltips_say():
         check('...and an assigned Text takes its place on both roads',
               inline.get_source() == _CODE_B and uniforms(inline.compile_source()) == ['gain', 'edge', 'stripes']
               and uniforms(EX._compile_node(inline)[0]) == ['gain', 'edge', 'stripes'])
+
+
+#: the master's sockets at tests/scenebuild.add_coded_floor's values
+_MASTER_SOCKETS = (
+    ('NodeSocketColor', 'Diffuse Color', (0.55, 0.55, 0.6, 1.0)), ('NodeSocketColor', 'Vertex Color', (1.0, 1.0, 1.0, 1.0)),
+    ('NodeSocketFloat', 'Vertex Color Mix', 0.0), ('NodeSocketFloat', 'Diffuse Level', 1.0),
+    ('NodeSocketColor', 'Specular Color', (1.0, 1.0, 1.0, 1.0)), ('NodeSocketFloat', 'Specular Level', 0.0),
+    ('NodeSocketFloat', 'Glossiness', 12.0), ('NodeSocketFloat', 'Roughness', 0.5),
+    ('NodeSocketFloat', 'Ambient', 0.6), ('NodeSocketColor', 'Self-Illumination', (0.0, 0.0, 0.0, 1.0)),
+    ('NodeSocketFloat', 'Opacity', 1.0), ('NodeSocketFloat', 'IOR', 1.45), ('NodeSocketFloat', 'Anisotropy', 0.0),
+    ('NodeSocketFloat', 'Anisotropic Rotation', 0.0), ('NodeSocketFloat', 'Metalness', 0.0),
+    ('NodeSocketFloat', 'Soften', 0.0), ('NodeSocketFloat', 'Reflection', 0.0), ('NodeSocketFloat', 'Translucency', 0.0),
+    ('NodeSocketFloat', 'Toon Size', 0.5), ('NodeSocketFloat', 'Toon Smooth', 0.05))
+
+
+def _code_master_tree(SN, source):
+    """_code_tree's material with a master in it: Value -> Coded Shader ->
+    Halcyon (Diffuse Color) -> Material Output, the wiring test_render's
+    coded GPU twins hold. The Value node reads 0.7, so the linked Gain is
+    not the shader's declared default."""
+    mat = _code_tree(SN, source)
+    tree = mat.node_tree
+    code, out = tree.nodes.get('Coded Shader'), tree.nodes.get('Material Output')
+    tree.nodes.get('Value').outputs['Value'].default_value = 0.7
+    for link in list(code.outputs['Color'].links):
+        tree.links.remove(link)
+    hal = types.SimpleNamespace(name='Halcyon', bl_idname='HALCYON_ShaderNode', id_data=tree, model='LAMBERT',
+                                toon_steps=2)
+    hal.inputs, hal.outputs = _CodeSockets(hal), _CodeSockets(hal)
+    for stype, name, value in _MASTER_SOCKETS:
+        hal.inputs.new(stype, name).default_value = value
+    hal.outputs.new('NodeSocketShader', 'Surface')
+    tree.nodes.append(hal)
+    tree.links.new(code.outputs['Color'], hal.inputs['Diffuse Color'])
+    tree.links.new(hal.outputs['Surface'], out.inputs['Surface'])
+    return mat
+
+
+def _code_twin(graph, programs, keep_plan=False):
+    """The demo floor wearing an exported graph: (d_max, n_bad, gpu, cpu,
+    why) of the CPU frame against the GLSL simulator's frame of the
+    deferred plan, over the covered pixels (_sim_vs_cpu's bar). keep_plan
+    leaves the plan cache as the last frame left it: an edit has to re-plan
+    by its SIGNATURE, not by a cleared cache."""
+    from ..core.scene import Material
+    from ..gpu import shade as GSH
+    st = base_settings(128, 96, shadows=True)
+    st.color_depth, st.dither, st.output_scale = '24', 'NONE', 'NONE'
+    sc = demo_scene(st, with_texture=False)
+    mat = Material(name='Coded', index=0, graph=graph)
+    mat.programs = programs
+    sc.materials[0] = mat
+    with redirect_stdout(io.StringIO()):
+        cpu = np.asarray(R.render(sc, st))
+        g, job = _job_for(sc, st)
+        if not keep_plan:
+            GSH._PLAN_CACHE.clear()
+        passes, why, atlases = GSH.plan_frame(job, g)
+        if passes is None:
+            return None, None, None, cpu, str(why)
+        img, hit = GSH.simulate(job, g, passes, atlases)
+    if img is None:
+        return None, None, None, cpu, str(hit)
+    cov = g.tri >= 0
+    d = np.abs(img[cov] - cpu[cov][:, :3])
+    return float(d.max()), int((d.max(axis=1) > 1e-2).sum()), img, cpu, None
+
+
+def test_code_node_one_source_on_every_road():
+    """A Coded Shader with a Text assigned ran two shaders. The exporter
+    compiled the Text into the program (what the CPU runs on either
+    device) and copied the node's raw inline `source_text` into the
+    graph -- the starter shader `init` writes there and nothing clears --
+    and the graph's copy is what the GPU emitter inlines. The deferred
+    pass QUALIFIED and drew the starter (it refused only when a socket's
+    type clashed with a like-named starter uniform). The editor and the
+    exporter also read an EMPTY assigned Text differently: the editor
+    compiled nothing, the exporter reached past it for the inline source
+    ('' did; one blank line did not). One rule now,
+    shaders/compiler.node_source: the assigned Text, whatever it holds,
+    else the inline source. The editor and the exporter compile through
+    one call (compile_node), the exporter ships that call's source as the
+    graph's, and the emitter reads nothing else -- and refuses by name a
+    graph source that is not its program's own."""
+    import ast
+    import copy
+    import importlib
+    import inspect
+    import textwrap
+    from . import fakebpy
+    fakebpy.install()
+    SN = importlib.import_module('halcyon.nodes.shader_nodes')
+    EX = importlib.import_module('halcyon.export')
+    SC = importlib.import_module('halcyon.shaders.compiler')
+    from ..gpu import emit as GE
+    from ..gpu import shade as GSH
+    Node = SN.HALCYON_CodeNode
+    STARTER = SC.DEFAULT_GLSL
+    # the Text's shader: _CODE_A in a cold tint, so its picture is far from
+    # the (orange) starter's and the twin below cannot pass on the wrong one
+    TEXT = _CODE_A.replace('vec3(1.0, 0.5, 0.25)', 'vec3(0.1, 0.6, 0.9)')
+    held = {'src': TEXT}
+    text = types.SimpleNamespace(name='shader_a', as_string=lambda: held['src'])
+
+    def names(socks):
+        return [s.name for s in socks]
+
+    def exported(n):
+        """The node's whole tree through the real export."""
+        images, programs, warnings = {}, {}, []
+        graph = EX.serialize_tree(n.id_data, images, programs, warnings)
+        return graph, programs, warnings
+
+    def roads(n):
+        """What each reader holds for the node: the editor's source, the
+        source the exported program was compiled from (None: no program),
+        the source the graph carries to the GPU emitter -- and the
+        export's warnings."""
+        graph, programs, warnings = exported(n)
+        return (n.get_source(), getattr(programs.get(n.name), 'source', None),
+                graph['nodes'][n.name]['props'].get('source_text'), warnings)
+
+    def short(v):
+        return repr(v)[:48]
+
+    # ---- the reported state: the node's own "New Shader Text", then an edit
+    n = _code_master_tree(SN, text).node_tree.nodes.get('Coded Shader')
+    check('the reported state: a Text assigned, and the starter shader still in source_text (init wrote it)',
+          n.source is text and n.source_text == STARTER and TEXT not in (STARTER, _CODE_A)
+          and names(n.inputs) == ['Gain', 'Tint'],
+          f'{names(n.inputs)} {short(n.source_text)}')
+    ed, pr, gr, warns = roads(n)
+    check('the editor, the exported program and the graph hold ONE source: the Text',
+          ed == pr == gr == TEXT and not warns, f'editor {short(ed)} program {short(pr)} graph {short(gr)} {warns}')
+    check('...and the inline property is not what ships while a Text is assigned', gr != n.source_text, short(gr))
+
+    # ---- the picture: the frame pass draws the Text, as the CPU does
+    graph_a, programs_a, _w = exported(n)
+    d, bad, _gpu, cpu_a, why = _code_twin(graph_a, programs_a)
+    check('a Text-sourced coded shader still qualifies for the deferred pass', why is None, str(why))
+    check('...and its GPU frame IS the CPU frame (the pass drew the starter shader here)',
+          d is not None and bad == 0 and d < 6e-3, f'max {d} bad {bad}')
+    # ---- an edit in the Text Editor between two frames, the plan cache kept
+    # (it holds the plan of the frame above: the Text before the edit)
+    plans = len(GSH._PLAN_CACHE)
+    held['src'] = TEXT.replace('tint * gain', 'tint.bgr * gain')
+    check('the edit is a new source with the same sockets (nobody pressed Compile)',
+          held['src'] != TEXT and names(n.inputs) == ['Gain', 'Tint'])
+    graph_b, programs_b, _w = exported(n)
+    d, bad, _gpu, cpu_b, why = _code_twin(graph_b, programs_b, keep_plan=True)
+    check('the edited Text is a different picture on the CPU', _dmax(cpu_b, cpu_a) > 0.1, str(_dmax(cpu_b, cpu_a)))
+    check('...and the GPU frame follows it past the cached plan (the source rides the graph the plan signs)',
+          why is None and bad == 0 and d < 6e-3 and len(GSH._PLAN_CACHE) == plans + 1,
+          f'{why} max {d} bad {bad} plans {plans} -> {len(GSH._PLAN_CACHE)}')
+
+    # ---- what 1.92.0 shipped: the inline property under the graph's key
+    graph_old = copy.deepcopy(graph_a)
+    graph_old['nodes'][n.name]['props']['source_text'] = n.source_text
+    _d, _b, gpu_starter, _c, why = _code_twin(graph_old, {n.name: SC.compile_shader(STARTER)})
+    check('the starter shader is a DIFFERENT picture on this floor (the twins here can tell the two apart)',
+          gpu_starter is not None and _dmax(gpu_starter, cpu_a) > 0.3,
+          f'{why} {None if gpu_starter is None else _dmax(gpu_starter, cpu_a)}')
+    _d, _b, gpu_old, _c, why = _code_twin(graph_old, programs_a)
+    check('a graph source that is not its program\'s own is REFUSED by name, never drawn (the CPU renders it)',
+          gpu_old is None and 'not the source its program was compiled from' in str(why), str(why))
+
+    # ---- the one state that used to refuse instead: a starter uniform's
+    # NAME under another type, here with the out variable renamed too
+    held['src'] = ('uniform float baseColor = 0.35;\nuniform vec3 tint = vec3(0.2, 0.9, 0.4);\n\n'
+                   'out vec4 Shade;\n\nvoid main() {\n    Shade = vec4(tint * baseColor, 1.0);\n}\n')
+    check('the Compile press rebuilds the sockets from the Text (a float Base Color, an out named Shade)',
+          n.compile_source() is not None and names(n.inputs) == ['Base Color', 'Tint']
+          and n.inputs['Base Color'].type == 'VALUE' and names(n.outputs) == ['Shade'] and not n.error,
+          f'{names(n.inputs)} {names(n.outputs)} {n.error}')
+    tree = n.id_data
+    tree.links.new(n.outputs['Shade'], tree.nodes.get('Halcyon').inputs['Diffuse Color'])
+    graph_c, programs_c, _w = exported(n)
+    d, bad, _gpu, _cpu, why = _code_twin(graph_c, programs_c)
+    check('a Text reusing a starter uniform name under another type, out renamed: qualifies, and the twin holds',
+          why is None and bad == 0 and d < 6e-3, f'{why} max {d} bad {bad}')
+
+    # ---- an EMPTY assigned Text is an empty source on every road
+    for label, blank in (('empty', ''), ('one blank line', '\n'), ('spaces and newlines', '  \n\n')):
+        held['src'] = blank
+        before = names(n.inputs)
+        got = n.compile_source()
+        check(f'an assigned Text that is {label}: the editor compiles nothing, keeps the sockets and says so by name',
+              got is None and names(n.inputs) == before and 'shader_a' in n.error and 'empty' in n.error, repr(n.error))
+        ed, pr, gr, warns = roads(n)
+        check('...and so does the export: no program, the blank source in the graph (NOT the inline starter), '
+              'one warning naming the node and the Text',
+              ed == gr == blank and pr is None and n.source_text == STARTER and len(warns) == 1
+              and n.name in warns[0] and 'shader_a' in warns[0] and 'empty' in warns[0],
+              f'editor {short(ed)} program {short(pr)} graph {short(gr)} {warns}')
+    op, said = SN.HALCYON_OT_compile_shader(), []
+    op.node, op.report = n.name, (lambda kind, msg: said.append((kind, msg)))
+    got = op.execute(types.SimpleNamespace(space_data=types.SimpleNamespace(edit_tree=tree), active_node=None))
+    check('the Compile button on an emptied Text is cancelled with that reason (not a bare "Compile failed")',
+          got == {'CANCELLED'} and len(said) == 1 and said[0][0] == {'ERROR'} and 'shader_a' in said[0][1], f'{got} {said}')
+    held['src'] = ''
+    graph_e, programs_e, _w = exported(n)
+    d, bad, _gpu, cpu_e, why = _code_twin(graph_e, programs_e)
+    check('an emptied Text reads zeros on BOTH roads (the exporter ran the unseen inline starter under it)',
+          not programs_e and why is None and bad == 0 and d < 6e-3, f'{sorted(programs_e)} {why} max {d} bad {bad}')
+
+    def gone():
+        raise ReferenceError('StructRNA of type Text has been removed')
+
+    n.source = types.SimpleNamespace(name='removed', as_string=gone)
+    ed, pr, gr, warns = roads(n)
+    check('a Text that cannot be read is an empty source too, on every road',
+          ed == gr == '' and pr is None and len(warns) == 1 and 'removed' in warns[0], f'{short(ed)} {short(gr)} {warns}')
+
+    # ---- no Text assigned: the inline source, on every road
+    n.source, n.source_text = None, _CODE_A
+    check('with no Text the node compiles its inline source', n.compile_source() is not None
+          and names(n.inputs) == ['Gain', 'Tint'] and not n.error, f'{names(n.inputs)} {n.error}')
+    tree.links.new(n.outputs['Color'], tree.nodes.get('Halcyon').inputs['Diffuse Color'])
+    ed, pr, gr, warns = roads(n)
+    check('...and the editor, the program and the graph hold that one source', ed == pr == gr == _CODE_A and not warns,
+          f'editor {short(ed)} program {short(pr)} graph {short(gr)} {warns}')
+    graph_i, programs_i, _w = exported(n)
+    d, bad, _gpu, _cpu, why = _code_twin(graph_i, programs_i)
+    check('...and the inline source twins on the GPU through the real export', why is None and bad == 0 and d < 6e-3,
+          f'{why} max {d} bad {bad}')
+    n.source_text = '  \n'
+    got = n.compile_source()
+    ed, pr, gr, warns = roads(n)
+    check('no Text and a blank inline source: nothing compiles and nobody complains (as it always was)',
+          got is None and n.error == '' and ed == gr == '  \n' and pr is None and not warns, f'{n.error!r} {warns}')
+
+    # ---- the rule is ONE function, read from the code itself
+    def reads(f):
+        """Every attribute name and string constant a function mentions."""
+        tree_ = ast.parse(textwrap.dedent(inspect.getsource(f)))
+        return ({a.attr for a in ast.walk(tree_) if isinstance(a, ast.Attribute)}
+                | {c.value for c in ast.walk(tree_) if isinstance(c, ast.Constant) and isinstance(c.value, str)
+                   and '\n' not in c.value and ' ' not in c.value})
+
+    def calls(f):
+        tree_ = ast.parse(textwrap.dedent(inspect.getsource(f)))
+        return {ast.unparse(c.func) for c in ast.walk(tree_) if isinstance(c, ast.Call)}
+
+    check('the node module and the exporter import the SAME two functions from shaders/compiler',
+          SN.node_source is SC.node_source and SN.compile_node is SC.compile_node
+          and EX.compile_node is SC.compile_node)
+    check('get_source is node_source; the editor and the exporter both compile through compile_node',
+          calls(Node.get_source) == {'node_source'} and 'compile_node' in calls(Node.compile_source)
+          and calls(EX._compile_node) == {'compile_node'} and 'node_source' in calls(SC.compile_node),
+          f'{calls(Node.get_source)} {calls(Node.compile_source)} {calls(EX._compile_node)}')
+    own = {'source', 'source_text', 'as_string', 'language', 'try_compile'}
+    resolve = {f.__qualname__: sorted(own & (reads(f) | calls(f)))
+               for f in (Node.get_source, Node.compile_source, EX._compile_node)}
+    check('...and none of the three resolves a source, reads the Text or picks the language itself',
+          not any(resolve.values()), str(resolve))
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    readers = []
+    for folder, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('__pycache__', 'tests')]
+        for fname in files:
+            if fname.endswith('.py') and 'as_string' in open(os.path.join(folder, fname), encoding='utf-8').read():
+                readers.append(os.path.relpath(os.path.join(folder, fname), root).replace(os.sep, '/'))
+    check('exactly one file reads a Text datablock\'s contents: shaders/compiler.py',
+          readers == ['shaders/compiler.py'], str(readers))
+    check('the verbatim property table does not carry source_text (it would ship the inline copy again)',
+          'source_text' not in EX.NODE_PROPS['HALCYON_CodeNode'])
+    emit_tree = ast.parse(textwrap.dedent(inspect.getsource(GE.e_code_node)))
+    keys = sorted({c.args[1].value for c in ast.walk(emit_tree)
+                   if isinstance(c, ast.Call) and ast.unparse(c.func) == 'prop' and len(c.args) > 1
+                   and isinstance(c.args[1], ast.Constant)})
+    check('the GPU emitter reads ONE source key, source_text (the \'__source\' nothing ever wrote is gone)',
+          keys == ['as_surface', 'language', 'source_text'] and '__source' not in reads(GE.e_code_node), str(keys))
+
+    # ---- the two tooltips state the rule between them
+    tip = SN.PROP_TIPS[('HALCYON_CodeNode', 'source')]
+    check('the Text tooltip says an assigned Text is the source whatever it holds, and that the sockets wait '
+          'for Compile (it promised a recompile "on every edit"; typing in the Text Editor fires nothing on the node)',
+          len(tip) >= 40 and 'whatever it holds' in tip and 'empty text' in tip.lower() and 'on compile' in tip.lower()
+          and 'every edit' not in tip and Node.__annotations__['source'].kw.get('description') == tip, tip)
+    check('...and the Inline Source tooltip still gives the other half: the source while no Text is assigned',
+          'no text datablock' in SN.PROP_TIPS[('HALCYON_CodeNode', 'source_text')].lower())
 
 
 def test_code_node_rebuild_survives_undo_redo_and_load():
