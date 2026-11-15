@@ -564,8 +564,13 @@ def test_b_lamp_samples_override():
         c = frame(0, 16, method)
         d = frame(4, 4, method)
         tag = 'traced' if method == 'RAY' else 'mapped'
+        # traced: 4 against 16 rays is visibly different grain. Mapped:
+        # a sized lamp's penumbra is a continuous ramp at any count
+        # (core/softmap filters 4 taps per sample), so more Samples
+        # only refine it -- the dial still moves the frame, by less
+        bar = 0.02 if method == 'RAY' else 2e-3
         check(f'{tag}: the lamp\'s Samples moves the frame',
-              float(np.abs(a - b).max()) > 0.02,
+              float(np.abs(a - b).max()) > bar,
               f'max {float(np.abs(a - b).max()):.4f}')
         check(f'{tag}: lamp 16 under render 4 is render 16 bitwise',
               bool(np.array_equal(b, c)))
