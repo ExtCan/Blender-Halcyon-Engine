@@ -335,13 +335,17 @@ def test_a_neutrality():
             for mode in ('BRIGHTEST', 'FIRST', 'NEAREST'):
                 lamps = _many_lamps(n)
                 st_l = _settings(max_lights=limit, light_limit_mode=mode)
-                for centre in (None, np.zeros(3, f32)):
-                    got = LI.select_lights(lamps, st_l, centre)
-                    want = _old_select_lights(lamps, st_l, centre)
-                    same = same and len(got) == len(want) and \
-                        all(x is y for x, y in zip(got, want))
+                # a bare lamp list (no reference to measure against) is
+                # the raw ranking it always was; WITH a reference the
+                # limit ranks on what a lamp delivers (the R254 falloff
+                # fix, tests/test_r254_falloff.py), a different and
+                # deliberate selection that the mark must not disturb
+                got = LI.select_lights(lamps, st_l)
+                want = _old_select_lights(lamps, st_l)
+                same = same and len(got) == len(want) and \
+                    all(x is y for x, y in zip(got, want))
     check('select_lights returns the pre-R254 selection, object for '
-          'object, for every lamp list without a world light', same)
+          'object, for every bare lamp list without a world light', same)
     check('the demo frame is unchanged by all of the above', np.array_equal(
         ref, _render(demo_scene(_settings(), with_texture=False),
                      _settings())))
@@ -808,15 +812,25 @@ def test_h_behaves_like_a_lamp():
         lamps11 = _many_lamps(11)
         wl = WL.make_light(World(mode='BRYCE', world_light_strength=0.01))
         st_l = _settings(max_lights=8, light_limit_mode=mode)
-        for centre in (None, np.zeros(3, f32)):
-            sel = LI.select_lights(lamps11 + [wl], st_l, centre)
-            rest = _old_select_lights(
-                lamps11, _settings(max_lights=7, light_limit_mode=mode), centre)
+        # the reference the frame hands the limit (LI.limit_reference):
+        # a grid on the scene's bounds, its guard distance, the eye
+        _g = np.array([-4.0, 0.0, 4.0], f32)
+        ref_l = (np.stack(np.meshgrid(_g, _g, _g, indexing='ij'),
+                          -1).reshape(-1, 3).astype(f32),
+                 0.7, np.zeros(3, np.float64))
+        st_7 = _settings(max_lights=7, light_limit_mode=mode)
+        for reference in (None, ref_l):
+            sel = LI.select_lights(lamps11 + [wl], st_l, reference)
+            # the lamps alone under the seven slots left: the raw
+            # ranking for a bare list, the delivered-light ranking
+            # (scene order) with a reference
+            rest = _old_select_lights(lamps11, st_7) if reference is None \
+                else LI.select_lights(lamps11, st_7, reference)
             check(f'light limit 8 / {mode}'
-                  + ('' if centre is None else ' with a centre')
+                  + ('' if reference is None else ' with a reference')
                   + ': the world light keeps a slot however weak, and the '
                   'lamps are ranked for the seven left',
-                  len(sel) == 8 and sel[-1] is wl
+                  len(sel) == 8 and sel[-1] is wl and len(rest) == 7
                   and all(a is b for a, b in zip(sel, rest)))
     check('light limit 1 keeps the world light alone',
           LI.select_lights(_many_lamps(4) + [wl],
