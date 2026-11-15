@@ -1840,6 +1840,37 @@ def limit_strength(light, pts, guard, settings):
     return k * w / (4.0 * np.pi)
 
 
+def is_ambient_lamp(light):
+    """True for a lamp that is ONLY ambient: the AMBIENT type, and any
+    lamp with Ambient Only ticked (R254).
+
+    Such a lamp feeds the ambient pool (ambient_light_split) and
+    nothing else: it has no direction to shade from, so it is no
+    member of the frame's lamp list -- no diffuse or specular lobe, no
+    shadow, no beam, shaft or flare, no slot under the Light Limit.
+    Ambient Only used to be read by the pool alone: the lamp kept
+    lighting and shadowing as before with the ambient added on top.
+    This is the one predicate every reader of the lamp list asks."""
+    return str(getattr(light, 'type', '')).upper() == 'AMBIENT' or \
+        bool(getattr(light, 'ambient_only', False))
+
+
+def lights_volume(light):
+    """The sign a lamp's scatter takes in a medium (a volume container,
+    its own visible beam): +1.0, -1.0 for a Negative lamp, or 0.0 for a
+    lamp that lights no medium at all -- an ambient lamp (no position)
+    and an Only Shadow lamp (it adds no light anywhere, it only takes
+    it away where its shadow falls on a surface) (R254).
+
+    The media used to read none of the contribution flags: a Negative
+    lamp brightened the fog it should darken, an Only Shadow lamp lit
+    it. +1.0 for every lamp without those flags, so a scene that does
+    not use them marches exactly as before."""
+    if is_ambient_lamp(light) or getattr(light, 'only_shadow', False):
+        return 0.0
+    return -1.0 if getattr(light, 'negative', False) else 1.0
+
+
 #: R254: how the Light Limit chooses. `reference` is limit_reference's
 #: (pts, guard, eye), or a callable returning it that is read only when
 #: the limit actually drops a lamp (frame_lights hands in the scene's):
@@ -1853,7 +1884,7 @@ def limit_strength(light, pts, guard, settings):
 #: the limit comes back untouched.
 def select_lights(lights, settings, reference=None):
     """Emulate a hardware light limit by keeping only the strongest N."""
-    active = [l for l in lights if l.type != 'AMBIENT']
+    active = [l for l in lights if not is_ambient_lamp(l)]
     limit = int(settings.max_lights)
     if limit <= 0 or len(active) <= limit:
         return active
@@ -1947,6 +1978,44 @@ def limit_report(scene, settings, remember=False):
             f'{len(out)} of {len(lights)} lamps are not lit ({names}). '
             'Raise Light Limit in Render Properties > Lighting, or set it '
             'to 0 for no limit')
+
+
+#: R254: the flat ambient level above which an ambient lamp is called
+#: out (the panel's red row, the render's report): past 2.0 every
+#: surface is over twice its own colour
+AMBIENT_BRIGHT = 2.0
+
+
+def ambient_level(light):
+    """The flat level an ambient lamp adds to the pool, as one number:
+    its Energy times its strongest colour channel (R254)."""
+    try:
+        col = max(float(c) for c in getattr(light, 'color', (1.0, 1.0, 1.0)))
+    except (TypeError, ValueError):
+        col = 1.0
+    return abs(float(getattr(light, 'energy', 0.0))) * col
+
+
+def ambient_report(scene):
+    """One line naming the ambient lamps (is_ambient_lamp) whose level
+    whites the frame out, or None (R254).
+
+    The pool reads an ambient lamp's Energy as a FLAT level -- colour x
+    Energy, 1.0 = white ambient -- whatever the lamp's kind, where every
+    other use of a Point lamp's Energy divides its watts by 4 pi d^2.
+    Ambient Only ticked on a lamp at a working wattage therefore gives
+    hundreds of times white, and used to say nothing."""
+    out = [(str(getattr(l, 'name', '') or l.type), ambient_level(l))
+           for l in (getattr(scene, 'lights', None) or ())
+           if is_ambient_lamp(l) and ambient_level(l) > AMBIENT_BRIGHT]
+    if not out:
+        return None
+    names = ', '.join(f"'{n}' at level {v:.4g}" for n, v in out[:4])
+    if len(out) > 4:
+        names += f' and {len(out) - 4} more'
+    return (f'Ambient Only: {names}. An ambient lamp\'s Energy is a flat '
+            'level (1.0 = white ambient), not watts, so the frame whites '
+            'out. Lower it in the Light panel, under Ambient Only')
 
 
 def ambient_light_split(scene, settings):
@@ -2236,6 +2305,19 @@ def style_gain(light, time):
     rate = float(getattr(light, 'light_style_rate', 10.0) or 10.0)
     i = int(np.floor(float(time) * rate)) % len(sstr)
     return style_char_gain(sstr[i])
+
+
+def style_step(light, time):
+    """(step, steps) of the lamp's style string at `time` seconds: the
+    0-based character style_gain reads there and the string's length --
+    (0, 1) for NORMAL. For the panel's status line (R254); the same
+    index expression as style_gain."""
+    key = str(getattr(light, 'light_style', 'NORMAL') or 'NORMAL')
+    sstr = LIGHT_STYLES.get(key, 'm')
+    if sstr == 'm':
+        return 0, 1
+    rate = float(getattr(light, 'light_style_rate', 10.0) or 10.0)
+    return int(np.floor(float(time) * rate)) % len(sstr), len(sstr)
 
 
 def apply_light_styles(scene):

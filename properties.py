@@ -3818,7 +3818,11 @@ class HalcyonLightSettings(PropertyGroup):
                     "Blender Internal material's diffuse ramp and "
                     "terminator bias are not part of the subtraction) -- "
                     "a shadow without a light. With shadows off, or on a "
-                    "lamp that affects no diffuse, it does nothing")
+                    "lamp that affects no diffuse, it does nothing. It "
+                    "lights no fog and draws no beam, shaft or flare. With "
+                    "Negative the subtraction turns over, as in Blender "
+                    "Internal: the lamp gives its light back only where "
+                    "its shadow falls")
     hemi: BoolProperty(
         name="Hemisphere (BI Hemi)", default=False,
         description="Shade this Sun as Blender Internal's Hemi lamp: "
@@ -3920,7 +3924,12 @@ class HalcyonLightSettings(PropertyGroup):
         name="Light Linking", type=bpy.types.Collection,
         description="A collection this lamp treats specially. Every 1990s "
                     "package let you say which objects a light touched, and it "
-                    "is still the quickest way to control a render")
+                    "is still the quickest way to control a render. Every "
+                    "instance of an object in the collection counts, and so "
+                    "does everything instanced by an object in it (the empty "
+                    "of a collection instance, a geometry-nodes or particle "
+                    "instancer); a container's fog and an object's hair "
+                    "follow their object")
     exclude_mode: EnumProperty(name="Linking", default='EXCLUDE', items=_items(
         ('EXCLUDE', "Exclude", "The collection is not lit by this lamp"),
         ('ONLY', "Only", "Nothing but the collection is lit by this lamp")))
@@ -5210,13 +5219,28 @@ GROUP_DOCS = {
         'shadow_color': "Colour inside this light's shadows instead of "
                         "black -- the tinted-shadow trick of period art",
         'diffuse_only': "This light affects only the diffuse term, "
-                        "leaving highlights untouched",
+                        "leaving highlights untouched. Together with "
+                        "Specular Only the lamp lights no surface at all",
         'specular_only': "This light affects only highlights, adding "
-                         "sparkle without lifting the surface",
-        'ambient_only': "This light adds flat ambient everywhere instead "
-                        "of directional light",
+                         "sparkle without lifting the surface: it lights "
+                         "no fog in a volume container either (scatter "
+                         "is a diffuse answer), while the lamp's own "
+                         "Volumetric beam is neither lobe and stays. "
+                         "Together with Diffuse Only the lamp lights no "
+                         "surface at all",
+        'ambient_only': "This light adds flat ambient everywhere INSTEAD "
+                        "of directional light: no diffuse, no highlight, "
+                        "no shadow, no beam, shaft or flare, and no slot "
+                        "under the Light Limit. Its Energy is read as a "
+                        "flat level here, whatever the lamp's kind: "
+                        "colour x Energy joins the ambient, so 1.0 is "
+                        "white ambient (every surface at its full "
+                        "colour) and a Point lamp's hundreds of watts "
+                        "white out the frame -- set it to a fraction",
         'exclude_mode': "Whether the collection below is kept OUT of this "
-                        "light, or is the only thing kept IN it",
+                        "light, or is the only thing kept IN it. Only "
+                        "with a collection that holds no rendered object "
+                        "lights nothing",
     },
     'HalcyonWorldSettings': {
         'mode': "What the sky IS: the material node tree, a flat colour, "

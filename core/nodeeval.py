@@ -6123,6 +6123,16 @@ def n_u16_light_meter(ev, node):
         if lt == 'AMBIENT':
             total += col[None, :] * en
             continue
+        # R254: the meter reads what the lamp gives a diffuse surface --
+        # nothing from an ambient-only, Only Shadow or Specular Only
+        # lamp, a minus sign from a Negative one, and the frame's style
+        # gain on the energy (x 1.0 for a steady lamp, exact). It used
+        # to read the raw Power of every lamp in the list
+        l_sign = LI.lights_volume(l)
+        if l_sign == 0.0 or not getattr(l, 'affect_diffuse', True) \
+                or getattr(l, 'specular_only', False):
+            continue
+        en = l_sign * (en * float(getattr(l, 'style_gain', 1.0)))
         if lt == 'SUN':
             L = -np.asarray(getattr(l, 'direction', (0, 0, -1)),
                             np.float32)

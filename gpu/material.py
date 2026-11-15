@@ -475,6 +475,34 @@ def _generated_frame(src, consts, force_line=False, world_table=False):
 #: the CPU's sample() scales by, so the texel is bitwise its scale.
 LIGHT_TEXEL_STRIDE = 16
 
+#: R254: the AMBIENT TAIL. A scene that carries an ambient lamp (an
+#: AMBIENT light or a lamp with Ambient Only: lights.is_ambient_lamp)
+#: appends three texels after the last light's block --
+#:   tail + 0 = the whole pool        (lights.ambient_light)
+#:   tail + 1 = its engine part       (Global Ambient)
+#:   tail + 2 = its world part        (world ambient + the ambient lamps)
+#: -- the CPU's own float32 triples, which the pass reads in place of
+#: the baked literals. The pool was a literal in every pass while the
+#: plan signature held nothing of the lamps that feed it: an edit of
+#: such a lamp's Power or colour, or one step of its light style, was a
+#: cache hit that drew the old ambient. As values the edit is a hit
+#: plus this row's re-upload, like any other lamp edit. A scene without
+#: an ambient lamp has no tail (the row is the bytes it was) and bakes
+#: its literals as before.
+AMBIENT_TAIL_TEXELS = 3
+
+
+def scene_ambient_lamps(scene):
+    """True when the scene carries a lamp that feeds the ambient pool."""
+    from ..core.lights import is_ambient_lamp
+    return any(is_ambient_lamp(l)
+               for l in (getattr(scene, 'lights', None) or ()))
+
+
+def ambient_tail_base(n_lights):
+    """The texel index of the ambient tail in a row of `n_lights`."""
+    return max(int(n_lights), 1) * LIGHT_TEXEL_STRIDE
+
 
 def pack_light_texels(lights, job=None):
     """The per-light value texture, (1, n*STRIDE, 4) float32.
@@ -501,7 +529,19 @@ def pack_light_texels(lights, job=None):
         from ..core import render as _R
         vp_job = _R.camera_matrices(job.scene.camera, job.width,
                                     job.height)[2]
-    out = np.zeros((1, n * LIGHT_TEXEL_STRIDE, 4), np.float32)
+    scene_job = getattr(job, 'scene', None)
+    tail = scene_job is not None and st_job is not None \
+        and scene_ambient_lamps(scene_job)
+    out = np.zeros((1, n * LIGHT_TEXEL_STRIDE
+                    + (AMBIENT_TAIL_TEXELS if tail else 0), 4), np.float32)
+    if tail:
+        # R254: the ambient tail -- ambient_light_split's own float32
+        # results, read per frame (a plan-cache hit repacks this row)
+        tb = ambient_tail_base(len(lights))
+        a_eng, a_wrld = LI.ambient_light_split(scene_job, st_job)
+        out[0, tb + 0, :3] = LI.ambient_light(scene_job, st_job)
+        out[0, tb + 1, :3] = a_eng
+        out[0, tb + 2, :3] = a_wrld
     for i, light in enumerate(lights):
         b = i * LIGHT_TEXEL_STRIDE
         kind = getattr(light, 'type', 'POINT')
@@ -630,6 +670,44 @@ def pack_light_texels(lights, job=None):
                 out[0, b + 10, 3] = np.float32(light.spot_scale[0])
                 out[0, b + 11, 3] = np.float32(light.spot_scale[1])
     return out
+
+
+def link_runs(objects):
+    """A light link's object indices as runs of consecutive integers:
+    [(lo, hi), ...] ascending, lo == hi for a lone index (R254)."""
+    runs = []
+    for o in sorted({int(v) for v in (objects or ())}):
+        if runs and o == runs[-1][1] + 1:
+            runs[-1][1] = o
+        else:
+            runs.append([o, o])
+    return [(lo, hi) for lo, hi in runs]
+
+
+def link_ladder(objects):
+    """The GLSL sum that is >= 1.0 where td.y (the pixel's object index,
+    an exact integer float) is one of a light link's `objects` -- the
+    unrolled twin of light_surface's isin().
+
+    A lone index is the comparison it always was. R254: a RUN of
+    consecutive indices is one range test, so the link of an instanced
+    forest (every instance of the linked object resolves now, and they
+    export side by side) costs one term instead of one per tree -- and
+    stays under the plan's 64-term refusal, which counts terms."""
+    terms = []
+    for lo, hi in link_runs(objects):
+        if lo == hi:
+            one = _f(float(lo))
+            if lo < 0:
+                # the (-1,) of an 'Only' link that resolved to nothing:
+                # no object carries it, the term is never 1
+                one = f'({one})'
+            terms.append(f'((abs(td.y - {one}) < 0.5) '
+                         '? 1.0 : 0.0)')
+        else:
+            terms.append(f'((td.y > {_f(float(lo) - 0.5)} '
+                         f'&& td.y < {_f(float(hi) + 0.5)}) ? 1.0 : 0.0)')
+    return ' + '.join(terms)
 
 
 def spot_law_glsl(law, exp_on, r):
@@ -2495,9 +2573,7 @@ def _cel_composition(lines, bake, consts, affect_diffuse, affect_specular,
         # own lit step. The generic tail is bypassed: the block closes
         # here.
         if link_c:
-            tests = ' + '.join(f'((abs(td.y - {_f(float(o))}) < 0.5) '
-                               '? 1.0 : 0.0)'
-                               for o in link_c['objects'])
+            tests = link_ladder(link_c['objects'])
             lines.append(f'    float hal_clk = min({tests}, 1.0);')
             if str(link_c.get('mode', 'EXCLUDE')).upper() == 'ONLY':
                 lines.append('    float hal_cm = hal_clk;')
@@ -2805,9 +2881,7 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
             '    vec3 ss_fog = ss_col * (ss_en * ss_el);']
         link_ss = (consts.get('light_links') or {}).get(i)
         if link_ss:
-            tests = ' + '.join(f'((abs(td.y - {_f(float(o))}) < 0.5) '
-                               '? 1.0 : 0.0)'
-                               for o in link_ss['objects'])
+            tests = link_ladder(link_ss['objects'])
             lines.append(f'    float hal_lk{i} = min({tests}, 1.0);')
             mask = f'hal_lk{i}' \
                 if str(link_ss.get('mode', 'EXCLUDE')).upper() == 'ONLY' \
@@ -3158,9 +3232,7 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
         lines.append(f'    float hal_svk = {_sv_call};')
         link = (consts.get('light_links') or {}).get(i)
         if link:
-            tests = ' + '.join(f'((abs(td.y - {_f(float(o))}) < 0.5) '
-                               '? 1.0 : 0.0)'
-                               for o in link['objects'])
+            tests = link_ladder(link['objects'])
             lines.append(f'    float hal_lk{i} = min({tests}, 1.0);')
             mask = f'hal_lk{i}' if str(link.get('mode', 'EXCLUDE')).upper() \
                 == 'ONLY' else f'(1.0 - hal_lk{i})'
@@ -3218,9 +3290,7 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
             lines.append('    hal_osh = hal_osh * hal_osd;')
             link_os = (consts.get('light_links') or {}).get(i)
             if link_os:
-                tests = ' + '.join(f'((abs(td.y - {_f(float(o))}) < 0.5) '
-                                   '? 1.0 : 0.0)'
-                                   for o in link_os['objects'])
+                tests = link_ladder(link_os['objects'])
                 lines.append(f'    float hal_lk{i} = min({tests}, 1.0);')
                 mask = f'hal_lk{i}' \
                     if str(link_os.get('mode', 'EXCLUDE')).upper() == 'ONLY' \
@@ -3411,9 +3481,7 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
         # ONLY lights light just their list; EXCLUDE lights light
         # everything else. Hits carry the same object id through
         # hal_tri_data, exactly as ctx.object_index_raw does at hits.
-        tests = ' + '.join(f'((abs(td.y - {_f(float(o))}) < 0.5) '
-                           '? 1.0 : 0.0)'
-                           for o in link['objects'])
+        tests = link_ladder(link['objects'])
         lines.append(f'    float hal_lk{i} = min({tests}, 1.0);')
         mask = f'hal_lk{i}' if str(link.get('mode', 'EXCLUDE')).upper() \
             == 'ONLY' else f'(1.0 - hal_lk{i})'
@@ -5264,7 +5332,17 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     # R169: the per-light VALUE texture -- one row of texels the light
     # loop fetches instead of baked literals, so lamp edits re-upload
     # instead of recompiling (see LIGHT_TEXEL_STRIDE)
-    if lights and not (vertex_rate or shadeless) and \
+    # R254: the ambient tail rides the same row, so a pass that reads
+    # it declares the sampler even when no lamp is left in its loop
+    amb_tail = consts.get('ambient_tail')
+    if amb_tail is not None and (
+            vertex_rate or shadeless or rad_spec
+            or not bool(consts.get('light_texels', True))):
+        # these passes emit no flat ambient term (the corners carry it,
+        # a shadeless model has none, the radiosity gather replaces it)
+        amb_tail = None
+    if (lights or amb_tail is not None) \
+            and not (vertex_rate or shadeless) and \
             bool(consts.get('light_texels', True)):
         triaux_fns += (
             'uniform sampler2D hal_lights;\n'
@@ -5622,15 +5700,23 @@ void main()
         # verbatim shade_lamp_loop (R155/R156): BI's flat ambient rule
         # covers the WORLD pool only; the engine's Global Ambient stays
         # diffuse-tinted, exactly light_surface's BI branch
-        eng = consts.get('ambient_engine', consts['ambient_color'])
-        wrld = consts.get('ambient_world', (0.0, 0.0, 0.0))
+        eng = _v3(consts.get('ambient_engine', consts['ambient_color']))
+        wrld = _v3(consts.get('ambient_world', (0.0, 0.0, 0.0)))
+        if amb_tail is not None:
+            # R254: the pool's two halves as VALUES (the ambient tail)
+            eng = f'hal_ltex({int(amb_tail) + 1}).xyz'
+            wrld = f'hal_ltex({int(amb_tail) + 2}).xyz'
         lines.append(
-            f'    vec3 total = s.diffuse * ({_v3(eng)}'
+            f'    vec3 total = s.diffuse * ({eng}'
             f' * {_mv(consts, bake.get("ambient", 1.0))})'
-            f' + {_v3(wrld)} * {_mv(consts, bake.get("ambient", 1.0))};')
+            f' + {wrld} * {_mv(consts, bake.get("ambient", 1.0))};')
     else:
+        amb = _v3(consts["ambient_color"])
+        if amb_tail is not None:
+            # R254: the pool as a VALUE (the ambient tail of hal_lights)
+            amb = f'hal_ltex({int(amb_tail)}).xyz'
         lines.append(
-            f'    vec3 total = s.diffuse * ({_v3(consts["ambient_color"])}'
+            f'    vec3 total = s.diffuse * ({amb}'
             f' * {_mv(consts, bake.get("ambient", 1.0))});')
     if ao_spec and not rad_spec:
         # exactly light_surface's order: ambient occlusion scales the

@@ -196,6 +196,41 @@ def uses_nodes(datablock):
         return bool(getattr(datablock, 'use_nodes', True))
 
 
+def link_name(ob):
+    """The name light linking matches an object by: Blender's name_full
+    of the ORIGINAL datablock ('Rock [props.blend]' for an object linked
+    from a library, the plain name for a local one), so a library object
+    does not answer for a local object that shares its name (R254)."""
+    try:
+        orig = getattr(ob, 'original', None) or ob
+        return str(getattr(orig, 'name_full', None) or orig.name)
+    except Exception:                                           # noqa: BLE001
+        return str(getattr(ob, 'name', '') or '')
+
+
+def instancer_name(inst):
+    """The link name of the object that generated a depsgraph instance:
+    the empty of a collection instance, the object carrying a
+    geometry-nodes or particle instancer, the parent of a vertex / face
+    instance -- for a nested instance the outermost one, the object that
+    stands in the scene. '' for a real object (R254: light linking
+    resolves a linked instancer to everything it instances)."""
+    try:
+        if not getattr(inst, 'is_instance', False):
+            return ''
+        par = getattr(inst, 'parent', None)
+        return link_name(par) if par is not None else ''
+    except Exception:                                           # noqa: BLE001
+        return ''
+
+
+#: R254: instancer_name() of the item evaluated_meshes yielded LAST (''
+#: for a real object). The generator writes it just before each yield
+#: and its one caller (export.export_scene) reads it while it stands on
+#: that item; nothing else may iterate the generator in between.
+LAST_INSTANCER = ['']
+
+
 def enable_nodes(datablock):
     """Turn node mode on where the attribute still exists, silently.
 
@@ -323,6 +358,11 @@ def evaluated_meshes(depsgraph, skip=None, space=None):
     survived the old ordering by luck: it hands back geometry the depsgraph
     already owns, so nothing was ever actually freed. Text, curves, surfaces
     and metaballs are the ones that allocate, and they are the ones it broke.
+
+    R254: who generated the item (instancer_name: the empty of a
+    collection instance, a geometry-nodes or particle instancer; '' for
+    a real object) is left in LAST_INSTANCER[0] before each yield, for
+    light linking by instancer.
     """
     try:
         instances = []
@@ -337,18 +377,22 @@ def evaluated_meshes(depsgraph, skip=None, space=None):
             # .original is the bmain-owned datablock: the ONE reference
             # that stays valid after this iteration step ends
             orig = getattr(ob, 'original', None) or ob
-            instances.append((orig, i.matrix_world.copy()))
+            # R254: who instances it, as a plain string (nothing reached
+            # through the instance outlives this step)
+            instances.append((orig, i.matrix_world.copy(),
+                              instancer_name(i)))
     except Exception:                                           # noqa: BLE001
         return
     live = None
     try:
-        for orig, matrix_world in instances:
+        for orig, matrix_world, par in instances:
             if live is not None:
                 free_mesh(live)
                 live = None
             if skip is not None:
                 try:
                     if skip(orig, matrix_world):
+                        LAST_INSTANCER[0] = par
                         yield orig, None, matrix_world, False
                         continue
                 except Exception:                               # noqa: BLE001
@@ -362,6 +406,7 @@ def evaluated_meshes(depsgraph, skip=None, space=None):
             if me is None:
                 continue
             live = ev
+            LAST_INSTANCER[0] = par
             yield ev, me, matrix_world, True
     finally:
         # runs on exhaustion, on an early break, and on close()
