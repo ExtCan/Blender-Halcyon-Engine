@@ -2572,43 +2572,6 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
                             "its faces do not draw", icon='INFO')
 
 
-#: R254: the distance dials each falloff law reads, as the Light panel's
-#: rows -- (property, label; None = the property's own name). ONE table
-#: for a law chosen on the lamp and for one arriving through Scene
-#: Default; core/lights.attenuate and decay_law are the readers, and
-#: tests/test_r254_falloff.py holds the two against each other (a dial
-#: is drawn exactly when the law reads it). None, Inverse and Inverse
-#: Square read no dial at all.
-FALLOFF_ROWS = {
-    'CUSTOM': (('decay_start', None), ('decay_end', None)),
-    'BI_LINEAR': (('decay_end', "Distance"),),
-    'BI_SQUARE': (('decay_end', "Distance"),),
-    'BI_SLIDERS': (('decay_end', "Distance"), ('decay_ld1', None),
-                   ('decay_ld2', None)),
-    'GL_3TERM': (('decay_ld1', None), ('decay_ld2', None)),
-    'POV_FADE_LINEAR': (('decay_end', None),),
-    'POV_FADE_SQUARE': (('decay_end', None),),
-    'GX_GENTLE': (('decay_end', None),),
-    'GX_MEDIUM': (('decay_end', None),),
-    'GX_STEEP': (('decay_end', None),),
-    'NOMINAL_INVERSE': (('decay_end', "Nominal Distance"),),
-    'NOMINAL_INV_SQUARE': (('decay_end', "Nominal Distance"),),
-}
-
-
-def light_falloff_in_use(hs, scene):
-    """The falloff law a lamp runs: its own, or the render's Light
-    Falloff Default while it is left on Scene Default (core/lights.
-    resolved_decay's panel twin). Without a scene, Inverse Square --
-    the render setting's own default."""
-    mode = str(getattr(hs, 'decay', 'DEFAULT') or 'DEFAULT')
-    if mode == 'DEFAULT':
-        mode = str(getattr(getattr(scene, 'halcyon', None),
-                           'light_falloff_default', None)
-                   or 'INVERSE_SQUARE')
-    return mode
-
-
 def scene_clock(scene):
     """Seconds of scene time on the frame the editor stands on, by the
     EXPORTER's rule (what a render of this frame writes to Scene.time):
@@ -2654,6 +2617,43 @@ def light_style_status(hs, scene):
 #: R254: the flat ambient level above which the Ambient Only note turns
 #: into a warning (2.0 is twice white: every surface past its own colour)
 AMBIENT_ONLY_BRIGHT = 2.0
+
+
+#: R254: the distance dials each falloff law reads, as the Light panel's
+#: rows -- (property, label; None = the property's own name). ONE table
+#: for a law chosen on the lamp and for one arriving through Scene
+#: Default; core/lights.attenuate and decay_law are the readers, and
+#: tests/test_r254_falloff.py holds the two against each other (a dial
+#: is drawn exactly when the law reads it). None, Inverse and Inverse
+#: Square read no dial at all.
+FALLOFF_ROWS = {
+    'CUSTOM': (('decay_start', None), ('decay_end', None)),
+    'BI_LINEAR': (('decay_end', "Distance"),),
+    'BI_SQUARE': (('decay_end', "Distance"),),
+    'BI_SLIDERS': (('decay_end', "Distance"), ('decay_ld1', None),
+                   ('decay_ld2', None)),
+    'GL_3TERM': (('decay_ld1', None), ('decay_ld2', None)),
+    'POV_FADE_LINEAR': (('decay_end', None),),
+    'POV_FADE_SQUARE': (('decay_end', None),),
+    'GX_GENTLE': (('decay_end', None),),
+    'GX_MEDIUM': (('decay_end', None),),
+    'GX_STEEP': (('decay_end', None),),
+    'NOMINAL_INVERSE': (('decay_end', "Nominal Distance"),),
+    'NOMINAL_INV_SQUARE': (('decay_end', "Nominal Distance"),),
+}
+
+
+def light_falloff_in_use(hs, scene):
+    """The falloff law a lamp runs: its own, or the render's Light
+    Falloff Default while it is left on Scene Default (core/lights.
+    resolved_decay's panel twin). Without a scene, Inverse Square --
+    the render setting's own default."""
+    mode = str(getattr(hs, 'decay', 'DEFAULT') or 'DEFAULT')
+    if mode == 'DEFAULT':
+        mode = str(getattr(getattr(scene, 'halcyon', None),
+                           'light_falloff_default', None)
+                   or 'INVERSE_SQUARE')
+    return mode
 
 
 class HALCYON_PT_light(HalcyonPanel, Panel):
