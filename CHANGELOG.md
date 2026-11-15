@@ -1866,6 +1866,131 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   shading-batch boundaries on a frame whose pre-pass runs (the same
   chain in the material's own tree and in a group: 0.35 apart along two
   rows at 320x240, nothing at 128x96).
+- **A Coded Shader named in any script reaches the GPU: a letter GLSL
+  cannot hold is spelled as its code point (a node called 'Señal' kept
+  its whole frame on the CPU).** `e_code_node` inlines each coded shader
+  under `_cn<tag>_<name>`, and the tag is the node's graph id with every
+  non-word character flattened to `_` (the entry above). "Word" was
+  Python's, not GLSL's: `\W` is Unicode-aware, so the 'ñ' of a node
+  named 'Señal', a Cyrillic or a CJK name, the letters and digits of
+  every script stayed in the tag and went into the pass as written --
+  `_cnSeñal_main`. A GLSL identifier is `[A-Za-z0-9_]` and nothing else.
+  The entry above saw this from its probes and left it for its own fix.
+  *Wrong picture or fallback: the fallback.* The plan QUALIFIED the
+  material; the device's pre-flight (`gpu/device.preflight`: Halcyon's
+  own GLSL front-end, on the render worker, before the driver is handed
+  anything) refused the text -- "would not compile the pass (line 1209:
+  unexpected character 'ñ'); refused before the driver" -- and a refused
+  pass sends its whole frame to the CPU. So the picture was right, and a
+  scene holding one such node never shaded on the GPU, for nothing but a
+  name any keyboard outside English types. The probe put the real node
+  class (stand-in sockets) through the real `serialize_tree`: 'Señal'
+  alone feeding the master, and 'Señal' beside a second coded shader,
+  'Other', the two summed into the master's Diffuse Color. Both were
+  refused, Cyrillic and CJK names the same, and glslang refuses the same
+  text ("unexpected token") where the simulator does. The same in a real
+  Blender 5.2.2 (the `bpy` module, background; the registered node,
+  `export_material`): Blender keeps each name as it was typed, and all
+  four materials -- 'Señal' alone, beside 'Other', 'Шейдер' beside '色彩',
+  '色' beside '彩' -- were refused with that line. (1) *The spelling.*
+  `gpu/emit._code_spell(key)` is the flattening as it was, then every
+  character still outside ASCII -- by then letters and digits only --
+  written as its code point: `u` and four or more upper-case hex digits.
+  'Señal' is 'Seu00F1al', 'Шейдер' is 'u0428u0435u0439u0434u0435u0440',
+  '色彩' is 'u8272u5F69', a full-width '３' is 'uFF13', a letter beyond the
+  BMP 'u1D6FC'. `_code_tag` asks it for the tag and keeps its clash
+  check; nothing else spells one. (2) *Why the code point and not one
+  more underscore.* Flattening to ASCII ('ñ' to `_`) was tried first,
+  and it qualifies and twins as well. It was not shipped: a name of such
+  letters alone becomes underscores alone -- '色' and '彩' are both `_`,
+  one tag between them, and beside each other they are `_cn__main` and
+  `_cn2___main` -- and GLSL reserves every identifier that holds `__`.
+  glslang 15.1 takes those with a warning (`identifiers containing
+  consecutive underscores ("__") are reserved`) as desktop 4.30 and
+  under Vulkan rules alike, and refuses them below ES 3.00; no driver
+  was asked. A code point is letters and digits, so it adds no
+  underscore at all and can neither make a run nor lengthen one. That is
+  also why it carries no delimiter: `_u00F1_` makes a run between two
+  such letters, a leading `_` makes one after any punctuation, a
+  trailing one against the `_` that joins tag and name. (3) *Still one
+  tag per node.* The spelling is many-to-one, as the flattening is: a
+  node NAMED 'Seu00F1al' beside 'Señal' spells the same tag, and 'Señal
+  B' is 'Señal' plus `_` plus the start of a name (`B_k` under the one
+  and `k` under the other are both `_cnSeu00F1al_B_k`). `_code_tag`
+  settles both as it settles 'Coded Shader' beside `Coded_Shader` -- the
+  ordinal in front, `2_Seu00F1al` -- with no line of `_tags_clash`
+  changed: every tag is `[A-Za-z0-9_]` now, the alphabet its brute-force
+  check is over. A code point begins with a letter, so '色 彩' beside '色'
+  takes the ordinal (rightly: `u5F69_k` in the one is `k` in the other)
+  and 'Señal.001' beside 'Señal' does not, as Blender's own suffix never
+  did. (4) *What does not move.* A tag that was plain ASCII is the tag
+  it was, to the letter: the first substitution is the old line, and the
+  second touches only what no driver could read. That is every name the
+  pre-flight ever let through, punctuation in other scripts included
+  ('A—B' is still `A_B`), and with them `_cncode_main`,
+  `_cncode_baseColor`, `_cncode2_baseColor`, `_cncode_pattern` and the
+  tags the same-name test pins. It also means the double underscores
+  some ASCII names already make (`Group\/Coded Shader` is
+  `Group__Coded_Shader`, and a name with two spaces in a row makes one
+  too) are still made: pinned, on the footing they were, and not this
+  entry's to move. (5) *The strict gate.* `tests/glsl_strict.py` (the
+  tool, glslang) compiled no coded shader at all. `check_coded` compiles
+  the pass of eight pairs of names through the real exporter -- plain
+  ones, the two kinds of clash, 'Señal' beside 'Other' and beside a node
+  named 'Seu00F1al', Cyrillic beside CJK, one letter each, a full-width
+  digit beside a letter beyond the BMP -- as GLSL 4.30: eight of eight,
+  where the old flattening fails five by name. A refusal counts as a
+  failure there, because each of those names is meant to reach the
+  driver. `compile_source` now writes UTF-8 and decodes glslang's answer
+  leniently: glslang quotes ONE byte of the offending letter, and
+  decoding that strictly raised out of the check instead of failing the
+  shader by name. *Pictures that change*: none on the CPU. A frame
+  holding such a node shaded on the CPU and now shades on the GPU
+  wherever the GPU device is selected: 2.0e-5 off the CPU frame on the
+  simulator, the number the ASCII-named reference twins at, and both
+  frames bit for bit the frames of the same tree under ASCII names. In
+  the real Blender 5.2.2 the four materials above read the same: 2.0e-5,
+  bit for bit the reference's frames, the pre-flight silent. Pinned in
+  `test_code_node_non_ascii_name_reaches_the_gpu` (33 checks), through
+  the real `serialize_tree`: 'Señal' alone and beside 'Other' qualifying
+  and twinning (under 6e-3, no pixel over 1e-2), the CPU's frame and the
+  simulator's each bit for bit that of the same tree under ASCII names;
+  Cyrillic beside CJK, '色' beside '彩' and 'Señal' beside a node named
+  'Seu00F1al' the same; the `B_k` / `k` pair under 'Señal' / 'Señal B'
+  on the frame of unrelated names; the pass text plain ASCII, its six
+  mangled names exact, each an identifier and none holding `__`, the
+  device's sampler and uniform names with them, and the pre-flight
+  letting it through; the 1.92.0 flattening put back -- the plan
+  qualifying a text that is not ASCII, the pre-flight and the simulator
+  each refusing it by name, the CPU frame right all along -- so the
+  checks can tell; the spellings (a full-width digit, an Arabic-Indic
+  one, a superscript, a letter beyond the BMP); the pinned tags where
+  they were; over 16104 names up to four characters, all 7380 whose
+  flattening was plain ASCII unmoved, every tag in the alphabet, and the
+  runs of underscores the flattening's own, one for one; 399 names of
+  letters and digits alone spelling 399 tags without an underscore; the
+  clashing tags by name, one per node, none able to spell another's;
+  every name the port hands on under such a tag, a sampler's included;
+  and the rule read from the code (`_code_tag` spells through
+  `_code_spell` alone). Seventeen mutations each fail it: the old
+  flattening, in `_code_spell` or left behind in `_code_tag`; the
+  ASCII-only flatten; the code point between underscores, with a leading
+  one or with a trailing one; unpadded, lower-case or without its
+  letter; cut to 16 bits; one fixed letter for every such character;
+  every non-ASCII character spelled, punctuation too (tags the
+  pre-flight let through move); Latin-1 alone, the BMP alone, or letters
+  without digits; `_code_tag` without its clash check or without its
+  memory. *Seen from the same probes and left for their own fixes*: with
+  shadows on, the RAW text of a material pass declares `uniform
+  sampler2D hal_shadowpack;` once per shadowed lamp (beside each
+  `hal_shadow_vis<i>`), and with two such lamps -- the demo scene's --
+  glslang refuses it as a redefinition (declared once it compiles;
+  `strip_declarations` takes every such line off on the CreateInfo road,
+  so only the legacy constructor would hand a driver the raw text) --
+  the strict gate plans every scene with shadows off and has never seen
+  it, which is why `check_coded` plans that way too; and a comment in
+  another script inside the user's own GLSL travels in the pass as
+  written (the front-end and glslang both skip it; no driver was asked).
 - **A uniform the driver stripped never fails a pass (the llvmpipe field
   log).** A real Blender 5.2.2 session on the OpenGL backend (Mesa
   llvmpipe) printed, for every GPU frame, `rasterising on the CPU: raster
@@ -2402,6 +2527,19 @@ What headless cannot prove, per feature (the fakebpy / fakeblender stubs validat
   and matching on the driver under the ordinal tag
   (`_cn2_Coded_Shader_main`); and the F12 report naming a group's
   failing Coded Shader by its path ("Group/Coded Shader: ...").
+- A Coded Shader named in another script, on a real driver. The fix is
+  proven on the simulator, on the device's pre-flight, on glslang 15.1
+  (the pass as GLSL 4.30) and, through the registered node and
+  `export_material`, in a real Blender 5.2.2 as the `bpy` module in
+  background (refused before, 2.0e-5 after) -- never on a GPU and never
+  in the UI. Open there: a node renamed 'Señal' (and one in Cyrillic or
+  CJK) in a live file compiling and matching on the OpenGL, Vulkan and
+  Metal backends under its code-point tag (`_cnSeu00F1al_main`), with no
+  "shading on the CPU: the driver rejected ..." line in the console; and
+  the double underscores that names with runs of punctuation make as
+  they always did (`_cnGroup__Coded_Shader_main`), which glslang takes
+  with a warning under desktop and Vulkan rules and which no driver and
+  no Metal toolchain has been asked about.
 - The llvmpipe session itself (Blender 5.2.2, OpenGL backend, Mesa
   llvmpipe): the three lines gone, `raster split` and `shade split`
   printed in their place, and the Timing Breakdown naming the stripped

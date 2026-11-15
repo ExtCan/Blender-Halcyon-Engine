@@ -1219,12 +1219,45 @@ def _tags_clash(a, b):
     return not b[len(a) + 1:len(a) + 2].isdigit()
 
 
+def _code_spell(key):
+    """One graph id, spelled in the characters a GLSL identifier may hold.
+
+    Every non-word character is flattened to '_', as it always was -- and
+    R253 (review): "word" is Python's, not GLSL's. `\\W` is Unicode-aware,
+    so the 'ñ' of a node named 'Señal', a Cyrillic or a CJK name, every
+    letter and digit of every script stayed in the tag and went into the
+    pass as `_cnSeñal_main`. GLSL identifiers are [A-Za-z0-9_] and nothing
+    else: the plan qualified, the device's pre-flight refused the text
+    ("unexpected character 'ñ'") and the whole frame shaded on the CPU --
+    the right picture, never on the GPU, for a name any keyboard outside
+    English types. So each word character that is not ASCII is spelled as
+    its code point, 'u' and four or more hex digits: 'Señal' is
+    'Seu00F1al', '色彩' is 'u8272u5F69'.
+
+    Why the code point and not one more '_': a name of such letters alone
+    would be underscores alone ('色' and '彩' both '_', '色彩' a run of
+    two), and GLSL reserves every identifier that holds '__'. The spelling
+    is letters and digits, so it adds no underscore and can neither make
+    nor lengthen a run. It is not one-to-one either (a node NAMED
+    'Seu00F1al' spells the same) and does not have to be: `_code_tag`
+    tells clashing tags apart whatever they were spelled from.
+
+    A tag that was plain ASCII is the tag it was, to the letter: the first
+    substitution is the old one, and the second touches only what no
+    driver could read.
+    """
+    import re
+    flat = re.sub(r'\W', '_', str(key))
+    return re.sub(r'[^\x00-\x7F]', lambda m: 'u%04X' % ord(m.group()), flat)
+
+
 def _code_tag(em, key):
     """The tag one coded shader's GLSL names are mangled under in `em`.
 
-    It is the node's graph id with every non-word character flattened to
-    '_' -- and a flattening is many-to-one. R253 (review): the tag WAS
-    that flattening and nothing else, so 'Coded Shader', 'Coded_Shader'
+    It is the node's graph id as `_code_spell` writes it: every non-word
+    character flattened to '_', every letter GLSL cannot hold spelled as
+    its code point -- and both are many-to-one. R253 (review): the tag
+    WAS the flattening and nothing else, so 'Coded Shader', 'Coded_Shader'
     and 'Coded.Shader' (three legal names in one tree, three programs on
     the CPU) shared one set of GLSL names; the pass qualified, inlined
     both shaders over each other and drew one of them twice. A
@@ -1233,12 +1266,12 @@ def _code_tag(em, key):
     (`_tags_clash`) and a clashing one takes an ordinal in front --
     '2_Coded_Shader' -- counted up until nothing it meets begins that
     way. A node alone in its pass, and any two that never clashed, keep
-    exactly the names they had.
+    exactly the names they had. Every tag is [A-Za-z0-9_] alone, the
+    alphabet `_tags_clash` is exact over.
     """
     tag = em.code_tags.get(key)
     if tag is None:
-        import re
-        base = tag = re.sub(r'\W', '_', str(key))
+        base = tag = _code_spell(key)
         taken = list(em.code_tags.values())
         n = 1
         while any(_tags_clash(tag, t) for t in taken):
