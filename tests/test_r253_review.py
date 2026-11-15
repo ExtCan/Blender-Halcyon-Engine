@@ -3231,6 +3231,42 @@ def test_shadow_atlas_sampler_is_declared_once_per_pass():
     check('the frame still uploads the one packed atlas under that name',
           sorted(k for k in atlases if k.startswith('hal_shadow')) == ['hal_shadowpack'], str(sorted(atlases)))
 
+    # ---- a SIZED lamp (R254): its mapped function is written by another
+    # module, gpu/softmap.py -- the measured-penumbra lookup a lamp with a
+    # size takes from Samples 2 up. That text opened with its own copy of
+    # the declaration, so beside the assembler's one a pass declared the
+    # sampler twice with one sized lamp and three times with two
+    def sized(*which):
+        def edit(sc):
+            for k in which:
+                sc.lights[k].radius = 0.25
+                sc.lights[k].shadow_samples = 4
+        return edit
+
+    for label, edit in (('the POINT sized', sized(1)), ('both lamps sized', sized(0, 1))):
+        planned = _shadow_plan(edit)[0]
+        soft = texts(planned) if planned is not None else []
+        check(f'{label}: the scene still qualifies and every pass takes the sized lookup (`hal_sm_*`)',
+              bool(soft) and all('hal_sm_' in s for _n, s, _b in soft), str(planned is None))
+        check(f'{label}: every pass still declares the atlas sampler exactly once, and no uniform twice',
+              bool(soft) and all(count(s) == 1 and _declared_twice(s) == [] for _n, s, _b in soft),
+              str([(count(s), _declared_twice(s)) for _n, s, _b in soft]))
+    gpu_dir = os.path.dirname(os.path.abspath(GM.__file__))
+    writers = []
+    for fname in sorted(os.listdir(gpu_dir)):
+        if not fname.endswith('.py'):
+            continue
+        with open(os.path.join(gpu_dir, fname), encoding='utf-8') as fh:
+            mod = ast.parse(fh.read())
+        docs = {id(n.body[0].value) for n in ast.walk(mod)
+                if isinstance(n, (ast.Module, ast.FunctionDef, ast.ClassDef)) and n.body
+                and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant)}
+        writers += [fname for n in ast.walk(mod)
+                    if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docs
+                    and re.search(r'uniform\s+sampler2D\s+hal_shadowpack\s*;', n.value)]
+    check('one string under gpu/ writes the declaration: SHADOWPACK_DECL in material.py (no emitter carries a copy)',
+          writers == ['material.py'], str(writers))
+
     # ---- however many lamps cast, and whatever else shadows them
     for label, edit, kw, mapped, traced in (
             ('three mapped lamps', more(1), {}, [0, 1, 2], []),

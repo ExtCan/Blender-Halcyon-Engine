@@ -1174,6 +1174,20 @@ Shader's name resolution is pinned in `tests/test_shaders.py` as well.
   unlisted or listed twice; the decision made for a traced lamp too, from
   the second mapped lamp on, by the first lamp alone or by the last; the
   line without its newline or under another spelling.
+- **The sized-lamp lookup leaves the atlas declaration to the assembler
+  (the two fixes met).** The entry above declares `hal_shadowpack` once
+  per pass; the sized map lookup of the light round (`gpu/softmap.py`,
+  the function a mapped lamp with a size takes from Samples 2 up) landed
+  beside it still opening its own text with a copy, as every mapped
+  function did when it was written. Each alone was whole; merged, the raw
+  text of a pass declared the sampler twice with one sized lamp and three
+  times with two -- the same redefinition, back on the legacy-constructor
+  road, for exactly the lamps the light round made soft. The copy is
+  gone, and `test_shadow_atlas_sampler_is_declared_once_per_pass` plans
+  the demo scene with one and with both lamps sized (one declaration, no
+  uniform twice) and reads every string constant under `gpu/` for a
+  second writer of the line (there is one: `SHADOWPACK_DECL`). Putting the
+  copy back fails all three.
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
