@@ -113,7 +113,9 @@ by this package. No existing test pin was changed.
   `_settings_written`, which does nothing: having a callback is what makes
   Blender tag the owner. The two properties with a callback of their own
   keep it. The operator needed no edit -- its writes are now what a panel
-  drag is. Nothing is stored differently; old files are untouched.
+  drag is. Nothing is stored differently; old files are untouched. A Python
+  write costs 1.5-1.8 microseconds where it cost 0.5 (20,000 writes timed in
+  Blender): a preset that sets every dial pays about a millisecond.
 - **Scene-level dials.** With a callback a scene dial written from a script
   now fires its Scene update. That update carries the geometry and
   transform flags (an ID-property write always does; measured), which the
@@ -416,10 +418,15 @@ None. Existing tests run and green on this tree: the 16 functions of
 tests/test_render.py that touch the changed functions (one of them,
 `test_a_released_context_render_still_completes`, fails in that run order
 on 8de170d as well and passes alone on both trees), the tooltip and
-update-callback censuses, tests/test_r253_review.py,
-test_r253_mapping.py, test_r253_terrain_tool.py,
-test_r253_light_options.py, test_r254_falloff.py,
-test_r254_world_light.py.
+update-callback censuses, and whole modules: test_r253_review,
+test_r253_mapping, test_r253_terrain_tool, test_r253_light_options,
+test_r253_generated_coords, test_r253_convert_buttons, test_r253_halo_node,
+test_r253_cubemap, test_r253_console_presets, test_r253_region,
+test_r253_uniforms, test_r252_console, test_legacy, test_r254_falloff,
+test_r254_world_light. test_r251_material_nodes, test_r251_post_palette
+and test_r251_post_codec fail only on the baseline's "1.89.0 zip is beside
+the package" pins (the zip is not in this environment). The full suite was
+not run (the integrator's).
 
 tests/test_r254_viewport.py: 124 checks pass here. On 8de170d 25 checks
 fail and 8 of the 10 tests stop on a function that does not exist there;
