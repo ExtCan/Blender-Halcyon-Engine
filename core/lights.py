@@ -10,6 +10,7 @@ import numpy as np
 
 from . import mathx as M
 from . import raster
+from . import softmap as SM
 
 EPS = 1e-6
 
@@ -67,7 +68,7 @@ class ShadowMap:
     """One depth image rendered from a light."""
 
     __slots__ = ('vp', 'depth', 'near', 'far', 'persp', 'size', 'origin',
-                 'extent', 'soft_extra')
+                 'extent', 'axes', 'd_min')
 
     def __init__(self, vp, zndc, near, far, persp, size, origin, extent=1.0):
         self.vp = vp
@@ -101,9 +102,14 @@ class ShadowMap:
             self.depth = np.where(has2, mid, empty).astype(np.float32)
         else:
             self.depth = self._linearise(zndc)
-        # extra PCF blur, in texels, derived from the LAMP'S OWN SIZE at
-        # build time (see soft_size_texels) -- 0 keeps the classic blur
-        self.soft_extra = 0.0
+        # what a SIZED lamp's lookup (core/softmap.py) reads beside the
+        # depth: the map's right / up / depth world axes and the nearest
+        # depth it holds (no caster stands nearer, which bounds the
+        # blocker search). Neither depends on the lamp's size -- nothing
+        # on a map does, so a size edit never re-bakes one
+        self.axes = SM.map_axes(vp, self.persp)
+        self.d_min = float(self.depth.min()) if self.depth.size else \
+            float(self.far)
 
     def _linearise(self, z):
         z = np.clip(np.asarray(z, np.float32), -1.0, 1.0)
@@ -171,12 +177,13 @@ def _pcf_offsets(n):
 class CubeShadow:
     """Six ShadowMaps for an omnidirectional light."""
 
-    __slots__ = ('faces', 'origin', 'soft_extra')
+    __slots__ = ('faces', 'origin', 'd_min')
 
     def __init__(self, faces, origin):
         self.faces = faces
         self.origin = np.asarray(origin, np.float32)
-        self.soft_extra = 0.0
+        # the nearest depth any of the six faces holds (see ShadowMap)
+        self.d_min = min(float(f.d_min) for f in faces)
 
     def texel_size(self, dist):
         return self.faces[0].texel_size(dist)
@@ -335,17 +342,14 @@ def _light_shadow_signature(light):
 
     Colour and energy are deliberately absent -- they tint the LIGHT,
     never the depth -- so palette edits ride the cache untouched. The
-    lamp's SIZE is present: it does not move a depth texel either, but
-    the built map carries soft_extra (the size-derived blur) stamped at
-    build time, and the field proved a cached map serves a stale one --
-    dragging Radius did nothing until something else rebuilt the map."""
-    asz = getattr(light, 'area_size', (0.0, 0.0))
+    lamp's SIZE (Radius, a Sun's Angle, an Area's Size) is absent too:
+    it does not move a depth texel and the built map carries nothing
+    derived from it -- the penumbra is measured per receiver at lookup
+    (core/softmap.py) -- so dragging a size re-bakes nothing."""
     return (light.type, tuple(np.round(light.position, 5)),
             tuple(np.round(light.direction, 5)),
             round(float(light.spot_size), 5), light.shadow,
             int(light.shadow_map_size),
-            round(float(getattr(light, 'radius', 0.0)), 6),
-            round(float(asz[0]), 6), round(float(asz[1]), 6),
             # R251 C117: the per-lamp Map Depth override
             str(getattr(light, 'shadow_map_depth', 'INHERIT')),
             # R253: the Square cone widens the buffer's frustum and
@@ -428,41 +432,6 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
         return
     centre, radius = scene_bounds(mesh.verts)
 
-    def _soft_world(light, dist):
-        """The lamp's size as a world-space blur radius at `dist` away.
-
-        SUN's size is an ANGLE (Blender's light.angle), so its world
-        radius grows with distance; AREA uses half the mean edge;
-        POINT/SPOT use the radius directly. This is what makes the size
-        dials WORK under shadow maps: the field report was that only
-        the spot cone visibly responded to size, because the ray path
-        read radius and the map path read nothing.
-        """
-        kind = str(getattr(light, 'type', 'POINT')).upper()
-        if kind == 'SUN':
-            return float(np.tan(float(getattr(light, 'radius', 0.0))
-                                * 0.5)) * float(dist)
-        if kind == 'AREA':
-            asz = getattr(light, 'area_size', (0.0, 0.0))
-            return 0.25 * (float(asz[0]) + float(asz[1]))
-        return float(getattr(light, 'radius', 0.0))
-
-    def _stamp_soft(sm, light, rep_dist):
-        """Store the size-derived extra blur, in texels, on the map.
-
-        Computed once at build with the scene centre as the
-        representative receiver -- the era's buffer shadows were a
-        constant blur, and a constant is what both devices can agree
-        on exactly. Capped so a huge lamp cannot smear the whole map.
-        """
-        first = sm.faces[0] if hasattr(sm, 'faces') else sm
-        eff = _soft_world(light, rep_dist)
-        if eff <= 0.0:
-            return
-        texel = float(np.asarray(first.texel_size(
-            np.asarray([rep_dist], np.float32))).reshape(-1)[0])
-        sm.soft_extra = float(min(eff / max(texel, 1e-9) * 0.5, 24.0))
-
     # PLAN first (cheap geometry per map), RENDER second -- because the
     # renders are independent: each map is its own buffer, its own depth
     # min-compares, deterministic in isolation, so thread scheduling
@@ -500,8 +469,6 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
                        size=size, eye=eye, half=half):
                 light.shadow_map = ShadowMap(vp, depth, near, far, False,
                                              size, eye, half)
-                _stamp_soft(light.shadow_map, light,
-                            float(np.linalg.norm(centre - eye)))
             jobs.append((assign, vp, size, mid))
         elif light.type == 'SPOT':
             d = M.normalize(np.asarray(light.direction, np.float32))
@@ -528,8 +495,6 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
                 light.shadow_map = ShadowMap(vp, depth, near, far, True,
                                              size, pos,
                                              float(np.tan(fov * 0.5)))
-                _stamp_soft(light.shadow_map, light,
-                            float(np.linalg.norm(centre - pos)))
             jobs.append((assign, vp, size, mid))
         else:
             near = max(radius * 0.005, 1e-3)
@@ -551,8 +516,6 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
                     pending['n'] -= 1
                     if pending['n'] == 0:
                         light.shadow_map = CubeShadow(list(slots), pos)
-                        _stamp_soft(light.shadow_map, light,
-                                    float(np.linalg.norm(centre - pos)))
                 jobs.append((assign, vp, size, mid))
 
     if not jobs:
@@ -1703,12 +1666,35 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
     bias = 0.0 if mid else float(light.shadow_bias or settings.shadow_bias)
     ndl = np.clip(M.dot(N, L), 0.0, 1.0)
     slope = bias * (1.0 + 2.0 * (1.0 - ndl))
-    soft = max(float(light.shadow_softness) * settings.shadow_softness, 0.0) \
-        + float(getattr(sm, 'soft_extra', 0.0) or 0.0)
+    # the user's Softness: a constant blur in texels (the lamp's own
+    # dial multiplies the render's)
+    soft = max(float(light.shadow_softness) * settings.shadow_softness, 0.0)
     # normal offset: step off the surface by a texel or so, scaled by how
     # obliquely the light hits. Removes acne without the detached shadows a
     # large constant depth bias produces.
     texel = sm.texel_size(np.linalg.norm(P - sm.origin[None, :], axis=1))
+    shape = SM.lookup_shape(light, shadow_sample_count(light, settings))
+    if shape is not None:
+        # a SIZED lamp (Radius, a Sun's Angle, an Area's Size) at more
+        # than one Sample -- one Sample is the hard single-tap lookup
+        # below for every lamp, as one traced ray is hard. The penumbra
+        # is measured per receiver: a blocker search over the lamp's
+        # footprint, a width by similar triangles, a filter that wide
+        # (core/softmap.py). Every compare there is made against the
+        # receiver PLANE's depth at the tap, so the offset carries no
+        # blur factor and is scaled DOWN where that plane is exact
+        # (`offset_scale`): nothing lifts the receiver out from under
+        # its caster as the lamp or the Softness grows
+        if mid:
+            offset = np.zeros(n, np.float32)
+        else:
+            offset = texel * (1.5 + 2.5 * np.sqrt(
+                np.maximum(1.0 - ndl * ndl, 0.0))) * SM.offset_scale(ndl)
+        lit = SM.lookup(sm, shape, P + N * offset[:, None], N, ndl, slope,
+                        soft, shadow_sample_count(light, settings),
+                        mask=mask)
+        dens = float(light.shadow_density)
+        return (1.0 - (1.0 - lit) * dens).astype(np.float32)
     if mid:
         offset = np.zeros(n, np.float32)
     else:

@@ -48,6 +48,7 @@ from .featurematrix import _one_bsdf_graph
 from .test_r251_material import _job_for
 from .test_r252_console import _scene as console_scene
 from ..core import console as CON
+from ..core import render as R
 from ..core import shading as SH
 from ..gpu import shade as GSH
 
@@ -255,6 +256,48 @@ def check_coded():
     print(f'  coded shaders by node name: {counts}')
 
 
+def mapped_shadow_cases():
+    """(label, light, settings overrides): one mapped lamp per kind, with
+    and without a size -- a sized lamp's term is the per-fragment
+    penumbra lookup (gpu/softmap.py), a lamp of size 0 the constant PCF."""
+    from ..core.scene import Light
+    cases = []
+    for kind, sizes in (('POINT', (0.0, 0.3)), ('SPOT', (0.0, 0.3)),
+                        ('SUN', (0.0, 0.05)), ('AREA', (0.5,))):
+        for size in sizes:
+            kw = dict(type=kind, name='L', position=(1.5, 2.5, 4.0),
+                      direction=(-0.3, -0.5, -0.8), energy=3.0 if kind == 'SUN'
+                      else 900.0, shadow='MAP')
+            if kind == 'AREA':
+                l = Light(area_size=(size, size * 0.5), area_x=(1, 0, 0),
+                          area_y=(0, 1, 0), **kw)
+            else:
+                l = Light(radius=size, **kw)
+            if kind == 'SPOT':
+                l.spot_size = 1.2
+            cases.append((f'{kind} size {size}', l, {}))
+            if size > 0.0:
+                cases.append((f'{kind} size {size} midpoint, 16 samples', l,
+                              {'shadow_map_depth': 'MIDPOINT',
+                               'shadow_samples': 16}))
+    return cases
+
+
+def check_mapped_shadows():
+    """The shadow-map terms (the model sweep above plans with shadows
+    off, so no shadow function reached the front-end before R254)."""
+    counts = {'ok': 0, 'refused': 0, 'bad': 0}
+    for label, light, over in mapped_shadow_cases():
+        st = base_settings(24, 18, shadows=True, shadow_default='MAP',
+                           shadow_map_size=64, **over)
+        sc = demo_scene(st, with_texture=False)
+        sc.lights = [light]
+        R.render(sc, st)                    # bakes the map the plan packs
+        srcs, why = _pass_sources(sc, st)
+        counts[_record(f'mapped shadow, {label}', srcs, why)] += 1
+    print(f'  mapped shadows: {counts}')
+
+
 def main():
     utf8_console()
     FAILS.clear()
@@ -265,7 +308,8 @@ def main():
         return 0
     print(f'glsl_strict: {_glslang()}')
     for fn in (check_models, check_console, check_masters, check_stages,
-               check_sky_and_kernels, check_compute_raster, check_coded):
+               check_sky_and_kernels, check_mapped_shadows,
+               check_compute_raster, check_coded):
         try:
             fn()
         except Exception as exc:                                # noqa: BLE001
