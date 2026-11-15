@@ -1277,6 +1277,47 @@ def export_light(ob, matrix, unit_scale=1.0):
     return lt
 
 
+def _resolve_links(lights, objects):
+    """Light linking: the names of a lamp's linked collection -> the
+    object indices the renderer works in (Light.exclude_objects).
+
+    R254. The old resolver kept ONE index per name, so of three
+    instances of a linked object only the last was affected, and a lamp
+    linked to the collection holding the instancer empties reached
+    nothing (an instancer is no exported object). Every exported row of
+    a name answers now, and every row INSTANCED BY a named object
+    (ObjectInfo.instancer). Names are the library-qualified link names
+    (compat.link_name), falling back to the plain name for a row built
+    without one.
+
+    A collection that is picked but resolves to no rendered object
+    writes (-1,) under 'Only': no object carries that index, so the
+    lamp lights nothing on either road -- 'nothing but the collection'.
+    It used to write (), which both roads read as 'no link at all'.
+    Under 'Exclude' an unresolved link leaves the lamp unlinked."""
+    by_name, by_inst = {}, {}
+    for i, o in enumerate(objects or ()):
+        if o is None:
+            continue
+        by_name.setdefault(getattr(o, 'link_name', '') or o.name,
+                           []).append(i)
+        par = getattr(o, 'instancer', '') or ''
+        if par:
+            by_inst.setdefault(par, []).append(i)
+    for lt in lights:
+        names = getattr(lt, 'exclude_names', None)
+        if names is None:
+            continue
+        idx = set()
+        for n in names:
+            idx.update(by_name.get(n, ()))
+            idx.update(by_inst.get(n, ()))
+        if idx:
+            lt.exclude_objects = tuple(sorted(idx))
+        elif str(getattr(lt, 'exclude_mode', 'EXCLUDE')) == 'ONLY':
+            lt.exclude_objects = (-1,)
+
+
 # ------------------------------------------------------------------ the job
 
 
@@ -1737,47 +1778,6 @@ _KINDS = {'MESH': "Mesh", 'FONT': "Text", 'CURVE': "Curve",
 def _kind(ob):
     """What to call an object in a message, in the user's words not Blender's."""
     return _KINDS.get(getattr(ob, 'type', ''), "Object")
-
-
-def _resolve_links(lights, objects):
-    """Light linking: the names of a lamp's linked collection -> the
-    object indices the renderer works in (Light.exclude_objects).
-
-    R254. The old resolver kept ONE index per name, so of three
-    instances of a linked object only the last was affected, and a lamp
-    linked to the collection holding the instancer empties reached
-    nothing (an instancer is no exported object). Every exported row of
-    a name answers now, and every row INSTANCED BY a named object
-    (ObjectInfo.instancer). Names are the library-qualified link names
-    (compat.link_name), falling back to the plain name for a row built
-    without one.
-
-    A collection that is picked but resolves to no rendered object
-    writes (-1,) under 'Only': no object carries that index, so the
-    lamp lights nothing on either road -- 'nothing but the collection'.
-    It used to write (), which both roads read as 'no link at all'.
-    Under 'Exclude' an unresolved link leaves the lamp unlinked."""
-    by_name, by_inst = {}, {}
-    for i, o in enumerate(objects or ()):
-        if o is None:
-            continue
-        by_name.setdefault(getattr(o, 'link_name', '') or o.name,
-                           []).append(i)
-        par = getattr(o, 'instancer', '') or ''
-        if par:
-            by_inst.setdefault(par, []).append(i)
-    for lt in lights:
-        names = getattr(lt, 'exclude_names', None)
-        if names is None:
-            continue
-        idx = set()
-        for n in names:
-            idx.update(by_name.get(n, ()))
-            idx.update(by_inst.get(n, ()))
-        if idx:
-            lt.exclude_objects = tuple(sorted(idx))
-        elif str(getattr(lt, 'exclude_mode', 'EXCLUDE')) == 'ONLY':
-            lt.exclude_objects = (-1,)
 
 
 def export_lights_into(parked, depsgraph):

@@ -774,6 +774,27 @@ def _sample_volume(vnode, graph, textures, settings, P, lo, hi,
     return out
 
 
+def scatter_lights(scene, st):
+    """[(lamp, sign)]: the lamps that scatter in a volume container this
+    frame, each with the sign its light takes (R254).
+
+    They are the FRAME's lamps (LI.frame_lights: the Light Limit's
+    survivors, no ambient lamp) less every lamp whose flags leave it no
+    diffuse-like light to give: Only Shadow adds none anywhere, Specular
+    Only (or Diffuse off) has no lobe a medium answers to. A Negative
+    lamp scatters with a minus sign, as it shades a surface. The march
+    used to take every lamp that was not of type AMBIENT, flags and
+    limit unread: a Negative lamp brightened the fog, an Only Shadow
+    lamp lit it, a lamp the limit had dropped still lit it. A scene with
+    no such lamp gets the same lamps in the same order (the march keys
+    its per-lamp random streams on the position in this list)."""
+    return [(l, LI.lights_volume(l))
+            for l in LI.frame_lights(scene, st)
+            if LI.lights_volume(l) != 0.0
+            and getattr(l, 'affect_diffuse', True)
+            and not getattr(l, 'specular_only', False)]
+
+
 def march(img, scene, st, gbuf, vp, eye, w, h, bvh=None, sel_mask=None,
           textures=None, view=None):
     """Composite every volume container over the finished frame.
@@ -820,22 +841,7 @@ def march(img, scene, st, gbuf, vp, eye, w, h, bvh=None, sel_mask=None,
                                       1e-9, hit_h[:, 3:4])
         dist[covered] = np.linalg.norm(hit - eye[None, :], axis=1)
 
-    # R254: the lamps that scatter in a medium are the FRAME's lamps
-    # (LI.frame_lights: the Light Limit's survivors, no ambient lamp),
-    # less every lamp whose flags leave it no diffuse-like light to
-    # give: Only Shadow adds none anywhere, Specular Only (or Diffuse
-    # off) has no lobe a medium answers to. A Negative lamp scatters
-    # with a minus sign, as it shades a surface. The march used to take
-    # every lamp that was not of type AMBIENT, flags and limit unread: a
-    # Negative lamp brightened the fog, an Only Shadow lamp lit it, a
-    # lamp the limit had dropped still lit it. A scene with no such
-    # lamp marches the same list in the same order (the per-lamp random
-    # streams below are keyed on the position in it).
-    lights_all = [(l, LI.lights_volume(l))
-                  for l in LI.frame_lights(scene, st)
-                  if LI.lights_volume(l) != 0.0
-                  and getattr(l, 'affect_diffuse', True)
-                  and not getattr(l, 'specular_only', False)]
+    lights_all = scatter_lights(scene, st)
     # soft ray shadows draw whole-lane scalars: each (volume, step,
     # light) triple gets its OWN stream derived arithmetically from the
     # seed, so the draws are a pure function of the triple -- a band

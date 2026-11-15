@@ -4287,10 +4287,16 @@ def _fog_structure(st, scene):
             print(_note)
         # F015's fog half (LIGHT-A2): the lobe joins the target only when
         # a screen-spot lamp exists AND Spotlight Fog > 0 (both in the
-        # signature: _light_sig's screen_spot, st_sig's fog_spot gate)
+        # signature: _light_sig's screen_spot, st_sig's fog_spot gate).
+        # R254: a screen-spot lamp of the FRAME (LI.frame_lights) -- the
+        # pass declares hal_spotfog from its own light loop, so a screen
+        # spot the Light Limit dropped (or one that is Ambient Only) left
+        # the fog reading an accumulator no pass declared, and the plan
+        # failed to compile. The CPU's spot_fog_of reads the same list
+        from ..core import lights as _LI
         fs['spot'] = _FOG.spot_on(st) and any(
             getattr(l, 'screen_spot', False)
-            for l in (getattr(scene, 'lights', ()) or ()))
+            for l in _LI.frame_lights(scene, st))
     return fs
 
 

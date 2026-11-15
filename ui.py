@@ -2609,6 +2609,53 @@ def light_falloff_in_use(hs, scene):
     return mode
 
 
+def scene_clock(scene):
+    """Seconds of scene time on the frame the editor stands on, by the
+    EXPORTER's rule (what a render of this frame writes to Scene.time):
+    export.scene_time where the exporter carries the helper, else the
+    expression export_scene evaluates. The panel must never keep a
+    clock of its own -- a status line that disagrees with the render is
+    worse than none."""
+    from . import export as _ex
+    fn = getattr(_ex, 'scene_time', None)
+    if fn is not None:
+        return float(fn(scene))
+    return scene.frame_current / max(scene.render.fps, 1)
+
+
+def light_style_status(hs, scene):
+    """(text, icon) saying what the lamp's Light Style does on the
+    current frame, or None for a steady lamp or without a scene to read
+    the clock from (R254).
+
+    A style is animated and a still shows ONE step of it: at Blender's
+    frame 1 six of the eleven styles render exactly like Normal and
+    three switch the lamp off, and nothing in the panel said which. The
+    gain is core.lights.style_gain at scene_clock -- the number the
+    render multiplies the Power by."""
+    if str(getattr(hs, 'light_style', 'NORMAL') or 'NORMAL') == 'NORMAL' \
+            or scene is None:
+        return None
+    try:
+        from .core import lights as _LI
+        t = scene_clock(scene)
+        gain = float(_LI.style_gain(hs, t))
+        step, steps = _LI.style_step(hs, t)
+        frame = int(scene.frame_current)
+    except Exception:                                           # noqa: BLE001
+        return None
+    if gain == 0.0:
+        return (f"Animated: the lamp is DARK on frame {frame} "
+                f"(step {step + 1} of {steps})", 'ERROR')
+    return (f"Animated: Power x{gain:.2f} on frame {frame} "
+            f"(step {step + 1} of {steps})", 'TIME')
+
+
+#: R254: the flat ambient level above which the Ambient Only note turns
+#: into a warning (2.0 is twice white: every surface past its own colour)
+AMBIENT_ONLY_BRIGHT = 2.0
+
+
 class HALCYON_PT_light(HalcyonPanel, Panel):
     bl_label = "Halcyon Light"
     bl_context = "data"
@@ -2632,6 +2679,14 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
         sub = col.column()
         sub.active = hs.light_style != 'NORMAL'
         sub.prop(hs, 'light_style_rate')
+        # R254: what the style does on THIS frame (a still shows one
+        # step of it: most styles start on a full step, three on a dark
+        # one), read off the exporter's clock
+        style_now = light_style_status(hs, getattr(context, 'scene', None))
+        if style_now:
+            note = col.row()
+            note.active = style_now[1] == 'ERROR'
+            note.label(text=style_now[0], icon=style_now[1])
         col.separator()
         if light.type == 'AREA':
             # no decay menu for an area lamp: 2.79's lamp_get_visibility
@@ -2756,9 +2811,36 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
         row = col.row(align=True)
         row.prop(hs, 'diffuse_only')
         row.prop(hs, 'specular_only')
+        if hs.diffuse_only and hs.specular_only:
+            # R254: the two boxes sit side by side and cancel each
+            # other -- each removes the other's lobe
+            note = col.row()
+            note.label(text="Diffuse Only + Specular Only: this lamp "
+                            "lights no surface", icon='ERROR')
         col.prop(hs, 'negative')
         col.prop(hs, 'only_shadow')
         col.prop(hs, 'ambient_only')
+        if hs.ambient_only:
+            # R254: what Energy MEANS on an ambient lamp. The pool takes
+            # colour x Energy as a flat level (1.0 = white), where every
+            # other use of a Point lamp's Energy divides its watts by
+            # 4 pi d^2 -- so the lamp's own Energy is drawn again here
+            # under the name it answers to, in red once it whites out
+            lvl = col.row()
+            lvl.alert = float(light.energy) > AMBIENT_ONLY_BRIGHT
+            lvl.prop(light, 'energy', text="Ambient Level")
+            note = col.row()
+            note.active = bool(lvl.alert)
+            note.label(
+                text=("A flat level, not watts: 1.0 = white ambient"
+                      if not lvl.alert else
+                      f"Level {float(light.energy):.4g} whites out the "
+                      "frame: 1.0 = white ambient"),
+                icon='ERROR' if lvl.alert else 'INFO')
+            note = col.row()
+            note.active = False
+            note.label(text="No direct light, shadow, beam or flare",
+                       icon='BLANK1')
         if light.type == 'SUN':
             col.prop(hs, 'hemi')
             # R253 (C): the two-tone hemisphere's ground colour

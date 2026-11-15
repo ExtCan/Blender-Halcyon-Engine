@@ -1989,6 +1989,19 @@ def style_gain(light, time):
     return style_char_gain(sstr[i])
 
 
+def style_step(light, time):
+    """(step, steps) of the lamp's style string at `time` seconds: the
+    0-based character style_gain reads there and the string's length --
+    (0, 1) for NORMAL. For the panel's status line (R254); the same
+    index expression as style_gain."""
+    key = str(getattr(light, 'light_style', 'NORMAL') or 'NORMAL')
+    sstr = LIGHT_STYLES.get(key, 'm')
+    if sstr == 'm':
+        return 0, 1
+    rate = float(getattr(light, 'light_style_rate', 10.0) or 10.0)
+    return int(np.floor(float(time) * rate)) % len(sstr), len(sstr)
+
+
 def apply_light_styles(scene):
     """R253 (H): write every lamp's `style_gain` for THIS frame from
     scene.time -- called before the shadow maps build (render) and by
