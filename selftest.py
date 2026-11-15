@@ -1109,6 +1109,13 @@ def frame_breakdown(out):
     t0 = time.perf_counter()
     core_render.render(demo_scene(st), st)
     ST.report(total=time.perf_counter() - t0, printer=lambda s: _p(out, s))
+    # R253 (field): what the driver stripped over the whole report -- the
+    # GPU sections above compiled and drew every pass family, so this is
+    # the session's full list (empty on Vulkan: nothing is printed)
+    from .gpu import device as _dev
+    _note = _dev.stripped_note()
+    if _note:
+        _p(out, f'  {_note}')
 
 
 def gpu_compute(out):

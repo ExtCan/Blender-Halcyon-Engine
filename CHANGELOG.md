@@ -1573,6 +1573,150 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   the Compile operator (the fake bpy gained `fire` -- Blender's
   one-or-two-argument handler call -- `file_load` and persistent
   timers). Seven mutations of the fix each fail it.
+- **The Coded Shader's Auto Compile checkbox is retired, and Inline
+  Source says what it is.** `HALCYON_CodeNode.auto_compile` ("Auto
+  Compile", on by default) was drawn in the node's sidebar and named in
+  four places -- its declaration, `draw_buttons_ext`, its `PROP_TIPS`
+  tooltip and the census's `NOT_SHADING` reason -- and read in none. The
+  tooltip promised "off waits for the Build button (steadier while
+  typing long shaders)"; with the box unticked the node rebuilt exactly
+  as with it ticked: `_lang_changed` / `_source_changed` flag and
+  schedule, `_rearm_code_rebuilds` schedules every flagged node on undo,
+  redo and load, `_run_rebuilds` rebuilds every one, and
+  `export._compile_node` compiles the source at every export. The choice
+  was to wire it or to retire it; it is retired, on three findings. (1)
+  *Nothing rebuilds while typing.* The only automatic rebuild is the one
+  a Language or a Text-pointer change flags. `source_text` has no update
+  callback and no widget, and typing into the assigned Text fires
+  nothing on the node (seen in a real Blender 5.2.2: `Text.write` /
+  `clear` / `write` leave `needs_rebuild` down and the sockets as they
+  were) -- after an edit in the Text Editor the sockets have always
+  waited for the Compile button, with or without the box. (2) *The
+  picture never waited.* The exporter compiles the live source whatever
+  the sockets say, so a wired box could hold back the SOCKETS alone: the
+  old uniforms' sockets under a render already running the new program,
+  its new uniforms with no socket to set them and a renamed output with
+  none to carry it -- the stale state the entry above was written to
+  end, now as a mode. (3) *It would be saved.* `needs_rebuild` is
+  written to the .blend (seen: a node saved flagged comes back flagged),
+  so an unticked, flagged node would open under `-b` with nobody to
+  press Compile. What changed: the property, its sidebar line and the
+  separator under it, its `PROP_TIPS` entry and its `NOT_SHADING` reason
+  are gone; no rebuild road is touched and the callbacks still only
+  flag. *Files saved with the property still load.* Run in Blender 5.2.2
+  (the `bpy` module, background): the 1.92.0 add-on saved a file with
+  the box unticked on one Coded Shader, ticked on a second and unticked
+  on a third saved flagged (Language switched, the old sockets); a fresh
+  process with the property gone opened it -- `open_mainfile` FINISHED,
+  the three nodes whole, `hasattr(node, 'auto_compile')` False,
+  `compile_source` clean, and the stored 0 / 1 still among the node's
+  system ID properties (`bl_system_properties_get()`, not the
+  custom-property keys), where nothing reads it and a re-save carries it
+  along. The flagged node arrived rebuilt by `load_post`. A later
+  property of that name would inherit the stored values, so the name
+  stays retired. *The Inline Source tooltip.* `PROP_TIPS` called
+  `source_text` "the name of the Text datablock holding this shader's
+  source"; it is the source itself -- the starter shader `init` writes,
+  and what `get_source()` and `export._compile_node` compile while no
+  Text datablock is assigned. Reworded to say so (the registered RNA
+  description read back from the same Blender). Pinned in
+  `test_code_node_props_do_what_their_tooltips_say` (22 checks): the
+  real node class, subclassed so the stored value answers False and
+  every look at it is written down, goes through the callbacks' timer,
+  an undo landing, File > Open, a background load, the export of a
+  flagged node and the Compile operator -- every road rebuilds and not
+  one asks; the sidebar draws no property; no other Python file names
+  the retired property; every Coded Shader key in `PROP_TIPS` names a
+  live property; `source_text` compiles as the source with no Text
+  assigned and yields to an assigned Text, in the editor and at export.
+  Ten mutations each fail it: a gate on the value in `_run_rebuilds`,
+  `_pending_code_nodes`, `_source_changed` or `export._compile_node`;
+  the declaration, the draw line, the tooltip or the census reason
+  restored; the old Inline Source wording; `get_source` ignoring
+  `source_text`. The two coded-shader tests now share one bench
+  (`_code_bench`).
+- **A uniform the driver stripped never fails a pass (the llvmpipe field
+  log).** A real Blender 5.2.2 session on the OpenGL backend (Mesa
+  llvmpipe) printed, for every GPU frame, `rasterising on the CPU: raster
+  dispatch failed: ValueError: GPUShader.uniform_float: uniform
+  hal_rtiles_w not found`, `blended compositing fell back to per-pass
+  readback: ValueError: GPUShader.uniform_float: uniform hal_cam_right not
+  found` and `shading on the CPU: drawing 'Material.001' failed:
+  GPUShader.uniform_float: uniform hal_cam_right not found` -- the whole
+  session on the CPU road with the GPU device selected. One rule is behind
+  all three: a linked GL program keeps only the uniforms that reach its
+  output, Blender's `GPUShader.uniform_float` / `uniform_int` /
+  `uniform_bool` raise `ValueError` for a name the program no longer has,
+  and Halcyon set every uniform of a pass unconditionally -- so ONE
+  stripped name failed the compute raster, then the blended burst, then
+  the per-pass road behind it. (1) *One door.*
+  `gpu/device.set_uniform(shader, kind, name, value)` is the only place
+  under `gpu/` that calls a GPUShader's `uniform_sampler` / `uniform_bool`
+  / `uniform_int` / `uniform_float`. The two sites that did call them now
+  call it: `_draw_in_bound`, which every full-screen pass of every family
+  crosses (material, layer, bump height, radiosity grid, sky, ink,
+  resolve, the post chain), and `_dispatch_compute_impl`, which the
+  compute raster and the two ray kernels cross; a scan over `gpu/*.py`
+  pins that nothing else does. The `ValueError` whose text says the name
+  was *not found* is a skip, and the name is remembered per shader (a
+  program's active set never changes after the link), so the driver is
+  asked ONCE and every later draw of that shader skips the set without
+  raising at all. Every other error -- a `ValueError` about the value, a
+  `TypeError`, anything the driver raises -- propagates exactly as before,
+  the draw's `finally` still restores blend and scissor, and a kernel's
+  output IMAGE is never skipped (a kernel without its output has nothing
+  to read back). `engine.py`'s viewport blit sets `image` on Blender's
+  built-in IMAGE shader, which is not a Halcyon pass, and stays a plain
+  call. (2) *The raster's dead pair is gone.* `hal_rtiles_w` /
+  `hal_rtiles_h` were declared by the compute shell and read by nothing in
+  any of its eight variants -- the tiles fetch has been a `texelFetch`
+  with integer coordinates since the exact-fetch round -- so they left the
+  text, the CreateInfo and the dispatch together: `craster.RASTER_FLOATS`
+  is the one list both use, 15 push constants (60 bytes), each read by
+  every variant. (3) *The camera axes are skipped, not pruned.*
+  `hal_cam_right` / `hal_cam_up` / `hal_cam_back` are read only by a key
+  fixed to the camera (`cel_light` 1: the cel key block and the Anime
+  shine's follow); every other material and layer pass, every bump height
+  pre-pass and the radiosity grid pass carry them unread. They ride the
+  frame's ONE uniform dict and the spec of every pass family (seven sites
+  in `gpu/shade.py`), which is what keeps the source, the CreateInfo and
+  the dict in step; pruning them per variant would be a hand-kept copy of
+  what the linker already computed, so the door takes the skip -- three
+  names per material shader, each asked once. (4) *The Debug breakdown
+  says so.* With Timing Breakdown on, an F12 prints under its table
+  `[Halcyon GPU] N uniforms stripped by the driver in K shaders (names):
+  ...`, counted once per shader so the number is stable from the second
+  frame on; the self test's frame breakdown carries the same line, and
+  `device.reset()` forgets it with the rest of the driver world. Pinned in
+  `tests/test_r253_uniforms.py` (10 tests, 72 checks, registered in
+  `run_all`): the door's rule and its loud errors; the real
+  `draw_fullscreen`, `draw_many` and `dispatch_compute` over a shader that
+  refuses one name; `raster_on_device` sending exactly what its CreateInfo
+  declares; and the demo frame on `tests/fakedevice.installed_gl()` -- the
+  REAL device draw functions over a stand-in driver that strips every push
+  constant a pass never reads and raises Blender's own `ValueError` for it
+  -- which shades on the GPU road bit for bit the frame of a driver that
+  strips nothing, and with the old unconditional set prints the field's
+  two shading lines word for word. A one-off scan put all 121 shipped
+  presets through that driver (the demo frame, the render and the GPU post
+  chain): every one is bitwise the plain fake's, across 775 compiled
+  shaders in 41 pass families, and the only names stripped are the three
+  camera axes, in each of the 356 material shaders. The strict gate
+  (`tests/glsl_strict.py`, glslang 15.1.0) now compiles the compute raster
+  too, as a 4.30 compute shader in all eight variants under the header the
+  CreateInfo writes: 623 sources compile, 15 are refused by name before
+  the driver, none is rejected.
+- **Two handler-stub leftovers in the suite, closed.** (1)
+  `test_mesh_export_cache` proved "without bpy handlers the cache never
+  arms" by leaning on a stub that had no `bpy.app.handlers` at all; the
+  stub has modelled them since the persistent-handler fix, so
+  `export.register()` armed and the check failed in every run. The test
+  takes the handlers away for that one call and restores them. (2)
+  `test_append_watch` installed a one-list `bpy.app.handlers` and never
+  returned it, so every module after LEGACY in `run_all` ran against a
+  namespace with no `persistent` and no undo / load lists (the Coded
+  Shader test above raised on it in the full run); the stub is lent
+  inside a try / finally and restored, and the test checks the hand-back.
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
@@ -1880,6 +2024,22 @@ What headless cannot prove, per feature (the fakebpy / fakeblender stubs validat
   next pass; an undo from a later step onto the flagged one leaving the
   redo stack intact; a file saved flagged opening whole, in the UI and
   under `-b`.
+- The Coded Shader without its Auto Compile box in a live node editor:
+  the sidebar (N) showing the Available inputs list alone, and a 1.92.0
+  file with the box unticked opened in the UI. (The load was run in a
+  real Blender 5.2.2 as the `bpy` module, background, which is also the
+  first real-Blender sight of the entry above's background road: the
+  node saved flagged came back rebuilt by `load_post`.)
+- The llvmpipe session itself (Blender 5.2.2, OpenGL backend, Mesa
+  llvmpipe): the three lines gone, `raster split` and `shade split`
+  printed in their place, and the Timing Breakdown naming the stripped
+  uniforms. NOT run in this round -- the stripped-uniform fix is proven
+  on the stand-in driver (`fakedevice.installed_gl`) only. Open on the
+  real one: what a linker strips beyond the names a text never reads (a
+  uniform whose every use is dead code -- the door takes those the same
+  way), whether `uniform_sampler` raises for a stripped sampler on that
+  backend (it is skipped if it does), and a Vulkan session printing no
+  stripped line at all.
 
 ---
 

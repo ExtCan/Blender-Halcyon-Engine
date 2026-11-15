@@ -700,6 +700,12 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                 pass
         if settings.show_stats:
             ST.report(total=elapsed)
+            # R253 (field): what the GL driver stripped, under the table
+            # -- the passes drew, and this is how anyone knows why a
+            # uniform Halcyon set never arrived
+            _stripped = _gpu_stripped_note()
+            if _stripped:
+                print(f"[Halcyon GPU] {_stripped}")
         # the one-line answer to "where did this frame go", printed for
         # EVERY render: the 33-second mystery frame had its breakdown
         # collected all along, gated behind a panel nobody had ticked
@@ -1244,6 +1250,20 @@ def hold_store(scene_name, frame, size, settings, image, depth, shafts,
 
 
 _ONCE = set()
+
+
+def _gpu_stripped_note():
+    """R253 (field): the Timing Breakdown's line for the uniforms the
+    driver stripped -- 'N uniforms stripped by the driver in K shaders
+    (names)' -- or '' when it kept every one (Vulkan, a CPU frame). A
+    linked GL program drops what its output never reads; the device
+    skips those sets (gpu/device.set_uniform) and the pass draws, so
+    this line is the only place the skip shows."""
+    try:
+        from .gpu import device as _dev
+        return _dev.stripped_note()
+    except Exception:                                           # noqa: BLE001
+        return ''
 
 
 def _once(msg):
