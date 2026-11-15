@@ -196,19 +196,6 @@ def uses_nodes(datablock):
         return bool(getattr(datablock, 'use_nodes', True))
 
 
-def enable_nodes(datablock):
-    """Turn node mode on where the attribute still exists, silently.
-
-    In 6.0 the attribute disappears because nodes become the only mode --
-    at which point this is correctly a no-op.
-    """
-    import warnings
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore', DeprecationWarning)
-        if hasattr(datablock, 'use_nodes') and not datablock.use_nodes:
-            datablock.use_nodes = True
-
-
 def link_name(ob):
     """The name light linking matches an object by: Blender's name_full
     of the ORIGINAL datablock ('Rock [props.blend]' for an object linked
@@ -237,16 +224,34 @@ def instancer_name(inst):
         return ''
 
 
+#: R254: instancer_name() of the item evaluated_meshes yielded LAST (''
+#: for a real object). The generator writes it just before each yield
+#: and its one caller (export.export_scene) reads it while it stands on
+#: that item; nothing else may iterate the generator in between.
+LAST_INSTANCER = ['']
+
+
+def enable_nodes(datablock):
+    """Turn node mode on where the attribute still exists, silently.
+
+    In 6.0 the attribute disappears because nodes become the only mode --
+    at which point this is correctly a no-op.
+    """
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', DeprecationWarning)
+        if hasattr(datablock, 'use_nodes') and not datablock.use_nodes:
+            datablock.use_nodes = True
+
+
 def evaluated_meshes(depsgraph, skip=None):
-    """Yield (object, evaluated mesh, matrix, is_temporary, instancer),
-    one at a time. `instancer` is instancer_name() of the instance that
-    produced the item ('' for a real object; R254).
+    """Yield (object, evaluated mesh, matrix, is_temporary), one at a time.
 
     `skip(original, matrix)` -> True short-circuits an object BEFORE its
     depsgraph evaluation: the caller gets (original, None, matrix,
-    False, instancer) and serves the geometry from its own cache (R171's
-    export cache). The whole point is skipping `evaluated_get` +
-    `to_mesh` -- the measured cost of an unchanged 171-object export.
+    False) and serves the geometry from its own cache (R171's export
+    cache). The whole point is skipping `evaluated_get` + `to_mesh` --
+    the measured cost of an unchanged 171-object export.
 
     THREE Blender rules govern this, and breaking any of them is a hard
     crash rather than an exception:
@@ -281,6 +286,11 @@ def evaluated_meshes(depsgraph, skip=None):
     survived the old ordering by luck: it hands back geometry the depsgraph
     already owns, so nothing was ever actually freed. Text, curves, surfaces
     and metaballs are the ones that allocate, and they are the ones it broke.
+
+    R254: who generated the item (instancer_name: the empty of a
+    collection instance, a geometry-nodes or particle instancer; '' for
+    a real object) is left in LAST_INSTANCER[0] before each yield, for
+    light linking by instancer.
     """
     try:
         instances = []
@@ -308,7 +318,8 @@ def evaluated_meshes(depsgraph, skip=None):
             if skip is not None:
                 try:
                     if skip(orig, matrix_world):
-                        yield orig, None, matrix_world, False, par
+                        LAST_INSTANCER[0] = par
+                        yield orig, None, matrix_world, False
                         continue
                 except Exception:                               # noqa: BLE001
                     pass
@@ -321,7 +332,8 @@ def evaluated_meshes(depsgraph, skip=None):
             if me is None:
                 continue
             live = ev
-            yield ev, me, matrix_world, True, par
+            LAST_INSTANCER[0] = par
+            yield ev, me, matrix_world, True
     finally:
         # runs on exhaustion, on an early break, and on close()
         if live is not None:

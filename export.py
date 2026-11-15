@@ -1316,6 +1316,8 @@ def _resolve_links(lights, objects):
             lt.exclude_objects = tuple(sorted(idx))
         elif str(getattr(lt, 'exclude_mode', 'EXCLUDE')) == 'ONLY':
             lt.exclude_objects = (-1,)
+        else:
+            lt.exclude_objects = ()
 
 
 # ------------------------------------------------------------------ the job
@@ -1801,6 +1803,16 @@ def export_lights_into(parked, depsgraph):
             continue
         lights.append(export_light(ob, inst.matrix_world,
                                    bscene.unit_settings.scale_length))
+    name_to_index = {o.name: i
+                     for i, o in enumerate(parked.objects or [])}
+    for lt in lights:
+        names = getattr(lt, 'exclude_names', None)
+        if names:
+            lt.exclude_objects = tuple(sorted(
+                name_to_index[n] for n in names if n in name_to_index))
+    # R254: the resolver export_scene runs (every instance of a name,
+    # everything a named object instances, an empty 'Only'); it decides
+    # every link, over the single-index answer above
     _resolve_links(lights, parked.objects or [])
     scene = copy.copy(parked)
     scene.lights = lights
@@ -2440,10 +2452,10 @@ def _collect_hair_parts(depsgraph, bscene, mat_lookup, materials, images,
                             f"({type(exc).__name__}: {exc})")
 
     for inst in depsgraph.object_instances:
+        inst_by[0] = compat.instancer_name(inst)
         ob = inst.object
         if ob is None or not getattr(inst, 'show_self', True):
             continue
-        inst_by[0] = compat.instancer_name(inst)
 
         # ---- legacy particle-system hair ----
         for ps in (getattr(ob, 'particle_systems', None) or ()):
@@ -2709,8 +2721,8 @@ def export_scene(depsgraph, settings, warnings=None):
     # consumed lazily on purpose: the generator frees each converted mesh on
     # the way to the next one, and wrapping it in list() would read every one
     # of them after it had been freed. See compat.evaluated_meshes.
-    for ob, me, matrix, temp, inst_by in compat.evaluated_meshes(
-            depsgraph, skip=_skip):
+    for ob, me, matrix, temp in compat.evaluated_meshes(depsgraph,
+                                                        skip=_skip):
         if me is None:
             # the skip path: this object was never evaluated -- serve its
             # arrays from the cache. Materials still export FRESH every
@@ -2741,7 +2753,8 @@ def export_scene(depsgraph, settings, warnings=None):
                 # a stored slot name no longer names a material (renamed
                 # since the store): the only exact answer is the live
                 # path, run after the loop in the position reserved here
-                retries.append((len(parts), obj_index, ob, matrix, inst_by))
+                retries.append((len(parts), obj_index, ob, matrix,
+                                compat.LAST_INSTANCER[0]))
                 parts.append(None)
                 objects.append(None)
                 continue
@@ -2774,7 +2787,8 @@ def export_scene(depsgraph, settings, warnings=None):
                 pass
             # R253: the texture space rides the cached 'data'
             objects.append(_info_object(info, matrix,
-                                        data.get('gen_bounds'), inst_by))
+                                        data.get('gen_bounds'),
+                                        compat.LAST_INSTANCER[0]))
             _sp['cached_ms'] += (_time.perf_counter() - _t0) * 1000.0
             _sp['cached'] += 1
             if k in _touched:
@@ -2851,7 +2865,7 @@ def export_scene(depsgraph, settings, warnings=None):
         data['mat_index'] = remap[idx]
         parts.append(data)
         objects.append(_info_object(info, matrix, data.get('gen_bounds'),
-                                    inst_by))
+                                    compat.LAST_INSTANCER[0]))
 
     # the RETRY pass: cached entries whose stored slot names went
     # unresolvable (a material rename). One live re-export each, one at a

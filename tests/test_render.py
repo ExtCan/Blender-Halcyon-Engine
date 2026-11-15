@@ -4363,7 +4363,7 @@ def test_evaluated_meshes_survives_pointer_invalidation():
 
     dg = _DG()
     got = [(ob.type, me.name)
-           for ob, me, _mw, _tmp, _by in compat.evaluated_meshes(dg)]
+           for ob, me, _mw, _tmp in compat.evaluated_meshes(dg)]
     # the OLD code held epoch-0 evaluated pointers: the first conversion
     # bumped the epoch and every later to_mesh() hit the stale guard and
     # was silently skipped -- only ONE mesh survived. Fresh resolution
