@@ -1524,16 +1524,37 @@ def test_j_panels_follow_the_method_that_runs():
     check('Shadows panel under Planar: Floor Plane Z, map dials greyed',
           'planar_plane_z' in act and not act['shadow_map_size'])
 
-    # the Ray Tracing panel
-    for rt in (False, True):
-        shs.raytrace = rt
+    # the Ray Tracing panel: each of the two rows greys by what reads
+    # it, never by the panel's master alone
+    def rt_rows(**more):
+        for k, v in more.items():
+            setattr(shs, k, v)
         rec = _draw(UI.HALCYON_PT_raytrace, shs)
-        act = {n: a for kind, n, a in rec if kind == 'prop'}
-        check(f'Ray Tracing panel, master {"on" if rt else "off"}: Ray '
-              'Shadows and Ray Bias are drawn live, the reflection dials '
-              'follow the master', act['ray_shadows'] and act['ray_bias']
-              and act['ray_depth'] == rt and act['ray_reflection'] == rt)
-    shs.raytrace = False
+        base = _defaults(PR.HalcyonSettings)
+        for k in more:
+            setattr(shs, k, getattr(base, k))
+        return {n: a for kind, n, a in rec if kind == 'prop'}
+    act = rt_rows(shadow_default='RAY')
+    check('Ray Tracing panel, master off, Shadow Method Ray Traced: Ray '
+          'Shadows and Ray Bias are drawn LIVE (they were greyed while '
+          'they decided every shadow), the reflection dials stay greyed',
+          act['ray_shadows'] and act['ray_bias'] and not act['ray_depth']
+          and not act['ray_reflection'])
+    act = rt_rows(shadow_default='PER_LIGHT')
+    check('...and under Per Light', act['ray_shadows'] and act['ray_bias'])
+    act = rt_rows(shadow_default='MAP')
+    check('master off, Shadow Maps, nothing traces: both greyed',
+          not act['ray_shadows'] and not act['ray_bias'])
+    act = rt_rows(shadow_default='MAP', raytrace=True)
+    check('master on, Shadow Maps: Ray Bias live (reflections read it), '
+          'Ray Shadows greyed (no light traces)',
+          act['ray_bias'] and not act['ray_shadows'] and act['ray_depth'])
+    act = rt_rows(shadow_default='MAP', ambient_occlusion=True)
+    check('occlusion on: Ray Bias live', act['ray_bias'])
+    act = rt_rows(shadow_default='RAY', ray_shadows=False)
+    check('Ray Traced with Ray Shadows off: the switch stays live to turn '
+          'back on, its bias greys', act['ray_shadows']
+          and not act['ray_bias'])
 
     # the tooltips say the rules
     D = PR.DESCRIPTIONS

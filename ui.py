@@ -768,12 +768,21 @@ class HALCYON_PT_raytrace(HalcyonPanel, Panel):
         col.prop(hs, 'ray_depth')
         col.prop(hs, 'ray_reflection')
         col.prop(hs, 'ray_refraction')
-        # Ray Shadows and Ray Bias decide every traced shadow whether
-        # or not this panel's master is on (it gates reflections and
-        # refractions): their own column, never greyed by it
-        live = layout.column()
-        live.prop(hs, 'ray_shadows')
-        live.prop(hs, 'ray_bias')
+        # Ray Shadows and Ray Bias do not hang on this panel's master
+        # (it gates reflections and refractions): each greys by what
+        # reads it. Ray Shadows is the switch of the traced shadows,
+        # live while the Shadow Method lets a light trace; Ray Bias is
+        # the origin offset of EVERY ray, live while anything traces
+        shadow_rays = hs.shadows and hs.shadow_default in ('RAY',
+                                                           'PER_LIGHT')
+        row = layout.column()
+        row.active = shadow_rays
+        row.prop(hs, 'ray_shadows')
+        row = layout.column()
+        row.active = bool(hs.raytrace or hs.ambient_occlusion
+                          or hs.radiosity
+                          or (shadow_rays and hs.ray_shadows))
+        row.prop(hs, 'ray_bias')
         col = layout.column()
         col.active = hs.raytrace
         sub = col.column()
@@ -1912,17 +1921,28 @@ def light_shadow_method(light, hs, sh):
     shadows, then the render's Shadow Method decides for every light
     unless it is Per Light. The light panel greys its rows by this, not
     by the light's menu."""
-    if hs.shadow == 'NONE' or (sh is not None and not sh.shadows):
+    on, method, _rays, _n = render_shadow_state(sh)
+    if hs.shadow == 'NONE' or not on:
         return 'NONE'
     if getattr(light, 'type', '') == 'SUN' and getattr(hs, 'hemi', False):
         return 'NONE'
     if not getattr(light, 'use_shadow', True):
         # Blender's own Shadow checkbox: the export honours it
         return 'NONE'
-    if sh is None or sh.shadow_default == 'PER_LIGHT':
-        # (no render settings in reach: the light's own menu)
+    if method is None or method == 'PER_LIGHT':
+        # (no render method in reach: the light's own menu)
         return hs.shadow
-    return sh.shadow_default
+    return method
+
+
+def render_shadow_state(sh):
+    """(Shadows on, Shadow Method or None, Ray Shadows on, Samples) of
+    the render settings `sh`, each with the renderer's own default when
+    `sh` is missing or does not carry it."""
+    return (bool(getattr(sh, 'shadows', True)),
+            getattr(sh, 'shadow_default', None),
+            bool(getattr(sh, 'ray_shadows', True)),
+            int(getattr(sh, 'shadow_samples', 4) or 4))
 
 
 def shadow_method_label(key):
@@ -2680,11 +2700,12 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
         eff = light_shadow_method(light, hs, sh)
         # a lamp that would trace while the Ray Shadows master is off
         # casts nothing: its rows grey and one row says why
-        ray_off = eff == 'RAY' and sh is not None and not sh.ray_shadows
+        sh_on, sh_method, sh_rays, sh_samples = render_shadow_state(sh)
+        ray_off = eff == 'RAY' and not sh_rays
         col.prop(hs, 'shadow')
-        if sh is None:
+        if sh_method is None:
             pass
-        elif not sh.shadows:
+        elif not sh_on:
             note = col.row()
             note.active = False
             note.label(text="Shadows are switched off for the render",
@@ -2701,14 +2722,14 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
             note = col.row()
             note.active = False
             note.label(text="A hemi light casts no shadows", icon='INFO')
-        elif sh.shadow_default != 'PER_LIGHT' and hs.shadow != 'NONE' \
-                and hs.shadow != sh.shadow_default:
+        elif sh_method != 'PER_LIGHT' and hs.shadow != 'NONE' \
+                and hs.shadow != sh_method:
             # the menu names a method the render's choice overrides:
             # say so the moment it happens, with the way out beside it
             note = col.column(align=True)
             note.active = False
             note.label(text="The render's Shadow Method is "
-                            + shadow_method_label(sh.shadow_default) + ":",
+                            + shadow_method_label(sh_method) + ":",
                        icon='INFO')
             note.label(text="this menu is only read under Per Light",
                        icon='BLANK1')
@@ -2722,7 +2743,7 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
                        icon='ERROR')
         sub = col.column()
         sub.active = eff != 'NONE' and not ray_off
-        if eff == 'PLANAR' and sh is not None:
+        if eff == 'PLANAR' and hasattr(sh, 'planar_plane_z'):
             # the one dial a planar lamp reads lives on the render
             # settings; under Per Light this is where it is reached
             sub.prop(sh, 'planar_plane_z')
@@ -2758,8 +2779,7 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
         both.active = eff in ('MAP', 'RAY')
         both.prop(hs, 'shadow_samples')
         if eff == 'RAY' and not ray_off and light_has_size(light) \
-                and (hs.shadow_samples
-                     or getattr(sh, 'shadow_samples', 4)) <= 1:
+                and (hs.shadow_samples or sh_samples) <= 1:
             # one ray goes to the lamp's centre: the size dial is dead
             note = sub.row()
             note.active = False
