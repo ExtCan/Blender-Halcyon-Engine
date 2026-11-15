@@ -278,6 +278,109 @@ below was reproduced headless before it was fixed and is pinned in
   restored; the old Inline Source wording; `get_source` ignoring
   `source_text`. The two coded-shader tests now share one bench
   (`_code_bench`).
+- **The Coded Shader compiles one source on every road (a node with a
+  Text assigned drew the starter shader on the GPU).** A Coded Shader
+  keeps its shader in one of two places: the Text datablock assigned to
+  it (`source`) or the inline `source_text`, which `init` fills with the
+  starter shader and which assigning a Text -- the node's own "New
+  Shader Text" button does it -- never clears. Three readers answered
+  "which one" three ways. `get_source()` (the editor compile, the
+  sockets) took the Text whenever one was assigned.
+  `export._compile_node` (the program in `programs[node.name]`, what
+  `n_halcyon_code` runs wherever the CPU shades) took the Text but
+  reached past an empty one for the inline source. The GPU emitter
+  resolved nothing: `e_code_node` inlines `props.source_text`, which
+  `export._node_props` copied verbatim off the node (`NODE_PROPS` listed
+  it), "or" a `__source` prop that nothing in the tree ever wrote. So a
+  GLSL node with a Text assigned ran the Text on the CPU and whatever
+  its inline source last held in the deferred pass. *Wrong picture or
+  fallback: the wrong picture.* The probe put the real node class
+  (stand-in sockets) through the real `serialize_tree` and rendered
+  `R.render` against `gpu/shade.simulate` at 128x96. With a Text of
+  other uniforms the plan QUALIFIED and the frame was the starter at its
+  declared defaults -- the CPU's own frame of the starter to four
+  decimals, 1.43 off the CPU's frame of the Text over all 598 pixels of
+  the material. With the starter's uniforms kept and the body rewritten
+  (the "+" button, then an edit) it qualified and drew the starter under
+  the sockets' values (1.58); with the out variable renamed it qualified
+  and drew zeros (2.02). Only a Text reusing a starter uniform's NAME
+  under another type refused ("socket 'Base Color' is VALUE but the
+  uniform is vec3") and fell back to the CPU. The same in a real Blender
+  5.2.2 (the `bpy` module, background; the registered node,
+  `export_material`): a fresh node twinned at 1e-5, and the same node
+  with a Text assigned and edited qualified 1.46 off over the 598
+  pixels. (1) *One rule.* `shaders/compiler.node_source(node)`: the
+  assigned Text, whatever it holds, else the inline source.
+  `compile_node(node)` compiles it and returns (program, error, source).
+  `get_source` is `node_source`; `compile_source` and
+  `export._compile_node` are each that one `compile_node` call; no other
+  file reads a Text's contents. (2) *The export ships what it compiled.*
+  `_node_props` writes the call's source under `props.source_text` and
+  is the key's only writer -- `source_text` left `NODE_PROPS`, the table
+  of properties copied verbatim, and the census's `NOT_SHADING` says why
+  -- so the GLSL the emitter inlines is the string the program was
+  compiled from. Riding the graph also puts the Text in the GPU plan's
+  signature (`gpu/shade._mat_sig` hashes the graph, not the programs):
+  an edit in the Text Editor between two frames re-plans instead of
+  hitting the cache. (3) *The emitter reads one key and holds it to the
+  program.* `e_code_node` reads `source_text` alone (`__source` is
+  gone), and a graph source that is not `programs[id].source` refuses by
+  name -- "a coded shader whose graph source is not the source its
+  program was compiled from" -- so a hand-built graph or a later
+  regression falls back to the CPU instead of drawing another shader.
+  (4) *The empty Text: the editor's rule, on both.* In Blender 5.2.2 a
+  new or cleared Text reads `''` and one holding a blank line reads
+  `'\n'`. The editor compiled nothing for either and said nothing; the
+  exporter ran the inline source under `''` (the starter at its declared
+  defaults, beneath the sockets the last Text left, on both devices) and
+  nothing under `'\n'`. An assigned Text is now the source whatever it
+  holds, for three reasons: the inline source has no widget, so the
+  fallback rendered a shader the user could neither see nor edit while
+  the Text in front of them was blank; the fallback was itself two
+  rules; and the Inline Source tooltip already said it ("while the node
+  has no Text datablock assigned"). An emptied Text compiles nothing,
+  reads zeros on both roads and says so by name -- "the assigned Text
+  'x' is empty -- nothing to compile, the outputs read zeros" in the
+  node's error box, from the Compile button and as the export's warning
+  in the F12 report; a Text that cannot be read is treated the same. No
+  Text and a blank inline source stays silent, as before. *One picture
+  changes*: a file whose Coded Shader holds an EMPTY Text rendered the
+  inline source and now renders zeros, with that warning. (5) *The Text
+  tooltip.* It promised "edit it in the Text Editor and the node
+  recompiles on every edit"; typing in the Text fires nothing on the
+  node (seen again in 5.2.2: `needs_rebuild` down, the sockets as they
+  were, the next export compiling the new source). It now states the
+  rule, and that the sockets follow on Compile. Pinned in
+  `test_code_node_one_source_on_every_road` (33 checks): the real node
+  class with a Text assigned and the starter still in `source_text`,
+  through the real `serialize_tree` (the stand-in sockets gained `type`
+  and `is_linked`; a master stands between the node and the output) --
+  the editor's source, the program's and the graph's are one string; the
+  simulator's frame is the CPU's (under 6e-3, no pixel over 1e-2) for
+  the Text, for an edit made between two frames with the plan cache
+  kept, for the Text that used to refuse, for the emptied Text and for
+  the inline source; the 1.92.0 graph is refused by name; the three
+  kinds of empty Text and the unreadable one on every road; and the rule
+  read from the code (one resolver, one reader of a Text, one emitter
+  key). Fourteen mutations each fail it: the export shipping the raw
+  inline property, shipping nothing, or resolving for itself again;
+  `source_text` back in the verbatim table; `node_source` falling back
+  under an empty or an unreadable Text, or turned upside down;
+  `get_source` or `compile_source` resolving alone; the emitter's second
+  key restored, its hold on the program removed, or the emitter inlining
+  the program's source while the graph keeps the inline copy (the cached
+  plan then serves the old GLSL after an edit); the emptied Text made
+  silent; the old tooltip. *Seen from the same probe*: a colour wired
+  STRAIGHT into the Material Output's Surface (a plain RGB node does it,
+  no coded shader needed) qualified for the deferred pass and the
+  simulator's frame was 1.69 off the CPU's over the material, identical
+  on the tree before this fix -- closed since by its own entry below ("A
+  colour wired straight into a shader socket is an Emission on both
+  roads"). *Left for its own fix*: `serialize_tree` hands one `programs`
+  dict down its node-group recursion keyed by `node.name`, which is
+  unique per tree only, so a Coded Shader in the material and one inside
+  a group that share a name (the default one) leave ONE program, the
+  last compiled (seen at the export).
 - **A uniform the driver stripped never fails a pass (the llvmpipe field
   log).** A real Blender 5.2.2 session on the OpenGL backend (Mesa
   llvmpipe) printed, for every GPU frame, `rasterising on the CPU: raster
@@ -502,6 +605,16 @@ below was reproduced headless before it was fixed and is pinned in
   real Blender 5.2.2 as the `bpy` module, background, which is also the
   first real-Blender sight of the entry above's background road: the
   node saved flagged came back rebuilt by `load_post`.)
+- The Coded Shader's one source on a real driver. The fix is proven on
+  the simulator and, through the registered node and `export_material`,
+  in a real Blender 5.2.2 as the `bpy` module in background (the
+  Text-sourced node 1.46 off before, 1e-5 after) -- never on a GPU and
+  never in the UI. Open there: a Text-sourced coded shader's pass
+  compiling and matching on the driver; an edit in the Text Editor
+  followed by a render drawing the new shader (one re-plan per edit);
+  the emptied Text's line in the node's error box at the node's width,
+  and the same line in the F12 report; and a 1.92.0 file whose Coded
+  Shader holds an empty Text opening to zeros with that warning.
 - The llvmpipe session itself (Blender 5.2.2, OpenGL backend, Mesa
   llvmpipe): the three lines gone, `raster split` and `shade split`
   printed in their place, and the Timing Breakdown naming the stripped

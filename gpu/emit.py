@@ -1231,9 +1231,23 @@ def e_code_node(em, node, index):
                 VEC4: 'vec4(0.0, 0.0, 0.0, 0.0)'}[o_type]
         return em.tmp(o_type, zero)
 
-    src = prop(node, 'source_text') or prop(node, '__source')
+    # R253 (review): ONE key, and it is the source the CPU's program was
+    # compiled from. The exporter ships the node's RESOLVED source here
+    # (shaders.compiler.node_source: the assigned Text, else the inline
+    # property); this line used to read a verbatim copy of the inline
+    # property, "or" a '__source' nothing ever wrote -- so a node with a
+    # Text assigned inlined the starter shader while the CPU ran the Text.
+    # The program is the CPU's truth, so the pass holds itself to it: a
+    # graph source that is not the program's own refuses by name (a hand-
+    # built graph, a regression upstream) instead of drawing another shader
+    src = prop(node, 'source_text')
     if not src:
         raise Unsupported('HALCYON_CodeNode without source')
+    prog = em.programs.get(key) if em.programs is not None else None
+    if prog is not None and getattr(prog, 'source', src) != src:
+        raise Unsupported('a coded shader whose graph source is not the '
+                          'source its program was compiled from (the CPU '
+                          'runs the program)')
     import re
     tag = re.sub(r'\W', '_', str(key))
     inline, uniforms, ins, outs, samplers = _port_code_node(src, tag)

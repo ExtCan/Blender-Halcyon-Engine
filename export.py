@@ -13,7 +13,7 @@ import numpy as np
 from . import compat
 from .core.scene import (Camera, ImageBuffer, Light, Material, MeshData,
                          ObjectInfo, Scene, World)
-from .shaders.compiler import try_compile
+from .shaders.compiler import compile_node
 from .core import console as _console
 
 SOCKET_KIND = {
@@ -163,7 +163,10 @@ NODE_PROPS = {
     'HALCYON_RampNode': ('space', 'stops', 'positions', 'easing'),
     'HALCYON_BlurNode': ('taps',),
     'ShaderNodeTexGabor': ('gabor_type',),
-    'HALCYON_CodeNode': ('language', 'as_surface', 'source_text'),
+    # R253 (review): NOT source_text. This table copies properties
+    # verbatim, and the node's inline source is only one of its two
+    # sources; _node_props ships the RESOLVED one under that key
+    'HALCYON_CodeNode': ('language', 'as_surface'),
     # the retro utilities. Dither's pattern and Depth Cue's falloff were
     # MISSING from this table from the day those nodes shipped: the
     # evaluator read the prop, the exporter never copied it, and both
@@ -345,7 +348,18 @@ def _node_props(node, images, programs, warnings):
             props['direction'] = socket_default(outs[0]) if outs else [0, 0, 1]
 
     if node.bl_idname == 'HALCYON_CodeNode':
-        prog, err = _compile_node(node)
+        prog, err, src = _compile_node(node)
+        # R253 (review): the graph carries the source the program was
+        # compiled FROM -- the assigned Text when there is one, the inline
+        # source_text when there is none (shaders.compiler.node_source) --
+        # and this is the only line that writes the key. The GPU emitter
+        # inlines props.source_text as GLSL; it used to arrive as a verbatim
+        # copy of the inline property, so a node with a Text assigned ran
+        # the Text on the CPU and the starter shader in the deferred pass.
+        # Riding the graph also puts the Text's contents in the GPU plan's
+        # signature (gpu/shade._mat_sig hashes the graph, not the programs):
+        # an edit in the Text Editor re-plans instead of hitting the cache
+        props['source_text'] = src
         if prog is not None:
             programs[node.name] = prog
         elif err:
@@ -451,16 +465,12 @@ def object_map_props(node, warnings):
 
 
 def _compile_node(node):
-    src = ''
-    text = getattr(node, 'source', None)
-    if text is not None and hasattr(text, 'as_string'):
-        src = text.as_string()
-    if not src:
-        src = getattr(node, 'source_text', '') or ''
-    if not src.strip():
-        return None, None
-    lang = getattr(node, 'language', 'GLSL')
-    return try_compile(src, lang)
+    """(program, error, source) of a Coded Shader node, by the one rule
+    the node editor compiles by (shaders.compiler.compile_node -- the same
+    call HALCYON_CodeNode.compile_source makes). R253 (review): this used
+    to resolve the source itself, and differently -- an EMPTY assigned
+    Text fell back to the inline source the editor never looked at."""
+    return compile_node(node)
 
 
 # ------------------------------------------------------------- tree flatten

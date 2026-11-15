@@ -25281,6 +25281,10 @@ def test_every_node_prop_reaches_the_renderer():
             'gradient-widget bookkeeping; stops serialize instead',
         ('HALCYON_CodeNode', 'needs_rebuild'):
             'compile bookkeeping; the compiled program ships',
+        ('HALCYON_CodeNode', 'source_text'):
+            'never copied verbatim: it is one of the node\'s two sources, '
+            'and _node_props ships the RESOLVED one under this key '
+            '(shaders.compiler.node_source: the assigned Text, else this)',
         ('HALCYON_CodeNode', 'error'): 'compile diagnostics, UI only',
         ('HALCYON_CodeNode', 'warn'): 'compile diagnostics, UI only',
         ('HALCYON_CartoonNode', 'era'):
