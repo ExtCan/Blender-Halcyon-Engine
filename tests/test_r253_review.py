@@ -50,7 +50,15 @@ pinned where it bit.
     whatever the sockets say, so "off" could only strand the OLD sockets
     under the NEW program. The Inline Source tooltip called the property
     the NAME of a Text datablock; it is the source itself.
-(13) A Coded Shader with a Text assigned ran TWO shaders: the exporter
+(13) A colour, value or vector output wired straight into a SHADER socket
+    (the Material Output's Surface, a Mix / Add Shader input) drew two
+    pictures: the CPU coerced it to an EMPTY closure and shaded the
+    material's fallback surface, the deferred pass cast the same link
+    into its colour chain and drew it as the albedo -- qualified, 1.69
+    apart. `core/nodeeval.link_closure` reads Blender's implicit
+    conversion (an Emission of it, bitwise the explicit node) and
+    `gpu/shade._probe_material` refuses that lobe BY NAME.
+(14) A Coded Shader with a Text assigned ran TWO shaders: the exporter
     compiled the Text for the program (the CPU's truth) and copied the
     raw inline `source_text` -- the starter shader `init` leaves there --
     into the graph, which is what the GPU emitter inlines. The deferred
@@ -60,7 +68,7 @@ pinned where it bit.
     whatever it holds, else the inline source -- compiled by the editor
     and the exporter through one call, shipped by the exporter as the
     graph's source, and the only source the emitter reads.
-(14) Compiled Coded Shader programs were filed under the node's NAME in
+(15) Compiled Coded Shader programs were filed under the node's NAME in
     one dict handed down the node-group recursion, and names are unique
     per tree only: the material's "Coded Shader" and a group's "Coded
     Shader" (the default name, twice) left ONE program, and one of the two
@@ -71,14 +79,6 @@ pinned where it bit.
     The GPU emitter's mangling tag was the id with its punctuation
     flattened, which is many-to-one ('Coded Shader' / 'Coded_Shader'):
     `gpu/emit._code_tag` hands out one tag per node.
-(15) A colour, value or vector output wired straight into a SHADER socket
-    (the Material Output's Surface, a Mix / Add Shader input) drew two
-    pictures: the CPU coerced it to an EMPTY closure and shaded the
-    material's fallback surface, the deferred pass cast the same link
-    into its colour chain and drew it as the albedo -- qualified, 1.69
-    apart. `core/nodeeval.link_closure` reads Blender's implicit
-    conversion (an Emission of it, bitwise the explicit node) and
-    `gpu/shade._probe_material` refuses that lobe BY NAME.
 """
 import io
 import os
@@ -957,7 +957,7 @@ def test_code_node_props_do_what_their_tooltips_say():
     check('...and every property the node still declares keeps a tooltip at the 40-character bar',
           all(len(str(Node.__annotations__[k].kw.get('description') or '')) >= 40 for k in live),
           str({k: len(str(Node.__annotations__[k].kw.get('description') or '')) for k in live}))
-    check('the exporter copies language and as_surface verbatim (the source ships RESOLVED: finding 13)',
+    check('the exporter copies language and as_surface verbatim (the source ships RESOLVED: finding 14)',
           EX.NODE_PROPS['HALCYON_CodeNode'] == ('language', 'as_surface'))
     root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
     here, named = os.path.abspath(__file__), []
@@ -1971,7 +1971,7 @@ def test_code_node_rebuild_survives_undo_redo_and_load():
               not any(fn in getattr(handlers, e) for e in events))
 
 
-# ------------------------------- (15) a colour wired into a shader socket
+# ------------------------------- (13) a colour wired into a shader socket
 
 _WIRED_CODE = '''
 uniform vec3 baseColor = vec3(0.1, 0.9, 0.3);

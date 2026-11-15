@@ -1727,16 +1727,18 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   key restored, its hold on the program removed, or the emitter inlining
   the program's source while the graph keeps the inline copy (the cached
   plan then serves the old GLSL after an edit); the emptied Text made
-  silent; the old tooltip. *Seen from the same probe and left for their
-  own fixes*: a colour wired STRAIGHT into the Material Output's Surface
-  (a plain RGB node does it, no coded shader needed) qualifies for the
-  deferred pass and the simulator's frame is 1.69 off the CPU's over the
-  material -- identical on the tree before this fix; and
-  `serialize_tree` hands one `programs` dict down its node-group
-  recursion keyed by `node.name`, which is unique per tree only, so a
-  Coded Shader in the material and one inside a group that share a name
-  (the default one) leave ONE program, the last compiled (seen at the
-  export).
+  silent; the old tooltip. *Seen from the same probe*: a colour wired
+  STRAIGHT into the Material Output's Surface (a plain RGB node does it,
+  no coded shader needed) qualified for the deferred pass and the
+  simulator's frame was 1.69 off the CPU's over the material, identical
+  on the tree before this fix -- closed since by its own entry below ("A
+  colour wired straight into a shader socket is an Emission on both
+  roads"); and `serialize_tree` handed one `programs` dict down its
+  node-group recursion keyed by `node.name`, which is unique per tree
+  only, so a Coded Shader in the material and one inside a group that
+  shared a name (the default one) left ONE program, the last compiled
+  (seen at the export) -- closed since by the entry below ("Every Coded
+  Shader runs its own program").
 - **Every Coded Shader runs its own program: the graph id is the node's
   path (two that shared a name across trees shared one program).** A
   material's compiled Coded Shader programs live in one dict,
