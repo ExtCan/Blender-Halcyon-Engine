@@ -4849,6 +4849,7 @@ def render(scene, settings=None, progress=None, band=None):
     need_bvh = st.raytrace or st.ambient_occlusion or \
         getattr(st, 'radiosity', False) or \
         (st.shadows and st.shadow_default == 'RAY') or \
+        _per_light_ray_shadows(scene, st) or \
         _volume_occlusion_wanted(scene, st)
     bvh = None
     if need_bvh and mesh is not None and mesh.tris is not None and mesh.tris.size:
@@ -8312,6 +8313,20 @@ def _fog_coverage_note_z(zd, settings):
 #: absent: an infinite directional beam has no apex to glow from, and
 #: 2.79 gave neither a halo
 _VOLUME_KINDS = ('SPOT', 'POINT', 'AREA')
+
+
+def _per_light_ray_shadows(scene, st):
+    """True when Shadow Method = Per Light and some lamp's own menu
+    says Ray Traced: that lamp needs the BVH exactly as the scene-wide
+    Ray Traced method does. Without it `visibility` found no BVH and
+    the lamp cast nothing unless Ray Tracing or AO happened to be on."""
+    if not (st.shadows and getattr(st, 'ray_shadows', True)
+            and st.shadow_default == 'PER_LIGHT'):
+        return False
+    return any(str(getattr(l, 'shadow', 'MAP')) == 'RAY'
+               and str(getattr(l, 'type', 'POINT')).upper()
+               not in ('HEMI', 'AMBIENT')
+               for l in (getattr(scene, 'lights', None) or ()))
 
 
 def _volume_occlusion_wanted(scene, st):

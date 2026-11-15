@@ -228,7 +228,8 @@ class Light:
     shadow_bias: float = 0.0
     shadow_map_depth: str = 'INHERIT'   # INHERIT | CLASSIC | MIDPOINT (R251 C117)
     shadow_softness: float = 1.0      # shadow-map blur radius in texels
-    shadow_samples: int = 4
+    # 0 = inherit the render's Samples (the Map Size / Bias precedent)
+    shadow_samples: int = 0
     shadow_color: tuple = (0.0, 0.0, 0.0)
     shadow_density: float = 1.0
     # Period features

@@ -589,6 +589,93 @@ below was reproduced headless before it was fixed and is pinned in
   namespace with no `persistent` and no undo / load lists (the Coded
   Shader test above raised on it in the full run); the stub is lent
   inside a try / finally and restored, and the test checks the hand-back.
+- **A colour wired straight into a shader socket is an Emission on both
+  roads (the deferred pass qualified and drew it as the albedo).** A
+  Material Output whose Surface socket is fed by a COLOUR output -- no
+  shader node in between, the quick way to look at a texture -- drew two
+  pictures of one graph. *Which road was right: neither.* The CPU read
+  the socket through `nodeeval.coerce(v, SHADER)`, which hands anything
+  that is not a closure an EMPTY one, so `closure_to_surface` shaded the
+  material's fallback surface (the viewport colour under the default
+  model) exactly as if nothing were wired. The deferred probe saw that
+  same empty closure -- no lobe to refuse -- and
+  `gpu/material.assemble_frame` casts whatever feeds Surface into the
+  pass's one colour chain, the albedo. Reproduced headless before the
+  fix, on the demo Ball at 128x96 (`R.render` against
+  `gpu/shade.simulate`): the plan QUALIFIED and the simulator frame was
+  1.69 off the CPU's, more than 1e-2 off on all 598 pixels of the
+  material (CPU mean (1.17, 1.17, 1.20), which is the frame of an
+  unwired socket; simulator (1.31, 0.45, 0.17)). A value read 0.96 off
+  and a vector 3.38; a Coded Shader's Color 1.68 (the test's striped
+  shader; the report's own read 1.50) -- the wiring, not the node type;
+  and the same split sat on the Mix Shader's (0.51) and the Add
+  Shader's (2.04) shader inputs. Blender's own rule is neither
+  picture: `ntree_shader_implicit_closure_cast` puts an Emission node on
+  every link from a non-shader socket into a shader socket before EEVEE
+  compiles the tree, and Cycles' `ShaderGraph::connect` adds the same
+  node as its automatic conversion (colour one, Strength 1, a float into
+  Strength). (1) *The CPU reads Blender's conversion.*
+  `core/nodeeval.link_closure` is what a LINK hands a shader socket: a
+  closure passes through, and a colour, a value or a vector becomes ONE
+  EMISSION lobe -- `to_color` of the value, weight 1, Strength 1, the
+  very lobe an Emission node hands on, so the frame is the explicit
+  node's bit for bit. `GraphEvaluator.input` calls it for every linked
+  SHADER read, which is every shader socket there is: the Material and
+  World Output's Surface, the Mix and Add Shader inputs, the Max blends'
+  sub-materials, a group's shader sockets, Shader to RGB. An output with
+  no value (a renamed socket, a node that raised) and an UNLINKED shader
+  socket stay the empty closure. (2) *The deferred plan refuses it by
+  name.* The frame pass emits one colour chain into the diffuse term and
+  has no slot for a raw emission lobe (the Emission node's own standing
+  refusal), so `gpu/shade._probe_material` refuses the lobe -- it is
+  marked `implicit` -- with `IMPLICIT_EMISSION_REFUSAL`: "a colour, value
+  or vector output is wired straight into a shader socket: that is an
+  Emission of it (Blender's implicit conversion, the picture the CPU
+  shades), and the frame pass emits only the diffuse chain -- this
+  material shades on the CPU exactly (a Halcyon Shader in between, the
+  chain in its Diffuse Color or Self-Illumination, puts it on the
+  driver)". It refuses on the lobe's PRESENCE, never its weight: the
+  probe reads sixteen fragments, and a Mix Shader's Fac mask can read 0
+  on every one of them while the emitter still mixes the link into the
+  albedo elsewhere. (3) *This changes pictures.* On the CPU device such a
+  material rendered its fallback surface and now adds the wired colour
+  as emitted light, without the fallback's highlight (a plain closure
+  with no glossy lobe has specular level 0 -- the Emission node's
+  picture); on the demo frame every pixel off the material is bitwise
+  what it was. On the GPU device it rendered the colour as a lit albedo
+  and now renders the CPU's frame, with the reason printed once. A
+  colour wired into the WORLD Output's Surface was ignored (the world
+  fell through to its image, blend or flat colour) and is the sky now,
+  bitwise the Background node at Strength 1; the GPU sky pass already
+  refuses, by name, every world graph but a lone Background with
+  constant inputs. Graphs without such a link are untouched: the
+  conversion happens on that link and nowhere else. (4) *Considered and
+  left.* Twinning it instead -- routing the chain to the pass's emission
+  term, as the specular slot routing did for a lone GLOSSY lobe -- would
+  lift the Emission node's refusal with it and is its own piece of work
+  (the corner road lights emission in the corners; the layer and hit
+  passes each need the route proven); it stays queued, and until then
+  the two devices draw the same frame. And that frame is Halcyon's
+  Emission node's, not Cycles': with no DIFFUSE lobe in the closure
+  `closure_to_surface` leaves the material's fallback diffuse LIT under
+  the glow, where Blender shades black. That rule also reads its batch
+  (`np.any(diff_w > 1e-6)`: a pure-emission pixel has diffuse level 0
+  when a diffuse pixel shares its batch and level 1 when it is alone --
+  seen at the function, not hunted in a frame). Recorded, not changed:
+  every Emission-node material's picture hangs on it. Pinned in
+  `test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads`
+  (53 checks) for a colour, a value and a vector: the CPU frame bitwise
+  the Emission node's; the wired colour arriving as exactly itself over
+  the fallback (frame(colour) - frame(black) within 1e-6 on every pixel
+  of the Ball); the refusal word for word; and the road it names -- a
+  Halcyon Shader in between, either socket -- qualifying with the
+  simulator frame the CPU frame at the twin bar (measured 4.8e-6; the
+  bar is under 6e-3 with no pixel over 1e-2). Then the Mix and Add
+  Shader inputs, Fac 0, a Reroute on the way and a Coded Shader's
+  output; the unwired socket and a Diffuse BSDF in between still
+  twinning; the Emission node keeping its own refusal; the GPU device
+  road on the fake driver returning the CPU frame bit for bit; the World
+  Output. Ten mutations of the fix each fail it.
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
@@ -674,3 +761,11 @@ below was reproduced headless before it was fixed and is pinned in
   way), whether `uniform_sampler` raises for a stripped sampler on that
   backend (it is skipped if it does), and a Vulkan session printing no
   stripped line at all.
+- A colour wired straight into a shader socket in a live node editor
+  (proven against hand-built graphs alone): Blender drawing the link
+  valid and `serialize_tree` exporting it with the source socket's own
+  type, for the Material Output's Surface, a Mix Shader input and the
+  World Output; the F12 console's `shading on the CPU:` line naming the
+  wiring on the GPU device; the same file in EEVEE beside it, where the
+  surface under the glow is black and Halcyon's is its lit fallback
+  (the open item above).

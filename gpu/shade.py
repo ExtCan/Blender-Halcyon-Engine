@@ -83,6 +83,22 @@ from ..core import reyes as REYES        # R251 C119 (MAT-B)
 UNSUPPORTED_MODELS = frozenset({'GOURAUD', 'FLAT'}) | _SHM.UNSUPPORTED_MODELS
 SHADELESS_MODELS = frozenset({'WIREFRAME', 'CONSTANT'})
 
+#: a colour, value or vector output wired straight into a SHADER socket
+#: (the Material Output's Surface, a Mix / Add Shader input, a Max
+#: blend's sub-material). The CPU reads Blender's implicit conversion,
+#: an Emission of it (nodeeval.link_closure); the frame pass emits ONE
+#: colour chain and feeds it to the diffuse term, and the emitter casts
+#: that very link into the chain -- it qualified and drew the colour as
+#: the albedo, 1.69 off the CPU on the demo ball. Refused BY NAME, on
+#: the lobe's PRESENCE (never a sampled weight: the wiring is the fact)
+IMPLICIT_EMISSION_REFUSAL = (
+    'a colour, value or vector output is wired straight into a shader '
+    'socket: that is an Emission of it (Blender\'s implicit conversion, '
+    'the picture the CPU shades), and the frame pass emits only the '
+    'diffuse chain -- this material shades on the CPU exactly (a Halcyon '
+    'Shader in between, the chain in its Diffuse Color or '
+    'Self-Illumination, puts it on the driver)')
+
 
 def _plot_ss(st):
     from ..core import combine as _CBS
@@ -220,6 +236,13 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
         # matrix row ever carried one. Refuse BY NAME; the pictures stay
         # the CPU's own until the specular slot routing is ported.
         from .material import master_node
+        if any(_p.get('implicit') for _k, _w, _p
+               in (getattr(cl, 'items', None) or ())):
+            # a non-closure wired into a shader socket: the CPU's
+            # implicit Emission, the emitter's albedo -- by name, before
+            # the raw-lobe rule below could word it as a node the graph
+            # does not hold (and whatever a sampled weight reads)
+            return None, None, IMPLICIT_EMISSION_REFUSAL
         if getattr(cl, 'items', None) and \
                 master_node(mat.graph) is None:
             # HALCYON lobes stay allowed: their colour IS the diffuse
@@ -683,8 +706,8 @@ def _shadow_meta(light, st, bvh=None):
                         in ('DISK', 'ELLIPSE')}
         else:
             soft_on = float(getattr(light, 'radius', 0.0)) > 0.0
-        samples = max(1, int(getattr(st, 'shadow_samples', 1))) \
-            if soft_on else 1
+        from ..core.lights import shadow_sample_count as _ssc
+        samples = _ssc(light, st) if soft_on else 1
         # soft ray shadows travel now: the jitter is a pure function of
         # (pixel, sample, light, seed) through the pattern hash and the
         # shared unit-circle table, so both devices draw the SAME rays.
@@ -716,6 +739,7 @@ def _shadow_meta(light, st, bvh=None):
     # between the two nearest casters, and the compare carries no bias
     # and no normal offset (the CPU's `visibility` rule, one resolve)
     from ..core.lights import midpoint_map as _midpoint_map
+    from ..core.lights import shadow_sample_count as _shadow_sample_count
     mid = bool(_midpoint_map(light, st))
 
     # packed lazily, behind a content fingerprint: the CPU caches these maps
@@ -745,6 +769,8 @@ def _shadow_meta(light, st, bvh=None):
         'bias': bias, 'softness': soft,
         'density': float(getattr(light, 'shadow_density', 1.0)),
         'midpoint': mid,
+        # the lamp's own Samples (0 = the render's): the tap unroll
+        'samples': int(_shadow_sample_count(light, st)),
     }
     return meta, (key, build), None
 
@@ -801,6 +827,9 @@ def _light_sig(l):
            # the soft-ray shadow function bakes the radius and sample
            # unroll; the shadow colour folds into every light block
            round(float(getattr(l, 'radius', 0.0)), 6),
+           # the lamp's own Samples override sizes that unroll (0 =
+           # the render's, which the plan signature already carries)
+           int(getattr(l, 'shadow_samples', 0) or 0),
            t(getattr(l, 'shadow_color', (0, 0, 0))),
            # R253 light options: the four STRUCTURE bits -- a Square
            # cone, a non-white specular tint, a non-black hemi ground
