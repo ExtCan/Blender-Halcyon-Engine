@@ -121,6 +121,15 @@ pinned where it bit.
     pre-flight counts function bodies, and the strict gate planned
     shadows off. `gpu/material.assemble_frame` declares it once per pass
     (`SHADOWPACK_DECL`), ahead of the first function that fetches.
+(20) Six more sources compiled clean and failed or went wrong when the
+    program ran, none of them a name error: a struct constructor (the
+    parser filed the struct among the builtin types, for every later
+    compile too), the comma operator, a call with the wrong number of
+    arguments, two vector widths that cannot be combined, a Shadertoy
+    entry point (its parameters were never bound, its out parameter never
+    an output) and a misspelled input (nothing was ever warned of, so the
+    node's warning box could not show a line). The counts and the widths
+    are compile errors with a line; the rest run as written.
 """
 import io
 import os
@@ -3376,6 +3385,163 @@ def test_shadow_atlas_sampler_is_declared_once_per_pass():
     check('...and Halcyon\'s front-end does take the redeclared sampler (the simulator could never have caught it)',
           try_compile('uniform sampler2D hal_a;\nuniform sampler2D hal_a;\nuniform vec2 vUV;\nout vec4 Color;\n'
                       'void main() { Color = texelFetch(hal_a, ivec2(0, 0), 0); }\n', 'GLSL')[0] is not None)
+
+
+_CODE_MISSPELLED = """\
+uniform float gain = 1.0;
+
+in vec3 vNormals;
+
+out vec4 Color;
+
+void main() {
+    Color = vec4(vNormals * gain, 1.0);
+}
+"""
+
+_CODE_SHADERTOY = """\
+uniform float gain = 1.0;
+
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    fragColor = vec4(fragCoord, gain, 1.0);
+}
+"""
+
+
+def test_code_node_compiles_what_it_runs():
+    """Six sources the Coded Shader compiler accepted and the program then
+    refused or got wrong, as the node, the exporter, the evaluator and the
+    pre-flight meet them. The front-end's own pins are in test_shaders; this
+    is the same fix where the user sees it: the warning box that could
+    never show a line, the error box for a call with the wrong count or two
+    widths that cannot be combined, the output socket of a Shadertoy entry
+    point, and the pass the pre-flight now stops before a driver does."""
+    import importlib
+    from . import fakebpy
+    fakebpy.install()
+    SN = importlib.import_module('halcyon.nodes.shader_nodes')
+    from .. import export as EX
+    from ..core.nodeeval import GraphEvaluator
+    from ..gpu import device as DV
+    from ..gpu import emit as EM
+    from .test_render import _ctx
+
+    def text(body, name='t'):
+        return types.SimpleNamespace(name=name, as_string=lambda: body)
+
+    def names(socks):
+        return [s.name for s in socks]
+
+    def boxed(n, icon):
+        lay = _Layout()
+        n.draw_buttons(None, lay)
+        return [t for t, i in lay.seen if i == icon]
+
+    def compile_(n, tree):
+        said = []
+        op = SN.HALCYON_OT_compile_shader()
+        op.node, op.report = n.name, (lambda kind, t: said.append((kind, t)))
+        ctx = types.SimpleNamespace(space_data=types.SimpleNamespace(edit_tree=tree), active_node=None)
+        return op.execute(ctx), said
+
+    tree = _code_tree(SN, text(_CODE_A)).node_tree
+    n = tree.nodes.get('Coded Shader')
+    warning = "unknown input 'vNormals': bound to zero"
+
+    # ---- the warning box: it had a property, a draw branch and nothing that ever filled it
+    n.source = text(_CODE_MISSPELLED)
+    got, said = compile_(n, tree)
+    check('a misspelled input compiles (it is not an error) and Compile finishes',
+          got == {'FINISHED'} and n.error == '' and names(n.inputs) == ['Gain'], f'{got} {said} {n.error!r}')
+    check('...and the node\'s warning box names it: the input reads zero',
+          n.warn == warning and boxed(n, 'INFO') == [warning] and boxed(n, 'ERROR') == [],
+          f'{n.warn!r} {boxed(n, "INFO")}')
+    n.source = text(_CODE_MISSPELLED.replace('vNormals', 'vNormal'))
+    got, said = compile_(n, tree)
+    check('the name spelled as the table has it: the box is empty again',
+          got == {'FINISHED'} and n.warn == '' and boxed(n, 'INFO') == [], f'{got} {n.warn!r}')
+
+    # ---- the error box: the wrong count and the two widths, with their lines
+    n.source = text(_CODE_MISSPELLED)
+    compile_(n, tree)
+    refused = [
+        ('a call with one argument too many',
+         'out vec4 Color;\nfloat f(float a) { return a * 2.0; }\nvoid main() {\n    Color = vec4(f(1.0, 2.0));\n}\n',
+         'line 4: f() takes 1 argument, got 2'),
+        ('two vector widths that cannot be combined',
+         'out vec4 Color;\nvoid main() {\n    vec2 a = vec2(1.0);\n    vec3 b = vec3(2.0);\n'
+         '    Color = vec4(a + b, 1.0);\n}\n',
+         'line 5: cannot combine vec2 with vec3'),
+    ]
+    for what, body, want in refused:
+        n.warn = warning                     # the last good program's line, as the node held it
+        n.source = text(body)
+        got, said = compile_(n, tree)
+        check(f'{what}: Compile is cancelled, the error box shows the line',
+              got == {'CANCELLED'} and said == [({'ERROR'}, want)] and boxed(n, 'ERROR') == [want],
+              f'{got} {said} {boxed(n, "ERROR")}')
+        check('...and the warning of the program that is gone went with it', n.warn == '', repr(n.warn))
+        programs, warnings = {}, []
+        EX.serialize_tree(tree, {}, programs, warnings)
+        check('...the export files no program for it and warns with the node, the reason and the line',
+              programs == {} and warnings == [f'Coded Shader: {want}'], f'{sorted(programs)} {warnings}')
+    n.warn = warning
+    n.source, n.source_text = None, '   \n'
+    check('an empty source has no program, no error and no warning left over',
+          n.compile_source() is None and n.error == '' and n.warn == '', f'{n.error!r} {n.warn!r}')
+
+    # ---- a Shadertoy entry point: its out parameter is the node's output, its fragCoord the pixel
+    n.source = text(_CODE_SHADERTOY)
+    got, said = compile_(n, tree)
+    check('mainImage compiles into a node with an output socket for its out parameter',
+          got == {'FINISHED'} and names(n.outputs) == ['Frag Color'] and n.outputs[0].halcyon_key == 'fragColor'
+          and n.outputs[0].bl_idname == 'NodeSocketColor' and names(n.inputs) == ['Gain'] and n.warn == '',
+          f'{got} {said} {names(n.outputs)} {n.warn!r}')
+    tree.nodes.get('Value').outputs[0].default_value = 0.75      # the link into Gain survived the rebuild
+    programs, warnings = {}, []
+    graph = EX.serialize_tree(tree, {}, programs, warnings)
+    c = _ctx(16)
+    c.px, c.py = np.arange(16, dtype=np.int32), np.arange(16, dtype=np.int32)[::-1].copy()
+    c.width, c.height = 16, 16
+    ev = GraphEvaluator(graph, c, programs=programs)
+    col = ev.eval_output('Coded Shader', 0)
+    check('at shading time that output is what the entry wrote: the pixel centre from fragCoord, the linked '
+          'Gain in blue',
+          col is not None and np.allclose(col[:, 0], c.px + 0.5) and np.allclose(col[:, 1], c.py + 0.5)
+          and np.allclose(col[:, 2:], [0.75, 1.0]) and not ev.unsupported and not ev.errors
+          and warnings == [], f'{None if col is None else col[:3]} {sorted(ev.unsupported)} {ev.errors} {warnings}')
+
+    # ---- the GPU road refuses by name what the frame pass cannot bind (it calls the shader's main with
+    # no arguments: a driver refuses that call, and the front-end's count check now does too)
+    def port(body):
+        EM._CODE_PORTS.clear()
+        try:
+            EM._port_code_node(body, 'x')
+            return None
+        except EM.Unsupported as exc:
+            return str(exc)
+    why = port('out vec4 Color;\nvoid main(in vec2 uv) { Color = vec4(uv, 0.0, 1.0); }\n')
+    check('a main that takes parameters is refused for the deferred pass by name',
+          why is not None and 'main takes parameters' in why, str(why))
+    why = port(_CODE_SHADERTOY)
+    check('...as a mainImage entry already was', why is not None and 'mainImage' in why, str(why))
+    check('a plain void main() still ports', port(_CODE_A) is None)
+    EM._CODE_PORTS.clear()
+
+    # ---- the pre-flight every dynamic pass crosses is the same front-end: a pass that calls with the
+    # wrong count, or combines two widths, is refused before the driver, by name and line
+    head = 'in vec2 vUV;\nout vec4 fragColor;\nfloat hal_half(float x) { return x * 0.5; }\n'
+    pre = DV.preflight('Count', head + 'void main() {\n    fragColor = vec4(hal_half(vUV.x, 1.0));\n}\n')
+    check('device.preflight refuses a pass that calls a function with the wrong count',
+          pre is not None and 'line 5: hal_half() takes 1 argument, got 2' in pre
+          and 'refused before the driver' in pre, str(pre))
+    pre = DV.preflight('Width', head + 'void main() {\n    vec3 c = vec3(1.0);\n'
+                                      '    fragColor = vec4(c * vUV, hal_half(1.0));\n}\n')
+    check('...and one that combines a vec3 with a vec2',
+          pre is not None and 'line 6: cannot combine vec3 with vec2' in pre, str(pre))
+    check('the same pass with the call and the widths right goes through',
+          DV.preflight('Fine', head + 'void main() {\n    vec3 c = vec3(1.0);\n'
+                                      '    fragColor = vec4(c.xy * vUV, hal_half(1.0), 1.0);\n}\n') is None)
 
 
 def main():

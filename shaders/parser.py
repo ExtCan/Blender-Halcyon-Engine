@@ -7,12 +7,16 @@ Expressions
     ('num', text, is_int)      ('bool', True/False)   ('var', name, line)
     ('call', name, [args], line)                       ('index', obj, expr)
     ('member', obj, field, line)
-    ('bin', op, l, r)          ('un', op, expr)        ('post', op, expr)
-    ('assign', op, target, value)                      ('cond', c, a, b)
+    ('bin', op, l, r, line)    ('un', op, expr)        ('post', op, expr)
+    ('assign', op, target, value, line)                ('cond', c, a, b, line)
     ('seq', l, r)
     The three kinds that carry a NAME -- a variable, a function, a field or
     swizzle -- end with the source line of that name, so a name nothing
-    declares is reported where it was written (shaders/names.py).
+    declares is reported where it was written (shaders/names.py). The three
+    that COMBINE two values -- a binary operator, an assignment, a ternary
+    -- end with the line of their operator, so two vector widths that cannot
+    be combined are reported there. A node built without a line (the
+    interpreter's own compound-assignment rewrite) simply has none.
 Statements
     ('block', [stmt])          ('decl', gtype, [(name, arrsize, init)])
     ('expr', e)                ('if', c, then, else_or_None)
@@ -20,7 +24,9 @@ Statements
     ('do', body, c)            ('return', e_or_None)
     ('break',) ('continue',) ('discard',) ('nop',)
 Top level
-    ('func', rettype, name, [(qual, gtype, name, arrsize)], body)
+    ('func', rettype, name, [(qual, gtype, name, arrsize, default)], body)
+        `default` is the expression an HLSL parameter is declared with
+        (`float gain = 1.0`), or None: a call may leave such a parameter out.
     ('global', qual, gtype, name, arrsize, init)
     ('struct', name, [(gtype, name, arrsize)])
     One declaration per entry: `uniform float a, b;` and the members of an
@@ -190,8 +196,13 @@ class Parser:
             self.expect(';')
         self.expect('}')
         self.accept(';')
+        # the struct belongs to THIS source: `self.structs` is where the
+        # parser, the name check and the interpreter look it up. (It was
+        # also written into gtypes.BY_NAME, the module's table of builtin
+        # types: there the interpreter found it ahead of its own struct
+        # branch and built `S(a, b)` as a scalar cast of `a`, and there it
+        # stayed for every source compiled afterwards in the session.)
         self.structs[name] = fields
-        BY_NAME[name] = GType('struct', 1, 0, 0, name)
         return ('struct', name, fields)
 
     def parse_function(self, rettype, name):
@@ -214,9 +225,11 @@ class Parser:
                 pname = self.next().value if self.tok.kind == 'ident' else ''
                 pa = self.parse_array_suffix()
                 self.skip_semantic()
-                if self.accept('='):
-                    self.parse_assign()
-                params.append((qual, pt, pname, pa))
+                # an HLSL default (`float gain = 1.0`) is kept: a call that
+                # leaves the parameter out reads it (it was parsed and
+                # dropped, and the missing argument read zero)
+                default = self.parse_assign() if self.accept('=') else None
+                params.append((qual, pt, pname, pa, default))
                 if not self.accept(','):
                     break
         self.expect(')')
@@ -391,15 +404,16 @@ class Parser:
         cases = []
         cur = None
         while not self.at('}'):
-            if self.accept('case'):
+            ctok = self.accept('case')
+            if ctok:
                 v = self.parse_expr()
                 self.expect(':')
-                cur = (v, [])
+                cur = (v, [], ctok.line)
                 cases.append(cur)
                 continue
             if self.accept('default'):
                 self.expect(':')
-                cur = (None, [])
+                cur = (None, [], 0)
                 cases.append(cur)
                 continue
             s = self.parse_statement()
@@ -409,12 +423,12 @@ class Parser:
         self.expect('}')
         # lower to if/else-if; 'break' inside becomes a no-op at this level
         node = None
-        for v, body in reversed(cases):
+        for v, body, line in reversed(cases):
             stripped = ('block', [s for s in body if s[0] != 'break'])
             if v is None:
                 node = stripped
             else:
-                node = ('if', ('bin', '==', sel, v), stripped, node)
+                node = ('if', ('bin', '==', sel, v, line), stripped, node)
         return node or ('nop',)
 
     # ------------------------------------------------------------ expressions
@@ -427,18 +441,19 @@ class Parser:
     def parse_assign(self):
         left = self.parse_cond()
         if self.tok.kind == 'punct' and self.tok.value in ASSIGN_OPS:
-            op = self.next().value
+            optok = self.next()
             right = self.parse_assign()
-            return ('assign', op, left, right)
+            return ('assign', optok.value, left, right, optok.line)
         return left
 
     def parse_cond(self):
         c = self.parse_binary(0)
-        if self.accept('?'):
+        qtok = self.accept('?')
+        if qtok:
             a = self.parse_assign()
             self.expect(':')
             b = self.parse_assign()
-            return ('cond', c, a, b)
+            return ('cond', c, a, b, qtok.line)
         return c
 
     def parse_binary(self, level):
@@ -447,9 +462,9 @@ class Parser:
         ops = BIN_PRECEDENCE[level]
         left = self.parse_binary(level + 1)
         while self.tok.kind == 'punct' and self.tok.value in ops:
-            op = self.next().value
+            optok = self.next()
             right = self.parse_binary(level + 1)
-            left = ('bin', op, left, right)
+            left = ('bin', optok.value, left, right, optok.line)
         return left
 
     def parse_unary(self):

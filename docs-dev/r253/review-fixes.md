@@ -1188,6 +1188,150 @@ Shader's name resolution is pinned in `tests/test_shaders.py` as well.
   uniform twice) and reads every string constant under `gpu/` for a
   second writer of the line (there is one: `SHADOWPACK_DECL`). Putting the
   copy back fails all three.
+- **What the Coded Shader compiles, it runs: struct constructors, the
+  comma, argument counts, vector widths, entry-point parameters, input
+  warnings.** Six kinds of source went through
+  `shaders/compiler.try_compile` with error `None` and then failed or
+  went wrong in `prog.run` -- none of them a name error, so the name
+  check (`shaders/names.py`, run by `Interpreter.validate`) passed every
+  one. Each was reproduced headless first (`try_compile(src)`, then
+  `prog.run({}, {}, 4)`). (1) *Struct constructors.* `S s = S(0.5,
+  vec3(0.1, 0.2, 0.3)); Color = vec4(s.a, s.b);` raised `IndexError` on
+  the field read. `Parser.parse_struct` wrote every struct into
+  `gtypes.BY_NAME`, the module's table of builtin types;
+  `Interpreter.constructor` looked there first, took the scalar-cast path
+  and answered its first argument typed `S` -- the struct branch below it
+  could not be reached. The table is module-global, so the name also
+  outlived its source: a later shader's own `float S(float a, float b)`
+  was read as that constructor, and `S(0.25, 0.5)` answered 0.25. The
+  registration is gone (the parser, the name check and the interpreter
+  read the source's own `structs`), the constructor looks a struct up
+  before the builtin types and builds one field per argument, each
+  converted to its field's type, and the struct's type is one `GType`
+  wherever it is made (the unreachable branch and the name check built it
+  with `rows=1`, a matrix by `is_matrix`). One argument per field is the
+  rule: `S(0.5)`, and the one-argument `S(s)` the scalar path answered as
+  a copy by accident, are `S() takes 2 arguments (one per field), got 1`
+  -- no driver compiles either. (2) *The comma operator.* `for (int i =
+  0; i < 3; i++, b += 1.0)` parsed to `('seq', l, r)` and the interpreter
+  had no case: `unsupported expression 'seq'` when it ran. It has one
+  (the left side for what it writes, the right for the value). The same
+  gap was looked for in everything the parser emits: of its 19 binary and
+  11 assignment operators `^^` alone had no case either (`unsupported
+  operator` when a lane got there), and has one. (3) *Argument counts.*
+  With `float f(float a)`, both `f(1.0, 2.0)` and `f()` compiled and ran
+  -- the extra argument dropped, the missing one zero. The guard that
+  refuses this (R235) sits in `codegen.Generator.user_call`, and nothing
+  has called the generator since the interpreter replaced it.
+  `Interpreter.wrong_count` is the one place that knows the counts -- a
+  shader's own functions (every overload), a struct's fields, a builtin's
+  range -- and the name check asks it for every call before the shader
+  runs: `line 3: f() takes 1 argument, got 2`, `f() takes 1 or 2
+  arguments, got 3`, `sin() takes 1 argument, got 2` (a builtin raised
+  only when a lane reached the call, and never in a branch none took).
+  `Interpreter.pick` no longer falls back to the first function of the
+  name, and a shader's own function hides the builtin of its name
+  whatever the count, as on a driver. *An HLSL default argument is kept.*
+  The parser parsed `float f(float a, float b = 0.5)` and dropped the
+  default, so `f(a)` read `b` as zero; the parameter tuple carries it
+  now, the count is 1 to 2, and the argument left out reads the default
+  (evaluated among the globals). Without it the count check would have
+  refused a call the dialect allows. (4) *Vector widths.* `vec2 a; vec3
+  b; a + b` raised `cannot combine vec2 with vec3` from `gtypes.promote`
+  when the operator ran. The name check already computes every
+  expression's type by the interpreter's own rules, so it refuses the
+  pair where the run would: every operator that goes through `promote`, a
+  comparison, the two arms of a ternary, a compound assignment, and the
+  builtins whose rule promotes its arguments (`min(a, b)`, where NumPy
+  raised on the two shapes first). The message is `promote`'s and the
+  line is the operator's: the parser's `bin`, `assign` and `cond` nodes
+  end with it. *A text a driver compiles is not refused on the
+  front-end's own shortcut* (every pass the engine emits is pre-flighted
+  here). Where the interpreter's type is not the language's -- a matrix
+  times a scalar is typed as a vector, and of two functions with one name
+  and argument count the first is taken whatever the argument types --
+  the type is marked loose and no width is judged on it or on anything
+  computed from it; the swizzle check reads it as before. (5) *Entry
+  points.* `void mainImage(out vec4 fragColor, in vec2 fragCoord)`
+  compiled into a program with no outputs: `Interpreter.run` called the
+  entry with no arguments, so every parameter read zero and nothing an
+  `out` parameter was given left the call. The entry's parameters are
+  bound as the generator bound them (`codegen.param_binding`, its
+  `bind_param` moved out of the class): an `in` reads the renderer's
+  input of its name -- `fragCoord` the two-wide fragment coordinate,
+  `uv`, `normal`, `vColor`, cut or filled to the parameter's own width --
+  and an `out` / `inout` starts at zero and is an output of the program,
+  a socket on the node. The value the entry returns is delivered too: the
+  `Result` socket of a `vec4 main()` was declared by the schema and read
+  `None`. The entry is looked for under the generator's names again
+  (`main`, `mainImage`, then `PSMain`, `psmain`, `MainPS`, `frag`,
+  `fragment`, `pixel`, `PS`; the first function when none of them is
+  there, as before), so an HLSL `float4 PSMain(float2 uv : TEXCOORD0) :
+  SV_Target` written below its helpers is the function that runs. On the
+  GPU road a `mainImage` was already refused for the deferred pass by
+  name; a `main` that takes parameters is too (the frame's `main()` calls
+  it with none, which no driver compiles and the count check now stops at
+  the pre-flight). (6) *Warnings.* `Interpreter.warnings` was never
+  written to, so the generator's `unknown input 'vNormals': bound to
+  zero` was gone and the node's warning box (`HALCYON_CodeNode.warn`) had
+  nothing to draw. A declared `in` / `varying` / `attribute`, or an entry
+  parameter, that the renderer binds nothing to is warned of by name. One
+  that is in `codegen.VARYINGS`, or is itself a key the renderer supplies
+  (`in vec3 position;` reads `position`: the run looks a declared input
+  up under its own name first), is not -- `codegen.INPUT_KEYS` is that
+  list, pinned against `core/nodeeval._shader_inputs`. `compile_source`
+  clears the warning with the program it belonged to (a source that no
+  longer compiles, or is empty, kept the last good program's line).
+  *Nothing that compiled and ran is refused.* Held three ways. Every
+  source the whole suite hands the compiler was recorded (1739 distinct
+  texts: the engine's passes through the simulators and the pre-flight,
+  the twins, the tests' own) and compiled by the front-end before and
+  after: 1675 compile in both with the same outputs, uniforms and inputs
+  and no warning, 64 are refused in both with the same words. The
+  enumeration of `tests/glsl_strict.py` with a recorder standing where
+  glslang stands (every engine model at every rate, every console type
+  and option, the cel masters, the post stages, the sky and raster
+  fragments, the coded shaders by node name: 1771 fragment texts, 253
+  distinct) and the planner's pass texts for all 313 feature-matrix rows
+  and for 11760 Console Emulation Shader configurations (every machine by
+  its panel's options by the node's rate, at three scene rates, with the
+  light limit, a painted mesh and the luma / toon dials: 408 distinct)
+  compile the same in both, with the same declarations. And 12000 seeded
+  random shaders (operators, calls, constructors, swizzles, ternaries
+  over every type; half with wrong counts mixed in) were compiled and run
+  by both: of the 5431 that ran before, 5274 run to the same values, 104
+  are refused for the wrong count of a function or a struct constructor,
+  none is refused for its widths, and 53 raise where they "ran" -- each
+  uses a struct constructor's value as a number, which ran only because
+  the constructor answered its first argument; of the 625 that raised
+  `cannot combine` when run, 624 are compile errors (the last combines a
+  struct, below). What IS newly refused is, by intent: a wrong count
+  wherever it is written (it ran, on other arguments than the ones
+  written), and two widths in code no lane reached -- a branch never
+  taken, a function never called -- as the name check refuses an
+  undeclared name there. *Seen and left* (each reproduced; none is one of
+  the six): of two functions with one name and argument count the first
+  is called whatever the argument types (`float f(float)` then `vec3
+  f(vec3)`: `f(v)` runs the float one); a matrix times a scalar raises in
+  `einsum`; a struct used as a number, or compared with another, raises
+  when run; a struct field declared as an array is stored and typed as
+  one element (`l.dir[1] = v` reads back wrong, `l.dir[1].xy` is refused
+  as a swizzle of a float); a `vec3` initialised from a `vec2` keeps two
+  components, and `vec3(a, b)` / `vec2(a, b, c)` pad and cut in silence;
+  a source with no function at all compiles and raises `no main() in
+  shader` when run; `in vec3 vBitangent;` reads zero unwarned (the table
+  binds it, the renderer supplies nothing); and `in vec3 position;` -- a
+  renderer key used as a name -- reads the position on the CPU and zero
+  in the deferred pass (`gpu/emit` binds table names alone). Pinned in
+  `tests/test_shaders.py` (six tests, 67 checks: each reported shader,
+  its neighbours, per-lane runs, every operator the parser knows, every
+  builtin at each count of its range and one either side, 121 type pairs
+  by 7 operators against `promote` itself, the entry bindings, the
+  warning list) and in `test_code_node_compiles_what_it_runs` in
+  `tests/test_r253_review.py` (18 checks: the real node class through
+  Compile, the warning and error boxes, the export, the evaluator at
+  shading time, the GPU port and `device.preflight`). 32 mutations of the
+  fix each fail them.
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
@@ -1327,3 +1471,13 @@ Shader's name resolution is pinned in `tests/test_shaders.py` as well.
   a build that still takes that road compiling a material pass under two
   or more shadowed lamps, and what its driver says to the 1.92.0 text (a
   redefinition by GLSL's rule; no driver was asked).
+- The Coded Shader's warning box and a Shadertoy entry point in a live
+  node editor (proven against the fake bpy and the headless evaluator
+  alone): `in vec3 vNormals;` drawing the INFO line under the Compile
+  button and the corrected name clearing it; a `void mainImage(out vec4
+  fragColor, in vec2 fragCoord)` source growing a Frag Color socket on
+  Compile, keeping its links through the rebuild, and shading the pixel
+  coordinate in an F12 frame on the CPU road (the deferred pass refuses
+  it by name). A wrong argument count or two vector widths in a coded
+  shader of a real file: the red line in the node, and the frame shading
+  without that node's program rather than failing halfway.
