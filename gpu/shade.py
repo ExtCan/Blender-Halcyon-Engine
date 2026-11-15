@@ -724,20 +724,36 @@ def _shadow_meta(light, st, bvh=None):
     # atlas every frame was most of the warm frame's cost
     key = ('shadow', size, grid, 'MID' if mid else 'CLS',
            tuple(round(float(f.depth[::23].sum()), 3) for f in faces_sm))
+    # a SIZED lamp (Radius, a Sun's Angle, an Area's Size) measures its
+    # penumbra per fragment (gpu/softmap.py, the twin of core/softmap.py).
+    # The depth texels are the same either way; the one thing the sized
+    # lookup reads beside them is the map's nearest depth, which rides
+    # the G channel of the lamp's first atlas texel -- a caster moving
+    # nearer re-uploads the atlas (as it must) and never touches the
+    # shader text. The size itself is baked as literals (`_light_sig`)
+    from ..core import softmap as _softmap
+    shape = _softmap.lamp_shape(light)
+    d_min = None
+    if shape is not None:
+        d_min = float(_softmap.map_d_min(sm))
+        key = key + ('sized', d_min)
 
-    def build(_faces=faces_sm, _size=size, _grid=grid):
+    def build(_faces=faces_sm, _size=size, _grid=grid, _d_min=d_min):
         atlas = np.zeros((_size * _grid[1], _size * _grid[0], 4), np.float32)
         for fi, f in enumerate(_faces):
             cy, cx = (fi // _grid[0]) * _size, (fi % _grid[0]) * _size
             atlas[cy:cy + _size, cx:cx + _size, 0] = f.depth
+        if _d_min is not None:
+            atlas[0, 0, 1] = _d_min
         return atlas
 
     bias = float(getattr(light, 'shadow_bias', 0.0) or st.shadow_bias)
     if mid:
         bias = 0.0
+    # the user's Softness in texels (the lamp's own dial multiplies the
+    # render's); the lamp's size is no part of it
     soft = max(float(getattr(light, 'shadow_softness', 1.0))
-               * float(st.shadow_softness), 0.0) \
-        + float(getattr(sm, 'soft_extra', 0.0) or 0.0)
+               * float(st.shadow_softness), 0.0)
     meta = {
         'faces': [{'vp': np.asarray(f.vp, np.float32)} for f in faces_sm],
         'size': size, 'near': float(first.near), 'far': float(first.far),
@@ -749,6 +765,9 @@ def _shadow_meta(light, st, bvh=None):
         # the lamp's own Samples (0 = the render's): the tap unroll
         'samples': int(_shadow_sample_count(light, st)),
     }
+    if shape is not None:
+        meta['soft'] = {'shape': shape,
+                        'axes': [_softmap.face_axes(f) for f in faces_sm]}
     return meta, (key, build), None
 
 
@@ -845,7 +864,16 @@ def _light_sig(l):
                 round(float(getattr(l, 'shadow_density', 1.0)), 6),
                 # R251 C117: the per-lamp Map Depth override changes
                 # the emitted offset line
-                str(getattr(l, 'shadow_map_depth', 'INHERIT')))
+                str(getattr(l, 'shadow_map_depth', 'INHERIT')),
+                # R254: a sized lamp's map lookup bakes the size as
+                # literals -- the radius (a Sun's angle), an Area's
+                # rectangle and shape -- so each is structure here,
+                # whatever the traced road's entries above carry
+                round(float(getattr(l, 'radius', 0.0) or 0.0), 6),
+                t(getattr(l, 'area_size', (0.0, 0.0)) or (0.0, 0.0)),
+                t(getattr(l, 'area_x', (1, 0, 0))),
+                t(getattr(l, 'area_y', (0, 1, 0))),
+                str(getattr(l, 'area_shape', 'SQUARE')))
     if cookie is not None:
         # a projected texture bakes its frame, strength and size into
         # the pass, and its pixels ride the upload cache: swap or edit

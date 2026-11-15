@@ -1431,6 +1431,14 @@ def _shadow_function(i, meta, consts):
         L += [f'    return acc / {_f(float(samples))};', '}']
         return '\n'.join(L) + '\n'
 
+    if meta.get('soft'):
+        # a SIZED lamp: the penumbra is measured per fragment (a blocker
+        # search, a width by similar triangles, a filter that wide) --
+        # core/softmap.py's lookup, emitted by its twin. A lamp of size
+        # 0 never carries the key and keeps the text below
+        from .softmap import shadow_function as _soft_map_function
+        return _soft_map_function(i, meta)
+
     faces = meta['faces']                    # list of per-face dicts
     size = meta['size']
     near, far, persp = meta['near'], meta['far'], meta['persp']
