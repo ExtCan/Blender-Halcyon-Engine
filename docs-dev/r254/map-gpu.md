@@ -61,6 +61,14 @@ back to back. The probes are in `<scratch>/wt/map-gpu/aud/` (`soft0.py`,
   default is 1) and every lamp at Samples 1 keep the constant lookup
   (`softmap.lookup_shape`). A sized lamp's shadow is the map-soft frame.
 
+- **The tooltip.** Render Samples said a lamp of size 0 "takes this many
+  taps of the Softness blur". It reads: "Quality of soft shadows. 1 is a
+  hard edge for every lamp. Above 1, mapped: a lamp with a size, and any
+  lamp under a Softness above 1, filters 4 taps per sample (16 to 64) into
+  a smooth penumbra; a lamp of size 0 at Softness 1 or less takes this
+  many taps; traced: rays per pixel from a sized lamp. More is smoother
+  and slower".
+
 - **The device kept the old shadow atlas when a caster moved between the
   rows its fingerprint sampled.** The atlas upload key and the plan
   signature identified a map by `round(depth[::23].sum(), 3)` per face: the
@@ -397,14 +405,15 @@ pin after this branch forked (f6484e3). It was not touched.
 ## Tests
 
 `tests/test_r254_map_gpu.py` (`python -m halcyon.tests.test_r254_map_gpu`):
-eight functions, a to h, 141 checks, all passing here. On the fork point
-with only this file dropped in: 33 failures (27 failed checks and six
+nine functions, a to i, 142 checks, all passing here. On the fork point
+with only this file dropped in: 34 failures (28 failed checks and six
 functions that stop on a missing API), every function failing. Re-run on
-this tree: test_r254_map_soft (168 ok), test_r254_ray_road (the one fork-
-point failure above), test_r254_falloff, test_r254_spot_beam,
-test_r253_light_options (195 ok), test_r253_uniforms, test_r251_shadow and
-test_r251_lighting_lamps (only the 1.89.0 zip pin of the baseline list), 34
-functions of test_render that touch plans, shadows, lamps and the device
+this tree: test_r254_map_soft (168 ok), test_r254_ray_road (209 ok and the
+one fork-point failure above), test_r254_falloff (152 ok),
+test_r254_spot_beam (114 ok), test_r253_light_options (195 ok),
+test_r253_uniforms (72 ok), test_r251_shadow and test_r251_lighting_lamps
+(only the 1.89.0 zip pin of the baseline list), 38 functions of test_render
+that touch plans, shadows, lamps, tooltips and the device
 (`test_every_feature_survives_the_device_switch` among them; only
 `test_gpu_sky_pass`'s eight baseline sky pins fail), and the strict GLSL
 gate.
@@ -427,6 +436,7 @@ gate.
   `PLAN_STATS`, `SHADOW_TEXELS`, `RedTexture`, `sim_texture`.
 - `gpu/device.py`: `_upload_impl` uploads a 2D array as R32F.
 - `shaders/builtins.py`: `texelFetch` on a one-channel sampler.
+- `properties.py`: the render Samples tooltip.
 - `tests/fakedevice.py`: `FakeTexture.fmt`, the R32F sampler.
 - `tests/test_r254_map_gpu.py` (new), `tests/glsl_strict.py`, the pins
   above.

@@ -1605,11 +1605,12 @@ DESCRIPTIONS = {
                        "(Radius, Angle, Size) casts. 0 adds none. It "
                        "needs Samples above 1",
     'shadow_samples': "Quality of soft shadows. 1 is a hard edge for every "
-                      "lamp. Above 1, mapped: a lamp with a size filters 4 "
-                      "taps per sample (16 to 64) into a smooth penumbra "
-                      "and a lamp of size 0 takes this many taps of the "
-                      "Softness blur; traced: rays per pixel from a sized "
-                      "lamp. More is smoother and slower",
+                      "lamp. Above 1, mapped: a lamp with a size, and any "
+                      "lamp under a Softness above 1, filters 4 taps per "
+                      "sample (16 to 64) into a smooth penumbra; a lamp of "
+                      "size 0 at Softness 1 or less takes this many taps; "
+                      "traced: rays per pixel from a sized lamp. More is "
+                      "smoother and slower",
     # R251 C117
     'shadow_map_depth': "What each shadow-map texel stores. CLASSIC keeps "
                         "the nearest caster and fights acne with Bias and "

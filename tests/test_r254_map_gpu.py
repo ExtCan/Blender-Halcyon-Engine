@@ -24,6 +24,7 @@ a number that the tree before this package fails:
        the simulator
     h  the plan cache keeps a draft's and a refine's plan through a drag
        and holds no map alive
+    i  the Samples tooltip says which lookup a Softness selects
 
     python -m halcyon.tests.test_r254_map_gpu
 """
@@ -855,6 +856,29 @@ def test_h_the_plan_cache_holds_draft_and_refine():
           and sigs[0] in GSH._PLAN_CACHE and sigs[-1] in GSH._PLAN_CACHE
           and sigs[1] not in GSH._PLAN_CACHE and GSH.PLAN_CACHE_MAX >= 8,
           f'{len(GSH._PLAN_CACHE)} of {GSH.PLAN_CACHE_MAX}')
+
+
+def test_i_the_samples_tooltip_names_the_rule():
+    """The render's Samples said a lamp of size 0 'takes this many taps
+    of the Softness blur': true only up to one texel of Softness now."""
+    import importlib
+
+    from . import fakebpy
+    fakebpy.install()
+    try:
+        import halcyon.properties as P
+    except ImportError:
+        P = importlib.import_module('..properties', __package__)
+    importlib.reload(P)
+    samp = ' '.join(str(P.HalcyonSettings.__annotations__['shadow_samples']
+                        .kw.get('description', '') or '').split())
+    check("the render's Samples says any lamp under a Softness above 1 "
+          'takes the smooth filter, and a size-0 lamp its own tap count '
+          'only at Softness 1 or less',
+          len(samp) >= 40 and 'Softness above 1' in samp
+          and 'size 0 at Softness 1 or less' in samp
+          and '4 taps per sample (16 to 64)' in samp
+          and '1 is a hard edge' in samp, samp)
 
 
 def main():
