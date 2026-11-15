@@ -1872,7 +1872,40 @@ def region_bump_scene(st, strength=0.8):
     return sc
 
 
+def world_light_sky(w=256, h=128, sun_px=(40, 96), hot=40.0):
+    """R254: a small equirectangular HDR sky -- a blue gradient with one
+    3x3 block of `hot` warm texels (the sun) at column / row `sun_px`
+    (row 0 = bottom). Shared with tests/test_r254_world_light.py."""
+    px = np.zeros((h, w, 4), np.float32)
+    t = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None]
+    px[:, :, 0] = 0.20 + 0.10 * t
+    px[:, :, 1] = 0.30 + 0.15 * t
+    px[:, :, 2] = 0.45 + 0.30 * t
+    px[:, :, 3] = 1.0
+    x, y = int(sun_px[0]), int(sun_px[1])
+    px[y - 1:y + 2, x - 1:x + 2, :3] = np.array([1.0, 0.9, 0.7],
+                                                np.float32) * hot
+    return px
+
+
+def _sc_world_light(st):
+    """R254: the demo scene with NO lamps under an HDRI sky whose sun the
+    world light finds -- lit and shadowed by the world alone."""
+    sc = demo_scene(st, with_texture=False)
+    sc.lights = []
+    buf = ImageBuffer(name='wl_sky', pixels=world_light_sky(),
+                      colorspace='Linear')
+    sc.images['wl_sky'] = buf
+    sc.world.mode = 'HDRI'
+    sc.world.env_image = buf
+    sc.world.env_filter = 'NEAREST'
+    sc.world.world_light = True
+    return sc
+
+
 SCENES = {
+    # R254: the world's own luminary as the only light
+    'world_light': _sc_world_light,
     # R253: the render region's bump-context scene
     'region_bump': region_bump_scene,
     # R251 material pack, wave 2 (MAT-B): the period node scenes
@@ -2092,6 +2125,8 @@ ROWS = [
     ('shadow buffer clip end (BI ClipEnd)', {}, 'clip_map'),
     ('cookie offset / tiling / angle (projector map)', {}, 'cookie_xform'),
     ('Quake light style (slow strong pulse)', {}, 'light_style'),
+    # R254: no lamps at all -- the sky's sun is the light
+    ('world light (HDRI sun, no lamps)', {}, 'world_light'),
     # ------------------------------------------------------------ shadows
     ('shadows off', {'shadows': False}, 'demo'),
     ('ray shadows', {'shadow_default': 'RAY'}, 'demo'),

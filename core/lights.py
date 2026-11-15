@@ -306,12 +306,19 @@ def midpoint_map(light, settings):
 def _shadow_base_signature(scene, settings, caster_tris):
     """Fingerprint of what EVERY shadow map depends on: the geometry,
     the shadow settings and the caster set -- everything except the
-    light itself."""
+    light itself.
+
+    The geometry is the two strided sums AND mathx.content_digest of
+    every vertex position: the sums alone served the old maps -- the
+    shadow stayed where the object USED to stand -- for a move between
+    the stride's samples, and for a (0, d, -d) move whose float sum
+    cancels exactly."""
     mesh = scene.mesh
     v = mesh.verts
     step = max(1, v.shape[0] // 512)
     geo = (v.shape[0], float(v[::step].sum()), float(v[::step, 0].dot(
-        np.arange(v[::step].shape[0], dtype=np.float32))))
+        np.arange(v[::step].shape[0], dtype=np.float32))),
+        M.content_digest(v))
     return (geo, settings.shadows, settings.shadow_default,
             int(settings.shadow_map_size),
             # size AND sum: two caster sets of equal count (say, two
@@ -1475,8 +1482,17 @@ def select_lights(lights, settings, centre=None):
     limit = int(settings.max_lights)
     if limit <= 0 or len(active) <= limit:
         return active
+    # R254: the world's own light (core/worldlight.py) is the sky's sun --
+    # the limit ranks the LAMPS for the slots left beside it and never
+    # drops it. No scene without World Light carries the mark.
+    kept = [l for l in active if getattr(l, 'world_light', False)]
+    if kept:
+        active = [l for l in active if not getattr(l, 'world_light', False)]
+        limit = max(limit - len(kept), 0)
+        if limit == 0:
+            return kept
     if settings.light_limit_mode == 'FIRST':
-        return active[:limit]
+        return active[:limit] + kept
     if settings.light_limit_mode == 'NEAREST' and centre is not None:
         key = [float(np.linalg.norm(np.asarray(l.position, np.float32) - centre))
                for l in active]
@@ -1484,7 +1500,7 @@ def select_lights(lights, settings, centre=None):
     else:
         key = [float(l.energy) * float(np.mean(l.color)) for l in active]
         order = np.argsort(key)[::-1]
-    return [active[i] for i in order[:limit]]
+    return [active[i] for i in order[:limit]] + kept
 
 
 def ambient_light_split(scene, settings):
