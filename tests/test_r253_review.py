@@ -79,6 +79,15 @@ pinned where it bit.
     The GPU emitter's mangling tag was the id with its punctuation
     flattened, which is many-to-one ('Coded Shader' / 'Coded_Shader'):
     `gpu/emit._code_tag` hands out one tag per node.
+(16) The Coded Shader compiler resolved a name when a lane reached it: an
+    identifier nothing declares compiled clean, the node's error box
+    stayed empty, the exporter filed the program without a warning, and
+    the node read zeros at shading time behind an evaluator error -- or
+    shaded, when the name sat in a branch no lane took, and the text went
+    to the driver as written. `shaders/names.py` resolves every name at
+    compile time (identifiers, struct fields, swizzles), so the error is in
+    the box on Compile, in the export's warnings, and no program exists to
+    run or to inline.
 """
 import io
 import os
@@ -2242,6 +2251,173 @@ def test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads():
     check('...and the colour is the sky', bool(np.allclose(sky, [0.15, 0.35, 0.8], atol=0.02)), str(np.round(sky, 3)))
     check('...which the GPU sky pass refuses by name (the node road)',
           GSKY.refusal(scw, stw) == 'the world node graph is evaluated on the CPU', str(GSKY.refusal(scw, stw)))
+
+
+#: the reported source: `nothing` is declared nowhere
+_CODE_UNDECLARED = """\
+uniform float gain = 1.0;
+
+out vec4 Color;
+
+void main() {
+    Color = vec4(nothing, 0.05, gain, 1.0);
+}
+"""
+
+
+class _Layout:
+    """node.draw_buttons' layout: every label it draws, in order."""
+
+    def __init__(self, seen=None):
+        self.seen = [] if seen is None else seen
+        self.alert = False
+
+    def row(self, **_kw):
+        return _Layout(self.seen)
+
+    box = column = row
+
+    def prop(self, *_a, **_kw):
+        pass
+
+    def operator(self, *_a, **_kw):
+        return types.SimpleNamespace()
+
+    def label(self, text='', icon='NONE'):
+        self.seen.append((text, icon))
+
+
+def test_code_node_name_errors_are_compile_errors():
+    """An identifier nothing declares was accepted by the Coded Shader
+    compiler and failed only when the program ran: the node's error box
+    stayed empty on Compile, the exporter filed the program and warned of
+    nothing, and at shading time the evaluator caught the exception and the
+    node's outputs read zeros. On the GPU road the plan's probe refused the
+    whole frame when a probed lane reached the name -- and qualified it
+    when none did, handing the driver the text as written. The name is a
+    compile error now (shaders/names.py): in the box, in the export's
+    warnings, and with no program there is nothing to run and nothing to
+    inline."""
+    import importlib
+    from . import fakebpy
+    fakebpy.install()
+    SN = importlib.import_module('halcyon.nodes.shader_nodes')
+    from .. import export as EX
+    from ..core import raster
+    from ..core.nodeeval import GraphEvaluator
+    from ..gpu import device as DV
+    from ..gpu import shade as GSH
+    from ..shaders.compiler import try_compile
+    from .scenebuild import add_coded_floor
+    from .test_render import _ctx
+
+    want = "line 6: undeclared identifier 'nothing'"
+    good = types.SimpleNamespace(name='good', as_string=lambda: _CODE_A)
+    bad = types.SimpleNamespace(name='bad', as_string=lambda: _CODE_UNDECLARED)
+    mended = types.SimpleNamespace(name='mended',
+                                   as_string=lambda: _CODE_UNDECLARED.replace('nothing', 'gain * 0.5'))
+
+    def names(socks):
+        return [s.name for s in socks]
+
+    def links(n):
+        return ([(l.from_node.name, l.from_socket.name) for l in n.inputs['Gain'].links],
+                [(l.to_node.name, l.to_socket.name) for l in n.outputs['Color'].links])
+
+    def boxed(n):
+        lay = _Layout()
+        n.draw_buttons(None, lay)
+        return [text for text, icon in lay.seen if icon == 'ERROR']
+
+    # ---- the node: Compile puts the error in the box and keeps the sockets
+    tree = _code_tree(SN, good).node_tree
+    n = tree.nodes.get('Coded Shader')
+    wired = links(n)
+    check('the node starts whole: no error, the good source\'s sockets, both links',
+          n.error == '' and boxed(n) == [] and names(n.inputs) == ['Gain', 'Tint']
+          and wired == ([('Value', 'Value')], [('Material Output', 'Surface')]), f'{n.error!r} {names(n.inputs)}')
+    n.source = bad
+    said = []
+    op = SN.HALCYON_OT_compile_shader()
+    op.node, op.report = n.name, (lambda kind, text: said.append((kind, text)))
+    ctx = types.SimpleNamespace(space_data=types.SimpleNamespace(edit_tree=tree), active_node=None)
+    got = op.execute(ctx)
+    check('Compile on a source with an undeclared identifier is cancelled and reports it by name and line',
+          got == {'CANCELLED'} and said == [({'ERROR'}, want)], f'{got} {said}')
+    check('the node\'s error box shows that line', n.error == want and boxed(n) == [want], f'{n.error!r} {boxed(n)}')
+    check('...and the sockets are left as they were, links and all (no program, nothing to rebuild from)',
+          names(n.inputs) == ['Gain', 'Tint'] and names(n.outputs) == ['Color'] and links(n) == wired,
+          f'{names(n.inputs)} {links(n)}')
+    check('the rebuild timer\'s road (compile_source) answers the same', n.compile_source() is None and n.error == want)
+
+    # ---- the export: no program is filed, the warning names node, name and line
+    twin = _code_coded(SN, tree, 'Good Shader', good)
+    programs, warnings = {}, []
+    graph = EX.serialize_tree(tree, {}, programs, warnings)
+    check('serialize_tree files the good node\'s program and none for the node that does not compile',
+          sorted(programs) == ['Good Shader'] and twin.error == '', str(sorted(programs)))
+    check('...and the export warns, naming the node, the identifier and the line',
+          warnings == [f'Coded Shader: {want}'], str(warnings))
+
+    # ---- shading time: the node reads zeros with NOTHING for the evaluator to catch
+    ev = GraphEvaluator(graph, _ctx(), programs=programs)
+    col = ev.eval_output('Coded Shader', 0)
+    check('at shading time the node reads zeros and the evaluator records no error (it used to catch '
+          'ShaderError: unknown identifier per batch)',
+          col is not None and not np.any(col) and not ev.unsupported and not ev.errors,
+          f'{sorted(ev.unsupported)} {ev.errors}')
+
+    # ---- mending the source clears the box and rebuilds
+    n.source = mended
+    said[:] = []
+    got = op.execute(ctx)
+    check('the mended source compiles: the box is empty and the sockets follow the new declarations',
+          got == {'FINISHED'} and n.error == '' and boxed(n) == [] and names(n.inputs) == ['Gain']
+          and links(n) == wired, f'{got} {n.error!r} {names(n.inputs)} {links(n)}')
+
+    # ---- the GPU road. A name behind a branch the sixteen probe points miss used to qualify the frame
+    # and ride into the pass as written (here `vUV`, which the frame shader itself declares: a driver
+    # compiles that text and draws the full-screen quad's UV where the CPU zeroes the node)
+    strip = ('in vec2 vScreenUV;\nout vec4 Color;\nvoid main() {\n    Color = vec4(0.2, 0.6, 0.9, 1.0);\n'
+             '    if (vScreenUV.x > 0.5 && vScreenUV.x < 0.53) { Color = vec4(vUV, 0.0, 1.0); }\n}\n')
+    prog, err = try_compile(strip)
+    check('a varying read without its declaration, behind a branch, is a compile error that says what to write',
+          prog is None and err == "line 5: undeclared identifier 'vUV' (declare it: in vec2 vUV;)", repr(err))
+    w, h = 96, 72
+    st = base_settings(w, h, shadows=True)
+    st.color_depth, st.dither, st.output_scale = '24', 'NONE', 'NONE'
+    sc = add_coded_floor(demo_scene(st, with_texture=False))
+    code = sc.materials[0].graph['nodes']['code']
+    code['props']['source_text'], code['inputs'] = strip, []
+    sc.materials[0].programs = {}                # what the exporter files for a source that does not compile
+    cpu = R.render(sc, st)
+    view, _proj, vp, eye = R.camera_matrices(sc.camera, w, h)
+    g = raster.GBuffer(w, h)
+    raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+    job = R.ShadeJob(sc, st, {}, None, view, eye, w, h)
+    GSH._PLAN_CACHE.clear()
+    passes, why, atlases = GSH.plan_frame(job, g)
+    check('the frame still qualifies for the GPU: the node is zeros there, as on the CPU', passes is not None, str(why))
+    if passes is not None:
+        texts = [x for ps in passes for x in ps if isinstance(x, str) and 'void main' in x]
+        check('no pass carries the coded text (the unresolved name never reaches a driver)',
+              bool(texts) and not any('vScreenUV' in t or '_cncode_' in t for t in texts))
+        img, _hit = GSH.simulate(job, g, passes, atlases)
+        cov = g.tri >= 0
+        d = float(np.abs(img[cov] - cpu[cov][:, :3]).max())
+        check('...and the simulated GPU frame is the CPU frame', d < 6e-3, f'max {d:.5f}')
+    GSH._PLAN_CACHE.clear()
+
+    # ---- the pre-flight every dynamic pass crosses is the same front-end: a pass text that names
+    # something undeclared in a branch is refused before the driver, with the name and its line
+    stray = 'in vec2 vUV;\nout vec4 fragColor;\nvoid main() {\n    fragColor = vec4(vUV, 0.0, 1.0);\n' \
+            '    if (vUV.x > 2.0) { fragColor = vec4(hal_missing); }\n}\n'
+    pre = DV.preflight('Stray', stray)
+    check('device.preflight refuses a pass that names something undeclared',
+          pre is not None and "line 5: undeclared identifier 'hal_missing'" in pre and 'refused before the driver' in pre,
+          str(pre))
+    check('...and lets the same pass through once the name is declared',
+          DV.preflight('Stray', 'uniform float hal_missing;\n' + stray) is None)
 
 
 def main():

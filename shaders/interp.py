@@ -84,6 +84,10 @@ class Interpreter:
         self.inputs = []
         self.outputs = []
         self.warnings = []
+        #: every global declaration as (role, entry), in SOURCE order: the
+        #: order run() binds them in and names.py resolves them in, so an
+        #: initialiser sees exactly what is declared above it
+        self.order = []
         for d in decls:
             kind = d[0]
             if kind == 'func':
@@ -94,43 +98,38 @@ class Interpreter:
                     if arr else gtype
                 entry = (name, t, init, quals)
                 if 'uniform' in quals:
-                    self.uniforms.append(entry)
+                    role, into = 'uniform', self.uniforms
                 elif 'in' in quals or 'attribute' in quals or 'varying' in quals:
-                    self.inputs.append(entry)
+                    role, into = 'input', self.inputs
                 elif 'out' in quals:
-                    self.outputs.append(entry)
+                    role, into = 'output', self.outputs
                 else:
-                    self.globals.append(entry)
+                    role, into = 'global', self.globals
+                into.append(entry)
+                self.order.append((role, entry))
 
     def validate(self):
-        """Reject unknown functions before the shader ever runs.
+        """Reject every name that cannot resolve before the shader ever runs.
 
         The generator caught these while emitting code. An interpreter would
-        otherwise not notice until a pixel happened to reach the call, which
-        turns a compile error into a render that fails halfway.
+        otherwise not notice until a pixel happened to reach the name, which
+        turns a compile error into a render that fails halfway -- or into no
+        error at all, when the name sits in a branch no lane takes. Unknown
+        functions were checked here first; identifiers, struct fields and
+        swizzles are checked with them now (shaders/names.py), each reported
+        with its line.
         """
-        from .gtypes import BY_NAME
-
-        def walk(node):
-            if isinstance(node, tuple) and node and node[0] == 'call':
-                name = node[1]
-                known = (name in self.funcs or name in BUILTINS
-                         or name in BY_NAME or name in self.structs)
-                if not known:
-                    raise ShaderError(f'unknown function {name!r}')
-            if isinstance(node, (tuple, list)):
-                for part in node:
-                    walk(part)
-
-        for cands in self.funcs.values():
-            for fn in cands:
-                walk(fn[4])
+        from .names import NameCheck
+        NameCheck(self).check()
         return self
 
     # ------------------------------------------------------------- entry
     def run(self, uniforms, inputs, n):
         n = int(n)
-        root = Scope()
+        # the root is the scope every function body starts from (call_user)
+        # and the scope a global's initialiser is evaluated in: set before
+        # the first initialiser runs, so it never reads a previous run's
+        self.root = root = Scope()
         # gl_FragCoord is a builtin, in scope without a declaration -- as it
         # is in GLSL. Bound first so a declared `in vec4 gl_FragCoord;`
         # (redundant but accepted) takes the same value over it
@@ -139,30 +138,31 @@ class Interpreter:
         root.put('gl_FragCoord',
                  self.adapt(fc if fc is not None
                             else np.zeros((n, 4), np.float32), fc_t, n), fc_t)
-        for name, t, init, _q in self.uniforms:
-            v = uniforms.get(name)
-            if v is None:
-                v = self.const(init, t, n) if init is not None else self.zero(t, n)
-            root.put(name, self.adapt(v, t, n), t)
-        for name, t, init, _q in self.inputs:
-            # a varying can be supplied under its declared name or under the
-            # binding it maps to, and the generator accepted either
-            from .codegen import VARYINGS
-            v = inputs.get(name)
-            if v is None:
-                bound = VARYINGS.get(name)
-                if bound is not None:
-                    v = inputs.get(bound[0])
-            if v is None:
-                v = self.varying(name, t, n)
-            root.put(name, self.adapt(v, t, n), t)
-        for name, t, init, _q in self.globals:
-            root.put(name, self.const(init, t, n) if init is not None
-                     else self.zero(t, n), t)
-        for name, t, init, _q in self.outputs:
-            root.put(name, self.zero(t, n), t)
+        from .codegen import VARYINGS
+        for role, (name, t, init, _q) in self.order:
+            if role == 'uniform':
+                v = uniforms.get(name)
+                if v is None:
+                    v = self.const(init, t, n, root) if init is not None \
+                        else self.zero(t, n)
+                root.put(name, self.adapt(v, t, n), t)
+            elif role == 'input':
+                # a varying can be supplied under its declared name or under
+                # the binding it maps to, and the generator accepted either
+                v = inputs.get(name)
+                if v is None:
+                    bound = VARYINGS.get(name)
+                    if bound is not None:
+                        v = inputs.get(bound[0])
+                if v is None:
+                    v = self.varying(name, t, n)
+                root.put(name, self.adapt(v, t, n), t)
+            elif role == 'global':
+                root.put(name, self.const(init, t, n, root)
+                         if init is not None else self.zero(t, n), t)
+            else:
+                root.put(name, self.zero(t, n), t)
 
-        self.root = root
         entry = self.pick('main', 0) or self.pick('mainImage', 0)
         if entry is None:
             for cands in self.funcs.values():
@@ -544,12 +544,14 @@ class Interpreter:
 
     def call_user(self, fn, args, mask, scope, flags, n):
         _k, rtype, name, params, body = fn
+        # a function body starts from the root's own slots: every global the
+        # shader declares AND the builtin the root binds (gl_FragCoord used
+        # to stop at the root -- declared names were copied one by one, so
+        # the builtin was in scope everywhere except inside a function,
+        # which is everywhere a shader can read it)
         inner = Scope()
-        for name_g, t, init, _q in (self.uniforms + self.inputs + self.globals
-                                    + self.outputs):
-            slot = self.root.get(name_g) if self.root else None
-            if slot is not None:
-                inner.vars[name_g] = slot
+        if self.root is not None:
+            inner.vars.update(self.root.vars)
         writeback = []
         for i, p in enumerate(params):
             direction, ptype, pname = p[0], p[1], p[2]
@@ -743,9 +745,16 @@ class Interpreter:
         except ValueError:
             return np.zeros(n, np.float32), FLOAT
 
-    def const(self, init, t, n):
+    def const(self, init, t, n, scope=None):
+        """A global's initialiser, evaluated in the root as it stands when
+        the declaration is reached: `const float TAU = 2.0 * PI;` reads the
+        PI above it. (It was evaluated in an empty scope, so any name in it
+        raised here, was caught below and the global read zero without a
+        word.)"""
         try:
-            v, vt = self.expr(init, np.ones(n, bool), Scope(), Flags(n), n)
+            v, vt = self.expr(init, np.ones(n, bool),
+                              scope if scope is not None else Scope(),
+                              Flags(n), n)
             return self.coerce(v, vt, t, n)
         except Exception:                                       # noqa: BLE001
             return self.zero(t, n)

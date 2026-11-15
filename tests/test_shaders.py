@@ -297,6 +297,328 @@ def test_error_reporting():
           str(err))
 
 
+# ------------------------------------------------ names resolve at compile time
+#
+# R253 (review): the interpreter resolved a name when a lane reached it, so
+# an identifier nothing declares compiled clean and failed when the shader
+# ran -- or never, in a branch no lane took. shaders/names.py resolves every
+# name before the first run; each case below compiled with error None.
+
+_REPORTED = """uniform float gain = 1.0;
+
+out vec4 Color;
+
+void main() {
+    Color = vec4(nothing, 0.05, gain, 1.0);
+}
+"""
+
+#: (what, source, language, the whole error)
+_NAME_ERRORS = [
+    ('the reported shader', _REPORTED, 'GLSL',
+     "line 6: undeclared identifier 'nothing'"),
+    ('a function argument',
+     'out vec4 Color;\nfloat f(float a) { return a * 2.0; }\nvoid main() {\n'
+     '    Color = vec4(f(missing));\n}\n', 'GLSL',
+     "line 4: undeclared identifier 'missing'"),
+    ('a builtin argument',
+     'out vec4 Color;\nvoid main() {\n    Color = vec4(sin(q));\n}\n', 'GLSL',
+     "line 3: undeclared identifier 'q'"),
+    ('a helper body',
+     'out vec4 Color;\nfloat f(float a) { return a * b; }\nvoid main() {\n'
+     '    Color = vec4(f(1.0));\n}\n', 'GLSL',
+     "line 2: undeclared identifier 'b'"),
+    ('an assignment target',
+     'out vec4 Color;\nvoid main() {\n    Colour = vec4(1.0);\n'
+     '    Color = vec4(1.0);\n}\n', 'GLSL',
+     "line 3: undeclared identifier 'Colour'"),
+    ('an array index',
+     'out vec4 Color;\nvoid main() {\n    float a[3];\n    a[0] = 1.0;\n'
+     '    Color = vec4(a[k]);\n}\n', 'GLSL',
+     "line 5: undeclared identifier 'k'"),
+    ('a ternary arm',
+     'out vec4 Color;\nvoid main() {\n    Color = vec4(true ? 1.0 : zz);\n}\n',
+     'GLSL', "line 3: undeclared identifier 'zz'"),
+    ('a local read above its declaration',
+     'out vec4 Color;\nvoid main() {\n    Color = vec4(x);\n'
+     '    float x = 1.0;\n}\n', 'GLSL',
+     "line 3: undeclared identifier 'x'"),
+    ('a local read outside its block',
+     'out vec4 Color;\nvoid main() {\n    { float x = 1.0; }\n'
+     '    Color = vec4(x);\n}\n', 'GLSL',
+     "line 4: undeclared identifier 'x'"),
+    ('a loop variable read after its loop',
+     'out vec4 Color;\nvoid main() {\n    float a = 0.0;\n'
+     '    for (int i = 0; i < 3; i++) { a += 1.0; }\n'
+     '    Color = vec4(a, float(i), 0.0, 1.0);\n}\n', 'GLSL',
+     "line 5: undeclared identifier 'i'"),
+    ("the caller's local read in the callee",
+     'out vec4 Color;\nfloat f() { return secret; }\nvoid main() {\n'
+     '    float secret = 3.0;\n    Color = vec4(f());\n}\n', 'GLSL',
+     "line 2: undeclared identifier 'secret'"),
+    ('a branch no lane takes',
+     'uniform float gain = 1.0;\nout vec4 Color;\nvoid main() {\n'
+     '    Color = vec4(1.0);\n    if (gain > 5.0) { Color = vec4(nothing); }\n'
+     '}\n', 'GLSL', "line 5: undeclared identifier 'nothing'"),
+    ('a function nothing calls',
+     'out vec4 Color;\nfloat unused() { return nothing; }\nvoid main() {\n'
+     '    Color = vec4(1.0);\n}\n', 'GLSL',
+     "line 2: undeclared identifier 'nothing'"),
+    ("a global's initialiser (it read zero without a word)",
+     'const float TAU = 2.0 * PIE;\nout vec4 Color;\nvoid main() {\n'
+     '    Color = vec4(TAU);\n}\n', 'GLSL',
+     "line 1: undeclared identifier 'PIE'"),
+    ("a global's initialiser reading the global BELOW it",
+     'float a = b * 2.0;\nfloat b = 0.5;\nout vec4 Color;\nvoid main() {\n'
+     '    Color = vec4(a, b, 0.0, 1.0);\n}\n', 'GLSL',
+     "line 1: undeclared identifier 'b'"),
+    ("a uniform's default",
+     'uniform float g = nothing;\nout vec4 Color;\nvoid main() {\n'
+     '    Color = vec4(g);\n}\n', 'GLSL',
+     "line 1: undeclared identifier 'nothing'"),
+    ('the HLSL dialect',
+     'uniform float3 Tint = float3(0.6, 0.8, 1.0);\nout float4 Color;\n'
+     'void main() {\n    Color = float4(Tint * nothing, 1.0);\n}\n', 'HLSL',
+     "line 4: undeclared identifier 'nothing'"),
+    ('a name a macro expands to, at the line that uses it',
+     '#define LEVEL nothing\nout vec4 Color;\nvoid main() {\n'
+     '    Color = vec4(LEVEL);\n}\n', 'GLSL',
+     "line 4: undeclared identifier 'nothing'"),
+    ('a varying the shader never declared (the error says what to write)',
+     'out vec4 Color;\nvoid main() {\n    Color = vec4(vNormal, 1.0);\n}\n',
+     'GLSL', "line 3: undeclared identifier 'vNormal' "
+             "(declare it: in vec3 vNormal;)"),
+    ('gl_FragColor with no out declared',
+     'void main() {\n    gl_FragColor = vec4(1.0);\n}\n', 'GLSL',
+     "line 2: undeclared identifier 'gl_FragColor' "
+     "(declare it: out vec4 gl_FragColor;)"),
+    ('a misspelled struct field',
+     'struct S { float a; vec3 b; };\nout vec4 Color;\nvoid main() {\n'
+     '    S s;\n    s.a = 1.0;\n    Color = vec4(s.aa);\n}\n', 'GLSL',
+     "line 6: S has no field 'aa'"),
+    ('a misspelled struct field, written',
+     'struct S { float a; vec3 b; };\nout vec4 Color;\nvoid main() {\n'
+     '    S s;\n    s.aa = 1.0;\n    Color = vec4(s.a);\n}\n', 'GLSL',
+     "line 5: S has no field 'aa'"),
+    ('a swizzle that is no swizzle',
+     'out vec4 Color;\nvoid main() {\n    vec3 v = vec3(1.0);\n'
+     '    Color = vec4(v.xq, 0.0, 1.0);\n}\n', 'GLSL',
+     "line 4: bad swizzle 'xq'"),
+    ("a swizzle past the vector's width (an IndexError when it ran)",
+     'out vec4 Color;\nvoid main() {\n    vec2 v = vec2(1.0);\n'
+     '    Color = vec4(v.xyz, 1.0);\n}\n', 'GLSL',
+     "line 4: swizzle 'xyz' out of range for vec2"),
+    ('the same, written',
+     'out vec4 Color;\nvoid main() {\n    vec2 v = vec2(0.0);\n'
+     '    v.z = 1.0;\n    Color = vec4(v, 0.0, 1.0);\n}\n', 'GLSL',
+     "line 4: swizzle 'z' out of range for vec2"),
+    ("a swizzle past a call's result",
+     'out vec4 Color;\nvoid main() {\n    vec3 v = vec3(1.0);\n'
+     '    Color = vec4(normalize(v).w);\n}\n', 'GLSL',
+     "line 4: swizzle 'w' out of range for vec3"),
+    ('an unknown function, with its line now',
+     'out vec4 Color;\nvoid main() {\n    Color = vec9(1.0);\n}\n', 'GLSL',
+     "line 3: unknown function 'vec9'"),
+    ("an unknown function in a global's initialiser",
+     'const float K = nope(1.0);\nout vec4 Color;\nvoid main() {\n'
+     '    Color = vec4(K);\n}\n', 'GLSL',
+     "line 1: unknown function 'nope'"),
+]
+
+
+def test_names_resolve_at_compile_time():
+    for what, src, lang, want in _NAME_ERRORS:
+        prog, err = try_compile(src, lang)
+        check(f'compile error: {what}', prog is None and err == want,
+              repr(err))
+
+
+#: (what, source, language, uniforms, inputs, the expected Color row or None)
+_FC = np.array([[3.5, 7.5, 0.25, 1.0]] * 4, np.float32)
+_NAMES_FINE = [
+    ('uniforms, an `in`, an out, a local, a parameter, a helper',
+     'uniform float gain = 0.5;\nuniform vec3 tint = vec3(1.0, 0.5, 0.25);\n'
+     'in vec3 vNormal;\nout vec4 Color;\n'
+     'float half_of(float x) { float h = x * 0.5; return h; }\n'
+     'void main() {\n    vec3 n = vNormal;\n'
+     '    Color = vec4(tint * half_of(gain) + n * 0.0, 1.0);\n}\n',
+     'GLSL', {}, {}, [0.25, 0.125, 0.0625, 1.0]),
+    ('two uniforms in one declaration (they were dropped whole: no sockets, '
+     'unknown identifiers when it ran)',
+     'uniform float a = 0.5, b = 0.25;\nout vec4 Color;\n'
+     'void main() { Color = vec4(a, b, 0.0, 1.0); }\n',
+     'GLSL', {'b': np.float32(0.75)}, {}, [0.5, 0.75, 0.0, 1.0]),
+    ('two plain globals in one declaration, the second reading the first',
+     'float a = 0.5, b = a * 0.5;\nout vec4 Color;\n'
+     'void main() { Color = vec4(a, b, 0.0, 1.0); }\n',
+     'GLSL', {}, {}, [0.5, 0.25, 0.0, 1.0]),
+    ("an HLSL cbuffer's members (dropped the same way) are uniforms",
+     'cbuffer Params { float gain; float3 tint; };\nout float4 Color;\n'
+     'void main() { Color = float4(tint * gain, 1.0); }\n',
+     'HLSL', {'gain': np.float32(0.5),
+              'tint': np.array([[0.2, 0.4, 0.8]], np.float32)}, {},
+     [0.1, 0.2, 0.4, 1.0]),
+    ('gl_FragCoord with no declaration, in main and in a helper (the root '
+     'bound it; no function body could see it)',
+     'out vec4 Color;\nfloat px() { return gl_FragCoord.x; }\n'
+     'void main() { Color = vec4(px(), gl_FragCoord.yzw); }\n',
+     'GLSL', {}, {'fragcoord': _FC}, [3.5, 7.5, 0.25, 1.0]),
+    ('a constant built from the constant above it (it read ZERO: the '
+     'initialiser ran in an empty scope and the failure was swallowed)',
+     'const float PI = 3.0;\nconst float TAU = 2.0 * PI;\nout vec4 Color;\n'
+     'void main() { Color = vec4(TAU, PI, 0.0, 1.0); }\n',
+     'GLSL', {}, {}, [6.0, 3.0, 0.0, 1.0]),
+    ("a uniform's default and a global reading what is declared above them",
+     'const float K = 0.5;\nuniform float u = K;\nin vec3 vNormal;\n'
+     'vec3 nn = vNormal * K;\nout vec4 Color;\n'
+     'void main() { Color = vec4(nn.xy, u, 1.0); }\n',
+     'GLSL', {}, {'normal': np.array([[0.2, 0.4, 0.8]] * 4, np.float32)},
+     [0.1, 0.2, 0.5, 1.0]),
+    ('a global and a function written BELOW the function that uses them '
+     '(the run binds every global before main; a driver would not)',
+     'out vec4 Color;\nvoid main() { Color = vec4(twice(k), k, 0.0, 1.0); }\n'
+     'const float k = 0.25;\nfloat twice(float x) { return x * 2.0; }\n',
+     'GLSL', {}, {}, [0.5, 0.25, 0.0, 1.0]),
+    ('a parameter over a global of its name, a block local over both',
+     'uniform float g = 0.25;\nout vec4 Color;\n'
+     'float f(float g) { { float g = 0.75; } return g; }\n'
+     'void main() { Color = vec4(f(0.5), g, 0.0, 1.0); }\n',
+     'GLSL', {}, {}, [0.5, 0.25, 0.0, 1.0]),
+    ('a declaration whose initialiser reads the OUTER name it shadows',
+     'out vec4 Color;\nvoid main() {\n    float x = 0.5;\n'
+     '    { float x = x * 0.5; Color = vec4(x); }\n}\n',
+     'GLSL', {}, {}, [0.25, 0.25, 0.25, 0.25]),
+    ('struct fields, read and written, through a function',
+     'struct S { float a; vec3 b; };\n'
+     'S mk(float x) { S s; s.a = x; s.b = vec3(x); return s; }\n'
+     'out vec4 Color;\nvoid main() { Color = vec4(mk(0.25).b, mk(0.5).a); }\n',
+     'GLSL', {}, {}, [0.25, 0.25, 0.25, 0.5]),
+    ('swizzles: a scalar repeated, an array element, an ivec, a call result',
+     'out vec4 Color;\nvoid main() {\n    float f = 0.5;\n    vec3 a[2];\n'
+     '    a[0] = vec3(0.1, 0.2, 0.3);\n    ivec3 iv = ivec3(1, 2, 3);\n'
+     '    vec3 v = vec3(0.0, 3.0, 4.0);\n'
+     '    Color = vec4(f.xx.y, a[0].zy.x, float(iv.rg.g), '
+     'normalize(v).zyx.x);\n}\n',
+     'GLSL', {}, {}, [0.5, 0.3, 2.0, 0.8]),
+    ('a swizzle the runtime is wide enough for though the type is not '
+     '(pow is typed by its first argument and computed across the vector)',
+     'out vec4 Color;\nvoid main() {\n    vec3 v = vec3(1.0, 2.0, 3.0);\n'
+     '    Color = vec4(pow(2.0, v).xyz, 1.0);\n}\n',
+     'GLSL', {}, {}, [2.0, 4.0, 8.0, 1.0]),
+    ('a loop variable in its condition, step and body; a do-while',
+     'out vec4 Color;\nvoid main() {\n    float a = 0.0;\n'
+     '    for (int i = 0; i < 3; i++) { float s = float(i); a += s; }\n'
+     '    int j = 0;\n    do { j++; } while (j < 4);\n'
+     '    Color = vec4(a, float(j), 0.0, 1.0);\n}\n',
+     'GLSL', {}, {}, [3.0, 4.0, 0.0, 1.0]),
+    ('out and inout parameters written through',
+     'void split(vec3 c, out float lum, inout vec3 t) {\n'
+     '    lum = dot(c, vec3(0.25));\n    t *= 0.5;\n}\nout vec4 Color;\n'
+     'void main() {\n    float l;\n    vec3 q = vec3(1.0);\n'
+     '    split(vec3(1.0), l, q);\n    Color = vec4(q, l);\n}\n',
+     'GLSL', {}, {}, [0.5, 0.5, 0.5, 0.75]),
+    ('a macro, a switch, a const local, the HALCYON define',
+     '#define GAIN 0.5\nout vec4 Color;\nvoid main() {\n    const float k = '
+     'GAIN;\n    int m = 1;\n    float v = 0.0;\n    switch (m) { case 0: v = '
+     '0.25; break; case 1: v = k; break; default: v = 1.0; }\n'
+     '    Color = vec4(v, float(HALCYON), 0.0, 1.0);\n}\n',
+     'GLSL', {}, {}, [0.5, 1.0, 0.0, 1.0]),
+]
+
+
+def test_declared_names_are_never_refused():
+    """What compiles, resolves: every name the check accepts is one the run
+    finds (no ShaderError out of run()), and nothing declared is refused."""
+    from ..shaders.codegen import VARYINGS
+    from ..shaders.compiler import DEFAULT_GLSL, DEFAULT_HLSL
+    for what, src, lang, uniforms, inputs, want in _NAMES_FINE:
+        prog, err = try_compile(src, lang)
+        got = None
+        if prog is not None:
+            try:
+                got = prog.run(uniforms, inputs, 4)[0]['Color'][0]
+            except Exception as exc:                            # noqa: BLE001
+                err = f'compiled, then {type(exc).__name__}: {exc}'
+        check(f'resolves: {what}',
+              got is not None and np.allclose(got, want, atol=1e-5),
+              str(err if got is None else got))
+
+    # every varying the table knows, DECLARED with its own type: compiles,
+    # runs and reads the value handed in under its binding
+    bad = []
+    for name, (binding, t) in VARYINGS.items():
+        comp = '' if t.n == 1 else '.x'
+        src = (f'in {t.name()} {name};\nout vec4 Color;\n'
+               f'void main() {{ Color = vec4(float({name}{comp})); }}\n')
+        prog, err = try_compile(src)
+        if prog is None:
+            bad.append(f'{name}: {err}')
+            continue
+        value = np.full((4, t.n), 0.625, np.float32) if t.n > 1 \
+            else np.full(4, 3 if t.base == 'int' else 0.625, np.float32)
+        try:
+            got = prog.run({}, {binding: value}, 4)[0]['Color'][0, 0]
+        except Exception as exc:                                # noqa: BLE001
+            bad.append(f'{name}: {type(exc).__name__}: {exc}')
+            continue
+        if abs(float(got) - float(np.ravel(value)[0])) > 1e-6:
+            bad.append(f'{name}: read {got}')
+    check(f'all {len(VARYINGS)} varyings resolve when declared and read '
+          'their binding', not bad, '; '.join(bad))
+
+    # the same names FREE: each is refused with the declaration to write --
+    # gl_FragCoord alone is in scope without one, as GLSL defines it
+    bad = []
+    for name, (_binding, t) in VARYINGS.items():
+        comp = '' if t.n == 1 else '.x'
+        prog, err = try_compile(f'out vec4 Color;\nvoid main() {{ Color = '
+                                f'vec4(float({name}{comp})); }}\n')
+        want = None if name == 'gl_FragCoord' else \
+            (f"line 2: undeclared identifier {name!r} "
+             f"(declare it: in {t.name()} {name};)")
+        if err != want:
+            bad.append(f'{name}: {err}')
+    check('an undeclared varying is refused with the declaration to write '
+          '(gl_FragCoord is the one builtin)', not bad, '; '.join(bad))
+
+    # the shipped starter shaders
+    for label, src, lang in (('GLSL', DEFAULT_GLSL, 'GLSL'),
+                             ('HLSL', DEFAULT_HLSL, 'HLSL')):
+        prog, err = try_compile(src, lang)
+        ran = None
+        if prog is not None:
+            n4 = np.tile(np.array([[0.0, 0.0, 1.0]], np.float32), (4, 1))
+            ran = prog.run({}, {'normal': n4, 'view': n4, 'position': n4},
+                           4)[0]['Color']
+        check(f'the {label} starter shader compiles, warns of nothing and '
+              'runs', ran is not None and not prog.warnings
+              and bool(np.isfinite(ran).all()) and float(ran[0, 3]) == 1.0,
+              str(err))
+
+
+def test_a_name_error_never_reaches_the_run():
+    """The other half of the rule: a program that compiled raises no name
+    error however its lanes branch. Before the check, a lane reaching the
+    name raised ShaderError out of run(); a lane mask that missed it ran
+    clean, which is why the same source could shade one frame and break
+    the next."""
+    src = ('in vec3 vPosition;\nout vec4 Color;\nvoid main() {\n'
+           '    Color = vec4(0.25);\n'
+           '    if (vPosition.x > 0.5) { Color = vec4(nothing); }\n}\n')
+    prog, err = try_compile(src)
+    check('a name error behind a per-lane branch is a compile error',
+          prog is None and err == "line 5: undeclared identifier 'nothing'",
+          repr(err))
+    fixed = src.replace('vec4(nothing)', 'vec4(vPosition.x)')
+    p = np.zeros((8, 3), np.float32)
+    p[:, 0] = np.linspace(0.0, 1.0, 8)
+    outs, _, _ = run(fixed, inputs={'position': p})
+    check('...and the corrected source takes the branch per lane',
+          np.allclose(outs['Color'][:, 0], np.where(p[:, 0] > 0.5, p[:, 0],
+                                                    0.25)),
+          str(outs['Color'][:, 0]))
+
+
 def main():
     from . import utf8_console
     utf8_console()

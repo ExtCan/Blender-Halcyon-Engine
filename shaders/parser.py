@@ -4,11 +4,15 @@ AST nodes are plain tuples whose first element is the kind, which keeps the
 code generator a simple dispatch and avoids a pile of classes.
 
 Expressions
-    ('num', text, is_int)      ('bool', True/False)   ('var', name)
-    ('call', name, [args])     ('member', obj, field)  ('index', obj, expr)
+    ('num', text, is_int)      ('bool', True/False)   ('var', name, line)
+    ('call', name, [args], line)                       ('index', obj, expr)
+    ('member', obj, field, line)
     ('bin', op, l, r)          ('un', op, expr)        ('post', op, expr)
     ('assign', op, target, value)                      ('cond', c, a, b)
     ('seq', l, r)
+    The three kinds that carry a NAME -- a variable, a function, a field or
+    swizzle -- end with the source line of that name, so a name nothing
+    declares is reported where it was written (shaders/names.py).
 Statements
     ('block', [stmt])          ('decl', gtype, [(name, arrsize, init)])
     ('expr', e)                ('if', c, then, else_or_None)
@@ -19,6 +23,8 @@ Top level
     ('func', rettype, name, [(qual, gtype, name, arrsize)], body)
     ('global', qual, gtype, name, arrsize, init)
     ('struct', name, [(gtype, name, arrsize)])
+    One declaration per entry: `uniform float a, b;` and the members of an
+    HLSL cbuffer arrive as one 'global' each (Parser.parse flattens them).
 """
 
 from .gtypes import BY_NAME, GType
@@ -88,7 +94,7 @@ class Parser:
         while self.tok.kind != 'eof':
             d = self.parse_toplevel()
             if d is not None:
-                decls.append(d)
+                _flatten(d, decls)
         return decls
 
     def parse_toplevel(self):
@@ -119,7 +125,7 @@ class Parser:
                 out.append(self.parse_toplevel())
             self.expect('}')
             self.accept(';')
-            return ('block', [o for o in out if o])
+            return ('block', [_as_uniform(o) for o in out if o])
 
         quals = []
         while self.tok.value in QUALIFIERS and self.tok.kind == 'keyword':
@@ -457,10 +463,11 @@ class Parser:
         e = self.parse_primary()
         while True:
             if self.accept('.'):
-                field = self.next().value
+                ftok = self.next()
+                field = ftok.value
                 if self.at('('):
                     self.err('method calls are not supported')
-                e = ('member', e, field)
+                e = ('member', e, field, ftok.line)
             elif self.accept('['):
                 idx = self.parse_expr()
                 self.expect(']')
@@ -513,8 +520,8 @@ class Parser:
                         if not self.accept(','):
                             break
                 self.expect(')')
-                return ('call', name, args)
-            return ('var', name)
+                return ('call', name, args, t.line)
+            return ('var', name, t.line)
         self.err(f'unexpected token {t.value!r}')
 
 
@@ -528,6 +535,30 @@ def _const_int(node):
     if node[0] == 'un' and node[1] == '-':
         return -_const_int(node[2])
     return 0
+
+
+def _as_uniform(d):
+    """A cbuffer's members ARE the shader's uniforms: HLSL writes no
+    qualifier inside the braces, so the member is given the one the rest
+    of the front-end files a socket under."""
+    if d[0] == 'block':
+        return ('block', [_as_uniform(sub) for sub in d[1]])
+    if d[0] == 'global' and 'uniform' not in d[1]:
+        return (d[0], list(d[1]) + ['uniform']) + tuple(d[2:])
+    return d
+
+
+def _flatten(d, out):
+    """A multi-declarator global (`uniform float a, b;`) and an HLSL
+    cbuffer both parse to ('block', [...]). Every reader of the top level
+    -- the interpreter, the coded-shader port -- walks 'global' entries, so
+    a block it did not open was a declaration it never saw: the names read
+    as unknown identifiers when the shader ran."""
+    if d[0] == 'block':
+        for sub in d[1]:
+            _flatten(sub, out)
+    else:
+        out.append(d)
 
 
 def parse(src, hlsl=False, defines=None):
