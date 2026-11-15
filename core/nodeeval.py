@@ -1856,7 +1856,9 @@ def _bump_field_for(c, node):
 
     Fields are keyed by (material index, node id); the batch is
     single-material wherever `c.px` is real, so the batch's first
-    triangle names the material.
+    triangle names the material. The pre-pass covers the material's own
+    tree; a Bump inside a node group has another id (its path,
+    export.node_id), finds no field and differences its own batch.
     """
     fields = getattr(c, 'bump_fields', None)
     tri = getattr(c, 'tri', None)
@@ -4511,7 +4513,12 @@ def n_bi_material(ev, node):
 
 
 def n_halcyon_code(ev, node):
-    """Coded-shader node: run the compiled GLSL/HLSL program."""
+    """Coded-shader node: run the compiled GLSL/HLSL program.
+
+    The program is looked up by the node's graph id, which the exporter
+    makes unique across the material's trees (export.node_id: a node in a
+    group carries its path) -- n_group hands its sub-evaluator this same
+    `programs` dict, and a bare name would find a namesake's program."""
     c = ev.ctx
     key = node.get('id')
     prog = ev.programs.get(key)

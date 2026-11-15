@@ -1737,6 +1737,130 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   Coded Shader in the material and one inside a group that share a name
   (the default one) leave ONE program, the last compiled (seen at the
   export).
+- **Every Coded Shader runs its own program: the graph id is the node's
+  path (two that shared a name across trees shared one program).** A
+  material's compiled Coded Shader programs live in one dict,
+  `programs`, which `export.serialize_tree` hands down its node-group
+  recursion. `_node_props` filed each program under `node.name`, and
+  `n_halcyon_code` looks its program up by the node's graph id, which
+  was that same bare name. Blender keeps node names unique per TREE, and
+  a material is several trees: its own and one per group node. So the
+  material's "Coded Shader" and a group's "Coded Shader" -- the default
+  name, twice; nobody has to rename anything to get here -- left ONE
+  program, the last compiled, and the other node ran it under its own
+  sockets wherever the CPU shades. The entry above saw this at the
+  export and left it for its own fix. *Wrong picture or fallback: the
+  wrong picture.* The probe put the real node class (stand-in sockets)
+  through the real `serialize_tree` and rendered `R.render` at 128x96,
+  with two shaders that differ in their BODY: every uniform has a
+  socket, so two sources that differ in a declared default alone draw
+  one picture under either program -- the probe's first pair did, and
+  read 0.0000. With the group node after the material's node in the
+  tree, the material's node drew the group's shader: 1.48 off the frame
+  of the same trees with the inner node renamed, over all 4848 pixels of
+  the floor. With the group node first it was the group's node that drew
+  the material's shader (2.17). The GPU device hid none of it: the
+  deferred pass refuses a graph source that is not its program's own
+  (the entry above) and a node group has no emitter at all, so the frame
+  fell to the CPU and its wrong program. The same in a real Blender
+  5.2.2 (the `bpy` module, background; a real node group, the registered
+  node, `export_material`): Blender itself named both nodes 'Coded
+  Shader', the export kept one program, and the frame was 1.52 off.
+  (1) *The id is the path.* `export.node_id(name, path)`: a node of the
+  material's own tree keeps its bare name (every
+  `graph['nodes'][node.name]` still holds); a node inside the group node
+  'Group' is 'Group/Coded Shader', inside a second instance of the same
+  group 'Group.001/Coded Shader', two levels down 'Outer/Group/Coded
+  Shader'. Each step is escaped (`/` and `\`), so no two paths spell one
+  id whatever the names hold -- a node NAMED 'Group/Coded Shader' beside
+  that group included. `serialize_tree` writes that one id as the node
+  key, the entry's `id`, every link and `group_output`, hands the id
+  plus the separator to the recursion as its path, and hands the id to
+  `_node_props`, whose `programs[key]` is the only line that files a
+  program. Nothing changed in the evaluator: `n_halcyon_code`, and the
+  sub-evaluator `n_group` builds over the same `programs`, already
+  looked up by graph id. The compile warning names the node by the same
+  id ("Group/Coded Shader: ..."), so two same-named nodes that fail can
+  be told apart. (2) *The Bump pre-pass, the other thing filed by node
+  id.* `core/render._bump_height_fields` files a material's whole-frame
+  gradient fields under (material, node id) for the Bump nodes of the
+  material's own tree, and `n_bump` gathers by (material, node id)
+  wherever it sits. A group's "Bump" beside the material's "Bump" took
+  the OTHER node's field on any frame whose pre-pass runs (a material
+  covering more than one shading batch, 16384 pixels): 1.00 off over
+  29164 pixels at 320x240, nothing at 128x96 where no pre-pass runs. The
+  path id ends it with no line changed in the renderer: the group's Bump
+  is 'Group/Bump', finds no field and differences its own batch, as a
+  group's Bump under any other name always did. (3) *The GPU's key: one
+  mangling tag per node.* `e_code_node` inlines each coded shader under
+  `_cn<tag>_<name>`, and the tag was the id with every non-word
+  character flattened to '_', which is many-to-one. 'Coded Shader' and
+  'Coded_Shader' (or 'Coded.Shader') in ONE tree are two programs on the
+  CPU and one set of GLSL names: the plan QUALIFIED, one shader's text
+  was renamed onto the other's, and the simulator's frame was 0.80 off
+  the CPU's over the 4848 pixels. Two tags also meet without being
+  equal: 'Coded' declaring `B_k` and 'Coded B' declaring `k` are both
+  `_cnCoded_B_k` (0.57 off). `gpu/emit._code_tag(em, key)` hands out one
+  tag per node id per emitter: the flattened id while it meets no tag
+  already handed out, else the same with an ordinal in front
+  ('2_Coded_Shader'), counted up until nothing begins that way.
+  `_tags_clash` is the test: equal, or one is the other plus '_' plus a
+  rest that can begin an identifier. A rest that begins with a digit
+  cannot, which is why Blender's own 'Coded Shader' / 'Coded Shader.001'
+  never met and keep their tags; a node alone in its pass keeps exactly
+  the names it had (`_cncode_main` and the other spellings `test_render`
+  pins are untouched). The emitter's once-set, which the node id shared
+  with the emitters' own helper markers ('__wang', ...), takes the node
+  under a marker of its own, so a node named like one of them is still
+  inlined. A coded shader INSIDE a group is not emitted:
+  groups have no emitter, the material is refused by name ("no GLSL
+  emitter for ShaderNodeGroup") and the CPU -- right, now -- draws it.
+  *Pictures that change*: a material whose trees hold same-named Coded
+  Shaders (or same-named Bump nodes, on a pre-passed frame) drew one
+  node with another's program or field, and now draws each with its
+  own; two coded shaders in one tree whose names flatten alike drew one
+  shader twice on the GPU device and now twin the CPU. Nothing else
+  moves: the ids of a material's own tree are the names they were (a
+  name holding `/` or `\` gains its escape, in the node key and its
+  links together). Pinned in `test_code_node_same_name_across_trees` (46
+  checks), through the real `serialize_tree`: the two programs under
+  their paths, each compiled from its own node's graph source, and the
+  group's tree written under the same ids; in BOTH node orders the
+  material's node and the group's node each drawing the frame of its
+  shader alone, bit for bit, and their sum the frame of the same trees
+  with the inner node renamed; one group instanced twice and a group in
+  a group (four nodes named alike, four programs, the frame of four
+  different names); the 1.92.0 export of each rebuilt by hand and shown
+  to be another picture, so the frames can tell; a name holding the
+  separator; 2379 paths of awkward names spelling 2379 ids; the warning
+  by path; on the GPU the material's node qualifying and twinning beside
+  a group that holds its namesake (under 6e-3, no pixel over 1e-2), the
+  1.92.0 export refused there, a group-fed master refused by name with
+  the right CPU frame; the two tag clashes twinning on the frame the
+  same shaders draw under unrelated names; the tags themselves, and
+  `_tags_clash` against brute force over all 741 pairs of short tags
+  ("can these two spell one mangled name"); the two Bump nodes on a
+  320x240 frame whose pre-pass is seen to run; and the rule read from
+  the code (one reader of a node's name, one line that files a program).
+  Nineteen mutations each fail it: the program filed by name; the node
+  keys, the links or the recursion's path left bare; the path built from
+  the group node's name instead of its id (a nested path loses its
+  parents); `node_id` escaping nothing, the separator alone or the
+  escape alone; the warning by bare name; `_node_props` ignoring its
+  key; the emitter's old tag; `_code_tag` without its check or its
+  memory; `_tags_clash` reduced to equality, without the digit
+  exception, without the swap, or without the joining underscore; the
+  once-set taking the bare id; the group evaluator handed an empty
+  `programs`. *Seen from the same probes
+  and left for their own fixes*: a Coded Shader whose node name holds a
+  non-ASCII letter puts that letter into its GLSL names (`\W` keeps
+  every Unicode letter) and the plan's pre-flight refuses the material
+  -- "would not compile: unexpected character" -- so it shades on the
+  CPU, correctly, but never on the GPU; the shader compiler accepts an
+  undeclared identifier (`vec4(nothing, ...)` compiles with no error and
+  no warning, raises "unknown identifier" when it runs, and the node
+  reads zeros with nothing in the report); and the Bump pre-pass still
+  covers the material's own tree only.
 - **A uniform the driver stripped never fails a pass (the llvmpipe field
   log).** A real Blender 5.2.2 session on the OpenGL backend (Mesa
   llvmpipe) printed, for every GPU frame, `rasterising on the CPU: raster
@@ -2131,6 +2255,16 @@ What headless cannot prove, per feature (the fakebpy / fakeblender stubs validat
   the emptied Text's line in the node's error box at the node's width,
   and the same line in the F12 report; and a 1.92.0 file whose Coded
   Shader holds an empty Text opening to zeros with that warning.
+- Same-named Coded Shaders across trees, in the UI and on a driver.
+  The fix is proven headless and in a real Blender 5.2.2 as the `bpy`
+  module in background (a real node group holding a default-named Coded
+  Shader beside the material's own: 1.52 off before, bit for bit after)
+  -- never in the UI and never on a GPU. Open there: the viewport and
+  an F12 of such a file drawing each node's own shader; two coded
+  shaders in one tree named 'Coded Shader' and 'Coded_Shader' compiling
+  and matching on the driver under the ordinal tag
+  (`_cn2_Coded_Shader_main`); and the F12 report naming a group's
+  failing Coded Shader by its path ("Group/Coded Shader: ...").
 - The llvmpipe session itself (Blender 5.2.2, OpenGL backend, Mesa
   llvmpipe): the three lines gone, `raster split` and `shade split`
   printed in their place, and the Timing Breakdown naming the stripped

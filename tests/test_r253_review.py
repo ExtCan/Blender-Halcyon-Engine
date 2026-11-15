@@ -60,6 +60,17 @@ pinned where it bit.
     whatever it holds, else the inline source -- compiled by the editor
     and the exporter through one call, shipped by the exporter as the
     graph's source, and the only source the emitter reads.
+(14) Compiled Coded Shader programs were filed under the node's NAME in
+    one dict handed down the node-group recursion, and names are unique
+    per tree only: the material's "Coded Shader" and a group's "Coded
+    Shader" (the default name, twice) left ONE program, and one of the two
+    nodes ran the other's shader under its own sockets. The graph id is
+    the node's PATH now (`export.node_id`: 'Group/Coded Shader'), written
+    in one place for the node keys, the links and the programs; the Bump
+    pre-pass fields, filed by the same id, stop crossing trees with it.
+    The GPU emitter's mangling tag was the id with its punctuation
+    flattened, which is many-to-one ('Coded Shader' / 'Coded_Shader'):
+    `gpu/emit._code_tag` hands out one tag per node.
 """
 import io
 import os
@@ -722,32 +733,42 @@ class _CodeNodes(list):
         return next((n for n in self if n.name == name), default)
 
 
-def _code_tree(SN, source, name='Coded', cls=None):
-    """A material whose tree is Value -> Coded Shader -> Material Output,
-    the coded node being the REAL class (or `cls`, a subclass of it) run
-    against stand-in sockets."""
-    tree = types.SimpleNamespace(name=name, nodes=_CodeNodes(), links=_CodeLinks())
+def _code_plain(tree, name, idname, ins=(), outs=(), **attrs):
+    """A stand-in node of any other type, appended to `tree`: its sockets
+    as (socket bl_idname, name) pairs, its properties as attributes."""
+    node = types.SimpleNamespace(name=name, bl_idname=idname, id_data=tree, **attrs)
+    node.inputs, node.outputs = _CodeSockets(node), _CodeSockets(node)
+    for stype, sn in ins:
+        node.inputs.new(stype, sn)
+    for stype, sn in outs:
+        node.outputs.new(stype, sn)
+    tree.nodes.append(node)
+    return node
 
-    def plain(nm, idname, ins=(), outs=()):
-        node = types.SimpleNamespace(name=nm, bl_idname=idname, id_data=tree)
-        node.inputs, node.outputs = _CodeSockets(node), _CodeSockets(node)
-        for stype, sn in ins:
-            node.inputs.new(stype, sn)
-        for stype, sn in outs:
-            node.outputs.new(stype, sn)
-        tree.nodes.append(node)
-        return node
 
-    value = plain('Value', 'ShaderNodeValue', outs=(('NodeSocketFloat', 'Value'),))
-    out = plain('Material Output', 'ShaderNodeOutputMaterial', ins=(('NodeSocketShader', 'Surface'),))
+def _code_coded(SN, tree, name, source, cls=None):
+    """The REAL Coded Shader class (or `cls`, a subclass of it) run against
+    stand-in sockets: appended to `tree` and built from `source`, a Text,
+    exactly as `init` builds a new node."""
     code = (cls or SN.HALCYON_CodeNode)()
-    code.name, code.id_data = 'Coded Shader', tree
+    code.name, code.id_data = name, tree
     code.language, code.source, code.source_text = 'GLSL', source, ''
     code.as_surface, code.needs_rebuild = False, False
     code.error = code.warn = ''
     code.inputs, code.outputs = _CodeSockets(code), _CodeSockets(code)
     tree.nodes.append(code)
     code.init(None)
+    return code
+
+
+def _code_tree(SN, source, name='Coded', cls=None):
+    """A material whose tree is Value -> Coded Shader -> Material Output,
+    the coded node being the REAL class (or `cls`, a subclass of it) run
+    against stand-in sockets."""
+    tree = types.SimpleNamespace(name=name, nodes=_CodeNodes(), links=_CodeLinks())
+    value = _code_plain(tree, 'Value', 'ShaderNodeValue', outs=(('NodeSocketFloat', 'Value'),))
+    out = _code_plain(tree, 'Material Output', 'ShaderNodeOutputMaterial', ins=(('NodeSocketShader', 'Surface'),))
+    code = _code_coded(SN, tree, 'Coded Shader', source, cls)
     tree.links.new(value.outputs['Value'], code.inputs['Gain'])
     tree.links.new(code.outputs['Color'], out.inputs['Surface'])
     return types.SimpleNamespace(name=name, use_nodes=True, node_tree=tree)
@@ -1052,20 +1073,34 @@ def _code_master_tree(SN, source):
     return mat
 
 
+def _code_floor(graph, programs, size=(128, 96)):
+    """The demo scene with its floor wearing an exported graph: (scene,
+    settings)."""
+    from ..core.scene import Material
+    st = base_settings(size[0], size[1], shadows=True)
+    st.color_depth, st.dither, st.output_scale = '24', 'NONE', 'NONE'
+    sc = demo_scene(st, with_texture=False)
+    mat = Material(name='Coded', index=0, graph=graph)
+    mat.programs = programs
+    sc.materials[0] = mat
+    return sc, st
+
+
+def _code_cpu(graph, programs, size=(128, 96)):
+    """The CPU's frame of that floor, and nothing else."""
+    sc, st = _code_floor(graph, programs, size)
+    with redirect_stdout(io.StringIO()):
+        return np.asarray(R.render(sc, st))
+
+
 def _code_twin(graph, programs, keep_plan=False):
     """The demo floor wearing an exported graph: (d_max, n_bad, gpu, cpu,
     why) of the CPU frame against the GLSL simulator's frame of the
     deferred plan, over the covered pixels (_sim_vs_cpu's bar). keep_plan
     leaves the plan cache as the last frame left it: an edit has to re-plan
     by its SIGNATURE, not by a cleared cache."""
-    from ..core.scene import Material
     from ..gpu import shade as GSH
-    st = base_settings(128, 96, shadows=True)
-    st.color_depth, st.dither, st.output_scale = '24', 'NONE', 'NONE'
-    sc = demo_scene(st, with_texture=False)
-    mat = Material(name='Coded', index=0, graph=graph)
-    mat.programs = programs
-    sc.materials[0] = mat
+    sc, st = _code_floor(graph, programs)
     with redirect_stdout(io.StringIO()):
         cpu = np.asarray(R.render(sc, st))
         g, job = _job_for(sc, st)
@@ -1295,6 +1330,457 @@ def test_code_node_one_source_on_every_road():
           and 'every edit' not in tip and Node.__annotations__['source'].kw.get('description') == tip, tip)
     check('...and the Inline Source tooltip still gives the other half: the source while no Text is assigned',
           'no text datablock' in SN.PROP_TIPS[('HALCYON_CodeNode', 'source_text')].lower())
+
+
+def _code_text(name, src):
+    """A Text datablock, as far as shaders/compiler.node_source reads one."""
+    return types.SimpleNamespace(name=name, as_string=lambda: src)
+
+
+def _code_says(rgb, extra=''):
+    """A coded shader that says its colour in its BODY. The sockets supply
+    every uniform, so two sources that differed in a declared default alone
+    would draw one picture under either program -- and hide a swap."""
+    return f'uniform float gain = 1.0;\n{extra}\nout vec4 Color;\n\nvoid main() {{\n    Color = vec4({rgb}, 1.0);\n}}\n'
+
+
+_CODE_RED = _code_says('gain, 0.05, 0.05')
+_CODE_BLUE = _code_says('0.05, 0.05, gain')
+_CODE_GREEN = _code_says('0.05, gain, 0.05')
+
+
+def _code_group_node(tree, name, node_tree, gain=1.0):
+    """A group node in `tree`: Gain in, Color out, `node_tree` inside."""
+    node = _code_plain(tree, name, 'ShaderNodeGroup', ins=(('NodeSocketFloat', 'Gain'),),
+                       outs=(('NodeSocketColor', 'Color'),), node_tree=node_tree)
+    node.inputs['Gain'].default_value = gain
+    return node
+
+
+def _code_group_tree(SN, source=None, coded='Coded Shader', nested=None):
+    """A node group's tree: Group Input (Gain) -> X -> Group Output (Color).
+    X is a Coded Shader named `coded`, built from `source` -- or, given
+    `nested` (another group's tree), a group node named 'Group' holding it:
+    a group in a group."""
+    tree = types.SimpleNamespace(name='Group Tree', nodes=_CodeNodes(), links=_CodeLinks())
+    gin = _code_plain(tree, 'Group Input', 'NodeGroupInput', outs=(('NodeSocketFloat', 'Gain'),))
+    gout = _code_plain(tree, 'Group Output', 'NodeGroupOutput', ins=(('NodeSocketColor', 'Color'),),
+                       is_active_output=True)
+    mid = _code_group_node(tree, 'Group', nested) if nested is not None else _code_coded(SN, tree, coded, source)
+    tree.links.new(gin.outputs['Gain'], mid.inputs['Gain'])
+    tree.links.new(mid.outputs['Color'], gout.inputs['Color'])
+    return tree
+
+
+def _code_feed(tree, nodes):
+    """The master's Diffuse Color takes the SUM of the `nodes`' Color
+    outputs (a chain of Add mixes at factor 1; one node links straight)."""
+    hal = tree.nodes.get('Halcyon')
+    for link in list(hal.inputs['Diffuse Color'].links):
+        tree.links.remove(link)
+    acc = nodes[0].outputs['Color']
+    for k, node in enumerate(nodes[1:]):
+        mix = _code_plain(tree, 'Mix' if not k else f'Mix.{k:03d}', 'ShaderNodeMixRGB',
+                          ins=(('NodeSocketFloat', 'Fac'), ('NodeSocketColor', 'Color1'), ('NodeSocketColor', 'Color2')),
+                          outs=(('NodeSocketColor', 'Color'),), blend_type='ADD', use_clamp=False)
+        mix.inputs['Fac'].default_value = 1.0
+        tree.links.new(acc, mix.inputs['Color1'])
+        tree.links.new(node.outputs['Color'], mix.inputs['Color2'])
+        acc = mix.outputs['Color']
+    tree.links.new(acc, hal.inputs['Diffuse Color'])
+
+
+def test_code_node_same_name_across_trees():
+    """Compiled Coded Shader programs were filed under the node's NAME,
+    in ONE dict that serialize_tree hands down its node-group recursion --
+    and Blender keeps node names unique per tree, not per material. The
+    material's "Coded Shader" and a group's "Coded Shader" (the default
+    name, twice) left one program, the last compiled; n_halcyon_code looked
+    it up by the same bare name, so one of the two nodes ran the OTHER's
+    shader under its own sockets, on every road the CPU shades. Which one
+    lost depended on the order of the nodes in the tree. The graph id is
+    the node's PATH now (export.node_id), the one key the node dicts, the
+    links and the programs are written under; the Bump pre-pass fields,
+    filed by the same id, stop crossing trees with it. On the GPU the
+    mangling tag was the id with its punctuation flattened -- 'Coded
+    Shader' and 'Coded_Shader' in one tree shared every GLSL name, and the
+    pass qualified and drew one of them twice; gpu/emit._code_tag hands out
+    one tag per node. Groups themselves have no emitter: a coded shader
+    inside one is refused by name and the CPU -- right, now -- draws it."""
+    import ast
+    import copy
+    import importlib
+    import inspect
+    import itertools
+    import re
+    import textwrap
+    from . import fakebpy
+    fakebpy.install()
+    SN = importlib.import_module('halcyon.nodes.shader_nodes')
+    EX = importlib.import_module('halcyon.export')
+    from ..core import nodeeval as NE
+    from ..gpu import emit as GE
+    red, blue, green = (_code_text(n, src) for n, src in (('red', _CODE_RED), ('blue', _CODE_BLUE),
+                                                          ('green', _CODE_GREEN)))
+
+    def exported(mat):
+        images, programs, warnings = {}, {}, []
+        graph = EX.serialize_tree(mat.node_tree, images, programs, warnings)
+        return graph, programs, warnings
+
+    def cpu(mat, size=(128, 96)):
+        graph, programs, _w = exported(mat)
+        return _code_cpu(graph, programs, size)
+
+    def same(a, b):
+        return bool(np.array_equal(a, b))
+
+    def coded(graph):
+        """{id: its graph source} of every Coded Shader at every depth."""
+        out = {}
+        for nid, node in graph['nodes'].items():
+            if node['bl_idname'] == 'HALCYON_CodeNode':
+                out[nid] = node['props']['source_text']
+            if node.get('group'):
+                out.update(coded(node['group']))
+        return out
+
+    def whole(graph):
+        """Every tree of the graph hangs together: a node sits under its
+        own id, every link and the group output name a node of that tree."""
+        ok = all(nid == node['id'] and all(not s['link'] or s['link'][0] in graph['nodes'] for s in node['inputs'])
+                 and (not node.get('group') or whole(node['group'])) for nid, node in graph['nodes'].items())
+        return ok and graph['group_output'] in (None, *graph['nodes'])
+
+    def as_1920(graph, programs):
+        """The same export as 1.92.0 wrote it: every node under its bare
+        name and the programs filed the same way, in the order
+        serialize_tree compiles them (the last one wins)."""
+        old = {}
+
+        def bare(g, path):
+            nodes = {}
+            for nid, node in g['nodes'].items():
+                node = dict(node, id=nid[len(path):])
+                node['inputs'] = [dict(sk, link=[sk['link'][0][len(path):], sk['link'][1]] if sk['link'] else None)
+                                  for sk in node['inputs']]
+                if nid in programs:
+                    old[node['id']] = programs[nid]
+                if node.get('group'):
+                    node['group'] = bare(node['group'], nid + EX.ID_SEP)
+                nodes[node['id']] = node
+            return {'nodes': nodes, 'output': g['output'] and g['output'][len(path):],
+                    'group_output': g['group_output'] and g['group_output'][len(path):]}
+        return bare(copy.deepcopy(graph), ''), old
+
+    def pair(wire, inner='Coded Shader', top='Coded Shader', group_first=False):
+        """The reported material: the master fed by its own tree's Coded
+        Shader (RED, its Gain linked to the Value node's 0.7), by a group
+        holding a Coded Shader (BLUE, the group's Gain 1.0), or by their
+        sum. Both nodes are in the material whatever feeds the master."""
+        mat = _code_master_tree(SN, red)
+        tree = mat.node_tree
+        code = tree.nodes.get('Coded Shader')
+        code.name = top
+        grp = _code_group_node(tree, 'Group', _code_group_tree(SN, blue, coded=inner))
+        if group_first:
+            tree.nodes.remove(grp)
+            tree.nodes.insert(0, grp)
+        _code_feed(tree, {'top': [code], 'group': [grp], 'both': [code, grp]}[wire])
+        return mat
+
+    # ---- each shader alone: what "its own picture" means below
+    alone_red = cpu(_code_master_tree(SN, red))
+    lone = _code_master_tree(SN, blue)
+    lone.node_tree.nodes.get('Value').outputs['Value'].default_value = 1.0
+    alone_blue = cpu(lone)
+    check('the two shaders alone are two pictures (the red one and the blue one)', _dmax(alone_red, alone_blue) > 0.5,
+          str(_dmax(alone_red, alone_blue)))
+
+    # ---- the export: one program per node, under its path
+    graph, programs, warns = exported(pair('both'))
+    check('the reported state: a Coded Shader in the material and one inside a group, both under the default name',
+          [n.name for n in pair('both').node_tree.nodes if n.bl_idname == 'HALCYON_CodeNode'] == ['Coded Shader']
+          and [n.name for n in pair('both').node_tree.nodes.get('Group').node_tree.nodes
+               if n.bl_idname == 'HALCYON_CodeNode'] == ['Coded Shader'])
+    check('the export keeps TWO programs, the group\'s under its path (1.92.0 kept one, the last compiled)',
+          sorted(programs) == ['Coded Shader', 'Group/Coded Shader'] and not warns, f'{sorted(programs)} {warns}')
+    check('...and each is the program of its own node: compiled from the source that node\'s graph entry carries',
+          coded(graph) == {'Coded Shader': _CODE_RED, 'Group/Coded Shader': _CODE_BLUE}
+          and {k: p.source for k, p in programs.items()} == coded(graph), str(sorted(coded(graph))))
+    inner = graph['nodes']['Group']['group']
+    check('the group\'s tree is written under the same ids: its node keys, its links and its group output',
+          sorted(inner['nodes']) == ['Group/Coded Shader', 'Group/Group Input', 'Group/Group Output']
+          and inner['group_output'] == 'Group/Group Output' and whole(graph)
+          and inner['nodes']['Group/Coded Shader']['inputs'][0]['link'] == ['Group/Group Input', 0],
+          f'{sorted(inner["nodes"])} {inner["group_output"]}')
+    check('a node of the material\'s own tree keeps its bare name as its id (every graph[\'nodes\'][node.name] holds)',
+          sorted(graph['nodes']) == ['Coded Shader', 'Group', 'Halcyon', 'Material Output', 'Mix', 'Value']
+          and graph['output'] == 'Material Output' and EX.node_id('Coded Shader.001') == 'Coded Shader.001')
+
+    # ---- the picture, on the CPU, in both node orders (which node lost its
+    # program depended on which was compiled last)
+    for first in (False, True):
+        order = 'listed first' if first else 'listed last'
+        top_only, group_only = cpu(pair('top', group_first=first)), cpu(pair('group', group_first=first))
+        check(f'group {order}: the material\'s Coded Shader draws ITS shader -- the frame of that shader alone, '
+              'bit for bit', same(top_only, alone_red), str(_dmax(top_only, alone_red)))
+        check(f'group {order}: the group\'s Coded Shader draws ITS shader -- the frame of that shader alone, '
+              'bit for bit', same(group_only, alone_blue), str(_dmax(group_only, alone_blue)))
+        both = cpu(pair('both', group_first=first))
+        named = cpu(pair('both', inner='Coded Shader.001', group_first=first))
+        check(f'group {order}: summed, the frame is the frame of the same tree with the inner node renamed, bit for '
+              'bit -- and neither shader\'s alone', same(both, named) and _dmax(both, alone_red) > 0.3
+              and _dmax(both, alone_blue) > 0.3, f'{_dmax(both, named)} {_dmax(both, alone_red)}')
+        # what 1.92.0 exported for the same trees: one of the two is the wrong picture
+        g_old, p_old = as_1920(*exported(pair('group' if first else 'top', group_first=first))[:2])
+        old = _code_cpu(g_old, p_old)
+        check(f'group {order}: the 1.92.0 export of it kept one program and drew the OTHER node\'s shader here '
+              '(these frames can tell)', len(p_old) == 1 and _dmax(old, group_only if first else top_only) > 0.5,
+              f'{sorted(p_old)} {_dmax(old, group_only if first else top_only)}')
+
+    # ---- the same group instanced twice, and a group in a group
+    def deep(unique=False):
+        mat = _code_master_tree(SN, red)
+        tree = mat.node_tree
+        tint = _code_group_tree(SN, blue, coded='Coded Shader.001' if unique else 'Coded Shader')
+        nest = _code_group_tree(SN, green, coded='Coded Shader.002' if unique else 'Coded Shader')
+        nodes = [tree.nodes.get('Coded Shader'), _code_group_node(tree, 'Group', tint, gain=0.6),
+                 _code_group_node(tree, 'Group.001', tint, gain=0.25),
+                 _code_group_node(tree, 'Outer', _code_group_tree(SN, nested=nest), gain=0.4)]
+        _code_feed(tree, nodes)
+        return mat
+
+    graph_d, programs_d, warns = exported(deep())
+    ids = ['Coded Shader', 'Group.001/Coded Shader', 'Group/Coded Shader', 'Outer/Group/Coded Shader']
+    check('one group instanced twice and a group in a group: four Coded Shaders named alike, four programs by path',
+          sorted(programs_d) == ids and not warns and whole(graph_d), f'{sorted(programs_d)} {warns}')
+    check('...each compiled from its own node\'s source (the two instances of one group: the same source, twice)',
+          {k: p.source for k, p in programs_d.items()} == coded(graph_d)
+          and [coded(graph_d)[k] for k in ids] == [_CODE_RED, _CODE_BLUE, _CODE_BLUE, _CODE_GREEN])
+    frame_d, frame_u = _code_cpu(graph_d, programs_d), cpu(deep(unique=True))
+    check('...and the frame is the frame of the same trees under four different names, bit for bit',
+          same(frame_d, frame_u), str(_dmax(frame_d, frame_u)))
+    old = _code_cpu(*as_1920(graph_d, programs_d))
+    check('...where the 1.92.0 export of them ran ONE shader in all four nodes', len(as_1920(graph_d, programs_d)[1]) == 1
+          and _dmax(old, frame_d) > 0.3, str(_dmax(old, frame_d)))
+
+    # ---- the id is the path, whatever the names hold
+    slashed = pair('both', top='Group/Coded Shader')
+    graph_s, programs_s, _w = exported(slashed)
+    check('a node NAMED \'Group/Coded Shader\' beside the group\'s Coded Shader: two ids, two programs, each its own',
+          sorted(programs_s) == ['Group/Coded Shader', 'Group\\/Coded Shader'] and whole(graph_s)
+          and programs_s['Group\\/Coded Shader'].source == _CODE_RED
+          and programs_s['Group/Coded Shader'].source == _CODE_BLUE, str(sorted(programs_s)))
+    check('...and the frame is the plainly named pair\'s, bit for bit',
+          same(_code_cpu(graph_s, programs_s), cpu(pair('both'))))
+    names = ['a', 'b', 'a/b', '/', 'a/', '/b', '\\', 'a\\', '\\/b', 'a\\/b', '\\\\', 'Coded Shader', 'Group']
+    paths = [p for n in (1, 2, 3) for p in itertools.product(names, repeat=n)]
+
+    def spelled(path):
+        nid = ''
+        for k, step in enumerate(path):
+            nid = EX.node_id(step, nid + EX.ID_SEP if k else '')
+        return nid
+
+    check(f'no two of {len(paths)} paths (names holding the separator and the escape, one to three deep) spell one id',
+          len({spelled(p) for p in paths}) == len(paths), f'{len({spelled(p) for p in paths})} of {len(paths)}')
+    check('a name with neither character is its own id, and a path reads as one',
+          all(EX.node_id(n) == n for n in ('Coded Shader', 'Coded Shader.001', 'Señal', 'Mix (old)'))
+          and spelled(('Outer', 'Group', 'Coded Shader')) == 'Outer/Group/Coded Shader')
+
+    # ---- a shader that fails to compile is named by its path
+    held = {'src': _CODE_BLUE}
+    mat = _code_master_tree(SN, red)
+    grp = _code_group_node(mat.node_tree, 'Group', _code_group_tree(
+        SN, types.SimpleNamespace(name='blue', as_string=lambda: held['src'])))
+    _code_feed(mat.node_tree, [mat.node_tree.nodes.get('Coded Shader'), grp])
+    held['src'] = _CODE_BLUE.replace('1.0);', '1.0;')
+    graph_w, programs_w, warns = exported(mat)
+    check('a group\'s Coded Shader that does not compile: the warning names it by its path, and the material\'s '
+          'like-named node keeps its own program', sorted(programs_w) == ['Coded Shader'] and len(warns) == 1
+          and warns[0].startswith('Group/Coded Shader: ') and programs_w['Coded Shader'].source == _CODE_RED,
+          f'{sorted(programs_w)} {warns}')
+    broken = _code_cpu(graph_w, programs_w)
+    check('...which still draws the red shader (the group\'s output reads zeros: the sum is the red frame)',
+          same(broken, alone_red), str(_dmax(broken, alone_red)))
+
+    # ---- the GPU: the material's own coded shader qualifies beside a group
+    # that holds its namesake; a group has no emitter, and is refused by name
+    d, bad, _gpu, cpu_top, why = _code_twin(*exported(pair('top'))[:2])
+    check('the material\'s Coded Shader, a like-named one in a group beside it: qualifies for the deferred pass',
+          why is None, str(why))
+    check('...and its GPU frame IS the CPU frame, the red one', d is not None and bad == 0 and d < 6e-3
+          and same(cpu_top, alone_red), f'max {d} bad {bad}')
+    _d, _b, gpu_old, _c, why = _code_twin(*as_1920(*exported(pair('top'))[:2]))
+    check('the 1.92.0 export of it was REFUSED there (the graph\'s source against the other node\'s program) while '
+          'the CPU drew the wrong shader', gpu_old is None and 'not the source its program was compiled from' in str(why),
+          str(why))
+    for wire in ('group', 'both'):
+        _d, _b, gpu, cpu_g, why = _code_twin(*exported(pair(wire))[:2])
+        check(f'a Coded Shader inside a group feeding the master ({wire}): REFUSED by name, never drawn -- groups '
+              'have no emitter -- and the CPU frame is the right one', gpu is None and 'ShaderNodeGroup' in str(why)
+              and same(cpu_g, alone_blue if wire == 'group' else cpu(pair('both', inner='Coded Shader.001'))),
+              str(why))
+
+    # ---- the GPU's own key: the tag a node's GLSL names are mangled under
+    def two(name_a, name_b, src_a=_CODE_RED, src_b=_CODE_BLUE):
+        """Two Coded Shaders in ONE tree, summed into the master."""
+        mat = _code_master_tree(SN, _code_text('a', src_a))
+        tree = mat.node_tree
+        a = tree.nodes.get('Coded Shader')
+        a.name = name_a
+        b = _code_coded(SN, tree, name_b, _code_text('b', src_b))
+        b.inputs['Gain'].default_value = 0.4
+        _code_feed(tree, [a, b])
+        return mat
+
+    d, bad, _gpu, cpu_ref, why = _code_twin(*exported(two('Coded Shader', 'Other'))[:2])
+    check('two Coded Shaders in one tree under unrelated names: the deferred pass twins the CPU (the reference)',
+          why is None and bad == 0 and d < 6e-3, f'{why} max {d} bad {bad}')
+    d, bad, _gpu, cpu_t, why = _code_twin(*exported(two('Coded Shader', 'Coded_Shader'))[:2])
+    check('\'Coded Shader\' and \'Coded_Shader\' in one tree (one flattens onto the other: the pass drew one shader '
+          'twice, 0.80 off the CPU over the whole floor): qualifies, twins, and is the reference frame',
+          why is None and bad == 0 and d < 6e-3 and same(cpu_t, cpu_ref), f'{why} max {d} bad {bad}')
+    # a tag that is another tag plus '_' plus the start of a name: `B_k` under
+    # 'Coded' and `k` under 'Coded B' are both _cnCoded_B_k
+    src_a, src_b = (_code_says('gain * B_k, 0.05, 0.05', 'float B_k = 1.0;\n'),
+                    _code_says('0.05, 0.05, gain * k', 'float k = 0.5;\n'))
+    d, bad, _gpu, cpu_p, why = _code_twin(*exported(two('Coded', 'Coded B', src_a, src_b))[:2])
+    check('\'Coded\' declaring B_k beside \'Coded B\' declaring k (one GLSL name between them: 0.57 off): qualifies '
+          'and twins', why is None and bad == 0 and d < 6e-3, f'{why} max {d} bad {bad}')
+    check('...on the frame the same two shaders draw under unrelated names',
+          same(cpu_p, cpu(two('Coded', 'Other', src_a, src_b))))
+
+    em = GE.Emitter({})
+    asked = ['Coded Shader', 'Coded Shader.001', 'Coded_Shader', 'Coded.Shader', 'Group/Coded Shader',
+             'Group_Coded Shader', 'Group\\/Coded Shader', 'Coded', 'Coded B', '2 Coded Shader', 'Other',
+             'Other Shader']
+    tags = [GE._code_tag(em, k) for k in asked]
+    check('a node alone in its pass, and Blender\'s own .001, keep the tag they always had (the id, flattened)',
+          tags[:2] == ['Coded_Shader', 'Coded_Shader_001'] and GE._code_tag(GE.Emitter({}), 'code') == 'code'
+          and GE._code_tag(GE.Emitter({}), 'Group/Coded Shader') == 'Group_Coded_Shader', str(tags[:2]))
+    check('every later node whose flattened id would meet an earlier tag takes an ordinal in front, counted up '
+          'past every tag that begins that way',
+          tags[2:] == ['2_Coded_Shader', '3_Coded_Shader', 'Group_Coded_Shader', '2_Group_Coded_Shader',
+                       'Group__Coded_Shader', '4_Coded', 'Coded_B', '2_2_Coded_Shader', 'Other', '2_Other_Shader'],
+          str(tags))
+    check('one tag per node: asked again, every node has the tag it was given, and no two nodes share one',
+          [GE._code_tag(em, k) for k in asked] == tags and len(set(tags)) == len(asked), str(tags))
+    check('...and no two of them can spell one GLSL name', not any(GE._tags_clash(a, b)
+                                                                   for a, b in itertools.combinations(tags, 2)))
+    # `once` also holds the emitters' own markers: a node NAMED like one
+    graph_m, programs_m, _w = exported(two('__wang', 'Other'))
+    em = GE.Emitter(graph_m)
+    em.frame_mode, em.resolution, em.programs = True, (128, 96), programs_m
+    em.once.add('__wang')                    # the Wang-hash helper's marker, already down
+    em.output('__wang', 0)
+    check('a Coded Shader named like an emitter marker (\'__wang\', the helper already inlined) is still inlined '
+          'and run: the node\'s once-key is its own', len(em.inline) == 1 and '_cn__wang_main' in em.inline[0]
+          and any('_cn__wang_main();' in line for line in em.lines), f'{len(em.inline)} {em.lines[-3:]}')
+    # the clash rule IS "two tags can spell one name": every pair of tags up
+    # to three characters, against every identifier up to four
+    alphabet = 'a_1'
+    words = [''.join(w) for n in (1, 2, 3, 4) for w in itertools.product(alphabet, repeat=n)]
+    idents = [w for w in words if not w[0].isdigit()]
+    short = [w for w in words if len(w) <= 3]
+    spell = {t: {f'_cn{t}_{n}' for n in idents} for t in short}
+    wrong = [(a, b) for a, b in itertools.combinations(short, 2)
+             if GE._tags_clash(a, b) != bool(spell[a] & spell[b])]
+    check(f'_tags_clash is exactly "two tags can spell one mangled name": all {len(short) * (len(short) - 1) // 2} '
+          'pairs of short tags, by brute force', not wrong and GE._tags_clash('a', 'a')
+          and GE._tags_clash('Coded', 'Coded_B') and not GE._tags_clash('Coded_Shader', 'Coded_Shader_001'),
+          str(wrong[:6]))
+
+    # ---- the Bump pre-pass: the other thing filed by (material, node id)
+    bump_ins = (('NodeSocketFloat', 'Strength'), ('NodeSocketFloat', 'Distance'), ('NodeSocketFloat', 'Height'),
+                ('NodeSocketVector', 'Normal'))
+
+    def bump(tree, name):
+        node = _code_plain(tree, name, 'ShaderNodeBump', ins=bump_ins, outs=(('NodeSocketVector', 'Normal'),),
+                           invert=False)
+        node.inputs['Strength'].default_value = node.inputs['Distance'].default_value = 1.0
+        return node
+
+    def bumped(inner_name):
+        """The master's Normal fed by a group whose Bump has a FLAT height
+        (it bends nothing); in the material's own tree a Bump over a steep
+        ramp, wired to nothing."""
+        mat = _code_master_tree(SN, red)
+        tree = mat.node_tree
+        hal = tree.nodes.get('Halcyon')
+        hal.inputs.new('NodeSocketVector', 'Normal')
+        hal.inputs.new('NodeSocketFloat', 'Bump Strength').default_value = 1.0
+        ramp = _code_plain(tree, 'Gradient Texture', 'ShaderNodeTexGradient', ins=(('NodeSocketVector', 'Vector'),),
+                           outs=(('NodeSocketColor', 'Color'), ('NodeSocketFloat', 'Fac')), gradient_type='LINEAR')
+        steep = _code_plain(tree, 'Math', 'ShaderNodeMath', ins=(('NodeSocketFloat', 'Value'),) * 2,
+                            outs=(('NodeSocketFloat', 'Value'),), operation='MULTIPLY', use_clamp=False)
+        steep.inputs[1].default_value = 40.0
+        tree.links.new(ramp.outputs['Fac'], steep.inputs[0])
+        tree.links.new(steep.outputs['Value'], bump(tree, 'Bump').inputs['Height'])
+        gtree = types.SimpleNamespace(name='Flat Bump', nodes=_CodeNodes(), links=_CodeLinks())
+        gout = _code_plain(gtree, 'Group Output', 'NodeGroupOutput', ins=(('NodeSocketVector', 'Normal'),),
+                           is_active_output=True)
+        flat = _code_plain(gtree, 'Value', 'ShaderNodeValue', outs=(('NodeSocketFloat', 'Value'),))
+        flat.outputs['Value'].default_value = 0.25
+        inner_bump = bump(gtree, inner_name)
+        gtree.links.new(flat.outputs['Value'], inner_bump.inputs['Height'])
+        gtree.links.new(inner_bump.outputs['Normal'], gout.inputs['Normal'])
+        grp = _code_plain(tree, 'Group', 'ShaderNodeGroup', outs=(('NodeSocketVector', 'Normal'),), node_tree=gtree)
+        tree.links.new(grp.outputs['Normal'], hal.inputs['Normal'])
+        return mat
+
+    built, real = [], R._bump_height_fields
+
+    def spy(*args, **kw):
+        out = real(*args, **kw)
+        built.append(sorted(key[1] for key in out))
+        return out
+
+    R._bump_height_fields = spy
+    try:
+        big = (320, 240)                      # the floor outgrows one shading batch: the pre-pass runs
+        graph_b, programs_b, _w = exported(bumped('Bump'))
+        frame_b = _code_cpu(graph_b, programs_b, big)
+        fields_b = list(built)
+        frame_n = cpu(bumped('Bump.001'), big)
+        frame_o = _code_cpu(*as_1920(graph_b, programs_b), big)
+    finally:
+        R._bump_height_fields = real
+    check('a Bump in the material and a Bump in a group, named alike, on a frame whose Bump pre-pass runs: the '
+          'field is built for the material\'s own, and the group\'s is a different id',
+          fields_b == [['Bump']] and 'Group/Bump' in graph_b['nodes']['Group']['group']['nodes'], str(fields_b))
+    check('...the group\'s flat Bump bends nothing: the frame of the same trees with the inner Bump renamed, bit '
+          'for bit', same(frame_b, frame_n), str(_dmax(frame_b, frame_n)))
+    check('...where under 1.92.0\'s bare ids it took the OTHER Bump\'s gradient field (1.00 off over the floor)',
+          _dmax(frame_o, frame_b) > 0.5, str(_dmax(frame_o, frame_b)))
+
+    # ---- the rule, read from the code itself
+    def parsed(f):
+        return ast.parse(textwrap.dedent(inspect.getsource(f)))
+
+    def calls(f):
+        return {ast.unparse(c.func) for c in ast.walk(parsed(f)) if isinstance(c, ast.Call)}
+
+    tree_ = parsed(EX.serialize_tree)
+    read = [a for a in ast.walk(tree_) if isinstance(a, ast.Attribute) and a.attr == 'name'
+            and isinstance(a.value, ast.Name) and a.value.id in ('node', 'from_node')]
+    made = [c.args[0] for c in ast.walk(tree_) if isinstance(c, ast.Call) and ast.unparse(c.func) == 'node_id' and c.args]
+    check('serialize_tree reads a node\'s name for ONE purpose, its id: the node key and the link, both through '
+          'node_id', len(read) == 2 and all(any(a is m for m in made) for a in read),
+          str([ast.unparse(a) for a in read]))
+    sub = [c for c in ast.walk(tree_) if isinstance(c, ast.Call) and ast.unparse(c.func) == 'serialize_tree']
+    check('...and hands each group its own node\'s id as the path (the recursion passed nothing down)',
+          len(sub) == 1 and {k.arg: ast.unparse(k.value) for k in sub[0].keywords}.get('path') == 'nid + ID_SEP',
+          str([ast.unparse(c) for c in sub]))
+    source = open(os.path.abspath(EX.__file__), encoding='utf-8').read()
+    check('one line of the exporter files a program, and it files it under the id it was handed',
+          re.findall(r'programs\[[^\]]*\]\s*=', source) == ['programs[key] ='] and 'key = node_id(node.name)' in source,
+          str(re.findall(r'programs\[[^\]]*\]\s*=', source)))
+    check('the evaluator and the emitter look the program up by the graph id, and the emitter mangles under '
+          '_code_tag alone', "node.get('id')" in inspect.getsource(NE.n_halcyon_code)
+          and "node.get('id')" in inspect.getsource(GE.e_code_node) and '_code_tag' in calls(GE.e_code_node)
+          and 're.sub' not in calls(GE.e_code_node), str(sorted(calls(GE.e_code_node))))
 
 
 def test_code_node_rebuild_survives_undo_redo_and_load():

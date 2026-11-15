@@ -118,7 +118,10 @@ class Material:
     # linec/starc; 0 = off), line_color (spec rgb), ring_color (mir
     # rgb), xalpha, soft, shaded, puno (the mode bits).
     halo: Optional[Dict[str, Any]] = None
-    # Cached compiled coded-shader programs keyed by node name.
+    # Compiled coded-shader programs, keyed by the node's GRAPH ID
+    # (export.node_id): its name in the material's own tree, its path
+    # inside a node group ('Group/Coded Shader'). A name alone is unique
+    # per tree only, and this one dict serves every tree of the material.
     programs: Dict[str, Any] = field(default_factory=dict)
     # Filled by the renderer: node names that could not be evaluated.
     unsupported: List[str] = field(default_factory=list)

@@ -36,6 +36,7 @@ class Emitter:
         self.inline = []
         self.samplers = []
         self.once = set()          # nodes whose setup lines are already down
+        self.code_tags = {}        # coded-shader node id -> its mangling tag
         self.frame_uniforms = set()  # per-frame scalars a code node asked for
         self.programs = None       # material's compiled programs, or None
         self.frame_mode = False    # True only under assemble_frame
@@ -1198,6 +1199,55 @@ def _code_socket_expr(em, node, uname, gtype, default):
     return em.const(default if default is not None else 0.0, want)
 
 
+def _tags_clash(a, b):
+    """True when two mangling tags can spell ONE GLSL name between them.
+
+    A coded shader's names are mangled to `_cn<tag>_<name>`. Equal tags
+    share every name. Unequal ones still meet when the longer is the
+    shorter plus '_' plus a rest that can begin an identifier: tags
+    'Coded' and 'Coded_B' make `_cnCoded_B_k` out of `B_k` in the first
+    node and out of `k` in the second. A rest that begins with a digit
+    cannot (no identifier starts with one), which is why Blender's own
+    'Coded Shader' / 'Coded Shader.001' never met.
+    """
+    if a == b:
+        return True
+    if len(a) > len(b):
+        a, b = b, a
+    if not b.startswith(a + '_'):
+        return False
+    return not b[len(a) + 1:len(a) + 2].isdigit()
+
+
+def _code_tag(em, key):
+    """The tag one coded shader's GLSL names are mangled under in `em`.
+
+    It is the node's graph id with every non-word character flattened to
+    '_' -- and a flattening is many-to-one. R253 (review): the tag WAS
+    that flattening and nothing else, so 'Coded Shader', 'Coded_Shader'
+    and 'Coded.Shader' (three legal names in one tree, three programs on
+    the CPU) shared one set of GLSL names; the pass qualified, inlined
+    both shaders over each other and drew one of them twice. A
+    path-qualified id ('Group/Coded Shader') flattens the same way. So
+    the tag is checked against every tag this emitter has handed out
+    (`_tags_clash`) and a clashing one takes an ordinal in front --
+    '2_Coded_Shader' -- counted up until nothing it meets begins that
+    way. A node alone in its pass, and any two that never clashed, keep
+    exactly the names they had.
+    """
+    tag = em.code_tags.get(key)
+    if tag is None:
+        import re
+        base = tag = re.sub(r'\W', '_', str(key))
+        taken = list(em.code_tags.values())
+        n = 1
+        while any(_tags_clash(tag, t) for t in taken):
+            n += 1
+            tag = f'{n}_{base}'
+        em.code_tags[key] = tag
+    return tag
+
+
 def e_code_node(em, node, index):
     """The coded shader node, running natively in the deferred pass.
 
@@ -1248,12 +1298,14 @@ def e_code_node(em, node, index):
         raise Unsupported('a coded shader whose graph source is not the '
                           'source its program was compiled from (the CPU '
                           'runs the program)')
-    import re
-    tag = re.sub(r'\W', '_', str(key))
+    tag = _code_tag(em, key)
     inline, uniforms, ins, outs, samplers = _port_code_node(src, tag)
 
-    if key not in em.once:
-        em.once.add(key)
+    # `once` is shared with the emitters' own markers ('__wang',
+    # ('__pat', name), ...): a node id goes in under a marker of its own,
+    # so a node NAMED like one of those is still a node
+    if ('__code', key) not in em.once:
+        em.once.add(('__code', key))
         em.inline.append(inline)
         for uname, mangled in samplers:
             # the socket names the image; its prepared pixels ride the
