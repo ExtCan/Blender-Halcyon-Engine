@@ -411,11 +411,14 @@ One pin changed:
 
 ## For the integrator
 
-- Merges into claude-cloud at 3e30799 (the ray-road, spot-beam, map-soft
-  and viewport packages in) without a conflict, checked with
-  `git merge-tree`; on that merged tree tests/test_r254_flags.py and the
-  viewport, spot-beam, falloff, world-light and light-options modules
-  pass (ray-road and map-soft passed on the merge with 4e655f6).
+- Merges into claude-cloud at 6f0ac79 (the ray-road, spot-beam, map-soft,
+  viewport and native packages in) without a conflict, checked with
+  `git merge-tree`. On that merged tree: test_r254_flags 137 checks,
+  test_r254_native 222, test_r254_viewport 124, test_r254_spot_beam 114,
+  test_r254_falloff 154, test_r253_light_options 195,
+  test_r254_world_light 188, test_r254_ray_road 211, test_r254_map_soft
+  164, all green, and the strict GLSL gate compiles all 439 distinct
+  texts.
 - `export.export_lights_into` (the viewport package's): this package only
   ADDS a line, `_resolve_links(lights, parked.objects or [])`, after the
   single-index statements that function had. They are redundant now (the
@@ -426,12 +429,17 @@ One pin changed:
   form is).
 - `core/render.shaft_sources`: the filter sits at the `out.append` (a
   lamp must be one of `_medium_lamps`) so it merges under the spot
-  package's rewrite of the loop head; it may move to the loop head later.
-- `ui.scene_clock` looks for `export.scene_time` (the name the frame-rate
-  package's helper carries in its worktree). If that helper lands under
-  another name, `test_f_the_panel_says_what_the_flags_do` fails on the
-  frame-rate-base rows and names the two clocks: point `scene_clock` at
-  the helper.
+  package's rewrite of the loop head. It asks for the list once per shaft
+  lamp; taken once at the loop head it costs nothing in a scene over the
+  Light Limit with many shaft lamps (two lines, after the merge).
+- `ui.scene_clock` reads `export.scene_time`, the native package's
+  helper, where the exporter carries it (on the merged tree the status
+  line and the export agree at a frame-rate base of 2 and at subframes;
+  the test compares them through a real export).
+- The panel's Ambient Level row and its red warning read the lamp's own
+  Energy and colour; the F12 report reads the exported lamp. With the
+  native package's Exposure, Temperature or Normalize off the exported
+  energy differs from the field, and the report is the exact one.
 - tests/run_all.py: add `test_r254_flags`.
 - A scene with an ambient lamp uploads a `hal_lights` row three texels
   longer; texels 12-15 of each light's block are still reserved zeros.
