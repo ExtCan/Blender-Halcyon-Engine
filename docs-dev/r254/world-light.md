@@ -83,10 +83,12 @@ this branch: whether this ships as its own round is the user's call.
   touch the scene at all. A world-only edit re-lights at the next render;
   the GPU plan signature follows through the existing per-light signatures.
 - **Beside real lamps.** The world light is added to them: a scene that
-  already has a Sun lamp is lit by both, and the panel says so. The light
-  limit (`lights.select_lights`) ranks the lamps for the slots left and
-  never drops the world light, in all three limit modes; for every list
-  without one it returns the old selection object for object.
+  already has a Sun lamp is lit by both, and the panel says so. The Light
+  Limit never drops the world light, in all three limit modes: it ranks
+  the LAMPS for the slots left beside it, by the limit as the falloff
+  package of this round reconciled it (`lights.frame_lights` -- Brightest
+  on what a lamp delivers, Nearest from the camera), and a scene at or
+  under the limit is not touched.
 - **Shadow** (None / Shadow Map / Ray Traced) is the lamp's own Shadow
   choice and obeys the render settings' Shadow Method the same way; under
   Per Light, a Ray Traced world light gets its BVH as any Ray Traced lamp
