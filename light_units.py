@@ -94,6 +94,16 @@ UNITS_VERSION = 1
 #: unsorted Area lamp of every older file, whatever it was rendered with
 HALCYON_FILES_ONLY = True
 
+#: R254: the visible beam's unit changed with the same round. The old
+#: composite multiplied the marched scatter by energy / pi; a spot or
+#: point lamp's beam is energy / (64 pi^3) now (core/cones.beam_gain),
+#: 64 pi^2 = 631.65 times less, and an Area lamp's follows its Distance
+#: (energy * D^2 / (32 pi^3)). keep_beams puts both back for the scenes
+#: of an older Halcyon file that draw beams
+BEAM_UNIT_GAIN = 64.0 * 3.141592653589793 ** 2
+#: the render's Beam Density tops out here (properties.RANGES)
+BEAM_DENSITY_MAX = 100000.0
+
 #: bytes whose presence in a .blend says what it is: the engine's name
 #: sits in a scene's RenderData, the stamp's name in the property itself
 _MARK_ENGINE = ENGINE.encode('ascii')
@@ -320,6 +330,59 @@ def stamp_scenes(data):
             pass
 
 
+def keep_beams(data):
+    """The beams of an older Halcyon file keep their brightness.
+
+    Returns the names of the scenes whose Beam Density was rescaled.
+    A scene is touched only when it is unstamped, draws beams (Render >
+    Lighting > Volumetric Lights is on) and some local lamp has a
+    Volumetric above zero: its Beam Density is multiplied by
+    BEAM_UNIT_GAIN, which is exact for every spot and point lamp. An
+    Area lamp's beam reads its Distance now -- 2 D^2 on top of that --
+    so each such lamp's Volumetric is divided by it (these lamps are on
+    Blender Internal units in such a file, where Distance is the dial
+    the panel shows). A file that never drew a beam is left on the new
+    unit, where the Volumetric slider's 0..4 is the working range."""
+    lamps = []
+    for la in getattr(data, 'lights', ()):
+        hs = getattr(la, 'halcyon', None)
+        if hs is None or not _local(la):
+            continue
+        try:
+            if float(getattr(hs, 'volumetric', 0.0) or 0.0) > 0.0:
+                lamps.append(la)
+        except Exception:                                       # noqa: BLE001
+            pass
+    if not lamps:
+        return []
+    kept = []
+    for sc in getattr(data, 'scenes', ()):
+        hs = getattr(sc, 'halcyon', None)
+        if hs is None or not _local(sc):
+            continue
+        try:
+            if int(getattr(hs, 'light_units_version', 0) or 0) \
+                    >= UNITS_VERSION or not getattr(hs, 'spot_cones', False):
+                continue
+            hs.spot_cone_density = min(
+                float(hs.spot_cone_density) * BEAM_UNIT_GAIN,
+                BEAM_DENSITY_MAX)
+            kept.append(sc.name)
+        except Exception:                                       # noqa: BLE001
+            pass
+    if kept:
+        for la in lamps:
+            if getattr(la, 'type', '') != 'AREA':
+                continue
+            try:
+                d = max(float(la.halcyon.decay_end), 1e-6)
+                la.halcyon.volumetric = \
+                    float(la.halcyon.volumetric) / (2.0 * d * d)
+            except Exception:                                   # noqa: BLE001
+                pass
+    return kept
+
+
 def sort_file(data=None, on_disk_only=False):
     """The load-time sort of the open file. Returns the names of the
     lamps kept on Blender Internal units.
@@ -331,11 +394,11 @@ def sort_file(data=None, on_disk_only=False):
     new lamp."""
     data = bpy.data if data is None else data
     kept = []
+    own_sorted = file_is_sorted(data)
+    own_halcyon = file_shows_halcyon(data)
     lights = [la for la in getattr(data, 'lights', ())
               if _unsorted_area(la)]
     if lights:
-        own_sorted = file_is_sorted(data)
-        own_halcyon = file_shows_halcyon(data)
         own_path = str(getattr(data, 'filepath', '') or '')
         for la in lights:
             lib = getattr(la, 'library', None)
@@ -352,6 +415,17 @@ def sort_file(data=None, on_disk_only=False):
                     else (False, None)
             if keeps_bi(la, halcyon, is_sorted) and _keep(la):
                 kept.append(la.name)
+    if own_halcyon and not own_sorted:
+        # the beam's unit moved in the same round: an older Halcyon
+        # file's beams keep their brightness (before the stamp below,
+        # which is what makes this run once)
+        beams = keep_beams(data)
+        if beams:
+            print(f'[Halcyon] Beam Density rescaled by {BEAM_UNIT_GAIN:.2f} '
+                  'in ' + ', '.join(sorted(beams)[:12])
+                  + ('...' if len(beams) > 12 else '')
+                  + ': the visible beam is on the lamp\'s own radiance '
+                  'scale now, and this file\'s beams keep their brightness')
     stamp_scenes(data)
     return kept
 
