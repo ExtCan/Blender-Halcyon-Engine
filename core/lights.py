@@ -1129,6 +1129,20 @@ def sample(light, P, settings, area_sample=None):
 #: the GPU twin bakes the same corners as literals.
 AREA_DISC_SIDES = 16
 
+#: the shortest side an area lamp LIGHTS with (world units). The Stokes
+#: contour sums the arc angles between unit vectors to the lamp's
+#: corners and multiplies by dist^2 / A; on a face much smaller than
+#: this the arcs are rounding noise and A is nearly zero -- a Size 0
+#: lamp (Blender lets it be typed) lit the scene with noise seventy-six
+#: times too bright, and the float32 GLSL twin broke fifty times sooner
+#: (3% off the CPU at 0.005, 84% at 0.001). The far-field energy does
+#: not depend on the size at all (BI's area lamp is total-power-like),
+#: so a face clamped here IS the small lamp, drawn cleanly: at 0.02 the
+#: GPU twin is within 0.3% of the CPU. One constant for the three
+#: places that build the face: area_emit_area, area_corners and the
+#: GLSL rectangle (gpu/material._area_function)
+AREA_MIN_SIDE = 0.02
+
 
 def area_is_disc(light):
     """True for the round area shapes (Blender's DISK and ELLIPSE)."""
@@ -1142,12 +1156,21 @@ def area_emit_area(light):
     by this, so a disc and a square of the same size throw the same
     far-field energy (BI's area lamp is total-power-like: its energy
     does not grow with its size) and differ only in SHAPE."""
-    asz = getattr(light, 'area_size', (1.0, 1.0))
-    sx = max(float(asz[0]), 1e-6)
-    sy = max(float(asz[1]) if len(asz) > 1 else float(asz[0]), 1e-6)
+    sx, sy = area_lit_sides(light)
     if area_is_disc(light):
         return sx * sy * (np.pi * 0.25)
     return sx * sy
+
+
+def area_lit_sides(light):
+    """(sx, sy): the two sides the lamp's LIGHTING is computed with --
+    its Size, never under AREA_MIN_SIDE. The traced shadow still reads
+    the true Size (a Size 0 lamp casts a hard shadow)."""
+    asz = getattr(light, 'area_size', (1.0, 1.0))
+    sx = max(float(asz[0]), AREA_MIN_SIDE)
+    sy = max(float(asz[1]) if len(asz) > 1 else float(asz[0]),
+             AREA_MIN_SIDE)
+    return sx, sy
 
 
 def area_corners(light, dtype=np.float64):
@@ -1172,9 +1195,7 @@ def area_corners(light, dtype=np.float64):
     ay = np.asarray(getattr(light, 'area_y', None)
                     if getattr(light, 'area_y', None) is not None
                     else (0.0, 1.0, 0.0), dtype)
-    asz = getattr(light, 'area_size', (1.0, 1.0))
-    sx = max(float(asz[0]), 1e-6)
-    sy = max(float(asz[1]) if len(asz) > 1 else float(asz[0]), 1e-6)
+    sx, sy = area_lit_sides(light)
     hx, hy = ax * dtype(sx * 0.5), ay * dtype(sy * 0.5)
     if not area_is_disc(light):
         return np.stack((pos - hx - hy, pos - hx + hy,

@@ -1273,9 +1273,10 @@ def _area_function(i, light, consts):
     ay = np.asarray(getattr(light, 'area_y', None)
                     if getattr(light, 'area_y', None) is not None
                     else (0.0, 1.0, 0.0), np.float64)
-    asz = getattr(light, 'area_size', (1.0, 1.0))
-    sx = max(float(asz[0]), 1e-6)
-    sy = max(float(asz[1]) if len(asz) > 1 else float(asz[0]), 1e-6)
+    # the sides the CPU's contour is built from (never under
+    # lights.AREA_MIN_SIDE): the rectangle's half-axes below and the
+    # dist^2 / A texel must describe the SAME face
+    sx, sy = LI.area_lit_sides(light)
     hx = (ax * (sx * 0.5)).astype(np.float32)
     hy = (ay * (sy * 0.5)).astype(np.float32)
     disc = LI.area_is_disc(light)
