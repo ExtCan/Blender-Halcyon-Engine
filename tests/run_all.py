@@ -54,6 +54,8 @@ def run_tests():
     from . import test_r254_world_light
     # R254: the light falloff family and the Light Limit
     from . import test_r254_falloff
+    # R254: traced soft shadows, the shadow panels, Area lamp scale
+    from . import test_r254_ray_road
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -222,6 +224,11 @@ def run_tests():
     print('R254 FALLOFF (THE LIGHT FALLOFF FAMILY AND THE LIGHT LIMIT)')
     print('=' * 66)
     rc |= test_r254_falloff.main()
+    print()
+    print('=' * 66)
+    print('R254 RAY ROAD (TRACED SOFT SHADOWS, DENSITY, AREA LAMP SCALE, PANELS)')
+    print('=' * 66)
+    rc |= test_r254_ray_road.main()
     return rc
 
 
