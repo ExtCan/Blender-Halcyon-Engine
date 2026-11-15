@@ -688,7 +688,7 @@ def test_h_light_limit_nearest_measures_a_distance():
     orig = LI.select_lights
 
     def spy(lights, settings, centre=None, *a, **k):
-        calls.append(centre is not None)
+        calls.append(centre is not None or k.get('bounds') is not None)
         return orig(lights, settings, centre, *a, **k)
 
     LI.select_lights = spy
@@ -698,7 +698,7 @@ def test_h_light_limit_nearest_measures_a_distance():
     finally:
         LI.select_lights = orig
     check('every selection of an over-limit frame, CPU and GPU, is handed '
-          'the scene\'s centre', bool(calls) and all(calls),
+          'the scene\'s bounds', bool(calls) and all(calls),
           f'{sum(calls)} of {len(calls)} calls')
 
 

@@ -1524,24 +1524,26 @@ def limit_strength(light, centre, radius, settings):
     return k * w / (4.0 * np.pi)
 
 
-def select_lights(lights, settings, centre=None, radius=0.0):
-    """Emulate a hardware light limit by keeping only N of the lamps.
-
-    `centre` / `radius` are the scene's bounds (frame_lights hands them
-    in): Brightest ranks on what each lamp delivers there
-    (limit_strength), Nearest on its distance from the centre with a
-    Sun or hemi at distance 0 (it reaches everything), ties in scene
-    order, and the survivors come back in scene order -- the order the
-    per-material light limit and the GPU plan's selection signature
-    both assume. Without a centre (a bare lamp list, or a scene with no
-    geometry to measure against) the ranking is the raw one it always
-    was. A list at or under the limit is returned untouched either way."""
+#: R254: how the Light Limit chooses. `centre` / `radius` are the scene's
+#: bounds, or `bounds` a callable returning them, read only when the limit
+#: actually drops a lamp (frame_lights hands in the scene's): Brightest
+#: ranks on what each lamp delivers there (limit_strength), Nearest on its
+#: distance from the centre with a Sun or hemi at distance 0 (it reaches
+#: everything), ties in scene order, and the survivors come back in SCENE
+#: order -- the order the per-material light limit and the GPU plan's
+#: selection signature both assume. Without bounds (a bare lamp list, a
+#: scene with no geometry to measure against) the ranking is the raw one
+#: it always was. A list at or under the limit comes back untouched.
+def select_lights(lights, settings, centre=None, radius=0.0, bounds=None):
+    """Emulate a hardware light limit by keeping only the strongest N."""
     active = [l for l in lights if l.type != 'AMBIENT']
     limit = int(settings.max_lights)
     if limit <= 0 or len(active) <= limit:
         return active
     if settings.light_limit_mode == 'FIRST':
         return active[:limit]
+    if centre is None and bounds is not None:
+        centre, radius = bounds()
     if centre is None:
         key = [float(l.energy) * float(np.mean(l.color)) for l in active]
         order = np.argsort(key)[::-1]
@@ -1577,24 +1579,26 @@ def frame_lights(scene, settings):
     They used to call select_lights with the bare lamp list, so no
     caller could say where the scene was: Nearest never measured a
     distance and Brightest compared a Sun's strength with a point
-    lamp's watts. Nothing is parked on the scene or the settings -- the
-    bounds are computed here, and only when the limit actually drops a
-    lamp."""
-    lights = getattr(scene, 'lights', None) or []
-    limit = int(settings.max_lights)
-    if limit <= 0 or settings.light_limit_mode == 'FIRST' or \
-            sum(1 for l in lights if l.type != 'AMBIENT') <= limit:
-        return select_lights(lights, settings)
-    centre, radius = limit_bounds(scene)
-    return select_lights(lights, settings, centre=centre, radius=radius)
+    lamp's watts. Nothing is parked on the scene or the settings: the
+    bounds are measured inside the call, and only when the limit
+    actually drops a lamp (a scene at or under it takes the old path
+    and never looks at a vertex)."""
+    return select_lights(getattr(scene, 'lights', None) or [], settings,
+                         bounds=lambda: limit_bounds(scene))
+
+
+class _NoLimit:
+    """Settings that keep every lamp: frame_lights under it is the list
+    the limit chooses among (limit_report's denominator)."""
+    max_lights = 0
+    light_limit_mode = 'FIRST'
 
 
 def limit_report(scene, settings):
     """One line naming the lamps the Light Limit leaves unlit this frame,
     or None when every lamp is lit. The limit used to drop lamps in
     silence -- at the factory 8 a ninth lamp simply did nothing."""
-    lights = [l for l in (getattr(scene, 'lights', None) or [])
-              if l.type != 'AMBIENT']
+    lights = frame_lights(scene, _NoLimit)
     kept = {id(l) for l in frame_lights(scene, settings)}
     out = [str(getattr(l, 'name', '') or l.type) for l in lights
            if id(l) not in kept]
