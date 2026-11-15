@@ -342,7 +342,12 @@ def shadow_function(i, meta):
                  'ts);')
     else:
         L.append('    float tp = min(max(dr - davg, 0.0), ts);')
-    L += [f'    vec2 fp = hal_sm_find{i}(tp, Ax, Ay, Bx, By, {cta});',
+    # a footprint with no lamp term (a lamp of size 0 under the user's
+    # Softness) puts the probe's taps exactly on the search's: skipped
+    L += ['    vec2 fp = fs;',
+          '    if (amax > 0.0) {',
+          f'    fp = hal_sm_find{i}(tp, Ax, Ay, Bx, By, {cta});',
+          '    }',
           '    float nb2 = fp.x; float dsum2 = fp.y;',
           f'    if (nb2 >= {nt}) {{ lit = 0.0; }}',
          '    else if (nb2 > 0.0) {',

@@ -768,7 +768,14 @@ def _shadow_meta(light, st, bvh=None):
     # nearer re-uploads the atlas (as it must) and never touches the
     # shader text. The size itself is baked as literals (`_light_sig`)
     from ..core import softmap as _softmap
-    shape = _softmap.lookup_shape(light, _shadow_sample_count(light, st))
+    # the user's Softness in texels (the lamp's own dial multiplies the
+    # render's); the lamp's size is no part of it. Above one texel it
+    # sends a lamp of size 0 through the sized lookup too, with no lamp
+    # term (`softmap.zero_shape`, the CPU's own rule)
+    soft = max(float(getattr(light, 'shadow_softness', 1.0))
+               * float(st.shadow_softness), 0.0)
+    shape = _softmap.lookup_shape(light, _shadow_sample_count(light, st),
+                                  soft)
     d_min = None
     if shape is not None:
         d_min = float(_softmap.map_d_min(sm))
@@ -786,10 +793,6 @@ def _shadow_meta(light, st, bvh=None):
     bias = float(getattr(light, 'shadow_bias', 0.0) or st.shadow_bias)
     if mid:
         bias = 0.0
-    # the user's Softness in texels (the lamp's own dial multiplies the
-    # render's); the lamp's size is no part of it
-    soft = max(float(getattr(light, 'shadow_softness', 1.0))
-               * float(st.shadow_softness), 0.0)
     meta = {
         'faces': [{'vp': np.asarray(f.vp, np.float32)} for f in faces_sm],
         'size': size, 'near': float(first.near), 'far': float(first.far),

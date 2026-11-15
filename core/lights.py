@@ -1673,7 +1673,8 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
     # obliquely the light hits. Removes acne without the detached shadows a
     # large constant depth bias produces.
     texel = sm.texel_size(np.linalg.norm(P - sm.origin[None, :], axis=1))
-    shape = SM.lookup_shape(light, shadow_sample_count(light, settings))
+    shape = SM.lookup_shape(light, shadow_sample_count(light, settings),
+                            soft)
     if shape is not None:
         # a SIZED lamp (Radius, a Sun's Angle, an Area's Size) at more
         # than one Sample -- one Sample is the hard single-tap lookup
@@ -1684,7 +1685,10 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
         # receiver PLANE's depth at the tap, so the offset carries no
         # blur factor and is scaled DOWN where that plane is exact
         # (`offset_scale`): nothing lifts the receiver out from under
-        # its caster as the lamp or the Softness grows
+        # its caster as the lamp or the Softness grows. A lamp of size
+        # 0 whose Softness is wider than one texel takes the same road
+        # with no lamp term (`SM.zero_shape`): the dial blurs the edge
+        # and no longer shrinks the shadow
         if mid:
             offset = np.zeros(n, np.float32)
         else:
