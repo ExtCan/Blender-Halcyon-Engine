@@ -1594,13 +1594,21 @@ def _heard_objects(depsgraph):
         main = vl.depsgraph
         if str(getattr(main, 'mode', '')) != 'VIEWPORT':
             return None
-        for item in type(main).bl_rna.functions[
-                'id_type_updated'].parameters['id_type'].enum_items:
-            if main.id_type_updated(item.identifier):
-                return None
+        if _pending_types(main):
+            return None
         return _viewport_enabled(vl)
     except Exception:                                           # noqa: BLE001
         return None
+
+
+def _pending_types(depsgraph):
+    """The ID types this depsgraph holds a tag for that it has not
+    reported yet (measured in 5.2: `ob.location.x += 1` sets 'OBJECT',
+    a vertex write 'MESH', and the next evaluation clears them)."""
+    kinds = type(depsgraph).bl_rna.functions[
+        'id_type_updated'].parameters['id_type'].enum_items
+    return [k.identifier for k in kinds
+            if depsgraph.id_type_updated(k.identifier)]
 
 
 #: the Scene fields that can change EVALUATED MESH GEOMETRY -- the
