@@ -1655,6 +1655,40 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   namespace with no `persistent` and no undo / load lists (the Coded
   Shader test above raised on it in the full run); the stub is lent
   inside a try / finally and restored, and the test checks the hand-back.
+- **A moved object under a still camera rendered from stale caches.**
+  The CPU's G-buffer cache (R170) keys on a mesh fingerprint and the
+  camera, and the fingerprint read the vertex positions as a strided
+  sum. A translation whose components cancel -- the demo ball moved by
+  (0.3, -0.3, 0), a grid-snapped (1, -1, 0) -- kept that sum, so with the
+  camera unmoved the CPU restored the previous frame's raster (`gbuf
+  HIT`) and shaded the old positions: 1.80 against the GPU's freshly
+  rastered twin, 7.6e-6 in a fresh process. A viewport with a still
+  camera and every motion-blur slice reach that road. A strided sum has
+  a second blind spot, and three more caches shared it: an object lying
+  wholly between the stride's samples (a 24-vertex box in a
+  40,000-vertex scene: stride 79, not one of its vertices read) kept the
+  mesh key, the BVH cache's key, the BVH upload key and the shadow maps'
+  base signature for ANY move -- the box drawn, shadowed and ray-shadowed
+  where it used to stand (1.62 / 1.72 / 1.72 against a fresh render).
+  `core/mathx.content_digest` -- the CRC-32 of every position byte, one
+  pass measured at ~2 us for the demo scene, ~60 us for 20,000 vertices
+  and ~0.6 ms for 200,000 -- now sits beside the sums in
+  `gpu/shade._mesh_key` (the one function behind the G-buffer cache, the
+  plan and the triaux / sres / attribute uploads),
+  `core/render._cached_bvh`, `gpu/rtrace.bvh_fingerprint` and
+  `core/lights._shadow_base_signature`. Per-axis weights on the strided
+  sum were weighed and left: beside the plain sum they still pass a
+  (2, -3, 1) move, and no strided statistic sees between the samples.
+  A re-export of an unmoved scene keeps every key and still hits.
+  Pinned in `tests/test_r253_generated_coords.py`
+  (`test_d_moved_objects_miss_the_frame_caches`: the frame after each
+  move is bitwise a fresh render with no cache cleared, the GPU twin
+  7.6e-6) and in `test_r253_review`'s signature test, which asserted the
+  translation KEPT the mesh key and now asserts it changes while the
+  plan signature still fingerprints the baked frame on its own. Left as
+  they were: the normal, UV, material-index and triangle-index parts of
+  the mesh key are still strided sums (a UV edit confined to unsampled
+  rows, or one that cancels, does not re-upload the attribute texture).
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
