@@ -1870,11 +1870,56 @@ def frustum_keep(clip, tris, width, height, near_eps=1e-5):
     return ~drop
 
 
-def depth_fragments(sx, sy, z, W, H, cull='NONE', max_batch_px=None):
+def _large_strips(t, x0, x1, x2, y0, y1, y2, area, bxmin, bxmax, bymin,
+                  bymax):
+    """One large triangle's box in row strips: yields (first row, e0, e1,
+    e2, inside), each a dense (rows, columns) plane -- fill()'s own
+    statements, the row and the column factor of every edge function
+    computed once."""
+    xa, xb, xc = x0[t], x1[t], x2[t]
+    ya, yb, yc = y0[t], y1[t], y2[t]
+    ar = area[t]
+    xs = np.arange(bxmin[t], bxmax[t] + 1, dtype=np.float32) + 0.5
+    X = xs[None, :]
+    c0 = (yc - yb) * (X - xb)
+    c1 = (ya - yc) * (X - xc)
+    c2 = (yb - ya) * (X - xa)
+    a0, a1, a2 = np.abs(c0), np.abs(c1), np.abs(c2)
+    row_end = int(bymax[t]) + 1
+    for r0 in range(int(bymin[t]), row_end, DEPTH_STRIP):
+        r1 = min(r0 + DEPTH_STRIP, row_end)
+        ys = np.arange(r0, r1, dtype=np.float32) + 0.5
+        Y = ys[:, None]
+        p0 = (xc - xb) * (Y - yb)
+        p1 = (xa - xc) * (Y - yc)
+        p2 = (xb - xa) * (Y - ya)
+        e0 = p0 - c0
+        e1 = p1 - c1
+        e2 = p2 - c2
+        w0 = np.abs(p0) + a0
+        w1 = np.abs(p1) + a1
+        w2 = np.abs(p2) + a2
+        if ar > 0:
+            inside = (e0 >= EDGE_WOBBLE * -w0) & (e1 >= EDGE_WOBBLE * -w1) \
+                & (e2 >= EDGE_WOBBLE * -w2)
+        else:
+            inside = (e0 <= EDGE_WOBBLE * w0) & (e1 <= EDGE_WOBBLE * w1) \
+                & (e2 <= EDGE_WOBBLE * w2)
+        yield r0, e0, e1, e2, inside
+
+
+def depth_fragments(sx, sy, z, W, H, cull='NONE', max_batch_px=None,
+                    planes=None):
     """Yield (pix, zz) for every fragment of the emitted triangles:
     pix = py * W + px (int64) and zz the NDC z the fills compute at
     depth_bits = 32. Order means nothing to a minimum. Fragments whose z
-    is NaN or +inf are not yielded (see the section note)."""
+    is NaN or +inf are not yielded (see the section note).
+
+    With `planes` the LARGE triangles are not yielded but resolved here,
+    densely, strip by strip (a large triangle fills most of its box, so
+    a gather per fragment costs more than the box): `planes` is (d,) --
+    the (H, W) depth plane, lowered in place -- or (None, z2, has2, lim)
+    for the MIDPOINT map's second surface."""
     n = sx.shape[0]
     if n == 0:
         return
@@ -1900,39 +1945,31 @@ def depth_fragments(sx, sy, z, W, H, cull='NONE', max_batch_px=None):
     big = live & ((bw_px * bh_px) > LARGE_TRI_PX)
     inf = np.float32(np.inf)
 
-    # ---- large boxes: fill()'s statements, the box taken in row strips
+    # ---- large boxes
     for t in np.nonzero(big)[0]:
-        xa, xb, xc = x0[t], x1[t], x2[t]
-        ya, yb, yc = y0[t], y1[t], y2[t]
-        ar = area[t]
-        inv_area = 1.0 / ar
-        xs = np.arange(bxmin[t], bxmax[t] + 1, dtype=np.float32) + 0.5
-        X = xs[None, :]
-        c0 = (yc - yb) * (X - xb)
-        c1 = (ya - yc) * (X - xc)
-        c2 = (yb - ya) * (X - xa)
-        a0, a1, a2 = np.abs(c0), np.abs(c1), np.abs(c2)
+        inv_area = 1.0 / area[t]
         z0, z1, z2 = z[t, 0], z[t, 1], z[t, 2]
-        row_end = int(bymax[t]) + 1
-        for r0 in range(int(bymin[t]), row_end, DEPTH_STRIP):
-            r1 = min(r0 + DEPTH_STRIP, row_end)
-            ys = np.arange(r0, r1, dtype=np.float32) + 0.5
-            Y = ys[:, None]
-            p0 = (xc - xb) * (Y - yb)
-            p1 = (xa - xc) * (Y - yc)
-            p2 = (xb - xa) * (Y - ya)
-            e0 = p0 - c0
-            e1 = p1 - c1
-            e2 = p2 - c2
-            w0 = np.abs(p0) + a0
-            w1 = np.abs(p1) + a1
-            w2 = np.abs(p2) + a2
-            if ar > 0:
-                inside = (e0 >= EDGE_WOBBLE * -w0) & (e1 >= EDGE_WOBBLE * -w1) \
-                    & (e2 >= EDGE_WOBBLE * -w2)
-            else:
-                inside = (e0 <= EDGE_WOBBLE * w0) & (e1 <= EDGE_WOBBLE * w1) \
-                    & (e2 <= EDGE_WOBBLE * w2)
+        c0, c1 = int(bxmin[t]), int(bxmax[t]) + 1
+        for r0, e0, e1, e2, inside in _large_strips(
+                t, x0, x1, x2, y0, y1, y2, area, bxmin, bxmax, bymin, bymax):
+            if planes is not None:
+                if not inside.any():
+                    continue
+                # the fragment's own statements over the whole strip
+                zz = ((e0 * inv_area) * z0 + (e1 * inv_area) * z1
+                      + (e2 * inv_area) * z2) + 0.0
+                inside &= zz < inf
+                r1 = r0 + inside.shape[0]
+                if planes[0] is not None:
+                    view = planes[0][r0:r1, c0:c1]
+                    np.minimum(view, zz, out=view, where=inside)
+                else:
+                    _d, z2p, has2, lim = planes
+                    inside &= zz > lim[r0:r1, c0:c1]
+                    view = z2p[r0:r1, c0:c1]
+                    np.minimum(view, zz, out=view, where=inside)
+                    has2[r0:r1, c0:c1] |= inside
+                continue
             yy, xx = np.nonzero(inside)
             if yy.size == 0:
                 continue
@@ -2056,28 +2093,32 @@ def rasterize_depth(verts, tris, mvp, width, height, cull='NONE',
     sx, sy, _iw, z, _bw, _src = build_screen_tris(
         clip, tris, width, height, snap=0.0, near_eps=near_eps,
         depth_bits=32)
-    n = width * height
-    d = None
-    for pix, zz in depth_fragments(sx, sy, z, width, height, cull):
-        if d is None:
-            d = np.full(n, np.inf, np.float32)
-        np.minimum.at(d, pix, zz)
-    if d is None:
+    if sx.shape[0] == 0:
         return _blank()
-    z1 = np.where(d == np.float32(np.inf), np.float32(1.0), d).astype(
-        np.float32, copy=False).reshape(height, width)
+    inf = np.float32(np.inf)
+    d = np.full((height, width), inf, np.float32)
+    flat = d.reshape(-1)
+    for pix, zz in depth_fragments(sx, sy, z, width, height, cull,
+                                   planes=(d,)):
+        np.minimum.at(flat, pix, zz)
+    empty = d == inf
+    if empty.all():
+        return _blank()
+    d[empty] = 1.0
     if not second:
-        return z1
-    z2 = np.full(n, 1.0, np.float32)
-    has2 = np.zeros(n, bool)
-    lim = abuf_depth_limit(z1).reshape(-1)
-    for pix, zz in depth_fragments(sx, sy, z, width, height, cull):
-        sel = zz > lim[pix]
+        return d
+    z2 = np.full((height, width), 1.0, np.float32)
+    has2 = np.zeros((height, width), bool)
+    lim = abuf_depth_limit(d)
+    z2f, h2f, limf = z2.reshape(-1), has2.reshape(-1), lim.reshape(-1)
+    for pix, zz in depth_fragments(sx, sy, z, width, height, cull,
+                                   planes=(None, z2, has2, lim)):
+        sel = zz > limf[pix]
         if not sel.any():
             continue
-        np.minimum.at(z2, pix[sel], zz[sel])
-        has2[pix[sel]] = True
-    return z1, z2.reshape(height, width), has2.reshape(height, width)
+        np.minimum.at(z2f, pix[sel], zz[sel])
+        h2f[pix[sel]] = True
+    return d, z2, has2
 
 
 # ---- R251 AA resolve helpers ----

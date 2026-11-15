@@ -669,8 +669,10 @@ def map_roles(scene, settings):
     # every lamp's shadow count: render._build_shadows says whether one
     # exists; unsaid, one is assumed
     quiet = bool(getattr(settings, '_shadow_quiet', False))
-    # the ambient lamps (Ambient Only): once every reader skips them
-    # through one predicate they shade nothing directly
+    # the ambient lamps (Ambient Only): where the module has the one
+    # predicate every reader skips them by, they shade nothing directly
+    # and their map is only promised. Without it an Ambient Only lamp
+    # still lights and shadows as a lamp, and is baked as one
     ambient = globals().get('is_ambient_lamp')
     roles = []
     for light in lights:
@@ -687,6 +689,20 @@ def map_roles(scene, settings):
         else:
             roles.append('bake')
     return roles
+
+
+def planned_map_bytes(scene, settings):
+    """Bytes of depth the maps `build_shadow_maps` would bake now for
+    this scene hold at most (every face counted whole)."""
+    total = 0
+    for light, role in zip(scene.lights or [], map_roles(scene, settings)):
+        if role != 'bake':
+            continue
+        size = _map_size(light, settings)
+        cube = light.type not in ('SUN', 'SPOT') or (
+            light.type == 'SPOT' and spot_map_fov(light) > SPOT_CUBE_FOV)
+        total += (6 if cube else 1) * size * size * 4
+    return total
 
 
 def map_deferred(light):

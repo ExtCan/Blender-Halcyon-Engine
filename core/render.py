@@ -4297,20 +4297,26 @@ def _build_shadows(scene, st, mesh):
     LI.build_shadow_maps(scene, st, cast)
 
 
-def prebake_shadows(scene, st):
+def prebake_shadows(scene, st, limit=None):
     """The frame's shadow maps, built the way render() builds them, for
     a caller that will not shade the frame itself: the worker pool's
     parent bakes here ONCE and the scene it then hands the workers
     carries the maps (LI.adopt_shadow_maps on their side). The steps
     before the build are render()'s own, each idempotent: the vertex
-    format, the world's light, the material override."""
+    format, the world's light, the material override. With `limit`, a
+    set of maps that would hold more bytes than that is not baked at
+    all (False): it would not be handed over."""
     scene.mesh = raster.quantize_mesh(
         scene.mesh, str(getattr(st, 'vertex_quantize', 'NONE')),
         float(getattr(st, 'vertex_units', 64.0)))
     from . import worldlight as _WL
     _WL.sync(scene, lambda: prepare_textures(scene, st))
     over = _apply_material_override(scene, st)
+    if limit is not None and LI.planned_map_bytes(over, st) > limit:
+        LI.drop_shadow_maps(over)
+        return False
     _build_shadows(over, st, over.mesh)
+    return True
 
 
 #: the models whose light loop reads a lamp's shadow apart from the

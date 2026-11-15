@@ -595,14 +595,8 @@ def render_parallel(scene, settings, workers, scene_key=None, progress=None,
     # workers bake their own, as before
     if scene_key is None or scene_key != pool._scene_key:
         try:
-            from . import lights as _lights
             from .render import prebake_shadows
-            prebake_shadows(scene, settings)
-            held = sum(_lights._map_bytes(l.shadow_map)
-                       for l in (scene.lights or ())
-                       if getattr(l, 'shadow_map', None) is not None)
-            if held > POOL_MAP_BYTES:
-                _lights.drop_shadow_maps(scene)
+            prebake_shadows(scene, settings, limit=POOL_MAP_BYTES)
         except Exception:                                       # noqa: BLE001
             pass
     try:
