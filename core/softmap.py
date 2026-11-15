@@ -72,15 +72,16 @@ F filter taps, B search taps)
   6. FILTER: the lamp's penumbra (radius t_f amax texels) and the user's
      Softness S are two blurs of one edge, so the radii add in
      quadrature: r = sqrt((t_f amax)^2 + S^2), fq = r / (t_f amax + S).
-     q = max(2 r / F, 1), st0 = the largest of 1, 2, 4 .. 64 not above q,
+     q = max(6 r / F, 1), st0 = the largest of 1, 2, 4 .. 64 not above q,
      st1 = 2 st0, wb = clamp((q/st0 - sqrt 2) / (2 - sqrt 2), 0, 1). The
      F taps sit at
         p = (u, v) + fq (t_f (a A + b Bv) + S (a, b))
      and each is a BILINEAR compare on the lattice of stride st: texels
      (x0 + {0,1}) st + floor(st/2) with x0 = floor(p.x / st - 0.5) and
      the fractions as weights. lit = mean(st0) (1 - wb) + mean(st1) wb.
-     The lattice ramp is as wide as the tap spacing, so the sum is a
-     continuous ramp at any tap count: no ghost copies, no bands.
+     The lattice ramp is one and a half to three tap spacings wide, so
+     the sum is a continuous ramp at any tap count: no ghost copies, no
+     bands, on a curved receiver either.
 
 A cube map's kernel crosses face seams: a tap that leaves its face reads
 the neighbouring face along the same direction from the lamp, with the
@@ -113,6 +114,18 @@ SEARCH_GROW = 4.0
 SEARCH_PAD = 2.0
 #: the lattice strides above 1 (a comparison ladder on both roads)
 STRIDES = (2.0, 4.0, 8.0, 16.0, 32.0, 64.0)
+#: the lattice stride follows LATTICE * r / F: three times the mean
+#: spacing of the F taps across the kernel. A tap's bilinear ramp is then
+#: wider than the gaps the Vogel disc leaves when it is projected on an
+#: edge's normal, so the taps do not cross a caster's edge one flat step
+#: at a time. At one spacing a ball in a box's penumbra showed the F + 1
+#: levels as stripes (a quarter of the penumbra flat at 16 taps); at two
+#: 4 % was still flat; at three none is, and the widths are the traced
+#: ones (the ramp is a small blur beside the kernel itself). The price is
+#: a coarser reading of a caster's outline under a wide lamp: the edge of
+#: a sliding caster's penumbra wanders by up to 3 texels where it
+#: wandered by 1.5 (radius 0.5 at 7 units, a 512 map)
+LATTICE = 6.0
 SQRT2 = 1.41421356
 SQRT2_SPAN = 0.58578644
 
@@ -552,7 +565,7 @@ def _filter(p, tf, soft, tab_f, fetch, plane, stats=None):
     rl = tf * p.amax
     r = np.sqrt(rl * rl + f32(soft) * f32(soft))
     fq = (r / np.maximum(rl + f32(soft), f32(1e-12))).astype(np.float32)
-    q = np.maximum(f32(2.0) * r / fn, f32(1.0)).astype(np.float32)
+    q = np.maximum(f32(LATTICE) * r / fn, f32(1.0)).astype(np.float32)
     st0 = np.ones(q.shape[0], np.float32)
     for lv in STRIDES:
         st0 = np.where(q >= f32(lv), f32(lv), st0)

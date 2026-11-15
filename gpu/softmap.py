@@ -355,7 +355,7 @@ def shadow_function(i, meta):
          '    float rl = tf * amax;',
          f'    float rtex = sqrt(rl * rl + {_lit(sq)});',
          f'    float fq = rtex / max(rl + {_lit(soft)}, 1e-12);',
-         f'    float q = max(2.0 * rtex / {fn}, 1.0);',
+         f'    float q = max({_lit(SM.LATTICE)} * rtex / {fn}, 1.0);',
          '    float st0 = 1.0;']
     for lv in SM.STRIDES:
         L.append(f'    if (q >= {_f(lv)}) {{ st0 = {_f(lv)}; }}')

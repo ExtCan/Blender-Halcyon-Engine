@@ -385,22 +385,38 @@ def test_a_size_zero_is_the_old_lookup():
 def test_b_the_shadow_keeps_its_mass():
     """size-map-02: a bigger lamp softens its shadow; it does not shrink
     it and a Sun does not lose it. (Old: POINT 7.47 -> 3.6 at radius 0.5,
-    a Sun at 0.2 rad cast nothing.)"""
-    for kind, zero, sizes in (('POINT', 0.0, (0.1, 0.5, 1.0, 2.0)),
-                              ('SPOT', 0.0, (0.1, 0.5, 1.0)),
-                              ('SUN', 0.0, (0.00918, 0.05, 0.2, 0.6)),
-                              ('AREA', 0.0, (0.25, 1.0, 3.0))):
-        sc, st = _prep(kind, zero)
+    a Sun at 0.2 rad cast nothing.) Two readings of 'the same mass': the
+    lamp's own size-0 shadow on the same map, and the traced road's
+    shadow of the same sized lamp -- which is the truer one, since a
+    wider lamp's shadow really does gain a little and the size-0 lookup
+    loses some 6% to its normal offset."""
+    P, cell = _floor_grid()
+    for kind, sizes, large in (('POINT', (0.1, 0.5, 1.0), (2.0,)),
+                               ('SPOT', (0.1, 0.5, 1.0), ()),
+                               ('SUN', (0.00918, 0.05, 0.2, 0.6), ()),
+                               ('AREA', (0.25, 1.0), (3.0,))):
+        sc, st = _prep(kind, 0.0)
         m0, a0 = _mass(sc, st)
         rows = []
-        ok = m0 > 1.0
-        for size in sizes:
+        ok0 = m0 > 1.0
+        okt = True
+        for size in sizes + large:
             sc, st = _prep(kind, size)
             m, a = _mass(sc, st)
-            rows.append(f'{size:g}: {m:.2f}')
-            ok = ok and abs(m / m0 - 1.0) < 0.15
-        check(f'{kind}: the shadow mass stays within 15% of the size-0 '
-              f'mass ({m0:.2f}) at every size', ok, ', '.join(rows))
+            mr = float((1.0 - _ref(sc, st, P, nsamp=36)).sum() * cell)
+            rows.append(f'{size:g}: {m:.2f} (traced {mr:.2f})')
+            # within 5% of the traced mass; a very large lamp (its far
+            # penumbra stops at the cap) within 10%
+            okt = okt and abs(m / mr - 1.0) < (0.10 if size in large
+                                               else 0.05)
+            # and within 17% of the size-0 mass on the same map (the
+            # traced mass itself moves by 12% over these sizes)
+            ok0 = ok0 and abs(m / m0 - 1.0) < 0.17
+        check(f'{kind}: the shadow mass is the traced one within 5% at '
+              'every size (10% for a very large lamp)', okt,
+              ', '.join(rows))
+        check(f'{kind}: and stays within 17% of the size-0 mass '
+              f'({m0:.2f})', ok0)
     # the umbra is still there under a large lamp: the darkest point
     sc, st = _prep('SUN', 0.2)
     v = _vis(sc, st, _xline(0.5, np.linspace(-0.3, 0.3, 61)))
@@ -522,6 +538,50 @@ def test_d_the_ramp_is_continuous():
     check('thin poles under a radius 0.25 lamp: a continuous shadow that '
           'follows the traced one', worst < 0.12 and rms < 0.04,
           f'largest step {worst:.3f}, rms {rms:.4f}')
+    # a CURVED receiver in a penumbra: the F taps cross the caster's edge
+    # one after another, and on a ball next to a box the levels between
+    # two crossings showed as stripes (16 taps on a lattice as wide as
+    # their spacing: 24% of the penumbra flat; at twice the spacing 4%).
+    # A gradient has no flat patch
+
+    def ball(light, st):
+        return _finish([plane(z=0.0, size=14.0, mat=0, obj=0),
+                        cube(centre=(0.0, 0.0, 1.6), size=1.2, mat=1, obj=1),
+                        sphere(centre=(-2.2, 0.8, 0.6), radius=0.6, mat=1,
+                               obj=1)], light, st)
+    for kind, size in (('AREA', 1.0), ('POINT', 0.5)):
+        st = _settings()
+        lamp = _lamp(kind, size, pos=(2.5, -1.5, 5.0), aim=(0.0, 0.0, 0.8))
+        sc = ball(lamp, st)
+        LI.clear_shadow_cache()
+        LI.build_shadow_maps(sc, st)
+        c = np.array([-2.2, 0.8, 0.6])
+        to = np.asarray(lamp.position, np.float64) - c
+        to /= np.linalg.norm(to)
+        e1 = np.cross(to, [0.0, 0.0, 1.0])
+        e1 /= np.linalg.norm(e1)
+        e2 = np.cross(e1, to)
+        g = np.linspace(-0.75, 0.75, 121)
+        a, b = np.meshgrid(g, g)
+        n = to[None, None, :] * np.sqrt(np.maximum(1.0 - a * a - b * b,
+                                                    0.0))[..., None] \
+            + a[..., None] * e1 + b[..., None] * e2
+        Pb = (c + 0.6 * n).reshape(-1, 3).astype(np.float32)
+        Nb = n.reshape(-1, 3).astype(np.float32)
+        Lb, _rad, db = LI.sample(lamp, Pb, st)
+        t = LI.visibility(lamp, Pb, Nb, Lb.astype(np.float32), db,
+                          st).reshape(a.shape)
+        pad = np.pad(t, 1, mode='edge')
+        nine = np.stack([pad[i:i + t.shape[0], j:j + t.shape[1]]
+                         for i in range(3) for j in range(3)], 0)
+        span = nine.max(0) - nine.min(0)
+        pen = (t > 0.05) & (t < 0.95)
+        flat = float((span[pen] < 1e-4).mean()) if pen.any() else 1.0
+        check(f'{kind} size {size:g}: the penumbra a box casts on a ball '
+              'is a gradient, not stripes (under 1% of it flat)',
+              int(pen.sum()) > 500 and flat < 0.01,
+              f'{flat * 100:.2f}% flat of {int(pen.sum())} samples, '
+              f'{len(np.unique(np.round(t[pen], 4)))} levels')
 
 
 def test_e_the_map_size_does_not_change_the_softness():
@@ -1068,7 +1128,8 @@ def test_n_the_tooltips_say_what_the_dials_do():
           and 'Samples above 1' in soft, soft)
     check("the render's Samples names the 4 taps per sample of a sized "
           'lamp and the hard edge at 1', len(samp) >= 40
-          and '16 to 64' in samp and 'size 0' in samp
+          and '4 taps per sample (16 to 64)' in ' '.join(samp.split())
+          and 'size 0' in samp
           and '1 is a hard edge' in samp, samp)
     lsamp = tip('HalcyonLightSettings', 'shadow_samples')
     check("the lamp's own Samples says so too", '1 is a' in lsamp, lsamp)

@@ -59,9 +59,10 @@ in `<scratch>/wt/map-soft/` (`aud/widths.py`, `aud/stress.py`,
      with the same taps at that radius (none / all -> lit / umbra), and the
      estimate once more from the casters the probe found;
   5. a FILTER of `F = clamp(4 * Samples, 16, 64)` taps, each a bilinear
-     compare on a lattice whose stride follows the radius (two strides
-     cross-faded), so the ramp is continuous at any tap count. The lamp's
-     penumbra and the user Softness add in quadrature.
+     compare on a lattice whose stride follows the radius (three tap
+     spacings, two strides cross-faded), so the ramp is continuous at any
+     tap count, on a curved receiver too. The lamp's penumbra and the user
+     Softness add in quadrature.
   A cube map's kernel crosses face seams by reading the neighbouring face
   along the same direction at lookup (`softmap._CubeFetch`), with the stored
   depth re-expressed along this face's axis. Nothing is added to the baked
@@ -121,6 +122,18 @@ in `<scratch>/wt/map-soft/` (`aud/widths.py`, `aud/stress.py`,
     radius 0.25, four floor lines, 512: 0.089 / 0.180 / 0.270 / 0.363 ->
     0.069 / 0.153 / 0.244 / 0.331; 2048: 0.059 / 0.146 / 0.237 / 0.325;
     traced: 0.059 / 0.150 / 0.242 / 0.326.
+  - *The lattice is three tap spacings wide, not one.* The F taps cross a
+    caster's edge one after another, and with a ramp as wide as their mean
+    spacing the F + 1 levels showed as STRIPES on a curved receiver -- the
+    ball beside the box of the acceptance scene, in real Blender too. Share
+    of the ball's penumbra that is flat (`try_filter.py`): AREA 1.0 24.5 %,
+    POINT 0.5 14.1 %; at two spacings 4.4 % / 0.2 %; at three 0.00 % /
+    0.00 %, and the wall's widths get closer to the traced ones, not
+    further (POINT 0.5, 512 map: 0.131 0.303 0.479 0.599 -> 0.128 0.300
+    0.481 0.650; traced 0.118 0.299 0.480 0.647). Eight taps per sample
+    was the other cure and was not taken: the same stripes gone for 55 %
+    more warm frame (0.82 -> 1.27 s on the two-point-lamp frame). The
+    price of the wide lattice is under Limits (a sliding caster).
   - V *No softness factor in the offset.* A sized lamp no longer erodes at
     any Softness (below).
   - V *The plain mean of the blocker depths on both roads* (the prototype's
@@ -318,6 +331,13 @@ bake is the same code). The prototype's cold 2048 point frame was 11.3 s.
   a handful of steps of 0.25 appear on a line of 2800 samples, under radius
   1.0 up to 0.44 (0.26 at Samples 16). The cure is a conservative depth
   pyramid for the search, not more taps; see the follow-up.
+- **A sliding caster under a wide lamp.** The lattice that removes the
+  stripes reads a caster's outline every few texels, so the penumbra's
+  50 % line does not follow a sliding caster exactly: over an 8-texel
+  slide it wanders by 3.4 texels peak to peak for POINT radius 0.5 at 7
+  units on a 512 map (1.5 with the lattice at one tap spacing), 1.7 for
+  SPOT 1.0, 0.5 for POINT 0.25, 0.9 for SUN 0.1 (`try_wobble.py`). More
+  Samples narrow the lattice; so does a larger map.
 - **Resolution.** Every edge carries the map's own texel and the user
   Softness (1 texel at the default): a Sun over a 14-unit scene on a 512 map
   cannot be sharper than about 0.06 at the contact.
