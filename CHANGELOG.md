@@ -1858,9 +1858,12 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   -- "would not compile: unexpected character" -- so it shades on the
   CPU, correctly, but never on the GPU; the shader compiler accepts an
   undeclared identifier (`vec4(nothing, ...)` compiles with no error and
-  no warning, raises "unknown identifier" when it runs, and the node
-  reads zeros with nothing in the report); and the Bump pre-pass still
-  covers the material's own tree only.
+  no warning and raises "unknown identifier" only when it runs: the node
+  reads zeros and the export warns of nothing); and the Bump pre-pass
+  still covers the material's own tree only, so a group's Bump is cut at
+  shading-batch boundaries on a frame whose pre-pass runs (the same
+  chain in the material's own tree and in a group: 0.35 apart along two
+  rows at 320x240, nothing at 128x96).
 - **A uniform the driver stripped never fails a pass (the llvmpipe field
   log).** A real Blender 5.2.2 session on the OpenGL backend (Mesa
   llvmpipe) printed, for every GPU frame, `rasterising on the CPU: raster
