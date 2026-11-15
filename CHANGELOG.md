@@ -1644,6 +1644,17 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   too, as a 4.30 compute shader in all eight variants under the header the
   CreateInfo writes: 623 sources compile, 15 are refused by name before
   the driver, none is rejected.
+- **Two handler-stub leftovers in the suite, closed.** (1)
+  `test_mesh_export_cache` proved "without bpy handlers the cache never
+  arms" by leaning on a stub that had no `bpy.app.handlers` at all; the
+  stub has modelled them since the persistent-handler fix, so
+  `export.register()` armed and the check failed in every run. The test
+  takes the handlers away for that one call and restores them. (2)
+  `test_append_watch` installed a one-list `bpy.app.handlers` and never
+  returned it, so every module after LEGACY in `run_all` ran against a
+  namespace with no `persistent` and no undo / load lists (the Coded
+  Shader test above raised on it in the full run); the stub is lent
+  inside a try / finally and restored, and the test checks the hand-back.
 - **A colour wired straight into a shader socket is an Emission on both
   roads (the deferred pass qualified and drew it as the albedo).** A
   Material Output whose Surface socket is fed by a COLOUR output -- no
