@@ -1383,11 +1383,13 @@ def test_c057_class_carry():
     cls_n = R.vertex_light_corners(job_n, 1, 'FACE', st_n)[sel * 3, 3]
     check('with NO lamps every face is SHADOW', bool(np.all(cls_n == 1.0)))
     # (i) ordering-independence: FIRST 1 vs 8 with no highlight class
-    def class_map(light_limit_mode, max_lights, swap=False):
+    def class_map(light_limit_mode, max_lights, swap=False, key_energy=None):
         st = _settings(force_model='MEGA_DRIVE_SH',
                        light_limit_mode=light_limit_mode, max_lights=max_lights)
         sc = demo_scene(st, with_texture=False)
         sc.materials[1].specular_level = 0.0
+        if key_energy is not None:
+            sc.lights[0].energy = key_energy
         if swap:
             sc.lights = [sc.lights[1], sc.lights[0]]
         _g, job = _job_for(sc, st)
@@ -1400,15 +1402,26 @@ def test_c057_class_carry():
     c = class_map('FIRST', 8, swap=True)
     check('(ii) swapping Key and Fill changes the class map (the key is the '
           'first lamp)', not np.array_equal(b, c))
+    # R254: BRIGHTEST ranks on what a lamp DELIVERS (a Sun's strength
+    # against a point lamp's watts after 4 pi and its falloff over the
+    # scene), through LI.frame_lights. The demo's Key (Sun 6.0 -> 5.68)
+    # now outranks its 600 W Fill (0.96) -- the old pin, the Sun losing
+    # on raw energy, WAS the defect -- so the culled-key case this check
+    # is about takes a Key of strength 0.5 (0.47 < 0.96)
     st_b = _settings(force_model='MEGA_DRIVE_SH', light_limit_mode='BRIGHTEST',
                      max_lights=1)
     sc_b = demo_scene(st_b, with_texture=False)
-    active = LI.select_lights(sc_b.lights, st_b)
+    check('(iii-a) BRIGHTEST at max_lights 1 keeps the demo Key: a Sun of '
+          'strength 6 delivers more than the 600 W Fill does over the scene',
+          [l.name for l in LI.frame_lights(sc_b, st_b)] == ['Key'],
+          str([l.name for l in LI.frame_lights(sc_b, st_b)]))
+    sc_b.lights[0].energy = 0.5
+    active = LI.frame_lights(sc_b, st_b)
     tri_idx, bary = _ball_samples(sc_b)
     ex = {'want_spec': True, 'want_key_lit': True}
     _rgb, ex = _direct_light(sc_b, st_b, 1, tri_idx, bary, ex)
-    d = class_map('BRIGHTEST', 1)
-    check('(iii) BRIGHTEST at max_lights 1 culls the Key (Fill alone), '
+    d = class_map('BRIGHTEST', 1, key_energy=0.5)
+    check('(iii) BRIGHTEST at max_lights 1 culls a weak Key (Fill alone), '
           'key_lit is never captured and every face is SHADOW',
           [l.name for l in active] == ['Fill'] and 'key_lit' not in ex
           and bool(np.all(d == 1.0)), str([l.name for l in active]))

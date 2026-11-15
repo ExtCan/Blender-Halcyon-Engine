@@ -300,6 +300,20 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                       f"concat {_es.get('concat_ms', 0.0):.0f} ms, "
                       f"other {_es.get('other_ms', 0.0):.0f} ms")
 
+        # R254: the lamps the Light Limit leaves unlit are named, in the
+        # console, in the render's report and (remembered) in the
+        # Lighting panel -- a tenth lamp under the factory limit of 8
+        # used to do nothing, and say nothing
+        if not preview:
+            try:
+                from .core import lights as _LIl
+                _lim = _LIl.limit_report(scene, settings, remember=True)
+                if _lim:
+                    print('[Halcyon] ' + _lim)
+                    warnings.append(_lim)
+            except Exception:                                   # noqa: BLE001
+                pass
+
         # the device plan needs the exported scene, so it runs after the export
         # rather than before it, where `scene` did not yet exist -- the
         # UnboundLocalError went straight into a bare except and the plan has

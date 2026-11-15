@@ -607,6 +607,24 @@ class HALCYON_PT_lighting(HalcyonPanel, Panel):
         sub = col.column()
         sub.active = hs.max_lights > 0
         sub.prop(hs, 'light_limit_mode')
+        # R254: the lamps the last render left unlit, by name -- its own
+        # report (core/lights.limit_report), shown while the limit and
+        # the mode are still the ones that render used. The limit used
+        # to drop lamps without a word anywhere
+        try:
+            from .core.lights import LAST_LIMIT_REPORT as rep
+        except Exception:                                       # noqa: BLE001
+            rep = {}
+        if rep.get('unlit') and rep.get('max_lights') == hs.max_lights \
+                and rep.get('mode') == hs.light_limit_mode:
+            names = ', '.join(rep['unlit'][:4])
+            if len(rep['unlit']) > 4:
+                names += f" and {len(rep['unlit']) - 4} more"
+            note = col.column(align=True)
+            note.label(text=f"Last render: {len(rep['unlit'])} of "
+                            f"{rep.get('total', 0)} lamps not lit",
+                       icon='ERROR')
+            note.label(text=names, icon='BLANK1')
         col.prop(hs, 'light_falloff_default')
         # the repair for lamps brought in via plain File > Append:
         # Blender's own append converts 2.79 energies to its modern
@@ -1604,6 +1622,68 @@ class HALCYON_PT_world_sun(_BrycePanel, Panel):
             sub.prop(hs, 'sun_size')
 
 
+class HALCYON_PT_world_light(HalcyonPanel, Panel):
+    """R254: the world's own luminary as a scene light. Shown for every
+    world type -- one with no sun or moon says so instead of offering a
+    control that could do nothing."""
+    bl_label = "World Light"
+    bl_context = "world"
+    bl_parent_id = 'HALCYON_PT_world'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.engine == ENGINE and context.world is not None
+
+    def draw_header(self, context):
+        from .core import worldlight as _WL
+        hs = context.world.halcyon
+        row = self.layout.row()
+        row.active = hs.mode in _WL.MODES_WITH_LUMINARY
+        row.prop(hs, 'world_light', text="")
+
+    def draw(self, context):
+        from .core import worldlight as _WL
+        layout = self.layout
+        layout.use_property_split = True
+        hs = context.world.halcyon
+        if hs.mode not in _WL.MODES_WITH_LUMINARY:
+            layout.label(text="This world type has no sun or moon to "
+                              "light with", icon='INFO')
+            layout.label(text="Bryce, Physical, a Sky Texture node, an "
+                              "HDRI or a cube map do")
+            return
+        col = layout.column()
+        col.active = bool(hs.world_light)
+        if hs.mode == 'BRYCE':
+            col.label(text="Lit by the Bryce moon" if hs.celestial == 'MOON'
+                      else "Lit by the Bryce sun", icon='LIGHT_SUN')
+        elif hs.mode == 'PHYSICAL':
+            col.label(text="Lit by the Physical sky's sun", icon='LIGHT_SUN')
+        elif hs.mode == 'NODES':
+            col.label(text="Lit by the Sky Texture node's sun",
+                      icon='LIGHT_SUN')
+        else:
+            col.prop(hs, 'world_light_find')
+            if hs.world_light_find == 'MANUAL':
+                col.prop(hs, 'world_light_elevation')
+                col.prop(hs, 'world_light_azimuth')
+                col.prop(hs, 'world_light_color')
+        col.prop(hs, 'world_light_strength')
+        col.prop(hs, 'world_light_shadow')
+        col.prop(hs, 'world_light_shafts')
+        if hs.world_light:
+            said = _WL.LAST_REPORT.get('text', '')
+            if said:
+                layout.label(text=said, icon='INFO')
+            scene = getattr(context, 'scene', None)
+            if any(getattr(ob, 'type', '') == 'LIGHT'
+                   and getattr(getattr(ob, 'data', None), 'type', '') == 'SUN'
+                   for ob in (getattr(scene, 'objects', None) or ())):
+                layout.label(text="The scene's Sun lamps light it as well",
+                             icon='ERROR')
+
+
 class HALCYON_PT_world_atmosphere(_BrycePanel, Panel):
     bl_label = "Atmosphere"
     bl_options = set()
@@ -2492,6 +2572,43 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
                             "its faces do not draw", icon='INFO')
 
 
+#: R254: the distance dials each falloff law reads, as the Light panel's
+#: rows -- (property, label; None = the property's own name). ONE table
+#: for a law chosen on the lamp and for one arriving through Scene
+#: Default; core/lights.attenuate and decay_law are the readers, and
+#: tests/test_r254_falloff.py holds the two against each other (a dial
+#: is drawn exactly when the law reads it). None, Inverse and Inverse
+#: Square read no dial at all.
+FALLOFF_ROWS = {
+    'CUSTOM': (('decay_start', None), ('decay_end', None)),
+    'BI_LINEAR': (('decay_end', "Distance"),),
+    'BI_SQUARE': (('decay_end', "Distance"),),
+    'BI_SLIDERS': (('decay_end', "Distance"), ('decay_ld1', None),
+                   ('decay_ld2', None)),
+    'GL_3TERM': (('decay_ld1', None), ('decay_ld2', None)),
+    'POV_FADE_LINEAR': (('decay_end', None),),
+    'POV_FADE_SQUARE': (('decay_end', None),),
+    'GX_GENTLE': (('decay_end', None),),
+    'GX_MEDIUM': (('decay_end', None),),
+    'GX_STEEP': (('decay_end', None),),
+    'NOMINAL_INVERSE': (('decay_end', "Nominal Distance"),),
+    'NOMINAL_INV_SQUARE': (('decay_end', "Nominal Distance"),),
+}
+
+
+def light_falloff_in_use(hs, scene):
+    """The falloff law a lamp runs: its own, or the render's Light
+    Falloff Default while it is left on Scene Default (core/lights.
+    resolved_decay's panel twin). Without a scene, Inverse Square --
+    the render setting's own default."""
+    mode = str(getattr(hs, 'decay', 'DEFAULT') or 'DEFAULT')
+    if mode == 'DEFAULT':
+        mode = str(getattr(getattr(scene, 'halcyon', None),
+                           'light_falloff_default', None)
+                   or 'INVERSE_SQUARE')
+    return mode
+
+
 class HALCYON_PT_light(HalcyonPanel, Panel):
     bl_label = "Halcyon Light"
     bl_context = "data"
@@ -2523,32 +2640,56 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
             # The BI pair instead: Distance (la->dist, the dist^2/A
             # normalisation) and Gamma (la->k, its pow shaping)
             col.prop(hs, 'decay_end', text="Distance")
+            # R254: the row is a GAIN, not a range -- the form factor is
+            # normalised to this distance, so the lamp's brightness goes
+            # with its square (25, the factory value, is 1250 times a
+            # point lamp of the same Power)
+            note = col.row()
+            note.active = False
+            note.label(text="Brightness scales with Distance squared",
+                       icon='INFO')
             col.prop(hs, 'area_gamma')
-        else:
+        elif light.type != 'SUN':
+            # R254: no falloff rows on a Sun or a hemi -- a directional
+            # lamp never reaches attenuate() on either road, so the menu
+            # and its sliders changed no pixel there
             col.prop(hs, 'decay')
-            if hs.decay == 'CUSTOM':
-                col.prop(hs, 'decay_start')
-                col.prop(hs, 'decay_end')
+            # R254: the rows follow the law the lamp actually RUNS. A
+            # lamp left on Scene Default reads its own distance dials
+            # for whatever law the render chose, and used to draw none
+            # of them (the panel preview and the tests draw without a
+            # scene: Inverse Square, the render's own default)
+            mode = light_falloff_in_use(hs, getattr(context, 'scene', None))
+            if hs.decay == 'DEFAULT' and FALLOFF_ROWS.get(mode):
+                note = col.row()
+                note.active = False
+                note.label(text="This lamp's dials for the render's "
+                                "falloff", icon='INFO')
             # R251 F013: the POV fade distance / GX ref_dist is Falloff
-            # End; GL's kl/kq are the Lin/Quad sliders (BI_SLIDERS reads
-            # them too and drew them nowhere)
-            if hs.decay in ('POV_FADE_LINEAR', 'POV_FADE_SQUARE') or \
-                    hs.decay.startswith('GX_'):
-                col.prop(hs, 'decay_end')
-            if hs.decay in ('NOMINAL_INVERSE', 'NOMINAL_INV_SQUARE'):
-                # R253 (D): Max's R0 / LightWave's Range IS Falloff End
-                col.prop(hs, 'decay_end', text="Nominal Distance")
-            if hs.decay in ('GL_3TERM', 'BI_SLIDERS'):
-                col.prop(hs, 'decay_ld1')
-                col.prop(hs, 'decay_ld2')
-            if hs.decay.startswith('GX_'):
+            # End; GL's kl/kq are the Lin/Quad sliders. R253 (D): Max's
+            # R0 / LightWave's Range IS Falloff End. R254: the three
+            # Blender Internal laws are scaled by it too (their
+            # Distance) and drew it nowhere
+            for name, text in FALLOFF_ROWS.get(mode, ()):
+                if text:
+                    col.prop(hs, name, text=text)
+                else:
+                    col.prop(hs, name)
+            if mode.startswith('GX_'):
                 col.prop(hs, 'gx_ref_brite')
-            if light.type != 'SUN':
-                # R253 (E): 3ds Max's Near Attenuation fade-in (the far
-                # pair is the Custom Range falloff); never on a Sun or
-                # a hemi -- directional lamps carry no attenuation
-                col.prop(hs, 'decay_near_start')
-                col.prop(hs, 'decay_near_end')
+            # R254: Blender Internal's Sphere was exported and clipped
+            # the lamp on every road with no row to see or clear it. The
+            # laws that draw no distance of their own show the one the
+            # Sphere clips at while it is on
+            col.prop(hs, 'bi_sphere')
+            if hs.bi_sphere and not any(
+                    n == 'decay_end' for n, _t in FALLOFF_ROWS.get(mode, ())):
+                col.prop(hs, 'decay_end', text="Sphere Distance")
+            # R253 (E): 3ds Max's Near Attenuation fade-in (the far
+            # pair is the Custom Range falloff); never on a Sun or
+            # a hemi -- directional lamps carry no attenuation
+            col.prop(hs, 'decay_near_start')
+            col.prop(hs, 'decay_near_end')
         if light.type == 'SPOT':
             col.prop(hs, 'hotspot')
             # R253 (A): Blender Internal's Square cone
@@ -3688,6 +3829,7 @@ CLASSES = (
     HALCYON_PT_light, HALCYON_PT_wireframe, HALCYON_PT_outline,
     HALCYON_PT_passes,
     HALCYON_PT_world, HALCYON_PT_world_sun,
+    HALCYON_PT_world_light,
     HALCYON_PT_world_atmosphere, HALCYON_PT_world_cumulus,
     HALCYON_PT_world_stratus, HALCYON_PT_world_effects,
     HALCYON_PT_world_ground, HALCYON_PT_world_weather,

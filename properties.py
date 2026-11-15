@@ -890,9 +890,20 @@ WIRE_MODE = _items(
      "test"),
 )
 LIGHT_LIMIT = _items(
-    ('BRIGHTEST', "Brightest", "Keep the strongest lights"),
-    ('NEAREST', "Nearest", "Keep the closest lights"),
-    ('FIRST', "First", "Keep them in scene order"),
+    ('BRIGHTEST', "Brightest",
+     "Keep the lamps that deliver the most light to the scene: a Sun's "
+     "Strength against a Point or Spot lamp's Power after its own falloff "
+     "and an Area lamp's after its form factor, averaged over the scene's "
+     "bounds. A Spot ranks as the point lamp it is inside its cone. Equal "
+     "lamps keep their scene order; the camera is not consulted"),
+    ('NEAREST', "Nearest",
+     "Keep the lamps closest to the camera. A Sun has no position and "
+     "reaches everything, so it always counts as nearest. The set follows "
+     "the camera: lamps can switch as it moves, as they did in the games"),
+    ('FIRST', "First",
+     "Keep the first lamps in collection order (the Outliner's order with "
+     "Sort Alphabetically off), whatever their strength -- a console's "
+     "fixed light registers"),
 )
 SPEC_VIEWER = _items(
     ('PIXEL', "Per Pixel", "The true eye direction at every shaded point"),
@@ -1544,11 +1555,16 @@ DESCRIPTIONS = {
     'light_falloff_default': "How light dims with distance when a light "
                              "does not choose: physically correct inverse "
                              "square, the gentler inverse, the era's "
-                             "none-at-all, or a custom start/end ramp",
+                             "none-at-all, or a custom start/end ramp. "
+                             "Only the law is set here: each lamp left on "
+                             "Scene Default shapes it with its own distance "
+                             "dials, which its Light panel then shows",
     'light_limit_mode': "Which lights survive when the scene has more than "
-                        "the Light Limit: the brightest, the nearest, or "
-                        "simply the first -- emulating fixed-function "
-                        "hardware's light slots",
+                        "the Light Limit: the ones that deliver the most "
+                        "light, the ones nearest the camera, or simply the "
+                        "first -- emulating fixed-function hardware's light "
+                        "slots. The lamps left out are named in the console, "
+                        "the render's report and under this row",
     # ---------------------------------------------------------- shadows
     'shadows': "Master switch for all shadowing. Off is the flat, "
                "floating look of the earliest real-time output",
@@ -2962,7 +2978,8 @@ DESCRIPTIONS = {
     'depth_sort': "Painter's algorithm reproduces the sorting errors of "
                   "hardware without a depth buffer",
     'max_lights': "Hardware light limit. Lights beyond this are dropped, as on "
-                  "fixed-function pipelines. Zero means unlimited",
+                  "fixed-function pipelines (which ones: Light Limit Mode below; "
+                  "a render names them in its report). Zero means unlimited",
 }
 
 COLOR_FIELDS = {'global_ambient', 'fog_color', 'wire_color',
@@ -3666,18 +3683,23 @@ class HalcyonLightSettings(PropertyGroup):
     decay_start: FloatProperty(name="Falloff Start", default=0.0, min=0.0)
     decay_end: FloatProperty(name="Falloff End", default=25.0, min=0.0)
     decay_ld1: FloatProperty(
-        name="Linear Slider", default=0.0, min=0.0, max=1.0,
-        description="BI's Lin slider (att1): active under the "
-                    "Lin/Quad Sliders falloff while above zero")
+        name="Linear Slider", default=0.0, min=0.0, max=100.0, soft_max=1.0,
+        description="The linear term of two falloffs. Lin/Quad Sliders: "
+                    "Blender Internal's Lin slider (att1), a factor only "
+                    "while above zero, 0 to 1 in 2.79. OpenGL 1.1: "
+                    "GL_LINEAR_ATTENUATION, which may be typed above 1")
     decay_ld2: FloatProperty(
-        name="Quad Slider", default=0.0, min=0.0, max=1.0,
-        description="BI's Quad slider (att2): active under the "
-                    "Lin/Quad Sliders falloff while above zero")
+        name="Quad Slider", default=0.0, min=0.0, max=100.0, soft_max=1.0,
+        description="The quadratic term of two falloffs. Lin/Quad Sliders: "
+                    "Blender Internal's Quad slider (att2), a factor only "
+                    "while above zero, 0 to 1 in 2.79. OpenGL 1.1: "
+                    "GL_QUADRATIC_ATTENUATION, which may be typed above 1")
     bi_sphere: BoolProperty(
         name="Sphere", default=False,
         description="BI's Sphere clamp: the light fades linearly to "
                     "zero at its Falloff End and never reaches past "
-                    "it, whatever the falloff curve")
+                    "it, whatever the falloff curve. Point and Spot "
+                    "lamps; the panel shows the distance it clips at")
     gx_ref_brite: FloatProperty(
         name="Ref Brightness (GX)", default=0.5, min=0.05, max=0.95,
         description="GX_InitLightDistAttn's ref_brite: the fraction of the "
@@ -3734,7 +3756,7 @@ class HalcyonLightSettings(PropertyGroup):
                     "Blender's buffer type were per lamp, and a scene can "
                     "mix a tight midpoint spot with a classic sun")
     shadow_softness: FloatProperty(name="Softness", default=1.0, min=0.0, max=32.0)
-    shadow_samples: IntProperty(name="Samples", default=4, min=1, max=64)
+    shadow_samples: IntProperty(name="Samples", default=0, min=0, max=64)
     shadow_density: FloatProperty(name="Density", default=1.0, min=0.0, max=1.0)
     shadow_color: FloatVectorProperty(name="Shadow Colour", subtype='COLOR', size=3,
                                       default=(0.0, 0.0, 0.0), min=0.0, max=1.0)
@@ -3769,7 +3791,9 @@ class HalcyonLightSettings(PropertyGroup):
         description="Blender Internal's area lamp Gamma (la->k): shapes "
                     "the form-factor energy as pow(intensity, gamma). "
                     "1.0 is linear; below softens the falloff across "
-                    "the lit field, above sharpens it")
+                    "the lit field, above sharpens it. The intensity it "
+                    "raises already carries Distance squared, so above 1 "
+                    "it is a large gain as well as a shape")
     volumetric: FloatProperty(
         name="Volumetric", default=0.0, min=0.0, max=4.0,
         description="Scatters light along the view ray toward this lamp. "
@@ -4259,6 +4283,68 @@ class HalcyonWorldSettings(PropertyGroup):
         description="How a face is sampled: point-sampled (the hard-edged "
                     "1990s look) or bilinear inside the face; a tap never "
                     "crosses into the neighbouring face either way")
+    # ---- R254 World Light: the world's own luminary as a scene light
+    # (core/worldlight.py makes one SUN Light from it at render entry)
+    world_light: BoolProperty(
+        name="World Light", default=False,
+        description="The sky's own sun or moon lights the scene as a real "
+                    "lamp: one Sun light is made from it at render time, "
+                    "aimed from where the sky draws it, casting shadows and "
+                    "counted like any lamp. Bryce and Physical skies give "
+                    "their sun (or the Bryce moon), a Sky Texture node "
+                    "gives its sun, an HDRI or cube map gives its brightest "
+                    "region; the other world types have none")
+    world_light_strength: FloatProperty(
+        name="Strength", default=1.0, min=0.0, soft_max=10.0, max=1000.0,
+        description="Multiplier on the world light's energy. At 1 a "
+                    "surface facing a sun of Sun Intensity 1 squarely "
+                    "reads its own colour; the World Strength and the sun's "
+                    "own intensity scale it too")
+    world_light_shadow: EnumProperty(
+        name="Shadow", default='MAP', items=_items(
+            ('NONE', "None", "The world light casts no shadow at all"),
+            ('MAP', "Shadow Map",
+             "A depth map from the luminary's direction, blurred by its "
+             "angular size (the render settings' map size and bias)"),
+            ('RAY', "Ray Traced",
+             "A shadow ray per sample toward the luminary's disc, soft by "
+             "its angular size")),
+        description="How the world light casts shadows, exactly as a Sun "
+                    "lamp's own Shadow choice does (the render settings' "
+                    "Scene Default shadow mode still overrides per-light "
+                    "choices)")
+    world_light_shafts: FloatProperty(
+        name="Light Shafts", default=0.0, min=0.0, soft_max=2.0, max=10.0,
+        description="The world light's Volumetric amount: above 0 the "
+                    "light-shaft pass streaks from where the sky's sun "
+                    "sits on screen, as it does for a Sun lamp with "
+                    "Volumetric set")
+    world_light_find: EnumProperty(
+        name="Find", default='DETECT', items=_items(
+            ('DETECT', "Detect in Image",
+             "Search the image once for its brightest region and light "
+             "from there in that region's colour; refused by name in the "
+             "console when nothing stands out or two regions tie"),
+            ('MANUAL', "Manual",
+             "Light from the Elevation and Azimuth below in the Colour "
+             "below; nothing is read from the image")),
+        description="Where an HDRI or cube-map world's light comes from: "
+                    "the brightest region found in the image, or a "
+                    "direction and colour set by hand (an 8-bit sky clips "
+                    "its sun and cannot always be searched)")
+    world_light_elevation: FloatProperty(
+        name="Elevation", default=0.7, min=-1.5708, max=1.5708,
+        subtype='ANGLE',
+        description="Manual world light: the angle of the luminary above "
+                    "the horizon, in the sky's own frame (the World "
+                    "Rotation turns it with the picture)")
+    world_light_azimuth: FloatProperty(
+        name="Azimuth", default=0.6, min=-6.2832, max=6.2832,
+        subtype='ANGLE',
+        description="Manual world light: the compass direction of the "
+                    "luminary, measured as the Bryce sun's is (0 = +X, "
+                    "turning toward +Y), in the sky's own frame")
+    world_light_color: _col("Colour", (1.0, 1.0, 1.0))
     cube_face_rot: IntVectorProperty(
         name="Face Turns", size=6, min=0, max=3, default=(0, 0, 0, 0, 0, 0),
         description="Quarter turns applied to each face image before it "
@@ -5010,17 +5096,28 @@ GROUP_DOCS = {
     'HalcyonLightSettings': {
         'decay': "How this light dims with distance: physically correct "
                  "inverse square, the gentler inverse, the era's none, or "
-                 "a custom start/end ramp",
-        'decay_start': "Distance where the custom ramp starts dimming. "
-                       "Closer than this is full brightness",
-        'decay_end': "Distance where the custom ramp reaches zero",
+                 "a custom start/end ramp. Scene Default takes the "
+                 "render's Light Falloff Default and shapes it with this "
+                 "lamp's own distance dials, shown below",
+        'decay_start': "Custom Range only: the distance where the ramp "
+                       "starts dimming; closer than this is full "
+                       "brightness. No other falloff reads it",
+        'decay_end': "This lamp's distance, read by the falloff in use. "
+                     "Custom Range: where the ramp reaches zero. Blender "
+                     "Internal laws: the Distance of half strength. "
+                     "POV-Ray fades: strength 1 here. GX laws: Ref "
+                     "Brightness here. Nominal Distance laws: full "
+                     "strength here. Sphere: the hard edge of the light. "
+                     "Area lamp: the Distance its strength is normalised "
+                     "to, not a range -- brightness scales with Distance "
+                     "squared",
         'shadow': "This light's own shadow method: depth map, traced "
                   "rays, or none -- overriding the scene default when "
                   "the scene is set to Per Light",
         'shadow_softness': "Blur of this light's mapped shadow, in "
                            "shadow-map texels. 0 is hard",
         'shadow_samples': "Taps or rays per pixel for this light's soft "
-                          "shadows",
+                          "shadows. 0 uses the render's Samples",
         'shadow_density': "How dark this light's shadows get. 1 is full "
                           "occlusion; less lets colour bleed through, as "
                           "the era's fake fill lights did",
@@ -5077,6 +5174,9 @@ GROUP_DOCS = {
                        "drag across the celestial sphere",
         'sun_elevation': "Height of the sun above the horizon, in "
                          "radians. Near 0 is sunset; 1.57 is overhead",
+        'world_light_color': "Manual world light: the colour of the "
+                             "light an HDRI or cube-map world throws, used "
+                             "in place of the colour found in the image",
         'sun_rotation': "Compass direction of the sun, in radians",
         'sun_color': "Colour of the sun disc and the light it throws "
                      "into the sky model",

@@ -1338,7 +1338,7 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         edge_vn = np.clip(1.0 - np.abs(M.dot(N, V)), 0.0, 1.0)
 
     lights = active_lights if active_lights is not None else \
-        LI.select_lights(scene.lights, settings)
+        LI.frame_lights(scene, settings)
     # R252: the machine's light limit, per material (the GTE's three
     # rows, the DS's four lights, the RSP's seven): the first N of the
     # scene's selection, in scene order -- the games' own register order
@@ -2612,7 +2612,7 @@ def _stash_ground_light(scene, st, bvh):
         if float(getattr(world, 'ground_lighting', 1.0) or 0.0) <= 0.0:
             return
         from . import lights as LI
-        lts = LI.select_lights(getattr(scene, 'lights', []) or [], st)
+        lts = LI.frame_lights(scene, st)
         if not lts:
             return
         world._ground_light = _make_ground_light(scene, st, bvh, lts)
@@ -2843,7 +2843,7 @@ class ShadeJob:
         # R253 (H): a job built without render() (the GPU plan rigs)
         # still packs the frame's style gains; idempotent after render's
         LI.apply_light_styles(scene)
-        self.lights = LI.select_lights(scene.lights, settings)
+        self.lights = LI.frame_lights(scene, settings)
         self.unsupported = set()
         self._obj_matrices = None
         self._bounds = None
@@ -4687,6 +4687,10 @@ def render(scene, settings=None, progress=None, band=None):
         scene.mesh, str(getattr(st, 'vertex_quantize', 'NONE')),
         float(getattr(st, 'vertex_units', 64.0)))
     scene.last_gel = None       # R251 C134: rebuilt below, beside last_depth
+    # R254: the world's own luminary joins scene.lights here, before any
+    # consumer reads the list (idempotent; untouched with the toggle off)
+    from . import worldlight as _WL
+    _WL.sync(scene, lambda: prepare_textures(scene, st))
     scene = _apply_material_override(scene, st)
     collect_exclusive_lights(scene)
     mesh = scene.mesh
@@ -4849,6 +4853,7 @@ def render(scene, settings=None, progress=None, band=None):
     need_bvh = st.raytrace or st.ambient_occlusion or \
         getattr(st, 'radiosity', False) or \
         (st.shadows and st.shadow_default == 'RAY') or \
+        _per_light_ray_shadows(scene, st) or \
         _volume_occlusion_wanted(scene, st)
     bvh = None
     if need_bvh and mesh is not None and mesh.tris is not None and mesh.tris.size:
@@ -6153,6 +6158,8 @@ def bake_lightmap(scene, st, obj_index=None, size=512, mode='COMBINED',
     from .nodeeval import desugar_master_bump
     for _m in (scene.materials or ()):
         desugar_master_bump(getattr(_m, 'graph', None))
+    from . import worldlight as _WL
+    _WL.sync(scene, lambda: prepare_textures(scene, st))      # R254
     collect_exclusive_lights(scene)
     textures = prepare_textures(scene, st)
     _build_shadows(scene, st, mesh)
@@ -7222,6 +7229,12 @@ def _cached_bvh(scene, mesh):
     is module-level so it survives the fresh Scene each export creates
     -- an F12 of an unchanged scene, an orbit, and most animation frames
     all skip the build.
+
+    The positions also carry mathx.content_digest, every byte of them:
+    the two strided sums alone kept the old tree -- so ray shadows fell
+    where the object USED to stand -- for a move between the stride's
+    samples, and for one whose components cancel in both sums (an
+    object in the +x +y quadrant moved by (d, -d, 0)).
     """
     v = mesh.verts
     t = mesh.tris
@@ -7230,6 +7243,7 @@ def _cached_bvh(scene, mesh):
     key = (int(v.shape[0]), int(t.shape[0]),
            round(float(v[::stride].sum()), 3),
            round(float(np.abs(v[::stride]).sum()), 3),
+           M.content_digest(v),
            int(t[::tstride].astype(np.int64).sum()))
     hit = _BVH_CACHE.get(key)
     if hit is not None:
@@ -8314,6 +8328,20 @@ def _fog_coverage_note_z(zd, settings):
 _VOLUME_KINDS = ('SPOT', 'POINT', 'AREA')
 
 
+def _per_light_ray_shadows(scene, st):
+    """True when Shadow Method = Per Light and some lamp's own menu
+    says Ray Traced: that lamp needs the BVH exactly as the scene-wide
+    Ray Traced method does. Without it `visibility` found no BVH and
+    the lamp cast nothing unless Ray Tracing or AO happened to be on."""
+    if not (st.shadows and getattr(st, 'ray_shadows', True)
+            and st.shadow_default == 'PER_LIGHT'):
+        return False
+    return any(str(getattr(l, 'shadow', 'MAP')) == 'RAY'
+               and str(getattr(l, 'type', 'POINT')).upper()
+               not in ('HEMI', 'AMBIENT')
+               for l in (getattr(scene, 'lights', None) or ()))
+
+
 def _volume_occlusion_wanted(scene, st):
     """True when any drawn beam asked to be shadowed (needs the BVH)."""
     if not getattr(st, 'spot_cones', False):
@@ -9293,9 +9321,11 @@ def _light_volumes(img, scene, st, gbuf, vp, eye, w, h, bvh=None,
                                          dl * (1.0 - 1e-3))
                 return out
         reach_l = reach
-        if str(getattr(light, 'decay', '')) == 'CUSTOM':
+        if LI.resolved_decay(light, st) == 'CUSTOM':
             # Custom Range's end is the lamp's own idea of how far it
             # reaches; the beam honours it rather than growing a dial
+            # (R254: whether the law is chosen on the lamp or arrives
+            # through Scene Default)
             reach_l = min(reach, max(float(getattr(light, 'decay_end',
                                                    reach)), 1e-3))
         scatter = marchers[kind](

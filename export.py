@@ -13,7 +13,7 @@ import numpy as np
 from . import compat
 from .core.scene import (Camera, ImageBuffer, Light, Material, MeshData,
                          ObjectInfo, Scene, World)
-from .shaders.compiler import try_compile
+from .shaders.compiler import compile_node
 from .core import console as _console
 
 SOCKET_KIND = {
@@ -163,7 +163,10 @@ NODE_PROPS = {
     'HALCYON_RampNode': ('space', 'stops', 'positions', 'easing'),
     'HALCYON_BlurNode': ('taps',),
     'ShaderNodeTexGabor': ('gabor_type',),
-    'HALCYON_CodeNode': ('language', 'as_surface', 'source_text'),
+    # R253 (review): NOT source_text. This table copies properties
+    # verbatim, and the node's inline source is only one of its two
+    # sources; _node_props ships the RESOLVED one under that key
+    'HALCYON_CodeNode': ('language', 'as_surface'),
     # the retro utilities. Dither's pattern and Depth Cue's falloff were
     # MISSING from this table from the day those nodes shipped: the
     # evaluator read the prop, the exporter never copied it, and both
@@ -228,7 +231,13 @@ CURVE_NODES = {'ShaderNodeRGBCurve': 4, 'ShaderNodeFloatCurve': 1,
 VALUE_NODES = {'ShaderNodeRGB', 'ShaderNodeValue', 'ShaderNodeNormal'}
 
 
-def _node_props(node, images, programs, warnings):
+def _node_props(node, images, programs, warnings, key=None):
+    """One node's shipped properties. `key` is the node's graph id
+    (`node_id`): what a Coded Shader's compiled program is filed under.
+    Left out, it is the node's bare name -- right for a node of the
+    material's own tree and for nothing below it."""
+    if key is None:
+        key = node_id(node.name)
     props = {}
     for name in NODE_PROPS.get(node.bl_idname, ()):
         if hasattr(node, name):
@@ -345,11 +354,31 @@ def _node_props(node, images, programs, warnings):
             props['direction'] = socket_default(outs[0]) if outs else [0, 0, 1]
 
     if node.bl_idname == 'HALCYON_CodeNode':
-        prog, err = _compile_node(node)
+        prog, err, src = _compile_node(node)
+        # R253 (review): the graph carries the source the program was
+        # compiled FROM -- the assigned Text when there is one, the inline
+        # source_text when there is none (shaders.compiler.node_source) --
+        # and this is the only line that writes the key. The GPU emitter
+        # inlines props.source_text as GLSL; it used to arrive as a verbatim
+        # copy of the inline property, so a node with a Text assigned ran
+        # the Text on the CPU and the starter shader in the deferred pass.
+        # Riding the graph also puts the Text's contents in the GPU plan's
+        # signature (gpu/shade._mat_sig hashes the graph, not the programs):
+        # an edit in the Text Editor re-plans instead of hitting the cache
+        props['source_text'] = src
+        # R253 (review): filed under the node's GRAPH ID, not its name. One
+        # `programs` dict serves the material's tree and every group tree
+        # under it, and a name is unique per tree only: the material's
+        # "Coded Shader" and a group's "Coded Shader" (the default name,
+        # twice) left ONE program, the last compiled, and the other node
+        # ran it under its own sockets. The id is the node's path
+        # (`node_id`), which is what the evaluator and the emitter look a
+        # program up by; the warning names the node the same way, so two
+        # same-named nodes that fail to compile can be told apart
         if prog is not None:
-            programs[node.name] = prog
+            programs[key] = prog
         elif err:
-            warnings.append(f"{node.name}: {err}")
+            warnings.append(f"{key}: {err}")
 
     if node.bl_idname == 'HALCYON_ObjectMapNode':
         # R253: the picked object's frame travels with the material
@@ -451,16 +480,12 @@ def object_map_props(node, warnings):
 
 
 def _compile_node(node):
-    src = ''
-    text = getattr(node, 'source', None)
-    if text is not None and hasattr(text, 'as_string'):
-        src = text.as_string()
-    if not src:
-        src = getattr(node, 'source_text', '') or ''
-    if not src.strip():
-        return None, None
-    lang = getattr(node, 'language', 'GLSL')
-    return try_compile(src, lang)
+    """(program, error, source) of a Coded Shader node, by the one rule
+    the node editor compiles by (shaders.compiler.compile_node -- the same
+    call HALCYON_CodeNode.compile_source makes). R253 (review): this used
+    to resolve the source itself, and differently -- an EMPTY assigned
+    Text fell back to the inline source the editor never looked at."""
+    return compile_node(node)
 
 
 # ------------------------------------------------------------- tree flatten
@@ -497,9 +522,44 @@ def canonical_socket_name(sock):
     return name
 
 
+#: what joins the steps of a group-internal node's path into its graph id
+ID_SEP = '/'
+
+
+def node_id(name, path=''):
+    """A node's id in the serialized graph: its name behind `path`, the
+    id of the group node whose tree it sits in plus ID_SEP ('' for a node
+    of the material's own tree).
+
+    R253 (review): Blender keeps node names unique PER TREE, and a
+    material is several trees -- its own and one per node group, nested
+    to any depth, each instanced any number of times. Everything that is
+    filed per node across the whole material was filed under the bare
+    name: the compiled Coded Shader programs (one dict handed down the
+    group recursion) and the Bump pre-pass fields
+    (`core/render._bump_height_fields`, keyed (material, node id)). Two
+    nodes that shared a name across trees shared the entry. The id is
+    the PATH instead -- 'Coded Shader' in the material, 'Group/Coded
+    Shader' inside the group node 'Group', 'Group.001/Coded Shader'
+    inside a second instance of the same group, 'Outer/Inner/Coded
+    Shader' two levels down -- and it is written in ONE place, here, so
+    the graph's node keys, its links, `group_output` and the `programs`
+    keys cannot disagree.
+
+    A name may itself contain the separator, so each step is escaped
+    ('/' -> '\\/', '\\' -> '\\\\'): no two different paths spell one id
+    -- a node NAMED 'Group/Coded Shader' beside a group node 'Group'
+    holding a 'Coded Shader' included. A name with neither character is
+    its own id, which is every name Blender hands out.
+    """
+    step = str(name).replace('\\', '\\\\').replace(ID_SEP, '\\' + ID_SEP)
+    return path + step
+
+
 def serialize_tree(tree, images, programs, warnings, output_type='OUTPUT_MATERIAL',
-                   depth=0):
-    """Flatten a node tree into plain dicts. Groups recurse."""
+                   depth=0, path=''):
+    """Flatten a node tree into plain dicts. Groups recurse, and every
+    node below the top tree carries its path in its id (`node_id`)."""
     if tree is None or depth > 12:
         return None
     nodes = {}
@@ -507,7 +567,7 @@ def serialize_tree(tree, images, programs, warnings, output_type='OUTPUT_MATERIA
     group_output_id = None
 
     for node in tree.nodes:
-        nid = node.name
+        nid = node_id(node.name, path)
         idname = node.bl_idname
         if idname == 'NodeFrame':
             continue
@@ -516,7 +576,7 @@ def serialize_tree(tree, images, programs, warnings, output_type='OUTPUT_MATERIA
         entry = {
             'id': nid,
             'bl_idname': idname,
-            'props': _node_props(node, images, programs, warnings)
+            'props': _node_props(node, images, programs, warnings, nid)
             if idname != 'NodeMuted' else {},
             'inputs': [],
             'outputs': [],
@@ -530,7 +590,7 @@ def serialize_tree(tree, images, programs, warnings, output_type='OUTPUT_MATERIA
                     oi = list(from_node.outputs).index(lk.from_socket)
                 except ValueError:
                     oi = 0
-                link = [from_node.name, oi]
+                link = [node_id(from_node.name, path), oi]
             entry['inputs'].append({
                 'name': canonical_socket_name(sock),
                 'label': sock.name,
@@ -553,7 +613,8 @@ def serialize_tree(tree, images, programs, warnings, output_type='OUTPUT_MATERIA
 
         if idname == 'ShaderNodeGroup' and getattr(node, 'node_tree', None):
             sub = serialize_tree(node.node_tree, images, programs, warnings,
-                                 output_type=None, depth=depth + 1)
+                                 output_type=None, depth=depth + 1,
+                                 path=nid + ID_SEP)
             entry['group'] = sub
 
         if idname == 'NodeGroupOutput' and getattr(node, 'is_active_output', True):

@@ -118,7 +118,10 @@ class Material:
     # linec/starc; 0 = off), line_color (spec rgb), ring_color (mir
     # rgb), xalpha, soft, shaded, puno (the mode bits).
     halo: Optional[Dict[str, Any]] = None
-    # Cached compiled coded-shader programs keyed by node name.
+    # Compiled coded-shader programs, keyed by the node's GRAPH ID
+    # (export.node_id): its name in the material's own tree, its path
+    # inside a node group ('Group/Coded Shader'). A name alone is unique
+    # per tree only, and this one dict serves every tree of the material.
     programs: Dict[str, Any] = field(default_factory=dict)
     # Filled by the renderer: node names that could not be evaluated.
     unsupported: List[str] = field(default_factory=list)
@@ -225,7 +228,8 @@ class Light:
     shadow_bias: float = 0.0
     shadow_map_depth: str = 'INHERIT'   # INHERIT | CLASSIC | MIDPOINT (R251 C117)
     shadow_softness: float = 1.0      # shadow-map blur radius in texels
-    shadow_samples: int = 4
+    # 0 = inherit the render's Samples (the Map Size / Bias precedent)
+    shadow_samples: int = 0
     shadow_color: tuple = (0.0, 0.0, 0.0)
     shadow_density: float = 1.0
     # Period features
@@ -400,6 +404,19 @@ class World:
     cube_image_ny: Optional[ImageBuffer] = None
     cube_image_pz: Optional[ImageBuffer] = None
     cube_image_nz: Optional[ImageBuffer] = None
+    # ------------------------------------------------ R254 world light
+    # The world's own luminary as a scene light (core/worldlight.py): the
+    # Bryce sun or moon, the Physical sky's sun, a Sky Texture node's sun,
+    # or the sun found in (or typed in for) an HDRI / cube map becomes one
+    # SUN Light at render entry. Off by default: no mode reads the rest.
+    world_light: bool = False
+    world_light_strength: float = 1.0
+    world_light_shadow: str = 'MAP'      # NONE | MAP | RAY
+    world_light_shafts: float = 0.0      # the light's `volumetric`
+    world_light_find: str = 'DETECT'     # DETECT | MANUAL (HDRI / CUBEMAP)
+    world_light_elevation: float = 0.7   # MANUAL: sky-space, radians
+    world_light_azimuth: float = 0.6
+    world_light_color: tuple = (1.0, 1.0, 1.0)
     # ------------------------------------------------ Bryce's Sky Lab
     # Bryce's Sky & Fog palette offered a Sky Mode: Soft Sky drove the dome
     # from the sun's own colour, Custom Sky exposed the three stops directly.
