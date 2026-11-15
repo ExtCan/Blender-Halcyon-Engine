@@ -4846,9 +4846,12 @@ def render(scene, settings=None, progress=None, band=None):
             except Exception:                                   # noqa: BLE001
                 pass
 
+    # traced shadows need the BVH only while Ray Shadows is on: with the
+    # master off `visibility` returns before it touches one (both terms)
     need_bvh = st.raytrace or st.ambient_occlusion or \
         getattr(st, 'radiosity', False) or \
-        (st.shadows and st.shadow_default == 'RAY') or \
+        (st.shadows and getattr(st, 'ray_shadows', True)
+         and st.shadow_default == 'RAY') or \
         _per_light_ray_shadows(scene, st) or \
         _volume_occlusion_wanted(scene, st)
     bvh = None

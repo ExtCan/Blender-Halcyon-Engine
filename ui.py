@@ -672,13 +672,34 @@ class HALCYON_PT_shadows(HalcyonPanel, Panel):
         col = layout.column()
         col.active = hs.shadows
         col.prop(hs, 'shadow_default')
-        if hs.shadow_default == 'PLANAR':
-            col.prop(hs, 'planar_plane_z')          # R251 C052
-        col.prop(hs, 'shadow_map_size')
-        col.prop(hs, 'shadow_map_depth')            # R251 C117
-        col.prop(hs, 'shadow_bias')
-        col.prop(hs, 'shadow_softness')
-        col.prop(hs, 'shadow_samples')
+        method = hs.shadow_default
+        if method in ('PLANAR', 'PER_LIGHT'):
+            # R251 C052. Under Per Light a lamp set to Planar reads it
+            # too (the row used to be hidden there)
+            col.prop(hs, 'planar_plane_z')
+        # the map dials grey when no light can read them, and the
+        # traced pair is reachable here whenever a light can trace --
+        # it used to live only inside the Ray Tracing panel, greyed by
+        # a master switch it does not depend on
+        mapped = col.column()
+        mapped.active = method in ('MAP', 'PER_LIGHT')
+        mapped.prop(hs, 'shadow_map_size')
+        mapped.prop(hs, 'shadow_map_depth')         # R251 C117
+        mapped.prop(hs, 'shadow_bias')
+        mapped.prop(hs, 'shadow_softness')
+        both = col.column()
+        both.active = method in ('MAP', 'RAY', 'PER_LIGHT')
+        both.prop(hs, 'shadow_samples')
+        if method in ('RAY', 'PER_LIGHT'):
+            col.prop(hs, 'ray_shadows')
+            traced = col.column()
+            traced.active = hs.ray_shadows
+            traced.prop(hs, 'ray_bias')
+            if method == 'RAY' and not hs.ray_shadows:
+                note = col.row()
+                note.alert = True
+                note.label(text="Ray Shadows is off: traced lights cast "
+                                "nothing", icon='ERROR')
         col.prop(hs, 'modvol_scale')                # R251 C020
         col.operator('halcyon.adopt_shadow_settings',
                      text="All Lights Use These Settings",
@@ -747,9 +768,14 @@ class HALCYON_PT_raytrace(HalcyonPanel, Panel):
         col.prop(hs, 'ray_depth')
         col.prop(hs, 'ray_reflection')
         col.prop(hs, 'ray_refraction')
-        col.prop(hs, 'ray_shadows')
-        col.prop(hs, 'ray_bias')
-        col.separator()
+        # Ray Shadows and Ray Bias decide every traced shadow whether
+        # or not this panel's master is on (it gates reflections and
+        # refractions): their own column, never greyed by it
+        live = layout.column()
+        live.prop(hs, 'ray_shadows')
+        live.prop(hs, 'ray_bias')
+        col = layout.column()
+        col.active = hs.raytrace
         sub = col.column()
         sub.active = hs.raytrace and hs.ray_reflection
         sub.prop(hs, 'reflection_blur')
@@ -1832,7 +1858,9 @@ class HALCYON_OT_adopt_shadow_settings(Operator):
     sliders -- and every light saved before 1.30.1 carries the old
     per-light defaults (512 / 0.02) explicitly, which is why raising the
     render setting's Shadow Map Size changed nothing in older scenes.
-    This clears the per-light values to 0 = inherit.
+    This clears the per-light overrides to inherit: Map Size, Bias and
+    Samples to 0, Map Depth to Inherit. Softness and Density are the
+    light's own (a multiplier and a strength, not overrides) and stay.
     """
 
     bl_idname = 'halcyon.adopt_shadow_settings'
@@ -1856,13 +1884,92 @@ class HALCYON_OT_adopt_shadow_settings(Operator):
             hs = getattr(light, 'halcyon', None)
             if hs is None:
                 continue
-            if hs.shadow_map_size != 0 or hs.shadow_bias != 0.0:
+            if hs.shadow_map_size != 0 or hs.shadow_bias != 0.0 \
+                    or getattr(hs, 'shadow_samples', 0) != 0 \
+                    or getattr(hs, 'shadow_map_depth',
+                               'INHERIT') != 'INHERIT':
                 hs.shadow_map_size = 0
                 hs.shadow_bias = 0.0
+                # the two overrides the button used to leave behind: a
+                # lamp's own Samples (0 = the render's) and its Map
+                # Depth -- the panel it sits under lists both
+                if hasattr(hs, 'shadow_samples'):
+                    hs.shadow_samples = 0
+                if hasattr(hs, 'shadow_map_depth'):
+                    hs.shadow_map_depth = 'INHERIT'
                 n += 1
         self.report({'INFO'},
                     f"{n} light(s) now inherit the render shadow settings"
                     if n else "Every light already inherits them")
+        return {'FINISHED'}
+
+
+def light_shadow_method(light, hs, sh):
+    """The shadow method that will RUN for one light -- 'NONE', 'MAP',
+    'RAY' or 'PLANAR' -- from the light's own settings `hs` and the
+    render's `sh`, by the renderer's rule (core/lights.visibility): the
+    Shadows master and the light's None veto first, a hemi sun never
+    shadows, then the render's Shadow Method decides for every light
+    unless it is Per Light. The light panel greys its rows by this, not
+    by the light's menu."""
+    if hs.shadow == 'NONE' or (sh is not None and not sh.shadows):
+        return 'NONE'
+    if getattr(light, 'type', '') == 'SUN' and getattr(hs, 'hemi', False):
+        return 'NONE'
+    if not getattr(light, 'use_shadow', True):
+        # Blender's own Shadow checkbox: the export honours it
+        return 'NONE'
+    if sh is None or sh.shadow_default == 'PER_LIGHT':
+        # (no render settings in reach: the light's own menu)
+        return hs.shadow
+    return sh.shadow_default
+
+
+def shadow_method_label(key):
+    """The Shadow Method menu's own label for an item key."""
+    from .properties import SHADOW_MODE
+    for item in SHADOW_MODE:
+        if item[0] == key:
+            return item[1]
+    return str(key).replace('_', ' ').title()
+
+
+def light_has_size(light):
+    """Whether the light's size dial is above zero: Radius for a point
+    or spot, Angle for a sun, Size for an area light."""
+    kind = getattr(light, 'type', '')
+    if kind == 'SUN':
+        return float(getattr(light, 'angle', 0.0) or 0.0) > 0.0
+    if kind == 'AREA':
+        return float(getattr(light, 'size', 0.0) or 0.0) > 0.0
+    return float(getattr(light, 'shadow_soft_size', 0.0) or 0.0) > 0.0
+
+
+class HALCYON_OT_shadows_per_light(Operator):
+    """Set the render's Shadow Method to Per Light.
+
+    Under any other method the render decides for every light and a
+    light's own Shadows menu is only read for None; under Per Light each
+    light uses the method its own menu names. Lights left on their
+    default (Shadow Map) keep mapping.
+    """
+
+    bl_idname = 'halcyon.shadows_per_light'
+    bl_label = "Per-Light Shadow Methods"
+    bl_description = ("Set the render's Shadow Method to Per Light, so "
+                      "that every light casts by the method its own "
+                      "Shadows menu names")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        hs = context.scene.halcyon
+        if hs.shadow_default == 'PER_LIGHT':
+            self.report({'INFO'}, "The Shadow Method is already Per Light")
+            return {'CANCELLED'}
+        hs.shadow_default = 'PER_LIGHT'
+        _poke_updated(context, context.scene)
+        self.report({'INFO'}, "Shadow Method set to Per Light: each light's "
+                              "own Shadows menu now decides")
         return {'FINISHED'}
 
 
@@ -2561,16 +2668,72 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
             # R251 F015: the Model 3 screen spotlight
             col.prop(hs, 'screen_spot')
         col.separator()
+        # The method that will RUN for this lamp is what the rows below
+        # grey by: the lamp's own menu only decides under the render's
+        # Per Light (None always opts the lamp out), a hemi sun casts
+        # nothing, and the Shadows master switches all of it off. The
+        # rows used to grey by the lamp's menu alone -- under render
+        # Shadow Maps a lamp set to Ray Traced drew its live Clip
+        # planes greyed, and under render Ray Traced the dead map rows
+        # drew active
+        sh = getattr(getattr(context, 'scene', None), 'halcyon', None)
+        eff = light_shadow_method(light, hs, sh)
+        # a lamp that would trace while the Ray Shadows master is off
+        # casts nothing: its rows grey and one row says why
+        ray_off = eff == 'RAY' and sh is not None and not sh.ray_shadows
         col.prop(hs, 'shadow')
+        if sh is None:
+            pass
+        elif not sh.shadows:
+            note = col.row()
+            note.active = False
+            note.label(text="Shadows are switched off for the render",
+                       icon='INFO')
+        elif hs.shadow != 'NONE' and not getattr(light, 'use_shadow', True):
+            # Blender's own Shadow checkbox (its sub-panel is not shown
+            # under Halcyon) vetoes the lamp at export
+            note = col.row()
+            note.active = False
+            note.label(text="Blender's own Shadow switch is off for "
+                            "this light", icon='INFO')
+        elif hs.shadow != 'NONE' and light.type == 'SUN' \
+                and getattr(hs, 'hemi', False):
+            note = col.row()
+            note.active = False
+            note.label(text="A hemi light casts no shadows", icon='INFO')
+        elif sh.shadow_default != 'PER_LIGHT' and hs.shadow != 'NONE' \
+                and hs.shadow != sh.shadow_default:
+            # the menu names a method the render's choice overrides:
+            # say so the moment it happens, with the way out beside it
+            note = col.column(align=True)
+            note.active = False
+            note.label(text="The render's Shadow Method is "
+                            + shadow_method_label(sh.shadow_default) + ":",
+                       icon='INFO')
+            note.label(text="this menu is only read under Per Light",
+                       icon='BLANK1')
+            col.operator('halcyon.shadows_per_light',
+                         text="Let Each Light Choose (Per Light)",
+                         icon='LIGHT')
+        if ray_off:
+            note = col.row()
+            note.alert = True
+            note.label(text="Ray Shadows is off: this light casts nothing",
+                       icon='ERROR')
         sub = col.column()
-        sub.active = hs.shadow != 'NONE'
-        sub.prop(hs, 'shadow_map_size')
-        sub.prop(hs, 'shadow_bias')
-        sub.prop(hs, 'shadow_map_depth')            # R251 C117
+        sub.active = eff != 'NONE' and not ray_off
+        if eff == 'PLANAR' and sh is not None:
+            # the one dial a planar lamp reads lives on the render
+            # settings; under Per Light this is where it is reached
+            sub.prop(sh, 'planar_plane_z')
+        mapped = sub.column()
+        mapped.active = eff == 'MAP'
+        mapped.prop(hs, 'shadow_map_size')
+        mapped.prop(hs, 'shadow_bias')
+        mapped.prop(hs, 'shadow_map_depth')         # R251 C117
         if light.type in ('SPOT', 'POINT'):
             # R253 (F): BI's ClipSta / ClipEnd -- the map's planes
-            clip = sub.column()
-            clip.active = hs.shadow == 'MAP'
+            clip = mapped.column()
             clip.prop(hs, 'shadow_clip_start')
             clip.prop(hs, 'shadow_clip_end')
             if hs.shadow_clip_start > 0.0 or hs.shadow_clip_end > 0.0:
@@ -2578,7 +2741,9 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
                 note.active = False
                 note.label(text="The map's near and far planes; "
                                 "0 = automatic", icon='INFO')
-        if hs.shadow_map_size > 0 or hs.shadow_bias > 0.0:
+        if hs.shadow_map_size > 0 or hs.shadow_bias > 0.0 \
+                or hs.shadow_map_depth != 'INHERIT' \
+                or hs.shadow_samples > 0:
             note = sub.row()
             note.active = False
             note.label(text="Overrides the render setting; 0 = inherit",
@@ -2586,8 +2751,20 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
             sub.operator('halcyon.adopt_shadow_settings',
                          text="Use Render Shadow Settings",
                          icon='FILE_REFRESH').scope = 'ACTIVE'
-        sub.prop(hs, 'shadow_softness')
-        sub.prop(hs, 'shadow_samples')
+        mapped = sub.column()
+        mapped.active = eff == 'MAP'
+        mapped.prop(hs, 'shadow_softness')
+        both = sub.column()
+        both.active = eff in ('MAP', 'RAY')
+        both.prop(hs, 'shadow_samples')
+        if eff == 'RAY' and not ray_off and light_has_size(light) \
+                and (hs.shadow_samples
+                     or getattr(sh, 'shadow_samples', 4)) <= 1:
+            # one ray goes to the lamp's centre: the size dial is dead
+            note = sub.row()
+            note.active = False
+            note.label(text="Samples is 1: traced shadows are hard, "
+                            "size is ignored", icon='INFO')
         sub.prop(hs, 'shadow_density')
         sub.prop(hs, 'shadow_color')
         # R219: every lamp kind projects its cookie -- Spot through the
@@ -3667,6 +3844,7 @@ CLASSES = (
     HALCYON_OT_halo_ramp,
     HALCYON_OT_halo_node,                 # R253
     HALCYON_OT_adopt_shadow_settings,
+    HALCYON_OT_shadows_per_light,
 ) + RESOLUTION_MENUS + (
     HALCYON_MT_resolutions, HALCYON_PT_output,
     HALCYON_OT_fix_view_transform,
