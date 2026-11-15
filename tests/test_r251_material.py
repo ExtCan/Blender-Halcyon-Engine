@@ -71,16 +71,18 @@ def _post_kw(sc, st):
                 shaft_sources=getattr(sc, 'last_shafts', None))
 
 
-def _job_for(sc, st, MOD=R):
+def _job_for(sc, st, MOD=R, bvh=None):
     """(gbuf, job) by the sim_vs_cpu recipe (TR:17851-17856), on `MOD`
-    (this tree's core.render, or the 1.89.0 zip's)."""
+    (this tree's core.render, or the 1.89.0 zip's). `bvh` rides on the
+    job as render() hands it over: a RAY-shadowed lamp plans no shadow
+    term without one (`gpu/shade._shadow_meta`)."""
     w, h = st.resolution_x, st.resolution_y
     view, _p, vp, eye = MOD.camera_matrices(sc.camera, w, h)
     g = raster.GBuffer(w, h)
     raster.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g,
                      depth_bits=st.depth_precision)
     MOD._build_shadows(sc, st, sc.mesh)
-    job = MOD.ShadeJob(sc, st, MOD.prepare_textures(sc, st), None, view, eye,
+    job = MOD.ShadeJob(sc, st, MOD.prepare_textures(sc, st), bvh, view, eye,
                        w, h)
     return g, job
 

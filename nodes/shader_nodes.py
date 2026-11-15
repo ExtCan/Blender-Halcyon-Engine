@@ -1708,6 +1708,11 @@ class HALCYON_CodeNode(Node, HalcyonNodeBase):
         prog, err, _src = compile_node(self)
         if prog is None:
             self.error = err or ''
+            # the warning belongs to the program it was compiled with: a
+            # source that is gone, or that no longer compiles, takes it
+            # along (the box used to keep the last good program's line --
+            # unseen while nothing was ever warned of)
+            self.warn = ''
             return None
         self.error = ''
         self.warn = '; '.join(prog.warnings[:3]) if prog.warnings else ''

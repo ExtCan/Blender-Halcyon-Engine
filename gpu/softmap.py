@@ -77,7 +77,12 @@ def shadow_function(i, meta):
     ctx = 'float u, float v, float dr, float gu, float gv, float sl, ' \
           'float cellx, float celly'
     cta = 'u, v, dr, gu, gv, sl, cellx, celly'
-    L = ['uniform sampler2D hal_shadowpack;']
+    # (no `uniform sampler2D hal_shadowpack;` here: gpu/material.assemble_frame
+    # declares the one atlas sampler ONCE per pass, ahead of every mapped
+    # lamp's function -- SHADOWPACK_DECL. A copy opening each sized lamp's
+    # text made the raw pass declare it two or three times, the
+    # redefinition a strict front-end refuses)
+    L = []
     if cube:
         # a depth texel of this face, continued past its edge onto the
         # neighbouring faces (`_CubeFetch`)

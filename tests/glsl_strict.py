@@ -31,10 +31,34 @@ the one place a name the user typed reaches the driver. A name in another
 script ('Señal', Cyrillic, CJK) went into the identifiers letter for
 letter; the tag spells those as code points now, and the pass of each
 compiles here beside the plain names and the two kinds of clash.
+R253 (review): SHADOWS are covered. Every sweep above planned its scene
+with shadows off, so no pass carrying a shadow term had ever been
+compiled here -- and the RAW text of one declared `uniform sampler2D
+hal_shadowpack;` once per mapped lamp: under two (the demo scene's SUN
+and POINT) a redefinition, on the one road that hands a driver the raw
+text (the legacy constructor; CreateInfo's text is stripped). The
+material sweeps run twice now, shadows off and then ON with the demo
+scene's two mapped lamps: the engine models at every rate, the console
+types and options, the cel masters, the coded shaders. And
+`check_shadow_kinds` plans the demo scene under the lamps' other shadow
+kinds -- traced (hard; soft for a SUN's disc, a POINT's sphere, an AREA
+lamp's rectangle and its disk), a mapped lamp beside a traced one (Per
+Light), the MIDPOINT map, a SPOT's single map beside the POINT's cube,
+one to sixteen PCF taps, eight mapped lamps on the one atlas -- with the
+BVH render() builds for traced shadows on the job, and holds each pass to
+the shadow functions its kind names. A shadowed sweep in which NO pass
+carries a shadow function fails by name: it checked nothing, which is how
+shadows stayed unseen. A text glslang has judged is not handed over
+again (the Floor's pass is one text under every console option), so the
+doubled sweeps cost their planning and little else.
 Not covered: the ray kernels (gpu/rtrace, their push constants are listed
-at each call) and the ink pass (built per frame from a job).
+at each call), the ink pass (built per frame from a job), and the lamps
+render() itself adds to a frame before it plans -- a caustics cookie, the
+World Light -- which the job recipe here does not (in a pass they are a
+cookie function and one more mapped SUN).
 """
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -79,11 +103,58 @@ def compile_source(src, stage='frag'):
         os.unlink(path)
 
 
+#: label suffix of a sweep's shadow state (off keeps the 1.92.0 labels)
+_SHADOWS = {False: '', True: ', shadows on'}
+
+#: (stage, text) -> glslang's (ok, message): a text is judged once
+_JUDGED = {}
+
+
+def _frame_bvh(sc, st):
+    """The BVH render() builds for a frame whose shadows are traced
+    (Shadow Method Ray, or Per Light with a Ray lamp), else None. Without
+    one on the job a RAY lamp plans NO shadow term at all
+    (gpu/shade._shadow_meta mirrors the CPU's fully-lit answer), and the
+    pass compiled here would be the unshadowed one."""
+    from ..core import render as R
+    if st.shadows and (st.shadow_default == 'RAY'
+                       or R._per_light_ray_shadows(sc, st)):
+        return R._cached_bvh(sc, sc.mesh)
+    return None
+
+
+def _shadow_fns(src, traced=False):
+    """How many lamps' shadow functions a pass DEFINES: the mapped ones
+    (three arguments, the atlas fetch), or the traced ones (a fourth, the
+    distance)."""
+    tail = r', float dist\)' if traced else r'\)'
+    return len(re.findall(r'^float hal_shadow_vis\d+\(vec3 P, vec3 N, vec3 L'
+                          + tail + r'\s*$', src, re.M))
+
+
+def _shadowed(srcs):
+    """The sources that carry a shadow term, of either kind."""
+    return sum(1 for src in (srcs or ())
+               if _shadow_fns(src) or _shadow_fns(src, traced=True))
+
+
+def _shadows_seen(what, n):
+    """A shadowed sweep whose passes carry no shadow function checked
+    nothing -- say so, and fail: the gate planned shadows off for two
+    rounds and nobody could tell from its output."""
+    print(f'      {n} of those passes carry a shadow term')
+    if n == 0:
+        FAILS.append(f'{what}: shadows on, yet no pass carries a shadow '
+                     'function -- the sweep checked nothing')
+        print(f'  FAIL {what}: shadows on, yet no pass carries a shadow '
+              'function')
+
+
 def _pass_sources(sc, st):
     """The fragment sources of every material pass the plan makes, or
     (None, why) when the plan refuses the frame by name."""
     st.render_device = 'GPU'
-    g, job = _job_for(sc, st)
+    g, job = _job_for(sc, st, bvh=_frame_bvh(sc, st))
     GSH._PLAN_CACHE.clear()
     passes, why, _atl = GSH.plan_frame(job, g)
     if passes is None:
@@ -100,7 +171,10 @@ def _record(label, srcs, why, stage='frag'):
     if srcs is None:
         return 'refused'
     for src in srcs:
-        ok, msg = compile_source(src, stage)
+        key = (stage, src)
+        if key not in _JUDGED:
+            _JUDGED[key] = compile_source(src, stage)
+        ok, msg = _JUDGED[key]
         if not ok:
             FAILS.append(f'{label}: {msg[:400]}')
             print(f'  FAIL {label}\n       {msg[:300]}')
@@ -109,43 +183,57 @@ def _record(label, srcs, why, stage='frag'):
 
 
 def check_models():
-    counts = {'ok': 0, 'refused': 0, 'bad': 0}
-    for ident, _l, _d in SH.MODEL_ITEMS:
-        for rate in ('PIXEL', 'VERTEX', 'FACE'):
-            st = base_settings(24, 18, shadows=False, force_model=ident,
-                               shading_rate=rate)
-            srcs, why = _pass_sources(demo_scene(st), st)
-            counts[_record(f'model {ident} at {rate}', srcs, why)] += 1
-    print(f'  engine models: {counts}')
+    for shadows in (False, True):
+        counts = {'ok': 0, 'refused': 0, 'bad': 0}
+        lit = 0
+        for ident, _l, _d in SH.MODEL_ITEMS:
+            for rate in ('PIXEL', 'VERTEX', 'FACE'):
+                st = base_settings(24, 18, shadows=shadows, force_model=ident,
+                                   shading_rate=rate)
+                srcs, why = _pass_sources(demo_scene(st), st)
+                lit += _shadowed(srcs)
+                counts[_record(f'model {ident} at {rate}{_SHADOWS[shadows]}',
+                               srcs, why)] += 1
+        print(f'  engine models{_SHADOWS[shadows]}: {counts}')
+        if shadows:
+            _shadows_seen('engine models', lit)
 
 
 def check_console():
-    counts = {'ok': 0, 'refused': 0, 'bad': 0}
-    for con, _l, _d in CON.CONSOLE_ITEMS:
-        for prop in CON.PANEL.get(con, ()):
-            items = next((it for nm, it, _d in CON.ENUM_PROPS if nm == prop), None)
-            vals = [it[0] for it in items] if items else [None]
-            for v in vals:
-                props = {'console': con}
-                if v is not None:
-                    props[prop] = v
-                else:
-                    props[prop] = {'luma_gamma': 0.5, 'm3_sun_clamp': False,
-                                   'm3_alpha_steps': True, 'light_limit': True,
-                                   'pc_color_vertex': True, 'pc_local_viewer': False,
-                                   'toon_steps': 4}.get(prop, True)
-                for rate in ('MACHINE', 'SCENE'):
-                    for shading in ('VERTEX', 'PIXEL'):
-                        sc, st = console_scene(dict(props, rate=rate), w=24, h=18,
-                                               shading_rate=shading)
-                        srcs, why = _pass_sources(sc, st)
-                        counts[_record(f'console {con} {prop}={props[prop]} '
-                                       f'{rate}/{shading}', srcs, why)] += 1
-    print(f'  console types and options: {counts}')
+    for shadows in (False, True):
+        counts = {'ok': 0, 'refused': 0, 'bad': 0}
+        lit = 0
+        for con, _l, _d in CON.CONSOLE_ITEMS:
+            for prop in CON.PANEL.get(con, ()):
+                items = next((it for nm, it, _d in CON.ENUM_PROPS if nm == prop), None)
+                vals = [it[0] for it in items] if items else [None]
+                for v in vals:
+                    props = {'console': con}
+                    if v is not None:
+                        props[prop] = v
+                    else:
+                        props[prop] = {'luma_gamma': 0.5, 'm3_sun_clamp': False,
+                                       'm3_alpha_steps': True, 'light_limit': True,
+                                       'pc_color_vertex': True, 'pc_local_viewer': False,
+                                       'toon_steps': 4}.get(prop, True)
+                    for rate in ('MACHINE', 'SCENE'):
+                        for shading in ('VERTEX', 'PIXEL'):
+                            sc, st = console_scene(dict(props, rate=rate), w=24, h=18,
+                                                   shading_rate=shading)
+                            # (the console scene is built with shadows off;
+                            # its lamps are the demo scene's two mapped ones)
+                            st.shadows = shadows
+                            srcs, why = _pass_sources(sc, st)
+                            lit += _shadowed(srcs)
+                            counts[_record(f'console {con} {prop}={props[prop]} '
+                                           f'{rate}/{shading}{_SHADOWS[shadows]}',
+                                           srcs, why)] += 1
+        print(f'  console types and options{_SHADOWS[shadows]}: {counts}')
+        if shadows:
+            _shadows_seen('console types and options', lit)
 
 
 def check_masters():
-    counts = {'ok': 0, 'refused': 0, 'bad': 0}
     graphs = {
         'anime': _one_bsdf_graph('HALCYON_AnimeShaderNode',
                                  [_sk('Diffuse Color', 'RGBA', [0.8, 0.3, 0.3, 1]),
@@ -159,14 +247,108 @@ def check_masters():
                                     _sk('Emission Strength', 'VALUE', 0.0)],
                                    {'shadow_mode': 'PAINTED'}),
     }
-    for name, graph in graphs.items():
-        for rate in ('PIXEL', 'VERTEX'):
-            st = base_settings(24, 18, shadows=False, shading_rate=rate)
-            sc = demo_scene(st)
-            sc.materials[1].graph = graph
-            srcs, why = _pass_sources(sc, st)
-            counts[_record(f'{name} master at {rate}', srcs, why)] += 1
-    print(f'  cel masters: {counts}')
+    for shadows in (False, True):
+        counts = {'ok': 0, 'refused': 0, 'bad': 0}
+        lit = 0
+        for name, graph in graphs.items():
+            for rate in ('PIXEL', 'VERTEX'):
+                st = base_settings(24, 18, shadows=shadows, shading_rate=rate)
+                sc = demo_scene(st)
+                sc.materials[1].graph = graph
+                srcs, why = _pass_sources(sc, st)
+                lit += _shadowed(srcs)
+                counts[_record(f'{name} master at {rate}{_SHADOWS[shadows]}',
+                               srcs, why)] += 1
+        print(f'  cel masters{_SHADOWS[shadows]}: {counts}')
+        if shadows:
+            _shadows_seen('cel masters', lit)
+
+
+def _spot(k=0):
+    from ..core.scene import Light
+    return Light(type='SPOT', name=f'Spot {k}', position=(0.5 - k, -3.0, 5.0),
+                 direction=(-0.1, 0.5, -0.85), color=(1.0, 0.9, 0.8),
+                 energy=300.0, shadow='MAP', spot_size=1.0)
+
+
+def _area(shape):
+    from ..core.scene import Light
+    return Light(type='AREA', name='Area', position=(0.0, -1.0, 5.0),
+                 direction=(0.0, 0.0, -1.0), energy=500.0, shadow='RAY',
+                 area_size=(1.5, 1.0), area_shape=shape)
+
+
+def _kind_soft(sc):
+    sc.lights[0].radius = 0.05          # a SUN's size is an angle
+    sc.lights[1].radius = 0.3           # a POINT's a sphere
+
+
+def _kind_point_traced(sc):
+    sc.lights[1].shadow = 'RAY'
+
+
+#: (label, settings, scene edit, mapped functions, traced functions, soft)
+#: -- the demo scene's SUN and POINT under each kind of shadow a lamp can
+#: cast into a deferred pass, and what every pass must then define
+SHADOW_KINDS = (
+    ('two mapped lamps, one PCF tap', {'shadow_samples': 1}, None, 2, 0, False),
+    ('two mapped lamps, nine PCF taps', {'shadow_samples': 9}, None, 2, 0, False),
+    ('two mapped lamps, sixteen PCF taps', {'shadow_samples': 16}, None, 2, 0, False),
+    ('two mapped lamps, softness 0', {'shadow_softness': 0.0}, None, 2, 0, False),
+    ('the MIDPOINT map', {'shadow_map_depth': 'MIDPOINT'}, None, 2, 0, False),
+    ("a SPOT's single map beside the SUN's and the POINT's cube", {},
+     lambda sc: sc.lights.append(_spot()), 3, 0, False),
+    ('eight mapped lamps on the one atlas', {},
+     lambda sc: sc.lights.extend(_spot(k) for k in range(6)), 8, 0, False),
+    ('two traced lamps, hard', {'shadow_default': 'RAY'}, None, 0, 2, False),
+    ("two traced lamps, soft (a SUN's disc, a POINT's sphere)",
+     {'shadow_default': 'RAY', 'shadow_samples': 4}, _kind_soft, 0, 2, True),
+    ("a traced AREA lamp, soft over its rectangle",
+     {'shadow_default': 'RAY', 'shadow_samples': 4},
+     lambda sc: sc.lights.append(_area('SQUARE')), 0, 3, True),
+    ("a traced AREA lamp, soft over its disk",
+     {'shadow_default': 'RAY', 'shadow_samples': 4},
+     lambda sc: sc.lights.append(_area('DISK')), 0, 3, True),
+    ('a mapped SUN beside a traced POINT (Per Light)',
+     {'shadow_default': 'PER_LIGHT'}, _kind_point_traced, 1, 1, False),
+    ("a mapped SUN and SPOT beside a soft traced POINT (Per Light)",
+     {'shadow_default': 'PER_LIGHT', 'shadow_samples': 4},
+     lambda sc: (_kind_point_traced(sc), _kind_soft(sc),
+                 sc.lights.append(_spot())), 2, 1, True),
+)
+
+
+def check_shadow_kinds():
+    """R253 (review): the demo scene under each kind of shadow a lamp
+    casts into a deferred pass (SHADOW_KINDS), at the pixel rate -- a
+    vertex-rate pass carries no shadow term, the corners do. Each pass
+    must DEFINE the functions its kind names: a kind that planned
+    something else (a RAY lamp with no BVH on the job plans nothing) is
+    a failure here, not a quiet pass. A refusal is a failure too: every
+    one of these is a frame the deferred road draws."""
+    counts = {'ok': 0, 'refused': 0, 'bad': 0}
+    for label, kw, edit, mapped, traced, soft in SHADOW_KINDS:
+        st = base_settings(24, 18, shadows=True, shading_rate='PIXEL', **kw)
+        sc = demo_scene(st)
+        if edit is not None:
+            edit(sc)
+        srcs, why = _pass_sources(sc, st)
+        label = 'shadows: ' + label
+        got = _record(label, srcs, why)
+        if got == 'refused':
+            FAILS.append(f'{label}: refused ({why})')
+            print(f'  FAIL {label}\n       refused: {why}')
+        elif got == 'ok':
+            seen = sorted({(_shadow_fns(src), _shadow_fns(src, traced=True),
+                            'hal_smp_hash3(sx' in src) for src in srcs})
+            if seen != [(mapped, traced, soft)]:
+                got = 'bad'
+                FAILS.append(f'{label}: the passes define {seen} (mapped, '
+                             f'traced, soft), not {(mapped, traced, soft)}')
+                print(f'  FAIL {label}\n       the passes define {seen}, '
+                      f'not {(mapped, traced, soft)}')
+        counts[got] += 1
+    print(f'  shadow kinds: {counts}')
 
 
 def check_stages():
@@ -235,25 +417,34 @@ def check_coded():
     carry -- the real node class through the real exporter
     (test_r253_review's stand-ins), two coded shaders summed into the
     master. A refusal is a failure HERE: every one of these names is
-    meant to reach the driver. Runs last: it installs the bpy stub."""
+    meant to reach the driver. Shadows off and on: the coded floor's own
+    pass carried the twice-declared atlas sampler under the demo lamps,
+    which is why this check planned with shadows off until the
+    declaration was fixed. Runs last: it installs the bpy stub."""
     import importlib
     from . import fakebpy
     fakebpy.install()
     from . import test_r253_review as RV
     SN = importlib.import_module('halcyon.nodes.shader_nodes')
-    counts = {'ok': 0, 'refused': 0, 'bad': 0}
-    for pair in (('Coded Shader', 'Other'), ('Coded Shader', 'Coded_Shader'), ('Coded', 'Coded B'),
-                 ('Señal', 'Other'), ('Señal', 'Seu00F1al'), ('Шейдер', '色彩'), ('色', '彩'),
-                 ('層３', '\U0001d6fc glow')):
-        graph, programs, _warns = RV._code_exported(RV._code_two(SN, *pair))
-        src, _binds, why = RV._code_pass(graph, programs, shadows=False, size=(24, 18))
-        label = 'coded shaders %r beside %r' % pair
-        got = _record(label, None if src is None else [src], why)
-        if got == 'refused':
-            FAILS.append(f'{label}: refused ({why})')
-            print(f'  FAIL {label}\n       refused: {why}')
-        counts[got] += 1
-    print(f'  coded shaders by node name: {counts}')
+    for shadows in (False, True):
+        counts = {'ok': 0, 'refused': 0, 'bad': 0}
+        lit = 0
+        for pair in (('Coded Shader', 'Other'), ('Coded Shader', 'Coded_Shader'), ('Coded', 'Coded B'),
+                     ('Señal', 'Other'), ('Señal', 'Seu00F1al'), ('Шейдер', '色彩'), ('色', '彩'),
+                     ('層３', '\U0001d6fc glow')):
+            graph, programs, _warns = RV._code_exported(RV._code_two(SN, *pair))
+            src, _binds, why = RV._code_pass(graph, programs, shadows=shadows, size=(24, 18))
+            label = 'coded shaders %r beside %r' % pair + _SHADOWS[shadows]
+            srcs = None if src is None else [src]
+            lit += _shadowed(srcs)
+            got = _record(label, srcs, why)
+            if got == 'refused':
+                FAILS.append(f'{label}: refused ({why})')
+                print(f'  FAIL {label}\n       refused: {why}')
+            counts[got] += 1
+        print(f'  coded shaders by node name{_SHADOWS[shadows]}: {counts}')
+        if shadows:
+            _shadows_seen('coded shaders by node name', lit)
 
 
 def mapped_shadow_cases():
@@ -301,14 +492,15 @@ def check_mapped_shadows():
 def main():
     utf8_console()
     FAILS.clear()
+    _JUDGED.clear()
     if _glslang() is None:
         print('glsl_strict: HALCYON_GLSLANG not set or not found -- the strict '
               'GLSL check did NOT run (build glslang and point the variable at '
               'StandAlone/glslang)')
         return 0
     print(f'glsl_strict: {_glslang()}')
-    for fn in (check_models, check_console, check_masters, check_stages,
-               check_sky_and_kernels, check_mapped_shadows,
+    for fn in (check_models, check_console, check_masters, check_shadow_kinds,
+               check_stages, check_sky_and_kernels, check_mapped_shadows,
                check_compute_raster, check_coded):
         try:
             fn()
@@ -322,7 +514,8 @@ def main():
         for f in FAILS:
             print('  ' + f)
         return 1
-    print('every shader compiles under strict GLSL 4.30')
+    print(f'every shader compiles under strict GLSL 4.30 ({len(_JUDGED)} '
+          'distinct texts)')
     return 0
 
 

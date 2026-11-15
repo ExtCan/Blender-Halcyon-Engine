@@ -1,4 +1,4 @@
-"""Name resolution at compile time.
+"""Name resolution at compile time -- and what else the run would refuse.
 
 The interpreter resolves a name when a lane reaches it: an identifier
 nothing declares, a field a struct does not have, a swizzle past the
@@ -9,6 +9,30 @@ interpreter replaced caught every one of them while it emitted code
 (`undeclared identifier`, `has no field`, `bad swizzle`, `swizzle out of
 range`); `Interpreter.validate` brought back the unknown-function half and
 this module is the rest.
+
+Two more refusals ride the same walk, because it already knows every
+call and the type of every expression:
+
+  counts     a call must pass a count of arguments its function takes. The
+             generator refused the wrong count for a shader's own function
+             (R235); the interpreter dropped the extra arguments and read
+             the missing ones as zero. A builtin with the wrong count
+             raised when a lane reached it, a struct constructor never
+             ran at all. One message for the three
+             (`Interpreter.wrong_count`).
+  widths     two vectors of different widths cannot be combined (`vec2 +
+             vec3`): `gtypes.promote` raised when the operator ran. The
+             types here are the interpreter's own, rule for rule, so the
+             operator is refused exactly where the run would raise. Where
+             the interpreter's type is not the language's -- a matrix
+             times a scalar (typed as a vector), two functions of one
+             name and argument count (the first is taken, whatever the
+             argument types) -- the type is kept, marked `_Loose`, and no
+             width is judged on it or on anything computed from it: a
+             text a driver compiles is not refused on this front-end's
+             own shortcut. (Not modelled: the type table has one sampler
+             type, so `texture()` of a sampler2DShadow is a vec4 here as
+             it is when the shader runs.)
 
 It is a walk of the same tree with the scopes `Interpreter.run`,
 `call_user`, `block` and `loop` build, holding a type where they hold a
@@ -36,15 +60,37 @@ from .builtins import BUILTINS
 from .codegen import FRAG_OUTS, VARYINGS
 from .gtypes import (BOOL, BY_NAME, FLOAT, INT, UINT, VOID, GType, promote,
                      swizzle_indices)
+from .interp import param_default, param_type, struct_type
 from .lexer import ShaderError
 
 #: in scope with no declaration, as GLSL defines it (Interpreter.run binds
 #: the same name into the root)
 BUILTIN_VARS = {'gl_FragCoord': GType('float', 4)}
 
-#: a value nothing is known about: its names were checked, and a field or
-#: swizzle on it is not judged
+#: a value nothing is known about: its names were checked, and a field,
+#: a swizzle or an operator on it is not judged
 UNKNOWN = (None, 0)
+
+_COMPARES = ('==', '!=', '<', '>', '<=', '>=')
+
+
+class _Loose(GType):
+    """The interpreter's type for a value whose type in the language may be
+    another. Every check that asks what the RUN will do reads it as the
+    plain type it is; the width check alone steps around it."""
+    __slots__ = ()
+
+
+def _loose(t, *parents):
+    """`t`, marked loose when any type it was computed from is."""
+    if t is None or isinstance(t, _Loose) or \
+            not any(isinstance(p, _Loose) for p in parents):
+        return t
+    return _Loose(t.base, t.n, t.rows, t.array, t.struct)
+
+
+def _mark(t):
+    return _Loose(t.base, t.n, t.rows, t.array, t.struct)
 
 
 class _Scope:
@@ -110,11 +156,10 @@ class NameCheck:
             for fn in cands:
                 inner = _Scope(root)
                 for p in fn[3]:
-                    ptype = p[1]
-                    if len(p) > 3 and p[3]:
-                        ptype = GType(ptype.base, ptype.n, ptype.rows, p[3],
-                                      ptype.struct)
-                    inner.names[p[2]] = ptype
+                    if param_default(p) is not None:
+                        # read among the globals, where the run reads it
+                        self.expr(param_default(p), root)
+                    inner.names[p[2]] = param_type(p)
                 self.block(fn[4], inner)
 
     # -------------------------------------------------------- statements
@@ -188,7 +233,7 @@ class NameCheck:
             if bt.base == 'struct':
                 for ftype, fname, _farr in self.structs.get(bt.struct, ()):
                     if fname == field:
-                        return ftype, ftype.n
+                        return _loose(ftype, bt), ftype.n
                 raise ShaderError(f'{bt.struct} has no field {field!r}',
                                   _line(node, 3))
             idx = swizzle_indices(field)
@@ -207,31 +252,22 @@ class NameCheck:
                 return UNKNOWN
             if bt.array:
                 et = bt.elem()
-                return et, et.n
+                return _loose(et, bt), et.n
             if bt.is_matrix:
-                return GType(bt.base, bt.rows), bt.rows
-            return GType(bt.base, 1), 1
+                return _loose(GType(bt.base, bt.rows), bt), bt.rows
+            return _loose(GType(bt.base, 1), bt), 1
         if k == 'call':
             return self.call(node, scope)
         if k == 'bin':
-            (at, aw), (bt, bw) = (self.expr(node[2], scope),
-                                  self.expr(node[3], scope))
-            op = node[1]
-            if op in ('&&', 'and', '||', 'or', '==', '!=', '<', '>', '<=',
-                      '>='):
-                return BOOL, 1
-            if at is None or bt is None:
-                return UNKNOWN
-            if op == '*' and (at.is_matrix or bt.is_matrix):
-                if at.is_matrix and bt.is_matrix:
-                    return at, at.n
-                if at.is_matrix:
-                    return GType(at.base, at.rows), max(at.rows, bw)
-                return GType(bt.base, bt.n), max(bt.n, aw)
-            return self._promote(at, bt, max(aw, bw))
+            a, b = self.expr(node[2], scope), self.expr(node[3], scope)
+            return self.binary(node[1], a, b, _line(node, 4))
         if k == 'assign':
-            self.expr(node[3], scope)
+            v = self.expr(node[3], scope)
             tt, tw = self.expr(node[2], scope)
+            if node[1] != '=':
+                # `a += b` runs as `a + b` (Interpreter.assign), so it
+                # combines the two the same way
+                self.binary(node[1][:-1], (tt, tw), v, _line(node, 4))
             # the interpreter answers a plain variable's own type; what a
             # field, swizzle or element write answers is its own affair
             return (tt, tw) if node[2][0] == 'var' else UNKNOWN
@@ -241,7 +277,7 @@ class NameCheck:
                                   self.expr(node[3], scope))
             if at is None or bt is None:
                 return UNKNOWN
-            return self._promote(at, bt, max(aw, bw))
+            return self._promote(at, bt, max(aw, bw), _line(node, 4))
         if k in ('post', 'pre'):
             return self.expr(node[2], scope)
         if k == 'un':
@@ -266,32 +302,75 @@ class NameCheck:
             return self.expr(node[2], scope)
         return UNKNOWN
 
+    def binary(self, op, a, b, line):
+        """(type, width) of `a op b` by Interpreter.binary's rules, refusing
+        the two widths its promote would refuse."""
+        (at, aw), (bt, bw) = a, b
+        if op in ('&&', 'and', '||', 'or', '^^'):
+            return BOOL, 1
+        if at is None or bt is None:
+            return (BOOL, 1) if op in _COMPARES else UNKNOWN
+        if op in _COMPARES:
+            # compared through the same promote as the arithmetic
+            self._promote(at, bt, 1, line)
+            return BOOL, 1
+        if op == '*' and (at.is_matrix or bt.is_matrix):
+            if at.is_matrix and bt.is_matrix:
+                return _loose(at, bt), at.n
+            if at.is_matrix:
+                t, w = GType(at.base, at.rows), max(at.rows, bw)
+            else:
+                t, w = GType(bt.base, bt.n), max(bt.n, aw)
+            other = bt if at.is_matrix else at
+            if other.n == 1:
+                # matrix * scalar: a vector by the interpreter's rule (which
+                # cannot run it), a matrix in the language
+                return _mark(t), w
+            return _loose(t, at, bt), w
+        return self._promote(at, bt, max(aw, bw), line)
+
     @staticmethod
-    def _promote(at, bt, width):
+    def _promote(at, bt, width, line=0):
         if at.base == 'struct' or bt.base == 'struct' or at.array or bt.array:
             return UNKNOWN
         try:
-            return promote(at, bt), width
-        except ShaderError:
-            return UNKNOWN          # a TYPE error; the run reports those
+            return _loose(promote(at, bt), at, bt), width
+        except ShaderError as exc:
+            if isinstance(at, _Loose) or isinstance(bt, _Loose):
+                return UNKNOWN      # not this walk's to judge; the run's
+            # promote's own refusal, with the line of the operator: this is
+            # where the run raised it, when a lane got that far
+            raise ShaderError(exc.msg, line)
 
     def call(self, node, scope):
         name, args = node[1], node[2]
         vals = []
         for a in args:              # a loop, not a comprehension: the walk
             vals.append(self.expr(a, scope))    # is never deeper than the run
+        line = _line(node, 3)
+        bad = self.it.wrong_count(name, len(args))
+        if bad:
+            raise ShaderError(bad, line)
+        if name in self.structs:                # a constructor, one argument
+            return struct_type(name), 1         # per field
         t = BY_NAME.get(name)
-        if t is None and name in self.structs:
-            t = GType('struct', 1, 1, 0, name)
         if t is not None:                       # a constructor
             return t, t.n
-        fn = self.it.pick(name, len(args))
-        if fn is not None:
+        cands = self.funcs.get(name)
+        if cands:
+            fn = self.it.pick(name, len(args))
             rtype = fn[1] if fn[1] != VOID else FLOAT
+            fits = [f for lo, hi, f in self.it.overloads[name]
+                    if lo <= len(args) <= hi]
+            if any(f[1] != fn[1] for f in fits):
+                # two functions of this name take this many arguments and
+                # answer different types: the run calls the first, a driver
+                # the one the argument types choose
+                return _mark(rtype), rtype.n
             return rtype, rtype.n
         impl = BUILTINS.get(name)
         if impl is None:
-            raise ShaderError(f'unknown function {name!r}', _line(node, 3))
+            raise ShaderError(f'unknown function {name!r}', line)
         types = [v[0] for v in vals]
         width = max([v[1] for v in vals] or [1])
         if any(a is None for a in types):
@@ -299,8 +378,15 @@ class NameCheck:
         rule = impl[1]
         try:
             rtype = rule(types) if callable(rule) else rule
+        except ShaderError as exc:
+            if any(isinstance(t, _Loose) for t in types):
+                return UNKNOWN
+            # min(vec2, vec3): the rule combines its arguments through the
+            # same promote, and the run raised from it (or from NumPy, on
+            # the two shapes, a step earlier)
+            raise ShaderError(exc.msg, line)
         except Exception:                                       # noqa: BLE001
-            return UNKNOWN          # too few arguments for the rule to read
+            return UNKNOWN          # not a rule this walk can read
         if rtype is None:
             rtype = types[0] if types else FLOAT
-        return rtype, max(rtype.n, width)
+        return _loose(rtype, *types), max(rtype.n, width)
