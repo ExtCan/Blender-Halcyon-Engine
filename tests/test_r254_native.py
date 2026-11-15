@@ -17,6 +17,7 @@ pins something that must NOT have moved.
         Square flag, a lobe factor of 0, the lamp object's ray visibility
     (h) the Light panel: one Halcyon-owned panel with the rows the engine
         reads, Cast Shadow among them; the stock panels are not forced
+    (i) an Area lamp mirrored across one face axis keeps shining
 
     python -m halcyon.tests.test_r254_native
 """
@@ -1188,7 +1189,7 @@ def test_e_spot_object_scale():
           int(live.sum()) > 40 and float(np.median(rel)) < 0.02
           and float(np.abs(fast[~live]).max(initial=0.0)) < 2e-3,
           f'{int(live.sum())} rays in the beam, median rel err '
-          f'{float(np.median(rel)):.4f}')
+          f'{float(np.median(rel)):.1e}, worst {float(rel.max()):.1e}')
     rl = _export('SPOT', energy=10.0, hs=_hs(shadow='NONE', volumetric=1.0),
                  matrix=_down((0.0, 0.0, 4.0)))
     rl2 = _export('SPOT', energy=10.0, hs=_hs(shadow='NONE', volumetric=1.0),
@@ -1342,6 +1343,47 @@ def test_g_hidden_switches():
         check('Custom Distance, the Transmission / Volume factors, the '
               'EEVEE shadow dials, Spread and Soft Falloff stay unread',
               True)
+
+
+def test_i_mirrored_area_lamp():
+    """Negative object scale (a mirrored rig): an Area lamp mirrored
+    across one face axis lit nothing; Blender keeps its handedness."""
+    pos = (1.5, -1.0, 4.0)
+    frames = {}
+    for label, scale in (('unit', (1.0, 1.0, 1.0)),
+                         ('mirrored in X', (-1.0, 1.0, 1.0)),
+                         ('mirrored in Y', (1.0, -1.0, 1.0)),
+                         ('mirrored in X and Y', (-1.0, -1.0, 1.0)),
+                         ('mirrored in Z', (1.0, 1.0, -1.0))):
+        lamp = _export('AREA', energy=40.0, scale=scale,
+                       hs=_hs(area_power='WATTS', shadow='NONE'),
+                       matrix=_matrix(scale, pos=pos, aim=(0, 0, 0)))
+        if label == 'unit':
+            check('an unmirrored Area lamp exports the axes it always did',
+                  _fields(lamp)['area_y'] == _fields(_export(
+                      'AREA', matrix=_matrix(pos=pos, aim=(0, 0, 0))))[
+                          'area_y'])
+        frames[label] = _roads(f'an Area lamp {label}', [lamp])[0]
+    ref = float(frames['unit'].mean())
+    for label, was in (('mirrored in X', 'it rendered black before'),
+                       ('mirrored in Y', 'it rendered black before'),
+                       ('mirrored in X and Y', 'a half turn: it always did')):
+        d = float(np.abs(frames[label] - frames['unit']).max())
+        check(f'an Area lamp {label} lights the scene as the unmirrored '
+              f'lamp does ({was})',
+              ref > 0.01 and d < 2e-5, f'max diff {d:.2e}, mean {ref:.4f}')
+    check('an Area lamp mirrored in Z points the other way and lights '
+          'nothing here, as in Blender',
+          float(frames['mirrored in Z'].max()) == 0.0)
+    sp = {}
+    for label, scale in (('unit', (1.0, 1.0, 1.0)),
+                         ('mirrored in X', (-1.0, 1.0, 1.0))):
+        sp[label] = _cpu([_export('SPOT', energy=2500.0, scale=scale,
+                                  hs=_hs(shadow='NONE'),
+                                  matrix=_matrix(scale, pos=pos,
+                                                 aim=(0, 0, 0)))])
+    check('a Spot mirrored in X keeps its cone (it always did)',
+          np.array_equal(sp['unit'], sp['mirrored in X']))
 
 
 # ------------------------------------------------------ (h) the Light panel

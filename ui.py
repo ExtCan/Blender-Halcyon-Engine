@@ -2662,8 +2662,8 @@ class HALCYON_PT_light_native(HalcyonPanel, Panel):
         # lobe OFF; each is drawn only while it does, so a default lamp
         # shows none and no hidden switch darkens one
         ob = getattr(context, 'object', None)
-        if ob is not None and getattr(ob, 'data', None) is not light:
-            ob = None
+        if ob is not None and getattr(ob, 'data', None) != light:
+            ob = None                   # a pinned lamp: not this object's
         off = []
         if float(getattr(light, 'diffuse_factor', 1.0)) == 0.0:
             off.append((light, 'diffuse_factor', "Diffuse Factor"))

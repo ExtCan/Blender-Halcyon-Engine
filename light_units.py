@@ -482,8 +482,11 @@ def _on_save(*_args):
     stamp."""
     try:
         for la in bpy.data.lights:
-            if _local(la) and _unsorted_area(la):
-                la.halcyon.area_power = la.halcyon.area_power
+            try:
+                if _local(la) and _unsorted_area(la):
+                    la.halcyon.area_power = la.halcyon.area_power
+            except Exception:                                   # noqa: BLE001
+                continue
         stamp_scenes(bpy.data)
     except Exception:                                           # noqa: BLE001
         pass

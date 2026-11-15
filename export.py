@@ -1208,6 +1208,17 @@ def _native_light_options(ob, la, hs, lt, kind, mw):
         # opened directly; it is Blender Internal's cone exactly
         if getattr(la, 'use_square', False):
             lt.spot_square = True
+    if kind == 'AREA':
+        # a lamp mirrored across ONE of its face axes (object scale -1
+        # in X or in Y: half of a mirrored rig) winds its face the
+        # other way, and the form factor of a face seen from behind is
+        # zero -- the lamp lit nothing. Blender keeps the handedness
+        # (eevee_light.cc Light::sync negates the Y axis), so the lamp
+        # goes on shining along its -Z; an unmirrored lamp runs nothing
+        ax = np.asarray(lt.area_x, np.float32)
+        ay = np.asarray(lt.area_y, np.float32)
+        if float(np.dot(np.cross(ax, ay), mw[:3, 2])) < 0.0:
+            lt.area_y = tuple(-ay)
     if kind == 'AREA' and hs is not None \
             and area_power_units(hs) == 'WATTS':
         # Power in Blender's watts: the form factor normalised at the
