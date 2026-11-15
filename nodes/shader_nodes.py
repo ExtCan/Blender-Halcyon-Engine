@@ -1676,7 +1676,17 @@ class HALCYON_CodeNode(Node, HalcyonNodeBase):
         description="Emit the first output as a shader closure instead of colour")
     error: StringProperty(name="Error", default='', options={'HIDDEN'})
     warn: StringProperty(name="Warning", default='', options={'HIDDEN'})
-    auto_compile: BoolProperty(name="Auto Compile", default=True)
+    # R253 (review): the Auto Compile checkbox is retired, not wired. It was
+    # drawn in the sidebar and read by nothing, and there is nothing for it
+    # to hold back: the only automatic rebuild is the one a Language or Text
+    # change flags (typing in the Text Editor fires no callback on the node)
+    # and the exporter compiles the live source at every export whatever the
+    # sockets say -- so "off" could only keep the OLD sockets under a render
+    # already running the NEW program, the stale state _rearm_code_rebuilds
+    # exists to end, saved into files no farm would press Compile on. A file
+    # that stored the old value keeps it among the node's system ID
+    # properties, where nothing reads it; a later property of that name
+    # would inherit those values, so the name stays retired.
 
     def init(self, context):
         self.source_text = DEFAULT_GLSL
@@ -1811,8 +1821,6 @@ class HALCYON_CodeNode(Node, HalcyonNodeBase):
                 box.label(text=line.strip(), icon='INFO')
 
     def draw_buttons_ext(self, context, layout):
-        layout.prop(self, 'auto_compile')
-        layout.separator()
         layout.label(text="Available inputs:")
         col = layout.column(align=True)
         for name in ('vPosition', 'vNormal', 'vUV', 'vColor', 'vView',
@@ -5652,19 +5660,15 @@ PROP_TIPS = {
         "button) clears, and that undo, redo and a file load re-arm "
         "when they bring it back; not a look control",
     ('HALCYON_CodeNode', 'source_text'):
-        "The name of the Text datablock holding this shader's "
-        "source, when it is edited in the Text Editor instead of the "
-        "node's own pane",
+        "The shader source kept on the node itself (the starter "
+        "shader until replaced): what compiles and renders while the "
+        "node has no Text datablock assigned",
     ('HALCYON_CodeNode', 'error'):
         "The compiler's last error for this node, shown in the "
         "editor -- diagnostics only, cleared by a clean build",
     ('HALCYON_CodeNode', 'warn'):
         "The compiler's last warning for this node -- diagnostics "
         "only; the program still runs",
-    ('HALCYON_CodeNode', 'auto_compile'):
-        "Rebuilds the program automatically whenever the source "
-        "changes; off waits for the Build button (steadier while "
-        "typing long shaders)",
     ('HALCYON_DitherNode', 'pattern'):
         "The ordered-dither matrix: Bayer 2x2 (coarsest, boldest "
         "crosshatch), 4x4 (the VGA-era standard), 8x8 (finest), or a "
