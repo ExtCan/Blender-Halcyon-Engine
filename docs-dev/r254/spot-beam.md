@@ -189,9 +189,15 @@ Sheet (real Blender, before | after):
     bounds are `shaft_sources`' own (|ndc| 6 = a frame fraction outside
     -2.5 .. 3.5): 0 disagreements on 400 random sun directions.
   - Tooltips: Volumetric, the switch, Beam Density (its unit).
-- **Proof.** `test_l_panel_says_what_each_dial_needs`; the real Properties
-  editor drew the patched panel during the viewport run with 0
-  exceptions.
+- **Proof.** `test_l_panel_says_what_each_dial_needs`. Real Blender 5.2.2
+  with a UI (bl/bl_panel_states.py): the Properties editor drew the panel
+  27 times across ten states (spot with the switch off / on, Hotspot, POV,
+  GX Ring 2 + Screen Spotlight, area with a cookie, point, sun ahead of
+  and behind the camera, hemi) with 0 exceptions, and the rows through
+  the real RNA are the ones listed here -- `shadow_soft_size` exists on
+  an Area lamp, the Sun's line reads "Light Shafts converge on the sun's
+  place in the sky" ahead of the camera and "Sun is BEHIND the render
+  camera -- no shafts" behind it.
 
 ## 5. The beam follows the lamp's cone law
 
