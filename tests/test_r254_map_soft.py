@@ -36,7 +36,6 @@ them except the first fails on the lookup it replaces:
 
     python -m halcyon.tests.test_r254_map_soft
 """
-import os
 import pickle
 import sys
 import traceback

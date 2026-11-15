@@ -37,10 +37,6 @@ def _vec3(v):
     return 'vec3({}, {}, {})'.format(*(_lit(c) for c in tuple(v)[:3]))
 
 
-def _vec4(v):
-    return 'vec4({}, {}, {}, {})'.format(*(_lit(c) for c in tuple(v)[:4]))
-
-
 def shadow_function(i, meta):
     """`hal_shadow_vis{i}(P, N, L)` for a mapped lamp WITH a size (the
     meta carries 'soft': its shape and the map's axes)."""
@@ -170,6 +166,38 @@ def shadow_function(i, meta):
                  '    }']
     L += ['    return acc;', '}']
 
+    grow = _lit(SM.search_grow(F))
+    lamp = 'float Ax, float Ay, float Bx, float By'
+    # the search pattern at one footprint t: (blocked taps, the sum of
+    # their depths). Written once; the search and the probe both call it
+    L += [f'vec2 hal_sm_find{i}(float t, {lamp}, {ctx})',
+          '{',
+          f'    float tg = t * {grow};',
+          '    float nb = 0.0; float ds = 0.0;']
+    for a, b, pa, pb in tab_s:
+        L += ['    {',
+              f'    vec2 r = hal_sm_blk{i}('
+              f'tg * ({_lit(a)} * Ax + {_lit(b)} * Bx) + {_lit(pa)}, '
+              f'tg * ({_lit(a)} * Ay + {_lit(b)} * By) + {_lit(pb)}, '
+              f'{cta});',
+              '    nb += r.x; ds += r.y;',
+              '    }']
+    L += ['    return vec2(nb, ds);', '}']
+    # the F filter taps on the lattice of stride st. Written once; called
+    # for one lattice, or for both where they cross-fade
+    L += [f'float hal_sm_flt{i}(float tf, float fq, float st, {lamp}, {ctx})',
+          '{',
+          '    float acc = 0.0;']
+    for a, b, sa, sb in tab_f:
+        L += ['    {',
+              f'    float px = u + fq * (tf * ({_lit(a)} * Ax + '
+              f'{_lit(b)} * Bx) + {_lit(sa)});',
+              f'    float py = v + fq * (tf * ({_lit(a)} * Ay + '
+              f'{_lit(b)} * By) + {_lit(sb)});',
+              f'    acc += hal_sm_tap{i}(px, py, st, {cta});',
+              '    }']
+    L += ['    return acc;', '}']
+
     L += [f'float hal_shadow_vis{i}(vec3 P, vec3 N, vec3 L)',
           '{',
           '    float ndl = clamp(dot(N, L), 0.0, 1.0);',
@@ -297,51 +325,26 @@ def shadow_function(i, meta):
               f'    float Ax = {kt}; float Ay = 0.0;',
               f'    float Bx = 0.0; float By = {kt};',
               '    float tmin = max(dr - dmin, 0.0);']
-    grow = _lit(SM.search_grow(F))
     cap = _lit(SM.cap_texels(size, ext, persp))
     L += ['    float amax = max(sqrt(Ax * Ax + Ay * Ay), '
           'sqrt(Bx * Bx + By * By));',
           f'    float ts = min(tmin, {cap} / max(amax, 1e-12));']
 
-    def search(t, acc_depth):
-        out = [f'    float {t}g = {t} * {grow};']
-        for a, b, pa, pb in tab_s:
-            out += ['    {',
-                    f'    vec2 r = hal_sm_blk{i}('
-                    f'{t}g * ({_lit(a)} * Ax + {_lit(b)} * Bx) + {_lit(pa)}, '
-                    f'{t}g * ({_lit(a)} * Ay + {_lit(b)} * By) + {_lit(pb)}, '
-                    f'{cta});',
-                    acc_depth,
-                    '    }']
-        return out
-
-    def filt(acc, st):
-        out = []
-        for a, b, sa, sb in tab_f:
-            out += ['    {',
-                    f'    float px = u + fq * (tf * ({_lit(a)} * Ax + '
-                    f'{_lit(b)} * Bx) + {_lit(sa)});',
-                    f'    float py = v + fq * (tf * ({_lit(a)} * Ay + '
-                    f'{_lit(b)} * By) + {_lit(sb)});',
-                    f'    {acc} += hal_sm_tap{i}(px, py, {st}, {cta});',
-                    '    }']
-        return out
-
     # the blocker search; then, only where it is undecided, the probe;
     # then, only where THAT is undecided, the filter
-    L += ['    float nb = 0.0; float dsum = 0.0;'] + \
-        search('ts', '    nb += r.x; dsum += r.y;') + \
-        [f'    if (nb >= {nt}) {{ lit = 0.0; }}',
-         '    else if (nb > 0.0) {',
-         '    float davg = dsum / max(nb, 1.0);']
+    L += [f'    vec2 fs = hal_sm_find{i}(ts, Ax, Ay, Bx, By, {cta});',
+          '    float nb = fs.x; float dsum = fs.y;',
+          f'    if (nb >= {nt}) {{ lit = 0.0; }}',
+          '    else if (nb > 0.0) {',
+          '    float davg = dsum / max(nb, 1.0);']
     if persp:
         L.append('    float tp = min(max(1.0 / max(davg, 1e-9) - dr, 0.0), '
                  'ts);')
     else:
         L.append('    float tp = min(max(dr - davg, 0.0), ts);')
-    L += ['    float nb2 = 0.0; float dsum2 = 0.0;'] + \
-        search('tp', '    nb2 += r.x; dsum2 += r.y;') + \
-        [f'    if (nb2 >= {nt}) {{ lit = 0.0; }}',
+    L += [f'    vec2 fp = hal_sm_find{i}(tp, Ax, Ay, Bx, By, {cta});',
+          '    float nb2 = fp.x; float dsum2 = fp.y;',
+          f'    if (nb2 >= {nt}) {{ lit = 0.0; }}',
          '    else if (nb2 > 0.0) {',
          # the estimate again, from the casters the probe itself found
          '    float davg2 = dsum2 / max(nb2, 1.0);',
@@ -358,13 +361,14 @@ def shadow_function(i, meta):
         L.append(f'    if (q >= {_f(lv)}) {{ st0 = {_f(lv)}; }}')
     L += [f'    float wb = clamp((q / st0 - {_lit(SM.SQRT2)}) / '
           f'{_lit(SM.SQRT2_SPAN)}, 0.0, 1.0);',
-          '    float acc0 = 0.0;'] + filt('acc0', 'st0') + \
-        [f'    lit = acc0 / {fn};',
-         '    if (wb > 0.0) {',
-         '    float st1 = st0 * 2.0;',
-         '    float acc1 = 0.0;'] + filt('acc1', 'st1') + \
-        [f'    lit = lit * (1.0 - wb) + (acc1 / {fn}) * wb;',
-         '    }',
+          f'    float acc0 = hal_sm_flt{i}(tf, fq, st0, Ax, Ay, Bx, By, '
+          f'{cta});',
+          f'    lit = acc0 / {fn};',
+          '    if (wb > 0.0) {',
+          f'    float acc1 = hal_sm_flt{i}(tf, fq, st0 * 2.0, Ax, Ay, Bx, By, '
+          f'{cta});',
+          f'    lit = lit * (1.0 - wb) + (acc1 / {fn}) * wb;',
+          '    }',
          '    }',
          '    }',
          '    }',
