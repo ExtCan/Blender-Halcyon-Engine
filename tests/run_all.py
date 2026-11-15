@@ -62,6 +62,8 @@ def run_tests():
     from . import test_r254_map_soft
     # R254: the rendered viewport follows what was changed
     from . import test_r254_viewport
+    # R254: Blender's own light options (Exposure, Temperature, ...)
+    from . import test_r254_native
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -250,6 +252,11 @@ def run_tests():
     print('R254 VIEWPORT (THE RENDERED VIEWPORT FOLLOWS WHAT WAS CHANGED)')
     print('=' * 66)
     rc |= test_r254_viewport.main()
+    print()
+    print('=' * 66)
+    print("R254 NATIVE (BLENDER'S OWN LIGHT OPTIONS, AREA WATTS, THE LIGHT PANEL)")
+    print('=' * 66)
+    rc |= test_r254_native.main()
     return rc
 
 
