@@ -760,8 +760,8 @@ def test_code_node_rebuild_survives_undo_redo_and_load():
     from . import fakebpy
     bpy = fakebpy.install()
     SN = importlib.import_module('halcyon.nodes.shader_nodes')
-    # the stub's own handler lists, whatever an earlier test left in their
-    # place (test_legacy swaps in a one-list namespace and keeps it there)
+    # the stub's own handler lists for the length of this test, whatever
+    # is installed when it starts (a test may have swapped the namespace)
     prior_handlers = bpy.app.handlers
     bpy.app.handlers = fakebpy._handlers
     handlers, timers = bpy.app.handlers, bpy.app.timers
