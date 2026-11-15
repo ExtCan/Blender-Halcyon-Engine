@@ -261,7 +261,11 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
                 # shelf round): a lone GLOSSY lobe's colour chain IS
                 # the specular colour -- closure_to_surface puts it in
                 # surf.specular -- so the pass routes the emitted chain
-                # to s.specular and bakes the untouched flat diffuse.
+                # to s.specular and bakes the CPU's own flat diffuse:
+                # with no DIFFUSE lobe that is the no-diffuse surface
+                # (white at level 0, ambient 0 -- closure_to_surface's
+                # per-pixel rule, read here through the probe; it was
+                # the material's fallback colour, fully lit).
                 # With a DIFFUSE lobe alongside (the Specular BSDF's
                 # spec/gloss pair), the emitted chain is the DIFFUSE
                 # lobe's own colour and stays in its slot; the glossy

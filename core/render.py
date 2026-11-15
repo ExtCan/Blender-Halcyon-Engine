@@ -767,22 +767,57 @@ def closure_to_surface(cl, ctx, settings, material=None):
                     gloss_model is not None:
                 model = gloss_model
     else:
-        w = np.maximum(diff_w, 1e-6)
-        if np.any(diff_w > 1e-6):
-            surf.diffuse = diff / w[:, None]
-            surf.diffuse_level = np.clip(diff_w, 0.0, 1.0)
-        if np.any(spec_w > 1e-6):
-            surf.specular = spec / np.maximum(spec_w, 1e-6)[:, None]
-            surf.specular_level = np.clip(spec_w, 0.0, 1.0)
-        else:
-            surf.specular_level = np.zeros(n, np.float32)
-        if np.any(rough_w > 1e-6):
-            r = np.clip(rough_acc / np.maximum(rough_w, 1e-6), 0.0, 1.0)
-            surf.roughness = r
-            # Blender roughness -> a Phong/Blinn exponent, the classic mapping
-            surf.glossiness = np.maximum(2.0 / np.maximum(r * r * r * r, 1e-5) - 2.0,
-                                         0.5).astype(np.float32)
-            surf.glossiness = np.minimum(surf.glossiness, 8192.0)
+        # EVERY slot is decided PER PIXEL, from that pixel's own lobe
+        # weights. These read `np.any(...)` over the batch, so one
+        # pixel's surface hung on which other pixels happened to be
+        # shaded with it: a pure-emission pixel of a masked Mix Shader
+        # (Diffuse, Emission) kept the material's fallback diffuse fully
+        # LIT when its chunk, its pool band or its render region lay
+        # wholly on the emission side, and had no diffuse at all when
+        # one diffuse pixel shared the batch -- a hard edge through the
+        # glow wherever a batch boundary fell (1280x960 in-process: 27929
+        # pixels of the demo ball, 1.93 apart).
+        #
+        # A pixel whose closure carries NO diffuse weight has no diffuse
+        # response -- Blender's own answer for an Emission, a Glossy, a
+        # Glass or a Transparent alone: diffuse level 0 and NO ambient
+        # share (the ambient term is the diffuse colour's answer to the
+        # ambient pool, and it does not read the level), over a WHITE
+        # diffuse colour. White, not black: nothing at the pixel rate
+        # reads it any more, and the two roads that do read the colour
+        # alone want the identity -- the corner road's `light x albedo`
+        # (a black albedo would wipe the glow and the highlight the
+        # corners just lit) and a see-through pixel's refraction tint.
+        # It must not hang on the colour either way: the deferred pass
+        # fills its diffuse slot from the graph's own colour chain, so
+        # only the LEVEL and the AMBIENT can say "no diffuse" on both
+        # devices. The graph-less material and the empty closure never
+        # reach here (the early return above keeps the fallback surface).
+        has_d = diff_w > 1e-6
+        surf.diffuse = np.where(
+            has_d[:, None], diff / np.maximum(diff_w, 1e-6)[:, None],
+            np.float32(1.0)).astype(np.float32)
+        surf.diffuse_level = np.clip(diff_w, 0.0, 1.0)
+        surf.ambient = np.where(has_d, surf.ambient,
+                                np.float32(0.0)).astype(np.float32)
+        # the specular side had the same shape: level 0 without a glossy
+        # weight (it always was), the colour the material's own there
+        has_s = spec_w > 1e-6
+        surf.specular = np.where(
+            has_s[:, None], spec / np.maximum(spec_w, 1e-6)[:, None],
+            surf.specular).astype(np.float32)
+        surf.specular_level = np.clip(spec_w, 0.0, 1.0)
+        # ...and the roughness: a pixel no rough-carrying lobe reaches
+        # keeps the material's own (it read roughness 0, exponent 8192,
+        # the moment a rough lobe shared its batch)
+        has_r = rough_w > 1e-6
+        r = np.clip(rough_acc / np.maximum(rough_w, 1e-6), 0.0, 1.0)
+        # Blender roughness -> a Phong/Blinn exponent, the classic mapping
+        g = np.minimum(np.maximum(2.0 / np.maximum(r * r * r * r, 1e-5) - 2.0,
+                                  0.5).astype(np.float32), 8192.0)
+        surf.roughness = np.where(has_r, r, surf.roughness).astype(np.float32)
+        surf.glossiness = np.where(has_r, g,
+                                   surf.glossiness).astype(np.float32)
         surf.emission = emis
         surf.opacity = np.clip(1.0 - transp, 0.0, 1.0)
         surf.reflect = np.clip(refr, 0.0, 1.0)

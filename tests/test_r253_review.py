@@ -58,6 +58,16 @@ pinned where it bit.
     apart. `core/nodeeval.link_closure` reads Blender's implicit
     conversion (an Emission of it, bitwise the explicit node) and
     `gpu/shade._probe_material` refuses that lobe BY NAME.
+(14) `closure_to_surface` decided a plain closure's diffuse, specular
+    and roughness slots with `np.any(...)` over the BATCH: a pixel with
+    no diffuse lobe kept the material's fallback diffuse fully lit when
+    its chunk, pool band or render region held no diffuse pixel, and had
+    none when one shared the batch -- a hard edge through the glow of a
+    masked Mix Shader (Diffuse, Emission) wherever a batch boundary
+    fell. Every slot is per pixel now, and a pixel with no diffuse
+    weight has no diffuse response (level 0, no ambient share, a white
+    albedo): Blender's answer for an Emission, a Glossy, a Glass or a
+    Transparent alone.
 """
 import io
 import os
@@ -1345,8 +1355,11 @@ def test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads():
     nodes_k, link_k, _pr = _wired_source('colour', rgb=(0.0, 0.0, 0.0))
     dark = _wired_cpu(_wired_out(nodes_k, link_k))
     gain = float(np.abs((lit - dark)[ball][:, :3] - np.array([0.9, 0.3, 0.1], f32)).max())
-    check('the wired colour is ADDED over the lit fallback surface: frame(colour) - frame(black) is the colour at every Ball pixel (1e-6)',
+    check('the wired colour ARRIVES as itself: frame(colour) - frame(black) is the colour at every Ball pixel (1e-6)',
           gain < 1e-6, str(gain))
+    under = float(np.abs(dark[ball][:, :3]).max())
+    check('...over NOTHING: black wired in is a black Ball (the material\'s fallback diffuse was lit under the glow)',
+          under == 0.0, str(under))
     check('...and the alpha stays opaque', float(lit[ball][:, 3].min()) == 1.0 and float(lit[ball][:, 3].max()) == 1.0)
 
     # ---- the text names what the user wired and where it shades
@@ -1453,6 +1466,370 @@ def test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads():
     check('...and the colour is the sky', bool(np.allclose(sky, [0.15, 0.35, 0.8], atol=0.02)), str(np.round(sky, 3)))
     check('...which the GPU sky pass refuses by name (the node road)',
           GSKY.refusal(scw, stw) == 'the world node graph is evaluated on the CPU', str(GSKY.refusal(scw, stw)))
+
+
+# ---------------------------------------------------------------------------
+# (14) a closure with no diffuse lobe has no diffuse, at every pixel
+# ---------------------------------------------------------------------------
+
+_ND_BLUE = (0.2, 0.3, 0.9)
+_ND_GLOW = (0.9, 0.3, 0.1)
+
+
+def _nd_node(kind, color=None):
+    """(nodes, link): one plain shader node of `kind`."""
+    c4 = lambda c: [c[0], c[1], c[2], 1.0]                      # noqa: E731
+    if kind == 'emission':
+        return _wired_emission({}, None)[0] | {'em': dict(_wired_emission({}, None)[0]['em'], inputs=[
+            _sk('Color', 'RGBA', c4(color or _ND_GLOW)), _sk('Strength', 'VALUE', 1.0)])}, ['em', 0]
+    spec = {'diffuse': ('ShaderNodeBsdfDiffuse', [_sk('Color', 'RGBA', c4(color or _ND_BLUE)), _sk('Roughness', 'VALUE', 0.0)]),
+            'glossy': ('ShaderNodeBsdfGlossy', [_sk('Color', 'RGBA', c4(color or (0.9, 0.6, 0.2))), _sk('Roughness', 'VALUE', 0.35),
+                                                _sk('Anisotropy', 'VALUE', 0.0), _sk('Rotation', 'VALUE', 0.0)]),
+            'metallic': ('ShaderNodeBsdfMetallic', [_sk('Base Color', 'RGBA', c4(color or (0.9, 0.6, 0.2))), _sk('Roughness', 'VALUE', 0.3)]),
+            'glass': ('ShaderNodeBsdfGlass', [_sk('Color', 'RGBA', c4(color or (0.7, 0.9, 0.8))), _sk('Roughness', 'VALUE', 0.1),
+                                              _sk('IOR', 'VALUE', 1.45)]),
+            'transparent': ('ShaderNodeBsdfTransparent', [_sk('Color', 'RGBA', c4(color or (1.0, 1.0, 1.0)))]),
+            'principled_metal': ('ShaderNodeBsdfPrincipled', [
+                _sk('Base Color', 'RGBA', c4(color or (0.8, 0.5, 0.2))), _sk('Metallic', 'VALUE', 1.0), _sk('Roughness', 'VALUE', 0.4),
+                _sk('IOR', 'VALUE', 1.45), _sk('Alpha', 'VALUE', 1.0), _sk('Specular IOR Level', 'VALUE', 0.5),
+                _sk('Transmission Weight', 'VALUE', 0.0)])}[kind]
+    return {kind: {'id': kind, 'bl_idname': spec[0], 'props': {}, 'inputs': spec[1],
+                   'outputs': [{'name': 'BSDF', 'type': 'SHADER'}]}}, [kind, 0]
+
+
+def _nd_lone(kind, color=None):
+    nodes, link = _nd_node(kind, color)
+    return _wired_out(nodes, link)
+
+
+def _nd_masked(kind):
+    """Mix Shader (Fac = the mask, a Diffuse BSDF, `kind`): the mask is
+    the interpolated normal's z > 0, so the UPPER side of the Ball is
+    `kind` alone, the lower side the Diffuse BSDF alone -- Fac exactly 0
+    or 1, the case the batch rule split."""
+    nodes, link = _nd_node(kind)
+    dn, dl = _nd_node('diffuse')
+    nodes = dict(nodes, **dn)
+    nodes['tc'] = {'id': 'tc', 'bl_idname': 'ShaderNodeTexCoord', 'props': {}, 'inputs': [],
+                   'outputs': [{'name': 'Generated', 'type': 'VECTOR'}, {'name': 'Normal', 'type': 'VECTOR'},
+                               {'name': 'UV', 'type': 'VECTOR'}]}
+    nodes['sep'] = {'id': 'sep', 'bl_idname': 'ShaderNodeSeparateXYZ', 'props': {},
+                    'inputs': [_sk('Vector', 'VECTOR', [0, 0, 0], ['tc', 1])],
+                    'outputs': [{'name': 'X', 'type': 'VALUE'}, {'name': 'Y', 'type': 'VALUE'}, {'name': 'Z', 'type': 'VALUE'}]}
+    nodes['gt'] = {'id': 'gt', 'bl_idname': 'ShaderNodeMath', 'props': {'operation': 'GREATER_THAN'},
+                   'inputs': [_sk('Value', 'VALUE', 0.5, ['sep', 2]), _sk('Value', 'VALUE', 0.0)],
+                   'outputs': [{'name': 'Value', 'type': 'VALUE'}]}
+    nodes['mix'] = {'id': 'mix', 'bl_idname': 'ShaderNodeMixShader', 'props': {},
+                    'inputs': [_sk('Fac', 'VALUE', 0.5, ['gt', 0]), _sk('Shader', 'SHADER', None, dl),
+                               _sk('Shader', 'SHADER', None, link)],
+                    'outputs': [{'name': 'Shader', 'type': 'SHADER'}]}
+    return _wired_out(nodes, ['mix', 0])
+
+
+def _nd_scene(graph, w=128, h=96, see_through=False, **kw):
+    """The demo scene with `graph` on the Ball (material 1; None = a
+    graph-less material), at any size and settings."""
+    from ..core.scene import Material
+    st = base_settings(w, h, **kw)
+    st.color_depth, st.dither, st.output_scale = '24', 'NONE', 'NONE'
+    sc = demo_scene(st, with_texture=False)
+    mat = Material(name='Wired', index=1, graph=graph)
+    mat.programs = {}
+    if see_through:
+        # what the exporter's alpha evidence says of a Transparent BSDF
+        mat.has_alpha, mat.alpha_why = True, 'a Transparent BSDF node'
+    sc.materials[1] = mat
+    return sc, st
+
+
+def _nd_frame(graph, w=128, h=96, band=None, see_through=False, lamps=True, **kw):
+    sc, st = _nd_scene(graph, w, h, see_through, **kw)
+    if not lamps:
+        sc.lights = []
+    R._GBUF_CACHE.clear()
+    return np.asarray(R.render(sc, st, band=band))
+
+
+def _nd_ball(w, h):
+    from .test_r251_material import _job_for
+    sc, st = _nd_scene(None, w, h)
+    g, _job = _job_for(sc, st)
+    return (g.tri >= 0) & (sc.mesh.mat_index[np.maximum(g.tri, 0)] == 1)
+
+
+def _nd_closure(kind, fac, n_extra=0):
+    """The closure a masked Mix Shader (Diffuse, `kind`) hands on for the
+    Fac values `fac`, one pixel each."""
+    from ..core import nodeeval as NE
+    fac = np.asarray(fac, f32)
+    n = fac.size
+    col = lambda c: np.tile(np.array([[c[0], c[1], c[2], 1.0]], f32), (n, 1))     # noqa: E731
+    cl = NE.Closure()
+    cl.add('DIFFUSE', 1.0 - fac, color=col(_ND_BLUE), roughness=np.full(n, 0.6, f32), model='LAMBERT')
+    if kind == 'EMISSION':
+        cl.add('EMISSION', fac, color=col(_ND_GLOW), strength=np.ones(n, f32))
+    elif kind == 'GLOSSY':
+        cl.add('GLOSSY', fac, color=col((0.9, 0.6, 0.2)), roughness=np.full(n, 0.35, f32), model='COOK_TORRANCE')
+    elif kind in ('GLASS', 'REFRACTION'):
+        cl.add(kind, fac, color=col((0.7, 0.9, 0.8)), roughness=np.full(n, 0.1, f32), ior=np.full(n, 1.45, f32))
+    elif kind == 'HOLDOUT':
+        cl.add('HOLDOUT', fac)
+    else:                                                       # TRANSPARENT, TRANSLUCENT
+        cl.add(kind, fac, color=col((0.3, 0.8, 0.3)))
+    return cl
+
+
+def _nd_slots(surf, i):
+    """Every per-fragment slot of pixel `i`, as bytes."""
+    from ..core import shading as SH
+    out = {}
+    for name in SH.Surface.__slots__:
+        v = getattr(surf, name, None)
+        if isinstance(v, np.ndarray) and v.ndim >= 1 and v.shape[0] == surf.n:
+            out[name] = np.ascontiguousarray(v[i]).tobytes()
+    return out
+
+
+def test_a_closure_with_no_diffuse_lobe_has_no_diffuse_at_every_pixel():
+    """`closure_to_surface` decided a plain closure's slots with
+    `np.any(...)` over the BATCH. A pixel with no diffuse lobe kept the
+    material's fallback diffuse fully LIT when no pixel of its batch had
+    a diffuse weight, and had no diffuse at all when one did -- and a
+    batch is a chunk of the shading loop, a band of the worker pool, a
+    render region: a masked Mix Shader (Diffuse, Emission) showed a hard
+    edge through its glow wherever one of those boundaries fell (the
+    demo Ball at 1280x960, in process: 27929 pixels, 1.93 apart; a
+    3-worker pool at 640x480: 3093 pixels, 1.79). The rule is per pixel
+    now and it is Blender's: no diffuse lobe, no diffuse -- level 0 and
+    no ambient share, over a white albedo, so the corner road and a
+    see-through pixel's tint keep the identity. The graph-less material
+    and the unwired socket keep the fallback surface."""
+    from ..core import nodeeval as NE
+    from ..core import parallel as PAR
+    from ..core.scene import Material
+    from ..gpu import shade as GSH
+    from .test_r251_material import _job_for
+    glow = np.array(_ND_GLOW, f32)
+    mat = Material(name='m', index=0, diffuse=(0.31, 0.47, 0.11), diffuse_level=0.83, ambient_level=0.6,
+                   specular=(0.9, 0.8, 0.7), specular_level=0.45, glossiness=19.0, roughness=0.27)
+    st0 = base_settings(8, 8)
+
+    def surf_of(kind, fac, material=mat):
+        return R.closure_to_surface(_nd_closure(kind, fac), NE.ShadeContext(len(fac)), st0, material)[0]
+
+    # ---- the finding, at the function: one pixel, two batches
+    with_neighbour = surf_of('EMISSION', [1.0, 0.0])
+    alone = surf_of('EMISSION', [1.0])
+    check('a pure-emission pixel: diffuse level 0 with a diffuse neighbour in its batch (it always was)',
+          float(with_neighbour.diffuse_level[0]) == 0.0)
+    check('a pure-emission pixel: diffuse level 0 ALONE in its batch too (it read the fallback\'s level, fully lit)',
+          float(alone.diffuse_level[0]) == 0.0, str(float(alone.diffuse_level[0])))
+
+    # ---- no slot of any pixel reads its batch: alone, or among every other Fac
+    facs = [1.0, 0.0, 0.4, 1.0, 0.0, 1e-7, 0.999999]
+    for kind in ('EMISSION', 'GLOSSY', 'GLASS', 'REFRACTION', 'TRANSPARENT', 'HOLDOUT', 'TRANSLUCENT'):
+        for material, tag in ((mat, 'a material'), (None, 'no material')):
+            whole = surf_of(kind, facs, material)
+            off = []
+            for i, f in enumerate(facs):
+                one = _nd_slots(surf_of(kind, [f], material), 0)
+                here = _nd_slots(whole, i)
+                off += [f'{name}@{f}' for name in one if one[name] != here.get(name)]
+            check(f'Mix (Diffuse, {kind}), {tag}: every slot of every pixel is bitwise the same alone and in a mixed batch',
+                  not off, ', '.join(off[:6]))
+
+    # ---- the rule: no diffuse weight, no diffuse response
+    for kind in ('EMISSION', 'GLOSSY', 'GLASS', 'REFRACTION', 'TRANSPARENT', 'HOLDOUT'):
+        s = surf_of(kind, [1.0, 0.0, 0.4])
+        check(f'a {kind}-only pixel: diffuse level 0, NO ambient share, a white albedo',
+              float(s.diffuse_level[0]) == 0.0 and float(s.ambient[0]) == 0.0 and bool(np.all(s.diffuse[0] == 1.0)),
+              f'{s.diffuse_level[0]} {s.ambient[0]} {s.diffuse[0]}')
+        check(f'...and beside it the diffuse pixels keep the lobe\'s colour, its weight as the level, the material\'s ambient',
+              bool(np.allclose(s.diffuse[1:], _ND_BLUE, atol=1e-6)) and bool(np.allclose(s.diffuse_level[1:], [1.0, 0.6], atol=1e-6))
+              and bool(np.all(s.ambient[1:] == f32(0.6))), f'{s.diffuse[1:]} {s.diffuse_level[1:]} {s.ambient[1:]}')
+    s = surf_of('EMISSION', [1.0, 0.0])
+    check('no glossy weight: specular level 0, the colour the material\'s own (level 0 always was; the colour read its batch)',
+          bool(np.all(s.specular_level == 0.0)) and bool(np.allclose(s.specular, (0.9, 0.8, 0.7), atol=1e-6)))
+    check('no rough-carrying lobe: the pixel keeps the material\'s roughness and exponent (0 and 8192 in a mixed batch)',
+          float(s.roughness[0]) == f32(0.27) and float(s.glossiness[0]) == 19.0 and abs(float(s.roughness[1]) - 0.6) < 1e-6,
+          f'{s.roughness} {s.glossiness}')
+    s = surf_of('TRANSLUCENT', [1.0])
+    check('a Translucent BSDF IS a diffuse lobe (half its weight): level 0.5, the material\'s ambient kept',
+          abs(float(s.diffuse_level[0]) - 0.5) < 1e-6 and float(s.ambient[0]) == f32(0.6))
+
+    # ---- what must keep the fallback surface: the graph-less material and the empty closure
+    for cl, tag in ((None, 'no closure (a graph-less material)'), (NE.Closure(), 'an EMPTY closure (an unwired Surface socket)')):
+        s = R.closure_to_surface(cl, NE.ShadeContext(3), st0, mat)[0]
+        check(f'{tag}: the material\'s own diffuse, level, ambient and specular, untouched',
+              bool(np.allclose(s.diffuse, (0.31, 0.47, 0.11), atol=1e-6)) and bool(np.all(s.diffuse_level == f32(0.83)))
+              and bool(np.all(s.ambient == f32(0.6))) and bool(np.all(s.specular_level == f32(0.45))),
+              f'{s.diffuse[0]} {s.diffuse_level[0]} {s.ambient[0]} {s.specular_level[0]}')
+    ball = _nd_ball(128, 96)
+    bare = _nd_frame(_wired_out({}, None))
+    check('the graph-less Ball and the unwired Surface socket are one frame, bit for bit', np.array_equal(_nd_frame(None), bare))
+    check('...and it is the LIT fallback surface (the Ball mean is over 1.0 in every channel)',
+          float(bare[ball][:, :3].mean(0).min()) > 1.0, str(bare[ball][:, :3].mean(0)))
+
+    # ---- the frame: an Emission node alone is its colour, and nothing under it
+    em = _nd_frame(_nd_lone('emission'))
+    dev = float(np.abs(em[ball][:, :3] - glow).max())
+    check('an Emission node on the Ball: every Ball pixel IS the colour (1e-6) -- the fallback diffuse was lit under it '
+          '(the Ball mean was (2.04, 1.44, 1.27))', dev < 1e-6, str(dev))
+    check('...every pixel off the Ball is bitwise the fallback frame\'s', np.array_equal(em[~ball], bare[~ball]))
+    read = dict(_nd_node('emission')[0])
+    read['s2r'] = {'id': 's2r', 'bl_idname': 'ShaderNodeShaderToRGB', 'props': {}, 'inputs': [_sk('Shader', 'SHADER', None, ['em', 0])],
+                   'outputs': [{'name': 'Color', 'type': 'RGBA'}, {'name': 'Alpha', 'type': 'VALUE'}]}
+    read['em2'] = {'id': 'em2', 'bl_idname': 'ShaderNodeEmission', 'props': {},
+                   'inputs': [_sk('Color', 'RGBA', [1.0, 1.0, 1.0, 1.0], ['s2r', 0]), _sk('Strength', 'VALUE', 1.0)],
+                   'outputs': [{'name': 'Emission', 'type': 'SHADER'}]}
+    dev = float(np.abs(_nd_frame(_wired_out(read, ['em2', 0]))[ball][:, :3] - glow).max())
+    check('Shader to RGB of an Emission reads the colour itself: through a second Emission the Ball is still exactly the colour '
+          '(the read lit a default surface under the glow: the Ball mean was (3.19, 2.58, 2.44))', dev < 1e-6, str(dev))
+    for rate in ('VERTEX', 'FACE'):
+        fr = _nd_frame(_nd_lone('emission'), shading_rate=rate)
+        dev = float(np.abs(fr[ball][:, :3] - glow).max())
+        check(f'an Emission node at the {rate} rate: the corner road\'s light x albedo still shows the colour (1e-5; a black '
+              f'albedo would wipe it, the fallback\'s dimmed and lit it)', dev < 1e-5, str(dev))
+
+    # ---- the frame: the two sides of a masked mix are each their own node's picture
+    mixed = _nd_frame(_nd_masked('emission'))
+    side = ball & (np.abs(mixed[..., :3] - glow).max(-1) < 1e-6)
+    check('the mask splits the Ball (both sides hold pixels)', 100 < int(side.sum()) < int(ball.sum()) - 100,
+          f'{int(side.sum())} of {int(ball.sum())}')
+    dif = _nd_frame(_nd_lone('diffuse'))
+    check('Mix (Diffuse, Emission) by a mask: the emission side is bitwise the Emission node\'s frame there',
+          np.array_equal(mixed[side], em[side]))
+    check('...and the diffuse side bitwise the Diffuse BSDF\'s', np.array_equal(mixed[ball & ~side], dif[ball & ~side]))
+
+    # ---- the picture no longer reads its batches: bands, the pool, a region, the chunks
+    W, H = 160, 120
+    ball_b = _nd_ball(W, H)
+    full = _nd_frame(_nd_masked('emission'), W, H)
+    side_b = ball_b & (np.abs(full[..., :3] - glow).max(-1) < 1e-6)
+    rows_all = np.nonzero(ball_b.any(1))[0]
+    rows_glow = [int(y) for y in rows_all if bool(np.all(side_b[y][ball_b[y]]))]
+    check('the masked Ball has rows wholly on the emission side (the batches the rule split)', len(rows_glow) >= 6, str(len(rows_glow)))
+    if len(rows_glow) < 6:
+        return              # nothing below has a premise (the checks above already failed by name)
+    y0, y1 = min(rows_glow), max(rows_glow) + 1
+    contiguous = rows_glow == list(range(y0, y1))
+    check('...and they are one run of rows', contiguous, str(rows_glow))
+    band = _nd_frame(_nd_masked('emission'), W, H, band=(y0, y1))
+    check('a band wholly on the emission side is the full frame\'s rows, bit for bit (its glow sat on the lit fallback)',
+          band.shape == full[y0:y1].shape and np.array_equal(band, full[y0:y1]),
+          str(float(np.abs(band - full[y0:y1]).max())) if band.shape == full[y0:y1].shape else str(band.shape))
+    edges = [0, y0, y1, H]
+    joined = np.concatenate([_nd_frame(_nd_masked('emission'), W, H, band=(edges[i], edges[i + 1])) for i in range(3)], 0)
+    check('three bands cut at the emission side\'s edges rejoin to the in-process frame, bit for bit', np.array_equal(joined, full))
+    # (the four rows nearest the mask's edge: the widest of the cap)
+    cols = np.nonzero(side_b[y0:y0 + 4].all(0))[0]
+    check('the emission side holds a rectangle of its own (4 rows, 12 columns or more)', cols.size >= 12, str(cols.size))
+    x0, x1 = int(cols.min()), int(cols.max()) + 1
+    sc_r, st_r = _nd_scene(_nd_masked('emission'), W, H, use_border=True, border_min_x=x0 / W, border_max_x=x1 / W,
+                           border_min_y=y0 / H, border_max_y=(y0 + 4) / H)
+    rect = R.region_pixels(st_r, W, H)
+    R._GBUF_CACHE.clear()
+    region = np.asarray(R.render(sc_r, st_r))
+    check('...and the region is that rectangle', rect == (x0, y0, x1, y0 + 4), f'{rect} vs {(x0, y0, x1, y0 + 4)}')
+    check('a render region wholly on the emission side is the full frame inside its rect, zero outside, bit for bit',
+          rect is not None and np.array_equal(region, R._apply_region(full.copy(), rect)), str(rect))
+    saved = (R.MIN_CHUNK, R.MAX_CHUNK)
+    try:
+        R.MIN_CHUNK = R.MAX_CHUNK = 96
+        chunked = _nd_frame(_nd_masked('emission'), W, H)
+    finally:
+        R.MIN_CHUNK, R.MAX_CHUNK = saved
+    check('the shading loop in 96-pixel chunks draws the one-chunk frame, bit for bit (chunks of pure glow sat on the lit fallback)',
+          np.array_equal(chunked, full), str(float(np.abs(chunked - full).max())))
+    for rate in ('VERTEX', 'FACE'):
+        full_r = _nd_frame(_nd_masked('emission'), W, H, shading_rate=rate)
+        band_r = _nd_frame(_nd_masked('emission'), W, H, band=(y0, y1), shading_rate=rate)
+        check(f'...and at the {rate} rate the same band is the full frame\'s rows, bit for bit', np.array_equal(band_r, full_r[y0:y1]))
+        lit_side = float(np.abs(full_r[y0:y1][side_b[y0:y1]][:, :3] - glow).max())
+        check(f'...where the emission side shows its colour (1e-5; the pixel pass\'s black albedo wiped it)', lit_side < 1e-5, str(lit_side))
+    # the pool itself: 3 workers band 320x240 at rows 80 and 160, and the Ball's cap above 160 is pure glow
+    WP, HP = 320, 240
+    ball_p = _nd_ball(WP, HP)
+    ref_p = _nd_frame(_nd_masked('emission'), WP, HP)
+    side_p = ball_p & (np.abs(ref_p[..., :3] - glow).max(-1) < 1e-6)
+    check('the pool\'s top band (rows 160..240) holds Ball pixels, every one on the emission side',
+          int(ball_p[160:].sum()) > 100 and bool(np.all(side_p[160:][ball_p[160:]])), str(int(ball_p[160:].sum())))
+    if PAR.find_interpreter() is not None:
+        sc_p, st_p = _nd_scene(_nd_masked('emission'), WP, HP)
+        img, err = PAR.render_parallel(sc_p, st_p, workers=3, scene_key='r253-no-diffuse')
+        PAR.shutdown()
+    else:
+        img, err = None, 'no worker interpreter'
+    if img is None:
+        check('the worker pool draws the in-process frame (skipped: unavailable here)', True, str(err))
+    else:
+        img = np.asarray(img)
+        check('the 3-worker pool draws the in-process frame, bit for bit (its top band lit the fallback under the glow)',
+              np.array_equal(img, ref_p), str(float(np.abs(img - ref_p).max())) if img.shape == ref_p.shape else str(img.shape))
+
+    # ---- the siblings through the same branch: no lamp, no light -- nothing answers the ambient pool
+    for kind in ('glossy', 'metallic', 'principled_metal'):
+        dark = _nd_frame(_nd_lone(kind), lamps=False)
+        check(f'a {kind} Ball with every lamp removed is BLACK (no diffuse lobe: the ambient pool lit the fallback colour)',
+              float(np.abs(dark[ball][:, :3]).max()) == 0.0, str(float(np.abs(dark[ball][:, :3]).max())))
+        lit = _nd_frame(_nd_lone(kind))
+        mx = _nd_frame(_nd_masked(kind))
+        side_k = ball & np.all(mx[..., :3] == lit[..., :3], -1) & ~np.all(mx[..., :3] == dif[..., :3], -1)
+        check(f'Mix (Diffuse, {kind}) by a mask: every Ball pixel is bitwise its own side\'s node alone',
+              bool(np.all((np.all(mx == lit, -1) | np.all(mx == dif, -1))[ball])) and int(side_k.sum()) > 100, str(int(side_k.sum())))
+        if kind == 'glossy' and int(side_k.sum()) >= GSH.PROBE_FRAGMENTS:
+            # the deferred probe is a batch too: sixteen fragments, here every one on the glossy side
+            # (without a glossy side the check above has already failed by name)
+            sc_k, st_k = _nd_scene(_nd_masked(kind))
+            g_k, job_k = _job_for(sc_k, st_k)
+            ys_k, xs_k = np.nonzero(side_k)
+            pick = np.linspace(0, ys_k.size - 1, GSH.PROBE_FRAGMENTS).astype(np.int64)
+            bake, _model, pwhy = GSH._probe_material(job_k, g_k, 1, ys_k[pick], xs_k[pick])
+            check('the probe is a batch too: sixteen glossy fragments of the MASKED Ball bake diffuse level 0 and ambient 0, the '
+                  'frame\'s own rule (they baked the lit fallback for the whole material: a Glossy Ball with a Diffuse island '
+                  'qualified 1.93 off the CPU on all 598 pixels)',
+                  bake is not None and bake.get('diffuse_level') == 0.0 and bake.get('ambient') == 0.0,
+                  str(pwhy if bake is None else (bake.get('diffuse_level'), bake.get('ambient'))))
+    check('control, a Diffuse BSDF Ball with every lamp removed is NOT black (its lobe answers the ambient pool)',
+          float(_nd_frame(_nd_lone('diffuse'), lamps=False)[ball][:, :3].max()) > 0.01)
+    glass_dark = _nd_frame(_nd_lone('glass'), lamps=False, env_reflection=False)
+    check('a glass Ball with no lamp and no environment is BLACK', float(np.abs(glass_dark[ball][:, :3]).max()) == 0.0)
+
+    # ---- transparent alone: invisible where alpha composites, black where it cannot
+    clear = _nd_frame(_nd_lone('transparent'), see_through=True)
+    check('a Transparent BSDF Ball composites to alpha 1 over the floor behind it (the layer road, as before)',
+          float(clear[ball][:, 3].min()) == 1.0 and float(clear[ball][:, :3].max()) < 1.0)
+    solid = _nd_frame(_nd_lone('transparent'), see_through=True, transparency='NONE')
+    check('...and under Transparency None, where nothing composites, it is opaque BLACK (it was the lit fallback surface)',
+          float(np.abs(solid[ball][:, :3]).max()) == 0.0 and float(solid[ball][:, 3].min()) == 1.0)
+
+    # ---- both roads: what the deferred plan qualifies it twins, what it cannot carry it refuses by name
+    for kind in ('glossy', 'metallic'):
+        for rate in ('PIXEL', 'VERTEX', 'FACE'):
+            sc, st = _nd_scene(_nd_lone(kind), shading_rate=rate)
+            d, nbad, _img, _cpu, passes, why = _sim_vs_cpu(sc, st)
+            check(f'a {kind} Ball at the {rate} rate: the plan qualifies and the simulator frame is the CPU frame (max < 6e-3, no px > 1e-2)',
+                  passes is not None and d is not None and d < 6e-3 and nbad == 0, str(why if d is None else (d, nbad)))
+            g, job = _job_for(sc, st)
+            ys, xs = np.nonzero((g.tri >= 0) & (sc.mesh.mat_index[np.maximum(g.tri, 0)] == 1))
+            bake, _model, pwhy = GSH._probe_material(job, g, 1, ys[::37], xs[::37])
+            check(f'...and the probe bakes diffuse level 0, ambient 0, a white diffuse (the same rule, read through closure_to_surface)',
+                  bake is not None and bake.get('diffuse_level') == 0.0 and bake.get('ambient') == 0.0
+                  and bake.get('diffuse') == (1.0, 1.0, 1.0),
+                  str(pwhy if bake is None else (bake.get('diffuse_level'), bake.get('ambient'), bake.get('diffuse'))))
+    for mode in ('NONE', 'STIPPLE'):
+        sc, st = _nd_scene(_nd_lone('transparent', (0.9, 0.2, 0.2)), see_through=True, transparency=mode)
+        d, nbad, _img, _cpu, passes, why = _sim_vs_cpu(sc, st)
+        check(f'a tinted Transparent BSDF Ball under Transparency {mode}: the simulator frame is the CPU frame (the pass lit the '
+              f'node\'s colour as an albedo over the CPU\'s fallback: 1.44 off on all 598 pixels)',
+              passes is not None and d is not None and d < 6e-3 and nbad == 0, str(why if d is None else (d, nbad)))
+    for graph, tag in ((_nd_lone('emission'), 'an Emission node'), (_nd_masked('emission'), 'Mix (Diffuse, Emission) by a mask')):
+        sc, st = _nd_scene(graph)
+        g, job = _job_for(sc, st)
+        GSH._PLAN_CACHE.clear()
+        passes, why, _atl = GSH.plan_frame(job, g)
+        check(f'{tag}: the deferred plan still refuses the raw EMISSION lobe by name (both devices draw the CPU frame)',
+              passes is None and 'a raw EMISSION lobe' in str(why), str(why))
 
 
 def main():
