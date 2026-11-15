@@ -6,6 +6,8 @@ bias a world-space number the user can reason about, instead of a magic
 depth-buffer epsilon that has to be retuned for every scene scale.
 """
 
+import threading
+
 import numpy as np
 
 from . import mathx as M
@@ -78,7 +80,17 @@ class ShadowMap:
         self.persp = bool(persp)
         self.size = int(size)
         self.origin = np.asarray(origin, np.float32)
-        if isinstance(zndc, tuple):
+        if zndc is None or raster.is_blank(zndc):
+            # R254: no caster reached this map (a cube face that sees
+            # nothing, a face outside a wide spot's cone). Every texel is
+            # CLASSIC's empty texel -- `linearise(1.0)`, the value the
+            # array path below gives a plane of ones -- and every blank
+            # map of one size and value shares ONE read-only plane: 16 MB
+            # and a full-plane pass saved per empty 2048 face, the same
+            # array at every lookup
+            empty = self._linearise(np.ones(1, np.float32))[0]
+            self.depth = _blank_plane(self.size, empty)
+        elif isinstance(zndc, tuple):
             # R251 C117: the MIDPOINT map (Woo 1992, Maya 'Use Mid Dist',
             # Blender Classic-Halfway). `_render_depth` hands (z1, z2,
             # has2): the nearest and the second-nearest caster per texel
@@ -157,6 +169,21 @@ class ShadowMap:
 
 _PCF_CACHE = {}
 
+#: the planes blank maps share, by (size, empty value); see ShadowMap
+_BLANK_PLANES = {}
+
+
+def _blank_plane(size, value):
+    key = (int(size), float(value))
+    plane = _BLANK_PLANES.get(key)
+    if plane is None:
+        plane = np.full((int(size), int(size)), value, np.float32)
+        plane.flags.writeable = False
+        if len(_BLANK_PLANES) >= 6:
+            _BLANK_PLANES.pop(next(iter(_BLANK_PLANES)))
+        _BLANK_PLANES[key] = plane
+    return plane
+
 
 def _pcf_offsets(n):
     if n in _PCF_CACHE:
@@ -219,9 +246,10 @@ def scene_bounds(verts):
 class _DepthFrags(raster.FragmentList):
     """R251 C117: a fragment collector that keeps only (px, py, depth).
 
-    The midpoint map's second raster wants every fragment's depth and
-    nothing else; the full FragmentList would hold bary/front/tri for
-    ~1.4 GB per cube face on a 4096-texel map at depth complexity 3."""
+    The G-buffer road's reading of the midpoint map's second surface
+    (tests/test_r254_bake_speed.py holds the depth-only bake against it);
+    the full FragmentList would hold bary/front/tri for ~1.4 GB per cube
+    face on a 4096-texel map at depth complexity 3."""
 
     def add(self, px, py, tri, depth, bary, front, bary_lin=None):
         if px.size == 0:
@@ -238,64 +266,77 @@ class _DepthFrags(raster.FragmentList):
                 np.concatenate(self.depth))
 
 
-#: triangles per run of the midpoint map's second raster (memory is
-#: bounded by one run's fragments; the result is run-size independent)
+#: triangles per run of the G-buffer road's second raster (see above)
 MIDPOINT_RUN = 20000
 
 
-def _render_depth(verts, tris, vp, size, cull='NONE', midpoint=False):
-    # A per-map frustum cull was tried here (R87) and REVERTED on the
-    # measurement: a concentrated high-poly object sits inside most map
-    # frustums, so the cull kept ~100% of triangles and its own gather
-    # cost made the stage 15% SLOWER. The rasteriser's early discard
-    # already handles the faces that see nothing. The honest lever for
-    # high-poly shadow cost is the rasteriser's per-triangle speed.
-    gb = raster.GBuffer(size, size)
-    raster.rasterize(verts, tris, vp, size, size, cull=cull, gbuf=gb,
-                     depth_bits=32)
-    if not midpoint:
-        return gb.zndc
-    # R251 C117: the MIDPOINT map's second surface. Raster 1 above is
-    # CLASSIC's own call (z1 is bitwise the CLASSIC texel). Raster 2 is a
-    # chunked fragment sweep: every fragment of the casters, and per texel
-    # the nearest one BEYOND the A-buffer tolerance of z1 -- THE NAMED TIE
-    # RULE: a fragment within `abuf_depth_limit` of the nearest is the
-    # SAME surface (the two triangles at a shared caster edge both include
-    # the boundary texel by the wobble window and would otherwise register
-    # the front surface twice: midpoint = front, self-shadow speckle along
-    # every caster's wireframe). Corollary: a closed shell thinner than the
-    # tolerance is one surface and casts nothing. Order-free by
-    # construction: z1 is a min; z2 is the min over a SET whose membership
-    # depends only on z1; a min is associative, commutative and exact in
-    # float32, so the run size cannot move a texel -- and the fill path is
-    # coverage-identical between `fill` and `fill_batched` (a run under
-    # BATCH_MIN_TRIS or a big triangle takes `fill` inside either).
-    z1 = gb.zndc
-    z2 = np.full((size, size), 1.0, np.float32)
-    has2 = np.zeros((size, size), bool)
-    n = int(tris.shape[0])
-    for start in range(0, n, MIDPOINT_RUN):
-        run = tris[start:start + MIDPOINT_RUN]
-        gb2 = raster.GBuffer(size, size)      # depth inf: every fragment kept
-        fl = _DepthFrags()
-        raster.rasterize(verts, run, vp, size, size, cull=cull, gbuf=gb2,
-                         frags=fl, depth_write=False, depth_bits=32)
-        px, py, zz = fl.finish()
-        if px.size == 0:
-            continue
-        sel = zz > raster.abuf_depth_limit(z1[py, px])
-        if not sel.any():
-            continue
-        np.minimum.at(z2, (py[sel], px[sel]), zz[sel])
-        has2[py[sel], px[sel]] = True
-    return z1, z2, has2
+def _box_misses(bounds, vp, size):
+    """True when an axis-aligned box of casters cannot put a fragment on
+    a size x size map: all eight corners behind the near plane, or all
+    eight in front of it and outside the same side of the map by four
+    texels. Both are linear half-spaces of clip space, so what holds for
+    the corners holds for every triangle inside the box; a box that
+    straddles the near plane is never judged (the clipper makes new
+    corners there). Float64 on eight points with a margin a thousand
+    float32 roundings wide: the per-triangle reject and the fills decide
+    everything this cannot."""
+    lo, hi = bounds
+    c = np.array([[x, y, z, 1.0] for x in (float(lo[0]), float(hi[0]))
+                  for y in (float(lo[1]), float(hi[1]))
+                  for z in (float(lo[2]), float(hi[2]))], np.float64)
+    clip = c @ np.asarray(vp, np.float64).T
+    x, y, w = clip[:, 0], clip[:, 1], clip[:, 3]
+    f = clip[:, 2] + w
+    tol = 1e-4 * max(float(np.abs(clip).max()), 1e-6)
+    if bool((f < -tol).all()):
+        return True
+    if not bool((f > tol).all()):
+        return False
+    g = (1.0 + 8.0 / float(size)) * w
+    return bool((x > g + tol).all() or (x < -g - tol).all()
+                or (y > g + tol).all() or (y < -g - tol).all())
 
 
-_SHADOW_CACHE = {}
+def _render_depth(verts, tris, vp, size, cull='NONE', midpoint=False,
+                  bounds=None):
+    """THE BAKE: vertex positions, caster triangles, a view-projection
+    and a size in; the map's NDC depth plane out (1.0 where nothing
+    landed), or the MIDPOINT triple (z1, z2, has2).
 
+    Every map this engine builds comes through this one function -- a
+    whole map, a cached static layer, the layer of the objects that
+    moved, a map baked on its first lookup, the maps a worker pool is
+    handed -- and always through the module's name for it, so a device
+    bake can stand here: whatever returns these texels for these
+    arguments is a bake. `bounds` (lo, hi) is an axis-aligned box around
+    the triangles' vertices, when the caller has one: a map the box
+    cannot reach returns blank without reading a vertex.
 
-def clear_shadow_cache():
-    _SHADOW_CACHE.clear()
+    R254: depth only (core/raster.rasterize_depth: the same clipper,
+    coverage and z as the beauty rasteriser, bitwise its zndc, none of
+    its G-buffer), in front of it a per-map reject of the triangles that
+    cannot own a fragment. The R87 note that stood here -- a frustum
+    cull 'kept ~100% of triangles' and cost 15% -- was measured on maps
+    that enclose the whole scene (a sun, a spot); a cube face keeps a
+    quarter to a half, and the reject is one byte per vertex instead of
+    the gather that cull paid.
+
+    R251 C117: the MIDPOINT map's second surface is, per texel, the
+    nearest fragment BEYOND the A-buffer tolerance of z1 -- THE NAMED
+    TIE RULE: a fragment within `abuf_depth_limit` of the nearest is the
+    SAME surface (the two triangles at a shared caster edge both include
+    the boundary texel by the wobble window and would otherwise register
+    the front surface twice: midpoint = front, self-shadow speckle along
+    every caster's wireframe). Corollary: a closed shell thinner than
+    the tolerance is one surface and casts nothing. Order-free by
+    construction: z1 is a min; z2 is the min over a SET whose membership
+    depends only on z1; a min is associative, commutative and exact in
+    float32."""
+    if bounds is not None and _box_misses(bounds, vp, size):
+        return raster.rasterize_depth(verts, tris[:0], vp, size, size,
+                                      cull=cull, second=midpoint)
+    return raster.rasterize_depth(verts, tris, vp, size, size, cull=cull,
+                                  second=midpoint)
 
 
 def midpoint_map(light, settings):
@@ -308,56 +349,6 @@ def midpoint_map(light, settings):
     mode = own if own != 'INHERIT' else \
         str(getattr(settings, 'shadow_map_depth', 'CLASSIC') or 'CLASSIC')
     return mode == 'MIDPOINT'
-
-
-def _shadow_base_signature(scene, settings, caster_tris):
-    """Fingerprint of what EVERY shadow map depends on: the geometry,
-    the shadow settings and the caster set -- everything except the
-    light itself.
-
-    The geometry is the two strided sums AND mathx.content_digest of
-    every vertex position: the sums alone served the old maps -- the
-    shadow stayed where the object USED to stand -- for a move between
-    the stride's samples, and for a (0, d, -d) move whose float sum
-    cancels exactly."""
-    mesh = scene.mesh
-    v = mesh.verts
-    step = max(1, v.shape[0] // 512)
-    geo = (v.shape[0], float(v[::step].sum()), float(v[::step, 0].dot(
-        np.arange(v[::step].shape[0], dtype=np.float32))),
-        M.content_digest(v))
-    return (geo, settings.shadows, settings.shadow_default,
-            int(settings.shadow_map_size),
-            # size AND sum: two caster sets of equal count (say, two
-            # same-sized materials toggling Shadow > Cast) must not
-            # collide in the cache
-            None if caster_tris is None else
-            (int(caster_tris.size), int(caster_tris.sum())),
-            # R251 C117: the map depth rule changes every texel
-            str(getattr(settings, 'shadow_map_depth', 'CLASSIC')))
-
-
-def _light_shadow_signature(light):
-    """The one light's own contribution to its map: pose and lens.
-
-    Colour and energy are deliberately absent -- they tint the LIGHT,
-    never the depth -- so palette edits ride the cache untouched. The
-    lamp's SIZE (Radius, a Sun's Angle, an Area's Size) is absent too:
-    it does not move a depth texel and the built map carries nothing
-    derived from it -- the penumbra is measured per receiver at lookup
-    (core/softmap.py) -- so dragging a size re-bakes nothing."""
-    return (light.type, tuple(np.round(light.position, 5)),
-            tuple(np.round(light.direction, 5)),
-            round(float(light.spot_size), 5), light.shadow,
-            int(light.shadow_map_size),
-            # R251 C117: the per-lamp Map Depth override
-            str(getattr(light, 'shadow_map_depth', 'INHERIT')),
-            # R253: the Square cone widens the buffer's frustum and
-            # ClipSta / ClipEnd move its planes -- every one a depth
-            # texel, so the per-light cache must rebuild on a change
-            bool(getattr(light, 'spot_square', False)),
-            round(float(getattr(light, 'shadow_clip_start', 0.0) or 0.0), 6),
-            round(float(getattr(light, 'shadow_clip_end', 0.0) or 0.0), 6))
 
 
 def shadow_clip_planes(light, near_auto, far_auto):
@@ -375,164 +366,868 @@ def shadow_clip_planes(light, near_auto, far_auto):
     return near, far
 
 
-def build_shadow_maps(scene, settings, caster_tris=None):
-    """Bake a shadow map (or cube) for every light that wants one.
+#: R254: a Spot bakes ONE perspective map while the field of view its
+#: cone needs stays at or under this (126 degrees); a wider one bakes the
+#: Point lamp's cube. A single map stretched towards 172 degrees spent 18
+#: texels per unit tangent where a 60 degree cone has 372, and the
+#: texel-scaled normal offset lifted the receiver out of its own shadow
+#: (150 degrees: 62% of the shadow lost)
+SPOT_CUBE_FOV = 2.2
 
-    Each map is a full rasterisation pass, and a point light needs six.
-    None of it changes while the lights and geometry hold still, which
-    for most of an animation is all of it. The cache is PER LIGHT:
-    the old whole-list fingerprint meant nudging ONE lamp of fifteen
-    re-rasterised every map in the scene ('if I wanted to move
-    lights... it will lag like crazy'); now only the moved lamp's own
-    map rebuilds, and a colour or energy edit rebuilds nothing at all.
-    """
-    if getattr(settings, 'cache_shadows', True) and scene.mesh is not None \
-            and scene.mesh.verts is not None and scene.mesh.verts.size:
-        try:
-            base = _shadow_base_signature(scene, settings, caster_tris)
-        except Exception:                                       # noqa: BLE001
-            base = None
-        if base is not None:
-            misses = []
-            for i, light in enumerate(scene.lights):
-                try:
-                    key = (base, _light_shadow_signature(light))
-                except Exception:                               # noqa: BLE001
-                    misses.append((i, None))
-                    continue
-                hit = _SHADOW_CACHE.get(key)
-                if hit is not None:
-                    light.shadow_map = hit
-                else:
-                    misses.append((i, key))
-            if misses:
-                _build_shadow_maps(scene, settings, caster_tris,
-                                   only={i for i, _k in misses})
-                for i, key in misses:
-                    sm = scene.lights[i].shadow_map
-                    if key is not None and sm is not None:
-                        if len(_SHADOW_CACHE) > 64:
-                            _SHADOW_CACHE.clear()
-                        _SHADOW_CACHE[key] = sm
-            return
-    _build_shadow_maps(scene, settings, caster_tris)
+#: the half angle of the cone that holds a whole cube face: acos(1/sqrt 3)
+_CUBE_FACE_REACH = float(np.arccos(1.0 / np.sqrt(3.0)))
 
 
-def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
-    """Build maps for every map-needing light, or -- with `only`, a set
-    of light indices -- just those, leaving the rest untouched (the
-    per-light cache hands the untouched ones their parked maps)."""
-    mesh = scene.mesh
-    if mesh is None or mesh.verts is None or mesh.tris is None:
-        return
-    tris = mesh.tris
-    if caster_tris is not None:
-        tris = tris[caster_tris]
-    if tris.shape[0] == 0:
-        return
-    centre, radius = scene_bounds(mesh.verts)
+def spot_map_fov(light):
+    """The field of view a Spot's shadow map must span, in radians and
+    uncapped: its cone with the 15% margin every Spot map always had --
+    the diagonal of a Square cone, and under GX Ring 2 the angle at
+    which the ring's light ends (libogc's RING2 is centred ON the cutoff
+    and reaches zero at cos = c - (1 - c) / sqrt 2, 9.5 degrees past a
+    60 degree cone; the map used to stop at the cutoff and the shadow
+    was cut off inside the lit ring). The one place the bake, the cache
+    key and the choice between one map and a cube read it."""
+    size = float(light.spot_size)
+    ring = str(getattr(light, 'spot_law', 'BLENDER') or 'BLENDER') \
+        == 'GX_RING2'
+    if getattr(light, 'spot_square', False):
+        # R253 (A): a Square cone lights a square patch whose corners
+        # sit sqrt(2) further out than the round cone's edge -- widen
+        # the buffer to the diagonal so the corners keep their shadows
+        half_t = float(np.tan(size * 0.5)) * np.sqrt(2.0)
+        if not ring:
+            return max(2.0 * float(np.arctan(half_t)) * 1.15, 0.05)
+        half = float(np.arctan(half_t))
+    else:
+        if not ring:
+            return max(size * 1.15, 0.05)
+        half = size * 0.5
+    c = float(np.cos(size * 0.5))
+    reach = float(np.arccos(max(c - (1.0 - c) / np.sqrt(2.0), -1.0)))
+    return max(2.0 * max(half, reach) * 1.15, 0.05)
 
-    # PLAN first (cheap geometry per map), RENDER second -- because the
-    # renders are independent: each map is its own buffer, its own depth
-    # min-compares, deterministic in isolation, so thread scheduling
-    # cannot move a bit. On a high-poly scene a point light is six full
-    # rasterisations and they used to run one after another; the
-    # rasteriser is big-array NumPy that releases the interpreter lock,
-    # which is the one shape of work threads genuinely scale on this
-    # renderer (the shading loop is not -- see the Threads tooltip).
-    jobs = []                      # (assign, vp, size, mid) -- assign(depth)
-    for li, light in enumerate(scene.lights):
-        if only is not None and li not in only:
-            continue
-        light.shadow_map = None
-        if not settings.shadows or light.type == 'AMBIENT':
-            continue
-        mode = light.shadow if settings.shadow_default == 'PER_LIGHT' else \
-            settings.shadow_default
-        if mode != 'MAP' or light.shadow == 'NONE':
-            continue
-        size = int(light.shadow_map_size or settings.shadow_map_size)
-        size = max(32, min(4096, size))
-        # R251 C117: CLASSIC (nearest + bias) or Woo's MIDPOINT map
-        mid = midpoint_map(light, settings)
-        pos = np.asarray(light.position, np.float32)
-        if light.type == 'SUN':
+
+def _map_size(light, settings):
+    """The side of a lamp's map: its own Map Size or the render's,
+    32..4096, divided for a viewport draft (preview.py sets
+    `_shadow_map_div` on a draft's settings and divides the texel-unit
+    Softness with it; a refine and an F12 never carry it)."""
+    size = int(light.shadow_map_size or settings.shadow_map_size)
+    size = max(32, min(4096, size))
+    div = int(getattr(settings, '_shadow_map_div', 1) or 1)
+    if div > 1:
+        size = min(size, max(64, size // div))
+    return size
+
+
+class _MapPlan:
+    """One lamp's map before it is baked: the frames of its faces and
+    everything the built map records. `skip` marks cube faces that are
+    never baked (outside a wide Spot's cone: no lit point looks there)."""
+
+    __slots__ = ('faces', 'skip', 'near', 'far', 'persp', 'size',
+                 'origin', 'extent', 'mid', 'cube')
+
+    def blob(self):
+        """Every number a bake of this plan reads, as bytes: two plans
+        with one blob rasterise identical texels from identical
+        casters."""
+        head = np.array([self.near, self.far, self.extent, self.size,
+                         self.persp, self.mid, self.cube], np.float64)
+        return head.tobytes() + bytes(bytearray(self.skip)) + b''.join(
+            np.asarray(vp, np.float32).tobytes() for vp in self.faces)
+
+    def face(self, fi, zndc):
+        """The ShadowMap of face `fi` from its depth plane."""
+        return ShadowMap(self.faces[fi], zndc, self.near, self.far,
+                         self.persp, self.size, self.origin, self.extent)
+
+    def build(self, depths):
+        """The ShadowMap / CubeShadow of one depth plane per face."""
+        return self.join([self.face(fi, z) for fi, z in enumerate(depths)])
+
+    def join(self, maps):
+        if self.cube:
+            return CubeShadow(list(maps), self.origin)
+        return maps[0]
+
+
+def _plan_map(light, settings, centre, radius):
+    """The plan of `light`'s map in a scene of these bounds. The
+    expressions are the ones the bake always evaluated, in their order:
+    a plan is bitwise the frame the old code built."""
+    plan = _MapPlan()
+    plan.size = _map_size(light, settings)
+    # R251 C117: CLASSIC (nearest + bias) or Woo's MIDPOINT map
+    plan.mid = midpoint_map(light, settings)
+    plan.cube = False
+    pos = np.asarray(light.position, np.float32)
+    if light.type == 'SUN':
+        d = M.normalize(np.asarray(light.direction, np.float32))
+        eye = centre - d * (radius * 2.5)
+        view = _look_at_lh(eye, centre, np.array([0, 0, 1.0], np.float32))
+        near = 1e-3
+        far = radius * 5.0
+        half = radius * 1.05
+        plan.faces = [_ortho(half, near, far) @ view]
+        plan.skip = [False]
+        plan.near, plan.far, plan.persp = near, far, False
+        plan.origin, plan.extent = eye, half
+        return plan
+    near = max(radius * 0.005, 1e-3)
+    far = max(float(np.linalg.norm(centre - pos)) + radius * 1.5, near * 10)
+    wide = None
+    if light.type == 'SPOT':
+        wide = spot_map_fov(light)
+        if wide <= SPOT_CUBE_FOV:
             d = M.normalize(np.asarray(light.direction, np.float32))
-            eye = centre - d * (radius * 2.5)
-            view = _look_at_lh(eye, centre, np.array([0, 0, 1.0], np.float32))
-            near = 1e-3
-            far = radius * 5.0
-            half = radius * 1.05
-            vp = _ortho(half, near, far) @ view
-
-            def assign(depth, light=light, vp=vp, near=near, far=far,
-                       size=size, eye=eye, half=half):
-                light.shadow_map = ShadowMap(vp, depth, near, far, False,
-                                             size, eye, half)
-            jobs.append((assign, vp, size, mid))
-        elif light.type == 'SPOT':
-            d = M.normalize(np.asarray(light.direction, np.float32))
-            view = _look_at_lh(pos, pos + d, np.array([0, 0, 1.0], np.float32))
-            near = max(radius * 0.005, 1e-3)
-            far = max(float(np.linalg.norm(centre - pos)) + radius * 1.5, near * 10)
+            view = _look_at_lh(pos, pos + d,
+                               np.array([0, 0, 1.0], np.float32))
             # R253 (F): BI's ClipSta / ClipEnd replace the automatic
             # planes (0 = automatic, the expressions above untouched)
             near, far = shadow_clip_planes(light, near, far)
-            if getattr(light, 'spot_square', False):
-                # R253 (A): a Square cone lights a square patch whose
-                # corners sit sqrt(2) further out than the round cone's
-                # edge -- widen the buffer to the diagonal so the
-                # corners keep their shadows (the round fov is the old
-                # expression, bitwise, when the flag is off)
-                half_t = float(np.tan(float(light.spot_size) * 0.5)) * np.sqrt(2.0)
-                fov = min(max(2.0 * float(np.arctan(half_t)) * 1.15, 0.05), 3.0)
-            else:
-                fov = min(max(float(light.spot_size) * 1.15, 0.05), 3.0)
-            vp = _persp(fov, 1.0, near, far) @ view
+            fov = min(wide, 3.0)
+            plan.faces = [_persp(fov, 1.0, near, far) @ view]
+            plan.skip = [False]
+            plan.near, plan.far, plan.persp = near, far, True
+            plan.origin, plan.extent = pos, float(np.tan(fov * 0.5))
+            return plan
+    # a Point lamp's cube -- also an Area lamp's, and a Spot's whose
+    # cone is too wide for one perspective map
+    if light.type != 'AREA':
+        # R253 (F): the cube's six faces share BI's clip pair. R254: an
+        # Area lamp keeps the automatic planes -- its panel never drew
+        # the pair and the tooltips say Spot and Point only, yet a value
+        # left on a lamp that was once a Spot clipped its map unseen
+        near, far = shadow_clip_planes(light, near, far)
+    proj = _persp(np.pi * 0.5, 1.0, near, far)
+    plan.faces, plan.skip = [], []
+    axis = None
+    if wide is not None:
+        axis = M.normalize(np.asarray(light.direction, np.float32))
+    for fwd, up in CUBE_DIRS:
+        plan.faces.append(proj @ _look_at_lh(pos, pos + fwd, up))
+        skip = False
+        if axis is not None:
+            # a face wholly outside the cone the map must span: nothing
+            # the Spot lights looks through it, so it stays blank -- as
+            # everything outside the single map always read lit
+            ang = float(np.arccos(np.clip(float(np.dot(axis, fwd)),
+                                          -1.0, 1.0)))
+            skip = ang - _CUBE_FACE_REACH > min(wide * 0.5, np.pi)
+        plan.skip.append(bool(skip))
+    plan.near, plan.far, plan.persp = near, far, True
+    plan.origin, plan.extent, plan.cube = pos, 1.0, True
+    return plan
 
-            def assign(depth, light=light, vp=vp, near=near, far=far,
-                       size=size, pos=pos, fov=fov):
-                light.shadow_map = ShadowMap(vp, depth, near, far, True,
-                                             size, pos,
-                                             float(np.tan(fov * 0.5)))
-            jobs.append((assign, vp, size, mid))
+
+def _light_shadow_signature(light, settings=None):
+    """What ONE lamp's bake reads of the lamp, resolved the way the bake
+    resolves it -- the lamp's part of its cache key (R254).
+
+    A SUN's frame is built from the scene's bounds and its DIRECTION: its
+    position is not here, so a Sun dragged across the viewport re-bakes
+    nothing. A Point or Area lamp's cube is built from its POSITION: its
+    rotation is not here, so aiming an Area lamp re-bakes nothing. Only
+    a Spot reads both, with its cone (Spot Size, Square, and whether the
+    law is GX Ring 2, which widens the map). ClipSta / ClipEnd count for
+    the lamps that use them (Spot and Point). The Map Size and the Map
+    Depth are the RESOLVED ones (the lamp's own or the render's, the
+    viewport draft's divisor applied), so a render setting a lamp
+    overrides never misses that lamp, and Shadow Method is no part of
+    any key: a lamp that wants a map wants the same map under Shadow
+    Maps and under Per Light.
+
+    Colour and energy are absent -- they tint the LIGHT, never the depth
+    -- and so is the lamp's SIZE (Radius, a Sun's Angle, an Area's
+    Size): the penumbra is measured per receiver at lookup
+    (core/softmap.py) and the built map carries nothing derived from it.
+    Without `settings` the lamp's own values stand unresolved (0 = the
+    render's size, INHERIT)."""
+    if settings is not None:
+        size = _map_size(light, settings)
+        mid = midpoint_map(light, settings)
+    else:
+        size = int(getattr(light, 'shadow_map_size', 0) or 0)
+        mid = str(getattr(light, 'shadow_map_depth', 'INHERIT')) == 'MIDPOINT'
+    clip = (round(float(getattr(light, 'shadow_clip_start', 0.0) or 0.0), 6),
+            round(float(getattr(light, 'shadow_clip_end', 0.0) or 0.0), 6))
+    if light.type == 'SUN':
+        return ('SUN', tuple(np.round(light.direction, 5)), size, mid)
+    pos = tuple(np.round(light.position, 5))
+    if light.type == 'SPOT':
+        return ('SPOT', pos, tuple(np.round(light.direction, 5)),
+                round(float(light.spot_size), 5),
+                bool(getattr(light, 'spot_square', False)),
+                str(getattr(light, 'spot_law', 'BLENDER') or 'BLENDER')
+                == 'GX_RING2', clip, size, mid)
+    if light.type == 'AREA':
+        clip = (0.0, 0.0)
+    return ('CUBE', pos, clip, size, mid)
+
+
+def _shadow_base_signature(scene, settings, caster_tris):
+    """What EVERY shadow map of a frame depends on beside its own lamp:
+    the geometry and the caster set, each read in full.
+
+    mathx.content_digest of every vertex position (a strided sum served
+    the old maps for a move between the stride's samples, and for one
+    whose components cancel), of every triangle index (the same
+    positions re-topologised are other casters) and of the caster list
+    (it was a count and an index sum: two sets of equal count and equal
+    sum collided). R254: the shadow settings left this key -- each lamp
+    carries what its own bake resolves from them
+    (`_light_shadow_signature`), so switching Shadow Maps to Per Light,
+    or moving the render's Map Size under lamps that set their own,
+    misses nothing."""
+    mesh = scene.mesh
+    v, t = mesh.verts, mesh.tris
+    return ((int(v.shape[0]), M.content_digest(v),
+             int(t.shape[0]), M.content_digest(t)),
+            None if caster_tris is None else
+            (int(caster_tris.size), M.content_digest(caster_tris)))
+
+
+# ------------------------------------------------- who looks a map up
+#
+# R254: a map is baked for a lamp when something will look it up. The
+# bake used to walk every lamp whose Shadows menu resolved to a map --
+# lamps the Light Limit had dropped, a Hemi (which casts no shadow), a
+# Screen Spotlight (which casts none either), lamps at Power 0 -- and
+# each paid one to six rasterisations for texels nothing read.
+#
+# The readers of `light.shadow_map` are `visibility` (the CPU lookup)
+# and the GPU plan's `_shadow_meta` / signatures, which only ever ask
+# for the lamps of `frame_lights`. So the rule has three answers:
+#
+#   None     the lamp has no shadow term at all: the render's Shadows
+#            off, an AMBIENT lamp, Shadows None, a method other than a
+#            map -- and a HEMI, for which `visibility` answers ones
+#            before it looks at a map and the plan emits no function.
+#   'bake'   a lamp of `frame_lights` whose shadow a surface may read:
+#            baked now (in threads), on both roads.
+#   'defer'  a lamp that still WOULD get a map but that no surface is
+#            known to read: one the Light Limit dropped, a Screen
+#            Spotlight, an ambient lamp, a lamp that adds no light while
+#            nothing reads a shadow apart from the light. It is baked on
+#            its first lookup (`visibility` -> `_deferred_map`), so a
+#            reader this rule does not know -- today the volume march,
+#            which lights a container from every lamp, and the ground
+#            plane under a Screen Spotlight -- gets exactly the map it
+#            always got, and a lamp nobody looks up is never baked.
+#
+# The deferral is what keeps the rule right while the readers change:
+# nothing here assumes who reads, only who certainly does.
+
+
+def lamp_is_dark(light):
+    """Power exactly 0 or a black colour: the lamp's radiance is zero at
+    every point. The RAW Power, never the light style's gain -- a
+    strobing lamp keeps its map (the per-light cache makes it pay once)
+    and its plan."""
+    return float(light.energy) == 0.0 \
+        or not any(float(c) != 0.0 for c in light.color)
+
+
+def lamp_has_no_lobe(light):
+    """Neither a diffuse nor a specular lobe is left by the lamp's flags
+    (Diffuse / Specular off, or Diffuse Only with Specular Only)."""
+    dif = bool(getattr(light, 'affect_diffuse', True)) \
+        and not getattr(light, 'specular_only', False)
+    spc = bool(getattr(light, 'affect_specular', True)) \
+        and not getattr(light, 'diffuse_only', False)
+    return not dif and not spc
+
+
+def lamp_adds_nothing(light):
+    """The lamp's own contribution to a lit surface is exactly zero: no
+    radiance, or no lobe to carry it. A Hemi is never judged here (its
+    ground colour is a second radiance, and it has no shadow to save)."""
+    if str(getattr(light, 'type', '')).upper() == 'HEMI':
+        return False
+    return lamp_is_dark(light) or lamp_has_no_lobe(light)
+
+
+def wants_shadow_map(light, settings):
+    """The bake's oldest gate: the render's Shadows on, a lamp that is
+    not AMBIENT, Shadows not None and a method that resolves to a
+    map."""
+    if not settings.shadows or light.type == 'AMBIENT':
+        return False
+    mode = light.shadow if settings.shadow_default == 'PER_LIGHT' else \
+        settings.shadow_default
+    return mode == 'MAP' and light.shadow != 'NONE'
+
+
+def map_roles(scene, settings):
+    """None / 'bake' / 'defer' for each lamp of the scene, in order (the
+    section note above is the rule)."""
+    lights = scene.lights or []
+    frame = {id(l) for l in frame_lights(scene, settings)}
+    # a reader that takes a shadow apart from its lamp's light (the
+    # Shadow pass, a Shadows Only material, a paint or cel key) makes
+    # every lamp's shadow count: render._build_shadows says whether one
+    # exists; unsaid, one is assumed
+    quiet = bool(getattr(settings, '_shadow_quiet', False))
+    # the ambient lamps (Ambient Only): once every reader skips them
+    # through one predicate they shade nothing directly
+    ambient = globals().get('is_ambient_lamp')
+    roles = []
+    for light in lights:
+        if not wants_shadow_map(light, settings) or light.type == 'HEMI':
+            roles.append(None)
+        elif id(light) not in frame:
+            roles.append('defer')
+        elif light.type == 'SPOT' and getattr(light, 'screen_spot', False):
+            roles.append('defer')
+        elif ambient is not None and ambient(light):
+            roles.append('defer')
+        elif quiet and lamp_adds_nothing(light):
+            roles.append('defer')
         else:
-            near = max(radius * 0.005, 1e-3)
-            far = max(float(np.linalg.norm(centre - pos)) + radius * 1.5, near * 10)
-            # R253 (F): the cube's six faces share BI's clip pair too
-            near, far = shadow_clip_planes(light, near, far)
-            proj = _persp(np.pi * 0.5, 1.0, near, far)
-            slots = [None] * len(CUBE_DIRS)
-            pending = {'n': len(CUBE_DIRS)}
-            for fi, (fwd, up) in enumerate(CUBE_DIRS):
-                view = _look_at_lh(pos, pos + fwd, up)
-                vp = proj @ view
+            roles.append('bake')
+    return roles
 
-                def assign(depth, light=light, vp=vp, near=near, far=far,
-                           size=size, pos=pos, fi=fi, slots=slots,
-                           pending=pending):
-                    slots[fi] = ShadowMap(vp, depth, near, far, True,
-                                          size, pos, 1.0)
-                    pending['n'] -= 1
-                    if pending['n'] == 0:
-                        light.shadow_map = CubeShadow(list(slots), pos)
-                jobs.append((assign, vp, size, mid))
 
+def map_deferred(light):
+    """True while `light` holds a deferred map this frame: nothing is
+    known to read its shadow. The GPU plan may answer 'no shadow term'
+    for such a lamp (it asks only for `frame_lights`, and a frame lamp is
+    deferred only when no surface reads its shadow on either road)."""
+    return light.__dict__.get('_shadow_defer') is not None
+
+
+def _no_promise():
+    return None
+
+
+class _Deferred:
+    """A lamp's map, promised: baked through the cache the first time
+    `visibility` looks it up. It crosses a pickle as nothing (a worker
+    process plans its own frame) and a deep copy as itself."""
+
+    __slots__ = ('scene', 'settings', 'casters', 'index')
+
+    def __init__(self, scene, settings, casters, index):
+        self.scene = scene
+        self.settings = settings
+        self.casters = casters
+        self.index = index
+
+    def __reduce__(self):
+        return (_no_promise, ())
+
+    def __deepcopy__(self, memo):
+        return self
+
+
+def _deferred_map(light):
+    """Keep a deferred lamp's promise (see `map_roles`): bake its map
+    now, once, whichever thread asks first."""
+    rec = light.__dict__.get('_shadow_defer')
+    if rec is None:
+        return None
+    with _BAKE_LOCK:
+        if light.__dict__.get('_shadow_defer') is rec:
+            lights = rec.scene.lights or []
+            src = lights[rec.index] if rec.index < len(lights) else None
+            if src is not None:
+                _bake_lamps(_Frame(rec.scene, rec.settings, rec.casters),
+                            [rec.index],
+                            cache=getattr(rec.settings, 'cache_shadows',
+                                          True))
+                if src is not light:
+                    light.shadow_map = src.shadow_map
+                    src.__dict__.pop('_shadow_defer', None)
+            light.__dict__.pop('_shadow_defer', None)
+    return light.shadow_map
+
+
+def drop_shadow_maps(scene):
+    """Forget every lamp's map and promise. A frame that builds none --
+    Ray Traced, Shadows off -- must not leave an earlier frame's map on
+    a Scene that is rendered again: `visibility` falls through to it
+    once the traced branch is off."""
+    for light in (getattr(scene, 'lights', None) or ()):
+        light.shadow_map = None
+        light.__dict__.pop('_shadow_defer', None)
+        light.__dict__.pop('_shadow_key', None)
+
+
+# ------------------------------------------------------------ the cache
+
+#: bytes of depth the cache may hold beyond what the frame in hand uses
+SHADOW_CACHE_BYTES = 512 * 1024 * 1024
+
+#: a static layer is kept while the objects that moved own at most this
+#: share of the casters (past it a full bake costs about the same)
+LAYER_MAX_MOVED = 1.0 / 3.0
+
+#: the most objects a mesh may hold for its maps to be layered
+LAYER_MAX_OBJECTS = 20000
+
+
+def _plane_bytes(a):
+    """Bytes a depth plane really holds (a blank plane holds none)."""
+    if a is None or raster.is_blank(a) \
+            or any(a is b for b in _BLANK_PLANES.values()):
+        return 0
+    return int(a.nbytes)
+
+
+def _map_bytes(sm):
+    faces = getattr(sm, 'faces', None) or [sm]
+    return sum(_plane_bytes(f.depth) for f in faces)
+
+
+class _Layer:
+    """What a lamp's map keeps so that a moved object re-rasterises only
+    itself: the plan it was baked for, the per-object digests at its
+    last bake, and -- once something has moved -- the depth planes of
+    everything that did NOT (`static`), the objects left out of them
+    (`excl`) and the digests those planes were baked from."""
+
+    __slots__ = ('blob', 'last', 'static', 'excl', 'static_od', 'maps')
+
+    def nbytes(self):
+        return sum(_plane_bytes(z) for z in (self.static or ()))
+
+    def reset(self, excl=None, static_od=None):
+        self.static = None
+        self.excl, self.static_od = excl, static_od
+        # the face maps of the static planes alone: a face the moved
+        # objects do not reach IS its static map, built once
+        self.maps = {}
+
+
+class _ShadowCache(dict):
+    """Baked maps by key, least recently used first, bounded by BYTES.
+
+    The bound was a count: past 64 entries everything was dropped. A
+    dragged lamp parks one map per pose, an animated mesh one per lamp
+    per frame, so two 2048 point lamps held 6 GB after 32 frames -- and
+    the clear then threw away the maps of the lamps that had not moved.
+    Now the oldest entries leave while the depth held exceeds
+    SHADOW_CACHE_BYTES plus what the frame in hand uses, and an entry
+    that frame uses never leaves (a frame with more lamps than the
+    budget would otherwise bake them in a circle)."""
+
+    def __init__(self):
+        super().__init__()
+        self.layers = {}                # (base, lamp signature) -> _Layer
+        self.frame = set()              # keys the frame in hand uses
+
+    def clear(self):
+        super().clear()
+        self.layers.clear()
+        self.frame.clear()
+
+    def begin_frame(self):
+        self.frame = set()
+
+    def touch(self, key):
+        """`key`'s map, marked as used by the frame in hand."""
+        sm = self.get(key)
+        if sm is not None:
+            self.frame.add(key)
+            # dicts keep insertion order: re-inserting moves to the end
+            super().__delitem__(key)
+            super().__setitem__(key, sm)
+        return sm
+
+    def store(self, key, sm):
+        if key in self:
+            super().__delitem__(key)
+        super().__setitem__(key, sm)
+        self.frame.add(key)
+        self.trim()
+
+    def held_bytes(self):
+        seen, total = set(), 0
+        for sm in self.values():
+            if id(sm) not in seen:
+                seen.add(id(sm))
+                total += _map_bytes(sm)
+        return total + sum(lay.nbytes() for lay in self.layers.values())
+
+    def trim(self):
+        used = sum(_map_bytes(self[k]) for k in self.frame if k in self)
+        budget = SHADOW_CACHE_BYTES + used
+        total = self.held_bytes()
+        if total <= budget:
+            return
+        live = {(k[1], k[2]) for k in self.frame}
+        for lk in list(self.layers):
+            if total <= budget:
+                return
+            if (lk[1], lk[2]) in live:
+                continue
+            total -= self.layers.pop(lk).nbytes()
+        for key in list(self.keys()):
+            if total <= budget:
+                return
+            if key in self.frame:
+                continue
+            total -= _map_bytes(self[key])
+            super().__delitem__(key)
+
+
+_SHADOW_CACHE = _ShadowCache()
+
+# one bake at a time touches the cache: a frame's own build, and the
+# deferred maps its shading threads may ask for
+_BAKE_LOCK = threading.RLock()
+
+#: per-object vertex ranges by topology (see `_Frame.objects`)
+_RANGE_CACHE = {}
+
+
+def clear_shadow_cache():
+    _SHADOW_CACHE.clear()
+    _RANGE_CACHE.clear()
+
+
+class _Frame:
+    """What one frame's bakes share: the casters, the scene's bounds and
+    the geometry's part of every cache key, read once."""
+
+    def __init__(self, scene, settings, caster_tris):
+        self.scene = scene
+        self.settings = settings
+        self.casters = caster_tris
+        mesh = scene.mesh
+        self.verts = mesh.verts
+        self.tris = mesh.tris if caster_tris is None else \
+            mesh.tris[caster_tris]
+        self.centre, self.radius = scene_bounds(mesh.verts)
+        self._base = None
+        self._objects = False
+        self._plans = {}
+        self._splits = {}
+
+    def base(self):
+        if self._base is None:
+            self._base = _shadow_base_signature(self.scene, self.settings,
+                                                self.casters)
+        return self._base
+
+    def plan(self, li):
+        p = self._plans.get(li)
+        if p is None:
+            p = self._plans[li] = _plan_map(self.scene.lights[li],
+                                            self.settings, self.centre,
+                                            self.radius)
+        return p
+
+    def key(self, li):
+        base = self.base()
+        return (base[0], base[1],
+                _light_shadow_signature(self.scene.lights[li],
+                                        self.settings))
+
+    def split(self, excl):
+        """(casters of every other object, casters of the objects in
+        `excl`, the box around those objects' vertices)."""
+        hit = self._splits.get(excl)
+        if hit is None:
+            obj_c, _od, rng, _okey = self.objects()
+            sel = np.isin(obj_c, np.fromiter(excl, np.int64, len(excl)))
+            hit = self._splits[excl] = (
+                self.tris[~sel], self.tris[sel],
+                _tri_bounds(self.verts, rng, excl))
+        return hit
+
+    def objects(self):
+        """(object of each caster triangle, per-object digests, per-
+        object vertex ranges, the topology's key), or None when the mesh
+        cannot be layered: no object index, or objects whose vertices
+        are not each one block of the vertex array (then one object's
+        digest would not cover exactly its own casters)."""
+        if self._objects is not False:
+            return self._objects
+        self._objects = None
+        mesh = self.scene.mesh
+        obj = getattr(mesh, 'obj_index', None)
+        tris = mesh.tris
+        if obj is None or tris is None or len(obj) != tris.shape[0] \
+                or tris.shape[0] == 0:
+            return None
+        tkey = (self.base()[0][2], self.base()[0][3], int(len(obj)),
+                M.content_digest(obj))
+        rng = _RANGE_CACHE.get(tkey)
+        if rng is None:
+            obj = np.asarray(obj, np.int64)
+            n_obj = int(obj.max()) + 1
+            rng = ()
+            if 0 <= int(obj.min()) and n_obj <= LAYER_MAX_OBJECTS:
+                big = np.iinfo(np.int64).max
+                lo = np.full(n_obj, big, np.int64)
+                hi = np.full(n_obj, -1, np.int64)
+                np.minimum.at(lo, obj, tris.min(axis=1).astype(np.int64))
+                np.maximum.at(hi, obj, tris.max(axis=1).astype(np.int64))
+                order = np.argsort(lo, kind='stable')
+                order = order[hi[order] >= 0]
+                if order.size and bool(
+                        (hi[order][:-1] < lo[order][1:]).all()):
+                    rng = (lo, hi)
+            if len(_RANGE_CACHE) >= 8:
+                _RANGE_CACHE.pop(next(iter(_RANGE_CACHE)))
+            _RANGE_CACHE[tkey] = rng
+        if not rng:
+            return None
+        lo, hi = rng
+        v = self.verts
+        if not v.flags.c_contiguous:
+            return None
+        digests = tuple(
+            M.content_digest(v[int(a):int(b) + 1]) if b >= 0 else 0
+            for a, b in zip(lo, hi))
+        obj_c = np.asarray(mesh.obj_index)
+        if self.casters is not None:
+            obj_c = obj_c[self.casters]
+        self._objects = (obj_c, digests, rng,
+                         (self.base()[0][0],) + tkey)
+        return self._objects
+
+
+def _run_depth_jobs(frame, jobs):
+    """Rasterise `jobs` -- (triangles, vp, size, midpoint, bounds) each
+    -- and return their depth planes in order.
+
+    The renders are independent: each map is its own buffer, its own
+    depth min-compares, deterministic in isolation, so thread scheduling
+    cannot move a bit. The rasteriser is big-array NumPy that releases
+    the interpreter lock, which is the one shape of work threads
+    genuinely scale on this renderer (the shading loop is not -- see the
+    Threads tooltip). R254: the gate counts TEXELS as well as triangles
+    -- the cost follows both, and a 29,000-triangle scene with one 2048
+    cube used to bake its six faces one after another."""
     if not jobs:
-        return
-    parallel = len(jobs) > 1 and tris.shape[0] >= 50000
-    if parallel:
+        return []
+    verts = frame.verts
+
+    def one(j):
+        return _render_depth(verts, j[0], j[1], j[2], midpoint=j[3],
+                             bounds=j[4])
+
+    work = sum(int(j[2]) * int(j[2]) for j in jobs)
+    tris = max(int(j[0].shape[0]) for j in jobs)
+    if len(jobs) > 1 and (tris >= 50000 or work >= 2_000_000):
         import concurrent.futures as _fut
         import os as _os
         workers = min(len(jobs), max((_os.cpu_count() or 2) - 1, 2))
         with _fut.ThreadPoolExecutor(max_workers=workers) as pool:
-            depths = list(pool.map(
-                lambda j: _render_depth(mesh.verts, tris, j[1], j[2], midpoint=j[3]), jobs))
-        for (assign, _vp, _s, _m), depth in zip(jobs, depths):
-            assign(depth)
-    else:
-        for assign, vp, size, mid in jobs:
-            assign(_render_depth(mesh.verts, tris, vp, size, midpoint=mid))
+            return list(pool.map(one, jobs))
+    return [one(j) for j in jobs]
+
+
+def _tri_bounds(verts, rng, objects):
+    """The box around the vertex blocks of `objects`."""
+    lo, hi = rng
+    los, his = [], []
+    for k in objects:
+        a, b = int(lo[k]), int(hi[k])
+        if b < a:
+            continue
+        blk = verts[a:b + 1]
+        los.append(blk.min(axis=0))
+        his.append(blk.max(axis=0))
+    if not los:
+        return None
+    return np.min(los, axis=0), np.max(his, axis=0)
+
+
+def _bake_lamps(frame, indices, cache=True):
+    """Bake the maps of the lamps at `indices` and hand each lamp its
+    map; with `cache`, through the per-light store.
+
+    A map whose lamp, casters and topology are the ones of an earlier
+    bake but whose VERTICES moved is not rasterised whole again
+    (R254). A CLASSIC texel is the minimum z over the fragments that
+    land on it and a fragment's z depends on its own triangle and the
+    map's frame only, so
+
+        depth(all casters) = linearise(min(zndc(static), zndc(moved)))
+
+    bit for bit (`ShadowMap._linearise` clips z to [-1, 1], so an empty
+    texel's 1.0 and a fragment beyond the far plane land on one float).
+    The first frame something moves bakes the layer of everything that
+    did not -- about the cost of the full bake it replaces -- and every
+    later frame of the same objects moving re-rasterises those objects
+    alone and takes one minimum per face. It holds while the plan is
+    bitwise the layer's (the scene's bounds move a Sun's frame and every
+    far plane) and the casters, the topology and the object index are;
+    a MIDPOINT map (its second surface is not a plain minimum), a mesh
+    without an object index, or more than a third of the casters moving
+    take the full bake."""
+    lights = frame.scene.lights
+    store = _SHADOW_CACHE if cache else None
+    jobs = []
+    full = []                 # (li, plan, key, first job, layer key, od)
+    layered = []              # (li, plan, key, layer, static job, moved job, od)
+
+    def face_jobs(plan, tris, mid, box):
+        j0 = len(jobs)
+        for vp, skip in zip(plan.faces, plan.skip):
+            jobs.append((tris[:0] if skip else tris, vp, plan.size, mid,
+                         box))
+        return j0
+
+    for li in indices:
+        light = lights[li]
+        plan = frame.plan(li)
+        key = frame.key(li) if cache else None
+        if store is not None:
+            hit = store.touch(key)
+            if hit is not None:
+                light.shadow_map = hit
+                light._shadow_key = key
+                continue
+        objs = frame.objects() if (store is not None and not plan.mid) \
+            else None
+        lkey = od = lay = None
+        if objs is not None:
+            od = objs[1]
+            lkey = (objs[3], key[1], key[2])
+            lay = store.layers.get(lkey)
+            if lay is not None and (lay.blob != plan.blob()
+                                    or len(lay.last) != len(od)):
+                lay = None
+        if lay is not None:
+            rest = [k for k in range(len(od)) if k not in (lay.excl or ())]
+            fresh = lay.static is None or any(
+                od[k] != lay.static_od[k] for k in rest)
+            s0 = None
+            if fresh:
+                # the layer of what did not move since this lamp's last
+                # bake (a full bake's cost, once per gesture)
+                excl = frozenset(k for k in range(len(od))
+                                 if od[k] != lay.last[k])
+                t_static, t_moved, _box = frame.split(excl)
+                if t_moved.shape[0] <= LAYER_MAX_MOVED * frame.tris.shape[0]:
+                    lay.reset(excl, od)
+                    s0 = face_jobs(plan, t_static, False, None)
+                    fresh = False
+            if not fresh:
+                _t_static, t_moved, box = frame.split(lay.excl)
+                m0 = face_jobs(plan, t_moved, False, box)
+                layered.append((li, plan, key, lay, s0, m0, od))
+                continue
+        j0 = face_jobs(plan, frame.tris, plan.mid, None)
+        full.append((li, plan, key, j0, lkey, od))
+    depths = _run_depth_jobs(frame, jobs)
+    for li, plan, key, j0, lkey, od in full:
+        sm = plan.build(depths[j0:j0 + len(plan.faces)])
+        lights[li].shadow_map = sm
+        if store is not None:
+            lights[li]._shadow_key = key
+            if lkey is not None:
+                lay = _Layer()
+                lay.blob, lay.last = plan.blob(), od
+                lay.reset()
+                store.layers[lkey] = lay
+            store.store(key, sm)
+    for li, plan, key, lay, s0, m0, od in layered:
+        nf = len(plan.faces)
+        if s0 is not None:
+            lay.static = depths[s0:s0 + nf]
+        maps = []
+        for fi, (zs, zm) in enumerate(zip(lay.static,
+                                          depths[m0:m0 + nf])):
+            if raster.is_blank(zm):
+                face = lay.maps.get(fi)
+                if face is None:
+                    face = lay.maps[fi] = plan.face(fi, zs)
+            elif raster.is_blank(zs):
+                face = plan.face(fi, zm)
+            else:
+                face = plan.face(fi, np.minimum(zs, zm))
+            maps.append(face)
+        lay.last = od
+        sm = plan.join(maps)
+        lights[li].shadow_map = sm
+        lights[li]._shadow_key = key
+        store.store(key, sm)
+
+
+def _plan_frame(scene, settings, caster_tris, only=None):
+    """Reset the lamps (all, or the indices in `only`), decide each
+    one's role and leave the deferred ones their promise. Returns
+    (frame, indices to bake now), or (None, []) when nothing can be
+    baked."""
+    lights = scene.lights or []
+    for li, light in enumerate(lights):
+        if only is not None and li not in only:
+            continue
+        light.shadow_map = None
+        light.__dict__.pop('_shadow_defer', None)
+        light.__dict__.pop('_shadow_key', None)
+    mesh = scene.mesh
+    if mesh is None or mesh.verts is None or mesh.tris is None \
+            or not mesh.verts.size:
+        return None, []
+    if (mesh.tris if caster_tris is None else caster_tris).shape[0] == 0:
+        return None, []
+    roles = map_roles(scene, settings)
+    now = []
+    for li, role in enumerate(roles):
+        if role is None or (only is not None and li not in only):
+            continue
+        if role == 'bake':
+            now.append(li)
+        else:
+            lights[li]._shadow_defer = _Deferred(scene, settings,
+                                                 caster_tris, li)
+    if not now:
+        return None, []
+    return _Frame(scene, settings, caster_tris), now
+
+
+def build_shadow_maps(scene, settings, caster_tris=None):
+    """Bake a shadow map (or cube) for every light a reader will look up
+    (`map_roles`).
+
+    Each map is a rasterisation pass, and a point light needs six. None
+    of it changes while the lights and geometry hold still, which for
+    most of an animation is all of it. The cache is PER LIGHT: the old
+    whole-list fingerprint meant nudging ONE lamp of fifteen
+    re-rasterised every map in the scene ('if I wanted to move
+    lights... it will lag like crazy'); now only the moved lamp's own
+    map rebuilds, a colour, energy or size edit rebuilds nothing at
+    all, and a moved OBJECT re-rasterises itself (`_bake_lamps`).
+    """
+    with _BAKE_LOCK:
+        cache = bool(getattr(settings, 'cache_shadows', True))
+        if cache:
+            _SHADOW_CACHE.begin_frame()
+        frame, now = _plan_frame(scene, settings, caster_tris)
+        if frame is not None:
+            _bake_lamps(frame, now, cache=cache)
+
+
+def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
+    """Build maps past the cache for every light that is read, or --
+    with `only`, a set of light indices -- just those, leaving the rest
+    untouched."""
+    with _BAKE_LOCK:
+        frame, now = _plan_frame(scene, settings, caster_tris, only=only)
+        if frame is not None:
+            _bake_lamps(frame, now, cache=False)
+
+
+def adopt_shadow_maps(scene):
+    """Park the maps a scene's lamps already carry under the keys they
+    were baked for. A worker process calls it on the scene it is handed:
+    the parent baked each map once, and the worker's own build then
+    finds every one of them instead of rasterising the set again for its
+    band (four workers used to do four bakes on the same cores)."""
+    with _BAKE_LOCK:
+        for light in (getattr(scene, 'lights', None) or ()):
+            key = light.__dict__.get('_shadow_key')
+            if key is not None and light.shadow_map is not None:
+                _SHADOW_CACHE.store(key, light.shadow_map)
+        _SHADOW_CACHE.begin_frame()
+
 
 
 # ------------------------------------------------------------- light sampling
@@ -1513,6 +2208,12 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
     # (the polygon is drawn by core/shadowmask.py over the finished frame)
     if mode in ('NONE', 'PLANAR'):
         return np.ones(n, np.float32)
+
+    # R254: a map nobody was known to read was not baked with the
+    # frame's (`map_roles`); the first lookup bakes it, here
+    if light.shadow_map is None and mode == 'MAP' \
+            and light.__dict__.get('_shadow_defer') is not None:
+        _deferred_map(light)
 
     # ray_shadows is the master switch for TRACED shadows: RAY-mode lights
     # obey it too. It used to gate only the no-map fallback -- a state no
