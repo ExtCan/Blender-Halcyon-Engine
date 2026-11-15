@@ -522,8 +522,11 @@ def pack_light_texels(lights, job=None):
                 out[0, b + 1, :3] = sd
                 spotsi = float(np.cos(float(light.spot_size) * 0.5))
                 out[0, b + 1, 3] = np.float32(spotsi)
+                # R254: the band is Blend's, or the Hotspot's inner
+                # angle (LI.spot_blend_band, the one place it is
+                # computed) -- a VALUE: dragging either re-uploads
                 out[0, b + 2, 3] = np.float32(
-                    (1.0 - spotsi) * float(light.spot_blend))
+                    LI.spot_blend_band(light, spotsi))
             elif kind == 'AREA':
                 # the form factor's value road: facing direction and
                 # the dist^2/(sx*sy) normalisation (area_lamp_vectors'
@@ -2740,8 +2743,13 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
                 else f'(1.0 - hal_lk{i})'
             lines += [f'    hal_sst = hal_sst * {mask};',
                       f'    ss_fog = ss_fog * {mask};']
-        lines += ['    total += hal_sst;',
-                  '    hal_spotfog += ss_fog;',
+        if getattr(light, 'affect_diffuse', True) and \
+                not getattr(light, 'specular_only', False):
+            # R254: the diffuse gates, exactly light_surface's (both
+            # flags are _light_sig structure): Specular Only leaves the
+            # fog lobe and adds nothing to the surface
+            lines.append('    total += hal_sst;')
+        lines += ['    hal_spotfog += ss_fog;',
                   '    }']
         return lines
     ck = (consts.get('cookies') or {}).get(i)
@@ -2848,7 +2856,8 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
             sd = np.asarray(light.direction, np.float32)
             sd = sd / max(float(np.linalg.norm(sd)), 1e-9)
             spotsi = float(np.cos(float(light.spot_size) * 0.5))
-            spotbl = (1.0 - spotsi) * float(light.spot_blend)
+            from ..core import lights as _LIb
+            spotbl = _LIb.spot_blend_band(light, spotsi)
             sd_r = _lref(i, 1, 'xyz') if use_tx else _v3(sd)
             si_r = _lref(i, 1, 'w') if use_tx else _f(spotsi)
             bl_r = _lref(i, 2, 'w') if use_tx else _f(spotbl)

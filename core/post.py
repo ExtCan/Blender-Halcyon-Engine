@@ -537,12 +537,132 @@ def lens_distortion(rgb, st):
     return out.astype(np.float32)
 
 
-def light_shafts(rgb, st, sources):
+def _shaft_step(flat, w, h, xx, yy, cx, cy, t):
+    """One resample of the thresholded frame toward (cx, cy): the bilinear
+    statements of _resample, with the four taps gathered by np.take through
+    flat row * w + column indices (2-D fancy indexing built five temporaries
+    per tap). `xx` / `yy` are the destination pixels' own coordinates -- the
+    whole frame, or the window of it that can receive light at this step."""
+    px = xx + (cx - xx) * t
+    py = yy + (cy - yy) * t
+    x = np.clip(px, 0, w - 1)
+    y = np.clip(py, 0, h - 1)
+    x0 = np.floor(x).astype(np.int32)
+    y0 = np.floor(y).astype(np.int32)
+    x1 = np.minimum(x0 + 1, w - 1)
+    y1 = np.minimum(y0 + 1, h - 1)
+    fx = (x - x0)[..., None]
+    fy = (y - y0)[..., None]
+    r0 = y0 * w
+    r1 = y1 * w
+    a = np.take(flat, r0 + x0, axis=0) * (1 - fx) \
+        + np.take(flat, r0 + x1, axis=0) * fx
+    b = np.take(flat, r1 + x0, axis=0) * (1 - fx) \
+        + np.take(flat, r1 + x1, axis=0) * fx
+    return (a * (1 - fy) + b * fy).astype(np.float32)
+
+
+def _shaft_window(lo, hi, c, t, n):
+    """The destination pixels [i0, i1) along one axis that can read a
+    bright pixel in [lo, hi] at march step `t` toward centre `c`. The
+    sample sits at i + (c - i) * t and is clamped into the frame, so a
+    bright edge column is read by everything beyond it. One pixel of
+    slack each side covers the bilinear tap and the float rounding; a
+    wider window only computes zeros, so the picture cannot move."""
+    if t >= 1.0:
+        return 0, n
+    i0, i1 = 0, n
+    if lo - 1 > 0:
+        i0 = int(np.floor((lo - 1 - c * t) / (1.0 - t))) - 1
+    if hi + 1 < n - 1:
+        i1 = int(np.ceil((hi + 1 - c * t) / (1.0 - t))) + 2
+    return max(i0, 0), min(i1, n)
+
+
+def _shaft_march(bright, st, centres):
+    """The summed smear of `bright` toward each (cx, cy, strength) centre,
+    in pixels of `bright` -- light_shafts' march.
+
+    R254: the same sums in the same order as the stage always computed
+    (so F12 is bitwise what it was), at a fraction of the cost: the taps
+    are gathered through flat indices, each step only visits the window
+    of the frame its samples can find a bright pixel from (everything
+    else adds an exact zero), and the steps of one source are resampled
+    on a few threads and ACCUMULATED IN STEP ORDER -- NumPy releases the
+    interpreter lock inside take and the arithmetic, and the order of
+    the float additions is what the picture depends on."""
+    h, w = bright.shape[:2]
+    flat = np.ascontiguousarray(bright).reshape(h * w, bright.shape[2])
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    nz = np.any(bright != 0.0, axis=2)
+    rows = np.nonzero(nz.any(axis=1))[0]
+    cols = np.nonzero(nz.any(axis=0))[0]
+    # a NaN or an infinity spreads through every tap it touches: no window
+    whole = not bool(np.isfinite(flat).all()) or rows.size == 0
+    total = np.zeros_like(bright)
+    steps = max(int(st.shaft_samples), 1)
+    length = float(st.shaft_length)
+    decay = float(st.shaft_decay)
+    import os as _os
+    workers = max(min((_os.cpu_count() or 2) - 1, 4), 1)
+    if h * w * steps < 2000000:
+        workers = 1                  # a small frame: the pool costs more
+    pool = None
+    if workers > 1:
+        import concurrent.futures as _fut
+        pool = _fut.ThreadPoolExecutor(max_workers=workers)
+
+    def one(job):
+        t, cx, cy = job
+        if whole:
+            y0, y1, x0, x1 = 0, h, 0, w
+        else:
+            x0, x1 = _shaft_window(int(cols[0]), int(cols[-1]), cx, t, w)
+            y0, y1 = _shaft_window(int(rows[0]), int(rows[-1]), cy, t, h)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return (y0, y1, x0, x1,
+                _shaft_step(flat, w, h, xx[y0:y1, x0:x1], yy[y0:y1, x0:x1],
+                            cx, cy, t))
+
+    try:
+        for cx, cy, strength in centres:
+            if strength <= 0.0:
+                continue
+            acc = np.zeros_like(bright)
+            weight = 0.0
+            amp = 1.0
+            jobs = [((i + 1) / steps * length, cx, cy) for i in range(steps)]
+            for k in range(0, steps, workers):
+                batch = jobs[k:k + workers]
+                got = list(pool.map(one, batch)) if pool is not None \
+                    else [one(j) for j in batch]
+                for res in got:
+                    if res is not None:
+                        y0, y1, x0, x1, smp = res
+                        acc[y0:y1, x0:x1] += smp * amp
+                    weight += amp
+                    amp *= decay
+            total += acc / max(weight, 1e-6) * strength
+    finally:
+        if pool is not None:
+            pool.shutdown()
+    return total
+
+
+def light_shafts(rgb, st, sources, proxy_pixels=0):
     """Radial scattering from a bright source -- the god rays of the era.
 
     Done exactly as it was then: take what is bright, smear it outward from the
     light's position on screen in a few halving steps, and add it back. No
     volume is integrated; the illusion is entirely in the streaks.
+
+    R254: `proxy_pixels` above zero marches a box-averaged copy of the
+    thresholded frame of at most that many pixels and adds the smear
+    back upsampled -- the rendered viewport's march (a shaft is a blur
+    along a line: it survives the decimation; the viewport would
+    otherwise pay seconds per volumetric lamp on every refine). F12
+    passes 0 and marches every pixel: bitwise the stage it always was.
     """
     if not sources:
         return rgb
@@ -551,27 +671,31 @@ def light_shafts(rgb, st, sources):
     bright = rgb * (lum > float(st.shaft_threshold))[:, :, None]
     if not np.any(bright):
         return rgb
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    total = np.zeros_like(rgb)
-    for (sx, sy), strength in sources:
-        if strength <= 0.0:
-            continue
-        cx = (sx * 0.5 + 0.5) * (w - 1)
-        cy = (sy * 0.5 + 0.5) * (h - 1)
-        acc = np.zeros_like(rgb)
-        weight = 0.0
-        decay = float(st.shaft_decay)
-        amp = 1.0
-        steps = max(int(st.shaft_samples), 1)
-        for i in range(steps):
-            t = (i + 1) / steps * float(st.shaft_length)
-            px = xx + (cx - xx) * t
-            py = yy + (cy - yy) * t
-            acc += _resample(bright, px, py) * amp
-            weight += amp
-            amp *= decay
-        total += acc / max(weight, 1e-6) * strength
-    return (rgb + total).astype(np.float32)
+    k = 1
+    if proxy_pixels and proxy_pixels > 0:
+        k = int(np.ceil(np.sqrt(h * w / float(proxy_pixels))))
+    if k <= 1:
+        centres = [((sx * 0.5 + 0.5) * (w - 1), (sy * 0.5 + 0.5) * (h - 1),
+                    strength) for (sx, sy), strength in sources]
+        total = _shaft_march(bright, st, centres)
+        return (rgb + total).astype(np.float32)
+    # the proxy: k x k box averages (the bright energy is kept, a lone
+    # highlight cannot fall between the samples), pixel centres mapped
+    # x_small = (x + 0.5) / k - 0.5 both ways
+    hp, wp = -(-h // k), -(-w // k)
+    pad = np.pad(bright, ((0, hp * k - h), (0, wp * k - w), (0, 0)),
+                 mode='edge')
+    small = pad.reshape(hp, k, wp, k, bright.shape[2]).mean(
+        axis=(1, 3)).astype(np.float32)
+    centres = [(((sx * 0.5 + 0.5) * (w - 1) + 0.5) / k - 0.5,
+                ((sy * 0.5 + 0.5) * (h - 1) + 0.5) / k - 0.5, strength)
+               for (sx, sy), strength in sources]
+    smear = _shaft_march(small, st, centres)
+    xs = (np.arange(w, dtype=np.float32) + 0.5) / k - 0.5
+    ys = (np.arange(h, dtype=np.float32) + 0.5) / k - 0.5
+    up = _resample(smear, np.broadcast_to(xs[None, :], (h, w)),
+                   np.broadcast_to(ys[:, None], (h, w)))
+    return (rgb + up).astype(np.float32)
 
 
 def depth_of_field(rgb, depth, st):
@@ -832,7 +956,7 @@ def fit_to(rgb, size):
 def process(image, st, frame=0, seed=0, target_size=None, allow_resize=True,
             depth=None, shaft_sources=None, flare_sources=None,
             stamp_info=None, key_frame=None, fps=24.0,
-            cvg=None, coverage=None, gel=None):
+            cvg=None, coverage=None, gel=None, shaft_proxy=0):
     """Linear RGBA framebuffer -> final display-referred RGBA.
 
     Row order is preserved; row 0 stays the bottom of the picture.
@@ -957,7 +1081,10 @@ def process(image, st, frame=0, seed=0, target_size=None, allow_resize=True,
     _cpu('depth of field', bool(st.dof) and depth is not None
          and str(getattr(st, 'dof_method', 'POST')) == 'POST',
          depth_of_field, depth, st)
-    _cpu('light shafts', bool(shaft_sources), light_shafts, st, shaft_sources)
+    # R254: `shaft_proxy` (the rendered viewport's pixel budget for the
+    # march; 0 = every pixel, what F12 passes)
+    _cpu('light shafts', bool(shaft_sources), light_shafts, st, shaft_sources,
+         proxy_pixels=int(shaft_proxy or 0))
     _cpu('glow', bool(st.glow) and float(st.glow_intensity) > 0, glow, st)
     _cpu('star filter', bool(st.star_filter) and float(st.star_intensity) > 0,
          star_filter, st)

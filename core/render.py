@@ -1550,9 +1550,15 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
             ss_t = ss_t * inv_pi
             if lit_mask is not None:
                 ss_t = ss_t * lit_mask[:, None]
-            out += ss_t
-            if want_split:
-                _sp_add(li, ss_t, None)                        # R253
+            if light.affect_diffuse and not light.specular_only:
+                # R254: the lobe is DIFFUSE light, so the lamp's diffuse
+                # gates apply (the ordinary lamp path's own condition):
+                # Specular Only used to leave the ellipse untouched. The
+                # fog lobe below is the lamp in the air, not a surface
+                # term, and stays
+                out += ss_t
+                if want_split:
+                    _sp_add(li, ss_t, None)                    # R253
             ss_fog = ss_col[None, :] * (ss_en * ss_el)[:, None]
             if lit_mask is not None:
                 ss_fog = ss_fog * lit_mask[:, None]
@@ -4275,9 +4281,11 @@ def shaft_sources(scene, settings, vp):
         vol = float(getattr(light, 'volumetric', 0.0))
         if vol <= 0.0:
             continue
-        if light.type == 'SUN':
+        if str(light.type).upper() in ('SUN', 'HEMI'):
             # a directional light has no position: its shafts converge on the
             # vanishing point, which is the direction projected with w = 0
+            # (R254: a HEMI is a Sun with the Hemisphere flag -- it took the
+            # positional branch and its shafts chased the lamp OBJECT)
             d = M.normalize(np.asarray(light.direction, np.float32))
             clip = np.append(-d, 0.0).astype(np.float32) @ vp.T
         else:
@@ -4292,6 +4300,50 @@ def shaft_sources(scene, settings, vp):
             continue
         out.append(((float(ndc[0]), float(ndc[1])), vol))
     return out
+
+
+#: R254: the caustic web's own values over one period-8 lattice at time
+#: 0 (what a Sun bakes on frame 0), kept to measure a strength's mean
+_CAUSTIC_REF = []
+#: the Caustics strength -> the mean of its factor over that lattice
+_CAUSTIC_MEAN = {}
+
+
+def caustic_factor(web, c):
+    """The lamp factor of the caustic web at strength `c`: the cells
+    darken and the crests overdrive around the pivot the bake always
+    used -- 1 + (web - 0.35) * 1.6 * min(c, 4), floored at zero."""
+    return np.maximum(1.0 + (web - 0.35) * 1.6 * min(c, 4.0), 0.0)
+
+
+def caustic_mean(c):
+    """R254: the mean of caustic_factor over the web's lattice.
+
+    The bake's comment promised "mean stays near 1", but the web's mean
+    is 0.17, half the 0.35 the factor pivots on: Caustics 1.0 threw
+    away 29% of the lamp's light and 2.0 half of it. Dividing the baked
+    tile by this mean keeps the web's look -- the same cells, the same
+    crest-to-cell contrast at every strength -- and gives the lamp its
+    light back. The mean is taken over a fixed lattice (the web's
+    statistics do not depend on the frame or the period), so the
+    divisor is one constant per strength: nothing breathes as the web
+    writhes, and a Sun's seamless tile averages 1 to within a percent
+    on every frame."""
+    key = round(float(min(c, 4.0)), 6)
+    got = _CAUSTIC_MEAN.get(key)
+    if got is None:
+        if not _CAUSTIC_REF:
+            from . import patterns as PT
+            ax = (np.arange(256, dtype=np.float32) + 0.5) / 256
+            uu = np.broadcast_to(ax[None, :] * 8, (256, 256))
+            vv = np.broadcast_to(ax[:, None] * 8, (256, 256))
+            _CAUSTIC_REF.append(PT.caustic_web(uu, vv, time=0.0, period=8))
+        got = max(float(np.mean(caustic_factor(
+            _CAUSTIC_REF[0].astype(np.float64), key))), 1e-6)
+        if len(_CAUSTIC_MEAN) > 256:
+            _CAUSTIC_MEAN.clear()
+        _CAUSTIC_MEAN[key] = got
+    return got
 
 
 def _synth_caustic_cookies(scene):
@@ -4315,7 +4367,9 @@ def _synth_caustic_cookies(scene):
     for light in lights:
         c = float(getattr(light, 'caustics', 0.0))
         kind = str(getattr(light, 'type', '')).upper()
-        if c <= 0.0 or kind not in ('SPOT', 'SUN'):
+        # R254: a HEMI (a Sun with the Hemisphere flag) tiles the web as
+        # its Sun does -- the panel drew the sliders and this skipped it
+        if c <= 0.0 or kind not in ('SPOT', 'SUN', 'HEMI'):
             continue
         if getattr(light, 'cookie', None) is not None and \
                 not getattr(light, '_caustic_cookie', False):
@@ -4324,11 +4378,22 @@ def _synth_caustic_cookies(scene):
         scale = max(float(getattr(light, 'caustics_scale', 4.0)), 0.05)
         speed = float(getattr(light, 'caustics_speed', 1.0))
         per = 8
+        cells = min(scale, float(per))
+        if kind == 'SPOT' and scale > 8.0:
+            # R254: the 8-cell period exists so a Sun tiles seamlessly; a
+            # spot never tiles, yet inherited the clamp -- Caustic Scale
+            # 8 to 64 moved no pixel. Above 8 the cone is cut from ONE
+            # 64-cell lattice, so the web zooms as the slider moves (a
+            # single re-seed at 8: scale <= 8 keeps the period-8 web);
+            # 32 texels a cell up to a 512 tile
+            per = 64
+            cells = scale
+            size = int(min(512, 32 * int(np.ceil(scale))))
         ax = (np.arange(size, dtype=np.float32) + 0.5) / size
         if kind == 'SPOT':
             # `scale` cells across the cone's image
-            u = ax[None, :] * min(scale, float(per))
-            v = ax[:, None] * min(scale, float(per))
+            u = ax[None, :] * cells
+            v = ax[:, None] * cells
         else:
             # one tile spans the full periodic lattice -- seamless
             u = ax[None, :] * per
@@ -4336,13 +4401,15 @@ def _synth_caustic_cookies(scene):
         uu = np.broadcast_to(u, (size, size))
         vv = np.broadcast_to(v, (size, size))
         web = PT.caustic_web(uu, vv, time=t * speed, period=per)
-        # energy-neutral-ish: mean stays near 1, crests overdrive
-        val = np.maximum(1.0 + (web - 0.35) * 1.6 * min(c, 4.0), 0.0)
+        # energy-neutral: the factor over its own mean (caustic_mean),
+        # so the cells darken, the crests overdrive and the lamp keeps
+        # the light it had
+        val = caustic_factor(web, c) / caustic_mean(c)
         px = np.repeat(val[:, :, None], 3, axis=2).astype(np.float32)
         light.cookie = ImageBuffer(name=f'__caustics_{light.name}',
                                    pixels=px, colorspace='Non-Color')
         light.cookie_strength = 1.0
-        if kind == 'SUN':
+        if kind in ('SUN', 'HEMI'):
             light.cookie_scale = scale   # world units per tile
         light._caustic_cookie = True
         light._cookie_tex = None         # the CPU sampler re-reads it
@@ -4376,7 +4443,8 @@ def _flare_sources(scene, st, gbuf, vp):
         fi = float(getattr(light, 'flare', 0.0))
         if fi <= 0.0:
             continue
-        if str(getattr(light, 'type', '')).upper() == 'SUN':
+        if str(getattr(light, 'type', '')).upper() in ('SUN', 'HEMI'):
+            # R254: a HEMI flares at its place in the sky, as its Sun does
             d = M.normalize(np.asarray(light.direction, np.float32))
             clip = np.append(-d, 0.0).astype(np.float32) @ vp.T
             z_l = np.inf                 # at infinity: only sky shows it
@@ -4701,6 +4769,9 @@ def render(scene, settings=None, progress=None, band=None):
     if getattr(scene, 'world', None) is not None:
         desugar_master_bump(getattr(scene.world, 'graph', None))
     _synth_caustic_cookies(scene)
+    # R254: one fingerprint of every cookie's texels for this frame (an
+    # image edited in place is noticed here, before any cache is read)
+    LI.refresh_cookie_fingerprints(getattr(scene, 'lights', None))
     # R253: the render region in output pixels, or None (the identity --
     # every old scene takes exactly the pre-R253 paths below)
     rect = region_pixels(st, W, H)
@@ -9308,11 +9379,14 @@ def _light_volumes(img, scene, st, gbuf, vp, eye, w, h, bvh=None,
                                          dl * (1.0 - 1e-3))
                 return out
         reach_l = reach
-        if LI.resolved_decay(light, st) == 'CUSTOM':
+        if LI.resolved_decay(light, st) == 'CUSTOM' and kind != 'AREA':
             # Custom Range's end is the lamp's own idea of how far it
             # reaches; the beam honours it rather than growing a dial
             # (R254: whether the law is chosen on the lamp or arrives
-            # through Scene Default)
+            # through Scene Default). Never for an AREA lamp: it draws
+            # no Falloff menu and never attenuates, its Falloff End is
+            # the panel's Distance -- a gain (cones.beam_gain), not a
+            # range, and a hidden Custom Range cut the beam there
             reach_l = min(reach, max(float(getattr(light, 'decay_end',
                                                    reach)), 1e-3))
         scatter = marchers[kind](
@@ -9324,10 +9398,10 @@ def _light_volumes(img, scene, st, gbuf, vp, eye, w, h, bvh=None,
             max_distance=reach_l, occlude=occ)
         if scatter.any():
             col = np.asarray(light.color, np.float32)[None, :]
-            # R253 (H): the beam flickers with the lamp's style
-            add += scatter[:, None] * col * (
-                float(light.energy)
-                * float(getattr(light, 'style_gain', 1.0))) / np.pi
+            # R253 (H): the beam flickers with the lamp's style. R254:
+            # on the lamp's own radiance scale (cones.beam_gain) -- the
+            # old energy / pi was 632 times a spot's or point's
+            add += scatter[:, None] * col * CONES.beam_gain(light)
     if sel is None:
         img[:, :, :3] += add.reshape(h, w, 3)
     else:

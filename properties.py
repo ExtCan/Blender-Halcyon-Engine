@@ -1102,6 +1102,10 @@ RANGES = {
     'motion_dither_tile': (8, 64),
     'pano_parts': (1, 16),
     'lens_distortion': (-1.0, 1.0), 'chromatic_aberration': (0.0, 8.0),
+    # R254: the beam's Density had no range at all (-1e6 .. 1e6); the
+    # top leaves room for the 632x that restores a beam tuned under the
+    # old energy / pi unit
+    'spot_cone_density': (0.0, 100000.0),
     'shaft_threshold': (0.0, 4.0), 'shaft_length': (0.0, 1.0),
     'shaft_decay': (0.5, 1.0), 'shaft_samples': (2, 128),
     'dof_focus': (0.01, 10000.0), 'dof_amount': (0.0, 8.0),
@@ -1146,6 +1150,10 @@ RANGES = {
 }
 
 LABELS = {
+    # R254: the beam dials serve Spot, Point and Area lamps alike
+    'spot_cones': "Volumetric Lights", 'spot_cone_density': "Beam Density",
+    'spot_cone_samples': "Beam Samples", 'spot_cone_falloff': "Beam Falloff",
+    'spot_cone_reach': "Beam Reach",
     # R251 (transparency pack)
     'blend_equation': "Blend Equation", 'translucent_order': "Composite Order",
     'translucent_depth_write': "Translucent Depth Write",
@@ -2607,16 +2615,23 @@ DESCRIPTIONS = {
                              "in a free view, or the scene's Render Region "
                              "in camera view) is honoured on top of it",
 
-    'spot_cones': "Draw the visible beam of every spot light whose Volumetric "
-                  "value is above zero. The view ray is intersected with the "
-                  "cone and a few samples are summed along whatever falls "
-                  "inside it -- which is what LightWave and 3D Studio did, "
-                  "rather than integrating a volume",
+    'spot_cones': "Draw the visible beam of every Spot, Point and Area light "
+                  "whose Volumetric value is above zero: a spot's cone, a "
+                  "point lamp's glow, an area lamp's slab. The view ray is "
+                  "intersected with the beam and a few samples are summed "
+                  "along whatever falls inside it -- which is what LightWave "
+                  "and 3D Studio did, rather than integrating a volume. A "
+                  "Sun has no beam: its Volumetric drives the Light Shafts",
     'spot_cone_samples': "Samples along each view ray. Low counts band, and "
                          "the banding is the period artefact rather than a "
                          "defect -- 8 to 16 is where those renderers sat",
-    'spot_cone_density': "Overall strength of every cone. Each light's own "
-                         "Volumetric value scales it further",
+    'spot_cone_density': "Overall strength of every beam; each light's own "
+                         "Volumetric value multiplies it. The product is the "
+                         "haze's scattering coefficient in units of 1 / (4 "
+                         "pi) per world unit, lit on the scale the lamp "
+                         "lights its surfaces with: 1 is a thick stage haze, "
+                         "4 is smoke. A beam tuned under the older unit "
+                         "(energy / pi) needs 632 times the Density",
     'spot_cone_falloff': "How fast scattering fades with distance from the "
                          "lamp. 2 is inverse-square; lower carries further",
     'spot_cone_reach': "How far a beam is drawn when nothing stops it",
@@ -3713,7 +3728,8 @@ class HalcyonLightSettings(PropertyGroup):
                     "edge, or the GameCube's six GX angular functions built "
                     "from the cone angle (the ring functions light a ring "
                     "and leave the axis dark). Spot Blend is Blender "
-                    "Internal's only: the other laws never read it")
+                    "Internal's only: the other laws never read it. The "
+                    "visible beam of a Volumetric spot follows the law")
     spot_exponent: FloatProperty(
         name="Cone Exponent", default=0.0, min=0.0, max=128.0,
         description="OpenGL's GL_SPOT_EXPONENT / POV-Ray's tightness: the "
@@ -3782,10 +3798,16 @@ class HalcyonLightSettings(PropertyGroup):
     specular_only: BoolProperty(name="Specular Only", default=False)
     ambient_only: BoolProperty(name="Ambient Only", default=False)
     hotspot: FloatProperty(name="Hotspot", default=0.0, min=0.0, max=3.1416,
-                           description="Inner cone angle, the 3D Studio "
-                                       "hotspot/falloff pair; POV-Ray's "
-                                       "radius under the POV cone law, "
-                                       "never wider than the Spot Size")
+                           description="Inner cone angle: full strength "
+                                       "inside it, fading out to the Spot "
+                                       "Size -- the 3D Studio hotspot / "
+                                       "falloff pair. Under the Blender "
+                                       "Internal cone law it replaces Blend "
+                                       "while above zero (0 leaves Blend in "
+                                       "charge); under POV-Ray's it is the "
+                                       "radius. Never wider than the Spot "
+                                       "Size; the OpenGL and GX laws have no "
+                                       "inner angle")
     area_gamma: FloatProperty(
         name="Gamma", default=1.0, min=0.01, max=2.0,
         description="Blender Internal's area lamp Gamma (la->k): shapes "
@@ -3796,12 +3818,16 @@ class HalcyonLightSettings(PropertyGroup):
                     "it is a large gain as well as a shape")
     volumetric: FloatProperty(
         name="Volumetric", default=0.0, min=0.0, max=4.0,
-        description="Scatters light along the view ray toward this lamp. "
-                    "Spot lamps cast their visible cone, point lamps a "
-                    "bounded glow, area lamps a soft-edged slab beam -- all "
-                    "layered against the scene's depth; a Sun (no apex to "
-                    "march from) drives the screen-space light shafts "
-                    "instead")
+        description="The light this lamp scatters in the air. Spot, Point "
+                    "and Area lamps draw their beam -- a cone, a bounded "
+                    "glow, a soft-edged slab, layered against the scene's "
+                    "depth -- while Render > Lighting > Volumetric Lights "
+                    "is on; 1 is a thick haze at its Density of 1. Every "
+                    "lamp with a value above zero, a Sun included, also "
+                    "throws the screen-space Light Shafts from pixels "
+                    "brighter than Shaft Threshold. A Sun has no beam: its "
+                    "shafts converge on its place in the sky, so the sun "
+                    "must be ahead of the camera")
     volumetric_occlusion: BoolProperty(
         name="Beam Occlusion", default=False,
         description="Trace each beam sample back to the lamp, so the "
@@ -3834,13 +3860,14 @@ class HalcyonLightSettings(PropertyGroup):
         description="Project the animated pool-light web through this "
                     "lamp -- the writhing bright cell edges every 1990s "
                     "pool floor and water cave was lit with. A spot casts "
-                    "it through its cone; a sun tiles it seamlessly "
-                    "across the world. A real cookie image on the lamp "
-                    "takes priority")
+                    "it through its cone; a sun or a hemi tiles it "
+                    "seamlessly across the world. The web moves the lamp's "
+                    "light from the cells to the crests and keeps its "
+                    "total. A real cookie image on the lamp takes priority")
     caustics_scale: FloatProperty(
         name="Caustic Scale", default=4.0, min=0.05, max=64.0,
-        description="Spot: how many cells across the cone. Sun: world "
-                    "units covered by one seamless tile")
+        description="Spot: how many cells across the cone, up to 64. "
+                    "Sun: world units covered by one seamless tile")
     caustics_speed: FloatProperty(
         name="Caustic Speed", default=1.0, min=0.0, max=8.0,
         description="How fast the caustic web writhes over the frames")

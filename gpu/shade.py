@@ -769,7 +769,14 @@ def _light_sig(l):
     import numpy as np
     t = lambda v: tuple(round(float(x), 6) for x in v)
     spotsi = float(np.cos(float(getattr(l, 'spot_size', 0.0)) * 0.5))
-    spotbl = (1.0 - spotsi) * float(getattr(l, 'spot_blend', 0.0))
+    # R254: whether a blend band EXISTS is structure, and the band is
+    # Blend's or the Hotspot's (a hotspot dragged onto the cone edge
+    # closes it: the hard-edge block)
+    if float(getattr(l, 'hotspot', 0.0) or 0.0) > 0.0:
+        from ..core.lights import spot_blend_band
+        spotbl = spot_blend_band(l, spotsi)
+    else:
+        spotbl = (1.0 - spotsi) * float(getattr(l, 'spot_blend', 0.0))
     baked_map = getattr(l, 'shadow_map', None) is not None
     cookie = getattr(l, 'cookie', None)
     sig = (l.type,
@@ -863,6 +870,13 @@ def _light_sig(l):
                 str(getattr(l, 'cookie_filter', 'BILINEAR')
                     or 'BILINEAR'),
                 _cookie_sig(l),
+                # R254: a SPOT's lookup bakes 2 tan(spot_size / 2) as a
+                # literal and its atlas carries the size blur over it;
+                # without a baked map (ray-traced shadows, shadows off)
+                # the Spot Size was in no part of the signature and a
+                # narrowed cone kept the old projection scale
+                round(float(getattr(l, 'spot_size', 0.0)), 6)
+                if str(getattr(l, 'type', '')).upper() == 'SPOT' else 0.0,
                 # R253 (G): the uv transform is baked as literals into
                 # the lookup function (the cookie road's convention)
                 t(getattr(l, 'cookie_offset', (0.0, 0.0)) or (0.0, 0.0)),
@@ -872,11 +886,17 @@ def _light_sig(l):
 
 
 def _cookie_sig(l):
+    """R254: the cookie image's part of the plan signature -- its size
+    and a fingerprint of EVERY texel (LI.cookie_fingerprint, taken
+    fresh on each plan). It was the sum of every 7th texel: a flipped
+    64 px slide or a painted detail between the samples was a plan-cache
+    hit and the device kept the old image."""
     px = getattr(getattr(l, 'cookie', None), 'pixels',
                  getattr(l, 'cookie', None))
     try:
-        px = np.asarray(px, np.float32)
-        return (px.shape[1], px.shape[0], round(float(px[::7, ::7].sum()), 3))
+        from ..core.lights import cookie_fingerprint
+        shape = np.shape(px)
+        return (shape[1], shape[0], cookie_fingerprint(l, fresh=True))
     except Exception:                                           # noqa: BLE001
         return None
 
@@ -1465,8 +1485,13 @@ def plan_frame(job, gbuf, use_cache=True):
                 + [np.ones(px.shape[:2] + (1,), np.float32)], axis=2) \
                 if px.shape[2] == 1 else np.concatenate(
                     [px, np.ones(px.shape[:2] + (1,), np.float32)], axis=2)
+        # R254: the upload is keyed on the preparation's own key (every
+        # source texel's fingerprint, the blur, the extension) -- the
+        # sum of every 7th prepared texel served a stale texture
+        _prep = getattr(l, '_cookie_prep', None)
         ckey = ('cookie', str(getattr(l, 'name', i)), px.shape[1],
-                px.shape[0], float(px[::7, ::7].sum()))
+                px.shape[0]) + (tuple(_prep[0]) if isinstance(_prep, tuple)
+                                else (float(px[::7, ::7].sum()),))
         atlases[f'hal_cookie{i}'] = (ckey, (lambda p=px: p))
         s_ax, u_ax, f_ax = LI.cookie_frame(l)
         try:
