@@ -71,6 +71,17 @@ pinned where it bit.
     The GPU emitter's mangling tag was the id with its punctuation
     flattened, which is many-to-one ('Coded Shader' / 'Coded_Shader'):
     `gpu/emit._code_tag` hands out one tag per node.
+(15) A Coded Shader whose node NAME holds a letter outside ASCII never
+    reached the GPU. The tag was the id with every non-WORD character
+    flattened, and Python's `\\W` is Unicode-aware: the 'ñ' of 'Señal',
+    a Cyrillic or a CJK name went into the pass's identifiers as written.
+    The plan qualified; the device's pre-flight refused the text
+    ("unexpected character 'ñ'") and the whole frame shaded on the CPU.
+    `gpu/emit._code_spell` spells each such letter or digit as its code
+    point ('Seu00F1al', 'u8272u5F69') -- not as one more '_', which makes
+    names of underscores alone and the '__' GLSL reserves. `_code_tag`
+    tells clashing tags apart as before, and a tag that was plain ASCII
+    is the tag it was.
 """
 import io
 import os
@@ -1073,11 +1084,11 @@ def _code_master_tree(SN, source):
     return mat
 
 
-def _code_floor(graph, programs, size=(128, 96)):
+def _code_floor(graph, programs, size=(128, 96), shadows=True):
     """The demo scene with its floor wearing an exported graph: (scene,
     settings)."""
     from ..core.scene import Material
-    st = base_settings(size[0], size[1], shadows=True)
+    st = base_settings(size[0], size[1], shadows=shadows)
     st.color_depth, st.dither, st.output_scale = '24', 'NONE', 'NONE'
     sc = demo_scene(st, with_texture=False)
     mat = Material(name='Coded', index=0, graph=graph)
@@ -1390,6 +1401,46 @@ def _code_feed(tree, nodes):
     tree.links.new(acc, hal.inputs['Diffuse Color'])
 
 
+def _code_exported(mat):
+    """A stand-in material through the REAL exporter: (graph, programs,
+    warnings)."""
+    import importlib
+    EX = importlib.import_module('halcyon.export')
+    images, programs, warnings = {}, {}, []
+    graph = EX.serialize_tree(mat.node_tree, images, programs, warnings)
+    return graph, programs, warnings
+
+
+def _code_two(SN, name_a, name_b, src_a=None, src_b=None):
+    """Two Coded Shaders in ONE tree, summed into the master: the first
+    (red unless `src_a` says otherwise) with its Gain linked to the Value
+    node's 0.7, the second (blue) at Gain 0.4."""
+    mat = _code_master_tree(SN, _code_text('a', _CODE_RED if src_a is None else src_a))
+    tree = mat.node_tree
+    a = tree.nodes.get('Coded Shader')
+    a.name = name_a
+    b = _code_coded(SN, tree, name_b, _code_text('b', _CODE_BLUE if src_b is None else src_b))
+    b.inputs['Gain'].default_value = 0.4
+    _code_feed(tree, [a, b])
+    return mat
+
+
+def _code_pass(graph, programs, shadows=True, size=(128, 96)):
+    """The deferred plan's pass for the demo floor wearing an exported
+    graph: (source, binds, why) -- the text the device is handed, or the
+    reason the plan gives for refusing the frame."""
+    from ..gpu import shade as GSH
+    sc, st = _code_floor(graph, programs, size, shadows)
+    with redirect_stdout(io.StringIO()):
+        g, job = _job_for(sc, st)
+        GSH._PLAN_CACHE.clear()
+        passes, why, _atlases = GSH.plan_frame(job, g)
+    if passes is None:
+        return None, None, str(why)
+    _mi, _name, src, binds = next(ps for ps in passes if ps[1] == 'Coded')
+    return src, binds, None
+
+
 def test_code_node_same_name_across_trees():
     """Compiled Coded Shader programs were filed under the node's NAME,
     in ONE dict that serialize_tree hands down its node-group recursion --
@@ -1626,14 +1677,7 @@ def test_code_node_same_name_across_trees():
     # ---- the GPU's own key: the tag a node's GLSL names are mangled under
     def two(name_a, name_b, src_a=_CODE_RED, src_b=_CODE_BLUE):
         """Two Coded Shaders in ONE tree, summed into the master."""
-        mat = _code_master_tree(SN, _code_text('a', src_a))
-        tree = mat.node_tree
-        a = tree.nodes.get('Coded Shader')
-        a.name = name_a
-        b = _code_coded(SN, tree, name_b, _code_text('b', src_b))
-        b.inputs['Gain'].default_value = 0.4
-        _code_feed(tree, [a, b])
-        return mat
+        return _code_two(SN, name_a, name_b, src_a, src_b)
 
     d, bad, _gpu, cpu_ref, why = _code_twin(*exported(two('Coded Shader', 'Other'))[:2])
     check('two Coded Shaders in one tree under unrelated names: the deferred pass twins the CPU (the reference)',
@@ -1781,6 +1825,213 @@ def test_code_node_same_name_across_trees():
           '_code_tag alone', "node.get('id')" in inspect.getsource(NE.n_halcyon_code)
           and "node.get('id')" in inspect.getsource(GE.e_code_node) and '_code_tag' in calls(GE.e_code_node)
           and 're.sub' not in calls(GE.e_code_node), str(sorted(calls(GE.e_code_node))))
+
+
+def test_code_node_non_ascii_name_reaches_the_gpu():
+    """A Coded Shader's GLSL names are mangled under a tag made from the
+    node's graph id, and the tag was the id with every non-WORD character
+    flattened to '_' -- Python's word, which is Unicode's: `\\W` keeps the
+    'ñ' of 'Señal', every Cyrillic and CJK letter, every digit of every
+    script. The letter went into the pass (`_cnSeñal_main`), a GLSL
+    identifier is [A-Za-z0-9_] and nothing else, and the device's
+    pre-flight refused the text before the driver ("unexpected character
+    'ñ'"): the CPU drew the right picture and the frame never reached the
+    GPU, for nothing but one node's name. gpu/emit._code_spell spells each
+    such letter as its code point ('Seu00F1al', 'u8272u5F69'). Not as one
+    more '_': a name of such letters alone would be underscores alone, two
+    of them one tag, and GLSL reserves every identifier holding '__'; a
+    code point is letters and digits and adds no underscore. Like the
+    flattening it is many-to-one (a node NAMED 'Seu00F1al'), and _code_tag
+    tells clashing tags apart as it did. A tag that was plain ASCII is the
+    tag it was."""
+    import ast
+    import importlib
+    import inspect
+    import itertools
+    import re
+    import textwrap
+    from . import fakebpy
+    fakebpy.install()
+    SN = importlib.import_module('halcyon.nodes.shader_nodes')
+    from ..gpu import device as DV
+    from ..gpu import emit as GE
+    ident = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')        # what GLSL calls an identifier
+
+    def one(name):
+        """The master fed by ONE Coded Shader, the red one, named `name`."""
+        mat = _code_master_tree(SN, _code_text('a', _CODE_RED))
+        mat.node_tree.nodes.get('Coded Shader').name = name
+        return mat
+
+    def two(*args):
+        return _code_two(SN, *args)
+
+    def twin(mat):
+        return _code_twin(*_code_exported(mat)[:2])
+
+    def handed(mat):
+        return _code_pass(*_code_exported(mat)[:2])
+
+    def same(a, b):
+        return a is not None and b is not None and bool(np.array_equal(a, b))
+
+    def mangled(src):
+        """Every name of a text that a coded shader's tag went into."""
+        return sorted(set(re.findall(r'\b_cn\w+', src or '')))
+
+    def flattened(key):
+        """The whole tag as 1.92.0 spelled it."""
+        return re.sub(r'\W', '_', str(key))
+
+    # ---- the references: the same trees under names GLSL could always spell
+    d, bad, gpu_one, cpu_one, why = twin(one('Coded Shader'))
+    check('one Coded Shader under its default name: the deferred pass twins the CPU (the reference)',
+          why is None and bad == 0 and d < 6e-3, f'{why} max {d} bad {bad}')
+    d, bad, gpu_two, cpu_two, why = twin(two('Coded Shader', 'Other'))
+    check('two Coded Shaders under unrelated ASCII names: the same (the second reference)',
+          why is None and bad == 0 and d < 6e-3 and not same(cpu_two, cpu_one), f'{why} max {d} bad {bad}')
+
+    # ---- the reported node: one non-ASCII letter in its name
+    d, bad, gpu, cpu, why = twin(one('Señal'))
+    check('a Coded Shader named \'Señal\', alone in its material: QUALIFIES for the deferred pass (it was refused: '
+          '"would not compile: unexpected character \'ñ\'")', why is None, str(why))
+    check('...and its GPU frame twins the CPU frame', d is not None and bad == 0 and d < 6e-3, f'max {d} bad {bad}')
+    check('...both of them the frames the same node draws under its default name, bit for bit (a name is not a '
+          'picture)', same(cpu, cpu_one) and same(gpu, gpu_one))
+    d, bad, gpu, cpu, why = twin(two('Señal', 'Other'))
+    check('\'Señal\' beside a second Coded Shader, \'Other\', summed into the master: qualifies and twins',
+          why is None and bad == 0 and d < 6e-3, f'{why} max {d} bad {bad}')
+    check('...on the frames the same pair draws under ASCII names, bit for bit',
+          same(cpu, cpu_two) and same(gpu, gpu_two))
+
+    # ---- no ASCII letter at all; one letter each; a name spelled like the other's tag
+    for name_a, name_b, what in (
+            ('Шейдер', '色彩', 'Cyrillic beside CJK, not one ASCII letter between them'),
+            ('色', '彩', 'one letter each: flattened, both are \'_\''),
+            ('Señal', 'Seu00F1al', 'a node NAMED as the other is spelled: one tag between them')):
+        d, bad, gpu, cpu, why = twin(two(name_a, name_b))
+        check(f'{name_a!r} beside {name_b!r} ({what}): qualifies and twins', why is None and bad == 0 and d < 6e-3,
+              f'{why} max {d} bad {bad}')
+        check('...on the reference pair\'s frames, bit for bit', same(cpu, cpu_two) and same(gpu, gpu_two))
+    # a tag that is another tag plus '_' plus the start of a name: `B_k` under
+    # 'Señal' and `k` under 'Señal B' would both be _cnSeu00F1al_B_k
+    src_a, src_b = (_code_says('gain * B_k, 0.05, 0.05', 'float B_k = 1.0;\n'),
+                    _code_says('0.05, 0.05, gain * k', 'float k = 0.5;\n'))
+    d, bad, _gpu, cpu_p, why = twin(two('Señal', 'Señal B', src_a, src_b))
+    check('\'Señal\' declaring B_k beside \'Señal B\' declaring k (one GLSL name between them, unless the tags are '
+          'told apart): qualifies and twins', why is None and bad == 0 and d < 6e-3, f'{why} max {d} bad {bad}')
+    check('...on the frame the same two shaders draw under unrelated names',
+          same(cpu_p, _code_cpu(*_code_exported(two('Coded', 'Other', src_a, src_b))[:2])))
+
+    # ---- the text the device is handed
+    src, binds, why = handed(two('Señal', 'Other'))
+    check('the pass of \'Señal\' beside \'Other\' is plain ASCII, and runs each shader under its own tag',
+          src is not None and src.isascii() and '    _cnSeu00F1al_main();' in src and '    _cnOther_main();' in src,
+          str(why))
+    check('...every name a tag went into is a GLSL identifier (letters, digits, underscores), none holding the '
+          'reserved \'__\'', mangled(src) == ['_cnOther_Color', '_cnOther_gain', '_cnOther_main', '_cnSeu00F1al_Color',
+                                              '_cnSeu00F1al_gain', '_cnSeu00F1al_main']
+          and all(ident.match(n) and '__' not in n for n in mangled(src)), str(mangled(src)))
+    declared = [n for key in ('samplers', 'frame_uniforms') for n in (binds or {}).get(key) or ()]
+    check('...and so is every sampler and uniform the device declares for the pass',
+          all(ident.match(n) for n in declared), str(declared))
+    check('...which the device\'s pre-flight -- the wall that refused it, before the driver -- lets through',
+          src is not None and DV.PREFLIGHT and DV.preflight('Coded', src) is None,
+          str(src is not None and DV.preflight('Coded', src)))
+    src_cjk, _binds, why = handed(two('色', '彩'))
+    check('\'色\' beside \'彩\': two tags with no ordinal and no underscore of their own (`_cnu8272_main`, '
+          '`_cnu5F69_main`)', mangled(src_cjk) == ['_cnu5F69_Color', '_cnu5F69_gain', '_cnu5F69_main', '_cnu8272_Color',
+                                                    '_cnu8272_gain', '_cnu8272_main']
+          and src_cjk.isascii() and DV.preflight('Coded', src_cjk) is None, f'{why} {mangled(src_cjk)}')
+
+    # ---- the tag as 1.92.0 spelled it: these checks can tell
+    real = GE._code_spell
+    GE._code_spell = flattened
+    try:
+        _d, _b, gpu_old, cpu_old, why_old = twin(one('Señal'))
+        src_old, _binds, _why = handed(one('Señal'))
+    finally:
+        GE._code_spell = real
+    check('the tag as 1.92.0 spelled it (the flattening alone) put the letter into the pass -- `_cnSeñal_main`, a '
+          'text that is not ASCII -- and the plan QUALIFIED it', src_old is not None and not src_old.isascii()
+          and '    _cnSeñal_main();' in src_old and not all(ident.match(n) for n in mangled(src_old)),
+          str(mangled(src_old)))
+    check('...the pre-flight refused that text by name, so no driver saw it and the whole frame shaded on the CPU',
+          'would not compile' in str(DV.preflight('Coded', src_old or ''))
+          and "unexpected character 'ñ'" in str(DV.preflight('Coded', src_old or '')),
+          str(DV.preflight('Coded', src_old or '')))
+    check('...as the simulator did: no GPU frame, and the CPU frame the right one all along', gpu_old is None
+          and "unexpected character 'ñ'" in str(why_old) and same(cpu_old, cpu_one), str(why_old))
+
+    # ---- the spelling itself
+    spelled = {'Señal': 'Seu00F1al', 'Шейдер': 'u0428u0435u0439u0434u0435u0440', '色': 'u8272', '彩': 'u5F69',
+               '色彩': 'u8272u5F69', 'Mi señal 2': 'Mi_seu00F1al_2', 'Group/Señal': 'Group_Seu00F1al',
+               '\U0001d6fc glow': 'u1D6FC_glow', '層３': 'u5C64uFF13', 'Capa ٣': 'Capa_u0663', 'x²': 'xu00B2',
+               '½': 'u00BD'}
+    got = {k: GE._code_spell(k) for k in spelled}
+    check('a letter or digit GLSL cannot hold (a full-width 3, an Arabic-Indic one, a superscript) is its code '
+          'point -- u and four or more hex digits, beyond the BMP included -- and the rest of the name is flattened '
+          'as it was', got == spelled, str(got))
+    pins = {'code': 'code', 'code2': 'code2', 'x': 'x', 'Coded Shader': 'Coded_Shader',
+            'Coded Shader.001': 'Coded_Shader_001', 'Group/Coded Shader': 'Group_Coded_Shader',
+            'Group\\/Coded Shader': 'Group__Coded_Shader', '__wang': '__wang'}
+    got = {k: GE._code_tag(GE.Emitter({}), k) for k in pins}
+    check('the tags test_render and the same-name test pin are where they were', got == pins, str(got))
+    alphabet = ('a', 'B', '7', '_', ' ', '.', '/', '\\', '—', 'ñ', '色')
+    keys = [''.join(w) for n in (1, 2, 3, 4) for w in itertools.product(alphabet, repeat=n)]
+    plain = [k for k in keys if flattened(k).isascii()]
+    moved = [k for k in plain if GE._code_spell(k) != flattened(k)]
+    check(f'a tag that was plain ASCII is the tag it was: all {len(plain)} of {len(keys)} names up to four characters '
+          '(punctuation, both separators, an em dash) that the flattening left no letter in',
+          not moved and 0 < len(plain) < len(keys), str(moved[:6]))
+    check(f'...and all {len(keys)} now spell a tag of letters, digits and underscores',
+          all(re.fullmatch(r'[A-Za-z0-9_]+', GE._code_spell(k)) for k in keys))
+    grew = [k for k in keys if re.findall(r'_+', GE._code_spell(k)) != re.findall(r'_+', flattened(k))]
+    check('...with exactly the underscores the flattening put there: no run of them is made or lengthened',
+          not grew, str(grew[:6]))
+    letters = ('a', 'Z', '7', 'ñ', 'Ш', '色', '\U0001d6fc')
+    words = [''.join(w) for n in (1, 2, 3) for w in itertools.product(letters, repeat=n)]
+    tags = [GE._code_spell(w) for w in words]
+    check(f'{len(words)} names of letters and digits alone (four scripts, one beyond the BMP) spell {len(words)} tags '
+          'and not one underscore (flattened to ASCII, \'色\' and \'彩\' are one tag: \'_\')',
+          len(set(tags)) == len(words) and not any('_' in t for t in tags), f'{len(set(tags))} tags')
+
+    # ---- one tag per node still: what the spelling cannot tell apart, _code_tag does
+    em = GE.Emitter({})
+    asked = ['Señal', 'Seu00F1al', 'Señal.001', 'Señal B', 'Señal_B', '色', '彩', '色彩', '色 彩',
+             'Group/Señal', 'Group Señal']
+    tags = [GE._code_tag(em, k) for k in asked]
+    check('a node whose spelled id meets an earlier tag takes the ordinal, as a flattened one does; Blender\'s own '
+          '.001 never needs it', tags == ['Seu00F1al', '2_Seu00F1al', 'Seu00F1al_001', '3_Seu00F1al_B', '4_Seu00F1al_B',
+                                          'u8272', 'u5F69', 'u8272u5F69', '2_u8272_u5F69', 'Group_Seu00F1al',
+                                          '2_Group_Seu00F1al'], str(tags))
+    check('...one tag per node, asked again or not; no two can spell one GLSL name; every one in the alphabet '
+          '_tags_clash is exact over', [GE._code_tag(em, k) for k in asked] == tags and len(set(tags)) == len(asked)
+          and not any(GE._tags_clash(a, b) for a, b in itertools.combinations(tags, 2))
+          and all(re.fullmatch(r'[A-Za-z0-9_]+', t) for t in tags), str(tags))
+
+    # ---- every name the port hands on, a sampler's included (the device
+    # declares that one by name)
+    inline, uniforms, ins, outs, samplers = GE._port_code_node(
+        'uniform float gain = 1.0;\nuniform sampler2D img;\nin vec3 vPosition;\nout vec4 Color;\n'
+        'float lift = 0.25;\nfloat half_of(float x) { return x * 0.5; }\n'
+        'void main() { Color = texture(img, vPosition.xy) * half_of(gain) + vec4(lift); }\n', GE._code_spell('色彩'))
+    names = [u[2] for u in uniforms] + [i[1] for i in ins] + [o[0] for o in outs.values()] + [m for _n, m in samplers]
+    check('a uniform, a varying, an out, a sampler, a global, a function and the entry point under the tag of '
+          '\'色彩\': seven ASCII identifiers, in an ASCII text',
+          names == ['_cnu8272u5F69_gain', '_cnu8272u5F69_vPosition', '_cnu8272u5F69_Color', '_cnu8272u5F69_img']
+          and mangled(inline) == sorted(names + ['_cnu8272u5F69_half_of', '_cnu8272u5F69_lift', '_cnu8272u5F69_main'])
+          and inline.isascii() and all(ident.match(n) for n in mangled(inline)), f'{names} {mangled(inline)}')
+
+    # ---- the rule, read from the code
+    def calls(f):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(f)))
+        return {ast.unparse(c.func) for c in ast.walk(tree) if isinstance(c, ast.Call)}
+
+    check('_code_tag spells through _code_spell and flattens nothing itself; the emitter mangles under _code_tag '
+          'alone', '_code_spell' in calls(GE._code_tag) and 're.sub' not in calls(GE._code_tag)
+          and '_code_tag' in calls(GE.e_code_node) and not {'re.sub', '_code_spell'} & calls(GE.e_code_node),
+          str(sorted(calls(GE._code_tag))))
 
 
 def test_code_node_rebuild_survives_undo_redo_and_load():
