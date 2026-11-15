@@ -526,6 +526,15 @@ def test_d_lights_only_export():
     check('_lamp_bound reads it off the exported materials',
           EX._lamp_bound([mat]) == (True, False)
           and EX._lamp_bound([Material(name='Plain')]) == (False, False))
+    nested = Material(name='Grouped')
+    nested.graph = {'nodes': {'g': {'bl_idname': 'ShaderNodeGroup', 'props': {},
+                                    'group': {'nodes': {'g/n1': {
+                                        'bl_idname': 'HALCYON_ObjectMapNode',
+                                        'props': p_lamp}}}}}}
+    check('...also from inside a node group, and from the world',
+          EX._lamp_bound([nested]) == (True, False)
+          and EX._lamp_bound([NS(graph=None, ground_graph=mat.graph)])
+          == (True, False))
     bound = copy.copy(parked)
     bound.lamp_bound = (True, False)
     check('a parked scene whose material projects from a lamp takes NO '

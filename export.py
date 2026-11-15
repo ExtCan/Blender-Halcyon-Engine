@@ -299,8 +299,9 @@ def _node_props(node, images, programs, warnings, key=None):
         if gname:
             # R254: this module has no module-level bpy, so the lookup
             # below raised NameError, the guard swallowed it, and EVERY
-            # Light Group resolved to no lamps in Blender: the material
-            # lost all direct light and the warning blamed the collection
+            # Light Group resolved to no lamps in Blender. The core reads
+            # an empty list as no group at all: the material took every
+            # lamp while the warning blamed the collection
             try:
                 import bpy
                 coll = bpy.data.collections.get(gname)
@@ -1626,7 +1627,8 @@ def _heard_objects(depsgraph):
       by the evaluation that reports it).
     The set is _viewport_enabled: an object disabled in viewports but
     enabled in renders is in the render depsgraph only, nobody reports
-    its edits, and it is exported live every time."""
+    its edits, and it is exported live every time; so is an object whose
+    mesh can change with no update fired (_reads_outside)."""
     try:
         if str(getattr(depsgraph, 'mode', '')) != 'RENDER':
             return None
@@ -1936,16 +1938,22 @@ def _lamp_bound(materials):
     `projects`: an Object Projection node picked a lamp, so the material
     graph carries that lamp's inverse matrix and cone (object_map_props).
     `grouped`: a material names lamps through a Light Group, resolved to
-    lamp NAMES when the material was exported."""
+    lamp NAMES when the material was exported. Node groups are walked (a
+    group node carries its tree under 'group'), and so is anything else
+    with a graph that is handed in (the world and its ground material)."""
     projects = grouped = False
-    for m in materials or ():
-        for node in ((getattr(m, 'graph', None) or {})
-                     .get('nodes', {}) or {}).values():
+    todo = [getattr(m, name, None) for m in materials or ()
+            for name in ('graph', 'ground_graph')]
+    while todo:
+        graph = todo.pop()
+        for node in ((graph or {}).get('nodes', {}) or {}).values():
             props = node.get('props') or {}
             if props.get('object_is_light'):
                 projects = True
             if props.get('light_group_lights'):
                 grouped = True
+            if node.get('group'):
+                todo.append(node['group'])
     return projects, grouped
 
 
@@ -3392,7 +3400,7 @@ def export_scene(depsgraph, settings, warnings=None, space=None):
     sc.images = images
     sc.warnings = warnings
     # R254: what these materials bake of the lamps (export_lights_into)
-    sc.lamp_bound = _lamp_bound(materials)
+    sc.lamp_bound = _lamp_bound(list(materials) + [world])
     # R170: the export split -- at 0.36s of a 0.75s warm F12, "export"
     # is a number and a split is a diagnosis (engine prints it)
     _sp['total_ms'] = (_time.perf_counter() - _t_all) * 1000.0
