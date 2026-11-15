@@ -401,6 +401,19 @@ class World:
     cube_image_ny: Optional[ImageBuffer] = None
     cube_image_pz: Optional[ImageBuffer] = None
     cube_image_nz: Optional[ImageBuffer] = None
+    # ------------------------------------------------ R254 world light
+    # The world's own luminary as a scene light (core/worldlight.py): the
+    # Bryce sun or moon, the Physical sky's sun, a Sky Texture node's sun,
+    # or the sun found in (or typed in for) an HDRI / cube map becomes one
+    # SUN Light at render entry. Off by default: no mode reads the rest.
+    world_light: bool = False
+    world_light_strength: float = 1.0
+    world_light_shadow: str = 'MAP'      # NONE | MAP | RAY
+    world_light_shafts: float = 0.0      # the light's `volumetric`
+    world_light_find: str = 'DETECT'     # DETECT | MANUAL (HDRI / CUBEMAP)
+    world_light_elevation: float = 0.7   # MANUAL: sky-space, radians
+    world_light_azimuth: float = 0.6
+    world_light_color: tuple = (1.0, 1.0, 1.0)
     # ------------------------------------------------ Bryce's Sky Lab
     # Bryce's Sky & Fog palette offered a Sky Mode: Soft Sky drove the dome
     # from the sun's own colour, Custom Sky exposed the three stops directly.

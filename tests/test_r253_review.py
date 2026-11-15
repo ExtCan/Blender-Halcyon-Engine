@@ -351,8 +351,13 @@ def test_generated_frame_signature_and_flat_axis():
     mw = np.eye(4, dtype=f32); mw[:3, 3] = (0.3, -0.3, 0.0)
     sc1 = demo_scene(st, with_texture=False); move_ball(sc1, mw); j1, _ = _job(sc1, st)
     k0, k1 = GSH._mesh_key(sc0.mesh), GSH._mesh_key(sc1.mesh)
-    check('a translation keeps the mesh key (the stale-cache case)', k0 == k1)
-    check('...and changes the plan signature (the baked frame is fingerprinted)', GSH._plan_sig(j0, k0) != GSH._plan_sig(j1, k1))
+    # the key read the positions as a strided SUM, which this translation
+    # (its components cancel) kept: the CPU's G-buffer cache served the
+    # unmoved raster. It carries an exact digest of every position now
+    # (core/mathx.content_digest; test_r253_generated_coords, heading d)
+    check('a translation whose components cancel changes the mesh key (it kept it: the stale-cache case)', k0 != k1)
+    check('...and the plan signature fingerprints the baked frame on its own (the same mesh key handed to both)',
+          GSH._plan_sig(j0, k0) != GSH._plan_sig(j1, k0))
     sc2 = demo_scene(st, with_texture=False); move_ball(sc2, mw)
     sc2.objects[1].gen_bounds = (np.array([-3.3, -3.3, -3.3], f32), np.array([3.3, 3.3, 3.3], f32))
     j2, _ = _job(sc2, st)
