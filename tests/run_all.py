@@ -60,6 +60,8 @@ def run_tests():
     from . import test_r254_spot_beam
     # R254: under Shadow Maps a lamp's size shapes its shadow
     from . import test_r254_map_soft
+    # R254: the rendered viewport follows what was changed
+    from . import test_r254_viewport
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -243,6 +245,11 @@ def run_tests():
     print("R254 MAP SOFT (A LAMP'S SIZE SHAPES ITS MAPPED SHADOW)")
     print('=' * 66)
     rc |= test_r254_map_soft.main()
+    print()
+    print('=' * 66)
+    print('R254 VIEWPORT (THE RENDERED VIEWPORT FOLLOWS WHAT WAS CHANGED)')
+    print('=' * 66)
+    rc |= test_r254_viewport.main()
     return rc
 
 
