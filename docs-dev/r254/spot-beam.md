@@ -481,10 +481,11 @@ Sheet (real Blender, before | after):
 
 ## Tests
 
-`tests/test_r254_spot_beam.py`, 16 functions, 115 checks. On the frozen
-old tree 40 pass (the neutrality pins and the options that already
-worked) and every fix's checks fail with the old numbers (log:
-`.../wt/spot-beam/logs/r254_on_base.log`).
+`tests/test_r254_spot_beam.py`, 16 functions, 115 checks (114 without
+HALCYON_GLSLANG). On the frozen old tree 40 pass (the neutrality pins and
+the options that already worked) and 63 fail with the old numbers, at
+least one in every fix's function (logs:
+`.../wt/spot-beam/logs/final/r254_new.log` and `r254_on_base.log`).
 
 Existing tests run green with no pin changed: tests/test_r253_light_options
 (195 checks), tests/test_r254_falloff (152), tests/test_r251_lighting_lamps
@@ -553,7 +554,8 @@ test_every_setting_does_what_it_says, the GLSL strictness pair).
   switch when it is the reason there is no beam; a Sun gets a live
   status line for its shafts.
 - **Light Shafts draw in the rendered viewport** (refine frames) and
-  survive Worker Processes; the stage is 2.5 to 40 times cheaper and
+  survive Worker Processes; the stage is 1.7 times cheaper on a frame
+  that is bright everywhere and up to 40 times on a lamp pool, and
   bitwise the same in F12.
 - **A Hemi's shafts, flare and caustics follow its direction.**
 - **Caustics keeps the lamp's light** (existing caustic lamps are 1.17x /
