@@ -418,7 +418,8 @@ One pin changed:
   test_r254_falloff 154, test_r253_light_options 195,
   test_r254_world_light 188, test_r254_ray_road 211, test_r254_map_soft
   164, all green, and the strict GLSL gate compiles all 439 distinct
-  texts.
+  texts. It still merges clean at 0b7db0e (the beam-units sort), where
+  test_r254_integration (18) and test_r254_flags (137) pass.
 - `export.export_lights_into` (the viewport package's): this package only
   ADDS a line, `_resolve_links(lights, parked.objects or [])`, after the
   single-index statements that function had. They are redundant now (the
