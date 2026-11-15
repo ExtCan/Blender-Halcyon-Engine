@@ -306,12 +306,19 @@ def midpoint_map(light, settings):
 def _shadow_base_signature(scene, settings, caster_tris):
     """Fingerprint of what EVERY shadow map depends on: the geometry,
     the shadow settings and the caster set -- everything except the
-    light itself."""
+    light itself.
+
+    The geometry is the two strided sums AND mathx.content_digest of
+    every vertex position: the sums alone served the old maps -- the
+    shadow stayed where the object USED to stand -- for a move between
+    the stride's samples, and for a (0, d, -d) move whose float sum
+    cancels exactly."""
     mesh = scene.mesh
     v = mesh.verts
     step = max(1, v.shape[0] // 512)
     geo = (v.shape[0], float(v[::step].sum()), float(v[::step, 0].dot(
-        np.arange(v[::step].shape[0], dtype=np.float32))))
+        np.arange(v[::step].shape[0], dtype=np.float32))),
+        M.content_digest(v))
     return (geo, settings.shadows, settings.shadow_default,
             int(settings.shadow_map_size),
             # size AND sum: two caster sets of equal count (say, two

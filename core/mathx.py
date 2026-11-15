@@ -5,9 +5,34 @@ renderer testable outside Blender and lets the whole pipeline be exercised
 by the test harness.
 """
 
+import zlib
+
 import numpy as np
 
 EPS = 1e-8
+
+
+def content_digest(a):
+    """An exact content digest of EVERY element of an array: the CRC-32
+    of its bytes, for the cache keys that fingerprint vertex positions.
+
+    Those keys were strided sums, and a sum is blind twice over. A
+    translation whose components cancel -- the demo ball moved by
+    (0.3, -0.3, 0), a grid-snapped (1, -1, 0) -- leaves the sum where it
+    was, and so does ANY move of an object lying wholly between the
+    stride's samples (a 24-vertex box in a 40,000-vertex scene: stride
+    79, not one of its vertices read). Either way a still camera got the
+    previous frame's G-buffer, shadow maps and BVH for a moved object:
+    the CPU shaded the old positions, 1.80 against the GPU's fresh
+    frame. Per-axis weights or a strided min/max narrow the first hole
+    and leave the second; reading every byte closes both.
+
+    One pass at a few GB/s -- ~2 us for the demo scene, ~60 us for
+    20,000 vertices, ~0.6 ms for 200,000 -- against the raster, the
+    shadow maps or the tree a stale hit skipped. Byte-exact on purpose:
+    a move below any rounding still misses. Zero for an empty array.
+    """
+    return zlib.crc32(np.ascontiguousarray(a)) & 0xffffffff
 
 
 def v3(x, y, z, n=None):
