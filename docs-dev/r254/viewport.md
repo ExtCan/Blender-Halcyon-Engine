@@ -24,10 +24,10 @@ real-Blender number is the frozen tree at commit 87489e1 (before any light
 fix); "the tree before this round" for the test module is 8de170d, the
 commit this branch starts from.
 
-Everything measured is in one log:
-`/tmp/claude-0/-home-user-Blender-Halcyon-Engine/1c5e906d-b1ee-5f5f-923e-25adb13f5e76/scratchpad/wt/viewport/out/viewport_before_after.txt`
-(the probes that wrote it are beside it in `../probes/`; `make_log.sh` runs
-all of them on both trees). In the viewport rows "px" is the number of
+Everything measured is in one log, `<scratch>/wt/viewport/out/viewport_before_after.txt`
+(`<scratch>` is the audit's scratch root; the probes that wrote the log are
+beside it in `../probes/`, and `make_log.sh` runs all of them on both
+trees). In the viewport rows "px" is the number of
 frame pixels that moved by more than 1/255 out of 181,304, and "forced full
 export" means: tag an unrelated mesh so that a full export of the very same
 state runs, and count the pixels that moves -- anything above 0 there is
@@ -115,8 +115,8 @@ by this package. No existing test pin was changed.
   transform flags (an ID-property write always does; measured), which the
   classifier read as 'full': the same was true of every DRAG of a
   scene-level dial in the interface -- 7 ticks of a Shadow Softness drag
-  were 7 full exports (7.7-72 ms each on 152 meshes) for a value that
-  travels in the settings. `_classify_updates` no longer lets a Scene
+  were 7 full exports (7.6-19.5 ms each on 152 meshes, the mesh cache
+  warm) for a value that travels in the settings. `_classify_updates` no longer lets a Scene
   update force an export by its flags; the dial is applied by
   `view_update`'s cheap half (no export at all). Every other scene edit
   measured (unit scale, camera, world, Freestyle, fps, resolution,
@@ -155,12 +155,14 @@ by this package. No existing test pin was changed.
 - **Pictures that change.** None: the lights-only export builds the same
   `Light` objects.
 - **Proof.** Real mouse drags on the probe's own three-row panel, 152 mesh
-  objects. Power: before 7 ticks = 7 full exports, 59-118 ms each; after 7
-  lights-only exports, 0.33-0.46 ms each. Halcyon Shadow Density: 6 x
-  50-82 ms -> 6 x 0.33-0.53 ms. Scene Shadow Softness: 7 x 7.7-72 ms -> no
-  export. The frames match (918 and 2,172 px on both trees), and through
-  the whole of vp_misc.py (two lamps, type changes, Volumetric Occlusion)
-  every forced full export after a lights-only frame is 0 px.
+  objects (the machine was shared; the times are per tick as logged).
+  Power: before 7 ticks = 7 full exports, 43-83 ms each; after 7
+  lights-only exports, 0.39-0.57 ms each with one at 2.2 ms. Halcyon
+  Shadow Density: 6 x 48-142 ms -> 6 x 0.36-0.57 ms. Scene Shadow
+  Softness: 7 x 7.6-19.5 ms -> no export. The frames match on both trees
+  (918, 452 and 2,137 px), and through the whole of vp_misc.py (two lamps,
+  type changes, Volumetric Occlusion) every forced full export after a
+  lights-only frame is 0 px.
   `test_a_update_classifier`; the six pins of
   `test_render.test_light_edit_fast_paths` pass unchanged.
 
@@ -465,7 +467,7 @@ test_r254_world_light.py.
   viewport's object-type filter). Halcyon settings changed from a script or
   by the panel's own buttons update the rendered viewport at once. Dragging
   a light slider no longer re-exports the scene (0.4 ms a tick instead of
-  60-120 ms on 152 objects); dragging a scene-level dial exports nothing.
+  40-140 ms on 152 objects); dragging a scene-level dial exports nothing.
   A keyframed lamp's Light Style and Caustics follow the timeline in the
   viewport. An Object Projection from a lamp follows the lamp. A BI
   Material's Light Group works in Blender (it never resolved). F12 reuses

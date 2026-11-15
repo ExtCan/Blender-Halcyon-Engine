@@ -928,6 +928,8 @@ def test_f_film_hold_follows_edits():
           'load_post, unregister() takes it off',
           '_drop_holds_handler' in src
           and '_drop_holds_handler' in inspect.getsource(EN.unregister))
+    check('...and it is a persistent handler (it survives File > Open)',
+          hasattr(EN._drop_holds_handler, '_bpy_persistent'))
 
 
 # -------------------------------------------------- (G) the image pixel cache
