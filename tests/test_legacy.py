@@ -3016,17 +3016,32 @@ def test_append_watch():
     # ---- registration against a stub handler list
     handlers = _t.SimpleNamespace(blend_import_post=[])
     bpy.app = getattr(bpy, 'app', _t.SimpleNamespace())
+    # R253: the fake bpy is ONE object for the whole run, so the stub is
+    # lent, not left -- it stayed installed, and every module after this
+    # one ran against a bpy.app.handlers with a single list and no
+    # `persistent`
+    had_handlers = hasattr(bpy.app, 'handlers')
+    prior_handlers = getattr(bpy.app, 'handlers', None)
     bpy.app.handlers = handlers
-    AW.register()
-    AW.register()
-    check('register adds the handler exactly once',
-          handlers.blend_import_post == [AW.on_blend_import_post])
-    check('the handler is marked persistent (survives file loads)',
-          AW.on_blend_import_post.__dict__.get('_bpy_persistent',
-                                               'unmarked')
-          != 'unmarked' or AW.persistent.__name__ == 'persistent')
-    AW.unregister()
-    check('unregister removes it', handlers.blend_import_post == [])
+    try:
+        AW.register()
+        AW.register()
+        check('register adds the handler exactly once',
+              handlers.blend_import_post == [AW.on_blend_import_post])
+        check('the handler is marked persistent (survives file loads)',
+              AW.on_blend_import_post.__dict__.get('_bpy_persistent',
+                                                   'unmarked')
+              != 'unmarked' or AW.persistent.__name__ == 'persistent')
+        AW.unregister()
+        check('unregister removes it', handlers.blend_import_post == [])
+    finally:
+        if had_handlers:
+            bpy.app.handlers = prior_handlers
+        else:
+            del bpy.app.handlers
+    check("the stub handler list is handed back (bpy.app.handlers is "
+          "whatever it was before this test)",
+          getattr(bpy.app, 'handlers', None) is prior_handlers)
 
     # ---- the hardened log writer, in isolation
     wrote = []

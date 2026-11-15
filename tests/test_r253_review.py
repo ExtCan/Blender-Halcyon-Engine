@@ -803,8 +803,8 @@ def _code_bench(bpy, SN):
     """An interactive session with the node module registered and nothing
     else in it: no material, no timer, no handler on the three re-arm
     events. Yields (handlers, timers). The handler lists are the stub's
-    own, whatever an earlier test left in their place (test_legacy swaps
-    in a one-list namespace and keeps it there). Everything touched in the
+    own for the length of the bench, whatever is installed when it starts
+    (a test may have swapped the namespace). Everything touched in the
     shared stub goes back as it was, and the module is unregistered on the
     way out unless the test already did that itself (the re-arm handler on
     the lists is what tells)."""
