@@ -7229,6 +7229,12 @@ def _cached_bvh(scene, mesh):
     is module-level so it survives the fresh Scene each export creates
     -- an F12 of an unchanged scene, an orbit, and most animation frames
     all skip the build.
+
+    The positions also carry mathx.content_digest, every byte of them:
+    the two strided sums alone kept the old tree -- so ray shadows fell
+    where the object USED to stand -- for a move between the stride's
+    samples, and for one whose components cancel in both sums (an
+    object in the +x +y quadrant moved by (d, -d, 0)).
     """
     v = mesh.verts
     t = mesh.tris
@@ -7237,6 +7243,7 @@ def _cached_bvh(scene, mesh):
     key = (int(v.shape[0]), int(t.shape[0]),
            round(float(v[::stride].sum()), 3),
            round(float(np.abs(v[::stride]).sum()), 3),
+           M.content_digest(v),
            int(t[::tstride].astype(np.int64).sum()))
     hit = _BVH_CACHE.get(key)
     if hit is not None:

@@ -77,11 +77,28 @@ EXTRA_COLORS = ('anime_shine_color2',
 #: (apply_wireframe carves the wires on the readback either way).
 from ..core import shading as _SHM
 from ..core import reyes as REYES        # R251 C119 (MAT-B)
+from ..core.mathx import content_digest as _content_digest
 # R251 (LIGHT-B2): SEGA_MODEL2 / SEGA_MODEL3 are their rates (FACE /
 # VERTEX, render.RATE_FOR_MODEL): the corner road is the machine on
 # both devices and a PIXEL-rate request refuses here by name
 UNSUPPORTED_MODELS = frozenset({'GOURAUD', 'FLAT'}) | _SHM.UNSUPPORTED_MODELS
 SHADELESS_MODELS = frozenset({'WIREFRAME', 'CONSTANT'})
+
+#: a colour, value or vector output wired straight into a SHADER socket
+#: (the Material Output's Surface, a Mix / Add Shader input, a Max
+#: blend's sub-material). The CPU reads Blender's implicit conversion,
+#: an Emission of it (nodeeval.link_closure); the frame pass emits ONE
+#: colour chain and feeds it to the diffuse term, and the emitter casts
+#: that very link into the chain -- it qualified and drew the colour as
+#: the albedo, 1.69 off the CPU on the demo ball. Refused BY NAME, on
+#: the lobe's PRESENCE (never a sampled weight: the wiring is the fact)
+IMPLICIT_EMISSION_REFUSAL = (
+    'a colour, value or vector output is wired straight into a shader '
+    'socket: that is an Emission of it (Blender\'s implicit conversion, '
+    'the picture the CPU shades), and the frame pass emits only the '
+    'diffuse chain -- this material shades on the CPU exactly (a Halcyon '
+    'Shader in between, the chain in its Diffuse Color or '
+    'Self-Illumination, puts it on the driver)')
 
 
 def _plot_ss(st):
@@ -220,6 +237,13 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
         # matrix row ever carried one. Refuse BY NAME; the pictures stay
         # the CPU's own until the specular slot routing is ported.
         from .material import master_node
+        if any(_p.get('implicit') for _k, _w, _p
+               in (getattr(cl, 'items', None) or ())):
+            # a non-closure wired into a shader socket: the CPU's
+            # implicit Emission, the emitter's albedo -- by name, before
+            # the raw-lobe rule below could word it as a node the graph
+            # does not hold (and whatever a sampled weight reads)
+            return None, None, IMPLICIT_EMISSION_REFUSAL
         if getattr(cl, 'items', None) and \
                 master_node(mat.graph) is None:
             # HALCYON lobes stay allowed: their colour IS the diffuse
@@ -970,7 +994,8 @@ def _plan_sig(job, mkey):
         'tex_lod_l',
         # R253: the Generated-coordinate road is a BAKE the plan reads
         # (the object-space line or the legacy world line); a moved
-        # object re-plans through _mesh_key already
+        # object re-plans through obgen_sig below (the baked frame, the
+        # R253 review) and through _mesh_key's position digest
         'generated_space',
         # R251 material pack (MAT-B): the REYES snap is a gate AND a
         # bake (C119), and the keys the pack found missing -- the AA
@@ -1078,8 +1103,10 @@ def _plan_sig(job, mkey):
         for o in (getattr(scene, 'objects', ()) or ()))
     # R253 (review): the per-object inverse rows and the Generated box
     # are BAKED into the pass as literals (hal_obj_rN, hal_lgen_lo /
-    # span); a transform that keeps the mesh key (a translation, a
-    # Texture Space edit) must re-plan, or the cache serves stale bits
+    # span); a change that keeps the mesh key (a Texture Space edit, a
+    # matrix handed without moving a vertex -- and, until the key's
+    # position digest, any translation whose components cancel) must
+    # re-plan, or the cache serves stale bits
     try:
         _g_lo, _g_span = job.object_generated_frame()
         obgen_sig = (np.asarray(_g_lo, np.float32).tobytes(),
@@ -2658,6 +2685,14 @@ def _mesh_key(mesh):
     mesh holds still for most of an animation -- but a fresh export makes
     fresh arrays, so identity is useless as a key. A strided sum is not: it
     costs microseconds and changes when the data does.
+
+    The vertex POSITIONS carry an exact digest of every byte beside their
+    sum (core/mathx.content_digest has the why): a sum cannot see a
+    translation whose components cancel, nor an object between the
+    stride's samples, and a moved object must miss every cache keyed
+    here -- the CPU's G-buffer cache (core/render.py imports this very
+    function), the plan, the 'triaux' / 'sres' / attribute uploads --
+    whichever way it moved.
     """
     v = mesh.verts
     stride = max(1, v.shape[0] // 512)
@@ -2665,6 +2700,7 @@ def _mesh_key(mesh):
     tstride = max(1, tris.shape[0] // 512)
     parts = [int(v.shape[0]), int(tris.shape[0]),
              round(float(v[::stride].sum()), 3),
+             _content_digest(v),
              # ORDER-SENSITIVE triangle fingerprint (R170): a winding
              # flip permutes each triangle's indices and a plain sum
              # never notices -- the G-buffer cache served a culled
