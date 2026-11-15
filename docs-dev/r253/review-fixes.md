@@ -1078,6 +1078,102 @@ Shader's name resolution is pinned in `tests/test_shaders.py` as well.
   initialiser reading a name in any engine source -- the initialiser
   change moves no engine value. The check costs about 4 ms on a
   1,562-line material pass, once per distinct text.
+- **The shadow atlas sampler is declared once per pass (the redefinition
+  the node-name entry above left for its own fix).** The report: the raw
+  GLSL of a deferred material pass declared `uniform sampler2D
+  hal_shadowpack;` once per shadowed lamp. Every mapped lamp reads the ONE
+  combined atlas, and `gpu/material._shadow_function` opened each lamp's
+  `hal_shadow_vis<i>` with that line, so a pass under two mapped lamps --
+  the demo scene's SUN and POINT, with shadows on -- held it twice.
+  glslang 15.1.0 (`-S frag` under a `#version 430 core` line, what
+  `tests/glsl_strict.compile_source` does) refuses the text,
+  `'hal_shadowpack' : redefinition`, and compiles it with the line kept
+  once. *Who was handed it.* On the CreateInfo road nobody:
+  `device.strip_declarations` takes every such line off and the interface
+  declares the sampler once. `device._compile_dynamic_miss` hands a driver
+  the raw text on one road only, the legacy `GPUShader(VERTEX, fragment)`
+  constructor, which it reaches when `gpu.types` has no
+  `GPUShaderCreateInfo`. *Why no check saw it.* Halcyon's own front-end
+  takes a redeclared uniform, so the simulator and the fake device drew
+  the pass; the pre-flight's `duplicate_definitions` counts function
+  bodies; and the strict gate planned every scene with shadows off
+  (`check_models`, `check_masters`, the console scene builder,
+  `check_coded` on purpose), so it had never compiled a pass that carries
+  a shadow term. *What changed.* (1) *The emitter.*
+  `gpu/material.SHADOWPACK_DECL` is the line; `assemble_frame` appends it
+  once, ahead of the loop that writes the shadow functions, when at least
+  one lamp of the pass is mapped, and `_shadow_function` writes no
+  declaration. The sampler is listed once in the pass's
+  `binds['samplers']`, where it was; `strip_declarations` and the
+  CreateInfo sampler list are untouched. Measured on the tree before and
+  after, over 366 plans (every engine model at the three rates with
+  shadows on and off, and nine shadow variants at two sizes; 1098 passes):
+  the binds are identical in every pass, the stripped text is line for
+  line the same in every pass (blank lines aside), and the raw text is
+  byte for byte the same in 966 and, in the other 132, exactly the old
+  text with its declarations gathered into one (two into one in 102, three
+  in 18, eight in 6; in 6 passes with a single mapped lamp the one line
+  moved from the head of its function to the head of the block). No value
+  moves: the simulator's frame of the once-declared passes is bit for bit
+  its frame of the 1.92.0 text. (2) *The strict gate*
+  (`tests/glsl_strict.py`) covers shadows, and its docstring says so. The
+  material sweeps run twice, shadows off and then on with the demo scene's
+  two mapped lamps: the engine models at every rate (174 compiled, 3
+  refused by name, 90 passes carrying a shadow term), the console types
+  and options (396, 12 refused, 228), the cel masters (4; 6) and the coded
+  shaders by node name (8; 8). `check_shadow_kinds` plans the demo scene
+  under thirteen more kinds -- one, nine and sixteen PCF taps, softness 0,
+  the MIDPOINT map, a SPOT's single map beside the POINT's cube, eight
+  mapped lamps on the one atlas, two traced lamps hard and soft (a SUN's
+  disc, a POINT's sphere), a traced AREA lamp over its rectangle and over
+  its disk, and a mapped lamp beside a traced one under Per Light, hard
+  and soft -- and holds every pass to the shadow functions its kind names.
+  A traced lamp plans NO shadow term without a BVH on the job, so
+  `_pass_sources` puts render()'s own on it (`_frame_bvh`;
+  `tests/test_r251_material._job_for` takes a `bvh`), and a shadowed sweep
+  in which no pass carries a shadow function fails by name: that is the
+  state the gate was in. A text glslang has judged is not handed over
+  again, so the doubled sweeps ask it for 406 distinct texts where the
+  single ones made 1779 calls. With glslang 15.1.0 the gate passes;
+  against the 1.92.0 emitter it fails 246 labels (30 engine models, 198
+  console, 2 masters, 8 kinds, 8 coded), each one this redefinition and
+  nothing else. *What else shadows on turned up*: nothing. One-off, each
+  pass both as raw text and as the unit CreateInfo declares (the interface
+  `gpu/shade` builds over the stripped text), under glslang: the gate's
+  sweeps with shadows on and thirty-odd variants of the demo scene (the
+  kinds above, image cookies on a SPOT and a SUN, an Only Shadow and a
+  negative lamp, ambient occlusion and radiosity beside the shadows, up to
+  eight lamps) -- 694 frames, 15 refused by name, 2037 passes, every one
+  compiled on both roads; no uniform declared twice, every sampler of a
+  spec declared once in its raw text and every declared name in its spec.
+  *Left as it is*: the pre-flight is not widened to repeated declarations
+  -- on the CreateInfo road they are stripped and harmless, and a refusal
+  there would turn a pass that draws into a CPU frame; the text-level
+  check lives in the test. *Not in the gate*: the caustics cookie and the
+  World Light's lamp, which render() adds to a frame and the gate's job
+  recipe does not (in a pass they are a cookie function and one more
+  mapped SUN). Pinned in
+  `test_shadow_atlas_sampler_is_declared_once_per_pass` in
+  `tests/test_r253_review.py` (52 checks, 54 where `HALCYON_GLSLANG`
+  points at glslang, which then compiles each shadowed pass and refuses
+  the 1.92.0 text of each): the demo scene's three passes declaring the
+  sampler once, on its own line, ahead of the first fetch, and listing it
+  once; three and eight mapped lamps the same; one declaration beside a
+  traced lamp, whichever comes first, and none (in the text or in the
+  binds) for traced lamps alone, at the vertex rate or with shadows off;
+  no uniform of any name declared twice; the 1.92.0 text put back -- named
+  by the text-level check, let through by the pre-flight, its stripped
+  text and its simulated frame the fixed pass's own -- so the checks can
+  tell; what each road of `_compile_dynamic_miss` hands a stand-in driver
+  (the raw text with one declaration; the stripped text with none and the
+  sampler once, in its slot); and the rule read from the code. Against the
+  1.92.0 emitter 13 of them fail, and fourteen mutations each fail at
+  least two, none by raising: the fix taken out whole; a declaration left
+  in each function beside the assembler's; the assembler's written after
+  the functions, once per mapped lamp, twice, or not at all; the sampler
+  unlisted or listed twice; the decision made for a traced lamp too, from
+  the second mapped lamp on, by the first lamp alone or by the last; the
+  line without its newline or under another spelling.
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
@@ -1207,3 +1303,13 @@ Shader's name resolution is pinned in `tests/test_shaders.py` as well.
   rule) and the pass that read the frame shader's `vUV` (which compiles,
   and draws what the CPU does not). `tests/glsl_strict.py` was not run in
   this round: the machine had no glslang.
+- The once-declared shadow atlas on a real driver. The fix is proven on
+  glslang 15.1.0 (every shadowed pass `tests/glsl_strict.py` plans, as raw
+  GLSL 4.30), on the simulator and on a stand-in `gpu` module for the
+  hand-over -- never on a GPU. The raw text reaches a driver through the
+  legacy `GPUShader(VERTEX, fragment)` constructor alone, which
+  `_compile_dynamic_miss` calls only when `gpu.types` has no
+  `GPUShaderCreateInfo`; no Blender session ran in this round. Open there:
+  a build that still takes that road compiling a material pass under two
+  or more shadowed lamps, and what its driver says to the 1.92.0 text (a
+  redefinition by GLSL's rule; no driver was asked).

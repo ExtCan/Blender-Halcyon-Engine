@@ -1373,6 +1373,12 @@ def _area_function(i, light, consts):
     return '\n'.join(L) + '\n'
 
 
+#: the combined shadow atlas, as a pass declares it: ONE line per pass
+#: however many mapped lamps fetch from it (assemble_frame writes it ahead
+#: of the first hal_shadow_vis; `_shadow_function` writes none)
+SHADOWPACK_DECL = 'uniform sampler2D hal_shadowpack;\n'
+
+
 def _shadow_function(i, meta, consts):
     """GLSL for one light's shadow term, mirroring ShadowMap.lookup exactly.
 
@@ -1528,8 +1534,12 @@ def _shadow_function(i, meta, consts):
     origin = meta['origin']
 
     voff = int(meta.get('voff', 0))
-    L = ['uniform sampler2D hal_shadowpack;',
-         f'float hal_shadow_vis{i}(vec3 P, vec3 N, vec3 L)',
+    # (no `uniform sampler2D hal_shadowpack;` here: the atlas is ONE
+    # sampler however many lamps read it, and the assembler declares it
+    # ONCE ahead of the first mapped function -- SHADOWPACK_DECL. One per
+    # function was a redefinition to a strict front-end from the second
+    # shadowed lamp on)
+    L = [f'float hal_shadow_vis{i}(vec3 P, vec3 N, vec3 L)',
          '{',
          f'    float ndl = clamp(dot(N, L), 0.0, 1.0);',
          f'    float slope = {_f(bias)} * (1.0 + 2.0 * (1.0 - ndl));',
@@ -5074,12 +5084,19 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     if bake.get('__cel_field') and not vertex_rate:
         shadow_fns.append(_cel_lookup_function(consts))
         samplers.append('hal_celfield')
-    mapped_shadow = False
+    mapped_shadow = any(s is not None and not s.get('ray') for s in shadows)
+    if mapped_shadow:
+        # R253 (review): the atlas sampler is declared ONCE per pass,
+        # ahead of the first hal_shadow_vis that fetches it. Each mapped
+        # lamp's function used to open with its own copy, so a pass under
+        # two shadowed lamps declared it twice: `strip_declarations`
+        # takes every copy off for CreateInfo, but the legacy constructor
+        # compiles the raw text, and there the second copy is a
+        # redefinition
+        shadow_fns.append(SHADOWPACK_DECL)
     for i, smeta in enumerate(shadows):
         if smeta is not None:
             shadow_fns.append(_shadow_function(i, smeta, consts))
-            if not smeta.get('ray'):
-                mapped_shadow = True
     if mapped_shadow:
         # every mapped light reads the ONE combined atlas: eight
         # per-light samplers put real materials at the driver's
