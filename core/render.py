@@ -4275,7 +4275,9 @@ def _caster_keep_tri(scene, mesh):
     return keep_tri
 
 
-def _build_shadows(scene, st, mesh):
+def _build_shadows(scene, st, mesh, traced=None):
+    # R254: `traced` says whether a BVH exists for this frame (render()
+    # knows; any other caller leaves it unsaid and one is assumed)
     # R253 (H): every lamp's style gain for THIS frame, written before
     # anything reads an energy -- the CPU loop, the beams, the fog
     # lobe, the ambient pool and the GPU packer all see one number
@@ -4292,8 +4294,10 @@ def _build_shadows(scene, st, mesh):
         cast = np.nonzero(keep_tri)[0]
     # R254: a lamp that adds no light (Power 0, a black colour, no lobe
     # left) needs no map unless something reads a shadow apart from its
-    # lamp's light (LI.map_roles)
+    # lamp's light, and a lamp of the frame may go without one only
+    # where no BVH could trace in the map's place (LI.map_roles)
     st._shadow_quiet = not shadow_read_apart_from_light(scene, st)
+    st._shadow_untraced = traced is False
     LI.build_shadow_maps(scene, st, cast)
 
 
@@ -5053,7 +5057,7 @@ def render(scene, settings=None, progress=None, band=None):
             bvh = _cached_bvh(scene, mesh)
 
     with ST.track('shadow maps'):
-        _build_shadows(scene, st, mesh)
+        _build_shadows(scene, st, mesh, traced=bvh is not None)
     # R208: the caster mask travels to the RAY shadow road too (the
     # maps already honour it at bake time). visibility() reads it off
     # the settings and hands it to the BVH's any-hit as a cast filter,

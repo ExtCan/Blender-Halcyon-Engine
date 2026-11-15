@@ -1837,26 +1837,33 @@ def frustum_keep(clip, tris, width, height, near_eps=1e-5):
 
     False for a triangle whose three corners are all behind the near
     plane (the clipper's own test, `z + w < near_eps`: it emits nothing
-    for one), and for a triangle wholly in FRONT of the near plane whose
-    three corners lie outside the same side plane -- left, right, bottom
-    or top, each two texels outside the target. A side plane is a linear
-    half-space of clip space, and a triangle in front of the near plane
-    is never clipped by it, so its screen corners are these very clip
-    corners divided by their own w: three corners two texels outside one
-    side put its whole box outside the target and no fill gives it a
-    texel. A triangle that STRADDLES the near plane is always kept (the
-    clipper makes new corners for it, and the reject must not depend on
-    how those round). Dropping the rest before the clipper changes no
-    texel.
+    for one), and for a triangle whose three corners lie outside the
+    same side plane -- left, right, bottom or top, each two texels
+    outside the target. A side plane is a linear half-space of clip
+    space, so three corners outside one put the whole triangle outside
+    it, and whatever the near clipper keeps of it too.
+
+    A triangle wholly in FRONT of the near plane is never clipped by it:
+    its screen corners are these very clip corners divided by their own
+    w, so the plain test decides. One that STRADDLES the near plane gets
+    new corners from the clipper, each an interpolation that rounds; it
+    is dropped only when its corners clear the side plane by a margin a
+    few hundred of those roundings wide (1e-4 of the corners' largest
+    magnitude), and kept otherwise. Either way a dropped triangle cannot
+    put a fragment on the target, and dropping it before the clipper
+    changes no texel.
 
     One byte per vertex and one gather per triangle, against the 48-byte
     gather and the clip classification build_screen_tris runs on every
-    triangle it is handed. A cube face keeps the triangles of its own 90
+    triangle it is handed -- and, for a straddler, the clipper's
+    per-triangle loop. A cube face keeps the triangles of its own 90
     degree frustum instead of the whole front hemisphere the 4-screen
     guard band lets through."""
     x, y, z, w = clip[:, 0], clip[:, 1], clip[:, 2], clip[:, 3]
-    gx = np.float32(1.0 + 4.0 / float(width)) * w
-    gy = np.float32(1.0 + 4.0 / float(height)) * w
+    kx = np.float32(1.0 + 4.0 / float(width))
+    ky = np.float32(1.0 + 4.0 / float(height))
+    gx = kx * w
+    gy = ky * w
     code = (x > gx).astype(np.uint8)
     code |= (x < -gx).astype(np.uint8) << 1
     code |= (y > gy).astype(np.uint8) << 2
@@ -1866,8 +1873,22 @@ def frustum_keep(clip, tris, width, height, near_eps=1e-5):
     c0, c1, c2 = c[:, 0], c[:, 1], c[:, 2]
     shared = c0 & c1 & c2
     behind = (c0 | c1 | c2) & 16
-    drop = ((shared & 16) != 0) | (((shared & 15) != 0) & (behind == 0))
-    return ~drop
+    side = (shared & 15) != 0
+    keep = ~(((shared & 16) != 0) | (side & (behind == 0)))
+    # the straddlers that share a side: outside it by the margin?
+    idx = np.nonzero(side & (behind != 0) & ((shared & 16) == 0))[0]
+    if idx.size:
+        cp = clip[tris[idx]].astype(np.float64)             # (S, 3, 4)
+        xs, ys, ws = cp[:, :, 0], cp[:, :, 1], cp[:, :, 3]
+        margin = (np.abs(xs) + np.abs(ys) + np.abs(ws)).max(axis=1) * 1e-4
+        ex = float(kx) * ws
+        ey = float(ky) * ws
+        out = ((xs - ex).min(axis=1) > margin) \
+            | ((-xs - ex).min(axis=1) > margin) \
+            | ((ys - ey).min(axis=1) > margin) \
+            | ((-ys - ey).min(axis=1) > margin)
+        keep[idx[out]] = False
+    return keep
 
 
 def _large_strips(t, x0, x1, x2, y0, y1, y2, area, bxmin, bxmax, bymin,

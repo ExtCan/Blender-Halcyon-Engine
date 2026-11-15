@@ -463,10 +463,8 @@ def test_b_the_reject_only_drops_what_cannot_land():
           and above == [False, False, False, False, True, False]
           and miss == [False, True, False, True, False, True],
           f'{inside} {above} {miss}')
-    with _spy() as calls:
-        z = LI._render_depth(V, T, faces[4].vp, faces[4].size,
-                             bounds=(lo, hi))
-    check('...and that face comes back blank without a vertex being read',
+    z = LI._render_depth(V, T, faces[4].vp, faces[4].size, bounds=(lo, hi))
+    check('...and with the box at hand that face comes back blank at once',
           CRg.is_blank(z) and np.array_equal(
               np.asarray(z), _gbuffer_depth(V, T, faces[4].vp,
                                             faces[4].size)))
@@ -557,8 +555,6 @@ def test_c_maps_are_baked_for_the_lamps_something_reads():
         st = _settings(64, **kw)
         (a, na, ma, _s, _t), (b, nb, _mb, _s2, _t2) = run(
             lambda: dark()[:2], st=st, mats=mats)
-        with _bake_every_lamp():
-            pass
         st0 = _settings(64, **kw)
         sc0 = _scene([dark()[0]], st0, mats=mats)
         alone = _cold(sc0, st0)
@@ -612,9 +608,10 @@ def test_c_maps_are_baked_for_the_lamps_something_reads():
     st.global_ambient = (0.0, 0.0, 0.0)
     (a, na, ma, sc, s), (b, nb, _mb, _s2, _t2) = run(sun_point, st=st,
                                                      sc_fn=vol_scene)
-    sc2 = vol_scene([l for l in sun_point()], copy.copy(st))
+    st2 = copy.copy(st)
+    sc2 = vol_scene(sun_point(), st2)
     sc2.lights[1].shadow = 'NONE'
-    unshadowed = _cold(sc2, sc2.settings if False else copy.copy(st))
+    unshadowed = _cold(sc2, st2)
     check('a lamp the Light Limit dropped still shadows a volume it '
           'lights: the march\'s first lookup bakes its map (the frame is '
           'the every-map frame, and not the unshadowed one)',
@@ -687,6 +684,16 @@ def test_c_maps_are_baked_for_the_lamps_something_reads():
               np.array_equal(sim, sim2)
               and float(np.abs(sim[cov] - cpu[cov][:, :3]).max()) < 6e-3,
               f'{float(np.abs(sim[cov] - cpu[cov][:, :3]).max()):.6f}')
+
+    # a frame with a BVH keeps the maps of its own lamps: a missing map
+    # there reads as a request for traced shadows on the GPU plan
+    for label, lights in (('a dark lamp', off), ('a Screen Spotlight',
+                                                screen)):
+        st = _settings(64, ambient_occlusion=True)
+        (a, na, ma, _s, _t), (b, nb, _mb, _s2, _t2) = run(lights, st=st)
+        check(f'{label} on a frame with a BVH (ambient occlusion on) keeps '
+              'its map; the frame is the every-map frame',
+              ma == [True, True] and na == nb and np.array_equal(a, b))
 
     # the traced road: a lamp that adds nothing is not asked either
     asked = []
@@ -826,8 +833,7 @@ def test_e_a_viewport_draft_bakes_draft_sized_maps():
                  _lamp('SPOT', pos=(-3, -2, 4), name='T',
                        shadow_map_size=64)], st)
     LI.clear_shadow_cache()
-    with _spy() as calls:
-        np.asarray(R.render(sc, st))
+    np.asarray(R.render(sc, st))
     full = [(f.size, l.shadow_map) for l in sc.lights
             for f in _faces(l.shadow_map)[:1]]
     draft = st.copy()

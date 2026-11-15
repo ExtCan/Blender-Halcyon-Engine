@@ -388,23 +388,20 @@ def spot_map_fov(light):
     was cut off inside the lit ring). The one place the bake, the cache
     key and the choice between one map and a cube read it."""
     size = float(light.spot_size)
-    ring = str(getattr(light, 'spot_law', 'BLENDER') or 'BLENDER') \
-        == 'GX_RING2'
-    if getattr(light, 'spot_square', False):
-        # R253 (A): a Square cone lights a square patch whose corners
-        # sit sqrt(2) further out than the round cone's edge -- widen
-        # the buffer to the diagonal so the corners keep their shadows
-        half_t = float(np.tan(size * 0.5)) * np.sqrt(2.0)
-        if not ring:
+    square = bool(getattr(light, 'spot_square', False))
+    if str(getattr(light, 'spot_law', 'BLENDER') or 'BLENDER') != 'GX_RING2':
+        if square:
+            # R253 (A): a Square cone lights a square patch whose corners
+            # sit sqrt(2) further out than the round cone's edge -- widen
+            # the buffer to the diagonal so the corners keep their shadows
+            half_t = float(np.tan(size * 0.5)) * np.sqrt(2.0)
             return max(2.0 * float(np.arctan(half_t)) * 1.15, 0.05)
-        half = float(np.arctan(half_t))
-    else:
-        if not ring:
-            return max(size * 1.15, 0.05)
-        half = size * 0.5
+        return max(size * 1.15, 0.05)
     c = float(np.cos(size * 0.5))
-    reach = float(np.arccos(max(c - (1.0 - c) / np.sqrt(2.0), -1.0)))
-    return max(2.0 * max(half, reach) * 1.15, 0.05)
+    edge = float(np.arccos(max(c - (1.0 - c) / np.sqrt(2.0), -1.0)))
+    if square:
+        edge = float(np.arctan(np.tan(min(edge, 1.5)) * np.sqrt(2.0)))
+    return max(2.0 * edge * 1.15, 0.05)
 
 
 def _map_size(light, settings):
@@ -607,14 +604,15 @@ def _shadow_base_signature(scene, settings, caster_tris):
 #   'bake'   a lamp of `frame_lights` whose shadow a surface may read:
 #            baked now (in threads), on both roads.
 #   'defer'  a lamp that still WOULD get a map but that no surface is
-#            known to read: one the Light Limit dropped, a Screen
-#            Spotlight, an ambient lamp, a lamp that adds no light while
-#            nothing reads a shadow apart from the light. It is baked on
-#            its first lookup (`visibility` -> `_deferred_map`), so a
-#            reader this rule does not know -- today the volume march,
-#            which lights a container from every lamp, and the ground
-#            plane under a Screen Spotlight -- gets exactly the map it
-#            always got, and a lamp nobody looks up is never baked.
+#            known to read: one the Light Limit dropped, and -- on a
+#            frame without a BVH -- a Screen Spotlight, an ambient lamp,
+#            a lamp that adds no light while nothing reads a shadow
+#            apart from the light. It is baked on its first lookup
+#            (`visibility` -> `_deferred_map`), so a reader this rule
+#            does not know -- today the volume march, which lights a
+#            container from every lamp, and the ground plane under a
+#            Screen Spotlight -- gets exactly the map it always got, and
+#            a lamp nobody looks up is never baked.
 #
 # The deferral is what keeps the rule right while the readers change:
 # nothing here assumes who reads, only who certainly does.
@@ -669,6 +667,11 @@ def map_roles(scene, settings):
     # every lamp's shadow count: render._build_shadows says whether one
     # exists; unsaid, one is assumed
     quiet = bool(getattr(settings, '_shadow_quiet', False))
+    # a lamp OF THE FRAME goes without a map only on a frame with no
+    # BVH. With one, the GPU plan reads a missing map as a request for
+    # traced shadows (`_shadow_meta`: the ray fallback, and its refusal
+    # under a caster mask), so such a frame keeps every map it had
+    alone = bool(getattr(settings, '_shadow_untraced', False))
     # the ambient lamps (Ambient Only): where the module has the one
     # predicate every reader skips them by, they shade nothing directly
     # and their map is only promised. Without it an Ambient Only lamp
@@ -680,6 +683,8 @@ def map_roles(scene, settings):
             roles.append(None)
         elif id(light) not in frame:
             roles.append('defer')
+        elif not alone:
+            roles.append('bake')
         elif light.type == 'SPOT' and getattr(light, 'screen_spot', False):
             roles.append('defer')
         elif ambient is not None and ambient(light):
