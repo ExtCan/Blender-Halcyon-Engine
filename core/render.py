@@ -9183,13 +9183,17 @@ def _draw_halos(img, scene, st, gbuf, view, proj, w, h, sel_mask=None):
                 # halo is a diffuse receiver. The loop used to walk
                 # every lamp and read Ambient Only alone: a Negative
                 # lamp brightened the halo, an Only Shadow or Specular
-                # Only lamp lit it
-                for lgt in LI.frame_lights(scene, st):
-                    _hs = LI.lights_volume(lgt)
-                    if _hs == 0.0 or not getattr(lgt, 'affect_diffuse',
-                                                 True) \
-                            or getattr(lgt, 'specular_only', False):
-                        continue
+                # Only lamp lit it. The list is taken once per frame
+                # (thousands of particle halos share it)
+                halo_lamps = shaded_cache.get('lamps')
+                if halo_lamps is None:
+                    halo_lamps = shaded_cache['lamps'] = [
+                        (lg, LI.lights_volume(lg))
+                        for lg in LI.frame_lights(scene, st)
+                        if LI.lights_volume(lg) != 0.0
+                        and getattr(lg, 'affect_diffuse', True)
+                        and not getattr(lg, 'specular_only', False)]
+                for lgt, _hs in halo_lamps:
                     try:
                         _L, radl, _d = LI.sample(lgt, p1, st)
                     except Exception:

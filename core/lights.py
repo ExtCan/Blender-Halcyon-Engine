@@ -1560,17 +1560,6 @@ def limit_strength(light, pts, guard, settings):
     return k * w / (4.0 * np.pi)
 
 
-#: R254: how the Light Limit chooses. `reference` is limit_reference's
-#: (pts, guard, eye), or a callable returning it that is read only when
-#: the limit actually drops a lamp (frame_lights hands in the scene's):
-#: Brightest ranks on what each lamp delivers over the scene
-#: (limit_strength), Nearest on its distance from the camera with a Sun or
-#: hemi at distance 0 (it reaches everything), ties in scene order, and
-#: the survivors come back in SCENE order -- the order the per-material
-#: light limit and the GPU plan's selection signature both assume.
-#: Without a reference (a bare lamp list, a scene with nothing to measure
-#: against) the ranking is the raw one it always was. A list at or under
-#: the limit comes back untouched.
 def is_ambient_lamp(light):
     """True for a lamp that is ONLY ambient: the AMBIENT type, and any
     lamp with Ambient Only ticked (R254).
@@ -1602,6 +1591,17 @@ def lights_volume(light):
     return -1.0 if getattr(light, 'negative', False) else 1.0
 
 
+#: R254: how the Light Limit chooses. `reference` is limit_reference's
+#: (pts, guard, eye), or a callable returning it that is read only when
+#: the limit actually drops a lamp (frame_lights hands in the scene's):
+#: Brightest ranks on what each lamp delivers over the scene
+#: (limit_strength), Nearest on its distance from the camera with a Sun or
+#: hemi at distance 0 (it reaches everything), ties in scene order, and
+#: the survivors come back in SCENE order -- the order the per-material
+#: light limit and the GPU plan's selection signature both assume.
+#: Without a reference (a bare lamp list, a scene with nothing to measure
+#: against) the ranking is the raw one it always was. A list at or under
+#: the limit comes back untouched.
 def select_lights(lights, settings, reference=None):
     """Emulate a hardware light limit by keeping only the strongest N."""
     active = [l for l in lights if not is_ambient_lamp(l)]

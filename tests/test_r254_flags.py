@@ -1391,6 +1391,33 @@ def test_g_flags_on_the_other_roads():
           'survive the limit (C is dropped, A is not in the group)',
           float(np.abs(cg[floor] - only_b[floor]).max()) < 1e-6,
           f'max difference {float(np.abs(cg[floor] - only_b[floor]).max()):.1e}')
+    # a console material's own light limit under the scene's Light Limit
+    from .test_r252_console import console_graph
+    con = {1: Material(name='BallCon', index=1, graph=console_graph(
+        {'console': 'SYSTEM22', 'light_limit': True}))}
+    weak = _fill(name='Weak', energy=2.0)
+    b1 = _key(name='B', shadow='NONE', energy=120.0)
+    c1 = _fill(name='C', position=(-4.0, -5.0, 5.0), energy=110.0)
+    st_c = _settings(shadows=False, max_lights=2, light_limit_mode='BRIGHTEST')
+    sc_c = _scene([weak, b1, c1], st_c, mats=con)
+    if sc_c.mesh.colors is not None:
+        sc_c.mesh.colors = None
+    kept = [l.name for l in _frame_lights(sc_c, st_c)]
+    cc, gc = _roads('a System 22 material (one lamp) under Light Limit 2 '
+                    '(Brightest keeps B, C)', sc_c, st_c)
+    st_1 = _settings(shadows=False)
+    sc_1 = _scene([_key(name='B', shadow='NONE', energy=120.0)], st_1,
+                  mats=con)
+    if sc_1.mesh.colors is not None:
+        sc_1.mesh.colors = None
+    ball = _objects(sc_c, st_c) == 1
+    one_b = _cpu(sc_1, st_1)
+    check('the machine\'s one lamp is the FIRST survivor of the scene\'s '
+          'limit in scene order (B), not the first lamp of the scene',
+          kept == ['B', 'C']
+          and float(np.abs(cc[ball] - one_b[ball]).max()) < 1e-6,
+          f'kept {kept}; ball against the B-only frame '
+          f'{float(np.abs(cc[ball] - one_b[ball]).max()):.1e}')
     # Only Shadow with Negative: Blender Internal's arithmetic, -(-x)
     rg = _regions()
     st = _settings()
