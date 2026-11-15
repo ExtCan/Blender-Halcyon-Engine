@@ -12,7 +12,7 @@
     (I) accumulation, lens and refine passes trace their own rays
     (J) the panels follow the method that will run
 
-The rig is the audit's: a floor, a plate whose straight edge shadows it
+The rig is a floor, a plate whose straight edge shadows it
 and one lamp, seen from straight above, so frame / unshadowed frame IS
 the visibility and a penumbra is a profile along x. Every law is proven
 on the CPU road and through the GLSL front-end (plan_frame + simulate at
@@ -38,7 +38,7 @@ import numpy as np
 
 from . import utf8_console
 from .test_render import _prev_engine, base_settings
-from .scenebuild import (_mesh_concat, demo_scene, look_at_matrix, plane)
+from .scenebuild import _mesh_concat, look_at_matrix, plane
 from . import featurematrix as FM
 from ..core import lights as LI
 from ..core import patterns as PT

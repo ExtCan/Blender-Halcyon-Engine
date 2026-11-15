@@ -45,7 +45,7 @@ geometry, inside the penumbra.
   bitwise the frame with a BVH in reach).
 - **Pictures that change.** None beyond the fix already on the branch.
 - **Proof.** POINT / SPOT / SUN / AREA: umbra darkness 0.000 -> 1.000, the
-  frame bitwise the render-wide Ray Traced frame, GLSL twin within 6.0e-4. A
+  frame bitwise the render-wide Ray Traced frame, GLSL twin within 5e-6. A
   mapped and a traced lamp under Per Light both cast (umbra vis 0.427 ->
   0.000). No BVH is built for: render Shadow Maps; Per Light with only mapped
   lamps; Per Light + lamp Ray Traced with Ray Shadows or Shadows off; a hemi
