@@ -1344,6 +1344,7 @@ _DIRTY_OBJS = set()       # object tokens whose entries must be dropped
 _DIRTY_DATA = set()       # data session_uids whose entries must be dropped
 _DIRTY_ALL = False
 _DIRTY_ALL_BY = None      # the ID type name that last set _DIRTY_ALL
+_DIRTY_RENDER = None      # the ID type that outdated the RENDER pool (R254)
 _CACHE_ARMED = False
 
 #: ID type names whose updates cannot change any object's evaluated mesh
@@ -1379,6 +1380,17 @@ _IRRELEVANT_IDS = frozenset({
     'CompositorNodeTree', 'TextureNodeTree', 'Brush', 'Palette',
     'Screen', 'WindowManager', 'WorkSpace'})
 
+#: R254. Three of the names above CAN change a mesh: an image or a texture
+#: that a Displace / Warp / Wave modifier (or a node tree's Image input)
+#: reads. Blender reports the texture and does NOT re-evaluate the object
+#: (measured: a displacement image rewritten on disk and reloaded reports
+#: ['ImageTexture'] alone), so the viewport depsgraph keeps showing the
+#: old mesh and the VIEWPORT pool agrees with it. A RENDER depsgraph is
+#: built new for every F12 and evaluates the new picture: every RENDER
+#: entry is dropped when one of these is reported (2106 px of stale
+#: displacement on the F12 after a reload otherwise).
+_RENDER_FEEDS = frozenset({'Image', 'Texture', 'ImageTexture'})
+
 #: geometry datablock types whose session_uid IS a cache key prefix
 _GEOM_DATA_IDS = frozenset({'Mesh', 'Curve', 'SurfaceCurve', 'TextCurve',
                             'MetaBall'})
@@ -1412,7 +1424,7 @@ def _watch_updates(scene, depsgraph, heard=None):
     holds: an object in `heard` is skipped, any other object is dirtied
     as always, and the non-object IDs are skipped too (each cached entry
     belongs to an object, and every object is either heard or dirtied)."""
-    global _DIRTY_ALL, _DIRTY_ALL_BY
+    global _DIRTY_ALL, _DIRTY_ALL_BY, _DIRTY_RENDER
     if not _CACHE_ARMED:
         return
     try:
@@ -1435,7 +1447,11 @@ def _watch_updates(scene, depsgraph, heard=None):
                     _DIRTY_ALL_BY = t
                     return
                 continue
-            if heard is not None or t in _IRRELEVANT_IDS:
+            if heard is not None:
+                continue
+            if t in _IRRELEVANT_IDS:
+                if t in _RENDER_FEEDS:
+                    _DIRTY_RENDER = t
                 continue
             uid = getattr(idb, 'session_uid', None)
             if t in _GEOM_DATA_IDS and uid is not None:
@@ -1531,6 +1547,39 @@ def _foreign_render_hooks(bpy):
     return False
 
 
+#: modifier types whose result can change with no depsgraph update: they
+#: read a file or a baked cache at evaluation (a point cache, an Alembic
+#: archive, an ocean or fluid bake), or run a node tree that may sample
+#: an image
+_OUTSIDE_MODIFIERS = frozenset({'NODES', 'MESH_CACHE', 'MESH_SEQUENCE_CACHE',
+                                'OCEAN', 'FLUID'})
+
+
+def _reads_outside(ob):
+    """True when the object's evaluated mesh can change while the
+    viewport depsgraph reports nothing, so that only a newly built RENDER
+    depsgraph sees it; such an object is never taken as heard.
+
+    * a driver on the object, its data or its shape keys: a scripted
+      driver can read a file or a module global;
+    * a modifier that reads a texture (Displace, Warp, Wave, the vertex
+      weight modifiers' mask): pixels written from a script fire no
+      update at all;
+    * a modifier in _OUTSIDE_MODIFIERS."""
+    data = getattr(ob, 'data', None)
+    for holder in (ob, data, getattr(data, 'shape_keys', None)):
+        ad = getattr(holder, 'animation_data', None)
+        if ad is not None and len(getattr(ad, 'drivers', ()) or ()):
+            return True
+    for md in getattr(ob, 'modifiers', ()) or ():
+        if str(getattr(md, 'type', '')) in _OUTSIDE_MODIFIERS:
+            return True
+        if getattr(md, 'texture', None) is not None or \
+                getattr(md, 'mask_texture', None) is not None:
+            return True
+    return False
+
+
 def _viewport_enabled(view_layer):
     """The tokens of the objects the view layer's VIEWPORT depsgraph
     holds and reports: the bases enabled in viewports. Blender's layer
@@ -1538,7 +1587,9 @@ def _viewport_enabled(view_layer):
     is inherited by everything under it, Exclude is each layer
     collection's own, and an object's own Disable in Viewports removes
     its base. (An object reached only through an instanced collection is
-    not here: it stays unheard and is exported live, as before.)"""
+    not here: it stays unheard and is exported live, as before; so does
+    an object whose mesh can change behind the depsgraph's back,
+    _reads_outside.)"""
     out = set()
     stack = [(view_layer.layer_collection, False)]
     while stack:
@@ -1547,7 +1598,7 @@ def _viewport_enabled(view_layer):
         restricted = restricted or bool(coll.hide_viewport)
         if not restricted and not lc.exclude:
             for ob in coll.objects:
-                if not ob.hide_viewport:
+                if not ob.hide_viewport and not _reads_outside(ob):
                     tok = _obj_token(ob)
                     if tok is not None:
                         out.add(tok)
@@ -1668,16 +1719,25 @@ def _cache_store(key, ent):
     _MESH_CACHE_BYTES += ent['bytes']
 
 
-def _cache_scrub():
+def _cache_scrub(mode=None):
     """Apply the dirt collected since the last export, then forget it.
 
     Returns (all_by, n_objs, n_data) -- what the dirt WAS, for the
     split instrument: the field's next paste can then say whether live
     re-exports came from real edits or from something spamming updates.
+    `mode` is the depsgraph mode of the export that asks: a RENDER export
+    whose pool an image or texture update emptied (_RENDER_FEEDS) reports
+    that type as its dirt.
     """
-    global _DIRTY_ALL, _DIRTY_ALL_BY
+    global _DIRTY_ALL, _DIRTY_ALL_BY, _DIRTY_RENDER
     took = (_DIRTY_ALL_BY if _DIRTY_ALL else None,
             len(_DIRTY_OBJS), len(_DIRTY_DATA))
+    if _DIRTY_RENDER is not None:
+        for k in [k for k in _MESH_CACHE if k[1] == 'RENDER']:
+            _cache_pop(k)
+        if mode == 'RENDER' and took[0] is None:
+            took = (_DIRTY_RENDER,) + took[1:]
+        _DIRTY_RENDER = None
     if _DIRTY_ALL:
         for k in list(_MESH_CACHE):
             _cache_pop(k)
@@ -1830,8 +1890,9 @@ def register():
 
 def unregister():
     global _CACHE_ARMED, _DIRTY_ALL, _DIRTY_ALL_BY, _MESH_CACHE_BYTES
-    global _SCENE_GEO_SIG
+    global _SCENE_GEO_SIG, _DIRTY_RENDER
     _CACHE_ARMED = False
+    _DIRTY_RENDER = None
     _MESH_CACHE.clear()
     _MESH_CACHE_BYTES = 0
     _DIRTY_OBJS.clear()
@@ -2841,10 +2902,10 @@ def export_scene(depsgraph, settings, warnings=None, space=None):
         _DIRTY_ALL = True
         _DIRTY_ALL_BY = 'simplify'
     _SCENE_GEO_SIG = _sig
-    _dirt_all_by, _dirt_objs, _dirt_data = _cache_scrub()
+    _dg_mode = str(getattr(depsgraph, 'mode', 'VIEWPORT'))
+    _dirt_all_by, _dirt_objs, _dirt_data = _cache_scrub(_dg_mode)
     _sp['dirt_all'] = _dirt_all_by or ''
     _sp['dirt_n'] = _dirt_objs + _dirt_data
-    _dg_mode = str(getattr(depsgraph, 'mode', 'VIEWPORT'))
     _view = space if _dg_mode == 'VIEWPORT' else None
     _cache_on = _CACHE_ARMED and not _DIRTY_ALL
     _touched = set()          # keys stored or reused THIS export

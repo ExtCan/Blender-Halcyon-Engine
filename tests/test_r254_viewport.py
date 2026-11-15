@@ -654,6 +654,29 @@ def test_e_f12_mesh_cache():
           "is each layer collection's own",
           got == {('n', 'a'), ('n', 'f'), ('n', 'g')}, str(sorted(got)))
 
+    # ---- an object whose mesh can change with no update fired at all
+    def ob(uid, **kw):
+        base = dict(name=f'o{uid}', session_uid=uid, hide_viewport=False,
+                    animation_data=None, data=None, modifiers=[])
+        base.update(kw)
+        return NS(**base)
+    quiet = [ob(1, modifiers=[NS(type='SUBSURF'), NS(type='BEVEL')]),
+             ob(2, animation_data=NS(drivers=[]))]
+    loud = [ob(3, animation_data=NS(drivers=[object()])),
+            ob(4, data=NS(animation_data=None, shape_keys=NS(
+                animation_data=NS(drivers=[object()])))),
+            ob(5, modifiers=[NS(type='DISPLACE', texture=object())]),
+            ob(6, modifiers=[NS(type='VERTEX_WEIGHT_MIX', texture=None,
+                                mask_texture=object())]),
+            ob(7, modifiers=[NS(type='NODES')]),
+            ob(8, modifiers=[NS(type='MESH_SEQUENCE_CACHE')])]
+    got = EX._viewport_enabled(NS(layer_collection=_layer(quiet + loud)))
+    check('an object with a driver, a texture-reading modifier, a node '
+          'modifier or a file cache is never heard -- pixels a script '
+          'writes fire no update, and only the new RENDER depsgraph sees '
+          'them (2106 px of stale displacement under a rule without this '
+          'test); a plain modifier stack is', got == {1, 2}, str(sorted(got)))
+
     # ---- when the main depsgraph's reports may be trusted
     main = _MainGraph()
     a = _mesh_object('A', 21)
@@ -795,6 +818,33 @@ def test_e_f12_mesh_cache():
             check('an object the main depsgraph reported is exported live, '
                   'the other one stays cached',
                   third['meshes'] == 1 and third['cached'] == 1, str(third))
+            # an image or a texture: Blender reports it and does NOT
+            # re-evaluate the objects whose modifiers read it, so the
+            # viewport pool still matches the viewport depsgraph and the
+            # RENDER pool does not match the next render depsgraph
+            EX.export_scene(_depsgraph(props, [a, b]), RenderSettings(), [])
+            both = {m: sum(1 for k in EX._MESH_CACHE if k[1] == m)
+                    for m in ('VIEWPORT', 'RENDER')}
+            EX._watch_updates(None, NS(updates=[NS(id=_id('ImageTexture'))]))
+            check('a texture update dirties no object and flushes nothing '
+                  'whole', not EX._DIRTY_OBJS and not EX._DIRTY_ALL
+                  and EX._DIRTY_RENDER == 'ImageTexture')
+            EX._on_frame_change(fake_scene, fresh_graph(a, b))
+            f12_export()
+            fourth = dict(EX.EXPORT_SPLIT)
+            kept = sum(1 for k in EX._MESH_CACHE if k[1] == 'VIEWPORT')
+            check('...but the F12 after it reads every mesh live and names '
+                  'the texture as its dirt (a displacement image reloaded '
+                  'from disk reports the texture alone: 2106 px of stale '
+                  'mesh otherwise), while the VIEWPORT pool is left alone',
+                  both == {'VIEWPORT': 2, 'RENDER': 2}
+                  and fourth['meshes'] == 2 and fourth['cached'] == 0
+                  and fourth['dirt_all'] == 'ImageTexture' and kept == 2
+                  and EX._DIRTY_RENDER is None, f'{both} {fourth} kept {kept}')
+            EX._on_frame_change(fake_scene, fresh_graph(a, b))
+            f12_export()
+            check('...and the F12 after that one is cached again',
+                  EX.EXPORT_SPLIT['cached'] == 2)
         finally:
             bpy.data.materials = old_mats
             EX._MESH_CACHE.clear()
