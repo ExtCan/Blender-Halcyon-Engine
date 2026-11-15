@@ -58,6 +58,8 @@ def run_tests():
     from . import test_r254_ray_road
     # R254: Hotspot, the visible beam, shafts, caustics, cookies
     from . import test_r254_spot_beam
+    # R254: under Shadow Maps a lamp's size shapes its shadow
+    from . import test_r254_map_soft
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -236,6 +238,11 @@ def run_tests():
     print('R254 SPOT AND BEAM (HOTSPOT, THE VISIBLE BEAM, SHAFTS, CAUSTICS, COOKIES)')
     print('=' * 66)
     rc |= test_r254_spot_beam.main()
+    print()
+    print('=' * 66)
+    print("R254 MAP SOFT (A LAMP'S SIZE SHAPES ITS MAPPED SHADOW)")
+    print('=' * 66)
+    rc |= test_r254_map_soft.main()
     return rc
 
 
