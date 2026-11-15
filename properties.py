@@ -3734,7 +3734,7 @@ class HalcyonLightSettings(PropertyGroup):
                     "Blender's buffer type were per lamp, and a scene can "
                     "mix a tight midpoint spot with a classic sun")
     shadow_softness: FloatProperty(name="Softness", default=1.0, min=0.0, max=32.0)
-    shadow_samples: IntProperty(name="Samples", default=4, min=1, max=64)
+    shadow_samples: IntProperty(name="Samples", default=0, min=0, max=64)
     shadow_density: FloatProperty(name="Density", default=1.0, min=0.0, max=1.0)
     shadow_color: FloatVectorProperty(name="Shadow Colour", subtype='COLOR', size=3,
                                       default=(0.0, 0.0, 0.0), min=0.0, max=1.0)
@@ -4259,6 +4259,68 @@ class HalcyonWorldSettings(PropertyGroup):
         description="How a face is sampled: point-sampled (the hard-edged "
                     "1990s look) or bilinear inside the face; a tap never "
                     "crosses into the neighbouring face either way")
+    # ---- R254 World Light: the world's own luminary as a scene light
+    # (core/worldlight.py makes one SUN Light from it at render entry)
+    world_light: BoolProperty(
+        name="World Light", default=False,
+        description="The sky's own sun or moon lights the scene as a real "
+                    "lamp: one Sun light is made from it at render time, "
+                    "aimed from where the sky draws it, casting shadows and "
+                    "counted like any lamp. Bryce and Physical skies give "
+                    "their sun (or the Bryce moon), a Sky Texture node "
+                    "gives its sun, an HDRI or cube map gives its brightest "
+                    "region; the other world types have none")
+    world_light_strength: FloatProperty(
+        name="Strength", default=1.0, min=0.0, soft_max=10.0, max=1000.0,
+        description="Multiplier on the world light's energy. At 1 a "
+                    "surface facing a sun of Sun Intensity 1 squarely "
+                    "reads its own colour; the World Strength and the sun's "
+                    "own intensity scale it too")
+    world_light_shadow: EnumProperty(
+        name="Shadow", default='MAP', items=_items(
+            ('NONE', "None", "The world light casts no shadow at all"),
+            ('MAP', "Shadow Map",
+             "A depth map from the luminary's direction, blurred by its "
+             "angular size (the render settings' map size and bias)"),
+            ('RAY', "Ray Traced",
+             "A shadow ray per sample toward the luminary's disc, soft by "
+             "its angular size")),
+        description="How the world light casts shadows, exactly as a Sun "
+                    "lamp's own Shadow choice does (the render settings' "
+                    "Scene Default shadow mode still overrides per-light "
+                    "choices)")
+    world_light_shafts: FloatProperty(
+        name="Light Shafts", default=0.0, min=0.0, soft_max=2.0, max=10.0,
+        description="The world light's Volumetric amount: above 0 the "
+                    "light-shaft pass streaks from where the sky's sun "
+                    "sits on screen, as it does for a Sun lamp with "
+                    "Volumetric set")
+    world_light_find: EnumProperty(
+        name="Find", default='DETECT', items=_items(
+            ('DETECT', "Detect in Image",
+             "Search the image once for its brightest region and light "
+             "from there in that region's colour; refused by name in the "
+             "console when nothing stands out or two regions tie"),
+            ('MANUAL', "Manual",
+             "Light from the Elevation and Azimuth below in the Colour "
+             "below; nothing is read from the image")),
+        description="Where an HDRI or cube-map world's light comes from: "
+                    "the brightest region found in the image, or a "
+                    "direction and colour set by hand (an 8-bit sky clips "
+                    "its sun and cannot always be searched)")
+    world_light_elevation: FloatProperty(
+        name="Elevation", default=0.7, min=-1.5708, max=1.5708,
+        subtype='ANGLE',
+        description="Manual world light: the angle of the luminary above "
+                    "the horizon, in the sky's own frame (the World "
+                    "Rotation turns it with the picture)")
+    world_light_azimuth: FloatProperty(
+        name="Azimuth", default=0.6, min=-6.2832, max=6.2832,
+        subtype='ANGLE',
+        description="Manual world light: the compass direction of the "
+                    "luminary, measured as the Bryce sun's is (0 = +X, "
+                    "turning toward +Y), in the sky's own frame")
+    world_light_color: _col("Colour", (1.0, 1.0, 1.0))
     cube_face_rot: IntVectorProperty(
         name="Face Turns", size=6, min=0, max=3, default=(0, 0, 0, 0, 0, 0),
         description="Quarter turns applied to each face image before it "
@@ -5020,7 +5082,7 @@ GROUP_DOCS = {
         'shadow_softness': "Blur of this light's mapped shadow, in "
                            "shadow-map texels. 0 is hard",
         'shadow_samples': "Taps or rays per pixel for this light's soft "
-                          "shadows",
+                          "shadows. 0 uses the render's Samples",
         'shadow_density': "How dark this light's shadows get. 1 is full "
                           "occlusion; less lets colour bleed through, as "
                           "the era's fake fill lights did",
@@ -5077,6 +5139,9 @@ GROUP_DOCS = {
                        "drag across the celestial sphere",
         'sun_elevation': "Height of the sun above the horizon, in "
                          "radians. Near 0 is sunset; 1.57 is overhead",
+        'world_light_color': "Manual world light: the colour of the "
+                             "light an HDRI or cube-map world throws, used "
+                             "in place of the colour found in the image",
         'sun_rotation': "Compass direction of the sun, in radians",
         'sun_color': "Colour of the sun disc and the light it throws "
                      "into the sky model",

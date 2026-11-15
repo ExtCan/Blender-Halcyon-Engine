@@ -4687,6 +4687,10 @@ def render(scene, settings=None, progress=None, band=None):
         scene.mesh, str(getattr(st, 'vertex_quantize', 'NONE')),
         float(getattr(st, 'vertex_units', 64.0)))
     scene.last_gel = None       # R251 C134: rebuilt below, beside last_depth
+    # R254: the world's own luminary joins scene.lights here, before any
+    # consumer reads the list (idempotent; untouched with the toggle off)
+    from . import worldlight as _WL
+    _WL.sync(scene, lambda: prepare_textures(scene, st))
     scene = _apply_material_override(scene, st)
     collect_exclusive_lights(scene)
     mesh = scene.mesh
@@ -4849,6 +4853,7 @@ def render(scene, settings=None, progress=None, band=None):
     need_bvh = st.raytrace or st.ambient_occlusion or \
         getattr(st, 'radiosity', False) or \
         (st.shadows and st.shadow_default == 'RAY') or \
+        _per_light_ray_shadows(scene, st) or \
         _volume_occlusion_wanted(scene, st)
     bvh = None
     if need_bvh and mesh is not None and mesh.tris is not None and mesh.tris.size:
@@ -6153,6 +6158,8 @@ def bake_lightmap(scene, st, obj_index=None, size=512, mode='COMBINED',
     from .nodeeval import desugar_master_bump
     for _m in (scene.materials or ()):
         desugar_master_bump(getattr(_m, 'graph', None))
+    from . import worldlight as _WL
+    _WL.sync(scene, lambda: prepare_textures(scene, st))      # R254
     collect_exclusive_lights(scene)
     textures = prepare_textures(scene, st)
     _build_shadows(scene, st, mesh)
@@ -7222,6 +7229,12 @@ def _cached_bvh(scene, mesh):
     is module-level so it survives the fresh Scene each export creates
     -- an F12 of an unchanged scene, an orbit, and most animation frames
     all skip the build.
+
+    The positions also carry mathx.content_digest, every byte of them:
+    the two strided sums alone kept the old tree -- so ray shadows fell
+    where the object USED to stand -- for a move between the stride's
+    samples, and for one whose components cancel in both sums (an
+    object in the +x +y quadrant moved by (d, -d, 0)).
     """
     v = mesh.verts
     t = mesh.tris
@@ -7230,6 +7243,7 @@ def _cached_bvh(scene, mesh):
     key = (int(v.shape[0]), int(t.shape[0]),
            round(float(v[::stride].sum()), 3),
            round(float(np.abs(v[::stride]).sum()), 3),
+           M.content_digest(v),
            int(t[::tstride].astype(np.int64).sum()))
     hit = _BVH_CACHE.get(key)
     if hit is not None:
@@ -8312,6 +8326,20 @@ def _fog_coverage_note_z(zd, settings):
 #: absent: an infinite directional beam has no apex to glow from, and
 #: 2.79 gave neither a halo
 _VOLUME_KINDS = ('SPOT', 'POINT', 'AREA')
+
+
+def _per_light_ray_shadows(scene, st):
+    """True when Shadow Method = Per Light and some lamp's own menu
+    says Ray Traced: that lamp needs the BVH exactly as the scene-wide
+    Ray Traced method does. Without it `visibility` found no BVH and
+    the lamp cast nothing unless Ray Tracing or AO happened to be on."""
+    if not (st.shadows and getattr(st, 'ray_shadows', True)
+            and st.shadow_default == 'PER_LIGHT'):
+        return False
+    return any(str(getattr(l, 'shadow', 'MAP')) == 'RAY'
+               and str(getattr(l, 'type', 'POINT')).upper()
+               not in ('HEMI', 'AMBIENT')
+               for l in (getattr(scene, 'lights', None) or ()))
 
 
 def _volume_occlusion_wanted(scene, st):

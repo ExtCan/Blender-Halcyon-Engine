@@ -649,11 +649,15 @@ def occluded_on_device(bvh, org, dirs, tmax):
 
 
 def bvh_fingerprint(bvh):
-    """A cheap content key, in the upload cache's strided-sum idiom."""
+    """A cheap content key, in the upload cache's strided-sum idiom --
+    with the exact digest of every vertex position beside the sum
+    (core/mathx.content_digest): a tree rebuilt for a moved object must
+    re-upload, whichever way the object moved."""
+    from ..core.mathx import content_digest
     v = bvh.verts
     stride = max(1, v.shape[0] // 512)
     return (int(bvh.n_nodes), int(bvh.tris.shape[0]),
-            round(float(v[::stride].sum()), 3))
+            round(float(v[::stride].sum()), 3), content_digest(v))
 
 
 def bvh_atlas_entries(bvh):

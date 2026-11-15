@@ -306,12 +306,19 @@ def midpoint_map(light, settings):
 def _shadow_base_signature(scene, settings, caster_tris):
     """Fingerprint of what EVERY shadow map depends on: the geometry,
     the shadow settings and the caster set -- everything except the
-    light itself."""
+    light itself.
+
+    The geometry is the two strided sums AND mathx.content_digest of
+    every vertex position: the sums alone served the old maps -- the
+    shadow stayed where the object USED to stand -- for a move between
+    the stride's samples, and for a (0, d, -d) move whose float sum
+    cancels exactly."""
     mesh = scene.mesh
     v = mesh.verts
     step = max(1, v.shape[0] // 512)
     geo = (v.shape[0], float(v[::step].sum()), float(v[::step, 0].dot(
-        np.arange(v[::step].shape[0], dtype=np.float32))))
+        np.arange(v[::step].shape[0], dtype=np.float32))),
+        M.content_digest(v))
     return (geo, settings.shadows, settings.shadow_default,
             int(settings.shadow_map_size),
             # size AND sum: two caster sets of equal count (say, two
@@ -1296,6 +1303,15 @@ def casts_shadow(light, settings):
     return mode not in ('NONE', 'PLANAR')
 
 
+def shadow_sample_count(light, settings):
+    """Taps (mapped) or rays (traced) for ONE light: its own Samples
+    when set, else the render's. 0 on the light means inherit -- the
+    same rule its Map Size and Bias overrides follow -- so a lamp left
+    alone reads exactly the render setting."""
+    own = int(getattr(light, 'shadow_samples', 0) or 0)
+    return own if own > 0 else max(1, int(getattr(settings, 'shadow_samples', 1)))
+
+
 def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
                sample_xy=None, mask=None):
     """Shadow term in 0..1 (1 = fully lit).
@@ -1359,7 +1375,7 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
             soft_on = area_hx > 0.0 or area_hy > 0.0
         else:
             soft_on = float(light.radius) > 0.0
-        samples = max(1, int(settings.shadow_samples)) if soft_on else 1
+        samples = shadow_sample_count(light, settings) if soft_on else 1
         if samples == 1:
             hit = bvh.occluded(origin, L, maxt, mask=mask, cast=cast)
             return (~hit).astype(np.float32)
@@ -1454,7 +1470,8 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
     else:
         offset = texel * (1.5 + 2.5 * np.sqrt(np.maximum(1.0 - ndl * ndl, 0.0))) * \
             max(1.0, soft)
-    lit = sm.lookup(P + N * offset[:, None], slope, soft, settings.shadow_samples)
+    lit = sm.lookup(P + N * offset[:, None], slope, soft,
+                    shadow_sample_count(light, settings))
     dens = float(light.shadow_density)
     return (1.0 - (1.0 - lit) * dens).astype(np.float32)
 
@@ -1465,8 +1482,17 @@ def select_lights(lights, settings, centre=None):
     limit = int(settings.max_lights)
     if limit <= 0 or len(active) <= limit:
         return active
+    # R254: the world's own light (core/worldlight.py) is the sky's sun --
+    # the limit ranks the LAMPS for the slots left beside it and never
+    # drops it. No scene without World Light carries the mark.
+    kept = [l for l in active if getattr(l, 'world_light', False)]
+    if kept:
+        active = [l for l in active if not getattr(l, 'world_light', False)]
+        limit = max(limit - len(kept), 0)
+        if limit == 0:
+            return kept
     if settings.light_limit_mode == 'FIRST':
-        return active[:limit]
+        return active[:limit] + kept
     if settings.light_limit_mode == 'NEAREST' and centre is not None:
         key = [float(np.linalg.norm(np.asarray(l.position, np.float32) - centre))
                for l in active]
@@ -1474,7 +1500,7 @@ def select_lights(lights, settings, centre=None):
     else:
         key = [float(l.energy) * float(np.mean(l.color)) for l in active]
         order = np.argsort(key)[::-1]
-    return [active[i] for i in order[:limit]]
+    return [active[i] for i in order[:limit]] + kept
 
 
 def ambient_light_split(scene, settings):

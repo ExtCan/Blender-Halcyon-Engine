@@ -226,6 +226,39 @@ def coerce(v, kind, n):
     return to_color(v, n)
 
 
+def link_closure(v, n):
+    """What a LINK hands a shader socket.
+
+    A closure passes through. A colour, a value or a vector wired into
+    a shader socket -- the Material or World Output's Surface, a Mix /
+    Add Shader input, a Max blend's sub-material, a group's shader
+    socket, Shader to RGB -- is an EMISSION of it at Strength 1:
+    Blender's own implicit conversion (Cycles inserts an Emission node
+    on the link, EEVEE reads the same), and here the very lobe an
+    Emission node hands on -- to_color of the value, weight one,
+    strength one -- so the picture is the explicit node's bit for bit.
+
+    This read `coerce(v, SHADER)`, which hands anything that is not a
+    closure an EMPTY one: the CPU shaded as if nothing were wired (the
+    material's fallback surface) while the deferred pass cast the same
+    link into its one colour chain and drew it as the albedo -- two
+    pictures of one graph, 1.69 apart on the demo ball, with the plan
+    qualified. The lobe is marked `implicit` so the GPU probe can
+    refuse it BY NAME (gpu/shade._probe_material).
+
+    An output with NO value (None: a renamed socket, a node that
+    raised) stays the empty closure, and so does an UNLINKED shader
+    socket, which never comes through here."""
+    if isinstance(v, Closure):
+        return v
+    if v is None:
+        return Closure()
+    cl = Closure()
+    cl.add('EMISSION', np.ones(n, np.float32), color=to_color(v, n),
+           strength=np.ones(n, np.float32), implicit=True)
+    return cl
+
+
 # ------------------------------------------------------------------ helpers
 
 
@@ -426,6 +459,10 @@ class GraphEvaluator:
         link = sock.get('link')
         if link:
             v = self.eval_output(link[0], link[1])
+            if k == SHADER:
+                # a colour / value / vector wired into a shader socket
+                # is an Emission of it (link_closure)
+                return link_closure(v, self.n)
             return coerce(v, k, self.n)
         return coerce(sock.get('default'), k, self.n)
 
@@ -523,7 +560,8 @@ class GraphEvaluator:
             if src is not None:
                 link = src.get('link')
                 v = self.eval_output(link[0], link[1]) if link else src.get('default')
-                out[o.get('name')] = coerce(v, k, self.n)
+                out[o.get('name')] = link_closure(v, self.n) \
+                    if (k == SHADER and link) else coerce(v, k, self.n)
             else:
                 out[o.get('name')] = coerce(None, k, self.n)
         return out

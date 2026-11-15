@@ -50,6 +50,8 @@ def run_tests():
     from . import test_r253_console_presets
     # R253 (field): a uniform the driver stripped never fails a pass
     from . import test_r253_uniforms
+    # R254: the world's own luminary as a scene light
+    from . import test_r254_world_light
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -208,6 +210,11 @@ def run_tests():
     print('R253 STRIPPED UNIFORMS (A GL DRIVER DROPS WHAT A PASS NEVER READS)')
     print('=' * 66)
     rc |= test_r253_uniforms.main()
+    print()
+    print('=' * 66)
+    print("R254 WORLD LIGHT (THE SKY'S OWN SUN OR MOON AS A SCENE LIGHT)")
+    print('=' * 66)
+    rc |= test_r254_world_light.main()
     return rc
 
 
