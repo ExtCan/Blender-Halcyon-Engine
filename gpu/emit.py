@@ -1137,6 +1137,13 @@ def _port_code_node(src, tag):
                     raise Unsupported('the coded shader returns a value '
                                       'from main; declare an out variable '
                                       'for the deferred pass')
+                if d[3]:
+                    # the CPU binds an entry parameter to the renderer's
+                    # input of its name; the frame's main() calls this one
+                    # with no arguments, which no driver compiles
+                    raise Unsupported('the coded shader\'s main takes '
+                                      'parameters; declare in / out '
+                                      'variables for the deferred pass')
             if d[2] == 'mainImage':
                 raise Unsupported('mainImage entry points need fragcoord, '
                                   'which the fullscreen pass does not carry')

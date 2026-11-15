@@ -1704,12 +1704,17 @@ class HALCYON_CodeNode(Node, HalcyonNodeBase):
 
     def compile_source(self):
         src = self.get_source()
+        # the warning belongs to the program it was compiled with: a source
+        # that is gone, or that no longer compiles, takes it along (the
+        # box used to keep the last good program's line -- unseen while
+        # nothing was ever warned of)
         if not src.strip():
-            self.error = ''
+            self.error = self.warn = ''
             return None
         prog, err = try_compile(src, self.language)
         if prog is None:
             self.error = err or 'compile failed'
+            self.warn = ''
             return None
         self.error = ''
         self.warn = '; '.join(prog.warnings[:3]) if prog.warnings else ''

@@ -6,6 +6,15 @@ select-and-write-back, loops iterate until no lane is still active, and `return`
 / `break` / `continue` / `discard` accumulate their own masks. That is why a
 shader with per-pixel branching produces the same image it would on hardware
 rather than something that only happens to work when every pixel agrees.
+
+Nothing calls the Generator below any more: shaders/interp.py walks the same
+tree (an extension may not exec generated source). What is LIVE in this
+module is the tables and helpers the interpreter, the name check and the GPU
+port share -- VARYINGS, FRAG_OUTS, INPUT_KEYS, ENTRY_NAMES, known_input,
+param_binding, check_recursion. A refusal written into the generator
+refuses nothing (its R235 argument-count guard sat here while the
+interpreter dropped and zero-filled arguments): what a compile must refuse
+is refused in shaders/names.py.
 """
 
 from .builtins import BUILTINS
@@ -50,6 +59,42 @@ VARYINGS = {
 }
 
 FRAG_OUTS = ('gl_FragColor', 'gl_FragData', 'fragColor', 'FragColor', 'outColor')
+
+#: every key the renderer hands a program its inputs under: the bindings
+#: above, and the two-wide fragment coordinate an entry parameter binds to
+#: (core/nodeeval `_shader_inputs` is the other end; it supplies every one
+#: but 'bitangent', which reads zero on both roads)
+INPUT_KEYS = frozenset(b for b, _t in VARYINGS.values()) | {'fragcoord2'}
+
+#: the functions a shader starts at, in the order they are looked for (a
+#: shader that names none of them starts at its first function)
+ENTRY_NAMES = ('main', 'mainImage', 'PSMain', 'psmain', 'MainPS', 'frag',
+               'fragment', 'pixel', 'PS')
+
+
+def known_input(name):
+    """Whether a declared `in` can read anything but zero in a render: its
+    name is one the table binds, or is itself a key the renderer supplies
+    (the run looks a declared input up under its own name first)."""
+    return name in VARYINGS or name in INPUT_KEYS
+
+
+def param_binding(pname, ptype):
+    """The input key an ENTRY parameter reads (`void mainImage(out vec4
+    fragColor, in vec2 fragCoord)`, `float4 PSMain(float2 uv : TEXCOORD0)`):
+    the table's own binding for the name, the same name in another case, the
+    two-wide fragment coordinate for a vec2 called some `...coord`, else the
+    name itself in lower case."""
+    v = VARYINGS.get(pname)
+    if v:
+        return v[0]
+    low = pname.lower()
+    for k, (b, _t) in VARYINGS.items():
+        if k.lower() == low:
+            return b
+    if ptype.n == 2 and 'coord' in low:
+        return 'fragcoord2'
+    return low
 
 
 class Scope:
@@ -176,7 +221,7 @@ class Generator:
         rt_, name, params, fbody = entry[1], entry[2], entry[3], entry[4]
         callscope = Scope(gscope)
         args = []
-        for qual, ptype, pname, parr in params:
+        for qual, ptype, pname, parr, *_default in params:
             py = 'p_' + _san(pname)
             binding = self.bind_param(pname, ptype)
             callscope.vars[pname] = (py, ptype)
@@ -213,20 +258,10 @@ class Generator:
         return '\n'.join(head + fn_lines + body), outs
 
     def bind_param(self, pname, ptype):
-        v = VARYINGS.get(pname)
-        if v:
-            return v[0]
-        low = pname.lower()
-        for k, (b, t) in VARYINGS.items():
-            if k.lower() == low:
-                return b
-        if ptype.n == 2 and 'coord' in low:
-            return 'fragcoord2'
-        return low
+        return param_binding(pname, ptype)
 
     def pick_entry(self):
-        for cand in ('main', 'mainImage', 'PSMain', 'psmain', 'MainPS', 'frag',
-                     'fragment', 'pixel', 'PS'):
+        for cand in ENTRY_NAMES:
             if cand in self.funcs:
                 return self.funcs[cand]
         if self.funcs:
@@ -268,7 +303,7 @@ class Generator:
         sc = Scope(gscope)
         argnames = []
         outs = []
-        for qual, ptype, pname, parr in params:
+        for qual, ptype, pname, parr, *_default in params:
             py = 'a_' + _san(pname)
             sc.vars[pname] = (py, ptype)
             argnames.append(py)
@@ -293,8 +328,8 @@ class Generator:
         self.lines, self.indent = saved, saved_i
         self.ret_type = prev
         self.func_outs = getattr(self, 'func_outs', {})
-        self.func_outs[name] = (ret_t, [(i, q) for i, (q, _, _, _) in
-                                        enumerate(params) if q in ('out', 'inout')])
+        self.func_outs[name] = (ret_t, [(i, p[0]) for i, p in
+                                        enumerate(params) if p[0] in ('out', 'inout')])
         return lines
 
     # ------------------------------------------------------------ statements
@@ -698,7 +733,7 @@ class Generator:
                               f'got {len(args)}')
         codes = []
         outs = []
-        for i, (qual, ptype, pname, parr) in enumerate(params):
+        for i, (qual, ptype, pname, parr, *_default) in enumerate(params):
             if i < len(args):
                 c, t = self.expr(args[i], mask, scope)
                 codes.append(self.coerce(c, t, ptype))
