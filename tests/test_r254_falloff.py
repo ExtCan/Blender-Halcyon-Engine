@@ -241,10 +241,12 @@ def test_a_start_zero_and_under_the_limit_are_the_old_statements():
           'and texel 5.w is 0 on every lamp', same
           and float(np.abs(t_plain[0, 5::GM.LIGHT_TEXEL_STRIDE, 3]).max())
           == 0.0)
-    # at or under the limit: the very list, and no bounds are measured
+    # at or under the limit: the very list, and nothing is measured
     calls = []
-    orig = LI.scene_bounds
-    LI.scene_bounds = lambda v: (calls.append(1), orig(v))[1]
+    spied = 'limit_reference' if hasattr(LI, 'limit_reference') \
+        else 'scene_bounds'
+    orig = getattr(LI, spied)
+    setattr(LI, spied, lambda v: (calls.append(1), orig(v))[1])
     try:
         pts = [_lamp(name=f'P{i}', position=(i * 2.0 - 7.0, 0.0, 2.0))
                for i in range(7)]
@@ -266,13 +268,13 @@ def test_a_start_zero_and_under_the_limit_are_the_old_statements():
         scf = _scene(pts + [sun], stf)
         ok_first = [l.name for l in _frame_lights(scf, stf)] == ['P0', 'P1']
     finally:
-        LI.scene_bounds = orig
+        setattr(LI, spied, orig)
     check('eight lamps under the factory limit of 8, and any number under '
           'limit 0, come back as the scene\'s own list in its order',
           ok)
     check('First keeps the first lamps in scene order, as it did', ok_first)
     check('...and none of those selections measured the scene (the old '
-          'path, untouched)', not calls, f'{len(calls)} bounds calls')
+          'path, untouched)', not calls, f'{len(calls)} {spied} calls')
     over = pts + [sun, _lamp(name='P7', energy=5.0), _lamp(name='P8',
                                                            energy=90.0)]
     st8 = _settings()
@@ -583,51 +585,88 @@ def test_g_light_limit_ranks_on_what_a_lamp_delivers():
         check('LI.limit_strength exists (the number Brightest ranks on)',
               False)
         return
-    # the number is the radiance the light loop delivers at the scene
+    # the number is the radiance the light loop delivers over the scene
     st = _settings()
     sc = _scene(pts + [sun], st)
-    centre, radius = LI.limit_bounds(sc)
+    grid, guard, eye = LI.limit_reference(sc)
+    lo, hi = sc.mesh.verts.min(axis=0), sc.mesh.verts.max(axis=0)
+    check('the reference is the 3 x 3 x 3 grid on the scene\'s bounds, a '
+          'guard of 5% of their diagonal, and the camera\'s position',
+          grid.shape == (27, 3) and np.array_equal(grid[0], lo)
+          and np.array_equal(grid[26], hi)
+          and np.allclose(grid[13], (lo + hi) * 0.5)
+          and abs(guard - 0.05 * float(np.linalg.norm(hi - lo))) < 1e-6
+          and np.allclose(eye, np.asarray(sc.camera.matrix_world)[:3, 3]))
     far = Light(type='POINT', name='far', position=(40.0, 0.0, 30.0),
                 color=(0.5, 1.0, 0.25), energy=900.0, shadow='NONE')
-    got = LI.limit_strength(far, centre, radius, st)
-    rad = float(np.mean(LI.sample(far, np.asarray([centre], f32), st)[1]))
-    check('a point lamp outside the scene is ranked on exactly the '
-          'radiance LI.sample delivers at the scene\'s centre',
+    got = LI.limit_strength(far, grid, guard, st)
+    rad = float(np.mean(LI.sample(far, grid, st)[1]))
+    check('a point lamp is ranked on exactly the radiance LI.sample '
+          'delivers, averaged over the grid',
           abs(got - rad) < 1e-6 * max(rad, 1e-12), f'{got:.6g} vs {rad:.6g}')
     check('a Sun is ranked on its strength times its mean colour',
-          LI.limit_strength(sun, centre, radius, st) == 3.0)
-    at_c = Light(type='POINT', name='c', position=tuple(centre),
+          LI.limit_strength(sun, grid, guard, st) == 3.0)
+    at_c = Light(type='POINT', name='c', position=tuple(grid[13]),
                  energy=10.0, shadow='NONE')
-    half = Light(type='POINT', name='h', energy=10.0, shadow='NONE',
-                 position=(float(centre[0]) + 0.5 * radius, float(centre[1]),
-                           float(centre[2])))
-    s_c = LI.limit_strength(at_c, centre, radius, st)
-    s_h = LI.limit_strength(half, centre, radius, st)
-    check('a lamp ON the centre is measured at half the scene\'s radius, '
-          'not at the pole of its own curve',
-          np.isfinite(s_c) and abs(s_c - s_h) < 1e-5 * s_h
-          and abs(s_c - 10.0 / (4.0 * np.pi * (0.5 * radius) ** 2))
-          < 1e-5 * s_c, f'{s_c:.6g} vs {s_h:.6g}')
+    d_c = np.maximum(np.linalg.norm(grid.astype(np.float64)
+                                    - grid[13].astype(np.float64), axis=1),
+                     guard)
+    want_c = 10.0 / (4.0 * np.pi) * float(np.mean(1.0 / d_c ** 2))
+    s_c = LI.limit_strength(at_c, grid, guard, st)
+    check('a lamp ON a grid point is measured at the guard distance, not at '
+          'the pole of its own curve',
+          np.isfinite(s_c) and abs(s_c - want_c) < 1e-5 * want_c
+          and s_c < 10.0 / (4.0 * np.pi * guard ** 2),
+          f'{s_c:.6g} (the pole would be {10.0 / (4.0 * np.pi * 1e-12):.3g})')
     neg = Light(type='POINT', name='n', position=(40.0, 0.0, 30.0),
                 color=(0.5, 1.0, 0.25), energy=-900.0, shadow='NONE')
     check('a negative Power ranks by its magnitude',
-          LI.limit_strength(neg, centre, radius, st) == got)
+          LI.limit_strength(neg, grid, guard, st) == got)
     none = Light(type='POINT', name='k', position=(40.0, 0.0, 30.0),
                  energy=10.0, decay='NONE', shadow='NONE')
     check('the lamp\'s own falloff law is what is ranked (Falloff None: '
           'Power / 4 pi at any distance)',
-          abs(LI.limit_strength(none, centre, radius, st)
+          abs(LI.limit_strength(none, grid, guard, st)
               - 10.0 / (4.0 * np.pi)) < 1e-6)
-    area = Light(type='AREA', name='a', position=(40.0, 0.0, 30.0),
-                 direction=(-0.8, 0.0, -0.6), energy=10.0, decay_end=25.0,
-                 area_size=(0.3, 0.3), area_x=(0.6, 0.0, -0.8),
+    # an Area lamp against a Point lamp at the same place: the ranking
+    # must agree with what each one alone puts in the frame
+    spot_at = (X0, 0.0, 5.0)
+    area = Light(type='AREA', name='Area60', position=spot_at,
+                 direction=(0.0, 0.0, -1.0), energy=60.0, decay_end=25.0,
+                 area_size=(0.5, 0.5), area_x=(1.0, 0.0, 0.0),
                  area_y=(0.0, 1.0, 0.0), shadow='NONE')
-    check('an Area lamp is ranked on its form factor\'s far field, 2 '
-          '(Distance / d)^2 (its Distance is a gain)',
-          abs(LI.limit_strength(area, centre, radius, st)
-              - 10.0 * 2.0 * (25.0 / 50.0) ** 2 / (4.0 * np.pi)) < 1e-5)
+    point = Light(type='POINT', name='Point300', position=spot_at,
+                  energy=300.0, shadow='NONE')
+    k_a = LI.limit_strength(area, grid, guard, st)
+    k_p = LI.limit_strength(point, grid, guard, st)
+    st0 = _settings(max_lights=0)
+    f_a = float(_cpu([area], st0).mean())
+    f_p = float(_cpu([point], st0).mean())
+    check('an Area lamp is ranked on its form factor (Distance is a gain): '
+          '60 W of it outranks a 300 W Point lamp at the same place, as its '
+          'frame does', k_a > 20.0 * k_p and f_a > 20.0 * f_p,
+          f'keys {k_a:.3f} / {k_p:.4f}, solo frame means {f_a:.3f} / {f_p:.4f}')
+    st1 = _settings(max_lights=1)
+    check('...so Light Limit 1 keeps the Area lamp',
+          [l.name for l in _frame_lights(_scene([point, area], st1), st1)]
+          == ['Area60'])
+    away = Light(type='AREA', name='away', position=spot_at,
+                 direction=(0.0, 0.0, 1.0), energy=60.0, decay_end=25.0,
+                 area_size=(0.5, 0.5), area_x=(1.0, 0.0, 0.0),
+                 area_y=(0.0, 1.0, 0.0), shadow='NONE')
+    check('an Area lamp facing away from the whole scene delivers nothing '
+          'and ranks last', LI.limit_strength(away, grid, guard, st) == 0.0)
+    # Brightest does not read the camera: an orbit never changes the set
+    sc_o = _scene(pts + [sun], st)
+    k_here = [l.name for l in _frame_lights(sc_o, st)]
+    sc_o.camera = Camera(matrix_world=look_at_matrix((30.0, -25.0, 9.0),
+                                                     (0.0, 0.0, 0.0)),
+                         lens=35.0, sensor=36.0, clip_start=0.1,
+                         clip_end=200.0)
+    check('Brightest keeps the same lamps wherever the camera stands',
+          [l.name for l in _frame_lights(sc_o, st)] == k_here)
     # the style gain is not in the ranking: a strobe keeps the selection
-    strobe = [Light(type='POINT', name=f'S{i}', position=(40.0, i, 30.0),
+    strobe = [Light(type='POINT', name=f'S{i}', position=(40.0, 0.0, 30.0),
                     energy=900.0 + i, shadow='NONE') for i in range(3)]
     st2 = _settings(max_lights=2)
     sc2 = _scene(strobe, st2)
@@ -640,16 +679,33 @@ def test_g_light_limit_ranks_on_what_a_lamp_delivers():
     st3 = _settings()
     sc3 = _scene(pts + [sun], st3)
     before = (set(vars(st3)), set(vars(sc3)))
-    _frame_lights(sc3, st3)
+    kept3 = {l.name for l in _frame_lights(sc3, st3)}
     check('frame_lights parks nothing on the settings or the scene',
           before == (set(vars(st3)), set(vars(sc3))))
+    gone = [l.name for l in sc3.lights if l.name not in kept3]
+    LI.LAST_LIMIT_REPORT.clear()
     line = LI.limit_report(sc3, st3)
     check('the lamps left unlit are named (the limit used to drop them in '
-          'silence)', bool(line) and 'P7' in line and 'P8' in line
-          and 'Sun' not in line.split('(', 2)[-1] and '2 of 10' in line,
-          str(line))
-    check('...and nothing is reported while every lamp is lit',
-          LI.limit_report(_scene(pts[:7] + [sun], st3), st3) is None)
+          'silence)', bool(line) and len(gone) == 2 and 'Sun' not in gone
+          and all(n in line for n in gone) and '2 of 10' in line
+          and 'Brightest' in line, str(line))
+    check('...a report does not remember itself unless asked (the F12 asks)',
+          not LI.LAST_LIMIT_REPORT)
+    LI.limit_report(sc3, st3, remember=True)
+    check('...and remembered it carries the names, the count, the limit and '
+          'the mode for the Lighting panel',
+          LI.LAST_LIMIT_REPORT == {'unlit': gone, 'total': 10,
+                                   'max_lights': 8, 'mode': 'BRIGHTEST'},
+          str(LI.LAST_LIMIT_REPORT))
+    under = _scene(pts[:7] + [sun], st3)
+    check('nothing is reported, and nothing stays remembered, while every '
+          'lamp is lit', LI.limit_report(under, st3, remember=True) is None
+          and not LI.LAST_LIMIT_REPORT)
+    stf = _settings(light_limit_mode='FIRST')
+    line_f = LI.limit_report(_scene(pts + [sun], stf), stf)
+    check('First reports its dropped lamps too (the Sun, listed last here)',
+          bool(line_f) and 'Sun' in line_f and 'P8' in line_f
+          and 'First' in line_f, str(line_f))
 
 
 def test_h_light_limit_nearest_measures_a_distance():
@@ -668,7 +724,8 @@ def test_h_light_limit_nearest_measures_a_distance():
     st_b = _settings(light_limit_mode='BRIGHTEST', max_lights=2)
     k_n = [l.name for l in _frame_lights(_scene(near, st_n), st_n)]
     k_b = [l.name for l in _frame_lights(_scene(near, st_b), st_b)]
-    check('Nearest keeps the two lamps nearest the middle of the scene',
+    check('Nearest keeps the two lamps nearest the camera (it looks down on '
+          'the middle of the floor)',
           k_n == ['near-weak', 'mid-weak'], str(k_n))
     check('...which is not what Brightest keeps on this rig',
           k_b == ['far-stronger', 'far-strong'], str(k_b))
@@ -677,6 +734,15 @@ def test_h_light_limit_nearest_measures_a_distance():
     check('the Nearest frame is the frame of the two near lamps alone',
           np.array_equal(c, alone),
           f'max |d| {float(np.abs(c - alone).max()):.3g}')
+    sc_m = _scene(near, st_n)
+    sc_m.camera = Camera(matrix_world=look_at_matrix((60.0, 0.0, 80.0),
+                                                     (60.0, 0.0, 0.0)),
+                         lens=35.0, sensor=36.0, clip_start=0.1,
+                         clip_end=200.0)
+    k_m = [l.name for l in _frame_lights(sc_m, st_n)]
+    check('Nearest follows the camera: over the far end of the floor it '
+          'keeps the lamp that hangs there',
+          k_m == ['far-strong', 'mid-weak'], str(k_m))
     sun = Light(type='SUN', name='Sun', direction=(0.2, 0.1, -1.0),
                 energy=0.01, shadow='NONE')
     st1 = _settings(light_limit_mode='NEAREST', max_lights=1)
@@ -687,9 +753,9 @@ def test_h_light_limit_nearest_measures_a_distance():
     calls = []
     orig = LI.select_lights
 
-    def spy(lights, settings, centre=None, *a, **k):
-        calls.append(centre is not None or k.get('bounds') is not None)
-        return orig(lights, settings, centre, *a, **k)
+    def spy(lights, settings, reference=None, *a, **k):
+        calls.append(reference is not None)
+        return orig(lights, settings, reference, *a, **k)
 
     LI.select_lights = spy
     try:
@@ -698,7 +764,7 @@ def test_h_light_limit_nearest_measures_a_distance():
     finally:
         LI.select_lights = orig
     check('every selection of an over-limit frame, CPU and GPU, is handed '
-          'the scene\'s bounds', bool(calls) and all(calls),
+          'the scene to measure against', bool(calls) and all(calls),
           f'{sum(calls)} of {len(calls)} calls')
 
 
@@ -773,7 +839,7 @@ def test_i_one_selection_for_both_roads():
           'its own block: the GPU twin is still the CPU frame',
           p2 is p1 and max(d1, d2) < BAR,
           f'max |CPU - GPU| {d1:.2e} then {d2:.2e}')
-    eq = [Light(type='POINT', name=f'E{i}', position=(i - 4.0, 0.0, 2.0),
+    eq = [Light(type='POINT', name=f'E{i}', position=(1.0, 0.0, 2.0),
                 energy=25.0, shadow='NONE') for i in range(9)]
     st8 = _settings()
     check('equal lamps keep their scene order (the first eight; ties used '
@@ -966,9 +1032,44 @@ def test_j_panel_draws_what_the_law_reads():
                  'description') or '')) < 40]
     check('every tooltip this round touched is 40+ characters', not thin,
           ', '.join(thin))
-    check('the Light Limit items say what they measure (delivered light; '
-          'the middle of the scene)',
-          'deliver' in PR.LIGHT_LIMIT[0][2] and 'middle' in PR.LIGHT_LIMIT[1][2])
+    check('the Light Limit items say what they measure (delivered light, a '
+          'Spot as the point lamp it is; the camera; collection order)',
+          'deliver' in PR.LIGHT_LIMIT[0][2] and 'cone' in PR.LIGHT_LIMIT[0][2]
+          and 'camera' in PR.LIGHT_LIMIT[1][2]
+          and 'collection order' in PR.LIGHT_LIMIT[2][2])
+    # the Lighting panel draws the last render's report, while it applies
+    hs_s = types.SimpleNamespace(max_lights=8, light_limit_mode='BRIGHTEST',
+                                 light_falloff_default='INVERSE_SQUARE',
+                                 global_ambient=(0, 0, 0),
+                                 global_ambient_level=1.0, sss=False,
+                                 auto_fix_appended_lamps=True)
+
+    def lighting(max_lights=8, mode='BRIGHTEST'):
+        hs_s.max_lights, hs_s.light_limit_mode = max_lights, mode
+        rec = []
+        panel = UI.HALCYON_PT_lighting()
+        panel.layout = _Layout(rec)
+        UI.HALCYON_PT_lighting.draw(panel, types.SimpleNamespace(
+            engine=UI.ENGINE, scene=types.SimpleNamespace(halcyon=hs_s)))
+        return [t for n, t in rec if n == 'label']
+
+    saved = dict(LI.LAST_LIMIT_REPORT)
+    try:
+        LI.LAST_LIMIT_REPORT.clear()
+        quiet = lighting()
+        LI.LAST_LIMIT_REPORT.update(unlit=['P7', 'P8'], total=10,
+                                    max_lights=8, mode='BRIGHTEST')
+        loud = lighting()
+        stale = lighting(max_lights=12) + lighting(mode='NEAREST')
+    finally:
+        LI.LAST_LIMIT_REPORT.clear()
+        LI.LAST_LIMIT_REPORT.update(saved)
+    check('the Lighting panel names the lamps the last render left unlit, '
+          'under the Light Limit rows', not quiet
+          and loud == ['Last render: 2 of 10 lamps not lit', 'P7, P8'],
+          str(loud))
+    check('...and drops the line once the limit or its mode is no longer '
+          'the one that render used', not stale, str(stale))
     check('the enum numbering is untouched (saved files hold the numbers)',
           [it[0] for it in PR.FALLOFF] == list(LAWS)
           and [it[0] for it in PR.LIGHT_LIMIT] == ['BRIGHTEST', 'NEAREST',

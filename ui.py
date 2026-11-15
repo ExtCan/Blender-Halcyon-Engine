@@ -607,6 +607,24 @@ class HALCYON_PT_lighting(HalcyonPanel, Panel):
         sub = col.column()
         sub.active = hs.max_lights > 0
         sub.prop(hs, 'light_limit_mode')
+        # R254: the lamps the last render left unlit, by name -- its own
+        # report (core/lights.limit_report), shown while the limit and
+        # the mode are still the ones that render used. The limit used
+        # to drop lamps without a word anywhere
+        try:
+            from .core.lights import LAST_LIMIT_REPORT as rep
+        except Exception:                                       # noqa: BLE001
+            rep = {}
+        if rep.get('unlit') and rep.get('max_lights') == hs.max_lights \
+                and rep.get('mode') == hs.light_limit_mode:
+            names = ', '.join(rep['unlit'][:4])
+            if len(rep['unlit']) > 4:
+                names += f" and {len(rep['unlit']) - 4} more"
+            note = col.column(align=True)
+            note.label(text=f"Last render: {len(rep['unlit'])} of "
+                            f"{rep.get('total', 0)} lamps not lit",
+                       icon='ERROR')
+            note.label(text=names, icon='BLANK1')
         col.prop(hs, 'light_falloff_default')
         # the repair for lamps brought in via plain File > Append:
         # Blender's own append converts 2.79 energies to its modern

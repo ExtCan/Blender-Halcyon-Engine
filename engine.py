@@ -301,12 +301,13 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                       f"other {_es.get('other_ms', 0.0):.0f} ms")
 
         # R254: the lamps the Light Limit leaves unlit are named, in the
-        # console and in the render's report -- a tenth lamp under the
-        # factory limit of 8 used to do nothing, and say nothing
+        # console, in the render's report and (remembered) in the
+        # Lighting panel -- a tenth lamp under the factory limit of 8
+        # used to do nothing, and say nothing
         if not preview:
             try:
                 from .core import lights as _LIl
-                _lim = _LIl.limit_report(scene, settings)
+                _lim = _LIl.limit_report(scene, settings, remember=True)
                 if _lim:
                     print('[Halcyon] ' + _lim)
                     warnings.append(_lim)

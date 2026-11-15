@@ -892,16 +892,18 @@ WIRE_MODE = _items(
 LIGHT_LIMIT = _items(
     ('BRIGHTEST', "Brightest",
      "Keep the lamps that deliver the most light to the scene: a Sun's "
-     "Strength against a Point, Spot or Area lamp's Power after its own "
-     "falloff, measured from the middle of the scene (never nearer than "
-     "half its radius). Equal lamps keep their scene order"),
+     "Strength against a Point or Spot lamp's Power after its own falloff "
+     "and an Area lamp's after its form factor, averaged over the scene's "
+     "bounds. A Spot ranks as the point lamp it is inside its cone. Equal "
+     "lamps keep their scene order; the camera is not consulted"),
     ('NEAREST', "Nearest",
-     "Keep the lamps closest to the middle of the scene's geometry. A Sun "
-     "has no position and reaches everything, so it always counts as "
-     "nearest. The camera is not consulted: an orbit never changes the set"),
+     "Keep the lamps closest to the camera. A Sun has no position and "
+     "reaches everything, so it always counts as nearest. The set follows "
+     "the camera: lamps can switch as it moves, as they did in the games"),
     ('FIRST', "First",
-     "Keep the first lamps in scene order, whatever their strength -- a "
-     "console's fixed light registers"),
+     "Keep the first lamps in collection order (the Outliner's order with "
+     "Sort Alphabetically off), whatever their strength -- a console's "
+     "fixed light registers"),
 )
 SPEC_VIEWER = _items(
     ('PIXEL', "Per Pixel", "The true eye direction at every shaded point"),
@@ -1559,10 +1561,10 @@ DESCRIPTIONS = {
                              "dials, which its Light panel then shows",
     'light_limit_mode': "Which lights survive when the scene has more than "
                         "the Light Limit: the ones that deliver the most "
-                        "light, the ones nearest the middle of the scene, "
-                        "or simply the first -- emulating fixed-function "
-                        "hardware's light slots. The lamps left out are "
-                        "named in the console and the render's report",
+                        "light, the ones nearest the camera, or simply the "
+                        "first -- emulating fixed-function hardware's light "
+                        "slots. The lamps left out are named in the console, "
+                        "the render's report and under this row",
     # ---------------------------------------------------------- shadows
     'shadows': "Master switch for all shadowing. Off is the flat, "
                "floating look of the earliest real-time output",

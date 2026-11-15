@@ -572,11 +572,12 @@ def resolved_decay(light, settings=None):
     """The falloff law a lamp actually runs: its own Falloff, or the
     render's Light Falloff while the lamp is left on Scene Default.
 
-    R254: every reader of the law's NAME goes through here (the Blender
-    Internal 0.001 snap in sample(), the volumetric beam's reach, the
-    panel's slider rows, the GPU packer) -- four of them used to test
-    the lamp's own unresolved 'DEFAULT' and so treated a Scene Default
-    lamp differently from the same law chosen on the lamp."""
+    R254: the readers of the law's NAME -- the Blender Internal 0.001
+    snap in sample() and the volumetric beam's reach here, the GPU
+    packer and emitter and the panel's slider rows by the same two
+    lines against their own settings -- used to test the lamp's own
+    unresolved 'DEFAULT', and so treated a Scene Default lamp
+    differently from the same law chosen on the lamp."""
     mode = str(getattr(light, 'decay', 'DEFAULT') or 'DEFAULT')
     if mode == 'DEFAULT' and settings is not None:
         mode = str(getattr(settings, 'light_falloff_default', 'DEFAULT'))
@@ -1492,49 +1493,78 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
     return (1.0 - (1.0 - lit) * dens).astype(np.float32)
 
 
-def limit_strength(light, centre, radius, settings):
+def limit_reference(scene):
+    """What the Light Limit measures against (R254): (pts, guard, eye).
+
+    `pts` is the 3 x 3 x 3 grid on the bounds of the scene's geometry
+    (27 points, float32; None without vertices) and `guard` 5% of the
+    bounds' diagonal -- Brightest averages what a lamp delivers over
+    them, so it does not depend on the camera and an orbit never changes
+    the set. `eye` is the camera's position, which Nearest measures from
+    (the middle of the bounds for a scene without a camera; None with
+    neither)."""
+    pts, guard, eye = None, 0.0, None
+    verts = getattr(getattr(scene, 'mesh', None), 'verts', None)
+    if verts is not None and len(verts):
+        v = np.asarray(verts, np.float32)
+        lo = v.min(axis=0).astype(np.float64)
+        hi = v.max(axis=0).astype(np.float64)
+        t = np.array([0.0, 0.5, 1.0])
+        g = np.stack(np.meshgrid(t, t, t, indexing='ij'), -1).reshape(-1, 3)
+        pts = (lo[None, :] + g * (hi - lo)[None, :]).astype(np.float32)
+        guard = max(0.05 * float(np.linalg.norm(hi - lo)), 1e-3)
+        eye = (lo + hi) * 0.5
+    mw = getattr(getattr(scene, 'camera', None), 'matrix_world', None)
+    if mw is not None:
+        eye = np.asarray(mw, np.float64)[:3, 3]
+    return pts, guard, eye
+
+
+def limit_strength(light, pts, guard, settings):
     """What a lamp delivers to the scene, in the light loop's own units:
     the number the Light Limit's Brightest ranks on (R254).
 
     A Sun's (or hemi's) strength IS the radiance every surface receives.
     A point or spot lamp's Power is divided by 4 pi and by its falloff
     in sample(), so it is ranked on exactly that: |Power| / (4 pi) times
-    the lamp's own law at its distance from the scene's centre. The
-    distance is never taken below half the scene's radius: an
-    inverse-square lamp anywhere inside the scene spreads its whole flux
-    over the scene's cross-section, pi R^2, which is its irradiance at
-    R / 2 -- so a lamp that happens to sit on the centre is not ranked
-    at the pole of its own curve. An area lamp reads no falloff; its
-    form factor's far field is 2 (Distance / d)^2, shaped by its Gamma.
+    the lamp's own law, averaged over the grid on the scene's bounds
+    (limit_reference). No distance is taken below `guard`, so a lamp
+    that sits on a grid point is not ranked at the pole of its own
+    curve. An area lamp reads no falloff: its strength is its form
+    factor (area_inp, Distance and Gamma included) on a surface facing
+    it, averaged the same way -- zero behind its face. A spot ranks as
+    the point lamp it is inside its cone: the cone is not read (weighted
+    at 27 points, a narrow key spot would fall between them).
 
     The RAW Power, never the style gain: a strobing lamp must not change
     the selection (and with it the GPU plan) from frame to frame."""
     k = abs(float(light.energy)) * float(np.mean(light.color))
     if light.type in ('SUN', 'HEMI'):
         return k
-    d = float(np.linalg.norm(np.asarray(light.position, np.float32)
-                             - np.asarray(centre, np.float32)))
-    d = max(d, 0.5 * float(radius), 1e-6)
+    delta = np.asarray(light.position, np.float64)[None, :] \
+        - np.asarray(pts, np.float64)
+    d = np.sqrt((delta * delta).sum(axis=1))
     if light.type == 'AREA':
-        w = 2.0 * (max(float(light.decay_end), 1e-6) / d) ** 2
-        w = w ** float(getattr(light, 'area_gamma', 1.0) or 1.0)
+        n = (delta / np.maximum(d, 1e-9)[:, None]).astype(np.float32)
+        w = float(np.mean(area_inp(light, np.asarray(pts, np.float32), n)))
     else:
-        w = float(attenuate(light, np.asarray([d], np.float32),
-                            settings)[0])
+        w = float(np.mean(attenuate(
+            light, np.maximum(d, guard).astype(np.float32), settings)))
     return k * w / (4.0 * np.pi)
 
 
-#: R254: how the Light Limit chooses. `centre` / `radius` are the scene's
-#: bounds, or `bounds` a callable returning them, read only when the limit
-#: actually drops a lamp (frame_lights hands in the scene's): Brightest
-#: ranks on what each lamp delivers there (limit_strength), Nearest on its
-#: distance from the centre with a Sun or hemi at distance 0 (it reaches
-#: everything), ties in scene order, and the survivors come back in SCENE
-#: order -- the order the per-material light limit and the GPU plan's
-#: selection signature both assume. Without bounds (a bare lamp list, a
-#: scene with no geometry to measure against) the ranking is the raw one
-#: it always was. A list at or under the limit comes back untouched.
-def select_lights(lights, settings, centre=None, radius=0.0, bounds=None):
+#: R254: how the Light Limit chooses. `reference` is limit_reference's
+#: (pts, guard, eye), or a callable returning it that is read only when
+#: the limit actually drops a lamp (frame_lights hands in the scene's):
+#: Brightest ranks on what each lamp delivers over the scene
+#: (limit_strength), Nearest on its distance from the camera with a Sun or
+#: hemi at distance 0 (it reaches everything), ties in scene order, and
+#: the survivors come back in SCENE order -- the order the per-material
+#: light limit and the GPU plan's selection signature both assume.
+#: Without a reference (a bare lamp list, a scene with nothing to measure
+#: against) the ranking is the raw one it always was. A list at or under
+#: the limit comes back untouched.
+def select_lights(lights, settings, reference=None):
     """Emulate a hardware light limit by keeping only the strongest N."""
     active = [l for l in lights if l.type != 'AMBIENT']
     limit = int(settings.max_lights)
@@ -1542,32 +1572,25 @@ def select_lights(lights, settings, centre=None, radius=0.0, bounds=None):
         return active
     if settings.light_limit_mode == 'FIRST':
         return active[:limit]
-    if centre is None and bounds is not None:
-        centre, radius = bounds()
-    if centre is None:
+    if callable(reference):
+        reference = reference()
+    pts, guard, eye = reference if reference is not None \
+        else (None, 0.0, None)
+    nearest = settings.light_limit_mode == 'NEAREST'
+    if (eye is None) if nearest else (pts is None):
         key = [float(l.energy) * float(np.mean(l.color)) for l in active]
         order = np.argsort(key)[::-1]
         return [active[i] for i in order[:limit]]
-    if settings.light_limit_mode == 'NEAREST':
-        c = np.asarray(centre, np.float32)
+    if nearest:
+        e = np.asarray(eye, np.float64)
         key = [0.0 if l.type in ('SUN', 'HEMI') else
-               float(np.linalg.norm(np.asarray(l.position, np.float32) - c))
+               float(np.linalg.norm(np.asarray(l.position, np.float64) - e))
                for l in active]
         order = np.argsort(np.asarray(key, np.float64), kind='stable')
     else:
-        key = [limit_strength(l, centre, radius, settings) for l in active]
+        key = [limit_strength(l, pts, guard, settings) for l in active]
         order = np.argsort(-np.asarray(key, np.float64), kind='stable')
     return [active[i] for i in sorted(int(i) for i in order[:limit])]
-
-
-def limit_bounds(scene):
-    """(centre, radius) the Light Limit measures against: the bounds of
-    the scene's geometry -- independent of the camera, so an orbit never
-    changes which lamps are lit. (None, 0.0) without vertices."""
-    verts = getattr(getattr(scene, 'mesh', None), 'verts', None)
-    if verts is None or len(verts) == 0:
-        return None, 0.0
-    return scene_bounds(np.asarray(verts, np.float32))
 
 
 def frame_lights(scene, settings):
@@ -1577,14 +1600,14 @@ def frame_lights(scene, settings):
     planar shadows all read (R254).
 
     They used to call select_lights with the bare lamp list, so no
-    caller could say where the scene was: Nearest never measured a
-    distance and Brightest compared a Sun's strength with a point
-    lamp's watts. Nothing is parked on the scene or the settings: the
-    bounds are measured inside the call, and only when the limit
+    caller could say where the scene or the camera was: Nearest never
+    measured a distance and Brightest compared a Sun's strength with a
+    point lamp's watts. Nothing is parked on the scene or the settings:
+    the reference is measured inside the call, and only when the limit
     actually drops a lamp (a scene at or under it takes the old path
     and never looks at a vertex)."""
     return select_lights(getattr(scene, 'lights', None) or [], settings,
-                         bounds=lambda: limit_bounds(scene))
+                         reference=lambda: limit_reference(scene))
 
 
 class _NoLimit:
@@ -1594,14 +1617,28 @@ class _NoLimit:
     light_limit_mode = 'FIRST'
 
 
-def limit_report(scene, settings):
+#: R254: the last F12's limit report, for the Lighting panel to draw:
+#: {'unlit': [names], 'total': n, 'max_lights': n, 'mode': str}, empty
+#: while every lamp was lit. A report only -- no render reads it.
+LAST_LIMIT_REPORT = {}
+
+
+def limit_report(scene, settings, remember=False):
     """One line naming the lamps the Light Limit leaves unlit this frame,
     or None when every lamp is lit. The limit used to drop lamps in
-    silence -- at the factory 8 a ninth lamp simply did nothing."""
+    silence -- at the factory 8 a ninth lamp simply did nothing.
+    `remember` keeps the answer in LAST_LIMIT_REPORT (the F12 does)."""
     lights = frame_lights(scene, _NoLimit)
     kept = {id(l) for l in frame_lights(scene, settings)}
     out = [str(getattr(l, 'name', '') or l.type) for l in lights
            if id(l) not in kept]
+    if remember:
+        LAST_LIMIT_REPORT.clear()
+        if out:
+            LAST_LIMIT_REPORT.update(
+                unlit=list(out), total=len(lights),
+                max_lights=int(settings.max_lights),
+                mode=str(settings.light_limit_mode))
     if not out:
         return None
     names = ', '.join(out[:6])
