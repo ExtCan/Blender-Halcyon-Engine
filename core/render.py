@@ -1338,7 +1338,7 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         edge_vn = np.clip(1.0 - np.abs(M.dot(N, V)), 0.0, 1.0)
 
     lights = active_lights if active_lights is not None else \
-        LI.select_lights(scene.lights, settings)
+        LI.frame_lights(scene, settings)
     # R252: the machine's light limit, per material (the GTE's three
     # rows, the DS's four lights, the RSP's seven): the first N of the
     # scene's selection, in scene order -- the games' own register order
@@ -2612,7 +2612,7 @@ def _stash_ground_light(scene, st, bvh):
         if float(getattr(world, 'ground_lighting', 1.0) or 0.0) <= 0.0:
             return
         from . import lights as LI
-        lts = LI.select_lights(getattr(scene, 'lights', []) or [], st)
+        lts = LI.frame_lights(scene, st)
         if not lts:
             return
         world._ground_light = _make_ground_light(scene, st, bvh, lts)
@@ -2843,7 +2843,7 @@ class ShadeJob:
         # R253 (H): a job built without render() (the GPU plan rigs)
         # still packs the frame's style gains; idempotent after render's
         LI.apply_light_styles(scene)
-        self.lights = LI.select_lights(scene.lights, settings)
+        self.lights = LI.frame_lights(scene, settings)
         self.unsupported = set()
         self._obj_matrices = None
         self._bounds = None
@@ -9308,9 +9308,11 @@ def _light_volumes(img, scene, st, gbuf, vp, eye, w, h, bvh=None,
                                          dl * (1.0 - 1e-3))
                 return out
         reach_l = reach
-        if str(getattr(light, 'decay', '')) == 'CUSTOM':
+        if LI.resolved_decay(light, st) == 'CUSTOM':
             # Custom Range's end is the lamp's own idea of how far it
             # reaches; the beam honours it rather than growing a dial
+            # (R254: whether the law is chosen on the lamp or arrives
+            # through Scene Default)
             reach_l = min(reach, max(float(getattr(light, 'decay_end',
                                                    reach)), 1e-3))
         scatter = marchers[kind](

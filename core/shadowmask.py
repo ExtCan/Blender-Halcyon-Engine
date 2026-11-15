@@ -240,7 +240,7 @@ def build(scene, st, gbuf, vp, snap, near_eps, cast_tri, scissor=None, view=None
     if mesh is not None and \
             getattr(mesh, 'tris', None) is not None and len(mesh.tris):
         idx = {id(l): i for i, l in enumerate(lights)}
-        for l in LI.select_lights(lights, st):
+        for l in LI.frame_lights(scene, st):
             if str(getattr(l, 'type', '')).upper() in ('HEMI', 'AMBIENT'):
                 continue
             if getattr(l, 'shadow', 'MAP') == 'NONE':

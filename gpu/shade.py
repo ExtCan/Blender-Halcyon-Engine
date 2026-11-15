@@ -1125,9 +1125,17 @@ def _plan_sig(job, mkey):
 
 
 def _selection_sig(scene, st):
+    """The Light Limit's survivors as scene indices.
+
+    R254: the selection comes back in scene order (LI.select_lights),
+    so the SET printed here is also the ORDER the plan's light loop and
+    the cache-hit texel repack run in. The old rank order was not in
+    this signature: a Power edit that swapped two kept lamps of
+    different kinds was a cache hit whose repack filled a spot's texels
+    into a point lamp's block."""
     from ..core import lights as LI
     try:
-        sel = LI.select_lights(scene.lights, st)
+        sel = LI.frame_lights(scene, st)
         ids = {id(l) for l in sel}
         return tuple(i for i, l in enumerate(scene.lights)
                      if id(l) in ids)
@@ -1246,8 +1254,8 @@ def plan_frame(job, gbuf, use_cache=True):
                 # instead of a 25-shader recompile storm)
                 from ..core import lights as _LI2
                 from .material import pack_light_texels as _plt
-                _arr = _plt(_LI2.select_lights(job.scene.lights,
-                                               job.settings), job)
+                _arr = _plt(_LI2.frame_lights(job.scene,
+                                              job.settings), job)
                 h_atlases = dict(h_atlases)
                 h_atlases['hal_lights'] = (('lights', _arr.tobytes()),
                                            lambda a=_arr: a)
@@ -1377,7 +1385,7 @@ def plan_frame(job, gbuf, use_cache=True):
         return None, 'Normal Source FACE needs stored face normals ' \
                      'this mesh does not carry', {}
 
-    lights = LI.select_lights(scene.lights, st)
+    lights = LI.frame_lights(scene, st)
     for l in lights:
         if l.type not in ('SUN', 'HEMI', 'POINT', 'SPOT', 'AREA'):
             return None, f'{l.type} lights are not in the GLSL light loop', {}

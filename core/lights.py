@@ -568,12 +568,33 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
 # ------------------------------------------------------------- light sampling
 
 
+def resolved_decay(light, settings=None):
+    """The falloff law a lamp actually runs: its own Falloff, or the
+    render's Light Falloff while the lamp is left on Scene Default.
+
+    R254: every reader of the law's NAME goes through here (the Blender
+    Internal 0.001 snap in sample(), the volumetric beam's reach, the
+    panel's slider rows, the GPU packer) -- four of them used to test
+    the lamp's own unresolved 'DEFAULT' and so treated a Scene Default
+    lamp differently from the same law chosen on the lamp."""
+    mode = str(getattr(light, 'decay', 'DEFAULT') or 'DEFAULT')
+    if mode == 'DEFAULT' and settings is not None:
+        mode = str(getattr(settings, 'light_falloff_default', 'DEFAULT'))
+    return mode
+
+
 def attenuate(light, dist, settings=None):
     mode = light.decay
     if mode == 'DEFAULT' and settings is not None:
         mode = settings.light_falloff_default
     start = float(light.decay_start)
-    d = np.maximum(dist - start, EPS) if start > 0 else np.maximum(dist, EPS)
+    # R254: Falloff Start is a Custom Range value and nothing else. The
+    # two inverse laws used to divide by (dist - start): a Start left
+    # over from a Custom Range lamp (the panel draws the slider for
+    # that law only) put a pole at d = Start and 1/EPS inside it -- the
+    # whole disc under the lamp at the ceiling. Start 0, the default,
+    # is the same statement it always was
+    d = np.maximum(dist, EPS)
     if mode == 'NONE':
         # R253: no early return any more -- the Sphere wrap below is
         # the SAME statements this branch used to run (LA_SPHERE
@@ -1107,10 +1128,12 @@ def sample(light, P, settings, area_sample=None):
         att = attenuate(light, dist, settings)
     if light.type == 'SPOT':
         att = att * spot_falloff(light, L)
-    if str(getattr(light, 'decay', '')).startswith('BI_') or \
+    if resolved_decay(light, settings).startswith('BI_') or \
             getattr(light, 'bi_sphere', False):
         # lamp_get_visibility's tail, verbatim (R155): a combined
-        # visifac at or below 0.001 is snapped to zero
+        # visifac at or below 0.001 is snapped to zero. R254: on the
+        # RESOLVED law -- a Scene Default lamp under a Blender Internal
+        # render default is the same lamp as one with the law chosen
         att = np.where(att <= 0.001, 0.0, att)
     scale = energy / (4.0 * np.pi)
     rad = col * (scale * att)[:, None]
@@ -1469,22 +1492,101 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
     return (1.0 - (1.0 - lit) * dens).astype(np.float32)
 
 
-def select_lights(lights, settings, centre=None):
-    """Emulate a hardware light limit by keeping only the strongest N."""
+def limit_strength(light, centre, radius, settings):
+    """What a lamp delivers to the scene, in the light loop's own units:
+    the number the Light Limit's Brightest ranks on (R254).
+
+    A Sun's (or hemi's) strength IS the radiance every surface receives.
+    A point or spot lamp's Power is divided by 4 pi and by its falloff
+    in sample(), so it is ranked on exactly that: |Power| / (4 pi) times
+    the lamp's own law at its distance from the scene's centre. The
+    distance is never taken below half the scene's radius: an
+    inverse-square lamp anywhere inside the scene spreads its whole flux
+    over the scene's cross-section, pi R^2, which is its irradiance at
+    R / 2 -- so a lamp that happens to sit on the centre is not ranked
+    at the pole of its own curve. An area lamp reads no falloff; its
+    form factor's far field is 2 (Distance / d)^2, shaped by its Gamma.
+
+    The RAW Power, never the style gain: a strobing lamp must not change
+    the selection (and with it the GPU plan) from frame to frame."""
+    k = abs(float(light.energy)) * float(np.mean(light.color))
+    if light.type in ('SUN', 'HEMI'):
+        return k
+    d = float(np.linalg.norm(np.asarray(light.position, np.float32)
+                             - np.asarray(centre, np.float32)))
+    d = max(d, 0.5 * float(radius), 1e-6)
+    if light.type == 'AREA':
+        w = 2.0 * (max(float(light.decay_end), 1e-6) / d) ** 2
+        w = w ** float(getattr(light, 'area_gamma', 1.0) or 1.0)
+    else:
+        w = float(attenuate(light, np.asarray([d], np.float32),
+                            settings)[0])
+    return k * w / (4.0 * np.pi)
+
+
+def select_lights(lights, settings, centre=None, radius=0.0):
+    """Emulate a hardware light limit by keeping only N of the lamps.
+
+    `centre` / `radius` are the scene's bounds (frame_lights hands them
+    in): Brightest ranks on what each lamp delivers there
+    (limit_strength), Nearest on its distance from the centre with a
+    Sun or hemi at distance 0 (it reaches everything), ties in scene
+    order, and the survivors come back in scene order -- the order the
+    per-material light limit and the GPU plan's selection signature
+    both assume. Without a centre (a bare lamp list, or a scene with no
+    geometry to measure against) the ranking is the raw one it always
+    was. A list at or under the limit is returned untouched either way."""
     active = [l for l in lights if l.type != 'AMBIENT']
     limit = int(settings.max_lights)
     if limit <= 0 or len(active) <= limit:
         return active
     if settings.light_limit_mode == 'FIRST':
         return active[:limit]
-    if settings.light_limit_mode == 'NEAREST' and centre is not None:
-        key = [float(np.linalg.norm(np.asarray(l.position, np.float32) - centre))
-               for l in active]
-        order = np.argsort(key)
-    else:
+    if centre is None:
         key = [float(l.energy) * float(np.mean(l.color)) for l in active]
         order = np.argsort(key)[::-1]
-    return [active[i] for i in order[:limit]]
+        return [active[i] for i in order[:limit]]
+    if settings.light_limit_mode == 'NEAREST':
+        c = np.asarray(centre, np.float32)
+        key = [0.0 if l.type in ('SUN', 'HEMI') else
+               float(np.linalg.norm(np.asarray(l.position, np.float32) - c))
+               for l in active]
+        order = np.argsort(np.asarray(key, np.float64), kind='stable')
+    else:
+        key = [limit_strength(l, centre, radius, settings) for l in active]
+        order = np.argsort(-np.asarray(key, np.float64), kind='stable')
+    return [active[i] for i in sorted(int(i) for i in order[:limit])]
+
+
+def limit_bounds(scene):
+    """(centre, radius) the Light Limit measures against: the bounds of
+    the scene's geometry -- independent of the camera, so an orbit never
+    changes which lamps are lit. (None, 0.0) without vertices."""
+    verts = getattr(getattr(scene, 'mesh', None), 'verts', None)
+    if verts is None or len(verts) == 0:
+        return None, 0.0
+    return scene_bounds(np.asarray(verts, np.float32))
+
+
+def frame_lights(scene, settings):
+    """The lamps this frame shades under the Light Limit: the ONE
+    selection the CPU light loop, the GPU plan and its texel repack,
+    the screen-spot fog, the ground plane, the light meter node and the
+    planar shadows all read (R254).
+
+    They used to call select_lights with the bare lamp list, so no
+    caller could say where the scene was: Nearest never measured a
+    distance and Brightest compared a Sun's strength with a point
+    lamp's watts. Nothing is parked on the scene or the settings -- the
+    bounds are computed here, and only when the limit actually drops a
+    lamp."""
+    lights = getattr(scene, 'lights', None) or []
+    limit = int(settings.max_lights)
+    if limit <= 0 or settings.light_limit_mode == 'FIRST' or \
+            sum(1 for l in lights if l.type != 'AMBIENT') <= limit:
+        return select_lights(lights, settings)
+    centre, radius = limit_bounds(scene)
+    return select_lights(lights, settings, centre=centre, radius=radius)
 
 
 def ambient_light_split(scene, settings):

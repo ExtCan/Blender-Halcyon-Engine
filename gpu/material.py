@@ -456,6 +456,10 @@ def _generated_frame(src, consts, force_line=False, world_table=False):
 #: R251 LIGHT-B1: 8 texels per light -- 4 = (spot_exponent, cr, a0, a1)
 #: and 5.x = a2 (F012), 5.yz = the GX (k1, k2) (F013), 6 = (cx, cy, w,
 #: h) and 7 = (start, aext, 0, 0) the Model 3 screen spotlight (F015)
+#: R254: the decay mode texel 3 is packed for is the RESOLVED law (a
+#: Scene Default lamp takes the render's), and 5.w = max(end, eps), the
+#: Sphere's own Distance, for a Custom Range + Sphere point / spot lamp
+#: (3.y is the ramp's width there); 0 on every other lamp
 #: R253 light options: 16 texels per light (texels 0-7 untouched; every
 #: reader goes through _lref / the symbol, so the bump moves no bit) --
 #:   t8  = (specular_color.rgb,     decay_near_start)
@@ -537,13 +541,28 @@ def pack_light_texels(lights, job=None):
         out[0, b + 2, :3] = np.asarray(
             getattr(light, 'color', (1, 1, 1)), np.float32)
         eps = 1e-6
+        # R254: the law is RESOLVED before the texel is chosen. A lamp
+        # on Scene Default under a Custom Range render used to pack
+        # Falloff End where the emitted ramp divides by (End - Start):
+        # the GPU ramped over End, the CPU over End - Start
         mode = getattr(light, 'decay', 'DEFAULT')
+        if mode == 'DEFAULT' and st_job is not None:
+            mode = str(getattr(st_job, 'light_falloff_default', 'DEFAULT'))
         start = float(getattr(light, 'decay_start', 0.0))
         out[0, b + 3, 0] = np.float32(start)
         if mode == 'CUSTOM':
             end = max(float(getattr(light, 'decay_end', 40.0)),
                       start + eps)
             out[0, b + 3, 1] = np.float32(end - start)
+            if getattr(light, 'bi_sphere', False) and \
+                    kind in ('POINT', 'SPOT'):
+                # R254: the Sphere clips at Falloff End itself, which
+                # texel 3.y no longer is under Custom Range -- the one
+                # float32 lights.attenuate divides by rides texel 5.w
+                # (written for this pairing only: every other lamp's
+                # texels are the bytes they were)
+                out[0, b + 5, 3] = np.float32(
+                    max(float(getattr(light, 'decay_end', 25.0)), eps))
         else:
             out[0, b + 3, 1] = np.float32(
                 max(float(getattr(light, 'decay_end', 25.0)), eps))
@@ -574,8 +593,6 @@ def pack_light_texels(lights, job=None):
                 out[0, b + 7, 0] = s0
                 out[0, b + 7, 1] = aext
         dmode = str(mode)
-        if dmode == 'DEFAULT' and st_job is not None:
-            dmode = str(getattr(st_job, 'light_falloff_default', 'DEFAULT'))
         if dmode.startswith('GX_') and kind not in ('SUN', 'HEMI'):
             # R251 F013: libogc's (k1, k2) for the lamp's ref_brite
             k1, k2 = LI.gx_dist_coeffs(light, dmode)
@@ -742,6 +759,16 @@ def _attenuation(light, falloff_default, eps=1e-6, refs=None):
         # even a Constant lamp clips (exactly lights.attenuate)
         D = refs['D'] if refs else _f(max(
             float(getattr(light, 'decay_end', 25.0)), eps))
+        mode = getattr(light, 'decay', 'DEFAULT')
+        if mode == 'DEFAULT':
+            mode = falloff_default
+        if refs and mode == 'CUSTOM':
+            # R254: under Custom Range refs['D'] is the ramp's (End -
+            # Start), not the lamp Distance -- the Sphere clipped at
+            # End - Start here and at Falloff End on the CPU. Its own
+            # value rides texel 5.w (the packer's max(End, eps)); a
+            # caller without that ref gets the sum, equal at Start 0
+            D = refs.get('sphere') or f'({refs["D"]} + {refs["start"]})'
         return (f'((max(dist, 0.0) < {D}) ? ({expr} '
                 f'* (({D} - max(dist, 0.0)) / {D})) : 0.0)')
     return expr
@@ -755,8 +782,10 @@ def _attenuation_curve(light, falloff_default, eps=1e-6, refs=None):
     s_ref = refs['start'] if refs else _f(start)
     if mode == 'NONE':
         return '1.0'
-    d = f'max(dist - {s_ref}, {_f(eps)})' if start > 0 else \
-        f'max(dist, {_f(eps)})'
+    # R254: Falloff Start belongs to Custom Range alone (the branch
+    # below); the inverse laws no longer shift by it -- exactly
+    # lights.attenuate. Start 0 emitted this same text before
+    d = f'max(dist, {_f(eps)})'
     if mode == 'INVERSE':
         return f'(1.0 / {d})'
     if mode == 'CUSTOM':
@@ -2735,21 +2764,25 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
                 f'    rad = rad * (vec3(1.0) + (hal_cookie_rgb{i}(ckuv) '
                 f'- vec3(1.0)) * {_f(ck["strength"])});']
     else:
-        mode_bi = str(getattr(light, 'decay', '')).startswith('BI_') or \
+        dmode = str(getattr(light, 'decay', 'DEFAULT') or 'DEFAULT')
+        if dmode == 'DEFAULT':
+            dmode = str(consts['falloff_default'])
+        # R254: the Blender Internal snap reads the RESOLVED law, as
+        # the CPU's sample() does -- a Scene Default lamp under a BI
+        # render default snaps like the same law chosen on the lamp
+        mode_bi = dmode.startswith('BI_') or \
             getattr(light, 'bi_sphere', False)
         refs = None
         if use_tx:
             refs = {'D': _lref(i, 3, 'y'), 'start': _lref(i, 3, 'x'),
-                    'ld1': _lref(i, 3, 'z'), 'ld2': _lref(i, 3, 'w')}
+                    'ld1': _lref(i, 3, 'z'), 'ld2': _lref(i, 3, 'w'),
+                    'sphere': _lref(i, 5, 'w')}
         pos = _lref(i, 0, 'xyz') if use_tx else _v3(light.position)
         e_pre = _lref(i, 0, 'w') if use_tx else \
             _f(energy / (4.0 * np.pi))
         lines += [f'    vec3 delta = {pos} - P;',
                   '    float dist = max(length(delta), 1e-6);',
                   '    vec3 L = delta / dist;']
-        dmode = str(getattr(light, 'decay', 'DEFAULT') or 'DEFAULT')
-        if dmode == 'DEFAULT':
-            dmode = str(consts['falloff_default'])
         if kind == 'AREA':
             # lamp_get_visibility skips its falloff switch for LA_AREA:
             # visifac stays 1.0 and distance speaks only through the

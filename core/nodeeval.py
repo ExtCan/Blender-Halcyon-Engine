@@ -5979,8 +5979,7 @@ def n_u16_light_meter(ev, node):
     total = np.zeros((n, 3), np.float32)
     lamps = []
     try:
-        lamps = LI.select_lights(getattr(c.scene, 'lights', []) or [],
-                                 c.settings)
+        lamps = LI.frame_lights(c.scene, c.settings)
     except Exception:                                           # noqa: BLE001
         lamps = list(getattr(c.scene, 'lights', []) or [])
     want_shadow = bool(_prop(node, 'shadows', False)) and \
