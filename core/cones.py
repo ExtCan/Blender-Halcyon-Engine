@@ -80,6 +80,92 @@ def _cone_segment(origin, rays, apex, axis, cos_half):
 DEFAULT_REACH = 64.0
 
 
+def beam_gain(light):
+    """R254: the radiance one unit of marched scatter is worth for `light`.
+
+    The marchers return density * integral(shape / d^falloff) along the
+    view ray, with density = the render's Density x the lamp's
+    Volumetric. Single scattering in a uniform medium adds
+
+        sigma_s * phase * I / d^2   per unit of path,
+
+    I being the intensity the lamp's SURFACES are lit with and phase the
+    isotropic 1 / (4 pi). Density x Volumetric counts sigma_s in units
+    of 1 / (4 pi) per world unit (1.0 is a mean free path of 4 pi =
+    12.6 units: a thick stage haze; the slider's 4.0 is smoke), so the
+    gain is I / (16 pi^2):
+
+    - SPOT, POINT: I = energy / (4 pi), what lights.sample() lights a
+      surface with -- energy / (64 pi^3).
+    - AREA: the form factor's far field is 2 D^2 times a point lamp's
+      (lights.area_inp: stokes * D^2 / A, D the lamp's Distance), so
+      I = energy * 2 D^2 / (4 pi) -- energy * D^2 / (32 pi^3). The beam
+      follows Distance exactly as the lamp's surfaces do, whatever
+      scale the lamp's Power is expressed on. Gamma shapes the surface
+      field only.
+
+    The old composite multiplied by energy / pi: 64 pi^2 = 632 times
+    this for a spot or point lamp, so any beam at the slider's unit
+    value was a solid white wedge. The light style's gain rides the
+    energy, as on every other road.
+    """
+    energy = float(getattr(light, 'energy', 0.0)) \
+        * float(getattr(light, 'style_gain', 1.0))
+    if str(getattr(light, 'type', '')).upper() == 'AREA':
+        d = max(float(getattr(light, 'decay_end', 25.0)), 1e-6)
+        return energy * d * d / (32.0 * np.pi ** 3)
+    return energy / (64.0 * np.pi ** 3)
+
+
+def beam_law(light):
+    """R254: the cone law the visible beam follows -- the lamp's own."""
+    from . import lights as LI
+    law = str(getattr(light, 'spot_law', 'BLENDER') or 'BLENDER')
+    return law if law in LI.SPOT_LAWS else 'BLENDER'
+
+
+def beam_edge(light):
+    """R254: the Blender Internal beam's soft edge as a fraction of
+    (1 - cos(half)): Blend, or the Hotspot's band (lights.spot_blend_band
+    over the cone's depth in cosine units). Hotspot 0 returns Blend
+    itself, the float the beam always read."""
+    if float(getattr(light, 'hotspot', 0.0) or 0.0) <= 0.0:
+        return float(getattr(light, 'spot_blend', 0.15))
+    from . import lights as LI
+    c = float(np.cos(float(getattr(light, 'spot_size', 1.2)) * 0.5))
+    return float(LI.spot_blend_band(light, c)) / max(1.0 - c, EPS)
+
+
+def beam_cos_out(light, cos_half):
+    """R254: the cosine the beam's cone is CUT at. Every law is dark at
+    the Spot Size except GX Ring 2, which is at full strength there and
+    fades 1 - 2 (c - cr)^2 / (1 - cr)^2 to zero at cr - (1 - cr) /
+    sqrt(2): its beam is marched out to that zero, or it would end in a
+    bright cut rim and lose the outer half of its ring. Clamped below a
+    right angle, as cos_half is."""
+    if beam_law(light) != 'GX_RING2':
+        return cos_half
+    c = float(np.cos(float(getattr(light, 'spot_size', 1.2)) * 0.5))
+    out = c - (1.0 - c) / float(np.sqrt(2.0))
+    return float(max(out, np.cos(np.pi * 0.5 - 1e-3)))
+
+
+def beam_angular(light, law, cosang, cos_half, edge):
+    """R254: the beam's brightness across the cone for cos(angle to the
+    axis). Blender Internal: the smoothstep over the blend band the beam
+    always drew (no cosine roll-off: the air is not a surface). Every
+    other law: lights.spot_law_factor itself, so POV's flat hotspot and
+    Hermite edge, both cosine exponents, GL's hard rim and the GX rings
+    shape the beam as they shape the pool."""
+    if law == 'BLENDER':
+        inner = cos_half + (1.0 - cos_half) * np.clip(edge, 0.0, 0.999)
+        ang = np.clip((cosang - cos_half) / np.maximum(inner - cos_half, EPS),
+                      0.0, 1.0)
+        return ang * ang * (3.0 - 2.0 * ang)
+    from . import lights as LI
+    return LI.spot_law_factor(light, np.asarray(cosang, np.float32))
+
+
 def spot_cone(origin, rays, depth, light, samples=12, density=1.0,
               falloff=2.0, edge=None, max_distance=0.0, occlude=None):
     """Scattered light along each view ray for one spot light.
@@ -97,14 +183,16 @@ def spot_cone(origin, rays, depth, light, samples=12, density=1.0,
     half = max(float(getattr(light, 'spot_size', 1.2)) * 0.5, 1e-3)
     cos_half = float(np.cos(min(half, np.pi * 0.5 - 1e-3)))
     if edge is None:
-        edge = float(getattr(light, 'spot_blend', 0.15))
+        edge = beam_edge(light)
+    law = beam_law(light)
 
     if origin.ndim == 1:
         origin = origin[None, :]
     if origin.shape[0] == 1:
         origin = np.repeat(origin, n, axis=0)
 
-    t0, t1, hit = _cone_segment(origin, rays, apex, axis, cos_half)
+    t0, t1, hit = _cone_segment(origin, rays, apex, axis,
+                                beam_cos_out(light, cos_half))
 
     # the beam cannot start behind the camera, and it stops at the first surface
     t0 = np.maximum(t0, 0.0)
@@ -133,11 +221,9 @@ def spot_cone(origin, rays, depth, light, samples=12, density=1.0,
         dist = np.sqrt(np.maximum(np.einsum('ij,ij->i', d, d), EPS))
         cosang = np.einsum('ij,j->i', d, axis) / dist
 
-        # angular falloff -- soft toward the rim, as the spot's own blend does
-        inner = cos_half + (1.0 - cos_half) * np.clip(edge, 0.0, 0.999)
-        ang = np.clip((cosang - cos_half) / np.maximum(inner - cos_half, EPS),
-                      0.0, 1.0)
-        ang = ang * ang * (3.0 - 2.0 * ang)
+        # angular falloff -- soft toward the rim, as the spot's own blend
+        # does (R254: or as the lamp's cone law shapes it)
+        ang = beam_angular(light, law, cosang, cos_half, edge)
 
         atten = 1.0 / np.maximum(np.power(dist, falloff), EPS)
         contrib = np.where(live, ang * atten, 0.0)
@@ -189,19 +275,33 @@ def point_glow(origin, rays, depth, light, samples=12, density=1.0,
     steps = max(int(samples), 1)
     offsets = (np.arange(steps, dtype=np.float32) + 0.5) / steps
     total = np.zeros(n, np.float32)
+    # R254: the samples are spaced by ANGLE about the lamp, not by
+    # distance along the ray. The segment through a 64-unit sphere is
+    # tens of units long and 1 / d^2 peaks within a unit or two of the
+    # ray's closest approach, so twelve evenly spaced midpoints mostly
+    # stepped over the peak: the glow came out as rings, twice the true
+    # integral at 12 samples and a third of it at 2. With t = tc + D
+    # tan(theta) (tc the closest approach, D its distance from the
+    # lamp) dt = d^2 / D dtheta, which cancels the inverse square: the
+    # sum is smooth and within a percent at any count
+    tc = -b
+    perp = np.sqrt(np.maximum(np.einsum('ij,ij->i', oc, oc) - b * b, 1e-6))
+    th0 = np.arctan((t0 - tc) / perp)
+    th1 = np.arctan((t1 - tc) / perp)
+    dth = np.where(live, th1 - th0, 0.0)
     for off in offsets:
-        t = t0 + span * off
+        t = tc + perp * np.tan(th0 + dth * off)
         p = origin + rays * t[:, None]
         d = p - centre[None, :]
         dist = np.sqrt(np.maximum(np.einsum('ij,ij->i', d, d), EPS))
         fade = np.clip(1.0 - (dist / R) * (dist / R), 0.0, 1.0)
         atten = fade / np.maximum(np.power(dist, falloff), EPS)
-        contrib = np.where(live, atten, 0.0)
+        contrib = np.where(live, atten * (dist * dist / perp), 0.0)
         if occlude is not None:
             contrib = np.where(occlude(p, live & (contrib > 0.0)),
                                0.0, contrib)
         total += contrib.astype(np.float32)
-    return (total * (span / steps) * density * np.where(live, 1.0, 0.0)
+    return (total * (dth / steps) * density * np.where(live, 1.0, 0.0)
             ).astype(np.float32)
 
 
@@ -319,8 +419,7 @@ def add_cones(rgb, origin, rays, depth, lights, st):
         if not scatter.any():
             continue
         col = np.asarray(light.color, np.float32)[None, :]
-        energy = float(getattr(light, 'energy', 1000.0))
-        out = out + scatter[:, None] * col * energy * (1.0 / np.pi)
+        out = out + scatter[:, None] * col * beam_gain(light)
     return out
 
 
@@ -337,7 +436,9 @@ def reference(origin, rays, depth, light, samples=4096, density=1.0,
     axis = M.normalize(np.asarray(light.direction, np.float32)[None, :])[0]
     half = max(float(light.spot_size) * 0.5, 1e-3)
     cos_half = float(np.cos(min(half, np.pi * 0.5 - 1e-3)))
-    edge = float(light.spot_blend)
+    edge = beam_edge(light)
+    law = beam_law(light)
+    cos_out = beam_cos_out(light, cos_half)
     if origin.ndim == 1:
         origin = origin[None, :]
     if origin.shape[0] == 1:
@@ -353,11 +454,10 @@ def reference(origin, rays, depth, light, samples=4096, density=1.0,
         d = p - apex[None, :]
         dist = np.sqrt(np.maximum(np.einsum('ij,ij->i', d, d), EPS))
         cosang = np.einsum('ij,j->i', d, axis) / dist
-        inside = cosang > cos_half
-        inner = cos_half + (1.0 - cos_half) * np.clip(edge, 0.0, 0.999)
-        ang = np.clip((cosang - cos_half) / np.maximum(inner - cos_half, EPS),
-                      0.0, 1.0)
-        ang = ang * ang * (3.0 - 2.0 * ang)
+        inside = cosang > cos_out
+        # R254: the same law statement as the fast path (the law is the
+        # lamp's, not the march's: what this twin checks is the segment)
+        ang = beam_angular(light, law, cosang, cos_half, edge)
         atten = 1.0 / np.maximum(np.power(dist, falloff), EPS)
         total += np.where(inside, ang * atten, 0.0).astype(np.float32) * step
     return (total * density).astype(np.float32)

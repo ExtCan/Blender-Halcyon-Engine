@@ -726,10 +726,38 @@ def square_cos(light, L, z):
     return np.where(z > 0.0, c, np.float32(0.0)).astype(np.float32)
 
 
+def spot_blend_band(light, spotsi):
+    """R254: the width of the Blender Internal cone's smoothstep band, in
+    cosine units, measured inward from the cutoff cosine `spotsi`.
+
+    Hotspot 0 (the default): Blender's Blend, (1 - spotsi) * spot_blend
+    -- the caller's own `spotsi` (the CPU's float32, the packer's
+    double) in the expression each site always evaluated, so such a
+    lamp moves no bit. Hotspot above 0: the band runs from the cone
+    edge to the HOTSPOT's cosine, cos(min(hotspot, spot_size)/2) -
+    cos(spot_size/2) -- full strength inside the inner angle, the
+    smoothstep down to the Spot Size, the 3D Studio hotspot / falloff
+    pair. Computed in float64 and rounded once by the caller, so the
+    CPU's band and the GPU's texel are the same float32. A hotspot at
+    or past the cone gives 0: the hard edge.
+
+    The ONE place the band is computed: _spot_blender, the GPU packer
+    (hal_lights texel 2.w), the baked literal, the plan signature's
+    "a blend exists" bit and the visible beam's edge all call it.
+    """
+    hot = float(getattr(light, 'hotspot', 0.0) or 0.0)
+    if hot > 0.0:
+        size = float(light.spot_size)
+        return float(np.cos(min(hot, size) * 0.5)) \
+            - float(np.cos(size * 0.5))
+    return (1.0 - spotsi) * float(light.spot_blend)
+
+
 def _spot_blender(light, inpr):
-    """Blender Internal's cone, verbatim (the 1.89.0 spot_falloff body)."""
+    """Blender Internal's cone, verbatim (the 1.89.0 spot_falloff body);
+    R254: the band is spot_blend_band's -- Blend, or the Hotspot's."""
     spotsi = np.float32(np.cos(float(light.spot_size) * 0.5))
-    spotbl = np.float32((1.0 - spotsi) * float(light.spot_blend))
+    spotbl = np.float32(spot_blend_band(light, spotsi))
     t = inpr - spotsi
     if spotbl != 0.0:
         i = np.clip(t / spotbl, 0.0, 1.0)
@@ -880,6 +908,53 @@ def _box1d(a, width, axis, pad_mode):
 _COOKIE_PAD = {'REPEAT': 'wrap', 'EXTEND': 'edge', 'CLIP': 'constant'}
 
 
+def cookie_fingerprint(light, fresh=False):
+    """R254: a fingerprint of EVERY texel of the lamp's cookie -- the
+    crc32 of its float32 bytes -- or None without one.
+
+    The cookie's caches (the blurred preparation, the CPU sampler's
+    texture, the GPU plan and the device upload) were keyed on the sum
+    of every 7th texel: 48 of 49 texels were never read, and a mirror
+    or half-turn of an image whose width is 1 mod 7 (8, 64, 512, 4096
+    px) maps that lattice onto itself, so a flipped slide or a small
+    painted detail kept serving the old image.
+
+    The crc costs about 0.3 ms per megabyte, and the shading loop asks
+    many times a frame, so it is remembered on the lamp against the
+    pixel ARRAY it was taken from (a held reference: an address cannot
+    be reused under it). A new array is fingerprinted on sight;
+    `fresh=True` recomputes -- render() does so once per frame and the
+    GPU plan signature on every plan, which is what notices an array
+    edited in place.
+    """
+    ck = getattr(light, 'cookie', None)
+    if ck is None:
+        return None
+    src = getattr(ck, 'pixels', ck)
+    memo = getattr(light, '_cookie_fp', None)
+    if not fresh and isinstance(memo, tuple) and memo[0] is src:
+        return memo[1]
+    try:
+        import zlib
+        px = np.ascontiguousarray(np.asarray(src, np.float32))
+        fp = int(zlib.crc32(px.tobytes() if px.size < 4096 else px))
+    except Exception:                                           # noqa: BLE001
+        return None
+    try:
+        light._cookie_fp = (src, fp)
+    except Exception:                                           # noqa: BLE001
+        pass
+    return fp
+
+
+def refresh_cookie_fingerprints(lights):
+    """R254: fingerprint every cookie's texels for this frame (see
+    cookie_fingerprint) -- one crc per cookie lamp, before any reader."""
+    for light in lights or ():
+        if getattr(light, 'cookie', None) is not None:
+            cookie_fingerprint(light, fresh=True)
+
+
 def cookie_pixels(light):
     """The image a lamp actually projects -- prepared ONCE and shared
     verbatim by the CPU sampler and the GPU upload, so both devices read
@@ -906,7 +981,9 @@ def cookie_pixels(light):
     else:
         bu, bv = cookie_blur_uv(light)
     ext = cookie_extend(light)
-    key = (px.shape, round(float(px[::7, ::7].sum()), 6),
+    # R254: keyed on every texel (cookie_fingerprint), not on the sum
+    # of every 7th
+    key = (px.shape, cookie_fingerprint(light),
            round(float(bu), 9), round(float(bv), 9), ext)
     prep = getattr(light, '_cookie_prep', None)
     if isinstance(prep, tuple) and prep[0] == key:

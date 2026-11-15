@@ -639,7 +639,9 @@ class HALCYON_PT_lighting(HalcyonPanel, Panel):
 
 
 class HALCYON_PT_spot_cones(HalcyonPanel, Panel):
-    bl_label = "Spot Cones"
+    # R254: the switch gates the beam of every Spot, Point and Area lamp
+    # (it was titled "Spot Cones" and said "spot light" throughout)
+    bl_label = "Volumetric Lights"
     bl_parent_id = "HALCYON_PT_lighting"
     bl_context = "render"
     bl_options = {'DEFAULT_CLOSED'}
@@ -660,8 +662,10 @@ class HALCYON_PT_spot_cones(HalcyonPanel, Panel):
         note = col.column(align=True)
         note.active = False
         note.scale_y = 0.8
-        note.label(text="Each spot light's own Volumetric value", icon='INFO')
-        note.label(text="decides whether it has a beam, and how strong.")
+        note.label(text="Each Spot, Point or Area light's own Volumetric",
+                   icon='INFO')
+        note.label(text="value decides whether it has a beam, and how "
+                        "strong.")
         # R222: the real volumes -- always live; a scene without volume
         # containers pays nothing, so there is no master switch to forget
         layout.separator()
@@ -999,6 +1003,12 @@ class HALCYON_PT_effects(HalcyonPanel, Panel):
         row = col.row()
         row.active = False
         row.label(text="Set Volumetric on a light to cast them", icon='LIGHT')
+        # R254: one lamp, one volumetric effect -- a Spot, Point or Area
+        # lamp throws shafts only while its in-air beam is not drawn
+        row = col.row()
+        row.active = False
+        row.label(text="(a Sun always; other lamps while Volumetric "
+                       "Lights is off)", icon='BLANK1')
         # R251 C134: the optical printer's backlit mattes
         col = layout.column(heading="Matte Glow")
         col.prop(hs, 'matte_glow', text="Enable")
@@ -2736,6 +2746,84 @@ def light_falloff_in_use(hs, scene):
     return mode
 
 
+#: R254: which slider softens a projected image, per lamp kind (the note
+#: named "Angle/Radius" for every kind, an Area lamp has neither)
+COOKIE_BLUR_NOTE = {
+    'SUN': "The lamp's Angle softens the projection",
+    'AREA': "Projection Blur softens the projection",
+    'POINT': "The lamp's Radius softens the projection",
+}
+
+
+def spot_cone_notes(hs):
+    """R254: (rows, notes) under a spot lamp's Cone Law -- the dials the
+    law in use reads, and what it does NOT read of Blender's own Beam
+    Shape panel (which the add-on cannot grey). Blender Internal reads
+    Blend, or the Hotspot while it is above zero; POV reads the Hotspot
+    and the exponent; OpenGL the exponent; the GX functions nothing but
+    the Spot Size. A Screen Spotlight has no cone at all."""
+    law = str(getattr(hs, 'spot_law', 'BLENDER') or 'BLENDER')
+    rows, notes = [], []
+    if law in ('BLENDER', 'POV'):
+        rows.append('hotspot')
+    if law in ('GL11', 'POV'):
+        rows.append('spot_exponent')
+    if getattr(hs, 'screen_spot', False):
+        notes.append("Screen Spotlight: no cone -- these dials are "
+                     "not read")
+    elif law == 'BLENDER':
+        if float(getattr(hs, 'hotspot', 0.0) or 0.0) > 0.0:
+            notes.append("Hotspot replaces Blend (Beam Shape)")
+    else:
+        notes.append("Blend (Beam Shape) is not read by this cone law")
+        if law == 'POV':
+            notes.append("Hotspot sets the soft edge")
+    return rows, notes
+
+
+def lamp_anchor_view(context, light):
+    """Where the lamp's screen anchor sits in the render camera's view:
+    (x, y, z) with x and y in frame fractions (0..1 inside the frame)
+    and z > 0 in front of the camera -- a Sun's anchor is its place in
+    the sky. None without a camera or an object (and in the tests)."""
+    try:
+        from bpy_extras import object_utils as _ou
+        from mathutils import Vector as _V
+        cam = context.scene.camera
+        ob = context.object
+        if cam is None or ob is None:
+            return None
+        if light.type == 'SUN':
+            d = (ob.matrix_world.to_3x3()
+                 @ _V((0.0, 0.0, -1.0))).normalized()
+            pt = cam.matrix_world.translation - d * 1000.0
+        else:
+            pt = ob.matrix_world.translation
+        co = _ou.world_to_camera_view(context.scene, cam, pt)
+        return (float(co.x), float(co.y), float(co.z))
+    except Exception:                                           # noqa: BLE001
+        return None
+
+
+def shaft_anchor_status(co):
+    """R254: (text, icon, hint) for a Sun's Light Shafts given its
+    anchor in the camera view (lamp_anchor_view), or None without one.
+    The bounds are core/render.shaft_sources' own: behind the camera
+    there is no source, nor beyond six half-frames (|ndc| > 6, a frame
+    fraction outside -2.5 .. 3.5)."""
+    if co is None:
+        return None
+    if co[2] <= 0.0:
+        return ("Sun is BEHIND the render camera -- no shafts", 'ERROR',
+                "Tilt the sun so it shines TOWARD the camera's view")
+    if not (-2.5 <= co[0] <= 3.5 and -2.5 <= co[1] <= 3.5):
+        return ("Sun is far outside the frame -- no shafts", 'ERROR',
+                "Aim the camera nearer the sun's place in the sky")
+    return ("Light Shafts converge on the sun's place in the sky",
+            'CHECKMARK',
+            "From pixels brighter than the render's Shaft Threshold")
+
+
 class HALCYON_PT_light(HalcyonPanel, Panel):
     bl_label = "Halcyon Light"
     bl_context = "data"
@@ -2818,14 +2906,23 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
             col.prop(hs, 'decay_near_start')
             col.prop(hs, 'decay_near_end')
         if light.type == 'SPOT':
-            col.prop(hs, 'hotspot')
+            # R251 F012: the cone law, then the dials THAT law reads.
+            # R254: Hotspot was drawn for every law and read by POV
+            # alone; it is the Blender Internal law's inner angle now
+            # and is drawn where it does something (the OpenGL and GX
+            # laws have no inner angle), as the exponent always was
+            col.prop(hs, 'spot_law')
+            rows, notes = spot_cone_notes(hs)
+            if 'hotspot' in rows:
+                col.prop(hs, 'hotspot')
+            if 'spot_exponent' in rows:
+                col.prop(hs, 'spot_exponent')
+            for text in notes:
+                note = col.row()
+                note.active = False
+                note.label(text=text, icon='INFO')
             # R253 (A): Blender Internal's Square cone
             col.prop(hs, 'spot_square')
-            # R251 F012: the cone law; the exponent only where a law
-            # reads it
-            col.prop(hs, 'spot_law')
-            if hs.spot_law in ('GL11', 'POV'):
-                col.prop(hs, 'spot_exponent')
             # R251 F015: the Model 3 screen spotlight
             col.prop(hs, 'screen_spot')
         col.separator()
@@ -2944,11 +3041,18 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
         sub.prop(hs, 'cookie_offset')
         sub.prop(hs, 'cookie_tile')
         sub.prop(hs, 'cookie_rotation')
+        if light.type == 'AREA':
+            # R254: the projection's focus blur reads the lamp's source
+            # radius, which Blender's own panel draws for Point and Spot
+            # lamps only -- an Area lamp's gel could not be softened, and
+            # one converted from a Point was blurred by a value no panel
+            # showed
+            sub.prop(light, 'shadow_soft_size', text="Projection Blur")
         if hs.cookie is not None:
             note = sub.row()
             note.active = False
-            note.label(text="The lamp's Angle/Radius softens the "
-                            "projection", icon='INFO')
+            note.label(text=COOKIE_BLUR_NOTE.get(
+                light.type, COOKIE_BLUR_NOTE['POINT']), icon='INFO')
         col.separator()
         row = col.row(align=True)
         row.prop(hs, 'diffuse_only')
@@ -2969,6 +3073,33 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
             sub = col.column()
             sub.active = hs.volumetric > 0.0
             sub.prop(hs, 'volumetric_occlusion')
+            # R254: the beam is drawn only while the render's Volumetric
+            # Lights switch is on (off by default, in a closed sub-panel
+            # of Render > Lighting). The lamp panel said nothing: the
+            # slider moved no pixel and nobody could tell why. The
+            # switch itself sits here while it is the reason
+            shs = getattr(getattr(context, 'scene', None), 'halcyon', None)
+            if hs.volumetric > 0.0 and shs is not None \
+                    and not getattr(shs, 'spot_cones', True):
+                warn = col.column(align=True)
+                warn.label(text="No beam: Volumetric Lights is off in "
+                                "Render > Lighting", icon='ERROR')
+                warn.label(text="(the lamp throws Light Shafts only)",
+                           icon='BLANK1')
+                warn.prop(shs, 'spot_cones',
+                          text="Enable Volumetric Lights (Render)")
+        elif hs.volumetric > 0.0:
+            # R254: a Sun's Volumetric is the screen-space Light Shafts,
+            # which converge on the sun's place in the sky -- nothing is
+            # drawn with the sun behind the camera, and the panel never
+            # said so. The same live answer the flare gets below
+            status = shaft_anchor_status(lamp_anchor_view(context, light))
+            if status:
+                srow = col.row()
+                srow.label(text=status[0], icon=status[1])
+                hint = col.row()
+                hint.active = False
+                hint.label(text=status[2], icon='BLANK1')
         col.separator()
         col.prop(hs, 'flare')
         sub = col.column()
@@ -2989,30 +3120,17 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
             # render camera's frame RIGHT NOW? The field set the dial
             # and saw nothing; this line says why before a render does
             status = None
-            try:
-                from bpy_extras import object_utils as _ou
-                from mathutils import Vector as _V
-                cam = context.scene.camera
-                ob = context.object
-                if cam is not None and ob is not None:
-                    if light.type == 'SUN':
-                        d = (ob.matrix_world.to_3x3()
-                             @ _V((0.0, 0.0, -1.0))).normalized()
-                        pt = cam.matrix_world.translation - d * 1000.0
-                    else:
-                        pt = ob.matrix_world.translation
-                    co = _ou.world_to_camera_view(context.scene, cam, pt)
-                    if co.z <= 0.0:
-                        status = ("Anchor is BEHIND the render camera "
-                                  "-- no flare", 'ERROR')
-                    elif -0.2 <= co.x <= 1.2 and -0.2 <= co.y <= 1.2:
-                        status = ("Anchor is in the render camera's "
-                                  "frame", 'CHECKMARK')
-                    else:
-                        status = ("Anchor is OUTSIDE the render "
-                                  "camera's frame -- no flare", 'ERROR')
-            except Exception:                                   # noqa: BLE001
-                status = None
+            co = lamp_anchor_view(context, light)
+            if co is not None:
+                if co[2] <= 0.0:
+                    status = ("Anchor is BEHIND the render camera "
+                              "-- no flare", 'ERROR')
+                elif -0.2 <= co[0] <= 1.2 and -0.2 <= co[1] <= 1.2:
+                    status = ("Anchor is in the render camera's "
+                              "frame", 'CHECKMARK')
+                else:
+                    status = ("Anchor is OUTSIDE the render "
+                              "camera's frame -- no flare", 'ERROR')
             if status:
                 srow = sub.row()
                 srow.label(text=status[0], icon=status[1])
