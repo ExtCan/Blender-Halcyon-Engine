@@ -4271,11 +4271,7 @@ def _build_shadows(scene, st, mesh):
 def shaft_sources(scene, settings, vp):
     """Screen positions of lights that scatter, for the light-shaft pass."""
     out = []
-    # R254: the frame's lamps that light a medium (_medium_lamps): a
-    # lamp that is only ambient has no position to throw a shaft from,
-    # an Only Shadow lamp or one the Light Limit left unlit emits
-    # nothing to scatter
-    for light in _medium_lamps(scene, settings):
+    for light in scene.lights:
         vol = float(getattr(light, 'volumetric', 0.0))
         if vol <= 0.0:
             continue
@@ -4293,6 +4289,12 @@ def shaft_sources(scene, settings, vp):
         # a source outside the frame still throws shafts into it, so the bound
         # is generous; only rule out lights nowhere near the view
         if abs(ndc[0]) > 6.0 or abs(ndc[1]) > 6.0:
+            continue
+        if not any(light is l for l in _medium_lamps(scene, settings)):
+            # R254: only a lamp that lights a medium this frame throws
+            # shafts (_medium_lamps): a lamp that is only ambient has
+            # no position to throw one from, an Only Shadow lamp or one
+            # the Light Limit left unlit emits nothing to scatter
             continue
         out.append(((float(ndc[0]), float(ndc[1])), vol))
     return out
