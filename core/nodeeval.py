@@ -1856,9 +1856,10 @@ def _bump_field_for(c, node):
 
     Fields are keyed by (material index, node id); the batch is
     single-material wherever `c.px` is real, so the batch's first
-    triangle names the material. The pre-pass covers the material's own
-    tree; a Bump inside a node group has another id (its path,
-    export.node_id), finds no field and differences its own batch.
+    triangle names the material. The id is the node's PATH
+    (export.node_id), so a Bump inside a node group -- at any depth, in
+    any instance of the group -- finds the field `bump_heights` filed
+    for that very node.
     """
     fields = getattr(c, 'bump_fields', None)
     tri = getattr(c, 'tri', None)
@@ -1869,6 +1870,57 @@ def _bump_field_for(c, node):
         else None
     mi = int(mat_index[tri[0]]) if mat_index is not None else 0
     return fields.get((mi, node.get('id')))
+
+
+def has_bump(graph):
+    """Whether any tree of the graph holds a Bump node: the material's
+    own, or a node group's at any depth."""
+    for node in ((graph or {}).get('nodes') or {}).values():
+        idn = node.get('bl_idname')
+        if idn == 'ShaderNodeBump' or (idn == 'ShaderNodeGroup'
+                                       and has_bump(node.get('group'))):
+            return True
+    return False
+
+
+def bump_heights(ev, _seen=None):
+    """(node id, heights) for every Bump node below the evaluator: its
+    own tree's, then each node group's, to any depth.
+
+    The Bump pre-pass (`core/render._bump_height_fields`, and the layered
+    road's per-rank twin) walked the material's own tree only, so a Bump
+    INSIDE a node group had no whole-material field and differenced its
+    own shading batch -- its gradients cut at every batch boundary once
+    the material outgrew one batch, the very seam the pre-pass exists to
+    remove. A group-internal height chain is evaluated here in the
+    group's context: `group_evaluator`, the binding `n_group` shades
+    with, taken step by step down the path. The id each height is handed
+    out under is the node's own -- its path (export.node_id), which is
+    what `_bump_field_for` looks up, and what keeps two instances of one
+    group (two bindings, two heights) apart.
+
+    One evaluator per tree and per call: every Bump of a tree shares its
+    cache, as they do in the shading pass. An id is handed out once, a
+    tree's own nodes before its groups': ids are unique in every
+    exported graph, and in a hand-built one that repeats an id the
+    material's own node keeps the field, as it always did.
+    """
+    seen = set() if _seen is None else _seen
+    groups = []
+    for node in ev.nodes.values():
+        idn = node.get('bl_idname')
+        if idn == 'ShaderNodeBump':
+            nid = node.get('id')
+            if nid not in seen:
+                seen.add(nid)
+                yield nid, np.asarray(ev.input(node, 'Height', VALUE),
+                                      np.float32).reshape(-1)
+        elif idn == 'ShaderNodeGroup':
+            groups.append(node)
+    for node in groups:
+        sub = group_evaluator(ev, node, lazy=True)
+        if sub is not None:
+            yield from bump_heights(sub, seen)
 
 
 def _screen_grad(c, values):
@@ -4602,21 +4654,56 @@ def n_reroute(ev, node):
     return {outs[0].get('name') if outs else 'Output': v}
 
 
-def n_group(ev, node):
-    """Node groups: evaluate the inner tree with the outer inputs bound."""
+class _BoundOnRead:
+    """A group node's bound inputs, bound when the inner tree first reads
+    one: all that `n_group_input` asks of the binding is `get`."""
+
+    def __init__(self, bind):
+        self._bind, self._bound = bind, None
+
+    def get(self, key, default=None):
+        if self._bound is None:
+            self._bound = self._bind()
+        return self._bound.get(key, default)
+
+
+def group_evaluator(ev, node, lazy=False):
+    """The evaluator of a group node's inner tree, the node's inputs bound
+    for its Group Input: each evaluated in the OUTER evaluator `ev`, filed
+    by position and by name. None for a group node that carries no tree.
+
+    ONE function, so everything that reads the inside of a group binds it
+    alike: `n_group` (the shading pass) and `bump_heights` (the Bump
+    pre-pass, whose field for a group-internal Bump has to be the height
+    chain exactly as the shading pass would evaluate it). `lazy` puts the
+    binding off until the inner tree first reads a Group Input socket:
+    the pre-pass evaluates height chains and nothing else, and a chain
+    that reads no group input must not pay for whatever feeds them.
+    """
     inner = node.get('group')
     if not inner:
-        return ev.fallback(node)
+        return None
     sub = GraphEvaluator({'nodes': inner.get('nodes', {}),
                           'output': inner.get('output')}, ev.ctx,
                          ev.images, ev.programs)
-    sub.cache = {}
-    bound = {}
-    for i, s in enumerate(node.get('inputs', [])):
-        k = s.get('type', VALUE)
-        bound[i] = ev.input(node, i, k)
-        bound[s.get('name')] = bound[i]
-    sub.group_inputs = bound
+
+    def bind():
+        bound = {}
+        for i, s in enumerate(node.get('inputs', [])):
+            k = s.get('type', VALUE)
+            bound[i] = ev.input(node, i, k)
+            bound[s.get('name')] = bound[i]
+        return bound
+    sub.group_inputs = _BoundOnRead(bind) if lazy else bind()
+    return sub
+
+
+def n_group(ev, node):
+    """Node groups: evaluate the inner tree with the outer inputs bound."""
+    inner = node.get('group')
+    sub = group_evaluator(ev, node)
+    if sub is None:
+        return ev.fallback(node)
     out_id = inner.get('group_output')
     res = {}
     if out_id and out_id in sub.nodes:

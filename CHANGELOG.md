@@ -1861,6 +1861,119 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   no warning, raises "unknown identifier" when it runs, and the node
   reads zeros with nothing in the report); and the Bump pre-pass still
   covers the material's own tree only.
+- **A Bump inside a node group gathers from a whole-material field (its
+  gradients were cut at every shading-batch boundary).** `n_bump`
+  differences its height toward the +x / +y neighbours shaded in the
+  SAME batch, so a material that covers more than one shading batch
+  (`MIN_CHUNK`, 16384 pixels) has its height chains rendered to
+  whole-material gradient fields first, and every batch gathers from
+  those. Both sites that build the fields --
+  `core/render._bump_height_fields` for the opaque frame, the per-rank
+  twin inside `_shade_fragments_cpu` for the layers -- walked
+  `graph['nodes']`, the material's OWN tree. Since the entry above, a
+  group's Bump has its path for an id ('Group/Bump'): it found no field
+  and went back to differencing its own batch, which is what a group's
+  Bump under any name had always done. The entry above saw it and left
+  it for its own fix. *Wrong picture or fallback: the wrong picture.*
+  The probe (the demo floor through the real `serialize_tree`,
+  `R.render` on the CPU) put ONE chain -- Gradient Texture (Quadratic
+  Sphere) -> Math Multiply 6.0 -> Bump -> the master's Normal -- once in
+  the material's own tree and once inside a group whose output feeds the
+  master's Normal. The two frames are identical at 128x96, where no
+  pre-pass runs. At 320x240 they are 0.35 apart over 230 pixels on rows
+  53-54, the batch boundary; at 640x480, 0.17 apart over 1472 pixels on
+  six rows with one thread and 0.31 over 3172 pixels on fourteen rows
+  with four, because the batch size follows the thread count: the
+  group's bump was a function of the machine. The top-level frame is the
+  reference, and not by convention: it is, bit for bit, the frame of the
+  material shaded in ONE batch (the batch size raised past the floor: no
+  pre-pass at all). Three more roads had the same hole. *See-through*:
+  the layered road shades rank by rank from per-rank fields, and found
+  its Bump materials in the top tree too, so the group's material took
+  the old single call -- every rank in one mixed array, cut per chunk
+  (0.21 off). *Bands*: `job.bump_field_source` hands the builder the
+  G-buffer's FULL coverage so that a band's last row keeps its +y
+  neighbour, and the group's Bump had no field to read it from: 0.53 off
+  along each band's last row (three bands of a 320x240 frame), and at
+  any frame size, since a banded frame always pre-passes (0.54 at
+  128x96). *The GPU device*: a node group has no emitter, the material
+  is refused by name and the frame falls to the same CPU road, cut
+  included. (1) *One walk.* `core/nodeeval.bump_heights(ev)` hands out
+  (node id, heights) for every Bump node below an evaluator: its own
+  tree's, then each group node's, to any depth. Both pre-pass sites take
+  their heights from it, and `nodeeval.has_bump(graph)` is the any-depth
+  test both ask (`_bump_materials_of` for the layered road, which is
+  what moves a group-Bump material onto the rank-by-rank road at all).
+  (2) *The group's context.* A group-internal chain is evaluated by the
+  evaluator of its group's tree with the group node's inputs bound:
+  `nodeeval.group_evaluator(ev, node)`, factored out of `n_group`, which
+  is now its first caller. The shading pass and the pre-pass bind
+  through ONE function, taken step by step down the path, so a height
+  that reads a Group Input reads what the shading pass will read -- two
+  levels down included. The pre-pass asks for the binding lazily: the
+  group's inputs are evaluated when the inner tree first reads a Group
+  Input socket, so a chain that reads none does not pay for whatever
+  feeds the group. `n_group` binds up front exactly as before; nothing
+  moves in the shading pass. (3) *Filed under the path.* The key is
+  (material index, node id) as it was, and the id is the node's path, so
+  `n_bump`'s lookup is the line it was and two instances of ONE group --
+  two bindings, two heights -- keep two fields ('Group/Bump',
+  'Group.001/Bump'). An id is handed out once, a tree's own nodes before
+  its groups': a hand-built graph that repeats an id (the 1.92.0 export,
+  rebuilt for the entry above's test) leaves the material's own node the
+  field, as it always did. (4) *One context per chunk.*
+  `_bump_height_fields` built a shading context and an evaluator per
+  Bump node per chunk; it builds one per chunk, every Bump of the
+  material shares it and its cache, and the coverage mask -- one mask,
+  whichever node -- is scattered once. The arithmetic of a field is the
+  lines it was: every top-level frame of the probes (one Bump and two
+  chained; opaque, see-through and banded; 128x96, 320x240 and 640x480)
+  is bit for bit the frame the tree drew before. *Pictures that change*:
+  a material whose Bump node sits inside a node group, where that
+  material covers more than 16384 pixels of the frame, on a banded
+  frame, or see-through. Its bump is the whole-material one now -- the
+  frame the same nodes draw outside the group. Nothing else moves.
+  Pinned in `test_group_bump_gathers_from_a_whole_material_field` (20
+  checks), through the real `serialize_tree`, with a spy on the pre-pass
+  so every frame says whether it ran and for which ids: the chain at the
+  top level building 'Bump' and inside a group building 'Group/Bump' on
+  a 320x240 frame, the two frames bit for bit, and both the one-batch
+  frame; the group's field withheld (the 1.92.0 pre-pass) cutting a row
+  or two by more than 0.1, so the frames can tell; 128x96 (no pre-pass,
+  the two agree as they always did) and 640x480; a chain that reads its
+  group's Scale and Normal inputs against the same chain fed at the top
+  level, and a chain that reads none leaving the Value at the group's
+  Scale unevaluated in the pre-pass; ONE group tree instanced twice at
+  two scales (two fields, one three times the other, and the frame of
+  two chains at the top level); a group in a group ('Outer/Inner/Bump');
+  the see-through floor on the layered road, with the fields each rank
+  gathers from and with the layer's heights in two chunks; three bands
+  joined against the whole frame; the GPU device on the stand-in driver
+  (refused by name, the CPU's pre-passed frame bit for bit); and the
+  rule read from the code (one walk, one function that binds a group).
+  The entry above's test keeps its two Bumps and gains the group's field
+  ('Bump' and 'Group/Bump' built side by side; under the 1.92.0 ids one
+  field, the material's own). Eighteen mutations each fail the two
+  tests: the walk not entering groups, entering one level only, or
+  entering them before the tree's own Bumps; the group's tree evaluated
+  with nothing bound, with a binding that never binds, or bound in the
+  walk's root evaluator instead of its parent's; the pre-pass binding
+  eagerly; an id handed out once per NAME, or again each time it is met;
+  `has_bump` looking at the own tree only; the field filed, or asked
+  for, under the bare name; one height image for every node, or the
+  first node's height alone; the coverage mask of the first chunk only;
+  the layered road finding top-level Bump materials only, keeping the
+  own tree's heights only, or writing a chunk's heights at the front of
+  the layer. *Seen from the same probes and left for their own fixes*:
+  the master's Bump Height socket is sugar that `desugar_master_bump`
+  rewrites into a Bump node for the nodes of the material's own tree
+  only, so a master INSIDE a group ignores its linked Bump Height
+  altogether (0.89 off over 4435 pixels of the floor at 128x96 -- no
+  pre-pass involved); and a Bump whose HEIGHT is fed by another Bump's
+  normal is still cut where the pre-pass chunks, in the material's own
+  tree too (0.84 off over 461 pixels on rows 52-54 at 320x240, the same
+  before and after this entry): while the fields are being built the
+  upstream Bump has none yet and differences the chunk.
 - **A uniform the driver stripped never fails a pass (the llvmpipe field
   log).** A real Blender 5.2.2 session on the OpenGL backend (Mesa
   llvmpipe) printed, for every GPU frame, `rasterising on the CPU: raster
@@ -2265,6 +2378,17 @@ What headless cannot prove, per feature (the fakebpy / fakeblender stubs validat
   and matching on the driver under the ordinal tag
   (`_cn2_Coded_Shader_main`); and the F12 report naming a group's
   failing Coded Shader by its path ("Group/Coded Shader: ...").
+- A Bump inside a node group in a real file. The fix is proven
+  headless alone (stand-in trees through the real `serialize_tree`, CPU
+  frames; bands rendered one after another through `render(band=...)`
+  in one process; the GPU device on the stand-in driver) -- never in
+  Blender and never on a GPU. Open there: an F12 at a real frame size
+  of a material whose Bump sits in a real node group, against the same
+  nodes ungrouped; the same frame through the worker pool, where each
+  band is its own process; the viewport of such a material on the GPU
+  device printing its refusal ("no GLSL emitter for ShaderNodeGroup")
+  and drawing the CPU's frame; and a group whose interface holds two
+  sockets of one name feeding the height.
 - The llvmpipe session itself (Blender 5.2.2, OpenGL backend, Mesa
   llvmpipe): the three lines gone, `raster split` and `shade split`
   printed in their place, and the Timing Breakdown naming the stripped

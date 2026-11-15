@@ -7261,39 +7261,49 @@ def _bump_height_fields(job, mat, mi, tri_m, bary_m, px_m, py_m, front_m,
     ONCE, and let every shading chunk gather its own pixels. Bitwise the
     same arithmetic as a whole-material batch: float32 grid, the same
     forward differences, the same validity, the same gather.
+
+    R253 (review): EVERY Bump of the material, at any depth -- the
+    fields were built for the nodes of the material's own tree, so a
+    Bump inside a node group gathered from nothing and went back to
+    differencing its batch. `nodeeval.bump_heights` walks the trees and
+    evaluates a group-internal chain in its group's context; the field
+    is filed under the node's path id, the id `n_bump` asks by. One
+    context and one evaluator per chunk now serve all of the material's
+    Bumps (they were rebuilt per node), and the coverage -- one mask,
+    whichever node -- is scattered once.
     """
-    from .nodeeval import VALUE, GraphEvaluator
+    from .nodeeval import GraphEvaluator, bump_heights, has_bump
     graph = getattr(mat, 'graph', None)
-    nodes = (graph or {}).get('nodes', {})
-    bumps = [n for n in nodes.values()
-             if n.get('bl_idname') == 'ShaderNodeBump']
-    if not bumps:
+    if not has_bump(graph):
         return {}
     H, W = job.height, job.width
-    fields = {}
-    for node in bumps:
-        img = np.zeros((H, W), np.float32)
-        valid = np.zeros((H, W), bool)
-        for s in range(0, int(tri_m.size), int(chunkn)):
-            e = min(s + int(chunkn), int(tri_m.size))
-            ctx = job.context(tri_m[s:e], bary_m[s:e], px_m[s:e],
-                              py_m[s:e], front_m[s:e]
-                              if front_m is not None else None,
-                              blin_m[s:e] if blin_m is not None else None,
-                              0, True)
-            ev = GraphEvaluator(graph, ctx, job.textures,
-                                getattr(mat, 'programs', None))
-            h = np.asarray(ev.input(node, 'Height', VALUE),
-                           np.float32).reshape(-1)
+    imgs = {}
+    valid = np.zeros((H, W), bool)
+    for s in range(0, int(tri_m.size), int(chunkn)):
+        e = min(s + int(chunkn), int(tri_m.size))
+        ctx = job.context(tri_m[s:e], bary_m[s:e], px_m[s:e],
+                          py_m[s:e], front_m[s:e]
+                          if front_m is not None else None,
+                          blin_m[s:e] if blin_m is not None else None,
+                          0, True)
+        ev = GraphEvaluator(graph, ctx, job.textures,
+                            getattr(mat, 'programs', None))
+        for nid, h in bump_heights(ev):
+            img = imgs.get(nid)
+            if img is None:
+                img = imgs[nid] = np.zeros((H, W), np.float32)
             img[py_m[s:e], px_m[s:e]] = h
-            valid[py_m[s:e], px_m[s:e]] = True
+        valid[py_m[s:e], px_m[s:e]] = True
+    fields = {}
+    for nid in list(imgs):
+        img = imgs.pop(nid)
         gx = np.zeros_like(img)
         gy = np.zeros_like(img)
         gx[:, :-1] = np.where(valid[:, 1:] & valid[:, :-1],
                               img[:, 1:] - img[:, :-1], 0.0)
         gy[:-1, :] = np.where(valid[1:, :] & valid[:-1, :],
                               img[1:, :] - img[:-1, :], 0.0)
-        fields[(int(mi), node.get('id'))] = (gx, gy)
+        fields[(int(mi), nid)] = (gx, gy)
     return fields
 
 
@@ -9552,7 +9562,9 @@ def _background_image(scene, st, w, h, vp, eye, uncovered=None,
 
 
 def _bump_materials_of(job, tri):
-    """{mi: material} for fragment materials carrying a Bump node."""
+    """{mi: material} for fragment materials carrying a Bump node, in
+    their own tree or in a node group at any depth."""
+    from .nodeeval import has_bump
     mesh = job.scene.mesh
     if mesh.mat_index is None or tri.size == 0:
         return {}
@@ -9562,9 +9574,7 @@ def _bump_materials_of(job, tri):
         mat = job.scene.materials[mi] \
             if mi < len(job.scene.materials) else None
         graph = getattr(mat, 'graph', None) if mat is not None else None
-        nodes = (graph or {}).get('nodes', {})
-        if any(n.get('bl_idname') == 'ShaderNodeBump'
-               for n in nodes.values()):
+        if has_bump(graph):
             out[mi] = mat
     return out
 
@@ -9589,7 +9599,7 @@ def _shade_fragments_cpu(job, tri, bary, px, py, front, rank, st):
     bump_mats = _bump_materials_of(job, tri)
     if not bump_mats:
         return _shade_chunked(job, tri, bary, px, py, front, None, st)
-    from .nodeeval import VALUE, GraphEvaluator
+    from .nodeeval import GraphEvaluator, bump_heights
     mesh = job.scene.mesh
     mat_f = mesh.mat_index[tri] if mesh.mat_index is not None \
         else np.zeros(tri.size, np.int32)
@@ -9600,7 +9610,9 @@ def _shade_fragments_cpu(job, tri, bary, px, py, front, rank, st):
     # same field definition, at a fraction of the evaluator cost the
     # first per-rank version paid (the field's 33-second frame grew to
     # 43 on exactly that; the waves' noise chain was re-running once
-    # per depth layer)
+    # per depth layer). R253 (review): every Bump of the material, at
+    # any depth -- nodeeval.bump_heights, the walk _bump_height_fields
+    # takes: a Bump inside a node group had no field on this road either
     H, W = job.height, job.width
     heights = {}
     mat_idx_of = {}
@@ -9610,22 +9622,19 @@ def _shade_fragments_cpu(job, tri, bary, px, py, front, rank, st):
             continue
         mat_idx_of[mi] = idx
         graph = getattr(mat, 'graph', None)
-        nodes = (graph or {}).get('nodes', {})
-        for node in nodes.values():
-            if node.get('bl_idname') != 'ShaderNodeBump':
-                continue
-            hv = np.empty(idx.size, np.float32)
-            for s in range(0, int(idx.size), int(MAX_CHUNK)):
-                e = min(s + int(MAX_CHUNK), int(idx.size))
-                sub = idx[s:e]
-                ctx = job.context(tri[sub], bary[sub], px[sub], py[sub],
-                                  front[sub] if front is not None
-                                  else None, None, 0, True)
-                ev = GraphEvaluator(graph, ctx, job.textures,
-                                    getattr(mat, 'programs', None))
-                hv[s:e] = np.asarray(ev.input(node, 'Height', VALUE),
-                                     np.float32).reshape(-1)
-            heights[(mi, node.get('id'))] = hv
+        for s in range(0, int(idx.size), int(MAX_CHUNK)):
+            e = min(s + int(MAX_CHUNK), int(idx.size))
+            sub = idx[s:e]
+            ctx = job.context(tri[sub], bary[sub], px[sub], py[sub],
+                              front[sub] if front is not None
+                              else None, None, 0, True)
+            ev = GraphEvaluator(graph, ctx, job.textures,
+                                getattr(mat, 'programs', None))
+            for nid, h in bump_heights(ev):
+                hv = heights.get((mi, nid))
+                if hv is None:
+                    hv = heights[(mi, nid)] = np.empty(idx.size, np.float32)
+                hv[s:e] = h
 
     col = np.zeros((tri.size, 4), np.float32)
     stash = dict(getattr(job, 'bump_fields', {}) or {})
