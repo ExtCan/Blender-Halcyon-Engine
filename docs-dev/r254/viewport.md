@@ -31,7 +31,10 @@ trees). In the viewport rows "px" is the number of
 frame pixels that moved by more than 1/255 out of 181,304, and "forced full
 export" means: tag an unrelated mesh so that a full export of the very same
 state runs, and count the pixels that moves -- anything above 0 there is
-something the fast path left stale.
+something the fast path left stale. The Blender sections of the log were
+run at commit 39670bb; the commits after it add the node-group walk of
+`export._lamp_bound` (pinned headless), comments, tests and this file, and
+the headless sections (13) were run on the final tree.
 
 No picture of a scene nobody edited changes. No GLSL is emitted or changed
 by this package. No existing test pin was changed.
@@ -85,8 +88,9 @@ by this package. No existing test pin was changed.
   the source collection leaves the instance and its lamp in (1,687 px, the
   original alone goes), H on the Empty takes them out (82,752 px), Empties
   filter 0 px, Lights filter 99,371 px, Local View on the Empty alone
-  leaves exactly its instances. Cost of the fingerprint: 0.17 ms per Scene
-  poke at 154 objects, 3.6 ms at 2,154; a lamp tick pays 0.009 ms.
+  leaves exactly its instances. Cost of the fingerprint: 0.23 ms per Scene
+  poke at 154 objects, 3.7 ms at 2,154; a lamp tick (no Scene named) pays
+  0.01 ms, 0.07 ms at 2,154.
   `test_b_viewport_visibility`.
 
 ## 2. A script's or an operator's write to a Halcyon setting never reached the viewport
@@ -128,9 +132,15 @@ by this package. No existing test pin was changed.
   view_update +0 and 0 px for Softness, Density, Shadow Colour, Negative,
   Shadow Map Size, the panel button, both scene dials and the world dial; a
   hand-made `update_tag()` afterwards moved 978 / 1,426 / 1,426 / 99,952 /
-  1,426 / 1,426 px. After: the same pixel counts arrive on the write
-  itself, through the lights-only path at 0.2-0.3 ms, and the hand-made
-  tag afterwards moves 0 px. Scene dials: 1,458 and 1,426 px on the write.
+  1,426 / 1,426 px for the six lamp writes. After: the same pixel counts
+  arrive on the write itself, through the lights-only path at 0.2-0.3 ms,
+  and the hand-made tag afterwards moves 0 px. Scene dials: 1,458 and
+  1,426 px on the write, no export. The world dial of that probe (Colour
+  under a node world) moves no pixel on either tree, but its update now
+  arrives; World Light Strength written from a script moves 85,009 px.
+  In the real bpy 55 of 55, 417 of 417, 215 of 215 and 95 of 95 properties
+  of the four groups carry the callback, and the evaluated copy reads the
+  written value (before: 1.0 after writing 7.0).
   A lamp's exclude collection set from a script: before, the cube linked
   into it stayed lit even through forced full exports (the evaluated lamp
   never got the pointer); after, 1,702 px. `test_c_settings_carry_an_update_callback`.
@@ -254,16 +264,20 @@ by this package. No existing test pin was changed.
   `depsgraph_update_post` of the main depsgraph before the render starts.
   `export._heard_objects` names the objects for which that is true, and
   the walk skips them; every other object is dirtied exactly as before. An
-  object is "heard" only when ALL of these hold, each of which was measured
-  as a stale picture without it:
+  object is "heard" only when ALL of these hold (the pixel counts are the
+  stale mesh measured with that one test switched off):
   * the depsgraph is a RENDER one and the frame did not move;
   * no foreign function sits in `render_init`, `render_pre`,
-    `frame_change_pre` or `frame_change_post` (the verifier's 207 px);
+    `frame_change_pre` or `frame_change_post` (the verifier's 207 px for
+    a handler that moves a vertex; a handler that tags what it edits is
+    also caught by the next test);
   * a window shows this scene and view layer -- a scene rendered by name
     from a script has no main depsgraph anyone evaluates (2,875 px);
   * that main depsgraph holds no tag it has not reported yet
     (`Depsgraph.id_type_updated`, measured: set when an ID is tagged,
-    cleared by the evaluation that reports it);
+    cleared by the evaluation that reports it). This one closes a case
+    that was reasoned, not produced: an edit and the F12 key handled in
+    one event batch;
   * the object is enabled in viewports (`_viewport_enabled`, Blender's
     layer sync read off the original data and checked against
     `Depsgraph.ids` in ten configurations): a render-only object is in the
@@ -277,13 +291,13 @@ by this package. No existing test pin was changed.
   the viewport depsgraph and is left alone.
 - **Pictures that change.** None: the cache stores the arrays a live
   export produces.
-- **Proof.** Background F12s, 25 meshes, 20 steps: before "live 25 cached
+- **Proof.** Background F12s, 25 meshes, 21 steps: before "live 25 cached
   0" at every step; after "live 2 cached 23" with nothing edited (the two
   are the render-only object and the instanced one, never heard), the same
   after a lamp's Power, a Halcyon softness written by a script, a scene
   dial, a moved lamp; "live 3" after one mesh moved, scaled or edited;
   "live 25" after a modifier or a material slot was added, a frame step,
-  Disable in Renders. At all 20 steps the warm F12 equals an F12 with the
+  Disable in Renders. At all 21 steps the warm F12 equals an F12 with the
   export cache flushed: 0 px. The interactive render job (the F12 key's):
   "live 63 cached 0" -> "live 0 cached 63", "live 1" after a mesh edit.
   With a foreign render_pre handler, a scene no window shows, a reloaded or
@@ -406,6 +420,16 @@ update-callback censuses, tests/test_r253_review.py,
 test_r253_mapping.py, test_r253_terrain_tool.py,
 test_r253_light_options.py, test_r254_falloff.py,
 test_r254_world_light.py.
+
+tests/test_r254_viewport.py: 124 checks pass here. On 8de170d 25 checks
+fail and 8 of the 10 tests stop on a function that does not exist there;
+the turn-about-centre test passes there too.
+
+claude-cloud has moved since this branch was cut (the map-soft, ray-road
+and spot-beam packages). `git merge-tree` of this branch with f6484e3
+reports no conflict, and on that merged tree this module and
+test_r254_map_soft, test_r254_ray_road, test_r254_spot_beam,
+test_r254_falloff, test_r254_world_light all pass.
 
 ## Not proven, and what is left
 
