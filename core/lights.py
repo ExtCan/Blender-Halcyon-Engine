@@ -67,8 +67,11 @@ CUBE_DIRS = (
 class ShadowMap:
     """One depth image rendered from a light."""
 
+    # `digest` is filled lazily by gpu/shade.map_digest (an exact content
+    # digest of `depth`, the GPU atlas's identity); a map whose depth is
+    # rewritten in place must reset it to None
     __slots__ = ('vp', 'depth', 'near', 'far', 'persp', 'size', 'origin',
-                 'extent', 'axes', 'd_min')
+                 'extent', 'axes', 'd_min', 'digest')
 
     def __init__(self, vp, zndc, near, far, persp, size, origin, extent=1.0):
         self.vp = vp

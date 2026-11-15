@@ -8,18 +8,29 @@ is a comparison ladder, and the operations are written in the CPU's own
 order so a tap lands on the same texel on either device.
 
 What a fragment pays (F filter taps, B + 1 search taps; 16 and 13 at the
-default Samples 4), in texel fetches:
+default Samples 4), in texel fetches of the depth pack:
 
-    lit or umbra by the search          1 + (B + 1)               = 14
-    decided by the probe                1 + 2 (B + 1)             = 27
-    penumbra, one lattice               1 + 2 (B + 1) + 4 F       = 91
-    penumbra, two lattices cross-faded  1 + 2 (B + 1) + 8 F       = 155
+    lit or umbra by the search          (B + 1)                   = 13
+    decided by the probe                2 (B + 1)                 = 26
+    penumbra, one lattice               2 (B + 1) + 4 F           = 90
+    penumbra, two lattices cross-faded  2 (B + 1) + 8 F           = 154
 
 The three stages are real branches, so only penumbra fragments run the
 filter; the simulator evaluates both sides of a branch and selects, which
-gives the same value. The one extra fetch is the map's nearest depth: it
-rides the G channel of the lamp's first atlas texel, so a moving caster
-re-uploads the atlas (as it must) and never changes this text.
+gives the same value. A lamp of size 0 under the user's Softness comes
+here too (`softmap.zero_shape`): its footprint has no lamp term, the probe
+would read the search's own taps, and is skipped (amax > 0).
+
+WHAT IS A LITERAL AND WHAT IS A TEXEL. With `mb` -- the lamp's first tail
+texel in hal_lights (`material.light_tail_layout`, `material.map_texels`)
+-- every VALUE is fetched: the light-space rows, the origin, the clip
+planes, Bias, Softness, Density, the lamp's size (k R, k tan, an Area's
+half-axes per face), the map's axes, the radius cap and the map's nearest
+depth. A moved lamp, a dragged size or Softness and a moved caster then
+re-upload texels and leave this text alone. What stays in the text is
+structure: the map's size and atlas cells, the projection, the face count,
+the tap count and the unit tap pattern. Without `mb` the same float32
+values are printed as literals (a direct call, or the plan's literal road).
 """
 
 import numpy as np
@@ -37,10 +48,12 @@ def _vec3(v):
     return 'vec3({}, {}, {})'.format(*(_lit(c) for c in tuple(v)[:3]))
 
 
-def shadow_function(i, meta):
-    """`hal_shadow_vis{i}(P, N, L)` for a mapped lamp WITH a size (the
-    meta carries 'soft': its shape and the map's axes)."""
-    from .material import _f, _v3, _v4
+def shadow_function(i, meta, mb=None):
+    """`hal_shadow_vis{i}(P, N, L)` for a mapped lamp that takes the
+    per-receiver lookup (the meta carries 'soft': its shape, the map's
+    axes and its nearest depth). `mb` is the lamp's tail block in
+    hal_lights, or None to print the values as literals."""
+    from .material import MAP_FACE, MAP_HEAD, _f, _v3, _v4
 
     sp = meta['soft']
     shape = sp['shape']
@@ -63,9 +76,62 @@ def shadow_function(i, meta):
     nt, fn = _lit(len(tab_s)), _lit(len(tab_f))
     sq = np.float32(soft) * np.float32(soft)
     k = np.float32(size / (2.0 * ext))
-    K = _lit(k)
     sz, sz1 = _lit(size), _lit(size - 1)
     fetch = 'texelFetch(hal_shadowpack, ivec2(int({}), int({})), 0).r'
+    tx = mb is not None
+
+    def fb(fi):
+        return mb + MAP_HEAD + fi * MAP_FACE
+
+    if tx:
+        # the header texels (`material.map_texels`), fetched once
+        head = [f'    vec4 hal_m0 = hal_ltex({mb});',
+                f'    vec4 hal_m1 = hal_ltex({mb + 1});',
+                f'    vec4 hal_m2 = hal_ltex({mb + 2});',
+                f'    vec4 hal_m3 = hal_ltex({mb + 3});']
+        x_bias, x_origin = 'hal_m0.w', 'hal_m0.xyz'
+        x_near, x_ext, x_texel = 'hal_m1.x', 'hal_m1.y', 'hal_m1.y'
+        x_fpn, x_fmn, x_tnf = 'hal_m1.z', 'hal_m1.w', 'hal_m2.x'
+        x_sv, x_dens = 'hal_m2.z', 'hal_m2.w'
+        K, x_kr, x_cap = 'hal_m3.y', 'hal_m3.z', 'hal_m3.w'
+        x_extl = 'hal_m1.y'
+        x_dmin = f'hal_ltex({mb + 4}).x'
+
+        def x_row(fi, r):
+            return f'hal_ltex({fb(fi) + r})'
+
+        def x_axis(fi, a):
+            return f'hal_ltex({fb(fi) + 4 + a}).xyz'
+
+        def x_rect(fi, a):
+            return f'hal_ltex({fb(fi) + 7 + a}).xyz'
+    else:
+        head = []
+        x_bias, x_origin = _f(bias), _v3(origin)
+        x_near, x_ext = _f(near), _f(ext)
+        x_texel = _f(2.0 * ext / size)
+        x_fpn, x_fmn, x_tnf = (_f(far + near), _f(far - near),
+                               _f(2.0 * near * far))
+        x_sv, x_dens = _lit(soft), _f(density)
+        K = _lit(k)
+        if shape['kind'] == 'SPHERE':
+            x_kr = _lit(np.float32(float(k) * float(shape['R'])))
+        elif shape['kind'] == 'SUN':
+            x_kr = _lit(np.float32(float(k) * float(shape['tan'])))
+        else:
+            x_kr = '0.0'
+        x_cap = _lit(SM.cap_texels(size, ext, persp))
+        x_extl = _lit(ext)
+        x_dmin = _lit(np.float32(float(sp['d_min'])))
+
+        def x_row(fi, r):
+            return _v4(np.asarray(faces[fi]['vp'], np.float32)[r])
+
+        def x_axis(fi, a):
+            return _vec3(axes[fi][a])
+
+        def x_rect(fi, a):
+            return _vec3(SM.rect_axes(shape, axes[fi])[a])
 
     if persp:
         def plane(du, dv):
@@ -106,9 +172,8 @@ def shadow_function(i, meta):
               '        vec3 fg = vec3(0.0, 0.0, 1.0);',
               '        float gx = 0.0; float gy = 0.0;']
         for gi in range(len(faces)):
-            s_g, u_g, f_g = axes[gi]
-            L.append(f'        if (g == {gi}) {{ sg = {_vec3(s_g)}; '
-                     f'ug = {_vec3(u_g)}; fg = {_vec3(f_g)}; '
+            L.append(f'        if (g == {gi}) {{ sg = {x_axis(gi, 0)}; '
+                     f'ug = {x_axis(gi, 1)}; fg = {x_axis(gi, 2)}; '
                      f'gx = {_f((gi % grid_w) * size)}; '
                      f'gy = {_f((gi // grid_w) * size + voff)}; }}')
         L += ['        float md = d.x * fg.x + d.y * fg.y + d.z * fg.z;',
@@ -174,40 +239,71 @@ def shadow_function(i, meta):
           '{',
           f'    float tg = t * {grow};',
           '    float nb = 0.0; float ds = 0.0;']
+    if tx:
+        # the pad (Softness + SEARCH_PAD) is a texel: each tap's share
+        # is the float32 product `search_table` takes, in a statement
+        # of its own ahead of the add
+        L.append(f'    float pad = hal_ltex({mb + 3}).x;')
     for a, b, pa, pb in tab_s:
-        L += ['    {',
-              f'    vec2 r = hal_sm_blk{i}('
-              f'tg * ({_lit(a)} * Ax + {_lit(b)} * Bx) + {_lit(pa)}, '
-              f'tg * ({_lit(a)} * Ay + {_lit(b)} * By) + {_lit(pb)}, '
-              f'{cta});',
-              '    nb += r.x; ds += r.y;',
-              '    }']
+        if tx:
+            L += ['    {',
+                  f'    float pa = pad * {_lit(a)};',
+                  f'    float pb = pad * {_lit(b)};',
+                  f'    vec2 r = hal_sm_blk{i}('
+                  f'tg * ({_lit(a)} * Ax + {_lit(b)} * Bx) + pa, '
+                  f'tg * ({_lit(a)} * Ay + {_lit(b)} * By) + pb, '
+                  f'{cta});',
+                  '    nb += r.x; ds += r.y;',
+                  '    }']
+        else:
+            L += ['    {',
+                  f'    vec2 r = hal_sm_blk{i}('
+                  f'tg * ({_lit(a)} * Ax + {_lit(b)} * Bx) + {_lit(pa)}, '
+                  f'tg * ({_lit(a)} * Ay + {_lit(b)} * By) + {_lit(pb)}, '
+                  f'{cta});',
+                  '    nb += r.x; ds += r.y;',
+                  '    }']
     L += ['    return vec2(nb, ds);', '}']
     # the F filter taps on the lattice of stride st. Written once; called
     # for one lattice, or for both where they cross-fade
     L += [f'float hal_sm_flt{i}(float tf, float fq, float st, {lamp}, {ctx})',
           '{',
           '    float acc = 0.0;']
+    if tx:
+        # the Softness is a texel: each tap's share is `filter_table`'s
+        # float32 product
+        L.append(f'    float sv = hal_ltex({mb + 2}).z;')
     for a, b, sa, sb in tab_f:
-        L += ['    {',
-              f'    float px = u + fq * (tf * ({_lit(a)} * Ax + '
-              f'{_lit(b)} * Bx) + {_lit(sa)});',
-              f'    float py = v + fq * (tf * ({_lit(a)} * Ay + '
-              f'{_lit(b)} * By) + {_lit(sb)});',
-              f'    acc += hal_sm_tap{i}(px, py, st, {cta});',
-              '    }']
+        if tx:
+            L += ['    {',
+                  f'    float sa = sv * {_lit(a)};',
+                  f'    float sb = sv * {_lit(b)};',
+                  f'    float px = u + fq * (tf * ({_lit(a)} * Ax + '
+                  f'{_lit(b)} * Bx) + sa);',
+                  f'    float py = v + fq * (tf * ({_lit(a)} * Ay + '
+                  f'{_lit(b)} * By) + sb);',
+                  f'    acc += hal_sm_tap{i}(px, py, st, {cta});',
+                  '    }']
+        else:
+            L += ['    {',
+                  f'    float px = u + fq * (tf * ({_lit(a)} * Ax + '
+                  f'{_lit(b)} * Bx) + {_lit(sa)});',
+                  f'    float py = v + fq * (tf * ({_lit(a)} * Ay + '
+                  f'{_lit(b)} * By) + {_lit(sb)});',
+                  f'    acc += hal_sm_tap{i}(px, py, st, {cta});',
+                  '    }']
     L += ['    return acc;', '}']
 
     L += [f'float hal_shadow_vis{i}(vec3 P, vec3 N, vec3 L)',
-          '{',
+          '{'] + head + [
           '    float ndl = clamp(dot(N, L), 0.0, 1.0);',
-          f'    float sl = {_f(bias)} * (1.0 + 2.0 * (1.0 - ndl));',
-          f'    float pdist = length(P - {_v3(origin)});']
+          f'    float sl = {x_bias} * (1.0 + 2.0 * (1.0 - ndl));',
+          f'    float pdist = length(P - {x_origin});']
     if persp:
-        L.append(f'    float texel = 2.0 * {_f(ext)} * '
-                 f'max(pdist, {_f(near)}) / {_f(size)};')
+        L.append(f'    float texel = 2.0 * {x_ext} * '
+                 f'max(pdist, {x_near}) / {_f(size)};')
     else:
-        L.append(f'    float texel = {_f(2.0 * ext / size)};')
+        L.append(f'    float texel = {x_texel};')
     if meta.get('midpoint'):
         L.append('    float off_amt = 0.0;')
     else:
@@ -222,13 +318,11 @@ def shadow_function(i, meta):
     L.append('    vec4 ph = vec4(P + N * off_amt, 1.0);')
 
     def face_consts(fi):
-        s_ax, u_ax, f_ax = axes[fi]
-        out = [f'sax = {_vec3(s_ax)};', f'uax = {_vec3(u_ax)};']
+        out = [f'sax = {x_axis(fi, 0)};', f'uax = {x_axis(fi, 1)};']
         if cube:
-            out.append(f'fax = {_vec3(f_ax)};')
+            out.append(f'fax = {x_axis(fi, 2)};')
         if rect:
-            e1, e2 = SM.rect_axes(shape, axes[fi])
-            out += [f'e1 = {_vec3(e1)};', f'e2 = {_vec3(e2)};']
+            out += [f'e1 = {x_rect(fi, 0)};', f'e2 = {x_rect(fi, 1)};']
         return out
 
     L.append('    vec3 sax = vec3(1.0, 0.0, 0.0); '
@@ -239,7 +333,7 @@ def shadow_function(i, meta):
         L.append('    vec3 e1 = vec3(0.0, 0.0, 0.0); '
                  'vec3 e2 = vec3(0.0, 0.0, 0.0);')
     if cube:
-        L += ['    vec3 dvec = ph.xyz - ' + _v3(origin) + ';',
+        L += ['    vec3 dvec = ph.xyz - ' + x_origin + ';',
               '    vec3 avec = abs(dvec);',
               '    int face = 0;',
               '    if (avec.x >= avec.y && avec.x >= avec.z) '
@@ -251,21 +345,19 @@ def shadow_function(i, meta):
               '    float clipz = 0.0; float clipw = 1.0;',
               '    float cellx = 0.0; float celly = 0.0;']
         for fi, fc in enumerate(faces):
-            vp = np.asarray(fc['vp'], np.float32)
             L += [f'    if (face == {fi}) {{',
-                  f'        clipx = dot(ph, {_v4(vp[0])});',
-                  f'        clipy = dot(ph, {_v4(vp[1])});',
-                  f'        clipz = dot(ph, {_v4(vp[2])});',
-                  f'        clipw = dot(ph, {_v4(vp[3])});',
+                  f'        clipx = dot(ph, {x_row(fi, 0)});',
+                  f'        clipy = dot(ph, {x_row(fi, 1)});',
+                  f'        clipz = dot(ph, {x_row(fi, 2)});',
+                  f'        clipw = dot(ph, {x_row(fi, 3)});',
                   f'        cellx = {_f((fi % grid_w) * size)};',
                   f'        celly = {_f((fi // grid_w) * size + voff)};'] + \
                  ['        ' + s for s in face_consts(fi)] + ['    }']
     else:
-        vp = np.asarray(faces[0]['vp'], np.float32)
-        L += [f'    float clipx = dot(ph, {_v4(vp[0])});',
-              f'    float clipy = dot(ph, {_v4(vp[1])});',
-              f'    float clipz = dot(ph, {_v4(vp[2])});',
-              f'    float clipw = dot(ph, {_v4(vp[3])});',
+        L += [f'    float clipx = dot(ph, {x_row(0, 0)});',
+              f'    float clipy = dot(ph, {x_row(0, 1)});',
+              f'    float clipz = dot(ph, {x_row(0, 2)});',
+              f'    float clipw = dot(ph, {x_row(0, 3)});',
               f'    float cellx = 0.0; float celly = {_f(voff)};'] + \
              ['    ' + s for s in face_consts(0)]
     eps = 1e-6
@@ -277,12 +369,12 @@ def shadow_function(i, meta):
           + (' && clipw > 0.0;' if persp else ';'),
           '    float zc = clamp(nz, -1.0, 1.0);']
     if persp:
-        L += [f'    float den = ({_f(far + near)}) - zc * {_f(far - near)};',
+        L += [f'    float den = ({x_fpn}) - zc * {x_fmn};',
               f'    den = abs(den) < {_f(eps)} ? {_f(eps)} : den;',
-              f'    float sdist = {_f(2.0 * near * far)} / den;']
+              f'    float sdist = {x_tnf} / den;']
     else:
-        L.append(f'    float sdist = (zc * 0.5 + 0.5) * {_f(far - near)}'
-                 f' + {_f(near)};')
+        L.append(f'    float sdist = (zc * 0.5 + 0.5) * {x_fmn}'
+                 f' + {x_near};')
     L += [f'    float u = (nx * 0.5 + 0.5) * {_f(size)};',
           f'    float v = (ny * 0.5 + 0.5) * {_f(size)};',
           '    float lit = 1.0;',
@@ -290,19 +382,17 @@ def shadow_function(i, meta):
           f'    float nd = max(ndl, {_lit(SM.NDL_MIN)});',
           '    float ns = N.x * sax.x + N.y * sax.y + N.z * sax.z;',
           '    float nu = N.x * uax.x + N.y * uax.y + N.z * uax.z;',
-          # the map's nearest depth: the G channel of the lamp's first
-          # atlas texel
-          f'    float dmin = texelFetch(hal_shadowpack, ivec2(0, {voff}), '
-          '0).g;']
+          # the map's nearest depth: a value of the lamp's tail block
+          f'    float dmin = {x_dmin};']
     if persp:
-        L += [f'    vec3 rel = ph.xyz - {_v3(origin)};',
+        L += [f'    vec3 rel = ph.xyz - {x_origin};',
               '    float deu = sqrt(rel.x * rel.x + rel.y * rel.y + '
               'rel.z * rel.z);',
               '    float cpl = -(deu * nd);',
               f'    float gu = ns / (cpl * {K});',
               f'    float gv = nu / (cpl * {K});',
-              f'    float x = nx * {_lit(ext)};',
-              f'    float y = ny * {_lit(ext)};',
+              f'    float x = nx * {x_extl};',
+              f'    float y = ny * {x_extl};',
               '    float dr = 1.0 / max(sdist, 1e-9);']
         if rect:
             L += [f'    float Ax = {K} * (e1.x - x * e1.z);',
@@ -310,25 +400,22 @@ def shadow_function(i, meta):
                   f'    float Bx = {K} * (e2.x - x * e2.z);',
                   f'    float By = {K} * (e2.y - y * e2.z);']
         else:
-            kr = _lit(np.float32(float(k) * float(shape['R'])))
             L += ['    float s1 = 1.0 + sqrt(1.0 + x * x + y * y);',
-                  f'    float Ax = {kr} * (1.0 + x * x / s1);',
-                  f'    float Ay = {kr} * (x * y / s1);',
+                  f'    float Ax = {x_kr} * (1.0 + x * x / s1);',
+                  f'    float Ay = {x_kr} * (x * y / s1);',
                   '    float Bx = Ay;',
-                  f'    float By = {kr} * (1.0 + y * y / s1);']
+                  f'    float By = {x_kr} * (1.0 + y * y / s1);']
         L.append('    float tmin = max(1.0 / max(dmin, 1e-9) - dr, 0.0);')
     else:
-        kt = _lit(np.float32(float(k) * float(shape['tan'])))
         L += [f'    float gu = ns / (nd * {K});',
               f'    float gv = nu / (nd * {K});',
               '    float dr = sdist;',
-              f'    float Ax = {kt}; float Ay = 0.0;',
-              f'    float Bx = 0.0; float By = {kt};',
+              f'    float Ax = {x_kr}; float Ay = 0.0;',
+              f'    float Bx = 0.0; float By = {x_kr};',
               '    float tmin = max(dr - dmin, 0.0);']
-    cap = _lit(SM.cap_texels(size, ext, persp))
     L += ['    float amax = max(sqrt(Ax * Ax + Ay * Ay), '
           'sqrt(Bx * Bx + By * By));',
-          f'    float ts = min(tmin, {cap} / max(amax, 1e-12));']
+          f'    float ts = min(tmin, {x_cap} / max(amax, 1e-12));']
 
     # the blocker search; then, only where it is undecided, the probe;
     # then, only where THAT is undecided, the filter
@@ -357,11 +444,15 @@ def shadow_function(i, meta):
           if persp else
           '    float tf = min(max(dr - davg2, 0.0), tp);'),
          # the lamp's penumbra and the Softness add in quadrature
-         '    float rl = tf * amax;',
-         f'    float rtex = sqrt(rl * rl + {_lit(sq)});',
-         f'    float fq = rtex / max(rl + {_lit(soft)}, 1e-12);',
-         f'    float q = max({_lit(SM.LATTICE)} * rtex / {fn}, 1.0);',
-         '    float st0 = 1.0;']
+         '    float rl = tf * amax;']
+    if tx:
+        L += [f'    float sq = {x_sv} * {x_sv};',
+              '    float rtex = sqrt(rl * rl + sq);']
+    else:
+        L.append(f'    float rtex = sqrt(rl * rl + {_lit(sq)});')
+    L += [f'    float fq = rtex / max(rl + {x_sv}, 1e-12);',
+          f'    float q = max({_lit(SM.LATTICE)} * rtex / {fn}, 1.0);',
+          '    float st0 = 1.0;']
     for lv in SM.STRIDES:
         L.append(f'    if (q >= {_f(lv)}) {{ st0 = {_f(lv)}; }}')
     L += [f'    float wb = clamp((q / st0 - {_lit(SM.SQRT2)}) / '
@@ -377,6 +468,6 @@ def shadow_function(i, meta):
          '    }',
          '    }',
          '    }',
-         f'    return 1.0 - (1.0 - lit) * {_f(density)};',
+         f'    return 1.0 - (1.0 - lit) * {x_dens};',
          '}']
     return '\n'.join(L) + '\n'
