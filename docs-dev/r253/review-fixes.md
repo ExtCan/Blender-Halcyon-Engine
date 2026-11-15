@@ -1060,42 +1060,46 @@ Shader's name resolution is pinned in `tests/test_shaders.py` as well.
   clears the warning with the program it belonged to (a source that no
   longer compiles, or is empty, kept the last good program's line).
   *Nothing that compiled and ran is refused.* Held three ways. Every
-  source the whole suite hands the compiler was recorded (1690 distinct
+  source the whole suite hands the compiler was recorded (1739 distinct
   texts: the engine's passes through the simulators and the pre-flight,
   the twins, the tests' own) and compiled by the front-end before and
-  after: 1628 compile in both with the same outputs, uniforms and inputs
-  and no warning, 62 are refused in both with the same words. The
-  planner's pass texts for all 312 feature-matrix rows and for 11760
-  Console Emulation Shader configurations (every machine by its panel's
-  options by the node's rate, at three scene rates, with the light limit,
-  a painted mesh and the luma / toon dials) came to 405 more distinct
-  texts: all compile in both, same declarations. And 12000 seeded random
-  shaders (operators, calls, constructors, swizzles, ternaries over every
-  type; half with wrong counts mixed in) were compiled and run by both:
-  of the 5431 that ran before, 5274 run to the same values, 104 are
-  refused for the wrong count of a function or a struct constructor, none
-  is refused for its widths, and 53 raise where they "ran" -- each uses a
-  struct constructor's value as a number, which ran only because the
-  constructor answered its first argument; of the 625 that raised `cannot
-  combine` when run, 624 are compile errors (the last combines a struct,
-  below). What IS newly refused is, by intent: a wrong count wherever it
-  is written (it ran, on other arguments than the ones written), and two
-  widths in code no lane reached -- a branch never taken, a function
-  never called -- as the name check refuses an undeclared name there.
-  *Seen and left* (each reproduced; none is one of the six): of two
-  functions with one name and argument count the first is called whatever
-  the argument types (`float f(float)` then `vec3 f(vec3)`: `f(v)` runs
-  the float one); a matrix times a scalar raises in `einsum`; a struct
-  used as a number, or compared with another, raises when run; a struct
-  field declared as an array is stored and typed as one element
-  (`l.dir[1] = v` reads back wrong, `l.dir[1].xy` is refused as a swizzle
-  of a float); a `vec3` initialised from a `vec2` keeps two components,
-  and `vec3(a, b)` / `vec2(a, b, c)` pad and cut in silence; a source
-  with no function at all compiles and raises `no main() in shader` when
-  run; `in vec3 vBitangent;` reads zero unwarned (the table binds it, the
-  renderer supplies nothing); and `in vec3 position;` -- a renderer key
-  used as a name -- reads the position on the CPU and zero in the
-  deferred pass (`gpu/emit` binds table names alone). Pinned in
+  after: 1675 compile in both with the same outputs, uniforms and inputs
+  and no warning, 64 are refused in both with the same words. The
+  enumeration of `tests/glsl_strict.py` with a recorder standing where
+  glslang stands (every engine model at every rate, every console type
+  and option, the cel masters, the post stages, the sky and raster
+  fragments, the coded shaders by node name: 1771 fragment texts, 253
+  distinct) and the planner's pass texts for all 313 feature-matrix rows
+  and for 11760 Console Emulation Shader configurations (every machine by
+  its panel's options by the node's rate, at three scene rates, with the
+  light limit, a painted mesh and the luma / toon dials: 408 distinct)
+  compile the same in both, with the same declarations. And 12000 seeded
+  random shaders (operators, calls, constructors, swizzles, ternaries
+  over every type; half with wrong counts mixed in) were compiled and run
+  by both: of the 5431 that ran before, 5274 run to the same values, 104
+  are refused for the wrong count of a function or a struct constructor,
+  none is refused for its widths, and 53 raise where they "ran" -- each
+  uses a struct constructor's value as a number, which ran only because
+  the constructor answered its first argument; of the 625 that raised
+  `cannot combine` when run, 624 are compile errors (the last combines a
+  struct, below). What IS newly refused is, by intent: a wrong count
+  wherever it is written (it ran, on other arguments than the ones
+  written), and two widths in code no lane reached -- a branch never
+  taken, a function never called -- as the name check refuses an
+  undeclared name there. *Seen and left* (each reproduced; none is one of
+  the six): of two functions with one name and argument count the first
+  is called whatever the argument types (`float f(float)` then `vec3
+  f(vec3)`: `f(v)` runs the float one); a matrix times a scalar raises in
+  `einsum`; a struct used as a number, or compared with another, raises
+  when run; a struct field declared as an array is stored and typed as
+  one element (`l.dir[1] = v` reads back wrong, `l.dir[1].xy` is refused
+  as a swizzle of a float); a `vec3` initialised from a `vec2` keeps two
+  components, and `vec3(a, b)` / `vec2(a, b, c)` pad and cut in silence;
+  a source with no function at all compiles and raises `no main() in
+  shader` when run; `in vec3 vBitangent;` reads zero unwarned (the table
+  binds it, the renderer supplies nothing); and `in vec3 position;` -- a
+  renderer key used as a name -- reads the position on the CPU and zero
+  in the deferred pass (`gpu/emit` binds table names alone). Pinned in
   `tests/test_shaders.py` (six tests, 67 checks: each reported shader,
   its neighbours, per-lane runs, every operator the parser knows, every
   builtin at each count of its range and one either side, 121 type pairs
@@ -1103,7 +1107,7 @@ Shader's name resolution is pinned in `tests/test_shaders.py` as well.
   warning list) and in `test_code_node_compiles_what_it_runs` in
   `tests/test_r253_review.py` (18 checks: the real node class through
   Compile, the warning and error boxes, the export, the evaluator at
-  shading time, the GPU port and `device.preflight`). 33 mutations of the
+  shading time, the GPU port and `device.preflight`). 32 mutations of the
   fix each fail them.
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
