@@ -209,6 +209,39 @@ def enable_nodes(datablock):
             datablock.use_nodes = True
 
 
+#: object type -> the SpaceView3D switch of the viewport's Object Types
+#: Visibility popover that hides it
+_VIEW_TYPE_SWITCH = {
+    'MESH': 'show_object_viewport_mesh', 'CURVE': 'show_object_viewport_curve',
+    'SURFACE': 'show_object_viewport_surf', 'META': 'show_object_viewport_meta',
+    'FONT': 'show_object_viewport_font',
+    'CURVES': 'show_object_viewport_curves',
+    'POINTCLOUD': 'show_object_viewport_pointcloud',
+    'VOLUME': 'show_object_viewport_volume',
+    'GREASEPENCIL': 'show_object_viewport_grease_pencil',
+    'GPENCIL': 'show_object_viewport_grease_pencil',
+    'ARMATURE': 'show_object_viewport_armature',
+    'LATTICE': 'show_object_viewport_lattice',
+    'EMPTY': 'show_object_viewport_empty',
+    'LIGHT': 'show_object_viewport_light',
+    'LIGHT_PROBE': 'show_object_viewport_light_probe',
+    'CAMERA': 'show_object_viewport_camera',
+    'SPEAKER': 'show_object_viewport_speaker'}
+
+
+def view_type_shown(space, kind):
+    """The viewport's own switch for objects of type `kind` (True when
+    the space has none)."""
+    name = _VIEW_TYPE_SWITCH.get(str(kind))
+    return True if name is None else bool(getattr(space, name, True))
+
+
+def view_type_switches(space):
+    """Every such switch of `space`, for a fingerprint."""
+    return tuple(bool(getattr(space, name, True))
+                 for name in sorted(set(_VIEW_TYPE_SWITCH.values())))
+
+
 def in_view(inst, space):
     """False when the viewport `space` (a SpaceView3D) does not show this
     depsgraph instance; True with no space.
@@ -217,14 +250,31 @@ def in_view(inst, space):
     object's collection is hidden with the outliner's eye, when Local
     View leaves the object out, when a local collection or the viewport's
     object-type filter hides it. What changes is the per-viewport test
-    Blender's own engines make on the instance's object
-    (Object.visible_in_viewport_get; an instanced object carries its
-    instancer's flags, so instances follow their instancer). An object
-    that cannot answer is shown."""
+    Blender's own engines make (BKE_object_is_visible_in_viewport, here
+    Object.visible_in_viewport_get).
+
+    An INSTANCE follows its instancer, not its source: Blender hands its
+    engines a copy of the instanced object that carries the instancer's
+    visibility, so a library collection kept in the scene with its eye
+    closed still shows through the Empty that instances it. Python sees
+    the source's own answer on `inst.object` (measured in 5.2.2: False for
+    such an instance), so the instancer (`inst.parent`) is asked instead,
+    and the viewport's type switch is read for the instanced object's own
+    type. An instancer hidden only by the switch of ITS type (Empties
+    filtered out) still shows its instances, as in Blender. An object that
+    cannot answer is shown."""
     if space is None:
         return True
     try:
-        return bool(inst.object.visible_in_viewport_get(space))
+        ob = inst.object
+        if not getattr(inst, 'is_instance', False):
+            return bool(ob.visible_in_viewport_get(space))
+        if not view_type_shown(space, getattr(ob, 'type', '')):
+            return False
+        parent = getattr(inst, 'parent', None)
+        if parent is None or parent.visible_in_viewport_get(space):
+            return True
+        return not view_type_shown(space, getattr(parent, 'type', ''))
     except Exception:                                           # noqa: BLE001
         return True
 

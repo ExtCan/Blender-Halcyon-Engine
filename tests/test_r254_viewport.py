@@ -343,6 +343,42 @@ def test_b_viewport_visibility():
           and compat.in_view(NS(object=NS()), space))
     space.hidden.clear()
 
+    # ---- an INSTANCE follows its instancer, not its source. The usual
+    # library set-up: a collection kept in the scene with its eye closed,
+    # shown through an Empty. Python answers for the SOURCE on inst.object
+    # (measured in 5.2.2: False), so asking it hid every instance
+    sp2 = NS(hidden=set(), show_object_viewport_empty=True,
+             show_object_viewport_mesh=True)
+    src = NS(type='MESH', name='Ball',
+             visible_in_viewport_get=lambda sp: False)
+    emp = NS(type='EMPTY', name='Inst',
+             visible_in_viewport_get=lambda sp: 'Inst' not in sp.hidden
+             and sp.show_object_viewport_empty)
+    inst = NS(object=src, is_instance=True, parent=emp)
+    check('an instance whose SOURCE is hidden is shown while its instancer '
+          'is', compat.in_view(inst, sp2))
+    check('...the hidden source itself (a real object) is not',
+          not compat.in_view(NS(object=src, is_instance=False), sp2))
+    sp2.hidden.add('Inst')
+    check('...hiding the instancer hides the instance',
+          not compat.in_view(inst, sp2))
+    sp2.hidden.clear()
+    sp2.show_object_viewport_empty = False
+    check("...the viewport's Empties switch hides the Empty, not what it "
+          'instances (as in Blender)', compat.in_view(inst, sp2))
+    sp2.show_object_viewport_empty = True
+    sp2.show_object_viewport_mesh = False
+    check("...and the switch of the instanced object's own type hides it",
+          not compat.in_view(inst, sp2))
+    sp2.show_object_viewport_mesh = True
+    s_on = EN._visible_sig(_depsgraph(props, objs, scene_poke), space)
+    space.show_object_viewport_light = False
+    s_off = EN._visible_sig(_depsgraph(props, objs, scene_poke), space)
+    del space.show_object_viewport_light
+    check('the type switches ride in the fingerprint (a type that exists '
+          'only inside an instanced collection has no base object to move '
+          'it)', s_on != s_off)
+
     # ---- a lamp edit and a visibility change on one poke is a full export
     vp2 = PV.Viewport()
     _view_update(EN, vp2, _depsgraph(props, objs), space)

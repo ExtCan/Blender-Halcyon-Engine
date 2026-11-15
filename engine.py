@@ -1280,7 +1280,9 @@ def _visible_sig(depsgraph, space, known=None):
     H / Alt+H, the eye on an object or a collection, Local View, a local
     collection and the viewport's object-type filter, and returns when
     each is undone. It walks base objects, not instances, so a file that
-    instances ten thousand copies pays for its instancers only.
+    instances ten thousand copies pays for its instancers only; the type
+    switches themselves ride along, for an object type that exists only
+    inside an instanced collection.
 
     Every one of those switches reports a Scene update, so a poke that
     names no Scene keeps `known` (the parked export's fingerprint) and
@@ -1295,9 +1297,10 @@ def _visible_sig(depsgraph, space, known=None):
         vl = getattr(depsgraph, 'view_layer', None)
         if vl is None:
             return None
-        return hash(tuple(sorted(
+        from . import compat
+        return hash((compat.view_type_switches(space), tuple(sorted(
             int(o.session_uid) for o in vl.objects
-            if o.visible_get(view_layer=vl, viewport=space))))
+            if o.visible_get(view_layer=vl, viewport=space)))))
     except Exception:                                           # noqa: BLE001
         return None
 
