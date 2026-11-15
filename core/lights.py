@@ -1296,6 +1296,15 @@ def casts_shadow(light, settings):
     return mode not in ('NONE', 'PLANAR')
 
 
+def shadow_sample_count(light, settings):
+    """Taps (mapped) or rays (traced) for ONE light: its own Samples
+    when set, else the render's. 0 on the light means inherit -- the
+    same rule its Map Size and Bias overrides follow -- so a lamp left
+    alone reads exactly the render setting."""
+    own = int(getattr(light, 'shadow_samples', 0) or 0)
+    return own if own > 0 else max(1, int(getattr(settings, 'shadow_samples', 1)))
+
+
 def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
                sample_xy=None, mask=None):
     """Shadow term in 0..1 (1 = fully lit).
@@ -1359,7 +1368,7 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
             soft_on = area_hx > 0.0 or area_hy > 0.0
         else:
             soft_on = float(light.radius) > 0.0
-        samples = max(1, int(settings.shadow_samples)) if soft_on else 1
+        samples = shadow_sample_count(light, settings) if soft_on else 1
         if samples == 1:
             hit = bvh.occluded(origin, L, maxt, mask=mask, cast=cast)
             return (~hit).astype(np.float32)
@@ -1454,7 +1463,8 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
     else:
         offset = texel * (1.5 + 2.5 * np.sqrt(np.maximum(1.0 - ndl * ndl, 0.0))) * \
             max(1.0, soft)
-    lit = sm.lookup(P + N * offset[:, None], slope, soft, settings.shadow_samples)
+    lit = sm.lookup(P + N * offset[:, None], slope, soft,
+                    shadow_sample_count(light, settings))
     dens = float(light.shadow_density)
     return (1.0 - (1.0 - lit) * dens).astype(np.float32)
 

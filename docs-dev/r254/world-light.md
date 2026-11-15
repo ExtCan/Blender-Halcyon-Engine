@@ -89,7 +89,8 @@ this branch: whether this ships as its own round is the user's call.
   without one it returns the old selection object for object.
 - **Shadow** (None / Shadow Map / Ray Traced) is the lamp's own Shadow
   choice and obeys the render settings' Shadow Method the same way; under
-  Per Light, a Ray Traced world light builds the BVH on its own account.
+  Per Light, a Ray Traced world light gets its BVH as any Ray Traced lamp
+  does (`render._per_light_ray_shadows`).
   **Light Shafts** is the lamp's Volumetric amount: the shaft pass streaks
   from the sun's own vanishing point on screen.
 - **Presets.** The eight `world_light*` fields are excluded from sky
@@ -99,7 +100,7 @@ this branch: whether this ships as its own round is the user's call.
   on every world type (bitwise frames), the scene's light list is the same
   object holding the same lamps, and no existing render moves.
 - **Files.** `core/worldlight.py` (new), `core/scene.py` (eight World
-  fields), `core/render.py` (two sync calls, the BVH gate),
+  fields), `core/render.py` (two sync calls),
   `core/lights.py` (`select_lights`), `properties.py`, `ui.py`
   (`HALCYON_PT_world_light`), `presets/skies.py` (EXCLUDED),
   `tests/test_r254_world_light.py`, `tests/featurematrix.py` (the row

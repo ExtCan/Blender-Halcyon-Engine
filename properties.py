@@ -3734,7 +3734,7 @@ class HalcyonLightSettings(PropertyGroup):
                     "Blender's buffer type were per lamp, and a scene can "
                     "mix a tight midpoint spot with a classic sun")
     shadow_softness: FloatProperty(name="Softness", default=1.0, min=0.0, max=32.0)
-    shadow_samples: IntProperty(name="Samples", default=4, min=1, max=64)
+    shadow_samples: IntProperty(name="Samples", default=0, min=0, max=64)
     shadow_density: FloatProperty(name="Density", default=1.0, min=0.0, max=1.0)
     shadow_color: FloatVectorProperty(name="Shadow Colour", subtype='COLOR', size=3,
                                       default=(0.0, 0.0, 0.0), min=0.0, max=1.0)
@@ -5082,7 +5082,7 @@ GROUP_DOCS = {
         'shadow_softness': "Blur of this light's mapped shadow, in "
                            "shadow-map texels. 0 is hard",
         'shadow_samples': "Taps or rays per pixel for this light's soft "
-                          "shadows",
+                          "shadows. 0 uses the render's Samples",
         'shadow_density': "How dark this light's shadows get. 1 is full "
                           "occlusion; less lets colour bleed through, as "
                           "the era's fake fill lights did",
