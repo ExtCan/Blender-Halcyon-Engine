@@ -298,7 +298,7 @@ def shadow_function(i, meta):
               f'    float Bx = 0.0; float By = {kt};',
               '    float tmin = max(dr - dmin, 0.0);']
     grow = _lit(SM.search_grow(F))
-    cap = _lit(np.float32(SM.CAP_FRAC * size))
+    cap = _lit(SM.cap_texels(size, ext, persp))
     L += ['    float amax = max(sqrt(Ax * Ax + Ay * Ay), '
           'sqrt(Bx * Bx + By * By));',
           f'    float ts = min(tmin, {cap} / max(amax, 1e-12));']

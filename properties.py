@@ -1575,13 +1575,14 @@ DESCRIPTIONS = {
                    "detaches shadows from their objects (Peter Panning)",
     'shadow_softness': "A constant blur of mapped shadows, in shadow-map "
                        "texels, added to the penumbra a lamp's own size "
-                       "(Radius, Angle, Size) casts. 0 adds none. A lamp "
-                       "of size 0 needs Samples above 1 to show it",
-    'shadow_samples': "Quality of soft shadows. Mapped: a lamp with a size "
-                      "filters 4 taps per sample (16 to 64) into a smooth "
-                      "penumbra; a lamp of size 0 takes this many taps of "
-                      "the Softness blur. Traced: rays per pixel from a "
-                      "sized lamp. More is smoother and slower",
+                       "(Radius, Angle, Size) casts. 0 adds none. It "
+                       "needs Samples above 1",
+    'shadow_samples': "Quality of soft shadows. 1 is a hard edge for every "
+                      "lamp. Above 1, mapped: a lamp with a size filters 4 "
+                      "taps per sample (16 to 64) into a smooth penumbra "
+                      "and a lamp of size 0 takes this many taps of the "
+                      "Softness blur; traced: rays per pixel from a sized "
+                      "lamp. More is smoother and slower",
     # R251 C117
     'shadow_map_depth': "What each shadow-map texel stores. CLASSIC keeps "
                         "the nearest caster and fights acne with Bias and "
@@ -5025,7 +5026,8 @@ GROUP_DOCS = {
                            "setting, 0 adds no blur. The penumbra itself "
                            "comes from the lamp's size",
         'shadow_samples': "Taps or rays per pixel for this light's soft "
-                          "shadows. 0 uses the render's Samples",
+                          "shadows. 0 uses the render's Samples; 1 is a "
+                          "hard edge",
         'shadow_density': "How dark this light's shadows get. 1 is full "
                           "occlusion; less lets colour bleed through, as "
                           "the era's fake fill lights did",

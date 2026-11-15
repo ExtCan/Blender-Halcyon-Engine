@@ -9,8 +9,9 @@ the penumbra by similar triangles and filter the map over exactly that
 footprint. This module is that lookup for the CPU road; gpu/softmap.py
 emits the same statements as GLSL, tap for tap.
 
-A lamp of size 0 never comes here: `lights.visibility` keeps the constant
-PCF lookup for it (`ShadowMap.lookup`), untouched.
+A lamp of size 0 never comes here, and no lamp does at Samples 1:
+`lights.visibility` keeps the constant PCF lookup for them
+(`ShadowMap.lookup`), untouched (`lookup_shape`).
 
 THE LOOKUP (one lamp, one receiver point P' already stepped off its
 surface by the caller -- `offset_scale` says how far --, shading normal N,
@@ -49,10 +50,14 @@ F filter taps, B search taps)
             disc pattern stands for the rectangle at equal area)
         SUN, angle: A = (k tan(angle/2), 0),  Bv = (0, k tan(angle/2))
      amax = max(|A|, |Bv|).
-  4. BLOCKER SEARCH at t_s = min(max(t(d_min), 0), (size/16) / amax).
-     d_min is the smallest depth the lamp's map holds (no caster is
-     nearer); size/16 texels caps the penumbra RADIUS as a fraction of
-     the map, so the same lamp is equally soft on a 512 and a 2048 map.
+  4. BLOCKER SEARCH at t_s = min(max(t(d_min), 0), cap / amax). d_min
+     is the smallest depth the lamp's map holds (no caster is nearer);
+     cap bounds the penumbra RADIUS: a tangent of 1/8 at the lamp under
+     a perspective map (size/16 texels of a cube face, the same angle
+     for a Spot's cone of any width, a quarter of the map at most),
+     size/16 under an ortho map -- a fraction of the map, never a texel
+     count, so the same lamp is equally soft on a 512 and a 2048 map
+     (`cap_texels`).
      Taps: the centre, the convex hull of the filter pattern and interior
      taps of it. Tap (a, b) reads the texel at
         floor((u, v) + t_s (1 + 4/F) (a A + b Bv) + (S + 2) (a, b)).
@@ -87,8 +92,19 @@ import numpy as np
 
 EPS = 1e-6
 
-#: the penumbra / search radius cap, as a fraction of the map's width
-CAP_FRAC = 1.0 / 16.0
+#: the penumbra / search radius cap. Under a perspective map it is an
+#: ANGLE at the lamp (a tangent, so a Point lamp's cube and a Spot's cone
+#: of any width give one lamp the same reach: an eighth is a sixteenth
+#: of a cube face), never more than a quarter of the map; under an ortho
+#: map a sixteenth of the map. Always a fraction of the map, not a texel
+#: count, so the same lamp is equally soft on a 512 and a 2048 map.
+#: Wider caps were measured and dropped: the far penumbra of a very
+#: large lamp gets closer to the traced one, but one mean caster depth
+#: over so wide a search lets light into the umbra and the twelve
+#: search taps step over casters (a Sun of 0.6 rad: steps of 0.3)
+TAN_CAP = 1.0 / 8.0
+MAP_CAP = 1.0 / 4.0
+ORTHO_CAP = 1.0 / 16.0
 #: the receiver-plane slope clamp (N.L below this is treated as this)
 NDL_MIN = 0.1
 #: the search disc is (1 + SEARCH_GROW / F) times the widest filter disc
@@ -156,11 +172,35 @@ def offset_scale(ndl):
     return (f32(OFFSET_BASE) + f32(1.0 - OFFSET_BASE) * w).astype(np.float32)
 
 
+def lookup_shape(light, samples):
+    """The lamp's shape when its mapped shadow takes the sized lookup,
+    else None (the constant PCF lookup): a lamp of size 0 -- and ANY lamp
+    at Samples 1. One sample is the hard single-tap lookup whatever the
+    lamp's size, the rule the traced road has always had (one sample,
+    one hard ray), and what the 'hard shadow maps' presets ask for with
+    Samples 1 on lamps that carry Blender's default sizes."""
+    if int(samples) <= 1:
+        return None
+    return lamp_shape(light)
+
+
 def tap_counts(samples):
-    """(F, B) from the Samples dial: F = 4 filter taps per sample, 16 to
-    64; B = F/2 search taps, 12 to 32 (the centre tap comes on top)."""
+    """(F, B) from the Samples dial (2 and up; 1 never comes here): F =
+    4 filter taps per sample, 16 to 64; B = F/2 search taps, 12 to 32
+    (the centre tap comes on top)."""
     F = int(min(max(4 * int(samples), 16), 64))
     return F, int(min(max(F // 2, 12), 32))
+
+
+def cap_texels(size, extent, persp):
+    """The penumbra / search radius cap of one map face, in its texels
+    (float32, the constant both roads read)."""
+    if persp:
+        cap = min(MAP_CAP * float(size),
+                  TAN_CAP * float(size) / (2.0 * float(extent)))
+    else:
+        cap = ORTHO_CAP * float(size)
+    return f32(cap)
 
 
 def _vogel(n):
@@ -435,7 +475,7 @@ def _face(face, fetch, rect, P, N, ndl, slope, soft, shape, dmin,
         t_min = np.maximum(pt.dr - f32(dmin), f32(0.0))
     pt.amax = np.maximum(np.sqrt(pt.ax * pt.ax + pt.ay * pt.ay),
                          np.sqrt(pt.bx * pt.bx + pt.by * pt.by))
-    cap = f32(CAP_FRAC * size)
+    cap = cap_texels(size, face.extent, persp)
     pt.ts = np.minimum(t_min, cap / np.maximum(pt.amax, f32(1e-12))) \
         .astype(np.float32)
 

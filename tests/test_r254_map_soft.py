@@ -18,8 +18,10 @@ them except the first fails on the lookup it replaces:
     b  the shadow keeps its mass as the lamp grows (no shrinking)
     c  the penumbra widens with caster distance and with size, and is the
        traced road's within the map's texel
-    d  the ramp is continuous at any Samples (no ghost copies, no bands)
-    e  the same lamp is equally soft on a 512 and a 2048 map
+    d  the ramp is continuous at any Samples above 1 (no ghost copies, no
+       bands); Samples 1 is the hard single-tap lookup for every lamp
+    e  the same lamp is equally soft on a 512 and a 2048 map, and under a
+       narrow spot cone
     f  unrelated scene bounds do not change the blur
     g  an Area's two sizes and its shape reach the shadow
     h  a sized lamp does not erode under the user Softness
@@ -447,11 +449,13 @@ def test_c_the_penumbra_follows_distance_and_size():
 
 
 def test_d_the_ramp_is_continuous():
-    """size-map-05: a smooth penumbra at ANY Samples -- four taps used to
-    be four displaced hard copies (5 levels, steps of 0.25) and Samples 1
-    no softening at all."""
+    """size-map-05: a smooth penumbra at any Samples above 1 -- four taps
+    used to be four displaced hard copies (5 levels, steps of 0.25). One
+    Sample stays the hard single-tap lookup for EVERY lamp, as one traced
+    ray is hard: the 'hard shadow maps' presets ask for exactly that on
+    lamps that carry Blender's default sizes, and it used to shrink."""
     for kind, size in (('POINT', 0.5), ('SUN', 0.1), ('AREA', 1.0)):
-        for samples in (1, 4, 16):
+        for samples in (2, 4, 16):
             sc, st = _prep(kind, size, shadow_samples=samples)
             e = _edge(XS, _vis(sc, st, _xline(2.5)))
             check(f'{kind} size {size:g} at Samples {samples}: at least 12 '
@@ -461,8 +465,30 @@ def test_d_the_ramp_is_continuous():
                   f'{e[1]} levels, largest step {e[2]:.3f}')
     check('Samples maps to 4 filter taps per sample, 16 to 64, and half '
           'as many search taps, 12 to 32',
-          [SM.tap_counts(s) for s in (1, 4, 8, 16, 64)]
+          [SM.tap_counts(s) for s in (2, 4, 8, 16, 64)]
           == [(16, 12), (16, 12), (32, 16), (64, 32), (64, 32)])
+    P, _cell = _floor_grid()
+    for kind, size in (('POINT', 0.5), ('SUN', 0.1), ('AREA', 1.0)):
+        sc, st = _prep(kind, size, shadow_samples=1)
+        hard = _vis(sc, st, P)
+        m1 = float((1.0 - hard).sum())
+        sc0, st0 = _prep(kind, 0.0, shadow_samples=1)
+        m0 = float((1.0 - _vis(sc0, st0, P)).sum())
+        check(f'{kind} size {size:g} at Samples 1: the hard single-tap '
+              'lookup (two levels, the classic statement bitwise) with the '
+              "size-0 lamp's shadow mass -- nothing shrinks",
+              SM.lookup_shape(sc.lights[0], 1) is None
+              and np.array_equal(hard, _classic(sc, st, P))
+              and len(np.unique(hard)) == 2 and abs(m1 / m0 - 1.0) < 1e-6,
+              f'{len(np.unique(hard))} levels, mass ratio {m1 / m0:.4f}')
+    # the lamp's own dial at 1 makes that lamp hard under a soft render
+    sc, st = _prep('POINT', 0.5, shadow_samples=4,
+                   lamp_kw={'shadow_samples': 1})
+    v = _vis(sc, st, P)
+    meta, _atl, _why = GSH._shadow_meta(sc.lights[0], st)
+    check("a lamp whose own Samples is 1 is hard under a render at 4, on "
+          'both roads (no sized key in its shadow meta)',
+          len(np.unique(v)) == 2 and 'soft' not in meta)
     # the lamp's own Samples dial sizes the filter too (0 = the render's)
     sc, st = _prep('POINT', 0.5, shadow_samples=4)
     a = _vis(sc, st, _xline(2.5))
@@ -474,6 +500,29 @@ def test_d_the_ramp_is_continuous():
     check("the lamp's own Samples overrides the render's for the sized "
           'lookup (0 inherits)', not np.array_equal(a, b)
           and np.array_equal(b, c))
+    # thin casters: poles 2 to 9 texels wide under a lamp of Blender's
+    # default size. (The stated limit of the method starts above it: a
+    # caster much thinner than the lamp's footprint can fall between the
+    # search taps of a WIDE lamp -- radius 0.5 and up here -- and its
+    # faint shadow then carries steps; more Samples shrink them.)
+
+    def poles(light, st):
+        parts = [plane(z=0.0, size=14.0, mat=0, obj=0)]
+        for x, wd in ((-2.0, 0.06), (0.0, 0.12), (2.0, 0.25)):
+            parts.append(_box((x - wd / 2, -wd / 2, 0.0),
+                              (x + wd / 2, wd / 2, 3.0)))
+        return _finish(parts, light, st)
+    sc, st = _prep('POINT', 0.25, scene=poles)
+    xs = np.linspace(-3.5, 3.5, 1401)
+    worst, rms = 0.0, 0.0
+    for y in (0.5, 1.5, 3.0):
+        v = _vis(sc, st, _xline(y, xs))
+        r = _ref(sc, st, _xline(y, xs))
+        worst = max(worst, float(np.abs(np.diff(v)).max()))
+        rms = max(rms, float(np.sqrt(np.mean((v - r) ** 2))))
+    check('thin poles under a radius 0.25 lamp: a continuous shadow that '
+          'follows the traced one', worst < 0.12 and rms < 0.04,
+          f'largest step {worst:.3f}, rms {rms:.4f}')
 
 
 def test_e_the_map_size_does_not_change_the_softness():
@@ -502,8 +551,34 @@ def test_e_the_map_size_does_not_change_the_softness():
     check('on a 2048 map radius 1.0 is still softer than radius 0.5 (the '
           'old cap made them one picture)',
           wide[1] > wide[0] * 1.5, f'{wide[0]:.3f} -> {wide[1]:.3f}')
-    check('the penumbra cap is a sixteenth of the map, whatever its size',
-          SM.CAP_FRAC == 1.0 / 16.0)
+    check('the penumbra cap is an ANGLE at the lamp under a perspective '
+          'map (a sixteenth of a cube face at any map size, a quarter of '
+          'a narrow cone\'s map at most) and a sixteenth of an ortho map',
+          [float(SM.cap_texels(n, 1.0, True)) for n in (512, 2048)]
+          == [32.0, 128.0]
+          and float(SM.cap_texels(512, 0.1, True)) == 128.0
+          and float(SM.cap_texels(512, 9.0, False)) == 32.0)
+    # a NARROW spot: its map covers only its cone, so a cap counted in
+    # texels (or as a share of the map) tied the penumbra to the cone
+    # angle -- radius 0.5 and 1.0 were one picture under a 0.35 rad cone
+    xs = np.linspace(0.0, 2.5, 801)
+    got = []
+    for size in (0.5, 1.0):
+        st = _settings()
+        sc = _wall(_lamp('SPOT', size, aim=(0.6, 1.5, 0.0),
+                         spot_size=0.35), st)
+        LI.clear_shadow_cache()
+        LI.build_shadow_maps(sc, st)
+        P = _xline(2.5, xs)
+        e, r = _edge(xs, _vis(sc, st, P)), _edge(xs, _ref(sc, st, P))
+        got.append((e, r))
+    check('a 0.35 rad spot: radius 1.0 is twice as soft as radius 0.5 and '
+          'both are the traced widths within 15%',
+          all(e is not None and r is not None
+              and abs(e[0] - r[0]) <= 0.15 * r[0] for e, r in got)
+          and got[1][0][0] > 1.7 * got[0][0][0],
+          ' '.join(f'{e[0]:.3f} (traced {r[0]:.3f})' for e, r in got
+                   if e is not None and r is not None))
 
 
 def test_f_scene_bounds_do_not_change_the_blur():
@@ -940,6 +1015,26 @@ def test_m_every_caller_keeps_working():
     check('a sized lamp on a MIDPOINT map casts a smooth penumbra too',
           e is not None and e[1] >= 12 and e[2] <= 0.08,
           'no edge' if e is None else f'{e[1]} levels, step {e[2]:.3f}')
+    # a Bias of 0 (the dial's own minimum) under the plane compare: the
+    # open floor on the lamp's side of the wall, which nothing shadows
+    gx, gy = np.meshgrid(np.linspace(-3.0, 3.0, 61),
+                         np.linspace(-3.0, -0.6, 25))
+    front = np.stack([gx.ravel(), gy.ravel(), np.zeros(gx.size)],
+                     1).astype(np.float32)
+    for kind, size in (('POINT', 0.25), ('SUN', 0.05), ('SPOT', 0.25)):
+        sc, st = _prep(kind, size, shadow_bias=0.0)
+        v = _vis(sc, st, front)
+        check(f'{kind} size {size:g} at Bias 0: the open floor before the '
+              'wall stays fully lit (no acne)',
+              float(v.min()) > 0.999, f'min {float(v.min()):.4f}')
+    # the buffer clip planes and a Square cone: still a soft edge
+    for label, lkw in (('clip start 2', {'shadow_clip_start': 2.0}),
+                       ('a Square cone', {'spot_square': True})):
+        sc, st = _prep('SPOT', 0.25, lamp_kw=lkw)
+        e = _edge(XS, _vis(sc, st, _xline(1.5)))
+        check(f'a sized spot with {label} keeps its smooth penumbra',
+              e is not None and e[1] >= 12 and 0.1 < e[0] < 0.22,
+              'no edge' if e is None else f'width {e[0]:.3f}')
     # the nearest depth is the map's own
     sc, st = _prep('SPOT', 0.4)
     sm = sc.lights[0].shadow_map
@@ -969,11 +1064,15 @@ def test_n_the_tooltips_say_what_the_dials_do():
         tip('HalcyonSettings', 'shadow_samples')
     lsoft = tip('HalcyonLightSettings', 'shadow_softness')
     check("the render's Softness is described as a blur ADDED to the "
-          "lamp's own penumbra, and says what a size-0 lamp needs",
-          len(soft) >= 40 and 'size' in soft and 'Samples' in soft, soft)
+          "lamp's own penumbra, and says it needs Samples above 1",
+          len(soft) >= 40 and 'size' in soft
+          and 'Samples above 1' in soft, soft)
     check("the render's Samples names the 4 taps per sample of a sized "
-          'lamp', len(samp) >= 40 and '16 to 64' in samp
-          and 'size 0' in samp, samp)
+          'lamp and the hard edge at 1', len(samp) >= 40
+          and '16 to 64' in samp and 'size 0' in samp
+          and '1 is a hard edge' in samp, samp)
+    lsamp = tip('HalcyonLightSettings', 'shadow_samples')
+    check("the lamp's own Samples says so too", '1 is a' in lsamp, lsamp)
     check("the lamp's Softness says it MULTIPLIES the render's (it never "
           'was texels)', len(lsoft) >= 40 and 'Multiplies' in lsoft
           and 'texels' not in lsoft, lsoft)

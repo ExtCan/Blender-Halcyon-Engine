@@ -1422,14 +1422,16 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
     # obliquely the light hits. Removes acne without the detached shadows a
     # large constant depth bias produces.
     texel = sm.texel_size(np.linalg.norm(P - sm.origin[None, :], axis=1))
-    shape = SM.lamp_shape(light)
+    shape = SM.lookup_shape(light, shadow_sample_count(light, settings))
     if shape is not None:
-        # a SIZED lamp (Radius, a Sun's Angle, an Area's Size): the
-        # penumbra is measured per receiver -- a blocker search over the
-        # lamp's footprint, a width by similar triangles, a filter that
-        # wide (core/softmap.py). Every compare there is made against
-        # the receiver PLANE's depth at the tap, so the offset carries
-        # no blur factor and is scaled DOWN where that plane is exact
+        # a SIZED lamp (Radius, a Sun's Angle, an Area's Size) at more
+        # than one Sample -- one Sample is the hard single-tap lookup
+        # below for every lamp, as one traced ray is hard. The penumbra
+        # is measured per receiver: a blocker search over the lamp's
+        # footprint, a width by similar triangles, a filter that wide
+        # (core/softmap.py). Every compare there is made against the
+        # receiver PLANE's depth at the tap, so the offset carries no
+        # blur factor and is scaled DOWN where that plane is exact
         # (`offset_scale`): nothing lifts the receiver out from under
         # its caster as the lamp or the Softness grows
         if mid:

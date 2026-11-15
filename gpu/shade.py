@@ -732,7 +732,7 @@ def _shadow_meta(light, st, bvh=None):
     # nearer re-uploads the atlas (as it must) and never touches the
     # shader text. The size itself is baked as literals (`_light_sig`)
     from ..core import softmap as _softmap
-    shape = _softmap.lamp_shape(light)
+    shape = _softmap.lookup_shape(light, _shadow_sample_count(light, st))
     d_min = None
     if shape is not None:
         d_min = float(_softmap.map_d_min(sm))
