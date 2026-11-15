@@ -18,7 +18,10 @@ follows a moved, turned and scaled object; identity scenes are BITWISE
 the 1.91 numbers (contexts and whole frames); the legacy switch
 reproduces the scroll bitwise; the GPU twins the CPU on moved objects
 (the pass and the bump pre-pass, 6e-3 -- the R243 bar; the generated
-line itself bitwise at the function level); the manual texture space is
+line itself bitwise at the function level); a moved object misses every
+frame cache under a still camera (the G-buffer, the shadow maps, the
+BVH: the frame after the move is bitwise a fresh render, whichever way
+it moved); the manual texture space is
 honoured; the cartoon centre still measures world space; the export
 road carries the box; the setting's surface (tooltip, enum items, the
 plan signature) and the refusal by name.
@@ -34,6 +37,7 @@ import numpy as np
 from . import utf8_console
 from .scenebuild import demo_scene
 from .test_render import _cartoon_graph, _sk, _wnode, base_settings
+from ..core import lights as LI
 from ..core import mathx as M
 from ..core import raster as CR
 from ..core import render as R
@@ -41,6 +45,7 @@ from ..core.scene import Material, ObjectInfo
 from ..core.settings import RenderSettings
 from ..gpu import device as DEV
 from ..gpu import material as GM
+from ..gpu import rtrace as GRT
 from ..gpu import shade as GSH
 from ..shaders import builtins as SB
 from ..shaders.compiler import try_compile
@@ -544,6 +549,203 @@ def test_d_gpu_twin_on_moved_objects():
                   for s in srcw))
         check('...and the two roads differ on the GPU as on the CPU',
               float(np.abs(simw[mw] - sim[m]).max()) > 1e-3)
+
+
+#: vertex rows of a dense neighbour, for the between-the-samples rig
+CROWD = 40000
+
+
+def _clear_frame_caches():
+    """Every cache that keeps something built from the vertex positions:
+    the rasterised G-buffers, the BVH, the shadow maps, the GPU plan."""
+    R._GBUF_CACHE.clear()
+    R._BVH_CACHE.clear()
+    LI.clear_shadow_cache()
+    GSH._PLAN_CACHE.clear()
+
+
+def _crowded_scene(st, box_t=(0.0, 0.0, 0.0)):
+    """The demo scene sharing its vertex array with CROWD further rows
+    (a dense neighbour's worth; no triangle reads them), its Box moved
+    by `box_t`. The fingerprints' stride is then 79 rows and the Box's
+    24 vertices lie wholly BETWEEN two samples -- a small prop in a
+    large scene. Returns (scene, the Box's vertex rows)."""
+    sc = _scene(st, marble_graph())
+    mesh = sc.mesh
+    vert_obj = np.zeros(mesh.verts.shape[0], np.int32)
+    vert_obj[mesh.tris.reshape(-1)] = np.repeat(mesh.obj_index, 3)
+    box = np.nonzero(vert_obj == 2)[0]
+    V = mesh.verts.copy()
+    V[box] += np.asarray(box_t, f32)
+
+    def crowd(a):
+        return np.concatenate([a, np.zeros((CROWD,) + a.shape[1:], a.dtype)])
+    mesh.verts, mesh.normals, mesh.uvs = crowd(V), crowd(mesh.normals), crowd(mesh.uvs)
+    mw = np.eye(4, dtype=f32)
+    mw[:3, 3] = box_t
+    sc.objects[2].matrix_world = mw
+    sc.objects[2].location = tuple(float(x) for x in box_t)
+    return sc, box
+
+
+def test_d_moved_objects_miss_the_frame_caches():
+    """A moved object under a STILL camera must re-rasterise. The
+    G-buffer cache (R170) keys on the mesh fingerprint and the camera,
+    and the fingerprint read the positions as a strided SUM: a
+    translation whose components cancel -- the ball moved by
+    (0.3, -0.3, 0), a grid-snapped (1, -1, 0) -- kept the key, the CPU
+    restored the previous frame's raster and shaded the old positions
+    (1.80 against the GPU's freshly rastered twin); a small object
+    lying between the stride's samples kept it for ANY move, and its
+    shadow maps and BVH with it. The positions now carry an exact
+    digest of every byte (core/mathx.content_digest) in all four
+    fingerprints, so the frame after a move is BITWISE a fresh
+    process's, and an unmoved re-export still hits."""
+    st = _settings()
+    d = 0.3
+
+    def ident():
+        return _scene(st, marble_graph())
+
+    def moved(t):
+        return move_ball(ident(), xform(t=t))
+
+    # ---- the report, verbatim: identity, then (d, -d, 0), no cache cleared
+    _clear_frame_caches()
+    gpu_road(ident(), st, 'identity marble', clear=True)
+    cpu, sim, m, passes, _why = gpu_road(moved((d, -d, 0.0)), st,
+                                         'ball moved by (d, -d, 0), caches kept',
+                                         clear=False)
+    last = str(R._GBUF_STATS.get('last'))
+    check('the G-buffer cache MISSES on the moved ball and blames the mesh '
+          '(it said HIT)', last == 'MISS(mesh)', last)
+    _clear_frame_caches()
+    fresh = np.asarray(R.render(moved((d, -d, 0.0)), st))[..., :3]
+    check('the CPU frame after the move is BITWISE a fresh render',
+          bits_equal(cpu, fresh), f'{float(np.abs(cpu - fresh).max()):.2e}')
+    if passes is not None:
+        err = float(np.abs(sim[m] - cpu[m]).max())
+        check('...and the GPU twins it within 6e-3 (1.80 on the stale raster)',
+              err < 6e-3, f'{err:.2e}')
+
+    # ---- every cancelling direction, the grid-snapped ones included:
+    # identity first, each move rendered on top of everything before it
+    moves = [(0.0, d, -d), (d, 0.0, -d), (1.0, -1.0, 0.0), (0.2, -0.3, 0.1)]
+    _clear_frame_caches()
+    R.render(ident(), st)
+    kept = [np.asarray(R.render(moved(t), st)) for t in moves]
+    stale = []
+    for t, a in zip(moves, kept):
+        _clear_frame_caches()
+        if not bits_equal(a, np.asarray(R.render(moved(t), st))):
+            stale.append(t)
+    check('four more translations whose components sum to zero -- (0, d, -d), '
+          '(d, 0, -d), (1, -1, 0), (0.2, -0.3, 0.1) -- each render BITWISE '
+          'fresh on top of the cached frames before them', not stale, str(stale))
+
+    # ---- the key itself: every such move changes it, a re-export does not
+    k0 = GSH._mesh_key(ident().mesh)
+    same = [t for t in [(d, -d, 0.0), (2.0, -3.0, 1.0), (1e-4, -1e-4, 0.0)] + moves
+            if GSH._mesh_key(moved(t).mesh) == k0]
+    check('the mesh key (the plan, the triaux / sres / attribute uploads) '
+          'changes on every one, on (2, -3, 1) -- which cancels under the '
+          '(1, 3, 7) weights too -- and on a 1e-4 nudge below the rounding',
+          not same, str(same))
+    check('...and holds on a re-export of the unmoved scene (fresh arrays, '
+          'the same bytes)', GSH._mesh_key(ident().mesh) == k0)
+    _clear_frame_caches()
+    a0 = np.asarray(R.render(ident(), st))
+    a1 = np.asarray(R.render(ident(), st))
+    check('so the unmoved re-export still HITS, bitwise',
+          R._GBUF_STATS.get('last') == 'HIT' and bits_equal(a0, a1),
+          str(R._GBUF_STATS.get('last')))
+
+    # ---- the digest reads EVERY row
+    v = ident().mesh.verts
+    v2 = v.copy()
+    v2[-1, 2] = np.nextafter(v2[-1, 2], f32(9.0))
+    check('content_digest: one ulp on the last coordinate changes it; a '
+          'strided view, a Fortran copy and an empty array all digest',
+          M.content_digest(v2) != M.content_digest(v)
+          and M.content_digest(v[::2]) == M.content_digest(v[::2].copy())
+          and M.content_digest(np.asfortranarray(v)) == M.content_digest(v)
+          and M.content_digest(np.zeros((0, 3), f32)) == 0)
+
+    # ---- the sibling sums had cancelling moves of their own: the shadow
+    # signature's unrounded sum on a grid-snapped (0, 1, -1) (exact in
+    # float32, and its second sum reads x alone), the BVH cache's plain
+    # and absolute sums on an object in the +x +y quadrant moved (d, -d, 0)
+    def with_verts(V):
+        sc = ident()
+        sc.mesh.verts = np.ascontiguousarray(V, f32)
+        return sc
+
+    base = ident().mesh
+    vert_obj = np.zeros(base.verts.shape[0], np.int32)
+    vert_obj[base.tris.reshape(-1)] = np.repeat(base.obj_index, 3)
+    ball = vert_obj == 1
+    Vg = (np.round(base.verts * 8.0) / 8.0).astype(f32)
+    Vg1 = Vg.copy()
+    Vg1[ball] += np.array([0.0, 1.0, -1.0], f32)
+    check('a grid-snapped (0, 1, -1) leaves both of the shadow signature\'s '
+          'sums bit for bit, and changes the signature',
+          float(Vg.sum()) == float(Vg1.sum()) and bits_equal(Vg[:, 0], Vg1[:, 0])
+          and LI._shadow_base_signature(with_verts(Vg), st, None)
+          != LI._shadow_base_signature(with_verts(Vg1), st, None))
+    Vq = (base.verts + np.array([4.0, 2.0, 0.0], f32)).astype(f32)
+    Vq1 = Vq.copy()
+    Vq1[ball] += np.array([d, -d, 0.0], f32)
+    R._BVH_CACHE.clear()
+    bq = R._cached_bvh(None, with_verts(Vq).mesh)
+    bq1 = R._cached_bvh(None, with_verts(Vq1).mesh)
+    check('a ball in the +x +y quadrant moved by (d, -d, 0) leaves the BVH '
+          'key\'s plain and absolute sums at the same three decimals, and '
+          'builds a new tree',
+          float(Vq[ball, :2].min()) > 0.0 and float(Vq1[ball, :2].min()) > 0.0
+          and round(float(Vq.sum()), 3) == round(float(Vq1.sum()), 3)
+          and round(float(np.abs(Vq).sum()), 3) == round(float(np.abs(Vq1).sum()), 3)
+          and bq1 is not bq and bits_equal(bq1.verts, Vq1))
+
+    # ---- between the samples: a small object in a large scene, ANY move
+    t = (0.4, 0.25, 0.1)
+    sc0, box = _crowded_scene(st)
+    stride = max(1, sc0.mesh.verts.shape[0] // 512)
+    check('the rig: the Box (24 vertices) lies wholly between two samples '
+          'of the stride',
+          box.size == 24 and stride > box.size and not np.any(box % stride == 0),
+          f'stride {stride}, rows {int(box.min())}..{int(box.max())}')
+    sc1, _b = _crowded_scene(st, t)
+    check('its move changes the mesh key', GSH._mesh_key(sc0.mesh) != GSH._mesh_key(sc1.mesh))
+    check('...the shadow maps\' base signature',
+          LI._shadow_base_signature(sc0, st, None) != LI._shadow_base_signature(sc1, st, None))
+    R._BVH_CACHE.clear()
+    b0 = R._cached_bvh(sc0, sc0.mesh)
+    b1 = R._cached_bvh(sc1, sc1.mesh)
+    check('...the BVH cache\'s key (a new tree, on the moved positions)',
+          b1 is not b0 and bits_equal(b1.verts, sc1.mesh.verts))
+    check('...and the BVH upload key',
+          GRT.bvh_fingerprint(b0) != GRT.bvh_fingerprint(b1))
+    check('while a re-export of the unmoved crowd keeps all four',
+          GSH._mesh_key(_crowded_scene(st)[0].mesh) == GSH._mesh_key(sc0.mesh)
+          and LI._shadow_base_signature(_crowded_scene(st)[0], st, None)
+          == LI._shadow_base_signature(sc0, st, None)
+          and R._cached_bvh(sc0, _crowded_scene(st)[0].mesh) is b0
+          and GRT.bvh_fingerprint(R.BVH(sc0.mesh.verts, sc0.mesh.tris))
+          == GRT.bvh_fingerprint(b0))
+    for label, kw in (('no shadows (the G-buffer cache)', dict(shadows=False)),
+                      ('shadow maps', dict(shadows=True, shadow_default='MAP')),
+                      ('ray shadows (the BVH)', dict(shadows=True, shadow_default='RAY'))):
+        stk = _settings(**kw)
+        _clear_frame_caches()
+        R.render(_crowded_scene(stk)[0], stk)
+        a = np.asarray(R.render(_crowded_scene(stk, t)[0], stk))
+        last = str(R._GBUF_STATS.get('last'))
+        _clear_frame_caches()
+        b = np.asarray(R.render(_crowded_scene(stk, t)[0], stk))
+        check(f'{label}: the frame after the Box moves is BITWISE a fresh '
+              'render', last == 'MISS(mesh)' and bits_equal(a, b),
+              f'{last}, {float(np.abs(a - b).max()):.2e}')
+    _clear_frame_caches()
 
 
 def test_e_bump_height_prepass_on_a_moved_object():

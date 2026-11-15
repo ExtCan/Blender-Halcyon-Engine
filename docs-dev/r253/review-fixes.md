@@ -278,6 +278,362 @@ below was reproduced headless before it was fixed and is pinned in
   restored; the old Inline Source wording; `get_source` ignoring
   `source_text`. The two coded-shader tests now share one bench
   (`_code_bench`).
+- **The Coded Shader compiles one source on every road (a node with a
+  Text assigned drew the starter shader on the GPU).** A Coded Shader
+  keeps its shader in one of two places: the Text datablock assigned to
+  it (`source`) or the inline `source_text`, which `init` fills with the
+  starter shader and which assigning a Text -- the node's own "New
+  Shader Text" button does it -- never clears. Three readers answered
+  "which one" three ways. `get_source()` (the editor compile, the
+  sockets) took the Text whenever one was assigned.
+  `export._compile_node` (the program in `programs[node.name]`, what
+  `n_halcyon_code` runs wherever the CPU shades) took the Text but
+  reached past an empty one for the inline source. The GPU emitter
+  resolved nothing: `e_code_node` inlines `props.source_text`, which
+  `export._node_props` copied verbatim off the node (`NODE_PROPS` listed
+  it), "or" a `__source` prop that nothing in the tree ever wrote. So a
+  GLSL node with a Text assigned ran the Text on the CPU and whatever
+  its inline source last held in the deferred pass. *Wrong picture or
+  fallback: the wrong picture.* The probe put the real node class
+  (stand-in sockets) through the real `serialize_tree` and rendered
+  `R.render` against `gpu/shade.simulate` at 128x96. With a Text of
+  other uniforms the plan QUALIFIED and the frame was the starter at its
+  declared defaults -- the CPU's own frame of the starter to four
+  decimals, 1.43 off the CPU's frame of the Text over all 598 pixels of
+  the material. With the starter's uniforms kept and the body rewritten
+  (the "+" button, then an edit) it qualified and drew the starter under
+  the sockets' values (1.58); with the out variable renamed it qualified
+  and drew zeros (2.02). Only a Text reusing a starter uniform's NAME
+  under another type refused ("socket 'Base Color' is VALUE but the
+  uniform is vec3") and fell back to the CPU. The same in a real Blender
+  5.2.2 (the `bpy` module, background; the registered node,
+  `export_material`): a fresh node twinned at 1e-5, and the same node
+  with a Text assigned and edited qualified 1.46 off over the 598
+  pixels. (1) *One rule.* `shaders/compiler.node_source(node)`: the
+  assigned Text, whatever it holds, else the inline source.
+  `compile_node(node)` compiles it and returns (program, error, source).
+  `get_source` is `node_source`; `compile_source` and
+  `export._compile_node` are each that one `compile_node` call; no other
+  file reads a Text's contents. (2) *The export ships what it compiled.*
+  `_node_props` writes the call's source under `props.source_text` and
+  is the key's only writer -- `source_text` left `NODE_PROPS`, the table
+  of properties copied verbatim, and the census's `NOT_SHADING` says why
+  -- so the GLSL the emitter inlines is the string the program was
+  compiled from. Riding the graph also puts the Text in the GPU plan's
+  signature (`gpu/shade._mat_sig` hashes the graph, not the programs):
+  an edit in the Text Editor between two frames re-plans instead of
+  hitting the cache. (3) *The emitter reads one key and holds it to the
+  program.* `e_code_node` reads `source_text` alone (`__source` is
+  gone), and a graph source that is not `programs[id].source` refuses by
+  name -- "a coded shader whose graph source is not the source its
+  program was compiled from" -- so a hand-built graph or a later
+  regression falls back to the CPU instead of drawing another shader.
+  (4) *The empty Text: the editor's rule, on both.* In Blender 5.2.2 a
+  new or cleared Text reads `''` and one holding a blank line reads
+  `'\n'`. The editor compiled nothing for either and said nothing; the
+  exporter ran the inline source under `''` (the starter at its declared
+  defaults, beneath the sockets the last Text left, on both devices) and
+  nothing under `'\n'`. An assigned Text is now the source whatever it
+  holds, for three reasons: the inline source has no widget, so the
+  fallback rendered a shader the user could neither see nor edit while
+  the Text in front of them was blank; the fallback was itself two
+  rules; and the Inline Source tooltip already said it ("while the node
+  has no Text datablock assigned"). An emptied Text compiles nothing,
+  reads zeros on both roads and says so by name -- "the assigned Text
+  'x' is empty -- nothing to compile, the outputs read zeros" in the
+  node's error box, from the Compile button and as the export's warning
+  in the F12 report; a Text that cannot be read is treated the same. No
+  Text and a blank inline source stays silent, as before. *One picture
+  changes*: a file whose Coded Shader holds an EMPTY Text rendered the
+  inline source and now renders zeros, with that warning. (5) *The Text
+  tooltip.* It promised "edit it in the Text Editor and the node
+  recompiles on every edit"; typing in the Text fires nothing on the
+  node (seen again in 5.2.2: `needs_rebuild` down, the sockets as they
+  were, the next export compiling the new source). It now states the
+  rule, and that the sockets follow on Compile. Pinned in
+  `test_code_node_one_source_on_every_road` (33 checks): the real node
+  class with a Text assigned and the starter still in `source_text`,
+  through the real `serialize_tree` (the stand-in sockets gained `type`
+  and `is_linked`; a master stands between the node and the output) --
+  the editor's source, the program's and the graph's are one string; the
+  simulator's frame is the CPU's (under 6e-3, no pixel over 1e-2) for
+  the Text, for an edit made between two frames with the plan cache
+  kept, for the Text that used to refuse, for the emptied Text and for
+  the inline source; the 1.92.0 graph is refused by name; the three
+  kinds of empty Text and the unreadable one on every road; and the rule
+  read from the code (one resolver, one reader of a Text, one emitter
+  key). Fourteen mutations each fail it: the export shipping the raw
+  inline property, shipping nothing, or resolving for itself again;
+  `source_text` back in the verbatim table; `node_source` falling back
+  under an empty or an unreadable Text, or turned upside down;
+  `get_source` or `compile_source` resolving alone; the emitter's second
+  key restored, its hold on the program removed, or the emitter inlining
+  the program's source while the graph keeps the inline copy (the cached
+  plan then serves the old GLSL after an edit); the emptied Text made
+  silent; the old tooltip. *Seen from the same probe*: a colour wired
+  STRAIGHT into the Material Output's Surface (a plain RGB node does it,
+  no coded shader needed) qualified for the deferred pass and the
+  simulator's frame was 1.69 off the CPU's over the material, identical
+  on the tree before this fix -- closed since by its own entry below ("A
+  colour wired straight into a shader socket is an Emission on both
+  roads"); and `serialize_tree` handed one `programs` dict down its
+  node-group recursion keyed by `node.name`, which is unique per tree
+  only, so a Coded Shader in the material and one inside a group that
+  shared a name (the default one) left ONE program, the last compiled
+  (seen at the export) -- closed since by the entry below ("Every Coded
+  Shader runs its own program").
+- **Every Coded Shader runs its own program: the graph id is the node's
+  path (two that shared a name across trees shared one program).** A
+  material's compiled Coded Shader programs live in one dict,
+  `programs`, which `export.serialize_tree` hands down its node-group
+  recursion. `_node_props` filed each program under `node.name`, and
+  `n_halcyon_code` looks its program up by the node's graph id, which
+  was that same bare name. Blender keeps node names unique per TREE, and
+  a material is several trees: its own and one per group node. So the
+  material's "Coded Shader" and a group's "Coded Shader" -- the default
+  name, twice; nobody has to rename anything to get here -- left ONE
+  program, the last compiled, and the other node ran it under its own
+  sockets wherever the CPU shades. The entry above saw this at the
+  export and left it for its own fix. *Wrong picture or fallback: the
+  wrong picture.* The probe put the real node class (stand-in sockets)
+  through the real `serialize_tree` and rendered `R.render` at 128x96,
+  with two shaders that differ in their BODY: every uniform has a
+  socket, so two sources that differ in a declared default alone draw
+  one picture under either program -- the probe's first pair did, and
+  read 0.0000. With the group node after the material's node in the
+  tree, the material's node drew the group's shader: 1.48 off the frame
+  of the same trees with the inner node renamed, over all 4848 pixels of
+  the floor. With the group node first it was the group's node that drew
+  the material's shader (2.17). The GPU device hid none of it: the
+  deferred pass refuses a graph source that is not its program's own
+  (the entry above) and a node group has no emitter at all, so the frame
+  fell to the CPU and its wrong program. The same in a real Blender
+  5.2.2 (the `bpy` module, background; a real node group, the registered
+  node, `export_material`): Blender itself named both nodes 'Coded
+  Shader', the export kept one program, and the frame was 1.52 off.
+  (1) *The id is the path.* `export.node_id(name, path)`: a node of the
+  material's own tree keeps its bare name (every
+  `graph['nodes'][node.name]` still holds); a node inside the group node
+  'Group' is 'Group/Coded Shader', inside a second instance of the same
+  group 'Group.001/Coded Shader', two levels down 'Outer/Group/Coded
+  Shader'. Each step is escaped (`/` and `\`), so no two paths spell one
+  id whatever the names hold -- a node NAMED 'Group/Coded Shader' beside
+  that group included. `serialize_tree` writes that one id as the node
+  key, the entry's `id`, every link and `group_output`, hands the id
+  plus the separator to the recursion as its path, and hands the id to
+  `_node_props`, whose `programs[key]` is the only line that files a
+  program. Nothing changed in the evaluator: `n_halcyon_code`, and the
+  sub-evaluator `n_group` builds over the same `programs`, already
+  looked up by graph id. The compile warning names the node by the same
+  id ("Group/Coded Shader: ..."), so two same-named nodes that fail can
+  be told apart. (2) *The Bump pre-pass, the other thing filed by node
+  id.* `core/render._bump_height_fields` files a material's whole-frame
+  gradient fields under (material, node id) for the Bump nodes of the
+  material's own tree, and `n_bump` gathers by (material, node id)
+  wherever it sits. A group's "Bump" beside the material's "Bump" took
+  the OTHER node's field on any frame whose pre-pass runs (a material
+  covering more than one shading batch, 16384 pixels): 1.00 off over
+  29164 pixels at 320x240, nothing at 128x96 where no pre-pass runs. The
+  path id ends it with no line changed in the renderer: the group's Bump
+  is 'Group/Bump', finds no field and differences its own batch, as a
+  group's Bump under any other name always did. (3) *The GPU's key: one
+  mangling tag per node.* `e_code_node` inlines each coded shader under
+  `_cn<tag>_<name>`, and the tag was the id with every non-word
+  character flattened to '_', which is many-to-one. 'Coded Shader' and
+  'Coded_Shader' (or 'Coded.Shader') in ONE tree are two programs on the
+  CPU and one set of GLSL names: the plan QUALIFIED, one shader's text
+  was renamed onto the other's, and the simulator's frame was 0.80 off
+  the CPU's over the 4848 pixels. Two tags also meet without being
+  equal: 'Coded' declaring `B_k` and 'Coded B' declaring `k` are both
+  `_cnCoded_B_k` (0.57 off). `gpu/emit._code_tag(em, key)` hands out one
+  tag per node id per emitter: the flattened id while it meets no tag
+  already handed out, else the same with an ordinal in front
+  ('2_Coded_Shader'), counted up until nothing begins that way.
+  `_tags_clash` is the test: equal, or one is the other plus '_' plus a
+  rest that can begin an identifier. A rest that begins with a digit
+  cannot, which is why Blender's own 'Coded Shader' / 'Coded Shader.001'
+  never met and keep their tags; a node alone in its pass keeps exactly
+  the names it had (`_cncode_main` and the other spellings `test_render`
+  pins are untouched). The emitter's once-set, which the node id shared
+  with the emitters' own helper markers ('__wang', ...), takes the node
+  under a marker of its own, so a node named like one of them is still
+  inlined. A coded shader INSIDE a group is not emitted:
+  groups have no emitter, the material is refused by name ("no GLSL
+  emitter for ShaderNodeGroup") and the CPU -- right, now -- draws it.
+  *Pictures that change*: a material whose trees hold same-named Coded
+  Shaders (or same-named Bump nodes, on a pre-passed frame) drew one
+  node with another's program or field, and now draws each with its
+  own; two coded shaders in one tree whose names flatten alike drew one
+  shader twice on the GPU device and now twin the CPU. Nothing else
+  moves: the ids of a material's own tree are the names they were (a
+  name holding `/` or `\` gains its escape, in the node key and its
+  links together). Pinned in `test_code_node_same_name_across_trees` (46
+  checks), through the real `serialize_tree`: the two programs under
+  their paths, each compiled from its own node's graph source, and the
+  group's tree written under the same ids; in BOTH node orders the
+  material's node and the group's node each drawing the frame of its
+  shader alone, bit for bit, and their sum the frame of the same trees
+  with the inner node renamed; one group instanced twice and a group in
+  a group (four nodes named alike, four programs, the frame of four
+  different names); the 1.92.0 export of each rebuilt by hand and shown
+  to be another picture, so the frames can tell; a name holding the
+  separator; 2379 paths of awkward names spelling 2379 ids; the warning
+  by path; on the GPU the material's node qualifying and twinning beside
+  a group that holds its namesake (under 6e-3, no pixel over 1e-2), the
+  1.92.0 export refused there, a group-fed master refused by name with
+  the right CPU frame; the two tag clashes twinning on the frame the
+  same shaders draw under unrelated names; the tags themselves, and
+  `_tags_clash` against brute force over all 741 pairs of short tags
+  ("can these two spell one mangled name"); the two Bump nodes on a
+  320x240 frame whose pre-pass is seen to run; and the rule read from
+  the code (one reader of a node's name, one line that files a program).
+  Nineteen mutations each fail it: the program filed by name; the node
+  keys, the links or the recursion's path left bare; the path built from
+  the group node's name instead of its id (a nested path loses its
+  parents); `node_id` escaping nothing, the separator alone or the
+  escape alone; the warning by bare name; `_node_props` ignoring its
+  key; the emitter's old tag; `_code_tag` without its check or its
+  memory; `_tags_clash` reduced to equality, without the digit
+  exception, without the swap, or without the joining underscore; the
+  once-set taking the bare id; the group evaluator handed an empty
+  `programs`. *Seen from the same probes
+  and left for their own fixes*: a Coded Shader whose node name holds a
+  non-ASCII letter puts that letter into its GLSL names (`\W` keeps
+  every Unicode letter) and the plan's pre-flight refuses the material
+  -- "would not compile: unexpected character" -- so it shades on the
+  CPU, correctly, but never on the GPU; the shader compiler accepts an
+  undeclared identifier (`vec4(nothing, ...)` compiles with no error and
+  no warning and raises "unknown identifier" only when it runs: the node
+  reads zeros and the export warns of nothing); and the Bump pre-pass
+  still covers the material's own tree only, so a group's Bump is cut at
+  shading-batch boundaries on a frame whose pre-pass runs (the same
+  chain in the material's own tree and in a group: 0.35 apart along two
+  rows at 320x240, nothing at 128x96).
+- **A Coded Shader named in any script reaches the GPU: a letter GLSL
+  cannot hold is spelled as its code point (a node called 'Señal' kept
+  its whole frame on the CPU).** `e_code_node` inlines each coded shader
+  under `_cn<tag>_<name>`, and the tag is the node's graph id with every
+  non-word character flattened to `_` (the entry above). "Word" was
+  Python's, not GLSL's: `\W` is Unicode-aware, so the 'ñ' of a node
+  named 'Señal', a Cyrillic or a CJK name, the letters and digits of
+  every script stayed in the tag and went into the pass as written --
+  `_cnSeñal_main`. A GLSL identifier is `[A-Za-z0-9_]` and nothing else.
+  The entry above saw this from its probes and left it for its own fix.
+  *Wrong picture or fallback: the fallback.* The plan QUALIFIED the
+  material; the device's pre-flight (`gpu/device.preflight`: Halcyon's
+  own GLSL front-end, on the render worker, before the driver is handed
+  anything) refused the text -- "would not compile the pass (line 1209:
+  unexpected character 'ñ'); refused before the driver" -- and a refused
+  pass sends its whole frame to the CPU. So the picture was right, and a
+  scene holding one such node never shaded on the GPU, for nothing but a
+  name any keyboard outside English types. The probe put the real node
+  class (stand-in sockets) through the real `serialize_tree`: 'Señal'
+  alone feeding the master, and 'Señal' beside a second coded shader,
+  'Other', the two summed into the master's Diffuse Color. Both were
+  refused, Cyrillic and CJK names the same, and glslang refuses the same
+  text ("unexpected token") where the simulator does. The same in a real
+  Blender 5.2.2 (the `bpy` module, background; the registered node,
+  `export_material`): Blender keeps each name as it was typed, and all
+  four materials -- 'Señal' alone, beside 'Other', 'Шейдер' beside '色彩',
+  '色' beside '彩' -- were refused with that line. (1) *The spelling.*
+  `gpu/emit._code_spell(key)` is the flattening as it was, then every
+  character still outside ASCII -- by then letters and digits only --
+  written as its code point: `u` and four or more upper-case hex digits.
+  'Señal' is 'Seu00F1al', 'Шейдер' is 'u0428u0435u0439u0434u0435u0440',
+  '色彩' is 'u8272u5F69', a full-width '３' is 'uFF13', a letter beyond the
+  BMP 'u1D6FC'. `_code_tag` asks it for the tag and keeps its clash
+  check; nothing else spells one. (2) *Why the code point and not one
+  more underscore.* Flattening to ASCII ('ñ' to `_`) was tried first,
+  and it qualifies and twins as well. It was not shipped: a name of such
+  letters alone becomes underscores alone -- '色' and '彩' are both `_`,
+  one tag between them, and beside each other they are `_cn__main` and
+  `_cn2___main` -- and GLSL reserves every identifier that holds `__`.
+  glslang 15.1 takes those with a warning (`identifiers containing
+  consecutive underscores ("__") are reserved`) as desktop 4.30 and
+  under Vulkan rules alike, and refuses them below ES 3.00; no driver
+  was asked. A code point is letters and digits, so it adds no
+  underscore at all and can neither make a run nor lengthen one. That is
+  also why it carries no delimiter: `_u00F1_` makes a run between two
+  such letters, a leading `_` makes one after any punctuation, a
+  trailing one against the `_` that joins tag and name. (3) *Still one
+  tag per node.* The spelling is many-to-one, as the flattening is: a
+  node NAMED 'Seu00F1al' beside 'Señal' spells the same tag, and 'Señal
+  B' is 'Señal' plus `_` plus the start of a name (`B_k` under the one
+  and `k` under the other are both `_cnSeu00F1al_B_k`). `_code_tag`
+  settles both as it settles 'Coded Shader' beside `Coded_Shader` -- the
+  ordinal in front, `2_Seu00F1al` -- with no line of `_tags_clash`
+  changed: every tag is `[A-Za-z0-9_]` now, the alphabet its brute-force
+  check is over. A code point begins with a letter, so '色 彩' beside '色'
+  takes the ordinal (rightly: `u5F69_k` in the one is `k` in the other)
+  and 'Señal.001' beside 'Señal' does not, as Blender's own suffix never
+  did. (4) *What does not move.* A tag that was plain ASCII is the tag
+  it was, to the letter: the first substitution is the old line, and the
+  second touches only what no driver could read. That is every name the
+  pre-flight ever let through, punctuation in other scripts included
+  ('A—B' is still `A_B`), and with them `_cncode_main`,
+  `_cncode_baseColor`, `_cncode2_baseColor`, `_cncode_pattern` and the
+  tags the same-name test pins. It also means the double underscores
+  some ASCII names already make (`Group\/Coded Shader` is
+  `Group__Coded_Shader`, and a name with two spaces in a row makes one
+  too) are still made: pinned, on the footing they were, and not this
+  entry's to move. (5) *The strict gate.* `tests/glsl_strict.py` (the
+  tool, glslang) compiled no coded shader at all. `check_coded` compiles
+  the pass of eight pairs of names through the real exporter -- plain
+  ones, the two kinds of clash, 'Señal' beside 'Other' and beside a node
+  named 'Seu00F1al', Cyrillic beside CJK, one letter each, a full-width
+  digit beside a letter beyond the BMP -- as GLSL 4.30: eight of eight,
+  where the old flattening fails five by name. A refusal counts as a
+  failure there, because each of those names is meant to reach the
+  driver. `compile_source` now writes UTF-8 and decodes glslang's answer
+  leniently: glslang quotes ONE byte of the offending letter, and
+  decoding that strictly raised out of the check instead of failing the
+  shader by name. *Pictures that change*: none on the CPU. A frame
+  holding such a node shaded on the CPU and now shades on the GPU
+  wherever the GPU device is selected: 2.0e-5 off the CPU frame on the
+  simulator, the number the ASCII-named reference twins at, and both
+  frames bit for bit the frames of the same tree under ASCII names. In
+  the real Blender 5.2.2 the four materials above read the same: 2.0e-5,
+  bit for bit the reference's frames, the pre-flight silent. Pinned in
+  `test_code_node_non_ascii_name_reaches_the_gpu` (33 checks), through
+  the real `serialize_tree`: 'Señal' alone and beside 'Other' qualifying
+  and twinning (under 6e-3, no pixel over 1e-2), the CPU's frame and the
+  simulator's each bit for bit that of the same tree under ASCII names;
+  Cyrillic beside CJK, '色' beside '彩' and 'Señal' beside a node named
+  'Seu00F1al' the same; the `B_k` / `k` pair under 'Señal' / 'Señal B'
+  on the frame of unrelated names; the pass text plain ASCII, its six
+  mangled names exact, each an identifier and none holding `__`, the
+  device's sampler and uniform names with them, and the pre-flight
+  letting it through; the 1.92.0 flattening put back -- the plan
+  qualifying a text that is not ASCII, the pre-flight and the simulator
+  each refusing it by name, the CPU frame right all along -- so the
+  checks can tell; the spellings (a full-width digit, an Arabic-Indic
+  one, a superscript, a letter beyond the BMP); the pinned tags where
+  they were; over 16104 names up to four characters, all 7380 whose
+  flattening was plain ASCII unmoved, every tag in the alphabet, and the
+  runs of underscores the flattening's own, one for one; 399 names of
+  letters and digits alone spelling 399 tags without an underscore; the
+  clashing tags by name, one per node, none able to spell another's;
+  every name the port hands on under such a tag, a sampler's included;
+  and the rule read from the code (`_code_tag` spells through
+  `_code_spell` alone). Seventeen mutations each fail it: the old
+  flattening, in `_code_spell` or left behind in `_code_tag`; the
+  ASCII-only flatten; the code point between underscores, with a leading
+  one or with a trailing one; unpadded, lower-case or without its
+  letter; cut to 16 bits; one fixed letter for every such character;
+  every non-ASCII character spelled, punctuation too (tags the
+  pre-flight let through move); Latin-1 alone, the BMP alone, or letters
+  without digits; `_code_tag` without its clash check or without its
+  memory. *Seen from the same probes and left for their own fixes*: with
+  shadows on, the RAW text of a material pass declares `uniform
+  sampler2D hal_shadowpack;` once per shadowed lamp (beside each
+  `hal_shadow_vis<i>`), and with two such lamps -- the demo scene's --
+  glslang refuses it as a redefinition (declared once it compiles;
+  `strip_declarations` takes every such line off on the CreateInfo road,
+  so only the legacy constructor would hand a driver the raw text) --
+  the strict gate plans every scene with shadows off and has never seen
+  it, which is why `check_coded` plans that way too; and a comment in
+  another script inside the user's own GLSL travels in the pass as
+  written (the front-end and glslang both skip it; no driver was asked).
 - **A uniform the driver stripped never fails a pass (the llvmpipe field
   log).** A real Blender 5.2.2 session on the OpenGL backend (Mesa
   llvmpipe) printed, for every GPU frame, `rasterising on the CPU: raster
@@ -360,6 +716,127 @@ below was reproduced headless before it was fixed and is pinned in
   namespace with no `persistent` and no undo / load lists (the Coded
   Shader test above raised on it in the full run); the stub is lent
   inside a try / finally and restored, and the test checks the hand-back.
+- **A colour wired straight into a shader socket is an Emission on both
+  roads (the deferred pass qualified and drew it as the albedo).** A
+  Material Output whose Surface socket is fed by a COLOUR output -- no
+  shader node in between, the quick way to look at a texture -- drew two
+  pictures of one graph. *Which road was right: neither.* The CPU read
+  the socket through `nodeeval.coerce(v, SHADER)`, which hands anything
+  that is not a closure an EMPTY one, so `closure_to_surface` shaded the
+  material's fallback surface (the viewport colour under the default
+  model) exactly as if nothing were wired. The deferred probe saw that
+  same empty closure -- no lobe to refuse -- and
+  `gpu/material.assemble_frame` casts whatever feeds Surface into the
+  pass's one colour chain, the albedo. Reproduced headless before the
+  fix, on the demo Ball at 128x96 (`R.render` against
+  `gpu/shade.simulate`): the plan QUALIFIED and the simulator frame was
+  1.69 off the CPU's, more than 1e-2 off on all 598 pixels of the
+  material (CPU mean (1.17, 1.17, 1.20), which is the frame of an
+  unwired socket; simulator (1.31, 0.45, 0.17)). A value read 0.96 off
+  and a vector 3.38; a Coded Shader's Color 1.68 (the test's striped
+  shader; the report's own read 1.50) -- the wiring, not the node type;
+  and the same split sat on the Mix Shader's (0.51) and the Add
+  Shader's (2.04) shader inputs. Blender's own rule is neither
+  picture: `ntree_shader_implicit_closure_cast` puts an Emission node on
+  every link from a non-shader socket into a shader socket before EEVEE
+  compiles the tree, and Cycles' `ShaderGraph::connect` adds the same
+  node as its automatic conversion (colour one, Strength 1, a float into
+  Strength). (1) *The CPU reads Blender's conversion.*
+  `core/nodeeval.link_closure` is what a LINK hands a shader socket: a
+  closure passes through, and a colour, a value or a vector becomes ONE
+  EMISSION lobe -- `to_color` of the value, weight 1, Strength 1, the
+  very lobe an Emission node hands on, so the frame is the explicit
+  node's bit for bit. `GraphEvaluator.input` calls it for every linked
+  SHADER read, which is every shader socket there is: the Material and
+  World Output's Surface, the Mix and Add Shader inputs, the Max blends'
+  sub-materials, a group's shader sockets, Shader to RGB. An output with
+  no value (a renamed socket, a node that raised) and an UNLINKED shader
+  socket stay the empty closure. (2) *The deferred plan refuses it by
+  name.* The frame pass emits one colour chain into the diffuse term and
+  has no slot for a raw emission lobe (the Emission node's own standing
+  refusal), so `gpu/shade._probe_material` refuses the lobe -- it is
+  marked `implicit` -- with `IMPLICIT_EMISSION_REFUSAL`: "a colour, value
+  or vector output is wired straight into a shader socket: that is an
+  Emission of it (Blender's implicit conversion, the picture the CPU
+  shades), and the frame pass emits only the diffuse chain -- this
+  material shades on the CPU exactly (a Halcyon Shader in between, the
+  chain in its Diffuse Color or Self-Illumination, puts it on the
+  driver)". It refuses on the lobe's PRESENCE, never its weight: the
+  probe reads sixteen fragments, and a Mix Shader's Fac mask can read 0
+  on every one of them while the emitter still mixes the link into the
+  albedo elsewhere. (3) *This changes pictures.* On the CPU device such a
+  material rendered its fallback surface and now adds the wired colour
+  as emitted light, without the fallback's highlight (a plain closure
+  with no glossy lobe has specular level 0 -- the Emission node's
+  picture); on the demo frame every pixel off the material is bitwise
+  what it was. On the GPU device it rendered the colour as a lit albedo
+  and now renders the CPU's frame, with the reason printed once. A
+  colour wired into the WORLD Output's Surface was ignored (the world
+  fell through to its image, blend or flat colour) and is the sky now,
+  bitwise the Background node at Strength 1; the GPU sky pass already
+  refuses, by name, every world graph but a lone Background with
+  constant inputs. Graphs without such a link are untouched: the
+  conversion happens on that link and nowhere else. (4) *Considered and
+  left.* Twinning it instead -- routing the chain to the pass's emission
+  term, as the specular slot routing did for a lone GLOSSY lobe -- would
+  lift the Emission node's refusal with it and is its own piece of work
+  (the corner road lights emission in the corners; the layer and hit
+  passes each need the route proven); it stays queued, and until then
+  the two devices draw the same frame. And that frame is Halcyon's
+  Emission node's, not Cycles': with no DIFFUSE lobe in the closure
+  `closure_to_surface` leaves the material's fallback diffuse LIT under
+  the glow, where Blender shades black. That rule also reads its batch
+  (`np.any(diff_w > 1e-6)`: a pure-emission pixel has diffuse level 0
+  when a diffuse pixel shares its batch and level 1 when it is alone --
+  seen at the function, not hunted in a frame). Recorded, not changed:
+  every Emission-node material's picture hangs on it. Pinned in
+  `test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads`
+  (53 checks) for a colour, a value and a vector: the CPU frame bitwise
+  the Emission node's; the wired colour arriving as exactly itself over
+  the fallback (frame(colour) - frame(black) within 1e-6 on every pixel
+  of the Ball); the refusal word for word; and the road it names -- a
+  Halcyon Shader in between, either socket -- qualifying with the
+  simulator frame the CPU frame at the twin bar (measured 4.8e-6; the
+  bar is under 6e-3 with no pixel over 1e-2). Then the Mix and Add
+  Shader inputs, Fac 0, a Reroute on the way and a Coded Shader's
+  output; the unwired socket and a Diffuse BSDF in between still
+  twinning; the Emission node keeping its own refusal; the GPU device
+  road on the fake driver returning the CPU frame bit for bit; the World
+  Output. Ten mutations of the fix each fail it.
+- **A moved object under a still camera rendered from stale caches.**
+  The CPU's G-buffer cache (R170) keys on a mesh fingerprint and the
+  camera, and the fingerprint read the vertex positions as a strided
+  sum. A translation whose components cancel -- the demo ball moved by
+  (0.3, -0.3, 0), a grid-snapped (1, -1, 0) -- kept that sum, so with the
+  camera unmoved the CPU restored the previous frame's raster (`gbuf
+  HIT`) and shaded the old positions: 1.80 against the GPU's freshly
+  rastered twin, 7.6e-6 in a fresh process. A viewport with a still
+  camera and every motion-blur slice reach that road. A strided sum has
+  a second blind spot, and three more caches shared it: an object lying
+  wholly between the stride's samples (a 24-vertex box in a
+  40,000-vertex scene: stride 79, not one of its vertices read) kept the
+  mesh key, the BVH cache's key, the BVH upload key and the shadow maps'
+  base signature for ANY move -- the box drawn, shadowed and ray-shadowed
+  where it used to stand (1.62 / 1.72 / 1.72 against a fresh render).
+  `core/mathx.content_digest` -- the CRC-32 of every position byte, one
+  pass measured at ~2 us for the demo scene, ~60 us for 20,000 vertices
+  and ~0.6 ms for 200,000 -- now sits beside the sums in
+  `gpu/shade._mesh_key` (the one function behind the G-buffer cache, the
+  plan and the triaux / sres / attribute uploads),
+  `core/render._cached_bvh`, `gpu/rtrace.bvh_fingerprint` and
+  `core/lights._shadow_base_signature`. Per-axis weights on the strided
+  sum were weighed and left: beside the plain sum they still pass a
+  (2, -3, 1) move, and no strided statistic sees between the samples.
+  A re-export of an unmoved scene keeps every key and still hits.
+  Pinned in `tests/test_r253_generated_coords.py`
+  (`test_d_moved_objects_miss_the_frame_caches`: the frame after each
+  move is bitwise a fresh render with no cache cleared, the GPU twin
+  7.6e-6) and in `test_r253_review`'s signature test, which asserted the
+  translation KEPT the mesh key and now asserts it changes while the
+  plan signature still fingerprints the baked frame on its own. Left as
+  they were: the normal, UV, material-index and triangle-index parts of
+  the mesh key are still strided sums (a UV edit confined to unsampled
+  rows, or one that cancels, does not re-upload the attribute texture).
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
@@ -415,6 +892,39 @@ below was reproduced headless before it was fixed and is pinned in
   real Blender 5.2.2 as the `bpy` module, background, which is also the
   first real-Blender sight of the entry above's background road: the
   node saved flagged came back rebuilt by `load_post`.)
+- The Coded Shader's one source on a real driver. The fix is proven on
+  the simulator and, through the registered node and `export_material`,
+  in a real Blender 5.2.2 as the `bpy` module in background (the
+  Text-sourced node 1.46 off before, 1e-5 after) -- never on a GPU and
+  never in the UI. Open there: a Text-sourced coded shader's pass
+  compiling and matching on the driver; an edit in the Text Editor
+  followed by a render drawing the new shader (one re-plan per edit);
+  the emptied Text's line in the node's error box at the node's width,
+  and the same line in the F12 report; and a 1.92.0 file whose Coded
+  Shader holds an empty Text opening to zeros with that warning.
+- Same-named Coded Shaders across trees, in the UI and on a driver.
+  The fix is proven headless and in a real Blender 5.2.2 as the `bpy`
+  module in background (a real node group holding a default-named Coded
+  Shader beside the material's own: 1.52 off before, bit for bit after)
+  -- never in the UI and never on a GPU. Open there: the viewport and
+  an F12 of such a file drawing each node's own shader; two coded
+  shaders in one tree named 'Coded Shader' and 'Coded_Shader' compiling
+  and matching on the driver under the ordinal tag
+  (`_cn2_Coded_Shader_main`); and the F12 report naming a group's
+  failing Coded Shader by its path ("Group/Coded Shader: ...").
+- A Coded Shader named in another script, on a real driver. The fix is
+  proven on the simulator, on the device's pre-flight, on glslang 15.1
+  (the pass as GLSL 4.30) and, through the registered node and
+  `export_material`, in a real Blender 5.2.2 as the `bpy` module in
+  background (refused before, 2.0e-5 after) -- never on a GPU and never
+  in the UI. Open there: a node renamed 'Señal' (and one in Cyrillic or
+  CJK) in a live file compiling and matching on the OpenGL, Vulkan and
+  Metal backends under its code-point tag (`_cnSeu00F1al_main`), with no
+  "shading on the CPU: the driver rejected ..." line in the console; and
+  the double underscores that names with runs of punctuation make as
+  they always did (`_cnGroup__Coded_Shader_main`), which glslang takes
+  with a warning under desktop and Vulkan rules and which no driver and
+  no Metal toolchain has been asked about.
 - The llvmpipe session itself (Blender 5.2.2, OpenGL backend, Mesa
   llvmpipe): the three lines gone, `raster split` and `shade split`
   printed in their place, and the Timing Breakdown naming the stripped
@@ -425,3 +935,11 @@ below was reproduced headless before it was fixed and is pinned in
   way), whether `uniform_sampler` raises for a stripped sampler on that
   backend (it is skipped if it does), and a Vulkan session printing no
   stripped line at all.
+- A colour wired straight into a shader socket in a live node editor
+  (proven against hand-built graphs alone): Blender drawing the link
+  valid and `serialize_tree` exporting it with the source socket's own
+  type, for the Material Output's Surface, a Mix Shader input and the
+  World Output; the F12 console's `shading on the CPU:` line naming the
+  wiring on the GPU device; the same file in EEVEE beside it, where the
+  surface under the glow is black and Halcyon's is its lit fallback
+  (the open item above).

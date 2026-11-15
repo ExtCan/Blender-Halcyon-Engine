@@ -25,6 +25,12 @@ reach a driver). R253 (field): the compute RASTER is covered too, as a
 header the CreateInfo writes: the images, the samplers and
 `craster.RASTER_FLOATS`, over `device.strip_declarations(source)`. A push
 constant the dispatch names and the text lost, or the reverse, fails here.
+R253 (review): the Coded Shader's pass too, by NODE NAME -- the node's
+graph id is the tag its GLSL names are mangled under (gpu/emit._code_tag),
+the one place a name the user typed reaches the driver. A name in another
+script ('Señal', Cyrillic, CJK) went into the identifiers letter for
+letter; the tag spells those as code points now, and the pass of each
+compiles here beside the plain names and the two kinds of clash.
 Not covered: the ray kernels (gpu/rtrace, their push constants are listed
 at each call) and the ink pass (built per frame from a job).
 """
@@ -54,14 +60,20 @@ def _glslang():
 
 
 def compile_source(src, stage='frag'):
-    """(ok, message) from glslang on `src` with a 4.30 version line."""
-    with tempfile.NamedTemporaryFile('w', suffix=f'.{stage}', delete=False) as fh:
+    """(ok, message) from glslang on `src` with a 4.30 version line.
+
+    Bytes both ways: the text is written as UTF-8 and the message decoded
+    leniently. A source holding a letter outside ASCII is exactly what
+    this tool exists to report, and glslang quotes ONE byte of it in its
+    error -- decoding that strictly raised out of the check instead of
+    failing the shader by name."""
+    with tempfile.NamedTemporaryFile('w', suffix=f'.{stage}', delete=False,
+                                     encoding='utf-8') as fh:
         fh.write('#version 430 core\n' + src)
         path = fh.name
     try:
-        r = subprocess.run([_glslang(), '-S', stage, path], capture_output=True,
-                           text=True)
-        return r.returncode == 0, (r.stdout + r.stderr).strip()
+        r = subprocess.run([_glslang(), '-S', stage, path], capture_output=True)
+        return r.returncode == 0, (r.stdout + r.stderr).decode('utf-8', 'replace').strip()
     finally:
         os.unlink(path)
 
@@ -217,6 +229,32 @@ def check_compute_raster():
     print(f'  compute raster: {counts}')
 
 
+def check_coded():
+    """R253 (review): the Coded Shader's pass under the names a node can
+    carry -- the real node class through the real exporter
+    (test_r253_review's stand-ins), two coded shaders summed into the
+    master. A refusal is a failure HERE: every one of these names is
+    meant to reach the driver. Runs last: it installs the bpy stub."""
+    import importlib
+    from . import fakebpy
+    fakebpy.install()
+    from . import test_r253_review as RV
+    SN = importlib.import_module('halcyon.nodes.shader_nodes')
+    counts = {'ok': 0, 'refused': 0, 'bad': 0}
+    for pair in (('Coded Shader', 'Other'), ('Coded Shader', 'Coded_Shader'), ('Coded', 'Coded B'),
+                 ('Señal', 'Other'), ('Señal', 'Seu00F1al'), ('Шейдер', '色彩'), ('色', '彩'),
+                 ('層３', '\U0001d6fc glow')):
+        graph, programs, _warns = RV._code_exported(RV._code_two(SN, *pair))
+        src, _binds, why = RV._code_pass(graph, programs, shadows=False, size=(24, 18))
+        label = 'coded shaders %r beside %r' % pair
+        got = _record(label, None if src is None else [src], why)
+        if got == 'refused':
+            FAILS.append(f'{label}: refused ({why})')
+            print(f'  FAIL {label}\n       refused: {why}')
+        counts[got] += 1
+    print(f'  coded shaders by node name: {counts}')
+
+
 def main():
     utf8_console()
     FAILS.clear()
@@ -227,7 +265,7 @@ def main():
         return 0
     print(f'glsl_strict: {_glslang()}')
     for fn in (check_models, check_console, check_masters, check_stages,
-               check_sky_and_kernels, check_compute_raster):
+               check_sky_and_kernels, check_compute_raster, check_coded):
         try:
             fn()
         except Exception as exc:                                # noqa: BLE001
