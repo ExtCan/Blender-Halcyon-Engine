@@ -1564,23 +1564,37 @@ def _iter_trees():
                 yield tree
 
 
+def _pending_code_nodes(tree):
+    """The coded shader nodes of one tree still flagged for a rebuild."""
+    return [node for node in list(getattr(tree, 'nodes', ()))
+            if getattr(node, 'bl_idname', '') == 'HALCYON_CodeNode'
+            and getattr(node, 'needs_rebuild', False)]
+
+
 def _run_rebuilds():
     """Recompile every node that asked for it, outside any update callback.
 
     Nothing is carried across the timer except a flag stored on the nodes
     themselves -- holding a node pointer across a callback is its own way to
     crash, because the tree may have been rebuilt in between.
+
+    R253 (review): the rebuild is deliberately NOT an undo step of its own.
+    The flag is what the undo stack carries (the step Blender pushes for the
+    edit encodes needs_rebuild with the old sockets, because the push runs
+    before this timer), and _rearm_code_rebuilds runs this again whenever
+    undo, redo or a file load lands on such a state -- the sockets are
+    derived data, re-derived on arrival. A step pushed from here would land
+    on top of the state an undo had just restored: the redo stack would be
+    cut and Ctrl+Z could never get past the flagged step.
     """
     _REBUILD_QUEUED[0] = False
     for tree in _iter_trees():
-        for node in list(getattr(tree, 'nodes', ())):
-            if node.bl_idname == 'HALCYON_CodeNode' and \
-                    getattr(node, 'needs_rebuild', False):
-                node.needs_rebuild = False
-                try:
-                    node.compile_source()
-                except Exception as exc:                        # noqa: BLE001
-                    node.error = f'{type(exc).__name__}: {exc}'
+        for node in _pending_code_nodes(tree):
+            node.needs_rebuild = False
+            try:
+                node.compile_source()
+            except Exception as exc:                            # noqa: BLE001
+                node.error = f'{type(exc).__name__}: {exc}'
     return None                       # one-shot
 
 
@@ -1596,10 +1610,14 @@ def _node_key(node):
 
 
 def _schedule_rebuild():
-    if _REBUILD_QUEUED[0]:
-        return
-    _REBUILD_QUEUED[0] = True
     try:
+        # R253 (review): the queued flag is checked against Blender, never
+        # trusted alone. File > Open drops a pending non-persistent timer,
+        # and the flag it left set kept every later rebuild from being
+        # scheduled for the rest of the session (the marshal pump's disease)
+        if _REBUILD_QUEUED[0] and bpy.app.timers.is_registered(_run_rebuilds):
+            return
+        _REBUILD_QUEUED[0] = True
         bpy.app.timers.register(_run_rebuilds, first_interval=0.0)
     except Exception:                                           # noqa: BLE001
         # no timer available (headless, or during registration): do it now,
@@ -1821,6 +1839,12 @@ class HALCYON_OT_compile_shader(bpy.types.Operator):
         node = tree.nodes.get(self.node) or context.active_node
         if node is None or node.bl_idname != 'HALCYON_CodeNode':
             return {'CANCELLED'}
+        # R253 (review): the button IS the pending rebuild, so it clears
+        # the flag before it compiles -- the undo step this operator pushes
+        # then holds the new sockets with needs_rebuild False, and landing
+        # on it never re-arms a second rebuild (_rearm_code_rebuilds)
+        if getattr(node, 'needs_rebuild', False):
+            node.needs_rebuild = False
         prog = node.compile_source()
         if prog is None:
             self.report({'ERROR'}, node.error or "Compile failed")
@@ -5623,9 +5647,10 @@ PROP_TIPS = {
         "subset or the HLSL one. Both compile to the same portable "
         "program and render identically on CPU and GPU",
     ('HALCYON_CodeNode', 'needs_rebuild'):
-        "Set while the source is newer than the compiled program -- "
-        "compile bookkeeping the Build button clears, not a look "
-        "control",
+        "Set while the source is newer than the node's sockets -- "
+        "compile bookkeeping the pending rebuild (or the Compile "
+        "button) clears, and that undo, redo and a file load re-arm "
+        "when they bring it back; not a look control",
     ('HALCYON_CodeNode', 'source_text'):
         "The name of the Text datablock holding this shader's "
         "source, when it is edited in the Text Editor instead of the "
@@ -6216,6 +6241,44 @@ def _migrate_master_sockets(_arg=None):
         pass
 
 
+#: the events after which a coded shader node can come back flagged
+_REARM_EVENTS = ('undo_post', 'redo_post', 'load_post')
+
+
+# R253 (review): persistent, like its neighbour -- it must outlive the very
+# file load it answers, and every one after
+@_persistent
+def _rearm_code_rebuilds(*_args):
+    """undo_post / redo_post / load_post: a restored pending rebuild runs.
+
+    A coded shader's language / source update callbacks may only FLAG the
+    rebuild (needs_rebuild) and leave the sockets to the _run_rebuilds
+    timer. Blender pushes the edit's undo step before that timer fires, so
+    the step holds needs_rebuild True with the OLD sockets -- and memfile
+    undo restores datablocks without firing a single update callback, which
+    was the only road to _schedule_rebuild. Redo (or an undo from a later
+    step) therefore brought back a node with stale sockets and a flag
+    nothing would ever read, and a file saved in that state carried it into
+    the next session. Every landing is scanned here instead, and a flagged
+    node gets its rebuild scheduled exactly as a fresh edit would.
+
+    The rebuild stays outside the undo stack on purpose (_run_rebuilds says
+    why). In background mode there is no main loop to fire a timer, and a
+    handler is not an update callback, so the rebuild runs here directly --
+    a render farm opening a file saved flagged gets its sockets before the
+    frame is exported.
+    """
+    try:
+        if not any(_pending_code_nodes(tree) for tree in _iter_trees()):
+            return
+        if getattr(bpy.app, 'background', False):
+            _run_rebuilds()
+        else:
+            _schedule_rebuild()
+    except Exception:                                           # noqa: BLE001
+        pass
+
+
 def register():
     global _menu_owner
     from . import pattern_nodes
@@ -6242,6 +6305,16 @@ def register():
         _migrate_master_sockets()          # the already-open file too
     except Exception:                                           # noqa: BLE001
         pass
+    # R253 (review): a coded shader's pending rebuild survives undo, redo
+    # and File > Open (the flag comes back without its update callback)
+    for name in _REARM_EVENTS:
+        try:
+            hs = getattr(bpy.app.handlers, name)
+            if _rearm_code_rebuilds not in hs:
+                hs.append(_rearm_code_rebuilds)
+        except Exception:                                       # noqa: BLE001
+            pass
+    _rearm_code_rebuilds()                 # the already-open file too
 
 
 def unregister():
@@ -6251,6 +6324,13 @@ def unregister():
             hs.remove(_migrate_master_sockets)
     except Exception:                                           # noqa: BLE001
         pass
+    for name in _REARM_EVENTS:
+        try:
+            hs = getattr(bpy.app.handlers, name)
+            while _rearm_code_rebuilds in hs:
+                hs.remove(_rearm_code_rebuilds)
+        except Exception:                                       # noqa: BLE001
+            pass
     from . import max_nodes
     max_nodes.unregister()
     from . import pattern_nodes

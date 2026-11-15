@@ -258,17 +258,30 @@ class _Timers:
 
     def __init__(self):
         self.fns = []
+        self._persistent = set()
 
     def register(self, fn, first_interval=0.0, persistent=False):
         if fn not in self.fns:
             self.fns.append(fn)
+        if persistent:
+            self._persistent.add(fn)
+        else:
+            self._persistent.discard(fn)
 
     def unregister(self, fn):
         if fn in self.fns:
             self.fns.remove(fn)
+        self._persistent.discard(fn)
 
     def is_registered(self, fn):
         return fn in self.fns
+
+    def on_file_load(self):
+        """BLI_timer_on_file_load: File > Open drops every timer that was
+        not registered persistent, pending or not."""
+        for fn in list(self.fns):
+            if fn not in self._persistent:
+                self.unregister(fn)
 
     def pump(self):
         """Run each registered timer once; a None return unregisters it,
@@ -294,6 +307,41 @@ _handlers = types.SimpleNamespace(
 
 app = types.SimpleNamespace(version=(5, 2, 0), background=True,
                             timers=_Timers(), handlers=_handlers)
+
+
+def fire(name, *args):
+    """Run one bpy.app.handlers list the way Blender runs it (the test IS
+    the event that fires it): every handler in order; a function declaring
+    exactly ONE positional parameter is handed the first argument alone,
+    any other the (id, depsgraph) pair -- bpy_app_handlers.cc's
+    choose_arguments. A handler that raises is printed and the rest still
+    run, as in Blender."""
+    import traceback
+    pair = (tuple(args) + (None, None))[:2]
+    for fn in list(getattr(_handlers, name)):
+        code = getattr(fn, '__code__', None)
+        try:
+            fn(*(pair[:1] if code is not None and code.co_argcount == 1
+                 else pair))
+        except Exception:                                       # noqa: BLE001
+            traceback.print_exc()
+
+
+def file_load(filepath=''):
+    """What File > Open does to Python's hooks, in Blender's order:
+    load_pre runs, every timer not registered persistent is dropped
+    (BLI_timer_on_file_load), every handler without the _bpy_persistent
+    mark is removed from every list (BPY_app_handlers_reset), then
+    load_post runs with the file's path. Memfile undo does none of the
+    dropping -- an undo is `fire('undo_post', scene)` alone."""
+    fire('load_pre', filepath)
+    app.timers.on_file_load()
+    for hooks in vars(_handlers).values():
+        if isinstance(hooks, list):
+            hooks[:] = [fn for fn in hooks if hasattr(fn, '_bpy_persistent')]
+    fire('load_post', filepath)
+
+
 class _Collection:
     def __init__(self, factory=None):
         self._items = []

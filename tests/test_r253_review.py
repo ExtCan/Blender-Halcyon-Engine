@@ -36,6 +36,13 @@ pinned where it bit.
     residual by the 1e-6 span clamp and read +/-0.5 of noise on its flat
     axis; `_gen_span` gives a flat axis of a transformed object the span
     1.0 (an identity object keeps the 1.91 bits).
+(11) The Coded Shader's language / source update callbacks only flag the
+    socket rebuild and a one-shot timer does it -- after Blender has
+    pushed the edit's undo step, so the step holds needs_rebuild with the
+    OLD sockets and memfile undo brings it back without the callback that
+    arms the timer. Persistent undo_post / redo_post / load_post handlers
+    (`_rearm_code_rebuilds`) schedule the rebuild on every landing; the
+    Compile operator clears the flag in its own step.
 """
 import io
 import os
@@ -595,6 +602,352 @@ def test_field_display_pin_on_transitions_only():
         fn = getattr(_il.import_module(modname), fname)
         check(f'{fname} is a persistent handler (it survives File > Open)',
               hasattr(fn, '_bpy_persistent'), str(list(vars(fn).keys())))
+
+
+_CODE_A = """\
+uniform float gain = 1.0;
+uniform vec3  tint = vec3(1.0, 0.5, 0.25);
+
+out vec4 Color;
+
+void main() {
+    Color = vec4(tint * gain, 1.0);
+}
+"""
+
+_CODE_B = """\
+uniform float  gain    = 1.0;
+uniform float3 edge    = float3(0.2, 0.4, 0.8);
+uniform float  stripes = 8.0;
+
+in float3 vPosition;
+
+out float4 Color;
+
+void main() {
+    float s = step(0.5, frac(vPosition.z * stripes));
+    Color = float4(edge * gain * lerp(0.5, 1.0, s), 1.0);
+}
+"""
+
+
+class _CodeSock:
+    """One node socket: exactly what rebuild_sockets reads and writes."""
+    _DEFAULTS = {'NodeSocketFloat': 0.0, 'NodeSocketInt': 0, 'NodeSocketBool': False,
+                 'NodeSocketVector': (0.0, 0.0, 0.0), 'NodeSocketColor': (0.0, 0.0, 0.0, 1.0)}
+
+    def __init__(self, node, stype, name):
+        self.node, self.bl_idname, self.name = node, stype, name
+        self.links = []
+        self.halcyon_uniform = self.halcyon_key = ''
+        self.halcyon_is_image = False
+        if stype in self._DEFAULTS:
+            self.default_value = self._DEFAULTS[stype]
+
+
+class _CodeSockets(list):
+    """node.inputs / node.outputs: new / get / clear and by-name indexing;
+    clearing takes the sockets' links with it, as Blender does."""
+
+    def __init__(self, node):
+        super().__init__()
+        self.node = node
+
+    def new(self, stype, name):
+        sock = _CodeSock(self.node, stype, name)
+        self.append(sock)
+        return sock
+
+    def get(self, name, default=None):
+        return next((s for s in self if s.name == name), default)
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return next(s for s in self if s.name == key)
+        return super().__getitem__(key)
+
+    def clear(self):
+        for sock in self:
+            for link in list(sock.links):
+                self.node.id_data.links.remove(link)
+        super().clear()
+
+
+class _CodeLinks(list):
+    def new(self, from_socket, to_socket):
+        link = types.SimpleNamespace(from_node=from_socket.node, from_socket=from_socket,
+                                     to_node=to_socket.node, to_socket=to_socket)
+        self.append(link)
+        from_socket.links.append(link)
+        to_socket.links.append(link)
+        return link
+
+    def remove(self, link):
+        for sock in (link.from_socket, link.to_socket):
+            sock.links[:] = [l for l in sock.links if l is not link]
+        self[:] = [l for l in self if l is not link]
+
+
+class _CodeNodes(list):
+    def get(self, name, default=None):
+        return next((n for n in self if n.name == name), default)
+
+
+def _code_tree(SN, source, name='Coded'):
+    """A material whose tree is Value -> Coded Shader -> Material Output,
+    the coded node being the REAL class run against stand-in sockets."""
+    tree = types.SimpleNamespace(name=name, nodes=_CodeNodes(), links=_CodeLinks())
+
+    def plain(nm, idname, ins=(), outs=()):
+        node = types.SimpleNamespace(name=nm, bl_idname=idname, id_data=tree)
+        node.inputs, node.outputs = _CodeSockets(node), _CodeSockets(node)
+        for stype, sn in ins:
+            node.inputs.new(stype, sn)
+        for stype, sn in outs:
+            node.outputs.new(stype, sn)
+        tree.nodes.append(node)
+        return node
+
+    value = plain('Value', 'ShaderNodeValue', outs=(('NodeSocketFloat', 'Value'),))
+    out = plain('Material Output', 'ShaderNodeOutputMaterial', ins=(('NodeSocketShader', 'Surface'),))
+    code = SN.HALCYON_CodeNode()
+    code.name, code.id_data = 'Coded Shader', tree
+    code.language, code.source, code.source_text = 'GLSL', source, ''
+    code.as_surface, code.auto_compile, code.needs_rebuild = False, True, False
+    code.error = code.warn = ''
+    code.inputs, code.outputs = _CodeSockets(code), _CodeSockets(code)
+    tree.nodes.append(code)
+    code.init(None)
+    tree.links.new(value.outputs['Value'], code.inputs['Gain'])
+    tree.links.new(code.outputs['Color'], out.inputs['Surface'])
+    return types.SimpleNamespace(name=name, use_nodes=True, node_tree=tree)
+
+
+class _MemfileUndo:
+    """Blender's memfile undo as far as Python can see it: a push encodes
+    the datablocks as they stand at that instant; landing on a step swaps
+    in fresh copies of them (new pointers) and fires NOT ONE update
+    callback -- undo_post / redo_post are all an add-on hears."""
+
+    def __init__(self, bpy):
+        self.bpy, self.steps, self.at = bpy, [], -1
+
+    def push(self):
+        import copy
+        del self.steps[self.at + 1:]
+        self.steps.append(copy.deepcopy(list(self.bpy.data.materials)))
+        self.at = len(self.steps) - 1
+
+    def restore(self, index):
+        import copy
+        self.at = index
+        self.bpy.data.materials[:] = copy.deepcopy(self.steps[index])
+
+
+def test_code_node_rebuild_survives_undo_redo_and_load():
+    """A coded shader's update callbacks may only FLAG the socket rebuild
+    (needs_rebuild) and leave the topology to a one-shot timer. Blender
+    pushes the edit's undo step BEFORE that timer runs, so the step holds
+    the flag with the OLD sockets, and memfile undo brings it back without
+    an update callback -- the only road to the timer. Redo (and an undo
+    from any later step) left a node with stale sockets and a flag nobody
+    would read; a file saved there carried it into the next session.
+    Persistent undo_post / redo_post / load_post handlers re-arm it."""
+    import ast
+    import importlib
+    import inspect
+    import textwrap
+    from . import fakebpy
+    bpy = fakebpy.install()
+    SN = importlib.import_module('halcyon.nodes.shader_nodes')
+    handlers, timers = bpy.app.handlers, bpy.app.timers
+    events = ('undo_post', 'redo_post', 'load_post')
+    scene = types.SimpleNamespace(name='Scene')
+    text_a = types.SimpleNamespace(name='shader_a', as_string=lambda: _CODE_A)
+    text_b = types.SimpleNamespace(name='shader_b', as_string=lambda: _CODE_B)
+
+    def names(socks):
+        return [s.name for s in socks]
+
+    def node(tree=None):
+        return (tree or bpy.data.materials[0].node_tree).nodes.get('Coded Shader')
+
+    def queued():
+        return timers.is_registered(SN._run_rebuilds)
+
+    def whole(n, stripes=8.0):
+        """The rebuilt node: the new source's sockets, the flag down, the
+        links that still have somewhere to go."""
+        return (not n.needs_rebuild and names(n.inputs) == ['Gain', 'Edge', 'Stripes']
+                and names(n.outputs) == ['Color'] and n.inputs['Stripes'].default_value == stripes
+                and [(l.from_node.name, l.from_socket.name) for l in n.inputs['Gain'].links] == [('Value', 'Value')]
+                and [(l.to_node.name, l.to_socket.name) for l in n.outputs['Color'].links]
+                == [('Material Output', 'Surface')])
+
+    def stale(n):
+        return n.needs_rebuild and n.language == 'HLSL' and names(n.inputs) == ['Gain', 'Tint']
+
+    def state(n):
+        return f'flag={n.needs_rebuild} lang={n.language} in={names(n.inputs)} queued={queued()}'
+
+    # everything this test touches in the shared stub goes back as it was
+    saved_hooks = {k: list(v) for k, v in vars(handlers).items() if isinstance(v, list)}
+    saved_timers = (list(timers.fns), set(timers._persistent))
+    saved_mats, saved_bg, saved_q = bpy.data.materials, bpy.app.background, SN._REBUILD_QUEUED[0]
+    had_groups = getattr(bpy.data, 'node_groups', None)
+    for name in events:
+        getattr(handlers, name)[:] = []
+    timers.fns[:] = []
+    bpy.data.materials = []
+    bpy.app.background = False             # an interactive session: timers fire
+    SN._REBUILD_QUEUED[0] = False
+    registered = False
+    try:
+        SN.register()
+        registered = True
+        fn = SN._rearm_code_rebuilds
+        check('register() puts the re-arm on undo_post, redo_post and load_post, once each',
+              all(getattr(handlers, e).count(fn) == 1 for e in events))
+        check('_rearm_code_rebuilds is a persistent handler (it survives File > Open)',
+              hasattr(fn, '_bpy_persistent'), str(list(vars(fn).keys())))
+
+        # ---- the edit, in Blender's order: callbacks, undo push, THEN the timer
+        bpy.data.materials.append(_code_tree(SN, text_a))
+        undo = _MemfileUndo(bpy)
+        n = node()
+        check('the node starts whole on the GLSL source', not n.needs_rebuild and names(n.inputs) == ['Gain', 'Tint'],
+              state(n))
+        undo.push()                                              # step 0
+        n.source = text_b
+        SN.HALCYON_CodeNode._source_changed(n, None)
+        n.language = 'HLSL'
+        SN.HALCYON_CodeNode._lang_changed(n, None)
+        check('the update callbacks only flag: the sockets are untouched and ONE timer is queued',
+              stale(n) and timers.fns.count(SN._run_rebuilds) == 1, state(n))
+        undo.push()                                              # step 1: flagged, OLD sockets
+        timers.pump()
+        check('the timer rebuilds outside the step: new sockets, flag down, links kept',
+              whole(n) and not queued(), state(n))
+        n.inputs['Stripes'].default_value = 12.0
+        undo.push()                                              # step 2: a later edit
+
+        # ---- undo from the later step lands on the flagged one
+        undo.restore(1)
+        n = node()
+        check('the restored step IS the flagged one, and the restore alone arms nothing (the 1.92.0 state)',
+              stale(n) and not queued(), state(n))
+        fakebpy.fire('undo_post', scene)
+        check('undo_post schedules the rebuild of the flagged node', queued(), state(n))
+        check('...and only schedules it: the handler itself changes no socket', stale(n), state(n))
+        timers.pump()
+        check('the scheduled rebuild leaves the node whole (the later edit undone, the Gain link kept)',
+              whole(node()) and not queued(), state(node()))
+
+        # ---- undo again: a clean step schedules nothing
+        undo.restore(0)
+        fakebpy.fire('undo_post', scene)
+        n = node()
+        check('a step with no flagged node schedules nothing',
+              not queued() and not n.needs_rebuild and n.language == 'GLSL' and names(n.inputs) == ['Gain', 'Tint'],
+              state(n))
+
+        # ---- Ctrl+Shift+Z: the field's symptom
+        undo.restore(1)
+        fakebpy.fire('redo_post', scene)
+        check('redo_post schedules the rebuild of the flagged node', queued() and stale(node()), state(node()))
+        timers.pump()
+        check('redo onto the flagged step ends whole', whole(node()) and not queued(), state(node()))
+        undo.restore(2)
+        fakebpy.fire('redo_post', scene)
+        check('redo onto the later step keeps its own edit and schedules nothing',
+              whole(node(), stripes=12.0) and not queued(), state(node()))
+
+        # ---- File > Open of a file saved flagged, with a rebuild still queued
+        undo.restore(1)
+        SN._schedule_rebuild()
+        check('a rebuild is queued when the load begins', queued() and SN._REBUILD_QUEUED[0])
+        probe = lambda *_a: None                                 # noqa: E731
+        handlers.load_post.append(probe)
+        fakebpy.file_load('/tmp/flagged.blend')
+        check('the load dropped the plain handler and kept the persistent re-arm',
+              probe not in handlers.load_post and fn in handlers.load_post)
+        check('load_post re-schedules although the dropped timer left its queued flag set',
+              queued() and stale(node()), f'{state(node())} flag={SN._REBUILD_QUEUED[0]}')
+        timers.pump()
+        check('the loaded file ends whole', whole(node()) and not queued(), state(node()))
+
+        # ---- a node group's tree is scanned too
+        group = _code_tree(SN, text_a, name='Group').node_tree
+        g = node(group)
+        g.source, g.language, g.needs_rebuild = text_b, 'HLSL', True
+        bpy.data.node_groups = [group]
+        fakebpy.fire('undo_post', scene)
+        check('a flagged node inside a node group is scheduled too', queued() and stale(g), state(g))
+        timers.pump()
+        check('...and rebuilt', whole(g), state(g))
+        bpy.data.node_groups = []
+
+        # ---- background: no main loop will ever fire a timer
+        bpy.app.background = True
+        undo.restore(1)
+        fakebpy.fire('load_post', '/tmp/flagged.blend')
+        check('in background the handler rebuilds at once and leaves no timer waiting',
+              whole(node()) and not queued(), state(node()))
+        bpy.app.background = False
+
+        # ---- the Compile button's own undo step is whole
+        undo.restore(1)
+        n = node()
+        op = SN.HALCYON_OT_compile_shader()
+        op.node, op.report = n.name, (lambda *_a: None)
+        ctx = types.SimpleNamespace(space_data=types.SimpleNamespace(edit_tree=n.id_data), active_node=None)
+        got = op.execute(ctx)
+        check('the Compile operator clears the flag as it rebuilds', got == {'FINISHED'} and whole(n),
+              f'{got} {state(n)}')
+        undo.push()                                              # the operator's REGISTER|UNDO step
+        undo.restore(undo.at)
+        fakebpy.fire('redo_post', scene)
+        check('landing on the step the operator pushed schedules nothing', not queued() and whole(node()),
+              state(node()))
+
+        # ---- the rules the fix stands on, read from the code itself
+        def calls(f):
+            tree = ast.parse(textwrap.dedent(inspect.getsource(f)))
+            return sorted({ast.unparse(c.func) for c in ast.walk(tree) if isinstance(c, ast.Call)})
+
+        topo = [c for f in (SN.HALCYON_CodeNode._lang_changed, SN.HALCYON_CodeNode._source_changed)
+                for c in calls(f)
+                if c.split('.')[-1] in ('new', 'clear', 'remove', 'compile_source', 'rebuild_sockets',
+                                        '_run_rebuilds')]
+        check('the update callbacks still only flag (no socket is made or cleared inside one)', not topo, str(topo))
+        pushes = [c for f in (SN._run_rebuilds, SN._schedule_rebuild, SN._rearm_code_rebuilds,
+                              SN.HALCYON_CodeNode.compile_source, SN.HALCYON_CodeNode.rebuild_sockets)
+                  for c in calls(f) if 'bpy.ops' in c or 'undo' in c.lower()]
+        check('the re-armed rebuild never pushes an undo step (one pushed after an undo would cut the redo '
+              'stack and trap Ctrl+Z on the flagged step)', not pushes, str(pushes))
+        check('needs_rebuild keeps its >= 40-character tooltip and its census reason',
+              len(SN.PROP_TIPS[('HALCYON_CodeNode', 'needs_rebuild')]) >= 40
+              and len(str(SN.HALCYON_CodeNode.__annotations__['needs_rebuild'].kw.get('description') or '')) >= 40)
+
+        SN.unregister()
+        registered = False
+        check('unregister() takes the re-arm off all three lists',
+              not any(fn in getattr(handlers, e) for e in events))
+    finally:
+        if registered:
+            SN.unregister()
+        for k, v in saved_hooks.items():
+            getattr(handlers, k)[:] = v
+        timers.fns[:] = saved_timers[0]
+        timers._persistent.clear()
+        timers._persistent.update(saved_timers[1])
+        bpy.data.materials, bpy.app.background = saved_mats, saved_bg
+        SN._REBUILD_QUEUED[0] = saved_q
+        if had_groups is None:
+            if hasattr(bpy.data, 'node_groups'):
+                del bpy.data.node_groups
+        else:
+            bpy.data.node_groups = had_groups
 
 
 def main():

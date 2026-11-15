@@ -164,6 +164,58 @@ below was reproduced headless before it was fixed and is pinned in
   had just left; (9) *view_update pins through the transition table*
   too, so a rendered viewport no longer re-applies undone Color
   Management edits on every depsgraph poke.
+- **The Coded Shader's socket rebuild survives undo, redo and File >
+  Open.** The node's Language and Text update callbacks may only FLAG the
+  rebuild (`needs_rebuild` -- sockets are never made or cleared inside an
+  RNA update) and a one-shot `bpy.app.timers` function, `_run_rebuilds`,
+  does it on the main loop's next pass. Blender pushes the edit's undo
+  step before that timer runs (5.2's own order: `ui_apply_but_funcs_after`
+  pushes inside the event handlers, `wm_event_do_notifiers` runs the
+  timers after them), so the step holds `needs_rebuild` True with the
+  OLD sockets and the rebuild lands outside any step; memfile undo then
+  restores datablocks without firing one update callback -- the only
+  road to `_schedule_rebuild`. Ctrl+Shift+Z onto such a step
+  (or Ctrl+Z onto it from a later one) brought back a node with stale
+  sockets, the flag up and nothing to read it; the next Coded Shader
+  edit anywhere rebuilt it by accident, and a file saved in between
+  carried the state into the next session. (1) *Every landing re-arms.*
+  `_rearm_code_rebuilds`, a persistent handler on `undo_post`,
+  `redo_post` and `load_post` (once each, and run for the already-open
+  file at registration), scans every material, world and node-group
+  tree for a flagged Coded Shader and schedules the rebuild exactly as a
+  fresh edit would. In background mode no main loop will ever fire a
+  timer (`-b` never enters `WM_main`) and a handler is not an update
+  callback, so it rebuilds at once: a render farm opening a file saved
+  flagged exports the right sockets. (2) *The queue is checked against
+  Blender.* `_schedule_rebuild` trusted a module flag alone; a File >
+  Open that dropped the pending non-persistent timer
+  (`wm_file_read_pre` -> `BLI_timer_on_file_load`) left it set, and no
+  rebuild could be scheduled again that session (the marshal pump's
+  disease). The flag counts only while `bpy.app.timers.is_registered`
+  agrees. (3) *The Compile
+  button's own step is whole.* `halcyon.compile_shader` (REGISTER |
+  UNDO) rebuilt the sockets and left the flag up, so the step it pushed
+  re-armed a second rebuild on every landing; it clears the flag before
+  it compiles. (4) *Considered and left: the timer's rebuild as an undo
+  step of its own.* Sending it through the operator gives two steps per
+  edit, and the first is still the flagged one -- an undo onto it must
+  rebuild again, and a step pushed there lands on top of the state the
+  undo just restored: the redo stack is cut and Ctrl+Z can never get
+  past the flagged step. (A timer also runs with a window and no
+  editor, so the operator's `space_data.edit_tree` has nothing to find.)
+  The sockets are derived data, so the flag is what the stack carries
+  and they are re-derived on arrival, un-pushed (pinned: nothing on the
+  rebuild road calls an operator or an undo push). By Blender's own rule
+  -- `BKE_undosys_step_undo` loads the step before the active one -- one
+  Ctrl+Z still takes the whole edit back and one Ctrl+Shift+Z brings it
+  back whole. Pinned in
+  `test_code_node_rebuild_survives_undo_redo_and_load`: the real node
+  class against a stand-in memfile stack that swaps in fresh copies of
+  each step and fires no update callback, through undo, redo, a file
+  load with a rebuild still queued, a node group, background mode and
+  the Compile operator (the fake bpy gained `fire` -- Blender's
+  one-or-two-argument handler call -- `file_load` and persistent
+  timers). Seven mutations of the fix each fail it.
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
@@ -206,3 +258,10 @@ below was reproduced headless before it was fixed and is pinned in
   grey names the job (RENDER means a render that never ended -- Esc in
   the render window), and `bpy.app.is_job_running('RENDER')` in the
   Python console says the same.
+- The Coded Shader's undo road in a live node editor (this fix was
+  proven against the fake bpy alone): a Language or Text edit, then
+  Ctrl+Z taking the whole edit back in one press and Ctrl+Shift+Z
+  bringing the new sockets and their links back after the main loop's
+  next pass; an undo from a later step onto the flagged one leaving the
+  redo stack intact; a file saved flagged opening whole, in the UI and
+  under `-b`.
