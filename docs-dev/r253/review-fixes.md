@@ -353,15 +353,14 @@ below was reproduced headless before it was fixed and is pinned in
   lift the Emission node's refusal with it and is its own piece of work
   (the corner road lights emission in the corners; the layer and hit
   passes each need the route proven); it stays queued, and until then
-  the picture is right on both devices. And
-  the picture is Halcyon's Emission node's, not Cycles': with no DIFFUSE
-  lobe in the closure `closure_to_surface` leaves the material's
-  fallback diffuse LIT under the glow, where Blender shades black. That
-  rule also reads its batch (`np.any(diff_w > 1e-6)`: a pure-emission
-  pixel has diffuse level 0 when a diffuse pixel shares its batch and
-  level 1 when it is alone -- seen at the function, not hunted in a
-  frame). Recorded, not changed: every Emission-node material's picture
-  hangs on it. Pinned in
+  the two devices draw the same frame. And that frame is Halcyon's
+  Emission node's, not Cycles': with no DIFFUSE lobe in the closure
+  `closure_to_surface` leaves the material's fallback diffuse LIT under
+  the glow, where Blender shades black. That rule also reads its batch
+  (`np.any(diff_w > 1e-6)`: a pure-emission pixel has diffuse level 0
+  when a diffuse pixel shares its batch and level 1 when it is alone --
+  seen at the function, not hunted in a frame). Recorded, not changed:
+  every Emission-node material's picture hangs on it. Pinned in
   `test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads`
   (53 checks) for a colour, a value and a vector: the CPU frame bitwise
   the Emission node's; the wired colour arriving as exactly itself over
