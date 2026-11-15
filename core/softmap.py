@@ -13,8 +13,9 @@ A lamp of size 0 never comes here: `lights.visibility` keeps the constant
 PCF lookup for it (`ShadowMap.lookup`), untouched.
 
 THE LOOKUP (one lamp, one receiver point P' already stepped off its
-surface by the caller, shading normal N, ndl = clamp(N.L, 0, 1), slope
-bias sl, S = the user Softness in texels, F filter taps, B search taps)
+surface by the caller -- `offset_scale` says how far --, shading normal N,
+ndl = clamp(N.L, 0, 1), slope bias sl, S = the user Softness in texels,
+F filter taps, B search taps)
 
   1. project P' exactly as ShadowMap.lookup does: texel coordinates
      (u, v), the receiver depth d_r, `inside`; a cube picks its face by
@@ -56,12 +57,20 @@ bias sl, S = the user Softness in texels, F filter taps, B search taps)
      taps of it. Tap (a, b) reads the texel at
         floor((u, v) + t_s (1 + 4/F) (a A + b Bv) + (S + 2) (a, b)).
      No blocker: lit. Every tap blocked: umbra.
-  5. t_f = clamp(t(mean blocker depth), 0, t_s), then a PROBE with the
-     same taps at t_f: none blocked -> lit, all blocked -> umbra.
-  6. FILTER: r = t_f amax + S texels, q = max(2 r / F, 1), st0 = the
-     largest of 1, 2, 4 .. 64 not above q, st1 = 2 st0,
-     wb = clamp((q/st0 - sqrt 2) / (2 - sqrt 2), 0, 1). The F taps sit at
-        p = (u, v) + t_f (a A + b Bv) + S (a, b)
+  5. t_p = clamp(t(mean blocker depth), 0, t_s), then a PROBE with the
+     same taps at t_p: none blocked -> lit, all blocked -> umbra. A wide
+     search averages casters the lamp's footprint at this receiver never
+     reaches (the top of a wall for a point at its foot), so the estimate
+     is taken once more from the casters the probe found:
+     t_f = clamp(t(their mean depth), 0, t_p). It costs no fetch and
+     tightens the shadow where the caster meets the receiver.
+  6. FILTER: the lamp's penumbra (radius t_f amax texels) and the user's
+     Softness S are two blurs of one edge, so the radii add in
+     quadrature: r = sqrt((t_f amax)^2 + S^2), fq = r / (t_f amax + S).
+     q = max(2 r / F, 1), st0 = the largest of 1, 2, 4 .. 64 not above q,
+     st1 = 2 st0, wb = clamp((q/st0 - sqrt 2) / (2 - sqrt 2), 0, 1). The
+     F taps sit at
+        p = (u, v) + fq (t_f (a A + b Bv) + S (a, b))
      and each is a BILINEAR compare on the lattice of stride st: texels
      (x0 + {0,1}) st + floor(st/2) with x0 = floor(p.x / st - 0.5) and
      the fractions as weights. lit = mean(st0) (1 - wb) + mean(st1) wb.
@@ -92,6 +101,11 @@ SQRT2 = 1.41421356
 SQRT2_SPAN = 0.58578644
 
 _GOLD = np.pi * (3.0 - np.sqrt(5.0))
+#: the caller's normal offset is this fraction of the classic one where
+#: the receiver plane serves the compare exactly, and grows to the whole
+#: of it between N.L = GRAZE_HI and NDL_MIN, where the slope clamp bites
+OFFSET_BASE = 0.25
+GRAZE_HI = 0.3
 _TABLES = {}
 f32 = np.float32
 
@@ -126,6 +140,20 @@ def lamp_shape(light):
     if r <= 0.0:
         return None
     return {'kind': 'SPHERE', 'R': r}
+
+
+def offset_scale(ndl):
+    """How much of the classic normal offset a sized lamp's lookup point
+    takes, per point. The plane-biased compare needs none of it on a flat
+    receiver, and a lifted point reads its caster's shadow displaced (it
+    can even land inside a thin caster lying close to the floor), so the
+    offset shrinks to OFFSET_BASE of itself -- a margin for shading
+    normals that are not the facet's and for a Bias of 0. Towards grazing
+    light the plane's slope is clamped (NDL_MIN) and no longer exact:
+    there the whole classic offset returns."""
+    w = np.clip((f32(GRAZE_HI) - ndl) / f32(GRAZE_HI - NDL_MIN),
+                f32(0.0), f32(1.0))
+    return (f32(OFFSET_BASE) + f32(1.0 - OFFSET_BASE) * w).astype(np.float32)
 
 
 def tap_counts(samples):
@@ -448,19 +476,27 @@ def _face(face, fetch, rect, P, N, ndl, slope, soft, shape, dmin,
         p2 = pt.take(idx)
         davg = dsum[idx] / np.maximum(nb[idx], f32(1.0))
         if persp:
-            tf = f32(1.0) / np.maximum(davg, f32(1e-9)) - p2.dr
+            tp = f32(1.0) / np.maximum(davg, f32(1e-9)) - p2.dr
         else:
-            tf = p2.dr - davg
-        tf = np.minimum(np.maximum(tf, f32(0.0)), p2.ts).astype(np.float32)
-        nb2, _ = blockers(p2, tf, False)
+            tp = p2.dr - davg
+        tp = np.minimum(np.maximum(tp, f32(0.0)), p2.ts).astype(np.float32)
+        nb2, dsum2 = blockers(p2, tp, True)
         if stats is not None:
             stats['probe'] = stats.get('probe', 0) + int(idx.size)
         res[idx[nb2 >= nt]] = 0.0
         keep = np.nonzero((nb2 > 0.0) & (nb2 < nt))[0]
         if keep.size:
-            # -- 6. the filter, penumbra points only
+            # -- 6. the estimate again from the casters the probe itself
+            # found (never wider than the probe), then the filter --
+            # penumbra points only
             p3 = p2.take(keep)
-            tf = tf[keep]
+            davg2 = dsum2[keep] / np.maximum(nb2[keep], f32(1.0))
+            if persp:
+                tf = f32(1.0) / np.maximum(davg2, f32(1e-9)) - p3.dr
+            else:
+                tf = p3.dr - davg2
+            tf = np.minimum(np.maximum(tf, f32(0.0)), tp[keep]) \
+                .astype(np.float32)
             res[idx[keep]] = _filter(p3, tf, soft, tab_f, fetch, plane, stats)
     if act.size < n:
         lit[act] = res
@@ -470,7 +506,12 @@ def _face(face, fetch, rect, P, N, ndl, slope, soft, shape, dmin,
 
 def _filter(p, tf, soft, tab_f, fetch, plane, stats=None):
     fn = f32(len(tab_f))
-    r = tf * p.amax + f32(soft)
+    # the lamp's penumbra and the user's Softness are two blurs of one
+    # edge: their radii add in quadrature, and the taps (laid out for the
+    # plain sum) are drawn in by the ratio
+    rl = tf * p.amax
+    r = np.sqrt(rl * rl + f32(soft) * f32(soft))
+    fq = (r / np.maximum(rl + f32(soft), f32(1e-12))).astype(np.float32)
     q = np.maximum(f32(2.0) * r / fn, f32(1.0)).astype(np.float32)
     st0 = np.ones(q.shape[0], np.float32)
     for lv in STRIDES:
@@ -504,8 +545,8 @@ def _filter(p, tf, soft, tab_f, fetch, plane, stats=None):
     acc0 = np.zeros(q.shape[0], np.float32)
     acc1 = np.zeros(blend.size, np.float32)
     for a, b, sa, sb in tab_f:
-        px = p.u + (tf * (a * p.ax + b * p.bx) + sa)
-        py = p.v + (tf * (a * p.ay + b * p.by) + sb)
+        px = p.u + fq * (tf * (a * p.ax + b * p.bx) + sa)
+        py = p.v + fq * (tf * (a * p.ay + b * p.by) + sb)
         acc0 += tap(p, px, py, st0)
         if blend.size:
             # the second lattice only where the cross-fade reaches it

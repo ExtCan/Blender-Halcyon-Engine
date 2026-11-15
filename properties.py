@@ -1573,12 +1573,15 @@ DESCRIPTIONS = {
     'shadow_bias': "World-space offset that keeps a surface from shadowing "
                    "itself. Too low shows acne stippling; too high "
                    "detaches shadows from their objects (Peter Panning)",
-    'shadow_softness': "Blur radius of mapped shadows, in shadow-map "
-                       "texels. 0 is hard-edged; more taps a wider "
-                       "neighbourhood for softer penumbras",
-    'shadow_samples': "Taps per pixel for soft mapped shadows, or rays per "
-                      "pixel for soft traced shadows from area-sized "
-                      "lights. More is smoother and slower",
+    'shadow_softness': "A constant blur of mapped shadows, in shadow-map "
+                       "texels, added to the penumbra a lamp's own size "
+                       "(Radius, Angle, Size) casts. 0 adds none. A lamp "
+                       "of size 0 needs Samples above 1 to show it",
+    'shadow_samples': "Quality of soft shadows. Mapped: a lamp with a size "
+                      "filters 4 taps per sample (16 to 64) into a smooth "
+                      "penumbra; a lamp of size 0 takes this many taps of "
+                      "the Softness blur. Traced: rays per pixel from a "
+                      "sized lamp. More is smoother and slower",
     # R251 C117
     'shadow_map_depth': "What each shadow-map texel stores. CLASSIC keeps "
                         "the nearest caster and fights acne with Bias and "
@@ -5017,8 +5020,10 @@ GROUP_DOCS = {
         'shadow': "This light's own shadow method: depth map, traced "
                   "rays, or none -- overriding the scene default when "
                   "the scene is set to Per Light",
-        'shadow_softness': "Blur of this light's mapped shadow, in "
-                           "shadow-map texels. 0 is hard",
+        'shadow_softness': "Multiplies the render's Softness for this "
+                           "light's mapped shadow: 1 is the render "
+                           "setting, 0 adds no blur. The penumbra itself "
+                           "comes from the lamp's size",
         'shadow_samples': "Taps or rays per pixel for this light's soft "
                           "shadows. 0 uses the render's Samples",
         'shadow_density': "How dark this light's shadows get. 1 is full "

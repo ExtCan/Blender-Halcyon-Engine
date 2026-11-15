@@ -1428,15 +1428,15 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
         # penumbra is measured per receiver -- a blocker search over the
         # lamp's footprint, a width by similar triangles, a filter that
         # wide (core/softmap.py). Every compare there is made against
-        # the receiver PLANE's depth at the tap, so the offset stays at
-        # its one-texel form whatever the kernel: nothing lifts the
-        # receiver out from under its caster as the lamp or the
-        # Softness grows
+        # the receiver PLANE's depth at the tap, so the offset carries
+        # no blur factor and is scaled DOWN where that plane is exact
+        # (`offset_scale`): nothing lifts the receiver out from under
+        # its caster as the lamp or the Softness grows
         if mid:
             offset = np.zeros(n, np.float32)
         else:
             offset = texel * (1.5 + 2.5 * np.sqrt(
-                np.maximum(1.0 - ndl * ndl, 0.0)))
+                np.maximum(1.0 - ndl * ndl, 0.0))) * SM.offset_scale(ndl)
         lit = SM.lookup(sm, shape, P + N * offset[:, None], N, ndl, slope,
                         soft, shadow_sample_count(light, settings),
                         mask=mask)

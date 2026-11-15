@@ -23315,12 +23315,13 @@ def test_light_sizes_actually_work():
 
     SUN's size is an ANGLE and now tilts its shadow rays inside that
     cone; AREA samples real points on its rectangle (penumbras follow
-    the lamp's true shape); every sized lamp blurs its SHADOW MAP too,
-    through a size-derived texel radius stamped on the map at build --
-    with the lamp's size in the map cache key, because a cached map was
-    serving its stale blur. Size zero stays bitwise-identical to the
-    old pictures, and the GPU twins reproduce every new sampler
-    exactly.
+    the lamp's true shape); every sized lamp softens its SHADOW MAP too.
+    R254: the map road measures that penumbra per receiver
+    (core/softmap.py) instead of stamping one size-derived texel radius
+    on the map at build, so the built map carries nothing of the size
+    and a size edit re-bakes nothing (tests/test_r254_map_soft.py holds
+    the laws). Size zero stays bitwise-identical to the old pictures,
+    and the GPU twins reproduce every new sampler exactly.
     """
     from ..core.scene import Light
     from ..core import raster as CR
@@ -23372,16 +23373,22 @@ def test_light_sizes_actually_work():
     sc3.lights = [Light(type='POINT', position=(1.5, 2.5, 4.0),
                         energy=900.0, radius=0.0, shadow='MAP')]
     m_hard = R.render(sc3, stm)
+    sm_hard = sc3.lights[0].shadow_map
     sc3.lights[0].radius = 1.2
     m_soft = R.render(sc3, stm)
     check('a POINT radius blurs its shadow MAP now',
           float(np.abs(m_soft - m_hard).max()) > 1e-3)
-    sc3.lights[0].radius = 0.0
-    check('radius zero maps are the old picture bitwise (cache keyed '
-          'on size)', bool(np.array_equal(R.render(sc3, stm), m_hard)))
+    # R254: the pin here was `hasattr(sm, 'soft_extra')` -- one blur
+    # radius stamped on the map at build, with the size in the cache
+    # key. The penumbra is measured per receiver now, the map carries
+    # nothing of the size, and the sized frame was served the SAME map
     sm = sc3.lights[0].shadow_map
-    check('the size-derived blur is stamped on the built map',
-          hasattr(sm, 'soft_extra'))
+    check('nothing derived from the size is stamped on the built map, '
+          'and a size edit is served the cached map',
+          not hasattr(sm, 'soft_extra') and sm is sm_hard)
+    sc3.lights[0].radius = 0.0
+    check('radius zero maps are the old picture bitwise',
+          bool(np.array_equal(R.render(sc3, stm), m_hard)))
 
     # --- GPU twins agree, sample for sample
     def parity(lights, name, ray=False):

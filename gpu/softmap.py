@@ -65,6 +65,7 @@ def shadow_function(i, meta):
     tab_s = SM.search_table(F, B, soft)
     tab_f = SM.filter_table(F, soft)
     nt, fn = _lit(len(tab_s)), _lit(len(tab_f))
+    sq = np.float32(soft) * np.float32(soft)
     k = np.float32(size / (2.0 * ext))
     K = _lit(k)
     sz, sz1 = _lit(size), _lit(size - 1)
@@ -182,10 +183,14 @@ def shadow_function(i, meta):
     if meta.get('midpoint'):
         L.append('    float off_amt = 0.0;')
     else:
-        # the one-texel normal offset, whatever the kernel: every compare
-        # is made against the receiver plane (no blur factor here)
+        # the normal offset, scaled down where the receiver plane serves
+        # the compare exactly and whole only towards grazing light
+        # (`softmap.offset_scale`); no blur factor, whatever the kernel
         L.append('    float off_amt = texel * (1.5 + 2.5 * '
-                 'sqrt(max(1.0 - ndl * ndl, 0.0)));')
+                 'sqrt(max(1.0 - ndl * ndl, 0.0))) * '
+                 f'({_lit(SM.OFFSET_BASE)} + {_lit(1.0 - SM.OFFSET_BASE)} * '
+                 f'clamp(({_lit(SM.GRAZE_HI)} - ndl) / '
+                 f'{_lit(SM.GRAZE_HI - SM.NDL_MIN)}, 0.0, 1.0));')
     L.append('    vec4 ph = vec4(P + N * off_amt, 1.0);')
 
     def face_consts(fi):
@@ -314,9 +319,9 @@ def shadow_function(i, meta):
         out = []
         for a, b, sa, sb in tab_f:
             out += ['    {',
-                    f'    float px = u + (tf * ({_lit(a)} * Ax + '
+                    f'    float px = u + fq * (tf * ({_lit(a)} * Ax + '
                     f'{_lit(b)} * Bx) + {_lit(sa)});',
-                    f'    float py = v + (tf * ({_lit(a)} * Ay + '
+                    f'    float py = v + fq * (tf * ({_lit(a)} * Ay + '
                     f'{_lit(b)} * By) + {_lit(sb)});',
                     f'    {acc} += hal_sm_tap{i}(px, py, {st}, {cta});',
                     '    }']
@@ -330,14 +335,23 @@ def shadow_function(i, meta):
          '    else if (nb > 0.0) {',
          '    float davg = dsum / max(nb, 1.0);']
     if persp:
-        L.append('    float tf = min(max(1.0 / max(davg, 1e-9) - dr, 0.0), '
+        L.append('    float tp = min(max(1.0 / max(davg, 1e-9) - dr, 0.0), '
                  'ts);')
     else:
-        L.append('    float tf = min(max(dr - davg, 0.0), ts);')
-    L += ['    float nb2 = 0.0;'] + search('tf', '    nb2 += r.x;') + \
+        L.append('    float tp = min(max(dr - davg, 0.0), ts);')
+    L += ['    float nb2 = 0.0; float dsum2 = 0.0;'] + \
+        search('tp', '    nb2 += r.x; dsum2 += r.y;') + \
         [f'    if (nb2 >= {nt}) {{ lit = 0.0; }}',
          '    else if (nb2 > 0.0) {',
-         f'    float rtex = tf * amax + {_lit(soft)};',
+         # the estimate again, from the casters the probe itself found
+         '    float davg2 = dsum2 / max(nb2, 1.0);',
+         ('    float tf = min(max(1.0 / max(davg2, 1e-9) - dr, 0.0), tp);'
+          if persp else
+          '    float tf = min(max(dr - davg2, 0.0), tp);'),
+         # the lamp's penumbra and the Softness add in quadrature
+         '    float rl = tf * amax;',
+         f'    float rtex = sqrt(rl * rl + {_lit(sq)});',
+         f'    float fq = rtex / max(rl + {_lit(soft)}, 1e-12);',
          f'    float q = max(2.0 * rtex / {fn}, 1.0);',
          '    float st0 = 1.0;']
     for lv in SM.STRIDES:
