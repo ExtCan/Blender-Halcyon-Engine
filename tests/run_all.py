@@ -56,6 +56,8 @@ def run_tests():
     from . import test_r254_falloff
     # R254: traced soft shadows, the shadow panels, Area lamp scale
     from . import test_r254_ray_road
+    # R254: Hotspot, the visible beam, shafts, caustics, cookies
+    from . import test_r254_spot_beam
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -229,6 +231,11 @@ def run_tests():
     print('R254 RAY ROAD (TRACED SOFT SHADOWS, DENSITY, AREA LAMP SCALE, PANELS)')
     print('=' * 66)
     rc |= test_r254_ray_road.main()
+    print()
+    print('=' * 66)
+    print('R254 SPOT AND BEAM (HOTSPOT, THE VISIBLE BEAM, SHAFTS, CAUSTICS, COOKIES)')
+    print('=' * 66)
+    rc |= test_r254_spot_beam.main()
     return rc
 
 
