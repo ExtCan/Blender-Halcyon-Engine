@@ -317,6 +317,15 @@ class Light:
     # characters per second of scene.time; NORMAL ('m') is exactly 1.0
     light_style: str = 'NORMAL'
     light_style_rate: float = 10.0
+    # R254: a Spot whose object is scaled unevenly across its beam
+    # (Blender's elliptical cone, eevee_light.cc spot_size_inv). Export
+    # folds the WIDER of the two axes into spot_size / spot_blend, so
+    # every reader of the cone angle follows the round cone that
+    # circumscribes the ellipse; this pair then narrows the other axis:
+    # the tangent across the lamp's side / up axis is multiplied by it
+    # before the cosine is taken. (1, 1) -- a unit, uniform or round
+    # scale -- runs none of it
+    spot_scale: tuple = (1.0, 1.0)
     # the light's own X/Y axes, for oriented projection. Export fills them
     # from the object matrix; hand-built scenes may leave them None and get
     # a stable basis derived from the direction.

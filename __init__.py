@@ -85,11 +85,12 @@ def fault_note(msg, key=None, limit=6):
 
 def _import_modules():
     from . import (append_watch, compat, convert, engine, export,
-                   legacy_import, objects, properties, selftest,
-                   sparking, templates, ui)
+                   legacy_import, light_units, objects, properties,
+                   selftest, sparking, templates, ui)
     from .nodes import shader_nodes
     return (properties, shader_nodes, convert, templates, legacy_import,
-            sparking, append_watch, export, objects, engine, selftest, ui)
+            sparking, append_watch, light_units, export, objects, engine,
+            selftest, ui)
 
 
 def register():

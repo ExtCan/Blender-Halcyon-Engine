@@ -1086,6 +1086,152 @@ def _mesh_arrays(me, matrix, mat_offset, obj_index):
 
 # ------------------------------------------------------------------- lights
 
+#: R254: the Distance at which Blender Internal's area form factor
+#: (pow(stokes * dist^2 / A, gamma), energy / 4 pi) gives Blender's own
+#: watts. Far from the lamp stokes = 2 A cos cos' / r^2, so the pixel is
+#: albedo * P * 2 D^2 cos cos' / (4 pi^2 r^2) where Cycles and EEVEE
+#: give albedo * P cos cos' / (4 pi r^2): the ratio 2 D^2 / pi is 1 at
+#: D = sqrt(pi / 2) (and 398 at the Distance dial's factory 25)
+AREA_WATTS_DISTANCE = math.sqrt(math.pi / 2.0)
+
+
+def area_power_units(hs):
+    """The power units an Area lamp's panel carries: 'WATTS' (Blender's)
+    or 'BI' (Blender Internal: Power times Distance squared). A lamp
+    without the property -- a test's fake settings, a panel older than
+    the option -- is the lamp it always was, 'BI'."""
+    return str(getattr(hs, 'area_power', 'BI') or 'BI')
+
+
+def area_blender_watts(energy, distance, units):
+    """What an Area lamp gives in Blender's watts: the Power itself
+    under 'WATTS', Power * 2 Distance^2 / pi under 'BI' (Gamma 1; the
+    panel prints it beside the Distance dial)."""
+    if units == 'WATTS':
+        return float(energy)
+    d = max(float(distance), 1e-6)
+    return float(energy) * 2.0 * d * d / math.pi
+
+
+def bke_light_area(la, mw):
+    """Blender's BKE_light_area (blenkernel/intern/light.cc), the factor
+    a lamp with Normalize OFF is multiplied by: an Area lamp's face
+    (Size times the object's scale, pi / 4 of it for the round shapes),
+    4 pi r^2 for a Point or Spot of Radius r (4 at Radius 0), and
+    pi sin^2(angle / 2) for a Sun (1 at Angle 0)."""
+    kind = str(getattr(la, 'type', 'POINT'))
+    if kind == 'AREA':
+        shape = str(getattr(la, 'shape', 'SQUARE'))
+        sx = float(getattr(la, 'size', 1.0))
+        sy = float(getattr(la, 'size_y', sx)) \
+            if shape in ('RECTANGLE', 'ELLIPSE') else sx
+        a = (sx * float(np.linalg.norm(mw[:3, 0]))) \
+            * (sy * float(np.linalg.norm(mw[:3, 1])))
+        return a * (math.pi / 4.0) if shape in ('DISK', 'ELLIPSE') else a
+    if kind == 'SUN':
+        h = float(getattr(la, 'angle', 0.0)) * 0.5
+        return math.pi * math.sin(h) ** 2 if h > 0.0 else 1.0
+    r = float(getattr(la, 'shadow_soft_size', 0.0))
+    return 4.0 * math.pi * r * r if r > 0.0 else 4.0
+
+
+def spot_scale_fold(lt, mw):
+    """R254: a Spot's OBJECT scale shapes its cone, as in Blender
+    (eevee_light.cc: spot_size_inv = scale.z / scale.xy, the tangent to
+    the axis divided by scale.x / scale.z across and scale.y / scale.z
+    up). Unit and uniform scale return at once: the lamp it was.
+
+    The wider of the two ratios, k, is FOLDED into the exported angles,
+    so every reader of the cone on both roads (the cone laws, the
+    shadow buffer, the beam, the slide, its focus blur) follows without
+    knowing: the half-angle becomes atan(k tan(half)), and Blend is
+    re-derived so the full-strength edge lands where Blender puts it
+    (inner = acos(ci + (1 - ci) blend) in the scaled frame). The POV
+    hotspot angle moves the same way. When the two ratios differ the
+    cone is an ellipse: spot_scale carries what is left for the
+    narrower axis (core/lights.scaled_cos and its GLSL twin)."""
+    nx = float(np.linalg.norm(mw[:3, 0]))
+    ny = float(np.linalg.norm(mw[:3, 1]))
+    nz = float(np.linalg.norm(mw[:3, 2]))
+    if min(nx, ny, nz) <= 1e-12:
+        return
+    kx = nx / nz
+    ky = ny / nz
+    if abs(kx - 1.0) <= 1e-6 and abs(ky - 1.0) <= 1e-6:
+        return
+    k = max(kx, ky)
+    lim = math.radians(89.9)
+    half = min(float(lt.spot_size) * 0.5, lim)
+    ci = math.cos(half)
+    inner = math.acos(min(max(ci + (1.0 - ci) * float(lt.spot_blend),
+                              -1.0), 1.0))
+    half_k = min(math.atan(k * math.tan(half)), lim)
+    inner_k = math.atan(k * math.tan(min(inner, lim)))
+    co = math.cos(half_k)
+    lt.spot_size = 2.0 * half_k
+    lt.spot_blend = max((math.cos(inner_k) - co) / max(1.0 - co, 1e-12),
+                        1e-3)
+    hot = float(getattr(lt, 'hotspot', 0.0) or 0.0)
+    if hot > 0.0:
+        lt.hotspot = 2.0 * math.atan(k * math.tan(min(hot * 0.5, lim)))
+    if abs(kx - ky) > 1e-6 * k:
+        lt.spot_scale = (k / kx, k / ky)
+
+
+def _native_light_options(ob, la, hs, lt, kind, mw):
+    """R254: Blender's OWN light options, with Blender's own meaning.
+
+    Every statement is gated on the option being moved off its default,
+    so a default lamp exports the fields it always did. Energy, colour,
+    the cone angles and the two lobe switches already travel on both
+    roads; only the elliptical cone needed a field (spot_scale)."""
+    # Exposure: BKE_light_power = energy * 2^exposure
+    ex = float(getattr(la, 'exposure', 0.0) or 0.0)
+    if ex != 0.0:
+        lt.energy = lt.energy * (2.0 ** ex)
+    # Temperature: BKE_light_color multiplies the colour (the Tint) by
+    # the blackbody colour. Blender's own value is read, so no table
+    if getattr(la, 'use_temperature', False):
+        tc = getattr(la, 'temperature_color', None)
+        if tc is not None:
+            lt.color = tuple(float(c) * float(t)
+                             for c, t in zip(lt.color[:3], tuple(tc)[:3]))
+    # Normalize off: the lamp's power grows with its size
+    if not getattr(la, 'normalize', True):
+        lt.energy = lt.energy * bke_light_area(la, mw)
+    if kind == 'SPOT':
+        spot_scale_fold(lt, mw)
+        # Blender's own Square survives its versioning of a 2.79 file
+        # opened directly; it is Blender Internal's cone exactly
+        if getattr(la, 'use_square', False):
+            lt.spot_square = True
+    if kind == 'AREA' and hs is not None \
+            and area_power_units(hs) == 'WATTS':
+        # Power in Blender's watts: the form factor normalised at the
+        # one Distance where it IS watts. The hidden Falloff menu and
+        # the render's default no longer reach the lamp either (Custom
+        # Range would cut its beam at that Distance): an Area lamp
+        # never attenuates, on both roads
+        lt.decay_end = AREA_WATTS_DISTANCE
+        lt.decay = 'INVERSE_SQUARE'
+        # Blender keeps the POWER under object scale (the face grows,
+        # its radiance drops); Blender Internal's matrix scale is a
+        # gain of scale_x * scale_y on the form factor, taken out here
+        nx = float(np.linalg.norm(mw[:3, 0]))
+        ny = float(np.linalg.norm(mw[:3, 1]))
+        if (abs(nx - 1.0) > 1e-6 or abs(ny - 1.0) > 1e-6) \
+                and nx * ny > 1e-12:
+            lt.energy = lt.energy / (nx * ny) ** float(lt.area_gamma)
+    # Influence: Blender's Diffuse / Glossy factors at exactly 0 and
+    # the lamp OBJECT's ray visibility (EEVEE multiplies each lobe by
+    # both, eevee_light.cc Light::sync) are the lobe switched off
+    if float(getattr(la, 'diffuse_factor', 1.0)) == 0.0 \
+            or not getattr(ob, 'visible_diffuse', True):
+        lt.affect_diffuse = False
+    if float(getattr(la, 'specular_factor', 1.0)) == 0.0 \
+            or not getattr(ob, 'visible_glossy', True):
+        lt.affect_specular = False
+
 
 def export_light(ob, matrix, unit_scale=1.0):
     la = ob.data
@@ -1204,6 +1350,7 @@ def export_light(ob, matrix, unit_scale=1.0):
         lt.shadow = 'MAP' if getattr(la, 'use_shadow', True) else 'NONE'
     if not getattr(la, 'use_shadow', True):
         lt.shadow = 'NONE'
+    _native_light_options(ob, la, hs, lt, kind, mw)
     # the lamp's own axes, so a projected texture turns with the object
     lt.frame_x = tuple(mw[:3, 0] / max(float(np.linalg.norm(mw[:3, 0])),
                                        1e-9))
@@ -1668,6 +1815,25 @@ def _kind(ob):
     return _KINDS.get(getattr(ob, 'type', ''), "Object")
 
 
+def scene_time(bscene):
+    """Seconds of scene time at the frame being exported: the frame AND
+    its subframe over the real frame rate, fps / fps_base.
+
+    R254: the clock every timed feature reads (light styles, caustics,
+    the time nodes) used to be frame_current / fps: a scene at 48 fps
+    with base 2 ran at half speed, and each shutter step of an
+    accumulated motion blur read a whole frame. With an integer frame
+    and base 1 the old expression is kept, so those frames are the
+    value they were."""
+    rd = bscene.render
+    fps = max(rd.fps, 1)
+    sub = float(getattr(bscene, 'frame_subframe', 0.0) or 0.0)
+    base = float(getattr(rd, 'fps_base', 1.0) or 1.0)
+    if sub == 0.0 and base == 1.0:
+        return bscene.frame_current / fps
+    return (bscene.frame_current + sub) * base / fps
+
+
 def export_lights_into(parked, depsgraph):
     """A next Scene with FRESH lights and everything else SHARED.
 
@@ -1698,6 +1864,12 @@ def export_lights_into(parked, depsgraph):
                 name_to_index[n] for n in names if n in name_to_index))
     scene = copy.copy(parked)
     scene.lights = lights
+    # R254: the one clock, so a lights-only tick cannot leave the timed
+    # features (light styles, caustics) on the parked export's time
+    try:
+        scene.time = scene_time(bscene)
+    except Exception:                                           # noqa: BLE001
+        pass
     return scene
 
 
@@ -3052,7 +3224,7 @@ def export_scene(depsgraph, settings, warnings=None):
                shadow_volumes=shadow_volumes,
                lights=lights, camera=camera, world=world, settings=settings,
                frame=bscene.frame_current, fps=bscene.render.fps,
-               time=bscene.frame_current / max(bscene.render.fps, 1))
+               time=scene_time(bscene))
     sc.halos = halo_groups or None
     sc.images = images
     sc.warnings = warnings

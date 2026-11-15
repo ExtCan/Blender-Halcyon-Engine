@@ -2547,6 +2547,142 @@ def light_falloff_in_use(hs, scene):
     return mode
 
 
+def area_watts_label(light, hs):
+    """What a Blender Internal Area lamp gives in Blender's watts, as
+    the panel's one-line note (R254). Power x 2 Distance^2 / pi is the
+    far-field ratio of the 2.79 form factor to Cycles and EEVEE; Gamma
+    off 1 reshapes the field, so the number is then only a guide."""
+    from . import export as _EX
+    try:
+        w = _EX.area_blender_watts(float(getattr(light, 'energy', 0.0)),
+                                   float(getattr(hs, 'decay_end', 25.0)),
+                                   'BI')
+    except (TypeError, ValueError):
+        return ''
+    if abs(float(getattr(hs, 'area_gamma', 1.0) or 1.0) - 1.0) > 1e-6:
+        return f"About {w:.4g} W in Blender's watts at Gamma 1"
+    return f"Gives {w:.4g} W in Blender's watts"
+
+
+class HALCYON_PT_light_native(HalcyonPanel, Panel):
+    """Blender's own Light options -- the ones Halcyon reads, and only
+    those.
+
+    R254: the stock panels were forced on (DATA_PT_light and
+    DATA_PT_EEVEE_light, both titled Light) and drew rows the engine
+    never read, beside rows Halcyon Light drew a second time. This
+    panel owns the native rows instead, so a Blender release cannot put
+    a dead control in front of the user: type; Temperature and Colour
+    (the Tint while Temperature is on); Power or Strength, Exposure,
+    Normalize; an Area lamp's power units; the size dial of each type;
+    a Spot's Angle, Blend and Show Cone; Cast Shadow. Soft Falloff has
+    no meaning here (a lamp lights from its centre) and is not drawn.
+    Every lamp attribute is read through getattr: the test stub's lamps
+    carry four fields."""
+
+    bl_label = "Light"
+    bl_context = "data"
+
+    @classmethod
+    def poll(cls, context):
+        return (context.engine == ENGINE and context.light is not None)
+
+    def draw(self, context):
+        layout = self.layout
+        light = context.light
+        hs = getattr(light, 'halcyon', None)
+        kind = str(getattr(light, 'type', 'POINT') or 'POINT')
+        layout.row().prop(light, 'type', expand=True)
+        layout.use_property_split = True
+
+        col = layout.column()
+        warm = bool(getattr(light, 'use_temperature', False))
+        if hasattr(light, 'use_temperature'):
+            heading = col.column(align=True, heading="Temperature")
+            row = heading.row(align=True)
+            row.prop(light, 'use_temperature', text="")
+            sub = row.row()
+            sub.active = warm
+            sub.prop(light, 'temperature', text="")
+        # the blackbody colour multiplies the Colour, which is then a tint
+        col.prop(light, 'color', text="Tint" if warm else "Color")
+
+        col = layout.column()
+        col.prop(light, 'energy')
+        if hasattr(light, 'exposure'):
+            col.prop(light, 'exposure')
+        if hasattr(light, 'normalize'):
+            col.prop(light, 'normalize')
+        if kind == 'AREA' and hs is not None and hasattr(hs, 'area_power'):
+            # what the Power above means. Under Blender Internal units
+            # the form factor is normalised at Distance (la->dist), so
+            # the dial is a gain: the note says what it comes to
+            col.prop(hs, 'area_power')
+            if str(hs.area_power) == 'BI':
+                col.prop(hs, 'decay_end', text="Distance")
+                note = col.row()
+                note.active = False
+                note.label(text=area_watts_label(light, hs), icon='INFO')
+
+        col = layout.column()
+        if kind in ('POINT', 'SPOT'):
+            # softens the shadow; the lamp still lights from its centre
+            col.prop(light, 'shadow_soft_size', text="Radius")
+        elif kind == 'SUN':
+            col.prop(light, 'angle')
+        elif kind == 'AREA':
+            col.prop(light, 'shape')
+            sub = col.column(align=True)
+            if str(getattr(light, 'shape', 'SQUARE')) in ('RECTANGLE',
+                                                          'ELLIPSE'):
+                sub.prop(light, 'size', text="Size X")
+                sub.prop(light, 'size_y', text="Y")
+            else:
+                sub.prop(light, 'size')
+        if kind == 'SPOT':
+            col = layout.column()
+            col.prop(light, 'spot_size', text="Angle")
+            sub = col.column()
+            # Blend is Blender Internal's cone only: the other cone
+            # laws never read it
+            sub.active = str(getattr(hs, 'spot_law', 'BLENDER')
+                             or 'BLENDER') == 'BLENDER'
+            sub.prop(light, 'spot_blend', text="Blend", slider=True)
+            col.prop(light, 'show_cone')
+            if getattr(light, 'use_square', False):
+                # Blender's own Square flag (a 2.79 file opened
+                # directly keeps it) renders as the Square cone; drawn
+                # only while set, so nothing hidden shapes the beam
+                col.prop(light, 'use_square', text="Square (Blender's)")
+
+        col = layout.column()
+        col.prop(light, 'use_shadow', text="Cast Shadow")
+
+        # Blender's Influence switches are honoured where they turn a
+        # lobe OFF; each is drawn only while it does, so a default lamp
+        # shows none and no hidden switch darkens one
+        ob = getattr(context, 'object', None)
+        if ob is not None and getattr(ob, 'data', None) is not light:
+            ob = None
+        off = []
+        if float(getattr(light, 'diffuse_factor', 1.0)) == 0.0:
+            off.append((light, 'diffuse_factor', "Diffuse Factor"))
+        if ob is not None and not getattr(ob, 'visible_diffuse', True):
+            off.append((ob, 'visible_diffuse', "Diffuse Ray Visibility"))
+        if float(getattr(light, 'specular_factor', 1.0)) == 0.0:
+            off.append((light, 'specular_factor', "Glossy Factor"))
+        if ob is not None and not getattr(ob, 'visible_glossy', True):
+            off.append((ob, 'visible_glossy', "Glossy Ray Visibility"))
+        if off:
+            col = layout.column()
+            note = col.row()
+            note.active = False
+            note.label(text="Blender's Influence switches a lobe off here",
+                       icon='INFO')
+            for owner, name, text in off:
+                col.prop(owner, name, text=text)
+
+
 class HALCYON_PT_light(HalcyonPanel, Panel):
     bl_label = "Halcyon Light"
     bl_context = "data"
@@ -2561,8 +2697,8 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
         light = context.light
         hs = light.halcyon
         col = layout.column()
-        col.prop(light, 'color')
-        col.prop(light, 'energy')
+        # R254: Colour and Power are the Light panel's rows (above);
+        # they were drawn here a second time
         # R253 light options: the lamp's second colour (GL_SPECULAR /
         # dcvSpecular) and Quake's lightstyle flicker
         col.prop(hs, 'specular_color')
@@ -2576,16 +2712,10 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
             # skipped its falloff switch for LA_AREA, and so does the
             # engine -- distance speaks only through the form factor.
             # The BI pair instead: Distance (la->dist, the dist^2/A
-            # normalisation) and Gamma (la->k, its pow shaping)
-            col.prop(hs, 'decay_end', text="Distance")
-            # R254: the row is a GAIN, not a range -- the form factor is
-            # normalised to this distance, so the lamp's brightness goes
-            # with its square (25, the factory value, is 1250 times a
-            # point lamp of the same Power)
-            note = col.row()
-            note.active = False
-            note.label(text="Brightness scales with Distance squared",
-                       icon='INFO')
+            # normalisation) and Gamma (la->k, its pow shaping).
+            # R254: Distance is drawn beside the Power it scales, in
+            # the Light panel, and only under Blender Internal power
+            # units -- a lamp in Blender's watts does not read it
             col.prop(hs, 'area_gamma')
         elif light.type != 'SUN':
             # R254: no falloff rows on a Sun or a hemi -- a directional
@@ -3764,6 +3894,7 @@ CLASSES = (
     HALCYON_PT_performance, HALCYON_PT_debug,
     HALCYON_OT_clear_palette_cache,
     HALCYON_OT_diagnostics, HALCYON_PT_material,
+    HALCYON_PT_light_native,              # R254: above Halcyon Light
     HALCYON_PT_light, HALCYON_PT_wireframe, HALCYON_PT_outline,
     HALCYON_PT_passes,
     HALCYON_PT_world, HALCYON_PT_world_sun,

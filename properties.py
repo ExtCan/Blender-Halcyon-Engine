@@ -315,6 +315,17 @@ LIGHT_MAP_DEPTH = _items(
      "Woo's midpoint between the two nearest casters; bias and offset "
      "become zero"),
 )
+# R254: what an Area lamp's Power means. Appended to a lamp, never a
+# render setting: a file can mix lamps authored either way
+AREA_POWER = _items(
+    ('WATTS', "Blender Power (Watts)",
+     "Power is Blender's watts: the lamp is as bright as the same lamp "
+     "in EEVEE or Cycles, and has no Distance dial"),
+    ('BI', "Blender Internal (Distance)",
+     "Power is Blender Internal's energy: the form factor is normalised "
+     "at the Distance dial, so brightness goes with Distance squared -- "
+     "what every Area lamp was before 1.93, and what a 2.79 import needs"),
+)
 # R251 C020/C036: a material's triangles as an authored shadow volume
 VOLUME_ROLE = _items(
     ('NONE', "Surface", "Drawn as geometry, as every material until now"),
@@ -3143,6 +3154,14 @@ class HalcyonSettings(PropertyGroup):
             ('SAMPLING', "Sampling", ""), ('SHADING', "Shading", ""),
             ('OUTPUT', "Output", ""), ('DISPLAY', "Display", "")),
         default='SAMPLING')
+    # R254: the file's light-units stamp (light_units.py). 0 = a file
+    # last saved before Area lamps could carry Blender's watts; never
+    # drawn, never exported, never a render setting
+    light_units_version: IntProperty(
+        name="Light Units Version", default=0, min=0, options={'HIDDEN'},
+        description="Bookkeeping, not a setting: marks a file whose Area "
+                    "lamps have been sorted into Blender watts and Blender "
+                    "Internal units, so the sorting runs once per file")
     palette_image: PointerProperty(
         name="Palette Image", type=bpy.types.Image,
         description="R202: with Palette set to Custom, the whole "
@@ -3786,6 +3805,19 @@ class HalcyonLightSettings(PropertyGroup):
                                        "hotspot/falloff pair; POV-Ray's "
                                        "radius under the POV cone law, "
                                        "never wider than the Spot Size")
+    # R254: the Area lamp's power units. The RNA default is what a NEW
+    # lamp gets; light_units.py stamps 'BI' onto the Area lamps of a
+    # Halcyon file saved before the option existed, so those render as
+    # they did
+    area_power: EnumProperty(
+        name="Power Units", items=AREA_POWER, default='WATTS',
+        description="What this Area lamp's Power means. Blender Power: "
+                    "watts, as bright as the same lamp in EEVEE or Cycles "
+                    "(a new lamp starts here). Blender Internal: Power "
+                    "times Distance squared, the 2.79 form factor every "
+                    "Area lamp used before 1.93 -- lamps from older files "
+                    "and 2.79 imports are kept on it, and render as they "
+                    "did")
     area_gamma: FloatProperty(
         name="Gamma", default=1.0, min=0.01, max=2.0,
         description="Blender Internal's area lamp Gamma (la->k): shapes "
@@ -5046,9 +5078,11 @@ GROUP_DOCS = {
                      "POV-Ray fades: strength 1 here. GX laws: Ref "
                      "Brightness here. Nominal Distance laws: full "
                      "strength here. Sphere: the hard edge of the light. "
-                     "Area lamp: the Distance its strength is normalised "
-                     "to, not a range -- brightness scales with Distance "
-                     "squared",
+                     "Area lamp on Blender Internal power units: the "
+                     "Distance its strength is normalised to, not a range "
+                     "-- brightness scales with Distance squared (1.25 "
+                     "makes Power read as Blender's watts, the factory 25 "
+                     "is about 400 times that)",
         'shadow': "This light's own shadow method: depth map, traced "
                   "rays, or none -- overriding the scene default when "
                   "the scene is set to Per Light",

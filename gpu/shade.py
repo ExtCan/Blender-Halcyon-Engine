@@ -822,6 +822,13 @@ def _light_sig(l):
                      or (0.0, 0.0, 0.0))) > 0.0,
            float(getattr(l, 'decay_near_end', 0.0) or 0.0)
            > float(getattr(l, 'decay_near_start', 0.0) or 0.0))
+    from ..core import lights as _LIs
+    _squeezed = _LIs.spot_scale_on(l)
+    if _squeezed:
+        # R254: an elliptical cone emits its own block (structure); the
+        # squeeze itself is texels 10.w / 11.w. Appended only when it
+        # is on, so every round lamp keeps the signature it had
+        sig += ('spot_scale',)
     if str(getattr(l, 'type', '')).upper() == 'AREA':
         # the AREA soft-ray twin bakes the rectangle -- centre, axes,
         # half-sizes, shape -- as literals (the radius precedent), so
@@ -868,6 +875,10 @@ def _light_sig(l):
                 t(getattr(l, 'cookie_offset', (0.0, 0.0)) or (0.0, 0.0)),
                 t(getattr(l, 'cookie_tile', (1.0, 1.0)) or (1.0, 1.0)),
                 round(float(getattr(l, 'cookie_rotation', 0.0) or 0.0), 6))
+        if _squeezed:
+            # R254: a squeezed Spot bakes its slide axes with the
+            # squeeze folded in (cookie_spot_axes) -- a baked value
+            sig += (t(l.spot_scale),)
     return sig
 
 
@@ -1469,6 +1480,10 @@ def plan_frame(job, gbuf, use_cache=True):
                 px.shape[0], float(px[::7, ::7].sum()))
         atlases[f'hal_cookie{i}'] = (ckey, (lambda p=px: p))
         s_ax, u_ax, f_ax = LI.cookie_frame(l)
+        if l.type == 'SPOT' and LI.spot_scale_on(l):
+            # R254: the elliptical cone squeezes its slide too -- the
+            # CPU lookup's own axes (cookie_factor), baked as literals
+            s_ax, u_ax = LI.cookie_spot_axes(l, s_ax, u_ax)
         try:
             a_sx, a_sy = (float(v) for v in
                           getattr(l, 'area_size', (1.0, 1.0))[:2])

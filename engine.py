@@ -1614,6 +1614,13 @@ EXCLUDED_PANELS = {
     'VIEWLAYER_PT_freestyle_lineset_collection',
     'MATERIAL_PT_freestyle_line', 'RENDER_PT_gpencil',
     'RENDER_PT_simplify_greasepencil',
+    # R254: the stock Light panels. DATA_PT_light (the bare one: the
+    # type row) and DATA_PT_spot carry the generic marker, and
+    # DATA_PT_EEVEE_light used to be forced beside them: two panels
+    # titled Light, with Exposure, Temperature, Normalize and Soft
+    # Falloff drawn and unread. ui.HALCYON_PT_light_native draws the
+    # native rows the engine reads instead (the rule above)
+    'DATA_PT_light', 'DATA_PT_spot',
 }
 
 # Panels Blender does not mark as generic but that are safe and needed here.
@@ -1622,8 +1629,7 @@ FORCED_PANELS = {
     'DATA_PT_context_mesh', 'DATA_PT_uv_texture', 'DATA_PT_vertex_colors',
     'DATA_PT_mesh_attributes', 'DATA_PT_vertex_groups', 'DATA_PT_shape_keys',
     'DATA_PT_normals', 'DATA_PT_customdata', 'DATA_PT_face_maps',
-    'DATA_PT_context_light', 'DATA_PT_light', 'DATA_PT_EEVEE_light',
-    'DATA_PT_spot', 'DATA_PT_area',
+    'DATA_PT_context_light',
     'WORLD_PT_context_world', 'WORLD_PT_viewport_display',
     'RENDER_PT_color_management', 'RENDER_PT_color_management_curves',
 }

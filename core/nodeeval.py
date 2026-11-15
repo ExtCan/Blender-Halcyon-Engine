@@ -6010,6 +6010,10 @@ def n_u16_light_meter(ev, node):
                                 np.float32)
                 ax = ax / max(float(np.linalg.norm(ax)), 1e-9)
                 cd = (-Lv * ax[None, :]).sum(1)
+                if LI.spot_scale_on(l):
+                    # R254: the elliptical cone's own cosine
+                    cd = LI.scaled_cos(l, Lv.astype(np.float32),
+                                       cd.astype(np.float32))
                 co = np.cos(float(getattr(l, 'spot_size', 1.2)) * 0.5)
                 blend = max(float(getattr(l, 'spot_blend', 0.15)), 1e-4)
                 ci = np.cos(float(getattr(l, 'spot_size', 1.2)) * 0.5
