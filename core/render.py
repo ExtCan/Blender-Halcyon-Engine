@@ -4687,6 +4687,10 @@ def render(scene, settings=None, progress=None, band=None):
         scene.mesh, str(getattr(st, 'vertex_quantize', 'NONE')),
         float(getattr(st, 'vertex_units', 64.0)))
     scene.last_gel = None       # R251 C134: rebuilt below, beside last_depth
+    # R254: the world's own luminary joins scene.lights here, before any
+    # consumer reads the list (idempotent; untouched with the toggle off)
+    from . import worldlight as _WL
+    _WL.sync(scene, lambda: prepare_textures(scene, st))
     scene = _apply_material_override(scene, st)
     collect_exclusive_lights(scene)
     mesh = scene.mesh
@@ -4849,7 +4853,12 @@ def render(scene, settings=None, progress=None, band=None):
     need_bvh = st.raytrace or st.ambient_occlusion or \
         getattr(st, 'radiosity', False) or \
         (st.shadows and st.shadow_default == 'RAY') or \
-        _volume_occlusion_wanted(scene, st)
+        _volume_occlusion_wanted(scene, st) or \
+        (st.shadows and st.shadow_default == 'PER_LIGHT' and any(
+            # R254: the world light's own Ray Traced choice needs the BVH
+            # (a World Light Shadow that silently cast nothing otherwise)
+            getattr(l, 'world_light', False) and l.shadow == 'RAY'
+            for l in (scene.lights or ())))
     bvh = None
     if need_bvh and mesh is not None and mesh.tris is not None and mesh.tris.size:
         with ST.track('build BVH'):
@@ -6153,6 +6162,8 @@ def bake_lightmap(scene, st, obj_index=None, size=512, mode='COMBINED',
     from .nodeeval import desugar_master_bump
     for _m in (scene.materials or ()):
         desugar_master_bump(getattr(_m, 'graph', None))
+    from . import worldlight as _WL
+    _WL.sync(scene, lambda: prepare_textures(scene, st))      # R254
     collect_exclusive_lights(scene)
     textures = prepare_textures(scene, st)
     _build_shadows(scene, st, mesh)

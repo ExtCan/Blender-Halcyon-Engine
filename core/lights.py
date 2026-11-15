@@ -1465,8 +1465,17 @@ def select_lights(lights, settings, centre=None):
     limit = int(settings.max_lights)
     if limit <= 0 or len(active) <= limit:
         return active
+    # R254: the world's own light (core/worldlight.py) is the sky's sun --
+    # the limit ranks the LAMPS for the slots left beside it and never
+    # drops it. No scene without World Light carries the mark.
+    kept = [l for l in active if getattr(l, 'world_light', False)]
+    if kept:
+        active = [l for l in active if not getattr(l, 'world_light', False)]
+        limit = max(limit - len(kept), 0)
+        if limit == 0:
+            return kept
     if settings.light_limit_mode == 'FIRST':
-        return active[:limit]
+        return active[:limit] + kept
     if settings.light_limit_mode == 'NEAREST' and centre is not None:
         key = [float(np.linalg.norm(np.asarray(l.position, np.float32) - centre))
                for l in active]
@@ -1474,7 +1483,7 @@ def select_lights(lights, settings, centre=None):
     else:
         key = [float(l.energy) * float(np.mean(l.color)) for l in active]
         order = np.argsort(key)[::-1]
-    return [active[i] for i in order[:limit]]
+    return [active[i] for i in order[:limit]] + kept
 
 
 def ambient_light_split(scene, settings):

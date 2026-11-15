@@ -40,6 +40,12 @@ EXCLUDED = frozenset({
     'cube_image_px', 'cube_image_nx', 'cube_image_py', 'cube_image_ny',
     'cube_image_pz', 'cube_image_nz', 'cube_source', 'cube_layout',
     'cube_convention', 'cube_filter', 'cube_face_rot', 'cube_face_flip',
+    # R254: World Light is a decision about the SCENE's lighting, not a
+    # look of the sky -- picking a sky must neither switch it off (apply
+    # resets every field a preset owns) nor ship in a sky file
+    'world_light', 'world_light_strength', 'world_light_shadow',
+    'world_light_shafts', 'world_light_find', 'world_light_elevation',
+    'world_light_azimuth', 'world_light_color',
 })
 
 

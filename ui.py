@@ -1604,6 +1604,68 @@ class HALCYON_PT_world_sun(_BrycePanel, Panel):
             sub.prop(hs, 'sun_size')
 
 
+class HALCYON_PT_world_light(HalcyonPanel, Panel):
+    """R254: the world's own luminary as a scene light. Shown for every
+    world type -- one with no sun or moon says so instead of offering a
+    control that could do nothing."""
+    bl_label = "World Light"
+    bl_context = "world"
+    bl_parent_id = 'HALCYON_PT_world'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.engine == ENGINE and context.world is not None
+
+    def draw_header(self, context):
+        from .core import worldlight as _WL
+        hs = context.world.halcyon
+        row = self.layout.row()
+        row.active = hs.mode in _WL.MODES_WITH_LUMINARY
+        row.prop(hs, 'world_light', text="")
+
+    def draw(self, context):
+        from .core import worldlight as _WL
+        layout = self.layout
+        layout.use_property_split = True
+        hs = context.world.halcyon
+        if hs.mode not in _WL.MODES_WITH_LUMINARY:
+            layout.label(text="This world type has no sun or moon to "
+                              "light with", icon='INFO')
+            layout.label(text="Bryce, Physical, a Sky Texture node, an "
+                              "HDRI or a cube map do")
+            return
+        col = layout.column()
+        col.active = bool(hs.world_light)
+        if hs.mode == 'BRYCE':
+            col.label(text="Lit by the Bryce moon" if hs.celestial == 'MOON'
+                      else "Lit by the Bryce sun", icon='LIGHT_SUN')
+        elif hs.mode == 'PHYSICAL':
+            col.label(text="Lit by the Physical sky's sun", icon='LIGHT_SUN')
+        elif hs.mode == 'NODES':
+            col.label(text="Lit by the Sky Texture node's sun",
+                      icon='LIGHT_SUN')
+        else:
+            col.prop(hs, 'world_light_find')
+            if hs.world_light_find == 'MANUAL':
+                col.prop(hs, 'world_light_elevation')
+                col.prop(hs, 'world_light_azimuth')
+                col.prop(hs, 'world_light_color')
+        col.prop(hs, 'world_light_strength')
+        col.prop(hs, 'world_light_shadow')
+        col.prop(hs, 'world_light_shafts')
+        if hs.world_light:
+            said = _WL.LAST_REPORT.get('text', '')
+            if said:
+                layout.label(text=said, icon='INFO')
+            scene = getattr(context, 'scene', None)
+            if any(getattr(ob, 'type', '') == 'LIGHT'
+                   and getattr(getattr(ob, 'data', None), 'type', '') == 'SUN'
+                   for ob in (getattr(scene, 'objects', None) or ())):
+                layout.label(text="The scene's Sun lamps light it as well",
+                             icon='ERROR')
+
+
 class HALCYON_PT_world_atmosphere(_BrycePanel, Panel):
     bl_label = "Atmosphere"
     bl_options = set()
@@ -3688,6 +3750,7 @@ CLASSES = (
     HALCYON_PT_light, HALCYON_PT_wireframe, HALCYON_PT_outline,
     HALCYON_PT_passes,
     HALCYON_PT_world, HALCYON_PT_world_sun,
+    HALCYON_PT_world_light,
     HALCYON_PT_world_atmosphere, HALCYON_PT_world_cumulus,
     HALCYON_PT_world_stratus, HALCYON_PT_world_effects,
     HALCYON_PT_world_ground, HALCYON_PT_world_weather,
