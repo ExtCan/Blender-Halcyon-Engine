@@ -2805,7 +2805,49 @@ def _mesh_key(mesh):
     # R251 C012: the vertex-format tag (a fine lattice can move the
     # strided sums by less than the 3-decimal rounding)
     parts.append(getattr(mesh, '_quant_tag', None))
+    # R254: every OTHER array the uploads keyed here pack, digested whole
+    parts.append(_attr_digests(mesh))
     return tuple(parts)
+
+
+#: the arrays the mesh-keyed uploads read besides the positions:
+#: gbuffer.pack_attributes (tris, normals, uvs, uvs2, colors, and the face
+#: normal of every flat triangle), pack_tri_data (mat_index, obj_index),
+#: pack_tri_aux and ink.pack_tri_fn (face_normals)
+_MESH_KEY_ARRAYS = ('tris', 'normals', 'uvs', 'uvs2', 'colors', 'mat_index',
+                    'obj_index', 'face_normals', 'smooth')
+
+
+def _attr_digests(mesh):
+    """mathx.content_digest of each array in _MESH_KEY_ARRAYS (None where
+    the mesh has none), memoised on the mesh.
+
+    The strided sums above read about 512 elements of each array, so a
+    change that lies between the samples left the key where it was: a
+    24-vertex box among 53,000 vertices switched from flat to smooth kept
+    its old normals on the device (245 px wrong against a cold frame), and
+    the same box given another material kept the old triangle table, so
+    the material pass left its pixels unshaded and the device refused
+    every frame. Only the positions were digested exactly.
+
+    A fresh export makes fresh arrays and pays one pass over them (about
+    1 ms per 2 MB); the memo holds the arrays themselves and is reused
+    only while each attribute IS the array it digested, so a lights-only
+    export, a draft and a refine -- all the same MeshData -- pay nothing.
+    An edit made IN PLACE keeps the memo: the sums in the key still catch
+    it exactly as far as they always did, no further."""
+    arrs = tuple(getattr(mesh, name, None) for name in _MESH_KEY_ARRAYS)
+    memo = getattr(mesh, '_attr_digest_memo', None)
+    if memo is not None and len(memo[0]) == len(arrs) and \
+            all(a is b for a, b in zip(memo[0], arrs)):
+        return memo[1]
+    out = tuple(None if a is None else _content_digest(np.asarray(a))
+                for a in arrs)
+    try:
+        mesh._attr_digest_memo = (arrs, out)
+    except Exception:                                           # noqa: BLE001
+        pass
+    return out
 
 
 #: where the last driver frame's milliseconds went, for the self-test
