@@ -2492,6 +2492,43 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
                             "its faces do not draw", icon='INFO')
 
 
+#: R254: the distance dials each falloff law reads, as the Light panel's
+#: rows -- (property, label; None = the property's own name). ONE table
+#: for a law chosen on the lamp and for one arriving through Scene
+#: Default; core/lights.attenuate and decay_law are the readers, and
+#: tests/test_r254_falloff.py holds the two against each other (a dial
+#: is drawn exactly when the law reads it). None, Inverse and Inverse
+#: Square read no dial at all.
+FALLOFF_ROWS = {
+    'CUSTOM': (('decay_start', None), ('decay_end', None)),
+    'BI_LINEAR': (('decay_end', "Distance"),),
+    'BI_SQUARE': (('decay_end', "Distance"),),
+    'BI_SLIDERS': (('decay_end', "Distance"), ('decay_ld1', None),
+                   ('decay_ld2', None)),
+    'GL_3TERM': (('decay_ld1', None), ('decay_ld2', None)),
+    'POV_FADE_LINEAR': (('decay_end', None),),
+    'POV_FADE_SQUARE': (('decay_end', None),),
+    'GX_GENTLE': (('decay_end', None),),
+    'GX_MEDIUM': (('decay_end', None),),
+    'GX_STEEP': (('decay_end', None),),
+    'NOMINAL_INVERSE': (('decay_end', "Nominal Distance"),),
+    'NOMINAL_INV_SQUARE': (('decay_end', "Nominal Distance"),),
+}
+
+
+def light_falloff_in_use(hs, scene):
+    """The falloff law a lamp runs: its own, or the render's Light
+    Falloff Default while it is left on Scene Default (core/lights.
+    resolved_decay's panel twin). Without a scene, Inverse Square --
+    the render setting's own default."""
+    mode = str(getattr(hs, 'decay', 'DEFAULT') or 'DEFAULT')
+    if mode == 'DEFAULT':
+        mode = str(getattr(getattr(scene, 'halcyon', None),
+                           'light_falloff_default', None)
+                   or 'INVERSE_SQUARE')
+    return mode
+
+
 class HALCYON_PT_light(HalcyonPanel, Panel):
     bl_label = "Halcyon Light"
     bl_context = "data"
@@ -2523,32 +2560,56 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
             # The BI pair instead: Distance (la->dist, the dist^2/A
             # normalisation) and Gamma (la->k, its pow shaping)
             col.prop(hs, 'decay_end', text="Distance")
+            # R254: the row is a GAIN, not a range -- the form factor is
+            # normalised to this distance, so the lamp's brightness goes
+            # with its square (25, the factory value, is 1250 times a
+            # point lamp of the same Power)
+            note = col.row()
+            note.active = False
+            note.label(text="Brightness scales with Distance squared",
+                       icon='INFO')
             col.prop(hs, 'area_gamma')
-        else:
+        elif light.type != 'SUN':
+            # R254: no falloff rows on a Sun or a hemi -- a directional
+            # lamp never reaches attenuate() on either road, so the menu
+            # and its sliders changed no pixel there
             col.prop(hs, 'decay')
-            if hs.decay == 'CUSTOM':
-                col.prop(hs, 'decay_start')
-                col.prop(hs, 'decay_end')
+            # R254: the rows follow the law the lamp actually RUNS. A
+            # lamp left on Scene Default reads its own distance dials
+            # for whatever law the render chose, and used to draw none
+            # of them (the panel preview and the tests draw without a
+            # scene: Inverse Square, the render's own default)
+            mode = light_falloff_in_use(hs, getattr(context, 'scene', None))
+            if hs.decay == 'DEFAULT' and FALLOFF_ROWS.get(mode):
+                note = col.row()
+                note.active = False
+                note.label(text="This lamp's dials for the render's "
+                                "falloff", icon='INFO')
             # R251 F013: the POV fade distance / GX ref_dist is Falloff
-            # End; GL's kl/kq are the Lin/Quad sliders (BI_SLIDERS reads
-            # them too and drew them nowhere)
-            if hs.decay in ('POV_FADE_LINEAR', 'POV_FADE_SQUARE') or \
-                    hs.decay.startswith('GX_'):
-                col.prop(hs, 'decay_end')
-            if hs.decay in ('NOMINAL_INVERSE', 'NOMINAL_INV_SQUARE'):
-                # R253 (D): Max's R0 / LightWave's Range IS Falloff End
-                col.prop(hs, 'decay_end', text="Nominal Distance")
-            if hs.decay in ('GL_3TERM', 'BI_SLIDERS'):
-                col.prop(hs, 'decay_ld1')
-                col.prop(hs, 'decay_ld2')
-            if hs.decay.startswith('GX_'):
+            # End; GL's kl/kq are the Lin/Quad sliders. R253 (D): Max's
+            # R0 / LightWave's Range IS Falloff End. R254: the three
+            # Blender Internal laws are scaled by it too (their
+            # Distance) and drew it nowhere
+            for name, text in FALLOFF_ROWS.get(mode, ()):
+                if text:
+                    col.prop(hs, name, text=text)
+                else:
+                    col.prop(hs, name)
+            if mode.startswith('GX_'):
                 col.prop(hs, 'gx_ref_brite')
-            if light.type != 'SUN':
-                # R253 (E): 3ds Max's Near Attenuation fade-in (the far
-                # pair is the Custom Range falloff); never on a Sun or
-                # a hemi -- directional lamps carry no attenuation
-                col.prop(hs, 'decay_near_start')
-                col.prop(hs, 'decay_near_end')
+            # R254: Blender Internal's Sphere was exported and clipped
+            # the lamp on every road with no row to see or clear it. The
+            # laws that draw no distance of their own show the one the
+            # Sphere clips at while it is on
+            col.prop(hs, 'bi_sphere')
+            if hs.bi_sphere and not any(
+                    n == 'decay_end' for n, _t in FALLOFF_ROWS.get(mode, ())):
+                col.prop(hs, 'decay_end', text="Sphere Distance")
+            # R253 (E): 3ds Max's Near Attenuation fade-in (the far
+            # pair is the Custom Range falloff); never on a Sun or
+            # a hemi -- directional lamps carry no attenuation
+            col.prop(hs, 'decay_near_start')
+            col.prop(hs, 'decay_near_end')
         if light.type == 'SPOT':
             col.prop(hs, 'hotspot')
             # R253 (A): Blender Internal's Square cone

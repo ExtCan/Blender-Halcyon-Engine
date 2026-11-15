@@ -1589,6 +1589,27 @@ def frame_lights(scene, settings):
     return select_lights(lights, settings, centre=centre, radius=radius)
 
 
+def limit_report(scene, settings):
+    """One line naming the lamps the Light Limit leaves unlit this frame,
+    or None when every lamp is lit. The limit used to drop lamps in
+    silence -- at the factory 8 a ninth lamp simply did nothing."""
+    lights = [l for l in (getattr(scene, 'lights', None) or [])
+              if l.type != 'AMBIENT']
+    kept = {id(l) for l in frame_lights(scene, settings)}
+    out = [str(getattr(l, 'name', '') or l.type) for l in lights
+           if id(l) not in kept]
+    if not out:
+        return None
+    names = ', '.join(out[:6])
+    if len(out) > 6:
+        names += f' and {len(out) - 6} more'
+    mode = str(settings.light_limit_mode).capitalize()
+    return (f'Light Limit {int(settings.max_lights)} ({mode}): '
+            f'{len(out)} of {len(lights)} lamps are not lit ({names}). '
+            'Raise Light Limit in Render Properties > Lighting, or set it '
+            'to 0 for no limit')
+
+
 def ambient_light_split(scene, settings):
     """(engine_part, world_part) of the ambient pool.
 

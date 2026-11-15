@@ -890,9 +890,18 @@ WIRE_MODE = _items(
      "test"),
 )
 LIGHT_LIMIT = _items(
-    ('BRIGHTEST', "Brightest", "Keep the strongest lights"),
-    ('NEAREST', "Nearest", "Keep the closest lights"),
-    ('FIRST', "First", "Keep them in scene order"),
+    ('BRIGHTEST', "Brightest",
+     "Keep the lamps that deliver the most light to the scene: a Sun's "
+     "Strength against a Point, Spot or Area lamp's Power after its own "
+     "falloff, measured from the middle of the scene (never nearer than "
+     "half its radius). Equal lamps keep their scene order"),
+    ('NEAREST', "Nearest",
+     "Keep the lamps closest to the middle of the scene's geometry. A Sun "
+     "has no position and reaches everything, so it always counts as "
+     "nearest. The camera is not consulted: an orbit never changes the set"),
+    ('FIRST', "First",
+     "Keep the first lamps in scene order, whatever their strength -- a "
+     "console's fixed light registers"),
 )
 SPEC_VIEWER = _items(
     ('PIXEL', "Per Pixel", "The true eye direction at every shaded point"),
@@ -1544,11 +1553,16 @@ DESCRIPTIONS = {
     'light_falloff_default': "How light dims with distance when a light "
                              "does not choose: physically correct inverse "
                              "square, the gentler inverse, the era's "
-                             "none-at-all, or a custom start/end ramp",
+                             "none-at-all, or a custom start/end ramp. "
+                             "Only the law is set here: each lamp left on "
+                             "Scene Default shapes it with its own distance "
+                             "dials, which its Light panel then shows",
     'light_limit_mode': "Which lights survive when the scene has more than "
-                        "the Light Limit: the brightest, the nearest, or "
-                        "simply the first -- emulating fixed-function "
-                        "hardware's light slots",
+                        "the Light Limit: the ones that deliver the most "
+                        "light, the ones nearest the middle of the scene, "
+                        "or simply the first -- emulating fixed-function "
+                        "hardware's light slots. The lamps left out are "
+                        "named in the console and the render's report",
     # ---------------------------------------------------------- shadows
     'shadows': "Master switch for all shadowing. Off is the flat, "
                "floating look of the earliest real-time output",
@@ -2962,7 +2976,8 @@ DESCRIPTIONS = {
     'depth_sort': "Painter's algorithm reproduces the sorting errors of "
                   "hardware without a depth buffer",
     'max_lights': "Hardware light limit. Lights beyond this are dropped, as on "
-                  "fixed-function pipelines. Zero means unlimited",
+                  "fixed-function pipelines (which ones: Light Limit Mode below; "
+                  "a render names them in its report). Zero means unlimited",
 }
 
 COLOR_FIELDS = {'global_ambient', 'fog_color', 'wire_color',
@@ -3666,18 +3681,23 @@ class HalcyonLightSettings(PropertyGroup):
     decay_start: FloatProperty(name="Falloff Start", default=0.0, min=0.0)
     decay_end: FloatProperty(name="Falloff End", default=25.0, min=0.0)
     decay_ld1: FloatProperty(
-        name="Linear Slider", default=0.0, min=0.0, max=1.0,
-        description="BI's Lin slider (att1): active under the "
-                    "Lin/Quad Sliders falloff while above zero")
+        name="Linear Slider", default=0.0, min=0.0, max=100.0, soft_max=1.0,
+        description="The linear term of two falloffs. Lin/Quad Sliders: "
+                    "Blender Internal's Lin slider (att1), a factor only "
+                    "while above zero, 0 to 1 in 2.79. OpenGL 1.1: "
+                    "GL_LINEAR_ATTENUATION, which may be typed above 1")
     decay_ld2: FloatProperty(
-        name="Quad Slider", default=0.0, min=0.0, max=1.0,
-        description="BI's Quad slider (att2): active under the "
-                    "Lin/Quad Sliders falloff while above zero")
+        name="Quad Slider", default=0.0, min=0.0, max=100.0, soft_max=1.0,
+        description="The quadratic term of two falloffs. Lin/Quad Sliders: "
+                    "Blender Internal's Quad slider (att2), a factor only "
+                    "while above zero, 0 to 1 in 2.79. OpenGL 1.1: "
+                    "GL_QUADRATIC_ATTENUATION, which may be typed above 1")
     bi_sphere: BoolProperty(
         name="Sphere", default=False,
         description="BI's Sphere clamp: the light fades linearly to "
                     "zero at its Falloff End and never reaches past "
-                    "it, whatever the falloff curve")
+                    "it, whatever the falloff curve. Point and Spot "
+                    "lamps; the panel shows the distance it clips at")
     gx_ref_brite: FloatProperty(
         name="Ref Brightness (GX)", default=0.5, min=0.05, max=0.95,
         description="GX_InitLightDistAttn's ref_brite: the fraction of the "
@@ -3769,7 +3789,9 @@ class HalcyonLightSettings(PropertyGroup):
         description="Blender Internal's area lamp Gamma (la->k): shapes "
                     "the form-factor energy as pow(intensity, gamma). "
                     "1.0 is linear; below softens the falloff across "
-                    "the lit field, above sharpens it")
+                    "the lit field, above sharpens it. The intensity it "
+                    "raises already carries Distance squared, so above 1 "
+                    "it is a large gain as well as a shape")
     volumetric: FloatProperty(
         name="Volumetric", default=0.0, min=0.0, max=4.0,
         description="Scatters light along the view ray toward this lamp. "
@@ -5010,10 +5032,21 @@ GROUP_DOCS = {
     'HalcyonLightSettings': {
         'decay': "How this light dims with distance: physically correct "
                  "inverse square, the gentler inverse, the era's none, or "
-                 "a custom start/end ramp",
-        'decay_start': "Distance where the custom ramp starts dimming. "
-                       "Closer than this is full brightness",
-        'decay_end': "Distance where the custom ramp reaches zero",
+                 "a custom start/end ramp. Scene Default takes the "
+                 "render's Light Falloff Default and shapes it with this "
+                 "lamp's own distance dials, shown below",
+        'decay_start': "Custom Range only: the distance where the ramp "
+                       "starts dimming; closer than this is full "
+                       "brightness. No other falloff reads it",
+        'decay_end': "This lamp's distance, read by the falloff in use. "
+                     "Custom Range: where the ramp reaches zero. Blender "
+                     "Internal laws: the Distance of half strength. "
+                     "POV-Ray fades: strength 1 here. GX laws: Ref "
+                     "Brightness here. Nominal Distance laws: full "
+                     "strength here. Sphere: the hard edge of the light. "
+                     "Area lamp: the Distance its strength is normalised "
+                     "to, not a range -- brightness scales with Distance "
+                     "squared",
         'shadow': "This light's own shadow method: depth map, traced "
                   "rays, or none -- overriding the scene default when "
                   "the scene is set to Per Light",
