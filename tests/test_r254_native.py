@@ -408,9 +408,8 @@ def test_c_area_power_units():
     _bpy()
     from .. import export as EX
     from .. import properties as PR
-    check('the watts Distance is sqrt(pi / 2) = 1.2533141',
-          abs(EX.AREA_WATTS_DISTANCE - math.sqrt(math.pi / 2.0)) < 1e-15
-          and abs(EX.AREA_WATTS_DISTANCE - 1.2533141) < 1e-7)
+    check('the watts Distance is sqrt(2) = 1.4142136',
+          abs(EX.AREA_WATTS_DISTANCE - math.sqrt(2.0)) < 1e-15)
     ann = PR.HalcyonLightSettings.__annotations__['area_power']
     items = ann.kw.get('items')
     check("Power Units is a lamp property, 'WATTS' by default (what a new "
@@ -434,7 +433,7 @@ def test_c_area_power_units():
     st_c = _settings(light_falloff_default='CUSTOM')
     wd = _export('AREA', hs=_hs(area_power='WATTS'))
     check('...and never resolves to Custom Range, on the lamp or through '
-          'Scene Default (the beam would be cut at 1.25 units)',
+          'Scene Default (the beam would be cut at 1.41 units)',
           LI.resolved_decay(wt, st_c) != 'CUSTOM'
           and LI.resolved_decay(wd, st_c) != 'CUSTOM'
           and LI.resolved_decay(bi, st_c) == 'CUSTOM')
@@ -467,16 +466,16 @@ def test_c_area_power_units():
         'AREA', energy=400.0 / 400.0, size=0.2,
         matrix=_down((0.0, 0.0, hgt)),
         hs=_hs(area_power='BI', shadow='NONE')), st_hi, box=False)) * 400.0
-    check("in watts an Area lamp is pi times the Point lamp of the same "
-          "Power under its nadir, Blender's own ratio",
-          abs(n_w / n_pt / math.pi - 1.0) < 0.01,
-          f'Area / Point = {n_w / n_pt:.4f} (pi = {math.pi:.4f})')
+    check("in watts an Area lamp is 4 times the Point lamp of the same "
+          "Power under its nadir, Blender's own ratio (a face of flux P "
+          "radiates P / pi along its axis, a point P / 4 pi)",
+          abs(n_w / n_pt / 4.0 - 1.0) < 0.01,
+          f'Area / Point = {n_w / n_pt:.4f}')
     check('on Blender Internal units at the factory Distance 25 the same '
-          'lamp is 2 * 25^2 / pi = 398 times that',
-          abs(n_b / n_w / (2.0 * 625.0 / math.pi) - 1.0) < 0.01,
-          f'{n_b / n_w:.1f}')
-    check('area_blender_watts says so: Power x 2 Distance^2 / pi',
-          abs(EX.area_blender_watts(1.0, 25.0, 'BI') - 397.887) < 1e-3
+          'lamp is 25^2 / 2 = 312.5 times that',
+          abs(n_b / n_w / 312.5 - 1.0) < 0.01, f'{n_b / n_w:.1f}')
+    check('area_blender_watts says so: Power x Distance^2 / 2',
+          EX.area_blender_watts(1.0, 25.0, 'BI') == 312.5
           and EX.area_blender_watts(10.0, 25.0, 'WATTS') == 10.0)
     # a new lamp at Blender's Add > Light > Area defaults (10 W, Size 1)
     new = _export('AREA', energy=10.0, size=1.0,
@@ -761,14 +760,38 @@ def test_d_light_units_sort():
               all(any(getattr(fn, '__module__', '').endswith('light_units')
                       and hasattr(fn, '_bpy_persistent')
                       for fn in getattr(hooks, n)) for n in saved))
-        # Blender hides bpy.data while an add-on registers: the sort
-        # waits for the main loop's next turn (a timer) or render_init
+        # Blender swaps bpy.data for a stub while an add-on registers;
+        # the real data is behind its restricted context
         LU.unregister()
         from . import fakebpy
+        real_ctx = bpy.context
+        r1 = _lamp('Unsaved')
+        behind = _data([_bscene('HALCYON_RENDER')], [r1])
+        bpy.data = types.SimpleNamespace()            # the stub
+        bpy.context = types.SimpleNamespace(_real_data=behind)
+        LU.register()
+        made_after = _lamp('MadeAfter')
+        behind.lights.append(made_after)
+        bpy.data = behind
+        bpy.app.timers.pump()
+        fakebpy.fire('render_init', None)
+        check('with bpy.data swapped out during register the open file is '
+              'still sorted at once (a lamp never saved included), nothing '
+              'is left pending, and a lamp a script makes afterwards is a '
+              'new lamp',
+              r1.halcyon.area_power == 'BI' and LU._PENDING[0] is False
+              and not made_after.halcyon.is_property_set('area_power'))
+        LU.unregister()
+        # a build with no road to the data: the sort waits for the main
+        # loop's next turn (a timer) or render_init, and then trusts
+        # only the file on disk
+        on_disk = _blend([eng, b'LAWait\x00', b'LAOther\x00'])
         for route in ('the timer', 'render_init'):
-            w1 = _lamp('Wait')
-            waiting = _data([_bscene('HALCYON_RENDER')], [w1])
-            bpy.data = types.SimpleNamespace()        # restricted
+            w1, w2 = _lamp('Wait'), _lamp('MadeMeanwhile')
+            waiting = _data([_bscene('HALCYON_RENDER')], [w1, w2])
+            waiting.filepath = on_disk
+            bpy.data = types.SimpleNamespace()
+            bpy.context = types.SimpleNamespace()
             LU.register()
             wrote_early = w1.halcyon.is_property_set('area_power')
             bpy.data = waiting
@@ -776,15 +799,25 @@ def test_d_light_units_sort():
                 bpy.app.timers.pump()
             else:
                 fakebpy.fire('render_init', None)
-            check(f'with bpy.data hidden during register the sort is left '
-                  f'pending and runs from {route}, once',
+            check(f'with no road to the data during register the sort is '
+                  f'left pending and runs from {route}, once: the lamp the '
+                  'file on disk holds keeps the old law, a lamp made in '
+                  'the meantime is new',
                   not wrote_early and w1.halcyon.area_power == 'BI'
+                  and not w2.halcyon.is_property_set('area_power')
                   and LU._PENDING[0] is False,
                   f'{wrote_early} {w1.halcyon.area_power}')
             bpy.app.timers.pump()
             LU.unregister()
             check(f'...and no timer is left behind ({route})',
                   not bpy.app.timers.is_registered(LU._sort_pending))
+        check('file_holds_lamp reads a Light datablock\'s name from the '
+              'file (code, name, terminator): Wait yes, Wai no',
+              LU.file_holds_lamp(on_disk, 'Wait') is True
+              and LU.file_holds_lamp(on_disk, 'Wai') is False
+              and LU.file_holds_lamp('/nowhere/x.blend', 'Wait') is None)
+        os.remove(on_disk)
+        bpy.context = real_ctx
         k1, k2 = _lamp('Reg1'), _lamp('Reg2', kind='POINT')
         bpy.data = _data([_bscene('HALCYON_RENDER')], [k1, k2])
         LU.register()
@@ -826,6 +859,8 @@ def test_d_light_units_sort():
                       for n in saved for fn in getattr(hooks, n)))
     finally:
         bpy.data = real_data
+        if 'real_ctx' in locals():
+            bpy.context = real_ctx
         for n, lst in saved.items():
             getattr(hooks, n)[:] = lst
         if not had_init:
@@ -1164,6 +1199,34 @@ def test_e_spot_object_scale():
                          CONES.spot_cone(org, rays, depth, rl2, samples=24)))
     check('spot_scale_fold is exported for the tests and the docs',
           callable(getattr(EX, 'spot_scale_fold', None)))
+    # ---- the strict front-end, where one is installed (the driver's
+    # stand-in: tests/glsl_strict.py compiles the demo scene, which has
+    # no squeezed lamp)
+    from . import glsl_strict as GS
+    if GS._glslang() is None:
+        note('HALCYON_GLSLANG is not set: the strict GLSL compile of the '
+             'elliptical block did not run here')
+        return
+    for label, square, slide in (('elliptical', False, False),
+                                 ('elliptical + Square', True, False),
+                                 ('elliptical with a slide', False, True)):
+        lamp = _export('SPOT', energy=2500.0, scale=(2.0, 1.0, 1.0),
+                       hs=_hs(shadow='MAP', spot_square=square),
+                       matrix=_matrix((2.0, 1.0, 1.0), pos=pos,
+                                      aim=(0, 0, 0)))
+        if slide:
+            lamp.cookie = ck
+        st = _settings()
+        srcs, why = GS._pass_sources(_scene([lamp], st), st)
+        if srcs is None:
+            check(f'strict GLSL: the {label} frame plans', False, str(why))
+            continue
+        bad = [msg for ok, msg in (GS.compile_source(src) for src in srcs)
+               if not ok]
+        check(f'strict GLSL 4.30 accepts every pass of the {label} frame '
+              '(the block is in the text)',
+              not bad and any('sc_x' in src for src in srcs),
+              bad[0][:200] if bad else f'{len(srcs)} passes')
 
 
 # --------------------------------------------------------- (f) scene time
@@ -1417,7 +1480,7 @@ def test_h_light_panel():
     check('an Area lamp on Blender Internal units draws Distance under '
           'Power Units and says what the lamp gives in Blender\'s watts',
           rec[i + 1][:2] == ('decay_end', 'Distance')
-          and rec[i + 2][0] == 'label' and '19.89 W' in rec[i + 2][1],
+          and rec[i + 2][0] == 'label' and '15.62 W' in rec[i + 2][1],
           str(rec[i:i + 3]))
     la_w = types.SimpleNamespace(type='AREA', halcyon=_hs(
         area_power='WATTS'), **NATIVE)

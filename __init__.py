@@ -88,8 +88,11 @@ def _import_modules():
                    legacy_import, light_units, objects, properties,
                    selftest, sparking, templates, ui)
     from .nodes import shader_nodes
+    # light_units after engine: its sort of an already-open file reads
+    # each scene's render engine, which Blender reports as its first
+    # engine until Halcyon's own is registered
     return (properties, shader_nodes, convert, templates, legacy_import,
-            sparking, append_watch, light_units, export, objects, engine,
+            sparking, append_watch, export, objects, engine, light_units,
             selftest, ui)
 
 

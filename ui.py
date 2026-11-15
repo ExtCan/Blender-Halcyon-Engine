@@ -2549,9 +2549,9 @@ def light_falloff_in_use(hs, scene):
 
 def area_watts_label(light, hs):
     """What a Blender Internal Area lamp gives in Blender's watts, as
-    the panel's one-line note (R254). Power x 2 Distance^2 / pi is the
-    far-field ratio of the 2.79 form factor to Cycles and EEVEE; Gamma
-    off 1 reshapes the field, so the number is then only a guide."""
+    the panel's one-line note (R254). Power x Distance^2 / 2 is the
+    ratio of the 2.79 form factor to Cycles and EEVEE; Gamma off 1
+    reshapes the field, so the number is then only a guide."""
     from . import export as _EX
     try:
         w = _EX.area_blender_watts(float(getattr(light, 'energy', 0.0)),

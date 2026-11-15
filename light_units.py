@@ -1,14 +1,14 @@
 """Area lamp power units: which lamps keep Blender Internal's law.
 
 An Area lamp's Power used to mean one thing under Halcyon: Blender
-Internal's energy, normalised at the lamp's Distance dial, 2 D^2 / pi
-times Blender's watts (398 at the factory Distance 25). A lamp added in
+Internal's energy, normalised at the lamp's Distance dial, D^2 / 2
+times Blender's watts (312 at the factory Distance 25). A lamp added in
 Blender 5 arrives in watts, so a new Area lamp whited out the frame.
 Since 1.93 every Area lamp carries `halcyon.area_power`: 'WATTS' (the
 RNA default, what a NEW lamp gets) or 'BI' (the old law, bitwise).
 
 A lamp saved before the option existed has no value stored, and would
-read the default and render 398 times darker. This module is what keeps
+read the default and render 312 times darker. This module is what keeps
 those lamps as they were: wherever an Area lamp ARRIVES without a stored
 value, it is judged by the file it was last saved in, and 'BI' is
 written onto it when that file is an older Halcyon file.
@@ -35,14 +35,18 @@ file, and before every save. The routes a lamp can arrive by:
   `bpy.data.libraries.load`: `blend_import_post`, the same search of
   the source file. A classic (2.79) source is the append watch's: its
   lamps get 'BI' with the rest of their Blender Internal values.
-* The add-on enabled over an open file: `register` runs the load-time
-  sort. Blender hides `bpy.data` while an add-on registers, so the sort
-  is left pending and runs from a zero-delay timer (the next turn of
-  the main loop) or, in a background session that has none, from
-  `render_init` before the first frame is exported. Those writes happen
-  outside the undo stack, so undo could take them back: every lamp this
-  session set to 'BI' is remembered by session_uid, and `undo_post` /
-  `redo_post` write the value again where it went missing.
+* The add-on enabled, or updated, over an open file: `register` sorts
+  the file at once -- every Area lamp that exists at that moment was lit
+  under the old law, saved or not. Blender swaps `bpy.data` for a stub
+  while an add-on registers; the real one is read through the restricted
+  context (`bpy.context._real_data`, what its own `window_manager`
+  property reads). Where a build offers no such road the sort is left
+  pending for a zero-delay timer or `render_init`, and then only touches
+  the lamps the file on disk holds (a lamp a script made after enabling
+  the add-on is a new lamp). Either way the writes happen outside the
+  undo stack, so undo could take them back: every lamp this session set
+  to 'BI' is remembered by session_uid, and `undo_post` / `redo_post`
+  write the value again where it went missing.
 * A lamp created by a script or an operator has no stored value: watts,
   the RNA default. `save_pre` stores the value each local Area lamp is
   using, so a lamp appended later from that file says what it is by
@@ -53,7 +57,8 @@ missing (the lamp's own dials decide alone); a lamp made while the
 add-on was disabled in an unstamped Halcyon file (it is sorted with the
 old ones); "Reset to Default Value" on a migrated lamp's Power Units
 followed by an undo in the same session (the 'BI' comes back; choosing
-an item from the menu is never overridden).
+an item from the menu is never overridden); a library override of a
+linked lamp follows its own stored value like any local lamp.
 """
 
 import os
@@ -184,19 +189,20 @@ def _chunks(fh, size=1 << 22):
         yield b
 
 
-def file_marks(path):
-    """(shows Halcyon, is sorted) for a .blend on disk, read from its
-    bytes, or None when the file cannot be read. Plain, zstd (Blender
-    3.0+) and gzip (older) files; cached per (path, mtime, size)."""
+def file_has(path, marks):
+    """Which of the byte strings `marks` a .blend on disk contains, as a
+    tuple of bools, or None when the file cannot be read. Plain, zstd
+    (Blender 3.0+) and gzip (older) files; cached per (path, mtime,
+    size, marks)."""
+    marks = tuple(marks)
     try:
         st = os.stat(path)
-        key = (path, st.st_mtime, st.st_size)
+        key = (path, st.st_mtime, st.st_size, marks)
     except OSError:
         return None
     hit = _MARKS.get(key)
     if hit is not None:
         return hit
-    marks = (_MARK_ENGINE, _MARK_STAMP)
     try:
         with open(path, 'rb') as fh:
             head = fh.read(4)
@@ -214,11 +220,29 @@ def file_marks(path):
                 found = _search(_chunks(fh), marks)
     except Exception:                                           # noqa: BLE001
         return None
-    out = (bool(found[0]), bool(found[1]))
+    out = tuple(bool(f) for f in found)
     if len(_MARKS) > 64:
         _MARKS.clear()
     _MARKS[key] = out
     return out
+
+
+def file_marks(path):
+    """(shows Halcyon, is sorted) for a .blend on disk, read from its
+    bytes, or None when the file cannot be read."""
+    return file_has(path, (_MARK_ENGINE, _MARK_STAMP))
+
+
+def file_holds_lamp(path, name):
+    """True when the .blend on disk holds a Light datablock of this name
+    (its ID name as the file stores it: the two-letter code, the name,
+    a terminator); None when the file cannot be read."""
+    try:
+        mark = b'LA' + str(name).encode('utf-8') + b'\x00'
+    except Exception:                                           # noqa: BLE001
+        return None
+    hit = file_has(path, (mark,))
+    return None if hit is None else hit[0]
 
 
 def _abspath(fp, library=None):
@@ -284,9 +308,15 @@ def stamp_scenes(data):
             pass
 
 
-def sort_file(data=None):
+def sort_file(data=None, on_disk_only=False):
     """The load-time sort of the open file. Returns the names of the
-    lamps kept on Blender Internal units."""
+    lamps kept on Blender Internal units.
+
+    `on_disk_only` is the pending form (the add-on enabled over an open
+    file on a build whose data could not be read at register): time has
+    passed since, so a local lamp is sorted only when the file on disk
+    holds it -- anything else was made after the add-on came up and is a
+    new lamp."""
     data = bpy.data if data is None else data
     kept = []
     lights = [la for la in getattr(data, 'lights', ())
@@ -294,9 +324,13 @@ def sort_file(data=None):
     if lights:
         own_sorted = file_is_sorted(data)
         own_halcyon = file_shows_halcyon(data)
+        own_path = str(getattr(data, 'filepath', '') or '')
         for la in lights:
             lib = getattr(la, 'library', None)
             if lib is None:
+                if on_disk_only and not (own_path and file_holds_lamp(
+                        own_path, la.name)):
+                    continue
                 halcyon, is_sorted = own_halcyon, own_sorted
             else:
                 marks = file_marks(_abspath(
@@ -354,10 +388,24 @@ def sort_import(items):
 # -------------------------------------------------------------- handlers
 
 
+def _readable(data):
+    return hasattr(data, 'lights') and hasattr(data, 'scenes')
+
+
 def _data_ready():
     """False while Blender restricts bpy.data (an add-on registering)."""
+    return _readable(getattr(bpy, 'data', None))
+
+
+def _data_now():
+    """The open file's data, also while an add-on registers: bpy.data,
+    or the real one behind Blender's restricted context. None when
+    neither can be read."""
     data = getattr(bpy, 'data', None)
-    return hasattr(data, 'lights') and hasattr(data, 'scenes')
+    if _readable(data):
+        return data
+    data = getattr(getattr(bpy, 'context', None), '_real_data', None)
+    return data if _readable(data) else None
 
 
 def _report(kept):
@@ -388,7 +436,7 @@ def _sort_pending(*_args):
     try:
         if _PENDING[0] and _data_ready():
             _PENDING[0] = False
-            _report(sort_file())
+            _report(sort_file(on_disk_only=True))
     except Exception:                                           # noqa: BLE001
         import traceback
         traceback.print_exc()
@@ -452,13 +500,13 @@ def register():
         lst = getattr(h, name, None)
         if isinstance(lst, list) and fn not in lst:
             lst.append(fn)
-    # the already-open file too. While an add-on registers Blender
-    # hides bpy.data, so the sort waits for the next turn of the main
-    # loop (or for render_init, or is made moot by a file load -- at
-    # start-up that is the load_post of the file being opened)
-    if _data_ready():
+    # the already-open file too: the lamps that exist now were lit
+    # under the old law (the add-on enabled or updated mid-session; at
+    # start-up the file is not loaded yet and its load_post follows)
+    data = _data_now()
+    if data is not None:
         try:
-            _report(sort_file())
+            _report(sort_file(data))
         except Exception:                                       # noqa: BLE001
             pass
         return

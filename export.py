@@ -1089,10 +1089,13 @@ def _mesh_arrays(me, matrix, mat_offset, obj_index):
 #: R254: the Distance at which Blender Internal's area form factor
 #: (pow(stokes * dist^2 / A, gamma), energy / 4 pi) gives Blender's own
 #: watts. Far from the lamp stokes = 2 A cos cos' / r^2, so the pixel is
-#: albedo * P * 2 D^2 cos cos' / (4 pi^2 r^2) where Cycles and EEVEE
-#: give albedo * P cos cos' / (4 pi r^2): the ratio 2 D^2 / pi is 1 at
-#: D = sqrt(pi / 2) (and 398 at the Distance dial's factory 25)
-AREA_WATTS_DISTANCE = math.sqrt(math.pi / 2.0)
+#: albedo * P * D^2 cos cos' / (2 pi^2 r^2). Blender's Area lamp is a
+#: one-sided Lambertian face of flux P, radiance P / (pi A) (EEVEE
+#: shape_radiance_get; Cycles renders the same), which lights that
+#: pixel albedo * P cos cos' / (pi^2 r^2) -- four times a Point lamp of
+#: the same Power on its axis. The ratio D^2 / 2 is 1 at D = sqrt(2)
+#: (and 312.5 at the Distance dial's factory 25)
+AREA_WATTS_DISTANCE = math.sqrt(2.0)
 
 
 def area_power_units(hs):
@@ -1105,12 +1108,12 @@ def area_power_units(hs):
 
 def area_blender_watts(energy, distance, units):
     """What an Area lamp gives in Blender's watts: the Power itself
-    under 'WATTS', Power * 2 Distance^2 / pi under 'BI' (Gamma 1; the
+    under 'WATTS', Power * Distance^2 / 2 under 'BI' (Gamma 1; the
     panel prints it beside the Distance dial)."""
     if units == 'WATTS':
         return float(energy)
     d = max(float(distance), 1e-6)
-    return float(energy) * 2.0 * d * d / math.pi
+    return float(energy) * d * d / 2.0
 
 
 def bke_light_area(la, mw):

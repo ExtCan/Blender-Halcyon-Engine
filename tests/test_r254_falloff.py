@@ -1019,9 +1019,9 @@ def test_j_panel_draws_what_the_law_reads():
             if ('decay_end', 'Distance') in rec else -1
         check('the Light panel draws an Area lamp\'s Distance under Blender '
               'Internal power units, with what the lamp gives in Blender\'s '
-              'watts beside it (10 W at Distance 25: 3979 W)',
+              'watts beside it (10 W at Distance 25: 3125 W)',
               i_d >= 1 and rec[i_d - 1][0] == 'area_power'
-              and rec[i_d + 1][0] == 'label' and '3979 W' in rec[i_d + 1][1],
+              and rec[i_d + 1][0] == 'label' and '3125 W' in rec[i_d + 1][1],
               str(rec[i_d - 1:i_d + 2]))
         check('...and no Distance in watts, where nothing reads it',
               not any(n == 'decay_end' for n, _t in native(

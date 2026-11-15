@@ -5080,9 +5080,9 @@ GROUP_DOCS = {
                      "strength here. Sphere: the hard edge of the light. "
                      "Area lamp on Blender Internal power units: the "
                      "Distance its strength is normalised to, not a range "
-                     "-- brightness scales with Distance squared (1.25 "
+                     "-- brightness scales with Distance squared (1.41 "
                      "makes Power read as Blender's watts, the factory 25 "
-                     "is about 400 times that)",
+                     "is 312 times that)",
         'shadow': "This light's own shadow method: depth map, traced "
                   "rays, or none -- overriding the scene default when "
                   "the scene is set to Per Light",
