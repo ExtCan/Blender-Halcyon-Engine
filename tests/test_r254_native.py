@@ -231,7 +231,8 @@ def _roads(label, lights, st=None, bar=BAR, **kw):
         return c, None
     d = float(np.abs(c - g).max())
     check(f'{label}: the GPU twin is the CPU frame within the deferred bar',
-          d < bar, f'max |CPU - GPU| {d:.2e} (frame peak {float(c.max()):.3f})')
+          d < bar,
+          f'max |CPU - GPU| {d:.2e} (frame peak {float(c.max()):.3f})')
     return c, g
 
 
@@ -314,7 +315,8 @@ def test_b_exposure_temperature_normalize():
         dn = _export(kind, exposure=-2.0)
         check(f'{kind}: Exposure +1 doubles the exported energy, -2 '
               'quarters it (BKE_light_power = energy * 2^exposure)',
-              up.energy == base.energy * 2.0 and dn.energy == base.energy * 0.25,
+              up.energy == base.energy * 2.0
+              and dn.energy == base.energy * 0.25,
               f'{base.energy} -> {up.energy}, {dn.energy}')
         warm = _export(kind, use_temperature=True, temperature=2000.0,
                        temperature_color=TEMP_2000, color=(1.0, 0.5, 0.25))
@@ -744,7 +746,7 @@ def test_d_light_units_sort():
         hooks.render_init = []
     saved = {n: list(getattr(hooks, n)) for n in (
         'load_post', 'blend_import_post', 'undo_post', 'redo_post',
-        'save_pre', 'render_init')}
+        'save_pre', 'render_init', 'depsgraph_update_post')}
     real_data = bpy.data
     try:
         # ---- the handlers, as Blender fires them
@@ -757,7 +759,8 @@ def test_d_light_units_sort():
               and bpy.data.scenes[0].halcyon.light_units_version
               == LU.UNITS_VERSION)
         check('register hooks load_post, blend_import_post, undo_post, '
-              'redo_post, save_pre and render_init, each marked persistent',
+              'redo_post, save_pre, render_init and depsgraph_update_post, '
+              'each marked persistent',
               all(any(getattr(fn, '__module__', '').endswith('light_units')
                       and hasattr(fn, '_bpy_persistent')
                       for fn in getattr(hooks, n)) for n in saved))
@@ -833,6 +836,48 @@ def test_d_light_units_sort():
         fakebpy.fire('redo_post', None)
         check('...and never touches a lamp this session did not sort',
               not user.halcyon.is_property_set('area_power'))
+        # a lamp made in this session says what it is at its first
+        # viewport update (the copy buffer and libraries.write carry no
+        # scene and no stamp: Ctrl+C / Ctrl+V of a new lamp with a moved
+        # Halcyon dial arrived looking like an older Halcyon lamp)
+
+        def dg(ids, mode='VIEWPORT', lights=True):
+            return types.SimpleNamespace(
+                mode=mode, id_type_updated=lambda t: lights and t == 'LIGHT',
+                updates=[types.SimpleNamespace(id=types.SimpleNamespace(
+                    original=i, type=i.type)) for i in ids])
+        made = _lamp('MadeNow', shadow='RAY')
+        pt = _lamp('PointNow', kind='POINT')
+        linked_new = _lamp('LinkedNow', library=lib(p_new))
+        fakebpy.fire('depsgraph_update_post', None,
+                     dg([made, pt, linked_new], mode='RENDER'))
+        check("the render's own depsgraph writes nothing",
+              not made.halcyon.is_property_set('area_power'))
+        fakebpy.fire('depsgraph_update_post', None,
+                     dg([made, pt, linked_new]))
+        check('a new Area lamp stores its units (watts) at its first '
+              'viewport update; a Point lamp and a linked lamp are not '
+              'written to',
+              made.halcyon.is_property_set('area_power')
+              and made.halcyon.area_power == 'WATTS'
+              and not pt.halcyon.is_property_set('area_power')
+              and not linked_new.halcyon.is_property_set('area_power'))
+        clip = _blend([])                     # a copy buffer: no scene
+        pasted = _lamp('Pasted', shadow='RAY', area_power='WATTS')
+        bare = _lamp('PastedBare', shadow='RAY')
+        kept = LU.sort_import([item(pasted, clip, 'LIGHT'),
+                               item(bare, clip, 'LIGHT')])
+        check('...so its copy through the copy buffer keeps watts (without '
+              'the stored value its moved dial reads as an older lamp)',
+              pasted.halcyon.area_power == 'WATTS' and kept == ['PastedBare'])
+        os.remove(clip)
+        # an undo that drops an old lamp's value and reaches the update
+        # handler before undo_post still keeps the old law
+        k1.halcyon.property_unset('area_power')
+        LU._TRIED.clear()
+        fakebpy.fire('depsgraph_update_post', None, dg([k1]))
+        check('an old lamp restored without its value keeps the old law '
+              'whichever handler sees it first', k1.halcyon.area_power == 'BI')
         # save
         fakebpy.fire('save_pre', None)
         check('before a save every local Area lamp stores the units it is '

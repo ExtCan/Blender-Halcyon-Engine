@@ -167,10 +167,20 @@ in the scratch directory `wt/native/out/`.
     written again by `undo_post` / `redo_post` for the lamps this session
     sorted.
   - A lamp made by a script or an operator has no stored value: watts.
-    `save_pre` stores what each local Area lamp is using and stamps every
-    scene, so a lamp appended later from that file says what it is.
+    It stores that value at its first viewport depsgraph update
+    (`depsgraph_update_post`; every lamp that came from a file has been
+    sorted by then) and `save_pre` stores what each local Area lamp is
+    using and stamps every scene, so a lamp says what it is wherever it
+    goes next. This closed a hole of the design itself, found by trying
+    it: Ctrl+C / Ctrl+V travels through a partial .blend with no scene and
+    no stamp, and a NEW lamp with a moved Halcyon dial came back from the
+    paste on Blender Internal units (312 times brighter); the same through
+    `bpy.data.libraries.write`.
   - The legacy importer and the append watch set 'BI' with the rest of a
     2.79 lamp's values (`legacy_import._apply_lamp_bi`).
+  By design: only lamps that ARE Area lamps when they arrive are sorted,
+  so a Point lamp of an old file switched to Area afterwards is a new Area
+  lamp (watts); a duplicate of a sorted lamp carries its stored value.
   Not covered: a compressed library when Blender's bundled zstandard
   module is missing (the lamp's own dials decide alone); a lamp made while
   the add-on was disabled, in an unstamped Halcyon file (sorted with the
@@ -178,11 +188,21 @@ in the scratch directory `wt/native/out/`.
   followed by an undo in the same session (the 'BI' returns; a choice from
   the menu is never overridden); an Area lamp appended from a pre-1.93
   Halcyon file that is zstd-unreadable AND has every Halcyon dial at its
-  default (arrives in watts).
+  default (arrives in watts); a lamp a background script creates, moves a
+  Halcyon dial on, writes with `libraries.write` and appends elsewhere
+  with no save and no viewport update in between (arrives looking like an
+  older Halcyon lamp); an old lamp with every Halcyon dial at its default
+  copied (Ctrl+C) in a Blender still running a pre-1.93 Halcyon and
+  pasted into this one (arrives in watts).
 - **Pictures that change.** A lamp CREATED after this version (watts); a
   file never used with Halcyon whose Area lamps were at the factory
   Distance (they were white, now they are Blender's lamp). Area lamps of
-  older Halcyon files: none.
+  older Halcyon files: none. Material preview thumbnails: Blender's own
+  preview scene hands the engine two Area lamps (54.98 W and 8 W) and a
+  1000 W Point lamp; that scene is not in bpy.data, so its Area lamps are
+  never sorted and now read as the watts Blender authored them in (they
+  were 312.5 times that). Not measured as pixels: the background preview
+  route returns flat frames on both trees.
 - **Proof.** New 10 W lamp, real F12: old tree frame mean 0.7945 with
   72.9% of the frame white -> 0.0447, 0.0% white (lit mean 0.0108, Cycles
   0.0100; the frame is 8-bit stepped). Size 3 and object scale 3 keep the
@@ -200,7 +220,11 @@ in the scratch directory `wt/native/out/`.
   (zstd copy) 'BI'; a Light datablock from an old library with default
   dials 'BI'; the EEVEE file's lamp unset; a lamp from a file re-saved by
   this tree keeps its stored Watts. Link: the same three verdicts, and
-  again after the linking file is saved and reopened. The EEVEE-authored
+  again after the linking file is saved and reopened. Ctrl+C / Ctrl+V
+  and libraries.write + append of a new lamp with Shadows moved to Ray
+  Traced, live UI session: the copies came back 'BI' before the lamp
+  stored its units at its first update, Watts after. The add-on enabled
+  at start-up with the old file on the command line: both lamps 'BI'. The EEVEE-authored
   file under Halcyon: mean 0.0511, 0.0% white. Headless: Area / Point at
   equal Power under the lamp 3.996 (Blender: 4); Blender Internal at
   Distance 25 / Watts 312.5; CPU against the GPU twin 3.5e-8.
@@ -375,7 +399,7 @@ closed, no thumbnail under the software rasteriser) and a real GPU F12
 
 ## Tests
 
-`tests/test_r254_native.py`, nine functions, 221 checks (three of them the
+`tests/test_r254_native.py`, nine functions, 225 checks (three of them the
 strict GLSL compile, run where HALCYON_GLSLANG is set; the zstd file check
 runs where the zstandard module imports, as in Blender); 52 fail on the
 base tree (every function fails or raises there). Existing modules run

@@ -48,9 +48,14 @@ file, and before every save. The routes a lamp can arrive by:
   to 'BI' is remembered by session_uid, and `undo_post` / `redo_post`
   write the value again where it went missing.
 * A lamp created by a script or an operator has no stored value: watts,
-  the RNA default. `save_pre` stores the value each local Area lamp is
-  using, so a lamp appended later from that file says what it is by
-  itself.
+  the RNA default. It is made to SAY so as soon as it shows up in a
+  viewport depsgraph update (`depsgraph_update_post`: every lamp that
+  came from a file has been sorted by then, so a lamp still without a
+  value was made, or switched to Area, in this session) and again by
+  `save_pre`, which stores the value each local Area lamp is using.
+  That matters wherever a lamp travels without its scene: Ctrl+C /
+  Ctrl+V goes through a partial .blend with no scene and no stamp, and
+  so does `bpy.data.libraries.write`.
 
 Not covered: a compressed library when Blender's zstandard module is
 missing (the lamp's own dials decide alone); a lamp made while the
@@ -58,7 +63,10 @@ add-on was disabled in an unstamped Halcyon file (it is sorted with the
 old ones); "Reset to Default Value" on a migrated lamp's Power Units
 followed by an undo in the same session (the 'BI' comes back; choosing
 an item from the menu is never overridden); a library override of a
-linked lamp follows its own stored value like any local lamp.
+linked lamp follows its own stored value like any local lamp; a lamp a
+background script creates, moves a Halcyon dial on, writes out with
+`libraries.write` and appends elsewhere without a save or a viewport
+update in between (it arrives looking like an older Halcyon lamp).
 """
 
 import os
@@ -100,6 +108,10 @@ _MARKS = {}
 #: True while the open file still waits for its sort (the add-on was
 #: enabled over it and bpy.data was not readable during register)
 _PENDING = [False]
+
+#: session_uid -> how often storing a new lamp's units was tried (a
+#: write that is refused is not retried forever)
+_TRIED = {}
 
 
 # ------------------------------------------------------------ inspection
@@ -422,6 +434,7 @@ def _on_load(*_args):
     try:
         _PENDING[0] = False
         _KEPT_BI.clear()
+        _TRIED.clear()
         _report(sort_file())
     except Exception:                                           # noqa: BLE001
         import traceback
@@ -464,6 +477,7 @@ def _on_undo(*_args):
     """undo_post / redo_post: a 'BI' this session wrote outside the undo
     stack is written again where a restored state dropped it."""
     try:
+        _TRIED.clear()
         if not _KEPT_BI:
             return
         for la in bpy.data.lights:
@@ -471,6 +485,45 @@ def _on_undo(*_args):
             if uid is not None and int(uid) in _KEPT_BI \
                     and _unsorted_area(la):
                 la.halcyon.area_power = 'BI'
+    except Exception:                                           # noqa: BLE001
+        pass
+
+
+@persistent
+def _on_depsgraph(scene=None, depsgraph=None):
+    """depsgraph_update_post: a local Area lamp that turns up in a
+    viewport update without a stored value was made (or switched to
+    Area) in this session, so it stores the units it is using. Lamps
+    only: the render's own depsgraph, a running render and a pending
+    sort are left alone, and a refused write is tried three times."""
+    try:
+        if _PENDING[0] or depsgraph is None:
+            return
+        if getattr(depsgraph, 'mode', 'VIEWPORT') != 'VIEWPORT':
+            return
+        if not depsgraph.id_type_updated('LIGHT'):
+            return
+        try:
+            if bpy.app.is_job_running('RENDER'):
+                return
+        except Exception:                                       # noqa: BLE001
+            pass
+        for u in depsgraph.updates:
+            la = getattr(u.id, 'original', u.id)
+            if not (_local(la) and _unsorted_area(la)):
+                continue
+            uid = int(getattr(la, 'session_uid', 0) or 0)
+            if _TRIED.get(uid, 0) >= 3:
+                continue
+            _TRIED[uid] = _TRIED.get(uid, 0) + 1
+            try:
+                # a lamp this session sorted onto the old law that an
+                # undo brought back without its value keeps that law,
+                # whichever of this handler and undo_post runs first
+                la.halcyon.area_power = 'BI' if uid in _KEPT_BI \
+                    else la.halcyon.area_power
+            except Exception:                                   # noqa: BLE001
+                continue
     except Exception:                                           # noqa: BLE001
         pass
 
@@ -494,7 +547,8 @@ def _on_save(*_args):
 
 _HOOKS = (('load_post', _on_load), ('blend_import_post', _on_import),
           ('undo_post', _on_undo), ('redo_post', _on_undo),
-          ('save_pre', _on_save), ('render_init', _sort_pending))
+          ('save_pre', _on_save), ('render_init', _sort_pending),
+          ('depsgraph_update_post', _on_depsgraph))
 
 
 def register():
@@ -534,4 +588,5 @@ def unregister():
         pass
     _PENDING[0] = False
     _KEPT_BI.clear()
+    _TRIED.clear()
     _MARKS.clear()
