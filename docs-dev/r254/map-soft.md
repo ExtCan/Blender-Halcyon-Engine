@@ -83,18 +83,23 @@ in `<scratch>/wt/map-soft/` (`aud/widths.py`, `aud/stress.py`,
 - **A size edit re-bakes nothing** (size-map-07). The lamp's size left
   `lights._light_shadow_signature`: the map carries nothing derived from it.
   A Radius drag on a 2048 point lamp went from 6 rasterisations and 2.0 to
-  2.7 s per step to 0 rasterisations and 0.19 to 0.29 s (`aud/perf.py drag`),
+  2.7 s per step to 0 rasterisations and 0.18 to 0.19 s (`aud/perf.py drag`;
+  512 point 0.19 to 0.24 s, 2048 Sun 0.12 s, 512 Area 0.29 to 0.37 s),
   and the per-size copies of the maps the cache used to keep (up to 65) are
   gone with the key.
 
 - **Where this departs from the audit's prototype, and why** (each measured;
-  the verifier's corrections are marked V):
+  the verifier's corrections are marked V; a before -> after pair in this
+  list was taken when that one change was made, the final tree's numbers
+  are under The numbers):
   - *No guard ring.* The prototype padded every cube face with 57 / 213
     texels resampled from its neighbours (2 to 5 s per bake at 2048, +140 MB
     of depth, a 2048 cube atlas growing from 384 to 560 MB). Reading the
     neighbour at lookup gives the same seam (largest step along a seam-hugging
-    shadow edge 0.005 to 0.012, rms against 256 rays 0.012 to 0.032; clamped
-    at the face edge the step is 1.0) for nothing: `aud/seam.py`.
+    shadow edge 0.003 to 0.007, rms against 256 rays 0.010 to 0.032 over
+    POINT 0.25 / 0.5 / 1.0 and AREA 1.0 on 512 and 2048 maps; clamped at the
+    face edge the step is 1.0 and the rms 0.12 to 0.23) for nothing:
+    `aud/seam.py`.
   - *The plane depth is clamped at the receiver's own.* A plane continued
     past a concave corner runs behind the neighbouring surface and reads it
     as a caster. Wall face above a floor, 512 map, darkest term: Sun 0.05
@@ -146,7 +151,7 @@ in `<scratch>/wt/map-soft/` (`aud/widths.py`, `aud/stress.py`,
     under size/16 texels (cone 0.35 rad: radius 0.5 and 1.0 both 0.320) and
     proposed size/4 for Spot and Sun maps. An angle at the lamp is the rule
     that makes a Point and a Spot of one Radius agree: cone 0.35 rad now
-    gives 0.474 / 0.973 for radius 0.5 / 1.0 (traced 0.479 / 0.966). For a
+    gives 0.464 / 0.930 for radius 0.5 / 1.0 (traced 0.480 / 0.965). For a
     Sun size/4 was measured and NOT taken: at 0.6 rad the twelve search taps
     step over casters (largest step 0.31 to 0.36 against 0.03 to 0.07 at
     size/16). Doubling the angle for cubes was measured and not taken either:
@@ -156,9 +161,11 @@ in `<scratch>/wt/map-soft/` (`aud/widths.py`, `aud/stress.py`,
 
 - **Softness on a sized lamp** (soft-erode-01, the sized half). Shadow mass
   behind the wall at Softness 1 / 4 / 8 / 16, 512 map: POINT radius 0.25:
-  7.89 / 7.90 / 7.88 / 7.88 (the prototype kept `max(1, S)` in the offset:
-  area 7.43 / 6.07 / 4.58 / 2.53); Sun 0.05: 3.29 / 3.29 / 3.28 / 3.14. The
-  edge still widens with the dial. A lamp of size 0 keeps its arithmetic
+  7.99 / 8.03 / 8.05 / 8.17, area darker than half 7.83 / 7.92 / 7.88 / 7.77
+  (the prototype kept `max(1, S)` in the offset: area 7.43 / 6.07 / 4.58 /
+  2.53; the old engine: mass 5.31 / 4.36 / 3.27 / 1.71); Sun 0.05: mass
+  3.30 / 3.26 / 3.31 / 3.47 (old 1.97 / 1.51 / 0.91 / 0.19). The edge still
+  widens with the dial. A lamp of size 0 keeps its arithmetic
   bitwise in this package, erosion included (POINT 7.47 -> 2.67 at 16): that
   is the other decision the audit names.
 
@@ -183,64 +190,80 @@ stratified rays (`aud/widths.py`).
 
 | lamp | traced | map 512 | map 2048 | old, 512 |
 |---|---|---|---|---|
-| POINT 0.1 | 0.024 0.061 0.095 0.132 | 0.040 0.073 0.103 0.136 | 0.025 0.060 0.096 0.131 | 0.078 0.070 0.081 0.093 |
-| POINT 0.25 | 0.059 0.150 0.242 0.326 | 0.069 0.153 0.244 0.331 | 0.059 0.146 0.237 0.325 | 0.116 0.140 0.166 none |
-| POINT 0.5 | 0.117 0.298 0.479 0.647 | 0.131 0.304 0.479 0.599 | 0.118 0.295 0.471 0.641 | 0.228 0.256 none none |
-| POINT 1.0 | 0.230 0.597 0.966 1.324 | 0.243 0.590 0.824 1.045 | 0.238 0.573 0.816 1.043 | 0.398 none none none |
-| SPOT 0.25 | 0.059 0.150 0.242 0.326 | 0.076 0.152 0.251 0.320 | 0.057 0.146 0.233 0.314 | 0.183 0.198 0.213 none |
-| SPOT 0.5 | 0.117 0.298 0.479 0.647 | 0.130 0.308 0.473 0.613 | 0.115 0.293 0.483 0.611 | 0.285 0.308 none none |
-| SUN 0.05 | 0.026 0.077 0.127 | 0.068 0.101 0.140 | 0.035 0.084 0.135 | 0.363 0.286 none |
-| SUN 0.1 | 0.051 0.153 0.253 | 0.087 0.171 0.260 | 0.066 0.169 0.263 | 0.536 none none |
-| SUN 0.2 | 0.103 0.307 0.516 | 0.143 0.339 0.516 | 0.135 0.337 0.527 | none none none |
-| AREA 0.5 | 0.067 0.171 0.275 0.376 | 0.075 0.176 0.271 0.360 | 0.066 0.163 0.263 0.354 | 0.116 0.140 0.166 none |
-| AREA 1.0 | 0.135 0.343 0.553 0.740 | 0.141 0.349 0.534 0.745 | 0.132 0.335 0.527 0.711 | 0.228 0.256 none none |
+| POINT 0.1 | 0.024 0.061 0.095 0.132 | 0.040 0.073 0.103 0.138 | 0.025 0.067 0.096 0.130 | 0.078 0.070 0.081 0.093 |
+| POINT 0.25 | 0.059 0.150 0.242 0.326 | 0.069 0.165 0.245 0.328 | 0.059 0.161 0.238 0.327 | 0.116 0.140 0.166 none |
+| POINT 0.5 | 0.117 0.298 0.479 0.647 | 0.128 0.300 0.481 0.650 | 0.117 0.310 0.474 0.644 | 0.228 0.256 none none |
+| POINT 1.0 | 0.230 0.597 0.966 1.324 | 0.257 0.625 0.862 1.075 | 0.255 0.623 0.854 1.065 | 0.398 none none none |
+| SPOT 0.25 | 0.059 0.150 0.242 0.326 | 0.076 0.152 0.260 0.315 | 0.057 0.144 0.244 0.317 | 0.183 0.198 0.213 none |
+| SPOT 0.5 | 0.117 0.298 0.479 0.647 | 0.130 0.315 0.461 0.650 | 0.122 0.305 0.463 0.646 | 0.285 0.308 none none |
+| SUN 0.05 | 0.026 0.077 0.127 | 0.068 0.101 0.140 | 0.035 0.082 0.132 | 0.363 0.286 none |
+| SUN 0.1 | 0.051 0.153 0.253 | 0.087 0.171 0.261 | 0.066 0.164 0.258 | 0.536 none none |
+| SUN 0.2 | 0.103 0.307 0.516 | 0.143 0.332 0.510 | 0.131 0.328 0.512 | none none none |
+| AREA 0.5 | 0.067 0.171 0.275 0.376 | 0.075 0.185 0.278 0.368 | 0.067 0.177 0.271 0.364 | 0.116 0.140 0.166 none |
+| AREA 1.0 | 0.135 0.343 0.553 0.740 | 0.135 0.340 0.547 0.744 | 0.129 0.353 0.541 0.730 | 0.228 0.256 none none |
 
-Levels across a penumbra: 18 to 390 (old: 5); largest single step on a line
+Levels across a penumbra: 12 to 432 (old: 5); largest single step on a line
 sampled every 0.0025: 0.02 to 0.06 for the sizes above at 512 (old: 0.25).
 A Sun's 512 map spans the whole scene (texel 0.041 here), which is the
-0.03 to 0.04 its nearest line is wider than the traced one.
+0.03 to 0.04 its nearest line is wider than the traced one. Shadow mass
+behind the wall against the traced road's (`try_mass.py`): within 3.1 % for
+POINT up to 1.0, SPOT up to 1.0, SUN up to 0.6 and AREA up to 1.0;
+POINT 2.0 -6.4 %, AREA 3.0 -4.8 % (the cap).
 
 The acceptance scene (`soft_metrics.py`, 320x240, floor + box + ball,
 512 map, Samples 4): umbra / penumbra pixels, shadow mass, grey levels,
-neighbour roughness.
+neighbour roughness; the traced column is the same lamp at 4 rays.
 
 | lamp, size | old mass | new: umbra | penumbra | mass | levels | rough | traced mass |
 |---|---|---|---|---|---|---|---|
 | POINT 0 | 2964.5 | 2914 | 121 | 2964.5 | 3 | 0.119 | 3127 |
-| POINT 0.1 | 2701.0 | 2845 | 432 | 3054.6 | 275 | 0.070 | 3098 |
-| POINT 0.5 | 1957.0 | 1944 | 2336 | 3058.1 | 760 | 0.023 | 3126 |
-| POINT 2.0 | 1247.2 | 1192 | 4819 | 3157.4 | 875 | 0.011 | 3860 |
-| SPOT 0.1 | 2726.8 | 2851 | 453 | 3070.4 | 342 | 0.080 | 3098 |
-| SPOT 0.5 | 2000.8 | 2079 | 2101 | 3060.2 | 759 | 0.021 | 3126 |
-| SPOT 2.0 | 1411.8 | 677 | 6984 | 3187.3 | 887 | 0.009 | 3860 |
+| POINT 0.1 | 2701.0 | 2840 | 433 | 3052.0 | 293 | 0.069 | 3103 |
+| POINT 0.5 | 1957.0 | 1967 | 2341 | 3086.6 | 782 | 0.013 | 3136 |
+| POINT 2.0 | 1247.2 | 1219 | 4866 | 3200.5 | 882 | 0.006 | 3874 |
+| SPOT 0 | 2988.8 | 2905 | 164 | 2988.8 | 3 | 0.117 | 3127 |
+| SPOT 0.1 | 2726.8 | 2851 | 453 | 3070.4 | 342 | 0.080 | 3103 |
+| SPOT 0.5 | 2000.8 | 2077 | 2081 | 3061.4 | 798 | 0.014 | 3136 |
+| SPOT 2.0 | 1411.8 | 647 | 6887 | 3170.5 | 897 | 0.006 | 3874 |
 | SUN 0 | 1675.0 | 1557 | 230 | 1675.0 | 3 | 0.095 | 1634 |
-| SUN 0.05 | 1610.0 | 1428 | 423 | 1633.1 | 328 | 0.064 | 1625 |
-| SUN 0.2 | 0.0 | 1081 | 1115 | 1625.2 | 623 | 0.024 | 1616 |
-| SUN 0.6 | 0.0 | 321 | 3104 | 1629.4 | 846 | 0.020 | 1563 |
-| AREA 0.05 | 2899.0 | 2933 | 238 | 3057.6 | 199 | 0.159 | 3115 |
-| AREA 0.25 | 2644.2 | 2820 | 490 | 3055.2 | 312 | 0.050 | 3096 |
-| AREA 1.0 | 1957.0 | 1932 | 2390 | 3050.3 | 749 | 0.019 | 3122 |
-| AREA 3.0 | 1247.2 | 1328 | 4518 | 3121.1 | 857 | 0.011 | 3431 |
+| SUN 0.05 | 1610.0 | 1428 | 423 | 1633.1 | 328 | 0.064 | 1622 |
+| SUN 0.2 | 0.0 | 1071 | 1113 | 1616.8 | 629 | 0.021 | 1607 |
+| SUN 0.6 | 0.0 | 326 | 3083 | 1656.7 | 862 | 0.014 | 1575 |
+| AREA 0.05 | 2899.0 | 2933 | 238 | 3057.6 | 199 | 0.159 | 3116 |
+| AREA 0.25 | 2644.2 | 2818 | 488 | 3055.3 | 331 | 0.050 | 3092 |
+| AREA 1.0 | 1957.0 | 1940 | 2405 | 3069.9 | 798 | 0.012 | 3124 |
+| AREA 3.0 | 1247.2 | 1323 | 4608 | 3160.1 | 882 | 0.006 | 3438 |
 
-The mass of a sized lamp sits 3 % above its size-0 mass because the size-0
-lookup keeps the classic normal offset (which costs it 5 % against the
-traced 3127) and the sized one does not; both are within 7 % of the traced
-road until the lamp is very large. The roughness column is the metric's
-own reading of a NARROW edge (a traced edge of the same width reads 0.11 to
-0.14): it is under 0.03 wherever the penumbra is wider than a few pixels.
+The mass of a sized lamp sits 3 to 8 % above its size-0 mass because the
+size-0 lookup keeps the classic normal offset (which costs it 5 % against
+the traced 3127) and the sized one does not; both are within 3 % of the
+traced road until the lamp is very large (POINT / SPOT 2.0 and AREA 3.0
+stop at the cap). The roughness column is the metric's own reading of a
+NARROW edge (a traced edge of the same width reads 0.11 to 0.14): it is
+0.006 to 0.021 wherever the penumbra is wider than a few pixels.
 
 GPU simulator against the CPU (`aud/gpu_par.py`, 160x120): POINT 0.25 / 1.0
 1e-6, SPOT 3e-6, SUN 6e-6, also at Samples 16, Softness 0 / 4 and on a
 MIDPOINT map; AREA 0.4e-3 to 2.8e-3, which is the Area lamp's own lighting
 term (the same gap, on the same pixels, with the lamp's shadow set to NONE:
-0.002762 over 455 px against 456 px with it).
+0.002762 over 455 px against 458 px with it).
 
-No leak, no acne: floor under the wall's foot, darkest reference 0: POINT
-0.25 / 0.5, SPOT 0.5, SUN 0.1, AREA 1.0 all under 0.02; lit ramp at 60 / 75 /
-82 degrees: false shadow 0.0000; concave corner, wall face: min 0.95 to 1.00
-(prototype 0.57 to 0.96); Bias 0: false shadow 0.00000 on the open floor;
-low-poly smooth spheres (12 and 8 segments), 512 map: 0 to 4 lit-side pixels
-darker than the traced road by 0.1.
+No leak, no acne (`aud/stress.py`, `aud/stress2.py`): floor under the
+wall's foot (traced: 0): POINT 0.25 / 0.5, SPOT 0.5, SUN 0.1, AREA 1.0 all
+0.0000; lit ramp at 60 / 75 / 82 degrees: false shadow 0.0000 (87 degrees:
+0.0008 under POINT 1.0, 0.034 under SUN 0.2); concave corner, the wall
+face and the floor before it: darkest 0.95 to 1.00 for every lamp up to
+POINT 0.5 / SUN 0.2 / AREA 1.0 (prototype: 0.57); three smooth spheres
+against the traced road: mean term error 0.0038 to 0.0061 (a size-0 lamp:
+0.0132), 28 to 52 of 5500 pixels darker by 0.25 (size 0: 79); Bias 0:
+false shadow 0.00000 on the open floor; low-poly smooth spheres (12 and 8
+segments), 512 map: 0 to 4 lit-side pixels darker than the traced road by
+0.1 under POINT 0.25 and SUN 0.05, 20 under AREA 1.0, and 70 to 140 for a
+Sun on a 128 map (the old full offset: 170 to 228). Two casters at
+different depths over one receiver: rms against 256 rays 0.108 / 0.116
+(512) and 0.050 / 0.044 (2048) for POINT 0.25 / 0.5 (prototype 0.282 /
+0.236 and 0.127 / 0.100). Narrow bars: full umbra kept under every lamp,
+rms 0.04 to 0.15 at 512 and 0.009 to 0.054 at 2048 (prototype 0.11 to 0.39
+and 0.03 to 0.11).
 
 ## Which pictures change
 
@@ -287,8 +310,11 @@ evaluating both sides and selecting:
 | the prototype, every fragment | 154 |
 
 Counted over whole frames of the acceptance scene (`aud/census.py`): 15 to
-27 fetches per fragment on average (POINT 0.1: 15.6; 0.5: 22.0; 2.0: 23.1;
-SUN 0.05: 15.7; 0.6: 26.3; AREA 1.0: 22.0), 38 to 79 at Samples 16.
+36 fetches per fragment on average (POINT 0.1: 16.0; 0.5: 22.1; 2.0: 30.5;
+SPOT 2.0: 36.3; SUN 0.05: 15.7; 0.6: 24.2; AREA 1.0: 22.3; 3.0: 28.9), 38
+to 115 at Samples 16 (a text that ran every stage on every fragment would
+take 155 and 579). Text per sized lamp: 12.7 to 18.5 KB at Samples 4, 29
+to 36 KB at 16.
 `tests/glsl_strict.py` gains `check_mapped_shadows` (the sweep planned with
 shadows off, so no shadow function had ever reached the strict front-end):
 11 of 11 mapped cases compile, sized and not, MIDPOINT and Samples 16
@@ -296,33 +322,37 @@ included.
 
 ## Cost
 
-640x480, two lamps (one Sun), six 96-segment spheres and a floor (55k
-triangles), Samples 4, best of three warm frames, shared machine
-(`aud/perf.py time`):
+640x480, two lamps of the kind (one for a Sun), six 96-segment spheres and
+a floor (55k triangles), Samples 4, best of three warm frames, shared
+machine (`aud/perf.py time`):
 
 | lamps | old cold / warm | new cold / warm | traced, 4 rays |
 |---|---|---|---|
-| POINT 0.3, 512 | 1.36 / 0.51 | 1.83 / 0.82 | 6.23 / 5.15 |
-| POINT 0.3, 2048 | 4.37 / 0.56 | 5.59 / 0.95 | |
-| SPOT 0.3, 512 | 0.75 / 0.50 | 0.98 / 0.71 | |
-| SPOT 0.3, 2048 | 2.58 / 0.49 | 2.73 / 0.70 | |
-| SUN 0.05, 512 | 0.56 / 0.44 | 0.55 / 0.42 | 2.42 / 1.98 |
-| SUN 0.05, 2048 | 1.22 / 0.45 | 1.13 / 0.42 | |
-| AREA 1.0, 512 | 1.47 / 0.84 | 1.76 / 1.13 | |
-| AREA 1.0, 2048 | 5.64 / 0.80 | 5.09 / 1.26 | |
-| POINT 0, 512 / 2048 | 1.60 / 0.53, 4.71 / 0.50 | 1.48 / 0.62, 6.08 / 0.56 | |
+| POINT 0.3, 512 | 1.40 / 0.58 | 1.63 / 0.93 | 5.18 / 5.14 |
+| POINT 0.3, 2048 | 5.21 / 0.48 | 4.74 / 0.93 | |
+| SPOT 0.3, 512 | 0.89 / 0.49 | 0.89 / 0.69 | |
+| SPOT 0.3, 2048 | 2.36 / 0.54 | 3.02 / 0.71 | |
+| SUN 0.05, 512 | 0.49 / 0.47 | 0.59 / 0.43 | 1.95 / 2.07 |
+| SUN 0.05, 2048 | 1.02 / 0.47 | 0.92 / 0.44 | |
+| AREA 1.0, 512 | 1.31 / 0.87 | 1.96 / 1.18 | |
+| AREA 1.0, 2048 | 4.89 / 0.73 | 5.05 / 1.18 | |
+| POINT 0, 512 / 2048 | 1.29 / 0.58, 4.63 / 0.61 | 1.40 / 0.55, 5.14 / 0.50 | |
+| SPOT 0, 512 / 2048 | 0.86 / 0.54, 2.63 / 0.50 | 0.66 / 0.52, 2.78 / 0.49 | |
 
-A warm frame costs 0.95 to 1.7 times the old one and a fifth of the traced
-road at the same Samples; a cold frame pays the lookup and nothing at bake
-(the cold spread between the two columns at 2048 is the shared machine: the
-bake is the same code). The prototype's cold 2048 point frame was 11.3 s.
+Both columns are one back-to-back run of the final tree and of the fork
+point. A warm frame with two sized point lamps costs 1.6 to 1.9 times the
+old one (two spots 1.3 to 1.4, an Area pair 1.4 to 1.6, a Sun 0.9) and
+under a fifth of the traced road at the same Samples; a lamp of size 0
+costs what it did. A cold frame pays the lookup and nothing at bake (the
+cold spread between the two columns at 2048 is the shared machine: the bake
+is the same code). The prototype's cold 2048 point frame was 11.3 s.
 
 ## Limits, as measured
 
 - **Very large lamps.** One mean caster depth cannot describe a lamp several
   units wide. POINT radius 2 at 7 units: the far penumbra stops at the cap
   (0.76 / 0.82 / 1.05 against traced 1.18 / 1.75 / 2.06) and the shadow is
-  darker and tighter than the traced one (umbra 1192 px against 783); it
+  darker and tighter than the traced one (umbra 1219 px against 783); it
   stays whole and smooth. A Sun past about 0.3 rad shows a blotchy core at
   Samples 4 (the twelve search taps); Samples 16 gives a clean one.
 - **Thin casters under wide lamps.** A caster much narrower than the lamp's
@@ -366,7 +396,8 @@ bake is the same code). The prototype's cold 2048 point frame was 11.3 s.
 halcyon.tests.test_r254_map_soft`): fourteen functions, a to n, one law
 each. On the OLD engine (the fork point's tree with only this test file and
 `core/softmap.py` dropped in) the neutrality test passes 20 of 20 and every
-other function fails: 80 failures. Existing modules re-run on this tree:
+other function fails: 86 failures against 165 passes of 165 here.
+Existing modules re-run on this tree:
 `test_r251_shadow` (only the 1.89.0 zip pin of the baseline list fails),
 `test_r253_light_options` (all pass), and 28 functions of `test_render`
 that touch lamps, shadows, tooltips and the device switch (all pass).
@@ -391,7 +422,7 @@ that touch lamps, shadows, tooltips and the device switch (all pass).
 - **A conservative search.** A dilated tile-minimum of each map (it fits the
   unused G channel of the atlas cell, so no layout change) would let a
   fragment with no caster within reach skip the search exactly: 14 fetches
-  -> 1 for most of a frame, and most of the 1.3 to 1.7 warm-frame factor. A
+  -> 1 for most of a frame, and most of the 1.3 to 1.9 warm-frame factor. A
   min pyramid on top of it is what the thin-caster limit needs.
 - **Softness on a lamp of size 0** still erodes the shadow (size-map-v01);
   routing it through the same plane-biased filter would also remove the
