@@ -315,10 +315,11 @@ def fire(name, *args):
     exactly ONE positional parameter is handed the first argument alone,
     any other the (id, depsgraph) pair -- bpy_app_handlers.cc's
     choose_arguments. A handler that raises is printed and the rest still
-    run, as in Blender."""
+    run, as in Blender. It reads the namespace the add-on itself sees
+    (bpy.app.handlers as it is NOW -- a test may have swapped it)."""
     import traceback
     pair = (tuple(args) + (None, None))[:2]
-    for fn in list(getattr(_handlers, name)):
+    for fn in list(getattr(app.handlers, name, ())):
         code = getattr(fn, '__code__', None)
         try:
             fn(*(pair[:1] if code is not None and code.co_argcount == 1
@@ -336,7 +337,7 @@ def file_load(filepath=''):
     dropping -- an undo is `fire('undo_post', scene)` alone."""
     fire('load_pre', filepath)
     app.timers.on_file_load()
-    for hooks in vars(_handlers).values():
+    for hooks in vars(app.handlers).values():
         if isinstance(hooks, list):
             hooks[:] = [fn for fn in hooks if hasattr(fn, '_bpy_persistent')]
     fire('load_post', filepath)

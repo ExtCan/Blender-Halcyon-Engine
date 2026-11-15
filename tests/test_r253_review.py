@@ -760,6 +760,10 @@ def test_code_node_rebuild_survives_undo_redo_and_load():
     from . import fakebpy
     bpy = fakebpy.install()
     SN = importlib.import_module('halcyon.nodes.shader_nodes')
+    # the stub's own handler lists, whatever an earlier test left in their
+    # place (test_legacy swaps in a one-list namespace and keeps it there)
+    prior_handlers = bpy.app.handlers
+    bpy.app.handlers = fakebpy._handlers
     handlers, timers = bpy.app.handlers, bpy.app.timers
     events = ('undo_post', 'redo_post', 'load_post')
     scene = types.SimpleNamespace(name='Scene')
@@ -938,6 +942,7 @@ def test_code_node_rebuild_survives_undo_redo_and_load():
             SN.unregister()
         for k, v in saved_hooks.items():
             getattr(handlers, k)[:] = v
+        bpy.app.handlers = prior_handlers
         timers.fns[:] = saved_timers[0]
         timers._persistent.clear()
         timers._persistent.update(saved_timers[1])
