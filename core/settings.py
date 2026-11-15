@@ -608,7 +608,33 @@ class RenderSettings:
 
     # ------------------------------------------------------------------ utils
     def copy(self):
-        return RenderSettings(**{f.name: getattr(self, f.name) for f in fields(self)})
+        """A copy of the FIELDS. The underscore-private per-frame flags
+        are dropped on purpose (a pass's jitter or a stereo eye must
+        not leak into the next road; each road re-states what its
+        passes need) -- with one exception, `_sample_pass`: the index
+        of the pass inside the averaging roads (accumulation, lens
+        passes, adaptive refines, motion-blur slices). The soft-shadow
+        sampler salts its rays with it so that N averaged frames are N
+        different patterns, and that only works when the index reaches
+        the innermost render() through every copy between -- a carry
+        list per road lost it at the first road nobody listed."""
+        st = RenderSettings(**{f.name: getattr(self, f.name) for f in fields(self)})
+        sp = self.__dict__.get('_sample_pass')
+        if sp:
+            st._sample_pass = sp
+        return st
+
+    def sample_pass_for(self, k):
+        """The `_sample_pass` of pass `k` of an averaging road running
+        on these settings: one more base-65 digit, k + 1, under the
+        index these settings already carry from an outer road. A frame
+        outside every road is 0 and no digit is ever 0, so a lens pass
+        inside an accumulation pass, the refines of either and their
+        base frames all get different numbers (every road averages at
+        most 64 frames). The result is kept inside the 24 bits a
+        float32 scalar carries exactly: the GPU road feeds it as one."""
+        outer = int(self.__dict__.get('_sample_pass', 0) or 0)
+        return (outer * 65 + int(k) + 1) & 0xffffff
 
     def apply(self, d):
         """Apply a preset dict; unknown keys are ignored (forward compatible)."""

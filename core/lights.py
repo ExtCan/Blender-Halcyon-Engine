@@ -1160,6 +1160,20 @@ def sample(light, P, settings, area_sample=None):
 #: the GPU twin bakes the same corners as literals.
 AREA_DISC_SIDES = 16
 
+#: the shortest side an area lamp LIGHTS with (world units). The Stokes
+#: contour sums the arc angles between unit vectors to the lamp's
+#: corners and multiplies by dist^2 / A; on a face much smaller than
+#: this the arcs are rounding noise and A is nearly zero -- a Size 0
+#: lamp (Blender lets it be typed) lit the scene with noise seventy-six
+#: times too bright, and the float32 GLSL twin broke fifty times sooner
+#: (3% off the CPU at 0.005, 84% at 0.001). The far-field energy does
+#: not depend on the size at all (BI's area lamp is total-power-like),
+#: so a face clamped here IS the small lamp, drawn cleanly: at 0.02 the
+#: GPU twin is within 0.3% of the CPU. One constant for the three
+#: places that build the face: area_emit_area, area_corners and the
+#: GLSL rectangle (gpu/material._area_function)
+AREA_MIN_SIDE = 0.02
+
 
 def area_is_disc(light):
     """True for the round area shapes (Blender's DISK and ELLIPSE)."""
@@ -1173,12 +1187,21 @@ def area_emit_area(light):
     by this, so a disc and a square of the same size throw the same
     far-field energy (BI's area lamp is total-power-like: its energy
     does not grow with its size) and differ only in SHAPE."""
-    asz = getattr(light, 'area_size', (1.0, 1.0))
-    sx = max(float(asz[0]), 1e-6)
-    sy = max(float(asz[1]) if len(asz) > 1 else float(asz[0]), 1e-6)
+    sx, sy = area_lit_sides(light)
     if area_is_disc(light):
         return sx * sy * (np.pi * 0.25)
     return sx * sy
+
+
+def area_lit_sides(light):
+    """(sx, sy): the two sides the lamp's LIGHTING is computed with --
+    its Size, never under AREA_MIN_SIDE. The traced shadow still reads
+    the true Size (a Size 0 lamp casts a hard shadow)."""
+    asz = getattr(light, 'area_size', (1.0, 1.0))
+    sx = max(float(asz[0]), AREA_MIN_SIDE)
+    sy = max(float(asz[1]) if len(asz) > 1 else float(asz[0]),
+             AREA_MIN_SIDE)
+    return sx, sy
 
 
 def area_corners(light, dtype=np.float64):
@@ -1203,9 +1226,7 @@ def area_corners(light, dtype=np.float64):
     ay = np.asarray(getattr(light, 'area_y', None)
                     if getattr(light, 'area_y', None) is not None
                     else (0.0, 1.0, 0.0), dtype)
-    asz = getattr(light, 'area_size', (1.0, 1.0))
-    sx = max(float(asz[0]), 1e-6)
-    sy = max(float(asz[1]) if len(asz) > 1 else float(asz[0]), 1e-6)
+    sx, sy = area_lit_sides(light)
     hx, hy = ax * dtype(sx * 0.5), ay * dtype(sy * 0.5)
     if not area_is_disc(light):
         return np.stack((pos - hx - hy, pos - hx + hy,
@@ -1312,6 +1333,91 @@ def area_samples(light, count, rng):
     return out
 
 
+# ---------------------------------------------- soft traced shadows
+#
+# The N rays one pixel fires at a sized lamp are ONE stratified pattern.
+# They used to be N independent hash draws -- white noise, whose error
+# is sqrt(p(1 - p) / N): at the default 4 rays a penumbra showed five
+# grey levels scattered with an RMS of 0.20. Now a pixel draws TWO
+# hashes, a radial shift h1 and a turn h2, and ray k of N takes
+#
+#     u1 = (k + h1) / N               N equal-area strata, one shared shift
+#     u2 = frac(turn_k + h2)          the pattern's own turn, rotated by h2
+#
+# with turn_k the base-2 radical inverse of k when N is a power of two
+# (the N points are then a (0,2)-net: every dyadic box of area 1/N holds
+# exactly one) and k times the golden ratio's fraction otherwise (evenly
+# spread whatever N is). Measured on half-plane occluders over every
+# orientation, the RMS falls to 0.53 / 0.37 / 0.38 of the old law at
+# 4 / 8 / 16 rays on a disc and 0.61 / 0.50 / 0.40 on a rectangle, for
+# two hashes a pixel instead of two a ray. The disc shapes read the turn
+# as an index into the shared 256-entry circle table (an integer add,
+# identical on every device); the rectangle reads it as its second
+# coordinate.
+
+#: the fraction of the golden ratio: its multiples spread evenly over
+#: [0, 1) for any count
+SOFT_PHI = 0.61803398875
+#: the salt of an averaging road's pass index (the 10000th prime): an
+#: accumulation pass, a lens pass or a motion-blur slice traces its own
+#: rays instead of the first pass's again
+SOFT_PASS_SALT = 104729
+
+
+def soft_ray_salt(light_index, seed, sample_pass=0):
+    """The hash salt of one lamp's soft-ray pattern, wrapped to the 31
+    bits both roads hash (a large Seed must stay a legal GLSL int)."""
+    from . import patterns as PT
+    return PT.wrap_salt(131 * int(light_index) + 7919 * int(seed)
+                        + SOFT_PASS_SALT * int(sample_pass))
+
+
+def soft_ray_turns(samples):
+    """The N rays' turns, as fractions of a full turn in [0, 1): the
+    base-2 radical inverse of k for a power-of-two count, k golden
+    fractions otherwise. Both roads bake THESE numbers."""
+    n = max(int(samples), 1)
+    if n & (n - 1) == 0:
+        out = []
+        for k in range(n):
+            r, f, q = 0.0, 0.5, k
+            while q:
+                r += f * (q & 1)
+                q >>= 1
+                f *= 0.5
+            out.append(r)
+        return out
+    return [(k * SOFT_PHI) % 1.0 for k in range(n)]
+
+
+def soft_ray_turn_index(turn):
+    """A turn as a step through the 256-entry circle table."""
+    return int(round(256.0 * float(turn))) & 255
+
+
+#: a sun's angular diameter never reaches the full half-space: EEVEE's
+#: own ceiling (179.9 degrees). At pi the tangent of the half-angle is
+#: 1.6e16 and every ray left perpendicular to the sun
+SUN_MAX_ANGLE = float(np.radians(179.9))
+#: above this angular diameter (radians) a sun's rays are drawn uniform
+#: in the SOLID ANGLE of its cap. Below it the classic law stands -- a
+#: uniform point in the tangent-plane disc of radius tan(angle / 2) --
+#: which is the same thing to within 1% up to here and crowds the rim
+#: beyond (at 2 rad only 12% of the rays fell inside half the radius,
+#: where a quarter belong)
+SUN_CAP_ANGLE = 0.5
+
+
+def sun_soft_law(angle):
+    """('DISC', tan(a / 2)) or ('CAP', 1 - cos(a / 2)) for a sun of
+    angular diameter `angle`, the constant as the float32 both roads
+    bake."""
+    a = min(max(float(angle), 0.0), SUN_MAX_ANGLE)
+    if a > SUN_CAP_ANGLE:
+        return 'CAP', float(np.float32(1.0 - np.cos(a * 0.5)))
+    return 'DISC', float(np.float32(np.tan(a * 0.5)))
+
+
 def casts_shadow(light, settings):
     """Whether `visibility` could return anything but ones for this
     lamp: its early-outs, as a predicate (R238: the fixed key folds
@@ -1400,11 +1506,23 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
         else:
             soft_on = float(light.radius) > 0.0
         samples = shadow_sample_count(light, settings) if soft_on else 1
+        # Density lightens a traced shadow exactly as it lightens a
+        # mapped one (the map tail's own expression). At the default
+        # 1.0 the visibility is returned untouched: 1 - (1 - v) is not
+        # bitwise v in float32, and a lamp left alone must not move
+        dens = float(getattr(light, 'shadow_density', 1.0))
+
+        def _dense(v):
+            if dens == 1.0:
+                return v
+            return (1.0 - (1.0 - v) * dens).astype(np.float32)
+
         if samples == 1:
             hit = bvh.occluded(origin, L, maxt, mask=mask, cast=cast)
-            return (~hit).astype(np.float32)
+            return _dense((~hit).astype(np.float32))
         acc = np.zeros(n, np.float32)
         t, b = M.orthonormal_basis(L)
+        disk = True
         if kind == 'AREA':
             ax = np.asarray(light.area_x, np.float32)
             ax = ax / max(float(np.linalg.norm(ax)), 1e-9)
@@ -1413,9 +1531,15 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
             lpos = np.asarray(light.position, np.float32)
             disk = str(getattr(light, 'area_shape', 'SQUARE')) \
                 in ('DISK', 'ELLIPSE')
+        elif kind == 'SUN':
+            sun_law, sun_k = sun_soft_law(light.radius)
+            sun_k = np.float32(sun_k)
 
-        def _soft_ray(u1, u2):
-            """(Lj, mt): one soft-shadow ray per pixel from two uniforms.
+        def _soft_ray(u1, ca_, sa_, u2):
+            """(Lj, mt): one soft-shadow ray per pixel. `u1` is the
+            area coordinate, (ca_, sa_) the unit-circle point of the
+            turn and `u2` the turn itself as a fraction (the rectangle's
+            second coordinate; the round shapes never read it).
 
             AREA aims at a real point on the rectangle (or ellipse) --
             penumbras follow the lamp's true shape and size; SUN tilts
@@ -1426,9 +1550,6 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
             if kind == 'AREA':
                 if disk:
                     rr = np.sqrt(u1)
-                    ca_, sa_ = PT.sample_circle(u2) if sample_xy is not None \
-                        else (np.cos(u2 * 2.0 * np.pi),
-                              np.sin(u2 * 2.0 * np.pi))
                     uu, vv = rr * ca_, rr * sa_
                 else:
                     uu, vv = u1 * 2.0 - 1.0, u2 * 2.0 - 1.0
@@ -1437,13 +1558,20 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
                 delta = ps - P
                 ds = np.sqrt(np.maximum((delta * delta).sum(axis=1), EPS))
                 return delta / ds[:, None], ds * (1.0 - 1e-3)
-            ca_, sa_ = PT.sample_circle(u2) if sample_xy is not None \
-                else (np.cos(u2 * 2.0 * np.pi), np.sin(u2 * 2.0 * np.pi))
             if kind == 'SUN':
+                if sun_law == 'CAP':
+                    # a wide sun: uniform in the solid angle of its cap
+                    # (cos of the tilt is uniform between 1 and cos of
+                    # the half-angle). L, t and b are orthonormal, so
+                    # the sum is the unit ray itself
+                    ct = np.float32(1.0) - u1 * sun_k
+                    sn = np.sqrt(np.maximum(np.float32(1.0) - ct * ct,
+                                            np.float32(0.0)))
+                    return (L * ct[:, None] + t * (sn * ca_)[:, None]
+                            + b * (sn * sa_)[:, None]), maxt
                 # the size is Blender's light.angle: tilt the ray inside
                 # that cone, which is what a sun's size IS
-                r = np.sqrt(u1) * np.float32(
-                    np.tan(float(light.radius) * 0.5))
+                r = np.sqrt(u1) * sun_k
                 jitter = t * (r * ca_)[:, None] + b * (r * sa_)[:, None]
                 return M.normalize(L + jitter), maxt
             r = np.sqrt(u1) * np.float32(light.radius)
@@ -1451,26 +1579,41 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
             return M.normalize(L * dist[:, None] + jitter), maxt
 
         if sample_xy is not None:
+            # the stratified pattern (see soft_ray_turns): two hashes
+            # for the pixel, then every ray is arithmetic on them
             from . import patterns as PT
             spx, spy, li = sample_xy
-            seed = int(getattr(settings, 'seed', 0) or 0)
+            z0 = soft_ray_salt(li, getattr(settings, 'seed', 0) or 0,
+                               getattr(settings, '_sample_pass', 0) or 0)
+            h1 = PT.sample_u(spx, spy, z0)
+            h2 = PT.sample_u(spx, spy, z0 + 1)
+            # the hash's own 16-bit integer (h2 * 65535 is exact in
+            # float32), as sample_circle recovers it
+            h2i = np.asarray(h2 * np.float32(65535.0) + np.float32(0.5),
+                             np.float32).astype(np.int64)
+            invn = np.float32(1.0 / samples)
+            turns = soft_ray_turns(samples)
             for k in range(samples):
-                z = 2 * k + 131 * int(li) + 7919 * seed
-                u1 = PT.sample_u(spx, spy, z)
-                u2 = PT.sample_u(spx, spy, z + 1)
-                Lj, mt = _soft_ray(u1, u2)
+                u1 = (np.float32(k) + h1) * invn
+                ai = (h2i + soft_ray_turn_index(turns[k])) & 255
+                u2 = None
+                if not disk:
+                    u2 = np.float32(turns[k]) + h2
+                    u2 = u2 - np.floor(u2)
+                Lj, mt = _soft_ray(u1, PT.CIRCLE256[ai, 0],
+                                   PT.CIRCLE256[ai, 1], u2)
                 acc += (~bvh.occluded(origin, Lj, mt, mask=mask,
                                       cast=cast)).astype(np.float32)
-            return acc / samples
-        from . import patterns as PT                            # noqa: F811
+            return _dense(acc / samples)
         rng = rng or np.random.default_rng(settings.seed)
         for _ in range(samples):
             u1 = np.full(n, rng.random(), np.float32)
             u2 = np.full(n, rng.random(), np.float32)
-            Lj, mt = _soft_ray(u1, u2)
+            Lj, mt = _soft_ray(u1, np.cos(u2 * 2.0 * np.pi),
+                               np.sin(u2 * 2.0 * np.pi), u2)
             acc += (~bvh.occluded(origin, Lj, mt, mask=mask,
                                   cast=cast)).astype(np.float32)
-        return acc / samples
+        return _dense(acc / samples)
 
     sm = light.shadow_map
     if sm is None:

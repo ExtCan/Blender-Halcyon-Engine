@@ -1579,10 +1579,13 @@ DESCRIPTIONS = {
         "conversion (which lands every classic sun at 1.0). Receipts "
         "go to a '<file> lamp fix log' text datablock. The Fix "
         "Appended Lamps button below does the same by hand",
-    'shadow_default': "How shadows are computed when a light does not "
-                      "choose: depth maps rendered from each light (soft, "
-                      "fast, the period standard), traced rays (hard and "
-                      "exact), or per-light choice",
+    'shadow_default': "The shadow method EVERY light uses: depth maps "
+                      "rendered from each light (soft, fast, the period "
+                      "standard), traced rays (exact; a light's size "
+                      "softens them), or flat planar polygons. Per Light "
+                      "is the one setting under which each light's own "
+                      "Shadows menu decides; under the others that menu "
+                      "is only read for None (a light can always opt out)",
     'shadow_map_size': "Resolution of each light's depth map. Small maps "
                        "give blocky period shadows; large maps sharpen "
                        "contact edges. Lights can override individually",
@@ -1640,7 +1643,8 @@ DESCRIPTIONS = {
     'ray_bias': "How far a spawned ray steps off its surface before "
                 "testing the world, in world units. Too low and surfaces "
                 "shadow and reflect themselves as speckle; too high and "
-                "contact detail goes missing",
+                "contact detail goes missing. Traced shadows read it "
+                "whether or not the Ray Tracing switch is on",
     'env_reflection': "Let materials reflect the world background where "
                       "rays are off or exhausted -- the era's spherical "
                       "environment map trick",
@@ -2759,7 +2763,9 @@ DESCRIPTIONS = {
                          "long crease. 0 treats silhouettes only",
     'ray_shadows': "Master switch for ray-traced shadows. Off, lights set to "
                    "trace (and lights with no shadow map to fall back on) "
-                   "cast no shadow at all",
+                   "cast no shadow at all. It does not depend on the Ray "
+                   "Tracing switch, which governs reflections and "
+                   "refractions only",
     'max_transparent_layers': "How many overlapping transparent surfaces a "
                               "pixel may accumulate. Beyond a handful the "
                               "furthest ones contribute almost nothing but cost "
@@ -5112,15 +5118,20 @@ GROUP_DOCS = {
                      "to, not a range -- brightness scales with Distance "
                      "squared",
         'shadow': "This light's own shadow method: depth map, traced "
-                  "rays, or none -- overriding the scene default when "
-                  "the scene is set to Per Light",
+                  "rays, planar polygons or none. Map, Ray Traced and "
+                  "Planar are only read while the render's Shadow Method "
+                  "is Per Light (any other method there decides for every "
+                  "light); None always switches this light's shadow off",
         'shadow_softness': "Blur of this light's mapped shadow, in "
                            "shadow-map texels. 0 is hard",
         'shadow_samples': "Taps or rays per pixel for this light's soft "
-                          "shadows. 0 uses the render's Samples",
-        'shadow_density': "How dark this light's shadows get. 1 is full "
-                          "occlusion; less lets colour bleed through, as "
-                          "the era's fake fill lights did",
+                          "shadows. 0 uses the render's Samples. At 1 a "
+                          "traced shadow is one ray at the light's centre: "
+                          "hard, whatever the light's size",
+        'shadow_density': "How dark this light's shadows get, mapped, "
+                          "traced or planar. 1 is full occlusion; less lets "
+                          "colour bleed through, as the era's fake fill "
+                          "lights did",
         'shadow_color': "Colour inside this light's shadows instead of "
                         "black -- the tinted-shadow trick of period art",
         'diffuse_only': "This light affects only the diffuse term, "

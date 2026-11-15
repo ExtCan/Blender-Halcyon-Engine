@@ -55,9 +55,22 @@ def sample_u(spx, spy, z):
 
     `spx`/`spy` are integer pixel coordinates (any int dtype), `z` the
     stream salt combining sample index, stream id and seed. 16-bit
-    stratification -- plenty for jitter, and exactly reproducible."""
+    stratification -- plenty for jitter, and exactly reproducible.
+
+    The salt is wrapped to 31 bits before it is hashed. hash3 keeps
+    only the low 31 bits of ix*A + iy*B + iz*C, so the wrapped salt
+    hashes to the SAME value as the bare one (iz = q * 2**31 + r adds
+    r * C mod 2**31) -- but a large Seed no longer overflows the int64
+    product here, and the GLSL twin can carry the same number as a
+    literal every compiler accepts (wrap_salt)."""
     return hash3(np.asarray(spx, np.int64), np.asarray(spy, np.int64),
-                 np.int64(z))
+                 np.int64(wrap_salt(z)))
+
+
+def wrap_salt(z):
+    """A hash salt as the 31-bit number both roads hash: the low 31
+    bits of `z`, a non-negative int that fits a GLSL int literal."""
+    return int(z) & 0x7fffffff
 
 
 def sample_circle(u):

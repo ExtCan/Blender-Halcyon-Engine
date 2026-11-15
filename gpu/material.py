@@ -17,6 +17,7 @@ the correct outcome and the caller renders it on the CPU.
 from . import glsl_shading as GS
 from . import combine as GCB         # R251 material pack (MAT-A)
 from .emit import Emitter, Unsupported
+from ..core import patterns as _PT   # the sampling salts' 31-bit wrap
 
 MAX_LIGHTS = 8
 
@@ -878,11 +879,17 @@ def _ao_function(ao, consts):
          f'    int sy = int(vUV.y * {_f(float(h))});',
          '    float occ = 0.0;']
     for k in range(samples):
-        z = 2 * k + 8389 + 7919 * seed
+        # the salt as the 31-bit number the hash keeps anyway (hal_smp_
+        # hash3 masks ix*A + iy*B + iz*C to 31 bits, so the wrapped salt
+        # hashes to the same value): a Seed above 271187 used to bake a
+        # literal past int32 here, and above 542357 one no GLSL compiler
+        # accepts at all
+        z = _PT.wrap_salt(2 * k + 8389 + 7919 * seed)
+        z1 = _PT.wrap_salt(z + 1)
         L += ['    {',
               f'    float u1 = hal_smp_hash3(sx, sy, {z});',
               f'    vec2 cs = hal_smp_circle(hal_smp_hash3(sx, sy, '
-              f'{z + 1}));',
+              f'{z1}));',
               '    float r = sqrt(u1);',
               '    vec3 d = normalize(t * (r * cs.x) + b * (r * cs.y) '
               '+ N * sqrt(max(1.0 - u1, 0.0)));',
@@ -936,11 +943,13 @@ def _rad_function(rad, consts):
           f'    vec3 org = P + N * {_f(float(rad["bias"]))};',
           '    vec3 gather = vec3(0.0, 0.0, 0.0);']
     for k in range(samples):
-        z = 2 * k + int(rad['salt']) + 7919 * seed
+        # wrapped to 31 bits like the occlusion salt above (same hash)
+        z = _PT.wrap_salt(2 * k + int(rad['salt']) + 7919 * seed)
+        z1 = _PT.wrap_salt(z + 1)
         L += ['    {',
               f'    float u1 = hal_smp_hash3(sx, sy, {z});',
               f'    vec2 cs = hal_smp_circle(hal_smp_hash3(sx, sy, '
-              f'{z + 1}));',
+              f'{z1}));',
               '    float r = sqrt(u1);',
               '    vec3 d = normalize(t * (r * cs.x) + b * (r * cs.y) '
               '+ N * sqrt(max(1.0 - u1, 0.0)));',
@@ -1293,9 +1302,10 @@ def _area_function(i, light, consts):
     ay = np.asarray(getattr(light, 'area_y', None)
                     if getattr(light, 'area_y', None) is not None
                     else (0.0, 1.0, 0.0), np.float64)
-    asz = getattr(light, 'area_size', (1.0, 1.0))
-    sx = max(float(asz[0]), 1e-6)
-    sy = max(float(asz[1]) if len(asz) > 1 else float(asz[0]), 1e-6)
+    # the sides the CPU's contour is built from (never under
+    # lights.AREA_MIN_SIDE): the rectangle's half-axes below and the
+    # dist^2 / A texel must describe the SAME face
+    sx, sy = LI.area_lit_sides(light)
     hx = (ax * (sx * 0.5)).astype(np.float32)
     hy = (ay * (sy * 0.5)).astype(np.float32)
     disc = LI.area_is_disc(light)
@@ -1374,14 +1384,24 @@ def _shadow_function(i, meta, consts):
     along the shading normal AND the light direction by the ray bias, clip
     the ray just short of the light, and ask the BVH -- the same
     `hal_bvh_occluded` the occlusion kernel proved against `bvh.occluded()`
-    ray for ray. No density term: the CPU's RAY branch applies none.
+    ray for ray. The lamp's Density lightens the result exactly as the
+    CPU's RAY branch does, and at the default 1.0 the line is the bare
+    visibility (no `1 - (1 - v)` round trip on either road).
     """
     import numpy as np
+    from ..core import lights as LI
     from ..core.lights import _pcf_offsets
 
     if meta.get('ray'):
         bias = _f(float(meta['bias']))
         samples = int(meta.get('samples', 1))
+        dens = float(meta.get('density', 1.0))
+
+        def _ret(expr):
+            if dens == 1.0:
+                return f'    return {expr};'
+            return f'    return 1.0 - (1.0 - ({expr})) * {_f(dens)};'
+
         if samples <= 1:
             return '\n'.join([
                 f'float hal_shadow_vis{i}(vec3 P, vec3 N, vec3 L, '
@@ -1389,19 +1409,29 @@ def _shadow_function(i, meta, consts):
                 '{',
                 f'    vec3 org = P + N * {bias} + L * {bias};',
                 '    float maxt = (dist > 1e8) ? 1e9 : dist * (1.0 - 1e-3);',
-                '    return 1.0 - hal_bvh_occluded(org, L, maxt);',
+                _ret('1.0 - hal_bvh_occluded(org, L, maxt)'),
                 '}']) + '\n'
-        # SOFT: visibility()'s deterministic branch, sample for sample --
-        # the same hash draws, the same table angles, the same jittered
-        # rays this pixel's CPU shade would build, averaged the same way.
-        # Three shapes, matching _soft_ray on the CPU: AREA aims at real
-        # points on its rectangle (or ellipse), SUN tilts inside its
-        # angular disc, POINT/SPOT jitter the target in a world sphere
+        # SOFT: visibility()'s deterministic branch, ray for ray -- the
+        # same two hash draws for the pixel, the same stratified pattern
+        # built on them (core/lights.soft_ray_turns: the radial strata
+        # and the baked turns), the same table angles, averaged the
+        # same way. Three shapes, matching _soft_ray on the CPU: AREA
+        # aims at real points on its rectangle (or ellipse), SUN tilts
+        # inside its angular disc (its cap when wide), POINT/SPOT
+        # jitter the target in a world sphere.
+        #
+        # The salt is a 31-bit literal (a large Seed used to bake an
+        # integer no GLSL compiler accepts) plus the averaging road's
+        # pass index, which rides the hal_spass uniform so that sixteen
+        # accumulation passes are sixteen patterns and ONE plan
         w, h = consts['resolution']
         seed = int(consts.get('seed', 0))
         kind = str(meta.get('kind', 'POINT')).upper()
         area = meta.get('area')
         radius = _f(float(meta['radius']))
+        z0 = LI.soft_ray_salt(i, seed)
+        turns = LI.soft_ray_turns(samples)
+        rect = kind == 'AREA' and area is not None and not area['disk']
         L = [f'float hal_shadow_vis{i}(vec3 P, vec3 N, vec3 L, float dist)',
              '{',
              f'    vec3 org = P + N * {bias} + L * {bias};',
@@ -1412,16 +1442,32 @@ def _shadow_function(i, meta, consts):
              '    vec3 b = cross(L, t);',
              f'    int sx = int(vUV.x * {_f(float(w))});',
              f'    int sy = int(vUV.y * {_f(float(h))});',
-             '    float acc = 0.0;']
+             f'    int sz = {int(z0)} + int(hal_spass) * '
+             f'{int(LI.SOFT_PASS_SALT)};',
+             '    sz = sz & 0x7fffffff;',
+             '    int sz1 = (sz + 1) & 0x7fffffff;',
+             '    float h1 = hal_smp_hash3(sx, sy, sz);',
+             '    float h2 = hal_smp_hash3(sx, sy, sz1);']
+        if not rect:
+            L.append('    int h2i = int(h2 * 65535.0 + 0.5);')
+        L.append('    float acc = 0.0;')
+        invn = _f(float(np.float32(1.0 / samples)))
+        sun_law, sun_k = LI.sun_soft_law(meta['radius']) \
+            if kind == 'SUN' else (None, 0.0)
         for k in range(samples):
-            z = 2 * k + 131 * int(i) + 7919 * seed
+            L += ['    {',
+                  f'    float u1 = ({_f(float(k))} + h1) * {invn};']
+            if rect:
+                L.append(f'    float u2 = fract('
+                         f'{_f(float(np.float32(turns[k])))} + h2);')
+            else:
+                L += [f'    int ai = (h2i + '
+                      f'{LI.soft_ray_turn_index(turns[k])}) & 255;',
+                      '    vec2 cs = texelFetch(hal_circle, ivec2(ai, 0), '
+                      '0).rg;']
             if kind == 'AREA' and area is not None:
-                L += ['    {',
-                      f'    float u1 = hal_smp_hash3(sx, sy, {z});',
-                      f'    float u2 = hal_smp_hash3(sx, sy, {z + 1});']
                 if area['disk']:
                     L += ['    float rr = sqrt(u1);',
-                          '    vec2 cs = hal_smp_circle(u2);',
                           '    float uu = rr * cs.x;',
                           '    float vv = rr * cs.y;']
                 else:
@@ -1436,28 +1482,27 @@ def _shadow_function(i, meta, consts):
                       '    float mt = ds * (1.0 - 1e-3);',
                       '    acc += 1.0 - hal_bvh_occluded(org, Lj, mt);',
                       '    }']
+            elif kind == 'SUN' and sun_law == 'CAP':
+                # a wide sun: uniform in the solid angle of its cap
+                L += [f'    float ct = 1.0 - u1 * {_f(sun_k)};',
+                      '    float sn = sqrt(max(1.0 - ct * ct, 0.0));',
+                      '    vec3 Lj = L * ct + t * (sn * cs.x) '
+                      '+ b * (sn * cs.y);',
+                      '    acc += 1.0 - hal_bvh_occluded(org, Lj, maxt);',
+                      '    }']
             elif kind == 'SUN':
-                tanh = _f(float(np.tan(float(meta['radius']) * 0.5)))
-                L += ['    {',
-                      f'    float u1 = hal_smp_hash3(sx, sy, {z});',
-                      f'    vec2 cs = hal_smp_circle(hal_smp_hash3(sx, sy, '
-                      f'{z + 1}));',
-                      f'    float r = sqrt(u1) * {tanh};',
+                L += [f'    float r = sqrt(u1) * {_f(sun_k)};',
                       '    vec3 jit = t * (r * cs.x) + b * (r * cs.y);',
                       '    vec3 Lj = normalize(L + jit);',
                       '    acc += 1.0 - hal_bvh_occluded(org, Lj, maxt);',
                       '    }']
             else:
-                L += ['    {',
-                      f'    float u1 = hal_smp_hash3(sx, sy, {z});',
-                      f'    vec2 cs = hal_smp_circle(hal_smp_hash3(sx, sy, '
-                      f'{z + 1}));',
-                      f'    float r = sqrt(u1) * {radius};',
+                L += [f'    float r = sqrt(u1) * {radius};',
                       '    vec3 jit = t * (r * cs.x) + b * (r * cs.y);',
                       '    vec3 Lj = normalize(L * dist + jit);',
                       '    acc += 1.0 - hal_bvh_occluded(org, Lj, maxt);',
                       '    }']
-        L += [f'    return acc / {_f(float(samples))};', '}']
+        L += [_ret(f'acc / {_f(float(samples))}'), '}']
         return '\n'.join(L) + '\n'
 
     faces = meta['faces']                    # list of per-face dicts
@@ -5211,6 +5256,12 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
         # salt; the pass declares the per-frame scalar (already fed by
         # the driver and the simulator)
         em.frame_uniforms.add('hal_frame')
+    if soft_any:
+        # the soft-ray pattern's salt takes the averaging road's pass
+        # index from a per-draw scalar (shade._frame_scalar feeds it on
+        # the driver, the simulator sets it), never from a literal: the
+        # passes of one frame share one plan and one compiled shader
+        em.frame_uniforms.add('hal_spass')
     frame_unis = sorted(em.frame_uniforms)
     extra_unis = ''.join(f'uniform float {u};\n' for u in frame_unis)
     # the interface declarations come FIRST: the sampling helpers and the

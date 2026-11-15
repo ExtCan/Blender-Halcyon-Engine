@@ -640,6 +640,15 @@ def _env_world(job):
                            for v in getattr(world, 'color', (0, 0, 0)))), None
 
 
+def _sample_pass(job):
+    """The index of the pass this frame is inside an averaging road (an
+    accumulation or lens pass, a motion-blur slice; 0 outside one), as
+    the float the hal_spass scalar carries. The soft-ray pattern adds it
+    to its salt on both roads (core/lights.soft_ray_salt), so the passes
+    of one frame trace different rays through ONE plan."""
+    return float(int(getattr(job.settings, '_sample_pass', 0) or 0))
+
+
 def _shadow_meta(light, st, bvh=None):
     """(meta, atlas, why) for one light's shadow term.
 
@@ -718,7 +727,10 @@ def _shadow_meta(light, st, bvh=None):
                 'bias': max(float(getattr(st, 'ray_bias', 1e-3)), 1e-4),
                 'radius': float(getattr(light, 'radius', 0.0)),
                 'kind': kind, 'area': area,
-                'samples': int(samples)}
+                'samples': int(samples),
+                # the lamp's Density lightens a traced shadow as it
+                # lightens a mapped one (the CPU's RAY branch)
+                'density': float(getattr(light, 'shadow_density', 1.0))}
         return meta, None, None
     if sm is None:
         # the CPU treats a missing map as lit (the ray fallback above
@@ -828,6 +840,9 @@ def _light_sig(l):
            # the soft-ray shadow function bakes the radius and sample
            # unroll; the shadow colour folds into every light block
            round(float(getattr(l, 'radius', 0.0)), 6),
+           # a traced shadow bakes the lamp's Density into its return
+           # line (the mapped road's tail carries it again below)
+           round(float(getattr(l, 'shadow_density', 1.0)), 6),
            # the lamp's own Samples override sizes that unroll (0 =
            # the render's, which the plan signature already carries)
            int(getattr(l, 'shadow_samples', 0) or 0),
@@ -3335,6 +3350,8 @@ def shade_fragments_frame(job, gbuf, tri, bary, px, py, rank):
                 extra[u] = float(getattr(job.scene, 'time', 0.0))
             elif u == 'hal_frame':
                 extra[u] = float(getattr(job.scene, 'frame', 0))
+            elif u == 'hal_spass':
+                extra[u] = _sample_pass(job)
             elif u == 'hal_mrow':
                 extra[u] = float(binds.get('mat_row', 0))
         # the Bump height pre-passes: the same shaders the opaque frame
@@ -3406,6 +3423,8 @@ def shade_fragments_frame(job, gbuf, tri, bary, px, py, rank):
                         extra[u] = float(getattr(job.scene, 'time', 0.0))
                     elif u == 'hal_frame':
                         extra[u] = float(getattr(job.scene, 'frame', 0))
+                    elif u == 'hal_spass':
+                        extra[u] = _sample_pass(job)
                     elif u == 'hal_mrow':
                         extra[u] = float(binds.get('mat_row', 0))
                 sec_draws[which2].append((name, shader, bind, extra))
@@ -3769,6 +3788,7 @@ def simulate_fragments(job, gbuf, tri, bary, px, py, rank):
         uni2['hal_frame'] = np.full(n, float(getattr(job.scene,
                                                      'frame', 0)),
                                     np.float32)
+        uni2['hal_spass'] = np.full(n, _sample_pass(job), np.float32)
         uni2['hal_mrow'] = np.full(n, float(binds2.get('mat_row', 0)),
                                    np.float32)
         uni2['vUV'] = uv
@@ -4761,6 +4781,8 @@ def simulate(job, gbuf, passes=None, atlases=None, region=None):
                                   np.float32)
         uni['hal_frame'] = np.full(n, float(getattr(job.scene, 'frame', 0)),
                                    np.float32)
+        # the averaging road's pass index (the soft-ray pattern's salt)
+        uni['hal_spass'] = np.full(n, _sample_pass(job), np.float32)
         # R174: this pass's row in the hal_mats value texture
         uni['hal_mrow'] = np.full(n, float(binds.get('mat_row', 0)),
                                   np.float32)
@@ -5095,6 +5117,8 @@ def shade_frame(job, gbuf, region=None):
                     extra[u] = float(getattr(job.scene, 'time', 0.0))
                 elif u == 'hal_frame':
                     extra[u] = float(getattr(job.scene, 'frame', 0))
+                elif u == 'hal_spass':
+                    extra[u] = _sample_pass(job)
                 elif u == 'hal_mrow':
                     extra[u] = float(binds.get('mat_row', 0))
             built.append((name, shader, bind, extra))
@@ -5170,6 +5194,8 @@ def shade_frame(job, gbuf, region=None):
                     extra[u] = float(getattr(job.scene, 'time', 0.0))
                 elif u == 'hal_frame':
                     extra[u] = float(getattr(job.scene, 'frame', 0))
+                elif u == 'hal_spass':
+                    extra[u] = _sample_pass(job)
             tgt = device.Target(w, h)
             prepass_targets.append(tgt)
             try:

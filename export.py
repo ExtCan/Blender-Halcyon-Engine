@@ -1179,6 +1179,20 @@ def export_light(ob, matrix, unit_scale=1.0):
         lt.area_shape = la.shape
         lt.area_x = tuple(mw[:3, 0])
         lt.area_y = tuple(mw[:3, 1])
+        # The object's scale multiplies the lamp's Size, as Blender
+        # does it (EEVEE: area.size *= scale.xy): S in the viewport
+        # makes the lamp BIGGER. The raw matrix columns used to carry
+        # the scale into the lit contour alone -- the emitting area
+        # the energy is divided by and the shadow rays' rectangle
+        # still read the unscaled Size, so a lamp scaled x4 lit the
+        # floor sixteen times brighter and its penumbra did not move.
+        # An unscaled lamp takes the lines above untouched
+        sxw = float(np.linalg.norm(mw[:3, 0]))
+        syw = float(np.linalg.norm(mw[:3, 1]))
+        if abs(sxw - 1.0) > 1e-5 or abs(syw - 1.0) > 1e-5:
+            lt.area_size = (sx * sxw, sy * syw)
+            lt.area_x = tuple(mw[:3, 0] / max(sxw, 1e-9))
+            lt.area_y = tuple(mw[:3, 1] / max(syw, 1e-9))
         if hs is not None:
             lt.area_gamma = float(getattr(hs, 'area_gamma', 1.0) or 1.0)
     if hs is not None:
