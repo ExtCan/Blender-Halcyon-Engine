@@ -3,7 +3,8 @@
 The round's review (three lenses per feature, three refuters per finding)
 and the console-shader deep re-read the field log asked for. Each item
 below was reproduced headless before it was fixed and is pinned in
-`tests/test_r253_review.py` (registered in `run_all`).
+`tests/test_r253_review.py` (registered in `run_all`); the Coded
+Shader's name resolution is pinned in `tests/test_shaders.py` as well.
 
 ## CHANGELOG
 
@@ -837,6 +838,133 @@ below was reproduced headless before it was fixed and is pinned in
   they were: the normal, UV, material-index and triangle-index parts of
   the mesh key are still strided sums (a UV edit confined to unsampled
   rows, or one that cancels, does not re-upload the attribute texture).
+- **A name the Coded Shader never declared is a compile error.** The
+  report: `shaders/compiler.try_compile` on a six-line source whose
+  `main` reads `nothing` returned a program with error `None` and no
+  warnings, and `prog.run` raised `ShaderError: unknown identifier
+  'nothing'` -- so `HALCYON_CodeNode.compile_source` left the error box
+  empty and rebuilt the sockets, `export._node_props` filed the program
+  and warned of nothing, and at shading time
+  `GraphEvaluator.eval_output` caught the exception and the node read
+  zeros. A missing parenthesis, a missing brace and an unknown function
+  were compile errors already. The cause is the interpreter itself: it
+  resolves a name when a lane reaches it. The source generator it
+  replaced resolved names as it emitted code (`undeclared identifier`,
+  `has no field`, `bad swizzle`, `swizzle out of range`), and
+  `Interpreter.validate` had brought back the unknown-function check
+  alone. *What the read found first*, each reproduced headless before
+  anything changed. (a) *The same slip wherever a name stands*: a
+  function's or a builtin's argument, a helper's body, an assignment
+  target, an array index, a ternary arm; a local read above its
+  declaration, outside its block, after its loop, or from inside the
+  function that was called; a misspelled struct field, read or written
+  (`S has no field 'aa'` when it ran); a swizzle that is none (`bad
+  swizzle 'xq'` when it ran) and a swizzle past the vector's width,
+  which was not even a ShaderError -- a bare numpy `IndexError`. (b)
+  *Names never reported at all*: one in a branch no lane takes, or in a
+  function nothing calls, ran clean frame after frame; one in a global's
+  initialiser or a uniform's default (`const float TAU = 2.0 * PIE;`)
+  was evaluated in an empty scope, the failure swallowed, and the global
+  read zero. (c) *Declared names the run could not find*: `const float
+  TAU = 2.0 * PI;` read zero by that same swallow; `uniform float a, b;`
+  and the members of an HLSL `cbuffer` were dropped whole (the parser
+  hands those back as a block and the interpreter walked single
+  declarations), so no socket was made and the names were unknown
+  identifiers when the shader ran; a free `gl_FragCoord`, bound in the
+  root since 1.25.16, stopped there -- `call_user` copied the declared
+  names into a function's scope one by one, so the builtin was in scope
+  everywhere except inside a function. (d) *The GPU road.*
+  `gpu/emit._port_code_node` only parses, so it accepts every one of
+  these. With the name on a path a probed lane takes (the report), the
+  plan's probe refuses the frame -- `'Coded': nodes the evaluator itself
+  does not know: HALCYON_CodeNode: ShaderError: unknown identifier
+  'nothing'` -- and the CPU draws it, the node at zeros. With the name
+  behind a branch none of the sixteen probe points takes, or in a
+  function nothing calls, the plan QUALIFIED, `device.preflight` (the
+  same front-end) passed the pass, and its text carried the name to the
+  driver as written (`_cncode_Color = vec4(nothing);`): the simulator
+  drew the CPU's picture, and GLSL obliges a driver to refuse the text.
+  And where the name is one the frame shader itself declares (`vUV`,
+  read without its `in`, behind `vScreenUV.x` between 0.50 and 0.53 at
+  128x96), the probes missed the strip, the frame qualified, and the
+  simulated GPU frame differed from the CPU frame by up to 2.17 over all
+  598 pixels of the material: nine of them reached the name on the CPU
+  and the evaluator zeroed the node for the whole batch, while the pass
+  drew every pixel, those nine in the full-screen quad's UV. *What
+  changed.* (1) `shaders/names.py`: `NameCheck`, run by
+  `Interpreter.validate` and so by every `try_compile`, walks the tree
+  with the scopes `run`, `call_user`, `block` and `loop` build, holding
+  a type where they hold a value, and raises with the line of the name
+  (the parser's `var`, `call` and `member` nodes carry it): `line 6:
+  undeclared identifier 'nothing'`, `line 6: S has no field 'aa'`,
+  `line 4: bad swizzle 'xq'`, `line 4: swizzle 'xyz' out of range for
+  vec2`, and `line 3: unknown function 'vec9'`, which had no line.
+  Untaken branches, uncalled functions, uniform defaults and global
+  initialisers are walked like everything else. (2) *Nothing declared
+  is refused.* Where the check and the run disagreed about a declared
+  name, the run changed: the globals are bound in source order
+  (`Interpreter.order`) and an initialiser is evaluated in the root as
+  it stands, so it sees what is declared above it (`TAU` is 6.28); a
+  function's scope starts from the root's own slots, `gl_FragCoord`
+  among them; `Parser.parse` flattens a multi-declarator global into its
+  declarations, and a cbuffer's members are uniforms, with sockets. A
+  swizzle is refused as out of range only past the widest the value can
+  be when it runs -- `pow(2.0, v).xyz` is typed by its first argument
+  and computed across the vector, and still compiles. (3) *A varying
+  still needs its declaration.* `codegen.VARYINGS` is what `in vec3
+  vNormal;` binds to, not a list of names in scope without one: the
+  generator bound them free, the interpreter never has (an unknown
+  identifier when the shader ran), and the port binds declared `in`
+  names only. Read free, each of the 28 is refused with the line to
+  write -- `undeclared identifier 'vNormal' (declare it: in vec3
+  vNormal;)` -- and so are the generator's five implicit outputs
+  (`gl_FragColor`: `declare it: out vec4 gl_FragColor;`). (4) *The
+  callers follow with no change of their own*: Compile is cancelled
+  with the error in the node's box and the sockets left alone; the
+  export warns `<node>: line 6: undeclared identifier 'nothing'` and
+  files no program; with no program both roads take the never-compiled
+  answer (zeros -- the evaluator records no error, the frame qualifies,
+  no pass carries the text); and `device.preflight` refuses an emitter's
+  own pass that names something undeclared before the driver sees it.
+  *Left as it is*: a global or a function written BELOW the function
+  that uses it still compiles (the run binds every global before `main`;
+  a driver refuses that order) -- tightening it would refuse sources
+  that run today. *Seen in the same read, not name errors, not
+  touched*: a struct constructor `S(a, b)`
+  returns its first argument (a field read then raises `IndexError`);
+  the comma operator parses and is `unsupported expression 'seq'` when
+  it runs; a user function called with the wrong number of arguments
+  compiles and runs (the R235 guard lives in the generator nothing
+  calls); `vec2 + vec3` is a `ShaderError` when it runs;
+  `mainImage(out vec4 fragColor, in vec2 fragCoord)` yields no output
+  socket. Pinned in `tests/test_shaders.py` (3 tests, 50 checks: 28
+  sources that must be refused, each with its whole message; 16 that
+  must compile AND run to a stated value; all 29 varyings declared, and
+  the 28 read free; both starter shaders) and in
+  `test_code_node_name_errors_are_compile_errors` in
+  `tests/test_r253_review.py` (15 checks: the real node class through
+  the Compile operator and its drawn error box, the real
+  `serialize_tree`, the evaluator, the plan and the simulator,
+  `device.preflight`); against the previous front-end 36 and 9 of them
+  fail, and eleven mutations, each taking one piece of the fix out alone
+  (the check, the line, the branch walk, the initialiser walk, the field
+  check, the width rule, the root scope, the source order, the builtin's
+  reach, the flattening, the cbuffer's qualifier), each fail at least
+  one. One-off scans of the new front-end, each beside the same scan of
+  the old one: all 121 shipped presets through the GPU road on the fake
+  device (the demo frame, the render and the post chain) compile the
+  same 165 distinct pass sources, none refused; the enumeration of
+  `tests/glsl_strict.py` with the front-end standing where glslang
+  stands (every engine model at every rate, every console type and
+  option, the cel masters, the post stages, the sky and the raster
+  fragments -- what `device.preflight` will say to each) compiles the
+  same 615 and leaves the same 15 refused by name, 245 distinct texts,
+  none rejected; and a run of the whole suite as it stood, with every
+  front-end compile error logged, raised three (each a test's own negative
+  case), failed no check the old front-end passes, and met no global
+  initialiser reading a name in any engine source -- the initialiser
+  change moves no engine value. The check costs about 4 ms on a
+  1,562-line material pass, once per distinct text.
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
@@ -943,3 +1071,15 @@ below was reproduced headless before it was fixed and is pinned in
   wiring on the GPU device; the same file in EEVEE beside it, where the
   surface under the glow is black and Halcyon's is its lit fallback
   (the open item above).
+- The Coded Shader's name error in a live node editor (proven against
+  the fake bpy alone): the box under the Compile button reading `line 6:
+  undeclared identifier 'nothing'`, the operator's red report in the
+  status bar, the export's warning in the render's console; how the
+  longer varying message (`... (declare it: in vec3 vNormal;)`) reads at
+  the node's width, where a label is clipped rather than wrapped; and a
+  cbuffer's members arriving as sockets on an HLSL node. NOT run on a
+  driver: what one does with the two old texts -- the pass that carried
+  `vec4(nothing)` behind an untaken branch (a compile error by GLSL's own
+  rule) and the pass that read the frame shader's `vUV` (which compiles,
+  and draws what the CPU does not). `tests/glsl_strict.py` was not run in
+  this round: the machine had no glslang.
