@@ -64,6 +64,8 @@ def run_tests():
     from . import test_r254_viewport
     # R254: Blender's own light options (Exposure, Temperature, ...)
     from . import test_r254_native
+    # R254: Ambient Only, light linking, flags in volumes and beams
+    from . import test_r254_flags
     # R254: where the light packages meet (beam unit, scaled Area lamps)
     from . import test_r254_integration
     utf8_console()
@@ -259,6 +261,11 @@ def run_tests():
     print("R254 NATIVE (BLENDER'S OWN LIGHT OPTIONS, AREA WATTS, THE LIGHT PANEL)")
     print('=' * 66)
     rc |= test_r254_native.main()
+    print()
+    print('=' * 66)
+    print('R254 FLAGS (AMBIENT ONLY, LIGHT LINKING, FLAGS IN VOLUMES AND BEAMS)')
+    print('=' * 66)
+    rc |= test_r254_flags.main()
     print()
     print('=' * 66)
     print('R254 INTEGRATION (WHERE THE LIGHT PACKAGES MEET)')
