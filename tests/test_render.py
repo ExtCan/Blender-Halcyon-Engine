@@ -25283,8 +25283,6 @@ def test_every_node_prop_reaches_the_renderer():
             'compile bookkeeping; the compiled program ships',
         ('HALCYON_CodeNode', 'error'): 'compile diagnostics, UI only',
         ('HALCYON_CodeNode', 'warn'): 'compile diagnostics, UI only',
-        ('HALCYON_CodeNode', 'auto_compile'):
-            'editor behaviour toggle; the program ships either way',
         ('HALCYON_CartoonNode', 'era'):
             'a preset applicator: writes the sockets and shadow_mode, '
             'which serialize by themselves (R228)',

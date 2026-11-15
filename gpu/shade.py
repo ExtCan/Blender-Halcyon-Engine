@@ -706,8 +706,8 @@ def _shadow_meta(light, st, bvh=None):
                         in ('DISK', 'ELLIPSE')}
         else:
             soft_on = float(getattr(light, 'radius', 0.0)) > 0.0
-        samples = max(1, int(getattr(st, 'shadow_samples', 1))) \
-            if soft_on else 1
+        from ..core.lights import shadow_sample_count as _ssc
+        samples = _ssc(light, st) if soft_on else 1
         # soft ray shadows travel now: the jitter is a pure function of
         # (pixel, sample, light, seed) through the pattern hash and the
         # shared unit-circle table, so both devices draw the SAME rays.
@@ -739,6 +739,7 @@ def _shadow_meta(light, st, bvh=None):
     # between the two nearest casters, and the compare carries no bias
     # and no normal offset (the CPU's `visibility` rule, one resolve)
     from ..core.lights import midpoint_map as _midpoint_map
+    from ..core.lights import shadow_sample_count as _shadow_sample_count
     mid = bool(_midpoint_map(light, st))
 
     # packed lazily, behind a content fingerprint: the CPU caches these maps
@@ -768,6 +769,8 @@ def _shadow_meta(light, st, bvh=None):
         'bias': bias, 'softness': soft,
         'density': float(getattr(light, 'shadow_density', 1.0)),
         'midpoint': mid,
+        # the lamp's own Samples (0 = the render's): the tap unroll
+        'samples': int(_shadow_sample_count(light, st)),
     }
     return meta, (key, build), None
 
@@ -824,6 +827,9 @@ def _light_sig(l):
            # the soft-ray shadow function bakes the radius and sample
            # unroll; the shadow colour folds into every light block
            round(float(getattr(l, 'radius', 0.0)), 6),
+           # the lamp's own Samples override sizes that unroll (0 =
+           # the render's, which the plan signature already carries)
+           int(getattr(l, 'shadow_samples', 0) or 0),
            t(getattr(l, 'shadow_color', (0, 0, 0))),
            # R253 light options: the four STRUCTURE bits -- a Square
            # cone, a non-white specular tint, a non-black hemi ground

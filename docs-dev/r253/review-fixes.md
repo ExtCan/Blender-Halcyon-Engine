@@ -216,6 +216,68 @@ below was reproduced headless before it was fixed and is pinned in
   the Compile operator (the fake bpy gained `fire` -- Blender's
   one-or-two-argument handler call -- `file_load` and persistent
   timers). Seven mutations of the fix each fail it.
+- **The Coded Shader's Auto Compile checkbox is retired, and Inline
+  Source says what it is.** `HALCYON_CodeNode.auto_compile` ("Auto
+  Compile", on by default) was drawn in the node's sidebar and named in
+  four places -- its declaration, `draw_buttons_ext`, its `PROP_TIPS`
+  tooltip and the census's `NOT_SHADING` reason -- and read in none. The
+  tooltip promised "off waits for the Build button (steadier while
+  typing long shaders)"; with the box unticked the node rebuilt exactly
+  as with it ticked: `_lang_changed` / `_source_changed` flag and
+  schedule, `_rearm_code_rebuilds` schedules every flagged node on undo,
+  redo and load, `_run_rebuilds` rebuilds every one, and
+  `export._compile_node` compiles the source at every export. The choice
+  was to wire it or to retire it; it is retired, on three findings. (1)
+  *Nothing rebuilds while typing.* The only automatic rebuild is the one
+  a Language or a Text-pointer change flags. `source_text` has no update
+  callback and no widget, and typing into the assigned Text fires
+  nothing on the node (seen in a real Blender 5.2.2: `Text.write` /
+  `clear` / `write` leave `needs_rebuild` down and the sockets as they
+  were) -- after an edit in the Text Editor the sockets have always
+  waited for the Compile button, with or without the box. (2) *The
+  picture never waited.* The exporter compiles the live source whatever
+  the sockets say, so a wired box could hold back the SOCKETS alone: the
+  old uniforms' sockets under a render already running the new program,
+  its new uniforms with no socket to set them and a renamed output with
+  none to carry it -- the stale state the entry above was written to
+  end, now as a mode. (3) *It would be saved.* `needs_rebuild` is
+  written to the .blend (seen: a node saved flagged comes back flagged),
+  so an unticked, flagged node would open under `-b` with nobody to
+  press Compile. What changed: the property, its sidebar line and the
+  separator under it, its `PROP_TIPS` entry and its `NOT_SHADING` reason
+  are gone; no rebuild road is touched and the callbacks still only
+  flag. *Files saved with the property still load.* Run in Blender 5.2.2
+  (the `bpy` module, background): the 1.92.0 add-on saved a file with
+  the box unticked on one Coded Shader, ticked on a second and unticked
+  on a third saved flagged (Language switched, the old sockets); a fresh
+  process with the property gone opened it -- `open_mainfile` FINISHED,
+  the three nodes whole, `hasattr(node, 'auto_compile')` False,
+  `compile_source` clean, and the stored 0 / 1 still among the node's
+  system ID properties (`bl_system_properties_get()`, not the
+  custom-property keys), where nothing reads it and a re-save carries it
+  along. The flagged node arrived rebuilt by `load_post`. A later
+  property of that name would inherit the stored values, so the name
+  stays retired. *The Inline Source tooltip.* `PROP_TIPS` called
+  `source_text` "the name of the Text datablock holding this shader's
+  source"; it is the source itself -- the starter shader `init` writes,
+  and what `get_source()` and `export._compile_node` compile while no
+  Text datablock is assigned. Reworded to say so (the registered RNA
+  description read back from the same Blender). Pinned in
+  `test_code_node_props_do_what_their_tooltips_say` (22 checks): the
+  real node class, subclassed so the stored value answers False and
+  every look at it is written down, goes through the callbacks' timer,
+  an undo landing, File > Open, a background load, the export of a
+  flagged node and the Compile operator -- every road rebuilds and not
+  one asks; the sidebar draws no property; no other Python file names
+  the retired property; every Coded Shader key in `PROP_TIPS` names a
+  live property; `source_text` compiles as the source with no Text
+  assigned and yields to an assigned Text, in the editor and at export.
+  Ten mutations each fail it: a gate on the value in `_run_rebuilds`,
+  `_pending_code_nodes`, `_source_changed` or `export._compile_node`;
+  the declaration, the draw line, the tooltip or the census reason
+  restored; the old Inline Source wording; `get_source` ignoring
+  `source_text`. The two coded-shader tests now share one bench
+  (`_code_bench`).
 - **A uniform the driver stripped never fails a pass (the llvmpipe field
   log).** A real Blender 5.2.2 session on the OpenGL backend (Mesa
   llvmpipe) printed, for every GPU frame, `rasterising on the CPU: raster
@@ -434,6 +496,12 @@ below was reproduced headless before it was fixed and is pinned in
   next pass; an undo from a later step onto the flagged one leaving the
   redo stack intact; a file saved flagged opening whole, in the UI and
   under `-b`.
+- The Coded Shader without its Auto Compile box in a live node editor:
+  the sidebar (N) showing the Available inputs list alone, and a 1.92.0
+  file with the box unticked opened in the UI. (The load was run in a
+  real Blender 5.2.2 as the `bpy` module, background, which is also the
+  first real-Blender sight of the entry above's background road: the
+  node saved flagged came back rebuilt by `load_post`.)
 - The llvmpipe session itself (Blender 5.2.2, OpenGL backend, Mesa
   llvmpipe): the three lines gone, `raster split` and `shade split`
   printed in their place, and the Timing Breakdown naming the stripped
