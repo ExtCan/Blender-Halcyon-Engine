@@ -83,6 +83,22 @@ from ..core import reyes as REYES        # R251 C119 (MAT-B)
 UNSUPPORTED_MODELS = frozenset({'GOURAUD', 'FLAT'}) | _SHM.UNSUPPORTED_MODELS
 SHADELESS_MODELS = frozenset({'WIREFRAME', 'CONSTANT'})
 
+#: a colour, value or vector output wired straight into a SHADER socket
+#: (the Material Output's Surface, a Mix / Add Shader input, a Max
+#: blend's sub-material). The CPU reads Blender's implicit conversion,
+#: an Emission of it (nodeeval.link_closure); the frame pass emits ONE
+#: colour chain and feeds it to the diffuse term, and the emitter casts
+#: that very link into the chain -- it qualified and drew the colour as
+#: the albedo, 1.69 off the CPU on the demo ball. Refused BY NAME, on
+#: the lobe's PRESENCE (never a sampled weight: the wiring is the fact)
+IMPLICIT_EMISSION_REFUSAL = (
+    'a colour, value or vector output is wired straight into a shader '
+    'socket: that is an Emission of it (Blender\'s implicit conversion, '
+    'the picture the CPU shades), and the frame pass emits only the '
+    'diffuse chain -- this material shades on the CPU exactly (a Halcyon '
+    'Shader in between, the chain in its Diffuse Color or '
+    'Self-Illumination, puts it on the driver)')
+
 
 def _plot_ss(st):
     from ..core import combine as _CBS
@@ -220,6 +236,13 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
         # matrix row ever carried one. Refuse BY NAME; the pictures stay
         # the CPU's own until the specular slot routing is ported.
         from .material import master_node
+        if any(_p.get('implicit') for _k, _w, _p
+               in (getattr(cl, 'items', None) or ())):
+            # a non-closure wired into a shader socket: the CPU's
+            # implicit Emission, the emitter's albedo -- by name, before
+            # the raw-lobe rule below could word it as a node the graph
+            # does not hold (and whatever a sampled weight reads)
+            return None, None, IMPLICIT_EMISSION_REFUSAL
         if getattr(cl, 'items', None) and \
                 master_node(mat.graph) is None:
             # HALCYON lobes stay allowed: their colour IS the diffuse
