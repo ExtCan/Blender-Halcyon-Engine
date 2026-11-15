@@ -1436,7 +1436,7 @@ def _shadow_function(i, meta, consts):
     near, far, persp = meta['near'], meta['far'], meta['persp']
     grid_w = meta['grid'][0]
     atlas_w, atlas_h = size * meta['grid'][0], size * meta['grid'][1]
-    taps = max(int(consts.get('shadow_samples', 4)), 1)
+    taps = max(int(meta.get('samples') or consts.get('shadow_samples', 4)), 1)
     soft = float(meta['softness'])
     bias = float(meta['bias'])
     density = float(meta['density'])
