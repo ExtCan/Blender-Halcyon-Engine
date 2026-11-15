@@ -43,13 +43,20 @@ pinned where it bit.
     arms the timer. Persistent undo_post / redo_post / load_post handlers
     (`_rearm_code_rebuilds`) schedule the rebuild on every landing; the
     Compile operator clears the flag in its own step.
+(12) The Coded Shader's Auto Compile checkbox was drawn in the sidebar and
+    read by nothing: unticked, the node still rebuilt on every road. It is
+    retired, not wired -- no rebuild fires while typing (only a Language
+    or Text change flags one) and the exporter compiles the live source
+    whatever the sockets say, so "off" could only strand the OLD sockets
+    under the NEW program. The Inline Source tooltip called the property
+    the NAME of a Text datablock; it is the source itself.
 """
 import io
 import os
 import sys
 import traceback
 import types
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 
 import numpy as np
 
@@ -693,9 +700,10 @@ class _CodeNodes(list):
         return next((n for n in self if n.name == name), default)
 
 
-def _code_tree(SN, source, name='Coded'):
+def _code_tree(SN, source, name='Coded', cls=None):
     """A material whose tree is Value -> Coded Shader -> Material Output,
-    the coded node being the REAL class run against stand-in sockets."""
+    the coded node being the REAL class (or `cls`, a subclass of it) run
+    against stand-in sockets."""
     tree = types.SimpleNamespace(name=name, nodes=_CodeNodes(), links=_CodeLinks())
 
     def plain(nm, idname, ins=(), outs=()):
@@ -710,10 +718,10 @@ def _code_tree(SN, source, name='Coded'):
 
     value = plain('Value', 'ShaderNodeValue', outs=(('NodeSocketFloat', 'Value'),))
     out = plain('Material Output', 'ShaderNodeOutputMaterial', ins=(('NodeSocketShader', 'Surface'),))
-    code = SN.HALCYON_CodeNode()
+    code = (cls or SN.HALCYON_CodeNode)()
     code.name, code.id_data = 'Coded Shader', tree
     code.language, code.source, code.source_text = 'GLSL', source, ''
-    code.as_surface, code.auto_compile, code.needs_rebuild = False, True, False
+    code.as_surface, code.needs_rebuild = False, False
     code.error = code.warn = ''
     code.inputs, code.outputs = _CodeSockets(code), _CodeSockets(code)
     tree.nodes.append(code)
@@ -744,6 +752,248 @@ class _MemfileUndo:
         self.bpy.data.materials[:] = copy.deepcopy(self.steps[index])
 
 
+_CODE_EVENTS = ('undo_post', 'redo_post', 'load_post')
+
+
+@contextmanager
+def _code_bench(bpy, SN):
+    """An interactive session with the node module registered and nothing
+    else in it: no material, no timer, no handler on the three re-arm
+    events. Yields (handlers, timers). The handler lists are the stub's
+    own, whatever an earlier test left in their place (test_legacy swaps
+    in a one-list namespace and keeps it there). Everything touched in the
+    shared stub goes back as it was, and the module is unregistered on the
+    way out unless the test already did that itself (the re-arm handler on
+    the lists is what tells)."""
+    from . import fakebpy
+    prior_handlers = bpy.app.handlers
+    bpy.app.handlers = fakebpy._handlers
+    handlers, timers = bpy.app.handlers, bpy.app.timers
+    saved_hooks = {k: list(v) for k, v in vars(handlers).items() if isinstance(v, list)}
+    saved_timers = (list(timers.fns), set(timers._persistent))
+    saved_mats, saved_bg, saved_q = bpy.data.materials, bpy.app.background, SN._REBUILD_QUEUED[0]
+    had_groups = getattr(bpy.data, 'node_groups', None)
+    for name in _CODE_EVENTS:
+        getattr(handlers, name)[:] = []
+    timers.fns[:] = []
+    bpy.data.materials = []
+    bpy.app.background = False             # an interactive session: timers fire
+    SN._REBUILD_QUEUED[0] = False
+    try:
+        SN.register()
+        yield handlers, timers
+    finally:
+        if any(SN._rearm_code_rebuilds in getattr(handlers, e) for e in _CODE_EVENTS):
+            SN.unregister()
+        for k, v in saved_hooks.items():
+            getattr(handlers, k)[:] = v
+        bpy.app.handlers = prior_handlers
+        timers.fns[:] = saved_timers[0]
+        timers._persistent.clear()
+        timers._persistent.update(saved_timers[1])
+        bpy.data.materials, bpy.app.background = saved_mats, saved_bg
+        SN._REBUILD_QUEUED[0] = saved_q
+        if had_groups is None:
+            if hasattr(bpy.data, 'node_groups'):
+                del bpy.data.node_groups
+        else:
+            bpy.data.node_groups = had_groups
+
+
+class _CodeLayout:
+    """A UILayout that only writes down what a node's draw asked of it."""
+
+    def __init__(self, log=None):
+        self.log = [] if log is None else log
+        self.alert = False
+
+    def prop(self, _data, name, **_kw):
+        self.log.append(('prop', name))
+
+    def label(self, text='', **_kw):
+        self.log.append(('label', text))
+
+    def operator(self, idname, **_kw):
+        self.log.append(('operator', idname))
+        return types.SimpleNamespace()
+
+    def separator(self, **_kw):
+        self.log.append(('separator', ''))
+
+    def row(self, **_kw):
+        return _CodeLayout(self.log)
+
+    column = box = row
+
+
+def test_code_node_props_do_what_their_tooltips_say():
+    """Two Coded Shader properties whose tooltips were not true. Auto
+    Compile ("off waits for the Build button") was drawn in the sidebar
+    and read by nothing: unticked, the node still rebuilt from the update
+    callbacks' timer, from the undo / redo / load re-arm and at every
+    export. It is RETIRED, not wired: no rebuild fires while typing (only
+    a Language or Text change flags one) and the exporter compiles the
+    live source whatever the sockets say, so "off" could only strand the
+    OLD sockets under a render already running the NEW program. A file
+    saved with the box unticked brings the value back as an ID property
+    the class no longer declares, and no road may ask for it. Inline
+    Source was described as the NAME of a Text datablock; it is the
+    source itself, the one that compiles while no Text is assigned."""
+    import importlib
+    from . import fakebpy
+    bpy = fakebpy.install()
+    SN = importlib.import_module('halcyon.nodes.shader_nodes')
+    EX = importlib.import_module('halcyon.export')
+    Node = SN.HALCYON_CodeNode
+    scene = types.SimpleNamespace(name='Scene')
+    text_a = types.SimpleNamespace(name='shader_a', as_string=lambda: _CODE_A)
+    text_b = types.SimpleNamespace(name='shader_b', as_string=lambda: _CODE_B)
+    asked = []
+
+    class _SavedUnticked(Node):
+        """The node of a file saved with the box unticked, at its most
+        reachable: the stored value answers as a plain attribute (Blender
+        itself keeps an undeclared ID property out of attribute access)
+        and every look at it is written down."""
+
+        @property
+        def auto_compile(self):
+            asked.append(sys._getframe(1).f_code.co_name)
+            return False
+
+    def names(socks):
+        return [s.name for s in socks]
+
+    def node():
+        return bpy.data.materials[0].node_tree.nodes.get('Coded Shader')
+
+    def queued():
+        return timers.is_registered(SN._run_rebuilds)
+
+    def edit(n):
+        """The Text and the Language change, as the two widgets make them."""
+        n.source = text_b
+        Node._source_changed(n, None)
+        n.language = 'HLSL'
+        Node._lang_changed(n, None)
+
+    def whole(n):
+        return (not n.needs_rebuild and names(n.inputs) == ['Gain', 'Edge', 'Stripes']
+                and [(l.from_node.name, l.from_socket.name) for l in n.inputs['Gain'].links] == [('Value', 'Value')]
+                and [(l.to_node.name, l.to_socket.name) for l in n.outputs['Color'].links]
+                == [('Material Output', 'Surface')])
+
+    def stale(n):
+        return n.needs_rebuild and n.language == 'HLSL' and names(n.inputs) == ['Gain', 'Tint']
+
+    def state(n):
+        return f'flag={n.needs_rebuild} lang={n.language} in={names(n.inputs)} queued={queued()} asked={asked}'
+
+    def uniforms(prog):
+        return [u['name'] for u in prog.uniform_schema()] if prog is not None else None
+
+    # ---- the declaration is gone from every table that carried it
+    live = set(Node.__annotations__)
+    check('the Coded Shader declares no Auto Compile property', 'auto_compile' not in live)
+    tipped = {k[1] for k in SN.PROP_TIPS if k[0] == 'HALCYON_CodeNode'}
+    check('every Coded Shader tooltip in PROP_TIPS names a live property (none outlives its property)',
+          tipped and tipped <= live, f'tips {sorted(tipped)} props {sorted(live)}')
+    check('...and every property the node still declares keeps a tooltip at the 40-character bar',
+          all(len(str(Node.__annotations__[k].kw.get('description') or '')) >= 40 for k in live),
+          str({k: len(str(Node.__annotations__[k].kw.get('description') or '')) for k in live}))
+    check('the exporter ships language, as_surface and source_text for the node, as before',
+          EX.NODE_PROPS['HALCYON_CodeNode'] == ('language', 'as_surface', 'source_text'))
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    here, named = os.path.abspath(__file__), []
+    for folder, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d != '__pycache__']
+        for fname in files:
+            path = os.path.join(folder, fname)
+            if fname.endswith('.py') and os.path.abspath(path) != here:
+                if 'auto_compile' in open(path, encoding='utf-8').read():
+                    named.append(os.path.relpath(path, root))
+    check('no other Python file names the retired property (declaration, draw line, tooltip, census reason)',
+          not named, ', '.join(named))
+
+    with _code_bench(bpy, SN) as (_handlers, timers):
+        # ---- the node draws no box for it, in the node or in the sidebar
+        bpy.data.materials.append(_code_tree(SN, text_a, cls=_SavedUnticked))
+        n = node()
+        side, face = _CodeLayout(), _CodeLayout()
+        n.draw_buttons_ext(None, side)
+        n.draw_buttons(None, face)
+        check('the sidebar draws no property, only the list of available inputs',
+              [name for kind, name in side.log if kind == 'prop'] == []
+              and side.log[0] == ('label', 'Available inputs:') and ('label', '  iTime') in side.log
+              and all(kind == 'label' for kind, _ in side.log), str(side.log))
+        check('the node body draws Language, Text and Output as Surface, and the Compile button',
+              [name for kind, name in face.log if kind == 'prop'] == ['language', 'source', 'as_surface']
+              and ('operator', 'halcyon.compile_shader') in face.log, str(face.log))
+
+        # ---- a file saved with the box unticked: every road still rebuilds
+        check('the node of the saved file starts whole on the GLSL source',
+              not n.needs_rebuild and names(n.inputs) == ['Gain', 'Tint'], state(n))
+        undo = _MemfileUndo(bpy)
+        undo.push()                                              # step 0
+        edit(n)
+        check('unticked: the update callbacks flag and queue the ONE timer, as for any node',
+              stale(n) and timers.fns.count(SN._run_rebuilds) == 1, state(n))
+        undo.push()                                              # step 1: flagged, OLD sockets
+        timers.pump()
+        check('unticked: the timer rebuilds the sockets with no Compile press', whole(n) and not queued(), state(n))
+        undo.restore(1)
+        fakebpy.fire('undo_post', scene)
+        check('unticked: an undo landing on the flagged step schedules the rebuild', queued() and stale(node()),
+              state(node()))
+        timers.pump()
+        check('...and it runs', whole(node()) and not queued(), state(node()))
+        undo.restore(1)
+        fakebpy.file_load('/tmp/unticked.blend')
+        check('unticked: File > Open of the file saved flagged schedules the rebuild', queued() and stale(node()),
+              state(node()))
+        timers.pump()
+        check('...and the loaded node ends whole', whole(node()) and not queued(), state(node()))
+        bpy.app.background = True
+        undo.restore(1)
+        fakebpy.file_load('/tmp/unticked.blend')
+        check('unticked: a background load (a render farm, nobody to press Compile) rebuilds at once',
+              whole(node()) and not queued(), state(node()))
+        bpy.app.background = False
+
+        # ---- the exporter was never the toggle's to hold: it compiles the live source
+        undo.restore(1)
+        n = node()
+        images, programs, warnings = {}, {}, []
+        props = EX._node_props(n, images, programs, warnings)
+        check('the export of a flagged node carries the NEW program (the picture never waited for a build)',
+              uniforms(programs.get(n.name)) == ['gain', 'edge', 'stripes'] and stale(n) and not warnings,
+              f'{uniforms(programs.get(n.name))} {warnings} {state(n)}')
+        check('...and exactly the three shipped properties', sorted(props) == ['as_surface', 'language', 'source_text'],
+              str(sorted(props)))
+        op = SN.HALCYON_OT_compile_shader()
+        op.node, op.report = n.name, (lambda *_a: None)
+        ctx = types.SimpleNamespace(space_data=types.SimpleNamespace(edit_tree=n.id_data), active_node=None)
+        got = op.execute(ctx)
+        check('the Compile button still rebuilds on demand and clears the flag', got == {'FINISHED'} and whole(n),
+              f'{got} {state(n)}')
+        check('through all of it NOT ONE road asked for the saved value', not asked, str(asked))
+
+        # ---- Inline Source is the source, not a datablock's name
+        tip = SN.PROP_TIPS[('HALCYON_CodeNode', 'source_text')]
+        check('the Inline Source tooltip says it is the source that compiles while no Text is assigned',
+              len(tip) >= 40 and 'name of' not in tip.lower() and 'no text datablock' in tip.lower()
+              and Node.__annotations__['source_text'].kw.get('description') == tip, tip)
+        inline = node()
+        inline.source, inline.source_text, inline.language = None, _CODE_A, 'GLSL'
+        check('with no Text assigned the node compiles source_text itself, in the editor and at export',
+              inline.get_source() == _CODE_A and uniforms(inline.compile_source()) == ['gain', 'tint']
+              and uniforms(EX._compile_node(inline)[0]) == ['gain', 'tint'])
+        inline.source, inline.language = text_b, 'HLSL'
+        check('...and an assigned Text takes its place on both roads',
+              inline.get_source() == _CODE_B and uniforms(inline.compile_source()) == ['gain', 'edge', 'stripes']
+              and uniforms(EX._compile_node(inline)[0]) == ['gain', 'edge', 'stripes'])
+
+
 def test_code_node_rebuild_survives_undo_redo_and_load():
     """A coded shader's update callbacks may only FLAG the socket rebuild
     (needs_rebuild) and leave the topology to a one-shot timer. Blender
@@ -760,12 +1010,7 @@ def test_code_node_rebuild_survives_undo_redo_and_load():
     from . import fakebpy
     bpy = fakebpy.install()
     SN = importlib.import_module('halcyon.nodes.shader_nodes')
-    # the stub's own handler lists, whatever an earlier test left in their
-    # place (test_legacy swaps in a one-list namespace and keeps it there)
-    prior_handlers = bpy.app.handlers
-    bpy.app.handlers = fakebpy._handlers
-    handlers, timers = bpy.app.handlers, bpy.app.timers
-    events = ('undo_post', 'redo_post', 'load_post')
+    events = _CODE_EVENTS
     scene = types.SimpleNamespace(name='Scene')
     text_a = types.SimpleNamespace(name='shader_a', as_string=lambda: _CODE_A)
     text_b = types.SimpleNamespace(name='shader_b', as_string=lambda: _CODE_B)
@@ -794,21 +1039,7 @@ def test_code_node_rebuild_survives_undo_redo_and_load():
     def state(n):
         return f'flag={n.needs_rebuild} lang={n.language} in={names(n.inputs)} queued={queued()}'
 
-    # everything this test touches in the shared stub goes back as it was
-    saved_hooks = {k: list(v) for k, v in vars(handlers).items() if isinstance(v, list)}
-    saved_timers = (list(timers.fns), set(timers._persistent))
-    saved_mats, saved_bg, saved_q = bpy.data.materials, bpy.app.background, SN._REBUILD_QUEUED[0]
-    had_groups = getattr(bpy.data, 'node_groups', None)
-    for name in events:
-        getattr(handlers, name)[:] = []
-    timers.fns[:] = []
-    bpy.data.materials = []
-    bpy.app.background = False             # an interactive session: timers fire
-    SN._REBUILD_QUEUED[0] = False
-    registered = False
-    try:
-        SN.register()
-        registered = True
+    with _code_bench(bpy, SN) as (handlers, timers):
         fn = SN._rearm_code_rebuilds
         check('register() puts the re-arm on undo_post, redo_post and load_post, once each',
               all(getattr(handlers, e).count(fn) == 1 for e in events))
@@ -934,25 +1165,8 @@ def test_code_node_rebuild_survives_undo_redo_and_load():
               and len(str(SN.HALCYON_CodeNode.__annotations__['needs_rebuild'].kw.get('description') or '')) >= 40)
 
         SN.unregister()
-        registered = False
         check('unregister() takes the re-arm off all three lists',
               not any(fn in getattr(handlers, e) for e in events))
-    finally:
-        if registered:
-            SN.unregister()
-        for k, v in saved_hooks.items():
-            getattr(handlers, k)[:] = v
-        bpy.app.handlers = prior_handlers
-        timers.fns[:] = saved_timers[0]
-        timers._persistent.clear()
-        timers._persistent.update(saved_timers[1])
-        bpy.data.materials, bpy.app.background = saved_mats, saved_bg
-        SN._REBUILD_QUEUED[0] = saved_q
-        if had_groups is None:
-            if hasattr(bpy.data, 'node_groups'):
-                del bpy.data.node_groups
-        else:
-            bpy.data.node_groups = had_groups
 
 
 def main():
