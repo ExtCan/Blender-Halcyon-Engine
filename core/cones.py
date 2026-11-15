@@ -191,8 +191,32 @@ def spot_cone(origin, rays, depth, light, samples=12, density=1.0,
     if origin.shape[0] == 1:
         origin = np.repeat(origin, n, axis=0)
 
-    t0, t1, hit = _cone_segment(origin, rays, apex, axis,
-                                beam_cos_out(light, cos_half))
+    # R254: a Spot scaled unevenly across its beam lights an ELLIPSE,
+    # and its shaft is the same elliptical cone: in the lamp's own
+    # frame with the side / up components multiplied by spot_scale the
+    # cone is round again (half-angle unchanged), a line stays a line,
+    # and the view ray's parameter only stretches by the squeezed
+    # direction's length. A round lamp builds none of it
+    squeeze = None
+    sc = getattr(light, 'spot_scale', None)
+    if sc is not None and (float(sc[0]), float(sc[1])) != (1.0, 1.0):
+        from . import lights as _LI
+        s_ax, u_ax, f_ax = _LI.cookie_frame(light)
+        squeeze = np.stack([np.asarray(s_ax, np.float32) * np.float32(sc[0]),
+                            np.asarray(u_ax, np.float32) * np.float32(sc[1]),
+                            np.asarray(f_ax, np.float32)], axis=0)
+        o_q = (origin - apex[None, :]) @ squeeze.T
+        r_q = rays @ squeeze.T
+        r_len = np.sqrt(np.maximum(np.einsum('ij,ij->i', r_q, r_q), EPS))
+        t0, t1, hit = _cone_segment(
+            o_q, r_q / r_len[:, None], np.zeros(3, np.float32),
+            np.array([0.0, 0.0, 1.0], np.float32),
+            beam_cos_out(light, cos_half))
+        t0 = t0 / r_len
+        t1 = t1 / r_len
+    else:
+        t0, t1, hit = _cone_segment(origin, rays, apex, axis,
+                                    beam_cos_out(light, cos_half))
 
     # the beam cannot start behind the camera, and it stops at the first surface
     t0 = np.maximum(t0, 0.0)
@@ -219,7 +243,14 @@ def spot_cone(origin, rays, depth, light, samples=12, density=1.0,
         p = origin + rays * t[:, None]
         d = p - apex[None, :]
         dist = np.sqrt(np.maximum(np.einsum('ij,ij->i', d, d), EPS))
-        cosang = np.einsum('ij,j->i', d, axis) / dist
+        if squeeze is None:
+            cosang = np.einsum('ij,j->i', d, axis) / dist
+        else:
+            # the angle to the axis in the squeezed frame; the distance
+            # the falloff reads stays the real one
+            d_q = d @ squeeze.T
+            cosang = d_q[:, 2] / np.sqrt(np.maximum(
+                np.einsum('ij,ij->i', d_q, d_q), EPS))
 
         # angular falloff -- soft toward the rim, as the spot's own blend
         # does (R254: or as the lamp's cone law shapes it)

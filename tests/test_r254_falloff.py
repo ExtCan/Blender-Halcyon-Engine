@@ -989,16 +989,46 @@ def test_j_panel_draws_what_the_law_reads():
               'Hemisphere flag and its ground colour)',
               any(n == 'hemi' for n, _t in rec)
               and any(n == 'hemi_ground' for n, _t in rec))
-    rec = _draw(UI, defaults, 'AREA')
+    # R254 (native): the Area lamp's Distance moved beside the Power it
+    # scales, into the Light panel, and is drawn only under Blender
+    # Internal power units (a lamp in Blender's watts does not read it);
+    # the note now gives the number instead of the rule
+    rec = _draw(UI, defaults, 'AREA', area_power='BI')
     names = [n for n, _t in rec]
-    i_d = rec.index(('decay_end', 'Distance')) \
-        if ('decay_end', 'Distance') in rec else -1
-    check('an Area lamp draws Distance, a note that brightness scales with '
-          'its square, then Gamma -- and no falloff menu',
-          i_d >= 0 and rec[i_d + 1][0] == 'label'
-          and 'Distance squared' in rec[i_d + 1][1]
-          and rec[i_d + 2][0] == 'area_gamma' and 'decay' not in names
-          and 'bi_sphere' not in names, str(rec[i_d:i_d + 3]))
+    check('Halcyon Light draws an Area lamp\'s Gamma and no falloff menu '
+          '(its Distance is the Light panel\'s row)',
+          'area_gamma' in names and 'decay' not in names
+          and 'bi_sphere' not in names and 'decay_end' not in names,
+          str(names[:8]))
+    if hasattr(UI, 'HALCYON_PT_light_native'):
+        def native(**fields):
+            hs = types.SimpleNamespace(**defaults)
+            hs.cookie = None
+            for k, v in fields.items():
+                setattr(hs, k, v)
+            lamp = types.SimpleNamespace(type='AREA', color=(1, 1, 1),
+                                         energy=10.0, halcyon=hs)
+            out = []
+            panel = UI.HALCYON_PT_light_native()
+            panel.layout = _Layout(out)
+            UI.HALCYON_PT_light_native.draw(panel, types.SimpleNamespace(
+                engine=UI.ENGINE, light=lamp, scene=None, object=None))
+            return out
+        rec = native(area_power='BI')
+        i_d = rec.index(('decay_end', 'Distance')) \
+            if ('decay_end', 'Distance') in rec else -1
+        check('the Light panel draws an Area lamp\'s Distance under Blender '
+              'Internal power units, with what the lamp gives in Blender\'s '
+              'watts beside it (10 W at Distance 25: 3125 W)',
+              i_d >= 1 and rec[i_d - 1][0] == 'area_power'
+              and rec[i_d + 1][0] == 'label' and '3125 W' in rec[i_d + 1][1],
+              str(rec[i_d - 1:i_d + 2]))
+        check('...and no Distance in watts, where nothing reads it',
+              not any(n == 'decay_end' for n, _t in native(
+                  area_power='WATTS')))
+    else:
+        check('the Light panel draws an Area lamp\'s Distance under Blender '
+              'Internal power units', False, 'no HALCYON_PT_light_native')
     try:
         _draw(UI, defaults, 'POINT', scene_default=None, decay='DEFAULT')
         ok = True

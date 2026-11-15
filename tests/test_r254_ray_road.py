@@ -848,9 +848,18 @@ def test_d_density_on_traced_shadows():
 # ------------------------------------- E. an Area lamp's object scale
 
 
-def _exported_area(size, scale=(1.0, 1.0, 1.0), shape='SQUARE', size_y=None):
+def _exported_area(size, scale=(1.0, 1.0, 1.0), shape='SQUARE', size_y=None,
+                   gain=False):
     """export_light on a fake Area lamp object whose world matrix carries
-    `scale`, standing where the rig's lamp stands."""
+    `scale`, standing where the rig's lamp stands.
+
+    The fake lamp has no Halcyon settings, so it is on Blender
+    Internal's power units, where the matrix scale is ALSO a gain of
+    scale_x * scale_y on the energy (every older file was lit that way;
+    export._native_light_options puts it back after the fold, and
+    tests/test_r254_native.py pins both units). `gain=False` takes that
+    gain out again, so the lamp's FACE can be compared with an unscaled
+    lamp of the same Size."""
     from . import fakebpy
     fakebpy.install()
     from .. import export as EX
@@ -866,6 +875,8 @@ def _exported_area(size, scale=(1.0, 1.0, 1.0), shape='SQUARE', size_y=None):
         shadow_soft_size=0.0, use_shadow=True)
     lt = EX.export_light(types.SimpleNamespace(name='L', data=data), mw)
     lt.shadow = 'RAY'
+    if not gain:
+        lt.energy = lt.energy / (float(scale[0]) * float(scale[1]))
     return lt, mw
 
 
@@ -904,9 +915,16 @@ def test_e_area_lamp_object_scale():
     one = measure(lambda: _exported_area(1.0)[0])
     scaled = measure(lambda: _exported_area(0.25, (4.0, 4.0, 4.0))[0])
     small = measure(lambda: _exported_area(0.25)[0])
-    check('Size 0.25 scaled x4 lights the floor as Size 1.0 does (it was '
-          'x16)', abs(scaled[0] / one[0] - 1.0) < 1e-3,
+    check('Size 0.25 scaled x4 has the Size 1.0 lamp\'s face: with '
+          'Blender Internal\'s scale gain taken out it lights the floor '
+          'as Size 1.0 does', abs(scaled[0] / one[0] - 1.0) < 1e-3,
           f'x{scaled[0] / one[0]:.4f}')
+    kept = measure(lambda: _exported_area(0.25, (4.0, 4.0, 4.0),
+                                          gain=True)[0])
+    check('...and on Blender Internal units the gain of scale_x * '
+          'scale_y is kept (x16: an older file\'s scaled lamp is as '
+          'bright as it was)', abs(kept[0] / one[0] / 16.0 - 1.0) < 1e-3,
+          f'x{kept[0] / one[0]:.4f}')
     check('...and throws Size 1.0\'s penumbra, four times the 0.25 lamp\'s',
           abs(scaled[1] / one[1] - 1.0) < 0.05 and one[1] / small[1] > 3.0,
           f'scaled {scaled[1]:.3f}, Size 1.0 {one[1]:.3f}, Size 0.25 '

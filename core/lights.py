@@ -657,12 +657,66 @@ def spot_falloff(light, L):
     cosine roll-off -- the field's spot rigs read wrong both ways."""
     d = M.normalize(np.asarray(light.direction, np.float32))
     inpr = -M.dot(L, np.broadcast_to(d[None, :], L.shape))
-    if getattr(light, 'spot_square', False):
+    if spot_scale_on(light):
+        # R254: a Spot scaled unevenly across its beam -- Blender's
+        # elliptical cone. The cosine every law reads is taken after
+        # the narrower axis is squeezed (the Square cone's max rides
+        # the same squeezed pair: a rectangular pyramid)
+        inpr = scaled_cos(light, L, inpr)
+    elif getattr(light, 'spot_square', False):
         # R253 (A): BI's LA_SQUARE -- the cosine the cone law reads is
         # measured along the wider of the lamp's two sides, so every
         # law (BI blend, GL11, POV, GX) gets a square version
         inpr = square_cos(light, L, inpr)
     return spot_law_factor(light, inpr)
+
+
+def spot_scale_on(light):
+    """R254: True when the lamp carries an elliptical cone -- its
+    spot_scale pair is not (1, 1). A lamp without the field (a
+    hand-built Light of an older shape) is round."""
+    sc = getattr(light, 'spot_scale', None)
+    if sc is None:
+        return False
+    try:
+        return (float(sc[0]), float(sc[1])) != (1.0, 1.0)
+    except (TypeError, ValueError, IndexError):
+        return False
+
+
+def scaled_cos(light, L, z):
+    """R254: the cosine to the axis of an ELLIPTICAL cone, Blender's
+    light_spot_attenuation (eevee_light_lib): the direction in lamp
+    space with its side / up components multiplied by spot_scale, then
+    1/sqrt(1 + (x/z)^2 + (y/z)^2); zero behind the lamp. With Square
+    the wider of the two squeezed sides is taken instead of their sum
+    (square_cos's max). `z` is the plain cosine (-L . direction), the
+    frame is cookie_frame's. Float32, one op per statement -- the CPU
+    half of the GLSL `sc_*` lines."""
+    s, u, _f = cookie_frame(light)
+    sc = getattr(light, 'spot_scale', (1.0, 1.0))
+    x = -(L @ s.astype(np.float32))
+    y = -(L @ u.astype(np.float32))
+    x = x * np.float32(sc[0])
+    y = y * np.float32(sc[1])
+    zz = np.maximum(np.asarray(z, np.float32), np.float32(1e-20))
+    with np.errstate(over='ignore', invalid='ignore'):
+        # behind the lamp x/zz overflows; the select below discards
+        # that lane, exactly the GLSL ternary
+        ax = x / zz
+        ay = y / zz
+        if getattr(light, 'spot_square', False):
+            ax = np.abs(ax)
+            ay = np.abs(ay)
+            m = np.maximum(ax, ay)
+            q = m * m
+        else:
+            q = ax * ax
+            t = ay * ay
+            q = q + t
+        q = np.float32(1.0) + q
+        c = np.float32(1.0) / np.sqrt(q)
+    return np.where(z > 0.0, c, np.float32(0.0)).astype(np.float32)
 
 
 def square_cos(light, L, z):
@@ -748,6 +802,16 @@ def cookie_frame(light):
     return s[0], u[0], f
 
 
+def cookie_spot_axes(light, s, u):
+    """R254: a Spot's slide axes with the elliptical cone's squeeze
+    folded in: (side * sx, up * sy) as float32. ONE place, read by the
+    CPU lookup and by the GPU's baked literals, so both project the
+    same slide."""
+    sc = getattr(light, 'spot_scale', (1.0, 1.0))
+    return (np.asarray(s, np.float32) * np.float32(sc[0]),
+            np.asarray(u, np.float32) * np.float32(sc[1]))
+
+
 #: R219: the extension each projection always had, before it was a
 #: choice -- SUN/HEMI tile their cloud shadow, a SPOT's cone edge lands
 #: on the image edge and clamps, a POINT's lat-long wraps around its own
@@ -808,6 +872,11 @@ def cookie_blur_uv(light):
         tanh = max(np.tan(float(getattr(light, 'spot_size', 1.2)) * 0.5),
                    1e-6)
         b = r / (2.0 * float(tanh))
+        if spot_scale_on(light):
+            # R254: the elliptical cone's gate is narrower across the
+            # squeezed axis, so the same source disc covers more of it
+            sc = light.spot_scale
+            return (b * float(sc[0]), b * float(sc[1]))
         return (b, b)
     if kind == 'POINT':
         a = float(np.arctan(r))
@@ -1124,6 +1193,11 @@ def cookie_factor(light, P, L):
     dz = d @ f.astype(np.float32)
     tanh = max(np.tan(float(light.spot_size) * 0.5), 1e-6)
     safe = np.maximum(dz, 1e-6) * (2.0 * tanh)
+    if spot_scale_on(light):
+        # R254: the slide is squeezed with the elliptical cone -- its
+        # edges stay on the cone's edges (the frame axes carry the
+        # scale, as the GPU bakes them)
+        s, u = cookie_spot_axes(light, s, u)
     cu = (d @ s.astype(np.float32)) / safe + 0.5
     cv = (d @ u.astype(np.float32)) / safe + 0.5
     if xf:

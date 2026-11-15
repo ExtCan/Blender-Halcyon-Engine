@@ -500,6 +500,13 @@ def _apply_lamp_bi(light, lm, warnings=None):
             hs.area_gamma = float(lm.get('area_gamma', 1.0) or 1.0)
         except (AttributeError, TypeError, ValueError):
             pass
+        # R254: the energy above is Blender Internal's and the Distance
+        # is la->dist, so the lamp says so -- a new Area lamp's Power is
+        # Blender's watts and reads no Distance
+        try:
+            hs.area_power = 'BI'
+        except (AttributeError, TypeError, ValueError):
+            pass
     # the lamp mode bits BI's loop honoured: Negative subtracts, No
     # Diffuse leaves only the highlight, No Specular only the diffuse
     try:

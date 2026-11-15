@@ -248,7 +248,14 @@ class HALCYON_OT_add_cornell_box(_AddBase):
 
         if self.add_lamp:
             lamp_data = bpy.data.lights.new("Cornell Light", 'AREA')
-            lamp_data.energy = 100.0 * max(self.size, 0.01) ** 2
+            # R254: Blender's watts (the lamp says so itself), about
+            # 0.75 on the white floor under the panel at any Size. The
+            # old 100 W per unit squared was neither law's number
+            lamp_data.energy = 10.0 * max(self.size, 0.01) ** 2
+            try:
+                lamp_data.halcyon.area_power = 'WATTS'
+            except (AttributeError, TypeError):
+                pass
             lamp_data.color = (1.0, 0.95, 0.85)
             try:
                 lamp_data.shape = 'RECTANGLE'
@@ -263,7 +270,10 @@ class HALCYON_OT_add_cornell_box(_AddBase):
             lamp.location = (ob.location[0] + 0.0,
                              ob.location[1] + 0.0,
                              ob.location[2] + 0.986 * self.size)
-            lamp.rotation_euler = (3.14159265, 0.0, 0.0)
+            # R254: an Area lamp shines along its own -Z, so the panel's
+            # lamp needs no turn: the half turn about X it used to get
+            # pointed it at the ceiling and the box stayed dark
+            lamp.rotation_euler = (0.0, 0.0, 0.0)
             lamp.parent = ob
             lamp.matrix_parent_inverse = ob.matrix_world.inverted()
         return {'FINISHED'}

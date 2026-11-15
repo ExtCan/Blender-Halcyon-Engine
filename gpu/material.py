@@ -468,6 +468,9 @@ def _generated_frame(src, consts, force_line=False, world_table=False):
 #:   t10 = (lamp frame side.xyz from LI.cookie_frame, 0)   (SPOT only)
 #:   t11 = (lamp frame up.xyz,                        0)   (SPOT only)
 #:   t12-15 reserved (zeros)
+#: R254: 10.w / 11.w = spot_scale, the elliptical cone's squeeze across
+#: the side / up axis, written ONLY for a lamp that carries one (a round
+#: spot's texels are the bytes they were)
 #: The style gain (H) is folded into texel 0.w: the SAME python double
 #: the CPU's sample() scales by, so the texel is bitwise its scale.
 LIGHT_TEXEL_STRIDE = 16
@@ -621,6 +624,11 @@ def pack_light_texels(lights, job=None):
             _sq_s, _sq_u, _sq_f = LI.cookie_frame(light)
             out[0, b + 10, :3] = np.asarray(_sq_s, np.float32)
             out[0, b + 11, :3] = np.asarray(_sq_u, np.float32)
+            if LI.spot_scale_on(light):
+                # R254: the elliptical cone's squeeze, the float32
+                # scaled_cos multiplies by
+                out[0, b + 10, 3] = np.float32(light.spot_scale[0])
+                out[0, b + 11, 3] = np.float32(light.spot_scale[1])
     return out
 
 
@@ -2926,7 +2934,45 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
             bl_r = _lref(i, 2, 'w') if use_tx else _f(spotbl)
             law = str(getattr(light, 'spot_law', 'BLENDER') or 'BLENDER')
             lines.append(f'    float cosang = -dot(L, {sd_r});')
-            if getattr(light, 'spot_square', False):
+            from ..core import lights as _LIsc
+            _sc_on = _LIsc.spot_scale_on(light)
+            if _sc_on:
+                # R254: Blender's elliptical cone (a Spot scaled
+                # unevenly across its beam), statement for statement
+                # lights.scaled_cos -- the squeezed cosine replaces
+                # cosang and every cone law below reads it unchanged;
+                # with Square the wider squeezed side is taken. Whether
+                # a squeeze exists is structure, its two factors are
+                # texels 10.w / 11.w (dragging the scale re-uploads)
+                if use_tx:
+                    _sc_sr, _sc_ur = _lref(i, 10, 'xyz'), _lref(i, 11, 'xyz')
+                    _sc_xr, _sc_yr = _lref(i, 10, 'w'), _lref(i, 11, 'w')
+                else:
+                    _scs, _scu, _scf = _LIsc.cookie_frame(light)
+                    _sc_sr, _sc_ur = _v3(_scs), _v3(_scu)
+                    _sc_xr = _f(np.float32(light.spot_scale[0]))
+                    _sc_yr = _f(np.float32(light.spot_scale[1]))
+                lines += [f'    float sc_x = -dot(L, {_sc_sr});',
+                          f'    float sc_y = -dot(L, {_sc_ur});',
+                          f'    sc_x = sc_x * {_sc_xr};',
+                          f'    sc_y = sc_y * {_sc_yr};',
+                          '    float sc_zz = max(cosang, 1e-20);',
+                          '    float sc_ax = sc_x / sc_zz;',
+                          '    float sc_ay = sc_y / sc_zz;']
+                if getattr(light, 'spot_square', False):
+                    lines += ['    sc_ax = abs(sc_ax);',
+                              '    sc_ay = abs(sc_ay);',
+                              '    float sc_m = max(sc_ax, sc_ay);',
+                              '    float sc_q = sc_m * sc_m;']
+                else:
+                    lines += ['    float sc_q = sc_ax * sc_ax;',
+                              '    float sc_t = sc_ay * sc_ay;',
+                              '    sc_q = sc_q + sc_t;']
+                lines += ['    sc_q = 1.0 + sc_q;',
+                          '    float sc_r = sqrt(sc_q);',
+                          '    float sc_c = 1.0 / sc_r;',
+                          '    cosang = (cosang > 0.0) ? sc_c : 0.0;']
+            if getattr(light, 'spot_square', False) and not _sc_on:
                 # R253 (A): BI's LA_SQUARE, statement for statement
                 # lights.square_cos -- the cosine along the wider side
                 # replaces cosang and the cone-law lines below read it
