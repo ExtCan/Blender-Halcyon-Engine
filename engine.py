@@ -736,12 +736,20 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
         center_k = int(np.argmin(np.abs(offs)))
         acc = None
         center_scene = None
+        # every slice traces its own soft-shadow rays (the index the
+        # sampler salts with, RenderSettings.sample_pass_for): with one
+        # shared pattern the slices averaged a still penumbra's grain
+        # into itself. Put back in the finally -- the settings object
+        # outlives this frame
+        pass0 = int(getattr(settings, '_sample_pass', 0) or 0)
         try:
             for k, off in enumerate(offs):
                 base = int(np.floor(frame0 + off))
                 sub = float(frame0 + off - base)
                 self.frame_set(base, sub)
                 scene_k = export.export_scene(depsgraph, settings, warnings)
+                settings._sample_pass = pass0
+                settings._sample_pass = settings.sample_pass_for(k)
                 img = core_render.render(
                     scene_k, settings,
                     progress=on_progress if k == center_k else None)
@@ -761,6 +769,7 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                 if self.test_break():
                     raise _Cancelled()
         finally:
+            settings._sample_pass = pass0
             try:
                 self.frame_set(frame0, 0.0)
             except Exception:                                   # noqa: BLE001

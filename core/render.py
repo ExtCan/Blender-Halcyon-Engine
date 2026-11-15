@@ -6763,6 +6763,9 @@ def _render_lens_accumulated(scene, st, progress, band):
         sc2.camera = cam2
         st2 = st.copy()
         st2._lens_pass = True
+        # this lens point's own soft-shadow rays (copy() carries the
+        # index down through every road below)
+        st2._sample_pass = st.sample_pass_for(k)
         # st.copy() drops the private flags; the outer roads' state (an
         # AA pass's jitter, a stereo eye, a pano strip) must ride along
         for flag in ('_accum_jitter', '_stereo', '_viewport', '_refine_mask',
@@ -6894,6 +6897,9 @@ def _render_accumulated(scene, st, progress, band):
         st2.aa_mode = 'NONE'
         st2._accum_jitter = (_halton(k + 1, 2) - 0.5,
                              _halton(k + 1, 3) - 0.5)
+        # every pass traces its OWN soft-shadow rays: with one shared
+        # pattern sixteen passes left the penumbra as grainy as one
+        st2._sample_pass = st.sample_pass_for(k)
         # R251: st.copy() drops the private flags; a stereo eye's or a
         # pano strip's pass must keep reading them (a pair per pass
         # since R190 otherwise; at defaults both read None / False)
@@ -7054,6 +7060,9 @@ def _adaptive_refine(scene, st, img, gbuf, mesh, depth_m, progress):
             st2._accum_jitter = (_halton(k, 2) - 0.5,
                                  _halton(k, 3) - 0.5)
             st2._refine_mask = mask
+            # a refine pass re-samples its pixels' soft shadows too (the
+            # base frame keeps the index these settings came with)
+            st2._sample_pass = st.sample_pass_for(k)
             st2._stereo = getattr(st, '_stereo', None)      # R251: carried
             st2._pano_strip = getattr(st, '_pano_strip', False)
             acc += render(scene, st2, None, band=None)[mask]
