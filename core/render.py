@@ -4271,7 +4271,11 @@ def _build_shadows(scene, st, mesh):
 def shaft_sources(scene, settings, vp):
     """Screen positions of lights that scatter, for the light-shaft pass."""
     out = []
-    for light in scene.lights:
+    # R254: the frame's lamps that light a medium (_medium_lamps): a
+    # lamp that is only ambient has no position to throw a shaft from,
+    # an Only Shadow lamp or one the Light Limit left unlit emits
+    # nothing to scatter
+    for light in _medium_lamps(scene, settings):
         vol = float(getattr(light, 'volumetric', 0.0))
         if vol <= 0.0:
             continue
@@ -4368,7 +4372,11 @@ def _flare_sources(scene, st, gbuf, vp):
     only through sky.
     """
     out = []
-    lights = getattr(scene, 'lights', None) or ()
+    # R254: a flare is the lens's answer to a lamp that SHINES: the
+    # frame's lamps that light a medium (_medium_lamps) -- never an
+    # ambient lamp (no position), an Only Shadow lamp or one the Light
+    # Limit left unlit
+    lights = _medium_lamps(scene, st)
     if not any(float(getattr(l, 'flare', 0.0)) > 0.0 for l in lights):
         return out
     h, w = gbuf.depth.shape
@@ -8336,20 +8344,41 @@ def _per_light_ray_shadows(scene, st):
     if not (st.shadows and getattr(st, 'ray_shadows', True)
             and st.shadow_default == 'PER_LIGHT'):
         return False
+    # R254: the frame's lamps only (LI.frame_lights) -- a lamp that is
+    # only ambient, or one the Light Limit left unlit, traces nothing
+    # and must not be the reason a BVH is built
     return any(str(getattr(l, 'shadow', 'MAP')) == 'RAY'
                and str(getattr(l, 'type', 'POINT')).upper()
                not in ('HEMI', 'AMBIENT')
-               for l in (getattr(scene, 'lights', None) or ()))
+               for l in LI.frame_lights(scene, st))
+
+
+def _medium_lamps(scene, st):
+    """The lamps that light a MEDIUM this frame -- the visible beam,
+    the light shafts, the lens flare: the frame's lamps (LI.frame_lights:
+    the Light Limit's survivors, no ambient lamp) less the Only Shadow
+    lamps (LI.lights_volume says 0 for a lamp that gives a medium
+    nothing). Scene order, so a scene without such a lamp reads the
+    list it always read (R254)."""
+    return [l for l in LI.frame_lights(scene, st)
+            if LI.lights_volume(l) != 0.0]
+
+
+def _beam_lamps(scene, st):
+    """The lamps whose visible beam _light_volumes draws: a marcher
+    exists for the kind, Volumetric is above 0, and the lamp lights a
+    medium at all (_medium_lamps)."""
+    return [l for l in _medium_lamps(scene, st)
+            if str(getattr(l, 'type', '')).upper() in _VOLUME_KINDS
+            and float(getattr(l, 'volumetric', 0.0)) > 0.0]
 
 
 def _volume_occlusion_wanted(scene, st):
     """True when any drawn beam asked to be shadowed (needs the BVH)."""
     if not getattr(st, 'spot_cones', False):
         return False
-    return any(float(getattr(l, 'volumetric', 0.0)) > 0.0
-               and getattr(l, 'volumetric_occlusion', False)
-               for l in (getattr(scene, 'lights', None) or ())
-               if str(getattr(l, 'type', '')).upper() in _VOLUME_KINDS)
+    return any(getattr(l, 'volumetric_occlusion', False)
+               for l in _beam_lamps(scene, st))
 
 
 def _halo_noise2(u, v, ti, seed):
@@ -9146,8 +9175,18 @@ def _draw_halos(img, scene, st, gbuf, view, proj, w, h, sel_mask=None):
             if lit is None:
                 p1 = wpos.reshape(1, 3).astype(np.float32)
                 acc = np.zeros(3, np.float32)
-                for lgt in scene.lights:
-                    if getattr(lgt, 'ambient_only', False):
+                # R254: the frame's lamps (the Light Limit's
+                # survivors, no ambient lamp of either kind), each with
+                # the sign and the lobe a surface would give it -- the
+                # halo is a diffuse receiver. The loop used to walk
+                # every lamp and read Ambient Only alone: a Negative
+                # lamp brightened the halo, an Only Shadow or Specular
+                # Only lamp lit it
+                for lgt in LI.frame_lights(scene, st):
+                    _hs = LI.lights_volume(lgt)
+                    if _hs == 0.0 or not getattr(lgt, 'affect_diffuse',
+                                                 True) \
+                            or getattr(lgt, 'specular_only', False):
                         continue
                     try:
                         _L, radl, _d = LI.sample(lgt, p1, st)
@@ -9155,7 +9194,10 @@ def _draw_halos(img, scene, st, gbuf, view, proj, w, h, sel_mask=None):
                         continue
                     # inp = 1 - |vn.lv| with vn the zero vector -> 1;
                     # a HEMI's 0.5*i+0.5 also lands on 1
-                    acc += np.maximum(radl[0], 0.0)
+                    if _hs < 0.0:
+                        acc -= np.maximum(radl[0], 0.0)
+                    else:
+                        acc += np.maximum(radl[0], 0.0)
                 lit = np.maximum(acc, 0.0)
                 shaded_cache[key] = lit
             crgb = crgb * lit[None, None, :]
@@ -9268,9 +9310,9 @@ def _light_volumes(img, scene, st, gbuf, vp, eye, w, h, bvh=None,
     """
     if not getattr(st, 'spot_cones', False):
         return img
-    lights = [l for l in (getattr(scene, 'lights', None) or ())
-              if str(getattr(l, 'type', '')).upper() in _VOLUME_KINDS
-              and float(getattr(l, 'volumetric', 0.0)) > 0.0]
+    # R254: _beam_lamps -- the frame's lamps only (no ambient lamp, no
+    # Only Shadow lamp, none the Light Limit left unlit)
+    lights = _beam_lamps(scene, st)
     if not lights:
         return img
     from . import cones as CONES
@@ -9335,6 +9377,10 @@ def _light_volumes(img, scene, st, gbuf, vp, eye, w, h, bvh=None,
             * float(light.volumetric),
             falloff=float(getattr(st, 'spot_cone_falloff', 2.0)),
             max_distance=reach_l, occlude=occ)
+        if LI.lights_volume(light) < 0.0:
+            # R254: a Negative lamp's beam takes light away, as the
+            # lamp does on a surface (it used to add)
+            scatter = -scatter
         if scatter.any():
             col = np.asarray(light.color, np.float32)[None, :]
             # R253 (H): the beam flickers with the lamp's style
@@ -11389,9 +11435,7 @@ def _beams_active(scene, st):
     """Whether _light_volumes will edit the frame (its own early exits)."""
     if not getattr(st, 'spot_cones', False):
         return False
-    return any(str(getattr(l, 'type', '')).upper() in _VOLUME_KINDS
-               and float(getattr(l, 'volumetric', 0.0)) > 0.0
-               for l in (getattr(scene, 'lights', None) or ()))
+    return bool(_beam_lamps(scene, st))
 
 
 def _propagate_gpu_flag(st, flags, what):

@@ -179,6 +179,15 @@ class ObjectInfo:
     # never moves with the object; None = derive it from the mesh
     # (hand-built scenes, hair parts).
     gen_bounds: Optional[tuple] = None
+    # R254: light linking. `instancer` names the object that INSTANCES
+    # this one -- a collection-instance empty, a geometry-nodes or
+    # particle instancer ('' = a real object): a lamp linked to the
+    # instancer reaches every object it instances. `link_name` is the
+    # object's library-qualified name (Blender's name_full), which the
+    # exporter matches a link by, so a linked-library object does not
+    # answer for a local one of the same name ('' = match on `name`).
+    instancer: str = ''
+    link_name: str = ''
 
 
 @dataclass

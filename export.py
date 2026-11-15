@@ -1219,7 +1219,11 @@ def export_light(ob, matrix, unit_scale=1.0):
         lt.exclude_mode = getattr(hs, 'exclude_mode', 'EXCLUDE')
         coll = getattr(hs, 'exclude_collection', None)
         if coll is not None:
-            lt.exclude_names = {o.name for o in coll.all_objects}
+            # a set even when the collection is EMPTY: "a collection is
+            # picked" is what tells 'Only nothing' from no link at all
+            # (_resolve_links). R254: library-qualified link names
+            lt.exclude_names = {compat.link_name(o)
+                                for o in coll.all_objects}
         # R253 light options: every new dial through getattr with the
         # dataclass default -- an older panel (or a test's fake hs
         # without the fields) exports the inert lamp
@@ -1645,6 +1649,8 @@ def _info_snapshot(ob):
     """The ObjectInfo fields, read from the evaluated object."""
     return dict(
         name=ob.name,
+        # R254: what light linking matches this object by
+        link_name=compat.link_name(ob),
         color=tuple(ob.color) if hasattr(ob, 'color') else (1, 1, 1, 1),
         index=int(getattr(ob, 'pass_index', 0)),
         random=float(abs(hash(ob.name)) % 10000) / 10000.0,
@@ -1656,12 +1662,16 @@ def _info_snapshot(ob):
         smoke_grid=_smoke_grid(ob))
 
 
-def _info_object(info, matrix, gen_bounds=None):
+def _info_object(info, matrix, gen_bounds=None, instancer=''):
     # R253: `gen_bounds` is the mesh's object-space texture space from
     # _mesh_arrays (None = the renderer derives it); an optional third
-    # argument so every older two-argument caller still works
+    # argument so every older two-argument caller still works. R254:
+    # `instancer` is compat.instancer_name of the instance this row
+    # stands for ('' = a real object), for _resolve_links
     mw = np.asarray(matrix, np.float32)
     return ObjectInfo(
+        instancer=str(instancer or ''),
+        link_name=str(info.get('link_name', '') or ''),
         name=info['name'], location=tuple(mw[:3, 3]), matrix_world=mw,
         color=info['color'], index=info['index'], random=info['random'],
         visible_camera=info['visible_camera'],
@@ -1729,6 +1739,47 @@ def _kind(ob):
     return _KINDS.get(getattr(ob, 'type', ''), "Object")
 
 
+def _resolve_links(lights, objects):
+    """Light linking: the names of a lamp's linked collection -> the
+    object indices the renderer works in (Light.exclude_objects).
+
+    R254. The old resolver kept ONE index per name, so of three
+    instances of a linked object only the last was affected, and a lamp
+    linked to the collection holding the instancer empties reached
+    nothing (an instancer is no exported object). Every exported row of
+    a name answers now, and every row INSTANCED BY a named object
+    (ObjectInfo.instancer). Names are the library-qualified link names
+    (compat.link_name), falling back to the plain name for a row built
+    without one.
+
+    A collection that is picked but resolves to no rendered object
+    writes (-1,) under 'Only': no object carries that index, so the
+    lamp lights nothing on either road -- 'nothing but the collection'.
+    It used to write (), which both roads read as 'no link at all'.
+    Under 'Exclude' an unresolved link leaves the lamp unlinked."""
+    by_name, by_inst = {}, {}
+    for i, o in enumerate(objects or ()):
+        if o is None:
+            continue
+        by_name.setdefault(getattr(o, 'link_name', '') or o.name,
+                           []).append(i)
+        par = getattr(o, 'instancer', '') or ''
+        if par:
+            by_inst.setdefault(par, []).append(i)
+    for lt in lights:
+        names = getattr(lt, 'exclude_names', None)
+        if names is None:
+            continue
+        idx = set()
+        for n in names:
+            idx.update(by_name.get(n, ()))
+            idx.update(by_inst.get(n, ()))
+        if idx:
+            lt.exclude_objects = tuple(sorted(idx))
+        elif str(getattr(lt, 'exclude_mode', 'EXCLUDE')) == 'ONLY':
+            lt.exclude_objects = (-1,)
+
+
 def export_lights_into(parked, depsgraph):
     """A next Scene with FRESH lights and everything else SHARED.
 
@@ -1750,13 +1801,7 @@ def export_lights_into(parked, depsgraph):
             continue
         lights.append(export_light(ob, inst.matrix_world,
                                    bscene.unit_settings.scale_length))
-    name_to_index = {o.name: i
-                     for i, o in enumerate(parked.objects or [])}
-    for lt in lights:
-        names = getattr(lt, 'exclude_names', None)
-        if names:
-            lt.exclude_objects = tuple(sorted(
-                name_to_index[n] for n in names if n in name_to_index))
+    _resolve_links(lights, parked.objects or [])
     scene = copy.copy(parked)
     scene.lights = lights
     return scene
@@ -2354,6 +2399,10 @@ def _collect_hair_parts(depsgraph, bscene, mat_lookup, materials, images,
     except Exception:                                           # noqa: BLE001
         eye = (0.0, 0.0, 0.0)
 
+    # R254: the instancer of the instance the loop below stands on, for
+    # the strand rows' ObjectInfo (light linking by instancer)
+    inst_by = ['']
+
     def _push_part(strands, widths, uv_roots, mat, ob, label):
         if not strands:
             return
@@ -2383,8 +2432,8 @@ def _collect_hair_parts(depsgraph, bscene, mat_lookup, materials, images,
                 'smooth': np.ones(t.shape[0], bool),
                 'uv_names': []})
             info = _info_snapshot(ob)
-            objects.append(_info_object(info, np.eye(4,
-                                                     dtype=np.float32)))
+            objects.append(_info_object(info, np.eye(4, dtype=np.float32),
+                                        None, inst_by[0]))
         except Exception as exc:                                # noqa: BLE001
             warnings.append(f"hair on '{getattr(ob, 'name', '?')}' "
                             f"could not be exported "
@@ -2394,6 +2443,7 @@ def _collect_hair_parts(depsgraph, bscene, mat_lookup, materials, images,
         ob = inst.object
         if ob is None or not getattr(inst, 'show_self', True):
             continue
+        inst_by[0] = compat.instancer_name(inst)
 
         # ---- legacy particle-system hair ----
         for ps in (getattr(ob, 'particle_systems', None) or ()):
@@ -2659,8 +2709,8 @@ def export_scene(depsgraph, settings, warnings=None):
     # consumed lazily on purpose: the generator frees each converted mesh on
     # the way to the next one, and wrapping it in list() would read every one
     # of them after it had been freed. See compat.evaluated_meshes.
-    for ob, me, matrix, temp in compat.evaluated_meshes(depsgraph,
-                                                        skip=_skip):
+    for ob, me, matrix, temp, inst_by in compat.evaluated_meshes(
+            depsgraph, skip=_skip):
         if me is None:
             # the skip path: this object was never evaluated -- serve its
             # arrays from the cache. Materials still export FRESH every
@@ -2691,7 +2741,7 @@ def export_scene(depsgraph, settings, warnings=None):
                 # a stored slot name no longer names a material (renamed
                 # since the store): the only exact answer is the live
                 # path, run after the loop in the position reserved here
-                retries.append((len(parts), obj_index, ob, matrix))
+                retries.append((len(parts), obj_index, ob, matrix, inst_by))
                 parts.append(None)
                 objects.append(None)
                 continue
@@ -2724,7 +2774,7 @@ def export_scene(depsgraph, settings, warnings=None):
                 pass
             # R253: the texture space rides the cached 'data'
             objects.append(_info_object(info, matrix,
-                                        data.get('gen_bounds')))
+                                        data.get('gen_bounds'), inst_by))
             _sp['cached_ms'] += (_time.perf_counter() - _t0) * 1000.0
             _sp['cached'] += 1
             if k in _touched:
@@ -2800,7 +2850,8 @@ def export_scene(depsgraph, settings, warnings=None):
         idx = np.clip(data['mat_index'], 0, len(remap) - 1)
         data['mat_index'] = remap[idx]
         parts.append(data)
-        objects.append(_info_object(info, matrix, data.get('gen_bounds')))
+        objects.append(_info_object(info, matrix, data.get('gen_bounds'),
+                                    inst_by))
 
     # the RETRY pass: cached entries whose stored slot names went
     # unresolvable (a material rename). One live re-export each, one at a
@@ -2809,7 +2860,7 @@ def export_scene(depsgraph, settings, warnings=None):
     # parts/objects positions the loop reserved -- object numbering and
     # every later object's baked obj_index stay identical to a fully
     # live export.
-    for i_part, obj_index, r_ob, r_matrix in retries:
+    for i_part, obj_index, r_ob, r_matrix, r_inst_by in retries:
         data = None
         info = None
         ev = None
@@ -2876,7 +2927,8 @@ def export_scene(depsgraph, settings, warnings=None):
             info = _info_snapshot(r_ob)
         parts[i_part] = data if data is not None else _empty_part()
         objects[obj_index] = _info_object(info, r_matrix,
-                                          (data or {}).get('gen_bounds'))
+                                          (data or {}).get('gen_bounds'),
+                                          r_inst_by)
 
     # R172: the stale sweep. Keys nobody visits again -- an instancer
     # empty dragged through fifty matrices, a scene emptied out -- used
@@ -2905,15 +2957,6 @@ def export_scene(depsgraph, settings, warnings=None):
         lights.append(export_light(ob, inst.matrix_world,
                                    bscene.unit_settings.scale_length))
 
-    # light linking is authored by object name; resolve to the indices the
-    # renderer works in, now that every object has one
-    name_to_index = {o.name: i for i, o in enumerate(objects)}
-    for lt in lights:
-        names = getattr(lt, 'exclude_names', None)
-        if names:
-            lt.exclude_objects = tuple(sorted(
-                name_to_index[n] for n in names if n in name_to_index))
-
     # R191: particles and point clouds wearing halo materials
     try:
         _collect_extra_halos(depsgraph, mat_lookup, materials, images,
@@ -2928,6 +2971,13 @@ def export_scene(depsgraph, settings, warnings=None):
                             images, objects, parts, warnings)
     except Exception:                                           # noqa: BLE001
         pass
+
+    # light linking is authored by object name; resolve to the indices the
+    # renderer works in, now that every object has one. R254: AFTER the
+    # hair parts (a strand row carries its emitter's name, so the hair
+    # of a linked object is linked with it -- the resolver used to run
+    # before those rows existed)
+    _resolve_links(lights, objects)
 
     _t0 = _time.perf_counter()
     mesh = _concat([p for p in parts if p is not None])

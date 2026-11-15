@@ -1147,8 +1147,39 @@ def _plan_sig(job, mkey):
             # flips the cap's choice would reuse a plan indexed for
             # different lamps
             _selection_sig(scene, st),
+            # R254: whether the ambient pool rides the hal_lights row
+            # (and its value where a pass still bakes it)
+            _ambient_sig(scene, st),
             tuple(_mat_sig(m) for m in scene.materials),
             tuple(sorted(job.textures or {})))
+
+
+def _ambient_sig(scene, st):
+    """How the plan carries the ambient lamps' share of the ambient pool.
+
+    None for a scene without an ambient lamp (lights.is_ambient_lamp):
+    its pool is the settings' Global Ambient and the world's ambient,
+    both in the signature already, and the passes bake it as literals
+    exactly as they did. With an ambient lamp the pool is a VALUE: the
+    passes read the ambient tail of the hal_lights row (STRUCTURE, the
+    one flag here), so a Power or colour edit of that lamp, or a step of
+    its light style, is a cache hit plus the row's re-upload -- never a
+    new plan, and never the stale ambient a hit used to draw (the pool
+    was a literal no signature entry stood for). The radiosity gather is
+    the one place that still bakes the pool (its sky term, in two
+    functions of the pre-pass and the material pass): under Radiosity
+    the pool's value joins the signature and an edit re-plans."""
+    from .material import scene_ambient_lamps
+    if not scene_ambient_lamps(scene):
+        return None
+    if not bool(getattr(st, 'radiosity', False)):
+        return ('ambient tail',)
+    from ..core import lights as LI
+    try:
+        return ('ambient tail',) + tuple(
+            round(float(v), 6) for v in LI.ambient_light(scene, st))
+    except Exception:                                           # noqa: BLE001
+        return ('ambient tail', None)
 
 
 def _selection_sig(scene, st):
@@ -1415,17 +1446,21 @@ def plan_frame(job, gbuf, use_cache=True):
         return None, 'Normal Source FACE needs stored face normals ' \
                      'this mesh does not carry', {}
 
+    from .material import link_runs as _link_runs
     lights = LI.frame_lights(scene, st)
     for l in lights:
         if l.type not in ('SUN', 'HEMI', 'POINT', 'SPOT', 'AREA'):
             return None, f'{l.type} lights are not in the GLSL light loop', {}
-        if len(getattr(l, 'exclude_objects', ()) or ()) > 64:
+        if len(_link_runs(getattr(l, 'exclude_objects', ()) or ())) > 64:
             # linking emits a per-light object ladder against td.y (an
             # exact integer float) -- the same isin() decision the CPU
             # takes, no texture, no cliff. A pathological list is the
-            # one honest refusal left.
-            return None, ('light linking with more than 64 linked '
-                          'objects shades on the CPU'), {}
+            # one honest refusal left. R254: the ladder is one term per
+            # RUN of consecutive indices (material.link_ladder), so the
+            # refusal counts runs -- three hundred instances side by
+            # side are one term, sixty-five scattered objects refuse
+            return None, ('light linking with more than 64 separate '
+                          'runs of linked objects shades on the CPU'), {}
 
     # shadow maps: the same maps the CPU just baked, packed for the GPU
     shadows, atlases = [], {}
@@ -1667,6 +1702,8 @@ def plan_frame(job, gbuf, use_cache=True):
         mat_ids = np.zeros(0, np.int64)
 
     from ..core import render as _CR
+    from .material import ambient_tail_base as _ambient_tail_base
+    from .material import scene_ambient_lamps as _scene_ambient_lamps
     _amb_eng, _amb_wrld = LI.ambient_light_split(scene, st)
     consts = {
         'ambient_color': tuple(float(v) for v in LI.ambient_light(scene, st)),
@@ -1675,6 +1712,12 @@ def plan_frame(job, gbuf, use_cache=True):
         # part flat-adds (see light_surface's BI branch)
         'ambient_engine': tuple(float(v) for v in _amb_eng),
         'ambient_world': tuple(float(v) for v in _amb_wrld),
+        # R254: with an ambient lamp in the scene the three triples are
+        # read from the ambient tail of the hal_lights row instead (the
+        # texel index after the last light's block; None = the literals
+        # above). In the plan signature: _ambient_sig
+        'ambient_tail': (_ambient_tail_base(len(lights))
+                         if _scene_ambient_lamps(scene) else None),
         'two_sided': bool(getattr(st, 'two_sided_lighting', True)),
         'specular_in_gamma': bool(getattr(st, 'specular_in_gamma', True)),
         'clamp_specular': bool(getattr(st, 'clamp_specular', True)),

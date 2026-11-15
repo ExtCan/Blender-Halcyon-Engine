@@ -1571,9 +1571,40 @@ def limit_strength(light, pts, guard, settings):
 #: Without a reference (a bare lamp list, a scene with nothing to measure
 #: against) the ranking is the raw one it always was. A list at or under
 #: the limit comes back untouched.
+def is_ambient_lamp(light):
+    """True for a lamp that is ONLY ambient: the AMBIENT type, and any
+    lamp with Ambient Only ticked (R254).
+
+    Such a lamp feeds the ambient pool (ambient_light_split) and
+    nothing else: it has no direction to shade from, so it is no
+    member of the frame's lamp list -- no diffuse or specular lobe, no
+    shadow, no beam, shaft or flare, no slot under the Light Limit.
+    Ambient Only used to be read by the pool alone: the lamp kept
+    lighting and shadowing as before with the ambient added on top.
+    This is the one predicate every reader of the lamp list asks."""
+    return str(getattr(light, 'type', '')).upper() == 'AMBIENT' or \
+        bool(getattr(light, 'ambient_only', False))
+
+
+def lights_volume(light):
+    """The sign a lamp's scatter takes in a medium (a volume container,
+    its own visible beam): +1.0, -1.0 for a Negative lamp, or 0.0 for a
+    lamp that lights no medium at all -- an ambient lamp (no position)
+    and an Only Shadow lamp (it adds no light anywhere, it only takes
+    it away where its shadow falls on a surface) (R254).
+
+    The media used to read none of the contribution flags: a Negative
+    lamp brightened the fog it should darken, an Only Shadow lamp lit
+    it. +1.0 for every lamp without those flags, so a scene that does
+    not use them marches exactly as before."""
+    if is_ambient_lamp(light) or getattr(light, 'only_shadow', False):
+        return 0.0
+    return -1.0 if getattr(light, 'negative', False) else 1.0
+
+
 def select_lights(lights, settings, reference=None):
     """Emulate a hardware light limit by keeping only the strongest N."""
-    active = [l for l in lights if l.type != 'AMBIENT']
+    active = [l for l in lights if not is_ambient_lamp(l)]
     limit = int(settings.max_lights)
     if limit <= 0 or len(active) <= limit:
         return active

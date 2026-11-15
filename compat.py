@@ -209,14 +209,44 @@ def enable_nodes(datablock):
             datablock.use_nodes = True
 
 
+def link_name(ob):
+    """The name light linking matches an object by: Blender's name_full
+    of the ORIGINAL datablock ('Rock [props.blend]' for an object linked
+    from a library, the plain name for a local one), so a library object
+    does not answer for a local object that shares its name (R254)."""
+    try:
+        orig = getattr(ob, 'original', None) or ob
+        return str(getattr(orig, 'name_full', None) or orig.name)
+    except Exception:                                           # noqa: BLE001
+        return str(getattr(ob, 'name', '') or '')
+
+
+def instancer_name(inst):
+    """The link name of the object that generated a depsgraph instance:
+    the empty of a collection instance, the object carrying a
+    geometry-nodes or particle instancer, the parent of a vertex / face
+    instance -- for a nested instance the outermost one, the object that
+    stands in the scene. '' for a real object (R254: light linking
+    resolves a linked instancer to everything it instances)."""
+    try:
+        if not getattr(inst, 'is_instance', False):
+            return ''
+        par = getattr(inst, 'parent', None)
+        return link_name(par) if par is not None else ''
+    except Exception:                                           # noqa: BLE001
+        return ''
+
+
 def evaluated_meshes(depsgraph, skip=None):
-    """Yield (object, evaluated mesh, matrix, is_temporary), one at a time.
+    """Yield (object, evaluated mesh, matrix, is_temporary, instancer),
+    one at a time. `instancer` is instancer_name() of the instance that
+    produced the item ('' for a real object; R254).
 
     `skip(original, matrix)` -> True short-circuits an object BEFORE its
     depsgraph evaluation: the caller gets (original, None, matrix,
-    False) and serves the geometry from its own cache (R171's export
-    cache). The whole point is skipping `evaluated_get` + `to_mesh` --
-    the measured cost of an unchanged 171-object export.
+    False, instancer) and serves the geometry from its own cache (R171's
+    export cache). The whole point is skipping `evaluated_get` +
+    `to_mesh` -- the measured cost of an unchanged 171-object export.
 
     THREE Blender rules govern this, and breaking any of them is a hard
     crash rather than an exception:
@@ -263,19 +293,22 @@ def evaluated_meshes(depsgraph, skip=None):
             # .original is the bmain-owned datablock: the ONE reference
             # that stays valid after this iteration step ends
             orig = getattr(ob, 'original', None) or ob
-            instances.append((orig, i.matrix_world.copy()))
+            # R254: who instances it, as a plain string (nothing reached
+            # through the instance outlives this step)
+            instances.append((orig, i.matrix_world.copy(),
+                              instancer_name(i)))
     except Exception:                                           # noqa: BLE001
         return
     live = None
     try:
-        for orig, matrix_world in instances:
+        for orig, matrix_world, par in instances:
             if live is not None:
                 free_mesh(live)
                 live = None
             if skip is not None:
                 try:
                     if skip(orig, matrix_world):
-                        yield orig, None, matrix_world, False
+                        yield orig, None, matrix_world, False, par
                         continue
                 except Exception:                               # noqa: BLE001
                     pass
@@ -288,7 +321,7 @@ def evaluated_meshes(depsgraph, skip=None):
             if me is None:
                 continue
             live = ev
-            yield ev, me, matrix_world, True
+            yield ev, me, matrix_world, True, par
     finally:
         # runs on exhaustion, on an early break, and on close()
         if live is not None:

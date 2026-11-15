@@ -4363,7 +4363,7 @@ def test_evaluated_meshes_survives_pointer_invalidation():
 
     dg = _DG()
     got = [(ob.type, me.name)
-           for ob, me, _mw, _tmp in compat.evaluated_meshes(dg)]
+           for ob, me, _mw, _tmp, _by in compat.evaluated_meshes(dg)]
     # the OLD code held epoch-0 evaluated pointers: the first conversion
     # bumped the epoch and every later to_mesh() hit the stale guard and
     # was silently skipped -- only ONE mesh survived. Fresh resolution
@@ -15542,14 +15542,17 @@ def test_the_shading_routes_fall():
               any('hal_lk' in s for _m, _n, s, _b in p))
     sc2, st2 = build('light linking (exclude + only)')
     st2.render_device = 'GPU'
-    sc2.lights[-1].exclude_objects = tuple(range(70))
+    # R254: the ladder is one term per RUN of consecutive indices, so the
+    # refusal counts runs: 70 SCATTERED objects still refuse by name (70
+    # in a row are one range test and plan -- tests/test_r254_flags.py)
+    sc2.lights[-1].exclude_objects = tuple(range(0, 140, 2))
     view, _proj, vp, eye = R.camera_matrices(sc2.camera, w, h)
     g3 = raster.GBuffer(w, h)
     raster.rasterize(sc2.mesh.verts, sc2.mesh.tris, vp, w, h, gbuf=g3)
     job3 = R.ShadeJob(sc2, st2, {}, None, view, eye, w, h)
     GSH._PLAN_CACHE.clear()
     p3, why3, _a3 = GSH.plan_frame(job3, g3)
-    check('a 70-object linking list refuses by name',
+    check('a linking list of 70 scattered objects refuses by name',
           p3 is None and '64' in str(why3), str(why3))
 
     # ---- R78: every new gate is in the plan signature. Prime the

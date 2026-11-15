@@ -140,9 +140,12 @@ def surface_points(mesh, gbuf, cov):
 
 def key_light(scene):
     """The key lamp of the line: the first non-ambient light in scene
-    order (the convention the shadow-side weight set in 1.70)."""
+    order (the convention the shadow-side weight set in 1.70). R254: a
+    lamp with Ambient Only ticked is an ambient light too (it has no
+    direction for the line to lean on): lights.is_ambient_lamp."""
+    from .lights import is_ambient_lamp
     for l in (getattr(scene, 'lights', None) or ()):
-        if str(getattr(l, 'type', '')).upper() != 'AMBIENT':
+        if not is_ambient_lamp(l):
             return l
     return None
 
