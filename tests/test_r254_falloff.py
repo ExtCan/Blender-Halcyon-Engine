@@ -1053,6 +1053,10 @@ def test_j_panel_draws_what_the_law_reads():
             engine=UI.ENGINE, scene=types.SimpleNamespace(halcyon=hs_s)))
         return [t for n, t in rec if n == 'label']
 
+    if not hasattr(LI, 'LAST_LIMIT_REPORT'):
+        check('the Lighting panel names the lamps the last render left '
+              'unlit, under the Light Limit rows', False)
+        return
     saved = dict(LI.LAST_LIMIT_REPORT)
     try:
         LI.LAST_LIMIT_REPORT.clear()

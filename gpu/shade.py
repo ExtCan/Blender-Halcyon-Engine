@@ -1132,7 +1132,10 @@ def _selection_sig(scene, st):
     the cache-hit texel repack run in. The old rank order was not in
     this signature: a Power edit that swapped two kept lamps of
     different kinds was a cache hit whose repack filled a spot's texels
-    into a point lamp's block."""
+    into a point lamp's block. Brightest does not read the camera, so
+    an orbit still re-plans nothing; under Nearest (distance from the
+    camera) a move that changes the kept set is a new plan, and only
+    for a scene with more lamps than the limit."""
     from ..core import lights as LI
     try:
         sel = LI.frame_lights(scene, st)

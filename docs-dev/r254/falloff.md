@@ -8,8 +8,11 @@ package is listed under "For the integrator" at the end.
 The user's report: "The lights don't get softer/harder with size. Also, I
 think some of the general options just don't work properly." This package
 is the second half for the falloff menu, its distance dials and the Light
-Limit: ten findings of the `hal-decay` audit cluster, the two Light Limit
-findings of `hal-flags`, and one defect found while fixing them.
+Limit: nine of the ten findings of the `hal-decay` audit cluster (the
+tenth, the dead lamp's shadow bake, is the bake-speed package's) and its
+verifier's three new ones, the Light Limit findings of `hal-flags`
+(limit-brightest-01, limit-nearest-01 and the report and tooltip of
+limit-first-order-ui-01), and one defect found while fixing them.
 
 Roads checked for every fix: the CPU road (core/render.py, headless and
 real Blender 5.2.2 F12), the GPU road through its simulator twin
@@ -130,42 +133,54 @@ before-number was measured on.
   Point lamp's Power (10 W) is divided by 4 pi and by its falloff before it
   lights anything. And its Nearest branch needed a `centre` that none of
   its nine callers passed, so Nearest ran the Brightest ranking.
-- **What it does now.**
-  - `LI.frame_lights(scene, settings)` is the one selection. All nine
-    readers call it: `core/render.light_surface` (its fallback),
-    `_ground_light_setup`, `ShadeJob`; `core/fog.spot_fog_of`;
+- **Two verdicts, one implementation.** The finding was audited twice
+  (hal-decay light-limit-raw-energy, hal-flags limit-brightest-01 and
+  limit-nearest-01) and the two verified texts differ on where a lamp is
+  measured. The hal-flags verdict arrived second, names the difference and
+  asks for one; this is it:
+  - `LI.frame_lights(scene, settings)` is the one selection (both
+    verdicts). All nine readers call it: `core/render.light_surface` (its
+    fallback), `_stash_ground_light`, `ShadeJob`; `core/fog.spot_fog_of`;
     `core/nodeeval.n_u16_light_meter`; `core/shadowmask.build`;
     `gpu/shade._selection_sig`, the plan-cache hit's texel repack, and the
-    plan. Nothing is parked on the scene or the settings: the scene's
-    bounds are measured inside the call, lazily, only when the limit
-    actually drops a lamp.
-  - Brightest ranks on `LI.limit_strength`: what the lamp delivers in the
-    light loop's own units. Sun / hemi: strength x mean colour. Point /
-    Spot: |Power| x mean colour / (4 pi) x the lamp's own falloff at its
-    distance from the middle of the scene's bounds. Area: |Power| x mean
-    colour / (4 pi) x (2 (Distance / d)^2)^Gamma, the far field of its form
-    factor. The raw Power, never the light style's gain (a strobing lamp
-    keeps its slot, and the GPU plan with it).
-  - Nearest sorts on the distance from the middle of the scene's bounds; a
-    Sun or hemi counts as distance 0 (it has no position and reaches
-    everything). Camera-independent: an orbit never changes the set.
+    plan. Nothing is parked on the scene or the settings:
+    `LI.limit_reference(scene)` is measured inside the call, lazily, only
+    when the limit actually drops a lamp.
+  - **Brightest** ranks on `LI.limit_strength`, what the lamp delivers in
+    the light loop's own units (the hal-flags text). Sun / hemi: strength x
+    mean colour. Point / Spot: |Power| x mean colour / (4 pi) x the lamp's
+    own falloff law, the mean over the 3 x 3 x 3 grid on the scene's
+    bounds, no distance taken below 5% of the bounds' diagonal. Area: its
+    form factor (`area_inp`, Distance and Gamma included) on a surface
+    facing it, the same mean -- zero behind its face. A Spot ranks as the
+    point lamp it is inside its cone (the cone is not read; the tooltip
+    says so). The raw Power, never the light style's gain: a strobing lamp
+    keeps its slot, and the GPU plan with it. The camera is not read: an
+    orbit never changes the set.
+  - **Nearest** sorts on the distance from the camera's position (the
+    hal-flags text: it is what "closest" means to the viewer, and what the
+    games did; a bounds centre keeps the lamps in the middle of a level
+    whatever the camera looks at). A Sun or hemi counts as distance 0. The
+    cost, stated: the set follows the camera, so a move that changes it
+    re-plans the GPU frame through `_selection_sig` -- for scenes over the
+    limit with Nearest chosen, and only on the frames the set changes.
   - Ties keep scene order (stable sort; they used to fall to an unstable
-    sort reversed), and the survivors come back in scene order.
+    sort reversed), and the survivors come back in scene order (both).
   - First is untouched. A lamp list at or under the limit comes back as the
     very list it was, and no vertex is read.
-  - `LI.limit_report` names the lamps left unlit; an F12 prints it and
-    reports it as a warning.
-- **The distance floor.** A lamp is never measured nearer than half the
-  scene's radius. An inverse-square lamp anywhere inside the scene spreads
-  its whole flux over the scene's cross-section, pi R^2, which is its
-  irradiance at R / 2; without the floor a lamp that happens to sit near
-  the middle of the bounds is ranked at the pole of its own curve. Probe
-  f06, a room-sized floor, a Sun of strength 3 and a chandelier of nine
-  100 W bulbs 1.62 from the centre, Light Limit 8: with no floor a bulb
-  ranks 3.05 against the Sun's 3.00, the Sun is dropped and the frame keeps
-  55.8% of its light; with the floor a bulb ranks 0.995, two bulbs go and
-  the frame keeps 86.0%. (The audit's verified text floors the distance at
-  1e-6 only; `select_lights(..., centre=c, radius=0)` is that rule.)
+  - The lamps left unlit are named, for all three modes
+    (`LI.limit_report`): an F12 prints the line, reports it as a warning,
+    and the Lighting panel draws it under the Light Limit rows ("Last
+    render: 2 of 10 lamps not lit" and the names) while the limit and the
+    mode are still the ones that render used.
+- **Why not at the scene's centre alone** (the hal-decay text: distance to
+  the bounds' centre, floored at 1e-6). A lamp that happens to sit near the
+  middle of the bounds is then ranked near the pole of its own curve.
+  Probe f06, a room-sized floor, a Sun of strength 3 and a chandelier of
+  nine 100 W bulbs 1.62 from the centre, Light Limit 8: at the centre a
+  bulb ranks 3.05 against the Sun's 3.00, the Sun is dropped and the frame
+  keeps 55.8% of its light; over the grid a bulb ranks 0.64, two bulbs go
+  and the frame keeps 86.0%.
 - **A defect found on the way: the kept lamps' order was not in the GPU
   plan's signature.** `gpu/shade._selection_sig` fingerprints the kept SET
   in scene order, but the plan's light loop and the cache-hit repack ran in
@@ -182,16 +197,26 @@ before-number was measured on.
   bitwise.
 - **Proof.** A Sun of strength 3 and nine 10 W Point lamps, factory limit:
   kept the nine lamps, frame mean 0.0301 of 0.5925 (5.1%) -> keeps the Sun
-  and seven lamps, 0.5854 (98.8%), CPU = GPU twin to 1.8e-7, whichever way
-  the list is ordered. Real Blender F12 (a Sun of 1.5 and nine 60 W lamps,
-  Shadow Map): the frame keeps 40.3% -> 87.5% of the unlimited frame's
-  light, the console and the report say `Light Limit 8 (Brightest): 2 of
-  10 lamps are not lit (X7, X8). ...`, and Brightest and Nearest now differ
-  by 78 codes (0 before). Rendered viewport, eleven lamps: raising the Sun
-  from 0 to 3 changed nothing (0.0000); now the frame mean goes 0.018 ->
-  0.779. Nearest on a rig where nearest is not brightest: kept the two far
-  lamps (frame mean 0.00269) -> keeps the two near ones, and the frame is
-  bitwise the frame of those two alone (0.00954).
+  and seven lamps, 0.5860 (98.9%), CPU = GPU twin to 1.2e-7, whichever way
+  the list is ordered. An Area lamp of 60 W against a Point lamp of 300 W
+  at the same place: keys 16.90 against 0.073 (x230), their solo frames
+  11.59 against 0.057 (x204); Light Limit 1 keeps the Area lamp; the same
+  lamp facing away from the scene ranks 0. Real Blender F12 (a Sun of 1.5
+  and nine 60 W lamps, Shadow Map): the frame keeps 40.3% -> 89.4% of the
+  unlimited frame's light, the console and the report say `Light Limit 8
+  (Brightest): 2 of 10 lamps are not lit (X1, X8). ...`, Nearest drops the
+  two lamps furthest from the camera instead (X2, X3) and differs from
+  Brightest by 45 codes (0 before). Real Blender panel
+  (bl_panel_limit.py): after the F12 the Lighting panel draws `Last
+  render: 2 of 10 lamps not lit` / `Lamp0, Lamp8`; switching the mode
+  removes the line until the next render; an F12 with the limit off clears
+  it. Rendered viewport, eleven lamps: raising the Sun from 0 to 3 changed
+  nothing (0.0000); now the frame mean goes 0.018 -> 0.779. Nearest on a
+  rig where nearest is not brightest: kept the two far lamps (frame mean
+  0.00269) -> keeps the two nearest the camera, and the frame is bitwise
+  the frame of those two alone (0.00954); with the camera moved over the
+  far end it keeps the lamp that hangs there, while Brightest keeps the
+  same lamps wherever the camera stands.
 
 ## 7. The Light panel draws the dials the law in use reads
 
@@ -261,8 +286,8 @@ No pixel moves; `ui.HALCYON_PT_light.draw` and tooltips only.
   text; a Sphere outside Custom Range emits the old text; at Start 0 the
   packed texels do not depend on the render's default and texel 5.w is 0
   on every lamp; eight lamps under limit 8, any number under limit 0, and
-  First return the scene's own list without one bounds call; a bare lamp
-  list keeps the raw ranking.
+  First return the scene's own list without measuring the scene once; a
+  bare lamp list keeps the raw ranking.
 
 ## Two roads
 
@@ -288,20 +313,23 @@ No pixel moves; `ui.HALCYON_PT_light.draw` and tooltips only.
 
 ## Tests
 
-`tests/test_r254_falloff.py`, 12 functions, 143 checks, 21 s. Run against
-the fork point (the helpers fall back to the calls it had) 76 checks fail,
-one or more per defect; on this tree all pass.
+`tests/test_r254_falloff.py`, 12 functions, 153 checks (one of them the
+strict front-end, which runs when HALCYON_GLSLANG is set), 25 s. Run
+against the fork point (the helpers fall back to the calls it had) 78
+checks fail, one or more per defect, and 55 pass (the neutrality pins); on
+this tree all pass.
 
 Pin changed: `tests/test_r251_material.py::test_c057_class_carry` (iii).
 - Old: `[l.name for l in LI.select_lights(sc_b.lights, st_b)] == ['Fill']`
   on the stock demo -- "BRIGHTEST at max_lights 1 culls the Key (Fill
   alone)". That is the defect: a Sun of strength 6 losing to a 600 W Point
-  lamp five units away on raw energy (5.68 against 410; delivered 5.68
-  against 1.29).
-- Now: (iii-a) `LI.frame_lights` keeps `['Key']` on the stock demo; (iii)
-  the culled-key case the check is about runs with the Key at strength 1.0
-  (0.95 against 1.29): `['Fill']`, `key_lit` never captured, every face
-  SHADOW -- the same three assertions.
+  lamp five units away on raw energy (5.68 against 410; delivered, 5.68
+  against 0.96).
+- Now: (iii-a) `LI.frame_lights` keeps `['Key']` on the stock demo (5.68
+  against the Fill's 0.96 over the grid); (iii) the culled-key case the
+  check is about runs with the Key at strength 0.5 (0.47 against 0.96):
+  `['Fill']`, `key_lit` never captured, every face SHADOW -- the same
+  three assertions.
 
 Existing tests, this tree against the fork point (same counts unless
 said): test_r253_light_options 195 ok; test_r251_lighting_lamps 106 ok;
@@ -320,9 +348,12 @@ baseline_fails.txt.
 - dead-lamp-shadow-bake (a lamp nothing reads still bakes its map): the
   bake-speed package.
 - A scene with no geometry at all (lamps over the analytic ground plane
-  only) has nothing to measure against and keeps the raw ranking.
-- The viewport does not print the limit's report (it would repeat on every
-  redraw); the F12 does.
+  only) has no bounds for Brightest to average over and keeps the raw
+  ranking; Nearest still measures from its camera.
+- The viewport does not print or remember the limit's report (it would
+  repeat on every redraw); the F12 does, and the panel line is that F12's.
+- The volume march and the visible beam do not read the Light Limit at all
+  (hal-flags flags-volume-beam-01): volumetrics, another package.
 
 ## For the integrator
 
@@ -341,13 +372,19 @@ baseline_fails.txt.
 - `select_lights`'s first two lines (the docstring and the `active = `
   candidate filter) are textually untouched, and `frame_lights` /
   `limit_report` derive their candidates from `select_lights` itself, so
-  a change to which lamps are candidates lands in that one line.
+  a change to which lamps are candidates (Ambient Only, say) lands in that
+  one line. Its third parameter is `reference` now (it was `centre`, which
+  nothing passed).
+- Nearest reads `scene.camera.matrix_world`. A pass that renders the scene
+  from another camera sees the set that camera gives.
 - hal_lights texel 5.w is taken (the Sphere's Distance of a Custom Range
   lamp). Texels 12-15 are still reserved zeros.
 - Adjacent text other packages may touch: properties.py GROUP_DOCS
   `decay_end` sits directly above `'shadow'`; ui.py's falloff rows end
-  above the Spot rows, the Shadows rows are untouched; engine.py gained
-  twelve lines between the export split print and the device plan.
+  above the Spot rows, the Shadows rows are untouched; the Lighting panel
+  gained the report line between Light Limit Mode and Light Falloff
+  Default; engine.py gained thirteen lines between the export split print
+  and the device plan.
 
 ### CHANGELOG fragment
 
@@ -358,10 +395,11 @@ baseline_fails.txt.
   roads. Lamps at Start 0 are bitwise.
 - **The Light Limit keeps the Sun.** Brightest ranks on what a lamp
   delivers -- a Sun's strength against a lamp's watts after 4 pi and its
-  own falloff at the scene -- instead of the raw numbers; Nearest really
-  measures a distance (from the middle of the scene; a Sun always counts);
-  ties and survivors keep scene order; the lamps left unlit are named in
-  the console and the render's report. One function, `LI.frame_lights`,
+  own falloff, an Area lamp by its form factor, averaged over the scene --
+  instead of the raw numbers; Nearest really measures a distance (from the
+  camera; a Sun always counts); ties and survivors keep scene order; the
+  lamps left unlit are named in the console, the render's report and the
+  Lighting panel. One function, `LI.frame_lights`,
   for the CPU loop, the GPU plan, the fog, the ground plane, the light
   meter and the planar shadows. Scenes at or under the limit are bitwise.
 - **Scene Default follows the law everywhere.** On the GPU a Scene Default
@@ -386,6 +424,7 @@ f01_limit_order_plan.py, f02_limit.py, f03_beam_reach.py, f04_text.py,
 f06_floor.py, f08_sphere_value.py, f09_matrix_neutral.py; real Blender:
 spec_start.json and spec_limit.json through blui/bl_harness.py with
 f05_bl_sheet.py (numbers and `out/bl_before_after.png`),
-bl_viewport_falloff.py (the rendered viewport, made by
-mk_viewport_probe.py), and the audit's bl_decay.py
+bl_panel_limit.py (the two real panels on a recording layout, the
+tooltips and ranges from RNA), bl_viewport_falloff.py (the rendered
+viewport, made by mk_viewport_probe.py), and the audit's bl_decay.py
 (`out/bl_decay_after.txt`).
