@@ -99,6 +99,16 @@ pinned where it bit.
     compile time (identifiers, struct fields, swizzles), so the error is in
     the box on Compile, in the export's warnings, and no program exists to
     run or to inline.
+(18) The raw text of a deferred material pass declared the shadow atlas
+    sampler once per shadowed lamp: `_shadow_function` opened each
+    `hal_shadow_vis<i>` with `uniform sampler2D hal_shadowpack;`, and
+    under two mapped lamps (the demo scene) a strict front-end refuses
+    the second as a redefinition. CreateInfo's text is stripped of every
+    declaration, so only the legacy `GPUShader(vertex, fragment)`
+    fallback handed a driver that text; Halcyon's front-end takes it, the
+    pre-flight counts function bodies, and the strict gate planned
+    shadows off. `gpu/material.assemble_frame` declares it once per pass
+    (`SHADOWPACK_DECL`), ahead of the first function that fetches.
 """
 import io
 import os
@@ -2669,6 +2679,301 @@ def test_code_node_name_errors_are_compile_errors():
           str(pre))
     check('...and lets the same pass through once the name is declared',
           DV.preflight('Stray', 'uniform float hal_missing;\n' + stray) is None)
+
+
+#: the shadow atlas sampler's declaration, as a line of a pass
+_SHADOWPACK_LINE = 'uniform sampler2D hal_shadowpack;'
+
+
+def _shadow_plan(edit=None, size=(48, 36), **kw):
+    """The demo scene's deferred plan with shadows ON -- its SUN and its
+    POINT both cast, both MAP unless `edit(scene)` or the settings say
+    otherwise: (passes, why, job, gbuf, atlases, scene, settings). The BVH
+    rides on the job by render()'s own rule for ray shadows, so a RAY
+    lamp plans its traversal."""
+    from ..gpu import shade as GSH
+    st = base_settings(size[0], size[1], **dict({'shadows': True}, **kw))
+    st.color_depth, st.dither, st.output_scale = '24', 'NONE', 'NONE'
+    sc = demo_scene(st, with_texture=False)
+    if edit is not None:
+        edit(sc)
+    traced = st.shadows and (st.shadow_default == 'RAY' or R._per_light_ray_shadows(sc, st))
+    with redirect_stdout(io.StringIO()):
+        g, job = _job_for(sc, st, bvh=R._cached_bvh(sc, sc.mesh) if traced else None)
+        GSH._PLAN_CACHE.clear()
+        passes, why, atlases = GSH.plan_frame(job, g)
+    GSH._PLAN_CACHE.clear()
+    return passes, why, job, g, atlases, sc, st
+
+
+def _shadow_fns(src, ray=False):
+    """The lamps whose shadow function a pass DEFINES: the mapped ones
+    (three arguments, the atlas fetch), or with `ray` the traced ones
+    (a fourth, the distance)."""
+    import re
+    tail = r', float dist\)' if ray else r'\)'
+    return [int(i) for i in re.findall(r'^float hal_shadow_vis(\d+)\(vec3 P, vec3 N, vec3 L' + tail + r'\s*$', src, re.M)]
+
+
+def _declared_twice(src):
+    """The names a text declares as a global `uniform` more than once --
+    what a strict GLSL front-end calls a redefinition (the text-level
+    stand-in for glslang, which the suite does not have). Whole lines,
+    comments aside, any number of declarations to a line: the same lines
+    `device.strip_declarations` reads."""
+    import re
+    names = []
+    for line in str(src).splitlines():
+        names += re.findall(r'(?:^|;)\s*uniform\s+\w+\s+(\w+)\s*(?=;)', line.split('//', 1)[0])
+    return sorted({n for n in names if names.count(n) > 1})
+
+
+def _as_1_92_declared(src):
+    """A pass as 1.92.0 wrote it: no declaration ahead of the shadow
+    functions, one opening EACH mapped lamp's own."""
+    import re
+    body = src.replace(_SHADOWPACK_LINE + '\n\n', '', 1)
+    return re.sub(r'^(float hal_shadow_vis\d+\(vec3 P, vec3 N, vec3 L\))\s*$', _SHADOWPACK_LINE + r'\n\1', body, flags=re.M)
+
+
+def _driver_handover(src, binds, createinfo):
+    """What `gpu/device._compile_dynamic_miss` hands a driver for a
+    material pass, over a stand-in `gpu` module: (error, fragment text,
+    [(slot, sampler)]). With `createinfo` the module has
+    GPUShaderCreateInfo (every current Blender); without, the legacy
+    `GPUShader(vertex, fragment)` constructor is the only road left. The
+    spec is the one `gpu/shade` builds for a material pass."""
+    from ..gpu import device as DV
+    got = {'fragment': None, 'samplers': []}
+
+    class _Info:
+        def vertex_in(self, *_a):
+            pass
+
+        vertex_out = fragment_out = push_constant = vertex_source = vertex_in
+
+        def sampler(self, slot, _kind, name):
+            got['samplers'].append((slot, name))
+
+        def fragment_source(self, text):
+            got['fragment'] = text
+
+    def _legacy(_vertex, fragment):
+        got['fragment'] = fragment
+        return object()
+
+    gpu = types.ModuleType('gpu')
+    gpu.types = types.SimpleNamespace(GPUShader=_legacy)
+    gpu.shader = types.SimpleNamespace(create_from_info=lambda _info: object())
+    if createinfo:
+        gpu.types.GPUShaderCreateInfo = _Info
+        gpu.types.GPUStageInterfaceInfo = lambda _name: types.SimpleNamespace(smooth=lambda *_a: None)
+    spec = {'samplers': ['hal_gb_ids', 'hal_gb_attrs', 'hal_gb_tris'] + list(binds.get('samplers', ())),
+            'floats': ['hal_attr_side', 'hal_slot_count', 'hal_tri_side'] + list(binds.get('frame_uniforms', ())),
+            'vec3': ['hal_eye', 'hal_cam_right', 'hal_cam_up', 'hal_cam_back']}
+    key = ('HAL_SHADOWPACK_HANDOVER', hash(src))
+    absent = object()
+    saved_mod = sys.modules.get('gpu', absent)
+    saved = {k: DV._STATE[k] for k in ('checked', 'available', 'reason')}
+    try:
+        sys.modules['gpu'] = gpu
+        DV._STATE.update(checked=True, available=True, reason='a stand-in driver')
+        _shader, err = DV._compile_dynamic_miss(key, 'HAL_TMAT', src, spec)
+    finally:
+        DV._STATE.update(saved)
+        DV._STATE['shaders'].pop(key, None)
+        if saved_mod is absent:
+            sys.modules.pop('gpu', None)
+        else:
+            sys.modules['gpu'] = saved_mod
+    return err, got['fragment'], got['samplers']
+
+
+def test_shadow_atlas_sampler_is_declared_once_per_pass():
+    """Every mapped lamp reads ONE combined shadow atlas, `hal_shadowpack`,
+    and `_shadow_function` opened each lamp's `hal_shadow_vis<i>` with its
+    own `uniform sampler2D hal_shadowpack;` -- so the raw text of a pass
+    under two shadowed lamps (the demo scene: a SUN and a POINT, both
+    MAP) declared the sampler twice, and a strict front-end refuses the
+    second as a redefinition (glslang 15.1: `'hal_shadowpack' :
+    redefinition`). `strip_declarations` takes every such line off on the
+    CreateInfo road, so current Blender builds never saw it; the legacy
+    `GPUShader(vertex, fragment)` fallback hands the driver the raw text.
+    Halcyon's own front-end accepts the redeclaration, the pre-flight
+    counts function bodies only, and the strict gate planned every scene
+    with shadows off. The assembler declares it once now
+    (`gpu/material.SHADOWPACK_DECL`), ahead of the first function that
+    fetches from it, however many lamps cast."""
+    import ast
+    import inspect
+    import re
+    import textwrap
+    from ..core.scene import Light
+    from ..gpu import device as DV
+    from ..gpu import material as GM
+    from ..gpu import shade as GSH
+    from ..shaders.compiler import try_compile
+
+    def spot(k):
+        return Light(type='SPOT', name=f'Spot {k}', position=(0.5 - k, -3.0, 5.0), direction=(-0.1, 0.5, -0.85),
+                     color=(1.0, 0.9, 0.8), energy=300.0, shadow='MAP', spot_size=1.0)
+
+    def more(n):
+        def edit(sc):
+            sc.lights += [spot(k) for k in range(n)]
+        return edit
+
+    def point_traced(sc):
+        sc.lights[1].shadow = 'RAY'
+
+    def sun_traced(sc):
+        sc.lights[0].shadow = 'RAY'
+
+    def texts(passes):
+        return [(name, src, binds) for _mi, name, src, binds in passes]
+
+    def count(src):
+        return len(re.findall(r'^\s*uniform\s+sampler2D\s+hal_shadowpack\s*;', src, re.M))
+
+    decl = getattr(GM, 'SHADOWPACK_DECL', None)
+    check('the assembler has the declaration to write, and it is that one line (`gpu/material.SHADOWPACK_DECL`)',
+          decl == _SHADOWPACK_LINE + '\n', repr(decl))
+
+    # ---- the report: the demo scene, shadows on -- two mapped lamps
+    passes, why, job, g, atlases, sc, st = _shadow_plan()
+    check('the demo scene with shadows on qualifies for the deferred road', passes is not None, str(why))
+    if passes is None:
+        return
+    demo = texts(passes)
+    check('it plans its three material passes, each defining a mapped shadow function for BOTH lamps (the SUN and the POINT)',
+          [n for n, _s, _b in demo] == ['Floor', 'Ball', 'Box'] and all(_shadow_fns(s) == [0, 1] for _n, s, _b in demo),
+          str([(n, _shadow_fns(s)) for n, s, _b in demo]))
+    check('every pass declares the atlas sampler exactly ONCE (it was once per shadowed lamp: twice here)',
+          [count(s) for _n, s, _b in demo] == [1, 1, 1], str([count(s) for _n, s, _b in demo]))
+    check('...as the line `uniform sampler2D hal_shadowpack;`, alone on its line',
+          all(s.splitlines().count(_SHADOWPACK_LINE) == 1 for _n, s, _b in demo))
+    check('...ahead of the first function that fetches from it (declaration before use, in file order)',
+          all(0 < s.find(_SHADOWPACK_LINE) < s.find('float hal_shadow_vis0(') < s.find('texelFetch(hal_shadowpack')
+              for _n, s, _b in demo))
+    check('...and both lamps\' functions still fetch from it',
+          all(s.count('texelFetch(hal_shadowpack') >= 2 for _n, s, _b in demo))
+    check('the sampler is listed once in each pass\'s binds, as before',
+          all(list(b['samplers']).count('hal_shadowpack') == 1 for _n, _s, b in demo),
+          str([list(b['samplers']) for _n, _s, b in demo]))
+    check('no pass declares ANY uniform twice (the text-level reading of a strict front-end\'s "redefinition")',
+          all(_declared_twice(s) == [] for _n, s, _b in demo), str([_declared_twice(s) for _n, s, _b in demo]))
+    check('the frame still uploads the one packed atlas under that name',
+          sorted(k for k in atlases if k.startswith('hal_shadow')) == ['hal_shadowpack'], str(sorted(atlases)))
+
+    # ---- however many lamps cast, and whatever else shadows them
+    for label, edit, kw, mapped, traced in (
+            ('three mapped lamps', more(1), {}, [0, 1, 2], []),
+            ('eight mapped lamps', more(6), {}, list(range(8)), []),
+            ('one mapped lamp beside a traced one (Per Light)', point_traced, {'shadow_default': 'PER_LIGHT'}, [0], [1]),
+            ('a traced lamp ahead of the one mapped lamp (Per Light)', sun_traced, {'shadow_default': 'PER_LIGHT'}, [1], [0]),
+            ('two traced lamps (Ray)', None, {'shadow_default': 'RAY'}, [], [0, 1])):
+        p2, why2 = _shadow_plan(edit, size=(24, 18), **kw)[:2]
+        check(f'{label}: the plan qualifies', p2 is not None, str(why2))
+        if p2 is None:
+            continue
+        t2 = texts(p2)
+        check(f'{label}: every pass defines exactly those shadow functions',
+              all(_shadow_fns(s) == mapped and _shadow_fns(s, ray=True) == traced for _n, s, _b in t2),
+              str([(_shadow_fns(s), _shadow_fns(s, ray=True)) for _n, s, _b in t2]))
+        want = 1 if mapped else 0
+        check(f'{label}: the sampler is declared {"once" if want else "nowhere"} and listed {"once" if want else "nowhere"}',
+              all(count(s) == want and list(b['samplers']).count('hal_shadowpack') == want for _n, s, b in t2),
+              str([(count(s), list(b['samplers']).count('hal_shadowpack')) for _n, s, b in t2]))
+        if mapped:
+            check(f'{label}: ...ahead of the first fetch, whichever lamp makes it',
+                  all(0 < s.find(_SHADOWPACK_LINE) < s.find('texelFetch(hal_shadowpack') for _n, s, _b in t2))
+        check(f'{label}: no uniform is declared twice', all(_declared_twice(s) == [] for _n, s, _b in t2),
+              str([_declared_twice(s) for _n, s, _b in t2]))
+        if not mapped:
+            check(f'{label}: the text never names the atlas', all('hal_shadowpack' not in s for _n, s, _b in t2))
+    for label, kw in (('at the vertex rate (the corners carry the shadowed light)', {'shading_rate': 'VERTEX'}),
+                      ('with shadows off', {'shadows': False})):
+        p3, why3 = _shadow_plan(size=(24, 18), **kw)[:2]
+        check(f'{label}: the plan qualifies and no pass names the atlas, in its text or in its binds',
+              p3 is not None and all('hal_shadowpack' not in s and 'hal_shadowpack' not in b['samplers']
+                                     and _shadow_fns(s) == [] for _n, s, b in texts(p3)), str(why3))
+
+    # ---- the 1.92.0 text put back, so the checks can tell -- and so the picture is known not to move
+    old = [(n, _as_1_92_declared(s), b) for n, s, b in demo]
+    check('the 1.92.0 text put back declares it once per lamp, and the text-level check names it',
+          [count(s) for _n, s, _b in old] == [2, 2, 2] and all(_declared_twice(s) == ['hal_shadowpack'] for _n, s, _b in old),
+          str([(count(s), _declared_twice(s)) for _n, s, _b in old]))
+    check('...which the pre-flight every pass crosses lets through (function bodies are all it counts; Halcyon\'s own '
+          'front-end takes a redeclared uniform) -- why no headless check saw it',
+          all(DV.duplicate_definitions(s) == [] and DV.preflight(n, s) is None for n, s, _b in old))
+    lines = [[ln for ln in DV.strip_declarations(s).splitlines() if ln.strip()] for _n, s, _b in demo]
+    check('the CreateInfo road\'s text is unmoved: stripped, each pass is line for line the stripped 1.92.0 text',
+          lines == [[ln for ln in DV.strip_declarations(s).splitlines() if ln.strip()] for _n, s, _b in old])
+    check('...and holds no declaration at all (the interface declares the sampler)',
+          all(not re.search(r'^\s*(?:uniform|in|out)\s+\w', DV.strip_declarations(s), re.M) for _n, s, _b in demo))
+    with redirect_stdout(io.StringIO()):
+        cpu = np.asarray(R.render(sc, st))
+        img, hit = GSH.simulate(job, g, passes, atlases)
+        img_old, hit_old = GSH.simulate(job, g, [(mi, n, s, b) for (mi, _n, _s, _b), (n, s, b) in zip(passes, old)], atlases)
+    check('the simulator draws the once-declared passes', img is not None, str(hit))
+    check('...and the 1.92.0 text\'s frame is that frame bit for bit (a declaration moves no value)',
+          img is not None and img_old is not None and np.array_equal(img, img_old), str(hit_old))
+    if img is not None:
+        cov = g.tri >= 0
+        d = np.abs(img[cov] - cpu[cov][:, :3])
+        check('...which is the CPU frame, shadows and all (max < 6e-3, no px > 1e-2)',
+              float(d.max()) < 6e-3 and int((d.max(axis=1) > 1e-2).sum()) == 0, f'max {float(d.max()):.5f}')
+
+    # ---- what each road hands the driver
+    for name, src, binds in demo[:1]:
+        err, frag, _samplers = _driver_handover(src, binds, createinfo=False)
+        check('the legacy constructor is handed the planned text itself -- the raw text, one declaration',
+              err is None and frag == src and count(frag) == 1, str(err))
+        err, frag, samplers = _driver_handover(src, binds, createinfo=True)
+        names = [nm for _slot, nm in samplers]
+        check('CreateInfo is handed the stripped text: the fetches, and no declaration of the sampler',
+              err is None and frag == DV.strip_declarations(src) and count(frag) == 0
+              and frag.count('texelFetch(hal_shadowpack') == src.count('texelFetch(hal_shadowpack'), str(err))
+        check('...and the sampler once, in the slot its place in the list gives it (the three G-buffer samplers first)',
+              names == ['hal_gb_ids', 'hal_gb_attrs', 'hal_gb_tris'] + list(binds['samplers'])
+              and names.count('hal_shadowpack') == 1 and [slot for slot, _nm in samplers] == list(range(len(names))),
+              str(samplers))
+        err, frag, _samplers = _driver_handover(_as_1_92_declared(src), binds, createinfo=False)
+        check('the 1.92.0 text reached the legacy constructor with BOTH declarations (the text glslang refuses)',
+              err is None and count(frag) == 2)
+
+    # ---- the strict front-end itself, where there is one (tests/glsl_strict.py is the gate; the suite has no glslang)
+    from . import glsl_strict as GS
+    if GS._glslang() is None:
+        print('  note HALCYON_GLSLANG is not set: the strict front-end did not run on the shadowed passes')
+    else:
+        said = [GS.compile_source(s) for _n, s, _b in demo]
+        check('glslang compiles each shadowed pass as raw text (strict GLSL 4.30)', all(ok for ok, _msg in said),
+              '; '.join(msg[:160] for ok, msg in said if not ok))
+        said = [GS.compile_source(s) for _n, s, _b in old]
+        check('...and refuses the 1.92.0 text of each as a redefinition of the sampler',
+              all(not ok and "'hal_shadowpack' : redefinition" in msg for ok, msg in said),
+              '; '.join(msg[:160] for _ok, msg in said))
+
+    # ---- the rule, read from the code
+    fn = ast.parse(textwrap.dedent(inspect.getsource(GM._shadow_function)))
+    said = [c.value for c in ast.walk(fn) if isinstance(c, ast.Constant) and isinstance(c.value, str)][1:]
+    check('`_shadow_function` writes no declaration of its own: no string in it says `uniform` (its docstring aside)',
+          bool(said) and not any('uniform' in t for t in said), str([t for t in said if 'uniform' in t]))
+    asm = inspect.getsource(GM.assemble_frame)
+    check('`assemble_frame` appends SHADOWPACK_DECL in one place, ahead of the loop that writes the functions, and lists the '
+          'sampler in one place',
+          asm.count('SHADOWPACK_DECL') == 1 and asm.count("'hal_shadowpack'") == 1
+          and 0 < asm.find('SHADOWPACK_DECL') < asm.find('_shadow_function(i, smeta, consts)'))
+    one = 'uniform sampler2D hal_shadowpack;\nuniform sampler2D hal_other; uniform float hal_k;  // note\n' \
+          'float hal_f() { return hal_k; }\n'
+    check('the text-level check reads whole lines the way `strip_declarations` does: comments aside, any number to a line',
+          _declared_twice(one) == [] and _declared_twice(one + '  uniform sampler2D hal_other;  // again\n') == ['hal_other']
+          and _declared_twice(one + 'uniform float hal_x; uniform float hal_k;\n') == ['hal_k']
+          and _declared_twice(one + '// uniform float hal_k;\n') == [])
+    check('...and Halcyon\'s front-end does take the redeclared sampler (the simulator could never have caught it)',
+          try_compile('uniform sampler2D hal_a;\nuniform sampler2D hal_a;\nuniform vec2 vUV;\nout vec4 Color;\n'
+                      'void main() { Color = texelFetch(hal_a, ivec2(0, 0), 0); }\n', 'GLSL')[0] is not None)
 
 
 def main():
