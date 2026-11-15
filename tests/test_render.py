@@ -13603,11 +13603,19 @@ def test_mesh_export_cache():
         dg = FB.depsgraph_of(props, objs)
         return EX.export_scene(dg, _RS(), warn), warn
 
-    # under the bpy stub there are no handlers: register() must leave
-    # the cache DISARMED and the export fully live
-    EX.register()
-    check('without bpy handlers the cache never arms (register is safe)',
-          not EX._CACHE_ARMED)
+    # under a bpy WITHOUT handlers register() must leave the cache
+    # DISARMED and the export fully live. The stub carries handler lists
+    # since R253 (the persistence and undo re-arm pins fire them), so the
+    # premise is made explicit: take them away for this call
+    EX.unregister()
+    _had = _fake_bpy.app.__dict__.pop('handlers', None)
+    try:
+        EX.register()
+        check('without bpy handlers the cache never arms (register is safe)',
+              not EX._CACHE_ARMED)
+    finally:
+        if _had is not None:
+            _fake_bpy.app.handlers = _had
 
     mat = FB.halcyon_material('CachedMat')
     a = uidobj('A', lambda: FB.cube_mesh(materials=(mat,)), 'MESH', 21)
