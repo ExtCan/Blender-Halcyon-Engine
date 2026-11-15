@@ -1700,6 +1700,44 @@ def limit_report(scene, settings, remember=False):
             'to 0 for no limit')
 
 
+#: R254: the flat ambient level above which an ambient lamp is called
+#: out (the panel's red row, the render's report): past 2.0 every
+#: surface is over twice its own colour
+AMBIENT_BRIGHT = 2.0
+
+
+def ambient_level(light):
+    """The flat level an ambient lamp adds to the pool, as one number:
+    its Energy times its strongest colour channel (R254)."""
+    try:
+        col = max(float(c) for c in getattr(light, 'color', (1.0, 1.0, 1.0)))
+    except (TypeError, ValueError):
+        col = 1.0
+    return abs(float(getattr(light, 'energy', 0.0))) * col
+
+
+def ambient_report(scene):
+    """One line naming the ambient lamps (is_ambient_lamp) whose level
+    whites the frame out, or None (R254).
+
+    The pool reads an ambient lamp's Energy as a FLAT level -- colour x
+    Energy, 1.0 = white ambient -- whatever the lamp's kind, where every
+    other use of a Point lamp's Energy divides its watts by 4 pi d^2.
+    Ambient Only ticked on a lamp at a working wattage therefore gives
+    hundreds of times white, and used to say nothing."""
+    out = [(str(getattr(l, 'name', '') or l.type), ambient_level(l))
+           for l in (getattr(scene, 'lights', None) or ())
+           if is_ambient_lamp(l) and ambient_level(l) > AMBIENT_BRIGHT]
+    if not out:
+        return None
+    names = ', '.join(f"'{n}' at level {v:.4g}" for n, v in out[:4])
+    if len(out) > 4:
+        names += f' and {len(out) - 4} more'
+    return (f'Ambient Only: {names}. An ambient lamp\'s Energy is a flat '
+            'level (1.0 = white ambient), not watts, so the frame whites '
+            'out. Lower it in the Light panel, under Ambient Only')
+
+
 def ambient_light_split(scene, settings):
     """(engine_part, world_part) of the ambient pool.
 

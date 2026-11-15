@@ -2614,11 +2614,6 @@ def light_style_status(hs, scene):
             f"(step {step + 1} of {steps})", 'TIME')
 
 
-#: R254: the flat ambient level above which the Ambient Only note turns
-#: into a warning (2.0 is twice white: every surface past its own colour)
-AMBIENT_ONLY_BRIGHT = 2.0
-
-
 #: R254: the distance dials each falloff law reads, as the Light panel's
 #: rows -- (property, label; None = the property's own name). ONE table
 #: for a law chosen on the lamp and for one arriving through Scene
@@ -2826,16 +2821,18 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
             # other use of a Point lamp's Energy divides its watts by
             # 4 pi d^2 -- so the lamp's own Energy is drawn again here
             # under the name it answers to, in red once it whites out
+            from .core import lights as _LIa
+            level = _LIa.ambient_level(light)
             lvl = col.row()
-            lvl.alert = float(light.energy) > AMBIENT_ONLY_BRIGHT
+            lvl.alert = level > _LIa.AMBIENT_BRIGHT
             lvl.prop(light, 'energy', text="Ambient Level")
             note = col.row()
             note.active = bool(lvl.alert)
             note.label(
                 text=("A flat level, not watts: 1.0 = white ambient"
                       if not lvl.alert else
-                      f"Level {float(light.energy):.4g} whites out the "
-                      "frame: 1.0 = white ambient"),
+                      f"Level {level:.4g} whites out the frame: 1.0 = "
+                      "white ambient"),
                 icon='ERROR' if lvl.alert else 'INFO')
             note = col.row()
             note.active = False

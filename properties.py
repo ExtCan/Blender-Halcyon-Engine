@@ -3771,7 +3771,11 @@ class HalcyonLightSettings(PropertyGroup):
                     "Blender Internal material's diffuse ramp and "
                     "terminator bias are not part of the subtraction) -- "
                     "a shadow without a light. With shadows off, or on a "
-                    "lamp that affects no diffuse, it does nothing")
+                    "lamp that affects no diffuse, it does nothing. It "
+                    "lights no fog and draws no beam, shaft or flare. With "
+                    "Negative the subtraction turns over, as in Blender "
+                    "Internal: the lamp gives its light back only where "
+                    "its shadow falls")
     hemi: BoolProperty(
         name="Hemisphere (BI Hemi)", default=False,
         description="Shade this Sun as Blender Internal's Hemi lamp: "

@@ -311,6 +311,12 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                 if _lim:
                     print('[Halcyon] ' + _lim)
                     warnings.append(_lim)
+                # R254: an Ambient Only lamp left at a working wattage
+                # (its Energy is a flat ambient level there)
+                _amb = _LIl.ambient_report(scene)
+                if _amb:
+                    print('[Halcyon] ' + _amb)
+                    warnings.append(_amb)
             except Exception:                                   # noqa: BLE001
                 pass
 

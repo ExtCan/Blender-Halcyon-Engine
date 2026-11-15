@@ -486,6 +486,44 @@ def test_b_ambient_only_is_only_ambient():
                               _settings(max_lights=2))
         check('and the Light Limit report does not count it as a lamp left '
               'unlit', rep is None, str(rep))
+    # what Energy means, said where the render is read
+    if hasattr(LI, 'ambient_report'):
+        hot = LI.ambient_report(_scene([_fill(), Light(
+            type='POINT', name='Amb', energy=800.0, ambient_only=True)], st))
+        check('a lamp left at 800 W with Ambient Only is reported by name '
+              'with its level and the unit (1.0 = white ambient)',
+              hot is not None and "'Amb' at level 800" in hot
+              and '1.0 = white ambient' in hot, str(hot))
+        check('...and nothing is reported at a usable level, or without an '
+              'ambient lamp',
+              LI.ambient_report(_scene([_fill(), amb_sun()], st)) is None
+              and LI.ambient_report(_scene([_fill(), _key()], st)) is None)
+        from . import fakeblender as FB
+        props, eng = FB.install()
+
+        def rig(_eng, dg, bscene, flag=True):
+            # (the stand-in's instances are a one-shot generator: a list,
+            # so the exporter's lamp walk still finds the lamp)
+            dg.object_instances = list(dg.object_instances)
+            lamp_ob = [o for o in bscene.objects if o.type == 'LIGHT'][0]
+            lamp_ob.data.type = 'POINT'
+            lamp_ob.data.energy = 800.0
+            lamp_ob.data.halcyon = FB.live(props.HalcyonLightSettings,
+                                           ambient_only=flag)
+        try:
+            _i, _p, cap_e = FB.run_render(props, eng, rig=rig)
+            said = [w for w in (cap_e.get('reports') or [])
+                    if 'Ambient Only' in str(w)]
+            _i, _p, cap_p = FB.run_render(
+                props, eng, rig=lambda e, d, b: rig(e, d, b, False))
+            quiet = [w for w in (cap_p.get('reports') or [])
+                     if 'Ambient Only' in str(w)]
+            check('the F12 says so in its report (and says nothing for the '
+                  'same lamp without the flag)', len(said) >= 1 and not quiet,
+                  str((said or ['no line'])[0])[:90])
+        except Exception as exc:                                # noqa: BLE001
+            traceback.print_exc()
+            check('the F12 says so in its report', False, repr(exc)[:160])
     old_type = Light(type='AMBIENT', name='Old', color=(0.2, 0.4, 0.6),
                      energy=0.5)
     flagged = Light(type='POINT', name='New', color=(0.2, 0.4, 0.6),
@@ -1051,6 +1089,41 @@ def test_e_media_honour_the_flags_and_the_limit():
               abs(got_h - want * xh) < 0.02 * xh, f'{got_h:+.4f} (the plain '
               f'lamp gives {xh:+.4f})')
     del st_h
+    # the Light Meter node reads what a lamp gives a diffuse surface
+    from ..core import nodeeval as NE
+
+    def meter(lights, time=0.0):
+        s = _settings()
+        sc = _scene(lights, s)
+        sc.time = time
+        LI.apply_light_styles(sc)
+        P = np.array([[0.0, 0.0, 0.0], [1.0, -1.0, 0.0]], f32)
+        N = np.tile(np.array([[0.0, 0.0, 1.0]], f32), (2, 1))
+        ev = types.SimpleNamespace(
+            ctx=types.SimpleNamespace(scene=sc, settings=s, n=2, N=N, P=P,
+                                      bvh=None),
+            input=lambda node, name, kind: np.ones(2, f32))
+        out = NE.n_u16_light_meter(ev, {
+            'bl_idname': 'HALCYON_LightMeterNode', 'props': {},
+            'inputs': [{'name': 'Exposure', 'default': 1.0}]})
+        return np.asarray(out['Color'])[:, :3].astype(np.float64)
+    m0 = meter([lamp()])
+    got_m = {
+        'negative': meter([lamp(negative=True)]),
+        'only shadow': meter([lamp(only_shadow=True)]),
+        'specular only': meter([lamp(specular_only=True)]),
+        'ambient only': meter([lamp(ambient_only=True)]),
+        'dark style step': meter([lamp(light_style='FAST_STROBE')], 0.1)}
+    check('the Light Meter node: a Negative lamp reads minus the plain lamp; '
+          'an Only Shadow, a Specular Only and an Ambient Only lamp read '
+          'nothing; a strobe on its dark step reads nothing',
+          float(m0.min()) > 0.0
+          and float(np.abs(got_m['negative'] + m0).max()) < 1e-6
+          and all(float(np.abs(got_m[k]).max()) == 0.0
+                  for k in ('only shadow', 'specular only', 'ambient only',
+                            'dark style step')),
+          f'plain {m0[0, 0]:.3f}; '
+          + ', '.join(f'{k} {v[0, 0]:+.3f}' for k, v in got_m.items()))
 
 
 # ----------------------------------------------------------- 5. the panel
