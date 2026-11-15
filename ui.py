@@ -968,6 +968,12 @@ class HALCYON_PT_effects(HalcyonPanel, Panel):
         row = col.row()
         row.active = False
         row.label(text="Set Volumetric on a light to cast them", icon='LIGHT')
+        # R254: one lamp, one volumetric effect -- a Spot, Point or Area
+        # lamp throws shafts only while its in-air beam is not drawn
+        row = col.row()
+        row.active = False
+        row.label(text="(a Sun always; other lamps while Volumetric "
+                       "Lights is off)", icon='BLANK1')
         # R251 C134: the optical printer's backlit mattes
         col = layout.column(heading="Matte Glow")
         col.prop(hs, 'matte_glow', text="Enable")
@@ -2819,6 +2825,8 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
                 warn = col.column(align=True)
                 warn.label(text="No beam: Volumetric Lights is off in "
                                 "Render > Lighting", icon='ERROR')
+                warn.label(text="(the lamp throws Light Shafts only)",
+                           icon='BLANK1')
                 warn.prop(shs, 'spot_cones',
                           text="Enable Volumetric Lights (Render)")
         elif hs.volumetric > 0.0:

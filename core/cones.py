@@ -275,19 +275,33 @@ def point_glow(origin, rays, depth, light, samples=12, density=1.0,
     steps = max(int(samples), 1)
     offsets = (np.arange(steps, dtype=np.float32) + 0.5) / steps
     total = np.zeros(n, np.float32)
+    # R254: the samples are spaced by ANGLE about the lamp, not by
+    # distance along the ray. The segment through a 64-unit sphere is
+    # tens of units long and 1 / d^2 peaks within a unit or two of the
+    # ray's closest approach, so twelve evenly spaced midpoints mostly
+    # stepped over the peak: the glow came out as rings, twice the true
+    # integral at 12 samples and a third of it at 2. With t = tc + D
+    # tan(theta) (tc the closest approach, D its distance from the
+    # lamp) dt = d^2 / D dtheta, which cancels the inverse square: the
+    # sum is smooth and within a percent at any count
+    tc = -b
+    perp = np.sqrt(np.maximum(np.einsum('ij,ij->i', oc, oc) - b * b, 1e-6))
+    th0 = np.arctan((t0 - tc) / perp)
+    th1 = np.arctan((t1 - tc) / perp)
+    dth = np.where(live, th1 - th0, 0.0)
     for off in offsets:
-        t = t0 + span * off
+        t = tc + perp * np.tan(th0 + dth * off)
         p = origin + rays * t[:, None]
         d = p - centre[None, :]
         dist = np.sqrt(np.maximum(np.einsum('ij,ij->i', d, d), EPS))
         fade = np.clip(1.0 - (dist / R) * (dist / R), 0.0, 1.0)
         atten = fade / np.maximum(np.power(dist, falloff), EPS)
-        contrib = np.where(live, atten, 0.0)
+        contrib = np.where(live, atten * (dist * dist / perp), 0.0)
         if occlude is not None:
             contrib = np.where(occlude(p, live & (contrib > 0.0)),
                                0.0, contrib)
         total += contrib.astype(np.float32)
-    return (total * (span / steps) * density * np.where(live, 1.0, 0.0)
+    return (total * (dth / steps) * density * np.where(live, 1.0, 0.0)
             ).astype(np.float32)
 
 

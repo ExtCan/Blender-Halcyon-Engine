@@ -4275,11 +4275,26 @@ def _build_shadows(scene, st, mesh):
 
 
 def shaft_sources(scene, settings, vp):
-    """Screen positions of lights that scatter, for the light-shaft pass."""
+    """Screen positions of lights that scatter, for the light-shaft pass.
+
+    R254: a Spot, Point or Area lamp is a source only while the render
+    does NOT draw its in-air beam (Volumetric Lights off). The one
+    Volumetric slider used to feed both at once, which nobody saw: a
+    usable beam sat at 0.001 .. 0.02 under the old beam unit, where the
+    shafts' strength is nothing. With the beam on its own radiance
+    scale a beam is set near 1, and the same 1 smeared every bright
+    pixel away from the lamp in the march's 24 steps -- banded streaks
+    below a spot's own pool, on top of the real beam. One lamp, one
+    volumetric effect: the beam where beams are drawn, the shafts
+    otherwise; a Sun or a hemi has no beam and always throws shafts.
+    """
     out = []
+    beams = bool(getattr(settings, 'spot_cones', False))
     for light in scene.lights:
         vol = float(getattr(light, 'volumetric', 0.0))
         if vol <= 0.0:
+            continue
+        if beams and str(light.type).upper() in _VOLUME_KINDS:
             continue
         if str(light.type).upper() in ('SUN', 'HEMI'):
             # a directional light has no position: its shafts converge on the

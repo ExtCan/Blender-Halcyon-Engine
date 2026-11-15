@@ -2621,7 +2621,8 @@ DESCRIPTIONS = {
                   "intersected with the beam and a few samples are summed "
                   "along whatever falls inside it -- which is what LightWave "
                   "and 3D Studio did, rather than integrating a volume. A "
-                  "Sun has no beam: its Volumetric drives the Light Shafts",
+                  "Sun has no beam: its Volumetric drives the Light Shafts, "
+                  "as a beam lamp's does while this is off",
     'spot_cone_samples': "Samples along each view ray. Low counts band, and "
                          "the banding is the period artefact rather than a "
                          "defect -- 8 to 16 is where those renderers sat",
@@ -3822,12 +3823,13 @@ class HalcyonLightSettings(PropertyGroup):
                     "and Area lamps draw their beam -- a cone, a bounded "
                     "glow, a soft-edged slab, layered against the scene's "
                     "depth -- while Render > Lighting > Volumetric Lights "
-                    "is on; 1 is a thick haze at its Density of 1. Every "
-                    "lamp with a value above zero, a Sun included, also "
-                    "throws the screen-space Light Shafts from pixels "
-                    "brighter than Shaft Threshold. A Sun has no beam: its "
-                    "shafts converge on its place in the sky, so the sun "
-                    "must be ahead of the camera")
+                    "is on; 1 is a thick haze at its Density of 1. With "
+                    "that switch off, and always for a Sun (it has no "
+                    "beam), the value is the strength of the screen-space "
+                    "Light Shafts instead: pixels brighter than Shaft "
+                    "Threshold smeared away from the lamp. A Sun's shafts "
+                    "converge on its place in the sky, so the sun must be "
+                    "ahead of the camera")
     volumetric_occlusion: BoolProperty(
         name="Beam Occlusion", default=False,
         description="Trace each beam sample back to the lamp, so the "
@@ -3887,8 +3889,12 @@ class HalcyonLightSettings(PropertyGroup):
                     "patterns); a Sun tiles it across the world as a cloud "
                     "shadow; a Point wraps it around itself like a pierced "
                     "lantern; an Area carries it on its face like a printed "
-                    "gel. The lamp's Angle/Radius slider softens the "
-                    "projection, exactly as a bigger source would")
+                    "gel. The image's RGB multiplies the light as stored "
+                    "(Non-Color: a mid grey halves it, a coloured slide "
+                    "tints it); its alpha is not read. The lamp's source "
+                    "size softens the projection, exactly as a bigger "
+                    "source would: Radius, a Sun's Angle, an Area lamp's "
+                    "Projection Blur")
     cookie_strength: FloatProperty(
         name="Projection Strength", default=1.0, min=0.0, max=1.0,
         description="Blend between plain light (0) and the fully projected "
