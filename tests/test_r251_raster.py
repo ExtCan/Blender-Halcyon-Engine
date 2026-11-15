@@ -1380,8 +1380,13 @@ def test_w2_c127_jitter():
     check('C127: the offsets are not degenerate (both axes spread over the '
           'cell)', len(np.unique(JX)) > 1000 and len(np.unique(JY)) > 1000)
     jx1, jy1 = raster.jitter_at(np.uint32(5), np.uint32(7), key)
+    # jitter_at answers in arrays (shape (1,) for one pixel): float() of a
+    # one-element array was a deprecation until NumPy 2.5 and is a
+    # TypeError since, which stopped this whole test at this line
     check('C127: jitter_at agrees with the planes (one hash, two callers)',
-          float(jx1) == float(JX[7, 5]) and float(jy1) == float(JY[7, 5]))
+          jx1.shape == (1,) and jy1.shape == (1,)
+          and float(jx1[0]) == float(JX[7, 5])
+          and float(jy1[0]) == float(JY[7, 5]))
     # (b) determinism and freshness on the demo scene at ss = 2
     def _jit_render(frame, seed, pattern='JITTER', mode='SUPERSAMPLE'):
         s_ = base_settings(W, H)

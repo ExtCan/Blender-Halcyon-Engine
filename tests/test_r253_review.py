@@ -99,6 +99,21 @@ pinned where it bit.
     compile time (identifiers, struct fields, swizzles), so the error is in
     the box on Compile, in the export's warnings, and no program exists to
     run or to inline.
+(18) The CPU sky unprojected its camera rays with a BLAS matmul
+    (`pts @ inv.T` in `core/render._background_image`) and the sky pass
+    sums the same four terms one float32 operation at a time, so the
+    bitwise sky twin was the BLAS KERNEL's to keep: it held on an
+    OpenBLAS kernel without FMA, sat 10 to 40 pixels apart on one with
+    it (every AVX2 machine: 20 checks of the suite), and was off on
+    every kernel past the oldest for a frame with ONE uncovered pixel
+    (sgemv, another sum again). `core/mathx.unproject_far` is the
+    shader's chain; the CPU sums it, whatever the BLAS.
+(19) Read for the same dependence, one more bitwise twin had it: the
+    GPU light packer normalised a Sun's direction with `np.linalg.norm`
+    (a BLAS dot) and the CPU with `mathx.normalize`, 2 ulp apart for one
+    direction in ten on every kernel past the oldest. The AXIS viewer's
+    bitwise frame broke whole for those directions and held on the Sun
+    the suite uses. The packer normalises as the CPU does.
 """
 import io
 import os
@@ -2669,6 +2684,268 @@ def test_code_node_name_errors_are_compile_errors():
           str(pre))
     check('...and lets the same pass through once the name is declared',
           DV.preflight('Stray', 'uniform float hal_missing;\n' + stray) is None)
+
+
+def test_sky_rays_are_the_same_bits_on_every_blas_kernel():
+    """`core/render._background_image` unprojected its camera rays with
+    `pts @ inv.T`, a BLAS sgemm, and `gpu/sky.py` sums the same four
+    terms one float32 operation at a time. The matmul's last bit is the
+    KERNEL's: an OpenBLAS kernel without FMA sums in the shader's order,
+    one with FMA (Haswell, Zen, SkylakeX: every AVX2 machine) fuses a
+    product into the running sum, and a frame with exactly ONE uncovered
+    pixel takes sgemv, which pairs the sum another way on every kernel
+    past the oldest. `test_gpu_sky_pass` failed 8 checks on an AVX-512
+    Xeon and passed under OPENBLAS_CORETYPE=Nehalem. The CPU road sums
+    the chain now (`core/mathx.unproject_far`): bitwise the shader's ray
+    whatever the BLAS, and a pixel's ray no longer depends on how many
+    pixels are uncovered with it."""
+    from ..core import mathx as M
+    from ..core.texture import Texture
+    from ..gpu import sky as GSKY
+    from ..shaders.compiler import try_compile
+
+    W, H = 96, 72
+
+    # ---- the chain is the shader's sum, each product and each sum one
+    # float32 operation (NumPy scalars: no vector loop, no BLAS)
+    rng = np.random.default_rng(253)
+    apart = total = 0
+    for scale in (0.01, 1.0, 100.0):
+        inv = (rng.standard_normal((4, 4)) * scale).astype(f32)
+        for n in (1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 33, 257):
+            nx = rng.uniform(-1.0, 1.0, n).astype(f32)
+            ny = rng.uniform(-1.0, 1.0, n).astype(f32)
+            got = M.unproject_far(nx, ny, inv)
+            ref = np.array([[f32(f32(f32(x * inv[r, 0]) + f32(y * inv[r, 1])) + inv[r, 2]) + inv[r, 3]
+                             for r in range(4)] for x, y in zip(nx, ny)], f32)
+            apart += int((got != ref).sum())
+            total += ref.size
+    check('mathx.unproject_far is ((nx * i.x + ny * i.y) + i.z) + i.w, one float32 operation at a time, at every row count from 1 to 257 '
+          f'({total} components against NumPy scalars)', apart == 0 and got.dtype == f32 and got.flags.c_contiguous, f'{apart} apart')
+
+    def rig(ss=1, **world):
+        st = base_settings(W, H)
+        st.shadows = False
+        st.transparency = 'NONE'
+        if ss > 1:
+            st.aa_mode = 'SUPERSAMPLE'
+            st.aa_samples = ss * ss
+        sc = demo_scene(st, with_texture=False)
+        for k, v in world.items():
+            setattr(sc.world, k, v)
+        return sc, st
+
+    @contextmanager
+    def rays_as_colours():
+        # the CPU road's own rays, read where it hands them to the world
+        keep = R.world_color
+        R.world_color = lambda scene, st, dirs, textures, n, eye=None: np.asarray(dirs, f32)
+        try:
+            yield
+        finally:
+            R.world_color = keep
+
+    def shader_rays(sc, st, w, h, vp, eye, ss):
+        # gpu/sky.py's hal_sky_ray, its own text through the front-end
+        p, why = GSKY.plan(sc, st, w, h, vp, eye, {}, ss=ss)
+        head = GSKY.SOURCE[:GSKY.SOURCE.rindex('void main()')].replace('in vec2 vUV;', 'uniform vec2 vUV;')
+        prog, err = try_compile(head + 'void main()\n{\n    vec2 size = hal_sky_size();\n'
+                                '    ivec2 px = ivec2(clamp(vUV * size, vec2(0.0), size - vec2(1.0)));\n'
+                                '    Color = vec4(hal_sky_ray(px), 1.0);\n}\n', 'GLSL')
+        if p is None or prog is None:
+            return None, str(why or err)
+        yy, xx = np.mgrid[0:h, 0:w]
+        uv = np.stack([(xx.ravel() + 0.5) / w, (yy.ravel() + 0.5) / h], 1).astype(f32)
+        par = Texture(GSKY.pack_params(p['params']), colorspace='Non-Color', filt='NEAREST', wrap='EXTEND')
+        u = {'vUV': uv, 'hal_sky_params': par, 'hal_gb_ids': par, 'hal_sky_env': par, 'hal_sky_tab': par,
+             'hal_sky_m7rows': par, 'hal_sky_m7map': par, 'hal_sky_mode': np.full(h * w, int(p['mode']), np.int32)}
+        outs, _disc = prog.run(u, {}, h * w)
+        return np.asarray(outs['Color'], f32).reshape(h, w, 4)[:, :, :3], None
+
+    # ---- the ray twin itself, every pixel of the frame, both roads
+    for label, ss, was in (('the frame', 1, 24), ('the fast_background block road at ss 2', 2, 96)):
+        sc, st = rig(ss=ss)
+        rw, rh = W * ss, H * ss
+        _view, _proj, vp, eye = R.camera_matrices(sc.camera, rw, rh)
+        gpu, why = shader_rays(sc, st, rw, rh, vp, eye, ss)
+        with rays_as_colours():
+            cpu = R._background_image(sc, st, rw, rh, vp, eye, None, {}, ss=ss)[:, :, :3]
+        n_bad = -1 if gpu is None else int((gpu != cpu).any(axis=2).sum())
+        check(f'{label}: the CPU road\'s camera ray is BITWISE hal_sky_ray at all {rw * rh} pixels, whatever kernel the BLAS runs '
+              f'(the matmul left {was} rays apart on a kernel with FMA)', n_bad == 0, f'{n_bad} px differ ({why})')
+
+    # ---- a pixel's ray does not depend on its company
+    sc, st = rig()
+    _view, _proj, vp, eye = R.camera_matrices(sc.camera, W, H)
+    with rays_as_colours():
+        full = R._background_image(sc, st, W, H, vp, eye, None, {})[:, :, :3]
+        alone = 0
+        picks = [(y, x) for y in range(1, H, 6) for x in range(2, W, 5)]
+        for y, x in picks:
+            m = np.zeros((H, W), bool)
+            m[y, x] = True
+            alone += int(not np.array_equal(R._background_image(sc, st, W, H, vp, eye, m, {})[y, x, :3], full[y, x]))
+        groups = 0
+        for k in (2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 33):
+            m = np.zeros(H * W, bool)
+            m[np.arange(k) * 197 % (H * W)] = True
+            m = m.reshape(H, W)
+            groups += int(not np.array_equal(R._background_image(sc, st, W, H, vp, eye, m, {})[m][:, :3], full[m]))
+    check(f'a sky pixel evaluated ALONE has the ray it has in the whole frame ({len(picks)} pixels, one uncovered at a time: the one-row '
+          'product went through sgemv, another sum on every kernel past the oldest, and all of them differed)', alone == 0,
+          f'{alone} of {len(picks)} differ')
+    check('...and in every small group (2 to 33 uncovered pixels: the kernels\' unrolled and remainder rows)', groups == 0,
+          f'{groups} of 13 groups differ')
+
+    # ---- the pass's own twin on a frame with ONE uncovered pixel
+    from ..core import raster as CR
+    sc, st = rig(mode='GRADIENT', gradient_falloff=0.7, blend_mode='SMOOTH', show_ground=True, horizon_height=0.15)
+    _view, _proj, vp, eye = R.camera_matrices(sc.camera, W, H)
+    n_bad, drawn = 0, 0
+    for y, x in ((3, 5), (10, 80), (20, 40), (35, 2), (36, 93), (50, 47), (60, 11), (70, 70)):
+        g = CR.GBuffer(W, H)
+        g.tri[:] = 0
+        g.tri[y, x] = CR.EMPTY
+        sim, why = GSKY.simulate(sc, g, st, vp, eye, {}, ss=1)
+        cpu = R._background_image(sc, st, W, H, vp, eye, ~g.mask(), {})
+        if sim is not None:
+            drawn += 1
+            n_bad += int(not np.array_equal(sim, cpu))
+    check('the sky pass over a frame with exactly ONE uncovered pixel is bitwise the CPU frame (8 frames, zeros at the covered pixels)',
+          drawn == 8 and n_bad == 0, f'{n_bad} of {drawn} differ')
+
+
+def test_previous_engine_pins_sum_the_rays_as_this_engine_does():
+    """Every release up to the R253 review sums its sky rays through the
+    BLAS, so on a kernel whose product is not the chain a pin against a
+    release zip would sit the sky pixels apart for no reason a pin is
+    there to catch (168 checks in 55 tests, measured on SkylakeX).
+    `tests/test_render._prev_engine` rewrites that one matmul of the
+    UNPACKED previous engine as the chain, and only there: where the
+    BLAS is the chain the zip is imported as shipped. Both verdicts are
+    forced here, so both roads of the rewrite are held on every
+    machine."""
+    import shutil
+    import tempfile
+    from ..core import mathx as M
+    from . import test_render as TR
+
+    engine = ('import numpy as np\n\n\ndef rays(nx, ny, inv):\n' + TR._PREV_RAY_MATMUL + '    return world\n')
+
+    def unpack(text):
+        d = tempfile.mkdtemp(prefix='halcyon_rays_')
+        os.makedirs(os.path.join(d, 'core'))
+        with open(os.path.join(d, 'core', 'render.py'), 'w', encoding='utf-8', newline='') as fh:
+            fh.write(text)
+        return d
+
+    def read(d):
+        with open(os.path.join(d, 'core', 'render.py'), 'r', encoding='utf-8', newline='') as fh:
+            return fh.read()
+
+    real = TR._blas_sums_rays_as_the_chain()
+    keep = list(TR._BLAS_RAYS)
+    dirs = []
+    try:
+        with redirect_stdout(io.StringIO()):
+            # ---- a BLAS that is the chain: the zip as shipped
+            TR._BLAS_RAYS[:] = [True]
+            d = unpack(engine)
+            dirs.append(d)
+            did = TR._chain_prev_rays(d, 'synthetic.zip')
+            check('where the BLAS sums the rays as the chain, the unpacked previous engine is left byte for byte', did is False
+                  and read(d) == engine)
+            # ---- a BLAS that is not: the one matmul, rewritten
+            TR._BLAS_RAYS[:] = [False]
+            did = TR._chain_prev_rays(d, 'synthetic.zip')
+            text = read(d)
+            check('where it does not, the one matmul is rewritten (and nothing else of the file)', did is True and ' @ ' not in text
+                  and text == engine.replace(TR._PREV_RAY_MATMUL, TR._PREV_RAY_CHAIN))
+            ns = {}
+            exec(compile(text, 'synthetic_render.py', 'exec'), ns)
+            rng = np.random.default_rng(254)
+            apart = 0
+            for n in (1, 2, 3, 5, 8, 17, 33, 4096):
+                inv = rng.standard_normal((4, 4)).astype(f32)
+                nx = rng.uniform(-1.0, 1.0, n).astype(f32)
+                ny = rng.uniform(-1.0, 1.0, n).astype(f32)
+                apart += int((ns['rays'](nx, ny, inv) != M.unproject_far(nx, ny, inv)).sum())
+            check('the rewritten engine\'s rays are bitwise mathx.unproject_far at every row count (1 to 4096)', apart == 0,
+                  f'{apart} components apart')
+            check('a second pass finds nothing to rewrite', TR._chain_prev_rays(d, 'synthetic.zip') is False and read(d) == text)
+            d2 = unpack(engine.replace('\n', '\r\n'))
+            dirs.append(d2)
+            did = TR._chain_prev_rays(d2, 'synthetic.zip')
+            check('a zip with CRLF line ends keeps them', did is True and read(d2) == text.replace('\n', '\r\n'))
+            d3 = unpack(engine.replace('world = pts @ inv.T', 'world = pts @ inv.T  # twice\n    world = pts @ inv.T'))
+            dirs.append(d3)
+            before = read(d3)
+            check('an engine that does not hold exactly those lines once is left alone',
+                  TR._chain_prev_rays(d3, 'synthetic.zip') is False and read(d3) == before)
+    finally:
+        TR._BLAS_RAYS[:] = keep
+        for d in dirs:
+            shutil.rmtree(d, True)
+    with open(R.__file__, 'r', encoding='utf-8') as fh:
+        mine = fh.read()
+    check('this engine no longer holds the matmul (a zip of it is imported as shipped on every machine)',
+          TR._PREV_RAY_MATMUL not in mine and '\n    world = pts @ inv.T\n' not in mine and 'M.unproject_far(nx, ny, inv)' in mine)
+    check('the verdict on this machine\'s own BLAS is a plain bool, measured once', isinstance(real, bool)
+          and TR._blas_sums_rays_as_the_chain() is real)
+
+
+def test_sun_direction_texel_is_the_cpu_normalisation():
+    """The same BLAS dependence, found by reading every other bitwise
+    twin for it: `gpu/material.py` normalised a Sun's (and a Hemi's)
+    direction with `np.linalg.norm` for the light texel and the baked
+    literal, the CPU with `mathx.normalize`. The norm takes a BLAS dot,
+    which sums another way on every kernel past the oldest: one
+    direction in ten came out up to 2 ulp from the CPU's, and for those
+    the AXIS viewer's bitwise frame (`test_r251_lighting_lamps`) broke
+    at every pixel -- held until now by the Sun the suite happens to
+    use. The packer normalises as the CPU does."""
+    from ..core import mathx as M
+    from ..core import raster as CR
+    from ..core.scene import Light
+    from ..gpu import material as GM
+    from ..gpu import shade as GSH
+    from . import featurematrix as FM
+
+    rng = np.random.default_rng(253)
+    D = rng.standard_normal((512, 3)).astype(f32)
+    lights = [Light(type='SUN' if i % 2 else 'HEMI', name=f'L{i}', direction=tuple(float(v) for v in d)) for i, d in enumerate(D)]
+    tex = GM.pack_light_texels(lights)
+    got = tex[0, 1::GM.LIGHT_TEXEL_STRIDE, :3]
+    want = np.stack([-M.normalize(np.asarray(l.direction, f32)) for l in lights])
+    apart = int((got != want).any(axis=1).sum())
+    check('the light texel of 512 Suns and Hemis is bitwise the CPU\'s own -normalize(direction) (np.linalg.norm left 59 of them apart '
+          'on every kernel but the oldest)', got.shape == want.shape and apart == 0, f'{apart} of 512 apart')
+
+    W, H = 96, 72
+    # three directions the two normalisations disagree on (Nehalem, Sandybridge, Haswell, SkylakeX): the frame was 1.2e-07,
+    # 6.0e-08 and 1.6e-06 off at all 6912 pixels
+    for d in ((0.46311014890670776, 0.8245135545730591, -0.5025298595428467),
+              (-0.7476196885108948, 0.12608730792999268, -0.7675462961196899),
+              (-0.7092268466949463, 1.5285791158676147, -0.6353087425231934)):
+        sc, st = FM.build('fixed camera-axis viewer (GL 1.1 / Sega Model / DS)')
+        suns = [l for l in sc.lights if str(l.type).upper() in ('SUN', 'HEMI')]
+        for l in suns:
+            l.direction = d
+        on = np.asarray(R.render(sc, st))
+        view, _p, vp, eye = R.camera_matrices(sc.camera, W, H)
+        g = CR.GBuffer(W, H)
+        CR.rasterize(sc.mesh.verts, sc.mesh.tris, vp, W, H, gbuf=g, depth_bits=st.depth_precision)
+        job = R.ShadeJob(sc, st, R.prepare_textures(sc, st), None, view, eye, W, H)
+        GSH._PLAN_CACHE.clear()
+        p, why, _atl = GSH.plan_frame(job, g)
+        worst, n_px = -1.0, 0
+        if p is not None:
+            sim, _hit = GSH.simulate(job, g)
+            yy, xx = np.nonzero(g.tri >= 0)
+            diff = np.abs(sim[yy, xx] - on[yy, xx, :3]).max(axis=1)
+            worst, n_px = float(diff.max()), int(yy.size)
+        check(f'the AXIS facing-quad frame under a Sun at ({d[0]:.3f}, {d[1]:.3f}, {d[2]:.3f}): simulator == CPU bitwise at all its pixels',
+              len(suns) == 1 and p is not None and n_px == 6912 and worst == 0.0, f'max {worst:.3g} over {n_px} px ({why})')
 
 
 def main():

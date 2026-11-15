@@ -9520,9 +9520,11 @@ def _background_image(scene, st, w, h, vp, eye, uncovered=None,
     inv = np.linalg.inv(vp).astype(np.float32)
     nx = (xx.astype(np.float32) + 0.5) / w * 2.0 - 1.0
     ny = (yy.astype(np.float32) + 0.5) / h * 2.0 - 1.0
-    pts = np.stack([nx, ny, np.ones(nx.size, np.float32),
-                    np.ones(nx.size, np.float32)], axis=1)
-    world = pts @ inv.T
+    # R253 (review): the unprojection is the op-by-op float32 chain the
+    # sky pass computes (M.unproject_far), never a BLAS kernel's sum --
+    # `pts @ inv.T` was the chain's bits on a kernel without FMA and an
+    # ulp off on a kernel with it, which is what the sky twin measured
+    world = M.unproject_far(nx, ny, inv)
     world = world[:, :3] / np.where(np.abs(world[:, 3:4]) < 1e-9, 1e-9, world[:, 3:4])
     dirs = M.normalize(world - eye[None, :])
     # R251 (sky-camera C056): Doom's cylinder sky is a function of the

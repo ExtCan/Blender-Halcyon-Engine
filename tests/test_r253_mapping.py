@@ -125,9 +125,23 @@ OLD_GLSL_XY_DIGESTS = {
 OLD_TEX_IMAGE_FLAT = ('    vec3 _v1 = vec3(hal_uv, 0.0);\n'
                       '    vec4 _v2 = texture(hal_tex0, _v1.xy);')
 #: adler32 of the CPU picture (R.render, 96 x 72, transparency NONE) of
-#: three pre-existing featurematrix scenes on the pre-edit tree
-OLD_FRAME_DIGESTS = {'textured': 1656485521, 'demo': 1045851408,
-                     'mirror': 1324349618}
+#: three pre-existing featurematrix scenes, as a PAIR: the bytes a BLAS
+#: kernel without FMA renders, then the bytes a kernel with FMA renders
+#: (measured on OpenBLAS 0.3.34: Katmai, Nehalem and Sandybridge render
+#: the first, Haswell and SkylakeX the second). The geometry road still
+#: sums through the BLAS, so the two families sit up to 3.1e-6 apart at
+#: about 557 covered pixels of the 6912, and one recorded number can hold
+#: on one family only: the round recorded 1656485521 / 1045851408 /
+#: 1324349618 on a kernel with FMA and the pin failed under
+#: OPENBLAS_CORETYPE=Nehalem from the day it was written. The first of
+#: each pair is the pre-edit tree's bytes (72da20a^) on a kernel without
+#: FMA, which nothing has moved. The second is the pre-edit tree's on a
+#: kernel with FMA but for 10 sky pixels, 5.96e-08: the R253 review's
+#: op-by-op sky rays (core/mathx.unproject_far), which moved no covered
+#: pixel on either family and no pixel at all on the first
+OLD_FRAME_DIGESTS = {'textured': (1539176161, 3858757274),
+                     'demo': (928542048, 3248123161),
+                     'mirror': (2436496908, 3526621371)}
 
 LANE_N = 4096
 NEW_MODES = ('CUBE', 'EQUIRECT', 'MIRROR_BALL', 'ANGULAR', 'CYLINDER_CAP',
@@ -1251,14 +1265,17 @@ def test_mapping_frame_twin():
     sc2.materials[1].graph = _ball_master(sc2, {'om': omap, 'pj': proj, 'im': img},
                                           ['im', 0])
     frame_bar('Object Projection -> Projector EQUIRECT -> Image Texture', sc2, st2)
-    # every pre-existing scene: the pre-edit bytes
+    # every pre-existing scene: the pre-edit bytes, of this machine's BLAS
+    # kernel family (OLD_FRAME_DIGESTS says why there are two)
     for key, want in OLD_FRAME_DIGESTS.items():
         st3 = base_settings(W, H, transparency='NONE')
         st3.use_processes = False
         img3 = np.asarray(R.render(FM.SCENES[key](st3), st3))
         dig = zlib.adler32(np.ascontiguousarray(img3, f32).tobytes())
         check(f"the '{key}' featurematrix scene renders the pre-edit bytes "
-              f'(adler32 {want})', dig == want, str(dig))
+              f'(adler32 {want[0]} on a BLAS kernel without FMA, {want[1]} '
+              'on one with: the same frame but for the 10 sky pixels whose '
+              'rays are summed op by op now)', dig in want, str(dig))
 
 
 def main():

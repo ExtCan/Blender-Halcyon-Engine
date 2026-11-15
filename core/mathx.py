@@ -184,6 +184,48 @@ def object_space_points(P, inv):
     return out
 
 
+def unproject_far(nx, ny, inv):
+    """The camera-ray unprojection of NDC points on the far plane: the
+    homogeneous (nx, ny, 1, 1) through `inv` (the inverse
+    view-projection), (n,4) float32 BEFORE the divide by w.
+
+    Written as the float32 chain per row r --
+    `t = nx*inv[r,0]; t += ny*inv[r,1]; t += inv[r,2]; t += inv[r,3]` --
+    which is op for op gpu/sky.py's
+    `((nx * i.x + ny * i.y) + i.z) + i.w`, so the CPU's sky rays and the
+    sky pass's are the same bits in the simulator on every machine (the
+    view_depth precedent in core/render.py, object_space_points above).
+
+    Until the R253 review this was `np.stack([nx, ny, 1, 1], 1) @ inv.T`,
+    a BLAS product, and its last bit was the KERNEL's. Measured against
+    this chain on the five kernels NumPy's OpenBLAS 0.3.34 selects among:
+    Katmai is the chain at every row count; Nehalem and Sandybridge are
+    the chain from two rows up (53M components, none apart) and another
+    sum at ONE row, which NumPy routes to sgemv; Haswell and SkylakeX --
+    every AVX2 machine -- fuse a product into the running sum (FMA) and
+    land on another float for 8.4% of components. A camera's inverse
+    has third and fourth columns that nearly cancel, so the order
+    shows: the sky twin was 10 to 40 pixels apart on the fused kernels,
+    and a frame of one uncovered pixel had a ray up to 192 ulp from the
+    ray the same pixel has in any other frame. A ufunc product and a
+    ufunc sum are each one correctly rounded IEEE operation whatever
+    the CPU, so this is a construction on any, and a row's result
+    cannot depend on how many rows are summed with it. The
+    1 * inv[r,2] and 1 * inv[r,3] products the matmul formed are exact
+    and are not formed."""
+    nx = np.asarray(nx, np.float32)
+    ny = np.asarray(ny, np.float32)
+    inv = np.asarray(inv, np.float32)
+    out = np.empty((nx.shape[0], 4), np.float32)
+    for r in range(4):
+        t = nx * inv[r, 0]
+        t += ny * inv[r, 1]
+        t += inv[r, 2]
+        t += inv[r, 3]
+        out[:, r] = t
+    return out
+
+
 def transform_h(m, p):
     """Homogeneous transform. p: (N,3) -> (N,4)."""
     m = np.asarray(m, dtype=np.float32)

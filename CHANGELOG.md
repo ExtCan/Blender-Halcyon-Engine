@@ -2321,6 +2321,126 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   initialiser reading a name in any engine source -- the initialiser
   change moves no engine value. The check costs about 4 ms on a
   1,562-line material pass, once per distinct text.
+- **The sky twin is bitwise on every BLAS kernel: the CPU sums its
+  camera rays one operation at a time.** The report:
+  `tests/test_render.py::test_gpu_sky_pass` failed 8 checks, the same 8
+  every run, on an Intel Xeon with AVX-512 (NumPy 2.5.3 and 2.5.4,
+  Python 3.13), and passed whole under `OPENBLAS_CORETYPE=Nehalem`;
+  NumPy's own SIMD dispatch (`NPY_DISABLE_CPU_FEATURES`) changed
+  nothing. *The cause.* `core/render._background_image` unprojected the
+  pixel centres with `pts @ inv.T`, an (n,4) x (4,4) float32 product
+  that NumPy hands to the BLAS, and `hal_sky_ray` in `gpu/sky.py` sums
+  the same four terms as `((nx * i.x + ny * i.y) + i.z) + i.w`, which
+  the simulator runs one float32 operation at a time. The product's
+  last bit is the kernel's. Measured against that sum on the five
+  kernels this NumPy's OpenBLAS 0.3.34 selects among: Katmai is the sum
+  at every row count; Nehalem and Sandybridge are the sum from two rows
+  up (53 million components, none apart) and ANOTHER sum at one row,
+  which NumPy routes to sgemv; Haswell and SkylakeX -- what every AVX2
+  machine runs, a Zen included -- fuse a product into the running sum
+  at every row count (8.4% of components apart on random matrices).
+  The camera's inverse view-projection has third and fourth columns
+  that nearly cancel (-25.99 against +25.40 in the demo frame's first
+  row), so the order shows: on the fused kernels 24 rays of the 96 x 72
+  frame and 96 of its 2x frame, 10 to 13 sky pixels a mode (40 on the
+  block road); at one row EVERY ray, by up to 192 ulp (1.3e-6), the
+  colour by up to 1.0e-7. The bitwise twin therefore held only where
+  the kernel had no FMA and the frame had two uncovered pixels or more.
+  Over the whole suite the two fused kernels fail the same 20 checks:
+  the 8, and twelve that single test does not run -- the sky pass under
+  Ground Fog (3, `test_r251_lighting_fog`), the Y-shear sky twin (1)
+  and the LightWave backdrop twin (7, `test_r251_sky_camera`), and the
+  Super FX frame through the fake device at bar 0.0 (1,
+  `test_r251_material`). *What changed.* `core/mathx.unproject_far`
+  is the shader's chain, term for term (the `view_depth` and
+  `object_space_points` precedent), and `_background_image` calls it.
+  A ufunc product and a ufunc sum are each one correctly rounded IEEE
+  operation on any CPU, so the ray is a construction now, and a pixel's
+  ray no longer depends on how many pixels are uncovered with it (a
+  band, a region or a frame that leaves ONE sky pixel draws the pixel
+  the whole frame draws). It is no slower (11 ms against the product's
+  27 for 720p's 921,600 rays, on a loaded machine). Nothing changed on
+  the simulator's side: its sum was already op by op and nothing it is
+  fed depends on the kernel (the inverse is the same LAPACK call on
+  both roads in one process), so the BLAS was the CPU road's alone and
+  that is the road that moved. The bar stays bitwise.
+  *What moved on the CPU.* On a kernel without FMA, nothing in a frame
+  of two uncovered pixels or more: the three featurematrix frames are
+  byte for byte the old tree's under Katmai, Nehalem and Sandybridge,
+  and the 61 tests that load a previous engine give the same outcome on
+  each of their 1,689 checks under Nehalem (zips built from the 1.91.0,
+  1.90.0 and 1.86.2 tags; the last two stand in for the releases the
+  pins name, which this repository does not hold, and four preset
+  checks fail against the stand-in before and after alike). A frame of
+  exactly one uncovered pixel moves by up to 1.0e-7 on Nehalem and
+  Sandybridge: the pixel that was no other frame's. On a kernel with
+  FMA the sky moves by the ray's last bit and nothing else does -- 10
+  pixels of the demo frame's 6912, 5.96e-08, no covered pixel. *The
+  previous-engine pins.* Every release up to this one sums its rays
+  through the BLAS, so on a fused kernel a pin against a release zip
+  would now sit those sky pixels apart: 168 checks in 55 of the 61
+  tests, measured on SkylakeX. `tests/test_render._prev_engine`
+  rewrites that one matmul of the UNPACKED previous engine as the chain
+  before importing it (`_chain_prev_rays`), and only where the
+  machine's BLAS is not the chain at two rows and up
+  (`_blas_sums_rays_as_the_chain`); everywhere else the zip is imported
+  as shipped and the pins compare against the release byte for byte.
+  With it SkylakeX, Haswell and Nehalem agree on all 1,689 checks.
+  *The frame digests.* `tests/test_r253_mapping.OLD_FRAME_DIGESTS`
+  pinned three whole CPU frames by adler32, recorded on a fused kernel,
+  and failed under Nehalem from the day it was written: the GEOMETRY
+  road still sums through the BLAS (557 covered pixels of the 6912 sit
+  up to 3.1e-6 apart between the two families; every twin that reads
+  them is held at the deferred bar, none bitwise), so one number can
+  hold on one family only. Each scene carries a pair now: the pre-edit
+  tree's bytes on a kernel without FMA (72da20a^ rendered again:
+  1539176161, 928542048, 2436496908), and the fused family's, which are
+  the pre-edit tree's but for the 10 sky pixels. *The other bitwise
+  twins, read for the same dependence.* One had it. `gpu/material.py`
+  normalised a Sun's and a Hemi's direction with `np.linalg.norm` for
+  the light texel and for the baked literal, and the CPU
+  (`core/lights.sample`) with `mathx.normalize`; the norm takes a BLAS
+  dot, the chain's sum on Katmai and another on the other four kernels,
+  where one direction in ten (59 of 512) came out up to 2 ulp from the
+  CPU's. For those the AXIS viewer's bitwise frame
+  (`test_r251_lighting_lamps`) broke at all 6912 pixels, by 6.0e-08 to
+  1.6e-06 in 5 of 12 directions tried; it held on the Sun the suite
+  uses. The packer normalises as the CPU does now, in both places, and
+  no CPU pixel moves. *Left as they are*, the same kind of product
+  where no bitwise twin reads its last bit: `core/sky.mode7_rows` (the
+  registers are CPU bytes on both roads); the cone march's two
+  unprojections in `core/render.py` (the CPU alone draws them); the
+  Spot and Area axes' `np.linalg.norm` in the same packer and in
+  `gpu/shade.py`; the shadow-map projection (`ph @ self.vp.T` against
+  the shader's four `dot`s), the square spot, the cookies, the anime
+  face map, subsurface and the NTSC matrix -- each twinned at a
+  tolerance (the deferred bar 6e-3, or tighter), none bitwise (read
+  from the tests, not measured again). Pinned in
+  `tests/test_r253_review.py`, 3 tests and 18 checks.
+  `test_sky_rays_are_the_same_bits_on_every_blas_kernel`: the chain
+  against NumPy scalars at 13 row counts; the CPU road's own rays
+  against `hal_sky_ray`'s text through the front-end at every pixel of
+  the frame and of the block road; a pixel alone and in small groups
+  against the whole frame; the pass over eight frames of one uncovered
+  pixel. `test_previous_engine_pins_sum_the_rays_as_this_engine_does`:
+  both verdicts of the rewrite forced on a stand-in engine, so both
+  roads are held on every machine, and this engine's own source no
+  longer holding the matmul. `test_sun_direction_texel_is_the_cpu_
+  normalisation`: 512 texels and three AXIS frames. With the old lines
+  back, the ray checks fail on Haswell and SkylakeX (24 and 96 rays),
+  the one-pixel checks on every kernel but Katmai (228 of 228 pixels, 8
+  of 8 frames), the source check on all five, and the Sun's four on
+  every kernel but Katmai. *Not the BLAS, and in the way of the same
+  green suite.* `test_r251_raster.test_w2_c127_jitter` took `float()`
+  of `raster.jitter_at`'s one-element array -- a deprecation until
+  NumPy 2.5, a TypeError since -- so on that NumPy the test raised
+  after its sixth check on every kernel and its other 23 never ran. It
+  indexes the element now and all 29 pass. *The suite*, on a machine
+  with no release zips beside the package (the 16 checks that require
+  `halcyon-1.89.0.zip` fail there on any kernel, before and after):
+  beyond those, 20 failures and the raise before on Haswell and
+  SkylakeX, 3 and the raise on Nehalem and Sandybridge; none on any of
+  the four after.
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
@@ -2697,6 +2817,14 @@ What headless cannot prove, per feature (the fakebpy / fakeblender stubs validat
   rule) and the pass that read the frame shader's `vUV` (which compiles,
   and draws what the CPU does not). `tests/glsl_strict.py` was not run in
   this round: the machine had no glslang.
+- The sky on a real driver beside the CPU sky, now that the CPU's ray
+  is the shader's sum term for term (proven in the simulator, on five
+  BLAS kernels): GLSL lets a driver contract `nx * i.x + ny * i.y` into
+  an FMA, which is the sum the fused BLAS kernels made, so the field
+  test's count of sky pixels an ulp of ray apart is the driver's own
+  and may differ from the count it printed against the old CPU road on
+  the same machine. NOT run on a driver in this round; nor was a Sun
+  whose direction the two normalisations disagreed on.
 
 ---
 

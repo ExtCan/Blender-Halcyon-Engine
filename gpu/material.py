@@ -508,8 +508,14 @@ def pack_light_texels(lights, job=None):
         energy = float(getattr(light, 'energy', 1.0)) \
             * float(getattr(light, 'style_gain', 1.0))
         if kind in ('SUN', 'HEMI'):
-            d = np.asarray(light.direction, np.float32)
-            d = d / max(float(np.linalg.norm(d)), 1e-9)
+            # R253 (review): the CPU's own normalisation
+            # (core/lights.sample: mathx.normalize, the np.sum
+            # chain), so the texel is the CPU's float32 direction.
+            # np.linalg.norm takes a BLAS dot, another sum on every
+            # kernel past the oldest: 2 ulp away for one direction in
+            # ten, where the AXIS twin's bitwise frame then broke whole
+            from ..core import mathx as _MX
+            d = _MX.normalize(np.asarray(light.direction, np.float32))
             out[0, b + 1, :3] = -d
             out[0, b + 0, 3] = np.float32(sign * energy)
         else:
@@ -2746,8 +2752,10 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
         return lines
     ck = (consts.get('cookies') or {}).get(i)
     if kind in ('SUN', 'HEMI'):
-        d = np.asarray(light.direction, np.float32)
-        d = d / max(float(np.linalg.norm(d)), 1e-9)
+        # R253 (review): mathx.normalize, as the CPU and the texel
+        # (pack_light_texels says why), never np.linalg.norm
+        from ..core import mathx as _MX
+        d = _MX.normalize(np.asarray(light.direction, np.float32))
         if use_tx:
             lines += [f'    vec3 L = {_lref(i, 1, "xyz")};',
                       f'    vec3 rad = {col} * {_lref(i, 0, "w")};']

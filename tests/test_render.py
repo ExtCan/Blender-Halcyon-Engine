@@ -29725,6 +29725,72 @@ def test_ink_style_pack():
 
 _PREV_ENGINE = {}
 
+#: R253 (review): every release up to that review unprojected its sky rays
+#: with these lines of core/render._background_image -- a BLAS product,
+#: whose last bit is the kernel's (core/mathx.unproject_far says which).
+#: The engine sums the chain now, so on a machine whose BLAS does NOT sum
+#: that product as the chain the same pixels of a previous engine sit an
+#: ulp of ray away for no reason a pin is there to catch
+_PREV_RAY_MATMUL = ('    pts = np.stack([nx, ny, np.ones(nx.size, np.float32),\n'
+                    '                    np.ones(nx.size, np.float32)], axis=1)\n'
+                    '    world = pts @ inv.T\n')
+_PREV_RAY_CHAIN = ('    world = np.empty((nx.size, 4), np.float32)\n'
+                   '    for _r in range(4):\n'
+                   '        _t = nx * inv[_r, 0]\n'
+                   '        _t += ny * inv[_r, 1]\n'
+                   '        _t += inv[_r, 2]\n'
+                   '        _t += inv[_r, 3]\n'
+                   '        world[:, _r] = _t\n')
+_BLAS_RAYS = []
+
+
+def _blas_sums_rays_as_the_chain():
+    """Whether THIS machine's (n,4) x (4,4) float32 matmul is
+    mathx.unproject_far's chain at every row count from 2 up (measured on
+    OpenBLAS 0.3.34: true on the Katmai, Nehalem and Sandybridge kernels,
+    false on Haswell and SkylakeX, which fuse a product into the sum).
+    One row is left out on purpose: it takes sgemv, another sum again on
+    Nehalem and Sandybridge, and a frame of one uncovered pixel is the
+    one place the chain moved the CPU sky on those machines -- a pin
+    there should say so."""
+    if not _BLAS_RAYS:
+        from ..core import mathx as M
+        rng = np.random.default_rng(253)
+        same = True
+        for n in (2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 33, 4096):
+            inv = rng.standard_normal((4, 4)).astype(np.float32)
+            nx = rng.uniform(-1.0, 1.0, n).astype(np.float32)
+            ny = rng.uniform(-1.0, 1.0, n).astype(np.float32)
+            one = np.ones(n, np.float32)
+            same &= bool(np.array_equal(np.stack([nx, ny, one, one], axis=1) @ inv.T,
+                                        M.unproject_far(nx, ny, inv)))
+        _BLAS_RAYS.append(same)
+    return _BLAS_RAYS[0]
+
+
+def _chain_prev_rays(pkg_dir, zip_name):
+    """Rewrite the previous engine's one ray matmul as the chain, in the
+    unpacked copy, BEFORE it is imported -- only where this machine's
+    BLAS is not the chain (`_blas_sums_rays_as_the_chain`). Where it is
+    (a kernel without FMA), the zip is imported byte for byte and the
+    pins compare against the release as shipped.
+    Nothing else of the previous engine is touched, and an engine that
+    does not hold exactly these lines once is left alone."""
+    if _blas_sums_rays_as_the_chain():
+        return False
+    path = os.path.join(pkg_dir, 'core', 'render.py')
+    with open(path, 'r', encoding='utf-8', newline='') as fh:
+        src = fh.read()
+    nl = '\r\n' if '\r\n' in src else '\n'
+    was = _PREV_RAY_MATMUL.replace('\n', nl)
+    if src.count(was) != 1:
+        return False
+    with open(path, 'w', encoding='utf-8', newline='') as fh:
+        fh.write(src.replace(was, _PREV_RAY_CHAIN.replace('\n', nl)))
+    print(f'  [prev engine] {zip_name}: this BLAS does not sum the sky rays as '
+          'the chain; the unpacked engine sums them as this one does')
+    return True
+
 
 def _prev_engine(zip_name='halcyon-1.70.0.zip'):
     """R228: the PREVIOUS release's WHOLE engine, imported from the
@@ -29732,7 +29798,10 @@ def _prev_engine(zip_name='halcyon-1.70.0.zip'):
     elsewhere) under its own package name, so a frame can be rendered
     by last round's code and compared bitwise with this round's. The
     strongest neutrality pin there is for a feature that must be
-    invisible until asked for."""
+    invisible until asked for. R253 (review): where this machine's BLAS
+    does not sum the sky rays as the engine now does, the unpacked
+    engine's one matmul is rewritten to the same sum first
+    (`_chain_prev_rays`); elsewhere it is the zip as shipped."""
     import atexit
     import importlib
     import shutil
@@ -29752,6 +29821,7 @@ def _prev_engine(zip_name='halcyon-1.70.0.zip'):
             pkg = 'halcyon_prev_' + zip_name.replace('.', '_').replace(
                 '-', '_')
             os.rename(os.path.join(d, 'halcyon'), os.path.join(d, pkg))
+            _chain_prev_rays(os.path.join(d, pkg), zip_name)
             sys.path.insert(0, d)
             mod = importlib.import_module(pkg + '.core.render')
             atexit.register(shutil.rmtree, d, True)
@@ -37103,7 +37173,10 @@ def test_gpu_sky_pass():
     int. The front-end truncates the block division the ray road relies
     on. shade.simulate mirrors the sky onto the G-buffer for the suite.
     And the CPU road is untouched: every mode renders bitwise the
-    previous release on the CPU device.
+    previous release on the CPU device. (R253 review: the rays are
+    bitwise on every BLAS kernel since `mathx.unproject_far`; the
+    previous release summed them with the BLAS, and `_prev_engine` says
+    what the last pin compares against where that is another sum.)
     """
     import re
     from ..core import raster as CR

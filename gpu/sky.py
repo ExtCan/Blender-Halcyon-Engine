@@ -28,9 +28,12 @@ a cleared target is not a promise (the pool hands back used targets), the
 written zero is the 2.79 contract.
 
 Twins: every mode here is BITWISE the CPU sky in the simulator on the
-suite's frames (the rays included: the CPU's (N,4)x(4,4) matmul sums in
-the shader's order, and `_rotate_z`'s float64 rounding lands on the same
-float32). The driver is measured by the field test: its `pow`, `atan`
+suite's frames (the rays included: the CPU sums the unprojection as the
+shader does, one float32 operation at a time -- `mathx.unproject_far`,
+since the R253 review; the (N,4)x(4,4) matmul it replaced summed in the
+shader's order on a BLAS kernel without FMA only, and never for a frame
+of one uncovered pixel -- and `_rotate_z`'s float64 rounding lands on
+the same float32). The driver is measured by the field test: its `pow`, `atan`
 and division are its own, and a ray an ulp off can flip a pixel that sits
 on a cliff (a band edge, a nearest texel edge) whole -- the field test
 counts those pixels by name. The supersampled road reproduces
@@ -202,7 +205,8 @@ vec3 hal_sky_norm(vec3 a)
 
 // render._background_image's camera ray of a pixel: the NDC centre of the
 // pixel (or, under fast_background, of its low-resolution block), through
-// the inverse view-projection, divided by w, less the eye, normalised
+// the inverse view-projection, divided by w, less the eye, normalised.
+// The four sums are mathx.unproject_far's, term for term in this order
 vec3 hal_sky_ray(ivec2 px)
 {
     vec2 size = hal_sky_size();

@@ -2473,8 +2473,10 @@ def mode7_rows(world, inv, eye, Wo, Ho):
     per OUTPUT row: the 8.8 fixed-point texel steps along the row (A, C)
     and the whole-texel row origin (X0, Y0, already << 8), from the row's
     first and last pixel-centre rays through `inv` (the frame's own
-    inverse view-projection, float32) exactly as `_background_image`
-    unprojects them. `np.round` (half to even) is the tie rule."""
+    inverse view-projection, float32), unprojected as `_background_image`
+    unprojected them until the R253 review: the BLAS product, left as it
+    was -- these registers are CPU bytes on BOTH roads, so no twin reads
+    their last bit. `np.round` (half to even) is the tie rule."""
     ts = max(float(getattr(world, 'mode7_texel_size', 1.0)), 1e-6)
     gh = float(getattr(world, 'ground_height', 0.0))
     inv = np.asarray(inv, np.float32)
@@ -2484,7 +2486,7 @@ def mode7_rows(world, inv, eye, Wo, Ho):
     nx1 = np.full(Ho, ((Wo - 0.5) / Wo) * 2.0 - 1.0, np.float32)
     eye32 = np.asarray(eye, np.float32)
 
-    def ray(nx):                                              # _background_image's unproject, float32
+    def ray(nx):                                              # the unprojection, float32 (the BLAS product: see above)
         pts = np.stack([nx, ny, np.ones(Ho, np.float32), np.ones(Ho, np.float32)], 1)
         wv = pts @ inv.T
         wv = wv[:, :3] / np.where(np.abs(wv[:, 3:4]) < 1e-9, 1e-9, wv[:, 3:4])
