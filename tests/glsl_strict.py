@@ -19,9 +19,14 @@ shading rate, every Console Emulation Shader type and option at the
 machine's and the scene's rate, the anime / cartoon / BI / Max masters,
 the post stages (gpu/stages*.py), the sky pass source and the
 rasteriser's fragment road. Refusals BY NAME are not failures (they never
-reach a driver). Not covered: the compute kernels (their uniforms are
-declared by the device's CreateInfo, so the text alone is not a unit) and
-the ink pass (built per frame from a job).
+reach a driver). R253 (field): the compute RASTER is covered too, as a
+4.30 compute shader in all eight variants -- its text alone is not a unit
+(the device's CreateInfo declares the interface), so the check writes the
+header the CreateInfo writes: the images, the samplers and
+`craster.RASTER_FLOATS`, over `device.strip_declarations(source)`. A push
+constant the dispatch names and the text lost, or the reverse, fails here.
+Not covered: the ray kernels (gpu/rtrace, their push constants are listed
+at each call) and the ink pass (built per frame from a job).
 """
 import os
 import subprocess
@@ -163,8 +168,8 @@ def check_stages():
 
 def check_sky_and_kernels():
     """The sky pass source as the device receives it (gpu/sky.SOURCE, the
-    accessors filled) and the rasteriser's fragment and compute sources
-    in every variant (gpu/craster)."""
+    accessors filled) and the rasteriser's fragment sources (gpu/craster;
+    its compute variants are check_compute_raster's)."""
     from ..gpu import sky as GSKY
     from ..gpu import craster as CR
     counts = {'ok': 0, 'bad': 0}
@@ -172,10 +177,44 @@ def check_sky_and_kernels():
     for cvg in (False, True):
         counts[_record(f'craster fragment cvg={cvg}', [CR.fragment_source(cvg)],
                        None)] += 1
-    # (the compute kernels are built for CreateInfo with their uniforms
-    # declared by the device, so their text alone is not a compilable
-    # unit; they are field-proven on the driver and not checked here)
     print(f'  sky and raster fragments: {counts}')
+
+
+def compute_raster_unit(lin, clear, cvg):
+    """The compute raster as the driver compiles it: the interface the
+    device's CreateInfo declares (compile_compute: 8x8 groups, RGBA32F
+    write images and samplers by index, float push constants -- plain
+    uniforms on the OpenGL backend) over the stripped source."""
+    from ..gpu import craster as CR
+    from ..gpu import device as DV
+    images = ('hal_out_ids', 'hal_out_aux') \
+        + (('hal_out_lin',) if lin else ()) \
+        + (('hal_out_cvg',) if cvg else ())
+    samplers = ('hal_rc', 'hal_rbins', 'hal_rtiles') \
+        + (('hal_rclear',) if clear else ())
+    head = ['layout(local_size_x = 8, local_size_y = 8) in;']
+    head += [f'layout(binding = {i}, rgba32f) uniform writeonly image2D {nm};'
+             for i, nm in enumerate(images)]
+    head += [f'layout(binding = {i}) uniform sampler2D {nm};'
+             for i, nm in enumerate(samplers)]
+    head += [f'uniform float {nm};' for nm in CR.RASTER_FLOATS]
+    return '\n'.join(head) + '\n' + DV.strip_declarations(
+        CR.compute_source(lin, clear, cvg))
+
+
+def check_compute_raster():
+    """R253 (field): the compute raster in every variant, as a compute
+    shader with exactly the interface raster_on_device declares."""
+    from ..gpu import craster as CR
+    counts = {'ok': 0, 'bad': 0}
+    for lin in (False, True):
+        for clear in (False, True):
+            for cvg in (False, True):
+                counts[_record(
+                    f'craster compute {CR.compute_variant_name(lin, clear, cvg)}',
+                    [compute_raster_unit(lin, clear, cvg)], None,
+                    stage='comp')] += 1
+    print(f'  compute raster: {counts}')
 
 
 def main():
@@ -188,7 +227,7 @@ def main():
         return 0
     print(f'glsl_strict: {_glslang()}')
     for fn in (check_models, check_console, check_masters, check_stages,
-               check_sky_and_kernels):
+               check_sky_and_kernels, check_compute_raster):
         try:
             fn()
         except Exception as exc:                                # noqa: BLE001

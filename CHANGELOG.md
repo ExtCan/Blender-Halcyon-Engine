@@ -1573,6 +1573,77 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   the Compile operator (the fake bpy gained `fire` -- Blender's
   one-or-two-argument handler call -- `file_load` and persistent
   timers). Seven mutations of the fix each fail it.
+- **A uniform the driver stripped never fails a pass (the llvmpipe field
+  log).** A real Blender 5.2.2 session on the OpenGL backend (Mesa
+  llvmpipe) printed, for every GPU frame, `rasterising on the CPU: raster
+  dispatch failed: ValueError: GPUShader.uniform_float: uniform
+  hal_rtiles_w not found`, `blended compositing fell back to per-pass
+  readback: ValueError: GPUShader.uniform_float: uniform hal_cam_right not
+  found` and `shading on the CPU: drawing 'Material.001' failed:
+  GPUShader.uniform_float: uniform hal_cam_right not found` -- the whole
+  session on the CPU road with the GPU device selected. One rule is behind
+  all three: a linked GL program keeps only the uniforms that reach its
+  output, Blender's `GPUShader.uniform_float` / `uniform_int` /
+  `uniform_bool` raise `ValueError` for a name the program no longer has,
+  and Halcyon set every uniform of a pass unconditionally -- so ONE
+  stripped name failed the compute raster, then the blended burst, then
+  the per-pass road behind it. (1) *One door.*
+  `gpu/device.set_uniform(shader, kind, name, value)` is the only place
+  under `gpu/` that calls a GPUShader's `uniform_sampler` / `uniform_bool`
+  / `uniform_int` / `uniform_float`. The two sites that did call them now
+  call it: `_draw_in_bound`, which every full-screen pass of every family
+  crosses (material, layer, bump height, radiosity grid, sky, ink,
+  resolve, the post chain), and `_dispatch_compute_impl`, which the
+  compute raster and the two ray kernels cross; a scan over `gpu/*.py`
+  pins that nothing else does. The `ValueError` whose text says the name
+  was *not found* is a skip, and the name is remembered per shader (a
+  program's active set never changes after the link), so the driver is
+  asked ONCE and every later draw of that shader skips the set without
+  raising at all. Every other error -- a `ValueError` about the value, a
+  `TypeError`, anything the driver raises -- propagates exactly as before,
+  the draw's `finally` still restores blend and scissor, and a kernel's
+  output IMAGE is never skipped (a kernel without its output has nothing
+  to read back). `engine.py`'s viewport blit sets `image` on Blender's
+  built-in IMAGE shader, which is not a Halcyon pass, and stays a plain
+  call. (2) *The raster's dead pair is gone.* `hal_rtiles_w` /
+  `hal_rtiles_h` were declared by the compute shell and read by nothing in
+  any of its eight variants -- the tiles fetch has been a `texelFetch`
+  with integer coordinates since the exact-fetch round -- so they left the
+  text, the CreateInfo and the dispatch together: `craster.RASTER_FLOATS`
+  is the one list both use, 15 push constants (60 bytes), each read by
+  every variant. (3) *The camera axes are skipped, not pruned.*
+  `hal_cam_right` / `hal_cam_up` / `hal_cam_back` are read only by a key
+  fixed to the camera (`cel_light` 1: the cel key block and the Anime
+  shine's follow); every other material and layer pass, every bump height
+  pre-pass and the radiosity grid pass carry them unread. They ride the
+  frame's ONE uniform dict and the spec of every pass family (seven sites
+  in `gpu/shade.py`), which is what keeps the source, the CreateInfo and
+  the dict in step; pruning them per variant would be a hand-kept copy of
+  what the linker already computed, so the door takes the skip -- three
+  names per material shader, each asked once. (4) *The Debug breakdown
+  says so.* With Timing Breakdown on, an F12 prints under its table
+  `[Halcyon GPU] N uniforms stripped by the driver in K shaders (names):
+  ...`, counted once per shader so the number is stable from the second
+  frame on; the self test's frame breakdown carries the same line, and
+  `device.reset()` forgets it with the rest of the driver world. Pinned in
+  `tests/test_r253_uniforms.py` (10 tests, 72 checks, registered in
+  `run_all`): the door's rule and its loud errors; the real
+  `draw_fullscreen`, `draw_many` and `dispatch_compute` over a shader that
+  refuses one name; `raster_on_device` sending exactly what its CreateInfo
+  declares; and the demo frame on `tests/fakedevice.installed_gl()` -- the
+  REAL device draw functions over a stand-in driver that strips every push
+  constant a pass never reads and raises Blender's own `ValueError` for it
+  -- which shades on the GPU road bit for bit the frame of a driver that
+  strips nothing, and with the old unconditional set prints the field's
+  two shading lines word for word. A one-off scan put all 121 shipped
+  presets through that driver (the demo frame, the render and the GPU post
+  chain): every one is bitwise the plain fake's, across 775 compiled
+  shaders in 41 pass families, and the only names stripped are the three
+  camera axes, in each of the 356 material shaders. The strict gate
+  (`tests/glsl_strict.py`, glslang 15.1.0) now compiles the compute raster
+  too, as a 4.30 compute shader in all eight variants under the header the
+  CreateInfo writes: 623 sources compile, 15 are refused by name before
+  the driver, none is rejected.
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
@@ -1880,6 +1951,16 @@ What headless cannot prove, per feature (the fakebpy / fakeblender stubs validat
   next pass; an undo from a later step onto the flagged one leaving the
   redo stack intact; a file saved flagged opening whole, in the UI and
   under `-b`.
+- The llvmpipe session itself (Blender 5.2.2, OpenGL backend, Mesa
+  llvmpipe): the three lines gone, `raster split` and `shade split`
+  printed in their place, and the Timing Breakdown naming the stripped
+  uniforms. NOT run in this round -- the stripped-uniform fix is proven
+  on the stand-in driver (`fakedevice.installed_gl`) only. Open on the
+  real one: what a linker strips beyond the names a text never reads (a
+  uniform whose every use is dead code -- the door takes those the same
+  way), whether `uniform_sampler` raises for a stripped sampler on that
+  backend (it is skipped if it does), and a Vulkan session printing no
+  stripped line at all.
 
 ---
 

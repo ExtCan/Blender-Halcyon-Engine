@@ -604,11 +604,19 @@ def _exact_core(cvg=False):
 
 #: compute wrapper: bin ranges per pixel from the tile texture; the driver
 #: runs this one. Images are written, samplers are read -- by texelFetch,
-#: per the note above (the tiles fetch included)
+#: per the note above (the tiles fetch included).
+#:
+#: R253 (field): the shell declared `hal_rtiles_w` / `hal_rtiles_h` and
+#: never read them -- the tiles fetch has taken INTEGER coordinates since
+#: the texelFetch round, so the grid's size reaches the kernel through
+#: nothing. A GL driver strips such a uniform at link time and Blender's
+#: uniform_float then raises for the name: the llvmpipe field log's
+#: 'raster dispatch failed: ValueError: ... uniform hal_rtiles_w not
+#: found', every frame, the whole raster on the CPU. The device skips a
+#: stripped name now (device.set_uniform), and these two are simply gone:
+#: a push constant no variant reads is interface for nobody.
 _COMPUTE_SHELL = """
 uniform sampler2D hal_rtiles;        // per tile: (start, count, 0, 0)
-uniform float hal_rtiles_w;
-uniform float hal_rtiles_h;
 uniform float hal_cull;
 uniform float hal_rw;
 uniform float hal_rh;
@@ -672,6 +680,18 @@ def compute_source(lin=False, clear=False, cvg=False):
         hit = _COMPUTE_CACHE[key] = _exact_core(cvg) + src
     return hit
 
+
+#: the compute kernel's float push constants, in declaration order: the
+#: two data sides, the cull, the frame size, the z grid and the referral
+#: switch, then R251's flat read and encoding family (6) and the jitter
+#: (2) -- 15 in all, 60 of the ~128 bytes. R253 (field): the list is the
+#: CreateInfo's AND the dispatch's, and every name in it is read by every
+#: variant's text (the two tile-grid sizes that were declared and never
+#: read are gone -- see _COMPUTE_SHELL).
+RASTER_FLOATS = ('hal_rc_side', 'hal_rbins_side', 'hal_cull', 'hal_rw',
+                 'hal_rh', 'hal_zsteps', 'hal_refer',
+                 'hal_flat', 'hal_zenc', 'hal_wob', 'hal_wnear',
+                 'hal_wrange', 'hal_wsteps', 'hal_jit', 'hal_jit_key')
 
 COMPUTE_SOURCE = compute_source(False, False, False)
 #: the affine variant: a third image carries the screen-linear
@@ -1111,6 +1131,11 @@ def raster_on_device(mesh, vp, width, height, cull='NONE', snap=0.0,
     constants, 15 floats in all: 60 of the ~128 bytes) and the pre-fill
     dials; `flat_depth` (Painter's, C004) replaces every corner z by the
     polygon's one depth, so the kernel compares whole polygons.
+
+    R253 (field): every push constant below is READ by the kernel in
+    every variant (`RASTER_FLOATS`; pinned by the suite), so a GL driver
+    has nothing to strip -- and one it strips anyway is skipped by the
+    device instead of failing the dispatch.
     """
     import time as _time
 
@@ -1143,14 +1168,7 @@ def raster_on_device(mesh, vp, width, height, cull='NONE', snap=0.0,
         compute_variant_name(want_lin, want_clear, want_cvg),
         compute_source(want_lin, want_clear, want_cvg),
         samplers=samplers,
-        floats=('hal_rc_side', 'hal_rbins_side', 'hal_rtiles_w',
-                'hal_rtiles_h', 'hal_cull', 'hal_rw', 'hal_rh',
-                'hal_zsteps', 'hal_refer',
-                # R251: the flat read and the encoding family (6 more
-                # float push constants), the jitter (2 more): 17 in all,
-                # 68 of the ~128 bytes
-                'hal_flat', 'hal_zenc', 'hal_wob', 'hal_wnear',
-                'hal_wrange', 'hal_wsteps', 'hal_jit', 'hal_jit_key'),
+        floats=RASTER_FLOATS,
         images=images)
     if shader is None:
         return None, err
@@ -1179,7 +1197,6 @@ def raster_on_device(mesh, vp, width, height, cull='NONE', snap=0.0,
             shader, width, height,
             uniforms={'hal_rc_side': float(c_side),
                       'hal_rbins_side': float(b_side),
-                      'hal_rtiles_w': float(tw), 'hal_rtiles_h': float(th),
                       'hal_cull': cull_f,
                       'hal_rw': float(width), 'hal_rh': float(height),
                       # R251: 0.0 under every depth encoding (the key is

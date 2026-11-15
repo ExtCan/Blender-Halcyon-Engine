@@ -71,6 +71,12 @@ def reset():
         bury(obj)
     del _SCREEN_GRAVE[:]
     _STATE['draw_tick'] = 0
+    # the stripped-uniform memory holds its shaders (the id() key's
+    # guarantee): they go the same road, and a new driver world links
+    # its own programs and strips its own names
+    for sh, _names in _STRIPPED.values():
+        bury(sh)
+    _STRIPPED.clear()
 
 
 def probe():
@@ -714,6 +720,106 @@ def _upload_impl(image):
     return tex
 
 
+# ------------------------------------------------ uniforms the driver strips
+#
+# R253 (field): a linked GL program keeps only the uniforms that reach its
+# output. Mesa, llvmpipe and every other GL driver drop the rest at link
+# time, and Blender's GPUShader.uniform_float / uniform_int / uniform_bool
+# raise ValueError for a name the linked program no longer has ('uniform
+# hal_cam_right not found'). Halcyon declares one interface per FAMILY of
+# passes and sets every uniform of it unconditionally -- the camera axes
+# ride every material pass and only a key fixed to the camera reads them --
+# so on the OpenGL backend ONE stripped name failed the whole pass: the
+# compute raster, the blended burst and the per-pass readback each raised,
+# and every frame of the session fell back to the CPU road with the GPU
+# idle. (The field's Vulkan months never printed it: that backend takes a
+# shader's interface from the CreateInfo, not from what a linker kept.) A
+# stripped uniform cannot change a pixel -- that is what stripped means --
+# so its set is skipped and the pass draws. Every uniform of every pass
+# goes through set_uniform below; nothing else under gpu/ calls a
+# GPUShader's uniform_* methods.
+
+#: id(shader) -> (shader, {names the linked program does not have}). The
+#: VALUE holds the shader, so the id() key cannot be recycled while its
+#: entry lives (the batch cache's rule); reset() empties it.
+_STRIPPED = {}
+
+_UNIFORM_SETTERS = {'sampler': 'uniform_sampler', 'bool': 'uniform_bool',
+                    'int': 'uniform_int', 'float': 'uniform_float'}
+
+
+def uniform_was_stripped(exc):
+    """Is `exc` Blender's 'the linked program has no such uniform'?
+
+    Exactly one error is forgiven: the ValueError whose text says the
+    name was NOT FOUND (`GPUShader.uniform_float: uniform hal_rtiles_w
+    not found` -- Blender 5.2's one format, `%s: uniform %.32s not
+    found`, for the float, int and bool setters alike). The name itself
+    is not matched: it is printed through `%.32s`, so a long name
+    arrives cut. A ValueError about the VALUE (a wrong length, a wrong
+    type) says no such thing and stays as loud as it always was, and so
+    does every other exception class.
+    """
+    return isinstance(exc, ValueError) and 'not found' in str(exc).lower()
+
+
+def set_uniform(shader, kind, name, value):
+    """Set ONE uniform on a bound shader; a stripped name is skipped.
+
+    `kind` is 'sampler', 'bool', 'int' or 'float' -- the GPUShader method
+    that takes the value. Returns True when the driver took it and False
+    when the linked program has no such name: the first refusal is
+    remembered per shader (a program's active set never changes after
+    the link), so the driver is asked once and every later draw of that
+    shader skips the name without raising at all. Any other error
+    propagates to the caller exactly as before this function existed.
+    """
+    entry = _STRIPPED.get(id(shader))
+    if entry is not None and name in entry[1]:
+        return False
+    try:
+        getattr(shader, _UNIFORM_SETTERS[kind])(name, value)
+    except ValueError as exc:
+        if not uniform_was_stripped(exc):
+            raise
+        if entry is None:
+            entry = _STRIPPED[id(shader)] = (shader, set())
+        entry[1].add(name)
+        return False
+    return True
+
+
+def stripped_stats():
+    """(uniforms, shaders): the names the driver stripped this session,
+    each counted ONCE per shader however many frames drew it, and the
+    number of shaders that lost at least one."""
+    return (sum(len(names) for _sh, names in _STRIPPED.values()),
+            len(_STRIPPED))
+
+
+def stripped_names():
+    """The distinct stripped names, sorted -- what the breakdown shows."""
+    return sorted({nm for _sh, names in _STRIPPED.values() for nm in names})
+
+
+def stripped_note(limit=6):
+    """The Debug breakdown's line, or '' when the driver kept every
+    uniform it was handed (Vulkan; a GL frame whose passes read all of
+    theirs). The count is per shader, so it is stable from the second
+    frame on: a number that grew every frame would read as a leak."""
+    n, shaders = stripped_stats()
+    if not n:
+        return ''
+    names = stripped_names()
+    shown = ', '.join(names[:max(int(limit), 1)])
+    if len(names) > limit:
+        shown += f' (+{len(names) - limit} more)'
+    return (f"{n} uniform{'' if n == 1 else 's'} stripped by the driver "
+            f"in {shaders} shader{'' if shaders == 1 else 's'} ({shown}): "
+            'a linked program drops what its output never reads; each set '
+            'was skipped and the pass drew')
+
+
 def draw_fullscreen(shader, uniforms, samplers, target, read=True,
                     blend='NONE', clear=False, region=None):
     """Run one full-screen pass. Returns (H,W,4) float32, or None if !read.
@@ -879,17 +985,21 @@ def _draw_in_bound(shader, uniforms, samplers, blend, clear, region=None):
         gpu.state.scissor_test_set(True)
     try:
         shader.bind()
+        # R253 (field): every set goes through set_uniform -- a name the
+        # driver stripped from the linked program is skipped, the pass
+        # draws (the llvmpipe log: one 'hal_cam_right not found' used to
+        # fail the burst AND the per-pass road, and the frame went CPU)
         for k, v in (samplers or {}).items():
-            shader.uniform_sampler(k, v)
+            set_uniform(shader, 'sampler', k, v)
         for k, v in (uniforms or {}).items():
             if isinstance(v, bool):
-                shader.uniform_bool(k, [v])
+                set_uniform(shader, 'bool', k, [v])
             elif isinstance(v, int):
-                shader.uniform_int(k, v)
+                set_uniform(shader, 'int', k, v)
             elif isinstance(v, (tuple, list)):
-                shader.uniform_float(k, v)
+                set_uniform(shader, 'float', k, v)
             else:
-                shader.uniform_float(k, float(v))
+                set_uniform(shader, 'float', k, float(v))
         batch.draw(shader)
     finally:
         gpu.state.blend_set('NONE')
@@ -1016,10 +1126,14 @@ def _dispatch_compute_impl(shader, width, height, uniforms, samplers,
     import gpu
     made = {}
     shader.bind()
+    # R253 (field): the one door (set_uniform) -- a push constant the
+    # driver stripped is skipped and the kernel dispatches. The IMAGES
+    # below stay a plain call: an image is an output, and a kernel
+    # without its output has nothing to read back
     for k, tex in (samplers or {}).items():
-        shader.uniform_sampler(k, tex)
+        set_uniform(shader, 'sampler', k, tex)
     for k, v in (uniforms or {}).items():
-        shader.uniform_float(k, float(v))
+        set_uniform(shader, 'float', k, float(v))
     for k in (images or ()):
         tex = gpu.types.GPUTexture((int(width), int(height)),
                                    format='RGBA32F')

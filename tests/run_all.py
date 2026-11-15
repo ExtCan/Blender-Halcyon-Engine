@@ -48,6 +48,8 @@ def run_tests():
     from . import test_r253_terrain_tool
     # R253 (1.92.0): render presets for the consoles that got shaders
     from . import test_r253_console_presets
+    # R253 (field): a uniform the driver stripped never fails a pass
+    from . import test_r253_uniforms
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -201,6 +203,11 @@ def run_tests():
     print('R253 CONSOLE RENDER PRESETS')
     print('=' * 66)
     rc |= test_r253_console_presets.main()
+    print()
+    print('=' * 66)
+    print('R253 STRIPPED UNIFORMS (A GL DRIVER DROPS WHAT A PASS NEVER READS)')
+    print('=' * 66)
+    rc |= test_r253_uniforms.main()
     return rc
 
 
