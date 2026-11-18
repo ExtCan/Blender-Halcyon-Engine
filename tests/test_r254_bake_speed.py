@@ -1437,7 +1437,8 @@ def test_l_the_gpu_device_bakes_its_maps():
           and not CRA.device_pays(20000, 512)
           and CRA.device_pays(16384, 512)
           and CRA.device_pays(885000, 4096))
-    gate = (CRA.DEPTH_DEVICE_TEXELS_PER_TRI, CRA.DEPTH_DEVICE_MIN_TEXELS)
+    gate = (CRA.DEPTH_DEVICE_TEXELS_PER_TRI, CRA.DEPTH_DEVICE_MIN_TEXELS,
+            CRA.DEPTH_TRIAL_GAIN, CRA.DEPTH_TRIAL_MIN_FILL)
     st_small = _settings(32, render_device='GPU')
     sc_small = _scene(lamps(), st_small)
     LI.clear_shadow_cache()
@@ -1448,12 +1449,16 @@ def test_l_the_gpu_device_bakes_its_maps():
         routed = (dev.compute['dispatches'] == []
                   and len(dev.compute['compiles']) >= 1)
     small_maps = _maps(sc_small)
-    # every check below runs the kernel on the test's small maps
+    # every check below runs the kernel on the test's small maps, and
+    # the trial's clock is off: the "device" here is the GLSL front-end
+    # in NumPy, slower than any fill (the clock has its own check)
     CRA.DEPTH_DEVICE_TEXELS_PER_TRI = CRA.DEPTH_DEVICE_MIN_TEXELS = 0
+    CRA.DEPTH_TRIAL_GAIN, CRA.DEPTH_TRIAL_MIN_FILL = None, 0.0
     try:
         _device_bake_checks(lamps, routed, small_maps, out.getvalue())
     finally:
-        CRA.DEPTH_DEVICE_TEXELS_PER_TRI, CRA.DEPTH_DEVICE_MIN_TEXELS = gate
+        (CRA.DEPTH_DEVICE_TEXELS_PER_TRI, CRA.DEPTH_DEVICE_MIN_TEXELS,
+         CRA.DEPTH_TRIAL_GAIN, CRA.DEPTH_TRIAL_MIN_FILL) = gate
 
 
 def _device_bake_checks(lamps, routed, small_maps, small_said):
@@ -1624,6 +1629,7 @@ def _device_bake_checks(lamps, routed, small_maps, small_said):
           'next and bakes the same maps, with nothing to say',
           [d[3] for d in dev.compute['dispatches']] == ['RGBA32F'] * 2
           and state.get('fmt') == 'RGBA32F' and 'R32F' in state.get('bad', {})
+          and state.get('trial', {}).get('faces') == 2
           and said == [] and _same_maps(_maps(scn), cpu_maps),
           str(state))
     scn, dev, said, state = frame({'compute_formats': ()})
@@ -1686,10 +1692,48 @@ def _device_bake_checks(lamps, routed, small_maps, small_said):
         _maps(scn), cpu_maps) for a, b in zip(x, y))
     check('...while a driver that moves every z by one ulp (a fused '
           'multiply-add) is believed: its maps are used as they are',
-          said == [] and state.get('checked') == 'R32F'
+          said == [] and not state.get('dead')
+          and state.get('trial', {}).get('faces') == 2
           and len(dev.compute['dispatches']) == 2
           and not _same_maps(_maps(scn), cpu_maps) and worst < 1e-3,
           f'worst linear depth difference {worst:.2e} world units')
+
+    # the trial's clock: a device that is no faster than the fill is
+    # switched off by name once two timed maps are in (here the "device"
+    # is the front-end in NumPy; in real Blender it was llvmpipe)
+    CRA.DEPTH_TRIAL_GAIN = 0.5
+    try:
+        s = gpu_settings()
+        scn = _scene([_lamp('POINT')], s)
+        LI.clear_shadow_cache()
+        out = io.StringIO()
+        with fakedevice.installed(compute=True) as dev:
+            with contextlib.redirect_stdout(out):
+                np.asarray(R.render(scn, s))
+                state = dict(DV._STATE.get('depth_bake', {}))
+                np.asarray(R.render(scn, s))
+            n_disp = len(dev.compute['dispatches'])
+        said = [ln for ln in out.getvalue().splitlines()
+                if ln.startswith('[Halcyon GPU] shadow')
+                and 'on the CPU' in ln]
+        st_p = _settings(32)
+        sc_p = _scene([_lamp('POINT')], st_p)
+        _cold(sc_p, st_p)
+        check('a device that bakes no faster than the CPU fills is off '
+              'after its trial -- a warm-up and two timed maps, three '
+              'dispatches -- by name; the rest of the cube is the fill\'s, '
+              'the map is the CPU bake\'s and the next frame says it once',
+              n_disp == 3 and state.get('checked') == 'R32F'
+              and 'no faster than the CPU fills it' in str(state.get('dead'))
+              and state['trial']['timed'] == 2 and len(said) == 2
+              and 'shadow bake on the CPU: the device bakes a map no '
+              'faster' in said[0]
+              and 'shadow maps bake on the CPU this session' in said[1]
+              and _same_maps(_maps(scn), _maps(sc_p)),
+              f'{n_disp} dispatches; {said[:1]}')
+    finally:
+        CRA.DEPTH_TRIAL_GAIN = None
+    CRA._DEPTH_SAID.clear()
 
     # texels on an edge: marked by the kernel, decided by the host
     def quad(a, b, size=32):

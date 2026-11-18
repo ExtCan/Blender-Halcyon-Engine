@@ -1438,13 +1438,27 @@ DEPTH_FRAGILE = 2e30
 #: the image formats the bake's one image is tried in, in order
 DEPTH_FORMATS = ('R32F', 'RGBA32F')
 
-#: the first device bake of a session is compared with the CPU bake of
-#: the same face: more texels than this share of the map further apart
+#: THE TRIAL. The first device bakes of a session are each compared with
+#: the CPU bake of the same face, texel for texel and on the clock.
+#: Texels: more of them than DEPTH_CHECK_SHARE of the map further apart
 #: than DEPTH_CHECK_TOL in NDC z and the device bakes no map this session
 #: (a driver's fused multiply-add moves a z by an ulp, about 1e-7; a wrong
-#: winner moves it by the distance between two surfaces)
+#: winner moves it by the distance between two surfaces). Clock: the
+#: first dispatch is a warm-up and is not timed; of the following faces,
+#: those whose CPU fill takes at least DEPTH_TRIAL_MIN_FILL seconds are,
+#: and once DEPTH_TRIAL_TIMED of them are in the device must have taken
+#: at most DEPTH_TRIAL_GAIN of the fill's time (upload, dispatch, read
+#: and replay against the fill alone, both in line) -- or it bakes no
+#: map this session, by name: a software rasteriser (llvmpipe: 162 ms
+#: against 60) or a GPU slower than this CPU's fill stays off the road it
+#: would slow down. The trial ends there, or after DEPTH_TRIAL_FACES
+#: faces whatever was timed. DEPTH_TRIAL_GAIN None switches the clock off
 DEPTH_CHECK_TOL = 1e-5
 DEPTH_CHECK_SHARE = 1e-4
+DEPTH_TRIAL_TIMED = 2
+DEPTH_TRIAL_FACES = 12
+DEPTH_TRIAL_MIN_FILL = 0.010
+DEPTH_TRIAL_GAIN = 0.5
 
 _DEPTH_TEXEL = """
 // R254: what the shadow-map bake keeps of a pixel: the winner's z, 1e30
@@ -1764,11 +1778,11 @@ def dispatch_depth(front, packed, size, cull='NONE', check=None):
     A failure of the driver (a compile, a dispatch, a read) retires that
     image format for the session and the next one is tried; with none
     left the device bake is off for the session (`dead`). A face whose
-    marks exceed the referral budget is refused alone. The first face a
-    session bakes in a format is compared with the CPU's bake of it --
-    `check()` returns that plane -- under DEPTH_CHECK_TOL /
-    DEPTH_CHECK_SHARE: a device that does not reproduce it bakes
-    nothing."""
+    marks exceed the referral budget is refused alone. The first faces a
+    session bakes in a format are its TRIAL (see DEPTH_CHECK_TOL): each
+    is compared with the CPU's bake of it -- `check()` returns that
+    plane -- and a device that does not reproduce it, or does not bake
+    faster than the fill, bakes nothing more."""
     import time as _time
 
     from . import device
@@ -1817,8 +1831,14 @@ def dispatch_depth(front, packed, size, cull='NONE', check=None):
     t_host = _time.perf_counter() - t0
     if state.get('checked') != fmt and check is not None:
         # trust nothing a driver has not shown: this face, once more on
-        # the CPU. A device that reproduces it is believed from here on
+        # the CPU, texel for texel and on the clock
+        trial = state.get('trial')
+        if trial is None or trial.get('fmt') != fmt:
+            trial = state['trial'] = {'fmt': fmt, 'faces': 0, 'timed': 0,
+                                      'dev': 0.0, 'cpu': 0.0}
+        t0 = _time.perf_counter()
         ref = check()
+        t_fill = _time.perf_counter() - t0
         with np.errstate(invalid='ignore'):
             far = ~(np.abs(np.asarray(ref, np.float32)
                            - np.asarray(plane, np.float32))
@@ -1827,9 +1847,25 @@ def dispatch_depth(front, packed, size, cull='NONE', check=None):
         if bad > DEPTH_CHECK_SHARE * size * size:
             state['dead'] = (f"the device's depth bake differs from the "
                              f"CPU's at {bad} of {size * size} texels of "
-                             'its first map')
+                             'a trial map')
             return None, state['dead']
-        state['checked'] = fmt
+        trial['faces'] += 1
+        if trial['faces'] > 1 and t_fill >= DEPTH_TRIAL_MIN_FILL:
+            trial['timed'] += 1
+            trial['dev'] += t_up + t_run + t_host
+            trial['cpu'] += t_fill
+        if trial['timed'] >= DEPTH_TRIAL_TIMED \
+                or trial['faces'] >= DEPTH_TRIAL_FACES:
+            state['checked'] = fmt
+            if DEPTH_TRIAL_GAIN is not None and trial['timed'] \
+                    and trial['dev'] > DEPTH_TRIAL_GAIN * trial['cpu']:
+                # this face is good (it was just compared); the next
+                # ones are the fill's
+                state['dead'] = (
+                    'the device bakes a map no faster than the CPU fills '
+                    f"it ({trial['dev'] * 1e3:.0f} ms against "
+                    f"{trial['cpu'] * 1e3:.0f} ms over {trial['timed']} "
+                    'maps)')
     dd = dict(getattr(device, 'LAST_DISPATCH', None) or {})
     LAST_DEPTH['faces'] = LAST_DEPTH.get('faces', 0) + 1
     LAST_DEPTH['replayed'] = LAST_DEPTH.get('replayed', 0) + n_mark
