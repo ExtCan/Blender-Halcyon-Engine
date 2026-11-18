@@ -195,6 +195,17 @@ def _cam_uniforms(job):
             'hal_cam_back': tuple(float(v) for v in b)}
 
 
+def _lobe_vote(job, mat):
+    """The material's own lobe vote (ShadeJob.lobe_rank) for a
+    closure_to_surface call made here: the probe and the normal
+    pre-passes are batches too, and what they bake or bend must be what
+    every batch of the frame shades with."""
+    fn = getattr(job, 'lobe_rank', None)
+    if fn is None or mat is None:
+        return None
+    return lambda: fn(mat)
+
+
 def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
                     secondary=False):
     """Run the CPU's own closure path on real fragments of material `mi`.
@@ -296,7 +307,11 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
                 # shelf round): a lone GLOSSY lobe's colour chain IS
                 # the specular colour -- closure_to_surface puts it in
                 # surf.specular -- so the pass routes the emitted chain
-                # to s.specular and bakes the untouched flat diffuse.
+                # to s.specular and bakes the CPU's own flat diffuse:
+                # with no DIFFUSE lobe that is the no-diffuse surface
+                # (white at level 0, ambient 0 -- closure_to_surface's
+                # per-pixel rule, read here through the probe; it was
+                # the material's fallback colour, fully lit).
                 # With a DIFFUSE lobe alongside (the Specular BSDF's
                 # spec/gloss pair), the emitted chain is the DIFFUSE
                 # lobe's own colour and stays in its slot; the glossy
@@ -329,7 +344,8 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
                                 'missing; the material shades on the '
                                 'CPU')
 
-    surf, model, nrm = closure_to_surface(cl, ctx, st, mat)
+    surf, model, nrm = closure_to_surface(cl, ctx, st, mat,
+                                          _lobe_vote(job, mat))
     if nrm is not None:
         # a bent normal qualifies exactly when the frame shader will bend
         # it identically: the master node's Normal chain, which the
@@ -3359,7 +3375,8 @@ def _ray_context(job, gbuf, py, px):
         ev = GraphEvaluator(graph, sub, job.textures,
                             getattr(mat, 'programs', None))
         cl, _disp = ev.evaluate_surface()
-        _surf, _model, nrm = closure_to_surface(cl, sub, job.settings, mat)
+        _surf, _model, nrm = closure_to_surface(cl, sub, job.settings, mat,
+                                                _lobe_vote(job, mat))
         if nrm is not None:
             N[sel] = M.normalize(nrm)
     return ctx, N
@@ -3416,7 +3433,7 @@ def _ray_blocks(job, gbuf, mats):
                 if ev is not None and master_normal_linked(graph):
                     cl, _disp = ev.evaluate_surface()
                     _surf, _model, nrm = closure_to_surface(
-                        cl, ctx, job.settings, mat)
+                        cl, ctx, job.settings, mat, _lobe_vote(job, mat))
                     if nrm is not None:
                         N = M.normalize(nrm)
                 blk = (py, px, np.asarray(ctx.P), np.asarray(ctx.I), N)
@@ -4386,7 +4403,8 @@ def _hit_surface(job, tris, bary):
         ev = GraphEvaluator(graph, sub, job.textures,
                             getattr(mat, 'programs', None))
         cl, _disp = ev.evaluate_surface()
-        _surf, _model, nrm = closure_to_surface(cl, sub, job.settings, mat)
+        _surf, _model, nrm = closure_to_surface(cl, sub, job.settings, mat,
+                                                _lobe_vote(job, mat))
         if nrm is not None:
             N[sel] = M.normalize(nrm)
     return np.asarray(ctx.P), np.asarray(ctx.I), N, m
