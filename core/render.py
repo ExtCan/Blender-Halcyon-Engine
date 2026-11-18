@@ -370,12 +370,56 @@ def prepare_textures(scene, settings):
 # ----------------------------------------------------------- closure resolve
 
 
-def closure_to_surface(cl, ctx, settings, material=None):
+def closure_rank(cl, n, area=None):
+    """The mean weights that name a mixed closure's UNBLENDABLE picks.
+
+    A mix of master shaders blends its numbers per pixel, but the model,
+    the normal's carrier, the Faceted flag and the python extras (ramps,
+    the BI kit) cannot blend: the heaviest master lobe names them, and a
+    plain glossy side heavier than every master outvotes the model.
+    This is the summary those votes read -- {'masters': the mean weight
+    of each master lobe in closure order, 'spec': the plain glossy
+    side's, 'hw': the masters' clipped sum's} -- over whatever `n`
+    points `cl` was evaluated on, each point counted by `area` when one
+    is given. `ShadeJob.lobe_rank` evaluates it ONCE per material over
+    the material's own surface."""
+    if area is None:
+        def mean(x):
+            return float(np.mean(x))
+    else:
+        a = np.asarray(area, np.float64).reshape(-1)
+        total = float(a.sum())
+
+        def mean(x):
+            return float((np.asarray(x, np.float64) * a).sum() / total)
+    masters = []
+    spec_w = np.zeros(n, np.float32)
+    wsum = np.zeros(n, np.float32)
+    for kind, w, _p in getattr(cl, 'items', None) or ():
+        w = np.clip(np.asarray(w, np.float32).reshape(-1), 0.0, None)
+        if w.shape[0] != n:
+            w = np.broadcast_to(w, (n,)).copy()
+        if kind == 'HALCYON':
+            masters.append(mean(w))
+            wsum += w
+        elif kind == 'GLOSSY':
+            spec_w += w
+        elif kind in ('GLASS', 'REFRACTION'):
+            spec_w += w * 0.5
+    return {'masters': tuple(masters), 'spec': mean(spec_w),
+            'hw': mean(np.clip(wsum, 0.0, 1.0))}
+
+
+def closure_to_surface(cl, ctx, settings, material=None, rank=None):
     """Collapse a node-graph closure into one reflectance model + parameters.
 
     Cycles-style closures are additive lobes; a 1990s renderer has one shader
     with a diffuse and a specular term. This is the honest translation: sum the
     weighted lobes into those slots and pick the model the tree implies.
+
+    `rank` (a `closure_rank` dict, or a callable returning one or None)
+    is the per-MATERIAL vote behind the picks that cannot blend; without
+    one the batch's own mean weights vote, as they always did.
     """
     n = ctx.n
     surf = SH.Surface(n)
@@ -435,6 +479,10 @@ def closure_to_surface(cl, ctx, settings, material=None):
     refr_col = np.zeros((n, 3), np.float32)
     rough_acc = np.zeros(n, np.float32)
     rough_w = np.zeros(n, np.float32)
+    # the weight that ANSWERS THE AMBIENT POOL: the diffuse lobes, and a
+    # Translucent at its WHOLE weight (diff_w takes half of it -- the
+    # other half lights from behind -- but both halves answer the pool)
+    amb_w = np.zeros(n, np.float32)
     normal = None
     halcyon = []          # (weight, params) -- EVERY master lobe, weighted.
     # It was one slot, last-wins, weight DISCARDED: mixing two Halcyon
@@ -459,6 +507,7 @@ def closure_to_surface(cl, ctx, settings, material=None):
         if kind == 'DIFFUSE':
             diff += rgb * w[:, None]
             diff_w += w
+            amb_w += w
             diff_model = p.get('model', diff_model)
             r = p.get('roughness')
             if r is not None:
@@ -495,6 +544,7 @@ def closure_to_surface(cl, ctx, settings, material=None):
             surf.translucency = np.maximum(surf.translucency, w)
             diff += rgb * w[:, None] * 0.5
             diff_w += w * 0.5
+            amb_w += w
         elif kind == 'HOLDOUT':
             transp += w
 
@@ -680,24 +730,44 @@ def closure_to_surface(cl, ctx, settings, material=None):
         # default so a master glass at IOR 1.6 keeps bending at 1.6.
         if not any(hp.get('ray_ior') is not None for _w, hp in halcyon):
             surf.ray_ior = np.asarray(surf.ior, np.float32).copy()
+        # WHAT CANNOT BLEND -- the model, the python extras (ramp specs,
+        # the light group), the normal's carrier, the Faceted flag -- is
+        # named by the HEAVIEST lobe. "Heaviest" was the mean weight
+        # over the BATCH, so two masters mixed by a mask shaded each
+        # chunk, pool band and render region with whichever side filled
+        # it (Phong against Toon on the demo Ball, three bands at
+        # 640x480: 3089 pixels up to 1.51 off the in-process frame). The
+        # vote is the MATERIAL's now: `rank` carries the mean weights
+        # over the material's own surface (ShadeJob.lobe_rank), one
+        # answer per frame whatever the batch. Without one (a bare call,
+        # Shader to RGB) the batch votes as before.
+        votes = None
+        if rank is not None and (len(halcyon) > 1 or gloss_model is not None):
+            votes = rank() if callable(rank) else rank
+            if votes is not None and \
+                    len(votes.get('masters', ())) != len(halcyon):
+                votes = None        # another closure's shape: not ours
+        lobe_w = list(votes['masters']) if votes is not None else \
+            [float(np.mean(hwl)) for hwl, _p in halcyon]
+
+        def heaviest(having=None):
+            idx = [i for i in range(len(halcyon))
+                   if having is None or halcyon[i][1].get(having) is not None]
+            return halcyon[max(idx, key=lambda i: lobe_w[i])] if idx else None
+
+        heavy = heaviest()
         # the non-numeric extras (ramp specs, light group) ride one
         # python object; the HEAVIEST closure names it, like the model
         if any(hp.get('bi_extras') is not None for _w, hp in halcyon):
-            surf.bi = max(halcyon,
-                          key=lambda t: float(np.mean(t[0])))[1].get(
-                              'bi_extras')
+            surf.bi = heavy[1].get('bi_extras')
         # R221: the baked Shadow Ramp rides the same one-object idiom
         if any(hp.get('anime_extras') is not None for _w, hp in halcyon):
-            surf.anime_ramp = max(
-                halcyon, key=lambda t: float(np.mean(t[0])))[1].get(
-                    'anime_extras')
+            surf.anime_ramp = heavy[1].get('anime_extras')
         # the model cannot blend: the HEAVIEST lobe names it, deterministic
-        heavy = max(halcyon, key=lambda t: float(np.mean(t[0])))
         model = heavy[1].get('model', model)
-        carriers = [(hwl, hp) for hwl, hp in halcyon
-                    if hp.get('normal') is not None]
-        if carriers:
-            _w_, p = max(carriers, key=lambda t: float(np.mean(t[0])))
+        carrier = heaviest('normal')
+        if carrier is not None:
+            _w_, p = carrier
             normal = p['normal']
             # Bump Strength scales how far the supplied normal is allowed to
             # bend away from the surface it sits on. Done here rather than in
@@ -719,53 +789,106 @@ def closure_to_surface(cl, ctx, settings, material=None):
         # albedos blend by relative weight, levels sum toward 1, the era
         # terms that only a master carries fade with its share, and the
         # transparent side eats into opacity exactly as Fac says
-        others = np.any(diff_w > 1e-6) or np.any(spec_w > 1e-6) or \
-            np.any(transp > 1e-6) or np.any(emis != 0.0) or \
-            np.any(refr > 1e-6) or np.any(plain_transl > 1e-6)
-        if others:
-            if np.any(diff_w > 1e-6):
-                t = diff_w / np.maximum(hw + diff_w, 1e-6)
-                pd = diff / np.maximum(diff_w, 1e-6)[:, None]
-                surf.diffuse = surf.diffuse * (1.0 - t)[:, None] \
-                    + pd * t[:, None]
-                surf.diffuse_level = np.clip(
-                    surf.diffuse_level * hw + diff_w, 0.0, 1.0)
-            else:
-                surf.diffuse_level = surf.diffuse_level * hw
-            if np.any(spec_w > 1e-6):
-                t = spec_w / np.maximum(hw + spec_w, 1e-6)
-                ps = spec / np.maximum(spec_w, 1e-6)[:, None]
-                surf.specular = surf.specular * (1.0 - t)[:, None] \
-                    + ps * t[:, None]
-                surf.specular_level = np.clip(
-                    surf.specular_level * hw + spec_w, 0.0, 1.0)
-            else:
-                surf.specular_level = surf.specular_level * hw
-            if np.any(rough_w > 1e-6):
-                t = rough_w / np.maximum(hw + rough_w, 1e-6)
-                rp = np.clip(rough_acc / np.maximum(rough_w, 1e-6), 0.0, 1.0)
-                gp = np.minimum(np.maximum(
-                    2.0 / np.maximum(rp ** 4, 1e-5) - 2.0, 0.5), 8192.0)
-                surf.roughness = np.clip(
-                    surf.roughness * (1.0 - t) + rp * t, 0.0, 1.0)
-                surf.glossiness = surf.glossiness * (1.0 - t) + gp * t
-            surf.emission = surf.emission * hw[:, None] + emis
-            surf.opacity = np.clip(
-                1.0 - transp - (1.0 - surf.opacity) * hw, 0.0, 1.0)
-            surf.reflect = np.clip(surf.reflect * hw + refr, 0.0, 1.0)
-            surf.translucency = np.maximum(surf.translucency * hw,
-                                           plain_transl)
-            surf.ambient = 1.0 + (surf.ambient - 1.0) * hw
-            surf.edge_opacity = 1.0 + (surf.edge_opacity - 1.0) * hw
+        #
+        # PER PIXEL, like the plain branch below: `other` is the pixel's
+        # OWN plain weight. The whole block ran when ANY pixel of the
+        # batch carried one, and its inner tests were `np.any` too, so a
+        # pure-master pixel was re-derived (its opacity through 1 - (1 -
+        # o), its Reflection and -- beside a plain diffuse or glossy
+        # pixel -- its levels clipped at 1) or left alone depending on
+        # its batch: a master at Specular Level 2 mixed with a Glossy
+        # BSDF by a mask cut its highlight in half wherever a band or a
+        # chunk held a glossy pixel. A pixel with no plain weight is the
+        # master alone now, bit for bit; a mixed pixel keeps the
+        # arithmetic it had.
+        d_px = diff_w > 1e-6
+        s_px = spec_w > 1e-6
+        r_px = rough_w > 1e-6
+        other = d_px | s_px | (transp > 1e-6) | np.any(emis != 0.0, axis=1) \
+            | (refr > 1e-6) | (plain_transl > 1e-6)
+        if np.any(other):
+            def _mixed(value, pure, mask=other):
+                value = np.asarray(value, np.float32)
+                m = mask if value.ndim == 1 else mask[:, None]
+                return np.where(m, value, pure).astype(np.float32)
+
+            t = diff_w / np.maximum(hw + diff_w, 1e-6)
+            pd = diff / np.maximum(diff_w, 1e-6)[:, None]
+            dif_mix = _mixed(surf.diffuse * (1.0 - t)[:, None]
+                             + pd * t[:, None], surf.diffuse, d_px)
+            lvl_mix = _mixed(np.clip(surf.diffuse_level * hw + diff_w,
+                                     0.0, 1.0),
+                             surf.diffuse_level * hw, d_px)
+            t = spec_w / np.maximum(hw + spec_w, 1e-6)
+            ps = spec / np.maximum(spec_w, 1e-6)[:, None]
+            spc_mix = _mixed(surf.specular * (1.0 - t)[:, None]
+                             + ps * t[:, None], surf.specular, s_px)
+            slv_mix = _mixed(np.clip(surf.specular_level * hw + spec_w,
+                                     0.0, 1.0),
+                             surf.specular_level * hw, s_px)
+            t = rough_w / np.maximum(hw + rough_w, 1e-6)
+            rp = np.clip(rough_acc / np.maximum(rough_w, 1e-6), 0.0, 1.0)
+            gp = np.minimum(np.maximum(
+                2.0 / np.maximum(rp ** 4, 1e-5) - 2.0, 0.5), 8192.0)
+            rgh_mix = _mixed(np.clip(surf.roughness * (1.0 - t) + rp * t,
+                                     0.0, 1.0), surf.roughness, r_px)
+            gls_mix = _mixed(surf.glossiness * (1.0 - t) + gp * t,
+                             surf.glossiness, r_px)
+            # the ambient level: the master's by its share, 1.0 for the
+            # rest -- LESS the opaque plain share that is not diffuse
+            # (an Emission, a Glossy, a Glass: no lobe there answers the
+            # ambient pool; it counted as a diffuse at ambient 1.0, so
+            # the master's colour kept its whole ambient term right up
+            # to Fac 1 and dropped it there). A Diffuse, a Translucent
+            # and the Transparent share take nothing away (float noise
+            # under 1e-6 is no share), so those mixes hold bit for bit.
+            nd = (1.0 - hw - transp - amb_w).astype(np.float32)
+            nd = np.where(nd > 1e-6, nd, np.float32(0.0)).astype(np.float32)
+            amb_mix = (1.0 + (surf.ambient - 1.0) * hw) - nd
+            # no master weight and no plain diffuse: NO diffuse response
+            # at all, the plain branch's rule -- level 0 already (the
+            # share is 0), no ambient, and the white albedo the corner
+            # road's `light x albedo` needs (the weighted colour is
+            # black there, which wiped the glow of a master mixed with
+            # an Emission by a mask at the vertex and face rates)
+            bare = (hw <= 1e-6) & ~d_px
+            dif_mix = np.where(bare[:, None], np.float32(1.0),
+                               dif_mix).astype(np.float32)
+            amb_mix = np.where(bare, np.float32(0.0),
+                               amb_mix).astype(np.float32)
+            surf.diffuse = _mixed(dif_mix, surf.diffuse)
+            surf.diffuse_level = _mixed(lvl_mix, surf.diffuse_level)
+            surf.specular = _mixed(spc_mix, surf.specular)
+            surf.specular_level = _mixed(slv_mix, surf.specular_level)
+            surf.roughness = _mixed(rgh_mix, surf.roughness)
+            surf.glossiness = _mixed(gls_mix, surf.glossiness)
+            surf.emission = _mixed(surf.emission * hw[:, None] + emis,
+                                   surf.emission)
+            surf.opacity = _mixed(np.clip(
+                1.0 - transp - (1.0 - surf.opacity) * hw, 0.0, 1.0),
+                surf.opacity)
+            surf.reflect = _mixed(np.clip(surf.reflect * hw + refr,
+                                          0.0, 1.0), surf.reflect)
+            surf.translucency = _mixed(
+                np.maximum(surf.translucency * hw, plain_transl),
+                surf.translucency)
+            surf.ambient = _mixed(amb_mix, surf.ambient)
+            surf.edge_opacity = _mixed(
+                1.0 + (surf.edge_opacity - 1.0) * hw, surf.edge_opacity)
             for a_ in ('fresnel', 'rim', 'matcap_blend', 'sheen',
                        'backface_mix'):
-                setattr(surf, a_, getattr(surf, a_) * hw)
+                setattr(surf, a_, _mixed(getattr(surf, a_) * hw,
+                                         getattr(surf, a_)))
             # a plain gloss side heavier than every master lobe also
-            # outvotes the model
-            if np.any(spec_w > 1e-6) and \
+            # outvotes the model (the batch's own vote; the material's
+            # is cast below, whatever this batch holds)
+            if votes is None and np.any(spec_w > 1e-6) and \
                     float(np.mean(spec_w)) > float(np.mean(hw)) and \
                     gloss_model is not None:
                 model = gloss_model
+        if votes is not None and gloss_model is not None and \
+                votes['spec'] > votes['hw']:
+            model = gloss_model
     else:
         # EVERY slot is decided PER PIXEL, from that pixel's own lobe
         # weights. These read `np.any(...)` over the batch, so one
@@ -798,8 +921,22 @@ def closure_to_surface(cl, ctx, settings, material=None):
             has_d[:, None], diff / np.maximum(diff_w, 1e-6)[:, None],
             np.float32(1.0)).astype(np.float32)
         surf.diffuse_level = np.clip(diff_w, 0.0, 1.0)
-        surf.ambient = np.where(has_d, surf.ambient,
-                                np.float32(0.0)).astype(np.float32)
+        # ...and WITH a diffuse weight the ambient level carries the
+        # diffuse SHARE of the pixel's covered surface: the weight that
+        # answers the pool over the coverage (1 - the Transparent
+        # share). A lobe at any weight above zero kept the whole ambient
+        # term, so a Fac running up to 1 dropped the lobe's colour times
+        # the pool where it arrived; the share fades it out with the
+        # lobe. A share within float noise of the whole IS the whole, so
+        # a Diffuse, a Translucent, a Principled at Metallic 0 and any
+        # of them mixed with a Transparent alone keep their ambient bit
+        # for bit.
+        share = amb_w / np.maximum(1.0 - transp, 1e-6)
+        part = has_d & (share < 1.0 - 1e-6)
+        surf.ambient = np.where(
+            has_d, np.where(part, surf.ambient * np.clip(share, 0.0, 1.0),
+                            surf.ambient),
+            np.float32(0.0)).astype(np.float32)
         # the specular side had the same shape: level 0 without a glossy
         # weight (it always was), the colour the material's own there
         has_s = spec_w > 1e-6
@@ -3540,6 +3677,65 @@ class ShadeJob:
             alpha = np.ones_like(alpha)
         return alpha
 
+    #: how many of a material's triangles the lobe vote reads (their
+    #: centroids, evenly spaced through the material's own triangle list)
+    RANK_SAMPLES = 64
+
+    def lobe_rank(self, mat):
+        """The mean lobe weights of `mat` over ITS OWN SURFACE: the vote
+        behind a mixed material's unblendable picks (closure_rank).
+
+        One answer per material per frame -- a function of the scene
+        alone, never of which pixels a chunk, a band, a region or the
+        deferred probe happens to hold, so every batch of the material
+        shades with the same model, normal carrier and extras. Read at
+        the centroids of up to RANK_SAMPLES of the material's triangles
+        through the job's own context and evaluator, each counted by its
+        triangle's area (a UV sphere's polar slivers are no share of its
+        surface). None (the batch votes, as before) for a graph-less
+        material, one with no triangle, or a graph that will not
+        evaluate there."""
+        if mat is None or not getattr(mat, 'graph', None):
+            return None
+        cache = self.__dict__.setdefault('_lobe_rank', {})
+        hit = cache.get(id(mat))
+        if hit is not None:
+            return hit[1]
+        rank = None
+        try:
+            mats = list(self.scene.materials or [])
+            mi = next((i for i, m in enumerate(mats) if m is mat), None)
+            mesh = self.scene.mesh
+            if mi is not None and mesh is not None:
+                idx = getattr(mesh, 'mat_index', None)
+                tris = np.arange(int(mesh.tris.shape[0]), dtype=np.int64) \
+                    if idx is None else np.nonzero(np.asarray(idx) == mi)[0]
+                if tris.size:
+                    k = int(min(tris.size, self.RANK_SAMPLES))
+                    pick = tris[np.linspace(0, tris.size - 1, k)
+                                .astype(np.int64)]
+                    bary = np.full((k, 3), 1.0 / 3.0, np.float32)
+                    ctx = self.context(pick, bary, None, None,
+                                       np.ones(k, bool), None, 0, True)
+                    ev = GraphEvaluator(mat.graph, ctx, self.textures,
+                                        mat.programs)
+                    cl, _disp = ev.evaluate_surface()
+                    v = np.asarray(mesh.verts, np.float64)[
+                        np.asarray(mesh.tris)[pick]]
+                    area = 0.5 * np.linalg.norm(np.cross(
+                        v[:, 1] - v[:, 0], v[:, 2] - v[:, 0]), axis=1)
+                    if not float(area.sum()) > 0.0:
+                        area = np.ones(k, np.float64)
+                    rank = closure_rank(cl, k, area)
+        except Exception as exc:                                # noqa: BLE001
+            print(f"[Halcyon] '{getattr(mat, 'name', '?')}': the lobe vote "
+                  f"could not be read over the material's surface "
+                  f"({type(exc).__name__}: {exc}); each batch votes for "
+                  f"itself")
+            rank = None
+        cache[id(mat)] = (mat, rank)
+        return rank
+
     def shade_batch(self, ctx, mat, ray_depth=0, rng=None):
         st = self.settings
         n = ctx.n
@@ -3560,12 +3756,13 @@ class ShadeJob:
             cl, disp = ev.evaluate_surface()
             self.unsupported.update(ev.unsupported)
             discard = ev.cache.get('__discard')
+        vote = (lambda: self.lobe_rank(mat)) if mat is not None else None
         if mat is not None and mat.shadeless:
-            surf, model, nrm = closure_to_surface(cl, ctx, st, mat)
+            surf, model, nrm = closure_to_surface(cl, ctx, st, mat, vote)
             rgb = surf.diffuse * surf.diffuse_level[:, None] + surf.emission
             return np.concatenate([rgb, surf.opacity[:, None]], 1).astype(np.float32)
 
-        surf, model, nrm = closure_to_surface(cl, ctx, st, mat)
+        surf, model, nrm = closure_to_surface(cl, ctx, st, mat, vote)
         # Gouraud/flat split (see _shade_interpolated): hardware of the
         # period interpolated the LIGHTING between vertices and still
         # sampled the TEXTURE at every pixel -- `texel x vertex colour`,
