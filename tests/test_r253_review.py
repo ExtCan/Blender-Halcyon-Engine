@@ -57,7 +57,8 @@ pinned where it bit.
     into its colour chain and drew it as the albedo -- qualified, 1.69
     apart. `core/nodeeval.link_closure` reads Blender's implicit
     conversion (an Emission of it, bitwise the explicit node) and
-    `gpu/shade._probe_material` refuses that lobe BY NAME.
+    `gpu/shade._probe_material` refuses that lobe BY NAME beside another
+    kind of lobe (alone it is drawn: item 21).
 (14) A Coded Shader with a Text assigned ran TWO shaders: the exporter
     compiled the Text for the program (the CPU's truth) and copied the
     raw inline `source_text` -- the starter shader `init` leaves there --
@@ -130,6 +131,39 @@ pinned where it bit.
     an output) and a misspelled input (nothing was ever warned of, so the
     node's warning box could not show a line). The counts and the widths
     are compile errors with a line; the rest run as written.
+(21) A master shader INSIDE a node group ignored its linked Bump Height:
+    the surface drew with no bump at all. The socket is sugar that
+    `core/nodeeval.desugar_master_bump` rewrites into a real Bump node at
+    the top of every render, and the rewrite walked the material's own
+    tree only; nothing else reads the socket. It enters every group now,
+    to any depth, and puts the synthesized Bump into the tree its master
+    sits in, under that tree's path (`nodeeval.synth_bump_id`:
+    'Group/__bump_Halcyon'), so the node shades in the group's own
+    evaluator, two instances of one group keep a Bump each, and the Bump
+    pre-pass of (18) files its field like any other.
+(22) The frame pass emits ONE colour chain, and a surface that is light
+    alone -- a colour wired straight into Surface, an Emission node, a
+    Mix / Add Shader of those -- refused the deferred plan by name. THE
+    EMISSION SLOT ROUTING: when every lobe of the closure is an EMISSION
+    the probe grants `bake['__slot'] = 'emission'`, the pass adds the
+    chain where `light_surface` adds `surf.emission` and bakes the flat
+    diffuse, and the simulator frame is the CPU frame. Structural (every
+    lobe, whatever its weight), on the proven nodes only
+    (`gpu/material.EMISSION_ROUTE_NODES`; a Max blend refuses by name),
+    with a bare shader socket emitting no light. Found on the way: a
+    ROUTED chain's alpha is not the texel alpha the decal combines read
+    -- the specular route drew 0.48 off under them.
+(23) A Coded Shader in a WORLD's node tree drew a black sky. The world
+    export handed `serialize_tree` a dict literal for the programs and
+    kept no reference to it, `core/scene.World` had no field for them and
+    `core/render.world_color` built its evaluator over an empty dict:
+    `n_halcyon_code` found no program and answered zeros, with no warning,
+    on both devices (the GPU sky pass refuses every world graph but a lone
+    Background by name, so its sky is the CPU's). The programs ride the
+    World now (`programs`, beside `ground_programs`), under the graph ids
+    `serialize_tree` writes, and the world evaluator is handed them; a
+    node group in the world tree finds its own by path. The shader's
+    inputs read the world evaluator's context, as every node there does.
 """
 import io
 import os
@@ -2097,23 +2131,30 @@ def test_code_node_non_ascii_name_reaches_the_gpu():
           str(sorted(calls(GE._code_tag))))
 
 
-def _bump_chain(tree, scale=None, normal=None, tag=''):
-    """The height chain of the group-Bump probe, in `tree`: Gradient Texture
-    (QUADRATIC_SPHERE) -> Math MULTIPLY -> Bump, a dome that bends the whole
-    floor. The multiplier is 6.0, or the output socket `scale`; the Bump's
-    Normal takes the output socket `normal`. `tag` ends the three names (a
-    second chain in one tree). Returns the Bump."""
+def _height_chain(tree, scale=None, tag=''):
+    """The height of the group-Bump probes, in `tree`: Gradient Texture
+    (QUADRATIC_SPHERE) -> Math MULTIPLY, a dome over the whole floor. The
+    multiplier is 6.0, or the output socket `scale`; `tag` ends the two
+    names (a second chain in one tree). Returns the Math node's output."""
     ramp = _code_plain(tree, 'Gradient Texture' + tag, 'ShaderNodeTexGradient', ins=(('NodeSocketVector', 'Vector'),),
                        outs=(('NodeSocketColor', 'Color'), ('NodeSocketFloat', 'Fac')),
                        gradient_type='QUADRATIC_SPHERE')
     steep = _code_plain(tree, 'Math' + tag, 'ShaderNodeMath', ins=(('NodeSocketFloat', 'Value'),) * 2,
                         outs=(('NodeSocketFloat', 'Value'),), operation='MULTIPLY', use_clamp=False)
     steep.inputs[1].default_value = 6.0
-    bump = _code_bump(tree, 'Bump' + tag)
     tree.links.new(ramp.outputs['Fac'], steep.inputs[0])
-    tree.links.new(steep.outputs['Value'], bump.inputs['Height'])
     if scale is not None:
         tree.links.new(scale, steep.inputs[1])
+    return steep.outputs['Value']
+
+
+def _bump_chain(tree, scale=None, normal=None, tag=''):
+    """`_height_chain` -> Bump, in `tree`: the dome bends the whole floor.
+    The Bump's Normal takes the output socket `normal`; `tag` ends the three
+    names. Returns the Bump."""
+    height = _height_chain(tree, scale, tag)
+    bump = _code_bump(tree, 'Bump' + tag)
+    tree.links.new(height, bump.inputs['Height'])
     if normal is not None:
         tree.links.new(normal, bump.inputs['Normal'])
     return bump
@@ -2441,6 +2482,527 @@ def test_group_bump_gathers_from_a_whole_material_field():
           and '.group_inputs = ' in inspect.getsource(NE.group_evaluator))
 
 
+#: the three sockets a master's bump rides, behind _MASTER_SOCKETS in the
+#: node's own order (nodes/shader_nodes.SOCKETS)
+_MASTER_BUMP_SOCKETS = (('NodeSocketVector', 'Normal', None), ('NodeSocketFloat', 'Bump Strength', 1.0),
+                        ('NodeSocketFloat', 'Bump Height', 0.5))
+
+#: what a master of the probe can be fed, and what a group around one
+#: takes through its interface: name -> socket type
+_MASTER_FEEDS = {'Scale': 'NodeSocketFloat', 'Normal': 'NodeSocketVector', 'Strength': 'NodeSocketFloat',
+                 'Height': 'NodeSocketFloat'}
+
+
+def _bump_master(tree, feeds=None, linked=True, strength=1.0, opacity=1.0, name='Halcyon'):
+    """A master in `tree` (at _MASTER_SOCKETS' values) whose Bump Height is
+    LINKED: to feeds['Height'], or to a `_height_chain` of its own whose
+    multiplier is feeds['Scale']. `feeds` maps those names to output sockets
+    of `tree`; 'Normal' feeds the master's Normal and 'Strength' its Bump
+    Strength, which reads `strength` unlinked. Not `linked`: no height at
+    all, the Bump Height socket at its 0.5."""
+    feeds = feeds or {}
+    hal = _code_plain(tree, name, 'HALCYON_ShaderNode', outs=(('NodeSocketShader', 'Surface'),), model='LAMBERT',
+                      toon_steps=2)
+    for stype, sname, value in _MASTER_SOCKETS + _MASTER_BUMP_SOCKETS:
+        sock = hal.inputs.new(stype, sname)
+        if value is not None:
+            sock.default_value = value
+    hal.inputs['Bump Strength'].default_value, hal.inputs['Opacity'].default_value = strength, opacity
+    if linked:
+        height = feeds['Height'] if 'Height' in feeds else _height_chain(tree, feeds.get('Scale'))
+        tree.links.new(height, hal.inputs['Bump Height'])
+    for fed, sname in (('Normal', 'Normal'), ('Strength', 'Bump Strength')):
+        if fed in feeds:
+            tree.links.new(feeds[fed], hal.inputs[sname])
+    return hal
+
+
+def _master_group_node(tree, name, node_tree, feeds=None):
+    """A group node in `tree` holding `node_tree`: Surface out, and one
+    input per name in `feeds`, linked to that output socket of `tree`."""
+    feeds = feeds or {}
+    node = _code_plain(tree, name, 'ShaderNodeGroup', ins=tuple((_MASTER_FEEDS[fed], fed) for fed in feeds),
+                       outs=(('NodeSocketShader', 'Surface'),), node_tree=node_tree)
+    for fed, sock in feeds.items():
+        tree.links.new(sock, node.inputs[fed])
+    return node
+
+
+def _master_group_tree(reads=(), nested=None, **master):
+    """A node group's tree around `_bump_master`: [Group Input] -> master ->
+    Group Output (Surface). `reads` names the group's inputs, each handed to
+    the master as its feed of that name (`master`: `_bump_master`'s other
+    arguments); given `nested` (another such tree, taking the same inputs)
+    a group node 'Inner' stands where the master would: a group in a
+    group."""
+    tree = types.SimpleNamespace(name='Master Group', nodes=_CodeNodes(), links=_CodeLinks())
+    gout = _code_plain(tree, 'Group Output', 'NodeGroupOutput', ins=(('NodeSocketShader', 'Surface'),),
+                       is_active_output=True)
+    gin = _code_plain(tree, 'Group Input', 'NodeGroupInput',
+                      outs=tuple((_MASTER_FEEDS[fed], fed) for fed in reads)) if reads else None
+    feeds = {fed: gin.outputs[fed] for fed in reads}
+    mid = _master_group_node(tree, 'Inner', nested, feeds) if nested is not None \
+        else _bump_master(tree, feeds, **master)
+    tree.links.new(mid.outputs['Surface'], gout.inputs['Surface'])
+    return tree
+
+
+def test_master_bump_height_inside_a_group_is_a_bump_of_that_group():
+    """A master shader INSIDE a node group ignored its linked Bump Height:
+    the surface drew with no bump at all. The socket is sugar -- nothing
+    shades from it; core/nodeeval.desugar_master_bump rewrites it, at the
+    top of every render, into a real Bump node the master's Normal then
+    reads -- and the rewrite walked graph['nodes'], the material's OWN tree.
+    A group node carries its tree under 'group', which it never entered, so
+    in there the link was read by nothing: the same master with the same
+    height drew 0.89 apart over 4435 pixels of a 128x96 floor in the
+    material's tree and inside a group, the group frame being, bit for bit,
+    the frame of the master with nothing linked. The rewrite walks every
+    tree now, to any depth. The synthesized Bump goes into the tree its
+    master sits in -- the one that holds the nodes its links name, and the
+    one the group's evaluator shades -- under that tree's path
+    (nodeeval.synth_bump_id: 'Group/__bump_Halcyon', the id the exporter
+    would give a node of that name there), so two instances of one group
+    and a like-named master of another tree keep a Bump and a pre-pass
+    field each, and on a frame large enough to pre-pass the new Bump
+    gathers from a whole-material field like any other."""
+    import ast
+    import copy
+    import importlib
+    import inspect
+    import textwrap
+    from . import fakebpy, fakedevice
+    fakebpy.install()
+    EX = importlib.import_module('halcyon.export')
+    from ..core import nodeeval as NE
+    from ..gpu import shade as GSH
+    small, big = (128, 96), (320, 240)        # the floor in one shading batch; outgrowing one: the pre-pass runs
+    synth = 'Group/__bump_Halcyon'
+
+    def value(tree, name, v):
+        node = _code_plain(tree, name, 'ShaderNodeValue', outs=(('NodeSocketFloat', 'Value'),))
+        node.outputs['Value'].default_value = v
+        return node.outputs['Value']
+
+    def fed(scale=None, strength=None, normal=False, height=False, tag=''):
+        """What feeds a master, or the group around one, from the nodes of
+        the material's own tree: a Value at the height's Scale, a Value at
+        the Bump Strength, a real Bump (a shallower dome) for the master's
+        own Normal chain, the height chain itself."""
+        def make(tree):
+            feeds = {}
+            if scale is not None:
+                feeds['Scale'] = value(tree, 'Scale' + tag, scale)
+            if normal:
+                feeds['Normal'] = _bump_chain(tree, value(tree, 'Under' + tag, 2.0), tag='.001' + tag).outputs['Normal']
+            if strength is not None:
+                feeds['Strength'] = value(tree, 'Strength' + tag, strength)
+            if height:
+                feeds['Height'] = _height_chain(tree, tag='.002' + tag)
+            return feeds
+        return make
+
+    def material(make):
+        """A material whose Material Output takes the Surface of what
+        `make(tree)` returns."""
+        tree = types.SimpleNamespace(name='Floor', nodes=_CodeNodes(), links=_CodeLinks())
+        out = _code_plain(tree, 'Material Output', 'ShaderNodeOutputMaterial', ins=(('NodeSocketShader', 'Surface'),))
+        tree.links.new(make(tree).outputs['Surface'], out.inputs['Surface'])
+        return types.SimpleNamespace(name='Floor', use_nodes=True, node_tree=tree)
+
+    # the reported pair: the master in the material's own tree, and inside a group
+    def top(feeds=None, **master):
+        return material(lambda tree: _bump_master(tree, feeds(tree) if feeds else None, **master))
+
+    def grouped(feeds=None, nested=False, **master):
+        def make(tree):
+            outer = feeds(tree) if feeds else {}
+            inner = _master_group_tree(tuple(outer), **master)
+            if nested:
+                return _master_group_node(tree, 'Outer', _master_group_tree(tuple(outer), nested=inner), outer)
+            return _master_group_node(tree, 'Group', inner, outer)
+        return material(make)
+
+    def wired_by_hand():
+        """The rewrite, done by hand in the node editor: the height chain
+        into a real Bump node of the GROUP's tree (Strength 1, Distance 1),
+        that Bump into the master's Normal, the Bump Height left alone."""
+        def make(tree):
+            inner = _master_group_tree(linked=False)
+            inner.links.new(_bump_chain(inner).outputs['Normal'], inner.nodes.get('Halcyon').inputs['Normal'])
+            return _master_group_node(tree, 'Group', inner)
+        return material(make)
+
+    def twice(wired):
+        """ONE group tree instanced twice, at Scale 6.0 and at 2.0; the
+        Material Output takes the instance `wired`."""
+        def make(tree):
+            inner = _master_group_tree(('Scale',))
+            return {name: _master_group_node(tree, name, inner, fed(scale, tag=tag)(tree))
+                    for name, scale, tag in (('Group', 6.0, ''), ('Group.001', 2.0, '.001'))}[wired]
+        return material(make)
+
+    def both(wired):
+        """A master 'Halcyon' in the material's own tree (Scale 6.0) and a
+        group holding a master of the SAME name (Scale 2.0); the Material
+        Output takes `wired`."""
+        def make(tree):
+            return {'Halcyon': _bump_master(tree, fed(6.0)(tree)),
+                    'Group': _master_group_node(tree, 'Group', _master_group_tree(('Scale',)),
+                                                fed(2.0, tag='.001')(tree))}[wired]
+        return material(make)
+
+    def exported(mat):
+        return _code_exported(mat)[0]
+
+    last = {}
+
+    def frame(mat, size=big, glass=False, band=None, device='CPU'):
+        """(frame, printed) of the demo floor wearing `mat`'s export; the
+        scene and settings stay in `last`. `glass` flags the material
+        see-through, as the exporter flags a master whose Opacity is under
+        1: its fragments leave the opaque pass for the layered road."""
+        graph, programs, _warnings = _code_exported(mat)
+        sc, st = _code_floor(graph, programs, size)
+        sc.materials[0].has_alpha = glass
+        st.render_device = device
+        last['scene'], last['settings'] = sc, st
+        said = io.StringIO()
+        with redirect_stdout(said):
+            img = np.asarray(R.render(sc, st, band=band))
+        return img, said.getvalue()
+
+    def same(a, b):
+        return bool(np.array_equal(a, b))
+
+    def off(a, b):
+        """(max difference, the pixels holding one, the rows holding one)."""
+        d = np.abs(a.astype(np.float64) - b.astype(np.float64)).max(axis=-1)
+        return float(d.max()), int((d > 0).sum()), sorted(set(np.nonzero(d > 0)[0].tolist()))
+
+    def sock(node, name):
+        return next(s for s in node['inputs'] if s['name'] == name)
+
+    def bumps(graph):
+        """The id of every Bump node of the graph, tree by tree, each read
+        off the node AND the key it is filed under."""
+        out = []
+        for nid, node in graph['nodes'].items():
+            if node['bl_idname'] == 'ShaderNodeBump':
+                out.append(nid if node['id'] == nid else f'{nid} holds {node["id"]}')
+            if node.get('group'):
+                out += bumps(node['group'])
+        return sorted(out)
+
+    def whole(graph):
+        """Every tree hangs together: a node sits under its own id and every
+        link names a node of THAT tree."""
+        return all(nid == node['id'] and all(not s['link'] or s['link'][0] in graph['nodes'] for s in node['inputs'])
+                   and (not node.get('group') or whole(node['group'])) for nid, node in graph['nodes'].items())
+
+    def inner_of(graph, *path):
+        """The nodes of the tree behind the group nodes `path` names."""
+        nodes, nid = graph['nodes'], ''
+        for step in path:
+            nid = EX.node_id(step, nid + EX.ID_SEP if nid else '')
+            nodes = nodes[nid]['group']['nodes']
+        return nodes
+
+    # ---- the spies: every field the pre-pass builds, the layered road, what each shading batch can gather from
+    built, layered, gathered = [], [], []
+    real_fields, real_layers, real_chunked = R._bump_height_fields, R._shade_fragments_cpu, R._shade_chunked
+    state = {'own_tree_only': False}
+
+    def spy_fields(*args, **kw):
+        out = real_fields(*args, **kw)
+        if state['own_tree_only']:            # no field for a node below the material's tree
+            out = {key: field for key, field in out.items() if EX.ID_SEP not in key[1]}
+        built.append(out)
+        return out
+
+    def spy_layers(job, tri, *args, **kw):
+        layered.append(int(tri.size))
+        return real_layers(job, tri, *args, **kw)
+
+    def spy_chunked(job, *args, **kw):
+        gathered.append(sorted(key[1] for key in job.bump_fields))
+        return real_chunked(job, *args, **kw)
+
+    def keys():
+        """The node ids of each pre-pass run since the last reset."""
+        return [sorted(key[1] for key in out) for out in built]
+
+    def reset():
+        for log in (built, layered, gathered):
+            del log[:]
+
+    def shot(mat, **kw):
+        """frame()'s picture, with the spies' logs of that frame alone."""
+        reset()
+        return frame(mat, **kw)[0]
+
+    R._bump_height_fields, R._shade_fragments_cpu, R._shade_chunked = spy_fields, spy_layers, spy_chunked
+    keep_chunks = R.MIN_CHUNK, R.MAX_CHUNK
+    try:
+        # ---- the reported pair at 128x96: no pre-pass at that size, the height is simply read or not
+        flat_top, small_top = shot(top(linked=False), size=small), shot(top(), size=small)
+        seen, pixels, _rows = off(small_top, flat_top)
+        check('the master in the material\'s own tree at 128x96: its linked Bump Height bends the floor -- more than '
+              '0.5 off the unlinked frame over thousands of pixels, with no pre-pass at that size (the reference)',
+              seen > 0.5 and pixels > 3000 and keys() == [], f'{seen} {pixels} {keys()}')
+        flat_grp, small_grp = shot(grouped(linked=False), size=small), shot(grouped(), size=small)
+        graph = last['scene'].materials[0].graph
+        check('the same master inside a group: the frame is the top-level frame, bit for bit (0.89 off over 4435 '
+              'pixels: the height was read by nothing)', same(small_grp, small_top), str(off(small_grp, small_top)[:2]))
+        check('...so linked and unlinked are two pictures inside the group as well (they were ONE, bit for bit), and '
+              'the unlinked pair still agrees', off(small_grp, flat_grp)[0] > 0.5 and same(flat_grp, flat_top),
+              f'{off(small_grp, flat_grp)[:2]} {off(flat_grp, flat_top)[:2]}')
+        nodes = inner_of(graph, 'Group')
+        bump, hal = nodes.get(synth, {'inputs': []}), nodes['Group/Halcyon']
+        links = {name: next((s['link'] for s in bump['inputs'] if s['name'] == name), 'no socket')
+                 for name in ('Strength', 'Height', 'Normal')}
+        check('the rewrite, read off the graph that frame was shaded from: ONE Bump node, in the GROUP\'s tree under '
+              'that tree\'s path (Group/__bump_Halcyon) and nothing new in the material\'s own; its Height is the '
+              'chain\'s Math node, the master\'s Normal reads it and the Bump Height link is consumed',
+              bumps(graph) == [synth] and sorted(graph['nodes']) == ['Group', 'Material Output'] and whole(graph)
+              and links == {'Strength': None, 'Height': ['Group/Math', 0], 'Normal': None}
+              and sock(hal, 'Normal')['link'] == [synth, 0] and sock(hal, 'Bump Height')['link'] is None,
+              f'{bumps(graph)} {sorted(graph["nodes"])} {links}')
+        check('...and a master with nothing linked grows no Bump node, in either tree',
+              bumps(NE.desugar_master_bump(exported(grouped(linked=False)))) == []
+              and bumps(NE.desugar_master_bump(exported(top(linked=False)))) == []
+              and bumps(NE.desugar_master_bump(exported(top()))) == ['__bump_Halcyon'],
+              str(bumps(NE.desugar_master_bump(exported(grouped(linked=False))))))
+
+        # ---- a frame whose pre-pass runs: the synthesized Bump gathers from a whole-material field
+        frame_top = shot(top())
+        check('the master in the material\'s own tree at 320x240: the pre-pass runs and builds the field of its '
+              'synthesized Bump (the reference)', keys() == [['__bump_Halcyon']], str(keys()))
+        frame_grp = shot(grouped())
+        check('the master inside a group at 320x240: the pre-pass runs for ITS synthesized Bump, the field filed '
+              'under the node\'s path id', keys() == [[synth]], str(keys()))
+        check('...and the frame is the top-level frame, bit for bit', same(frame_grp, frame_top),
+              str(off(frame_grp, frame_top)))
+        R.MIN_CHUNK = R.MAX_CHUNK = 1 << 30
+        whole_grp = shot(grouped())
+        whole_keys = keys()
+        R.MIN_CHUNK, R.MAX_CHUNK = keep_chunks
+        check('both are the frame of the group material shaded in ONE batch -- no pre-pass at all, the synthesized '
+              'Bump differencing the whole floor itself', whole_keys == [] and same(whole_grp, frame_grp),
+              f'{whole_keys} {off(whole_grp, frame_grp)}')
+        state['own_tree_only'] = True
+        cut = shot(grouped())
+        state['own_tree_only'] = False
+        seen, _pixels, rows = off(cut, frame_top)
+        check('these frames can tell: with the group\'s field withheld the synthesized Bump differences its own '
+              'batch and the frame is cut along the batch boundary -- a row or two, more than 0.1 off',
+              keys() == [[]] and seen > 0.1 and 1 <= len(rows) <= 4, f'{keys()} {seen} {rows}')
+        large_top, large_grp = shot(top(), size=(640, 480)), shot(grouped(), size=(640, 480))
+        check('at 640x480 (the floor in several batches): the field again, and bit for bit',
+              keys() == [[synth]] and same(large_grp, large_top), f'{keys()} {off(large_grp, large_top)}')
+        by_hand = shot(wired_by_hand())
+        check('the socket is sugar for exactly this: the height wired BY HAND into a real Bump node of the group\'s '
+              'tree, and that into the master\'s Normal, is the same frame bit for bit (its field under Group/Bump)',
+              keys() == [['Group/Bump']] and same(by_hand, frame_grp), f'{keys()} {off(by_hand, frame_grp)}')
+
+        # ---- each input of the synthesized node, one at a time (128x96) and together (320x240)
+        alone = {'the height\'s Scale': dict(scale=3.5), 'the master\'s Bump Strength': dict(strength=0.4),
+                 'the master\'s own Normal chain': dict(normal=True)}
+        told = {}
+        for what, kw in alone.items():
+            in_top, in_grp = shot(top(fed(**kw)), size=small), shot(grouped(fed(**kw)), size=small)
+            told[what] = (same(in_grp, in_top), off(in_top, small_top)[0])
+        check('a group that takes ONE thing through its interface -- the Scale of the height, the Bump Strength, the '
+              'Normal the bump bends -- draws the frame of the master fed the same at the top level, bit for bit, '
+              'and each is another picture than the plain pair\'s (the synthesized node reads that input)',
+              all(ok and seen > 0.02 for ok, seen in told.values()), str(told))
+        handed = shot(grouped(fed(height=True)), size=small)
+        check('the HEIGHT itself handed in through the interface (the chain outside, the master\'s Bump Height on '
+              'the Group Input): the plain pair\'s frame, bit for bit', same(handed, small_top),
+              str(off(handed, small_top)[:2]))
+        dialled = shot(grouped(strength=0.4), size=small)
+        check('an unlinked Bump Strength of 0.4 on the group\'s master is the synthesized node\'s Strength: the frame '
+              'of the same master at the top level, and of the Strength linked to a Value at 0.4',
+              same(dialled, shot(top(strength=0.4), size=small))
+              and same(dialled, shot(top(fed(strength=0.4)), size=small)), str(off(dialled, small_top)[:2]))
+        every = dict(scale=3.5, strength=0.6, normal=True)
+        fed_top = shot(top(fed(**every)))
+        top_keys = keys()
+        fed_grp = shot(grouped(fed(**every)))
+        check('all three at once on a frame that pre-passes: the field of the synthesized Bump is evaluated with the '
+              'group\'s inputs bound, beside the field of the real Bump under it -- the top-level frame, bit for bit',
+              top_keys == [['Bump.001', '__bump_Halcyon']] and keys() == [['Bump.001', synth]]
+              and same(fed_grp, fed_top) and off(fed_top, frame_top)[0] > 0.05,
+              f'{top_keys} {keys()} {off(fed_grp, fed_top)} {off(fed_top, frame_top)[0]}')
+
+        # ---- an id per tree and per instance
+        at_6, at_2 = shot(top(fed(6.0))), shot(top(fed(2.0)))
+        check('the 6.0 and the 2.0 height are two pictures at the top level (the references of the next three)',
+              off(at_6, at_2)[0] > 0.05 and same(at_6, frame_top), str(off(at_6, at_2)[0]))
+        first, second = shot(twice('Group')), shot(twice('Group.001'))
+        fields = built[-1] if built else {}
+        gx_a, gx_b = (fields.get((0, nid), (np.zeros(1),))[0] for nid in (synth, 'Group.001/__bump_Halcyon'))
+        check('ONE group instanced twice at two Scales: two synthesized Bumps and two fields, each under its own '
+              'instance\'s path, one three times the other',
+              keys() == [['Group.001/__bump_Halcyon', synth]] and gx_a.shape == gx_b.shape and bool(gx_b.any())
+              and float(np.abs(gx_a - 3.0 * gx_b).max()) < 1e-5 and float(np.abs(gx_a - gx_b).max()) > 1e-3,
+              f'{keys()} {float(np.abs(gx_a).max())} {float(np.abs(gx_b).max())}')
+        check('...and each instance wired to the output draws ITS height: the top-level frames at 6.0 and at 2.0, '
+              'bit for bit', same(first, at_6) and same(second, at_2), f'{off(first, at_6)} {off(second, at_2)}')
+        own, held = shot(both('Halcyon')), shot(both('Group'))
+        check('a master named Halcyon in the material\'s tree AND one inside a group, both bumped: two Bumps, two '
+              'fields (__bump_Halcyon and Group/__bump_Halcyon), and each wired to the output draws its own height',
+              keys() == [[synth, '__bump_Halcyon']] and same(own, at_6) and same(held, at_2),
+              f'{keys()} {off(own, at_6)} {off(held, at_2)}')
+        nested = shot(grouped(fed(**every), nested=True))
+        check('a group in a group, the three inputs handed down two levels: the Bump is synthesized in the INNER '
+              'tree under the whole path, and the frame is the top-level frame, bit for bit',
+              keys() == [['Bump.001', 'Outer/Inner/__bump_Halcyon']] and same(nested, fed_top)
+              and bumps(last['scene'].materials[0].graph) == ['Bump.001', 'Outer/Inner/__bump_Halcyon']
+              and whole(last['scene'].materials[0].graph), f'{keys()} {off(nested, fed_top)}')
+
+        # ---- the rewrite runs at the top of every render: idempotent
+        graph = NE.desugar_master_bump(exported(grouped(fed(**every), nested=True)))
+        once = copy.deepcopy(graph)
+        for _again in range(3):
+            NE.desugar_master_bump(graph)
+        check('the rewrite is idempotent in a group\'s tree as in the material\'s: three more passes leave the graph '
+              'exactly as the first left it', repr(graph) == repr(once) and whole(graph)
+              and bumps(graph) == ['Bump.001', 'Outer/Inner/__bump_Halcyon'], str(bumps(graph)))
+        reset()
+        fresh = frame(grouped())[0]
+        sc, st = last['scene'], last['settings']
+        with redirect_stdout(io.StringIO()):
+            again = np.asarray(R.render(sc, st))
+            third = np.asarray(R.render(sc, st))
+        check('...and so is the picture: the SAME scene rendered a second and a third time (its graph already '
+              'rewritten) builds the one field each time and draws the first frame, bit for bit',
+              keys() == [[synth]] * 3 and same(fresh, frame_grp) and same(again, fresh) and same(third, fresh)
+              and bumps(sc.materials[0].graph) == [synth], f'{keys()} {bumps(sc.materials[0].graph)}')
+
+        # ---- the layered road: the same floor, see-through
+        glass_top = shot(top(opacity=0.6), glass=True)
+        check('the floor flagged see-through leaves the opaque pass for the layered road, whose per-rank fields the '
+              'top-level master\'s Bump gathers from (the reference)',
+              len(layered) == 1 and keys() == [] and ['__bump_Halcyon'] in gathered
+              and off(glass_top, frame_top)[0] > 0.1, f'{layered} {keys()} {gathered}')
+        glass_grp = shot(grouped(opacity=0.6), glass=True)
+        check('the group master\'s Bump on the layered road: a field per rank under its path id, and the top-level '
+              'frame bit for bit', len(layered) == 1 and [synth] in gathered and same(glass_grp, glass_top),
+              f'{layered} {gathered} {off(glass_grp, glass_top)}')
+
+        # ---- bands: the fields come from the G-buffer's full coverage (job.bump_field_source)
+        reset()
+        height = big[1]
+        bands = [(0, height // 3), (height // 3, height // 2 + 7), (height // 2 + 7, height)]
+        joined = np.concatenate([frame(grouped(), band=band)[0] for band in bands], axis=0)
+        check('three bands of the group frame, joined: each band builds the synthesized Bump\'s whole-frame field, '
+              'and the rows are the whole frame\'s, bit for bit',
+              keys() == [[synth]] * 3 and same(joined, frame_grp), f'{keys()} {off(joined, frame_grp)}')
+
+        # ---- the GPU device: nothing emits a group's tree, so the CPU shades the frame -- bumped and pre-passed
+        def refusal(mat):
+            """(frame, the plan's refusal lines) on the GPU device, over the
+            stand-in driver, from empty caches."""
+            R._GBUF_CACHE.clear()
+            GSH._PLAN_CACHE.clear()
+            with fakedevice.installed():
+                img, said = frame(mat, device='GPU')
+            R._GBUF_CACHE.clear()
+            GSH._PLAN_CACHE.clear()
+            return img, [line for line in said.splitlines() if 'shading on the CPU' in line]
+
+        reset()
+        on_gpu, said = refusal(grouped())
+        gpu_keys = keys()
+        said_hand, said_flat = refusal(wired_by_hand())[1], refusal(grouped(linked=False))[1]
+        check('on the GPU device the material is refused by name and the CPU shades the frame: the same bumped, '
+              'pre-passed frame, bit for bit', len(said) == 1 and gpu_keys == [[synth]] and same(on_gpu, frame_grp),
+              f'{gpu_keys} {off(on_gpu, frame_grp)} {said}')
+        check('...the name being the one the Bump wired by hand always got (a normal bent below the material\'s own '
+              'tree); the master with nothing linked keeps the group\'s own refusal',
+              said == said_hand and 'bends the shading normal outside' in ''.join(said)
+              and len(said_flat) == 1 and 'no GLSL emitter for ShaderNodeGroup' in said_flat[0],
+              f'{said} {said_hand} {said_flat}')
+    finally:
+        R._bump_height_fields, R._shade_fragments_cpu, R._shade_chunked = real_fields, real_layers, real_chunked
+        R.MIN_CHUNK, R.MAX_CHUNK = keep_chunks
+
+    # ---- every master the sugar is drawn on, and the id, read from the graph alone
+    masters = ('HALCYON_ShaderNode', 'HALCYON_BIMaterialNode', 'HALCYON_MaxStandardNode', 'HALCYON_MaxRaytraceNode',
+               'HALCYON_ConsoleShaderNode')
+    strengths = {}
+    for kind in masters + ('ShaderNodeBsdfPrincipled',):
+        graph = exported(grouped(strength=0.4))
+        node = inner_of(graph, 'Group')['Group/Halcyon']
+        node['bl_idname'], node['props'] = kind, dict(node['props'], bump_amount=60)
+        made = inner_of(NE.desugar_master_bump(graph), 'Group').get(synth)
+        strengths[kind] = made and sock(made, 'Strength')['default']
+    check('each of the five masters that draw the socket is rewritten inside a group (the two 3ds Max nodes with '
+          'their Bump Amount spinner for a strength: 60 of 30 is 2.0), and a node of any other type is left alone',
+          strengths == {**dict.fromkeys(masters, 0.4), 'HALCYON_MaxStandardNode': 2.0,
+                        'HALCYON_MaxRaytraceNode': 2.0, 'ShaderNodeBsdfPrincipled': None}, str(strengths))
+    names = ('Halcyon', 'Halcyon.001', 'a/b', '/', 'a\\', '\\/b', 'Group/Halcyon', '__bump_Halcyon')
+    paths = [''] + [EX.node_id(inner, EX.node_id(outer) + EX.ID_SEP if outer else '') + EX.ID_SEP
+                    for outer, inner in (('', 'Group'), ('', 'a/b'), ('Outer', 'Inner'), ('a\\', '/'))]
+    spelt = {(path, name): NE.synth_bump_id(EX.node_id(name, path), path) for path in paths for name in names}
+    check(f'the synthesized id is the id the exporter gives a node named __bump_<master> of that same tree, for '
+          f'{len(spelt)} masters whose names and paths hold the separator and the escape -- so it can only meet a '
+          'node of its own tree', all(nid == EX.node_id('__bump_' + name, path) for (path, name), nid in spelt.items())
+          and len(set(spelt.values())) == len(spelt) and NE.synth_bump_id('hal') == '__bump_hal'
+          and NE.synth_bump_id('Group/Halcyon', 'Group/') == synth,
+          str([k for k, nid in spelt.items() if nid != EX.node_id('__bump_' + k[1], k[0])]))
+
+    graph = exported(grouped())
+    nodes = inner_of(graph, 'Group')
+    nodes[synth] = dict(nodes['Group/Math'], id=synth)
+    before = repr(graph)
+    NE.desugar_master_bump(graph)
+    check('the one clash the id can have, a node of the SAME tree that already carries that very name: the rewrite '
+          'looks before it writes, the node is not written over and the graph is left as it was (as in the '
+          'material\'s own tree)', repr(graph) == before and nodes[synth]['bl_idname'] == 'ShaderNodeMath',
+          str(nodes[synth]['bl_idname']))
+
+    def bare(g, path=''):
+        """The same export with every id cut back to the node's bare name,
+        as a graph built by hand (and the 1.92.0 exporter) spells it."""
+        nodes = {}
+        for nid, node in g['nodes'].items():
+            node = dict(node, id=nid[len(path):])
+            node['inputs'] = [dict(sk, link=[sk['link'][0][len(path):], sk['link'][1]] if sk['link'] else None)
+                              for sk in node['inputs']]
+            if node.get('group'):
+                node['group'] = bare(node['group'], nid + EX.ID_SEP)
+            nodes[node['id']] = node
+        return {'nodes': nodes, 'output': g['output'] and g['output'][len(path):],
+                'group_output': g['group_output'] and g['group_output'][len(path):]}
+
+    spelt_bare = bare(exported(both('Group')))
+    hand = _code_cpu(spelt_bare, {}, big)
+    check('a graph spelt by hand, the like-named masters of two trees both under the bare id Halcyon: the group\'s '
+          'Bump still takes its tree\'s path, so it cannot gather from the field of the material\'s own -- the '
+          'frame of the 2.0 height, bit for bit', bumps(spelt_bare) == [synth, '__bump_Halcyon'] and same(hand, at_2),
+          f'{bumps(spelt_bare)} {off(hand, at_2)}')
+
+    # ---- the rule, read from the code itself
+    def calls(f):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(f)))
+        return {ast.unparse(c.func) for c in ast.walk(tree) if isinstance(c, ast.Call)}
+
+    check('both render entries rewrite every material before anything reads a graph (render and bake_lightmap), '
+          'the rewrite enters a group by calling itself, and the id of what it makes is written in one place',
+          'desugar_master_bump' in calls(R.render) and 'desugar_master_bump' in calls(R.bake_lightmap)
+          and {'desugar_master_bump', 'synth_bump_id'} <= calls(NE.desugar_master_bump)
+          and inspect.getsource(NE).count('__bump_{') == 1 and '__bump_{' in inspect.getsource(NE.synth_bump_id),
+          str(sorted(calls(NE.desugar_master_bump))))
+    check('the exporter and the core join a path with ONE separator (the exporter imports nodeeval.ID_SEP and '
+          'defines none), which serialize_tree and the rewrite both put behind a group node\'s id',
+          EX.ID_SEP is NE.ID_SEP and 'from .core.nodeeval import ID_SEP\n' in inspect.getsource(EX)
+          and 'ID_SEP =' not in inspect.getsource(EX) and inspect.getsource(NE).count('ID_SEP =') == 1
+          and 'nid + ID_SEP' in inspect.getsource(EX.serialize_tree)
+          and "f'{nid}{ID_SEP}'" in inspect.getsource(NE.desugar_master_bump))
+
+
 def test_code_node_rebuild_survives_undo_redo_and_load():
     """A coded shader's update callbacks may only FLAG the socket rebuild
     (needs_rebuild) and leave the topology to a one-shot timer. Blender
@@ -2734,8 +3296,11 @@ def test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads():
     chain and drew it as the albedo. The plan QUALIFIED: 1.69 apart over
     all 598 pixels of the demo ball. Blender's own reading is the rule
     now (an Emission of the value, Strength 1): the CPU shades it,
-    bitwise the explicit node, on every shader socket; the deferred plan
-    refuses it by name."""
+    bitwise the explicit node, on every shader socket. The deferred plan
+    refused it by name; since the emission slot routing (item 21, the
+    test after this one) a closure of emission lobes ALONE rides the
+    pass's emission term, and what is refused by name here is the link
+    BESIDE another kind of lobe -- one chain cannot be two slots."""
     from ..core import nodeeval as NE
     from ..gpu import shade as GSH
     from ..gpu import sky as GSKY
@@ -2760,9 +3325,7 @@ def test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads():
               float(np.abs(wired - bare)[ball].max()) > 0.25, str(float(np.abs(wired - bare)[ball].max())))
         check(f'a {kind} wired into Surface: every pixel off the Ball is bitwise the unwired frame',
               np.array_equal(wired[~ball], bare[~ball]))
-        passes, why = _wired_plan(_wired_out(nodes, link))
-        check(f'a {kind} wired into Surface: the deferred plan REFUSES (it qualified and drew the albedo)', passes is None, str(why))
-        check(f'a {kind} wired into Surface: ...by name, word for word', why == want, str(why))
+        # (the plan's own answer for the lone link is item 21's test)
         # the road the refusal names qualifies and twins, in either socket
         for slot in ('emit', 'diffuse'):
             mn, ml = _wired_master(nodes, **{slot: link})
@@ -2779,16 +3342,18 @@ def test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads():
     nodes_k, link_k, _pr = _wired_source('colour', rgb=(0.0, 0.0, 0.0))
     dark = _wired_cpu(_wired_out(nodes_k, link_k))
     gain = float(np.abs((lit - dark)[ball][:, :3] - np.array([0.9, 0.3, 0.1], f32)).max())
-    check('the wired colour is ADDED over the lit fallback surface: frame(colour) - frame(black) is the colour at every Ball pixel (1e-6)',
+    check('the wired colour is ADDED as light the surface gives off: frame(colour) - frame(black) is the colour at every Ball pixel (1e-6)',
           gain < 1e-6, str(gain))
     check('...and the alpha stays opaque', float(lit[ball][:, 3].min()) == 1.0 and float(lit[ball][:, 3].max()) == 1.0)
 
     # ---- the text names what the user wired and where it shades
-    for part in ('wired straight into a shader socket', 'an Emission of it', "Blender's implicit conversion",
-                 'this material shades on the CPU exactly', 'a Halcyon Shader in between', 'Diffuse Color', 'Self-Illumination'):
+    for part in ('wired straight into a shader socket beside another kind of lobe', 'the link is an Emission of it',
+                 "Blender's implicit conversion", 'ONE colour chain', 'this material shades on the CPU exactly',
+                 'alone, the link rides the emission slot', 'a Halcyon Shader', 'Diffuse Color', 'Self-Illumination'):
         check(f'the refusal says "{part}"', part in GSH.IMPLICIT_EMISSION_REFUSAL)
 
-    # ---- every other shader socket: the Mix and Add Shader inputs, a Reroute on the way, a Coded Shader's output
+    # ---- every other shader socket, BESIDE a Diffuse BSDF: the Mix and Add Shader inputs (refused by name); then a
+    # Reroute on the way and a Coded Shader's output (the CPU law; their plan is item 21's)
     for label, idname in (('a Mix Shader input', 'ShaderNodeMixShader'), ('an Add Shader input', 'ShaderNodeAddShader')):
         tn, tl = _wired_two(nodes, link, idname)
         wired = _wired_cpu(_wired_out(tn, tl))
@@ -2797,7 +3362,8 @@ def test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads():
         check(f'a colour wired into {label}: the CPU frame is bitwise the Emission node\'s in that socket',
               np.array_equal(wired, _wired_cpu(_wired_out(xn, xl))))
         passes, why = _wired_plan(_wired_out(tn, tl))
-        check(f'a colour wired into {label}: the plan refuses by the same name', passes is None and why == want, str(why))
+        check(f'a colour wired into {label} beside a Diffuse BSDF: the plan refuses by name, word for word',
+              passes is None and why == want, str(why))
     zn, zl = _wired_two(nodes, link, 'ShaderNodeMixShader')
     zn['two']['inputs'][0]['default'] = 0.0
     passes, why = _wired_plan(_wired_out(zn, zl))
@@ -2808,17 +3374,12 @@ def test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads():
                 'outputs': [{'name': 'Output', 'type': 'RGBA'}]}
     check('a colour through a Reroute into Surface: the CPU frame is the direct link\'s, bit for bit',
           np.array_equal(_wired_cpu(_wired_out(rn, ['rr', 0])), lit))
-    passes, why = _wired_plan(_wired_out(rn, ['rr', 0]))
-    check('a colour through a Reroute into Surface: the plan refuses by the same name', passes is None and why == want, str(why))
     cn, cl_, cprog = _wired_source('coded')
     coded = _wired_cpu(_wired_out(cn, cl_), cprog)
     en, el = _wired_emission(cn, cl_)
     check('a Coded Shader\'s Color wired into Surface: the CPU frame is bitwise the Emission node\'s',
           np.array_equal(coded, _wired_cpu(_wired_out(en, el), cprog)))
     check('...and the shader\'s own stripes reach the Ball', float(np.abs(coded - bare)[ball].max()) > 0.25)
-    passes, why = _wired_plan(_wired_out(cn, cl_), cprog)
-    check('a Coded Shader\'s Color wired into Surface: the plan refuses by the same name (the wiring, not the node type)',
-          passes is None and why == want, str(why))
 
     # ---- what does NOT become an emission
     check('link_closure: a closure passes through untouched', NE.link_closure(NE.Closure().add('DIFFUSE', 1.0), 4).items[0][0] == 'DIFFUSE')
@@ -2846,22 +3407,25 @@ def test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads():
     check('control, a Diffuse BSDF in between: the plan qualifies and the simulator frame is the CPU frame',
           cp is not None and d is not None and d < 6e-3 and nbad == 0, str(cwhy if d is None else (d, nbad)))
     en, el = _wired_emission(nodes, link)
-    passes, why = _wired_plan(_wired_out(en, el))
-    check('control, the explicit Emission node keeps its own refusal (a raw EMISSION lobe), not the wiring\'s',
+    xn, xl = _wired_two(en, el, 'ShaderNodeMixShader')
+    passes, why = _wired_plan(_wired_out(xn, xl))
+    check('control, an explicit Emission node beside a Diffuse BSDF keeps the raw-lobe refusal, not the wiring\'s',
           passes is None and 'a raw EMISSION lobe' in str(why) and 'wired straight' not in str(why), str(why))
 
-    # ---- the device road end to end: the GPU device's frame IS the CPU device's, and says why
+    # ---- the device road end to end, for the refused wiring: the GPU device's frame IS the CPU device's, and says why
+    tn, tl = _wired_two(nodes, link, 'ShaderNodeMixShader')
+    mixed = _wired_cpu(_wired_out(tn, tl))
     R._GBUF_CACHE.clear()
     GSH._PLAN_CACHE.clear()
-    sc, st = _wired_scene(_wired_out(nodes, link), device='GPU')
+    sc, st = _wired_scene(_wired_out(tn, tl), device='GPU')
     buf = io.StringIO()
     with fakedevice.installed():
         with redirect_stdout(buf):
             gpu = np.asarray(R.render(sc, st))
     R._GBUF_CACHE.clear()
     GSH._PLAN_CACHE.clear()
-    check('the GPU device road draws the CPU frame bit for bit (the fake driver)', np.array_equal(gpu, lit),
-          str(float(np.abs(gpu - lit).max())) if gpu.shape == lit.shape else str(gpu.shape))
+    check('the GPU device road draws the refused wiring\'s CPU frame bit for bit (the fake driver)', np.array_equal(gpu, mixed),
+          str(float(np.abs(gpu - mixed).max())) if gpu.shape == mixed.shape else str(gpu.shape))
     check('...and prints the reason once, by name', buf.getvalue().count('[Halcyon GPU] shading on the CPU: ' + want) == 1,
           buf.getvalue()[-400:])
 
@@ -3542,6 +4106,768 @@ def test_code_node_compiles_what_it_runs():
     check('the same pass with the call and the widths right goes through',
           DV.preflight('Fine', head + 'void main() {\n    vec3 c = vec3(1.0);\n'
                                       '    fragColor = vec4(c.xy * vUV, hal_half(1.0), 1.0);\n}\n') is None)
+
+
+# ------------------------------------------ (21) the emission slot routing
+
+def _em_node(nid, rgb=(1.0, 1.0, 1.0), strength=1.0, color_link=None, strength_link=None):
+    """An Emission node: constant or linked Color, constant or linked Strength."""
+    return {nid: {'id': nid, 'bl_idname': 'ShaderNodeEmission', 'props': {},
+                  'inputs': [_sk('Color', 'RGBA', [rgb[0], rgb[1], rgb[2], 1.0], color_link),
+                             _sk('Strength', 'VALUE', strength, strength_link)],
+                  'outputs': [{'name': 'Emission', 'type': 'SHADER'}]}}
+
+
+def _shader_pair(idname, first, second, fac=0.5, fac_link=None):
+    """A Mix Shader (Fac, Shader, Shader) or an Add Shader (Shader, Shader)
+    over two links; None leaves that socket bare."""
+    ins = [_sk('Shader', 'SHADER', None, first), _sk('Shader', 'SHADER', None, second)]
+    if idname == 'ShaderNodeMixShader':
+        ins.insert(0, _sk('Fac', 'VALUE', fac, fac_link))
+    return {'two': {'id': 'two', 'bl_idname': idname, 'props': {}, 'inputs': ins,
+                    'outputs': [{'name': 'Shader', 'type': 'SHADER'}]}}
+
+
+def _wired_twin(graph, programs=None, **settings):
+    """(max, pixels over 1e-2, simulator frame, CPU frame, why) of `graph`
+    on the Ball: the CPU frame against gpu/shade.simulate over the
+    covered pixels; max is None when the plan (or the simulator) refuses."""
+    sc, st = _wired_scene(graph, programs)
+    for k, v in settings.items():
+        setattr(st, k, v)
+    d, nbad, img, cpu, _passes, why = _sim_vs_cpu(sc, st)
+    return d, nbad, img, cpu, why
+
+
+def _on_bar(d, nbad):
+    """The twin tests' bar: under 6e-3 with no pixel over 1e-2."""
+    return d is not None and d < 6e-3 and nbad == 0
+
+
+def _mirror_twin(rgb):
+    """The feature matrix's traced-reflection row (the Box mirrors at 0.5)
+    with a colour wired straight into the FLOOR's Surface: (max, pixels
+    over 1e-2, simulator frame, CPU frame, the Box's mask, why)."""
+    from ..core.bvh import BVH
+    from ..core.scene import Material
+    from ..gpu import shade as GSH
+    from .featurematrix import build
+    sc, st = build('traced reflection', 128, 96)
+    nodes, link, _pr = _wired_source('colour', rgb)
+    sc.materials[0] = Material(name='Wired', index=0, graph=_wired_out(nodes, link))
+    st.render_device = 'GPU'
+    with redirect_stdout(io.StringIO()):
+        cpu = np.asarray(R.render(sc, st))
+    g, job = _job_for(sc, st, bvh=BVH(sc.mesh.verts, sc.mesh.tris))
+    GSH._PLAN_CACHE.clear()
+    passes, why, atl = GSH.plan_frame(job, g)
+    if passes is None:
+        return None, None, None, cpu, None, why
+    img, hit = GSH.simulate(job, g, passes, atl)
+    if img is None:
+        return None, None, None, cpu, None, hit
+    cov = g.tri >= 0
+    box = cov & (sc.mesh.mat_index[np.maximum(g.tri, 0)] == 2)
+    d = np.abs(img[cov] - cpu[cov][:, :3])
+    return float(d.max()), int((d.max(axis=1) > 1e-2).sum()), img, cpu, box, None
+
+
+def test_emission_slot_routing_twins_an_emission_only_closure():
+    """The frame pass emits ONE colour chain. When every lobe of the
+    closure is an EMISSION -- a colour wired straight into Surface, an
+    Emission node, a Mix or Add Shader of those -- that chain is the light
+    the surface gives off and nothing else: no lobe feeds the diffuse or
+    the specular slot, so `closure_to_surface` hands back constants there
+    and puts the weighted sum of colour x strength in `surf.emission`.
+    The probe grants the EMISSION SLOT (`bake['__slot']`), the pass adds
+    the chain where `light_surface` adds the emission and bakes the flat
+    diffuse, and the plan that refused these graphs by name now draws
+    them: the simulator frame is the CPU frame."""
+    from ..core.scene import Material
+    from ..gpu import material as GM
+    from ..gpu import shade as GSH
+    from ..gpu.emit import Emitter
+    from . import fakedevice
+
+    sc0, st0 = _wired_scene(_wired_out({}, None))
+    g0, _job0 = _job_for(sc0, st0)
+    ball = (g0.tri >= 0) & (sc0.mesh.mat_index[np.maximum(g0.tri, 0)] == 1)
+    src, link, _pr = _wired_source('colour')
+
+    # ---- a colour, a value, a vector and a Coded Shader's Color, straight into Surface
+    for kind in ('colour', 'value', 'vector', 'coded'):
+        nodes, lk, prog = _wired_source(kind)
+        d, nbad, sim, cpu, why = _wired_twin(_wired_out(nodes, lk), prog)
+        check(f'a {kind} wired into Surface: the deferred plan QUALIFIES (it refused by name) and the simulator frame is the CPU '
+              f'frame (max < 6e-3, no px > 1e-2)', _on_bar(d, nbad), str(why if d is None else (d, nbad)))
+    d, nbad, sim, cpu, why = _wired_twin(_wired_out(src, link))
+    dark_n, dark_l, _pr = _wired_source('colour', rgb=(0.0, 0.0, 0.0))
+    dk, _nb, sim_k, _cpu_k, _why = _wired_twin(_wired_out(dark_n, dark_l))
+    gain = float(np.abs((sim - sim_k)[ball] - np.array([0.9, 0.3, 0.1], f32)).max()) if d is not None and dk is not None else None
+    check('the twin is not vacuous: the SIMULATOR\'s frame(colour) - frame(black) is the colour at every Ball pixel (1e-6)',
+          gain is not None and gain < 1e-6, str(gain))
+    check('...and on the Ball alone the two roads are within 1e-5', d is not None and float(np.abs(sim[ball] - cpu[ball][:, :3]).max()) < 1e-5)
+
+    # ---- the pass itself: the chain rides the emission term, the diffuse is the material's constant
+    sc, st = _wired_scene(_wired_out(src, link))
+    passes = _sim_vs_cpu(sc, st)[4]
+    text = next((s for _m, nm, s, _b in (passes or ()) if nm == 'Wired'), '')
+    adds = [ln.strip() for ln in text.splitlines() if ln.strip().startswith('total = total +')]
+    dif = [ln.strip() for ln in text.splitlines() if ln.strip().startswith('s.diffuse =')]
+    check('the pass adds the emitted chain to the total (light_surface\'s `out + surf.emission`)',
+          len(adds) == 1 and '_v' in adds[0] and 'vec3(' not in adds[0], str(adds))
+    check('...and its diffuse is a constant, never the chain', len(dif) == 1 and '_v' not in dif[0] and dif[0].startswith('s.diffuse = vec3('),
+          str(dif))
+
+    # ---- the Emission node, and the Mix / Add Shader over emissions: each chain IS the closure's emission
+    e1 = _em_node('e1', (0.9, 0.3, 0.1), 2.0)
+    e2 = _em_node('e2', (0.1, 0.8, 0.3), 0.5)
+    both = dict(e1, **e2)
+    tex = {'uv': {'id': 'uv', 'bl_idname': 'ShaderNodeTexCoord', 'props': {}, 'inputs': [],
+                  'outputs': [{'name': 'Generated', 'type': 'VECTOR'}, {'name': 'Normal', 'type': 'VECTOR'},
+                              {'name': 'UV', 'type': 'VECTOR'}]},
+           'sep': {'id': 'sep', 'bl_idname': 'ShaderNodeSeparateXYZ', 'props': {}, 'inputs': [_sk('Vector', 'VECTOR', [0, 0, 0], ['uv', 2])],
+                   'outputs': [{'name': 'X', 'type': 'VALUE'}, {'name': 'Y', 'type': 'VALUE'}, {'name': 'Z', 'type': 'VALUE'}]}}
+    rr = {'rr': {'id': 'rr', 'bl_idname': 'NodeReroute', 'props': {}, 'inputs': [_sk('Input', 'RGBA', [0, 0, 0, 1], link)],
+                 'outputs': [{'name': 'Output', 'type': 'RGBA'}]}}
+    cases = (
+        ('an Emission node (constant colour, Strength 2)', dict(e1), ['e1', 0]),
+        ('an Emission node with a linked Color and a linked Strength',
+         dict(tex, **_em_node('e1', color_link=['uv', 1], strength_link=['sep', 0])), ['e1', 0]),
+        ('a Mix Shader of two Emissions at Fac 0.3', dict(both, **_shader_pair('ShaderNodeMixShader', ['e1', 0], ['e2', 0], 0.3)), ['two', 0]),
+        ('a Mix Shader of two Emissions under a per-pixel Fac',
+         dict(both, **tex, **_shader_pair('ShaderNodeMixShader', ['e1', 0], ['e2', 0], 0.5, ['sep', 1])), ['two', 0]),
+        ('an Add Shader of two Emissions', dict(both, **_shader_pair('ShaderNodeAddShader', ['e1', 0], ['e2', 0])), ['two', 0]),
+        ('a Mix Shader of an Emission and a wired colour (the explicit lobe beside the implicit one)',
+         dict(src, **e2, **_shader_pair('ShaderNodeMixShader', ['e2', 0], link, 0.4)), ['two', 0]),
+        ('a Mix Shader of an Emission and a BARE socket (the empty closure adds no light)',
+         dict(e1, **_shader_pair('ShaderNodeMixShader', ['e1', 0], None, 0.25)), ['two', 0]),
+        ('an Add Shader of a wired colour and a BARE socket', dict(src, **_shader_pair('ShaderNodeAddShader', link, None)), ['two', 0]),
+        ('a colour through a Reroute', dict(src, **rr), ['rr', 0]),
+    )
+    for label, nodes, lk in cases:
+        d, nbad, _sim, _cpu, why = _wired_twin(_wired_out(nodes, lk))
+        check(f'{label}: the plan qualifies and the simulator frame is the CPU frame', _on_bar(d, nbad), str(why if d is None else (d, nbad)))
+    full = _wired_cpu(_wired_out(dict(e1), ['e1', 0]))
+    part = _wired_cpu(_wired_out(dict(e1, **_shader_pair('ShaderNodeMixShader', ['e1', 0], None, 0.25)), ['two', 0]))
+    dim = float(np.abs((full - part)[ball][:, :3] - np.array([0.9, 0.3, 0.1], f32) * 2.0 * 0.25).max())
+    check('a bare Mix side SCALES the emission by its weight on the CPU (0.75 of it; a master lobe would be normalised back to full)',
+          dim < 1e-6, str(dim))
+
+    # ---- the constants the pass bakes are the CPU's own for THIS material, never the engine's defaults
+    plain_sim, plain_cpu = sim, cpu
+    sc, st = _wired_scene(_wired_out(src, link))
+    sc.materials[1].diffuse, sc.materials[1].diffuse_level = (0.25, 0.55, 0.2), 0.7
+    sc.materials[1].specular, sc.materials[1].model = (0.2, 0.9, 0.4), 'LAMBERT'
+    d, nbad, sim, cpu, _passes, why = _sim_vs_cpu(sc, st)
+    check('a colour wired into the Surface of a material with its own fallback diffuse, level and model: the simulator frame is the CPU frame',
+          _on_bar(d, nbad), str(why if d is None else (d, nbad)))
+    moved = float(np.abs((sim - plain_sim)[ball] - (cpu - plain_cpu)[ball][:, :3]).max()) if d is not None else None
+    check('...and the simulator\'s Ball moves with that material exactly as the CPU\'s does (whatever closure_to_surface makes of a '
+          'surface with no diffuse lobe, the pass bakes THAT), within 1e-5', moved is not None and moved < 1e-5, str(moved))
+
+    # ---- the rates and the shadeless early return
+    vn, vl, _pr = _wired_source('vector')
+    for rate in ('VERTEX', 'FACE'):
+        d, nbad, _sim, _cpu, why = _wired_twin(_wired_out(vn, vl), shading_rate=rate)
+        check(f'a vector wired into Surface at the {rate} rate (the emission rides the CPU-lit corners, the pass multiplies the constant '
+              f'diffuse): the simulator frame is the CPU frame', _on_bar(d, nbad), str(why if d is None else (d, nbad)))
+    faint_n, faint_l, _pr = _wired_source('colour')
+    faint_n['src']['props']['value'] = [0.9, 0.3, 0.1, 0.3]
+    for model in ('DS_DECAL', 'DECAL_ALPHA', 'N64_BLENDRGBA'):
+        d, nbad, _sim, _cpu, why = _wired_twin(_wired_out(faint_n, faint_l), force_model=model, shading_rate='VERTEX')
+        check(f'a colour whose ALPHA is 0.3, wired into Surface under {model} (the decal combine reads the albedo pass\'s alpha, the opaque '
+              f'1.0 -- never the routed chain\'s): the simulator frame is the CPU frame', _on_bar(d, nbad), str(why if d is None else (d, nbad)))
+    glossy = dict(faint_n, gl={'id': 'gl', 'bl_idname': 'ShaderNodeBsdfGlossy', 'props': {'distribution': 'GGX'},
+                               'inputs': [_sk('Color', 'RGBA', [1, 1, 1, 1], faint_l), _sk('Roughness', 'VALUE', 0.3)],
+                               'outputs': [{'name': 'BSDF', 'type': 'SHADER'}]})
+    for model in ('DS_DECAL', 'DECAL_ALPHA', 'N64_BLENDRGBA'):
+        d, nbad, _sim, _cpu, why = _wired_twin(_wired_out(glossy, ['gl', 0]), force_model=model, shading_rate='VERTEX')
+        check(f'found on the way, the SPECULAR route under {model}: a lone Glossy BSDF whose colour carries alpha 0.3 drew 0.48 off the CPU '
+              f'(the routed chain\'s alpha read as the texel\'s); the simulator frame is the CPU frame', _on_bar(d, nbad),
+              str(why if d is None else (d, nbad)))
+    d, nbad, _sim, _cpu, why = _wired_twin(_wired_out(vn, vl), force_model='CONSTANT')
+    check('a vector wired into Surface under the CONSTANT model (diffuse x level + emission, no light): the simulator frame is the CPU frame',
+          _on_bar(d, nbad), str(why if d is None else (d, nbad)))
+
+    # ---- beside an Ambient Only lamp: the light row's ambient tail (R254) is read by the routed pass like any other
+    from ..core.scene import Light
+    sc, st = _wired_scene(_wired_out(vn, vl))
+    amb = Light(type='POINT', name='Amb', position=(0.0, 0.0, 3.0), color=(0.4, 0.6, 1.0), energy=0.4, shadow='NONE')
+    amb.ambient_only = True
+    sc.lights = list(sc.lights) + [amb]
+    d, nbad, _sim, amb_cpu, _passes, why = _sim_vs_cpu(sc, st)
+    check('a vector wired into Surface in a frame with an Ambient Only lamp: the simulator frame is the CPU frame', _on_bar(d, nbad),
+          str(why if d is None else (d, nbad)))
+    check('...and the ambient lamp is in that frame (it moves the CPU picture by more than 0.1)',
+          float(np.abs(amb_cpu - _wired_cpu(_wired_out(vn, vl))).max()) > 0.1)
+
+    # ---- an Image Texture straight into Surface (the quick look at a texture), nearest and through the mip footprint
+    for label, kw in (('the scene\'s default filter', {}), ('TRILINEAR with mipmaps', {'tex_filter': 'TRILINEAR', 'tex_mipmap': True})):
+        st = base_settings(128, 96, shadows=True, **kw)
+        st.color_depth, st.dither, st.output_scale = '24', 'NONE', 'NONE'
+        sc = demo_scene(st, with_texture=True)
+        img_nodes = {'src': {'id': 'src', 'bl_idname': 'ShaderNodeTexImage', 'props': {'image': 'checker', 'interpolation': 'Linear', 'extension': 'REPEAT'},
+                             'inputs': [_sk('Vector', 'VECTOR', [0, 0, 0])],
+                             'outputs': [{'name': 'Color', 'type': 'RGBA'}, {'name': 'Alpha', 'type': 'VALUE'}]}}
+        sc.materials[1] = Material(name='Wired', index=1, graph=_wired_out(img_nodes, ['src', 0]))
+        d, nbad, _img, _cpu, _p, why = _sim_vs_cpu(sc, st)
+        check(f'an Image Texture wired into Surface, {label}: the simulator frame is the CPU frame', _on_bar(d, nbad), str(why if d is None else (d, nbad)))
+
+    # ---- a ray hit on the routed surface: the mirror Box shows the emissive floor on both roads
+    d, nbad, sim, cpu, box, why = _mirror_twin((0.9, 0.3, 0.1))
+    dk, _nb, sim_k, cpu_k, _box, _why = _mirror_twin((0.0, 0.0, 0.0))
+    check('traced reflection, a colour wired into the FLOOR\'s Surface: the plan qualifies and the simulator frame is the CPU frame',
+          _on_bar(d, nbad), str(why if d is None else (d, nbad)))
+    if d is not None and dk is not None:
+        seen = float(np.abs(sim[box] - sim_k[box]).max())
+        seen_cpu = float(np.abs(cpu[box] - cpu_k[box])[:, :3].max())
+        check('...and the hit pass carries it: the emission moves the mirror\'s pixels by the same 0.45 on both roads (0.5 x 0.9)',
+              abs(seen - 0.45) < 1e-3 and abs(seen_cpu - 0.45) < 1e-3, f'sim {seen} cpu {seen_cpu}')
+
+    # ---- two routed materials: one structure, so one compiled text -- the colours ride the material texels
+    sc, st = _wired_scene(_wired_out(src, link))
+    other_n, other_l, _pr = _wired_source('colour', rgb=(0.1, 0.7, 0.9))
+    sc.materials[2] = Material(name='Wired2', index=2, graph=_wired_out(other_n, other_l))
+    d, nbad, _img, _cpu, passes, why = _sim_vs_cpu(sc, st)
+    check('two materials, each a colour wired into Surface: the simulator frame is the CPU frame', _on_bar(d, nbad), str(why if d is None else (d, nbad)))
+    texts = {nm: s for _m, nm, s, _b in (passes or ()) if nm in ('Wired', 'Wired2')}
+    check('...and their passes are ONE source text (a colour change is a texel, not a recompile)',
+          len(texts) == 2 and texts['Wired'] == texts['Wired2'])
+
+    # ---- what the one chain cannot carry is still refused, by name
+    dif = {'dif': {'id': 'dif', 'bl_idname': 'ShaderNodeBsdfDiffuse', 'props': {},
+                   'inputs': [_sk('Color', 'RGBA', [0.2, 0.3, 0.9, 1.0]), _sk('Roughness', 'VALUE', 0.0)],
+                   'outputs': [{'name': 'BSDF', 'type': 'SHADER'}]}}
+    for label, fac in (('at Fac 0.5', 0.5), ('at Fac 1 (the diffuse lobe weighs nothing, and is still a lobe: the route is structural)', 1.0)):
+        passes, why = _wired_plan(_wired_out(dict(e1, **dif, **_shader_pair('ShaderNodeMixShader', ['dif', 0], ['e1', 0], fac)), ['two', 0]))
+        check(f'a Diffuse BSDF mixed with an Emission {label}: refused as a raw EMISSION lobe', passes is None and 'a raw EMISSION lobe' in str(why), str(why))
+    mx = {'mx': {'id': 'mx', 'bl_idname': 'HALCYON_MaxBlendNode', 'props': {},
+                 'inputs': [_sk('Material 1', 'SHADER', None, ['e1', 0]), _sk('Material 2', 'SHADER', None, ['e2', 0]), _sk('Mix Amount', 'VALUE', 0.3)],
+                 'outputs': [{'name': 'Surface', 'type': 'SHADER'}]}}
+    passes, why = _wired_plan(_wired_out(dict(both, **mx), ['mx', 0]))
+    check('two Emissions through a Max Blend (its chain drops a bare side OUT; an emission lobe is scaled): refused by that node\'s name, word for word',
+          passes is None and why == "'Wired': " + GSH.emission_route_refusal('HALCYON_MaxBlendNode'), str(why))
+    behind_mix = dict(both, **mx, **_shader_pair('ShaderNodeMixShader', ['mx', 0], ['e1', 0], 0.5))
+    passes, why = _wired_plan(_wired_out(behind_mix, ['two', 0]))
+    check('...and so is a Max Blend BEHIND a Mix Shader (the walk follows every shader input)',
+          passes is None and why == "'Wired': " + GSH.emission_route_refusal('HALCYON_MaxBlendNode'), str(why))
+    behind_rr = dict(both, **mx, rr={'id': 'rr', 'bl_idname': 'NodeReroute', 'props': {}, 'inputs': [_sk('Input', 'SHADER', None, ['mx', 0])],
+                                     'outputs': [{'name': 'Output', 'type': 'SHADER'}]})
+    passes, why = _wired_plan(_wired_out(behind_rr, ['rr', 0]))
+    check('...and a Max Blend behind a Reroute (the walk follows the Reroute)',
+          passes is None and why == "'Wired': " + GSH.emission_route_refusal('HALCYON_MaxBlendNode'), str(why))
+    check('the refusal names the nodes the route IS proven on',
+          all(part in GSH.emission_route_refusal('X') for part in ('through X', 'Emission, Mix Shader, Add Shader and Reroute', 'shades on the CPU exactly')))
+
+    # ---- the walk and the emitter's bare-socket rule
+    check('EMISSION_ROUTE_NODES is the four proven nodes',
+          GM.EMISSION_ROUTE_NODES == ('ShaderNodeEmission', 'ShaderNodeMixShader', 'ShaderNodeAddShader', 'NodeReroute'))
+    from ..core import nodeeval as NE
+    lobe = NE.Closure().add('EMISSION', 1.0)
+    g_mix = _wired_out(dict(both, **_shader_pair('ShaderNodeMixShader', ['e1', 0], ['e2', 0])), ['two', 0])
+    g_max = _wired_out(dict(both, **mx), ['mx', 0])
+    check('emission_route_block: a Mix Shader of Emissions is open (None); a value chain on a shader socket is open; a bare socket is open',
+          GM.emission_route_block(g_mix, {('two', 0): lobe, ('e1', 0): lobe, ('e2', 0): lobe}) is None
+          and GM.emission_route_block(_wired_out(src, link), {('src', 0): np.ones((4, 4), f32)}) is None
+          and GM.emission_route_block(_wired_out(dict(e1, **_shader_pair('ShaderNodeAddShader', ['e1', 0], None)), ['two', 0]),
+                                      {('two', 0): lobe, ('e1', 0): lobe}) is None)
+    check('emission_route_block: a Max Blend stops it, by its bl_idname',
+          GM.emission_route_block(g_max, {('mx', 0): lobe, ('e1', 0): lobe, ('e2', 0): lobe}) == 'HALCYON_MaxBlendNode')
+    em = Emitter({})
+    check('the emitter writes zero for a bare shader socket ONLY under the route (bare_shader_zero is off by default)', em.bare_shader_zero is False)
+    pair = _shader_pair('ShaderNodeAddShader', None, None)['two']
+    em.bare_shader_zero = True
+    check('...and under it the socket is vec4(0, 0, 0, 1)', em.input_indexed(pair, 'Shader', 0, 'vec4') == 'vec4(0.0, 0.0, 0.0, 1.0)')
+
+    # ---- the device road end to end: the GPU device DRAWS it (the fake driver), within the bar of the CPU device's frame
+    lit = _wired_cpu(_wired_out(src, link))
+    R._GBUF_CACHE.clear()
+    GSH._PLAN_CACHE.clear()
+    sc, st = _wired_scene(_wired_out(src, link), device='GPU')
+    buf = io.StringIO()
+    with fakedevice.installed() as dev:
+        with redirect_stdout(buf):
+            gpu = np.asarray(R.render(sc, st))
+        n_shaders = len(dev.shaders)
+    R._GBUF_CACHE.clear()
+    GSH._PLAN_CACHE.clear()
+    said = buf.getvalue()
+    dd = np.abs(gpu[..., :3] - lit[..., :3]) if gpu.shape == lit.shape else None
+    check('the GPU device road shades the wired colour on the driver: material passes drawn, no "shading on the CPU" line',
+          n_shaders >= 1 and 'material pass' in said and 'shading on the CPU' not in said, said[-300:])
+    check('...and its frame is the CPU device\'s within the bar (max < 6e-3, no px > 1e-2)',
+          dd is not None and float(dd.max()) < 6e-3 and int((dd.max(axis=-1) > 1e-2).sum()) == 0,
+          str(None if dd is None else float(dd.max())))
+
+
+# ----------------------------------------------- (23) the world tree's programs
+
+
+#: the reported sky: a coded shader that writes one colour, and the RGB node
+#: of that colour it has to match
+_SKY_RGB = (0.15, 0.35, 0.8)
+_CODE_SKY = _code_says('0.15, 0.35, 0.8')
+
+#: what each Coded Shader input reads in a WORLD tree: the output of the
+#: stock node that reads the same field of the world evaluator's context
+#: (bl_idname, output socket type, output name), or the constant a context
+#: with no such thing holds. Every name of shaders.codegen.VARYINGS is here
+_SKY_INPUTS = {
+    'I': ('ShaderNodeCameraData', 'NodeSocketVector', 'View Vector'),
+    'vObject': ('ShaderNodeTexCoord', 'NodeSocketVector', 'Generated'),
+    'vNormal': ('ShaderNodeTexCoord', 'NodeSocketVector', 'Normal'),
+    'N': ('ShaderNodeTexCoord', 'NodeSocketVector', 'Normal'),
+    'normal': ('ShaderNodeTexCoord', 'NodeSocketVector', 'Normal'),
+    'vUV': ('ShaderNodeTexCoord', 'NodeSocketVector', 'UV'),
+    'uv': ('ShaderNodeTexCoord', 'NodeSocketVector', 'UV'),
+    'vUv': ('ShaderNodeTexCoord', 'NodeSocketVector', 'UV'),
+    'texCoord': ('ShaderNodeTexCoord', 'NodeSocketVector', 'UV'),
+    'vScreenUV': ('ShaderNodeTexCoord', 'NodeSocketVector', 'Window'),
+    'vPosition': ('ShaderNodeNewGeometry', 'NodeSocketVector', 'Position'),
+    'P': ('ShaderNodeNewGeometry', 'NodeSocketVector', 'Position'),
+    'worldPos': ('ShaderNodeNewGeometry', 'NodeSocketVector', 'Position'),
+    'vTangent': ('ShaderNodeNewGeometry', 'NodeSocketVector', 'Tangent'),
+    'vGeoNormal': ('ShaderNodeNewGeometry', 'NodeSocketVector', 'True Normal'),
+    'vView': ('ShaderNodeNewGeometry', 'NodeSocketVector', 'Incoming'),
+    'V': ('ShaderNodeNewGeometry', 'NodeSocketVector', 'Incoming'),
+    'vBackfacing': ('ShaderNodeNewGeometry', 'NodeSocketFloat', 'Backfacing'),
+    'vRandom': ('ShaderNodeNewGeometry', 'NodeSocketFloat', 'Random Per Island'),
+    'vDepth': ('ShaderNodeCameraData', 'NodeSocketFloat', 'View Z Depth'),
+    'vColor': ('ShaderNodeVertexColor', 'NodeSocketColor', 'Color'),
+    'iTime': ('HALCYON_ScreenInfoNode', 'NodeSocketFloat', 'Time'),
+    'time': ('HALCYON_ScreenInfoNode', 'NodeSocketFloat', 'Time'),
+    'iFrame': ('HALCYON_ScreenInfoNode', 'NodeSocketFloat', 'Frame'),
+    # no stock node hands these on: the context's own defaults
+    'vUV2': (0.0, 0.0, 0.0), 'vBitangent': (0.0, 0.0, 0.0), 'vCamera': (0.0, 0.0, 0.0),
+    'gl_FragCoord': (0.0, 0.0, 0.0), 'iResolution': (0.0, 0.0, 1.0),
+}
+
+#: the inputs a sky has nothing for: each reads exactly this in a world tree
+_SKY_NOTHING = {
+    'vUV': 0.0, 'uv': 0.0, 'vUv': 0.0, 'texCoord': 0.0, 'vUV2': 0.0, 'vGeoNormal': 0.0, 'vBitangent': 0.0,
+    'vDepth': 0.0, 'vBackfacing': 0.0, 'vRandom': 0.0, 'vScreenUV': 0.0, 'vCamera': 0.0, 'gl_FragCoord': 0.0,
+    'vColor': 1.0,
+}
+
+
+def _sky_reads(name, gtype):
+    """A coded shader that writes the input `name` as its colour."""
+    kind = 'int' if gtype.base == 'int' else ('float', 'vec2', 'vec3', 'vec4')[gtype.n - 1]
+    value = {'int': f'vec4(vec3(float({name})), 1.0)', 'float': f'vec4(vec3({name}), 1.0)',
+             'vec2': f'vec4({name}, 0.0, 1.0)', 'vec3': f'vec4({name}, 1.0)', 'vec4': f'vec4({name}.xyz, 1.0)'}[kind]
+    declared = '' if name == 'gl_FragCoord' else f'in {kind} {name};\n'
+    return f'{declared}out vec4 Color;\n\nvoid main() {{\n    Color = {value};\n}}\n'
+
+
+def _sky_tree(feed, strength=1.0, background=True):
+    """A world's node tree: `feed(tree)` -> Background (Color) -> World
+    Output, `feed` handing back the output socket it wires. Without the
+    Background that socket goes straight into the World Output's Surface."""
+    tree = types.SimpleNamespace(name='World Nodetree', nodes=_CodeNodes(), links=_CodeLinks())
+    out = _code_plain(tree, 'World Output', 'ShaderNodeOutputWorld', ins=(('NodeSocketShader', 'Surface'),),
+                      is_active_output=True)
+    sock = feed(tree)
+    if background:
+        bg = _code_plain(tree, 'Background', 'ShaderNodeBackground',
+                         ins=(('NodeSocketColor', 'Color'), ('NodeSocketFloat', 'Strength')),
+                         outs=(('NodeSocketShader', 'Background'),))
+        bg.inputs['Strength'].default_value = strength
+        tree.links.new(sock, bg.inputs['Color'])
+        sock = bg.outputs['Background']
+    tree.links.new(sock, out.inputs['Surface'])
+    return tree
+
+
+def _sky_rgb(tree, rgb, name='RGB'):
+    """An RGB node of that colour in `tree`: its Color output."""
+    node = _code_plain(tree, name, 'ShaderNodeRGB', outs=(('NodeSocketColor', 'Color'),))
+    node.outputs['Color'].default_value = (*rgb, 1.0)
+    return node.outputs['Color']
+
+
+def _sky_value(tree, value, name='Value'):
+    node = _code_plain(tree, name, 'ShaderNodeValue', outs=(('NodeSocketFloat', 'Value'),))
+    node.outputs['Value'].default_value = value
+    return node.outputs['Value']
+
+
+def _sky_sum(tree, socks):
+    """The sum of those Color outputs: a chain of Add mixes at factor 1."""
+    acc = socks[0]
+    for k, sock in enumerate(socks[1:]):
+        mix = _code_plain(tree, 'Mix' if not k else f'Mix.{k:03d}', 'ShaderNodeMixRGB',
+                          ins=(('NodeSocketFloat', 'Fac'), ('NodeSocketColor', 'Color1'), ('NodeSocketColor', 'Color2')),
+                          outs=(('NodeSocketColor', 'Color'),), blend_type='ADD', use_clamp=False)
+        mix.inputs['Fac'].default_value = 1.0
+        tree.links.new(acc, mix.inputs['Color1'])
+        tree.links.new(sock, mix.inputs['Color2'])
+        acc = mix.outputs['Color']
+    return acc
+
+
+def _sky_exported(tree):
+    """A stand-in World wearing `tree` through the REAL export_scene (the
+    world block is what is under test, so nothing of it is rebuilt here):
+    (the exported core World, the export's warnings)."""
+    from . import fakeblender as FB
+    from .. import export as EX
+    from ..core.settings import RenderSettings
+    props, _engine = FB.install()
+    depsgraph, scene, _hs, _mat = FB.build_scene(props)
+    scene.world = types.SimpleNamespace(name='World', color=(0.05, 0.05, 0.05), use_nodes=True, node_tree=tree,
+                                        halcyon=FB.live(props.HalcyonWorldSettings, mode='NODES'))
+    warnings = []
+    with redirect_stdout(io.StringIO()):
+        sc = EX.export_scene(depsgraph, RenderSettings(), warnings)
+    return sc.world, warnings
+
+
+def _sky_scene(world, size=(96, 72), device='CPU', mirror=0.0):
+    """The demo scene under that world: (scene, settings). `mirror` makes
+    the Ball reflect its environment by that much."""
+    st = base_settings(size[0], size[1], shadows=False)
+    st.transparency, st.render_device = 'NONE', device
+    sc = demo_scene(st, with_texture=False)
+    sc.world = world
+    if mirror:
+        sc.materials[1].reflect_level = mirror
+    return sc, st
+
+
+def _sky_frame(world, **kw):
+    """The CPU's frame of the demo scene under that world."""
+    sc, st = _sky_scene(world, **kw)
+    with redirect_stdout(io.StringIO()):
+        return np.asarray(R.render(sc, st))
+
+
+def _sky_open(size=(96, 72)):
+    """The pixels of that frame no surface covers: the sky's own."""
+    from ..core import raster as CR
+    sc, _st = _sky_scene(None, size)
+    _view, _proj, vp, _eye = R.camera_matrices(sc.camera, size[0], size[1])
+    g = CR.GBuffer(size[0], size[1])
+    CR.rasterize(sc.mesh.verts, sc.mesh.tris, vp, size[0], size[1], gbuf=g)
+    return ~g.mask()
+
+
+def test_code_node_in_the_world_tree():
+    """A Coded Shader in a WORLD's node tree drew a black sky. The node is
+    offered there (HalcyonNodeBase.poll takes any ShaderNodeTree) and
+    export.serialize_tree compiled its program -- into a dict literal the
+    world export handed it and kept no reference to. core/scene.World had a
+    field for the ground material's programs and none for its own tree's;
+    core/render.world_color, the one place a world graph is evaluated, built
+    its evaluator over an empty dict, and n_halcyon_code answers zeros for a
+    node with no program. No warning, on any road: the GPU sky pass refuses
+    every world graph but a lone Background by name, so the GPU device drew
+    the same zeros from the CPU's evaluator. The programs ride the World
+    now (`programs`, beside `ground_programs`), filed under the graph ids
+    serialize_tree writes, and the world evaluator is handed them -- so a
+    node group in the world tree finds its own, as a material's does. The
+    shader's inputs read the world evaluator's context, as every other node
+    of a world tree does: the ray, and the context's defaults for what a
+    sky has none of."""
+    import dataclasses
+    import importlib
+    import pickle
+    from . import fakebpy
+    from . import fakedevice
+    fakebpy.install()
+    SN = importlib.import_module('halcyon.nodes.shader_nodes')
+    from ..core import mathx as MX
+    from ..core import nodeeval as NE
+    from ..core.scene import World
+    from ..gpu import shade as GSH
+    from ..gpu import sky as GSKY
+    from ..presets import skies as SKP
+    from ..shaders.codegen import VARYINGS
+
+    f3 = lambda rgb: np.asarray(rgb, f32)                       # noqa: E731
+
+    def coded(source, name='Coded Shader', gain=None, surface=False):
+        """feed: a Coded Shader built from `source` (its Gain linked to a
+        Value node reading `gain`), handing on its Color -- or, as a
+        surface, the closure of its first output."""
+        def feed(tree):
+            node = _code_coded(SN, tree, name, _code_text(name, source))
+            if gain is not None:
+                tree.links.new(_sky_value(tree, gain), node.inputs['Gain'])
+            if surface:
+                node.as_surface = True
+                node.compile_source()
+            return node.outputs['Surface' if surface else 'Color']
+        return feed
+
+    def rgb(colour):
+        return lambda tree: _sky_rgb(tree, colour)
+
+    def grouped(inner, name='Group', gain=1.0):
+        """feed: a group node holding `inner` (a group's tree)."""
+        return lambda tree: _code_group_node(tree, name, inner, gain).outputs['Color']
+
+    def world_of(feed, **kw):
+        return _sky_exported(_sky_tree(feed, **kw))[0]
+
+    def same(a, b):
+        return bool(np.array_equal(a, b))
+
+    def as_1920(world):
+        """The same export as 1.92.0 handed the renderer: the graph, and
+        no program for it."""
+        return dataclasses.replace(world, programs=None)
+
+    open_ = _sky_open()
+    n_open = int(open_.sum())
+
+    def sky_is(img, colour):
+        """Every sky pixel of the frame is exactly that colour, opaque."""
+        return bool((img[open_][:, :3] == f3(colour)).all() and (img[open_][:, 3] == 1.0).all())
+
+    # ---- the report: Coded Shader (Color) -> Background (Color) -> World Output (Surface)
+    world, warns = _sky_exported(_sky_tree(coded(_CODE_SKY)))
+    check('the reported world: the export keeps the program its Coded Shader compiles, under the node\'s graph id, '
+          'beside the graph (1.92.0 compiled it into a dict nothing kept)',
+          world.mode == 'NODES' and sorted(world.programs or {}) == ['Coded Shader'] and not warns
+          and world.programs['Coded Shader'].source == world.graph['nodes']['Coded Shader']['props']['source_text']
+          == _CODE_SKY, f'{sorted(getattr(world, "programs", None) or {})} {warns}')
+    sky = _sky_frame(world)
+    plain = _sky_frame(world_of(rgb(_SKY_RGB)))
+    check(f'the sky is the shader\'s colour: all {n_open} uncovered pixels of the 96x72 frame read exactly '
+          f'{_SKY_RGB}', n_open > 2000 and sky_is(sky, _SKY_RGB), f'{n_open} {sky[open_][:, :3].mean(axis=0)}')
+    check('...and the frame is the frame of an RGB node of that colour in the node\'s place, bit for bit',
+          same(sky, plain) and sky_is(plain, _SKY_RGB), str(_dmax(sky, plain)))
+    old = _sky_frame(as_1920(world))
+    check('the 1.92.0 export of the same tree drew a black sky (these frames can tell)',
+          sky_is(old, (0.0, 0.0, 0.0)) and not same(old, sky), str(old[open_][:, :3].max()))
+    check('a World built by hand has no programs and none is asked for (the field\'s default is None)',
+          World().programs is None and same(_sky_frame(World(mode='NODES', graph=world.graph)), old)
+          and 'programs' in {f.name for f in dataclasses.fields(World)})
+    check('the programs travel with the node tree, never with a sky preset or a sky file',
+          'programs' not in SKP.sky_fields() and 'graph' not in SKP.sky_fields())
+
+    # ---- the node as Add > Coded Shader leaves it: the starter shader, inline, no Text
+    fresh, warns = _sky_exported(_sky_tree(lambda tree: _code_coded(SN, tree, 'Coded Shader', None).outputs['Color']))
+    started = _sky_frame(fresh)[open_][:, :3]
+    shades = len(np.unique(started, axis=0))
+    check('a node nobody has typed in yet draws its starter shader on the sky: the base colour in its bands, where '
+          'the 1.92.0 export of it was black', sorted(fresh.programs) == ['Coded Shader'] and not warns
+          and float(started.min()) > 0.1 and 2 <= shades <= 7 and bool((started[:, 0] > started[:, 2]).all())
+          and sky_is(_sky_frame(as_1920(fresh)), (0.0, 0.0, 0.0)), f'{shades} shades, min {started.min()} {warns}')
+
+    # ---- the sockets feed the program there too, and the Background's Strength scales it
+    linked = _sky_frame(world_of(coded(_CODE_BLUE, gain=0.7), strength=1.3))
+    wanted = f3((0.05, 0.05, 0.7)) * f32(1.3)
+    check('a linked uniform reaches the world\'s program: Gain from a Value node at 0.7 under a Background of '
+          'Strength 1.3 is the RGB node\'s frame, bit for bit',
+          same(linked, _sky_frame(world_of(rgb((0.05, 0.05, 0.7)), strength=1.3))) and sky_is(linked, wanted),
+          str(linked[open_][:, :3].mean(axis=0)))
+
+    # ---- the other two ways a coded colour reaches the World Output
+    straight = _sky_frame(world_of(coded(_CODE_SKY), background=False))
+    check('the Color wired straight into the World Output\'s Surface (an Emission of it) is the same sky, bit for '
+          'bit', same(straight, sky), str(_dmax(straight, sky)))
+    surf_world, warns = _sky_exported(_sky_tree(coded(_CODE_SKY, surface=True), background=False))
+    check('Output as Surface: the node\'s own closure into the World Output is the same sky, bit for bit',
+          [o['name'] for o in surf_world.graph['nodes']['Coded Shader']['outputs']] == ['Surface', 'Color']
+          and surf_world.graph['nodes']['Coded Shader']['props']['as_surface'] is True and not warns
+          and same(_sky_frame(surf_world), sky), str(_dmax(_sky_frame(surf_world), sky)))
+
+    # ---- inside a node group: the program is filed under the node's path and found there
+    in_group, warns = _sky_exported(_sky_tree(grouped(_code_group_tree(SN, _code_text('blue', _CODE_BLUE)))))
+    check('a Coded Shader inside a node group of the world tree: its program is kept under its path',
+          sorted(in_group.programs) == ['Group/Coded Shader'] and not warns
+          and in_group.programs['Group/Coded Shader'].source == _CODE_BLUE
+          and sorted(in_group.graph['nodes']['Group']['group']['nodes'])
+          == ['Group/Coded Shader', 'Group/Group Input', 'Group/Group Output'], f'{sorted(in_group.programs)} {warns}')
+    grp = _sky_frame(in_group)
+    check('...and its sky is the RGB node\'s (the group\'s Gain, 1.0, through the Group Input), bit for bit',
+          sky_is(grp, (0.05, 0.05, 1.0)) and same(grp, _sky_frame(world_of(rgb((0.05, 0.05, 1.0))))),
+          str(grp[open_][:, :3].mean(axis=0)))
+    check('...the same shader in the world\'s own tree draws that frame too',
+          same(grp, _sky_frame(world_of(coded(_CODE_BLUE, gain=1.0)))))
+    check('...where the 1.92.0 export of the group drew black', sky_is(_sky_frame(as_1920(in_group)), (0.0, 0.0, 0.0)))
+
+    def pair(inner='Coded Shader'):
+        """The world's own Coded Shader (RED, Gain 0.7) plus a group's
+        (BLUE, Gain 1.0): both under the default name unless told."""
+        def feed(tree):
+            top = coded(_CODE_RED, gain=0.7)(tree)
+            inside = _code_group_tree(SN, _code_text('blue', _CODE_BLUE), coded=inner)
+            return _sky_sum(tree, [top, grouped(inside)(tree)])
+        return feed
+
+    both, warns = _sky_exported(_sky_tree(pair()))
+    check('the world\'s Coded Shader beside a group\'s, both under the default name: two programs, each its own',
+          sorted(both.programs) == ['Coded Shader', 'Group/Coded Shader'] and not warns
+          and both.programs['Coded Shader'].source == _CODE_RED
+          and both.programs['Group/Coded Shader'].source == _CODE_BLUE, f'{sorted(both.programs)} {warns}')
+    summed = _sky_frame(both)
+    two_rgb = _sky_frame(world_of(lambda tree: _sky_sum(tree, [_sky_rgb(tree, (0.7, 0.05, 0.05)),
+                                                              _sky_rgb(tree, (0.05, 0.05, 1.0), 'RGB.001')])))
+    check('...their sum is the frame of the same trees with the inner node renamed, and of two RGB nodes through '
+          'the same Mix, bit for bit', same(summed, _sky_frame(world_of(pair('Coded Shader.001'))))
+          and same(summed, two_rgb) and sky_is(summed, f3((0.7, 0.05, 0.05)) + f3((0.05, 0.05, 1.0))),
+          str(summed[open_][:, :3].mean(axis=0)))
+    nest = _code_group_tree(SN, nested=_code_group_tree(SN, _code_text('green', _CODE_GREEN)))
+    deep, warns = _sky_exported(_sky_tree(grouped(nest, 'Outer', gain=0.6)))
+    check('a group in a group: the program two levels down is found by its whole path',
+          sorted(deep.programs) == ['Outer/Group/Coded Shader'] and not warns
+          and sky_is(_sky_frame(deep), (0.05, 0.6, 0.05)), f'{sorted(deep.programs)} {warns}')
+
+    # ---- a source that does not compile: no program, a warning by the node's id, zeros and no error
+    broken = _CODE_SKY.replace('0.15, 0.35, 0.8', 'nothing, 0.35, 0.8')
+    bad, warns = _sky_exported(_sky_tree(coded(broken)))
+    check('a world Coded Shader that does not compile files no program and the export warns by the node\'s id',
+          bad.programs == {} and len(warns) == 1 and warns[0].startswith('Coded Shader: line ')
+          and "undeclared identifier 'nothing'" in warns[0], f'{sorted(bad.programs)} {warns}')
+    inner = _code_group_tree(SN, _code_text('blue', _CODE_BLUE))
+    inner.nodes.get('Coded Shader').source = _code_text('bad', broken)       # edited after its sockets were built
+    bad_in, warns = _sky_exported(_sky_tree(grouped(inner)))
+    check('...inside a group, by its path', bad_in.programs == {} and len(warns) == 1
+          and warns[0].startswith('Group/Coded Shader: line '), str(warns))
+    check('...and its sky is black, as a node without a program reads on every road',
+          sky_is(_sky_frame(bad), (0.0, 0.0, 0.0)))
+
+    # ---- the inputs: what the world evaluator's context gives every other node, or the context's
+    # defaults -- and nothing raises (STRICT lets no node error be swallowed)
+    check('every input the Coded Shader binds is accounted for below', set(_SKY_INPUTS) == set(VARYINGS)
+          and set(_SKY_NOTHING) <= set(VARYINGS), str(sorted(set(_SKY_INPUTS) ^ set(VARYINGS))))
+    rng = np.random.default_rng(21)
+    dirs = rng.normal(size=(64, 3)).astype(f32)
+    unit = MX.normalize(dirs)
+    sc_in, st_in = _sky_scene(None)
+    sc_in.time, sc_in.frame = 2.5, 61
+    eye = np.asarray(sc_in.camera.matrix_world, f32)[:3, 3]
+
+    def reads(world_):
+        sc_in.world = world_
+        return np.asarray(R.world_color(sc_in, st_in, dirs, {}, eye=eye))
+
+    def stock(idname, stype, output):
+        def feed(tree):
+            return _code_plain(tree, 'Stock', idname, outs=((stype, output),)).outputs[output]
+        return feed
+
+    strict = NE.STRICT
+    NE.STRICT = True
+    got, raised, differs = {}, [], []
+    try:
+        for name in sorted(VARYINGS):
+            source = _sky_reads(name, VARYINGS[name][1])
+            world_, warns = _sky_exported(_sky_tree(coded(source)))
+            if warns or sorted(world_.programs) != ['Coded Shader']:
+                raised.append(f'{name}: {warns}')
+                continue
+            try:
+                got[name] = reads(world_)
+                want = _SKY_INPUTS[name]
+                ref = reads(world_of(stock(*want))) if isinstance(want[0], str) else \
+                    np.broadcast_to(f3(want), (64, 3))
+            except Exception as exc:                            # noqa: BLE001
+                raised.append(f'{name}: {type(exc).__name__}: {exc}')
+                continue
+            if not same(got[name], ref):
+                differs.append(name)
+        extra = {
+            'pixel': 'in vec3 vObject;\nout vec4 Color;\n\nvoid main() {\n'
+                     '    vec3 d = dFdx(vObject) + dFdy(vObject) + fwidth(vObject);\n'
+                     '    Color = vec4(d + vec3(dither4x4(0.25)), 1.0);\n}\n',
+            'fourth': 'in vec4 vColor;\nout vec4 Color;\n\nvoid main() {\n'
+                      '    Color = vec4(gl_FragCoord.w, vColor.a, 0.0, 1.0);\n}\n'}
+        for name, source in extra.items():
+            try:
+                got[name] = reads(world_of(coded(source)))
+            except Exception as exc:                            # noqa: BLE001
+                raised.append(f'{name}: {type(exc).__name__}: {exc}')
+        # the stock outputs named above are ones their nodes really hand on (a misspelled one would read
+        # zero beside an input that reads zero, and agree with it for nothing)
+        ghost = []
+        for idname, stype, output in sorted({v for v in _SKY_INPUTS.values() if isinstance(v[0], str)}):
+            graph = world_of(stock(idname, stype, output)).graph
+            vals = NE.GraphEvaluator(graph, NE.ShadeContext(4)).eval_node(graph['nodes']['Stock'])
+            if output not in (vals or {}):
+                ghost.append(f'{idname}.{output}')
+    finally:
+        NE.STRICT = strict
+    check(f'all {len(VARYINGS)} inputs compile, export and run in a world tree and none raises', not raised
+          and len(got) == len(VARYINGS) + len(extra), '; '.join(raised[:3]))
+    check('the stock outputs they are held against are outputs those nodes produce', not ghost, ', '.join(ghost))
+    check('each reads what the stock node of the same field reads in a world tree (Texture Coordinate, Geometry, '
+          'Camera Data, Color Attribute, Screen Info), or the context\'s default, bit for bit', not differs,
+          ', '.join(differs))
+    check('the ray: I is the direction, vObject the direction, vNormal and vView its reverse, vPosition a point '
+          '1e6 along it', raised or (
+              same(got['I'], MX.normalize(unit)) and same(got['vObject'], unit) and same(got['vNormal'], -unit)
+              and same(got['vView'], -MX.normalize(unit)) and same(got['vPosition'], unit * f32(1e6))))
+    wrong = [k for k, v in _SKY_NOTHING.items() if k in got and not bool((got[k] == f32(v)).all())]
+    check('what a sky has none of reads zeros (UVs, the geometric normal, the bitangent, depth, backfacing, '
+          'random, the screen and the camera position) and the vertex colour white', not wrong and not raised,
+          ', '.join(wrong))
+    check('the pixel\'s builtins stand down: derivatives read zero and the ordered dither hands its value on',
+          raised or bool((got['pixel'] == f32(0.25)).all()), str(None if raised else got['pixel'][0]))
+    check('the fourth components: gl_FragCoord.w is 1 and the vertex colour\'s alpha is 1',
+          raised or bool((got['fourth'] == f3((1.0, 1.0, 0.0))).all()), str(None if raised else got['fourth'][0]))
+
+    # ---- the frame's other roads onto the sky: reflections, bands, a worker's copy
+    mirror = _sky_frame(world, mirror=0.6)
+    ball = (~open_) & (np.abs(mirror[:, :, :3] - sky[:, :, :3]).max(axis=2) > 1e-3)
+    off = float(np.abs(mirror[:, :, :3] - _sky_frame(as_1920(world), mirror=0.6)[:, :, :3])[ball].max())
+    check('a mirror reflects the coded sky as it reflects the RGB node\'s (bit for bit), where the 1.92.0 export '
+          'reflected black', int(ball.sum()) > 200 and same(mirror, _sky_frame(world_of(rgb(_SKY_RGB)), mirror=0.6))
+          and off > 0.05, f'{int(ball.sum())} px, {off}')
+    sc_b, st_b = _sky_scene(world)
+    with redirect_stdout(io.StringIO()):
+        bands = [np.asarray(R.render(sc_b, st_b, band=b)) for b in ((0, 25), (25, 50), (50, 72))]
+    check('rendered in three bands, as the worker pool does, the frame is the whole frame bit for bit',
+          same(np.concatenate(bands, axis=0), sky), str([b.shape for b in bands]))
+    shipped = pickle.loads(pickle.dumps(world))
+    check('the world as a worker receives it (pickled: each program recompiles on arrival) draws the same frame',
+          sorted(shipped.programs) == ['Coded Shader'] and shipped.programs['Coded Shader'] is not
+          world.programs['Coded Shader'] and same(_sky_frame(shipped), sky))
+
+    # ---- the GPU device: the sky pass refuses a world graph by name and the CPU draws it
+    def gpu_frame(world_, mirror_=0.0, clear=True):
+        sc, st = _sky_scene(world_, device='GPU', mirror=mirror_)
+        if clear:
+            R._GBUF_CACHE.clear()
+            GSH._PLAN_CACHE.clear()
+        said = io.StringIO()
+        with redirect_stdout(said), fakedevice.installed():
+            img = np.asarray(R.render(sc, st))
+        return img, dict(GSH.LAST_TIMINGS), dict(R.LAST_GPU_VERDICT), said.getvalue()
+
+    sc_g, st_g = _sky_scene(world, device='GPU')
+    why = GSKY.refusal(sc_g, st_g)
+    check('the GPU sky pass refuses the coded world by name', why == 'the world node graph is evaluated on the CPU',
+          str(why))
+    GSKY._WARNED.discard(why)                # said once a session: this frame is the one that says it
+    gpu, LT, verdict, said = gpu_frame(world)
+    check('the GPU device shades the surfaces and its sky is the CPU\'s, bit for bit',
+          verdict.get('engaged') is True and LT.get('sky') == -1 and LT.get('sky_why') == why
+          and same(gpu[open_], sky[open_]) and sky_is(gpu, _SKY_RGB),
+          f'{verdict.get("engaged")} {LT.get("sky")} {LT.get("sky_why")!r}')
+    check('...and the console says why the sky is not the pass\'s own, by name',
+          f'[Halcyon GPU] sky on the CPU: {why}' in said.splitlines(), said[-300:])
+    gpu_m, LT, verdict, _said = gpu_frame(world, 0.6)
+    d = float(np.abs(gpu_m[:, :, :3] - mirror[:, :, :3]).max())
+    check('...and a mirror on the GPU device reflects it (the environment term is the CPU\'s evaluator there): '
+          'the frame within the shading twin\'s rounding of the CPU\'s', verdict.get('engaged') is True
+          and d <= 6e-6 and same(gpu_m[open_], mirror[open_]), f'{verdict.get("engaged")} max {d}')
+
+    # ---- an edit of the source: nothing caches the world graph, so nothing has to follow it
+    edited, warns = _sky_exported(_sky_tree(coded(_CODE_SKY.replace('0.15, 0.35, 0.8', '0.8, 0.35, 0.15'))))
+    plan_keys = set(GSH._PLAN_CACHE)
+    gpu_e, LT, verdict, _said = gpu_frame(edited, 0.6, clear=False)
+    cpu_e = _sky_frame(edited, mirror=0.6)
+    d = float(np.abs(gpu_e[:, :, :3] - cpu_e[:, :, :3]).max())
+    check('the source edited and exported again, every cache left warm: the sky and the mirror follow on both '
+          'devices', sky_is(cpu_e, (0.8, 0.35, 0.15)) and same(gpu_e[open_], cpu_e[open_]) and d <= 6e-6
+          and float(np.abs(cpu_e[:, :, :3] - mirror[:, :, :3])[ball].max()) > 0.05, f'max {d}')
+    check('...on ONE deferred plan: the plan\'s signature holds whether the world has a graph, not the graph (the '
+          'sky and the environment term are evaluated per frame, never baked into a pass)',
+          len(plan_keys) == 1 and set(GSH._PLAN_CACHE) == plan_keys, f'{len(plan_keys)} {len(GSH._PLAN_CACHE)}')
 
 
 def main():

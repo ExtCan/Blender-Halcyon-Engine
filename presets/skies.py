@@ -33,6 +33,10 @@ FORMAT_VERSION = 1
 EXCLUDED = frozenset({
     'graph', 'env_image', 'mist', 'mist_start', 'mist_depth', 'mist_color',
     'mist_falloff', 'mist_intensity', 'mode', 'strength',
+    # R253 (review): the node tree's compiled Coded Shader programs travel
+    # with the tree ('graph', above), never with a sky -- a preset that
+    # reset them would leave the graph's Coded Shaders without a program
+    'programs',
     'ground_image',       # R251 C048: the Mode 7 map, an image datablock
     # R253: a skybox belongs to its images, not to the Bryce library --
     # the six slots foremost (an ImageBuffer is not JSON), and the dials
