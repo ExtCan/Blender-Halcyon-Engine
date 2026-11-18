@@ -1413,6 +1413,302 @@ def test_k_the_small_ones():
           and not np.array_equal(again, mapped))
 
 
+def test_l_the_gpu_device_bakes_its_maps():
+    """perf-gpu-device-cpu-bake-02: on the GPU device every map was baked
+    by the NumPy fill while a traced shadow never left the shader. The
+    device bakes them now -- the compute rasteriser's depth-only variant,
+    one image read back into the same ShadowMap -- and anything it
+    cannot do goes back to the CPU bake by name."""
+    from . import fakedevice
+    from ..gpu import craster as CRA
+    from ..gpu import device as DV
+
+    def lamps():
+        return [_lamp('SUN', pos=(1, 2, 6), name='S'),
+                _lamp('SPOT', pos=(-3, -2, 4), name='T')]
+
+    def gpu_settings(size=32, **kw):
+        kw.setdefault('render_device', 'GPU')
+        return _settings(size, **kw)
+
+    # the kernel: one image, the camera raster's own walk, every push
+    # constant read
+    comp, frag = CRA.depth_compute_source(), CRA.depth_fragment_source()
+    walk = CRA.COMPUTE_SOURCE[CRA.COMPUTE_SOURCE.index('vec4 hal_raster_pixel'):
+                              CRA.COMPUTE_SOURCE.index("// the winner's outputs")]
+    check('the depth variant is the compute rasteriser\'s own pixel walk '
+          '(the same text), stores ONE image and carries no resolve',
+          walk in comp and comp.count('imageStore(') == 1
+          and 'imageStore(hal_out_depth, xy,' in comp
+          and 'hal_raster_resolve' not in comp
+          and 'hal_raster_resolve' not in frag
+          and CRA.compute_variant_name(depth=True) == 'HAL_RASTER_DEPTH'
+          and CRA.compute_source(depth=True) is comp)
+    check('every push constant of RASTER_FLOATS is read by its text, and '
+          'a dispatch sets every one of them',
+          fakedevice.unread_uniforms(comp, CRA.RASTER_FLOATS
+                                     + CRA.DEPTH_SAMPLERS) == []
+          and sorted(CRA.depth_uniforms(8, 8, 32)) == sorted(
+              CRA.RASTER_FLOATS)
+          and CRA.depth_uniforms(8, 8, 32)['hal_refer'] == 1.0)
+
+    # a GPU-device frame: the maps are baked by the kernel and are the
+    # CPU bake's, texel for texel
+    st_c = _settings(32)
+    sc_c = _scene(lamps(), st_c)
+    cpu = _cold(sc_c, st_c)
+    cpu_maps = _maps(sc_c)
+    cpu_keys = [l._shadow_key for l in sc_c.lights]
+    st = gpu_settings()
+    sc = _scene(lamps(), st)
+    LI.clear_shadow_cache()
+    with fakedevice.installed(compute=True) as dev:
+        with _spy() as calls:
+            img = np.asarray(R.render(sc, st))
+        n_first = len(dev.compute['dispatches'])
+        check('a GPU-device frame bakes each map with ONE dispatch of the '
+              'depth kernel into a one-channel image, in line',
+              n_first == 2 and len(calls) == 2
+              and dev.compute['dispatches'] == [
+                  ('HAL_RASTER_DEPTH', 32, 32, 'R32F')] * 2
+              and CRA.LAST_DEPTH.get('faces') == 2,
+              str(dev.compute['dispatches']))
+        check('the maps it read back are the CPU bake\'s, bit for bit, and '
+              'the frame is the frame those maps give',
+              _same_maps(_maps(sc), cpu_maps)
+              and float(np.abs(img - cpu).max()) < 6e-3,
+              f'{float(np.abs(img - cpu).max()):.6f}')
+        check('a device map is kept apart from the fill\'s in the cache '
+              '(its key names the baker)',
+              all(k[2][-1] == ('baker', 'device')
+                  for k in (l._shadow_key for l in sc.lights))
+              and all(k[2][-1] != ('baker', 'device') for k in cpu_keys))
+        np.asarray(R.render(sc, st))
+        check('the next frame is served the device\'s maps: no dispatch',
+              len(dev.compute['dispatches']) == n_first)
+        # the CPU device beside it: never served a device map
+        st_c2 = _settings(32)
+        sc_c2 = _scene(lamps(), st_c2)
+        with _spy() as calls:
+            np.asarray(R.render(sc_c2, st_c2))
+        np.asarray(R.render(sc, st))
+        check('a CPU-device frame of the same scene is not served the '
+              'device\'s maps: it bakes its own two (the same texels), and '
+              'the GPU-device frame after it is still served the device\'s',
+              len(calls) == 2 and _same_maps(_maps(sc_c2), cpu_maps)
+              and all(a.shadow_map is not b.shadow_map
+                      for a, b in zip(sc_c2.lights, sc.lights))
+              and len(dev.compute['dispatches']) == n_first)
+        # a moved lamp: its map alone, on the device
+        sc.lights[1].position = (-3.0, -2.2, 4.0)
+        np.asarray(R.render(sc, st))
+        check('a nudged lamp re-bakes its own map on the device (one '
+              'dispatch)', len(dev.compute['dispatches']) == n_first + 1)
+        # a moved object: the static layer and the moved layer are both
+        # the device's, and their minimum is the full bake
+        n0 = len(dev.compute['dispatches'])
+        ball = int(sc.mesh.obj_index.max())
+        bv = np.unique(sc.mesh.tris[sc.mesh.obj_index == ball])
+        sc.mesh.verts[bv, 0] += 0.2
+        np.asarray(R.render(sc, st))
+        sc.mesh.verts[bv, 0] += 0.2
+        with _spy() as calls:
+            np.asarray(R.render(sc, st))
+        moved_maps = _maps(sc)
+        st_f = _settings(32)
+        sc_f = _scene(lamps(), st_f)
+        sc_f.lights[1].position = (-3.0, -2.2, 4.0)
+        sc_f.mesh.verts[:] = sc.mesh.verts
+        _cold(sc_f, st_f)
+        check('a moved object re-rasterises itself on the device over the '
+              'device\'s static layer; the maps are a fresh CPU bake\'s',
+              len(dev.compute['dispatches']) > n0
+              and all(c[0] < sc.mesh.tris.shape[0] // 3 for c in calls)
+              and _same_maps(moved_maps, _maps(sc_f)))
+        # MIDPOINT: the second surface is the fill's
+        n0 = len(dev.compute['dispatches'])
+        st_m = gpu_settings(shadow_map_depth='MIDPOINT')
+        sc_m = _scene(lamps(), st_m)
+        np.asarray(R.render(sc_m, st_m))
+        check('a MIDPOINT map is baked by the fill on any device (no '
+              'dispatch, the fill\'s key)',
+              len(dev.compute['dispatches']) == n0
+              and all(k[2][-1] != ('baker', 'device')
+                      for k in (l._shadow_key for l in sc_m.lights)))
+    # the CPU device, the GPU Rasteriser off, a worker's band: untouched
+    for label, kw, band in (('the CPU device', {'render_device': 'CPU'},
+                             None),
+                            ('GPU Rasteriser off', {'gpu_raster': False},
+                             None),
+                            ('a worker\'s band', {}, (0, 36))):
+        s = gpu_settings(**kw)
+        scn = _scene(lamps(), s)
+        LI.clear_shadow_cache()
+        with fakedevice.installed(compute=True) as dev:
+            np.asarray(R.render(scn, s, band=band))
+            check(f'{label}: nothing is compiled or dispatched for the '
+                  'maps and their keys are the fill\'s',
+                  dev.compute['compiles'] == []
+                  and all(l._shadow_key[2][-1] != ('baker', 'device')
+                          for l in scn.lights)
+                  and _same_maps(_maps(scn), cpu_maps))
+
+    # refusals, each by name, each ending in the CPU bake's texels
+    def frame(dev_kw, patch=None, size=32):
+        s = gpu_settings(size)
+        scn = _scene(lamps(), s)
+        LI.clear_shadow_cache()
+        out = io.StringIO()
+        with fakedevice.installed(compute=True, **dev_kw) as dev:
+            undo = patch(dev) if patch else None
+            try:
+                with contextlib.redirect_stdout(out):
+                    np.asarray(R.render(scn, s))
+                state = dict(DV._STATE.get('depth_bake', {}))
+            finally:
+                if undo:
+                    undo()
+        said = [ln for ln in out.getvalue().splitlines()
+                if ln.startswith('[Halcyon GPU] shadow')
+                and 'on the CPU' in ln]
+        printed.append(out.getvalue())
+        return scn, dev, said, state
+
+    printed = []
+    scn, dev, said, state = frame({'compute_formats': ('RGBA32F',)})
+    check('a frame that baked on the device prints the split of it (host, '
+          'upload, dispatch, read)',
+          '[Halcyon GPU] shadow bake: 2 map face(s) on the device; host '
+          in printed[-1] and ' ms, read ' in printed[-1])
+    check('a driver that creates no R32F image: the wide format is tried '
+          'next and bakes the same maps, with nothing to say',
+          [d[3] for d in dev.compute['dispatches']] == ['RGBA32F'] * 2
+          and state.get('fmt') == 'RGBA32F' and 'R32F' in state.get('bad', {})
+          and said == [] and _same_maps(_maps(scn), cpu_maps),
+          str(state))
+    scn, dev, said, state = frame({'compute_formats': ()})
+    check('a driver that compiles the kernel in neither format: the frame '
+          'bakes on the CPU under the fill\'s keys and says so once, by '
+          'name',
+          dev.compute['dispatches'] == [] and len(said) == 1
+          and 'shadow maps bake on the CPU this session' in said[0]
+          and 'compute CreateInfo failed' in said[0]
+          and all(l._shadow_key[2][-1] != ('baker', 'device')
+                  for l in scn.lights)
+          and _same_maps(_maps(scn), cpu_maps), str(said))
+
+    def broken_dispatch(dev):
+        real = DV.dispatch_compute
+
+        def boom(*a, **k):
+            raise RuntimeError('the driver lost the context')
+        DV.dispatch_compute = boom
+        return lambda: setattr(DV, 'dispatch_compute', real)
+    CRA._DEPTH_SAID.clear()
+    scn, dev, said, state = frame({}, patch=broken_dispatch)
+    check('a dispatch that raises: both formats are retired, every face '
+          'is baked by the CPU and the frame names the driver\'s words',
+          len(said) == 1 and 'shadow bake on the CPU' in said[0]
+          and 'the driver lost the context' in said[0]
+          and '(2 faces)' in said[0] and state.get('dead')
+          and _same_maps(_maps(scn), cpu_maps), str(said))
+
+    def wrong_texels(dev):
+        real = DV.dispatch_compute
+
+        def off(shader, w, h, **k):
+            out = real(shader, w, h, **k)
+            return {nm: np.where(a < 1e29, a * 0.5, a).astype(np.float32)
+                    for nm, a in out.items()}
+        DV.dispatch_compute = off
+        return lambda: setattr(DV, 'dispatch_compute', real)
+    scn, dev, said, state = frame({}, patch=wrong_texels)
+    check('a device whose first map is not the CPU\'s map is not believed: '
+          'the check against the fill switches the device bake off, by '
+          'name, and the maps are the fill\'s',
+          len(said) == 1 and 'differs from the CPU\'s' in said[0]
+          and 'of 1024 texels' in said[0]
+          and len(dev.compute['dispatches']) == 1
+          and _same_maps(_maps(scn), cpu_maps), str(said))
+
+    def one_ulp(dev):
+        real = DV.dispatch_compute
+
+        def wobble(shader, w, h, **k):
+            out = real(shader, w, h, **k)
+            return {nm: np.where(a < 1e29, np.nextafter(
+                a, np.float32(2.0), dtype=np.float32), a).astype(np.float32)
+                for nm, a in out.items()}
+        DV.dispatch_compute = wobble
+        return lambda: setattr(DV, 'dispatch_compute', real)
+    scn, dev, said, state = frame({}, patch=one_ulp)
+    worst = max(float(np.abs(a - b).max()) for x, y in zip(
+        _maps(scn), cpu_maps) for a, b in zip(x, y))
+    check('...while a driver that moves every z by one ulp (a fused '
+          'multiply-add) is believed: its maps are used as they are',
+          said == [] and state.get('checked') == 'R32F'
+          and len(dev.compute['dispatches']) == 2
+          and not _same_maps(_maps(scn), cpu_maps) and worst < 1e-3,
+          f'worst linear depth difference {worst:.2e} world units')
+
+    # texels on an edge: marked by the kernel, decided by the host
+    def quad(a, b, size=32):
+        def w(p):
+            return p / size * 2.0 - 1.0
+        v = np.array([[w(a), w(a), 0.2], [w(b), w(a), 0.2],
+                      [w(b), w(b), 0.6], [w(a), w(b), 0.6]], np.float32)
+        return v, np.array([[0, 1, 2], [0, 2, 3]], np.int32)
+    eye = np.eye(4, dtype=np.float32)
+    with fakedevice.installed(compute=True):
+        v, t = quad(2.3, 29.7)
+        ref = CRg.rasterize_depth(v, t, eye, 32, 32)
+        CRA.LAST_DEPTH.clear()
+        got, why = CRA.bake_depth(v, t, eye, 32)
+        marked = CRA.LAST_DEPTH.get('replayed', 0)
+        v2, t2 = quad(10.3, 14.7)
+        got2, why2 = CRA.bake_depth(v2, t2, eye, 32)
+        ve, te = quad(40.0, 50.0)                 # wholly off the map
+        got3, why3 = CRA.bake_depth(ve, te, eye, 32)
+    check('texels whose centre lies on a triangle edge are marked by the '
+          'kernel and decided again with the fill\'s arithmetic: the plane '
+          'is the fill\'s, bit for bit',
+          why is None and marked == 29 and np.array_equal(got, ref),
+          f'{marked} texels replayed')
+    check('a face on which more than a tenth of the covered texels are '
+          'marked is refused alone, by name (the CPU bakes it)',
+          got2 is None and 'past the referral budget' in str(why2))
+    check('a face no caster reaches comes back blank without a dispatch',
+          why3 is None and CRg.is_blank(got3))
+    # replay_depth against the fill at every texel of a busy face
+    st = _settings(32)
+    sc = _scene([_lamp('POINT')], st, seg=10)
+    LI.clear_shadow_cache()
+    LI._build_shadow_maps(sc, st, None)
+    worst = 0
+    for f in _faces(sc.lights[0].shadow_map)[:3]:
+        em = CRg.depth_screen_tris(sc.mesh.verts, sc.mesh.tris, f.vp, 32, 32)
+        if em is None:
+            continue
+        pk = CRA.pack_raster_inputs(*em, None, 32, 32)
+        yy, xx = np.mgrid[0:32, 0:32]
+        z = CRA.replay_depth(xx.ravel(), yy.ravel(), em[0], em[1], em[3],
+                             pk[4], pk[2].reshape(-1), pk[5])
+        ref = np.asarray(CRg.rasterize_depth(sc.mesh.verts, sc.mesh.tris,
+                                             f.vp, 32, 32))
+        got = np.where(np.isfinite(z), z, 1.0).reshape(32, 32)
+        worst += int((got != ref).sum())
+    check('the host\'s replay decides EVERY texel of a cube\'s faces as the '
+          'fill does (0 texels differ)', worst == 0, f'{worst} differ')
+    # the device's doors take the format, and forget the verdict on a
+    # reset
+    src = open(DV.__file__, encoding='utf-8').read()
+    check('gpu/device: the compute doors take an image format (RGBA32F '
+          'unless named) and a reset forgets the bake\'s verdict',
+          "image_format='RGBA32F'" in src
+          and "_STATE.pop('depth_bake', None)" in src
+          and "format=str(image_format)" in src)
+
+
 def main():
     utf8_console()
     FAILS.clear()

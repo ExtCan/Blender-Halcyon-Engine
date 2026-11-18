@@ -2082,6 +2082,31 @@ def depth_fragments(sx, sy, z, W, H, cull='NONE', max_batch_px=None,
                 yield pix, zz.astype(np.float32, copy=False)
 
 
+def depth_screen_tris(verts, tris, mvp, width, height, near_eps=1e-5):
+    """The triangles a depth bake fills, as the clipper emits them:
+    build_screen_tris' (sx, sy, iw, z, bw, src) after the per-map reject,
+    or None when nothing reaches the target. The one front half of every
+    depth bake -- the fill below and the device's kernel
+    (gpu/craster.bake_depth) both start from these very arrays, so the
+    two can only differ in how they resolve them."""
+    tris = np.asarray(tris, dtype=np.int32)
+    if tris.shape[0] == 0:
+        return None
+    clip = clip_positions(verts, mvp)
+    if tris.shape[0] >= DEPTH_REJECT_MIN_TRIS:
+        keep = frustum_keep(clip, tris, width, height, near_eps=near_eps)
+        if not keep.all():
+            tris = tris[keep]
+            if tris.shape[0] == 0:
+                return None
+    emitted = build_screen_tris(
+        clip, tris, int(width), int(height), snap=0.0, near_eps=near_eps,
+        depth_bits=32)
+    if emitted[0].shape[0] == 0:
+        return None
+    return emitted
+
+
 def rasterize_depth(verts, tris, mvp, width, height, cull='NONE',
                     near_eps=1e-5, second=False):
     """The depth plane `rasterize(verts, tris, mvp, width, height,
@@ -2093,7 +2118,6 @@ def rasterize_depth(verts, tris, mvp, width, height, cull='NONE',
     (z1, z2, has2): per texel the nearest fragment BEYOND the A-buffer
     tolerance of z1 (lights._render_depth has the rule), 1.0 where none
     is nearer than the far plane, and where one exists at all."""
-    tris = np.asarray(tris, dtype=np.int32)
     width, height = int(width), int(height)
 
     def _blank():
@@ -2102,20 +2126,11 @@ def rasterize_depth(verts, tris, mvp, width, height, cull='NONE',
             return z1
         return z1, z1, np.broadcast_to(np.bool_(False), (height, width))
 
-    if tris.shape[0] == 0:
+    emitted = depth_screen_tris(verts, tris, mvp, width, height,
+                                near_eps=near_eps)
+    if emitted is None:
         return _blank()
-    clip = clip_positions(verts, mvp)
-    if tris.shape[0] >= DEPTH_REJECT_MIN_TRIS:
-        keep = frustum_keep(clip, tris, width, height, near_eps=near_eps)
-        if not keep.all():
-            tris = tris[keep]
-            if tris.shape[0] == 0:
-                return _blank()
-    sx, sy, _iw, z, _bw, _src = build_screen_tris(
-        clip, tris, width, height, snap=0.0, near_eps=near_eps,
-        depth_bits=32)
-    if sx.shape[0] == 0:
-        return _blank()
+    sx, sy, z = emitted[0], emitted[1], emitted[3]
     inf = np.float32(np.inf)
     d = np.full((height, width), inf, np.float32)
     flat = d.reshape(-1)

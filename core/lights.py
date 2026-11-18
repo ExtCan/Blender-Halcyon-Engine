@@ -300,8 +300,16 @@ def _box_misses(bounds, vp, size):
                 or (y > g + tol).all() or (y < -g - tol).all())
 
 
+#: R254: the frame's depth baker when the caller names none: None bakes
+#: every map with the NumPy fill below. core/render hands the GPU
+#: device's baker to `build_shadow_maps` per frame (gpu/craster.
+#: DepthBaker) and never sets this; it is the hook for a tool or a test
+#: that wants every bake of the process on a baker of its own
+DEPTH_BAKER = None
+
+
 def _render_depth(verts, tris, vp, size, cull='NONE', midpoint=False,
-                  bounds=None):
+                  bounds=None, baker=None):
     """THE BAKE: vertex positions, caster triangles, a view-projection
     and a size in; the map's NDC depth plane out (1.0 where nothing
     landed), or the MIDPOINT triple (z1, z2, has2).
@@ -314,6 +322,12 @@ def _render_depth(verts, tris, vp, size, cull='NONE', midpoint=False,
     arguments is a bake. `bounds` (lo, hi) is an axis-aligned box around
     the triangles' vertices, when the caller has one: a map the box
     cannot reach returns blank without reading a vertex.
+
+    `baker`, when the frame has one (the GPU device's: gpu/craster.
+    DepthBaker), is asked first for a CLASSIC plane -- baker(verts, tris,
+    vp, size, cull) -- and answers it or None; None is a refusal the
+    baker names itself, and the fill below bakes the face. A MIDPOINT
+    map's second surface is the fill's alone.
 
     R254: depth only (core/raster.rasterize_depth: the same clipper,
     coverage and z as the beauty rasteriser, bitwise its zndc, none of
@@ -338,6 +352,10 @@ def _render_depth(verts, tris, vp, size, cull='NONE', midpoint=False,
     if bounds is not None and _box_misses(bounds, vp, size):
         return raster.rasterize_depth(verts, tris[:0], vp, size, size,
                                       cull=cull, second=midpoint)
+    if baker is not None and not midpoint and tris.shape[0]:
+        plane = baker(verts, tris, vp, size, cull)
+        if plane is not None:
+            return plane
     return raster.rasterize_depth(verts, tris, vp, size, size, cull=cull,
                                   second=midpoint)
 
@@ -915,10 +933,13 @@ class _Frame:
     """What one frame's bakes share: the casters, the scene's bounds and
     the geometry's part of every cache key, read once."""
 
-    def __init__(self, scene, settings, caster_tris):
+    def __init__(self, scene, settings, caster_tris, baker=None):
         self.scene = scene
         self.settings = settings
         self.casters = caster_tris
+        # who bakes this frame's CLASSIC planes beside the NumPy fill
+        # (None: nobody); see `_render_depth`
+        self.baker = DEPTH_BAKER if baker is None else baker
         mesh = scene.mesh
         self.verts = mesh.verts
         self.tris = mesh.tris if caster_tris is None else \
@@ -945,9 +966,15 @@ class _Frame:
 
     def key(self, li):
         base = self.base()
-        return (base[0], base[1],
-                _light_shadow_signature(self.scene.lights[li],
-                                        self.settings))
+        sig = _light_shadow_signature(self.scene.lights[li], self.settings)
+        if self.baker is not None and not self.plan(li).mid:
+            # a baker's maps are kept apart from the fill's: a device
+            # reproduces the fill's texels to the last ulp of z, not bit
+            # for bit, and a CPU-device frame must never be served one
+            # (a MIDPOINT map is the fill's whoever bakes the frame)
+            sig = sig + (('baker', str(getattr(self.baker, 'identity',
+                                               'baker'))),)
+        return (base[0], base[1], sig)
 
     def split(self, excl):
         """(casters of every other object, casters of the objects in
@@ -1029,11 +1056,16 @@ def _run_depth_jobs(frame, jobs):
     if not jobs:
         return []
     verts = frame.verts
+    baker = frame.baker
 
     def one(j):
         return _render_depth(verts, j[0], j[1], j[2], midpoint=j[3],
-                             bounds=j[4])
+                             bounds=j[4], baker=baker)
 
+    if baker is not None:
+        # a device is ONE queue: its dispatches cross to the main thread
+        # one at a time (gpu/device._main), so the faces go in line
+        return [one(j) for j in jobs]
     work = sum(int(j[2]) * int(j[2]) for j in jobs)
     tris = max(int(j[0].shape[0]) for j in jobs)
     if len(jobs) > 1 and (tris >= 50000 or work >= 2_000_000):
@@ -1174,7 +1206,7 @@ def _bake_lamps(frame, indices, cache=True):
         store.store(key, sm)
 
 
-def _plan_frame(scene, settings, caster_tris, only=None):
+def _plan_frame(scene, settings, caster_tris, only=None, baker=None):
     """Reset the lamps (all, or the indices in `only`), decide each
     one's role and leave the deferred ones their promise. Returns
     (frame, indices to bake now), or (None, []) when nothing can be
@@ -1204,10 +1236,10 @@ def _plan_frame(scene, settings, caster_tris, only=None):
                                                  caster_tris, li)
     if not now:
         return None, []
-    return _Frame(scene, settings, caster_tris), now
+    return _Frame(scene, settings, caster_tris, baker=baker), now
 
 
-def build_shadow_maps(scene, settings, caster_tris=None):
+def build_shadow_maps(scene, settings, caster_tris=None, baker=None):
     """Bake a shadow map (or cube) for every light a reader will look up
     (`map_roles`).
 
@@ -1219,12 +1251,17 @@ def build_shadow_maps(scene, settings, caster_tris=None):
     lights... it will lag like crazy'); now only the moved lamp's own
     map rebuilds, a colour, energy or size edit rebuilds nothing at
     all, and a moved OBJECT re-rasterises itself (`_bake_lamps`).
+
+    `baker` is the frame's depth baker (see `_render_depth`): the GPU
+    device's on a GPU-device frame, None otherwise. A map promised to a
+    later lookup (`map_roles`: 'defer') is baked by the fill when it is
+    asked for -- that lookup comes from a shading thread.
     """
     with _BAKE_LOCK:
         cache = bool(getattr(settings, 'cache_shadows', True))
         if cache:
             _SHADOW_CACHE.begin_frame()
-        frame, now = _plan_frame(scene, settings, caster_tris)
+        frame, now = _plan_frame(scene, settings, caster_tris, baker=baker)
         if frame is not None:
             _bake_lamps(frame, now, cache=cache)
 

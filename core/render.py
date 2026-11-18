@@ -4275,9 +4275,28 @@ def _caster_keep_tri(scene, mesh):
     return keep_tri
 
 
-def _build_shadows(scene, st, mesh, traced=None):
+def _shadow_baker(st):
+    """The GPU device's depth baker for this frame (gpu/craster.
+    DepthBaker), or None: the render device is the CPU, the GPU
+    Rasteriser is off (the bake is that compute kernel's depth-only
+    variant and obeys its switch), or the device cannot bake."""
+    if str(getattr(st, 'render_device', 'CPU')).upper() != 'GPU' \
+            or not getattr(st, 'gpu_raster', False):
+        return None
+    try:
+        from ..gpu import craster as _craster
+        return _craster.depth_baker()
+    except Exception:                                           # noqa: BLE001
+        return None
+
+
+def _build_shadows(scene, st, mesh, traced=None, device=False):
     # R254: `traced` says whether a BVH exists for this frame (render()
-    # knows; any other caller leaves it unsaid and one is assumed)
+    # knows; any other caller leaves it unsaid and one is assumed).
+    # `device` lets a GPU-device frame bake its maps on the device: only
+    # render() says so, for a whole frame it shades itself -- a worker's
+    # band, the pool parent's prebake and the texture baker bake on the
+    # CPU, under the CPU's cache keys
     # R253 (H): every lamp's style gain for THIS frame, written before
     # anything reads an energy -- the CPU loop, the beams, the fog
     # lobe, the ambient pool and the GPU packer all see one number
@@ -4298,7 +4317,13 @@ def _build_shadows(scene, st, mesh, traced=None):
     # where no BVH could trace in the map's place (LI.map_roles)
     st._shadow_quiet = not shadow_read_apart_from_light(scene, st)
     st._shadow_untraced = traced is False
-    LI.build_shadow_maps(scene, st, cast)
+    baker = _shadow_baker(st) if device else None
+    try:
+        LI.build_shadow_maps(scene, st, cast, baker=baker)
+    finally:
+        if baker is not None:
+            # every face the device did not bake, by name
+            baker.report()
 
 
 def prebake_shadows(scene, st, limit=None):
@@ -5067,7 +5092,8 @@ def render(scene, settings=None, progress=None, band=None):
             bvh = _cached_bvh(scene, mesh)
 
     with ST.track('shadow maps'):
-        _build_shadows(scene, st, mesh, traced=bvh is not None)
+        _build_shadows(scene, st, mesh, traced=bvh is not None,
+                       device=band is None)
     # R208: the caster mask travels to the RAY shadow road too (the
     # maps already honour it at bake time). visibility() reads it off
     # the settings and hands it to the BVH's any-hit as a cast filter,
