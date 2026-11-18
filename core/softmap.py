@@ -174,6 +174,12 @@ ANISO_STEPS = (2.0, 4.0, 8.0, 16.0)
 #: (CPU road only; the tests turn it off to prove a round footprint
 #: keeps its one stride bit for bit)
 ANISO = True
+#: (CPU road only) how many values one fetch of the search or of the
+#: filter may carry: taps are grouped into (taps, points) blocks up to
+#: this size, which spares numpy's per-call cost on the small arrays a
+#: penumbra is and keeps a block inside the cache. The values and the
+#: order they are summed in are tap by tap what one tap at a time gives
+TAP_BATCH = 32768
 SQRT2 = 1.41421356
 SQRT2_SPAN = 0.58578644
 
@@ -1103,19 +1109,29 @@ def _face(face, fetch, rect, P, N, ndl, slope, soft, shape, dmin,
             return f32(1.0) / np.maximum(lin, p.dr)
         return np.minimum(lin, p.dr)
 
+    cols_s = np.array(tab_s, np.float32)
+
     def blockers(p, t, want_depth):
-        cnt = np.zeros(p.u.shape[0], np.float32)
-        dsum = np.zeros(p.u.shape[0], np.float32) if want_depth else None
+        npts = p.u.shape[0]
+        cnt = np.zeros(npts, np.float32)
+        dsum = np.zeros(npts, np.float32) if want_depth else None
         tg = t * grow
-        for a, b, pa, pb in tab_s:
+        # several taps per fetch while the arrays stay small: a (taps,
+        # points) block holds, tap by tap, the values the taps give one
+        # at a time, and the sums below run in the taps' own order
+        step = max(1, min(len(tab_s), TAP_BATCH // max(npts, 1)))
+        for i in range(0, len(tab_s), step):
+            c = cols_s[i:i + step]
+            a, b, pa, pb = c[:, 0:1], c[:, 1:2], c[:, 2:3], c[:, 3:4]
             xf = np.floor(p.u + (tg * (a * p.ax + b * p.bx) + pa))
             yf = np.floor(p.v + (tg * (a * p.ay + b * p.by) + pb))
             occ, xf, yf = fetch(xf, yf)
             pd = plane(p, xf + f32(0.5) - p.u, yf + f32(0.5) - p.v)
             blk = occ < pd - p.sl
-            cnt += blk
-            if want_depth:
-                dsum += np.where(blk, occ, f32(0.0))
+            for j in range(blk.shape[0]):
+                cnt += blk[j]
+                if want_depth:
+                    dsum += np.where(blk[j], occ[j], f32(0.0))
         return cnt, dsum
 
     # -- 4. the blocker search
@@ -1242,6 +1258,9 @@ def _filter(p, tf, soft, tab_f, fetch, plane, stats=None):
             + int(((k0 > f32(1.0)) | (wa > f32(0.0))).sum())
 
     def tap(pp, px, py, sx, sy):
+        # px, py: (taps, points). The four texels of each bilinear tap
+        # go through ONE fetch -- rows (dy, dx) = (0, 0), (0, 1), (1, 0),
+        # (1, 1), the order their weights are summed in
         gx = px / sx - f32(0.5)
         gy = py / sy - f32(0.5)
         x0 = np.floor(gx)
@@ -1250,31 +1269,51 @@ def _filter(p, tf, soft, tab_f, fetch, plane, stats=None):
         fy = gy - y0
         hx = np.floor(sx * f32(0.5))
         hy = np.floor(sy * f32(0.5))
-        acc = np.zeros(px.shape[0], np.float32)
-        for dy, wy in ((0.0, f32(1.0) - fy), (1.0, fy)):
-            for dx, wx in ((0.0, f32(1.0) - fx), (1.0, fx)):
-                occ, xf, yf = fetch((x0 + f32(dx)) * sx + hx,
-                                    (y0 + f32(dy)) * sy + hy)
-                pd = plane(pp, xf + f32(0.5) - pp.u, yf + f32(0.5) - pp.v)
-                acc += (wx * wy) * (pd - pp.sl <= occ)
+        x1 = x0 + f32(1.0)
+        y1 = y0 + f32(1.0)
+        occ, xf, yf = fetch(np.stack((x0, x1, x0, x1)) * sx + hx,
+                            np.stack((y0, y0, y1, y1)) * sy + hy)
+        pd = plane(pp, xf + f32(0.5) - pp.u, yf + f32(0.5) - pp.v)
+        hit = pd - pp.sl <= occ
+        ex = f32(1.0) - fx
+        ey = f32(1.0) - fy
+        acc = np.zeros(px.shape, np.float32)
+        acc += (ex * ey) * hit[0]
+        acc += (fx * ey) * hit[1]
+        acc += (ex * fy) * hit[2]
+        acc += (fx * fy) * hit[3]
         return acc
 
     acc0 = np.zeros(q.shape[0], np.float32)
     acc1 = np.zeros(blend.size, np.float32)
     acc0f = np.zeros(fine.size, np.float32)
     acc1f = np.zeros(both.size, np.float32)
-    for a, b, sa, sb in tab_f:
+    # several filter taps per fetch while the arrays stay small (as the
+    # search does): the same values, summed in the taps' own order
+    cols = np.array(tab_f, np.float32)
+    step = max(1, min(len(tab_f), TAP_BATCH // (4 * max(q.shape[0], 1))))
+    for i in range(0, len(tab_f), step):
+        c = cols[i:i + step]
+        a, b, sa, sb = c[:, 0:1], c[:, 1:2], c[:, 2:3], c[:, 3:4]
         px = p.u + fq * (tf * (a * p.ax + b * p.bx) + sa)
         py = p.v + fq * (tf * (a * p.ay + b * p.by) + sb)
-        acc0 += tap(p, px, py, sx0, sy0)
+        r0 = tap(p, px, py, sx0, sy0)
         if blend.size:
             # the second lattice only where the cross-fade reaches it
-            acc1 += tap(pb, px[blend], py[blend], sx1, sy1)
+            r1 = tap(pb, px[:, blend], py[:, blend], sx1, sy1)
         if fine.size:
             # and the finer one across a strip's short side
-            acc0f += tap(pf, px[fine], py[fine], sx0f, sy0f)
+            r0f = tap(pf, px[:, fine], py[:, fine], sx0f, sy0f)
         if both.size:
-            acc1f += tap(pbf, px[both], py[both], sx1f, sy1f)
+            r1f = tap(pbf, px[:, both], py[:, both], sx1f, sy1f)
+        for j in range(r0.shape[0]):
+            acc0 += r0[j]
+            if blend.size:
+                acc1 += r1[j]
+            if fine.size:
+                acc0f += r0f[j]
+            if both.size:
+                acc1f += r1f[j]
     if fine.size:
         w2 = wa[fine]
         acc0[fine] = acc0[fine] * (f32(1.0) - w2) + acc0f * w2
