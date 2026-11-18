@@ -3248,6 +3248,17 @@ def _cpu_height_image(job, gbuf, mat_id, node_id):
     per material, per pass: 1.5 seconds times three passes of a
     14-second frame). The values at the computed texels are the full
     image's values bit for bit, so the picture cannot move.
+
+    R253 (review): one pixel of surround PER LEVEL. A height chain that
+    holds another Bump (the deferred pass refuses one it could emit
+    whole, but a chain it cannot emit comes here, Bump and all -- a
+    Bump inside a node group above all) evaluates that Bump right here,
+    differencing these very pixels: its gradient on the surround ring
+    needs the heights one pixel further out, and with the one ring the
+    fetched texels there were cut -- 1.27 off at 446 of a 160x120
+    probe's 3840 flagged pixels. `nodeeval.bump_levels` says how many
+    Bumps deep the node's height reads, and the mask grows by that many
+    pixels more (the outermost rings are evaluated and never fetched).
     """
     from ..core.nodeeval import VALUE
     h, w = gbuf.tri.shape
@@ -3258,11 +3269,19 @@ def _cpu_height_image(job, gbuf, mat_id, node_id):
         if py.size == 0 or ev is None:
             return img
     else:
-        grow = rm.copy()
-        grow[1:] |= rm[:-1]
-        grow[:-1] |= rm[1:]
-        grow[:, 1:] |= rm[:, :-1]
-        grow[:, :-1] |= rm[:, 1:]
+        from ..core.nodeeval import bump_levels
+        mat_l = job.scene.materials[mat_id] \
+            if mat_id < len(job.scene.materials) else None
+        levels = bump_levels(getattr(mat_l, 'graph', None))
+        rings = 1 + next((k for k, ids in enumerate(levels)
+                          if node_id in ids), 0)
+        grow = rm
+        for _ring in range(rings):
+            last, grow = grow, grow.copy()
+            grow[1:] |= last[:-1]
+            grow[:-1] |= last[1:]
+            grow[:, 1:] |= last[:, :-1]
+            grow[:, :-1] |= last[:, 1:]
         mesh = job.scene.mesh
         covered = gbuf.tri >= 0
         m = np.where(covered, mesh.mat_index[gbuf.tri], -1) \
