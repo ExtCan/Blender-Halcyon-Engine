@@ -162,6 +162,15 @@ STRIDES = (2.0, 4.0, 8.0, 16.0, 32.0, 64.0)
 #: a sliding caster's penumbra wanders by up to 3 texels where it
 #: wandered by 1.5 (radius 0.5 at 7 units, a 512 map)
 LATTICE = 6.0
+#: the lattice's stride ACROSS a footprint's short side: from a ratio of
+#: ANISO_FROM between the kernel's blur radii along the map's two axes
+#: it is divided by the largest of ANISO_STEPS (and 1) not above the
+#: ratio, cross-faded to the next (`_filter`)
+ANISO_FROM = 1.5
+ANISO_STEPS = (2.0, 4.0, 8.0, 16.0)
+#: (CPU road only; the tests turn it off to prove a round footprint
+#: keeps its one stride bit for bit)
+ANISO = True
 SQRT2 = 1.41421356
 SQRT2_SPAN = 0.58578644
 
@@ -1026,7 +1035,8 @@ def _filter(p, tf, soft, tab_f, fetch, plane, stats=None):
     # edge: their radii add in quadrature, and the taps (laid out for the
     # plain sum) are drawn in by the ratio
     rl = tf * p.amax
-    r = np.sqrt(rl * rl + f32(soft) * f32(soft))
+    s2 = f32(soft) * f32(soft)
+    r = np.sqrt(rl * rl + s2)
     fq = (r / np.maximum(rl + f32(soft), f32(1e-12))).astype(np.float32)
     q = np.maximum(f32(LATTICE) * r / fn, f32(1.0)).astype(np.float32)
     st0 = np.ones(q.shape[0], np.float32)
@@ -1034,41 +1044,101 @@ def _filter(p, tf, soft, tab_f, fetch, plane, stats=None):
         st0 = np.where(q >= f32(lv), f32(lv), st0)
     wb = np.clip((q / st0 - f32(SQRT2)) / f32(SQRT2_SPAN),
                  f32(0.0), f32(1.0)).astype(np.float32)
+    # A STRIP's footprint (an Area lamp far longer than wide) is as long
+    # along one axis of the map as the stride above allows for, and a
+    # fraction of that along the other: there the taps stand that much
+    # closer, and a lattice as coarse as the long side needs blurred
+    # the lamp's sharp side to two or three times its width. The
+    # kernel's blur radius along each map axis (rx, ry), their ratio kq:
+    # the stride ACROSS the short one is divided by the largest of 1, 2,
+    # 4 .. 16 not above kq, cross-faded to the next like the stride
+    # itself. Under a ratio of ANISO_FROM -- every round lamp: a disc's
+    # footprint reaches 1.41 at a cube face's edge -- nothing changes
+    ex = tf * np.sqrt(p.ax * p.ax + p.bx * p.bx)
+    ey = tf * np.sqrt(p.ay * p.ay + p.by * p.by)
+    rx = np.sqrt(ex * ex + s2)
+    ry = np.sqrt(ey * ey + s2)
+    kq = (np.maximum(rx, ry)
+          / np.maximum(np.minimum(rx, ry), f32(1e-12))).astype(np.float32)
+    k0 = np.ones(q.shape[0], np.float32)
+    for lv in ANISO_STEPS:
+        k0 = np.where(kq >= f32(lv), f32(lv), k0)
+    wa = np.clip((kq / k0 - f32(ANISO_FROM)) / f32(2.0 - ANISO_FROM),
+                 f32(0.0), f32(1.0)).astype(np.float32)
+    if not ANISO:
+        k0 = np.ones(q.shape[0], np.float32)
+        wa = np.zeros(q.shape[0], np.float32)
+    thin_x = rx <= ry
+
+    def strides(st, k, idx=None):
+        thin = np.maximum(st / k, f32(1.0))
+        tx = thin_x if idx is None else thin_x[idx]
+        return np.where(tx, thin, st), np.where(tx, st, thin)
+
     blend = np.nonzero(wb > 0.0)[0]
+    fine = np.nonzero(wa > 0.0)[0]
+    both = np.nonzero((wb > 0.0) & (wa > 0.0))[0]
     pb = p.take(blend) if blend.size else None
-    st1 = (st0[blend] * f32(2.0)).astype(np.float32) if blend.size else None
+    pf = p.take(fine) if fine.size else None
+    pbf = p.take(both) if both.size else None
+    st1 = (st0 * f32(2.0)).astype(np.float32)
+    sx0, sy0 = strides(st0, k0)
+    if blend.size:
+        sx1, sy1 = strides(st1[blend], k0[blend], blend)
+    if fine.size:
+        sx0f, sy0f = strides(st0[fine], k0[fine] * f32(2.0), fine)
+    if both.size:
+        sx1f, sy1f = strides(st1[both], k0[both] * f32(2.0), both)
     if stats is not None:
         stats['filter'] = stats.get('filter', 0) + int(q.shape[0])
-        stats['filter2'] = stats.get('filter2', 0) + int(blend.size)
+        stats['filter2'] = stats.get('filter2', 0) + int(blend.size) \
+            + int(fine.size) + int(both.size)
+        stats['strip'] = stats.get('strip', 0) \
+            + int(((k0 > f32(1.0)) | (wa > f32(0.0))).sum())
 
-    def tap(pp, px, py, st):
-        gx = px / st - f32(0.5)
-        gy = py / st - f32(0.5)
+    def tap(pp, px, py, sx, sy):
+        gx = px / sx - f32(0.5)
+        gy = py / sy - f32(0.5)
         x0 = np.floor(gx)
         y0 = np.floor(gy)
         fx = gx - x0
         fy = gy - y0
-        hf = np.floor(st * f32(0.5))
+        hx = np.floor(sx * f32(0.5))
+        hy = np.floor(sy * f32(0.5))
         acc = np.zeros(px.shape[0], np.float32)
         for dy, wy in ((0.0, f32(1.0) - fy), (1.0, fy)):
             for dx, wx in ((0.0, f32(1.0) - fx), (1.0, fx)):
-                occ, xf, yf = fetch((x0 + f32(dx)) * st + hf,
-                                    (y0 + f32(dy)) * st + hf)
+                occ, xf, yf = fetch((x0 + f32(dx)) * sx + hx,
+                                    (y0 + f32(dy)) * sy + hy)
                 pd = plane(pp, xf + f32(0.5) - pp.u, yf + f32(0.5) - pp.v)
                 acc += (wx * wy) * (pd - pp.sl <= occ)
         return acc
 
     acc0 = np.zeros(q.shape[0], np.float32)
     acc1 = np.zeros(blend.size, np.float32)
+    acc0f = np.zeros(fine.size, np.float32)
+    acc1f = np.zeros(both.size, np.float32)
     for a, b, sa, sb in tab_f:
         px = p.u + fq * (tf * (a * p.ax + b * p.bx) + sa)
         py = p.v + fq * (tf * (a * p.ay + b * p.by) + sb)
-        acc0 += tap(p, px, py, st0)
+        acc0 += tap(p, px, py, sx0, sy0)
         if blend.size:
             # the second lattice only where the cross-fade reaches it
-            acc1 += tap(pb, px[blend], py[blend], st1)
+            acc1 += tap(pb, px[blend], py[blend], sx1, sy1)
+        if fine.size:
+            # and the finer one across a strip's short side
+            acc0f += tap(pf, px[fine], py[fine], sx0f, sy0f)
+        if both.size:
+            acc1f += tap(pbf, px[both], py[both], sx1f, sy1f)
+    if fine.size:
+        w2 = wa[fine]
+        acc0[fine] = acc0[fine] * (f32(1.0) - w2) + acc0f * w2
     out = acc0 / fn
     if blend.size:
+        if both.size:
+            at = np.searchsorted(blend, both)
+            w2 = wa[both]
+            acc1[at] = acc1[at] * (f32(1.0) - w2) + acc1f * w2
         w1 = wb[blend]
         out[blend] = out[blend] * (f32(1.0) - w1) + (acc1 / fn) * w1
     return out

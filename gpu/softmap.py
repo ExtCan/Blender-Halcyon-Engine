@@ -16,7 +16,8 @@ default Samples 4), in texel fetches of the depth pack:
     decided by the probe                k + 2 (B + 1)             = 29
     penumbra, one lattice               k + 2 (B + 1) + 4 F       = 93
     penumbra, two lattices cross-faded  k + 2 (B + 1) + 8 F       = 157
-    (the sums at k = 3)
+    (the sums at k = 3; a strip lamp's footprint can cross-fade a
+    second pair of lattices, finer across its short side: 16 F at most)
 
 The stages are real branches, so only penumbra fragments run the filter
 and a fragment the pyramid shows no nearer depth within reach of runs no
@@ -252,23 +253,26 @@ def shadow_function(i, meta, mb=None):
          '    float b = (occ < pd - sl) ? 1.0 : 0.0;',
          '    return vec2(b, b * occ);',
          '}']
-    # one filter tap on the lattice of stride st: four plane-biased
-    # compares, bilinear
-    L += [f'float hal_sm_tap{i}(float px, float py, float st, {ctx})',
+    # one filter tap on the lattice of strides (sx, sy) -- one stride
+    # for a round footprint, a finer one across a strip's short side:
+    # four plane-biased compares, bilinear
+    L += [f'float hal_sm_tap{i}(float px, float py, float sx, float sy, '
+          f'{ctx})',
           '{',
-          '    float gx0 = px / st - 0.5;',
-          '    float gy0 = py / st - 0.5;',
+          '    float gx0 = px / sx - 0.5;',
+          '    float gy0 = py / sy - 0.5;',
           '    float x0 = floor(gx0);',
           '    float y0 = floor(gy0);',
           '    float fx = gx0 - x0;',
           '    float fy = gy0 - y0;',
-          '    float hf = floor(st * 0.5);',
+          '    float hx = floor(sx * 0.5);',
+          '    float hy = floor(sy * 0.5);',
           '    float acc = 0.0;']
     for dy, wy in ((0.0, '(1.0 - fy)'), (1.0, 'fy')):
         for dx, wx in ((0.0, '(1.0 - fx)'), (1.0, 'fx')):
             L += ['    {'] + \
-                texel(f'(x0 + {_f(dx)}) * st + hf',
-                      f'(y0 + {_f(dy)}) * st + hf') + \
+                texel(f'(x0 + {_f(dx)}) * sx + hx',
+                      f'(y0 + {_f(dy)}) * sy + hy') + \
                 [f'    float pd = {plane("xi + 0.5 - u", "yi + 0.5 - v")};',
                  f'    acc += ({wx} * {wy}) * '
                  '((pd - sl <= occ) ? 1.0 : 0.0);',
@@ -308,9 +312,10 @@ def shadow_function(i, meta, mb=None):
                   '    nb += r.x; ds += r.y;',
                   '    }']
     L += ['    return vec2(nb, ds);', '}']
-    # the F filter taps on the lattice of stride st. Written once; called
-    # for one lattice, or for both where they cross-fade
-    L += [f'float hal_sm_flt{i}(float tf, float fq, float st, {lamp}, {ctx})',
+    # the F filter taps on one lattice. Written once; called for one
+    # lattice, for the two that cross-fade, and for a strip's finer ones
+    L += [f'float hal_sm_flt{i}(float tf, float fq, float sx, float sy, '
+          f'{lamp}, {ctx})',
           '{',
           '    float acc = 0.0;']
     if tx:
@@ -326,7 +331,7 @@ def shadow_function(i, meta, mb=None):
                   f'{_lit(b)} * Bx) + sa);',
                   f'    float py = v + fq * (tf * ({_lit(a)} * Ay + '
                   f'{_lit(b)} * By) + sb);',
-                  f'    acc += hal_sm_tap{i}(px, py, st, {cta});',
+                  f'    acc += hal_sm_tap{i}(px, py, sx, sy, {cta});',
                   '    }']
         else:
             L += ['    {',
@@ -334,7 +339,7 @@ def shadow_function(i, meta, mb=None):
                   f'{_lit(b)} * Bx) + {_lit(sa)});',
                   f'    float py = v + fq * (tf * ({_lit(a)} * Ay + '
                   f'{_lit(b)} * By) + {_lit(sb)});',
-                  f'    acc += hal_sm_tap{i}(px, py, st, {cta});',
+                  f'    acc += hal_sm_tap{i}(px, py, sx, sy, {cta});',
                   '    }']
     L += ['    return acc;', '}']
 
@@ -525,7 +530,8 @@ def shadow_function(i, meta, mb=None):
         L += [f'    float sq = {x_sv} * {x_sv};',
               '    float rtex = sqrt(rl * rl + sq);']
     else:
-        L.append(f'    float rtex = sqrt(rl * rl + {_lit(sq)});')
+        L += [f'    float sq = {_lit(sq)};',
+              '    float rtex = sqrt(rl * rl + sq);']
     L += [f'    float fq = rtex / max(rl + {x_sv}, 1e-12);',
           f'    float q = max({_lit(SM.LATTICE)} * rtex / {fn}, 1.0);',
           '    float st0 = 1.0;']
@@ -533,12 +539,40 @@ def shadow_function(i, meta, mb=None):
         L.append(f'    if (q >= {_f(lv)}) {{ st0 = {_f(lv)}; }}')
     L += [f'    float wb = clamp((q / st0 - {_lit(SM.SQRT2)}) / '
           f'{_lit(SM.SQRT2_SPAN)}, 0.0, 1.0);',
-          f'    float acc0 = hal_sm_flt{i}(tf, fq, st0, Ax, Ay, Bx, By, '
-          f'{cta});',
+          # a strip's footprint: the kernel's blur radius along each
+          # axis of the map, their ratio, and the divisor of the stride
+          # across the short one (`softmap._filter`)
+          '    float ex = tf * sqrt(Ax * Ax + Bx * Bx);',
+          '    float ey = tf * sqrt(Ay * Ay + By * By);',
+          '    float rx = sqrt(ex * ex + sq);',
+          '    float ry = sqrt(ey * ey + sq);',
+          '    float kq = max(rx, ry) / max(min(rx, ry), 1e-12);',
+          '    float k0 = 1.0;']
+    for lv in SM.ANISO_STEPS:
+        L.append(f'    if (kq >= {_f(lv)}) {{ k0 = {_f(lv)}; }}')
+    flt = f'hal_sm_flt{i}(tf, fq, {{}}, Ax, Ay, Bx, By, {cta})'
+
+    def lattice(st, k):
+        # (the stride across the short side, the call on that lattice)
+        thin = f'max({st} / {k}, 1.0)'
+        return flt.format(f'thx > 0.5 ? {thin} : {st}, '
+                          f'thx > 0.5 ? {st} : {thin}')
+    L += [f'    float wa = clamp((kq / k0 - {_lit(SM.ANISO_FROM)}) / '
+          f'{_lit(2.0 - SM.ANISO_FROM)}, 0.0, 1.0);',
+          '    float thx = rx <= ry ? 1.0 : 0.0;',
+          f'    float acc0 = {lattice("st0", "k0")};',
+          '    if (wa > 0.0) {',
+          f'    float acc0f = {lattice("st0", "(k0 * 2.0)")};',
+          '    acc0 = acc0 * (1.0 - wa) + acc0f * wa;',
+          '    }',
           f'    lit = acc0 / {fn};',
           '    if (wb > 0.0) {',
-          f'    float acc1 = hal_sm_flt{i}(tf, fq, st0 * 2.0, Ax, Ay, Bx, By, '
-          f'{cta});',
+          '    float st1 = st0 * 2.0;',
+          f'    float acc1 = {lattice("st1", "k0")};',
+          '    if (wa > 0.0) {',
+          f'    float acc1f = {lattice("st1", "(k0 * 2.0)")};',
+          '    acc1 = acc1 * (1.0 - wa) + acc1f * wa;',
+          '    }',
           f'    lit = lit * (1.0 - wb) + (acc1 / {fn}) * wb;',
           '    }',
          '    }',

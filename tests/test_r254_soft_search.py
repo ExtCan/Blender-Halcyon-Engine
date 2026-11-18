@@ -26,6 +26,9 @@ Each test below states one law as a number:
     e  the GPU twin shades the CPU picture; the pyramid rides the depth
        pack under the lamp's cells, keyed by layout and stamped by content
     f  lamps the lookup does not serve keep their lookup, text and pack
+    g  a strip Area lamp's thin side stays sharp (SP-2): the filter's
+       lattice takes a finer stride across a footprint's short side, and
+       a round footprint keeps its one stride bit for bit
 
     python -m halcyon.tests.test_r254_soft_search
 """
@@ -473,6 +476,135 @@ def test_f_other_lamps_keep_their_lookup():
                   f'{len(built)} built')
     finally:
         SM._build_pyramid = orig
+
+
+def _ball_penumbra(lamp, st):
+    """The shadow term over the lit cap of a ball standing in a box's
+    penumbra: (share of its penumbra points whose 3 x 3 neighbourhood
+    does not change at all, largest neighbour step)."""
+    sc = MS._finish([plane(z=0.0, size=14.0, mat=0, obj=0),
+                     MS._box((-0.6, -0.6, 1.0), (0.6, 0.6, 2.2)),
+                     sphere(centre=(-2.2, 0.8, 0.6), radius=0.6, mat=1,
+                            obj=1)], lamp, st)
+    LI.clear_shadow_cache()
+    LI.build_shadow_maps(sc, st)
+    c = np.array([-2.2, 0.8, 0.6])
+    to = np.asarray(lamp.position, np.float64) - c
+    to /= np.linalg.norm(to)
+    e1 = np.cross(to, [0.0, 0.0, 1.0])
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(e1, to)
+    g = np.linspace(-0.75, 0.75, 97)
+    a, b = np.meshgrid(g, g)
+    n = to[None, None, :] * np.sqrt(np.maximum(
+        1.0 - a * a - b * b, 0.0))[..., None] \
+        + a[..., None] * e1 + b[..., None] * e2
+    pb = (c + 0.6 * n).reshape(-1, 3).astype(np.float32)
+    nb = n.reshape(-1, 3).astype(np.float32)
+    lb, _rad, db = LI.sample(lamp, pb, st)
+    t = LI.visibility(lamp, pb, nb, lb.astype(np.float32), db,
+                      st).reshape(a.shape)
+    pad = np.pad(t, 1, mode='edge')
+    nine = np.stack([pad[i:i + t.shape[0], j:j + t.shape[1]]
+                     for i in range(3) for j in range(3)], 0)
+    span = nine.max(0) - nine.min(0)
+    pen = (t > 0.05) & (t < 0.95)
+    step = max(float(np.abs(np.diff(t, axis=0)).max()),
+               float(np.abs(np.diff(t, axis=1)).max()))
+    return float((span[pen] < 1e-4).mean()), int(pen.sum()), step
+
+
+def test_g_a_strip_lamp_keeps_its_thin_side_sharp():
+    """SP-2. An Area lamp 0.2 x 2.0: the shadow edge ACROSS its thin side
+    is as narrow as the traced one, the thin Size moves it, and the
+    ball in a box's penumbra carries no stripes."""
+    strip = {'area_shape': 'RECTANGLE'}
+    sc, st = MS._prep('AREA', (0.2, 2.0), lamp_kw=strip)
+    w = MS._widths(sc, st)
+    r = MS._widths(sc, st, MS._ref)
+    ok = all(abs(a - b) <= 0.35 * b + 0.02 for a, b in zip(w[1:], r[1:])) \
+        and w[0] <= r[0] + 0.05
+    check('a 0.2 x 2.0 strip: the edge across its thin side is the traced '
+          'width within a third (it was 2 to 3 times as wide)', ok,
+          'mapped ' + ' '.join(f'{x:.3f}' for x in w) + ', traced '
+          + ' '.join(f'{x:.3f}' for x in r))
+    mid = []
+    for sx in (0.1, 0.8):
+        sc, st = MS._prep('AREA', (sx, 2.0), lamp_kw=strip)
+        mid.append((MS._widths(sc, st)[2], MS._widths(sc, st, MS._ref)[2]))
+    grow_map = mid[1][0] / mid[0][0]
+    grow_ray = mid[1][1] / mid[0][1]
+    check('the thin Size from 0.1 to 0.8 widens that edge as the traced '
+          'road does (it grew by half of that)',
+          grow_map > 0.7 * grow_ray,
+          f'mapped x{grow_map:.2f} ({mid[0][0]:.3f} -> {mid[1][0]:.3f}), '
+          f'traced x{grow_ray:.2f} ({mid[0][1]:.3f} -> {mid[1][1]:.3f})')
+    # the long side is still as soft as it was
+    sc, st = MS._prep('AREA', (2.0, 0.2), lamp_kw=strip)
+    w = MS._widths(sc, st)
+    r = MS._widths(sc, st, MS._ref)
+    check('turned by a quarter, its long side across the edge: the '
+          'traced width within a sixth',
+          all(abs(a - b) <= 0.16 * b + 0.02 for a, b in zip(w, r)),
+          'mapped ' + ' '.join(f'{x:.3f}' for x in w) + ', traced '
+          + ' '.join(f'{x:.3f}' for x in r))
+    # a curved receiver: no flat patches (the reason the lattice is as
+    # wide as it is; a stride taken from the short radius alone left
+    # half of this penumbra flat)
+    for label, size in (('0.2 x 2.0', (0.2, 2.0)), ('2.0 x 0.2', (2.0, 0.2))):
+        st = MS._settings()
+        lamp = MS._lamp('AREA', size, pos=(2.5, -1.5, 5.0),
+                        aim=(0.0, 0.0, 0.8), **strip)
+        flat, npen, step = _ball_penumbra(lamp, st)
+        check(f'strip {label} on a ball in a penumbra: a gradient, no '
+              'stripes', flat < 0.01 and step < 0.2 and npen > 1000,
+              f'{flat:.2%} of {npen} penumbra points flat, largest '
+              f'neighbour step {step:.3f}')
+    # round footprints take the one stride they always did
+    gx, gy = np.meshgrid(np.linspace(-3.5, 3.5, 71),
+                         np.linspace(0.2, 6.5, 64))
+    P = np.stack([gx.ravel(), gy.ravel(), np.zeros(gx.size)],
+                 1).astype(np.float32)
+    for kind, size, lkw, same in (('POINT', 0.5, {}, True),
+                                  ('SPOT', 0.5, {}, True),
+                                  ('SUN', 0.1, {}, True),
+                                  ('AREA', 1.0, {}, True),
+                                  ('AREA', 1.0, {'area_shape': 'DISK'},
+                                   True),
+                                  ('AREA', (0.2, 2.0), strip, False)):
+        sc, st = MS._prep(kind, size, lamp_kw=lkw)
+        a = MS._vis(sc, st, P)
+        SM.ANISO = False
+        try:
+            b = MS._vis(sc, st, P)
+        finally:
+            SM.ANISO = True
+        check(f'{kind} {size} {lkw.get("area_shape", "")}: '
+              + ('one stride, bit for bit' if same
+                 else 'a finer stride across its short side'),
+              np.array_equal(a, b) == same,
+              f'{int((a != b).sum())} of {a.size} points differ')
+    # both roads
+    for size, skw in (((0.2, 2.0), {}), ((2.0, 0.2), {}),
+                      ((0.25, 3.0), {'shadow_samples': 16})):
+        worst = []
+        for texels in (True, False):
+            GSH.SHADOW_TEXELS = texels
+            try:
+                st = MS._settings(**skw)
+                sc = MS._wall(MS._lamp('AREA', size, **strip), st)
+                LI.clear_shadow_cache()
+                cpu, sim, cov, passes, _atl, why = MS._gpu(sc, st)
+            finally:
+                GSH.SHADOW_TEXELS = True
+            if sim is None:
+                worst.append(1e9)
+                continue
+            worst.append(float(np.abs(sim[cov] - cpu[cov][:, :3]).max()))
+        check(f'strip {size} {skw or ""}: the simulator shades the CPU '
+              'picture on both value roads', max(worst) < 6e-3,
+              f'max |sim - cpu| {worst[0]:.6f} (texels), {worst[1]:.6f} '
+              '(literals)')
 
 
 def main():
