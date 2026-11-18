@@ -56,6 +56,15 @@ class Emitter:
         #                            must never read as painted white
         self.used_screen = False   # a code node read vScreenUV/iResolution
         self.bump_passes = []      # Bump nodes needing a height pre-pass
+        self.bare_shader_zero = False  # the emission slot routing: an
+        #                            UNLINKED shader socket is the empty
+        #                            closure and adds no light, so a Mix /
+        #                            Add Shader input with nothing wired
+        #                            emits zero. Set ONLY by assemble_frame
+        #                            under bake['__slot'] 'emission': in the
+        #                            diffuse slot a bare side must drop OUT
+        #                            of the mix (the CPU normalises the
+        #                            colour by its weight), which zero is not
         self.mark_values = False   # R174: wrap graph constants in hal_MV()
         #                            markers so the material-texel lifter
         #                            can pull them out of the source; set
@@ -441,6 +450,11 @@ def _input_indexed(em, node, name, index, gtype):
             if link:
                 var, vt = em.output(link[0], link[1])
                 return em.cast(var, vt, gtype)
+            if em.bare_shader_zero and sock.get('default') is None \
+                    and gtype == VEC4:
+                # a bare shader socket under the emission route: no
+                # lobe, no light (see Emitter.bare_shader_zero)
+                return 'vec4(0.0, 0.0, 0.0, 1.0)'
             return em.const(sock.get('default'), gtype)
         seen += 1
     return em.const(0.0 if gtype == FLOAT else (0, 0, 0, 1), gtype)

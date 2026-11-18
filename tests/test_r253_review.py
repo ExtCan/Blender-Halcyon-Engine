@@ -57,7 +57,8 @@ pinned where it bit.
     into its colour chain and drew it as the albedo -- qualified, 1.69
     apart. `core/nodeeval.link_closure` reads Blender's implicit
     conversion (an Emission of it, bitwise the explicit node) and
-    `gpu/shade._probe_material` refuses that lobe BY NAME.
+    `gpu/shade._probe_material` refuses that lobe BY NAME beside another
+    kind of lobe (alone it is drawn: item 21).
 (14) A Coded Shader with a Text assigned ran TWO shaders: the exporter
     compiled the Text for the program (the CPU's truth) and copied the
     raw inline `source_text` -- the starter shader `init` leaves there --
@@ -140,7 +141,19 @@ pinned where it bit.
     'Group/__bump_Halcyon'), so the node shades in the group's own
     evaluator, two instances of one group keep a Bump each, and the Bump
     pre-pass of (18) files its field like any other.
-(22) A Bump whose HEIGHT is fed by another Bump's normal was still cut.
+(22) The frame pass emits ONE colour chain, and a surface that is light
+    alone -- a colour wired straight into Surface, an Emission node, a
+    Mix / Add Shader of those -- refused the deferred plan by name. THE
+    EMISSION SLOT ROUTING: when every lobe of the closure is an EMISSION
+    the probe grants `bake['__slot'] = 'emission'`, the pass adds the
+    chain where `light_surface` adds `surf.emission` and bakes the flat
+    diffuse, and the simulator frame is the CPU frame. Structural (every
+    lobe, whatever its weight), on the proven nodes only
+    (`gpu/material.EMISSION_ROUTE_NODES`; a Max blend refuses by name),
+    with a bare shader socket emitting no light. Found on the way: a
+    ROUTED chain's alpha is not the texel alpha the decal combines read
+    -- the specular route drew 0.48 off under them.
+(23) A Bump whose HEIGHT is fed by another Bump's normal was still cut.
     The pre-pass of (18) evaluated every height chain in one pass, before
     any of the material's fields existed, so the upstream Bump differenced
     the pre-pass chunk it was evaluated in and the downstream height was
@@ -3925,8 +3938,11 @@ def test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads():
     chain and drew it as the albedo. The plan QUALIFIED: 1.69 apart over
     all 598 pixels of the demo ball. Blender's own reading is the rule
     now (an Emission of the value, Strength 1): the CPU shades it,
-    bitwise the explicit node, on every shader socket; the deferred plan
-    refuses it by name."""
+    bitwise the explicit node, on every shader socket. The deferred plan
+    refused it by name; since the emission slot routing (item 21, the
+    test after this one) a closure of emission lobes ALONE rides the
+    pass's emission term, and what is refused by name here is the link
+    BESIDE another kind of lobe -- one chain cannot be two slots."""
     from ..core import nodeeval as NE
     from ..gpu import shade as GSH
     from ..gpu import sky as GSKY
@@ -3951,9 +3967,7 @@ def test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads():
               float(np.abs(wired - bare)[ball].max()) > 0.25, str(float(np.abs(wired - bare)[ball].max())))
         check(f'a {kind} wired into Surface: every pixel off the Ball is bitwise the unwired frame',
               np.array_equal(wired[~ball], bare[~ball]))
-        passes, why = _wired_plan(_wired_out(nodes, link))
-        check(f'a {kind} wired into Surface: the deferred plan REFUSES (it qualified and drew the albedo)', passes is None, str(why))
-        check(f'a {kind} wired into Surface: ...by name, word for word', why == want, str(why))
+        # (the plan's own answer for the lone link is item 21's test)
         # the road the refusal names qualifies and twins, in either socket
         for slot in ('emit', 'diffuse'):
             mn, ml = _wired_master(nodes, **{slot: link})
@@ -3970,16 +3984,18 @@ def test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads():
     nodes_k, link_k, _pr = _wired_source('colour', rgb=(0.0, 0.0, 0.0))
     dark = _wired_cpu(_wired_out(nodes_k, link_k))
     gain = float(np.abs((lit - dark)[ball][:, :3] - np.array([0.9, 0.3, 0.1], f32)).max())
-    check('the wired colour is ADDED over the lit fallback surface: frame(colour) - frame(black) is the colour at every Ball pixel (1e-6)',
+    check('the wired colour is ADDED as light the surface gives off: frame(colour) - frame(black) is the colour at every Ball pixel (1e-6)',
           gain < 1e-6, str(gain))
     check('...and the alpha stays opaque', float(lit[ball][:, 3].min()) == 1.0 and float(lit[ball][:, 3].max()) == 1.0)
 
     # ---- the text names what the user wired and where it shades
-    for part in ('wired straight into a shader socket', 'an Emission of it', "Blender's implicit conversion",
-                 'this material shades on the CPU exactly', 'a Halcyon Shader in between', 'Diffuse Color', 'Self-Illumination'):
+    for part in ('wired straight into a shader socket beside another kind of lobe', 'the link is an Emission of it',
+                 "Blender's implicit conversion", 'ONE colour chain', 'this material shades on the CPU exactly',
+                 'alone, the link rides the emission slot', 'a Halcyon Shader', 'Diffuse Color', 'Self-Illumination'):
         check(f'the refusal says "{part}"', part in GSH.IMPLICIT_EMISSION_REFUSAL)
 
-    # ---- every other shader socket: the Mix and Add Shader inputs, a Reroute on the way, a Coded Shader's output
+    # ---- every other shader socket, BESIDE a Diffuse BSDF: the Mix and Add Shader inputs (refused by name); then a
+    # Reroute on the way and a Coded Shader's output (the CPU law; their plan is item 21's)
     for label, idname in (('a Mix Shader input', 'ShaderNodeMixShader'), ('an Add Shader input', 'ShaderNodeAddShader')):
         tn, tl = _wired_two(nodes, link, idname)
         wired = _wired_cpu(_wired_out(tn, tl))
@@ -3988,7 +4004,8 @@ def test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads():
         check(f'a colour wired into {label}: the CPU frame is bitwise the Emission node\'s in that socket',
               np.array_equal(wired, _wired_cpu(_wired_out(xn, xl))))
         passes, why = _wired_plan(_wired_out(tn, tl))
-        check(f'a colour wired into {label}: the plan refuses by the same name', passes is None and why == want, str(why))
+        check(f'a colour wired into {label} beside a Diffuse BSDF: the plan refuses by name, word for word',
+              passes is None and why == want, str(why))
     zn, zl = _wired_two(nodes, link, 'ShaderNodeMixShader')
     zn['two']['inputs'][0]['default'] = 0.0
     passes, why = _wired_plan(_wired_out(zn, zl))
@@ -3999,17 +4016,12 @@ def test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads():
                 'outputs': [{'name': 'Output', 'type': 'RGBA'}]}
     check('a colour through a Reroute into Surface: the CPU frame is the direct link\'s, bit for bit',
           np.array_equal(_wired_cpu(_wired_out(rn, ['rr', 0])), lit))
-    passes, why = _wired_plan(_wired_out(rn, ['rr', 0]))
-    check('a colour through a Reroute into Surface: the plan refuses by the same name', passes is None and why == want, str(why))
     cn, cl_, cprog = _wired_source('coded')
     coded = _wired_cpu(_wired_out(cn, cl_), cprog)
     en, el = _wired_emission(cn, cl_)
     check('a Coded Shader\'s Color wired into Surface: the CPU frame is bitwise the Emission node\'s',
           np.array_equal(coded, _wired_cpu(_wired_out(en, el), cprog)))
     check('...and the shader\'s own stripes reach the Ball', float(np.abs(coded - bare)[ball].max()) > 0.25)
-    passes, why = _wired_plan(_wired_out(cn, cl_), cprog)
-    check('a Coded Shader\'s Color wired into Surface: the plan refuses by the same name (the wiring, not the node type)',
-          passes is None and why == want, str(why))
 
     # ---- what does NOT become an emission
     check('link_closure: a closure passes through untouched', NE.link_closure(NE.Closure().add('DIFFUSE', 1.0), 4).items[0][0] == 'DIFFUSE')
@@ -4037,22 +4049,25 @@ def test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads():
     check('control, a Diffuse BSDF in between: the plan qualifies and the simulator frame is the CPU frame',
           cp is not None and d is not None and d < 6e-3 and nbad == 0, str(cwhy if d is None else (d, nbad)))
     en, el = _wired_emission(nodes, link)
-    passes, why = _wired_plan(_wired_out(en, el))
-    check('control, the explicit Emission node keeps its own refusal (a raw EMISSION lobe), not the wiring\'s',
+    xn, xl = _wired_two(en, el, 'ShaderNodeMixShader')
+    passes, why = _wired_plan(_wired_out(xn, xl))
+    check('control, an explicit Emission node beside a Diffuse BSDF keeps the raw-lobe refusal, not the wiring\'s',
           passes is None and 'a raw EMISSION lobe' in str(why) and 'wired straight' not in str(why), str(why))
 
-    # ---- the device road end to end: the GPU device's frame IS the CPU device's, and says why
+    # ---- the device road end to end, for the refused wiring: the GPU device's frame IS the CPU device's, and says why
+    tn, tl = _wired_two(nodes, link, 'ShaderNodeMixShader')
+    mixed = _wired_cpu(_wired_out(tn, tl))
     R._GBUF_CACHE.clear()
     GSH._PLAN_CACHE.clear()
-    sc, st = _wired_scene(_wired_out(nodes, link), device='GPU')
+    sc, st = _wired_scene(_wired_out(tn, tl), device='GPU')
     buf = io.StringIO()
     with fakedevice.installed():
         with redirect_stdout(buf):
             gpu = np.asarray(R.render(sc, st))
     R._GBUF_CACHE.clear()
     GSH._PLAN_CACHE.clear()
-    check('the GPU device road draws the CPU frame bit for bit (the fake driver)', np.array_equal(gpu, lit),
-          str(float(np.abs(gpu - lit).max())) if gpu.shape == lit.shape else str(gpu.shape))
+    check('the GPU device road draws the refused wiring\'s CPU frame bit for bit (the fake driver)', np.array_equal(gpu, mixed),
+          str(float(np.abs(gpu - mixed).max())) if gpu.shape == mixed.shape else str(gpu.shape))
     check('...and prints the reason once, by name', buf.getvalue().count('[Halcyon GPU] shading on the CPU: ' + want) == 1,
           buf.getvalue()[-400:])
 
@@ -4733,6 +4748,299 @@ def test_code_node_compiles_what_it_runs():
     check('the same pass with the call and the widths right goes through',
           DV.preflight('Fine', head + 'void main() {\n    vec3 c = vec3(1.0);\n'
                                       '    fragColor = vec4(c.xy * vUV, hal_half(1.0), 1.0);\n}\n') is None)
+
+
+# ------------------------------------------ (21) the emission slot routing
+
+def _em_node(nid, rgb=(1.0, 1.0, 1.0), strength=1.0, color_link=None, strength_link=None):
+    """An Emission node: constant or linked Color, constant or linked Strength."""
+    return {nid: {'id': nid, 'bl_idname': 'ShaderNodeEmission', 'props': {},
+                  'inputs': [_sk('Color', 'RGBA', [rgb[0], rgb[1], rgb[2], 1.0], color_link),
+                             _sk('Strength', 'VALUE', strength, strength_link)],
+                  'outputs': [{'name': 'Emission', 'type': 'SHADER'}]}}
+
+
+def _shader_pair(idname, first, second, fac=0.5, fac_link=None):
+    """A Mix Shader (Fac, Shader, Shader) or an Add Shader (Shader, Shader)
+    over two links; None leaves that socket bare."""
+    ins = [_sk('Shader', 'SHADER', None, first), _sk('Shader', 'SHADER', None, second)]
+    if idname == 'ShaderNodeMixShader':
+        ins.insert(0, _sk('Fac', 'VALUE', fac, fac_link))
+    return {'two': {'id': 'two', 'bl_idname': idname, 'props': {}, 'inputs': ins,
+                    'outputs': [{'name': 'Shader', 'type': 'SHADER'}]}}
+
+
+def _wired_twin(graph, programs=None, **settings):
+    """(max, pixels over 1e-2, simulator frame, CPU frame, why) of `graph`
+    on the Ball: the CPU frame against gpu/shade.simulate over the
+    covered pixels; max is None when the plan (or the simulator) refuses."""
+    sc, st = _wired_scene(graph, programs)
+    for k, v in settings.items():
+        setattr(st, k, v)
+    d, nbad, img, cpu, _passes, why = _sim_vs_cpu(sc, st)
+    return d, nbad, img, cpu, why
+
+
+def _on_bar(d, nbad):
+    """The twin tests' bar: under 6e-3 with no pixel over 1e-2."""
+    return d is not None and d < 6e-3 and nbad == 0
+
+
+def _mirror_twin(rgb):
+    """The feature matrix's traced-reflection row (the Box mirrors at 0.5)
+    with a colour wired straight into the FLOOR's Surface: (max, pixels
+    over 1e-2, simulator frame, CPU frame, the Box's mask, why)."""
+    from ..core.bvh import BVH
+    from ..core.scene import Material
+    from ..gpu import shade as GSH
+    from .featurematrix import build
+    sc, st = build('traced reflection', 128, 96)
+    nodes, link, _pr = _wired_source('colour', rgb)
+    sc.materials[0] = Material(name='Wired', index=0, graph=_wired_out(nodes, link))
+    st.render_device = 'GPU'
+    with redirect_stdout(io.StringIO()):
+        cpu = np.asarray(R.render(sc, st))
+    g, job = _job_for(sc, st, bvh=BVH(sc.mesh.verts, sc.mesh.tris))
+    GSH._PLAN_CACHE.clear()
+    passes, why, atl = GSH.plan_frame(job, g)
+    if passes is None:
+        return None, None, None, cpu, None, why
+    img, hit = GSH.simulate(job, g, passes, atl)
+    if img is None:
+        return None, None, None, cpu, None, hit
+    cov = g.tri >= 0
+    box = cov & (sc.mesh.mat_index[np.maximum(g.tri, 0)] == 2)
+    d = np.abs(img[cov] - cpu[cov][:, :3])
+    return float(d.max()), int((d.max(axis=1) > 1e-2).sum()), img, cpu, box, None
+
+
+def test_emission_slot_routing_twins_an_emission_only_closure():
+    """The frame pass emits ONE colour chain. When every lobe of the
+    closure is an EMISSION -- a colour wired straight into Surface, an
+    Emission node, a Mix or Add Shader of those -- that chain is the light
+    the surface gives off and nothing else: no lobe feeds the diffuse or
+    the specular slot, so `closure_to_surface` hands back constants there
+    and puts the weighted sum of colour x strength in `surf.emission`.
+    The probe grants the EMISSION SLOT (`bake['__slot']`), the pass adds
+    the chain where `light_surface` adds the emission and bakes the flat
+    diffuse, and the plan that refused these graphs by name now draws
+    them: the simulator frame is the CPU frame."""
+    from ..core.scene import Material
+    from ..gpu import material as GM
+    from ..gpu import shade as GSH
+    from ..gpu.emit import Emitter
+    from . import fakedevice
+
+    sc0, st0 = _wired_scene(_wired_out({}, None))
+    g0, _job0 = _job_for(sc0, st0)
+    ball = (g0.tri >= 0) & (sc0.mesh.mat_index[np.maximum(g0.tri, 0)] == 1)
+    src, link, _pr = _wired_source('colour')
+
+    # ---- a colour, a value, a vector and a Coded Shader's Color, straight into Surface
+    for kind in ('colour', 'value', 'vector', 'coded'):
+        nodes, lk, prog = _wired_source(kind)
+        d, nbad, sim, cpu, why = _wired_twin(_wired_out(nodes, lk), prog)
+        check(f'a {kind} wired into Surface: the deferred plan QUALIFIES (it refused by name) and the simulator frame is the CPU '
+              f'frame (max < 6e-3, no px > 1e-2)', _on_bar(d, nbad), str(why if d is None else (d, nbad)))
+    d, nbad, sim, cpu, why = _wired_twin(_wired_out(src, link))
+    dark_n, dark_l, _pr = _wired_source('colour', rgb=(0.0, 0.0, 0.0))
+    dk, _nb, sim_k, _cpu_k, _why = _wired_twin(_wired_out(dark_n, dark_l))
+    gain = float(np.abs((sim - sim_k)[ball] - np.array([0.9, 0.3, 0.1], f32)).max()) if d is not None and dk is not None else None
+    check('the twin is not vacuous: the SIMULATOR\'s frame(colour) - frame(black) is the colour at every Ball pixel (1e-6)',
+          gain is not None and gain < 1e-6, str(gain))
+    check('...and on the Ball alone the two roads are within 1e-5', d is not None and float(np.abs(sim[ball] - cpu[ball][:, :3]).max()) < 1e-5)
+
+    # ---- the pass itself: the chain rides the emission term, the diffuse is the material's constant
+    sc, st = _wired_scene(_wired_out(src, link))
+    passes = _sim_vs_cpu(sc, st)[4]
+    text = next((s for _m, nm, s, _b in (passes or ()) if nm == 'Wired'), '')
+    adds = [ln.strip() for ln in text.splitlines() if ln.strip().startswith('total = total +')]
+    dif = [ln.strip() for ln in text.splitlines() if ln.strip().startswith('s.diffuse =')]
+    check('the pass adds the emitted chain to the total (light_surface\'s `out + surf.emission`)',
+          len(adds) == 1 and '_v' in adds[0] and 'vec3(' not in adds[0], str(adds))
+    check('...and its diffuse is a constant, never the chain', len(dif) == 1 and '_v' not in dif[0] and dif[0].startswith('s.diffuse = vec3('),
+          str(dif))
+
+    # ---- the Emission node, and the Mix / Add Shader over emissions: each chain IS the closure's emission
+    e1 = _em_node('e1', (0.9, 0.3, 0.1), 2.0)
+    e2 = _em_node('e2', (0.1, 0.8, 0.3), 0.5)
+    both = dict(e1, **e2)
+    tex = {'uv': {'id': 'uv', 'bl_idname': 'ShaderNodeTexCoord', 'props': {}, 'inputs': [],
+                  'outputs': [{'name': 'Generated', 'type': 'VECTOR'}, {'name': 'Normal', 'type': 'VECTOR'},
+                              {'name': 'UV', 'type': 'VECTOR'}]},
+           'sep': {'id': 'sep', 'bl_idname': 'ShaderNodeSeparateXYZ', 'props': {}, 'inputs': [_sk('Vector', 'VECTOR', [0, 0, 0], ['uv', 2])],
+                   'outputs': [{'name': 'X', 'type': 'VALUE'}, {'name': 'Y', 'type': 'VALUE'}, {'name': 'Z', 'type': 'VALUE'}]}}
+    rr = {'rr': {'id': 'rr', 'bl_idname': 'NodeReroute', 'props': {}, 'inputs': [_sk('Input', 'RGBA', [0, 0, 0, 1], link)],
+                 'outputs': [{'name': 'Output', 'type': 'RGBA'}]}}
+    cases = (
+        ('an Emission node (constant colour, Strength 2)', dict(e1), ['e1', 0]),
+        ('an Emission node with a linked Color and a linked Strength',
+         dict(tex, **_em_node('e1', color_link=['uv', 1], strength_link=['sep', 0])), ['e1', 0]),
+        ('a Mix Shader of two Emissions at Fac 0.3', dict(both, **_shader_pair('ShaderNodeMixShader', ['e1', 0], ['e2', 0], 0.3)), ['two', 0]),
+        ('a Mix Shader of two Emissions under a per-pixel Fac',
+         dict(both, **tex, **_shader_pair('ShaderNodeMixShader', ['e1', 0], ['e2', 0], 0.5, ['sep', 1])), ['two', 0]),
+        ('an Add Shader of two Emissions', dict(both, **_shader_pair('ShaderNodeAddShader', ['e1', 0], ['e2', 0])), ['two', 0]),
+        ('a Mix Shader of an Emission and a wired colour (the explicit lobe beside the implicit one)',
+         dict(src, **e2, **_shader_pair('ShaderNodeMixShader', ['e2', 0], link, 0.4)), ['two', 0]),
+        ('a Mix Shader of an Emission and a BARE socket (the empty closure adds no light)',
+         dict(e1, **_shader_pair('ShaderNodeMixShader', ['e1', 0], None, 0.25)), ['two', 0]),
+        ('an Add Shader of a wired colour and a BARE socket', dict(src, **_shader_pair('ShaderNodeAddShader', link, None)), ['two', 0]),
+        ('a colour through a Reroute', dict(src, **rr), ['rr', 0]),
+    )
+    for label, nodes, lk in cases:
+        d, nbad, _sim, _cpu, why = _wired_twin(_wired_out(nodes, lk))
+        check(f'{label}: the plan qualifies and the simulator frame is the CPU frame', _on_bar(d, nbad), str(why if d is None else (d, nbad)))
+    full = _wired_cpu(_wired_out(dict(e1), ['e1', 0]))
+    part = _wired_cpu(_wired_out(dict(e1, **_shader_pair('ShaderNodeMixShader', ['e1', 0], None, 0.25)), ['two', 0]))
+    dim = float(np.abs((full - part)[ball][:, :3] - np.array([0.9, 0.3, 0.1], f32) * 2.0 * 0.25).max())
+    check('a bare Mix side SCALES the emission by its weight on the CPU (0.75 of it; a master lobe would be normalised back to full)',
+          dim < 1e-6, str(dim))
+
+    # ---- the constants the pass bakes are the CPU's own for THIS material, never the engine's defaults
+    plain_sim, plain_cpu = sim, cpu
+    sc, st = _wired_scene(_wired_out(src, link))
+    sc.materials[1].diffuse, sc.materials[1].diffuse_level = (0.25, 0.55, 0.2), 0.7
+    sc.materials[1].specular, sc.materials[1].model = (0.2, 0.9, 0.4), 'LAMBERT'
+    d, nbad, sim, cpu, _passes, why = _sim_vs_cpu(sc, st)
+    check('a colour wired into the Surface of a material with its own fallback diffuse, level and model: the simulator frame is the CPU frame',
+          _on_bar(d, nbad), str(why if d is None else (d, nbad)))
+    moved = float(np.abs((sim - plain_sim)[ball] - (cpu - plain_cpu)[ball][:, :3]).max()) if d is not None else None
+    check('...and the simulator\'s Ball moves with that material exactly as the CPU\'s does (whatever closure_to_surface makes of a '
+          'surface with no diffuse lobe, the pass bakes THAT), within 1e-5', moved is not None and moved < 1e-5, str(moved))
+
+    # ---- the rates and the shadeless early return
+    vn, vl, _pr = _wired_source('vector')
+    for rate in ('VERTEX', 'FACE'):
+        d, nbad, _sim, _cpu, why = _wired_twin(_wired_out(vn, vl), shading_rate=rate)
+        check(f'a vector wired into Surface at the {rate} rate (the emission rides the CPU-lit corners, the pass multiplies the constant '
+              f'diffuse): the simulator frame is the CPU frame', _on_bar(d, nbad), str(why if d is None else (d, nbad)))
+    faint_n, faint_l, _pr = _wired_source('colour')
+    faint_n['src']['props']['value'] = [0.9, 0.3, 0.1, 0.3]
+    for model in ('DS_DECAL', 'DECAL_ALPHA', 'N64_BLENDRGBA'):
+        d, nbad, _sim, _cpu, why = _wired_twin(_wired_out(faint_n, faint_l), force_model=model, shading_rate='VERTEX')
+        check(f'a colour whose ALPHA is 0.3, wired into Surface under {model} (the decal combine reads the albedo pass\'s alpha, the opaque '
+              f'1.0 -- never the routed chain\'s): the simulator frame is the CPU frame', _on_bar(d, nbad), str(why if d is None else (d, nbad)))
+    glossy = dict(faint_n, gl={'id': 'gl', 'bl_idname': 'ShaderNodeBsdfGlossy', 'props': {'distribution': 'GGX'},
+                               'inputs': [_sk('Color', 'RGBA', [1, 1, 1, 1], faint_l), _sk('Roughness', 'VALUE', 0.3)],
+                               'outputs': [{'name': 'BSDF', 'type': 'SHADER'}]})
+    for model in ('DS_DECAL', 'DECAL_ALPHA', 'N64_BLENDRGBA'):
+        d, nbad, _sim, _cpu, why = _wired_twin(_wired_out(glossy, ['gl', 0]), force_model=model, shading_rate='VERTEX')
+        check(f'found on the way, the SPECULAR route under {model}: a lone Glossy BSDF whose colour carries alpha 0.3 drew 0.48 off the CPU '
+              f'(the routed chain\'s alpha read as the texel\'s); the simulator frame is the CPU frame', _on_bar(d, nbad),
+              str(why if d is None else (d, nbad)))
+    d, nbad, _sim, _cpu, why = _wired_twin(_wired_out(vn, vl), force_model='CONSTANT')
+    check('a vector wired into Surface under the CONSTANT model (diffuse x level + emission, no light): the simulator frame is the CPU frame',
+          _on_bar(d, nbad), str(why if d is None else (d, nbad)))
+
+    # ---- beside an Ambient Only lamp: the light row's ambient tail (R254) is read by the routed pass like any other
+    from ..core.scene import Light
+    sc, st = _wired_scene(_wired_out(vn, vl))
+    amb = Light(type='POINT', name='Amb', position=(0.0, 0.0, 3.0), color=(0.4, 0.6, 1.0), energy=0.4, shadow='NONE')
+    amb.ambient_only = True
+    sc.lights = list(sc.lights) + [amb]
+    d, nbad, _sim, amb_cpu, _passes, why = _sim_vs_cpu(sc, st)
+    check('a vector wired into Surface in a frame with an Ambient Only lamp: the simulator frame is the CPU frame', _on_bar(d, nbad),
+          str(why if d is None else (d, nbad)))
+    check('...and the ambient lamp is in that frame (it moves the CPU picture by more than 0.1)',
+          float(np.abs(amb_cpu - _wired_cpu(_wired_out(vn, vl))).max()) > 0.1)
+
+    # ---- an Image Texture straight into Surface (the quick look at a texture), nearest and through the mip footprint
+    for label, kw in (('the scene\'s default filter', {}), ('TRILINEAR with mipmaps', {'tex_filter': 'TRILINEAR', 'tex_mipmap': True})):
+        st = base_settings(128, 96, shadows=True, **kw)
+        st.color_depth, st.dither, st.output_scale = '24', 'NONE', 'NONE'
+        sc = demo_scene(st, with_texture=True)
+        img_nodes = {'src': {'id': 'src', 'bl_idname': 'ShaderNodeTexImage', 'props': {'image': 'checker', 'interpolation': 'Linear', 'extension': 'REPEAT'},
+                             'inputs': [_sk('Vector', 'VECTOR', [0, 0, 0])],
+                             'outputs': [{'name': 'Color', 'type': 'RGBA'}, {'name': 'Alpha', 'type': 'VALUE'}]}}
+        sc.materials[1] = Material(name='Wired', index=1, graph=_wired_out(img_nodes, ['src', 0]))
+        d, nbad, _img, _cpu, _p, why = _sim_vs_cpu(sc, st)
+        check(f'an Image Texture wired into Surface, {label}: the simulator frame is the CPU frame', _on_bar(d, nbad), str(why if d is None else (d, nbad)))
+
+    # ---- a ray hit on the routed surface: the mirror Box shows the emissive floor on both roads
+    d, nbad, sim, cpu, box, why = _mirror_twin((0.9, 0.3, 0.1))
+    dk, _nb, sim_k, cpu_k, _box, _why = _mirror_twin((0.0, 0.0, 0.0))
+    check('traced reflection, a colour wired into the FLOOR\'s Surface: the plan qualifies and the simulator frame is the CPU frame',
+          _on_bar(d, nbad), str(why if d is None else (d, nbad)))
+    if d is not None and dk is not None:
+        seen = float(np.abs(sim[box] - sim_k[box]).max())
+        seen_cpu = float(np.abs(cpu[box] - cpu_k[box])[:, :3].max())
+        check('...and the hit pass carries it: the emission moves the mirror\'s pixels by the same 0.45 on both roads (0.5 x 0.9)',
+              abs(seen - 0.45) < 1e-3 and abs(seen_cpu - 0.45) < 1e-3, f'sim {seen} cpu {seen_cpu}')
+
+    # ---- two routed materials: one structure, so one compiled text -- the colours ride the material texels
+    sc, st = _wired_scene(_wired_out(src, link))
+    other_n, other_l, _pr = _wired_source('colour', rgb=(0.1, 0.7, 0.9))
+    sc.materials[2] = Material(name='Wired2', index=2, graph=_wired_out(other_n, other_l))
+    d, nbad, _img, _cpu, passes, why = _sim_vs_cpu(sc, st)
+    check('two materials, each a colour wired into Surface: the simulator frame is the CPU frame', _on_bar(d, nbad), str(why if d is None else (d, nbad)))
+    texts = {nm: s for _m, nm, s, _b in (passes or ()) if nm in ('Wired', 'Wired2')}
+    check('...and their passes are ONE source text (a colour change is a texel, not a recompile)',
+          len(texts) == 2 and texts['Wired'] == texts['Wired2'])
+
+    # ---- what the one chain cannot carry is still refused, by name
+    dif = {'dif': {'id': 'dif', 'bl_idname': 'ShaderNodeBsdfDiffuse', 'props': {},
+                   'inputs': [_sk('Color', 'RGBA', [0.2, 0.3, 0.9, 1.0]), _sk('Roughness', 'VALUE', 0.0)],
+                   'outputs': [{'name': 'BSDF', 'type': 'SHADER'}]}}
+    for label, fac in (('at Fac 0.5', 0.5), ('at Fac 1 (the diffuse lobe weighs nothing, and is still a lobe: the route is structural)', 1.0)):
+        passes, why = _wired_plan(_wired_out(dict(e1, **dif, **_shader_pair('ShaderNodeMixShader', ['dif', 0], ['e1', 0], fac)), ['two', 0]))
+        check(f'a Diffuse BSDF mixed with an Emission {label}: refused as a raw EMISSION lobe', passes is None and 'a raw EMISSION lobe' in str(why), str(why))
+    mx = {'mx': {'id': 'mx', 'bl_idname': 'HALCYON_MaxBlendNode', 'props': {},
+                 'inputs': [_sk('Material 1', 'SHADER', None, ['e1', 0]), _sk('Material 2', 'SHADER', None, ['e2', 0]), _sk('Mix Amount', 'VALUE', 0.3)],
+                 'outputs': [{'name': 'Surface', 'type': 'SHADER'}]}}
+    passes, why = _wired_plan(_wired_out(dict(both, **mx), ['mx', 0]))
+    check('two Emissions through a Max Blend (its chain drops a bare side OUT; an emission lobe is scaled): refused by that node\'s name, word for word',
+          passes is None and why == "'Wired': " + GSH.emission_route_refusal('HALCYON_MaxBlendNode'), str(why))
+    behind_mix = dict(both, **mx, **_shader_pair('ShaderNodeMixShader', ['mx', 0], ['e1', 0], 0.5))
+    passes, why = _wired_plan(_wired_out(behind_mix, ['two', 0]))
+    check('...and so is a Max Blend BEHIND a Mix Shader (the walk follows every shader input)',
+          passes is None and why == "'Wired': " + GSH.emission_route_refusal('HALCYON_MaxBlendNode'), str(why))
+    behind_rr = dict(both, **mx, rr={'id': 'rr', 'bl_idname': 'NodeReroute', 'props': {}, 'inputs': [_sk('Input', 'SHADER', None, ['mx', 0])],
+                                     'outputs': [{'name': 'Output', 'type': 'SHADER'}]})
+    passes, why = _wired_plan(_wired_out(behind_rr, ['rr', 0]))
+    check('...and a Max Blend behind a Reroute (the walk follows the Reroute)',
+          passes is None and why == "'Wired': " + GSH.emission_route_refusal('HALCYON_MaxBlendNode'), str(why))
+    check('the refusal names the nodes the route IS proven on',
+          all(part in GSH.emission_route_refusal('X') for part in ('through X', 'Emission, Mix Shader, Add Shader and Reroute', 'shades on the CPU exactly')))
+
+    # ---- the walk and the emitter's bare-socket rule
+    check('EMISSION_ROUTE_NODES is the four proven nodes',
+          GM.EMISSION_ROUTE_NODES == ('ShaderNodeEmission', 'ShaderNodeMixShader', 'ShaderNodeAddShader', 'NodeReroute'))
+    from ..core import nodeeval as NE
+    lobe = NE.Closure().add('EMISSION', 1.0)
+    g_mix = _wired_out(dict(both, **_shader_pair('ShaderNodeMixShader', ['e1', 0], ['e2', 0])), ['two', 0])
+    g_max = _wired_out(dict(both, **mx), ['mx', 0])
+    check('emission_route_block: a Mix Shader of Emissions is open (None); a value chain on a shader socket is open; a bare socket is open',
+          GM.emission_route_block(g_mix, {('two', 0): lobe, ('e1', 0): lobe, ('e2', 0): lobe}) is None
+          and GM.emission_route_block(_wired_out(src, link), {('src', 0): np.ones((4, 4), f32)}) is None
+          and GM.emission_route_block(_wired_out(dict(e1, **_shader_pair('ShaderNodeAddShader', ['e1', 0], None)), ['two', 0]),
+                                      {('two', 0): lobe, ('e1', 0): lobe}) is None)
+    check('emission_route_block: a Max Blend stops it, by its bl_idname',
+          GM.emission_route_block(g_max, {('mx', 0): lobe, ('e1', 0): lobe, ('e2', 0): lobe}) == 'HALCYON_MaxBlendNode')
+    em = Emitter({})
+    check('the emitter writes zero for a bare shader socket ONLY under the route (bare_shader_zero is off by default)', em.bare_shader_zero is False)
+    pair = _shader_pair('ShaderNodeAddShader', None, None)['two']
+    em.bare_shader_zero = True
+    check('...and under it the socket is vec4(0, 0, 0, 1)', em.input_indexed(pair, 'Shader', 0, 'vec4') == 'vec4(0.0, 0.0, 0.0, 1.0)')
+
+    # ---- the device road end to end: the GPU device DRAWS it (the fake driver), within the bar of the CPU device's frame
+    lit = _wired_cpu(_wired_out(src, link))
+    R._GBUF_CACHE.clear()
+    GSH._PLAN_CACHE.clear()
+    sc, st = _wired_scene(_wired_out(src, link), device='GPU')
+    buf = io.StringIO()
+    with fakedevice.installed() as dev:
+        with redirect_stdout(buf):
+            gpu = np.asarray(R.render(sc, st))
+        n_shaders = len(dev.shaders)
+    R._GBUF_CACHE.clear()
+    GSH._PLAN_CACHE.clear()
+    said = buf.getvalue()
+    dd = np.abs(gpu[..., :3] - lit[..., :3]) if gpu.shape == lit.shape else None
+    check('the GPU device road shades the wired colour on the driver: material passes drawn, no "shading on the CPU" line',
+          n_shaders >= 1 and 'material pass' in said and 'shading on the CPU' not in said, said[-300:])
+    check('...and its frame is the CPU device\'s within the bar (max < 6e-3, no px > 1e-2)',
+          dd is not None and float(dd.max()) < 6e-3 and int((dd.max(axis=-1) > 1e-2).sum()) == 0,
+          str(None if dd is None else float(dd.max())))
 
 
 def main():

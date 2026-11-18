@@ -4508,6 +4508,56 @@ def master_node(graph):
     return None
 
 
+#: the shader-socket nodes the EMISSION SLOT ROUTING has been proven on:
+#: for each of them the emitter's one chain IS the closure's emission --
+#: e_emission writes colour x Strength, e_mix_shader and e_add_shader the
+#: weighted sum n_mix_shader / n_add_shader hand closure_to_surface, a
+#: Reroute forwards. The Max blends are NOT here: their chains drop a
+#: bare side out of the mix (the master lobes' normalisation), where an
+#: emission lobe is scaled by its weight
+EMISSION_ROUTE_NODES = ('ShaderNodeEmission', 'ShaderNodeMixShader',
+                        'ShaderNodeAddShader', 'NodeReroute')
+
+
+def emission_route_block(graph, values):
+    """None when the chain the emitter writes for `graph`'s Surface link
+    is the emission the CPU sums, else the bl_idname that stops the route.
+
+    `values` is the evaluator's own output cache for this graph, (node id,
+    output index) -> value: an output that evaluated to a CLOSURE is a
+    shader node and must be one of EMISSION_ROUTE_NODES (walked through
+    its shader inputs); anything else on a shader socket is a colour,
+    value or vector chain -- the implicit Emission (nodeeval.link_closure)
+    -- which the emitter casts as it stands. The evaluator's verdict,
+    never the serialised socket types: a hand graph may not carry them.
+    An unlinked shader socket is the empty closure (the emitter writes
+    zero for it under the route, Emitter.bare_shader_zero)."""
+    from ..core.nodeeval import Closure
+    nodes = (graph or {}).get('nodes', {})
+    stack = [find_surface_link(graph)]
+    seen = set()
+    while stack:
+        link = stack.pop()
+        if not link:
+            continue
+        key = (link[0], int(link[1]))
+        if key in seen:
+            continue
+        seen.add(key)
+        if not isinstance(values.get(key), Closure):
+            continue
+        node = nodes.get(link[0]) or {}
+        idname = node.get('bl_idname', '?')
+        if idname not in EMISSION_ROUTE_NODES:
+            return idname
+        if idname == 'NodeReroute':
+            stack += [sk.get('link') for sk in node.get('inputs', ())[:1]]
+        elif idname != 'ShaderNodeEmission':
+            stack += [sk.get('link') for sk in node.get('inputs', ())
+                      if sk.get('name') == 'Shader']
+    return None
+
+
 def _replace_all(text, pairs):
     for old, new in pairs:
         text = text.replace(old, new)
@@ -4989,6 +5039,13 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     # {} is authoritative "nothing compiled" (code nodes read as zeros, the
     # CPU's own answer); the frame path always knows, so it never passes None
     em.programs = programs if programs is not None else {}
+    # THE EMISSION SLOT ROUTING (the probe grants it, bake['__slot']): the
+    # closure is emission lobes and nothing else, so the one chain the
+    # emitter writes is the light the surface gives off -- it rides the
+    # emission term below and the diffuse is the constant the CPU gave
+    # that surface (the probe's bake)
+    emission_slot = str(bake.get('__slot', '')) == 'emission'
+    em.bare_shader_zero = emission_slot
     base = None
     base_alpha = '1.0'
     body = ''
@@ -5103,6 +5160,23 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
             return None, f'no GLSL emitter for {missing}'
     if base is None:
         base = _v3(bake.get('diffuse', (0.8, 0.8, 0.8)))
+    elif emission_slot:
+        # light_surface adds surf.emission once, after the light loop and
+        # the clamp: the shared `total = total + ...` line below reads
+        # this, exactly as it reads a master's linked Self-Illumination.
+        # A corner-rate pass never reaches that line -- the emission is
+        # in the CPU-lit corners -- and multiplies them by the constant
+        # diffuse
+        perpix_exprs['emission'] = base
+    if str(bake.get('__slot', '')) in ('specular', 'emission'):
+        # a ROUTED chain is not the albedo, so its alpha is not the
+        # texel alpha the decal combines read (DS_DECAL, DECAL_ALPHA,
+        # N64_BLENDRGBA): the CPU's albedo pass hands them the constant
+        # diffuse and the surface's own opacity, the opaque 1.0. Left at
+        # the chain's alpha, a lone Glossy BSDF (the specular route,
+        # since it was ported) whose colour carried alpha 0.3 drew 0.48
+        # off the CPU at the corner rates under those three combines
+        base_alpha = '1.0'
 
     # image textures: the CPU samples the *prepared* pixels -- resized,
     # quantised, colourspace-converted -- so those exact pixels travel, and
@@ -5863,6 +5937,17 @@ void main()
             f'    s.diffuse = '
             f'{_mv3(consts, bake.get("diffuse", (0.8, 0.8, 0.8)))};',
             f'    s.specular = {base};',
+        ]
+    elif emission_slot:
+        # the emission slot routing: no diffuse and no glossy lobe
+        # arrives, so BOTH colours are the constants closure_to_surface
+        # gave the surface (the levels bake beside them); the chain is
+        # added as emission further down
+        lines += [
+            f'    s.diffuse = '
+            f'{_mv3(consts, bake.get("diffuse", (0.8, 0.8, 0.8)))};',
+            f'    s.specular = '
+            f'{_mv3(consts, bake.get("specular", (1, 1, 1)))};',
         ]
     else:
         lines += [
