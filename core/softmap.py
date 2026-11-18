@@ -1097,7 +1097,12 @@ def _face(face, fetch, rect, P, N, ndl, slope, soft, shape, dmin,
                 al = (np.abs(gu_c - guh) + np.abs(gv_c - gvh)) * win
                 room = pt.dr[cand] - (np.abs(guh) + np.abs(gvh)) * win - al
                 ok = (up > f32(0.0)) & (room > f32(0.0))
-                rise = up * al / np.maximum(room, f32(1e-30))
+                # (no room: the point is not `ok`, and its quotient is
+                # kept finite -- a receiver above the lamp has an `al`
+                # of 1e12 and would overflow over the floor of `room`)
+                rise = up * al / np.where(room > f32(0.0),
+                                          np.maximum(room, f32(1e-30)),
+                                          f32(1.0))
                 eps = f32(4e-6) * (np.abs(pz) + up + f32(1.0) / pt.dr[cand]
                                    + f32(1.0))
             else:

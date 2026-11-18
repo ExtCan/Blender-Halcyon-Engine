@@ -527,7 +527,8 @@ def shadow_function(i, meta, mb=None):
               '    float gvh = uax.z / hden;',
               '    float al = (abs(gu - guh) + abs(gv - gvh)) * win;',
               '    float room = dr - (abs(guh) + abs(gvh)) * win - al;',
-              '    float rise = up * al / max(room, 1e-30);',
+              '    float rise = up * al '
+              '/ (room > 0.0 ? max(room, 1e-30) : 1.0);',
               '    float zeps = 4e-6 * (abs(pz) + up + 1.0 / dr + 1.0);',
               '    if (up > 0.0 && room > 0.0 && top >= zeps + rise - pz) '
               '{ near = lim; }']

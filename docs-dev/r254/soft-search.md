@@ -478,9 +478,9 @@ The others gain beyond their skips because the tighter reach calls fewer
 points partly shadowed (a point lamp's probes: 112,633 -> 78,331).
 
 Text of one sized lamp's shadow function (`ms/glsl_size.py`, the literal
-road): POINT 0.3 17,882 -> 22,592 bytes at Samples 4 and 35,463 -> 40,379
-at 16; SPOT 13,249 -> 17,492 and 29,810 -> 34,259; SUN 12,689 -> 16,747 and
-29,250 -> 33,514; AREA 18,469 -> 23,179 and 36,050 -> 40,966. A lamp of
+road): POINT 0.3 17,882 -> 22,613 bytes at Samples 4 and 35,463 -> 40,400
+at 16; SPOT 13,249 -> 17,513 and 29,810 -> 34,280; SUN 12,689 -> 16,747 and
+29,250 -> 33,514; AREA 18,469 -> 23,200 and 36,050 -> 40,987. A lamp of
 size 0 on the constant lookup: 4,161 and 7,353 bytes, unchanged.
 
 ## Cost
@@ -624,6 +624,11 @@ rows, 26 % of its texels, uploaded with the pack when the map changes.
   cap's reach up to a Softness of 8 texels (`_SEAM_SOFT`); past it a reach
   that crosses a seam is bounded by the nearest depth of the whole cube,
   as on the fork point.
+- **A receiver above the lamp is not a level receiver.** The level test
+  needs the lamp above the point (`up > 0`) and room for the plane's
+  disagreement; elsewhere its quotient is kept finite on both roads (the
+  floor of `room` alone let it overflow there, a numpy warning on the
+  console) and the point is searched.
 - **The Bias bound needs the stamp.** `scene_radius` is set by
   `core/render._build_shadows`; a map baked by another caller carries none
   and its Bias is the dial's own value.
