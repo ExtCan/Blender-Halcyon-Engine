@@ -1332,6 +1332,154 @@ Shader's name resolution is pinned in `tests/test_shaders.py` as well.
   Compile, the warning and error boxes, the export, the evaluator at
   shading time, the GPU port and `device.preflight`). 32 mutations of the
   fix each fail them.
+- **A Bump whose height is fed by another Bump gathers from fields built
+  in dependency order (it was cut at every pre-pass chunk, band edge,
+  region edge and layer).** The height pre-pass -- `n_bump` differences
+  its height toward the +x / +y neighbours shaded in the SAME batch, so
+  a material that covers more than one shading batch has its height
+  chains rendered to whole-material gradient fields first -- evaluated
+  every Bump's Height chain in ONE pass over the material, chunk by
+  chunk, and the material's fields exist only once that pass returns
+  (`job.bump_fields` is updated after `_bump_height_fields`). A Bump B
+  whose Height chain holds a Bump A therefore had A evaluated with no
+  field: A fell back to differencing the batch in front of it
+  (`_screen_grad`), which there is the PRE-PASS chunk, and A's normal --
+  B's height -- was cut at every pre-pass chunk boundary. "Heights are
+  per-pixel independent, so chunking here cannot cut anything" holds
+  for a height that reads no Bump, and for no other. The Bump-in-a-group
+  entry above saw it and left it for its own fix. *Wrong picture or
+  fallback: the wrong picture.* The probe (the demo floor through the
+  real `serialize_tree`, `R.render` on the CPU): Gradient Texture
+  (Quadratic Sphere) -> Math Multiply 6.0 -> Bump A; A's Normal ->
+  Separate XYZ (X) -> Math Multiply 6.0 -> Bump B's Height; B -> the
+  master's Normal. Against the frame of the material shaded in ONE batch
+  (the batch size raised past the floor: no pre-pass at all) it is
+  identical at 128x96, where no pre-pass runs; 0.84 off over 461 pixels
+  on rows 52-54 at 320x240; 0.98 off over 2946 pixels on nine rows at
+  640x480; and with a Bump C on B's normal, 1.35 off over 692 pixels on
+  rows 51-54. Every road the entry above named was then probed, and each
+  had the hole. *Inside groups*: the whole probe in one group, A in a
+  group under B, B in a group over A (its height the group's input), a
+  group in a group -- 0.84 off on the same 461 pixels, each of them.
+  *See-through*: the layered road evaluated its heights `MAX_CHUNK`
+  fragments at a time across ALL ranks. One layer of the probe is right
+  at the stock chunk size (one chunk holds the floor) and 0.65 off over
+  378 pixels on rows 70-72 with its heights in two chunks; TWO layers (a
+  second sheet of the material over the floor) are 0.69 off over 8806
+  pixels at the stock size, 0.79 over 9135 with three levels -- A
+  differenced both ranks' fragments in one batch, two heights colliding
+  at every pixel both layers cover: the collision the per-rank fields
+  were built to remove, one level down. *Bands*: a band's scissor keeps
+  ONE context row past the band, the row a Bump's gradient reads. B's
+  gradient on the band's last row reads B's height on that context row,
+  which reads A's gradient there, which reads A's height one row further
+  -- never rasterised. On a floor of small triangles (the scissor keeps
+  whole triangles, so the demo floor's two cover every row whatever it
+  asks for and hide this) three bands of the 320x240 frame are 1.01 off
+  along rows 79 and 126, the last row of each band that has another
+  above it; sixteen-row bands 1.21 off over 337 pixels, the last row of
+  every such band; and a see-through floor in three bands 0.60. *The
+  render region*: the same reading, in the ring
+  `_region_reach` keeps past the rect -- 1.05 off along the rect's edge.
+  *The GPU device*: the deferred pass refuses a Bump inside another
+  Bump's height chain by name where it could emit the chain, and the
+  frame falls to the same CPU road, cut included. A chain it cannot emit
+  -- a node group above all -- is evaluated on the CPU into the Bump's
+  height image (`gpu/shade._cpu_height_image`), the upstream Bump with
+  it: over the whole material in one batch, so the whole frame was right
+  (inside the deferred bar on the simulator: one pixel 0.0022 from the
+  CPU frame, every other under 1e-5), but a refine pass (adaptive
+  anti-aliasing) evaluates the flagged pixels grown by ONE ring, and
+  its flagged pixels were 1.27 off at 446 of 3840 on a 160x120 probe.
+  (1) *The order.*
+  `core/nodeeval.bump_levels(graph)` sorts a material's Bumps into
+  levels: the first holds every Bump whose height chain reads no other
+  Bump, each later one the Bumps whose height reads only Bumps of the
+  levels before it. The walk is `bump_heights`' own (a tree's nodes,
+  then its groups', an id counted once), so the two cannot disagree
+  about which node an id names. What feeds a height is read from the
+  links (`_bump_feeders`), never less than the evaluator reads: every
+  input of every node on the way, a group node's output as its inner
+  Group Output's socket of that name, a Group Input's output as the
+  holding group node's input of that name, else of that position (the
+  readings of `n_group` and `n_group_input`). A Bump met on the way is a
+  feeder whose HEIGHT is not followed -- by the time it is asked it
+  gathers from its field -- and whose Strength, Distance and Normal are:
+  a height reads what the Bump it takes reads. The group boundary is
+  taken socket by socket because the usual stack of bump groups hands
+  the NORMAL down, group after group: read by node, every group of such
+  a stack would seem to feed the next one's height and each would cost a
+  pass. (2) *The opaque frame.* `_bump_height_fields` builds its fields
+  a level at a time, each level's chunks evaluated with every field
+  built before it in reach (`ctx.bump_fields`), so the upstream Bump
+  gathers from its whole-material field there as it does in the shading
+  pass; `bump_heights(ev, only)` evaluates one level's Bumps and passes
+  the others over. (3) *The layers.* "Per-fragment pure" is the first
+  level's alone, so the layered road evaluates the first level across
+  the ranks, as it did, and hands each rank's fragments to that same
+  builder for the levels above it (`first=1`), the rank's first-level
+  fields filed where the builder looks. (4) *A pixel of context per
+  level.* A level-0 gradient reads the neighbour's height; each level
+  above it reads one neighbour further. The band scissor keeps
+  `len(bump_levels)` rows past the band where it kept one,
+  `_region_reach` that many rings, and `_cpu_height_image` grows a
+  refine mask by one ring more per level of the node it evaluates. (5)
+  *One difference.* The forward differences behind a field were written
+  out at both sites; they are `_bump_gradients`, the one place.
+  *Pictures that change*: a material in which one Bump's Height chain
+  reads another Bump -- the master's own Bump Height fed by a Bump's
+  normal included,
+  since it desugars to a Bump -- where that material covers more than
+  16384 pixels of the frame, on a banded frame, in a render region,
+  see-through, or in a refine pass on the GPU device. It draws the
+  one-batch frame now, on every one of those roads. *Nothing else
+  moves, and nothing else pays*: a material whose Bumps do not feed each
+  other's height is ONE level -- the pass it always was, the same
+  evaluator calls in the same order. Rendered by the tree before this
+  entry and by this one, the frames of five such materials (one Bump;
+  two chained through the Normal socket; one group instanced twice and
+  four times, each bending the last one's normal; a group in a group)
+  are identical bit for bit, opaque, see-through, in three bands and in
+  a region, and their pre-passes build the same number of contexts.
+  Pinned in
+  `test_bump_fed_by_a_bump_builds_its_fields_in_dependency_order` (33
+  checks), through the real `serialize_tree`, with a spy on the pre-pass
+  that says for every frame whether it ran, for which ids, how many
+  times it evaluated the material, and whether any Bump differenced a
+  chunk on the way: the levels read from the graphs (the probe at two
+  and three levels, the four group arrangements under their path ids, a
+  Normal-chained pair and a stack of three groups as ONE level, a group
+  with a second output no Bump feeds, a Bump read THROUGH another Bump's
+  Normal socket, the master's desugared Bump Height, a loop of heights
+  cut rather than walked for ever); the probe at 320x240 in two passes
+  with no chunk differenced, bit for bit the one-batch frame; the old
+  pre-pass put back (every Bump in one level) cutting a few rows by more
+  than 0.1, so the frames can tell; 128x96 and 640x480; the four group
+  arrangements against the top-level one-batch frame; three levels; four
+  Bumps on three; the stack of groups in one pass; the three-level probe
+  see-through in two layers, its heights in more than one chunk, against
+  each rank shaded in ONE batch with no field at all, and the same
+  inside a group; three bands and a region of a floor of small
+  triangles against the whole frame; the GPU device on the stand-in
+  driver (the probe refused by name and the CPU's pre-passed frame bit
+  for bit; a group's Bump drawn by the deferred pass and a refine pass's
+  flagged pixels bit for bit the whole frame's); and the rule read from
+  the code (one order behind every road, one difference). Each road has
+  its own "can tell" check with the levels flattened. Thirteen mutations
+  each fail it: the builder back to one pass; a level evaluated without
+  the earlier fields in reach; every level evaluating every Bump; the
+  levels in reverse; the band's context back to one row; the region's
+  ring back to one pixel; the height image's mask back to one ring; the
+  layered road evaluating every level across the ranks, or starting its
+  per-rank builder a level late; the walk never crossing a group
+  boundary; a met Bump ending the walk; a Group Input, or a group node's
+  output, read by node instead of by socket. *Seen from the same probes
+  and left*: `core/render._promote_clip` evaluates a punch-through
+  material's alpha chain `MAX_CHUNK` fragments at a time with no field
+  in reach, so an alpha that reads a Bump's normal differences that
+  chunk -- read in the code, not probed; and the deferred pass still
+  refuses a Bump inside a height chain it could otherwise emit (the
+  frame is right, on the CPU).
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
@@ -1481,3 +1629,17 @@ Shader's name resolution is pinned in `tests/test_shaders.py` as well.
   it by name). A wrong argument count or two vector widths in a coded
   shader of a real file: the red line in the node, and the frame shading
   without that node's program rather than failing halfway.
+- A Bump fed by another Bump in a real file. The fix is proven
+  headless alone (stand-in trees through the real `serialize_tree`, CPU
+  frames; bands rendered one after another through `render(band=...)`
+  in one process; the GPU device on the stand-in driver) -- never in
+  Blender and never on a GPU. Open there: an F12 at a real frame size
+  of a material whose Bump takes its Height from another Bump's Normal
+  (through a Separate XYZ, a Dot Product, anything), against the same
+  frame at a size small enough to shade in one batch; the same frame
+  through the worker pool, where each band is its own process, on a
+  mesh of small triangles; Ctrl+B over it; such a material see-through
+  over itself; and on the GPU device, the console's refusal line ("a
+  Bump node inside another Bump's height chain is not in the deferred
+  pass yet") with the CPU's frame, and an Adaptive anti-aliased frame of
+  a material whose upstream Bump sits in a node group.

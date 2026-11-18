@@ -1921,9 +1921,178 @@ def has_bump(graph):
     return False
 
 
-def bump_heights(ev, _seen=None):
+class _BumpTree:
+    """One tree of a material as the Bump dependency walk reads it: its
+    nodes and, below the material's own tree, the group node that holds
+    it (`holder`) in the tree above (`parent`). One per group node, so
+    two instances of a group are two trees, as they are two bindings."""
+
+    __slots__ = ('nodes', 'output', 'parent', 'holder', '_subs')
+
+    def __init__(self, graph, parent=None, holder=None):
+        graph = graph or {}
+        self.nodes = graph.get('nodes') or {}
+        self.output = graph.get('group_output')
+        self.parent, self.holder = parent, holder
+        self._subs = {}
+
+    def sub(self, node):
+        tree = self._subs.get(id(node))
+        if tree is None:
+            tree = self._subs[id(node)] = _BumpTree(node.get('group'),
+                                                    self, node)
+        return tree
+
+
+def _is_height(sock):
+    return 'Height' in (sock.get('name'), sock.get('identifier'))
+
+
+def _bump_feeders(tree, link):
+    """The ids of the Bump nodes the output `link` ([node id, output
+    index]) of `tree` can take its value from.
+
+    A node reads every input it has, so the walk follows every link --
+    with the evaluator's own three exceptions, each the reading of the
+    code that evaluates it. A group node's output is its inner Group
+    Output's socket of that name (`n_group` files them by name and
+    `eval_output` asks by name, identifier, alias). A Group Input's
+    output is the holding group node's input of that name, else of that
+    position (`n_group_input`); in the material's own tree it reads
+    nothing. And a Bump node met on the way is a feeder whose HEIGHT is
+    not followed: by the time it is asked it gathers from its field
+    (`n_bump`), and what its own height takes is its own level's
+    business -- its Strength, Distance and Normal are read as ever.
+    The group boundary is taken socket by socket because the usual
+    stack of bump groups hands the NORMAL down (group after group, each
+    bending the last one's): by node, every group of such a stack would
+    seem to feed the next one's height, and each would cost a pass.
+    """
+    found, seen = set(), set()
+    todo = [(tree, link[0], link[1])]
+    while todo:
+        tree, nid, oi = todo.pop()
+        node = tree.nodes.get(nid)
+        if node is None:
+            continue
+        idn = node.get('bl_idname')
+        inner = idn == 'ShaderNodeGroup' and bool(node.get('group'))
+        by_socket = inner or idn == 'NodeGroupInput'
+        key = (id(tree), nid, oi if by_socket else None)
+        if key in seen:
+            continue
+        seen.add(key)
+        outs = node.get('outputs') or []
+        out = outs[oi] if isinstance(oi, int) and 0 <= oi < len(outs) \
+            else None
+        if inner:
+            sub = tree.sub(node)
+            onode = sub.nodes.get(sub.output) or {}
+            names = set() if out is None else \
+                {out.get('name'), out.get('identifier'),
+                 _OUTPUT_ALIASES.get(out.get('name'))} - {None}
+            tree, socks = sub, [s for s in onode.get('inputs') or ()
+                                if s.get('name') in names]
+        elif idn == 'NodeGroupInput':
+            ins = (tree.holder or {}).get('inputs') or []
+            socks = [] if out is None else \
+                [s for s in ins if s.get('name') == out.get('name')] \
+                or ins[oi:oi + 1]
+            tree = tree.parent
+        else:
+            bump = idn == 'ShaderNodeBump'
+            if bump:
+                found.add(node.get('id'))
+            socks = [s for s in node.get('inputs') or ()
+                     if not (bump and _is_height(s))]
+        for s in socks:
+            lk = s.get('link')
+            if lk and tree is not None:
+                todo.append((tree, lk[0], lk[1]))
+    return found
+
+
+def bump_levels(graph):
+    """The graph's Bump nodes in the order their fields have to be built:
+    a list of id lists, [] for a graph without a Bump. The first holds
+    every Bump whose height chain reads no other Bump; each later one
+    the Bumps whose height reads only Bumps of the lists before it.
+
+    R253 (review): the pre-pass evaluated every height chain in ONE
+    pass, before any of the material's fields existed. A Bump whose
+    Height is fed by another Bump's normal therefore had that upstream
+    Bump differencing the PRE-PASS chunk it was evaluated in (no field:
+    `n_bump` falls back to `_screen_grad`), and the upstream normal --
+    hence the downstream height, hence its gradients -- was cut at
+    every pre-pass chunk boundary: the very seam the pre-pass removes,
+    one level down (0.84 off on three rows of the 320x240 probe). The
+    fields are built level by level instead, each level's heights
+    evaluated with the fields of the levels before it in reach.
+
+    The walk is `bump_heights`' own -- a tree's nodes, then its groups',
+    an id counted once -- so the two can never disagree about which
+    node an id names. What feeds a height is read from the links
+    (`_bump_feeders`): never less than the evaluator reads, so a field
+    can only be built a level LATER than it strictly had to be, never
+    before something it needs. A material whose Bumps do not feed each
+    other's height is ONE level, and its pre-pass is the single pass it
+    always was. The number of levels is also how many pixels past a
+    shaded pixel its Bumps read (a level-0 gradient reads the +x / +y
+    neighbour's height; each level above it reads one neighbour further),
+    which is what a band's or a region's context has to cover.
+    """
+    order, feeds = [], {}
+
+    def walk(tree):
+        groups = []
+        for node in tree.nodes.values():
+            idn = node.get('bl_idname')
+            if idn == 'ShaderNodeBump':
+                nid = node.get('id')
+                if nid not in feeds:
+                    order.append(nid)
+                    link = next((s.get('link') for s in
+                                 node.get('inputs') or ()
+                                 if _is_height(s)), None)
+                    feeds[nid] = _bump_feeders(tree, link) if link \
+                        else set()
+            elif idn == 'ShaderNodeGroup' and node.get('group'):
+                groups.append(node)
+        for node in groups:
+            walk(tree.sub(node))
+
+    walk(_BumpTree(graph))
+    if not order:
+        return []
+    level = {}
+    todo = order
+    while todo:
+        rest = []
+        for nid in todo:
+            need = [d for d in feeds[nid] if d != nid and d in feeds]
+            if all(d in level for d in need):
+                level[nid] = 1 + max((level[d] for d in need), default=-1)
+            else:
+                rest.append(nid)
+        if len(rest) == len(todo):
+            # a loop of heights: no tree Blender exports has one (its
+            # links are acyclic), so this is a hand-built graph's --
+            # cut where it stands rather than never return
+            for nid in rest:
+                level[nid] = 1 + max((level[d] for d in feeds[nid]
+                                      if d in level), default=-1)
+            break
+        todo = rest
+    return [[nid for nid in order if level[nid] == k]
+            for k in range(max(level.values()) + 1)]
+
+
+def bump_heights(ev, only=None, _seen=None):
     """(node id, heights) for every Bump node below the evaluator: its
-    own tree's, then each node group's, to any depth.
+    own tree's, then each node group's, to any depth. Given `only` (a
+    set of ids: one level of `bump_levels`), for those Bumps alone --
+    the walk and its order are the same, the others are passed over
+    unevaluated.
 
     The Bump pre-pass (`core/render._bump_height_fields`, and the layered
     road's per-rank twin) walked the material's own tree only, so a Bump
@@ -1951,14 +2120,15 @@ def bump_heights(ev, _seen=None):
             nid = node.get('id')
             if nid not in seen:
                 seen.add(nid)
-                yield nid, np.asarray(ev.input(node, 'Height', VALUE),
-                                      np.float32).reshape(-1)
+                if only is None or nid in only:
+                    yield nid, np.asarray(ev.input(node, 'Height', VALUE),
+                                          np.float32).reshape(-1)
         elif idn == 'ShaderNodeGroup':
             groups.append(node)
     for node in groups:
         sub = group_evaluator(ev, node, lazy=True)
         if sub is not None:
-            yield from bump_heights(sub, seen)
+            yield from bump_heights(sub, only, seen)
 
 
 def _screen_grad(c, values):

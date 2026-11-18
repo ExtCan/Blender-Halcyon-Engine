@@ -4732,10 +4732,12 @@ def _region_reach(scene, st, ink_reach, has_bump):
     radiosity grid) plus one ring for the edge tent (_edge_smooth), two
     for the adaptive contrast window (_adaptive_mask: 'within two
     pixels of a geometric flag'). The Fuzz / Thin Wall blends have no
-    finite ring (render() renders them whole and crops, by name)."""
+    finite ring (render() renders them whole and crops, by name).
+    `has_bump` is the Bumps' reach in pixels (render()'s bump_reach: 0
+    without a Bump, 1 with, one more for each Bump a height reads
+    through); True reads as the one ring it always meant."""
     reach = int(ink_reach or 0)
-    if has_bump:
-        reach += 1
+    reach += int(has_bump or 0)
     rad_n = int(getattr(st, 'radiosity_spacing', 1) or 1)
     if getattr(st, 'radiosity', False) and rad_n > 1:
         reach += 2 * rad_n
@@ -5156,9 +5158,17 @@ def render(scene, settings=None, progress=None, band=None):
     # when only a band is wanted, the rasteriser is told so: otherwise every
     # worker in a pool rasterises the whole mesh for its own slice
     scissor = None
-    has_bump = any('ShaderNodeBump' in
-                   str((getattr(m, 'graph', None) or {}).get('nodes', {}))
-                   for m in getattr(scene, 'materials', ()) or ())
+    # R253 (review): how many pixels past a shaded pixel the frame's
+    # Bumps read -- one for a Bump, one more for each Bump its HEIGHT
+    # reads through (nodeeval.bump_levels): its gradient reads the
+    # neighbour's height, which reads the upstream Bump's gradient
+    # there, which reads the next neighbour's height. This was "is
+    # there a Bump", and the band and the region kept the one row
+    from .nodeeval import bump_levels as _bump_levels
+    bump_reach = max((len(_bump_levels(getattr(m, 'graph', None)))
+                      for m in getattr(scene, 'materials', ()) or ()),
+                     default=0)
+    has_bump = bump_reach > 0
     # R227: the ink's REACH in rows. A band's scissor culls the
     # triangles outside its rows, and an outline seeded in the row
     # just past the band used to be missing from the band's edge rows
@@ -5189,8 +5199,11 @@ def render(scene, settings=None, progress=None, band=None):
             # last shaded row flattened its waves -- the same seam the
             # chunk fix killed, band edition. The scissor culls whole
             # triangles, so one extra row keeps the neighbour coverage
-            # complete; shading stays band-masked below.
-            scissor = (scissor[0], min(scissor[1] + 1, rh))
+            # complete; shading stays band-masked below. R253 (review):
+            # one row PER LEVEL -- a Bump whose height reads another
+            # Bump's normal reads that Bump's gradient on the context
+            # row, and that gradient its own neighbour's height
+            scissor = (scissor[0], min(scissor[1] + bump_reach, rh))
         rad_n = int(getattr(st, 'radiosity_spacing', 1) or 1)
         if getattr(st, 'radiosity', False) and rad_n > 1:
             # the interpolated gather's grid blocks must be COMPLETE
@@ -5215,7 +5228,7 @@ def render(scene, settings=None, progress=None, band=None):
     t_scissor = scissor
     if rect is not None:
         _keep2 = _region_keep(rect, rw, rh, ss,
-                              _region_reach(scene, st, ink_reach, has_bump))
+                              _region_reach(scene, st, ink_reach, bump_reach))
         _region_box_px = _region_box(_keep2)
         if band is None:
             t_scissor = (_region_box_px[1],
@@ -7368,8 +7381,21 @@ def _cached_bvh(scene, mesh):
     return bvh
 
 
+def _bump_gradients(img, valid):
+    """(gx, gy) of a height image over its covered pixels: `_screen_grad`'s
+    own forward differences, a pixel differenced toward its +x / +y
+    neighbour where both are covered and 0 elsewhere."""
+    gx = np.zeros_like(img)
+    gy = np.zeros_like(img)
+    gx[:, :-1] = np.where(valid[:, 1:] & valid[:, :-1],
+                          img[:, 1:] - img[:, :-1], 0.0)
+    gy[:-1, :] = np.where(valid[1:, :] & valid[:-1, :],
+                          img[1:, :] - img[:-1, :], 0.0)
+    return gx, gy
+
+
 def _bump_height_fields(job, mat, mi, tri_m, bary_m, px_m, py_m, front_m,
-                        blin_m, chunkn):
+                        blin_m, chunkn, first=0):
     """(mi, node_id) -> (gx, gy): whole-material bump gradients, pre-passed.
 
     `n_bump` differences its height chain toward the +x/+y neighbours,
@@ -7393,39 +7419,60 @@ def _bump_height_fields(job, mat, mi, tri_m, bary_m, px_m, py_m, front_m,
     context and one evaluator per chunk now serve all of the material's
     Bumps (they were rebuilt per node), and the coverage -- one mask,
     whichever node -- is scattered once.
+
+    R253 (review): IN DEPENDENCY ORDER. "Heights are per-pixel
+    independent" holds for a height chain that reads no Bump. One that
+    does -- a Bump whose Height is fed by another Bump's normal -- had
+    that upstream Bump evaluated right here with no field (none of the
+    material's exist until this returns), differencing the pre-pass
+    CHUNK: the downstream height was cut at every chunk boundary, 0.84
+    off on three rows of the 320x240 probe. `nodeeval.bump_levels`
+    sorts the Bumps by what their heights read, and the fields are
+    built a level at a time, each level's chunks evaluated with every
+    field built before it in reach (`ctx.bump_fields`), so the upstream
+    Bump gathers from its whole-material field there as it does in the
+    shading pass. A material whose Bumps do not feed each other's
+    height is one level: the one pass above, the same evaluator calls
+    in the same order, nothing added. `first` skips the levels below
+    it, for a caller that has already filed their fields in
+    `job.bump_fields` (the layered road builds its first level itself,
+    once for all ranks).
     """
-    from .nodeeval import GraphEvaluator, bump_heights, has_bump
+    from .nodeeval import GraphEvaluator, bump_heights, bump_levels, has_bump
     graph = getattr(mat, 'graph', None)
     if not has_bump(graph):
         return {}
+    levels = bump_levels(graph)
     H, W = job.height, job.width
-    imgs = {}
     valid = np.zeros((H, W), bool)
-    for s in range(0, int(tri_m.size), int(chunkn)):
-        e = min(s + int(chunkn), int(tri_m.size))
-        ctx = job.context(tri_m[s:e], bary_m[s:e], px_m[s:e],
-                          py_m[s:e], front_m[s:e]
-                          if front_m is not None else None,
-                          blin_m[s:e] if blin_m is not None else None,
-                          0, True)
-        ev = GraphEvaluator(graph, ctx, job.textures,
-                            getattr(mat, 'programs', None))
-        for nid, h in bump_heights(ev):
-            img = imgs.get(nid)
-            if img is None:
-                img = imgs[nid] = np.zeros((H, W), np.float32)
-            img[py_m[s:e], px_m[s:e]] = h
-        valid[py_m[s:e], px_m[s:e]] = True
+    valid[py_m, px_m] = True
     fields = {}
-    for nid in list(imgs):
-        img = imgs.pop(nid)
-        gx = np.zeros_like(img)
-        gy = np.zeros_like(img)
-        gx[:, :-1] = np.where(valid[:, 1:] & valid[:, :-1],
-                              img[:, 1:] - img[:, :-1], 0.0)
-        gy[:-1, :] = np.where(valid[1:, :] & valid[:-1, :],
-                              img[1:, :] - img[:-1, :], 0.0)
-        fields[(int(mi), nid)] = (gx, gy)
+    for depth in range(int(first), len(levels)):
+        # one level: every Bump of the material when it has but the one
+        only = frozenset(levels[depth]) if len(levels) > 1 else None
+        known = None
+        if depth:
+            known = dict(getattr(job, 'bump_fields', None) or {})
+            known.update(fields)
+        imgs = {}
+        for s in range(0, int(tri_m.size), int(chunkn)):
+            e = min(s + int(chunkn), int(tri_m.size))
+            ctx = job.context(tri_m[s:e], bary_m[s:e], px_m[s:e],
+                              py_m[s:e], front_m[s:e]
+                              if front_m is not None else None,
+                              blin_m[s:e] if blin_m is not None else None,
+                              0, True)
+            if known is not None:
+                ctx.bump_fields = known
+            ev = GraphEvaluator(graph, ctx, job.textures,
+                                getattr(mat, 'programs', None))
+            for nid, h in bump_heights(ev, only):
+                img = imgs.get(nid)
+                if img is None:
+                    img = imgs[nid] = np.zeros((H, W), np.float32)
+                img[py_m[s:e], px_m[s:e]] = h
+        for nid in list(imgs):
+            fields[(int(mi), nid)] = _bump_gradients(imgs.pop(nid), valid)
     return fields
 
 
@@ -9782,7 +9829,7 @@ def _shade_fragments_cpu(job, tri, bary, px, py, front, rank, st):
     bump_mats = _bump_materials_of(job, tri)
     if not bump_mats:
         return _shade_chunked(job, tri, bary, px, py, front, None, st)
-    from .nodeeval import GraphEvaluator, bump_heights
+    from .nodeeval import GraphEvaluator, bump_heights, bump_levels
     mesh = job.scene.mesh
     mat_f = mesh.mat_index[tri] if mesh.mat_index is not None \
         else np.zeros(tri.size, np.int32)
@@ -9795,16 +9842,31 @@ def _shade_fragments_cpu(job, tri, bary, px, py, front, rank, st):
     # 43 on exactly that; the waves' noise chain was re-running once
     # per depth layer). R253 (review): every Bump of the material, at
     # any depth -- nodeeval.bump_heights, the walk _bump_height_fields
-    # takes: a Bump inside a node group had no field on this road either
+    # takes: a Bump inside a node group had no field on this road either.
+    # R253 (review): "per-fragment pure" is the FIRST level's alone
+    # (nodeeval.bump_levels): a Bump whose height reads another Bump's
+    # normal reads that Bump's gradients, which are the layer's -- so
+    # only the first level is evaluated here, across the ranks, and the
+    # levels above it rank by rank below, each with the rank's own
+    # fields of the levels before it in reach. They were evaluated here
+    # with the rest, the upstream Bump differencing one chunk of every
+    # rank's fragments at once: cut at each chunk, and two layers' heights
+    # colliding at a pixel wherever a second layer covered the first
     H, W = job.height, job.width
     heights = {}
     mat_idx_of = {}
+    deeper = {}
     for mi, mat in bump_mats.items():
         idx = np.nonzero(mat_f == mi)[0]
         if idx.size == 0:
             continue
         mat_idx_of[mi] = idx
         graph = getattr(mat, 'graph', None)
+        levels = bump_levels(graph)
+        only = None
+        if len(levels) > 1:
+            deeper[mi] = mat
+            only = frozenset(levels[0])
         for s in range(0, int(idx.size), int(MAX_CHUNK)):
             e = min(s + int(MAX_CHUNK), int(idx.size))
             sub = idx[s:e]
@@ -9813,7 +9875,7 @@ def _shade_fragments_cpu(job, tri, bary, px, py, front, rank, st):
                               else None, None, 0, True)
             ev = GraphEvaluator(graph, ctx, job.textures,
                                 getattr(mat, 'programs', None))
-            for nid, h in bump_heights(ev):
+            for nid, h in bump_heights(ev, only):
                 hv = heights.get((mi, nid))
                 if hv is None:
                     hv = heights[(mi, nid)] = np.empty(idx.size, np.float32)
@@ -9843,14 +9905,19 @@ def _shade_fragments_cpu(job, tri, bary, px, py, front, rank, st):
                 valid = np.zeros((H, W), bool)
                 img[py[idx[m]], px[idx[m]]] = hv[m]
                 valid[py[idx[m]], px[idx[m]]] = True
-                gx = np.zeros_like(img)
-                gy = np.zeros_like(img)
-                gx[:, :-1] = np.where(valid[:, 1:] & valid[:, :-1],
-                                      img[:, 1:] - img[:, :-1], 0.0)
-                gy[:-1, :] = np.where(valid[1:, :] & valid[:-1, :],
-                                      img[1:, :] - img[:-1, :], 0.0)
-                fields[(mi, node_id)] = (gx, gy)
+                fields[(mi, node_id)] = _bump_gradients(img, valid)
             job.bump_fields = fields
+            for mi, mat in deeper.items():
+                # the levels above the first, over THIS rank's fragments
+                # of the material: the opaque frame's own builder, the
+                # rank's first-level fields filed where it looks
+                idx = mat_idx_of[mi]
+                sub = idx[rank[idx] == r]
+                if sub.size:
+                    fields.update(_bump_height_fields(
+                        job, mat, mi, tri[sub], bary[sub], px[sub],
+                        py[sub], front[sub] if front is not None else None,
+                        None, MAX_CHUNK, first=1))
             col[sel] = _shade_chunked(job, tri[sel], bary[sel], px[sel],
                                       py[sel],
                                       front[sel] if front is not None
