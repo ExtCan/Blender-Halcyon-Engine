@@ -1045,10 +1045,16 @@ Shader's name resolution is pinned in `tests/test_shaders.py` as well.
   move is bitwise a fresh render with no cache cleared, the GPU twin
   7.6e-6) and in `test_r253_review`'s signature test, which asserted the
   translation KEPT the mesh key and now asserts it changes while the
-  plan signature still fingerprints the baked frame on its own. Left as
-  they were: the normal, UV, material-index and triangle-index parts of
-  the mesh key are still strided sums (a UV edit confined to unsampled
-  rows, or one that cancels, does not re-upload the attribute texture).
+  plan signature still fingerprints the baked frame on its own. This
+  fix left the normal, UV, material-index and triangle-index parts of
+  the mesh key as strided sums; the R254 viewport round digests those
+  arrays whole (`gpu/shade._attr_digests`, docs-dev/r254/viewport.md,
+  section 9), and `test_d_unmoved_edits_move_the_mesh_key` holds the
+  cases this entry named: an edit that cancels in the sum (every UV
+  shifted by (0.1, -0.1); two rows exchanged), an edit between the
+  samples, and two visible triangles' rows exchanged on the CPU road
+  (bitwise a fresh render with no cache cleared; 1.40 on the stale
+  raster).
 - **A name the Coded Shader never declared is a compile error.** The
   report: `shaders/compiler.try_compile` on a six-line source whose
   `main` reads `nothing` returned a program with error `None` and no

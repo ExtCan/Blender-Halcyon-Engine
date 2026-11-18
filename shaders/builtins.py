@@ -581,7 +581,14 @@ def texelFetch(samp, xy, lod=0):
     p = np.asarray(xy)
     x = np.clip(p[:, 0].astype(np.int64), 0, samp.width - 1)
     y = np.clip(p[:, 1].astype(np.int64), 0, samp.height - 1)
-    return samp.pixels[y, x].astype(F32)
+    px = samp.pixels
+    if px.ndim == 2:
+        # a one-channel (R32F) texture: (r, 0, 0, 1), as a driver hands it
+        out = np.zeros((x.shape[0], 4), F32)
+        out[:, 0] = px[y, x]
+        out[:, 3] = 1.0
+        return out
+    return px[y, x].astype(F32)
 
 
 def textureSize(samp, lod=0):
