@@ -2947,8 +2947,9 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   rows off the chain` in the container, `... is the chain, bitwise (an
   unfused kernel)` where the twins were green. With this the container's
   `run_all` fails the zip pins and nothing else: on the tree this entry
-  landed on, 12,293 checks pass where 12,217 did, and the failing lines
-  that remain are the baseline's zip lines, byte for byte.
+  landed on (`claude-cloud` 1e6239c), 12,939 checks pass where 12,863 did,
+  and the failing lines that remain are the baseline's zip lines, byte for
+  byte.
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
