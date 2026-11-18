@@ -9,12 +9,21 @@ verify-key-overreach-11, perf-viewport-fullsize-bake-06 = perf-draft-bake-01,
 verify-object-move-layers-13, perf-thread-gate-09, perf-cache-hoard-07 =
 perf-cache-bytes-01 = size-map-v03 (second half), perf-worker-pool-rebake-08,
 wide-spot-map-01 = v-spot-wide-beam-maps, ring2-map-reach-01, clip-area-01,
-note-coarse-01, stale-map-same-scene-01. Every number below was measured on
-this tree against the commit it forked from (4e655f6); the probes are in
-`<scratch>/wt/bake-speed/work/` (`t1_depth.py`, `t2_profile.py`,
-`t3_threads.py`, `t4_pool.py`, `n1_dump.py` + `n2_cmp.py`, `tm_table.py` +
-`tm_all.sh` + `tm_print.py`, `bl/`), their outputs in
-`<scratch>/wt/bake-speed/out/` and `logs/`.
+note-coarse-01, stale-map-same-scene-01, perf-gpu-device-cpu-bake-02.
+
+The package was built in two sittings. The first forked from 4e655f6 and was
+cut off with its write-up unfinished; the second merged it over claude-cloud
+as it stood at dd9d034 (the viewport, native, flags and map-gpu packages and
+the integration commit on top), re-proved every item on the merged tree,
+measured everything below again and added the device bake. Every number in
+this file was measured on the merged tree against dd9d034 ("before"), same
+machine, back to back -- two frozen copies of the trees, `<scratch>/wt/
+bake-speed2/base/` and `new/`. The probes are in `<scratch>/wt/bake-speed2/
+work/` (`t1_depth.py`, `t3_threads.py`, `t4_pool.py`, `n1_dump.py` +
+`n2_cmp.py` + `n_all.sh`, `tm_table.py` + `tm_all.sh` + `tm_drive.sh` +
+`tm_print.py`, `p1_draft_soft.py`, `p2_vol.py`, `g1_fake.py`, `g2_marks.py`,
+`g3_host_cost.py`, `accept.sh`), the real-Blender scripts in `<scratch>/wt/
+bake-speed2/bl/`, outputs in its `out/`, `logs/` and `bl/out/`.
 
 ## CHANGELOG
 
@@ -92,20 +101,26 @@ this tree against the commit it forked from (4e655f6); the probes are in
   - *bake*: a lamp of `LI.frame_lights` whose shadow a surface may read;
   - *defer*: a lamp that would get a map but that no surface is known to
     read -- a lamp the Light Limit dropped (12 point lamps at the default
-    limit of 8: 72 faces baked, 48 read), and, on a frame without a BVH, a
-    Screen Spotlight ('no shadows, no cone'), an ambient lamp
-    (`is_ambient_lamp`, where the module has it), and a lamp that adds no
-    light (Power 0, a black colour, both Only flags or neither lobe) while
-    nothing reads a shadow apart from its lamp's light.
+    limit of 8: 72 faces baked, 48 read), an Ambient Only lamp
+    (`is_ambient_lamp`: `frame_lights` holds none since the flags
+    package), and, on a frame without a BVH, a Screen Spotlight ('no
+    shadows, no cone') and a lamp that adds no light (Power 0, a black
+    colour, both Only flags or neither lobe) while nothing reads a shadow
+    apart from its lamp's light.
   A deferred lamp is not skipped: it holds a PROMISE (`_Deferred`), and the
   first `visibility` call that reaches for its map bakes it, once, through
   the cache, whichever thread asks. So the rule needs to know who certainly
-  reads, never who might: the volume march lights a container from every
-  lamp of the scene, limit or not, and shadows it through `visibility`
-  (0.17 of frame difference if a dropped lamp's map is simply not there);
-  the ground plane lights itself from a Screen Spotlight as from a spot.
-  Both get exactly the map they always got, on demand, and when those
-  readers learn the Light Limit and the flags nothing here changes.
+  reads, never who might: the volume march and the ground plane light from
+  a Screen Spotlight as from a spot and shadow it through `visibility`;
+  both get exactly the map they always got, on demand. When the first
+  sitting wrote the rule the march still lit a container from EVERY lamp,
+  limit or not, and a dropped lamp's map was baked by its first lookup;
+  the flags package made the march read `frame_lights`, and the same
+  promise is now simply never called (12 lamps under limit 8 beside a
+  volume: 48 faces, was 72). The march also no longer asks a lamp of no
+  radiance for a shadow (`core/volume.march`: it adds zeros whatever the
+  shadow says, and the lookup was what baked the promised map: 6 faces ->
+  0 beside a volume).
   "Nothing reads a shadow apart from the light" is
   `render.shadow_read_apart_from_light`, one clause per reader in
   `light_surface` that takes `vis` without multiplying by the lamp's
@@ -171,13 +186,18 @@ this tree against the commit it forked from (4e655f6); the probes are in
   `_shadow_map_div`: 2 when the draft's pixels are twice the refine's, 4
   at four times or more; a map's side is divided by it (never under 64,
   never over its own size). The Softness is in TEXELS, so the same copy
-  divides it (the verifier's correction: undivided, a quarter-size map
-  blurs sixteen times the refine's world width and a size-0 lamp's shadow
-  erodes away -- the test measures both). The resolved size is in each
-  lamp's key, so draft and refine maps are separate entries and the refine
-  at rest is served its own. `RenderSettings.copy` carries the divisor as
-  it carries `_sample_pass`, so every road inside a draft frame bakes the
-  draft's size. F12 and refines never see it.
+  divides it (the verifier's correction: undivided, the same count of
+  texels on a quarter-size map is a blur four times as wide; penumbra area
+  of a Sun's shadow at Softness 8, refine / draft at 2 / draft at 8: 2105 /
+  2202 / 6376 floor points, the shadow's mass 1635 / 1637). The resolved
+  size is in each lamp's key, so draft and refine maps are separate entries
+  and the refine at rest is served its own. `RenderSettings.copy` carries
+  the divisor as it carries `_sample_pass`, so every road inside a draft
+  frame bakes the draft's size. F12 and refines never see it. On the GPU
+  road the map size is plan structure, so a draft and a refine are two
+  plans; the plan cache (eight entries since map-gpu) keeps both and a drag
+  that alternates them re-plans neither (the test counts 2 misses and 6
+  hits over four ticks).
 
 - **The cache is bounded by bytes** (perf-cache-hoard-07, perf-cache-
   bytes-01, size-map-v03; `_ShadowCache`). One map per lamp pose (and one

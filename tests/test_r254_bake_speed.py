@@ -1427,6 +1427,40 @@ def test_l_the_gpu_device_bakes_its_maps():
         return [_lamp('SUN', pos=(1, 2, 6), name='S'),
                 _lamp('SPOT', pos=(-3, -2, 4), name='T')]
 
+    # which faces the device takes: the ones it bakes faster than the
+    # fill (texels per emitted triangle, and a floor on the map's size)
+    check('the device takes a face of at least 512 x 512 texels and 16 '
+          'texels per clipped triangle: 55k triangles on a 2048 map, not '
+          '885k on a 512 one, not a small map, not 20k on a 512 one',
+          CRA.device_pays(55000, 2048) and not CRA.device_pays(885000, 512)
+          and not CRA.device_pays(100, 256)
+          and not CRA.device_pays(20000, 512)
+          and CRA.device_pays(16384, 512)
+          and CRA.device_pays(885000, 4096))
+    gate = (CRA.DEPTH_DEVICE_TEXELS_PER_TRI, CRA.DEPTH_DEVICE_MIN_TEXELS)
+    st_small = _settings(32, render_device='GPU')
+    sc_small = _scene(lamps(), st_small)
+    LI.clear_shadow_cache()
+    out = io.StringIO()
+    with fakedevice.installed(compute=True) as dev:
+        with contextlib.redirect_stdout(out):
+            np.asarray(R.render(sc_small, st_small))
+        routed = (dev.compute['dispatches'] == []
+                  and len(dev.compute['compiles']) >= 1)
+    small_maps = _maps(sc_small)
+    # every check below runs the kernel on the test's small maps
+    CRA.DEPTH_DEVICE_TEXELS_PER_TRI = CRA.DEPTH_DEVICE_MIN_TEXELS = 0
+    try:
+        _device_bake_checks(lamps, routed, small_maps, out.getvalue())
+    finally:
+        CRA.DEPTH_DEVICE_TEXELS_PER_TRI, CRA.DEPTH_DEVICE_MIN_TEXELS = gate
+
+
+def _device_bake_checks(lamps, routed, small_maps, small_said):
+    from . import fakedevice
+    from ..gpu import craster as CRA
+    from ..gpu import device as DV
+
     def gpu_settings(size=32, **kw):
         kw.setdefault('render_device', 'GPU')
         return _settings(size, **kw)
@@ -1459,6 +1493,12 @@ def test_l_the_gpu_device_bakes_its_maps():
     cpu = _cold(sc_c, st_c)
     cpu_maps = _maps(sc_c)
     cpu_keys = [l._shadow_key for l in sc_c.lights]
+    check('a face the device would not bake faster stays with the fill, '
+          'silently: a 32 x 32 map is compiled for and never dispatched, '
+          'its texels are the fill\'s and nothing is said',
+          routed and _same_maps(small_maps, cpu_maps)
+          and 'shadow bake' not in small_said
+          and 'shadow maps bake' not in small_said)
     st = gpu_settings()
     sc = _scene(lamps(), st)
     LI.clear_shadow_cache()

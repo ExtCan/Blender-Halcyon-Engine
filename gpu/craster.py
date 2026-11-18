@@ -1733,39 +1733,52 @@ def _depth_shader(state):
     return None, why
 
 
-def bake_depth(verts, tris, vp, size, cull='NONE', near_eps=1e-5):
-    """ONE shadow-map face on the device: (plane, None) -- the NDC depth
-    plane core/raster.rasterize_depth returns for these arguments (1.0
-    where nothing landed, blank_depth where nothing landed at all) -- or
-    (None, why): the caller bakes the face on the CPU and names why.
+#: R254: the device bakes a face only where it pays. Both bakes run the
+#: same clipper (core/raster.depth_screen_tris) and both pay about half a
+#: microsecond per emitted triangle after it (the fill's setup, the
+#: kernel's corner pack and tile bins); what the device removes is the
+#: fill's work per TEXEL (40 to 80 ns measured, against a 4-byte read).
+#: So a face goes to the device when it holds at least this many texels
+#: per emitted triangle and is at least DEPTH_DEVICE_MIN_TEXELS large --
+#: below either the CPU fill is as fast or faster (885,000 triangles on a
+#: 512 map: 0.3 texels a triangle) and the face stays with it, in the
+#: bake's threads, silently: that is routing, not a refusal
+DEPTH_DEVICE_TEXELS_PER_TRI = 16
+DEPTH_DEVICE_MIN_TEXELS = 512 * 512
 
-    Pack, upload, dispatch, read back, replay the marked texels. A
-    failure of the driver (a compile, a dispatch, a read) retires that
+
+def device_pays(emitted, size):
+    """Whether a size x size face of `emitted` clipped triangles is one
+    the device bakes faster than the fill (see the constants above)."""
+    texels = int(size) * int(size)
+    return texels >= DEPTH_DEVICE_MIN_TEXELS \
+        and texels >= DEPTH_DEVICE_TEXELS_PER_TRI * int(emitted)
+
+
+def dispatch_depth(front, packed, size, cull='NONE', check=None):
+    """The device half of one face: upload the packed inputs, dispatch
+    the kernel, read the image back, decide the marked texels on the
+    host. `front` is depth_screen_tris' output and `packed`
+    pack_raster_inputs' of it. Returns (plane, None) or (None, why).
+
+    A failure of the driver (a compile, a dispatch, a read) retires that
     image format for the session and the next one is tried; with none
-    left the device bake is off for the session. A face whose marks
-    exceed the referral budget is refused alone. The first face a
-    session bakes is compared with the CPU's bake of it (DEPTH_CHECK_TOL
-    / DEPTH_CHECK_SHARE): a device that does not reproduce it bakes
+    left the device bake is off for the session (`dead`). A face whose
+    marks exceed the referral budget is refused alone. The first face a
+    session bakes in a format is compared with the CPU's bake of it --
+    `check()` returns that plane -- under DEPTH_CHECK_TOL /
+    DEPTH_CHECK_SHARE: a device that does not reproduce it bakes
     nothing."""
     import time as _time
 
     from . import device
-    from ..core import raster as CR
 
     state = _depth_state()
     if state.get('dead'):
         return None, state['dead']
     size = int(size)
-    t0 = _time.perf_counter()
-    emitted = CR.depth_screen_tris(verts, tris, vp, size, size,
-                                   near_eps=near_eps)
-    if emitted is None:
-        return CR.blank_depth(size, size), None
-    sx, sy, iw, z, bw, src = emitted
-    corners, c_side, bins, b_side, tiles, tw, _th = pack_raster_inputs(
-        sx, sy, iw, z, bw, src, None, size, size)
+    corners, c_side, bins, b_side, tiles, tw, _th = packed
     uniforms = depth_uniforms(c_side, b_side, size, cull)
-    t_host = _time.perf_counter() - t0
     raw = None
     t_up = t_run = 0.0
     while raw is None:
@@ -1797,16 +1810,15 @@ def bake_depth(verts, tris, vp, size, cull='NONE', near_eps=1e-5):
             raw = None
     state['fmt'] = fmt
     t0 = _time.perf_counter()
-    plane, why, n_mark = depth_plane(raw, emitted, tiles, bins.reshape(-1),
+    plane, why, n_mark = depth_plane(raw, front, tiles, bins.reshape(-1),
                                      tw, size, cull)
     if plane is None:
         return None, why
-    t_host += _time.perf_counter() - t0
-    if state.get('checked') != fmt:
+    t_host = _time.perf_counter() - t0
+    if state.get('checked') != fmt and check is not None:
         # trust nothing a driver has not shown: this face, once more on
         # the CPU. A device that reproduces it is believed from here on
-        ref = CR.rasterize_depth(verts, tris, vp, size, size, cull=cull,
-                                 near_eps=near_eps)
+        ref = check()
         with np.errstate(invalid='ignore'):
             far = ~(np.abs(np.asarray(ref, np.float32)
                            - np.asarray(plane, np.float32))
@@ -1828,31 +1840,99 @@ def bake_depth(verts, tris, vp, size, cull='NONE', near_eps=1e-5):
     return plane, None
 
 
+def bake_depth(verts, tris, vp, size, cull='NONE', near_eps=1e-5):
+    """ONE shadow-map face on the device, whatever its size: (plane,
+    None) -- the NDC depth plane core/raster.rasterize_depth returns for
+    these arguments (1.0 where nothing landed, blank_depth where nothing
+    landed at all) -- or (None, why). The frame's bakes go through a
+    DepthBaker, which routes each face and threads the host half; this
+    is the same road in one call, for a tool or a test."""
+    from ..core import raster as CR
+    size = int(size)
+    front = CR.depth_screen_tris(verts, tris, vp, size, size,
+                                 near_eps=near_eps)
+    if front is None:
+        return CR.blank_depth(size, size), None
+    packed = pack_raster_inputs(*front, None, size, size)
+    return dispatch_depth(
+        front, packed, size, cull,
+        check=lambda: CR.rasterize_depth(verts, tris, vp, size, size,
+                                         cull=cull, near_eps=near_eps,
+                                         front=front))
+
+
+class _DepthTicket:
+    """One face between the two halves of its device bake: the host half
+    is done (the clipper's triangles, their pack), the device half is
+    `finish()` -- called in line by the bake, one face at a time."""
+
+    __slots__ = ('baker', 'args', 'front', 'packed', 'host_ms')
+
+    def finish(self):
+        return self.baker._finish(self)
+
+
 class DepthBaker:
     """What core/lights takes as a frame's depth baker (`build_shadow_maps
-    (baker=...)`): called with a face's (verts, tris, vp, size, cull), it
-    answers the face's depth plane or None -- then the CPU bakes that
-    face, and `report` names why once the frame's maps are built.
-    `identity` keys the maps it bakes apart from the CPU's in the shadow
-    cache: on a driver the two agree to the last ulp of z, not bit for
-    bit."""
+    (baker=...)`). Called with a face's (verts, tris, vp, size, cull) --
+    from the bake's threads -- it does the HOST half and answers either
+    the face's depth plane (nothing landed; or the face is one the CPU
+    fill bakes as fast, `device_pays`, and was filled right here from the
+    clipper's output) or a ticket whose `finish()` -- called in line: a
+    device is one queue -- dispatches the kernel and answers the plane.
+    A face the device then refuses is filled from the same clipper output
+    and `report` names why once the frame's maps are built.
+
+    `identity` keys the maps of a frame that has a baker apart from the
+    fill's in the shadow cache: on a driver the two agree to the last ulp
+    of z, not bit for bit."""
 
     identity = 'device'
 
     def __init__(self):
         self.refused = {}
-        self.faces = 0
+        self.host_ms = 0.0
         LAST_DEPTH.clear()
 
     def __call__(self, verts, tris, vp, size, cull='NONE'):
+        import time as _time
+
+        from ..core import raster as CR
+        size = int(size)
+        t0 = _time.perf_counter()
+        front = CR.depth_screen_tris(verts, tris, vp, size, size)
+        if front is None:
+            return CR.blank_depth(size, size)
+        if _depth_state().get('dead') \
+                or not device_pays(front[0].shape[0], size):
+            return CR.rasterize_depth(verts, tris, vp, size, size,
+                                      cull=cull, front=front)
+        ticket = _DepthTicket()
+        ticket.baker = self
+        ticket.args = (verts, tris, vp, size, cull)
+        ticket.front = front
+        ticket.packed = pack_raster_inputs(*front, None, size, size)
+        ticket.host_ms = (_time.perf_counter() - t0) * 1e3
+        return ticket
+
+    def _fill(self, ticket):
+        from ..core import raster as CR
+        verts, tris, vp, size, cull = ticket.args
+        return CR.rasterize_depth(verts, tris, vp, size, size, cull=cull,
+                                  front=ticket.front)
+
+    def _finish(self, ticket):
+        size, cull = ticket.args[3], ticket.args[4]
         try:
-            plane, why = bake_depth(verts, tris, vp, size, cull=cull)
+            plane, why = dispatch_depth(ticket.front, ticket.packed, size,
+                                        cull,
+                                        check=lambda: self._fill(ticket))
         except Exception as exc:                                # noqa: BLE001
             plane, why = None, f'{type(exc).__name__}: {exc}'
         if plane is None:
             self.refused[str(why)] = self.refused.get(str(why), 0) + 1
-            return None
-        self.faces += 1
+            return self._fill(ticket)
+        self.host_ms += ticket.host_ms
         return plane
 
     def report(self):
@@ -1865,8 +1945,9 @@ class DepthBaker:
                   + (f' ({n} faces)' if n > 1 else ''))
         ld = LAST_DEPTH
         if ld.get('faces'):
+            host = self.host_ms + ld.get('host_ms', 0.0)
             print(f"[Halcyon GPU] shadow bake: {ld['faces']} map face(s) on "
-                  f"the device; host {ld.get('host_ms', 0.0):.0f} ms, "
+                  f"the device; host {host:.0f} ms, "
                   f"upload {ld.get('upload_ms', 0.0):.0f} ms, dispatch "
                   f"{ld.get('dispatch_ms', 0.0):.0f} ms, read "
                   f"{ld.get('read_ms', 0.0):.0f} ms"

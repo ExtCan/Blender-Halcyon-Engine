@@ -2108,11 +2108,16 @@ def depth_screen_tris(verts, tris, mvp, width, height, near_eps=1e-5):
 
 
 def rasterize_depth(verts, tris, mvp, width, height, cull='NONE',
-                    near_eps=1e-5, second=False):
+                    near_eps=1e-5, second=False, front=None):
     """The depth plane `rasterize(verts, tris, mvp, width, height,
     cull=cull, depth_bits=32).zndc` holds -- 1.0 where nothing landed --
     without the G-buffer. A target no fragment landed on comes back as
     `blank_depth` (the same ones, unallocated).
+
+    `front` is `depth_screen_tris`' output for these very arguments, when
+    the caller already has it (a device baker that ran the clipper and
+    then left the face to this fill): it is used instead of running the
+    clipper again.
 
     `second` adds the MIDPOINT map's second surface and returns
     (z1, z2, has2): per texel the nearest fragment BEYOND the A-buffer
@@ -2126,8 +2131,8 @@ def rasterize_depth(verts, tris, mvp, width, height, cull='NONE',
             return z1
         return z1, z1, np.broadcast_to(np.bool_(False), (height, width))
 
-    emitted = depth_screen_tris(verts, tris, mvp, width, height,
-                                near_eps=near_eps)
+    emitted = front if front is not None else depth_screen_tris(
+        verts, tris, mvp, width, height, near_eps=near_eps)
     if emitted is None:
         return _blank()
     sx, sy, z = emitted[0], emitted[1], emitted[3]

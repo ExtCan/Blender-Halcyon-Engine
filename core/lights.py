@@ -324,10 +324,13 @@ def _render_depth(verts, tris, vp, size, cull='NONE', midpoint=False,
     cannot reach returns blank without reading a vertex.
 
     `baker`, when the frame has one (the GPU device's: gpu/craster.
-    DepthBaker), is asked first for a CLASSIC plane -- baker(verts, tris,
-    vp, size, cull) -- and answers it or None; None is a refusal the
-    baker names itself, and the fill below bakes the face. A MIDPOINT
-    map's second surface is the fill's alone.
+    DepthBaker), bakes every CLASSIC plane: baker(verts, tris, vp, size,
+    cull) answers the plane, or a TICKET -- an object whose `finish()`
+    answers it -- when the baker's second half must run in line (a
+    device is one queue; `_run_depth_jobs` finishes the tickets one at a
+    time after the threads have done every host half). A baker always
+    answers: what it cannot bake it fills itself, and names why. A
+    MIDPOINT map's second surface is the fill's alone.
 
     R254: depth only (core/raster.rasterize_depth: the same clipper,
     coverage and z as the beauty rasteriser, bitwise its zndc, none of
@@ -353,9 +356,7 @@ def _render_depth(verts, tris, vp, size, cull='NONE', midpoint=False,
         return raster.rasterize_depth(verts, tris[:0], vp, size, size,
                                       cull=cull, second=midpoint)
     if baker is not None and not midpoint and tris.shape[0]:
-        plane = baker(verts, tris, vp, size, cull)
-        if plane is not None:
-            return plane
+        return baker(verts, tris, vp, size, cull)
     return raster.rasterize_depth(verts, tris, vp, size, size, cull=cull,
                                   second=midpoint)
 
@@ -1062,10 +1063,6 @@ def _run_depth_jobs(frame, jobs):
         return _render_depth(verts, j[0], j[1], j[2], midpoint=j[3],
                              bounds=j[4], baker=baker)
 
-    if baker is not None:
-        # a device is ONE queue: its dispatches cross to the main thread
-        # one at a time (gpu/device._main), so the faces go in line
-        return [one(j) for j in jobs]
     work = sum(int(j[2]) * int(j[2]) for j in jobs)
     tris = max(int(j[0].shape[0]) for j in jobs)
     if len(jobs) > 1 and (tris >= 50000 or work >= 2_000_000):
@@ -1073,8 +1070,15 @@ def _run_depth_jobs(frame, jobs):
         import os as _os
         workers = min(len(jobs), max((_os.cpu_count() or 2) - 1, 2))
         with _fut.ThreadPoolExecutor(max_workers=workers) as pool:
-            return list(pool.map(one, jobs))
-    return [one(j) for j in jobs]
+            out = list(pool.map(one, jobs))
+    else:
+        out = [one(j) for j in jobs]
+    if baker is not None:
+        # the device halves, in line: a device is ONE queue and its
+        # dispatches cross to the main thread one at a time
+        # (gpu/device._main). The host halves ran above, in the threads
+        out = [z.finish() if hasattr(z, 'finish') else z for z in out]
+    return out
 
 
 def _tri_bounds(verts, rng, objects):
