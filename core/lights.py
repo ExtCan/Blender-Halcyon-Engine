@@ -69,9 +69,11 @@ class ShadowMap:
 
     # `digest` is filled lazily by gpu/shade.map_digest (an exact content
     # digest of `depth`, the GPU atlas's identity); a map whose depth is
-    # rewritten in place must reset it to None
+    # rewritten in place must reset it to None. `pyr` is the sized
+    # lookup's reach pyramid, filled lazily by core/softmap.map_pyramid
+    # from `depth` and reset with it the same way
     __slots__ = ('vp', 'depth', 'near', 'far', 'persp', 'size', 'origin',
-                 'extent', 'axes', 'd_min', 'digest')
+                 'extent', 'axes', 'd_min', 'digest', 'pyr')
 
     def __init__(self, vp, zndc, near, far, persp, size, origin, extent=1.0):
         self.vp = vp
@@ -180,7 +182,9 @@ def _pcf_offsets(n):
 class CubeShadow:
     """Six ShadowMaps for an omnidirectional light."""
 
-    __slots__ = ('faces', 'origin', 'd_min')
+    # `pyr`: the six faces' reach pyramids (core/softmap.map_pyramid,
+    # lazily; reset to None with any face's depth)
+    __slots__ = ('faces', 'origin', 'd_min', 'pyr')
 
     def __init__(self, faces, origin):
         self.faces = faces

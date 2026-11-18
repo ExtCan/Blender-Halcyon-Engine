@@ -10,23 +10,31 @@ order so a tap lands on the same texel on either device.
 What a fragment pays (F filter taps, B + 1 search taps; 16 and 13 at the
 default Samples 4), in texel fetches of the depth pack:
 
-    lit or umbra by the search          (B + 1)                   = 13
-    decided by the probe                2 (B + 1)                 = 26
-    penumbra, one lattice               2 (B + 1) + 4 F           = 90
-    penumbra, two lattices cross-faded  2 (B + 1) + 8 F           = 154
+    lit: nothing nearer within reach    k   (the reach pyramid: 1 to
+                                            SEARCH_STEPS, 2 to 3 mostly)
+    lit or umbra by the search          k + (B + 1)               = 16
+    decided by the probe                k + 2 (B + 1)             = 29
+    penumbra, one lattice               k + 2 (B + 1) + 4 F       = 93
+    penumbra, two lattices cross-faded  k + 2 (B + 1) + 8 F       = 157
+    (the sums at k = 3)
 
-The three stages are real branches, so only penumbra fragments run the
-filter; the simulator evaluates both sides of a branch and selects, which
-gives the same value. A lamp of size 0 under the user's Softness comes
-here too (`softmap.zero_shape`): its footprint has no lamp term, the probe
-would read the search's own taps, and is skipped (amax > 0).
+The stages are real branches, so only penumbra fragments run the filter
+and a fragment the pyramid shows no nearer depth within reach of runs no
+search at all; the simulator evaluates both sides of a branch and
+selects, which gives the same value. The pyramid is rows of the depth
+pack under the lamp's own cells (`softmap.pyr_layout`; gpu/shade's
+`_shadow_meta` builds them, `_shadow_pack` stacks them). A lamp of size
+0 under the user's Softness comes here too (`softmap.zero_shape`): its
+footprint has no lamp term, the probe would read the search's own taps,
+and is skipped (amax > 0).
 
 WHAT IS A LITERAL AND WHAT IS A TEXEL. With `mb` -- the lamp's first tail
 texel in hal_lights (`material.light_tail_layout`, `material.map_texels`)
 -- every VALUE is fetched: the light-space rows, the origin, the clip
 planes, Bias, Softness, Density, the lamp's size (k R, k tan, an Area's
-half-axes per face), the map's axes, the radius cap and the map's nearest
-depth. A moved lamp, a dragged size or Softness and a moved caster then
+half-axes per face), the map's axes and the radius cap; the nearest
+depths that bound the search are texels of the pack itself (the reach
+pyramid). A moved lamp, a dragged size or Softness and a moved caster then
 re-upload texels and leave this text alone. What stays in the text is
 structure: the map's size and atlas cells, the projection, the face count,
 the tap count and the unit tap pattern. Without `mb` the same float32
@@ -50,8 +58,8 @@ def _vec3(v):
 
 def shadow_function(i, meta, mb=None):
     """`hal_shadow_vis{i}(P, N, L)` for a mapped lamp that takes the
-    per-receiver lookup (the meta carries 'soft': its shape, the map's
-    axes and its nearest depth). `mb` is the lamp's tail block in
+    per-receiver lookup (the meta carries 'soft': its shape and the
+    map's axes). `mb` is the lamp's tail block in
     hal_lights, or None to print the values as literals."""
     from .material import MAP_FACE, MAP_HEAD, _f, _v3, _v4
 
@@ -79,6 +87,10 @@ def shadow_function(i, meta, mb=None):
     sz, sz1 = _lit(size), _lit(size - 1)
     fetch = 'texelFetch(hal_shadowpack, ivec2(int({}), int({})), 0).r'
     tx = mb is not None
+    # the reach pyramid: one block per face, side by side under the
+    # lamp's depth cells
+    lay = SM.pyr_layout(size)
+    pyr_y = voff + size * int(meta['grid'][1])
 
     def fb(fi):
         return mb + MAP_HEAD + fi * MAP_FACE
@@ -95,7 +107,6 @@ def shadow_function(i, meta, mb=None):
         x_sv, x_dens = 'hal_m2.z', 'hal_m2.w'
         K, x_kr, x_cap = 'hal_m3.y', 'hal_m3.z', 'hal_m3.w'
         x_extl = 'hal_m1.y'
-        x_dmin = f'hal_ltex({mb + 4}).x'
 
         def x_row(fi, r):
             return f'hal_ltex({fb(fi) + r})'
@@ -122,7 +133,6 @@ def shadow_function(i, meta, mb=None):
             x_kr = '0.0'
         x_cap = _lit(SM.cap_texels(size, ext, persp))
         x_extl = _lit(ext)
-        x_dmin = _lit(np.float32(float(sp['d_min'])))
 
         def x_row(fi, r):
             return _v4(np.asarray(faces[fi]['vp'], np.float32)[r])
@@ -206,6 +216,35 @@ def shadow_function(i, meta, mb=None):
                     '    float occ = '
                     + fetch.format('cellx + xi', 'celly + yi') + ';']
 
+    # the nearest depth within r texels of (u, v): one cell of the reach
+    # pyramid, at the level whose tile is the first at least r wide
+    # (`softmap._reach_min`; a tile's width is a power of two, so the
+    # division is exact on both roads)
+    t0, n0, ox0, oy0 = lay['levels'][0]
+    L += [f'float hal_sm_near{i}(float u, float v, float r, float pbx'
+          + (', float dlow)' if cube else ')'),
+          '{',
+          f'    float T = {_f(float(t0))}; float ox = {_f(float(ox0))}; '
+          f'float oy = {_f(float(oy0))}; float n1 = {_f(float(n0 - 1))};']
+    for (tp_, _np, _ox, _oy), (t1, n1_, ox1, oy1) in zip(
+            lay['levels'], lay['levels'][1:]):
+        L.append(f'    if (r > {_f(float(tp_))}) {{ T = {_f(float(t1))}; '
+                 f'ox = {_f(float(ox1))}; oy = {_f(float(oy1))}; '
+                 f'n1 = {_f(float(n1_ - 1))}; }}')
+    L += ['    float x = clamp(floor((u + 1.0) / T), 0.0, n1);',
+          '    float y = clamp(floor((v + 1.0) / T), 0.0, n1);',
+          '    float q = ' + fetch.format('pbx + ox + x',
+                                          f'{_f(float(pyr_y))} + oy + y')
+          + ';']
+    if cube:
+        # the whole cube's nearest depth bounds a tap too, divided by
+        # no more than the tap's distance from the face's centre in
+        # half-faces (`softmap._face`)
+        half = _lit(np.float32(size * 0.5))
+        L += [f'    float fo = max(abs(u - {half}) + r, '
+              f'abs(v - {half}) + r) / {half};',
+              '    q = max(q, dlow / max(fo, 1.0));']
+    L += ['    return q;', '}']
     # one search / probe tap: (blocked, blocked * depth)
     L += [f'vec2 hal_sm_blk{i}(float ox, float oy, {ctx})', '{'] + \
         texel('floor(u + ox)', 'floor(v + oy)') + \
@@ -348,7 +387,8 @@ def shadow_function(i, meta, mb=None):
               '    else { face = dvec.z >= 0.0 ? 4 : 5; }',
               '    float clipx = 0.0; float clipy = 0.0;',
               '    float clipz = 0.0; float clipw = 1.0;',
-              '    float cellx = 0.0; float celly = 0.0;']
+              '    float cellx = 0.0; float celly = 0.0;',
+              '    float pbx = 0.0;']
         for fi, fc in enumerate(faces):
             L += [f'    if (face == {fi}) {{',
                   f'        clipx = dot(ph, {x_row(fi, 0)});',
@@ -356,14 +396,16 @@ def shadow_function(i, meta, mb=None):
                   f'        clipz = dot(ph, {x_row(fi, 2)});',
                   f'        clipw = dot(ph, {x_row(fi, 3)});',
                   f'        cellx = {_f((fi % grid_w) * size)};',
-                  f'        celly = {_f((fi // grid_w) * size + voff)};'] + \
+                  f'        celly = {_f((fi // grid_w) * size + voff)};',
+                  f'        pbx = {_f(float(fi * lay["w"]))};'] + \
                  ['        ' + s for s in face_consts(fi)] + ['    }']
     else:
         L += [f'    float clipx = dot(ph, {x_row(0, 0)});',
               f'    float clipy = dot(ph, {x_row(0, 1)});',
               f'    float clipz = dot(ph, {x_row(0, 2)});',
               f'    float clipw = dot(ph, {x_row(0, 3)});',
-              f'    float cellx = 0.0; float celly = {_f(voff)};'] + \
+              f'    float cellx = 0.0; float celly = {_f(voff)};',
+              '    float pbx = 0.0;'] + \
              ['    ' + s for s in face_consts(0)]
     eps = 1e-6
     L += [f'    float w = abs(clipw) < {_f(eps)} ? {_f(eps)} : clipw;',
@@ -386,9 +428,7 @@ def shadow_function(i, meta, mb=None):
           '    if (inside) {',
           f'    float nd = max(ndl, {_lit(SM.NDL_MIN)});',
           '    float ns = N.x * sax.x + N.y * sax.y + N.z * sax.z;',
-          '    float nu = N.x * uax.x + N.y * uax.y + N.z * uax.z;',
-          # the map's nearest depth: a value of the lamp's tail block
-          f'    float dmin = {x_dmin};']
+          '    float nu = N.x * uax.x + N.y * uax.y + N.z * uax.z;']
     if persp:
         L += [f'    vec3 rel = ph.xyz - {x_origin};',
               '    float deu = sqrt(rel.x * rel.x + rel.y * rel.y + '
@@ -410,21 +450,52 @@ def shadow_function(i, meta, mb=None):
                   f'    float Ay = {x_kr} * (x * y / s1);',
                   '    float Bx = Ay;',
                   f'    float By = {x_kr} * (1.0 + y * y / s1);']
-        L.append('    float tmin = max(1.0 / max(dmin, 1e-9) - dr, 0.0);')
     else:
         L += [f'    float gu = ns / (nd * {K});',
               f'    float gv = nu / (nd * {K});',
               '    float dr = sdist;',
               f'    float Ax = {x_kr}; float Ay = 0.0;',
-              f'    float Bx = 0.0; float By = {x_kr};',
-              '    float tmin = max(dr - dmin, 0.0);']
+              f'    float Bx = 0.0; float By = {x_kr};']
     L += ['    float amax = max(sqrt(Ax * Ax + Ay * Ay), '
           'sqrt(Bx * Bx + By * By));',
-          f'    float ts = min(tmin, {x_cap} / max(amax, 1e-12));']
+          f'    float capt = {x_cap} / max(amax, 1e-12);']
+    # the search's reach, tightened against the pyramid: from the cap,
+    # up to SEARCH_STEPS times, the nearest depth within the current
+    # reach and the reach that depth leaves (`softmap._face`, step 4a).
+    # A step that does not move the bound ends them (the next would ask
+    # the same cell), and so does a fragment with nothing nearer than
+    # its own depth less the bias within reach: it is lit and runs no
+    # search. A footprint with no lamp term asks one reach, the pad's
+    if tx:
+        L.append(f'    float padp = hal_ltex({mb + 3}).x + 1.0;')
+    else:
+        L.append(f'    float padp = {_lit(np.float32(np.float32(soft + SM.SEARCH_PAD) + np.float32(1.0)))};')
+    t_of = ('min(max(1.0 / max(near, 1e-9) - dr, 0.0), capt)' if persp
+            else 'min(max(dr - near, 0.0), capt)')
+    near_x = ', dlow' if cube else ''
+    if cube:
+        dm = f'hal_ltex({mb + 4}).x' if tx else \
+            _lit(np.float32(float(sp['d_min'])))
+        L.append(f'    float dlow = {dm} * {_lit(SM._SEAM_SLACK)};')
+    L += [f'    float r0 = (amax > 0.0 ? {x_cap} * {grow} : 0.0) + padp;',
+          f'    float near = hal_sm_near{i}(u, v, r0, pbx{near_x});',
+          f'    float ts = {t_of};',
+          ('    float lim = 1.0 / dr - sl;' if persp
+           else '    float lim = dr - sl;'),
+          '    float more = amax > 0.0 ? 1.0 : 0.0;']
+    for _step in range(1, SM.SEARCH_STEPS):
+        L += ['    if (near < lim && more > 0.5) {',
+              f'    float q = hal_sm_near{i}(u, v, '
+              f'ts * {grow} * amax + padp, pbx{near_x});',
+              '    more = q > near ? 1.0 : 0.0;',
+              '    near = max(near, q);',
+              f'    ts = {t_of};',
+              '    }']
 
     # the blocker search; then, only where it is undecided, the probe;
     # then, only where THAT is undecided, the filter
-    L += [f'    vec2 fs = hal_sm_find{i}(ts, Ax, Ay, Bx, By, {cta});',
+    L += ['    if (near < lim) {',
+          f'    vec2 fs = hal_sm_find{i}(ts, Ax, Ay, Bx, By, {cta});',
           '    float nb = fs.x; float dsum = fs.y;',
           f'    if (nb >= {nt}) {{ lit = 0.0; }}',
           '    else if (nb > 0.0) {',
@@ -470,6 +541,7 @@ def shadow_function(i, meta, mb=None):
           f'{cta});',
           f'    lit = lit * (1.0 - wb) + (acc1 / {fn}) * wb;',
           '    }',
+         '    }',
          '    }',
          '    }',
          '    }',

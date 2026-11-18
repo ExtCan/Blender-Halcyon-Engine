@@ -740,16 +740,26 @@ def test_g_the_pack_is_one_channel():
     key, build, stamp = atlases['hal_shadowpack']
     px = build()
     sm = lt.shadow_map
+    # R254 soft-search: a lamp on the per-receiver lookup (this one has a
+    # Radius) carries its reach pyramid under its cells -- rows derived
+    # from the same depth texels, announced by the key's PYR. The pins
+    # were `px.shape == (2 * 128, 3 * 128)` and a key without PYR
+    from ..core import softmap as _SMP
+    lay = _SMP.pyr_layout(128)
     check('the pack builds as ONE channel of float32: the six faces in '
-          'their cells and nothing else',
+          "their cells and, under them, the lamp's reach pyramid",
           px.ndim == 2 and px.dtype == np.float32
-          and px.shape == (2 * 128, 3 * 128)
+          and px.shape == (2 * 128 + lay['h'], 3 * 128)
           and all(np.array_equal(
               px[(fi // 3) * 128:(fi // 3 + 1) * 128,
                  (fi % 3) * 128:(fi % 3 + 1) * 128], f.depth)
-              for fi, f in enumerate(sm.faces)), str(px.shape))
+              for fi, f in enumerate(sm.faces))
+          and all(np.array_equal(
+              px[256:, fi * lay['w']:(fi + 1) * lay['w']], blk)
+              for fi, blk in enumerate(_SMP.map_pyramid(sm)))
+          and not px[256:, 6 * lay['w']:].any(), str(px.shape))
     check('its key is the layout and its stamp the content',
-          key == ('shadowpack', ('shadow', 128, (3, 2), 'CLS'))
+          key == ('shadowpack', ('shadow', 128, (3, 2), 'CLS', 'PYR'))
           and stamp == (tuple(GSH.map_digest(f) for f in sm.faces),))
     tex = GSH.sim_texture(px)
     from ..shaders import builtins as BI

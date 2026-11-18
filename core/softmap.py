@@ -51,14 +51,33 @@ F filter taps, B search taps)
             disc pattern stands for the rectangle at equal area)
         SUN, angle: A = (k tan(angle/2), 0),  Bv = (0, k tan(angle/2))
      amax = max(|A|, |Bv|).
-  4. BLOCKER SEARCH at t_s = min(max(t(d_min), 0), cap / amax). d_min
-     is the smallest depth the lamp's map holds (no caster is nearer);
-     cap bounds the penumbra RADIUS: a tangent of 1/8 at the lamp under
-     a perspective map (size/16 texels of a cube face, the same angle
-     for a Spot's cone of any width, a quarter of the map at most),
-     size/16 under an ortho map -- a fraction of the map, never a texel
-     count, so the same lamp is equally soft on a 512 and a 2048 map
+  4. BLOCKER SEARCH at t_s = min(max(t(d_near), 0), cap / amax). d_near
+     is the smallest depth the map holds WITHIN THE SEARCH'S OWN REACH
+     of this receiver (no caster the search could find is nearer); cap
+     bounds the penumbra RADIUS: a tangent of 1/8 at the lamp under a
+     perspective map (size/16 texels of a cube face, the same angle for
+     a Spot's cone of any width, a quarter of the map at most), size/16
+     under an ortho map -- a fraction of the map, never a texel count,
+     so the same lamp is equally soft on a 512 and a 2048 map
      (`cap_texels`).
+     d_near comes from the map's REACH PYRAMID (`map_pyramid`): per
+     level a grid of tiles 4, 8, 16 .. texels wide, each holding the
+     smallest depth over the 3 x 3 tiles around it, so ONE texel answers
+     "the nearest depth within r texels of (u, v)" for any r up to the
+     tile's width. Starting from the cap (the widest reach there is),
+     SEARCH_STEPS times: r = t_s (1 + 4/F) amax + S + 3, d_near =
+     max(d_near, the pyramid at r), t_s again. Every step is
+     conservative -- no caster inside the current reach is nearer than
+     its minimum, so none of them matters beyond the next, smaller
+     reach -- and it ends at the reach of the casters that stand near
+     this receiver. The nearest depth of the whole map used to bound
+     the search for every receiver: under a tilted Sun that is the near
+     corner of the ground, tens of units nearer than any caster, the
+     search taps stood units apart and stepped over the casters, so the
+     same lamp and objects cast a different shadow on a larger ground.
+     A receiver the pyramid shows NO depth nearer than d_r - sl within
+     reach is lit, exactly (no tap could be a blocker: the plane's
+     depth is never deeper than d_r), and skips the search.
      Taps: the centre, the convex hull of the filter pattern and interior
      taps of it. Tap (a, b) reads the texel at
         floor((u, v) + t_s (1 + 4/F) (a A + b Bv) + (S + 2) (a, b)).
@@ -113,6 +132,22 @@ NDL_MIN = 0.1
 #: plus SEARCH_PAD texels (the bilinear footprint)
 SEARCH_GROW = 4.0
 SEARCH_PAD = 2.0
+#: THE REACH PYRAMID. Its finest tile is 2 ** PYR_BASE texels wide: the
+#: smallest reach ever asked is the search pad plus one texel (3 at
+#: Softness 0), so finer levels would never be read, and starting at 4
+#: keeps the whole pyramid at a twelfth of the map's texels
+PYR_BASE = 2
+#: how many times, at most, the search's reach is tightened against the
+#: pyramid. One query costs one texel, and a query that does not move
+#: the bound ends them (the next would ask the same cell). Each step
+#: shrinks the reach by the factor the receiver's own slope leaves: on
+#: open ground a Sun of 0.2 rad 40 degrees off the vertical comes from
+#: the cap's 164 texels (a 2048 map) to 53, 13, 6 and its fixed point
+#: of 5; near a caster it stops at that caster's reach in two or three
+SEARCH_STEPS = 6
+#: a receiver with nothing nearer than itself within reach skips the
+#: search (CPU road only; the tests turn it off to prove it moves no bit)
+SEARCH_SKIP = True
 #: the lattice strides above 1 (a comparison ladder on both roads)
 STRIDES = (2.0, 4.0, 8.0, 16.0, 32.0, 64.0)
 #: the lattice stride follows LATTICE * r / F: three times the mean
@@ -365,6 +400,306 @@ def map_d_min(sm):
     return float(sm.depth.min())
 
 
+def pyr_layout(size):
+    """Where one face's reach pyramid keeps its levels, for a map face
+    of `size` texels: {'levels': [(T, n, ox, oy)], 'w', 'h'} -- level j
+    is an n x n grid of tiles T = 4 * 2 ** j texels wide whose first
+    cell sits at (ox, oy) of a w x h block. The finest level fills the
+    left of the block and the coarser ones stack in a column beside it
+    (a mip chain's layout); the last level is one tile. Pure structure:
+    both roads and the GPU pack read it.
+
+    Tile x of a level covers the texels x T - 1 .. (x + 1) T - 2: the
+    grid stands ONE TEXEL off the map's own, so the middle of a map and
+    its halves and quarters -- where a lamp aimed at a centred scene
+    puts whole lines of receivers -- are not tile borders, and the last
+    bit of such a receiver's coordinate cannot choose its tile."""
+    key = ('p', int(size))
+    if key not in _TABLES:
+        n = -(-(int(size) + 1) // (1 << PYR_BASE))
+        t = 1 << PYR_BASE
+        levels = [(t, n, 0, 0)]
+        n0, y = n, 0
+        while n > 1:
+            n = -(-n // 2)
+            t *= 2
+            levels.append((t, n, n0, y))
+            y += n
+        _TABLES[key] = {
+            'levels': levels,
+            'w': n0 + (levels[1][1] if len(levels) > 1 else 0),
+            'h': max(n0, y),
+            # the per-level columns the CPU gathers through
+            'n1': np.array([lv[1] - 1 for lv in levels], np.float32),
+            'ox': np.array([lv[2] for lv in levels], np.int32),
+            'oy': np.array([lv[3] for lv in levels], np.int32),
+        }
+    return _TABLES[key]
+
+
+def _pool_first(d):
+    """The minima of the finest tiles of one face, (n, n): tile x covers
+    the texels 4x - 1 .. 4x + 2 (`pyr_layout`), so each of the four
+    texel columns of a tile is one strided slice of the map."""
+    f = 1 << PYR_BASE
+    a = np.asarray(d, np.float32)
+    # whole rows first (contiguous), then the columns of what is left
+    rows = np.full((-(-(a.shape[0] + 1) // f), a.shape[1]), np.inf,
+                   np.float32)
+    for k in range(f):
+        # texel f x - 1 + k of tile x
+        src = a[f - 1::f] if k == 0 else a[k - 1::f]
+        dst = rows[1:1 + src.shape[0]] if k == 0 else rows[:src.shape[0]]
+        np.minimum(dst, src, out=dst)
+    out = np.full((rows.shape[0], -(-(a.shape[1] + 1) // f)), np.inf,
+                  np.float32)
+    for k in range(f):
+        src = rows[:, f - 1::f] if k == 0 else rows[:, k - 1::f]
+        dst = out[:, 1:1 + src.shape[1]] if k == 0 \
+            else out[:, :src.shape[1]]
+        np.minimum(dst, src, out=dst)
+    return out
+
+
+def _pool_next(a):
+    """2 x 2 minimum pooling of a stack of grids (.., n, n); an odd edge
+    pools what tiles it has."""
+    n = a.shape[-1]
+    h = -(-n // 2)
+    out = np.full(a.shape[:-2] + (h, h), np.inf, a.dtype)
+    for dy in range(2):
+        for dx in range(2):
+            src = a[..., dy::2, dx::2]
+            dst = out[..., :src.shape[-2], :src.shape[-1]]
+            np.minimum(dst, src, out=dst)
+    return out
+
+
+def _dilate3(e):
+    """The minimum over each 3 x 3 neighbourhood of a stack of
+    (n + 2, n + 2) grids whose rim is the tiles beyond the face:
+    (.., n, n)."""
+    n = e.shape[-1] - 2
+    out = e[..., 1:n + 1, 1:n + 1].copy()
+    for dy in range(3):
+        for dx in range(3):
+            if dy != 1 or dx != 1:
+                np.minimum(out, e[..., dy:dy + n, dx:dx + n], out=out)
+    return out
+
+
+#: a depth read ACROSS a cube seam is a float32 quotient of products
+#: (`_CubeFetch`): the bound stored for it sits this far below the exact
+#: value, so no rounding of the lookup's own arithmetic undercuts it
+_SEAM_SLACK = 1.0 - 4e-6
+#: the softest user Softness (texels) whose reach a cube's seam ring
+#: still covers; past it a reach that crosses a seam is bounded by the
+#: nearest depth of the whole cube alone (`seam_ring`)
+_SEAM_SOFT = 8.0
+
+
+def seam_ring(size):
+    """How many of the finest tiles a cube face's pyramid is continued
+    past each edge: the first power of two of tiles that covers the
+    widest reach a search asks (the cap's, at four taps per sample, with
+    a Softness up to _SEAM_SOFT)."""
+    reach = float(cap_texels(size, 1.0, True)) * (1.0 + SEARCH_GROW / 16.0) \
+        + _SEAM_SOFT + SEARCH_PAD + 1.0
+    w = 1
+    while w * (1 << PYR_BASE) < reach:
+        w *= 2
+    return w
+
+
+def _seam_grids(axes, plain, size, ring):
+    """The finest level of a cube's six faces, each continued past its
+    edges -- `ring` tiles before the first, 2 `ring` after the last (a
+    coarser level's last tile can start a whole tile past the edge):
+    (6, n + 3 ring, n + 3 ring), every tile beyond a face holding a
+    lower bound of each depth a tap landing in it can read.
+
+    A tap past the edge of a cube face reads the neighbouring face along
+    the same direction from the lamp and divides the stored depth by
+    that direction's component along the neighbour's axis
+    (`_CubeFetch`). For a tile past the edge towards a neighbour G, the
+    part beyond the edge is a rectangle of directions; its image on G
+    is a convex quad, so the tiles of G under the image's bounding box
+    hold every texel a tap can land on, and the largest divisor over
+    the rectangle is at one of its corners. An edge tile the grid's own
+    offset (or a ragged size) leaves partly outside the face takes the
+    same bound for that part. All six faces at once: `axes` is
+    (6, 3, 3), the faces' right / up / depth rows, `plain` (6, n, n)."""
+    t = float(1 << PYR_BASE)
+    n = plain.shape[-1]
+    e = np.full((6, n + 3 * ring, n + 3 * ring), np.inf, np.float32)
+    e[:, ring:ring + n, ring:ring + n] = plain
+    s, u, f = axes[:, 0], axes[:, 1], axes[:, 2]
+    idx = np.arange(-ring, n + 2 * ring, dtype=np.float64)  # extended tiles
+    lo = idx * t - 1.0                                  # texel spans
+    hi = lo + t
+    fsel = np.arange(6)[:, None, None]
+    eps = 1e-4
+    to_ndc = 2.0 / size
+    # the other way: every extended tile's borders, J + 1 of them
+    pb = np.append(lo, hi[-1]) * to_ndc - 1.0
+    # each face's own tiles, every one with its eight neighbours folded
+    # in: one cell of it answers a bounding box up to three tiles wide
+    rim = np.full((6, n + 2, n + 2), np.inf, np.float32)
+    rim[:, 1:n + 1, 1:n + 1] = plain
+    near3 = _dilate3(rim)
+
+    def per_face(v):
+        return v[:, None, None]
+
+    def corners(a, fn):
+        # over the four corners of each tile: (6, K + 1, J + 1) -> (6, K, J)
+        return fn(fn(a[:, :-1, :-1], a[:, 1:, :-1]),
+                  fn(a[:, :-1, 1:], a[:, 1:, 1:]))
+
+    for along in (0, 1):
+        for sign in (1.0, -1.0):
+            # the tiles that reach past this edge (a run of neighbours),
+            # with the span along the edge's normal clipped to the part
+            # beyond it: K + 1 borders
+            if sign > 0:
+                sel = np.nonzero(hi > size)[0]
+                pa = np.append(max(lo[sel[0]], float(size)), hi[sel])
+            else:
+                sel = np.nonzero(lo < 0.0)[0]
+                pa = np.append(lo[sel], min(hi[sel[-1]], 0.0))
+            pa = pa * to_ndc - 1.0
+            g = np.argmax((axes[:, along] * sign) @ f.T, axis=1)
+            sg, ug, fg = s[g], u[g], f[g]
+            # the grid of the tiles' corners as directions d = xr s +
+            # yr u + f per face: (K + 1, J + 1)
+            xr, yr = (pa[:, None], pb[None, :]) if along == 0 \
+                else (pb[None, :], pa[:, None])
+
+            def along_axis(ax):
+                return xr[None] * per_face((s * ax).sum(1)) \
+                    + yr[None] * per_face((u * ax).sum(1)) \
+                    + per_face((f * ax).sum(1))
+            md = along_axis(fg)                         # (6, K + 1, J + 1)
+            gx = ((along_axis(sg) / md * 0.5 + 0.5) * size + 1.0) / t
+            gy = ((along_axis(ug) / md * 0.5 + 0.5) * size + 1.0) / t
+            x0 = np.clip(np.floor(corners(gx, np.minimum) - eps), 0, n - 1) \
+                .astype(np.int64)
+            x1 = np.clip(np.floor(corners(gx, np.maximum) + eps), 0, n - 1) \
+                .astype(np.int64)
+            y0 = np.clip(np.floor(corners(gy, np.minimum) - eps), 0, n - 1) \
+                .astype(np.int64)
+            y1 = np.clip(np.floor(corners(gy, np.maximum) + eps), 0, n - 1) \
+                .astype(np.int64)
+            if int((y1 - y0).max()) <= 2 and int((x1 - x0).max()) <= 2:
+                # the image of a tile this fine is under three tiles
+                # wide: the folded cell at the box's middle covers it
+                low = near3[g[:, None, None], (y0 + y1 + 1) // 2,
+                            (x0 + x1 + 1) // 2].astype(np.float64)
+            else:
+                pg = plain[g]
+                low = np.full(x0.shape, np.inf)
+                for dy in range(int((y1 - y0).max()) + 1):
+                    for dx in range(int((x1 - x0).max()) + 1):
+                        np.minimum(low, pg[fsel, np.minimum(y0 + dy, y1),
+                                           np.minimum(x0 + dx, x1)],
+                                   out=low)
+            low = low / corners(md, np.maximum) * _SEAM_SLACK   # (6, K, J)
+            # down to float32 without rounding a bound up
+            l32 = low.astype(np.float32)
+            l32 = np.where(l32 > low, np.nextafter(l32, f32(-np.inf)), l32)
+            run = slice(int(sel[0]), int(sel[-1]) + 1)
+            if along == 0:
+                np.minimum(e[:, :, run], l32.transpose(0, 2, 1),
+                           out=e[:, :, run])
+            else:
+                np.minimum(e[:, run, :], l32, out=e[:, run, :])
+    return e
+
+
+def _build_pyramid(sm):
+    """The reach pyramid of a map: one float32 block per face, laid out
+    by `pyr_layout`. A cell of level j holds the smallest depth a tap
+    can read within the 3 x 3 tiles around its own -- across the seams
+    of a cube too -- so the cell under (u, v) at the level whose tile is
+    at least r wide bounds every depth within r texels of (u, v). The
+    one-tile top level of a flat map holds the nearest depth of the
+    whole map, which is what a reach wider than the map gets (a flat
+    map's taps never leave it: `_MapFetch` reads the edge texel).
+
+    A cube's faces are continued past their edges ONCE, at the finest
+    level, by `seam_ring` tiles read off the neighbouring faces
+    (`_seam_grids`); every coarser level pools that. A level whose tile
+    is wider than the ring knows nothing beyond the face: its cells
+    along an edge hold 0, which bounds nothing, and the lookup's own
+    floor (the nearest depth of the whole cube) serves there."""
+    faces = getattr(sm, 'faces', None)
+    cube = faces is not None
+    if not cube:
+        faces = [sm]
+    size = int(faces[0].size)
+    lay = pyr_layout(size)
+    plain = np.stack([_pool_first(f.depth) for f in faces])
+    ring = 0
+    if cube:
+        axes = np.array([[np.asarray(a, np.float64) for a in face_axes(f)]
+                         for f in faces])
+        ring = seam_ring(size)
+        wide = _seam_grids(axes, plain, size, ring)
+    blocks = np.zeros((len(faces), lay['h'], lay['w']), np.float32)
+    for li, (t, n, ox, oy) in enumerate(lay['levels']):
+        if li:
+            plain = _pool_next(plain)
+            if ring > 1:
+                wide = _pool_next(wide)
+            ring //= 2
+        if ring:
+            e = wide[:, ring - 1:ring + n + 1, ring - 1:ring + n + 1]
+        else:
+            e = np.full((len(faces), n + 2, n + 2),
+                        0.0 if cube else np.inf, np.float32)
+            e[:, 1:n + 1, 1:n + 1] = plain
+            if cube:
+                # past the ring: a tile that is not wholly inside the
+                # face (the first always, by the grid's offset; the last
+                # when it overhangs) knows nothing of its outer part
+                last = n if n * t - 1 > size else n + 1
+                e[:, 1, :] = e[:, :, 1] = 0.0
+                e[:, last:, :] = 0.0
+                e[:, :, last:] = 0.0
+        blocks[:, oy:oy + n, ox:ox + n] = _dilate3(e)
+    return list(blocks)
+
+
+def map_pyramid(sm):
+    """The map's reach pyramid, built once from its depth and parked on
+    it (`ShadowMap.pyr` / `CubeShadow.pyr`; a bake that rewrites `depth`
+    in place must reset the slot to None, as it must `digest`)."""
+    p = getattr(sm, 'pyr', None)
+    if p is None:
+        p = _build_pyramid(sm)
+        try:
+            sm.pyr = p
+        except AttributeError:
+            pass
+    return p
+
+
+def _reach_min(block, lay, u, v, r):
+    """The smallest depth within `r` texels of (u, v), read from one
+    cell of the reach pyramid: the level whose tile is the first at
+    least r wide (the top level for any wider reach)."""
+    m, e = np.frexp(r)
+    # r = m 2^e with m in [0.5, 1): the smallest power of two not below r
+    lv = e - (m == f32(0.5))
+    li = np.clip(lv - PYR_BASE, 0, len(lay['levels']) - 1)
+    sh = -(li + PYR_BASE)
+    n1 = lay['n1'][li]
+    x = np.clip(np.floor(np.ldexp(u + f32(1.0), sh)), f32(0.0), n1)
+    y = np.clip(np.floor(np.ldexp(v + f32(1.0), sh)), f32(0.0), n1)
+    return block[lay['oy'][li] + y.astype(np.int32),
+                 lay['ox'][li] + x.astype(np.int32)]
+
+
 class _Pts:
     """The per-point state of one face's lookup; `take` narrows it to the
     points still undecided."""
@@ -447,8 +782,9 @@ class _CubeFetch:
 
 
 def _face(face, fetch, rect, P, N, ndl, slope, soft, shape, dmin,
-          tab_s, tab_f, stats=None):
-    """The lookup of M points against ONE map face. Returns lit (M,)."""
+          tab_s, tab_f, stats=None, pyr=None):
+    """The lookup of M points against ONE map face. Returns lit (M,).
+    `pyr` is the face's reach pyramid as (block, layout, is a cube's)."""
     n = P.shape[0]
     size = face.size
     persp = bool(face.persp)
@@ -520,8 +856,91 @@ def _face(face, fetch, rect, P, N, ndl, slope, soft, shape, dmin,
     pt.amax = np.maximum(np.sqrt(pt.ax * pt.ax + pt.ay * pt.ay),
                          np.sqrt(pt.bx * pt.bx + pt.by * pt.by))
     cap = cap_texels(size, face.extent, persp)
-    pt.ts = np.minimum(t_min, cap / np.maximum(pt.amax, f32(1e-12))) \
-        .astype(np.float32)
+    cap_t = (cap / np.maximum(pt.amax, f32(1e-12))).astype(np.float32)
+    grow = search_grow(len(tab_f))
+    res = np.ones(m, np.float32)
+    sel = None
+    if pyr is None:
+        # no pyramid (a direct call with a bare face): the search is
+        # bounded by the nearest depth of the whole map
+        pt.ts = np.minimum(t_min, cap_t).astype(np.float32)
+    else:
+        # -- 4a. the search's reach, tightened against the pyramid. It
+        # starts at the cap -- the widest any receiver can ask -- and
+        # each step reads the nearest depth within the current reach
+        # and takes the reach that depth leaves
+        blk, lay, cube = pyr
+        padp1 = f32(f32(float(soft) + SEARCH_PAD) + f32(1.0))
+        half = f32(size * 0.5)
+        dlow = f32(f32(dmin) * f32(_SEAM_SLACK))
+
+        def nearest(idx, r):
+            uu = pt.u if idx is None else pt.u[idx]
+            vv = pt.v if idx is None else pt.v[idx]
+            q = _reach_min(blk, lay, uu, vv, r)
+            if cube:
+                # the nearest depth of the whole cube bounds a tap too:
+                # stored along its own face's axis, it is read across a
+                # seam divided by no more than the tap's own distance
+                # from the face's centre, in half-faces. It serves where
+                # the pyramid knows nothing past an edge (a reach wider
+                # than the seam ring)
+                far_out = np.maximum(np.abs(uu - half) + r,
+                                     np.abs(vv - half) + r) / half
+                q = np.maximum(q, dlow / np.maximum(far_out, f32(1.0)))
+            return q
+
+        def reach(nr, dr, capt):
+            if persp:
+                t = f32(1.0) / np.maximum(nr, f32(1e-9)) - dr
+            else:
+                t = dr - nr
+            return np.minimum(np.maximum(t, f32(0.0)), capt)
+
+        # the cap's own reach first: one number for the whole lamp (a
+        # footprint with no lamp term asks the pad's alone)
+        lamp_on = pt.amax > f32(0.0)
+        near = nearest(None, np.where(lamp_on, f32(cap * grow), f32(0.0))
+                       + padp1)
+        ts = reach(near, pt.dr, cap_t).astype(np.float32)
+        # nothing within reach is nearer than the receiver less its
+        # bias: no tap can be a blocker (the plane's depth is never
+        # deeper than the receiver's own, the value `plane` floors at),
+        # so the point is lit and skips the search
+        lim = ((f32(1.0) / pt.dr) if persp else pt.dr) - pt.sl
+        asked = m
+        # the later steps, each only where the last one moved the bound
+        # and the point is not lit yet: an unmoved bound asks the same
+        # cell again
+        idx = np.nonzero(lamp_on & (near < lim))[0]
+        for _step in range(1, SEARCH_STEPS):
+            if idx.size == 0:
+                break
+            asked += int(idx.size)
+            q = nearest(idx, ts[idx] * grow * pt.amax[idx] + padp1)
+            moved = q > near[idx]
+            idx = idx[moved]
+            near[idx] = q[moved]
+            ts[idx] = reach(near[idx], pt.dr[idx], cap_t[idx])
+            idx = idx[near[idx] < lim[idx]]
+        pt.ts = ts
+        lit_now = near >= lim
+        if not SEARCH_SKIP:
+            lit_now = np.zeros(m, bool)
+        if stats is not None:
+            stats['bound'] = stats.get('bound', 0) + int(m)
+            stats['asked'] = stats.get('asked', 0) + int(asked)
+            stats['skip'] = stats.get('skip', 0) + int(lit_now.sum())
+        sel = np.nonzero(~lit_now)[0]
+        if sel.size == 0:
+            if act.size < n:
+                lit[act] = res
+                return lit
+            return res
+        if sel.size < m:
+            pt = pt.take(sel)
+        else:
+            sel = None
 
     def plane(p, du, dv):
         lin = p.dr + p.gu * du + p.gv * dv
@@ -529,8 +948,6 @@ def _face(face, fetch, rect, P, N, ndl, slope, soft, shape, dmin,
             # 1/depth, floored at the receiver's own: no deeper than d_r
             return f32(1.0) / np.maximum(lin, p.dr)
         return np.minimum(lin, p.dr)
-
-    grow = search_grow(len(tab_f))
 
     def blockers(p, t, want_depth):
         cnt = np.zeros(p.u.shape[0], np.float32)
@@ -552,8 +969,8 @@ def _face(face, fetch, rect, P, N, ndl, slope, soft, shape, dmin,
     nb, dsum = blockers(pt, pt.ts, True)
     if stats is not None:
         stats['search'] = stats.get('search', 0) + int(nb.shape[0])
-    res = np.ones(m, np.float32)
-    res[nb >= nt] = 0.0
+    rs = np.ones(nb.shape[0], np.float32)
+    rs[nb >= nt] = 0.0
     idx = np.nonzero((nb > 0.0) & (nb < nt))[0]
     if idx.size:
         # -- 5. the penumbra estimate, then the probe at its own radius
@@ -578,7 +995,7 @@ def _face(face, fetch, rect, P, N, ndl, slope, soft, shape, dmin,
                                                   True)
         if stats is not None:
             stats['probe'] = stats.get('probe', 0) + int(live.size)
-        res[idx[nb2 >= nt]] = 0.0
+        rs[idx[nb2 >= nt]] = 0.0
         keep = np.nonzero((nb2 > 0.0) & (nb2 < nt))[0]
         if keep.size:
             # -- 6. the estimate again from the casters the probe itself
@@ -592,7 +1009,11 @@ def _face(face, fetch, rect, P, N, ndl, slope, soft, shape, dmin,
                 tf = p3.dr - davg2
             tf = np.minimum(np.maximum(tf, f32(0.0)), tp[keep]) \
                 .astype(np.float32)
-            res[idx[keep]] = _filter(p3, tf, soft, tab_f, fetch, plane, stats)
+            rs[idx[keep]] = _filter(p3, tf, soft, tab_f, fetch, plane, stats)
+    if sel is None:
+        res = rs
+    else:
+        res[sel] = rs
     if act.size < n:
         lit[act] = res
         return lit
@@ -683,11 +1104,13 @@ def lookup(sm, shape, P, N, ndl, slope, soft, samples, mask=None,
     dmin = map_d_min(sm)
     faces = getattr(sm, 'faces', None)
     rect = shape['kind'] == 'RECT'
+    blocks = map_pyramid(sm)
+    lay = pyr_layout((sm if faces is None else faces[0]).size)
     if faces is None:
         return _face(sm, _MapFetch(sm),
                      rect_axes(shape, face_axes(sm)) if rect else None,
                      P, N, ndl, slope, soft, shape, dmin, tab_s, tab_f,
-                     stats)
+                     stats, (blocks[0], lay, False))
     d = P - sm.origin[None, :]
     major = np.argmax(np.abs(d), axis=1)
     sign = d[np.arange(n), major] >= 0
@@ -700,5 +1123,5 @@ def lookup(sm, shape, P, N, ndl, slope, soft, samples, mask=None,
                        rect_axes(shape, face_axes(faces[fi])) if rect
                        else None,
                        P[m], N[m], ndl[m], slope[m], soft, shape, dmin,
-                       tab_s, tab_f, stats)
+                       tab_s, tab_f, stats, (blocks[fi], lay, True))
     return lit
