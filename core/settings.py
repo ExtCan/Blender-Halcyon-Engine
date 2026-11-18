@@ -611,7 +611,7 @@ class RenderSettings:
         """A copy of the FIELDS. The underscore-private per-frame flags
         are dropped on purpose (a pass's jitter or a stereo eye must
         not leak into the next road; each road re-states what its
-        passes need) -- with one exception, `_sample_pass`: the index
+        passes need) -- with two exceptions. `_sample_pass`: the index
         of the pass inside the averaging roads (accumulation, lens
         passes, adaptive refines, motion-blur slices). The soft-shadow
         sampler salts its rays with it so that N averaged frames are N
@@ -622,6 +622,14 @@ class RenderSettings:
         sp = self.__dict__.get('_sample_pass')
         if sp:
             st._sample_pass = sp
+        # R254: and a second one, for the same reason -- a viewport
+        # draft's shadow-map divisor (preview.py sets it beside the
+        # Softness it divides with it; core/lights._map_size reads it).
+        # The maps of a draft must be the draft's in every road its
+        # frame takes, or one frame would bake two sizes
+        dv = self.__dict__.get('_shadow_map_div')
+        if dv:
+            st._shadow_map_div = dv
         return st
 
     def sample_pass_for(self, k):

@@ -1658,6 +1658,16 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         if area_nd is not None:
             # shade_one_light's area lamp correction: specfac *= inp
             spec = spec * area_nd[:, None]
+        if only_accum is None and not want_split and model != 'CARTOON' \
+                and light is not sh_key and LI.lamp_adds_nothing(light):
+            # R254: a lamp at Power 0, of a black colour or with no lobe
+            # left adds exact zeros to this batch, and nothing here reads
+            # its shadow apart from its light (no Shadows Only sum, no
+            # light split, no paint verdict, not the key lamp whose lit
+            # fraction is kept; the fixed cel key left the loop above).
+            # So its shadow is not asked for: no lookup, no traced ray,
+            # and its map -- deferred by LI.map_roles -- is never baked
+            continue
         need = None
         if only_accum is None and getattr(light, 'type', '') != 'HEMI':
             need = (dif != 0.0) | (spec != 0.0).any(axis=1)
@@ -2588,6 +2598,11 @@ def _make_ground_light(scene, st, bvh, lts):
                     ndl = np.clip(L[:, 2], 0.0, 1.0)
                 face = ndl > 0.0
                 if not face.any():
+                    continue
+                if light.type != 'HEMI' and LI.lamp_is_dark(light):
+                    # R254: no radiance, so the term below is zero
+                    # whatever the shadow says -- do not ask for it (a
+                    # dark lamp's map is deferred: LI.map_roles)
                     continue
                 vis = LI.visibility(light, P, up, L, dist, st, bvh,
                                     sample_xy=(spx, spy, li), mask=face)
@@ -4260,18 +4275,105 @@ def _caster_keep_tri(scene, mesh):
     return keep_tri
 
 
-def _build_shadows(scene, st, mesh):
+def _build_shadows(scene, st, mesh, traced=None):
+    # R254: `traced` says whether a BVH exists for this frame (render()
+    # knows; any other caller leaves it unsaid and one is assumed)
     # R253 (H): every lamp's style gain for THIS frame, written before
     # anything reads an energy -- the CPU loop, the beams, the fog
     # lobe, the ambient pool and the GPU packer all see one number
     LI.apply_light_styles(scene)
     if not (st.shadows and st.shadow_default in ('MAP', 'PER_LIGHT')):
+        # R254: no map is built this frame, so none may stay on the
+        # lamps from an earlier frame of the same Scene (Ray Traced with
+        # Ray Shadows off fell through to the previous frame's map)
+        LI.drop_shadow_maps(scene)
         return
     keep_tri = _caster_keep_tri(scene, mesh)
     cast = None
     if keep_tri is not None and not keep_tri.all():
         cast = np.nonzero(keep_tri)[0]
+    # R254: a lamp that adds no light (Power 0, a black colour, no lobe
+    # left) needs no map unless something reads a shadow apart from its
+    # lamp's light, and a lamp of the frame may go without one only
+    # where no BVH could trace in the map's place (LI.map_roles)
+    st._shadow_quiet = not shadow_read_apart_from_light(scene, st)
+    st._shadow_untraced = traced is False
     LI.build_shadow_maps(scene, st, cast)
+
+
+def prebake_shadows(scene, st, limit=None):
+    """The frame's shadow maps, built the way render() builds them, for
+    a caller that will not shade the frame itself: the worker pool's
+    parent bakes here ONCE and the scene it then hands the workers
+    carries the maps (LI.adopt_shadow_maps on their side). The steps
+    before the build are render()'s own, each idempotent: the vertex
+    format, the world's light, the material override. With `limit`, a
+    set of maps that would hold more bytes than that is not baked at
+    all (False): it would not be handed over."""
+    scene.mesh = raster.quantize_mesh(
+        scene.mesh, str(getattr(st, 'vertex_quantize', 'NONE')),
+        float(getattr(st, 'vertex_units', 64.0)))
+    from . import worldlight as _WL
+    _WL.sync(scene, lambda: prepare_textures(scene, st))
+    over = _apply_material_override(scene, st)
+    if limit is not None and LI.planned_map_bytes(over, st) > limit:
+        LI.drop_shadow_maps(over)
+        return False
+    _build_shadows(over, st, over.mesh)
+    return True
+
+
+#: the models whose light loop reads a lamp's shadow apart from the
+#: lamp's radiance: the paint keeps the strongest lamp's lit VERDICT
+#: (light_surface's CARTOON branch), the Mega Drive class asks for the
+#: key lamp's lit fraction (combine.light_extras)
+_SHADOW_APART_MODELS = frozenset({'CARTOON', 'MEGA_DRIVE_SH'})
+
+
+def shadow_read_apart_from_light(scene, st):
+    """True when this frame may read a lamp's SHADOW without multiplying
+    it by that lamp's light -- so that even a lamp at Power 0 counts:
+
+      * a light pass is wanted (the Shadow pass averages 1 - visibility
+        over the shadowing lamps, 2.79's shade_only_shadow shape);
+      * a material is Shadows Only (the same average becomes its alpha);
+      * a material lights its cel from a fixed key (Light Source Camera
+        or World): the scene's lamps then only CAST, and the strongest
+        caster's visibility is the key's own;
+      * a material shades as the paint or the Mega Drive class
+        (`_SHADOW_APART_MODELS`), by its own model, its node's, a
+        Console node's or the render's default / forced model.
+
+    Each clause is the one source of the surface field light_surface
+    keys the read on (surf.shadows_only, surf.cel_light, the model);
+    anything this cannot tell from a graph answers True. Only the lamps
+    that add no light are affected by the answer."""
+    if light_pass_names(st):
+        return True
+    if str(getattr(st, 'force_model', 'NONE')) in _SHADOW_APART_MODELS \
+            or str(getattr(st, 'default_model', '')) in _SHADOW_APART_MODELS:
+        return True
+    for mat in (getattr(scene, 'materials', None) or ()):
+        if str(getattr(mat, 'model', '')) in _SHADOW_APART_MODELS:
+            return True
+        graph = getattr(mat, 'graph', None)
+        if not graph:
+            continue
+        if not isinstance(graph, dict):
+            return True
+        for node in (graph.get('nodes') or {}).values():
+            props = node.get('props') or {}
+            ident = str(node.get('bl_idname', ''))
+            if props.get('shadow_only'):
+                return True
+            if str(props.get('light_source', 'SCENE') or 'SCENE').upper() \
+                    != 'SCENE':
+                return True
+            if str(props.get('model', '')) in _SHADOW_APART_MODELS:
+                return True
+            if 'Cartoon' in ident or 'Console' in ident:
+                return True
+    return False
 
 
 def shaft_sources(scene, settings, vp):
@@ -4533,8 +4635,13 @@ def _shadow_coarseness_note(scene, gbuf, proj, rh):
                 or cam is None:
             return
         centre = mesh.verts.mean(axis=0)
-        eye = np.asarray(getattr(cam, 'position', (0.0, 0.0, 0.0)),
-                         np.float32)
+        # R254: the camera's place is the translation of its matrix. This
+        # read a `position` no Camera carries, so the distance was the
+        # scene's distance from the world ORIGIN: a camera 9 units from a
+        # scene 1.4 units from the origin was told its 512 map spanned
+        # ~10 pixels a texel (it spanned 1.5) and to raise Shadow Map
+        # Size, which multiplies the bake
+        eye = np.asarray(cam.matrix_world, np.float32)[:3, 3]
         dist_cam = float(np.linalg.norm(centre - eye))
         ang, ortho_w = pixel_footprint(cam, proj, rh)
         px_world = ortho_w if ang == 0.0 else ang * max(dist_cam, 1e-6)
@@ -4960,7 +5067,7 @@ def render(scene, settings=None, progress=None, band=None):
             bvh = _cached_bvh(scene, mesh)
 
     with ST.track('shadow maps'):
-        _build_shadows(scene, st, mesh)
+        _build_shadows(scene, st, mesh, traced=bvh is not None)
     # R208: the caster mask travels to the RAY shadow road too (the
     # maps already honour it at bake time). visibility() reads it off
     # the settings and hands it to the BVH's any-hit as a cast filter,
