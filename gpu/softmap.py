@@ -12,6 +12,8 @@ default Samples 4), in texel fetches of the depth pack:
 
     lit: nothing nearer within reach    k   (the reach pyramid: 1 to
                                             SEARCH_STEPS, 2 to 3 mostly)
+    lit: a level receiver, nothing
+         above it within reach          k + 1 (the pyramid's heights)
     lit or umbra by the search          k + (B + 1)               = 16
     decided by the probe                k + 2 (B + 1)             = 29
     penumbra, one lattice               k + 2 (B + 1) + 4 F       = 93
@@ -217,13 +219,14 @@ def shadow_function(i, meta, mb=None):
                     '    float occ = '
                     + fetch.format('cellx + xi', 'celly + yi') + ';']
 
-    # the nearest depth within r texels of (u, v): one cell of the reach
-    # pyramid, at the level whose tile is the first at least r wide
-    # (`softmap._reach_min`; a tile's width is a power of two, so the
-    # division is exact on both roads)
+    # one cell of the reach pyramid, at the level whose tile is the
+    # first at least r wide (`softmap._reach_min`; a tile's width is a
+    # power of two, so the division is exact on both roads). `part` is
+    # the row its part of the block starts at: the nearest depths, or
+    # the heights under them
     t0, n0, ox0, oy0 = lay['levels'][0]
-    L += [f'float hal_sm_near{i}(float u, float v, float r, float pbx'
-          + (', float dlow)' if cube else ')'),
+    L += [f'float hal_sm_cell{i}(float u, float v, float r, float pbx, '
+          'float part)',
           '{',
           f'    float T = {_f(float(t0))}; float ox = {_f(float(ox0))}; '
           f'float oy = {_f(float(oy0))}; float n1 = {_f(float(n0 - 1))};']
@@ -234,9 +237,15 @@ def shadow_function(i, meta, mb=None):
                  f'n1 = {_f(float(n1_ - 1))}; }}')
     L += ['    float x = clamp(floor((u + 1.0) / T), 0.0, n1);',
           '    float y = clamp(floor((v + 1.0) / T), 0.0, n1);',
-          '    float q = ' + fetch.format('pbx + ox + x',
-                                          f'{_f(float(pyr_y))} + oy + y')
-          + ';']
+          '    return ' + fetch.format('pbx + ox + x', 'part + oy + y')
+          + ';',
+          '}']
+    # the nearest depth within r texels of (u, v)
+    L += [f'float hal_sm_near{i}(float u, float v, float r, float pbx'
+          + (', float dlow)' if cube else ')'),
+          '{',
+          f'    float q = hal_sm_cell{i}(u, v, r, pbx, '
+          f'{_f(float(pyr_y))});']
     if cube:
         # the whole cube's nearest depth bounds a tap too, divided by
         # no more than the tap's distance from the face's centre in
@@ -499,6 +508,42 @@ def shadow_function(i, meta, mb=None):
 
     # the blocker search; then, only where it is undecided, the probe;
     # then, only where THAT is undecided, the filter
+    # a LEVEL receiver (a floor, a ground) with nothing above it within
+    # reach: the height part of the pyramid (`softmap._face`, step 4b).
+    # The receiver's plane against the level plane through the same
+    # point over the tile's window (al), that as a height (rise)
+    L += ['    if (near < lim) {',
+          f'    float rr = ts * {grow} * amax + padp;',
+          f'    float top = hal_sm_cell{i}(u, v, rr, pbx, '
+          f'{_f(float(pyr_y + lay["part"]))});',
+          '    float pz = ph.z;',
+          '    float win = 4.0 * rr + 1.0;']
+    if persp:
+        oz = 'hal_m0.z' if tx else _lit(np.float32(origin[2]))
+        L += [f'    float up = {oz} - pz;',
+              f'    float hden = -(max(up, 1e-12) * {K});',
+              '    float guh = sax.z / hden;',
+              '    float gvh = uax.z / hden;',
+              '    float al = (abs(gu - guh) + abs(gv - gvh)) * win;',
+              '    float room = dr - (abs(guh) + abs(gvh)) * win - al;',
+              '    float rise = up * al / max(room, 1e-30);',
+              '    float zeps = 4e-6 * (abs(pz) + up + 1.0 / dr + 1.0);',
+              '    if (up > 0.0 && room > 0.0 && top >= zeps + rise - pz) '
+              '{ near = lim; }']
+    else:
+        fz = f'hal_ltex({fb(0) + 6}).z' if tx else \
+            _lit(np.float32(axes[0][2][2]))
+        L += [f'    float down = -({fz});',
+              f'    float hden = max(down, 1e-12) * {K};',
+              '    float guh = sax.z / hden;',
+              '    float gvh = uax.z / hden;',
+              '    float al = (abs(gu - guh) + abs(gv - gvh)) * win;',
+              '    float rise = al * down;',
+              '    float zeps = 4e-6 * (abs(pz) + dr + 1.0);',
+              '    if (down > 0.0 && top >= zeps + rise - pz) '
+              '{ near = lim; }']
+    L.append('    }')
+
     L += ['    if (near < lim) {',
           f'    vec2 fs = hal_sm_find{i}(ts, Ax, Ay, Bx, By, {cta});',
           '    float nb = fs.x; float dsum = fs.y;',

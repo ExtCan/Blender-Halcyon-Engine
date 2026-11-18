@@ -33,6 +33,9 @@ Each test below states one law as a number:
        it cannot draw
     i  a scene smaller than a unit keeps its mapped shadows (SP-3): the
        Bias is bounded by the scene the map was baked for
+    j  a LEVEL receiver (a floor under a slanted light) with nothing
+       above it within reach skips the search too: the pyramid's height
+       part, exact, on both roads
 
     python -m halcyon.tests.test_r254_soft_search
 """
@@ -158,10 +161,11 @@ def test_a_the_pyramid_is_a_lower_bound():
                   f'{len(lay["levels"])} levels in a block '
                   f'{lay["w"]} x {lay["h"]}')
     lay = SM.pyr_layout(512)
-    check('the pyramid starts at tiles of 4 texels and is a twelfth of '
-          'the map',
+    check('the pyramid starts at tiles of 4 texels; its two parts (the '
+          'nearest depths, the heights) are a fifth of the map',
           lay['levels'][0][0] == 4 and lay['levels'][-1][1] == 1
-          and lay['w'] * lay['h'] < 512 * 512 / 9,
+          and lay['h'] == 2 * lay['part']
+          and lay['w'] * lay['h'] < 512 * 512 / 4.9,
           f'{lay["w"]} x {lay["h"]} cells for a 512 face')
     sc, st = MS._prep('POINT', 0.3, shadow_map_size=64)
     sm = sc.lights[0].shadow_map
@@ -217,9 +221,9 @@ def test_b_a_sun_shadow_does_not_depend_on_the_ground():
     seen = []
     orig = SM._reach_min
 
-    def spy(block, lay, u, v, r):
+    def spy(block, lay, u, v, r, *part):
         seen.append(float(np.asarray(r).ravel()[0]))
-        return orig(block, lay, u, v, r)
+        return orig(block, lay, u, v, r, *part)
     SM._reach_min = spy
     try:
         SM.lookup(sm, SM.lamp_shape(sc.lights[0]), far, n,
@@ -229,7 +233,7 @@ def test_b_a_sun_shadow_does_not_depend_on_the_ground():
         SM._reach_min = orig
     check("away from the figure the search comes from the cap's 164 "
           'texels down to a few, a texel fetched per step',
-          2 < len(seen) <= SM.SEARCH_STEPS and seen[0] > 150.0
+          2 < len(seen) <= SM.SEARCH_STEPS + 1 and seen[0] > 150.0
           and seen[-1] < 8.0 and stats.get('asked') == len(seen),
           f'reach per step, texels: {[round(r, 1) for r in seen]}')
 
@@ -789,6 +793,176 @@ def test_i_a_small_scene_keeps_its_mapped_shadows():
               and 0.0 < meta['bias'] < 0.005,
               f'max |sim - cpu| {d:.6f}, Bias {meta["bias"]:.5f}'
               if meta else str(why))
+
+
+def _world_z(face, xi, yi):
+    """The world height of the point texel (xi, yi) of a map face
+    stores, through the face's own matrix (not the pyramid's code)."""
+    size = face.size
+    d = float(face.depth[yi, xi])
+    n, f = face.near, face.far
+    if face.persp:
+        zn = ((f + n) - 2.0 * n * f / d) / (f - n)
+    else:
+        zn = (d - n) / (f - n) * 2.0 - 1.0
+    ndc = np.array([(xi + 0.5) * 2.0 / size - 1.0,
+                    (yi + 0.5) * 2.0 / size - 1.0, zn, 1.0])
+    inv = np.linalg.inv(np.asarray(face.vp, np.float64))
+    if face.persp:
+        # clip = ndc * w with w the depth along the face's axis
+        w = inv @ (ndc * d)
+    else:
+        w = inv @ ndc
+    return float(w[2] / w[3])
+
+
+def test_j_a_level_receiver_skips_under_a_slanted_light():
+    """Under a slanted light a floor's own plane is the nearest depth
+    within any reach, so 'nothing nearer than the receiver' never holds
+    and the search ran on every lit point of it. The pyramid's height
+    part answers 'does anything within reach stand above this level?'
+    for a receiver whose plane is level."""
+    rng = np.random.default_rng(9)
+    # the height part bounds the heights: brute force, and against the
+    # map's own matrix
+    for kind in ('SUN', 'SPOT', 'POINT'):
+        sc, st = MS._prep(kind, 0.3, shadow_map_size=64,
+                          lamp_kw={'pos': (2.5, -1.5, 5.0),
+                                   'aim': (0.0, 0.0, 0.8)})
+        sm = sc.lights[0].shadow_map
+        faces = getattr(sm, 'faces', None) or [sm]
+        blocks = SM.map_pyramid(sm)
+        lay = SM.pyr_layout(64)
+        bad, exact, off = 0, 0, 0.0
+        for fi, face in enumerate(faces):
+            neg = SM._neg_heights(face)
+            for _ in range(60):
+                xi, yi = int(rng.integers(0, 64)), int(rng.integers(0, 64))
+                z = _world_z(face, xi, yi)
+                off = max(off, abs(-float(neg[yi, xi]) - z)
+                          / (1.0 + abs(z)))
+            for _ in range(120):
+                u = f32(rng.uniform(0, 64))
+                v = f32(rng.uniform(0, 64))
+                r = f32(rng.choice([3.0, 4.0, 5.5, 8.0, 13.0]))
+                top = -float(SM._reach_min(blocks[fi], lay, np.array([u]),
+                                           np.array([v]), np.array([r]),
+                                           1)[0])
+                x0 = int(np.floor(u - r + 1.0))
+                x1 = int(np.floor(u + r - 1.0))
+                y0 = int(np.floor(v - r + 1.0))
+                y1 = int(np.floor(v + r - 1.0))
+                if len(faces) > 1 and (x0 < 0 or y0 < 0 or x1 > 63
+                                       or y1 > 63):
+                    # past a cube face's edge the part knows nothing
+                    bad += top != np.inf
+                    continue
+                win = -neg[max(y0, 0):min(y1, 63) + 1,
+                           max(x0, 0):min(x1, 63) + 1]
+                bad += top < float(win.max())
+                exact += top == float(win.max())
+        check(f'{kind} map: the height part is never under the highest '
+              'point a tap within its reach reads, and each height is the '
+              "texel's world z", bad == 0 and exact > 0 and off < 1e-4,
+              f'{bad} under, {exact} exact; largest height error '
+              f'{off:.2e} (relative)')
+    # the skip: most of a floor, under every kind of lamp, and exact
+    gx, gy = np.meshgrid(np.linspace(-6.0, 6.0, 121),
+                         np.linspace(-5.0, 6.0, 111))
+    P = np.stack([gx.ravel(), gy.ravel(), np.zeros(gx.size)],
+                 1).astype(np.float32)
+
+    def run(lt, st, normal, bias=0.02):
+        n = np.tile(np.asarray(normal, np.float32)[None], (P.shape[0], 1))
+        L, _rad, _dist = LI.sample(lt, P, st)
+        ndl = np.clip((n * L).sum(1), 0.0, 1.0).astype(np.float32)
+        sm = lt.shadow_map
+        tex = sm.texel_size(np.linalg.norm(P - sm.origin[None, :], axis=1))
+        off = tex * (1.5 + 2.5 * np.sqrt(np.maximum(1.0 - ndl * ndl, 0.0))) \
+            * SM.offset_scale(ndl)
+        stats = {}
+        out = SM.lookup(sm, SM.lamp_shape(lt), P + n * off[:, None], n, ndl,
+                        bias * (1.0 + 2.0 * (1.0 - ndl)), 1.0, 4,
+                        stats=stats)
+        return out, stats
+
+    for kind, size, floor in (('SUN', 0.05, 0.6), ('SPOT', 0.25, 0.5),
+                              ('POINT', 0.25, 0.6), ('AREA', 1.0, 0.45)):
+        st = MS._settings()
+        lt = MS._lamp(kind, size, pos=(2.5, -1.5, 5.0), aim=(0.0, 0.0, 0.8))
+        sc = MS._wall(lt, st)
+        LI.clear_shadow_cache()
+        LI.build_shadow_maps(sc, st)
+        out, stats = run(lt, st, (0.0, 0.0, 1.0))
+        SM.LEVEL_SKIP = False
+        try:
+            depth_only, stats_d = run(lt, st, (0.0, 0.0, 1.0))
+        finally:
+            SM.LEVEL_SKIP = True
+        SM.SEARCH_SKIP = False
+        try:
+            full, _s = run(lt, st, (0.0, 0.0, 1.0))
+        finally:
+            SM.SEARCH_SKIP = True
+        share = stats.get('skip', 0) / max(stats.get('bound', 0), 1)
+        share_d = stats_d.get('skip', 0) / max(stats_d.get('bound', 0), 1)
+        check(f'{kind} slanted over a floor: most receivers skip the '
+              'search (by depth alone hardly any did)',
+              share > floor and stats.get('level', 0) > 0
+              and share > share_d + 0.1,
+              f'{share:.0%} skipped, {stats.get("level", 0)} of them by '
+              f'height; {share_d:.0%} by depth alone')
+        check(f'{kind}: the skip changes no value',
+              np.array_equal(out, full) and np.array_equal(out, depth_only))
+        # a receiver that is not level: a hair off still skips (its plane
+        # agrees with the level one to within the margin), 20 degrees off
+        # never does by height; neither moves a value
+        for tilt, want in ((1e-6, True), (0.35, False)):
+            nrm = (float(np.sin(tilt)), 0.0, float(np.cos(tilt)))
+            out_t, st_t = run(lt, st, nrm)
+            SM.SEARCH_SKIP = False
+            try:
+                full_t, _s = run(lt, st, nrm)
+            finally:
+                SM.SEARCH_SKIP = True
+            check(f'{kind}: a receiver tilted by {tilt:g} rad '
+                  + ('still skips by height' if want
+                     else 'does not skip by height') + ', bit for bit',
+                  np.array_equal(out_t, full_t)
+                  and (st_t.get('level', 0) > 0) == want,
+                  f'{st_t.get("level", 0)} by height')
+    # the other road: the same branch fires in the shader. Its result is
+    # the search's own, so the frame cannot show it; a copy of the text
+    # that paints the branch does
+    for kind, size, share in (('SUN', 0.05, 0.5), ('SPOT', 0.25, 0.3),
+                              ('POINT', 0.25, 0.1)):
+        st = MS._settings()
+        sc = MS._wall(MS._lamp(kind, size, pos=(2.5, -1.5, 5.0),
+                               aim=(0.0, 0.0, 0.8)), st)
+        LI.clear_shadow_cache()
+        cpu, sim, cov, passes, atlases, why = MS._gpu(sc, st)
+        if not check(f'{kind} slanted: the deferred pass plans',
+                     sim is not None, str(why)):
+            continue
+        d = float(np.abs(sim[cov] - cpu[cov][:, :3]).max())
+        mark = '{ near = lim; }'
+        painted = [tuple(x.replace(mark, '{ near = lim; lit = 0.0; }')
+                         if isinstance(x, str) else x for x in ps)
+                   for ps in passes]
+        hits = sum(x.count(mark) for ps in passes for x in ps
+                   if isinstance(x, str))
+        view, _p, vp, eye = MS.R.camera_matrices(sc.camera, 96, 72)
+        g = MS.CRg.GBuffer(96, 72)
+        MS.CRg.rasterize(sc.mesh.verts, sc.mesh.tris, vp, 96, 72, gbuf=g)
+        job = MS.R.ShadeJob(sc, st, {}, None, view, eye, 96, 72)
+        img, _hit = GSH.simulate(job, g, painted, atlases)
+        dark = (np.abs(img - sim).max(axis=2) > 1e-3) & cov
+        check(f'{kind} slanted: the simulator shades the CPU picture, and '
+              "the shader's own height branch decides its share of the frame",
+              d < 6e-3 and hits >= 1
+              and int(dark.sum()) > share * int(cov.sum()),
+              f'max |sim - cpu| {d:.6f}; the branch lit {int(dark.sum())} '
+              f'of {int(cov.sum())} pixels')
 
 
 def main():

@@ -148,6 +148,9 @@ SEARCH_STEPS = 6
 #: a receiver with nothing nearer than itself within reach skips the
 #: search (CPU road only; the tests turn it off to prove it moves no bit)
 SEARCH_SKIP = True
+#: ... and a LEVEL receiver with nothing above it within reach (the
+#: height part of the pyramid)
+LEVEL_SKIP = True
 #: the lattice strides above 1 (a comparison ladder on both roads)
 STRIDES = (2.0, 4.0, 8.0, 16.0, 32.0, 64.0)
 #: the lattice stride follows LATTICE * r / F: three times the mean
@@ -451,7 +454,9 @@ def pyr_layout(size):
     cell sits at (ox, oy) of a w x h block. The finest level fills the
     left of the block and the coarser ones stack in a column beside it
     (a mip chain's layout); the last level is one tile. Pure structure:
-    both roads and the GPU pack read it.
+    both roads and the GPU pack read it. The block holds the levels
+    twice, the second copy `part` rows under the first: the nearest
+    DEPTH around each tile, then the greatest HEIGHT (`_build_pyramid`).
 
     Tile x of a level covers the texels x T - 1 .. (x + 1) T - 2: the
     grid stands ONE TEXEL off the map's own, so the middle of a map and
@@ -472,7 +477,10 @@ def pyr_layout(size):
         _TABLES[key] = {
             'levels': levels,
             'w': n0 + (levels[1][1] if len(levels) > 1 else 0),
-            'h': max(n0, y),
+            # the block is two parts of `part` rows, one under the
+            # other: the nearest depths, then the heights
+            'part': max(n0, y),
+            'h': 2 * max(n0, y),
             # the per-level columns the CPU gathers through
             'n1': np.array([lv[1] - 1 for lv in levels], np.float32),
             'ox': np.array([lv[2] for lv in levels], np.int32),
@@ -660,6 +668,27 @@ def _seam_grids(axes, plain, size, ring):
     return e
 
 
+def _neg_heights(face):
+    """Minus the world height (z) of the point each texel of a face
+    stores, float32, never above the exact value (so the height is never
+    under-stated): what the height part of the pyramid pools. A texel's
+    point stands on the ray through its centre at its stored depth, the
+    point the lookup's plane compare is made at."""
+    size = int(face.size)
+    s, u, f = (np.asarray(a, np.float64) for a in face_axes(face))
+    c = ((np.arange(size, dtype=np.float64) + 0.5) * (2.0 / size) - 1.0) \
+        * float(face.extent)
+    depth = np.asarray(face.depth, np.float64)
+    oz = float(face.origin[2])
+    if face.persp:
+        z = oz + depth * (c[None, :] * s[2] + c[:, None] * u[2] + f[2])
+    else:
+        z = oz + c[None, :] * s[2] + c[:, None] * u[2] + depth * f[2]
+    z = -z
+    neg = z.astype(np.float32)
+    return np.where(neg > z, np.nextafter(neg, f32(-np.inf)), neg)
+
+
 def _build_pyramid(sm):
     """The reach pyramid of a map: one float32 block per face, laid out
     by `pyr_layout`. A cell of level j holds the smallest depth a tap
@@ -690,9 +719,29 @@ def _build_pyramid(sm):
         ring = seam_ring(size)
         wide = _seam_grids(axes, plain, size, ring)
     blocks = np.zeros((len(faces), lay['h'], lay['w']), np.float32)
+    # THE HEIGHT PART: minus the greatest world height over the same
+    # tiles (the minimum of minus z). It answers "does anything within
+    # reach stand above this level?" for a receiver whose plane is level
+    # -- a floor, a ground, a table top, under any lamp, however the
+    # light slants. A cube's part knows nothing past a face's edge: a
+    # tile there holds minus infinity (anything may stand above), so a
+    # reach that crosses a seam is searched
+    high = np.stack([_pool_first(_neg_heights(f)) for f in faces])
+    unknown = f32(-np.inf) if cube else f32(np.inf)
+    part = lay['part']
+
+    def edge_tiles(e, t, n, fill):
+        # a tile not wholly inside the face: the first always (the
+        # grid's offset), the last when it overhangs
+        last = n if n * t - 1 > size else n + 1
+        e[:, 1, :] = e[:, :, 1] = fill
+        e[:, last:, :] = fill
+        e[:, :, last:] = fill
+
     for li, (t, n, ox, oy) in enumerate(lay['levels']):
         if li:
             plain = _pool_next(plain)
+            high = _pool_next(high)
             if ring > 1:
                 wide = _pool_next(wide)
             ring //= 2
@@ -703,14 +752,14 @@ def _build_pyramid(sm):
                         0.0 if cube else np.inf, np.float32)
             e[:, 1:n + 1, 1:n + 1] = plain
             if cube:
-                # past the ring: a tile that is not wholly inside the
-                # face (the first always, by the grid's offset; the last
-                # when it overhangs) knows nothing of its outer part
-                last = n if n * t - 1 > size else n + 1
-                e[:, 1, :] = e[:, :, 1] = 0.0
-                e[:, last:, :] = 0.0
-                e[:, :, last:] = 0.0
+                # past the ring a tile knows nothing of its outer part
+                edge_tiles(e, t, n, 0.0)
         blocks[:, oy:oy + n, ox:ox + n] = _dilate3(e)
+        e = np.full((len(faces), n + 2, n + 2), unknown, np.float32)
+        e[:, 1:n + 1, 1:n + 1] = high
+        if cube:
+            edge_tiles(e, t, n, unknown)
+        blocks[:, part + oy:part + oy + n, ox:ox + n] = _dilate3(e)
     return list(blocks)
 
 
@@ -728,10 +777,11 @@ def map_pyramid(sm):
     return p
 
 
-def _reach_min(block, lay, u, v, r):
+def _reach_min(block, lay, u, v, r, part=0):
     """The smallest depth within `r` texels of (u, v), read from one
     cell of the reach pyramid: the level whose tile is the first at
-    least r wide (the top level for any wider reach)."""
+    least r wide (the top level for any wider reach). `part` 1 reads
+    the height part instead: minus the greatest height within r."""
     m, e = np.frexp(r)
     # r = m 2^e with m in [0.5, 1): the smallest power of two not below r
     lv = e - (m == f32(0.5))
@@ -740,7 +790,7 @@ def _reach_min(block, lay, u, v, r):
     n1 = lay['n1'][li]
     x = np.clip(np.floor(np.ldexp(u + f32(1.0), sh)), f32(0.0), n1)
     y = np.clip(np.floor(np.ldexp(v + f32(1.0), sh)), f32(0.0), n1)
-    return block[lay['oy'][li] + y.astype(np.int32),
+    return block[part * lay['part'] + lay['oy'][li] + y.astype(np.int32),
                  lay['ox'][li] + x.astype(np.int32)]
 
 
@@ -969,6 +1019,46 @@ def _face(face, fetch, rect, P, N, ndl, slope, soft, shape, dmin,
             idx = idx[near[idx] < lim[idx]]
         pt.ts = ts
         lit_now = near >= lim
+        # -- 4b. a LEVEL receiver (a floor, a ground): under a slanted
+        # light its own plane is the nearest depth within any reach, so
+        # the test above never passes. The height part answers it: where
+        # the receiver's plane agrees with the level plane through the
+        # same point over the whole of the tile's window (`al`: their
+        # largest disagreement there, as a depth; `rise`: that as a
+        # height), a blocker stands above that level less `rise`, and
+        # nothing within reach does
+        cand = np.nonzero(~lit_now)[0]
+        if cand.size and LEVEL_SKIP:
+            rr = pt.ts[cand] * grow * pt.amax[cand] + padp1
+            top = _reach_min(blk, lay, pt.u[cand], pt.v[cand], rr, 1)
+            pz = P[cand, 2]
+            win = f32(4.0) * rr + f32(1.0)
+            gu_c, gv_c = pt.gu[cand], pt.gv[cand]
+            if persp:
+                up = f32(face.origin[2]) - pz
+                den = -(np.maximum(up, f32(1e-12)) * k)
+                guh = s_ax[2] / den
+                gvh = u_ax[2] / den
+                al = (np.abs(gu_c - guh) + np.abs(gv_c - gvh)) * win
+                room = pt.dr[cand] - (np.abs(guh) + np.abs(gvh)) * win - al
+                ok = (up > f32(0.0)) & (room > f32(0.0))
+                rise = up * al / np.maximum(room, f32(1e-30))
+                eps = f32(4e-6) * (np.abs(pz) + up + f32(1.0) / pt.dr[cand]
+                                   + f32(1.0))
+            else:
+                down = -f32(_f_ax[2])
+                den = np.maximum(down, f32(1e-12)) * k
+                guh = f32(s_ax[2]) / den
+                gvh = f32(u_ax[2]) / den
+                al = (np.abs(gu_c - guh) + np.abs(gv_c - gvh)) * win
+                ok = np.full(cand.size, bool(down > 0.0))
+                rise = al * down
+                eps = f32(4e-6) * (np.abs(pz) + pt.dr[cand] + f32(1.0))
+            level = ok & (top >= eps + rise - pz)
+            lit_now[cand[level]] = True
+            if stats is not None:
+                stats['level'] = stats.get('level', 0) + int(level.sum())
+                asked += int(cand.size)
         if not SEARCH_SKIP:
             lit_now = np.zeros(m, bool)
         if stats is not None:
