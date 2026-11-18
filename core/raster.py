@@ -180,13 +180,21 @@ def jitter_at(ix, iy, key):
     sample per subpixel, from `film._hash_u32_raw` (the integer hash the
     grain already ships; the kernel's `hal_jit_hash` is its verbatim GLSL
     twin). Every step is exact in float32: (n + 0.5) * 2^-12 - 0.5 for
-    a 12-bit n, so a sample never sits on a cell edge."""
+    a 12-bit n, so a sample never sits on a cell edge.
+
+    The offsets come back in the indices' own (broadcast) shape: planes
+    for planes, a list for a list, and 0-d float32 for one pixel's pair
+    of scalars -- the hash below needs arrays, and its (1,) used to
+    leak out for a scalar pair, where `float(jx)` was a
+    DeprecationWarning from NumPy 1.25 and is a TypeError from 2.4."""
     from . import film as _film
     f32 = np.float32
+    ix = np.asarray(ix)
+    iy = np.asarray(iy)
+    shape = np.broadcast(ix, iy).shape
     # arrays, never scalars: NumPy warns on a wrapping scalar multiply
     # where the array road wraps silently (the hash's own arithmetic)
-    h = _film._hash_u32_raw(np.atleast_1d(np.asarray(ix)),
-                            np.atleast_1d(np.asarray(iy)), int(key))
+    h = _film._hash_u32_raw(np.atleast_1d(ix), np.atleast_1d(iy), int(key))
     jx = (h & np.uint32(0xfff)).astype(np.float32)
     jx = jx + f32(0.5)
     jx = jx * f32(0.000244140625)
@@ -195,7 +203,7 @@ def jitter_at(ix, iy, key):
     jy = jy + f32(0.5)
     jy = jy * f32(0.000244140625)
     jy = jy - f32(0.5)
-    return jx, jy
+    return jx.reshape(shape), jy.reshape(shape)
 
 
 def jitter_offsets(width, height, key):

@@ -681,7 +681,8 @@ def upload_cached(key, build, stamp=None):
 
 
 def upload(image):
-    """(H,W,4) float32 -> a GPUTexture, bottom row first as everywhere else."""
+    """(H,W,4) float32 -> an RGBA32F GPUTexture, bottom row first as
+    everywhere else; a 2D (H,W) float32 array -> an R32F one."""
     return _main('a texture upload', lambda: _upload_impl(image))
 
 
@@ -696,6 +697,27 @@ def _upload_impl(image):
     # objects release on the persistent timer and the draw tick instead.
     arr = np.ascontiguousarray(np.asarray(image, np.float32))
     h, w = arr.shape[:2]
+    if arr.ndim == 2:
+        # R254: a 2D array is ONE channel of data (the shadow pack: one
+        # depth per texel) and uploads as R32F -- a quarter of the VRAM
+        # and of the transfer the RGBA32F pack cost with three channels
+        # of zeros. A sampler2D reads it as (r, 0, 0, 1). A build that
+        # cannot create the format falls through to RGBA32F below with
+        # the same values in .r
+        flat = np.ascontiguousarray(arr.ravel())
+        try:
+            try:
+                buf = gpu.types.Buffer('FLOAT', flat.shape[0], flat)
+            except (TypeError, ValueError):
+                buf = gpu.types.Buffer('FLOAT', flat.shape[0], flat.tolist())
+            tex = gpu.types.GPUTexture((w, h), format='R32F', data=buf)
+            bury((flat, buf))
+            return tex
+        except Exception:                                       # noqa: BLE001
+            rgba = np.zeros((h, w, 4), np.float32)
+            rgba[:, :, 0] = arr
+            rgba[:, :, 3] = 1.0
+            arr = rgba
     if arr.shape[2] == 3:
         arr = np.concatenate([arr, np.ones((h, w, 1), np.float32)], axis=2)
     flat = np.ascontiguousarray(arr.ravel())
