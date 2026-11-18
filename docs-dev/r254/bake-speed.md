@@ -676,18 +676,29 @@ Where the map road is still slower than the traced road, and why:
   triangle fill); a traced viewport frame of 45,000 pixels costs 0.19 s.
   This is the reporter's sentence and on the CPU device it still holds
   for this gesture; the gap went from 2.1x-4.6x to 1.4x-2.6x.
-- **A 160x120 draft** in the headless table: POINT 512 0.11 s against 0.09 s traced (before 0.32 s); POINT 2048 0.14 s against 0.10 s traced (before 1.88 s); SPOT 512 0.10 s against 0.09 s traced (before 0.17 s); SPOT 2048 0.09 s against 0.11 s traced (before 1.12 s); SUN 512 0.07 s against 0.07 s traced (before 0.09 s); SUN 2048 0.08 s against 0.07 s traced (before 0.55 s). The draft's
-  maps are a quarter of the side and still a bake per nudge; a traced
-  draft of 19,200 pixels is nearly free.
+- **A 160x120 draft** in the headless table:
+  POINT 512 0.11 s against 0.09 s traced (before 0.32 s); POINT 2048 0.14 s
+  against 0.10 s traced (before 1.88 s); SPOT 512 0.10 s against 0.09 s
+  traced (before 0.17 s); SPOT 2048 0.09 s against 0.11 s traced (before
+  1.12 s); SUN 512 0.07 s against 0.07 s traced (before 0.09 s); SUN 2048
+  0.08 s against 0.07 s traced (before 0.55 s).
+  The draft's maps are a quarter of the side and still a bake per nudge;
+  a traced draft of 19,200 pixels is nearly free.
 - **The first frame an object moves** costs about two later ones, and at
-  2048 as much as the traced frame: POINT 2.02 s against 2.18 s traced (before 4.46 s); SPOT 1.30 s against 2.35 s traced (before 5.81 s); SUN 1.89 s against 1.68 s traced (before 1.17 s). It
-  bakes the layer of everything that did not move (a full bake's cost)
+  2048 as much as the traced frame:
+  POINT 2.02 s against 2.18 s traced (before 4.46 s); SPOT 1.30 s against
+  2.35 s traced (before 5.81 s); SUN 1.89 s against 1.68 s traced (before
+  1.17 s).
+  It bakes the layer of everything that did not move (a full bake's cost)
   and the moved layer; from the second step on the object alone is
   rasterised.
-- **The worker pool, a cold frame at 2048**: POINT 3.48 s against 1.45 s traced (before 14.81 s; in-process 1.64 s); SPOT 1.30 s against 1.49 s traced (before 7.59 s; in-process 1.29 s); SUN 1.56 s against 1.45 s traced (before 3.00 s; in-process 1.59 s). The parent's
-  bake (1.0 s) and 154 MB of maps crossing four pipes (1.1 s) are still
-  more than a traced pool frame; in-process the same cold frame is faster
-  than both. The maps would have to be shared, not copied (a mapped file
+- **The worker pool, a cold frame at 2048**:
+  POINT 3.48 s against 1.45 s traced (before 14.81 s; in-process 1.64 s);
+  SPOT 1.30 s against 1.49 s traced (before 7.59 s; in-process 1.29 s); SUN
+  1.56 s against 1.45 s traced (before 3.00 s; in-process 1.59 s).
+  The parent's bake (1.0 s) and 154 MB of maps crossing four pipes (1.1 s)
+  are still more than a traced pool frame for point lamps; in-process the
+  same cold frame is faster than both. The maps would have to be shared, not copied (a mapped file
   or shared memory, with the lifetime rules that needs on each platform):
   not done.
 - **A high-poly scene on a small map** (885,000 triangles, 512): a spot
@@ -823,8 +834,27 @@ function fails.
   referral budget; a blank face; `replay_depth` against the fill at every
   texel of three cube faces.
 
-Re-run on the final tree (`work/accept.sh`, logs in `logs/accept_final/`):
-@@ACCEPT_PENDING@@
+Re-run on the final tree (`work/accept.sh`, logs in `logs/accept_final/`,
+`logs/post_merge_*.log`, `logs/t_*.log`):
+test_r254_bake_speed 134 ok; test_r254_map_soft 168; test_r254_map_gpu 142;
+test_r254_flags 137; test_r254_falloff 154; test_r254_ray_road 211;
+test_r254_spot_beam 114; test_r254_native 222; test_r254_viewport 124;
+test_r254_world_light 188; test_r254_integration 26;
+test_r253_light_options 195; test_r253_generated_coords 122;
+test_r253_uniforms 72; test_r251_shadow 156 and the 1.89.0 zip pin;
+test_r251_raster 311 and the two named in the merge notes; in test_render,
+`test_high_poly_shadow_maps_build_in_parallel_and_exact`,
+`test_light_sizes_actually_work`, `test_worker_pool`,
+`test_deferred_shading_carries_the_shadows` and eight device tests
+(`test_the_device_switch_gates_every_gpu_entry`,
+`test_every_feature_survives_the_device_switch`,
+`test_device_choice_does_not_change_the_image`,
+`test_the_viewport_honors_the_device_switch`,
+`test_the_compute_rasteriser_is_fill`,
+`test_compute_wrappers_fetch_data_exactly`, `test_device_plan_falls_back`,
+`test_device_capability_table`): 0 failures; the strict GLSL gate: 'every
+shader compiles under strict GLSL 4.30 (528 distinct texts)'. The full
+suite was not run (the integrator's).
 
 ## Files
 
@@ -893,11 +923,16 @@ For the integrator:
   through and the two tests that pinned the old readers were rewritten:
   the volume march reads `frame_lights`, a Softness above one texel is a
   filter that keeps the shadow's mass).
-- Two failures of `tests/test_r254_flags.py` ('its passes bake the
-  ambient literal they always did and read no tail texel', 'and the
-  uploaded row is 2 x STRIDE texels') are on claude-cloud at dd9d034 as
-  they are here; `tests/test_r251_shadow.py` fails only the 1.89.0 zip
-  pin of the baseline list.
+- The branch ends on a merge of claude-cloud at f4e373e (three commits
+  of test pins and notes past dd9d034, the base of every measurement
+  here). Before it `tests/test_r254_flags.py` failed two checks on both
+  trees ('its passes bake the ambient literal they always did and read no
+  tail texel', 'and the uploaded row is 2 x STRIDE texels'); ea46eec
+  repaired those pins and the module is 137 of 137 here.
+  `tests/test_r251_shadow.py` fails only the 1.89.0 zip pin of the
+  baseline list. `tests/test_r251_raster.py test_w2_c127_jitter` raises a
+  TypeError ('only 0-dimensional arrays can be converted to Python
+  scalars') on dd9d034 as it does here; it is not in baseline_fails.txt.
 - Under the plain fake device (no compute door) the first GPU-device
   frame of a process prints one line, `[Halcyon GPU] shadow maps bake on
   the CPU this session: HAL_RASTER_DEPTH_RGBA32F: compute CreateInfo
