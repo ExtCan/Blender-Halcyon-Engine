@@ -2793,7 +2793,7 @@ def test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads():
     nodes_k, link_k, _pr = _wired_source('colour', rgb=(0.0, 0.0, 0.0))
     dark = _wired_cpu(_wired_out(nodes_k, link_k))
     gain = float(np.abs((lit - dark)[ball][:, :3] - np.array([0.9, 0.3, 0.1], f32)).max())
-    check('the wired colour is ADDED over the lit fallback surface: frame(colour) - frame(black) is the colour at every Ball pixel (1e-6)',
+    check('the wired colour is ADDED as light the surface gives off: frame(colour) - frame(black) is the colour at every Ball pixel (1e-6)',
           gain < 1e-6, str(gain))
     check('...and the alpha stays opaque', float(lit[ball][:, 3].min()) == 1.0 and float(lit[ball][:, 3].max()) == 1.0)
 
@@ -3627,8 +3627,8 @@ def test_emission_slot_routing_twins_an_emission_only_closure():
     """The frame pass emits ONE colour chain. When every lobe of the
     closure is an EMISSION -- a colour wired straight into Surface, an
     Emission node, a Mix or Add Shader of those -- that chain is the light
-    the surface gives off and nothing else: `closure_to_surface` leaves
-    the diffuse at the material's own constant, zeroes the specular level
+    the surface gives off and nothing else: no lobe feeds the diffuse or
+    the specular slot, so `closure_to_surface` hands back constants there
     and puts the weighted sum of colour x strength in `surf.emission`.
     The probe grants the EMISSION SLOT (`bake['__slot']`), the pass adds
     the chain where `light_surface` adds the emission and bakes the flat
@@ -3705,16 +3705,17 @@ def test_emission_slot_routing_twins_an_emission_only_closure():
     check('a bare Mix side SCALES the emission by its weight on the CPU (0.75 of it; a master lobe would be normalised back to full)',
           dim < 1e-6, str(dim))
 
-    # ---- the constants the pass bakes are the MATERIAL's own, not the engine's defaults
+    # ---- the constants the pass bakes are the CPU's own for THIS material, never the engine's defaults
+    plain_sim, plain_cpu = sim, cpu
     sc, st = _wired_scene(_wired_out(src, link))
     sc.materials[1].diffuse, sc.materials[1].diffuse_level = (0.25, 0.55, 0.2), 0.7
     sc.materials[1].specular, sc.materials[1].model = (0.2, 0.9, 0.4), 'LAMBERT'
     d, nbad, sim, cpu, _passes, why = _sim_vs_cpu(sc, st)
     check('a colour wired into the Surface of a material with its own fallback diffuse, level and model: the simulator frame is the CPU frame',
           _on_bar(d, nbad), str(why if d is None else (d, nbad)))
-    plain = _wired_cpu(_wired_out(src, link))
-    check('...and that fallback is in the picture (the CPU frame moved off the default material\'s by more than 0.1 on the Ball)',
-          float(np.abs(cpu - plain)[ball].max()) > 0.1, str(float(np.abs(cpu - plain)[ball].max())))
+    moved = float(np.abs((sim - plain_sim)[ball] - (cpu - plain_cpu)[ball][:, :3]).max()) if d is not None else None
+    check('...and the simulator\'s Ball moves with that material exactly as the CPU\'s does (whatever closure_to_surface makes of a '
+          'surface with no diffuse lobe, the pass bakes THAT), within 1e-5', moved is not None and moved < 1e-5, str(moved))
 
     # ---- the rates and the shadeless early return
     vn, vl, _pr = _wired_source('vector')
@@ -3739,6 +3740,18 @@ def test_emission_slot_routing_twins_an_emission_only_closure():
     d, nbad, _sim, _cpu, why = _wired_twin(_wired_out(vn, vl), force_model='CONSTANT')
     check('a vector wired into Surface under the CONSTANT model (diffuse x level + emission, no light): the simulator frame is the CPU frame',
           _on_bar(d, nbad), str(why if d is None else (d, nbad)))
+
+    # ---- beside an Ambient Only lamp: the light row's ambient tail (R254) is read by the routed pass like any other
+    from ..core.scene import Light
+    sc, st = _wired_scene(_wired_out(vn, vl))
+    amb = Light(type='POINT', name='Amb', position=(0.0, 0.0, 3.0), color=(0.4, 0.6, 1.0), energy=0.4, shadow='NONE')
+    amb.ambient_only = True
+    sc.lights = list(sc.lights) + [amb]
+    d, nbad, _sim, amb_cpu, _passes, why = _sim_vs_cpu(sc, st)
+    check('a vector wired into Surface in a frame with an Ambient Only lamp: the simulator frame is the CPU frame', _on_bar(d, nbad),
+          str(why if d is None else (d, nbad)))
+    check('...and the ambient lamp is in that frame (it moves the CPU picture by more than 0.1)',
+          float(np.abs(amb_cpu - _wired_cpu(_wired_out(vn, vl))).max()) > 0.1)
 
     # ---- an Image Texture straight into Surface (the quick look at a texture), nearest and through the mip footprint
     for label, kw in (('the scene\'s default filter', {}), ('TRILINEAR with mipmaps', {'tex_filter': 'TRILINEAR', 'tex_mipmap': True})):

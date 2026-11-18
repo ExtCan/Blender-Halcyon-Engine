@@ -2395,10 +2395,12 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   value or vector wired straight into Surface, an Emission node, a Mix or
   Add Shader of those -- refused the deferred plan by name and shaded on
   the CPU. *The route.* When EVERY lobe of the closure is an EMISSION,
-  `closure_to_surface` leaves the diffuse and the specular colour at the
-  material's own constants, zeroes the specular level and puts the
-  weighted sum of colour x Strength in `surf.emission` -- and that sum
-  is the one chain the emitter already writes for those nodes
+  no lobe feeds the diffuse or the specular slot: `closure_to_surface`
+  hands back constants there -- whatever it decides for a surface with
+  no diffuse and no glossy lobe, the probe bakes that and restates
+  nothing -- and puts the weighted sum of colour x Strength in
+  `surf.emission`. That sum is the one chain the emitter already writes
+  for those nodes
   (`e_emission`: colour x Strength; `e_mix_shader` and `e_add_shader`:
   the mix and the sum that `n_mix_shader` and `n_add_shader` hand on; a
   Reroute forwards). So `gpu/shade._probe_material` grants
@@ -2469,20 +2471,30 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   driver, none worse. *The strict gate* (`tests/glsl_strict.py`, glslang
   15.1.0) gained `check_emission_route`: ten graphs at three rates,
   shadows off and on -- 60 planned frames, 39 distinct texts, none
-  rejected, none refused (the gate's other 439 texts compile as before).
+  rejected, none refused (the whole gate on this tree: 559 distinct
+  texts, none rejected).
   *This changes where these pictures are made, not the pictures:* on the
   GPU device such a material fell back to the CPU's frame and now shades
   on the driver, within the deferred bar of that frame; the CPU device
-  is untouched. Pinned in
-  `test_emission_slot_routing_twins_an_emission_only_closure` (48
+  is untouched. *Whichever way the CPU fills that surface.* The route
+  restates nothing about a surface with no diffuse lobe: it bakes what
+  `closure_to_surface` hands the probe. Under the batch rule recorded in
+  the entry above that is the material's fallback diffuse, lit; under
+  the per-pixel rule that replaces it (white at level 0, no ambient
+  share -- applied over this tree from its branch before it landed) it
+  is no diffuse at all, and the route's test and the entry above's pass
+  unchanged on both, 50 and 47 checks. Pinned in
+  `test_emission_slot_routing_twins_an_emission_only_closure` (50
   checks): the four kinds of lone link; the non-vacuity and the pass's
   own two lines (the chain added to the total, the diffuse a constant);
   the Emission node with constant and with linked sockets, the Mix (a
   constant and a per-pixel Fac) and the Add Shader over emissions, an
   explicit lobe beside the implicit one, a bare side, a Reroute; a
-  material with its own fallback diffuse, level and model; the VERTEX
+  material with its own fallback diffuse, level and model (the
+  simulator moving with it exactly as the CPU does); the VERTEX
   and FACE rates, the three decal combines on both routes, the CONSTANT
-  model; an Image Texture, nearest and through the mip footprint; the
+  model; a frame with an Ambient Only lamp (the light row's ambient
+  tail); an Image Texture, nearest and through the mip footprint; the
   traced reflection; two routed materials sharing ONE source text (a
   colour change is a texel, not a recompile); what stays refused -- a
   Diffuse mixed with an Emission, at Fac 1 too, and the Max blend by its

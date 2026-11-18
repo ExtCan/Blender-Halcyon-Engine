@@ -5042,7 +5042,8 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     # THE EMISSION SLOT ROUTING (the probe grants it, bake['__slot']): the
     # closure is emission lobes and nothing else, so the one chain the
     # emitter writes is the light the surface gives off -- it rides the
-    # emission term below and the diffuse is the CPU's untouched constant
+    # emission term below and the diffuse is the constant the CPU gave
+    # that surface (the probe's bake)
     emission_slot = str(bake.get('__slot', '')) == 'emission'
     em.bare_shader_zero = emission_slot
     base = None
@@ -5938,10 +5939,10 @@ void main()
             f'    s.specular = {base};',
         ]
     elif emission_slot:
-        # the emission slot routing: closure_to_surface leaves BOTH
-        # colours at the material's own constants when no diffuse and no
-        # glossy lobe arrives (the specular LEVEL bakes as its zero); the
-        # chain is added as emission further down
+        # the emission slot routing: no diffuse and no glossy lobe
+        # arrives, so BOTH colours are the constants closure_to_surface
+        # gave the surface (the levels bake beside them); the chain is
+        # added as emission further down
         lines += [
             f'    s.diffuse = '
             f'{_mv3(consts, bake.get("diffuse", (0.8, 0.8, 0.8)))};',

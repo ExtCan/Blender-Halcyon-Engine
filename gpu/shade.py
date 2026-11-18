@@ -257,13 +257,15 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
             # THE EMISSION SLOT ROUTING: every lobe of the closure is an
             # EMISSION -- a colour wired straight into Surface (the
             # implicit one), an Emission node, a Mix / Add Shader of
-            # those. closure_to_surface then leaves the diffuse and the
-            # specular colour at the material's own constants, zeroes
-            # the specular level and puts the weighted sum of colour x
-            # strength in surf.emission -- which is exactly the ONE chain
-            # the emitter writes for those nodes. So the pass adds the
-            # chain where light_surface adds surf.emission and bakes the
-            # flat diffuse. STRUCTURAL on purpose (every lobe, whatever
+            # those. No lobe then feeds the diffuse or the specular
+            # slot: closure_to_surface hands back CONSTANTS there
+            # (whatever it decides for a surface with no diffuse and no
+            # glossy lobe -- the bake below reads it, never restates it)
+            # and puts the weighted sum of colour x strength in
+            # surf.emission -- which is exactly the ONE chain the
+            # emitter writes for those nodes. So the pass adds the chain
+            # where light_surface adds surf.emission and bakes the flat
+            # diffuse. STRUCTURAL on purpose (every lobe, whatever
             # its weight): a diffuse lobe a Fac mask zeroes at the
             # sixteen probed fragments is still a diffuse lobe elsewhere
             _stop = emission_route_block(mat.graph, ev.cache)
