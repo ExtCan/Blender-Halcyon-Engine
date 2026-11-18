@@ -66,6 +66,8 @@ def run_tests():
     from . import test_r254_native
     # R254: Ambient Only, light linking, flags in volumes and beams
     from . import test_r254_flags
+    # R254: Softness on a size-0 lamp, the atlas key, lamp edits as plan hits
+    from . import test_r254_map_gpu
     # R254: where the light packages meet (beam unit, scaled Area lamps)
     from . import test_r254_integration
     utf8_console()
@@ -266,6 +268,11 @@ def run_tests():
     print('R254 FLAGS (AMBIENT ONLY, LIGHT LINKING, FLAGS IN VOLUMES AND BEAMS)')
     print('=' * 66)
     rc |= test_r254_flags.main()
+    print()
+    print('=' * 66)
+    print('R254 MAP GPU (SOFTNESS AT SIZE 0, THE ATLAS KEY, EDITS AS PLAN HITS)')
+    print('=' * 66)
+    rc |= test_r254_map_gpu.main()
     print()
     print('=' * 66)
     print('R254 INTEGRATION (WHERE THE LIGHT PACKAGES MEET)')
