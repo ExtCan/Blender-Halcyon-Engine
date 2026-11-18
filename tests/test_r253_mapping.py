@@ -18,7 +18,8 @@ the transcendental modes), the refusals by name, the tables the census
 tests read, the frame-level twin on the demo scene (the deferred bar
 6e-3, no pixel > 1e-2), and default neutrality: the shipped Projector
 modes and the pre-existing featurematrix pictures are the pre-edit
-bytes.
+bytes -- the pictures per machine class, the class measured where the
+test runs (`machine_class`, FRAME_DIGESTS).
 
     python -m halcyon.tests.test_r253_mapping
 """
@@ -35,6 +36,7 @@ from .test_render import _ctx, _sk, _wnode, base_settings
 from .featurematrix import _one_bsdf_graph
 from . import featurematrix as FM
 from .test_r251_material_nodes import _master_ins, frame_bar, node_twin
+from .test_r253_kernels import _fused, _reference
 from ..core import mathx as M
 from ..core import nodeeval as NE
 from ..core import render as R
@@ -56,6 +58,10 @@ def check(name, cond, extra=''):
     if not ok:
         FAILS.append(name)
     return ok
+
+
+def note(text):
+    print(f'  note {text}')
 
 
 # ------------------------------------------------------------ the pins
@@ -125,28 +131,82 @@ OLD_GLSL_XY_DIGESTS = {
 OLD_TEX_IMAGE_FLAT = ('    vec3 _v1 = vec3(hal_uv, 0.0);\n'
                       '    vec4 _v2 = texture(hal_tex0, _v1.xy);')
 #: adler32 of the CPU picture (R.render, 96 x 72, transparency NONE) of
-#: three pre-existing featurematrix scenes on the pre-edit tree
-OLD_FRAME_DIGESTS = {'textured': 1656485521, 'demo': 1045851408,
-                     'mirror': 1324349618}
-#: ... and of the same three since the sky ray is `mathx.unproject_far`
-#: (the field round's kernel fix, tests/test_r253_kernels.py). The
-#: pre-edit bytes were computed where NumPy's matmul runs a FUSED
-#: `sgemm`, and that kernel's ray is in them: ten sky pixels of each
-#: frame sit one ulp (5.96e-08) off the float32 chain the sky pass
-#: states. With the ray put back as the matmul it was, the frames are
-#: still the pre-edit bytes above -- the test renders both -- so the
-#: ray is the whole difference.
+#: three pre-existing featurematrix scenes: the bitwise-neutral rule on
+#: whole frames. A frame's bytes are the bytes of ONE machine class,
+#: because two functions under the engine are not the same function on
+#: every machine:
 #:
-#: Both rows are the bytes of ONE machine class, as the pre-edit row
-#: always was: a fused BLAS kernel under NumPy's AVX-512 loops (measured
-#: equal on NumPy 1.26.4, 2.0.2, 2.3.5 and 2.5.3 over OpenBLAS's
-#: Haswell, Cooperlake and SkylakeX cores). The vertex transforms are
-#: matmuls too and `pow` / `atan2` are NumPy's SIMD loops, so an unfused
-#: kernel (Prescott, Nehalem, Sandybridge) renders 1539176161 /
-#: 928542048 / 2436496908 for textured / demo / mirror before AND after
-#: the fix, and a NumPy without the AVX-512 loops other bytes again.
-FRAME_DIGESTS = {'textured': 3858757274, 'demo': 3248123161,
-                 'mirror': 3526621371}
+#:   the float32 matmul  the vertex transforms are (N,4)x(4,4) products
+#:       that NumPy hands to BLAS `sgemm`. An unfused kernel rounds after
+#:       every operation; a Haswell-or-later one fuses the multiply-adds
+#:       and lands a vertex an ulp away.
+#:   float32 `np.power`  the shading's `safe_pow`. NumPy's AVX-512 loop
+#:       where it dispatches one; the C library's `powf` where it does
+#:       not (bitwise glibc's on all 8,192 lanes of the fingerprint), and
+#:       a fifth of those lanes differ between the two.
+#:
+#: Nothing else the three frames call tells the measured machines apart.
+#: Isolated: with NumPy's AVX-512 loops left on and `safe_pow` alone
+#: handed `powf` (twelve calls over the three frames), the frames ARE the
+#: bytes of the class without those loops, digest for digest. Traced,
+#: call by call: the frames never call `arctan2`; the camera's float64
+#: `tan` / `arctan` build the same matrices in all four classes; float32
+#: `sin` differs between the AVX2 and the SSE loops and reaches no pixel
+#: of them, so with AVX-512 off, AVX2 on or off is one class.
+#:
+#: So the pin is one row per class, and the key is MEASURED where the
+#: test runs (`machine_class`: adler32 of two fixed float32 matmuls,
+#: adler32 of `np.power` on fixed lanes) -- never a CPU name, a NumPy
+#: version or a feature flag. A scene's pair is (pre-edit, now):
+#:
+#:   pre-edit  what the pre-edit tree (claude-cloud b0cbe1c, the 1.91
+#:       code) renders in that class -- every row measured by running
+#:       THAT tree there -- and what this tree renders with the sky ray
+#:       put back as the matmul it was (the test renders both);
+#:   now       the frame since the sky ray is `mathx.unproject_far` (the
+#:       field round's kernel fix, tests/test_r253_kernels.py): ten sky
+#:       pixels one ulp (5.96e-08) onto the float32 chain where the
+#:       matmul is fused, the same bytes where it is the chain already.
+#:
+#: Measured in one cloud container (an AVX-512 Xeon, Linux, glibc 2.39),
+#: the kernel forced with OPENBLAS_CORETYPE and NumPy's dispatch
+#: narrowed with NPY_DISABLE_CPU_FEATURES: NumPy 1.26.4, 2.0.2, 2.2.6,
+#: 2.3.5 and 2.5.3 give the same key and the same frames within a class,
+#: on every kernel their OpenBLAS (0.3.23 to 0.3.34) runs there. The
+#: first row is the class the round was computed in (the pair that was
+#: OLD_FRAME_DIGESTS / FRAME_DIGESTS).
+#:
+#: A machine whose key is in no row FAILS by name and prints its row:
+#: the test cannot say there whether a picture moved, and says that
+#: instead of skipping. Not measured, and each expected to be a class of
+#: its own: another C library's `powf` (Windows, macOS, an older glibc),
+#: ARM, a NumPy on another BLAS or on none. Add a row only from a tree
+#: that passes in a class already listed -- that is what makes the bytes
+#: it prints a machine's and not a moved picture's.
+FRAME_MATMUL = {
+    0xC1C32195: 'fused (OpenBLAS Haswell, SkylakeX, Cooperlake)',
+    0xB34ECF20: 'the unfused chain (OpenBLAS Katmai, Prescott, Nehalem, '
+                'Sandybridge)',
+}
+FRAME_POWER = {
+    0x7F01125B: "NumPy's AVX-512 loop",
+    0x04FA130F: "the C library's powf (glibc 2.39)",
+}
+FRAME_SCENES = ('textured', 'demo', 'mirror')
+FRAME_DIGESTS = {
+    (0xC1C32195, 0x7F01125B): {'textured': (1656485521, 3858757274),
+                               'demo': (1045851408, 3248123161),
+                               'mirror': (1324349618, 3526621371)},
+    (0xB34ECF20, 0x7F01125B): {'textured': (1539176161, 1539176161),
+                               'demo': (928542048, 928542048),
+                               'mirror': (2436496908, 2436496908)},
+    (0xC1C32195, 0x04FA130F): {'textured': (3073177232, 981464729),
+                               'demo': (2462543119, 370830616),
+                               'mirror': (2741041329, 649328826)},
+    (0xB34ECF20, 0x04FA130F): {'textured': (2955867872, 2955867872),
+                               'demo': (2345233759, 2345233759),
+                               'mirror': (3853188619, 3853188619)},
+}
 
 LANE_N = 4096
 NEW_MODES = ('CUBE', 'EQUIRECT', 'MIRROR_BALL', 'ANGULAR', 'CYLINDER_CAP',
@@ -194,6 +254,61 @@ def lane_ctx(n=LANE_N, seed=253, screen=True):
         extra['vUV'] = np.stack([((c.px + 0.5) / W).astype(f32),
                                  ((c.py + 0.5) / H).astype(f32)], 1)
     return c, V, extra
+
+
+def _lane(n, salt):
+    """`n` float32 in [0, 1) that are the same operands on every
+    machine: a 32-bit integer hash of the index (integer arithmetic
+    alone), its top 24 bits over 2**24 -- one exact division. No RNG
+    stream and no rounding to trust."""
+    m = np.uint64(0xFFFFFFFF)
+    x = (np.arange(n, dtype=np.uint64)
+         + np.uint64(salt) * np.uint64(0x9E3779B9)) & m
+    for shift, mul in ((16, 0x7FEB352D), (15, 0x846CA68B)):
+        x ^= x >> np.uint64(shift)
+        x = (x * np.uint64(mul)) & m
+    x ^= x >> np.uint64(16)
+    return (x >> np.uint64(8)).astype(f32) / f32(16777216.0)
+
+
+def machine_class():
+    """This machine's class for a CPU frame's bytes, MEASURED: the key
+    FRAME_DIGESTS is read by, and the sky rows' matmul in words.
+
+    key[0]  adler32 of two float32 matmuls in the shapes the vertex and
+            normal transforms take -- (N,4) @ (4,4).T and (N,3) @
+            (3,3).T, every column general -- so whatever `sgemm` this
+            NumPy calls (or its own loop, without BLAS) is in it;
+    key[1]  adler32 of float32 `np.power`, the call `mathx.safe_pow`
+            makes, on two sets of lanes: a base in [0.25, 1) to an
+            exponent in [0, 32), and a base in [0.25, 4) to one in
+            [-4, 4). Every result is a normal float32 (2**-64 at the
+            least), so the key cannot turn on how a process treats
+            denormals.
+
+    The words are the kernel module's reading of the SAME kernel on the
+    sky's rows (two general products and two exact ones): 'the chain',
+    'the fused chain' or neither. They are printed and never keyed on --
+    the bytes are the key."""
+    n = LANE_N
+    cols = [_lane(n, s) * f32(4.0) - f32(2.0) for s in (1, 2, 3, 4)]
+    mat = (_lane(16, 5) * f32(4.0) - f32(2.0)).reshape(4, 4)
+    pts = np.stack(cols, axis=1)
+    mm = zlib.adler32((pts @ mat.T).tobytes())
+    mm = zlib.adler32((np.ascontiguousarray(pts[:, :3])
+                       @ np.ascontiguousarray(mat[:3, :3]).T).tobytes(), mm)
+    pw = zlib.adler32(np.power(_lane(n, 6) * f32(0.75) + f32(0.25),
+                               _lane(n, 7) * f32(32.0)).tobytes())
+    pw = zlib.adler32(np.power(_lane(n, 8) * f32(3.75) + f32(0.25),
+                               _lane(n, 9) * f32(8.0) - f32(4.0)).tobytes(),
+                      pw)
+    one = np.ones(n, f32)
+    sky = np.stack([cols[0], cols[1], one, one], axis=1) @ mat.T
+    ray = ('the chain' if np.array_equal(sky, _reference(cols[0], cols[1], mat))
+           else 'the fused chain'
+           if np.array_equal(sky, _fused(cols[0], cols[1], mat))
+           else 'neither the chain nor the fused chain')
+    return (mm, pw), ray
 
 
 def cpu_eval(node, lanes, ctx, out=0, images=None):
@@ -1245,7 +1360,9 @@ def test_mapping_frame_twin():
     under frame_bar (deferred bar 6e-3, no pixel > 1e-2); and the CPU
     picture of three pre-existing featurematrix scenes byte-identical to
     the pre-edit tree (the bitwise-neutral rule) once the sky ray is the
-    matmul that tree ran, and pinned as they render now."""
+    matmul that tree ran, and pinned as they render now -- against the
+    row of THIS machine's class (FRAME_DIGESTS has the account). A class
+    with no row fails by name and prints its row; it is never skipped."""
     st = base_settings(W, H, transparency='NONE')
     st.use_processes = False
     sc = demo_scene(st, with_texture=True)
@@ -1271,10 +1388,11 @@ def test_mapping_frame_twin():
     sc2.materials[1].graph = _ball_master(sc2, {'om': omap, 'pj': proj, 'im': img},
                                           ['im', 0])
     frame_bar('Object Projection -> Projector EQUIRECT -> Image Texture', sc2, st2)
-    # every pre-existing scene: the pre-edit bytes. The sky ray has moved
-    # since they were computed (FRAME_DIGESTS has the account), so each
-    # scene renders twice: with the ray as the matmul the pre-edit tree
-    # ran -- the pre-edit bytes, untouched -- and as it is
+    # every pre-existing scene: the pre-edit bytes of this machine's
+    # class. The sky ray has moved since they were computed (FRAME_DIGESTS
+    # has the account), so each scene renders twice: with the ray as the
+    # matmul the pre-edit tree ran -- the pre-edit bytes, untouched --
+    # and as it is
     def matmul_ray(nx, ny, inv):
         pts = np.stack([nx, ny, np.ones(nx.size, f32), np.ones(nx.size, f32)],
                        axis=1)
@@ -1286,21 +1404,52 @@ def test_mapping_frame_twin():
         return np.asarray(R.render(FM.SCENES[key](st3), st3))
 
     chain_ray = M.unproject_far
-    for key, want in OLD_FRAME_DIGESTS.items():
+    got, moved = {}, {}
+    for key in FRAME_SCENES:
         img3 = picture(key)
-        dig = zlib.adler32(np.ascontiguousarray(img3, f32).tobytes())
         M.unproject_far = matmul_ray
         try:
             img_old = picture(key)
         finally:
             M.unproject_far = chain_ray
-        dig_old = zlib.adler32(np.ascontiguousarray(img_old, f32).tobytes())
-        moved = int((img3 != img_old).any(axis=2).sum())
-        check(f"the '{key}' featurematrix scene renders the pre-edit bytes "
-              f'(adler32 {want}) with the sky ray as the matmul it was, and '
-              f'adler32 {FRAME_DIGESTS[key]} with the chain',
-              dig_old == want and dig == FRAME_DIGESTS[key],
-              f'{dig_old}, {dig}; {moved} px between them')
+        got[key] = (zlib.adler32(np.ascontiguousarray(img_old, f32).tobytes()),
+                    zlib.adler32(np.ascontiguousarray(img3, f32).tobytes()))
+        moved[key] = int((img3 != img_old).any(axis=2).sum())
+    cls, ray = machine_class()
+    row = ('    (0x%08X, 0x%08X): {' % cls
+           + ', '.join(f'{k!r}: {got[k]}' for k in FRAME_SCENES) + '},')
+    in_no_row = 'in no row of FRAME_DIGESTS'
+    note(f'this machine, measured: float32 matmul {cls[0]:#010x} -- '
+         f'{FRAME_MATMUL.get(cls[0], in_no_row)}; on the sky\'s rows it is '
+         f'{ray} -- and float32 pow {cls[1]:#010x} -- '
+         f'{FRAME_POWER.get(cls[1], in_no_row)}')
+    want = FRAME_DIGESTS.get(cls)
+    if want is None:
+        check("this machine's class has a row in FRAME_DIGESTS (a CPU "
+              "frame's bytes turn on the machine's float32 matmul and pow, "
+              'so the pre-edit bytes are pinned per class; with no row for '
+              'this one the test cannot say whether a pre-existing picture '
+              'moved here)', False,
+              f'({cls[0]:#010x}, {cls[1]:#010x}) is in no row')
+        note('the row to add, as (pre-edit, now) rendered here -- only from '
+             'a tree that passes this test in a class already listed, which '
+             "is what makes these bytes a machine's and not a moved "
+             "picture's:")
+        print(row)
+        return
+    for key in FRAME_SCENES:
+        check(f"the '{key}' featurematrix scene renders its machine class's "
+              f'pre-edit bytes (adler32 {want[key][0]}) with the sky ray as '
+              f'the matmul it was, and adler32 {want[key][1]} with the chain',
+              got[key] == want[key],
+              f'{got[key][0]}, {got[key][1]}; {moved[key]} px between them')
+    if any(got[key] != want[key] for key in FRAME_SCENES):
+        note('a class with a row, and its frames are not the row: a '
+             'pre-existing picture moved -- or this machine differs from '
+             'its class in something the fingerprint does not measure, and '
+             'this same tree passing in a class already listed is what '
+             'tells the two apart. As rendered here:')
+        print(row)
 
 
 def main():
