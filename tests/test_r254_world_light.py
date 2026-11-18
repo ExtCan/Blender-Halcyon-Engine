@@ -1016,11 +1016,20 @@ def test_j_wiring():
     check("the panel's icons are on the vetted list",
           icons and all(i in VERIFIED_ICONS for i in icons), str(icons))
     rsrc = inspect.getsource(R)
+    # R254 bake-speed: a third caller syncs it the same way -- the worker
+    # pool's parent bakes the frame's shadow maps before the upload
+    # (render.prebake_shadows, defined above render()), and the world's
+    # light is one of the lamps it bakes for. The order is read inside
+    # render() itself, from its own first line on
+    rnd = rsrc.index('\ndef render(')
     check('render() and the second shading entry both sync the world light '
-          'before collect_exclusive_lights reads the lamps',
+          'before collect_exclusive_lights reads the lamps (and the pool '
+          'parent\'s prebake_shadows before it bakes)',
           rsrc.count('_WL.sync(scene, lambda: prepare_textures(scene, st))')
-          == 2
-          and rsrc.index('_WL.sync(scene')
+          == 3
+          and 'def prebake_shadows(' in rsrc[:rnd]
+          and rsrc[:rnd].count('_WL.sync(scene') == 1
+          and rsrc.index('_WL.sync(scene', rnd)
           < rsrc.index('    collect_exclusive_lights(scene)\n    mesh = '))
     # the real export fast path: lamps only, then render re-lights
     export = importlib.import_module('halcyon.export')

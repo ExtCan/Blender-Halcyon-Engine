@@ -935,6 +935,35 @@ def test_e_a_viewport_draft_bakes_draft_sized_maps():
           and abs(m_draft - m_full) <= 0.05 * m_full,
           f'penumbra points {p_full} / {p_draft} / undivided {p_wrong}; '
           f'mass {m_full:.0f} / {m_draft:.0f}')
+    # the GPU plan: the map's size is structure, so a draft and a refine
+    # are two plans -- and a drag that alternates them re-plans neither
+    # (the plan cache keeps both; the Softness and the lamp's pose ride
+    # texels). Every hit carries the maps of its own frame
+    LI.clear_shadow_cache()
+    GSH._PLAN_CACHE.clear()
+    GSH.PLAN_STATS['hit'] = GSH.PLAN_STATS['miss'] = 0
+    sizes = []
+    for i in range(4):
+        sc.lights[0].position = (3.0 + 0.1 * i, -3.0, 5.0)
+        for s, (w, h) in ((draft, (48, 36)), (st, (96, 72))):
+            sc.settings = s
+            LI.build_shadow_maps(sc, s)
+            view, _p, vp, eye = R.camera_matrices(sc.camera, w, h)
+            g = CRg.GBuffer(w, h)
+            CRg.rasterize(sc.mesh.verts, sc.mesh.tris, vp, w, h, gbuf=g)
+            passes, why, atlases = GSH.plan_frame(
+                R.ShadeJob(sc, s, {}, None, view, eye, w, h), g)
+            pack = atlases['hal_shadowpack'][1]() if passes else None
+            sizes.append(None if pack is None else pack.shape)
+    sc.settings = st
+    check('a four-tick drag that alternates a draft (maps / 4) and a '
+          'refine builds two GPU plans and hits them six times; a draft\'s '
+          'pack is the draft\'s maps (a 64 cube, a 128 and a 64 map: 320 '
+          'rows of 192; the refine\'s 1088 of 768)',
+          GSH.PLAN_STATS['miss'] == 2 and GSH.PLAN_STATS['hit'] == 6
+          and sizes[0::2] == [(320, 192)] * 4
+          and sizes[1::2] == [(1088, 768)] * 4,
+          f'{GSH.PLAN_STATS} {sizes[:2]}')
     src = open(__file__.replace('tests/test_r254_bake_speed.py',
                                 'preview.py').replace(
         'tests\\test_r254_bake_speed.py', 'preview.py'),
