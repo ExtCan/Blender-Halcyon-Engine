@@ -1499,6 +1499,197 @@ there alone.
   landed on (`claude-cloud` 1e6239c), 12,939 checks pass where 12,863 did,
   and the failing lines that remain are the baseline's zip lines, byte for
   byte.
+- **The Coded Shader's matrices, writes through a variable index, array
+  fields and integer division.** Four more kinds of source went through
+  `shaders/compiler.try_compile` with error `None` and then failed, or
+  answered another number, in `prog.run` -- what was left after the name
+  check and the six above. Each was reproduced headless first
+  (`try_compile(src)`, then `prog.run({}, {}, 4)`) on `claude-cloud` at
+  `1e6239c`. (1) *A matrix is one array.* `mat3 m = mat3(1.0, 0.0, 0.0,
+  0.0, 2.0, 0.0, 0.0, 0.0, 3.0); Color = vec4(m[1], 1.0);` raised
+  `ValueError`. The interpreter held a matrix two ways. `rt.mat` (a
+  constructor) builds one (lanes, columns, rows) array -- the shape
+  `shaders/builtins.py` documents and every function in it takes -- while
+  `Interpreter.zero` (a declared `mat3 m;`) made a Python list of
+  columns, and `subscript` and `store` indexed whatever they were handed
+  as that list. A column read of a constructed matrix therefore indexed
+  the LANE axis: an error at four lanes, and at three, where the shapes
+  fit, lane 1's rows without a word (`[1, 0, 0]` for the `[0, 2, 0]`
+  asked for). `m[1][1]`, `m[1].xyz` and `m[0] = vec3(0.5)` failed the
+  same way, and a declared matrix with its columns written handed
+  `mat_mul_vec` a list (`AttributeError: 'list' object has no attribute
+  'shape'`). `mat3(...) * v` alone worked, the one road the tests walked.
+  The retired generator had it right (`np.zeros((1, C, R))`, `(m)[:, c]`,
+  `rt.col_set`); the interpreter that replaced it did not carry that
+  over. A matrix is the one array wherever it comes from: `zero` builds
+  it, `subscript` reads a column of it (`rt.col`; through a variable
+  index a column per lane, where it read column 0 for every lane) and
+  `store` writes a column into it (`rt.col_set`, the value converted as a
+  vector's is). With that a matrix also survives what it could not: being
+  returned from a function, written by an `out` parameter, held in a
+  struct or an array, or declared and then assigned whole -- each
+  selected the array against the list (`ValueError`). *`m.xyz` is a
+  compile error*, `line 4: 'xyz' of mat3: a matrix is indexed first
+  (m[0].xyz)`, where it raised `ValueError` when run (and `m.x` answered
+  column 0, typed float). `shaders/names.py` stepped around its swizzle
+  check for a matrix -- and for an array in the same condition, so `a.x`
+  of a `float a[3]` and `a.k` of an array of structs are refused with it
+  (a NumPy error and a `TypeError` when run). A loosely typed value is
+  left to the run, as everywhere. (2) *A write through a variable index.*
+  `float a[3]; for (int i = 0; i < 3; i++) { a[i] = float(i) * 0.25; }`
+  raised `ShaderError: dynamic array writes are not supported`; `vec3 v;
+  int i = 1; v[i] = 0.5;` and `mat3 m; int i = 1; m[i] = vec3(0.5);` the
+  matching messages. `store` read the index off the tree (`_const_int`: a
+  number written in the brackets and nothing else) where `subscript`
+  evaluates it and chooses per lane. `store` evaluates it too: the lanes
+  whose index is element j are the lanes element j is written for
+  (`Interpreter.indexed`), under the mask of the branch the write stands
+  in -- for an array's element, a vector's component and a matrix's
+  column, through any nesting (`a[i].y`, `a[i][j]`, `s.w[i]`, `m[c][r]`).
+  The index is clamped into range as the read's is, so what is written
+  through an index is what a read through it finds. *One read changed
+  with it.* A vector's per-lane read clamped an index below zero and not
+  one past the last component: there the lanes that DIFFERED read
+  component 0 while lanes that agreed read the last, so one index read
+  two components depending on its neighbours in the batch. It is clamped
+  at both ends, as an array's always was. (An index out of range is
+  undefined in the language, and no run in the suite moves by it: below.)
+  *An index is evaluated once.* A write through `a[i].y` reads `a[i]`,
+  changes it and writes it back, and `a[i] += x` reads before it writes:
+  each step names the element again, which cost nothing while the index
+  could only be a number. `Interpreter.hold` evaluates the indices a
+  target is reached through once and keeps the values in the node, so
+  `a[i++].y = x`, `a[i++].x += x`, `++a[i++].x` and an `out` argument
+  `f(i, a[i])` whose call moves `i` each name one element. *Two writes
+  stay refused, as they were*: a NUMBER written past the size (`a[3] = x`
+  of a `float a[3]` raised `IndexError`, and no driver compiles it:
+  `index 3 is out of range for float[3]`), and a variable index into what
+  holds no elements (`float f; f[i] = x`) -- which is what keeps an array
+  sized by a named constant from going wrong in silence, below. (3) *A
+  struct's array field.* `struct S2 { float w[3]; }; S2 s; s.w[1] = 0.5;
+  Color = vec4(s.w[1]);` raised `IndexError`. `Parser.parse_struct`
+  records each field as (type, name, array size) and nothing read the
+  third: `Interpreter.zero` built ONE float for `w`, and the name check
+  typed `s.w` float -- so `s.p[0].y` of a `vec3 p[2]` was refused at
+  compile time as `swizzle 'y' out of range for float`, a text every
+  driver compiles. `interp.field_type` is the field's type with its size,
+  and the five readers ask it: the value a declared struct starts with, a
+  field read, a field write, the constructor (`S(float[3](...), 2.0)`)
+  and the name check. (4) *Signed integer division.* `int a = 7; int b =
+  2; int c = a / b;` gave 3.5 and `-a / b` -3.5 with no error; `ivec2(7,
+  9) / 2` gave (3.5, 4.5) and `7 / 2 * 2` gave 7. `Interpreter.binary`
+  cut the quotient for `uint` alone. On the GPU road the same text is
+  inlined in the deferred pass and a driver answers 3, -3, (3, 4) and 6,
+  so the two roads disagreed on any Coded Shader that divides two ints.
+  The quotient of two ints is cut toward zero (`np.trunc`), a vector's
+  component by component and `/=` with it; a float on either side is a
+  float quotient as it was, and `uint` is as it was. *The cut is all that
+  changes.* The quotient is held as before -- NumPy's float64, exact for
+  any two 32-bit operands -- so one that had no fraction is the same
+  number in the same dtype and nothing computed from it moves by a bit.
+  (Held as an int32 it would: a float vector built from ints alone is
+  kept an int array, a looseness of the constructor's, and `vec2(n / 2, n
+  / 2) * 0.1 * 0.7` would run its two products in float64 and round the
+  other way. That shader is pinned.) A zero divisor answers what it did;
+  the language leaves it undefined. *What moves.* Asked before anything
+  was changed: the unchanged tree ran the whole suite with a recorder on
+  that one line of `binary` (on `1e6239c`, and again on `e228c85`, whose
+  numbers these are). 2835 division sites in 1328 distinct sources divide
+  two signed ints (86015 executions, 249 million live lanes, 214 million
+  of them with a fraction in the quotient, no negative operand, no zero
+  divisor in a live lane and 1.96 million in lanes outside the mask).
+  2833 of the sites are the engine's own and they are ONE idiom in 12
+  spellings -- the texel address of a data texture,
+  `texelFetch(hal_gb_attrs, ivec2(index % side, index / side), 0)`, over
+  `hal_gb_attrs`, `hal_gb_tris`, `hal_ink_fn`, `hal_sres`,
+  `hal_sss_tree`, `hal_triaux`, `hal_vlight` and `hal_vscreen`
+  (`gpu/gbuffer.py`, `gpu/ink.py`, `gpu/glsl_shading.py`,
+  `gpu/combine.py`, `gpu/material.py`); the other two are the shader
+  tests' own, with exact quotients. In every one the fractional quotient
+  went straight into an `ivec2`, whose constructor cut it, so the address
+  was already the right texel and is the same texel now: no engine pass
+  moves, held bit for bit below. (The cut now comes before the float32
+  that constructor passes through, where it came after. Measured on the
+  idiom alone, the old address is right for every index of a square
+  texture up to 4096 texels a side -- all 16.7 million of them -- and
+  puts the last texel of the last row in the next row at 4097; the new
+  one is exact. No run in the suite is that large.) What does move is a
+  user's Coded Shader that divides two ints with a remainder, on the CPU
+  road: `1 / 2` is 0 and `x / 255` of an `int x` is 0 below 255 -- the
+  value the deferred pass always gave it. Where the float quotient was
+  meant, a float is written: `1.0 / 2.0`, `float(x) / 255.0`. *Nothing
+  that compiled and ran is refused, and nothing else moved.* Held four
+  ways. The suite, `python3 -m halcyon.tests.run_all` on the unchanged
+  head and on the changed tree, the checks compared line by line: on
+  `claude-cloud` at `e228c85`, the tree this lands on, 13106 checks pass
+  and 32 FAIL lines are printed before (each the `halcyon-1.89.0.zip` no
+  fresh container has beside the package), 13172 pass and the same 32
+  lines are printed after, character for character and in the same order;
+  no check is lost and the 66 more are the new ones. On `1e6239c`, where
+  the four were reproduced, 12863 and 64 before (32 the zip, 32 the
+  bitwise twins a few 1e-7 off that `e228c85` has since put right), 12929
+  and the same 64 lines after. Every compile and every run the suite
+  makes, repeated by the unchanged front-end imported beside the changed
+  one, on the same uniforms and inputs: 3668 distinct sources through
+  `try_compile` (3152 compile in both to the same outputs, uniforms,
+  inputs and warnings, 504 are refused in both in the same words, and the
+  12 that differ are the new tests' own: 7 members of a matrix or an
+  array, 5 array fields) and 9900 runs of 2353 distinct programs. Outside
+  the four new tests every run returns the same arrays -- values, shapes
+  and dtypes -- and the same discard mask (one raises, the same error in
+  both): 9373 runs. The other 527 are the new tests' shaders, which
+  raised or answered otherwise before. 6000 seeded random shaders of what
+  ran before (every type, operator, constructor, swizzle, array, struct,
+  function and branch, 5760 of them dividing ints) were compiled and run
+  by the unchanged front-end and the changed one, and where the two
+  differed by the changed one with the cut switched off: all compile and
+  run in both, 1790 to the same bits and dtypes, and the other 4210
+  differ by the cut alone -- with it off they are the old values bit for
+  bit (1550 of the dividing shaders do not move at all: their quotients
+  are exact). 6000 more with what could not run mixed in (columns and
+  components of matrices, declared matrices, functions returning one,
+  writes through a variable index, array fields, indices that leave the
+  range): 4294 raised before and run, 251 were refused before and compile
+  (each the array field's `swizzle ... out of range for float`), 446 are
+  the same bits, 964 differ by the cut alone, 25 by the clamp of a vector
+  index past the end (with or without the cut: the old read restored,
+  they are the old values), 20 raise in both -- a number written past the
+  size, now by name -- and none is newly refused, newly raises or moves
+  for another reason. And 40 of 41 mutations of the fix each fail the
+  tests; the one that does not (the struct constructor converting to the
+  bare field type) changes nothing a shader can observe, since a
+  conversion passes an array of its own base through. What IS newly
+  refused is, by intent: a member of a matrix or an array wherever it is
+  written (it raised when a lane got there, or swizzled the lanes). What
+  changes value is, by intent: a quotient of two ints that has a
+  fraction, and a per-lane read of a vector past its last component.
+  *Seen and left* (each reproduced; none is one of the four): an array
+  sized by a named constant is one element -- `const int N = 3; float
+  a[N];` declares a float, because `Parser.parse_array_suffix` reads a
+  number and nothing else (`#define N 3` works); reads through any index
+  answer that one float, as they did, and a write past index 0 is refused
+  by name, as it raised. A compound assignment evaluates its right side
+  twice (`Interpreter.assign`): `x += float(i++)` leaves `i` at 2 and
+  adds 1. The value of an assignment through a swizzle or a vector
+  component is the vector as it was (`a.x = b.x = 1.0` gives `a.x` the
+  old `b.x`); through an element, a column or a field it is the value
+  written. A matrix times or divided by a scalar still raises (the six
+  above left it), and so does `m == m`. A `uniform mat3` on the node is a
+  float socket (`KIND_TO_SOCKET`), so the uniform arrives as a float and
+  every use of it fails -- unbound it is a zero matrix and works. A
+  number written past the size in a READ (`a[5]` of a `float a[3]`) is
+  clamped in silence where a driver refuses the text. `uint` division by
+  zero answers 0 with a NumPy cast warning, `int` division by zero the
+  dividend times 1e30. A float vector built from ints alone is held as an
+  int array and arithmetic on it runs in float64 -- why the quotient
+  keeps its dtype. Pinned in `tests/test_shaders.py` (four tests, 66
+  checks: each reported shader at 1, 2, 3, 4 and 7 lanes; a matrix made
+  18 ways by used 12 ways; the one shape of a declared and a constructed
+  matrix; per-lane writes into an array, a vector and a matrix under a
+  branch; 120 seeded programs of indexed reads and writes held lane by
+  lane against a plain Python run of the same program; the array field
+  built and typed; every pair of -12 .. 12 divided; the ends of the
+  32-bit range; the exact quotient that moves nothing).
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
@@ -1648,6 +1839,20 @@ there alone.
   it by name). A wrong argument count or two vector widths in a coded
   shader of a real file: the red line in the node, and the frame shading
   without that node's program rather than failing halfway.
+- The Coded Shader's matrices, indexed writes and integer division in a
+  live file (proven against the headless evaluator alone): a node whose
+  source declares a `mat3`, writes its columns in a loop and multiplies a
+  normal by it, shading an F12 frame on the CPU road; `m.xyz` drawing
+  `line N: 'xyz' of mat3: a matrix is indexed first (m[0].xyz)` in the
+  box under the Compile button. NOT run on a driver, and the claim that
+  matters most: a Coded Shader that divides two ints (`int cells = 7; ...
+  cells / 2`), inlined in the deferred pass on a real GPU, against the
+  CPU frame of the same file -- the cut toward zero is C's rule and the
+  one this front-end now follows, but no driver was asked here, and what
+  one answers for a NEGATIVE dividend is the case to look at. A matrix in
+  a coded shader never reached a driver either: a matrix uniform is
+  refused for the deferred pass by name, a local matrix is inlined as
+  written.
 - The release machine itself, where the zips are (the cloud-container
   fix was proven on the container's one Xeon, with the kernel varied by
   `OPENBLAS_CORETYPE` and the previous engine stood in for by this
