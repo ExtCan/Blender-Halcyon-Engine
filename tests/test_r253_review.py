@@ -2567,6 +2567,7 @@ def test_bump_fed_by_a_bump_builds_its_fields_in_dependency_order():
     SN = importlib.import_module('halcyon.nodes.shader_nodes')
     EX = importlib.import_module('halcyon.export')
     from ..core import nodeeval as NE
+    from ..core.scene import Material
     from ..gpu import shade as GSH
     big = (320, 240)                          # the floor outgrows one shading batch: the pre-pass runs
 
@@ -2631,19 +2632,51 @@ def test_bump_fed_by_a_bump_builds_its_fields_in_dependency_order():
             return _bump_fed(tree, fed, 'Bump B')
         return built_as(make)
 
-    # a height that reads a Bump THROUGH another Bump's Normal socket: C reads Bump.001, whose Normal takes B's
-    def threaded(tree):
-        second = _bump_chain(tree, normal=_bump_on_bump(tree).outputs['Normal'], tag='.001')
+    # a height that reads a Bump THROUGH another Bump: C reads Bump.001, whose Normal (or Strength) takes B's
+    def threaded(tree, via='Normal'):
+        normal = _bump_on_bump(tree).outputs['Normal']
+        second = _bump_chain(tree, normal=normal if via == 'Normal' else None, tag='.001')
+        if via != 'Normal':
+            tree.links.new(_bump_lean(tree, normal, '.002'), second.inputs[via])
         return _bump_fed(tree, _bump_lean(tree, second.outputs['Normal'], '.001'), 'Bump C')
+
+    # what a link can pass through on its way from A's Normal to B's Height: a Reroute and a muted node, a
+    # group that hands its input straight out, both; and a diamond (B and C both on A, D on both)
+    def wired(kind):
+        def make(tree):
+            normal = _bump_chain(tree).outputs['Normal']
+            if kind in ('hops', 'both'):
+                hop = _code_plain(tree, 'Reroute', 'NodeReroute', ins=(('NodeSocketVector', 'Input'),),
+                                  outs=(('NodeSocketVector', 'Output'),))
+                off = _code_plain(tree, 'Muted', 'ShaderNodeVectorMath', ins=(('NodeSocketVector', 'Vector'),) * 2,
+                                  outs=(('NodeSocketVector', 'Vector'),), operation='ADD', mute=True)
+                tree.links.new(normal, hop.inputs[0])
+                tree.links.new(hop.outputs[0], off.inputs[0])
+                normal = off.outputs[0]
+            if kind in ('through', 'both'):
+                ins = (('NodeSocketVector', 'Normal'),)
+                normal = _bump_group(tree, 'Through', _bump_tree_of(lambda t, gin: gin, ins), ins,
+                                     Normal=normal).outputs['Normal']
+            if kind == 'diamond':
+                left = _bump_fed(tree, _bump_lean(tree, normal), 'Bump B')
+                right = _bump_fed(tree, _bump_lean(tree, normal, '.001'), 'Bump C')
+                both = _code_plain(tree, 'Sum', 'ShaderNodeMath', ins=(('NodeSocketFloat', 'Value'),) * 2,
+                                   outs=(('NodeSocketFloat', 'Value'),), operation='ADD', use_clamp=False)
+                tree.links.new(_bump_lean(tree, left.outputs['Normal'], '.002'), both.inputs[0])
+                tree.links.new(_bump_lean(tree, right.outputs['Normal'], '.003'), both.inputs[1])
+                return _bump_fed(tree, both.outputs['Value'], 'Bump D')
+            return _bump_fed(tree, _bump_lean(tree, normal), 'Bump B')
+        return built_as(make)
 
     def graph_of(mat):
         return EX.serialize_tree(mat.node_tree, {}, {}, [])
 
-    def frame(mat, size=big, glass=False, band=None, device='CPU', floors=(), **settings):
+    def frame(mat, size=big, glass=False, band=None, device='CPU', floors=(), ball=False, **settings):
         """(frame, printed) of the demo floor wearing `mat`'s export:
         `glass` as test_group_bump_gathers_from_a_whole_material_field's,
-        `floors` in place of the floor plane (_bump_floors), `settings`
-        set on the render settings."""
+        `floors` in place of the floor plane (_bump_floors), `ball` the
+        demo ball wearing the same export as a second material,
+        `settings` set on the render settings."""
         if glass:
             mat.node_tree.nodes.get('Halcyon').inputs['Opacity'].default_value = 0.6
         images, programs, warnings = {}, {}, []
@@ -2652,6 +2685,9 @@ def test_bump_fed_by_a_bump_builds_its_fields_in_dependency_order():
         sc.materials[0].has_alpha = glass
         if floors:
             _bump_floors(sc, *floors)
+        if ball:
+            sc.materials[1] = Material(name='Coded Ball', index=1, graph=graph)
+            sc.materials[1].programs, sc.materials[1].has_alpha = programs, glass
         st.render_device = device
         for key, value in settings.items():
             setattr(st, key, value)
@@ -2702,6 +2738,17 @@ def test_bump_fed_by_a_bump_builds_its_fields_in_dependency_order():
           'Normal takes B\'s, so C -- fed by Bump.001\'s normal -- comes after B, on the third',
           levels(graph_of(built_as(threaded))) == [['Bump', 'Bump.001'], ['Bump B'], ['Bump C']],
           str(levels(graph_of(built_as(threaded)))))
+    check('...and the same through its Strength or its Distance: every socket of a met Bump but its Height is read',
+          all(levels(graph_of(built_as(lambda tree: threaded(tree, via)))) == [['Bump', 'Bump.001'], ['Bump B'], ['Bump C']]
+              for via in ('Strength', 'Distance')),
+          str(levels(graph_of(built_as(lambda tree: threaded(tree, 'Strength'))))))
+    check('the link is followed through whatever passes it on: a Reroute and a muted node, a group that hands its '
+          'input straight to its output (in by the group\'s output socket, out by its input), both in a row',
+          all(levels(graph_of(wired(kind))) == [['Bump'], ['Bump B']] for kind in ('hops', 'through', 'both')),
+          str([levels(graph_of(wired(kind))) for kind in ('hops', 'through', 'both')]))
+    check('a diamond -- B and C each on A\'s normal, D on both -- is three levels: a level is the LONGEST way down',
+          levels(graph_of(wired('diamond'))) == [['Bump'], ['Bump B', 'Bump C'], ['Bump D']],
+          str(levels(graph_of(wired('diamond')))))
     sugar = graph_of(built_as(lambda tree: _bump_lean(tree, _bump_chain(tree).outputs['Normal']), height=True))
     check('the master\'s own Bump Height fed by a Bump\'s normal: the Bump it desugars to is the second level',
           levels(NE.desugar_master_bump(sugar)) == [['Bump'], ['__bump_Halcyon']], str(levels(sugar)))
@@ -2760,6 +2807,15 @@ def test_bump_fed_by_a_bump_builds_its_fields_in_dependency_order():
             col[sel] = job.shade(tri[sel], bary[sel], px[sel], py[sel], front[sel] if front is not None else None, None)
         return col
 
+    def planted(job, tri, bary, px, py, front, rank, st):
+        """spy_layers, with a stale field (a constant 7) filed first under
+        the upstream Bump's key for both materials: what an opaque pass
+        of the same material would have left behind."""
+        stale = np.full((job.height, job.width), 7.0, np.float32)
+        for mi in (0, 1):
+            job.bump_fields[(mi, 'Bump')] = (stale, stale)
+        return spy_layers(job, tri, bary, px, py, front, rank, st)
+
     def spy_chunked(job, *args, **kw):
         gathered.append(sorted(key[1] for key in job.bump_fields))
         return real_chunked(job, *args, **kw)
@@ -2813,6 +2869,19 @@ def test_bump_fed_by_a_bump_builds_its_fields_in_dependency_order():
               'field in reach) A differences each chunk and the frame is cut along the chunk boundary -- a few rows, '
               'more than 0.1 off', passes() == [1.0] and built[0]['fallbacks'] == built[0]['chunks'] and off > 0.1
               and 1 <= len(rows) <= 4, f'{built} {off} {rows}')
+        R.MIN_CHUNK = 4096
+        finer = shot(top())
+        finer_runs = list(built)
+        R.MIN_CHUNK, R.MAX_CHUNK = keep_chunks
+        check('whatever the chunking: with MIN_CHUNK lowered the pre-pass takes more, smaller chunks -- two passes '
+              'still, the same frame', [run['ids'] for run in finer_runs] == [['Bump', 'Bump B']]
+              and finer_runs[0]['chunks'] >= 3 and finer_runs[0]['contexts'] == 2 * finer_runs[0]['chunks']
+              and finer_runs[0]['fallbacks'] == 0 and same(finer, whole), f'{finer_runs} {rows_off(finer, whole)}')
+        routed = shot(wired('both'))
+        check('A\'s normal through a Reroute, a muted node and a pass-through group before B reads it: two passes, no '
+              'chunk differenced, and the plain probe\'s one-batch frame bit for bit',
+              ids() == [['Bump', 'Bump B']] and passes() == [2.0] and built[0]['fallbacks'] == 0
+              and same(routed, whole), f'{built} {rows_off(routed, whole)}')
         small = shot(top(), size=(128, 96))
         small_ids = ids()
         check('at 128x96 the floor fits one batch: no pre-pass runs, as none ever did, and the probe inside a group '
@@ -2890,6 +2959,19 @@ def test_bump_fed_by_a_bump_builds_its_fields_in_dependency_order():
         check('the same probe inside a group on that road: the fields under the path ids, the same frame bit for '
               'bit', ids() == [['Group/Bump B', 'Group/Bump C']] * 2 and same(glass_grouped, glass_whole),
               f'{ids()} {rows_off(glass_grouped, glass_whole)[0]}')
+        R._shade_fragments_cpu = whole_ranks
+        pair_whole = shot(top(3), glass=True, ball=True)
+        R._shade_fragments_cpu = planted
+        R.MAX_CHUNK = 3000
+        pair = shot(top(3), glass=True, ball=True)
+        R.MIN_CHUNK, R.MAX_CHUNK = keep_chunks
+        R._shade_fragments_cpu = spy_layers
+        check('TWO see-through materials wearing the probe (the floor, and the ball\'s front and back faces): three '
+              'ranks of mixed materials, each material\'s upper levels built per rank; with a stale field planted '
+              'under the upstream Bump\'s key and the heights in small chunks, still each rank shaded whole, bit for bit',
+              layered == [[0, 1, 2]] and len(built) >= 4 and all(run['first'] == 1 and run['fallbacks'] == 0
+                                                                 and run['ids'] == ['Bump B', 'Bump C'] for run in built)
+              and same(pair, pair_whole), f'{layered} {built} {rows_off(pair, pair_whole)[0]}')
         NE.bump_levels = one_pass
         glass_cut = shot(top(3), glass=True, floors=sheets)
         NE.bump_levels = real_levels

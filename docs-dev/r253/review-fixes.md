@@ -1607,7 +1607,7 @@ Shader's name resolution is pinned in `tests/test_shaders.py` as well.
   are identical bit for bit, opaque, see-through, in three bands and in
   a region, and their pre-passes build the same number of contexts.
   Pinned in
-  `test_bump_fed_by_a_bump_builds_its_fields_in_dependency_order` (33
+  `test_bump_fed_by_a_bump_builds_its_fields_in_dependency_order` (39
   checks), through the real `serialize_tree`, with a spy on the pre-pass
   that says for every frame whether it ran, for which ids, how many
   times it evaluated the material, and whether any Bump differenced a
@@ -1615,30 +1615,38 @@ Shader's name resolution is pinned in `tests/test_shaders.py` as well.
   and three levels, the four group arrangements under their path ids, a
   Normal-chained pair and a stack of three groups as ONE level, a group
   with a second output no Bump feeds, a Bump read THROUGH another Bump's
-  Normal socket, the master's desugared Bump Height, a loop of heights
-  cut rather than walked for ever); the probe at 320x240 in two passes
-  with no chunk differenced, bit for bit the one-batch frame; the old
+  Normal socket and through its Strength or Distance, a link that passes
+  a Reroute, a muted node and a group handing its input straight out, a
+  diamond, the master's desugared Bump Height, a loop of heights cut
+  rather than walked for ever); the probe at 320x240 in two passes with
+  no chunk differenced, bit for bit the one-batch frame; the old
   pre-pass put back (every Bump in one level) cutting a few rows by more
-  than 0.1, so the frames can tell; 128x96 and 640x480; the four group
-  arrangements against the top-level one-batch frame; three levels; four
-  Bumps on three; the stack of groups in one pass; the three-level probe
-  see-through in two layers, its heights in more than one chunk, against
-  each rank shaded in ONE batch with no field at all, and the same
-  inside a group; three bands and a region of a floor of small
-  triangles against the whole frame; the GPU device on the stand-in
-  driver (the probe refused by name and the CPU's pre-passed frame bit
-  for bit; a group's Bump drawn by the deferred pass and a refine pass's
-  flagged pixels bit for bit the whole frame's); and the rule read from
-  the code (one order behind every road, one difference). Each road has
-  its own "can tell" check with the levels flattened. Thirteen mutations
+  than 0.1, so the frames can tell; a finer chunking (`MIN_CHUNK`
+  lowered); the link through the Reroute, the muted node and the
+  pass-through group, bit for bit the plain probe's frame; 128x96 and
+  640x480; the four group arrangements against the top-level one-batch
+  frame; three levels; four Bumps on three; the stack of groups in one
+  pass; the three-level probe see-through in two layers, its heights in
+  more than one chunk, against each rank shaded in ONE batch with no
+  field at all, the same inside a group, and two see-through MATERIALS
+  wearing it (the floor and the ball: three ranks of mixed materials)
+  with a stale field planted under the upstream Bump's key; three bands
+  and a region of a floor of small triangles against the whole frame;
+  the GPU device on the stand-in driver (the probe refused by name and
+  the CPU's pre-passed frame bit for bit; a group's Bump drawn by the
+  deferred pass and a refine pass's flagged pixels bit for bit the whole
+  frame's); and the rule read from the code (one order behind every
+  road, one difference). Each road has
+  its own "can tell" check with the levels flattened. Fourteen mutations
   each fail it: the builder back to one pass; a level evaluated without
   the earlier fields in reach; every level evaluating every Bump; the
   levels in reverse; the band's context back to one row; the region's
   ring back to one pixel; the height image's mask back to one ring; the
   layered road evaluating every level across the ranks, or starting its
   per-rank builder a level late; the walk never crossing a group
-  boundary; a met Bump ending the walk; a Group Input, or a group node's
-  output, read by node instead of by socket. *Seen from the same probes
+  boundary; a met Bump ending the walk, or passing on its Normal alone;
+  a Group Input, or a group node's output, read by node instead of by
+  socket. *Seen from the same probes
   and left*: `core/render._promote_clip` evaluates a punch-through
   material's alpha chain `MAX_CHUNK` fragments at a time with no field
   in reach, so an alpha that reads a Bump's normal differences that
