@@ -90,8 +90,8 @@ def shadow_function(i, meta, mb=None):
     sz, sz1 = _lit(size), _lit(size - 1)
     fetch = 'texelFetch(hal_shadowpack, ivec2(int({}), int({})), 0).r'
     tx = mb is not None
-    # the reach pyramid: one block per face, side by side under the
-    # lamp's depth cells
+    # the reach pyramid: one block per face, on the faces' own grid
+    # under the lamp's depth cells
     lay = SM.pyr_layout(size)
     pyr_y = voff + size * int(meta['grid'][1])
 
@@ -221,12 +221,12 @@ def shadow_function(i, meta, mb=None):
 
     # one cell of the reach pyramid, at the level whose tile is the
     # first at least r wide (`softmap._reach_min`; a tile's width is a
-    # power of two, so the division is exact on both roads). `part` is
-    # the row its part of the block starts at: the nearest depths, or
-    # the heights under them
+    # power of two, so the division is exact on both roads). (pbx, pby)
+    # is where its part of the face's block starts: the nearest depths,
+    # or the heights beside them
     t0, n0, ox0, oy0 = lay['levels'][0]
     L += [f'float hal_sm_cell{i}(float u, float v, float r, float pbx, '
-          'float part)',
+          'float pby)',
           '{',
           f'    float T = {_f(float(t0))}; float ox = {_f(float(ox0))}; '
           f'float oy = {_f(float(oy0))}; float n1 = {_f(float(n0 - 1))};']
@@ -237,15 +237,14 @@ def shadow_function(i, meta, mb=None):
                  f'n1 = {_f(float(n1_ - 1))}; }}')
     L += ['    float x = clamp(floor((u + 1.0) / T), 0.0, n1);',
           '    float y = clamp(floor((v + 1.0) / T), 0.0, n1);',
-          '    return ' + fetch.format('pbx + ox + x', 'part + oy + y')
+          '    return ' + fetch.format('pbx + ox + x', 'pby + oy + y')
           + ';',
           '}']
     # the nearest depth within r texels of (u, v)
-    L += [f'float hal_sm_near{i}(float u, float v, float r, float pbx'
-          + (', float dlow)' if cube else ')'),
+    L += [f'float hal_sm_near{i}(float u, float v, float r, float pbx, '
+          'float pby' + (', float dlow)' if cube else ')'),
           '{',
-          f'    float q = hal_sm_cell{i}(u, v, r, pbx, '
-          f'{_f(float(pyr_y))});']
+          f'    float q = hal_sm_cell{i}(u, v, r, pbx, pby);']
     if cube:
         # the whole cube's nearest depth bounds a tap too, divided by
         # no more than the tap's distance from the face's centre in
@@ -402,7 +401,7 @@ def shadow_function(i, meta, mb=None):
               '    float clipx = 0.0; float clipy = 0.0;',
               '    float clipz = 0.0; float clipw = 1.0;',
               '    float cellx = 0.0; float celly = 0.0;',
-              '    float pbx = 0.0;']
+              '    float pbx = 0.0; float pby = 0.0;']
         for fi, fc in enumerate(faces):
             L += [f'    if (face == {fi}) {{',
                   f'        clipx = dot(ph, {x_row(fi, 0)});',
@@ -411,7 +410,9 @@ def shadow_function(i, meta, mb=None):
                   f'        clipw = dot(ph, {x_row(fi, 3)});',
                   f'        cellx = {_f((fi % grid_w) * size)};',
                   f'        celly = {_f((fi // grid_w) * size + voff)};',
-                  f'        pbx = {_f(float(fi * lay["w"]))};'] + \
+                  f'        pbx = {_f(float((fi % grid_w) * lay["w"]))};',
+                  f'        pby = '
+                  f'{_f(float(pyr_y + (fi // grid_w) * lay["h"]))};'] + \
                  ['        ' + s for s in face_consts(fi)] + ['    }']
     else:
         L += [f'    float clipx = dot(ph, {x_row(0, 0)});',
@@ -419,7 +420,7 @@ def shadow_function(i, meta, mb=None):
               f'    float clipz = dot(ph, {x_row(0, 2)});',
               f'    float clipw = dot(ph, {x_row(0, 3)});',
               f'    float cellx = 0.0; float celly = {_f(voff)};',
-              '    float pbx = 0.0;'] + \
+              f'    float pbx = 0.0; float pby = {_f(float(pyr_y))};'] + \
              ['    ' + s for s in face_consts(0)]
     eps = 1e-6
     L += [f'    float w = abs(clipw) < {_f(eps)} ? {_f(eps)} : clipw;',
@@ -486,7 +487,7 @@ def shadow_function(i, meta, mb=None):
         L.append(f'    float padp = {_lit(np.float32(np.float32(soft + SM.SEARCH_PAD) + np.float32(1.0)))};')
     t_of = ('min(max(1.0 / max(near, 1e-9) - dr, 0.0), capt)' if persp
             else 'min(max(dr - near, 0.0), capt)')
-    near_x = ', dlow' if cube else ''
+    near_x = ', pby, dlow' if cube else ', pby'
     if cube:
         dm = f'hal_ltex({mb + 4}).x' if tx else \
             _lit(np.float32(float(sp['d_min'])))
@@ -514,8 +515,8 @@ def shadow_function(i, meta, mb=None):
     # point over the tile's window (al), that as a height (rise)
     L += ['    if (near < lim) {',
           f'    float rr = ts * {grow} * amax + padp;',
-          f'    float top = hal_sm_cell{i}(u, v, rr, pbx, '
-          f'{_f(float(pyr_y + lay["part"]))});',
+          f'    float top = hal_sm_cell{i}(u, v, rr, '
+          f'pbx + {_f(float(lay["part"]))}, pby);',
           '    float pz = ph.z;',
           '    float win = 4.0 * rr + 1.0;']
     if persp:

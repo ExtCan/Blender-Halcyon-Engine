@@ -455,8 +455,10 @@ def pyr_layout(size):
     left of the block and the coarser ones stack in a column beside it
     (a mip chain's layout); the last level is one tile. Pure structure:
     both roads and the GPU pack read it. The block holds the levels
-    twice, the second copy `part` rows under the first: the nearest
-    DEPTH around each tile, then the greatest HEIGHT (`_build_pyramid`).
+    twice, the second copy `part` columns to the right of the first:
+    the nearest DEPTH around each tile, then the greatest HEIGHT
+    (`_build_pyramid`). A lamp's blocks sit in the depth pack on the
+    map's own grid of faces, under its depth cells (gpu/shade).
 
     Tile x of a level covers the texels x T - 1 .. (x + 1) T - 2: the
     grid stands ONE TEXEL off the map's own, so the middle of a map and
@@ -476,11 +478,11 @@ def pyr_layout(size):
             y += n
         _TABLES[key] = {
             'levels': levels,
-            'w': n0 + (levels[1][1] if len(levels) > 1 else 0),
-            # the block is two parts of `part` rows, one under the
-            # other: the nearest depths, then the heights
-            'part': max(n0, y),
-            'h': 2 * max(n0, y),
+            # the block is two parts side by side, each `part` columns
+            # wide: the nearest depths, then the heights
+            'part': n0 + (levels[1][1] if len(levels) > 1 else 0),
+            'w': 2 * (n0 + (levels[1][1] if len(levels) > 1 else 0)),
+            'h': max(n0, y),
             # the per-level columns the CPU gathers through
             'n1': np.array([lv[1] - 1 for lv in levels], np.float32),
             'ox': np.array([lv[2] for lv in levels], np.int32),
@@ -673,20 +675,38 @@ def _neg_heights(face):
     stores, float32, never above the exact value (so the height is never
     under-stated): what the height part of the pyramid pools. A texel's
     point stands on the ray through its centre at its stored depth, the
-    point the lookup's plane compare is made at."""
+    point the lookup's plane compare is made at. In float32 and in
+    place, three passes over the map (a 2048 face is four million
+    texels): the few roundings are covered by a slack of a millionth of
+    the largest term."""
     size = int(face.size)
     s, u, f = (np.asarray(a, np.float64) for a in face_axes(face))
     c = ((np.arange(size, dtype=np.float64) + 0.5) * (2.0 / size) - 1.0) \
         * float(face.extent)
-    depth = np.asarray(face.depth, np.float64)
+    depth = np.asarray(face.depth, np.float32)
     oz = float(face.origin[2])
+    far = float(np.abs(depth).max()) if depth.size else 0.0
+    reach = float(np.abs(c).max()) if size else 0.0
+    # minus z = depth (-(x s + y u + f).z) - oz for a perspective face,
+    # depth (-f.z) - (x s + y u).z - oz for a parallel one
+    row = (-(c * s[2])).astype(np.float32)[None, :]
     if face.persp:
-        z = oz + depth * (c[None, :] * s[2] + c[:, None] * u[2] + f[2])
+        col = (-(c * u[2] + f[2])).astype(np.float32)[:, None]
+        neg = row + col
+        np.multiply(neg, depth, out=neg)
+        big = far * (reach * (abs(s[2]) + abs(u[2])) + abs(f[2])) + abs(oz)
     else:
-        z = oz + c[None, :] * s[2] + c[:, None] * u[2] + depth * f[2]
-    z = -z
-    neg = z.astype(np.float32)
-    return np.where(neg > z, np.nextafter(neg, f32(-np.inf)), neg)
+        col = (-(c * u[2])).astype(np.float32)[:, None]
+        neg = depth * f32(-f[2])
+        np.add(neg, row + col, out=neg)
+        big = far * abs(f[2]) + reach * (abs(s[2]) + abs(u[2])) + abs(oz)
+    # the origin's height and the slack in one pass: the float32 sum of
+    # the two constants is rounded up, so the slack is never lost
+    off = f32(oz + big * 1e-6)
+    if float(off) < oz + big * 1e-6:
+        off = np.nextafter(off, f32(np.inf))
+    np.subtract(neg, off, out=neg)
+    return neg
 
 
 def _build_pyramid(sm):
@@ -759,7 +779,7 @@ def _build_pyramid(sm):
         e[:, 1:n + 1, 1:n + 1] = high
         if cube:
             edge_tiles(e, t, n, unknown)
-        blocks[:, part + oy:part + oy + n, ox:ox + n] = _dilate3(e)
+        blocks[:, oy:oy + n, part + ox:part + ox + n] = _dilate3(e)
     return list(blocks)
 
 
@@ -790,8 +810,8 @@ def _reach_min(block, lay, u, v, r, part=0):
     n1 = lay['n1'][li]
     x = np.clip(np.floor(np.ldexp(u + f32(1.0), sh)), f32(0.0), n1)
     y = np.clip(np.floor(np.ldexp(v + f32(1.0), sh)), f32(0.0), n1)
-    return block[part * lay['part'] + lay['oy'][li] + y.astype(np.int32),
-                 lay['ox'][li] + x.astype(np.int32)]
+    return block[lay['oy'][li] + y.astype(np.int32),
+                 part * lay['part'] + lay['ox'][li] + x.astype(np.int32)]
 
 
 class _Pts:

@@ -760,15 +760,16 @@ def test_g_the_pack_is_one_channel():
     check('the pack builds as ONE channel of float32: the six faces in '
           "their cells and, under them, the lamp's reach pyramid",
           px.ndim == 2 and px.dtype == np.float32
-          and px.shape == (2 * 128 + lay['h'], 3 * 128)
+          and px.shape == (2 * 128 + 2 * lay['h'], 3 * 128)
           and all(np.array_equal(
               px[(fi // 3) * 128:(fi // 3 + 1) * 128,
                  (fi % 3) * 128:(fi % 3 + 1) * 128], f.depth)
               for fi, f in enumerate(sm.faces))
           and all(np.array_equal(
-              px[256:, fi * lay['w']:(fi + 1) * lay['w']], blk)
+              px[256 + (fi // 3) * lay['h']:256 + (fi // 3 + 1) * lay['h'],
+                 (fi % 3) * lay['w']:(fi % 3 + 1) * lay['w']], blk)
               for fi, blk in enumerate(_SMP.map_pyramid(sm)))
-          and not px[256:, 6 * lay['w']:].any(), str(px.shape))
+          and not px[256:, 3 * lay['w']:].any(), str(px.shape))
     check('its key is the layout and its stamp the content',
           key == ('shadowpack', ('shadow', 128, (3, 2), 'CLS', 'PYR'))
           and stamp == (tuple(GSH.map_digest(f) for f in sm.faces),))

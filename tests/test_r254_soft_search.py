@@ -164,7 +164,7 @@ def test_a_the_pyramid_is_a_lower_bound():
     check('the pyramid starts at tiles of 4 texels; its two parts (the '
           'nearest depths, the heights) are a fifth of the map',
           lay['levels'][0][0] == 4 and lay['levels'][-1][1] == 1
-          and lay['h'] == 2 * lay['part']
+          and lay['w'] == 2 * lay['part']
           and lay['w'] * lay['h'] < 512 * 512 / 4.9,
           f'{lay["w"]} x {lay["h"]} cells for a 512 face')
     sc, st = MS._prep('POINT', 0.3, shadow_map_size=64)
@@ -412,13 +412,14 @@ def test_e_the_gpu_twin():
     blocks = SM.map_pyramid(sm)
     check("a sized lamp's band of the pack is its six faces and, under "
           'them, the six blocks of its reach pyramid',
-          px.ndim == 2 and px.shape == (2 * 128 + lay['h'], 3 * 128)
+          px.ndim == 2 and px.shape == (2 * 128 + 2 * lay['h'], 3 * 128)
           and all(np.array_equal(
               px[(fi // 3) * 128:(fi // 3 + 1) * 128,
                  (fi % 3) * 128:(fi % 3 + 1) * 128], f.depth)
               for fi, f in enumerate(sm.faces))
           and all(np.array_equal(
-              px[256:256 + lay['h'], fi * lay['w']:(fi + 1) * lay['w']], b)
+              px[256 + (fi // 3) * lay['h']:256 + (fi // 3 + 1) * lay['h'],
+                 (fi % 3) * lay['w']:(fi % 3 + 1) * lay['w']], b)
               for fi, b in enumerate(blocks)), str(px.shape))
     check('that the rows exist is layout (the key says PYR); the stamp is '
           "still the faces' content digests",
