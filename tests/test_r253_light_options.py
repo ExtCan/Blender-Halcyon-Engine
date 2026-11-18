@@ -285,10 +285,18 @@ def test_a_identity_at_defaults():
           and GM._lref(1, 8, 'rgb') == 'hal_ltex(24).rgb')
     sc = _scene(_settings(), 'demo')
     tex = GM.pack_light_texels(sc.lights)
-    check('texels 12-15 are reserved zeros, 8.rgb white and 9.rgb black at '
-          'the defaults',
+    # R254 map-gpu: texels 12-15 were reserved zeros; they carry the
+    # lamp's shadow values now (12 = Shadow Colour and Density, 13 = the
+    # traced size and Area Gamma, 14 / 15 an Area lamp's axes) -- black,
+    # Density 1, size 0, Gamma 1 and no Area axes on the demo's lamps
+    check('texels 12-15 hold the shadow values at their defaults, 8.rgb '
+          'white and 9.rgb black',
           tex.shape[1] == len(sc.lights) * 16
-          and bool(np.all(tex[0, 12:16] == 0.0))
+          and bool(np.all(tex[0, 12, :3] == 0.0))
+          and float(tex[0, 12, 3]) == 1.0
+          and float(tex[0, 13, 0]) == 0.0 and float(tex[0, 13, 1]) == 1.0
+          and bool(np.all(tex[0, 13, 2:] == 0.0))
+          and bool(np.all(tex[0, 14:16] == 0.0))
           and bool(np.all(tex[0, 8, :3] == 1.0))
           and bool(np.all(tex[0, 9] == 0.0)))
 

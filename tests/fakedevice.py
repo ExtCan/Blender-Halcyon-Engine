@@ -54,11 +54,16 @@ from ..shaders.compiler import try_compile
 
 
 class FakeTexture:
+    """An uploaded texture. R254: a 2D (H, W) array is an R32F texture
+    (gpu/device._upload_impl's rule) and keeps its one channel; `fmt`
+    names what the driver would hold, for the tests that count bytes."""
+
     def __init__(self, arr):
         a = np.ascontiguousarray(np.asarray(arr, np.float32))
         if a.ndim == 3 and a.shape[2] == 3:
             a = np.concatenate([a, np.ones(a.shape[:2] + (1,), np.float32)], 2)
         self._arr = a
+        self.fmt = 'R32F' if a.ndim == 2 else 'RGBA32F'
 
     @property
     def pixels(self):
@@ -266,6 +271,11 @@ class Device:
                 if v.target.freed:
                     raise AssertionError(f'{shader.name}: samples a freed '
                                          'target')
+            if getattr(v, 'fmt', 'RGBA32F') == 'R32F':
+                # one channel: the simulator's R32F sampler, (r, 0, 0, 1)
+                from ..gpu.shade import RedTexture
+                u[k] = RedTexture(v.pixels)
+                continue
             u[k] = Texture(v.pixels, colorspace='Non-Color', filt='NEAREST',
                            wrap='EXTEND')
         for k in spec['samplers']:
