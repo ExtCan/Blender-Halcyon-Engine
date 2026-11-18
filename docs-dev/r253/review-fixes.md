@@ -1594,15 +1594,19 @@ Shader's name resolution is pinned in `tests/test_shaders.py` as well.
   loops, Crater too once AVX2 is off, before and after this entry. Those
   pins are a lane's and a mesh's, not a frame's, and how to widen each is
   its own decision. In the container `run_all` is otherwise what it was.
-  As the machine runs it (a fused kernel under the AVX-512 loops), 12,939
-  checks pass before and after and the failing lines are the 32 zip lines.
-  Forced into the other three classes, the module's three checks turn from
-  FAIL to ok and no other line of the suite changes: on the unfused kernel
-  12,939 pass where 12,936 did; on the fused one without the AVX-512 loops
-  12,931 where 12,928 did; on the unfused one without AVX2 either 12,930
-  where 12,927 did -- and what still fails there beside the zip lines is
-  the six Projector lanes and the two or three terrain hashes named above,
-  as before.
+  On the tree the pin was measured on (`claude-cloud` 1e6239c with the
+  entry above), as the machine runs it (a fused kernel under the AVX-512
+  loops), 12,939 checks pass before and after and the failing lines are
+  the 32 zip lines. Forced into the other three classes, the module's
+  three checks turn from FAIL to ok and no other line of the suite
+  changes: on the unfused kernel 12,939 pass where 12,936 did; on the
+  fused one without the AVX-512 loops 12,931 where 12,928 did; on the
+  unfused one without AVX2 either 12,930 where 12,927 did -- and what
+  still fails there beside the zip lines is the six Projector lanes and
+  the two or three terrain hashes named above, as before. Merged onto
+  `claude-cloud` e228c85, where the suite has grown, the same four classes
+  pass 13,106, 13,106, 13,098 and 13,097 checks and fail those names and
+  no other.
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
