@@ -12,6 +12,11 @@ seams between them, which no single package could test:
         under both power units (native): in watts the power is kept, on
         Blender Internal units the gain of scale_x * scale_y is kept --
         and either way the shadow softens with the scale
+    (c) the hal_lights row carries TWO tails past the per-lamp texels:
+        the ambient pool (flags) and the lamps' shadow values (map-gpu).
+        Each package laid its own at n * STRIDE; together the ambient
+        tail sits first and the shadow blocks follow it, on the plan
+        build and on every repack, and the frame is the CPU's
 
     python -m halcyon.tests.test_r254_integration
 """
@@ -212,6 +217,92 @@ def test_b_scaled_area_lamp_under_both_units():
               abs(k - 6.0 ** 0.5) < 1e-5, f'x{k:.6f}')
     except Exception as exc:                                    # noqa: BLE001
         check('a scaled Area lamp with a Gamma exports', False, repr(exc))
+
+
+def test_c_the_two_tails_of_the_light_row():
+    """An ambient lamp, a mapped sized lamp and an Area lamp in one
+    frame: the ambient tail and the shadow tail share the hal_lights
+    row without overlapping, and the GPU twin draws the CPU's frame --
+    before and after an edit that only repacks the row."""
+    import copy
+    from . import test_r254_map_soft as MS
+    from . import test_r254_map_gpu as MG
+    from ..core import lights as LI
+    from ..core import render as R
+    from ..gpu import material as GM
+    from ..gpu import shade as GSH
+
+    def build(amb_energy=0.2, radius=0.3):
+        st = MS._settings(shadow_samples=4)
+        key = MS._lamp('POINT', radius, 'MAP')
+        sc = MS._wall(key, st)
+        area = MS._lamp('AREA', 1.0, 'MAP', pos=(-3.0, -4.0, 5.0))
+        area.energy = 2.0
+        amb = Light(type='POINT', name='Amb', position=(0.0, 0.0, 3.0),
+                    color=(0.4, 0.6, 1.0), energy=amb_energy, shadow='NONE')
+        amb.ambient_only = True
+        sc.lights = [key, area, amb]
+        return sc, st
+
+    sc, st = build()
+    cpu, img, cov, passes, atlases, why = MG._sim(sc, st)
+    check('a frame with an ambient lamp, a mapped sized lamp and an Area '
+          'lamp plans', img is not None, str(why))
+    if img is None:
+        return
+    d = float(np.abs(img[cov][:, :3] - cpu[cov][:, :3]).max())
+    check('...and the GPU twin draws the CPU frame (the 6e-3 bar)',
+          d < 6e-3, f'max {d:.2e}')
+    lights = LI.frame_lights(sc, st)
+    n = len(lights)
+    job, _g = MG._job(sc, st)
+    metas = [GSH._shadow_meta(l, st, None, want_atlas=False)[0]
+             for l in lights]
+    tail = GM.light_tail_layout(lights, metas, ambient=True)
+    base = GM.ambient_tail_base(n)
+    first = min(list(tail['area'].values()) + list(tail['map'].values()))
+    check('the ambient tail sits at n * STRIDE and every shadow block '
+          'starts past its three texels',
+          base == n * GM.LIGHT_TEXEL_STRIDE
+          and first >= base + GM.AMBIENT_TAIL_TEXELS
+          and len(tail['map']) >= 1 and len(tail['area']) == 1,
+          f'ambient at {base}, first block at {first}')
+    row = GM.pack_light_texels(lights, job, shadows=metas)
+    pool = LI.ambient_light(sc, st)
+    check('the packed row is as wide as the layout says and holds the '
+          'ambient pool in its tail',
+          row.shape[1] == tail['width']
+          and np.array_equal(row[0, base, :3], pool)
+          and float(np.abs(pool).max()) > 0.0)
+    bare = GM.light_tail_layout(lights, metas)
+    check('without an ambient lamp the shadow blocks start at n * STRIDE '
+          '(the layout map-gpu ships alone)',
+          min(list(bare['area'].values()) + list(bare['map'].values()))
+          == n * GM.LIGHT_TEXEL_STRIDE)
+    # an edit of the ambient lamp AND of the mapped lamp's size: a
+    # plan-cache hit that repacks the row, and still the CPU's frame
+    job, g = MG._job(sc, st)
+    GSH._PLAN_CACHE.clear()
+    p0 = GSH.plan_frame(job, g)
+    sc.lights[2].energy = 0.6
+    sc.lights[0].radius = 0.6
+    stats = getattr(GSH, 'PLAN_STATS', None)
+    before = dict(stats) if isinstance(stats, dict) else None
+    job2, g2 = MG._job(sc, st)
+    passes2, why2, atl2 = GSH.plan_frame(job2, g2)
+    img2, _hit = GSH.simulate(job2, g2, passes2, atl2)
+    cpu2 = MG._cpu_frame(sc, st)
+    cov2 = g2.tri >= 0
+    d2 = float(np.abs(img2[cov2][:, :3] - cpu2[cov2][:, :3]).max())
+    check('after an ambient Power edit and a size edit the repacked row '
+          'still draws the CPU frame', d2 < 6e-3, f'max {d2:.2e}')
+    check('...and the two frames differ (the edit was drawn)',
+          float(np.abs(img2 - img).max()) > 1e-3)
+    if before is not None:
+        check('...on the same plan: the edit was a cache hit',
+              int(stats.get('miss', 0)) == int(before.get('miss', 0)),
+              f"misses {before.get('miss')} -> {stats.get('miss')}")
+    del p0, copy
 
 
 def main():

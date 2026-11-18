@@ -184,6 +184,57 @@ def object_space_points(P, inv):
     return out
 
 
+def unproject_far(nx, ny, inv):
+    """The far-plane point (nx, ny, 1, 1) of each pixel through the
+    inverse view-projection `inv` (4,4): (N,4) float32, homogeneous (the
+    caller divides by w). `nx`, `ny` are (N,) float32 NDC.
+
+    Written as the SEQUENTIAL float32 chain per row r --
+    `a = nx*inv[r,0]; b = ny*inv[r,1]; a = a + b; a = a + inv[r,2];
+    a = a + inv[r,3]` -- which is `gpu/sky.py`'s `hal_sky_ray` statement
+    for statement (`((nx*i.x + ny*i.y) + i.z) + i.w`): one correctly
+    rounded float32 operation each, never fused, on every NumPy build
+    and every CPU. So the CPU's sky ray and the sky pass's are the same
+    bits in the simulator by construction (the view_depth /
+    object_space_points precedent).
+
+    It replaces `np.stack([nx, ny, 1, 1], 1) @ inv.T`, which is this
+    chain only where the BLAS behind NumPy's matmul has no fused
+    multiply-add. OpenBLAS's `sgemm` on its Haswell-and-later cores
+    (Haswell, Zen, SkylakeX, Cooperlake) computes the second product
+    fused into the first -- `fma(ny, i.y, nx*i.x)`, one rounding where
+    the chain has two -- and lands an ulp away in about three rows of
+    ten on random input; a ONE-row product takes another routine and
+    another order again, off the chain in nearly four rows of five on
+    fused and unfused cores alike. Which core a NumPy wheel runs is its
+    bundled OpenBLAS's reading of the CPU, not the NumPy version: on
+    one Xeon, 1.26.4 (OpenBLAS 0.3.23) fell back to the unfused
+    Prescott core and gave the chain, the same 1.26.4 forced to Haswell
+    did not, and 2.0.2 .. 2.5.3 (OpenBLAS 0.3.27 .. 0.3.34) picked
+    Cooperlake / SkylakeX and moved every GPU sky twin held to
+    `d == 0.0` (10..13 pixels of the suite's 96x72 frame, 4e-08..8e-07).
+    Measured bitwise the unfused matmul on the suite's frames (two rows
+    or more), so a machine whose suite was green keeps every CPU sky
+    pixel it had."""
+    nx = np.asarray(nx, np.float32)
+    ny = np.asarray(ny, np.float32)
+    inv = np.asarray(inv, np.float32)
+    n = nx.shape[0]
+    out = np.empty((n, 4), np.float32)
+    a = np.empty(n, np.float32)
+    b = np.empty(n, np.float32)
+    for r in range(4):
+        # one ufunc call per statement of the chain, into two scratch
+        # rows (the same bits as `((nx*i0 + ny*i1) + i2) + i3` spelled
+        # with temporaries, a third less time at 720p)
+        np.multiply(nx, inv[r, 0], out=a)
+        np.multiply(ny, inv[r, 1], out=b)
+        np.add(a, b, out=a)
+        np.add(a, inv[r, 2], out=a)
+        np.add(a, inv[r, 3], out=out[:, r])
+    return out
+
+
 def transform_h(m, p):
     """Homogeneous transform. p: (N,3) -> (N,4)."""
     m = np.asarray(m, dtype=np.float32)

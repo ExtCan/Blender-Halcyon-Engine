@@ -128,6 +128,25 @@ OLD_TEX_IMAGE_FLAT = ('    vec3 _v1 = vec3(hal_uv, 0.0);\n'
 #: three pre-existing featurematrix scenes on the pre-edit tree
 OLD_FRAME_DIGESTS = {'textured': 1656485521, 'demo': 1045851408,
                      'mirror': 1324349618}
+#: ... and of the same three since the sky ray is `mathx.unproject_far`
+#: (the field round's kernel fix, tests/test_r253_kernels.py). The
+#: pre-edit bytes were computed where NumPy's matmul runs a FUSED
+#: `sgemm`, and that kernel's ray is in them: ten sky pixels of each
+#: frame sit one ulp (5.96e-08) off the float32 chain the sky pass
+#: states. With the ray put back as the matmul it was, the frames are
+#: still the pre-edit bytes above -- the test renders both -- so the
+#: ray is the whole difference.
+#:
+#: Both rows are the bytes of ONE machine class, as the pre-edit row
+#: always was: a fused BLAS kernel under NumPy's AVX-512 loops (measured
+#: equal on NumPy 1.26.4, 2.0.2, 2.3.5 and 2.5.3 over OpenBLAS's
+#: Haswell, Cooperlake and SkylakeX cores). The vertex transforms are
+#: matmuls too and `pow` / `atan2` are NumPy's SIMD loops, so an unfused
+#: kernel (Prescott, Nehalem, Sandybridge) renders 1539176161 /
+#: 928542048 / 2436496908 for textured / demo / mirror before AND after
+#: the fix, and a NumPy without the AVX-512 loops other bytes again.
+FRAME_DIGESTS = {'textured': 3858757274, 'demo': 3248123161,
+                 'mirror': 3526621371}
 
 LANE_N = 4096
 NEW_MODES = ('CUBE', 'EQUIRECT', 'MIRROR_BALL', 'ANGULAR', 'CYLINDER_CAP',
@@ -1225,7 +1244,8 @@ def test_mapping_frame_twin():
     a scaled + turned frame) -> Projector EQUIRECT -> Image Texture,
     under frame_bar (deferred bar 6e-3, no pixel > 1e-2); and the CPU
     picture of three pre-existing featurematrix scenes byte-identical to
-    the pre-edit tree (the bitwise-neutral rule)."""
+    the pre-edit tree (the bitwise-neutral rule) once the sky ray is the
+    matmul that tree ran, and pinned as they render now."""
     st = base_settings(W, H, transparency='NONE')
     st.use_processes = False
     sc = demo_scene(st, with_texture=True)
@@ -1251,14 +1271,36 @@ def test_mapping_frame_twin():
     sc2.materials[1].graph = _ball_master(sc2, {'om': omap, 'pj': proj, 'im': img},
                                           ['im', 0])
     frame_bar('Object Projection -> Projector EQUIRECT -> Image Texture', sc2, st2)
-    # every pre-existing scene: the pre-edit bytes
-    for key, want in OLD_FRAME_DIGESTS.items():
+    # every pre-existing scene: the pre-edit bytes. The sky ray has moved
+    # since they were computed (FRAME_DIGESTS has the account), so each
+    # scene renders twice: with the ray as the matmul the pre-edit tree
+    # ran -- the pre-edit bytes, untouched -- and as it is
+    def matmul_ray(nx, ny, inv):
+        pts = np.stack([nx, ny, np.ones(nx.size, f32), np.ones(nx.size, f32)],
+                       axis=1)
+        return pts @ inv.T
+
+    def picture(key):
         st3 = base_settings(W, H, transparency='NONE')
         st3.use_processes = False
-        img3 = np.asarray(R.render(FM.SCENES[key](st3), st3))
+        return np.asarray(R.render(FM.SCENES[key](st3), st3))
+
+    chain_ray = M.unproject_far
+    for key, want in OLD_FRAME_DIGESTS.items():
+        img3 = picture(key)
         dig = zlib.adler32(np.ascontiguousarray(img3, f32).tobytes())
+        M.unproject_far = matmul_ray
+        try:
+            img_old = picture(key)
+        finally:
+            M.unproject_far = chain_ray
+        dig_old = zlib.adler32(np.ascontiguousarray(img_old, f32).tobytes())
+        moved = int((img3 != img_old).any(axis=2).sum())
         check(f"the '{key}' featurematrix scene renders the pre-edit bytes "
-              f'(adler32 {want})', dig == want, str(dig))
+              f'(adler32 {want}) with the sky ray as the matmul it was, and '
+              f'adler32 {FRAME_DIGESTS[key]} with the chain',
+              dig_old == want and dig == FRAME_DIGESTS[key],
+              f'{dig_old}, {dig}; {moved} px between them')
 
 
 def main():
