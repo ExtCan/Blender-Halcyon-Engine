@@ -130,6 +130,16 @@ pinned where it bit.
     an output) and a misspelled input (nothing was ever warned of, so the
     node's warning box could not show a line). The counts and the widths
     are compile errors with a line; the rest run as written.
+(21) A Bump whose HEIGHT reads another Bump's normal was still cut where
+    the pre-pass chunks, in the material's own tree too. The pre-pass
+    evaluates height chains chunk by chunk; a chain that reads a Bump
+    pulled that node's `n_bump` through one chunk before any field
+    existed, so it differenced the chunk and the cut was baked into the
+    downstream field. On the layered road the same normal was differenced
+    over the fragments of every rank at once. A pre-pass context carries
+    `bump_demand` now: a Bump met without a field has its own field built
+    first (`core/render._bump_height_fields`), and a see-through material
+    that asks builds its fields rank by rank.
 """
 import io
 import os
@@ -2439,6 +2449,345 @@ def test_group_bump_gathers_from_a_whole_material_field():
           'group_evaluator' in calls(NE.n_group) and 'group_evaluator' in calls(NE.bump_heights)
           and inspect.getsource(NE).count('.group_inputs = ') == 1
           and '.group_inputs = ' in inspect.getsource(NE.group_evaluator))
+
+
+def test_bump_height_that_reads_a_bump_has_that_field_built_first():
+    """A Bump whose HEIGHT reads another Bump's normal -- a Bump over a
+    Bump, or any chain that carries a bumped normal into a height -- was
+    cut where the pre-pass chunks. The pre-pass evaluates every height
+    chain over the material's pixels chunk by chunk, which is safe while
+    a height is a function of its own pixel; a chain that reads a Bump
+    pulled that node's n_bump through ONE chunk, before any field existed,
+    so the upstream node differenced the chunk, lost its neighbours at the
+    chunk's edge, and the cut was baked into the downstream node's field:
+    0.87 off the frame of the material shaded in one batch, along three
+    rows at 320x240. The layered road had it twice over: its heights are
+    evaluated across every rank at once, so the upstream normal was
+    differenced over front and back faces together (0.87 off over the
+    ball at ordinary sizes) and cut at MAX_CHUNK besides. A pre-pass
+    context carries `bump_demand` now -- n_bump, met without a field
+    there, has its own field built first and gathers from it -- and a
+    see-through material that asks builds its fields rank by rank through
+    the same builder. The GPU device refuses such a chain by name and
+    shades it on this road."""
+    import ast
+    import importlib
+    import inspect
+    import textwrap
+    from . import fakebpy
+    fakebpy.install()
+    SN = importlib.import_module('halcyon.nodes.shader_nodes')
+    EX = importlib.import_module('halcyon.export')
+    from ..core import nodeeval as NE
+    from ..core.scene import Material
+    big = (320, 240)                          # the floor outgrows one shading batch: the pre-pass runs
+
+    def master():
+        mat = _code_master_tree(SN, _code_text('red', _CODE_RED))
+        hal = mat.node_tree.nodes.get('Halcyon')
+        hal.inputs.new('NodeSocketVector', 'Normal')
+        hal.inputs.new('NodeSocketFloat', 'Bump Strength').default_value = 1.0
+        return mat, mat.node_tree, hal
+
+    def reads(tree, normal, tag='.001'):
+        """A Bump in `tree` whose Height is the output socket `normal` (a
+        bumped normal, read as a value) times 4."""
+        gain = _code_plain(tree, 'Gain' + tag, 'ShaderNodeMath', ins=(('NodeSocketFloat', 'Value'),) * 2,
+                           outs=(('NodeSocketFloat', 'Value'),), operation='MULTIPLY', use_clamp=False)
+        gain.inputs[1].default_value = 4.0
+        bump = _code_bump(tree, 'Bump' + tag)
+        tree.links.new(normal, gain.inputs[0])
+        tree.links.new(gain.outputs['Value'], bump.inputs['Height'])
+        return bump
+
+    def group_tree(up=False):
+        """A group's tree ending in a Bump that reads a Bump: the probe's
+        chain inside it, or -- `up` -- a Group Input handing the normal in."""
+        tree = types.SimpleNamespace(name='Bump Group', nodes=_CodeNodes(), links=_CodeLinks())
+        gout = _code_plain(tree, 'Group Output', 'NodeGroupOutput', ins=(('NodeSocketVector', 'Normal'),),
+                           is_active_output=True)
+        if up:
+            source = _code_plain(tree, 'Group Input', 'NodeGroupInput', outs=(('NodeSocketVector', 'Up'),)).outputs['Up']
+            last = reads(tree, source, tag='')
+        else:
+            last = reads(tree, _bump_chain(tree).outputs['Normal'])
+        tree.links.new(last.outputs['Normal'], gout.inputs['Normal'])
+        return tree
+
+    def built_as(make):
+        mat, tree, hal = master()
+        tree.links.new(make(tree).outputs['Normal'], hal.inputs['Normal'])
+        return mat
+
+    # the probe's chain alone: its height reads no Bump
+    def alone():
+        return built_as(_bump_chain)
+
+    # a second Bump over it (and a third over that): Height <- 4 x the normal below
+    def over(depth=2):
+        def make(tree):
+            last = _bump_chain(tree)
+            for k in range(1, depth):
+                last = reads(tree, last.outputs['Normal'], tag=f'.{k:03d}')
+            return last
+        return built_as(make)
+
+    # both inside ONE group; and the first in the material's tree, the second in a group that is handed its normal
+    def grouped():
+        return built_as(lambda tree: _code_plain(tree, 'Group', 'ShaderNodeGroup', outs=(('NodeSocketVector', 'Normal'),),
+                                                 node_tree=group_tree()))
+
+    def across():
+        def make(tree):
+            node = _code_plain(tree, 'Group', 'ShaderNodeGroup', ins=(('NodeSocketVector', 'Up'),),
+                               outs=(('NodeSocketVector', 'Normal'),), node_tree=group_tree(up=True))
+            tree.links.new(_bump_chain(tree).outputs['Normal'], node.inputs['Up'])
+            return node
+        return built_as(make)
+
+    # a height that reads its OWN normal: no node editor links this, a hand-built graph can
+    def own():
+        def make(tree):
+            bump = reads(tree, _code_plain(tree, 'Value.001', 'ShaderNodeValue',
+                                           outs=(('NodeSocketFloat', 'Value'),)).outputs['Value'], tag='')
+            gain = tree.nodes.get('Gain')
+            for link in list(gain.inputs[0].links):
+                tree.links.remove(link)
+            tree.links.new(bump.outputs['Normal'], gain.inputs[0])
+            return bump
+        return built_as(make)
+
+    def frame(mat, size=big, glass=False, band=None, ball=False):
+        """The demo floor wearing `mat`'s export. `glass`: the master's
+        Opacity at 0.6 and the material flagged see-through, so its
+        fragments take the layered road; `ball`: the ball wears the same
+        graph as a material of its own -- front and back faces, two ranks."""
+        if glass:
+            mat.node_tree.nodes.get('Halcyon').inputs['Opacity'].default_value = 0.6
+        graph, programs, _warnings = _code_exported(mat)
+        sc, st = _code_floor(graph, programs, size)
+        sc.materials[0].has_alpha = glass
+        if ball:
+            twin = Material(name='Coded Ball', index=1, graph=graph)
+            twin.programs, twin.has_alpha = programs, glass
+            sc.materials[1] = twin
+        with redirect_stdout(io.StringIO()):
+            return np.asarray(R.render(sc, st, band=band))
+
+    def same(a, b):
+        return bool(np.array_equal(a, b))
+
+    def rows_off(a, b):
+        """(max difference, pixels over 1e-2, the rows holding one)."""
+        d = np.abs(a.astype(np.float64) - b.astype(np.float64)).max(axis=-1)
+        return float(d.max()), int((d > 1e-2).sum()), sorted(set(np.nonzero(d > 1e-2)[0].tolist()))
+
+    # ---- the spies: the fields each pre-pass run builds, which heights each of its passes evaluates, every
+    # time a Bump DIFFERENCES while a pre-pass is evaluating heights -- and the 1.92.0 n_bump, which never asks
+    built, passes, cuts, layered = [], [], [], []
+    real_fields, real_heights, real_grad, real_layers = (R._bump_height_fields, NE.bump_heights, NE._screen_grad,
+                                                         R._shade_fragments_cpu)
+    real_bump = NE.DISPATCH['ShaderNodeBump']
+    state = {'prepass': 0, 'deaf': False, 'no_fields': False, 'seed': None}
+
+    def spy_fields(*args, **kw):
+        if state['no_fields']:
+            return {}
+        state['prepass'] += 1
+        try:
+            out = real_fields(*args, **kw)
+        finally:
+            state['prepass'] -= 1
+        built.append(sorted(key[1] for key in out))
+        return out
+
+    def spy_heights(ev, _seen=None, only=None):
+        if _seen is None:                     # one entry per pass over one chunk: None, or the node it is for
+            passes.append(None if only is None else tuple(sorted(only)))
+        return real_heights(ev, _seen, only)
+
+    def spy_grad(c, values):
+        if state['prepass']:
+            cuts.append(int(np.size(values)))
+        return real_grad(c, values)
+
+    def spy_bump(ev, node):
+        if not state['deaf']:
+            return real_bump(ev, node)
+        c = ev.ctx
+        keep = getattr(c, 'bump_demand', None)
+        c.bump_demand = None
+        try:
+            return real_bump(ev, node)
+        finally:
+            c.bump_demand = keep
+
+    def spy_layers(job, tri, *args, **kw):
+        layered.append(int(tri.size))
+        if state['seed'] is not None:         # a field of the opaque frame's, filed under a key this road will use
+            job.bump_fields[state['seed']] = (np.full((job.height, job.width), 7.0, np.float32),) * 2
+        return real_layers(job, tri, *args, **kw)
+
+    def shot(mat, deaf=False, one_batch=False, no_fields=False, max_chunk=None, min_chunk=None, seed=None, **kw):
+        """frame()'s picture and the spies' logs of that frame alone.
+        `deaf`: n_bump as 1.92.0 had it (it differences whatever batch it
+        is in); `one_batch`: no chunking anywhere; `no_fields`: the
+        pre-pass builds nothing."""
+        for log in (built, passes, cuts, layered):
+            del log[:]
+        state.update(deaf=deaf, no_fields=no_fields, seed=seed)
+        keep = R.MIN_CHUNK, R.MAX_CHUNK
+        if one_batch:
+            R.MIN_CHUNK = R.MAX_CHUNK = 1 << 30
+        elif max_chunk:
+            R.MAX_CHUNK = max_chunk
+        elif min_chunk:
+            R.MIN_CHUNK = min_chunk
+        try:
+            return frame(mat, **kw)
+        finally:
+            R.MIN_CHUNK, R.MAX_CHUNK = keep
+            state.update(deaf=False, no_fields=False, seed=None)
+
+    R._bump_height_fields, R._shade_fragments_cpu = spy_fields, spy_layers
+    NE.bump_heights, NE._screen_grad, NE.DISPATCH['ShaderNodeBump'] = spy_heights, spy_grad, spy_bump
+    try:
+        # ---- the reported chain, in the material's own tree
+        whole = shot(over(), one_batch=True)
+        check('the reference: a Bump over a Bump shaded in ONE batch -- no pre-pass, each n_bump differencing the '
+              'whole floor', built == [] and not passes, f'{built} {passes}')
+        cut = shot(over(), deaf=True)
+        off, n_px, rows = rows_off(cut, whole)
+        check('at 320x240 the pre-pass runs in chunks, and as 1.92.0 evaluated it the upstream Bump DIFFERENCES one '
+              'inside the pre-pass: the frame is cut along the chunk\'s edge (a few rows, more than 0.3 off)',
+              built == [['Bump', 'Bump.001']] and len(cuts) >= 1 and off > 0.3 and 1 <= len(rows) <= 4,
+              f'{built} cuts {cuts} off {off} px {n_px} rows {rows}')
+        fixed = shot(over())
+        n_chunks = passes.count(None)
+        check('the same frame now: no Bump differences inside the pre-pass, and the frame is the ONE-batch frame, '
+              'bit for bit', built == [['Bump', 'Bump.001']] and cuts == [] and same(fixed, whole),
+              f'{built} cuts {cuts} {rows_off(fixed, whole)}')
+        check('...the upstream field built FIRST, once, by a pass of its own over every chunk -- asked for from '
+              'inside the first chunk that read it', n_chunks >= 2 and passes[0] is None
+              and passes[1:1 + n_chunks] == [('Bump',)] * n_chunks and passes.count(('Bump',)) == n_chunks
+              and len(passes) == 2 * n_chunks, str(passes))
+        finer = shot(over(), min_chunk=2000)
+        check('...and whatever the chunking: with MIN_CHUNK lowered the pre-pass takes more, smaller chunks, and '
+              'the frame is still the one-batch frame, bit for bit', passes.count(None) > n_chunks
+              and passes.count(('Bump',)) == passes.count(None) and cuts == [] and same(finer, whole),
+              f'{passes.count(None)} chunks {rows_off(finer, whole)}')
+        small_fixed = shot(over(), size=(128, 96))
+        small_logs = (list(built), list(passes))
+        small_whole = shot(over(), size=(128, 96), one_batch=True)
+        check('at 128x96 the floor fits one batch: no pre-pass runs and nothing is asked for, as it always was',
+              small_logs == ([], []) and same(small_fixed, small_whole),
+              f'{small_logs} {rows_off(small_fixed, small_whole)}')
+
+        # ---- a height chain that reads no Bump never asks
+        plain = shot(alone())
+        check('a Bump whose height reads no Bump: the pre-pass takes the one pass it always took (nothing is '
+              'asked for, no second pass)', built == [['Bump']] and passes == [None] * n_chunks and cuts == []
+              and same(plain, shot(alone(), one_batch=True)), f'{built} {passes}')
+
+        # ---- three deep, inside a group, across a group's boundary
+        deep = shot(over(3))
+        deep_passes = list(passes)
+        deep_whole = shot(over(3), one_batch=True)
+        check('three deep (a Bump over a Bump over a Bump): each field below is built once, the lowest first, and '
+              'the frame is the one-batch frame, bit for bit',
+              deep_passes.count(('Bump',)) == n_chunks and deep_passes.count(('Bump.001',)) == n_chunks
+              and deep_passes.index(('Bump',)) < deep_passes.index(('Bump.001',))
+              and deep_passes.count(None) == n_chunks and same(deep, deep_whole)
+              and rows_off(shot(over(3), deaf=True), deep_whole)[0] > 0.3,
+              f'{deep_passes} {rows_off(deep, deep_whole)}')
+        in_group = shot(grouped())
+        check('both Bumps inside ONE group: the fields are asked for and filed by path id, and the frame is the '
+              'top-level pair\'s, bit for bit', built == [['Group/Bump', 'Group/Bump.001']]
+              and passes.count(('Group/Bump',)) == n_chunks and cuts == [] and same(in_group, fixed),
+              f'{built} {passes} {rows_off(in_group, fixed)}')
+        handed = shot(across())
+        check('the first Bump in the material\'s tree, the second inside a group that is handed its normal: the '
+              'group\'s height asks through the group input, and the frame is the top-level pair\'s, bit for bit',
+              built == [['Bump', 'Group/Bump']] and passes.count(('Bump',)) == n_chunks and cuts == []
+              and same(handed, fixed) and rows_off(shot(across(), deaf=True), fixed)[0] > 0.3,
+              f'{built} {passes} {rows_off(handed, fixed)}')
+
+        # ---- bands: each band builds its fields from the G-buffer's full coverage, in the same order
+        height = big[1]
+        bands = [(0, height // 3), (height // 3, height // 2 + 7), (height // 2 + 7, height)]
+        joined = np.concatenate([shot(over(), band=band) for band in bands], axis=0)
+        check('three bands of the frame, joined: the rows are the whole frame\'s, bit for bit', same(joined, fixed),
+              str(rows_off(joined, fixed)))
+
+        # ---- a height that reads its own normal has no order: the pre-pass ends, and says nothing false
+        selfish = shot(own())
+        check('a Bump whose height reads its OWN normal (a hand-built graph: no order exists): the pre-pass ends, '
+              'the frame is finite, and the node is not asked for twice over',
+              built == [['Bump']] and bool(np.isfinite(selfish).all()) and passes.count(('Bump',)) == n_chunks,
+              f'{built} {passes}')
+
+        # ---- the layered road, one rank: the floor see-through, its heights in two chunks
+        glass_whole = shot(over(), glass=True, one_batch=True)
+        glass_cut = shot(over(), glass=True, max_chunk=20000, deaf=True)
+        check('the floor see-through, the layer\'s heights evaluated in two chunks (MAX_CHUNK lowered under its '
+              'fragment count), as 1.92.0 evaluated them: cut along the chunk\'s edge',
+              len(layered) == 1 and 20000 < layered[0] <= 40000 and rows_off(glass_cut, glass_whole)[0] > 0.1,
+              f'{layered} {rows_off(glass_cut, glass_whole)}')
+        glass_two = shot(over(), glass=True, max_chunk=20000)
+        check('...and now: the frame of the layer shaded in one batch, bit for bit', same(glass_two, glass_whole),
+              str(rows_off(glass_two, glass_whole)))
+
+        # ---- two ranks: the ball wears it too (front and back faces at one pixel)
+        truth = shot(over(), glass=True, ball=True, one_batch=True, no_fields=True)
+        check('the truth for two ranks: every rank shaded in one batch with no field at all -- n_bump differencing '
+              'that rank\'s own fragments -- is another picture than the floor alone', not same(truth, glass_whole))
+        mixed = shot(over(), glass=True, ball=True, deaf=True)
+        off, n_px, _rows = rows_off(mixed, truth)
+        check('as 1.92.0 evaluated them, at ordinary chunk sizes, the upstream normal was differenced over BOTH '
+              'ranks at once: far off the truth over the ball', off > 0.3 and n_px > 500, f'{off} {n_px}')
+        ranked = shot(over(), glass=True, ball=True)
+        check('now the material builds its fields rank by rank from that rank\'s fragments: the truth, bit for bit',
+              same(ranked, truth) and ['Bump', 'Bump.001'] in built, f'{rows_off(ranked, truth)} {built}')
+        check('...whatever the chunk size', same(shot(over(), glass=True, ball=True, max_chunk=3000), truth))
+        check('...and a field of the opaque frame\'s filed under the same key is not this road\'s to read',
+              same(shot(over(), glass=True, ball=True, seed=(0, 'Bump')), truth))
+        plain_glass = shot(alone(), glass=True, ball=True)
+        check('a see-through Bump whose height reads no Bump keeps the one evaluation across the ranks it always '
+              'had (the builder is not called for it)', built == [] and layered
+              and same(plain_glass, shot(alone(), glass=True, ball=True, max_chunk=3000)), f'{built} {layered}')
+    finally:
+        R._bump_height_fields, R._shade_fragments_cpu = real_fields, real_layers
+        NE.bump_heights, NE._screen_grad, NE.DISPATCH['ShaderNodeBump'] = real_heights, real_grad, real_bump
+
+    # ---- the GPU device has no such chain: refused by name, shaded on this road
+    graph, programs, _warnings = _code_exported(over())
+    _src, _binds, why = _code_pass(graph, programs, size=big)
+    check('the deferred pass refuses a Bump inside another Bump\'s height chain BY NAME (the CPU shades it)',
+          'inside another Bump\'s height chain' in str(why), str(why))
+
+    # ---- the rule, read from the code itself
+    def parsed(f):
+        return ast.parse(textwrap.dedent(inspect.getsource(f)))
+
+    asks = [n for n in ast.walk(parsed(NE.n_bump)) if isinstance(n, ast.If) and ast.unparse(n.test) == 'field is None'
+            and 'bump_demand' in ast.unparse(n)]
+    named = [c for c in ast.walk(parsed(NE.n_bump)) if isinstance(c, ast.Constant) and c.value == 'bump_demand']
+    check('n_bump asks for a field only where it found none, and only of a context that carries bump_demand',
+          len(asks) == 1 and len(named) == 1, f'{len(asks)} {len(named)}')
+    root = os.path.dirname(os.path.dirname(os.path.abspath(R.__file__)))
+    setters = []
+    for folder, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('__pycache__', 'tests')]
+        for fname in files:
+            if fname.endswith('.py'):
+                text = open(os.path.join(folder, fname), encoding='utf-8').read()
+                setters += [(os.path.relpath(os.path.join(folder, fname), root).replace(os.sep, '/'), line.strip())
+                            for line in text.splitlines() if '.bump_demand = ' in line]
+    check('two places hand a context a bump_demand, both pre-passes: the builder (which builds) and the layered '
+          'road\'s shared evaluation (which notes who asked)',
+          setters == [('core/render.py', 'ctx.bump_demand = demand'), ('core/render.py', 'ctx.bump_demand = asked')]
+          and 'ctx.bump_fields = fields' in inspect.getsource(R._bump_height_fields)
+          and 'ctx.bump_fields = None' in inspect.getsource(R._shade_fragments_cpu), str(setters))
 
 
 def test_code_node_rebuild_survives_undo_redo_and_load():

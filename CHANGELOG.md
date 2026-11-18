@@ -2197,16 +2197,114 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   first node's height alone; the coverage mask of the first chunk only;
   the layered road finding top-level Bump materials only, keeping the
   own tree's heights only, or writing a chunk's heights at the front of
-  the layer. *Seen from the same probes and left for their own fixes*:
-  the master's Bump Height socket is sugar that `desugar_master_bump`
-  rewrites into a Bump node for the nodes of the material's own tree
-  only, so a master INSIDE a group ignores its linked Bump Height
-  altogether (0.89 off over 4435 pixels of the floor at 128x96 -- no
-  pre-pass involved); and a Bump whose HEIGHT is fed by another Bump's
-  normal is still cut where the pre-pass chunks, in the material's own
-  tree too (0.84 off over 461 pixels on rows 52-54 at 320x240, the same
-  before and after this entry): while the fields are being built the
-  upstream Bump has none yet and differences the chunk.
+  the layer. *Seen from the same probes*: a Bump whose HEIGHT is fed by
+  another Bump's normal was still cut where the pre-pass chunks, in the
+  material's own tree too (0.84 off over 461 pixels on rows 52-54 at
+  320x240, the same before and after this entry) -- while the fields
+  were being built the upstream Bump had none yet and differenced the
+  chunk; closed since by its own entry below ("A Bump whose height reads
+  another Bump is built in order"). *Left for its own fix*: the master's
+  Bump Height socket is sugar that `desugar_master_bump` rewrites into a
+  Bump node for the nodes of the material's own tree only, so a master
+  INSIDE a group ignores its linked Bump Height altogether (0.89 off
+  over 4435 pixels of the floor at 128x96 -- no pre-pass involved).
+- **A Bump whose height reads another Bump is built in order (it was cut
+  where the pre-pass chunks; on the layered road its normal was
+  differenced across every rank).** The Bump pre-pass evaluates each
+  height chain over the material's pixels chunk by chunk and differences
+  once -- sound while a height is a function of its own pixel ("heights
+  are per-pixel independent, so chunking here cannot cut anything", the
+  builder's own docstring). A height chain that reads another Bump's
+  NORMAL is not: that normal is itself a gradient. Evaluating the chain
+  pulled the upstream `n_bump` through ONE chunk, before any field
+  existed; it differenced the chunk, lost its neighbours along the
+  chunk's edge, and the cut was baked into the downstream node's field
+  -- the seam the pre-pass exists to remove, moved one node up. The
+  entry above saw it and left it for its own fix. *Wrong picture or
+  fallback: the wrong picture.* The probe is the entry above's chain
+  with a second Bump over it (Height <- 4 x the first Bump's Normal;
+  the second's Normal -> the master's), against the frame of the
+  material shaded in ONE batch: `MIN_CHUNK` and `MAX_CHUNK` raised out
+  of reach, no pre-pass at all, each `n_bump` differencing the whole
+  floor. Identical at 128x96, where no pre-pass runs. At 320x240, 0.87
+  off over 461 pixels on rows 52-54, the pre-pass chunk's edge; at
+  640x480, 0.95 over 2918 pixels on nine rows; three Bumps deep, 0.91
+  over 630 pixels. The same numbers with both Bumps inside one group,
+  with the first in the material's tree and the second inside a group
+  that is handed its normal, and in bands. The layered road had it twice
+  over. Its heights are evaluated `MAX_CHUNK` (262144) fragments at a
+  time: with that lowered under the see-through floor's fragment count,
+  0.45 off over 371 pixels on rows 70-72. And they are evaluated across
+  EVERY rank at once, as "per-fragment pure": with the ball wearing the
+  material too (front and back faces at one pixel) the upstream normal
+  was differenced over both ranks together -- 0.87 off over 2091 pixels
+  at ordinary chunk sizes, against each rank shaded in one batch with no
+  field at all. The GPU device has no such chain: the deferred pass
+  refuses "a Bump node inside another Bump's height chain" by name and
+  the frame is shaded on this road. In a real Blender 5.2.2 (the `bpy`
+  module, background; two real Bump nodes, `export_material`): 1.16 off
+  over 461 pixels on rows 52-54 at 320x240, in the material's tree and
+  inside a real node group, with Strength and Distance at 1.0 as the
+  headless probe has them. (A new Bump node's Distance is 0.001 in that
+  Blender; left there, the two frames were within 1e-2 of each other and
+  not bit for bit.) (1) *n_bump asks.* A pre-pass context carries
+  `bump_demand`. `n_bump`, finding no field for its node, asks it for
+  one before it differences; a shading batch carries none, and nothing
+  changes there. (2) *The builder builds in order.*
+  `core/render._bump_height_fields` answers by building that node's
+  field then and there -- a pass of its own over every chunk for that
+  one node (`bump_heights(..., only=)`), which asks in turn for whatever
+  ITS chain reads -- and the chunk that asked gathers from the result.
+  The field is filed once; every later chunk and node finds it. The
+  builder's contexts read the fields of this build and no others. A
+  height that reads its OWN normal (no node editor links one, a
+  hand-built graph can) has no order: the demand declines and that node
+  differences, as before. A material whose heights read no Bump never
+  asks: it takes the one pass it always took and its fields are the bits
+  they were. (3) *The layered road.* The shared evaluation across the
+  ranks notes every material whose `n_bump` asks -- its contexts read no
+  field at all there: the frame's are the opaque layer's -- and drops
+  that material's shared heights; each rank then builds that material's
+  fields from its own fragments through the same builder. Every other
+  see-through material keeps the one evaluation across the ranks.
+  *Pictures that change*: a material with a Bump whose height reads
+  another Bump's normal, on a frame whose pre-pass runs (the material
+  over 16384 pixels; bands of such a frame) or on the layered road with
+  more than one rank or more than `MAX_CHUNK` fragments. Each is now the
+  frame of that surface shaded in one batch, bit for bit. Nothing else
+  moves. *What it costs*: a Bump over a Bump pays one more evaluation of
+  the lower chain -- the demo floor's frame 0.72 s -> 0.81 s at 640x480
+  and 2.64 s -> 3.21 s at 1280x960, three deep 0.72 -> 0.88 and 2.74 ->
+  3.58; a single Bump is unchanged (0.66 / 0.69, 2.74 / 2.57). Pinned in
+  `test_bump_height_that_reads_a_bump_has_that_field_built_first` (23
+  checks), stand-in trees through the real `serialize_tree`, with spies
+  on the builder, on each pass of the height walk and on every
+  differencing done inside a pre-pass, and with 1.92.0's `n_bump` (deaf
+  to the demand) to show each frame can tell: the pair at 320x240 cut as
+  1.92.0 evaluated it, and now the one-batch frame bit for bit with no
+  Bump differencing inside the pre-pass; the upstream field built first,
+  once, by a pass of its own; the same frame under a finer chunking;
+  128x96 untouched; a chain that reads no Bump taking its one pass;
+  three deep, the lowest first; inside a group; across a group's
+  boundary; three bands joined; a height that reads itself; the
+  see-through floor in two chunks; two ranks against the truth, at two
+  chunk sizes, with a field of the opaque frame's planted under the same
+  key; a see-through Bump that reads no Bump keeping its shared
+  evaluation; the deferred pass's refusal by name; and the rule read
+  from the code (one place asks, two hand out a demand). Fifteen
+  mutations each fail it: `n_bump` never asking, or
+  asking and differencing anyway; the builder's contexts given no
+  demand, or reading the frame's fields; the demand not filing what it
+  built, or evaluating every Bump where one was asked for; the height
+  walk ignoring `only`, or dropping it below the first tree; no guard
+  against a height that reads itself; on the layered road the shared
+  evaluation noting nobody, reading the frame's fields, or keeping the
+  shared heights of a material that asked; the per-rank build left out,
+  handed every rank's fragments, or always the first rank's. *Not
+  verified*: the UI and the viewport; the worker pool's own processes
+  (bands were rendered in one process); the REYES micropolygon grid
+  under such a chain. *Still open from the entry above*: a master
+  INSIDE a group ignoring its linked Bump Height.
 - **A uniform the driver stripped never fails a pass (the llvmpipe field
   log).** A real Blender 5.2.2 session on the OpenGL backend (Mesa
   llvmpipe) printed, for every GPU frame, `rasterising on the CPU: raster
@@ -3148,6 +3246,17 @@ What headless cannot prove, per feature (the fakebpy / fakeblender stubs validat
   device printing its refusal ("no GLSL emitter for ShaderNodeGroup")
   and drawing the CPU's frame; and a group whose interface holds two
   sockets of one name feeding the height.
+- A Bump over a Bump in a real file. The fix is proven headless and in
+  a real Blender 5.2.2 as the `bpy` module in background (two real Bump
+  nodes through `export_material`, in the material's tree and in a real
+  node group: 1.16 off along three rows at 320x240 before, bit for bit
+  after) -- never in the UI and never on a GPU, where the deferred pass
+  refuses such a chain by name. Open there: an F12 at a real frame size
+  of a material whose Bump reads another Bump's normal, with no seam
+  where the pre-pass chunks; a see-through object wearing it, front and
+  back faces both bumped by their own layer; the same frame through the
+  worker pool; and the viewport on the GPU device printing its refusal
+  and drawing the CPU's frame.
 - The llvmpipe session itself (Blender 5.2.2, OpenGL backend, Mesa
   llvmpipe): the three lines gone, `raster split` and `shade split`
   printed in their place, and the Timing Breakdown naming the stripped

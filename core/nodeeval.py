@@ -1871,6 +1871,19 @@ def n_bump(ev, node):
     if c.px is None or c.width <= 0:
         return {'Normal': nrm}
     field = _bump_field_for(c, node)
+    if field is None:
+        # R253 (review): a PRE-PASS is running, and the height chain it is
+        # evaluating reads THIS Bump's normal. The pre-pass works chunk by
+        # chunk, so differencing here would cut this node's gradients at
+        # every chunk edge and bake the cut into the field of the Bump
+        # downstream -- the seam the pre-pass exists to remove, one node
+        # up. The pre-pass hands the context a `bump_demand`: it builds
+        # this node's whole-material field first (its own height chain
+        # over every chunk, whatever THAT reads built before it) and the
+        # chunk gathers from it. No shading batch carries one.
+        demand = getattr(c, 'bump_demand', None)
+        if demand is not None:
+            field = demand(node.get('id'))
     if field is not None:
         # a whole-material gradient pre-pass exists (built when this
         # material is too covered for one shading batch): gather from it,
@@ -1921,9 +1934,11 @@ def has_bump(graph):
     return False
 
 
-def bump_heights(ev, _seen=None):
+def bump_heights(ev, _seen=None, only=None):
     """(node id, heights) for every Bump node below the evaluator: its
-    own tree's, then each node group's, to any depth.
+    own tree's, then each node group's, to any depth. `only`, a set of
+    node ids, keeps the walk and evaluates those nodes' heights alone
+    (the pre-pass building ONE node's field ahead of the rest).
 
     The Bump pre-pass (`core/render._bump_height_fields`, and the layered
     road's per-rank twin) walked the material's own tree only, so a Bump
@@ -1951,14 +1966,15 @@ def bump_heights(ev, _seen=None):
             nid = node.get('id')
             if nid not in seen:
                 seen.add(nid)
-                yield nid, np.asarray(ev.input(node, 'Height', VALUE),
-                                      np.float32).reshape(-1)
+                if only is None or nid in only:
+                    yield nid, np.asarray(ev.input(node, 'Height', VALUE),
+                                          np.float32).reshape(-1)
         elif idn == 'ShaderNodeGroup':
             groups.append(node)
     for node in groups:
         sub = group_evaluator(ev, node, lazy=True)
         if sub is not None:
-            yield from bump_heights(sub, seen)
+            yield from bump_heights(sub, seen, only)
 
 
 def _screen_grad(c, values):

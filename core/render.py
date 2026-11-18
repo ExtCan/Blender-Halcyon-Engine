@@ -7393,39 +7393,82 @@ def _bump_height_fields(job, mat, mi, tri_m, bary_m, px_m, py_m, front_m,
     context and one evaluator per chunk now serve all of the material's
     Bumps (they were rebuilt per node), and the coverage -- one mask,
     whichever node -- is scattered once.
+
+    R253 (review): IN DEPENDENCY ORDER. A height chain may read another
+    Bump's NORMAL (a Bump over a Bump, a Fresnel or a Layer Weight fed by
+    one). Evaluating that chain here pulls the upstream `n_bump` through
+    one chunk before any field exists; it differenced the chunk, its
+    gradients were cut at the chunk's edge, and the cut was baked into
+    the downstream node's field -- the seam this pre-pass removes, moved
+    one node up (0.87 off along three rows at 320x240). So every context
+    of the pre-pass carries `bump_demand`: a Bump met without a field has
+    its own field built first -- its height chain over every chunk, which
+    asks in turn for whatever IT reads -- and the chunk gathers from that.
+    The contexts read the fields of THIS build and no others. A material
+    whose height chains read no Bump never asks: it takes the one pass it
+    always took, and its fields are the bits they were.
     """
     from .nodeeval import GraphEvaluator, bump_heights, has_bump
     graph = getattr(mat, 'graph', None)
     if not has_bump(graph):
         return {}
     H, W = job.height, job.width
-    imgs = {}
+    mi = int(mi)
     valid = np.zeros((H, W), bool)
-    for s in range(0, int(tri_m.size), int(chunkn)):
-        e = min(s + int(chunkn), int(tri_m.size))
-        ctx = job.context(tri_m[s:e], bary_m[s:e], px_m[s:e],
-                          py_m[s:e], front_m[s:e]
-                          if front_m is not None else None,
-                          blin_m[s:e] if blin_m is not None else None,
-                          0, True)
-        ev = GraphEvaluator(graph, ctx, job.textures,
-                            getattr(mat, 'programs', None))
-        for nid, h in bump_heights(ev):
-            img = imgs.get(nid)
-            if img is None:
-                img = imgs[nid] = np.zeros((H, W), np.float32)
-            img[py_m[s:e], px_m[s:e]] = h
-        valid[py_m[s:e], px_m[s:e]] = True
+    valid[py_m, px_m] = True
+    #: (mi, node id) -> (gx, gy), filed as each is final
     fields = {}
-    for nid in list(imgs):
-        img = imgs.pop(nid)
+    building = set()
+
+    def gradients(img):
         gx = np.zeros_like(img)
         gy = np.zeros_like(img)
         gx[:, :-1] = np.where(valid[:, 1:] & valid[:, :-1],
                               img[:, 1:] - img[:, :-1], 0.0)
         gy[:-1, :] = np.where(valid[1:, :] & valid[:-1, :],
                               img[1:, :] - img[:-1, :], 0.0)
-        fields[(int(mi), nid)] = (gx, gy)
+        return gx, gy
+
+    def heights(only=None):
+        """{node id: its height over the material's pixels}, every Bump
+        of the material or the ones in `only`."""
+        imgs = {}
+        for s in range(0, int(tri_m.size), int(chunkn)):
+            e = min(s + int(chunkn), int(tri_m.size))
+            ctx = job.context(tri_m[s:e], bary_m[s:e], px_m[s:e],
+                              py_m[s:e], front_m[s:e]
+                              if front_m is not None else None,
+                              blin_m[s:e] if blin_m is not None else None,
+                              0, True)
+            ctx.bump_fields = fields
+            ctx.bump_demand = demand
+            ev = GraphEvaluator(graph, ctx, job.textures,
+                                getattr(mat, 'programs', None))
+            for nid, h in bump_heights(ev, only=only):
+                img = imgs.get(nid)
+                if img is None:
+                    img = imgs[nid] = np.zeros((H, W), np.float32)
+                img[py_m[s:e], px_m[s:e]] = h
+        return imgs
+
+    def demand(nid):
+        """The field of the Bump `nid`, built now if it is not there:
+        what `n_bump` asks when a height chain reads that node's normal."""
+        if nid in building:
+            return None                 # a height that reads itself: no order exists
+        building.add(nid)
+        try:
+            img = heights({nid}).get(nid)
+        finally:
+            building.discard(nid)
+        if img is None:
+            return None                 # no such Bump below this material
+        fields[(mi, nid)] = gradients(img)
+        return fields[(mi, nid)]
+
+    for nid, img in heights().items():
+        if (mi, nid) not in fields:
+            fields[(mi, nid)] = gradients(img)
     return fields
 
 
@@ -9796,21 +9839,43 @@ def _shade_fragments_cpu(job, tri, bary, px, py, front, rank, st):
     # per depth layer). R253 (review): every Bump of the material, at
     # any depth -- nodeeval.bump_heights, the walk _bump_height_fields
     # takes: a Bump inside a node group had no field on this road either
+    #
+    # R253 (review): "per-fragment pure" holds until a height chain reads
+    # another Bump's NORMAL. That normal is a gradient: here it was
+    # differenced over a chunk of fragments of EVERY rank (cut at the
+    # chunk's edge, and front and back faces colliding at one pixel) and
+    # baked into the downstream heights. Such a material -- `n_bump` asks
+    # for a field while its heights are evaluated, which is how it is
+    # known -- leaves the shared evaluation: each rank builds its fields
+    # from its own fragments through _bump_height_fields, which orders
+    # them by what reads what. Every other material keeps the one pass,
+    # and its bits
     H, W = job.height, job.width
     heights = {}
     mat_idx_of = {}
+    chained = set()
     for mi, mat in bump_mats.items():
         idx = np.nonzero(mat_f == mi)[0]
         if idx.size == 0:
             continue
         mat_idx_of[mi] = idx
         graph = getattr(mat, 'graph', None)
+
+        def asked(_nid, _mi=mi):
+            chained.add(_mi)
+
         for s in range(0, int(idx.size), int(MAX_CHUNK)):
+            if mi in chained:
+                break
             e = min(s + int(MAX_CHUNK), int(idx.size))
             sub = idx[s:e]
             ctx = job.context(tri[sub], bary[sub], px[sub], py[sub],
                               front[sub] if front is not None
                               else None, None, 0, True)
+            # no field of the frame's is this evaluation's to read (they
+            # are the opaque layer's); a Bump that wants one says so
+            ctx.bump_fields = None
+            ctx.bump_demand = asked
             ev = GraphEvaluator(graph, ctx, job.textures,
                                 getattr(mat, 'programs', None))
             for nid, h in bump_heights(ev):
@@ -9818,6 +9883,8 @@ def _shade_fragments_cpu(job, tri, bary, px, py, front, rank, st):
                 if hv is None:
                     hv = heights[(mi, nid)] = np.empty(idx.size, np.float32)
                 hv[s:e] = h
+    for key in [k for k in heights if k[0] in chained]:
+        del heights[key]
 
     col = np.zeros((tri.size, 4), np.float32)
     stash = dict(getattr(job, 'bump_fields', {}) or {})
@@ -9834,6 +9901,15 @@ def _shade_fragments_cpu(job, tri, bary, px, py, front, rank, st):
             if sel.size == 0:
                 continue
             fields = dict(stash)
+            for mi in sorted(chained):
+                idx = mat_idx_of[mi]
+                lay = idx[rank[idx] == r]
+                if lay.size:
+                    fields.update(_bump_height_fields(
+                        job, bump_mats[mi], mi, tri[lay], bary[lay],
+                        px[lay], py[lay],
+                        front[lay] if front is not None else None, None,
+                        MAX_CHUNK))
             for (mi, node_id), hv in heights.items():
                 idx = mat_idx_of[mi]
                 m = rank[idx] == r
