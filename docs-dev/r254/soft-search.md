@@ -1,7 +1,7 @@
 # R254 soft-search: the mapped soft shadow's blocker search and filter
 
-Work-package key `soft-search`, forked from dd9d034 (claude-cloud after the
-map-gpu merge and the integration commit). The integrator owns CHANGELOG.md /
+Work-package key `soft-search`, forked from dd9d034 (the round's base after
+the map-gpu merge and the integration commit). The integrator owns CHANGELOG.md /
 README.md / the version stamps; the fragments below are in their house
 voice. Findings covered: the independent review's SP-1 (high), SP-2 (medium)
 and SP-3 (low) of the mapped soft shadow, the no-caster skip the map-soft
@@ -156,6 +156,18 @@ map-soft and map-gpu packages' census, width, neutrality and timing tools)
   radius)` is the same number at the default and leaves every scene of a
   unit or more alone.)
 
+- **What it costs.** On the GPU road, texels: an open floor fetches half
+  of what it did (a point lamp of radius 0.1 at Samples 4: 14.9 -> 7.1 per
+  point looked up); a crowded frame 5 to 29 % fewer for a Point, Spot or
+  Sun lamp, and a wide Area lamp 5 % more at Samples 4. On the CPU road
+  the search and the filter now fetch their taps in blocks (the same
+  values in the same order, bit for bit): the lookup of a crowded frame is
+  15 to 31 % cheaper at Samples 16 and, at Samples 4, 7 to 14 % cheaper
+  for a cube lamp and up to 22 % dearer for a Sun's or a Spot's 512 map
+  (0.02 to 0.06 s of a frame). Cold, a map pays its pyramid once per bake:
+  16 ms for a 512 cube, 209 ms for a 2048 one, 2 to 23 ms for a flat map.
+  The lamp's depth pack grows by 26 %. Tables under "Cost".
+
 ## The numbers
 
 ### SP-1: a Sun over a growing ground (`probes/probe_dmin.py`, 200x150)
@@ -206,7 +218,9 @@ warning stands. POINT and SPOT were independent of the ground and are
 Add > Light > Sun with its Angle at 0.2, the reviewer's scene, 320x240; and
 an Area lamp of shape RECTANGLE over a wall, orthographic camera above.
 Sheet: `<scratch>/wt/soft-search/out/soft_search_before_after.png` (left the
-traced reference, middle the fork point, right this tree).
+traced reference, middle the fork point, right this tree). Rendered again
+through the package's last code commit: the 24 frames are the same arrays
+(`probes/bl_same.py`).
 
 | case | traced, 64 rays | before | after |
 |---|---|---|---|
@@ -445,8 +459,293 @@ bound alone (before the level-receiver test) a Sun paid MORE than on the
 fork point -- 17.3 against 14.5, the bound's texels on top of a search that
 its own ground never let it skip -- which is why the height part exists.
 
+The same count in a CROWDED frame (the timing scene under "Cost": six
+spheres of radius 0.9 on a 14-unit floor, two lamps, 640x480;
+`aud/look_prof.py`), where a caster stands within reach of most receivers
+and few points skip:
+
+| lamp | Samples 4: before -> after | Samples 16 | pyramid texels per point | points that skip |
+|---|---|---|---|---|
+| POINT 0.3 | 28.1 -> 26.8 | 72.7 -> 62.9 | 4.0 | 28 % |
+| SPOT 0.3 | 29.7 -> 27.9 | 79.1 -> 66.7 | 4.6 | 31 % |
+| SUN 0.05 | 18.6 -> 14.9 | 54.2 -> 38.7 | 4.0 | 53 % |
+| AREA 1.0 | 35.6 -> 37.3 | 102.0 -> 100.7 | 3.4 | 13 % |
+
+A wide Area lamp over a crowded floor is the case that does not gain: 13 %
+of its points skip, every point pays the bound's 3.4 texels, and at
+Samples 4 it fetches 5 % MORE than on the fork point (1 % fewer at 16).
+The others gain beyond their skips because the tighter reach calls fewer
+points partly shadowed (a point lamp's probes: 112,633 -> 78,331).
+
 Text of one sized lamp's shadow function (`ms/glsl_size.py`, the literal
-road): POINT 0.3 17,882 -> 22,404 bytes at Samples 4 and 35,463 -> 40,191
-at 16; SPOT 13,249 -> 17,430 and 29,810 -> 34,197; SUN 12,689 -> 16,685 and
-29,250 -> 33,452; AREA 18,469 -> 22,991 and 36,050 -> 40,778. A lamp of
+road): POINT 0.3 17,882 -> 22,592 bytes at Samples 4 and 35,463 -> 40,379
+at 16; SPOT 13,249 -> 17,492 and 29,810 -> 34,259; SUN 12,689 -> 16,747 and
+29,250 -> 33,514; AREA 18,469 -> 23,179 and 36,050 -> 40,966. A lamp of
 size 0 on the constant lookup: 4,161 and 7,353 bytes, unchanged.
+
+## Cost
+
+**On the GPU road the cost is texels**, and the tables under "The GPU
+road" are the measure: half the fetches on an open floor; in a crowded
+frame 5 to 29 % fewer for a Point, Spot or Sun lamp, and for a wide Area
+lamp 5 % MORE at Samples 4 and 1 % fewer at 16.
+
+**On the CPU road it is numpy passes**, and the first timing of the lookup
+alone showed the bound costing more than it saved: seconds inside
+`softmap.lookup` per warm frame of the crowded scene (`aud/look_time.py`,
+`look.sh`: 640x480, two lamps of the kind, one for a Sun; six 96-segment
+spheres on a floor, 55k triangles) were 6 to 35 % HIGHER at Samples 4 than
+on the fork point (POINT 0.518 -> 0.605 s on a 512 map, AREA 0.637 ->
+0.823) -- the bound's reads and a strip's extra lattices are calls on
+small arrays, where a call costs more than its values. The search and the
+filter now fetch their taps in blocks (`TAP_BATCH`: the four texels of a
+bilinear tap in one fetch, several taps per fetch while a block stays
+inside the cache). The values, and the order they are summed in, are tap
+by tap what one tap at a time gives: every CPU and simulator frame of the
+neutrality dump is bit for bit what it was before the change, and a frame
+is the same array at a block of 1, 8192, 32768, 131072 and 524288 values.
+With it, the fork point and this tree back to back, two rounds, the lowest
+of three warm frames each, a machine at a load of 3 to 4:
+
+| lamps, map | before: cold / Samples 4 / Samples 16 | after | warm, after / before: 4, 16 |
+|---|---|---|---|
+| 2 POINT 0.3, 512 | 0.570 / 0.590 / 1.214 | 0.583 / 0.538 / 0.881 | 0.91, 0.73 |
+| 2 POINT 0.3, 2048 | 0.615 / 0.587 / 1.416 | 0.911 / 0.504 / 1.001 | 0.86, 0.71 |
+| 2 SPOT 0.3, 512 | 0.347 / 0.313 / 0.734 | 0.369 / 0.374 / 0.623 | 1.20, 0.85 |
+| 2 SPOT 0.3, 2048 | 0.399 / 0.366 / 0.878 | 0.418 / 0.345 / 0.665 | 0.94, 0.76 |
+| 1 SUN 0.05, 512 | 0.108 / 0.101 / 0.252 | 0.123 / 0.123 / 0.212 | 1.22, 0.84 |
+| 1 SUN 0.05, 2048 | 0.130 / 0.114 / 0.272 | 0.165 / 0.124 / 0.187 | 1.08, 0.69 |
+| 2 AREA 1.0, 512 | 0.659 / 0.687 / 1.832 | 0.714 / 0.638 / 1.342 | 0.93, 0.73 |
+| 2 AREA 1.0, 2048 | 0.718 / 0.745 / 1.892 | 1.024 / 0.678 / 1.378 | 0.91, 0.73 |
+
+At Samples 16 the lookup is 15 to 31 % cheaper on every row. At Samples 4
+a cube lamp's (POINT, AREA) is 7 to 14 % cheaper and a flat map's lies
+between 6 % cheaper and 22 % DEARER: a Sun's and a Spot's 512 map, 0.02
+and 0.06 s of a frame. Their frame is one array of 220k to 400k points,
+where grouping the taps gains nothing and the search is at its cheapest,
+and the bound's four reads per point (each a handful of index gathers in
+numpy) cost more than the third to half of the searches they spare. The
+cold frame's lookup carries the pyramid's build: 0.3 s for the two 2048
+cubes.
+
+Whole frames of the same runs (seconds: cold / warm at Samples 4 / warm at
+Samples 16):
+
+| lamps, map | before | after | warm, after / before: 4, 16 |
+|---|---|---|---|
+| 2 POINT 0.3, 512 | 1.77 / 0.96 / 1.58 | 1.81 / 0.93 / 1.22 | 0.97, 0.77 |
+| 2 POINT 0.3, 2048 | 4.63 / 0.94 / 1.66 | 5.03 / 0.88 / 1.35 | 0.93, 0.81 |
+| 2 SPOT 0.3, 512 | 0.96 / 0.76 / 1.12 | 0.95 / 0.81 / 1.01 | 1.08, 0.91 |
+| 2 SPOT 0.3, 2048 | 2.73 / 0.78 / 1.21 | 2.70 / 0.74 / 1.06 | 0.96, 0.87 |
+| 1 SUN 0.05, 512 | 0.63 / 0.50 / 0.59 | 0.57 / 0.47 / 0.57 | 0.94, 0.98 |
+| 1 SUN 0.05, 2048 | 1.16 / 0.47 / 0.62 | 1.10 / 0.47 / 0.53 | 1.01, 0.86 |
+| 2 AREA 1.0, 512 | 1.88 / 1.31 / 2.36 | 1.89 / 1.26 / 1.93 | 0.96, 0.82 |
+| 2 AREA 1.0, 2048 | 4.83 / 1.46 / 2.40 | 5.35 / 1.32 / 1.92 | 0.90, 0.80 |
+
+A warm frame at Samples 16 is 2 to 23 % shorter; at Samples 4 between 10 %
+shorter and 8 % longer (the Spot on its 512 map). The cold frame of two
+2048 cubes is 0.4 to 0.5 s longer (4.63 -> 5.03, 4.83 -> 5.35): the build
+below.
+
+Beside them, from the earlier back-to-back run of `aud/perf2.py` (code
+this package did not touch): the same lamps TRACED with 4 rays, warm, 5.62
+/ 5.69 / 2.18 / 5.88 s before and 5.51 / 5.56 / 2.25 / 5.94 s after for
+POINT / SPOT / SUN / AREA; and the same lamps with no size on a 512 map
+(the constant lookup, a control: the same code on both trees) 0.57 / 0.59
+/ 0.40 before and 0.57 / 0.51 / 0.40 after, which is the spread to read
+the frame table with.
+
+**The pyramid's build** is the cold cost, once per bake of a map that a
+per-receiver lookup reads (`aud/pyr_same.py`, the best of three, the same
+machine): a flat map 1.5 ms at 512, 6 ms at 1024, 23 ms at 2048; a cube
+16 ms at 512, 55 ms at 1024, 209 ms at 2048. From a face of 1024 texels
+the first pooling of each face and part and the four seam directions run
+in a thread pool, as the bake's own faces do (307 -> 209 ms for the 2048
+cube on four busy cores; the blocks are bit for bit the same). A lamp on
+the constant lookup (size 0 at Softness 1 or less, or Samples 1) never
+builds one. On the GPU road the lamp's depth pack grows by the pyramid's
+rows, 26 % of its texels, uploaded with the pack when the map changes.
+
+## Limits
+
+- **Thin casters under wide lamps: not fixed.** A pole much thinner than
+  the kernel is found by some receivers' 13 search taps and stepped over by
+  their neighbours', whatever bounds the reach: the pyramid tightens the
+  reach to the nearest depth around the receiver and a pole standing on the
+  receiver's own floor leaves that depth where it was. Steps above 0.12
+  along three floor lines of 1401 samples in the map-soft test's scene of
+  thin poles (`aud/poles.py`), before -> after: Samples 4, Radius 0.25 /
+  0.5 / 1.0: 0 -> 0, 6 -> 5, 19 -> 22; Samples 16: 0 -> 0, 3 -> 4, 6 -> 6.
+  One cheap idea was measured in
+  a scratch copy and not taken (`patch/exp_thin.py`: where the search found
+  nothing but the pyramid shows a depth nearer than the receiver's own
+  plane explains, search once more at that depth's reach): 5 -> 2 steps at
+  Radius 0.5 and 22 -> 25 at Radius 1.0, at the price of a second search
+  on those fragments. Not better everywhere.
+- **Two casters at different depths over one receiver: not fixed.** The
+  search averages the blockers it finds, so a receiver under a near and a
+  far caster gets a penumbra between the two, and which taps find which
+  caster changes as a lamp moves. The review's numbers stand:
+  `probe_flicker.py`, pixels whose mapped term moves by more than 0.15 in a
+  frame where 64 traced rays move by less than 0.05, six frames, before ->
+  after: POINT 0.25 [16, 20, 11, 32, 13, 15] -> [16, 20, 12, 32, 13, 15];
+  POINT 0.5 [26, 27, 45, 45, 30, 54] -> [26, 26, 45, 45, 30, 54]; POINT
+  0.1 [12, 13, 13, 11, 9, 7] -> the same; SPOT 0.25 [9, 4, 3, 6, 9, 11] ->
+  [8, 4, 2, 4, 8, 9]; SUN 0.05 turning [3, 8, 5, 21, 5, 1] -> the same;
+  AREA 1.0 [45, 37, 66, 70, 32, 71] -> [45, 38, 65, 70, 33, 70].
+  `probe_beam.py` (a thin beam 2.4 above the floor, the profile of its
+  shadow band against 256 traced rays), the mean / largest distance from
+  the traced band: Radius 0.25 0.047 / 0.15 (512) and 0.035 / 0.12 (2048),
+  Radius 0.5 0.086 / 0.21 and 0.091 / 0.22, Radius 1.0 0.143 / 0.23 and
+  0.148 / 0.23 -- the fork point's numbers to the last digit (at Radius 1.0
+  the band is 2.09 wide at half depth where the traced one is 0.71). No
+  change is made for it. The one cheap idea tried in this package (the
+  second search above) was measured on the poles only and dropped there,
+  and it would not keep two layers apart either; the remedy is a search
+  that does, which is a different lookup.
+- **A strip's long side at Samples 4 is still lumpy.** The lattice is finer
+  across the strip only; along it the 4 x 4 lattice spans the long radius
+  as before (rms against the traced ramp 0.0226 -> 0.0230, largest change
+  0.088; `out/strip_long_zoom.png`).
+- **A strip that stands diagonally in the map is helped less.** The finer
+  stride is taken along an axis of the map. A footprint at 45 degrees to
+  the map's axes has equal radii along both, so it keeps the one stride
+  and the fork point's width; in between it is sharpened as far as its
+  per-axis ratio goes (from 1.5). A lattice turned to the footprint would
+  serve every pose and is a different filter.
+- **A 512 map over a 400-unit ground is past what the map resolves.** One
+  texel is 1.2 units there, twice the figure's width; the shadow holds
+  213.5 of the traced mass of 375.6 (169.5 before). The console's texel
+  warning says so; the Map Size is the remedy (357.8 at 2048).
+- **The level-receiver skip stops at a cube's seams.** The height part of a
+  cube face knows nothing past the face's edge, so a floor point whose
+  reach crosses a seam is searched (and gets the value it always got).
+- **A Softness above 8 near a cube's seam.** The seam ring covers the
+  cap's reach up to a Softness of 8 texels (`_SEAM_SOFT`); past it a reach
+  that crosses a seam is bounded by the nearest depth of the whole cube,
+  as on the fork point.
+- **The Bias bound needs the stamp.** `scene_radius` is set by
+  `core/render._build_shadows`; a map baked by another caller carries none
+  and its Bias is the dial's own value.
+
+## Not done
+
+- The seam ring's build (the largest part of a 2048 cube's 209 ms)
+  computes every tile's image on the neighbouring face in float64 over a
+  full grid. A cube's faces are axis-aligned, so the image is separable
+  (one coordinate depends on the distance past the edge alone); written
+  that way it would be about a third of the work. Not attempted: the
+  function is the conservative bound's delicate part.
+- The tightening steps read 3.4 to 4.6 pyramid texels per point in a
+  crowded frame. The last read of most points lands in the cell the read
+  before it returned (the reach moved, its level did not) and could be
+  spared by comparing the levels first; on a cube the floor term still
+  has to be recomputed. About one texel of 27 per fragment at Samples 4.
+  Not attempted.
+- No GPU hardware timing: the fetch counts above are the two roads' common
+  branches, counted on the CPU road.
+
+## Pins changed
+
+| test | old assertion | new assertion | why |
+|---|---|---|---|
+| `tests/test_r254_map_soft.py` `test_j_the_gpu_twin` | `bar = 6e-3 if kind == 'AREA' else 1e-4` | `bar = 6e-3 if kind == 'AREA' else 5e-4` | the reach is read off tiles; one pixel of 5285 at 1.0e-4 where the two roads stand on either side of a tile border (SPOT with its own Bias and Softness). The frame bar is 6e-3. |
+| `tests/test_r254_map_gpu.py` `test_a_softness_blurs_a_size_zero_lamp` | the "constant lookup, bitwise" list held `{'shadow_softness': 4.0, 'shadow_samples': 1}` | that entry is `{'shadow_softness': 1.0, 'shadow_samples': 1}`, and a new check: Samples 1 at Softness 4 is the constant lookup of Softness 1, bitwise | the pin held the shrinking hard shadow this package removes (item 4) |
+| `tests/test_r254_map_gpu.py` `test_g_the_pack_is_one_channel` | `px.shape == (2 * 128, 3 * 128)`; `key == ('shadowpack', ('shadow', 128, (3, 2), 'CLS'))` | `px.shape == (2 * 128 + 2 * lay['h'], 3 * 128)`, each face's pyramid block equal to `map_pyramid(sm)` on the grid, nothing beside them; `key == ('shadowpack', ('shadow', 128, (3, 2), 'CLS', 'PYR'))` | the lamp in that test has a Radius: its pack carries the pyramid's rows, announced in the key |
+
+No test was removed.
+
+## Tests
+
+`tests/test_r254_soft_search.py`, 117 checks, shaped like
+`test_r253_light_options` (`check`, `FAILS`, `main`):
+
+- `test_a_the_pyramid_is_a_lower_bound`: every cell against the brute-force
+  minimum of the texels a tap within its reach can read, flat maps and a
+  cube with its seams; the layout; the slot.
+- `test_b_a_sun_shadow_does_not_depend_on_the_ground`: SP-1 -- grounds of 20
+  and 80 units, the traced mass within 5 %, the penumbra growing with the
+  Angle, the reach per tightening step.
+- `test_c_a_caster_beside_the_lamp_moves_nothing`: the fixture plate.
+- `test_d_no_caster_in_reach_skips_the_search`: the share that skips per
+  kind, the skip against the search it replaces bit for bit, a size-0 lamp
+  under a Softness bitwise the lookup bounded by the whole map.
+- `test_e_the_gpu_twin`: simulator against CPU on both value roads, the
+  pack's layout, key and stamp, the emitted text.
+- `test_f_other_lamps_keep_their_lookup`: size 0 at Softness 1 or less,
+  Samples 1, traced lamps -- the same arrays and the same GLSL.
+- `test_g_a_strip_lamp_keeps_its_thin_side_sharp`: SP-2 -- widths against
+  the traced edge, the Size series, round footprints bit for bit, no flat
+  penumbra on a ball.
+- `test_h_one_sample_does_not_shrink_under_softness`: item 4, both roads,
+  Softness 1 or less bitwise.
+- `test_i_a_small_scene_keeps_its_mapped_shadows`: SP-3 -- the scene at a
+  hundredth, a scene of a unit or more bitwise, the console note, both
+  roads.
+- `test_j_a_level_receiver_skips_under_a_slanted_light`: the height part is
+  an upper bound of the heights, the share that skips, exactness, tilted
+  normals, the shader's branch.
+
+On the fork point: 27 failures -- all ten functions fail. Six raise on what
+does not exist there (the pyramid, the stamp); 21 checks fail by value:
+SP-1's three, the fixture's two, the four skip shares and the two size-0
+exactness checks, SP-2's three, Samples 1's seven
+(`logs/t_ss_on_base_final.txt`).
+
+Run for this package (not the full suite): every `tests/test_r254_*.py`,
+`test_r253_light_options`, `test_r251_shadow`, the four named functions of
+`test_render`, and `tests/glsl_strict.py` with glslang -- "every shader
+compiles under strict GLSL 4.30 (526 distinct texts)". Green except three
+checks that fail identically on the fork point and are not this package's:
+`test_r251_shadow` 1 (the zip pinned at 1.89.0) and `test_r254_flags` 2
+("its passes bake the ambient literal they always did and read no tail
+texel", "and the uploaded row is 2 x STRIDE texels").
+
+## Files
+
+- `core/softmap.py`: the reach pyramid (`pyr_layout`, `_pool_first`,
+  `_pool_next`, `_dilate3`, `seam_ring`, `_seam_grids`, `_neg_heights`,
+  `_build_pyramid`, `map_pyramid`, `_reach_min`), the bounded search and
+  the two skips in `_face`, the per-axis lattice in `_filter`, the taps
+  in blocks (`TAP_BATCH`), the threaded build (`_each`), `stamp_scene`,
+  `scene_bias`.
+- `gpu/softmap.py`: the twin (`hal_sm_cell`, `hal_sm_near`, the tightening
+  steps, the level test, the per-axis lattice).
+- `gpu/shade.py`: the pyramid's rows in the depth pack, the key's `'PYR'`,
+  the scene-bounded Bias texel.
+- `gpu/material.py`: the Samples-1 factor (texel `h2.y` and its literal) is
+  1.
+- `core/lights.py`: two slots (`pyr`, `scene_radius`) on `ShadowMap` and
+  `CubeShadow`; in `visibility` the classic offset without the Softness
+  factor and the Bias through `scene_bias`. Nothing in the bake.
+- `core/render.py`: `stamp_scene` after the bake, `_shadow_bias_note`.
+- `properties.py`: one sentence in the render Bias tooltip.
+- `tests/test_r254_soft_search.py` (new), `tests/test_r254_map_soft.py`,
+  `tests/test_r254_map_gpu.py` (the pins above).
+- `docs-dev/r254/soft-search.md`.
+
+## Notes for the merge
+
+- **The bake.** `map_pyramid` parks the pyramid on the map (`pyr`). A bake
+  that rewrites `depth` IN PLACE must set `pyr = None` wherever it resets
+  `digest`; a bake that builds new `ShadowMap` / `CubeShadow` objects needs
+  nothing (the slot starts unset and is read with `getattr`). The two
+  classes' `__slots__` gained `'pyr'` and `'scene_radius'` in
+  `core/lights.py`; that is the only edit near the bake, and a rewrite of
+  the classes has to keep both names.
+- **The stamp.** `scene_radius` is written by `softmap.stamp_scene(scene)`
+  in `core/render._build_shadows`, right after `LI.build_shadow_maps`. If
+  the bake moves or caches maps across scenes, the stamp has to follow the
+  scene that is being rendered (it is rewritten on every call, cached map
+  or not).
+- **Cold cost.** A sized lamp's first lookup after a bake builds the
+  pyramid (209 ms for a 2048 cube, 16 ms for a 512 one); a faster bake
+  makes that share larger. It is per map object, so a map that the bake's
+  cache hands back keeps it. From a face of 1024 texels the build opens
+  its own thread pool (`softmap._each`), as `_build_shadow_maps` does for
+  its faces: if the bake moves into worker processes or grows a shared
+  pool, that is the place to hand it one.
+- `tests/run_all.py` is not edited: `test_r254_soft_search` has to be added
+  to its list by the integrator.
+- The two `test_r254_flags` failures and the `test_r251_shadow` zip pin are
+  on the fork point as well.
