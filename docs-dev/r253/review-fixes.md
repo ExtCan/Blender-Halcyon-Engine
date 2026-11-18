@@ -1993,12 +1993,12 @@ there alone.
   other way. That shader is pinned.) A zero divisor answers what it did;
   the language leaves it undefined. *What moves.* Asked before anything
   was changed: the unchanged tree ran the whole suite with a recorder on
-  that one line of `binary` (on `1e6239c`, and again on `e228c85`, whose
-  numbers these are). 2835 division sites in 1328 distinct sources divide
-  two signed ints (86015 executions, 249 million live lanes, 214 million
+  that one line of `binary` (on `1e6239c`, and again on `9fc4d43`, whose
+  numbers these are). 2912 division sites in 1360 distinct sources divide
+  two signed ints (87569 executions, 260 million live lanes, 224 million
   of them with a fraction in the quotient, no negative operand, no zero
   divisor in a live lane and 1.96 million in lanes outside the mask).
-  2833 of the sites are the engine's own and they are ONE idiom in 12
+  2910 of the sites are the engine's own and they are ONE idiom in 12
   spellings -- the texel address of a data texture,
   `texelFetch(hal_gb_attrs, ivec2(index % side, index / side), 0)`, over
   `hal_gb_attrs`, `hal_gb_tris`, `hal_ink_fn`, `hal_sres`,
@@ -2021,65 +2021,65 @@ there alone.
   that compiled and ran is refused, and nothing else moved.* Held four
   ways. The suite, `python3 -m halcyon.tests.run_all` on the unchanged
   head and on the changed tree, the checks compared line by line: on
-  `claude-cloud` at `e228c85`, the tree this lands on, 13106 checks pass
-  and 32 FAIL lines are printed before (each the `halcyon-1.89.0.zip` no
-  fresh container has beside the package), 13172 pass and the same 32
-  lines are printed after, character for character and in the same order;
-  no check is lost and the 66 more are the new ones. On `1e6239c`, where
-  the four were reproduced, 12863 and 64 before (32 the zip, 32 the
-  bitwise twins a few 1e-7 off that `e228c85` has since put right), 12929
-  and the same 64 lines after. Every compile and every run the suite
-  makes, repeated by the unchanged front-end imported beside the changed
-  one, on the same uniforms and inputs: 3668 distinct sources through
-  `try_compile` (3152 compile in both to the same outputs, uniforms,
-  inputs and warnings, 504 are refused in both in the same words, and the
-  12 that differ are the new tests' own: 7 members of a matrix or an
-  array, 5 array fields) and 9900 runs of 2353 distinct programs. Outside
-  the four new tests every run returns the same arrays -- values, shapes
-  and dtypes -- and the same discard mask (one raises, the same error in
-  both): 9373 runs. The other 527 are the new tests' shaders, which
-  raised or answered otherwise before. 6000 seeded random shaders of what
-  ran before (every type, operator, constructor, swizzle, array, struct,
-  function and branch, 5760 of them dividing ints) were compiled and run
-  by the unchanged front-end and the changed one, and where the two
-  differed by the changed one with the cut switched off: all compile and
-  run in both, 1790 to the same bits and dtypes, and the other 4210
-  differ by the cut alone -- with it off they are the old values bit for
-  bit (1550 of the dividing shaders do not move at all: their quotients
-  are exact). 6000 more with what could not run mixed in (columns and
-  components of matrices, declared matrices, functions returning one,
-  writes through a variable index, array fields, indices that leave the
-  range): 4294 raised before and run, 251 were refused before and compile
-  (each the array field's `swizzle ... out of range for float`), 446 are
-  the same bits, 964 differ by the cut alone, 25 by the clamp of a vector
-  index past the end (with or without the cut: the old read restored,
-  they are the old values), 20 raise in both -- a number written past the
-  size, now by name -- and none is newly refused, newly raises or moves
-  for another reason. And 40 of 41 mutations of the fix each fail the
-  tests; the one that does not (the struct constructor converting to the
-  bare field type) changes nothing a shader can observe, since a
-  conversion passes an array of its own base through. What IS newly
-  refused is, by intent: a member of a matrix or an array wherever it is
-  written (it raised when a lane got there, or swizzled the lanes). What
-  changes value is, by intent: a quotient of two ints that has a
-  fraction, and a per-lane read of a vector past its last component.
-  *Seen and left* (each reproduced; none is one of the four): an array
-  sized by a named constant is one element -- `const int N = 3; float
-  a[N];` declares a float, because `Parser.parse_array_suffix` reads a
-  number and nothing else (`#define N 3` works); reads through any index
-  answer that one float, as they did, and a write past index 0 is refused
-  by name, as it raised. A compound assignment evaluates its right side
-  twice (`Interpreter.assign`): `x += float(i++)` leaves `i` at 2 and
-  adds 1. The value of an assignment through a swizzle or a vector
-  component is the vector as it was (`a.x = b.x = 1.0` gives `a.x` the
-  old `b.x`); through an element, a column or a field it is the value
-  written. A matrix times or divided by a scalar still raises (the six
-  above left it), and so does `m == m`. A `uniform mat3` on the node is a
-  float socket (`KIND_TO_SOCKET`), so the uniform arrives as a float and
-  every use of it fails -- unbound it is a zero matrix and works. A
-  number written past the size in a READ (`a[5]` of a `float a[3]`) is
-  clamped in silence where a driver refuses the text. `uint` division by
-  zero answers 0 with a NumPy cast warning, `int` division by zero the
+  `claude-cloud` at `9fc4d43`, 13221 checks pass and 32 FAIL lines are
+  printed before (each the `halcyon-1.89.0.zip` no fresh container has
+  beside the package), 13287 pass and the same 32 lines are printed
+  after, character for character and in the same order; no check is lost
+  and the 66 more are the new ones. On `1e6239c`, where the four were
+  reproduced, 12863 and 64 before (32 the zip, 32 the bitwise twins a few
+  1e-7 off that claude-cloud has since put right), 12929 and the same 64
+  lines after. Every compile and every run the suite makes, repeated by
+  the unchanged front-end imported beside the changed one, on the same
+  uniforms and inputs: 3734 distinct sources through `try_compile` (3217
+  compile in both to the same outputs, uniforms, inputs and warnings, 505
+  are refused in both in the same words, and the 12 that differ are the
+  new tests' own: 7 members of a matrix or an array, 5 array fields) and
+  10074 runs of 2418 distinct programs. Outside the four new tests every
+  run returns the same arrays -- values, shapes and dtypes -- and the
+  same discard mask (one raises, the same error in both): 9547 runs. The
+  other 527 are the new tests' shaders, which raised or answered
+  otherwise before. 6000 seeded random shaders of what ran before (every
+  type, operator, constructor, swizzle, array, struct, function and
+  branch, 5760 of them dividing ints) were compiled and run by the
+  unchanged front-end and the changed one, and where the two differed by
+  the changed one with the cut switched off: all compile and run in both,
+  1790 to the same bits and dtypes, and the other 4210 differ by the cut
+  alone -- with it off they are the old values bit for bit (1550 of the
+  dividing shaders do not move at all: their quotients are exact). 6000
+  more with what could not run mixed in (columns and components of
+  matrices, declared matrices, functions returning one, writes through a
+  variable index, array fields, indices that leave the range): 4294
+  raised before and run, 251 were refused before and compile (each the
+  array field's `swizzle ... out of range for float`), 446 are the same
+  bits, 964 differ by the cut alone, 25 by the clamp of a vector index
+  past the end (with or without the cut: the old read restored, they are
+  the old values), 20 raise in both -- a number written past the size,
+  now by name -- and none is newly refused, newly raises or moves for
+  another reason. And 40 of 41 mutations of the fix each fail the tests;
+  the one that does not (the struct constructor converting to the bare
+  field type) changes nothing a shader can observe, since a conversion
+  passes an array of its own base through. What IS newly refused is, by
+  intent: a member of a matrix or an array wherever it is written (it
+  raised when a lane got there, or swizzled the lanes). What changes
+  value is, by intent: a quotient of two ints that has a fraction, and a
+  per-lane read of a vector past its last component. *Seen and left*
+  (each reproduced; none is one of the four): an array sized by a named
+  constant is one element -- `const int N = 3; float a[N];` declares a
+  float, because `Parser.parse_array_suffix` reads a number and nothing
+  else (`#define N 3` works); reads through any index answer that one
+  float, as they did, and a write past index 0 is refused by name, as it
+  raised. A compound assignment evaluates its right side twice
+  (`Interpreter.assign`): `x += float(i++)` leaves `i` at 2 and adds 1.
+  The value of an assignment through a swizzle or a vector component is
+  the vector as it was (`a.x = b.x = 1.0` gives `a.x` the old `b.x`);
+  through an element, a column or a field it is the value written. A
+  matrix times or divided by a scalar still raises (the six above left
+  it), and so does `m == m`. A `uniform mat3` on the node is a float
+  socket (`KIND_TO_SOCKET`), so the uniform arrives as a float and every
+  use of it fails -- unbound it is a zero matrix and works. A number
+  written past the size in a READ (`a[5]` of a `float a[3]`) is clamped
+  in silence where a driver refuses the text. `uint` division by zero
+  answers 0 with a NumPy cast warning, `int` division by zero the
   dividend times 1e30. A float vector built from ints alone is held as an
   int array and arithmetic on it runs in float64 -- why the quotient
   keeps its dtype. Pinned in `tests/test_shaders.py` (four tests, 66
