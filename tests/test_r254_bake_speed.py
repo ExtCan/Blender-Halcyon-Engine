@@ -608,23 +608,62 @@ def test_c_maps_are_baked_for_the_lamps_something_reads():
     st.global_ambient = (0.0, 0.0, 0.0)
     (a, na, ma, sc, s), (b, nb, _mb, _s2, _t2) = run(sun_point, st=st,
                                                      sc_fn=vol_scene)
+    # the volume march lights a container from the FRAME's lamps (the
+    # flags package: volume.scatter_lights), so a lamp the Light Limit
+    # dropped is looked up by nothing and its promise is never called
+    check('a lamp the Light Limit dropped lights no volume and is looked '
+          'up by nothing: its cube is never baked (it was: 6 faces) and '
+          'the frame is the every-map frame',
+          ma == [False, False] and na == 0 and nb == 6
+          and np.array_equal(a, b), f'{na} / {nb} faces')
+
+    # a reader the rule does not name: the march lights a container from
+    # a Screen Spotlight as from a spot, and shadows it. No surface reads
+    # that lamp's shadow, so its map is only promised -- and the march's
+    # first lookup bakes it
+    def sun_screen():
+        return [Light(type='SUN', name='Sun', direction=(-0.4, 0.35, -0.85),
+                      energy=2.0, shadow='NONE'),
+                Light(type='SPOT', name='SS', position=(-1.3, 0.2, 6.0),
+                      direction=(0.2, 0.0, -1.0), energy=3000.0,
+                      shadow='MAP', spot_size=1.2, screen_spot=True)]
+    st = base_settings(W, H)
+    st.shadow_map_size = 64
+    st.global_ambient = (0.0, 0.0, 0.0)
+    (a, na, ma, sc, s), (b, nb, _mb, _s2, _t2) = run(sun_screen, st=st,
+                                                     sc_fn=vol_scene)
     st2 = copy.copy(st)
-    sc2 = vol_scene(sun_point(), st2)
+    sc2 = vol_scene(sun_screen(), st2)
     sc2.lights[1].shadow = 'NONE'
     unshadowed = _cold(sc2, st2)
-    check('a lamp the Light Limit dropped still shadows a volume it '
-          'lights: the march\'s first lookup bakes its map (the frame is '
-          'the every-map frame, and not the unshadowed one)',
-          ma == [False, True] and na == nb == 6 and np.array_equal(a, b)
+    check('a Screen Spotlight still shadows a volume it lights: the '
+          'march\'s first lookup bakes its map (the frame is the every-'
+          'map frame, and not the unshadowed one)',
+          ma == [False, True] and na == nb == 1 and np.array_equal(a, b)
           and not np.array_equal(a, unshadowed))
     LI.clear_shadow_cache()
-    sc3 = vol_scene(sun_point(), copy.copy(st))
+    sc3 = vol_scene(sun_screen(), copy.copy(st))
     s3 = copy.copy(st)
     with _spy() as calls:
-        R._build_shadows(sc3, s3, sc3.mesh)
+        R._build_shadows(sc3, s3, sc3.mesh, traced=False)
     check('...and not before: the frame\'s own build leaves it a promise',
           not calls and sc3.lights[1].shadow_map is None
           and LI.map_deferred(sc3.lights[1]))
+
+    # the march does not ask a lamp of no radiance (it adds zeros to the
+    # container whatever its shadow says; asking baked its promised map)
+    def sun_dark():
+        return [Light(type='SUN', name='Sun', direction=(-0.4, 0.35, -0.85),
+                      energy=2.0, shadow='NONE'),
+                Light(type='POINT', name='Pt', position=(-1.3, 0.2, 6.0),
+                      energy=0.0, shadow='MAP')]
+    (a, na, ma, sc, s), (b, nb, _mb, _s2, _t2) = run(sun_dark, st=st,
+                                                     sc_fn=vol_scene)
+    check('a Power 0 lamp beside a volume: the march does not ask for its '
+          'shadow, no map is baked (every map: 6 faces) and the frame is '
+          'the every-map frame',
+          ma == [False, False] and na == 0 and nb == 6
+          and np.array_equal(a, b), f'{na} / {nb} faces')
 
     def ground(sc, st):
         sc.world.ground_plane = True
@@ -863,16 +902,19 @@ def test_e_a_viewport_draft_bakes_draft_sized_maps():
           draft.copy()._shadow_map_div == 4
           and '_shadow_map_div' not in st.copy().__dict__)
     # the blur keeps its world width: the Softness is in texels. Measured
-    # as the Sun's shadow mass on the floor: with the Softness divided the
-    # draft keeps the refine's; undivided, four times the texels of a map
-    # a quarter of the side is sixteen times the blur and the shadow of a
-    # size-0 lamp erodes away
+    # on the Sun's shadow on the floor as the AREA OF ITS PENUMBRA (the
+    # points neither lit nor dark): with the Softness divided the draft
+    # keeps the refine's; undivided, the same count of texels four times
+    # as wide is a blur four times as wide. (The shadow's mass no longer
+    # tells the two apart: a Softness above one texel is a filter that
+    # keeps it -- core/softmap.zero_shape -- where it used to erode the
+    # shadow away.)
     gx, gy = np.meshgrid(np.linspace(-5, 5, 120), np.linspace(-4, 4, 100))
     P = np.stack([gx.ravel(), gy.ravel(), np.zeros(gx.size)],
                  1).astype(np.float32)
     N = np.tile(np.array([[0, 0, 1.0]], np.float32), (P.shape[0], 1))
 
-    def mass(s, soft):
+    def penumbra(s, soft):
         s = copy.copy(s)
         s.shadow_softness = soft
         l = sc.lights[1]
@@ -880,16 +922,19 @@ def test_e_a_viewport_draft_bakes_draft_sized_maps():
         np.asarray(R.render(sc, s))
         L, _r, dist = LI.sample(l, P, s)
         v = LI.visibility(l, P, N, L.astype(np.float32), dist, s)
-        return float((1.0 - v).sum())
-    m_full = mass(st, 4.0)
-    m_draft = mass(draft, 1.0)
-    m_wrong = mass(draft, 4.0)
+        return (int(((v > 0.05) & (v < 0.95)).sum()),
+                float((1.0 - v).sum()))
+    (p_full, m_full) = penumbra(st, 8.0)
+    (p_draft, m_draft) = penumbra(draft, 2.0)
+    (p_wrong, _m) = penumbra(draft, 8.0)
     check('Softness / 4 on the quarter-size map keeps the refine\'s '
-          'shadow (undivided, the blur is sixteen times the refine\'s and '
-          'the shadow erodes)',
-          m_full > 50 and abs(m_draft - m_full) <= 0.15 * m_full
-          and abs(m_wrong - m_full) > 0.3 * m_full,
-          f'{m_full:.0f} / {m_draft:.0f} / undivided {m_wrong:.0f}')
+          'penumbra and its shadow (undivided, the blur is four times as '
+          'wide)',
+          p_full > 500 and abs(p_draft - p_full) <= 0.15 * p_full
+          and p_wrong > 2.5 * p_full
+          and abs(m_draft - m_full) <= 0.05 * m_full,
+          f'penumbra points {p_full} / {p_draft} / undivided {p_wrong}; '
+          f'mass {m_full:.0f} / {m_draft:.0f}')
     src = open(__file__.replace('tests/test_r254_bake_speed.py',
                                 'preview.py').replace(
         'tests\\test_r254_bake_speed.py', 'preview.py'),

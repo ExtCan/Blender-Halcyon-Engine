@@ -961,6 +961,13 @@ def march(img, scene, st, gbuf, vp, eye, w, h, bvh=None, sel_mask=None,
                 for li, (light, l_sign) in enumerate(lights_all):
                     if not _linked(light, _oi):
                         continue
+                    if LI.lamp_is_dark(light):
+                        # R254: no radiance, so the term below is zero
+                        # whatever the shadow says -- the lamp is not
+                        # asked for one (a dark lamp's map is only
+                        # promised, LI.map_roles, and this lookup was
+                        # what baked it)
+                        continue
                     L, rad, ldist = LI.sample(light, Pv, st)
                     if l_sign < 0.0:
                         rad = -rad
