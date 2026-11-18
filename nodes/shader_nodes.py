@@ -25,7 +25,8 @@ from ..core.shading import (CARTOON_SHADOW_MODE_ITEMS,
                             ANIME_STYLE_ITEMS, ANIME_STYLE_PRESETS,
                             ANIME_COMPAT_ITEMS,
                             HAIR_SHINE_SHAPE_ITEMS)
-from ..shaders.compiler import DEFAULT_GLSL, DEFAULT_HLSL, try_compile
+from ..shaders.compiler import (DEFAULT_GLSL, DEFAULT_HLSL, compile_node,
+                                node_source)
 
 ENGINE = 'HALCYON_RENDER'
 
@@ -1695,21 +1696,23 @@ class HALCYON_CodeNode(Node, HalcyonNodeBase):
 
     # ....................................................... compilation
     def get_source(self):
-        if self.source is not None:
-            try:
-                return self.source.as_string()
-            except Exception:                                   # noqa: BLE001
-                return ''
-        return self.source_text or ''
+        # R253 (review): ONE rule, shared with the exporter and (through
+        # the source the exporter ships) the GPU emitter -- the assigned
+        # Text, whatever it holds, else the inline source_text
+        return node_source(self)
 
     def compile_source(self):
-        src = self.get_source()
-        if not src.strip():
-            self.error = ''
-            return None
-        prog, err = try_compile(src, self.language)
+        # the same call export._compile_node makes: the sockets follow the
+        # program the render will run. An emptied Text says so by name; a
+        # blank inline source stays silent (err is None for it)
+        prog, err, _src = compile_node(self)
         if prog is None:
-            self.error = err or 'compile failed'
+            self.error = err or ''
+            # the warning belongs to the program it was compiled with: a
+            # source that is gone, or that no longer compiles, takes it
+            # along (the box used to keep the last good program's line --
+            # unseen while nothing was ever warned of)
+            self.warn = ''
             return None
         self.error = ''
         self.warn = '; '.join(prog.warnings[:3]) if prog.warnings else ''
@@ -5607,8 +5610,10 @@ PROP_TIPS = {
         "The specular colorband's stops (position, colour, alpha), "
         "edited through the ramp rows drawn in the panel",
     ('HALCYON_CodeNode', 'source'):
-        "The Text datablock holding the shader source -- edit it in "
-        "the Text Editor and the node recompiles on every edit",
+        "The Text datablock holding the shader source. While one is "
+        "assigned it is the source, whatever it holds -- an empty Text "
+        "compiles nothing. Every render compiles its current contents; "
+        "the sockets follow on Compile",
     ('HALCYON_BIMaterialNode', 'ramp_dif_factor'):
         "How strongly the diffuse ramp's colour takes over its input "
         "(BI's Factor slider, 0 off to 1 full)",

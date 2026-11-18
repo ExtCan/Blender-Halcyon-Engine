@@ -50,6 +50,29 @@ def run_tests():
     from . import test_r253_console_presets
     # R253 (field): a uniform the driver stripped never fails a pass
     from . import test_r253_uniforms
+    # R253 (field): the sky ray on any BLAS kernel, the jitter pair on
+    # NumPy 2.4 and later
+    from . import test_r253_kernels
+    # R254: the world's own luminary as a scene light
+    from . import test_r254_world_light
+    # R254: the light falloff family and the Light Limit
+    from . import test_r254_falloff
+    # R254: traced soft shadows, the shadow panels, Area lamp scale
+    from . import test_r254_ray_road
+    # R254: Hotspot, the visible beam, shafts, caustics, cookies
+    from . import test_r254_spot_beam
+    # R254: under Shadow Maps a lamp's size shapes its shadow
+    from . import test_r254_map_soft
+    # R254: the rendered viewport follows what was changed
+    from . import test_r254_viewport
+    # R254: Blender's own light options (Exposure, Temperature, ...)
+    from . import test_r254_native
+    # R254: Ambient Only, light linking, flags in volumes and beams
+    from . import test_r254_flags
+    # R254: Softness on a size-0 lamp, the atlas key, lamp edits as plan hits
+    from . import test_r254_map_gpu
+    # R254: where the light packages meet (beam unit, scaled Area lamps)
+    from . import test_r254_integration
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -208,6 +231,62 @@ def run_tests():
     print('R253 STRIPPED UNIFORMS (A GL DRIVER DROPS WHAT A PASS NEVER READS)')
     print('=' * 66)
     rc |= test_r253_uniforms.main()
+    print()
+    print('=' * 66)
+    print('R253 ANOTHER MACHINE\'S NUMPY (THE SKY RAY ON ANY BLAS KERNEL, THE '
+          'JITTER PAIR ON 2.4 AND LATER)')
+    print('=' * 66)
+    rc |= test_r253_kernels.main()
+    print()
+    print('=' * 66)
+    print("R254 WORLD LIGHT (THE SKY'S OWN SUN OR MOON AS A SCENE LIGHT)")
+    print('=' * 66)
+    rc |= test_r254_world_light.main()
+    print()
+    print('=' * 66)
+    print('R254 FALLOFF (THE LIGHT FALLOFF FAMILY AND THE LIGHT LIMIT)')
+    print('=' * 66)
+    rc |= test_r254_falloff.main()
+    print()
+    print('=' * 66)
+    print('R254 RAY ROAD (TRACED SOFT SHADOWS, DENSITY, AREA LAMP SCALE, PANELS)')
+    print('=' * 66)
+    rc |= test_r254_ray_road.main()
+    print()
+    print('=' * 66)
+    print('R254 SPOT AND BEAM (HOTSPOT, THE VISIBLE BEAM, SHAFTS, CAUSTICS, COOKIES)')
+    print('=' * 66)
+    rc |= test_r254_spot_beam.main()
+    print()
+    print('=' * 66)
+    print("R254 MAP SOFT (A LAMP'S SIZE SHAPES ITS MAPPED SHADOW)")
+    print('=' * 66)
+    rc |= test_r254_map_soft.main()
+    print()
+    print('=' * 66)
+    print('R254 VIEWPORT (THE RENDERED VIEWPORT FOLLOWS WHAT WAS CHANGED)')
+    print('=' * 66)
+    rc |= test_r254_viewport.main()
+    print()
+    print('=' * 66)
+    print("R254 NATIVE (BLENDER'S OWN LIGHT OPTIONS, AREA WATTS, THE LIGHT PANEL)")
+    print('=' * 66)
+    rc |= test_r254_native.main()
+    print()
+    print('=' * 66)
+    print('R254 FLAGS (AMBIENT ONLY, LIGHT LINKING, FLAGS IN VOLUMES AND BEAMS)')
+    print('=' * 66)
+    rc |= test_r254_flags.main()
+    print()
+    print('=' * 66)
+    print('R254 MAP GPU (SOFTNESS AT SIZE 0, THE ATLAS KEY, EDITS AS PLAN HITS)')
+    print('=' * 66)
+    rc |= test_r254_map_gpu.main()
+    print()
+    print('=' * 66)
+    print('R254 INTEGRATION (WHERE THE LIGHT PACKAGES MEET)')
+    print('=' * 66)
+    rc |= test_r254_integration.main()
     return rc
 
 

@@ -300,6 +300,26 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                       f"concat {_es.get('concat_ms', 0.0):.0f} ms, "
                       f"other {_es.get('other_ms', 0.0):.0f} ms")
 
+        # R254: the lamps the Light Limit leaves unlit are named, in the
+        # console, in the render's report and (remembered) in the
+        # Lighting panel -- a tenth lamp under the factory limit of 8
+        # used to do nothing, and say nothing
+        if not preview:
+            try:
+                from .core import lights as _LIl
+                _lim = _LIl.limit_report(scene, settings, remember=True)
+                if _lim:
+                    print('[Halcyon] ' + _lim)
+                    warnings.append(_lim)
+                # R254: an Ambient Only lamp left at a working wattage
+                # (its Energy is a flat ambient level there)
+                _amb = _LIl.ambient_report(scene)
+                if _amb:
+                    print('[Halcyon] ' + _amb)
+                    warnings.append(_amb)
+            except Exception:                                   # noqa: BLE001
+                pass
+
         # the device plan needs the exported scene, so it runs after the export
         # rather than before it, where `scene` did not yet exist -- the
         # UnboundLocalError went straight into a bare except and the plan has
@@ -742,12 +762,20 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
         center_k = int(np.argmin(np.abs(offs)))
         acc = None
         center_scene = None
+        # every slice traces its own soft-shadow rays (the index the
+        # sampler salts with, RenderSettings.sample_pass_for): with one
+        # shared pattern the slices averaged a still penumbra's grain
+        # into itself. Put back in the finally -- the settings object
+        # outlives this frame
+        pass0 = int(getattr(settings, '_sample_pass', 0) or 0)
         try:
             for k, off in enumerate(offs):
                 base = int(np.floor(frame0 + off))
                 sub = float(frame0 + off - base)
                 self.frame_set(base, sub)
                 scene_k = export.export_scene(depsgraph, settings, warnings)
+                settings._sample_pass = pass0
+                settings._sample_pass = settings.sample_pass_for(k)
                 img = core_render.render(
                     scene_k, settings,
                     progress=on_progress if k == center_k else None)
@@ -767,6 +795,7 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                 if self.test_break():
                     raise _Cancelled()
         finally:
+            settings._sample_pass = pass0
             try:
                 self.frame_set(frame0, 0.0)
             except Exception:                                   # noqa: BLE001
@@ -940,6 +969,21 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
             settings = _viewport_settings(depsgraph.scene, w, h)
             kind = _classify_updates(depsgraph) if vp.has_scene() \
                 else 'full'
+            # R254: what THIS viewport shows. H, Alt+H, the outliner's eye
+            # on an object or on a collection, Local View and the
+            # viewport's own object-type filter all report a bare Scene
+            # update, which the classifier above reads as 'none': the
+            # hidden lamp kept lighting the frame and a hidden mesh stayed
+            # in it until some other edit forced an export. The set of
+            # visible objects is compared with the parked export's; a
+            # difference is a full export (a lamp's visibility can change
+            # a mesh's on the same poke, so the lights-only path is not
+            # enough), and the export below reads the same space
+            space = getattr(context, 'space_data', None)
+            vis = _visible_sig(depsgraph, space,
+                               getattr(vp, '_visible_sig', None))
+            if kind != 'full' and vis != getattr(vp, '_visible_sig', vis):
+                kind = 'full'
             if kind == 'none':
                 # nothing renderable changed: keep the parked export.
                 # Blender fires view_update for EVERY depsgraph poke --
@@ -962,16 +1006,24 @@ class HalcyonRenderEngine(bpy.types.RenderEngine):
                 # -- 'Blender will freeze up' -- for data no lamp can
                 # change. Sharing the objects also keeps every identity
                 # cache warm downstream (BVH, textures, shadow maps).
+                # R254: None is the export saying a lamp is baked into
+                # the parked materials (an Object Projection node that
+                # projects from it, a Light Group that names it), so
+                # only the full export below is right
                 try:
                     scene = export.export_lights_into(vp.scene,
-                                                      depsgraph)
-                    vp.set_scene(scene, settings)
-                    self.tag_redraw()
-                    return
+                                                      depsgraph,
+                                                      space=space)
+                    if scene is not None:
+                        vp.set_scene(scene, settings)
+                        vp._visible_sig = vis
+                        self.tag_redraw()
+                        return
                 except Exception:                               # noqa: BLE001
                     pass                    # fall through: full export
-            scene = export.export_scene(depsgraph, settings)
+            scene = export.export_scene(depsgraph, settings, space=space)
             vp.set_scene(scene, settings)
+            vp._visible_sig = vis
             try:
                 from . import fault_note
                 fault_note('viewport export delivered to the worker',
@@ -1162,6 +1214,22 @@ def _classify_updates(depsgraph):
     if not ups:
         # no update list at all: assume the worst, export
         return 'full'
+    # R254: a 5.x light owns an embedded node tree (Light.node_tree) and
+    # Blender tags it with EVERY edit of the light -- Power, Radius, a
+    # Halcyon slider -- so each tick arrived as [Object, PointLight,
+    # ShaderNodeTree] and the tree sent it down the full export (152
+    # meshes re-read per tick where the lights-only path takes a third of
+    # a millisecond). A node tree that belongs to a light updated in this
+    # same list is that light's edit; any other tree stays a full export
+    lamp_trees = set()
+    for u in ups:
+        uid = getattr(u, 'id', None)
+        if type(uid).__name__ in _LIGHT_ID_TYPES:
+            nt = getattr(uid, 'node_tree', None)
+            if nt is not None:
+                lamp_trees.add(getattr(getattr(nt, 'original', nt),
+                                       'session_uid', None))
+    lamp_trees.discard(None)
     touched = False
     lights_only = True
     for u in ups:
@@ -1173,9 +1241,26 @@ def _classify_updates(depsgraph):
         if tname == 'Object' and getattr(uid, 'type', '') == 'LIGHT':
             touched = True
             continue
+        if tname == 'ShaderNodeTree' and lamp_trees and getattr(
+                getattr(uid, 'original', uid), 'session_uid',
+                None) in lamp_trees:
+            touched = True
+            continue
         if tname in _RENDER_ID_TYPES:
             touched = True
             lights_only = False
+            continue
+        if tname == 'Scene':
+            # R254: a Scene update carries the geometry and transform
+            # flags when one of the scene's ID properties was written --
+            # every Halcyon render setting is one -- and never otherwise
+            # (measured: the unit scale, the camera, the world, a hide,
+            # a selection all report it bare). The flags sent each tick
+            # of a scene-level dial (Shadow Softness, Max Lights) down
+            # the full export, for values that travel in the SETTINGS
+            # and that view_update's cheap half applies on its own.
+            # What a scene edit can change in the export arrives as the
+            # Object, World or Collection update beside it
             continue
         if getattr(u, 'is_updated_geometry', False) or \
                 getattr(u, 'is_updated_transform', False):
@@ -1189,6 +1274,50 @@ def _classify_updates(depsgraph):
 def _updates_touch_render(depsgraph):
     """True when a depsgraph update invalidates the exported scene."""
     return _classify_updates(depsgraph) != 'none'
+
+
+def _names_scene(depsgraph):
+    """True when the update list names a Scene (or cannot be read)."""
+    try:
+        for u in getattr(depsgraph, 'updates', ()) or ():
+            if type(getattr(u, 'id', None)).__name__ == 'Scene':
+                return True
+    except Exception:                                           # noqa: BLE001
+        return True
+    return False
+
+
+def _visible_sig(depsgraph, space, known=None):
+    """A fingerprint of the objects THIS viewport shows, or None.
+
+    The view layer's objects that pass Object.visible_get for the view's
+    own space: the test Blender's viewport itself makes, so it moves for
+    H / Alt+H, the eye on an object or a collection, Local View, a local
+    collection and the viewport's object-type filter, and returns when
+    each is undone. It walks base objects, not instances, so a file that
+    instances ten thousand copies pays for its instancers only; the type
+    switches themselves ride along, for an object type that exists only
+    inside an instanced collection.
+
+    Every one of those switches reports a Scene update, so a poke that
+    names no Scene keeps `known` (the parked export's fingerprint) and
+    costs nothing; with nothing known yet it is always computed. None
+    without a space or a view layer (headless, a stub): nothing is
+    compared and the export keeps its old rule."""
+    if space is None:
+        return None
+    if known is not None and not _names_scene(depsgraph):
+        return known
+    try:
+        vl = getattr(depsgraph, 'view_layer', None)
+        if vl is None:
+            return None
+        from . import compat
+        return hash((compat.view_type_switches(space), tuple(sorted(
+            int(o.session_uid) for o in vl.objects
+            if o.visible_get(view_layer=vl, viewport=space)))))
+    except Exception:                                           # noqa: BLE001
+        return None
 
 
 #: R230: the frame hold -- the last KEY frame's rendered cel, so a held
@@ -1600,6 +1729,13 @@ EXCLUDED_PANELS = {
     'VIEWLAYER_PT_freestyle_lineset_collection',
     'MATERIAL_PT_freestyle_line', 'RENDER_PT_gpencil',
     'RENDER_PT_simplify_greasepencil',
+    # R254: the stock Light panels. DATA_PT_light (the bare one: the
+    # type row) and DATA_PT_spot carry the generic marker, and
+    # DATA_PT_EEVEE_light used to be forced beside them: two panels
+    # titled Light, with Exposure, Temperature, Normalize and Soft
+    # Falloff drawn and unread. ui.HALCYON_PT_light_native draws the
+    # native rows the engine reads instead (the rule above)
+    'DATA_PT_light', 'DATA_PT_spot',
 }
 
 # Panels Blender does not mark as generic but that are safe and needed here.
@@ -1608,8 +1744,7 @@ FORCED_PANELS = {
     'DATA_PT_context_mesh', 'DATA_PT_uv_texture', 'DATA_PT_vertex_colors',
     'DATA_PT_mesh_attributes', 'DATA_PT_vertex_groups', 'DATA_PT_shape_keys',
     'DATA_PT_normals', 'DATA_PT_customdata', 'DATA_PT_face_maps',
-    'DATA_PT_context_light', 'DATA_PT_light', 'DATA_PT_EEVEE_light',
-    'DATA_PT_spot', 'DATA_PT_area',
+    'DATA_PT_context_light',
     'WORLD_PT_context_world', 'WORLD_PT_viewport_display',
     'RENDER_PT_color_management', 'RENDER_PT_color_management_curves',
 }
@@ -1710,6 +1845,51 @@ def _pin_display_handler(*_args):
         pass
 
 
+def _render_job_running():
+    """True while Blender's own render job runs (an interactive F12 or
+    Ctrl+F12 keeps the interface alive, and every redraw of it can
+    evaluate the main depsgraph)."""
+    try:
+        return bool(bpy.app.is_job_running('RENDER'))
+    except Exception:                                           # noqa: BLE001
+        return False
+
+
+@_persistent
+def _drop_holds_handler(*args):
+    """R254: an edit of the scene retires the held cel.
+
+    Shoot On twos / threes keeps the last key frame's picture and hands
+    it to the held frames after it (hold_lookup). The entry was keyed on
+    the scene's name, the key frame, the size and the SETTINGS only, so a
+    still F12 on a held frame after the lamp was moved, recoloured or
+    re-powered returned the picture from before the edit and printed
+    'holds frame 1 (not rendered again)'.
+
+    Any update of the main depsgraph that would re-export the viewport
+    (the same classifier view_update asks) drops the entry. A sequence
+    render keeps its holds: its frame steps evaluate the RENDER depsgraph
+    and fire frame_change, not this handler, and while Blender's render
+    job runs nothing is dropped whatever the interface redraws. On
+    load_post (no depsgraph in the arguments) the entry goes too: the
+    next file's 'Scene' at the same frame and size is another picture."""
+    if not _HOLD_CACHE:
+        return
+    try:
+        depsgraph = args[1] if len(args) > 1 else None
+        if depsgraph is None or not hasattr(depsgraph, 'updates'):
+            _HOLD_CACHE.clear()
+            return
+        if str(getattr(depsgraph, 'mode', '')) == 'RENDER':
+            return
+        if _render_job_running():
+            return
+        if _classify_updates(depsgraph) != 'none':
+            _HOLD_CACHE.clear()
+    except Exception:                                           # noqa: BLE001
+        pass
+
+
 def register():
     bpy.utils.register_class(HalcyonRenderEngine)
     enable_compatible_panels()
@@ -1719,6 +1899,9 @@ def register():
             _h.depsgraph_update_post.append(_pin_display_handler)
         if _pin_display_handler not in _h.load_post:
             _h.load_post.append(_pin_display_handler)
+        for hl in (_h.depsgraph_update_post, _h.load_post):
+            if _drop_holds_handler not in hl:
+                hl.append(_drop_holds_handler)
         _pin_display_handler()             # the already-open file too
     except Exception:                                           # noqa: BLE001
         pass
@@ -1734,8 +1917,9 @@ def unregister():
     try:
         import bpy.app.handlers as _h
         for hl in (_h.depsgraph_update_post, _h.load_post):
-            if _pin_display_handler in hl:
-                hl.remove(_pin_display_handler)
+            for fn in (_pin_display_handler, _drop_holds_handler):
+                if fn in hl:
+                    hl.remove(fn)
     except Exception:                                           # noqa: BLE001
         pass
     try:

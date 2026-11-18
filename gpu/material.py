@@ -17,6 +17,7 @@ the correct outcome and the caller renders it on the CPU.
 from . import glsl_shading as GS
 from . import combine as GCB         # R251 material pack (MAT-A)
 from .emit import Emitter, Unsupported
+from ..core import patterns as _PT   # the sampling salts' 31-bit wrap
 
 MAX_LIGHTS = 8
 
@@ -456,20 +457,183 @@ def _generated_frame(src, consts, force_line=False, world_table=False):
 #: R251 LIGHT-B1: 8 texels per light -- 4 = (spot_exponent, cr, a0, a1)
 #: and 5.x = a2 (F012), 5.yz = the GX (k1, k2) (F013), 6 = (cx, cy, w,
 #: h) and 7 = (start, aext, 0, 0) the Model 3 screen spotlight (F015)
+#: R254: the decay mode texel 3 is packed for is the RESOLVED law (a
+#: Scene Default lamp takes the render's), and 5.w = max(end, eps), the
+#: Sphere's own Distance, for a Custom Range + Sphere point / spot lamp
+#: (3.y is the ramp's width there); 0 on every other lamp
 #: R253 light options: 16 texels per light (texels 0-7 untouched; every
 #: reader goes through _lref / the symbol, so the bump moves no bit) --
 #:   t8  = (specular_color.rgb,     decay_near_start)
 #:   t9  = (hemi_ground.rgb,        near_span = near_end - near_start)
 #:   t10 = (lamp frame side.xyz from LI.cookie_frame, 0)   (SPOT only)
 #:   t11 = (lamp frame up.xyz,                        0)   (SPOT only)
-#:   t12-15 reserved (zeros)
+#: R254: 10.w / 11.w = spot_scale, the elliptical cone's squeeze across
+#: the side / up axis, written ONLY for a lamp that carries one (a round
+#: spot's texels are the bytes they were)
 #: The style gain (H) is folded into texel 0.w: the SAME python double
 #: the CPU's sample() scales by, so the texel is bitwise its scale.
+#: R254: the lamp's SHADOW values (they baked as literals: a nudged
+#: mapped lamp, a dragged size, Softness, Bias, Density or Shadow
+#: Colour recompiled every material pass) --
+#:   t12 = (shadow_color.rgb,       shadow_density)
+#:   t13 = (the traced size: Radius, or a Sun's law constant
+#:          (LI.sun_soft_law),      area_gamma, 0, 0)
+#:   t14 = (area_x unit .xyz,       half Size X)            (AREA only)
+#:   t15 = (area_y unit .xyz,       half Size Y)            (AREA only)
+#: and, past the n * STRIDE lamp texels, a TAIL laid out by
+#: `light_tail_layout` (the emitters bake its offsets, which follow the
+#: lamp list's structure and never a value):
+#:   per AREA lamp: the form factor's face -- its two half-axes for a
+#:     rectangle, AREA_DISC_SIDES corner offsets for a round shape;
+#:   per MAPPED lamp: MAP_HEAD header texels, then MAP_FACE per face --
+#:     h0 = (origin.xyz,            Bias)
+#:     h1 = (near, extent | an ortho map's texel size,
+#:           far + near,            far - near)
+#:     h2 = (2 near far,            max(1, Softness), Softness, Density)
+#:     h3 = (Softness + the search pad, k = size / (2 extent),
+#:           k Radius | k tan(angle / 2), the radius cap)   (sized lookup)
+#:     h4 = (the map's nearest depth, 0, 0, 0)              (sized lookup)
+#:     f0..f3 = the face's four light-space rows
+#:     f4..f6 = its right / up / depth world axes           (sized lookup)
+#:     f7, f8 = an Area lamp's half-axes in the face's frame (sized)
+#: Every value is the float32 the CPU computes with (core/lights,
+#: core/softmap); the shader's arithmetic and its order are unchanged.
 LIGHT_TEXEL_STRIDE = 16
+MAP_HEAD = 5
+MAP_FACE = 9
+
+#: R254: the AMBIENT TAIL. A scene that carries an ambient lamp (an
+#: AMBIENT light or a lamp with Ambient Only: lights.is_ambient_lamp)
+#: appends three texels after the last light's block --
+#:   tail + 0 = the whole pool        (lights.ambient_light)
+#:   tail + 1 = its engine part       (Global Ambient)
+#:   tail + 2 = its world part        (world ambient + the ambient lamps)
+#: -- the CPU's own float32 triples, which the pass reads in place of
+#: the baked literals. The pool was a literal in every pass while the
+#: plan signature held nothing of the lamps that feed it: an edit of
+#: such a lamp's Power or colour, or one step of its light style, was a
+#: cache hit that drew the old ambient. As values the edit is a hit
+#: plus this row's re-upload, like any other lamp edit. A scene without
+#: an ambient lamp has no tail (the row is the bytes it was) and bakes
+#: its literals as before.
+AMBIENT_TAIL_TEXELS = 3
 
 
-def pack_light_texels(lights, job=None):
-    """The per-light value texture, (1, n*STRIDE, 4) float32.
+def scene_ambient_lamps(scene):
+    """True when the scene carries a lamp that feeds the ambient pool."""
+    from ..core.lights import is_ambient_lamp
+    return any(is_ambient_lamp(l)
+               for l in (getattr(scene, 'lights', None) or ()))
+
+
+def ambient_tail_base(n_lights):
+    """The texel index of the ambient tail in a row of `n_lights`."""
+    return max(int(n_lights), 1) * LIGHT_TEXEL_STRIDE
+
+
+def light_tail_layout(lights, shadows, ambient=False):
+    """Where the hal_lights TAIL holds each lamp's blocks: {'area':
+    {light index: first texel}, 'map': {light index: first texel},
+    'width': the texture's width in texels}. Pure structure -- the lamp
+    kinds, the Area shapes, which lamps are mapped and their face
+    counts, and whether the scene carries an ambient lamp (`ambient`:
+    its three-texel tail sits first, at ambient_tail_base, and these
+    blocks follow it) -- so the plan build (which bakes the offsets)
+    and every repack of a cache hit lay out the same texels."""
+    from ..core import lights as LI
+    off = max(len(lights), 1) * LIGHT_TEXEL_STRIDE \
+        + (AMBIENT_TAIL_TEXELS if ambient else 0)
+    areas, maps = {}, {}
+    for i, light in enumerate(lights):
+        if str(getattr(light, 'type', '')).upper() == 'AREA':
+            areas[i] = off
+            off += LI.AREA_DISC_SIDES if LI.area_is_disc(light) else 2
+        m = shadows[i] if shadows is not None and i < len(shadows) else None
+        if m is not None and not m.get('ray'):
+            maps[i] = off
+            off += MAP_HEAD + len(m['faces']) * MAP_FACE
+    return {'area': areas, 'map': maps, 'width': off}
+
+
+def area_face_texels(light):
+    """The form factor's face as texels, (K, 3) float32: a rectangle's
+    two half-axes (the corners are hp -+ hax -+ hay in the shader), or a
+    round shape's polygon corners as offsets from the lamp's position --
+    the very float32 values `_area_function` bakes as literals."""
+    import numpy as np
+    from ..core import lights as LI
+    ax = np.asarray(getattr(light, 'area_x', None)
+                    if getattr(light, 'area_x', None) is not None
+                    else (1.0, 0.0, 0.0), np.float64)
+    ay = np.asarray(getattr(light, 'area_y', None)
+                    if getattr(light, 'area_y', None) is not None
+                    else (0.0, 1.0, 0.0), np.float64)
+    if not LI.area_is_disc(light):
+        sx, sy = LI.area_lit_sides(light)
+        return np.stack([(ax * (sx * 0.5)).astype(np.float32),
+                         (ay * (sy * 0.5)).astype(np.float32)])
+    pos64 = np.asarray(light.position, np.float64)
+    return (LI.area_corners(light) - pos64[None, :]).astype(np.float32)
+
+
+def map_texels(meta):
+    """One mapped lamp's tail block, (MAP_HEAD + faces * MAP_FACE, 4)
+    float32, from its shadow meta: each value is np.float32 of the
+    expression the literal emitters print (`_shadow_function`,
+    gpu/softmap.shadow_function), which is the float32 the CPU's lookup
+    computes with."""
+    import numpy as np
+    from ..core import softmap as SM
+    f32 = np.float32
+    faces = meta['faces']
+    size = int(meta['size'])
+    near, far = float(meta['near']), float(meta['far'])
+    ext = float(meta['extent'])
+    persp = bool(meta['persp'])
+    soft = max(float(meta['softness']), 0.0)
+    out = np.zeros((MAP_HEAD + len(faces) * MAP_FACE, 4), np.float32)
+    out[0, :3] = np.asarray(meta['origin'], np.float32)
+    out[0, 3] = f32(float(meta['bias']))
+    out[1, 0] = f32(near)
+    out[1, 1] = f32(ext) if persp else f32(2.0 * ext / size)
+    out[1, 2] = f32(far + near)
+    out[1, 3] = f32(far - near)
+    out[2, 0] = f32(2.0 * near * far)
+    out[2, 1] = f32(max(1.0, soft))
+    out[2, 2] = f32(soft)
+    out[2, 3] = f32(float(meta['density']))
+    sp = meta.get('soft')
+    if sp is not None:
+        shape = sp['shape']
+        k = f32(size / (2.0 * ext))
+        out[3, 0] = f32(soft + SM.SEARCH_PAD)
+        out[3, 1] = k
+        if shape['kind'] == 'SPHERE':
+            out[3, 2] = f32(float(k) * float(shape['R']))
+        elif shape['kind'] == 'SUN':
+            out[3, 2] = f32(float(k) * float(shape['tan']))
+        out[3, 3] = SM.cap_texels(size, ext, persp)
+        out[4, 0] = f32(float(sp['d_min']))
+    for fi, fc in enumerate(faces):
+        b = MAP_HEAD + fi * MAP_FACE
+        out[b:b + 4] = np.asarray(fc['vp'], np.float32)
+        if sp is not None:
+            s_ax, u_ax, f_ax = sp['axes'][fi]
+            out[b + 4, :3] = np.asarray(s_ax, np.float32)
+            out[b + 5, :3] = np.asarray(u_ax, np.float32)
+            out[b + 6, :3] = np.asarray(f_ax, np.float32)
+            if sp['shape']['kind'] == 'RECT':
+                e1, e2 = SM.rect_axes(sp['shape'], sp['axes'][fi])
+                out[b + 7, :3] = e1
+                out[b + 8, :3] = e2
+    return out
+
+
+def pack_light_texels(lights, job=None, shadows=None):
+    """The per-light value texture, (1, n*STRIDE, 4) float32 -- or, with
+    `shadows` (each lamp's shadow meta, gpu/shade._shadow_meta), (1,
+    width, 4) with the TAIL `light_tail_layout` describes: the Area
+    faces and the mapped lamps' blocks (R254).
 
     Every value is np.float32 of the SAME python expression the old
     literal bake evaluated, so the arithmetic downstream sees the same
@@ -493,10 +657,63 @@ def pack_light_texels(lights, job=None):
         from ..core import render as _R
         vp_job = _R.camera_matrices(job.scene.camera, job.width,
                                     job.height)[2]
-    out = np.zeros((1, n * LIGHT_TEXEL_STRIDE, 4), np.float32)
+    scene_job = getattr(job, 'scene', None)
+    # R254: two tails follow the n * STRIDE lamp texels -- the ambient
+    # tail first (three texels, only in a scene with an ambient lamp),
+    # then the shadow tail `light_tail_layout` lays out behind it
+    amb = bool(scene_job is not None and st_job is not None
+               and scene_ambient_lamps(scene_job))
+    tail = light_tail_layout(lights, shadows, ambient=amb) \
+        if shadows is not None else None
+    out = np.zeros((1, tail['width'] if tail is not None
+                    else n * LIGHT_TEXEL_STRIDE
+                    + (AMBIENT_TAIL_TEXELS if amb else 0), 4), np.float32)
+    if amb:
+        # the ambient tail -- ambient_light_split's own float32
+        # results, read per frame (a plan-cache hit repacks this row)
+        tb = ambient_tail_base(len(lights))
+        a_eng, a_wrld = LI.ambient_light_split(scene_job, st_job)
+        out[0, tb + 0, :3] = LI.ambient_light(scene_job, st_job)
+        out[0, tb + 1, :3] = a_eng
+        out[0, tb + 2, :3] = a_wrld
     for i, light in enumerate(lights):
         b = i * LIGHT_TEXEL_STRIDE
         kind = getattr(light, 'type', 'POINT')
+        # R254: the shadow values (texels 12-15, and the tail blocks).
+        # Each is np.float32 of what the CPU multiplies with: the
+        # Shadow Colour and Density of light_surface / visibility, the
+        # traced road's radius or sun law constant, an Area lamp's unit
+        # axes and half sizes (lights.visibility's own normalisation)
+        out[0, b + 12, :3] = np.asarray(
+            tuple(getattr(light, 'shadow_color', (0.0, 0.0, 0.0))
+                  or (0.0, 0.0, 0.0))[:3], np.float32)
+        out[0, b + 12, 3] = np.float32(
+            float(getattr(light, 'shadow_density', 1.0)))
+        _rad = float(getattr(light, 'radius', 0.0) or 0.0)
+        if str(kind).upper() == 'SUN':
+            out[0, b + 13, 0] = np.float32(LI.sun_soft_law(_rad)[1])
+        else:
+            out[0, b + 13, 0] = np.float32(_rad)
+        out[0, b + 13, 1] = np.float32(
+            float(getattr(light, 'area_gamma', 1.0) or 1.0))
+        if str(kind).upper() == 'AREA':
+            _asz = getattr(light, 'area_size', (0.0, 0.0)) or (0.0, 0.0)
+            _ax = np.asarray(getattr(light, 'area_x', (1, 0, 0)), np.float32)
+            _ax = _ax / max(float(np.linalg.norm(_ax)), 1e-9)
+            _ay = np.asarray(getattr(light, 'area_y', (0, 1, 0)), np.float32)
+            _ay = _ay / max(float(np.linalg.norm(_ay)), 1e-9)
+            out[0, b + 14, :3] = _ax
+            out[0, b + 14, 3] = np.float32(float(_asz[0]) * 0.5)
+            out[0, b + 15, :3] = _ay
+            out[0, b + 15, 3] = np.float32(float(_asz[1]) * 0.5)
+            if tail is not None:
+                _fc = area_face_texels(light)
+                _ab = tail['area'][i]
+                out[0, _ab:_ab + _fc.shape[0], :3] = _fc
+        if tail is not None and i in tail['map']:
+            _mt = map_texels(shadows[i])
+            _mb = tail['map'][i]
+            out[0, _mb:_mb + _mt.shape[0]] = _mt
         sign = -1.0 if getattr(light, 'negative', False) else 1.0
         # R253 (H): the light style's gain -- BEFORE the np.float32 of
         # the /4pi scale, so the texel is the CPU's own float32 (x 1.0
@@ -518,8 +735,11 @@ def pack_light_texels(lights, job=None):
                 out[0, b + 1, :3] = sd
                 spotsi = float(np.cos(float(light.spot_size) * 0.5))
                 out[0, b + 1, 3] = np.float32(spotsi)
+                # R254: the band is Blend's, or the Hotspot's inner
+                # angle (LI.spot_blend_band, the one place it is
+                # computed) -- a VALUE: dragging either re-uploads
                 out[0, b + 2, 3] = np.float32(
-                    (1.0 - spotsi) * float(light.spot_blend))
+                    LI.spot_blend_band(light, spotsi))
             elif kind == 'AREA':
                 # the form factor's value road: facing direction and
                 # the dist^2/(sx*sy) normalisation (area_lamp_vectors'
@@ -537,13 +757,28 @@ def pack_light_texels(lights, job=None):
         out[0, b + 2, :3] = np.asarray(
             getattr(light, 'color', (1, 1, 1)), np.float32)
         eps = 1e-6
+        # R254: the law is RESOLVED before the texel is chosen. A lamp
+        # on Scene Default under a Custom Range render used to pack
+        # Falloff End where the emitted ramp divides by (End - Start):
+        # the GPU ramped over End, the CPU over End - Start
         mode = getattr(light, 'decay', 'DEFAULT')
+        if mode == 'DEFAULT' and st_job is not None:
+            mode = str(getattr(st_job, 'light_falloff_default', 'DEFAULT'))
         start = float(getattr(light, 'decay_start', 0.0))
         out[0, b + 3, 0] = np.float32(start)
         if mode == 'CUSTOM':
             end = max(float(getattr(light, 'decay_end', 40.0)),
                       start + eps)
             out[0, b + 3, 1] = np.float32(end - start)
+            if getattr(light, 'bi_sphere', False) and \
+                    kind in ('POINT', 'SPOT'):
+                # R254: the Sphere clips at Falloff End itself, which
+                # texel 3.y no longer is under Custom Range -- the one
+                # float32 lights.attenuate divides by rides texel 5.w
+                # (written for this pairing only: every other lamp's
+                # texels are the bytes they were)
+                out[0, b + 5, 3] = np.float32(
+                    max(float(getattr(light, 'decay_end', 25.0)), eps))
         else:
             out[0, b + 3, 1] = np.float32(
                 max(float(getattr(light, 'decay_end', 25.0)), eps))
@@ -574,8 +809,6 @@ def pack_light_texels(lights, job=None):
                 out[0, b + 7, 0] = s0
                 out[0, b + 7, 1] = aext
         dmode = str(mode)
-        if dmode == 'DEFAULT' and st_job is not None:
-            dmode = str(getattr(st_job, 'light_falloff_default', 'DEFAULT'))
         if dmode.startswith('GX_') and kind not in ('SUN', 'HEMI'):
             # R251 F013: libogc's (k1, k2) for the lamp's ref_brite
             k1, k2 = LI.gx_dist_coeffs(light, dmode)
@@ -600,7 +833,50 @@ def pack_light_texels(lights, job=None):
             _sq_s, _sq_u, _sq_f = LI.cookie_frame(light)
             out[0, b + 10, :3] = np.asarray(_sq_s, np.float32)
             out[0, b + 11, :3] = np.asarray(_sq_u, np.float32)
+            if LI.spot_scale_on(light):
+                # R254: the elliptical cone's squeeze, the float32
+                # scaled_cos multiplies by
+                out[0, b + 10, 3] = np.float32(light.spot_scale[0])
+                out[0, b + 11, 3] = np.float32(light.spot_scale[1])
     return out
+
+
+def link_runs(objects):
+    """A light link's object indices as runs of consecutive integers:
+    [(lo, hi), ...] ascending, lo == hi for a lone index (R254)."""
+    runs = []
+    for o in sorted({int(v) for v in (objects or ())}):
+        if runs and o == runs[-1][1] + 1:
+            runs[-1][1] = o
+        else:
+            runs.append([o, o])
+    return [(lo, hi) for lo, hi in runs]
+
+
+def link_ladder(objects):
+    """The GLSL sum that is >= 1.0 where td.y (the pixel's object index,
+    an exact integer float) is one of a light link's `objects` -- the
+    unrolled twin of light_surface's isin().
+
+    A lone index is the comparison it always was. R254: a RUN of
+    consecutive indices is one range test, so the link of an instanced
+    forest (every instance of the linked object resolves now, and they
+    export side by side) costs one term instead of one per tree -- and
+    stays under the plan's 64-term refusal, which counts terms."""
+    terms = []
+    for lo, hi in link_runs(objects):
+        if lo == hi:
+            one = _f(float(lo))
+            if lo < 0:
+                # the (-1,) of an 'Only' link that resolved to nothing:
+                # no object carries it, the term is never 1
+                one = f'({one})'
+            terms.append(f'((abs(td.y - {one}) < 0.5) '
+                         '? 1.0 : 0.0)')
+        else:
+            terms.append(f'((td.y > {_f(float(lo) - 0.5)} '
+                         f'&& td.y < {_f(float(hi) + 0.5)}) ? 1.0 : 0.0)')
+    return ' + '.join(terms)
 
 
 def spot_law_glsl(law, exp_on, r):
@@ -742,6 +1018,16 @@ def _attenuation(light, falloff_default, eps=1e-6, refs=None):
         # even a Constant lamp clips (exactly lights.attenuate)
         D = refs['D'] if refs else _f(max(
             float(getattr(light, 'decay_end', 25.0)), eps))
+        mode = getattr(light, 'decay', 'DEFAULT')
+        if mode == 'DEFAULT':
+            mode = falloff_default
+        if refs and mode == 'CUSTOM':
+            # R254: under Custom Range refs['D'] is the ramp's (End -
+            # Start), not the lamp Distance -- the Sphere clipped at
+            # End - Start here and at Falloff End on the CPU. Its own
+            # value rides texel 5.w (the packer's max(End, eps)); a
+            # caller without that ref gets the sum, equal at Start 0
+            D = refs.get('sphere') or f'({refs["D"]} + {refs["start"]})'
         return (f'((max(dist, 0.0) < {D}) ? ({expr} '
                 f'* (({D} - max(dist, 0.0)) / {D})) : 0.0)')
     return expr
@@ -755,8 +1041,10 @@ def _attenuation_curve(light, falloff_default, eps=1e-6, refs=None):
     s_ref = refs['start'] if refs else _f(start)
     if mode == 'NONE':
         return '1.0'
-    d = f'max(dist - {s_ref}, {_f(eps)})' if start > 0 else \
-        f'max(dist, {_f(eps)})'
+    # R254: Falloff Start belongs to Custom Range alone (the branch
+    # below); the inverse laws no longer shift by it -- exactly
+    # lights.attenuate. Start 0 emitted this same text before
+    d = f'max(dist, {_f(eps)})'
     if mode == 'INVERSE':
         return f'(1.0 / {d})'
     if mode == 'CUSTOM':
@@ -849,11 +1137,17 @@ def _ao_function(ao, consts):
          f'    int sy = int(vUV.y * {_f(float(h))});',
          '    float occ = 0.0;']
     for k in range(samples):
-        z = 2 * k + 8389 + 7919 * seed
+        # the salt as the 31-bit number the hash keeps anyway (hal_smp_
+        # hash3 masks ix*A + iy*B + iz*C to 31 bits, so the wrapped salt
+        # hashes to the same value): a Seed above 271187 used to bake a
+        # literal past int32 here, and above 542357 one no GLSL compiler
+        # accepts at all
+        z = _PT.wrap_salt(2 * k + 8389 + 7919 * seed)
+        z1 = _PT.wrap_salt(z + 1)
         L += ['    {',
               f'    float u1 = hal_smp_hash3(sx, sy, {z});',
               f'    vec2 cs = hal_smp_circle(hal_smp_hash3(sx, sy, '
-              f'{z + 1}));',
+              f'{z1}));',
               '    float r = sqrt(u1);',
               '    vec3 d = normalize(t * (r * cs.x) + b * (r * cs.y) '
               '+ N * sqrt(max(1.0 - u1, 0.0)));',
@@ -907,11 +1201,13 @@ def _rad_function(rad, consts):
           f'    vec3 org = P + N * {_f(float(rad["bias"]))};',
           '    vec3 gather = vec3(0.0, 0.0, 0.0);']
     for k in range(samples):
-        z = 2 * k + int(rad['salt']) + 7919 * seed
+        # wrapped to 31 bits like the occlusion salt above (same hash)
+        z = _PT.wrap_salt(2 * k + int(rad['salt']) + 7919 * seed)
+        z1 = _PT.wrap_salt(z + 1)
         L += ['    {',
               f'    float u1 = hal_smp_hash3(sx, sy, {z});',
               f'    vec2 cs = hal_smp_circle(hal_smp_hash3(sx, sy, '
-              f'{z + 1}));',
+              f'{z1}));',
               '    float r = sqrt(u1);',
               '    vec3 d = normalize(t * (r * cs.x) + b * (r * cs.y) '
               '+ N * sqrt(max(1.0 - u1, 0.0)));',
@@ -1248,12 +1544,14 @@ def _area_function(i, light, consts):
     float32 where acos of a near-1 dot sheds digits -- the C could
     afford plain acos because area_lamp_energy ran in doubles.
 
-    Corners derive in-shader from the texel POSITION plus literal
-    half-extent offsets, so dragging the lamp re-uploads a texel; the
-    facing direction and the dist^2/(sx*sy) normalisation ride texel 1
+    Corners derive in-shader from the texel POSITION plus half-extent
+    offsets, so dragging the lamp re-uploads a texel; the facing
+    direction and the dist^2/(sx*sy) normalisation ride texel 1
     (pack_light_texels), so Distance drags stay recompile-free too.
-    Size, axes and Gamma are structure and recompile, like the shadow
-    twin's own geometry bakes.
+    R254: the offsets and Gamma are texels as well under a plan
+    (consts['light_tail']); what recompiles is the SHAPE (a rectangle's
+    four corners or a round shape's polygon) and whether the Gamma pow
+    exists at all.
     """
     import numpy as np
     from ..core import lights as LI
@@ -1264,9 +1562,10 @@ def _area_function(i, light, consts):
     ay = np.asarray(getattr(light, 'area_y', None)
                     if getattr(light, 'area_y', None) is not None
                     else (0.0, 1.0, 0.0), np.float64)
-    asz = getattr(light, 'area_size', (1.0, 1.0))
-    sx = max(float(asz[0]), 1e-6)
-    sy = max(float(asz[1]) if len(asz) > 1 else float(asz[0]), 1e-6)
+    # the sides the CPU's contour is built from (never under
+    # lights.AREA_MIN_SIDE): the rectangle's half-axes below and the
+    # dist^2 / A texel must describe the SAME face
+    sx, sy = LI.area_lit_sides(light)
     hx = (ax * (sx * 0.5)).astype(np.float32)
     hy = (ay * (sy * 0.5)).astype(np.float32)
     disc = LI.area_is_disc(light)
@@ -1282,27 +1581,41 @@ def _area_function(i, light, consts):
         vdir = _v3(d)
         asize = _f(dist * dist / LI.area_emit_area(light))
     k = float(getattr(light, 'area_gamma', 1.0) or 1.0)
+    # R254: the face itself -- the two half-axes, a round shape's
+    # corner offsets -- and Gamma ride hal_lights when the plan laid
+    # out the tail (`area_face_texels`, texel 13.y): an Area lamp's
+    # Size, turn or Gamma drag re-uploads texels. Without the tail the
+    # same float32 values bake as the literals below
+    tail = consts.get('light_tail') if use_tx else None
+    ab = tail['area'].get(i) if tail is not None else None
+    k_x = _lref(i, 13, 'y') if ab is not None else _f(k)
     L = [f'vec2 hal_area_inp{i}(vec3 P, vec3 N)',
          '{',
          f'    vec3 hp = {pos};']
     if not disc:
         # area_lamp_vectors' corner order: -x-y, -x+y, +x+y, +x-y
-        L += [f'    vec3 hax = {_v3(hx)};',
-              f'    vec3 hay = {_v3(hy)};',
-              '    vec3 av0 = normalize(P - (hp - hax - hay));',
+        if ab is not None:
+            L += [f'    vec3 hax = hal_ltex({ab}).xyz;',
+                  f'    vec3 hay = hal_ltex({ab + 1}).xyz;']
+        else:
+            L += [f'    vec3 hax = {_v3(hx)};',
+                  f'    vec3 hay = {_v3(hy)};']
+        L += ['    vec3 av0 = normalize(P - (hp - hax - hay));',
               '    vec3 av1 = normalize(P - (hp - hax + hay));',
               '    vec3 av2 = normalize(P - (hp + hax + hay));',
               '    vec3 av3 = normalize(P - (hp + hax - hay));']
         nc = 4
     else:
         # R225: the round shapes' equal-area polygon (lights.
-        # area_corners), each corner a literal OFFSET from the texel
+        # area_corners), each corner an OFFSET from the texel
         # position so the lamp still drags recompile-free
         pos64 = np.asarray(light.position, np.float64)
         offs = (LI.area_corners(light) - pos64[None, :]).astype(np.float32)
         nc = offs.shape[0]
         for c in range(nc):
-            L.append(f'    vec3 av{c} = normalize(P - (hp + {_v3(offs[c])}));')
+            off_x = f'hal_ltex({ab + c}).xyz' if ab is not None \
+                else _v3(offs[c])
+            L.append(f'    vec3 av{c} = normalize(P - (hp + {off_x}));')
     L += [
          # BI shades with normals flipped along the view ray; the
          # contour sees the normal bare, so -N is the C's own frame
@@ -1324,11 +1637,17 @@ def _area_function(i, light, consts):
           '    float ab = max(-fac, 0.0) * aas;']
     if abs(k - 1.0) > 1e-9:
         # pow(0, k) is undefined territory on real drivers
-        L += [f'    af = (af > 0.0) ? pow(af, {_f(k)}) : 0.0;',
-              f'    ab = (ab > 0.0) ? pow(ab, {_f(k)}) : 0.0;']
+        L += [f'    af = (af > 0.0) ? pow(af, {k_x}) : 0.0;',
+              f'    ab = (ab > 0.0) ? pow(ab, {k_x}) : 0.0;']
     L += ['    return vec2(af, ab) * afront;',
           '}']
     return '\n'.join(L) + '\n'
+
+
+#: the combined shadow atlas, as a pass declares it: ONE line per pass
+#: however many mapped lamps fetch from it (assemble_frame writes it ahead
+#: of the first hal_shadow_vis; `_shadow_function` writes none)
+SHADOWPACK_DECL = 'uniform sampler2D hal_shadowpack;\n'
 
 
 def _shadow_function(i, meta, consts):
@@ -1345,14 +1664,33 @@ def _shadow_function(i, meta, consts):
     along the shading normal AND the light direction by the ray bias, clip
     the ray just short of the light, and ask the BVH -- the same
     `hal_bvh_occluded` the occlusion kernel proved against `bvh.occluded()`
-    ray for ray. No density term: the CPU's RAY branch applies none.
+    ray for ray. The lamp's Density lightens the result exactly as the
+    CPU's RAY branch does, and at the default 1.0 the line is the bare
+    visibility (no `1 - (1 - v)` round trip on either road).
     """
     import numpy as np
+    from ..core import lights as LI
     from ..core.lights import _pcf_offsets
+
+    # R254: the lamp's shadow VALUES are hal_lights texels when the plan
+    # laid out the tail (consts['light_tail']); without it -- a direct
+    # call, or gpu/shade.SHADOW_TEXELS off -- the same float32 values
+    # bake as the literals they always were
+    tail = consts.get('light_tail') \
+        if bool(consts.get('light_texels', True)) else None
+    tx = tail is not None
 
     if meta.get('ray'):
         bias = _f(float(meta['bias']))
         samples = int(meta.get('samples', 1))
+        dens = float(meta.get('density', 1.0))
+        dens_x = _lref(i, 12, 'w') if tx else _f(dens)
+
+        def _ret(expr):
+            if dens == 1.0:
+                return f'    return {expr};'
+            return f'    return 1.0 - (1.0 - ({expr})) * {dens_x};'
+
         if samples <= 1:
             return '\n'.join([
                 f'float hal_shadow_vis{i}(vec3 P, vec3 N, vec3 L, '
@@ -1360,19 +1698,29 @@ def _shadow_function(i, meta, consts):
                 '{',
                 f'    vec3 org = P + N * {bias} + L * {bias};',
                 '    float maxt = (dist > 1e8) ? 1e9 : dist * (1.0 - 1e-3);',
-                '    return 1.0 - hal_bvh_occluded(org, L, maxt);',
+                _ret('1.0 - hal_bvh_occluded(org, L, maxt)'),
                 '}']) + '\n'
-        # SOFT: visibility()'s deterministic branch, sample for sample --
-        # the same hash draws, the same table angles, the same jittered
-        # rays this pixel's CPU shade would build, averaged the same way.
-        # Three shapes, matching _soft_ray on the CPU: AREA aims at real
-        # points on its rectangle (or ellipse), SUN tilts inside its
-        # angular disc, POINT/SPOT jitter the target in a world sphere
+        # SOFT: visibility()'s deterministic branch, ray for ray -- the
+        # same two hash draws for the pixel, the same stratified pattern
+        # built on them (core/lights.soft_ray_turns: the radial strata
+        # and the baked turns), the same table angles, averaged the
+        # same way. Three shapes, matching _soft_ray on the CPU: AREA
+        # aims at real points on its rectangle (or ellipse), SUN tilts
+        # inside its angular disc (its cap when wide), POINT/SPOT
+        # jitter the target in a world sphere.
+        #
+        # The salt is a 31-bit literal (a large Seed used to bake an
+        # integer no GLSL compiler accepts) plus the averaging road's
+        # pass index, which rides the hal_spass uniform so that sixteen
+        # accumulation passes are sixteen patterns and ONE plan
         w, h = consts['resolution']
         seed = int(consts.get('seed', 0))
         kind = str(meta.get('kind', 'POINT')).upper()
         area = meta.get('area')
         radius = _f(float(meta['radius']))
+        z0 = LI.soft_ray_salt(i, seed)
+        turns = LI.soft_ray_turns(samples)
+        rect = kind == 'AREA' and area is not None and not area['disk']
         L = [f'float hal_shadow_vis{i}(vec3 P, vec3 N, vec3 L, float dist)',
              '{',
              f'    vec3 org = P + N * {bias} + L * {bias};',
@@ -1383,53 +1731,97 @@ def _shadow_function(i, meta, consts):
              '    vec3 b = cross(L, t);',
              f'    int sx = int(vUV.x * {_f(float(w))});',
              f'    int sy = int(vUV.y * {_f(float(h))});',
-             '    float acc = 0.0;']
-        for k in range(samples):
-            z = 2 * k + 131 * int(i) + 7919 * seed
+             f'    int sz = {int(z0)} + int(hal_spass) * '
+             f'{int(LI.SOFT_PASS_SALT)};',
+             '    sz = sz & 0x7fffffff;',
+             '    int sz1 = (sz + 1) & 0x7fffffff;',
+             '    float h1 = hal_smp_hash3(sx, sy, sz);',
+             '    float h2 = hal_smp_hash3(sx, sy, sz1);']
+        if not rect:
+            L.append('    int h2i = int(h2 * 65535.0 + 0.5);')
+        L.append('    float acc = 0.0;')
+        invn = _f(float(np.float32(1.0 / samples)))
+        sun_law, sun_k = LI.sun_soft_law(meta['radius']) \
+            if kind == 'SUN' else (None, 0.0)
+        sun_kx = _f(sun_k)
+        if area is not None:
+            a_pos, a_ax, a_ay = (_v3(area['pos']), _v3(area['ax']),
+                                 _v3(area['ay']))
+            a_hx, a_hy = _f(area['hx']), _f(area['hy'])
+        if tx:
+            # the size, fetched once ahead of the unrolled rays: texel
+            # 13.x is the Radius or the sun law's constant, 14 / 15 an
+            # Area lamp's unit axes and half sizes, 0 its centre
             if kind == 'AREA' and area is not None:
-                L += ['    {',
-                      f'    float u1 = hal_smp_hash3(sx, sy, {z});',
-                      f'    float u2 = hal_smp_hash3(sx, sy, {z + 1});']
+                L += [f'    vec3 hal_sap = {_lref(i, 0, "xyz")};',
+                      f'    vec4 hal_sax = hal_ltex('
+                      f'{i * LIGHT_TEXEL_STRIDE + 14});',
+                      f'    vec4 hal_say = hal_ltex('
+                      f'{i * LIGHT_TEXEL_STRIDE + 15});']
+                a_pos, a_ax, a_ay = 'hal_sap', 'hal_sax.xyz', 'hal_say.xyz'
+                a_hx, a_hy = 'hal_sax.w', 'hal_say.w'
+            else:
+                L.append(f'    float hal_ssz = {_lref(i, 13, "x")};')
+                radius = sun_kx = 'hal_ssz'
+        for k in range(samples):
+            L += ['    {',
+                  f'    float u1 = ({_f(float(k))} + h1) * {invn};']
+            if rect:
+                L.append(f'    float u2 = fract('
+                         f'{_f(float(np.float32(turns[k])))} + h2);')
+            else:
+                L += [f'    int ai = (h2i + '
+                      f'{LI.soft_ray_turn_index(turns[k])}) & 255;',
+                      '    vec2 cs = texelFetch(hal_circle, ivec2(ai, 0), '
+                      '0).rg;']
+            if kind == 'AREA' and area is not None:
                 if area['disk']:
                     L += ['    float rr = sqrt(u1);',
-                          '    vec2 cs = hal_smp_circle(u2);',
                           '    float uu = rr * cs.x;',
                           '    float vv = rr * cs.y;']
                 else:
                     L += ['    float uu = u1 * 2.0 - 1.0;',
                           '    float vv = u2 * 2.0 - 1.0;']
-                L += [f'    vec3 ps = {_v3(area["pos"])} + '
-                      f'{_v3(area["ax"])} * ({_f(area["hx"])} * uu) + '
-                      f'{_v3(area["ay"])} * ({_f(area["hy"])} * vv);',
+                L += [f'    vec3 ps = {a_pos} + '
+                      f'{a_ax} * ({a_hx} * uu) + '
+                      f'{a_ay} * ({a_hy} * vv);',
                       '    vec3 dl = ps - P;',
                       '    float ds = max(length(dl), 1e-6);',
                       '    vec3 Lj = dl / ds;',
                       '    float mt = ds * (1.0 - 1e-3);',
                       '    acc += 1.0 - hal_bvh_occluded(org, Lj, mt);',
                       '    }']
+            elif kind == 'SUN' and sun_law == 'CAP':
+                # a wide sun: uniform in the solid angle of its cap
+                L += [f'    float ct = 1.0 - u1 * {sun_kx};',
+                      '    float sn = sqrt(max(1.0 - ct * ct, 0.0));',
+                      '    vec3 Lj = L * ct + t * (sn * cs.x) '
+                      '+ b * (sn * cs.y);',
+                      '    acc += 1.0 - hal_bvh_occluded(org, Lj, maxt);',
+                      '    }']
             elif kind == 'SUN':
-                tanh = _f(float(np.tan(float(meta['radius']) * 0.5)))
-                L += ['    {',
-                      f'    float u1 = hal_smp_hash3(sx, sy, {z});',
-                      f'    vec2 cs = hal_smp_circle(hal_smp_hash3(sx, sy, '
-                      f'{z + 1}));',
-                      f'    float r = sqrt(u1) * {tanh};',
+                L += [f'    float r = sqrt(u1) * {sun_kx};',
                       '    vec3 jit = t * (r * cs.x) + b * (r * cs.y);',
                       '    vec3 Lj = normalize(L + jit);',
                       '    acc += 1.0 - hal_bvh_occluded(org, Lj, maxt);',
                       '    }']
             else:
-                L += ['    {',
-                      f'    float u1 = hal_smp_hash3(sx, sy, {z});',
-                      f'    vec2 cs = hal_smp_circle(hal_smp_hash3(sx, sy, '
-                      f'{z + 1}));',
-                      f'    float r = sqrt(u1) * {radius};',
+                L += [f'    float r = sqrt(u1) * {radius};',
                       '    vec3 jit = t * (r * cs.x) + b * (r * cs.y);',
                       '    vec3 Lj = normalize(L * dist + jit);',
                       '    acc += 1.0 - hal_bvh_occluded(org, Lj, maxt);',
                       '    }']
-        L += [f'    return acc / {_f(float(samples))};', '}']
+        L += [_ret(f'acc / {_f(float(samples))}'), '}']
         return '\n'.join(L) + '\n'
+
+    if meta.get('soft'):
+        # a SIZED lamp: the penumbra is measured per fragment (a blocker
+        # search, a width by similar triangles, a filter that wide) --
+        # core/softmap.py's lookup, emitted by its twin. A lamp of size
+        # 0 never carries the key and keeps the text below
+        from .softmap import shadow_function as _soft_map_function
+        return _soft_map_function(
+            i, meta, tail['map'].get(i) if tx else None)
 
     faces = meta['faces']                    # list of per-face dicts
     size = meta['size']
@@ -1443,18 +1835,49 @@ def _shadow_function(i, meta, consts):
     origin = meta['origin']
 
     voff = int(meta.get('voff', 0))
-    L = ['uniform sampler2D hal_shadowpack;',
-         f'float hal_shadow_vis{i}(vec3 P, vec3 N, vec3 L)',
-         '{',
+    # the lamp's values: its tail block (`map_texels`: h0 = origin and
+    # Bias, h1 = near, extent | texel, far + near, far - near, h2 =
+    # 2 near far, max(1, Softness), Softness, Density, then four rows
+    # per face), or the same float32 values as literals
+    mb = tail['map'].get(i) if tx else None
+    if mb is not None:
+        head = [f'    vec4 hal_m0 = hal_ltex({mb});',
+                f'    vec4 hal_m1 = hal_ltex({mb + 1});',
+                f'    vec4 hal_m2 = hal_ltex({mb + 2});']
+        x_bias, x_origin = 'hal_m0.w', 'hal_m0.xyz'
+        x_near, x_ext, x_texel = 'hal_m1.x', 'hal_m1.y', 'hal_m1.y'
+        x_fpn, x_fmn, x_tnf = 'hal_m1.z', 'hal_m1.w', 'hal_m2.x'
+        x_mx, x_dens = 'hal_m2.y', 'hal_m2.w'
+
+        def x_row(fi, r):
+            return f'hal_ltex({mb + MAP_HEAD + fi * MAP_FACE + r})'
+    else:
+        head = []
+        x_bias, x_origin = _f(bias), _v3(origin)
+        x_near, x_ext = _f(near), _f(meta['extent'])
+        x_texel = _f(2.0 * meta['extent'] / size)
+        x_fpn, x_fmn, x_tnf = (_f(far + near), _f(far - near),
+                               _f(2.0 * near * far))
+        x_mx, x_dens = _f(max(1.0, soft)), _f(density)
+
+        def x_row(fi, r):
+            return _v4(np.asarray(faces[fi]['vp'], np.float32)[r])
+    # (no `uniform sampler2D hal_shadowpack;` here: the atlas is ONE
+    # sampler however many lamps read it, and the assembler declares it
+    # ONCE ahead of the first mapped function -- SHADOWPACK_DECL. One per
+    # function was a redefinition to a strict front-end from the second
+    # shadowed lamp on)
+    L = [f'float hal_shadow_vis{i}(vec3 P, vec3 N, vec3 L)',
+         '{'] + head + [
          f'    float ndl = clamp(dot(N, L), 0.0, 1.0);',
-         f'    float slope = {_f(bias)} * (1.0 + 2.0 * (1.0 - ndl));',
-         f'    float pdist = length(P - {_v3(origin)});']
+         f'    float slope = {x_bias} * (1.0 + 2.0 * (1.0 - ndl));',
+         f'    float pdist = length(P - {x_origin});']
     # texel_size, then the normal offset the CPU applies before the lookup
     if persp:
-        L.append(f'    float texel = 2.0 * {_f(meta["extent"])} * '
-                 f'max(pdist, {_f(near)}) / {_f(size)};')
+        L.append(f'    float texel = 2.0 * {x_ext} * '
+                 f'max(pdist, {x_near}) / {_f(size)};')
     else:
-        L.append(f'    float texel = {_f(2.0 * meta["extent"] / size)};')
+        L.append(f'    float texel = {x_texel};')
     if meta.get('midpoint'):
         # R251 C117: the MIDPOINT map's compare has no normal offset (and
         # `slope` above folds to 0.0 * (...) = 0.0 from the zero bias):
@@ -1462,12 +1885,12 @@ def _shadow_function(i, meta, consts):
         L.append('    float off_amt = 0.0;')
     else:
         L.append(f'    float off_amt = texel * (1.5 + 2.5 * '
-                 f'sqrt(max(1.0 - ndl * ndl, 0.0))) * {_f(max(1.0, soft))};')
+                 f'sqrt(max(1.0 - ndl * ndl, 0.0))) * {x_mx};')
     L.append('    vec4 ph = vec4(P + N * off_amt, 1.0);')
 
     if len(faces) > 1:
         # cube: the face is the major axis of the vector from the light
-        L += ['    vec3 dvec = ph.xyz - ' + _v3(origin) + ';',
+        L += ['    vec3 dvec = ph.xyz - ' + x_origin + ';',
               '    vec3 avec = abs(dvec);',
               '    int face = 0;',
               '    if (avec.x >= avec.y && avec.x >= avec.z) '
@@ -1479,21 +1902,19 @@ def _shadow_function(i, meta, consts):
               '    float clipz = 0.0; float clipw = 1.0;',
               '    float cellx = 0.0; float celly = 0.0;']
         for fi, fc in enumerate(faces):
-            vp = np.asarray(fc['vp'], np.float32)
             L += [f'    if (face == {fi}) {{',
-                  f'        clipx = dot(ph, {_v4(vp[0])});',
-                  f'        clipy = dot(ph, {_v4(vp[1])});',
-                  f'        clipz = dot(ph, {_v4(vp[2])});',
-                  f'        clipw = dot(ph, {_v4(vp[3])});',
+                  f'        clipx = dot(ph, {x_row(fi, 0)});',
+                  f'        clipy = dot(ph, {x_row(fi, 1)});',
+                  f'        clipz = dot(ph, {x_row(fi, 2)});',
+                  f'        clipw = dot(ph, {x_row(fi, 3)});',
                   f'        cellx = {_f((fi % grid_w) * size)};',
                   f'        celly = {_f((fi // grid_w) * size + voff)};',
                   '    }']
     else:
-        vp = np.asarray(faces[0]['vp'], np.float32)
-        L += [f'    float clipx = dot(ph, {_v4(vp[0])});',
-              f'    float clipy = dot(ph, {_v4(vp[1])});',
-              f'    float clipz = dot(ph, {_v4(vp[2])});',
-              f'    float clipw = dot(ph, {_v4(vp[3])});',
+        L += [f'    float clipx = dot(ph, {x_row(0, 0)});',
+              f'    float clipy = dot(ph, {x_row(0, 1)});',
+              f'    float clipz = dot(ph, {x_row(0, 2)});',
+              f'    float clipw = dot(ph, {x_row(0, 3)});',
               f'    float cellx = 0.0; float celly = {_f(voff)};']
 
     eps = 1e-6
@@ -1509,29 +1930,49 @@ def _shadow_function(i, meta, consts):
     # linearise the fragment's own depth exactly as _linearise does
     L.append('    float zc = clamp(nz, -1.0, 1.0);')
     if persp:
-        L.append(f'    float den = ({_f(far + near)}) - zc * {_f(far - near)};')
+        L.append(f'    float den = ({x_fpn}) - zc * {x_fmn};')
         L.append(f'    den = abs(den) < {_f(eps)} ? {_f(eps)} : den;')
-        L.append(f'    float sdist = {_f(2.0 * near * far)} / den;')
+        L.append(f'    float sdist = {x_tnf} / den;')
     else:
-        L.append(f'    float sdist = (zc * 0.5 + 0.5) * {_f(far - near)}'
-                 f' + {_f(near)};')
+        L.append(f'    float sdist = (zc * 0.5 + 0.5) * {x_fmn}'
+                 f' + {x_near};')
     L += [f'    float u = (nx * 0.5 + 0.5) * {_f(size)};',
           f'    float v = (ny * 0.5 + 0.5) * {_f(size)};',
           '    float lit = 0.0;']
-    offs = _pcf_offsets(taps) * max(soft, 0.0)
-    for ox, oy in offs:
-        L += [f'    {{',
-              f'    float xi = clamp(floor(u + {_f(ox)}), 0.0, '
-              f'{_f(size - 1)});',
-              f'    float yi = clamp(floor(v + {_f(oy)}), 0.0, '
-              f'{_f(size - 1)});',
-              '    float occ = texelFetch(hal_shadowpack, '
-              'ivec2(int(cellx + xi), int(celly + yi)), 0).r;',
-              '    lit += (sdist - slope <= occ) ? 1.0 : 0.0;',
-              '    }']
-    L += [f'    lit /= {_f(len(offs))};',
+    if mb is not None:
+        # the Vogel disc scaled by the Softness texel: the product the
+        # CPU takes in float32 (`_pcf_offsets(taps) * radius`), in a
+        # statement of its own ahead of the add
+        pts = _pcf_offsets(taps)
+        for vx, vy in pts:
+            L += ['    {',
+                  f'    float ox = {_f(vx)} * hal_m2.z;',
+                  f'    float oy = {_f(vy)} * hal_m2.z;',
+                  f'    float xi = clamp(floor(u + ox), 0.0, '
+                  f'{_f(size - 1)});',
+                  f'    float yi = clamp(floor(v + oy), 0.0, '
+                  f'{_f(size - 1)});',
+                  '    float occ = texelFetch(hal_shadowpack, '
+                  'ivec2(int(cellx + xi), int(celly + yi)), 0).r;',
+                  '    lit += (sdist - slope <= occ) ? 1.0 : 0.0;',
+                  '    }']
+        ntap = len(pts)
+    else:
+        offs = _pcf_offsets(taps) * max(soft, 0.0)
+        for ox, oy in offs:
+            L += [f'    {{',
+                  f'    float xi = clamp(floor(u + {_f(ox)}), 0.0, '
+                  f'{_f(size - 1)});',
+                  f'    float yi = clamp(floor(v + {_f(oy)}), 0.0, '
+                  f'{_f(size - 1)});',
+                  '    float occ = texelFetch(hal_shadowpack, '
+                  'ivec2(int(cellx + xi), int(celly + yi)), 0).r;',
+                  '    lit += (sdist - slope <= occ) ? 1.0 : 0.0;',
+                  '    }']
+        ntap = len(offs)
+    L += [f'    lit /= {_f(ntap)};',
           '    if (!inside) { lit = 1.0; }',
-          f'    return 1.0 - (1.0 - lit) * {_f(density)};',
+          f'    return 1.0 - (1.0 - lit) * {x_dens};',
           '}']
     return '\n'.join(L) + '\n'
 
@@ -2392,9 +2833,7 @@ def _cel_composition(lines, bake, consts, affect_diffuse, affect_specular,
         # own lit step. The generic tail is bypassed: the block closes
         # here.
         if link_c:
-            tests = ' + '.join(f'((abs(td.y - {_f(float(o))}) < 0.5) '
-                               '? 1.0 : 0.0)'
-                               for o in link_c['objects'])
+            tests = link_ladder(link_c['objects'])
             lines.append(f'    float hal_clk = min({tests}, 1.0);')
             if str(link_c.get('mode', 'EXCLUDE')).upper() == 'ONLY':
                 lines.append('    float hal_cm = hal_clk;')
@@ -2702,17 +3141,20 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
             '    vec3 ss_fog = ss_col * (ss_en * ss_el);']
         link_ss = (consts.get('light_links') or {}).get(i)
         if link_ss:
-            tests = ' + '.join(f'((abs(td.y - {_f(float(o))}) < 0.5) '
-                               '? 1.0 : 0.0)'
-                               for o in link_ss['objects'])
+            tests = link_ladder(link_ss['objects'])
             lines.append(f'    float hal_lk{i} = min({tests}, 1.0);')
             mask = f'hal_lk{i}' \
                 if str(link_ss.get('mode', 'EXCLUDE')).upper() == 'ONLY' \
                 else f'(1.0 - hal_lk{i})'
             lines += [f'    hal_sst = hal_sst * {mask};',
                       f'    ss_fog = ss_fog * {mask};']
-        lines += ['    total += hal_sst;',
-                  '    hal_spotfog += ss_fog;',
+        if getattr(light, 'affect_diffuse', True) and \
+                not getattr(light, 'specular_only', False):
+            # R254: the diffuse gates, exactly light_surface's (both
+            # flags are _light_sig structure): Specular Only leaves the
+            # fog lobe and adds nothing to the surface
+            lines.append('    total += hal_sst;')
+        lines += ['    hal_spotfog += ss_fog;',
                   '    }']
         return lines
     ck = (consts.get('cookies') or {}).get(i)
@@ -2735,21 +3177,25 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
                 f'    rad = rad * (vec3(1.0) + (hal_cookie_rgb{i}(ckuv) '
                 f'- vec3(1.0)) * {_f(ck["strength"])});']
     else:
-        mode_bi = str(getattr(light, 'decay', '')).startswith('BI_') or \
+        dmode = str(getattr(light, 'decay', 'DEFAULT') or 'DEFAULT')
+        if dmode == 'DEFAULT':
+            dmode = str(consts['falloff_default'])
+        # R254: the Blender Internal snap reads the RESOLVED law, as
+        # the CPU's sample() does -- a Scene Default lamp under a BI
+        # render default snaps like the same law chosen on the lamp
+        mode_bi = dmode.startswith('BI_') or \
             getattr(light, 'bi_sphere', False)
         refs = None
         if use_tx:
             refs = {'D': _lref(i, 3, 'y'), 'start': _lref(i, 3, 'x'),
-                    'ld1': _lref(i, 3, 'z'), 'ld2': _lref(i, 3, 'w')}
+                    'ld1': _lref(i, 3, 'z'), 'ld2': _lref(i, 3, 'w'),
+                    'sphere': _lref(i, 5, 'w')}
         pos = _lref(i, 0, 'xyz') if use_tx else _v3(light.position)
         e_pre = _lref(i, 0, 'w') if use_tx else \
             _f(energy / (4.0 * np.pi))
         lines += [f'    vec3 delta = {pos} - P;',
                   '    float dist = max(length(delta), 1e-6);',
                   '    vec3 L = delta / dist;']
-        dmode = str(getattr(light, 'decay', 'DEFAULT') or 'DEFAULT')
-        if dmode == 'DEFAULT':
-            dmode = str(consts['falloff_default'])
         if kind == 'AREA':
             # lamp_get_visibility skips its falloff switch for LA_AREA:
             # visifac stays 1.0 and distance speaks only through the
@@ -2815,13 +3261,52 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
             sd = np.asarray(light.direction, np.float32)
             sd = sd / max(float(np.linalg.norm(sd)), 1e-9)
             spotsi = float(np.cos(float(light.spot_size) * 0.5))
-            spotbl = (1.0 - spotsi) * float(light.spot_blend)
+            from ..core import lights as _LIb
+            spotbl = _LIb.spot_blend_band(light, spotsi)
             sd_r = _lref(i, 1, 'xyz') if use_tx else _v3(sd)
             si_r = _lref(i, 1, 'w') if use_tx else _f(spotsi)
             bl_r = _lref(i, 2, 'w') if use_tx else _f(spotbl)
             law = str(getattr(light, 'spot_law', 'BLENDER') or 'BLENDER')
             lines.append(f'    float cosang = -dot(L, {sd_r});')
-            if getattr(light, 'spot_square', False):
+            from ..core import lights as _LIsc
+            _sc_on = _LIsc.spot_scale_on(light)
+            if _sc_on:
+                # R254: Blender's elliptical cone (a Spot scaled
+                # unevenly across its beam), statement for statement
+                # lights.scaled_cos -- the squeezed cosine replaces
+                # cosang and every cone law below reads it unchanged;
+                # with Square the wider squeezed side is taken. Whether
+                # a squeeze exists is structure, its two factors are
+                # texels 10.w / 11.w (dragging the scale re-uploads)
+                if use_tx:
+                    _sc_sr, _sc_ur = _lref(i, 10, 'xyz'), _lref(i, 11, 'xyz')
+                    _sc_xr, _sc_yr = _lref(i, 10, 'w'), _lref(i, 11, 'w')
+                else:
+                    _scs, _scu, _scf = _LIsc.cookie_frame(light)
+                    _sc_sr, _sc_ur = _v3(_scs), _v3(_scu)
+                    _sc_xr = _f(np.float32(light.spot_scale[0]))
+                    _sc_yr = _f(np.float32(light.spot_scale[1]))
+                lines += [f'    float sc_x = -dot(L, {_sc_sr});',
+                          f'    float sc_y = -dot(L, {_sc_ur});',
+                          f'    sc_x = sc_x * {_sc_xr};',
+                          f'    sc_y = sc_y * {_sc_yr};',
+                          '    float sc_zz = max(cosang, 1e-20);',
+                          '    float sc_ax = sc_x / sc_zz;',
+                          '    float sc_ay = sc_y / sc_zz;']
+                if getattr(light, 'spot_square', False):
+                    lines += ['    sc_ax = abs(sc_ax);',
+                              '    sc_ay = abs(sc_ay);',
+                              '    float sc_m = max(sc_ax, sc_ay);',
+                              '    float sc_q = sc_m * sc_m;']
+                else:
+                    lines += ['    float sc_q = sc_ax * sc_ax;',
+                              '    float sc_t = sc_ay * sc_ay;',
+                              '    sc_q = sc_q + sc_t;']
+                lines += ['    sc_q = 1.0 + sc_q;',
+                          '    float sc_r = sqrt(sc_q);',
+                          '    float sc_c = 1.0 / sc_r;',
+                          '    cosang = (cosang > 0.0) ? sc_c : 0.0;']
+            if getattr(light, 'spot_square', False) and not _sc_on:
                 # R253 (A): BI's LA_SQUARE, statement for statement
                 # lights.square_cos -- the cosine along the wider side
                 # replaces cosang and the cone-law lines below read it
@@ -3007,9 +3492,7 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
         lines.append(f'    float hal_svk = {_sv_call};')
         link = (consts.get('light_links') or {}).get(i)
         if link:
-            tests = ' + '.join(f'((abs(td.y - {_f(float(o))}) < 0.5) '
-                               '? 1.0 : 0.0)'
-                               for o in link['objects'])
+            tests = link_ladder(link['objects'])
             lines.append(f'    float hal_lk{i} = min({tests}, 1.0);')
             mask = f'hal_lk{i}' if str(link.get('mode', 'EXCLUDE')).upper() \
                 == 'ONLY' else f'(1.0 - hal_lk{i})'
@@ -3062,14 +3545,17 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
                 '    hal_osh = hal_osh * 0.318309886;',
                 '    vec3 hal_osd = vec3(1.0 - hal_sv);']
             if max(_oshc) > 0.0:
+                # R254: the colour is texel 12 under a plan (whether
+                # the term exists stays structure)
+                _oshx = _lref(i, 12, 'rgb') if (
+                    use_tx and consts.get('light_tail') is not None) \
+                    else _v3(_oshc)
                 lines.append(f'    hal_osd = hal_osd * (vec3(1.0) - '
-                             f'{_v3(_oshc)});')
+                             f'{_oshx});')
             lines.append('    hal_osh = hal_osh * hal_osd;')
             link_os = (consts.get('light_links') or {}).get(i)
             if link_os:
-                tests = ' + '.join(f'((abs(td.y - {_f(float(o))}) < 0.5) '
-                                   '? 1.0 : 0.0)'
-                                   for o in link_os['objects'])
+                tests = link_ladder(link_os['objects'])
                 lines.append(f'    float hal_lk{i} = min({tests}, 1.0);')
                 mask = f'hal_lk{i}' \
                     if str(link_os.get('mode', 'EXCLUDE')).upper() == 'ONLY' \
@@ -3246,8 +3732,13 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
                  or (0.0, 0.0, 0.0))
     if not anime:
         if max(_shc) > 0.0:
+            # R254: the colour is texel 12 under a plan (a Shadow Colour
+            # drag re-uploads it); whether the term exists is structure
+            _shx = _lref(i, 12, 'rgb') if (
+                use_tx and consts.get('light_tail') is not None) \
+                else _v3(_shc)
             lines.append(f'    hal_dcon *= 0.318309886 * (vec3(hal_sv)'
-                         f' + {_v3(_shc)} * (1.0 - hal_sv));')
+                         f' + {_shx} * (1.0 - hal_sv));')
         else:
             lines.append('    hal_dcon *= 0.318309886 * hal_sv;')
         lines.append('    hal_scon *= 0.318309886 * hal_sv;')
@@ -3260,9 +3751,7 @@ def _one_light_source(i, light, consts, shadowed=None, bake=None, bi=None):
         # ONLY lights light just their list; EXCLUDE lights light
         # everything else. Hits carry the same object id through
         # hal_tri_data, exactly as ctx.object_index_raw does at hits.
-        tests = ' + '.join(f'((abs(td.y - {_f(float(o))}) < 0.5) '
-                           '? 1.0 : 0.0)'
-                           for o in link['objects'])
+        tests = link_ladder(link['objects'])
         lines.append(f'    float hal_lk{i} = min({tests}, 1.0);')
         mask = f'hal_lk{i}' if str(link.get('mode', 'EXCLUDE')).upper() \
             == 'ONLY' else f'(1.0 - hal_lk{i})'
@@ -4979,12 +5468,28 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     if bake.get('__cel_field') and not vertex_rate:
         shadow_fns.append(_cel_lookup_function(consts))
         samplers.append('hal_celfield')
-    mapped_shadow = False
+    mapped_shadow = any(s is not None and not s.get('ray') for s in shadows)
+    if mapped_shadow:
+        # R253 (review): the atlas sampler is declared ONCE per pass,
+        # ahead of the first hal_shadow_vis that fetches it. Each mapped
+        # lamp's function used to open with its own copy, so a pass under
+        # two shadowed lamps declared it twice: `strip_declarations`
+        # takes every copy off for CreateInfo, but the legacy constructor
+        # compiles the raw text, and there the second copy is a
+        # redefinition
+        shadow_fns.append(SHADOWPACK_DECL)
+    # R254: the shadow functions read their values through hal_ltex when
+    # the plan laid out the hal_lights tail. Its definition lands after
+    # this block (the R193 declaration-order law), so the prototype goes
+    # first -- once, shared with the area form factors below
+    ltex_proto = False
     for i, smeta in enumerate(shadows):
         if smeta is not None:
-            shadow_fns.append(_shadow_function(i, smeta, consts))
-            if not smeta.get('ray'):
-                mapped_shadow = True
+            _sfn = _shadow_function(i, smeta, consts)
+            if 'hal_ltex(' in _sfn and not ltex_proto:
+                shadow_fns.append('vec4 hal_ltex(int t);\n')
+                ltex_proto = True
+            shadow_fns.append(_sfn)
     if mapped_shadow:
         # every mapped light reads the ONE combined atlas: eight
         # per-light samplers put real materials at the driver's
@@ -5022,7 +5527,8 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
             _area_lights = [
                 (i, _al) for i, _al in enumerate(lights)
                 if getattr(_al, 'type', 'POINT') == 'AREA']
-            if _area_lights and bool(consts.get('light_texels', True)):
+            if _area_lights and bool(consts.get('light_texels', True)) \
+                    and not ltex_proto:
                 shadow_fns.append('vec4 hal_ltex(int t);\n')
             for i, _al in _area_lights:
                 shadow_fns.append(_area_function(i, _al, consts))
@@ -5106,7 +5612,17 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
     # R169: the per-light VALUE texture -- one row of texels the light
     # loop fetches instead of baked literals, so lamp edits re-upload
     # instead of recompiling (see LIGHT_TEXEL_STRIDE)
-    if lights and not (vertex_rate or shadeless) and \
+    # R254: the ambient tail rides the same row, so a pass that reads
+    # it declares the sampler even when no lamp is left in its loop
+    amb_tail = consts.get('ambient_tail')
+    if amb_tail is not None and (
+            vertex_rate or shadeless or rad_spec
+            or not bool(consts.get('light_texels', True))):
+        # these passes emit no flat ambient term (the corners carry it,
+        # a shadeless model has none, the radiosity gather replaces it)
+        amb_tail = None
+    if (lights or amb_tail is not None) \
+            and not (vertex_rate or shadeless) and \
             bool(consts.get('light_texels', True)):
         triaux_fns += (
             'uniform sampler2D hal_lights;\n'
@@ -5178,6 +5694,12 @@ def assemble_frame(graph, mat_id, model_index, bake, lights, consts,
         # salt; the pass declares the per-frame scalar (already fed by
         # the driver and the simulator)
         em.frame_uniforms.add('hal_frame')
+    if soft_any:
+        # the soft-ray pattern's salt takes the averaging road's pass
+        # index from a per-draw scalar (shade._frame_scalar feeds it on
+        # the driver, the simulator sets it), never from a literal: the
+        # passes of one frame share one plan and one compiled shader
+        em.frame_uniforms.add('hal_spass')
     frame_unis = sorted(em.frame_uniforms)
     extra_unis = ''.join(f'uniform float {u};\n' for u in frame_unis)
     # the interface declarations come FIRST: the sampling helpers and the
@@ -5458,15 +5980,23 @@ void main()
         # verbatim shade_lamp_loop (R155/R156): BI's flat ambient rule
         # covers the WORLD pool only; the engine's Global Ambient stays
         # diffuse-tinted, exactly light_surface's BI branch
-        eng = consts.get('ambient_engine', consts['ambient_color'])
-        wrld = consts.get('ambient_world', (0.0, 0.0, 0.0))
+        eng = _v3(consts.get('ambient_engine', consts['ambient_color']))
+        wrld = _v3(consts.get('ambient_world', (0.0, 0.0, 0.0)))
+        if amb_tail is not None:
+            # R254: the pool's two halves as VALUES (the ambient tail)
+            eng = f'hal_ltex({int(amb_tail) + 1}).xyz'
+            wrld = f'hal_ltex({int(amb_tail) + 2}).xyz'
         lines.append(
-            f'    vec3 total = s.diffuse * ({_v3(eng)}'
+            f'    vec3 total = s.diffuse * ({eng}'
             f' * {_mv(consts, bake.get("ambient", 1.0))})'
-            f' + {_v3(wrld)} * {_mv(consts, bake.get("ambient", 1.0))};')
+            f' + {wrld} * {_mv(consts, bake.get("ambient", 1.0))};')
     else:
+        amb = _v3(consts["ambient_color"])
+        if amb_tail is not None:
+            # R254: the pool as a VALUE (the ambient tail of hal_lights)
+            amb = f'hal_ltex({int(amb_tail)}).xyz'
         lines.append(
-            f'    vec3 total = s.diffuse * ({_v3(consts["ambient_color"])}'
+            f'    vec3 total = s.diffuse * ({amb}'
             f' * {_mv(consts, bake.get("ambient", 1.0))});')
     if ao_spec and not rad_spec:
         # exactly light_surface's order: ambient occlusion scales the

@@ -774,6 +774,27 @@ def _sample_volume(vnode, graph, textures, settings, P, lo, hi,
     return out
 
 
+def scatter_lights(scene, st):
+    """[(lamp, sign)]: the lamps that scatter in a volume container this
+    frame, each with the sign its light takes (R254).
+
+    They are the FRAME's lamps (LI.frame_lights: the Light Limit's
+    survivors, no ambient lamp) less every lamp whose flags leave it no
+    diffuse-like light to give: Only Shadow adds none anywhere, Specular
+    Only (or Diffuse off) has no lobe a medium answers to. A Negative
+    lamp scatters with a minus sign, as it shades a surface. The march
+    used to take every lamp that was not of type AMBIENT, flags and
+    limit unread: a Negative lamp brightened the fog, an Only Shadow
+    lamp lit it, a lamp the limit had dropped still lit it. A scene with
+    no such lamp gets the same lamps in the same order (the march keys
+    its per-lamp random streams on the position in this list)."""
+    return [(l, LI.lights_volume(l))
+            for l in LI.frame_lights(scene, st)
+            if LI.lights_volume(l) != 0.0
+            and getattr(l, 'affect_diffuse', True)
+            and not getattr(l, 'specular_only', False)]
+
+
 def march(img, scene, st, gbuf, vp, eye, w, h, bvh=None, sel_mask=None,
           textures=None, view=None):
     """Composite every volume container over the finished frame.
@@ -820,8 +841,7 @@ def march(img, scene, st, gbuf, vp, eye, w, h, bvh=None, sel_mask=None,
                                       1e-9, hit_h[:, 3:4])
         dist[covered] = np.linalg.norm(hit - eye[None, :], axis=1)
 
-    lights_all = [l for l in (getattr(scene, 'lights', None) or ())
-                  if str(getattr(l, 'type', '')).upper() != 'AMBIENT']
+    lights_all = scatter_lights(scene, st)
     # soft ray shadows draw whole-lane scalars: each (volume, step,
     # light) triple gets its OWN stream derived arithmetically from the
     # seed, so the draws are a pure function of the triple -- a band
@@ -833,6 +853,19 @@ def march(img, scene, st, gbuf, vp, eye, w, h, bvh=None, sel_mask=None,
         s = (base_seed * 2654435761 + vol_i * 97911
              + step_k * 8191 + light_i * 131071 + 12043) & 0x7fffffff
         return np.random.RandomState(s)
+
+    def _linked(light, obj_i):
+        # R254: light linking reaches a container as it reaches any
+        # other object -- the lamp's linked indices against the
+        # container's own (light_surface's isin rule for one object)
+        excl = getattr(light, 'exclude_objects', None)
+        if not excl or obj_i < 0:
+            # no link, or a mesh without object ids (no surface is
+            # linked there either)
+            return True
+        inside = int(obj_i) in {int(o) for o in excl}
+        return inside if getattr(light, 'exclude_mode', 'EXCLUDE') == 'ONLY' \
+            else not inside
     objects = getattr(scene, 'objects', None) or []
     mesh = getattr(scene, 'mesh', None)
     mats = getattr(scene, 'materials', None) or []
@@ -925,8 +958,12 @@ def march(img, scene, st, gbuf, vp, eye, w, h, bvh=None, sel_mask=None,
             if sc_alb.max() > 0.0 and lights_all and \
                     model not in UNLIT_MODELS:
                 dv = d_idx[liveT]
-                for li, light in enumerate(lights_all):
+                for li, (light, l_sign) in enumerate(lights_all):
+                    if not _linked(light, _oi):
+                        continue
                     L, rad, ldist = LI.sample(light, Pv, st)
+                    if l_sign < 0.0:
+                        rad = -rad
                     if shadows_on:
                         vis = LI.visibility(
                             light, Pv, L, L, ldist, st, bvh,
@@ -989,8 +1026,9 @@ def march(img, scene, st, gbuf, vp, eye, w, h, bvh=None, sel_mask=None,
             except Exception:                                   # noqa: BLE001
                 pass
 
+    # (|scatter|: a Negative lamp's scatter is below zero)
     changed = (T_total.min(axis=1) < 1.0 - 1e-6) | \
-        (scatter_total.max(axis=1) > 1e-6)
+        (np.abs(scatter_total).max(axis=1) > 1e-6)
     if not changed.any():
         return img
     if sel is None:

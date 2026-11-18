@@ -650,7 +650,7 @@ def spot_on(st):
 
 def spot_fog_of(job, px, py, depth):
     """A52: the screen spotlights' fog lobe colE * (en * el), summed over
-    the frame's screen-spot lamps in select_lights' order, for points
+    the frame's screen-spot lamps in frame_lights' order, for points
     that ARE pixels -- what light_surface accumulates in ctx.spot_fog;
     `fog_for_points` calls it for the refusal road (a fog_cpu material
     under a Model 3 headlight). None when no lamp is a screen spot or
@@ -662,7 +662,7 @@ def spot_fog_of(job, px, py, depth):
     scene = job.scene
     if px is None or py is None or depth is None:
         return None
-    lights = [l for l in LI.select_lights(scene.lights, st)
+    lights = [l for l in LI.frame_lights(scene, st)
               if getattr(l, 'screen_spot', False)
               and getattr(l, 'type', '') == 'SPOT']
     if not lights:

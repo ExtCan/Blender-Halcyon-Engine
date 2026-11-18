@@ -1510,7 +1510,7 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
         edge_vn = np.clip(1.0 - np.abs(M.dot(N, V)), 0.0, 1.0)
 
     lights = active_lights if active_lights is not None else \
-        LI.select_lights(scene.lights, settings)
+        LI.frame_lights(scene, settings)
     # R252: the machine's light limit, per material (the GTE's three
     # rows, the DS's four lights, the RSP's seven): the first N of the
     # scene's selection, in scene order -- the games' own register order
@@ -1722,9 +1722,15 @@ def light_surface(surf, model, ctx, scene, settings, bvh=None, rng=None,
             ss_t = ss_t * inv_pi
             if lit_mask is not None:
                 ss_t = ss_t * lit_mask[:, None]
-            out += ss_t
-            if want_split:
-                _sp_add(li, ss_t, None)                        # R253
+            if light.affect_diffuse and not light.specular_only:
+                # R254: the lobe is DIFFUSE light, so the lamp's diffuse
+                # gates apply (the ordinary lamp path's own condition):
+                # Specular Only used to leave the ellipse untouched. The
+                # fog lobe below is the lamp in the air, not a surface
+                # term, and stays
+                out += ss_t
+                if want_split:
+                    _sp_add(li, ss_t, None)                    # R253
             ss_fog = ss_col[None, :] * (ss_en * ss_el)[:, None]
             if lit_mask is not None:
                 ss_fog = ss_fog * lit_mask[:, None]
@@ -2784,7 +2790,7 @@ def _stash_ground_light(scene, st, bvh):
         if float(getattr(world, 'ground_lighting', 1.0) or 0.0) <= 0.0:
             return
         from . import lights as LI
-        lts = LI.select_lights(getattr(scene, 'lights', []) or [], st)
+        lts = LI.frame_lights(scene, st)
         if not lts:
             return
         world._ground_light = _make_ground_light(scene, st, bvh, lts)
@@ -3015,7 +3021,7 @@ class ShadeJob:
         # R253 (H): a job built without render() (the GPU plan rigs)
         # still packs the frame's style gains; idempotent after render's
         LI.apply_light_styles(scene)
-        self.lights = LI.select_lights(scene.lights, settings)
+        self.lights = LI.frame_lights(scene, settings)
         self.unsupported = set()
         self._obj_matrices = None
         self._bounds = None
@@ -4501,15 +4507,32 @@ def _build_shadows(scene, st, mesh):
 
 
 def shaft_sources(scene, settings, vp):
-    """Screen positions of lights that scatter, for the light-shaft pass."""
+    """Screen positions of lights that scatter, for the light-shaft pass.
+
+    R254: a Spot, Point or Area lamp is a source only while the render
+    does NOT draw its in-air beam (Volumetric Lights off). The one
+    Volumetric slider used to feed both at once, which nobody saw: a
+    usable beam sat at 0.001 .. 0.02 under the old beam unit, where the
+    shafts' strength is nothing. With the beam on its own radiance
+    scale a beam is set near 1, and the same 1 smeared every bright
+    pixel away from the lamp in the march's 24 steps -- banded streaks
+    below a spot's own pool, on top of the real beam. One lamp, one
+    volumetric effect: the beam where beams are drawn, the shafts
+    otherwise; a Sun or a hemi has no beam and always throws shafts.
+    """
     out = []
+    beams = bool(getattr(settings, 'spot_cones', False))
     for light in scene.lights:
         vol = float(getattr(light, 'volumetric', 0.0))
         if vol <= 0.0:
             continue
-        if light.type == 'SUN':
+        if beams and str(light.type).upper() in _VOLUME_KINDS:
+            continue
+        if str(light.type).upper() in ('SUN', 'HEMI'):
             # a directional light has no position: its shafts converge on the
             # vanishing point, which is the direction projected with w = 0
+            # (R254: a HEMI is a Sun with the Hemisphere flag -- it took the
+            # positional branch and its shafts chased the lamp OBJECT)
             d = M.normalize(np.asarray(light.direction, np.float32))
             clip = np.append(-d, 0.0).astype(np.float32) @ vp.T
         else:
@@ -4522,8 +4545,58 @@ def shaft_sources(scene, settings, vp):
         # is generous; only rule out lights nowhere near the view
         if abs(ndc[0]) > 6.0 or abs(ndc[1]) > 6.0:
             continue
+        if not any(light is l for l in _medium_lamps(scene, settings)):
+            # R254: only a lamp that lights a medium this frame throws
+            # shafts (_medium_lamps): a lamp that is only ambient has
+            # no position to throw one from, an Only Shadow lamp or one
+            # the Light Limit left unlit emits nothing to scatter
+            continue
         out.append(((float(ndc[0]), float(ndc[1])), vol))
     return out
+
+
+#: R254: the caustic web's own values over one period-8 lattice at time
+#: 0 (what a Sun bakes on frame 0), kept to measure a strength's mean
+_CAUSTIC_REF = []
+#: the Caustics strength -> the mean of its factor over that lattice
+_CAUSTIC_MEAN = {}
+
+
+def caustic_factor(web, c):
+    """The lamp factor of the caustic web at strength `c`: the cells
+    darken and the crests overdrive around the pivot the bake always
+    used -- 1 + (web - 0.35) * 1.6 * min(c, 4), floored at zero."""
+    return np.maximum(1.0 + (web - 0.35) * 1.6 * min(c, 4.0), 0.0)
+
+
+def caustic_mean(c):
+    """R254: the mean of caustic_factor over the web's lattice.
+
+    The bake's comment promised "mean stays near 1", but the web's mean
+    is 0.17, half the 0.35 the factor pivots on: Caustics 1.0 threw
+    away 29% of the lamp's light and 2.0 half of it. Dividing the baked
+    tile by this mean keeps the web's look -- the same cells, the same
+    crest-to-cell contrast at every strength -- and gives the lamp its
+    light back. The mean is taken over a fixed lattice (the web's
+    statistics do not depend on the frame or the period), so the
+    divisor is one constant per strength: nothing breathes as the web
+    writhes, and a Sun's seamless tile averages 1 to within a percent
+    on every frame."""
+    key = round(float(min(c, 4.0)), 6)
+    got = _CAUSTIC_MEAN.get(key)
+    if got is None:
+        if not _CAUSTIC_REF:
+            from . import patterns as PT
+            ax = (np.arange(256, dtype=np.float32) + 0.5) / 256
+            uu = np.broadcast_to(ax[None, :] * 8, (256, 256))
+            vv = np.broadcast_to(ax[:, None] * 8, (256, 256))
+            _CAUSTIC_REF.append(PT.caustic_web(uu, vv, time=0.0, period=8))
+        got = max(float(np.mean(caustic_factor(
+            _CAUSTIC_REF[0].astype(np.float64), key))), 1e-6)
+        if len(_CAUSTIC_MEAN) > 256:
+            _CAUSTIC_MEAN.clear()
+        _CAUSTIC_MEAN[key] = got
+    return got
 
 
 def _synth_caustic_cookies(scene):
@@ -4547,7 +4620,9 @@ def _synth_caustic_cookies(scene):
     for light in lights:
         c = float(getattr(light, 'caustics', 0.0))
         kind = str(getattr(light, 'type', '')).upper()
-        if c <= 0.0 or kind not in ('SPOT', 'SUN'):
+        # R254: a HEMI (a Sun with the Hemisphere flag) tiles the web as
+        # its Sun does -- the panel drew the sliders and this skipped it
+        if c <= 0.0 or kind not in ('SPOT', 'SUN', 'HEMI'):
             continue
         if getattr(light, 'cookie', None) is not None and \
                 not getattr(light, '_caustic_cookie', False):
@@ -4556,11 +4631,22 @@ def _synth_caustic_cookies(scene):
         scale = max(float(getattr(light, 'caustics_scale', 4.0)), 0.05)
         speed = float(getattr(light, 'caustics_speed', 1.0))
         per = 8
+        cells = min(scale, float(per))
+        if kind == 'SPOT' and scale > 8.0:
+            # R254: the 8-cell period exists so a Sun tiles seamlessly; a
+            # spot never tiles, yet inherited the clamp -- Caustic Scale
+            # 8 to 64 moved no pixel. Above 8 the cone is cut from ONE
+            # 64-cell lattice, so the web zooms as the slider moves (a
+            # single re-seed at 8: scale <= 8 keeps the period-8 web);
+            # 32 texels a cell up to a 512 tile
+            per = 64
+            cells = scale
+            size = int(min(512, 32 * int(np.ceil(scale))))
         ax = (np.arange(size, dtype=np.float32) + 0.5) / size
         if kind == 'SPOT':
             # `scale` cells across the cone's image
-            u = ax[None, :] * min(scale, float(per))
-            v = ax[:, None] * min(scale, float(per))
+            u = ax[None, :] * cells
+            v = ax[:, None] * cells
         else:
             # one tile spans the full periodic lattice -- seamless
             u = ax[None, :] * per
@@ -4568,13 +4654,15 @@ def _synth_caustic_cookies(scene):
         uu = np.broadcast_to(u, (size, size))
         vv = np.broadcast_to(v, (size, size))
         web = PT.caustic_web(uu, vv, time=t * speed, period=per)
-        # energy-neutral-ish: mean stays near 1, crests overdrive
-        val = np.maximum(1.0 + (web - 0.35) * 1.6 * min(c, 4.0), 0.0)
+        # energy-neutral: the factor over its own mean (caustic_mean),
+        # so the cells darken, the crests overdrive and the lamp keeps
+        # the light it had
+        val = caustic_factor(web, c) / caustic_mean(c)
         px = np.repeat(val[:, :, None], 3, axis=2).astype(np.float32)
         light.cookie = ImageBuffer(name=f'__caustics_{light.name}',
                                    pixels=px, colorspace='Non-Color')
         light.cookie_strength = 1.0
-        if kind == 'SUN':
+        if kind in ('SUN', 'HEMI'):
             light.cookie_scale = scale   # world units per tile
         light._caustic_cookie = True
         light._cookie_tex = None         # the CPU sampler re-reads it
@@ -4600,7 +4688,11 @@ def _flare_sources(scene, st, gbuf, vp):
     only through sky.
     """
     out = []
-    lights = getattr(scene, 'lights', None) or ()
+    # R254: a flare is the lens's answer to a lamp that SHINES: the
+    # frame's lamps that light a medium (_medium_lamps) -- never an
+    # ambient lamp (no position), an Only Shadow lamp or one the Light
+    # Limit left unlit
+    lights = _medium_lamps(scene, st)
     if not any(float(getattr(l, 'flare', 0.0)) > 0.0 for l in lights):
         return out
     h, w = gbuf.depth.shape
@@ -4608,7 +4700,8 @@ def _flare_sources(scene, st, gbuf, vp):
         fi = float(getattr(light, 'flare', 0.0))
         if fi <= 0.0:
             continue
-        if str(getattr(light, 'type', '')).upper() == 'SUN':
+        if str(getattr(light, 'type', '')).upper() in ('SUN', 'HEMI'):
+            # R254: a HEMI flares at its place in the sky, as its Sun does
             d = M.normalize(np.asarray(light.direction, np.float32))
             clip = np.append(-d, 0.0).astype(np.float32) @ vp.T
             z_l = np.inf                 # at infinity: only sky shows it
@@ -4919,6 +5012,10 @@ def render(scene, settings=None, progress=None, band=None):
         scene.mesh, str(getattr(st, 'vertex_quantize', 'NONE')),
         float(getattr(st, 'vertex_units', 64.0)))
     scene.last_gel = None       # R251 C134: rebuilt below, beside last_depth
+    # R254: the world's own luminary joins scene.lights here, before any
+    # consumer reads the list (idempotent; untouched with the toggle off)
+    from . import worldlight as _WL
+    _WL.sync(scene, lambda: prepare_textures(scene, st))
     scene = _apply_material_override(scene, st)
     collect_exclusive_lights(scene)
     mesh = scene.mesh
@@ -4933,6 +5030,9 @@ def render(scene, settings=None, progress=None, band=None):
     if getattr(scene, 'world', None) is not None:
         desugar_master_bump(getattr(scene.world, 'graph', None))
     _synth_caustic_cookies(scene)
+    # R254: one fingerprint of every cookie's texels for this frame (an
+    # image edited in place is noticed here, before any cache is read)
+    LI.refresh_cookie_fingerprints(getattr(scene, 'lights', None))
     # R253: the render region in output pixels, or None (the identity --
     # every old scene takes exactly the pre-R253 paths below)
     rect = region_pixels(st, W, H)
@@ -5078,9 +5178,12 @@ def render(scene, settings=None, progress=None, band=None):
             except Exception:                                   # noqa: BLE001
                 pass
 
+    # traced shadows need the BVH only while Ray Shadows is on: with the
+    # master off `visibility` returns before it touches one (both terms)
     need_bvh = st.raytrace or st.ambient_occlusion or \
         getattr(st, 'radiosity', False) or \
-        (st.shadows and st.shadow_default == 'RAY') or \
+        (st.shadows and getattr(st, 'ray_shadows', True)
+         and st.shadow_default == 'RAY') or \
         _per_light_ray_shadows(scene, st) or \
         _volume_occlusion_wanted(scene, st)
     bvh = None
@@ -6386,6 +6489,8 @@ def bake_lightmap(scene, st, obj_index=None, size=512, mode='COMBINED',
     from .nodeeval import desugar_master_bump
     for _m in (scene.materials or ()):
         desugar_master_bump(getattr(_m, 'graph', None))
+    from . import worldlight as _WL
+    _WL.sync(scene, lambda: prepare_textures(scene, st))      # R254
     collect_exclusive_lights(scene)
     textures = prepare_textures(scene, st)
     _build_shadows(scene, st, mesh)
@@ -6995,6 +7100,9 @@ def _render_lens_accumulated(scene, st, progress, band):
         sc2.camera = cam2
         st2 = st.copy()
         st2._lens_pass = True
+        # this lens point's own soft-shadow rays (copy() carries the
+        # index down through every road below)
+        st2._sample_pass = st.sample_pass_for(k)
         # st.copy() drops the private flags; the outer roads' state (an
         # AA pass's jitter, a stereo eye, a pano strip) must ride along
         for flag in ('_accum_jitter', '_stereo', '_viewport', '_refine_mask',
@@ -7126,6 +7234,9 @@ def _render_accumulated(scene, st, progress, band):
         st2.aa_mode = 'NONE'
         st2._accum_jitter = (_halton(k + 1, 2) - 0.5,
                              _halton(k + 1, 3) - 0.5)
+        # every pass traces its OWN soft-shadow rays: with one shared
+        # pattern sixteen passes left the penumbra as grainy as one
+        st2._sample_pass = st.sample_pass_for(k)
         # R251: st.copy() drops the private flags; a stereo eye's or a
         # pano strip's pass must keep reading them (a pair per pass
         # since R190 otherwise; at defaults both read None / False)
@@ -7286,6 +7397,9 @@ def _adaptive_refine(scene, st, img, gbuf, mesh, depth_m, progress):
             st2._accum_jitter = (_halton(k, 2) - 0.5,
                                  _halton(k, 3) - 0.5)
             st2._refine_mask = mask
+            # a refine pass re-samples its pixels' soft shadows too (the
+            # base frame keeps the index these settings came with)
+            st2._sample_pass = st.sample_pass_for(k)
             st2._stereo = getattr(st, '_stereo', None)      # R251: carried
             st2._pano_strip = getattr(st, '_pano_strip', False)
             acc += render(scene, st2, None, band=None)[mask]
@@ -7501,39 +7615,49 @@ def _bump_height_fields(job, mat, mi, tri_m, bary_m, px_m, py_m, front_m,
     ONCE, and let every shading chunk gather its own pixels. Bitwise the
     same arithmetic as a whole-material batch: float32 grid, the same
     forward differences, the same validity, the same gather.
+
+    R253 (review): EVERY Bump of the material, at any depth -- the
+    fields were built for the nodes of the material's own tree, so a
+    Bump inside a node group gathered from nothing and went back to
+    differencing its batch. `nodeeval.bump_heights` walks the trees and
+    evaluates a group-internal chain in its group's context; the field
+    is filed under the node's path id, the id `n_bump` asks by. One
+    context and one evaluator per chunk now serve all of the material's
+    Bumps (they were rebuilt per node), and the coverage -- one mask,
+    whichever node -- is scattered once.
     """
-    from .nodeeval import VALUE, GraphEvaluator
+    from .nodeeval import GraphEvaluator, bump_heights, has_bump
     graph = getattr(mat, 'graph', None)
-    nodes = (graph or {}).get('nodes', {})
-    bumps = [n for n in nodes.values()
-             if n.get('bl_idname') == 'ShaderNodeBump']
-    if not bumps:
+    if not has_bump(graph):
         return {}
     H, W = job.height, job.width
-    fields = {}
-    for node in bumps:
-        img = np.zeros((H, W), np.float32)
-        valid = np.zeros((H, W), bool)
-        for s in range(0, int(tri_m.size), int(chunkn)):
-            e = min(s + int(chunkn), int(tri_m.size))
-            ctx = job.context(tri_m[s:e], bary_m[s:e], px_m[s:e],
-                              py_m[s:e], front_m[s:e]
-                              if front_m is not None else None,
-                              blin_m[s:e] if blin_m is not None else None,
-                              0, True)
-            ev = GraphEvaluator(graph, ctx, job.textures,
-                                getattr(mat, 'programs', None))
-            h = np.asarray(ev.input(node, 'Height', VALUE),
-                           np.float32).reshape(-1)
+    imgs = {}
+    valid = np.zeros((H, W), bool)
+    for s in range(0, int(tri_m.size), int(chunkn)):
+        e = min(s + int(chunkn), int(tri_m.size))
+        ctx = job.context(tri_m[s:e], bary_m[s:e], px_m[s:e],
+                          py_m[s:e], front_m[s:e]
+                          if front_m is not None else None,
+                          blin_m[s:e] if blin_m is not None else None,
+                          0, True)
+        ev = GraphEvaluator(graph, ctx, job.textures,
+                            getattr(mat, 'programs', None))
+        for nid, h in bump_heights(ev):
+            img = imgs.get(nid)
+            if img is None:
+                img = imgs[nid] = np.zeros((H, W), np.float32)
             img[py_m[s:e], px_m[s:e]] = h
-            valid[py_m[s:e], px_m[s:e]] = True
+        valid[py_m[s:e], px_m[s:e]] = True
+    fields = {}
+    for nid in list(imgs):
+        img = imgs.pop(nid)
         gx = np.zeros_like(img)
         gy = np.zeros_like(img)
         gx[:, :-1] = np.where(valid[:, 1:] & valid[:, :-1],
                               img[:, 1:] - img[:, :-1], 0.0)
         gy[:-1, :] = np.where(valid[1:, :] & valid[:-1, :],
                               img[1:, :] - img[:-1, :], 0.0)
-        fields[(int(mi), node.get('id'))] = (gx, gy)
+        fields[(int(mi), nid)] = (gx, gy)
     return fields
 
 
@@ -8562,20 +8686,41 @@ def _per_light_ray_shadows(scene, st):
     if not (st.shadows and getattr(st, 'ray_shadows', True)
             and st.shadow_default == 'PER_LIGHT'):
         return False
+    # R254: the frame's lamps only (LI.frame_lights) -- a lamp that is
+    # only ambient, or one the Light Limit left unlit, traces nothing
+    # and must not be the reason a BVH is built
     return any(str(getattr(l, 'shadow', 'MAP')) == 'RAY'
                and str(getattr(l, 'type', 'POINT')).upper()
                not in ('HEMI', 'AMBIENT')
-               for l in (getattr(scene, 'lights', None) or ()))
+               for l in LI.frame_lights(scene, st))
+
+
+def _medium_lamps(scene, st):
+    """The lamps that light a MEDIUM this frame -- the visible beam,
+    the light shafts, the lens flare: the frame's lamps (LI.frame_lights:
+    the Light Limit's survivors, no ambient lamp) less the Only Shadow
+    lamps (LI.lights_volume says 0 for a lamp that gives a medium
+    nothing). Scene order, so a scene without such a lamp reads the
+    list it always read (R254)."""
+    return [l for l in LI.frame_lights(scene, st)
+            if LI.lights_volume(l) != 0.0]
+
+
+def _beam_lamps(scene, st):
+    """The lamps whose visible beam _light_volumes draws: a marcher
+    exists for the kind, Volumetric is above 0, and the lamp lights a
+    medium at all (_medium_lamps)."""
+    return [l for l in _medium_lamps(scene, st)
+            if str(getattr(l, 'type', '')).upper() in _VOLUME_KINDS
+            and float(getattr(l, 'volumetric', 0.0)) > 0.0]
 
 
 def _volume_occlusion_wanted(scene, st):
     """True when any drawn beam asked to be shadowed (needs the BVH)."""
     if not getattr(st, 'spot_cones', False):
         return False
-    return any(float(getattr(l, 'volumetric', 0.0)) > 0.0
-               and getattr(l, 'volumetric_occlusion', False)
-               for l in (getattr(scene, 'lights', None) or ())
-               if str(getattr(l, 'type', '')).upper() in _VOLUME_KINDS)
+    return any(getattr(l, 'volumetric_occlusion', False)
+               for l in _beam_lamps(scene, st))
 
 
 def _halo_noise2(u, v, ti, seed):
@@ -9372,16 +9517,33 @@ def _draw_halos(img, scene, st, gbuf, view, proj, w, h, sel_mask=None):
             if lit is None:
                 p1 = wpos.reshape(1, 3).astype(np.float32)
                 acc = np.zeros(3, np.float32)
-                for lgt in scene.lights:
-                    if getattr(lgt, 'ambient_only', False):
-                        continue
+                # R254: the frame's lamps (the Light Limit's
+                # survivors, no ambient lamp of either kind), each with
+                # the sign and the lobe a surface would give it -- the
+                # halo is a diffuse receiver. The loop used to walk
+                # every lamp and read Ambient Only alone: a Negative
+                # lamp brightened the halo, an Only Shadow or Specular
+                # Only lamp lit it. The list is taken once per frame
+                # (thousands of particle halos share it)
+                halo_lamps = shaded_cache.get('lamps')
+                if halo_lamps is None:
+                    halo_lamps = shaded_cache['lamps'] = [
+                        (lg, LI.lights_volume(lg))
+                        for lg in LI.frame_lights(scene, st)
+                        if LI.lights_volume(lg) != 0.0
+                        and getattr(lg, 'affect_diffuse', True)
+                        and not getattr(lg, 'specular_only', False)]
+                for lgt, _hs in halo_lamps:
                     try:
                         _L, radl, _d = LI.sample(lgt, p1, st)
                     except Exception:
                         continue
                     # inp = 1 - |vn.lv| with vn the zero vector -> 1;
                     # a HEMI's 0.5*i+0.5 also lands on 1
-                    acc += np.maximum(radl[0], 0.0)
+                    if _hs < 0.0:
+                        acc -= np.maximum(radl[0], 0.0)
+                    else:
+                        acc += np.maximum(radl[0], 0.0)
                 lit = np.maximum(acc, 0.0)
                 shaded_cache[key] = lit
             crgb = crgb * lit[None, None, :]
@@ -9494,9 +9656,9 @@ def _light_volumes(img, scene, st, gbuf, vp, eye, w, h, bvh=None,
     """
     if not getattr(st, 'spot_cones', False):
         return img
-    lights = [l for l in (getattr(scene, 'lights', None) or ())
-              if str(getattr(l, 'type', '')).upper() in _VOLUME_KINDS
-              and float(getattr(l, 'volumetric', 0.0)) > 0.0]
+    # R254: _beam_lamps -- the frame's lamps only (no ambient lamp, no
+    # Only Shadow lamp, none the Light Limit left unlit)
+    lights = _beam_lamps(scene, st)
     if not lights:
         return img
     from . import cones as CONES
@@ -9547,9 +9709,14 @@ def _light_volumes(img, scene, st, gbuf, vp, eye, w, h, bvh=None,
                                          dl * (1.0 - 1e-3))
                 return out
         reach_l = reach
-        if str(getattr(light, 'decay', '')) == 'CUSTOM':
+        if LI.resolved_decay(light, st) == 'CUSTOM' and kind != 'AREA':
             # Custom Range's end is the lamp's own idea of how far it
             # reaches; the beam honours it rather than growing a dial
+            # (R254: whether the law is chosen on the lamp or arrives
+            # through Scene Default). Never for an AREA lamp: it draws
+            # no Falloff menu and never attenuates, its Falloff End is
+            # the panel's Distance -- a gain (cones.beam_gain), not a
+            # range, and a hidden Custom Range cut the beam there
             reach_l = min(reach, max(float(getattr(light, 'decay_end',
                                                    reach)), 1e-3))
         scatter = marchers[kind](
@@ -9559,12 +9726,16 @@ def _light_volumes(img, scene, st, gbuf, vp, eye, w, h, bvh=None,
             * float(light.volumetric),
             falloff=float(getattr(st, 'spot_cone_falloff', 2.0)),
             max_distance=reach_l, occlude=occ)
+        if LI.lights_volume(light) < 0.0:
+            # R254: a Negative lamp's beam takes light away, as the
+            # lamp does on a surface (it used to add)
+            scatter = -scatter
         if scatter.any():
             col = np.asarray(light.color, np.float32)[None, :]
-            # R253 (H): the beam flickers with the lamp's style
-            add += scatter[:, None] * col * (
-                float(light.energy)
-                * float(getattr(light, 'style_gain', 1.0))) / np.pi
+            # R253 (H): the beam flickers with the lamp's style. R254:
+            # on the lamp's own radiance scale (cones.beam_gain) -- the
+            # old energy / pi was 632 times a spot's or point's
+            add += scatter[:, None] * col * CONES.beam_gain(light)
     if sel is None:
         img[:, :, :3] += add.reshape(h, w, 3)
     else:
@@ -9744,9 +9915,11 @@ def _background_image(scene, st, w, h, vp, eye, uncovered=None,
     inv = np.linalg.inv(vp).astype(np.float32)
     nx = (xx.astype(np.float32) + 0.5) / w * 2.0 - 1.0
     ny = (yy.astype(np.float32) + 0.5) / h * 2.0 - 1.0
-    pts = np.stack([nx, ny, np.ones(nx.size, np.float32),
-                    np.ones(nx.size, np.float32)], axis=1)
-    world = pts @ inv.T
+    # the sequential float32 chain gpu/sky.py's hal_sky_ray states, never
+    # a matmul: `pts @ inv.T` was that chain only on a BLAS without fused
+    # multiply-add (mathx.unproject_far has the measurement), and every
+    # GPU sky twin moved an ulp at a dozen pixels on the others
+    world = M.unproject_far(nx, ny, inv)
     world = world[:, :3] / np.where(np.abs(world[:, 3:4]) < 1e-9, 1e-9, world[:, 3:4])
     dirs = M.normalize(world - eye[None, :])
     # R251 (sky-camera C056): Doom's cylinder sky is a function of the
@@ -9806,7 +9979,9 @@ def _background_image(scene, st, w, h, vp, eye, uncovered=None,
 
 
 def _bump_materials_of(job, tri):
-    """{mi: material} for fragment materials carrying a Bump node."""
+    """{mi: material} for fragment materials carrying a Bump node, in
+    their own tree or in a node group at any depth."""
+    from .nodeeval import has_bump
     mesh = job.scene.mesh
     if mesh.mat_index is None or tri.size == 0:
         return {}
@@ -9816,9 +9991,7 @@ def _bump_materials_of(job, tri):
         mat = job.scene.materials[mi] \
             if mi < len(job.scene.materials) else None
         graph = getattr(mat, 'graph', None) if mat is not None else None
-        nodes = (graph or {}).get('nodes', {})
-        if any(n.get('bl_idname') == 'ShaderNodeBump'
-               for n in nodes.values()):
+        if has_bump(graph):
             out[mi] = mat
     return out
 
@@ -9843,7 +10016,7 @@ def _shade_fragments_cpu(job, tri, bary, px, py, front, rank, st):
     bump_mats = _bump_materials_of(job, tri)
     if not bump_mats:
         return _shade_chunked(job, tri, bary, px, py, front, None, st)
-    from .nodeeval import VALUE, GraphEvaluator
+    from .nodeeval import GraphEvaluator, bump_heights
     mesh = job.scene.mesh
     mat_f = mesh.mat_index[tri] if mesh.mat_index is not None \
         else np.zeros(tri.size, np.int32)
@@ -9854,7 +10027,9 @@ def _shade_fragments_cpu(job, tri, bary, px, py, front, rank, st):
     # same field definition, at a fraction of the evaluator cost the
     # first per-rank version paid (the field's 33-second frame grew to
     # 43 on exactly that; the waves' noise chain was re-running once
-    # per depth layer)
+    # per depth layer). R253 (review): every Bump of the material, at
+    # any depth -- nodeeval.bump_heights, the walk _bump_height_fields
+    # takes: a Bump inside a node group had no field on this road either
     H, W = job.height, job.width
     heights = {}
     mat_idx_of = {}
@@ -9864,22 +10039,19 @@ def _shade_fragments_cpu(job, tri, bary, px, py, front, rank, st):
             continue
         mat_idx_of[mi] = idx
         graph = getattr(mat, 'graph', None)
-        nodes = (graph or {}).get('nodes', {})
-        for node in nodes.values():
-            if node.get('bl_idname') != 'ShaderNodeBump':
-                continue
-            hv = np.empty(idx.size, np.float32)
-            for s in range(0, int(idx.size), int(MAX_CHUNK)):
-                e = min(s + int(MAX_CHUNK), int(idx.size))
-                sub = idx[s:e]
-                ctx = job.context(tri[sub], bary[sub], px[sub], py[sub],
-                                  front[sub] if front is not None
-                                  else None, None, 0, True)
-                ev = GraphEvaluator(graph, ctx, job.textures,
-                                    getattr(mat, 'programs', None))
-                hv[s:e] = np.asarray(ev.input(node, 'Height', VALUE),
-                                     np.float32).reshape(-1)
-            heights[(mi, node.get('id'))] = hv
+        for s in range(0, int(idx.size), int(MAX_CHUNK)):
+            e = min(s + int(MAX_CHUNK), int(idx.size))
+            sub = idx[s:e]
+            ctx = job.context(tri[sub], bary[sub], px[sub], py[sub],
+                              front[sub] if front is not None
+                              else None, None, 0, True)
+            ev = GraphEvaluator(graph, ctx, job.textures,
+                                getattr(mat, 'programs', None))
+            for nid, h in bump_heights(ev):
+                hv = heights.get((mi, nid))
+                if hv is None:
+                    hv = heights[(mi, nid)] = np.empty(idx.size, np.float32)
+                hv[s:e] = h
 
     col = np.zeros((tri.size, 4), np.float32)
     stash = dict(getattr(job, 'bump_fields', {}) or {})
@@ -11613,9 +11785,7 @@ def _beams_active(scene, st):
     """Whether _light_volumes will edit the frame (its own early exits)."""
     if not getattr(st, 'spot_cones', False):
         return False
-    return any(str(getattr(l, 'type', '')).upper() in _VOLUME_KINDS
-               and float(getattr(l, 'volumetric', 0.0)) > 0.0
-               for l in (getattr(scene, 'lights', None) or ()))
+    return bool(_beam_lamps(scene, st))
 
 
 def _propagate_gpu_flag(st, flags, what):

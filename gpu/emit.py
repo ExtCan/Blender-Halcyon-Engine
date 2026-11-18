@@ -36,6 +36,7 @@ class Emitter:
         self.inline = []
         self.samplers = []
         self.once = set()          # nodes whose setup lines are already down
+        self.code_tags = {}        # coded-shader node id -> its mangling tag
         self.frame_uniforms = set()  # per-frame scalars a code node asked for
         self.programs = None       # material's compiled programs, or None
         self.frame_mode = False    # True only under assemble_frame
@@ -1137,6 +1138,13 @@ def _port_code_node(src, tag):
                     raise Unsupported('the coded shader returns a value '
                                       'from main; declare an out variable '
                                       'for the deferred pass')
+                if d[3]:
+                    # the CPU binds an entry parameter to the renderer's
+                    # input of its name; the frame's main() calls this one
+                    # with no arguments, which no driver compiles
+                    raise Unsupported('the coded shader\'s main takes '
+                                      'parameters; declare in / out '
+                                      'variables for the deferred pass')
             if d[2] == 'mainImage':
                 raise Unsupported('mainImage entry points need fragcoord, '
                                   'which the fullscreen pass does not carry')
@@ -1198,6 +1206,88 @@ def _code_socket_expr(em, node, uname, gtype, default):
     return em.const(default if default is not None else 0.0, want)
 
 
+def _tags_clash(a, b):
+    """True when two mangling tags can spell ONE GLSL name between them.
+
+    A coded shader's names are mangled to `_cn<tag>_<name>`. Equal tags
+    share every name. Unequal ones still meet when the longer is the
+    shorter plus '_' plus a rest that can begin an identifier: tags
+    'Coded' and 'Coded_B' make `_cnCoded_B_k` out of `B_k` in the first
+    node and out of `k` in the second. A rest that begins with a digit
+    cannot (no identifier starts with one), which is why Blender's own
+    'Coded Shader' / 'Coded Shader.001' never met.
+    """
+    if a == b:
+        return True
+    if len(a) > len(b):
+        a, b = b, a
+    if not b.startswith(a + '_'):
+        return False
+    return not b[len(a) + 1:len(a) + 2].isdigit()
+
+
+def _code_spell(key):
+    """One graph id, spelled in the characters a GLSL identifier may hold.
+
+    Every non-word character is flattened to '_', as it always was -- and
+    R253 (review): "word" is Python's, not GLSL's. `\\W` is Unicode-aware,
+    so the 'ñ' of a node named 'Señal', a Cyrillic or a CJK name, every
+    letter and digit of every script stayed in the tag and went into the
+    pass as `_cnSeñal_main`. GLSL identifiers are [A-Za-z0-9_] and nothing
+    else: the plan qualified, the device's pre-flight refused the text
+    ("unexpected character 'ñ'") and the whole frame shaded on the CPU --
+    the right picture, never on the GPU, for a name any keyboard outside
+    English types. So each word character that is not ASCII is spelled as
+    its code point, 'u' and four or more hex digits: 'Señal' is
+    'Seu00F1al', '色彩' is 'u8272u5F69'.
+
+    Why the code point and not one more '_': a name of such letters alone
+    would be underscores alone ('色' and '彩' both '_', '色彩' a run of
+    two), and GLSL reserves every identifier that holds '__'. The spelling
+    is letters and digits, so it adds no underscore and can neither make
+    nor lengthen a run. It is not one-to-one either (a node NAMED
+    'Seu00F1al' spells the same) and does not have to be: `_code_tag`
+    tells clashing tags apart whatever they were spelled from.
+
+    A tag that was plain ASCII is the tag it was, to the letter: the first
+    substitution is the old one, and the second touches only what no
+    driver could read.
+    """
+    import re
+    flat = re.sub(r'\W', '_', str(key))
+    return re.sub(r'[^\x00-\x7F]', lambda m: 'u%04X' % ord(m.group()), flat)
+
+
+def _code_tag(em, key):
+    """The tag one coded shader's GLSL names are mangled under in `em`.
+
+    It is the node's graph id as `_code_spell` writes it: every non-word
+    character flattened to '_', every letter GLSL cannot hold spelled as
+    its code point -- and both are many-to-one. R253 (review): the tag
+    WAS the flattening and nothing else, so 'Coded Shader', 'Coded_Shader'
+    and 'Coded.Shader' (three legal names in one tree, three programs on
+    the CPU) shared one set of GLSL names; the pass qualified, inlined
+    both shaders over each other and drew one of them twice. A
+    path-qualified id ('Group/Coded Shader') flattens the same way. So
+    the tag is checked against every tag this emitter has handed out
+    (`_tags_clash`) and a clashing one takes an ordinal in front --
+    '2_Coded_Shader' -- counted up until nothing it meets begins that
+    way. A node alone in its pass, and any two that never clashed, keep
+    exactly the names they had. Every tag is [A-Za-z0-9_] alone, the
+    alphabet `_tags_clash` is exact over.
+    """
+    tag = em.code_tags.get(key)
+    if tag is None:
+        base = tag = _code_spell(key)
+        taken = list(em.code_tags.values())
+        n = 1
+        while any(_tags_clash(tag, t) for t in taken):
+            n += 1
+            tag = f'{n}_{base}'
+        em.code_tags[key] = tag
+    return tag
+
+
 def e_code_node(em, node, index):
     """The coded shader node, running natively in the deferred pass.
 
@@ -1231,15 +1321,31 @@ def e_code_node(em, node, index):
                 VEC4: 'vec4(0.0, 0.0, 0.0, 0.0)'}[o_type]
         return em.tmp(o_type, zero)
 
-    src = prop(node, 'source_text') or prop(node, '__source')
+    # R253 (review): ONE key, and it is the source the CPU's program was
+    # compiled from. The exporter ships the node's RESOLVED source here
+    # (shaders.compiler.node_source: the assigned Text, else the inline
+    # property); this line used to read a verbatim copy of the inline
+    # property, "or" a '__source' nothing ever wrote -- so a node with a
+    # Text assigned inlined the starter shader while the CPU ran the Text.
+    # The program is the CPU's truth, so the pass holds itself to it: a
+    # graph source that is not the program's own refuses by name (a hand-
+    # built graph, a regression upstream) instead of drawing another shader
+    src = prop(node, 'source_text')
     if not src:
         raise Unsupported('HALCYON_CodeNode without source')
-    import re
-    tag = re.sub(r'\W', '_', str(key))
+    prog = em.programs.get(key) if em.programs is not None else None
+    if prog is not None and getattr(prog, 'source', src) != src:
+        raise Unsupported('a coded shader whose graph source is not the '
+                          'source its program was compiled from (the CPU '
+                          'runs the program)')
+    tag = _code_tag(em, key)
     inline, uniforms, ins, outs, samplers = _port_code_node(src, tag)
 
-    if key not in em.once:
-        em.once.add(key)
+    # `once` is shared with the emitters' own markers ('__wang',
+    # ('__pat', name), ...): a node id goes in under a marker of its own,
+    # so a node NAMED like one of those is still a node
+    if ('__code', key) not in em.once:
+        em.once.add(('__code', key))
         em.inline.append(inline)
         for uname, mangled in samplers:
             # the socket names the image; its prepared pixels ride the

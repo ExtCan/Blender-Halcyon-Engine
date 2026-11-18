@@ -656,13 +656,25 @@ def _env_world(job):
                            for v in getattr(world, 'color', (0, 0, 0)))), None
 
 
-def _shadow_meta(light, st, bvh=None):
+def _sample_pass(job):
+    """The index of the pass this frame is inside an averaging road (an
+    accumulation or lens pass, a motion-blur slice; 0 outside one), as
+    the float the hal_spass scalar carries. The soft-ray pattern adds it
+    to its salt on both roads (core/lights.soft_ray_salt), so the passes
+    of one frame trace different rays through ONE plan."""
+    return float(int(getattr(job.settings, '_sample_pass', 0) or 0))
+
+
+def _shadow_meta(light, st, bvh=None, want_atlas=True):
     """(meta, atlas, why) for one light's shadow term.
 
     (None, None, None) means the light casts no shadow and needs no code --
     which must mean the CPU also treats it as fully lit, or the frame does
-    not qualify. The meta carries everything `_shadow_function` bakes; for a
-    mapped light the atlas is the depth data, one cell per cube face. A ray
+    not qualify. The meta carries everything `_shadow_function` emits and
+    everything `material.pack_light_texels` packs for it; for a mapped
+    light the atlas is the depth data, one cell per cube face, as
+    (key, build, stamp) -- `want_atlas=False` skips it (the plan
+    signature reads structure only and must not digest a map). A ray
     light needs no atlas of its own -- the BVH textures are shared and the
     caller packs them once for the frame.
     """
@@ -734,7 +746,10 @@ def _shadow_meta(light, st, bvh=None):
                 'bias': max(float(getattr(st, 'ray_bias', 1e-3)), 1e-4),
                 'radius': float(getattr(light, 'radius', 0.0)),
                 'kind': kind, 'area': area,
-                'samples': int(samples)}
+                'samples': int(samples),
+                # the lamp's Density lightens a traced shadow as it
+                # lightens a mapped one (the CPU's RAY branch)
+                'density': float(getattr(light, 'shadow_density', 1.0))}
         return meta, None, None
     if sm is None:
         # the CPU treats a missing map as lit (the ray fallback above
@@ -759,25 +774,42 @@ def _shadow_meta(light, st, bvh=None):
     from ..core.lights import shadow_sample_count as _shadow_sample_count
     mid = bool(_midpoint_map(light, st))
 
-    # packed lazily, behind a content fingerprint: the CPU caches these maps
-    # across frames, and re-packing + re-uploading an unchanged 33 MB cube
-    # atlas every frame was most of the warm frame's cost
-    key = ('shadow', size, grid, 'MID' if mid else 'CLS',
-           tuple(round(float(f.depth[::23].sum()), 3) for f in faces_sm))
+    # the atlas: this lamp's depth texels, one cell per face, ONE channel
+    # (the pack uploads as R32F). Its identity is split in two. The KEY
+    # is the layout -- size, grid, depth rule -- and stays the same while
+    # the plan does; the STAMP is an exact digest of every depth texel
+    # (`map_digest`), so the device replaces its one resident atlas when
+    # a texel changed and never keeps an old one. The key used to carry
+    # the sum of every 23rd row: a caster sliding along the rows, or a
+    # small one between the sampled rows, kept the key, and the device
+    # drew the shadow where the caster used to be
+    key = ('shadow', size, grid, 'MID' if mid else 'CLS')
+    stamp = tuple(map_digest(f) for f in faces_sm) if want_atlas else None
+    # a SIZED lamp (Radius, a Sun's Angle, an Area's Size) measures its
+    # penumbra per fragment (gpu/softmap.py, the twin of core/softmap.py).
+    # The depth texels are the same either way; the one thing the sized
+    # lookup reads beside them is the map's nearest depth, a VALUE that
+    # rides the lamp's texels like everything else the lookup reads
+    from ..core import softmap as _softmap
+    # the user's Softness in texels (the lamp's own dial multiplies the
+    # render's); the lamp's size is no part of it. Above one texel it
+    # sends a lamp of size 0 through the sized lookup too, with no lamp
+    # term (`softmap.zero_shape`, the CPU's own rule)
+    soft = max(float(getattr(light, 'shadow_softness', 1.0))
+               * float(st.shadow_softness), 0.0)
+    shape = _softmap.lookup_shape(light, _shadow_sample_count(light, st),
+                                  soft)
 
     def build(_faces=faces_sm, _size=size, _grid=grid):
-        atlas = np.zeros((_size * _grid[1], _size * _grid[0], 4), np.float32)
+        atlas = np.zeros((_size * _grid[1], _size * _grid[0]), np.float32)
         for fi, f in enumerate(_faces):
             cy, cx = (fi // _grid[0]) * _size, (fi % _grid[0]) * _size
-            atlas[cy:cy + _size, cx:cx + _size, 0] = f.depth
+            atlas[cy:cy + _size, cx:cx + _size] = f.depth
         return atlas
 
     bias = float(getattr(light, 'shadow_bias', 0.0) or st.shadow_bias)
     if mid:
         bias = 0.0
-    soft = max(float(getattr(light, 'shadow_softness', 1.0))
-               * float(st.shadow_softness), 0.0) \
-        + float(getattr(sm, 'soft_extra', 0.0) or 0.0)
     meta = {
         'faces': [{'vp': np.asarray(f.vp, np.float32)} for f in faces_sm],
         'size': size, 'near': float(first.near), 'far': float(first.far),
@@ -789,7 +821,99 @@ def _shadow_meta(light, st, bvh=None):
         # the lamp's own Samples (0 = the render's): the tap unroll
         'samples': int(_shadow_sample_count(light, st)),
     }
-    return meta, (key, build), None
+    if shape is not None:
+        meta['soft'] = {'shape': shape,
+                        'axes': [_softmap.face_axes(f) for f in faces_sm],
+                        'd_min': float(_softmap.map_d_min(sm))}
+    return meta, ((key, build, stamp) if want_atlas else None), None
+
+
+def map_digest(face):
+    """An exact content digest of one baked map's depth texels, computed
+    once per BAKED map and parked on it (`ShadowMap.digest`): a map the
+    CPU's cache serves again keeps it, and a re-baked map with the same
+    texels gets the same one. One pass over the bytes against a bake
+    that costs far more."""
+    d = getattr(face, 'digest', None)
+    if d is None:
+        d = (int(face.size), _content_digest(face.depth))
+        try:
+            face.digest = d
+        except AttributeError:
+            pass
+    return d
+
+
+def _shadow_struct(meta, why=None):
+    """What of one lamp's shadow meta is STRUCTURE: everything that
+    changes the emitted source, and none of the values (they ride
+    hal_lights, `material.pack_light_texels`). This is the plan
+    signature's whole view of a lamp's shadow, so a moved lamp, a
+    dragged size, Softness, Bias or Density and a moved caster all hit
+    the cached plan."""
+    if why is not None:
+        return ('refused', str(why))
+    if meta is None:
+        return None
+    if meta.get('ray'):
+        from ..core.lights import sun_soft_law
+        area = meta.get('area')
+        soft_ray = int(meta.get('samples', 1)) > 1
+        return ('ray', str(meta.get('kind')), int(meta.get('samples', 1)),
+                sun_soft_law(meta['radius'])[0]
+                if soft_ray and str(meta.get('kind')) == 'SUN' else None,
+                None if area is None else bool(area['disk']),
+                float(meta.get('density', 1.0)) != 1.0)
+    soft = meta.get('soft')
+    return ('map', len(meta['faces']), int(meta['size']),
+            bool(meta['persp']), tuple(meta['grid']),
+            bool(meta.get('midpoint')), int(meta.get('samples', 1)),
+            None if soft is None else str(soft['shape']['kind']))
+
+
+def _shadow_pack(shadows, parts):
+    """The ONE combined atlas of every mapped lamp, stacked by rows:
+    assigns each lamp's row offset (`meta['voff']`) and returns the
+    hal_shadowpack entry (key, build, stamp), or None without a mapped
+    lamp. `parts` is [(light index, (key, build, stamp))].
+
+    Eight per-light samplers put the field's heavier materials AT the
+    16-sampler fragment cliff (12 material samplers + the G-buffer's
+    three), and the real driver rejected the compile: 'the driver
+    rejected <material>: HAL_MAT_1: CreateInfo failed'. Packing costs
+    one added row offset per light and frees seven sampler slots on an
+    eight-light scene.
+
+    The key is the pack's LAYOUT and the stamp its content (every map's
+    digest): `device.upload_cached` keeps one resident pack per layout
+    and replaces it when a map changed (the R251 C015 stamp rule). The
+    plan build and the plan-cache hit both come through here, so a hit
+    always carries the CURRENT maps. The pack is one channel of float32
+    (the device uploads a 2D array as R32F): a quarter of the bytes the
+    RGBA pack held, three channels of which were zeros."""
+    if not parts:
+        return None
+    voff = 0
+    keys, stamps, packs = [], [], []
+    for i, (akey, abuild, astamp) in parts:
+        m = shadows[i]
+        ph = int(m['size']) * int(m['grid'][1])
+        pw = int(m['size']) * int(m['grid'][0])
+        m['voff'] = voff
+        keys.append(akey)
+        stamps.append(astamp)
+        packs.append((voff, ph, pw, abuild))
+        voff += ph
+    total_h = voff
+    total_w = max(pw for _v, _h, pw, _b in packs)
+
+    def build_pack(_packs=tuple(packs), _th=total_h, _tw=total_w):
+        out = np.zeros((_th, _tw), np.float32)
+        for v, ph, pw, b in _packs:
+            out[v:v + ph, :pw] = b()[:, :pw]
+        return out
+
+    return (('shadowpack',) + tuple(keys), build_pack, tuple(stamps))
 
 
 def _light_sig(l):
@@ -801,15 +925,32 @@ def _light_sig(l):
     edit is a plan-cache HIT plus a texel re-upload instead of the
     recompile storm the field measured at 45 seconds per viewport
     refine. What stays is STRUCTURE: everything that changes the
-    emitted source. Two exceptions keep their values: a MAP-shadowed
-    light bakes its light-space matrices into the shadow function
-    (moving it re-plans -- its map rebuilt anyway), and a cookie light
+    emitted source. One exception keeps its values: a cookie light
     bakes its projection axes from the direction.
+
+    R254: a lamp's SHADOW values left too. A MAP-shadowed light used to
+    bake its light-space matrices, Bias, Softness and Density into the
+    shadow function, a traced one its Radius (a Sun's Angle, an Area's
+    rectangle), and every lamp its Shadow Colour into the light block:
+    nudging a mapped lamp, or one tick of any of those sliders,
+    recompiled every material pass where a traced lamp's move compiled
+    nothing. They ride hal_lights now (texels 12-15 and the tail,
+    `material.pack_light_texels`); what stays here is whether each
+    block EXISTS, and `_plan_sig` adds the shadow's own structure
+    (`_shadow_struct`). With SHADOW_TEXELS off the values bake as they
+    did and the plan signature carries the packed bytes instead.
     """
     import numpy as np
     t = lambda v: tuple(round(float(x), 6) for x in v)
     spotsi = float(np.cos(float(getattr(l, 'spot_size', 0.0)) * 0.5))
-    spotbl = (1.0 - spotsi) * float(getattr(l, 'spot_blend', 0.0))
+    # R254: whether a blend band EXISTS is structure, and the band is
+    # Blend's or the Hotspot's (a hotspot dragged onto the cone edge
+    # closes it: the hard-edge block)
+    if float(getattr(l, 'hotspot', 0.0) or 0.0) > 0.0:
+        from ..core.lights import spot_blend_band
+        spotbl = spot_blend_band(l, spotsi)
+    else:
+        spotbl = (1.0 - spotsi) * float(getattr(l, 'spot_blend', 0.0))
     baked_map = getattr(l, 'shadow_map', None) is not None
     cookie = getattr(l, 'cookie', None)
     sig = (l.type,
@@ -841,13 +982,18 @@ def _light_sig(l):
            # signature)
            tuple(sorted(getattr(l, 'exclude_objects', ()) or ())),
            str(getattr(l, 'exclude_mode', 'EXCLUDE')),
-           # the soft-ray shadow function bakes the radius and sample
-           # unroll; the shadow colour folds into every light block
-           round(float(getattr(l, 'radius', 0.0)), 6),
+           # whether the lamp HAS a size is structure (the soft-ray
+           # unroll, the sized map lookup); the size is a texel
+           float(getattr(l, 'radius', 0.0) or 0.0) > 0.0,
+           # a traced shadow emits its Density term only off 1.0 (the
+           # value is a texel; a mapped shadow always carries the term)
+           float(getattr(l, 'shadow_density', 1.0)) != 1.0,
            # the lamp's own Samples override sizes that unroll (0 =
            # the render's, which the plan signature already carries)
            int(getattr(l, 'shadow_samples', 0) or 0),
-           t(getattr(l, 'shadow_color', (0, 0, 0))),
+           # the Shadow Colour's term exists only off black (a texel)
+           max(tuple(getattr(l, 'shadow_color', (0.0, 0.0, 0.0))
+                     or (0.0, 0.0, 0.0))) > 0.0,
            # R253 light options: the four STRUCTURE bits -- a Square
            # cone, a non-white specular tint, a non-black hemi ground
            # and a live Near Attenuation pair each emit a block; their
@@ -862,27 +1008,30 @@ def _light_sig(l):
                      or (0.0, 0.0, 0.0))) > 0.0,
            float(getattr(l, 'decay_near_end', 0.0) or 0.0)
            > float(getattr(l, 'decay_near_start', 0.0) or 0.0))
+    from ..core import lights as _LIs
+    _squeezed = _LIs.spot_scale_on(l)
+    if _squeezed:
+        # R254: an elliptical cone emits its own block (structure); the
+        # squeeze itself is texels 10.w / 11.w. Appended only when it
+        # is on, so every round lamp keeps the signature it had
+        sig += ('spot_scale',)
     if str(getattr(l, 'type', '')).upper() == 'AREA':
-        # the AREA soft-ray twin bakes the rectangle -- centre, axes,
-        # half-sizes, shape -- as literals (the radius precedent), so
-        # all of them are structure
+        # the rectangle -- centre, axes, half-sizes -- rides texels
+        # (14, 15 and the tail) for the soft-ray twin and the form
+        # factor alike. Structure: whether it has a size at all, the
+        # shape (a rectangle's four corners or a round shape's
+        # polygon), and whether the form factor's Gamma pow exists
+        asz = tuple(getattr(l, 'area_size', (0.0, 0.0)) or (0.0, 0.0))
         sig += ('area',
-                t(getattr(l, 'area_size', (0.0, 0.0))),
-                t(getattr(l, 'area_x', (1, 0, 0))),
-                t(getattr(l, 'area_y', (0, 1, 0))),
-                t(getattr(l, 'position', (0, 0, 0))),
+                max(float(v) for v in asz[:2]) > 0.0 if asz else False,
                 str(getattr(l, 'area_shape', 'SQUARE')),
-                # the form factor bakes Gamma (and emits no pow at the
-                # 1.0 default); its distance and direction are texels
-                round(float(getattr(l, 'area_gamma', 1.0) or 1.0), 6))
+                abs(float(getattr(l, 'area_gamma', 1.0) or 1.0) - 1.0)
+                > 1e-9)
     if baked_map:
+        # the light-space matrices, clip planes, Bias, Softness and
+        # Density ride the tail texels: a moved lamp re-uploads its
+        # atlas and its texels and re-plans nothing
         sig += ('map',
-                t(getattr(l, 'position', (0, 0, 0))),
-                t(getattr(l, 'direction', (0, 0, -1))),
-                round(float(getattr(l, 'spot_size', 0.0)), 6),
-                round(float(getattr(l, 'shadow_bias', 0.0)), 6),
-                round(float(getattr(l, 'shadow_softness', 1.0)), 6),
-                round(float(getattr(l, 'shadow_density', 1.0)), 6),
                 # R251 C117: the per-lamp Map Depth override changes
                 # the emitted offset line
                 str(getattr(l, 'shadow_map_depth', 'INHERIT')))
@@ -903,20 +1052,48 @@ def _light_sig(l):
                 str(getattr(l, 'cookie_filter', 'BILINEAR')
                     or 'BILINEAR'),
                 _cookie_sig(l),
+                # R254: a SPOT's lookup bakes 2 tan(spot_size / 2) as a
+                # literal and its atlas carries the size blur over it;
+                # without a baked map (ray-traced shadows, shadows off)
+                # the Spot Size was in no part of the signature and a
+                # narrowed cone kept the old projection scale
+                round(float(getattr(l, 'spot_size', 0.0)), 6)
+                if str(getattr(l, 'type', '')).upper() == 'SPOT' else 0.0,
+                # an AREA lamp's lookup bakes its two sides as the
+                # image's extent (they left the 'area' group above,
+                # where a texel carries them for the rectangle itself)
+                t(getattr(l, 'area_size', (0.0, 0.0)) or (0.0, 0.0))
+                if str(getattr(l, 'type', '')).upper() == 'AREA' else (),
+                # the projected image is blurred by the lamp's SOURCE
+                # size (LI.cookie_blur_uv) and the prepared pixels are
+                # held by the plan: the size stays a value here for a
+                # cookie lamp (a re-plan with the same sources: a new
+                # image upload, no compile)
+                round(float(getattr(l, 'radius', 0.0) or 0.0), 6),
                 # R253 (G): the uv transform is baked as literals into
                 # the lookup function (the cookie road's convention)
                 t(getattr(l, 'cookie_offset', (0.0, 0.0)) or (0.0, 0.0)),
                 t(getattr(l, 'cookie_tile', (1.0, 1.0)) or (1.0, 1.0)),
                 round(float(getattr(l, 'cookie_rotation', 0.0) or 0.0), 6))
+        if _squeezed:
+            # R254: a squeezed Spot bakes its slide axes with the
+            # squeeze folded in (cookie_spot_axes) -- a baked value
+            sig += (t(l.spot_scale),)
     return sig
 
 
 def _cookie_sig(l):
+    """R254: the cookie image's part of the plan signature -- its size
+    and a fingerprint of EVERY texel (LI.cookie_fingerprint, taken
+    fresh on each plan). It was the sum of every 7th texel: a flipped
+    64 px slide or a painted detail between the samples was a plan-cache
+    hit and the device kept the old image."""
     px = getattr(getattr(l, 'cookie', None), 'pixels',
                  getattr(l, 'cookie', None))
     try:
-        px = np.asarray(px, np.float32)
-        return (px.shape[1], px.shape[0], round(float(px[::7, ::7].sum()), 3))
+        from ..core.lights import cookie_fingerprint
+        shape = np.shape(px)
+        return (shape[1], shape[0], cookie_fingerprint(l, fresh=True))
     except Exception:                                           # noqa: BLE001
         return None
 
@@ -1026,8 +1203,11 @@ def _plan_sig(job, mkey):
         # bake the plan reads MUST be in this signature)
         'stipple_pattern',
         'specular_in_gamma', 'clamp_specular', 'light_clamp',
-        'light_falloff_default', 'shadow_samples', 'shadow_bias',
-        'shadow_softness', 'tex_filter', 'max_lights', 'light_limit_mode',
+        # R254: the render's Bias and Softness are VALUES (hal_lights
+        # carries each lamp's resolved pair); which lookup a Softness
+        # selects is structure and sits in shadow_sig below
+        'light_falloff_default', 'shadow_samples',
+        'tex_filter', 'max_lights', 'light_limit_mode',
         'global_ambient', 'global_ambient_level', 'default_model',
         'displacement_scale', 'normal_source', 'ray_shadows', 'ray_bias',
         'ray_reflection', 'ray_refraction', 'ray_depth',
@@ -1106,13 +1286,28 @@ def _plan_sig(job, mkey):
                      int(getattr(world, 'band_count', 8)),
                      round(float(getattr(world, 'band_softness', 0.0)), 6),
                      round(float(getattr(world, 'strength', 1.0)), 6))
-    shadow_sig = tuple(
-        (None if getattr(l, 'shadow_map', None) is None else
-         ('cube', tuple(round(float(f.depth[::23].sum()), 3)
-                        for f in l.shadow_map.faces))
-         if hasattr(getattr(l, 'shadow_map', None), 'faces') else
-         ('map', round(float(l.shadow_map.depth[::23].sum()), 3)))
-        for l in scene.lights)
+    # R254: each lamp's shadow as STRUCTURE only (`_shadow_struct`): the
+    # method, the map's size / grid / projection / depth rule, the tap
+    # unroll, which lookup. The depth CONTENT is not here -- it used to
+    # be, as the sum of every 23rd row, blind to a caster sliding along
+    # the rows -- because a plan-cache hit rebuilds the hal_shadowpack
+    # entry from the current maps under an exact content stamp
+    # (`_shadow_pack`): a changed map can neither be missed nor cost a
+    # re-plan
+    _bvh = getattr(job, 'bvh', None)
+
+    def _lamp_shadow(l):
+        try:
+            meta, _a, why = _shadow_meta(l, st, _bvh, want_atlas=False)
+        except Exception as exc:                                # noqa: BLE001
+            return ('error', str(exc))
+        return _shadow_struct(meta, why)
+    shadow_sig = tuple(_lamp_shadow(l) for l in scene.lights)
+    if not SHADOW_TEXELS:
+        # the literal road (the suite's A/B): every shadow value is
+        # baked, so every one of them is in the signature -- as the very
+        # bytes the texel road would upload
+        shadow_sig = shadow_sig + (_shadow_value_bytes(job),)
     obcol_sig = tuple(
         tuple(np.round(np.asarray(getattr(o, 'color', (1, 1, 1, 1)),
                                   np.float32), 5))
@@ -1163,14 +1358,56 @@ def _plan_sig(job, mkey):
             # flips the cap's choice would reuse a plan indexed for
             # different lamps
             _selection_sig(scene, st),
+            # R254: whether the ambient pool rides the hal_lights row
+            # (and its value where a pass still bakes it)
+            _ambient_sig(scene, st),
             tuple(_mat_sig(m) for m in scene.materials),
             tuple(sorted(job.textures or {})))
 
 
-def _selection_sig(scene, st):
+def _ambient_sig(scene, st):
+    """How the plan carries the ambient lamps' share of the ambient pool.
+
+    None for a scene without an ambient lamp (lights.is_ambient_lamp):
+    its pool is the settings' Global Ambient and the world's ambient,
+    both in the signature already, and the passes bake it as literals
+    exactly as they did. With an ambient lamp the pool is a VALUE: the
+    passes read the ambient tail of the hal_lights row (STRUCTURE, the
+    one flag here), so a Power or colour edit of that lamp, or a step of
+    its light style, is a cache hit plus the row's re-upload -- never a
+    new plan, and never the stale ambient a hit used to draw (the pool
+    was a literal no signature entry stood for). The radiosity gather is
+    the one place that still bakes the pool (its sky term, in two
+    functions of the pre-pass and the material pass): under Radiosity
+    the pool's value joins the signature and an edit re-plans."""
+    from .material import scene_ambient_lamps
+    if not scene_ambient_lamps(scene):
+        return None
+    if not bool(getattr(st, 'radiosity', False)):
+        return ('ambient tail',)
     from ..core import lights as LI
     try:
-        sel = LI.select_lights(scene.lights, st)
+        return ('ambient tail',) + tuple(
+            round(float(v), 6) for v in LI.ambient_light(scene, st))
+    except Exception:                                           # noqa: BLE001
+        return ('ambient tail', None)
+
+
+def _selection_sig(scene, st):
+    """The Light Limit's survivors as scene indices.
+
+    R254: the selection comes back in scene order (LI.select_lights),
+    so the SET printed here is also the ORDER the plan's light loop and
+    the cache-hit texel repack run in. The old rank order was not in
+    this signature: a Power edit that swapped two kept lamps of
+    different kinds was a cache hit whose repack filled a spot's texels
+    into a point lamp's block. Brightest does not read the camera, so
+    an orbit still re-plans nothing; under Nearest (distance from the
+    camera) a move that changes the kept set is a new plan, and only
+    for a scene with more lamps than the limit."""
+    from ..core import lights as LI
+    try:
+        sel = LI.frame_lights(scene, st)
         ids = {id(l) for l in sel}
         return tuple(i for i, l in enumerate(scene.lights)
                      if id(l) in ids)
@@ -1220,6 +1457,78 @@ def _pool_tag(tag, src, spec):
 
 
 _PLAN_CACHE = {}
+
+#: R254: how many plans the cache holds, least recently used out first.
+#: It used to empty itself past four entries: every nudge of a mapped
+#: lamp was a new plan, so a drag threw away the draft's and the
+#: refine's plans (different frame sizes, and different map sizes once
+#: drafts bake smaller maps) every fifth tick. A lamp edit is no longer
+#: a plan at all, and the two plans a viewport alternates between are
+#: always the two most recently used
+PLAN_CACHE_MAX = 8
+
+#: plan-cache lookups since the module loaded (the counters the tests
+#: and the edit-cost tables read): a hit reuses every source
+PLAN_STATS = {'hit': 0, 'miss': 0}
+
+#: R254: a lamp's shadow VALUES ride hal_lights (on) or bake into the
+#: shadow functions as literals (off: the suite's A/B -- there is no
+#: user option, the float32 values are the same either way)
+SHADOW_TEXELS = True
+
+
+def _plan_store(sig, passes, atlases):
+    """Park a built plan. The cached copy keeps the pack's KEY only: its
+    build closure holds the lamps' depth maps (a 2048 cube is 100 MB),
+    every hit rebuilds the entry from the current maps anyway, and a
+    plan that outlived its maps must not keep them alive."""
+    kept = atlases
+    if 'hal_shadowpack' in atlases:
+        kept = dict(atlases)
+        kept['hal_shadowpack'] = (atlases['hal_shadowpack'][0], None, None)
+    _PLAN_CACHE.pop(sig, None)
+    while len(_PLAN_CACHE) >= PLAN_CACHE_MAX:
+        try:
+            _PLAN_CACHE.pop(next(iter(_PLAN_CACHE)), None)
+        except (StopIteration, RuntimeError):
+            break                 # another thread emptied or resized it
+    _PLAN_CACHE[sig] = (passes, None, kept)
+
+
+class RedTexture:
+    """The simulator's stand-in for an R32F texture: ONE float32 channel,
+    (H, W). `texelFetch` on it returns (r, 0, 0, 1), what a driver hands
+    a sampler2D bound to a one-channel image -- so a shader reading .g
+    of one sees zero here as it would on the device."""
+
+    __slots__ = ('pixels', 'width', 'height')
+
+    def __init__(self, arr):
+        a = np.ascontiguousarray(np.asarray(arr, np.float32))
+        self.pixels = a
+        self.height, self.width = a.shape
+
+
+def sim_texture(arr):
+    """One uploaded array as the simulator samples it, by the device's
+    own rule (`gpu/device.upload`): a 2D (H, W) array is an R32F
+    texture, anything else RGBA32F."""
+    from ..core.texture import Texture
+    a = np.asarray(arr)
+    if a.ndim == 2:
+        return RedTexture(a)
+    return Texture(a, colorspace='Non-Color', filt='NEAREST', wrap='EXTEND')
+
+
+def _shadow_value_bytes(job):
+    """Every lamp's packed values, tail included, as bytes: the literal
+    road's part of the plan signature (SHADOW_TEXELS off)."""
+    from ..core import lights as LI
+    from .material import pack_light_texels
+    lights = LI.frame_lights(job.scene, job.settings)
+    metas = [_shadow_meta(l, job.settings, getattr(job, 'bvh', None),
+                          want_atlas=False)[0] for l in lights]
+    return pack_light_texels(lights, job, shadows=metas).tobytes()
 
 
 def _pack_dstab(job, rows):
@@ -1278,19 +1587,45 @@ def plan_frame(job, gbuf, use_cache=True):
             # material the mesh carries (below), and a hit that still
             # lacks one on screen re-plans instead of serving it
             hit = None
+        h_lts = h_metas = h_pack = None
+        if hit is not None and hit[2] and ('hal_lights' in hit[2]
+                                           or 'hal_shadowpack' in hit[2]):
+            # R254: the SHADOW entries of a hit are per-frame data. The
+            # metas are rebuilt from the current lamps and maps (their
+            # structure is the cached plan's, by the signature) and the
+            # pack entry carries the current maps under their content
+            # stamp
+            from ..core import lights as _LI2
+            h_lts = _LI2.frame_lights(job.scene, job.settings)
+            h_metas, _parts = [], []
+            for _i, _l in enumerate(h_lts):
+                _m, _a, _w = _shadow_meta(_l, job.settings,
+                                          getattr(job, 'bvh', None))
+                h_metas.append(_m)
+                if _a is not None:
+                    _parts.append((_i, _a))
+            h_pack = _shadow_pack(h_metas, _parts)
+            if ('hal_shadowpack' in hit[2]) != (h_pack is not None):
+                # the plan and the frame disagree on whether a map
+                # exists (the signature rules it out): plan afresh
+                hit = None
         if hit is not None:
+            PLAN_STATS['hit'] += 1
+            # least recently USED is what the cap evicts
+            _PLAN_CACHE.pop(sig, None)
+            _PLAN_CACHE[sig] = hit
             h_passes, h_why, h_atlases = hit
-            if h_atlases and 'hal_lights' in h_atlases:
+            if h_lts is not None and 'hal_lights' in h_atlases:
                 # R169: the light VALUES are per-frame data, not part
                 # of the plan -- a cache hit reuses every source and
                 # every other atlas, but the hal_lights texture repacks
                 # from the CURRENT lamps (this is the whole point: a
                 # lamp edit lands here, as a hit plus one tiny upload,
-                # instead of a 25-shader recompile storm)
-                from ..core import lights as _LI2
+                # instead of a 25-shader recompile storm). R254: the
+                # lamps' shadow values ride the same repack
                 from .material import pack_light_texels as _plt
-                _arr = _plt(_LI2.select_lights(job.scene.lights,
-                                               job.settings), job)
+                _arr = _plt(h_lts, job,
+                            shadows=h_metas if SHADOW_TEXELS else None)
                 h_atlases = dict(h_atlases)
                 h_atlases['hal_lights'] = (('lights', _arr.tobytes()),
                                            lambda a=_arr: a)
@@ -1338,7 +1673,14 @@ def plan_frame(job, gbuf, use_cache=True):
                     h_atlases['hal_celfield'] = _cel_atlas_entry(_cf)
                     hit = (h_passes, h_why, h_atlases)
                     _PLAN_CACHE[sig] = hit
+            if h_pack is not None:
+                # handed to THIS frame only: the cache keeps no entry
+                # that holds a map (`_plan_store`)
+                h_atlases = dict(h_atlases)
+                h_atlases['hal_shadowpack'] = h_pack
+                hit = (h_passes, h_why, h_atlases)
             return hit
+        PLAN_STATS['miss'] += 1
 
     st = job.settings
     scene = job.scene
@@ -1420,17 +1762,21 @@ def plan_frame(job, gbuf, use_cache=True):
         return None, 'Normal Source FACE needs stored face normals ' \
                      'this mesh does not carry', {}
 
-    lights = LI.select_lights(scene.lights, st)
+    from .material import link_runs as _link_runs
+    lights = LI.frame_lights(scene, st)
     for l in lights:
         if l.type not in ('SUN', 'HEMI', 'POINT', 'SPOT', 'AREA'):
             return None, f'{l.type} lights are not in the GLSL light loop', {}
-        if len(getattr(l, 'exclude_objects', ()) or ()) > 64:
+        if len(_link_runs(getattr(l, 'exclude_objects', ()) or ())) > 64:
             # linking emits a per-light object ladder against td.y (an
             # exact integer float) -- the same isin() decision the CPU
             # takes, no texture, no cliff. A pathological list is the
-            # one honest refusal left.
-            return None, ('light linking with more than 64 linked '
-                          'objects shades on the CPU'), {}
+            # one honest refusal left. R254: the ladder is one term per
+            # RUN of consecutive indices (material.link_ladder), so the
+            # refusal counts runs -- three hundred instances side by
+            # side are one term, sixty-five scattered objects refuse
+            return None, ('light linking with more than 64 separate '
+                          'runs of linked objects shades on the CPU'), {}
 
     # shadow maps: the same maps the CPU just baked, packed for the GPU
     shadows, atlases = [], {}
@@ -1442,38 +1788,24 @@ def plan_frame(job, gbuf, use_cache=True):
         shadows.append(meta)
         if atlas is not None:
             shadow_parts.append((i, atlas))
-    if shadow_parts:
-        # ONE combined atlas for every mapped light, stacked by rows.
-        # Eight per-light samplers put the field's heavier materials AT
-        # the 16-sampler fragment cliff (12 material samplers + the
-        # G-buffer's three), and the real driver rejected the compile:
-        # 'the driver rejected <material>: HAL_MAT_1: CreateInfo failed' --
-        # the refusal milestone that ended five rounds of guessing.
-        # Every light's cell arithmetic is already baked as literals,
-        # so packing costs one added row offset per light and frees
-        # seven sampler slots on an eight-light scene.
-        voff = 0
-        keys, packs = [], []
-        for i, (akey, abuild) in shadow_parts:
-            m = shadows[i]
-            ph = int(m['size']) * int(m['grid'][1])
-            pw = int(m['size']) * int(m['grid'][0])
-            m['voff'] = voff
-            keys.append(akey)
-            packs.append((voff, ph, pw, abuild))
-            voff += ph
-        total_h = voff
-        total_w = max(pw for _v, _h, pw, _b in packs)
-
-        def build_pack(_packs=tuple(packs), _th=total_h, _tw=total_w):
-            out = np.zeros((_th, _tw, 4), np.float32)
-            for v, ph, pw, b in _packs:
-                px = b()
-                out[v:v + ph, :pw] = px[:, :pw]
-            return out
-
-        atlases['hal_shadowpack'] = (('shadowpack',) + tuple(keys),
-                                     build_pack)
+    # ONE combined atlas for every mapped light, stacked by rows
+    # (`_shadow_pack`: the row offsets, the layout key, the content stamp)
+    _pack_entry = _shadow_pack(shadows, shadow_parts)
+    if _pack_entry is not None:
+        atlases['hal_shadowpack'] = _pack_entry
+    # R254: where each lamp's shadow values sit in hal_lights past the
+    # per-lamp texels (the Area faces, the mapped lamps' blocks). The
+    # emitters read through it; with SHADOW_TEXELS off it is absent and
+    # they bake the same float32 values as literals
+    light_tail = None
+    if SHADOW_TEXELS:
+        from .material import light_tail_layout
+        from .material import scene_ambient_lamps as _amb_lamps
+        # (the ambient tail, when the scene has one, sits first: the
+        # packer lays the row out with the same flag)
+        light_tail = light_tail_layout(
+            lights, shadows,
+            ambient=bool(st is not None and _amb_lamps(scene)))
 
     # projected light textures (gobos): the image rides along per light,
     # in the same cached-upload idiom, and the light loop samples it with
@@ -1497,10 +1829,19 @@ def plan_frame(job, gbuf, use_cache=True):
                 + [np.ones(px.shape[:2] + (1,), np.float32)], axis=2) \
                 if px.shape[2] == 1 else np.concatenate(
                     [px, np.ones(px.shape[:2] + (1,), np.float32)], axis=2)
+        # R254: the upload is keyed on the preparation's own key (every
+        # source texel's fingerprint, the blur, the extension) -- the
+        # sum of every 7th prepared texel served a stale texture
+        _prep = getattr(l, '_cookie_prep', None)
         ckey = ('cookie', str(getattr(l, 'name', i)), px.shape[1],
-                px.shape[0], float(px[::7, ::7].sum()))
+                px.shape[0]) + (tuple(_prep[0]) if isinstance(_prep, tuple)
+                                else (float(px[::7, ::7].sum()),))
         atlases[f'hal_cookie{i}'] = (ckey, (lambda p=px: p))
         s_ax, u_ax, f_ax = LI.cookie_frame(l)
+        if l.type == 'SPOT' and LI.spot_scale_on(l):
+            # R254: the elliptical cone squeezes its slide too -- the
+            # CPU lookup's own axes (cookie_factor), baked as literals
+            s_ax, u_ax = LI.cookie_spot_axes(l, s_ax, u_ax)
         try:
             a_sx, a_sy = (float(v) for v in
                           getattr(l, 'area_size', (1.0, 1.0))[:2])
@@ -1672,6 +2013,8 @@ def plan_frame(job, gbuf, use_cache=True):
         mat_ids = np.zeros(0, np.int64)
 
     from ..core import render as _CR
+    from .material import ambient_tail_base as _ambient_tail_base
+    from .material import scene_ambient_lamps as _scene_ambient_lamps
     _amb_eng, _amb_wrld = LI.ambient_light_split(scene, st)
     consts = {
         'ambient_color': tuple(float(v) for v in LI.ambient_light(scene, st)),
@@ -1680,6 +2023,12 @@ def plan_frame(job, gbuf, use_cache=True):
         # part flat-adds (see light_surface's BI branch)
         'ambient_engine': tuple(float(v) for v in _amb_eng),
         'ambient_world': tuple(float(v) for v in _amb_wrld),
+        # R254: with an ambient lamp in the scene the three triples are
+        # read from the ambient tail of the hal_lights row instead (the
+        # texel index after the last light's block; None = the literals
+        # above). In the plan signature: _ambient_sig
+        'ambient_tail': (_ambient_tail_base(len(lights))
+                         if _scene_ambient_lamps(scene) else None),
         'two_sided': bool(getattr(st, 'two_sided_lighting', True)),
         'specular_in_gamma': bool(getattr(st, 'specular_in_gamma', True)),
         'clamp_specular': bool(getattr(st, 'clamp_specular', True)),
@@ -1691,6 +2040,8 @@ def plan_frame(job, gbuf, use_cache=True):
         'exclusive_lights': tuple(sorted(
             getattr(scene, 'exclusive_lights', None) or ())),
         'shadow_samples': int(getattr(st, 'shadow_samples', 4)),
+        # R254: the hal_lights tail (None = the shadow values bake)
+        'light_tail': light_tail,
         # the per-lamp shadow MODE resolution the CPU runs (smode =
         # light.shadow under PER_LIGHT, the override otherwise): the
         # RAYBIAS terminator branch fires only for smode == 'RAY'
@@ -2447,7 +2798,8 @@ def plan_frame(job, gbuf, use_cache=True):
         # -- and nothing else: the pass sources no longer contain the
         # values, so the plan above was a cache HIT.
         from .material import pack_light_texels
-        _lt_arr = pack_light_texels(lights, job)
+        _lt_arr = pack_light_texels(
+            lights, job, shadows=shadows if SHADOW_TEXELS else None)
         atlases['hal_lights'] = (('lights', _lt_arr.tobytes()),
                                  lambda a=_lt_arr: a)
     if consts.get('fogtab'):
@@ -2531,9 +2883,7 @@ def plan_frame(job, gbuf, use_cache=True):
     if unplanned:
         atlases['__unplanned'] = unplanned
     if sig is not None:
-        if len(_PLAN_CACHE) > 4:
-            _PLAN_CACHE.clear()
-        _PLAN_CACHE[sig] = (passes, None, atlases)
+        _plan_store(sig, passes, atlases)
     return passes, None, atlases
 
 
@@ -2742,7 +3092,49 @@ def _mesh_key(mesh):
     # R251 C012: the vertex-format tag (a fine lattice can move the
     # strided sums by less than the 3-decimal rounding)
     parts.append(getattr(mesh, '_quant_tag', None))
+    # R254: every OTHER array the uploads keyed here pack, digested whole
+    parts.append(_attr_digests(mesh))
     return tuple(parts)
+
+
+#: the arrays the mesh-keyed uploads read besides the positions:
+#: gbuffer.pack_attributes (tris, normals, uvs, uvs2, colors, and the face
+#: normal of every flat triangle), pack_tri_data (mat_index, obj_index),
+#: pack_tri_aux and ink.pack_tri_fn (face_normals)
+_MESH_KEY_ARRAYS = ('tris', 'normals', 'uvs', 'uvs2', 'colors', 'mat_index',
+                    'obj_index', 'face_normals', 'smooth')
+
+
+def _attr_digests(mesh):
+    """mathx.content_digest of each array in _MESH_KEY_ARRAYS (None where
+    the mesh has none), memoised on the mesh.
+
+    The strided sums above read about 512 elements of each array, so a
+    change that lies between the samples left the key where it was: a
+    24-vertex box among 53,000 vertices switched from flat to smooth kept
+    its old normals on the device (245 px wrong against a cold frame), and
+    the same box given another material kept the old triangle table, so
+    the material pass left its pixels unshaded and the device refused
+    every frame. Only the positions were digested exactly.
+
+    A fresh export makes fresh arrays and pays one pass over them (about
+    1 ms per 2 MB); the memo holds the arrays themselves and is reused
+    only while each attribute IS the array it digested, so a lights-only
+    export, a draft and a refine -- all the same MeshData -- pay nothing.
+    An edit made IN PLACE keeps the memo: the sums in the key still catch
+    it exactly as far as they always did, no further."""
+    arrs = tuple(getattr(mesh, name, None) for name in _MESH_KEY_ARRAYS)
+    memo = getattr(mesh, '_attr_digest_memo', None)
+    if memo is not None and len(memo[0]) == len(arrs) and \
+            all(a is b for a, b in zip(memo[0], arrs)):
+        return memo[1]
+    out = tuple(None if a is None else _content_digest(np.asarray(a))
+                for a in arrs)
+    try:
+        mesh._attr_digest_memo = (arrs, out)
+    except Exception:                                           # noqa: BLE001
+        pass
+    return out
 
 
 #: where the last driver frame's milliseconds went, for the self-test
@@ -3341,6 +3733,8 @@ def shade_fragments_frame(job, gbuf, tri, bary, px, py, rank):
                 extra[u] = float(getattr(job.scene, 'time', 0.0))
             elif u == 'hal_frame':
                 extra[u] = float(getattr(job.scene, 'frame', 0))
+            elif u == 'hal_spass':
+                extra[u] = _sample_pass(job)
             elif u == 'hal_mrow':
                 extra[u] = float(binds.get('mat_row', 0))
         # the Bump height pre-passes: the same shaders the opaque frame
@@ -3412,6 +3806,8 @@ def shade_fragments_frame(job, gbuf, tri, bary, px, py, rank):
                         extra[u] = float(getattr(job.scene, 'time', 0.0))
                     elif u == 'hal_frame':
                         extra[u] = float(getattr(job.scene, 'frame', 0))
+                    elif u == 'hal_spass':
+                        extra[u] = _sample_pass(job)
                     elif u == 'hal_mrow':
                         extra[u] = float(binds.get('mat_row', 0))
                 sec_draws[which2].append((name, shader, bind, extra))
@@ -3740,9 +4136,8 @@ def simulate_fragments(job, gbuf, tri, bary, px, py, rank):
     for sname, entry in (atlases or {}).items():
         if sname.startswith('__'):
             continue
-        _key, build = entry
-        base[sname] = Texture(build(), colorspace='Non-Color',
-                              filt='NEAREST', wrap='EXTEND')
+        _key, build = entry[0], entry[1]    # a stamped entry is a 3-tuple
+        base[sname] = sim_texture(build())
     if (atlases or {}).get('__radfield') is not None:
         ids_f, _a2, _s2, _t2, _ts2 = _textures(job, gbuf)
         rtex, rwhy = _sim_radfield(atlases['__radfield'], job, ids_f,
@@ -3775,6 +4170,7 @@ def simulate_fragments(job, gbuf, tri, bary, px, py, rank):
         uni2['hal_frame'] = np.full(n, float(getattr(job.scene,
                                                      'frame', 0)),
                                     np.float32)
+        uni2['hal_spass'] = np.full(n, _sample_pass(job), np.float32)
         uni2['hal_mrow'] = np.full(n, float(binds2.get('mat_row', 0)),
                                    np.float32)
         uni2['vUV'] = uv
@@ -4251,10 +4647,16 @@ def _fog_structure(st, scene):
             print(_note)
         # F015's fog half (LIGHT-A2): the lobe joins the target only when
         # a screen-spot lamp exists AND Spotlight Fog > 0 (both in the
-        # signature: _light_sig's screen_spot, st_sig's fog_spot gate)
+        # signature: _light_sig's screen_spot, st_sig's fog_spot gate).
+        # R254: a screen-spot lamp of the FRAME (LI.frame_lights) -- the
+        # pass declares hal_spotfog from its own light loop, so a screen
+        # spot the Light Limit dropped (or one that is Ambient Only) left
+        # the fog reading an accumulator no pass declared, and the plan
+        # failed to compile. The CPU's spot_fog_of reads the same list
+        from ..core import lights as _LI
         fs['spot'] = _FOG.spot_on(st) and any(
             getattr(l, 'screen_spot', False)
-            for l in (getattr(scene, 'lights', ()) or ()))
+            for l in _LI.frame_lights(scene, st))
     return fs
 
 
@@ -4692,8 +5094,7 @@ def simulate(job, gbuf, passes=None, atlases=None, region=None):
         if sname.startswith('__'):
             continue               # plans and specs, not atlases
         _key, build = entry[0], entry[1]    # R251 C015: a stamped 3-tuple
-        tex[sname] = Texture(build(), colorspace='Non-Color', filt='NEAREST',
-                             wrap='EXTEND')
+        tex[sname] = sim_texture(build())
 
     if (atlases or {}).get('__radfield') is not None:
         # the interpolated gather's grid pre-pass, over grid lanes: the
@@ -4768,6 +5169,8 @@ def simulate(job, gbuf, passes=None, atlases=None, region=None):
                                   np.float32)
         uni['hal_frame'] = np.full(n, float(getattr(job.scene, 'frame', 0)),
                                    np.float32)
+        # the averaging road's pass index (the soft-ray pattern's salt)
+        uni['hal_spass'] = np.full(n, _sample_pass(job), np.float32)
         # R174: this pass's row in the hal_mats value texture
         uni['hal_mrow'] = np.full(n, float(binds.get('mat_row', 0)),
                                   np.float32)
@@ -5102,6 +5505,8 @@ def shade_frame(job, gbuf, region=None):
                     extra[u] = float(getattr(job.scene, 'time', 0.0))
                 elif u == 'hal_frame':
                     extra[u] = float(getattr(job.scene, 'frame', 0))
+                elif u == 'hal_spass':
+                    extra[u] = _sample_pass(job)
                 elif u == 'hal_mrow':
                     extra[u] = float(binds.get('mat_row', 0))
             built.append((name, shader, bind, extra))
@@ -5177,6 +5582,8 @@ def shade_frame(job, gbuf, region=None):
                     extra[u] = float(getattr(job.scene, 'time', 0.0))
                 elif u == 'hal_frame':
                     extra[u] = float(getattr(job.scene, 'frame', 0))
+                elif u == 'hal_spass':
+                    extra[u] = _sample_pass(job)
             tgt = device.Target(w, h)
             prepass_targets.append(tgt)
             try:

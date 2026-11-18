@@ -10,6 +10,7 @@ import numpy as np
 
 from . import mathx as M
 from . import raster
+from . import softmap as SM
 
 EPS = 1e-6
 
@@ -66,8 +67,11 @@ CUBE_DIRS = (
 class ShadowMap:
     """One depth image rendered from a light."""
 
+    # `digest` is filled lazily by gpu/shade.map_digest (an exact content
+    # digest of `depth`, the GPU atlas's identity); a map whose depth is
+    # rewritten in place must reset it to None
     __slots__ = ('vp', 'depth', 'near', 'far', 'persp', 'size', 'origin',
-                 'extent', 'soft_extra')
+                 'extent', 'axes', 'd_min', 'digest')
 
     def __init__(self, vp, zndc, near, far, persp, size, origin, extent=1.0):
         self.vp = vp
@@ -101,9 +105,14 @@ class ShadowMap:
             self.depth = np.where(has2, mid, empty).astype(np.float32)
         else:
             self.depth = self._linearise(zndc)
-        # extra PCF blur, in texels, derived from the LAMP'S OWN SIZE at
-        # build time (see soft_size_texels) -- 0 keeps the classic blur
-        self.soft_extra = 0.0
+        # what a SIZED lamp's lookup (core/softmap.py) reads beside the
+        # depth: the map's right / up / depth world axes and the nearest
+        # depth it holds (no caster stands nearer, which bounds the
+        # blocker search). Neither depends on the lamp's size -- nothing
+        # on a map does, so a size edit never re-bakes one
+        self.axes = SM.map_axes(vp, self.persp)
+        self.d_min = float(self.depth.min()) if self.depth.size else \
+            float(self.far)
 
     def _linearise(self, z):
         z = np.clip(np.asarray(z, np.float32), -1.0, 1.0)
@@ -171,12 +180,13 @@ def _pcf_offsets(n):
 class CubeShadow:
     """Six ShadowMaps for an omnidirectional light."""
 
-    __slots__ = ('faces', 'origin', 'soft_extra')
+    __slots__ = ('faces', 'origin', 'd_min')
 
     def __init__(self, faces, origin):
         self.faces = faces
         self.origin = np.asarray(origin, np.float32)
-        self.soft_extra = 0.0
+        # the nearest depth any of the six faces holds (see ShadowMap)
+        self.d_min = min(float(f.d_min) for f in faces)
 
     def texel_size(self, dist):
         return self.faces[0].texel_size(dist)
@@ -335,17 +345,14 @@ def _light_shadow_signature(light):
 
     Colour and energy are deliberately absent -- they tint the LIGHT,
     never the depth -- so palette edits ride the cache untouched. The
-    lamp's SIZE is present: it does not move a depth texel either, but
-    the built map carries soft_extra (the size-derived blur) stamped at
-    build time, and the field proved a cached map serves a stale one --
-    dragging Radius did nothing until something else rebuilt the map."""
-    asz = getattr(light, 'area_size', (0.0, 0.0))
+    lamp's SIZE (Radius, a Sun's Angle, an Area's Size) is absent too:
+    it does not move a depth texel and the built map carries nothing
+    derived from it -- the penumbra is measured per receiver at lookup
+    (core/softmap.py) -- so dragging a size re-bakes nothing."""
     return (light.type, tuple(np.round(light.position, 5)),
             tuple(np.round(light.direction, 5)),
             round(float(light.spot_size), 5), light.shadow,
             int(light.shadow_map_size),
-            round(float(getattr(light, 'radius', 0.0)), 6),
-            round(float(asz[0]), 6), round(float(asz[1]), 6),
             # R251 C117: the per-lamp Map Depth override
             str(getattr(light, 'shadow_map_depth', 'INHERIT')),
             # R253: the Square cone widens the buffer's frustum and
@@ -428,41 +435,6 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
         return
     centre, radius = scene_bounds(mesh.verts)
 
-    def _soft_world(light, dist):
-        """The lamp's size as a world-space blur radius at `dist` away.
-
-        SUN's size is an ANGLE (Blender's light.angle), so its world
-        radius grows with distance; AREA uses half the mean edge;
-        POINT/SPOT use the radius directly. This is what makes the size
-        dials WORK under shadow maps: the field report was that only
-        the spot cone visibly responded to size, because the ray path
-        read radius and the map path read nothing.
-        """
-        kind = str(getattr(light, 'type', 'POINT')).upper()
-        if kind == 'SUN':
-            return float(np.tan(float(getattr(light, 'radius', 0.0))
-                                * 0.5)) * float(dist)
-        if kind == 'AREA':
-            asz = getattr(light, 'area_size', (0.0, 0.0))
-            return 0.25 * (float(asz[0]) + float(asz[1]))
-        return float(getattr(light, 'radius', 0.0))
-
-    def _stamp_soft(sm, light, rep_dist):
-        """Store the size-derived extra blur, in texels, on the map.
-
-        Computed once at build with the scene centre as the
-        representative receiver -- the era's buffer shadows were a
-        constant blur, and a constant is what both devices can agree
-        on exactly. Capped so a huge lamp cannot smear the whole map.
-        """
-        first = sm.faces[0] if hasattr(sm, 'faces') else sm
-        eff = _soft_world(light, rep_dist)
-        if eff <= 0.0:
-            return
-        texel = float(np.asarray(first.texel_size(
-            np.asarray([rep_dist], np.float32))).reshape(-1)[0])
-        sm.soft_extra = float(min(eff / max(texel, 1e-9) * 0.5, 24.0))
-
     # PLAN first (cheap geometry per map), RENDER second -- because the
     # renders are independent: each map is its own buffer, its own depth
     # min-compares, deterministic in isolation, so thread scheduling
@@ -500,8 +472,6 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
                        size=size, eye=eye, half=half):
                 light.shadow_map = ShadowMap(vp, depth, near, far, False,
                                              size, eye, half)
-                _stamp_soft(light.shadow_map, light,
-                            float(np.linalg.norm(centre - eye)))
             jobs.append((assign, vp, size, mid))
         elif light.type == 'SPOT':
             d = M.normalize(np.asarray(light.direction, np.float32))
@@ -528,8 +498,6 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
                 light.shadow_map = ShadowMap(vp, depth, near, far, True,
                                              size, pos,
                                              float(np.tan(fov * 0.5)))
-                _stamp_soft(light.shadow_map, light,
-                            float(np.linalg.norm(centre - pos)))
             jobs.append((assign, vp, size, mid))
         else:
             near = max(radius * 0.005, 1e-3)
@@ -551,8 +519,6 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
                     pending['n'] -= 1
                     if pending['n'] == 0:
                         light.shadow_map = CubeShadow(list(slots), pos)
-                        _stamp_soft(light.shadow_map, light,
-                                    float(np.linalg.norm(centre - pos)))
                 jobs.append((assign, vp, size, mid))
 
     if not jobs:
@@ -575,12 +541,34 @@ def _build_shadow_maps(scene, settings, caster_tris=None, only=None):
 # ------------------------------------------------------------- light sampling
 
 
+def resolved_decay(light, settings=None):
+    """The falloff law a lamp actually runs: its own Falloff, or the
+    render's Light Falloff while the lamp is left on Scene Default.
+
+    R254: the readers of the law's NAME -- the Blender Internal 0.001
+    snap in sample() and the volumetric beam's reach here, the GPU
+    packer and emitter and the panel's slider rows by the same two
+    lines against their own settings -- used to test the lamp's own
+    unresolved 'DEFAULT', and so treated a Scene Default lamp
+    differently from the same law chosen on the lamp."""
+    mode = str(getattr(light, 'decay', 'DEFAULT') or 'DEFAULT')
+    if mode == 'DEFAULT' and settings is not None:
+        mode = str(getattr(settings, 'light_falloff_default', 'DEFAULT'))
+    return mode
+
+
 def attenuate(light, dist, settings=None):
     mode = light.decay
     if mode == 'DEFAULT' and settings is not None:
         mode = settings.light_falloff_default
     start = float(light.decay_start)
-    d = np.maximum(dist - start, EPS) if start > 0 else np.maximum(dist, EPS)
+    # R254: Falloff Start is a Custom Range value and nothing else. The
+    # two inverse laws used to divide by (dist - start): a Start left
+    # over from a Custom Range lamp (the panel draws the slider for
+    # that law only) put a pole at d = Start and 1/EPS inside it -- the
+    # whole disc under the lamp at the ceiling. Start 0, the default,
+    # is the same statement it always was
+    d = np.maximum(dist, EPS)
     if mode == 'NONE':
         # R253: no early return any more -- the Sphere wrap below is
         # the SAME statements this branch used to run (LA_SPHERE
@@ -672,12 +660,66 @@ def spot_falloff(light, L):
     cosine roll-off -- the field's spot rigs read wrong both ways."""
     d = M.normalize(np.asarray(light.direction, np.float32))
     inpr = -M.dot(L, np.broadcast_to(d[None, :], L.shape))
-    if getattr(light, 'spot_square', False):
+    if spot_scale_on(light):
+        # R254: a Spot scaled unevenly across its beam -- Blender's
+        # elliptical cone. The cosine every law reads is taken after
+        # the narrower axis is squeezed (the Square cone's max rides
+        # the same squeezed pair: a rectangular pyramid)
+        inpr = scaled_cos(light, L, inpr)
+    elif getattr(light, 'spot_square', False):
         # R253 (A): BI's LA_SQUARE -- the cosine the cone law reads is
         # measured along the wider of the lamp's two sides, so every
         # law (BI blend, GL11, POV, GX) gets a square version
         inpr = square_cos(light, L, inpr)
     return spot_law_factor(light, inpr)
+
+
+def spot_scale_on(light):
+    """R254: True when the lamp carries an elliptical cone -- its
+    spot_scale pair is not (1, 1). A lamp without the field (a
+    hand-built Light of an older shape) is round."""
+    sc = getattr(light, 'spot_scale', None)
+    if sc is None:
+        return False
+    try:
+        return (float(sc[0]), float(sc[1])) != (1.0, 1.0)
+    except (TypeError, ValueError, IndexError):
+        return False
+
+
+def scaled_cos(light, L, z):
+    """R254: the cosine to the axis of an ELLIPTICAL cone, Blender's
+    light_spot_attenuation (eevee_light_lib): the direction in lamp
+    space with its side / up components multiplied by spot_scale, then
+    1/sqrt(1 + (x/z)^2 + (y/z)^2); zero behind the lamp. With Square
+    the wider of the two squeezed sides is taken instead of their sum
+    (square_cos's max). `z` is the plain cosine (-L . direction), the
+    frame is cookie_frame's. Float32, one op per statement -- the CPU
+    half of the GLSL `sc_*` lines."""
+    s, u, _f = cookie_frame(light)
+    sc = getattr(light, 'spot_scale', (1.0, 1.0))
+    x = -(L @ s.astype(np.float32))
+    y = -(L @ u.astype(np.float32))
+    x = x * np.float32(sc[0])
+    y = y * np.float32(sc[1])
+    zz = np.maximum(np.asarray(z, np.float32), np.float32(1e-20))
+    with np.errstate(over='ignore', invalid='ignore'):
+        # behind the lamp x/zz overflows; the select below discards
+        # that lane, exactly the GLSL ternary
+        ax = x / zz
+        ay = y / zz
+        if getattr(light, 'spot_square', False):
+            ax = np.abs(ax)
+            ay = np.abs(ay)
+            m = np.maximum(ax, ay)
+            q = m * m
+        else:
+            q = ax * ax
+            t = ay * ay
+            q = q + t
+        q = np.float32(1.0) + q
+        c = np.float32(1.0) / np.sqrt(q)
+    return np.where(z > 0.0, c, np.float32(0.0)).astype(np.float32)
 
 
 def square_cos(light, L, z):
@@ -704,10 +746,38 @@ def square_cos(light, L, z):
     return np.where(z > 0.0, c, np.float32(0.0)).astype(np.float32)
 
 
+def spot_blend_band(light, spotsi):
+    """R254: the width of the Blender Internal cone's smoothstep band, in
+    cosine units, measured inward from the cutoff cosine `spotsi`.
+
+    Hotspot 0 (the default): Blender's Blend, (1 - spotsi) * spot_blend
+    -- the caller's own `spotsi` (the CPU's float32, the packer's
+    double) in the expression each site always evaluated, so such a
+    lamp moves no bit. Hotspot above 0: the band runs from the cone
+    edge to the HOTSPOT's cosine, cos(min(hotspot, spot_size)/2) -
+    cos(spot_size/2) -- full strength inside the inner angle, the
+    smoothstep down to the Spot Size, the 3D Studio hotspot / falloff
+    pair. Computed in float64 and rounded once by the caller, so the
+    CPU's band and the GPU's texel are the same float32. A hotspot at
+    or past the cone gives 0: the hard edge.
+
+    The ONE place the band is computed: _spot_blender, the GPU packer
+    (hal_lights texel 2.w), the baked literal, the plan signature's
+    "a blend exists" bit and the visible beam's edge all call it.
+    """
+    hot = float(getattr(light, 'hotspot', 0.0) or 0.0)
+    if hot > 0.0:
+        size = float(light.spot_size)
+        return float(np.cos(min(hot, size) * 0.5)) \
+            - float(np.cos(size * 0.5))
+    return (1.0 - spotsi) * float(light.spot_blend)
+
+
 def _spot_blender(light, inpr):
-    """Blender Internal's cone, verbatim (the 1.89.0 spot_falloff body)."""
+    """Blender Internal's cone, verbatim (the 1.89.0 spot_falloff body);
+    R254: the band is spot_blend_band's -- Blend, or the Hotspot's."""
     spotsi = np.float32(np.cos(float(light.spot_size) * 0.5))
-    spotbl = np.float32((1.0 - spotsi) * float(light.spot_blend))
+    spotbl = np.float32(spot_blend_band(light, spotsi))
     t = inpr - spotsi
     if spotbl != 0.0:
         i = np.clip(t / spotbl, 0.0, 1.0)
@@ -733,6 +803,16 @@ def cookie_frame(light):
                 M.normalize(np.asarray(fy, np.float32)), f)
     s, u = M.orthonormal_basis(f[None, :])
     return s[0], u[0], f
+
+
+def cookie_spot_axes(light, s, u):
+    """R254: a Spot's slide axes with the elliptical cone's squeeze
+    folded in: (side * sx, up * sy) as float32. ONE place, read by the
+    CPU lookup and by the GPU's baked literals, so both project the
+    same slide."""
+    sc = getattr(light, 'spot_scale', (1.0, 1.0))
+    return (np.asarray(s, np.float32) * np.float32(sc[0]),
+            np.asarray(u, np.float32) * np.float32(sc[1]))
 
 
 #: R219: the extension each projection always had, before it was a
@@ -795,6 +875,11 @@ def cookie_blur_uv(light):
         tanh = max(np.tan(float(getattr(light, 'spot_size', 1.2)) * 0.5),
                    1e-6)
         b = r / (2.0 * float(tanh))
+        if spot_scale_on(light):
+            # R254: the elliptical cone's gate is narrower across the
+            # squeezed axis, so the same source disc covers more of it
+            sc = light.spot_scale
+            return (b * float(sc[0]), b * float(sc[1]))
         return (b, b)
     if kind == 'POINT':
         a = float(np.arctan(r))
@@ -858,6 +943,53 @@ def _box1d(a, width, axis, pad_mode):
 _COOKIE_PAD = {'REPEAT': 'wrap', 'EXTEND': 'edge', 'CLIP': 'constant'}
 
 
+def cookie_fingerprint(light, fresh=False):
+    """R254: a fingerprint of EVERY texel of the lamp's cookie -- the
+    crc32 of its float32 bytes -- or None without one.
+
+    The cookie's caches (the blurred preparation, the CPU sampler's
+    texture, the GPU plan and the device upload) were keyed on the sum
+    of every 7th texel: 48 of 49 texels were never read, and a mirror
+    or half-turn of an image whose width is 1 mod 7 (8, 64, 512, 4096
+    px) maps that lattice onto itself, so a flipped slide or a small
+    painted detail kept serving the old image.
+
+    The crc costs about 0.3 ms per megabyte, and the shading loop asks
+    many times a frame, so it is remembered on the lamp against the
+    pixel ARRAY it was taken from (a held reference: an address cannot
+    be reused under it). A new array is fingerprinted on sight;
+    `fresh=True` recomputes -- render() does so once per frame and the
+    GPU plan signature on every plan, which is what notices an array
+    edited in place.
+    """
+    ck = getattr(light, 'cookie', None)
+    if ck is None:
+        return None
+    src = getattr(ck, 'pixels', ck)
+    memo = getattr(light, '_cookie_fp', None)
+    if not fresh and isinstance(memo, tuple) and memo[0] is src:
+        return memo[1]
+    try:
+        import zlib
+        px = np.ascontiguousarray(np.asarray(src, np.float32))
+        fp = int(zlib.crc32(px.tobytes() if px.size < 4096 else px))
+    except Exception:                                           # noqa: BLE001
+        return None
+    try:
+        light._cookie_fp = (src, fp)
+    except Exception:                                           # noqa: BLE001
+        pass
+    return fp
+
+
+def refresh_cookie_fingerprints(lights):
+    """R254: fingerprint every cookie's texels for this frame (see
+    cookie_fingerprint) -- one crc per cookie lamp, before any reader."""
+    for light in lights or ():
+        if getattr(light, 'cookie', None) is not None:
+            cookie_fingerprint(light, fresh=True)
+
+
 def cookie_pixels(light):
     """The image a lamp actually projects -- prepared ONCE and shared
     verbatim by the CPU sampler and the GPU upload, so both devices read
@@ -884,7 +1016,9 @@ def cookie_pixels(light):
     else:
         bu, bv = cookie_blur_uv(light)
     ext = cookie_extend(light)
-    key = (px.shape, round(float(px[::7, ::7].sum()), 6),
+    # R254: keyed on every texel (cookie_fingerprint), not on the sum
+    # of every 7th
+    key = (px.shape, cookie_fingerprint(light),
            round(float(bu), 9), round(float(bv), 9), ext)
     prep = getattr(light, '_cookie_prep', None)
     if isinstance(prep, tuple) and prep[0] == key:
@@ -1062,6 +1196,11 @@ def cookie_factor(light, P, L):
     dz = d @ f.astype(np.float32)
     tanh = max(np.tan(float(light.spot_size) * 0.5), 1e-6)
     safe = np.maximum(dz, 1e-6) * (2.0 * tanh)
+    if spot_scale_on(light):
+        # R254: the slide is squeezed with the elliptical cone -- its
+        # edges stay on the cone's edges (the frame axes carry the
+        # scale, as the GPU bakes them)
+        s, u = cookie_spot_axes(light, s, u)
     cu = (d @ s.astype(np.float32)) / safe + 0.5
     cv = (d @ u.astype(np.float32)) / safe + 0.5
     if xf:
@@ -1114,10 +1253,12 @@ def sample(light, P, settings, area_sample=None):
         att = attenuate(light, dist, settings)
     if light.type == 'SPOT':
         att = att * spot_falloff(light, L)
-    if str(getattr(light, 'decay', '')).startswith('BI_') or \
+    if resolved_decay(light, settings).startswith('BI_') or \
             getattr(light, 'bi_sphere', False):
         # lamp_get_visibility's tail, verbatim (R155): a combined
-        # visifac at or below 0.001 is snapped to zero
+        # visifac at or below 0.001 is snapped to zero. R254: on the
+        # RESOLVED law -- a Scene Default lamp under a Blender Internal
+        # render default is the same lamp as one with the law chosen
         att = np.where(att <= 0.001, 0.0, att)
     scale = energy / (4.0 * np.pi)
     rad = col * (scale * att)[:, None]
@@ -1136,6 +1277,20 @@ def sample(light, P, settings, area_sample=None):
 #: the GPU twin bakes the same corners as literals.
 AREA_DISC_SIDES = 16
 
+#: the shortest side an area lamp LIGHTS with (world units). The Stokes
+#: contour sums the arc angles between unit vectors to the lamp's
+#: corners and multiplies by dist^2 / A; on a face much smaller than
+#: this the arcs are rounding noise and A is nearly zero -- a Size 0
+#: lamp (Blender lets it be typed) lit the scene with noise seventy-six
+#: times too bright, and the float32 GLSL twin broke fifty times sooner
+#: (3% off the CPU at 0.005, 84% at 0.001). The far-field energy does
+#: not depend on the size at all (BI's area lamp is total-power-like),
+#: so a face clamped here IS the small lamp, drawn cleanly: at 0.02 the
+#: GPU twin is within 0.3% of the CPU. One constant for the three
+#: places that build the face: area_emit_area, area_corners and the
+#: GLSL rectangle (gpu/material._area_function)
+AREA_MIN_SIDE = 0.02
+
 
 def area_is_disc(light):
     """True for the round area shapes (Blender's DISK and ELLIPSE)."""
@@ -1149,12 +1304,21 @@ def area_emit_area(light):
     by this, so a disc and a square of the same size throw the same
     far-field energy (BI's area lamp is total-power-like: its energy
     does not grow with its size) and differ only in SHAPE."""
-    asz = getattr(light, 'area_size', (1.0, 1.0))
-    sx = max(float(asz[0]), 1e-6)
-    sy = max(float(asz[1]) if len(asz) > 1 else float(asz[0]), 1e-6)
+    sx, sy = area_lit_sides(light)
     if area_is_disc(light):
         return sx * sy * (np.pi * 0.25)
     return sx * sy
+
+
+def area_lit_sides(light):
+    """(sx, sy): the two sides the lamp's LIGHTING is computed with --
+    its Size, never under AREA_MIN_SIDE. The traced shadow still reads
+    the true Size (a Size 0 lamp casts a hard shadow)."""
+    asz = getattr(light, 'area_size', (1.0, 1.0))
+    sx = max(float(asz[0]), AREA_MIN_SIDE)
+    sy = max(float(asz[1]) if len(asz) > 1 else float(asz[0]),
+             AREA_MIN_SIDE)
+    return sx, sy
 
 
 def area_corners(light, dtype=np.float64):
@@ -1179,9 +1343,7 @@ def area_corners(light, dtype=np.float64):
     ay = np.asarray(getattr(light, 'area_y', None)
                     if getattr(light, 'area_y', None) is not None
                     else (0.0, 1.0, 0.0), dtype)
-    asz = getattr(light, 'area_size', (1.0, 1.0))
-    sx = max(float(asz[0]), 1e-6)
-    sy = max(float(asz[1]) if len(asz) > 1 else float(asz[0]), 1e-6)
+    sx, sy = area_lit_sides(light)
     hx, hy = ax * dtype(sx * 0.5), ay * dtype(sy * 0.5)
     if not area_is_disc(light):
         return np.stack((pos - hx - hy, pos - hx + hy,
@@ -1288,6 +1450,91 @@ def area_samples(light, count, rng):
     return out
 
 
+# ---------------------------------------------- soft traced shadows
+#
+# The N rays one pixel fires at a sized lamp are ONE stratified pattern.
+# They used to be N independent hash draws -- white noise, whose error
+# is sqrt(p(1 - p) / N): at the default 4 rays a penumbra showed five
+# grey levels scattered with an RMS of 0.20. Now a pixel draws TWO
+# hashes, a radial shift h1 and a turn h2, and ray k of N takes
+#
+#     u1 = (k + h1) / N               N equal-area strata, one shared shift
+#     u2 = frac(turn_k + h2)          the pattern's own turn, rotated by h2
+#
+# with turn_k the base-2 radical inverse of k when N is a power of two
+# (the N points are then a (0,2)-net: every dyadic box of area 1/N holds
+# exactly one) and k times the golden ratio's fraction otherwise (evenly
+# spread whatever N is). Measured on half-plane occluders over every
+# orientation, the RMS falls to 0.53 / 0.37 / 0.38 of the old law at
+# 4 / 8 / 16 rays on a disc and 0.61 / 0.50 / 0.40 on a rectangle, for
+# two hashes a pixel instead of two a ray. The disc shapes read the turn
+# as an index into the shared 256-entry circle table (an integer add,
+# identical on every device); the rectangle reads it as its second
+# coordinate.
+
+#: the fraction of the golden ratio: its multiples spread evenly over
+#: [0, 1) for any count
+SOFT_PHI = 0.61803398875
+#: the salt of an averaging road's pass index (the 10000th prime): an
+#: accumulation pass, a lens pass or a motion-blur slice traces its own
+#: rays instead of the first pass's again
+SOFT_PASS_SALT = 104729
+
+
+def soft_ray_salt(light_index, seed, sample_pass=0):
+    """The hash salt of one lamp's soft-ray pattern, wrapped to the 31
+    bits both roads hash (a large Seed must stay a legal GLSL int)."""
+    from . import patterns as PT
+    return PT.wrap_salt(131 * int(light_index) + 7919 * int(seed)
+                        + SOFT_PASS_SALT * int(sample_pass))
+
+
+def soft_ray_turns(samples):
+    """The N rays' turns, as fractions of a full turn in [0, 1): the
+    base-2 radical inverse of k for a power-of-two count, k golden
+    fractions otherwise. Both roads bake THESE numbers."""
+    n = max(int(samples), 1)
+    if n & (n - 1) == 0:
+        out = []
+        for k in range(n):
+            r, f, q = 0.0, 0.5, k
+            while q:
+                r += f * (q & 1)
+                q >>= 1
+                f *= 0.5
+            out.append(r)
+        return out
+    return [(k * SOFT_PHI) % 1.0 for k in range(n)]
+
+
+def soft_ray_turn_index(turn):
+    """A turn as a step through the 256-entry circle table."""
+    return int(round(256.0 * float(turn))) & 255
+
+
+#: a sun's angular diameter never reaches the full half-space: EEVEE's
+#: own ceiling (179.9 degrees). At pi the tangent of the half-angle is
+#: 1.6e16 and every ray left perpendicular to the sun
+SUN_MAX_ANGLE = float(np.radians(179.9))
+#: above this angular diameter (radians) a sun's rays are drawn uniform
+#: in the SOLID ANGLE of its cap. Below it the classic law stands -- a
+#: uniform point in the tangent-plane disc of radius tan(angle / 2) --
+#: which is the same thing to within 1% up to here and crowds the rim
+#: beyond (at 2 rad only 12% of the rays fell inside half the radius,
+#: where a quarter belong)
+SUN_CAP_ANGLE = 0.5
+
+
+def sun_soft_law(angle):
+    """('DISC', tan(a / 2)) or ('CAP', 1 - cos(a / 2)) for a sun of
+    angular diameter `angle`, the constant as the float32 both roads
+    bake."""
+    a = min(max(float(angle), 0.0), SUN_MAX_ANGLE)
+    if a > SUN_CAP_ANGLE:
+        return 'CAP', float(np.float32(1.0 - np.cos(a * 0.5)))
+    return 'DISC', float(np.float32(np.tan(a * 0.5)))
+
+
 def casts_shadow(light, settings):
     """Whether `visibility` could return anything but ones for this
     lamp: its early-outs, as a predicate (R238: the fixed key folds
@@ -1376,11 +1623,23 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
         else:
             soft_on = float(light.radius) > 0.0
         samples = shadow_sample_count(light, settings) if soft_on else 1
+        # Density lightens a traced shadow exactly as it lightens a
+        # mapped one (the map tail's own expression). At the default
+        # 1.0 the visibility is returned untouched: 1 - (1 - v) is not
+        # bitwise v in float32, and a lamp left alone must not move
+        dens = float(getattr(light, 'shadow_density', 1.0))
+
+        def _dense(v):
+            if dens == 1.0:
+                return v
+            return (1.0 - (1.0 - v) * dens).astype(np.float32)
+
         if samples == 1:
             hit = bvh.occluded(origin, L, maxt, mask=mask, cast=cast)
-            return (~hit).astype(np.float32)
+            return _dense((~hit).astype(np.float32))
         acc = np.zeros(n, np.float32)
         t, b = M.orthonormal_basis(L)
+        disk = True
         if kind == 'AREA':
             ax = np.asarray(light.area_x, np.float32)
             ax = ax / max(float(np.linalg.norm(ax)), 1e-9)
@@ -1389,9 +1648,15 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
             lpos = np.asarray(light.position, np.float32)
             disk = str(getattr(light, 'area_shape', 'SQUARE')) \
                 in ('DISK', 'ELLIPSE')
+        elif kind == 'SUN':
+            sun_law, sun_k = sun_soft_law(light.radius)
+            sun_k = np.float32(sun_k)
 
-        def _soft_ray(u1, u2):
-            """(Lj, mt): one soft-shadow ray per pixel from two uniforms.
+        def _soft_ray(u1, ca_, sa_, u2):
+            """(Lj, mt): one soft-shadow ray per pixel. `u1` is the
+            area coordinate, (ca_, sa_) the unit-circle point of the
+            turn and `u2` the turn itself as a fraction (the rectangle's
+            second coordinate; the round shapes never read it).
 
             AREA aims at a real point on the rectangle (or ellipse) --
             penumbras follow the lamp's true shape and size; SUN tilts
@@ -1402,9 +1667,6 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
             if kind == 'AREA':
                 if disk:
                     rr = np.sqrt(u1)
-                    ca_, sa_ = PT.sample_circle(u2) if sample_xy is not None \
-                        else (np.cos(u2 * 2.0 * np.pi),
-                              np.sin(u2 * 2.0 * np.pi))
                     uu, vv = rr * ca_, rr * sa_
                 else:
                     uu, vv = u1 * 2.0 - 1.0, u2 * 2.0 - 1.0
@@ -1413,13 +1675,20 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
                 delta = ps - P
                 ds = np.sqrt(np.maximum((delta * delta).sum(axis=1), EPS))
                 return delta / ds[:, None], ds * (1.0 - 1e-3)
-            ca_, sa_ = PT.sample_circle(u2) if sample_xy is not None \
-                else (np.cos(u2 * 2.0 * np.pi), np.sin(u2 * 2.0 * np.pi))
             if kind == 'SUN':
+                if sun_law == 'CAP':
+                    # a wide sun: uniform in the solid angle of its cap
+                    # (cos of the tilt is uniform between 1 and cos of
+                    # the half-angle). L, t and b are orthonormal, so
+                    # the sum is the unit ray itself
+                    ct = np.float32(1.0) - u1 * sun_k
+                    sn = np.sqrt(np.maximum(np.float32(1.0) - ct * ct,
+                                            np.float32(0.0)))
+                    return (L * ct[:, None] + t * (sn * ca_)[:, None]
+                            + b * (sn * sa_)[:, None]), maxt
                 # the size is Blender's light.angle: tilt the ray inside
                 # that cone, which is what a sun's size IS
-                r = np.sqrt(u1) * np.float32(
-                    np.tan(float(light.radius) * 0.5))
+                r = np.sqrt(u1) * sun_k
                 jitter = t * (r * ca_)[:, None] + b * (r * sa_)[:, None]
                 return M.normalize(L + jitter), maxt
             r = np.sqrt(u1) * np.float32(light.radius)
@@ -1427,26 +1696,41 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
             return M.normalize(L * dist[:, None] + jitter), maxt
 
         if sample_xy is not None:
+            # the stratified pattern (see soft_ray_turns): two hashes
+            # for the pixel, then every ray is arithmetic on them
             from . import patterns as PT
             spx, spy, li = sample_xy
-            seed = int(getattr(settings, 'seed', 0) or 0)
+            z0 = soft_ray_salt(li, getattr(settings, 'seed', 0) or 0,
+                               getattr(settings, '_sample_pass', 0) or 0)
+            h1 = PT.sample_u(spx, spy, z0)
+            h2 = PT.sample_u(spx, spy, z0 + 1)
+            # the hash's own 16-bit integer (h2 * 65535 is exact in
+            # float32), as sample_circle recovers it
+            h2i = np.asarray(h2 * np.float32(65535.0) + np.float32(0.5),
+                             np.float32).astype(np.int64)
+            invn = np.float32(1.0 / samples)
+            turns = soft_ray_turns(samples)
             for k in range(samples):
-                z = 2 * k + 131 * int(li) + 7919 * seed
-                u1 = PT.sample_u(spx, spy, z)
-                u2 = PT.sample_u(spx, spy, z + 1)
-                Lj, mt = _soft_ray(u1, u2)
+                u1 = (np.float32(k) + h1) * invn
+                ai = (h2i + soft_ray_turn_index(turns[k])) & 255
+                u2 = None
+                if not disk:
+                    u2 = np.float32(turns[k]) + h2
+                    u2 = u2 - np.floor(u2)
+                Lj, mt = _soft_ray(u1, PT.CIRCLE256[ai, 0],
+                                   PT.CIRCLE256[ai, 1], u2)
                 acc += (~bvh.occluded(origin, Lj, mt, mask=mask,
                                       cast=cast)).astype(np.float32)
-            return acc / samples
-        from . import patterns as PT                            # noqa: F811
+            return _dense(acc / samples)
         rng = rng or np.random.default_rng(settings.seed)
         for _ in range(samples):
             u1 = np.full(n, rng.random(), np.float32)
             u2 = np.full(n, rng.random(), np.float32)
-            Lj, mt = _soft_ray(u1, u2)
+            Lj, mt = _soft_ray(u1, np.cos(u2 * 2.0 * np.pi),
+                               np.sin(u2 * 2.0 * np.pi), u2)
             acc += (~bvh.occluded(origin, Lj, mt, mask=mask,
                                   cast=cast)).astype(np.float32)
-        return acc / samples
+        return _dense(acc / samples)
 
     sm = light.shadow_map
     if sm is None:
@@ -1459,12 +1743,39 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
     bias = 0.0 if mid else float(light.shadow_bias or settings.shadow_bias)
     ndl = np.clip(M.dot(N, L), 0.0, 1.0)
     slope = bias * (1.0 + 2.0 * (1.0 - ndl))
-    soft = max(float(light.shadow_softness) * settings.shadow_softness, 0.0) \
-        + float(getattr(sm, 'soft_extra', 0.0) or 0.0)
+    # the user's Softness: a constant blur in texels (the lamp's own
+    # dial multiplies the render's)
+    soft = max(float(light.shadow_softness) * settings.shadow_softness, 0.0)
     # normal offset: step off the surface by a texel or so, scaled by how
     # obliquely the light hits. Removes acne without the detached shadows a
     # large constant depth bias produces.
     texel = sm.texel_size(np.linalg.norm(P - sm.origin[None, :], axis=1))
+    shape = SM.lookup_shape(light, shadow_sample_count(light, settings),
+                            soft)
+    if shape is not None:
+        # a SIZED lamp (Radius, a Sun's Angle, an Area's Size) at more
+        # than one Sample -- one Sample is the hard single-tap lookup
+        # below for every lamp, as one traced ray is hard. The penumbra
+        # is measured per receiver: a blocker search over the lamp's
+        # footprint, a width by similar triangles, a filter that wide
+        # (core/softmap.py). Every compare there is made against the
+        # receiver PLANE's depth at the tap, so the offset carries no
+        # blur factor and is scaled DOWN where that plane is exact
+        # (`offset_scale`): nothing lifts the receiver out from under
+        # its caster as the lamp or the Softness grows. A lamp of size
+        # 0 whose Softness is wider than one texel takes the same road
+        # with no lamp term (`SM.zero_shape`): the dial blurs the edge
+        # and no longer shrinks the shadow
+        if mid:
+            offset = np.zeros(n, np.float32)
+        else:
+            offset = texel * (1.5 + 2.5 * np.sqrt(
+                np.maximum(1.0 - ndl * ndl, 0.0))) * SM.offset_scale(ndl)
+        lit = SM.lookup(sm, shape, P + N * offset[:, None], N, ndl, slope,
+                        soft, shadow_sample_count(light, settings),
+                        mask=mask)
+        dens = float(light.shadow_density)
+        return (1.0 - (1.0 - lit) * dens).astype(np.float32)
     if mid:
         offset = np.zeros(n, np.float32)
     else:
@@ -1476,22 +1787,242 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
     return (1.0 - (1.0 - lit) * dens).astype(np.float32)
 
 
-def select_lights(lights, settings, centre=None):
+def limit_reference(scene):
+    """What the Light Limit measures against (R254): (pts, guard, eye).
+
+    `pts` is the 3 x 3 x 3 grid on the bounds of the scene's geometry
+    (27 points, float32; None without vertices) and `guard` 5% of the
+    bounds' diagonal -- Brightest averages what a lamp delivers over
+    them, so it does not depend on the camera and an orbit never changes
+    the set. `eye` is the camera's position, which Nearest measures from
+    (the middle of the bounds for a scene without a camera; None with
+    neither)."""
+    pts, guard, eye = None, 0.0, None
+    verts = getattr(getattr(scene, 'mesh', None), 'verts', None)
+    if verts is not None and len(verts):
+        v = np.asarray(verts, np.float32)
+        lo = v.min(axis=0).astype(np.float64)
+        hi = v.max(axis=0).astype(np.float64)
+        t = np.array([0.0, 0.5, 1.0])
+        g = np.stack(np.meshgrid(t, t, t, indexing='ij'), -1).reshape(-1, 3)
+        pts = (lo[None, :] + g * (hi - lo)[None, :]).astype(np.float32)
+        guard = max(0.05 * float(np.linalg.norm(hi - lo)), 1e-3)
+        eye = (lo + hi) * 0.5
+    mw = getattr(getattr(scene, 'camera', None), 'matrix_world', None)
+    if mw is not None:
+        eye = np.asarray(mw, np.float64)[:3, 3]
+    return pts, guard, eye
+
+
+def limit_strength(light, pts, guard, settings):
+    """What a lamp delivers to the scene, in the light loop's own units:
+    the number the Light Limit's Brightest ranks on (R254).
+
+    A Sun's (or hemi's) strength IS the radiance every surface receives.
+    A point or spot lamp's Power is divided by 4 pi and by its falloff
+    in sample(), so it is ranked on exactly that: |Power| / (4 pi) times
+    the lamp's own law, averaged over the grid on the scene's bounds
+    (limit_reference). No distance is taken below `guard`, so a lamp
+    that sits on a grid point is not ranked at the pole of its own
+    curve. An area lamp reads no falloff: its strength is its form
+    factor (area_inp, Distance and Gamma included) on a surface facing
+    it, averaged the same way -- zero behind its face. A spot ranks as
+    the point lamp it is inside its cone: the cone is not read (weighted
+    at 27 points, a narrow key spot would fall between them).
+
+    The RAW Power, never the style gain: a strobing lamp must not change
+    the selection (and with it the GPU plan) from frame to frame."""
+    k = abs(float(light.energy)) * float(np.mean(light.color))
+    if light.type in ('SUN', 'HEMI'):
+        return k
+    delta = np.asarray(light.position, np.float64)[None, :] \
+        - np.asarray(pts, np.float64)
+    d = np.sqrt((delta * delta).sum(axis=1))
+    if light.type == 'AREA':
+        n = (delta / np.maximum(d, 1e-9)[:, None]).astype(np.float32)
+        w = float(np.mean(area_inp(light, np.asarray(pts, np.float32), n)))
+    else:
+        w = float(np.mean(attenuate(
+            light, np.maximum(d, guard).astype(np.float32), settings)))
+    return k * w / (4.0 * np.pi)
+
+
+def is_ambient_lamp(light):
+    """True for a lamp that is ONLY ambient: the AMBIENT type, and any
+    lamp with Ambient Only ticked (R254).
+
+    Such a lamp feeds the ambient pool (ambient_light_split) and
+    nothing else: it has no direction to shade from, so it is no
+    member of the frame's lamp list -- no diffuse or specular lobe, no
+    shadow, no beam, shaft or flare, no slot under the Light Limit.
+    Ambient Only used to be read by the pool alone: the lamp kept
+    lighting and shadowing as before with the ambient added on top.
+    This is the one predicate every reader of the lamp list asks."""
+    return str(getattr(light, 'type', '')).upper() == 'AMBIENT' or \
+        bool(getattr(light, 'ambient_only', False))
+
+
+def lights_volume(light):
+    """The sign a lamp's scatter takes in a medium (a volume container,
+    its own visible beam): +1.0, -1.0 for a Negative lamp, or 0.0 for a
+    lamp that lights no medium at all -- an ambient lamp (no position)
+    and an Only Shadow lamp (it adds no light anywhere, it only takes
+    it away where its shadow falls on a surface) (R254).
+
+    The media used to read none of the contribution flags: a Negative
+    lamp brightened the fog it should darken, an Only Shadow lamp lit
+    it. +1.0 for every lamp without those flags, so a scene that does
+    not use them marches exactly as before."""
+    if is_ambient_lamp(light) or getattr(light, 'only_shadow', False):
+        return 0.0
+    return -1.0 if getattr(light, 'negative', False) else 1.0
+
+
+#: R254: how the Light Limit chooses. `reference` is limit_reference's
+#: (pts, guard, eye), or a callable returning it that is read only when
+#: the limit actually drops a lamp (frame_lights hands in the scene's):
+#: Brightest ranks on what each lamp delivers over the scene
+#: (limit_strength), Nearest on its distance from the camera with a Sun or
+#: hemi at distance 0 (it reaches everything), ties in scene order, and
+#: the survivors come back in SCENE order -- the order the per-material
+#: light limit and the GPU plan's selection signature both assume.
+#: Without a reference (a bare lamp list, a scene with nothing to measure
+#: against) the ranking is the raw one it always was. A list at or under
+#: the limit comes back untouched.
+def select_lights(lights, settings, reference=None):
     """Emulate a hardware light limit by keeping only the strongest N."""
-    active = [l for l in lights if l.type != 'AMBIENT']
+    active = [l for l in lights if not is_ambient_lamp(l)]
     limit = int(settings.max_lights)
     if limit <= 0 or len(active) <= limit:
         return active
+    # R254: the world's own light (core/worldlight.py) is the sky's sun --
+    # the limit ranks the LAMPS for the slots left beside it and never
+    # drops it. No scene without World Light carries the mark.
+    kept = [l for l in active if getattr(l, 'world_light', False)]
+    if kept:
+        active = [l for l in active if not getattr(l, 'world_light', False)]
+        limit = max(limit - len(kept), 0)
+        if limit == 0:
+            return kept
     if settings.light_limit_mode == 'FIRST':
-        return active[:limit]
-    if settings.light_limit_mode == 'NEAREST' and centre is not None:
-        key = [float(np.linalg.norm(np.asarray(l.position, np.float32) - centre))
-               for l in active]
-        order = np.argsort(key)
-    else:
+        return active[:limit] + kept
+    if callable(reference):
+        reference = reference()
+    pts, guard, eye = reference if reference is not None \
+        else (None, 0.0, None)
+    nearest = settings.light_limit_mode == 'NEAREST'
+    if (eye is None) if nearest else (pts is None):
         key = [float(l.energy) * float(np.mean(l.color)) for l in active]
         order = np.argsort(key)[::-1]
-    return [active[i] for i in order[:limit]]
+        return [active[i] for i in order[:limit]] + kept
+    if nearest:
+        e = np.asarray(eye, np.float64)
+        key = [0.0 if l.type in ('SUN', 'HEMI') else
+               float(np.linalg.norm(np.asarray(l.position, np.float64) - e))
+               for l in active]
+        order = np.argsort(np.asarray(key, np.float64), kind='stable')
+    else:
+        key = [limit_strength(l, pts, guard, settings) for l in active]
+        order = np.argsort(-np.asarray(key, np.float64), kind='stable')
+    # the world's light is the last lamp of the scene (core/worldlight
+    # appends it), so the survivors stay in scene order
+    return [active[i] for i in sorted(int(i) for i in order[:limit])] + kept
+
+
+def frame_lights(scene, settings):
+    """The lamps this frame shades under the Light Limit: the ONE
+    selection the CPU light loop, the GPU plan and its texel repack,
+    the screen-spot fog, the ground plane, the light meter node and the
+    planar shadows all read (R254).
+
+    They used to call select_lights with the bare lamp list, so no
+    caller could say where the scene or the camera was: Nearest never
+    measured a distance and Brightest compared a Sun's strength with a
+    point lamp's watts. Nothing is parked on the scene or the settings:
+    the reference is measured inside the call, and only when the limit
+    actually drops a lamp (a scene at or under it takes the old path
+    and never looks at a vertex)."""
+    return select_lights(getattr(scene, 'lights', None) or [], settings,
+                         reference=lambda: limit_reference(scene))
+
+
+class _NoLimit:
+    """Settings that keep every lamp: frame_lights under it is the list
+    the limit chooses among (limit_report's denominator)."""
+    max_lights = 0
+    light_limit_mode = 'FIRST'
+
+
+#: R254: the last F12's limit report, for the Lighting panel to draw:
+#: {'unlit': [names], 'total': n, 'max_lights': n, 'mode': str}, empty
+#: while every lamp was lit. A report only -- no render reads it.
+LAST_LIMIT_REPORT = {}
+
+
+def limit_report(scene, settings, remember=False):
+    """One line naming the lamps the Light Limit leaves unlit this frame,
+    or None when every lamp is lit. The limit used to drop lamps in
+    silence -- at the factory 8 a ninth lamp simply did nothing.
+    `remember` keeps the answer in LAST_LIMIT_REPORT (the F12 does)."""
+    lights = frame_lights(scene, _NoLimit)
+    kept = {id(l) for l in frame_lights(scene, settings)}
+    out = [str(getattr(l, 'name', '') or l.type) for l in lights
+           if id(l) not in kept]
+    if remember:
+        LAST_LIMIT_REPORT.clear()
+        if out:
+            LAST_LIMIT_REPORT.update(
+                unlit=list(out), total=len(lights),
+                max_lights=int(settings.max_lights),
+                mode=str(settings.light_limit_mode))
+    if not out:
+        return None
+    names = ', '.join(out[:6])
+    if len(out) > 6:
+        names += f' and {len(out) - 6} more'
+    mode = str(settings.light_limit_mode).capitalize()
+    return (f'Light Limit {int(settings.max_lights)} ({mode}): '
+            f'{len(out)} of {len(lights)} lamps are not lit ({names}). '
+            'Raise Light Limit in Render Properties > Lighting, or set it '
+            'to 0 for no limit')
+
+
+#: R254: the flat ambient level above which an ambient lamp is called
+#: out (the panel's red row, the render's report): past 2.0 every
+#: surface is over twice its own colour
+AMBIENT_BRIGHT = 2.0
+
+
+def ambient_level(light):
+    """The flat level an ambient lamp adds to the pool, as one number:
+    its Energy times its strongest colour channel (R254)."""
+    try:
+        col = max(float(c) for c in getattr(light, 'color', (1.0, 1.0, 1.0)))
+    except (TypeError, ValueError):
+        col = 1.0
+    return abs(float(getattr(light, 'energy', 0.0))) * col
+
+
+def ambient_report(scene):
+    """One line naming the ambient lamps (is_ambient_lamp) whose level
+    whites the frame out, or None (R254).
+
+    The pool reads an ambient lamp's Energy as a FLAT level -- colour x
+    Energy, 1.0 = white ambient -- whatever the lamp's kind, where every
+    other use of a Point lamp's Energy divides its watts by 4 pi d^2.
+    Ambient Only ticked on a lamp at a working wattage therefore gives
+    hundreds of times white, and used to say nothing."""
+    out = [(str(getattr(l, 'name', '') or l.type), ambient_level(l))
+           for l in (getattr(scene, 'lights', None) or ())
+           if is_ambient_lamp(l) and ambient_level(l) > AMBIENT_BRIGHT]
+    if not out:
+        return None
+    names = ', '.join(f"'{n}' at level {v:.4g}" for n, v in out[:4])
+    if len(out) > 4:
+        names += f' and {len(out) - 4} more'
+    return (f'Ambient Only: {names}. An ambient lamp\'s Energy is a flat '
+            'level (1.0 = white ambient), not watts, so the frame whites '
+            'out. Lower it in the Light panel, under Ambient Only')
 
 
 def ambient_light_split(scene, settings):
@@ -1781,6 +2312,19 @@ def style_gain(light, time):
     rate = float(getattr(light, 'light_style_rate', 10.0) or 10.0)
     i = int(np.floor(float(time) * rate)) % len(sstr)
     return style_char_gain(sstr[i])
+
+
+def style_step(light, time):
+    """(step, steps) of the lamp's style string at `time` seconds: the
+    0-based character style_gain reads there and the string's length --
+    (0, 1) for NORMAL. For the panel's status line (R254); the same
+    index expression as style_gain."""
+    key = str(getattr(light, 'light_style', 'NORMAL') or 'NORMAL')
+    sstr = LIGHT_STYLES.get(key, 'm')
+    if sstr == 'm':
+        return 0, 1
+    rate = float(getattr(light, 'light_style_rate', 10.0) or 10.0)
+    return int(np.floor(float(time) * rate)) % len(sstr), len(sstr)
 
 
 def apply_light_styles(scene):

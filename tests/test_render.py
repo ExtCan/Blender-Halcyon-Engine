@@ -8371,9 +8371,11 @@ def test_deferred_shading_carries_the_shadows():
           == ['hal_shadowpack'], str(sorted(atlases)))
     entry = atlases.get('hal_shadowpack')
     pack = entry[1]() if entry is not None else None
+    # R254 map-gpu: the pack is ONE channel of depth (it was RGBA32F
+    # with three channels of zeros: `pack.ndim == 3 and shape[2] == 4`)
     check('the combined atlas builds, one row band per light, '
           'cube faces included',
-          pack is not None and pack.ndim == 3 and pack.shape[2] == 4
+          pack is not None and pack.ndim == 2
           and float(np.abs(pack).sum()) > 0.0,
           str(None if pack is None else pack.shape))
 
@@ -15542,14 +15544,17 @@ def test_the_shading_routes_fall():
               any('hal_lk' in s for _m, _n, s, _b in p))
     sc2, st2 = build('light linking (exclude + only)')
     st2.render_device = 'GPU'
-    sc2.lights[-1].exclude_objects = tuple(range(70))
+    # R254: the ladder is one term per RUN of consecutive indices, so the
+    # refusal counts runs: 70 SCATTERED objects still refuse by name (70
+    # in a row are one range test and plan -- tests/test_r254_flags.py)
+    sc2.lights[-1].exclude_objects = tuple(range(0, 140, 2))
     view, _proj, vp, eye = R.camera_matrices(sc2.camera, w, h)
     g3 = raster.GBuffer(w, h)
     raster.rasterize(sc2.mesh.verts, sc2.mesh.tris, vp, w, h, gbuf=g3)
     job3 = R.ShadeJob(sc2, st2, {}, None, view, eye, w, h)
     GSH._PLAN_CACHE.clear()
     p3, why3, _a3 = GSH.plan_frame(job3, g3)
-    check('a 70-object linking list refuses by name',
+    check('a linking list of 70 scattered objects refuses by name',
           p3 is None and '64' in str(why3), str(why3))
 
     # ---- R78: every new gate is in the plan signature. Prime the
@@ -23315,12 +23320,13 @@ def test_light_sizes_actually_work():
 
     SUN's size is an ANGLE and now tilts its shadow rays inside that
     cone; AREA samples real points on its rectangle (penumbras follow
-    the lamp's true shape); every sized lamp blurs its SHADOW MAP too,
-    through a size-derived texel radius stamped on the map at build --
-    with the lamp's size in the map cache key, because a cached map was
-    serving its stale blur. Size zero stays bitwise-identical to the
-    old pictures, and the GPU twins reproduce every new sampler
-    exactly.
+    the lamp's true shape); every sized lamp softens its SHADOW MAP too.
+    R254: the map road measures that penumbra per receiver
+    (core/softmap.py) instead of stamping one size-derived texel radius
+    on the map at build, so the built map carries nothing of the size
+    and a size edit re-bakes nothing (tests/test_r254_map_soft.py holds
+    the laws). Size zero stays bitwise-identical to the old pictures,
+    and the GPU twins reproduce every new sampler exactly.
     """
     from ..core.scene import Light
     from ..core import raster as CR
@@ -23372,16 +23378,22 @@ def test_light_sizes_actually_work():
     sc3.lights = [Light(type='POINT', position=(1.5, 2.5, 4.0),
                         energy=900.0, radius=0.0, shadow='MAP')]
     m_hard = R.render(sc3, stm)
+    sm_hard = sc3.lights[0].shadow_map
     sc3.lights[0].radius = 1.2
     m_soft = R.render(sc3, stm)
     check('a POINT radius blurs its shadow MAP now',
           float(np.abs(m_soft - m_hard).max()) > 1e-3)
-    sc3.lights[0].radius = 0.0
-    check('radius zero maps are the old picture bitwise (cache keyed '
-          'on size)', bool(np.array_equal(R.render(sc3, stm), m_hard)))
+    # R254: the pin here was `hasattr(sm, 'soft_extra')` -- one blur
+    # radius stamped on the map at build, with the size in the cache
+    # key. The penumbra is measured per receiver now, the map carries
+    # nothing of the size, and the sized frame was served the SAME map
     sm = sc3.lights[0].shadow_map
-    check('the size-derived blur is stamped on the built map',
-          hasattr(sm, 'soft_extra'))
+    check('nothing derived from the size is stamped on the built map, '
+          'and a size edit is served the cached map',
+          not hasattr(sm, 'soft_extra') and sm is sm_hard)
+    sc3.lights[0].radius = 0.0
+    check('radius zero maps are the old picture bitwise',
+          bool(np.array_equal(R.render(sc3, stm), m_hard)))
 
     # --- GPU twins agree, sample for sample
     def parity(lights, name, ray=False):
@@ -25281,6 +25293,10 @@ def test_every_node_prop_reaches_the_renderer():
             'gradient-widget bookkeeping; stops serialize instead',
         ('HALCYON_CodeNode', 'needs_rebuild'):
             'compile bookkeeping; the compiled program ships',
+        ('HALCYON_CodeNode', 'source_text'):
+            'never copied verbatim: it is one of the node\'s two sources, '
+            'and _node_props ships the RESOLVED one under this key '
+            '(shaders.compiler.node_source: the assigned Text, else this)',
         ('HALCYON_CodeNode', 'error'): 'compile diagnostics, UI only',
         ('HALCYON_CodeNode', 'warn'): 'compile diagnostics, UI only',
         ('HALCYON_CartoonNode', 'era'):
@@ -29721,6 +29737,72 @@ def test_ink_style_pack():
 
 _PREV_ENGINE = {}
 
+#: the previous releases' sky ray: the one line of `_background_image`
+#: (every release from 1.32 to 1.92.0) and of `sky.mode7_rows` (1.90 on)
+#: that unprojected a pixel through BLAS, and the line that replaces it
+#: in the extracted copy -- (file, the shipped line, the chained line)
+_PREV_SKY_RAY = (
+    ('core/render.py', '    world = pts @ inv.T\n',
+     '    world = _hal_chain_ray(nx, ny, inv)\n'),
+    ('core/sky.py', '        wv = pts @ inv.T\n',
+     '        wv = _hal_chain_ray(nx, ny, inv)\n'),
+)
+_PREV_SKY_RAY_NOTED = set()
+
+
+def _chain_prev_sky_ray(root, zip_name):
+    """Put the extracted previous engine's sky ray on the float32 chain
+    (R253 field round; `mathx.unproject_far` has the measurement).
+
+    The releases computed the ray as `pts @ inv.T`, which is `sgemm`:
+    on a BLAS that fuses multiply-add (OpenBLAS's Haswell-and-later
+    cores) it lands an ulp off the chain at a dozen sky pixels of a
+    96x72 frame, and since this tree's ray IS the chain, every
+    'bitwise the previous release' pin of a frame with sky in it would
+    then measure the machine's BLAS kernel instead of the release.
+    Each shipped line is replaced, line for line, by a call to
+    `_hal_chain_ray`, and THIS tree's `mathx.unproject_far` is appended
+    to the file under that name -- its own source, so there is one
+    chain, and the copy stays whole for a worker process that imports
+    it afresh. On an unfused kernel that is the shipped arithmetic bit
+    for bit (measured: 685 skies, 659 frames), so the pins there are
+    what they were; on a fused one both engines now state the same ray
+    and the pins compare everything else, as they were written to.
+
+    A line is replaced only where it stands EXACTLY once; anything else
+    leaves the file as shipped and says so once -- except a release cut
+    after this fix, whose ray is the chain already: silently as shipped.
+    Returns the files that were chained."""
+    import inspect
+    from ..core import mathx as _M
+    helper = inspect.getsource(_M.unproject_far).replace(
+        'def unproject_far(', 'def _hal_chain_ray(', 1)
+    done = []
+    for rel, shipped, chained in _PREV_SKY_RAY:
+        path = os.path.join(root, *rel.split('/'))
+        if not os.path.exists(path):
+            continue
+        with open(path, 'r', encoding='utf-8') as fh:
+            text = fh.read()
+        if text.count(shipped) != 1 or 'def _hal_chain_ray(' not in helper:
+            # a release cut after this fix already states the chain: there
+            # is no shipped line in it and nothing to say
+            already = text.count(shipped) == 0 and 'unproject_far(' in text
+            if rel == 'core/render.py' and not already and \
+                    (zip_name, rel) not in _PREV_SKY_RAY_NOTED:
+                _PREV_SKY_RAY_NOTED.add((zip_name, rel))
+                print(f'  note {zip_name}: {rel} does not hold the sky ray '
+                      f'line exactly once ({text.count(shipped)}); the '
+                      'previous engine keeps its own ray, and on a fused '
+                      'BLAS its sky is an ulp off this tree\'s')
+            continue
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(text.replace(shipped, chained)
+                     + '\n\n# appended by tests.test_render._prev_engine\n'
+                     + helper)
+        done.append(rel)
+    return done
+
 
 def _prev_engine(zip_name='halcyon-1.70.0.zip'):
     """R228: the PREVIOUS release's WHOLE engine, imported from the
@@ -29728,7 +29810,11 @@ def _prev_engine(zip_name='halcyon-1.70.0.zip'):
     elsewhere) under its own package name, so a frame can be rendered
     by last round's code and compared bitwise with this round's. The
     strongest neutrality pin there is for a feature that must be
-    invisible until asked for."""
+    invisible until asked for.
+
+    One line of it is not the release's: the sky ray is brought onto
+    the float32 chain this tree states (`_chain_prev_sky_ray`), so the
+    comparison never turns on which `sgemm` kernel the machine has."""
     import atexit
     import importlib
     import shutil
@@ -29748,6 +29834,14 @@ def _prev_engine(zip_name='halcyon-1.70.0.zip'):
             pkg = 'halcyon_prev_' + zip_name.replace('.', '_').replace(
                 '-', '_')
             os.rename(os.path.join(d, 'halcyon'), os.path.join(d, pkg))
+            try:
+                _chain_prev_sky_ray(os.path.join(d, pkg), zip_name)
+            except Exception as exc:                            # noqa: BLE001
+                # never the reason a pin cannot run: the engine imports
+                # as shipped and the line says what that costs
+                print(f'  note {zip_name}: the sky ray stays as shipped '
+                      f'({type(exc).__name__}: {exc}); on a fused BLAS '
+                      "its sky is an ulp off this tree's")
             sys.path.insert(0, d)
             mod = importlib.import_module(pkg + '.core.render')
             atexit.register(shutil.rmtree, d, True)

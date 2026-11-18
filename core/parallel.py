@@ -564,6 +564,20 @@ def render_parallel(scene, settings, workers, scene_key=None, progress=None,
     if parts is None:
         return None, pool.error
     joined = np.concatenate(parts, axis=0)
+    # R254: the workers send back pixels only, and the in-process road
+    # sets the light shafts' screen anchors inside render() -- so a
+    # pooled F12 handed the post chain no sources and dropped every
+    # lamp's shafts. The anchors are a pure function of the lamps and
+    # the camera (no buffer is read), so the parent derives them, with
+    # the Y-shear flag render() sets before it builds the same matrix
+    try:
+        from .render import camera_matrices, shaft_sources, yshear_active
+        if scene.camera is not None:
+            scene.camera._yshear = yshear_active(scene.camera, settings)
+        scene.last_shafts = shaft_sources(
+            scene, settings, camera_matrices(scene.camera, W, H)[2])
+    except Exception:                                           # noqa: BLE001
+        scene.last_shafts = None
     if rect is None:
         return joined, None
     # R253: the rect's rows land in a zero full-frame canvas at y0 -- the

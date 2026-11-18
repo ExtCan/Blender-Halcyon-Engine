@@ -22,11 +22,49 @@ import numpy as np
 
 from . import builtins as rt
 from .builtins import BUILTINS
-from .gtypes import (BOOL, FLOAT, INT, UINT, VOID, GType, promote,
+from .gtypes import (BOOL, BY_NAME, FLOAT, INT, UINT, VOID, GType, promote,
                      swizzle_indices)
 from .lexer import ShaderError
 
 MAX_LOOP = 4096
+
+
+def param_type(p):
+    """A parameter's type, its array size included (`vec3 pa[4]`)."""
+    ptype = p[1]
+    if len(p) > 3 and p[3]:
+        return GType(ptype.base, ptype.n, ptype.rows, p[3], ptype.struct)
+    return ptype
+
+
+def param_default(p):
+    """The expression a parameter is declared with (HLSL), or None."""
+    return p[4] if len(p) > 4 else None
+
+
+def arity(fn):
+    """(fewest, most) arguments a call of one function may pass: every
+    parameter up to the last one written without a default, to all of
+    them."""
+    params = fn[3]
+    need = 0
+    for i, p in enumerate(params):
+        if param_default(p) is None:
+            need = i + 1
+    return need, len(params)
+
+
+def count_text(spans):
+    """'1 argument', '1 to 2 arguments', '1 or 3 arguments' -- the
+    argument counts a name accepts, for the message that refuses another."""
+    spans = sorted(set(spans))
+    parts = [str(lo) if lo == hi else f'{lo} to {hi}' for lo, hi in spans]
+    return ' or '.join(parts) + (' argument' if spans == [(1, 1)]
+                                 else ' arguments')
+
+
+def struct_type(name):
+    return GType('struct', 1, 0, 0, name)
 
 
 class Scope:
@@ -84,6 +122,10 @@ class Interpreter:
         self.inputs = []
         self.outputs = []
         self.warnings = []
+        #: every global declaration as (role, entry), in SOURCE order: the
+        #: order run() binds them in and names.py resolves them in, so an
+        #: initialiser sees exactly what is declared above it
+        self.order = []
         for d in decls:
             kind = d[0]
             if kind == 'func':
@@ -94,43 +136,74 @@ class Interpreter:
                     if arr else gtype
                 entry = (name, t, init, quals)
                 if 'uniform' in quals:
-                    self.uniforms.append(entry)
+                    role, into = 'uniform', self.uniforms
                 elif 'in' in quals or 'attribute' in quals or 'varying' in quals:
-                    self.inputs.append(entry)
+                    role, into = 'input', self.inputs
                 elif 'out' in quals:
-                    self.outputs.append(entry)
+                    role, into = 'output', self.outputs
                 else:
-                    self.globals.append(entry)
+                    role, into = 'global', self.globals
+                into.append(entry)
+                self.order.append((role, entry))
+        #: name -> [(fewest, most, function)]: what `pick` reads on every
+        #: call, counted once
+        self.overloads = {name: [arity(f) + (f,) for f in cands]
+                          for name, cands in self.funcs.items()}
+        #: the function the run starts at (None: the shader has none)
+        self.entry = self.find_entry()
+        self.warn_unbound()
+
+    def find_entry(self):
+        """The entry point: `main`, `mainImage`, the HLSL names, else the
+        first function. Among overloads of the name, the one that takes no
+        parameters."""
+        from .codegen import ENTRY_NAMES
+        for name in ENTRY_NAMES:
+            cands = self.funcs.get(name)
+            if cands:
+                return next((f for f in cands if not f[3]), cands[0])
+        for cands in self.funcs.values():
+            return cands[0]
+        return None
+
+    def warn_unbound(self):
+        """What compiles and can only read zero: a declared input, or an
+        entry parameter, whose name the renderer binds nothing to (a
+        misspelled `vNormals`). The generator said so; the interpreter that
+        replaced it kept the list and never wrote to it, so the node's
+        warning box had nothing to show."""
+        from .codegen import INPUT_KEYS, known_input, param_binding
+        for name, _t, _i, _q in self.inputs:
+            if not known_input(name):
+                self.warnings.append(f'unknown input {name!r}: bound to zero')
+        for p in (self.entry[3] if self.entry else ()):
+            if p[0] not in ('out', 'inout') and p[2] and \
+                    param_binding(p[2], param_type(p)) not in INPUT_KEYS:
+                self.warnings.append(f'unknown input {p[2]!r}: bound to zero')
 
     def validate(self):
-        """Reject unknown functions before the shader ever runs.
+        """Reject what the run would refuse before the shader ever runs.
 
         The generator caught these while emitting code. An interpreter would
-        otherwise not notice until a pixel happened to reach the call, which
-        turns a compile error into a render that fails halfway.
+        otherwise not notice until a pixel happened to reach the line, which
+        turns a compile error into a render that fails halfway -- or into no
+        error at all, when the line sits in a branch no lane takes. Unknown
+        functions were checked here first; identifiers, struct fields and
+        swizzles came with shaders/names.py, and the argument count of every
+        call and two vector widths that cannot be combined are checked there
+        too now, each reported with its line.
         """
-        from .gtypes import BY_NAME
-
-        def walk(node):
-            if isinstance(node, tuple) and node and node[0] == 'call':
-                name = node[1]
-                known = (name in self.funcs or name in BUILTINS
-                         or name in BY_NAME or name in self.structs)
-                if not known:
-                    raise ShaderError(f'unknown function {name!r}')
-            if isinstance(node, (tuple, list)):
-                for part in node:
-                    walk(part)
-
-        for cands in self.funcs.values():
-            for fn in cands:
-                walk(fn[4])
+        from .names import NameCheck
+        NameCheck(self).check()
         return self
 
     # ------------------------------------------------------------- entry
     def run(self, uniforms, inputs, n):
         n = int(n)
-        root = Scope()
+        # the root is the scope every function body starts from (call_user)
+        # and the scope a global's initialiser is evaluated in: set before
+        # the first initialiser runs, so it never reads a previous run's
+        self.root = root = Scope()
         # gl_FragCoord is a builtin, in scope without a declaration -- as it
         # is in GLSL. Bound first so a declared `in vec4 gl_FragCoord;`
         # (redundant but accepted) takes the same value over it
@@ -139,47 +212,89 @@ class Interpreter:
         root.put('gl_FragCoord',
                  self.adapt(fc if fc is not None
                             else np.zeros((n, 4), np.float32), fc_t, n), fc_t)
-        for name, t, init, _q in self.uniforms:
-            v = uniforms.get(name)
-            if v is None:
-                v = self.const(init, t, n) if init is not None else self.zero(t, n)
-            root.put(name, self.adapt(v, t, n), t)
-        for name, t, init, _q in self.inputs:
-            # a varying can be supplied under its declared name or under the
-            # binding it maps to, and the generator accepted either
-            from .codegen import VARYINGS
-            v = inputs.get(name)
-            if v is None:
-                bound = VARYINGS.get(name)
-                if bound is not None:
-                    v = inputs.get(bound[0])
-            if v is None:
-                v = self.varying(name, t, n)
-            root.put(name, self.adapt(v, t, n), t)
-        for name, t, init, _q in self.globals:
-            root.put(name, self.const(init, t, n) if init is not None
-                     else self.zero(t, n), t)
-        for name, t, init, _q in self.outputs:
-            root.put(name, self.zero(t, n), t)
+        from .codegen import VARYINGS
+        for role, (name, t, init, _q) in self.order:
+            if role == 'uniform':
+                v = uniforms.get(name)
+                if v is None:
+                    v = self.const(init, t, n, root) if init is not None \
+                        else self.zero(t, n)
+                root.put(name, self.adapt(v, t, n), t)
+            elif role == 'input':
+                # a varying can be supplied under its declared name or under
+                # the binding it maps to, and the generator accepted either
+                v = inputs.get(name)
+                if v is None:
+                    bound = VARYINGS.get(name)
+                    if bound is not None:
+                        v = inputs.get(bound[0])
+                if v is None:
+                    v = self.varying(name, t, n)
+                root.put(name, self.adapt(v, t, n), t)
+            elif role == 'global':
+                root.put(name, self.const(init, t, n, root)
+                         if init is not None else self.zero(t, n), t)
+            else:
+                root.put(name, self.zero(t, n), t)
 
-        self.root = root
-        entry = self.pick('main', 0) or self.pick('mainImage', 0)
-        if entry is None:
-            for cands in self.funcs.values():
-                entry = cands[0]
-                break
+        entry = self.entry
         if entry is None:
             raise ShaderError('no main() in shader')
 
         flags = Flags(n)
         mask = np.ones(n, bool)
-        self.call_user(entry, [], mask, root, flags, n)
+        # the entry is not called by any expression, so its parameters are
+        # bound here: an `in` reads the renderer's input of its name, an
+        # `out` / `inout` starts at zero and is an output of the program.
+        # (It was called with no arguments at all: every parameter read
+        # zero and nothing an `out` parameter was given left the call, so
+        # `void mainImage(out vec4 fragColor, in vec2 fragCoord)` compiled
+        # into a program with no outputs.)
+        values = [self.zero(param_type(p), n) if p[0] in ('out', 'inout')
+                  else self.entry_input(p, inputs, n) for p in entry[3]]
+        result, _rt, inner = self.invoke(entry, values, mask, flags, n)
 
         outs = {}
         for name, t, _i, _q in self.outputs:
             slot = root.get(name)
             outs[name] = slot[0] if slot else self.zero(t, n)
+        for p in entry[3]:
+            # over a global `out` of the same name: inside the entry the
+            # parameter is the one the shader writes
+            if p[0] in ('out', 'inout') and p[2]:
+                outs[p[2]] = inner.get(p[2])[0]
+        if entry[1] != VOID:
+            outs['__return'] = result
         return outs, flags.discard
+
+    def entry_input(self, p, inputs, n):
+        """The value an `in` parameter of the entry point starts with."""
+        from .codegen import param_binding
+        name, t = p[2], param_type(p)
+        v = inputs.get(name) if name else None
+        if v is None and name:
+            key = param_binding(name, t)
+            v = inputs.get(key)
+            if v is None and key == 'fragcoord2':
+                # a caller that hands over gl_FragCoord alone: its xy
+                v = inputs.get('fragcoord')
+        if v is None:
+            return self.zero(t, n)
+        if t.base in ('struct', 'sampler') or t.array or t.is_matrix:
+            return v
+        v = np.asarray(rt.bc(v, n))
+        if t.n > 1:
+            # the parameter's width decides, not the binding's: a vec2 of
+            # the fragment coordinate is its xy, a vec3 of the vertex
+            # colour its rgb, and a scalar fills the vector
+            v = rt.vec(t.n, v)
+        elif v.ndim > 1:
+            v = rt.sw(v, [0])
+        if t.base == 'float':
+            return rt.to_float(v)
+        kind = v.dtype.kind
+        return self.coerce(v, GType('bool' if kind == 'b' else 'float'
+                                    if kind == 'f' else 'int', t.n), t, n)
 
     # -------------------------------------------------------- statements
     def block(self, node, mask, scope, flags, n):
@@ -306,8 +421,13 @@ class Interpreter:
             t = promote(at, bt)
             return rt.sel(cb, self.coerce(a, at, t, n),
                           self.coerce(b, bt, t, n)), t
+        if k == 'seq':
+            # the comma operator: the left side for what it writes, the
+            # right side for the value (`for (...; i++, b += 1.0)`). The
+            # parser has always built the node; the interpreter had no case
+            self.expr(node[1], mask, scope, flags, n)
+            return self.expr(node[2], mask, scope, flags, n)
         if k == 'arrinit':
-            from .gtypes import BY_NAME
             et = BY_NAME.get(node[1])
             if et is None:
                 raise ShaderError(f'unknown array element type {node[1]!r}')
@@ -380,6 +500,10 @@ class Interpreter:
             return rt.to_bool(a) & rt.to_bool(b), BOOL
         if op in ('||', 'or'):
             return rt.to_bool(a) | rt.to_bool(b), BOOL
+        if op == '^^':
+            # the one operator the parser knew and this did not (it fell
+            # through to 'unsupported operator' when a lane reached it)
+            return rt.to_bool(a) ^ rt.to_bool(b), BOOL
         if op in ('==', '!=', '<', '>', '<=', '>='):
             t = promote(at, bt)
             x = self.coerce(a, at, t, n)
@@ -506,11 +630,40 @@ class Interpreter:
 
     # -------------------------------------------------------------- calls
     def pick(self, name, argc):
-        for f in self.funcs.get(name, []):
-            if len(f[3]) == argc:
+        """The function of that name a call with `argc` arguments reaches,
+        or None. It used to answer the first function of the name when no
+        count fitted, and the call went through with the extra arguments
+        dropped and the missing ones zero: the wrong count is refused at
+        compile time now (`wrong_count`, raised from shaders/names.py)."""
+        for lo, hi, f in self.overloads.get(name, ()):
+            if lo <= argc <= hi:
                 return f
-        cands = self.funcs.get(name)
-        return cands[0] if cands else None
+        return None
+
+    def wrong_count(self, name, argc):
+        """The message for a call no function, constructor or builtin of
+        that name takes -- or None when the count is fine. One wording for
+        the three, and one place that knows the counts: the name check asks
+        before the shader runs, `call` below is the backstop."""
+        fields = self.structs.get(name)
+        if fields is not None:
+            if argc == len(fields):
+                return None
+            want = count_text([(len(fields), len(fields))])
+            return f'{name}() takes {want} (one per field), got {argc}'
+        if name in BY_NAME:
+            return None                 # vec3(...), float(...): not judged
+        cands = self.overloads.get(name)
+        if cands:
+            spans = [c[:2] for c in cands]
+        else:
+            impl = BUILTINS.get(name)
+            if impl is None:
+                return None             # an unknown function, said elsewhere
+            spans = [(impl[2], impl[3])]
+        if any(lo <= argc <= hi for lo, hi in spans):
+            return None
+        return f'{name}() takes {count_text(spans)}, got {argc}'
 
     def call(self, node, mask, scope, flags, n):
         name, args = node[1], node[2]
@@ -520,14 +673,14 @@ class Interpreter:
         fn = self.pick(name, len(args))
         if fn is not None:
             return self.call_user(fn, args, mask, scope, flags, n)
-        impl = BUILTINS.get(name)
-        if impl is None:
-            raise ShaderError(f"unknown function {name!r}")
+        # a shader's own function hides the builtin of its name, whatever
+        # the count -- as on a driver
+        impl = None if name in self.funcs else BUILTINS.get(name)
+        if impl is None or not (impl[2] <= len(args) <= impl[3]):
+            raise ShaderError(self.wrong_count(name, len(args))
+                              or f'unknown function {name!r}')
         # (runtime name, return-type rule, min args, max args)
         rt_name, rule, lo, hi = impl
-        if not (lo <= len(args) <= hi):
-            raise ShaderError(f'{name} takes {lo}..{hi} arguments, '
-                              f'got {len(args)}')
         fn = getattr(rt, rt_name, None)
         if fn is None:
             raise ShaderError(f'runtime has no {rt_name!r}')
@@ -543,28 +696,43 @@ class Interpreter:
                                                      else FLOAT)
 
     def call_user(self, fn, args, mask, scope, flags, n):
-        _k, rtype, name, params, body = fn
-        inner = Scope()
-        for name_g, t, init, _q in (self.uniforms + self.inputs + self.globals
-                                    + self.outputs):
-            slot = self.root.get(name_g) if self.root else None
-            if slot is not None:
-                inner.vars[name_g] = slot
-        writeback = []
-        for i, p in enumerate(params):
-            direction, ptype, pname = p[0], p[1], p[2]
-            if len(p) > 3 and p[3]:
-                # array parameter: vec3 pa[4]
-                ptype = GType(ptype.base, ptype.n, ptype.rows, p[3],
-                              ptype.struct)
+        values, writeback = [], []
+        for i, p in enumerate(fn[3]):
+            ptype = param_type(p)
             if i < len(args):
                 v, vt = self.expr(args[i], mask, scope, flags, n)
                 v = self.coerce(v, vt, ptype, n)
+                if p[0] in ('out', 'inout'):
+                    writeback.append((args[i], p[2], ptype))
             else:
-                v = self.zero(ptype, n)
-            inner.put(pname, v, ptype)
-            if direction in ('out', 'inout') and i < len(args):
-                writeback.append((args[i], pname, ptype))
+                # the call left the parameter out, which the count check
+                # allows for one declared with a default alone: the default
+                # is read where it was written, among the globals
+                v, vt = self.expr(param_default(p), mask, self.root, flags, n)
+                v = self.coerce(v, vt, ptype, n)
+            values.append(v)
+        result, rtype, inner = self.invoke(fn, values, mask, flags, n)
+        for target, pname, ptype in writeback:
+            slot = inner.get(pname)
+            if slot is not None:
+                self.store(target, slot[0], ptype, mask, scope, flags, n)
+        return result, rtype
+
+    def invoke(self, fn, values, mask, flags, n):
+        """Run one function over values already bound to its parameters.
+        Returns (result, type, the scope the body ran in) -- the scope is
+        where a caller finds what an `out` parameter was left holding."""
+        _k, rtype, name, params, body = fn
+        # a function body starts from the root's own slots: every global the
+        # shader declares AND the builtin the root binds (gl_FragCoord used
+        # to stop at the root -- declared names were copied one by one, so
+        # the builtin was in scope everywhere except inside a function,
+        # which is everywhere a shader can read it)
+        inner = Scope()
+        if self.root is not None:
+            inner.vars.update(self.root.vars)
+        for p, v in zip(params, values):
+            inner.put(p[2], v, param_type(p))
 
         saved = (self.ret_type, self.ret_val)
         self.ret_type = None if rtype == VOID else rtype
@@ -575,26 +743,26 @@ class Interpreter:
         flags.discard = flags.discard | sub.discard
         result = self.ret_val
         self.ret_type, self.ret_val = saved
-
-        for target, pname, ptype in writeback:
-            slot = inner.get(pname)
-            if slot is not None:
-                self.store(target, slot[0], ptype, mask, scope, flags, n)
         return (result if result is not None else np.zeros(n, np.float32),
-                rtype if rtype != VOID else FLOAT)
+                rtype if rtype != VOID else FLOAT, inner)
 
     def constructor(self, name, args, mask, scope, flags, n):
-        from .gtypes import BY_NAME
+        fields = self.structs.get(name)
+        if fields is not None:
+            # S(a, b): one argument per field, in the order they are
+            # declared, each converted to its field's type. The struct is
+            # looked up in THIS shader's own table and before the builtin
+            # types -- the parser used to register it among those, where
+            # the scalar path below found it first and answered `a`
+            if len(args) != len(fields):
+                raise ShaderError(self.wrong_count(name, len(args)))
+            vals = [self.expr(a, mask, scope, flags, n) for a in args]
+            out = {}
+            for (ftype, fname, _arr), (v, vt) in zip(fields, vals):
+                out[fname] = self.coerce(v, vt, ftype, n)
+            return out, struct_type(name)
         t = BY_NAME.get(name)
         if t is None:
-            if name in self.structs:
-                fields = self.structs[name]
-                vals = [self.expr(a, mask, scope, flags, n) for a in args]
-                out = {}
-                for i, (ftype, fname, _arr) in enumerate(fields):
-                    out[fname] = self.coerce(vals[i][0], vals[i][1], ftype, n) \
-                        if i < len(vals) else self.zero(ftype, n)
-                return out, GType('struct', 1, 1, 0, name)
             return None
         parts = []
         ptypes = []
@@ -743,9 +911,16 @@ class Interpreter:
         except ValueError:
             return np.zeros(n, np.float32), FLOAT
 
-    def const(self, init, t, n):
+    def const(self, init, t, n, scope=None):
+        """A global's initialiser, evaluated in the root as it stands when
+        the declaration is reached: `const float TAU = 2.0 * PI;` reads the
+        PI above it. (It was evaluated in an empty scope, so any name in it
+        raised here, was caught below and the global read zero without a
+        word.)"""
         try:
-            v, vt = self.expr(init, np.ones(n, bool), Scope(), Flags(n), n)
+            v, vt = self.expr(init, np.ones(n, bool),
+                              scope if scope is not None else Scope(),
+                              Flags(n), n)
             return self.coerce(v, vt, t, n)
         except Exception:                                       # noqa: BLE001
             return self.zero(t, n)
@@ -781,11 +956,18 @@ class Interpreter:
     def output_schema_list(self):
         """(glsl name, key in the returned dict, type) -- the same for both,
         because the interpreter returns its outputs keyed by their real name
-        rather than by a generated variable."""
+        rather than by a generated variable. The declared `out` globals,
+        then what the entry point hands back: its `out` / `inout`
+        parameters and the value it returns."""
         outs = [(name, name, t) for name, t, _i, _q in self.outputs]
-        for cands in self.funcs.values():
-            fn = cands[0]
-            if fn[2] in ('main', 'mainImage') and fn[1] != VOID:
+        fn = self.entry
+        if fn is not None:
+            seen = {o[0] for o in outs}
+            for p in fn[3]:
+                if p[0] in ('out', 'inout') and p[2] and p[2] not in seen:
+                    seen.add(p[2])
+                    outs.append((p[2], p[2], param_type(p)))
+            if fn[1] != VOID:
                 outs.append(('__return', '__return', fn[1]))
         return outs
 

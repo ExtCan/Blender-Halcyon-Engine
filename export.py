@@ -13,7 +13,8 @@ import numpy as np
 from . import compat
 from .core.scene import (Camera, ImageBuffer, Light, Material, MeshData,
                          ObjectInfo, Scene, World)
-from .shaders.compiler import try_compile
+from .core.nodeeval import ID_SEP
+from .shaders.compiler import compile_node
 from .core import console as _console
 
 SOCKET_KIND = {
@@ -163,7 +164,10 @@ NODE_PROPS = {
     'HALCYON_RampNode': ('space', 'stops', 'positions', 'easing'),
     'HALCYON_BlurNode': ('taps',),
     'ShaderNodeTexGabor': ('gabor_type',),
-    'HALCYON_CodeNode': ('language', 'as_surface', 'source_text'),
+    # R253 (review): NOT source_text. This table copies properties
+    # verbatim, and the node's inline source is only one of its two
+    # sources; _node_props ships the RESOLVED one under that key
+    'HALCYON_CodeNode': ('language', 'as_surface'),
     # the retro utilities. Dither's pattern and Depth Cue's falloff were
     # MISSING from this table from the day those nodes shipped: the
     # evaluator read the prop, the exporter never copied it, and both
@@ -228,7 +232,13 @@ CURVE_NODES = {'ShaderNodeRGBCurve': 4, 'ShaderNodeFloatCurve': 1,
 VALUE_NODES = {'ShaderNodeRGB', 'ShaderNodeValue', 'ShaderNodeNormal'}
 
 
-def _node_props(node, images, programs, warnings):
+def _node_props(node, images, programs, warnings, key=None):
+    """One node's shipped properties. `key` is the node's graph id
+    (`node_id`): what a Coded Shader's compiled program is filed under.
+    Left out, it is the node's bare name -- right for a node of the
+    material's own tree and for nothing below it."""
+    if key is None:
+        key = node_id(node.name)
     props = {}
     for name in NODE_PROPS.get(node.bl_idname, ()):
         if hasattr(node, name):
@@ -288,7 +298,13 @@ def _node_props(node, images, programs, warnings):
         # the engine never sees collections, only the name list
         gname = str(getattr(node, 'light_group', '') or '')
         if gname:
+            # R254: this module has no module-level bpy, so the lookup
+            # below raised NameError, the guard swallowed it, and EVERY
+            # Light Group resolved to no lamps in Blender. The core reads
+            # an empty list as no group at all: the material took every
+            # lamp while the warning blamed the collection
             try:
+                import bpy
                 coll = bpy.data.collections.get(gname)
             except Exception:                                   # noqa: BLE001
                 coll = None
@@ -345,11 +361,31 @@ def _node_props(node, images, programs, warnings):
             props['direction'] = socket_default(outs[0]) if outs else [0, 0, 1]
 
     if node.bl_idname == 'HALCYON_CodeNode':
-        prog, err = _compile_node(node)
+        prog, err, src = _compile_node(node)
+        # R253 (review): the graph carries the source the program was
+        # compiled FROM -- the assigned Text when there is one, the inline
+        # source_text when there is none (shaders.compiler.node_source) --
+        # and this is the only line that writes the key. The GPU emitter
+        # inlines props.source_text as GLSL; it used to arrive as a verbatim
+        # copy of the inline property, so a node with a Text assigned ran
+        # the Text on the CPU and the starter shader in the deferred pass.
+        # Riding the graph also puts the Text's contents in the GPU plan's
+        # signature (gpu/shade._mat_sig hashes the graph, not the programs):
+        # an edit in the Text Editor re-plans instead of hitting the cache
+        props['source_text'] = src
+        # R253 (review): filed under the node's GRAPH ID, not its name. One
+        # `programs` dict serves the material's tree and every group tree
+        # under it, and a name is unique per tree only: the material's
+        # "Coded Shader" and a group's "Coded Shader" (the default name,
+        # twice) left ONE program, the last compiled, and the other node
+        # ran it under its own sockets. The id is the node's path
+        # (`node_id`), which is what the evaluator and the emitter look a
+        # program up by; the warning names the node the same way, so two
+        # same-named nodes that fail to compile can be told apart
         if prog is not None:
-            programs[node.name] = prog
+            programs[key] = prog
         elif err:
-            warnings.append(f"{node.name}: {err}")
+            warnings.append(f"{key}: {err}")
 
     if node.bl_idname == 'HALCYON_ObjectMapNode':
         # R253: the picked object's frame travels with the material
@@ -412,6 +448,14 @@ def object_map_props(node, warnings):
         kind = str(getattr(ob, 'type', '') or '')
         sub = str(getattr(getattr(ob, 'data', None), 'type', '') or '')
     out['object_inv'] = [_lit8(x) for x in inv[:3, :].reshape(-1)]
+    if kind == 'LIGHT':
+        # R254: this material carries a LAMP's frame (and a spot's cone
+        # below). The viewport's lights-only export shares the parked
+        # materials, so it must stand down for a scene that holds one
+        # (export_lights_into): the projection stayed at the old pose
+        # while the lamp moved. Written for a lamp only -- every other
+        # node's props are what they were
+        out['object_is_light'] = True
 
     mode = str(getattr(node, 'mode', 'AUTO') or 'AUTO')
     data = getattr(ob, 'data', None)
@@ -451,16 +495,12 @@ def object_map_props(node, warnings):
 
 
 def _compile_node(node):
-    src = ''
-    text = getattr(node, 'source', None)
-    if text is not None and hasattr(text, 'as_string'):
-        src = text.as_string()
-    if not src:
-        src = getattr(node, 'source_text', '') or ''
-    if not src.strip():
-        return None, None
-    lang = getattr(node, 'language', 'GLSL')
-    return try_compile(src, lang)
+    """(program, error, source) of a Coded Shader node, by the one rule
+    the node editor compiles by (shaders.compiler.compile_node -- the same
+    call HALCYON_CodeNode.compile_source makes). R253 (review): this used
+    to resolve the source itself, and differently -- an EMPTY assigned
+    Text fell back to the inline source the editor never looked at."""
+    return compile_node(node)
 
 
 # ------------------------------------------------------------- tree flatten
@@ -497,9 +537,47 @@ def canonical_socket_name(sock):
     return name
 
 
+#: ID_SEP, what joins the steps of a group-internal node's path into its
+#: graph id, is imported at the top of this file from core/nodeeval.py:
+#: the core may not import this file, and `desugar_master_bump` writes the
+#: one id that is not written here -- a node synthesized inside a group's
+#: tree at render time (`nodeeval.synth_bump_id`)
+
+
+def node_id(name, path=''):
+    """A node's id in the serialized graph: its name behind `path`, the
+    id of the group node whose tree it sits in plus ID_SEP ('' for a node
+    of the material's own tree).
+
+    R253 (review): Blender keeps node names unique PER TREE, and a
+    material is several trees -- its own and one per node group, nested
+    to any depth, each instanced any number of times. Everything that is
+    filed per node across the whole material was filed under the bare
+    name: the compiled Coded Shader programs (one dict handed down the
+    group recursion) and the Bump pre-pass fields
+    (`core/render._bump_height_fields`, keyed (material, node id)). Two
+    nodes that shared a name across trees shared the entry. The id is
+    the PATH instead -- 'Coded Shader' in the material, 'Group/Coded
+    Shader' inside the group node 'Group', 'Group.001/Coded Shader'
+    inside a second instance of the same group, 'Outer/Inner/Coded
+    Shader' two levels down -- and it is written in ONE place, here, so
+    the graph's node keys, its links, `group_output` and the `programs`
+    keys cannot disagree.
+
+    A name may itself contain the separator, so each step is escaped
+    ('/' -> '\\/', '\\' -> '\\\\'): no two different paths spell one id
+    -- a node NAMED 'Group/Coded Shader' beside a group node 'Group'
+    holding a 'Coded Shader' included. A name with neither character is
+    its own id, which is every name Blender hands out.
+    """
+    step = str(name).replace('\\', '\\\\').replace(ID_SEP, '\\' + ID_SEP)
+    return path + step
+
+
 def serialize_tree(tree, images, programs, warnings, output_type='OUTPUT_MATERIAL',
-                   depth=0):
-    """Flatten a node tree into plain dicts. Groups recurse."""
+                   depth=0, path=''):
+    """Flatten a node tree into plain dicts. Groups recurse, and every
+    node below the top tree carries its path in its id (`node_id`)."""
     if tree is None or depth > 12:
         return None
     nodes = {}
@@ -507,7 +585,7 @@ def serialize_tree(tree, images, programs, warnings, output_type='OUTPUT_MATERIA
     group_output_id = None
 
     for node in tree.nodes:
-        nid = node.name
+        nid = node_id(node.name, path)
         idname = node.bl_idname
         if idname == 'NodeFrame':
             continue
@@ -516,7 +594,7 @@ def serialize_tree(tree, images, programs, warnings, output_type='OUTPUT_MATERIA
         entry = {
             'id': nid,
             'bl_idname': idname,
-            'props': _node_props(node, images, programs, warnings)
+            'props': _node_props(node, images, programs, warnings, nid)
             if idname != 'NodeMuted' else {},
             'inputs': [],
             'outputs': [],
@@ -530,7 +608,7 @@ def serialize_tree(tree, images, programs, warnings, output_type='OUTPUT_MATERIA
                     oi = list(from_node.outputs).index(lk.from_socket)
                 except ValueError:
                     oi = 0
-                link = [from_node.name, oi]
+                link = [node_id(from_node.name, path), oi]
             entry['inputs'].append({
                 'name': canonical_socket_name(sock),
                 'label': sock.name,
@@ -553,7 +631,8 @@ def serialize_tree(tree, images, programs, warnings, output_type='OUTPUT_MATERIA
 
         if idname == 'ShaderNodeGroup' and getattr(node, 'node_tree', None):
             sub = serialize_tree(node.node_tree, images, programs, warnings,
-                                 output_type=None, depth=depth + 1)
+                                 output_type=None, depth=depth + 1,
+                                 path=nid + ID_SEP)
             entry['group'] = sub
 
         if idname == 'NodeGroupOutput' and getattr(node, 'is_active_output', True):
@@ -1086,6 +1165,174 @@ def _mesh_arrays(me, matrix, mat_offset, obj_index):
 
 # ------------------------------------------------------------------- lights
 
+#: R254: the Distance at which Blender Internal's area form factor
+#: (pow(stokes * dist^2 / A, gamma), energy / 4 pi) gives Blender's own
+#: watts. Far from the lamp stokes = 2 A cos cos' / r^2, so the pixel is
+#: albedo * P * D^2 cos cos' / (2 pi^2 r^2). Blender's Area lamp is a
+#: one-sided Lambertian face of flux P, radiance P / (pi A) (EEVEE
+#: shape_radiance_get; Cycles renders the same), which lights that
+#: pixel albedo * P cos cos' / (pi^2 r^2) -- four times a Point lamp of
+#: the same Power on its axis. The ratio D^2 / 2 is 1 at D = sqrt(2)
+#: (and 312.5 at the Distance dial's factory 25)
+AREA_WATTS_DISTANCE = math.sqrt(2.0)
+
+
+def area_power_units(hs):
+    """The power units an Area lamp's panel carries: 'WATTS' (Blender's)
+    or 'BI' (Blender Internal: Power times Distance squared). A lamp
+    without the property -- a test's fake settings, a panel older than
+    the option -- is the lamp it always was, 'BI'."""
+    return str(getattr(hs, 'area_power', 'BI') or 'BI')
+
+
+def area_blender_watts(energy, distance, units):
+    """What an Area lamp gives in Blender's watts: the Power itself
+    under 'WATTS', Power * Distance^2 / 2 under 'BI' (Gamma 1; the
+    panel prints it beside the Distance dial)."""
+    if units == 'WATTS':
+        return float(energy)
+    d = max(float(distance), 1e-6)
+    return float(energy) * d * d / 2.0
+
+
+def bke_light_area(la, mw):
+    """Blender's BKE_light_area (blenkernel/intern/light.cc), the factor
+    a lamp with Normalize OFF is multiplied by: an Area lamp's face
+    (Size times the object's scale, pi / 4 of it for the round shapes),
+    4 pi r^2 for a Point or Spot of Radius r (4 at Radius 0), and
+    pi sin^2(angle / 2) for a Sun (1 at Angle 0)."""
+    kind = str(getattr(la, 'type', 'POINT'))
+    if kind == 'AREA':
+        shape = str(getattr(la, 'shape', 'SQUARE'))
+        sx = float(getattr(la, 'size', 1.0))
+        sy = float(getattr(la, 'size_y', sx)) \
+            if shape in ('RECTANGLE', 'ELLIPSE') else sx
+        a = (sx * float(np.linalg.norm(mw[:3, 0]))) \
+            * (sy * float(np.linalg.norm(mw[:3, 1])))
+        return a * (math.pi / 4.0) if shape in ('DISK', 'ELLIPSE') else a
+    if kind == 'SUN':
+        h = float(getattr(la, 'angle', 0.0)) * 0.5
+        return math.pi * math.sin(h) ** 2 if h > 0.0 else 1.0
+    r = float(getattr(la, 'shadow_soft_size', 0.0))
+    return 4.0 * math.pi * r * r if r > 0.0 else 4.0
+
+
+def spot_scale_fold(lt, mw):
+    """R254: a Spot's OBJECT scale shapes its cone, as in Blender
+    (eevee_light.cc: spot_size_inv = scale.z / scale.xy, the tangent to
+    the axis divided by scale.x / scale.z across and scale.y / scale.z
+    up). Unit and uniform scale return at once: the lamp it was.
+
+    The wider of the two ratios, k, is FOLDED into the exported angles,
+    so every reader of the cone on both roads (the cone laws, the
+    shadow buffer, the beam, the slide, its focus blur) follows without
+    knowing: the half-angle becomes atan(k tan(half)), and Blend is
+    re-derived so the full-strength edge lands where Blender puts it
+    (inner = acos(ci + (1 - ci) blend) in the scaled frame). The POV
+    hotspot angle moves the same way. When the two ratios differ the
+    cone is an ellipse: spot_scale carries what is left for the
+    narrower axis (core/lights.scaled_cos and its GLSL twin)."""
+    nx = float(np.linalg.norm(mw[:3, 0]))
+    ny = float(np.linalg.norm(mw[:3, 1]))
+    nz = float(np.linalg.norm(mw[:3, 2]))
+    if min(nx, ny, nz) <= 1e-12:
+        return
+    kx = nx / nz
+    ky = ny / nz
+    if abs(kx - 1.0) <= 1e-6 and abs(ky - 1.0) <= 1e-6:
+        return
+    k = max(kx, ky)
+    lim = math.radians(89.9)
+    half = min(float(lt.spot_size) * 0.5, lim)
+    ci = math.cos(half)
+    inner = math.acos(min(max(ci + (1.0 - ci) * float(lt.spot_blend),
+                              -1.0), 1.0))
+    half_k = min(math.atan(k * math.tan(half)), lim)
+    inner_k = math.atan(k * math.tan(min(inner, lim)))
+    co = math.cos(half_k)
+    lt.spot_size = 2.0 * half_k
+    lt.spot_blend = max((math.cos(inner_k) - co) / max(1.0 - co, 1e-12),
+                        1e-3)
+    hot = float(getattr(lt, 'hotspot', 0.0) or 0.0)
+    if hot > 0.0:
+        lt.hotspot = 2.0 * math.atan(k * math.tan(min(hot * 0.5, lim)))
+    if abs(kx - ky) > 1e-6 * k:
+        lt.spot_scale = (k / kx, k / ky)
+
+
+def _native_light_options(ob, la, hs, lt, kind, mw):
+    """R254: Blender's OWN light options, with Blender's own meaning.
+
+    Every statement is gated on the option being moved off its default,
+    so a default lamp exports the fields it always did. Energy, colour,
+    the cone angles and the two lobe switches already travel on both
+    roads; only the elliptical cone needed a field (spot_scale)."""
+    # Exposure: BKE_light_power = energy * 2^exposure
+    ex = float(getattr(la, 'exposure', 0.0) or 0.0)
+    if ex != 0.0:
+        lt.energy = lt.energy * (2.0 ** ex)
+    # Temperature: BKE_light_color multiplies the colour (the Tint) by
+    # the blackbody colour. Blender's own value is read, so no table
+    if getattr(la, 'use_temperature', False):
+        tc = getattr(la, 'temperature_color', None)
+        if tc is not None:
+            lt.color = tuple(float(c) * float(t)
+                             for c, t in zip(lt.color[:3], tuple(tc)[:3]))
+    # Normalize off: the lamp's power grows with its size
+    if not getattr(la, 'normalize', True):
+        lt.energy = lt.energy * bke_light_area(la, mw)
+    if kind == 'SPOT':
+        spot_scale_fold(lt, mw)
+        # Blender's own Square survives its versioning of a 2.79 file
+        # opened directly; it is Blender Internal's cone exactly
+        if getattr(la, 'use_square', False):
+            lt.spot_square = True
+    if kind == 'AREA':
+        # a lamp mirrored across ONE of its face axes (object scale -1
+        # in X or in Y: half of a mirrored rig) winds its face the
+        # other way, and the form factor of a face seen from behind is
+        # zero -- the lamp lit nothing. Blender keeps the handedness
+        # (eevee_light.cc Light::sync negates the Y axis), so the lamp
+        # goes on shining along its -Z; an unmirrored lamp runs nothing
+        ax = np.asarray(lt.area_x, np.float32)
+        ay = np.asarray(lt.area_y, np.float32)
+        if float(np.dot(np.cross(ax, ay), mw[:3, 2])) < 0.0:
+            lt.area_y = tuple(-ay)
+    if kind == 'AREA' and hs is not None \
+            and area_power_units(hs) == 'WATTS':
+        # Power in Blender's watts: the form factor normalised at the
+        # one Distance where it IS watts. The hidden Falloff menu and
+        # the render's default no longer reach the lamp either (Custom
+        # Range would cut its beam at that Distance): an Area lamp
+        # never attenuates, on both roads.
+        # Blender keeps the POWER under object scale (the face grows,
+        # its radiance drops), and so does the lamp as exported: the
+        # scale is folded into the Size above, and the form factor is
+        # normalised by that true face
+        lt.decay_end = AREA_WATTS_DISTANCE
+        lt.decay = 'INVERSE_SQUARE'
+    elif kind == 'AREA':
+        # Blender Internal's units: the matrix scale was a GAIN of
+        # scale_x * scale_y on the form factor ("the matrix size works
+        # on energy"), and every older file was lit that way. With the
+        # scale folded into the Size the face is the true one and the
+        # shadow softens with it; the gain is put back here, so a
+        # scaled lamp of an older file keeps its brightness
+        nx = float(np.linalg.norm(mw[:3, 0]))
+        ny = float(np.linalg.norm(mw[:3, 1]))
+        if (abs(nx - 1.0) > 1e-5 or abs(ny - 1.0) > 1e-5) \
+                and nx * ny > 1e-12:
+            lt.energy = lt.energy * (nx * ny) ** float(lt.area_gamma)
+    # Influence: Blender's Diffuse / Glossy factors at exactly 0 and
+    # the lamp OBJECT's ray visibility (EEVEE multiplies each lobe by
+    # both, eevee_light.cc Light::sync) are the lobe switched off
+    if float(getattr(la, 'diffuse_factor', 1.0)) == 0.0 \
+            or not getattr(ob, 'visible_diffuse', True):
+        lt.affect_diffuse = False
+    if float(getattr(la, 'specular_factor', 1.0)) == 0.0 \
+            or not getattr(ob, 'visible_glossy', True):
+        lt.affect_specular = False
+
 
 def export_light(ob, matrix, unit_scale=1.0):
     la = ob.data
@@ -1118,6 +1365,20 @@ def export_light(ob, matrix, unit_scale=1.0):
         lt.area_shape = la.shape
         lt.area_x = tuple(mw[:3, 0])
         lt.area_y = tuple(mw[:3, 1])
+        # The object's scale multiplies the lamp's Size, as Blender
+        # does it (EEVEE: area.size *= scale.xy): S in the viewport
+        # makes the lamp BIGGER. The raw matrix columns used to carry
+        # the scale into the lit contour alone -- the emitting area
+        # the energy is divided by and the shadow rays' rectangle
+        # still read the unscaled Size, so a lamp scaled x4 lit the
+        # floor sixteen times brighter and its penumbra did not move.
+        # An unscaled lamp takes the lines above untouched
+        sxw = float(np.linalg.norm(mw[:3, 0]))
+        syw = float(np.linalg.norm(mw[:3, 1]))
+        if abs(sxw - 1.0) > 1e-5 or abs(syw - 1.0) > 1e-5:
+            lt.area_size = (sx * sxw, sy * syw)
+            lt.area_x = tuple(mw[:3, 0] / max(sxw, 1e-9))
+            lt.area_y = tuple(mw[:3, 1] / max(syw, 1e-9))
         if hs is not None:
             lt.area_gamma = float(getattr(hs, 'area_gamma', 1.0) or 1.0)
     if hs is not None:
@@ -1158,7 +1419,11 @@ def export_light(ob, matrix, unit_scale=1.0):
         lt.exclude_mode = getattr(hs, 'exclude_mode', 'EXCLUDE')
         coll = getattr(hs, 'exclude_collection', None)
         if coll is not None:
-            lt.exclude_names = {o.name for o in coll.all_objects}
+            # a set even when the collection is EMPTY: "a collection is
+            # picked" is what tells 'Only nothing' from no link at all
+            # (_resolve_links). R254: library-qualified link names
+            lt.exclude_names = {compat.link_name(o)
+                                for o in coll.all_objects}
         # R253 light options: every new dial through getattr with the
         # dataclass default -- an older panel (or a test's fake hs
         # without the fields) exports the inert lamp
@@ -1204,12 +1469,56 @@ def export_light(ob, matrix, unit_scale=1.0):
         lt.shadow = 'MAP' if getattr(la, 'use_shadow', True) else 'NONE'
     if not getattr(la, 'use_shadow', True):
         lt.shadow = 'NONE'
+    _native_light_options(ob, la, hs, lt, kind, mw)
     # the lamp's own axes, so a projected texture turns with the object
     lt.frame_x = tuple(mw[:3, 0] / max(float(np.linalg.norm(mw[:3, 0])),
                                        1e-9))
     lt.frame_y = tuple(mw[:3, 1] / max(float(np.linalg.norm(mw[:3, 1])),
                                        1e-9))
     return lt
+
+
+def _resolve_links(lights, objects):
+    """Light linking: the names of a lamp's linked collection -> the
+    object indices the renderer works in (Light.exclude_objects).
+
+    R254. The old resolver kept ONE index per name, so of three
+    instances of a linked object only the last was affected, and a lamp
+    linked to the collection holding the instancer empties reached
+    nothing (an instancer is no exported object). Every exported row of
+    a name answers now, and every row INSTANCED BY a named object
+    (ObjectInfo.instancer). Names are the library-qualified link names
+    (compat.link_name), falling back to the plain name for a row built
+    without one.
+
+    A collection that is picked but resolves to no rendered object
+    writes (-1,) under 'Only': no object carries that index, so the
+    lamp lights nothing on either road -- 'nothing but the collection'.
+    It used to write (), which both roads read as 'no link at all'.
+    Under 'Exclude' an unresolved link leaves the lamp unlinked."""
+    by_name, by_inst = {}, {}
+    for i, o in enumerate(objects or ()):
+        if o is None:
+            continue
+        by_name.setdefault(getattr(o, 'link_name', '') or o.name,
+                           []).append(i)
+        par = getattr(o, 'instancer', '') or ''
+        if par:
+            by_inst.setdefault(par, []).append(i)
+    for lt in lights:
+        names = getattr(lt, 'exclude_names', None)
+        if names is None:
+            continue
+        idx = set()
+        for n in names:
+            idx.update(by_name.get(n, ()))
+            idx.update(by_inst.get(n, ()))
+        if idx:
+            lt.exclude_objects = tuple(sorted(idx))
+        elif str(getattr(lt, 'exclude_mode', 'EXCLUDE')) == 'ONLY':
+            lt.exclude_objects = (-1,)
+        else:
+            lt.exclude_objects = ()
 
 
 # ------------------------------------------------------------------ the job
@@ -1270,6 +1579,7 @@ _DIRTY_OBJS = set()       # object tokens whose entries must be dropped
 _DIRTY_DATA = set()       # data session_uids whose entries must be dropped
 _DIRTY_ALL = False
 _DIRTY_ALL_BY = None      # the ID type name that last set _DIRTY_ALL
+_DIRTY_RENDER = None      # the ID type that outdated the RENDER pool (R254)
 _CACHE_ARMED = False
 
 #: ID type names whose updates cannot change any object's evaluated mesh
@@ -1290,11 +1600,31 @@ _CACHE_ARMED = False
 #: its OBJECT, whose own update dirties it -- the same dependency
 #: propagation Image and Texture already trust. Everything not named
 #: here still flushes the whole cache -- unknown means dirty.
+#
+# R254: light DATA reports as its concrete subclass (PointLight, never
+# Light), so the name above never matched and every lamp edit flushed
+# the whole pool: the split line read 'dirt ALL(PointLight)' after a
+# Power tick. The four subclasses are named now, and the Freestyle line
+# style beside them (every new depsgraph lists one; it draws lines and
+# cannot reach a mesh).
 _IRRELEVANT_IDS = frozenset({
     'Material', 'Image', 'Texture', 'ImageTexture', 'Light', 'World',
+    'PointLight', 'SunLight', 'SpotLight', 'AreaLight',
+    'FreestyleLineStyle',
     'Camera', 'Scene', 'Collection', 'ViewLayer', 'ShaderNodeTree',
     'CompositorNodeTree', 'TextureNodeTree', 'Brush', 'Palette',
     'Screen', 'WindowManager', 'WorkSpace'})
+
+#: R254. Three of the names above CAN change a mesh: an image or a texture
+#: that a Displace / Warp / Wave modifier (or a node tree's Image input)
+#: reads. Blender reports the texture and does NOT re-evaluate the object
+#: (measured: a displacement image rewritten on disk and reloaded reports
+#: ['ImageTexture'] alone), so the viewport depsgraph keeps showing the
+#: old mesh and the VIEWPORT pool agrees with it. A RENDER depsgraph is
+#: built new for every F12 and evaluates the new picture: every RENDER
+#: entry is dropped when one of these is reported (2106 px of stale
+#: displacement on the F12 after a reload otherwise).
+_RENDER_FEEDS = frozenset({'Image', 'Texture', 'ImageTexture'})
 
 #: geometry datablock types whose session_uid IS a cache key prefix
 _GEOM_DATA_IDS = frozenset({'Mesh', 'Curve', 'SurfaceCurve', 'TextCurve',
@@ -1320,9 +1650,16 @@ def _obj_token(ob):
 
 
 @_persistent
-def _watch_updates(scene, depsgraph):
-    """depsgraph_update_post: turn Blender's update report into dirt."""
-    global _DIRTY_ALL, _DIRTY_ALL_BY
+def _watch_updates(scene, depsgraph, heard=None):
+    """depsgraph_update_post: turn Blender's update report into dirt.
+
+    `heard` (R254, _on_frame_change only): the tokens of the objects whose
+    every edit the main depsgraph has already reported here. With it the
+    list is a newly built RENDER depsgraph's, which names every ID it
+    holds: an object in `heard` is skipped, any other object is dirtied
+    as always, and the non-object IDs are skipped too (each cached entry
+    belongs to an object, and every object is either heard or dirtied)."""
+    global _DIRTY_ALL, _DIRTY_ALL_BY, _DIRTY_RENDER
     if not _CACHE_ARMED:
         return
     try:
@@ -1338,13 +1675,18 @@ def _watch_updates(scene, depsgraph):
                 # correct one
                 tok = _obj_token(idb)
                 if tok is not None:
-                    _DIRTY_OBJS.add(tok)
+                    if heard is None or tok not in heard:
+                        _DIRTY_OBJS.add(tok)
                 else:
                     _DIRTY_ALL = True
                     _DIRTY_ALL_BY = t
                     return
                 continue
+            if heard is not None:
+                continue
             if t in _IRRELEVANT_IDS:
+                if t in _RENDER_FEEDS:
+                    _DIRTY_RENDER = t
                 continue
             uid = getattr(idb, 'session_uid', None)
             if t in _GEOM_DATA_IDS and uid is not None:
@@ -1389,6 +1731,15 @@ def _on_frame_change(scene, depsgraph=None):
     walks through the ordinary targeted dirt. A real frame step (an
     animation render, playback, scrubbing) still flushes whole,
     exactly as before.
+
+    R254: on an F12 that depsgraph is the RENDER depsgraph Blender has
+    just built, and a newly built depsgraph lists every ID it holds --
+    so 'whatever it lists' was every object of the scene, and no F12
+    ever reused a cached mesh ('meshes live 62 cached 0' with nothing
+    edited). Edits do not need that list: they arrive through
+    depsgraph_update_post of the main depsgraph before the render
+    starts. _heard_objects says which objects that is true for; they are
+    skipped, and every other object is dirtied as before.
     """
     global _DIRTY_ALL, _DIRTY_ALL_BY
     if not _CACHE_ARMED:
@@ -1403,12 +1754,148 @@ def _on_frame_change(scene, depsgraph=None):
             _LAST_FRAME.pop(next(iter(_LAST_FRAME)))
         if last == (fr, sub):
             if depsgraph is not None:
-                _watch_updates(scene, depsgraph)
+                _watch_updates(scene, depsgraph,
+                               heard=_heard_objects(depsgraph))
             return
     except Exception:                                           # noqa: BLE001
         pass
     _DIRTY_ALL = True
     _DIRTY_ALL_BY = 'frame'
+
+
+#: the handler lists whose functions run between the main depsgraph's
+#: last report and the export of an F12: an edit made there is seen by
+#: the RENDER depsgraph alone
+_RENDER_HOOKS = ('render_init', 'render_pre', 'frame_change_pre',
+                 'frame_change_post')
+
+
+def _foreign_render_hooks(bpy):
+    """True when a function that is not this add-on's sits in one of
+    _RENDER_HOOKS (another add-on, a script in the file)."""
+    root = __name__.rpartition('.')[0]
+    for name in _RENDER_HOOKS:
+        for fn in getattr(bpy.app.handlers, name, ()) or ():
+            mod = str(getattr(fn, '__module__', '') or '')
+            if not root or not (mod == root or mod.startswith(root + '.')):
+                return True
+    return False
+
+
+#: modifier types whose result can change with no depsgraph update: they
+#: read a file or a baked cache at evaluation (a point cache, an Alembic
+#: archive, an ocean or fluid bake), or run a node tree that may sample
+#: an image
+_OUTSIDE_MODIFIERS = frozenset({'NODES', 'MESH_CACHE', 'MESH_SEQUENCE_CACHE',
+                                'OCEAN', 'FLUID'})
+
+
+def _reads_outside(ob):
+    """True when the object's evaluated mesh can change while the
+    viewport depsgraph reports nothing, so that only a newly built RENDER
+    depsgraph sees it; such an object is never taken as heard.
+
+    * a driver on the object, its data or its shape keys: a scripted
+      driver can read a file or a module global;
+    * a modifier that reads a texture (Displace, Warp, Wave, the vertex
+      weight modifiers' mask): pixels written from a script fire no
+      update at all;
+    * a modifier in _OUTSIDE_MODIFIERS."""
+    data = getattr(ob, 'data', None)
+    for holder in (ob, data, getattr(data, 'shape_keys', None)):
+        ad = getattr(holder, 'animation_data', None)
+        if ad is not None and len(getattr(ad, 'drivers', ()) or ()):
+            return True
+    for md in getattr(ob, 'modifiers', ()) or ():
+        if str(getattr(md, 'type', '')) in _OUTSIDE_MODIFIERS:
+            return True
+        if getattr(md, 'texture', None) is not None or \
+                getattr(md, 'mask_texture', None) is not None:
+            return True
+    return False
+
+
+def _viewport_enabled(view_layer):
+    """The tokens of the objects the view layer's VIEWPORT depsgraph
+    holds and reports: the bases enabled in viewports. Blender's layer
+    sync, read off the original data: a collection's Disable in Viewports
+    is inherited by everything under it, Exclude is each layer
+    collection's own, and an object's own Disable in Viewports removes
+    its base. (An object reached only through an instanced collection is
+    not here: it stays unheard and is exported live, as before; so does
+    an object whose mesh can change behind the depsgraph's back,
+    _reads_outside.)"""
+    out = set()
+    stack = [(view_layer.layer_collection, False)]
+    while stack:
+        lc, restricted = stack.pop()
+        coll = lc.collection
+        restricted = restricted or bool(coll.hide_viewport)
+        if not restricted and not lc.exclude:
+            for ob in coll.objects:
+                if not ob.hide_viewport and not _reads_outside(ob):
+                    tok = _obj_token(ob)
+                    if tok is not None:
+                        out.add(tok)
+        for child in lc.children:
+            stack.append((child, restricted))
+    return out
+
+
+def _heard_objects(depsgraph):
+    """The objects of a still F12 whose edits have all been reported
+    already, or None when nothing may be assumed (the whole update list
+    is then walked, as it always was).
+
+    A set comes back only when every one of these holds:
+    * the depsgraph is a RENDER one (a viewport re-evaluation of the same
+      frame lists real changes and is walked whole);
+    * no foreign function is registered in _RENDER_HOOKS -- a render_pre
+      handler that moves a vertex is seen by the render depsgraph alone
+      (measured: 207 px of stale mesh under a rule without this test);
+    * a window shows this scene and view layer, so its main depsgraph is
+      the one Blender evaluates after every edit and before the render
+      (a scene rendered by name from a script has no such depsgraph);
+    * that main depsgraph holds no tag it has not reported yet
+      (Depsgraph.id_type_updated is set when an ID is tagged and cleared
+      by the evaluation that reports it).
+    The set is _viewport_enabled: an object disabled in viewports but
+    enabled in renders is in the render depsgraph only, nobody reports
+    its edits, and it is exported live every time; so is an object whose
+    mesh can change with no update fired (_reads_outside)."""
+    try:
+        if str(getattr(depsgraph, 'mode', '')) != 'RENDER':
+            return None
+        import bpy
+        if _foreign_render_hooks(bpy):
+            return None
+        sc = depsgraph.scene
+        vl = depsgraph.view_layer
+        shown = False
+        for wm in bpy.data.window_managers:
+            for win in wm.windows:
+                if win.scene == sc and win.view_layer == vl:
+                    shown = True
+        if not shown:
+            return None
+        main = vl.depsgraph
+        if str(getattr(main, 'mode', '')) != 'VIEWPORT':
+            return None
+        if _pending_types(main):
+            return None
+        return _viewport_enabled(vl)
+    except Exception:                                           # noqa: BLE001
+        return None
+
+
+def _pending_types(depsgraph):
+    """The ID types this depsgraph holds a tag for that it has not
+    reported yet (measured in 5.2: `ob.location.x += 1` sets 'OBJECT',
+    a vertex write 'MESH', and the next evaluation clears them)."""
+    kinds = type(depsgraph).bl_rna.functions[
+        'id_type_updated'].parameters['id_type'].enum_items
+    return [k.identifier for k in kinds
+            if depsgraph.id_type_updated(k.identifier)]
 
 
 #: the Scene fields that can change EVALUATED MESH GEOMETRY -- the
@@ -1468,16 +1955,25 @@ def _cache_store(key, ent):
     _MESH_CACHE_BYTES += ent['bytes']
 
 
-def _cache_scrub():
+def _cache_scrub(mode=None):
     """Apply the dirt collected since the last export, then forget it.
 
     Returns (all_by, n_objs, n_data) -- what the dirt WAS, for the
     split instrument: the field's next paste can then say whether live
     re-exports came from real edits or from something spamming updates.
+    `mode` is the depsgraph mode of the export that asks: a RENDER export
+    whose pool an image or texture update emptied (_RENDER_FEEDS) reports
+    that type as its dirt.
     """
-    global _DIRTY_ALL, _DIRTY_ALL_BY
+    global _DIRTY_ALL, _DIRTY_ALL_BY, _DIRTY_RENDER
     took = (_DIRTY_ALL_BY if _DIRTY_ALL else None,
             len(_DIRTY_OBJS), len(_DIRTY_DATA))
+    if _DIRTY_RENDER is not None:
+        for k in [k for k in _MESH_CACHE if k[1] == 'RENDER']:
+            _cache_pop(k)
+        if mode == 'RENDER' and took[0] is None:
+            took = (_DIRTY_RENDER,) + took[1:]
+        _DIRTY_RENDER = None
     if _DIRTY_ALL:
         for k in list(_MESH_CACHE):
             _cache_pop(k)
@@ -1584,6 +2080,8 @@ def _info_snapshot(ob):
     """The ObjectInfo fields, read from the evaluated object."""
     return dict(
         name=ob.name,
+        # R254: what light linking matches this object by
+        link_name=compat.link_name(ob),
         color=tuple(ob.color) if hasattr(ob, 'color') else (1, 1, 1, 1),
         index=int(getattr(ob, 'pass_index', 0)),
         random=float(abs(hash(ob.name)) % 10000) / 10000.0,
@@ -1595,12 +2093,16 @@ def _info_snapshot(ob):
         smoke_grid=_smoke_grid(ob))
 
 
-def _info_object(info, matrix, gen_bounds=None):
+def _info_object(info, matrix, gen_bounds=None, instancer=''):
     # R253: `gen_bounds` is the mesh's object-space texture space from
     # _mesh_arrays (None = the renderer derives it); an optional third
-    # argument so every older two-argument caller still works
+    # argument so every older two-argument caller still works. R254:
+    # `instancer` is compat.instancer_name of the instance this row
+    # stands for ('' = a real object), for _resolve_links
     mw = np.asarray(matrix, np.float32)
     return ObjectInfo(
+        instancer=str(instancer or ''),
+        link_name=str(info.get('link_name', '') or ''),
         name=info['name'], location=tuple(mw[:3, 3]), matrix_world=mw,
         color=info['color'], index=info['index'], random=info['random'],
         visible_camera=info['visible_camera'],
@@ -1630,8 +2132,9 @@ def register():
 
 def unregister():
     global _CACHE_ARMED, _DIRTY_ALL, _DIRTY_ALL_BY, _MESH_CACHE_BYTES
-    global _SCENE_GEO_SIG
+    global _SCENE_GEO_SIG, _DIRTY_RENDER
     _CACHE_ARMED = False
+    _DIRTY_RENDER = None
     _MESH_CACHE.clear()
     _MESH_CACHE_BYTES = 0
     _DIRTY_OBJS.clear()
@@ -1668,7 +2171,59 @@ def _kind(ob):
     return _KINDS.get(getattr(ob, 'type', ''), "Object")
 
 
-def export_lights_into(parked, depsgraph):
+def _lamp_bound(materials):
+    """What the exported materials bake of the scene's LAMPS, for
+    export_lights_into: (projects, grouped).
+
+    `projects`: an Object Projection node picked a lamp, so the material
+    graph carries that lamp's inverse matrix and cone (object_map_props).
+    `grouped`: a material names lamps through a Light Group, resolved to
+    lamp NAMES when the material was exported. Node groups are walked (a
+    group node carries its tree under 'group'), and so is anything else
+    with a graph that is handed in (the world and its ground material)."""
+    projects = grouped = False
+    todo = [getattr(m, name, None) for m in materials or ()
+            for name in ('graph', 'ground_graph')]
+    while todo:
+        graph = todo.pop()
+        for node in ((graph or {}).get('nodes', {}) or {}).values():
+            props = node.get('props') or {}
+            if props.get('object_is_light'):
+                projects = True
+            if props.get('light_group_lights'):
+                grouped = True
+            if node.get('group'):
+                todo.append(node['group'])
+    return projects, grouped
+
+
+def _lamp_names(lights):
+    """The exported lamps' names, sorted; the world's own light (made at
+    render entry by core/worldlight.sync, never exported) left out."""
+    return sorted(str(getattr(l, 'name', '')) for l in lights or ()
+                  if not getattr(l, 'world_light', False))
+
+
+def scene_time(bscene):
+    """Seconds of scene time at the frame being exported: the frame AND
+    its subframe over the real frame rate, fps / fps_base.
+
+    R254: the clock every timed feature reads (light styles, caustics,
+    the time nodes) used to be frame_current / fps: a scene at 48 fps
+    with base 2 ran at half speed, and each shutter step of an
+    accumulated motion blur read a whole frame. With an integer frame
+    and base 1 the old expression is kept, so those frames are the
+    value they were."""
+    rd = bscene.render
+    fps = max(rd.fps, 1)
+    sub = float(getattr(bscene, 'frame_subframe', 0.0) or 0.0)
+    base = float(getattr(rd, 'fps_base', 1.0) or 1.0)
+    if sub == 0.0 and base == 1.0:
+        return bscene.frame_current / fps
+    return (bscene.frame_current + sub) * base / fps
+
+
+def export_lights_into(parked, depsgraph, space=None):
     """A next Scene with FRESH lights and everything else SHARED.
 
     A lamp drag fires view_update every tick, and each tick used to run
@@ -1679,16 +2234,38 @@ def export_lights_into(parked, depsgraph):
     shallow-copies the parked export around them, so the mesh, material,
     image and world objects keep their identities and every downstream
     identity-keyed cache (BVH, prepared textures, shadow signatures)
-    stays warm."""
+    stays warm.
+
+    R254. The clock is read here as export_scene reads it: a keyframed
+    lamp scrubbed or played takes this path, and the parked frame number
+    froze Light Style and Caustics while the lamp's Power and position
+    animated. `space` is the view's SpaceView3D (compat.in_view): a lamp
+    this viewport hides is left out, as export_scene leaves it out.
+
+    Returns None when the parked MATERIALS bake something of a lamp, so
+    that fresh lamps around old materials would be a wrong picture and
+    the caller must export fully: an Object Projection node that projects
+    from a lamp (its matrix and cone sit in the material graph), or a
+    Light Group while the set of lamp names differs from the parked one
+    (the group was resolved to names at material export)."""
     import copy
     bscene = depsgraph.scene
+    projects, grouped = getattr(parked, 'lamp_bound', None) or (False, False)
+    if projects:
+        return None
+    view = space if str(getattr(depsgraph, 'mode', 'VIEWPORT')) \
+        == 'VIEWPORT' else None
     lights = []
     for inst in depsgraph.object_instances:
         ob = inst.object
         if ob is None or ob.type != 'LIGHT' or not inst.show_self:
             continue
+        if not compat.in_view(inst, view):
+            continue
         lights.append(export_light(ob, inst.matrix_world,
                                    bscene.unit_settings.scale_length))
+    if grouped and _lamp_names(lights) != _lamp_names(parked.lights):
+        return None
     name_to_index = {o.name: i
                      for i, o in enumerate(parked.objects or [])}
     for lt in lights:
@@ -1696,8 +2273,27 @@ def export_lights_into(parked, depsgraph):
         if names:
             lt.exclude_objects = tuple(sorted(
                 name_to_index[n] for n in names if n in name_to_index))
+    # R254: the resolver export_scene runs (every instance of a name,
+    # everything a named object instances, an empty 'Only'); it decides
+    # every link, over the single-index answer above
+    _resolve_links(lights, parked.objects or [])
     scene = copy.copy(parked)
     scene.lights = lights
+    # the three values export_scene ends on; a stub depsgraph with no
+    # clock keeps the parked one. R254: the time comes from the one
+    # clock (scene_time: subframe and fps_base included), so a
+    # lights-only tick cannot leave the timed features (light styles,
+    # caustics) on the parked export's time
+    fr = getattr(bscene, 'frame_current', None)
+    if fr is not None:
+        fps = getattr(getattr(bscene, 'render', None), 'fps',
+                      getattr(parked, 'fps', 24))
+        scene.frame = fr
+        scene.fps = fps
+        try:
+            scene.time = scene_time(bscene)
+        except Exception:                                       # noqa: BLE001
+            scene.time = fr / max(fps, 1)
     return scene
 
 
@@ -2275,7 +2871,7 @@ def _strand_material(mat, mat_lookup, materials, images, warnings):
 
 
 def _collect_hair_parts(depsgraph, bscene, mat_lookup, materials, images,
-                        objects, parts, warnings):
+                        objects, parts, warnings, space=None):
     """R208: hair renders. Particle-system hair and Curves objects both
     become camera-facing ribbon meshes (core.geometry.hair_ribbons --
     the primitive BI rendered strands as), wearing a strand-flagged
@@ -2292,6 +2888,10 @@ def _collect_hair_parts(depsgraph, bscene, mat_lookup, materials, images,
             if cam is not None else (0.0, 0.0, 0.0)
     except Exception:                                           # noqa: BLE001
         eye = (0.0, 0.0, 0.0)
+
+    # R254: the instancer of the instance the loop below stands on, for
+    # the strand rows' ObjectInfo (light linking by instancer)
+    inst_by = ['']
 
     def _push_part(strands, widths, uv_roots, mat, ob, label):
         if not strands:
@@ -2322,16 +2922,19 @@ def _collect_hair_parts(depsgraph, bscene, mat_lookup, materials, images,
                 'smooth': np.ones(t.shape[0], bool),
                 'uv_names': []})
             info = _info_snapshot(ob)
-            objects.append(_info_object(info, np.eye(4,
-                                                     dtype=np.float32)))
+            objects.append(_info_object(info, np.eye(4, dtype=np.float32),
+                                        None, inst_by[0]))
         except Exception as exc:                                # noqa: BLE001
             warnings.append(f"hair on '{getattr(ob, 'name', '?')}' "
                             f"could not be exported "
                             f"({type(exc).__name__}: {exc})")
 
     for inst in depsgraph.object_instances:
+        inst_by[0] = compat.instancer_name(inst)
         ob = inst.object
         if ob is None or not getattr(inst, 'show_self', True):
+            continue
+        if not compat.in_view(inst, space):
             continue
 
         # ---- legacy particle-system hair ----
@@ -2438,7 +3041,7 @@ def _collect_hair_parts(depsgraph, bscene, mat_lookup, materials, images,
 
 
 def _collect_extra_halos(depsgraph, mat_lookup, materials, images,
-                         halo_groups, warnings):
+                         halo_groups, warnings, space=None):
     """Particles and point clouds as halos, API-guarded.
 
     BI rendered particles through the same halo road when their
@@ -2450,6 +3053,8 @@ def _collect_extra_halos(depsgraph, mat_lookup, materials, images,
     for inst in depsgraph.object_instances:
         ob = inst.object
         if ob is None or not getattr(inst, 'show_self', True):
+            continue
+        if not compat.in_view(inst, space):
             continue
         mw = _np.asarray(inst.matrix_world, _np.float32)
         # ---- legacy particle systems ----
@@ -2546,8 +3151,16 @@ def _world_image(hs, attr, images):
     return images.get(key)
 
 
-def export_scene(depsgraph, settings, warnings=None):
-    """Evaluated depsgraph -> Scene."""
+def export_scene(depsgraph, settings, warnings=None, space=None):
+    """Evaluated depsgraph -> Scene.
+
+    `space` (R254): the SpaceView3D of the rendered viewport this export
+    is for, or None. A VIEWPORT depsgraph keeps an object whose collection
+    was hidden with the outliner's eye, or that Local View left out, with
+    show_self True; what says it is hidden is the per-viewport test
+    Blender's own engines make (compat.in_view), so every instance loop
+    below asks it. F12 passes no space and keeps its own rule (show_self
+    of the RENDER depsgraph: hide_render decides)."""
     import time as _time
     warnings = warnings if warnings is not None else []
     bscene = depsgraph.scene
@@ -2571,10 +3184,11 @@ def export_scene(depsgraph, settings, warnings=None):
         _DIRTY_ALL = True
         _DIRTY_ALL_BY = 'simplify'
     _SCENE_GEO_SIG = _sig
-    _dirt_all_by, _dirt_objs, _dirt_data = _cache_scrub()
+    _dg_mode = str(getattr(depsgraph, 'mode', 'VIEWPORT'))
+    _dirt_all_by, _dirt_objs, _dirt_data = _cache_scrub(_dg_mode)
     _sp['dirt_all'] = _dirt_all_by or ''
     _sp['dirt_n'] = _dirt_objs + _dirt_data
-    _dg_mode = str(getattr(depsgraph, 'mode', 'VIEWPORT'))
+    _view = space if _dg_mode == 'VIEWPORT' else None
     _cache_on = _CACHE_ARMED and not _DIRTY_ALL
     _touched = set()          # keys stored or reused THIS export
     retries = []
@@ -2599,7 +3213,8 @@ def export_scene(depsgraph, settings, warnings=None):
     # the way to the next one, and wrapping it in list() would read every one
     # of them after it had been freed. See compat.evaluated_meshes.
     for ob, me, matrix, temp in compat.evaluated_meshes(depsgraph,
-                                                        skip=_skip):
+                                                        skip=_skip,
+                                                        space=_view):
         if me is None:
             # the skip path: this object was never evaluated -- serve its
             # arrays from the cache. Materials still export FRESH every
@@ -2630,7 +3245,8 @@ def export_scene(depsgraph, settings, warnings=None):
                 # a stored slot name no longer names a material (renamed
                 # since the store): the only exact answer is the live
                 # path, run after the loop in the position reserved here
-                retries.append((len(parts), obj_index, ob, matrix))
+                retries.append((len(parts), obj_index, ob, matrix,
+                                compat.LAST_INSTANCER[0]))
                 parts.append(None)
                 objects.append(None)
                 continue
@@ -2663,7 +3279,8 @@ def export_scene(depsgraph, settings, warnings=None):
                 pass
             # R253: the texture space rides the cached 'data'
             objects.append(_info_object(info, matrix,
-                                        data.get('gen_bounds')))
+                                        data.get('gen_bounds'),
+                                        compat.LAST_INSTANCER[0]))
             _sp['cached_ms'] += (_time.perf_counter() - _t0) * 1000.0
             _sp['cached'] += 1
             if k in _touched:
@@ -2739,7 +3356,8 @@ def export_scene(depsgraph, settings, warnings=None):
         idx = np.clip(data['mat_index'], 0, len(remap) - 1)
         data['mat_index'] = remap[idx]
         parts.append(data)
-        objects.append(_info_object(info, matrix, data.get('gen_bounds')))
+        objects.append(_info_object(info, matrix, data.get('gen_bounds'),
+                                    compat.LAST_INSTANCER[0]))
 
     # the RETRY pass: cached entries whose stored slot names went
     # unresolvable (a material rename). One live re-export each, one at a
@@ -2748,7 +3366,7 @@ def export_scene(depsgraph, settings, warnings=None):
     # parts/objects positions the loop reserved -- object numbering and
     # every later object's baked obj_index stay identical to a fully
     # live export.
-    for i_part, obj_index, r_ob, r_matrix in retries:
+    for i_part, obj_index, r_ob, r_matrix, r_inst_by in retries:
         data = None
         info = None
         ev = None
@@ -2815,7 +3433,8 @@ def export_scene(depsgraph, settings, warnings=None):
             info = _info_snapshot(r_ob)
         parts[i_part] = data if data is not None else _empty_part()
         objects[obj_index] = _info_object(info, r_matrix,
-                                          (data or {}).get('gen_bounds'))
+                                          (data or {}).get('gen_bounds'),
+                                          r_inst_by)
 
     # R172: the stale sweep. Keys nobody visits again -- an instancer
     # empty dragged through fifty matrices, a scene emptied out -- used
@@ -2832,7 +3451,7 @@ def export_scene(depsgraph, settings, warnings=None):
                 if k not in _touched:
                     _cache_pop(k)
 
-    for name, kind in compat.unconvertible(depsgraph):
+    for name, kind in compat.unconvertible(depsgraph, space=_view):
         warnings.append(f"{_KINDS.get(kind, kind.title())} '{name}' is not a "
                         f"surface Halcyon can render. Convert it to a mesh "
                         f"to include it")
@@ -2841,22 +3460,15 @@ def export_scene(depsgraph, settings, warnings=None):
         ob = inst.object
         if ob is None or ob.type != 'LIGHT' or not inst.show_self:
             continue
+        if not compat.in_view(inst, _view):
+            continue
         lights.append(export_light(ob, inst.matrix_world,
                                    bscene.unit_settings.scale_length))
-
-    # light linking is authored by object name; resolve to the indices the
-    # renderer works in, now that every object has one
-    name_to_index = {o.name: i for i, o in enumerate(objects)}
-    for lt in lights:
-        names = getattr(lt, 'exclude_names', None)
-        if names:
-            lt.exclude_objects = tuple(sorted(
-                name_to_index[n] for n in names if n in name_to_index))
 
     # R191: particles and point clouds wearing halo materials
     try:
         _collect_extra_halos(depsgraph, mat_lookup, materials, images,
-                             halo_groups, warnings)
+                             halo_groups, warnings, space=_view)
     except Exception:                                           # noqa: BLE001
         pass
 
@@ -2864,9 +3476,16 @@ def export_scene(depsgraph, settings, warnings=None):
     # camera-facing ribbons wearing a strand-flagged material clone
     try:
         _collect_hair_parts(depsgraph, bscene, mat_lookup, materials,
-                            images, objects, parts, warnings)
+                            images, objects, parts, warnings, space=_view)
     except Exception:                                           # noqa: BLE001
         pass
+
+    # light linking is authored by object name; resolve to the indices the
+    # renderer works in, now that every object has one. R254: AFTER the
+    # hair parts (a strand row carries its emitter's name, so the hair
+    # of a linked object is linked with it -- the resolver used to run
+    # before those rows existed)
+    _resolve_links(lights, objects)
 
     _t0 = _time.perf_counter()
     mesh = _concat([p for p in parts if p is not None])
@@ -3052,10 +3671,12 @@ def export_scene(depsgraph, settings, warnings=None):
                shadow_volumes=shadow_volumes,
                lights=lights, camera=camera, world=world, settings=settings,
                frame=bscene.frame_current, fps=bscene.render.fps,
-               time=bscene.frame_current / max(bscene.render.fps, 1))
+               time=scene_time(bscene))
     sc.halos = halo_groups or None
     sc.images = images
     sc.warnings = warnings
+    # R254: what these materials bake of the lamps (export_lights_into)
+    sc.lamp_bound = _lamp_bound(list(materials) + [world])
     # R170: the export split -- at 0.36s of a 0.75s warm F12, "export"
     # is a number and a split is a diagnosis (engine prints it)
     _sp['total_ms'] = (_time.perf_counter() - _t_all) * 1000.0

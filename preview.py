@@ -59,6 +59,11 @@ DRAFT_FACTOR = 2
 #: ~64k pixels is the 352x144-class frame the field machine renders at
 #: a few frames a second through the full pipeline
 DRAFT_BUDGET_PX = 64_000
+#: R254: the pixel budget of the viewport's light-shaft march. F12
+#: marches every pixel; a refine marches a box-averaged proxy of at most
+#: this many and upsamples the smear (core/post.light_shafts), so a
+#: volumetric lamp costs the viewport tens of milliseconds, not seconds
+SHAFT_PROXY_PX = 48_000
 
 #: how far past the window's lapse the armed recheck fires -- enough that
 #: the clock has definitely crossed it, small enough to feel instant
@@ -249,6 +254,26 @@ def region_rect(w, h, frame=None, border=None):
     if (x0, y0, x1, y1) == (0, 0, w, h):
         return None
     return (x0 / w, y0 / h, x1 / w, y1 / h, bool(frame_only))
+
+
+def crop_shaft_sources(shafts, full_size, rect):
+    """R254: the light-shaft anchors of a region-sized render, carried
+    through the camera-frame crop: ((x, y), strength) in the region's
+    ndc -> the same screen point in the cropped frame's ndc (post maps
+    ndc onto (size - 1), as the flare anchors do). An anchor outside the
+    crop stays outside: shafts converge on it from inside the frame."""
+    if not shafts:
+        return shafts
+    W0, H0 = full_size
+    x0, y0, x1, y1 = rect
+    bw, bh = x1 - x0, y1 - y0
+    moved = []
+    for (hx, hy), amount in shafts:
+        px = (float(hx) * 0.5 + 0.5) * (W0 - 1) - x0
+        py = (float(hy) * 0.5 + 0.5) * (H0 - 1) - y0
+        moved.append((((px / max(bw - 1, 1)) * 2.0 - 1.0,
+                       (py / max(bh - 1, 1)) * 2.0 - 1.0), amount))
+    return moved
 
 
 class Viewport:
@@ -570,6 +595,13 @@ class Viewport:
                 mode, over the CROPPED frame so the frame's own corner is
                 the pattern origin exactly as an F12 of the frame"""
                 flares = getattr(scene, 'last_flares', None)
+                # R254: the screen-space light shafts (a Sun's only
+                # volumetric effect) were F12-only -- the render computed
+                # the sources and this call never passed them. A refine
+                # draws them through the proxy march; a draft, which
+                # exists to keep motion fluid, does not
+                shafts = None if draft else getattr(scene, 'last_shafts',
+                                                    None)
                 cvg = getattr(scene, 'last_cvg', None)   # R251 C001
                 tsize = (stx.resolution_x, stx.resolution_y)
                 rp = core_render.region_pixels(stx, stx.resolution_x,
@@ -600,6 +632,7 @@ class Viewport:
                             except Exception:                   # noqa: BLE001
                                 moved.append(src)
                         flares = moved
+                    shafts = crop_shaft_sources(shafts, (W0, H0), rp)
                     tsize = (x1 - x0, y1 - y0)
                     try:
                         from .gpu import frame as _FRc
@@ -619,7 +652,9 @@ class Viewport:
                                    # the dial, looked exactly here, and saw
                                    # nothing because this call never passed
                                    # the sources the render had computed
-                                   flare_sources=flares)
+                                   flare_sources=flares,
+                                   shaft_sources=shafts,
+                                   shaft_proxy=SHAFT_PROXY_PX)
                 return out, rp
 
             wants_gpu = str(getattr(settings, 'render_device',

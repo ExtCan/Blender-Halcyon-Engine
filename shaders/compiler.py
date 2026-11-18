@@ -186,6 +186,66 @@ def try_compile(src, lang='GLSL', defines=None):
         return None, f'{type(e).__name__}: {e}'
 
 
+def node_source(node):
+    """THE rule for which source a Coded Shader node compiles.
+
+    An assigned Text datablock IS the source, whatever it holds; the
+    node's inline `source_text` is the source only while no Text is
+    assigned.
+
+    R253 (review): this lived in two places under two rules, and a third
+    reader followed neither. `HALCYON_CodeNode.get_source` (the editor
+    compile, the sockets) read the Text whenever one was assigned;
+    `export._compile_node` (the program the CPU evaluator runs) read the
+    Text but reached past an EMPTY one for the inline source; and the GPU
+    emitter inlined `props.source_text`, the raw inline property the
+    exporter copied without resolving anything -- so a node with a Text
+    assigned ran the Text on the CPU and the starter shader `init` left in
+    `source_text` in the deferred pass. All three ask here now: the node's
+    `get_source`, and `compile_node` below, which the editor and the
+    exporter both compile through and whose third return is the string the
+    exporter ships for the emitter.
+
+    Why an empty Text is an empty source and not a reason to fall back:
+    the inline source has no widget, so falling back renders a shader the
+    user can neither see nor edit while the Text they are looking at is
+    blank; and the old fallback was itself two rules -- '' fell back, one
+    blank line ('\\n') compiled nothing. A Text that cannot be read is an
+    empty source too.
+    """
+    text = getattr(node, 'source', None)
+    if text is not None:
+        try:
+            return str(text.as_string() or '')
+        except Exception:                                       # noqa: BLE001
+            return ''
+    return str(getattr(node, 'source_text', '') or '')
+
+
+def compile_node(node):
+    """Compile a Coded Shader node: (program, error, source).
+
+    `source` is `node_source(node)`, always returned -- it is what the
+    program was compiled from, and the exporter ships that very string in
+    the graph for the GPU emitter to inline. `error` is None on a clean
+    build. A blank source compiles nothing: with a Text assigned that is
+    said by name (an emptied Text is a state the node editor reaches in
+    two clicks, and the outputs reading zeros wants a reason); with no
+    Text it stays silent, as it always was.
+    """
+    src = node_source(node)
+    if not src.strip():
+        text = getattr(node, 'source', None)
+        if text is None:
+            return None, None, src
+        return None, (f"the assigned Text '{getattr(text, 'name', '?')}' is "
+                      "empty -- nothing to compile, the outputs read zeros"), src
+    prog, err = try_compile(src, str(getattr(node, 'language', 'GLSL') or 'GLSL'))
+    if prog is None:
+        return None, err or 'compile failed', src
+    return prog, None, src
+
+
 def clear_cache():
     _CACHE.clear()
 

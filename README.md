@@ -1410,6 +1410,18 @@ for a set that loads sideways, the world's Rotation, Tint and Strength.
 It is an environment like the HDRI: reflections see it, and it draws in
 the GPU sky pass bitwise the CPU's.
 
+**World Light** -- the sky's own sun or moon lights the scene. Switch it on
+in the World panel and the luminary the sky draws becomes a real Sun lamp
+at render time, aimed from where the picture shows it and casting shadows:
+the Bryce sun, or the Bryce moon at a quarter of the strength and following
+its phase; the Physical sky's sun; a Sky Texture node's sun; the brightest
+region of an HDRI or a cube map, found once per image -- or a direction and
+colour set by hand when an 8-bit sky cannot be searched. It follows the
+World Rotation and Strength, fades as the sun sets, keeps its place under
+the light limit, can throw light shafts, and renders the same on both
+devices. World types with no sun or moon say so. Off by default: no
+existing scene changes.
+
 **303 sky presets, every one with a rendered thumbnail.** The original 43 plus
 **260 new skies in 26 authored families** — Golden Hour, Blue Hour, High Noon,
 Storm Front, Ember, Midnight Clear, Vapor Dream, Winter Overcast, Desert Dusk,

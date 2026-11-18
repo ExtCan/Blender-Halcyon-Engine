@@ -607,6 +607,24 @@ class HALCYON_PT_lighting(HalcyonPanel, Panel):
         sub = col.column()
         sub.active = hs.max_lights > 0
         sub.prop(hs, 'light_limit_mode')
+        # R254: the lamps the last render left unlit, by name -- its own
+        # report (core/lights.limit_report), shown while the limit and
+        # the mode are still the ones that render used. The limit used
+        # to drop lamps without a word anywhere
+        try:
+            from .core.lights import LAST_LIMIT_REPORT as rep
+        except Exception:                                       # noqa: BLE001
+            rep = {}
+        if rep.get('unlit') and rep.get('max_lights') == hs.max_lights \
+                and rep.get('mode') == hs.light_limit_mode:
+            names = ', '.join(rep['unlit'][:4])
+            if len(rep['unlit']) > 4:
+                names += f" and {len(rep['unlit']) - 4} more"
+            note = col.column(align=True)
+            note.label(text=f"Last render: {len(rep['unlit'])} of "
+                            f"{rep.get('total', 0)} lamps not lit",
+                       icon='ERROR')
+            note.label(text=names, icon='BLANK1')
         col.prop(hs, 'light_falloff_default')
         # the repair for lamps brought in via plain File > Append:
         # Blender's own append converts 2.79 energies to its modern
@@ -621,7 +639,9 @@ class HALCYON_PT_lighting(HalcyonPanel, Panel):
 
 
 class HALCYON_PT_spot_cones(HalcyonPanel, Panel):
-    bl_label = "Spot Cones"
+    # R254: the switch gates the beam of every Spot, Point and Area lamp
+    # (it was titled "Spot Cones" and said "spot light" throughout)
+    bl_label = "Volumetric Lights"
     bl_parent_id = "HALCYON_PT_lighting"
     bl_context = "render"
     bl_options = {'DEFAULT_CLOSED'}
@@ -642,8 +662,10 @@ class HALCYON_PT_spot_cones(HalcyonPanel, Panel):
         note = col.column(align=True)
         note.active = False
         note.scale_y = 0.8
-        note.label(text="Each spot light's own Volumetric value", icon='INFO')
-        note.label(text="decides whether it has a beam, and how strong.")
+        note.label(text="Each Spot, Point or Area light's own Volumetric",
+                   icon='INFO')
+        note.label(text="value decides whether it has a beam, and how "
+                        "strong.")
         # R222: the real volumes -- always live; a scene without volume
         # containers pays nothing, so there is no master switch to forget
         layout.separator()
@@ -672,13 +694,34 @@ class HALCYON_PT_shadows(HalcyonPanel, Panel):
         col = layout.column()
         col.active = hs.shadows
         col.prop(hs, 'shadow_default')
-        if hs.shadow_default == 'PLANAR':
-            col.prop(hs, 'planar_plane_z')          # R251 C052
-        col.prop(hs, 'shadow_map_size')
-        col.prop(hs, 'shadow_map_depth')            # R251 C117
-        col.prop(hs, 'shadow_bias')
-        col.prop(hs, 'shadow_softness')
-        col.prop(hs, 'shadow_samples')
+        method = hs.shadow_default
+        if method in ('PLANAR', 'PER_LIGHT'):
+            # R251 C052. Under Per Light a lamp set to Planar reads it
+            # too (the row used to be hidden there)
+            col.prop(hs, 'planar_plane_z')
+        # the map dials grey when no light can read them, and the
+        # traced pair is reachable here whenever a light can trace --
+        # it used to live only inside the Ray Tracing panel, greyed by
+        # a master switch it does not depend on
+        mapped = col.column()
+        mapped.active = method in ('MAP', 'PER_LIGHT')
+        mapped.prop(hs, 'shadow_map_size')
+        mapped.prop(hs, 'shadow_map_depth')         # R251 C117
+        mapped.prop(hs, 'shadow_bias')
+        mapped.prop(hs, 'shadow_softness')
+        both = col.column()
+        both.active = method in ('MAP', 'RAY', 'PER_LIGHT')
+        both.prop(hs, 'shadow_samples')
+        if method in ('RAY', 'PER_LIGHT'):
+            col.prop(hs, 'ray_shadows')
+            traced = col.column()
+            traced.active = hs.ray_shadows
+            traced.prop(hs, 'ray_bias')
+            if method == 'RAY' and not hs.ray_shadows:
+                note = col.row()
+                note.alert = True
+                note.label(text="Ray Shadows is off: traced lights cast "
+                                "nothing", icon='ERROR')
         col.prop(hs, 'modvol_scale')                # R251 C020
         col.operator('halcyon.adopt_shadow_settings',
                      text="All Lights Use These Settings",
@@ -747,9 +790,23 @@ class HALCYON_PT_raytrace(HalcyonPanel, Panel):
         col.prop(hs, 'ray_depth')
         col.prop(hs, 'ray_reflection')
         col.prop(hs, 'ray_refraction')
-        col.prop(hs, 'ray_shadows')
-        col.prop(hs, 'ray_bias')
-        col.separator()
+        # Ray Shadows and Ray Bias do not hang on this panel's master
+        # (it gates reflections and refractions): each greys by what
+        # reads it. Ray Shadows is the switch of the traced shadows,
+        # live while the Shadow Method lets a light trace; Ray Bias is
+        # the origin offset of EVERY ray, live while anything traces
+        shadow_rays = hs.shadows and hs.shadow_default in ('RAY',
+                                                           'PER_LIGHT')
+        row = layout.column()
+        row.active = shadow_rays
+        row.prop(hs, 'ray_shadows')
+        row = layout.column()
+        row.active = bool(hs.raytrace or hs.ambient_occlusion
+                          or hs.radiosity
+                          or (shadow_rays and hs.ray_shadows))
+        row.prop(hs, 'ray_bias')
+        col = layout.column()
+        col.active = hs.raytrace
         sub = col.column()
         sub.active = hs.raytrace and hs.ray_reflection
         sub.prop(hs, 'reflection_blur')
@@ -946,6 +1003,12 @@ class HALCYON_PT_effects(HalcyonPanel, Panel):
         row = col.row()
         row.active = False
         row.label(text="Set Volumetric on a light to cast them", icon='LIGHT')
+        # R254: one lamp, one volumetric effect -- a Spot, Point or Area
+        # lamp throws shafts only while its in-air beam is not drawn
+        row = col.row()
+        row.active = False
+        row.label(text="(a Sun always; other lamps while Volumetric "
+                       "Lights is off)", icon='BLANK1')
         # R251 C134: the optical printer's backlit mattes
         col = layout.column(heading="Matte Glow")
         col.prop(hs, 'matte_glow', text="Enable")
@@ -1604,6 +1667,68 @@ class HALCYON_PT_world_sun(_BrycePanel, Panel):
             sub.prop(hs, 'sun_size')
 
 
+class HALCYON_PT_world_light(HalcyonPanel, Panel):
+    """R254: the world's own luminary as a scene light. Shown for every
+    world type -- one with no sun or moon says so instead of offering a
+    control that could do nothing."""
+    bl_label = "World Light"
+    bl_context = "world"
+    bl_parent_id = 'HALCYON_PT_world'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.engine == ENGINE and context.world is not None
+
+    def draw_header(self, context):
+        from .core import worldlight as _WL
+        hs = context.world.halcyon
+        row = self.layout.row()
+        row.active = hs.mode in _WL.MODES_WITH_LUMINARY
+        row.prop(hs, 'world_light', text="")
+
+    def draw(self, context):
+        from .core import worldlight as _WL
+        layout = self.layout
+        layout.use_property_split = True
+        hs = context.world.halcyon
+        if hs.mode not in _WL.MODES_WITH_LUMINARY:
+            layout.label(text="This world type has no sun or moon to "
+                              "light with", icon='INFO')
+            layout.label(text="Bryce, Physical, a Sky Texture node, an "
+                              "HDRI or a cube map do")
+            return
+        col = layout.column()
+        col.active = bool(hs.world_light)
+        if hs.mode == 'BRYCE':
+            col.label(text="Lit by the Bryce moon" if hs.celestial == 'MOON'
+                      else "Lit by the Bryce sun", icon='LIGHT_SUN')
+        elif hs.mode == 'PHYSICAL':
+            col.label(text="Lit by the Physical sky's sun", icon='LIGHT_SUN')
+        elif hs.mode == 'NODES':
+            col.label(text="Lit by the Sky Texture node's sun",
+                      icon='LIGHT_SUN')
+        else:
+            col.prop(hs, 'world_light_find')
+            if hs.world_light_find == 'MANUAL':
+                col.prop(hs, 'world_light_elevation')
+                col.prop(hs, 'world_light_azimuth')
+                col.prop(hs, 'world_light_color')
+        col.prop(hs, 'world_light_strength')
+        col.prop(hs, 'world_light_shadow')
+        col.prop(hs, 'world_light_shafts')
+        if hs.world_light:
+            said = _WL.LAST_REPORT.get('text', '')
+            if said:
+                layout.label(text=said, icon='INFO')
+            scene = getattr(context, 'scene', None)
+            if any(getattr(ob, 'type', '') == 'LIGHT'
+                   and getattr(getattr(ob, 'data', None), 'type', '') == 'SUN'
+                   for ob in (getattr(scene, 'objects', None) or ())):
+                layout.label(text="The scene's Sun lamps light it as well",
+                             icon='ERROR')
+
+
 class HALCYON_PT_world_atmosphere(_BrycePanel, Panel):
     bl_label = "Atmosphere"
     bl_options = set()
@@ -1832,7 +1957,9 @@ class HALCYON_OT_adopt_shadow_settings(Operator):
     sliders -- and every light saved before 1.30.1 carries the old
     per-light defaults (512 / 0.02) explicitly, which is why raising the
     render setting's Shadow Map Size changed nothing in older scenes.
-    This clears the per-light values to 0 = inherit.
+    This clears the per-light overrides to inherit: Map Size, Bias and
+    Samples to 0, Map Depth to Inherit. Softness and Density are the
+    light's own (a multiplier and a strength, not overrides) and stay.
     """
 
     bl_idname = 'halcyon.adopt_shadow_settings'
@@ -1856,13 +1983,103 @@ class HALCYON_OT_adopt_shadow_settings(Operator):
             hs = getattr(light, 'halcyon', None)
             if hs is None:
                 continue
-            if hs.shadow_map_size != 0 or hs.shadow_bias != 0.0:
+            if hs.shadow_map_size != 0 or hs.shadow_bias != 0.0 \
+                    or getattr(hs, 'shadow_samples', 0) != 0 \
+                    or getattr(hs, 'shadow_map_depth',
+                               'INHERIT') != 'INHERIT':
                 hs.shadow_map_size = 0
                 hs.shadow_bias = 0.0
+                # the two overrides the button used to leave behind: a
+                # lamp's own Samples (0 = the render's) and its Map
+                # Depth -- the panel it sits under lists both
+                if hasattr(hs, 'shadow_samples'):
+                    hs.shadow_samples = 0
+                if hasattr(hs, 'shadow_map_depth'):
+                    hs.shadow_map_depth = 'INHERIT'
                 n += 1
         self.report({'INFO'},
                     f"{n} light(s) now inherit the render shadow settings"
                     if n else "Every light already inherits them")
+        return {'FINISHED'}
+
+
+def light_shadow_method(light, hs, sh):
+    """The shadow method that will RUN for one light -- 'NONE', 'MAP',
+    'RAY' or 'PLANAR' -- from the light's own settings `hs` and the
+    render's `sh`, by the renderer's rule (core/lights.visibility): the
+    Shadows master and the light's None veto first, a hemi sun never
+    shadows, then the render's Shadow Method decides for every light
+    unless it is Per Light. The light panel greys its rows by this, not
+    by the light's menu."""
+    on, method, _rays, _n = render_shadow_state(sh)
+    if hs.shadow == 'NONE' or not on:
+        return 'NONE'
+    if getattr(light, 'type', '') == 'SUN' and getattr(hs, 'hemi', False):
+        return 'NONE'
+    if not getattr(light, 'use_shadow', True):
+        # Blender's own Shadow checkbox: the export honours it
+        return 'NONE'
+    if method is None or method == 'PER_LIGHT':
+        # (no render method in reach: the light's own menu)
+        return hs.shadow
+    return method
+
+
+def render_shadow_state(sh):
+    """(Shadows on, Shadow Method or None, Ray Shadows on, Samples) of
+    the render settings `sh`, each with the renderer's own default when
+    `sh` is missing or does not carry it."""
+    return (bool(getattr(sh, 'shadows', True)),
+            getattr(sh, 'shadow_default', None),
+            bool(getattr(sh, 'ray_shadows', True)),
+            int(getattr(sh, 'shadow_samples', 4) or 4))
+
+
+def shadow_method_label(key):
+    """The Shadow Method menu's own label for an item key."""
+    from .properties import SHADOW_MODE
+    for item in SHADOW_MODE:
+        if item[0] == key:
+            return item[1]
+    return str(key).replace('_', ' ').title()
+
+
+def light_has_size(light):
+    """Whether the light's size dial is above zero: Radius for a point
+    or spot, Angle for a sun, Size for an area light."""
+    kind = getattr(light, 'type', '')
+    if kind == 'SUN':
+        return float(getattr(light, 'angle', 0.0) or 0.0) > 0.0
+    if kind == 'AREA':
+        return float(getattr(light, 'size', 0.0) or 0.0) > 0.0
+    return float(getattr(light, 'shadow_soft_size', 0.0) or 0.0) > 0.0
+
+
+class HALCYON_OT_shadows_per_light(Operator):
+    """Set the render's Shadow Method to Per Light.
+
+    Under any other method the render decides for every light and a
+    light's own Shadows menu is only read for None; under Per Light each
+    light uses the method its own menu names. Lights left on their
+    default (Shadow Map) keep mapping.
+    """
+
+    bl_idname = 'halcyon.shadows_per_light'
+    bl_label = "Per-Light Shadow Methods"
+    bl_description = ("Set the render's Shadow Method to Per Light, so "
+                      "that every light casts by the method its own "
+                      "Shadows menu names")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        hs = context.scene.halcyon
+        if hs.shadow_default == 'PER_LIGHT':
+            self.report({'INFO'}, "The Shadow Method is already Per Light")
+            return {'CANCELLED'}
+        hs.shadow_default = 'PER_LIGHT'
+        _poke_updated(context, context.scene)
+        self.report({'INFO'}, "Shadow Method set to Per Light: each light's "
+                              "own Shadows menu now decides")
         return {'FINISHED'}
 
 
@@ -2492,6 +2709,303 @@ class HALCYON_PT_material(HalcyonPanel, Panel):
                             "its faces do not draw", icon='INFO')
 
 
+def scene_clock(scene):
+    """Seconds of scene time on the frame the editor stands on, by the
+    EXPORTER's rule (what a render of this frame writes to Scene.time):
+    export.scene_time where the exporter carries the helper, else the
+    expression export_scene evaluates. The panel must never keep a
+    clock of its own -- a status line that disagrees with the render is
+    worse than none."""
+    from . import export as _ex
+    fn = getattr(_ex, 'scene_time', None)
+    if fn is not None:
+        return float(fn(scene))
+    return scene.frame_current / max(scene.render.fps, 1)
+
+
+def light_style_status(hs, scene):
+    """(text, icon) saying what the lamp's Light Style does on the
+    current frame, or None for a steady lamp or without a scene to read
+    the clock from (R254).
+
+    A style is animated and a still shows ONE step of it: at Blender's
+    frame 1 six of the eleven styles render exactly like Normal and
+    three switch the lamp off, and nothing in the panel said which. The
+    gain is core.lights.style_gain at scene_clock -- the number the
+    render multiplies the Power by."""
+    if str(getattr(hs, 'light_style', 'NORMAL') or 'NORMAL') == 'NORMAL' \
+            or scene is None:
+        return None
+    try:
+        from .core import lights as _LI
+        t = scene_clock(scene)
+        gain = float(_LI.style_gain(hs, t))
+        step, steps = _LI.style_step(hs, t)
+        frame = int(scene.frame_current)
+    except Exception:                                           # noqa: BLE001
+        return None
+    if gain == 0.0:
+        return (f"Animated: the lamp is DARK on frame {frame} "
+                f"(step {step + 1} of {steps})", 'ERROR')
+    return (f"Animated: Power x{gain:.2f} on frame {frame} "
+            f"(step {step + 1} of {steps})", 'TIME')
+
+
+#: R254: the distance dials each falloff law reads, as the Light panel's
+#: rows -- (property, label; None = the property's own name). ONE table
+#: for a law chosen on the lamp and for one arriving through Scene
+#: Default; core/lights.attenuate and decay_law are the readers, and
+#: tests/test_r254_falloff.py holds the two against each other (a dial
+#: is drawn exactly when the law reads it). None, Inverse and Inverse
+#: Square read no dial at all.
+FALLOFF_ROWS = {
+    'CUSTOM': (('decay_start', None), ('decay_end', None)),
+    'BI_LINEAR': (('decay_end', "Distance"),),
+    'BI_SQUARE': (('decay_end', "Distance"),),
+    'BI_SLIDERS': (('decay_end', "Distance"), ('decay_ld1', None),
+                   ('decay_ld2', None)),
+    'GL_3TERM': (('decay_ld1', None), ('decay_ld2', None)),
+    'POV_FADE_LINEAR': (('decay_end', None),),
+    'POV_FADE_SQUARE': (('decay_end', None),),
+    'GX_GENTLE': (('decay_end', None),),
+    'GX_MEDIUM': (('decay_end', None),),
+    'GX_STEEP': (('decay_end', None),),
+    'NOMINAL_INVERSE': (('decay_end', "Nominal Distance"),),
+    'NOMINAL_INV_SQUARE': (('decay_end', "Nominal Distance"),),
+}
+
+
+def light_falloff_in_use(hs, scene):
+    """The falloff law a lamp runs: its own, or the render's Light
+    Falloff Default while it is left on Scene Default (core/lights.
+    resolved_decay's panel twin). Without a scene, Inverse Square --
+    the render setting's own default."""
+    mode = str(getattr(hs, 'decay', 'DEFAULT') or 'DEFAULT')
+    if mode == 'DEFAULT':
+        mode = str(getattr(getattr(scene, 'halcyon', None),
+                           'light_falloff_default', None)
+                   or 'INVERSE_SQUARE')
+    return mode
+
+
+#: R254: which slider softens a projected image, per lamp kind (the note
+#: named "Angle/Radius" for every kind, an Area lamp has neither)
+COOKIE_BLUR_NOTE = {
+    'SUN': "The lamp's Angle softens the projection",
+    'AREA': "Projection Blur softens the projection",
+    'POINT': "The lamp's Radius softens the projection",
+}
+
+
+def spot_cone_notes(hs):
+    """R254: (rows, notes) under a spot lamp's Cone Law -- the dials the
+    law in use reads, and what it does NOT read of the Light panel's
+    Blend (greyed there by the same rule). Blender Internal reads
+    Blend, or the Hotspot while it is above zero; POV reads the Hotspot
+    and the exponent; OpenGL the exponent; the GX functions nothing but
+    the Spot Size. A Screen Spotlight has no cone at all."""
+    law = str(getattr(hs, 'spot_law', 'BLENDER') or 'BLENDER')
+    rows, notes = [], []
+    if law in ('BLENDER', 'POV'):
+        rows.append('hotspot')
+    if law in ('GL11', 'POV'):
+        rows.append('spot_exponent')
+    if getattr(hs, 'screen_spot', False):
+        notes.append("Screen Spotlight: no cone -- these dials are "
+                     "not read")
+    elif law == 'BLENDER':
+        if float(getattr(hs, 'hotspot', 0.0) or 0.0) > 0.0:
+            notes.append("Hotspot replaces Blend (Light panel)")
+    else:
+        notes.append("Blend (Light panel) is not read by this cone law")
+        if law == 'POV':
+            notes.append("Hotspot sets the soft edge")
+    return rows, notes
+
+
+def lamp_anchor_view(context, light):
+    """Where the lamp's screen anchor sits in the render camera's view:
+    (x, y, z) with x and y in frame fractions (0..1 inside the frame)
+    and z > 0 in front of the camera -- a Sun's anchor is its place in
+    the sky. None without a camera or an object (and in the tests)."""
+    try:
+        from bpy_extras import object_utils as _ou
+        from mathutils import Vector as _V
+        cam = context.scene.camera
+        ob = context.object
+        if cam is None or ob is None:
+            return None
+        if light.type == 'SUN':
+            d = (ob.matrix_world.to_3x3()
+                 @ _V((0.0, 0.0, -1.0))).normalized()
+            pt = cam.matrix_world.translation - d * 1000.0
+        else:
+            pt = ob.matrix_world.translation
+        co = _ou.world_to_camera_view(context.scene, cam, pt)
+        return (float(co.x), float(co.y), float(co.z))
+    except Exception:                                           # noqa: BLE001
+        return None
+
+
+def shaft_anchor_status(co):
+    """R254: (text, icon, hint) for a Sun's Light Shafts given its
+    anchor in the camera view (lamp_anchor_view), or None without one.
+    The bounds are core/render.shaft_sources' own: behind the camera
+    there is no source, nor beyond six half-frames (|ndc| > 6, a frame
+    fraction outside -2.5 .. 3.5)."""
+    if co is None:
+        return None
+    if co[2] <= 0.0:
+        return ("Sun is BEHIND the render camera -- no shafts", 'ERROR',
+                "Tilt the sun so it shines TOWARD the camera's view")
+    if not (-2.5 <= co[0] <= 3.5 and -2.5 <= co[1] <= 3.5):
+        return ("Sun is far outside the frame -- no shafts", 'ERROR',
+                "Aim the camera nearer the sun's place in the sky")
+    return ("Light Shafts converge on the sun's place in the sky",
+            'CHECKMARK',
+            "From pixels brighter than the render's Shaft Threshold")
+
+
+def area_watts_label(light, hs):
+    """What a Blender Internal Area lamp gives in Blender's watts, as
+    the panel's one-line note (R254). Power x Distance^2 / 2 is the
+    ratio of the 2.79 form factor to Cycles and EEVEE; Gamma off 1
+    reshapes the field, so the number is then only a guide."""
+    from . import export as _EX
+    try:
+        w = _EX.area_blender_watts(float(getattr(light, 'energy', 0.0)),
+                                   float(getattr(hs, 'decay_end', 25.0)),
+                                   'BI')
+    except (TypeError, ValueError):
+        return ''
+    if abs(float(getattr(hs, 'area_gamma', 1.0) or 1.0) - 1.0) > 1e-6:
+        return f"About {w:.4g} W in Blender's watts at Gamma 1"
+    return f"Gives {w:.4g} W in Blender's watts"
+
+
+class HALCYON_PT_light_native(HalcyonPanel, Panel):
+    """Blender's own Light options -- the ones Halcyon reads, and only
+    those.
+
+    R254: the stock panels were forced on (DATA_PT_light and
+    DATA_PT_EEVEE_light, both titled Light) and drew rows the engine
+    never read, beside rows Halcyon Light drew a second time. This
+    panel owns the native rows instead, so a Blender release cannot put
+    a dead control in front of the user: type; Temperature and Colour
+    (the Tint while Temperature is on); Power or Strength, Exposure,
+    Normalize; an Area lamp's power units; the size dial of each type;
+    a Spot's Angle, Blend and Show Cone; Cast Shadow. Soft Falloff has
+    no meaning here (a lamp lights from its centre) and is not drawn.
+    Every lamp attribute is read through getattr: the test stub's lamps
+    carry four fields."""
+
+    bl_label = "Light"
+    bl_context = "data"
+
+    @classmethod
+    def poll(cls, context):
+        return (context.engine == ENGINE and context.light is not None)
+
+    def draw(self, context):
+        layout = self.layout
+        light = context.light
+        hs = getattr(light, 'halcyon', None)
+        kind = str(getattr(light, 'type', 'POINT') or 'POINT')
+        layout.row().prop(light, 'type', expand=True)
+        layout.use_property_split = True
+
+        col = layout.column()
+        warm = bool(getattr(light, 'use_temperature', False))
+        if hasattr(light, 'use_temperature'):
+            heading = col.column(align=True, heading="Temperature")
+            row = heading.row(align=True)
+            row.prop(light, 'use_temperature', text="")
+            sub = row.row()
+            sub.active = warm
+            sub.prop(light, 'temperature', text="")
+        # the blackbody colour multiplies the Colour, which is then a tint
+        col.prop(light, 'color', text="Tint" if warm else "Color")
+
+        col = layout.column()
+        col.prop(light, 'energy')
+        if hasattr(light, 'exposure'):
+            col.prop(light, 'exposure')
+        if hasattr(light, 'normalize'):
+            col.prop(light, 'normalize')
+        if kind == 'AREA' and hs is not None and hasattr(hs, 'area_power'):
+            # what the Power above means. Under Blender Internal units
+            # the form factor is normalised at Distance (la->dist), so
+            # the dial is a gain: the note says what it comes to
+            col.prop(hs, 'area_power')
+            if str(hs.area_power) == 'BI':
+                col.prop(hs, 'decay_end', text="Distance")
+                note = col.row()
+                note.active = False
+                note.label(text=area_watts_label(light, hs), icon='INFO')
+
+        col = layout.column()
+        if kind in ('POINT', 'SPOT'):
+            # softens the shadow; the lamp still lights from its centre
+            col.prop(light, 'shadow_soft_size', text="Radius")
+        elif kind == 'SUN':
+            col.prop(light, 'angle')
+        elif kind == 'AREA':
+            col.prop(light, 'shape')
+            sub = col.column(align=True)
+            if str(getattr(light, 'shape', 'SQUARE')) in ('RECTANGLE',
+                                                          'ELLIPSE'):
+                sub.prop(light, 'size', text="Size X")
+                sub.prop(light, 'size_y', text="Y")
+            else:
+                sub.prop(light, 'size')
+        if kind == 'SPOT':
+            col = layout.column()
+            col.prop(light, 'spot_size', text="Angle")
+            sub = col.column()
+            # Blend is Blender Internal's cone only, and only while
+            # the Hotspot is 0: the other cone laws never read it, and
+            # a Hotspot above zero replaces it (spot_cone_notes)
+            sub.active = (str(getattr(hs, 'spot_law', 'BLENDER')
+                              or 'BLENDER') == 'BLENDER'
+                          and not float(getattr(hs, 'hotspot', 0.0)
+                                        or 0.0) > 0.0
+                          and not getattr(hs, 'screen_spot', False))
+            sub.prop(light, 'spot_blend', text="Blend", slider=True)
+            col.prop(light, 'show_cone')
+            if getattr(light, 'use_square', False):
+                # Blender's own Square flag (a 2.79 file opened
+                # directly keeps it) renders as the Square cone; drawn
+                # only while set, so nothing hidden shapes the beam
+                col.prop(light, 'use_square', text="Square (Blender's)")
+
+        col = layout.column()
+        col.prop(light, 'use_shadow', text="Cast Shadow")
+
+        # Blender's Influence switches are honoured where they turn a
+        # lobe OFF; each is drawn only while it does, so a default lamp
+        # shows none and no hidden switch darkens one
+        ob = getattr(context, 'object', None)
+        if ob is not None and getattr(ob, 'data', None) != light:
+            ob = None                   # a pinned lamp: not this object's
+        off = []
+        if float(getattr(light, 'diffuse_factor', 1.0)) == 0.0:
+            off.append((light, 'diffuse_factor', "Diffuse Factor"))
+        if ob is not None and not getattr(ob, 'visible_diffuse', True):
+            off.append((ob, 'visible_diffuse', "Diffuse Ray Visibility"))
+        if float(getattr(light, 'specular_factor', 1.0)) == 0.0:
+            off.append((light, 'specular_factor', "Glossy Factor"))
+        if ob is not None and not getattr(ob, 'visible_glossy', True):
+            off.append((ob, 'visible_glossy', "Glossy Ray Visibility"))
+        if off:
+            col = layout.column()
+            note = col.row()
+            note.active = False
+            note.label(text="Blender's Influence switches a lobe off here",
+                       icon='INFO')
+            for owner, name, text in off:
+                col.prop(owner, name, text=text)
+
+
 class HALCYON_PT_light(HalcyonPanel, Panel):
     bl_label = "Halcyon Light"
     bl_context = "data"
@@ -2506,8 +3020,8 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
         light = context.light
         hs = light.halcyon
         col = layout.column()
-        col.prop(light, 'color')
-        col.prop(light, 'energy')
+        # R254: Colour and Power are the Light panel's rows (above);
+        # they were drawn here a second time
         # R253 light options: the lamp's second colour (GL_SPECULAR /
         # dcvSpecular) and Quake's lightstyle flicker
         col.prop(hs, 'specular_color')
@@ -2515,62 +3029,154 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
         sub = col.column()
         sub.active = hs.light_style != 'NORMAL'
         sub.prop(hs, 'light_style_rate')
+        # R254: what the style does on THIS frame (a still shows one
+        # step of it: most styles start on a full step, three on a dark
+        # one), read off the exporter's clock
+        style_now = light_style_status(hs, getattr(context, 'scene', None))
+        if style_now:
+            note = col.row()
+            note.active = style_now[1] == 'ERROR'
+            note.label(text=style_now[0], icon=style_now[1])
         col.separator()
         if light.type == 'AREA':
             # no decay menu for an area lamp: 2.79's lamp_get_visibility
             # skipped its falloff switch for LA_AREA, and so does the
             # engine -- distance speaks only through the form factor.
             # The BI pair instead: Distance (la->dist, the dist^2/A
-            # normalisation) and Gamma (la->k, its pow shaping)
-            col.prop(hs, 'decay_end', text="Distance")
+            # normalisation) and Gamma (la->k, its pow shaping).
+            # R254: Distance is drawn beside the Power it scales, in
+            # the Light panel, and only under Blender Internal power
+            # units -- a lamp in Blender's watts does not read it
             col.prop(hs, 'area_gamma')
-        else:
+        elif light.type != 'SUN':
+            # R254: no falloff rows on a Sun or a hemi -- a directional
+            # lamp never reaches attenuate() on either road, so the menu
+            # and its sliders changed no pixel there
             col.prop(hs, 'decay')
-            if hs.decay == 'CUSTOM':
-                col.prop(hs, 'decay_start')
-                col.prop(hs, 'decay_end')
+            # R254: the rows follow the law the lamp actually RUNS. A
+            # lamp left on Scene Default reads its own distance dials
+            # for whatever law the render chose, and used to draw none
+            # of them (the panel preview and the tests draw without a
+            # scene: Inverse Square, the render's own default)
+            mode = light_falloff_in_use(hs, getattr(context, 'scene', None))
+            if hs.decay == 'DEFAULT' and FALLOFF_ROWS.get(mode):
+                note = col.row()
+                note.active = False
+                note.label(text="This lamp's dials for the render's "
+                                "falloff", icon='INFO')
             # R251 F013: the POV fade distance / GX ref_dist is Falloff
-            # End; GL's kl/kq are the Lin/Quad sliders (BI_SLIDERS reads
-            # them too and drew them nowhere)
-            if hs.decay in ('POV_FADE_LINEAR', 'POV_FADE_SQUARE') or \
-                    hs.decay.startswith('GX_'):
-                col.prop(hs, 'decay_end')
-            if hs.decay in ('NOMINAL_INVERSE', 'NOMINAL_INV_SQUARE'):
-                # R253 (D): Max's R0 / LightWave's Range IS Falloff End
-                col.prop(hs, 'decay_end', text="Nominal Distance")
-            if hs.decay in ('GL_3TERM', 'BI_SLIDERS'):
-                col.prop(hs, 'decay_ld1')
-                col.prop(hs, 'decay_ld2')
-            if hs.decay.startswith('GX_'):
+            # End; GL's kl/kq are the Lin/Quad sliders. R253 (D): Max's
+            # R0 / LightWave's Range IS Falloff End. R254: the three
+            # Blender Internal laws are scaled by it too (their
+            # Distance) and drew it nowhere
+            for name, text in FALLOFF_ROWS.get(mode, ()):
+                if text:
+                    col.prop(hs, name, text=text)
+                else:
+                    col.prop(hs, name)
+            if mode.startswith('GX_'):
                 col.prop(hs, 'gx_ref_brite')
-            if light.type != 'SUN':
-                # R253 (E): 3ds Max's Near Attenuation fade-in (the far
-                # pair is the Custom Range falloff); never on a Sun or
-                # a hemi -- directional lamps carry no attenuation
-                col.prop(hs, 'decay_near_start')
-                col.prop(hs, 'decay_near_end')
+            # R254: Blender Internal's Sphere was exported and clipped
+            # the lamp on every road with no row to see or clear it. The
+            # laws that draw no distance of their own show the one the
+            # Sphere clips at while it is on
+            col.prop(hs, 'bi_sphere')
+            if hs.bi_sphere and not any(
+                    n == 'decay_end' for n, _t in FALLOFF_ROWS.get(mode, ())):
+                col.prop(hs, 'decay_end', text="Sphere Distance")
+            # R253 (E): 3ds Max's Near Attenuation fade-in (the far
+            # pair is the Custom Range falloff); never on a Sun or
+            # a hemi -- directional lamps carry no attenuation
+            col.prop(hs, 'decay_near_start')
+            col.prop(hs, 'decay_near_end')
         if light.type == 'SPOT':
-            col.prop(hs, 'hotspot')
+            # R251 F012: the cone law, then the dials THAT law reads.
+            # R254: Hotspot was drawn for every law and read by POV
+            # alone; it is the Blender Internal law's inner angle now
+            # and is drawn where it does something (the OpenGL and GX
+            # laws have no inner angle), as the exponent always was
+            col.prop(hs, 'spot_law')
+            rows, notes = spot_cone_notes(hs)
+            if 'hotspot' in rows:
+                col.prop(hs, 'hotspot')
+            if 'spot_exponent' in rows:
+                col.prop(hs, 'spot_exponent')
+            for text in notes:
+                note = col.row()
+                note.active = False
+                note.label(text=text, icon='INFO')
             # R253 (A): Blender Internal's Square cone
             col.prop(hs, 'spot_square')
-            # R251 F012: the cone law; the exponent only where a law
-            # reads it
-            col.prop(hs, 'spot_law')
-            if hs.spot_law in ('GL11', 'POV'):
-                col.prop(hs, 'spot_exponent')
             # R251 F015: the Model 3 screen spotlight
             col.prop(hs, 'screen_spot')
         col.separator()
+        # The method that will RUN for this lamp is what the rows below
+        # grey by: the lamp's own menu only decides under the render's
+        # Per Light (None always opts the lamp out), a hemi sun casts
+        # nothing, and the Shadows master switches all of it off. The
+        # rows used to grey by the lamp's menu alone -- under render
+        # Shadow Maps a lamp set to Ray Traced drew its live Clip
+        # planes greyed, and under render Ray Traced the dead map rows
+        # drew active
+        sh = getattr(getattr(context, 'scene', None), 'halcyon', None)
+        eff = light_shadow_method(light, hs, sh)
+        # a lamp that would trace while the Ray Shadows master is off
+        # casts nothing: its rows grey and one row says why
+        sh_on, sh_method, sh_rays, sh_samples = render_shadow_state(sh)
+        ray_off = eff == 'RAY' and not sh_rays
         col.prop(hs, 'shadow')
+        if sh_method is None:
+            pass
+        elif not sh_on:
+            note = col.row()
+            note.active = False
+            note.label(text="Shadows are switched off for the render",
+                       icon='INFO')
+        elif hs.shadow != 'NONE' and not getattr(light, 'use_shadow', True):
+            # Blender's own Shadow checkbox, drawn as Cast Shadow in
+            # the Light panel, vetoes the lamp at export
+            note = col.row()
+            note.active = False
+            note.label(text="Cast Shadow is off for this light "
+                            "(Light panel)", icon='INFO')
+        elif hs.shadow != 'NONE' and light.type == 'SUN' \
+                and getattr(hs, 'hemi', False):
+            note = col.row()
+            note.active = False
+            note.label(text="A hemi light casts no shadows", icon='INFO')
+        elif sh_method != 'PER_LIGHT' and hs.shadow != 'NONE' \
+                and hs.shadow != sh_method:
+            # the menu names a method the render's choice overrides:
+            # say so the moment it happens, with the way out beside it
+            note = col.column(align=True)
+            note.active = False
+            note.label(text="The render's Shadow Method is "
+                            + shadow_method_label(sh_method) + ":",
+                       icon='INFO')
+            note.label(text="this menu is only read under Per Light",
+                       icon='BLANK1')
+            col.operator('halcyon.shadows_per_light',
+                         text="Let Each Light Choose (Per Light)",
+                         icon='LIGHT')
+        if ray_off:
+            note = col.row()
+            note.alert = True
+            note.label(text="Ray Shadows is off: this light casts nothing",
+                       icon='ERROR')
         sub = col.column()
-        sub.active = hs.shadow != 'NONE'
-        sub.prop(hs, 'shadow_map_size')
-        sub.prop(hs, 'shadow_bias')
-        sub.prop(hs, 'shadow_map_depth')            # R251 C117
+        sub.active = eff != 'NONE' and not ray_off
+        if eff == 'PLANAR' and hasattr(sh, 'planar_plane_z'):
+            # the one dial a planar lamp reads lives on the render
+            # settings; under Per Light this is where it is reached
+            sub.prop(sh, 'planar_plane_z')
+        mapped = sub.column()
+        mapped.active = eff == 'MAP'
+        mapped.prop(hs, 'shadow_map_size')
+        mapped.prop(hs, 'shadow_bias')
+        mapped.prop(hs, 'shadow_map_depth')         # R251 C117
         if light.type in ('SPOT', 'POINT'):
             # R253 (F): BI's ClipSta / ClipEnd -- the map's planes
-            clip = sub.column()
-            clip.active = hs.shadow == 'MAP'
+            clip = mapped.column()
             clip.prop(hs, 'shadow_clip_start')
             clip.prop(hs, 'shadow_clip_end')
             if hs.shadow_clip_start > 0.0 or hs.shadow_clip_end > 0.0:
@@ -2578,7 +3184,9 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
                 note.active = False
                 note.label(text="The map's near and far planes; "
                                 "0 = automatic", icon='INFO')
-        if hs.shadow_map_size > 0 or hs.shadow_bias > 0.0:
+        if hs.shadow_map_size > 0 or hs.shadow_bias > 0.0 \
+                or hs.shadow_map_depth != 'INHERIT' \
+                or hs.shadow_samples > 0:
             note = sub.row()
             note.active = False
             note.label(text="Overrides the render setting; 0 = inherit",
@@ -2586,8 +3194,19 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
             sub.operator('halcyon.adopt_shadow_settings',
                          text="Use Render Shadow Settings",
                          icon='FILE_REFRESH').scope = 'ACTIVE'
-        sub.prop(hs, 'shadow_softness')
-        sub.prop(hs, 'shadow_samples')
+        mapped = sub.column()
+        mapped.active = eff == 'MAP'
+        mapped.prop(hs, 'shadow_softness')
+        both = sub.column()
+        both.active = eff in ('MAP', 'RAY')
+        both.prop(hs, 'shadow_samples')
+        if eff == 'RAY' and not ray_off and light_has_size(light) \
+                and (hs.shadow_samples or sh_samples) <= 1:
+            # one ray goes to the lamp's centre: the size dial is dead
+            note = sub.row()
+            note.active = False
+            note.label(text="Samples is 1: traced shadows are hard, "
+                            "size is ignored", icon='INFO')
         sub.prop(hs, 'shadow_density')
         sub.prop(hs, 'shadow_color')
         # R219: every lamp kind projects its cookie -- Spot through the
@@ -2606,18 +3225,54 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
         sub.prop(hs, 'cookie_offset')
         sub.prop(hs, 'cookie_tile')
         sub.prop(hs, 'cookie_rotation')
+        if light.type == 'AREA':
+            # R254: the projection's focus blur reads the lamp's source
+            # radius, which Blender's own panel draws for Point and Spot
+            # lamps only -- an Area lamp's gel could not be softened, and
+            # one converted from a Point was blurred by a value no panel
+            # showed
+            sub.prop(light, 'shadow_soft_size', text="Projection Blur")
         if hs.cookie is not None:
             note = sub.row()
             note.active = False
-            note.label(text="The lamp's Angle/Radius softens the "
-                            "projection", icon='INFO')
+            note.label(text=COOKIE_BLUR_NOTE.get(
+                light.type, COOKIE_BLUR_NOTE['POINT']), icon='INFO')
         col.separator()
         row = col.row(align=True)
         row.prop(hs, 'diffuse_only')
         row.prop(hs, 'specular_only')
+        if hs.diffuse_only and hs.specular_only:
+            # R254: the two boxes sit side by side and cancel each
+            # other -- each removes the other's lobe
+            note = col.row()
+            note.label(text="Diffuse Only + Specular Only: this lamp "
+                            "lights no surface", icon='ERROR')
         col.prop(hs, 'negative')
         col.prop(hs, 'only_shadow')
         col.prop(hs, 'ambient_only')
+        if hs.ambient_only:
+            # R254: what Energy MEANS on an ambient lamp. The pool takes
+            # colour x Energy as a flat level (1.0 = white), where every
+            # other use of a Point lamp's Energy divides its watts by
+            # 4 pi d^2 -- so the lamp's own Energy is drawn again here
+            # under the name it answers to, in red once it whites out
+            from .core import lights as _LIa
+            level = _LIa.ambient_level(light)
+            lvl = col.row()
+            lvl.alert = level > _LIa.AMBIENT_BRIGHT
+            lvl.prop(light, 'energy', text="Ambient Level")
+            note = col.row()
+            note.active = bool(lvl.alert)
+            note.label(
+                text=("A flat level, not watts: 1.0 = white ambient"
+                      if not lvl.alert else
+                      f"Level {level:.4g} whites out the frame: 1.0 = "
+                      "white ambient"),
+                icon='ERROR' if lvl.alert else 'INFO')
+            note = col.row()
+            note.active = False
+            note.label(text="No direct light, shadow, beam or flare",
+                       icon='BLANK1')
         if light.type == 'SUN':
             col.prop(hs, 'hemi')
             # R253 (C): the two-tone hemisphere's ground colour
@@ -2631,6 +3286,33 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
             sub = col.column()
             sub.active = hs.volumetric > 0.0
             sub.prop(hs, 'volumetric_occlusion')
+            # R254: the beam is drawn only while the render's Volumetric
+            # Lights switch is on (off by default, in a closed sub-panel
+            # of Render > Lighting). The lamp panel said nothing: the
+            # slider moved no pixel and nobody could tell why. The
+            # switch itself sits here while it is the reason
+            shs = getattr(getattr(context, 'scene', None), 'halcyon', None)
+            if hs.volumetric > 0.0 and shs is not None \
+                    and not getattr(shs, 'spot_cones', True):
+                warn = col.column(align=True)
+                warn.label(text="No beam: Volumetric Lights is off in "
+                                "Render > Lighting", icon='ERROR')
+                warn.label(text="(the lamp throws Light Shafts only)",
+                           icon='BLANK1')
+                warn.prop(shs, 'spot_cones',
+                          text="Enable Volumetric Lights (Render)")
+        elif hs.volumetric > 0.0:
+            # R254: a Sun's Volumetric is the screen-space Light Shafts,
+            # which converge on the sun's place in the sky -- nothing is
+            # drawn with the sun behind the camera, and the panel never
+            # said so. The same live answer the flare gets below
+            status = shaft_anchor_status(lamp_anchor_view(context, light))
+            if status:
+                srow = col.row()
+                srow.label(text=status[0], icon=status[1])
+                hint = col.row()
+                hint.active = False
+                hint.label(text=status[2], icon='BLANK1')
         col.separator()
         col.prop(hs, 'flare')
         sub = col.column()
@@ -2651,30 +3333,17 @@ class HALCYON_PT_light(HalcyonPanel, Panel):
             # render camera's frame RIGHT NOW? The field set the dial
             # and saw nothing; this line says why before a render does
             status = None
-            try:
-                from bpy_extras import object_utils as _ou
-                from mathutils import Vector as _V
-                cam = context.scene.camera
-                ob = context.object
-                if cam is not None and ob is not None:
-                    if light.type == 'SUN':
-                        d = (ob.matrix_world.to_3x3()
-                             @ _V((0.0, 0.0, -1.0))).normalized()
-                        pt = cam.matrix_world.translation - d * 1000.0
-                    else:
-                        pt = ob.matrix_world.translation
-                    co = _ou.world_to_camera_view(context.scene, cam, pt)
-                    if co.z <= 0.0:
-                        status = ("Anchor is BEHIND the render camera "
-                                  "-- no flare", 'ERROR')
-                    elif -0.2 <= co.x <= 1.2 and -0.2 <= co.y <= 1.2:
-                        status = ("Anchor is in the render camera's "
-                                  "frame", 'CHECKMARK')
-                    else:
-                        status = ("Anchor is OUTSIDE the render "
-                                  "camera's frame -- no flare", 'ERROR')
-            except Exception:                                   # noqa: BLE001
-                status = None
+            co = lamp_anchor_view(context, light)
+            if co is not None:
+                if co[2] <= 0.0:
+                    status = ("Anchor is BEHIND the render camera "
+                              "-- no flare", 'ERROR')
+                elif -0.2 <= co[0] <= 1.2 and -0.2 <= co[1] <= 1.2:
+                    status = ("Anchor is in the render camera's "
+                              "frame", 'CHECKMARK')
+                else:
+                    status = ("Anchor is OUTSIDE the render "
+                              "camera's frame -- no flare", 'ERROR')
             if status:
                 srow = sub.row()
                 srow.label(text=status[0], icon=status[1])
@@ -3667,6 +4336,7 @@ CLASSES = (
     HALCYON_OT_halo_ramp,
     HALCYON_OT_halo_node,                 # R253
     HALCYON_OT_adopt_shadow_settings,
+    HALCYON_OT_shadows_per_light,
 ) + RESOLUTION_MENUS + (
     HALCYON_MT_resolutions, HALCYON_PT_output,
     HALCYON_OT_fix_view_transform,
@@ -3685,9 +4355,11 @@ CLASSES = (
     HALCYON_PT_performance, HALCYON_PT_debug,
     HALCYON_OT_clear_palette_cache,
     HALCYON_OT_diagnostics, HALCYON_PT_material,
+    HALCYON_PT_light_native,              # R254: above Halcyon Light
     HALCYON_PT_light, HALCYON_PT_wireframe, HALCYON_PT_outline,
     HALCYON_PT_passes,
     HALCYON_PT_world, HALCYON_PT_world_sun,
+    HALCYON_PT_world_light,
     HALCYON_PT_world_atmosphere, HALCYON_PT_world_cumulus,
     HALCYON_PT_world_stratus, HALCYON_PT_world_effects,
     HALCYON_PT_world_ground, HALCYON_PT_world_weather,

@@ -118,7 +118,10 @@ class Material:
     # linec/starc; 0 = off), line_color (spec rgb), ring_color (mir
     # rgb), xalpha, soft, shaded, puno (the mode bits).
     halo: Optional[Dict[str, Any]] = None
-    # Cached compiled coded-shader programs keyed by node name.
+    # Compiled coded-shader programs, keyed by the node's GRAPH ID
+    # (export.node_id): its name in the material's own tree, its path
+    # inside a node group ('Group/Coded Shader'). A name alone is unique
+    # per tree only, and this one dict serves every tree of the material.
     programs: Dict[str, Any] = field(default_factory=dict)
     # Filled by the renderer: node names that could not be evaluated.
     unsupported: List[str] = field(default_factory=list)
@@ -176,6 +179,15 @@ class ObjectInfo:
     # never moves with the object; None = derive it from the mesh
     # (hand-built scenes, hair parts).
     gen_bounds: Optional[tuple] = None
+    # R254: light linking. `instancer` names the object that INSTANCES
+    # this one -- a collection-instance empty, a geometry-nodes or
+    # particle instancer ('' = a real object): a lamp linked to the
+    # instancer reaches every object it instances. `link_name` is the
+    # object's library-qualified name (Blender's name_full), which the
+    # exporter matches a link by, so a linked-library object does not
+    # answer for a local one of the same name ('' = match on `name`).
+    instancer: str = ''
+    link_name: str = ''
 
 
 @dataclass
@@ -317,6 +329,15 @@ class Light:
     # characters per second of scene.time; NORMAL ('m') is exactly 1.0
     light_style: str = 'NORMAL'
     light_style_rate: float = 10.0
+    # R254: a Spot whose object is scaled unevenly across its beam
+    # (Blender's elliptical cone, eevee_light.cc spot_size_inv). Export
+    # folds the WIDER of the two axes into spot_size / spot_blend, so
+    # every reader of the cone angle follows the round cone that
+    # circumscribes the ellipse; this pair then narrows the other axis:
+    # the tangent across the lamp's side / up axis is multiplied by it
+    # before the cosine is taken. (1, 1) -- a unit, uniform or round
+    # scale -- runs none of it
+    spot_scale: tuple = (1.0, 1.0)
     # the light's own X/Y axes, for oriented projection. Export fills them
     # from the object matrix; hand-built scenes may leave them None and get
     # a stable basis derived from the direction.
@@ -401,6 +422,19 @@ class World:
     cube_image_ny: Optional[ImageBuffer] = None
     cube_image_pz: Optional[ImageBuffer] = None
     cube_image_nz: Optional[ImageBuffer] = None
+    # ------------------------------------------------ R254 world light
+    # The world's own luminary as a scene light (core/worldlight.py): the
+    # Bryce sun or moon, the Physical sky's sun, a Sky Texture node's sun,
+    # or the sun found in (or typed in for) an HDRI / cube map becomes one
+    # SUN Light at render entry. Off by default: no mode reads the rest.
+    world_light: bool = False
+    world_light_strength: float = 1.0
+    world_light_shadow: str = 'MAP'      # NONE | MAP | RAY
+    world_light_shafts: float = 0.0      # the light's `volumetric`
+    world_light_find: str = 'DETECT'     # DETECT | MANUAL (HDRI / CUBEMAP)
+    world_light_elevation: float = 0.7   # MANUAL: sky-space, radians
+    world_light_azimuth: float = 0.6
+    world_light_color: tuple = (1.0, 1.0, 1.0)
     # ------------------------------------------------ Bryce's Sky Lab
     # Bryce's Sky & Fog palette offered a Sky Mode: Soft Sky drove the dome
     # from the sun's own colour, Custom Sky exposed the three stops directly.

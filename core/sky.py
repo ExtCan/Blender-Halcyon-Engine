@@ -2485,8 +2485,7 @@ def mode7_rows(world, inv, eye, Wo, Ho):
     eye32 = np.asarray(eye, np.float32)
 
     def ray(nx):                                              # _background_image's unproject, float32
-        pts = np.stack([nx, ny, np.ones(Ho, np.float32), np.ones(Ho, np.float32)], 1)
-        wv = pts @ inv.T
+        wv = M.unproject_far(nx, ny, inv)                     # its own chain (no matmul kernel)
         wv = wv[:, :3] / np.where(np.abs(wv[:, 3:4]) < 1e-9, 1e-9, wv[:, 3:4])
         return M.normalize(wv - eye32[None, :])
 
