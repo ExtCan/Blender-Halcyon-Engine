@@ -3206,6 +3206,22 @@ def test_bump_fed_by_a_bump_builds_its_fields_in_dependency_order():
             return _bump_fed(tree, _bump_lean(tree, normal), 'Bump B')
         return built_as(make)
 
+    # a master INSIDE a group whose Bump Height is fed by a Bump's normal (the Bump the socket desugars to sits
+    # in the group's tree): A in the material's tree, handed in at the group's Height input, or inside the group
+    def group_master(inside):
+        tree = types.SimpleNamespace(name='Floor', nodes=_CodeNodes(), links=_CodeLinks())
+        out = _code_plain(tree, 'Material Output', 'ShaderNodeOutputMaterial', ins=(('NodeSocketShader', 'Surface'),))
+        if inside:
+            inner = _master_group_tree(linked=False)
+            inner.links.new(_bump_lean(inner, _bump_chain(inner).outputs['Normal']),
+                            inner.nodes.get('Halcyon').inputs['Bump Height'])
+            node = _master_group_node(tree, 'Group', inner)
+        else:
+            node = _master_group_node(tree, 'Group', _master_group_tree(('Height',)),
+                                      {'Height': _bump_lean(tree, _bump_chain(tree).outputs['Normal'])})
+        tree.links.new(node.outputs['Surface'], out.inputs['Surface'])
+        return types.SimpleNamespace(name='Floor', use_nodes=True, node_tree=tree)
+
     def graph_of(mat):
         return EX.serialize_tree(mat.node_tree, {}, {}, [])
 
@@ -3290,6 +3306,10 @@ def test_bump_fed_by_a_bump_builds_its_fields_in_dependency_order():
     sugar = graph_of(built_as(lambda tree: _bump_lean(tree, _bump_chain(tree).outputs['Normal']), height=True))
     check('the master\'s own Bump Height fed by a Bump\'s normal: the Bump it desugars to is the second level',
           levels(NE.desugar_master_bump(sugar)) == [['Bump'], ['__bump_Halcyon']], str(levels(sugar)))
+    in_group = [levels(NE.desugar_master_bump(graph_of(group_master(inside)))) for inside in (False, True)]
+    check('...and so is a master\'s INSIDE a group, the Bump it desugars to filed in the group\'s tree: after a Bump of '
+          'the material\'s tree handed in at the group\'s input, and after one inside the group beside it',
+          in_group == [[['Bump'], ['Group/__bump_Halcyon']], [['Group/Bump'], ['Group/__bump_Halcyon']]], str(in_group))
 
     def looped(*feeds):
         """A hand-built graph of Bumps 'a', 'b', ...: each one's Height
@@ -3545,6 +3565,26 @@ def test_bump_fed_by_a_bump_builds_its_fields_in_dependency_order():
               'row and the region inside its rect, by more than 0.1',
               off > 0.1 and bands[0][1] - 1 in rows and rows_off(region_cut[y0:y1, x0:x1], tiled[y0:y1, x0:x1])[0] > 0.1,
               f'{off} {rows} {rows_off(region_cut[y0:y1, x0:x1], tiled[y0:y1, x0:x1])[0]}')
+
+        # ---- the master inside a group: its Bump Height fed by a Bump
+        mastered = shot(group_master(False))
+        mastered_runs = list(built)
+        R.MIN_CHUNK = R.MAX_CHUNK = 1 << 30
+        mastered_whole = shot(group_master(False))
+        R.MIN_CHUNK, R.MAX_CHUNK = keep_chunks
+        check('a master inside a group, its Bump Height the group\'s input fed by A\'s normal: two passes -- A\'s field, '
+              'then the desugared Bump\'s -- no chunk differenced, and the one-batch frame bit for bit',
+              [run['ids'] for run in mastered_runs] == [['Bump', 'Group/__bump_Halcyon']]
+              and mastered_runs[0]['contexts'] == 2 * mastered_runs[0]['chunks'] and mastered_runs[0]['fallbacks'] == 0
+              and same(mastered, mastered_whole), f'{mastered_runs} {rows_off(mastered, mastered_whole)}')
+        within = shot(group_master(True))
+        check('...and with A inside the group beside the master: the same two passes under the group\'s path ids, the '
+              'same frame', ids() == [['Group/Bump', 'Group/__bump_Halcyon']] and passes() == [2.0]
+              and built[0]['fallbacks'] == 0 and same(within, mastered_whole), f'{built} {rows_off(within, mastered_whole)}')
+        mastered_tiled = shot(group_master(False), floors=fine)
+        mastered_joined = np.concatenate([frame(group_master(False), floors=fine, band=band)[0] for band in bands], axis=0)
+        check('...and in three bands on the floor of small triangles: the whole frame\'s rows, bit for bit',
+              same(mastered_joined, mastered_tiled), str(rows_off(mastered_joined, mastered_tiled)))
 
         # ---- the GPU device
         reset()

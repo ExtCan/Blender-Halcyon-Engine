@@ -3204,7 +3204,7 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   are identical bit for bit, opaque, see-through, in three bands and in
   a region, and their pre-passes build the same number of contexts.
   Pinned in
-  `test_bump_fed_by_a_bump_builds_its_fields_in_dependency_order` (39
+  `test_bump_fed_by_a_bump_builds_its_fields_in_dependency_order` (43
   checks), through the real `serialize_tree`, with a spy on the pre-pass
   that says for every frame whether it ran, for which ids, how many
   times it evaluated the material, and whether any Bump differenced a
@@ -3214,8 +3214,9 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   with a second output no Bump feeds, a Bump read THROUGH another Bump's
   Normal socket and through its Strength or Distance, a link that passes
   a Reroute, a muted node and a group handing its input straight out, a
-  diamond, the master's desugared Bump Height, a loop of heights cut
-  rather than walked for ever); the probe at 320x240 in two passes with
+  diamond, the master's desugared Bump Height in the material's tree
+  and inside a group, a loop of heights cut rather than walked for
+  ever); the probe at 320x240 in two passes with
   no chunk differenced, bit for bit the one-batch frame; the old
   pre-pass put back (every Bump in one level) cutting a few rows by more
   than 0.1, so the frames can tell; a finer chunking (`MIN_CHUNK`
@@ -3229,7 +3230,10 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   wearing it (the floor and the ball: three ranks of mixed materials)
   with a stale field planted under the upstream Bump's key; three bands
   and a region of a floor of small triangles against the whole frame;
-  the GPU device on the stand-in driver (the probe refused by name and
+  a master INSIDE a group whose Bump Height is fed by a Bump -- the
+  entry above's rewrite and this order together -- against its
+  one-batch frame, and in three bands on that floor; the GPU device on
+  the stand-in driver (the probe refused by name and
   the CPU's pre-passed frame bit for bit; a group's Bump drawn by the
   deferred pass and a refine pass's flagged pixels bit for bit the whole
   frame's); and the rule read from the code (one order behind every
