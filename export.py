@@ -3562,6 +3562,9 @@ def export_scene(depsgraph, settings, warnings=None, space=None):
                 if f.name in ('graph', 'env_image', 'mist', 'mist_start',
                               'mist_depth', 'mist_color', 'mist_falloff',
                               'mist_intensity', 'ground_image',
+                              # R253 (review): the world tree's compiled
+                              # programs (filed with the graph, below)
+                              'programs',
                               # R253: the six cube-map slots (loaded below)
                               'cube_image_px', 'cube_image_nx',
                               'cube_image_py', 'cube_image_ny',
@@ -3632,7 +3635,15 @@ def export_scene(depsgraph, settings, warnings=None, space=None):
                         f"Ground material '{gm.name}' could not "
                         "serialize; the plane falls back to Solid")
         if compat.uses_nodes(bw) and bw.node_tree:
-            world.graph = serialize_tree(bw.node_tree, images, {}, warnings)
+            # R253 (review): the programs the world tree's Coded Shaders
+            # compile to ride beside the graph, as a material's and the
+            # ground material's do. This call handed serialize_tree a
+            # throwaway dict: _node_props compiled every program into it,
+            # filed under the node's graph id, and the dict was dropped on
+            # the next line -- the sky read zeros (core/render.world_color)
+            progs = {}
+            world.graph = serialize_tree(bw.node_tree, images, progs, warnings)
+            world.programs = progs
     if bscene.render.use_freestyle:
         warnings.append("Freestyle is not supported; use the Wireframe shader instead")
 
