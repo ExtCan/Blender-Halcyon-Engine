@@ -4272,6 +4272,11 @@ def _build_shadows(scene, st, mesh):
     if keep_tri is not None and not keep_tri.all():
         cast = np.nonzero(keep_tri)[0]
     LI.build_shadow_maps(scene, st, cast)
+    # what the mapped lookups read beside the depth: the radius of the
+    # scene the maps were framed by (it bounds the Bias in a scene
+    # smaller than a unit)
+    from . import softmap as _softmap
+    _softmap.stamp_scene(scene)
 
 
 def shaft_sources(scene, settings, vp):
@@ -4515,6 +4520,40 @@ def _flare_sources(scene, st, gbuf, vp):
                     'rings': int(getattr(light, 'flare_rings', 1)),
                     'ghosts': int(getattr(light, 'flare_ghosts', 6))})
     return out
+
+
+def _shadow_bias_note(scene, st):
+    """One line when the mapped shadows' Bias was scaled to a small
+    scene. The Bias is a world length (0.02 by default); a scene
+    modelled at centimetre size used to lose every mapped shadow to it,
+    and the tooltip's 'World-space offset' was the only hint why."""
+    try:
+        from . import softmap as _softmap
+        if not (st.shadows and st.shadow_default in ('MAP', 'PER_LIGHT')):
+            return
+        named = []
+        for light in (scene.lights or ()):
+            sm = getattr(light, 'shadow_map', None)
+            if sm is None or LI.midpoint_map(light, st):
+                continue
+            bias = float(getattr(light, 'shadow_bias', 0.0)
+                         or st.shadow_bias)
+            used = float(_softmap.scene_bias(sm, bias))
+            if bias > 0.0 and used != bias:
+                named.append((getattr(light, 'name', '?') or '?', bias,
+                              used, float(sm.scene_radius)))
+        if not named:
+            return
+        radius = named[0][3]
+        print(f'[Halcyon] shadows: the scene is {2.0 * radius:.3g} units '
+              f'across, smaller than the shadow Bias is made for (a world '
+              f'length); it is scaled to the scene: '
+              + ', '.join(f"'{n}' Bias {b:g} -> {u:.3g}"
+                          for n, b, u, _r in named[:4])
+              + '. Model at a larger scale, or lower Bias, to set it '
+                'yourself')
+    except Exception:                                           # noqa: BLE001
+        pass
 
 
 def _shadow_coarseness_note(scene, gbuf, proj, rh):
@@ -5492,6 +5531,7 @@ def render(scene, settings=None, progress=None, band=None):
                                   f'{v:.1f} ms'
                                   for k, v in _LR.items()))
         _shadow_coarseness_note(scene, gbuf, proj, rh)
+        _shadow_bias_note(scene, st)
         _sp = LAST_SPLIT
         if _sp.get('see_through'):
             named = '; '.join(f'{n}: {w}' for n, w

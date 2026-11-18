@@ -72,8 +72,11 @@ class ShadowMap:
     # rewritten in place must reset it to None. `pyr` is the sized
     # lookup's reach pyramid, filled lazily by core/softmap.map_pyramid
     # from `depth` and reset with it the same way
+    # `scene_radius`: the radius of the scene the map was baked for
+    # (core/softmap.stamp_scene, after the bake): what bounds the Bias
+    # in a scene smaller than a unit
     __slots__ = ('vp', 'depth', 'near', 'far', 'persp', 'size', 'origin',
-                 'extent', 'axes', 'd_min', 'digest', 'pyr')
+                 'extent', 'axes', 'd_min', 'digest', 'pyr', 'scene_radius')
 
     def __init__(self, vp, zndc, near, far, persp, size, origin, extent=1.0):
         self.vp = vp
@@ -184,7 +187,7 @@ class CubeShadow:
 
     # `pyr`: the six faces' reach pyramids (core/softmap.map_pyramid,
     # lazily; reset to None with any face's depth)
-    __slots__ = ('faces', 'origin', 'd_min', 'pyr')
+    __slots__ = ('faces', 'origin', 'd_min', 'pyr', 'scene_radius')
 
     def __init__(self, faces, origin):
         self.faces = faces
@@ -1745,6 +1748,10 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
     # zeroed inputs (Woo's rule, Maya's Use Mid Dist)
     mid = midpoint_map(light, settings)
     bias = 0.0 if mid else float(light.shadow_bias or settings.shadow_bias)
+    # the Bias is a world length: in a scene smaller than a unit it is
+    # scaled to the scene the map was baked for (`SM.scene_bias`), or a
+    # centimetre-sized scene would lose every mapped shadow to it
+    bias = SM.scene_bias(sm, bias)
     ndl = np.clip(M.dot(N, L), 0.0, 1.0)
     slope = bias * (1.0 + 2.0 * (1.0 - ndl))
     # the user's Softness: a constant blur in texels (the lamp's own
@@ -1780,11 +1787,19 @@ def visibility(light, P, N, L, dist, settings, bvh=None, rng=None,
                         mask=mask)
         dens = float(light.shadow_density)
         return (1.0 - (1.0 - lit) * dens).astype(np.float32)
+    # The constant lookup: a lamp of size 0 at Softness 1 or less, and
+    # every lamp at one Sample. Its kernel is never wider than a texel
+    # -- a wider Softness goes through the filter above, and at one
+    # Sample there is one tap and nothing to blur -- so the offset
+    # carries no Softness factor. It used to be max(1, Softness), which
+    # at one Sample lifted the receiver off its surface by a blur the
+    # single tap could not draw and SHRANK the hard shadow (a point
+    # lamp's lost a sixth of its area at Softness 4 and two thirds at
+    # 16). At Softness 1 or less the factor was 1: the same bits
     if mid:
         offset = np.zeros(n, np.float32)
     else:
-        offset = texel * (1.5 + 2.5 * np.sqrt(np.maximum(1.0 - ndl * ndl, 0.0))) * \
-            max(1.0, soft)
+        offset = texel * (1.5 + 2.5 * np.sqrt(np.maximum(1.0 - ndl * ndl, 0.0)))
     lit = sm.lookup(P + N * offset[:, None], slope, soft,
                     shadow_sample_count(light, settings))
     dens = float(light.shadow_density)

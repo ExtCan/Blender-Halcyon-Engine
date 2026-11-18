@@ -180,7 +180,7 @@ def test_a_softness_blurs_a_size_zero_lamp():
         for kw in ({'shadow_softness': 0.0}, {'shadow_softness': 0.5},
                    {'shadow_softness': 1.0},
                    {'shadow_softness': 1.0, 'shadow_samples': 16},
-                   {'shadow_softness': 4.0, 'shadow_samples': 1},
+                   {'shadow_softness': 1.0, 'shadow_samples': 1},
                    {'shadow_softness': 1.0,
                     'shadow_map_depth': 'MIDPOINT'},
                    {'shadow_softness': 2.0,
@@ -190,6 +190,17 @@ def test_a_softness_blurs_a_size_zero_lamp():
                                            MS._classic(sc, st, P))
         check(f'{kind} size 0: Softness at or below 1 (lamp x render) and '
               'Samples 1 keep the constant lookup, bitwise', same)
+        # R254 soft-search: this list held {'shadow_softness': 4.0,
+        # 'shadow_samples': 1} -- the hard shadow SHRINKING under a blur
+        # one tap cannot draw (the offset's max(1, Softness)), pinned
+        # bitwise. One Sample at Softness 4 is now the hard shadow of
+        # Softness 1
+        sc, st = MS._prep(kind, 0.0, shadow_softness=4.0, shadow_samples=1)
+        hard4 = MS._vis(sc, st, P)
+        sc, st = MS._prep(kind, 0.0, shadow_softness=1.0, shadow_samples=1)
+        check(f'{kind} size 0 at Samples 1: Softness 4 is the constant '
+              'lookup of Softness 1, bitwise (it shrank the shadow)',
+              np.array_equal(hard4, MS._classic(sc, st, P)))
     lt = MS._lamp('POINT', 0.0)
     check('the rule is one function: a size-0 lamp takes the sized lookup '
           'above Softness 1 at Samples above 1, and only then',

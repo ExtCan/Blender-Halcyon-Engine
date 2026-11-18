@@ -813,6 +813,8 @@ def _shadow_meta(light, st, bvh=None, want_atlas=True):
     bias = float(getattr(light, 'shadow_bias', 0.0) or st.shadow_bias)
     if mid:
         bias = 0.0
+    # the CPU's own rule for a scene smaller than a unit
+    bias = _softmap.scene_bias(sm, bias)
     meta = {
         'faces': [{'vp': np.asarray(f.vp, np.float32)} for f in faces_sm],
         'size': size, 'near': float(first.near), 'far': float(first.far),

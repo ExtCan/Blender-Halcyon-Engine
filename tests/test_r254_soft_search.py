@@ -29,6 +29,10 @@ Each test below states one law as a number:
     g  a strip Area lamp's thin side stays sharp (SP-2): the filter's
        lattice takes a finer stride across a footprint's short side, and
        a round footprint keeps its one stride bit for bit
+    h  a lamp at one Sample is hard and does not shrink under a Softness
+       it cannot draw
+    i  a scene smaller than a unit keeps its mapped shadows (SP-3): the
+       Bias is bounded by the scene the map was baked for
 
     python -m halcyon.tests.test_r254_soft_search
 """
@@ -605,6 +609,186 @@ def test_g_a_strip_lamp_keeps_its_thin_side_sharp():
               'picture on both value roads', max(worst) < 6e-3,
               f'max |sim - cpu| {worst[0]:.6f} (texels), {worst[1]:.6f} '
               '(literals)')
+
+
+def test_h_one_sample_does_not_shrink_under_softness():
+    """One Sample is the hard single-tap lookup for every lamp, and one
+    tap cannot blur: the Softness must not move it. The normal offset
+    carried max(1, Softness), which lifted the receiver off its surface
+    and shrank the hard shadow."""
+    P, cell = MS._floor_grid()
+    for kind, size in (('POINT', 0.0), ('SPOT', 0.0), ('SUN', 0.0),
+                       ('POINT', 0.25)):
+        first, same, masses = None, True, []
+        for soft in (1.0, 4.0, 8.0, 16.0):
+            sc, st = MS._prep(kind, size, shadow_samples=1,
+                              shadow_softness=soft)
+            v = MS._vis(sc, st, P)
+            masses.append(float((1.0 - v).sum() * cell))
+            if first is None:
+                first = v
+            same = same and np.array_equal(v, first)
+        check(f'{kind} size {size} at Samples 1: Softness 1 / 4 / 8 / 16 '
+              'is one hard shadow, bit for bit', same
+              and len(np.unique(first)) == 2,
+              'mass ' + ' / '.join(f'{m:.2f}' for m in masses))
+    # the lamp's own dials: Samples 1 on the lamp, Softness 8 on the lamp
+    sc, st = MS._prep('POINT', 0.0, lamp_kw={'shadow_samples': 1})
+    a = MS._vis(sc, st, P)
+    sc, st = MS._prep('POINT', 0.0, lamp_kw={'shadow_samples': 1,
+                                             'shadow_softness': 8.0})
+    b = MS._vis(sc, st, P)
+    check("the lamp's own Samples 1 and Softness 8: the same shadow",
+          np.array_equal(a, b))
+    # the other road: the factor rides its texel (and is a literal on
+    # the literal road), so the text does not move with the Softness
+    texts = {}
+    for texels in (True, False):
+        for soft in (1.0, 8.0):
+            GSH.SHADOW_TEXELS = texels
+            try:
+                st = MS._settings(shadow_samples=1, shadow_softness=soft)
+                sc = MS._wall(MS._lamp('POINT', 0.0), st)
+                LI.clear_shadow_cache()
+                cpu, sim, cov, passes, atlases, why = MS._gpu(sc, st)
+            finally:
+                GSH.SHADOW_TEXELS = True
+            d = float(np.abs(sim[cov] - cpu[cov][:, :3]).max()) \
+                if sim is not None else 1e9
+            texts[(texels, soft)] = MS._sources(passes) if passes else ''
+            check(f'Samples 1 at Softness {soft:g} '
+                  f'({"texels" if texels else "literals"}): the simulator '
+                  'shades the CPU picture', d < 1e-4, f'max {d:.6f}')
+            if texels and soft == 8.0:
+                tex = atlases['hal_lights'][1]() if callable(
+                    atlases['hal_lights'][1]) else atlases['hal_lights'][1]
+                tex = np.asarray(tex)
+                check("the constant lookup's offset factor is the texel "
+                      'h2.y = 1 at any Softness (it was max(1, Softness))',
+                      float(tex[0, 16 + 2, 1]) == 1.0
+                      and float(tex[0, 16 + 2, 2]) == 8.0,
+                      str(tex[0, 16 + 2]))
+    check('the text of a hard lamp does not move with the Softness on '
+          'either value road',
+          texts[(True, 1.0)] == texts[(True, 8.0)]
+          and texts[(False, 1.0)] == texts[(False, 8.0)]
+          and 'hal_shadow_vis0' in texts[(True, 1.0)])
+    # no shipped preset pairs mapped shadows at one Sample with a
+    # Softness above 1: none of their pictures moves
+    from ..presets import library as PL
+    paired = [k for k, v in PL.PRESETS.items()
+              if isinstance(v, dict)
+              and int(v.get('settings', {}).get('shadow_samples', 4)) == 1
+              and float(v.get('settings', {}).get('shadow_softness', 1.0))
+              > 1.0
+              and v.get('settings', {}).get('shadow_default', 'MAP')
+              != 'RAY']
+    check('no shipped preset pairs mapped shadows at Samples 1 with a '
+          'Softness above 1', not paired and len(PL.PRESETS) > 20,
+          f'{len(PL.PRESETS)} presets, paired: {paired}')
+
+
+def _scaled_wall(scale, kind, size, **stkw):
+    """The wall scene with every length times `scale` (a Sun's angle is
+    no length), the lamp's energy scaled to keep the picture."""
+    st = MS._settings(**stkw)
+    k = float(scale)
+    lt = MS._lamp(kind, size if kind == 'SUN' else size * k,
+                  pos=tuple(c * k for c in MS.LAMP_POS),
+                  aim=tuple(c * k for c in MS.LAMP_AIM))
+    if kind != 'SUN':
+        lt.energy = lt.energy * k * k
+    sc = MS._finish([plane(z=0.0, size=14.0 * k, mat=0, obj=0),
+                     MS._box((-0.6 * k, -0.15 * k, 0.0),
+                             (0.6 * k, 0.15 * k, 3.0 * k))], lt, st,
+                    eye=(7.0 * k, -3.5 * k, 7.0 * k),
+                    at=(0.3 * k, 1.9 * k, 0.0))
+    sc.camera.clip_start = 0.1 * k
+    sc.camera.clip_end = 200.0 * k
+    return sc, st
+
+
+def test_i_a_small_scene_keeps_its_mapped_shadows():
+    """SP-3. The default Bias is 0.02 WORLD units: in a scene modelled
+    at centimetre size it is larger than the casters stand off their
+    receivers, and every mapped shadow was gone."""
+    import contextlib
+    import io
+    P1, cell = MS._floor_grid()
+    for kind, size in (('POINT', 0.0), ('POINT', 0.25), ('SUN', 0.05),
+                       ('SPOT', 0.0)):
+        mass = {}
+        for scale in (1.0, 0.01):
+            sc, st = _scaled_wall(scale, kind, size)
+            LI.clear_shadow_cache()
+            LI.build_shadow_maps(sc, st)
+            if scale == 1.0:
+                bare = MS._vis(sc, st, P1)
+            SM.stamp_scene(sc)
+            v = MS._vis(sc, st, (P1 * f32(scale)).astype(np.float32))
+            mass[scale] = float((1.0 - v).sum() * cell)
+            if scale == 1.0:
+                same = np.array_equal(v, bare)
+                radius = float(sc.lights[0].shadow_map.scene_radius)
+        check(f'{kind} size {size}: the scene at a hundredth of its size '
+              'casts the same shadow (it cast none)',
+              abs(mass[0.01] - mass[1.0]) < 0.12 * mass[1.0],
+              f'mass {mass[1.0]:.2f} at scale 1, {mass[0.01]:.2f} at 0.01 '
+              '(in the scaled floor grid)')
+        check(f'{kind} size {size}: at a radius of {radius:.1f} units the '
+              "Bias is the dial's own, bit for bit", same and radius > 1.0)
+    # the rule itself
+    sc, st = _scaled_wall(0.01, 'POINT', 0.0)
+    LI.clear_shadow_cache()
+    LI.build_shadow_maps(sc, st)
+    sm = sc.lights[0].shadow_map
+    unstamped = SM.scene_bias(sm, 0.02)
+    SM.stamp_scene(sc)
+    r = float(sm.scene_radius)
+    check('under a scene radius of one unit the Bias scales with the '
+          'radius (the default is then 2 % of it); a map nobody stamped '
+          'keeps the dial',
+          unstamped == 0.02 and 0.05 < r < 0.2
+          and SM.scene_bias(sm, 0.02) == 0.02 * r
+          and SM.scene_bias(sm, 0.0) == 0.0, f'radius {r:.4f}')
+    sm.scene_radius = 1.0
+    check('at exactly one unit it is the dial',
+          SM.scene_bias(sm, 0.02) == 0.02)
+    # the render path stamps the maps it bakes and says so once
+    for scale, want in ((0.01, True), (1.0, False)):
+        sc, st = _scaled_wall(scale, 'POINT', 0.0)
+        LI.clear_shadow_cache()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            img = np.asarray(MS.R.render(sc, st))
+        st2 = MS._settings(shadows=False)
+        sc2, _st = _scaled_wall(scale, 'POINT', 0.0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            ref = np.asarray(MS.R.render(sc2, st2))
+        lost = float((ref[..., :3] - img[..., :3]).sum())
+        said = 'Bias' in out.getvalue() and 'scaled to the scene' \
+            in out.getvalue()
+        check(f'a frame at scale {scale:g}: the shadow is in the picture'
+              + (', and the console says the Bias was scaled' if want
+                 else ', and the console says nothing about the Bias'),
+              lost > 1.0 and said == want
+              and getattr(sc.lights[0].shadow_map, 'scene_radius', None)
+              is not None, f'light the shadow removes: {lost:.1f}')
+    # both roads read one Bias
+    for kind, size in (('POINT', 0.0), ('POINT', 0.25), ('SUN', 0.05)):
+        sc, st = _scaled_wall(0.01, kind, size)
+        LI.clear_shadow_cache()
+        with contextlib.redirect_stdout(io.StringIO()):
+            cpu, sim, cov, passes, atlases, why = MS._gpu(sc, st)
+        meta, _a, _w = GSH._shadow_meta(sc.lights[0], st)
+        d = float(np.abs(sim[cov] - cpu[cov][:, :3]).max()) \
+            if sim is not None else 1e9
+        check(f'{kind} size {size} at scale 0.01: the simulator shades '
+              'the CPU picture with the scaled Bias',
+              d < 6e-3 and meta is not None
+              and 0.0 < meta['bias'] < 0.005,
+              f'max |sim - cpu| {d:.6f}, Bias {meta["bias"]:.5f}'
+              if meta else str(why))
 
 
 def main():

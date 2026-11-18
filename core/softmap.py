@@ -409,6 +409,41 @@ def map_d_min(sm):
     return float(sm.depth.min())
 
 
+def stamp_scene(scene):
+    """Park the scene's radius -- `lights.scene_bounds`, what every map
+    of this bake was framed by -- on each lamp's map (`scene_radius`).
+    core/render calls it right after the bake; a map baked any other
+    way carries none and its Bias is used as it is."""
+    mesh = getattr(scene, 'mesh', None)
+    verts = getattr(mesh, 'verts', None)
+    if verts is None or not getattr(verts, 'size', 0):
+        return
+    lo = verts.min(axis=0)
+    hi = verts.max(axis=0)
+    radius = float(np.linalg.norm(hi - lo)) * 0.5 + 1e-4
+    for light in (getattr(scene, 'lights', None) or ()):
+        sm = getattr(light, 'shadow_map', None)
+        if sm is not None:
+            try:
+                sm.scene_radius = radius
+            except AttributeError:
+                pass
+
+
+def scene_bias(sm, bias):
+    """The Bias a mapped lookup runs with. It is a WORLD length (0.02 by
+    default), made for scenes a unit or more across: in a scene modelled
+    at centimetre size it is larger than the casters stand off their
+    receivers and every mapped shadow is gone. Under a scene radius of
+    one unit the Bias scales with the radius -- the default is then 2 %
+    of it, where a shadow stays whole -- and at one unit or more it is
+    the dial's own value, bit for bit."""
+    r = getattr(sm, 'scene_radius', None)
+    if r is None or not (float(r) < 1.0):
+        return bias
+    return bias * float(r)
+
+
 def pyr_layout(size):
     """Where one face's reach pyramid keeps its levels, for a map face
     of `size` texels: {'levels': [(T, n, ox, oy)], 'w', 'h'} -- level j
