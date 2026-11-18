@@ -350,25 +350,35 @@ def test_a_size_zero_is_the_old_lookup():
     lookup, statement for statement, and the old shader text."""
     P, _cell = _floor_grid()
     for kind in ('POINT', 'SPOT', 'SUN', 'AREA'):
-        for kw in ({}, {'shadow_softness': 4.0, 'shadow_samples': 9},
+        # R254 map-gpu: the constant lookup is a size-0 lamp's at a
+        # Softness of one texel or less (this list held Softness 4,
+        # where the lifted lookup shrank the shadow; see below)
+        for kw in ({}, {'shadow_softness': 1.0, 'shadow_samples': 9},
                    {'shadow_softness': 0.0}, {'shadow_map_depth': 'MIDPOINT'}):
             sc, st = _prep(kind, 0.0, **kw)
             check(f'{kind} size 0 {kw or ""}: the term is the classic PCF '
                   'lookup, bitwise',
                   SM.lamp_shape(sc.lights[0]) is None
                   and np.array_equal(_vis(sc, st, P), _classic(sc, st, P)))
+        sc, st = _prep(kind, 0.0, shadow_softness=4.0, shadow_samples=9)
+        check(f'{kind} size 0 at Softness 4: the blur is the plane-biased '
+              'filter with no lamp term, no longer the lifted constant '
+              'lookup',
+              SM.lamp_shape(sc.lights[0]) is None
+              and SM.lookup_shape(sc.lights[0], 9, 4.0) is not None
+              and not np.array_equal(_vis(sc, st, P), _classic(sc, st, P)))
     # the GPU road: no sized key in the meta, the atlas or the text
     for kind in ('POINT', 'SPOT', 'SUN'):
         sc, st = _prep(kind, 0.0)
         meta, atlas, why = GSH._shadow_meta(sc.lights[0], st)
-        key, build = atlas
+        key, build = atlas[0], atlas[1]
         px = build()
         text = GM._shadow_function(0, dict(meta, voff=0),
                                    {'shadow_samples': 4})
         check(f'{kind} size 0: the shadow meta, atlas and shader text '
               'carry nothing of the sized lookup',
               'soft' not in meta and 'sized' not in key
-              and float(np.abs(px[..., 1:]).max()) == 0.0
+              and px.ndim == 2
               and 'hal_sm_' not in text and '.g;' not in text
               and text.count('texelFetch(hal_shadowpack') == 4,
               f'key {key[:4]}')
@@ -719,12 +729,19 @@ def test_h_a_sized_lamp_does_not_erode_under_softness():
           'plane is exact and whole towards grazing light',
           np.allclose(sc_, [0.25, 0.25, 0.25, 0.625, 1.0, 1.0], atol=1e-6),
           str(np.round(sc_, 3)))
-    # the user Softness of a lamp WITHOUT a size is not touched here
+    # the user Softness of a lamp WITHOUT a size: the same filter with no
+    # lamp term (R254 map-gpu; it was the lifted constant lookup here,
+    # 'its own decision', which lost 37% of the mass at Softness 8)
     P, _c = _floor_grid()
+    sc, st = _prep('POINT', 0.0, shadow_softness=1.0)
+    m1, _a1 = _mass(sc, st)
     sc, st = _prep('POINT', 0.0, shadow_softness=8.0)
-    check('a lamp of size 0 at Softness 8 is still the classic lookup '
-          '(its own decision)', np.array_equal(_vis(sc, st, P),
-                                               _classic(sc, st, P)))
+    m8, _a8 = _mass(sc, st)
+    check('a lamp of size 0 at Softness 8 keeps its mass too (the same '
+          'filter, no lamp term)',
+          abs(m8 / m1 - 1.0) < 0.1
+          and not np.array_equal(_vis(sc, st, P), _classic(sc, st, P)),
+          f'{m1:.2f} -> {m8:.2f}')
 
 
 def test_i_a_size_edit_rebakes_nothing():
@@ -819,40 +836,51 @@ def test_j_the_gpu_twin():
           float(np.abs(R.render(sc, st) - lit).max()) > 0.05)
 
     # what rides a texel: the map's nearest depth. A caster moving nearer
-    # the lamp (inside the scene's bounds) re-keys the atlas and leaves
-    # the shader text alone
+    # the lamp (inside the scene's bounds) re-stamps the atlas and leaves
+    # the shader text alone. R254 map-gpu: the depth sat in the G channel
+    # of the lamp's first atlas texel and re-KEYED the atlas; the pack is
+    # one channel now, the depth is the lamp's tail texel h4.x in
+    # hal_lights, and the atlas keeps its key (one resident pack) under
+    # a new content stamp
     def plan(extra):
         st = _settings()
         sc = _wall(_lamp('POINT', 0.3), st, extra=extra)
         LI.clear_shadow_cache()
         _cpu, sim, _cov, passes, atlases, why = _gpu(sc, st)
-        key, build = atlases['hal_shadowpack']
-        return _sources(passes), key, build(), sc.lights[0].shadow_map
-    t0, k0, px0, sm0 = plan([_box((2.0, 2.0, 0.0), (2.4, 2.4, 0.5))])
-    t1, k1, px1, sm1 = plan([_box((2.0, -2.0, 2.0), (2.4, -1.6, 2.9))])
-    check('the nearest depth of the map rides the G channel of the '
-          "lamp's first atlas texel",
-          float(px0[0, 0, 1]) == f32(sm0.d_min)
-          and float(px1[0, 0, 1]) == f32(sm1.d_min)
-          and sm1.d_min < sm0.d_min
-          and float(np.abs(px0[..., 1]).sum()) == float(px0[0, 0, 1]),
+        key, build, stamp = atlases['hal_shadowpack']
+        return (_sources(passes), key, stamp, build(),
+                atlases['hal_lights'][1](), sc.lights[0].shadow_map)
+    t0, k0, s0, px0, lt0, sm0 = plan([_box((2.0, 2.0, 0.0), (2.4, 2.4, 0.5))])
+    t1, k1, s1, px1, lt1, sm1 = plan([_box((2.0, -2.0, 2.0),
+                                           (2.4, -1.6, 2.9))])
+    h4 = GM.LIGHT_TEXEL_STRIDE + 4       # one lamp: its tail block's h4
+    check("the nearest depth of the map rides the lamp's tail block in "
+          'hal_lights, and the pack is one channel of depth',
+          float(lt0[0, h4, 0]) == f32(sm0.d_min)
+          and float(lt1[0, h4, 0]) == f32(sm1.d_min)
+          and sm1.d_min < sm0.d_min and px0.ndim == 2,
           f'{sm0.d_min:.4f} -> {sm1.d_min:.4f}')
-    check('a nearer caster re-keys the atlas and leaves the shader text '
-          'untouched', k0 != k1 and t0 == t1)
-    # what is baked: the size is structure
+    check('a nearer caster re-stamps the atlas under the same key and '
+          'leaves the shader text untouched',
+          k0 == k1 and s0 != s1 and t0 == t1)
+    # what is baked: the SHAPE is structure, the size is a value (it was
+    # a literal, and each of these four pinned `!=`)
     st = _settings()
-    for a, b, what in ((_lamp('POINT', 0.2), _lamp('POINT', 0.3), 'radius'),
-                       (_lamp('SUN', 0.02), _lamp('SUN', 0.05), 'angle'),
-                       (_lamp('AREA', (1.0, 0.5)), _lamp('AREA', (1.0, 0.6)),
-                        'Size Y'),
-                       (_lamp('AREA', 1.0),
-                        _lamp('AREA', 1.0, area_shape='DISK'), 'shape')):
+    for a, b, what, same in (
+            (_lamp('POINT', 0.2), _lamp('POINT', 0.3), 'radius', True),
+            (_lamp('SUN', 0.02), _lamp('SUN', 0.05), 'angle', True),
+            (_lamp('AREA', (1.0, 0.5)), _lamp('AREA', (1.0, 0.6)),
+             'Size Y', True),
+            (_lamp('AREA', 1.0),
+             _lamp('AREA', 1.0, area_shape='DISK'), 'shape', False)):
         for l in (a, b):
             sc = _wall(l, st)
             LI.clear_shadow_cache()
             LI.build_shadow_maps(sc, st)
-        check(f"a mapped lamp's {what} is light-signature structure (it "
-              'is baked as a literal)', GSH._light_sig(a) != GSH._light_sig(b))
+        check(f"a mapped lamp's {what} is "
+              + ('a texel value: the light signature does not move'
+                 if same else 'light-signature structure'),
+              (GSH._light_sig(a) == GSH._light_sig(b)) == same)
     # the strict front-end, when it is installed
     try:
         from . import glsl_strict as GS

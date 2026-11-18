@@ -471,12 +471,64 @@ def mapped_shadow_cases():
                 cases.append((f'{kind} size {size} midpoint, 16 samples', l,
                               {'shadow_map_depth': 'MIDPOINT',
                                'shadow_samples': 16}))
+            else:
+                # R254 map-gpu: Softness above a texel sends a size-0
+                # lamp through the sized lookup with no lamp term
+                cases.append((f'{kind} size 0, Softness 4', l,
+                              {'shadow_softness': 4.0}))
     return cases
+
+
+def traced_shadow_cases():
+    """(label, light): the traced shadow functions and the Area form
+    factor, whose sizes ride hal_lights texels since R254 map-gpu."""
+    from ..core.scene import Light
+    cases = []
+    for kind, size, extra in (('POINT', 0.0, {'shadow_density': 0.6}),
+                              ('POINT', 0.3, {}), ('SPOT', 0.3, {}),
+                              ('SUN', 0.1, {}), ('SUN', 2.0, {}),
+                              ('AREA', 0.8, {}),
+                              ('AREA', 0.8, {'area_shape': 'DISK',
+                                             'area_gamma': 0.8}),
+                              ('POINT', 0.3, {'shadow_color':
+                                              (0.2, 0.1, 0.0),
+                                              'shadow_density': 0.5})):
+        kw = dict(type=kind, name='L', position=(1.5, 2.5, 4.0),
+                  direction=(-0.3, -0.5, -0.8), energy=3.0 if kind == 'SUN'
+                  else 900.0, shadow='RAY')
+        if kind == 'AREA':
+            l = Light(area_size=(size, size * 0.5), area_x=(1, 0, 0),
+                      area_y=(0, 1, 0), **kw)
+        else:
+            l = Light(radius=size, **kw)
+        if kind == 'SPOT':
+            l.spot_size = 1.2
+        for k, v in extra.items():
+            setattr(l, k, v)
+        cases.append((f'{kind} size {size} {extra or ""}'.strip(), l))
+    return cases
+
+
+def _both_value_roads(label, plan):
+    """Compile the plan `plan()` makes on the texel road (the shadow
+    values fetched from hal_lights) and on the literal road (the same
+    float32 values printed), the suite's A/B of gpu/shade.SHADOW_TEXELS."""
+    out = []
+    for flag, road in ((True, 'texels'), (False, 'literals')):
+        old = GSH.SHADOW_TEXELS
+        GSH.SHADOW_TEXELS = flag
+        try:
+            srcs, why = plan()
+        finally:
+            GSH.SHADOW_TEXELS = old
+        out.append(_record(f'{label} ({road})', srcs, why))
+    return out
 
 
 def check_mapped_shadows():
     """The shadow-map terms (the model sweep above plans with shadows
-    off, so no shadow function reached the front-end before R254)."""
+    off, so no shadow function reached the front-end before R254), on
+    both value roads."""
     counts = {'ok': 0, 'refused': 0, 'bad': 0}
     for label, light, over in mapped_shadow_cases():
         st = base_settings(24, 18, shadows=True, shadow_default='MAP',
@@ -484,9 +536,38 @@ def check_mapped_shadows():
         sc = demo_scene(st, with_texture=False)
         sc.lights = [light]
         R.render(sc, st)                    # bakes the map the plan packs
-        srcs, why = _pass_sources(sc, st)
-        counts[_record(f'mapped shadow, {label}', srcs, why)] += 1
+        for got in _both_value_roads(f'mapped shadow, {label}',
+                                     lambda: _pass_sources(sc, st)):
+            counts[got] += 1
     print(f'  mapped shadows: {counts}')
+
+
+def check_traced_shadows():
+    """The traced shadow functions (hard, soft, a Sun's two laws, an
+    Area's rectangle and ellipse) and the Area form factor, on both
+    value roads."""
+    from ..core.bvh import BVH
+    counts = {'ok': 0, 'refused': 0, 'bad': 0}
+    for label, light in traced_shadow_cases():
+        st = base_settings(24, 18, shadows=True, shadow_default='PER_LIGHT')
+        sc = demo_scene(st, with_texture=False)
+        sc.lights = [light]
+
+        def plan(sc=sc, st=st):
+            st.render_device = 'GPU'
+            g, job = _job_for(sc, st)
+            job = R.ShadeJob(sc, st, job.textures,
+                             BVH.cached(sc.mesh.verts, sc.mesh.tris),
+                             job.view, job.eye, job.width, job.height)
+            GSH._PLAN_CACHE.clear()
+            passes, why, _atl = GSH.plan_frame(job, g)
+            if passes is None:
+                return None, why
+            return [x for ps in passes for x in ps
+                    if isinstance(x, str) and 'void main' in x], None
+        for got in _both_value_roads(f'traced shadow, {label}', plan):
+            counts[got] += 1
+    print(f'  traced shadows: {counts}')
 
 
 def main():
@@ -501,7 +582,7 @@ def main():
     print(f'glsl_strict: {_glslang()}')
     for fn in (check_models, check_console, check_masters, check_shadow_kinds,
                check_stages, check_sky_and_kernels, check_mapped_shadows,
-               check_compute_raster, check_coded):
+               check_traced_shadows, check_compute_raster, check_coded):
         try:
             fn()
         except Exception as exc:                                # noqa: BLE001

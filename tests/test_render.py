@@ -8371,9 +8371,11 @@ def test_deferred_shading_carries_the_shadows():
           == ['hal_shadowpack'], str(sorted(atlases)))
     entry = atlases.get('hal_shadowpack')
     pack = entry[1]() if entry is not None else None
+    # R254 map-gpu: the pack is ONE channel of depth (it was RGBA32F
+    # with three channels of zeros: `pack.ndim == 3 and shape[2] == 4`)
     check('the combined atlas builds, one row band per light, '
           'cube faces included',
-          pack is not None and pack.ndim == 3 and pack.shape[2] == 4
+          pack is not None and pack.ndim == 2
           and float(np.abs(pack).sum()) > 0.0,
           str(None if pack is None else pack.shape))
 

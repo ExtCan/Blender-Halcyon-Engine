@@ -9,9 +9,10 @@ the penumbra by similar triangles and filter the map over exactly that
 footprint. This module is that lookup for the CPU road; gpu/softmap.py
 emits the same statements as GLSL, tap for tap.
 
-A lamp of size 0 never comes here, and no lamp does at Samples 1:
-`lights.visibility` keeps the constant PCF lookup for them
-(`ShadowMap.lookup`), untouched (`lookup_shape`).
+No lamp comes here at Samples 1, and a lamp of size 0 comes only when
+the user's Softness is above one texel (its footprint is then the
+Softness alone, `zero_shape`): `lights.visibility` keeps the constant
+PCF lookup for the rest (`ShadowMap.lookup`), untouched (`lookup_shape`).
 
 THE LOOKUP (one lamp, one receiver point P' already stepped off its
 surface by the caller -- `offset_scale` says how far --, shading normal N,
@@ -185,16 +186,46 @@ def offset_scale(ndl):
     return (f32(OFFSET_BASE) + f32(1.0 - OFFSET_BASE) * w).astype(np.float32)
 
 
-def lookup_shape(light, samples):
-    """The lamp's shape when its mapped shadow takes the sized lookup,
-    else None (the constant PCF lookup): a lamp of size 0 -- and ANY lamp
-    at Samples 1. One sample is the hard single-tap lookup whatever the
-    lamp's size, the rule the traced road has always had (one sample,
-    one hard ray), and what the 'hard shadow maps' presets ask for with
-    Samples 1 on lamps that carry Blender's default sizes."""
+def zero_shape(light):
+    """The shape of a lamp of size 0 in the sized lookup's own terms: no
+    footprint at all (A = Bv = 0), so the only blur is the user's
+    Softness. The kind follows the map the lamp bakes -- an ortho map
+    for a Sun, a rectangle of two null half-axes for an Area (the text
+    an Area's GLSL carries at any size), a null radius otherwise."""
+    kind = str(getattr(light, 'type', 'POINT')).upper()
+    if kind == 'SUN':
+        return {'kind': 'SUN', 'tan': 0.0, 'zero': True}
+    if kind == 'AREA':
+        return {'kind': 'RECT', 'E1': np.zeros(3, np.float64),
+                'E2': np.zeros(3, np.float64), 'zero': True}
+    return {'kind': 'SPHERE', 'R': 0.0, 'zero': True}
+
+
+def lookup_shape(light, samples, soft=0.0):
+    """The lamp's shape when its mapped shadow takes the per-receiver
+    lookup of this module, else None (the constant PCF lookup).
+
+    Samples 1 is None for every lamp: one sample is the hard single-tap
+    lookup whatever the lamp's size, the rule the traced road has always
+    had (one sample, one hard ray), and what the 'hard shadow maps'
+    presets ask for with Samples 1 on lamps that carry Blender's default
+    sizes.
+
+    A lamp WITH a size comes here at any Softness. A lamp of size 0
+    comes here when the user's Softness (`soft`, the lamp's dial times
+    the render's, in texels) is above 1: the blur is then wider than a
+    texel, and the constant lookup could only afford it by lifting the
+    receiver off its surface by the blur's radius -- which shrank the
+    shadow and, at 16 texels, erased it. Here the same blur is F
+    plane-biased bilinear compares (`zero_shape`: the filter of a sized
+    lamp with no lamp term). At Softness 1 and below a lamp of size 0
+    keeps the constant lookup, bit for bit."""
     if int(samples) <= 1:
         return None
-    return lamp_shape(light)
+    shape = lamp_shape(light)
+    if shape is None and float(soft) > 1.0:
+        return zero_shape(light)
+    return shape
 
 
 def tap_counts(samples):
@@ -533,9 +564,20 @@ def _face(face, fetch, rect, P, N, ndl, slope, soft, shape, dmin,
         else:
             tp = p2.dr - davg
         tp = np.minimum(np.maximum(tp, f32(0.0)), p2.ts).astype(np.float32)
-        nb2, dsum2 = blockers(p2, tp, True)
+        # a footprint with no lamp term (a lamp of size 0 under the
+        # user's Softness) puts the probe's taps exactly on the search's:
+        # the probe would return what the search just did, so it is
+        # skipped there (the GLSL branches on the same amax > 0)
+        live = np.nonzero(p2.amax > f32(0.0))[0]
+        if live.size == idx.size:
+            nb2, dsum2 = blockers(p2, tp, True)
+        else:
+            nb2, dsum2 = nb[idx].copy(), dsum[idx].copy()
+            if live.size:
+                nb2[live], dsum2[live] = blockers(p2.take(live), tp[live],
+                                                  True)
         if stats is not None:
-            stats['probe'] = stats.get('probe', 0) + int(idx.size)
+            stats['probe'] = stats.get('probe', 0) + int(live.size)
         res[idx[nb2 >= nt]] = 0.0
         keep = np.nonzero((nb2 > 0.0) & (nb2 < nt))[0]
         if keep.size:
