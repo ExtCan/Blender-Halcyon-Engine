@@ -9691,9 +9691,11 @@ def _background_image(scene, st, w, h, vp, eye, uncovered=None,
     inv = np.linalg.inv(vp).astype(np.float32)
     nx = (xx.astype(np.float32) + 0.5) / w * 2.0 - 1.0
     ny = (yy.astype(np.float32) + 0.5) / h * 2.0 - 1.0
-    pts = np.stack([nx, ny, np.ones(nx.size, np.float32),
-                    np.ones(nx.size, np.float32)], axis=1)
-    world = pts @ inv.T
+    # the sequential float32 chain gpu/sky.py's hal_sky_ray states, never
+    # a matmul: `pts @ inv.T` was that chain only on a BLAS without fused
+    # multiply-add (mathx.unproject_far has the measurement), and every
+    # GPU sky twin moved an ulp at a dozen pixels on the others
+    world = M.unproject_far(nx, ny, inv)
     world = world[:, :3] / np.where(np.abs(world[:, 3:4]) < 1e-9, 1e-9, world[:, 3:4])
     dirs = M.normalize(world - eye[None, :])
     # R251 (sky-camera C056): Doom's cylinder sky is a function of the

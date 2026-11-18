@@ -50,6 +50,9 @@ def run_tests():
     from . import test_r253_console_presets
     # R253 (field): a uniform the driver stripped never fails a pass
     from . import test_r253_uniforms
+    # R253 (field): the sky ray on any BLAS kernel, the jitter pair on
+    # NumPy 2.4 and later
+    from . import test_r253_kernels
     # R254: the world's own luminary as a scene light
     from . import test_r254_world_light
     # R254: the light falloff family and the Light Limit
@@ -228,6 +231,12 @@ def run_tests():
     print('R253 STRIPPED UNIFORMS (A GL DRIVER DROPS WHAT A PASS NEVER READS)')
     print('=' * 66)
     rc |= test_r253_uniforms.main()
+    print()
+    print('=' * 66)
+    print('R253 ANOTHER MACHINE\'S NUMPY (THE SKY RAY ON ANY BLAS KERNEL, THE '
+          'JITTER PAIR ON 2.4 AND LATER)')
+    print('=' * 66)
+    rc |= test_r253_kernels.main()
     print()
     print('=' * 66)
     print("R254 WORLD LIGHT (THE SKY'S OWN SUN OR MOON AS A SCENE LIGHT)")
