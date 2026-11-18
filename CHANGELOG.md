@@ -2956,6 +2956,144 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   landed on (`claude-cloud` 1e6239c), 12,939 checks pass where 12,863 did,
   and the failing lines that remain are the baseline's zip lines, byte for
   byte.
+- **A master shader inside a node group bumps from its Bump Height (the
+  socket was read by nothing there, and the surface drew flat).** The
+  master's Bump Height is sugar: nothing shades from the socket.
+  `core/nodeeval.desugar_master_bump` rewrites a linked one, at the top
+  of every render, into a real Bump node -- Height takes the link,
+  Strength the master's Bump Strength, and the master's Normal then
+  reads the new node -- and it walked `graph['nodes']`, the material's
+  OWN tree. A group node carries its tree under `'group'`, which the
+  rewrite never entered, so a master inside a group kept a linked socket
+  that nothing read. The Bump-in-a-group entry above saw it from its
+  probes and left it for its own fix. *Wrong picture or fallback: the
+  wrong picture*, and a quiet one: no warning and no refusal, a height
+  map wired in and a flat surface drawn. The probe (the demo floor
+  through the real `serialize_tree`, `R.render` on the CPU) put ONE
+  master with one height -- Gradient Texture (Quadratic Sphere) -> Math
+  Multiply 6.0 -> the master's Bump Height -- once in the material's own
+  tree and once inside a group whose Surface output feeds the Material
+  Output. In the material's tree, linked and unlinked are 0.89 apart
+  over 4435 pixels of the floor at 128x96. Inside the group they were
+  ONE frame, bit for bit, and the group frame was 0.89 off the top-level
+  one: 0.60 over 27678 pixels at 320x240, 0.37 over 110679 at 640x480,
+  0.36 see-through. No pre-pass runs at 128x96; the height was simply
+  dropped. (1) *Every tree.* The rewrite enters a group node's tree by
+  calling itself, to any depth, and rewrites each tree where it stands:
+  the synthesized Bump goes into the tree its master sits in. That is
+  the tree holding the nodes its links name -- a height chain inside the
+  group, or the Group Input when the height, the strength or the normal
+  underneath is handed in through the group's interface -- and the tree
+  the group's evaluator shades (`group_evaluator`), so the master's
+  Normal finds the node; the material's own tree gains nothing. The
+  exporter serializes a group's tree once per group NODE, so two
+  instances of one group are two trees and each gets its own Bump. (2)
+  *An id of that tree.* The node is filed under
+  `nodeeval.synth_bump_id(master id, tree path)`: `__bump_` ahead of the
+  master's own step, behind the path of its tree. `__bump_Halcyon` in
+  the material's tree, the id it always had; `Group/__bump_Halcyon`
+  inside the group node 'Group', `Group.001/__bump_Halcyon` in a second
+  instance of that group, `Outer/Inner/__bump_Halcyon` two levels down.
+  It is the id `export.node_id` gives a node NAMED `__bump_Halcyon` of
+  that same tree, escapes included, so it can only ever meet a node of
+  its own tree -- which the rewrite looks for before it writes, the rule
+  the material's tree always had (a node already under that id is not
+  written over). `__bump_` ahead of the WHOLE id, the old line applied
+  to a path, spells a node of another tree (`__bump_Group/Halcyon` is a
+  'Halcyon' inside a group node named '__bump_Group'), where no look at
+  this tree could see the clash. A tree built by hand whose ids carry no
+  path gets its group's path in the synthesized id all the same, so the
+  group's Bump cannot take the field of a like-named master of the
+  material's own tree. The core may not import the exporter (it imports
+  `bpy`), so the separator moved house: `ID_SEP` is defined in
+  `core/nodeeval.py` and `export.py` imports it -- one constant, as
+  before. (3) *The any-depth roads were already there.* That entry built
+  them and the synthesized node rides them like any Bump of a group:
+  `has_bump` finds it, `bump_heights` evaluates its height in the
+  group's context with the group's inputs bound and hands it out under
+  its id, `_bump_field_for` asks by that id. On a frame large enough to
+  pre-pass (320x240 on the demo floor) the field `Group/__bump_Halcyon`
+  is built and the frame is the top-level frame bit for bit -- itself
+  the frame of the material shaded in ONE batch. With that field
+  withheld the frame is cut along the batch boundary (0.31 over 230
+  pixels on rows 53-54; 0.15 over 1472 pixels on six rows at 640x480),
+  so the frames can tell. The layered road's per-rank fields, the band
+  scissor's context row and the banded `job.bump_field_source` take the
+  node the same way. (4) *Idempotent as it was.* The rewrite consumes
+  the Bump Height link, in a group's tree as in the material's, so the
+  pass at the top of the next render finds nothing to do: three more
+  passes leave a rewritten graph exactly as the first left it, and one
+  scene rendered three times builds the one field each time and draws
+  one frame. *The GPU device.* Nothing emits a group's tree, so such a
+  material shaded on the CPU before and does now; the plan's line for it
+  follows the picture. A master in a group with nothing bending its
+  normal is refused as "no GLSL emitter for ShaderNodeGroup". One whose
+  normal IS bent is refused a step earlier, as "the graph bends the
+  shading normal outside the master shader's Normal socket" -- the line
+  a Bump wired by hand to that master inside the group always printed,
+  and the line the Bump Height prints now that it bends anything.
+  *Pictures that change*: a material whose master -- Halcyon, BI
+  Material, 3ds Max Standard or Raytrace, Console -- sits inside a node
+  group with its Bump Height linked. It is bumped now: the frame the
+  same nodes draw outside the group, and the frame of the same height
+  wired by hand into a Bump node inside the group. Nothing else moves:
+  21 frames whose masters all sit in the material's own tree (no height,
+  the sugar, the sugar over a Normal chain with its Scale and Strength
+  fed, that entry's Bump inside a group; 128x96, 320x240 and 640x480;
+  see-through; banded; an unlinked Bump Strength of 0.4) are bit for bit
+  the frames the tree drew before. Pinned in
+  `test_master_bump_height_inside_a_group_is_a_bump_of_that_group` (34
+  checks), through the real `serialize_tree`, with a spy on the pre-pass
+  so every frame says which fields it built: the pair at 128x96 (linked
+  and unlinked two pictures in the material's tree and, now, inside the
+  group; the group frame the top-level frame); the rewritten graph read
+  off the scene (one Bump, in the group's tree, under its path, its
+  Height the chain's Math node, the master's Normal on it, the link
+  consumed, every link naming a node of its own tree); 320x240 with the
+  field built under 'Group/__bump_Halcyon', the top-level frame and the
+  one-batch frame bit for bit, and the field withheld cutting two rows;
+  640x480; the same height wired by hand into a Bump node of the group;
+  a group that takes the height's Scale, the Bump Strength or the Normal
+  underneath through its interface, one at a time and all three on a
+  pre-passed frame, and the height itself handed in; an unlinked Bump
+  Strength; ONE group instanced twice at two Scales (two fields, one
+  three times the other, each instance drawing its own height); a master
+  named 'Halcyon' in the material's tree and another inside a group (two
+  Bumps, two fields); a group in a group ('Outer/Inner/__bump_Halcyon');
+  idempotence on the graph and on the picture; the see-through floor on
+  the layered road; three bands joined against the whole frame; the GPU
+  device on the stand-in driver (refused by the hand-wired Bump's own
+  line, the CPU's frame bit for bit); each of the five masters rewritten
+  inside a group, the two Max nodes with their Bump Amount for a
+  strength; the id against `export.node_id` for 40 names and paths
+  holding the separator and the escape; a node already under the id left
+  alone; a graph spelt by hand with like-named masters in two trees; and
+  the rule read from the code (both render entries call the rewrite, one
+  place writes the id, one separator). The Bump-in-a-group test's
+  `_bump_chain` is `_height_chain` plus its Bump now, and its 20 checks
+  pass as they were. Twenty-five mutations each fail the new test: the
+  rewrite not entering groups, or one level only; the path not handed
+  down, handed down without its separator, doubled, or the parent's
+  handed on; the id without its path, with the path twice, or with
+  `__bump_` behind the step; the node filed under one id and carrying
+  another; the link not consumed; a node already under the id written
+  over; the master's Normal not pointed at the node; the Height, the
+  Strength link, the Strength default or the Normal underneath not
+  taken; the Console master left out; the Max masters reading the
+  socket; either render entry skipping the rewrite; `has_bump`, the
+  pre-pass walk or the band scissor looking at the material's own tree
+  only; and the exporter defining a separator of its own. *Seen from the
+  same probes and left for its own fix*: a master inside a group loses
+  its shading RATE. `core/render.material_model` reads the model off the
+  material's own tree, so for a Gouraud or Flat master inside a group it
+  answers the scene's default model (Phong in the probe) and the floor
+  shades per pixel: 0.64 and 1.09 off the same master at the top level
+  over 4848 pixels at 128x96, nothing linked. With `material_model` made
+  to answer the master's own model the group frame is the top-level
+  frame bit for bit, and the per-pixel models (Lambert, Phong, Toon)
+  agree bit for bit as they stand. NOT verified, here or by the report:
+  a real Blender, a real GPU, and the world graph (the same call
+  rewrites it; nothing drew one).
 - **A Bump whose height is fed by another Bump gathers from fields built
   in dependency order (it was cut at every pre-pass chunk, band edge,
   region edge and layer).** The height pre-pass -- `n_bump` differences
@@ -3532,6 +3670,23 @@ What headless cannot prove, per feature (the fakebpy / fakeblender stubs validat
   kernel", its sky twins were red before this round and are green now;
   the three mapping frame digests pass there only if its NumPy also runs
   the AVX-512 loops.
+- A master inside a node group, bumped, in a real file. The fix is
+  proven headless alone (stand-in trees through the real
+  `serialize_tree`, CPU frames; bands rendered one after another through
+  `render(band=...)` in one process; the GPU device on the stand-in
+  driver) -- never in Blender and never on a GPU. Open there: an F12 of
+  a material whose Halcyon Shader sits in a real node group with a
+  texture on its Bump Height, against the same nodes ungrouped, at a
+  small frame and at a real frame size; the same for the BI Material,
+  the two 3ds Max nodes and the Console node, which were rewritten here
+  on the graph alone (no frame of them was drawn inside a group); the
+  same frame through the worker pool, where each band is its own
+  process; the viewport of such a material on the GPU device printing
+  "the graph bends the shading normal outside the master shader's Normal
+  socket" and drawing the CPU's frame; a World whose node tree holds
+  such a group (the same call rewrites the world graph; nothing here
+  drew one); and a lightmap bake of such a material (`bake_lightmap`
+  makes the same call; no bake was run).
 - A Bump fed by another Bump in a real file. The fix is proven
   headless alone (stand-in trees through the real `serialize_tree`, CPU
   frames; bands rendered one after another through `render(band=...)`
