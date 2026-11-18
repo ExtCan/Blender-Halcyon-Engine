@@ -2830,7 +2830,15 @@ def world_color(scene, settings, dirs, textures, n=None, eye=None):
         ctx.P = M.normalize(dirs) * 1e6
         ctx.generated = M.normalize(dirs)
         ctx.settings = settings
-        ev = GraphEvaluator(world.graph, ctx, textures, {})
+        # R253 (review): the world tree's own compiled programs (the export
+        # files them on the World beside the graph). This evaluator was
+        # handed an empty dict, so n_halcyon_code found no program for a
+        # Coded Shader of the world tree and answered zeros. Its inputs
+        # read THIS context, as every other node of the tree does: the ray
+        # as I, vObject and (reversed) N and vView, a point 1e6 along it as
+        # P, and ShadeContext's defaults for what a sky has none of
+        ev = GraphEvaluator(world.graph, ctx, textures,
+                            getattr(world, 'programs', None))
         cl, _ = ev.evaluate_surface()
         if isinstance(cl, Closure) and cl.items:
             acc = np.zeros((n, 3), np.float32)

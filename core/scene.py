@@ -618,6 +618,14 @@ class World:
     ground_lighting: float = 1.0
     ground_graph: Optional[Dict[str, Any]] = None
     ground_programs: Optional[Dict[str, Any]] = None
+    # R253 (review): the compiled Coded Shader programs of the WORLD's own
+    # node tree (`graph`, far above), by graph id (export.node_id) -- what
+    # ground_programs is to ground_graph and Material.programs to a
+    # material's graph. The world export compiled them into a dict nothing
+    # kept, the world evaluator was handed an empty one, and a Coded
+    # Shader in a world tree read zeros: a black sky, with no warning.
+    # None for a hand-built world (the evaluator takes it as none)
+    programs: Optional[Dict[str, Any]] = None
     # R251 C048 Mode 7 (SNES / GBA) floor: the ground group
     ground_image: Optional[ImageBuffer] = None   # R251 Mode 7 map (an image datablock: never in a preset)
     mode7_texel_size: float = 1.0

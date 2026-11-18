@@ -56,6 +56,12 @@ at each call), the ink pass (built per frame from a job), and the lamps
 render() itself adds to a frame before it plans -- a caustics cookie, the
 World Light -- which the job recipe here does not (in a pass they are a
 cookie function and one more mapped SUN).
+R253 (review): the EMISSION SLOT ROUTING. A closure of emission lobes
+alone (a colour wired straight into Surface, an Emission node, a Mix /
+Add Shader of those) rides the pass's emission term since the route was
+ported, and its text had been judged by the simulator alone:
+check_emission_route compiles ten such graphs at every shading rate,
+shadows off and on, the bare-socket literal included.
 """
 import os
 import re
@@ -447,6 +453,62 @@ def check_coded():
             _shadows_seen('coded shaders by node name', lit)
 
 
+def check_emission_route():
+    """R253 (review): the EMISSION SLOT ROUTING's passes -- a colour, a
+    value, a vector, a Coded Shader's Color and an Image Texture wired
+    straight into Surface, an Emission node, and the Mix / Add Shader
+    over emissions with a linked and with a BARE side (the one new
+    literal the route writes) -- at every shading rate, shadows off and
+    on. A refusal is a failure HERE: each of these is meant to reach the
+    driver, where the simulator alone had judged its text. Runs after
+    check_coded (the review module's builders want the bpy stub)."""
+    from . import fakebpy
+    fakebpy.install()
+    from ..core.scene import Material
+    from . import test_r253_review as RV
+
+    def cases():
+        for kind in ('colour', 'value', 'vector', 'coded'):
+            nodes, link, prog = RV._wired_source(kind)
+            yield f'a {kind} wired into Surface', RV._wired_out(nodes, link), prog, False
+        yield ('an Image Texture wired into Surface', RV._wired_out(
+            {'src': {'id': 'src', 'bl_idname': 'ShaderNodeTexImage',
+                     'props': {'image': 'checker', 'interpolation': 'Linear', 'extension': 'REPEAT'},
+                     'inputs': [_sk('Vector', 'VECTOR', [0, 0, 0])],
+                     'outputs': [{'name': 'Color', 'type': 'RGBA'}, {'name': 'Alpha', 'type': 'VALUE'}]}},
+            ['src', 0]), {}, True)
+        e1 = RV._em_node('e1', (0.9, 0.3, 0.1), 2.0)
+        e2 = RV._em_node('e2', (0.1, 0.8, 0.3), 0.5)
+        yield 'an Emission node', RV._wired_out(dict(e1), ['e1', 0]), {}, False
+        for idname in ('ShaderNodeMixShader', 'ShaderNodeAddShader'):
+            yield (f'{idname} over two Emissions', RV._wired_out(
+                dict(e1, **e2, **RV._shader_pair(idname, ['e1', 0], ['e2', 0], 0.3)), ['two', 0]), {}, False)
+            yield (f'{idname} over an Emission and a bare socket', RV._wired_out(
+                dict(e1, **RV._shader_pair(idname, ['e1', 0], None, 0.3)), ['two', 0]), {}, False)
+
+    for shadows in (False, True):
+        counts = {'ok': 0, 'refused': 0, 'bad': 0}
+        lit = 0
+        for what, graph, programs, textured in cases():
+            for rate in ('PIXEL', 'VERTEX', 'FACE'):
+                st = base_settings(24, 18, shadows=shadows, shading_rate=rate)
+                sc = demo_scene(st, with_texture=textured)
+                mat = Material(name='Wired', index=1, graph=graph)
+                mat.programs = programs
+                sc.materials[1] = mat
+                srcs, why = _pass_sources(sc, st)
+                label = f'emission route: {what} at {rate}{_SHADOWS[shadows]}'
+                lit += _shadowed(srcs)
+                got = _record(label, srcs, why)
+                if got == 'refused':
+                    FAILS.append(f'{label}: refused ({why})')
+                    print(f'  FAIL {label}\n       refused: {why}')
+                counts[got] += 1
+        print(f'  emission slot routing{_SHADOWS[shadows]}: {counts}')
+        if shadows:
+            _shadows_seen('emission slot routing', lit)
+
+
 def mapped_shadow_cases():
     """(label, light, settings overrides): one mapped lamp per kind, with
     and without a size -- a sized lamp's term is the per-fragment
@@ -582,7 +644,8 @@ def main():
     print(f'glsl_strict: {_glslang()}')
     for fn in (check_models, check_console, check_masters, check_shadow_kinds,
                check_stages, check_sky_and_kernels, check_mapped_shadows,
-               check_traced_shadows, check_compute_raster, check_coded):
+               check_traced_shadows, check_compute_raster, check_coded,
+               check_emission_route):
         try:
             fn()
         except Exception as exc:                                # noqa: BLE001
