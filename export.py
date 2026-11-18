@@ -13,6 +13,7 @@ import numpy as np
 from . import compat
 from .core.scene import (Camera, ImageBuffer, Light, Material, MeshData,
                          ObjectInfo, Scene, World)
+from .core.nodeeval import ID_SEP
 from .shaders.compiler import compile_node
 from .core import console as _console
 
@@ -536,8 +537,11 @@ def canonical_socket_name(sock):
     return name
 
 
-#: what joins the steps of a group-internal node's path into its graph id
-ID_SEP = '/'
+#: ID_SEP, what joins the steps of a group-internal node's path into its
+#: graph id, is imported at the top of this file from core/nodeeval.py:
+#: the core may not import this file, and `desugar_master_bump` writes the
+#: one id that is not written here -- a node synthesized inside a group's
+#: tree at render time (`nodeeval.synth_bump_id`)
 
 
 def node_id(name, path=''):

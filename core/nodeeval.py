@@ -1791,7 +1791,48 @@ def _shifted_ctx(c, t_axis, b_axis, du, dv):
     return sub
 
 
-def desugar_master_bump(graph):
+#: what joins the steps of a group-internal node's path into its graph id.
+#: The exporter writes the ids (export.node_id, which also escapes a
+#: name's own separators) and re-exports this very constant as
+#: export.ID_SEP; it lives here because the core cannot import the
+#: exporter (which imports bpy) and has one id of its own to write: a
+#: node it synthesizes INSIDE a group's tree (desugar_master_bump)
+ID_SEP = '/'
+
+#: the master nodes whose Bump Height socket is sugar for a Bump node
+BUMP_SUGAR_NODES = ('HALCYON_ShaderNode', 'HALCYON_BIMaterialNode',
+                    'HALCYON_MaxStandardNode', 'HALCYON_MaxRaytraceNode',
+                    # R252: the Console node's Bump Map / Bumpiness
+                    # (RenderWare's RpMatFX bump) ride the same desugar
+                    'HALCYON_ConsoleShaderNode')
+
+
+def synth_bump_id(nid, path=''):
+    """The id of the Bump node synthesized for the master `nid`, a node
+    of the tree whose ids sit behind `path` ('' for the material's own
+    tree, the group node's id plus ID_SEP for a group's).
+
+    '__bump_' goes ahead of the master's own STEP, behind the tree's
+    path: '__bump_Halcyon' in the material's tree (the id it always had),
+    'Group/__bump_Halcyon' inside the group node 'Group',
+    'Outer/Inner/__bump_Halcyon' two levels down. That is the id the
+    exporter would give a node named '__bump_Halcyon' of that same tree,
+    so it reads as a path like every other id (export.node_id) and can
+    only ever equal the id of a node of ITS OWN tree -- which the rewrite
+    looks for before it writes. '__bump_' ahead of the whole id would
+    spell a node of some other tree ('__bump_Group/Halcyon': a 'Halcyon'
+    inside a group node named '__bump_Group'), where no look at this tree
+    could see the clash. A hand-built tree whose ids do not carry the
+    path gets it all the same, so its node cannot take the id of the
+    material's own.
+    """
+    step = str(nid)
+    if path and step.startswith(path):
+        step = step[len(path):]
+    return f'{path}__bump_{step}'
+
+
+def desugar_master_bump(graph, _path=''):
     """Bump Height on the master shader becomes a REAL Bump node, in place.
 
     The socket is sugar: a linked greyscale height cannot honestly grow a
@@ -1802,6 +1843,24 @@ def desugar_master_bump(graph):
     and the master's Normal input then points at the synthesized node.
     Called at the top of every render, so the CPU evaluator, the GPU
     plan and the emitter all see the SAME desugared tree.
+
+    R253 (review): EVERY tree of the graph, to any depth. The rewrite
+    walked `graph['nodes']`, the material's own tree, and nothing else
+    reads the socket: a master INSIDE a node group drew with no bump at
+    all, its linked height read by nothing. A group node carries its tree
+    under 'group' and each is rewritten where it stands: the synthesized
+    node goes into the tree its master is in -- the tree that holds the
+    nodes its links name, and the one the group's evaluator shades
+    (`group_evaluator`) -- under that tree's path (`synth_bump_id`). The
+    exporter serializes a group's tree once per group NODE, so two
+    instances of one group are two trees with two paths, and each gets
+    its own Bump: the id the Bump pre-pass files its field under
+    (`bump_heights` finds the node like any other Bump of that tree).
+
+    Idempotent as it was: the rewrite consumes the Bump Height link, so
+    a second pass finds nothing to do, in a group's tree as in the
+    material's -- and so does a second walk of ONE tree dict that a
+    hand-built graph hands to two group nodes.
     """
     if not graph:
         return graph
@@ -1811,11 +1870,12 @@ def desugar_master_bump(graph):
     for nid in list(nodes.keys()):
         nd = nodes[nid]
         idn = nd.get('bl_idname')
-        if idn not in ('HALCYON_ShaderNode', 'HALCYON_BIMaterialNode',
-                       'HALCYON_MaxStandardNode', 'HALCYON_MaxRaytraceNode',
-                       # R252: the Console node's Bump Map / Bumpiness
-                       # (RenderWare's RpMatFX bump) ride the same desugar
-                       'HALCYON_ConsoleShaderNode'):
+        if idn == 'ShaderNodeGroup':
+            # the exporter's own rule (serialize_tree): a group's tree
+            # sits behind the id of its group node
+            desugar_master_bump(nd.get('group'), f'{nid}{ID_SEP}')
+            continue
+        if idn not in BUMP_SUGAR_NODES:
             continue
         ins = nd.get('inputs') or []
 
@@ -1825,8 +1885,8 @@ def desugar_master_bump(graph):
         bh = _find('Bump Height')
         if bh is None or not bh.get('link'):
             continue
-        synth = f'__bump_{nid}'
-        if synth in nodes:                        # already desugared
+        synth = synth_bump_id(nid, _path)
+        if synth in nodes:              # already there: never written over
             continue
         bs = _find('Bump Strength')
         nrm = _find('Normal')
