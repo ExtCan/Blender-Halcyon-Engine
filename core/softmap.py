@@ -497,6 +497,25 @@ def pyr_layout(size):
     return _TABLES[key]
 
 
+#: a map this size or larger builds its pyramid's first level in threads
+#: (the first pooling per face and part, a cube's four seam directions):
+#: numpy releases the interpreter inside its loops, as the bake's own
+#: thread pool relies on
+PYR_THREADS_FROM = 1024
+
+
+def _each(fn, jobs, size):
+    """`fn` over `jobs`, the results in order; in threads for a large
+    map (what each job computes does not depend on the others)."""
+    if len(jobs) > 1 and size >= PYR_THREADS_FROM:
+        import concurrent.futures as _fut
+        import os as _os
+        workers = min(len(jobs), max((_os.cpu_count() or 2) - 1, 2))
+        with _fut.ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(fn, jobs))
+    return [fn(j) for j in jobs]
+
+
 def _pool_first(d):
     """The minima of the finest tiles of one face, (n, n): tile x covers
     the texels 4x - 1 .. 4x + 2 (`pyr_layout`), so each of the four
@@ -616,63 +635,69 @@ def _seam_grids(axes, plain, size, ring):
         return fn(fn(a[:, :-1, :-1], a[:, 1:, :-1]),
                   fn(a[:, :-1, 1:], a[:, 1:, 1:]))
 
-    for along in (0, 1):
-        for sign in (1.0, -1.0):
-            # the tiles that reach past this edge (a run of neighbours),
-            # with the span along the edge's normal clipped to the part
-            # beyond it: K + 1 borders
-            if sign > 0:
-                sel = np.nonzero(hi > size)[0]
-                pa = np.append(max(lo[sel[0]], float(size)), hi[sel])
-            else:
-                sel = np.nonzero(lo < 0.0)[0]
-                pa = np.append(lo[sel], min(hi[sel[-1]], 0.0))
-            pa = pa * to_ndc - 1.0
-            g = np.argmax((axes[:, along] * sign) @ f.T, axis=1)
-            sg, ug, fg = s[g], u[g], f[g]
-            # the grid of the tiles' corners as directions d = xr s +
-            # yr u + f per face: (K + 1, J + 1)
-            xr, yr = (pa[:, None], pb[None, :]) if along == 0 \
-                else (pb[None, :], pa[:, None])
+    def edge(job):
+        along, sign = job
+        # the tiles that reach past this edge (a run of neighbours),
+        # with the span along the edge's normal clipped to the part
+        # beyond it: K + 1 borders
+        if sign > 0:
+            sel = np.nonzero(hi > size)[0]
+            pa = np.append(max(lo[sel[0]], float(size)), hi[sel])
+        else:
+            sel = np.nonzero(lo < 0.0)[0]
+            pa = np.append(lo[sel], min(hi[sel[-1]], 0.0))
+        pa = pa * to_ndc - 1.0
+        g = np.argmax((axes[:, along] * sign) @ f.T, axis=1)
+        sg, ug, fg = s[g], u[g], f[g]
+        # the grid of the tiles' corners as directions d = xr s + yr u
+        # + f per face: (K + 1, J + 1)
+        xr, yr = (pa[:, None], pb[None, :]) if along == 0 \
+            else (pb[None, :], pa[:, None])
 
-            def along_axis(ax):
-                return xr[None] * per_face((s * ax).sum(1)) \
-                    + yr[None] * per_face((u * ax).sum(1)) \
-                    + per_face((f * ax).sum(1))
-            md = along_axis(fg)                         # (6, K + 1, J + 1)
-            gx = ((along_axis(sg) / md * 0.5 + 0.5) * size + 1.0) / t
-            gy = ((along_axis(ug) / md * 0.5 + 0.5) * size + 1.0) / t
-            x0 = np.clip(np.floor(corners(gx, np.minimum) - eps), 0, n - 1) \
-                .astype(np.int64)
-            x1 = np.clip(np.floor(corners(gx, np.maximum) + eps), 0, n - 1) \
-                .astype(np.int64)
-            y0 = np.clip(np.floor(corners(gy, np.minimum) - eps), 0, n - 1) \
-                .astype(np.int64)
-            y1 = np.clip(np.floor(corners(gy, np.maximum) + eps), 0, n - 1) \
-                .astype(np.int64)
-            if int((y1 - y0).max()) <= 2 and int((x1 - x0).max()) <= 2:
-                # the image of a tile this fine is under three tiles
-                # wide: the folded cell at the box's middle covers it
-                low = near3[g[:, None, None], (y0 + y1 + 1) // 2,
-                            (x0 + x1 + 1) // 2].astype(np.float64)
-            else:
-                pg = plain[g]
-                low = np.full(x0.shape, np.inf)
-                for dy in range(int((y1 - y0).max()) + 1):
-                    for dx in range(int((x1 - x0).max()) + 1):
-                        np.minimum(low, pg[fsel, np.minimum(y0 + dy, y1),
-                                           np.minimum(x0 + dx, x1)],
-                                   out=low)
-            low = low / corners(md, np.maximum) * _SEAM_SLACK   # (6, K, J)
-            # down to float32 without rounding a bound up
-            l32 = low.astype(np.float32)
-            l32 = np.where(l32 > low, np.nextafter(l32, f32(-np.inf)), l32)
-            run = slice(int(sel[0]), int(sel[-1]) + 1)
-            if along == 0:
-                np.minimum(e[:, :, run], l32.transpose(0, 2, 1),
-                           out=e[:, :, run])
-            else:
-                np.minimum(e[:, run, :], l32, out=e[:, run, :])
+        def along_axis(ax):
+            return xr[None] * per_face((s * ax).sum(1)) \
+                + yr[None] * per_face((u * ax).sum(1)) \
+                + per_face((f * ax).sum(1))
+        md = along_axis(fg)                             # (6, K + 1, J + 1)
+        gx = ((along_axis(sg) / md * 0.5 + 0.5) * size + 1.0) / t
+        gy = ((along_axis(ug) / md * 0.5 + 0.5) * size + 1.0) / t
+        x0 = np.clip(np.floor(corners(gx, np.minimum) - eps), 0, n - 1) \
+            .astype(np.int64)
+        x1 = np.clip(np.floor(corners(gx, np.maximum) + eps), 0, n - 1) \
+            .astype(np.int64)
+        y0 = np.clip(np.floor(corners(gy, np.minimum) - eps), 0, n - 1) \
+            .astype(np.int64)
+        y1 = np.clip(np.floor(corners(gy, np.maximum) + eps), 0, n - 1) \
+            .astype(np.int64)
+        if int((y1 - y0).max()) <= 2 and int((x1 - x0).max()) <= 2:
+            # the image of a tile this fine is under three tiles wide:
+            # the folded cell at the box's middle covers it
+            low = near3[g[:, None, None], (y0 + y1 + 1) // 2,
+                        (x0 + x1 + 1) // 2].astype(np.float64)
+        else:
+            pg = plain[g]
+            low = np.full(x0.shape, np.inf)
+            for dy in range(int((y1 - y0).max()) + 1):
+                for dx in range(int((x1 - x0).max()) + 1):
+                    np.minimum(low, pg[fsel, np.minimum(y0 + dy, y1),
+                                       np.minimum(x0 + dx, x1)],
+                               out=low)
+        low = low / corners(md, np.maximum) * _SEAM_SLACK       # (6, K, J)
+        # down to float32 without rounding a bound up
+        l32 = low.astype(np.float32)
+        l32 = np.where(l32 > low, np.nextafter(l32, f32(-np.inf)), l32)
+        return along, slice(int(sel[0]), int(sel[-1]) + 1), l32
+
+    # the four directions past an edge, each on its own (in threads for
+    # a large map); their corners overlap in `e`, so the minimums are
+    # applied here, one after the other
+    for along, run, l32 in _each(edge, [(0, 1.0), (0, -1.0), (1, 1.0),
+                                        (1, -1.0)], size):
+        if along == 0:
+            np.minimum(e[:, :, run], l32.transpose(0, 2, 1),
+                       out=e[:, :, run])
+        else:
+            np.minimum(e[:, run, :], l32, out=e[:, run, :])
     return e
 
 
@@ -737,7 +762,11 @@ def _build_pyramid(sm):
         faces = [sm]
     size = int(faces[0].size)
     lay = pyr_layout(size)
-    plain = np.stack([_pool_first(f.depth) for f in faces])
+    # the first pooling of both parts, per face
+    first = _each(lambda j: _pool_first(j[0].depth if j[1] == 0
+                                        else _neg_heights(j[0])),
+                  [(f, part) for part in (0, 1) for f in faces], size)
+    plain = np.stack(first[:len(faces)])
     ring = 0
     if cube:
         axes = np.array([[np.asarray(a, np.float64) for a in face_axes(f)]
@@ -752,7 +781,7 @@ def _build_pyramid(sm):
     # light slants. A cube's part knows nothing past a face's edge: a
     # tile there holds minus infinity (anything may stand above), so a
     # reach that crosses a seam is searched
-    high = np.stack([_pool_first(_neg_heights(f)) for f in faces])
+    high = np.stack(first[len(faces):])
     unknown = f32(-np.inf) if cube else f32(np.inf)
     part = lay['part']
 
