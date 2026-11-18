@@ -2325,25 +2325,31 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   sub-materials, a group's shader sockets, Shader to RGB. An output with
   no value (a renamed socket, a node that raised) and an UNLINKED shader
   socket stay the empty closure. (2) *The deferred plan refuses it by
-  name.* The frame pass emits one colour chain into the diffuse term and
-  has no slot for a raw emission lobe (the Emission node's own standing
-  refusal), so `gpu/shade._probe_material` refuses the lobe -- it is
-  marked `implicit` -- with `IMPLICIT_EMISSION_REFUSAL`: "a colour, value
-  or vector output is wired straight into a shader socket: that is an
-  Emission of it (Blender's implicit conversion, the picture the CPU
-  shades), and the frame pass emits only the diffuse chain -- this
-  material shades on the CPU exactly (a Halcyon Shader in between, the
-  chain in its Diffuse Color or Self-Illumination, puts it on the
-  driver)". It refuses on the lobe's PRESENCE, never its weight: the
-  probe reads sixteen fragments, and a Mix Shader's Fac mask can read 0
-  on every one of them while the emitter still mixes the link into the
-  albedo elsewhere. (3) *This changes pictures.* On the CPU device such a
+  name.* As first fixed, every such link refused: the frame pass emitted
+  one colour chain into the diffuse term and had no slot for a raw
+  emission lobe (the Emission node's own refusal). The emission slot
+  routing -- the next entry -- has since put the LONE link on the
+  driver; what `gpu/shade._probe_material` still refuses is the link
+  BESIDE another kind of lobe (the lobe is marked `implicit`), with
+  `IMPLICIT_EMISSION_REFUSAL` as it reads now: "a colour, value or
+  vector output is wired straight into a shader socket beside another
+  kind of lobe: the link is an Emission of it (Blender's implicit
+  conversion, the picture the CPU shades), and the frame pass emits ONE
+  colour chain, which cannot feed the emission term and the diffuse term
+  at once -- this material shades on the CPU exactly (alone, the link
+  rides the emission slot on the driver; so does a Halcyon Shader with
+  the chain in its Diffuse Color or Self-Illumination)". It refuses on
+  the lobe's PRESENCE, never its weight: the probe reads sixteen
+  fragments, and a Mix Shader's Fac mask can read 0 on every one of them
+  while the emitter still mixes the link into the albedo elsewhere. (3)
+  *This changes pictures.* On the CPU device such a
   material rendered its fallback surface and now adds the wired colour
   as emitted light, without the fallback's highlight (a plain closure
   with no glossy lobe has specular level 0 -- the Emission node's
   picture); on the demo frame every pixel off the material is bitwise
   what it was. On the GPU device it rendered the colour as a lit albedo
-  and now renders the CPU's frame, with the reason printed once. A
+  and now draws the CPU's picture: with the reason printed once where
+  the plan refuses, on the driver for the lone link (the next entry). A
   colour wired into the WORLD Output's Surface was ignored (the world
   fell through to its image, blend or flat colour) and is the sky now,
   bitwise the Background node at Strength 1; the GPU sky pass already
@@ -2354,9 +2360,9 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   term, as the specular slot routing did for a lone GLOSSY lobe -- would
   lift the Emission node's refusal with it and is its own piece of work
   (the corner road lights emission in the corners; the layer and hit
-  passes each need the route proven); it stays queued, and until then
-  the two devices draw the same frame. And that frame is Halcyon's
-  Emission node's, not Cycles': with no DIFFUSE lobe in the closure
+  passes each need the route proven); it was queued here and is the
+  next entry. And the frame both devices draw is Halcyon's Emission
+  node's, not Cycles': with no DIFFUSE lobe in the closure
   `closure_to_surface` leaves the material's fallback diffuse LIT under
   the glow, where Blender shades black. That rule also reads its batch
   (`np.any(diff_w > 1e-6)`: a pure-emission pixel has diffuse level 0
@@ -2364,18 +2370,138 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   seen at the function, not hunted in a frame). Recorded, not changed:
   every Emission-node material's picture hangs on it. Pinned in
   `test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads`
-  (53 checks) for a colour, a value and a vector: the CPU frame bitwise
+  (47 checks, since the routing took the lone link's plan answer to its
+  own test) for a colour, a value and a vector: the CPU frame bitwise
   the Emission node's; the wired colour arriving as exactly itself over
   the fallback (frame(colour) - frame(black) within 1e-6 on every pixel
-  of the Ball); the refusal word for word; and the road it names -- a
-  Halcyon Shader in between, either socket -- qualifying with the
-  simulator frame the CPU frame at the twin bar (measured 4.8e-6; the
-  bar is under 6e-3 with no pixel over 1e-2). Then the Mix and Add
-  Shader inputs, Fac 0, a Reroute on the way and a Coded Shader's
-  output; the unwired socket and a Diffuse BSDF in between still
-  twinning; the Emission node keeping its own refusal; the GPU device
-  road on the fake driver returning the CPU frame bit for bit; the World
+  of the Ball); and the road the refusal names -- a Halcyon Shader in
+  between, either socket -- qualifying with the simulator frame the CPU
+  frame at the twin bar (measured 4.8e-6; the bar is under 6e-3 with no
+  pixel over 1e-2). Then the Mix and Add Shader inputs beside a Diffuse
+  BSDF refusing word for word, at Fac 0 too; a Reroute on the way and a
+  Coded Shader's output on the CPU; the unwired socket and a Diffuse
+  BSDF in between still twinning; an Emission node beside a Diffuse BSDF
+  keeping the raw-lobe refusal; the GPU device road on the fake driver
+  returning the refused wiring's CPU frame bit for bit; the World
   Output. Ten mutations of the fix each fail it.
+- **The emission slot routing: a surface that is light alone shades on
+  the driver (the wired colour and the Emission node twin where the plan
+  refused them).** What was asked: "Now do the emission slot routing so
+  the GPU twins it" -- the item the entry above left queued. *What the
+  pass could not do.* The frame pass emits ONE per-pixel colour chain and
+  fed it to the diffuse term, or, for a lone GLOSSY lobe, to the specular
+  colour (the specular slot routing). An emission lobe's colour belongs
+  to neither, so every graph whose surface is light alone -- a colour,
+  value or vector wired straight into Surface, an Emission node, a Mix or
+  Add Shader of those -- refused the deferred plan by name and shaded on
+  the CPU. *The route.* When EVERY lobe of the closure is an EMISSION,
+  no lobe feeds the diffuse or the specular slot: `closure_to_surface`
+  hands back constants there -- whatever it decides for a surface with
+  no diffuse and no glossy lobe, the probe bakes that and restates
+  nothing -- and puts the weighted sum of colour x Strength in
+  `surf.emission`. That sum is the one chain the emitter already writes
+  for those nodes
+  (`e_emission`: colour x Strength; `e_mix_shader` and `e_add_shader`:
+  the mix and the sum that `n_mix_shader` and `n_add_shader` hand on; a
+  Reroute forwards). So `gpu/shade._probe_material` grants
+  `bake['__slot'] = 'emission'`, exempts the emission from the constancy
+  rule (its variation is the point) and bakes the flat diffuse, as the
+  specular route does; and `gpu/material.assemble_frame` hands the chain
+  to the pass's one `total = total + ...` line -- where `light_surface`
+  adds `surf.emission`, after the light loop and the clamp, the line a
+  master's linked Self-Illumination already rides -- and writes the
+  diffuse and the specular colour as constants. No new GLSL. The
+  shadeless early return (diffuse x level + emission), the layer passes
+  and the ray-hit passes all read that line; a corner-rate pass never
+  reaches it, because the CPU lights the corners WITH the emission in
+  them and the pass multiplies by the constant diffuse, exactly the
+  CPU's own albedo half. *Three rules keep it exact.* (1) STRUCTURAL:
+  every lobe, whatever its weight. A Diffuse BSDF that a Mix Shader's
+  Fac zeroes at the sixteen probed fragments is still a diffuse lobe
+  elsewhere, so a Diffuse mixed with an Emission at Fac 1 stays refused.
+  (2) PROVEN NODES ONLY: `gpu/material.emission_route_block` walks the
+  Surface link's shader path by the evaluator's own cache (an output
+  that evaluated to a closure is a shader node; anything else on a
+  shader socket is the implicit link) and lets through Emission, Mix
+  Shader, Add Shader and Reroute (`EMISSION_ROUTE_NODES`). The Max
+  blends are stopped by name -- their chains drop a bare side OUT of the
+  mix, the master lobes' normalisation, where an emission lobe is scaled
+  by its weight -- with `emission_route_refusal`: "an emission-only
+  closure reaches the Surface through HALCYON_MaxBlendNode, whose chain
+  is not the emission the CPU sums (Emission, Mix Shader, Add Shader and
+  Reroute are) -- this material shades on the CPU exactly". (3) A BARE
+  SOCKET IS NO LIGHT: an unlinked Mix or Add Shader input is the empty
+  closure, and under the route the emitter writes `vec4(0.0, 0.0, 0.0,
+  1.0)` for it (`Emitter.bare_shader_zero`, armed by the assembler under
+  this slot alone: in the diffuse slot a bare side must drop out of the
+  mix, which zero is not). *Still refused, by name:* the implicit link
+  BESIDE another kind of lobe (`IMPLICIT_EMISSION_REFUSAL`, reworded in
+  the entry above) and a raw Emission lobe beside a diffuse or a glossy
+  one (the raw-lobe text) -- one chain cannot be two slots. *Found on
+  the way: both routes read the wrong alpha.* The decal combines
+  (DS_DECAL, DECAL_ALPHA, N64_BLENDRGBA) take the TEXEL's alpha from the
+  chain. A routed chain is not the albedo: the CPU's albedo pass hands
+  those combines the constant diffuse and the surface's own opacity, 1.
+  A lone Glossy BSDF whose colour carried alpha 0.3 -- the specular
+  route, since it was ported -- qualified and drew 0.48 off the CPU over
+  593 or more of the Ball's 598 pixels at the corner rates under those
+  three models; the emission route would have been 0.37 off over all
+  598. A routed chain's alpha is pinned at 1.0 on both routes now, and
+  both read 0.0. *Measured* (the demo Ball at 128x96, `R.render` against
+  `gpu/shade.simulate`): the lone colour was 1.69 off before the entry
+  above, refused after it, and is 4.8e-7 off on the Ball now. The twin
+  is not two roads agreeing on a missing emission: the SIMULATOR's
+  frame(colour) - frame(black) is the colour to 1e-6 on every pixel of
+  the Ball. A traced reflection of a routed floor moves the mirror Box's
+  pixels by the same 0.45 on both roads (0.5 x 0.9; the frames 2e-5
+  apart). Every engine model forced over a routed vector is on the twin
+  bar, but for the Super FX plot (refused by its own palette rule) and
+  WIREFRAME, whose wires are carved after the stage the simulator covers
+  -- the same 6,172 pixels with and without the route. *A one-off sweep*
+  put a routed material into all 313 feature-matrix rows on the fake
+  driver (the real draw functions over `tests/fakedevice`), three times:
+  a vector on material 1, a colour on the last material, a Coded
+  Shader's stripes on the floor. The frame shaded on the driver in at
+  least 307 rows of each sweep -- the rest fall back for the row's own
+  reason (in the floor sweep: the three ray-traced rows, whose sweeps
+  want a real driver, the Env hole and the light-split passes) -- and no
+  row's frame was over the deferred bar where the unmodified row was
+  under it, nor more than twice as far from the CPU device's. An Image
+  Texture wired into Surface across the 54 textured rows: all on the
+  driver, none worse. *The strict gate* (`tests/glsl_strict.py`, glslang
+  15.1.0) gained `check_emission_route`: ten graphs at three rates,
+  shadows off and on -- 60 planned frames, 39 distinct texts, none
+  rejected, none refused (the whole gate on this tree: 559 distinct
+  texts, none rejected).
+  *This changes where these pictures are made, not the pictures:* on the
+  GPU device such a material fell back to the CPU's frame and now shades
+  on the driver, within the deferred bar of that frame; the CPU device
+  is untouched. *Whichever way the CPU fills that surface.* The route
+  restates nothing about a surface with no diffuse lobe: it bakes what
+  `closure_to_surface` hands the probe. Under the batch rule recorded in
+  the entry above that is the material's fallback diffuse, lit; under
+  the per-pixel rule that replaces it (white at level 0, no ambient
+  share -- applied over this tree from its branch before it landed) it
+  is no diffuse at all, and the route's test and the entry above's pass
+  unchanged on both, 50 and 47 checks. Pinned in
+  `test_emission_slot_routing_twins_an_emission_only_closure` (50
+  checks): the four kinds of lone link; the non-vacuity and the pass's
+  own two lines (the chain added to the total, the diffuse a constant);
+  the Emission node with constant and with linked sockets, the Mix (a
+  constant and a per-pixel Fac) and the Add Shader over emissions, an
+  explicit lobe beside the implicit one, a bare side, a Reroute; a
+  material with its own fallback diffuse, level and model (the
+  simulator moving with it exactly as the CPU does); the VERTEX
+  and FACE rates, the three decal combines on both routes, the CONSTANT
+  model; a frame with an Ambient Only lamp (the light row's ambient
+  tail); an Image Texture, nearest and through the mip footprint; the
+  traced reflection; two routed materials sharing ONE source text (a
+  colour change is a texel, not a recompile); what stays refused -- a
+  Diffuse mixed with an Emission, at Fac 1 too, and the Max blend by its
+  name word for word, behind a Mix Shader and behind a Reroute included;
+  the walk and the bare-socket rule; and the GPU device road on the fake
+  driver drawing it within the bar with no fallback line. Eighteen
+  mutations of the route each fail it.
 - **A moved object under a still camera rendered from stale caches.**
   The CPU's G-buffer cache (R170) keys on a mesh fingerprint and the
   camera, and the fingerprint read the vertex positions as a strided
@@ -3204,6 +3330,142 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   agree bit for bit as they stand. NOT verified, here or by the report:
   a real Blender, a real GPU, and the world graph (the same call
   rewrites it; nothing drew one).
+- **A Coded Shader in a world's node tree draws its program (it drew a
+  black sky: the world export compiled the program and kept no reference
+  to it).** The node is offered in world trees (`HalcyonNodeBase.poll`
+  takes any `ShaderNodeTree`), and `export.serialize_tree` compiles its
+  source there as it does in a material -- into the `programs` dict its
+  caller hands it. The world export handed it a dict literal,
+  `world.graph = serialize_tree(bw.node_tree, images, {}, warnings)`:
+  `_node_props` filed the program in it and the dict was gone on the
+  next line. `core/scene.World` had a field for the ground material's
+  programs (`ground_programs`, kept a few lines above) and none for its
+  own tree's; `core/render.world_color`, the one place a world graph is
+  evaluated, built `GraphEvaluator(world.graph, ctx, textures, {})`; and
+  `n_halcyon_code` answers zeros for a node with no program. *Wrong
+  picture or fallback: the wrong picture, and nothing said.* The probe
+  put the real node class (stand-in sockets) through the real
+  `export_scene` under the fake Blender and rendered `R.render` at 96x72
+  over the demo scene: with Coded Shader (Color) -> Background (Color)
+  -> World Output (Surface) and a shader that writes `vec4(0.15, 0.35,
+  0.8, 1.0)`, all 2649 uncovered pixels of the 6912 read (0, 0, 0),
+  where an RGB node of that colour in the node's place reads (0.15,
+  0.35, 0.8). No warning was due: the compile had succeeded. The GPU
+  device drew the same black -- its sky pass refuses every world graph
+  but a lone Background by name (`gpu/sky.refusal`), so the sky in its
+  frame is the CPU evaluator's -- and so did a mirror, whose environment
+  term is `world_color` along the reflected ray (339 pixels of the demo
+  Ball at `reflect_level` 0.6, up to 0.48 off). (1) *The programs ride
+  the World.* `World.programs`, beside `ground_programs`: what
+  `Material.programs` is to a material's graph. The world export hands
+  `serialize_tree` a dict it keeps and files it there. The generic World
+  loop skips the field (it is no setting of the panel's), and
+  `presets/skies.EXCLUDED` names it beside `graph`: a sky preset resets
+  every field it owns, and must not take the programs from under a tree
+  it leaves alone. A scene pickled for the worker pool carries the field
+  with the rest of the World, each program recompiling on arrival as a
+  material's does (`Program.__setstate__`). (2) *The world evaluator is
+  handed them.* `world_color` passes `world.programs` to its evaluator
+  (None on a World built by hand: the evaluator takes that as none, and
+  such a world reads what it read). Every road onto the sky calls that
+  one function -- the background pass and the environment term of a
+  reflective material on both devices (both rendered here), a traced ray
+  that hits nothing and the fog that fades to the backdrop (read in the
+  code, not rendered) -- so there is one line to hand them to. (3) *Node
+  groups.* Nothing more was needed: a program is filed under its node's
+  graph id (`export.node_id`, the path), `serialize_tree` hands the one
+  dict down its group recursion, and `group_evaluator` hands its
+  sub-evaluator the same `programs`. A Coded Shader inside a node group
+  of the world tree is 'Group/Coded Shader', two levels down
+  'Outer/Group/Coded Shader', and each runs its own; the world's own
+  "Coded Shader" beside a group's "Coded Shader" are two programs. A
+  source that does not compile files none and the export warns by the
+  same id ("Group/Coded Shader: line 6: undeclared identifier
+  'nothing'"), as it already did. (4) *What the inputs read: the world
+  evaluator's context, as every other node of a world tree reads it.*
+  Nothing was added to that context for this node. The ray is all a sky
+  has: `I` is its direction (the Camera Data node's View Vector) and so
+  is `vObject` (the Texture Coordinate node's Generated); `vNormal` /
+  `N` and `vView` / `V` are its reverse (Texture Coordinate's Normal,
+  Geometry's Incoming); `vPosition` / `P` / `worldPos` is a point 1e6
+  along it (Geometry's Position); `vTangent` is a tangent of that
+  reversed normal (Geometry's Tangent). What a sky has none of reads the
+  context's default, and the default is zero: `vUV` (under each of its
+  names) and `vUV2`, `vGeoNormal`, `vBitangent`, `vDepth`,
+  `vBackfacing`, `vRandom`, `vScreenUV`, `vCamera`, and `gl_FragCoord`,
+  which is (0, 0, 0, 1). Two defaults are not zero: `vColor` is white,
+  (1, 1, 1, 1), the context's default where there is no colour layer,
+  and `iResolution` is (0, 0, 1). That context carries no clock: `iTime`
+  reads 0 and `iFrame` reads 1 on every frame, as the Screen Info node's
+  Time and Frame do there (below). `dFdx` / `dFdy` / `fwidth` read zero
+  and `dither4x4` hands its value on, for want of a pixel; `discard` is
+  not read (a sky has no alpha to cut). None of it raises: the test runs
+  all 29 names with the evaluator's STRICT switch on, which lets no node
+  error be swallowed. (5) *The GPU device* needed no change and is right
+  now. The sky pass refuses the graph by name -- `[Halcyon GPU] sky on
+  the CPU: the world node graph is evaluated on the CPU` -- and the CPU
+  draws the sky; the deferred plan gives a world that has a graph the
+  CPU's environment term (`('CPU',)`), so a mirror on that device
+  reflects the coded sky as well. No cache keys on the world graph, so
+  none had to learn the source: the plan's signature holds WHETHER the
+  world has a graph, not the graph, because no pass bakes the sky or the
+  environment term of such a world. An edit of the source re-exports,
+  and the next frame's sky and reflections are the new shader's on the
+  plan the last frame left. *Pictures that change*: a world whose node
+  tree holds a Coded Shader was black wherever the world is evaluated --
+  the sky and its reflections -- and is the shader now, on both devices.
+  A node nobody has typed in draws the starter shader it opens with: its
+  Base Color in bands across the dome (the normal it shades by is the
+  reversed ray). Nothing else moves: a world without the node is
+  evaluated over the same empty programs as before, and a World built by
+  hand has none. Pinned in `test_code_node_in_the_world_tree` (37
+  checks), with the real node class through the real `export_scene`: the
+  program kept under the node's id, compiled from the source its graph
+  entry carries; every uncovered pixel exactly the shader's colour and
+  the whole frame the RGB node's, bit for bit; the 1.92.0 export of the
+  same tree (the graph, no program) black, so the frames can tell; the
+  starter node; a linked uniform under a Background Strength of 1.3
+  against the RGB node; the Color wired straight into the World Output
+  and the node's own Output as Surface, each the same sky bit for bit;
+  the group, the same-named pair summed (the frame of the inner node
+  renamed, and of two RGB nodes through the same Mix) and a group in a
+  group; the two compile warnings; the 29 inputs, each held bit for bit
+  to the stock node that reads the same field in a world tree or to the
+  context's default, with those stock outputs checked to exist; a
+  mirror, three bands against the whole frame, and the pickled world;
+  and on the stand-in driver the refusal, its console line, the device's
+  sky bit for bit the CPU's, the mirror within the shading twin's 6e-6,
+  and the edited source followed on one plan with every cache left warm.
+  Nineteen mutations each fail it: the dict literal back in the export;
+  the dict kept but not filed, filed under `ground_programs`, or an
+  empty one filed; the evaluator handed `{}` or the ground material's
+  programs; `World` without the field; the field left to the sky
+  presets; a group's evaluator or a group's export handed a dict of its
+  own; the program filed by bare name; the compile warning dropped; the
+  context's normal turned along the ray; the coded inputs reading a UV
+  or a Generated coordinate the context does not hold; the fragment
+  coordinate or a derivative requiring a pixel; the sky pass not
+  refusing the graph; the plan not giving a graph world the CPU's
+  environment term. *Seen from the same probes and left for their own
+  fixes*: three more evaluators are built without the material's
+  programs, and a Coded Shader that feeds them reads zero there in the
+  same silence -- `core/volume._sample_volume` (a Value node of 0.5 into
+  a Halcyon Volume's Density gives extinction 0.5, the coded shader that
+  writes 0.5 gives 0: the volume is not there) and the Anime Shader's
+  two bakes, `bake_anime_ramp` and `bake_face_sdf` (the Shadow Ramp and
+  Face Shadow (SDF) tables come out all zero). A `uniform sampler2D` has
+  no road to an image -- nothing in the add-on writes the socket's
+  `halcyon_image_key` -- and `texture()` on the unbound sampler raises
+  inside `prog.run` (`'numpy.ndarray' object has no attribute
+  'sample'`); the evaluator swallows that, the node reads zero, and
+  where a material's evaluator errors are printed (`node evaluator:
+  ...`) the world road reads neither `ev.unsupported` nor `ev.errors`,
+  so a node that raises in a world tree says nothing. And the world's
+  node context has no clock, no camera position and no pixel although
+  `world_color` is handed the scene's time (for the sky models) and the
+  eye: with the scene at 2.5 seconds, frame 61, `iTime` read 0 and
+  `iFrame` 1 -- an animated sky cannot be written in any node of a world
+  tree until that context carries them.
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
@@ -3579,6 +3841,13 @@ What headless cannot prove, per feature (the fakebpy / fakeblender stubs validat
   wiring on the GPU device; the same file in EEVEE beside it, where the
   surface under the glow is black and Halcyon's is its lit fallback
   (the open item above).
+- The emission slot routing on a real driver (proven in the simulator,
+  on the fake driver and under glslang alone): an Emission node and a
+  texture wired straight into Surface shading on the GPU device with no
+  `shading on the CPU:` line and matching the CPU device's frame; a
+  Mix Shader with one input left empty over an Emission doing the same;
+  the routed surface seen in a ray-traced mirror (the sweeps never ran
+  on the fake driver).
 - The Coded Shader's name error in a live node editor (proven against
   the fake bpy alone): the box under the Compile button reading `line 6:
   undeclared identifier 'nothing'`, the operator's red report in the
@@ -3656,6 +3925,19 @@ What headless cannot prove, per feature (the fakebpy / fakeblender stubs validat
   such a group (the same call rewrites the world graph; nothing here
   drew one); and a lightmap bake of such a material (`bake_lightmap`
   makes the same call; no bake was run).
+- A Coded Shader in a world's node tree, in Blender and on a driver. The
+  fix is proven headless alone (the real node class on stand-in sockets
+  through the real `export_scene` under the fake Blender, CPU frames,
+  the GPU device on the stand-in driver) -- never in a Blender session
+  and never on a GPU (no Blender and no `bpy` module in the session this
+  was written in). Open there: a Coded Shader added to a real world tree
+  and an F12 of it (the starter shader's bands on the sky, then an
+  edited source after Compile); a real `bpy.types.World` whose tree
+  holds the node inside a real node group; the viewport following an
+  edit of the Text after a re-export; the GPU device's console line
+  (`[Halcyon GPU] sky on the CPU: the world node graph is evaluated on
+  the CPU`) beside a sky drawn by the CPU; and the F12 report carrying a
+  world Coded Shader's compile error by its node's name.
 
 *World Light: the sky's own sun or moon lights the scene.*
 

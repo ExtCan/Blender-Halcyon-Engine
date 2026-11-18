@@ -87,18 +87,33 @@ SHADELESS_MODELS = frozenset({'WIREFRAME', 'CONSTANT'})
 #: a colour, value or vector output wired straight into a SHADER socket
 #: (the Material Output's Surface, a Mix / Add Shader input, a Max
 #: blend's sub-material). The CPU reads Blender's implicit conversion,
-#: an Emission of it (nodeeval.link_closure); the frame pass emits ONE
-#: colour chain and feeds it to the diffuse term, and the emitter casts
-#: that very link into the chain -- it qualified and drew the colour as
-#: the albedo, 1.69 off the CPU on the demo ball. Refused BY NAME, on
-#: the lobe's PRESENCE (never a sampled weight: the wiring is the fact)
+#: an Emission of it (nodeeval.link_closure); the emitter casts that very
+#: link into the pass's ONE colour chain. Alone -- a closure of emission
+#: lobes and nothing else -- the chain IS the emission and rides its
+#: slot (the emission slot routing, _probe_material). Beside a diffuse or
+#: a glossy lobe one chain cannot be both: the pass qualified and drew
+#: the colour as the albedo, 1.69 off the CPU on the demo ball, before
+#: this refused BY NAME -- on the lobe's PRESENCE, never a sampled
+#: weight: the wiring is the fact
 IMPLICIT_EMISSION_REFUSAL = (
     'a colour, value or vector output is wired straight into a shader '
-    'socket: that is an Emission of it (Blender\'s implicit conversion, '
-    'the picture the CPU shades), and the frame pass emits only the '
-    'diffuse chain -- this material shades on the CPU exactly (a Halcyon '
-    'Shader in between, the chain in its Diffuse Color or '
-    'Self-Illumination, puts it on the driver)')
+    'socket beside another kind of lobe: the link is an Emission of it '
+    '(Blender\'s implicit conversion, the picture the CPU shades), and '
+    'the frame pass emits ONE colour chain, which cannot feed the '
+    'emission term and the diffuse term at once -- this material shades '
+    'on the CPU exactly (alone, the link rides the emission slot on the '
+    'driver; so does a Halcyon Shader with the chain in its Diffuse '
+    'Color or Self-Illumination)')
+
+
+def emission_route_refusal(idname):
+    """An emission-only closure that reaches the Surface through a
+    shader node the emission slot routing has not been proven on
+    (material.EMISSION_ROUTE_NODES), by that node's name."""
+    return (f'an emission-only closure reaches the Surface through '
+            f'{idname}, whose chain is not the emission the CPU sums '
+            f'(Emission, Mix Shader, Add Shader and Reroute are) -- this '
+            f'material shades on the CPU exactly')
 
 
 def _plot_ss(st):
@@ -236,15 +251,35 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
         # on the driver since the emitters existed, unseen because no
         # matrix row ever carried one. Refuse BY NAME; the pictures stay
         # the CPU's own until the specular slot routing is ported.
-        from .material import master_node
-        if any(_p.get('implicit') for _k, _w, _p
-               in (getattr(cl, 'items', None) or ())):
-            # a non-closure wired into a shader socket: the CPU's
-            # implicit Emission, the emitter's albedo -- by name, before
-            # the raw-lobe rule below could word it as a node the graph
-            # does not hold (and whatever a sampled weight reads)
+        from .material import emission_route_block, master_node
+        _items = getattr(cl, 'items', None) or ()
+        if _items and all(_k == 'EMISSION' for _k, _w, _p in _items):
+            # THE EMISSION SLOT ROUTING: every lobe of the closure is an
+            # EMISSION -- a colour wired straight into Surface (the
+            # implicit one), an Emission node, a Mix / Add Shader of
+            # those. No lobe then feeds the diffuse or the specular
+            # slot: closure_to_surface hands back CONSTANTS there
+            # (whatever it decides for a surface with no diffuse and no
+            # glossy lobe -- the bake below reads it, never restates it)
+            # and puts the weighted sum of colour x strength in
+            # surf.emission -- which is exactly the ONE chain the
+            # emitter writes for those nodes. So the pass adds the chain
+            # where light_surface adds surf.emission and bakes the flat
+            # diffuse. STRUCTURAL on purpose (every lobe, whatever
+            # its weight): a diffuse lobe a Fac mask zeroes at the
+            # sixteen probed fragments is still a diffuse lobe elsewhere
+            _stop = emission_route_block(mat.graph, ev.cache)
+            if _stop is not None:
+                return None, None, emission_route_refusal(_stop)
+            route_slot = 'emission'
+        elif any(_p.get('implicit') for _k, _w, _p in _items):
+            # a non-closure wired into a shader socket BESIDE another
+            # kind of lobe: the CPU's implicit Emission, the emitter's
+            # albedo -- by name, before the raw-lobe rule below could
+            # word it as a node the graph does not hold (and whatever a
+            # sampled weight reads)
             return None, None, IMPLICIT_EMISSION_REFUSAL
-        if getattr(cl, 'items', None) and \
+        elif getattr(cl, 'items', None) and \
                 master_node(mat.graph) is None:
             # HALCYON lobes stay allowed: their colour IS the diffuse
             # chain (e_halcyon_shader emits exactly that, and a Mix
@@ -454,9 +489,10 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
     for name in ('specular', 'emission') + EXTRA_COLORS:
         if name in perpix:
             continue
-        if name == 'specular' and route_slot == 'specular':
-            # the routed chain IS the specular colour: the pass emits
-            # it per pixel, so its variation is the whole point
+        if name == route_slot:
+            # the routed chain IS the specular colour (or the emission):
+            # the pass emits it per pixel, so its variation is the whole
+            # point
             continue
         field = getattr(surf, name, None)
         if field is None:
@@ -490,18 +526,20 @@ def _probe_material(job, gbuf, mi, py, px, frags=None, layer=False,
     if ok_d and surf.diffuse.shape[0]:
         bake['diffuse_flat'] = tuple(float(v)
                                      for v in np.asarray(surf.diffuse)[0])
-    if route_slot == 'specular':
-        # the specular slot routing: the emitted chain becomes
-        # s.specular, so s.diffuse must carry the CPU's own untouched
-        # flat value as a constant -- and it must BE flat, or the pass
-        # cannot represent the surface
+    if route_slot in ('specular', 'emission'):
+        # the specular / emission slot routing: the emitted chain becomes
+        # s.specular (or the emission term), so s.diffuse must carry the
+        # CPU's own untouched flat value as a constant -- and it must BE
+        # flat, or the pass cannot represent the surface
         if not ok_d:
-            return None, None, ('a glossy-routed graph varies its '
+            _which = 'a glossy' if route_slot == 'specular' \
+                else 'an emission'
+            return None, None, (f'{_which}-routed graph varies its '
                                 'diffuse per pixel; the material '
                                 'shades on the CPU')
         bake['diffuse'] = tuple(float(v)
                                 for v in np.asarray(surf.diffuse)[0])
-        bake['__slot'] = 'specular'
+        bake['__slot'] = route_slot
     if _sssp is not None and getattr(st, 'sss', True):
         # the assembler binds the tree texture and emits the diffuse
         # replacement (shade_lamp_loop's block); texfac shapes the col
