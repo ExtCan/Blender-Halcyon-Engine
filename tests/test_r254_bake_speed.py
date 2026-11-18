@@ -964,6 +964,24 @@ def test_e_a_viewport_draft_bakes_draft_sized_maps():
           and sizes[0::2] == [(320, 192)] * 4
           and sizes[1::2] == [(1088, 768)] * 4,
           f'{GSH.PLAN_STATS} {sizes[:2]}')
+    # the divisor is taken only where it makes the draft's bake cheaper:
+    # on a mesh whose bake follows the triangle count a smaller map costs
+    # the same and the refine would pay a second bake (the real viewport,
+    # 65k triangles, a 512 cube: draft + refine 0.57 s -> 0.63 s with the
+    # divisor, 0.45 s without)
+    dense = _scene([_lamp('POINT'), _lamp('SUN', pos=(1, 2, 6), name='S',
+                                          shadow_map_size=512),
+                    _lamp('SPOT', pos=(-3, -2, 4), name='T',
+                          shadow_map_size=64)], st, seg=96)
+    n_light, n_dense = sc.mesh.tris.shape[0], dense.mesh.tris.shape[0]
+    check('draft_map_divisor: 2 at twice the refine\'s pixel size, 4 at '
+          'four times, 1 at the refine\'s own -- and 1 for a mesh that '
+          'holds fewer than 64 map texels per triangle and lamp',
+          [LI.draft_map_divisor(sc, st, r) for r in (1, 2, 3, 4, 9)]
+          == [1, 2, 2, 4, 4]
+          and [LI.draft_map_divisor(dense, st, r) for r in (2, 4)] == [1, 1]
+          and n_dense > 30000 > n_light,
+          f'{n_light} / {n_dense} triangles')
     src = open(__file__.replace('tests/test_r254_bake_speed.py',
                                 'preview.py').replace(
         'tests\\test_r254_bake_speed.py', 'preview.py'),
@@ -971,6 +989,7 @@ def test_e_a_viewport_draft_bakes_draft_sized_maps():
     check('preview.py sets the divisor and divides the Softness on a '
           'draft\'s settings copy only',
           'settings._shadow_map_div = div' in src
+          and 'div = _lights.draft_map_divisor(scene, settings, rel)' in src
           and 'float(settings.shadow_softness) / div' in src
           and src.index('if draft:') < src.index('_shadow_map_div'))
 

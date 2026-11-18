@@ -439,6 +439,42 @@ def _map_size(light, settings):
     return size
 
 
+#: R254: a viewport draft bakes smaller maps only where the frame's maps
+#: hold at least this many texels per scene triangle (and per mapped
+#: lamp). Under it the bake follows the triangle count -- measured in the
+#: real viewport on a 65,000-triangle mesh: a 256 cube bakes in the time
+#: of a 512 one -- so a smaller map buys the draft nothing and the refine
+#: a second bake; over it the draft's bake shrinks with its texels (a
+#: 2048 cube: 0.64 s, at half the side 0.32 s)
+DRAFT_TEXELS_PER_TRI = 64
+
+
+def draft_map_divisor(scene, settings, rel):
+    """What a viewport draft divides the side of its shadow maps by,
+    given `rel`, the draft's pixel size over the refine's: 2 at twice, 4
+    at four times or more -- and 1 where smaller maps would not make the
+    draft's bake cheaper (DRAFT_TEXELS_PER_TRI). `settings` is the
+    frame's, before any divisor is on it."""
+    div = 4 if rel >= 4 else (2 if rel >= 2 else 1)
+    if div == 1:
+        return 1
+    tris = getattr(getattr(scene, 'mesh', None), 'tris', None)
+    if tris is None:
+        return div
+    texels = lamps = 0
+    for light in (getattr(scene, 'lights', None) or ()):
+        if not wants_shadow_map(light, settings) or light.type == 'HEMI':
+            continue
+        size = _map_size(light, settings)
+        cube = light.type not in ('SUN', 'SPOT') or (
+            light.type == 'SPOT' and spot_map_fov(light) > SPOT_CUBE_FOV)
+        texels += (6 if cube else 1) * size * size
+        lamps += 1
+    if texels < DRAFT_TEXELS_PER_TRI * int(tris.shape[0]) * max(lamps, 1):
+        return 1
+    return div
+
+
 class _MapPlan:
     """One lamp's map before it is baked: the frames of its faces and
     everything the built map records. `skip` marks cube faces that are
