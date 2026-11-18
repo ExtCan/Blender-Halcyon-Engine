@@ -28,14 +28,18 @@ a cleared target is not a promise (the pool hands back used targets), the
 written zero is the 2.79 contract.
 
 Twins: every mode here is BITWISE the CPU sky in the simulator on the
-suite's frames (the rays included: the CPU's (N,4)x(4,4) matmul sums in
-the shader's order, and `_rotate_z`'s float64 rounding lands on the same
-float32). The driver is measured by the field test: its `pow`, `atan`
-and division are its own, and a ray an ulp off can flip a pixel that sits
-on a cliff (a band edge, a nearest texel edge) whole -- the field test
-counts those pixels by name. The supersampled road reproduces
-`fast_background` exactly: the low-resolution pixel centre's ray for every
-pixel of a block, edge blocks folded into the last row and column.
+suite's frames (the rays included: the CPU unprojects through
+`mathx.unproject_far`, `hal_sky_ray`'s own sum statement for statement --
+until the 1.92.0 field round it was an (N,4)x(4,4) matmul, which is that
+sum only on a BLAS without fused multiply-add: an FMA `sgemm` moved every
+twin here an ulp at a dozen pixels -- and `_rotate_z`'s float64 rounding
+lands on the same float32). The driver is measured by the field test:
+its `pow`, `atan` and division are its own, and a ray an ulp off can flip
+a pixel that sits on a cliff (a band edge, a nearest texel edge) whole --
+the field test counts those pixels by name. The supersampled road
+reproduces `fast_background` exactly: the low-resolution pixel centre's
+ray for every pixel of a block, edge blocks folded into the last row and
+column.
 
 Every dial rides a params texture (texelFetch is exact; ints to 2**24);
 the mode is the one push-constant int. Nothing here is a setting: the
