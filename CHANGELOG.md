@@ -3032,7 +3032,7 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   the AVX-512 loops other bytes again, because the vertex transforms are
   matmuls too and `pow` / `atan2` are SIMD loops. Off that class the pin
   fails exactly as it did; widening it (a digest per class, or a
-  comparison in place of a checksum) is a decision left open. (b) *The
+  comparison in place of a checksum) is the next entry's. (b) *The
   previous releases in their zips.* `test_render._prev_engine` renders
   "bitwise the 1.89.0 engine", and every release computed the ray as the
   matmul (the line stands exactly once in all 29 revisions of
@@ -3082,6 +3082,116 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   landed on (`claude-cloud` 1e6239c), 12,939 checks pass where 12,863 did,
   and the failing lines that remain are the baseline's zip lines, byte for
   byte.
+- **The three frame digests hold in every machine class that was measured
+  (the decision the entry above left open).** `test_mapping_frame_twin`
+  ends on the bitwise-neutral rule for whole frames: three pre-existing
+  featurematrix scenes (`textured`, `demo`, `mirror`; `R.render`, 96x72,
+  transparency NONE) held to frozen `adler32` constants -- the pre-edit
+  bytes with the sky ray as the matmul it was, and the frame as it renders
+  now. A whole-frame checksum is the bytes of ONE machine class, so the
+  three checks passed on a fused BLAS under NumPy's AVX-512 loops and
+  failed on every other machine, whatever the code. (1) *Two functions,
+  isolated.* The three frames were traced call by call. The kernel half is
+  the float32 matmul of the vertex transforms (BLAS `sgemm`, fused or not
+  by the core OpenBLAS picks, as in the entry above). The other half is
+  float32 `np.power` and nothing else: with NumPy's AVX-512 loops left on
+  and `mathx.safe_pow` alone handed the C library's `powf` (twelve calls
+  over the three frames, some 1,600 results changed), the frames ARE the
+  bytes of the class without those loops, digest for digest on both
+  kernels. NumPy runs its AVX-512 `pow` loop where it dispatches one and
+  calls `powf` where it does not (bitwise glibc 2.39's on 8,192 lanes; a
+  fifth of them differ between the two). Not `arctan2`: the three frames
+  never call it (one import-time table does, in float64). Not the camera:
+  its float64 `tan` / `arctan` take the AVX-512 loops too, and build the
+  same matrices in all four classes. Not float32 `sin`, which differs
+  between the AVX2 and the SSE loops and reaches no pixel of these frames
+  -- so with AVX-512 off, AVX2 on or off is one class. Two functions with
+  two answers each: four classes. (2) *The pin is a table, and its key is
+  measured.* `machine_class()` computes the key where the test runs:
+  `adler32` of two float32 matmuls in the shapes the vertex and normal
+  transforms take ((N,4)x(4,4) and (N,3)x(3,3), every column general) and
+  `adler32` of `np.power` on 8,192 lanes (a base in [0.25, 1) to an
+  exponent in [0, 32), a base in [0.25, 4) to one in [-4, 4): every result
+  a normal float32, so the key cannot turn on how a process treats
+  denormals), the operands built from an integer hash and one exact
+  division so that they are the same floats on every NumPy -- no RNG
+  stream to trust. Never a CPU name, a NumPy version or a feature flag:
+  the bytes are the key, and the kernel module's reading of the same
+  matmul on the sky's rows ("the chain" / "the fused chain") is printed
+  beside it in a `note`, never keyed on. `FRAME_DIGESTS` holds one row per
+  key and, for each scene, the pair (pre-edit, now). As textured / demo /
+  mirror: a fused matmul under the AVX-512 loop (`0xc1c32195`,
+  `0x7f01125b`: the pair the test held before) 1656485521 / 1045851408 /
+  1324349618 and 3858757274 / 3248123161 / 3526621371; the unfused chain
+  under that loop (`0xb34ecf20`) 1539176161 / 928542048 / 2436496908,
+  twice; a fused matmul under `powf` (`0x04fa130f`) 3073177232 /
+  2462543119 / 2741041329 and 981464729 / 370830616 / 649328826; the chain
+  under `powf` 2955867872 / 2345233759 / 3853188619, twice. Where the
+  matmul is the chain the sky ray never moved and the pair is one number.
+  (3) *Every row is the pre-edit tree's own.* The pre-edit tree
+  (`claude-cloud` b0cbe1c) was exported and run in each class, not
+  inferred from this one. Over 168 configurations -- NumPy 2.5.3 under
+  eighteen settings of `OPENBLAS_CORETYPE` and four levels of
+  `NPY_DISABLE_CPU_FEATURES` (everything on; without the Ice Lake and
+  Sapphire Rapids groups; without AVX-512; without AVX2 too), and 1.26.4,
+  2.0.2, 2.2.6 and 2.3.5 under six cores and four levels each, with
+  Katmai, Prescott, Nehalem, Sandybridge, Haswell, SkylakeX and Cooperlake
+  the kernels that ran (OpenBLAS 0.3.23 to 0.3.34) -- that tree renders
+  the first column of the row this tree's test picks, bit for bit, and the
+  test finds its key and passes its three checks, in every one. The 1.91.0
+  commit (116863b) renders the same first column in the four classes: the
+  pre-edit bytes are the previous release's too. A CPU without FMA takes
+  other variants of glibc's libm; forced with `GLIBC_TUNABLES`, float64
+  `pow`, `exp`, `sin` and `cos` move, and `powf`, the key and the frames
+  do not. (4) *A class with no row fails, by name.* A key in no row is one
+  FAIL -- "this machine's class has a row in FRAME_DIGESTS" -- beside a
+  `note` that says which half of the key the table knows, and the
+  machine's own row printed ready to paste; it is never skipped, because
+  there the test cannot say whether a picture moved. A key WITH a row
+  whose frames are not the row fails its scene's check and prints the row
+  as rendered. Not measured, and each expected to be a class of its own:
+  another C library's `powf` (Windows, macOS, an older glibc), ARM, a
+  NumPy on another BLAS or on none. A row is to be added only from a tree
+  that passes in a class already listed: that is what makes the bytes it
+  prints a machine's and not a moved picture's. (5) *Not a tolerance, and
+  not the zip.* The pin stays bitwise in every class; a moved pixel fails
+  as it did. Comparing against the previous release in its zip
+  (`test_render._prev_engine`) would be machine-independent, but it skips
+  wherever the zip is absent -- the container among them -- and the table
+  needs nothing beside the tree. (6) *It still bites.* Two mutations, each
+  run in the four classes and failing in all four: the Image Texture's
+  flat U 1e-5 high (`core/nodeeval.n_tex_image`: ONE pixel of `textured`
+  crosses a checker edge and that scene's check fails, while `demo` and
+  `mirror`, which hold no texture, stay green), and `safe_pow` one ulp
+  high (eleven pixels of each frame, 2.4e-07 to 4.8e-07: all three fail).
+  The path of a class with no row was run by taking this machine's row
+  away, and with `np.power` itself an ulp high (the kernel half named from
+  the table, the `pow` half "in no row"). *Seen and left as found:*
+  `test_projector_old_modes_frozen` in the same module holds the
+  Projector's CYLINDER and SPHERE lanes to digests of float32 `arctan2` /
+  `arccos`, which have the same two answers, so its six checks (two modes
+  by three axes) fail without the AVX-512 loops, before and after this
+  entry. The pre-edit tree's own digests there are 3794526883 / 2315255300
+  / 2522480949 (CYLINDER X / Y / Z) and 2796990144 / 4009201160 /
+  2923579709 (SPHERE), the same on NumPy 1.26.4 to 2.5.3. The terrain
+  tool's "is the 1.91 mesh bitwise" hashes (`test_r253_terrain_tool`) are
+  a third pin of the kind: Dunes and Volcano fail without the AVX-512
+  loops, Crater too once AVX2 is off, before and after this entry. Those
+  pins are a lane's and a mesh's, not a frame's, and how to widen each is
+  its own decision. In the container `run_all` is otherwise what it was.
+  On the tree the pin was measured on (`claude-cloud` 1e6239c with the
+  entry above), as the machine runs it (a fused kernel under the AVX-512
+  loops), 12,939 checks pass before and after and the failing lines are
+  the 32 zip lines. Forced into the other three classes, the module's
+  three checks turn from FAIL to ok and no other line of the suite
+  changes: on the unfused kernel 12,939 pass where 12,936 did; on the
+  fused one without the AVX-512 loops 12,931 where 12,928 did; on the
+  unfused one without AVX2 either 12,930 where 12,927 did -- and what
+  still fails there beside the zip lines is the six Projector lanes and
+  the two or three terrain hashes named above, as before. Merged onto
+  `claude-cloud` e228c85, where the suite has grown, the same four classes
+  pass 13,106, 13,106, 13,098 and 13,097 checks and fail those names and
+  no other.
 - **A master shader inside a node group bumps from its Bump Height (the
   socket was read by nothing there, and the surface drew flat).** The
   master's Bump Height is sugar: nothing shades from the socket.
@@ -3941,8 +4051,23 @@ What headless cannot prove, per feature (the fakebpy / fakeblender stubs validat
   exactly once -- with the identity pins as they were. NOT run in this
   round: the container has no zip. If that machine's line says "an FMA
   kernel", its sky twins were red before this round and are green now;
-  the three mapping frame digests pass there only if its NumPy also runs
-  the AVX-512 loops.
+  the three mapping frame digests pass there if its class is one of the
+  table's four (the next item).
+- Any machine but the container, for the frame-digest table. The four rows
+  of `FRAME_DIGESTS` were each produced on the container's one Xeon
+  (Linux, glibc 2.39), by forcing the BLAS kernel and narrowing NumPy's
+  dispatch; no second machine was run. NOT run in this round: a real
+  AVX2-only CPU and a real pre-Haswell one (under this glibc, expected in
+  the table: the forced classes are their arithmetic, and glibc's variants
+  for a CPU without FMA were forced too), Blender's own Python and NumPy,
+  Windows, macOS and ARM (each expected to be a class of its own). There
+  `test_mapping_frame_twin` either finds its key and passes, or fails
+  "this machine's class has a row in FRAME_DIGESTS" and prints the row, to
+  be pasted only from a tree that passes in the container. A machine
+  without the AVX-512 loops also fails the six Projector lane checks of
+  `test_projector_old_modes_frozen` and two or three of the terrain tool's
+  mesh hashes, as it did before this round's table: those pins were not
+  widened.
 - A master inside a node group, bumped, in a real file. The fix is
   proven headless alone (stand-in trees through the real
   `serialize_tree`, CPU frames; bands rendered one after another through
