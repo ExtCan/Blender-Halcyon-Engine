@@ -130,6 +130,16 @@ pinned where it bit.
     an output) and a misspelled input (nothing was ever warned of, so the
     node's warning box could not show a line). The counts and the widths
     are compile errors with a line; the rest run as written.
+(21) A master shader INSIDE a node group ignored its linked Bump Height:
+    the surface drew with no bump at all. The socket is sugar that
+    `core/nodeeval.desugar_master_bump` rewrites into a real Bump node at
+    the top of every render, and the rewrite walked the material's own
+    tree only; nothing else reads the socket. It enters every group now,
+    to any depth, and puts the synthesized Bump into the tree its master
+    sits in, under that tree's path (`nodeeval.synth_bump_id`:
+    'Group/__bump_Halcyon'), so the node shades in the group's own
+    evaluator, two instances of one group keep a Bump each, and the Bump
+    pre-pass of (18) files its field like any other.
 """
 import io
 import os
@@ -2097,23 +2107,30 @@ def test_code_node_non_ascii_name_reaches_the_gpu():
           str(sorted(calls(GE._code_tag))))
 
 
-def _bump_chain(tree, scale=None, normal=None, tag=''):
-    """The height chain of the group-Bump probe, in `tree`: Gradient Texture
-    (QUADRATIC_SPHERE) -> Math MULTIPLY -> Bump, a dome that bends the whole
-    floor. The multiplier is 6.0, or the output socket `scale`; the Bump's
-    Normal takes the output socket `normal`. `tag` ends the three names (a
-    second chain in one tree). Returns the Bump."""
+def _height_chain(tree, scale=None, tag=''):
+    """The height of the group-Bump probes, in `tree`: Gradient Texture
+    (QUADRATIC_SPHERE) -> Math MULTIPLY, a dome over the whole floor. The
+    multiplier is 6.0, or the output socket `scale`; `tag` ends the two
+    names (a second chain in one tree). Returns the Math node's output."""
     ramp = _code_plain(tree, 'Gradient Texture' + tag, 'ShaderNodeTexGradient', ins=(('NodeSocketVector', 'Vector'),),
                        outs=(('NodeSocketColor', 'Color'), ('NodeSocketFloat', 'Fac')),
                        gradient_type='QUADRATIC_SPHERE')
     steep = _code_plain(tree, 'Math' + tag, 'ShaderNodeMath', ins=(('NodeSocketFloat', 'Value'),) * 2,
                         outs=(('NodeSocketFloat', 'Value'),), operation='MULTIPLY', use_clamp=False)
     steep.inputs[1].default_value = 6.0
-    bump = _code_bump(tree, 'Bump' + tag)
     tree.links.new(ramp.outputs['Fac'], steep.inputs[0])
-    tree.links.new(steep.outputs['Value'], bump.inputs['Height'])
     if scale is not None:
         tree.links.new(scale, steep.inputs[1])
+    return steep.outputs['Value']
+
+
+def _bump_chain(tree, scale=None, normal=None, tag=''):
+    """`_height_chain` -> Bump, in `tree`: the dome bends the whole floor.
+    The Bump's Normal takes the output socket `normal`; `tag` ends the three
+    names. Returns the Bump."""
+    height = _height_chain(tree, scale, tag)
+    bump = _code_bump(tree, 'Bump' + tag)
+    tree.links.new(height, bump.inputs['Height'])
     if normal is not None:
         tree.links.new(normal, bump.inputs['Normal'])
     return bump
@@ -2439,6 +2456,527 @@ def test_group_bump_gathers_from_a_whole_material_field():
           'group_evaluator' in calls(NE.n_group) and 'group_evaluator' in calls(NE.bump_heights)
           and inspect.getsource(NE).count('.group_inputs = ') == 1
           and '.group_inputs = ' in inspect.getsource(NE.group_evaluator))
+
+
+#: the three sockets a master's bump rides, behind _MASTER_SOCKETS in the
+#: node's own order (nodes/shader_nodes.SOCKETS)
+_MASTER_BUMP_SOCKETS = (('NodeSocketVector', 'Normal', None), ('NodeSocketFloat', 'Bump Strength', 1.0),
+                        ('NodeSocketFloat', 'Bump Height', 0.5))
+
+#: what a master of the probe can be fed, and what a group around one
+#: takes through its interface: name -> socket type
+_MASTER_FEEDS = {'Scale': 'NodeSocketFloat', 'Normal': 'NodeSocketVector', 'Strength': 'NodeSocketFloat',
+                 'Height': 'NodeSocketFloat'}
+
+
+def _bump_master(tree, feeds=None, linked=True, strength=1.0, opacity=1.0, name='Halcyon'):
+    """A master in `tree` (at _MASTER_SOCKETS' values) whose Bump Height is
+    LINKED: to feeds['Height'], or to a `_height_chain` of its own whose
+    multiplier is feeds['Scale']. `feeds` maps those names to output sockets
+    of `tree`; 'Normal' feeds the master's Normal and 'Strength' its Bump
+    Strength, which reads `strength` unlinked. Not `linked`: no height at
+    all, the Bump Height socket at its 0.5."""
+    feeds = feeds or {}
+    hal = _code_plain(tree, name, 'HALCYON_ShaderNode', outs=(('NodeSocketShader', 'Surface'),), model='LAMBERT',
+                      toon_steps=2)
+    for stype, sname, value in _MASTER_SOCKETS + _MASTER_BUMP_SOCKETS:
+        sock = hal.inputs.new(stype, sname)
+        if value is not None:
+            sock.default_value = value
+    hal.inputs['Bump Strength'].default_value, hal.inputs['Opacity'].default_value = strength, opacity
+    if linked:
+        height = feeds['Height'] if 'Height' in feeds else _height_chain(tree, feeds.get('Scale'))
+        tree.links.new(height, hal.inputs['Bump Height'])
+    for fed, sname in (('Normal', 'Normal'), ('Strength', 'Bump Strength')):
+        if fed in feeds:
+            tree.links.new(feeds[fed], hal.inputs[sname])
+    return hal
+
+
+def _master_group_node(tree, name, node_tree, feeds=None):
+    """A group node in `tree` holding `node_tree`: Surface out, and one
+    input per name in `feeds`, linked to that output socket of `tree`."""
+    feeds = feeds or {}
+    node = _code_plain(tree, name, 'ShaderNodeGroup', ins=tuple((_MASTER_FEEDS[fed], fed) for fed in feeds),
+                       outs=(('NodeSocketShader', 'Surface'),), node_tree=node_tree)
+    for fed, sock in feeds.items():
+        tree.links.new(sock, node.inputs[fed])
+    return node
+
+
+def _master_group_tree(reads=(), nested=None, **master):
+    """A node group's tree around `_bump_master`: [Group Input] -> master ->
+    Group Output (Surface). `reads` names the group's inputs, each handed to
+    the master as its feed of that name (`master`: `_bump_master`'s other
+    arguments); given `nested` (another such tree, taking the same inputs)
+    a group node 'Inner' stands where the master would: a group in a
+    group."""
+    tree = types.SimpleNamespace(name='Master Group', nodes=_CodeNodes(), links=_CodeLinks())
+    gout = _code_plain(tree, 'Group Output', 'NodeGroupOutput', ins=(('NodeSocketShader', 'Surface'),),
+                       is_active_output=True)
+    gin = _code_plain(tree, 'Group Input', 'NodeGroupInput',
+                      outs=tuple((_MASTER_FEEDS[fed], fed) for fed in reads)) if reads else None
+    feeds = {fed: gin.outputs[fed] for fed in reads}
+    mid = _master_group_node(tree, 'Inner', nested, feeds) if nested is not None \
+        else _bump_master(tree, feeds, **master)
+    tree.links.new(mid.outputs['Surface'], gout.inputs['Surface'])
+    return tree
+
+
+def test_master_bump_height_inside_a_group_is_a_bump_of_that_group():
+    """A master shader INSIDE a node group ignored its linked Bump Height:
+    the surface drew with no bump at all. The socket is sugar -- nothing
+    shades from it; core/nodeeval.desugar_master_bump rewrites it, at the
+    top of every render, into a real Bump node the master's Normal then
+    reads -- and the rewrite walked graph['nodes'], the material's OWN tree.
+    A group node carries its tree under 'group', which it never entered, so
+    in there the link was read by nothing: the same master with the same
+    height drew 0.89 apart over 4435 pixels of a 128x96 floor in the
+    material's tree and inside a group, the group frame being, bit for bit,
+    the frame of the master with nothing linked. The rewrite walks every
+    tree now, to any depth. The synthesized Bump goes into the tree its
+    master sits in -- the one that holds the nodes its links name, and the
+    one the group's evaluator shades -- under that tree's path
+    (nodeeval.synth_bump_id: 'Group/__bump_Halcyon', the id the exporter
+    would give a node of that name there), so two instances of one group
+    and a like-named master of another tree keep a Bump and a pre-pass
+    field each, and on a frame large enough to pre-pass the new Bump
+    gathers from a whole-material field like any other."""
+    import ast
+    import copy
+    import importlib
+    import inspect
+    import textwrap
+    from . import fakebpy, fakedevice
+    fakebpy.install()
+    EX = importlib.import_module('halcyon.export')
+    from ..core import nodeeval as NE
+    from ..gpu import shade as GSH
+    small, big = (128, 96), (320, 240)        # the floor in one shading batch; outgrowing one: the pre-pass runs
+    synth = 'Group/__bump_Halcyon'
+
+    def value(tree, name, v):
+        node = _code_plain(tree, name, 'ShaderNodeValue', outs=(('NodeSocketFloat', 'Value'),))
+        node.outputs['Value'].default_value = v
+        return node.outputs['Value']
+
+    def fed(scale=None, strength=None, normal=False, height=False, tag=''):
+        """What feeds a master, or the group around one, from the nodes of
+        the material's own tree: a Value at the height's Scale, a Value at
+        the Bump Strength, a real Bump (a shallower dome) for the master's
+        own Normal chain, the height chain itself."""
+        def make(tree):
+            feeds = {}
+            if scale is not None:
+                feeds['Scale'] = value(tree, 'Scale' + tag, scale)
+            if normal:
+                feeds['Normal'] = _bump_chain(tree, value(tree, 'Under' + tag, 2.0), tag='.001' + tag).outputs['Normal']
+            if strength is not None:
+                feeds['Strength'] = value(tree, 'Strength' + tag, strength)
+            if height:
+                feeds['Height'] = _height_chain(tree, tag='.002' + tag)
+            return feeds
+        return make
+
+    def material(make):
+        """A material whose Material Output takes the Surface of what
+        `make(tree)` returns."""
+        tree = types.SimpleNamespace(name='Floor', nodes=_CodeNodes(), links=_CodeLinks())
+        out = _code_plain(tree, 'Material Output', 'ShaderNodeOutputMaterial', ins=(('NodeSocketShader', 'Surface'),))
+        tree.links.new(make(tree).outputs['Surface'], out.inputs['Surface'])
+        return types.SimpleNamespace(name='Floor', use_nodes=True, node_tree=tree)
+
+    # the reported pair: the master in the material's own tree, and inside a group
+    def top(feeds=None, **master):
+        return material(lambda tree: _bump_master(tree, feeds(tree) if feeds else None, **master))
+
+    def grouped(feeds=None, nested=False, **master):
+        def make(tree):
+            outer = feeds(tree) if feeds else {}
+            inner = _master_group_tree(tuple(outer), **master)
+            if nested:
+                return _master_group_node(tree, 'Outer', _master_group_tree(tuple(outer), nested=inner), outer)
+            return _master_group_node(tree, 'Group', inner, outer)
+        return material(make)
+
+    def wired_by_hand():
+        """The rewrite, done by hand in the node editor: the height chain
+        into a real Bump node of the GROUP's tree (Strength 1, Distance 1),
+        that Bump into the master's Normal, the Bump Height left alone."""
+        def make(tree):
+            inner = _master_group_tree(linked=False)
+            inner.links.new(_bump_chain(inner).outputs['Normal'], inner.nodes.get('Halcyon').inputs['Normal'])
+            return _master_group_node(tree, 'Group', inner)
+        return material(make)
+
+    def twice(wired):
+        """ONE group tree instanced twice, at Scale 6.0 and at 2.0; the
+        Material Output takes the instance `wired`."""
+        def make(tree):
+            inner = _master_group_tree(('Scale',))
+            return {name: _master_group_node(tree, name, inner, fed(scale, tag=tag)(tree))
+                    for name, scale, tag in (('Group', 6.0, ''), ('Group.001', 2.0, '.001'))}[wired]
+        return material(make)
+
+    def both(wired):
+        """A master 'Halcyon' in the material's own tree (Scale 6.0) and a
+        group holding a master of the SAME name (Scale 2.0); the Material
+        Output takes `wired`."""
+        def make(tree):
+            return {'Halcyon': _bump_master(tree, fed(6.0)(tree)),
+                    'Group': _master_group_node(tree, 'Group', _master_group_tree(('Scale',)),
+                                                fed(2.0, tag='.001')(tree))}[wired]
+        return material(make)
+
+    def exported(mat):
+        return _code_exported(mat)[0]
+
+    last = {}
+
+    def frame(mat, size=big, glass=False, band=None, device='CPU'):
+        """(frame, printed) of the demo floor wearing `mat`'s export; the
+        scene and settings stay in `last`. `glass` flags the material
+        see-through, as the exporter flags a master whose Opacity is under
+        1: its fragments leave the opaque pass for the layered road."""
+        graph, programs, _warnings = _code_exported(mat)
+        sc, st = _code_floor(graph, programs, size)
+        sc.materials[0].has_alpha = glass
+        st.render_device = device
+        last['scene'], last['settings'] = sc, st
+        said = io.StringIO()
+        with redirect_stdout(said):
+            img = np.asarray(R.render(sc, st, band=band))
+        return img, said.getvalue()
+
+    def same(a, b):
+        return bool(np.array_equal(a, b))
+
+    def off(a, b):
+        """(max difference, the pixels holding one, the rows holding one)."""
+        d = np.abs(a.astype(np.float64) - b.astype(np.float64)).max(axis=-1)
+        return float(d.max()), int((d > 0).sum()), sorted(set(np.nonzero(d > 0)[0].tolist()))
+
+    def sock(node, name):
+        return next(s for s in node['inputs'] if s['name'] == name)
+
+    def bumps(graph):
+        """The id of every Bump node of the graph, tree by tree, each read
+        off the node AND the key it is filed under."""
+        out = []
+        for nid, node in graph['nodes'].items():
+            if node['bl_idname'] == 'ShaderNodeBump':
+                out.append(nid if node['id'] == nid else f'{nid} holds {node["id"]}')
+            if node.get('group'):
+                out += bumps(node['group'])
+        return sorted(out)
+
+    def whole(graph):
+        """Every tree hangs together: a node sits under its own id and every
+        link names a node of THAT tree."""
+        return all(nid == node['id'] and all(not s['link'] or s['link'][0] in graph['nodes'] for s in node['inputs'])
+                   and (not node.get('group') or whole(node['group'])) for nid, node in graph['nodes'].items())
+
+    def inner_of(graph, *path):
+        """The nodes of the tree behind the group nodes `path` names."""
+        nodes, nid = graph['nodes'], ''
+        for step in path:
+            nid = EX.node_id(step, nid + EX.ID_SEP if nid else '')
+            nodes = nodes[nid]['group']['nodes']
+        return nodes
+
+    # ---- the spies: every field the pre-pass builds, the layered road, what each shading batch can gather from
+    built, layered, gathered = [], [], []
+    real_fields, real_layers, real_chunked = R._bump_height_fields, R._shade_fragments_cpu, R._shade_chunked
+    state = {'own_tree_only': False}
+
+    def spy_fields(*args, **kw):
+        out = real_fields(*args, **kw)
+        if state['own_tree_only']:            # no field for a node below the material's tree
+            out = {key: field for key, field in out.items() if EX.ID_SEP not in key[1]}
+        built.append(out)
+        return out
+
+    def spy_layers(job, tri, *args, **kw):
+        layered.append(int(tri.size))
+        return real_layers(job, tri, *args, **kw)
+
+    def spy_chunked(job, *args, **kw):
+        gathered.append(sorted(key[1] for key in job.bump_fields))
+        return real_chunked(job, *args, **kw)
+
+    def keys():
+        """The node ids of each pre-pass run since the last reset."""
+        return [sorted(key[1] for key in out) for out in built]
+
+    def reset():
+        for log in (built, layered, gathered):
+            del log[:]
+
+    def shot(mat, **kw):
+        """frame()'s picture, with the spies' logs of that frame alone."""
+        reset()
+        return frame(mat, **kw)[0]
+
+    R._bump_height_fields, R._shade_fragments_cpu, R._shade_chunked = spy_fields, spy_layers, spy_chunked
+    keep_chunks = R.MIN_CHUNK, R.MAX_CHUNK
+    try:
+        # ---- the reported pair at 128x96: no pre-pass at that size, the height is simply read or not
+        flat_top, small_top = shot(top(linked=False), size=small), shot(top(), size=small)
+        seen, pixels, _rows = off(small_top, flat_top)
+        check('the master in the material\'s own tree at 128x96: its linked Bump Height bends the floor -- more than '
+              '0.5 off the unlinked frame over thousands of pixels, with no pre-pass at that size (the reference)',
+              seen > 0.5 and pixels > 3000 and keys() == [], f'{seen} {pixels} {keys()}')
+        flat_grp, small_grp = shot(grouped(linked=False), size=small), shot(grouped(), size=small)
+        graph = last['scene'].materials[0].graph
+        check('the same master inside a group: the frame is the top-level frame, bit for bit (0.89 off over 4435 '
+              'pixels: the height was read by nothing)', same(small_grp, small_top), str(off(small_grp, small_top)[:2]))
+        check('...so linked and unlinked are two pictures inside the group as well (they were ONE, bit for bit), and '
+              'the unlinked pair still agrees', off(small_grp, flat_grp)[0] > 0.5 and same(flat_grp, flat_top),
+              f'{off(small_grp, flat_grp)[:2]} {off(flat_grp, flat_top)[:2]}')
+        nodes = inner_of(graph, 'Group')
+        bump, hal = nodes.get(synth, {'inputs': []}), nodes['Group/Halcyon']
+        links = {name: next((s['link'] for s in bump['inputs'] if s['name'] == name), 'no socket')
+                 for name in ('Strength', 'Height', 'Normal')}
+        check('the rewrite, read off the graph that frame was shaded from: ONE Bump node, in the GROUP\'s tree under '
+              'that tree\'s path (Group/__bump_Halcyon) and nothing new in the material\'s own; its Height is the '
+              'chain\'s Math node, the master\'s Normal reads it and the Bump Height link is consumed',
+              bumps(graph) == [synth] and sorted(graph['nodes']) == ['Group', 'Material Output'] and whole(graph)
+              and links == {'Strength': None, 'Height': ['Group/Math', 0], 'Normal': None}
+              and sock(hal, 'Normal')['link'] == [synth, 0] and sock(hal, 'Bump Height')['link'] is None,
+              f'{bumps(graph)} {sorted(graph["nodes"])} {links}')
+        check('...and a master with nothing linked grows no Bump node, in either tree',
+              bumps(NE.desugar_master_bump(exported(grouped(linked=False)))) == []
+              and bumps(NE.desugar_master_bump(exported(top(linked=False)))) == []
+              and bumps(NE.desugar_master_bump(exported(top()))) == ['__bump_Halcyon'],
+              str(bumps(NE.desugar_master_bump(exported(grouped(linked=False))))))
+
+        # ---- a frame whose pre-pass runs: the synthesized Bump gathers from a whole-material field
+        frame_top = shot(top())
+        check('the master in the material\'s own tree at 320x240: the pre-pass runs and builds the field of its '
+              'synthesized Bump (the reference)', keys() == [['__bump_Halcyon']], str(keys()))
+        frame_grp = shot(grouped())
+        check('the master inside a group at 320x240: the pre-pass runs for ITS synthesized Bump, the field filed '
+              'under the node\'s path id', keys() == [[synth]], str(keys()))
+        check('...and the frame is the top-level frame, bit for bit', same(frame_grp, frame_top),
+              str(off(frame_grp, frame_top)))
+        R.MIN_CHUNK = R.MAX_CHUNK = 1 << 30
+        whole_grp = shot(grouped())
+        whole_keys = keys()
+        R.MIN_CHUNK, R.MAX_CHUNK = keep_chunks
+        check('both are the frame of the group material shaded in ONE batch -- no pre-pass at all, the synthesized '
+              'Bump differencing the whole floor itself', whole_keys == [] and same(whole_grp, frame_grp),
+              f'{whole_keys} {off(whole_grp, frame_grp)}')
+        state['own_tree_only'] = True
+        cut = shot(grouped())
+        state['own_tree_only'] = False
+        seen, _pixels, rows = off(cut, frame_top)
+        check('these frames can tell: with the group\'s field withheld the synthesized Bump differences its own '
+              'batch and the frame is cut along the batch boundary -- a row or two, more than 0.1 off',
+              keys() == [[]] and seen > 0.1 and 1 <= len(rows) <= 4, f'{keys()} {seen} {rows}')
+        large_top, large_grp = shot(top(), size=(640, 480)), shot(grouped(), size=(640, 480))
+        check('at 640x480 (the floor in several batches): the field again, and bit for bit',
+              keys() == [[synth]] and same(large_grp, large_top), f'{keys()} {off(large_grp, large_top)}')
+        by_hand = shot(wired_by_hand())
+        check('the socket is sugar for exactly this: the height wired BY HAND into a real Bump node of the group\'s '
+              'tree, and that into the master\'s Normal, is the same frame bit for bit (its field under Group/Bump)',
+              keys() == [['Group/Bump']] and same(by_hand, frame_grp), f'{keys()} {off(by_hand, frame_grp)}')
+
+        # ---- each input of the synthesized node, one at a time (128x96) and together (320x240)
+        alone = {'the height\'s Scale': dict(scale=3.5), 'the master\'s Bump Strength': dict(strength=0.4),
+                 'the master\'s own Normal chain': dict(normal=True)}
+        told = {}
+        for what, kw in alone.items():
+            in_top, in_grp = shot(top(fed(**kw)), size=small), shot(grouped(fed(**kw)), size=small)
+            told[what] = (same(in_grp, in_top), off(in_top, small_top)[0])
+        check('a group that takes ONE thing through its interface -- the Scale of the height, the Bump Strength, the '
+              'Normal the bump bends -- draws the frame of the master fed the same at the top level, bit for bit, '
+              'and each is another picture than the plain pair\'s (the synthesized node reads that input)',
+              all(ok and seen > 0.02 for ok, seen in told.values()), str(told))
+        handed = shot(grouped(fed(height=True)), size=small)
+        check('the HEIGHT itself handed in through the interface (the chain outside, the master\'s Bump Height on '
+              'the Group Input): the plain pair\'s frame, bit for bit', same(handed, small_top),
+              str(off(handed, small_top)[:2]))
+        dialled = shot(grouped(strength=0.4), size=small)
+        check('an unlinked Bump Strength of 0.4 on the group\'s master is the synthesized node\'s Strength: the frame '
+              'of the same master at the top level, and of the Strength linked to a Value at 0.4',
+              same(dialled, shot(top(strength=0.4), size=small))
+              and same(dialled, shot(top(fed(strength=0.4)), size=small)), str(off(dialled, small_top)[:2]))
+        every = dict(scale=3.5, strength=0.6, normal=True)
+        fed_top = shot(top(fed(**every)))
+        top_keys = keys()
+        fed_grp = shot(grouped(fed(**every)))
+        check('all three at once on a frame that pre-passes: the field of the synthesized Bump is evaluated with the '
+              'group\'s inputs bound, beside the field of the real Bump under it -- the top-level frame, bit for bit',
+              top_keys == [['Bump.001', '__bump_Halcyon']] and keys() == [['Bump.001', synth]]
+              and same(fed_grp, fed_top) and off(fed_top, frame_top)[0] > 0.05,
+              f'{top_keys} {keys()} {off(fed_grp, fed_top)} {off(fed_top, frame_top)[0]}')
+
+        # ---- an id per tree and per instance
+        at_6, at_2 = shot(top(fed(6.0))), shot(top(fed(2.0)))
+        check('the 6.0 and the 2.0 height are two pictures at the top level (the references of the next three)',
+              off(at_6, at_2)[0] > 0.05 and same(at_6, frame_top), str(off(at_6, at_2)[0]))
+        first, second = shot(twice('Group')), shot(twice('Group.001'))
+        fields = built[-1] if built else {}
+        gx_a, gx_b = (fields.get((0, nid), (np.zeros(1),))[0] for nid in (synth, 'Group.001/__bump_Halcyon'))
+        check('ONE group instanced twice at two Scales: two synthesized Bumps and two fields, each under its own '
+              'instance\'s path, one three times the other',
+              keys() == [['Group.001/__bump_Halcyon', synth]] and gx_a.shape == gx_b.shape and bool(gx_b.any())
+              and float(np.abs(gx_a - 3.0 * gx_b).max()) < 1e-5 and float(np.abs(gx_a - gx_b).max()) > 1e-3,
+              f'{keys()} {float(np.abs(gx_a).max())} {float(np.abs(gx_b).max())}')
+        check('...and each instance wired to the output draws ITS height: the top-level frames at 6.0 and at 2.0, '
+              'bit for bit', same(first, at_6) and same(second, at_2), f'{off(first, at_6)} {off(second, at_2)}')
+        own, held = shot(both('Halcyon')), shot(both('Group'))
+        check('a master named Halcyon in the material\'s tree AND one inside a group, both bumped: two Bumps, two '
+              'fields (__bump_Halcyon and Group/__bump_Halcyon), and each wired to the output draws its own height',
+              keys() == [[synth, '__bump_Halcyon']] and same(own, at_6) and same(held, at_2),
+              f'{keys()} {off(own, at_6)} {off(held, at_2)}')
+        nested = shot(grouped(fed(**every), nested=True))
+        check('a group in a group, the three inputs handed down two levels: the Bump is synthesized in the INNER '
+              'tree under the whole path, and the frame is the top-level frame, bit for bit',
+              keys() == [['Bump.001', 'Outer/Inner/__bump_Halcyon']] and same(nested, fed_top)
+              and bumps(last['scene'].materials[0].graph) == ['Bump.001', 'Outer/Inner/__bump_Halcyon']
+              and whole(last['scene'].materials[0].graph), f'{keys()} {off(nested, fed_top)}')
+
+        # ---- the rewrite runs at the top of every render: idempotent
+        graph = NE.desugar_master_bump(exported(grouped(fed(**every), nested=True)))
+        once = copy.deepcopy(graph)
+        for _again in range(3):
+            NE.desugar_master_bump(graph)
+        check('the rewrite is idempotent in a group\'s tree as in the material\'s: three more passes leave the graph '
+              'exactly as the first left it', repr(graph) == repr(once) and whole(graph)
+              and bumps(graph) == ['Bump.001', 'Outer/Inner/__bump_Halcyon'], str(bumps(graph)))
+        reset()
+        fresh = frame(grouped())[0]
+        sc, st = last['scene'], last['settings']
+        with redirect_stdout(io.StringIO()):
+            again = np.asarray(R.render(sc, st))
+            third = np.asarray(R.render(sc, st))
+        check('...and so is the picture: the SAME scene rendered a second and a third time (its graph already '
+              'rewritten) builds the one field each time and draws the first frame, bit for bit',
+              keys() == [[synth]] * 3 and same(fresh, frame_grp) and same(again, fresh) and same(third, fresh)
+              and bumps(sc.materials[0].graph) == [synth], f'{keys()} {bumps(sc.materials[0].graph)}')
+
+        # ---- the layered road: the same floor, see-through
+        glass_top = shot(top(opacity=0.6), glass=True)
+        check('the floor flagged see-through leaves the opaque pass for the layered road, whose per-rank fields the '
+              'top-level master\'s Bump gathers from (the reference)',
+              len(layered) == 1 and keys() == [] and ['__bump_Halcyon'] in gathered
+              and off(glass_top, frame_top)[0] > 0.1, f'{layered} {keys()} {gathered}')
+        glass_grp = shot(grouped(opacity=0.6), glass=True)
+        check('the group master\'s Bump on the layered road: a field per rank under its path id, and the top-level '
+              'frame bit for bit', len(layered) == 1 and [synth] in gathered and same(glass_grp, glass_top),
+              f'{layered} {gathered} {off(glass_grp, glass_top)}')
+
+        # ---- bands: the fields come from the G-buffer's full coverage (job.bump_field_source)
+        reset()
+        height = big[1]
+        bands = [(0, height // 3), (height // 3, height // 2 + 7), (height // 2 + 7, height)]
+        joined = np.concatenate([frame(grouped(), band=band)[0] for band in bands], axis=0)
+        check('three bands of the group frame, joined: each band builds the synthesized Bump\'s whole-frame field, '
+              'and the rows are the whole frame\'s, bit for bit',
+              keys() == [[synth]] * 3 and same(joined, frame_grp), f'{keys()} {off(joined, frame_grp)}')
+
+        # ---- the GPU device: nothing emits a group's tree, so the CPU shades the frame -- bumped and pre-passed
+        def refusal(mat):
+            """(frame, the plan's refusal lines) on the GPU device, over the
+            stand-in driver, from empty caches."""
+            R._GBUF_CACHE.clear()
+            GSH._PLAN_CACHE.clear()
+            with fakedevice.installed():
+                img, said = frame(mat, device='GPU')
+            R._GBUF_CACHE.clear()
+            GSH._PLAN_CACHE.clear()
+            return img, [line for line in said.splitlines() if 'shading on the CPU' in line]
+
+        reset()
+        on_gpu, said = refusal(grouped())
+        gpu_keys = keys()
+        said_hand, said_flat = refusal(wired_by_hand())[1], refusal(grouped(linked=False))[1]
+        check('on the GPU device the material is refused by name and the CPU shades the frame: the same bumped, '
+              'pre-passed frame, bit for bit', len(said) == 1 and gpu_keys == [[synth]] and same(on_gpu, frame_grp),
+              f'{gpu_keys} {off(on_gpu, frame_grp)} {said}')
+        check('...the name being the one the Bump wired by hand always got (a normal bent below the material\'s own '
+              'tree); the master with nothing linked keeps the group\'s own refusal',
+              said == said_hand and 'bends the shading normal outside' in ''.join(said)
+              and len(said_flat) == 1 and 'no GLSL emitter for ShaderNodeGroup' in said_flat[0],
+              f'{said} {said_hand} {said_flat}')
+    finally:
+        R._bump_height_fields, R._shade_fragments_cpu, R._shade_chunked = real_fields, real_layers, real_chunked
+        R.MIN_CHUNK, R.MAX_CHUNK = keep_chunks
+
+    # ---- every master the sugar is drawn on, and the id, read from the graph alone
+    masters = ('HALCYON_ShaderNode', 'HALCYON_BIMaterialNode', 'HALCYON_MaxStandardNode', 'HALCYON_MaxRaytraceNode',
+               'HALCYON_ConsoleShaderNode')
+    strengths = {}
+    for kind in masters + ('ShaderNodeBsdfPrincipled',):
+        graph = exported(grouped(strength=0.4))
+        node = inner_of(graph, 'Group')['Group/Halcyon']
+        node['bl_idname'], node['props'] = kind, dict(node['props'], bump_amount=60)
+        made = inner_of(NE.desugar_master_bump(graph), 'Group').get(synth)
+        strengths[kind] = made and sock(made, 'Strength')['default']
+    check('each of the five masters that draw the socket is rewritten inside a group (the two 3ds Max nodes with '
+          'their Bump Amount spinner for a strength: 60 of 30 is 2.0), and a node of any other type is left alone',
+          strengths == {**dict.fromkeys(masters, 0.4), 'HALCYON_MaxStandardNode': 2.0,
+                        'HALCYON_MaxRaytraceNode': 2.0, 'ShaderNodeBsdfPrincipled': None}, str(strengths))
+    names = ('Halcyon', 'Halcyon.001', 'a/b', '/', 'a\\', '\\/b', 'Group/Halcyon', '__bump_Halcyon')
+    paths = [''] + [EX.node_id(inner, EX.node_id(outer) + EX.ID_SEP if outer else '') + EX.ID_SEP
+                    for outer, inner in (('', 'Group'), ('', 'a/b'), ('Outer', 'Inner'), ('a\\', '/'))]
+    spelt = {(path, name): NE.synth_bump_id(EX.node_id(name, path), path) for path in paths for name in names}
+    check(f'the synthesized id is the id the exporter gives a node named __bump_<master> of that same tree, for '
+          f'{len(spelt)} masters whose names and paths hold the separator and the escape -- so it can only meet a '
+          'node of its own tree', all(nid == EX.node_id('__bump_' + name, path) for (path, name), nid in spelt.items())
+          and len(set(spelt.values())) == len(spelt) and NE.synth_bump_id('hal') == '__bump_hal'
+          and NE.synth_bump_id('Group/Halcyon', 'Group/') == synth,
+          str([k for k, nid in spelt.items() if nid != EX.node_id('__bump_' + k[1], k[0])]))
+
+    graph = exported(grouped())
+    nodes = inner_of(graph, 'Group')
+    nodes[synth] = dict(nodes['Group/Math'], id=synth)
+    before = repr(graph)
+    NE.desugar_master_bump(graph)
+    check('the one clash the id can have, a node of the SAME tree that already carries that very name: the rewrite '
+          'looks before it writes, the node is not written over and the graph is left as it was (as in the '
+          'material\'s own tree)', repr(graph) == before and nodes[synth]['bl_idname'] == 'ShaderNodeMath',
+          str(nodes[synth]['bl_idname']))
+
+    def bare(g, path=''):
+        """The same export with every id cut back to the node's bare name,
+        as a graph built by hand (and the 1.92.0 exporter) spells it."""
+        nodes = {}
+        for nid, node in g['nodes'].items():
+            node = dict(node, id=nid[len(path):])
+            node['inputs'] = [dict(sk, link=[sk['link'][0][len(path):], sk['link'][1]] if sk['link'] else None)
+                              for sk in node['inputs']]
+            if node.get('group'):
+                node['group'] = bare(node['group'], nid + EX.ID_SEP)
+            nodes[node['id']] = node
+        return {'nodes': nodes, 'output': g['output'] and g['output'][len(path):],
+                'group_output': g['group_output'] and g['group_output'][len(path):]}
+
+    spelt_bare = bare(exported(both('Group')))
+    hand = _code_cpu(spelt_bare, {}, big)
+    check('a graph spelt by hand, the like-named masters of two trees both under the bare id Halcyon: the group\'s '
+          'Bump still takes its tree\'s path, so it cannot gather from the field of the material\'s own -- the '
+          'frame of the 2.0 height, bit for bit', bumps(spelt_bare) == [synth, '__bump_Halcyon'] and same(hand, at_2),
+          f'{bumps(spelt_bare)} {off(hand, at_2)}')
+
+    # ---- the rule, read from the code itself
+    def calls(f):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(f)))
+        return {ast.unparse(c.func) for c in ast.walk(tree) if isinstance(c, ast.Call)}
+
+    check('both render entries rewrite every material before anything reads a graph (render and bake_lightmap), '
+          'the rewrite enters a group by calling itself, and the id of what it makes is written in one place',
+          'desugar_master_bump' in calls(R.render) and 'desugar_master_bump' in calls(R.bake_lightmap)
+          and {'desugar_master_bump', 'synth_bump_id'} <= calls(NE.desugar_master_bump)
+          and inspect.getsource(NE).count('__bump_{') == 1 and '__bump_{' in inspect.getsource(NE.synth_bump_id),
+          str(sorted(calls(NE.desugar_master_bump))))
+    check('the exporter and the core join a path with ONE separator (the exporter imports nodeeval.ID_SEP and '
+          'defines none), which serialize_tree and the rewrite both put behind a group node\'s id',
+          EX.ID_SEP is NE.ID_SEP and 'from .core.nodeeval import ID_SEP\n' in inspect.getsource(EX)
+          and 'ID_SEP =' not in inspect.getsource(EX) and inspect.getsource(NE).count('ID_SEP =') == 1
+          and 'nid + ID_SEP' in inspect.getsource(EX.serialize_tree)
+          and "f'{nid}{ID_SEP}'" in inspect.getsource(NE.desugar_master_bump))
 
 
 def test_code_node_rebuild_survives_undo_redo_and_load():
