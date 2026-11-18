@@ -359,17 +359,31 @@ def test_a_a_scene_without_the_features_reads_what_it_read():
         srcs = [s for _m, _n, s, _b in passes]
         lit = 'vec3 total = s.diffuse * (vec3(0.200000003, 0.100000001, ' \
               '0.0500000007)'
-        tail = f'hal_ltex({2 * GM.LIGHT_TEXEL_STRIDE})'
+        # (the row has a second tail since the map-gpu package: the
+        # lamps' shadow values, which start at n * STRIDE when there is
+        # no ambient tail -- so the ambient EXPRESSION is what must not
+        # read a texel, and the row is as wide as the shadow layout
+        # alone says)
+        amb_lines = [ln for s in srcs for ln in s.splitlines()
+                     if 'vec3 total = s.diffuse' in ln]
         check('its passes bake the ambient literal they always did and '
-              'read no tail texel',
-              all(lit in s for s in srcs)
-              and not any(tail in s for s in srcs),
-              next((ln.strip() for s in srcs for ln in s.splitlines()
-                    if 'vec3 total = s.diffuse' in ln), '')[:90])
+              'the ambient reads no tail texel',
+              all(lit in s for s in srcs) and bool(amb_lines)
+              and not any('hal_ltex(' in ln for ln in amb_lines),
+              amb_lines[0].strip()[:90] if amb_lines else '')
         lt = atl.get('hal_lights')
-        check('and the uploaded row is 2 x STRIDE texels', lt is not None
-              and np.asarray(lt[1]()).shape
-              == (1, 2 * GM.LIGHT_TEXEL_STRIDE, 4))
+        fl2 = LI.frame_lights(sc2, st2)
+        metas2 = [GSH._shadow_meta(l, st2, None, want_atlas=False)[0]
+                  for l in fl2]
+        want_w = GM.light_tail_layout(fl2, metas2)['width'] \
+            if hasattr(GM, 'light_tail_layout') \
+            else len(fl2) * GM.LIGHT_TEXEL_STRIDE
+        check('and the uploaded row carries no ambient tail: 2 x STRIDE '
+              'lamp texels plus only the lamps\' own shadow blocks',
+              lt is not None and len(fl2) == 2
+              and np.asarray(lt[1]()).shape == (1, want_w, 4),
+              f'{None if lt is None else np.asarray(lt[1]()).shape} '
+              f'against width {want_w}')
     if hasattr(GM, 'link_ladder'):
         check('a link to scattered objects emits the comparisons it always '
               'did', GM.link_ladder((1, 4)) ==

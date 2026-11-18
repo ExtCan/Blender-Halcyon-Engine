@@ -21,7 +21,8 @@ reproduces the scroll bitwise; the GPU twins the CPU on moved objects
 line itself bitwise at the function level); a moved object misses every
 frame cache under a still camera (the G-buffer, the shadow maps, the
 BVH: the frame after the move is bitwise a fresh render, whichever way
-it moved); the manual texture space is
+it moved), and an edit that moves no vertex -- UVs, normals, the index
+arrays -- moves the mesh key too; the manual texture space is
 honoured; the cartoon centre still measures world space; the export
 road carries the box; the setting's surface (tooltip, enum items, the
 plan signature) and the refusal by name.
@@ -745,6 +746,124 @@ def test_d_moved_objects_miss_the_frame_caches():
         check(f'{label}: the frame after the Box moves is BITWISE a fresh '
               'render', last == 'MISS(mesh)' and bits_equal(a, b),
               f'{last}, {float(np.abs(a - b).max()):.2e}')
+    _clear_frame_caches()
+
+
+def test_d_unmoved_edits_move_the_mesh_key():
+    """What the position digest did not cover. The mesh key's normal,
+    UV, material-index and triangle-index terms were sums over about
+    512 samples: blind to an edit that cancels in the sum (every UV
+    shifted by (0.1, -0.1); two rows exchanged) and to one between the
+    samples. gpu/shade._attr_digests (the R254 viewport round) digests
+    those arrays whole, in one tuple at the END of the key, so each
+    case here reads the same way: every earlier term of the key holds
+    (the sums could not see the edit) and the last one moves. The
+    arrays are fresh, as an export hands them. The index case is also
+    driven on the CPU road: the G-buffer cache keys on this function,
+    and a stale raster's triangle ids would index the edited table."""
+    st = _settings()
+
+    def ident():
+        return _scene(st, marble_graph())
+
+    def sums_held_digests_moved(k, k0):
+        return k[:-1] == k0[:-1] and k[-1] != k0[-1]
+
+    base = ident().mesh
+    k0 = GSH._mesh_key(base)
+    check('the key ends in the tuple of whole-array digests, and a re-export '
+          '(fresh arrays, the same bytes) keeps all of it',
+          isinstance(k0[-1], tuple) and len(k0[-1]) > 0
+          and not any(isinstance(x, tuple) for x in k0[:-1])
+          and GSH._mesh_key(ident().mesh) == k0)
+
+    # ---- edits that CANCEL in a sum. The demo scene's stride is 1 --
+    # every row is read -- and the sums still cannot see these
+    ta = int(np.nonzero(base.obj_index == 1)[0][0])      # a Ball triangle
+    tb = int(np.nonzero(base.obj_index == 2)[0][0])      # a Box triangle
+    # two vertex rows whose normals point opposite ways along x
+    va, vb = int(np.argmax(base.normals[:, 0])), int(np.argmin(base.normals[:, 0]))
+
+    def edited(attr, fn):
+        sc = ident()
+        a = getattr(sc.mesh, attr).copy()
+        fn(a)
+        setattr(sc.mesh, attr, a)
+        return sc
+
+    def exchange(i, j):
+        def fn(a):
+            a[[i, j]] = a[[j, i]]
+        return fn
+
+    def shift_uv(a):
+        a += np.array([0.1, -0.1], f32)
+
+    cancelling = (
+        ('every UV shifted by (0.1, -0.1)', 'uvs', shift_uv),
+        ('two vertices\' normals exchanged', 'normals', exchange(va, vb)),
+        ('two triangles\' rows exchanged', 'tris', exchange(ta, tb)),
+        ('two triangles\' materials exchanged', 'mat_index', exchange(ta, tb)))
+    for what, attr, fn in cancelling:
+        sc = edited(attr, fn)
+        check(f'{what}: the array changed, every sum in the key held, the '
+              'digests moved',
+              not np.array_equal(getattr(sc.mesh, attr), getattr(base, attr))
+              and sums_held_digests_moved(GSH._mesh_key(sc.mesh), k0))
+
+    # ---- edits BETWEEN the samples: the Box in the crowd (stride 79)
+    sc0, box = _crowded_scene(st)
+    kc = GSH._mesh_key(sc0.mesh)
+    stride = max(1, sc0.mesh.verts.shape[0] // 512)
+    box_t = np.nonzero(sc0.mesh.obj_index == 2)[0]
+    check('the rig: no vertex row of the Box, and no row of its material '
+          'indices, is among the samples',
+          not np.any(box % stride == 0) and not np.any(box_t % stride == 0),
+          f'stride {stride}')
+
+    def crowd_edited(attr, rows, fn):
+        sc, _b = _crowded_scene(st)
+        a = getattr(sc.mesh, attr).copy()
+        a[rows] = fn(a[rows])
+        setattr(sc.mesh, attr, a)
+        return sc
+
+    between = (
+        ('the Box\'s UVs rescaled', 'uvs', box, lambda a: a * 0.5 + 0.25),
+        ('the Box\'s normals flipped', 'normals', box, lambda a: -a),
+        ('the Box given another material', 'mat_index', box_t, lambda a: a * 0))
+    for what, attr, rows, fn in between:
+        sc = crowd_edited(attr, rows, fn)
+        check(f'{what}: every sum in the key held, the digests moved',
+              sums_held_digests_moved(GSH._mesh_key(sc.mesh), kc))
+    check('...and a re-export of the unedited crowd keeps the whole key',
+          GSH._mesh_key(_crowded_scene(st)[0].mesh) == kc)
+
+    # ---- the index part on the CPU road: two VISIBLE triangles' rows
+    # exchanged under a still camera, no cache cleared
+    _view, _p, vp, _eye = R.camera_matrices(ident().camera, W, H)
+    gb = CR.GBuffer(W, H)
+    CR.rasterize(base.verts, base.tris, vp, W, H, gbuf=gb)
+    seen = np.bincount(gb.tri[gb.tri >= 0], minlength=base.tris.shape[0])
+    ball_t = int(np.argmax(np.where(base.obj_index == 1, seen, 0)))
+    box_t1 = int(np.argmax(np.where(base.obj_index == 2, seen, 0)))
+    check('the rig: a Ball triangle and a Box triangle that both cover pixels',
+          seen[ball_t] > 0 and seen[box_t1] > 0, f'{seen[ball_t]}, {seen[box_t1]} px')
+
+    def swapped():
+        return edited('tris', exchange(ball_t, box_t1))
+
+    _clear_frame_caches()
+    f0 = np.asarray(R.render(ident(), st))
+    f1 = np.asarray(R.render(swapped(), st))
+    last = str(R._GBUF_STATS.get('last'))
+    _clear_frame_caches()
+    f2 = np.asarray(R.render(swapped(), st))
+    check('the G-buffer cache MISSES on the exchanged rows and blames the mesh',
+          last == 'MISS(mesh)', last)
+    check('the frame after the exchange is BITWISE a fresh render (and not '
+          'the frame before it)', bits_equal(f1, f2) and not bits_equal(f1, f0),
+          f'{float(np.abs(f1 - f2).max()):.2e}')
     _clear_frame_caches()
 
 
