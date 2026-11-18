@@ -4,7 +4,9 @@ The round's review (three lenses per feature, three refuters per finding)
 and the console-shader deep re-read the field log asked for. Each item
 below was reproduced headless before it was fixed and is pinned in
 `tests/test_r253_review.py` (registered in `run_all`); the Coded
-Shader's name resolution is pinned in `tests/test_shaders.py` as well.
+Shader's name resolution is pinned in `tests/test_shaders.py` as well,
+and its matrices, indexed writes, array fields and integer division
+there alone.
 
 ## CHANGELOG
 
