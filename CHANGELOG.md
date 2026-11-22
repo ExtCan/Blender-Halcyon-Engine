@@ -4125,12 +4125,12 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   taken in float64 and rounded once, where the value was stored -- where
   two float32 products answer 0.21000001. The entry above lists it under
   *Seen and left*; reproduced headless (`try_compile(src)`, then
-  `prog.run({}, {}, 4)`) on `claude-cloud` at `31aa3f1` with that
-  entry's branch merged in (`2dcc4aa`: `claude-cloud` did not hold it
-  yet, and this stands on its integer division and its pin). It is the
-  drift R243 removed for `float(u)` and for a vector with a Python
-  literal in it (`Interpreter.constructor`, `builtins._f32_only`), left
-  standing for the vector that has no float part at all. *The root.*
+  `prog.run({}, {}, 4)`) on `claude-cloud` at `f959f6d`, the merge of
+  that entry's branch (measured on the same tree before `claude-cloud`
+  held it: `31aa3f1` with `2dcc4aa` merged in). It is the drift R243
+  removed for `float(u)` and for a vector with a Python literal in it
+  (`Interpreter.constructor`, `builtins._f32_only`), left standing for
+  the vector that has no float part at all. *The root.*
   `Interpreter.constructor` builds a vector with `rt.vec(t.n, *parts)`
   and converted the int, uint and bool vectors alone. `rt.vec` joins the
   parts and `_f32_only` converts a FLOAT join: ints alone stayed the
