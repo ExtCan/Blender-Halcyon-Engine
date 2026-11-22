@@ -4564,6 +4564,11 @@ def _build_shadows(scene, st, mesh, traced=None, device=False):
         if baker is not None:
             # every face the device did not bake, by name
             baker.report()
+    # what the mapped lookups read beside the depth: the radius of the
+    # scene the maps were framed by (it bounds the Bias in a scene
+    # smaller than a unit)
+    from . import softmap as _softmap
+    _softmap.stamp_scene(scene)
 
 
 def prebake_shadows(scene, st, limit=None):
@@ -4657,6 +4662,11 @@ def shaft_sources(scene, settings, vp):
     """
     out = []
     beams = bool(getattr(settings, 'spot_cones', False))
+    # the lamps that light a medium this frame, selected at most ONCE a
+    # call and only when a candidate reaches the test below: under a
+    # binding Light Limit each selection measures the scene, and asking
+    # per lamp made this loop quadratic in the lamp count
+    medium = None
     for light in scene.lights:
         vol = float(getattr(light, 'volumetric', 0.0))
         if vol <= 0.0:
@@ -4680,7 +4690,9 @@ def shaft_sources(scene, settings, vp):
         # is generous; only rule out lights nowhere near the view
         if abs(ndc[0]) > 6.0 or abs(ndc[1]) > 6.0:
             continue
-        if not any(light is l for l in _medium_lamps(scene, settings)):
+        if medium is None:
+            medium = {id(l) for l in _medium_lamps(scene, settings)}
+        if id(light) not in medium:
             # R254: only a lamp that lights a medium this frame throws
             # shafts (_medium_lamps): a lamp that is only ambient has
             # no position to throw one from, an Only Shadow lamp or one
@@ -4882,6 +4894,40 @@ def _flare_sources(scene, st, gbuf, vp):
                     'rings': int(getattr(light, 'flare_rings', 1)),
                     'ghosts': int(getattr(light, 'flare_ghosts', 6))})
     return out
+
+
+def _shadow_bias_note(scene, st):
+    """One line when the mapped shadows' Bias was scaled to a small
+    scene. The Bias is a world length (0.02 by default); a scene
+    modelled at centimetre size used to lose every mapped shadow to it,
+    and the tooltip's 'World-space offset' was the only hint why."""
+    try:
+        from . import softmap as _softmap
+        if not (st.shadows and st.shadow_default in ('MAP', 'PER_LIGHT')):
+            return
+        named = []
+        for light in (scene.lights or ()):
+            sm = getattr(light, 'shadow_map', None)
+            if sm is None or LI.midpoint_map(light, st):
+                continue
+            bias = float(getattr(light, 'shadow_bias', 0.0)
+                         or st.shadow_bias)
+            used = float(_softmap.scene_bias(sm, bias))
+            if bias > 0.0 and used != bias:
+                named.append((getattr(light, 'name', '?') or '?', bias,
+                              used, float(sm.scene_radius)))
+        if not named:
+            return
+        radius = named[0][3]
+        print(f'[Halcyon] shadows: the scene is {2.0 * radius:.3g} units '
+              f'across, smaller than the shadow Bias is made for (a world '
+              f'length); it is scaled to the scene: '
+              + ', '.join(f"'{n}' Bias {b:g} -> {u:.3g}"
+                          for n, b, u, _r in named[:4])
+              + '. Model at a larger scale, or lower Bias, to set it '
+                'yourself')
+    except Exception:                                           # noqa: BLE001
+        pass
 
 
 def _shadow_coarseness_note(scene, gbuf, proj, rh):
@@ -5878,6 +5924,7 @@ def render(scene, settings=None, progress=None, band=None):
                                   f'{v:.1f} ms'
                                   for k, v in _LR.items()))
         _shadow_coarseness_note(scene, gbuf, proj, rh)
+        _shadow_bias_note(scene, st)
         _sp = LAST_SPLIT
         if _sp.get('see_through'):
             named = '; '.join(f'{n}: {w}' for n, w

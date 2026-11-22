@@ -75,6 +75,8 @@ def run_tests():
     from . import test_r254_integration
     # R254: the shadow-map bake (which maps, when, how fast, on the device)
     from . import test_r254_bake_speed
+    # R254: the mapped soft shadow's blocker search on large and small scenes
+    from . import test_r254_soft_search
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -294,6 +296,11 @@ def run_tests():
     print('R254 BAKE SPEED (WHICH SHADOW MAPS ARE BAKED, WHEN, AND HOW FAST)')
     print('=' * 66)
     rc |= test_r254_bake_speed.main()
+    print()
+    print('=' * 66)
+    print("R254 SOFT SEARCH (THE MAPPED PENUMBRA ON LARGE GROUNDS, STRIPS, SMALL SCENES)")
+    print('=' * 66)
+    rc |= test_r254_soft_search.main()
     return rc
 
 

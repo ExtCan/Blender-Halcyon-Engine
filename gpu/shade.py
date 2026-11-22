@@ -838,16 +838,38 @@ def _shadow_meta(light, st, bvh=None, want_atlas=True):
     shape = _softmap.lookup_shape(light, _shadow_sample_count(light, st),
                                   soft)
 
-    def build(_faces=faces_sm, _size=size, _grid=grid):
-        atlas = np.zeros((_size * _grid[1], _size * _grid[0]), np.float32)
+    # a lamp on the per-receiver lookup carries its map's REACH PYRAMID
+    # under its depth cells: one block per face, on the faces' own grid
+    # (`softmap.map_pyramid`, laid out by `softmap.pyr_layout`). The
+    # rows are derived from the depth texels alone, so the digests above
+    # still identify every texel of the band; that the rows EXIST is
+    # layout, and the key says so
+    pyr_rows = 0
+    if shape is not None:
+        key = key + ('PYR',)
+        pyr_rows = int(_softmap.pyr_layout(size)['h']) * grid[1]
+
+    def build(_faces=faces_sm, _size=size, _grid=grid,
+              _pyr=sm if shape is not None else None):
+        rows = _size * _grid[1]
+        lay = _softmap.pyr_layout(_size) if _pyr is not None else None
+        atlas = np.zeros((rows + (lay['h'] * _grid[1] if lay else 0),
+                          _size * _grid[0]), np.float32)
         for fi, f in enumerate(_faces):
             cy, cx = (fi // _grid[0]) * _size, (fi % _grid[0]) * _size
             atlas[cy:cy + _size, cx:cx + _size] = f.depth
+        if lay is not None:
+            for fi, blk in enumerate(_softmap.map_pyramid(_pyr)):
+                py = rows + (fi // _grid[0]) * lay['h']
+                px = (fi % _grid[0]) * lay['w']
+                atlas[py:py + lay['h'], px:px + lay['w']] = blk
         return atlas
 
     bias = float(getattr(light, 'shadow_bias', 0.0) or st.shadow_bias)
     if mid:
         bias = 0.0
+    # the CPU's own rule for a scene smaller than a unit
+    bias = _softmap.scene_bias(sm, bias)
     meta = {
         'faces': [{'vp': np.asarray(f.vp, np.float32)} for f in faces_sm],
         'size': size, 'near': float(first.near), 'far': float(first.far),
@@ -863,6 +885,8 @@ def _shadow_meta(light, st, bvh=None, want_atlas=True):
         meta['soft'] = {'shape': shape,
                         'axes': [_softmap.face_axes(f) for f in faces_sm],
                         'd_min': float(_softmap.map_d_min(sm))}
+        # the rows its reach pyramid adds to the lamp's band of the pack
+        meta['pyr_rows'] = pyr_rows
     return meta, ((key, build, stamp) if want_atlas else None), None
 
 
@@ -935,7 +959,9 @@ def _shadow_pack(shadows, parts):
     keys, stamps, packs = [], [], []
     for i, (akey, abuild, astamp) in parts:
         m = shadows[i]
-        ph = int(m['size']) * int(m['grid'][1])
+        # the lamp's band: its depth cells, then the rows of its reach
+        # pyramid when it takes the per-receiver lookup
+        ph = int(m['size']) * int(m['grid'][1]) + int(m.get('pyr_rows', 0))
         pw = int(m['size']) * int(m['grid'][0])
         m['voff'] = voff
         keys.append(akey)

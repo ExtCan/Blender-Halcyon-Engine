@@ -180,7 +180,7 @@ def test_a_softness_blurs_a_size_zero_lamp():
         for kw in ({'shadow_softness': 0.0}, {'shadow_softness': 0.5},
                    {'shadow_softness': 1.0},
                    {'shadow_softness': 1.0, 'shadow_samples': 16},
-                   {'shadow_softness': 4.0, 'shadow_samples': 1},
+                   {'shadow_softness': 1.0, 'shadow_samples': 1},
                    {'shadow_softness': 1.0,
                     'shadow_map_depth': 'MIDPOINT'},
                    {'shadow_softness': 2.0,
@@ -190,6 +190,17 @@ def test_a_softness_blurs_a_size_zero_lamp():
                                            MS._classic(sc, st, P))
         check(f'{kind} size 0: Softness at or below 1 (lamp x render) and '
               'Samples 1 keep the constant lookup, bitwise', same)
+        # R254 soft-search: this list held {'shadow_softness': 4.0,
+        # 'shadow_samples': 1} -- the hard shadow SHRINKING under a blur
+        # one tap cannot draw (the offset's max(1, Softness)), pinned
+        # bitwise. One Sample at Softness 4 is now the hard shadow of
+        # Softness 1
+        sc, st = MS._prep(kind, 0.0, shadow_softness=4.0, shadow_samples=1)
+        hard4 = MS._vis(sc, st, P)
+        sc, st = MS._prep(kind, 0.0, shadow_softness=1.0, shadow_samples=1)
+        check(f'{kind} size 0 at Samples 1: Softness 4 is the constant '
+              'lookup of Softness 1, bitwise (it shrank the shadow)',
+              np.array_equal(hard4, MS._classic(sc, st, P)))
     lt = MS._lamp('POINT', 0.0)
     check('the rule is one function: a size-0 lamp takes the sized lookup '
           'above Softness 1 at Samples above 1, and only then',
@@ -740,16 +751,27 @@ def test_g_the_pack_is_one_channel():
     key, build, stamp = atlases['hal_shadowpack']
     px = build()
     sm = lt.shadow_map
+    # R254 soft-search: a lamp on the per-receiver lookup (this one has a
+    # Radius) carries its reach pyramid under its cells -- rows derived
+    # from the same depth texels, announced by the key's PYR. The pins
+    # were `px.shape == (2 * 128, 3 * 128)` and a key without PYR
+    from ..core import softmap as _SMP
+    lay = _SMP.pyr_layout(128)
     check('the pack builds as ONE channel of float32: the six faces in '
-          'their cells and nothing else',
+          "their cells and, under them, the lamp's reach pyramid",
           px.ndim == 2 and px.dtype == np.float32
-          and px.shape == (2 * 128, 3 * 128)
+          and px.shape == (2 * 128 + 2 * lay['h'], 3 * 128)
           and all(np.array_equal(
               px[(fi // 3) * 128:(fi // 3 + 1) * 128,
                  (fi % 3) * 128:(fi % 3 + 1) * 128], f.depth)
-              for fi, f in enumerate(sm.faces)), str(px.shape))
+              for fi, f in enumerate(sm.faces))
+          and all(np.array_equal(
+              px[256 + (fi // 3) * lay['h']:256 + (fi // 3 + 1) * lay['h'],
+                 (fi % 3) * lay['w']:(fi % 3 + 1) * lay['w']], blk)
+              for fi, blk in enumerate(_SMP.map_pyramid(sm)))
+          and not px[256:, 3 * lay['w']:].any(), str(px.shape))
     check('its key is the layout and its stamp the content',
-          key == ('shadowpack', ('shadow', 128, (3, 2), 'CLS'))
+          key == ('shadowpack', ('shadow', 128, (3, 2), 'CLS', 'PYR'))
           and stamp == (tuple(GSH.map_digest(f) for f in sm.faces),))
     tex = GSH.sim_texture(px)
     from ..shaders import builtins as BI

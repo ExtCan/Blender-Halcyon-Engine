@@ -821,8 +821,15 @@ def test_j_the_gpu_twin():
             continue
         d = np.abs(sim[cov] - cpu[cov][:, :3]).max(axis=1)
         # an AREA lamp's own lighting term differs by up to 3e-3 between
-        # the roads with shadows off; the shadow term adds nothing to it
-        bar = 6e-3 if kind == 'AREA' else 1e-4
+        # the roads with shadows off; the shadow term adds nothing to it.
+        # (R254 soft-search: 5e-4, from 1e-4. The search's reach is read
+        # off the reach pyramid, whose cells are tiles: a receiver
+        # within a thousandth of a texel of a tile border reads the
+        # neighbouring cell on the road whose position differs in its
+        # last bits -- both are valid bounds, and the search then
+        # stands at a slightly different reach. One pixel of 5285 at
+        # 1.0e-4 in the SPOT case with its own Bias and Softness)
+        bar = 6e-3 if kind == 'AREA' else 5e-4
         check(f'{label}: the simulator shades the CPU picture',
               float(d.max()) < bar and 'hal_sm_blk0' in _sources(passes),
               f'max {float(d.max()):.6f} over {int(cov.sum())} px')

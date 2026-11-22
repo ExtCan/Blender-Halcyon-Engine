@@ -1611,7 +1611,9 @@ DESCRIPTIONS = {
                        "contact edges. Lights can override individually",
     'shadow_bias': "World-space offset that keeps a surface from shadowing "
                    "itself. Too low shows acne stippling; too high "
-                   "detaches shadows from their objects (Peter Panning)",
+                   "detaches shadows from their objects (Peter Panning). "
+                   "In a scene smaller than one unit across its radius "
+                   "it scales down with the scene",
     'shadow_softness': "A constant blur of mapped shadows, in shadow-map "
                        "texels, added to the penumbra a lamp's own size "
                        "(Radius, Angle, Size) casts. 0 adds none. It "

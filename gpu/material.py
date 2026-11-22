@@ -489,7 +489,8 @@ def _generated_frame(src, consts, force_line=False, world_table=False):
 #:     h0 = (origin.xyz,            Bias)
 #:     h1 = (near, extent | an ortho map's texel size,
 #:           far + near,            far - near)
-#:     h2 = (2 near far,            max(1, Softness), Softness, Density)
+#:     h2 = (2 near far,            1 (the constant lookup's offset
+#:           factor: it carries no Softness), Softness, Density)
 #:     h3 = (Softness + the search pad, k = size / (2 extent),
 #:           k Radius | k tan(angle / 2), the radius cap)   (sized lookup)
 #:     h4 = (the map's nearest depth, 0, 0, 0)              (sized lookup)
@@ -599,7 +600,9 @@ def map_texels(meta):
     out[1, 2] = f32(far + near)
     out[1, 3] = f32(far - near)
     out[2, 0] = f32(2.0 * near * far)
-    out[2, 1] = f32(max(1.0, soft))
+    # the constant lookup's normal offset carries no Softness factor
+    # (core/lights.visibility): its kernel is never wider than a texel
+    out[2, 1] = f32(1.0)
     out[2, 2] = f32(soft)
     out[2, 3] = f32(float(meta['density']))
     sp = meta.get('soft')
@@ -1858,7 +1861,7 @@ def _shadow_function(i, meta, consts):
         x_texel = _f(2.0 * meta['extent'] / size)
         x_fpn, x_fmn, x_tnf = (_f(far + near), _f(far - near),
                                _f(2.0 * near * far))
-        x_mx, x_dens = _f(max(1.0, soft)), _f(density)
+        x_mx, x_dens = _f(1.0), _f(density)
 
         def x_row(fi, r):
             return _v4(np.asarray(faces[fi]['vp'], np.float32)[r])
