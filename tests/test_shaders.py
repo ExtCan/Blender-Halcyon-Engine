@@ -1213,6 +1213,886 @@ def test_unknown_inputs_warn():
           str(sorted(supplied ^ set(INPUT_KEYS))))
 
 
+# ----------------------- matrices, indexed writes, array fields, int division
+#
+# R253 (review): four more things try_compile accepted (error None) that
+# failed, or answered another number, when the program ran. Each shader
+# named "the reported shader" below is the text the defect was reproduced
+# with; the comment over each test says what the run did with it.
+
+def _body(body, head=''):
+    return 'out vec4 Color;\n' + head + 'void main() {\n' + body + '}\n'
+
+
+#: diag(1, 2, 3) written as nine numbers: the matrix every case below holds
+_D9 = 'mat3(1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0)'
+_DIAG = f'    mat3 m = {_D9};\n'
+
+#: (what, declarations above main, statements that leave diag(1, 2, 3) in m)
+_MATRIX_MADE = [
+    ('nine numbers', '', _DIAG),
+    ('three columns', '',
+     '    mat3 m = mat3(vec3(1.0, 0.0, 0.0), vec3(0.0, 2.0, 0.0), '
+     'vec3(0.0, 0.0, 3.0));\n'),
+    ('declared, its columns written', '',
+     '    mat3 m;\n    m[0] = vec3(1.0, 0.0, 0.0);\n'
+     '    m[1] = vec3(0.0, 2.0, 0.0);\n    m[2] = vec3(0.0, 0.0, 3.0);\n'),
+    ('declared, its components written', '',
+     '    mat3 m;\n    m[0][0] = 1.0;\n    m[1][1] = 2.0;\n'
+     '    m[2][2] = 3.0;\n'),
+    ('the identity, its diagonal written through swizzles', '',
+     '    mat3 m = mat3(1.0);\n    m[1].y = 2.0;\n    m[2].z = 3.0;\n'),
+    ('returned by a function', f'mat3 diag() {{ return {_D9}; }}\n',
+     '    mat3 m = diag();\n'),
+    ('returned by a function that declares and fills it',
+     'mat3 diag() {\n    mat3 r;\n    for (int i = 0; i < 3; i++) '
+     '{ r[i][i] = float(i + 1); }\n    return r;\n}\n',
+     '    mat3 m = diag();\n'),
+    ('passed through a parameter', 'mat3 same(mat3 x) { return x; }\n',
+     f'    mat3 m = same({_D9});\n'),
+    ('written by an out parameter',
+     f'void fill(out mat3 x) {{ x = {_D9}; }}\n',
+     '    mat3 m;\n    fill(m);\n'),
+    ('a struct field', 'struct T { mat3 m; float k; };\n',
+     f'    T t;\n    t.m = {_D9};\n    mat3 m = t.m;\n'),
+    ('a declared struct field, its columns written',
+     'struct T { mat3 m; float k; };\n',
+     '    T t;\n    t.m[0] = vec3(1.0, 0.0, 0.0);\n    t.m[1].y = 2.0;\n'
+     '    t.m[2][2] = 3.0;\n    mat3 m = t.m;\n'),
+    ('an array element', '',
+     f'    mat3 a[2];\n    a[1] = {_D9};\n    mat3 m = a[1];\n'),
+    ('a global constant', f'const mat3 G = {_D9};\n', '    mat3 m = G;\n'),
+    ('a declared global, written in main', 'mat3 G;\n',
+     '    G[0].x = 1.0;\n    G[1] = vec3(0.0, 2.0, 0.0);\n'
+     '    G[2][2] = 3.0;\n    mat3 m = G;\n'),
+    ('one arm of a ternary', '',
+     f'    mat3 m = true ? {_D9} : mat3(0.0);\n'),
+    ('a product', '', f'    mat3 m = {_D9} * mat3(1.0);\n'),
+    ('transposed twice', '',
+     f'    mat3 m = transpose(transpose({_D9}));\n'),
+    ('cut from a mat4 that was built from it', '',
+     f'    mat3 m = mat3(mat4({_D9}));\n'),
+]
+
+#: (what, statements reading m into Color, the Color of diag(1, 2, 3))
+_MATRIX_USED = [
+    ('m * v', '    Color = vec4(m * vec3(1.0), 1.0);\n', [1, 2, 3, 1]),
+    ('v * m', '    Color = vec4(vec3(1.0, 0.5, 2.0) * m, 1.0);\n',
+     [1, 1, 6, 1]),
+    ('a column', '    Color = vec4(m[1], 1.0);\n', [0, 2, 0, 1]),
+    ('a component', '    Color = vec4(m[0][0], m[1][1], m[2][2], m[1][2]);\n',
+     [1, 2, 3, 0]),
+    ('a swizzle of a column', '    Color = vec4(m[2].zyx, m[1].y);\n',
+     [3, 0, 0, 2]),
+    ('a column through a variable index',
+     '    int i = 2;\n    Color = vec4(m[i], m[i - 1][i - 1]);\n',
+     [0, 0, 3, 2]),
+    ('a column written, then m * v',
+     '    m[0] = vec3(0.5);\n    Color = vec4(m * vec3(1.0), 1.0);\n',
+     [0.5, 2.5, 3.5, 1]),
+    ('a component written, then m * v',
+     '    m[2][0] = 4.0;\n    Color = vec4(m * vec3(1.0), 1.0);\n',
+     [5, 2, 3, 1]),
+    ('a swizzle of a column written',
+     '    m[1].xz = vec2(7.0, 8.0);\n    Color = vec4(m[1], 1.0);\n',
+     [7, 2, 8, 1]),
+    ('a component incremented, a column added to',
+     '    m[1][1]++;\n    m[2] += vec3(1.0);\n'
+     '    Color = vec4(m[1].y, m[2]);\n', [3, 1, 1, 4]),
+    ('m * m, its determinant',
+     '    Color = vec4((m * m)[2], determinant(m));\n', [0, 0, 9, 6]),
+    ('copied, the copy written',
+     '    mat3 k = m;\n    k[1] = vec3(9.0);\n'
+     '    Color = vec4(m[1].y, k[1].y, k[2].z, m[0].x);\n', [2, 9, 3, 1]),
+]
+
+
+def test_a_matrix_is_one_array_however_it_is_made():
+    """`mat3 m = mat3(...); Color = vec4(m[1], 1.0);` compiled and raised
+    ValueError: a constructed matrix is one (lanes, columns, rows) array
+    and the column read indexed it as a list of columns -- the lane axis.
+    With three lanes the shapes fitted and it answered lane 1's rows. A
+    declared `mat3 m;` WAS a list of columns, and `m * v` handed it to
+    mat_mul_vec: AttributeError."""
+    reported = [
+        ('a column of a constructed matrix',
+         _body(_DIAG + '    Color = vec4(m[1], 1.0);\n'), [0, 2, 0, 1]),
+        ('m[1][1]', _body(_DIAG + '    Color = vec4(m[1][1]);\n'),
+         [2, 2, 2, 2]),
+        ('m[1].xyz', _body(_DIAG + '    Color = vec4(m[1].xyz, 1.0);\n'),
+         [0, 2, 0, 1]),
+        ('m[0] = vec3(0.5) on a constructed matrix',
+         _body(_DIAG + '    m[0] = vec3(0.5);\n'
+               '    Color = vec4(m[0], m[1].y);\n'), [0.5, 0.5, 0.5, 2]),
+        ('a declared matrix, its columns written, times a vector',
+         _body('    mat3 m;\n    m[0] = vec3(1.0, 0.0, 0.0);\n'
+               '    m[1] = vec3(0.0, 2.0, 0.0);\n'
+               '    m[2] = vec3(0.0, 0.0, 3.0);\n'
+               '    Color = vec4(m * vec3(1.0), 1.0);\n'), [1, 2, 3, 1]),
+        ('mat3(...) * vec3, the road that worked',
+         _body(_DIAG + '    Color = vec4(m * vec3(1.0), 1.0);\n'),
+         [1, 2, 3, 1]),
+    ]
+    for what, src, want in reported:
+        # three lanes is the count at which the wrong axis FITTED: the
+        # column read answered [1, 0, 0] without a word
+        bad = []
+        for n in (1, 2, 3, 4, 7):
+            got, err = _first(src, n=n)
+            if got is None or not np.allclose(got, want, atol=1e-6):
+                bad.append(f'{n} lanes: {err if got is None else got}')
+        check(f'matrix: {what} (the reported shader, at 1, 2, 3, 4 and 7 '
+              'lanes)', not bad, '; '.join(bad))
+
+    # however the matrix came to be, every use of it reads the same matrix
+    bad, ran = [], 0
+    for made, head, make in _MATRIX_MADE:
+        for used, use, want in _MATRIX_USED:
+            for n in (3, 5):
+                got, err = _first(_body(make + use, head), n=n)
+                ran += 1
+                if got is None or not np.allclose(got, want, atol=1e-6):
+                    bad.append(f'{made} / {used} / {n} lanes: '
+                               f'{err if got is None else got}')
+    check(f'matrix: made {len(_MATRIX_MADE)} ways by used '
+          f'{len(_MATRIX_USED)} ways, at 3 and 5 lanes ({ran} shaders): '
+          'every one reads diag(1, 2, 3)', not bad,
+          f'{len(bad)} wrong: ' + '; '.join(bad[:4]))
+
+    # the one shape, wherever the value comes from: (lanes, columns, rows)
+    from ..shaders.gtypes import BY_NAME
+    src = ('out mat3 Made;\nout mat3 Declared;\nout mat4 Wide;\n'
+           'out mat2 Small;\nout vec4 Color;\nvoid main() {\n'
+           f'    Made = {_D9};\n    Declared[1] = vec3(0.0, 2.0, 0.0);\n'
+           '    Wide[3] = vec4(1.0);\n    Small = mat2(2.0);\n'
+           '    Color = vec4(1.0);\n}\n')
+    prog, err = try_compile(src)
+    outs = prog.run({}, {}, 5)[0] if prog else {}
+    shapes = {k: getattr(v, 'shape', type(v).__name__)
+              for k, v in outs.items()}
+    zero = prog.interp.zero(BY_NAME['mat3'], 5) if prog else None
+    check('matrix: a declared one and a constructed one are the same '
+          '(lanes, columns, rows) float32 array',
+          shapes == {'Made': (5, 3, 3), 'Declared': (5, 3, 3),
+                     'Wide': (5, 4, 4), 'Small': (5, 2, 2),
+                     'Color': (5, 4)}
+          and isinstance(zero, np.ndarray) and zero.shape == (5, 3, 3)
+          and all(outs[k].dtype == np.float32 for k in shapes)
+          and np.array_equal(outs['Declared'][2],
+                             [[0, 0, 0], [0, 2, 0], [0, 0, 0]])
+          and np.array_equal(outs['Made'][4], np.diag([1.0, 2.0, 3.0])),
+          str(err or shapes))
+
+    # per lane: a matrix that differs by lane, written under a branch and
+    # read through an index that differs by lane
+    src = ('in vec3 vPosition;\nout vec4 Color;\nout vec4 Pick;\n'
+           'void main() {\n    float x = vPosition.x;\n'
+           '    mat3 m = mat3(x);\n    m[1] = vec3(x, 2.0, 0.25);\n'
+           '    if (x > 0.5) { m[1][1] = 5.0; m[2] = vec3(x); }\n'
+           '    int i = int(x * 3.0);\n'
+           '    Color = vec4(m * vec3(1.0), m[1].y);\n'
+           '    Pick = vec4(m[i], m[i][i]);\n}\n')
+    p = np.zeros((8, 3), np.float32)
+    p[:, 0] = np.arange(8) / 8.0
+    outs, _, _ = run(src, inputs={'position': p})
+    x = p[:, 0]
+    hot = x > 0.5
+    ref = np.zeros((8, 3, 3), np.float32)        # [lane, column, row]
+    for c in range(3):
+        ref[:, c, c] = x
+    ref[:, 1] = np.stack([x, np.full(8, 2.0), np.full(8, 0.25)], 1)
+    ref[hot, 1, 1] = 5.0
+    ref[hot, 2] = x[hot, None]
+    i = (x * 3.0).astype(int)
+    lanes = np.arange(8)
+    check('matrix: per lane -- built from a varying, written under a '
+          'branch, multiplied',
+          np.allclose(outs['Color'][:, :3], ref.sum(1))
+          and np.allclose(outs['Color'][:, 3], ref[:, 1, 1]),
+          str(outs['Color']))
+    check('matrix: a variable index chooses the column per lane (it read '
+          'column 0 for every lane)',
+          np.allclose(outs['Pick'][:, :3], ref[lanes, i])
+          and np.allclose(outs['Pick'][:, 3], ref[lanes, i, i])
+          and len(set(i)) == 3, str(outs['Pick']))
+
+    # a swizzle of a matrix is no driver's GLSL: refused where it is
+    # written. The name check skipped the swizzle check for a matrix (and
+    # for an array, on the same line), and the run swizzled the lane axis
+    _refused('m.xyz on a matrix (it raised ValueError when run)',
+             _body(_DIAG + '    Color = vec4(m.xyz, 1.0);\n'),
+             "line 4: 'xyz' of mat3: a matrix is indexed first "
+             "(m[0].xyz)")
+    _refused('m.x, which answered column 0 typed float',
+             _body(_DIAG + '    vec3 c = m.x;\n    Color = vec4(c, 1.0);\n'),
+             "line 4: 'x' of mat3: a matrix is indexed first (m[0].x)")
+    _refused('...in a branch no lane takes',
+             _body(_DIAG + '    Color = vec4(1.0);\n'
+                   '    if (Color.x > 2.0) {\n        Color = m.rgbr;\n'
+                   '    }\n'),
+             "line 6: 'rgbr' of mat3: a matrix is indexed first "
+             "(m[0].rgbr)")
+    _refused('...of a matrix a function returns',
+             _body('    Color = vec4(ident().xy, 0.0, 1.0);\n',
+                   'mat2 ident() { return mat2(1.0); }\n'),
+             "line 4: 'xy' of mat2: a matrix is indexed first")
+    _refused('a.x on an array (the same skipped check)',
+             _body('    float a[3];\n    a[0] = 1.0;\n'
+                   '    Color = vec4(a.x);\n'),
+             "line 5: 'x' of float[3]: an array is indexed first "
+             "(a[0].x)")
+    _refused('a field of an array of structs (TypeError when run)',
+             _body('    S a[2];\n    Color = vec4(a.k);\n',
+                   'struct S { float k; };\n'),
+             "line 5: 'k' of S[2]: an array is indexed first (a[0].k)")
+    fine = [
+        ('a swizzle of a column, of an element, of an element\'s field',
+         _body(_DIAG + '    vec2 a[2];\n    a[1] = vec2(0.25, 0.5);\n'
+               '    S s[2];\n    s[1].k = 0.75;\n'
+               '    Color = vec4(m[2].z, a[1].yx, s[1].k);\n',
+               'struct S { float k; };\n'), [3, 0.5, 0.25, 0.75]),
+    ]
+    for what, src, want in fine:
+        got, err = _first(src)
+        check(f'matrix: not refused -- {what}',
+              got is not None and np.allclose(got, want, atol=1e-6),
+              str(err if got is None else got))
+    # where the type is the interpreter's shortcut and not the language's
+    # (of two functions with one name and count the first is taken), the
+    # member is left to the run: a driver compiles this text
+    prog, err = try_compile(
+        'out vec4 Color;\nmat3 f(float x) { return mat3(x); }\n'
+        'vec3 f(vec3 x) { return x; }\nvoid main() {\n'
+        '    Color = vec4(f(vec3(1.0)).xyz, 1.0);\n}\n')
+    check('matrix: a member of a loosely typed value is not judged',
+          prog is not None, repr(err))
+
+
+def _lanes(count, limit):
+    """`count` lanes of position: x counts 0, 1, 2 .. limit - 1 and round
+    again, y is a quarter of the lane number."""
+    p = np.zeros((count, 3), np.float32)
+    p[:, 0] = np.arange(count) % limit
+    p[:, 1] = np.arange(count) * 0.25
+    return p
+
+
+def test_writes_through_a_variable_index():
+    """`float a[3]; for (int i = 0; i < 3; i++) { a[i] = float(i) * 0.25;
+    }` compiled and raised ShaderError 'dynamic array writes are not
+    supported': a write took a number written in the brackets and nothing
+    else, where a read through a variable chose its element per lane."""
+    reported = [
+        ('an array filled in a loop',
+         _body('    float a[3];\n    for (int i = 0; i < 3; i++) '
+               '{ a[i] = float(i) * 0.25; }\n'
+               '    Color = vec4(a[0], a[1], a[2], 1.0);\n'),
+         [0, 0.25, 0.5, 1]),
+        ('a component of a vector',
+         _body('    vec3 v;\n    int i = 1;\n    v[i] = 0.5;\n'
+               '    Color = vec4(v, 1.0);\n'), [0, 0.5, 0, 1]),
+        ('a column of a matrix',
+         _body('    mat3 m;\n    int i = 1;\n    m[i] = vec3(0.5);\n'
+               '    Color = vec4(m[0].x, m[1].yz, m[2].z);\n'),
+         [0, 0.5, 0.5, 0]),
+    ]
+    for what, src, want in reported:
+        got, err = _first(src)
+        check(f'indexed write: {what} (the reported shader)',
+              got is not None and np.allclose(got, want, atol=1e-6),
+              str(err if got is None else got))
+
+    fine = [
+        ('a compound assignment and ++ through a variable index',
+         _body('    float a[3];\n    for (int i = 0; i < 3; i++) {\n'
+               '        a[i] += float(i);\n        a[i] *= 2.0;\n'
+               '        a[i]++;\n        --a[i];\n        a[i] -= 0.5;\n'
+               '    }\n    Color = vec4(a[0], a[1], a[2], 1.0);\n'),
+         [-0.5, 1.5, 3.5, 1]),
+        ('a component of an element, an element of an element',
+         _body('    vec2 a[3];\n    ivec2 b[2];\n'
+               '    for (int i = 0; i < 3; i++) { a[i].y = float(i); '
+               'a[i][0] = float(i) * 0.5; }\n'
+               '    for (int i = 0; i < 2; i++) for (int j = 0; j < 2; '
+               'j++) b[i][j] = i * 2 + j;\n'
+               '    Color = vec4(a[2], a[1].x + a[1].y, '
+               'float(b[0][1] + b[1][0] * 4 + b[1][1] * 16));\n'),
+         [1, 2, 1.5, 57]),
+        ('a component of a matrix, a swizzle of its column',
+         _body('    mat2 m = mat2(0.0);\n'
+               '    for (int c = 0; c < 2; c++) for (int r = 0; r < 2; '
+               'r++) m[c][r] = float(c * 2 + r);\n'
+               '    int k = 1;\n    m[k].yx += vec2(0.5, 0.25);\n'
+               '    Color = vec4(m[0], m[1]);\n'), [0, 1, 2.25, 3.5]),
+        ('an array inside a struct, a struct inside an array',
+         _body('    S s;\n    S t[2];\n'
+               '    for (int i = 0; i < 3; i++) { s.w[i] = float(i) * '
+               '0.25; t[i % 2].w[i] = float(i + 1); }\n'
+               '    Color = vec4(s.w[1] + s.w[2], t[0].w[0], t[1].w[1], '
+               't[0].w[2]);\n', 'struct S { float w[3]; };\n'),
+         [0.75, 1, 2, 3]),
+        ('an out parameter given an element: written back to the element '
+         'the call named',
+         _body('    float a[3];\n    int i = 0;\n'
+               '    step2(i, a[i]);\n    step2(i, a[i]);\n'
+               '    Color = vec4(a[0], a[1], a[2], float(i));\n',
+               'void step2(inout int k, out float v) { k += 1; '
+               'v = float(k) * 0.25; }\n'), [0.25, 0.5, 0, 2]),
+        ('the value of the assignment is the element written',
+         _body('    float a[3];\n    float b[3];\n    int i = 2;\n'
+               '    a[i] = b[i - 1] = 0.75;\n'
+               '    Color = vec4(a[2], b[1], a[1], b[2]);\n'),
+         [0.75, 0.75, 0, 0]),
+        ('...and the column written',
+         _body('    mat2 m = mat2(1.0);\n    mat2 k = mat2(0.0);\n'
+               '    int i = 1;\n    k[i - 1] = m[i] = vec2(0.5, 0.25);\n'
+               '    Color = vec4(k[0], m[1]);\n'), [0.5, 0.25, 0.5, 0.25]),
+        ('the HLSL dialect',
+         'out float4 Color;\nvoid main() {\n    float a[3];\n'
+         '    float3 v = float3(0, 0, 0);\n'
+         '    for (int i = 0; i < 3; i++) { a[i] = i * 0.5; v[i] = '
+         'a[i] + 1; }\n    Color = float4(v, a[1]);\n}\n',
+         [1, 1.5, 2, 0.5]),
+        ('a column takes what a vector takes: a scalar fills it, an int '
+         'vector is converted',
+         'out float4 Color;\nvoid main() {\n'
+         '    float3x3 m = float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1);\n'
+         '    int k = 2;\n    m[k] = 0.5;\n    m[k - 1] = int3(7, 8, 9);\n'
+         '    Color = float4(m[2].xz, m[1].yz * 0.5);\n}\n',
+         [0.5, 0.5, 4, 4.5]),
+    ]
+    for what, src, want in fine:
+        got, err = _first(src, 'HLSL' if 'float4' in src else 'GLSL')
+        check(f'indexed write: {what}',
+              got is not None and np.allclose(got, want, atol=1e-6),
+              str(err if got is None else got))
+
+    # an index with a side effect moves once: the write names its element
+    # again at every step on the way (`a[i].y = x` reads a[i], changes it
+    # and writes a[i] back), and each used to be a fresh evaluation
+    once = [
+        ('a[i++] = x', '    a[i++].x = 0.5;\n    a[i++].x = 0.25;\n',
+         [0.5, 0.25, 0, 2]),
+        ('a[i++].y = x', '    a[i++].y = 0.5;\n    a[i++].y = 0.25;\n'
+         '    a[0].x = a[0].y;\n    a[1].x = a[1].y;\n',
+         [0.5, 0.25, 0, 2]),
+        ('a[i++][1] = x', '    a[i++][1] = 0.5;\n    a[i++][1] = 0.25;\n'
+         '    a[0].x = a[0].y;\n    a[1].x = a[1].y;\n',
+         [0.5, 0.25, 0, 2]),
+        ('a[i++].x += x', '    a[i++].x += 0.5;\n    a[i++].x += 0.25;\n',
+         [0.5, 0.25, 0, 2]),
+        ('a[++i].x++', '    a[++i].x++;\n', [0, 1, 0, 1]),
+        ('++a[i++].x', '    ++a[i++].x;\n    --a[i++].x;\n',
+         [1, -1, 0, 2]),
+    ]
+    for what, stmts, want in once:
+        got, err = _first(_body(
+            '    vec2 a[3];\n    int i = 0;\n' + stmts
+            + '    Color = vec4(a[0].x, a[1].x, a[2].x, float(i));\n'))
+        check(f'indexed write: {what} evaluates its index once',
+              got is not None and np.allclose(got, want, atol=1e-6),
+              str(err if got is None else got))
+
+    # per lane: every lane writes the element ITS index names, under the
+    # mask of the branch it is in
+    src = ('in vec3 vPosition;\nout vec4 Color;\nout vec4 Vec;\n'
+           'out vec4 Mat;\nvoid main() {\n'
+           '    int k = int(vPosition.x);\n    float f = vPosition.y;\n'
+           '    float a[4];\n    vec4 v = vec4(0.0);\n'
+           '    mat2 m = mat2(0.0);\n'
+           '    a[k] = 1.0 + f;\n    v[k] = 1.0 + f;\n'
+           '    if (f > 1.0) { a[3 - k] += 8.0; v[3 - k] -= 8.0; }\n'
+           '    m[k / 2][k % 2] = 1.0 + f;\n'
+           '    if (k == 2) { m[k - 2] = vec2(f, -f); }\n'
+           '    Color = vec4(a[0], a[1], a[2], a[3]);\n    Vec = v;\n'
+           '    Mat = vec4(m[0], m[1]);\n}\n')
+    p = _lanes(12, 4)
+    outs, _, _ = run(src, inputs={'position': p}, n=12)
+    k = p[:, 0].astype(int)
+    f = p[:, 1]
+    lanes = np.arange(12)
+    ra = np.zeros((12, 4), np.float32)
+    ra[lanes, k] = 1.0 + f
+    rv = ra.copy()
+    hot = f > 1.0
+    ra[lanes[hot], 3 - k[hot]] += 8.0
+    rv[lanes[hot], 3 - k[hot]] -= 8.0
+    rm = np.zeros((12, 2, 2), np.float32)
+    rm[lanes, k // 2, k % 2] = 1.0 + f
+    two = k == 2
+    rm[two, 0] = np.stack([f[two], -f[two]], 1)
+    check('indexed write: per lane, into an array, a vector and a matrix, '
+          'under a branch',
+          np.array_equal(outs['Color'], ra) and np.array_equal(outs['Vec'], rv)
+          and np.array_equal(outs['Mat'], rm.reshape(12, 4))
+          and hot.any() and not hot.all(),
+          str(outs['Color'][:5]))
+
+    # past the end, a variable index is clamped as the read's is: what is
+    # written through an index is what a read through it finds
+    src = ('in vec3 vPosition;\nout vec4 Color;\nvoid main() {\n'
+           '    int k = int(vPosition.x) - 2;\n    float a[3];\n'
+           '    vec3 v = vec3(0.0);\n    a[k] = 1.0;\n    v[k] = 2.0;\n'
+           '    Color = vec4(a[k], v[k], a[0] + a[1] * 2.0 + a[2] * 4.0, '
+           'v.x + v.y * 2.0 + v.z * 4.0);\n}\n')
+    p = _lanes(7, 7)
+    outs, _, _ = run(src, inputs={'position': p}, n=7)
+    where = np.clip(p[:, 0].astype(int) - 2, 0, 2)
+    check('indexed write: an index past either end writes the element a '
+          'read through it reads (-2 .. 4 into three elements)',
+          np.array_equal(outs['Color'][:, 0], np.ones(7))
+          and np.array_equal(outs['Color'][:, 1], np.full(7, 2.0))
+          and np.array_equal(outs['Color'][:, 2], 2.0 ** where)
+          and np.array_equal(outs['Color'][:, 3], 2.0 * 2.0 ** where),
+          str(outs['Color']))
+
+    # what a write still refuses, as it did -- by name now
+    for what, src, want in (
+            ('a number written past the size (it raised IndexError)',
+             _body('    float a[3];\n    a[3] = 1.0;\n'
+                   '    Color = vec4(a[2]);\n'),
+             'index 3 is out of range for float[3]'),
+            ('...past a vector\'s width',
+             _body('    vec3 v = vec3(0.0);\n    v[3] = 1.0;\n'
+                   '    Color = vec4(v, 1.0);\n'),
+             'index 3 is out of range for vec3'),
+            ('...past a matrix\'s columns',
+             _body('    mat2 m = mat2(1.0);\n    m[2] = vec2(1.0);\n'
+                   '    Color = vec4(m[1], 0.0, 1.0);\n'),
+             'index 2 is out of range for mat2'),
+            ('a variable index into a float: nothing to choose between',
+             _body('    float f = 0.0;\n    int i = 1;\n    f[i] = 1.0;\n'
+                   '    Color = vec4(f);\n'),
+             'float is not an array, a vector or a matrix: a variable '
+             'index cannot write to it')):
+        got, err = _first(src)
+        check(f'indexed write, still refused: {what}',
+              got is None and err == f'compiled, then ShaderError: {want}',
+              str(err if got is None else got))
+
+    # the rule, held against a second implementation: seeded programs of
+    # indexed reads and writes (constant and per-lane indices, in and out
+    # of range, nested branches and loops), each lane computed here in
+    # plain Python on plain lists
+    bad, n_prog, n_writes = [], 120, 0
+    for seed in range(n_prog):
+        text, tree = _index_program(np.random.RandomState(1000 + seed))
+        n_writes += text.count(' = ') + text.count('+= ')
+        p = _lanes(10, 5)
+        prog, err = try_compile(text)
+        if prog is None:
+            bad.append(f'seed {seed}: {err}')
+            continue
+        try:
+            outs = prog.run({}, {'position': p}, 10)[0]
+        except Exception as exc:                                # noqa: BLE001
+            bad.append(f'seed {seed}: {type(exc).__name__}: {exc}')
+            continue
+        got = np.concatenate([outs['A'], outs['V'], outs['M']], 1)
+        want = np.array([_index_reference(tree, int(k), float(f))
+                         for k, f in p[:, :2]], np.float32)
+        if not np.array_equal(got, want):
+            lane = int(np.argwhere((got != want).any(1))[0, 0])
+            bad.append(f'seed {seed} lane {lane}: {got[lane]} for '
+                       f'{want[lane]}')
+    check(f'indexed write: {n_prog} seeded programs ({n_writes} writes), '
+          'every lane equal to a plain-Python run of the same program',
+          not bad, f'{len(bad)} differ: ' + '; '.join(bad[:3]))
+
+
+# -- the seeded programs of the test above: a small tree, written out as
+# GLSL and run by `_index_reference` one lane at a time. Values are small
+# multiples of 1/4, so every sum is exact in float32 and the two can be
+# held to equality.
+
+_IDX_SIZES = {'a': 4, 'v': 3, 'm': 2}
+
+
+def _index_expr(rng, loops):
+    """(GLSL text, f(env) -> int): an index, sometimes out of range."""
+    kind = rng.randint(6)
+    if kind == 0 and loops:
+        name = loops[rng.randint(len(loops))]
+        return name, lambda e: e[name]
+    if kind == 1 and loops:
+        name = loops[rng.randint(len(loops))]
+        return f'({name} + k)', lambda e: e[name] + e['k']
+    if kind == 2:
+        c = int(rng.randint(4))
+        return f'(k - {c})', lambda e: e['k'] - c
+    if kind == 3:
+        c = int(rng.randint(3))
+        return f'(k * 2 - {c})', lambda e: e['k'] * 2 - c
+    if kind == 4:
+        return 'k', lambda e: e['k']
+    c = int(rng.randint(2))            # a written number: in range for all
+    return str(c), lambda e: c
+
+
+def _index_value(rng, loops, depth=0):
+    """(GLSL text, f(env) -> float): a value, sometimes an indexed read."""
+    kind = rng.randint(7 if depth < 2 else 4)
+    if kind == 0:
+        c = int(rng.randint(1, 9))
+        return f'{c * 0.25}', lambda e: c * 0.25
+    if kind == 1:
+        return 'f', lambda e: e['f']
+    if kind == 2:
+        return '(float(k) * 0.5)', lambda e: e['k'] * 0.5
+    if kind == 3 and loops:
+        name = loops[rng.randint(len(loops))]
+        return f'float({name})', lambda e: float(e[name])
+    if kind == 4:
+        t, i = _index_expr(rng, loops)
+        return f'a[{t}]', lambda e: e['a'][_clamp(i(e), 4)]
+    if kind == 5:
+        t, i = _index_expr(rng, loops)
+        return f'v[{t}]', lambda e: e['v'][_clamp(i(e), 3)]
+    if kind == 6:
+        (t1, i1), (t2, i2) = _index_expr(rng, loops), _index_expr(rng, loops)
+        return (f'm[{t1}][{t2}]',
+                lambda e: e['m'][_clamp(i1(e), 2)][_clamp(i2(e), 2)])
+    return '0.25', lambda e: 0.25
+
+
+def _clamp(i, count):
+    return max(0, min(int(i), count - 1))
+
+
+def _index_block(rng, loops, depth, pad):
+    """([GLSL lines], [statement closures]) of one block."""
+    lines, stmts = [], []
+    for _ in range(rng.randint(2, 5)):
+        kind = rng.randint(9)
+        if kind < 5:
+            name = 'avm'[rng.randint(3)]
+            (ti, fi), (tv, fv) = (_index_expr(rng, loops),
+                                  _index_value(rng, loops))
+            add = rng.randint(3) == 0
+            op = '+=' if add else '='
+            if name == 'm':
+                tj, fj = _index_expr(rng, loops)
+                lines.append(f'{pad}m[{ti}][{tj}] {op} {tv};')
+
+                def put(e, fi=fi, fj=fj, fv=fv, add=add):
+                    c, r, x = _clamp(fi(e), 2), _clamp(fj(e), 2), fv(e)
+                    e['m'][c][r] = e['m'][c][r] + x if add else x
+            else:
+                size = _IDX_SIZES[name]
+                lines.append(f'{pad}{name}[{ti}] {op} {tv};')
+
+                def put(e, name=name, size=size, fi=fi, fv=fv, add=add):
+                    j, x = _clamp(fi(e), size), fv(e)
+                    e[name][j] = e[name][j] + x if add else x
+            stmts.append(put)
+        elif kind == 5:
+            ti, fi = _index_expr(rng, loops)
+            tv, fv = _index_value(rng, loops)
+            lines.append(f'{pad}m[{ti}] = vec2({tv}, 0.75);')
+
+            def put_col(e, fi=fi, fv=fv):
+                e['m'][_clamp(fi(e), 2)] = [fv(e), 0.75]
+            stmts.append(put_col)
+        elif kind in (6, 7) and depth < 2:
+            c = int(rng.randint(1, 4))
+            use_f = rng.randint(2) == 0
+            cond = f'f > {c * 0.5}' if use_f else f'k >= {c}'
+            a_lines, a_stmts = _index_block(rng, loops, depth + 1,
+                                            pad + '    ')
+            b_lines, b_stmts = _index_block(rng, loops, depth + 1,
+                                            pad + '    ')
+            lines += ([f'{pad}if ({cond}) {{'] + a_lines
+                      + [f'{pad}}} else {{'] + b_lines + [f'{pad}}}'])
+
+            def branch(e, c=c, use_f=use_f, a=a_stmts, b=b_stmts):
+                taken = e['f'] > c * 0.5 if use_f else e['k'] >= c
+                for st in (a if taken else b):
+                    st(e)
+            stmts.append(branch)
+        elif kind == 8 and depth < 2:
+            name = 'ij'[len(loops)] if len(loops) < 2 else None
+            if name is None:
+                continue
+            trips = int(rng.randint(1, 4))
+            b_lines, b_stmts = _index_block(rng, loops + [name], depth + 1,
+                                            pad + '    ')
+            lines += ([f'{pad}for (int {name} = 0; {name} < {trips}; '
+                       f'{name}++) {{'] + b_lines + [f'{pad}}}'])
+
+            def loop(e, name=name, trips=trips, body=b_stmts):
+                for t in range(trips):
+                    e[name] = t
+                    for st in body:
+                        st(e)
+            stmts.append(loop)
+    return lines, stmts
+
+
+def _index_program(rng):
+    lines, stmts = _index_block(rng, [], 0, '    ')
+    text = ('in vec3 vPosition;\nout vec4 A;\nout vec4 V;\nout vec4 M;\n'
+            'void main() {\n    int k = int(vPosition.x);\n'
+            '    float f = vPosition.y;\n'
+            '    float a[4] = float[4](0.0, 0.0, 0.0, 0.0);\n'
+            '    vec3 v = vec3(0.0);\n    mat2 m = mat2(0.0);\n'
+            + '\n'.join(lines) + '\n'
+            '    A = vec4(a[0], a[1], a[2], a[3]);\n    V = vec4(v, 1.0);\n'
+            '    M = vec4(m[0], m[1]);\n}\n')
+    return text, stmts
+
+
+def _index_reference(stmts, k, f):
+    env = {'k': k, 'f': f, 'a': [0.0] * 4, 'v': [0.0] * 3,
+           'm': [[0.0, 0.0], [0.0, 0.0]]}
+    for st in stmts:
+        st(env)
+    return env['a'] + env['v'] + [1.0] + env['m'][0] + env['m'][1]
+
+
+def test_a_struct_field_keeps_its_array_size():
+    """`struct S2 { float w[3]; }; S2 s; s.w[1] = 0.5; Color =
+    vec4(s.w[1]);` compiled and raised IndexError: the field's array size
+    -- the third element of the parser's field tuple -- was read by
+    nothing, so the struct was built with ONE float for `w` and the name
+    check typed it float."""
+    got, err = _first('struct S2 { float w[3]; };\nout vec4 Color;\n'
+                      'void main() {\n    S2 s;\n    s.w[1] = 0.5;\n'
+                      '    Color = vec4(s.w[1]);\n}\n')
+    check('struct array field: s.w[1] = 0.5 (the reported shader)',
+          got is not None and np.allclose(got, 0.5),
+          str(err if got is None else got))
+
+    _S = 'struct S { float w[3]; vec3 p[2]; float k; };\n'
+    fine = [
+        ('every element is its own (w[1] read back what w[0] was given)',
+         _body('    S s;\n    s.w[0] = 0.25;\n    s.w[1] = 0.5;\n'
+               '    s.w[2] = 0.75;\n    s.k = 2.0;\n'
+               '    Color = vec4(s.w[0], s.w[1], s.w[2], s.k);\n', _S),
+         [0.25, 0.5, 0.75, 2]),
+        ('an array of vectors: an element, its swizzle, its component '
+         '(s.p[0].y was refused as a swizzle of a float)',
+         _body('    S s;\n    s.p[1] = vec3(0.5);\n    s.p[0].y = 0.25;\n'
+               '    s.p[1][2] = 0.75;\n'
+               '    Color = vec4(s.p[1].xz, s.p[0].yx);\n', _S),
+         [0.5, 0.75, 0.25, 0]),
+        ('the constructor takes the array as one argument',
+         _body('    S s = S(float[3](0.25, 0.5, 0.75), '
+               'vec3[2](vec3(1.0), vec3(2.0)), 4.0);\n'
+               '    Color = vec4(s.w[2], s.p[0].x, s.p[1].z, s.k);\n', _S),
+         [0.75, 1, 2, 4]),
+        ('copied whole, passed to a function, returned from one',
+         _body('    S s = make(0.25);\n    S t = s;\n    t.w[1] = 9.0;\n'
+               '    Color = vec4(s.w[1], t.w[1], total(s), t.p[1].y);\n',
+               _S + 'S make(float x) {\n    S r;\n'
+               '    for (int i = 0; i < 3; i++) { r.w[i] = x * float(i + '
+               '1); }\n    r.p[1] = vec3(x);\n    return r;\n}\n'
+               'float total(S s) { return s.w[0] + s.w[1] + s.w[2]; }\n'),
+         [0.5, 9, 1.5, 0.25]),
+        ('a struct inside a struct inside an array',
+         _body('    Out o[2];\n    o[1].i.w[2] = 0.5;\n'
+               '    o[0].i.w[2] = 0.25;\n    o[1].c[1] = vec3(0.75);\n'
+               '    Color = vec4(o[1].i.w[2], o[0].i.w[2], o[1].c[1].z, '
+               'o[1].i.w[1]);\n',
+               'struct In { float w[3]; };\n'
+               'struct Out { In i; vec3 c[2]; };\n'),
+         [0.5, 0.25, 0.75, 0]),
+        ('the field assigned whole: the value of the assignment is the '
+         'array',
+         _body('    S s;\n    S t;\n'
+               '    float x = (s.w = float[3](0.25, 0.5, 0.75))[1];\n'
+               '    t.w = s.w;\n    t.w[0] = 2.0;\n'
+               '    Color = vec4(x, s.w[0], t.w[0], t.w[2]);\n', _S),
+         [0.5, 0.25, 2, 0.75]),
+        ('a field that is no array is as it was',
+         _STRUCT + 'void main() {\n    S s = S(0.5, vec3(0.1, 0.2, '
+         '0.3));\n    s.b.y = 1.0;\n    Color = vec4(s.a, s.b);\n}\n',
+         [0.5, 0.1, 1.0, 0.3]),
+        ('the HLSL dialect',
+         'struct S { float w[3]; };\nout float4 Color;\nvoid main() {\n'
+         '    S s;\n    s.w[2] = 0.5;\n    s.w[0] = 0.25;\n'
+         '    Color = float4(s.w[0], s.w[1], s.w[2], 1);\n}\n',
+         [0.25, 0, 0.5, 1]),
+    ]
+    for what, src, want in fine:
+        got, err = _first(src, 'HLSL' if 'float4' in src else 'GLSL')
+        check(f'struct array field: {what}',
+              got is not None and np.allclose(got, want, atol=1e-6),
+              str(err if got is None else got))
+
+    # the two halves agree on what the field is: the value the struct is
+    # built with and the type the name check gives it
+    from ..shaders.interp import field_type
+    from ..shaders.names import NameCheck, _Scope
+    prog, err = try_compile(_body('    S s;\n    Color = vec4(s.k);\n', _S))
+    zero = prog.interp.zero(prog.interp.fields('S')['w'], 4)
+    built = prog.interp.zero(_struct_type('S'), 4)
+    scope = _Scope()
+    scope.names['s'] = _struct_type('S')
+    typed = {f: NameCheck(prog.interp).expr(('member', ('var', 's', 0), f, 0),
+                                            scope)[0].name()
+             for f in ('w', 'p', 'k')}
+    check('struct array field: built as three floats, two vec3 and a float; '
+          'typed float[3], vec3[2], float',
+          [np.shape(e) for e in built['w']] == [(4,)] * 3
+          and [np.shape(e) for e in built['p']] == [(4, 3)] * 2
+          and np.shape(built['k']) == (4,) and len(zero) == 3
+          and typed == {'w': 'float[3]', 'p': 'vec3[2]', 'k': 'float'}
+          and [field_type(f).name()
+               for f in prog.interp.structs['S']] == ['float[3]', 'vec3[2]',
+                                                      'float'],
+          str((typed, {k: np.shape(v) for k, v in built.items()})))
+
+    # per lane, under a branch
+    src = (_S + 'in vec3 vPosition;\nout vec4 Color;\nvoid main() {\n'
+           '    int k = int(vPosition.x);\n    S s;\n'
+           '    s.w[k] = 1.0 + vPosition.y;\n'
+           '    if (vPosition.y > 1.0) { s.w[2 - k] += 4.0; '
+           's.p[k % 2].z = 0.5; }\n'
+           '    Color = vec4(s.w[0], s.w[1], s.w[2], s.p[0].z + 2.0 * '
+           's.p[1].z);\n}\n')
+    p = _lanes(9, 3)
+    outs, _, _ = run(src, inputs={'position': p}, n=9)
+    k = p[:, 0].astype(int)
+    lanes = np.arange(9)
+    ref = np.zeros((9, 4), np.float32)
+    ref[lanes, k] = 1.0 + p[:, 1]
+    hot = p[:, 1] > 1.0
+    ref[lanes[hot], 2 - k[hot]] += 4.0
+    ref[hot, 3] = np.where(k[hot] % 2 == 0, 0.5, 1.0)
+    check('struct array field: per lane, under a branch',
+          np.array_equal(outs['Color'], ref) and hot.any() and not hot.all(),
+          str(outs['Color']))
+
+    # an array field is an array to the name check too
+    _refused('a swizzle of an array field (it is indexed first)',
+             _body('    S s;\n    Color = vec4(s.p.xyz, 1.0);\n', _S),
+             "line 5: 'xyz' of vec3[2]: an array is indexed first")
+
+
+def _struct_type(name):
+    from ..shaders.interp import struct_type
+    return struct_type(name)
+
+
+def test_signed_integers_divide_to_an_integer():
+    """`int a = 7; int b = 2; int c = a / b;` gave 3.5 and `-a / b` -3.5,
+    with no error: the `/` of two ints kept NumPy's float quotient, typed
+    int. A driver -- which compiles the same text when the shader is
+    inlined in the deferred pass -- cuts the quotient toward zero: 3, -3.
+    `uint` division was already right."""
+    reported = [
+        ('7 / 2 and -7 / 2',
+         _body('    int a = 7;\n    int b = 2;\n    int c = a / b;\n'
+               '    int d = -a / b;\n'
+               '    Color = vec4(float(c), float(d), float(a / -b), '
+               'float(-a / -b));\n'), [3, -3, -3, 3]),
+        ('ivec2(7, 9) / 2',
+         _body('    ivec2 e = ivec2(7, 9) / 2;\n'
+               '    ivec2 g = 19 / ivec2(7, -9);\n'
+               '    Color = vec4(e, g);\n'), [3, 4, 2, -2]),
+        ('7 / 2 * 2 (it gave 7)',
+         _body('    Color = vec4(float(7 / 2 * 2), float(7 - 7 / 2 * 2), '
+               '1 / 2, float(1 / 2 + 1 / 2));\n'), [6, 1, 0, 0]),
+    ]
+    for what, src, want in reported:
+        got, err = _first(src)
+        check(f'int division: {what} (the reported shader)',
+              got is not None and np.array_equal(got, want),
+              str(err if got is None else got))
+
+    fine = [
+        ('a compound assignment, a vector divided by a vector',
+         _body('    int a = 17;\n    a /= 5;\n'
+               '    ivec3 v = ivec3(17, -17, 6) / ivec3(5, 5, -4);\n'
+               '    Color = vec4(float(a), v);\n'), [3, 3, -3, -1]),
+        ('a float on either side is a float quotient, as it was',
+         _body('    int a = 7;\n    float h = 2.0;\n'
+               '    Color = vec4(a / h, h / a, float(a) / 2.0, '
+               'float(a / 2) / 2.0);\n'), [3.5, 2.0 / 7.0, 3.5, 1.5]),
+        ('uint division is as it was',
+         _body('    uint a = 7u;\n    uint big = 0xffffffffu;\n'
+               '    Color = vec4(float(a / 2u), float(big / 0x10000u), '
+               'float(a / 7u), float((a - 8u) / 0x80000000u));\n'),
+         [3, 65535, 1, 1]),
+        ('a quotient indexes, counts a loop and addresses a texel',
+         _body('    float a[4] = float[4](0.25, 0.5, 0.75, 1.0);\n'
+               '    int n = 7;\n    float acc = 0.0;\n'
+               '    for (int i = 0; i < n / 2; i++) { acc += 1.0; }\n'
+               '    int t = 29;\n    ivec2 at = ivec2(t % 8, t / 8);\n'
+               '    Color = vec4(a[n / 2], acc, at);\n'),
+         [1.0, 3, 5, 3]),
+        ('the HLSL dialect',
+         'out float4 Color;\nvoid main() {\n    int a = 7;\n'
+         '    int2 v = int2(7, -9) / 2;\n'
+         '    Color = float4(a / 2, -a / 2, v);\n}\n', [3, -3, 3, -4]),
+    ]
+    for what, src, want in fine:
+        got, err = _first(src, 'HLSL' if 'float4' in src else 'GLSL')
+        check(f'int division: {what}',
+              got is not None and np.allclose(got, want, atol=1e-6),
+              str(err if got is None else got))
+
+    # the rule itself, on every pair of -12 .. 12: the quotient is cut
+    # toward zero, lane by lane, and what it is stored as is an int
+    src = ('in vec3 vPosition;\nout int Q;\nout ivec2 QV;\nout vec4 Color;\n'
+           'void main() {\n    int a = int(vPosition.x);\n'
+           '    int b = int(vPosition.y);\n    Q = a / b;\n'
+           '    QV = ivec2(a, -a) / ivec2(b, 3);\n    int c = a;\n'
+           '    c /= b;\n'
+           '    Color = vec4(float(c), float(a / b * b + (a - a / b * b)), '
+           'float(a) / float(b), 1.0);\n}\n')
+    vals = [(a, b) for a in range(-12, 13) for b in range(-12, 13)]
+    p = np.zeros((len(vals), 3), np.float32)
+    p[:, :2] = vals
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')      # a zero divisor stays silent
+        outs, _, _ = run(src, inputs={'position': p}, n=len(vals))
+    a, b = np.array(vals).T
+    live = b != 0
+    cut = np.array([int(x / y) for x, y in np.array(vals)[live]])
+    check(f'int division: all {int(live.sum())} pairs of -12 .. 12 with a '
+          'divisor are cut toward zero (and the lanes that divide by zero '
+          'raise no warning)',
+          np.array_equal(outs['Q'][live], cut)
+          and np.array_equal(outs['QV'][live, 0], cut)
+          and np.array_equal(outs['QV'][:, 1],
+                             [int(-x / 3) for x in a])
+          and np.array_equal(outs['Color'][live, 0], cut)
+          and np.array_equal(outs['Color'][live, 1], a[live])
+          and np.allclose(outs['Color'][live, 2], a[live] / b[live])
+          and (cut != np.floor(a[live] / b[live])).any()
+          and (cut != np.round(a[live] / b[live])).any(),
+          str(outs['Q'][:12]))
+
+    # the cut is all that changes. A quotient that had no fraction is the
+    # number it was, held as it was: a float vector built from it computes
+    # at float32 as it did (held as an int32 the same chain would run in
+    # float64 -- the 0.1 * 0.7 below rounds the other way there)
+    got, err = _first(_body(
+        '    int n = 6;\n    vec2 g = vec2(n / 2, n / 2) * 0.1 * 0.7;\n'
+        '    Color = vec4(g, float(n / 2), float(n / 3 * 3));\n'))
+    chain = np.float32(np.float32(3.0) * np.float32(0.1)) * np.float32(0.7)
+    wide = np.float32(3.0 * float(np.float32(0.1)) * float(np.float32(0.7)))
+    check('int division: an exact quotient moves nothing computed from it '
+          '(vec2(n / 2, n / 2) * 0.1 * 0.7, bit for bit)',
+          got is not None and chain != wide
+          and np.array_equal(got, np.array([chain, chain, 3.0, 6.0],
+                                           np.float32)),
+          str(err if got is None else [float(v) for v in got]))
+
+    # the ends of the range, compared as ints inside the shader (a float
+    # output cannot hold them)
+    got, err = _first(_body(
+        '    int big = 2147483647;\n    int low = -2147483647 - 1;\n'
+        '    Color = vec4(big / 2 == 1073741823, low / 2 == -1073741824, '
+        'big / -big == -1 && low / big == -1, big / 3 * 3 == big - 1);\n'))
+    check('int division: exact at the ends of the 32-bit range',
+          got is not None and np.array_equal(got, [1, 1, 1, 1]),
+          str(err if got is None else got))
+
+
+
 def main():
     from . import utf8_console
     utf8_console()
