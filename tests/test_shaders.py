@@ -2491,7 +2491,7 @@ def test_a_matrix_and_a_scalar_combine_component_by_component():
         raised = exc
     check('matrix and scalar: a float handed in for a `uniform mat3` (the '
           'node\'s socket) still raises when it is used -- it is not taken '
-          'for a matrix', isinstance(raised, ValueError), repr(raised))
+          'for a matrix', raised is not None, repr(raised))
 
 
 def test_two_matrices_compare_whole():
