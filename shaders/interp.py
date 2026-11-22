@@ -328,7 +328,7 @@ class Interpreter:
         if k == 'block':
             return self.block(node, mask, scope, flags, n)
         if k == 'expr':
-            self.expr(node[1], mask, scope, flags, n)
+            self.effect(node[1], mask, scope, flags, n)
             return mask
         if k == 'decl':
             gtype = node[1]
@@ -406,11 +406,25 @@ class Interpreter:
             flags.cont = saved_cont
             if step is not None and step[0] != 'nop':
                 if active.any():
-                    self.expr(step, active, sc, flags, n)
+                    self.effect(step, active, sc, flags, n)
         flags.brk = saved_brk
         return flags.live(mask)
 
     # ------------------------------------------------------- expressions
+    def effect(self, node, mask, scope, flags, n):
+        """An expression evaluated for what it writes -- a statement, the
+        step of a `for`, the left of a comma. Nothing reads its value, so
+        an assignment is told not to read back what it wrote (`store`):
+        `v.xyz = w;` does the work it always did."""
+        k = node[0]
+        if k == 'assign':
+            self.assign(node, mask, scope, flags, n, False)
+        elif k == 'seq':
+            self.effect(node[1], mask, scope, flags, n)
+            self.effect(node[2], mask, scope, flags, n)
+        else:
+            self.expr(node, mask, scope, flags, n)
+
     def expr(self, node, mask, scope, flags, n):
         k = node[0]
         if k == 'num':
@@ -444,7 +458,7 @@ class Interpreter:
             # the comma operator: the left side for what it writes, the
             # right side for the value (`for (...; i++, b += 1.0)`). The
             # parser has always built the node; the interpreter had no case
-            self.expr(node[1], mask, scope, flags, n)
+            self.effect(node[1], mask, scope, flags, n)
             return self.expr(node[2], mask, scope, flags, n)
         if k == 'arrinit':
             et = BY_NAME.get(node[1])
@@ -479,7 +493,7 @@ class Interpreter:
             cur, t = self.expr(target, mask, scope, flags, n)
             delta = np.ones(n, np.float32) * (1.0 if op == '++' else -1.0)
             newv = self.coerce(cur + self.coerce(delta, FLOAT, t, n), t, t, n)
-            self.store(target, newv, t, mask, scope, flags, n)
+            self.store(target, newv, t, mask, scope, flags, n, False)
             return (cur if k == 'post' else newv), t
         if k == 'un':
             op, operand = node[1], node[2]
@@ -490,7 +504,7 @@ class Interpreter:
                 delta = np.ones(n, np.float32) * (1.0 if op == '++' else -1.0)
                 newv = self.coerce(cur + self.coerce(delta, FLOAT, t, n),
                                    t, t, n)
-                self.store(operand, newv, t, mask, scope, flags, n)
+                self.store(operand, newv, t, mask, scope, flags, n, False)
                 return newv, t
             v, t = self.expr(operand, mask, scope, flags, n)
             if op == '-':
@@ -513,9 +527,18 @@ class Interpreter:
         raise ShaderError(f'unsupported expression {k!r}')
 
     def binary(self, node, mask, scope, flags, n):
-        op = node[1]
         a, at = self.expr(node[2], mask, scope, flags, n)
         b, bt = self.expr(node[3], mask, scope, flags, n)
+        return self.combine(node[1], a, at, b, bt, n)
+
+    def combine(self, op, a, at, b, bt, n):
+        """`a op b` of two values already evaluated: (value, type).
+
+        The whole of a binary operator but the evaluation of its two
+        sides, which `binary` does for an operator written in the source
+        and `assign` for a compound assignment -- where the left side is
+        the target as it stands and the right side has been evaluated
+        once already."""
         if op in ('&&', 'and'):
             return rt.to_bool(a) & rt.to_bool(b), BOOL
         if op in ('||', 'or'):
@@ -594,17 +617,33 @@ class Interpreter:
             r = r.astype(np.int64) & 0xffffffff
         return r, t
 
-    def assign(self, node, mask, scope, flags, n):
+    def assign(self, node, mask, scope, flags, n, used=True):
+        """(value, type) of an assignment -- (None, None) when `used` is
+        False: the caller reads no value (`effect`)."""
         op, target, value = node[1], node[2], node[3]
-        v, vt = self.expr(value, mask, scope, flags, n)
-        if op != '=':
-            # the target's indices once, for the read and the write alike
-            # (`a[i++] += x` names one element)
-            target = self.hold(target, mask, scope, flags, n)
-            cur, ct = self.expr(target, mask, scope, flags, n)
-            v, vt = self.binary(('bin', op[:-1], target, value), mask, scope,
-                                flags, n)
-        return self.store(target, v, vt, mask, scope, flags, n)
+        if op == '=':
+            v, vt = self.expr(value, mask, scope, flags, n)
+            return self.store(target, v, vt, mask, scope, flags, n, used)
+        # `target op= value`: every expression in it is evaluated ONCE.
+        # It ran as the binary node `target op value` after the right side
+        # had been evaluated for nothing, so the right side ran twice and
+        # whatever it wrote -- `x += float(i++)`, an assignment, a call
+        # that writes an out argument or a global -- was written twice
+        # (and every `acc += f()` in a loop paid for `f()` twice).
+        #
+        # The order is the one the values that were USED came out of, so a
+        # right side that writes nothing gives the same bits: the target's
+        # indices first (`a[i++] += float(i)` adds the `i` the index left
+        # behind -- the left of an assignment is evaluated before its
+        # right), then the right side, then the target is read, after
+        # whatever the right side wrote to it (`x += (x = 5.0)` is 10).
+        # It is the order glslang emits: the l-value, the right side, the
+        # load of the left, the operation, the store.
+        target = self.hold(target, mask, scope, flags, n)
+        b, bt = self.expr(value, mask, scope, flags, n)
+        a, at = self.expr(target, mask, scope, flags, n)
+        v, vt = self.combine(op[:-1], a, at, b, bt, n)
+        return self.store(target, v, vt, mask, scope, flags, n, used)
 
     def hold(self, target, mask, scope, flags, n):
         """The same assignment target with every index it is reached
@@ -633,7 +672,15 @@ class Interpreter:
             return target
         return ('index', inner, idx)
 
-    def store(self, target, value, vtype, mask, scope, flags, n):
+    def store(self, target, value, vtype, mask, scope, flags, n, used=True):
+        """Write `value` to the target, for the lanes of `mask`. Returns the
+        value of the assignment: (what a read of the target now finds, its
+        type) -- whatever the target is reached through.
+
+        With `used` False nothing will read that value and the branches
+        that would have to compute it answer (None, None): a statement, ++,
+        an out argument written back, and each write on the way to a nested
+        target (`a[i].y = x` writes `a[i]` back) pay for no read."""
         k = target[0]
         if k in ('member', 'index'):
             # every index on the way to the target, once (`hold`). A caller
@@ -660,15 +707,22 @@ class Interpreter:
                 merged[field] = rt.sel(mask, self.coerce(value, vtype, ft, n),
                                        base[field])
                 self.store(target[1], merged, bt, np.ones(n, bool), scope,
-                           flags, n)
+                           flags, n, False)
                 return merged[field], ft
             idx = swizzle_indices(field)
             if idx is None:
                 raise ShaderError(f'bad swizzle {field!r}')
-            updated = rt.sw_set(base, idx, value)
-            self.store(target[1], rt.sel(mask, updated, base), bt,
-                       np.ones(n, bool), scope, flags, n)
-            return base, bt
+            merged = rt.sel(mask, rt.sw_set(base, idx, value), base)
+            self.store(target[1], merged, bt, np.ones(n, bool), scope,
+                       flags, n, False)
+            if not used:
+                return None, None
+            # the value of the assignment is the components written, as a
+            # read of the target finds them now -- what `var`, a field, an
+            # element and a column answer. This answered `base, bt`: the
+            # whole vector as it was BEFORE the write, typed as the vector,
+            # so `a.x = b.x = 1.0` gave `a.x` the old `b.x`
+            return rt.sw(merged, idx), GType(bt.base, len(idx))
         if k == 'index':
             base, bt = self.expr(target[1], mask, scope, flags, n)
             i, _it = self.expr(target[2], mask, scope, flags, n)
@@ -680,8 +734,10 @@ class Interpreter:
                 for j, hit in self.indexed(target[2], i, len(items), bt,
                                            mask):
                     items[j] = rt.sel(hit, value, items[j])
-                self.store(target[1], items, bt, everyone, scope, flags, n)
-                return self.subscript(items, bt, i, n)
+                self.store(target[1], items, bt, everyone, scope, flags, n,
+                           False)
+                return self.subscript(items, bt, i, n) if used \
+                    else (None, None)
             if bt.is_matrix:
                 # a column of the one array a matrix is (it was a Python
                 # list of columns here, and an array where it was built)
@@ -690,13 +746,19 @@ class Interpreter:
                 m = base
                 for j, hit in self.indexed(target[2], i, bt.n, bt, mask):
                     m = rt.sel(hit, rt.col_set(base, j, column), m)
-                self.store(target[1], m, bt, everyone, scope, flags, n)
-                return self.subscript(m, bt, i, n)
+                self.store(target[1], m, bt, everyone, scope, flags, n,
+                           False)
+                return self.subscript(m, bt, i, n) if used else (None, None)
             updated = base
             for j, hit in self.indexed(target[2], i, bt.n, bt, mask):
                 updated = rt.sel(hit, rt.sw_set(base, [j], value), updated)
-            self.store(target[1], updated, bt, everyone, scope, flags, n)
-            return base, bt
+            self.store(target[1], updated, bt, everyone, scope, flags, n,
+                       False)
+            if not used:
+                return None, None
+            # the component written, read back through the same index (it
+            # answered the vector as it was, as the swizzle above did)
+            return self.subscript(updated, bt, i, n)
         raise ShaderError(f'cannot assign to {k!r}')
 
     def indexed(self, node, i, count, bt, mask):
@@ -841,7 +903,8 @@ class Interpreter:
         for target, pname, ptype in writeback:
             slot = inner.get(pname)
             if slot is not None:
-                self.store(target, slot[0], ptype, mask, scope, flags, n)
+                self.store(target, slot[0], ptype, mask, scope, flags, n,
+                           False)
         return result, rtype
 
     def invoke(self, fn, values, mask, flags, n):

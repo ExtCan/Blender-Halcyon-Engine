@@ -2092,6 +2092,782 @@ def test_signed_integers_divide_to_an_integer():
           str(err if got is None else got))
 
 
+# ------------------------------------------------------------- assignments
+#
+# R253 (review): two wrong values in how an assignment is evaluated, both
+# listed under "Seen and left" by the round above. Neither raised. Each
+# shader named "the reported shader" below is the text the defect was
+# reproduced with; the comment over each test says what the run did with it.
+
+#: functions that write when they are called: a global, an out argument,
+#: an inout argument (the seed of a random number)
+_WRITERS = ('int calls = 0;\nfloat g = 0.0;\n'
+            'float one() { calls += 1; return 1.0; }\n'
+            'float bump() { g += 1.0; return g; }\n'
+            'float into(out float o) { calls += 1; o = float(calls); '
+            'return 0.5; }\n'
+            'float next(inout int s) { s = s * 5 + 1; return float(s); }\n')
+
+#: `int j = 3; int a = 52; a OP j++;` -- what a holds, per operator. (With
+#: the right side evaluated twice it was 52 OP 4, and j 5.)
+_COMPOUND = {'+=': 55, '-=': 49, '*=': 156, '/=': 17, '%=': 1, '&=': 0,
+             '|=': 55, '^=': 55, '<<=': 416, '>>=': 6}
+
+
+def test_a_compound_assignment_evaluates_its_right_side_once():
+    """`int i = 0; float x = 0.0; x += float(i++);` compiled, raised
+    nothing, added 1 and left `i` at 2. `Interpreter.assign` evaluated the
+    right side, then ran `x + float(i++)` as a binary node -- which
+    evaluated it again. Whatever the right side wrote, it wrote twice, and
+    every `acc += f()` in a loop called `f` twice."""
+    reported = _body('    int i = 0;\n    float x = 0.0;\n'
+                     '    x += float(i++);\n'
+                     '    Color = vec4(x, float(i), 0.0, 0.0);\n')
+    bad = []
+    for n in (1, 2, 3, 4, 7):
+        got, err = _first(reported, n=n)
+        if got is None or not np.array_equal(got, [0, 1, 0, 0]):
+            bad.append(f'{n} lanes: {err if got is None else got}')
+    check('compound assignment: x += float(i++) adds 0 and leaves i at 1 '
+          '(the reported shader, at 1, 2, 3, 4 and 7 lanes)', not bad,
+          '; '.join(bad))
+
+    fine = [
+        ('-= of a pre-decrement',
+         _body('    int i = 3;\n    float x = 10.0;\n    x -= float(--i);\n'
+               '    Color = vec4(x, float(i), 0.0, 0.0);\n'), [8, 2, 0, 0]),
+        ('an assignment on the right, written once (x += (y += 1.0), then '
+         'x += y += 1.0)',
+         _body('    float y = 0.0;\n    float x = 0.0;\n'
+               '    x += (y += 1.0);\n    x += y += 1.0;\n'
+               '    Color = vec4(x, y, 0.0, 0.0);\n'), [3, 2, 0, 0]),
+        ('a call that writes a global',
+         _body('    float x = 0.0;\n    x += bump();\n    x += bump();\n'
+               '    Color = vec4(x, g, 0.0, 0.0);\n', _WRITERS),
+         [3, 2, 0, 0]),
+        ('a call that writes an out argument',
+         _body('    float o = 0.0;\n    float x = 0.0;\n    x += into(o);\n'
+               '    Color = vec4(x, o, float(calls), 0.0);\n', _WRITERS),
+         [0.5, 1, 1, 0]),
+        ('a call that advances an inout argument (the seed of a random '
+         'number, summed in a loop)',
+         _body('    int s = 1;\n    float acc = 0.0;\n'
+               '    for (int i = 0; i < 3; i++) { acc += next(s); }\n'
+               '    Color = vec4(acc, float(s), 0.0, 0.0);\n', _WRITERS),
+         [193, 156, 0, 0]),
+        ('acc += one() three times calls one() three times',
+         _body('    float acc = 0.0;\n'
+               '    for (int i = 0; i < 3; i++) { acc += one(); }\n'
+               '    Color = vec4(acc, float(calls), 0.0, 0.0);\n', _WRITERS),
+         [3, 3, 0, 0]),
+        ('the step of a for (i += k++)',
+         _body('    int k = 1;\n    int c = 0;\n'
+               '    for (int i = 0; i < 9; i += k++) { c++; }\n'
+               '    Color = vec4(float(c), float(k), 0.0, 0.0);\n'),
+         [4, 5, 0, 0]),
+        ('a vector, each component of the right side evaluated once',
+         _body('    vec3 v = vec3(1.0);\n    int i = 1;\n'
+               '    v *= vec3(float(i++), float(i++), float(i++));\n'
+               '    Color = vec4(v, float(i));\n'), [1, 2, 3, 4]),
+        ('the HLSL dialect',
+         'out float4 Color;\nvoid main() {\n    float x = 0;\n'
+         '    int i = 0;\n    x += i++;\n    x += i++;\n'
+         '    Color = float4(x, i, 0, 0);\n}\n', [1, 2, 0, 0]),
+    ]
+    for what, src, want in fine:
+        got, err = _first(src, 'HLSL' if 'float4' in src else 'GLSL')
+        check(f'compound assignment: {what}',
+              got is not None and np.array_equal(got, want),
+              str(err if got is None else got))
+
+    # an operator written in the source goes through the same arithmetic
+    # (`combine`) and evaluates each of its sides once, as it did
+    got, err = _first(_body(
+        '    int i = 0;\n    float x = float(i++) - float(i++) * 4.0;\n'
+        '    float y = one() * 2.0 + one();\n'
+        '    Color = vec4(x, float(i), y, float(calls));\n', _WRITERS))
+    check('compound assignment: a binary operator still evaluates each '
+          'side once, left then right',
+          got is not None and np.array_equal(got, [-4, 2, 3, 2]),
+          str(err if got is None else got))
+
+    # every compound operator the parser knows, the same slip in each
+    from ..shaders.parser import ASSIGN_OPS
+    ops = [op for op in ASSIGN_OPS if op != '=']
+    bad = []
+    for op in ops:
+        got, err = _first(_body(
+            f'    int j = 3;\n    int a = 52;\n    a {op} j++;\n'
+            '    Color = vec4(float(a), float(j), 0.0, 0.0);\n'))
+        if got is None or not np.array_equal(got, [_COMPOUND.get(op), 4,
+                                                   0, 0]):
+            bad.append(f'{op}: {err if got is None else got}')
+    check(f'compound assignment: all {len(ops)} operators the parser knows '
+          'evaluate `j++` on the right once',
+          not bad and set(ops) == set(_COMPOUND), '; '.join(bad))
+
+    # every kind of target
+    struct = 'struct S { float f; vec2 p[2]; };\n'
+    targets = [
+        ('a swizzle',
+         '    vec3 v = vec3(10.0);\n'
+         '    v.zx += vec2(float(i++), float(i++));\n'
+         '    Color = vec4(v, float(i));\n', [12, 10, 11, 3]),
+        ('a component',
+         '    vec3 v = vec3(10.0);\n    v[1] += float(i++);\n'
+         '    Color = vec4(v, float(i));\n', [10, 11, 10, 2]),
+        ('a component through a variable index',
+         '    vec3 v = vec3(10.0);\n    int c = 2;\n'
+         '    v[c] += float(i++);\n    Color = vec4(v, float(i));\n',
+         [10, 10, 11, 2]),
+        ('an element of an array',
+         '    float a[3] = float[3](10.0, 20.0, 30.0);\n'
+         '    a[2] += float(i++);\n'
+         '    Color = vec4(a[0], a[1], a[2], float(i));\n', [10, 20, 31, 2]),
+        ('a column of a matrix',
+         '    mat2 m = mat2(10.0);\n    m[1] += vec2(float(i++));\n'
+         '    Color = vec4(m[1], m[0].x, float(i));\n', [1, 11, 10, 2]),
+        ('a field of a struct',
+         '    S s;\n    s.f = 10.0;\n    s.f += float(i++);\n'
+         '    Color = vec4(s.f, float(i), 0.0, 0.0);\n', [11, 2, 0, 0]),
+        ('a component of an element of a field, twice',
+         '    S s;\n    s.p[1].y += float(i++);\n'
+         '    s.p[1].y += float(i++);\n'
+         '    Color = vec4(s.p[1], s.p[0].y, float(i));\n', [0, 3, 0, 3]),
+    ]
+    for what, stmts, want in targets:
+        got, err = _first(_body('    int i = 1;\n' + stmts, struct))
+        check(f'compound assignment: into {what}',
+              got is not None and np.array_equal(got, want),
+              str(err if got is None else got))
+
+    # the order. The target's indices come first (`hold`): the left of an
+    # assignment is evaluated before its right, so the index is the `i` the
+    # right side has not moved yet, and a right side reads the `i` the
+    # index left behind -- which is the value it was given before, by the
+    # second evaluation. Then the right side, then the target is read:
+    # what the right side wrote to the target is in the sum (glslang emits
+    # the l-value, the right side, the load, the operation, the store).
+    arr = ('    float a[3] = float[3](10.0, 20.0, 30.0);\n    int i = 1;\n',
+           '    Color = vec4(a[0], a[1], a[2], float(i));\n')
+    order = [
+        ('a[i] += float(i++) writes the element i named before the ++',
+         _body(arr[0] + '    a[i] += float(i++);\n' + arr[1]),
+         [10, 21, 30, 2]),
+        ('a[i++] += float(i) adds the i the index left (as it did: a right '
+         'side that writes nothing)',
+         _body(arr[0] + '    a[i++] += float(i);\n' + arr[1]),
+         [10, 22, 30, 2]),
+        ('a[i++] += float(i++)',
+         _body(arr[0] + '    a[i++] += float(i++);\n' + arr[1]),
+         [10, 22, 30, 3]),
+        ('x += (x = 5.0) reads x after the right side wrote it',
+         _body('    float x = 1.0;\n    x += (x = 5.0);\n'
+               '    Color = vec4(x, 0.0, 0.0, 0.0);\n'), [10, 0, 0, 0]),
+        ('x += x++',
+         _body('    float x = 1.0;\n    x += x++;\n'
+               '    Color = vec4(x, 0.0, 0.0, 0.0);\n'), [3, 0, 0, 0]),
+        ('g += bump(), the global the call writes',
+         _body('    g += bump();\n    Color = vec4(g, 0.0, 0.0, 0.0);\n',
+               _WRITERS), [2, 0, 0, 0]),
+        ('x += into(x), the out argument the call writes',
+         _body('    float x = 0.0;\n    x += into(x);\n'
+               '    Color = vec4(x, float(calls), 0.0, 0.0);\n', _WRITERS),
+         [1.5, 1, 0, 0]),
+    ]
+    for what, src, want in order:
+        got, err = _first(src)
+        check(f'compound assignment, the order: {what}',
+              got is not None and np.array_equal(got, want),
+              str(err if got is None else got))
+
+    # per lane: a right side that writes, under a loop whose trip count
+    # differs by lane and under a branch some lanes take
+    src = ('in vec3 vPosition;\nout vec4 Color;\nout vec4 More;\n'
+           'int calls = 0;\n'
+           'float next(inout int s) { calls += 1; s = s * 5 + 1; '
+           'return float(s % 7); }\n'
+           'void main() {\n    int k = int(vPosition.x);\n'
+           '    float f = vPosition.y;\n    int s = k + 1;\n'
+           '    int i = 0;\n    float acc = 0.0;\n    float x = 0.0;\n'
+           '    vec3 v = vec3(0.0);\n'
+           '    for (int j = 0; j < k; j++) { acc += next(s); }\n'
+           '    if (f > 1.0) { x += float(i++) + 0.5; '
+           'v.yz -= vec2(float(++i)); }\n'
+           '    Color = vec4(acc, float(s), float(calls), x);\n'
+           '    More = vec4(v, float(i));\n}\n')
+    p = _lanes(12, 4)
+    outs, _, _ = run(src, inputs={'position': p}, n=12)
+    want_c, want_m = [], []
+    for k, f in p[:, :2]:
+        s, i, acc, x, v, calls = int(k) + 1, 0, 0.0, 0.0, [0.0] * 3, 0
+        for _ in range(int(k)):
+            calls += 1
+            s = s * 5 + 1
+            acc += s % 7
+        if f > 1.0:
+            x += i + 0.5
+            i += 2
+            v[1] -= i
+            v[2] -= i
+        want_c.append([acc, s, calls, x])
+        want_m.append(v + [i])
+    hot = p[:, 1] > 1.0
+    check('compound assignment: per lane -- a seed advanced once a pass '
+          'under a per-lane trip count, ++ on the right under a branch',
+          np.array_equal(outs['Color'], np.array(want_c, np.float32))
+          and np.array_equal(outs['More'], np.array(want_m, np.float32))
+          and hot.any() and not hot.all(), str(outs['Color'][:5]))
+
+    # the cost: a function on the right is called once for each pass of
+    # the loop (it was called twice -- and so was everything inside it)
+    src = _body('    float acc = 0.0;\n    for (int i = 0; i < 5; i++) '
+                '{ acc += heavy(float(i)); }\n    Color = vec4(acc);\n',
+                'float heavy(float x) { return x * x; }\n')
+    prog, err = try_compile(src)
+    called, outs = [], {}
+    if prog is not None:
+        inner = prog.interp.call_user
+
+        def counted(fn, *args):
+            called.append(fn[2])
+            return inner(fn, *args)
+        prog.interp.call_user = counted
+        try:
+            outs = prog.run({}, {}, 4)[0]
+        finally:
+            del prog.interp.call_user
+    check('compound assignment: acc += heavy(x) over five passes calls '
+          'heavy five times (it called it ten times)',
+          called == ['heavy'] * 5 and 'Color' in outs
+          and np.array_equal(outs['Color'][0], [30, 30, 30, 30]),
+          str(err or f'{len(called)} calls'))
+
+    # a right side that writes nothing is the number it was, to the bit:
+    # each step below is one float32 operation, held against NumPy's
+    src = ('in vec3 vPosition;\nout vec4 Color;\nout vec4 Vec;\n'
+           'out vec4 Ints;\nvoid main() {\n'
+           '    float x = vPosition.x * 0.1;\n    x += 0.7;\n'
+           '    x *= 0.3;\n    x -= vPosition.y;\n    x /= 0.7;\n'
+           '    vec3 v = vec3(x, 0.1, 0.7);\n    v *= 0.3;\n'
+           '    v += vec3(0.1, x, 0.7);\n    v /= vec3(0.7, 3.0, 0.3);\n'
+           '    v -= 0.05;\n'
+           '    int a = 17 + int(vPosition.x);\n    a /= 5;\n    a *= 7;\n'
+           '    a %= 4;\n    a <<= 3;\n    a |= 5;\n    a ^= 3;\n'
+           '    a &= 30;\n    a >>= 1;\n    a += 2;\n    a -= 9;\n'
+           '    uint u = 0xffffffffu;\n    u += 2u;\n    u *= 3u;\n'
+           '    Color = vec4(x, v);\n    Vec = vec4(v, 1.0);\n'
+           '    Ints = vec4(float(a), float(u), 0.0, 1.0);\n}\n')
+    p = _lanes(9, 9)
+    outs, _, _ = run(src, inputs={'position': p}, n=9)
+    f32 = np.float32
+    x = p[:, 0] * f32(0.1)
+    x = (((x + f32(0.7)) * f32(0.3)) - p[:, 1]) / f32(0.7)
+    v = np.stack([x, np.full(9, 0.1, f32), np.full(9, 0.7, f32)], 1)
+    v = v * f32(0.3)
+    v = v + np.stack([np.full(9, 0.1, f32), x, np.full(9, 0.7, f32)], 1)
+    v = v / np.array([0.7, 3.0, 0.3], f32)
+    v = v - f32(0.05)
+    ints = []
+    for k in p[:, 0].astype(int):
+        a = int((17 + k) / 5) * 7 % 4
+        a = ((((a << 3) | 5) ^ 3) & 30) >> 1
+        ints.append([a + 2 - 9, 3, 0, 1])
+    check('compound assignment: a right side that writes nothing gives the '
+          'same bits (float, vector, int and uint chains against NumPy '
+          'float32, operation for operation)',
+          outs['Color'].dtype == np.float32
+          and np.array_equal(outs['Color'][:, 0], x)
+          and np.array_equal(outs['Vec'][:, :3], v)
+          and np.array_equal(outs['Ints'], np.array(ints, f32))
+          and len(set(x.tolist())) == 9, str(outs['Ints'][:4]))
+
+
+def test_an_assignment_through_a_swizzle_answers_what_it_wrote():
+    """`vec3 a = vec3(0.0); vec3 b = vec3(0.25); a.x = b.x = 1.0;` compiled,
+    raised nothing and left a.x at 0.25. The value of `b.x = 1.0` was the
+    whole of `b` as it stood BEFORE the write, typed vec3: `store` returned
+    its base for a swizzle and for a component of a vector, where a
+    variable, a field, an element and a column return what was written."""
+    reported = _body('    vec3 a = vec3(0.0);\n    vec3 b = vec3(0.25);\n'
+                     '    a.x = b.x = 1.0;\n'
+                     '    Color = vec4(a.x, b.x, 0.0, 0.0);\n')
+    bad = []
+    for n in (1, 2, 3, 4, 7):
+        got, err = _first(reported, n=n)
+        if got is None or not np.array_equal(got, [1, 1, 0, 0]):
+            bad.append(f'{n} lanes: {err if got is None else got}')
+    check('assignment value: a.x = b.x = 1.0 writes 1 to both (the '
+          'reported shader, at 1, 2, 3, 4 and 7 lanes)', not bad,
+          '; '.join(bad))
+
+    ab = '    vec3 a = vec3(0.0);\n    vec3 b = vec3(0.25);\n'
+    struct = 'struct S { float f; };\n'
+    fine = [
+        ('two components (a.xy = b.yz = v)',
+         _body(ab + '    a.xy = b.yz = vec2(0.5, 0.75);\n'
+               '    Color = vec4(a.xy, b.yz);\n'), [0.5, 0.75, 0.5, 0.75]),
+        ('a chain of three into one vector',
+         _body(ab + '    a.x = a.y = a.z = 0.5;\n'
+               '    Color = vec4(a, 1.0);\n'), [0.5, 0.5, 0.5, 1]),
+        ('a component by a number (a[1] = b[2] = 1.0)',
+         _body(ab + '    a[1] = b[2] = 1.0;\n'
+               '    Color = vec4(a.y, b.z, a.x, b.x);\n'), [1, 1, 0, 0.25]),
+        ('a component through a variable index',
+         _body(ab + '    int i = 1;\n    int j = 2;\n'
+               '    a[i] = b[j] = 1.0;\n'
+               '    Color = vec4(a.y, b.z, a.x, b.x);\n'), [1, 1, 0, 0.25]),
+        ('initialising a float',
+         _body(ab + '    float f = (b.x = 0.5);\n'
+               '    Color = vec4(f, b, 0.0).xyzy;\n'), [0.5, 0.5, 0.25, 0.5]),
+        ('its type is the swizzle\'s: a vec2 times a float',
+         _body(ab + '    vec2 c = (b.yz = vec2(0.5, 1.0)) * 2.0;\n'
+               '    Color = vec4(c, b.yz);\n'), [1, 2, 0.5, 1]),
+        ('...a vec2 plus it (the run raised: cannot combine vec2 with vec3)',
+         _body('    vec2 p = vec2(1.0);\n    vec3 a = vec3(0.0);\n'
+               '    vec2 c = p + (a.xy = vec2(0.5));\n'
+               '    Color = vec4(c, a.xy);\n'), [1.5, 1.5, 0.5, 0.5]),
+        ('...a matrix times it, a dot with it (the run raised from NumPy, '
+         'on the two shapes)',
+         _body('    mat2 m = mat2(2.0);\n    vec2 p = vec2(1.0, 2.0);\n'
+               '    vec3 a = vec3(0.0);\n'
+               '    vec2 c = m * (a.zy = vec2(0.5, 0.25));\n'
+               '    float d = dot(p, a.xy = vec2(0.5, 0.25));\n'
+               '    Color = vec4(c, d, a.z);\n'), [1, 0.5, 1, 0.5]),
+        ('...a swizzle of it',
+         _body(ab + '    float f = (b.zx = vec2(0.5, 0.75)).y;\n'
+               '    Color = vec4(f, b);\n'), [0.75, 0.75, 0.25, 0.5]),
+        ('...an int of an ivec3, divided as an int',
+         _body('    ivec3 k = ivec3(1);\n'
+               '    Color = vec4(float((k.x = 7) / 2), float(k.x), '
+               'float((k[1] = 9) / 2), float(k.y));\n'), [3, 7, 4, 9]),
+        ('a compound assignment (the sum, not the vector before it)',
+         _body(ab + '    float f = (b.x += 1.0);\n'
+               '    float h = (b[1] *= 3.0);\n'
+               '    Color = vec4(f, b.x, h, b.y);\n'),
+         [1.25, 1.25, 0.75, 0.75]),
+        ('in a condition',
+         _body(ab + '    float t = 0.0;\n'
+               '    if ((a.x = 0.75) > 0.5) { t = 1.0; }\n'
+               '    Color = vec4(t, a.x, 0.0, 0.0);\n'), [1, 0.75, 0, 0]),
+        ('as an argument',
+         _body(ab + '    float f = sq(b.x = 0.5);\n'
+               '    Color = vec4(f, b.x, 0.0, 0.0);\n',
+               'float sq(float x) { return x * x; }\n'), [0.25, 0.5, 0, 0]),
+        ('through a column of a matrix, by swizzle and by number',
+         _body('    mat2 m = mat2(0.0);\n    mat2 k = mat2(0.0);\n'
+               '    m[1].x = m[0].y = 2.0;\n    k[1][0] = k[0][1] = 3.0;\n'
+               '    Color = vec4(m[0].y, m[1].x, k[0].y, k[1].x);\n'),
+         [2, 2, 3, 3]),
+        ('a chain across a field, a swizzle and a component of an element',
+         _body('    S s;\n    vec3 a = vec3(0.0);\n    vec2 arr[2];\n'
+               '    s.f = a.x = arr[1].y = 0.5;\n'
+               '    Color = vec4(s.f, a.x, arr[1].y, arr[1].x);\n', struct),
+         [0.5, 0.5, 0.5, 0]),
+        ('an int written into a float vector',
+         _body(ab + '    a.x = b.x = 1;\n'
+               '    Color = vec4(a.x, b.x, a.y, b.y);\n'), [1, 1, 0, 0.25]),
+        ('every component in order (c = a.xyz = b)',
+         _body('    vec3 a = vec3(0.0);\n'
+               '    vec3 b = vec3(0.25, 0.5, 0.75);\n'
+               '    vec3 c = a.xyz = b;\n    Color = vec4(c, a.x);\n'),
+         [0.25, 0.5, 0.75, 0.25]),
+        ('what was written, converted to the target (HLSL: 2.5 into an '
+         'int3 is 2)',
+         'out float4 Color;\nvoid main() {\n    int3 k = int3(1, 1, 1);\n'
+         '    float f = (k.x = 2.5);\n    float h = (k[1] = 3.5);\n'
+         '    Color = float4(f, k.x, h, k.y);\n}\n', [2, 2, 3, 3]),
+        ('the HLSL dialect',
+         'out float4 Color;\nvoid main() {\n'
+         '    float3 a = float3(0, 0, 0);\n'
+         '    float3 b = float3(0.25, 0.25, 0.25);\n'
+         '    a.x = b.x = 1;\n    a.yz = b.zy = float2(0.5, 0.75);\n'
+         '    Color = float4(a, b.y);\n}\n', [1, 0.5, 0.75, 0.75]),
+    ]
+    for what, src, want in fine:
+        got, err = _first(src, 'HLSL' if 'float4' in src else 'GLSL')
+        check(f'assignment value: {what}',
+              got is not None and np.array_equal(got, want),
+              str(err if got is None else got))
+
+    # what answered the value written already, held where it was
+    was = [
+        ('a variable',
+         _body(ab + '    a = b = vec3(0.5);\n    float x = 0.0;\n'
+               '    float y = x = 0.75;\n    Color = vec4(a.x, b.y, x, y);\n'),
+         [0.5, 0.5, 0.75, 0.75]),
+        ('a field',
+         _body('    S s;\n    S t;\n    s.f = t.f = 0.5;\n'
+               '    Color = vec4(s.f, t.f, 0.0, 0.0);\n', struct),
+         [0.5, 0.5, 0, 0]),
+        ('an element and a column',
+         _body('    float r[2];\n    float q[2];\n    r[1] = q[0] = 0.5;\n'
+               '    mat2 m = mat2(0.0);\n    mat2 k = mat2(0.0);\n'
+               '    m[1] = k[0] = vec2(0.25, 0.75);\n'
+               '    Color = vec4(r[1], q[0], m[1].y, k[0].x);\n'),
+         [0.5, 0.5, 0.75, 0.25]),
+    ]
+    for what, src, want in was:
+        got, err = _first(src)
+        check(f'assignment value, as it was: {what}',
+              got is not None and np.array_equal(got, want),
+              str(err if got is None else got))
+
+    # per lane: a chain under a branch some lanes take, through an index
+    # that differs by lane
+    src = ('in vec3 vPosition;\nout vec4 Color;\nout vec4 More;\n'
+           'out vec4 Pair;\nvoid main() {\n'
+           '    int k = int(vPosition.x);\n    float f = vPosition.y;\n'
+           '    vec3 a = vec3(-1.0);\n    vec3 b = vec3(-2.0);\n'
+           '    float got = -3.0;\n    float comp = -5.0;\n'
+           '    vec2 pair = vec2(-4.0);\n    if (f > 1.0) {\n'
+           '        got = a.y = b.z = f + 0.5;\n'
+           '        pair = a.zx = b.xy = vec2(f, -f);\n'
+           '        comp = a[k] = b[2 - k] = f * 2.0;\n    }\n'
+           '    Color = vec4(a, got);\n    More = vec4(b, comp);\n'
+           '    Pair = vec4(pair, 0.0, 1.0);\n}\n')
+    p = _lanes(12, 3)
+    outs, _, _ = run(src, inputs={'position': p}, n=12)
+    want_a, want_b, want_p = [], [], []
+    for k, f in p[:, :2]:
+        a, b, got, comp, pair = [-1.0] * 3, [-2.0] * 3, -3.0, -5.0, [-4.0] * 2
+        if f > 1.0:
+            got = a[1] = b[2] = f + 0.5
+            b[0], b[1] = f, -f
+            a[2], a[0] = f, -f
+            pair = [f, -f]
+            comp = a[int(k)] = b[2 - int(k)] = f * 2.0
+        want_a.append(a + [got])
+        want_b.append(b + [comp])
+        want_p.append(pair + [0.0, 1.0])
+    hot = p[:, 1] > 1.0
+    check('assignment value: per lane -- chains through swizzles and '
+          'through a per-lane component, under a branch',
+          np.array_equal(outs['Color'], np.array(want_a, np.float32))
+          and np.array_equal(outs['More'], np.array(want_b, np.float32))
+          and np.array_equal(outs['Pair'], np.array(want_p, np.float32))
+          and hot.any() and not hot.all() and len(set(p[hot, 0])) == 3,
+          str(outs['Color'][5:8]))
+
+    # the name check types such an assignment as nothing it judges, before
+    # and now, so no text is refused that was not. A text that used the old
+    # vector as a vector -- which no driver compiles -- is told the width
+    # when a lane reaches it (it ran, on the vector before the write)
+    got, err = _first(_body(ab + '    vec3 c = b + (a.xy = vec2(0.5));\n'
+                            '    Color = vec4(c, 1.0);\n'))
+    check('assignment value: its width is the swizzle\'s -- a vec3 plus '
+          '(a.xy = v) is refused by the run',
+          got is None and err == 'compiled, then ShaderError: cannot '
+          'combine vec3 with vec2', str(err if got is None else got))
+
+    # the value is read back only when something reads it. A statement, the
+    # step of a for, the left of a comma, ++ and an out argument written
+    # back read nothing they did not read before (the element, column or
+    # component a write answered was fetched every time and dropped): the
+    # reads below are the ones the text itself asks for
+    head = ('in vec3 vPosition;\nout vec4 Color;\n'
+            'void fill(out float o) { o = 0.5; }\nvoid main() {\n'
+            '    int k = int(vPosition.x);\n    vec3 v = vec3(0.0);\n'
+            '    float a[3];\n    mat2 m = mat2(0.0);\n    vec2 w[2];\n'
+            '    float x = 0.0;\n')
+    tail = '    Color = vec4(v, x);\n}\n'
+    reads = [
+        ('v[k] = 0.5;', 0), ('a[k] = 0.25;', 0), ('v.zx = vec2(0.5);', 0),
+        ('m[k % 2] = vec2(0.5);', 0), ('x = 0.0, v[k] = 0.5;', 0),
+        ('x = (v[k] = 0.5, 1.0);', 0),
+        ('for (int i = 0; i < 2; v[k] = 0.5) { i++; }', 0),
+        ('w[k % 2].y = 0.75;', 1), ('v[k]++;', 1), ('fill(a[k]);', 1),
+        ('v[k] += 0.5;', 1), ('x = (v[k] = 0.5);', 1),
+        ('x = (a[k] = 0.5);', 1), ('x = (v[k] = a[k] = 0.5);', 2),
+    ]
+    bad = []
+    for stmt, want in reads:
+        prog, err = try_compile(head + '    ' + stmt + '\n' + tail)
+        if prog is None:
+            bad.append(f'{stmt} {err}')
+            continue
+        seen = []
+        inner = prog.interp.subscript
+
+        def counted(*args, seen=seen, inner=inner):
+            seen.append(1)
+            return inner(*args)
+        prog.interp.subscript = counted
+        try:
+            prog.run({}, {'position': _lanes(6, 3)}, 6)
+        except Exception as exc:                                # noqa: BLE001
+            bad.append(f'{stmt} {type(exc).__name__}: {exc}')
+        finally:
+            del prog.interp.subscript
+        if len(seen) != want:
+            bad.append(f'{stmt} reads {len(seen)} for {want}')
+    check(f'assignment value: read back only when it is read ({len(reads)} '
+          'statements: an indexed read is made where the text asks for '
+          'one, and nowhere else)', not bad, '; '.join(bad))
+
+
+def test_seeded_assignments_equal_a_plain_python_run():
+    """The two rules above against a second implementation: seeded programs
+    of plain, chained and compound assignments -- through variables,
+    swizzles, components and elements, with `i++`, calls that write and
+    assignments on the right, under per-lane branches and loops -- each
+    lane computed here in plain Python, one float32 operation at a time."""
+    bad, n_prog, n_assign = [], 150, 0
+    for seed in range(n_prog):
+        text, stmts, count = _assign_program(
+            np.random.RandomState(7000 + seed))
+        n_assign += count
+        p = _lanes(8, 4)
+        prog, err = try_compile(text)
+        if prog is None:
+            bad.append(f'seed {seed}: {err}')
+            continue
+        try:
+            outs = prog.run({}, {'position': p}, 8)[0]
+        except Exception as exc:                                # noqa: BLE001
+            bad.append(f'seed {seed}: {type(exc).__name__}: {exc}')
+            continue
+        got = np.concatenate([outs['A'], outs['B'], outs['R'], outs['I']], 1)
+        want = np.array([_assign_reference(stmts, int(k), f)
+                         for k, f in p[:, :2]], np.float32)
+        if not np.array_equal(got, want):
+            lane = int(np.argwhere((got != want).any(1))[0, 0])
+            bad.append(f'seed {seed} lane {lane}: {got[lane]} for '
+                       f'{want[lane]}')
+    check(f'assignments: {n_prog} seeded programs ({n_assign} assignments), '
+          'every lane equal to a plain-Python run of the same program',
+          not bad, f'{len(bad)} differ: ' + '; '.join(bad[:3]))
+
+
+# -- the seeded programs of the test above. A piece is (GLSL text, closure
+# over one lane's variables); the closures are the language's rule written
+# out: the indices of a compound assignment's target, then its right side
+# ONCE, then the target is read; the value of an assignment is what it
+# wrote. Arithmetic is NumPy float32 one operation at a time, so the two
+# runs can be held to equality whatever the values.
+#
+# A plain assignment's target is indexed by a number or by `k`, which
+# nothing writes: the order a plain assignment evaluates its two sides in
+# is not this test's subject.
+
+_F32 = np.float32
+_ASSIGN_HEAD = ('float g = 0.0;\n'
+                'float bump() { g += 0.25; return g; }\n'
+                'float next(inout int s) { s += 2; return float(s) * 0.5; }\n')
+_ASSIGN_OPS = {'+=': lambda a, b: a + b, '-=': lambda a, b: a - b,
+               '*=': lambda a, b: a * b}
+
+
+def _assign_target(rng, compound):
+    """(GLSL text, index(env) -> where, get(env, where), set(env, where,
+    value)) of a float l-value. `index` is what the language evaluates
+    before the right side; only a compound target's may write (`i++`)."""
+    kind = rng.randint(7 if compound else 6)
+    if kind == 0:
+        name = 'xy'[rng.randint(2)]
+        return (name, lambda e: name, lambda e, w: e[w],
+                lambda e, w, v: e.__setitem__(w, v))
+    get = lambda e, w: e[w[0]][w[1]]                            # noqa: E731
+    put = lambda e, w, v: e[w[0]].__setitem__(w[1], v)          # noqa: E731
+    if kind == 1:
+        name, c = 'ab'[rng.randint(2)], int(rng.randint(3))
+        return f'{name}.{"xyz"[c]}', lambda e: (name, c), get, put
+    if kind == 2:
+        name, c = 'abr'[rng.randint(3)], int(rng.randint(3))
+        return f'{name}[{c}]', lambda e: (name, c), get, put
+    if kind in (3, 4):
+        name, c = 'abr'[rng.randint(3)], int(rng.randint(3))
+        return (f'{name}[(k + {c}) % 3]',
+                lambda e: (name, (e['k'] + c) % 3), get, put)
+    if kind == 5:
+        name, c = 'ab'[rng.randint(2)], int(rng.randint(3))
+        return f'{name}.{"rgb"[c]}', lambda e: (name, c), get, put
+    name = 'abr'[rng.randint(3)]
+
+    def moving(e):
+        e['i'] += 1
+        return name, (e['i'] - 1) % 3
+    return f'{name}[i++ % 3]', moving, get, put
+
+
+def _assign_value(rng, depth=0):
+    """(GLSL text, f(env) -> float32): a float, most of them writing
+    something on the way."""
+    kind = rng.randint(10 if depth < 2 else 6)
+    if kind == 0:
+        c = int(rng.randint(1, 9))
+        return f'{c * 0.25}', lambda e: _F32(c * 0.25)
+    if kind == 1:
+        name = 'xyf'[rng.randint(3)]
+        return name, lambda e: e[name]
+    if kind == 2:
+        def post(e):
+            e['i'] += 1
+            return _F32(e['i'] - 1)
+        return 'float(i++)', post
+    if kind == 3:
+        def pre(e):
+            e['j'] += 1
+            return _F32(e['j'])
+        return 'float(++j)', pre
+    if kind == 4:
+        def bump(e):
+            e['g'] = e['g'] + _F32(0.25)
+            return e['g']
+        return 'bump()', bump
+    if kind == 5:
+        def nxt(e):
+            e['i'] += 2
+            return _F32(e['i']) * _F32(0.5)
+        return 'next(i)', nxt
+    if kind in (6, 7):
+        tv, fv = _assign_value(rng, depth + 1)
+        if kind == 6:
+            c = int(rng.randint(1, 5))
+            return f'({tv} + {c * 0.25})', lambda e: fv(e) + _F32(c * 0.25)
+        return f'({tv} * 0.5)', lambda e: fv(e) * _F32(0.5)
+    # an assignment as a value, plain or compound
+    compound = kind == 9
+    tt, where, get, put = _assign_target(rng, compound)
+    tv, fv = _assign_value(rng, depth + 1)
+    if not compound:
+        def plain(e):
+            v = fv(e)
+            put(e, where(e), v)
+            return v
+        return f'({tt} = {tv})', plain
+    op = ('+=', '-=')[rng.randint(2)]
+
+    def comp(e):
+        w = where(e)
+        b = fv(e)
+        v = _ASSIGN_OPS[op](get(e, w), b)
+        put(e, w, v)
+        return v
+    return f'({tt} {op} {tv})', comp
+
+
+def _assign_block(rng, depth, pad):
+    """([GLSL lines], [statement closures]) of one block."""
+    lines, stmts = [], []
+    for _ in range(rng.randint(2, 5)):
+        kind = rng.randint(10)
+        if kind < 3:                                # T op= V
+            tt, where, get, put = _assign_target(rng, True)
+            op = ('+=', '-=', '*=')[rng.randint(3)]
+            if op == '*=':
+                c = (0.5, 2.0, -1.0)[rng.randint(3)]
+                tv, fv = f'{c}', lambda e, c=c: _F32(c)
+            else:
+                tv, fv = _assign_value(rng)
+            lines.append(f'{pad}{tt} {op} {tv};')
+
+            def comp(e, where=where, get=get, put=put, fv=fv, op=op):
+                w = where(e)
+                b = fv(e)
+                put(e, w, _ASSIGN_OPS[op](get(e, w), b))
+            stmts.append(comp)
+        elif kind < 6:                              # T = T = (T =) V
+            targets = [_assign_target(rng, False)
+                       for _ in range(rng.randint(2, 4))]
+            tv, fv = _assign_value(rng)
+            lines.append(pad + ' = '.join(t[0] for t in targets)
+                         + f' = {tv};')
+
+            def chain(e, targets=targets, fv=fv):
+                v = fv(e)
+                for _t, where, _get, put in reversed(targets):
+                    put(e, where(e), v)
+            stmts.append(chain)
+        elif kind == 6:                             # a.zx = b.xy = vec2(V, c)
+            pairs = [(0, 1), (1, 2), (2, 0), (1, 0), (2, 1), (0, 2)]
+            (n1, s1), (n2, s2) = [('ab'[rng.randint(2)],
+                                   pairs[rng.randint(6)]) for _ in range(2)]
+            tv, fv = _assign_value(rng)
+            c = int(rng.randint(1, 5))
+            sw = lambda s: 'xyz'[s[0]] + 'xyz'[s[1]]            # noqa: E731
+            lines.append(f'{pad}{n1}.{sw(s1)} = {n2}.{sw(s2)} = '
+                         f'vec2({tv}, {c * 0.25});')
+
+            def pair(e, n1=n1, s1=s1, n2=n2, s2=s2, fv=fv, c=c):
+                v = (fv(e), _F32(c * 0.25))
+                for name, s in ((n2, s2), (n1, s1)):
+                    e[name][s[0]], e[name][s[1]] = v
+            stmts.append(pair)
+        elif kind == 7:                             # ints
+            if rng.randint(2):
+                lines.append(f'{pad}i += j++;')
+
+                def ints(e):
+                    e['j'] += 1
+                    e['i'] += e['j'] - 1
+            else:
+                lines.append(f'{pad}j += (i += 1);')
+
+                def ints(e):
+                    e['i'] += 1
+                    e['j'] += e['i']
+            stmts.append(ints)
+        elif kind == 8 and depth < 2:
+            c = int(rng.randint(1, 4))
+            use_f = rng.randint(2) == 0
+            cond = f'f > {c * 0.5}' if use_f else f'k >= {c}'
+            a_lines, a_stmts = _assign_block(rng, depth + 1, pad + '    ')
+            b_lines, b_stmts = _assign_block(rng, depth + 1, pad + '    ')
+            lines += ([f'{pad}if ({cond}) {{'] + a_lines
+                      + [f'{pad}}} else {{'] + b_lines + [f'{pad}}}'])
+
+            def branch(e, c=c, use_f=use_f, a=a_stmts, b=b_stmts):
+                taken = e['f'] > c * 0.5 if use_f else e['k'] >= c
+                for st in (a if taken else b):
+                    st(e)
+            stmts.append(branch)
+        elif kind == 9 and depth < 2:
+            name = 'nm'[depth]
+            trips = int(rng.randint(1, 4))
+            b_lines, b_stmts = _assign_block(rng, depth + 1, pad + '    ')
+            lines += ([f'{pad}for (int {name} = 0; {name} < {trips}; '
+                       f'{name}++) {{'] + b_lines + [f'{pad}}}'])
+
+            def loop(e, trips=trips, body=b_stmts):
+                for _ in range(trips):
+                    for st in body:
+                        st(e)
+            stmts.append(loop)
+    return lines, stmts
+
+
+def _assign_program(rng):
+    lines, stmts = _assign_block(rng, 0, '    ')
+    text = ('in vec3 vPosition;\nout vec4 A;\nout vec4 B;\nout vec4 R;\n'
+            'out vec4 I;\n' + _ASSIGN_HEAD + 'void main() {\n'
+            '    int k = int(vPosition.x);\n    float f = vPosition.y;\n'
+            '    float x = f;\n    float y = 0.5;\n    int i = k;\n'
+            '    int j = 0;\n    vec3 a = vec3(f, 0.25, 0.5);\n'
+            '    vec3 b = vec3(0.0);\n'
+            '    float r[3] = float[3](0.25, 0.5, 0.75);\n'
+            + '\n'.join(lines) + '\n'
+            '    A = vec4(a, x);\n    B = vec4(b, y);\n'
+            '    R = vec4(r[0], r[1], r[2], g);\n'
+            '    I = vec4(float(i), float(j), 0.0, 1.0);\n}\n')
+    # the assignments written, an `if` and a `for` line holding none
+    count = sum(line.count('= ') for line in lines
+                if not line.lstrip().startswith(('if', 'for')))
+    return text, stmts, count
+
+
+def _assign_reference(stmts, k, f):
+    f = _F32(f)
+    env = {'k': k, 'f': f, 'x': f, 'y': _F32(0.5), 'i': k, 'j': 0,
+           'g': _F32(0.0), 'a': [f, _F32(0.25), _F32(0.5)],
+           'b': [_F32(0.0)] * 3,
+           'r': [_F32(0.25), _F32(0.5), _F32(0.75)]}
+    for st in stmts:
+        st(env)
+    return (env['a'] + [env['x']] + env['b'] + [env['y']] + env['r']
+            + [env['g'], env['i'], env['j'], 0.0, 1.0])
+
+
 
 def main():
     from . import utf8_console
