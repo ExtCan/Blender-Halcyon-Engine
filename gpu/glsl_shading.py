@@ -1124,8 +1124,10 @@ vec4 hal_evaluate(int model, HalcyonSurface s, vec3 n, vec3 l, vec3 v)
 # The scatter tree rides a data texture (core/sss.ScatterTree.pack_gpu's
 # layout) and the traversal is STACKLESS: nodes linearised in preorder --
 # the C's own 0..7 child visit order -- with hit/miss links, exactly the
-# threading gpu/rtrace.py uses for the BVH, because the kernels support
-# divergent while-loops but not dynamic array writes. The 'self' chain
+# threading gpu/rtrace.py uses for the BVH, because the kernels supported
+# divergent while-loops but not dynamic array writes when this was written
+# (the front-end writes through a variable index now; a stack is still
+# nothing a traversal needs). The 'self' chain
 # (SUBNODE_INDEX matches forcing descent past the error criterion) is a
 # per-node box of the ancestors' split half-spaces, >= on the upper side
 # exactly like SUBNODE_INDEX; collapsed cells contributed no split and
