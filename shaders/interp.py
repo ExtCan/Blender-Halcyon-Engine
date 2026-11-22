@@ -532,7 +532,7 @@ class Interpreter:
             # through to 'unsupported operator' when a lane reached it)
             return rt.to_bool(a) ^ rt.to_bool(b), BOOL
         if op in ('==', '!=', '<', '>', '<=', '>='):
-            if op in ('==', '!=') and same_matrix(at, bt) \
+            if at.rows and op in ('==', '!=') and same_matrix(at, bt) \
                     and np.ndim(a) == 3 and np.ndim(b) == 3:
                 # two matrices are equal when every component is: one bool
                 # a lane. (They went on below, where `sw(x, [0])` of a matrix
@@ -557,9 +557,11 @@ class Interpreter:
         # scalar one number a lane -- because a type here can be looser than
         # its value (`pow(2.0, v)` is typed float and holds a vector, and
         # `m * pow(2.0, v)` has always run as matrix * vector): what is not
-        # both goes on below exactly as it did
+        # both goes on below exactly as it did. (`rows` is zero for all but
+        # a matrix, and is asked first: this line is every operator's, and a
+        # shader with no matrix in it should not pay for the question)
         scaled = None
-        if op in ('*', '/', '+', '-'):
+        if (at.rows or bt.rows) and op in ('*', '/', '+', '-'):
             scaled = matrix_and_scalar(at, bt)
             if scaled is not None:
                 m, s = (a, b) if scaled is at else (b, a)
