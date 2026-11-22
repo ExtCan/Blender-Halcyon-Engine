@@ -118,8 +118,35 @@ def swizzle_indices(field):
     return None
 
 
+def matrix_and_scalar(a, b):
+    """The matrix of a pair that is one matrix and one scalar -- the type
+    `m * s`, `s * m`, `m / s`, `s / m`, `m + s`, `s + m`, `m - s` and
+    `s - m` have in GLSL, where the operator is applied to every component
+    of the matrix -- or None for any other pair.
+
+    A scalar is one float, int, uint or bool: not a vector (`m * v` is the
+    linear product, and `m + v` is nothing in the language), not a struct
+    or a sampler, and not an array of anything. An array of matrices is no
+    matrix here either. The interpreter (`Interpreter.binary`) and the name
+    check (`NameCheck.binary`) both ask this, so the two cannot disagree on
+    which pairs they are."""
+    for m, s in ((a, b), (b, a)):
+        if m.is_matrix and not m.array and s.is_scalar and not s.array:
+            return m
+    return None
+
+
+def same_matrix(a, b):
+    """Whether both are matrices of one shape: the pair `==` and `!=`
+    compare whole, to one bool (all components equal, or any different)."""
+    return (a.is_matrix and b.is_matrix and not a.array and not b.array
+            and (a.n, a.rows) == (b.n, b.rows))
+
+
 def promote(a, b, line=0):
-    """Result type of an arithmetic binop."""
+    """Result type of an arithmetic binop. A matrix on either side answers
+    the matrix: the type of matrix + matrix and of a matrix with a scalar
+    (`matrix_and_scalar`), which is all the language has for + - and /."""
     if a.is_matrix or b.is_matrix:
         return a if a.is_matrix else b
     base = 'float'

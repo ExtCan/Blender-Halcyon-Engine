@@ -24,15 +24,19 @@ call and the type of every expression:
              vec3`): `gtypes.promote` raised when the operator ran. The
              types here are the interpreter's own, rule for rule, so the
              operator is refused exactly where the run would raise. Where
-             the interpreter's type is not the language's -- a matrix
-             times a scalar (typed as a vector), two functions of one
-             name and argument count (the first is taken, whatever the
-             argument types) -- the type is kept, marked `_Loose`, and no
-             width is judged on it or on anything computed from it: a
-             text a driver compiles is not refused on this front-end's
-             own shortcut. (Not modelled: the type table has one sampler
-             type, so `texture()` of a sampler2DShadow is a vec4 here as
-             it is when the shader runs.)
+             the interpreter's type is not the language's -- two functions
+             of one name and argument count (the first is taken, whatever
+             the argument types), a matrix times a value typed one number
+             that the run may hold as a vector (`m * pow(2.0, v)`: the
+             run multiplies by what it holds) -- the type is kept, marked
+             `_Loose`, and no width is judged on it or on anything
+             computed from it: a text a driver compiles is not refused on
+             this front-end's own shortcut. (A matrix times a scalar was
+             one of these while the interpreter typed the product a
+             vector. It is the matrix now, here and there:
+             `gtypes.matrix_and_scalar`.) (Not modelled: the type table
+             has one sampler type, so `texture()` of a sampler2DShadow is
+             a vec4 here as it is when the shader runs.)
   members    a field or a swizzle is taken from a struct, a vector or a
              scalar -- never from a matrix or an array, which is indexed
              first (`m[0].xyz`). The swizzle check used to step around
@@ -65,8 +69,8 @@ them says what to write.
 
 from .builtins import BUILTINS
 from .codegen import FRAG_OUTS, VARYINGS
-from .gtypes import (BOOL, BY_NAME, FLOAT, INT, UINT, VOID, GType, promote,
-                     swizzle_indices)
+from .gtypes import (BOOL, BY_NAME, FLOAT, INT, UINT, VOID, GType,
+                     matrix_and_scalar, promote, swizzle_indices)
 from .interp import field_type, param_default, param_type, struct_type
 from .lexer import ShaderError
 
@@ -339,14 +343,26 @@ class NameCheck:
         if op == '*' and (at.is_matrix or bt.is_matrix):
             if at.is_matrix and bt.is_matrix:
                 return _loose(at, bt), at.n
+            mt = matrix_and_scalar(at, bt)
+            if mt is not None:
+                # matrix * scalar, scalar * matrix: the matrix, in the
+                # language and by the interpreter's rule (it typed the
+                # product a vector, could not run it, and this marked the
+                # type loose). The run holds the rule to the VALUE as well:
+                # one typed a number that may hold a vector (`pow(2.0, v)`,
+                # the width says) is multiplied as that vector, so the
+                # product may be either and is not judged
+                if (bw if mt is at else aw) > 1:
+                    return _mark(mt), max(mt.n, mt.rows, aw, bw)
+                return _loose(mt, at, bt), mt.n
             if at.is_matrix:
                 t, w = GType(at.base, at.rows), max(at.rows, bw)
             else:
                 t, w = GType(bt.base, bt.n), max(bt.n, aw)
             other = bt if at.is_matrix else at
             if other.n == 1:
-                # matrix * scalar: a vector by the interpreter's rule (which
-                # cannot run it), a matrix in the language
+                # what is left with one component is no number -- a struct,
+                # a sampler, an array -- and the run raises on it
                 return _mark(t), w
             return _loose(t, at, bt), w
         return self._promote(at, bt, max(aw, bw), line)

@@ -13,6 +13,12 @@ and written. (The interpreter used to make a declared matrix a Python list
 of its columns and index a constructed one the same way: `m[1]` of a
 constructed matrix indexed the LANE axis, and `m * v` of a declared one
 handed `mat_mul_vec` a list.)
+
+A scalar meets a matrix as (N, 1, 1) -- `mat_scalar` -- so that it lines up
+with the LANE axis and reaches every component of its own lane's matrix. A
+bare (N,) against (N, C, R) is NumPy's last axis against the rows: an error
+at most lane counts, and at N == R the scalar of lane r applied to row r of
+every lane without a word. Two matrices compare whole (`mat_equal`).
 """
 
 import numpy as np
@@ -288,6 +294,21 @@ def mat_mul_mat(a, b):
     a = bc(a, n)
     b = bc(b, n)
     return np.einsum('nkr,nck->ncr', a, b)
+
+
+def mat_scalar(s):
+    """A scalar shaped to meet a matrix component by component: (N,) ->
+    (N, 1, 1), so `m * mat_scalar(s)` is every component of lane i's matrix
+    times lane i's scalar (and one lane of either broadcasts against N of
+    the other). Float32, as a matrix's components are: an int left as it is
+    would carry the whole matrix into float64."""
+    return to_float(s).reshape(-1, 1, 1)
+
+
+def mat_equal(a, b):
+    """`a == b` of two matrices of one shape: one bool per lane, true where
+    every component is equal (`!=` is its negation: any component differs)."""
+    return np.all(np.asarray(a) == np.asarray(b), axis=(1, 2))
 
 
 def transpose(m):

@@ -977,6 +977,16 @@ def test_vector_widths_are_checked_at_compile_time():
          '    vec2 v = vec2(0.5);\n    bool c = v.x < 1.0;\n'
          '    Color = vec4(v * i, c ? v + i : v - i);\n}\n',
          [0.5, 1.0, 1.5, 2.5]),
+        # this one stood among the loosely typed below: a matrix times a
+        # scalar was typed a vector (and raised from einsum when run), so a
+        # 2x3 matrix doubled, times a vec2, was a vec3 times a vec2 by that
+        # rule and had to be stepped around. It is the matrix now, and runs
+        ('a matrix times a scalar is the matrix: a 2x3 doubled, times a '
+         'vec2, is a vec3',
+         'out vec4 Color;\nvoid main() {\n    vec3 c = vec3(1.0);\n'
+         '    vec2 r = vec2(0.5);\n'
+         '    vec3 w = (outerProduct(c, r) * 2.0) * r;\n'
+         '    Color = vec4(w, 1.0);\n}\n', [1.0, 1.0, 1.0, 1.0]),
     ]
     for what, src, want in fine:
         got, err = _first(src)
@@ -993,12 +1003,13 @@ def test_vector_widths_are_checked_at_compile_time():
          'out vec4 Color;\nvec2 f(vec2 x) { return x; }\n'
          'vec3 f(vec3 x) { return x; }\nvoid main() {\n'
          '    vec3 v = vec3(1.0);\n    Color = vec4(f(v) + v, 1.0);\n}\n'),
-        ('a matrix times a scalar is typed as a vector here: a 2x3 matrix '
-         'doubled, times a vec2, is a vec3 times a vec2 by that rule',
-         'out vec4 Color;\nvoid main() {\n    vec3 c = vec3(1.0);\n'
+        ('a matrix times a value typed one number that holds a vector '
+         '(pow(2.0, v)): the run multiplies by the vector, so the product '
+         'is a vec3 there and its swizzle, plus a vec2, is the run\'s',
+         'out vec4 Color;\nvoid main() {\n    vec3 v = vec3(1.0);\n'
          '    vec2 r = vec2(0.5);\n'
-         '    vec3 w = (outerProduct(c, r) * 2.0) * r;\n'
-         '    Color = vec4(w, 1.0);\n}\n'),
+         '    vec2 w = (mat3(2.0) * pow(2.0, v)).xy + r;\n'
+         '    Color = vec4(w, 0.0, 1.0);\n}\n'),
     ]
     for what, src in loose:
         prog, err = try_compile(src)
@@ -2090,6 +2101,457 @@ def test_signed_integers_divide_to_an_integer():
     check('int division: exact at the ends of the 32-bit range',
           got is not None and np.array_equal(got, [1, 1, 1, 1]),
           str(err if got is None else got))
+
+
+# --------------------------- a matrix with a scalar, two matrices compared
+#
+# R253 (review): valid GLSL on a matrix that try_compile accepted (error
+# None) and the run raised on -- or, at the lane count that happens to equal
+# the matrix's rows, answered along the wrong axis without a word. Each
+# shader named "the reported shader" is the text the defect was reproduced
+# with.
+
+#: (what, statements reading m into Color, the Color of diag(1, 2, 3)).
+#: `k * vec3(1.0)` is the sum of k's columns, so every component is in it
+_MATRIX_SCALED = [
+    ('m * 2.0',
+     '    mat3 k = m * 2.0;\n    Color = vec4(k * vec3(1.0), k[1][1]);\n',
+     [2, 4, 6, 4]),
+    ('2.0 * m',
+     '    mat3 k = 2.0 * m;\n    Color = vec4(k * vec3(1.0), k[1][1]);\n',
+     [2, 4, 6, 4]),
+    ('m * 2, an int',
+     '    mat3 k = m * 2;\n    Color = vec4(k * vec3(1.0), k[1][1]);\n',
+     [2, 4, 6, 4]),
+    ('m / 2.0',
+     '    mat3 k = m / 2.0;\n    Color = vec4(k * vec3(1.0), k[1][1]);\n',
+     [0.5, 1, 1.5, 1]),
+    ('m / 4, an int',
+     '    mat3 k = m / 4;\n    Color = vec4(k * vec3(1.0), k[1][1]);\n',
+     [0.25, 0.5, 0.75, 0.5]),
+    ('6.0 / (m + 1.0), the scalar on the left of a division',
+     '    mat3 k = 6.0 / (m + 1.0);\n'
+     '    Color = vec4(k[0][0], k[1][1], k[2][2], k[0][1]);\n',
+     [3, 2, 1.5, 6]),
+    ('m + 1.0',
+     '    mat3 k = m + 1.0;\n    Color = vec4(k * vec3(1.0), k[1][1]);\n',
+     [4, 5, 6, 3]),
+    ('1.0 + m',
+     '    mat3 k = 1.0 + m;\n    Color = vec4(k * vec3(1.0), k[1][1]);\n',
+     [4, 5, 6, 3]),
+    ('m - 1.0',
+     '    mat3 k = m - 1.0;\n    Color = vec4(k * vec3(1.0), k[1][1]);\n',
+     [-2, -1, 0, 1]),
+    ('1.0 - m',
+     '    mat3 k = 1.0 - m;\n    Color = vec4(k * vec3(1.0), k[1][1]);\n',
+     [2, 1, 0, -1]),
+    ('m *= 2.0',
+     '    m *= 2.0;\n    Color = vec4(m * vec3(1.0), m[1][1]);\n',
+     [2, 4, 6, 4]),
+    ('m /= 2.0',
+     '    m /= 2.0;\n    Color = vec4(m * vec3(1.0), m[1][1]);\n',
+     [0.5, 1, 1.5, 1]),
+    ('m += 1.0',
+     '    m += 1.0;\n    Color = vec4(m * vec3(1.0), m[1][1]);\n',
+     [4, 5, 6, 3]),
+    ('m -= 1.0',
+     '    m -= 1.0;\n    Color = vec4(m * vec3(1.0), m[1][1]);\n',
+     [-2, -1, 0, 1]),
+    ('m++, whose value is the matrix as it was',
+     '    mat3 k = m++;\n    Color = vec4(m * vec3(1.0), k[1][1]);\n',
+     [4, 5, 6, 2]),
+    ('++m, whose value is the matrix as it is',
+     '    mat3 k = ++m;\n    Color = vec4(m * vec3(1.0), k[1][1]);\n',
+     [4, 5, 6, 3]),
+    ('m--, then --m',
+     '    m--;\n    mat3 k = --m;\n'
+     '    Color = vec4(m * vec3(1.0), k[1][1]);\n', [-5, -4, -3, 0]),
+    ('a chain: (m * 2.0 + 1.0) / 2.0 - 0.5 is m again',
+     '    mat3 k = (m * 2.0 + 1.0) / 2.0 - 0.5;\n'
+     '    Color = vec4(k * vec3(1.0), k[0][1]);\n', [1, 2, 3, 0]),
+    ('the negative, scaled',
+     '    mat3 k = -m * 2.0;\n    Color = vec4(k * vec3(1.0), k[1][1]);\n',
+     [-2, -4, -6, -4]),
+    ('a column, a component and a swizzle of a product',
+     '    Color = vec4((m * 2.0)[1].xy, (2.0 * m)[2][2], '
+     '(m / 2.0)[0].x);\n', [0, 4, 6, 0.5]),
+    ('scaled, then times a vector, times a matrix, a vector times it',
+     '    Color = vec4(((m * 2.0) * vec3(1.0)).xy, ((m * 2.0) * m)[2].z, '
+     '(vec3(1.0) * (0.5 * m)).y);\n', [2, 4, 18, 1]),
+    ('by a scalar a builtin answers',
+     '    mat3 k = m * dot(vec3(1.0), vec3(1.0, 0.0, 1.0)) '
+     '/ length(vec3(0.0, 2.0, 0.0));\n'
+     '    Color = vec4(k * vec3(1.0), k[2][2]);\n', [1, 2, 3, 3]),
+    ('m == m, m != m, and against what was computed from it',
+     '    Color = vec4(m == m ? 1.0 : 0.0, m != m ? 1.0 : 0.0, '
+     'm == m * 1.0 ? 1.0 : 0.0, m * 2.0 == m + m ? 1.0 : 0.0);\n',
+     [1, 0, 1, 1]),
+    ('equal to a copy until one component of the copy is written',
+     '    mat3 k = m;\n    bool before = m == k;\n    k[2][1] = 0.5;\n'
+     '    Color = vec4(before ? 1.0 : 0.0, m == k ? 1.0 : 0.0, '
+     'm != k ? 1.0 : 0.0, k == m ? 1.0 : 0.0);\n', [1, 0, 1, 0]),
+    ('compared in an if',
+     '    mat3 k = m;\n    k[1][2] = 0.5;\n    Color = vec4(0.0);\n'
+     '    if (m == k) { Color.x = 1.0; }\n'
+     '    if (m != k) { Color.y = 1.0; }\n'
+     '    if (m == m && !(m != m)) { Color.z = 1.0; }\n', [0, 1, 1, 0]),
+]
+
+
+def _lane_matrix(size, x, y):
+    """A matrix that differs by lane and is symmetric nowhere, twice: the
+    GLSL constructor, and the same numbers as [lane, column, row] -- filled
+    one number at a time, so the reference owes nothing to broadcasting."""
+    parts, ref = [], np.zeros((len(x), size, size), np.float32)
+    for c in range(size):
+        for r in range(size):
+            k = c * size + r + 1
+            parts.append(f'{k}.0 + ' + ('x' if (c + r) % 2 == 0 else 'y'))
+            for lane in range(len(x)):
+                ref[lane, c, r] = np.float32(k) + (
+                    x[lane] if (c + r) % 2 == 0 else y[lane])
+    return f'mat{size}(' + ', '.join(parts) + ')', ref
+
+
+def _per_lane(fn, *arrays):
+    """`fn` of each lane's own values, one lane at a time."""
+    return np.stack([fn(*[a[i] for a in arrays])
+                     for i in range(len(arrays[0]))])
+
+
+def test_a_matrix_and_a_scalar_combine_component_by_component():
+    """`mat3 k = m * 2.0;` compiled and raised ValueError from einsum: every
+    `*` with a matrix on one side went to the linear product, the scalar
+    handed over as if it were a vector (and the result typed a vector).
+    `m / 2.0`, `m + 1.0` and `m - 1.0` raised 'operands could not be
+    broadcast together': the scalar is (lanes,) and the matrix (lanes,
+    columns, rows), which NumPy lines up with the rows -- so at three lanes
+    of a mat3 they RAN, lane r's scalar on row r of every lane. `m == m`
+    compared the first column of each side, a bool per lane and row."""
+    reported = [
+        ('mat3 k = m * 2.0',
+         _body(_DIAG + '    mat3 k = m * 2.0;\n'
+               '    Color = vec4(k * vec3(1.0), 1.0);\n'), [2, 4, 6, 1]),
+        ('mat3 k = 2.0 * m',
+         _body(_DIAG + '    mat3 k = 2.0 * m;\n'
+               '    Color = vec4(k * vec3(1.0), 1.0);\n'), [2, 4, 6, 1]),
+        ('m *= 2.0',
+         _body(_DIAG + '    m *= 2.0;\n'
+               '    Color = vec4(m * vec3(1.0), 1.0);\n'), [2, 4, 6, 1]),
+        ('mat3 k = m / 2.0',
+         _body(_DIAG + '    mat3 k = m / 2.0;\n'
+               '    Color = vec4(k * vec3(1.0), 1.0);\n'), [0.5, 1, 1.5, 1]),
+        ('m == m ? 1.0 : 0.0',
+         _body(_DIAG + '    Color = vec4(m == m ? 1.0 : 0.0);\n'),
+         [1, 1, 1, 1]),
+    ]
+    for what, src, want in reported:
+        bad = []
+        for n in (1, 3, 4, 7):
+            got, err = _first(src, n=n)
+            if got is None or not np.array_equal(got, want):
+                bad.append(f'{n} lanes: {err if got is None else got}')
+        check(f'matrix and scalar: {what} (the reported shader, at 1, 3, 4 '
+              'and 7 lanes)', not bad, '; '.join(bad))
+
+    # every form, on a matrix made every way a matrix is made
+    bad, ran = [], 0
+    for made, head, make in _MATRIX_MADE:
+        for used, use, want in _MATRIX_SCALED:
+            for n in (1, 3, 4, 7):
+                got, err = _first(_body(make + use, head), n=n)
+                ran += 1
+                if got is None or not np.allclose(got, want, atol=1e-6):
+                    bad.append(f'{made} / {used} / {n} lanes: '
+                               f'{err if got is None else got}')
+    check(f'matrix and scalar: {len(_MATRIX_SCALED)} forms on a matrix made '
+          f'{len(_MATRIX_MADE)} ways, at 1, 3, 4 and 7 lanes ({ran} '
+          'shaders)', not bad, f'{len(bad)} wrong: ' + '; '.join(bad[:4]))
+
+    # per lane, and this is the check the lane counts are chosen for. The
+    # scalar and the matrix both differ by lane, and the matrix is
+    # symmetric nowhere, so an operator applied along another axis is
+    # another number. The count at which the wrong axis FITS is the
+    # matrix's own row count -- 2 lanes of a mat2, 3 of a mat3, 4 of a mat4
+    # -- and there the old `/`, `+` and `-` answered without a word. Held
+    # bit for bit: the same float32 operation, one lane at a time.
+    f32 = np.float32
+    for size in (2, 3, 4):
+        mt = f'mat{size}'
+        outs_decl = ''.join(f'out {mt} {name};\n' for name in (
+            'Mul', 'Lmul', 'Div', 'Rdiv', 'Add', 'Radd', 'Sub', 'Rsub',
+            'Comp', 'Step', 'Branch'))
+        bad, counts = [], (1, 2, 3, 4, 7)
+        for n in counts:
+            x = (np.arange(n) + 1.0).astype(f32)
+            y = (np.arange(n) * 0.5 + 0.75).astype(f32)
+            make, m = _lane_matrix(size, x, y)
+            src = ('in vec3 vPosition;\n' + outs_decl + 'out vec4 Color;\n'
+                   'void main() {\n    float x = vPosition.x;\n'
+                   '    float y = vPosition.y;\n'
+                   f'    {mt} m = {make};\n'
+                   '    Mul = m * x;\n    Lmul = y * m;\n    Div = m / y;\n'
+                   '    Rdiv = x / m;\n    Add = m + x;\n    Radd = y + m;\n'
+                   '    Sub = m - y;\n    Rsub = x - m;\n'
+                   f'    {mt} c = m;\n    c *= x;\n    c += y;\n'
+                   '    c /= 4.0;\n    c -= x;\n    Comp = c;\n'
+                   f'    {mt} s = m;\n    s++;\n    ++s;\n    s--;\n'
+                   '    Step = s;\n'
+                   f'    {mt} b = m;\n'
+                   '    if (x > 2.5) { b *= y; } else { b = b - x; }\n'
+                   '    Branch = b;\n    Color = vec4(1.0);\n}\n')
+            p = np.zeros((n, 3), f32)
+            p[:, 0], p[:, 1] = x, y
+            prog, err = try_compile(src)
+            try:
+                outs = prog.run({}, {'position': p}, n)[0]
+            except Exception as exc:                            # noqa: BLE001
+                bad.append(f'{n} lanes: {err or repr(exc)}')
+                continue
+            want = {
+                'Mul': _per_lane(lambda a, s, t: a * s, m, x, y),
+                'Lmul': _per_lane(lambda a, s, t: t * a, m, x, y),
+                'Div': _per_lane(lambda a, s, t: a / t, m, x, y),
+                'Rdiv': _per_lane(lambda a, s, t: s / a, m, x, y),
+                'Add': _per_lane(lambda a, s, t: a + s, m, x, y),
+                'Radd': _per_lane(lambda a, s, t: t + a, m, x, y),
+                'Sub': _per_lane(lambda a, s, t: a - t, m, x, y),
+                'Rsub': _per_lane(lambda a, s, t: s - a, m, x, y),
+                'Comp': _per_lane(
+                    lambda a, s, t: (a * s + t) / f32(4.0) - s, m, x, y),
+                'Step': _per_lane(
+                    lambda a, s, t: a + f32(1.0) + f32(1.0) - f32(1.0),
+                    m, x, y),
+                'Branch': _per_lane(
+                    lambda a, s, t: a * t if s > 2.5 else a - s, m, x, y),
+            }
+            for name, ref in want.items():
+                got = outs[name]
+                if got.shape != (n, size, size) or got.dtype != f32 \
+                        or not np.array_equal(got, ref):
+                    bad.append(f'{name} at {n} lanes')
+        check(f'matrix and scalar: {mt} per lane -- * / + - with the scalar '
+              'on either side, the compound forms, ++ and --, under a '
+              f'branch -- bit for bit at {", ".join(map(str, counts))} '
+              f'lanes ({size} is where the row axis fitted)',
+              not bad, '; '.join(bad[:6]))
+
+    # the rule itself: a matrix with one number of any base, either side of
+    # each operator, is that operator on every component -- and float32
+    # whatever the number is (an int, left an int, carried the matrix into
+    # float64: a precision no GPU has)
+    diag = np.diag([1.0, 2.0, 3.0]).astype(f32)
+    ops = {'*': np.multiply, '/': np.divide, '+': np.add, '-': np.subtract}
+    bad, ran = [], 0
+    for text, value in (('2.0', 2.0), ('2', 2.0), ('2u', 2.0),
+                        ('true', 1.0)):
+        for op, fn in ops.items():
+            for left in (True, False):
+                expr = f'(m + 1.0) {op} {text}' if left \
+                    else f'{text} {op} (m + 1.0)'
+                src = ('out mat3 K;\nout vec4 Color;\nvoid main() {\n'
+                       + _DIAG + f'    K = {expr};\n'
+                       f'    Color = vec4(({expr})[1].xyz, 1.0);\n}}\n')
+                ref = fn(diag + f32(1.0), f32(value)) if left \
+                    else fn(f32(value), diag + f32(1.0))
+                prog, err = try_compile(src)
+                for n in (3, 4):
+                    ran += 1
+                    try:
+                        outs = prog.run({}, {}, n)[0]
+                    except Exception as exc:                    # noqa: BLE001
+                        bad.append(f'{expr}: {err or repr(exc)}')
+                        continue
+                    if outs['K'].dtype != f32 \
+                            or outs['K'].shape != (n, 3, 3) \
+                            or not np.array_equal(outs['K'][n - 1], ref) \
+                            or not np.array_equal(outs['Color'][0, :3],
+                                                  ref[1]):
+                        bad.append(f'{expr} at {n} lanes: '
+                                   f'{outs["K"].dtype} {outs["K"][n - 1]}')
+    check('matrix and scalar: a float, an int, a uint and a bool on either '
+          f'side of * / + - ({ran} runs): the operator on every component, '
+          'a float32 (lanes, columns, rows) array, and the result indexed '
+          'and swizzled as the matrix it is', not bad, '; '.join(bad[:4]))
+
+    # wherever a matrix can stand
+    fine = [
+        ('returned by and passed to a function',
+         _body(_DIAG + '    Color = vec4(twice(m) * vec3(1.0), '
+               'twice(m / 2.0)[2].z);\n',
+               'mat3 twice(mat3 x) { return x * 2.0; }\n'), [2, 4, 6, 3]),
+        ('a struct field, by a field',
+         _body(_DIAG + '    T t;\n    t.m = m;\n    t.k = 2.0;\n'
+               '    t.m *= t.k;\n'
+               '    Color = vec4(t.m * vec3(1.0), (t.m / t.k)[1].y);\n',
+               'struct T { mat3 m; float k; };\n'), [2, 4, 6, 2]),
+        ('an array element, written through a variable index',
+         _body(_DIAG + '    mat3 a[2];\n    int i = 1;\n    a[i] = m;\n'
+               '    a[i] *= 2.0;\n    a[i - 1] = a[i] / 4.0;\n'
+               '    Color = vec4(a[1] * vec3(1.0), a[0][2][2]);\n'),
+         [2, 4, 6, 1.5]),
+        ('by a uniform and by a loop counter',
+         _body(_DIAG + '    for (int i = 0; i < 3; i++) { m += float(i); }\n'
+               '    Color = vec4((m * gain)[0], (gain * m)[1].y);\n',
+               'uniform float gain = 0.5;\n'), [2, 1.5, 1.5, 2.5]),
+        ('a mat4 and a mat2',
+         _body('    mat4 a = mat4(2.0) * 0.5 + 1.0;\n'
+               '    mat2 b = 3.0 - mat2(1.0) / 0.5;\n    b++;\n'
+               '    Color = vec4(a[3].wx, b[0]);\n'), [2, 1, 2, 4]),
+        ('the HLSL dialect',
+         'out float4 Color;\nvoid main() {\n    float3x3 m = float3x3(1.0, '
+         '0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0);\n'
+         '    float3x3 k = m * 2.0;\n    k /= 4.0;\n'
+         '    Color = float4(mul(k, float3(1.0, 1.0, 1.0)), '
+         'k == m * 0.5 ? 1.0 : 0.0);\n}\n', [0.5, 1, 1.5, 1]),
+        # what the run held to the VALUE, as it did: pow(2.0, v) is typed
+        # float and holds a vector, and a matrix times it is the linear
+        # product it always was
+        ('a matrix times a value typed float that holds a vector is still '
+         'matrix * vector',
+         _body(_DIAG + '    vec3 v = vec3(1.0, 2.0, 3.0);\n'
+               '    Color = vec4((m * pow(2.0, v)).zyx, 1.0);\n'),
+         [24, 8, 2, 1]),
+    ]
+    for what, src, want in fine:
+        bad = []
+        for n in (1, 3, 4, 7):
+            got, err = _first(src, 'HLSL' if 'float4' in src else 'GLSL',
+                              n=n)
+            if got is None or not np.allclose(got, want, atol=1e-6):
+                bad.append(f'{n} lanes: {err if got is None else got}')
+        check(f'matrix and scalar: {what}', not bad, '; '.join(bad))
+
+    # typed as the language types it. The product was typed a vector and
+    # marked loose, so nothing computed from it was judged -- and one thing
+    # was misjudged: a column of it was a float, and its swizzle refused
+    got, err = _first(_body(_DIAG + '    Color = vec4((m * 2.0)[1].xyz, '
+                            '(2.0 * m)[2].z);\n'))
+    check('matrix and scalar: (m * 2.0)[1].xyz compiles (it was refused: '
+          "swizzle 'xyz' out of range for float)",
+          got is not None and np.array_equal(got, [0, 4, 0, 6]),
+          str(err if got is None else got))
+    _refused('(m * 2.0).xyz, a swizzle of a matrix (it compiled, and raised '
+             'from einsum when run)',
+             _body(_DIAG + '    Color = vec4((m * 2.0).xyz, 1.0);\n'),
+             "line 4: 'xyz' of mat3: a matrix is indexed first")
+    _refused('a width computed from the product (nothing computed from it '
+             'was judged)',
+             _body(_DIAG + '    vec2 r = vec2(0.5);\n'
+                   '    Color = vec4((m * 2.0) * vec3(1.0) + r, 1.0);\n'),
+             'line 5: cannot combine vec3 with vec2')
+
+    # what is not the language's is left as it was: to the run. An array is
+    # the operand of no operator (`a * 2.0` of a `mat3 a[2]`, `m * w` of a
+    # `float w[3]`). Typed by the rule above each would be a matrix and a
+    # member of it refused -- where the text compiled and, in a branch no
+    # lane takes, ran
+    got, err = _first(_body(
+        _DIAG + '    mat3 a[2];\n    float w[3];\n    Color = vec4(1.0);\n'
+        '    if (Color.x > 2.0) {\n'
+        '        Color = vec4((a * 2.0).x, (m * w).x, (w * m).y, 1.0);\n'
+        '    }\n'))
+    check('matrix and scalar: an array is neither (a mat3[2] times a float, '
+          'a mat3 times a float[3]): not typed by this rule, and not '
+          'refused where it compiled',
+          got is not None and np.array_equal(got, [1, 1, 1, 1]),
+          str(err if got is None else got))
+
+    # a matrix handed in with one lane (a caller's uniform) against a
+    # scalar with many, and the other way about
+    src = ('uniform mat3 M;\nin vec3 vPosition;\nout mat3 K;\nout bool Same;'
+           '\nout vec4 Color;\nvoid main() {\n    K = M * vPosition.x;\n'
+           '    Same = M == M;\n    Color = vec4(M / 2.0 == 0.5 * M ? 1.0 '
+           ': 0.0);\n}\n')
+    p = _lanes(5, 5) + 1.0
+    outs, _, _ = run(src, uniforms={'M': diag[None]}, inputs={'position': p},
+                     n=5)
+    check('matrix and scalar: one lane of matrix against five of scalar; '
+          'the comparison answers a bool for every lane',
+          outs['K'].shape == (5, 3, 3)
+          and np.array_equal(outs['K'], _per_lane(lambda s: diag * s,
+                                                  p[:, 0]))
+          and outs['Same'].shape == (5,) and outs['Same'].dtype == bool
+          and outs['Same'].all() and np.array_equal(outs['Color'][:, 0],
+                                                    np.ones(5)),
+          str(outs['K'].shape))
+
+    # NOT this entry's: the Coded Shader node gives a `uniform mat3` a float
+    # socket, so the uniform arrives as one float a lane. What a float
+    # should mean there is undecided; until it is, a use of it is refused by
+    # the run as it was -- never multiplied as if a (lanes,) array were a
+    # matrix, which would answer a (lanes, 1, lanes) array without a word
+    prog, err = try_compile('uniform mat3 M;\nout vec4 Color;\nvoid main() '
+                            '{\n    mat3 k = M * 2.0;\n'
+                            '    Color = vec4(k * vec3(1.0), 1.0);\n}\n')
+    try:
+        prog.run({'M': np.full(4, 0.5, f32)}, {}, 4)
+        raised = None
+    except Exception as exc:                                    # noqa: BLE001
+        raised = exc
+    check('matrix and scalar: a float handed in for a `uniform mat3` (the '
+          'node\'s socket) still raises when it is used -- it is not taken '
+          'for a matrix', isinstance(raised, ValueError), repr(raised))
+
+
+def test_two_matrices_compare_whole():
+    """`Color = vec4(m == m ? 1.0 : 0.0);` compiled and raised ValueError:
+    the comparison took component [0] of each side, which of a matrix is
+    its first column -- a bool per lane and ROW, flattened. In an `if`,
+    which cuts its condition to the lane count, that ran: `if (m == k)` was
+    taken for two matrices that differed anywhere outside their first
+    column (and read another lane's rows where they differed inside it)."""
+    # one component of the copy differs, on the odd lanes alone, for each of
+    # the nine in turn: `==` is all nine, `!=` any of them, per lane
+    bad, ran = [], 0
+    for c in range(3):
+        for r in range(3):
+            src = ('in vec3 vPosition;\nout vec4 Color;\nout bool Same;\n'
+                   'void main() {\n    float x = vPosition.x;\n'
+                   '    mat3 m = mat3(x, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, '
+                   '8.0);\n    mat3 k = m;\n'
+                   f'    if (mod(x, 2.0) > 0.5) {{ k[{c}][{r}] += 0.5; }}\n'
+                   '    Same = m == k;\n'
+                   '    Color = vec4(m == k ? 1.0 : 0.0, m != k ? 1.0 : 0.0,'
+                   ' 0.0, Same ? 1.0 : 0.0);\n'
+                   '    if (k == m) { Color.z = 1.0; }\n}\n')
+            for n in (1, 3, 4, 7):
+                p = np.zeros((n, 3), np.float32)
+                p[:, 0] = np.arange(n) + 1.0
+                ran += 1
+                try:
+                    outs, _, _ = run(src, inputs={'position': p}, n=n)
+                except Exception as exc:                        # noqa: BLE001
+                    bad.append(f'[{c}][{r}] at {n} lanes: {exc!r}')
+                    continue
+                same = (np.arange(n) + 1) % 2 == 0
+                col = outs['Color']
+                if outs['Same'].dtype != bool \
+                        or not np.array_equal(outs['Same'], same) \
+                        or not np.array_equal(col[:, 0], same) \
+                        or not np.array_equal(col[:, 1], ~same) \
+                        or not np.array_equal(col[:, 2], same) \
+                        or not np.array_equal(col[:, 3], same):
+                    bad.append(f'[{c}][{r}] at {n} lanes: {col[:, :2]}')
+    check('matrix ==: a copy that differs in one component on the odd lanes, '
+          f'each of the nine in turn, at 1, 3, 4 and 7 lanes ({ran} runs): '
+          'equal where all nine are, in a ternary, a bool and an if',
+          not bad, '; '.join(bad[:4]))
+
+    fine = [
+        ('a mat2 and a mat4; a product against its factors',
+         _body('    mat4 a = mat4(2.0);\n    mat2 b = mat2(1.0, 2.0, 3.0, '
+               '4.0);\n    mat2 t = transpose(b);\n'
+               '    Color = vec4(a == mat4(2.0), a * 0.5 != mat4(1.0), '
+               'b == t, transpose(t) == b && b != t);\n'), [1, 0, 0, 1]),
+    ]
+    for what, src, want in fine:
+        bad = []
+        for n in (1, 3, 4, 7):
+            got, err = _first(src, n=n)
+            if got is None or not np.array_equal(got, want):
+                bad.append(f'{n} lanes: {err if got is None else got}')
+        check(f'matrix ==: {what}', not bad, '; '.join(bad))
 
 
 

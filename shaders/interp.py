@@ -22,8 +22,8 @@ import numpy as np
 
 from . import builtins as rt
 from .builtins import BUILTINS
-from .gtypes import (BOOL, BY_NAME, FLOAT, INT, UINT, VOID, GType, promote,
-                     swizzle_indices)
+from .gtypes import (BOOL, BY_NAME, FLOAT, INT, UINT, VOID, GType,
+                     matrix_and_scalar, promote, same_matrix, swizzle_indices)
 from .lexer import ShaderError
 
 MAX_LOOP = 4096
@@ -477,8 +477,7 @@ class Interpreter:
             # ('post', '++', target) -- the operator comes first
             op, target = node[1], self.hold(node[2], mask, scope, flags, n)
             cur, t = self.expr(target, mask, scope, flags, n)
-            delta = np.ones(n, np.float32) * (1.0 if op == '++' else -1.0)
-            newv = self.coerce(cur + self.coerce(delta, FLOAT, t, n), t, t, n)
+            newv = self.stepped(cur, t, op, n)
             self.store(target, newv, t, mask, scope, flags, n)
             return (cur if k == 'post' else newv), t
         if k == 'un':
@@ -487,9 +486,7 @@ class Interpreter:
                 # ++x is a write as well as a read, so it shares the post path
                 operand = self.hold(operand, mask, scope, flags, n)
                 cur, t = self.expr(operand, mask, scope, flags, n)
-                delta = np.ones(n, np.float32) * (1.0 if op == '++' else -1.0)
-                newv = self.coerce(cur + self.coerce(delta, FLOAT, t, n),
-                                   t, t, n)
+                newv = self.stepped(cur, t, op, n)
                 self.store(operand, newv, t, mask, scope, flags, n)
                 return newv, t
             v, t = self.expr(operand, mask, scope, flags, n)
@@ -512,6 +509,16 @@ class Interpreter:
             return [p[0] for p in parts], node[1]
         raise ShaderError(f'unsupported expression {k!r}')
 
+    def stepped(self, cur, t, op, n):
+        """`cur` one more (`++`) or one less (`--`): every component of a
+        vector, and of a matrix -- where the one was added as (lanes,) to
+        (lanes, columns, rows), the same misfit `binary` had for a matrix
+        and a scalar."""
+        delta = np.ones(n, np.float32) * (1.0 if op == '++' else -1.0)
+        if t.is_matrix and not t.array and np.ndim(cur) == 3:
+            return cur + rt.mat_scalar(delta)
+        return self.coerce(cur + self.coerce(delta, FLOAT, t, n), t, t, n)
+
     def binary(self, node, mask, scope, flags, n):
         op = node[1]
         a, at = self.expr(node[2], mask, scope, flags, n)
@@ -525,6 +532,16 @@ class Interpreter:
             # through to 'unsupported operator' when a lane reached it)
             return rt.to_bool(a) ^ rt.to_bool(b), BOOL
         if op in ('==', '!=', '<', '>', '<=', '>='):
+            if op in ('==', '!=') and same_matrix(at, bt) \
+                    and np.ndim(a) == 3 and np.ndim(b) == 3:
+                # two matrices are equal when every component is: one bool
+                # a lane. (They went on below, where `sw(x, [0])` of a matrix
+                # is its first COLUMN: the answer was a bool per lane and
+                # row, flattened -- an error in a ternary, and in an `if`,
+                # which cuts a condition to the lane count, "equal" for two
+                # matrices that differ outside that column.)
+                same = rt.mat_equal(a, b)
+                return (same if op == '==' else ~same), BOOL
             t = promote(at, bt)
             x = self.coerce(a, at, t, n)
             y = self.coerce(b, bt, t, n)
@@ -534,15 +551,39 @@ class Interpreter:
                  '>': np.greater, '<=': np.less_equal,
                  '>=': np.greater_equal}[op](x, y)
             return np.reshape(r, (-1,)), BOOL
-        if op == '*' and (at.is_matrix or bt.is_matrix):
+        # a matrix with a scalar under * / + or -: the operator on every
+        # component, and the matrix's type (GLSL 4.60, 5.9). Held to the
+        # values as well as the types -- the matrix the one array it is, the
+        # scalar one number a lane -- because a type here can be looser than
+        # its value (`pow(2.0, v)` is typed float and holds a vector, and
+        # `m * pow(2.0, v)` has always run as matrix * vector): what is not
+        # both goes on below exactly as it did
+        scaled = None
+        if op in ('*', '/', '+', '-'):
+            scaled = matrix_and_scalar(at, bt)
+            if scaled is not None:
+                m, s = (a, b) if scaled is at else (b, a)
+                if np.ndim(m) != 3 or np.ndim(s) > 1:
+                    scaled = None
+        if op == '*' and (at.is_matrix or bt.is_matrix) and scaled is None:
             if at.is_matrix and bt.is_matrix:
                 return rt.mat_mul_mat(a, b), at
             if at.is_matrix:
                 return rt.mat_mul_vec(a, b), GType(at.base, at.rows)
             return rt.vec_mul_mat(a, b), GType(bt.base, bt.n)
         t = promote(at, bt)
-        x = self.coerce(a, at, t, n)
-        y = self.coerce(b, bt, t, n)
+        if scaled is not None:
+            # the scalar against the lane axis (`rt.mat_scalar`). `*` handed
+            # it to einsum as a vector and typed the product a vector; `/`,
+            # `+` and `-` left it (lanes,) against (lanes, columns, rows),
+            # which NumPy lines up with the ROWS: an error at most lane
+            # counts, and at three lanes of a mat3 lane r's scalar on row r
+            # of every lane, without a word
+            x, y = (a, rt.mat_scalar(b)) if scaled is at \
+                else (rt.mat_scalar(a), b)
+        else:
+            x = self.coerce(a, at, t, n)
+            y = self.coerce(b, bt, t, n)
         if op == '+':
             r = x + y
         elif op == '-':
