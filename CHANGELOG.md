@@ -4099,8 +4099,9 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   (`Interpreter.assign`): `x += float(i++)` leaves `i` at 2 and adds 1.
   The value of an assignment through a swizzle or a vector component is
   the vector as it was (`a.x = b.x = 1.0` gives `a.x` the old `b.x`);
-  through an element, a column or a field it is the value written. A
-  matrix times or divided by a scalar still raises (the six above left
+  through an element, a column or a field it is the value written. Both
+  are closed since by the entry below ("The Coded Shader's assignments").
+  A matrix times or divided by a scalar still raises (the six above left
   it), and so does `m == m`. A `uniform mat3` on the node is a float
   socket (`KIND_TO_SOCKET`), so the uniform arrives as a float and every
   use of it fails -- unbound it is a zero matrix and works. A number
@@ -4117,6 +4118,220 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   lane against a plain Python run of the same program; the array field
   built and typed; every pair of -12 .. 12 divided; the ends of the
   32-bit range; the exact quotient that moves nothing).
+- **The Coded Shader's assignments: a compound assignment evaluates its
+  right side once, and an assignment through a swizzle answers what it
+  wrote.** Two wrong values in how an assignment is evaluated, both
+  listed under *Seen and left* by the entry above. Neither raised on the
+  shader it was reported with, and `shaders/compiler.try_compile` passed
+  both with error `None`. Each was reproduced headless first
+  (`try_compile(src)`, then `prog.run({}, {}, 4)`) on `claude-cloud` at
+  `f959f6d`, the merge that brought the entry above in (its
+  `Interpreter.hold` is what this stands on). (1) *A compound assignment
+  evaluated its right side twice.* `int i = 0; float x = 0.0; x +=
+  float(i++); Color = vec4(x, float(i), 0.0, 0.0);` gave (1, 2, 0, 0)
+  where the language gives (0, 1, 0, 0). `Interpreter.assign` evaluated
+  the right side, and for every operator but `=` then evaluated the
+  target (the value unused) and ran `self.binary(('bin', op[:-1], target,
+  value), ...)`, which evaluates both sides itself. Whatever the right
+  side wrote, it wrote twice. *What the read found with it*, each
+  reproduced before anything changed: `x -= float(--i)` from 10 and 3
+  gave 9 and left `i` at 1 (8 and 2); an assignment on the right, `x +=
+  (y += 1.0)`, gave 2 and 2 (1 and 1); a call that writes a global, `x +=
+  bump()` twice over `float bump() { g += 1.0; return g; }`, gave 6 and
+  left `g` at 4 (3 and 2); the seed of a random number, `acc += next(s)`
+  three times round a loop over `float next(inout int s) { s = s * 5 + 1;
+  return float(s); }`, gave 20343 and left the seed at 19531 (193 and
+  156); `for (int i = 0; i < 9; i += k++)` ran three passes (four); and
+  the same slip in all ten compound operators the parser knows, into
+  every kind of target -- a variable, a swizzle, a component, an element,
+  a column, a field. A call whose one write is an `out` argument wrote
+  the same value twice and showed nothing. *It was a cost as well*: every
+  `acc += f()` in a loop called `f` twice, and a function called there
+  whose own body sums in a loop doubled again inside. Measured at 200000
+  lanes on the container's Xeon, the two front-ends turn about, best of
+  nine: `acc += fbm(q + float(i))` over eight passes, `fbm` five octaves
+  of `s += a * hash(q)`, 871 ms before and 282 after; forty statements of
+  `col *= 0.5; col += tint;`, whose right sides call nothing, 86 and 85.
+  *The fix.* `Interpreter.binary` is the evaluation of its two sides and
+  `Interpreter.combine`, the whole arithmetic of an operator on two
+  values already evaluated; `assign` holds the target's indices,
+  evaluates the right side ONCE, reads the target and hands the two to
+  `combine`. *The order is the one the values that were used came out
+  of*, so a right side that writes nothing gives the same bits (held
+  below). The target's indices first (`Interpreter.hold`): `a[i++] +=
+  float(i)` adds the `i` the index left behind, as it did -- the value it
+  was given came from the second evaluation, after the index -- and `a[i]
+  += float(i++)` writes the element `i` named before the `++` (it wrote
+  the next one, and added the next `i`). That is the language's rule:
+  "Expressions on the left of an assignment are evaluated before
+  expressions on the right of the assignment" (the GLSL specification, on
+  assignments). Then the right side, then the target is read, after
+  whatever the right side wrote to it: `x += (x = 5.0)` is 10 as it was,
+  `x += x++` from 1 is 3 (it was 4) and `g += bump()` is 2 (3). The
+  specification says `lvalue op= expression` is `lvalue = lvalue op
+  expression` and no more; the order is the one glslang emits
+  (`GlslangToSpv.cpp`: the l-value, the right side, the load of the left,
+  the operation, the store), read from its source and not run. (2) *The
+  value of an assignment through a swizzle or a vector component was the
+  vector as it was.* `vec3 a = vec3(0.0); vec3 b = vec3(0.25); a.x = b.x
+  = 1.0; Color = vec4(a.x, b.x, 0.0, 0.0);` gave (0.25, 1, 0, 0) for (1,
+  1, 0, 0). In `Interpreter.store` the swizzle branch and the
+  vector-component tail of the index branch both ended `return base, bt`:
+  the whole vector read BEFORE the write, typed as the vector, where a
+  variable, a field, an element and a column answer what was written.
+  *What the read found with it*: `a.xy = b.yz = vec2(0.5, 0.75)` left
+  `a.xy` at the old `b.xy`; `a[1] = b[2] = 1.0`, by a number or by a
+  variable index, the same; `float f = (a.x = 0.5)` read 0.25; `(a.x +=
+  1.0)` answered the `a.x` from before the sum; `if ((a.x = 0.75) > 0.5)`
+  was not taken; `sq(a.x = 0.5)` squared 0.25; `m[1].x = m[0].y = 2.0`
+  and `m[1][0] = m[0][1] = 2.0` wrote the inner one alone (the outer got
+  the column as it was); `s.f = a.x = arr[1].y = 0.5` left `s.f` and
+  `a.x` at 0. *And a text every driver compiles raised.* The value was
+  typed as the whole vector, so `vec2 c = p + (a.xy = vec2(0.5));` was
+  `ShaderError: cannot combine vec2 with vec3` when a lane reached it,
+  and `m * (a.zy = v)` and `dot(p, a.xy = v)` were NumPy's `ValueError`
+  on the two shapes. Both branches answer what a read of the target finds
+  after the write, as the other four do: the components written, typed as
+  the swizzle (`rt.sw(merged, idx)`, `GType(bt.base, len(idx))`), and the
+  component read back through the same index (`subscript`: a per-lane
+  index answers per lane). It is what was written, not what was handed
+  over -- "an r-value with the type and precision of lvalue-expression":
+  `(k.x = 2.5)` of an `int3` in the HLSL dialect is 2, and `(k.x = 7) /
+  2` of an `ivec3` is 3. *The value is read back only when something
+  reads it.* A statement, the step of a `for` and the left of a comma
+  (`Interpreter.effect`), `++` and `--`, an `out` argument written back,
+  and each write on the way to a nested target (`a[i].y = x` writes
+  `a[i]` back) read no value: `store` is told (`used`) and answers
+  nothing there. Read back every time, the fix charged a statement for a
+  read nobody makes: twenty writes through a per-lane component index
+  (`v[k] = s;`, measured as above) went from 255 ms to 280, a tenth,
+  three rounds running. Told, they are 255 and 259 at the best of thirty
+  and 270 and 269 at the median: the work they did. (An element or a
+  column written through an index fetched its answer every time and
+  dropped it; a statement no longer does.) *The name check.*
+  `shaders/names.py` types an assignment to anything but a plain variable
+  as nothing it judges, before and now, and is the file it was, byte for
+  byte: no text is refused that compiled (held below). What its silence
+  leaves to the run: a text that used the old vector AS a vector -- no
+  driver compiles one -- ran, and is told the width when a lane reaches
+  it. `vec3 c = b + (a.xy = v)` is `cannot combine vec3 with vec2` (it
+  added the old `a`), and `(a.x = 1.0).y` is NumPy's `IndexError` (it
+  read the old `a.y`); in a branch no lane takes both still run. The
+  run's type for every assignment is now the type the name check computes
+  for its target, so it could say both where they are written: left,
+  below. *Nothing that compiled and ran correctly is refused or moves.*
+  Held five ways. The suite, `python3 -m halcyon.tests.run_all` on the
+  unchanged head and on the changed tree, the checks compared line by
+  line: 13737 checks pass and 32 FAIL lines are printed before (each the
+  `halcyon-1.89.0.zip` no fresh container has beside the package), 13793
+  pass and the same 32 lines are printed after, character for character
+  and in the same order; no check is lost, the 13737 stand in the order
+  they stood in (35 of their lines print a run's own detail after the
+  check -- a timing, a thread id, a temporary directory, the order a set
+  prints in -- and differ in that alone) and the 56 more are the new
+  ones. Every compile and every run the suite makes, repeated by the
+  unchanged front-end imported beside the changed one on the same
+  uniforms and inputs: 4035 distinct sources through `try_compile` (3523
+  compile in both to the same outputs, uniforms, inputs and warnings, 512
+  are refused in both in the same words, none differs) and 10637 runs of
+  2709 distinct programs. Outside the three new tests every run returns
+  the same arrays -- values, shapes and dtypes -- and the same discard
+  mask (5 raise, the same error in both): 10402 runs of 2482 programs.
+  The other 235 are the new tests' shaders, 211 of which answered
+  otherwise before. The suite's runs execute 102734 compound assignments
+  over 115.7 million live lanes; each evaluated its right side twice
+  before. *The engine's own GLSL*, asked because the simulators run it
+  through this interpreter: does any pass hold a compound assignment
+  whose right side writes? The enumeration of `tests/glsl_strict.py` with
+  a recorder standing where glslang stands (every engine model at every
+  rate, shadows off and on, every console type and option, the cel
+  masters, the shadow kinds, the post stages, the sky and raster
+  fragments, the coded shaders by node name, the emission routes: 561
+  distinct texts, 551 fragment and 10 compute) holds 19335 compound
+  assignments in the fragments, parsed by this front-end and walked for
+  what writes -- `++` and `--`, an assignment, and a call of any function
+  that has an `out` parameter, or that writes a global or discards,
+  itself or through what it calls -- and 50 in the compute texts, which
+  this front-end does not parse (their right sides were read as tokens:
+  no `++`, no `--`, no assignment, no call at all). None writes, and none
+  uses the value of an assignment through a field, a swizzle or an index.
+  The same walk over every source the suite hands the compiler and the
+  compiler takes (3523: the simulators' own pass texts, the ray kernels,
+  the ink pass, the sky, the twins, the tests') finds 43912 compound
+  assignments in the 1391 the engine itself asks for, none writing; 4117
+  in the 633 the other test modules ask for, ONE text writing; and in
+  `tests/test_shaders.py` the 152 sources of the three new tests and no
+  other. The one is an engine text off the deferred road: the
+  per-material shader `gpu/material.assemble` builds
+  (`capability.material_shader`, which nothing calls at run time; the
+  suite compiles it in `test_assembled_material_shader_matches_cpu`) sums
+  its lights as `total += hal_one_light(...)`, and `hal_one_light`
+  reaches `hal_evaluate2`, which leaves a coloured diffuse in the global
+  `hal_dif_rgb` for its caller to read. Evaluated twice it wrote the same
+  value twice: the frame is the same bits before and after, and each
+  light was computed twice. (The deferred pass calls it in a declaration,
+  `vec4 ds = hal_evaluate(...)`, and adds to its sums on lines of their
+  own.) 6000 seeded random programs of what ran correctly before (every
+  scalar, vector and matrix type, the ten compound operators, plain and
+  chained assignments through variables, fields, elements and columns,
+  swizzle and component writes as statements, branches and loops: 36385
+  compound assignments, no right side writing) were compiled and run by
+  the unchanged front-end and the changed one: all compile and run in
+  both, to the same bits and dtypes. 6000 more with `i++`, calls that
+  write and assignments on the right, and the value of swizzle and
+  component assignments, mixed in (42814 compound assignments): the 629
+  in which the scan above finds neither are the same bits; of the other
+  5371, 405 are the same bits, 2782 differ and 2184 raised before and run
+  (the vector's width, as above); none is newly refused and none newly
+  raises. Switched off one at a time, the first fix alone moves 1925 of
+  them, each with a writing right side, and the second alone 4383, each
+  using such a value; with both off all 12000 are the old run bit for bit
+  -- the split of `binary`, `effect` and `used` move nothing by
+  themselves. And 42 of 44 mutations of the fix each fail the tests; the
+  two that do not change nothing a shader can observe (the sum handed to
+  `store` under the right side's type, which a conversion passes through;
+  the swizzle's value answered for the lanes outside the branch, which
+  nothing stores) -- no one of the 12000 seeded programs tells either
+  from the fix. What IS newly refused is nothing, at compile time; when
+  run, the two texts above that no driver compiles. What changes value
+  is, by intent: a compound assignment whose right side writes, and an
+  expression that uses the value of an assignment through a swizzle or a
+  vector component -- and what such a text raised on, runs. *Seen and
+  left* (each reproduced; none is one of the two): a PLAIN assignment
+  still evaluates its right side before the index of its target, where
+  the language -- and `op=` here -- takes the left first: `a[i++] =
+  float(i) + 1.0` from 0 writes 1 to `a[0]` (a driver: 2) and `a[i] =
+  float(i++) + 1.0` writes `a[1]` (a driver: `a[0]`); only a target whose
+  index writes, or reads what the right side writes, can tell. `?:`
+  evaluates both of its arms for every lane and selects, and `&&` and
+  `||` evaluate both sides: `true ? i++ : j++` moves both, `false && (i++
+  > 0)` moves `i` (the language evaluates one arm, and the right side
+  only when the left has not settled it). `switch (i++)` evaluates its
+  selector once for every `case` it is compared with -- the parser lowers
+  a switch to an if / else-if chain that repeats the expression -- so
+  from 1 `i` ends at 4 and no case runs; and a `case` with no statement
+  does not fall into the next (`case 0: case 1: x = 2.0;` leaves `x`
+  alone for 0). A swizzle that names a component twice is accepted as a
+  target (`a.xx = vec2(0.5, 0.75)` leaves 0.75), which the language
+  refuses. The name check does not type the value of an assignment
+  through a field, a swizzle or an index, so the two texts above are
+  refused by the run and not where they are written. `m *= 2.0` raises
+  with `m * 2.0`, as the entry above left it. And a component of a `uvec`
+  at 2^31 or above reads back negative (`uvec3 u = uvec3(0xfffffffeu);
+  float(u.x)` is -2 for 4294967294): an unsigned vector is held as int32,
+  where a `uint` is held wide. Pinned in `tests/test_shaders.py` (three
+  tests, 56 checks: each reported shader at 1, 2, 3, 4 and 7 lanes; every
+  compound operator the parser knows and every kind of target with `i++`
+  on the right; the order, by seven texts; a seed advanced under a
+  per-lane trip count and `++` on the right under a branch; the calls
+  counted; float, vector, int and uint chains whose right sides write
+  nothing held to NumPy's float32 operation for operation; chains through
+  swizzles, components, columns, fields and elements; the value's type
+  and width; per-lane chains under a branch; the reads counted, fourteen
+  statements; and 150 seeded programs of plain, chained and compound
+  assignments, 1811 of them, every lane equal to a plain-Python run of
+  the same program). On the unchanged interpreter 49 of the 56 fail; the
+  7 that pass are the ones that hold what must not move.
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
@@ -4545,6 +4760,19 @@ What headless cannot prove, per feature (the fakebpy / fakeblender stubs validat
   a coded shader never reached a driver either: a matrix uniform is
   refused for the deferred pass by name, a local matrix is inlined as
   written.
+- The Coded Shader's assignments on a driver (proven against the headless
+  evaluator alone, and against glslang's source, which was read and not
+  run): a node whose loop sums a random number through an `inout` seed
+  (`acc += next(seed)`), or that chains through swizzles (`a.x = b.x =
+  1.0`), inlined in the deferred pass on a real GPU against the CPU frame
+  of the same file. The two roads disagreed on both -- the CPU road
+  advanced the seed twice a pass -- and should agree now; no driver was
+  asked. The case to look at is the one order this takes from glslang and
+  not from the text of the language: `x += (x = 5.0)`, `x += x++` and `g
+  += f()` where `f` writes `g` read the target AFTER the right side has
+  run. A driver with a front-end of its own may read it before; a shader
+  whose compound assignment writes its own target on the right is the
+  only one that can tell.
 - The release machine itself, where the zips are (the cloud-container
   fix was proven on the container's one Xeon, with the kernel varied by
   `OPENBLAS_CORETYPE` and the previous engine stood in for by this
