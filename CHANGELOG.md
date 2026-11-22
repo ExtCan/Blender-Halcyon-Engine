@@ -4117,6 +4117,215 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   lane against a plain Python run of the same program; the array field
   built and typed; every pair of -12 .. 12 divided; the ends of the
   32-bit range; the exact quotient that moves nothing).
+- **The Coded Shader's matrix with a scalar, and two matrices compared.**
+  Valid GLSL on a matrix went through `shaders/compiler.try_compile` with
+  error `None` and raised in `prog.run` -- or, at the one lane count that
+  equals the matrix's rows, answered along the wrong axis without a word.
+  It is what the two Coded Shader entries above listed under *Seen and
+  left*. Each was reproduced headless first (`try_compile(src)`, then
+  `prog.run({}, {}, 4)`) on `claude-cloud` at `f959f6d` (this stands on
+  the one-array matrix of the entry above), every body inside `out vec4
+  Color; void main() { mat3 m = mat3(1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0,
+  0.0, 3.0); ... }`. *The reported five.* `mat3 k = m * 2.0;` raised
+  `ValueError: einstein sum subscripts string contains too many
+  subscripts for operand 1`, `mat3 k = 2.0 * m;` the same for operand 0
+  and `m *= 2.0;` the same; `mat3 k = m / 2.0;` raised `ValueError:
+  operands could not be broadcast together with shapes (4,3,3) (4,)`;
+  `Color = vec4(m == m ? 1.0 : 0.0);` raised the same from the ternary's
+  select, on `(12,) (4,) (4,)`. *Three roads, one misfit.* A matrix is
+  one (lanes, columns, rows) array and a scalar is (lanes,). (1)
+  `Interpreter.binary` sent every `*` with a matrix on one side to the
+  linear products (`rt.mat_mul_vec` / `rt.vec_mul_mat`), so a scalar was
+  handed to `einsum` as if it were a vector -- and the product was typed
+  a vector. (2) `/`, `+` and `-` went through `gtypes.promote`, which
+  answers the matrix, then `coerce`, which leaves a value bound for a
+  matrix as it is, then plain NumPy: (lanes,) against (lanes, columns,
+  rows) lines up with the LAST axis, the rows. At most lane counts that
+  is the error above. At the lane count that equals the row count --
+  three lanes of a `mat3`, two of a `mat2`, four of a `mat4` -- it RAN,
+  lane r's scalar applied to row r of every lane. With one number on
+  every lane (a literal) that is the right answer by accident; with a
+  scalar that differs by lane it is not: `mat3 k = m / x;` of a varying
+  `x` that is 1, 2, 3 on three lanes answered `k * vec3(1.0)` = (1, 1, 1)
+  on every lane, where lane 0 is (1, 2, 3), lane 1 (0.5, 1, 1.5) and lane
+  2 (1/3, 2/3, 1). At ONE lane it ran and was right, which is how a test
+  of one lane would have passed. (3) A comparison took component [0] of
+  each side (`rt.sw(x, [0])`), which of a matrix is its first COLUMN: a
+  bool per lane and row, flattened. In a ternary, or stored in a `bool`,
+  that was the error above. In an `if`, which cuts its condition to the
+  lane count (`as_lane_mask`), it ran at every lane count: `mat3 k = m;
+  k[2][2] = 9.0; if (m == k) { ... }` was TAKEN, and `if (m != k)` was
+  not -- two matrices were equal unless they differed in their first
+  column, and there the rows read were another lane's. *Found by the same
+  root, reproduced the same way*: the scalar on the left of `-` and `/`
+  (`1.0 - m`, `6.0 / m`); `m += 1.0`, `m -= 1.0`, `m /= 2.0`; `m++`,
+  `++m`, `m--` and `--m`, which added the one as (lanes,) (`operands
+  could not be broadcast together` at four lanes); a scalar of another
+  base (`m * 2` raised as `m * 2.0` did, and `m / 2`, at the lane counts
+  where it ran, carried the whole matrix into float64 -- a precision no
+  GPU has); and one at COMPILE time: `Color = vec4((m * 2.0)[1].xyz,
+  1.0);`, a text every driver compiles, was refused -- `swizzle 'xyz' out
+  of range for float` -- because the name check typed the product a
+  vector by the interpreter's rule, so a column of it was a float. *The
+  fix is one rule, asked in both places.* `gtypes.matrix_and_scalar`
+  answers the matrix of a pair that is one matrix and one scalar -- a
+  float, an int, a uint or a bool; not a vector, a struct, a sampler or
+  an array of anything -- and under `*`, `/`, `+` and `-`, whichever side
+  the scalar is on, that pair is the operator on every component and has
+  the matrix's type, as the language has it. `Interpreter.binary` shapes
+  the scalar against the LANE axis (`rt.mat_scalar`: (lanes,) to (lanes,
+  1, 1), float32 as a matrix's components are) and then runs the same
+  four lines of arithmetic it ran, the zero-divisor guard with them (the
+  rule is asked only where one side's type has rows: a shader with no
+  matrix in it times the same); the compound forms are those operators
+  (`Interpreter.assign`), and `++` / `--` take the same shape
+  (`Interpreter.stepped`, the two copies of that line made one). `==` and
+  `!=` of two matrices of one shape are `rt.mat_equal` and its negation:
+  one bool a lane, true where EVERY component is equal.
+  `NameCheck.binary` types a matrix times a scalar as the matrix it is,
+  where it typed a vector and marked it loose so that nothing computed
+  from it was judged; `/`, `+` and `-` were typed the matrix already.
+  *Held to the value as well as the type.* A type here can be looser than
+  its value: `pow(2.0, v)` is typed float, by its first argument, and
+  holds a vector, and `m * pow(2.0, v)` has always run -- as matrix *
+  vector, (2, 8, 24) for the `m` above and `v` = (1, 2, 3). So the rule
+  is taken where the matrix is the one array and the scalar is one number
+  a lane; anything else goes down the road it went, and that shader
+  answers what it did. The name check reads the same from the width it
+  already keeps: the product of a matrix and a float that may hold a
+  vector is marked loose, a matrix, and not judged. (That width is an
+  upper bound -- a builtin's result is as wide as its widest argument --
+  so `m * dot(a, b)` is one of these: it runs, as the matrix, and nothing
+  computed from it is judged.) For the same reason a float handed in for
+  a `uniform mat3` (below) is not taken for a matrix: it raises as it
+  did, where shaped as one it would answer a (lanes, 1, lanes) array
+  without a word. *What the compile says, counted.* 5724 sources -- 19
+  kinds of scalar (a literal of each base, a variable, a component, a
+  builtin's result, a float that holds a vector, the result of an
+  overloaded function, a struct, an array) by the four operators by both
+  sides, by 18 things done with the product (a swizzle, a column, a
+  component, a second operator), in a live line and in a branch no lane
+  takes, and seven other products -- were compiled by the unchanged
+  front-end and by the changed one and run at 1, 3 and 4 lanes. 88 are
+  newly refused, by intent: `.x` and `.xyz` taken straight from the
+  product of a matrix and a known scalar (`(m * 2.0).xyz` is `line N:
+  'xyz' of mat3: a matrix is indexed first`). Half stand in a live line,
+  where the product raised at every lane count; half in a branch no lane
+  takes, where the text compiled and ran, as an undeclared name there
+  once did. A width computed from the product is judged with them (`(m *
+  2.0) * vec3(1.0) + r` of a `vec2 r` is `cannot combine vec3 with
+  vec2`). 92 that were refused now compile, 46 of them in a live line: 30
+  run -- a swizzle of a column of the product, `(m * 2.0)[1].xyz`, for 15
+  kinds of scalar on either side -- and 16 raise when a lane reaches
+  them, none of them any driver's GLSL: `.w` of a product whose scalar a
+  builtin computed from vectors (it was `out of range for vec3`; the
+  product may be the matrix and is left to the run) and `[1].xyz` of a
+  matrix times a float that holds a vector. 112 are refused in both in
+  other words (`(m * 2.0)[1].w` was out of range for float and is out of
+  range for vec3), 812 in the same words, and of the 4620 that compile in
+  both no run that succeeded raises now. *What changes value* is, by
+  intent: `/`, `+`, `-`, their compound forms and `++` / `--` of a matrix
+  with a scalar that DIFFERS BY LANE at the lane count equal to the row
+  count (the wrong axis, above); `==` / `!=` of two matrices wherever it
+  ran (an `if` at any lane count; a ternary or a `bool` at one lane,
+  where the answer had a lane for every row); and a matrix combined with
+  an int, a uint or a bool at one lane or at the row count, which is
+  float32 where it was float64 (the same number to within an ulp of
+  float32). Everything else that ran, runs to the same bits. *Nothing
+  that compiled and ran correctly is refused, and nothing else moved.*
+  Held four ways. The suite, `python3 -m halcyon.tests.run_all` on the
+  unchanged head and on the changed tree, the checks compared line by
+  line: 13737 checks pass and 32 FAIL lines are printed before (each the
+  `halcyon-1.89.0.zip` no fresh container has beside the package), 13763
+  pass and the same 32 lines are printed after, character for character
+  and in the same order; no check is lost and the 26 more are the new
+  ones (33 other lines print a timing, a thread id or a temporary path
+  and differ in that alone). The engine's own GLSL holds no matrix type
+  (`mat2` / `mat3` / `mat4` occur in no shader text under `gpu/`, `core/`
+  or `nodes/`), and no shipped preset or template does, so only a Coded
+  Shader source can reach a changed line -- and a second run of the
+  suite, with a recorder on the two helpers every changed road goes
+  through (`rt.mat_scalar`, `rt.mat_equal`; hooked from outside, the tree
+  untouched), reaches them 4097 times, every one from
+  `tests/test_shaders.py`: no engine pass and no scene the suite renders
+  arrives there. 6000 seeded random shaders of what the change must not
+  touch -- every matrix form that ran (`m * v`, `v * m`, `m * m`, `m +
+  m`, `m - m`, `m / m`, `-m`, `transpose`, `matrixCompMult`, columns and
+  components read and written, a ternary of two matrices) mixed with
+  forms outside the language, which are to do whatever they did (`m + v`,
+  `m < k`, `m % s`, `m == s`, `mix(m, k, s)`, `m * pow(2.0, v)`, `v ==
+  v`) -- were each run at 1, 2, 3, 4 and 7 lanes by the unchanged
+  front-end and by the changed one: of the 30000 runs 23377 return the
+  same arrays (values, shapes, dtypes) and the same discard mask and 6623
+  raise the same error in the same words; none differs. 6000 more of
+  valid GLSL with the fixed forms mixed in (`*`, `/`, `+`, `-` with a
+  float on either side, the compound forms, `++` and `--`, `==` and `!=`,
+  in `mat2`, `mat3` and `mat4`) were held against a reference that
+  evaluates ONE LANE AT A TIME, a component at a time, and so cannot line
+  a scalar up with the wrong axis. The changed front-end runs all 30000
+  and 29937 are the reference bit for bit; the other 63 are 15 `mat4`
+  programs within 7e-5 of it, where the unchanged linear product sums a
+  row of four in pairs or in order by the operand's memory layout
+  (`einsum`) -- each of the 15, run one lane at a time by the changed
+  front-end itself, is its own seven-lane run bit for bit. Of the same
+  30000 the unchanged front-end raised in 28789, answered the same bits
+  in 620 and another answer in 591: 297 a comparison's flattened bools at
+  one lane (another shape), 294 another value at the lane count equal to
+  the row count. 6000 more with an int, a uint or a bool for the scalar:
+  29934 the reference bit for bit and 66 (16 `mat4` programs) the same
+  sum order; the unchanged front-end raised in 28779, answered the same
+  bits in 347 and another answer in 874 -- 279 a comparison misread at
+  one lane, 246 another value at the row count, and 349 the same
+  computation carried through float64 by the int, uint or bool (343
+  within an ulp of the reference's float32; the other 6 to a part in a
+  million, or finite where float32 overflows). In none of the 90000 runs
+  does a run that succeeded before raise now, and no source is newly
+  refused. And 35 of 36 mutations of the fix each fail the tests; the one
+  that does not (`==` taking two matrices of different shapes) changes
+  only which NumPy error a `mat2 == mat3` raises. *Seen and left* (each
+  reproduced; none is this entry's): HLSL's `mul(m, s)` of a matrix and a
+  scalar is the same misfit by another road -- `rt.mul` falls through to
+  `a * b`, so it raises at four lanes, runs at one and at three, and
+  `_mul_rule` types it a vector; the operator (`m * 2.0`, in either
+  dialect) is what is fixed, because the builtin's type rule reads types
+  alone and cannot tell `mul(m, 2.0)` from `mul(m, pow(2.0, v))`, which
+  runs. What the language does not have for a matrix still does what it
+  did: `m + v`, `m % 2.0`, `m == 2.0` and `mix(m, k, 0.5)` raise at four
+  lanes and answer something at one and at three, `m < k` in an `if` runs
+  at every count on the first column's rows, and two matrices of
+  different shapes raise from NumPy. `m * true` runs, as `m * 1.0`: a
+  bool is a number in this front-end's arithmetic, as it is against a
+  vector. Two VECTORS compare by their first component alone --
+  `vec3(1.0, 2.0, 3.0) == vec3(1.0, 5.0, 6.0)` is true and `!=` false --
+  by the same `rt.sw(x, [0])` a matrix no longer reaches; a driver
+  compares all three. The recorder above counted that line as well: no
+  run in the whole suite compares two vectors with `==` or `!=` (0
+  sites), so nothing the suite holds would move. It is left because the
+  two dialects part on the answer (GLSL: one bool, every component; HLSL:
+  a bool a component), which is a decision and not a repair. The type
+  table has square matrices alone (`mat2x3 m;` is `expected ';', found
+  'm'`), and a product of two matrices is typed as its left operand,
+  which is the language's type while both are square (`outerProduct` and
+  `transpose` are the only ways to another shape). A `uniform mat3` on
+  the node is still a float socket (`KIND_TO_SOCKET['MATRIX']` in
+  `nodes/shader_nodes.py`): the uniform arrives as one float a lane and
+  every use of it raises, `M * 2.0` included -- unbound it is a zero
+  matrix and works. What one float should mean for a matrix uniform
+  (nothing, and no socket; the scale of an identity, `mat3(f)`; or nine
+  sockets) is a product decision, and it is left as one. Pinned in
+  `tests/test_shaders.py` (two tests, 25 checks, and one more in the
+  widths test, whose "not judged" case for this product is now a shader
+  with a value: each reported shader at 1, 3, 4 and 7 lanes; 25 forms on
+  a matrix made 18 ways at those four counts, 1800 shaders; `mat2`,
+  `mat3` and `mat4` with a scalar and a matrix that both differ by lane,
+  bit for bit at 1, 2, 3, 4 and 7 lanes -- each matrix at the count where
+  its row axis fitted; a float, an int, a uint and a bool on either side
+  of the four operators; a copy that differs in one component on
+  alternate lanes, each of the nine in turn; a matrix of one lane against
+  a scalar of five; the two compile errors, the swizzle that was refused,
+  and the three things left as they were). Run against the unchanged
+  front-end, every one of those checks fails or raises but the three that
+  hold what was left.
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
@@ -4545,6 +4754,18 @@ What headless cannot prove, per feature (the fakebpy / fakeblender stubs validat
   a coded shader never reached a driver either: a matrix uniform is
   refused for the deferred pass by name, a local matrix is inlined as
   written.
+- A matrix scaled, stepped and compared in a coded shader of a live file
+  (proven against the headless evaluator alone): a node whose source
+  builds a `mat3`, multiplies and divides it by a varying (`m * vUV.x`,
+  `m / (1.0 + vUV.y)`), adds a float to it and compares it with a copy
+  (`if (m == k)`), shading an F12 frame on the CPU road, where `prog.run`
+  raised; `(m * 2.0).xyz` drawing `line N: 'xyz' of mat3: a matrix is
+  indexed first` in the box under the Compile button. NOT run on a
+  driver: the same source inlined in the deferred pass, where a local
+  matrix is inlined as written and the driver's own `m * 2.0` and `m ==
+  k` answer -- the frame the CPU road should now match. And a `uniform
+  mat3` on a node in a live file: the float socket it is given, and the
+  error a use of it raises, are as they were.
 - The release machine itself, where the zips are (the cloud-container
   fix was proven on the container's one Xeon, with the kernel varied by
   `OPENBLAS_CORETYPE` and the previous engine stood in for by this
