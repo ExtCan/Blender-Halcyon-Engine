@@ -5,8 +5,8 @@ and the console-shader deep re-read the field log asked for. Each item
 below was reproduced headless before it was fixed and is pinned in
 `tests/test_r253_review.py` (registered in `run_all`); the Coded
 Shader's name resolution is pinned in `tests/test_shaders.py` as well,
-and its matrices, indexed writes, array fields and integer division
-there alone.
+and its matrices, indexed writes, array fields, integer division and
+array sizes there alone.
 
 ## CHANGELOG
 
@@ -2638,7 +2638,8 @@ there alone.
   float, because `Parser.parse_array_suffix` reads a number and nothing
   else (`#define N 3` works); reads through any index answer that one
   float, as they did, and a write past index 0 is refused by name, as it
-  raised. A compound assignment evaluates its right side twice
+  raised -- closed since, in the next entry: a size is a constant
+  expression. A compound assignment evaluates its right side twice
   (`Interpreter.assign`): `x += float(i++)` leaves `i` at 2 and adds 1.
   The value of an assignment through a swizzle or a vector component is
   the vector as it was (`a.x = b.x = 1.0` gives `a.x` the old `b.x`);
@@ -2660,6 +2661,151 @@ there alone.
   lane against a plain Python run of the same program; the array field
   built and typed; every pair of -12 .. 12 divided; the ends of the
   32-bit range; the exact quotient that moves nothing).
+- **The Coded Shader's arrays sized by a constant expression.** `const int
+  N = 3; float a[N];` declared ONE float -- the first of the *Seen and
+  left* of the entry above, and what that entry kept two refusals loud for.
+  The source went through `shaders/compiler.try_compile` with error `None`;
+  then `a[0] = 0.5; Color = vec4(a[0], a[2], 0.0, 1.0);` answered (0.5,
+  0.5, 0, 1) -- `a[2]` read `a[0]` -- `a[1] = 0.5` raised `ShaderError:
+  index 1 is out of range for float`, and the loop that fills the array
+  (`for (int i = 0; i < N; i++) a[i] = ...`) raised `float is not an array,
+  a vector or a matrix: a variable index cannot write to it`. A read
+  through any index answered the one float without a word. `#define N 3`
+  worked: the preprocessor had put the number there before the parser
+  looked. Reproduced headless first (`try_compile(src)`, then `prog.run({},
+  {}, 4)`) on `claude-cloud` at `31aa3f1` with the entry above merged in
+  (`d289722`; on `31aa3f1` alone, which that entry had not reached, the
+  same float under the older errors). *The root.*
+  `Parser.parse_array_suffix` (`shaders/parser.py`) handed the expression
+  in the brackets to `_const_int`, which knew a number, and a minus in
+  front of one, and answered 0 for anything else -- and 0 is how a
+  declarator WITHOUT brackets is told apart. So a size the parser could not
+  read was no array at all: a plain `float`, in each of the four places the
+  one suffix parser serves (a global, a local, a parameter, a struct's
+  field). The expression itself was dropped where it was parsed, so the
+  name check (`shaders/names.py`), which walks the tree, never saw it:
+  `float a[UNDECLARED];` compiled too. *A size is a constant expression,
+  computed where it is parsed* (`Parser.array_size`). It is what the
+  language says it is (GLSL 4.3.3): a number; a `const` declared above the
+  brackets with a constant initialiser, global or local; and an operator, a
+  constructor or a builtin function applied to those -- `N`, `N * 2`, `N +
+  1`, `(N + 1) / 2`, `N > 2 ? N : 2`, `int(R) + 1`, `max(A, B)`, a
+  component, an element or a field of a constant (`D.y`, `T[1]`, `K.n`),
+  and constants made of constants to any depth. Its type has to be int or
+  uint and its value at least 1. *One arithmetic.* The parser does not
+  compute a size with an evaluator of its own: it hands the expression to
+  the interpreter's `Interpreter.expr` on one lane (`interp.fold`), each
+  constant first converted to its declared type as its declaration converts
+  it. The number in the brackets is therefore the number the same
+  expression gives in the body of the shader -- `N / 2` is cut toward zero
+  in both, by the one line the entry above put in `binary` -- and a loop
+  bound written like a size is that size. The name check walks the
+  expression before it is computed (`names.check_constant`), so what is
+  wrong in a size is refused in the words it is refused in anywhere else
+  (`swizzle 'z' out of range for ivec2`, `max() takes 2 arguments, got 1`).
+  *Which constant a name is.* The parser keeps the scopes the interpreter
+  and the name check build -- the root, a function's parameters, a block,
+  the head of a loop; an `if` arm and a `switch` case are blocks of their
+  own -- and records EVERY declared name in them (`Parser.declare`): its
+  constant, or the words for why it is not one. So an `int N` in a block
+  hides the `const int N` above it, and a size that names it there is
+  refused for what it is instead of given the outer 3; a constant is in
+  scope from the statement after its declaration, whose initialiser still
+  saw the outer name (`const int N = N + 1;` is 4 below a global 3); a
+  constant of a block, a loop or another function is gone outside it.
+  *Nothing is computed for a shader whose sizes are numbers.* A `const` is
+  recorded when it is declared -- a walk of its initialiser that finds the
+  constants it names, no arithmetic -- and evaluated the first time a size
+  names it, once. A number in the brackets takes the road it took
+  (`_const_int`). *Decided: what is not a size is a compile error.* Each of
+  these declared a float, compiled, and ran for as long as the shader
+  touched `a[0]` alone; a driver compiles none of them, and on the GPU road
+  -- where the Coded Shader's text is inlined in the deferred pass (`float
+  a[_cn0_N];`) and the driver computes the size itself -- the port handed
+  the text over as it was written. Each is refused at the line of its
+  bracket now, wherever that stands (a function nothing calls, a branch no
+  lane takes), and `gpu/emit._port_code_node` refuses the same source
+  before a driver sees it (`the coded shader does not parse: ...`). *A name
+  nothing above the brackets declares*: `line 3: undeclared identifier
+  'UNDECLARED'`, the name check's own words. That includes a constant
+  declared BELOW the size, which is a driver's answer too (the body of a
+  function reads a global wherever it is written, here; a size does not).
+  *A size that is not a compile-time constant*, GLSL's own rule: `line 4:
+  array size is not a compile-time constant: 'count' is a uniform` -- and
+  `is an input`, `is not declared const`, `is a parameter` (const or not),
+  `is a cbuffer's member`, `'n' has no initialiser`, `the initialiser of
+  'n' is not constant ('count' is a uniform)`, `three() is the shader's own
+  function`, `texture() is not evaluated at compile time`, `it assigns`,
+  `it writes (++ or --)`, `it holds a comma`. *A constant that is not an
+  int*: `array size must be an int, this is a float` (a `const float`, `N *
+  1.5`, a bool, a vector). *An int that is no size*: `array size must be at
+  least 1, not 0` -- a constant that is zero or below, and the number 0
+  written out, which declared the same float (`float a[-1];` was `float
+  a[];`); and `1 / 0` is `array size does not fit an int`. *A number in the
+  brackets is the size it was*: `3`, `3u`, and -- this front-end's own
+  latitude, no driver's -- `3.0` as 3; `[]` is sized by its initialiser.
+  One spelling is new: `float a[0x10];` failed the compile with `TypeError:
+  float expected at most 1 argument, got 2` (`_const_int` called
+  `float(text, 0)`) and is 16. *The builtins a constant may call* are the
+  ones written down as such (`builtins.CONSTANT`: the trigonometric,
+  exponential, common, geometric, matrix and relational functions, and
+  their HLSL spellings) -- not a texture read, a screen-space derivative,
+  `clip`, or Halcyon's own extensions, which no driver has to fold. The
+  shader's own function is never a constant, by the language's rule; and
+  since a function the shader defines hides the builtin of its name in
+  every call when it runs, wherever it is defined, a size computed through
+  `max` in a shader that goes on to define `max` is refused with it.
+  *Nothing that compiled and ran correctly is refused, and nothing else
+  moved.* 4000 seeded programs (globals, uniforms, a struct's field, a
+  parameter and locals in nested blocks, branches, loops and switches, six
+  element types, one in five in the HLSL dialect), each written twice. With
+  numbers for sizes, both parsers build the same tree, 4000 of 4000, and
+  the unchanged and the changed front-end run them to the same bytes. With
+  each size spelled through the constants in scope (`K1`, `K2 + 1`, `K3 -
+  2`, `K1 * 3`, `(K2 * 2 - K2) / 4 * 5`) the changed parser builds the tree
+  of the numbered spelling, 4000 of 4000 -- a size is a number in the tree
+  -- and the program runs to the numbered program's bytes; the unchanged
+  front-end compiled 835 of those 4000, ran 384, and answered the numbered
+  program's bytes for 365 and other numbers for 19: the aliasing, in
+  silence. And 54 of 55 mutations of the fix each fail the tests; the one
+  that does not (the body of a `for` given no scope of its own) changes
+  nothing a size can observe, the scope of the loop's head ending where the
+  body's would. *What IS newly refused* is, by intent, a text no driver
+  compiles: a size that is not a constant int of at least 1, in the words
+  above; and a member taken from an array sized by a name (`a.x`: `'x' of
+  float[3]: an array is indexed first (a[0].x)`, as for one sized by a
+  number -- it was a float, and a float has an `.x`). *What changes value*
+  is, by intent: a read past element 0 of an array sized by a name, which
+  answered element 0. With sizes resolved the two refusals fire for what
+  they name alone: `a[6] = x` of a `float a[N * 2]` is `index 6 is out of
+  range for float[6]`, and `f[i] = x` is a variable index into a float.
+  *Seen and left* (each reproduced; none is this defect): a `const` can be
+  assigned -- `N = 5;` compiles and `N` reads 5 after it, where a driver
+  refuses the text; a size is the constant's initialiser whatever is
+  assigned later. An index written as a constant expression (`a[N] = x` of
+  a `float a[N]`) is a variable index to the write: past the size it is
+  clamped onto the last element, where the number written out is refused by
+  name. `float a[2][3];` is an array of three -- the last suffix wins;
+  there are no arrays of arrays. `float[3] a;`, the size written on the
+  type, does not parse (`expected ';', found '3'`). The size written in an
+  array constructor (`float[N](0.25, 0.5)`) is parsed and not held against
+  the arguments: an array declared three holds two elements. A float
+  written as a size (`a[3.0]`; `a[2.5]` is two elements) still declares the
+  array where a driver refuses it. `float b[];` with no initialiser is one
+  element. Arithmetic on a whole array (`a + 1.0`, `a = 0.5` of a `float
+  a[3]`) compiles and raises NumPy's `ValueError` when run. A screen-space
+  derivative of a constant is a constant in the language (zero) and is not
+  folded here (`dFdx() is not evaluated at compile time`). Pinned in
+  `tests/test_shaders.py` (three tests, 109 checks: each reported shader at
+  1, 2, 3, 4 and 7 lanes; 26 ways to write a size, each compiled beside the
+  same program with the number written out and run per lane -- every lane
+  changes the element its own index names -- to the same arrays, to
+  NumPy's, and to the number in the tree; the seven places a declarator
+  stands; the HLSL dialect; the scopes; 58 refusals, each by its whole
+  message; the numbers a size could always be; nothing computed for sizes
+  written as numbers, and no NumPy warning from one that is; 300 seeded
+  constant expressions whose declared size, value in the body of the shader
+  and value in plain Python agree).
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
@@ -2830,6 +2976,22 @@ there alone.
   a coded shader never reached a driver either: a matrix uniform is
   refused for the deferred pass by name, a local matrix is inlined as
   written.
+- The Coded Shader's arrays sized by a constant in a live file (proven
+  against the headless evaluator alone): a node whose source declares
+  `const int R = 2;` and `float w[2 * R + 1];`, fills the array in a loop
+  and sums it, shading an F12 frame on the CPU road; `float a[count];` of a
+  `uniform int count` drawing `line N: array size is not a compile-time
+  constant: 'count' is a uniform` in the box under the Compile button, and
+  how the longest of the new lines (the one that quotes an initialiser's
+  own reason) reads at the node's width, where a label is clipped rather
+  than wrapped. NOT run on a driver: the same source inlined in the
+  deferred pass (`float w[2 * _cn0_R + 1];`), where the driver computes the
+  size itself, against the CPU frame of the same file -- the two roads mean
+  the same array now, and no driver was asked; the console's `the coded
+  shader does not parse: ...` line for a size the front-end refuses, which
+  used to reach the driver; and what a driver says to the two latitudes
+  this front-end keeps, a float written as a size and a `const` assigned
+  after a size was taken from it.
 - The release machine itself, where the zips are (the cloud-container
   fix was proven on the container's one Xeon, with the kernel varied by
   `OPENBLAS_CORETYPE` and the previous engine stood in for by this
