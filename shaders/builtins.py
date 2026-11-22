@@ -102,7 +102,12 @@ def _f32_only(out):
     literal component (vec3(h, 0.0, 0.0)) used to promote the whole
     vector to float64, and everything downstream of it ran at a
     precision no GPU has -- R243 caught it when a Max noise twin drifted
-    by 1e-3 from a zero-weighted velocity term."""
+    by 1e-3 from a zero-weighted velocity term.
+
+    A join of ints, uints or bools alone is NOT converted here: `vec` builds
+    the int and bool vectors too and is not told which it is building. The
+    caller that knows the type converts it (`Interpreter.constructor`: a
+    float vector is float32 whatever it is built from)."""
     if out.dtype.kind == 'f' and out.dtype != F32:
         return out.astype(F32)
     return out

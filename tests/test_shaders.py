@@ -2066,9 +2066,16 @@ def test_signed_integers_divide_to_an_integer():
           str(outs['Q'][:12]))
 
     # the cut is all that changes. A quotient that had no fraction is the
-    # number it was, held as it was: a float vector built from it computes
-    # at float32 as it did (held as an int32 the same chain would run in
-    # float64 -- the 0.1 * 0.7 below rounds the other way there)
+    # number it was, held as it was, and a float vector built from it
+    # computes at float32 as it did. (When this was written the quotient
+    # HAD to stay as it was held for that: a float vector built from ints
+    # alone was kept an int array, and from an int32 quotient this chain
+    # would have run in float64 -- the 0.1 * 0.7 below rounds the other way
+    # there. A float vector is float32 however it is built now,
+    # test_a_float_vector_is_float32_whatever_it_is_built_from, so the
+    # chain is this one whichever way the quotient is held: `h` below is
+    # the same quotient through an int variable, and the second line the
+    # int32 this one stood in for.)
     got, err = _first(_body(
         '    int n = 6;\n    vec2 g = vec2(n / 2, n / 2) * 0.1 * 0.7;\n'
         '    Color = vec4(g, float(n / 2), float(n / 3 * 3));\n'))
@@ -2079,6 +2086,14 @@ def test_signed_integers_divide_to_an_integer():
           got is not None and chain != wide
           and np.array_equal(got, np.array([chain, chain, 3.0, 6.0],
                                            np.float32)),
+          str(err if got is None else [float(v) for v in got]))
+    got, err = _first(_body(
+        '    int n = 6;\n    int h = n / 2;\n    int q = 3;\n'
+        '    Color = vec4(vec2(h, h) * 0.1 * 0.7, vec2(q, q) * 0.1 * 0.7);\n'))
+    check('int division: the same chain from the quotient through an int '
+          'variable, and from the int32 it stood in for',
+          got is not None and got.dtype == np.float32
+          and np.array_equal(got, np.full(4, chain, np.float32)),
           str(err if got is None else [float(v) for v in got]))
 
     # the ends of the range, compared as ints inside the shader (a float
@@ -2091,6 +2106,444 @@ def test_signed_integers_divide_to_an_integer():
           got is not None and np.array_equal(got, [1, 1, 1, 1]),
           str(err if got is None else got))
 
+
+
+_F = np.float32
+#: 3 * 0.1 * 0.7 as a driver runs it -- two float32 products -- and as the
+#: front-end ran it from an int array: both products in float64, rounded
+#: once where the value was stored. They differ in the last bit.
+_CHAIN = _F(_F(_F(3.0) * _F(0.1)) * _F(0.7))
+_WIDE = _F(3.0 * float(_F(0.1)) * float(_F(0.7)))
+
+#: (what, declarations above main, statements): each leaves 3 * 0.1 * 0.7
+#: in all four components of Color, and each answered _WIDE
+_THREE_TENTHS = [
+    ('the reported shader: vec2(q, q) * 0.1 * 0.7', '',
+     '    int q = 3;\n    vec2 g = vec2(q, q) * 0.1 * 0.7;\n'
+     '    Color = vec4(g, g);\n'),
+    ('one int, filling the vector', '',
+     '    int q = 3;\n    vec3 g = vec3(q) * 0.1 * 0.7;\n'
+     '    Color = vec4(g, g.x);\n'),
+    ('two written numbers', '',
+     '    Color = vec4(vec2(3, 3) * 0.1 * 0.7, vec2(3, 3) * 0.1 * 0.7);\n'),
+    ('an ivec2', '',
+     '    ivec2 iv = ivec2(3, 3);\n    vec2 g = vec2(iv) * 0.1 * 0.7;\n'
+     '    Color = vec4(g, g);\n'),
+    ('two uints', '',
+     '    uint u = 3u;\n    vec2 g = vec2(u, u) * 0.1 * 0.7;\n'
+     '    Color = vec4(g, g);\n'),
+    ('a uvec3', '',
+     '    uvec3 u = uvec3(3u);\n    vec3 g = vec3(u) * 0.1 * 0.7;\n'
+     '    Color = vec4(g, g.z);\n'),
+    ('a vec4 of an int-built vec2 and two ints', '',
+     '    Color = vec4(vec2(3, 3), 3, 3) * 0.1 * 0.7;\n'),
+    ('the whole vector written to the output, which is float32', '',
+     '    Color = vec4(3, 3, 3, 3) * 0.1 * 0.7;\n'),
+    ('a component of it', '',
+     '    int q = 3;\n    Color = vec4(vec2(q, q).y * 0.1 * 0.7);\n'),
+    ('float() of a component of it', '',
+     '    int q = 3;\n    Color = vec4(float(vec2(q, q).x) * 0.1 * 0.7);\n'),
+    ('a swizzle of it', '',
+     '    int q = 3;\n    Color = vec4(vec2(q, 1).xx * 0.1 * 0.7, '
+     'vec3(1, q, 1).yy * 0.1 * 0.7);\n'),
+    ('one arm of a ternary', '',
+     '    int q = 3;\n'
+     '    vec2 g = (q > 0 ? vec2(q, q) : vec2(1.0)) * 0.1 * 0.7;\n'
+     '    Color = vec4(g, g);\n'),
+    ('divided: (vec2(q, q) / 10.0) * 0.7 after 0.1 is written as 1 / 10',
+     None, None),
+    ('a function\'s argument, taken as a swizzle',
+     'vec2 twice(vec2 p) { return p * 0.1 * 0.7; }\n',
+     '    Color = vec4(twice(vec2(3, 3).yx), twice(ivec2(3, 3)));\n'),
+    ('a struct\'s field, written from a swizzle',
+     'struct S { vec2 a; float k; };\n',
+     '    S s;\n    s.a = vec3(3, 3, 3).xy;\n    s.k = 3;\n'
+     '    Color = vec4(s.a * 0.1 * 0.7, s.k * 0.1 * 0.7, '
+     'S(vec2(3, 3), 3).k * 0.1 * 0.7);\n'),
+    ('abs(), and the negation, of it', '',
+     '    int q = 3;\n    vec2 g = abs(vec2(q, -q)) * 0.1 * 0.7;\n'
+     '    vec2 h = -(-vec2(q, q)) * 0.1 * 0.7;\n    Color = vec4(g, h);\n'),
+    ('a matrix times it', '',
+     '    int q = 3;\n    vec3 v = mat3(1.0) * vec3(q, q, q) * 0.1 * 0.7;\n'
+     '    Color = vec4(v, v.y);\n'),
+    ('a matrix times an ivec3, an ivec3 times a matrix', '',
+     '    ivec3 iv = ivec3(3);\n    vec3 v = mat3(1.0) * iv;\n'
+     '    vec3 w = iv * mat3(1.0);\n'
+     '    Color = vec4(v.xy * 0.1 * 0.7, w.yz * 0.1 * 0.7);\n'),
+    ('the columns of outerProduct of two ivec2', '',
+     '    mat2 m = outerProduct(ivec2(3, 3), ivec2(1, 1));\n'
+     '    Color = vec4(m[0] * 0.1 * 0.7, m[1] * 0.1 * 0.7);\n'),
+    ('an int written into a float array\'s element', '',
+     '    float a[3];\n    int q = 3;\n    a[1] = 0.5;\n    a[0] = q;\n'
+     '    int i = 2;\n    a[i] = q;\n'
+     '    Color = vec4(a[0] * 0.1 * 0.7, a[i] * 0.1 * 0.7, '
+     'a[0] * 0.1 * 0.7, a[2] * 0.1 * 0.7);\n'),
+    ('an int-built vector written into a vec2 array\'s element', '',
+     '    vec2 a[2];\n    a[1] = vec2(3, 3).yx;\n'
+     '    Color = vec4(a[1] * 0.1 * 0.7, a[1].yx * 0.1 * 0.7);\n'),
+    ('max, min and clamp of a float beside written ints', '',
+     '    float x = 3.0;\n'
+     '    Color = vec4(max(x, 1) * 0.1 * 0.7, min(x, 7) * 0.1 * 0.7, '
+     'clamp(x, 0, 5) * 0.1 * 0.7, clamp(vec2(x), 0, 5).y * 0.1 * 0.7);\n'),
+    ('max of an int variable beside a float', '',
+     '    int q = 3;\n    Color = vec4(max(q, 0.5) * 0.1 * 0.7, '
+     'min(0.5, -q) * -0.1 * 0.7, max(vec2(0.5), q).y * 0.1 * 0.7, '
+     'max(q, vec2(0.5)).x * 0.1 * 0.7);\n'),
+    ('max and min of a uint beside a float', '',
+     '    uint u = 3u;\n    uvec2 uv = uvec2(3u);\n'
+     '    Color = vec4(max(u, 0.5) * 0.1 * 0.7, min(7.5, u) * 0.1 * 0.7, '
+     'max(uv, 0.5).x * 0.1 * 0.7, clamp(2.5 + 0.5, u, u) * 0.1 * 0.7);\n'),
+    ('mix and mad of a float beside ints', '',
+     '    float x = 0.1;\n'
+     '    Color = vec4(mix(x, 3, 1) * 0.1 * 0.7, mad(x, 3, 0) * 0.7, '
+     'mix(3, x, 0.0) * 0.1 * 0.7, mad(3, 1, 0.0) * 0.1 * 0.7);\n'),
+]
+
+#: (what, declarations above main, statements, the Color wanted, what it
+#: was): the same int array giving another NUMBER, not another last bit
+_NOT_A_LAST_BIT = [
+    ('a component written into an int-built vector (0.5 was cut to 0)', '',
+     '    vec2 g = vec2(1, 2).yx;\n    g.x = 0.5;\n'
+     '    Color = vec4(g, 0.0, 1.0);\n', [0.5, 1, 0, 1]),
+    ('... in a parameter', 'float half_x(vec2 p) { p.x = 0.5; return p.x; }\n',
+     '    Color = vec4(half_x(vec2(1, 2).xy));\n', [0.5, 0.5, 0.5, 0.5]),
+    ('... after a ternary', '',
+     '    vec2 d = true ? vec2(1, 0) : vec2(0, 1);\n    d.x = 0.25;\n'
+     '    Color = vec4(d, 0.0, 1.0);\n', [0.25, 0, 0, 1]),
+    ('two of them added past 2^31 (the int32 sum wrapped)', '',
+     '    Color = vec4(vec2(2000000000, 1) + vec2(2000000000, 1), '
+     '0.0, 1.0);\n', [4.0e9, 2, 0, 1]),
+    ('two of them multiplied past 2^31', '',
+     '    Color = vec4(vec2(100000, 3) * vec2(100000, 3), 0.0, 1.0);\n',
+     [1.0e10, 9, 0, 1]),
+    ('an int no float32 holds is rounded where the vector is built', '',
+     '    Color = vec4(vec2(16777217, 3).x - 16777216.0, '
+     'vec2(16777217, 3).x == 16777216.0, vec2(16777219, 3).x - 16777216.0, '
+     'vec2(3, -16777217).y + 16777216.0);\n', [0, 1, 4, 0]),
+    ('two bool-built vectors added (true + true was true)', '',
+     '    Color = vec4(vec2(true, true) + vec2(true, false), '
+     'vec2(true, true) * vec2(2, 2));\n', [2, 1, 2, 2]),
+    ('a bool-built vector negated (it raised TypeError)', '',
+     '    Color = vec4(-vec2(true, false), vec2(3 > 2, 2 > 3) - 1.0);\n',
+     [-1, 0, 0, -1]),
+]
+
+
+def _float_census(sources):
+    """Every expression of `sources` evaluated, and the ones whose value is
+    typed float and held as anything but float32: (how many values were
+    looked at, {(node, name, type, dtype): count})."""
+    from ..shaders.interp import Interpreter
+    seen = {}
+    count = [0]
+    plain = Interpreter.expr
+
+    def expr(self, node, mask, scope, flags, n):
+        v, t = plain(self, node, mask, scope, flags, n)
+        if getattr(t, 'base', None) == 'float' and not t.array:
+            count[0] += 1
+            held = np.asarray(v).dtype
+            if held != np.float32:
+                name = node[1] if node[0] in ('call', 'bin', 'un') else ''
+                key = (node[0], str(name), t.name(), held.name)
+                seen[key] = seen.get(key, 0) + 1
+        return v, t
+
+    Interpreter.expr = expr
+    try:
+        for src in sources:
+            _first(src)
+    finally:
+        Interpreter.expr = plain
+    return count[0], seen
+
+
+def _chain_program(rng):
+    """One seeded chain: a float vector built from two ints, then two to
+    five float operations written on it in one expression. Returns (source,
+    the float32 result, the same chain in float64 rounded once)."""
+    q, r = (int(v) for v in rng.integers(-60, 61, 2))
+    if rng.random() < 0.25:
+        q = int(rng.integers(-(1 << 26), 1 << 26))
+    text = f'vec2({q}, {r})'
+    x32 = np.array([q, r]).astype(np.float32)
+    x64 = np.array([q, r], np.float64)
+    for _ in range(int(rng.integers(2, 6))):
+        op = '*+-/'[int(rng.integers(0, 4))]
+        if rng.random() < 0.3:
+            i, j = (int(v) for v in rng.integers(1, 12, 2))
+            rhs, text = np.array([i, j]), f'({text} {op} vec2({i}, {j}))'
+        else:
+            lit = f'{float(rng.integers(1, 400)) / 100.0:.2f}'
+            rhs, text = np.array(float(lit)), f'({text} {op} {lit})'
+        a32, a64 = rhs.astype(np.float32), rhs.astype(np.float32).astype(
+            np.float64)
+        if op == '*':
+            x32, x64 = x32 * a32, x64 * a64
+        elif op == '+':
+            x32, x64 = x32 + a32, x64 + a64
+        elif op == '-':
+            x32, x64 = x32 - a32, x64 - a64
+        else:
+            x32, x64 = x32 / a32, x64 / a64
+    return (_body(f'    vec2 g = {text};\n    Color = vec4(g, g.yx);\n'),
+            x32, x64.astype(np.float32))
+
+
+class _Pixels:
+    """A texture's pixels that answer the texel address they are read at."""
+    ndim = 3
+
+    def __getitem__(self, yx):
+        y, x = yx
+        return np.stack([x, y, x - 16777216, y], axis=1)
+
+
+class _WideTexture:
+    def __init__(self, width, height):
+        self.width, self.height, self.pixels = width, height, _Pixels()
+
+
+def test_a_float_vector_is_float32_whatever_it_is_built_from():
+    """`int q = 3; vec2 g = vec2(q, q) * 0.1 * 0.7;` answered 0.21 where
+    two float32 products answer 0.21000001: a float vector built from ints
+    alone was held as the int32 array NumPy made of its parts, typed vec2,
+    and the first float it met was answered in float64 -- a precision no
+    GPU has, the drift R243 removed for `float(u)` and for a vector with a
+    Python literal in it. From uints it was an int64 array and from bools
+    a bool one. A float vector is float32 where it is built, a float
+    destination is float32 whichever type object names it, and the three
+    other places an int array met a float without being converted convert
+    it: an array's element, a matrix's vector and a builtin's argument."""
+    check('float32: the two references differ, so the pins below can tell '
+          'them apart', _CHAIN != _WIDE,
+          f'{float(_CHAIN)!r} {float(_WIDE)!r}')
+    want = np.full(4, _CHAIN, np.float32)
+    cases = [c for c in _THREE_TENTHS if c[2] is not None]
+    for what, head, body in cases:
+        got, err = _first(_body(body, head))
+        check(f'float32: {what} -- 3 * 0.1 * 0.7 is the float32 chain, bit '
+              'for bit',
+              got is not None and got.dtype == np.float32
+              and got.tobytes() == want.tobytes(),
+              str(err if got is None else
+                  [got.dtype.name] + [float(v) for v in got]))
+
+    # the same vector in the other operators, each against NumPy's float32
+    got, err = _first(_body(
+        '    int q = 3;\n    vec2 g = vec2(q, 7) / 10.0 * 0.7;\n'
+        '    vec2 h = 0.1 / vec2(q, 7) + 0.7;\n'
+        '    Color = vec4(g, h);\n'))
+    q7 = np.array([3, 7], np.float32)
+    ref = np.concatenate([q7 / _F(10.0) * _F(0.7), _F(0.1) / q7 + _F(0.7)])
+    check('float32: divided, and divided by -- each operator is NumPy\'s '
+          'float32 one',
+          got is not None and got.tobytes() == ref.tobytes(),
+          str(err if got is None else [float(v) for v in got]))
+    got, err = _first(_body(
+        '    float x = 0.37;\n'
+        '    Color = vec4(smoothstep(0, 5, x) * 0.7, '
+        'smoothstep(0, 7, vec2(x)).y * 0.7, step(0, x) * 0.3, '
+        'pow(x, 2) * 0.7);\n'))
+    x = _F(0.37)
+
+    def smooth(e1):
+        t = np.clip((x - _F(0.0)) / (_F(e1) - _F(0.0)), _F(0.0), _F(1.0))
+        return t * t * (_F(3.0) - _F(2.0) * t)
+    ref = np.array([smooth(5) * _F(0.7), smooth(7) * _F(0.7), _F(0.3),
+                    np.power(x, _F(2.0)) * _F(0.7)], np.float32)
+    check('float32: smoothstep between written ints; step and pow as they '
+          'were',
+          got is not None and got.tobytes() == ref.tobytes(),
+          str(err if got is None else [float(v) for v in got]))
+
+    # a matrix times an int vector is the matrix times the same floats
+    # (the sum ran in float64: 5.1999998 where float32 answers 5.2000003)
+    outs, _, _ = run(
+        'out vec4 Color;\nout vec4 Ref;\nvoid main() {\n'
+        '    mat2 m = mat2(0.1, 0.1, 0.7, 0.7);\n    ivec2 iv = ivec2(3, 7);\n'
+        '    Color = vec4(m * iv, iv * mat2(0.1, 0.7, 0.3, 1.3));\n'
+        '    Ref = vec4(m * vec2(3.0, 7.0), '
+        'vec2(3.0, 7.0) * mat2(0.1, 0.7, 0.3, 1.3));\n}\n', n=3)
+    check('float32: a matrix times an ivec2, and an ivec2 times a matrix, '
+          'are the products of the same floats',
+          outs['Color'].dtype == np.float32
+          and outs['Color'].tobytes() == outs['Ref'].tobytes()
+          and np.allclose(outs['Ref'][0], [5.2, 5.2, 5.2, 10.0], atol=1e-5),
+          str(outs['Color'][0]) + str(outs['Ref'][0]))
+
+    # what the CALLER hands over typed float and held as ints: an array
+    # uniform is bound as it is given, and every use of an element is
+    # float32 all the same -- in an operator, in a declaration, in a
+    # builtin, in a constructor
+    w = [np.full(4, 3, np.int32), np.full(4, 3, np.int64)]
+    got, err = _first(
+        'uniform float w[2];\nout vec4 Color;\nvoid main() {\n'
+        '    float x = w[1];\n'
+        '    Color = vec4(w[0] * 0.1 * 0.7, x * 0.1 * 0.7, '
+        'mix(w[0], 0.3, 0.9), vec2(w[1]).y * 0.1 * 0.7);\n}\n',
+        uniforms={'w': w})
+    mixed = _F(3.0) + (_F(0.3) - _F(3.0)) * _F(0.9)
+    ref = np.array([_CHAIN, _CHAIN, mixed, _CHAIN], np.float32)
+    check('float32: a float array uniform handed over as ints is float32 '
+          'wherever an element is used',
+          got is not None and got.tobytes() == ref.tobytes()
+          and mixed != _F(3.0 + (float(_F(0.3)) - 3.0) * float(_F(0.9))),
+          str(err if got is None else [float(v) for v in got]))
+
+    for what, head, body, wanted in _NOT_A_LAST_BIT:
+        got, err = _first(_body(body, head))
+        check(f'float32: {what}',
+              got is not None and got.dtype == np.float32
+              and np.array_equal(got, np.array(wanted, np.float32)),
+              str(err if got is None else [float(v) for v in got]))
+
+    # lane by lane, every int a lane can hold: the vector is what float()
+    # of each int is -- rounded once, to nearest, where it is built
+    src = ('in vec3 vPosition;\nout vec4 Color;\nout vec2 G;\nout vec3 U;\n'
+           'void main() {\n    int q = int(vPosition.x) * 65536 + '
+           'int(vPosition.y);\n    uint u = uint(q);\n'
+           '    G = vec2(q, -q);\n    U = vec3(u, u >> 1u, q > 0);\n'
+           '    Color = vec4(vec2(q, q) * 0.1 * 0.7, float(q) * 0.1 * 0.7, '
+           'G.x == float(q));\n}\n')
+    rng = np.random.default_rng(253)
+    ints = np.concatenate([
+        rng.integers(-(1 << 31), 1 << 31, 500),
+        [0, 1, -1, 3, 16777216, 16777217, 16777219, -16777217,
+         (1 << 31) - 1, -(1 << 31), (1 << 31) - 129]]).astype(np.int64)
+    p = np.zeros((len(ints), 3), np.float32)
+    p[:, 0] = ints >> 16                 # two halves a float32 holds exactly
+    p[:, 1] = ints & 0xffff
+    outs, _, _ = run(src, inputs={'position': p}, n=len(ints))
+    f = ints.astype(np.float32)
+    us = ints & 0xffffffff
+    chain = f * _F(0.1) * _F(0.7)
+    check(f'float32: {len(ints)} ints across the 32-bit range, lane by '
+          'lane -- vec2(q, -q) is float(q) and float(-q), a uint its '
+          'unsigned value, a bool 0 or 1, and the chain from the vector is '
+          'the chain from float(q)',
+          all(outs[k].dtype == np.float32 for k in ('G', 'U', 'Color'))
+          and np.array_equal(outs['G'][:, 0], f)
+          and np.array_equal(outs['G'][:, 1],
+                             (-ints).astype(np.int32).astype(np.float32))
+          and np.array_equal(outs['U'][:, 0], us.astype(np.float32))
+          and np.array_equal(outs['U'][:, 1], (us >> 1).astype(np.float32))
+          and np.array_equal(outs['U'][:, 2], (ints > 0).astype(np.float32))
+          and outs['Color'][:, 0].tobytes() == chain.tobytes()
+          and outs['Color'][:, 1].tobytes() == chain.tobytes()
+          and outs['Color'][:, 2].tobytes() == chain.tobytes()
+          and bool((outs['Color'][:, 3] == 1.0).all())
+          and bool((f.astype(np.int64) != ints).any()),
+          str(outs['G'][:3]))
+
+    # seeded chains against NumPy's float32, and the proof that the pin
+    # has teeth: the same chains in float64 round another way
+    rng = np.random.default_rng(2530)
+    progs = [_chain_program(rng) for _ in range(240)]
+    same = other = 0
+    bad = ''
+    for src, x32, x64 in progs:
+        got, err = _first(src)
+        ok = got is not None and got.dtype == np.float32 and \
+            got.tobytes() == np.concatenate([x32, x32[::-1]]).tobytes()
+        same += ok
+        other += x32.tobytes() != x64.tobytes()
+        if not ok and not bad:
+            bad = f'{src!r} -> {err if got is None else got}'
+    check(f'float32: {len(progs)} seeded chains on an int-built vector are '
+          f'NumPy\'s float32 chain bit for bit ({other} of them round '
+          'another way in float64)',
+          same == len(progs) and other > len(progs) // 4,
+          f'{same} of {len(progs)}, {other} differ in float64  {bad}')
+
+    # the rule itself: nothing typed float is held as anything else, at
+    # any node of every shader above and of the shaders the tests before
+    # this one build
+    corpus = [_body(b, h) for _w, h, b in cases]
+    corpus += [_body(b, h) for _w, h, b, _c in _NOT_A_LAST_BIT]
+    corpus += [src for src, _a, _b in progs]
+    corpus += [_body(make + use, head) for _w, head, make in _MATRIX_MADE
+               for _u, use, _c in _MATRIX_USED]
+    corpus += [_index_program(np.random.RandomState(1000 + seed))[0]
+               for seed in range(60)]
+    looked, odd = _float_census(corpus)
+    check(f'float32: every value typed float is held as float32 -- '
+          f'{looked} values at every node of {len(corpus)} shaders',
+          looked > 5000 and not odd, f'{looked} values, {odd}')
+
+    # what is NOT a float stays what it was: the int, uint and bool
+    # constructors, and an int handed to a function that reads a texel
+    got, err = _first(
+        'out ivec2 I;\nout vec4 Color;\nvoid main() {\n'
+        '    I = ivec2(7, -9) / 2;\n    bvec2 b = bvec2(3, 0);\n'
+        '    uvec2 u = uvec2(7u, 9u) / 2u;\n'
+        '    Color = vec4(ivec2(1.75, -2.75), b.x && !b.y, u.x + u.y);\n}\n')
+    check('float32: int, uint and bool vectors are built as they were',
+          got is not None and np.array_equal(got, [1, -2, 1, 7]),
+          str(err if got is None else got))
+    got, err = _first(_body(
+        '    int big = 16777217;\n    ivec2 iv = ivec2(big, -big);\n'
+        '    Color = vec4(max(big, 0) == big, abs(-big) == big, '
+        'min(big, big + 2) - 16777216, abs(iv).y - max(iv, 0).x);\n'))
+    check('float32: a builtin that answers an int keeps its ints (16777217 '
+          'through max, min and abs)',
+          got is not None and np.array_equal(got, [1, 1, 1, 0]),
+          str(err if got is None else got))
+    got, err = _first(_body(
+        '    float big = 100000000.0;\n    bvec2 pick = bvec2(true, false);\n'
+        '    Color = vec4(mix(big, 0.1, true), mix(0.1, big, false), '
+        'mix(vec2(big), vec2(0.1), pick));\n'))
+    check('float32: mix by a bool still selects (as arithmetic 1e8 + (0.1 '
+          '- 1e8) is 0)',
+          got is not None and got.tobytes() == np.array(
+              [0.1, 0.1, 0.1, 1.0e8], np.float32).tobytes(),
+          str(err if got is None else got))
+    tex = _WideTexture(1 << 25, 4)
+    got, err = _first(
+        'uniform sampler2D tex;\nout vec4 Color;\nvoid main() {\n'
+        '    int x = 16777217;\n'
+        '    vec4 t = texelFetch(tex, ivec2(x, 3), 0);\n'
+        '    ivec2 sz = textureSize(tex, 0);\n'
+        '    Color = vec4(t.z, t.y, float(sz.x == 33554432), '
+        'vec2(sz).y);\n}\n', uniforms={'tex': tex})
+    check('float32: texelFetch addresses its texel with the ints it is '
+          'given (16777217 is not a float32), textureSize answers ints',
+          got is not None and np.array_equal(got, [1, 3, 1, 4]),
+          str(err if got is None else got))
+
+    # an element is stored as a variable of its type is
+    got, err = _first(_body(
+        '    int a[2];\n    int v;\n    a[1] = 2.75;\n    v = 2.75;\n'
+        '    uint b[2];\n    uint w;\n    b[0] = -7;\n    w = -7;\n'
+        '    vec2 c[2];\n    vec2 x;\n    c[1] = 0.5;\n    x = 0.5;\n'
+        '    Color = vec4(a[1] == v && v == 2, b[0] == w && '
+        'w == 4294967289u, c[1] == x, c[1].y);\n'))
+    check('float32: an array\'s element is converted as a variable of its '
+          'type is (an int cut, a uint wrapped, a scalar filling a vector)',
+          got is not None and np.array_equal(got, [1, 1, 1, 0.5]),
+          str(err if got is None else got))
+
+    # the engine's own use of it: the G-buffer's texel address
+    # (gpu/gbuffer.py), a float uv times vec2 of an ivec2. The product is
+    # float32 now and the texel is the one it was, at every centre
+    src = ('uniform sampler2D gb;\nin vec2 vUV;\nout vec4 Color;\n'
+           'void main() {\n    ivec2 gbsz = textureSize(gb, 0);\n'
+           '    ivec2 gbpx = ivec2(clamp(vUV * vec2(gbsz), vec2(0.0), '
+           'vec2(gbsz) - vec2(1.0)));\n    Color = vec4(gbpx, 0.0, 1.0);\n}\n')
+    wrong = []
+    for w, h in ((7200, 4050), (4097, 3), (16384, 16384), (1, 1), (1920, 1080)):
+        xs = np.arange(w)
+        ys = (xs * 7919) % h
+        uv = np.stack([(xs + 0.5) / w, (ys + 0.5) / h], axis=1).astype(
+            np.float32)
+        outs, _, _ = run(src, uniforms={'gb': _WideTexture(w, h)},
+                         inputs={'uv': uv}, n=w)
+        if not (np.array_equal(outs['Color'][:, 0], xs)
+                and np.array_equal(outs['Color'][:, 1], ys)):
+            wrong.append((w, h))
+    check('float32: the G-buffer read\'s texel address, ivec2(clamp(uv * '
+          'vec2(textureSize), ...)), is the texel of every centre up to '
+          '16384 across', not wrong, str(wrong))
 
 
 def main():

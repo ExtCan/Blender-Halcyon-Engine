@@ -386,11 +386,14 @@ void main()
 # `resolve_spec`'s interface, so STAGES / INTERFACE / VALIDATION and the
 # self test's stage table never see them. `vec3(float(ii.r), ...) * 0.0025`
 # is the same float32 multiply as raster.gamma2_tables' `dom` (the
-# per-component float() matters: the simulator's vec3(ivec3) keeps the
-# integers and a later float op promotes to float64 -- a front-end blind
-# spot this pack's twin test found), the fetches return the
-# CPU's table bits and the accumulation order is RESOLVE's, so both
-# variants are EXACT in the simulator (tests/test_r251_raster_wire.py).
+# per-component float() mattered when this was written: the simulator's
+# vec3(ivec3) kept the integers and a later float op promoted to float64
+# -- a front-end blind spot this pack's twin test found. The front-end
+# builds a float vector as float32 from any parts now, so `vec3(ii)` would
+# be the same multiply; the text stays as it is pinned), the fetches
+# return the CPU's table bits and the accumulation order is RESOLVE's, so
+# both variants are EXACT in the simulator
+# (tests/test_r251_raster_wire.py).
 RESOLVE_CLAMP = """
             if (clamp_samples > 0.5) { t.rgb = min(t.rgb, vec3(1.0)); }
 """

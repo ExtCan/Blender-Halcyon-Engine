@@ -22,8 +22,8 @@ import numpy as np
 
 from . import builtins as rt
 from .builtins import BUILTINS
-from .gtypes import (BOOL, BY_NAME, FLOAT, INT, UINT, VOID, GType, promote,
-                     swizzle_indices)
+from .gtypes import (BOOL, BY_NAME, FLOAT, INT, SAMPLER, UINT, VOID, GType,
+                     promote, swizzle_indices)
 from .lexer import ShaderError
 
 MAX_LOOP = 4096
@@ -537,9 +537,12 @@ class Interpreter:
         if op == '*' and (at.is_matrix or bt.is_matrix):
             if at.is_matrix and bt.is_matrix:
                 return rt.mat_mul_mat(a, b), at
+            # the vector as a float one, which is what the product is
+            # typed (`m * ivec3(...)` ran the sum in float64)
             if at.is_matrix:
-                return rt.mat_mul_vec(a, b), GType(at.base, at.rows)
-            return rt.vec_mul_mat(a, b), GType(bt.base, bt.n)
+                return (rt.mat_mul_vec(a, rt.to_float(b)),
+                        GType(at.base, at.rows))
+            return rt.vec_mul_mat(rt.to_float(a), b), GType(bt.base, bt.n)
         t = promote(at, bt)
         x = self.coerce(a, at, t, n)
         y = self.coerce(b, bt, t, n)
@@ -675,8 +678,12 @@ class Interpreter:
             everyone = np.ones(n, bool)
             if bt.array:
                 # one element per lane: the lanes that index element j are
-                # the ones it is written for
+                # the ones it is written for. The value is converted to the
+                # element's type first, as a variable's and a field's is
+                # (it was merged in as it came: `a[i] = q` of an int into a
+                # `float a[4]` left the element float64, typed float)
                 items = list(base)
+                value = self.coerce(value, vtype, bt.elem(), n)
                 for j, hit in self.indexed(target[2], i, len(items), bt,
                                            mask):
                     items[j] = rt.sel(hit, value, items[j])
@@ -811,11 +818,22 @@ class Interpreter:
             v, t = self.expr(a, mask, scope, flags, n)
             vals.append(v)
             types.append(t)
-        out = fn(*vals)
         # the rules take the argument-type list, not varargs
         rtype = rule(types) if callable(rule) else rule
-        return out, rtype if rtype is not None else (types[0] if types
-                                                     else FLOAT)
+        if rtype is None:
+            rtype = types[0] if types else FLOAT
+        if rtype.base == 'float' and SAMPLER not in types:
+            # a float result's numbers are float32 on the way in, an int
+            # among them converted as a driver converts it: `clamp(x, 0,
+            # 1)`, `max(x, 1)`, `smoothstep(0, 1, x)` handed NumPy an int32
+            # array beside a float32 one and the result, typed float, was
+            # float64 (and `outerProduct` of two ivecs was a matrix of
+            # ints). A bool is left a bool (`mix` selects by one), and so
+            # is every argument where a sampler is read: `texelFetch`
+            # addresses a texel with its ints.
+            vals = [rt.to_float(v) if t.base in ('float', 'int', 'uint')
+                    else v for v, t in zip(vals, types)]
+        return fn(*vals), rtype
 
     def call_user(self, fn, args, mask, scope, flags, n):
         values, writeback = [], []
@@ -912,6 +930,21 @@ class Interpreter:
             v = rt.to_int(v)
         elif t.base == 'bool':
             v = rt.to_bool(v)
+        else:
+            # a float vector is float32 whatever it is built from -- the
+            # vector's half of the R243 rule above. `rt.vec` joins the
+            # parts and converts a FLOAT join alone, so one built from
+            # ints, uints or bools and nothing else (`vec2(q, q)`,
+            # `vec3(1, 0, 0)`, `vec2(textureSize(t, 0))`, `vec4(a < b)`)
+            # stayed the int32 / int64 / bool array NumPy made of them,
+            # typed vec2. `coerce` did not convert it either (both sides
+            # said float), so the next float it met was answered in
+            # float64 and the chain ran on at that precision; two such
+            # vectors added or multiplied as int32 and wrapped at 2^31;
+            # two built from bools added to 1; and a component written
+            # into one (`g.x = 0.5`) was cut to an integer. A vector with
+            # one float part was float32 already.
+            v = rt.to_float(v)
         return v, t
 
     # ------------------------------------------------------------ helpers
@@ -988,7 +1021,12 @@ class Interpreter:
             v = rt.sw(v, list(range(dst.n)))
         elif dst.n == 1 and src.n > 1:
             v = rt.sw(v, [0])
-        if dst.base == 'float' and src.base != 'float':
+        if dst.base == 'float':
+            # whatever the source says it is: the rule above (`src is dst`)
+            # held for one type OBJECT, and a type that is equal without
+            # being the same one -- every swizzle, every binary result,
+            # an array's element -- passed through as it was held. A
+            # float32 array is returned as it is.
             v = rt.to_float(v)
         elif dst.base == 'uint' and src.base != 'uint':
             # uint(x) wraps: uint(-7) is 4294967289 on every driver
