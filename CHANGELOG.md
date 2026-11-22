@@ -2342,14 +2342,14 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   the lobe's PRESENCE, never its weight: the probe reads sixteen
   fragments, and a Mix Shader's Fac mask can read 0 on every one of them
   while the emitter still mixes the link into the albedo elsewhere. (3)
-  *This changes pictures.* On the CPU device such a
-  material rendered its fallback surface and now adds the wired colour
-  as emitted light, without the fallback's highlight (a plain closure
-  with no glossy lobe has specular level 0 -- the Emission node's
-  picture); on the demo frame every pixel off the material is bitwise
-  what it was. On the GPU device it rendered the colour as a lit albedo
-  and now draws the CPU's picture: with the reason printed once where
-  the plan refuses, on the driver for the lone link (the next entry). A
+  *This changes pictures.* On the CPU device such a material rendered
+  its fallback surface and now renders the wired colour as emitted light
+  alone, the Emission node's picture (no glossy lobe: specular level 0;
+  no diffuse lobe: no diffuse, the no-diffuse entry below); on the demo
+  frame every pixel off the material is bitwise what it was. On the GPU
+  device it rendered the colour as a lit albedo and now draws the CPU's
+  picture: with the reason printed once where the plan refuses, on the
+  driver for the lone link (the next entry). A
   colour wired into the WORLD Output's Surface was ignored (the world
   fell through to its image, blend or flat colour) and is the sky now,
   bitwise the Background node at Strength 1; the GPU sky pass already
@@ -2361,20 +2361,21 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   lift the Emission node's refusal with it and is its own piece of work
   (the corner road lights emission in the corners; the layer and hit
   passes each need the route proven); it was queued here and is the
-  next entry. And the frame both devices draw is Halcyon's Emission
+  next entry. And the frame both devices drew was Halcyon's Emission
   node's, not Cycles': with no DIFFUSE lobe in the closure
-  `closure_to_surface` leaves the material's fallback diffuse LIT under
-  the glow, where Blender shades black. That rule also reads its batch
-  (`np.any(diff_w > 1e-6)`: a pure-emission pixel has diffuse level 0
-  when a diffuse pixel shares its batch and level 1 when it is alone --
-  seen at the function, not hunted in a frame). Recorded, not changed:
-  every Emission-node material's picture hangs on it. Pinned in
+  `closure_to_surface` left the material's fallback diffuse LIT under
+  the glow, where Blender shades black, and that rule read its batch
+  (`np.any(diff_w > 1e-6)`: a pure-emission pixel had diffuse level 0
+  when a diffuse pixel shared its batch and level 1 when it was alone).
+  Recorded here as an open item, seen at the function alone; hunted in
+  a frame and closed by the no-diffuse entry below. Pinned in
   `test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads`
-  (47 checks, since the routing took the lone link's plan answer to its
+  (48 checks, since the routing took the lone link's plan answer to its
   own test) for a colour, a value and a vector: the CPU frame bitwise
-  the Emission node's; the wired colour arriving as exactly itself over
-  the fallback (frame(colour) - frame(black) within 1e-6 on every pixel
-  of the Ball); and the road the refusal names -- a Halcyon Shader in
+  the Emission node's; the wired colour arriving as exactly itself
+  (frame(colour) - frame(black) within 1e-6 on every pixel of the Ball,
+  and since the no-diffuse entry frame(black) is black: it sat over the
+  lit fallback); and the road the refusal names -- a Halcyon Shader in
   between, either socket -- qualifying with the simulator frame the CPU
   frame at the twin bar (measured 4.8e-6; the bar is under 6e-3 with no
   pixel over 1e-2). Then the Mix and Add Shader inputs beside a Diffuse
@@ -2502,6 +2503,305 @@ All notable changes to Halcyon are recorded here. Dates are ISO 8601.
   the walk and the bare-socket rule; and the GPU device road on the fake
   driver drawing it within the bar with no fallback line. Eighteen
   mutations of the route each fail it.
+- **A closure with no diffuse lobe has no diffuse, at every pixel (the
+  rule read its batch: a hard edge through the glow).** The open item of
+  the shader-socket entry (two above), hunted in a frame and closed. In
+  `core/render.closure_to_surface` the branch for a closure with no
+  master lobe decided its slots with `np.any(...)` over the BATCH it was
+  handed: `if np.any(diff_w > 1e-6)` took the diffuse colour and level
+  from the lobes and otherwise left the material's fallback diffuse (the
+  viewport colour, level 1) fully lit, and the specular colour and the
+  roughness had the same shape. One pixel's surface hung on which other
+  pixels were shaded with it -- and a batch is a chunk of the shading
+  loop, a band of the worker pool, a render region, the sixteen
+  fragments of the deferred probe. *It reaches the picture.* Reproduced
+  headless before the fix on the demo scene, the Ball wearing a Mix
+  Shader (a Diffuse BSDF, an Emission) whose Fac is a mask (the
+  interpolated normal's z > 0: the upper side glows). (a) *One
+  in-process frame.* At 1280x960 the Ball's 60,697 pixels shade in four
+  16,384-pixel chunks (`MIN_CHUNK`); the chunks lying wholly on the
+  emission side lit the fallback under the glow, and the frame carries a
+  horizontal edge through it -- 27,929 pixels up to 1.93 off the
+  one-chunk frame, the two rows at the chunk boundary reading (0.9, 0.3,
+  0.1) and (2.71, 2.13, 2.02). No pool and no region is needed. (b) *The
+  worker pool.* 640x480 with three workers (bands cut at rows 160 and
+  320): 3,093 pixels of the Ball's cap up to 1.79 off the in-process
+  frame, rows 319 and 320 reading (0.9, 0.3, 0.1) and (2.60, 2.00,
+  1.86). Two and four workers happen to cut where every band holds both
+  sides, and drew the in-process frame. (c) *A render region* drawn
+  wholly inside the glow: every one of its 1,200 pixels off the full
+  frame's, up to 1.73. (d) *The corner road.* A pure-emission pixel
+  sharing its batch with a diffuse one got a BLACK albedo (0 / 1e-6),
+  and at the vertex and face rates `light x albedo` wiped the glow the
+  corners had just lit: the emission side of the masked Ball rendered
+  black (Ball mean (0.04, 0.05, 0.16) at the vertex rate, (0.67, 0.26,
+  0.23) now). (e) *The probe is a batch too.* On a Ball that is Glossy
+  but for a small Diffuse island (79 of its 598 pixels) the sixteen
+  probe fragments were all glossy and baked the lit fallback for the
+  whole material, while the frame's own batch held the island and shaded
+  the glossy side with no diffuse at all: the plan QUALIFIED and the
+  simulator frame was 1.93 off the CPU's on all 598 pixels. (1) *The
+  rule, per pixel.* Every slot of that branch is decided from the
+  pixel's own lobe weights. A pixel WITH a diffuse weight keeps what it
+  had, bit for bit: the lobes' weighted colour, the clipped weight as
+  the level, the material's ambient level (which carries the diffuse
+  share since the entry below). A pixel with NONE has no diffuse
+  response -- Blender's answer for an Emission, a Glossy, a Glass or a
+  Transparent alone, and what every such pixel already was the moment
+  one diffuse pixel shared its batch: diffuse level 0 and NO ambient
+  share, over a WHITE diffuse colour. The ambient share goes because the
+  ambient term is the diffuse colour times the ambient level and never
+  reads the diffuse level. The colour is white rather than the mixed
+  batch's black because nothing at the pixel rate reads it once the
+  level and the ambient are 0, and the two roads that read the colour
+  alone want the identity: the corner road's `light x albedo` (finding
+  d) and a see-through pixel's refraction tint. And "no diffuse" cannot
+  hang on the colour: the deferred pass fills its diffuse slot from the
+  graph's own colour chain, so only the level and the ambient can say it
+  to both devices. The specular level is the clipped glossy weight (0
+  without one, as it always was) and the specular colour stays the
+  material's own there; a pixel no rough-carrying lobe reaches keeps the
+  material's roughness and exponent (it read roughness 0 and the clamped
+  exponent 8192 the moment a rough lobe shared its batch). The
+  graph-less material and the EMPTY closure (an unwired Surface socket)
+  never reach the branch: the early return keeps the fallback surface,
+  bit for bit. (2) *This changes pictures: every closure with no diffuse
+  lobe, on the CPU device.* Surveyed old against new on 216 frames of
+  the demo scene at 128x96 -- twenty closures at nine settings (the
+  three rates, ray tracing, Transparency None, Screen Door and A-Buffer,
+  a forced Constant model, shadows and the environment off) and six
+  see-through closures on the layer road at six. An **Emission node**
+  alone, and a colour wired straight into Surface: the Ball is exactly
+  the colour at the pixel, vertex and face rates; it was the colour over
+  the lit fallback (Ball mean (2.04, 1.44, 1.27)), and at the corner
+  rates the fallback colour multiplied into both. Shader to RGB of an
+  Emission reads the colour itself (through a second Emission the Ball
+  was (3.19, 2.58, 2.44): the read lit a default surface under the
+  glow). A **Glossy BSDF**, a **Metallic BSDF** and a **Principled BSDF
+  at Metallic 1** (the node always hands on a DIFFUSE lobe, whose weight
+  is 0 at Metallic 1 or Transmission 1): the highlight alone, Ball mean
+  (1.15, 1.15, 1.17) -> (0.009, 0.006, 0.002). A GLOSSY lobe carries no
+  reflection in this engine, so a metal is its highlight on black where
+  it was its highlight on the viewport colour lit as plastic -- the
+  largest change in this entry for an imported scene. A **Glass BSDF**,
+  a **Refraction BSDF** and a Principled at Transmission 1: the
+  reflection and the highlight alone ((1.21, 1.24, 1.31) -> (0.07, 0.10,
+  0.14); (0.16, 0.22, 0.25) ray traced). A **Transparent BSDF** and a
+  **Holdout** alone: bitwise unchanged wherever alpha composites
+  (Sorted, A-Buffer, ray traced, the corner rates: the layer is alpha
+  0); under Transparency None, where alpha is forced to 1, the opaque
+  surface is black where it was the lit fallback, and under Screen Door
+  the dropped pixel carries no colour. **Mixes by a mask**, one batch,
+  pixel rate: Diffuse with Emission, with Glossy, and with Transparent
+  on the layer road are bitwise what they were (their no-diffuse pixels
+  were already unlit); Diffuse with Glass differs on the glass side's
+  highlight alone (139 pixels, up to 0.87): a GLASS lobe adds a specular
+  weight and no roughness, so its exponent was 8192 in a mixed batch and
+  the material's 25 alone, and is the material's now. At the corner
+  rates the emission, glossy and glass sides appear where they were
+  black. Unchanged, bit for bit, at all nine settings: a Diffuse BSDF, a
+  Translucent BSDF (a diffuse lobe at half its weight), a Principled
+  BSDF at Metallic 0 and 0.5 and at Alpha 0, the unwired Surface socket
+  and the graph-less material. (3) *Both roads.* What the plan qualifies
+  it twins by construction, with no GLSL changed: the probe bakes
+  through `closure_to_surface`, and the pass's ambient term is
+  `s.diffuse * (ambient * the baked level)`. An emission-only closure
+  rides the emission slot routing of the entry above, which restates
+  nothing about the surface under the light: the probe bakes diffuse
+  level 0, ambient 0 and a white diffuse, and the Emission Ball is its
+  colour in the simulator as on the CPU (the frames 7.2e-7, 4.8e-7 and
+  1.2e-7 apart at the pixel, vertex and face rates). A lone Glossy or
+  Metallic (the specular slot routing) bakes the same three and twins at
+  5.1e-5, 4.8e-7 and 1.2e-7. A raw EMISSION lobe beside a diffuse one
+  (the masked mix) still refuses the plan by name, so both devices draw
+  the CPU frame there. Two disagreements the batch rule held go with it.
+  Finding (e): the glossy pixels twin now (the island's 79 remain, item
+  4 (iv) below). And a Transparent BSDF alone under Transparency None or
+  Screen Door, where the plan qualified and the pass lit the node's own
+  colour as an albedo while the CPU lit the fallback: 0.48 off on all
+  598 pixels of the Ball for a white one and 1.44 for a tinted one,
+  7.2e-7 now (level 0 and ambient 0 leave the colour unread on both).
+  (4) *Considered and left* (items i and iii are closed by the entry
+  below). (i) *The ambient share of a PARTIAL diffuse weight.* A diffuse
+  lobe at any weight above zero kept the whole ambient term, so a Fac
+  running up to 1 stepped down by the lobe's colour times the ambient
+  pool where it arrived: Fac 0.999 against Fac 1 was (0.021, 0.036,
+  0.145) on the demo Ball. (Under the batch rule the step at exactly 1
+  was the whole fallback popping IN, 1.12 the other way.) (ii) *The
+  Glass and Refraction lobes' Roughness.* The nodes evaluate it and
+  `closure_to_surface` never accumulates it, which is why a glass pixel
+  has a specular weight and no roughness of its own (the 139 pixels
+  above). (iii) *The master branch read its batch for the MODEL.* Two
+  Halcyon Shaders of different models mixed by a mask shaded each batch
+  with its heaviest lobe's model (the mean weight over the batch): Phong
+  against Toon on the Ball, three bands at 640x480 against the
+  in-process frame, 3,089 pixels up to 1.51. (iv) *The probe's sampled
+  constancy cannot see an island.* The 79 island pixels of finding (e)
+  still draw as the glossy surface in the simulator: sixteen fragments
+  missed a lobe living on 13% of the material, `PROBE_FRAGMENTS`'
+  standing risk for every baked field. (v) *A Mix Shader (Diffuse,
+  Transparent) at a constant Fac 0.5 under Transparency None or Screen
+  Door* qualifies and draws 0.48 off the CPU on all 598 pixels, before
+  and after this fix (it has a diffuse lobe; the pass's colour chain is
+  the mix of both nodes' colours, the CPU's diffuse the Diffuse BSDF's
+  alone). Recorded, not touched. Pinned in
+  `test_a_closure_with_no_diffuse_lobe_has_no_diffuse_at_every_pixel`
+  (90 checks). At the function: the report's own two lines; every slot
+  of every pixel bitwise the same alone and in a mixed batch, for a
+  Diffuse mixed with an Emission, a Glossy, a Glass, a Refraction, a
+  Transparent, a Holdout and a Translucent, with and without a material;
+  the rule slot by slot; the graph-less and the empty closure keeping
+  the material's own fields; a glossy probe of the masked material
+  baking the frame's own rule. In the frame: the Emission Ball exactly
+  its colour at the three rates, and through Shader to RGB; each side of
+  the masked Ball bitwise its own node alone; a band, three rejoined
+  bands, a render region and 96-pixel chunks each bitwise the in-process
+  frame, the band at the corner rates too; the three-worker pool at
+  320x240 bitwise the in-process frame (its top band is pure glow;
+  skipped by name without a worker interpreter); a Glossy, a Metallic, a
+  Principled-metal and a Glass Ball black with every lamp removed while
+  a Diffuse Ball is not; the Transparent Ball under Transparency None;
+  the Glossy and Metallic twins at three rates with the probe's bake
+  read back; the tinted Transparent twin under None and Screen Door; the
+  Emission node's twin at three rates with its Ball the colour in the
+  simulator and the emission slot's bake read back; the masked mix's
+  refusal. Twelve mutations each fail it: the batch rule restored for
+  the diffuse, the specular or the roughness slot; the fallback kept per
+  pixel; the ambient share kept, taken from every pixel, or decided by
+  the batch; a black albedo, or the fallback's; the level or the
+  specular level left the material's; the rule reaching the empty
+  closure.
+  `test_colour_wired_into_a_shader_socket_is_an_emission_on_both_roads`
+  was re-run: the wired colour is still bitwise the Emission node's
+  frame and frame(colour) - frame(black) still the colour, and it now
+  also holds that frame(black) is black (48 checks).
+- **A mix carries its ambient by share, the master branch is per pixel,
+  and what cannot blend votes once per material (what the entry above
+  left in the same function).** Three more reads of
+  `closure_to_surface`, each seen in a frame before it was touched. (1)
+  *The ambient share.* A diffuse lobe at any weight above zero kept the
+  WHOLE ambient term -- the ambient is the diffuse colour times the
+  ambient level and reads no weight -- so a Fac running up to 1 dropped
+  the lobe's colour times the ambient pool where it arrived: (0.021,
+  0.036, 0.145) between Fac 0.999 and Fac 1 on the demo Ball, for a
+  Diffuse BSDF and for a Halcyon Shader mixed with an Emission alike.
+  The ambient level carries the diffuse SHARE of the pixel's covered
+  surface now. Plain branch: the material's level times (the Diffuse
+  weights + the Translucent weights) / (1 - the Transparent share) -- a
+  Translucent counted whole (the diffuse slot takes half of it, but both
+  halves answer the pool), and a share within 1e-6 of the whole taken as
+  the whole. Master branch: `1 + (ambient - 1) x the master's share`, as
+  it was, less the opaque plain share that is not diffuse (an Emission,
+  a Glossy, a Glass: it counted as a diffuse at ambient 1.0). The step
+  is gone: Fac 0.999 is within 0.01 of Fac 1 on every pixel of the Ball,
+  the lobe's own last thousandth. *What it changes:* a diffuse side (a
+  Diffuse BSDF, a Translucent, a Halcyon Shader) mixed with an Emission,
+  a Glossy or a Glass at a PARTIAL Fac, and a Principled BSDF at a
+  partial Metallic or Transmission, lose the ambient of the share that
+  is not diffuse -- 0.072 on the Ball at Fac 0.5 (half the lobe's colour
+  times the pool), 0.036 at Fac 0.25, 0.044 for a Principled at Metallic
+  0.5. Blender's reading (the diffuse BSDF's share of the world light),
+  and the same on both devices: the probe bakes the level through
+  `closure_to_surface` (0.5 where it baked 1.0). *What it does not:*
+  every whole share is bitwise -- a Diffuse, a Translucent, a Principled
+  at Metallic 0, a Specular BSDF, a Subsurface, an Add Shader with an
+  Emission, and any of them, or a Halcyon Shader at any Ambient, mixed
+  with a Transparent alone (the share is of what is covered). (2) *The
+  master branch, per pixel.* The entry above first said this branch's
+  slots other than the model were per pixel. They were not: the check
+  behind that used levels under 1, where a batch-wide clip does not
+  bite. The block that mixes master lobes with plain ones ran for the
+  WHOLE batch when any pixel carried a plain weight, and its inner tests
+  were `np.any` too. A pure-master pixel beside a plain one had its
+  Reflection clipped at 1 (1.4 -> 1.0) and its opacity re-derived
+  through 1 - (1 - o) (an ulp at 0.1); beside a plain glossy or diffuse
+  pixel its Specular or Diffuse Level was clipped at 1 (2.0 -> 1.0, 1.5
+  -> 1.0). Every test is the pixel's own weight now: a pixel with no
+  plain weight is the master alone, bit for bit, and a mixed pixel keeps
+  the arithmetic it had. Where neither a master nor a diffuse lobe
+  weighs (the Emission side of a mask) the pixel takes the plain
+  branch's rule -- level 0, no ambient, a white albedo. The weighted
+  colour is black there, and at the vertex and face rates `light x
+  albedo` wiped the glow: a Halcyon Shader mixed with an Emission by a
+  mask rendered all 421 emission pixels of the Ball (0, 0, 0), and
+  renders them (0.9, 0.3, 0.1). (3) *The vote.* What cannot blend -- the
+  model, the normal's carrier, the Faceted flag, the python extras (the
+  BI kit, the shadow ramp) -- is named by the heaviest master lobe, and
+  a plain glossy side heavier than every master outvotes the model.
+  "Heaviest" was the mean weight over the BATCH. Two Halcyon Shaders
+  (Phong, Toon) mixed by a mask shaded each band with whichever side
+  filled it: three bands at 640x480 against the in-process frame, 3,089
+  pixels up to 1.51. A master at Specular Level 2 mixed with a Glossy
+  BSDF by a mask: the band under the glossy cap at 320x240, 250 pixels
+  up to 1.63 (the outvote and the clip of (2) together). The vote is
+  cast ONCE PER MATERIAL: `ShadeJob.lobe_rank` evaluates the graph at
+  the centroids of up to 64 of the material's own triangles (evenly
+  spaced through its triangle list), `core/render.closure_rank` takes
+  the mean weights there, each centroid counted by its triangle's area,
+  and `closure_to_surface(..., rank)` reads them in place of the batch's
+  -- from `shade_batch`, and from the deferred probe and the normal
+  pre-passes of `gpu/shade.py`, which are batches too (sixteen probe
+  fragments on the Toon cap baked Toon for the whole material; they bake
+  the material's Phong, and the simulator frame is the CPU frame). It is
+  a function of the scene alone: the same in every chunk, band, region
+  and worker, and the same as the camera moves. A graph that will not
+  evaluate there says so once and each batch votes for itself, as
+  before; so does a bare call with no vote handed in. *What it changes:*
+  a mix whose weights VARY over the surface is voted by its surface, not
+  by the pixels a batch holds. On the survey's two masked Balls the
+  visible majority had named the model (Toon; the Glossy side's
+  Cook-Torrance) and the surface names the other (1.89 and 1.62 on the
+  Ball). A mix at constant weights votes as it did: two masters at Fac
+  0.3, 0.5 and 0.7 are bitwise. It is still ONE model per material; each
+  side of a mask keeping its own is a per-pixel light loop, which this
+  does not attempt. *Surveyed* old against new on 144 frames (48
+  closures at the pixel rate, the vertex rate and Transparency None): 95
+  bitwise, 49 changed, each of them named above. *Left.* (i)
+  `light_surface` reads three blended flags for the batch and not the
+  pixel -- the cel key (`cel_light`, the batch's first pixel), the
+  console light limit (the batch's maximum) and the axis viewer (any
+  pixel) -- so two masters that DIFFER in one of them and are mixed by a
+  mask still read their batch there. Read in the code, not run. (ii) A
+  mixed pixel still sums its levels toward 1, so a master at a level
+  over 1 steps down where a plain weight begins. (iii) Bump Strength's
+  bend is gated by `np.any` (a pixel at strength 1 is re-derived beside
+  one that is not: an ulp). (iv) Shader to RGB collapses its closure
+  with a bare call, so a mix read through it has no material to vote.
+  (v) The deferred pass's ONE colour chain for a Mix Shader of two plain
+  lobes is the mix of both nodes' colours, where the CPU's diffuse is
+  the diffuse lobe's own: Mix (Diffuse, Glossy, 0.5) qualifies 0.45 off
+  the CPU on all 598 pixels of the Ball (0.42 after this entry), the
+  Diffuse / Transparent pair of the entry above 0.48. Seen, not touched:
+  its own fix. Pinned in
+  `test_a_mix_carries_its_ambient_by_share_and_votes_once_per_material`
+  (61 checks). At the function: the share for a Diffuse mixed with an
+  Emission, a Glossy, a Glass and a Refraction at three Facs; the
+  bitwise set (a Transparent, a Holdout, a Translucent, an Add, a nested
+  Transparent mix) and the covered-surface share of a three-way mix;
+  every slot of every pixel of a hot master (levels 1.5 and 2,
+  Reflection 1.4, opacity 0.1) mixed with each of seven plain lobes
+  bitwise the same alone and in a batch, and beside a third lobe it does
+  not carry; the master's ambient against a diffuse, a transparent and a
+  non-diffuse plain side; the bare pixel's rule; the vote for the model,
+  the normal and the extras in four batches, a vote of another shape, an
+  unreadable vote, the glossy outvote both ways. In the frame: a band
+  wholly on the Toon side and 96-pixel chunks bitwise the in-process
+  frame; the frame bitwise the one whose minority master wears the
+  majority's model, with the mask either way round; `lobe_rank` read
+  back (three quarters against one quarter of the sphere, cached, None
+  without a graph, and None said once by name when the graph will not
+  evaluate there); the probe's baked model and the simulator twin; the
+  hot master's band; the emission side at the three rates; Fac 0.999
+  against the Emission alone for both branches; the probe's baked
+  ambient for both. Twenty-two mutations each fail it: for the share,
+  none applied, of the whole pixel, a Translucent at half, no
+  float-noise snap, a Diffuse uncounted; for the master branch, the
+  block or either inner test run for the batch, the non-diffuse share
+  kept, unsnapped, or counting a diffuse or the transparent side, no
+  white albedo or a kept ambient on a bare pixel; for the vote, ignored,
+  taken at another shape, the outvote uncast or cast by the batch as
+  well, `lobe_rank` empty or over one triangle, and `shade_batch` or the
+  probe not handing it on.
 - **A moved object under a still camera rendered from stale caches.**
   The CPU's G-buffer cache (R170) keys on a mesh fingerprint and the
   camera, and the fingerprint read the vertex positions as a strided
@@ -4190,8 +4490,8 @@ What headless cannot prove, per feature (the fakebpy / fakeblender stubs validat
   type, for the Material Output's Surface, a Mix Shader input and the
   World Output; the F12 console's `shading on the CPU:` line naming the
   wiring on the GPU device; the same file in EEVEE beside it, where the
-  surface under the glow is black and Halcyon's is its lit fallback
-  (the open item above).
+  surface under the glow is black, as Halcyon's is since the
+  no-diffuse entry above.
 - The emission slot routing on a real driver (proven in the simulator,
   on the fake driver and under glslang alone): an Emission node and a
   texture wired straight into Surface shading on the GPU device with no
@@ -4342,6 +4642,21 @@ What headless cannot prove, per feature (the fakebpy / fakeblender stubs validat
   so no new shader text is involved, but only a device shows it.
 - Animation: a keyed sunset crossing the horizon fading the light, and the
   moon phase keyed across a month.
+- A closure with no diffuse lobe in a live file (proven against
+  hand-built graphs and a headless worker pool alone): a masked Mix
+  Shader (Diffuse, Emission) at 1280x960 or larger in a real F12, in
+  process, across the worker pool and under Ctrl+B, with no edge through
+  the glow; a Principled BSDF at Metallic 1 from a real export (the
+  weight-0 DIFFUSE lobe the node always hands on) drawing its highlight
+  on black beside EEVEE's reflecting metal; a lone Glossy BSDF on a real
+  driver matching the CPU device (the simulator twin is 5.1e-5); a
+  Transparent BSDF alone under Transparency None on the driver.
+- A mix in a live file (proven against hand-built graphs alone): two
+  Halcyon Shaders of different models mixed by a painted mask drawing
+  ONE model in every band and region and holding it as the camera moves;
+  the console line when a graph will not evaluate at the triangle
+  centroids (each batch then votes for itself); a Principled BSDF at
+  Metallic 0.5 beside EEVEE.
 
 ---
 
