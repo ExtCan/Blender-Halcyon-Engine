@@ -2116,7 +2116,8 @@ _CHAIN = _F(_F(_F(3.0) * _F(0.1)) * _F(0.7))
 _WIDE = _F(3.0 * float(_F(0.1)) * float(_F(0.7)))
 
 #: (what, declarations above main, statements): each leaves 3 * 0.1 * 0.7
-#: in all four components of Color, and each answered _WIDE
+#: in all four components of Color, and each answered _WIDE in one of them
+#: at least (or the float64 array the chain was left in)
 _THREE_TENTHS = [
     ('the reported shader: vec2(q, q) * 0.1 * 0.7', '',
      '    int q = 3;\n    vec2 g = vec2(q, q) * 0.1 * 0.7;\n'
@@ -2150,8 +2151,6 @@ _THREE_TENTHS = [
      '    int q = 3;\n'
      '    vec2 g = (q > 0 ? vec2(q, q) : vec2(1.0)) * 0.1 * 0.7;\n'
      '    Color = vec4(g, g);\n'),
-    ('divided: (vec2(q, q) / 10.0) * 0.7 after 0.1 is written as 1 / 10',
-     None, None),
     ('a function\'s argument, taken as a swizzle',
      'vec2 twice(vec2 p) { return p * 0.1 * 0.7; }\n',
      '    Color = vec4(twice(vec2(3, 3).yx), twice(ivec2(3, 3)));\n'),
@@ -2199,8 +2198,9 @@ _THREE_TENTHS = [
      'mix(3, x, 0.0) * 0.1 * 0.7, mad(3, 1, 0.0) * 0.1 * 0.7);\n'),
 ]
 
-#: (what, declarations above main, statements, the Color wanted, what it
-#: was): the same int array giving another NUMBER, not another last bit
+#: (what -- and what it gave, declarations above main, statements, the
+#: Color wanted): the same int array giving another NUMBER, not another
+#: last bit
 _NOT_A_LAST_BIT = [
     ('a component written into an int-built vector (0.5 was cut to 0)', '',
      '    vec2 g = vec2(1, 2).yx;\n    g.x = 0.5;\n'
@@ -2319,7 +2319,7 @@ def test_a_float_vector_is_float32_whatever_it_is_built_from():
           'them apart', _CHAIN != _WIDE,
           f'{float(_CHAIN)!r} {float(_WIDE)!r}')
     want = np.full(4, _CHAIN, np.float32)
-    cases = [c for c in _THREE_TENTHS if c[2] is not None]
+    cases = _THREE_TENTHS
     for what, head, body in cases:
         got, err = _first(_body(body, head))
         check(f'float32: {what} -- 3 * 0.1 * 0.7 is the float32 chain, bit '
@@ -2523,9 +2523,46 @@ def test_a_float_vector_is_float32_whatever_it_is_built_from():
           got is not None and np.array_equal(got, [1, 1, 1, 0.5]),
           str(err if got is None else got))
 
-    # the engine's own use of it: the G-buffer's texel address
-    # (gpu/gbuffer.py), a float uv times vec2 of an ivec2. The product is
-    # float32 now and the texel is the one it was, at every centre
+    # the engine's own two uses of it. The Blender Internal Voronoi's
+    # feature point (gpu/procedural.py, bi_voronoi) is a hash point plus
+    # its cell, `vec3 pt = bi_hpntv(hi) + vec3(c);` of an ivec3: the sum
+    # was float64 and stayed so through the distance taken from it, which
+    # is why that twin sat 4e-7 off core/bitex's float32 and is exact
+    # now. Here on its own, at the scale the texture works at (P / 0.25)
+    src = ('in vec3 vPosition;\nout vec4 Color;\nvoid main() {\n'
+           '    vec3 p = vPosition / 0.25;\n'
+           '    ivec3 base = ivec3(floor(p));\n'
+           '    ivec3 c = base + ivec3(1, -1, 0);\n'
+           '    vec3 h = fract(vPosition.zxy * 0.731);\n'
+           '    vec3 pt = h + vec3(c);\n'
+           '    vec3 d = p - pt;\n    Color = vec4(d, dot(d, d));\n}\n')
+    rng = np.random.default_rng(11)
+    pos = rng.uniform(-3, 3, (256, 3)).astype(np.float32)
+    outs, _, _ = run(src, inputs={'position': pos}, n=len(pos))
+    p = pos / _F(0.25)
+    cell = (np.floor(p).astype(np.int32)
+            + np.array([1, -1, 0], np.int32)).astype(np.float32)
+    h = pos[:, [2, 0, 1]] * _F(0.731)
+    h = h - np.floor(h)
+    d32 = p - (h + cell)
+    d64 = (p.astype(np.float64) - (h.astype(np.float64) + cell)).astype(
+        np.float32)
+    other = int((d32 != d64).any(axis=1).sum())
+    check('float32: the Voronoi feature point, a hash point + vec3 of its '
+          'ivec3 cell, is the float32 sum at 256 points (from the float64 '
+          f'sum {other} of them are another distance, by up to '
+          f'{float(np.abs(d32 - d64).max()):.2e})',
+          outs['Color'].dtype == np.float32
+          and outs['Color'][:, :3].tobytes() == d32.tobytes()
+          and np.array_equal(outs['Color'][:, 3],
+                             np.sum(d32 * d32, axis=1, dtype=np.float32))
+          and other > 128,
+          str(outs['Color'][0]))
+
+    # ...and the G-buffer's texel address (gpu/gbuffer.py; the same over
+    # hal_uvgrad in gpu/material.py), a float uv times vec2 of an ivec2.
+    # The product is float32 now and the texel is the one it was, at
+    # every centre
     src = ('uniform sampler2D gb;\nin vec2 vUV;\nout vec4 Color;\n'
            'void main() {\n    ivec2 gbsz = textureSize(gb, 0);\n'
            '    ivec2 gbpx = ivec2(clamp(vUV * vec2(gbsz), vec2(0.0), '
