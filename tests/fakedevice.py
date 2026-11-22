@@ -163,6 +163,16 @@ class Shader:
         self.name, self.prog, self.spec = name, prog, spec
 
 
+class ComputeShader:
+    """R254: a compiled compute kernel as the fake keeps it -- its
+    CreateInfo, to hold every dispatch against."""
+
+    def __init__(self, name, source, samplers, floats, images, fmt):
+        self.name, self.source = name, source
+        self.samplers, self.floats = tuple(samplers), tuple(floats)
+        self.images, self.fmt = tuple(images), str(fmt)
+
+
 _DECL = re.compile(r'^\s*uniform\s+(\w+)\s+(\w+)\s*;', re.M)
 
 
@@ -176,6 +186,12 @@ class Device:
         self.targets = []
         self.pool = {}
         self.pool_on = True
+        # R254: the compute door (installed(compute=True)): the image
+        # formats this "driver" compiles a kernel for, and what it was
+        # asked -- [(name, format)] compiles, [(name, w, h, format)]
+        # dispatches
+        self.compute_formats = ('R32F', 'RGBA32F')
+        self.compute = {'compiles': [], 'dispatches': []}
 
     def probe(self):
         return True, 'the fake device'
@@ -347,19 +363,121 @@ class Device:
             raise AssertionError('reads a freed target')
         return self._read(target, region)
 
+    # ---- R254: the compute door, for the shadow-map bake's kernel
+
+    def compile_compute(self, name, source, samplers=(), floats=(),
+                        images=(), image_format='RGBA32F'):
+        """gpu/device.compile_compute under the driver's rules: the
+        image format must be one this device creates, every uniform the
+        text declares must be in the CreateInfo and of its kind, every
+        push constant and sampler of the CreateInfo must be declared by
+        the text, and every image must be stored to."""
+        self.compute['compiles'].append((name, str(image_format)))
+        if image_format not in self.compute_formats:
+            return None, (f'{name}: compute CreateInfo failed: image '
+                          f'format {image_format}')
+        declared = {nm: kind for kind, nm in _DECL.findall(source)}
+        for nm, kind in declared.items():
+            want = floats if kind == 'float' else samplers
+            if nm not in want:
+                return None, (f'{name}: uniform {nm} is declared but not '
+                              'in the CreateInfo')
+        # the CreateInfo is the interface (the device strips the text's
+        # own declarations): a name of it the text never READS is one a
+        # driver strips, and a kernel that lost an input is refused here
+        unread = unread_uniforms(source, tuple(floats) + tuple(samplers))
+        if unread:
+            return None, (f'{name}: the source never reads '
+                          + ', '.join(unread))
+        for nm in images:
+            if f'imageStore({nm},' not in source:
+                return None, f'{name}: image {nm} is never stored to'
+        key = (name, hash(source), str(image_format))
+        sh = self.shaders.get(key)
+        if sh is None:
+            sh = self.shaders[key] = ComputeShader(
+                name, source, samplers, floats, images, image_format)
+        return sh, None
+
+    def dispatch_compute(self, shader, width, height, uniforms=None,
+                         samplers=None, images=None,
+                         image_format='RGBA32F'):
+        """gpu/device.dispatch_compute for the ONE kernel this fake has
+        a twin of: the depth variant of the compute rasteriser, run
+        through the GLSL front-end over the very arrays the dispatch
+        uploaded and the push constants it set (gpu/craster.
+        simulate_depth). A dispatch that leaves a sampler unbound or a
+        push constant unset, sets one the CreateInfo does not declare,
+        or asks for another format or image than it compiled is refused
+        by name, as the driver refuses it."""
+        from ..gpu import craster as CRA
+        uniforms, samplers = dict(uniforms or {}), dict(samplers or {})
+        if shader.source != CRA.depth_compute_source():
+            raise AssertionError(f'{shader.name}: the fake device '
+                                 'dispatches the depth kernel only')
+        if str(image_format) != shader.fmt:
+            raise AssertionError(f'{shader.name}: dispatched for '
+                                 f'{image_format}, compiled for '
+                                 f'{shader.fmt}')
+        if tuple(images or ()) != shader.images:
+            raise AssertionError(f'{shader.name}: images {images}')
+        for nm in shader.samplers:
+            if not isinstance(samplers.get(nm), FakeTexture):
+                raise AssertionError(f'{shader.name}: sampler {nm} unbound')
+        for nm in shader.floats:
+            if not isinstance(uniforms.get(nm), float):
+                raise AssertionError(f'{shader.name}: push constant {nm} '
+                                     'is not set to a float')
+        for nm in list(uniforms) + list(samplers):
+            if nm not in shader.floats and nm not in shader.samplers:
+                raise AssertionError(f'{shader.name}: {nm} is not in the '
+                                     'CreateInfo')
+        if int(width) != int(height) \
+                or float(uniforms['hal_rw']) != float(width) \
+                or float(uniforms['hal_rh']) != float(height):
+            raise AssertionError(f'{shader.name}: a {width} x {height} '
+                                 'dispatch of a square map')
+        self.compute['dispatches'].append(
+            (shader.name, int(width), int(height), shader.fmt))
+        plane = CRA.simulate_depth(
+            samplers['hal_rc'].pixels, samplers['hal_rbins'].pixels,
+            samplers['hal_rtiles'].pixels, int(width), uniforms)
+        if shader.fmt == 'R32F':
+            return {shader.images[0]: plane}
+        wide = np.zeros((int(height), int(width), 4), np.float32)
+        wide[:, :, 0] = plane
+        wide[:, :, 3] = 1.0
+        return {shader.images[0]: wide}
+
 
 _NAMES = ('probe', 'upload', 'upload_cached', 'compile_dynamic',
           'compile_stage', 'target_texture', 'draw_many', 'draw_fullscreen',
           'read_target', 'Target')
 
 
+#: R254: the compute door's two functions, swapped in on request only
+#: (a suite that never asked for it keeps the real functions, which
+#: refuse without a driver exactly as before)
+_COMPUTE_NAMES = ('compile_compute', 'dispatch_compute')
+
+
 @contextlib.contextmanager
-def installed():
-    """Swap the fake in for gpu/device's functions; yields the Device."""
+def installed(compute=False, compute_formats=None):
+    """Swap the fake in for gpu/device's functions; yields the Device.
+
+    R254: `compute=True` also swaps the compute door in (the shadow-map
+    bake's kernel runs through the front-end), with `compute_formats`
+    the image formats the fake compiles a kernel for (default: both);
+    the session's verdict on the device bake starts fresh and is
+    forgotten on the way out."""
     from ..gpu import device as real
     fake = Device()
-    saved = {nm: getattr(real, nm) for nm in _NAMES}
-    for nm in _NAMES:
+    if compute_formats is not None:
+        fake.compute_formats = tuple(compute_formats)
+    names = _NAMES + (_COMPUTE_NAMES if compute else ())
+    saved = {nm: getattr(real, nm) for nm in names}
+    verdict = real._STATE.pop('depth_bake', None)
+    for nm in names:
         setattr(real, nm, getattr(fake, nm))
     # Target.free() must return the fake target to the fake's pool: the
     # real module's free() is a method on the real class, so the fake
@@ -371,6 +489,9 @@ def installed():
         for nm, fn in saved.items():
             setattr(real, nm, fn)
         Target.free = _plain_free
+        real._STATE.pop('depth_bake', None)
+        if verdict is not None:
+            real._STATE['depth_bake'] = verdict
 
 
 def _plain_free(self):

@@ -574,6 +574,32 @@ class Viewport:
                     while (max(int(w) // scale, 4)
                            * max(int(h) // scale, 4)) > DRAFT_BUDGET_PX:
                         scale += 1
+                # R254: draft-sized shadow maps. A draft shrinks the
+                # picture and a traced shadow shrinks with it, but a
+                # moved lamp re-baked its maps at full size on every
+                # draft -- a 131x86 picture paying for six 512 (or 2048)
+                # cube faces was most of each drag step. The draft's
+                # maps follow its pixels: half the side at twice the
+                # refine's pixel size, a quarter at four times or more.
+                # The Softness is in TEXELS, so it shrinks with the map
+                # and the blur keeps its world width. The divisor rides
+                # this frame's settings copy only (core/lights._map_size;
+                # RenderSettings.copy carries it through the roads inside
+                # the frame): draft and refine maps are separate cache
+                # entries, and the refine and every F12 keep their own.
+                # Only where it makes the draft's bake cheaper: on a
+                # mesh whose bake follows the TRIANGLE count a smaller
+                # map costs the same, and the refine -- which used to be
+                # served the draft's full-size map -- would pay a second
+                # bake for nothing (core/lights.draft_map_divisor)
+                rel = scale // max(int(getattr(settings, 'preview_scale',
+                                               1)), 1)
+                from .core import lights as _lights
+                div = _lights.draft_map_divisor(scene, settings, rel)
+                if div > 1:
+                    settings._shadow_map_div = div
+                    settings.shadow_softness = \
+                        float(settings.shadow_softness) / div
             settings.resolution_x = max(int(w) // scale, 4)
             settings.resolution_y = max(int(h) // scale, 4)
             if rect is not None:

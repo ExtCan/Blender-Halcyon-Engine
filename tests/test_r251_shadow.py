@@ -418,9 +418,19 @@ def test_c117_midpoint_per_lamp_override():
     check('the per-lamp cache signature differs between INHERIT and '
           'MIDPOINT (the cache cannot serve across the override)',
           LI._light_shadow_signature(a) != LI._light_shadow_signature(b))
-    check('the base signature differs between CLASSIC and MIDPOINT',
-          LI._shadow_base_signature(sc_c, st_c, None)
-          != LI._shadow_base_signature(sc_m, st_m, None))
+    # R254: the render's Map Depth left the BASE signature (it holds the
+    # geometry and the casters only); each lamp's signature carries the
+    # depth rule its own bake resolves, so the cache still cannot serve
+    # a CLASSIC map to a MIDPOINT render -- and a lamp that overrides
+    # the render's rule no longer misses when the render's changes
+    check('the resolved lamp signature differs between a CLASSIC and a '
+          'MIDPOINT render (the cache cannot serve across the setting)',
+          LI._light_shadow_signature(a, st_c)
+          != LI._light_shadow_signature(a, st_m)
+          and LI._shadow_base_signature(sc_c, st_c, None)
+          == LI._shadow_base_signature(sc_m, st_m, None)
+          and LI._light_shadow_signature(b, st_c)
+          == LI._light_shadow_signature(b, st_m))
     check('midpoint_map resolves INHERIT to the render setting and the '
           'lamp\'s own value over it',
           LI.midpoint_map(a, st_m) and not LI.midpoint_map(a, st_c)

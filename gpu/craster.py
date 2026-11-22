@@ -653,19 +653,26 @@ _NO_CLEAR_READ = 'float ck = 1e30;'
 _COMPUTE_CACHE = {}
 
 
-def compute_variant_name(lin=False, clear=False, cvg=False):
+def compute_variant_name(lin=False, clear=False, cvg=False, depth=False):
     """The compiled shader's name: image and sampler bindings are part
     of the compile signature (gpu/device.py), so every flag set is its
-    own name."""
+    own name. R254: `depth` names the shadow-map bake's variant (one
+    image, the winner's z alone; none of the other flags apply to it)."""
+    if depth:
+        return 'HAL_RASTER_DEPTH'
     return (f'HAL_RASTER_L{1 if lin else 0}C{1 if clear else 0}'
             f'V{1 if cvg else 0}')
 
 
-def compute_source(lin=False, clear=False, cvg=False):
+def compute_source(lin=False, clear=False, cvg=False, depth=False):
     """The compute rasteriser's source for one flag set: `lin` adds the
     third image (the screen-linear barycentrics), `clear` (C038) the
     `hal_rclear` sampler read per pixel, `cvg` (C001) the coverage
-    block and its fourth image `hal_out_cvg`. Cached by the flag triple."""
+    block and its fourth image `hal_out_cvg`. Cached by the flag triple.
+    R254: `depth` is the shadow-map bake's variant (`depth_compute_source`,
+    further down)."""
+    if depth:
+        return depth_compute_source()
     key = (bool(lin), bool(clear), bool(cvg))
     hit = _COMPUTE_CACHE.get(key)
     if hit is None:
@@ -1396,3 +1403,621 @@ LAST_REFERRED = {'count': 0}
 #: is a diagnosis. render.py prints it under the frame breakdown so a
 #: high-resolution F12 names which half of the road got slow
 LAST_RASTER = {}
+
+
+# ------------------------------------------- R254: the shadow-map bake
+#
+# A shadow map keeps one number per texel -- the nearest NDC z -- and on
+# the GPU device every map was still baked by the NumPy fill, while a
+# traced shadow never left the shader: every lamp or object edit under
+# Shadow Maps paid a CPU bake the Ray Traced road never paid. The variant
+# below is the SAME kernel core (hal_raster_pixel: the fill's coverage,
+# its wobble window, its z, the strict `<`) resolved to that one number:
+#
+#     the winner's z            where a triangle landed
+#     DEPTH_EMPTY   (1e30)      where none did (the walk's own clear)
+#     DEPTH_FRAGILE (2e30)      where the decision sat inside the cross-
+#                               device noise window (hal_refer): the host
+#                               decides those texels again with the depth
+#                               fill's own arithmetic (`replay_depth`), so
+#                               the driver's value there is never read
+#
+# ONE image comes back (one channel where the build can create it: 16 MB
+# for a 2048 face against the 128 MB of the G-buffer variant's two RGBA
+# images). The host half is core/raster.depth_screen_tris -- the very
+# arrays the CPU bake fills -- and the tile binning of the camera raster.
+# What the simulator twin proves is the arithmetic (bitwise the CPU
+# bake's texels); the dispatch is the driver's, and the first bake of a
+# session is held against the CPU's own before any is trusted
+# (`DEPTH_CHECK_TOL`).
+
+#: the two values of a read-back texel that are not a depth
+DEPTH_EMPTY = 1e30
+DEPTH_FRAGILE = 2e30
+
+#: the image formats the bake's one image is tried in, in order
+DEPTH_FORMATS = ('R32F', 'RGBA32F')
+
+#: THE TRIAL. The first device bakes of a session are each compared with
+#: the CPU bake of the same face, texel for texel and on the clock.
+#: Texels: more of them than DEPTH_CHECK_SHARE of the map further apart
+#: than DEPTH_CHECK_TOL in NDC z and the device bakes no map this session
+#: (a driver's fused multiply-add moves a z by an ulp, about 1e-7; a wrong
+#: winner moves it by the distance between two surfaces). Clock: the
+#: first dispatch is a warm-up and is not timed; of the following faces,
+#: those whose CPU fill takes at least DEPTH_TRIAL_MIN_FILL seconds are,
+#: and once DEPTH_TRIAL_TIMED of them are in the device must have taken
+#: at most DEPTH_TRIAL_GAIN of the fill's time (upload, dispatch, read
+#: and replay against the fill alone, both in line) -- or it bakes no
+#: map this session, by name: a software rasteriser (llvmpipe: 162 ms
+#: against 60) or a GPU slower than this CPU's fill stays off the road it
+#: would slow down. The trial ends there, or after DEPTH_TRIAL_FACES
+#: faces whatever was timed. DEPTH_TRIAL_GAIN None switches the clock off
+DEPTH_CHECK_TOL = 1e-5
+DEPTH_CHECK_SHARE = 1e-4
+DEPTH_TRIAL_TIMED = 2
+DEPTH_TRIAL_FACES = 12
+DEPTH_TRIAL_MIN_FILL = 0.010
+DEPTH_TRIAL_GAIN = 0.5
+
+_DEPTH_TEXEL = """
+// R254: what the shadow-map bake keeps of a pixel: the winner's z, 1e30
+// where nothing landed, 2e30 where the host must decide again
+float hal_depth_texel(vec4 win, float fragile)
+{
+    if (fragile > 0.5) { return 2e30; }
+    if (win.x < -0.5) { return 1e30; }
+    return win.w;
+}
+"""
+
+#: the simulator's wrapper of the depth variant (one tile at a time, the
+#: bin range as uniforms: fragment_source's own shape)
+_DEPTH_FRAGMENT_SHELL = """
+uniform vec2 hal_pix;                // this lane's pixel centre
+uniform float hal_bin_start;
+uniform float hal_bin_count;
+uniform float hal_cull;
+out vec4 Depth;
+void main()
+{
+    float fragile = 0.0;
+    vec2 jit = hal_jitter(hal_pix);
+    vec4 win = hal_raster_pixel(hal_pix, jit, hal_bin_start, hal_bin_count,
+                                hal_cull, 1e30, fragile);
+    Depth = vec4(hal_depth_texel(win, fragile), 0.0, 0.0, 1.0);
+}
+"""
+
+#: the driver's wrapper: _COMPUTE_SHELL with the resolve and its images
+#: replaced by the one store
+_DEPTH_COMPUTE_SHELL = """
+uniform sampler2D hal_rtiles;        // per tile: (start, count, 0, 0)
+uniform float hal_cull;
+uniform float hal_rw;
+uniform float hal_rh;
+void main()
+{
+    ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (float(xy.x) >= hal_rw || float(xy.y) >= hal_rh) { return; }
+    vec2 pix = vec2(float(xy.x) + 0.5, float(xy.y) + 0.5);
+    vec4 trange = texelFetch(hal_rtiles,
+                             ivec2(xy.x / TILE_I, xy.y / TILE_I), 0);
+    float fragile = 0.0;
+    vec2 jit = hal_jitter(pix);
+    vec4 win = hal_raster_pixel(pix, jit, trange.x, trange.y, hal_cull,
+                                1e30, fragile);
+    imageStore(hal_out_depth, xy,
+               vec4(hal_depth_texel(win, fragile), 0.0, 0.0, 1.0));
+}
+""".replace('TILE_I', str(TILE))
+
+_DEPTH_SOURCES = {}
+
+
+def _depth_core(core):
+    """The kernel core up to its resolve: the bake reads the walk's own
+    result and none of the winner's attributes, so hal_raster_resolve is
+    not in its text (every push constant of RASTER_FLOATS is read above
+    it)."""
+    return core[:core.index("// the winner's outputs")]
+
+
+def depth_fragment_source():
+    """The depth variant as the NumPy front-end runs it."""
+    hit = _DEPTH_SOURCES.get('frag')
+    if hit is None:
+        hit = _DEPTH_SOURCES['frag'] = _depth_core(kernel_core(False)) \
+            + _DEPTH_TEXEL + _DEPTH_FRAGMENT_SHELL
+    return hit
+
+
+def depth_compute_source():
+    """The depth variant as the driver compiles it (texelFetch reads)."""
+    hit = _DEPTH_SOURCES.get('comp')
+    if hit is None:
+        hit = _DEPTH_SOURCES['comp'] = _depth_core(_exact_core(False)) \
+            + _DEPTH_TEXEL + _DEPTH_COMPUTE_SHELL
+    return hit
+
+
+def depth_uniforms(c_side, b_side, size, cull='NONE'):
+    """Every push constant of one depth dispatch (RASTER_FLOATS, all of
+    them): 32-bit z, no encoding, no jitter, the referral marks ON."""
+    ku = kernel_uniforms(None, 32, False)
+    u = {'hal_rc_side': float(c_side), 'hal_rbins_side': float(b_side),
+         'hal_cull': {'NONE': 0.0, 'BACK': 1.0, 'FRONT': 2.0}.get(cull, 0.0),
+         'hal_rw': float(size), 'hal_rh': float(size),
+         'hal_refer': 1.0}
+    for nm in RASTER_FLOATS:
+        if nm not in u:
+            u[nm] = float(ku[nm])
+    return u
+
+
+def simulate_depth(corners, bins, tiles, size, uniforms):
+    """The depth kernel through Halcyon's own front-end, tile by tile,
+    over the PACKED inputs (the arrays a dispatch uploads) and the push
+    constants it would set: the read-back plane the driver's dispatch
+    would produce -- z, DEPTH_EMPTY or DEPTH_FRAGILE per texel."""
+    from ..core.texture import Texture
+    from ..shaders.compiler import try_compile
+
+    prog, err = try_compile(depth_fragment_source(), 'GLSL')
+    if prog is None:
+        raise RuntimeError(f'depth kernel does not compile: {err}')
+    size = int(size)
+    out = np.full((size, size), DEPTH_EMPTY, np.float32)
+    tex = {'hal_rc': Texture(np.asarray(corners, np.float32),
+                             colorspace='Non-Color', filt='NEAREST',
+                             wrap='EXTEND'),
+           'hal_rbins': Texture(np.asarray(bins, np.float32),
+                                colorspace='Non-Color', filt='NEAREST',
+                                wrap='EXTEND')}
+    th, tw = tiles.shape[0], tiles.shape[1]
+    for tyy in range(th):
+        for txx in range(tw):
+            count = float(tiles[tyy, txx, 1])
+            if count < 0.5:
+                continue
+            xs = np.arange(txx * TILE, min((txx + 1) * TILE, size))
+            ys = np.arange(tyy * TILE, min((tyy + 1) * TILE, size))
+            X, Y = np.meshgrid(xs, ys)
+            n = X.size
+            uni = dict(tex)
+            for nm, v in uniforms.items():
+                if nm in ('hal_rw', 'hal_rh'):
+                    continue
+                uni[nm] = np.full(n, float(v), np.float32)
+            uni['hal_pix'] = np.stack([X.ravel() + 0.5, Y.ravel() + 0.5],
+                                      1).astype(np.float32)
+            uni['hal_bin_start'] = np.full(n, float(tiles[tyy, txx, 0]),
+                                           np.float32)
+            uni['hal_bin_count'] = np.full(n, count, np.float32)
+            got = prog.run(uni, {}, n)[0]['Depth']
+            out[Y.ravel(), X.ravel()] = np.asarray(got, np.float32)[:, 0]
+    return out
+
+
+def replay_depth(pxs, pys, sx, sy, z, tiles, bins_flat, tw, cull='NONE'):
+    """The depth bake's half of the raster tie referral: the texels the
+    kernel marked, decided again with the depth fill's own float32
+    statements (core/raster.depth_fragments, the batched branch) over the
+    triangles of each texel's tile bin. Returns their z, +inf where no
+    fragment lands (a NaN or +inf fragment is no fragment, as there)."""
+    from ..core.raster import EDGE_WOBBLE as _EW
+    f32 = np.float32
+    n = int(pxs.size)
+    out = np.full(n, np.inf, np.float32)
+    if n == 0:
+        return out
+    starts = tiles[:, :, 0].ravel().astype(np.int64)
+    counts = tiles[:, :, 1].ravel().astype(np.int64)
+    t_idx = (pys.astype(np.int64) // TILE) * tw \
+        + (pxs.astype(np.int64) // TILE)
+    cnt_all = counts[t_idx]
+    # rows of one chunk share a lane count: a few marked texels in a
+    # crowded tile must not size the arrays of all the others
+    order = np.argsort(cnt_all, kind='stable')
+    pos = int((cnt_all == 0).sum())             # an empty bin: no fragment
+    while pos < n:
+        hi = pos + 1
+        while hi < n and int(cnt_all[order[hi]]) * (hi + 1 - pos) \
+                <= REPLAY_LANES:
+            hi += 1
+        rows = order[pos:hi]
+        pos = hi
+        cnt = cnt_all[rows]
+        lane = np.arange(int(cnt.max()), dtype=np.int64)[None, :]
+        valid = lane < cnt[:, None]
+        entry = np.where(valid, starts[t_idx[rows]][:, None] + lane, 0)
+        T = bins_flat[entry].astype(np.int64)
+        X = (pxs[rows].astype(np.float32) + f32(0.5))[:, None]
+        Y = (pys[rows].astype(np.float32) + f32(0.5))[:, None]
+        ix = X - f32(0.5)
+        iy = Y - f32(0.5)
+        xa, xb, xc = sx[T, 0], sx[T, 1], sx[T, 2]
+        ya, yb, yc = sy[T, 0], sy[T, 1], sy[T, 2]
+        ar = (xb - xa) * (yc - ya) - (xc - xa) * (yb - ya)
+        ok = valid & (np.abs(ar) > 1e-9)
+        if cull == 'BACK':
+            ok &= ar > 0.0
+        elif cull == 'FRONT':
+            ok &= ar < 0.0
+        bxmin = np.maximum(np.floor(np.minimum(np.minimum(xa, xb), xc)), 0.0)
+        bxmax = np.ceil(np.maximum(np.maximum(xa, xb), xc))
+        bymin = np.maximum(np.floor(np.minimum(np.minimum(ya, yb), yc)), 0.0)
+        bymax = np.ceil(np.maximum(np.maximum(ya, yb), yc))
+        ok &= (ix >= bxmin) & (ix <= bxmax) & (iy >= bymin) & (iy <= bymax)
+        p0 = (xc - xb) * (Y - yb)
+        c0 = (yc - yb) * (X - xb)
+        p1 = (xa - xc) * (Y - yc)
+        c1 = (ya - yc) * (X - xc)
+        p2 = (xb - xa) * (Y - ya)
+        c2 = (yb - ya) * (X - xa)
+        e0 = p0 - c0
+        e1 = p1 - c1
+        e2 = p2 - c2
+        w0 = (np.abs(p0) + np.abs(c0)) * _EW
+        w1 = (np.abs(p1) + np.abs(c1)) * _EW
+        w2 = (np.abs(p2) + np.abs(c2)) * _EW
+        ok &= np.where(ar > 0.0,
+                       (e0 >= -w0) & (e1 >= -w1) & (e2 >= -w2),
+                       (e0 <= w0) & (e1 <= w1) & (e2 <= w2))
+        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+            inv_area = 1.0 / np.where(ar == 0.0, f32(1.0), ar)
+            zz = ((e0 * inv_area) * z[T, 0] + (e1 * inv_area) * z[T, 1]
+                  + (e2 * inv_area) * z[T, 2]) + 0.0
+            ok &= zz < f32(np.inf)
+        out[rows] = np.where(ok, zz, f32(np.inf)).min(axis=1)
+    return out
+
+
+#: (marked texel x bin entry) lanes one sweep of `replay_depth` holds
+REPLAY_LANES = 4_000_000
+
+
+def depth_plane(raw, emitted, tiles, bins_flat, tw, size, cull='NONE'):
+    """(plane, None, replayed) from the kernel's read-back texels: the
+    marked ones decided again on the host, the empty ones at the CPU
+    bake's 1.0, a map nothing landed on as core/raster.blank_depth. Or
+    (None, why, marked) when the marks exceed the referral budget."""
+    from ..core import raster as CR
+    size = int(size)
+    d = np.array(raw, np.float32).reshape(size, size)
+    mark = d > np.float32(1.5e30)
+    n_mark = int(mark.sum())
+    if n_mark:
+        covered = int((d < np.float32(0.5e30)).sum()) + n_mark
+        if n_mark > REFER_BAIL_FRAC * max(covered, 1):
+            return None, (f'{n_mark} of {covered} covered texels sit on a '
+                          'triangle edge -- past the referral budget'), n_mark
+        pys, pxs = np.nonzero(mark)
+        sx, sy, z = emitted[0], emitted[1], emitted[3]
+        d[pys, pxs] = replay_depth(pxs, pys, sx, sy, z, tiles, bins_flat,
+                                   tw, cull)
+    empty = d > np.float32(0.5e30)
+    if empty.all():
+        return CR.blank_depth(size, size), None, n_mark
+    d[empty] = 1.0
+    return d, None, n_mark
+
+
+def _depth_state():
+    """The session's verdict on the device bake: the image format that
+    worked, whether its first bake was held against the CPU's, and the
+    reason it is off for good (`dead`). It lives in the device's state
+    so that a device reset -- a new driver world -- forgets it."""
+    from . import device
+    return device._STATE.setdefault('depth_bake', {})
+
+
+#: the last frame's device bakes, for the frame's stage print: faces,
+#: host / upload / dispatch / read milliseconds, texels replayed
+LAST_DEPTH = {}
+
+#: the depth kernel's CreateInfo beside RASTER_FLOATS
+DEPTH_SAMPLERS = ('hal_rc', 'hal_rbins', 'hal_rtiles')
+DEPTH_IMAGES = ('hal_out_depth',)
+
+
+def _depth_shader(state):
+    """(shader, image format) of the first format in DEPTH_FORMATS the
+    driver compiles the kernel for and has not failed a dispatch in this
+    session, or (None, why) when none is left."""
+    from . import device
+    bad = state.setdefault('bad', {})
+    why = 'no image format'
+    for fmt in DEPTH_FORMATS:
+        if fmt in bad:
+            why = bad[fmt]
+            continue
+        name = compute_variant_name(depth=True) + \
+            ('' if fmt == DEPTH_FORMATS[0] else '_' + fmt)
+        try:
+            shader, err = device.compile_compute(
+                name, depth_compute_source(), samplers=DEPTH_SAMPLERS,
+                floats=RASTER_FLOATS, images=DEPTH_IMAGES,
+                image_format=fmt)
+        except Exception as exc:                                # noqa: BLE001
+            shader, err = None, f'{name}: {type(exc).__name__}: {exc}'
+        if shader is not None:
+            return shader, fmt
+        bad[fmt] = why = str(err)
+    return None, why
+
+
+#: R254: the device bakes a face only where it pays. Both bakes run the
+#: same clipper (core/raster.depth_screen_tris) and both pay about half a
+#: microsecond per emitted triangle after it (the fill's setup, the
+#: kernel's corner pack and tile bins); what the device removes is the
+#: fill's work per TEXEL (40 to 80 ns measured, against a 4-byte read).
+#: So a face goes to the device when it holds at least this many texels
+#: per emitted triangle and is at least DEPTH_DEVICE_MIN_TEXELS large --
+#: below either the CPU fill is as fast or faster (885,000 triangles on a
+#: 512 map: 0.3 texels a triangle) and the face stays with it, in the
+#: bake's threads, silently: that is routing, not a refusal
+DEPTH_DEVICE_TEXELS_PER_TRI = 16
+DEPTH_DEVICE_MIN_TEXELS = 512 * 512
+
+
+def device_pays(emitted, size):
+    """Whether a size x size face of `emitted` clipped triangles is one
+    the device bakes faster than the fill (see the constants above)."""
+    texels = int(size) * int(size)
+    return texels >= DEPTH_DEVICE_MIN_TEXELS \
+        and texels >= DEPTH_DEVICE_TEXELS_PER_TRI * int(emitted)
+
+
+def dispatch_depth(front, packed, size, cull='NONE', check=None):
+    """The device half of one face: upload the packed inputs, dispatch
+    the kernel, read the image back, decide the marked texels on the
+    host. `front` is depth_screen_tris' output and `packed`
+    pack_raster_inputs' of it. Returns (plane, None) or (None, why).
+
+    A failure of the driver (a compile, a dispatch, a read) retires that
+    image format for the session and the next one is tried; with none
+    left the device bake is off for the session (`dead`). A face whose
+    marks exceed the referral budget is refused alone. The first faces a
+    session bakes in a format are its TRIAL (see DEPTH_CHECK_TOL): each
+    is compared with the CPU's bake of it -- `check()` returns that
+    plane -- and a device that does not reproduce it, or does not bake
+    faster than the fill, bakes nothing more."""
+    import time as _time
+
+    from . import device
+
+    state = _depth_state()
+    if state.get('dead'):
+        return None, state['dead']
+    size = int(size)
+    corners, c_side, bins, b_side, tiles, tw, _th = packed
+    uniforms = depth_uniforms(c_side, b_side, size, cull)
+    raw = None
+    t_up = t_run = 0.0
+    while raw is None:
+        shader, fmt = _depth_shader(state)
+        if shader is None:
+            state['dead'] = str(fmt)
+            return None, state['dead']
+        try:
+            t0 = _time.perf_counter()
+            binds = {'hal_rc': device.upload(corners),
+                     'hal_rbins': device.upload(bins),
+                     'hal_rtiles': device.upload(tiles)}
+            t_up = _time.perf_counter() - t0
+            t0 = _time.perf_counter()
+            got = device.dispatch_compute(
+                shader, size, size, uniforms=uniforms, samplers=binds,
+                images=DEPTH_IMAGES, image_format=fmt)
+            t_run = _time.perf_counter() - t0
+            raw = np.asarray(got[DEPTH_IMAGES[0]], np.float32)
+            if raw.ndim == 3:
+                raw = raw[:, :, 0]
+            if raw.shape != (size, size):
+                state['bad'][fmt] = (f'the {fmt} depth image read back '
+                                     f'as {raw.shape}')
+                raw = None
+        except Exception as exc:                                # noqa: BLE001
+            state['bad'][fmt] = (f'depth dispatch failed ({fmt}): '
+                                 f'{type(exc).__name__}: {exc}')
+            raw = None
+    state['fmt'] = fmt
+    t0 = _time.perf_counter()
+    plane, why, n_mark = depth_plane(raw, front, tiles, bins.reshape(-1),
+                                     tw, size, cull)
+    if plane is None:
+        return None, why
+    t_host = _time.perf_counter() - t0
+    if state.get('checked') != fmt and check is not None:
+        # trust nothing a driver has not shown: this face, once more on
+        # the CPU, texel for texel and on the clock
+        trial = state.get('trial')
+        if trial is None or trial.get('fmt') != fmt:
+            trial = state['trial'] = {'fmt': fmt, 'faces': 0, 'timed': 0,
+                                      'dev': 0.0, 'cpu': 0.0}
+        t0 = _time.perf_counter()
+        ref = check()
+        t_fill = _time.perf_counter() - t0
+        with np.errstate(invalid='ignore'):
+            far = ~(np.abs(np.asarray(ref, np.float32)
+                           - np.asarray(plane, np.float32))
+                    <= np.float32(DEPTH_CHECK_TOL))
+        bad = int(far.sum())
+        if bad > DEPTH_CHECK_SHARE * size * size:
+            state['dead'] = (f"the device's depth bake differs from the "
+                             f"CPU's at {bad} of {size * size} texels of "
+                             'a trial map')
+            return None, state['dead']
+        trial['faces'] += 1
+        if trial['faces'] > 1 and t_fill >= DEPTH_TRIAL_MIN_FILL:
+            trial['timed'] += 1
+            trial['dev'] += t_up + t_run + t_host
+            trial['cpu'] += t_fill
+        if trial['timed'] >= DEPTH_TRIAL_TIMED \
+                or trial['faces'] >= DEPTH_TRIAL_FACES:
+            state['checked'] = fmt
+            if DEPTH_TRIAL_GAIN is not None and trial['timed'] \
+                    and trial['dev'] > DEPTH_TRIAL_GAIN * trial['cpu']:
+                # this face is good (it was just compared); the next
+                # ones are the fill's
+                state['dead'] = (
+                    'the device bakes a map no faster than the CPU fills '
+                    f"it ({trial['dev'] * 1e3:.0f} ms against "
+                    f"{trial['cpu'] * 1e3:.0f} ms over {trial['timed']} "
+                    'maps)')
+    dd = dict(getattr(device, 'LAST_DISPATCH', None) or {})
+    LAST_DEPTH['faces'] = LAST_DEPTH.get('faces', 0) + 1
+    LAST_DEPTH['replayed'] = LAST_DEPTH.get('replayed', 0) + n_mark
+    for key, ms in (('host_ms', t_host * 1e3), ('upload_ms', t_up * 1e3),
+                    ('dispatch_ms', dd.get('dispatch_ms', t_run * 1e3)),
+                    ('read_ms', dd.get('read_ms', 0.0))):
+        LAST_DEPTH[key] = LAST_DEPTH.get(key, 0.0) + float(ms)
+    return plane, None
+
+
+def bake_depth(verts, tris, vp, size, cull='NONE', near_eps=1e-5):
+    """ONE shadow-map face on the device, whatever its size: (plane,
+    None) -- the NDC depth plane core/raster.rasterize_depth returns for
+    these arguments (1.0 where nothing landed, blank_depth where nothing
+    landed at all) -- or (None, why). The frame's bakes go through a
+    DepthBaker, which routes each face and threads the host half; this
+    is the same road in one call, for a tool or a test."""
+    from ..core import raster as CR
+    size = int(size)
+    front = CR.depth_screen_tris(verts, tris, vp, size, size,
+                                 near_eps=near_eps)
+    if front is None:
+        return CR.blank_depth(size, size), None
+    packed = pack_raster_inputs(*front, None, size, size)
+    return dispatch_depth(
+        front, packed, size, cull,
+        check=lambda: CR.rasterize_depth(verts, tris, vp, size, size,
+                                         cull=cull, near_eps=near_eps,
+                                         front=front))
+
+
+class _DepthTicket:
+    """One face between the two halves of its device bake: the host half
+    is done (the clipper's triangles, their pack), the device half is
+    `finish()` -- called in line by the bake, one face at a time."""
+
+    __slots__ = ('baker', 'args', 'front', 'packed', 'host_ms')
+
+    def finish(self):
+        return self.baker._finish(self)
+
+
+class DepthBaker:
+    """What core/lights takes as a frame's depth baker (`build_shadow_maps
+    (baker=...)`). Called with a face's (verts, tris, vp, size, cull) --
+    from the bake's threads -- it does the HOST half and answers either
+    the face's depth plane (nothing landed; or the face is one the CPU
+    fill bakes as fast, `device_pays`, and was filled right here from the
+    clipper's output) or a ticket whose `finish()` -- called in line: a
+    device is one queue -- dispatches the kernel and answers the plane.
+    A face the device then refuses is filled from the same clipper output
+    and `report` names why once the frame's maps are built.
+
+    `identity` keys the maps of a frame that has a baker apart from the
+    fill's in the shadow cache: on a driver the two agree to the last ulp
+    of z, not bit for bit."""
+
+    identity = 'device'
+
+    def __init__(self):
+        self.refused = {}
+        self.host_ms = 0.0
+        LAST_DEPTH.clear()
+
+    def __call__(self, verts, tris, vp, size, cull='NONE'):
+        import time as _time
+
+        from ..core import raster as CR
+        size = int(size)
+        t0 = _time.perf_counter()
+        front = CR.depth_screen_tris(verts, tris, vp, size, size)
+        if front is None:
+            return CR.blank_depth(size, size)
+        if _depth_state().get('dead') \
+                or not device_pays(front[0].shape[0], size):
+            return CR.rasterize_depth(verts, tris, vp, size, size,
+                                      cull=cull, front=front)
+        ticket = _DepthTicket()
+        ticket.baker = self
+        ticket.args = (verts, tris, vp, size, cull)
+        ticket.front = front
+        ticket.packed = pack_raster_inputs(*front, None, size, size)
+        ticket.host_ms = (_time.perf_counter() - t0) * 1e3
+        return ticket
+
+    def _fill(self, ticket):
+        from ..core import raster as CR
+        verts, tris, vp, size, cull = ticket.args
+        return CR.rasterize_depth(verts, tris, vp, size, size, cull=cull,
+                                  front=ticket.front)
+
+    def _finish(self, ticket):
+        size, cull = ticket.args[3], ticket.args[4]
+        try:
+            plane, why = dispatch_depth(ticket.front, ticket.packed, size,
+                                        cull,
+                                        check=lambda: self._fill(ticket))
+        except Exception as exc:                                # noqa: BLE001
+            plane, why = None, f'{type(exc).__name__}: {exc}'
+        if plane is None:
+            self.refused[str(why)] = self.refused.get(str(why), 0) + 1
+            return self._fill(ticket)
+        self.host_ms += ticket.host_ms
+        return plane
+
+    def report(self):
+        """One line per reason a face went back to the CPU this frame,
+        and the split of what the device baked ('0.9 s' is a number, a
+        split is a diagnosis: the host half is the clipper and the tile
+        binning, which follow the triangle count)."""
+        for why, n in self.refused.items():
+            print(f'[Halcyon GPU] shadow bake on the CPU: {why}'
+                  + (f' ({n} faces)' if n > 1 else ''))
+        ld = LAST_DEPTH
+        if ld.get('faces'):
+            host = self.host_ms + ld.get('host_ms', 0.0)
+            print(f"[Halcyon GPU] shadow bake: {ld['faces']} map face(s) on "
+                  f"the device; host {host:.0f} ms, "
+                  f"upload {ld.get('upload_ms', 0.0):.0f} ms, dispatch "
+                  f"{ld.get('dispatch_ms', 0.0):.0f} ms, read "
+                  f"{ld.get('read_ms', 0.0):.0f} ms"
+                  + (f"; {ld['replayed']} texel(s) decided on the host"
+                     if ld.get('replayed') else ''))
+
+
+_DEPTH_SAID = set()
+
+
+def depth_baker():
+    """A DepthBaker for one frame, or None when the device cannot bake:
+    no device, a driver that compiles the kernel in no image format, or
+    a session in which the bake already failed (said once, by name; the
+    frame then bakes on the CPU under the CPU's own cache keys)."""
+    from . import device
+    try:
+        ok, _why = device.probe()
+    except Exception:                                           # noqa: BLE001
+        ok = False
+    if not ok:
+        return None
+    state = _depth_state()
+    if not state.get('dead'):
+        # the compile is asked for HERE, before a key of the frame is
+        # made: a device without the kernel never names a map its own
+        shader, why = _depth_shader(state)
+        if shader is None:
+            state['dead'] = str(why)
+    dead = state.get('dead')
+    if dead:
+        if dead not in _DEPTH_SAID:
+            _DEPTH_SAID.add(dead)
+            print('[Halcyon GPU] shadow maps bake on the CPU this '
+                  f'session: {dead}')
+        return None
+    return DepthBaker()

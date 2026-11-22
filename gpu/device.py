@@ -47,6 +47,9 @@ def _main(what, fn):
 def reset():
     _STATE.update(checked=False, available=False, reason='')
     _STATE.pop('max_frag_samplers', None)
+    # R254: the session's verdict on the device's shadow-map bake
+    # (gpu/craster._depth_state) belongs to the driver world that gave it
+    _STATE.pop('depth_bake', None)
     # shaders, batches and cached textures go to the graveyard, not
     # straight to the driver -- a reset can arrive while queued commands
     # still reference them
@@ -1088,28 +1091,34 @@ def _read_target_impl(target, region=None):
     return out
 
 
-def compile_compute(name, source, samplers=(), floats=(), images=()):
+def compile_compute(name, source, samplers=(), floats=(), images=(),
+                    image_format='RGBA32F'):
     """Compile a compute shader through CreateInfo, cached on the source.
 
     The API shape is the one the capability probe proved on hardware:
     local_group_size + image(WRITE) + compute_source + create_from_info.
     Inputs are samplers and float push constants, outputs are RGBA32F
     images -- the gpu module offers no storage buffers, and the G-buffer
-    is texture-shaped anyway.
+    is texture-shaped anyway. R254: `image_format` names another format
+    for the images (the shadow-map bake's one image is R32F where the
+    build takes it); the format is part of the compile signature, so the
+    caller gives each format its own `name`.
     """
-    key = (name, hash(source))
+    key = (name, hash(source)) if image_format == 'RGBA32F' \
+        else (name, hash(source), str(image_format))
     hit = _STATE['shaders'].get(key)
     if hit is not None:
         return hit, None
     import time as _t
     t0 = _t.perf_counter()
     out = _main(f'compiling {name}', lambda: _compile_compute_miss(
-        key, name, source, samplers, floats, images))
+        key, name, source, samplers, floats, images, image_format))
     _count_compile(t0)
     return out
 
 
-def _compile_compute_miss(key, name, source, samplers, floats, images):
+def _compile_compute_miss(key, name, source, samplers, floats, images,
+                          image_format='RGBA32F'):
     ok, why = probe()
     if not ok:
         return None, why
@@ -1118,7 +1127,7 @@ def _compile_compute_miss(key, name, source, samplers, floats, images):
         info = gpu.types.GPUShaderCreateInfo()
         info.local_group_size(8, 8)
         for i, iname in enumerate(images):
-            info.image(i, 'RGBA32F', 'FLOAT_2D', iname,
+            info.image(i, str(image_format), 'FLOAT_2D', iname,
                        qualifiers={'WRITE'})
         for i, sname in enumerate(samplers):
             info.sampler(i, 'FLOAT_2D', sname)
@@ -1133,18 +1142,24 @@ def _compile_compute_miss(key, name, source, samplers, floats, images):
 
 
 def dispatch_compute(shader, width, height, uniforms=None, samplers=None,
-                     images=None):
+                     images=None, image_format='RGBA32F'):
     """Bind, dispatch over a width x height grid, read the images back.
 
     Returns {image name: (H, W, 4) float32}. The group size is the 8x8 the
     shader was compiled with; the kernel guards the ragged edge itself.
+    R254: with `image_format` 'R32F' (the format the shader was compiled
+    for) each image is one channel and comes back (H, W).
     """
     return _main('a compute dispatch', lambda: _dispatch_compute_impl(
-        shader, width, height, uniforms, samplers, images))
+        shader, width, height, uniforms, samplers, images, image_format))
+
+
+#: channels per texel of the image formats a compute dispatch reads back
+_IMAGE_CHANNELS = {'R32F': 1, 'RG32F': 2, 'RGBA32F': 4}
 
 
 def _dispatch_compute_impl(shader, width, height, uniforms, samplers,
-                           images):
+                           images, image_format='RGBA32F'):
     import gpu
     made = {}
     shader.bind()
@@ -1158,7 +1173,7 @@ def _dispatch_compute_impl(shader, width, height, uniforms, samplers,
         set_uniform(shader, 'float', k, float(v))
     for k in (images or ()):
         tex = gpu.types.GPUTexture((int(width), int(height)),
-                                   format='RGBA32F')
+                                   format=str(image_format))
         shader.image(k, tex)
         made[k] = tex
     import time as _time
@@ -1169,13 +1184,14 @@ def _dispatch_compute_impl(shader, width, height, uniforms, samplers,
     t_dispatch = _time.perf_counter() - t0
     out = {}
     import numpy as np
+    ch = _IMAGE_CHANNELS.get(str(image_format), 4)
     t0 = _time.perf_counter()
     for k, tex in made.items():
         buf = tex.read()
         # the buffer protocol, exactly as read_target: to_list() on a frame
         # of floats is the 316 ms mistake this project already made once
         try:
-            buf.dimensions = int(width) * int(height) * 4
+            buf.dimensions = int(width) * int(height) * ch
             arr = np.asarray(buf, np.float32)
         except Exception:                                       # noqa: BLE001
             arr = np.array(buf.to_list(), dtype=np.float32)
@@ -1186,7 +1202,15 @@ def _dispatch_compute_impl(shader, width, height, uniforms, samplers,
         # slices then read the Python heap, and the worker threads that
         # fetch attributes from these arrays never touch driver memory
         # (a 1.35.10 field log caught a worker AV inside such a fetch)
-        out[k] = arr.reshape(int(height), int(width), 4).copy()
+        if ch == 1 and arr.size == int(height) * int(width):
+            # one channel: a flat plane
+            out[k] = arr.reshape(int(height), int(width)).copy()
+        elif ch == 1:
+            # a build whose read hands a one-channel image back wider:
+            # the caller takes the first channel
+            out[k] = arr.reshape(int(height), int(width), -1).copy()
+        else:
+            out[k] = arr.reshape(int(height), int(width), ch).copy()
         bury(buf)   # its pages outlive any transfer that may still land
     flush_tick()                # reads returned: the graph executed
     LAST_DISPATCH['dispatch_ms'] = t_dispatch * 1000.0

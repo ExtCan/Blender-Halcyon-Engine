@@ -1780,6 +1780,396 @@ def fill_batched(gbuf, sx, sy, iw, z, bw, src, cull='NONE', frags=None,
     return written + int(px.size)
 
 
+# ------------------------------------------------------- depth-only raster
+#
+# R254: a shadow map keeps ONE number per texel, the nearest NDC z. The
+# beauty fills above compute it on the way to a G-buffer (perspective
+# barycentrics, an attribute einsum, triangle ids, a three-key sort, 29
+# bytes of planes per texel) and the bake threw the rest away. The
+# functions below produce the same texels and nothing else:
+#
+#   * the same clip positions, the same clipper (build_screen_tris), the
+#     same boxes and size classes;
+#   * every edge function, wobble window and z as the SAME float32
+#     operations on the same operands -- an edge function is a row term
+#     minus a column term, so the two factors are computed once per row
+#     and once per column and only the subtraction runs per texel;
+#   * the resolve is a per-texel minimum: with depth_bits = 32 and no
+#     encoding the fills' named tie rule only chooses the triangle ID
+#     among equal depths, the depth itself is the smallest z. A NaN or
+#     +inf fragment never passed their strict `<` against an empty
+#     texel, so it is dropped here before the minimum.
+#
+# Bitwise the texels `rasterize(..., depth_bits=32).zndc` leaves, held
+# by tests/test_r254_bake_speed.py against the G-buffer road.
+
+#: rows per strip of a large triangle's box (cache-sized temporaries)
+DEPTH_STRIP = 64
+
+#: candidate texels per sweep of the small-triangle buckets
+DEPTH_BATCH_PX = 1_000_000
+
+#: below this many triangles the per-map reject costs more than it saves
+DEPTH_REJECT_MIN_TRIS = 4096
+
+
+def blank_depth(height, width):
+    """The depth plane of a target no fragment landed on: 1.0 at every
+    texel, as a read-only broadcast view of one float (nothing is
+    allocated and `is_blank` knows it without reading a texel)."""
+    return np.broadcast_to(np.float32(1.0), (int(height), int(width)))
+
+
+def is_blank(zndc):
+    """True for `blank_depth`'s plane, or for a MIDPOINT triple whose
+    first surface is one."""
+    if isinstance(zndc, tuple):
+        zndc = zndc[0]
+    return isinstance(zndc, np.ndarray) and zndc.ndim == 2 \
+        and zndc.strides == (0, 0) and zndc.size > 1
+
+
+def clip_positions(verts, mvp):
+    """World verts -> clip space: `project`'s matrix product alone (the
+    screen coordinates it also returns are per VERTEX and no fill reads
+    them -- the clipper re-derives them per emitted corner)."""
+    n = verts.shape[0]
+    ph = np.empty((n, 4), dtype=np.float32)
+    ph[:, :3] = verts
+    ph[:, 3] = 1.0
+    return ph @ np.asarray(mvp, dtype=np.float32).T
+
+
+def frustum_keep(clip, tris, width, height, near_eps=1e-5):
+    """Which triangles can own a fragment of a width x height target.
+
+    False for a triangle whose three corners are all behind the near
+    plane (the clipper's own test, `z + w < near_eps`: it emits nothing
+    for one), and for a triangle whose three corners lie outside the
+    same side plane -- left, right, bottom or top, each two texels
+    outside the target. A side plane is a linear half-space of clip
+    space, so three corners outside one put the whole triangle outside
+    it, and whatever the near clipper keeps of it too.
+
+    A triangle wholly in FRONT of the near plane is never clipped by it:
+    its screen corners are these very clip corners divided by their own
+    w, so the plain test decides. One that STRADDLES the near plane gets
+    new corners from the clipper, each an interpolation that rounds; it
+    is dropped only when its corners clear the side plane by a margin a
+    few hundred of those roundings wide (1e-4 of the corners' largest
+    magnitude), and kept otherwise. Either way a dropped triangle cannot
+    put a fragment on the target, and dropping it before the clipper
+    changes no texel.
+
+    One byte per vertex and one gather per triangle, against the 48-byte
+    gather and the clip classification build_screen_tris runs on every
+    triangle it is handed -- and, for a straddler, the clipper's
+    per-triangle loop. A cube face keeps the triangles of its own 90
+    degree frustum instead of the whole front hemisphere the 4-screen
+    guard band lets through."""
+    x, y, z, w = clip[:, 0], clip[:, 1], clip[:, 2], clip[:, 3]
+    kx = np.float32(1.0 + 4.0 / float(width))
+    ky = np.float32(1.0 + 4.0 / float(height))
+    gx = kx * w
+    gy = ky * w
+    code = (x > gx).astype(np.uint8)
+    code |= (x < -gx).astype(np.uint8) << 1
+    code |= (y > gy).astype(np.uint8) << 2
+    code |= (y < -gy).astype(np.uint8) << 3
+    code |= ((z + w) < np.float32(near_eps)).astype(np.uint8) << 4
+    c = code[tris]
+    c0, c1, c2 = c[:, 0], c[:, 1], c[:, 2]
+    shared = c0 & c1 & c2
+    behind = (c0 | c1 | c2) & 16
+    side = (shared & 15) != 0
+    keep = ~(((shared & 16) != 0) | (side & (behind == 0)))
+    # the straddlers that share a side: outside it by the margin?
+    idx = np.nonzero(side & (behind != 0) & ((shared & 16) == 0))[0]
+    if idx.size:
+        cp = clip[tris[idx]].astype(np.float64)             # (S, 3, 4)
+        xs, ys, ws = cp[:, :, 0], cp[:, :, 1], cp[:, :, 3]
+        margin = (np.abs(xs) + np.abs(ys) + np.abs(ws)).max(axis=1) * 1e-4
+        ex = float(kx) * ws
+        ey = float(ky) * ws
+        out = ((xs - ex).min(axis=1) > margin) \
+            | ((-xs - ex).min(axis=1) > margin) \
+            | ((ys - ey).min(axis=1) > margin) \
+            | ((-ys - ey).min(axis=1) > margin)
+        keep[idx[out]] = False
+    return keep
+
+
+def _large_strips(t, x0, x1, x2, y0, y1, y2, area, bxmin, bxmax, bymin,
+                  bymax):
+    """One large triangle's box in row strips: yields (first row, e0, e1,
+    e2, inside), each a dense (rows, columns) plane -- fill()'s own
+    statements, the row and the column factor of every edge function
+    computed once."""
+    xa, xb, xc = x0[t], x1[t], x2[t]
+    ya, yb, yc = y0[t], y1[t], y2[t]
+    ar = area[t]
+    xs = np.arange(bxmin[t], bxmax[t] + 1, dtype=np.float32) + 0.5
+    X = xs[None, :]
+    c0 = (yc - yb) * (X - xb)
+    c1 = (ya - yc) * (X - xc)
+    c2 = (yb - ya) * (X - xa)
+    a0, a1, a2 = np.abs(c0), np.abs(c1), np.abs(c2)
+    row_end = int(bymax[t]) + 1
+    for r0 in range(int(bymin[t]), row_end, DEPTH_STRIP):
+        r1 = min(r0 + DEPTH_STRIP, row_end)
+        ys = np.arange(r0, r1, dtype=np.float32) + 0.5
+        Y = ys[:, None]
+        p0 = (xc - xb) * (Y - yb)
+        p1 = (xa - xc) * (Y - yc)
+        p2 = (xb - xa) * (Y - ya)
+        e0 = p0 - c0
+        e1 = p1 - c1
+        e2 = p2 - c2
+        w0 = np.abs(p0) + a0
+        w1 = np.abs(p1) + a1
+        w2 = np.abs(p2) + a2
+        if ar > 0:
+            inside = (e0 >= EDGE_WOBBLE * -w0) & (e1 >= EDGE_WOBBLE * -w1) \
+                & (e2 >= EDGE_WOBBLE * -w2)
+        else:
+            inside = (e0 <= EDGE_WOBBLE * w0) & (e1 <= EDGE_WOBBLE * w1) \
+                & (e2 <= EDGE_WOBBLE * w2)
+        yield r0, e0, e1, e2, inside
+
+
+def depth_fragments(sx, sy, z, W, H, cull='NONE', max_batch_px=None,
+                    planes=None):
+    """Yield (pix, zz) for every fragment of the emitted triangles:
+    pix = py * W + px (int64) and zz the NDC z the fills compute at
+    depth_bits = 32. Order means nothing to a minimum. Fragments whose z
+    is NaN or +inf are not yielded (see the section note).
+
+    With `planes` the LARGE triangles are not yielded but resolved here,
+    densely, strip by strip (a large triangle fills most of its box, so
+    a gather per fragment costs more than the box): `planes` is (d,) --
+    the (H, W) depth plane, lowered in place -- or (None, z2, has2, lim)
+    for the MIDPOINT map's second surface."""
+    n = sx.shape[0]
+    if n == 0:
+        return
+    if max_batch_px is None:
+        max_batch_px = DEPTH_BATCH_PX
+    x0, x1, x2 = sx[:, 0], sx[:, 1], sx[:, 2]
+    y0, y1, y2 = sy[:, 0], sy[:, 1], sy[:, 2]
+    area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)
+
+    live = np.abs(area) > 1e-9
+    if cull == 'BACK':
+        live &= area > 0.0
+    elif cull == 'FRONT':
+        live &= area < 0.0
+
+    bxmin = np.maximum(np.floor(np.minimum(np.minimum(x0, x1), x2)), 0).astype(np.int64)
+    bxmax = np.minimum(np.ceil(np.maximum(np.maximum(x0, x1), x2)), W - 1).astype(np.int64)
+    bymin = np.maximum(np.floor(np.minimum(np.minimum(y0, y1), y2)), 0).astype(np.int64)
+    bymax = np.minimum(np.ceil(np.maximum(np.maximum(y0, y1), y2)), H - 1).astype(np.int64)
+    live &= (bxmax >= bxmin) & (bymax >= bymin)
+    bw_px = bxmax - bxmin + 1
+    bh_px = bymax - bymin + 1
+    big = live & ((bw_px * bh_px) > LARGE_TRI_PX)
+    inf = np.float32(np.inf)
+
+    # ---- large boxes
+    for t in np.nonzero(big)[0]:
+        inv_area = 1.0 / area[t]
+        z0, z1, z2 = z[t, 0], z[t, 1], z[t, 2]
+        c0, c1 = int(bxmin[t]), int(bxmax[t]) + 1
+        for r0, e0, e1, e2, inside in _large_strips(
+                t, x0, x1, x2, y0, y1, y2, area, bxmin, bxmax, bymin, bymax):
+            if planes is not None:
+                if not inside.any():
+                    continue
+                # the fragment's own statements over the whole strip
+                zz = ((e0 * inv_area) * z0 + (e1 * inv_area) * z1
+                      + (e2 * inv_area) * z2) + 0.0
+                inside &= zz < inf
+                r1 = r0 + inside.shape[0]
+                if planes[0] is not None:
+                    view = planes[0][r0:r1, c0:c1]
+                    np.minimum(view, zz, out=view, where=inside)
+                else:
+                    _d, z2p, has2, lim = planes
+                    inside &= zz > lim[r0:r1, c0:c1]
+                    view = z2p[r0:r1, c0:c1]
+                    np.minimum(view, zz, out=view, where=inside)
+                    has2[r0:r1, c0:c1] |= inside
+                continue
+            yy, xx = np.nonzero(inside)
+            if yy.size == 0:
+                continue
+            l0 = e0[yy, xx] * inv_area
+            l1 = e1[yy, xx] * inv_area
+            l2 = e2[yy, xx] * inv_area
+            zz = (l0 * z0 + l1 * z1 + l2 * z2) + 0.0
+            pix = (yy + r0) * W + (xx + bxmin[t])
+            ok = zz < inf
+            if not ok.all():
+                pix, zz = pix[ok], zz[ok]
+            if pix.size:
+                yield pix, zz.astype(np.float32, copy=False)
+
+    # ---- small boxes: fill_batched's size classes; each class is swept
+    # once per winding, so a sweep takes one branch of the coverage test
+    idx_all = np.nonzero(live & ~big)[0]
+    if idx_all.size == 0:
+        return
+    wc = _size_classes(bw_px[idx_all])
+    hc = _size_classes(bh_px[idx_all])
+    key = (wc * 65536 + hc) * 2 + (area[idx_all] > 0)
+    order = np.argsort(key, kind='stable')
+    key_s = key[order]
+    cuts = np.nonzero(key_s[1:] != key_s[:-1])[0] + 1
+    starts = np.concatenate([[0], cuts])
+    ends = np.concatenate([cuts, [key_s.size]])
+    for s0, s1 in zip(starts, ends):
+        k = int(key_s[s0])
+        positive = bool(k & 1)
+        SW = int((k >> 1) // 65536)
+        SH = int((k >> 1) % 65536)
+        members = idx_all[order[s0:s1]]
+        per = max(int(max_batch_px // max(SW * SH, 1)), 1)
+        ox = np.arange(SW, dtype=np.int64)[None, None, :]
+        oy = np.arange(SH, dtype=np.int64)[None, :, None]
+        for start in range(0, members.size, per):
+            t = members[start:start + per]
+            bx = bxmin[t][:, None, None]
+            by = bymin[t][:, None, None]
+            X = (bx + ox).astype(np.float32) + 0.5          # (T, 1, SW)
+            Y = (by + oy).astype(np.float32) + 0.5          # (T, SH, 1)
+            xa, xb, xc = x0[t][:, None, None], x1[t][:, None, None], x2[t][:, None, None]
+            ya, yb, yc = y0[t][:, None, None], y1[t][:, None, None], y2[t][:, None, None]
+            p0 = (xc - xb) * (Y - yb)
+            c0 = (yc - yb) * (X - xb)
+            p1 = (xa - xc) * (Y - yc)
+            c1 = (ya - yc) * (X - xc)
+            p2 = (xb - xa) * (Y - ya)
+            c2 = (yb - ya) * (X - xa)
+            e0 = p0 - c0
+            e1 = p1 - c1
+            e2 = p2 - c2
+            # the window: EDGE_WOBBLE * -w and -(EDGE_WOBBLE * w) are
+            # the same float (a sign never moves a rounding)
+            w0 = np.abs(p0) + np.abs(c0)
+            w0 *= EDGE_WOBBLE
+            w1 = np.abs(p1) + np.abs(c1)
+            w1 *= EDGE_WOBBLE
+            w2 = np.abs(p2) + np.abs(c2)
+            w2 *= EDGE_WOBBLE
+            if positive:
+                np.negative(w0, out=w0)
+                np.negative(w1, out=w1)
+                np.negative(w2, out=w2)
+                inside = e0 >= w0
+                inside &= e1 >= w1
+                inside &= e2 >= w2
+            else:
+                inside = e0 <= w0
+                inside &= e1 <= w1
+                inside &= e2 <= w2
+            inside &= ox < bw_px[t][:, None, None]
+            inside &= oy < bh_px[t][:, None, None]
+            ti, yy, xx = np.nonzero(inside)
+            if ti.size == 0:
+                continue
+            inv_area = (1.0 / area[t])[ti]
+            l0 = e0[ti, yy, xx] * inv_area
+            l1 = e1[ti, yy, xx] * inv_area
+            l2 = e2[ti, yy, xx] * inv_area
+            zz = (l0 * z[t, 0][ti] + l1 * z[t, 1][ti] +
+                  l2 * z[t, 2][ti]) + 0.0
+            pix = (bymin[t][ti] + yy) * W + (bxmin[t][ti] + xx)
+            ok = zz < inf
+            if not ok.all():
+                pix, zz = pix[ok], zz[ok]
+            if pix.size:
+                yield pix, zz.astype(np.float32, copy=False)
+
+
+def depth_screen_tris(verts, tris, mvp, width, height, near_eps=1e-5):
+    """The triangles a depth bake fills, as the clipper emits them:
+    build_screen_tris' (sx, sy, iw, z, bw, src) after the per-map reject,
+    or None when nothing reaches the target. The one front half of every
+    depth bake -- the fill below and the device's kernel
+    (gpu/craster.bake_depth) both start from these very arrays, so the
+    two can only differ in how they resolve them."""
+    tris = np.asarray(tris, dtype=np.int32)
+    if tris.shape[0] == 0:
+        return None
+    clip = clip_positions(verts, mvp)
+    if tris.shape[0] >= DEPTH_REJECT_MIN_TRIS:
+        keep = frustum_keep(clip, tris, width, height, near_eps=near_eps)
+        if not keep.all():
+            tris = tris[keep]
+            if tris.shape[0] == 0:
+                return None
+    emitted = build_screen_tris(
+        clip, tris, int(width), int(height), snap=0.0, near_eps=near_eps,
+        depth_bits=32)
+    if emitted[0].shape[0] == 0:
+        return None
+    return emitted
+
+
+def rasterize_depth(verts, tris, mvp, width, height, cull='NONE',
+                    near_eps=1e-5, second=False, front=None):
+    """The depth plane `rasterize(verts, tris, mvp, width, height,
+    cull=cull, depth_bits=32).zndc` holds -- 1.0 where nothing landed --
+    without the G-buffer. A target no fragment landed on comes back as
+    `blank_depth` (the same ones, unallocated).
+
+    `front` is `depth_screen_tris`' output for these very arguments, when
+    the caller already has it (a device baker that ran the clipper and
+    then left the face to this fill): it is used instead of running the
+    clipper again.
+
+    `second` adds the MIDPOINT map's second surface and returns
+    (z1, z2, has2): per texel the nearest fragment BEYOND the A-buffer
+    tolerance of z1 (lights._render_depth has the rule), 1.0 where none
+    is nearer than the far plane, and where one exists at all."""
+    width, height = int(width), int(height)
+
+    def _blank():
+        z1 = blank_depth(height, width)
+        if not second:
+            return z1
+        return z1, z1, np.broadcast_to(np.bool_(False), (height, width))
+
+    emitted = front if front is not None else depth_screen_tris(
+        verts, tris, mvp, width, height, near_eps=near_eps)
+    if emitted is None:
+        return _blank()
+    sx, sy, z = emitted[0], emitted[1], emitted[3]
+    inf = np.float32(np.inf)
+    d = np.full((height, width), inf, np.float32)
+    flat = d.reshape(-1)
+    for pix, zz in depth_fragments(sx, sy, z, width, height, cull,
+                                   planes=(d,)):
+        np.minimum.at(flat, pix, zz)
+    empty = d == inf
+    if empty.all():
+        return _blank()
+    d[empty] = 1.0
+    if not second:
+        return d
+    z2 = np.full((height, width), 1.0, np.float32)
+    has2 = np.zeros((height, width), bool)
+    lim = abuf_depth_limit(d)
+    z2f, h2f, limf = z2.reshape(-1), has2.reshape(-1), lim.reshape(-1)
+    for pix, zz in depth_fragments(sx, sy, z, width, height, cull,
+                                   planes=(None, z2, has2, lim)):
+        sel = zz > limf[pix]
+        if not sel.any():
+            continue
+        np.minimum.at(z2f, pix[sel], zz[sel])
+        h2f[pix[sel]] = True
+    return d, z2, has2
+
+
 # ---- R251 AA resolve helpers ----
 # RAST-B (1.90.0): C094 LightWave's Limit Dynamic Range, C122 Blender
 # 2.41's gamma-2 OSA blend, C063 Elite's wireframe rule, C055 the vector

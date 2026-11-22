@@ -124,6 +124,15 @@ def main():
             if kind == 'scene':
                 _STATE['scene'] = msg[1]
                 _STATE['settings'] = msg[2]
+                # R254: the parent baked the shadow maps once and the
+                # lamps carry them; parked under their keys here, this
+                # process's own build finds each one instead of
+                # rasterising the whole set again for its band
+                try:
+                    from . import lights as _lights
+                    _lights.adopt_shadow_maps(msg[1])
+                except Exception as exc:                        # noqa: BLE001
+                    _log('adopting the shadow maps RAISED %r' % (exc,))
                 _write(stdout, ('ok',))
             elif kind == 'band':
                 from . import render as core_render

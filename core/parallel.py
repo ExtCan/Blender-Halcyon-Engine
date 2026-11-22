@@ -195,6 +195,12 @@ HANDSHAKE_DEADLINE = 60.0
 BAND_DEADLINE = 3600.0
 
 
+#: the most bytes of baked shadow maps a scene upload carries (the
+#: message length is 32 bits, and past this the transfer costs more
+#: than the workers' own bakes)
+POOL_MAP_BYTES = 1024 * 1024 * 1024
+
+
 class WorkerCancelled(Exception):
     """The caller's cancel flag went up while a worker was busy."""
 
@@ -272,7 +278,11 @@ class Worker:
             self._inbox.put(('eof', f'{type(exc).__name__}: {exc}'))
 
     def send(self, msg):
-        payload = pickle.dumps(msg, protocol=pickle.HIGHEST_PROTOCOL)
+        self.send_packed(pickle.dumps(msg, protocol=pickle.HIGHEST_PROTOCOL))
+
+    def send_packed(self, payload):
+        """Send an already pickled message (one pickle of a scene serves
+        every worker)."""
         self.proc.stdin.write(struct.pack('>I', len(payload)))
         self.proc.stdin.write(payload)
         self.proc.stdin.flush()
@@ -402,12 +412,39 @@ class Pool:
     def upload(self, scene, settings, key, cancel=None):
         if key is not None and key == self._scene_key:
             return True
+        # R254: ONE pickle for every worker (the scene now carries the
+        # baked shadow maps -- render_parallel -- and was pickled once
+        # per worker), every worker sent to before any is waited for, so
+        # one unpacks while the next receives
+        payload = pickle.dumps(('scene', scene, settings),
+                               protocol=pickle.HIGHEST_PROTOCOL)
+        issued = []
         for w in self.workers:
-            reply = w.call(('scene', scene, settings), cancel=cancel,
-                           deadline=BAND_DEADLINE)
+            try:
+                w.send_packed(payload)
+                issued.append(w)
+            except Exception as exc:                            # noqa: BLE001
+                self.error = ('scene upload failed: '
+                              f'{type(exc).__name__}: {exc}'
+                              + w.stderr_tail())
+                break
+        ok = len(issued) == len(self.workers)
+        for w in issued:
+            try:
+                reply = w.recv(cancel=cancel, deadline=BAND_DEADLINE)
+            except WorkerCancelled:
+                raise
+            except Exception as exc:                            # noqa: BLE001
+                self.error = ('scene upload failed: '
+                              f'{type(exc).__name__}: {exc}'
+                              + w.stderr_tail())
+                ok = False
+                continue
             if reply[0] != 'ok':
                 self.error = f'scene upload failed: {reply!r}'
-                return False
+                ok = False
+        if not ok:
+            return False
         self._scene_key = key
         return True
 
@@ -550,6 +587,18 @@ def render_parallel(scene, settings, workers, scene_key=None, progress=None,
     bands = [(edges[i], edges[i + 1]) for i in range(n_bands)
              if edges[i + 1] > edges[i]]
 
+    # R254: the shadow maps are baked ONCE, here, and travel with the
+    # scene. Every worker used to bake the whole set for its own band --
+    # four bakes on the same cores, a cold 2048 frame at twice its
+    # in-process time -- because a map is not a band's: it is the
+    # frame's. A set too large for one message stays behind and the
+    # workers bake their own, as before
+    if scene_key is None or scene_key != pool._scene_key:
+        try:
+            from .render import prebake_shadows
+            prebake_shadows(scene, settings, limit=POOL_MAP_BYTES)
+        except Exception:                                       # noqa: BLE001
+            pass
     try:
         if not pool.upload(scene, settings, scene_key, cancel=cancel):
             return None, pool.error

@@ -73,6 +73,8 @@ def run_tests():
     from . import test_r254_map_gpu
     # R254: where the light packages meet (beam unit, scaled Area lamps)
     from . import test_r254_integration
+    # R254: the shadow-map bake (which maps, when, how fast, on the device)
+    from . import test_r254_bake_speed
     utf8_console()
     rc = 0
     print('=' * 66)
@@ -287,6 +289,11 @@ def run_tests():
     print('R254 INTEGRATION (WHERE THE LIGHT PACKAGES MEET)')
     print('=' * 66)
     rc |= test_r254_integration.main()
+    print()
+    print('=' * 66)
+    print('R254 BAKE SPEED (WHICH SHADOW MAPS ARE BAKED, WHEN, AND HOW FAST)')
+    print('=' * 66)
+    rc |= test_r254_bake_speed.main()
     return rc
 
 

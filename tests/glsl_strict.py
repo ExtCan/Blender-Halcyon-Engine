@@ -415,7 +415,29 @@ def check_compute_raster():
                     f'craster compute {CR.compute_variant_name(lin, clear, cvg)}',
                     [compute_raster_unit(lin, clear, cvg)], None,
                     stage='comp')] += 1
+    # R254: the shadow-map bake's depth variant, in both image formats
+    # its one image is tried in
+    for fmt in CR.DEPTH_FORMATS:
+        counts[_record(
+            f'craster compute {CR.compute_variant_name(depth=True)} {fmt}',
+            [depth_bake_unit(fmt)], None, stage='comp')] += 1
     print(f'  compute raster: {counts}')
+
+
+def depth_bake_unit(fmt):
+    """R254: the depth variant of the compute raster as the driver
+    compiles it for the shadow-map bake (gpu/craster.bake_depth): one
+    write image of `fmt`, the three data samplers, RASTER_FLOATS."""
+    from ..gpu import craster as CR
+    from ..gpu import device as DV
+    head = ['layout(local_size_x = 8, local_size_y = 8) in;']
+    head += [f'layout(binding = {i}, {fmt.lower()}) uniform writeonly '
+             f'image2D {nm};' for i, nm in enumerate(CR.DEPTH_IMAGES)]
+    head += [f'layout(binding = {i}) uniform sampler2D {nm};'
+             for i, nm in enumerate(CR.DEPTH_SAMPLERS)]
+    head += [f'uniform float {nm};' for nm in CR.RASTER_FLOATS]
+    return '\n'.join(head) + '\n' + DV.strip_declarations(
+        CR.depth_compute_source())
 
 
 def check_coded():
