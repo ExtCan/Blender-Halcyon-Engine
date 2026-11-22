@@ -2328,6 +2328,59 @@ def test_an_array_is_sized_by_a_constant_expression():
               and shape(named) == shape(plain),
               str(err or err2 or (got, shape(named))))
 
+    # a uniform array and its socket. The node gives `uniform float w[N]`
+    # ONE float socket and the evaluator hands the run that socket's value,
+    # a float per lane (core/nodeeval). While a named size declared a
+    # float, every `w[i]` read it; now that it declares an array every
+    # element reads it -- the same picture -- and so does an array sized
+    # by a number, which read LANE i's value as element i. A list is the
+    # array's own elements, as it was
+    lanes = np.array([0.25, 0.5, 0.75, 1.0], np.float32)
+    rgb = np.stack([lanes, lanes * 2, lanes * 4], 1)
+    bad = []
+    for size in ('N', '3'):
+        prog, err = try_compile(
+            _N3 + f'uniform float w[{size}];\nuniform vec3 p[{size}];\n'
+            + _body('    float v[N];\n    v[1] = w[1] * 2.0;\n'
+                    '    Color = vec4(w[0], v[1], w[2] + p[2].z, p[1].y);\n'))
+        if prog is None:
+            bad.append(f'[{size}]: {err}')
+            continue
+        fed = [
+            ('a float per lane', {'w': lanes, 'p': rgb},
+             np.stack([lanes, lanes * 2, lanes * 5, lanes * 2], 1)),
+            ('one number', {'w': np.float32(0.5),
+                            'p': np.array([[1.0, 2.0, 4.0]], np.float32)},
+             [[0.5, 1, 4.5, 2]] * 4),
+            ('a list of elements',
+             {'w': [lanes * 0 + 0.25, lanes, lanes * 2], 'p': rgb},
+             np.stack([lanes * 0 + 0.25, lanes * 2, lanes * 6, lanes * 2],
+                      1)),
+            ('nothing', {}, [[0, 0, 0, 0]] * 4),
+        ]
+        for what, uniforms, want in fed:
+            try:
+                got = prog.run(uniforms, {}, 4)[0]['Color']
+            except Exception as exc:                            # noqa: BLE001
+                bad.append(f'[{size}] {what}: {type(exc).__name__}: {exc}')
+                continue
+            if not np.array_equal(got, np.asarray(want, np.float32)):
+                bad.append(f'[{size}] {what}: {got.tolist()}')
+    check('array size: a uniform array reads its socket in every element, '
+          'sized by a name or by a number (a float per lane, one number, '
+          'a list of elements, nothing)', not bad, '; '.join(bad))
+
+    # the size written in an array constructor is a size too, and then
+    # informative: the array is as long as its arguments
+    got, err = _first(_N3 + _body(
+        '    float a[N] = float[N](0.25, 0.5, 0.75);\n'
+        '    float b[] = float[N - 1](1.0, 2.0);\n'
+        '    float c[] = float[2](3.0, 4.0);\n'
+        '    Color = vec4(a[2], b[1], c[1], a[0]);\n'))
+    check('array size: a constructor sized by a constant expression',
+          got is not None and np.array_equal(got, [0.75, 2, 4, 0.25]),
+          str(err if got is None else got))
+
     # the HLSL dialect (`static const`), and a `const` the shader spells
     # with the qualifiers the other way round
     for what, src in (
@@ -2346,6 +2399,16 @@ def test_an_array_is_sized_by_a_constant_expression():
         check(f'array size: {what}',
               got is not None and np.array_equal(got, [0, 0.5, 1.25, 6]),
               str(err if got is None else got))
+    got, err = _first(
+        'cbuffer C { float gain; };\nstatic const int N = 3;\n'
+        'out float4 Color;\nvoid main() {\n    const static int M = N * 2;\n'
+        '    static const int L = M - 1;\n    float a[M];\n    float b[L];\n'
+        '    a[5] = 0.5;\n    b[4] = 0.25;\n'
+        '    Color = float4(a[5], b[4], gain, M + L);\n}\n', 'HLSL')
+    check('array size: HLSL, a constant after a cbuffer, and `const '
+          'static` / `static const` in a function',
+          got is not None and np.array_equal(got, [0.5, 0.25, 0, 11]),
+          str(err if got is None else got))
 
     # which constant a name is follows the scopes the run builds: the
     # nearest declaration above the brackets, whose own initialiser still
@@ -2539,6 +2602,14 @@ def test_a_size_that_is_not_a_constant_is_a_compile_error():
          _body('    float a[three()];\n' + use,
                'int three() { return 3; }\n'),
          f"line 4: {no}three() is the shader's own function"),
+        ('...declared above the size and defined below it',
+         _body('    float a[three()];\n' + use, 'int three();\n')
+         + 'int three() { return 3; }\n',
+         f"line 4: {no}three() is the shader's own function"),
+        ('...defined below the size, with nothing above it',
+         _body('    float a[three()];\n' + use)
+         + 'int three() { return 3; }\n',
+         f'line 3: {no}three() is not declared above it'),
         ('...even with a builtin\'s name, defined below the size',
          _body('    float a[max(2, 3)];\n' + use)
          + 'int max(int a, int b) { return 7; }\n',
@@ -2550,6 +2621,9 @@ def test_a_size_that_is_not_a_constant_is_a_compile_error():
         ('a builtin the language does not fold',
          _body('    float a[int(noise(vec3(0.5))) + 1];\n' + use),
          f'line 3: {no}noise() is not evaluated at compile time'),
+        ('a ternary whose condition is not constant',
+         _body('    float a[count > 2 ? 3 : 2];\n' + use, count),
+         f"line 4: {no}'count' is a uniform"),
         ('an assignment',
          _body('    int n = 1;\n    float a[n = 3];\n' + use),
          f"line 4: {no}it assigns"),
@@ -2590,9 +2664,21 @@ def test_a_size_that_is_not_a_constant_is_a_compile_error():
          'line 4: array size must be at least 1, not -2'),
         ('a division by zero', _body('    float a[1 / 0];\n' + use),
          'line 3: array size does not fit an int'),
+        ('an array with nothing in it',
+         _body('    float a[int(float[]())];\n' + use),
+         'line 3: array size is not one number'),
+        # ---- the size written in an array constructor is a size too
+        ('a name nothing declares, in a constructor\'s brackets',
+         _body('    float a[] = float[ZZ](1.0, 2.0);\n' + use),
+         "line 3: undeclared identifier 'ZZ'"),
+        ('a constructor size that is not a constant',
+         _body('    int n = 2;\n    float a[] = float[n](1.0, 2.0);\n'
+               + use),
+         f"line 4: {no}'n' is not declared const"),
         # ---- what the name check refuses in the body, in the brackets
-        ('an unknown function', _body('    float a[nope(3)];\n' + use),
-         "line 3: unknown function 'nope'"),
+        ('a function nothing declares',
+         _body('    float a[nope(3)];\n' + use),
+         f'line 3: {no}nope() is not declared above it'),
         ('a call with the wrong count',
          _N3 + _body('    float a[max(N)];\n' + use),
          'line 4: max() takes 2 arguments, got 1'),
@@ -2649,13 +2735,61 @@ def test_a_size_that_is_not_a_constant_is_a_compile_error():
           and np.array_equal(prog.run({}, {}, 2)[0]['Color'][0],
                              [0.25, 0.5, 0.75, 1]), repr(err))
 
+    # the scopes the parser keeps cost no depth of Python's stack: a chain
+    # of `else if`, and arms, loops and blocks inside one another, parse
+    # as deep as they did. (Each scope was first opened through a helper
+    # that called the parse -- one more frame a level -- and a chain of
+    # 400 arms, which compiled, was "too deeply nested".)
+    deep = 400
+    arms = '\n    else '.join(f'if (i == {j}) c = {j}.0;' for j in range(deep))
+    nests = [
+        ('else if', 'in vec3 vPosition;\nout vec4 Color;\nvoid main() {\n'
+         '    int i = int(vPosition.x);\n    float c = -1.0;\n    ' + arms
+         + '\n    Color = vec4(c);\n}\n'),
+        ('if', _body('    float c = 0.0;\n    ' + 'if (c < 1.0) ' * deep
+                     + 'c = 1.0;\n    Color = vec4(c);\n')),
+        ('for', _body('    float c = 0.0;\n    ' + ''.join(
+            f'for (int i{j} = 0; i{j} < 1; i{j}++) ' for j in range(deep))
+            + 'c += 1.0;\n    Color = vec4(c);\n')),
+        ('while', _body('    float c = 0.0;\n    ' + 'while (c < 1.0) ' * deep
+                        + 'c = 1.0;\n    Color = vec4(c);\n')),
+        ('do', _body('    float c = 0.0;\n    ' + 'do ' * deep + 'c += 1.0;'
+                     + ' while (false);' * deep + '\n    Color = vec4(c);\n')),
+        ('{', _body('    float c = 0.0;\n    ' + '{ ' * deep + 'c = 1.0;'
+                    + ' }' * deep + '\n    Color = vec4(c);\n')),
+    ]
+    bad = [f'{what}: {err}' for what, err in
+           ((what, try_compile(src)[1]) for what, src in nests) if err]
+    check(f'array size: {deep} levels of else if, if, for, while, do and '
+          '{ } still compile', not bad, '; '.join(bad))
+    short = '\n    else '.join(f'if (i == {j}) c = {j}.0;' for j in range(150))
+    p = np.zeros((4, 3), np.float32)
+    p[:, 0] = [0, 57, 149, 150]
+    outs, _, _ = run('in vec3 vPosition;\nout vec4 Color;\nvoid main() {\n'
+                     '    int i = int(vPosition.x);\n    float c = -1.0;\n    '
+                     + short + '\n    Color = vec4(c);\n}\n',
+                     inputs={'position': p}, n=4)
+    check('array size: ...and a chain of 150 arms takes each lane to its '
+          'own', np.array_equal(outs['Color'][:, 0], [0, 57, 149, -1]),
+          str(outs['Color'][:, 0]))
+
+    # nor do the constants a size names: one made of the one above it,
+    # 3000 deep, is followed with a list
+    prog, err = try_compile(
+        'const int K0 = 1;\n' + ''.join(
+            f'const int K{i} = K{i - 1} + 1;\n' for i in range(1, 3000))
+        + _body('    Color = vec4(1.0);\n',
+                'void sized() { float a[K2999 / 100]; }\n'))
+    check('array size: a constant 3000 constants deep',
+          prog is not None and _declared(prog)['a'] == 30, repr(err))
+
     # a shader that sizes its arrays with numbers computes nothing at
     # parse time, however many constants it declares: the constants are
     # recorded, and only a size that names one evaluates it
     from ..shaders import parser
     from ..shaders.compiler import DEFAULT_GLSL, DEFAULT_HLSL
     folds = []
-    kept = parser.Parser.fold
+    kept = parser.Parser.compute
 
     def counted(self, *args, **kwargs):
         folds.append(args[0])
@@ -2668,7 +2802,7 @@ def test_a_size_that_is_not_a_constant_is_a_compile_error():
                       ) + _body(
         '    float a[3];\n    const int M = N * 2;\n    a[2] = K[1].x;\n'
         '    Color = vec4(sum(a), float(M), w[3], 1.0);\n')
-    parser.Parser.fold = counted
+    parser.Parser.compute = counted
     try:
         quiet = []
         for src, lang in ((numbered, 'GLSL'), (DEFAULT_GLSL, 'GLSL'),
@@ -2679,7 +2813,7 @@ def test_a_size_that_is_not_a_constant_is_a_compile_error():
                             .replace('float v[3]', 'float v[N]')
                             + '\n// folded')[1]
     finally:
-        parser.Parser.fold = kept
+        parser.Parser.compute = kept
     check('array size: nothing is computed for sizes written as numbers '
           '(and two sizes that name N compute three things: themselves, '
           'and N once)',
@@ -2780,9 +2914,9 @@ def test_a_size_is_the_number_its_expression_runs_to():
         src, value, names = _size_case(np.random.RandomState(4000 + seed))
         prog, err = try_compile(src)
         body = src.replace('void sized() {', '//')
-        ran = _first(body)[0]
         row = [value, names['A'], names['B'], names['C']]
-        if ran is None or not np.array_equal(ran, row):
+        ran = [_first(body, n=n)[0] for n in (1, 4, 7)]
+        if any(r is None or not np.array_equal(r, row) for r in ran):
             bad.append(f'seed {seed}: the body ran to {ran} for {row}')
         elif value < 1:
             refused += 1
@@ -2795,10 +2929,43 @@ def test_a_size_is_the_number_its_expression_runs_to():
                 bad.append(f'seed {seed}: {value} gave '
                            f'{err or _declared(prog)}')
     check(f'array size: {n_prog} seeded constant expressions -- the size '
-          'declared, the value the body runs to and plain Python agree '
-          f'({sized} sizes, {refused} below 1 refused with their number)',
+          'declared, the value the body runs to (at 1, 4 and 7 lanes) and '
+          f'plain Python agree ({sized} sizes, {refused} below 1 refused '
+          'with their number)',
           not bad and sized > 150 and refused > 30,
           f'{len(bad)} differ: ' + '; '.join(bad[:3]))
+
+    # a size is computed on more lanes than a vector or a matrix has
+    # anything of, as a frame is. Two things this interpreter cannot do in
+    # a frame -- a matrix divided by a scalar, HLSL's fmod of a vector and
+    # a scalar -- go through on one or two lanes, where the shapes happen
+    # to fit; computed on one lane the size would be a number the same
+    # constant never runs to in a frame. So the size is refused -- or, the
+    # day the interpreter can compute these, it is the number the body
+    # runs to on seven lanes: the invariant, whichever holds
+    from ..shaders.interp import FOLD_LANES
+    cases = [
+        ('a matrix divided by a scalar', 'GLSL',
+         'const mat2 M = mat2(4.0) / 2.0;\n'
+         'const int N = int(M[0][0]) + 1;\nout vec4 Color;\n',
+         'void main() {\n    Color = vec4(float(N));\n}\n'),
+        ('HLSL fmod of a vector and a scalar', 'HLSL',
+         'static const float2 P = fmod(float2(7.0, 5.0), 4.0);\n'
+         'static const int N = int(P.x) + 1;\nout float4 Color;\n',
+         'void main() {\n    Color = float4(N, N, N, N);\n}\n'),
+    ]
+    for what, lang, head, main in cases:
+        prog, err = try_compile(head + 'void sized() { float a[N]; }\n'
+                                + main, lang)
+        ran, err2 = _first(head + main, lang, n=FOLD_LANES)
+        check(f'array size: {what} is no size, or the number a frame '
+              'runs it to',
+              FOLD_LANES > 4 and (
+                  (prog is None and err.startswith(
+                      'line 4: array size cannot be evaluated ('))
+                  or (prog is not None and ran is not None
+                      and _declared(prog)['a'] == ran[0])),
+              str(err or err2 or (_declared(prog), ran)))
 
 
 

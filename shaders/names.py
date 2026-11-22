@@ -45,11 +45,13 @@ One thing a shader names is not in the tree this walks: the size of an
 array. A size is a number by the time the parser hands the tree over -- it
 is a constant expression, and the parser computes it where it stands
 (parser.Parser.array_size), resolving its names in scopes of its own that
-follow the rules below. What this walk refuses in an expression it refuses
-in a size too, in the same words: `check_constant`, at the foot of this
-module, is the walk over that one expression, called by the parser before
-it computes it. (A size was read as a number or not at all, so `float
-a[UNDECLARED];` compiled.)
+follow the rules below. A name nothing above the brackets declares is the
+parser's to refuse -- `undeclared identifier`, without the hint a varying
+gets here: declaring one would not make it a constant. Everything else
+this walk refuses in an expression it refuses in a size too, in the same
+words: `check_constant`, at the foot of this module, is the walk over that
+one expression, called by the parser before it computes it. (A size was
+read as a number or not at all, so `float a[UNDECLARED];` compiled.)
 
 It is a walk of the same tree with the scopes `Interpreter.run`,
 `call_user`, `block` and `loop` build, holding a type where they hold a

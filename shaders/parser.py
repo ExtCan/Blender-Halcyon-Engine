@@ -302,13 +302,12 @@ class Parser:
 
     def parse_function(self, rettype, name):
         self.own_funcs.add(name)
-        # the parameters' scope: the body is a block inside it
+        # the parameters' scope: the body is a block inside it. Every scope
+        # in this parser is opened and closed in line, as here, and never
+        # through a helper that calls the parse: a helper is one more frame
+        # of Python's stack for each level of nesting, and a chain of four
+        # hundred `else if` has to parse as it always did
         self.scopes.append({})
-        fn = self.parse_function_rest(rettype, name)
-        self.scopes.pop()
-        return fn
-
-    def parse_function_rest(self, rettype, name):
         self.expect('(')
         params = []
         if not self.at(')'):
@@ -341,8 +340,10 @@ class Parser:
         self.expect(')')
         self.skip_semantic()
         if self.accept(';'):
+            self.scopes.pop()
             return ('proto', rettype, name, params)
         body = self.parse_block()
+        self.scopes.pop()
         return ('func', rettype, name, params, body)
 
     def parse_type(self):
@@ -374,14 +375,6 @@ class Parser:
             self.expect(']')
 
     # ------------------------------------------------- constants and sizes
-    def scoped(self, parse):
-        """What `parse` returns, read in a scope of its own: a
-        declaration it meets is gone when it is done."""
-        self.scopes.append({})
-        out = parse()
-        self.scopes.pop()
-        return out
-
     def declare(self, name, const=False, gtype=None, arr=0, init=None,
                 why='is not declared const'):
         """Record a name the source declares, in the scope the parser
@@ -419,8 +412,8 @@ class Parser:
     def not_constant(self, node, uses):
         """None when `node` is a constant expression, and `uses` then
         holds the _Const of every name in it. Otherwise (why, error): the
-        words for what is not constant, and -- for a name nothing declares
-        or a function that does not exist -- the error it is on its own.
+        words for what is not constant, and -- for a name nothing above
+        declares -- the error it is on its own.
 
         The language's rule (GLSL 4.3.3): a literal; a `const` variable
         whose initialiser is a constant expression; an operator, a
@@ -470,9 +463,9 @@ class Parser:
             elif name in BUILTINS:
                 return f'{name}() is not evaluated at compile time', None
             else:
-                line = node[3] if len(node) > 3 else 0
-                return (f'{name}() is not a function',
-                        ShaderError(f'unknown function {name!r}', line))
+                # unknown, or the shader's own and defined further down:
+                # the parser cannot tell yet, and neither is a constant
+                return f'{name}() is not declared above it', None
         else:
             return _WRITES.get(k, f'{k!r} is not a constant'), None
         for part in parts:
@@ -482,23 +475,46 @@ class Parser:
         return None
 
     def fold(self, node, uses, line, as_type=None):
-        """[value, type] of a constant expression: its constants first,
-        each once, then the expression itself -- through the name check
-        (names.check_constant), which refuses here what it refuses in the
-        body of a shader, in the same words, and then computed
-        (interp.fold)."""
+        """[value, type] of a constant expression: the constants it names
+        first, each once and the ones THEY name before them, then the
+        expression itself (`compute`). The constants are followed with a
+        list, not by calling back in here: a constant made of the one
+        above it, a thousand deep, is no depth of Python's stack."""
+        todo = [c for c in uses.consts.values() if c.slot is None]
+        opened = set()
+        while todo:
+            const = todo[-1]
+            need = [c for c in const.uses.consts.values() if c.slot is None]
+            if need:
+                if id(const) in opened:
+                    # back at a constant whose own are still not computed:
+                    # it names itself. `declare` records a constant after
+                    # its initialiser is read, so no source gets here --
+                    # and if one ever does, this is an error and not a
+                    # list that grows for ever
+                    raise ShaderError('array size: a constant that names '
+                                      'itself', line)
+                opened.add(id(const))
+                todo.extend(need)
+            else:
+                if const.slot is None:
+                    const.slot = self.compute(const.init, const.uses, line,
+                                              const.type)
+                todo.pop()
+        return self.compute(node, uses, line, as_type)
+
+    def compute(self, node, uses, line, as_type=None):
+        """One constant expression whose constants are all computed:
+        through the name check (names.check_constant), which refuses here
+        what it refuses in the body of a shader, in the same words, and
+        then through the interpreter (interp.fold)."""
         from .interp import fold
         from .names import check_constant
         for called in uses.calls:
             # held against the functions the shader goes on to declare
             # (`parse`)
             self.folded.setdefault(called, line)
-        consts = {}
-        for name, const in uses.consts.items():
-            if const.slot is None:
-                const.slot = self.fold(const.init, const.uses, line,
-                                       const.type)
-            consts[name] = const.slot
+        consts = {name: const.slot for name, const in uses.consts.items()}
         try:
             check_constant(node, {name: slot[1]
                                   for name, slot in consts.items()},
@@ -537,7 +553,12 @@ class Parser:
                     or t.is_matrix:
                 raise ShaderError('array size must be an int, this is '
                                   f'{_a(t.name())}', line)
-            one = _one(v)
+            try:
+                one = _one(v)
+            except (TypeError, ValueError, IndexError):
+                # no number (`int(float[]())`), or not the same one in
+                # every lane it was computed on
+                raise ShaderError('array size is not one number', line)
             try:
                 size = int(one)
             except (TypeError, ValueError, OverflowError):
@@ -650,19 +671,23 @@ class Parser:
         c = self.parse_expr()
         self.expect(')')
         # an arm is a block of its own, braces or not (shaders/names.py)
-        then = self.scoped(self.parse_statement)
+        self.scopes.append({})
+        then = self.parse_statement()
+        self.scopes.pop()
         els = None
         if self.accept('else'):
-            els = self.scoped(self.parse_statement)
+            self.scopes.append({})
+            els = self.parse_statement()
+            self.scopes.pop()
         return ('if', c, then, els)
 
     def parse_for(self):
-        # one scope for the init, the condition and the step; the body is
-        # a block inside it
-        return self.scoped(self.parse_for_rest)
-
-    def parse_for_rest(self):
         self.expect('for')
+        # one scope for the init, the condition and the step. The body is
+        # a block inside it, which needs no scope of its own here: braces
+        # open one (parse_block), and without them it is one statement,
+        # whose name ends with the loop's
+        self.scopes.append({})
         self.expect('(')
         if self.accept(';'):
             init = ('nop',)
@@ -676,7 +701,8 @@ class Parser:
         self.expect(';')
         step = None if self.at(')') else self.parse_expr()
         self.expect(')')
-        body = self.scoped(self.parse_statement)
+        body = self.parse_statement()
+        self.scopes.pop()
         return ('for', init, cond, step, body)
 
     def parse_while(self):
@@ -684,11 +710,16 @@ class Parser:
         self.expect('(')
         c = self.parse_expr()
         self.expect(')')
-        return ('while', c, self.scoped(self.parse_statement))
+        self.scopes.append({})
+        body = self.parse_statement()
+        self.scopes.pop()
+        return ('while', c, body)
 
     def parse_do(self):
         self.expect('do')
-        body = self.scoped(self.parse_statement)
+        self.scopes.append({})
+        body = self.parse_statement()
+        self.scopes.pop()
         self.expect('while')
         self.expect('(')
         c = self.parse_expr()
@@ -819,10 +850,13 @@ class Parser:
         if t.kind in ('ident', 'type'):
             name = self.next().value
             if t.kind == 'type' and self.at('['):
-                # array constructor: float[4](a, b, c, d)
-                self.next()
+                # array constructor: float[4](a, b, c, d). The size is a
+                # size like any other -- a constant int of at least 1,
+                # its names declared above -- and then informative: the
+                # array is as long as its arguments
+                bracket = self.next()
                 if not self.at(']'):
-                    self.parse_assign()          # declared size (informative)
+                    self.array_size(self.parse_assign(), bracket.line)
                 self.expect(']')
                 self.expect('(')
                 args = []
@@ -866,9 +900,13 @@ def _const_int(node):
 
 
 def _one(v):
-    """The one number a folded constant holds (one lane, one component)."""
+    """The one number a folded scalar holds: the same in every lane it was
+    computed on (interp.fold), or it is no constant (a ValueError)."""
     import numpy as np
-    return np.asarray(v).reshape(-1)[0]
+    lanes = np.asarray(v).reshape(-1)
+    if not (lanes == lanes[0]).all():
+        raise ValueError('not one value')
+    return lanes[0]
 
 
 def _a(noun):

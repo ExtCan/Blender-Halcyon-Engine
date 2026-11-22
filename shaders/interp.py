@@ -1070,6 +1070,16 @@ class Interpreter:
     def adapt(self, v, t, n):
         if t.base == 'sampler':
             return v
+        if t.array and not isinstance(v, (list, tuple)):
+            # ONE value for an array: the socket of a `uniform float
+            # w[3]`, which the node gives a single float socket (it has no
+            # other). Every element reads it, as a scalar fills a vector.
+            # (The value was kept as it came and indexed as the list an
+            # array is: element i was LANE i's value, and one number for
+            # every lane raised a TypeError. An array sized by a named
+            # constant was a float until the parser read its size, and
+            # read its socket -- this is what keeps it reading it.)
+            return [self.adapt(v, t.elem(), n)] * max(t.array, 1)
         if t.array or t.base == 'struct' or t.is_matrix:
             return v
         arr = rt.bc(v, n)
@@ -1118,13 +1128,19 @@ class Interpreter:
     ret_val = None
 
 
+#: the lanes a constant expression is computed on (`fold`): more than any
+#: vector or matrix has components, columns or rows
+FOLD_LANES = 7
+
+
 def fold(node, consts, structs, hlsl=False, as_type=None):
-    """[value, type] of a constant expression, computed on ONE lane by the
+    """[value, type] of a constant expression, computed by the
     `Interpreter.expr` that computes it when the shader runs.
 
     `consts` is {name: [value, type]} for the constants the expression
-    names. With `as_type` the value is converted to it, as a declaration
-    converts its initialiser (`const int N = ...`).
+    names, each a value this function returned. With `as_type` the value
+    is converted to it, as a declaration converts its initialiser (`const
+    int N = ...`).
 
     This is how the parser reads the size of an array (`float a[N * 2]`,
     parser.Parser.array_size): the number in the brackets is the number
@@ -1132,15 +1148,22 @@ def fold(node, consts, structs, hlsl=False, as_type=None):
     not a second one written for sizes. What may be handed here is the
     parser's to decide (`Parser.not_constant`): nothing that writes, and
     no function of the shader's own, so the empty interpreter below is
-    all the expression can reach."""
+    all the expression can reach.
+
+    On FOLD_LANES lanes, not one: a frame runs thousands. Where an
+    operation this interpreter cannot do (a matrix divided by a scalar)
+    goes through on one or two lanes because the shapes happen to fit, it
+    would give a size the run of the same constant never agrees with; on
+    seven lanes it raises as it does in a frame, and the size is refused.
+    The parser takes the value only when every lane holds the same."""
     it = Interpreter([], structs, hlsl=hlsl)
     scope = Scope()
     scope.vars.update(consts)
+    n = FOLD_LANES
     # quiet: what NumPy would warn of here (`1 / 0`, `sqrt(-1.0)`) is a
     # size the parser refuses by name a line later
     with np.errstate(all='ignore'):
-        v, t = it.expr(node, np.ones(1, bool), scope, Flags(1), 1)
+        v, t = it.expr(node, np.ones(n, bool), scope, Flags(n), n)
         if as_type is not None:
-            v, t = it.coerce(v, t, as_type, 1), as_type
+            v, t = it.coerce(v, t, as_type, n), as_type
     return [v, t]
-
