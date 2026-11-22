@@ -2092,6 +2092,715 @@ def test_signed_integers_divide_to_an_integer():
           str(err if got is None else got))
 
 
+# ------------------------------------ an array sized by a constant expression
+#
+# R253 (review): `const int N = 3; float a[N];` declared ONE float. The
+# parser read a size with `_const_int`, which knew a number and answered 0
+# -- "no brackets" -- for anything else: every index read the one float, a
+# write past index 0 was refused by name (the indexed-write test above
+# keeps that refusal loud), and a size nothing declares compiled. The
+# shader named "the reported shader" below is the text the defect was
+# reproduced with; the comment over each test says what the run did.
+
+_N3 = 'const int N = 3;\n'
+
+_SIZE_REPORTED = """const int N = 3;
+out vec4 Color;
+void main() {
+    float a[N];
+    a[0] = 0.5;
+    Color = vec4(a[0], a[2], 0.0, 1.0);
+}"""
+
+
+def _sized(size, count, head='', pre=''):
+    """A program whose array `a` is declared with `size` written in its
+    brackets and used at every one of the `count` elements that is to
+    mean: filled through a loop counter, the lane's own element changed,
+    the whole summed with a weight per element, both ends read by number
+    and one element through the lane's index."""
+    return ('in vec3 vPosition;\nout vec4 Color;\n' + head
+            + 'void main() {\n' + pre
+            + '    int k = int(vPosition.x);\n'
+            f'    float a[{size}];\n'
+            f'    for (int i = 0; i < {count}; i++) '
+            '{ a[i] = float(i + 1) * 0.25; }\n'
+            '    a[k] += vPosition.y;\n    float s = 0.0;\n'
+            f'    for (int i = 0; i < {count}; i++) '
+            '{ s += a[i] * float(i + 1); }\n'
+            f'    Color = vec4(a[0], a[{count - 1}], a[k], s);\n}}\n')
+
+
+def _sized_reference(count, p):
+    """What `_sized` computes for `count` elements, in NumPy. Every number
+    is a small multiple of 1/4, so float32 holds each sum exactly and the
+    two can be held to equality."""
+    lanes = np.arange(len(p))
+    k = p[:, 0].astype(int)
+    weight = np.arange(1, count + 1, dtype=np.float32)
+    a = np.tile(weight * np.float32(0.25), (len(p), 1))
+    a[lanes, k] += p[:, 1]
+    return np.stack([a[:, 0], a[:, count - 1], a[lanes, k],
+                     (a * weight).sum(1, dtype=np.float32)], 1)
+
+
+def _declared(prog):
+    """{name: array size} of every local a program declares, read off its
+    tree: 0 is no array at all, which is what a named size used to be."""
+    out = {}
+
+    def walk(node):
+        if isinstance(node, tuple) and node and node[0] == 'decl':
+            for name, arr, _init in node[2]:
+                out[name] = arr
+        if isinstance(node, (tuple, list)):
+            for part in node:
+                walk(part)
+
+    for cands in prog.interp.funcs.values():
+        for fn in cands:
+            walk(fn[4])
+    return out
+
+
+#: (what, declarations above main, statements at the top of main, the size
+#: as written, the number it is)
+_SIZE_FORMS = [
+    ('a const int', _N3, '', 'N', 3),
+    ('N * 2', _N3, '', 'N * 2', 6),
+    ('N + 1', _N3, '', 'N + 1', 4),
+    ('parentheses: (N + 1) * 2', _N3, '', '(N + 1) * 2', 8),
+    ('...and without them: N + 1 * 2', _N3, '', 'N + 1 * 2', 5),
+    ('from the left: 9 - N - 1 and 16 / 2 / N', _N3, '',
+     '9 - N - 1 + 16 / 2 / N', 7),
+    ('the quotient of two ints, cut: N / 2 + 1', _N3, '', 'N / 2 + 1', 2),
+    ('a remainder, a shift, the bit operators',
+     _N3, '', '7 % N + (N << 1) - (6 & N | 1)', 4),
+    ('unary minus and plus', _N3, '', '-N + +7', 4),
+    ('two numbers and no name: 2 + 1', '', '', '2 + 1', 3),
+    ('a constant made of constants',
+     _N3 + 'const int K = N * 2 + 1;\n', '', 'K', 7),
+    ('...three deep', _N3 + 'const int K = N * 2;\nconst int L = K - N;\n'
+     'const int M = L + K / N;\n', '', 'M', 5),
+    ('two constants of one declaration, the second made of the first',
+     'const int A = 2, B = A + 3;\n', '    const int C = B - A, D = C * 2;\n',
+     'B + D - A', 9),
+    ('a const int of the function', '', '    const int L = 4;\n', 'L', 4),
+    ('...made of a global one', _N3, '    const int L = N + 2;\n', 'L', 5),
+    ('a const uint', 'const uint U = 3u;\n', '', 'U', 3),
+    ('...plus a uint', 'const uint U = 3u;\n', '', 'U + 1u', 4),
+    ('a #define of an expression', '#define M (2 + 1)\n', '', 'M', 3),
+    ('a #define inside a constant',
+     '#define W 2\nconst int N = W + 1;\n', '', 'N * W', 6),
+    ('a ternary of constants', _N3, '', 'N > 2 ? N + 1 : 2', 4),
+    ('a cast of a float constant',
+     'const float R = 2.5;\n', '', 'int(R) + 1', 3),
+    ('builtins of constants',
+     _N3 + 'const float R = 2.5;\n', '', 'max(N, 4) + int(ceil(R))', 7),
+    ('a component of a constant vector',
+     'const ivec2 D = ivec2(2, 5);\n', '', 'D.y', 5),
+    ('an element of a constant array',
+     'const int T[2] = int[2](2, 4);\n', '', 'T[1]', 4),
+    ('a field of a constant struct',
+     'struct P { int n; float f; };\nconst P K = P(3, 1.0);\n', '', 'K.n',
+     3),
+    ('a constant declared with a named size itself',
+     _N3 + 'const int T[N] = int[N](2, 4, 6);\n', '', 'T[N - 1]', 6),
+]
+
+
+def test_an_array_is_sized_by_a_constant_expression():
+    """`const int N = 3; float a[N]; a[0] = 0.5; Color = vec4(a[0], a[2],
+    0.0, 1.0);` compiled and answered (0.5, 0.5, 0, 1): `a` was a float,
+    and `a[2]` read it. `a[1] = 0.5` raised `index 1 is out of range for
+    float`, and the loop that fills the array `float is not an array, a
+    vector or a matrix: a variable index cannot write to it`."""
+    fill = '    for (int i = 0; i < N; i++) { a[i] = float(i) * 0.25; }\n'
+    reported = [
+        ('one element written, another read (it answered 0.5 for a[2])',
+         _SIZE_REPORTED, [0.5, 0, 0, 1]),
+        ('a write past index 0 (index 1 is out of range for float)',
+         _N3 + _body('    float a[N];\n    a[1] = 0.5;\n'
+                     '    Color = vec4(a[0], a[1], a[2], 1.0);\n'),
+         [0, 0.5, 0, 1]),
+        ('filled in a loop (float is not an array, a vector or a matrix)',
+         _N3 + _body('    float a[N];\n' + fill
+                     + '    Color = vec4(a[0], a[1], a[2], 1.0);\n'),
+         [0, 0.25, 0.5, 1]),
+    ]
+    for what, src, want in reported:
+        bad = []
+        for n in (1, 2, 3, 4, 7):
+            got, err = _first(src, n=n)
+            if got is None or not np.array_equal(got, want):
+                bad.append(f'{n} lanes: {err if got is None else got}')
+        check(f'array size: {what} (the reported shader, at 1, 2, 3, 4 and '
+              '7 lanes)', not bad, '; '.join(bad))
+
+    # the rule: a size written as an expression is the size written as its
+    # number. Each form is compiled both ways and run per lane (every lane
+    # changes the element ITS index names); the two return the same
+    # arrays, they are the arrays NumPy computes, and the tree holds the
+    # number -- which a use of the first elements alone would not show
+    for what, head, pre, size, count in _SIZE_FORMS:
+        p = _lanes(2 * count + 1, count)
+        named, err = try_compile(_sized(size, count, head, pre))
+        plain, _e = try_compile(_sized(str(count), count, head, pre))
+        if named is None:
+            check(f'array size: {what}', False, repr(err))
+            continue
+        try:
+            got = named.run({}, {'position': p}, len(p))[0]['Color']
+            twin = plain.run({}, {'position': p}, len(p))[0]['Color']
+        except Exception as exc:                                # noqa: BLE001
+            check(f'array size: {what}', False,
+                  f'{type(exc).__name__}: {exc}')
+            continue
+        check(f'array size: {what} -- a[{size}] is a[{count}]',
+              _declared(named)['a'] == count == _declared(plain)['a']
+              and got.dtype == twin.dtype and np.array_equal(got, twin)
+              and np.array_equal(got, _sized_reference(count, p)),
+              f'declared {_declared(named)["a"]}; {got[:3]}')
+
+    # wherever a declarator stands: the suffix of a global, a uniform, a
+    # parameter, a struct's field, a second declarator, a local of any
+    # block. `{S}` is written N + 1 and then 4
+    sites = [
+        ('a global',
+         _N3 + 'float g[{S}];\n' + _body(
+             '    for (int i = 0; i <= N; i++) { g[i] = float(i) * 0.25; }\n'
+             '    Color = vec4(g[0], g[1], g[2], g[3]);\n'),
+         [0, 0.25, 0.5, 0.75],
+         lambda prog: prog.interp.globals[-1][1].name()),
+        ('a uniform',
+         _N3 + 'uniform float w[{S}];\n' + _body(
+             '    Color = vec4(w[0], w[1], w[2], w[3] + 1.0);\n'),
+         [0, 0, 0, 1], lambda prog: prog.uniforms[0][1].name()),
+        ('a parameter',
+         _N3 + 'float total(float v[{S}]) {\n    float s = 0.0;\n'
+         '    for (int i = 0; i <= N; i++) { s += v[i]; }\n'
+         '    return s;\n}\n' + _body(
+             '    float a[{S}];\n'
+             '    for (int i = 0; i <= N; i++) { a[i] = float(i) * 0.25; }\n'
+             '    Color = vec4(total(a), a[1], a[2], a[3]);\n'),
+         [1.5, 0.25, 0.5, 0.75],
+         lambda prog: prog.interp.funcs['total'][0][3][0][3]),
+        ("a struct's field",
+         _N3 + 'struct S { float w[{S}]; vec2 p[{S}]; };\n' + _body(
+             '    S s;\n    for (int i = 0; i <= N; i++) { s.w[i] = '
+             'float(i) * 0.25; s.p[i].y = float(i); }\n'
+             '    Color = vec4(s.w[1], s.w[3], s.p[2].y, s.p[3].y);\n'),
+         [0.25, 0.75, 2, 3],
+         lambda prog: [t.name() for t in prog.interp.fields('S').values()]),
+        ('every declarator of one declaration',
+         _N3 + _body(
+             '    float a[{S}], f = 2.0, b[{S}];\n'
+             '    for (int i = 0; i <= N; i++) { a[i] = float(i); '
+             'b[N - i] = float(i) * 0.25; }\n'
+             '    Color = vec4(a[3], b[0], b[3], f);\n'),
+         [3, 0.75, 0, 2], _declared),
+        ('an array of vectors, an array of structs',
+         _N3 + 'struct S { float k; };\n' + _body(
+             '    vec3 p[{S}];\n    S t[{S}];\n'
+             '    for (int i = 0; i <= N; i++) { p[i] = vec3(float(i)); '
+             't[i].k = float(i) * 0.25; }\n'
+             '    Color = vec4(p[1].x, p[3].z, t[2].k, t[3].k);\n'),
+         [1, 3, 0.5, 0.75], _declared),
+        ('a local of a loop, of a branch, of a helper',
+         _N3 + 'float last() {\n    float c[{S}];\n    c[N] = 0.75;\n'
+         '    return c[N];\n}\n' + _body(
+             '    float r = 0.0;\n    float q = 0.0;\n'
+             '    for (int j = 0; j < 2; j++) {\n        float a[{S}];\n'
+             '        a[N] = float(j + 1);\n        r += a[N] + a[0];\n'
+             '    }\n    if (r > 2.0) {\n        float b[{S}];\n'
+             '        b[N - 1] = 0.5;\n        q = b[N - 1] + b[N];\n    }\n'
+             '    Color = vec4(r, q, last(), 1.0);\n'),
+         [3, 0.5, 0.75, 1], _declared),
+    ]
+    for what, src, want, shape in sites:
+        named, err = try_compile(src.replace('{S}', 'N + 1'))
+        plain, _e = try_compile(src.replace('{S}', '4'))
+        got, err2 = _first(src.replace('{S}', 'N + 1'), n=3)
+        twin, _e = _first(src.replace('{S}', '4'), n=3)
+        check(f'array size: {what} sized N + 1 is the one sized 4',
+              named is not None and got is not None
+              and np.array_equal(got, want) and np.array_equal(got, twin)
+              and shape(named) == shape(plain),
+              str(err or err2 or (got, shape(named))))
+
+    # the HLSL dialect (`static const`), and a `const` the shader spells
+    # with the qualifiers the other way round
+    for what, src in (
+            ('HLSL, static const',
+             'static const int N = 3;\nstatic const int K = N * 2;\n'
+             'out float4 Color;\nvoid main() {\n    float a[K];\n'
+             '    for (int i = 0; i < K; i++) { a[i] = i * 0.25; }\n'
+             '    Color = float4(a[0], a[2], a[5], K);\n}\n'),
+            ('HLSL, const static, sized in a helper',
+             'const static int K = 6;\nout float4 Color;\n'
+             'float last() {\n    float a[K];\n    a[K - 1] = 1.25;\n'
+             '    a[2] = 0.5;\n    return a[5] + a[2] - a[0];\n}\n'
+             'void main() {\n    Color = float4(0, 0.5, last() - 0.5, K);\n'
+             '}\n')):
+        got, err = _first(src, 'HLSL')
+        check(f'array size: {what}',
+              got is not None and np.array_equal(got, [0, 0.5, 1.25, 6]),
+              str(err if got is None else got))
+
+    # which constant a name is follows the scopes the run builds: the
+    # nearest declaration above the brackets, whose own initialiser still
+    # saw the outer name
+    scopes = [
+        ('the function\'s own N hides the global one',
+         _N3 + _body('    const int N = 2;\n    float a[N];\n'
+                     '    Color = vec4(float(N));\n'), {'a': 2}, 2),
+        ('...from the statement after it: its initialiser saw the global',
+         _N3 + _body('    const int N = N + 1;\n    float a[N];\n'
+                     '    Color = vec4(float(N));\n'), {'a': 4}, 4),
+        ('a block\'s N, and the global one again after the block',
+         _N3 + _body('    { const int N = 5;\n      float a[N]; }\n'
+                     '    float b[N];\n    Color = vec4(float(N));\n'),
+         {'a': 5, 'b': 3}, 3),
+        ('each function its own, and a loop its own',
+         _N3 + 'float f() { const int N = 2; float c[N * 2]; return 1.0; }\n'
+         + _body('    for (int i = 0; i < 2; i++) {\n'
+                 '        const int N = 6;\n        float a[N];\n    }\n'
+                 '    float b[N];\n    Color = vec4(float(N) + f());\n'),
+         {'a': 6, 'b': 3, 'c': 4}, 4),
+        ('a parameter of that name hides it in its own function alone',
+         _N3 + 'float f(int N) { return float(N); }\n'
+         + _body('    float a[N];\n    Color = vec4(f(1) + 3.0);\n'),
+         {'a': 3}, 4),
+        ('a constant of the head of a loop, in its body',
+         _body('    float r = 0.0;\n'
+               '    for (const int M = 2; r < 1.0; r += 1.0) {\n'
+               '        float a[M * 2];\n    }\n'
+               '    Color = vec4(r + 4.0);\n'), {'a': 4}, 5),
+    ]
+    for what, src, sizes, want in scopes:
+        prog, err = try_compile(src)
+        got, err2 = _first(src)
+        check(f'array size: {what}',
+              prog is not None and got is not None
+              and {k: _declared(prog)[k] for k in sizes} == sizes
+              and np.array_equal(got, [want] * 4),
+              str(err or err2 or (_declared(prog), got)))
+
+    # the two refusals that kept the named size from aliasing in silence
+    # fire for what they name and nothing else: a number past the size is
+    # said with the size the name resolved to (it said `for float`)
+    got, err = _first(_N3 + _body('    float a[N * 2];\n    a[6] = 1.0;\n'
+                                  '    Color = vec4(a[5]);\n'))
+    check('array size: a number written past a named size is refused by '
+          'the size it is',
+          got is None and err == 'compiled, then ShaderError: index 6 is '
+          'out of range for float[6]', str(err if got is None else got))
+
+
+def test_a_size_that_is_not_a_constant_is_a_compile_error():
+    """`float a[UNDECLARED];` compiled, and so did `uniform int count;
+    float a[count];` -- each declared a float, as every size that was not a
+    number did. A size is a constant expression of type int, at least 1:
+    what is not is refused where it is written, whether or not a lane ever
+    reaches the line -- a driver compiles none of these."""
+    use = '    Color = vec4(a[0]);\n'
+    count = 'uniform int count = 3;\n'
+    no = 'array size is not a compile-time constant: '
+    refused = [
+        # ---- a name nothing above declares
+        ('a size nothing declares (the reported shader)',
+         _body('    float a[UNDECLARED];\n    a[0] = 0.5;\n' + use),
+         "line 3: undeclared identifier 'UNDECLARED'"),
+        ('...inside an expression',
+         _N3 + _body('    float a[N * 2 + M];\n' + use),
+         "line 4: undeclared identifier 'M'"),
+        ('a constant declared below the size',
+         _body('    float a[N];\n' + use) + _N3,
+         "line 3: undeclared identifier 'N'"),
+        ('a constant of a block that has closed',
+         _body('    { const int M = 2; }\n    float a[M];\n' + use),
+         "line 4: undeclared identifier 'M'"),
+        ('...of an if arm without braces',
+         _body('    if (true) const int M = 2;\n    float a[M];\n' + use),
+         "line 4: undeclared identifier 'M'"),
+        ('...of an else arm without braces',
+         _body('    if (false) { } else const int M = 2;\n'
+               '    float a[M];\n' + use),
+         "line 4: undeclared identifier 'M'"),
+        ('...of a loop',
+         _body('    for (int i = 0; i < 2; i++) { const int M = 2; }\n'
+               '    float a[M];\n' + use),
+         "line 4: undeclared identifier 'M'"),
+        ('...of the head of a loop, after the loop',
+         _body('    for (const int M = 2; false; ) { }\n'
+               '    float a[M];\n' + use),
+         "line 4: undeclared identifier 'M'"),
+        ('...of a loop body without braces: for, while, do',
+         _body('    for (int i = 0; i < 2; i++) const int F = 2;\n'
+               '    while (false) const int W = 2;\n'
+               '    do const int D = 2; while (false);\n'
+               '    float a[F + W + D];\n' + use),
+         "line 6: undeclared identifier 'F'"),
+        ('...of a while body without braces',
+         _body('    while (false) const int W = 2;\n'
+               '    float a[W];\n' + use),
+         "line 4: undeclared identifier 'W'"),
+        ('...of a do body without braces',
+         _body('    do const int D = 2; while (false);\n'
+               '    float a[D];\n' + use),
+         "line 4: undeclared identifier 'D'"),
+        ('...of another function',
+         _body('    float a[M];\n' + use,
+               'float f() { const int M = 2; return 1.0; }\n'),
+         "line 4: undeclared identifier 'M'"),
+        ('...of another case of a switch',
+         _body('    int k = 1;\n    switch (k) {\n'
+               '    case 0: const int M = 2; break;\n'
+               '    case 1: float a[M]; break;\n    }\n'
+               '    Color = vec4(1.0);\n'),
+         "line 6: undeclared identifier 'M'"),
+        ('...of a case, in the default after it',
+         _body('    int k = 1;\n    switch (k) {\n'
+               '    case 0: const int M = 2; break;\n'
+               '    default: float a[M]; break;\n    }\n'
+               '    Color = vec4(1.0);\n'),
+         "line 6: undeclared identifier 'M'"),
+        ('...written in a switch above its first case (the statement is '
+         'dropped, and its name with it)',
+         _body('    int k = 1;\n    switch (k) {\n'
+               '        const int M = 2;\n    case 0: break;\n    }\n'
+               '    float a[M];\n' + use),
+         "line 8: undeclared identifier 'M'"),
+        ('...of a switch, after it',
+         _body('    int k = 1;\n    switch (k) {\n'
+               '    default: const int M = 2; break;\n    }\n'
+               '    float a[M];\n' + use),
+         "line 7: undeclared identifier 'M'"),
+        # ---- a name that is not a constant
+        ('a uniform', _body('    float a[count];\n' + use, count),
+         f"line 4: {no}'count' is a uniform"),
+        ('...as the size of a global',
+         count + 'float g[count];\n' + _body('    Color = vec4(g[0]);\n'),
+         f"line 2: {no}'count' is a uniform"),
+        ("...of a struct's field",
+         count + 'struct S { float w[count * 2]; };\n'
+         + _body('    Color = vec4(1.0);\n'),
+         f"line 2: {no}'count' is a uniform"),
+        ('...of a parameter',
+         count + 'float f(float v[count]) { return v[0]; }\n'
+         + _body('    Color = vec4(1.0);\n'),
+         f"line 2: {no}'count' is a uniform"),
+        ('an input',
+         _body('    float a[int(vDepth) + 1];\n' + use, 'in float vDepth;\n'),
+         f"line 4: {no}'vDepth' is an input"),
+        ('gl_FragCoord',
+         _body('    float a[int(gl_FragCoord.x) + 1];\n' + use),
+         f"line 3: {no}'gl_FragCoord' is not a constant"),
+        ('a global that is not const',
+         _body('    float a[n];\n' + use, 'int n = 3;\n'),
+         f"line 4: {no}'n' is not declared const"),
+        ('a local that is not const',
+         _body('    int n = 3;\n    float a[n];\n' + use),
+         f"line 4: {no}'n' is not declared const"),
+        ('a loop counter',
+         _body('    for (int i = 1; i < 3; i++) { float a[i]; }\n'
+               '    Color = vec4(1.0);\n'),
+         f"line 3: {no}'i' is not declared const"),
+        ('a parameter, const or not',
+         _body('    Color = vec4(f(3));\n',
+               'float f(const int n) { float a[n]; return a[0]; }\n'),
+         f"line 2: {no}'n' is a parameter"),
+        ('a const whose initialiser is not constant',
+         _body('    const int n = count * 2;\n    float a[n];\n' + use,
+               count),
+         f"line 5: {no}the initialiser of 'n' is not constant ('count' is "
+         'a uniform)'),
+        ('...at one remove',
+         _body('    float a[m + 1];\n' + use,
+               count + 'const int n = count;\nconst int m = n * 2;\n'),
+         f"line 6: {no}the initialiser of 'm' is not constant (the "
+         "initialiser of 'n' is not constant ('count' is a uniform))"),
+        ('a const with no initialiser',
+         _body('    float a[n];\n' + use, 'const int n;\n'),
+         f"line 4: {no}'n' has no initialiser"),
+        ('a local that hides the constant: the size is not the outer 3',
+         _N3 + _body('    int N = 2;\n    float a[N];\n' + use),
+         f"line 5: {no}'N' is not declared const"),
+        ('a parameter that hides it',
+         _N3 + _body('    Color = vec4(f(1));\n',
+                     'float f(int N) { float a[N]; return a[0]; }\n'),
+         f"line 3: {no}'N' is a parameter"),
+        ('an HLSL cbuffer\'s member, whatever it says',
+         'cbuffer C { const int N = 3; };\nout float4 Color;\n'
+         'void main() {\n    float a[N];\n    Color = float4(a[0]);\n}\n',
+         f"line 4: {no}'N' is a cbuffer's member"),
+        # ---- an expression that is not one
+        ("the shader's own function",
+         _body('    float a[three()];\n' + use,
+               'int three() { return 3; }\n'),
+         f"line 4: {no}three() is the shader's own function"),
+        ('...even with a builtin\'s name, defined below the size',
+         _body('    float a[max(2, 3)];\n' + use)
+         + 'int max(int a, int b) { return 7; }\n',
+         f"line 3: {no}max() is the shader's own function"),
+        ('a texture read',
+         _body('    float a[int(texture(t, vec2(0.0)).x) + 1];\n' + use,
+               'uniform sampler2D t;\n'),
+         f"line 4: {no}texture() is not evaluated at compile time"),
+        ('a builtin the language does not fold',
+         _body('    float a[int(noise(vec3(0.5))) + 1];\n' + use),
+         f'line 3: {no}noise() is not evaluated at compile time'),
+        ('an assignment',
+         _body('    int n = 1;\n    float a[n = 3];\n' + use),
+         f"line 4: {no}it assigns"),
+        ('an increment',
+         _N3 + _body('    float a[N++];\n' + use),
+         f"line 4: {no}it writes (++ or --)"),
+        ('...written in front', _N3 + _body('    float a[++N];\n' + use),
+         f"line 4: {no}it writes (++ or --)"),
+        ('a decrement', _N3 + _body('    float a[--N + 2];\n' + use),
+         f"line 4: {no}it writes (++ or --)"),
+        ('a comma', _N3 + _body('    float a[(1, N)];\n' + use),
+         f"line 4: {no}it holds a comma"),
+        # ---- a constant that is not an int
+        ('a float constant',
+         _body('    float a[R];\n' + use, 'const float R = 3.0;\n'),
+         'line 4: array size must be an int, this is a float'),
+        ('an int times a float',
+         _N3 + _body('    float a[N * 1.5];\n' + use),
+         'line 4: array size must be an int, this is a float'),
+        ('a float constant given an int: it is the type it is declared',
+         _body('    float a[R / 2 + 1];\n' + use, 'const float R = 5;\n'),
+         'line 4: array size must be an int, this is a float'),
+        ('a bool', _body('    float a[true];\n' + use),
+         'line 3: array size must be an int, this is a bool'),
+        ('a vector',
+         _body('    float a[D];\n' + use, 'const ivec2 D = ivec2(2, 3);\n'),
+         'line 4: array size must be an int, this is an ivec2'),
+        ('a builtin of an int that answers a fraction',
+         _body('    float a[sqrt(2)];\n' + use),
+         'line 3: array size must be an int, this is 1.41421'),
+        # ---- an int that is no size
+        ('zero', _body('    float a[0];\n' + use),
+         'line 3: array size must be at least 1, not 0'),
+        ('a constant that is zero',
+         _body('    float a[Z];\n' + use, 'const int Z = 0;\n'),
+         'line 4: array size must be at least 1, not 0'),
+        ('below zero', _N3 + _body('    float a[N - 5];\n' + use),
+         'line 4: array size must be at least 1, not -2'),
+        ('a division by zero', _body('    float a[1 / 0];\n' + use),
+         'line 3: array size does not fit an int'),
+        # ---- what the name check refuses in the body, in the brackets
+        ('an unknown function', _body('    float a[nope(3)];\n' + use),
+         "line 3: unknown function 'nope'"),
+        ('a call with the wrong count',
+         _N3 + _body('    float a[max(N)];\n' + use),
+         'line 4: max() takes 2 arguments, got 1'),
+        ("a swizzle past the constant's width",
+         _body('    float a[D.z];\n' + use, 'const ivec2 D = ivec2(2, 3);\n'),
+         "line 4: swizzle 'z' out of range for ivec2"),
+        ('a field the constant does not have',
+         _body('    float a[K.m];\n' + use,
+               'struct P { int n; };\nconst P K = P(3);\n'),
+         "line 5: P has no field 'm'"),
+        ('...in the initialiser of a constant the size names',
+         _body('    float a[M];\n' + use, 'const ivec2 D = ivec2(2, 3);\n'
+               'const int M = D.z + 1;\n'),
+         "line 3: swizzle 'z' out of range for ivec2"),
+    ]
+    for what, src, want in refused:
+        _refused(f'array size, {what}', src, want,
+                 'HLSL' if 'float4' in src else 'GLSL')
+
+    # refused where it is written, not where a lane arrives: in a helper
+    # nothing calls, and behind a branch no lane takes
+    _refused('array size, a non-constant size in a function nothing calls',
+             _body('    Color = vec4(1.0);\n', count
+                   + 'float unused() { float a[count]; return a[0]; }\n'),
+             f"line 3: {no}'count' is a uniform")
+    _refused('array size, ...behind a branch no lane takes',
+             _body('    Color = vec4(1.0);\n'
+                   '    if (count > 99) { float a[count]; Color = '
+                   'vec4(a[0]); }\n', count),
+             f"line 5: {no}'count' is a uniform")
+
+    # what a number in the brackets does is what it did: an int, an int
+    # with a suffix and (this front-end's own latitude) a float all read
+    # as before; `[]` is sized by its initialiser. One spelling is new: a
+    # size in hex failed the compile with Python's own TypeError
+    numbers = [('3', 3), ('3u', 3), ('3.0', 3), ('3.9', 3), ('1e1', 10),
+               ('4f', 4), ('0x10', 16), ('0x1Fu', 31)]
+    bad = []
+    for text, want in numbers:
+        prog, err = try_compile(_body(
+            f'    float a[{text}];\n    a[{want - 1}] = 0.5;\n'
+            f'    Color = vec4(a[{want - 1}]);\n'))
+        if prog is None or _declared(prog)['a'] != want or \
+                not np.array_equal(prog.run({}, {}, 2)[0]['Color'][0],
+                                   [0.5] * 4):
+            bad.append(f'[{text}]: {err or _declared(prog)}')
+    check('array size: a number in the brackets is the size it was '
+          f'({", ".join(t for t, _w in numbers)})', not bad, '; '.join(bad))
+    prog, err = try_compile(_body(
+        '    float a[] = float[](0.25, 0.5, 0.75);\n    float b[];\n'
+        '    Color = vec4(a[0], a[1], a[2], b[0] + 1.0);\n'))
+    check('array size: [] is still sized by its initialiser',
+          prog is not None and _declared(prog) == {'a': -1, 'b': -1}
+          and np.array_equal(prog.run({}, {}, 2)[0]['Color'][0],
+                             [0.25, 0.5, 0.75, 1]), repr(err))
+
+    # a shader that sizes its arrays with numbers computes nothing at
+    # parse time, however many constants it declares: the constants are
+    # recorded, and only a size that names one evaluates it
+    from ..shaders import parser
+    from ..shaders.compiler import DEFAULT_GLSL, DEFAULT_HLSL
+    folds = []
+    kept = parser.Parser.fold
+
+    def counted(self, *args, **kwargs):
+        folds.append(args[0])
+        return kept(self, *args, **kwargs)
+
+    numbered = _N3 + ('const float TAU = 6.2831853;\n'
+                      'const vec3 K[2] = vec3[2](vec3(1.0), vec3(TAU));\n'
+                      'uniform float w[4];\nstruct S { float f[2]; };\n'
+                      'float sum(float v[3]) { return v[0] + v[2]; }\n'
+                      ) + _body(
+        '    float a[3];\n    const int M = N * 2;\n    a[2] = K[1].x;\n'
+        '    Color = vec4(sum(a), float(M), w[3], 1.0);\n')
+    parser.Parser.fold = counted
+    try:
+        quiet = []
+        for src, lang in ((numbered, 'GLSL'), (DEFAULT_GLSL, 'GLSL'),
+                          (DEFAULT_HLSL, 'HLSL')):
+            quiet.append(try_compile(src + '\n// unfolded', lang)[1])
+        none = len(folds)
+        named = try_compile(numbered.replace('float a[3]', 'float a[N]')
+                            .replace('float v[3]', 'float v[N]')
+                            + '\n// folded')[1]
+    finally:
+        parser.Parser.fold = kept
+    check('array size: nothing is computed for sizes written as numbers '
+          '(and two sizes that name N compute three things: themselves, '
+          'and N once)',
+          quiet == [None] * 3 and none == 0 and named is None
+          and len(folds) == 3, f'{quiet} {none} {named} {len(folds)}')
+
+    # ...and in silence: what NumPy would warn of while a size is
+    # computed is either no size at all (refused by name, above) or, as
+    # here -- a float32 product past the range -- still the size it is
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        prog, err = try_compile(_body(
+            '    float a[1e30 * 1e30 > 1.0 ? 3 : 2];\n' + use))
+    check('array size: a size is computed without a NumPy warning',
+          prog is not None and _declared(prog)['a'] == 3, repr(err))
+
+    # the builtins a constant may call are the ones written down as such:
+    # every one is a builtin, and what is left out is this list
+    from ..shaders.builtins import BUILTINS, CONSTANT
+    left_out = {'texture', 'texture2D', 'textureLod', 'texture2DLod',
+                'textureGrad', 'texelFetch', 'textureSize', 'tex2D',
+                'tex2Dlod', 'dFdx', 'dFdy', 'ddx', 'ddy', 'fwidth', 'clip',
+                'noise', 'noise3', 'fbm', 'quantize', 'posterize',
+                'dither4x4', 'hsv2rgb', 'rgb2hsv', 'luminance'}
+    check('array size: the builtins a constant may call, and the ones it '
+          'may not', CONSTANT <= set(BUILTINS)
+          and set(BUILTINS) - CONSTANT == left_out,
+          str(sorted((set(BUILTINS) - CONSTANT) ^ left_out)))
+
+
+def _size_expr(rng, names, depth):
+    """(GLSL text, value) of a seeded constant expression over the ints in
+    `names` and small numbers -- every binary node in parentheses, the
+    value computed here on Python ints the way the language defines it
+    (the quotient cut toward zero). None for one the language leaves
+    undefined: a zero divisor, or a remainder of anything negative."""
+    kind = rng.randint(8) if depth > 0 else rng.randint(2)
+    if kind == 0:
+        v = int(rng.randint(1, 10))
+        return str(v), v
+    if kind == 1:
+        name = sorted(names)[rng.randint(len(names))]
+        return name, names[name]
+    if kind == 2:
+        sub = _size_expr(rng, names, depth - 1)
+        return sub and (f'(-{sub[0]})', -sub[1])
+    op = '+-*/%+-*'[rng.randint(8)]
+    left = _size_expr(rng, names, depth - 1)
+    right = _size_expr(rng, names, depth - 1)
+    if left is None or right is None:
+        return None
+    (ta, a), (tb, b) = left, right
+    if op == '/':
+        if b == 0:
+            return None
+        v = abs(a) // abs(b) * (1 if (a < 0) == (b < 0) else -1)
+    elif op == '%':
+        if a < 0 or b <= 0:
+            return None
+        v = a % b
+    else:
+        v = {'+': a + b, '-': a - b, '*': a * b}[op]
+    return f'({ta} {op} {tb})', v
+
+
+def _size_case(rng):
+    """One seeded shader: three constants, each made of the ones above it,
+    and a size made of all three -- (source, the size, the constants)."""
+    while True:
+        names = {'A': int(rng.randint(1, 10))}
+        lines = [f'const int A = {names["A"]};']
+        for name in 'BC':
+            made = _size_expr(rng, names, 2)
+            if made is None or abs(made[1]) > 99:
+                break
+            names[name] = made[1]
+            lines.append(f'const int {name} = {made[0]};')
+        else:
+            size = _size_expr(rng, names, 3)
+            if size is not None and -40 <= size[1] <= 400:
+                break
+    text, value = size
+    src = ('\n'.join(lines) + '\nout vec4 Color;\n'
+           f'void sized() {{ float a[{text}]; }}\n'
+           f'void main() {{\n    Color = vec4(float({text}), float(A), '
+           'float(B), float(C));\n}\n')
+    return src, value, names
+
+
+def test_a_size_is_the_number_its_expression_runs_to():
+    """The size in the brackets and the same expression in the body of the
+    shader are one number: the parser computes a size with the
+    interpreter's own arithmetic (interp.fold), and the two are held here
+    against a third, plain Python on plain ints."""
+    bad, sized, refused, n_prog = [], 0, 0, 300
+    for seed in range(n_prog):
+        src, value, names = _size_case(np.random.RandomState(4000 + seed))
+        prog, err = try_compile(src)
+        body = src.replace('void sized() {', '//')
+        ran = _first(body)[0]
+        row = [value, names['A'], names['B'], names['C']]
+        if ran is None or not np.array_equal(ran, row):
+            bad.append(f'seed {seed}: the body ran to {ran} for {row}')
+        elif value < 1:
+            refused += 1
+            if prog is not None or err != ('line 5: array size must be at '
+                                           f'least 1, not {value}'):
+                bad.append(f'seed {seed}: {value} gave {err!r}')
+        else:
+            sized += 1
+            if prog is None or _declared(prog)['a'] != value:
+                bad.append(f'seed {seed}: {value} gave '
+                           f'{err or _declared(prog)}')
+    check(f'array size: {n_prog} seeded constant expressions -- the size '
+          'declared, the value the body runs to and plain Python agree '
+          f'({sized} sizes, {refused} below 1 refused with their number)',
+          not bad and sized > 150 and refused > 30,
+          f'{len(bad)} differ: ' + '; '.join(bad[:3]))
+
+
 
 def main():
     from . import utf8_console

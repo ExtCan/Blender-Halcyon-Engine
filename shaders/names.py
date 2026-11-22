@@ -41,6 +41,16 @@ call and the type of every expression:
              an array of three), by the same `field_type` the interpreter
              builds the struct from.
 
+One thing a shader names is not in the tree this walks: the size of an
+array. A size is a number by the time the parser hands the tree over -- it
+is a constant expression, and the parser computes it where it stands
+(parser.Parser.array_size), resolving its names in scopes of its own that
+follow the rules below. What this walk refuses in an expression it refuses
+in a size too, in the same words: `check_constant`, at the foot of this
+module, is the walk over that one expression, called by the parser before
+it computes it. (A size was read as a number or not at all, so `float
+a[UNDECLARED];` compiled.)
+
 It is a walk of the same tree with the scopes `Interpreter.run`,
 `call_user`, `block` and `loop` build, holding a type where they hold a
 value. The two must agree on what is in scope where, so the rules are
@@ -412,3 +422,21 @@ class NameCheck:
         if rtype is None:
             rtype = types[0] if types else FLOAT
         return _loose(rtype, *types), max(rtype.n, width)
+
+
+def check_constant(node, types, structs, hlsl=False):
+    """This walk over ONE constant expression -- the size of an array, or
+    the initialiser of a `const` a size names -- before the parser computes
+    it (parser.Parser.fold). `types` is {name: type} for the constants in
+    it; the parser has already refused every other name.
+
+    A size is parsed and gone before the check above walks the tree: it is
+    a number in every node that carries one. So what is wrong in the
+    brackets is refused from here, by the same rules in the same words (a
+    swizzle past the width, a field the struct does not have, a call with
+    the wrong count, two widths that cannot be combined), where computing
+    it would answer with whatever NumPy raised."""
+    from .interp import Interpreter
+    scope = _Scope()
+    scope.names.update(types)
+    NameCheck(Interpreter([], structs, hlsl=hlsl)).expr(node, scope)

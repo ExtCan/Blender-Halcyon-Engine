@@ -945,6 +945,30 @@ BUILTINS = {
     'luminance': ('luminance', _float, 1, 1),
 }
 
+#: The builtins a constant expression may call (`float a[int(max(A, B))]`,
+#: parser.Parser.not_constant): the ones the language itself folds, each a
+#: function of its arguments and nothing else. A name is here by being
+#: written here -- a builtin added to the table above is not one until it
+#: is. Left out: every texture read, the screen-space derivatives (they
+#: read the neighbouring lanes), `clip`, and Halcyon's own extensions,
+#: which no driver has to fold (`dither4x4` reads the frame besides).
+CONSTANT = frozenset((
+    'radians', 'degrees', 'sin', 'cos', 'tan', 'asin', 'acos', 'atan',
+    'atan2', 'sinh', 'cosh', 'tanh', 'asinh', 'acosh', 'atanh',
+    'pow', 'exp', 'log', 'log10', 'exp2', 'log2', 'sqrt', 'inversesqrt',
+    'rsqrt',
+    'abs', 'sign', 'floor', 'ceil', 'trunc', 'round', 'roundEven', 'fract',
+    'frac', 'mod', 'fmod', 'min', 'max', 'clamp', 'saturate', 'mix', 'lerp',
+    'step', 'smoothstep', 'isnan', 'isinf',
+    'length', 'distance', 'dot', 'cross', 'normalize', 'faceforward',
+    'reflect', 'refract',
+    'matrixCompMult', 'outerProduct', 'transpose', 'determinant', 'inverse',
+    'mul', 'mad',
+    'lessThan', 'lessThanEqual', 'greaterThan', 'greaterThanEqual', 'equal',
+    'notEqual', 'any', 'all', 'not',
+    'asfloat', 'asint',
+))
+
 
 # ------------------------------------------------- operators used by codegen
 

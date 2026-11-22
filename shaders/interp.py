@@ -1117,3 +1117,30 @@ class Interpreter:
     ret_type = None
     ret_val = None
 
+
+def fold(node, consts, structs, hlsl=False, as_type=None):
+    """[value, type] of a constant expression, computed on ONE lane by the
+    `Interpreter.expr` that computes it when the shader runs.
+
+    `consts` is {name: [value, type]} for the constants the expression
+    names. With `as_type` the value is converted to it, as a declaration
+    converts its initialiser (`const int N = ...`).
+
+    This is how the parser reads the size of an array (`float a[N * 2]`,
+    parser.Parser.array_size): the number in the brackets is the number
+    the same expression gives in the body of the shader -- one arithmetic,
+    not a second one written for sizes. What may be handed here is the
+    parser's to decide (`Parser.not_constant`): nothing that writes, and
+    no function of the shader's own, so the empty interpreter below is
+    all the expression can reach."""
+    it = Interpreter([], structs, hlsl=hlsl)
+    scope = Scope()
+    scope.vars.update(consts)
+    # quiet: what NumPy would warn of here (`1 / 0`, `sqrt(-1.0)`) is a
+    # size the parser refuses by name a line later
+    with np.errstate(all='ignore'):
+        v, t = it.expr(node, np.ones(1, bool), scope, Flags(1), 1)
+        if as_type is not None:
+            v, t = it.coerce(v, t, as_type, 1), as_type
+    return [v, t]
+

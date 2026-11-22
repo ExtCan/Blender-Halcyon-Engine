@@ -31,8 +31,32 @@ Top level
     ('struct', name, [(gtype, name, arrsize)])
     One declaration per entry: `uniform float a, b;` and the members of an
     HLSL cbuffer arrive as one 'global' each (Parser.parse flattens them).
+
+Array sizes
+    `arrsize` is a number in every entry above: 0 when the declarator has
+    no brackets, -1 for `[]` (sized by its initialiser), else the size --
+    and a size is at least 1. What is written in the brackets is a
+    CONSTANT EXPRESSION and is evaluated here, where it is parsed
+    (Parser.array_size): a number, a `const` declared above it with a
+    constant initialiser, and whatever the language builds from those
+    (`N`, `N * 2`, `(N + 1) / 2`, `int(R) + 1`, `max(A, B)`). The value is
+    the one `Interpreter.expr` gives the same expression in the body of the
+    shader (interp.fold), so a size and a loop bound written alike are the
+    same number. A size that is not a constant, not an integer or below 1
+    is a compile error at the line of its bracket; so is a name in it that
+    nothing above declares.
+
+    To know what a name in the brackets IS, the parser keeps the scopes
+    the name check and the interpreter build (shaders/names.py lists
+    them), holding for each declared name either its constant or the
+    reason it is not one (Parser.declare). (Until this was written the size
+    was read by `_const_int`, which knew a number and answered 0 --
+    "no brackets" -- for anything else: `const int N = 3; float a[N];`
+    declared ONE float, every index read it, and a size nothing declared
+    compiled.)
 """
 
+from .builtins import BUILTINS, CONSTANT
 from .gtypes import BY_NAME, GType
 from .lexer import ShaderError, preprocess, tokenize
 
@@ -53,6 +77,46 @@ QUALIFIERS = {'uniform', 'varying', 'attribute', 'in', 'out', 'inout', 'const',
               # qualifier and ignoring it IS its semantics here
               'precise'}
 
+#: the qualifiers of a global the renderer or the node fills in, and what
+#: each makes of the name: whatever else such a declaration says, it is
+#: not a constant
+BOUND_QUALIFIERS = {'uniform': 'is a uniform', 'in': 'is an input',
+                    'attribute': 'is an input', 'varying': 'is an input',
+                    'out': 'is an output', 'inout': 'is an output'}
+
+#: the largest size an `int` can hold
+MAX_ARRAY = 2 ** 31 - 1
+
+#: the expressions that are never a constant, by node kind: the ones that
+#: write, and the comma (which the language leaves out by name)
+_WRITES = {'assign': 'it assigns', 'post': 'it writes (++ or --)',
+           'pre': 'it writes (++ or --)', 'seq': 'it holds a comma'}
+
+
+class _Const:
+    """A `const` whose initialiser is a constant expression: what a size
+    may name. `uses` is what the initialiser names itself, as it stood
+    where it was written; `slot` is its [value, type], computed the first
+    time a size asks (Parser.fold) -- a shader that sizes its arrays with
+    numbers evaluates nothing here."""
+    __slots__ = ('type', 'init', 'uses', 'slot')
+
+    def __init__(self, gtype, init, uses):
+        self.type = gtype
+        self.init = init
+        self.uses = uses
+        self.slot = None
+
+
+class _Uses:
+    """What a constant expression names: its constants by name, and the
+    builtins it calls."""
+    __slots__ = ('consts', 'calls')
+
+    def __init__(self):
+        self.consts = {}
+        self.calls = set()
+
 
 class Parser:
     def __init__(self, src, hlsl=False, defines=None):
@@ -61,6 +125,17 @@ class Parser:
         self.i = 0
         self.structs = {}
         self.hlsl = hlsl
+        #: what is declared where the parser stands, the innermost scope
+        #: last: name -> its _Const, or the words for why it is not a
+        #: constant (`declare`). The root starts with the one name GLSL
+        #: declares for the shader (names.BUILTIN_VARS)
+        self.scopes = [{'gl_FragCoord': "'gl_FragCoord' is not a constant"}]
+        #: the functions the shader has declared so far
+        self.own_funcs = set()
+        #: builtin -> line, for each one a size was computed through
+        self.folded = {}
+        #: inside the braces of an HLSL cbuffer
+        self.in_cbuffer = False
 
     # ------------------------------------------------------------- utilities
     @property
@@ -101,6 +176,14 @@ class Parser:
             d = self.parse_toplevel()
             if d is not None:
                 _flatten(d, decls)
+        for name, line in self.folded.items():
+            if name in self.own_funcs:
+                # the size was computed through the builtin, and when the
+                # shader runs every call of the name reaches its own
+                # function (Interpreter.call), wherever that is written
+                raise ShaderError(
+                    'array size is not a compile-time constant: '
+                    f"{name}() is the shader's own function", line)
         return decls
 
     def parse_toplevel(self):
@@ -127,8 +210,10 @@ class Parser:
                 self.next()
             self.expect('{')
             out = []
+            self.in_cbuffer = True
             while not self.at('}') and self.tok.kind != 'eof':
                 out.append(self.parse_toplevel())
+            self.in_cbuffer = False
             self.expect('}')
             self.accept(';')
             return ('block', [_as_uniform(o) for o in out if o])
@@ -147,17 +232,27 @@ class Parser:
         if self.at('('):
             return self.parse_function(gtype, name)
 
+        # a global is a constant when it says so and nothing fills it in:
+        # not a uniform, an input or an output, and not a cbuffer's member
+        # (those ARE the shader's uniforms, `_as_uniform`)
+        why = "is a cbuffer's member" if self.in_cbuffer else \
+            next((BOUND_QUALIFIERS[q] for q in quals
+                  if q in BOUND_QUALIFIERS), None)
+        const = 'const' in quals and why is None
+        why = why or 'is not declared const'
         arr = self.parse_array_suffix()
         self.skip_semantic()
         init = None
         if self.accept('='):
             init = self.parse_assign()
+        self.declare(name, const, gtype, arr, init, why)
         results = [('global', quals, gtype, name, arr, init)]
         while self.accept(','):
             nm = self.next().value
             a2 = self.parse_array_suffix()
             self.skip_semantic()
             ini = self.parse_assign() if self.accept('=') else None
+            self.declare(nm, const, gtype, a2, ini, why)
             results.append(('global', quals, gtype, nm, a2, ini))
         self.expect(';')
         return results[0] if len(results) == 1 else ('block', results)
@@ -206,6 +301,14 @@ class Parser:
         return ('struct', name, fields)
 
     def parse_function(self, rettype, name):
+        self.own_funcs.add(name)
+        # the parameters' scope: the body is a block inside it
+        self.scopes.append({})
+        fn = self.parse_function_rest(rettype, name)
+        self.scopes.pop()
+        return fn
+
+    def parse_function_rest(self, rettype, name):
         self.expect('(')
         params = []
         if not self.at(')'):
@@ -229,6 +332,9 @@ class Parser:
                 # leaves the parameter out reads it (it was parsed and
                 # dropped, and the missing argument read zero)
                 default = self.parse_assign() if self.accept('=') else None
+                # a parameter is never a constant, `const` or not: it is
+                # whatever the call passes
+                self.declare(pname, why='is a parameter')
                 params.append((qual, pt, pname, pa, default))
                 if not self.accept(','):
                     break
@@ -257,23 +363,210 @@ class Parser:
 
     def parse_array_suffix(self):
         size = 0
-        while self.accept('['):
+        while True:
+            bracket = self.accept('[')
+            if not bracket:
+                return size
             if self.at(']'):
                 size = -1
             else:
-                e = self.parse_assign()
-                size = _const_int(e)
+                size = self.array_size(self.parse_assign(), bracket.line)
             self.expect(']')
+
+    # ------------------------------------------------- constants and sizes
+    def scoped(self, parse):
+        """What `parse` returns, read in a scope of its own: a
+        declaration it meets is gone when it is done."""
+        self.scopes.append({})
+        out = parse()
+        self.scopes.pop()
+        return out
+
+    def declare(self, name, const=False, gtype=None, arr=0, init=None,
+                why='is not declared const'):
+        """Record a name the source declares, in the scope the parser
+        stands in -- AFTER its initialiser was parsed, which still saw the
+        outer name (the block rule of shaders/names.py).
+
+        Every declared name is recorded, constant or not: `int N = 2;` in a
+        block hides the `const int N` above it, and a size that names it
+        there is refused for what it is rather than given the outer 3. A
+        `const` with a constant initialiser becomes a _Const; anything else
+        is recorded as the words that say why it is not one."""
+        if not name:
+            return
+        if not const:
+            slot = f'{name!r} {why}'
+        elif init is None:
+            slot = f'{name!r} has no initialiser'
+        else:
+            uses = _Uses()
+            try:
+                no = self.not_constant(init, uses)
+            except RecursionError:
+                # an initialiser nested this deep is the name check's to
+                # refuse, in its own words (compiler.try_compile)
+                no = ('it is too deeply nested', None)
+            if no is None:
+                t = GType(gtype.base, gtype.n, gtype.rows, arr,
+                          gtype.struct) if arr else gtype
+                slot = _Const(t, init, uses)
+            else:
+                slot = (f'the initialiser of {name!r} is not constant '
+                        f'({no[0]})')
+        self.scopes[-1][name] = slot
+
+    def not_constant(self, node, uses):
+        """None when `node` is a constant expression, and `uses` then
+        holds the _Const of every name in it. Otherwise (why, error): the
+        words for what is not constant, and -- for a name nothing declares
+        or a function that does not exist -- the error it is on its own.
+
+        The language's rule (GLSL 4.3.3): a literal; a `const` variable
+        whose initialiser is a constant expression; an operator, a
+        constructor or a builtin function applied to constant expressions.
+        Never a call of the shader's own function, and nothing that
+        writes. It never raises: a `const` it cannot follow is simply not
+        one a size may name."""
+        k = node[0]
+        if k in ('num', 'bool'):
+            return None
+        if k == 'var':
+            name = node[1]
+            for scope in reversed(self.scopes):
+                slot = scope.get(name)
+                if slot is not None:
+                    if isinstance(slot, str):
+                        return slot, None
+                    uses.consts[name] = slot
+                    return None
+            line = node[2] if len(node) > 2 else 0
+            return (f'{name!r} is not declared above it',
+                    ShaderError(f'undeclared identifier {name!r}', line))
+        if k == 'un':
+            if node[1] in ('++', '--'):
+                return _WRITES['pre'], None
+            return self.not_constant(node[2], uses)
+        if k == 'bin':
+            parts = node[2:4]
+        elif k == 'cond':
+            parts = node[1:4]
+        elif k == 'index':
+            parts = node[1:3]
+        elif k == 'member':
+            parts = node[1:2]
+        elif k == 'arrinit':
+            parts = node[2]
+        elif k == 'call':
+            name, parts = node[1], node[2]
+            t = BY_NAME.get(name)
+            if name in self.structs or \
+                    (t is not None and t.base not in ('void', 'sampler')):
+                pass                                    # a constructor
+            elif name in self.own_funcs:
+                return f"{name}() is the shader's own function", None
+            elif name in CONSTANT:
+                uses.calls.add(name)
+            elif name in BUILTINS:
+                return f'{name}() is not evaluated at compile time', None
+            else:
+                line = node[3] if len(node) > 3 else 0
+                return (f'{name}() is not a function',
+                        ShaderError(f'unknown function {name!r}', line))
+        else:
+            return _WRITES.get(k, f'{k!r} is not a constant'), None
+        for part in parts:
+            no = self.not_constant(part, uses)
+            if no is not None:
+                return no
+        return None
+
+    def fold(self, node, uses, line, as_type=None):
+        """[value, type] of a constant expression: its constants first,
+        each once, then the expression itself -- through the name check
+        (names.check_constant), which refuses here what it refuses in the
+        body of a shader, in the same words, and then computed
+        (interp.fold)."""
+        from .interp import fold
+        from .names import check_constant
+        for called in uses.calls:
+            # held against the functions the shader goes on to declare
+            # (`parse`)
+            self.folded.setdefault(called, line)
+        consts = {}
+        for name, const in uses.consts.items():
+            if const.slot is None:
+                const.slot = self.fold(const.init, const.uses, line,
+                                       const.type)
+            consts[name] = const.slot
+        try:
+            check_constant(node, {name: slot[1]
+                                  for name, slot in consts.items()},
+                           self.structs, self.hlsl)
+        except ShaderError as exc:
+            raise ShaderError(exc.msg, exc.line or line)
+        try:
+            return fold(node, consts, self.structs, self.hlsl, as_type)
+        except ShaderError as exc:
+            raise ShaderError(f'array size: {exc.msg}', line)
+        except RecursionError:
+            raise
+        except Exception as exc:                                # noqa: BLE001
+            raise ShaderError('array size cannot be evaluated '
+                              f'({type(exc).__name__}: {exc})', line)
+
+    def array_size(self, node, line):
+        """The size written in a declarator's brackets, as a number.
+
+        A number is read as it always was (`3`, `3u`, and `3.0` as 3).
+        Anything else is a constant expression and is computed: it has to
+        BE one, of type int or uint. Either way the size is at least 1 --
+        0 is how a declaration with no brackets is told apart, so a size
+        of 0 declared a plain float, and -1 is `[]`."""
+        if node[0] == 'num':
+            size = _const_int(node)
+        else:
+            uses = _Uses()
+            no = self.not_constant(node, uses)
+            if no is not None:
+                raise no[1] or ShaderError(
+                    f'array size is not a compile-time constant: {no[0]}',
+                    line)
+            v, t = self.fold(node, uses, line)
+            if t.base not in ('int', 'uint') or t.n != 1 or t.array \
+                    or t.is_matrix:
+                raise ShaderError('array size must be an int, this is '
+                                  f'{_a(t.name())}', line)
+            one = _one(v)
+            try:
+                size = int(one)
+            except (TypeError, ValueError, OverflowError):
+                size = None             # nan, inf
+            if size is None or abs(size) > MAX_ARRAY:
+                # `1 / 0` and its kin: the interpreter answers a division
+                # by zero with the dividend times 1e30
+                raise ShaderError('array size does not fit an int', line)
+            if size != one:
+                # typed int by the interpreter's shortcut (a builtin
+                # answers its argument's type: `sqrt(2)`), not a whole
+                # number
+                raise ShaderError('array size must be an int, this is '
+                                  f'{float(one):g}', line)
+        if size < 1:
+            raise ShaderError(f'array size must be at least 1, not {size}',
+                              line)
         return size
 
     # ------------------------------------------------------------- statements
     def parse_block(self):
         self.expect('{')
         stmts = []
+        self.scopes.append({})
         while not self.at('}'):
             if self.tok.kind == 'eof':
                 self.err('unexpected end of source in block')
             stmts.append(self.parse_statement())
+        self.scopes.pop()
         self.expect('}')
         return ('block', stmts)
 
@@ -332,8 +625,9 @@ class Parser:
         return ('expr', e)
 
     def parse_decl(self):
+        const = False
         while self.tok.value in QUALIFIERS and self.tok.kind == 'keyword':
-            self.next()
+            const |= self.next().value == 'const'
         gtype = self.parse_type()
         if gtype is None:
             self.err('unknown type in declaration')
@@ -344,6 +638,7 @@ class Parser:
             init = None
             if self.accept('='):
                 init = self.parse_assign()
+            self.declare(name, const, gtype, arr, init)
             items.append((name, arr, init))
             if not self.accept(','):
                 break
@@ -354,13 +649,19 @@ class Parser:
         self.expect('(')
         c = self.parse_expr()
         self.expect(')')
-        then = self.parse_statement()
+        # an arm is a block of its own, braces or not (shaders/names.py)
+        then = self.scoped(self.parse_statement)
         els = None
         if self.accept('else'):
-            els = self.parse_statement()
+            els = self.scoped(self.parse_statement)
         return ('if', c, then, els)
 
     def parse_for(self):
+        # one scope for the init, the condition and the step; the body is
+        # a block inside it
+        return self.scoped(self.parse_for_rest)
+
+    def parse_for_rest(self):
         self.expect('for')
         self.expect('(')
         if self.accept(';'):
@@ -375,7 +676,7 @@ class Parser:
         self.expect(';')
         step = None if self.at(')') else self.parse_expr()
         self.expect(')')
-        body = self.parse_statement()
+        body = self.scoped(self.parse_statement)
         return ('for', init, cond, step, body)
 
     def parse_while(self):
@@ -383,11 +684,11 @@ class Parser:
         self.expect('(')
         c = self.parse_expr()
         self.expect(')')
-        return ('while', c, self.parse_statement())
+        return ('while', c, self.scoped(self.parse_statement))
 
     def parse_do(self):
         self.expect('do')
-        body = self.parse_statement()
+        body = self.scoped(self.parse_statement)
         self.expect('while')
         self.expect('(')
         c = self.parse_expr()
@@ -403,16 +704,21 @@ class Parser:
         self.expect('{')
         cases = []
         cur = None
+        # each case is lowered to a block of its own below, so what one
+        # declares the next does not see
+        self.scopes.append({})
         while not self.at('}'):
             ctok = self.accept('case')
             if ctok:
                 v = self.parse_expr()
                 self.expect(':')
+                self.scopes[-1] = {}
                 cur = (v, [], ctok.line)
                 cases.append(cur)
                 continue
             if self.accept('default'):
                 self.expect(':')
+                self.scopes[-1] = {}
                 cur = (None, [], 0)
                 cases.append(cur)
                 continue
@@ -420,6 +726,7 @@ class Parser:
             if cur is None:
                 continue
             cur[1].append(s)
+        self.scopes.pop()
         self.expect('}')
         # lower to if/else-if; 'break' inside becomes a no-op at this level
         node = None
@@ -541,15 +848,31 @@ class Parser:
 
 
 def _const_int(node):
+    """A number written as a size: `3`, `3u`, `0x10`, and `3.0` or `3f`
+    as 3 (no driver takes a float there; this front-end always has, and a
+    shader that runs is not refused for it). Anything but a number is
+    `Parser.array_size`'s."""
     if node[0] == 'num':
+        text = node[1]
         try:
-            return int(float(node[1].rstrip('uUfFhH'), 0) if node[1].lower().startswith('0x')
-                       else float(node[1].rstrip('uUfFhH')))
+            if text[:2].lower() == '0x':
+                # (it was `float(text, 0)`: a TypeError, so a size written
+                # in hex failed the compile with Python's own message)
+                return int(text.rstrip('uU'), 16)
+            return int(float(text.rstrip('uUfFhH')))
         except ValueError:
             return 0
-    if node[0] == 'un' and node[1] == '-':
-        return -_const_int(node[2])
     return 0
+
+
+def _one(v):
+    """The one number a folded constant holds (one lane, one component)."""
+    import numpy as np
+    return np.asarray(v).reshape(-1)[0]
+
+
+def _a(noun):
+    return ('an ' if noun[:1] in 'aeiou' else 'a ') + noun
 
 
 def _as_uniform(d):
