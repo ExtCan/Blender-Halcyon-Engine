@@ -5,6 +5,14 @@ Values are numpy arrays with a leading lane axis:
     vecN     (N,K) or (1,K)
     matCxR   (N,C,R) column-major, so m[c] is a column -- matching GLSL
 Every function here is written to broadcast a lane count of 1 against N.
+
+A matrix has that ONE shape wherever it comes from -- the constructor
+(`mat`), a declaration (`Interpreter.zero`), a function's result, a struct's
+field, an array's element -- and `col` / `col_set` are how a column is read
+and written. (The interpreter used to make a declared matrix a Python list
+of its columns and index a constructed one the same way: `m[1]` of a
+constructed matrix indexed the LANE axis, and `m * v` of a declared one
+handed `mat_mul_vec` a list.)
 """
 
 import numpy as np
@@ -1022,6 +1030,11 @@ def struct_set(d, field, value):
     out = dict(d)
     out[field] = value
     return out
+
+
+def col(m, c):
+    """Column `c` of a matrix: (N, R), the vector `m[c]` is in GLSL."""
+    return np.asarray(m)[:, c, :]
 
 
 def col_set(m, c, value):

@@ -42,6 +42,19 @@ def param_default(p):
     return p[4] if len(p) > 4 else None
 
 
+def field_type(f):
+    """A struct field's type, its array size included (`float w[3]`): the
+    third element of the parser's field tuple. Everything that asks what a
+    field is asks here -- the value a declared struct starts with, a field
+    read, a field write, the constructor and the name check. (Each read the
+    bare element type: the field was stored and typed as ONE element, so
+    `s.w[1]` indexed a float.)"""
+    ftype, _name, arr = f
+    if arr:
+        return GType(ftype.base, ftype.n, ftype.rows, arr, ftype.struct)
+    return ftype
+
+
 def arity(fn):
     """(fewest, most) arguments a call of one function may pass: every
     parameter up to the last one written without a default, to all of
@@ -115,6 +128,9 @@ class Flags:
 class Interpreter:
     def __init__(self, decls, structs, hlsl=False):
         self.structs = structs
+        #: struct name -> {field name: type}, in declaration order, built
+        #: when first asked for (`fields`)
+        self.field_types = {}
         self.hlsl = hlsl
         self.funcs = {}
         self.globals = []
@@ -409,6 +425,9 @@ class Interpreter:
             if slot is None:
                 raise ShaderError(f'unknown identifier {node[1]!r}')
             return slot[0], slot[1]
+        if k == 'held':
+            # an index `hold` evaluated ahead of the write it belongs to
+            return node[1], node[2]
         if k == 'bin':
             return self.binary(node, mask, scope, flags, n)
         if k == 'assign':
@@ -442,7 +461,7 @@ class Interpreter:
             base, bt = self.expr(node[1], mask, scope, flags, n)
             field = node[2]
             if bt.base == 'struct':
-                fields = {f[1]: f[0] for f in self.structs.get(bt.struct, [])}
+                fields = self.fields(bt.struct)
                 if field not in fields:
                     raise ShaderError(f'{bt.struct} has no field {field!r}')
                 return base[field], fields[field]
@@ -456,7 +475,7 @@ class Interpreter:
             return self.subscript(base, bt, i, n)
         if k in ('post', 'pre'):
             # ('post', '++', target) -- the operator comes first
-            op, target = node[1], node[2]
+            op, target = node[1], self.hold(node[2], mask, scope, flags, n)
             cur, t = self.expr(target, mask, scope, flags, n)
             delta = np.ones(n, np.float32) * (1.0 if op == '++' else -1.0)
             newv = self.coerce(cur + self.coerce(delta, FLOAT, t, n), t, t, n)
@@ -466,6 +485,7 @@ class Interpreter:
             op, operand = node[1], node[2]
             if op in ('++', '--'):
                 # ++x is a write as well as a read, so it shares the post path
+                operand = self.hold(operand, mask, scope, flags, n)
                 cur, t = self.expr(operand, mask, scope, flags, n)
                 delta = np.ones(n, np.float32) * (1.0 if op == '++' else -1.0)
                 newv = self.coerce(cur + self.coerce(delta, FLOAT, t, n),
@@ -531,6 +551,18 @@ class Interpreter:
             r = x * y
         elif op == '/':
             r = x / np.where(np.asarray(y) == 0, np.asarray(y, np.float32) + 1e-30, y)
+            if t.base == 'int':
+                # two signed integers divide to an integer, cut toward
+                # zero: 7 / 2 is 3 and -7 / 2 is -3, where the quotient was
+                # kept whole (3.5, typed int) -- on a driver, which compiles
+                # the same text when the shader is inlined in the deferred
+                # pass, it never was. `uint` is cut below, as it always
+                # was. The cut is ALL that changes: the quotient is held as
+                # before (NumPy's float64, exact here for any two 32-bit
+                # operands), so one that had no fraction is the same number
+                # in the same dtype and nothing computed from it moves by a
+                # bit.
+                r = np.trunc(r)
         elif op == '%':
             r = rt.mod(x, y) if t.base == 'float' else np.remainder(
                 rt.to_int(x), np.where(np.asarray(rt.to_int(y)) == 0, 1,
@@ -566,13 +598,49 @@ class Interpreter:
         op, target, value = node[1], node[2], node[3]
         v, vt = self.expr(value, mask, scope, flags, n)
         if op != '=':
+            # the target's indices once, for the read and the write alike
+            # (`a[i++] += x` names one element)
+            target = self.hold(target, mask, scope, flags, n)
             cur, ct = self.expr(target, mask, scope, flags, n)
             v, vt = self.binary(('bin', op[:-1], target, value), mask, scope,
                                 flags, n)
         return self.store(target, v, vt, mask, scope, flags, n)
 
+    def hold(self, target, mask, scope, flags, n):
+        """The same assignment target with every index it is reached
+        through evaluated -- once, here.
+
+        A write through `a[i].x` reads `a[i]`, changes the component and
+        writes `a[i]` back (`store`), and `a[i] += x` reads the element
+        before it writes it: each step names the element again. With a
+        number written in the brackets that costs nothing, and it was the
+        only index a write accepted. An expression is evaluated here and
+        its value kept in the node, so every step names the element the
+        first one did -- `a[i++] = x` moves `i` once."""
+        k = target[0]
+        if k == 'member':
+            inner = self.hold(target[1], mask, scope, flags, n)
+            if inner is target[1]:
+                return target
+            return ('member', inner) + tuple(target[2:])
+        if k != 'index':
+            return target
+        inner = self.hold(target[1], mask, scope, flags, n)
+        idx = target[2]
+        if idx[0] not in ('num', 'held'):
+            idx = ('held',) + tuple(self.expr(idx, mask, scope, flags, n))
+        if inner is target[1] and idx is target[2]:
+            return target
+        return ('index', inner, idx)
+
     def store(self, target, value, vtype, mask, scope, flags, n):
         k = target[0]
+        if k in ('member', 'index'):
+            # every index on the way to the target, once (`hold`). A caller
+            # that read the target before writing it -- a compound
+            # assignment, ++, an out argument -- held it then, and this
+            # answers that same node
+            target = self.hold(target, mask, scope, flags, n)
         if k == 'var':
             slot = scope.get(target[1])
             if slot is None:
@@ -584,7 +652,7 @@ class Interpreter:
             base, bt = self.expr(target[1], mask, scope, flags, n)
             field = target[2]
             if bt.base == 'struct':
-                fields = {f[1]: f[0] for f in self.structs.get(bt.struct, [])}
+                fields = self.fields(bt.struct)
                 if field not in fields:
                     raise ShaderError(f'{bt.struct} has no field {field!r}')
                 ft = fields[field]
@@ -603,30 +671,84 @@ class Interpreter:
             return base, bt
         if k == 'index':
             base, bt = self.expr(target[1], mask, scope, flags, n)
-            const = _const_int(target[2])
+            i, _it = self.expr(target[2], mask, scope, flags, n)
+            everyone = np.ones(n, bool)
             if bt.array:
-                if const is None:
-                    raise ShaderError('dynamic array writes are not supported')
+                # one element per lane: the lanes that index element j are
+                # the ones it is written for
                 items = list(base)
-                items[const] = rt.sel(mask, value, items[const])
-                self.store(target[1], items, bt, np.ones(n, bool), scope,
-                           flags, n)
-                return items[const], bt.elem()
+                for j, hit in self.indexed(target[2], i, len(items), bt,
+                                           mask):
+                    items[j] = rt.sel(hit, value, items[j])
+                self.store(target[1], items, bt, everyone, scope, flags, n)
+                return self.subscript(items, bt, i, n)
             if bt.is_matrix:
-                if const is None:
-                    raise ShaderError('dynamic matrix writes are not supported')
-                cols = list(base)
-                cols[const] = rt.sel(mask, value, cols[const])
-                self.store(target[1], cols, bt, np.ones(n, bool), scope,
-                           flags, n)
-                return cols[const], GType(bt.base, bt.rows)
-            if const is None:
-                raise ShaderError('dynamic component writes are not supported')
-            updated = rt.sw_set(base, [const], value)
-            self.store(target[1], rt.sel(mask, updated, base), bt,
-                       np.ones(n, bool), scope, flags, n)
+                # a column of the one array a matrix is (it was a Python
+                # list of columns here, and an array where it was built)
+                ct = GType(bt.base, bt.rows)
+                column = self.coerce(value, vtype, ct, n)
+                m = base
+                for j, hit in self.indexed(target[2], i, bt.n, bt, mask):
+                    m = rt.sel(hit, rt.col_set(base, j, column), m)
+                self.store(target[1], m, bt, everyone, scope, flags, n)
+                return self.subscript(m, bt, i, n)
+            updated = base
+            for j, hit in self.indexed(target[2], i, bt.n, bt, mask):
+                updated = rt.sel(hit, rt.sw_set(base, [j], value), updated)
+            self.store(target[1], updated, bt, everyone, scope, flags, n)
             return base, bt
         raise ShaderError(f'cannot assign to {k!r}')
+
+    def indexed(self, node, i, count, bt, mask):
+        """What a write through an index reaches: (element, the lanes of
+        `mask` that write it), one pair per element some lane writes.
+        `node` is the index as written, `i` its value, `count` the elements
+        a `bt` holds.
+
+        A read through a variable index has always chosen per lane
+        (`subscript`); a write accepted a written number alone and raised
+        `dynamic array writes are not supported` on `a[i] = x` inside the
+        loop that fills an array. This is the write's half of the same
+        rule, and the index is clamped into range as the read's is, so
+        what is written through an index is what a read through it finds.
+
+        Two writes stay refused, as they were. A NUMBER written past the
+        size (`a[3] = x` of a `float a[3]`) raised an IndexError and no
+        driver compiles it: it is said by name. And a variable index into
+        what holds no elements -- a float -- has nothing to choose
+        between: clamping it would send every write to the one value in
+        silence."""
+        count = max(int(count), 1)
+        const = self.same_index(i)
+        if node[0] == 'num':
+            if const is None or not 0 <= const < count:
+                raise ShaderError(f'index {node[1]} is out of range for '
+                                  f'{bt.name()}')
+            return [(const, mask)]
+        if not (bt.array or bt.is_matrix or bt.n > 1):
+            raise ShaderError(f'{bt.name()} is not an array, a vector or a '
+                              'matrix: a variable index cannot write to it')
+        if const is not None:
+            return [(max(0, min(const, count - 1)), mask)]
+        idx = np.clip(np.reshape(rt.to_int(i), (-1,)).astype(np.int64),
+                      0, count - 1)
+        out = []
+        for j in range(count):
+            hit = mask & (idx == j)
+            if hit.any():
+                out.append((j, hit))
+        return out
+
+    @staticmethod
+    def same_index(i):
+        """The index every lane holds, or None when the lanes differ."""
+        try:
+            arr = np.asarray(i).reshape(-1)
+            if arr.size and np.all(arr == arr[0]):
+                return int(arr[0])
+        except Exception:                                       # noqa: BLE001
+            pass
+        return None
 
     # -------------------------------------------------------------- calls
     def pick(self, name, argc):
@@ -700,10 +822,14 @@ class Interpreter:
         for i, p in enumerate(fn[3]):
             ptype = param_type(p)
             if i < len(args):
-                v, vt = self.expr(args[i], mask, scope, flags, n)
-                v = self.coerce(v, vt, ptype, n)
+                arg = args[i]
                 if p[0] in ('out', 'inout'):
-                    writeback.append((args[i], p[2], ptype))
+                    # the element the call names is the one it is written
+                    # back to, whatever the call does to the index
+                    arg = self.hold(arg, mask, scope, flags, n)
+                    writeback.append((arg, p[2], ptype))
+                v, vt = self.expr(arg, mask, scope, flags, n)
+                v = self.coerce(v, vt, ptype, n)
             else:
                 # the call left the parameter out, which the count check
                 # allows for one declared with a default alone: the default
@@ -758,7 +884,8 @@ class Interpreter:
                 raise ShaderError(self.wrong_count(name, len(args)))
             vals = [self.expr(a, mask, scope, flags, n) for a in args]
             out = {}
-            for (ftype, fname, _arr), (v, vt) in zip(fields, vals):
+            for (fname, ftype), (v, vt) in zip(self.fields(name).items(),
+                                               vals):
                 out[fname] = self.coerce(v, vt, ftype, n)
             return out, struct_type(name)
         t = BY_NAME.get(name)
@@ -789,13 +916,7 @@ class Interpreter:
 
     # ------------------------------------------------------------ helpers
     def subscript(self, base, bt, i, n):
-        const = None
-        try:
-            arr = np.asarray(i).reshape(-1)
-            if arr.size and np.all(arr == arr[0]):
-                const = int(arr[0])
-        except Exception:                                       # noqa: BLE001
-            const = None
+        const = self.same_index(i)
         if bt.array:
             if const is not None:
                 return base[max(0, min(const, len(base) - 1))], bt.elem()
@@ -816,11 +937,21 @@ class Interpreter:
                 out = rt.sel(idx == j, base[j], out)
             return out, bt.elem()
         if bt.is_matrix:
-            col = base[max(0, min(const or 0, len(base) - 1))]
-            return col, GType(bt.base, bt.rows)
+            # the column axis of (N, C, R), whichever way the matrix was
+            # made; a variable index chooses a column per lane, as it
+            # chooses an element of an array (it read column 0)
+            ct = GType(bt.base, bt.rows)
+            if const is not None:
+                return rt.col(base, max(0, min(const, bt.n - 1))), ct
+            return rt.idx_axis(base, np.reshape(rt.to_int(i), (-1,))), ct
         if const is not None:
             return rt.sw(base, [max(0, min(const, bt.n - 1))]), GType(bt.base, 1)
-        idx = np.reshape(rt.to_int(i), (-1,))
+        # clamped at both ends, as the line above clamps the index every
+        # lane agrees on and as an array's is: past the last component the
+        # lanes that DIFFERED read component 0, so one index read two
+        # components depending on its neighbours -- and a write through it
+        # (`indexed`) has to land where the read looks
+        idx = np.clip(np.reshape(rt.to_int(i), (-1,)), 0, bt.n - 1)
         out = rt.sw(base, [0])
         for j in range(1, bt.n):
             out = rt.sel(idx == j, rt.sw(base, [j]), out)
@@ -879,14 +1010,25 @@ class Interpreter:
         if t.array:
             return [self.zero(t.elem(), n) for _ in range(max(t.array, 1))]
         if t.base == 'struct':
-            return {f[1]: self.zero(f[0], n) for f in self.structs.get(t.struct, [])}
+            return {name: self.zero(ft, n)
+                    for name, ft in self.fields(t.struct).items()}
         if t.is_matrix:
-            return [np.zeros((n, t.rows), np.float32) for _ in range(t.n)]
+            # the shape the constructor builds and the runtime multiplies
+            return np.zeros((n, t.n, t.rows), np.float32)
         if t.n == 1:
             return np.zeros(n, bool if t.base == 'bool' else
                             np.int64 if t.base == 'uint' else
                             np.int32 if t.base == 'int' else np.float32)
         return np.zeros((n, t.n), np.float32)
+
+    def fields(self, struct):
+        """{field name: type} of one struct, in the order it declares them
+        -- each type with its array size (`field_type`)."""
+        known = self.field_types.get(struct)
+        if known is None:
+            known = self.field_types[struct] = {
+                f[1]: field_type(f) for f in self.structs.get(struct, ())}
+        return known
 
     def number(self, node, n):
         raw = node[1]
@@ -975,11 +1117,3 @@ class Interpreter:
     ret_type = None
     ret_val = None
 
-
-def _const_int(node):
-    if node and node[0] == 'num':
-        try:
-            return int(float(node[1].rstrip('uUfFhH')))
-        except ValueError:
-            return None
-    return None
