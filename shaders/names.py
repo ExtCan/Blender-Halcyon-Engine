@@ -10,7 +10,7 @@ interpreter replaced caught every one of them while it emitted code
 range`); `Interpreter.validate` brought back the unknown-function half and
 this module is the rest.
 
-Two more refusals ride the same walk, because it already knows every
+Three more refusals ride the same walk, because it already knows every
 call and the type of every expression:
 
   counts     a call must pass a count of arguments its function takes. The
@@ -33,6 +33,13 @@ call and the type of every expression:
              own shortcut. (Not modelled: the type table has one sampler
              type, so `texture()` of a sampler2DShadow is a vec4 here as
              it is when the shader runs.)
+  members    a field or a swizzle is taken from a struct, a vector or a
+             scalar -- never from a matrix or an array, which is indexed
+             first (`m[0].xyz`). The swizzle check used to step around
+             both, and `m.xyz` raised from NumPy when a lane reached it. A
+             struct's field is typed with its array size (`float w[3]` is
+             an array of three), by the same `field_type` the interpreter
+             builds the struct from.
 
 It is a walk of the same tree with the scopes `Interpreter.run`,
 `call_user`, `block` and `loop` build, holding a type where they hold a
@@ -60,7 +67,7 @@ from .builtins import BUILTINS
 from .codegen import FRAG_OUTS, VARYINGS
 from .gtypes import (BOOL, BY_NAME, FLOAT, INT, UINT, VOID, GType, promote,
                      swizzle_indices)
-from .interp import param_default, param_type, struct_type
+from .interp import field_type, param_default, param_type, struct_type
 from .lexer import ShaderError
 
 #: in scope with no declaration, as GLSL defines it (Interpreter.run binds
@@ -230,9 +237,24 @@ class NameCheck:
             field = node[2]
             if bt is None:
                 return UNKNOWN
+            if (bt.array or bt.is_matrix) and not isinstance(bt, _Loose):
+                # an array or a matrix is indexed before anything is taken
+                # from it: `m.xyz`, `a.x`, `a.field` are no driver's GLSL.
+                # (The swizzle check below stepped around both, and the run
+                # then swizzled the lane axis: a NumPy error, or the wrong
+                # numbers when the shapes happened to fit. A loose type is
+                # left to the run, as everywhere: it may not be the
+                # language's.)
+                what = 'an array' if bt.array else 'a matrix'
+                eg = f' ({node[1][1]}[0].{field})' \
+                    if node[1][0] == 'var' else ''
+                raise ShaderError(f'{field!r} of {bt.name()}: {what} is '
+                                  f'indexed first{eg}', _line(node, 3))
             if bt.base == 'struct':
-                for ftype, fname, _farr in self.structs.get(bt.struct, ()):
-                    if fname == field:
+                for f in self.structs.get(bt.struct, ()):
+                    if f[1] == field:
+                        # with its array size: `float w[3]` is an array
+                        ftype = field_type(f)
                         return _loose(ftype, bt), ftype.n
                 raise ShaderError(f'{bt.struct} has no field {field!r}',
                                   _line(node, 3))
