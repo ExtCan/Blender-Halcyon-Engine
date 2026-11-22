@@ -2073,8 +2073,8 @@ def test_signed_integers_divide_to_an_integer():
     # would have run in float64 -- the 0.1 * 0.7 below rounds the other way
     # there. A float vector is float32 however it is built now,
     # test_a_float_vector_is_float32_whatever_it_is_built_from, so the
-    # chain is this one whichever way the quotient is held: `h` below is
-    # the same quotient through an int variable, and the second line the
+    # chain is this one whichever way the quotient is held: in the second
+    # check `h` is the same quotient through an int variable, and `q` the
     # int32 this one stood in for.)
     got, err = _first(_body(
         '    int n = 6;\n    vec2 g = vec2(n / 2, n / 2) * 0.1 * 0.7;\n'

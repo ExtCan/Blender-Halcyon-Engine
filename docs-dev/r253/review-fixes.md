@@ -5,8 +5,8 @@ and the console-shader deep re-read the field log asked for. Each item
 below was reproduced headless before it was fixed and is pinned in
 `tests/test_r253_review.py` (registered in `run_all`); the Coded
 Shader's name resolution is pinned in `tests/test_shaders.py` as well,
-and its matrices, indexed writes, array fields and integer division
-there alone.
+and its matrices, indexed writes, array fields, integer division and
+float vectors built from ints there alone.
 
 ## CHANGELOG
 
@@ -2557,10 +2557,11 @@ there alone.
   changes.* The quotient is held as before -- NumPy's float64, exact for
   any two 32-bit operands -- so one that had no fraction is the same
   number in the same dtype and nothing computed from it moves by a bit.
-  (Held as an int32 it would: a float vector built from ints alone is
-  kept an int array, a looseness of the constructor's, and `vec2(n / 2, n
-  / 2) * 0.1 * 0.7` would run its two products in float64 and round the
-  other way. That shader is pinned.) A zero divisor answers what it did;
+  (Held as an int32 it would have: a float vector built from ints alone
+  was kept an int array then, a looseness of the constructor's, and
+  `vec2(n / 2, n / 2) * 0.1 * 0.7` would have run its two products in
+  float64 and rounded the other way. That shader is pinned, and the
+  entry below converts the vector.) A zero divisor answers what it did;
   the language leaves it undefined. *What moves.* Asked before anything
   was changed: the unchanged tree ran the whole suite with a recorder on
   that one line of `binary` (on `1e6239c`, and again on `9fc4d43`, whose
@@ -2650,16 +2651,263 @@ there alone.
   written past the size in a READ (`a[5]` of a `float a[3]`) is clamped
   in silence where a driver refuses the text. `uint` division by zero
   answers 0 with a NumPy cast warning, `int` division by zero the
-  dividend times 1e30. A float vector built from ints alone is held as an
-  int array and arithmetic on it runs in float64 -- why the quotient
-  keeps its dtype. Pinned in `tests/test_shaders.py` (four tests, 66
-  checks: each reported shader at 1, 2, 3, 4 and 7 lanes; a matrix made
-  18 ways by used 12 ways; the one shape of a declared and a constructed
-  matrix; per-lane writes into an array, a vector and a matrix under a
-  branch; 120 seeded programs of indexed reads and writes held lane by
-  lane against a plain Python run of the same program; the array field
-  built and typed; every pair of -12 .. 12 divided; the ends of the
-  32-bit range; the exact quotient that moves nothing).
+  dividend times 1e30. A float vector built from ints alone was held as
+  an int array and arithmetic on it ran in float64 -- why the quotient
+  keeps its dtype; it is float32 since, the entry below. Pinned in
+  `tests/test_shaders.py` (four tests, 66 checks: each reported shader
+  at 1, 2, 3, 4 and 7 lanes; a matrix made 18 ways by used 12 ways; the
+  one shape of a declared and a constructed matrix; per-lane writes into
+  an array, a vector and a matrix under a branch; 120 seeded programs of
+  indexed reads and writes held lane by lane against a plain Python run
+  of the same program; the array field built and typed; every pair of
+  -12 .. 12 divided; the ends of the 32-bit range; the exact quotient
+  that moves nothing).
+- **A float vector the Coded Shader builds from ints is float32 (it was
+  held as an int array, and arithmetic on it ran in float64).** `int q =
+  3; vec2 g = vec2(q, q) * 0.1 * 0.7;` answered 0.21 -- both products
+  taken in float64 and rounded once, where the value was stored -- where
+  two float32 products answer 0.21000001. The entry above lists it under
+  *Seen and left*; reproduced headless (`try_compile(src)`, then
+  `prog.run({}, {}, 4)`) on `claude-cloud` at `31aa3f1` with that
+  entry's branch merged in (`2dcc4aa`: `claude-cloud` did not hold it
+  yet, and this stands on its integer division and its pin). It is the
+  drift R243 removed for `float(u)` and for a vector with a Python
+  literal in it (`Interpreter.constructor`, `builtins._f32_only`), left
+  standing for the vector that has no float part at all. *The root.*
+  `Interpreter.constructor` builds a vector with `rt.vec(t.n, *parts)`
+  and converted the int, uint and bool vectors alone. `rt.vec` joins the
+  parts and `_f32_only` converts a FLOAT join: ints alone stayed the
+  int32 array NumPy made of them (uints an int64 one, bools a bool one),
+  typed `vec2`. `Interpreter.coerce` converted where the source's BASE
+  differs from the destination's, and both said float; so the int32
+  array met a float32 scalar, NumPy answered float64, and the chain ran
+  on at that precision until something stored it. A vector with one
+  float part was float32 already. A declaration hid most of it -- `vec2
+  g = vec2(q, q);` converts, because there the two types are the same
+  OBJECT and `coerce` held its rule for that case alone -- so the ints
+  survived only in a vector USED where it is built, or reached through a
+  swizzle, a ternary or a binary result, whose types are equal and not
+  the same object. *It was not only a last bit.* The same array gave
+  other NUMBERS wherever it was used as the float it was typed: a
+  component written into one was cut to an integer (`vec2 g = vec2(1,
+  2).yx; g.x = 0.5;` read 0, and so in a function's parameter and after
+  a ternary); two of them added or multiplied as int32 and wrapped
+  (`vec2(2000000000, 1) + vec2(2000000000, 1)` gave -294967296,
+  `vec2(100000, 3) * vec2(100000, 3)` 1410065408); an int no float32
+  holds was never rounded (`vec2(16777217, 3).x - 16777216.0` gave 1);
+  two built from bools added as bools (`vec2(true, true) + vec2(true,
+  true)` gave 1) and one negated raised `TypeError` out of NumPy; and a
+  vector written whole to an `out` left the program as a float64 array.
+  *Measured before anything was decided.* Converting changes the last
+  bit of any shader that builds a float vector from ints and computes on
+  it, and the suite compares the GLSL simulators with the CPU bitwise:
+  so, first, does any engine pass do that? The whole suite (`python3 -m
+  halcyon.tests.run_all`) was run with the unchanged front-end imported
+  beside the changed one. Every `Program.run` -- the engine's texts
+  reach it from `gpu/shade`, `gpu/sky`, `gpu/ink`, `gpu/craster`,
+  `gpu/rtrace`, `core/nodeeval` and `tests/fakedevice`, and from the
+  tests that run an engine text by hand; `device.preflight` compiles and
+  runs nothing -- was repeated by the unchanged front-end on the very
+  same uniforms and inputs, the two results compared as bytes (values,
+  shapes, dtypes, the discard mask), and in both every expression's
+  value was checked against its type where it was evaluated: outside the
+  shader tests 9651 runs of 1977 distinct sources, 47.4 million lanes.
+  Those sources were also typed by the front-end's own name check for
+  where such a vector is WRITTEN, a lane reaching it or not. The answer
+  is yes: the engine's GLSL builds one and computes on it in eight
+  statements, three idioms. (a) *A texel address taken from a uv*, four
+  times: `ivec2 gbsz = textureSize(hal_gb_ids, 0); ivec2 gbpx =
+  ivec2(clamp(screen_uv * vec2(gbsz), vec2(0.0), vec2(gbsz) -
+  vec2(1.0)));` in the G-buffer read (`gpu/gbuffer.py`) and the same in
+  `gpu/material.py` over `hal_uvgrad` (twice) and `hal_gb_idslin` --
+  built by a lane in 1447 of the 1977 sources, 9136 times. `vec2(gbsz)`
+  was an int array, and the product, the difference and the clamp ran in
+  float64. Nothing computed from it moves: the result goes straight into
+  an `ivec2`, whose constructor cuts it, and at a texel centre -- the
+  only place these reads are asked, `(x + 0.5) / W` -- the float32
+  product is `x + 0.5` to a few parts in ten million, nowhere near the
+  half texel that would cut it to another `x`. (On a texel EDGE, `uv = k
+  / W`, which the reads never ask for, the float64 product fell a texel
+  short of a driver's float32 one at 3364 of the 7199 edges of a
+  7200-pixel row; the simulator is the driver's there now.) (b) *An int
+  vector over 255*, `Color = vec4(vec3(o) / 255.0, t.a);`, three times
+  in the two N64 Video Interface stages (`gpu/stages_vi.py`), written in
+  three of the sources and built by a lane in one. It does not move
+  either: it is ONE division, and a float64 quotient rounded once to
+  float32 is the float32 quotient. (c) *The Blender Internal Voronoi's
+  feature point*, `vec3 pt = bi_hpntv(hi) + vec3(c);` of an `ivec3 c`
+  (`gpu/procedural.py`, `bi_voronoi`): a hash point plus its cell.
+  `vec3(c)` was an int array, the sum was float64, and `pt` stayed
+  float64 through the distance taken from it and into the `pa[]` it is
+  stored in -- its declaration converted nothing, the sum's type being
+  equal to `vec3` and not the same object. **This one moves**, and it is
+  all that does. Seven of the sources carry the statement and a lane
+  reaches it in one, which returns other bytes in 2 of its 13 runs:
+  `tests/test_legacy.py`'s twin of the BI textures against
+  `core/bitex.py` (thirteen modes at 256 points), in the two modes that
+  reach `bi_voronoi`. Both move TOWARD the CPU's NumPy float32, the
+  reference the twin is held to. Voronoi (Minkowski): 215 lanes move,
+  every one of them nearer; 41 lanes were the CPU's bits before and all
+  256 are now; the largest distance goes from 4.17e-07 to 0. Crackle: 70
+  lanes move, 59 nearer and 11 farther; 186 lanes were the CPU's bits
+  and 231 are; the largest distance goes from 1.85e-05 to 1.43e-05 (what
+  is left is its near-ties, as the test says). The other eleven modes do
+  not move by a bit. Both checks pass at their 1e-4 bar before and
+  after; what changes is the distance they print (`GPU twin: voronoi
+  minkowski  max diff 4.17e-07` prints `0.00e+00`, `GPU twin: crackle
+  max diff 1.85e-05` prints `1.43e-05`), and the constructor alone,
+  switched on over the unchanged code, gives exactly these values. One
+  more engine text held a float as float64 without building a vector:
+  the node emitters write a whole-number socket value as an int
+  (`Emitter._m` formats 1.0 as `1`), so the Hue/Saturation node's
+  `mix(c.rgb, rgb, clamp(1, 0.0, 1.0))` and the Map Range node's
+  `max(abs((1) - (0)), 1e-8)` handed a builtin an int beside floats, in
+  the two sources that two tests assemble by hand (the deferred pass
+  lifts such a constant into a texel, `hal_MV`, and no pass it runs
+  holds one). Those are (5) below, and their outputs do not move. (The
+  emitters write a whole-number colour the same way -- `vec4 _v18 =
+  vec4(1, 1, 1, 1);` in four sources a third test assembles by hand, and
+  a palette's unrolled entry `e = vec3(0, 0, 0);` (`gpu/emit.py`) in one
+  deferred pass. Each is declared or assigned where it is built, which
+  converted it then as now, and nothing was computed from the ints.)
+  Every other run outside the shader tests -- all but those 2 of the
+  9651 -- returns the same bytes and dtypes from both front-ends, and
+  nothing else the suite runs there held a float as anything else,
+  before or after. `gpu/stages.py` knew: its gamma-2 resolve writes
+  `vec3(float(ii.r), float(ii.g), float(ii.b))` with a comment naming
+  the simulator's `vec3(ivec3)` as "a front-end blind spot this pack's
+  twin test found" -- the one place an engine pass had met it and
+  written around it. The text stays as it is pinned; the comment says
+  the blind spot is gone. *The change.* A value typed float is held as
+  float32, and five places make it so. (1) `Interpreter.constructor`
+  converts a float vector where it is built, whatever its parts -- the
+  root, and by itself the reported shader and the Voronoi above. (2)
+  `Interpreter.coerce` converts for a float destination whichever type
+  object names it: every operand of an operator, every declaration,
+  assignment, argument, returned value, field and ternary arm goes
+  through it, so nothing typed float reaches arithmetic as another dtype
+  whatever built it (its comment already said "a float destination is
+  float32, full stop", and the rule held for one object). The other
+  three are where an int array, rightly typed int, met a float without
+  being converted, and NumPy answered float64 in the same way: (3) a
+  write to an array's element was merged in as it came, where a variable
+  and a struct's field are converted (`float a[3]; a[0] = q;` left the
+  element float64) -- `store` converts it to the element's type; (4) a
+  matrix times a vector ran its sum in float64 for an `ivec3`
+  (`mat2(0.1, 0.1, 0.7, 0.7) * ivec2(3, 7)` gave 5.1999998 where the
+  same matrix times `vec2(3.0, 7.0)` gives 5.2000003) -- `binary` hands
+  the vector over as floats; (5) a builtin was handed its arguments as
+  they were evaluated, so `clamp(x, 0, 5)`, `max(x, 1)`, `max(q, 0.5)`,
+  `mix(x, 3, t)` and `smoothstep(0, 1, x)` came back float64 and
+  `outerProduct` of two `ivec2` was a matrix of ints -- `call` converts
+  the numbers of a builtin that answers a float, as a driver converts an
+  int argument on the way in. A bool is left a bool (`mix` selects by
+  one), a builtin that answers an int keeps its ints (`max(a, b)` of two
+  ints), and nothing is converted where a sampler is read (`texelFetch`
+  addresses a texel with its ints: 16777217 is not a float32). *The
+  quotient of two ints is held as it was.* The entry above kept it
+  NumPy's float64 so that `vec2(n / 2, n / 2) * 0.1 * 0.7` would not
+  move, because from an int32 quotient the constructor would have built
+  an int array. That reason is gone -- the vector is float32 from either
+  -- and the pin holds bit for bit as it stands; its comment says so
+  now, and a second check beside it runs the same chain from the
+  quotient through an `int` variable and from the plain `int` the
+  float64 stood in for. How the quotient is held is no longer tied to
+  this, and is left (below). *What moves, and which way.* No check
+  changes state. Two print another number, the Voronoi twin's two
+  distances above, both smaller: toward the float32 reference. Beyond
+  the suite, what moves is a Coded Shader on the CPU road, and always
+  toward float32: 240 seeded chains (a vector of two ints, then two to
+  five of `+ - * /` against written floats and int-built vectors, in one
+  expression) are NumPy's float32 chain bit for bit, where the unchanged
+  front-end answered 107 of them and rounded the other 133 from float64.
+  The moves are a last bit wherever the old value was a float64 chain
+  rounded once (the vector, a component or swizzle of it, a ternary of
+  it, a matrix times it or times an `ivec`, an int stored in a float
+  array, a builtin given an int beside a float); the number itself in
+  the cases under *It was not only a last bit*; and a float32 array
+  where an `out` was float64. The deferred pass, which inlines the same
+  text for a driver, always computed the new value: the two roads
+  disagreed and now do not. Three side effects of (3), each what a
+  variable of the type already did: an `int` element given a float is
+  cut (`int a[2]; a[1] = 2.75;` held 2.75), a `uint` element given a
+  negative int wraps, and a scalar or a wider vector written to a vector
+  element fills or is cut where it raised `ValueError`. The cost is a
+  dtype test where a conversion is asked: on 120 of the seeded shaders
+  below, 5 % at 64 lanes and nothing measurable at 20000. *Nothing that
+  compiled and ran is refused, and nothing else moved.* The change is in
+  five methods the run calls; nothing a compile reads is touched. Held
+  four ways. The suite on the unchanged head and on the changed tree,
+  the checks compared name by name and in order: 13737 pass and 32 FAIL
+  lines are printed before (each the `halcyon-1.89.0.zip` no fresh
+  container has beside the package), 13785 pass and the same 32 lines
+  after, character for character and in the same order; no check is lost
+  and the 48 more are the new ones. (What a check prints beside its name
+  differs in 39 of them between the two runs: timings, thread ids,
+  temporary paths, the order of a printed set -- and the two distances.)
+  Every run the suite makes, as above; in the shader tests themselves,
+  1588 runs of 792 sources, the 338 that differ are the new checks' own
+  shaders. In the changed front-end no value typed float is held as
+  anything else at any node of any source the suite runs, the engine's
+  included -- but for the one check that hands a float array uniform
+  over as ints, to show its uses convert. 6000 seeded random shaders
+  written the way a driver accepts and the old constructor mishandled --
+  ints, uints and bools as the parts of float vectors, written ints in
+  `min`, `max`, `clamp`, `mix`, `step` and `smoothstep`, an `ivec` times
+  a matrix, ints stored in a float array, through swizzles, ternaries,
+  functions, branches and loops -- were compiled and run by both: 2049
+  return the same bits and dtypes, 1367 the same values with a float64
+  output now float32, 2567 other values, and 17 raised `TypeError`
+  before and run (a bool-built vector negated or subtracted). With the
+  five conversions switched off in the changed front-end all 3951 are
+  the old result bit for bit, so the five are all that changed (each
+  alone, switched on over the old code, moves 1985, 3726, 6, 782 and
+  2806 of them in the order above; `coerce` and the array element can be
+  switched off alone without one result moving, because what they leave
+  is converted at its next use -- they are what keeps the value float32
+  where it is HELD, which the check on every node pins). The unchanged
+  front-end held some float as another dtype in 5996 of the 6000 and the
+  changed one in none. And 6000 more with an int nowhere it went wrong
+  (a float part in every float vector, floats to the builtins, float
+  vectors to the matrices) -- all 6000 the same bits and dtypes from
+  both, and every float float32 in both. 17 of 17 mutations of the
+  change each fail the tests: every conversion removed in turn, the
+  constructor leaving ints, uints or bools, the argument rule leaving a
+  float, an int or a uint, converting a bool, converting where a sampler
+  is read, skipping a matrix result, or converting for an int result.
+  What changes value is, by intent: a float vector with no float part
+  and what is computed from it; an int beside a float in an array
+  element, a matrix product or a builtin; and what is stored into an
+  array's element. *Seen and left* (each reproduced; all but the last
+  three are a value typed INT held as something else, the opposite
+  looseness, and none is asked for here): a declared `ivec2 p;` is a
+  float32 array (`Interpreter.zero` makes every vector one), so `p.x =
+  16777217;` reads back 16777216; `uvec2(4000000000u, 1u)` goes through
+  int32 and `u.x == 4000000000u` is false, where a `uint` scalar holds
+  it; a builtin typed by its first argument answers a float typed int
+  when handed an int beside floats (`int z = clamp(q, 0.5, 2.5);` holds
+  2.5, `mix(1, 2, 0.3)` is 1.3 typed int -- a driver takes the float
+  overload); the quotient of two ints is still held as float64, exact
+  and typed int, so `int h = 6 / 2; h * 1000000000` is 3e9 where an int
+  wraps to -1294967296; a bit operator with a float operand (`3 & 1.0`,
+  which no driver compiles) is typed float and held as ints until the
+  next operator converts it; and a float array uniform is bound as the
+  caller hands it -- its uses convert, the binding does not, and on the
+  node an array uniform is one socket, as a `uniform mat3` is; and the
+  node emitters' `1` for 1.0, which a driver converts and the simulator
+  now does too. Pinned in `tests/test_shaders.py`
+  (`test_a_float_vector_is_float32_whatever_it_is_built_from`, 47
+  checks, and one more beside the exact-quotient pin: the reported
+  shader and 23 other ways to 3 * 0.1 * 0.7, each the float32 chain bit
+  for bit; the numbers that were wrong; 511 ints across the 32-bit range
+  lane by lane; the 240 seeded chains; every value typed float at every
+  node of 548 shaders; a float array uniform handed over as ints; what
+  stays -- the int, uint and bool constructors, an int-answering
+  builtin, `mix` by a bool, a texel address past 2^24 -- and the
+  engine's own two: the Voronoi feature point as the float32 sum at 256
+  points, and the texel address at every centre of five frame sizes up
+  to 16384 across). 42 of the 48 fail on the unchanged front-end; the
+  other 6 pin what did not change, and that the two references differ.
 - **Findings judged and left.** The review also named: the cel converters
   landing an Emission shader's colour twice (paint plus self-illumination)
   and the Cartoon era presets overwriting the flat-paint extras; the Toon
@@ -2830,6 +3078,21 @@ there alone.
   a coded shader never reached a driver either: a matrix uniform is
   refused for the deferred pass by name, a local matrix is inlined as
   written.
+- The Coded Shader's float vectors on a real driver (proven against the
+  headless evaluator alone, with NumPy's float32 as the reference): a
+  node whose source is the reported `int q = 3; vec2 g = vec2(q, q) *
+  0.1 * 0.7;`, inlined in the deferred pass on a real GPU, against the
+  CPU frame of the same file. No driver was asked here. The claim is
+  that a driver's two float32 products are the CPU road's now, where the
+  CPU road rounded once from float64; what a driver's own compiler does
+  with a chain of written constants (folding it, or contracting a
+  multiply and an add) is its business, so the case to look at is a
+  chain fed by a varying -- `vec2(int(vPosition.x), 3) * vUV.x * 0.7` --
+  on both devices. Also open, and the engine's own: a Blender Internal
+  Voronoi texture (any distance metric, and Crackle) on the GPU device
+  against the CPU frame -- the simulator's feature point is the float32
+  sum a driver takes now, and its twin of `core/bitex.py` is exact for
+  Voronoi where it sat 4e-7 off, but no driver drew it here.
 - The release machine itself, where the zips are (the cloud-container
   fix was proven on the container's one Xeon, with the kernel varied by
   `OPENBLAS_CORETYPE` and the previous engine stood in for by this
